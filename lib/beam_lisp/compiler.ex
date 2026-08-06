@@ -132,21 +132,23 @@ defmodule BeamLisp.Compiler do
   end
 
   def compile({:list, [{:symbol, name} | args]}, env) do
-    arg_env = notail(env)
-    arg_asts = Enum.map(args, &compile(&1, arg_env))
-
     cond do
       local?(env, name) ->
-        invoke_quoted(local(env, name), arg_asts)
+        invoke_quoted(local(env, name), compile_args(args, env))
 
       true ->
         # Macros resolve at compile time against the live registry,
         # including through aliases (a/macro → target-ns/macro).
+        # Macro args are DATA: they must not be compiled before
+        # expansion (a `recur` or an unbound symbol inside them is
+        # the macro's business, not ours).
         case macro_for(env.ns, name) do
           {:ok, macro_fn} ->
             compile(expand_macro(macro_fn, args), env)
 
           :error ->
+            arg_asts = compile_args(args, env)
+
             if String.contains?(name, "/") do
               case slash_target(env, name) do
                 {:var, ns, var} ->
@@ -167,6 +169,11 @@ defmodule BeamLisp.Compiler do
   def compile({:list, [head | args]}, env) do
     arg_env = notail(env)
     invoke_quoted(compile(head, arg_env), Enum.map(args, &compile(&1, arg_env)))
+  end
+
+  defp compile_args(args, env) do
+    arg_env = notail(env)
+    Enum.map(args, &compile(&1, arg_env))
   end
 
   # --- special forms ---

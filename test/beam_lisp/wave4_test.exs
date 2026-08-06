@@ -126,6 +126,46 @@ defmodule BeamLisp.Wave4Test do
     end
   end
 
+  describe "control-flow macros (prelude)" do
+    test "cond picks the first true branch, :else last" do
+      assert eval("(cond (< 2 1) :a (= 2 2) :b :else :c)") == :b
+      assert eval("(cond false :a)") == nil
+    end
+
+    test "case dispatches on value, odd clause is the default" do
+      assert eval("(case 2 1 :one 2 :two :other)") == :two
+      assert eval("(case 9 1 :one :other)") == :other
+    end
+
+    test "case compares with =, keywords included" do
+      assert eval("(case :b :a 1 :b 2 3)") == 2
+    end
+
+    test "when runs a body or yields nil" do
+      assert eval("(when (= 1 1) 1 2 3)") == 3
+      assert eval("(when false 1)") == nil
+      assert eval("(when-not false 7)") == 7
+    end
+
+    test "and/or return values, short-circuit" do
+      assert eval("(and)") == true
+      assert eval("(and 1 2)") == 2
+      assert eval("(and 1 nil 2)") == nil
+      assert eval("(or)") == nil
+      assert eval("(or nil :x)") == :x
+      assert eval("(or nil false 1)") == 1
+    end
+
+    test "or evaluates its first form once" do
+      # side effect: an Agent bump; if `or` re-evaluated, we'd get 2
+      eval("(def w4-box (erlang/element 2 (Agent/start_link (fn [] 0))))")
+      assert eval("""
+             (let [f (fn [] (Agent/update w4-box (fn [n] (+ n 1))) :val)]
+               (do (or (f) :unused) (Agent/get w4-box (fn [n] n))))
+             """) == 1
+    end
+  end
+
   describe "variadic arithmetic" do
     test "+ and * fold any arity, with identity at zero" do
       assert eval("(+)") == 0
