@@ -117,6 +117,22 @@ defmodule BeamLisp.RT do
 
   def println(x), do: IO.puts(print_str(x))
 
+  # The reader-macro table: dispatch-char → wrapper symbol name.
+  # Lives in the vars ETS table (same registry as vars); the reader
+  # consults it for `@`, core.bl registers the mapping, users may
+  # rebind it. `(reader-macro! "@" (quote deref))`.
+  def reader_macro(char) do
+    case :ets.lookup(:beam_lisp_vars, {:reader_macro, char}) do
+      [{{:reader_macro, ^char}, name}] -> {:ok, name}
+      [] -> :error
+    end
+  end
+
+  def reader_macro!(char, {:symbol, name}) when is_binary(char) do
+    :ets.insert(:beam_lisp_vars, {{:reader_macro, char}, name})
+    name
+  end
+
   # Inside a collection, strings print readably; at the top level
   # (println, pr-str of a bare string) they print raw.
   defp print_elem(x) when is_binary(x), do: inspect(x)
@@ -193,7 +209,8 @@ defmodule BeamLisp.RT do
       "promise" => &BeamLisp.Refs.promise/0,
       "deliver" => &BeamLisp.Refs.deliver/2,
       "future?" => &BeamLisp.Refs.future?/1,
-      "future-cancel" => &BeamLisp.Refs.future_cancel/1
+      "future-cancel" => &BeamLisp.Refs.future_cancel/1,
+      "reader-macro!" => &reader_macro!/2
     }
 
     prims = Map.merge(prims, refs_prims)
@@ -249,7 +266,8 @@ defmodule BeamLisp.RT do
       "drop" => 2,
       "apply" => :apply_to,
       "println" => 1,
-      "pr-str" => :print_str
+      "pr-str" => :print_str,
+      "reader-macro!" => :reader_macro!
     }
 
     for {name, spec} <- rt_fns do

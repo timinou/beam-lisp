@@ -16,9 +16,12 @@ defmodule BeamLisp.Reader do
     * literals — integers, floats, strings, `nil`, `true`, `false`
 
   `'` is sugar for `(quote …)`, "`" for `(syntax-quote …)`, `~` for
-  `(unquote …)`, `~@` for `(unquote-splicing …)` and `@` for
-  `(deref …)`. `;` starts a line comment and `,` is whitespace, same
-  as in jank and Clojure.
+  `(unquote …)`, `~@` for `(unquote-splicing …)` — those four are
+  structural, needed to read core.bl itself. `@` is sugar for
+  `(deref …)` by default, but the mapping lives in the rebindable
+  reader-macro table and is registered from core.bl (see
+  BeamLisp.RT.reader_macro!/2). `;` starts a line comment and `,`
+  is whitespace, same as in jank and Clojure.
   """
 
   alias BeamLisp.Reader.SyntaxError
@@ -83,19 +86,29 @@ defmodule BeamLisp.Reader do
         quote_form(rest, "unquote")
 
       [?@ | rest] ->
-        deref_form(rest)
+        wrap_form(rest, "@", "deref")
 
       [?" | rest] -> string(rest, [])
       rest -> atom_form(rest)
     end
   end
 
-  # `@x` reads as `(deref x)`, like Clojure; `@` followed only by
-  # whitespace (or nothing) is a reader error.
-  defp deref_form(rest) do
+  # `@x` reads as `(deref x)` — but the `@ → deref` mapping is not
+  # wired into the reader: it lives in the reader-macro table (see
+  # BeamLisp.RT.reader_macro/1), registered from priv/core.bl like a
+  # Lisp reader macro, and rebindable. The builtin default keeps `@`
+  # working before the prelude loads. `@` followed only by whitespace
+  # (or nothing) is a reader error.
+  defp wrap_form(rest, char, default) do
+    name =
+      case BeamLisp.RT.reader_macro(char) do
+        {:ok, registered} -> registered
+        :error -> default
+      end
+
     case form(skip_ignored(rest)) do
-      {:ok, f, rest} -> {:ok, {:list, [{:symbol, "deref"}, f]}, rest}
-      :none -> {:error, "@ with no following form"}
+      {:ok, f, rest} -> {:ok, {:list, [{:symbol, name}, f]}, rest}
+      :none -> {:error, "#{char} with no following form"}
       err -> err
     end
   end
