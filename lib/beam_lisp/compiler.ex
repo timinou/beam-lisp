@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote receive)
+  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote receive throw try)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -69,6 +69,10 @@ defmodule BeamLisp.Compiler do
     Module.create(
       mod,
       quote do
+        # Generated eval modules are throwaway codegen; signature
+        # inference would type-check their try/catch AST, so it is
+        # disabled for the module regardless of the session option.
+        @compile no_type_check: true
         def run, do: unquote(ast)
       end,
       Macro.Env.location(__ENV__)
@@ -346,6 +350,49 @@ defmodule BeamLisp.Compiler do
 
   defp compile_special("do", body, env), do: block_forms(body, env)
 
+  # (throw x) — raise a value as an exception so try can catch it.
+  # Values become ExInfo payloads (maps keep their data), so a thrown
+  # value survives the round trip; an existing exception re-raises.
+  defp compile_special("throw", [x], env) do
+    quote do
+      BeamLisp.ExInfo.raise_payload(unquote(compile(x, notail(env))))
+    end
+  end
+
+  # (try body… (catch e handler…)… (finally f…))
+  #
+  # Catch clauses: `(catch e h…)` binds the raised value to `e` for
+  # any kind; `(catch Module.Name e h…)` matches only that Elixir
+  # exception. All clauses compile into one Elixir `catch kind, value`
+  # clause that dispatches in source order (see compile_catches); body
+  # is an implicit do. The try's value is the body's (or the matching
+  # handler's); a finally's value is discarded.
+  defp compile_special("try", forms, env) do
+    {body, catches, finally_body} = split_try_forms(forms)
+
+    # A try with no catch and no finally is just its body — Elixir's
+    # `try` requires at least one of :rescue/:catch/:after.
+    if catches == [] and finally_body == [] do
+      block_forms(body, env)
+    else
+      body_ast = block_forms(body, env)
+      opts = [do: body_ast]
+
+      opts =
+        case compile_catches(catches, env) do
+          nil -> opts
+          clause -> Keyword.put(opts, :catch, [clause])
+        end
+
+      opts =
+        if finally_body != [],
+          do: Keyword.put(opts, :after, block_forms(finally_body, notail(env))),
+          else: opts
+
+      {:try, [], [opts]}
+    end
+  end
+
   # (receive pattern body… (after ms body…)) — Elixir's receive,
   # with beam-lisp pattern syntax: literals and keywords match
   # themselves, symbols bind, [p q] is a 2-or-more-tuple, {:k p} a
@@ -381,6 +428,132 @@ defmodule BeamLisp.Compiler do
       end
 
     {:receive, [], [block]}
+  end
+
+  # Split (try …) into body forms, catch clauses, and a finally body.
+  # Catch/finally are classified by their head symbol; the caller
+  # keeps the catch clauses in source order (first match wins).
+  defp split_try_forms(forms) do
+    {catches, rest} = Enum.split_with(forms, &match?({:list, [{:symbol, "catch"} | _]}, &1))
+    {finallies, body} = Enum.split_with(rest, &match?({:list, [{:symbol, "finally"} | _]}, &1))
+
+    finally_body =
+      case finallies do
+        [] -> []
+        [{:list, [{:symbol, "finally"} | fb]}] -> fb
+        _ -> raise "try takes at most one (finally …) clause"
+      end
+
+    {body, catches, finally_body}
+  end
+
+  # Compile all catch clauses into a single Elixir `catch kind, value`
+  # clause. A bare-variable catch clause is used deliberately: Elixir's
+  # signature inference crashes (deferred, at VM exit) on hand-built
+  # `rescue ... in` and literal-kind `catch` patterns, so the dispatch
+  # happens here instead. `e` is bound per kind — thrown value for
+  # :throw, Exception.normalize for :error (users get structs), and
+  # {:exit, reason} for :exit — then clauses are tried in source order
+  # as nested if/else: a typed clause matches via is_struct, an untyped
+  # clause is a catch-all, and a re-raise of the original kind/value is
+  # the final fallback. Returns nil when there are no catch clauses.
+  defp compile_catches([], _env), do: nil
+
+  defp compile_catches(catches, env) do
+    kind_var = fresh_var("kind")
+    value_var = fresh_var("value")
+    e_var = fresh_var("e")
+    stack_var = fresh_var("stack")
+
+    normalize =
+      quote do
+        case unquote(kind_var) do
+          :throw -> unquote(value_var)
+          :error -> Exception.normalize(:error, unquote(value_var), unquote(stack_var))
+          :exit -> {:exit, unquote(value_var)}
+        end
+      end
+
+    cond_clauses =
+      Enum.map(catches, fn clause -> catch_branch(clause, e_var, env) end)
+
+    # Nested if/else (not a cond): Elixir's parser chokes on the nested
+    # `->` of a cond inside a catch clause body.
+    fallback = reralse_ast(kind_var, value_var, stack_var)
+
+    dispatch_body =
+      Enum.reduce(Enum.reverse(cond_clauses), fallback, fn {:->, [], [[cond_ast], handler]}, else_ast ->
+        {:if, [], [cond_ast, [do: handler, else: else_ast]]}
+      end)
+
+    # `__STACKTRACE__` is captured into a var first: Elixir mishandles it
+    # when it appears directly inside a `case` within a catch handler.
+    dispatch =
+      quote do
+        unquote(stack_var) = __STACKTRACE__
+        unquote(e_var) = unquote(normalize)
+        unquote(dispatch_body)
+      end
+
+    {:->, [], [[kind_var, value_var], dispatch]}
+  end
+
+  # One (catch …) clause → a `cond` clause `{:->, [], [[condition], handler]}`
+  # for the dispatch. A capitalized first symbol names a typed module; any
+  # other symbol is an untyped catch-all. The handler's `e` is bound to
+  # the dispatched value before it runs.
+  defp catch_branch({:list, [{:symbol, "catch"}, first | rest]}, e_var, env) do
+    case first do
+      {:symbol, name} ->
+        if uppercase?(name) do
+          case rest do
+            [{:symbol, e_name} | handler] ->
+              typed_branch(name, e_name, handler, e_var, env)
+
+            _ ->
+              raise "typed catch requires (catch Module.Name e handler…)"
+          end
+        else
+          untyped_branch(name, rest, e_var, env)
+        end
+
+      other ->
+        raise "catch requires a variable or Module.Name, got: #{inspect(other)}"
+    end
+  end
+
+  # (catch Module.Name e handler…) — match only that Elixir exception,
+  # resolved from its dotted symbol via Module.concat.
+  defp typed_branch(module_str, e_name, handler_forms, e_var, env) do
+    module = Module.concat(String.split(module_str, "."))
+    handler_var = fresh_var(e_name)
+    segs = Module.split(module) |> Enum.map(&String.to_atom/1)
+    mod_ast = {:__aliases__, [alias: false], segs}
+
+    cond_ast = quote do: is_struct(unquote(e_var), unquote(mod_ast))
+    handler = run_handler(handler_var, e_var, handler_forms, e_name, env)
+    {:->, [], [[cond_ast], handler]}
+  end
+
+  # (catch e handler…) — untyped catch-all over every kind.
+  defp untyped_branch(e_name, handler_forms, e_var, env) do
+    handler_var = fresh_var(e_name)
+    handler = run_handler(handler_var, e_var, handler_forms, e_name, env)
+    {:->, [], [[true], handler]}
+  end
+
+  # Bind the handler's `e` to the dispatched value, then run its body.
+  defp run_handler(handler_var, e_var, handler_forms, e_name, env) do
+    handler_ast = block_forms(handler_forms, put_local(env, e_name, handler_var))
+    {:__block__, [], [{:=, [], [handler_var, e_var]}, handler_ast]}
+  end
+
+  # Re-raise the original kind/value when no clause matches (only
+  # reachable when every clause is typed and none matched).
+  defp reralse_ast(kind_var, value_var, stack_var) do
+    quote do
+      :erlang.raise(unquote(kind_var), unquote(value_var), unquote(stack_var))
+    end
   end
 
   # A receive pattern, compiled with its bindings added to the env.
