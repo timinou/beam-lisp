@@ -69,13 +69,16 @@ user=> (map inc (lists/seq 1 5))
 ## Language status
 
 Supported today: literals, first-class persistent vectors (distinct
-from lists, `Enumerable` for `Enum` interop), maps, `def`, `fn`
+from lists, `Enumerable` for `Enum` interop), maps, **namespaces**
+(`ns` with `:require`/` :as`/` :refer`, file loading from the load
+path, alias resolution through macros too), `def`, `fn`
 (incl. multi-clause and variadic `& rest`), `defn` (incl.
 multi-arity and docstrings), **`defmacro` with syntax-quote** (` ` ,
 `~`, `~@`), `let` and `loop` with full Clojure-style destructuring
 (`[a b & rest]`, `{:keys [a b] :as m}` — lenient, like Clojure),
 `recur` with compile-time tail-position checking, `if`, `do`,
-`quote`, keywords-as-functions, full Elixir/Erlang interop, and a
+`quote`, keywords-as-functions, variadic arithmetic and comparisons
+(`(< 1 2 3)` chains, as Clojure), full Elixir/Erlang interop, and a
 self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
 `range`, `zipmap`, … — itself written in beam-lisp).
 
@@ -89,8 +92,6 @@ runs at native speed with genuine tail-call optimization — this
 
 Deliberate gaps, roughly in priority order:
 
-- **namespaces** — currently a flat `core`/`user` split with `core`
-  fallback
 - **compile-to-module + var linking** — each evaluated form currently
   becomes a throwaway module (native code, but ~50ms compile cost per
   form and no lifecycle); AOT per-file modules and direct var linking
@@ -128,6 +129,7 @@ $ mix beam_lisp.run examples/hello.bl      # language tour
 $ mix beam_lisp.run examples/interop.bl    # Elixir/Erlang interop
 $ mix beam_lisp.run examples/processes.bl  # Task/Agent/spawn: OTP from beam-lisp
 $ mix beam_lisp.run examples/macros.bl     # defmacro + syntax-quote
+$ mix beam_lisp.run examples/app.bl       # namespaces: require, alias, refer (loads geometry.bl)
 ```
 
 `processes.bl` is the point of the whole project in one file:
@@ -147,6 +149,7 @@ Layout:
 lib/beam_lisp/reader.ex     text → forms
 lib/beam_lisp/compiler.ex   forms → Elixir quoted → native modules
 lib/beam_lisp/env.ex        var registry (ETS-backed)
+lib/beam_lisp/loader.ex     namespace file loading
 lib/beam_lisp/vector.ex     the persistent vector type
 lib/beam_lisp/rt.ex         primitives seeded into core
 priv/core.bl                self-hosted prelude, jank-flavored

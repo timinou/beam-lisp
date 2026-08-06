@@ -132,16 +132,39 @@ defmodule BeamLisp.RT do
 
   @doc "Seed `core` with the primitives the prelude and interop need."
   def seed_core do
-    prims = %{
-      "+" => &Kernel.+/2,
-      "-" => &Kernel.-/2,
-      "*" => &Kernel.*/2,
-      "/" => &Kernel.//2,
-      "<" => &Kernel.</2,
-      ">" => &Kernel.>/2,
-      "<=" => &Kernel.<=/2,
-      ">=" => &Kernel.>=/2,
-      "=" => &Kernel.==/2,
+    # Clojure arithmetic is variadic: (+ 1 2 3), (*) → 1, (- 5) → -5.
+    arith = %{
+      "+" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 0, &Kernel.+/2) end}),
+      "*" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 1, &Kernel.*/2) end}),
+      "-" => multi_fn(%{}, {1, fn x, rest ->
+        case rest do
+          [] -> -x
+          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel.-(acc, e) end)
+        end
+      end}),
+      "/" => multi_fn(%{}, {1, fn x, rest ->
+        case rest do
+          [] -> 1 / x
+          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel./(acc, e) end)
+        end
+      end})
+    }
+
+    # (< 1 2 3) is a chain: 1 < 2 and 2 < 3.
+    chain = fn op ->
+      multi_fn(%{}, {1, fn x, rest ->
+        [x | rest]
+        |> Enum.zip(rest)
+        |> Enum.all?(fn {a, b} -> op.(a, b) end)
+      end})
+    end
+
+    prims = Map.merge(arith, %{
+      "<" => chain.(&Kernel.</2),
+      ">" => chain.(&Kernel.>/2),
+      "<=" => chain.(&Kernel.<=/2),
+      ">=" => chain.(&Kernel.>=/2),
+      "=" => chain.(&Kernel.==/2),
       "not" => &Kernel.not/1,
       "str" => str(),
       "first" => &first/1,
@@ -154,7 +177,7 @@ defmodule BeamLisp.RT do
       "apply" => &apply_to/2,
       "println" => fn x -> IO.puts(print_str(x)) end,
       "pr-str" => &print_str/1
-    }
+    })
 
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
     :ok

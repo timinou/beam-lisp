@@ -35,16 +35,20 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(def fn defn defmacro let loop recur if do quote syntax-quote)
+  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
 
   @doc "Read, compile and evaluate every form in `source`. Returns the last value."
   def eval_string(source, env \\ new_env()) do
+    # Enter the env's namespace; from there, per-form re-reads track
+    # any `ns` switches, exactly as defmacro side effects are seen.
+    Env.in_ns(env.ns)
+
     source
     |> Reader.read_all()
-    |> Enum.map(&eval_form(&1, env))
+    |> Enum.map(&eval_form(&1, %{env | ns: Env.current_ns()}))
     |> List.last()
   end
 
@@ -101,7 +105,10 @@ defmodule BeamLisp.Compiler do
         local(env, name)
 
       String.contains?(name, "/") ->
-        remote_value_quoted(name)
+        case slash_target(env, name) do
+          {:var, ns, var} -> fetch_quoted(ns, var)
+          {:remote, module, fun} -> remote_value_quoted(module, fun)
+        end
 
       true ->
         fetch_quoted(env.ns, name)
@@ -132,20 +139,27 @@ defmodule BeamLisp.Compiler do
       local?(env, name) ->
         invoke_quoted(local(env, name), arg_asts)
 
-      String.contains?(name, "/") ->
-        {module, fun} = remote_target(name)
-
-        quote do
-          apply(unquote(module), unquote(fun), unquote(arg_asts))
-        end
-
       true ->
+        # Macros resolve at compile time against the live registry,
+        # including through aliases (a/macro → target-ns/macro).
         case macro_for(env.ns, name) do
           {:ok, macro_fn} ->
             compile(expand_macro(macro_fn, args), env)
 
           :error ->
-            invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
+            if String.contains?(name, "/") do
+              case slash_target(env, name) do
+                {:var, ns, var} ->
+                  invoke_quoted(fetch_quoted(ns, var), arg_asts)
+
+                {:remote, module, fun} ->
+                  quote do
+                    apply(unquote(module), unquote(fun), unquote(arg_asts))
+                  end
+              end
+            else
+              invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
+            end
         end
     end
   end
@@ -158,6 +172,46 @@ defmodule BeamLisp.Compiler do
   # --- special forms ---
 
   defp compile_special("quote", [form], _env), do: Macro.escape(datum(form))
+
+  # (ns foo.bar (:require [other.ns :as o] [third.ns :refer [x]]))
+  # Emits runtime registry ops; the *next* form's compile then sees
+  # the new ns via Env.current_ns (eval_string re-reads it per form).
+  defp compile_special("ns", [{:symbol, name} | clauses], _env) do
+    specs =
+      Enum.flat_map(clauses, fn
+        {:list, [{:keyword, "require"} | require_specs]} -> require_specs
+        other -> raise "ns supports only :require clauses, got: #{inspect(other)}"
+      end)
+
+    {loads, aliases, refers} =
+      Enum.reduce(specs, {[], [], []}, fn spec, {loads, aliases, refers} ->
+        {target, as_alias, refer_syms} = parse_require_spec(spec)
+        load = quote do: BeamLisp.Loader.ensure_loaded(unquote(target))
+
+        alias_op =
+          if as_alias do
+            [quote do: BeamLisp.Env.add_alias(unquote(name), unquote(as_alias), unquote(target))]
+          else
+            []
+          end
+
+        refer_ops =
+          for sym <- refer_syms do
+            quote do: BeamLisp.Env.add_refer(unquote(name), unquote(sym), unquote(target))
+          end
+
+        {[load | loads], alias_op ++ aliases, refer_ops ++ refers}
+      end)
+
+    quote do
+      ns = unquote(name)
+      BeamLisp.Env.in_ns(ns)
+      unquote(Enum.reverse(loads))
+      unquote(block(aliases))
+      unquote(block(refers))
+      String.to_atom(ns)
+    end
+  end
 
   defp compile_special("def", [{:symbol, name}, init], env),
     do: compile_def(name, compile(init, notail(env)), env)
@@ -242,6 +296,26 @@ defmodule BeamLisp.Compiler do
   defp compile_special("if", [test, then, else_], env), do: compile_if(test, then, else_, env)
 
   defp compile_special("do", body, env), do: block_forms(body, env)
+
+  # [other.ns :as o] / [other.ns :refer [x y]] / other.ns — and both
+  # flags at once, as Clojure allows.
+  defp parse_require_spec({:symbol, target}), do: {target, nil, []}
+
+  defp parse_require_spec({:vector, [{:symbol, target} | flags]}) do
+    {as_alias, refer_syms} =
+      Enum.reduce(flags, {nil, []}, fn
+        {:keyword, "as"}, {_prev, refers} -> {{:expecting, "as"}, refers}
+        {:keyword, "refer"}, {as_alias, _prev} -> {as_alias, {:expecting, "refer"}}
+        {:symbol, a}, {{:expecting, "as"}, refers} -> {a, refers}
+        {:vector, syms}, {as_alias, {:expecting, "refer"}} ->
+          {as_alias, Enum.map(syms, fn {:symbol, s} -> s end)}
+        other, _acc -> raise "invalid :require spec for #{target}: #{inspect(other)}"
+      end)
+
+    {target, as_alias, refer_syms}
+  end
+
+  defp parse_require_spec(other), do: raise("invalid :require spec: #{inspect(other)}")
 
   # --- macros ---
 
@@ -557,25 +631,31 @@ defmodule BeamLisp.Compiler do
 
   # --- quoted builders ---
 
-  defp remote_value_quoted(name) do
-    {module, fun} = remote_target(name)
-
+  defp remote_value_quoted(module, fun) do
     quote do
       BeamLisp.RT.remote_fun(unquote(module), unquote(fun))
     end
   end
 
-  defp remote_target(name) do
-    [prefix, fun] = String.split(name, "/", parts: 2)
+  # Decide what a slash-named symbol refers to: an alias or explicit
+  # namespace (a var), or an Elixir/Erlang module (a remote call).
+  # Order: alias wins, then Elixir (uppercase), then an existing
+  # namespace, then Erlang. An ns named like an Erlang module
+  # shadows it — explicit user intent beats the heuristic.
+  defp slash_target(env, name) do
+    case String.split(name, "/", parts: 2) do
+      # `/` (and `/x`) is a var name, not a qualified reference.
+      ["" | _] ->
+        {:var, env.ns, name}
 
-    module =
-      if uppercase?(prefix) do
-        Module.concat([prefix])
-      else
-        String.to_atom(prefix)
-      end
-
-    {module, String.to_atom(fun)}
+      [prefix, fun] ->
+        cond do
+          target = Env.alias_target(env.ns, prefix) -> {:var, target, fun}
+          uppercase?(prefix) -> {:remote, Module.concat([prefix]), String.to_atom(fun)}
+          Env.ns_exists?(prefix) -> {:var, prefix, fun}
+          true -> {:remote, String.to_atom(prefix), String.to_atom(fun)}
+        end
+    end
   end
 
   defp fetch_quoted(ns, name) do
@@ -615,4 +695,5 @@ defmodule BeamLisp.Compiler do
   end
 
   defp uppercase?(<<c, _::binary>>), do: c in ?A..?Z
+  defp uppercase?(_), do: false
 end
