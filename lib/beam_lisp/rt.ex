@@ -181,9 +181,43 @@ defmodule BeamLisp.RT do
       "pr-str" => &print_str/1
     })
 
+    # Reference types: atoms, futures, promises. All plain Refs
+    # fns, so the link entries below turn call sites into direct
+    # remote calls.
+    refs_prims = %{
+      "atom" => &BeamLisp.Refs.atom/1,
+      "deref" => multi_fn(%{1 => &BeamLisp.Refs.deref/1, 3 => &BeamLisp.Refs.deref/3}),
+      "swap!" => multi_fn(%{2 => &BeamLisp.Refs.swap!/2}, {2, &BeamLisp.Refs.swap!/3}),
+      "reset!" => &BeamLisp.Refs.reset!/2,
+      "compare-and-set!" => &BeamLisp.Refs.compare_and_set!/3,
+      "promise" => &BeamLisp.Refs.promise/0,
+      "deliver" => &BeamLisp.Refs.deliver/2,
+      "future?" => &BeamLisp.Refs.future?/1,
+      "future-cancel" => &BeamLisp.Refs.future_cancel/1
+    }
+
+    prims = Map.merge(prims, refs_prims)
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
+    Env.intern("core", "future", future_macro())
     seed_links()
     :ok
+  end
+
+  # `(future body…)` → `(BeamLisp.Refs/future_exec (fn [] body…))`.
+  # Seeded from Elixir rather than the prelude (which another agent
+  # owns). The macro gets the raw arg forms as datum data and returns
+  # a form list; the compiler re-reads it, exactly as a beam-lisp
+  # defmacro would. `future_exec` is reached by slash syntax (an
+  # Elixir module) so the expansion works in any namespace.
+  defp future_macro do
+    # A macro fn is variadic (like core.bl's `[& body]` macros): the
+    # compiler passes each body form as a separate arg, and the
+    # multi_fn tag has RT.invoke collect them into one rest list.
+    {:"$macro",
+     multi_fn(%{}, {0, fn body_forms ->
+       [{:symbol, "BeamLisp.Refs/future_exec"},
+        [{:symbol, "fn"}, BeamLisp.Vector.new() | body_forms]]
+     end})}
   end
 
   # Prims link to direct calls too: operators to their :erlang BIFs,
@@ -226,6 +260,25 @@ defmodule BeamLisp.RT do
         end
 
       Env.put_link("core", name, {BeamLisp.RT, %{arity => fname}, nil})
+    end
+
+    # Reference types link to direct calls too. The trailing `!`
+    # atoms are valid Elixir; "compare-and-set!" mangles to
+    # `:compare_and_set!`.
+    ref_links = %{
+      "atom" => {BeamLisp.Refs, %{1 => :atom}, nil},
+      "deref" => {BeamLisp.Refs, %{1 => :deref, 3 => :deref}, nil},
+      "swap!" => {BeamLisp.Refs, %{2 => :swap!}, {2, :swap!}},
+      "reset!" => {BeamLisp.Refs, %{2 => :reset!}, nil},
+      "compare-and-set!" => {BeamLisp.Refs, %{3 => :compare_and_set!}, nil},
+      "promise" => {BeamLisp.Refs, %{0 => :promise}, nil},
+      "deliver" => {BeamLisp.Refs, %{2 => :deliver}, nil},
+      "future?" => {BeamLisp.Refs, %{1 => :future?}, nil},
+      "future-cancel" => {BeamLisp.Refs, %{1 => :future_cancel}, nil}
+    }
+
+    for {name, info} <- ref_links do
+      Env.put_link("core", name, info)
     end
 
     :ok

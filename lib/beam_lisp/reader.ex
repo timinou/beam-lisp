@@ -16,8 +16,9 @@ defmodule BeamLisp.Reader do
     * literals — integers, floats, strings, `nil`, `true`, `false`
 
   `'` is sugar for `(quote …)`, "`" for `(syntax-quote …)`, `~` for
-  `(unquote …)` and `~@` for `(unquote-splicing …)`. `;` starts a
-  line comment and `,` is whitespace, same as in jank and Clojure.
+  `(unquote …)`, `~@` for `(unquote-splicing …)` and `@` for
+  `(deref …)`. `;` starts a line comment and `,` is whitespace, same
+  as in jank and Clojure.
   """
 
   alias BeamLisp.Reader.SyntaxError
@@ -81,8 +82,21 @@ defmodule BeamLisp.Reader do
       [?~ | rest] ->
         quote_form(rest, "unquote")
 
+      [?@ | rest] ->
+        deref_form(rest)
+
       [?" | rest] -> string(rest, [])
       rest -> atom_form(rest)
+    end
+  end
+
+  # `@x` reads as `(deref x)`, like Clojure; `@` followed only by
+  # whitespace (or nothing) is a reader error.
+  defp deref_form(rest) do
+    case form(skip_ignored(rest)) do
+      {:ok, f, rest} -> {:ok, {:list, [{:symbol, "deref"}, f]}, rest}
+      :none -> {:error, "@ with no following form"}
+      err -> err
     end
   end
 
