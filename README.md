@@ -106,15 +106,52 @@ in ~25ms (~70× the pre-linking registry dispatch, see
 (loop [i 0] (if (< i 1000000) (recur (+ i 1)) i))
 ```
 
+The persistent vector is a 32-way bit-partitioned trie in Clojure's
+`PersistentVector` shape (`cnt`/`shift`/`root`/`tail`): `conj` is
+amortized O(1) through the tail buffer, indexed access O(log32 n),
+with path-copying persistence — building a 100k vector by `conj`
+went from 9.2s to 12ms. Vectors of 32 elements or fewer stay a raw
+element tuple, which is exactly what the compiler emits for literals
+and matches in `receive` patterns.
+
+Syntax-quote is **hygienic**: a symbol ending in `#` inside a
+backquote auto-gensyms to a unique name (`x#` → `x__42__auto`),
+stable within one backquote and distinct across separate ones, so
+macro temporaries can neither capture nor be captured by user
+locals. The prelude's own `and`/`or`/`case` were the proof cases
+— `(let [and-tmp 5] (and 1 and-tmp))` used to return `1`. Macros
+written by hand get the same guarantee from the `(gensym)` prim.
+
+And beam-lisp **tests itself**: `deftest`, `is`, `testing` and `are`
+(a port of clojure.test, written in beam-lisp in `priv/test.bl`)
+register tests that `mix beam_lisp.test` discovers under
+`test/**/*.bl`, printing a clojure.test-shaped summary and exiting
+non-zero on failure. The prelude's own suite lives in
+`test/bl/prelude_test.bl`.
+
+```console
+$ mix beam_lisp.test
+Ran 11 tests containing 50 assertions.
+0 failures, 0 errors.
+```
+
+**Atom-table safety.** beam-lisp compiles its input as trusted code,
+so symbols and keywords become real BEAM atoms — and a full atom
+table is a whole-VM abort, not a catchable exception. The reader,
+the one place every source text passes, samples the table and
+refuses input past a configurable high-water mark (default 90%),
+turning a would-be crash dump into a catchable `AtomLimitError`.
+Cost on the read path is under 1%. `docs/trust-boundary.md` has the
+full model.
+
 Deliberate gaps, roughly in priority order:
 
-- **HAMT vectors** — the tuple-backed vector is O(1) read / O(n)
-  write; fine at idiomatic sizes, swap for a HAMT if profiling
-  demands
-- **hygiene** — macros are unhygienic (no auto-gensym) for now
+- **lazy sequences** — the prelude's `map`/`filter` are strict, so
+  infinite sequences are not yet expressible
 - **AOT compilation** — `defn` links into per-namespace modules at
   runtime (`BeamLisp.Ns.*`); emitting those as compiled project
   modules for releases is the remaining step
+- **polymorphism** — no multimethods or protocols yet
 - **jank stdlib convergence** — the prelude is a slice; loading more
   of jank's `core.jank` unmodified is the long-term test of the
   dialect claim
@@ -149,6 +186,9 @@ $ mix beam_lisp.run examples/pingpong.bl  # receive: pattern-matched message pas
 $ mix beam_lisp.run examples/errors.bl    # try/catch/finally, throw, ex-info
 $ mix beam_lisp.run examples/atoms.bl     # atoms, futures, promises across processes
 $ mix beam_lisp.run examples/destructuring.bl  # map destructuring, docstrings
+$ mix beam_lisp.run examples/hygiene.bl    # auto-gensym: macros that can't capture
+$ mix beam_lisp.run examples/vectors.bl    # persistent trie vectors at scale
+$ mix beam_lisp.run examples/testing.bl    # deftest/is/run-tests in beam-lisp
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -160,7 +200,8 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 204 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, errors, refs, fidelity, examples
+$ mix test     # 254 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, errors, refs, hygiene, examples
+$ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 ```
 
 ### The MCP playground (dev only)
