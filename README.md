@@ -86,8 +86,13 @@ self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
 `range`, `zipmap`, … — itself written in beam-lisp).
 
 Evaluation compiles each form into a real module, so beam-lisp code
-runs at native speed with genuine tail-call optimization — this
-`loop` runs a million iterations of constant-stack recursion:
+runs at native speed with genuine tail-call optimization. On top of
+that, **`defn` links**: clauses become named functions in a
+per-namespace module (`BeamLisp.Ns.*`), prims link to their
+`:erlang` BIFs, and call sites compile to direct remote calls —
+this `loop` runs a million iterations of constant-stack recursion
+in ~25ms (~70× the pre-linking registry dispatch, see
+`examples/bench.bl`):
 
 ```clojure
 (loop [i 0] (if (< i 1000000) (recur (+ i 1)) i))
@@ -95,18 +100,16 @@ runs at native speed with genuine tail-call optimization — this
 
 Deliberate gaps, roughly in priority order:
 
-- **compile-to-module + var linking** — each evaluated form currently
-  becomes a throwaway module (native code, but ~50ms compile cost per
-  form and no lifecycle); AOT per-file modules and direct var linking
-  replace both that and the per-call var lookups
-- **fn-targeted `recur`** — `loop` targets only; a `fn` body is a new
-  recur scope
 - **HAMT vectors** — the tuple-backed vector is O(1) read / O(n)
   write; fine at idiomatic sizes, swap for a HAMT if profiling
   demands
 - **hygiene** — macros are unhygienic (no auto-gensym) for now
-- ~~**`receive`, `case`, `cond`**~~ — done: `case`/`cond` are
-  prelude macros; `receive` compiles to Elixir's with patterns
+- **AOT compilation** — `defn` links into per-namespace modules at
+  runtime (`BeamLisp.Ns.*`); emitting those as compiled project
+  modules for releases is the remaining step
+- **jank stdlib convergence** — the prelude is a slice; loading more
+  of jank's `core.jank` unmodified is the long-term test of the
+  dialect claim
 
 ## Relationship to jank
 
@@ -135,6 +138,7 @@ $ mix beam_lisp.run examples/macros.bl     # defmacro + syntax-quote
 $ mix beam_lisp.run examples/app.bl       # namespaces: require, alias, refer (loads geometry.bl)
 $ mix beam_lisp.run examples/control.bl   # cond/case/when/and/or: prelude macros
 $ mix beam_lisp.run examples/pingpong.bl  # receive: pattern-matched message passing
+$ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
 `processes.bl` is the point of the whole project in one file:
@@ -170,6 +174,7 @@ Layout:
 lib/beam_lisp/reader.ex     text → forms
 lib/beam_lisp/compiler.ex   forms → Elixir quoted → native modules
 lib/beam_lisp/env.ex        var registry (ETS-backed)
+lib/beam_lisp/link.ex       defn → per-ns module fns, call-site linking
 lib/beam_lisp/loader.ex     namespace file loading
 lib/beam_lisp/vector.ex     the persistent vector type
 lib/beam_lisp/rt.ex         primitives seeded into core

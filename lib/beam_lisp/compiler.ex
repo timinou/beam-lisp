@@ -149,18 +149,29 @@ defmodule BeamLisp.Compiler do
           :error ->
             arg_asts = compile_args(args, env)
 
-            if String.contains?(name, "/") do
-              case slash_target(env, name) do
-                {:var, ns, var} ->
-                  invoke_quoted(fetch_quoted(ns, var), arg_asts)
-
-                {:remote, module, fun} ->
-                  quote do
-                    apply(unquote(module), unquote(fun), unquote(arg_asts))
-                  end
+            linked =
+              case Env.link(env.ns, name) do
+                {:ok, info} -> linked_call(info, arg_asts)
+                :error -> nil
               end
-            else
-              invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
+
+            cond do
+              linked ->
+                linked
+
+              String.contains?(name, "/") ->
+                case slash_target(env, name) do
+                  {:var, ns, var} ->
+                    invoke_quoted(fetch_quoted(ns, var), arg_asts)
+
+                  {:remote, module, fun} ->
+                    quote do
+                      apply(unquote(module), unquote(fun), unquote(arg_asts))
+                    end
+                end
+
+              true ->
+                invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
             end
         end
     end
@@ -174,6 +185,29 @@ defmodule BeamLisp.Compiler do
   defp compile_args(args, env) do
     arg_env = notail(env)
     Enum.map(args, &compile(&1, arg_env))
+  end
+
+  # Direct remote call to a linked fn var: fixed arity hits the def
+  # itself; variadic splits args into fixed + a rest list for the
+  # mangled def. Returns nil when no clause matches (caller falls
+  # back to the invoke path).
+  defp linked_call({mod, fixed, variadic}, arg_asts) do
+    arity = length(arg_asts)
+
+    case fixed do
+      %{^arity => fname} ->
+        {{:., [], [mod, fname]}, [], arg_asts}
+
+      _ ->
+        case variadic do
+          {min, vfname} when arity >= min ->
+            {fargs, rargs} = Enum.split(arg_asts, min)
+            {{:., [], [mod, vfname]}, [], fargs ++ [rargs]}
+
+          _ ->
+            nil
+        end
+    end
   end
 
   # --- special forms ---
@@ -243,7 +277,7 @@ defmodule BeamLisp.Compiler do
         rest -> rest
       end
 
-    compile_def(name, compile_fn(fn_clauses(rest), env), env)
+    compile_defn(name, fn_clauses(rest), env)
   end
 
   # A macro is a fn stored under a tag; calls to it expand at
@@ -286,15 +320,24 @@ defmodule BeamLisp.Compiler do
       nil ->
         raise "recur used with no enclosing loop or fn"
 
-      %{self: self, arity: arity} ->
+      %{arity: arity} = target ->
         unless env.tail, do: raise("recur must be in tail position")
 
         unless length(args) == arity,
           do: raise("recur arity mismatch: target takes #{arity}, got #{length(args)}")
 
         arg_asts = Enum.map(args, &compile(&1, notail(env)))
-        self_app = {{:., [], [self]}, [], [self]}
-        {{:., [], [self_app]}, [], arg_asts}
+
+        case target do
+          # Anonymous fn / loop: re-enter via self-application.
+          %{self: self} ->
+            self_app = {{:., [], [self]}, [], [self]}
+            {{:., [], [self_app]}, [], arg_asts}
+
+          # Linked defn: a named self-call, TCO'd like any tail call.
+          %{self_call: {mod, fname}} ->
+            {{:., [], [mod, fname]}, [], arg_asts}
+        end
     end
   end
 
@@ -393,6 +436,35 @@ defmodule BeamLisp.Compiler do
     do: {[lit], env}
 
   defp compile_pattern(other, _env), do: raise("unsupported receive pattern: #{inspect(other)}")
+
+  # A defn links: its clauses become named defs in the namespace
+  # module (variadic under a mangled name, rest as the last param),
+  # the var's value is a capture, and later call sites compile to
+  # direct remote calls. See BeamLisp.Link.
+  defp compile_defn(name, clauses, env) do
+    mod = BeamLisp.Link.module_for(env.ns)
+
+    entries =
+      Enum.map(clauses, fn {params, body} ->
+        {_fixed, rest} = split_variadic(params)
+
+        {kind, fname} =
+          case rest do
+            nil -> {:fixed, String.to_atom(name)}
+            _ -> {:variadic, String.to_atom(name <> "__bl_v")}
+          end
+
+        {head_vars, body_ast, fixed_count, _v?} =
+          compile_clause(env, params, body, %{self_call: {mod, fname}})
+
+        def_ast = {:def, [], [{fname, [], head_vars}, [do: body_ast]]}
+        {kind, fixed_count, fname, def_ast}
+      end)
+
+    quote do
+      BeamLisp.Link.defvar(unquote(env.ns), unquote(name), unquote(Macro.escape(entries)))
+    end
+  end
 
   # [other.ns :as o] / [other.ns :refer [x y]] / other.ns — and both
   # flags at once, as Clojure allows.
@@ -552,27 +624,14 @@ defmodule BeamLisp.Compiler do
   defp compile_fn(clauses, env) do
     compiled =
       Enum.map(clauses, fn {params, body} ->
-        {fixed, rest} = split_variadic(params)
-        {head_vars, preludes, clause_env} = bind_params(env, fixed)
-
-        {head_vars, clause_env} =
-          case rest do
-            nil ->
-              {head_vars, clause_env}
-
-            {:symbol, name} ->
-              rest_var = fresh_var(name)
-              {head_vars ++ [rest_var], put_local(clause_env, name, rest_var)}
-          end
-
         self = fresh_var("fnself")
-        fn_env = %{clause_env | recur: %{self: self, arity: length(head_vars)}, tail: true}
-        body_ast = block(preludes ++ [block_forms(body, fn_env)])
+        {head_vars, body_ast, fixed_count, variadic?} = compile_clause(env, params, body, %{self: self})
         fn_ast = self_apply(self, {:fn, [], [{:->, [], [head_vars, body_ast]}]})
 
-        case rest do
-          nil -> {:fixed, length(fixed), fn_ast}
-          _ -> {:variadic, length(fixed), fn_ast}
+        if variadic? do
+          {:variadic, fixed_count, fn_ast}
+        else
+          {:fixed, fixed_count, fn_ast}
         end
       end)
 
@@ -602,6 +661,31 @@ defmodule BeamLisp.Compiler do
   defp self_apply(self, inner_fn) do
     outer_fn = {:fn, [], [{:->, [], [[self], inner_fn]}]}
     {{:., [], [outer_fn]}, [], [outer_fn]}
+  end
+
+  # Compile one `{params, body}` fn clause. Returns
+  # `{head_vars, body_ast, fixed_param_count, variadic?}`; the
+  # caller picks the recur target via `recur_spec` (`%{self: var}`
+  # for anonymous fns, `%{self_call: {mod, fname}}` for linked
+  # defns) and decides how to wrap the result.
+  defp compile_clause(env, params, body, recur_spec) do
+    {fixed, rest} = split_variadic(params)
+    {head_vars, preludes, clause_env} = bind_params(env, fixed)
+
+    {head_vars, clause_env} =
+      case rest do
+        nil ->
+          {head_vars, clause_env}
+
+        {:symbol, name} ->
+          rest_var = fresh_var(name)
+          {head_vars ++ [rest_var], put_local(clause_env, name, rest_var)}
+      end
+
+    recur = Map.put(recur_spec, :arity, length(head_vars))
+    fn_env = %{clause_env | recur: recur, tail: true}
+    body_ast = block(preludes ++ [block_forms(body, fn_env)])
+    {head_vars, body_ast, length(fixed), rest != nil}
   end
 
   defp split_variadic(params) do

@@ -115,6 +115,8 @@ defmodule BeamLisp.RT do
 
   def print_str(x), do: inspect(x)
 
+  def println(x), do: IO.puts(print_str(x))
+
   # Inside a collection, strings print readably; at the top level
   # (println, pr-str of a bare string) they print raw.
   defp print_elem(x) when is_binary(x), do: inspect(x)
@@ -175,11 +177,57 @@ defmodule BeamLisp.RT do
       "empty?" => &empty?/1,
       "get" => &get/3,
       "apply" => &apply_to/2,
-      "println" => fn x -> IO.puts(print_str(x)) end,
+      "println" => &println/1,
       "pr-str" => &print_str/1
     })
 
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
+    seed_links()
+    :ok
+  end
+
+  # Prims link to direct calls too: operators to their :erlang BIFs,
+  # seq fns to BeamLisp.RT. Only arities whose semantics match
+  # exactly get linked — everything else falls back to invoke.
+  defp seed_links do
+    bif2 = [:+, :-, :*, :/, :<, :>, :<=, :>=, :==]
+
+    for op <- bif2 do
+      Env.put_link("core", to_string(op), {:erlang, %{2 => op}, nil})
+    end
+
+    # Unary + - * are identity/negate on the BIFs; (= x) and friends
+    # stay invoke (chain semantics).
+    Env.put_link("core", "+", {:erlang, %{1 => :+, 2 => :+}, nil})
+    Env.put_link("core", "-", {:erlang, %{1 => :-, 2 => :-}, nil})
+    Env.put_link("core", "*", {:erlang, %{1 => :*, 2 => :*}, nil})
+    Env.put_link("core", "=", {:erlang, %{2 => :==}, nil})
+
+    rt_fns = %{
+      "first" => 1,
+      "rest" => 1,
+      "cons" => 2,
+      "conj" => 2,
+      "count" => 1,
+      "empty?" => 1,
+      "get" => 3,
+      "nth" => 2,
+      "drop" => 2,
+      "apply" => :apply_to,
+      "println" => 1,
+      "pr-str" => :print_str
+    }
+
+    for {name, spec} <- rt_fns do
+      {fname, arity} =
+        case spec do
+          a when is_atom(a) -> {a, 2}
+          n when is_integer(n) -> {String.to_atom(name), n}
+        end
+
+      Env.put_link("core", name, {BeamLisp.RT, %{arity => fname}, nil})
+    end
+
     :ok
   end
 end

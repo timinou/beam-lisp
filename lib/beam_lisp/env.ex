@@ -105,6 +105,45 @@ defmodule BeamLisp.Env do
   def loaded_ns?(ns), do: Agent.get(__MODULE__, &MapSet.member?(&1.loaded, ns))
   def mark_loaded(ns), do: Agent.update(__MODULE__, &%{&1 | loaded: MapSet.put(&1.loaded, ns)})
 
+  # --- var linking (BeamLisp.Link) ---
+  # fn vars also live as named functions in a per-ns module; the
+  # registry below lets call sites compile to direct remote calls.
+
+  @doc "The def entries `{name => [{kind, arity, fname, def_ast}]}` backing ns's module."
+  def ns_defs(ns) do
+    case :ets.lookup(@table, {:ns_defs, ns}) do
+      [{_, defs}] -> defs
+      [] -> %{}
+    end
+  end
+
+  def put_ns_defs(ns, defs), do: :ets.insert(@table, {{:ns_defs, ns}, defs})
+
+  @doc "Register link metadata `{module, %{arity => fname}, {min, vfname} | nil}` for a fn var."
+  def put_link(ns, name, info), do: :ets.insert(@table, {{:link, ns, name}, info})
+
+  @doc "Resolve link metadata with the same alias/refer/core rules as fetch/2."
+  def link(ns, name) do
+    candidates =
+      case String.split(name, "/", parts: 2) do
+        ["" | _] ->
+          [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}]
+
+        [prefix, var_name] ->
+          [{alias_target(ns, prefix) || prefix, var_name}]
+
+        [plain] ->
+          [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}]
+      end
+
+    Enum.find_value(candidates, :error, fn {cns, cname} ->
+      case :ets.lookup(@table, {:link, cns, cname}) do
+        [{_, info}] -> {:ok, info}
+        [] -> nil
+      end
+    end)
+  end
+
   @doc "Directories the loader searches for `<ns>.bl` files, innermost first."
   def load_paths, do: Agent.get(__MODULE__, & &1.load_paths)
 
