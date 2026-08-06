@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote)
+  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote receive)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -302,6 +302,97 @@ defmodule BeamLisp.Compiler do
   defp compile_special("if", [test, then, else_], env), do: compile_if(test, then, else_, env)
 
   defp compile_special("do", body, env), do: block_forms(body, env)
+
+  # (receive pattern body… (after ms body…)) — Elixir's receive,
+  # with beam-lisp pattern syntax: literals and keywords match
+  # themselves, symbols bind, [p q] is a 2-or-more-tuple, {:k p} a
+  # map match. Clause bodies see their pattern's bindings.
+  defp compile_special("receive", clauses, env) do
+    {after_clauses, normal} =
+      Enum.split_with(clauses, &match?({:list, [{:symbol, "after"} | _]}, &1))
+
+    pairs = Enum.chunk_every(normal, 2)
+
+    unless Enum.all?(pairs, &(length(&1) == 2)) do
+      raise "receive clauses must be pattern/body pairs"
+    end
+
+    do_clauses =
+      Enum.flat_map(pairs, fn [pattern_form, body] ->
+        {pat_asts, pat_env} = compile_pattern(pattern_form, env)
+        body_ast = compile(body, pat_env)
+        Enum.map(pat_asts, &{:->, [], [[&1], body_ast]})
+      end)
+
+    block =
+      case after_clauses do
+        [] ->
+          [do: do_clauses]
+
+        [{:list, [{:symbol, "after"}, timeout, body]}] ->
+          after_clause = {:->, [], [[compile(timeout, notail(env))], compile(body, env)]}
+          [do: do_clauses, after: [after_clause]]
+
+        _ ->
+          raise "receive takes at most one (after ms body) clause"
+      end
+
+    {:receive, [], [block]}
+  end
+
+  # A receive pattern, compiled with its bindings added to the env.
+  # Returns one or more pattern ASTs (a vector pattern matches both
+  # Erlang tuples and beam-lisp vectors — one clause each).
+  defp compile_pattern({:symbol, "_"}, env), do: {[{:_, [], __MODULE__}], env}
+
+  defp compile_pattern({:symbol, name}, env) do
+    var = fresh_var(name)
+    {[var], put_local(env, name, var)}
+  end
+
+  defp compile_pattern({:keyword, name}, env), do: {[String.to_atom(name)], env}
+
+  defp compile_pattern({:vector, items}, env) do
+    {pats, env} =
+      Enum.map_reduce(items, env, fn item, acc_env ->
+        {[pat], acc_env} = compile_pattern(item, acc_env)
+        {pat, acc_env}
+      end)
+
+    tuple_pat = {:{}, [], pats}
+
+    vector_pat =
+      {:%, [],
+       [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_pat]}]}
+
+    {[tuple_pat, vector_pat], env}
+  end
+
+  defp compile_pattern({:map, kvs}, env) do
+    {pairs, env} =
+      Enum.map_reduce(kvs, env, fn {k, v}, acc_env ->
+        key =
+          case k do
+            {:keyword, name} -> String.to_atom(name)
+            lit when is_number(lit) or is_binary(lit) -> lit
+            other -> raise "unsupported map pattern key: #{inspect(other)}"
+          end
+
+        {[pat], acc_env} = compile_pattern(v, acc_env)
+        {{key, pat}, acc_env}
+      end)
+
+    {[{:%{}, [], pairs}], env}
+  end
+
+  defp compile_pattern({:list, [{:symbol, "quote"}, form]}, env) do
+    {[Macro.escape(datum(form))], env}
+  end
+
+  defp compile_pattern(lit, env) when is_number(lit) or is_binary(lit) or is_boolean(lit) or is_nil(lit),
+    do: {[lit], env}
+
+  defp compile_pattern(other, _env), do: raise("unsupported receive pattern: #{inspect(other)}")
 
   # [other.ns :as o] / [other.ns :refer [x y]] / other.ns — and both
   # flags at once, as Clojure allows.

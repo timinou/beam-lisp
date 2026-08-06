@@ -76,8 +76,11 @@ path, alias resolution through macros too), `def`, `fn`
 multi-arity and docstrings), **`defmacro` with syntax-quote** (` ` ,
 `~`, `~@`), `let` and `loop` with full Clojure-style destructuring
 (`[a b & rest]`, `{:keys [a b] :as m}` — lenient, like Clojure),
-`recur` with compile-time tail-position checking, `if`, `do`,
-`quote`, keywords-as-functions, variadic arithmetic and comparisons
+`recur` with compile-time tail-position checking (loops and fns
+are both targets), `if`, `do`, `quote`, **`receive` with patterns**
+(keywords match themselves, symbols bind, `[p q]` matches tuples
+*and* vectors, `{:k p}` matches maps, `(after ms …)`),
+keywords-as-functions, variadic arithmetic and comparisons
 (`(< 1 2 3)` chains, as Clojure), full Elixir/Erlang interop, and a
 self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
 `range`, `zipmap`, … — itself written in beam-lisp).
@@ -102,8 +105,8 @@ Deliberate gaps, roughly in priority order:
   write; fine at idiomatic sizes, swap for a HAMT if profiling
   demands
 - **hygiene** — macros are unhygienic (no auto-gensym) for now
-- **`receive`, `case`, `cond`** — `case`/`cond` are macros waiting to
-  be written in beam-lisp itself; `receive` wants pattern clauses
+- ~~**`receive`, `case`, `cond`**~~ — done: `case`/`cond` are
+  prelude macros; `receive` compiles to Elixir's with patterns
 
 ## Relationship to jank
 
@@ -130,6 +133,8 @@ $ mix beam_lisp.run examples/interop.bl    # Elixir/Erlang interop
 $ mix beam_lisp.run examples/processes.bl  # Task/Agent/spawn: OTP from beam-lisp
 $ mix beam_lisp.run examples/macros.bl     # defmacro + syntax-quote
 $ mix beam_lisp.run examples/app.bl       # namespaces: require, alias, refer (loads geometry.bl)
+$ mix beam_lisp.run examples/control.bl   # cond/case/when/and/or: prelude macros
+$ mix beam_lisp.run examples/pingpong.bl  # receive: pattern-matched message passing
 ```
 
 `processes.bl` is the point of the whole project in one file:
@@ -140,7 +145,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 109 tests: reader, compiler, prelude, vectors, macros, namespaces, examples
+$ mix test     # 118 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, examples
 ```
 
 ### The MCP playground (dev only)

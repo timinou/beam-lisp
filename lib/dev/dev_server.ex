@@ -1,4 +1,8 @@
-defmodule BeamLisp.DevServer do
+# Dev-only: Tidewave/Plug exist only in :dev deps, so compile the
+# module only when they are loadable (mix.exs also gates lib/dev via
+# elixirc_paths, belt and suspenders).
+if Code.ensure_loaded?(Plug.Conn) do
+  defmodule BeamLisp.DevServer do
   @moduledoc """
   Dev-only HTTP endpoint. Its whole job is hosting Tidewave's MCP
   tools (`project_eval`, docs, source lookup) against the running
@@ -30,3 +34,4 @@ defmodule BeamLisp.DevServer do
   end
 end
 
+end
