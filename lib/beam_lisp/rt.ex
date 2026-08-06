@@ -215,26 +215,8 @@ defmodule BeamLisp.RT do
 
     prims = Map.merge(prims, refs_prims)
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
-    Env.intern("core", "future", future_macro())
     seed_links()
     :ok
-  end
-
-  # `(future body…)` → `(BeamLisp.Refs/future_exec (fn [] body…))`.
-  # Seeded from Elixir rather than the prelude (which another agent
-  # owns). The macro gets the raw arg forms as datum data and returns
-  # a form list; the compiler re-reads it, exactly as a beam-lisp
-  # defmacro would. `future_exec` is reached by slash syntax (an
-  # Elixir module) so the expansion works in any namespace.
-  defp future_macro do
-    # A macro fn is variadic (like core.bl's `[& body]` macros): the
-    # compiler passes each body form as a separate arg, and the
-    # multi_fn tag has RT.invoke collect them into one rest list.
-    {:"$macro",
-     multi_fn(%{}, {0, fn body_forms ->
-       [{:symbol, "BeamLisp.Refs/future_exec"},
-        [{:symbol, "fn"}, BeamLisp.Vector.new() | body_forms]]
-     end})}
   end
 
   # Prims link to direct calls too: operators to their :erlang BIFs,
