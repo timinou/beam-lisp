@@ -306,7 +306,14 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp compile_special("syntax-quote", [form], env), do: synq_data(form, env)
+  # Thread a per-syntax-quote-form gensym map through synq so a `x#`
+  # symbol is renamed once and reuses that name everywhere inside one
+  # backquote — the auto-gensym that makes macros hygienic. Unquoted
+  # (~ ~@) code compiles normally and never consults the map.
+  defp compile_special("syntax-quote", [form], env) do
+    {ast, _gensyms} = synq_data(form, env, %{})
+    ast
+  end
 
   defp compile_special("let", [{:vector, bindings} | body], env) do
     {steps, final_env} = compile_bindings(bindings, notail(env))
@@ -735,36 +742,80 @@ defmodule BeamLisp.Compiler do
   # --- syntax-quote ---
 
   # Emits AST that *builds* the datum at runtime, with ~ and ~@
-  # punching holes back into evaluated code.
-  defp synq_data({:list, [{:symbol, "unquote"}, x]}, env), do: compile(x, notail(env))
+  # punching holes back into evaluated code. The third arg is the
+  # per-syntax-quote gensym map; every clause passes it back so a
+  # `x#` rename seen in an earlier sibling is visible to later ones.
+  defp synq_data({:list, [{:symbol, "unquote"}, x]}, env, g),
+    do: {compile(x, notail(env)), g}
 
-  defp synq_data({:list, [{:symbol, "unquote-splicing"}, _]}, _env),
+  defp synq_data({:list, [{:symbol, "unquote-splicing"}, _]}, _env, _g),
     do: raise("~@ is only valid inside a syntax-quoted list or vector")
 
-  defp synq_data({:list, items}, env), do: synq_list(items, env)
+  # A nested syntax-quote gets its own fresh map: its `#` symbols must
+  # not collide with the enclosing quote's gensyms.
+  defp synq_data({:list, [{:symbol, "syntax-quote"}, inner]}, env, g) do
+    {inner_ast, _} = synq_data(inner, env, %{})
+    {[{:|, [], [{:symbol, "syntax-quote"}, [{:|, [], [inner_ast, []]}]]}], g}
+  end
 
-  defp synq_data({:vector, items}, env) do
-    quote do
-      BeamLisp.Vector.new(unquote(synq_list(items, env)))
+  defp synq_data({:list, items}, env, g), do: synq_list(items, env, g)
+
+  defp synq_data({:vector, items}, env, g) do
+    {items_ast, g2} = synq_list(items, env, g)
+
+    {quote do
+       BeamLisp.Vector.new(unquote(items_ast))
+     end, g2}
+  end
+
+  defp synq_data({:map, kvs}, env, g) do
+    {pairs, g2} =
+      Enum.reduce(kvs, {[], g}, fn {k, v}, {acc, gacc} ->
+        {kast, g1} = synq_data(k, env, gacc)
+        {vast, g2} = synq_data(v, env, g1)
+        {[{kast, vast} | acc], g2}
+      end)
+
+    {{:%{}, [], Enum.reverse(pairs)}, g2}
+  end
+
+  defp synq_data({:symbol, name}, _env, g) do
+    {resolved, g2} = resolve_gensym(name, g)
+    {Macro.escape({:symbol, resolved}), g2}
+  end
+
+  defp synq_data({:keyword, name}, _env, g), do: {String.to_atom(name), g}
+  defp synq_data(lit, _env, g), do: {lit, g}
+
+  defp synq_list(items, env, g) do
+    Enum.reduce(Enum.reverse(items), {[], g}, fn
+      {:list, [{:symbol, "unquote-splicing"}, x]}, {acc, gacc} ->
+        {{:++, [], [compile(x, notail(env)), acc]}, gacc}
+
+      item, {acc, gacc} ->
+        {item_ast, g2} = synq_data(item, env, gacc)
+        {[{:|, [], [item_ast, acc]}], g2}
+    end)
+  end
+
+  # `x#` (longer than one char) auto-gensyms to `x__N__auto`, stably
+  # within one syntax-quote. A `#` anywhere else in a symbol is kept.
+  defp resolve_gensym(name, g) do
+    if gensym?(name) do
+      case Map.fetch(g, name) do
+        {:ok, gen} -> {gen, g}
+        :error -> gen = gensym_name(name); {gen, Map.put(g, name, gen)}
+      end
+    else
+      {name, g}
     end
   end
 
-  defp synq_data({:map, kvs}, env) do
-    {:%{}, [], Enum.map(kvs, fn {k, v} -> {synq_data(k, env), synq_data(v, env)} end)}
-  end
+  defp gensym?(name), do: byte_size(name) > 1 and String.ends_with?(name, "#")
 
-  defp synq_data({:symbol, name}, _env), do: Macro.escape({:symbol, name})
-  defp synq_data({:keyword, name}, _env), do: String.to_atom(name)
-  defp synq_data(lit, _env), do: lit
-
-  defp synq_list(items, env) do
-    Enum.reduce(Enum.reverse(items), [], fn
-      {:list, [{:symbol, "unquote-splicing"}, x]}, acc ->
-        {:++, [], [compile(x, notail(env)), acc]}
-
-      item, acc ->
-        [{:|, [], [synq_data(item, env), acc]}]
-    end)
+  defp gensym_name(name) do
+    base = binary_part(name, 0, byte_size(name) - 1)
+    base <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"
   end
 
   # --- special form helpers ---

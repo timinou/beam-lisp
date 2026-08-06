@@ -148,6 +148,15 @@ defmodule BeamLisp.RT do
   defp to_str(x) when is_atom(x), do: Atom.to_string(x)
   defp to_str(x), do: to_string(x)
 
+  # Fresh, collision-proof symbol datum for hand-written macros. Shares
+  # the `__N__auto` shape with syntax-quote `x#` auto-gensyms.
+  def gensym(), do: gensym("G")
+
+  def gensym(prefix) when is_binary(prefix) do
+    {:symbol,
+     prefix <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"}
+  end
+
   @doc "Seed `core` with the primitives the prelude and interop need."
   def seed_core do
     # Clojure arithmetic is variadic: (+ 1 2 3), (*) → 1, (- 5) → -5.
@@ -194,7 +203,8 @@ defmodule BeamLisp.RT do
       "get" => &get/3,
       "apply" => &apply_to/2,
       "println" => &println/1,
-      "pr-str" => &print_str/1
+      "pr-str" => &print_str/1,
+      "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1})
     })
 
     # Reference types: atoms, futures, promises. All plain Refs
@@ -261,6 +271,9 @@ defmodule BeamLisp.RT do
 
       Env.put_link("core", name, {BeamLisp.RT, %{arity => fname}, nil})
     end
+
+    # gensym links both arities directly — plain name, no mangling.
+    Env.put_link("core", "gensym", {BeamLisp.RT, %{0 => :gensym, 1 => :gensym}, nil})
 
     # Reference types link to direct calls too. The trailing `!`
     # atoms are valid Elixir; "compare-and-set!" mangles to
