@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(def fn defn let loop recur if do quote)
+  @special_forms ~w(def fn defn defmacro let loop recur if do quote syntax-quote)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -84,7 +84,10 @@ defmodule BeamLisp.Compiler do
 
   def compile({:keyword, name}, _env), do: String.to_atom(name)
 
-  def compile({:vector, items}, env), do: Enum.map(items, &compile(&1, notail(env)))
+  def compile({:vector, items}, env) do
+    tuple_ast = {:{}, [], Enum.map(items, &compile(&1, notail(env)))}
+    {:%, [], [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_ast]}]}
+  end
 
   def compile({:map, kvs}, env) do
     {:%{}, [], Enum.map(kvs, fn {k, v} -> {compile(k, notail(env)), compile(v, notail(env))} end)}
@@ -137,7 +140,13 @@ defmodule BeamLisp.Compiler do
         end
 
       true ->
-        invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
+        case macro_for(env.ns, name) do
+          {:ok, macro_fn} ->
+            compile(expand_macro(macro_fn, args), env)
+
+          :error ->
+            invoke_quoted(fetch_quoted(env.ns, name), arg_asts)
+        end
     end
   end
 
@@ -175,6 +184,20 @@ defmodule BeamLisp.Compiler do
 
     compile_def(name, compile_fn(fn_clauses(rest), env), env)
   end
+
+  # A macro is a fn stored under a tag; calls to it expand at
+  # compile time (see macro_for/expand_macro below).
+  defp compile_special("defmacro", [{:symbol, name} | rest], env) do
+    rest =
+      case rest do
+        [doc | rest] when is_binary(doc) -> rest
+        rest -> rest
+      end
+
+    compile_def(name, {:{}, [], [:"$macro", compile_fn(fn_clauses(rest), env)]}, env)
+  end
+
+  defp compile_special("syntax-quote", [form], env), do: synq_data(form, env)
 
   defp compile_special("let", [{:vector, bindings} | body], env) do
     {steps, final_env} = compile_bindings(bindings, notail(env))
@@ -219,6 +242,80 @@ defmodule BeamLisp.Compiler do
   defp compile_special("if", [test, then, else_], env), do: compile_if(test, then, else_, env)
 
   defp compile_special("do", body, env), do: block_forms(body, env)
+
+  # --- macros ---
+
+  # Macros resolve at compile time against the live registry, so a
+  # defmacro must precede its callers in the same session.
+  defp macro_for(ns, name) do
+    case Env.fetch(ns, name) do
+      {:ok, {:"$macro", m}} -> {:ok, m}
+      _ -> :error
+    end
+  end
+
+  # Call the macro with the *unevaluated* argument forms as data,
+  # then reinterpret the data it returns as a form to compile.
+  # Vectors-as-data round-trip as `%BeamLisp.Vector{}`, which is why
+  # macros needed a real vector type: `(fn [x] …)` and `[x]` must
+  # not collapse into each other.
+  defp expand_macro(macro_fn, args) do
+    args
+    |> Enum.map(&datum/1)
+    |> then(&BeamLisp.RT.invoke(macro_fn, &1))
+    |> data_to_form()
+  end
+
+  defp data_to_form({:symbol, _name} = sym), do: sym
+
+  defp data_to_form(%BeamLisp.Vector{} = v),
+    do: {:vector, Enum.map(BeamLisp.Vector.to_list(v), &data_to_form/1)}
+
+  defp data_to_form(items) when is_list(items),
+    do: {:list, Enum.map(items, &data_to_form/1)}
+
+  defp data_to_form(m) when is_map(m),
+    do: {:map, Enum.map(m, fn {k, v} -> {data_to_form(k), data_to_form(v)} end)}
+
+  defp data_to_form(a) when is_atom(a) and a not in [nil, true, false],
+    do: {:keyword, Atom.to_string(a)}
+
+  defp data_to_form(lit), do: lit
+
+  # --- syntax-quote ---
+
+  # Emits AST that *builds* the datum at runtime, with ~ and ~@
+  # punching holes back into evaluated code.
+  defp synq_data({:list, [{:symbol, "unquote"}, x]}, env), do: compile(x, notail(env))
+
+  defp synq_data({:list, [{:symbol, "unquote-splicing"}, _]}, _env),
+    do: raise("~@ is only valid inside a syntax-quoted list or vector")
+
+  defp synq_data({:list, items}, env), do: synq_list(items, env)
+
+  defp synq_data({:vector, items}, env) do
+    quote do
+      BeamLisp.Vector.new(unquote(synq_list(items, env)))
+    end
+  end
+
+  defp synq_data({:map, kvs}, env) do
+    {:%{}, [], Enum.map(kvs, fn {k, v} -> {synq_data(k, env), synq_data(v, env)} end)}
+  end
+
+  defp synq_data({:symbol, name}, _env), do: Macro.escape({:symbol, name})
+  defp synq_data({:keyword, name}, _env), do: String.to_atom(name)
+  defp synq_data(lit, _env), do: lit
+
+  defp synq_list(items, env) do
+    Enum.reduce(Enum.reverse(items), [], fn
+      {:list, [{:symbol, "unquote-splicing"}, x]}, acc ->
+        {:++, [], [compile(x, notail(env)), acc]}
+
+      item, acc ->
+        [{:|, [], [synq_data(item, env), acc]}]
+    end)
+  end
 
   # --- special form helpers ---
 
@@ -454,7 +551,7 @@ defmodule BeamLisp.Compiler do
   defp datum({:symbol, name}), do: {:symbol, name}
   defp datum({:keyword, name}), do: String.to_atom(name)
   defp datum({:list, items}), do: Enum.map(items, &datum/1)
-  defp datum({:vector, items}), do: Enum.map(items, &datum/1)
+  defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {datum(k), datum(v)} end)
   defp datum(lit), do: lit
 

@@ -68,14 +68,16 @@ user=> (map inc (lists/seq 1 5))
 
 ## Language status
 
-Supported today: literals, `def`, `fn` (incl. multi-clause and
-variadic `& rest`), `defn` (incl. multi-arity and docstrings), `let`
-and `loop` with full Clojure-style destructuring (`[a b & rest]`,
-`{:keys [a b] :as m}` — lenient, like Clojure), `recur` with
-compile-time tail-position checking, `if`, `do`, `quote`,
-keywords-as-functions, full Elixir/Erlang interop, and a self-hosted
-prelude (`priv/core.bl`: `map`, `filter`, `reduce`, `range`,
-`zipmap`, … — itself written in beam-lisp).
+Supported today: literals, first-class persistent vectors (distinct
+from lists, `Enumerable` for `Enum` interop), maps, `def`, `fn`
+(incl. multi-clause and variadic `& rest`), `defn` (incl.
+multi-arity and docstrings), **`defmacro` with syntax-quote** (` ` ,
+`~`, `~@`), `let` and `loop` with full Clojure-style destructuring
+(`[a b & rest]`, `{:keys [a b] :as m}` — lenient, like Clojure),
+`recur` with compile-time tail-position checking, `if`, `do`,
+`quote`, keywords-as-functions, full Elixir/Erlang interop, and a
+self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
+`range`, `zipmap`, … — itself written in beam-lisp).
 
 Evaluation compiles each form into a real module, so beam-lisp code
 runs at native speed with genuine tail-call optimization — this
@@ -87,12 +89,6 @@ runs at native speed with genuine tail-call optimization — this
 
 Deliberate gaps, roughly in priority order:
 
-- **persistent vectors** — vectors currently compile to Elixir lists;
-  semantics are seq-correct but not vector-correct. This blocks
-  `defmacro` (macro output is data reinterpreted as forms, so lists
-  and vectors must be distinct types)
-- **`defmacro` + syntax-quote** — the compiler already round-trips
-  forms as data, so this is additive once vectors exist
 - **namespaces** — currently a flat `core`/`user` split with `core`
   fallback
 - **compile-to-module + var linking** — each evaluated form currently
@@ -101,6 +97,12 @@ Deliberate gaps, roughly in priority order:
   replace both that and the per-call var lookups
 - **fn-targeted `recur`** — `loop` targets only; a `fn` body is a new
   recur scope
+- **HAMT vectors** — the tuple-backed vector is O(1) read / O(n)
+  write; fine at idiomatic sizes, swap for a HAMT if profiling
+  demands
+- **hygiene** — macros are unhygienic (no auto-gensym) for now
+- **`receive`, `case`, `cond`** — `case`/`cond` are macros waiting to
+  be written in beam-lisp itself; `receive` wants pattern clauses
 
 ## Relationship to jank
 
@@ -117,18 +119,36 @@ code would not be BEAM bytecode, and a jank segfault would take the
 node down. That's embedding, not nativeness; the compiler route above
 is what makes beam-lisp *of* the BEAM.
 
+## Examples
+
+Runnable, and guarded by the test suite so they can't rot:
+
+```console
+$ mix beam_lisp.run examples/hello.bl      # language tour
+$ mix beam_lisp.run examples/interop.bl    # Elixir/Erlang interop
+$ mix beam_lisp.run examples/processes.bl  # Task/Agent/spawn: OTP from beam-lisp
+$ mix beam_lisp.run examples/macros.bl     # defmacro + syntax-quote
+```
+
+`processes.bl` is the point of the whole project in one file:
+`Task/async` takes a beam-lisp `(fn [] …)` because that fn *is* an
+Elixir fun — two million-iteration loops run as real BEAM processes,
+concurrently, with `Task/await` joining them.
+
 ## Development
 
 ```console
-$ mix test     # 59 tests: reader, compiler, prelude, loop/destructure/variadic
+$ mix test     # 82 tests: reader, compiler, prelude, vectors, macros, examples
 ```
 
 Layout:
 
 ```
 lib/beam_lisp/reader.ex     text → forms
-lib/beam_lisp/compiler.ex   forms → Elixir quoted
-lib/beam_lisp/env.ex        var registry (the namespace state)
+lib/beam_lisp/compiler.ex   forms → Elixir quoted → native modules
+lib/beam_lisp/env.ex        var registry (ETS-backed)
+lib/beam_lisp/vector.ex     the persistent vector type
 lib/beam_lisp/rt.ex         primitives seeded into core
 priv/core.bl                self-hosted prelude, jank-flavored
+examples/                   executable documentation
 ```

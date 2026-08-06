@@ -15,8 +15,9 @@ defmodule BeamLisp.Reader do
     * `{:map, [{k, v}]}` — `{:a 1}`
     * literals — integers, floats, strings, `nil`, `true`, `false`
 
-  `'` is sugar for `(quote …)`, `;` starts a line comment and `,` is
-  whitespace, same as in jank and Clojure.
+  `'` is sugar for `(quote …)`, "`" for `(syntax-quote …)`, `~` for
+  `(unquote …)` and `~@` for `(unquote-splicing …)`. `;` starts a
+  line comment and `,` is whitespace, same as in jank and Clojure.
   """
 
   alias BeamLisp.Reader.SyntaxError
@@ -69,14 +70,27 @@ defmodule BeamLisp.Reader do
       [?] | _] -> {:error, "unexpected ]"}
       [?} | _] -> {:error, "unexpected }"}
       [?' | rest] ->
-        case form(skip_ignored(rest)) do
-          {:ok, f, rest} -> {:ok, {:list, [{:symbol, "quote"}, f]}, rest}
-          :none -> {:error, "quote with no following form"}
-          err -> err
-        end
+        quote_form(rest, "quote")
+
+      [?` | rest] ->
+        quote_form(rest, "syntax-quote")
+
+      [?~, ?@ | rest] ->
+        quote_form(rest, "unquote-splicing")
+
+      [?~ | rest] ->
+        quote_form(rest, "unquote")
 
       [?" | rest] -> string(rest, [])
       rest -> atom_form(rest)
+    end
+  end
+
+  defp quote_form(rest, name) do
+    case form(skip_ignored(rest)) do
+      {:ok, f, rest} -> {:ok, {:list, [{:symbol, name}, f]}, rest}
+      :none -> {:error, "#{name} with no following form"}
+      err -> err
     end
   end
 

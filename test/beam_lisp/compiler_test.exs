@@ -18,8 +18,8 @@ defmodule BeamLisp.CompilerTest do
   end
 
   test "collections" do
-    assert eval("[1 2 3]") == [1, 2, 3]
-    assert eval("[(+ 1 1) (+ 2 2)]") == [2, 4]
+    assert eval("[1 2 3]") == BeamLisp.Vector.new([1, 2, 3])
+    assert eval("[(+ 1 1) (+ 2 2)]") == BeamLisp.Vector.new([2, 4])
     assert eval("{:a 1}") == %{a: 1}
   end
 
@@ -98,7 +98,7 @@ defmodule BeamLisp.CompilerTest do
   end
 
   test "erlang interop: lowercase prefix is an Erlang module" do
-    assert eval("(lists/reverse [1 2 3])") == [3, 2, 1]
+    assert eval("(lists/reverse '(1 2 3))") == [3, 2, 1]
     assert eval("(lists/seq 1 3)") == [1, 2, 3]
   end
 

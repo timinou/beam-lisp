@@ -31,6 +31,12 @@ defmodule BeamLisp do
     Compiler.eval_string(source)
   end
 
+  @doc "Evaluate a beam-lisp file. Returns the last value."
+  def run_file(path) do
+    init()
+    path |> File.read!() |> Compiler.eval_string()
+  end
+
   @doc "Seed the `core` namespace and load the prelude, once."
   def init do
     unless Env.seeded?() do
