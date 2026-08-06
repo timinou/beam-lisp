@@ -262,7 +262,7 @@ defmodule BeamLisp.Compiler do
     do: compile_def(name, compile(init, notail(env)), env)
 
   defp compile_special("def", [{:symbol, name}, doc, init], env) when is_binary(doc),
-    do: compile_def(name, compile(init, notail(env)), env)
+    do: compile_def(name, compile(init, notail(env)), env, doc)
 
   defp compile_special("fn", args, env) do
     clauses =
@@ -376,17 +376,21 @@ defmodule BeamLisp.Compiler do
       block_forms(body, env)
     else
       body_ast = block_forms(body, env)
+      # `do:` MUST stay first in the keyword list: the compiler
+      # accepts any order, but Elixir's printer and the 1.20 type
+      # checker only recognize the try special form when it leads
+      # (Keyword.put prepends — append instead).
       opts = [do: body_ast]
 
       opts =
         case compile_catches(catches, env) do
           nil -> opts
-          clause -> Keyword.put(opts, :catch, [clause])
+          clause -> opts ++ [catch: [clause]]
         end
 
       opts =
         if finally_body != [],
-          do: Keyword.put(opts, :after, block_forms(finally_body, notail(env))),
+          do: opts ++ [after: block_forms(finally_body, notail(env))],
           else: opts
 
       {:try, [], [opts]}
