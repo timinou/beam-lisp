@@ -46,25 +46,31 @@ defmodule BeamLisp.Env do
   is an alias in `ns`, it resolves to the alias target instead.
   """
   def fetch(ns, name) do
-    candidates =
-      case String.split(name, "/", parts: 2) do
-        # A leading slash (`/`, `/x`) is part of the var name itself.
-        ["" | _] ->
-          [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}]
-
-        [prefix, var_name] ->
-          [{alias_target(ns, prefix) || prefix, var_name}]
-
-        [plain] ->
-          [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}]
-      end
-
-    Enum.find_value(candidates, :error, fn key ->
+    Enum.find_value(candidates(ns, name), :error, fn key ->
       case :ets.lookup(@table, key) do
         [{^key, value}] -> {:ok, value}
         [] -> nil
       end
     end)
+  end
+
+  # The candidate `{ns, name}` pairs a lookup should try, in order:
+  # the namespace itself, then referred vars, then `core` (mirroring
+  # how jank and Clojure refer `clojure.core` into every namespace).
+  # A name containing a `/` splits into `{ns, var}`; if the prefix is
+  # an alias in `ns`, it resolves to the alias target instead. A
+  # leading slash (`/`, `/x`) is part of the var name itself.
+  defp candidates(ns, name) do
+    case String.split(name, "/", parts: 2) do
+      ["" | _] ->
+        [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}]
+
+      [prefix, var_name] ->
+        [{alias_target(ns, prefix) || prefix, var_name}]
+
+      [plain] ->
+        [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}]
+    end
   end
 
   @doc "Record `alias` as shorthand for `target` inside `ns`."
@@ -124,25 +130,57 @@ defmodule BeamLisp.Env do
 
   @doc "Resolve link metadata with the same alias/refer/core rules as fetch/2."
   def link(ns, name) do
-    candidates =
-      case String.split(name, "/", parts: 2) do
-        ["" | _] ->
-          [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}]
-
-        [prefix, var_name] ->
-          [{alias_target(ns, prefix) || prefix, var_name}]
-
-        [plain] ->
-          [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}]
-      end
-
-    Enum.find_value(candidates, :error, fn {cns, cname} ->
+    Enum.find_value(candidates(ns, name), :error, fn {cns, cname} ->
       case :ets.lookup(@table, {:link, cns, cname}) do
         [{_, info}] -> {:ok, info}
         [] -> nil
       end
     end)
   end
+
+  @doc """
+  Record `meta` (a map, conventionally `%{doc: docstring}`) for `name`
+  in `ns`. The latest write wins; redefining a var with a new
+  docstring replaces the old one. Returns `:ok`.
+  """
+  def put_meta(ns, name, meta) when is_map(meta) do
+    :ets.insert(@table, {{:meta, ns, name}, meta})
+    :ok
+  end
+
+  @doc "Read the metadata map recorded by `put_meta/3` for `name` in `ns` (no resolution)."
+  def meta(ns, name) do
+    case :ets.lookup(@table, {:meta, ns, name}) do
+      [{_, meta}] -> {:ok, meta}
+      [] -> :error
+    end
+  end
+
+  @doc """
+  Resolve `name` through the same alias/refer/core rules as `fetch/2`
+  and return its docstring metadata.
+
+  `name` is a var name string, or the quoted-symbol datum `{:symbol, name}`
+  that `(doc 'foo)` hands over. Returns `%{ns: resolved_ns, name: resolved_name, doc: doc}`
+  when a var with a docstring resolves, else `nil` (beam-lisp `doc` checks
+  with `nil?` and reads the fields with `get`).
+  """
+  def doc_string(ns, name) do
+    name = unwrap_doc_name(name)
+
+    case Enum.find_value(candidates(ns, name), fn {cns, cname} ->
+           case :ets.lookup(@table, {:meta, cns, cname}) do
+             [{_, %{doc: doc}}] -> {cns, cname, doc}
+             [] -> nil
+           end
+         end) do
+      {cns, cname, doc} -> %{ns: cns, name: cname, doc: doc}
+      nil -> nil
+    end
+  end
+
+  defp unwrap_doc_name({:symbol, name}), do: name
+  defp unwrap_doc_name(name) when is_binary(name), do: name
 
   @doc "Directories the loader searches for `<ns>.bl` files, innermost first."
   def load_paths, do: Agent.get(__MODULE__, & &1.load_paths)

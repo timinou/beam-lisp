@@ -275,25 +275,35 @@ defmodule BeamLisp.Compiler do
   end
 
   defp compile_special("defn", [{:symbol, name} | rest], env) do
-    rest =
-      case rest do
-        [doc | rest] when is_binary(doc) -> rest
-        rest -> rest
-      end
+    {doc, rest} = split_docstring(rest)
 
-    compile_defn(name, fn_clauses(rest), env)
+    cond do
+      rest == [] ->
+        raise "defn #{name}: expected at least one parameter vector"
+
+      match?([h | _] when is_binary(h), rest) ->
+        raise "defn #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+
+      true ->
+        compile_defn(name, fn_clauses(rest), env, doc)
+    end
   end
 
   # A macro is a fn stored under a tag; calls to it expand at
   # compile time (see macro_for/expand_macro below).
   defp compile_special("defmacro", [{:symbol, name} | rest], env) do
-    rest =
-      case rest do
-        [doc | rest] when is_binary(doc) -> rest
-        rest -> rest
-      end
+    {doc, rest} = split_docstring(rest)
 
-    compile_def(name, {:{}, [], [:"$macro", compile_fn(fn_clauses(rest), env)]}, env)
+    cond do
+      rest == [] ->
+        raise "defmacro #{name}: expected at least one parameter vector"
+
+      match?([h | _] when is_binary(h), rest) ->
+        raise "defmacro #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+
+      true ->
+        compile_def(name, {:{}, [], [:"$macro", compile_fn(fn_clauses(rest), env)]}, env, doc)
+    end
   end
 
   defp compile_special("syntax-quote", [form], env), do: synq_data(form, env)
@@ -305,16 +315,18 @@ defmodule BeamLisp.Compiler do
   end
 
   # loop = let + a recur target. Self-application is a tail call on
-  # the BEAM, so (recur …) runs in constant stack.
+  # the BEAM, so (recur …) runs in constant stack. Destructured
+  # bindings destructure at entry: the recur params are the pattern
+  # values (the whole map/vector), so `recur` re-supplies them exactly
+  # as in Clojure.
   defp compile_special("loop", [{:vector, bindings} | body], env) do
-    {steps, bound_env} = compile_bindings(bindings, notail(env))
+    {params, entry_binds, arg_asts, bound_env} = loop_bindings(bindings, notail(env))
 
     self = fresh_var("loop")
-    {param_vars, arg_asts} = Enum.unzip(steps)
-    loop_env = %{bound_env | recur: %{self: self, arity: length(steps)}, tail: true}
-    body_ast = block_forms(body, loop_env)
+    loop_env = %{bound_env | recur: %{self: self, arity: length(params)}, tail: true}
+    body_ast = nest_steps(entry_binds, block_forms(body, loop_env))
 
-    inner_fn = {:fn, [], [{:->, [], [param_vars, body_ast]}]}
+    inner_fn = {:fn, [], [{:->, [], [params, body_ast]}]}
     self_applied = self_apply(self, inner_fn)
     {{:., [], [self_applied]}, [], arg_asts}
   end
@@ -433,6 +445,11 @@ defmodule BeamLisp.Compiler do
 
     {:receive, [], [block]}
   end
+
+  # A docstring is a string literal followed by more forms; anything
+  # else keeps today's meaning (first form is a clause / the value).
+  defp split_docstring([doc | rest]) when is_binary(doc) and rest != [], do: {doc, rest}
+  defp split_docstring(rest), do: {nil, rest}
 
   # Split (try …) into body forms, catch clauses, and a finally body.
   # Catch/finally are classified by their head symbol; the caller
@@ -618,7 +635,7 @@ defmodule BeamLisp.Compiler do
   # module (variadic under a mangled name, rest as the last param),
   # the var's value is a capture, and later call sites compile to
   # direct remote calls. See BeamLisp.Link.
-  defp compile_defn(name, clauses, env) do
+  defp compile_defn(name, clauses, env, doc) do
     mod = BeamLisp.Link.module_for(env.ns)
 
     entries =
@@ -638,8 +655,21 @@ defmodule BeamLisp.Compiler do
         {kind, fixed_count, fname, def_ast}
       end)
 
-    quote do
-      BeamLisp.Link.defvar(unquote(env.ns), unquote(name), unquote(Macro.escape(entries)))
+    defvar_ast =
+      quote do
+        BeamLisp.Link.defvar(unquote(env.ns), unquote(name), unquote(Macro.escape(entries)))
+      end
+
+    if doc do
+      # defn returns the interned value (Clojure's def returns the var
+      # root); the meta write is a side effect after it.
+      quote do
+        value = unquote(defvar_ast)
+        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+        value
+      end
+    else
+      defvar_ast
     end
   end
 
@@ -739,15 +769,54 @@ defmodule BeamLisp.Compiler do
 
   # --- special form helpers ---
 
-  defp compile_def(name, init_ast, env) do
-    quote do
-      BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(init_ast))
+  defp compile_def(name, init_ast, env, doc \\ nil) do
+    intern_ast =
+      quote do
+        BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(init_ast))
+      end
+
+    if doc do
+      # def returns the interned value; the meta write is a side effect.
+      quote do
+        value = unquote(intern_ast)
+        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+        value
+      end
+    else
+      intern_ast
     end
   end
 
   defp compile_if(test, then, else_, env) do
     {:if, [],
      [compile(test, notail(env)), [do: compile(then, env), else: compile(else_, env)]]}
+  end
+
+  # Like compile_bindings, but split for loop: `params` are the recur
+  # params (one per binding; a destructure's param is its whole value),
+  # `entry_binds` destructure those at loop entry, and `arg_asts` are
+  # the initial values passed on the first call.
+  defp loop_bindings(bindings, env) do
+    pairs = Enum.chunk_every(bindings, 2)
+
+    unless Enum.all?(pairs, &(length(&1) == 2)) do
+      raise "binding forms must be even, each a pattern and a value"
+    end
+
+    Enum.reduce(pairs, {[], [], [], env}, fn [pattern_form, init], {params, entry, arg_asts, acc_env} ->
+      init_ast = compile(init, acc_env)
+
+      case pattern_form do
+        {:symbol, name} ->
+          var = fresh_var(name)
+          {params ++ [var], entry, arg_asts ++ [init_ast], put_local(acc_env, name, var)}
+
+        destructure ->
+          whole = fresh_var("whole")
+          {sub_steps, new_env} = destructure_steps(destructure, acc_env, whole)
+          {params ++ [whole], entry ++ sub_steps, arg_asts ++ [init_ast], new_env}
+      end
+    end)
   end
 
   # Sequential destructuring bindings, shared by let and loop.
@@ -942,36 +1011,103 @@ defmodule BeamLisp.Compiler do
   end
 
   defp destructure_steps({:map, kvs}, env, whole_ast) do
+    # Collect the binds and the `:or` defaults in one pass, so any
+    # default can apply to a symbol bound by the same map. Clojure
+    # compiles each to `(get m key default)`: the default applies when
+    # the key is absent (or the map is nil), while a present nil stays
+    # nil — exactly `Map.get/3` semantics.
+    {binds, ors} =
+      Enum.reduce(kvs, {[], %{}}, fn
+        {{:keyword, "or"}, {:map, or_kvs}}, {binds, ors} ->
+          defaults =
+            Map.new(or_kvs, fn
+              {{:symbol, k}, default} -> {k, default}
+              other -> raise "unsupported :or binding: #{inspect(other)}"
+            end)
+
+          {binds, Map.merge(ors, defaults)}
+
+        {{:keyword, "keys"}, {:vector, syms}}, {binds, ors} ->
+          key_binds =
+            Enum.map(syms, fn
+              {:symbol, name} -> {:get, {:symbol, name}, String.to_atom(name)}
+              other -> raise "unsupported :keys binding: #{inspect(other)}"
+            end)
+
+          {binds ++ key_binds, ors}
+
+        {{:keyword, "strs"}, {:vector, syms}}, {binds, ors} ->
+          str_binds =
+            Enum.map(syms, fn
+              {:symbol, name} -> {:get, {:symbol, name}, name}
+              other -> raise "unsupported :strs binding: #{inspect(other)}"
+            end)
+
+          {binds ++ str_binds, ors}
+
+        {{:keyword, "as"}, {:symbol, name}}, {binds, ors} ->
+          {binds ++ [{:as, name}], ors}
+
+        # `{local :key}` / `{[a b] :pair}`: the binding form sits in
+        # the map's key slot, the lookup key in its value slot. The
+        # codebase's established `{:key local}` spelling (keyword in
+        # the key slot) means the same thing, so both are accepted.
+        {pattern, key_form}, {binds, ors} ->
+          bind =
+            case {pattern, key_form} do
+              {{:keyword, k}, {:symbol, local}} ->
+                {:get, {:symbol, local}, String.to_atom(k)}
+
+              {pattern, key_form} ->
+                key =
+                  case key_form do
+                    {:keyword, k} -> String.to_atom(k)
+                    k when is_binary(k) -> k
+                    other -> raise "unsupported map key in binding: #{inspect(other)}"
+                  end
+
+                {:get, pattern, key}
+            end
+
+          {binds ++ [bind], ors}
+
+        {other, _}, _ ->
+          raise "unsupported map binding: #{inspect(other)}"
+      end)
+
+    # Compile the :or defaults in the entering scope (before any bind
+    # in this map), as Clojure does.
+    ors_asts = Map.new(ors, fn {k, default} -> {k, compile(default, env)} end)
+
     {steps, env} =
-      Enum.reduce(kvs, {[], env}, fn
-        {{:keyword, "keys"}, {:vector, syms}}, {steps, acc_env} ->
-          Enum.reduce(syms, {steps, acc_env}, fn {:symbol, name}, {steps, acc_env} ->
+      Enum.reduce(binds, {[], env}, fn bind, {steps, acc_env} ->
+        case bind do
+          {:as, name} ->
             var = fresh_var(name)
+            {steps ++ [{var, whole_ast}], put_local(acc_env, name, var)}
+
+          {:get, {:symbol, name}, key} ->
+            var = fresh_var(name)
+            default = Map.get(ors_asts, name)
 
             get_ast =
               quote do
-                BeamLisp.RT.get(unquote(whole_ast), unquote(String.to_atom(name)))
+                BeamLisp.RT.get(unquote(whole_ast), unquote(key), unquote(default))
               end
 
             {steps ++ [{var, get_ast}], put_local(acc_env, name, var)}
-          end)
 
-        {{:keyword, "as"}, {:symbol, name}}, {steps, acc_env} ->
-          var = fresh_var(name)
-          {steps ++ [{var, whole_ast}], put_local(acc_env, name, var)}
+          # A non-symbol pattern under a key destructures recursively,
+          # so maps and vectors nest inside each other.
+          {:get, pattern, key} ->
+            get_ast =
+              quote do
+                BeamLisp.RT.get(unquote(whole_ast), unquote(key))
+              end
 
-        {{:keyword, key}, {:symbol, name}}, {steps, acc_env} ->
-          var = fresh_var(name)
-
-          get_ast =
-            quote do
-              BeamLisp.RT.get(unquote(whole_ast), unquote(String.to_atom(key)))
-            end
-
-          {steps ++ [{var, get_ast}], put_local(acc_env, name, var)}
-
-        other, _acc ->
-          raise "unsupported map binding: #{inspect(other)}"
+            {sub_steps, nested_env} = destructure_steps(pattern, acc_env, get_ast)
+            {steps ++ sub_steps, nested_env}
+        end
       end)
 
     {steps, env}
