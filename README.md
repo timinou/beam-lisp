@@ -81,9 +81,17 @@ are both targets), `if`, `do`, `quote`, **`receive` with patterns**
 (keywords match themselves, symbols bind, `[p q]` matches tuples
 *and* vectors, `{:k p}` matches maps, `(after ms …)`),
 keywords-as-functions, variadic arithmetic and comparisons
-(`(< 1 2 3)` chains, as Clojure), full Elixir/Erlang interop, and a
+(`(< 1 2 3)` chains, as Clojure), **`try`/`catch`/`finally` +
+`throw`** (untyped catch-all with normalized errors, typed
+`(catch Module.Name e …)`, `ex-info`/`ex-data`/`ex-message`),
+**reference types** (`atom`, `deref`, `swap!`, `reset!`,
+`compare-and-set!` — Agent-backed; `future` and `promise` with
+blocking `deref`, incl. timeout), `@x` sugar — registered in
+`core.bl` through a **rebindable reader-macro table**, not wired
+into the reader — full Elixir/Erlang interop, and a
 self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
-`range`, `zipmap`, … — itself written in beam-lisp).
+`range`, `zipmap`, `when`, `case`, `future`, … — itself written in
+beam-lisp).
 
 Evaluation compiles each form into a real module, so beam-lisp code
 runs at native speed with genuine tail-call optimization. On top of
@@ -138,6 +146,9 @@ $ mix beam_lisp.run examples/macros.bl     # defmacro + syntax-quote
 $ mix beam_lisp.run examples/app.bl       # namespaces: require, alias, refer (loads geometry.bl)
 $ mix beam_lisp.run examples/control.bl   # cond/case/when/and/or: prelude macros
 $ mix beam_lisp.run examples/pingpong.bl  # receive: pattern-matched message passing
+$ mix beam_lisp.run examples/errors.bl    # try/catch/finally, throw, ex-info
+$ mix beam_lisp.run examples/atoms.bl     # atoms, futures, promises across processes
+$ mix beam_lisp.run examples/destructuring.bl  # map destructuring, docstrings
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -149,7 +160,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 118 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, examples
+$ mix test     # 204 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, errors, refs, fidelity, examples
 ```
 
 ### The MCP playground (dev only)
