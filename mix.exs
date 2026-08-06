@@ -18,5 +18,10 @@ defmodule BeamLisp.MixProject do
     ]
   end
 
-  defp deps, do: []
+  defp deps do
+    [
+      {:tidewave, "~> 0.5", only: :dev},
+      {:bandit, "~> 1.5", only: :dev}
+    ]
+  end
 end

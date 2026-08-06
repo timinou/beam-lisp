@@ -140,8 +140,24 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 82 tests: reader, compiler, prelude, vectors, macros, examples
+$ mix test     # 109 tests: reader, compiler, prelude, vectors, macros, namespaces, examples
 ```
+
+### The MCP playground (dev only)
+
+Start the app interactively and Tidewave's MCP endpoint comes up on
+a deliberately uncommon, loopback-only port:
+
+```console
+$ iex -S mix        # or: mix run --no-halt
+# http://127.0.0.1:9837/tidewave/mcp
+```
+
+Agents (including Spell subagents) can then call `project_eval`,
+`get_docs`, `get_logs`, and `get_source_location` against the live
+app — e.g. `project_eval` with `BeamLisp.eval("(fact 20 1)")`.
+The endpoint never starts for one-shot CLI tasks (`mix beam_lisp.run`,
+`mix test`, …), so it can't fight a running playground for the port.
 
 Layout:
 
@@ -152,6 +168,7 @@ lib/beam_lisp/env.ex        var registry (ETS-backed)
 lib/beam_lisp/loader.ex     namespace file loading
 lib/beam_lisp/vector.ex     the persistent vector type
 lib/beam_lisp/rt.ex         primitives seeded into core
+lib/beam_lisp/dev_server.ex dev-only Tidewave MCP endpoint (:9837)
 priv/core.bl                self-hosted prelude, jank-flavored
 examples/                   executable documentation
 ```
