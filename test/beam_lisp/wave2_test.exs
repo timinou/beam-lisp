@@ -46,9 +46,16 @@ defmodule BeamLisp.Wave2Test do
       end
     end
 
-    test "recur may not cross a fn boundary" do
-      assert_raise RuntimeError, ~r/no enclosing/, fn ->
+    test "recur inside an inner fn targets that fn, not the loop" do
+      # The fn is the innermost target; its arity (0) mismatches.
+      assert_raise RuntimeError, ~r/arity mismatch/, fn ->
         eval("(loop [i 0] ((fn [] (recur 1))))")
+      end
+    end
+
+    test "recur at top level still has no target" do
+      assert_raise RuntimeError, ~r/no enclosing/, fn ->
+        eval("(recur 1)")
       end
     end
 

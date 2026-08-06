@@ -270,8 +270,7 @@ defmodule BeamLisp.Compiler do
     body_ast = block_forms(body, loop_env)
 
     inner_fn = {:fn, [], [{:->, [], [param_vars, body_ast]}]}
-    outer_fn = {:fn, [], [{:->, [], [[self], inner_fn]}]}
-    self_applied = {{:., [], [outer_fn]}, [], [outer_fn]}
+    self_applied = self_apply(self, inner_fn)
     {{:., [], [self_applied]}, [], arg_asts}
   end
 
@@ -446,8 +445,12 @@ defmodule BeamLisp.Compiler do
   # A single-arity fn compiles to a real Elixir fn — passable to
   # `Enum`, storable in a var, callable via `apply/2`. Elixir fns are
   # fixed-arity, so multi-clause and variadic fns get a tag that
-  # `RT.invoke/2` dispatches on. A fn body is a new recur scope:
-  # recur may not cross a fn boundary (fn-targeted recur is wave 3).
+  # `RT.invoke/2` dispatches on.
+  #
+  # Every clause is also a recur target (as in Clojure): the clause
+  # fn is wrapped in self-application, and `recur` in tail position
+  # re-enters it in constant stack. Inner fns shadow outer targets,
+  # so recur never crosses a fn boundary.
   defp compile_fn(clauses, env) do
     compiled =
       Enum.map(clauses, fn {params, body} ->
@@ -464,9 +467,10 @@ defmodule BeamLisp.Compiler do
               {head_vars ++ [rest_var], put_local(clause_env, name, rest_var)}
           end
 
-        fn_env = %{clause_env | recur: nil, tail: true}
+        self = fresh_var("fnself")
+        fn_env = %{clause_env | recur: %{self: self, arity: length(head_vars)}, tail: true}
         body_ast = block(preludes ++ [block_forms(body, fn_env)])
-        fn_ast = {:fn, [], [{:->, [], [head_vars, body_ast]}]}
+        fn_ast = self_apply(self, {:fn, [], [{:->, [], [head_vars, body_ast]}]})
 
         case rest do
           nil -> {:fixed, length(fixed), fn_ast}
@@ -493,6 +497,13 @@ defmodule BeamLisp.Compiler do
 
         {:{}, [], [:"$blfn", {:%{}, [], fixed}, variadic_ast]}
     end
+  end
+
+  # `(fn s -> fn … -> body end end).(itself)` — self-application,
+  # tail-call-optimized on the BEAM; shared by loop and fn recur.
+  defp self_apply(self, inner_fn) do
+    outer_fn = {:fn, [], [{:->, [], [[self], inner_fn]}]}
+    {{:., [], [outer_fn]}, [], [outer_fn]}
   end
 
   defp split_variadic(params) do

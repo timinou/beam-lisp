@@ -101,6 +101,31 @@ defmodule BeamLisp.Wave4Test do
     end
   end
 
+  describe "fn-targeted recur" do
+    test "recur re-enters the fn in constant stack" do
+      assert eval("(defn w4-countdown [n] (if (= n 0) :done (recur (dec n)))) (w4-countdown 500000)") == :done
+    end
+
+    test "multi-arg recur" do
+      assert eval("(defn w4-fib [n a b] (if (= n 0) a (recur (dec n) b (+ a b)))) (w4-fib 30 0 1)") == 832_040
+    end
+
+    test "an inner fn's recur targets the inner fn, not the outer" do
+      assert eval("""
+             (defn w4-outer [n]
+               (let [helper (fn [k] (if (= k 0) :inner-done (recur (dec k))))]
+                 (helper n)))
+             (w4-outer 100)
+             """) == :"inner-done"
+    end
+
+    test "recur arity must match the fn's params" do
+      assert_raise RuntimeError, ~r/recur arity mismatch/, fn ->
+        eval("(fn [a b] (recur 1))")
+      end
+    end
+  end
+
   describe "variadic arithmetic" do
     test "+ and * fold any arity, with identity at zero" do
       assert eval("(+)") == 0
