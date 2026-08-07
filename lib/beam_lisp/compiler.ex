@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol defrecord deftype let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
+  @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defprotocol extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -158,7 +158,7 @@ defmodule BeamLisp.Compiler do
 
       String.contains?(name, "/") ->
         case slash_target(env, name) do
-          {:var, ns, var} -> fetch_quoted(ns, var)
+          {:var, ns, var} -> private_fetch_quoted(env, ns, var)
           {:remote, module, fun} -> remote_value_quoted(module, fun)
         end
 
@@ -227,12 +227,13 @@ defmodule BeamLisp.Compiler do
 
             cond do
               linked ->
+                reject_private_link(env, name)
                 linked
 
               String.contains?(name, "/") ->
                 case slash_target(env, name) do
                   {:var, ns, var} ->
-                    invoke_quoted(fetch_quoted(ns, var), arg_asts)
+                    invoke_quoted(private_fetch_quoted(env, ns, var), arg_asts)
 
                   {:remote, module, fun} ->
                     quote do
@@ -287,7 +288,7 @@ defmodule BeamLisp.Compiler do
   # (ns foo.bar (:require [other.ns :as o] [third.ns :refer [x]]))
   # Emits runtime registry ops; the *next* form's compile then sees
   # the new ns via Env.current_ns (eval_string re-reads it per form).
-  defp compile_special("ns", [name_form | clauses], _env) do
+  defp compile_special("ns", [name_form | clauses], env) do
     name = name_of(name_form)
 
     specs =
@@ -312,7 +313,14 @@ defmodule BeamLisp.Compiler do
 
         refer_ops =
           for sym <- refer_syms do
-            quote do: BeamLisp.Env.add_refer(unquote(name), unquote(sym), unquote(target))
+            # Clojure refuses to refer a private var (`var: #'a/f is not
+            # public`); mirror that here so a referred name can never
+            # smuggle a private var past the unqualified lookup path.
+            if private_var?(target, sym) do
+              compile_error(env, "var #{target}/#{sym} is not public")
+            else
+              quote do: BeamLisp.Env.add_refer(unquote(name), unquote(sym), unquote(target))
+            end
           end
 
         {[load | loads], alias_op ++ aliases, refer_ops ++ refers}
@@ -329,10 +337,10 @@ defmodule BeamLisp.Compiler do
   end
 
   defp compile_special("def", [name_form, init], env),
-    do: compile_def(name_of(name_form), compile(init, notail(env)), env)
+    do: compile_def(name_of(name_form), compile(init, notail(env)), env, nil, name_meta(name_form))
 
   defp compile_special("def", [name_form, doc, init], env) when is_binary(doc),
-    do: compile_def(name_of(name_form), compile(init, notail(env)), env, doc)
+    do: compile_def(name_of(name_form), compile(init, notail(env)), env, doc, name_meta(name_form))
 
   defp compile_special("fn", args, env) do
     case args do
@@ -350,22 +358,15 @@ defmodule BeamLisp.Compiler do
   end
 
   defp compile_special("defn", [name_form | rest], env) do
-    name = name_of(name_form)
-    {doc, rest} = split_docstring(rest)
+    compile_def_special("defn", name_form, rest, env, false)
+  end
 
-    cond do
-      rest == [] ->
-        compile_error(env, "defn #{name}: expected at least one parameter vector")
-
-      match?([h | _] when is_binary(h), rest) ->
-        compile_error(
-          env,
-          "defn #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
-        )
-
-      true ->
-        compile_defn(name, fn_clauses(rest), env, doc)
-    end
+  # `defn-` is `defn` with `^:private` metadata on the var, exactly as
+  # in Clojure. The flag is threaded to compile_defn so it lands in the
+  # var's metadata map (`%{private: true}`) alongside any docstring;
+  # resolution then enforces it (see private_fetch_quoted/3).
+  defp compile_special("defn-", [name_form | rest], env) do
+    compile_def_special("defn-", name_form, rest, env, true)
   end
 
   # A macro is a fn stored under a tag; calls to it expand at
@@ -389,7 +390,8 @@ defmodule BeamLisp.Compiler do
           name,
           {:{}, [], [:"$macro", compile_fn(macro_clauses(fn_clauses(rest)), env, nil_rest: true)]},
           env,
-          doc
+          doc,
+          name_meta(name_form)
         )
     end
   end
@@ -510,8 +512,14 @@ defmodule BeamLisp.Compiler do
   # several at once. A type arg is a keyword tag (`:vector`, `:map`,
   # `:binary`…) or an Elixir struct module (`Foo.Bar`), resolved to a
   # tag at compile time.
+  # `(defprotocol Name "docstring" (m [this] …) …)` accepts an optional
+  # leading docstring between the name and the first method, and stores
+  # it as the protocol's `:doc` var metadata rather than discarding it —
+  # the same split defn/defmacro use, so a docstring is a string in the
+  # same position a method list is not confused with one.
   defp compile_special("defprotocol", [name_form | method_forms], env) do
     name = name_of(name_form)
+    {doc, method_forms} = split_docstring(method_forms)
 
     method_names =
       Enum.map(method_forms, fn mf ->
@@ -521,8 +529,19 @@ defmodule BeamLisp.Compiler do
         end
       end)
 
-    quote do
-      BeamLisp.Multi.define_protocol(unquote(env.ns), unquote(name), unquote(method_names))
+    define_ast =
+      quote do
+        BeamLisp.Multi.define_protocol(unquote(env.ns), unquote(name), unquote(method_names))
+      end
+
+    if doc do
+      quote do
+        value = unquote(define_ast)
+        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+        value
+      end
+    else
+      define_ast
     end
   end
 
@@ -604,6 +623,59 @@ defmodule BeamLisp.Compiler do
 
   defp compile_special("deftype", args, env),
     do: compile_error(env, "deftype: expected (deftype Name [fields…] & protocols), got #{inspect(args)}")
+
+  # `(reify Proto (m [this] …) …) Proto2 (n [this] …)` builds an
+  # anonymous instance implementing one or more protocols, the whole
+  # point being that it *closes over its lexical environment* — the
+  # thing deftype deliberately cannot do (deftype fields are declared,
+  # reify captures whatever locals are in scope at the form).
+  #
+  # Shape: an instance is a `{:bl_reify, ref, {}}` tuple — the same
+  # tagged-tuple family deftype uses, but with a per-evaluation
+  # reference in place of a module atom. It must be per-evaluation:
+  # two instances built by one reify site capture different locals, so
+  # they must dispatch to different method closures, and a compile-time
+  # constant module atom would make them share one slot and all behave
+  # like the last instance built. `make_ref()` is unique per evaluation,
+  # costs no atom-table entries (a deftype's module atom is a
+  # compile-time constant; a reify has no name and is created at
+  # runtime), and still keys `Multi.type_of`/`extend_type` exactly like
+  # a module tag — the one protocol machinery, no parallel path. Each
+  # protocol's methods are registered with `Multi.extend_type` as
+  # `extend-type` would; the method bodies compile in the enclosing
+  # env, so each evaluation's closures capture that evaluation's local
+  # values.
+  #
+  # `extend_type` already refuses an incomplete extension, so a reify
+  # that names a protocol without covering every method is a compile
+  # error, matching Clojure. Unlike deftype there is no type name or
+  # `->Name` constructor: the value is the form's result.
+  #
+  # The cost of per-evaluation identity is that each instance leaves
+  # its method entries in the dispatch table for the process lifetime.
+  # That is bounded by how many reify evaluations a program performs
+  # (Specter builds each navigator once, at var init), and is the same
+  # trade-off the multimethod tables already document.
+  defp compile_special("reify", forms, env) do
+    groups = reify_protocol_groups(forms, env)
+    tag_var = Macro.var(:tag, __MODULE__)
+
+    extend_asts =
+      for {proto, method_forms} <- groups do
+        {pns, pname} = multi_var_target(env, proto)
+        impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
+
+        quote do
+          BeamLisp.Multi.extend_type(unquote(pns), unquote(pname), unquote(tag_var), unquote(impls))
+        end
+      end
+
+    quote do
+      unquote(tag_var) = make_ref()
+      unquote(block(extend_asts))
+      {:bl_reify, unquote(tag_var), {}}
+    end
+  end
 
   # Thread a per-syntax-quote-form gensym map through synq so a `x#`
   # symbol is renamed once and reuses that name everywhere inside one
@@ -965,11 +1037,55 @@ defmodule BeamLisp.Compiler do
   defp compile_pattern_bare(other, _env),
     do: raise("unsupported receive pattern: #{inspect(other)}")
 
-  # A defn links: its clauses become named defs in the namespace
-  # module (variadic under a mangled name, rest as the last param),
-  # the var's value is a capture, and later call sites compile to
-  # direct remote calls. See BeamLisp.Link.
-  defp compile_defn(name, clauses, env, doc) do
+  # Shared expansion for `defn` and `defn-`: peel the optional leading
+  # docstring, then hand the clauses to compile_defn with the private
+  # flag. Kept out of the compile_special clause chain so it cannot
+  # split that (Elixir requires same-name/arity clauses to be adjacent).
+  defp compile_def_special(kind, name_form, rest, env, private) do
+    name = name_of(name_form)
+    {doc, rest} = split_docstring(rest)
+    {attr, rest} = split_defn_attr(rest, name_meta(name_form))
+
+    cond do
+      rest == [] ->
+        compile_error(env, kind <> " " <> name <> ": expected at least one parameter vector")
+
+      match?([h | _] when is_binary(h), rest) ->
+        compile_error(
+          env,
+          kind <> " " <> name <> ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+        )
+
+      true ->
+        compile_defn(name, fn_clauses(rest), env, doc, private, attr)
+    end
+  end
+
+  # `(defn name "doc" {:attr-map} [params] …)` — Clojure's defn takes an
+  # optional metadata-map literal between the docstring and the clauses.
+  # It merges into any `^{...}` metadata that rode on the name symbol
+  # (the `:inline` on jank's bit-not is written this way).
+  defp split_defn_attr([{:map, kvs} | rest], attr), do: {merge_attr(attr, kvs), rest}
+  defp split_defn_attr(rest, attr), do: {attr, rest}
+
+  defp merge_attr(nil, kvs), do: attr_map(kvs)
+  defp merge_attr(attr, kvs), do: Map.merge(attr, attr_map(kvs))
+  defp attr_map(kvs), do: Map.new(kvs, fn {k, v} -> {attr_key(k), v} end)
+  defp attr_key({:keyword, name}), do: String.to_atom(name)
+
+  # One defn into a per-ns body module. The `defn` form's own line
+  # stamps each generated `:def` node, so the namespace module's line
+  # table names the definition site (not the default module line). The
+  # location rides to Link.defvar so its Module.create claims the same
+  # file.
+  #
+  # Clauses are split by arity: fixed-arity clauses become same-named
+  # defs; a variadic clause is emitted under a mangled name taking the
+  # rest as its last parameter (split_variadic/1). The var's value is a
+  # capture, and later call sites compile to direct remote calls (see
+  # BeamLisp.Link). The `private` flag and any `^{...}`/attr-map metadata
+  # land in the var's metadata.
+  defp compile_defn(name, clauses, env, doc, private, attr) do
     mod = BeamLisp.Link.module_for(env.ns)
 
     # The defn form's own line stamps each generated `:def` node, so the
@@ -1013,12 +1129,15 @@ defmodule BeamLisp.Compiler do
         )
       end
 
-    if doc do
+    if meta = var_meta_ast(doc, private, attr, env) do
       # defn returns the interned value (Clojure's def returns the var
-      # root); the meta write is a side effect after it.
+      # root); the meta write is a side effect after it. The private
+      # flag and the `^{...}`/attr-map metadata land in the same map
+      # (Env.put_meta merges, so a later public redefinition keeps a
+      # private flag — faithful to Clojure, where var metadata sticks).
       quote do
         value = unquote(defvar_ast)
-        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), unquote(meta))
         value
       end
     else
@@ -1360,17 +1479,46 @@ defmodule BeamLisp.Compiler do
 
   # --- special form helpers ---
 
-  defp compile_def(name, init_ast, env, doc \\ nil) do
+  # The var's metadata map as an Elixir AST, or nil when there is nothing
+  # to write. The docstring and `private` flag are literals; each `^{...}` /
+  # attr-map value is a reader FORM lowered to a runtime value, so `meta`
+  # reads real data (a string, a fn, a quoted list), not reader data. A
+  # bare symbol value (`^String` on a name) is NOT compiled — that would
+  # resolve it as a var — it is kept as the symbol datum Clojure stores,
+  # matching datum/1.
+  defp var_meta_ast(doc, private, attr, env) do
+    entries =
+      (if doc, do: [doc: doc], else: []) ++
+        (if private, do: [private: true], else: []) ++
+        Enum.map(attr || %{}, fn {k, v} -> {k, attr_value_ast(v, env)} end)
+
+    case entries do
+      [] -> nil
+      entries -> {:%{}, [], entries}
+    end
+  end
+
+  defp attr_value_ast({:symbol, _} = sym, _env), do: sym
+  defp attr_value_ast(form, env), do: compile(form, notail(env))
+
+  # The user-metadata map a `^{...}` reader form attached to a def/defn
+  # name symbol. The name form is `{:meta, {:symbol, name}, m}` where `m`
+  # holds exactly the author's `^` metadata — positions never attach to
+  # symbols, so there is no `:line`/`:file` to filter out.
+  defp name_meta({:meta, _form, m}) when is_map(m), do: m
+  defp name_meta(_), do: nil
+
+  defp compile_def(name, init_ast, env, doc, attr) do
     intern_ast =
       quote do
         BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(init_ast))
       end
 
-    if doc do
+    if meta = var_meta_ast(doc, false, attr, env) do
       # def returns the interned value; the meta write is a side effect.
       quote do
         value = unquote(intern_ast)
-        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+        BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), unquote(meta))
         value
       end
     else
@@ -1886,6 +2034,31 @@ defmodule BeamLisp.Compiler do
     end
   end
 
+  # Group reify's alternating protocol-name / method-impl forms, the
+  # same split `extend-protocol` and `record_protocol_extends` use.
+  # Kept here, away from the compile_special clauses, so it cannot split
+  # that contiguous chain (Elixir needs same-name/arity clauses adjacent).
+  defp reify_protocol_groups(forms, env) do
+    {groups, cur_proto, cur_methods} =
+      Enum.reduce(forms, {[], nil, []}, fn f, {groups, proto, methods} ->
+        case unwrap_meta(f) do
+          {:list, _} = bare -> {groups, proto, methods ++ [bare]}
+          proto_form -> {groups ++ [{proto, methods}], proto_form, []}
+        end
+      end)
+
+    groups =
+      for {proto, method_forms} <- groups ++ [{cur_proto, cur_methods}], proto != nil do
+        {name_of(proto), method_forms}
+      end
+
+    if groups == [] do
+      compile_error(env, "reify: expected at least one protocol with methods")
+    end
+
+    groups
+  end
+
   # Deftype field access lowers to a lookup against the tagged tuple.
   defp compile_deftype_field(field, [obj], env) do
     [obj_ast] = compile_args([obj], env)
@@ -2048,6 +2221,41 @@ defmodule BeamLisp.Compiler do
     quote do
       BeamLisp.Env.fetch!(unquote(ns), unquote(name))
     end
+  end
+
+  # A qualified reference to a var in another namespace must not reach a
+  # private var, matching Clojure's compile-time "var: #'ns/name is not
+  # public". This is checked in the *resolving* namespace (env.ns) at
+  # compile time; same-ns qualified access stays legal. It precedes the
+  # direct-call link in the call path so a private linked fn cannot slip
+  # through the remote-call shortcut either.
+  defp private_fetch_quoted(env, target_ns, var) do
+    if target_ns != env.ns and private_var?(target_ns, var) do
+      compile_error(env, "var #{target_ns}/#{var} is not public")
+    else
+      fetch_quoted(target_ns, var)
+    end
+  end
+
+  # Refuse the same privacy violation when the call path would otherwise
+  # take the linked direct-call shortcut (link metadata bypasses
+  # fetch_quoted). Harmless no-op for unqualified or remote targets.
+  defp reject_private_link(env, name) do
+    if String.contains?(name, "/") do
+      case slash_target(env, name) do
+        {:var, ns, var} ->
+          if ns != env.ns and private_var?(ns, var) do
+            compile_error(env, "var #{ns}/#{var} is not public")
+          end
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp private_var?(ns, name) do
+    match?({:ok, %{private: true}}, Env.meta(ns, name))
   end
 
   defp invoke_quoted(f_ast, arg_asts) do

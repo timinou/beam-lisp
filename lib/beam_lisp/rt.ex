@@ -93,6 +93,32 @@ defmodule BeamLisp.RT do
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
+  @doc """
+  Clojure `identical?`: reference equality.
+
+  On the BEAM this can only be `===` (the no-coercion strict compare),
+  and that is the honest thing to ship, with one documented deviation:
+
+  * terms that genuinely carry reference identity on the VM — funs,
+    pids, ports, references — compare **by identity**: `===` is true
+    exactly for the same term. That matches Clojure exactly.
+  * every immutable, value-typed term (numbers, atoms, strings, tuples,
+    maps, lists, vectors) has **no** reference identity on the BEAM —
+    two equal terms are indistinguishable and may or may not share
+    memory. `===` gives structural equality for these: equal is `true`
+    where Clojure's `identical?` would be `false` (Clojure only
+    *guarantees* a result for references). This is the closest true
+    predicate the VM admits; pretending to a reference identity the
+    term model does not have would be a lie.
+
+  Specter's `NONE` sentinel is built on this: two copies of the sentinel
+  must not be "the same", and two copies of any other value may be. `===`
+  delivers exactly that for the sentinel's reference-typed or atom
+  representation (atoms are interned, so a sentinel atom is genuinely
+  one value, like a Clojure keyword sentinel).
+  """
+  def identical?(a, b), do: a === b
+
   @doc "Clojure `not`: truthiness-based — true exactly for `nil` and `false`."
   def not_(x), do: x == false or x == nil
 
@@ -598,6 +624,77 @@ defmodule BeamLisp.RT do
     end
   end
 
+  @doc "jank's `cpp/jank.runtime.reduced`: wrap x so a `reduce` terminates early with it."
+  def reduced(x), do: %BeamLisp.Reduced{value: x}
+
+  @doc "jank's `cpp/jank.runtime.is_reduced`: true exactly for a reduced wrapper."
+  def reduced?(%BeamLisp.Reduced{}), do: true
+  def reduced?(_), do: false
+
+  @doc """
+  jank's `cpp/jank.runtime.reduce` — `(reduce f init coll)`. Iterates via
+  LazySeq.cell (so vectors, lazy seqs, sets and maps all fold), and
+  short-circuits the moment the step fn returns a Reduced, returning the
+  *unwrapped* value — Clojure peels the sentinel at the halting point, so
+  `transduce`'s `(f ret)` sees a plain result, not a boxed one.
+  """
+  def reduce(f, init, coll), do: reduce_loop(f, init, LazySeq.cell(coll))
+
+  defp reduce_loop(_f, acc, nil), do: acc
+  defp reduce_loop(_f, acc, []), do: acc
+  defp reduce_loop(f, acc, [h | t]) do
+    case invoke(f, [acc, h]) do
+      %BeamLisp.Reduced{} = r -> r.value
+      acc2 -> reduce_loop(f, acc2, LazySeq.cell(t))
+    end
+  end
+
+  @doc "jank's `cpp/jank.runtime.peek`: a vector's last element, a seq's first; nil when empty."
+  def peek(%BeamLisp.Vector{} = v) do
+    case BeamLisp.Vector.to_list(v) do
+      [] -> nil
+      xs -> List.last(xs)
+    end
+  end
+
+  def peek([]), do: nil
+  def peek(nil), do: nil
+  def peek(coll), do: first(coll)
+
+  @doc "jank's `cpp/jank.runtime.pop`: a vector without its last, a seq without its first; empty throws."
+  def pop(%BeamLisp.Vector{} = v) do
+    case BeamLisp.Vector.to_list(v) do
+      [] -> raise(ArgumentError, "Can't pop empty vector")
+      xs -> BeamLisp.Vector.new(Enum.drop(xs, -1))
+    end
+  end
+
+  def pop([]), do: raise(ArgumentError, "Can't pop empty list")
+  def pop(nil), do: raise(ArgumentError, "Can't pop empty list")
+  def pop([_ | t]), do: t
+  def pop(coll), do: rest(coll)
+
+  @doc """
+  jank's `cpp/jank.runtime.promoting_inc`. On the BEAM integers are
+  arbitrary precision, so `+ 1` can never overflow — the promotion jank's
+  C++ `inc'` performs is inherent in the representation, not a step we
+  need to take.
+  """
+  def promoting_inc(x), do: x + 1
+
+  @doc "jank's `cpp/jank.runtime.is_ratio`: beam-lisp has no Ratio type (no exact rationals), so nothing is one."
+  def ratio?(_), do: false
+
+  @doc "jank's `cpp/jank.runtime.is_big_decimal`: beam-lisp has no BigDecimal type, so nothing is one."
+  def decimal?(_), do: false
+
+  @doc "jank's `cpp/jank.runtime.is_sorted`: beam-lisp has no sorted collection type, so nothing is one."
+  def sorted?(_), do: false
+
+  @doc "jank's `cpp/jank.runtime.is_nan`: true for a NaN float (the only value unequal to itself)."
+  def nan?(x) when is_float(x), do: x != x
+  def nan?(_), do: false
+
   @doc """
   Clojure `=`: for lazy operands, realize-and-compare element-wise with
   short-circuiting, so `(= (range) '(1 2))` stops at the first mismatch
@@ -605,7 +702,15 @@ defmodule BeamLisp.RT do
   `==` fast path, preserving existing equality exactly.
   """
   def eqv(a, b) do
-    if LazySeq.lazy?(a) or LazySeq.lazy?(b), do: eqv_walk(a, b), else: Kernel.==(a, b)
+    # Walk whenever an operand is lazy *or* an improper list (a
+    # partially-realized `[h | LazySeq]`), so a lazy interleave result
+    # compares element-wise against a proper list instead of failing the
+    # structural `==` that distinguishes improper from proper.
+    if LazySeq.lazy?(a) or LazySeq.lazy?(b) or improper?(a) or improper?(b) do
+      eqv_walk(a, b)
+    else
+      Kernel.==(a, b)
+    end
   end
 
   defp eqv_walk(a, b) do
@@ -801,9 +906,28 @@ defmodule BeamLisp.RT do
     end
   end
 
-  @doc "`(doall coll)` fully realizes a lazy seq, returning it."
+  @doc """
+  `(doall coll)` fully realizes a lazy seq, returning it. A
+  partially-realized improper list (`[h | LazySeq]` — what cons onto a
+  lazy tail yields) is realized to a proper list too, so a lazy
+  interleave / interpose result survives doall and the printer; a proper
+  list is returned unchanged.
+  """
   def doall(%LazySeq{} = l), do: LazySeq.to_list(l)
+  def doall(coll) when is_list(coll), do: if(improper?(coll), do: LazySeq.to_list(coll), else: coll)
   def doall(coll), do: coll
+
+  # An "improper" list is a cons chain that terminates in a LazySeq
+  # rather than `[]` — the beam-lisp shape for a partially-realized seq
+  # (`cons x lazy`). `LazySeq.to_list` and `LazySeq.sample` already walk
+  # these via cell/1, but plain Enum calls (and the is_list print branch)
+  # assume a proper list, so callers that must handle both check here.
+  defp improper?([_ | t]), do: improper_tail?(t)
+  defp improper?(_), do: false
+  defp improper_tail?(nil), do: false
+  defp improper_tail?([]), do: false
+  defp improper_tail?(%LazySeq{}), do: true
+  defp improper_tail?([_ | t]), do: improper_tail?(t)
 
   @doc "`(dorun coll)` forces a lazy seq for side effects, returning nil."
   def dorun(%LazySeq{} = l) do
@@ -860,14 +984,14 @@ defmodule BeamLisp.RT do
   def print_str(true), do: "true"
   def print_str(false), do: "false"
   def print_str(x) when is_atom(x), do: ":" <> Atom.to_string(x)
-  def print_str(x) when is_list(x), do: "(" <> Enum.map_join(x, " ", &print_elem/1) <> ")"
-
-  def print_str(%LazySeq{} = l) do
-    {elems, truncated} = LazySeq.sample(l, 20)
-    body = Enum.map_join(elems, " ", &print_elem/1)
-    suffix = if truncated, do: " …", else: ""
-    "(" <> body <> suffix <> ")"
+  # A proper list prints fully; an improper one (a partially-realized
+  # seq whose tail is a LazySeq) goes through the bounded sample path so
+  # an infinite lazy interleave can never hang the printer.
+  def print_str(x) when is_list(x) do
+    if improper?(x), do: print_seq(x), else: "(" <> Enum.map_join(x, " ", &print_elem/1) <> ")"
   end
+
+  def print_str(%LazySeq{} = l), do: print_seq(l)
 
   # A set prints as `#{…}`. The `"#" <> "{"` splice avoids the `#{`
   # Elixir-interpolation pitfall. (A set is a struct-map, so this must
@@ -901,6 +1025,17 @@ defmodule BeamLisp.RT do
   def print_str(m) when is_map(m), do: print_str_map(m)
 
   def print_str(x), do: inspect(x)
+
+  # Bounded printing for a lazy or improper seq: realize at most 20
+  # elements and truncate with " …" if more remain, so an infinite seq
+  # can never hang the printer. Shared by LazySeq and improper-list
+  # print_str clauses.
+  defp print_seq(seq) do
+    {elems, truncated} = LazySeq.sample(seq, 20)
+    body = Enum.map_join(elems, " ", &print_elem/1)
+    suffix = if truncated, do: " …", else: ""
+    "(" <> body <> suffix <> ")"
+  end
 
   defp print_str_map(m) do
     pairs = Enum.map_join(m, ", ", fn {k, v} -> print_elem(k) <> " " <> print_elem(v) end)
@@ -1013,6 +1148,7 @@ defmodule BeamLisp.RT do
       ">=" => chain.(&Kernel.>=/2),
       "=" => eqv_chain(),
       "not" => &not_/1,
+      "identical?" => &identical?/2,
       "str" => str(),
       "first" => &first/1,
       "rest" => &rest/1,
@@ -1093,6 +1229,12 @@ defmodule BeamLisp.RT do
       "deliver" => &BeamLisp.Refs.deliver/2,
       "future?" => &BeamLisp.Refs.future?/1,
       "future-cancel" => &BeamLisp.Refs.future_cancel/1,
+      "volatile!" => &BeamLisp.Refs.volatile/1,
+      "vreset!" => &BeamLisp.Refs.vreset!/2,
+      "vswap!" => multi_fn(%{2 => &BeamLisp.Refs.vswap!/2}, {2, &BeamLisp.Refs.vswap!/3}),
+      "volatile?" => &BeamLisp.Refs.volatile?/1,
+      "reduced" => &reduced/1,
+      "reduced?" => &reduced?/1,
       "reader-macro!" => &reader_macro!/2
     }
 
@@ -1165,7 +1307,28 @@ defmodule BeamLisp.RT do
     cpp_prims = %{
       "jank.runtime.name" => &name_of/1,
       "jank.runtime.namespace_" => &namespace_of/1,
-      "jank.runtime.keyword" => &keyword_of/2
+      "jank.runtime.keyword" => &keyword_of/2,
+      # The reduce/transducer core and the numeric layer. `reduce` is
+      # honest: it actually short-circuits on a Reduced, and the is_*
+      # predicates report beam-lisp's real type space (no Ratio, no
+      # BigDecimal, no sorted coll, so those are genuinely always false).
+      "jank.runtime.reduce" => &reduce/3,
+      "jank.runtime.reduced" => &reduced/1,
+      "jank.runtime.is_reduced" => &reduced?/1,
+      "jank.runtime.peek" => &peek/1,
+      "jank.runtime.pop" => &pop/1,
+      "jank.runtime.promoting_inc" => &promoting_inc/1,
+      "jank.runtime.is_integer" => &int?/1,
+      "jank.runtime.is_ratio" => &ratio?/1,
+      "jank.runtime.is_big_decimal" => &decimal?/1,
+      "jank.runtime.is_sorted" => &sorted?/1,
+      "jank.runtime.is_nan" => &nan?/1,
+      "jank.runtime.is_list" => &list?/1,
+      "jank.runtime.volatile_" => &BeamLisp.Refs.volatile/1,
+      "jank.runtime.vreset" => &BeamLisp.Refs.vreset!/2,
+      "jank.runtime.vswap" =>
+        multi_fn(%{2 => &BeamLisp.Refs.vswap!/2, 3 => &BeamLisp.Refs.vswap!/3}),
+      "jank.runtime.is_volatile" => &BeamLisp.Refs.volatile?/1
     }
 
     Enum.each(cpp_prims, fn {name, f} -> Env.intern("cpp", name, f) end)
@@ -1246,7 +1409,8 @@ defmodule BeamLisp.RT do
       "set?" => 1,
       "disj" => 2,
       "sequential?" => 1,
-      "compare" => 2
+      "compare" => 2,
+      "identical?" => 2
     }
 
     for {name, spec} <- rt_fns do

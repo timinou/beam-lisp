@@ -9,6 +9,46 @@ defmodule BeamLisp.Atom do
   defstruct [:pid]
 end
 
+
+defmodule BeamLisp.Volatile do
+  @moduledoc """
+  beam-lisp's `(volatile! v)` — Clojure's unsynchronized mutable box,
+  on the BEAM.
+
+  The value lives in the **process dictionary** of the process that
+  created it, keyed by a unique reference. `deref` reads it, `vreset!`
+  overwrites it, `vswap!` reads-and-writes, and all three are plain
+  dictionary operations — no Agent, no message passing, no serialization.
+  That is deliberately cheaper than an atom, honouring the deal Clojure's
+  volatiles make with stateful transducers: the reduction is
+  single-threaded by contract, so the box needs no coordination.
+
+  **What this guarantees:** reads and writes are atomic *within the
+  creating process*, and that is all. A transducer reduction runs in one
+  process, so every volatile it touches lives there.
+
+  **What it does NOT guarantee:** cross-process visibility, cross-process
+  atomicity, or survival of the creating process. A volatile is not an
+  atom: it will not and cannot coordinate two processes. If a value must
+  cross a process boundary, use `(atom v)`. The struct holds only the
+  dictionary key, never the value, so it is safe to send anywhere; the
+  value simply is not visible outside its home process.
+  """
+  defstruct [:key]
+end
+
+defmodule BeamLisp.Reduced do
+  @moduledoc """
+  Clojure's `Reduced` sentinel: wraps a value so a `reduce` terminates
+  early with it. `reduce` returns the *unwrapped* value when the step
+  function yields a Reduced (the sentinel is peeled at the halting
+  point); `reduced?` tests for the wrapper, and `deref`/`unreduced` peel
+  it by hand. Structurally a plain one-field struct, so `=` distinguishes
+  it from the value it carries.
+  """
+  defstruct [:value]
+end
+
 defmodule BeamLisp.Promise do
   @moduledoc """
   A single-assignment reference: `deref` blocks until `deliver` sets
@@ -77,7 +117,49 @@ defmodule BeamLisp.Refs do
     raise ArgumentError, message: "compare-and-set!: not an atom: #{inspect(other)}"
   end
 
+
+  # --- volatiles ---
+  # A volatile is an *unsynchronized* box (see the BeamLisp.Volatile
+  # moduledoc): a process-dictionary cell, not an Agent. That is the
+  # whole point — the transducer layer creates and swaps a volatile per
+  # step, so spawning a process for each would forfeit the performance
+  # deal. The cost is the documented honesty: visible only within the
+  # creating process. Single-threaded reductions get the speed, and
+  # anything that needs to coordinate processes is told to use `atom`.
+
+  def volatile(v) do
+    key = make_ref()
+    Process.put({BeamLisp.Volatile, key}, v)
+    %BeamLisp.Volatile{key: key}
+  end
+
+  def vreset!(%BeamLisp.Volatile{} = vol, v) do
+    Process.put({BeamLisp.Volatile, vol.key}, v)
+    v
+  end
+
+  def vreset!(other, _v), do: raise(ArgumentError, "vreset!: not a volatile: #{inspect(other)}")
+
+  def vswap!(vol, f), do: vswap!(vol, f, [])
+
+  # Like swap!, the step fn runs in the caller's process (no Agent), so
+  # read-modify-write is atomic only against other ops in the same
+  # process — which is exactly the volatile contract.
+  def vswap!(%BeamLisp.Volatile{} = vol, f, args_list) do
+    new = BeamLisp.RT.invoke(f, [deref(vol) | args_list])
+    Process.put({BeamLisp.Volatile, vol.key}, new)
+    new
+  end
+
+  def vswap!(other, _f, _args_list) do
+    raise ArgumentError, "vswap!: not a volatile: #{inspect(other)}"
+  end
+
+  def volatile?(%BeamLisp.Volatile{}), do: true
+  def volatile?(_), do: false
+
   # --- futures ---
+
 
   def future_exec(thunk_fn), do: %BeamLisp.Future{task: Task.async(thunk_fn)}
   def future?(%BeamLisp.Future{}), do: true
@@ -154,6 +236,9 @@ defmodule BeamLisp.Refs do
 
   def deref(%BeamLisp.Promise{} = p), do: deref(p, :infinity, nil)
 
+  def deref(%BeamLisp.Volatile{} = vol), do: Process.get({BeamLisp.Volatile, vol.key})
+  def deref(%BeamLisp.Reduced{} = r), do: r.value
+
   def deref(other), do: raise(ArgumentError, "deref: not a derefable reference: #{inspect(other)}")
 
   def deref(%BeamLisp.Atom{} = atom, _timeout_ms, _timeout_val), do: Agent.get(atom.pid, & &1)
@@ -165,6 +250,9 @@ defmodule BeamLisp.Refs do
       :exit, {:timeout, _} -> timeout_val
     end
   end
+
+  def deref(%BeamLisp.Volatile{} = vol, _timeout_ms, _timeout_val), do: Process.get({BeamLisp.Volatile, vol.key})
+  def deref(%BeamLisp.Reduced{} = r, _timeout_ms, _timeout_val), do: r.value
 
   def deref(%BeamLisp.Promise{} = p, timeout_ms, timeout_val) do
     pid = p.pid

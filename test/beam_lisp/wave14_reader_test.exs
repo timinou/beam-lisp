@@ -4,7 +4,10 @@ defmodule BeamLisp.Wave14ReaderTest do
   # gap list names. The desugaring happens entirely in the reader, which
   # is how Clojure does it (a reader macro), so the compiler never sees
   # `#` — it only ever gets the `(fn [params] body)` form.
-  use ExUnit.Case, async: true
+  # NOT async: the evaluation tests below compile forms, which rebuilds
+  # the shared namespace modules — concurrent Module.create on the same
+  # module fails outright, so this file must run alone.
+  use ExUnit.Case, async: false
 
   alias BeamLisp.Reader
   alias BeamLisp.Reader.SyntaxError

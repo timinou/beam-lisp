@@ -41,6 +41,15 @@ defmodule BeamLisp.Reader do
       every collection too, so `#(vector [% %])` works.
     * `#_ form` — discard: reads and drops the next form, so `(+ 1 #_2 3)`
       is `(+ 1 3)`. (A trailing `#_` with nothing after is an error.)
+    * `#?(…)` / `#?@(…)` — reader conditional. `#?(:clj a :cljs b)`
+      selects a branch by platform feature, `#?@` splices the selected
+      collection's elements into the enclosing collection. beam-lisp
+      answers to **`:clj`** (see the reader-conditionals section);
+      `:default` matches last-resort, an unmatched conditional is a read
+      error, and a top-level `#?@` is refused.
+    * `^… form` — reader metadata. `^:kw form`, `^{:map} form`,
+      `^Sym form` and `^"str" form` attach a metadata map to the
+      following form (see `meta_form/2`).
 
   Character literals `\\a` `\\newline` `\\space` `\\tab` `\\return`
   `\\backspace` `\\formfeed` `\\uNNNN` and `\\\\` read as **integer
@@ -172,6 +181,11 @@ defmodule BeamLisp.Reader do
 
   defp forms(rest, pos, acc) do
     case form(rest, pos) do
+      # A `#?@` splice at the top level has no enclosing collection to
+      # splice into; Clojure refuses it the same way.
+      {:ok, {:splice, _items}, _rest, _pos} ->
+        {:error, "reader conditional splicing (#?@) is only allowed inside a collection"}
+
       {:ok, f, rest, pos} ->
         {rest, pos} = skip_ignored(rest, pos)
         forms(rest, pos, [f | acc])
@@ -211,6 +225,17 @@ defmodule BeamLisp.Reader do
         collection(rest, advance_pos(pos, [?#, ?{]), ?}, &{:set, &1})
 
       [?#, ?_ | rest] -> discard_form(rest, pos)
+      # `#?` — the reader conditional (`#?(:clj … :cljs …)`), splicing
+      # form `#?@(...)`. Must be matched before the bare-`#` path so a
+      # conditional is never misread as a symbol (the silent mis-read that
+      # shipped before wave 25 — a reader error is better than a wrong
+      # form).
+      [?#, ?? | rest] -> reader_conditional(rest, pos)
+      # `^:kw form` / `^{:doc ...} form` / `^Sym form` — the reader
+      # metadata macro. `^` is not a delimiter, so without this clause it
+      # would read `^:private` as a bare symbol; here it attaches metadata
+      # to the form that follows (see meta_form/2).
+      [?^ | rest] -> meta_form(rest, pos)
       # `#Name{...}` / `#ns/Name{...}` — a record literal. Matched after
       # the `#`-dispatch forms it must not steal (`#()`, `#{}`, `#_`); a
       # `#` followed by anything else falls to record_or_tag, which reads
@@ -294,6 +319,67 @@ defmodule BeamLisp.Reader do
     end
   end
 
+  # `^:kw form` / `^{:doc ...} form` / `^Sym form` / `^"str" form` — the
+  # reader metadata macro. Reads a metadata spec, then the target form, and
+  # attaches the spec as a metadata map on the target (see attach_meta/2).
+  defp meta_form(rest, pos0) do
+    {rest, pos} = skip_ignored(rest, pos0)
+
+    case form(rest, pos) do
+      {:ok, spec, rest, pos} ->
+        {rest, pos} = skip_ignored(rest, pos)
+
+        case form(rest, pos) do
+          {:ok, target, rest, pos} -> {:ok, attach_meta(target, metadata_spec(spec)), rest, pos}
+          :none -> {:error, "^ with no form to attach metadata to"}
+          err -> err
+        end
+
+      :none ->
+        {:error, "^ with no metadata (expected a Symbol, Keyword, String or Map)"}
+
+      err ->
+        err
+    end
+  end
+
+  # Merge `^` metadata onto the target form. When the target already carries
+  # a `{:meta, form, m}` wrapper — a list with a source position, or a
+  # previous `^` in a stack like `^:private ^:static x` — the maps merge;
+  # otherwise a fresh wrapper is created.
+  #
+  # This is the deliberate crossing of wave 20's "symbols stay bare" line:
+  # positions attach to lists only because symbols are shape tokens matched
+  # structurally in ~50 compiler sites. But `^` metadata is *written by the
+  # author onto a specific form* — a def name, a fn param — so it only ever
+  # wraps a form the author explicitly decorated, never every symbol. The
+  # compiler peels the wrapper at compile/2 (positions) and name_of (names),
+  # so a `^`-wrapped symbol costs nothing at the ~50 bare-symbol sites; the
+  # ones that do see it are exactly the def/defn handlers that consume it.
+  defp attach_meta({:meta, form, m}, meta_map), do: {:meta, form, Map.merge(m, meta_map)}
+  defp attach_meta(form, meta_map), do: {:meta, form, meta_map}
+
+  # The spec after `^` lowers to a metadata map with atom keys, the shape
+  # FormMeta and the compiler's var-metadata writer both consume. `^:kw` is
+  # `{:kw true}`; `^Sym`/`^"str"` are `{:tag …}`; `^{...}` is the map
+  # itself (keys must be keywords, as in Clojure). Values stay reader forms
+  # — the compiler lowers them when the metadata lands on a var.
+  defp metadata_spec({:keyword, name}), do: %{String.to_atom(name) => true}
+  defp metadata_spec({:symbol, name}), do: %{:tag => {:symbol, name}}
+  defp metadata_spec(str) when is_binary(str), do: %{:tag => str}
+  defp metadata_spec({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {metadata_key(k), v} end)
+
+  defp metadata_spec(other) do
+    raise SyntaxError,
+      message: "metadata must be a Symbol, Keyword, String or Map, got: #{inspect(other)}"
+  end
+
+  defp metadata_key({:keyword, name}), do: String.to_atom(name)
+
+  defp metadata_key(other) do
+    raise SyntaxError, message: "metadata map keys must be keywords, got: #{inspect(other)}"
+  end
+
   # `#Name{...}` / `#ns/Name{...}` — a record literal. Read the type name
   # after the `#`; if a `{` follows it, read a map and lower to
   # `{:record, name, kvs}`. A `#` NOT followed by a record brace is just a
@@ -320,6 +406,104 @@ defmodule BeamLisp.Reader do
         atom_form([?# | rest], pos0)
     end
   end
+
+  # --- reader conditionals ---
+  #
+  # `#?(:clj … :cljs …)` selects one branch by platform feature;
+  # `#?@(:clj [a b] :default [c])` splices the selected collection's
+  # elements into the enclosing collection. Both read the conditional
+  # body as a flat `feat expr feat expr …` sequence and pick the first
+  # match (see select_conditional/1); the splice then requires the chosen
+  # branch to BE a collection and returns a `{:splice, items}` marker the
+  # enclosing collection reader flattens.
+  #
+  # ## Which platform does beam-lisp answer to?
+  #
+  # `:clj`. Not `:bl`/`:beam` — honest, but no upstream file mentions
+  # them, so every conditional would take the default branch, and most
+  # `.cljc` conditionals have NO `:default`, which would turn the whole
+  # file unreadable again. The point of supporting `#?` at all is to read
+  # `.cljc` source (Specter is 139 conditionals across its modules), and
+  # the JVM branch is the one closest to what beam-lisp implements, so it
+  # is the branch that *can* run. The tradeoff is real: a `:clj` branch may
+  # name a JVM-only var (`clojure.lang.PersistentQueue`) that beam-lisp
+  # lacks, turning what would have been a clean read-failure into a runtime
+  # failure. That is the honest cost of claiming the JVM branch, and
+  # `:default` remains the escape hatch for source that must never take it.
+  @conditional_feature :clj
+
+  # `#?(...)` — select one branch and return its form as-is.
+  defp reader_conditional([?( | rest], pos0) do
+    {rest, pos} = skip_ignored(rest, pos0)
+
+    case forms_until(rest, pos, ?), []) do
+      {:ok, items, rest, pos} ->
+        case select_conditional(items) do
+          {:ok, form} -> {:ok, form, rest, pos}
+          err -> err
+        end
+
+      err ->
+        err
+    end
+  end
+
+  # `#?@(...)` — select one branch and splice its elements in.
+  defp reader_conditional([?@, ?( | rest], pos0) do
+    {rest, pos} = skip_ignored(rest, pos0)
+
+    case forms_until(rest, pos, ?), []) do
+      {:ok, items, rest, pos} ->
+        case select_conditional(items) do
+          {:ok, form} -> splice_items(form, rest, pos)
+          err -> err
+        end
+
+      err ->
+        err
+    end
+  end
+
+  defp reader_conditional(_, _pos0),
+    do: {:error, "reader conditional must be #?( ... ) or #?@( ... )"}
+
+  # Walk `feat expr feat expr …`. The first feature that matches wins;
+  # `:default` matches last-resort. A feature that does not match skips its
+  # expression. No match at all is an error (Clojure's behaviour) — a
+  # silent empty read would hide a branch-selection bug.
+  defp select_conditional([feat, expr | rest]) do
+    case feature_match?(feat) do
+      {:ok, true} -> {:ok, expr}
+      {:ok, false} -> select_conditional(rest)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp select_conditional([feat]) do
+    case feature_match?(feat) do
+      {:ok, _} -> {:error, "reader conditional feature #{inspect(feat)} has no expression"}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp select_conditional([]),
+    do: {:error, "reader conditional matched no feature and has no :default branch"}
+
+  # `@conditional_feature` (our platform) and `:default` match; anything
+  # else skips.
+  defp feature_match?({:keyword, feat}), do: {:ok, feature_selected?(feat)}
+  defp feature_match?(other), do: {:error, "reader conditional feature must be a keyword, got: #{inspect(other)}"}
+
+  defp feature_selected?(feat),
+    do: feat == Atom.to_string(@conditional_feature) or feat == "default"
+
+  # A splice branch must be a collection; its elements become the marker.
+  defp splice_items({:vector, items}, rest, pos), do: {:ok, {:splice, items}, rest, pos}
+  defp splice_items({:list, items}, rest, pos), do: {:ok, {:splice, items}, rest, pos}
+  defp splice_items({:set, items}, rest, pos), do: {:ok, {:splice, items}, rest, pos}
+
+  defp splice_items(other, _rest, _pos),
+    do: {:error, "reader conditional splicing requires a collection, got: #{inspect(other)}"}
 
   # Rewrite the `#(...)` body into a single-clause `(fn [params] body)`.
   # Params are p1__..pN__ (rest: rest__) — names with a marker a human
@@ -410,6 +594,13 @@ defmodule BeamLisp.Reader do
       [] -> {:error, "unterminated collection, expected #{<<closer>>}"}
       rest ->
         case form(rest, pos) do
+          # A `#?@` splice contributes its elements, not a marker node —
+          # the acc is a prepending stack, so the splice items are
+          # reversed before they join it.
+          {:ok, {:splice, items}, rest, pos} ->
+            {rest, pos} = skip_ignored(rest, pos)
+            forms_until(rest, pos, closer, Enum.reverse(items) ++ acc)
+
           {:ok, f, rest, pos} ->
             {rest, pos} = skip_ignored(rest, pos)
             forms_until(rest, pos, closer, [f | acc])
