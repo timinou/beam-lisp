@@ -1,7 +1,7 @@
 # Specter compatibility measurement
 
 **Thesis under test:** Specter is the settled north star for beam-lisp's
-optics story. beam-lisp just shipped its own `priv/optics.bl` — a
+optics story. beam-lisp ships its own `priv/optics.bl` — a
 van-Laarhoven-flavored lens/traversal library — but that is a beam-lisp
 design, not the thing users of Clojure reach for. Clojure's optics
 de-facto standard is *Specter*, and the question this document measures
@@ -13,6 +13,24 @@ stdlib. Same rules, same honesty: loading a slice of the real Specter
 and calling it with Specter's own examples is the measurement. A low
 score is a *successful measurement* — it names precisely what to build
 next, ranked by how many slices each gap unlocks.
+
+## Headline — measured 2026-08-07
+
+> **23 of 31 slices load. 4 of 31 load *and* behave.**
+>
+> Load rose from **11 → 23** since the last full measurement, and behave
+> from **1 → 4**. The two numbers now tell opposite stories, and that
+> divergence *is* the finding: the syntax wave closed the load gap but
+> barely moved behavior, because what remains is not special forms — it
+> is Specter's **impl machinery** (`i/NONE`, the compiled-path cache, the
+> exec interop) plus a handful of missing *core prims* (`type`, `into`,
+> `vec`, `sequence`, `reduce-kv`, `subs`, `unreduced`, …) that the old
+> taxonomy never listed.
+>
+> The four behaving slices are the protocol definitions (`RichNavigator`,
+> `Collector`, `ImplicitNav`), one pure filter-path function, and one
+> pure list-insertion helper. Every *navigator* still either fails to
+> load (blocked on the `defnav` macro stack) or loads but cannot run.
 
 ## Source & provenance
 
@@ -37,264 +55,251 @@ Measured shape of the source (all 3,379 lines):
 > **`.bl` vs `.cljc`.** The fixtures use `.bl` for consistency with the
 > jank fixtures, even though the source is `.cljc`. The extension is
 > cosmetic — the harness evaluates the text directly. Reader-conditionals
-> (`#?`) are preserved verbatim inside a slice, and one of the key
-> findings is that beam-lisp's reader cannot read them.
+> (`#?`) are preserved verbatim inside a slice, and the reader now reads
+> them (selecting the `:clj` branch); one slice (29) still cannot load
+> because its `#?(:bb … :cljs …)` block has **no** `:clj` branch — which
+> is *correct* reader behavior, identical to Clojure (see below).
 
 ## Method
 
 1. **Slice.** Copy each candidate block *verbatim* out of the Specter
    source into `test/fixtures/specter/slice_NN_<name>.bl`. The slices
-   are chosen to span the real surface rather than the easy surface:
-   the protocol definitions, the simple navigators, the core entry
-   points, plus — deliberately — a `defrecord`-heavy block, a `deftype`
-   block, and a reader-conditional block that are *expected* to fail.
-   Those failures are the point: they are the ranked gap list.
-2. **Load.** The harness wraps each slice in a throwaway `(ns specter.slice_NN)`
-   and `Compiler.eval_string`s it. The vendored `(ns com.rpl.specter.impl …)`
+   span the real surface: protocol definitions, simple navigators,
+   entry-point macros, plus the `defrecord`-heavy path-analyzer and the
+   `deftype`/reader-conditional `MutableCell` block.
+2. **Load.** The harness wraps each slice in a throwaway `(ns …)` and
+   `Compiler.eval_string`s it. The vendored `(ns com.rpl.specter.impl …)`
    header line is excluded because the harness provides its own
-   namespace (the same convention as the jank fixtures). A slice that
-   needs a local edit is a **FAIL with a recorded reason** — never a
-   patch. The vendored text is never rewritten (a checksum test guards
-   that).
-3. **Behave.** Loading only proves the reader + compiler accept the
-   form. Each loaded slice is then *called* with an upstream-shaped
-   argument. This is where the real verdict lands.
+   namespace. A slice that needs a local edit is a **FAIL with a
+   recorded reason** — never a patch. The vendored text is never
+   rewritten (a checksum test guards that).
+3. **Behave.** Each loaded slice is then *called* with an
+   upstream-shaped argument. Where a slice calls a sibling in the
+   vendored set (e.g. `if-select` calls `i/exec-select*`), the sibling
+   is co-loaded into its canonical upstream namespace and aliased as
+   upstream does — that is Specter's own internal dependency, not a
+   beam-lisp gap. Slices that need *non-vendored* upstream machinery
+   (`i/NONE`, `doseqres`, `eachnav`, `PosNavigator`, the `path` macro,
+   `compiled-traverse*`, …) are recorded as load-only with that named as
+   the blocker.
 
-> **`load` ≠ `behave`.** Ten slices read and compile ("load") but fail
-> when called — the jank pattern in miniature. Notably the four
-> entry-point *macros* (`select`/`select-any`/`transform`/`setval`)
-> all load, because `defmacro` compiles its backquote template without
-> resolving the vars it names; they fail at expansion, naming the
-> absent `i/*` impl. And `not-selected?*` loads but can't run because
-> its body reaches for `identical?` at call time.
+> **`load` ≠ `behave`, and never more starkly than here.** 19 of the 23
+> loaded slices cannot run. Worse than a clean failure, the ones that
+> reference an unresolved qualified name — every `i/NONE` client — do
+> not fail loudly at all: see *the phantom sentinel* below. The gap
+> between the two numbers is not syntax; it is machinery.
 
 ## The checklist — 31 attempted slices
 
-Verdicts: **✓ pass** (loads and behaves) · **◐ load-only** (reads and
-compiles, fails at call — behavioral gap) · **✗ fail** (a recorded
+Verdicts: **✓ pass** (loads *and* behaves) · **◐ load-only** (reads and
+compiles, fails when called — behavioral gap) · **✗ fail** (a recorded
 load/compile gap). Row *lines* are the upstream span at the commit
-above. `defn-` = private function definition.
+above.
 
 | # | slice | upstream | defines | verdict | blocker |
 |---|-------|----------|---------|:-------:|---------|
-| 01 | rich-navigator-protocol | protocols.cljc 3–18 | `RichNavigator` defprotocol | ✗ | `defprotocol` can't skip a leading docstring |
-| 02 | collector-implicitnav | protocols.cljc 21–27 | `Collector`, `ImplicitNav` | ✗ | same docstring gap |
-| 03 | determine-params-impls | macros.clj 6–11 | `determine-params-impls` | ✗ | `defn-` missing |
-| 04 | richnav+nav | macros.clj 14–32 | `richnav`, `nav` macros | ✗ | map destructuring can't key on `'select*` (and needs `reify`) |
-| 05 | defnav+defrichnav | macros.clj 34–54 | `defnav`, `defrichnav` | ✗ | `defn-` missing |
-| 06 | not-selected/selected | navs.cljc 15–23 | `not-selected?*`, `selected?*` | ◐ | loads; `identical?` missing at call |
-| 07 | all-select | navs.cljc 26–28 | `all-select` | ◐ | loads; `doseqres` macro missing at call |
-| 08 | queue? reader-cond | navs.cljc 30–37 | `queue?` | ✗ | **`#?` reader conditional** — reads `#?` as a bare symbol |
-| 09 | void-kv-pair + non-transient | navs.cljc 43–55 | `void-transformed-kv-pair?`, `non-transient-map-all-transform` | ✗ | `defn-` missing |
-| 10 | not-NONE? + all-transform | navs.cljc 57–69 | `not-NONE?`, `all-transform-list`, `all-transform-record` | ✗ | `defn-` missing |
-| 11 | srange-select | navs.cljc 395–402 | `srange-select`, `srange-transform` | ◐ | loads; `vec` missing at call (`subs` too, for the string branch) |
-| 12 | extract-basic-filter-fn | navs.cljc 405–418 | `extract-basic-filter-fn` | ✓ | self-contained |
-| 13 | if-select + if-transform | navs.cljc 421–437 | `if-select`, `if-transform` | ◐ | loads; `i/exec-select*`/`i/exec-transform*` impl not vendored |
-| 14 | do-keypath-transform | navs.cljc 689–695 | `do-keypath-transform` | ✗ | `defn-` missing |
-| 15 | keypath* + must* | navs.cljc 697–721 | `keypath*`, `must*` | ✗ | `defrichnav` (→ `reify`) missing |
-| 16 | insert-before-index-list | navs.cljc 755–758 | `insert-before-index-list` | ✗ | `defn-` missing |
-| 17 | static-path + wrap-dynamic | specter.cljc 35–53 | `static-path?`, `wrap-dynamic-nav` | ✗ | `defn-` missing |
-| 18 | select macro | specter.cljc 349–354 | `select` | ◐ | loads; expands to `path` + `i/compiled-select*` |
+| 01 | rich-navigator-protocol | protocols.cljc 3–18 | `RichNavigator` defprotocol | **✓** | — reify + dispatch of both methods work |
+| 02 | collector-implicitnav | protocols.cljc 21–27 | `Collector`, `ImplicitNav` | **✓** | — both dispatch |
+| 03 | determine-params-impls | macros.clj 6–11 | `determine-params-impls` | ◐ | `into`, `keys` missing |
+| 04 | richnav+nav | macros.clj 14–32 | `richnav`, `nav` | ✗ | **quoted-symbol map-destructure key** (`'select*`) |
+| 05 | defnav+defrichnav | macros.clj 34–54 | `defnav`, `defrichnav` | ◐ | `symbol` missing (`helper-name`); macros expand via 04 |
+| 06 | not-selected/selected | navs.cljc 15–23 | `not-selected?*`, `selected?*` | ◐ | `i/compiled-select-any*` + `i/NONE` (impl) |
+| 07 | all-select | navs.cljc 26–28 | `all-select` | ◐ | `doseqres` + `i/NONE` (not vendored) |
+| 08 | queue? reader-cond | navs.cljc 30–37 | `queue?` | ◐ | `instance?` + `clojure.lang.PersistentQueue` (Java) |
+| 09 | void-kv-pair + non-transient | navs.cljc 43–55 | `void-transformed-kv-pair?`, `non-transient-map-all-transform` | ◐ | `i/NONE`, `reduce-kv` |
+| 10 | not-NONE? + all-transform | navs.cljc 57–69 | `not-NONE?`, `all-transform-list/-record` | ◐ | `i/NONE`, `sequence` |
+| 11 | srange-select | navs.cljc 395–402 | `srange-select`, `srange-transform` | ◐ | `vec`, `subs`, `i/srange-transform*` |
+| 12 | extract-basic-filter-fn | navs.cljc 405–418 | `extract-basic-filter-fn` | **✓** | self-contained |
+| 13 | if-select + if-transform | navs.cljc 421–437 | `if-select`, `if-transform` | ◐ | `i/exec-select*` (28) can't expand: `^Tag`-metad let symbol + `.select*` |
+| 14 | do-keypath-transform | navs.cljc 689–695 | `do-keypath-transform` | ◐ | `i/NONE` (phantom), `dissoc`, `i/srange-transform*` |
+| 15 | keypath* + must* | navs.cljc 697–721 | `keypath*`, `must*` | ✗ | needs `defrichnav` (05) → stack blocked at 04 |
+| 16 | insert-before-index-list | navs.cljc 755–758 | `insert-before-index-list` | **✓** | self-contained |
+| 17 | static-path + wrap-dynamic | specter.cljc 35–53 | `static-path?`, `wrap-dynamic-nav` | ◐ | `i/dynamic-param?` (31) needs `type` |
+| 18 | select macro | specter.cljc 349–354 | `select` | ◐ | `path` macro + `i/compiled-select*` (impl) |
 | 19 | select-any macro | specter.cljc 373–379 | `select-any` | ◐ | same — `path` + `i/compiled-select-any*` |
 | 20 | transform macro | specter.cljc 386–392 | `transform` | ◐ | `path` + `i/compiled-transform*` |
 | 21 | setval macro | specter.cljc 409–413 | `setval` | ◐ | `path` + `i/compiled-setval*` |
-| 22 | comp-paths | specter.cljc 516–520 | `comp-paths` | ◐ | loads; `vec` missing at call (`(i/comp-paths* (vec apath))`) |
-| 23 | ALL | specter.cljc 717–725 | `ALL` nav | ✗ | `defnav` (→ `reify`) missing |
-| 24 | MAP-VALS | specter.cljc 740–749 | `MAP-VALS` nav | ✗ | `defnav` missing |
-| 25 | FIRST + LAST | specter.cljc 767–777 | `FIRST`, `LAST` | ✗ | `def` init calls `n/PosNavigator` → **compiler crash** |
-| 26 | srange | specter.cljc 793–801 | `srange` nav | ✗ | `defnav` missing |
-| 27 | keypath | specter.cljc 989–993 | `keypath` | ✗ | `def` init calls `eachnav` → **compiler crash** |
-| 28 | exec-select/transform | impl.cljc 99–127 | `exec-select*`, `exec-transform*` | ✗ | `#?` reader conditional |
-| 29 | mutable-cell deftype | impl.cljc 222–273 | `MutableCell` | ✗ | `#?` reader + `defrecord`/`deftype` missing |
-| 30 | compiled-select/transform | impl.cljc 372–441 | `compiled-select*` … `terminal*` | ◐ | loads; `mutable-cell`/`identical?`/`reduced`/`unreduced` missing at call |
-| 31 | defrecord path forms | impl.cljc 449–474 | `LocalSym` … `DynamicFunction`, `dynamic-param?` | ✗ | `defrecord` missing |
+| 22 | comp-paths | specter.cljc 516–520 | `comp-paths` | ◐ | `i/comp-paths*` + `vec` |
+| 23 | ALL | specter.cljc 717–725 | `ALL` nav | ✗ | needs `defnav` (05) → stack blocked at 04 |
+| 24 | MAP-VALS | specter.cljc 740–749 | `MAP-VALS` nav | ✗ | needs `defnav` (05) → stack blocked at 04 |
+| 25 | FIRST + LAST | specter.cljc 767–777 | `FIRST`, `LAST` | ✗ | `n/PosNavigator` (non-vendored navs) |
+| 26 | srange | specter.cljc 793–801 | `srange` nav | ✗ | needs `defnav` (05) → stack blocked at 04 |
+| 27 | keypath | specter.cljc 989–993 | `keypath` | ✗ | `eachnav` (non-vendored navs) |
+| 28 | exec-select/transform | impl.cljc 99–127 | `exec-select*`, `exec-transform*` | ◐ | expansion: `^Tag`-metad let symbol, `.select*` interop |
+| 29 | mutable-cell deftype | impl.cljc 222–273 | `MutableCell` | ✗ | `#?(:bb … :cljs …)` — **no `:clj` branch** (correct) |
+| 30 | compiled-select/transform | impl.cljc 372–441 | `compiled-select*` … `terminal*` | ◐ | `mutable-cell` (29), `compiled-traverse*`, `unreduced` |
+| 31 | defrecord path forms | impl.cljc 449–474 | `LocalSym` … `dynamic-param?` | ◐ | records construct; `dynamic-param?` needs `type` |
 
-## Counts — the headline
+**Counts.** 23 load; **4 behave** (`✓`); 8 fail to load (04, 15, 23, 24,
+25, 26, 27, 29); 19 load but do not behave (03, 05, 06, 07, 08, 09, 10,
+11, 13, 14, 17, 18, 19, 20, 21, 22, 28, 30, 31).
 
-> **1 of 31 attempted slices** loads **and** behaves. 10 more load but
-> fail when called; 20 fail at read/compile. That is a low number, and
-> the honest one. Specter is *built* on the four things beam-lisp
-> deliberately does not have — `deftype`, `defrecord`, `reify` (the
-> whole Navigator-construction macro stack sits on it), and reader
-> conditionals — plus `defn-`, which beam-lisp lacks entirely. Every
-> single slice that fails does so for a nameable reason below.
->
-> The single passing slice, `extract-basic-filter-fn` (a pure function
-> that turns a filter path — one predicate or a collection of them —
-> into one predicate), is telling in a good way: **Specter's pure
-> functions run on beam-lisp today.** `fn?`/`coll?`/`every?`/`reduce`/
-> `and`/`cond` are all present, and the slice behaves correctly. The
-> gap is not the language's *expressiveness* — it is its *object model*
-> (records/types/reify) and a handful of primitives (`defn-`,
-> `identical?`, `vec`, `doseqres`, `#?`). This is a measurably narrower
-> wall than the count alone suggests, because the object model is
-> exactly the wave-11 exclusion the project already has on its roadmap.
->
-> Also positive: **`defmacro` + backquote + `~`/`~@`/`x#` gensym all
-> work** — the four entry-point macros (`select`/`select-any`/
-> `transform`/`setval`) load as macro definitions. What fails is their
-> *expansion*, which names `path` and the `i/*` compiled navigators.
-> And **dotted namespaces work**: `(ns com.rpl.specter.impl)` compiles
-> and `a.b.c/x` qualified references resolve. (`require`-from-disk is
-> absent, but whole-file loading is explicitly out of scope here — the
-> harness supplies the ns.)
+## The interesting finding: behavior barely moved
 
-## Failure taxonomy
+The prior measurement's implicit promise was that closing the syntax
+list would move the *behavior* number. It did not. Load went **11 → 23**
+— the syntax wave did its job — but behave went only **1 → 4**, and the
+three new behaving slices (01, 02, 16) were unlocked by exactly two of
+the shipped fixes: `defprotocol`'s leading docstring (01, 02) and
+`defn-` (16). The other **19 loaded-but-not-behaving** slices are stuck
+on things the syntax wave never touched.
 
-*Unlock counts are the number of the 31 slices each gap blocks; items
-are ordered by unlock count.*
+Two walls, distinct in kind and both missing from the old taxonomy:
 
-### 1. `defn-` — private function definition — the dominant blocker (7 slices)
+**1. Missing core prims.** `type` (blocks 17 and 31 via
+`dynamic-param?`), `into` (03), `vec` (11, 22), `sequence` (10),
+`reduce-kv` (09), `subs` (11), `unreduced` (30), `dissoc` (14),
+`instance?` (08), `symbol` (05). These are small, cheap, and — because
+Specter is *built* on them — each one is a gate to several slices once
+the impl machinery is present.
 
-`determine-params-impls`, `defnav`/`defrichnav` helpers, `non-transient-*`,
-`all-transform-list`/`-record`, `do-keypath-transform`,
-`insert-before-index-list`, `static-path?` — all begin `(defn- …)`.
-beam-lisp has **no `defn-`**: it is not a special form, so the reader
-compiles `(defn- name …)` as a *call* to an undefined function and the
-slice fails at load with `undefined var: …/defn-`. Every Specter
-`defn-` helper is unreachable. Smallest fix in the whole list: treat
-`defn-` as `defn` with a private var (or a one-line macro).
+**2. Specter's impl machinery.** `i/NONE` (06, 07, 09, 10, 14, 30),
+`doseqres` (07), the `path` macro + `i/compiled-*` family (18–21),
+`i/comp-paths*` (22), `i/exec-select*`/`exec-transform*` expansion
+(13, 28), `mutable-cell`/`compiled-traverse*` (30), `i/srange-transform*`
+(11, 14). This is the *larger kind of work* the load score always
+tipped toward: it is not adding special forms, it is implementing the
+engine those forms drive. `i/NONE` alone is a prerequisite of five
+slices' genuine behavior.
 
-### 2. The Navigator-construction macro stack: `defnav`/`defrichnav`/`defdynamicnav` + `reify` (6 slices)
+The entry-point macros tell the whole story in miniature: `select`,
+`select-any`, `transform`, `setval` **all load** (they compile their
+backquote templates without resolving `path`/`i/compiled-*`), and
+**none can run** — their expansion is the `path` caching machinery,
+which is the compiled-path heart of Specter. Macro-heavy libraries load
+far more readily than they run; that is this measurement in one line.
 
-`ALL`, `MAP-VALS`, `FIRST`/`LAST`, `srange`, `keypath*`/`must*`, and
-`keypath` all exist only through the `defnav`/`defrichnav` macros, which
-build their navigators with `reify RichNavigator`. beam-lisp has
-protocols and `extend-type`/`extend-protocol` but **no `reify`**, so the
-macros themselves (`macros.clj`) don't compile and nothing that uses
-them loads. Two slices (`FIRST`+`LAST`, `keypath`) fail even harder:
-their `def` init calls `n/PosNavigator`/`eachnav` with no namespace
-bound, and the compiler crashes with `no function clause matching in
-compile_special/3` rather than a clean error. This is the single most
-load-bearing feature for Specter — every simple navigator lives behind
-it.
+## The phantom sentinel — a hazard, not just a gap
 
-### 3. `#?` reader conditional (3 slices)
+Worth its own paragraph because it silently corrupts behavior
+measurements. beam-lisp compiles an **unresolved qualified name** —
+`i/NONE` in a namespace with no `i` alias — into a *zero-argument
+function reference*, not an error and not a value. Probe:
 
-`queue?`, `exec-select*`/`exec-transform*`, and the `MutableCell` block
-all carry `#?(:clj … :cljs …)` / `#?( :clj … :cljs …)`. beam-lisp's
-reader does **not implement the reader conditional** — it reads `#?` as
-a plain symbol, so `(#? :clj (defn queue? …) …)` compiles to a call of
-a nonexistent `#?` function. Reader-level FAIL: the slice text itself
-cannot be read as Clojure. (The reader *does* accept the text — it just
-misreads it. `#?` is silently a symbol, which is worse than a loud
-error.) A `.cljc` source leans on `#?` every few lines (66 in navs, 57
-in impl), so no whole file can load until this lands.
+```
+(fn? i/NONE)            ;=> true
+(identical? :x i/NONE)  ;=> false   (compares :x against a function)
+(i/NONE)                ;=> ERROR  "module :i is not available"
+```
 
-### 4. `defprotocol` leading docstring (2 slices)
+So `not-selected?*`, `void-transformed-kv-pair?`, `do-keypath-transform`,
+and the other `i/NONE` clients do not fail loudly at call time — they
+run with a *vacuous sentinel*: `(identical? x i/NONE)` is false for
+every real `x`, so NONE-detection never fires. That is worse than a
+clean error: it turns a load-only slice into one that looks like it
+might be working. **Before any further behavior credit is given, an
+unresolved qualified name should be a loud error** (or resolve to a real
+value), or the whole load-vs-behave line is untrustworthy. Every
+`i/NONE` verdict above is `◐ load-only` *because* of this — even where
+a happy path returned a plausible answer.
 
-`RichNavigator`, `Collector`, `ImplicitNav` all carry a docstring
-between the protocol name and the first method:
-`(defprotocol RichNavigator "…" (select* …))`. beam-lisp's `defprotocol`
-expects *every* form after the name to be a method; a leading string
-raises. The whole 27-line `protocols.cljc` is blocked by this one small
-parser gap — worth noting because these three protocols are the
-foundation every navigator implements.
+## Load-failure taxonomy (the remaining 8)
 
-### 5. `identical?` missing (2 slices behaviorally, pervasive)
+*Unlock counts are slices each gap blocks; ordered by current relevance.*
 
-`not-selected?*`/`selected?*` and `compiled-select*`/`-transform*` fail
-at call on `undefined var: …/identical?`. `identical?` is the linchpin
-of Specter's `NONE` sentinel protocol — every transform path tests
-`(identical? newv i/NONE)`. Almost every runtime slice in the set would
-need it the moment it runs. A small BEAM identity/eq predicate would
-unblock the two behavioral slices above and is prerequisite to nearly
-everything in category 2/6 once those load.
+### 1. Quoted-symbol map-destructure key — the macro-stack wall (5 slices)
 
-### 6. `vec` missing (2 slices) — and `subs`
+The `nav` macro destructures its impls on a literal quoted symbol:
+`{[[_ s-sym s-next] & s-body] 'select* …}`. beam-lisp's map
+destructuring rejects a quoted-symbol key at compile time, so slice 04
+(`richnav`/`nav`) fails. This blocks **04 directly and 15/23/24/26
+transitively**: `defnav`/`defrichnav` (05) expand into `nav`/`richnav`
+(04), so every navigator built through the macro stack is unreachable.
+Reify is *not* the blocker anymore (it works — wave 25); the gate is
+one step earlier, in the macro's destructuring.
 
-`comp-paths` (`(i/comp-paths* (vec apath))`) and `srange-select`
-(`(-> structure vec (subvec …))`) both fail at call on `vec`.
-`subs` is likewise absent for the string branch of `srange-select`.
-Plain coercions.
+### 2. Non-vendored navs helpers (2 slices)
 
-### 7. `defrecord`/`deftype` missing (1 slice direct, strategic)
+`FIRST`/`LAST` (25) reference `n/PosNavigator` and `keypath` (27)
+reference `eachnav` — both live in `navs.cljc` outside the vendored 31.
+They are upstream internal deps, not beam-lisp gaps, but they are also
+*built on* the `defnav` stack, so they are double-blocked until #1 lands.
 
-`LocalSym` … `DynamicFunction` (the path-analyzer records), `MutableCell`,
-and — in navs — `SrangeEndFunction` are all `defrecord`s; the cljs
-`MutableCell` is a `deftype`. These are the *deliberate wave-11
-exclusions* already on the roadmap. Directly they block slice 31; more
-importantly they are the substrate for the path macro's
-precompilation/inline-caching analyzer, which is Specter's performance
-heart. When `deftype`/`defrecord`/`reify` land, the load score jumps
-far more than the 1 slice this category names.
+### 3. A reader conditional with no matching branch (1 slice — correct)
 
-### 8. `doseqres` macro missing (1 slice)
+Slice 29 (`MutableCell`) is `#?(:bb … :cljs …)`: under `:clj` reader
+features it has no branch, so the reader correctly raises *no
+conditional matching* — exactly as real Clojure would. On `:clj`,
+`MutableCell` is a Java class (`com.rpl.specter.MutableCell`), not a
+beam-lisp form. This is a **correct measurement, not a gap**: the
+slice genuinely cannot be read as `:clj` source. Its `mutable-cell`/
+`get-cell`/`set-cell!` functions are also `:clj`-branch Java interop
+(`.get`/`.set`), untestable on the BEAM.
 
-`all-select` and the `select*` bodies of `MAP-VALS`/`MAP-KEYS` use
-`doseqres`, a util-macros helper that returns its accumulator. Not
-vendored, so `all-select` loads but can't run. A trivial macro.
+## Prediction vs. outcome — the check the list is owed
 
-### 9. `i/*` impl namespace + `comp-paths*`/`exec-select*` machinery (4 macros + 2 slices)
+The previous ranking claimed `defn-` would unlock **7 slices** and
+`reify` **6**. Both shipped. Here is what actually happened:
 
-The entry-point macros (`select`/`select-any`/`transform`/`setval`)
-load but expand to `(path ~apath)` and `i/compiled-*` calls; the
-`i/*` functions (`comp-paths*`, `exec-select*`, `compiled-select*`, …)
-live in `impl.cljc` behind `deftype`/`defrecord`/`reify`. This is the
-"big one" that makes `select`/`transform`/`setval` real — but it is
-*downstream* of categories 2 and 7, so it is ranked last.
+| predicted unlock | shipped? | outcome |
+|---|---|---|
+| `defn-` → 7 slices | yes | **Held only for load.** All 7 `defn-` slices now load (03, 05, 09, 10, 14, 16, 17), but just **1 of 7 behaves** (16). The helpers now parse and bind; they still call missing machinery when run. The prediction implicitly assumed loading ≈ behaving — exactly the assumption this measurement exists to falsify. |
+| `reify` → 6 slices | yes | **Did not materialize.** `reify` works in isolation (wave 25), but all the navigator slices still fail to load — blocked one level *before* reify, in slice 04's quoted-symbol destructure. The ranking named the wrong gate: `reify` was necessary, but the actual wall was the `nav`/`richnav` macro body. |
+| `#?` → 3 slices | yes | Materialized **for load**: 08 and 28 now load (29 correctly errors — no `:clj` branch). Not for behavior (08 needs `instance?`+Java; 28's expansion fails on `^Tag`-metad let symbol). |
+| `defprotocol` docstring → 2 | yes | **Fully materialized** — 01 and 02 both load *and* behave. The one clean prediction. |
+| `identical?` → 2 | yes | Necessary, not sufficient: 06 and 30 still load-only, blocked by compiled machinery rather than `identical?`. |
+| `vec` → 2 | **no** | **Never shipped.** `vec` is still absent; 11 and 22 remain load-only. |
+| `defrecord`/`deftype` → 1+ | yes | Partially: the path-analyzer records construct (31), but `dynamic-param?` needs `type`, and the `:clj` `MutableCell`/deftype surface isn't reachable at all. |
+| `doseqres` → 1 | no | Not a beam-lisp prim — it is Specter's own util-macro; 07 still load-only. |
+| `i/*` machinery | — | The wall, unchanged. |
 
-### 10. Map destructuring can't key on a quoted symbol (1 slice)
+**Verdict.** The ranking was right about *what* the cheap fixes were,
+and *did* lift the load number as promised — but the count was taken on
+the wrong axis. Every prediction was framed as "slices unlocked," and
+unlocks were scored on load; the behave axis was never predicted. The
+result is that the two big headline claims (`defn-` → 7, `reify` → 6)
+were at best half-true, and the list entirely missed the missing core
+prims. A ranked list that is never checked against outcomes is
+astrology; this check says: predict **behave**, not load, and audit
+prim availability before promising object-model wins.
 
-The `nav` macro destructures its impls with a map keyed on the literal
-`'select*`:
-`{[[_ s-structure-sym s-next-fn-sym] & s-body] 'select* …}`.
-beam-lisp's map destructuring rejects a quoted-symbol key at
-compile time. Macro-body edge case, unblocks the `nav` macro itself.
+## What to build next — re-ranked for *behavior*
 
-## What to build next
+*Ordered by behavioral yield, not load yield. Every item names the axis
+it moves.*
 
-*Ranked by how many of the 31 slices each gap unlocks. The count is
-deliberate: every item above the line is a prerequisite that buys
-several slices; the big object-model items buy the most per unit of
-design once they land.*
+1. **Quoted-symbol map-destructure key (slice 04)** — the single
+   biggest load wall: unlocks **5 slices' load** (04, 15, 23, 24, 26)
+   via the `defnav`/`defrichnav` stack. Reify is done; this is the
+   one parser gap standing between the navigators and the macro stack.
+   Cheap, contained, and it unblocks the *construction* half of Specter.
+2. **The missing core prims** — `type` (17, 31), `into` (03), `vec`
+   (11, 22), `sequence` (10), `reduce-kv` (09), `subs` (11),
+   `unreduced` (30), `dissoc` (14), `instance?` (08), `symbol` (05).
+   Each is a small, well-bounded function; together they are the
+   prerequisite for any behavior test of 10 of the 19 load-only slices.
+   This is the cheapest way to move the **behave** number.
+3. **Loud unresolved-qualified-name** — turn the phantom `i/NONE`
+   miscompilation into a real error (or a real value). This is a
+   correctness hazard first: until it lands, no `i/*`-dependent slice
+   can be trusted to fail honestly, and any future behavior credit is
+   suspect. One-line compiler change with disproportionate payoff.
+4. **Exec interop** — `(.select* nav …)` / `(.transform* nav …)` on a
+   reify'd `RichNavigator`, plus accepting a `^Tag`-metad symbol as a
+   `let` binding. Unblocks the `exec-select*`/`exec-transform*`
+   expansion (13, 28) and is the bridge between the navigators (once #1
+   lands) and the entry-point macros.
+5. **The compiled-path machinery** — `i/NONE` sentinel, `doseqres`,
+   `path` macro, `i/comp-paths*`, `compiled-traverse*`, `mutable-cell`
+   (a BEAM analogue of the `:clj` Java cell). This unblocks the
+   entry-point macros (18–21), `comp-paths` (22), `not-selected?*` (06),
+   `all-select` (07) and is prerequisite to `compiled-*` (30). This is
+   the *larger* kind of work — Specter's engine, not its grammar — and
+   it is what the behave number is actually waiting on.
+6. **Non-vendored navs helpers** (`PosNavigator`, `eachnav`) — for 25
+   and 27; only meaningful after #1, since they are built on the
+   `defnav` stack.
 
-1. **`defn-` (private `defn`)** — unlocks **7 slices** with a one-line
-   special-form/macro. The single highest-leverage fix in the sample;
-   no design cost, and it also names a real language gap (beam-lisp
-   currently has no way to mark a var private in source).
-2. **`reify` + the `defnav`/`defrichnav`/`defdynamicnav` stack** —
-   unlocks **6 slices** (`ALL`, `MAP-VALS`, `FIRST`/`LAST`, `srange`,
-   `keypath*`/`must*`, `keypath`). Requires `reify` over the existing
-   `defprotocol` machinery. This is the wall that keeps *every simple
-   navigator* out; it should be the next object-model milestone. Also
-   harden the two `compile_special` crashes (`FIRST`/`LAST`, `keypath`)
-   so a missing qualifier is a clean error, not a case-clause failure.
-3. **`#?` reader conditional** — unlocks **3 slices** and is the gate
-   for reading *any* `.cljc` file (66 conditionals in navs alone).
-   Read `#?(:clj … :cljs …)` selecting the `:clj` branch. Also make the
-   current silent mis-read (bare symbol `#?`) a loud reader error until
-   then.
-4. **`defprotocol` leading docstring** — unlocks **2 slices** (the whole
-   `protocols.cljc`) with a two-line parser tweak: skip a leading string
-   form after the protocol name.
-5. **`identical?`** — unlocks **2 behavioral slices** and is prerequisite
-   to nearly every runtime slice once the object model lands (Specter's
-   `NONE` sentinel protocol is built on it).
-6. **`vec` (+ `subs`)** — unlocks **2 slices**; plain coercions.
-7. **`defrecord`/`deftype`** — unlocks **1 slice** directly but is the
-   *strategic* item: `MutableCell`, the path-analyzer records, and
-   `SrangeEndFunction` are its direct consumers, and the path
-   macro's precompilation cache (Specter's performance heart) is built
-   on them. This is the wave-11 exclusion; landing it, with `reify`,
-   is what would move the headline number materially.
-8. **`doseqres`** — unlocks **1 slice**; a trivial macro.
-9. **`i/*` compiled-navigator machinery** — unlocks the 4 entry-point
-   macros to actually run (`select`/`select-any`/`transform`/`setval`)
-   plus slices 13/30. *Downstream of 2 and 7* — the compiled select/
-   transform/exec functions are implemented over `reify`'d navigators
-   and the defrecord'd mutable cell.
-
-**The honest trajectory.** The wall is real and named: object model
-(`reify`/`defrecord`/`deftype`), `defn-`, `#?`, `defprotocol`
-docstrings, and two missing prims. Items 1, 3, 4, 5, 6, 8 are small,
-well-bounded, and buy **17 of the 31 slices between them**. Items 2 and
-7 are the larger object-model work that turns "the pure functions run"
-into "the navigators construct" — and that is exactly the leap from
-1-of-31 toward something like a real Specter. The next wave should take
-items 1–6 first (cheap, quantified), then commit to `reify` +
-`defrecord`/`deftype` as the object-model milestone that makes the
-entry points (18–21) and the navigators (23–27) land together.
+**The honest trajectory.** The syntax wall is nearly gone — 23 of 31
+load — and that was real progress. But the behave number (4 of 31) is
+the number that matters, and it is low for a structural reason: the
+loaders that remain un-runnable are blocked on core prims and on
+Specter's impl engine, both of which are different and larger kinds of
+work than adding special forms. The cheapest honest next wave is #1 +
+#2 + #3: unblock the macro stack, supply the missing prims, and make
+the compiler fail loudly on unresolved names. That turns "19 slices
+load but can't be trusted" into "loads and fails honestly" — and only
+then is the impl-machinery work (#4, #5) worth starting.
 
 ## Keeping this honest
 
@@ -311,5 +316,8 @@ entry points (18–21) and the navigators (23–27) land together.
   per-gap measurement. The dotted-ns shape was verified in isolation
   (`(ns com.rpl.specter.impl)` and `a.b.c/x` both resolve); the
   harness-provided `(ns specter.slice_NN)` follows the jank convention.
-- Specter's README/docstring examples were the call targets where a
-  slice could run; the rest are recorded as load- or call-time gaps.
+- Behavior was tested with upstream's own usage (the `core_test.cljc`
+  suite and the README/docstrings); a load-only verdict means the slice
+  failed a genuine call, with the exact blocker named. Sibling co-loads
+  are noted where they occurred. The phantom-sentinel section above is
+  the standing caveat on every `i/*`-dependent verdict.

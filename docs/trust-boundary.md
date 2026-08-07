@@ -132,10 +132,19 @@ instead of a crash dump that takes down the whole VM.
 1. **A single large hostile read.** The guard samples the *absolute* VM-wide
    count, not the *delta* caused by one read. A fresh VM with an empty table
    reading one generated file that would intern a million new names will not
-   trip the guard at read time; the compiler's interning would still exhaust
-   the table mid-compile. Full protection requires checking at the compiler's
-   intern sites too, not just the reader boundary. (The reader cannot track
-   this delta — it interns nothing itself.)
+   trip the guard at read time.
+
+   The compiler half of this is now closed: `BeamLisp.AtomGuard` samples the
+   same table at the compiler's intern sites, so a form that reaches the
+   compiler without passing the reader — a macro building keyword forms, or
+   any caller compiling forms directly — is guarded too. It also tries
+   `String.to_existing_atom/1` first, so a name the VM already holds costs
+   nothing and cannot grow the table; only genuinely new names are counted.
+
+   What remains unsolved is the *granularity*: both layers sample every
+   `:atom_check_interval` names, so a single form interning a million names
+   between two samples still gets through. This is a high-water alarm, not a
+   quota, and cannot become one without paying `system_info` per name.
 2. **Long-running REPLs grow the table monotonically.** Every gensym the
    macro-expander mints, every unique identifier you type or a running
    program generates, is a permanent atom. A REPL that has been up for days
@@ -143,12 +152,13 @@ instead of a crash dump that takes down the whole VM.
    input involved. The guard turns that eventual exhaustion into a clean
    error, but it does not prevent the growth.
 3. **It is advisory, not a cap.** Setting the fraction to `1.0` disables the
-   guard and restores the raw VM-abort behavior. Nothing in the reader
-   prevents the compiler from interning.
+   guard and restores the raw VM-abort behavior.
 
-The durable fixes for (1) and (2) are real engineering work upstream of the
-reader: interning guards in the compiler's `String.to_atom` sites, and
-(where the language allows) reusing existing atoms before interning new ones
-via `String.to_existing_atom/1`. The reader guard is the boundary's first
-line — cheap, always-on, and it turns a catastrophic failure into a
-catchable one.
+The remaining item is (2), and it is inherent rather than unfinished: atoms
+are never collected, so a long-lived REPL minting gensyms grows the table by
+design. The guard turns that eventual exhaustion into a clean error at both
+the reader and the compiler; it does not and cannot prevent the growth.
+
+Both layers now share one implementation (`BeamLisp.AtomGuard`) rather than
+two copies of the policy, because a guard that disagrees with itself about
+where the ceiling is would be worse than no guard at all.

@@ -236,7 +236,56 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_112_replicate.bl", "jank.accept.replicate",
      "eaeb33657018c7c33df57a7ba4c7e0c3f93a9bfbf76aca0a952280eab1d51e48"},
     {"slice_113_comparator.bl", "jank.accept.comparator",
-     "4521c68e92514c724bcb8e56106ac91cb32c3a3940078473765f4d60fcd53237"}
+     "4521c68e92514c724bcb8e56106ac91cb32c3a3940078473765f4d60fcd53237"},
+    # Promoted by wave 25 (re-measure after the cpp/jank.runtime shim
+    # widened, the reader `^{}`-metadata fix, and volatile!/vreset!/vswap!
+    # landed). 20 previously-failing slices now load AND behave. The
+    # cpp shim gained reduce/reduced/is_reduced/peek/pop/promoting_inc and
+    # the is_* predicates; the reader gained `^{:arglists …}` / `^{:inline …}`;
+    # `volatile!` completed the transducer 1-arities. Slices that need a
+    # co-loaded dependency name it (drop-last needs the vendored multi-coll
+    # `map`; interpose needs `interleave`; transduce/cat need the transducer
+    # machinery) — all core.jank's own, satisfied verbatim.
+    {"slice_65_meta_def.bl", "jank.accept.listq",
+     "7193e5ba85d94a04f52f3046a8bc18e08505909a2ff7bdae3d9aa6b004a9b7ce"},
+    {"slice_66_reduced.bl", "jank.accept.reduced",
+     "9cdb4b1510d8f51cd5fbc884ad525b77e7465bd06cbf7979fe4c856be615dab9"},
+    {"slice_67_reduced_q.bl", "jank.accept.reducedq",
+     "e0fbc2945e3e2fdce9f266fa05f161474042af17aa947c3784078f982ce6ae4f"},
+    {"slice_68_ensure_reduced.bl", "jank.accept.ensurereduced",
+     "4ef81b6e46f67d79d503b31817924fb84d665f603cf997d84e68c34463d02e79"},
+    {"slice_69_unreduced.bl", "jank.accept.unreduced",
+     "d45e93a845ae29f33c1fcfa54a3f32807614417f015cb760d16631b911f6b072"},
+    {"slice_72_transduce.bl", "jank.accept.transduce",
+     "b768a3da247c01db6c9cfaa3cc8b026bd594f1de00011a3a48b1fc9fd7ed5a3f"},
+    {"slice_73_preserving_reduced.bl", "jank.accept.preservingreduced",
+     "c8dd3a4c8dcc5e1de2fa243f4f1a59fc306254f426dc7fdc21314af06c1620b7"},
+    {"slice_74_cat.bl", "jank.accept.cat",
+     "362b110108e954908b99120a048a436935a717307019cfc5916539c2d39dddd5"},
+    {"slice_75_peek.bl", "jank.accept.peek",
+     "f71aead05a6e6d766960fef46b5027d9c9dad155c2d9895d198737460a1e6439"},
+    {"slice_76_pop.bl", "jank.accept.pop",
+     "a1ca3e4932f5d84c98627a64be0f8572f9c2fe6f43353e62615ccc70f2b3fde7"},
+    {"slice_77_volatile.bl", "jank.accept.volatile",
+     "2b0c67ea98a99c4f8265120f5492f2324250370f15281a597659f026d9e2d07f"},
+    {"slice_81_promoting_arith.bl", "jank.accept.promoting",
+     "9a06952e8fe518ca2e017e6f24c365a4d289082ac344833f543fdc9606b73b45"},
+    {"slice_83_int_q.bl", "jank.accept.intq",
+     "5e5e8a88d7dacb2c9d814d88256babf2be5a817839022de655d4ba35409cf948"},
+    {"slice_93_drop_last.bl", "jank.accept.droplast",
+     "fc3d5c6123383103a6917916038ef78161b5132b050743f763f1266f59c0838d"},
+    {"slice_95_interpose.bl", "jank.accept.interpose",
+     "fa6ab662f8d31dccb9890e33c58a060b95ca5151128590e35666ad4a8b3c124d"},
+    {"slice_98_reductions.bl", "jank.accept.reductions",
+     "b942e3c6048a6e784dd88e72dc6a7e5a09d0bf68d2a28a4334bb840974e59c52"},
+    {"slice_114_ratio.bl", "jank.accept.ratio",
+     "38ef42cbbb69e854eaba122d526595dc2142c02c29ae30d16a90c8bd75b5ab43"},
+    {"slice_115_decimal_rational.bl", "jank.accept.decimal",
+     "58c6bd7b68f97ec375794c60e77ccd1d9f89dd51f495fa015c7a00fcf638786a"},
+    {"slice_116_sorted_preds.bl", "jank.accept.sorted",
+     "1c095714c52d0fb864ad8c06f16d6a5516ce7fc2bc0c866b25cb509801885f8d"},
+    {"slice_120_nan_q.bl", "jank.accept.nanq",
+     "c0b22754c18091dd7bc134d803764bfa29b33b2b333d0a70fc64a95fad7fd0e4"}
   ]
 
   setup_all do
@@ -824,13 +873,19 @@ defmodule BeamLisp.JankCompatTest do
       assert eval_in("jank.accept.completing", "((completing +))") == 0
     end
 
-    test "reduce folds with no init (upstream 2-arity; the 3-arity is a cpp gap)" do
-      # Upstream reduce's [f coll] arity is self-recursive and works;
-      # its [f init coll] arity calls cpp/jank.runtime.reduce, which the
-      # shim does not cover — recorded in docs/jank-compat.md.
+    test "reduce folds with no init, and the [f init coll] arity now via the cpp shim" do
+      # Upstream reduce's [f coll] arity is self-recursive and works; its
+      # [f init coll] arity calls cpp/jank.runtime.reduce. Wave 25 widened
+      # the cpp shim to cover it, so both arities now behave — and the cpp
+      # reduce genuinely short-circuits on a Reduced, peeling the sentinel.
       load_slice("slice_70_reduce.bl", "jank.accept.reduce")
       assert eval_in("jank.accept.reduce", "(reduce + [1 2 3])") == 6
       assert eval_in("jank.accept.reduce", "(reduce (fn [a b] (if (> a b) a b)) [3 1 4 1 5])") == 5
+      assert eval_in("jank.accept.reduce", "(reduce + 10 [1 2 3])") == 16
+      assert eval_in(
+               "jank.accept.reduce",
+               "(reduce (fn [a b] (if (>= a 5) (reduced a) (+ a b))) 0 [1 2 3 4 5])"
+             ) == 6
     end
 
     test "not= negates = at every arity" do
@@ -1005,6 +1060,198 @@ defmodule BeamLisp.JankCompatTest do
       assert eval_in("jank.accept.comparator", "((comparator <) 1 2)") == -1
       assert eval_in("jank.accept.comparator", "((comparator <) 2 1)") == 1
       assert eval_in("jank.accept.comparator", "((comparator <) 2 2)") == 0
+    end
+
+    # --- promoted by wave 25 (re-measure). The cpp/jank.runtime shim
+    # widened (reduce/reduced/is_reduced/peek/pop/promoting_inc and the
+    # is_* predicates), the reader learned `^{:arglists …}` / `^{:inline
+    # …}` metadata, and volatile!/vreset!/vswap! shipped. Twenty previously-
+    # failing slices now load AND behave. The four upstream TODO stubs
+    # (with-open, instance?, rseq, unchecked-inc-int) still throw by
+    # construction and are recorded, not counted against beam-lisp.
+
+    test "list? via ^{:arglists …} metadata and the is_list shim" do
+      # This is the head-of-core.jank dialect that used to fail at the
+      # reader: a `(def ^{:arglists '([x]) :doc …} list? (fn* …))`.
+      load_slice("slice_65_meta_def.bl", "jank.accept.listq")
+      assert eval_in("jank.accept.listq", "(list? '(1 2))") == true
+      assert eval_in("jank.accept.listq", "(list? [1 2])") == false
+    end
+
+    test "reduced wraps a value for early reduction termination" do
+      load_slice("slice_66_reduced.bl", "jank.accept.reduced")
+      assert eval_in("jank.accept.reduced", "(deref (reduced 42))") == 42
+    end
+
+    test "reduced? tests the reduced wrapper" do
+      load_slice("slice_67_reduced_q.bl", "jank.accept.reducedq")
+      assert eval_in("jank.accept.reducedq", "(reduced? (reduced 5))") == true
+      assert eval_in("jank.accept.reducedq", "(reduced? 5)") == false
+    end
+
+    test "ensure-reduced returns its arg if reduced, else wraps it" do
+      load_slice("slice_68_ensure_reduced.bl", "jank.accept.ensurereduced")
+
+      assert eval_in("jank.accept.ensurereduced", "(reduced? (ensure-reduced (reduced 5)))") ==
+               true
+
+      assert eval_in("jank.accept.ensurereduced", "(reduced? (ensure-reduced 5))") == true
+      assert eval_in("jank.accept.ensurereduced", "(deref (ensure-reduced 5))") == 5
+    end
+
+    test "unreduced unwraps a reduced, passes others through" do
+      load_slice("slice_69_unreduced.bl", "jank.accept.unreduced")
+      assert eval_in("jank.accept.unreduced", "(unreduced (reduced 5))") == 5
+      assert eval_in("jank.accept.unreduced", "(unreduced 5)") == 5
+    end
+
+    test "transduce reduces with a transformed reducing fn" do
+      # The canonical example needs the 1-arity `(map inc)` xform, which is
+      # core.jank's own map (vendored slice 89) co-loaded.
+      load_slice("slice_89_map.bl", "jank.accept.transduce")
+      load_slice("slice_72_transduce.bl", "jank.accept.transduce")
+      assert eval_in("jank.accept.transduce", "(transduce (map inc) + 0 [1 2 3])") == 9
+      # the no-init arity reaches the same completing step (f ret)
+      assert eval_in("jank.accept.transduce", "(transduce (map inc) + [1 2 3])") == 9
+    end
+
+    test "preserving-reduced re-wraps a reduced result" do
+      load_slice("slice_73_preserving_reduced.bl", "jank.accept.preservingreduced")
+      assert eval_in("jank.accept.preservingreduced", "((preserving-reduced +) 1 2)") == 3
+
+      assert eval_in(
+               "jank.accept.preservingreduced",
+               "(reduced? ((preserving-reduced (fn [a b] (reduced 99))) 1 2))"
+             ) == true
+    end
+
+    test "cat concatenates each input collection into the reduction" do
+      # cat's body calls preserving-reduced (its core.jank dependency).
+      load_slice("slice_73_preserving_reduced.bl", "jank.accept.cat")
+      load_slice("slice_74_cat.bl", "jank.accept.cat")
+      load_slice("slice_72_transduce.bl", "jank.accept.cat")
+      assert eval_in("jank.accept.cat", "(transduce cat + 0 [[1 2] [3 4]])") == 10
+    end
+
+    test "peek reads a vector's last or a list's first, nil when empty" do
+      load_slice("slice_75_peek.bl", "jank.accept.peek")
+      assert eval_in("jank.accept.peek", "(peek [1 2 3])") == 3
+      assert eval_in("jank.accept.peek", "(peek [])") == nil
+      assert eval_in("jank.accept.peek", "(peek '(1 2 3))") == 1
+    end
+
+    test "pop removes a vector's last or a list's first" do
+      load_slice("slice_76_pop.bl", "jank.accept.pop")
+      assert eval_in("jank.accept.pop", "(pr-str (pop [1 2 3]))") == "[1 2]"
+      assert eval_in("jank.accept.pop", "(pr-str (pop '(1 2 3)))") == "(2 3)"
+    end
+
+    test "volatile! with vreset! and vswap! builds a mutable cell" do
+      # The definition carries ^{:inline (fn* …)} metadata — the reader
+      # gate that used to fail this slice at load.
+      load_slice("slice_77_volatile.bl", "jank.accept.volatile")
+      assert eval_in("jank.accept.volatile", "(deref (volatile! 5))") == 5
+
+      assert eval_in(
+               "jank.accept.volatile",
+               "(let [v (volatile! 0)] (vreset! v 7) (vswap! v + 3) @v)"
+             ) == 10
+    end
+
+    test "inc' promotes past the fixed-precision boundary" do
+      load_slice("slice_81_promoting_arith.bl", "jank.accept.promoting")
+      assert eval_in("jank.accept.promoting", "(inc' 5)") == 6
+    end
+
+    test "int? tests a fixed-precision integer (is_integer shim)" do
+      load_slice("slice_83_int_q.bl", "jank.accept.intq")
+      assert eval_in("jank.accept.intq", "(int? 5)") == true
+      assert eval_in("jank.accept.intq", "(int? 5.0)") == false
+    end
+
+    test "drop-last returns all but the last n (needs the vendored multi-coll map)" do
+      # drop-last is (map (fn [x _] x) coll (drop n coll)) — a two-coll map.
+      # It resolves `map` to core.jank's own multi-coll map (slice 89); the
+      # docs note that beam-lisp's native map is still single-coll.
+      load_slice("slice_89_map.bl", "jank.accept.droplast")
+      load_slice("slice_93_drop_last.bl", "jank.accept.droplast")
+      assert eval_in("jank.accept.droplast", "(doall (drop-last [1 2 3 4]))") == [1, 2, 3]
+      assert eval_in("jank.accept.droplast", "(doall (drop-last 2 [1 2 3 4 5]))") == [1, 2, 3]
+    end
+
+    test "interpose separates elements with sep (needs upstream interleave)" do
+      load_slice("slice_40_interleave.bl", "jank.accept.interpose")
+      load_slice("slice_95_interpose.bl", "jank.accept.interpose")
+      assert eval_in("jank.accept.interpose", "(doall (interpose :x [1 2 3]))") ==
+               [1, :x, 2, :x, 3]
+
+      # and its 1-arity is a stateful (volatile!-based) transducer
+      load_slice("slice_72_transduce.bl", "jank.accept.interpose")
+      assert eval_in("jank.accept.interpose", "(transduce (interpose 10) + 0 [1 2 3])") == 26
+    end
+
+    test "reductions yields the intermediate values of a reduction" do
+      load_slice("slice_98_reductions.bl", "jank.accept.reductions")
+      assert eval_in("jank.accept.reductions", "(doall (reductions + [1 2 3]))") == [1, 3, 6]
+
+      assert eval_in("jank.accept.reductions", "(doall (reductions + 10 [1 2 3]))") ==
+               [10, 11, 13, 16]
+    end
+
+    test "ratio?, decimal? and sorted? are always false on the BEAM" do
+      # beam-lisp has no Ratio, BigDecimal, or sorted-collection type, so
+      # each is genuinely false for every value — the honest answer.
+      load_slice("slice_114_ratio.bl", "jank.accept.ratio")
+      assert eval_in("jank.accept.ratio", "(ratio? 3)") == false
+      load_slice("slice_115_decimal_rational.bl", "jank.accept.decimal")
+      assert eval_in("jank.accept.decimal", "(decimal? 3)") == false
+      load_slice("slice_116_sorted_preds.bl", "jank.accept.sorted")
+      assert eval_in("jank.accept.sorted", "(sorted? {})") == false
+    end
+
+    test "NaN? is always false because beam-lisp cannot produce a NaN" do
+      # The slice behaves: no reachable value is NaN. beam-lisp has no
+      # `##NaN` literal, `(/ 0.0 0.0)` raises, and there is no Math module,
+      # so the true branch is unreachable — recorded, not a defect.
+      load_slice("slice_120_nan_q.bl", "jank.accept.nanq")
+      assert eval_in("jank.accept.nanq", "(NaN? 3.0)") == false
+      assert eval_in("jank.accept.nanq", "(NaN? 3)") == false
+    end
+
+    test "transducer 1-arities reduce correctly with a completing rf" do
+      # volatile!/reduced? now ship, so the previously-"needs volatile!"
+      # transducer 1-arities behave. transduce's final `(f ret)` requires
+      # rf to accept a 1-arity (the completing convention); driving them
+      # with `+` avoids `conj`'s missing 1-arity (a recorded core gap).
+      load_slice("slice_72_transduce.bl", "jank.accept.tx37")
+      load_slice("slice_37_take_while.bl", "jank.accept.tx37")
+      load_slice("slice_72_transduce.bl", "jank.accept.tx38")
+      load_slice("slice_38_drop_while.bl", "jank.accept.tx38")
+      load_slice("slice_72_transduce.bl", "jank.accept.tx49")
+      load_slice("slice_49_distinct.bl", "jank.accept.tx49")
+      load_slice("slice_72_transduce.bl", "jank.accept.tx90")
+      load_slice("slice_90_map_indexed.bl", "jank.accept.tx90")
+      load_slice("slice_72_transduce.bl", "jank.accept.tx92")
+      load_slice("slice_92_keep_indexed.bl", "jank.accept.tx92")
+      load_slice("slice_72_transduce.bl", "jank.accept.tx105")
+      load_slice("slice_35_when_some.bl", "jank.accept.tx105")
+      load_slice("slice_105_dedupe.bl", "jank.accept.tx105")
+
+      assert eval_in("jank.accept.tx37", "(transduce (take-while odd?) + 0 [1 3 4])") == 4
+      assert eval_in("jank.accept.tx38", "(transduce (drop-while odd?) + 0 [1 3 5 2 4])") == 6
+      assert eval_in("jank.accept.tx49", "(transduce (distinct) + 0 [1 1 2 3 3 1])") == 6
+
+      assert eval_in(
+               "jank.accept.tx90",
+               "(transduce (map-indexed (fn [i x] (* i x))) + 0 [1 2 3 4])"
+             ) == 20
+
+      assert eval_in(
+               "jank.accept.tx92",
+               "(transduce (keep-indexed (fn [i x] x)) + 0 [1 2 3 4])"
+             ) == 10
+
+      assert eval_in("jank.accept.tx105", "(transduce (dedupe) + 0 [1 1 2 3 3 1])") == 7
     end
 
   end

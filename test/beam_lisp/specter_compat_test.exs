@@ -8,11 +8,13 @@ defmodule BeamLisp.SpecterCompatTest do
   #
   # ONLY slices that load AND behave correctly are tested here. A slice
   # that needs a local edit is a FAIL, recorded in docs/specter-compat.md,
-  # never patched into passing. The measurement is 1 of 31 and that low
-  # number is the deliverable — it names exactly which primitives
-  # stand between beam-lisp and Specter (docs/specter-compat.md ranks
-  # them by how many slices each unlocks). docs/specter-compat.md holds
-  # the full per-slice table.
+  # never patched into passing. The measurement is 23 of 31 load, and
+  # 4 of 31 load AND behave (slices 01, 02, 12, 16) — those four are
+  # exercised here. The gap between loading and behaving is the point:
+  # the syntax is mostly there, but Specter's impl machinery (i/NONE,
+  # the compiled path cache, the exec interop) and a handful of missing
+  # core prims are not. docs/specter-compat.md holds the full per-slice
+  # table and the honest re-ranking.
   use ExUnit.Case, async: false
 
   @moduletag :specter_compat
@@ -147,6 +149,56 @@ defmodule BeamLisp.SpecterCompatTest do
 
       assert eval_in("specter.accept.extractfilter", "((extract-basic-filter-fn [odd? pos?]) -3)") ==
                false
+    end
+
+    test "rich-navigator protocol defines and dispatches a working navigator protocol" do
+      # A defprotocol with a leading docstring and per-method docstrings. Its
+      # behavior is that it can be implemented (here via reify) and its methods
+      # dispatched — the docstring support is what used to block this slice
+      # from loading at all, and the protocol itself now works end to end.
+      load_slice("01_rich_navigator_protocol", "specter.accept.richnav")
+
+      # both methods reify'd onto one instance and dispatch correctly
+      assert eval_in(
+               "specter.accept.richnav",
+               "(let [nav (reify RichNavigator" <>
+                 " (select* [this vals structure next-fn] (next-fn vals structure))" <>
+                 " (transform* [this vals structure next-fn] (+ structure 1)))]" <>
+                 " [(select* nav [] 41 (fn [vals s] (+ s 1)))" <>
+                 "  (transform* nav [] 41 (fn [vals s] s))])"
+             ) == BeamLisp.Vector.new([42, 42])
+    end
+
+    test "collector and implicit-nav protocols define and dispatch" do
+      # Two more defprotocols, the second (ImplicitNav) without a docstring.
+      # Both dispatch through reify — the single-arg implicit-nav dispatches on
+      # its argument, the two-arg collect-val on its receiver + structure.
+      load_slice("02_collector_implicitnav", "specter.accept.collector")
+
+      assert eval_in(
+               "specter.accept.collector",
+               "(let [c (reify Collector (collect-val [this structure] (inc structure)))" <>
+                 "      i (reify ImplicitNav (implicit-nav [obj] :ok))]" <>
+                 " [(collect-val c 41) (implicit-nav i)])"
+             ) == BeamLisp.Vector.new([42, :ok])
+    end
+
+    test "insert-before-index-list inserts a value at an index into a seq" do
+      # A defn- (private) list-insertion helper — the first thing the old
+      # measurement couldn't even parse, now both private and functional.
+      load_slice("16_insert_before_index_list", "specter.accept.insertidx")
+
+      assert eval_in(
+               "specter.accept.insertidx",
+               "(insert-before-index-list [1 2 3 4] 2 :x)"
+             ) == [1, 2, :x, 3, 4]
+
+      # index 0 pushes to the front; end-of-list appends
+      assert eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 0 :z)") ==
+               [:z, 1, 2]
+
+      assert eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 2 :y)") ==
+               [1, 2, :y]
     end
   end
 end

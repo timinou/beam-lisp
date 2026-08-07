@@ -61,8 +61,29 @@ defmodule BeamLisp.RT do
   defp to_list(xs) when is_list(xs), do: xs
   defp to_list(other), do: Enum.to_list(other)
 
-  @doc "A first-class handle to a remote function, e.g. `(map String/upcase xs)`."
-  def remote_fun(module, fun), do: {:"$remote", module, fun}
+  @doc """
+  A first-class handle to a remote function, e.g. `(map String/upcase xs)`.
+
+  Refuses a module that does not exist. A lowercase qualified name is
+  read as Erlang interop, so a mistyped or unaliased prefix — `i/NONE`
+  when nothing aliases `i` — would otherwise produce a perfectly usable
+  handle to a module that was never loaded. That value compares unequal
+  to everything and fails only much later, at the call site, blaming a
+  module the author never mentioned. Failing here names the real
+  mistake while the reference is still in view.
+  """
+  def remote_fun(module, fun) do
+    if Code.ensure_loaded?(module) do
+      {:"$remote", module, fun}
+    else
+      raise BeamLisp.CompileError,
+        message:
+          "unresolved qualified name #{module}/#{fun}: no namespace or alias named " <>
+            "#{inspect(module)} is in scope, and no such module is loadable. A lowercase " <>
+            "prefix means Erlang interop — if you meant a beam-lisp namespace, require or " <>
+            "alias it first."
+    end
+  end
 
   def get(m, key, default \\ nil)
   # A vector is a struct, so it is also a map — index access must be

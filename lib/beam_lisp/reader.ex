@@ -735,6 +735,11 @@ defmodule BeamLisp.Reader do
   defp check_atom_safety!({:keyword, _}, token), do: sample_atom_table!(token)
   defp check_atom_safety!(_literal, _token), do: :ok
 
+  # The counting and the table sampling live in BeamLisp.AtomGuard, which
+  # the compiler's intern sites share — the reader is the first layer to
+  # see a hostile name, not the only one, and two copies of this policy
+  # would drift. The reader keeps raising its own AtomLimitError because
+  # that name is public, documented in docs/trust-boundary.md, and tested.
   defp sample_atom_table!(token) do
     {fraction, interval} =
       Process.get(@guard_cfg_key, {@default_atom_high_water, @default_atom_check_interval})
@@ -747,21 +752,8 @@ defmodule BeamLisp.Reader do
     end
   end
 
-  defp atom_guard_config, do: {high_water_fraction(), check_interval()}
-
-  defp high_water_fraction do
-    case Application.get_env(:beam_lisp, :atom_high_water_fraction, @default_atom_high_water) do
-      f when is_number(f) -> min(max(f, 0.0), 1.0)
-      _ -> @default_atom_high_water
-    end
-  end
-
-  defp check_interval do
-    case Application.get_env(:beam_lisp, :atom_check_interval, @default_atom_check_interval) do
-      i when is_number(i) -> max(trunc(i), 1)
-      _ -> @default_atom_check_interval
-    end
-  end
+  defp atom_guard_config,
+    do: {BeamLisp.AtomGuard.high_water_fraction(), BeamLisp.AtomGuard.check_interval()}
 
   defp check_atom_table!(token, fraction) do
     count = :erlang.system_info(:atom_count)

@@ -119,7 +119,7 @@ defmodule BeamLisp.Compiler do
       when is_number(form) or is_binary(form) or is_boolean(form) or is_nil(form),
       do: form
 
-  defp do_compile({:keyword, name}, _env), do: String.to_atom(name)
+  defp do_compile({:keyword, name}, _env), do: BeamLisp.AtomGuard.to_atom(name)
 
   defp do_compile({:vector, items}, env) do
     tuple_ast = {:{}, [], Enum.map(items, &compile(&1, notail(env)))}
@@ -991,7 +991,7 @@ defmodule BeamLisp.Compiler do
     {[var], put_local(env, name, var)}
   end
 
-  defp compile_pattern_bare({:keyword, name}, env), do: {[String.to_atom(name)], env}
+  defp compile_pattern_bare({:keyword, name}, env), do: {[BeamLisp.AtomGuard.to_atom(name)], env}
 
   defp compile_pattern_bare({:vector, items}, env) do
     {pats, env} =
@@ -1071,7 +1071,7 @@ defmodule BeamLisp.Compiler do
   defp merge_attr(nil, kvs), do: attr_map(kvs)
   defp merge_attr(attr, kvs), do: Map.merge(attr, attr_map(kvs))
   defp attr_map(kvs), do: Map.new(kvs, fn {k, v} -> {attr_key(k), v} end)
-  defp attr_key({:keyword, name}), do: String.to_atom(name)
+  defp attr_key({:keyword, name}), do: BeamLisp.AtomGuard.to_atom(name)
 
   # One defn into a per-ns body module. The `defn` form's own line
   # stamps each generated `:def` node, so the namespace module's line
@@ -1439,7 +1439,7 @@ defmodule BeamLisp.Compiler do
     {Macro.escape({:symbol, resolved}), g2}
   end
 
-  defp synq_data({:keyword, name}, _env, g), do: {String.to_atom(name), g}
+  defp synq_data({:keyword, name}, _env, g), do: {BeamLisp.AtomGuard.to_atom(name), g}
   defp synq_data(lit, _env, g), do: {lit, g}
 
   defp synq_list(items, env, g) do
@@ -2002,7 +2002,7 @@ defmodule BeamLisp.Compiler do
   # A quoted form becomes data: symbols stay tagged so tooling can
   # recognize them, keywords become atoms, everything else is itself.
   defp datum({:symbol, name}), do: {:symbol, name}
-  defp datum({:keyword, name}), do: String.to_atom(name)
+  defp datum({:keyword, name}), do: BeamLisp.AtomGuard.to_atom(name)
   # Source positions are a COMPILER channel, not data. A macro receives
   # its arguments as data and walks them with `first`/`rest`/`seq?` —
   # runtime fns that know lists, not `{:meta, form, m}` wrappers. Leaving
