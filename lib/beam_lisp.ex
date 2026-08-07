@@ -44,7 +44,13 @@ defmodule BeamLisp do
   def init do
     unless Env.seeded?() do
       RT.seed_core()
-      Compiler.eval_string(File.read!(prelude_path()), Compiler.new_env("core"))
+      # The prelude is layered: core.bl is the language, multi.bl the
+      # dispatch library that builds on it (derive/isa? and friends
+      # are ordinary beam-lisp over BeamLisp.Multi).
+      for file <- [prelude_path(), multi_path()] do
+        Compiler.eval_string(File.read!(file), Compiler.new_env("core"))
+      end
+
       Env.mark_seeded()
       Env.in_ns("user")
     end
@@ -53,6 +59,7 @@ defmodule BeamLisp do
   end
 
   defp prelude_path, do: Application.app_dir(:beam_lisp, "priv/core.bl")
+  defp multi_path, do: Application.app_dir(:beam_lisp, "priv/multi.bl")
 
   @doc "A read-eval-print loop. Exit with Ctrl+C or by evaluating `(System/halt)`."
   def repl do

@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro let loop recur if do quote syntax-quote receive throw try)
+  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -304,6 +304,105 @@ defmodule BeamLisp.Compiler do
       true ->
         compile_def(name, {:{}, [], [:"$macro", compile_fn(fn_clauses(rest), env)]}, env, doc)
     end
+  end
+
+  # --- open dispatch: multimethods ---
+  #
+  # `(defmulti name dispatch-fn)` interns `name` as a callable that
+  # applies dispatch-fn to all args and runs the matching method.
+  # Re-definition reuses the method table (only the dispatch fn
+  # changes), mirroring Clojure's CLJ-1351. `(defmethod name val
+  # [args] body…)` adds or replaces one entry; the dispatch value is
+  # an ordinary expression evaluated at definition time.
+  defp compile_special("defmulti", [{:symbol, name}, dispatch], env) do
+    dispatch_ast = compile(dispatch, notail(env))
+    quote do: BeamLisp.Multi.define_multi(unquote(env.ns), unquote(name), unquote(dispatch_ast))
+  end
+
+  defp compile_special("defmulti", [{:symbol, name}, doc, dispatch], env) when is_binary(doc) do
+    dispatch_ast = compile(dispatch, notail(env))
+
+    quote do
+      value = BeamLisp.Multi.define_multi(unquote(env.ns), unquote(name), unquote(dispatch_ast))
+      BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), %{doc: unquote(doc)})
+      value
+    end
+  end
+
+  defp compile_special("defmulti", args, _env),
+    do: raise("defmulti: expected (defmulti name dispatch-fn), got #{inspect(args)}")
+
+  defp compile_special("defmethod", [{:symbol, name}, dispatch_val | rest], env) do
+    if rest == [], do: raise("defmethod #{name}: expected a method body")
+
+    {mns, mname} = multi_var_target(env, name)
+    dispatch_ast = compile(dispatch_val, notail(env))
+    method_ast = compile_fn(fn_clauses(rest), env)
+
+    quote do
+      BeamLisp.Multi.add_method(unquote(mns), unquote(mname), unquote(dispatch_ast), unquote(method_ast))
+    end
+  end
+
+  # --- protocols ---
+  #
+  # `(defprotocol Name (m [this] …) …)` interns `Name` as a descriptor
+  # var and each method as a callable var that dispatches on the type
+  # tag of its first argument (see Multi.type_of/1).
+  # `(extend-type Type Name (m [this] …) …)` fills in one type's
+  # methods; `(extend-protocol Name Type (m …) Type2 (m2 …) …)` does
+  # several at once. A type arg is a keyword tag (`:vector`, `:map`,
+  # `:binary`…) or an Elixir struct module (`Foo.Bar`), resolved to a
+  # tag at compile time.
+  defp compile_special("defprotocol", [{:symbol, name} | method_forms], env) do
+    method_names =
+      Enum.map(method_forms, fn
+        {:list, [{:symbol, m} | _]} -> m
+        other -> raise "defprotocol #{name}: expected (method-name [args]…), got #{inspect(other)}"
+      end)
+
+    quote do
+      BeamLisp.Multi.define_protocol(unquote(env.ns), unquote(name), unquote(method_names))
+    end
+  end
+
+  defp compile_special("defprotocol", args, _env),
+    do: raise("defprotocol: expected (defprotocol Name (method [args]…)), got #{inspect(args)}")
+
+  defp compile_special("extend-type", [type_form, {:symbol, protocol} | method_forms], env) do
+    {pns, pname} = multi_var_target(env, protocol)
+    tag = type_tag(type_form)
+    impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
+
+    quote do
+      BeamLisp.Multi.extend_type(unquote(pns), unquote(pname), unquote(tag), unquote(impls))
+    end
+  end
+
+  defp compile_special("extend-protocol", [{:symbol, protocol} | forms], env) do
+    {pns, pname} = multi_var_target(env, protocol)
+    # Forms alternate type / method-forms; a type is a keyword or
+    # symbol, a method form is a list — enough to split the groups
+    # without consulting the protocol descriptor.
+    {groups, cur_type, cur_methods} =
+      Enum.reduce(forms, {[], nil, []}, fn
+        {:list, _} = mf, {groups, type, methods} -> {groups, type, methods ++ [mf]}
+        type_form, {groups, prev_type, methods} ->
+          {groups ++ [{prev_type, methods}], type_form, []}
+      end)
+
+    calls =
+      for {type_form, method_forms} <- groups ++ [{cur_type, cur_methods}],
+          type_form != nil do
+        tag = type_tag(type_form)
+        impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
+
+        quote do
+          BeamLisp.Multi.extend_type(unquote(pns), unquote(pname), unquote(tag), unquote(impls))
+        end
+      end
+
+    block(calls)
   end
 
   # Thread a per-syntax-quote-form gensym map through synq so a `x#`
@@ -1185,6 +1284,38 @@ defmodule BeamLisp.Compiler do
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {datum(k), datum(v)} end)
   defp datum(lit), do: lit
+
+  # One protocol method implementation: `(m [args] body…)` compiles to
+  # a method-name => fn-value map entry.
+  defp protocol_impl({:list, [{:symbol, m} | rest]}, env) do
+    if rest == [], do: raise("defprotocol method #{m}: expected a body")
+    {m, compile_fn(fn_clauses(rest), env)}
+  end
+
+  defp protocol_impl(other, _env),
+    do: raise("expected (method-name [args]…) implementation, got #{inspect(other)}")
+
+  # Resolve a type argument to the tag `Multi.type_of/1` would produce
+  # for values of that type: keywords are the builtin tags themselves,
+  # an uppercase symbol names an Elixir struct module, a lowercase
+  # symbol is a bare tag name.
+  defp type_tag({:keyword, name}), do: String.to_atom(name)
+
+  defp type_tag({:symbol, name}) do
+    if uppercase?(name), do: Module.concat([name]), else: String.to_atom(name)
+  end
+
+  defp type_tag(other), do: raise("expected a type tag (keyword) or struct module, got #{inspect(other)}")
+
+  # Resolve a var name (possibly `alias/name` or `ns/name`) to a
+  # `{ns, name}` pair for defmethod / protocol targets.
+  defp multi_var_target(env, name) do
+    case String.split(name, "/", parts: 2) do
+      ["", _rest] -> {env.ns, name}
+      [prefix, var] -> {Env.alias_target(env.ns, prefix) || prefix, var}
+      [plain] -> {env.ns, plain}
+    end
+  end
 
   # --- quoted builders ---
 
