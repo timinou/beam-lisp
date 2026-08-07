@@ -173,15 +173,14 @@ runtime compilation — the path from Lisp source to a BEAM release.
 
 Deliberate gaps, roughly in priority order:
 
-- **uniform laziness** — the seq model is hybrid: realized inputs take
-  the strict path, so bounded `(range n)` is eager (`PLAN-010`)
-- **transducers** — the collection arities of the seq fns are done;
-  the 1-arity transducer paths need `volatile!`, `reduced` and `cat`
-- **jank stdlib convergence** — 89 of 120 attempted `core.jank` slices
-  run unmodified. The sample was doubled once the previous one stopped
-  being informative at 63 of 64; the gap list it refilled is led by the
-  `cpp/jank.runtime.*` shim and reader `^{}` metadata
-  (`docs/jank-compat.md`)
+- **`into` with a map target and a 1-arity `map` transducer** — the
+  last genuine jank-sample failure; map transients lack a `conj!`
+  clause and core `map` has no transducer form
+- **jank stdlib convergence** — 115 of 120 attempted `core.jank` slices
+  run unmodified. Four of the five that remain are upstream TODO stubs
+  whose bodies are commented out — they throw by construction and
+  cannot pass in jank either — and the fifth (`into`) is recorded as
+  partial rather than promoted (`docs/jank-compat.md`)
 - **Specter** — 1 of 31 slices of Clojure's Specter behave today. The
   number is low on purpose: it is a measurement, not a claim, and it
   ranks the remaining work by what each gap unlocks
@@ -282,6 +281,28 @@ down a production node under load. A call cap (default 1000) is
 enforced inside the tracer process, and asserted in the suite rather
 than trusted.
 
+## Laziness that actually is
+
+The canonical Clojure demonstration holds, which for six waves it did
+not:
+
+```clojure
+(take 5 (map f (range 1000000)))
+```
+
+realizes **32 cells** — one chunk — not a million. The seq layer is
+uniformly lazy (`map`, `filter`, bounded and unbounded `range`,
+`concat`, `take-while`, `drop-while`), with `seq`/`first`/`rest` as
+the only forcing primitives, and `reduce`/`into`/`doall` strict
+exactly where Clojure's are.
+
+Chunking at 32, as Clojure does, is what makes this affordable. The
+plan that specified this work predicted uniform laziness would make
+small strict maps ~14× slower; chunked, they run within ~1.4–2× of the
+old strict path and ~6–15× faster than the old unchunked lazy one. The
+realization count is asserted with a side-effect counter rather than a
+stopwatch — timing proves speed, only counting proves laziness.
+
 ## Libraries written in beam-lisp
 
 The prelude has always been `priv/core.bl` — beam-lisp source, not
@@ -346,7 +367,7 @@ have to be an opinion. It can be a test.
 vendored byte-for-byte from upstream commit `3028594`, each carrying
 a sha256 that the test suite asserts — so making a slice pass by
 editing it would fail the build rather than quietly inflate the
-claim. **89 of 120 load and behave correctly**, called with upstream's
+claim. **115 of 120 load and behave correctly**, called with upstream's
 own docstring examples: the threading macros, `if-let`, `doseq`,
 `doto`, `memoize`, `comp`, `juxt`, `partial`, `trampoline`, `keys`,
 `vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->`, `set`,
@@ -448,7 +469,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 624 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 767 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
