@@ -35,7 +35,7 @@ defmodule BeamLisp.Link do
   `{:fixed, arity, fname, def_ast} | {:variadic, min, fname, def_ast}`.
   Returns the interned value.
   """
-  def defvar(ns, name, new_defs) when is_binary(ns) and is_binary(name) do
+  def defvar(ns, name, new_defs, location \\ nil) when is_binary(ns) and is_binary(name) do
     mod = module_for(ns)
 
     all_defs =
@@ -53,7 +53,11 @@ defmodule BeamLisp.Link do
     Code.compiler_options(ignore_module_conflict: true)
 
     try do
-      Module.create(mod, block, Macro.Env.location(__ENV__))
+      # `location` is the `{file, line}` of the defining `.bl` form (nil
+      # when the form carried no position, e.g. a macro-built defn); it
+      # makes the regenerated module's line table point at the user's
+      # source instead of this file.
+      Module.create(mod, block, location || Macro.Env.location(__ENV__))
     after
       Code.compiler_options(prev_opts)
     end

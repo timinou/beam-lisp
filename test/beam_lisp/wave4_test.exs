@@ -120,7 +120,7 @@ defmodule BeamLisp.Wave4Test do
     end
 
     test "recur arity must match the fn's params" do
-      assert_raise RuntimeError, ~r/recur arity mismatch/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/recur arity mismatch/, fn ->
         eval("(fn [a b] (recur 1))")
       end
     end

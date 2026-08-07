@@ -40,14 +40,22 @@ defmodule BeamLisp.Compiler do
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
 
-  @doc "Read, compile and evaluate every form in `source`. Returns the last value."
-  def eval_string(source, env \\ new_env()) do
+  @doc """
+  Read, compile and evaluate every form in `source`. Returns the last value.
+
+  `file` is the source path (or nil) attached to each form's position
+  metadata, so generated modules and compile errors can name it. The
+  position-aware reader entry is used deliberately: `read_all`/`read_one`
+  deep-unwrap positions for callers that ignore them, and would strip the
+  very information this path exists to carry.
+  """
+  def eval_string(source, env \\ new_env(), file \\ nil) do
     # Enter the env's namespace; from there, per-form re-reads track
     # any `ns` switches, exactly as defmacro side effects are seen.
     Env.in_ns(env.ns)
 
     source
-    |> Reader.read_all()
+    |> Reader.read_string(file)
     |> Enum.map(&eval_form(&1, %{env | ns: Env.current_ns()}))
     |> List.last()
   end
@@ -75,38 +83,54 @@ defmodule BeamLisp.Compiler do
         @compile no_type_check: true
         def run, do: unquote(ast)
       end,
-      Macro.Env.location(__ENV__)
+      # Claim the form's own `.bl` file (and line) so the module's line
+      # table points at the user's source, not beam-lisp's compiler. A
+      # macro-built form with no position falls back to the old
+      # behaviour.
+      module_location(form, env) || Macro.Env.location(__ENV__)
     )
 
     mod.run()
   end
 
   @doc "Compile one reader form to an Elixir quoted expression."
-  def compile(form, env)
 
   # --- literals ---
 
-  def compile(form, _env)
+  # Form metadata is the reader's source-location channel: unwrap the
+  # wrapper, thread the position into the compile env, lower the bare form,
+  # then stamp the form's line onto the resulting AST so Elixir propagates
+  # it into the module's line table. The metadata never reaches a runtime
+  # value (= and printing are unaffected); a form with no position compiles
+  # identically to today, just without line attribution.
+  def compile(form, env) do
+    {inner, env} =
+      case form do
+        {:meta, inner, m} -> {inner, pos_env(env, m)}
+        _ -> {form, env}
+      end
+
+    inner
+    |> do_compile(env)
+    |> stamp_line(env)
+  end
+
+  defp do_compile(form, _env)
       when is_number(form) or is_binary(form) or is_boolean(form) or is_nil(form),
       do: form
 
-  # Form metadata is source-location info: strip it before codegen so a
-  # meta-carrying form compiles identically to the bare form, and the
-  # metadata never reaches a runtime value (= and printing are unaffected).
-  def compile({:meta, form, _m}, env), do: compile(form, env)
+  defp do_compile({:keyword, name}, _env), do: String.to_atom(name)
 
-  def compile({:keyword, name}, _env), do: String.to_atom(name)
-
-  def compile({:vector, items}, env) do
+  defp do_compile({:vector, items}, env) do
     tuple_ast = {:{}, [], Enum.map(items, &compile(&1, notail(env)))}
     {:%, [], [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_ast]}]}
   end
 
-  def compile({:map, kvs}, env) do
+  defp do_compile({:map, kvs}, env) do
     {:%{}, [], Enum.map(kvs, fn {k, v} -> {compile(k, notail(env)), compile(v, notail(env))} end)}
   end
 
-  def compile({:set, items}, env) do
+  defp do_compile({:set, items}, env) do
     members = Enum.map(items, &compile(&1, notail(env)))
 
     quote do
@@ -116,7 +140,7 @@ defmodule BeamLisp.Compiler do
 
   # --- symbols ---
 
-  def compile({:symbol, name}, env) do
+  defp do_compile({:symbol, name}, env) do
     cond do
       local?(env, name) ->
         local(env, name)
@@ -134,13 +158,20 @@ defmodule BeamLisp.Compiler do
 
   # --- calls and special forms ---
 
-  def compile({:list, []}, _env), do: []
+  defp do_compile({:list, []}, _env), do: []
 
-  def compile({:list, [{:symbol, head} | args]}, env) when head in @special_forms do
+  # The reader wraps the head of a call form in FormMeta; peel it so
+  # special-form / keyword / symbol dispatch sees the bare head. The list
+  # form's own position (already in env) stands for the call site.
+  defp do_compile({:list, [{:meta, head, _} | args]}, env) do
+    do_compile({:list, [head | args]}, env)
+  end
+
+  defp do_compile({:list, [{:symbol, head} | args]}, env) when head in @special_forms do
     compile_special(head, args, env)
   end
 
-  def compile({:list, [{:keyword, kw} | args]}, env) do
+  defp do_compile({:list, [{:keyword, kw} | args]}, env) do
     arg_asts = Enum.map(args, &compile(&1, notail(env)))
 
     quote do
@@ -148,7 +179,7 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  def compile({:list, [{:symbol, name} | args]}, env) do
+  defp do_compile({:list, [{:symbol, name} | args]}, env) do
     cond do
       local?(env, name) ->
         invoke_quoted(local(env, name), compile_args(args, env))
@@ -194,7 +225,7 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  def compile({:list, [head | args]}, env) do
+  defp do_compile({:list, [head | args]}, env) do
     arg_env = notail(env)
     invoke_quoted(compile(head, arg_env), Enum.map(args, &compile(&1, arg_env)))
   end
@@ -234,11 +265,15 @@ defmodule BeamLisp.Compiler do
   # (ns foo.bar (:require [other.ns :as o] [third.ns :refer [x]]))
   # Emits runtime registry ops; the *next* form's compile then sees
   # the new ns via Env.current_ns (eval_string re-reads it per form).
-  defp compile_special("ns", [{:symbol, name} | clauses], _env) do
+  defp compile_special("ns", [name_form | clauses], _env) do
+    name = name_of(name_form)
+
     specs =
-      Enum.flat_map(clauses, fn
-        {:list, [{:keyword, "require"} | require_specs]} -> require_specs
-        other -> raise "ns supports only :require clauses, got: #{inspect(other)}"
+      Enum.flat_map(clauses, fn clause ->
+        case unwrap_meta(clause) do
+          {:list, [{:keyword, "require"} | require_specs]} -> require_specs
+          other -> raise "ns supports only :require clauses, got: #{inspect(other)}"
+        end
       end)
 
     {loads, aliases, refers} =
@@ -271,30 +306,40 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp compile_special("def", [{:symbol, name}, init], env),
-    do: compile_def(name, compile(init, notail(env)), env)
+  defp compile_special("def", [name_form, init], env),
+    do: compile_def(name_of(name_form), compile(init, notail(env)), env)
 
-  defp compile_special("def", [{:symbol, name}, doc, init], env) when is_binary(doc),
-    do: compile_def(name, compile(init, notail(env)), env, doc)
+  defp compile_special("def", [name_form, doc, init], env) when is_binary(doc),
+    do: compile_def(name_of(name_form), compile(init, notail(env)), env, doc)
 
   defp compile_special("fn", args, env) do
     case args do
       # A named fn binds its own name to the fn value inside its body, so
       # `(fn step [n] (step (- n 1)))` can recurse (doseq's builder does).
-      [{:symbol, name} | clauses] -> compile_fn(fn_clauses(clauses), env, name: name)
-      clauses -> compile_fn(fn_clauses(clauses), env)
+      [first | clauses] ->
+        case unwrap_meta(first) do
+          {:symbol, name} -> compile_fn(fn_clauses(clauses), env, name: name)
+          _ -> compile_fn(fn_clauses(args), env)
+        end
+
+      clauses ->
+        compile_fn(fn_clauses(clauses), env)
     end
   end
 
-  defp compile_special("defn", [{:symbol, name} | rest], env) do
+  defp compile_special("defn", [name_form | rest], env) do
+    name = name_of(name_form)
     {doc, rest} = split_docstring(rest)
 
     cond do
       rest == [] ->
-        raise "defn #{name}: expected at least one parameter vector"
+        compile_error(env, "defn #{name}: expected at least one parameter vector")
 
       match?([h | _] when is_binary(h), rest) ->
-        raise "defn #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+        compile_error(
+          env,
+          "defn #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+        )
 
       true ->
         compile_defn(name, fn_clauses(rest), env, doc)
@@ -303,15 +348,19 @@ defmodule BeamLisp.Compiler do
 
   # A macro is a fn stored under a tag; calls to it expand at
   # compile time (see macro_for/expand_macro below).
-  defp compile_special("defmacro", [{:symbol, name} | rest], env) do
+  defp compile_special("defmacro", [name_form | rest], env) do
+    name = name_of(name_form)
     {doc, rest} = split_docstring(rest)
 
     cond do
       rest == [] ->
-        raise "defmacro #{name}: expected at least one parameter vector"
+        compile_error(env, "defmacro #{name}: expected at least one parameter vector")
 
       match?([h | _] when is_binary(h), rest) ->
-        raise "defmacro #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+        compile_error(
+          env,
+          "defmacro #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
+        )
 
       true ->
         compile_def(
@@ -331,12 +380,14 @@ defmodule BeamLisp.Compiler do
   # changes), mirroring Clojure's CLJ-1351. `(defmethod name val
   # [args] body…)` adds or replaces one entry; the dispatch value is
   # an ordinary expression evaluated at definition time.
-  defp compile_special("defmulti", [{:symbol, name}, dispatch], env) do
+  defp compile_special("defmulti", [name_form, dispatch], env) do
+    name = name_of(name_form)
     dispatch_ast = compile(dispatch, notail(env))
     quote do: BeamLisp.Multi.define_multi(unquote(env.ns), unquote(name), unquote(dispatch_ast))
   end
 
-  defp compile_special("defmulti", [{:symbol, name}, doc, dispatch], env) when is_binary(doc) do
+  defp compile_special("defmulti", [name_form, doc, dispatch], env) when is_binary(doc) do
+    name = name_of(name_form)
     dispatch_ast = compile(dispatch, notail(env))
 
     quote do
@@ -346,11 +397,12 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp compile_special("defmulti", args, _env),
-    do: raise("defmulti: expected (defmulti name dispatch-fn), got #{inspect(args)}")
+  defp compile_special("defmulti", args, env),
+    do: compile_error(env, "defmulti: expected (defmulti name dispatch-fn), got #{inspect(args)}")
 
-  defp compile_special("defmethod", [{:symbol, name}, dispatch_val | rest], env) do
-    if rest == [], do: raise("defmethod #{name}: expected a method body")
+  defp compile_special("defmethod", [name_form, dispatch_val | rest], env) do
+    name = name_of(name_form)
+    if rest == [], do: compile_error(env, "defmethod #{name}: expected a method body")
 
     {mns, mname} = multi_var_target(env, name)
     dispatch_ast = compile(dispatch_val, notail(env))
@@ -371,11 +423,15 @@ defmodule BeamLisp.Compiler do
   # several at once. A type arg is a keyword tag (`:vector`, `:map`,
   # `:binary`…) or an Elixir struct module (`Foo.Bar`), resolved to a
   # tag at compile time.
-  defp compile_special("defprotocol", [{:symbol, name} | method_forms], env) do
+  defp compile_special("defprotocol", [name_form | method_forms], env) do
+    name = name_of(name_form)
+
     method_names =
-      Enum.map(method_forms, fn
-        {:list, [{:symbol, m} | _]} -> m
-        other -> raise "defprotocol #{name}: expected (method-name [args]…), got #{inspect(other)}"
+      Enum.map(method_forms, fn mf ->
+        case unwrap_meta(mf) do
+          {:list, [head | _]} -> name_of(head)
+          other -> raise "defprotocol #{name}: expected (method-name [args]…), got #{inspect(other)}"
+        end
       end)
 
     quote do
@@ -383,10 +439,11 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp compile_special("defprotocol", args, _env),
-    do: raise("defprotocol: expected (defprotocol Name (method [args]…)), got #{inspect(args)}")
+  defp compile_special("defprotocol", args, env),
+    do: compile_error(env, "defprotocol: expected (defprotocol Name (method [args]…)), got #{inspect(args)}")
 
-  defp compile_special("extend-type", [type_form, {:symbol, protocol} | method_forms], env) do
+  defp compile_special("extend-type", [type_form, protocol_form | method_forms], env) do
+    protocol = name_of(protocol_form)
     {pns, pname} = multi_var_target(env, protocol)
     tag = type_tag(type_form)
     impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
@@ -396,16 +453,18 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp compile_special("extend-protocol", [{:symbol, protocol} | forms], env) do
+  defp compile_special("extend-protocol", [protocol_form | forms], env) do
+    protocol = name_of(protocol_form)
     {pns, pname} = multi_var_target(env, protocol)
     # Forms alternate type / method-forms; a type is a keyword or
     # symbol, a method form is a list — enough to split the groups
     # without consulting the protocol descriptor.
     {groups, cur_type, cur_methods} =
-      Enum.reduce(forms, {[], nil, []}, fn
-        {:list, _} = mf, {groups, type, methods} -> {groups, type, methods ++ [mf]}
-        type_form, {groups, prev_type, methods} ->
-          {groups ++ [{prev_type, methods}], type_form, []}
+      Enum.reduce(forms, {[], nil, []}, fn mf, {groups, type, methods} ->
+        case unwrap_meta(mf) do
+          {:list, _} = bare -> {groups, type, methods ++ [bare]}
+          type_form -> {groups ++ [{type, methods}], type_form, []}
+        end
       end)
 
     calls =
@@ -431,7 +490,8 @@ defmodule BeamLisp.Compiler do
     ast
   end
 
-  defp compile_special("let", [{:vector, bindings} | body], env) do
+  defp compile_special("let", [bindings_form | body], env) do
+    {:vector, bindings} = unwrap_meta(bindings_form)
     {steps, final_env} = compile_bindings(bindings, notail(env))
     body_ast = block_forms(body, %{final_env | tail: env.tail})
     nest_steps(steps, body_ast)
@@ -442,7 +502,8 @@ defmodule BeamLisp.Compiler do
   # bindings destructure at entry: the recur params are the pattern
   # values (the whole map/vector), so `recur` re-supplies them exactly
   # as in Clojure.
-  defp compile_special("loop", [{:vector, bindings} | body], env) do
+  defp compile_special("loop", [bindings_form | body], env) do
+    {:vector, bindings} = unwrap_meta(bindings_form)
     {params, entry_binds, arg_asts, bound_env} = loop_bindings(bindings, notail(env))
 
     self = fresh_var("loop")
@@ -458,24 +519,22 @@ defmodule BeamLisp.Compiler do
   # The star-suffixed primitives beneath loop/let/fn, which upstream
   # macros expand to (jank's threading macros use loop*, its head uses
   # fn*/let*). Each shares its unstarred sibling's semantics.
-  defp compile_special("loop*", [{:vector, bindings} | body], env),
-    do: compile_special("loop", [{:vector, bindings} | body], env)
+  defp compile_special("loop*", args, env), do: compile_special("loop", args, env)
 
-  defp compile_special("let*", [{:vector, bindings} | body], env),
-    do: compile_special("let", [{:vector, bindings} | body], env)
+  defp compile_special("let*", args, env), do: compile_special("let", args, env)
 
   defp compile_special("fn*", args, env), do: compile_special("fn", args, env)
 
   defp compile_special("recur", args, env) do
     case env.recur do
       nil ->
-        raise "recur used with no enclosing loop or fn"
+        compile_error(env, "recur used with no enclosing loop or fn")
 
       %{arity: arity} = target ->
-        unless env.tail, do: raise("recur must be in tail position")
+        unless env.tail, do: compile_error(env, "recur must be in tail position")
 
         unless length(args) == arity,
-          do: raise("recur arity mismatch: target takes #{arity}, got #{length(args)}")
+          do: compile_error(env, "recur arity mismatch: target takes #{arity}, got #{length(args)}")
 
         arg_asts = Enum.map(args, &compile(&1, notail(env)))
 
@@ -550,12 +609,12 @@ defmodule BeamLisp.Compiler do
   # map match. Clause bodies see their pattern's bindings.
   defp compile_special("receive", clauses, env) do
     {after_clauses, normal} =
-      Enum.split_with(clauses, &match?({:list, [{:symbol, "after"} | _]}, &1))
+      Enum.split_with(clauses, &match?({:list, [{:symbol, "after"} | _]}, unwrap_meta(&1)))
 
     pairs = Enum.chunk_every(normal, 2)
 
     unless Enum.all?(pairs, &(length(&1) == 2)) do
-      raise "receive clauses must be pattern/body pairs"
+      compile_error(env, "receive clauses must be pattern/body pairs")
     end
 
     do_clauses =
@@ -570,12 +629,13 @@ defmodule BeamLisp.Compiler do
         [] ->
           [do: do_clauses]
 
-        [{:list, [{:symbol, "after"}, timeout, body]}] ->
+        [after_form] ->
+          {:list, [{:symbol, "after"}, timeout, body]} = unwrap_meta(after_form)
           after_clause = {:->, [], [[compile(timeout, notail(env))], compile(body, env)]}
           [do: do_clauses, after: [after_clause]]
 
         _ ->
-          raise "receive takes at most one (after ms body) clause"
+          compile_error(env, "receive takes at most one (after ms body) clause")
       end
 
     {:receive, [], [block]}
@@ -590,13 +650,19 @@ defmodule BeamLisp.Compiler do
   # Catch/finally are classified by their head symbol; the caller
   # keeps the catch clauses in source order (first match wins).
   defp split_try_forms(forms) do
-    {catches, rest} = Enum.split_with(forms, &match?({:list, [{:symbol, "catch"} | _]}, &1))
-    {finallies, body} = Enum.split_with(rest, &match?({:list, [{:symbol, "finally"} | _]}, &1))
+    {catches, rest} =
+      Enum.split_with(forms, &match?({:list, [{:symbol, "catch"} | _]}, unwrap_meta(&1)))
+
+    {finallies, body} =
+      Enum.split_with(rest, &match?({:list, [{:symbol, "finally"} | _]}, unwrap_meta(&1)))
 
     finally_body =
       case finallies do
         [] -> []
-        [{:list, [{:symbol, "finally"} | fb]}] -> fb
+        [finally_form] ->
+          {:list, [{:symbol, "finally"} | fb]} = unwrap_meta(finally_form)
+          fb
+
         _ -> raise "try takes at most one (finally …) clause"
       end
 
@@ -658,13 +724,15 @@ defmodule BeamLisp.Compiler do
   # for the dispatch. A capitalized first symbol names a typed module; any
   # other symbol is an untyped catch-all. The handler's `e` is bound to
   # the dispatched value before it runs.
-  defp catch_branch({:list, [{:symbol, "catch"}, first | rest]}, e_var, env) do
-    case first do
+  defp catch_branch(clause, e_var, env) do
+    {:list, [{:symbol, "catch"}, first | rest]} = unwrap_meta(clause)
+
+    case unwrap_meta(first) do
       {:symbol, name} ->
         if uppercase?(name) do
           case rest do
-            [{:symbol, e_name} | handler] ->
-              typed_branch(name, e_name, handler, e_var, env)
+            [e_name_form | handler] ->
+              typed_branch(name, name_of(e_name_form), handler, e_var, env)
 
             _ ->
               raise "typed catch requires (catch Module.Name e handler…)"
@@ -715,16 +783,21 @@ defmodule BeamLisp.Compiler do
   # A receive pattern, compiled with its bindings added to the env.
   # Returns one or more pattern ASTs (a vector pattern matches both
   # Erlang tuples and beam-lisp vectors — one clause each).
-  defp compile_pattern({:symbol, "_"}, env), do: {[{:_, [], __MODULE__}], env}
+  # A receive pattern may carry a reader position wrapper; unwrap it for
+  # the shape clauses below while nested items stay wrapped so their own
+  # positions re-capture when compiled.
+  defp compile_pattern(form, env), do: compile_pattern_bare(unwrap_meta(form), env)
 
-  defp compile_pattern({:symbol, name}, env) do
+  defp compile_pattern_bare({:symbol, "_"}, env), do: {[{:_, [], __MODULE__}], env}
+
+  defp compile_pattern_bare({:symbol, name}, env) do
     var = fresh_var(name)
     {[var], put_local(env, name, var)}
   end
 
-  defp compile_pattern({:keyword, name}, env), do: {[String.to_atom(name)], env}
+  defp compile_pattern_bare({:keyword, name}, env), do: {[String.to_atom(name)], env}
 
-  defp compile_pattern({:vector, items}, env) do
+  defp compile_pattern_bare({:vector, items}, env) do
     {pats, env} =
       Enum.map_reduce(items, env, fn item, acc_env ->
         {[pat], acc_env} = compile_pattern(item, acc_env)
@@ -740,11 +813,11 @@ defmodule BeamLisp.Compiler do
     {[tuple_pat, vector_pat], env}
   end
 
-  defp compile_pattern({:map, kvs}, env) do
+  defp compile_pattern_bare({:map, kvs}, env) do
     {pairs, env} =
       Enum.map_reduce(kvs, env, fn {k, v}, acc_env ->
         key =
-          case k do
+          case unwrap_meta(k) do
             {:keyword, name} -> String.to_atom(name)
             lit when is_number(lit) or is_binary(lit) -> lit
             other -> raise "unsupported map pattern key: #{inspect(other)}"
@@ -757,14 +830,16 @@ defmodule BeamLisp.Compiler do
     {[{:%{}, [], pairs}], env}
   end
 
-  defp compile_pattern({:list, [{:symbol, "quote"}, form]}, env) do
+  defp compile_pattern_bare({:list, [{:symbol, "quote"}, form]}, env) do
     {[Macro.escape(datum(form))], env}
   end
 
-  defp compile_pattern(lit, env) when is_number(lit) or is_binary(lit) or is_boolean(lit) or is_nil(lit),
-    do: {[lit], env}
+  defp compile_pattern_bare(lit, env)
+       when is_number(lit) or is_binary(lit) or is_boolean(lit) or is_nil(lit),
+       do: {[lit], env}
 
-  defp compile_pattern(other, _env), do: raise("unsupported receive pattern: #{inspect(other)}")
+  defp compile_pattern_bare(other, _env),
+    do: raise("unsupported receive pattern: #{inspect(other)}")
 
   # A defn links: its clauses become named defs in the namespace
   # module (variadic under a mangled name, rest as the last param),
@@ -772,6 +847,13 @@ defmodule BeamLisp.Compiler do
   # direct remote calls. See BeamLisp.Link.
   defp compile_defn(name, clauses, env, doc) do
     mod = BeamLisp.Link.module_for(env.ns)
+
+    # The defn form's own line stamps each generated `:def` node, so the
+    # namespace module's line table names the definition site (not the
+    # default module line). The location rides to Link.defvar so its
+    # Module.create claims the same file.
+    def_line = if line = pos_line(env[:line]), do: [line: line], else: []
+    location = if env[:file], do: [file: env[:file], line: pos_line(env[:line]) || 1], else: nil
 
     entries =
       Enum.map(clauses, fn {params, body} ->
@@ -786,13 +868,18 @@ defmodule BeamLisp.Compiler do
         {head_vars, body_ast, fixed_count, _v?} =
           compile_clause(env, params, body, %{self_call: {mod, fname}})
 
-        def_ast = {:def, [], [{fname, [], head_vars}, [do: body_ast]]}
+        def_ast = {:def, def_line, [{fname, [], head_vars}, [do: body_ast]]}
         {kind, fixed_count, fname, def_ast}
       end)
 
     defvar_ast =
       quote do
-        BeamLisp.Link.defvar(unquote(env.ns), unquote(name), unquote(Macro.escape(entries)))
+        BeamLisp.Link.defvar(
+          unquote(env.ns),
+          unquote(name),
+          unquote(Macro.escape(entries)),
+          unquote(location)
+        )
       end
 
     if doc do
@@ -901,6 +988,13 @@ defmodule BeamLisp.Compiler do
   # punching holes back into evaluated code. The third arg is the
   # per-syntax-quote gensym map; every clause passes it back so a
   # `x#` rename seen in an earlier sibling is visible to later ones.
+  #
+  # A syntax-quoted list may carry a reader position (only lists do under
+  # the narrowed design); unwrap it so the shape clauses see the bare
+  # form, while the nested items stay wrapped so their own positions
+  # re-capture when compiled.
+  defp synq_data({:meta, _inner, _m} = form, env, g), do: synq_data(unwrap_meta(form), env, g)
+
   defp synq_data({:list, [{:symbol, "unquote"}, x]}, env, g),
     do: {compile(x, notail(env)), g}
 
@@ -944,15 +1038,17 @@ defmodule BeamLisp.Compiler do
   defp synq_data(lit, _env, g), do: {lit, g}
 
   defp synq_list(items, env, g) do
-    Enum.reduce(Enum.reverse(items), {[], g}, fn
-      {:list, [{:symbol, "unquote-splicing"}, x]}, {acc, gacc} ->
+    Enum.reduce(Enum.reverse(items), {[], g}, fn item, {acc, gacc} ->
+      case unwrap_meta(item) do
         # `~@` splices any seqable, not just a list — jank's own macros
         # splice binding *vectors*, and `++` demands a list.
-        {quote(do: BeamLisp.RT.splice(unquote(compile(x, notail(env))), unquote(acc))), gacc}
+        {:list, [{:symbol, "unquote-splicing"}, x]} ->
+          {quote(do: BeamLisp.RT.splice(unquote(compile(x, notail(env))), unquote(acc))), gacc}
 
-      item, {acc, gacc} ->
-        {item_ast, g2} = synq_data(item, env, gacc)
-        {[{:|, [], [item_ast, acc]}], g2}
+        _ ->
+          {item_ast, g2} = synq_data(item, env, gacc)
+          {[{:|, [], [item_ast, acc]}], g2}
+      end
     end)
   end
 
@@ -1009,7 +1105,7 @@ defmodule BeamLisp.Compiler do
     pairs = Enum.chunk_every(bindings, 2)
 
     unless Enum.all?(pairs, &(length(&1) == 2)) do
-      raise "binding forms must be even, each a pattern and a value"
+      compile_error(env, "binding forms must be even, each a pattern and a value")
     end
 
     Enum.reduce(pairs, {[], [], [], env}, fn [pattern_form, init], {params, entry, arg_asts, acc_env} ->
@@ -1036,7 +1132,7 @@ defmodule BeamLisp.Compiler do
     pairs = Enum.chunk_every(bindings, 2)
 
     unless Enum.all?(pairs, &(length(&1) == 2)) do
-      raise "binding forms must be even, each a pattern and a value"
+      compile_error(env, "binding forms must be even, each a pattern and a value")
     end
 
     Enum.reduce(pairs, {[], env}, fn [pattern_form, init], {steps, acc_env} ->
@@ -1061,9 +1157,11 @@ defmodule BeamLisp.Compiler do
   defp fn_clauses([{:vector, params} | body]), do: [{params, body}]
 
   defp fn_clauses(clauses) do
-    Enum.map(clauses, fn
-      {:list, [{:vector, params} | body]} -> {params, body}
-      other -> raise "invalid fn clause: #{inspect(other)}"
+    Enum.map(clauses, fn clause ->
+      case unwrap_meta(clause) do
+        {:list, [{:vector, params} | body]} -> {params, body}
+        other -> raise "invalid fn clause: #{inspect(other)}"
+      end
     end)
   end
 
@@ -1424,7 +1522,14 @@ defmodule BeamLisp.Compiler do
   # recognize them, keywords become atoms, everything else is itself.
   defp datum({:symbol, name}), do: {:symbol, name}
   defp datum({:keyword, name}), do: String.to_atom(name)
-  defp datum({:meta, form, m}), do: {:meta, datum(form), m}
+  # Source positions are a COMPILER channel, not data. A macro receives
+  # its arguments as data and walks them with `first`/`rest`/`seq?` —
+  # runtime fns that know lists, not `{:meta, form, m}` wrappers. Leaving
+  # the wrapper on made `(-> 5 (+ 3) (* 2))` compile `(* 2)` as a
+  # one-argument call, because `->`'s `rest` saw a wrapper where a list
+  # was promised. Positions are read off the form BEFORE it becomes a
+  # datum (see `compile/2`); past this boundary they are dropped.
+  defp datum({:meta, form, _m}), do: datum(form)
   defp datum({:list, items}), do: Enum.map(items, &datum/1)
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:set, items}), do: BeamLisp.Set.new(Enum.map(items, &datum/1))
@@ -1432,14 +1537,18 @@ defmodule BeamLisp.Compiler do
   defp datum(lit), do: lit
 
   # One protocol method implementation: `(m [args] body…)` compiles to
-  # a method-name => fn-value map entry.
-  defp protocol_impl({:list, [{:symbol, m} | rest]}, env) do
-    if rest == [], do: raise("defprotocol method #{m}: expected a body")
-    {m, compile_fn(fn_clauses(rest), env)}
-  end
+  # a method-name => fn-value map entry. The method form may carry a
+  # reader position (it is a list); unwrap it so the shape matches.
+  defp protocol_impl(form, env) do
+    case unwrap_meta(form) do
+      {:list, [{:symbol, m} | rest]} ->
+        if rest == [], do: raise("defprotocol method #{m}: expected a body")
+        {m, compile_fn(fn_clauses(rest), env)}
 
-  defp protocol_impl(other, _env),
-    do: raise("expected (method-name [args]…) implementation, got #{inspect(other)}")
+      other ->
+        raise("expected (method-name [args]…) implementation, got #{inspect(other)}")
+    end
+  end
 
   # Resolve a type argument to the tag `Multi.type_of/1` would produce
   # for values of that type: keywords are the builtin tags themselves,
@@ -1520,6 +1629,78 @@ defmodule BeamLisp.Compiler do
   # --- compile-time env ---
 
   defp notail(env), do: %{env | tail: false}
+
+  # Thread a form's position (from its FormMeta wrapper) into the compile
+  # env so the emitters below can stamp `line:` onto the AST. Positions are
+  # best-effort: a form with no metadata keeps the env's current position.
+  defp pos_env(env, m) when is_map(m) do
+    env
+    |> maybe_put(:line, m[:line], &(is_integer(&1) and &1 > 0))
+    |> maybe_put(:file, m[:file], &is_binary/1)
+  end
+
+  defp pos_env(env, _m), do: env
+
+  defp maybe_put(env, _key, nil, _ok?), do: env
+  defp maybe_put(env, key, value, ok?) do
+    if ok?.(value), do: Map.put(env, key, value), else: env
+  end
+
+  # The `[file:, line:]` location for a generated module, from the form's
+  # own position metadata (only lists carry it) then the compile env,
+  # else nil — the caller falls back to `Macro.Env.location(__ENV__)`.
+  defp module_location(form, env) do
+    case form do
+      {:meta, _inner, m} ->
+        pos_loc(m[:file] || env[:file], pos_line(m[:line]) || pos_line(env[:line]))
+
+      _ ->
+        pos_loc(env[:file], pos_line(env[:line]))
+    end
+  end
+
+  defp pos_loc(file, line) when is_binary(file), do: [file: file, line: line || 1]
+  defp pos_loc(_file, _line), do: nil
+
+  defp pos_line(line) when is_integer(line) and line > 0, do: line
+  defp pos_line(_), do: nil
+
+  # Stamp the form's line onto the outermost AST node. A literal (a bare
+  # number/string/atom) carries no call site, so it is left alone; a call
+  # form's outermost node is the call itself, which is what the BEAM line
+  # table records.
+  defp stamp_line(ast, env) do
+    case env[:line] do
+      line when is_integer(line) and line > 0 -> stamp_node(ast, line)
+      _ -> ast
+    end
+  end
+
+  defp stamp_node({node, meta, args}, line) when is_list(meta) do
+    {node, Keyword.put(meta, :line, line), args}
+  end
+
+  defp stamp_node(ast, _line), do: ast
+
+  # Drop one FormMeta wrapper so a shape clause matches the bare form; a
+  # form with no wrapper passes through. Shape tokens (names, params,
+  # patterns) are unwrapped before matching, while the forms a helper
+  # recurses into stay wrapped so compile/2 re-captures their positions.
+  defp unwrap_meta({:meta, form, _m}), do: form
+  defp unwrap_meta(other), do: other
+
+  # The name of a `{:symbol, name}` token, possibly position-wrapped.
+  defp name_of(form), do: name_of_unwrapped(unwrap_meta(form))
+  defp name_of_unwrapped({:symbol, name}), do: name
+
+  # Raise a compile error carrying the current position and offending form.
+  defp compile_error(env, message, form \\ nil) do
+    raise BeamLisp.CompileError,
+      message: message,
+      file: env[:file],
+      line: env[:line],
+      form: form
+  end
 
   defp local?(env, name), do: Map.has_key?(env.locals, name)
   defp local(env, name), do: Map.fetch!(env.locals, name)

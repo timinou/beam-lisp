@@ -36,7 +36,7 @@ defmodule BeamLisp do
     init()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      path |> File.read!() |> Compiler.eval_string()
+      path |> File.read!() |> Compiler.eval_string(Compiler.new_env(), path)
     end)
   end
 

@@ -49,6 +49,20 @@ defmodule BeamLisp.Reader do
   Clojure — closing that needs a runtime char wrapper, a later wave. The
   reader gap (a bare symbol `\\a`) is closed here; the value is a literal.
 
+  ## Source positions
+
+  The parser threads a `{line, col, file}` position (both 1-indexed) as it
+  consumes characters; newlines advance the line and reset the column. The
+  position is attached to every form where an error could be reported —
+  lists, vectors, maps, sets, symbols, and the head of each call form —
+  via the `BeamLisp.FormMeta` `{:meta, form, %{line: l, col: c, file: f}}`
+  wrapper, the source-location channel the compiler already strips before
+  codegen. Scalars (integers, floats, strings, keywords) carry no wrapper
+  because `FormMeta` only wraps form-shaped data. `read_string/1,2` is the
+  position-aware entry and returns the wrapped forms; `read_all/1` and
+  `read_one/1` deep-unwrap so the bare shapes they always returned are
+  preserved for callers that ignore positions.
+
   ## Atom safety
 
   The reader interns nothing — symbol and keyword names travel as plain
@@ -75,14 +89,15 @@ defmodule BeamLisp.Reader do
   @guard_cfg_key {__MODULE__, :atom_guard_cfg}
   @fn_literal_depth_key {__MODULE__, :fn_literal_depth}
 
-  @spec read_all(String.t()) :: [term]
-  def read_all(source) when is_binary(source) do
+  @spec read_string(String.t()) :: [term]
+  @spec read_string(String.t(), binary | nil) :: [term]
+  def read_string(source, file \\ nil) when is_binary(source) do
     Process.put(@guard_cfg_key, atom_guard_config())
     Process.put(@guard_count_key, 0)
     Process.put(@fn_literal_depth_key, 0)
 
-    case forms(String.to_charlist(source)) do
-      {:ok, forms, rest} ->
+    case forms(String.to_charlist(source), {1, 1, file}) do
+      {:ok, forms, rest, _pos} ->
         if blank?(rest) do
           forms
         else
@@ -94,6 +109,11 @@ defmodule BeamLisp.Reader do
     end
   end
 
+  @spec read_all(String.t()) :: [term]
+  def read_all(source) when is_binary(source) do
+    source |> read_string() |> Enum.map(&unwrap_deep/1)
+  end
+
   @spec read_one(String.t()) :: term
   def read_one(source) do
     case read_all(source) do
@@ -103,56 +123,94 @@ defmodule BeamLisp.Reader do
     end
   end
 
+  # --- source positions ---
+  #
+  # `pos` is a `{line, col, file}` tuple (line and col 1-indexed, file a
+  # path or nil). The parser threads it so each form knows where its first
+  # character begins; with_pos/2 wraps a constructed form in the FormMeta
+  # source-location channel, and unwrap_deep/1 removes every wrapper so
+  # `read_all` keeps returning the bare shapes it always did.
+
+  # Advance over one char: newline restarts the column at 1, anything else
+  # advances the column by one. The file component is invariant.
+  # The list clause must precede the `_char` catch-all so a charlist is
+  # reduced over rather than treated as a single character.
+  defp advance_pos(pos, chars) when is_list(chars), do: Enum.reduce(chars, pos, fn char, acc -> advance_pos(acc, char) end)
+  defp advance_pos({line, _col, file}, ?\n), do: {line + 1, 1, file}
+  defp advance_pos({line, col, file}, _char), do: {line, col + 1, file}
+
+  # Attach the source location to a constructed form. FormMeta wraps only
+  # form-shaped data, so this is a no-op for scalars — exactly the intent:
+  # positions ride on the forms an error can name, never on a value.
+  defp with_pos(form, {line, col, file}) do
+    existing = BeamLisp.FormMeta.meta(form)
+    BeamLisp.FormMeta.with_meta(form, Map.merge(existing || %{}, %{line: line, col: col, file: file}))
+  end
+
+  # Wrap the bare form a collection constructor produced, or pass an error
+  # through untouched. `pos` is the position of the opening delimiter.
+  defp with_pos_ok({:ok, form, rest, pos}, pos0), do: {:ok, with_pos(form, pos0), rest, pos}
+  defp with_pos_ok(err, _pos0), do: err
+
+  # Strip every `{:meta, form, m}` wrapper (top-level and nested) so a
+  # position-free caller sees the bare form shapes it always matched on.
+  defp unwrap_deep({:meta, form, _m}), do: unwrap_deep(form)
+  defp unwrap_deep({:list, items}), do: {:list, Enum.map(items, &unwrap_deep/1)}
+  defp unwrap_deep({:vector, items}), do: {:vector, Enum.map(items, &unwrap_deep/1)}
+  defp unwrap_deep({:map, kvs}), do: {:map, Enum.map(kvs, fn {k, v} -> {unwrap_deep(k), unwrap_deep(v)} end)}
+  defp unwrap_deep({:set, items}), do: {:set, Enum.map(items, &unwrap_deep/1)}
+  defp unwrap_deep(other), do: other
+
   # --- form parsing ---
 
-  defp forms(rest), do: forms(skip_ignored(rest), [])
+  defp forms(rest, pos) do
+    {rest, pos} = skip_ignored(rest, pos)
+    forms(rest, pos, [])
+  end
 
-  defp forms(rest, acc) do
-    case form(rest) do
-      {:ok, f, rest} -> forms(skip_ignored(rest), [f | acc])
-      :none -> {:ok, Enum.reverse(acc), rest}
+  defp forms(rest, pos, acc) do
+    case form(rest, pos) do
+      {:ok, f, rest, pos} ->
+        {rest, pos} = skip_ignored(rest, pos)
+        forms(rest, pos, [f | acc])
+
+      :none -> {:ok, Enum.reverse(acc), rest, pos}
       {:error, _} = err -> err
     end
   end
 
-  defp form(rest) do
+  # Read one form. `pos` is the position of the head of `rest` — the
+  # position where the form's first character sits — and is attached to
+  # the form via its FormMeta wrapper. Scalars and keywords stay bare.
+  defp form(rest, pos) do
     case rest do
       [] -> :none
-      [?( | rest] -> collection(rest, ?), &{:list, &1})
-      [?[ | rest] -> collection(rest, ?], &{:vector, &1})
-      [?{ | rest] -> map_form(rest)
+      [?( | rest] -> with_pos_ok(collection(rest, advance_pos(pos, ?(), ?), &{:list, &1}), pos)
+      # Only lists carry a position. A vector, map or set is as often a
+      # *shape token* as a value — a parameter list, a `let` binding vector,
+      # a destructuring pattern — and the compiler matches those structurally
+      # in dozens of helpers. A list is where evaluation happens, so a list
+      # is what an error names.
+      [?[ | rest] -> collection(rest, advance_pos(pos, ?[), ?], &{:vector, &1})
+      [?{ | rest] -> map_form(rest, advance_pos(pos, ?{))
       [?) | _] -> {:error, "unexpected )"}
       [?] | _] -> {:error, "unexpected ]"}
       [?} | _] -> {:error, "unexpected }"}
-      [?' | rest] ->
-        quote_form(rest, "quote")
-
-      [?` | rest] ->
-        quote_form(rest, "syntax-quote")
-
-      [?~, ?@ | rest] ->
-        quote_form(rest, "unquote-splicing")
-
-      [?~ | rest] ->
-        quote_form(rest, "unquote")
-
-      [?@ | rest] ->
-        wrap_form(rest, "@", "deref")
-
-      [?#, ?( | rest] ->
-        fn_literal(rest)
-
+      [?' | rest] -> quote_form(rest, pos, "quote")
+      [?` | rest] -> quote_form(rest, pos, "syntax-quote")
+      [?~, ?@ | rest] -> quote_form(rest, pos, "unquote-splicing")
+      [?~ | rest] -> quote_form(rest, pos, "unquote")
+      [?@ | rest] -> wrap_form(rest, pos, "@", "deref")
+      [?#, ?( | rest] -> fn_literal(rest, pos)
       [?#, ?{ | rest] ->
         # `#{a b}` is a set literal. It must be matched before the bare
         # `#` token path, and before `{`, since `#` alone is a legal
         # symbol character (trailing `#` is the auto-gensym marker).
-        collection(rest, ?}, &{:set, &1})
+        collection(rest, advance_pos(pos, [?#, ?{]), ?}, &{:set, &1})
 
-      [?#, ?_ | rest] ->
-        discard_form(rest)
-
-      [?" | rest] -> string(rest, [])
-      rest -> atom_form(rest)
+      [?#, ?_ | rest] -> discard_form(rest, pos)
+      [?" | rest] -> string(rest, advance_pos(pos, ?"), [])
+      rest -> atom_form(rest, pos)
     end
   end
 
@@ -162,23 +220,27 @@ defmodule BeamLisp.Reader do
   # Lisp reader macro, and rebindable. The builtin default keeps `@`
   # working before the prelude loads. `@` followed only by whitespace
   # (or nothing) is a reader error.
-  defp wrap_form(rest, char, default) do
+  defp wrap_form(rest, pos0, char, default) do
     name =
       case BeamLisp.RT.reader_macro(char) do
         {:ok, registered} -> registered
         :error -> default
       end
 
-    case form(skip_ignored(rest)) do
-      {:ok, f, rest} -> {:ok, {:list, [{:symbol, name}, f]}, rest}
+    {rest, pos} = skip_ignored(rest, pos0)
+
+    case form(rest, pos) do
+      {:ok, f, rest, pos} -> {:ok, with_pos({:list, [{:symbol, name}, f]}, pos0), rest, pos}
       :none -> {:error, "#{char} with no following form"}
       err -> err
     end
   end
 
-  defp quote_form(rest, name) do
-    case form(skip_ignored(rest)) do
-      {:ok, f, rest} -> {:ok, {:list, [{:symbol, name}, f]}, rest}
+  defp quote_form(rest, pos0, name) do
+    {rest, pos} = skip_ignored(rest, pos0)
+
+    case form(rest, pos) do
+      {:ok, f, rest, pos} -> {:ok, with_pos({:list, [{:symbol, name}, f]}, pos0), rest, pos}
       :none -> {:error, "#{name} with no following form"}
       err -> err
     end
@@ -188,7 +250,7 @@ defmodule BeamLisp.Reader do
   # `(fn [params] body)` form the compiler already handles — Clojure does
   # this as a reader macro too. A nested `#()` inside the body is an error,
   # tracked via a process-dict depth flag.
-  defp fn_literal(rest) do
+  defp fn_literal(rest, pos0) do
     if Process.get(@fn_literal_depth_key, 0) > 0 do
       {:error, "nested #() fn literals are not allowed"}
     else
@@ -197,8 +259,10 @@ defmodule BeamLisp.Reader do
       try do
         # The `(...)` after `#` is a single list and becomes the fn's one
         # body form: `#(+ % 1)` → `(fn [p1__] (+ p1__ 1))`.
-        case collection(skip_ignored(rest), ?), &{:list, &1}) do
-          {:ok, {:list, items}, rest} -> {:ok, desugar_fn(items), rest}
+        {rest, pos} = skip_ignored(rest, pos0)
+
+        case collection(rest, pos, ?), &{:list, &1}) do
+          {:ok, {:list, items}, rest, pos} -> {:ok, with_pos(desugar_fn(items), pos0), rest, pos}
           err -> err
         end
       after
@@ -210,9 +274,13 @@ defmodule BeamLisp.Reader do
   # `#_ form` reads and drops the next form, then continues reading from
   # after it — so `#_` behaves like whitespace that happens to consume a
   # form: `(+ 1 #_2 3)` is `(+ 1 3)`. A trailing `#_` is an error.
-  defp discard_form(rest) do
-    case form(skip_ignored(rest)) do
-      {:ok, _discarded, rest} -> form(skip_ignored(rest))
+  defp discard_form(rest, pos) do
+    {rest, pos} = skip_ignored(rest, pos)
+
+    case form(rest, pos) do
+      {:ok, _discarded, rest, pos} ->
+        {rest, pos} = skip_ignored(rest, pos)
+        form(rest, pos)
       :none -> {:error, "#_ must be followed by a form"}
       err -> err
     end
@@ -232,6 +300,13 @@ defmodule BeamLisp.Reader do
   # the literal (Clojure's rule). Unlike Clojure, which only rewrites in
   # list position (a quirk that leaks raw `%` into vectors), this walk
   # covers vectors and maps too, so `#(vector [% %])` reads as intended.
+  # Each item may already carry a position wrapper; it is preserved
+  # through the rewrite so a rewritten `%` keeps pointing at its source.
+  defp rewrite_fn_arg({:meta, form, m}, acc) do
+    {rewritten, acc} = rewrite_fn_arg(form, acc)
+    {{:meta, rewritten, m}, acc}
+  end
+
   defp rewrite_fn_arg({:symbol, name}, {max_arg, has_rest}) do
     case fn_arg_index(name) do
       nil -> {{:symbol, name}, {max_arg, has_rest}}
@@ -281,31 +356,41 @@ defmodule BeamLisp.Reader do
     {:vector, positional ++ rest_elems}
   end
 
-  defp collection(rest, closer, wrap) do
-    case forms_until(skip_ignored(rest), closer, []) do
-      {:ok, items, rest} -> {:ok, wrap.(items), rest}
+  # Read a bracketed collection to its closer; returns the bare constructed
+  # form (`{:list, items}`, `{:vector, items}`, `{:set, items}`) — the
+  # caller attaches the opening-delimiter position. `pos` is the position
+  # of the first item's first character.
+  defp collection(rest, pos, closer, wrap) do
+    {rest, pos} = skip_ignored(rest, pos)
+
+    case forms_until(rest, pos, closer, []) do
+      {:ok, items, rest, pos} -> {:ok, wrap.(items), rest, pos}
       err -> err
     end
   end
 
-  defp forms_until(rest, closer, acc) do
+  defp forms_until(rest, pos, closer, acc) do
     case rest do
-      [^closer | rest] -> {:ok, Enum.reverse(acc), rest}
+      [^closer | rest] -> {:ok, Enum.reverse(acc), rest, advance_pos(pos, closer)}
       [] -> {:error, "unterminated collection, expected #{<<closer>>}"}
       rest ->
-        case form(rest) do
-          {:ok, f, rest} -> forms_until(skip_ignored(rest), closer, [f | acc])
+        case form(rest, pos) do
+          {:ok, f, rest, pos} ->
+            {rest, pos} = skip_ignored(rest, pos)
+            forms_until(rest, pos, closer, [f | acc])
           :none -> {:error, "unterminated collection, expected #{<<closer>>}"}
           err -> err
         end
     end
   end
 
-  defp map_form(rest) do
-    case forms_until(skip_ignored(rest), ?}, []) do
-      {:ok, items, rest} ->
+  defp map_form(rest, pos) do
+    {rest, pos} = skip_ignored(rest, pos)
+
+    case forms_until(rest, pos, ?}, []) do
+      {:ok, items, rest, pos} ->
         if rem(length(items), 2) == 0 do
-          {:ok, {:map, Enum.chunk_every(items, 2) |> Enum.map(&List.to_tuple/1)}, rest}
+          {:ok, {:map, Enum.chunk_every(items, 2) |> Enum.map(&List.to_tuple/1)}, rest, pos}
         else
           {:error, "map literal has an odd number of forms"}
         end
@@ -315,19 +400,19 @@ defmodule BeamLisp.Reader do
     end
   end
 
-  defp string(rest, acc) do
+  defp string(rest, pos, acc) do
     case rest do
       [] ->
         {:error, "unterminated string"}
 
       [?" | rest] ->
-        {:ok, List.to_string(Enum.reverse(acc)), rest}
+        {:ok, List.to_string(Enum.reverse(acc)), rest, advance_pos(pos, ?")}
 
       [?\\, c | rest] ->
-        string(rest, [unescape(c) | acc])
+        string(rest, advance_pos(pos, [?\\, c]), [unescape(c) | acc])
 
       [c | rest] ->
-        string(rest, [c | acc])
+        string(rest, advance_pos(pos, c), [c | acc])
     end
   end
 
@@ -336,19 +421,34 @@ defmodule BeamLisp.Reader do
   defp unescape(?r), do: ?\r
   defp unescape(c), do: c
 
-  defp atom_form(rest) do
+  defp atom_form(rest, pos) do
     {token, rest} = Enum.split_while(rest, fn c -> c not in @delimiters end)
 
     case token do
       [] -> {:error, "unexpected character #{inspect(hd(rest))}"}
-      token -> atom_form(List.to_string(token), rest)
+      token -> atom_form(List.to_string(token), rest, pos, advance_pos(pos, token))
     end
   end
 
-  defp atom_form(token, rest) do
+  # `pos` is the position of the token's first character; `pos_after` is
+  # the position of the following character (returned with the rest so the
+  # next form is positioned correctly).
+  #
+  # Atoms deliberately do NOT carry a position. A symbol appears as a
+  # *shape token* all over the compiler — a parameter, a binding name, a
+  # `def` name, a destructuring pattern — and there are ~50 sites that
+  # match `{:symbol, name}` structurally. Wrapping symbols would demand
+  # meta-tolerance at every one of them, which is a large diff whose only
+  # payoff is per-symbol columns nothing reports.
+  #
+  # The enclosing form already carries the line, and errors are reported
+  # against forms: `(+ x nil)` names line 5, not the `nil` within it. So
+  # positions ride on compound forms — lists, vectors, maps, sets — where
+  # the compiler already destructures through a handful of choke points.
+  defp atom_form(token, rest, _pos, pos_after) do
     form = classify(token)
     check_atom_safety!(form, token)
-    {:ok, form, rest}
+    {:ok, form, rest, pos_after}
   end
 
   defp classify("nil"), do: nil
@@ -454,9 +554,22 @@ defmodule BeamLisp.Reader do
 
   # --- trivia ---
 
-  defp skip_ignored([?; | rest]), do: skip_ignored(Enum.drop_while(rest, &(&1 != ?\n)))
-  defp skip_ignored([c | rest]) when c in [?\s, ?\t, ?\n, ?\r, ?,], do: skip_ignored(rest)
-  defp skip_ignored(rest), do: rest
+  # Consume whitespace, commas, and `;` line comments, advancing the
+  # position as characters are eaten so a form that follows them is
+  # attributed to the line it actually sits on.
+  defp skip_ignored(rest, pos) do
+    case rest do
+      [?; | rest] ->
+        {comment, rest} = Enum.split_while(rest, &(&1 != ?\n))
+        skip_ignored(rest, advance_pos(pos, comment))
+
+      [c | rest] when c in [?\s, ?\t, ?\n, ?\r, ?,] ->
+        skip_ignored(rest, advance_pos(pos, c))
+
+      _ ->
+        {rest, pos}
+    end
+  end
 
   defp blank?(rest), do: Enum.all?(rest, &(&1 in [?\s, ?\t, ?\n, ?\r]))
 end

@@ -42,7 +42,7 @@ defmodule BeamLisp.Loader do
 
           try do
             with_load_path(Path.dirname(path), fn ->
-              path |> File.read!() |> Compiler.eval_string(Compiler.new_env(ns))
+              path |> File.read!() |> Compiler.eval_string(Compiler.new_env(ns), path)
             end)
           after
             # A required file's (ns …) is scoped to that file; the

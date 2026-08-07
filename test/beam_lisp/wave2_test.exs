@@ -31,30 +31,30 @@ defmodule BeamLisp.Wave2Test do
     end
 
     test "recur outside tail position is a compile error" do
-      assert_raise RuntimeError, ~r/tail position/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/tail position/, fn ->
         eval("(loop [i 0] (+ 1 (recur (+ i 1))))")
       end
     end
 
     test "recur with no target is a compile error" do
-      assert_raise RuntimeError, ~r/no enclosing/, fn -> eval("(recur 1)") end
+      assert_raise BeamLisp.CompileError, ~r/no enclosing/, fn -> eval("(recur 1)") end
     end
 
     test "recur arity must match the loop" do
-      assert_raise RuntimeError, ~r/arity mismatch/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/arity mismatch/, fn ->
         eval("(loop [i 0] (recur 1 2))")
       end
     end
 
     test "recur inside an inner fn targets that fn, not the loop" do
       # The fn is the innermost target; its arity (0) mismatches.
-      assert_raise RuntimeError, ~r/arity mismatch/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/arity mismatch/, fn ->
         eval("(loop [i 0] ((fn [] (recur 1))))")
       end
     end
 
     test "recur at top level still has no target" do
-      assert_raise RuntimeError, ~r/no enclosing/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/no enclosing/, fn ->
         eval("(recur 1)")
       end
     end

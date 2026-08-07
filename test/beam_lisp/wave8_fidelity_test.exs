@@ -50,13 +50,13 @@ defmodule BeamLisp.Wave8FidelityTest do
     end
 
     test "defn with no clauses is a compile error" do
-      assert_raise RuntimeError, ~r/expected at least one parameter vector/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/expected at least one parameter vector/, fn ->
         eval("(defn w8-empty)")
       end
     end
 
     test "a lone string in defn (not followed by clauses) is an error" do
-      assert_raise RuntimeError, ~r/expected a parameter vector, got a string literal/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/expected a parameter vector, got a string literal/, fn ->
         eval(~s|(defn w8-lone "just a string")|)
       end
     end

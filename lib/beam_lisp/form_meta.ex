@@ -75,10 +75,16 @@ defmodule BeamLisp.FormMeta do
     if form_shape?(form), do: {:meta, form, m}, else: form
   end
 
-  # The datum shapes the compiler produces for forms. A bare atom is
-  # ambiguous (keyword datum vs `true`/`false`/`nil`), so keywords are
-  # not wrapped; form metadata on a bare keyword is a rare edge.
+  # The datum shapes the compiler produces for forms, plus the tuple shapes
+  # the reader emits before datum conversion (`{:list, items}` etc.) so
+  # source positions attach at read time. A bare atom is ambiguous (keyword
+  # datum vs `true`/`false`/`nil`), so keywords are not wrapped; form
+  # metadata on a bare keyword is a rare edge.
   defp form_shape?({:symbol, _}), do: true
+  defp form_shape?({:list, _}), do: true
+  defp form_shape?({:vector, _}), do: true
+  defp form_shape?({:map, _}), do: true
+  defp form_shape?({:set, _}), do: true
   defp form_shape?(form) when is_list(form), do: true
   defp form_shape?(%BeamLisp.Vector{}), do: true
   defp form_shape?(form) when is_map(form), do: true
