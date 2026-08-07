@@ -125,6 +125,17 @@ defmodule BeamLisp.Env do
 
   def put_ns_defs(ns, defs), do: :ets.insert(@table, {{:ns_defs, ns}, defs})
 
+  @doc """
+  Every namespace that has defined something.
+
+  Used to resolve a bare name when the current namespace is not the one
+  that defines it — `current_ns/0` is process-global and outlives any
+  single evaluation, so it is a hint rather than an answer.
+  """
+  def namespaces do
+    :ets.select(@table, [{{{:ns_defs, :"$1"}, :_}, [], [:"$1"]}])
+  end
+
   @doc "Register link metadata `{module, %{arity => fname}, {min, vfname} | nil}` for a fn var."
   def put_link(ns, name, info), do: :ets.insert(@table, {{:link, ns, name}, info})
 

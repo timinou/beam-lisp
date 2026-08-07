@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try loop* let* fn*)
+  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -369,6 +369,71 @@ defmodule BeamLisp.Compiler do
           env,
           doc
         )
+    end
+  end
+
+  # --- OTP servers ---
+  #
+  # `(defserver name (init [arg] body…) (handle-call PAT [from state] body…) …)`
+  # compiles to a genuine `:gen_server` behaviour module: real callbacks, real
+  # `{:reply, v, state}` returns, real supervision and `:observer` support —
+  # never a lookalike. Each callback clause is a beam-lisp fn body;
+  # `handle-call`/`handle-cast`/`handle-info` clauses carry a message pattern
+  # that dispatches across multiple `handle_*/N` defs, emitted adjacently
+  # (Elixir warns and the build breaks otherwise). The generated module is
+  # named `BeamLisp.Server.<ns>.<name>` (see `BeamLisp.Server.module_for/2`),
+  # and the client fns `start`/`start-link`/`call`/`cast`/`stop` make the
+  # server usable without raw interop.
+  defp compile_special("defserver", [name_form | clauses], env) do
+    name = name_of(name_form)
+
+    if clauses == [] do
+      compile_error(env, "defserver #{name}: expected at least an (init …) clause")
+    end
+
+    mod = BeamLisp.Server.module_for(env.ns, name)
+
+    def_line = if line = pos_line(env[:line]), do: [line: line], else: []
+    # Module.create/3 requires a location; there is no "unknown" value it
+    # accepts. A form read from a string (the REPL, eval_string with no
+    # path) has no file, so fall back to this module rather than passing
+    # nil and getting a FunctionClauseError at the create site.
+    location =
+      if env[:file],
+        do: [file: env[:file], line: pos_line(env[:line]) || 1],
+        else: [file: __ENV__.file, line: __ENV__.line]
+
+    {defs, init?} =
+      Enum.reduce(clauses, {[], false}, fn clause, {acc, init?} ->
+        {fname, arity, clause_defs} = parse_server_clause(clause, env, def_line)
+        tagged = Enum.map(clause_defs, &{fname, arity, &1})
+        {acc ++ tagged, init? or {fname, arity} == {:init, 1}}
+      end)
+
+    unless init? do
+      compile_error(env, "defserver #{name}: requires an (init …) clause")
+    end
+
+    module_body =
+      {:__block__, [],
+       [quote(do: @behaviour :gen_server)] ++ server_ordered_defs(group_server_defs(defs)) ++ server_client_defs()}
+
+    quote do
+      previous = Code.compiler_options()
+      Code.compiler_options(ignore_module_conflict: true)
+
+      try do
+        # The body is escaped so its `@behaviour`/`def` nodes are reconstructed
+        # at runtime as data and compiled by Module.create — never expanded in
+        # this eval module's own body (Elixir would reject `@` outside module
+        # scope if the nodes were inlined here).
+        Module.create(unquote(mod), unquote(Macro.escape(module_body)), unquote(location))
+      after
+        Code.compiler_options(previous)
+      end
+
+      BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(mod))
+      unquote(mod)
     end
   end
 
@@ -853,7 +918,14 @@ defmodule BeamLisp.Compiler do
     # default module line). The location rides to Link.defvar so its
     # Module.create claims the same file.
     def_line = if line = pos_line(env[:line]), do: [line: line], else: []
-    location = if env[:file], do: [file: env[:file], line: pos_line(env[:line]) || 1], else: nil
+    # Module.create/3 requires a location; there is no "unknown" value it
+    # accepts. A form read from a string (the REPL, eval_string with no
+    # path) has no file, so fall back to this module rather than passing
+    # nil and getting a FunctionClauseError at the create site.
+    location =
+      if env[:file],
+        do: [file: env[:file], line: pos_line(env[:line]) || 1],
+        else: [file: __ENV__.file, line: __ENV__.line]
 
     entries =
       Enum.map(clauses, fn {params, body} ->
@@ -894,6 +966,161 @@ defmodule BeamLisp.Compiler do
       defvar_ast
     end
   end
+
+  # One defserver clause into OTP callback defs. Pattern clauses may expand to
+  # several defs: a vector message pattern matches both a tuple and a
+  # `%Vector{}` struct, so both are emitted with an identical body.
+  defp parse_server_clause(clause, env, def_line) do
+    cb_name =
+      case unwrap_meta(clause) do
+        {:list, [head | _]} -> name_of(head)
+        other -> raise "defserver: expected a (callback …) clause, got #{inspect(other)}"
+      end
+
+    case BeamLisp.Server.callback(cb_name) do
+      nil ->
+        raise(
+          "defserver: unknown callback #{cb_name} " <>
+            "(expected init, handle-call, handle-cast, handle-info, handle-continue or terminate)"
+        )
+
+      {fname, arity, shape} ->
+        {fname, arity, server_clause_defs(unwrap_meta(clause), fname, shape, env, def_line)}
+    end
+  end
+
+  # A `:vector` callback (`init`, `terminate`, `handle-continue`) binds a plain
+  # param vector like a fn clause.
+  defp server_clause_defs({:list, [_head | rest]}, fname, :vector, env, def_line) do
+    [{:vector, params} | body] = rest
+    {head_vars, preludes, clause_env} = bind_params(env, params)
+    body_ast = compile_server_body(preludes ++ body, clause_env)
+    [{:def, def_line, [{fname, [], head_vars}, [do: body_ast]]}]
+  end
+
+  # A `:pattern` callback (`handle-call`, `handle-cast`, `handle-info`) carries
+  # a message pattern before the param vector; the pattern lands in the def
+  # head so OTP dispatches on it, and the remaining params bind like a fn.
+  defp server_clause_defs({:list, [_head | rest]}, fname, :pattern, env, def_line) do
+    [pat_form, params_form | body] = rest
+    {params, body} = server_params(params_form, body)
+    {pat_asts, msg_env} = compile_pattern(pat_form, env)
+    {head_vars, preludes, clause_env} = bind_params(msg_env, params)
+    body_ast = compile_server_body(preludes ++ body, clause_env)
+    Enum.map(pat_asts, &{:def, def_line, [{fname, [], [&1 | head_vars]}, [do: body_ast]]})
+  end
+
+  defp server_params({:vector, params}, body), do: {params, body}
+  defp server_params(other, _body), do: raise("defserver: expected a param vector, got #{inspect(other)}")
+
+  # Compile a callback body with the return constructors (ok/reply/noreply/
+  # stop/ignore/hibernate/continue) bound as locals, so they resolve anywhere
+  # in the body — nested in if/let/fn included — and lower to the exact OTP
+  # return tuple via `RT.invoke/2` on the arity-dispatching `$blfn` values.
+  defp compile_server_body(forms, env) do
+    ret_env =
+      Enum.reduce(BeamLisp.Server.return_constructors(), env, fn {cname, _ctor}, acc ->
+        put_local(acc, cname, server_return_local(cname))
+      end)
+
+    block_forms(forms, ret_env)
+  end
+
+  defp server_return_local(name) do
+    quote do
+      Map.fetch!(BeamLisp.Server.return_constructors(), unquote(name))
+    end
+  end
+
+  # Group callback defs by their OTP fn/arity, then emit every callback in a
+  # fixed order (BeamLisp.Server.callback_order/0) with its clauses adjacent
+  # and its user clauses first. A callback's default is added only when the
+  # user provided no clause, so a user catch-all is never shadowed by dead code.
+  defp group_server_defs(defs) do
+    Enum.reduce(defs, %{}, fn {fname, _arity, def_ast}, acc ->
+      Map.update(acc, fname, [def_ast], &(&1 ++ [def_ast]))
+    end)
+  end
+
+  defp server_ordered_defs(grouped) do
+    Enum.flat_map(BeamLisp.Server.callback_order(), fn cb ->
+      user = Map.get(grouped, cb, [])
+      user ++ if(user == [], do: server_defaults(cb), else: [])
+    end)
+  end
+
+  # Default clauses keep the generated module a well-formed gen_server even
+  # when the user omits a callback: unknown messages stop the server (so a
+  # supervisor can restart it), terminate/code_change behave as OTP expects.
+  defp server_defaults(:handle_call),
+    do: [default_def(:handle_call, [:msg, :_from, :state], stuple([:stop, stuple([:bad_call, {:var, :msg}]), {:var, :state}]))]
+
+  defp server_defaults(:handle_cast),
+    do: [default_def(:handle_cast, [:msg, :state], stuple([:stop, stuple([:bad_cast, {:var, :msg}]), {:var, :state}]))]
+
+  defp server_defaults(:handle_info),
+    do: [default_def(:handle_info, [:msg, :state], stuple([:noreply, {:var, :state}]))]
+
+  defp server_defaults(:terminate), do: [default_def(:terminate, [:_reason, :_state], :ok)]
+  defp server_defaults(:code_change), do: [default_def(:code_change, [:_old_vsn, :state, :_extra], stuple([:ok, {:var, :state}]))]
+  defp server_defaults(_), do: []
+
+  # A `def` whose head/body vars carry nil context, so the node is safe to
+  # splice into a generated module (the vars stay locals there).
+  defp default_def(fname, arg_names, body_ast) do
+    vars = for n <- arg_names, do: {n, [], nil}
+    {:def, [], [{fname, [], vars}, [do: body_ast]]}
+  end
+
+  # A tiny AST builder for default bodies: `stuple([:reply, {:var, :r}, {:var, :s}])`
+  # makes the tuple `{:reply, r, s}` where `{:var, n}` is a nil-context var and
+  # a bare atom is a literal tag.
+  defp stuple(elems) do
+    {:{}, [], Enum.map(elems, fn
+      {:var, n} -> {n, [], nil}
+      {:{}, [], _} = t -> t
+      atom when is_atom(atom) -> atom
+    end)}
+  end
+
+  # Client fns so a server is usable without raw interop: `start`/`start-link`
+  # (with OTP options incl. `:name` registration), `call` (with timeout),
+  # `cast`, and `stop`. All reference `__MODULE__` so they work on whatever
+  # generated module they are spliced into.
+  defp server_client_defs do
+    gs = quote(do: GenServer)
+    m = quote(do: __MODULE__)
+
+    [
+      client_def(:start, [:init_arg, :opts], %{opts: []}, {{:., [], [gs, :start]}, [], [m, svar(:init_arg), svar(:opts)]}),
+      client_def(:start_link, [:init_arg, :opts], %{opts: []},
+        {{:., [], [gs, :start_link]}, [], [m, svar(:init_arg), svar(:opts)]}
+      ),
+      client_def(:call, [:server, :request, :timeout], %{timeout: 5000},
+        {{:., [], [gs, :call]}, [], [svar(:server), svar(:request), svar(:timeout)]}
+      ),
+      client_def(:cast, [:server, :request], %{},
+        {{:., [], [gs, :cast]}, [], [svar(:server), svar(:request)]}
+      ),
+      client_def(:stop, [:server, :reason, :timeout], %{reason: :normal, timeout: :infinity},
+        {{:., [], [gs, :stop]}, [], [svar(:server), svar(:reason), svar(:timeout)]}
+      )
+    ]
+  end
+
+  defp client_def(fname, arg_names, defaults, body_ast) do
+    args =
+      Enum.map(arg_names, fn n ->
+        case Map.get(defaults, n) do
+          nil -> svar(n)
+          d -> {:\\, [], [svar(n), d]}
+        end
+      end)
+
+    {:def, [], [{fname, [], args}, [do: body_ast]]}
+  end
+
+  defp svar(n), do: {n, [], nil}
 
   # [other.ns :as o] / [other.ns :refer [x y]] / other.ns — and both
   # flags at once, as Clojure allows.

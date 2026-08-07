@@ -860,6 +860,16 @@ defmodule BeamLisp.RT do
      prefix <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"}
   end
 
+  # `trace`/`untrace` resolve a quoted symbol against the namespace the
+  # call runs in; the registered prim arities match the beam-lisp surface
+  # and thread `Env.current_ns/0` in here.
+  defp trace_2(sym, handler), do: BeamLisp.Trace.trace(Env.current_ns(), sym, handler)
+
+  defp trace_3(sym, handler, opts),
+    do: BeamLisp.Trace.trace(Env.current_ns(), sym, handler, opts)
+
+  defp untrace_1(sym), do: BeamLisp.Trace.untrace(Env.current_ns(), sym)
+
   @doc "Seed `core` with the primitives the prelude and interop need."
   def seed_core do
     # Clojure arithmetic is variadic: (+ 1 2 3), (*) → 1, (- 5) → -5.
@@ -992,6 +1002,49 @@ defmodule BeamLisp.RT do
     }
 
     prims = Map.merge(prims, transient_prims)
+
+    # Wave 22: the BEAM-native band. `supervise`/`worker` lower a
+    # supervision tree to a real Elixir Supervisor (see BeamLisp.Supervisor);
+    # `trace`/`untrace` expose `:dbg` as data with hard safety rails (see
+    # BeamLisp.Trace). The trace wrappers thread the current namespace in,
+    # since a quoted symbol resolves against the defining ns.
+    otp_prims = %{
+      "supervise" =>
+        multi_fn(%{
+          2 => &BeamLisp.Supervisor.supervise/2,
+          3 => &BeamLisp.Supervisor.supervise/3
+        }),
+      "worker" =>
+        multi_fn(%{
+          2 => &BeamLisp.Supervisor.worker/2,
+          3 => &BeamLisp.Supervisor.worker/3
+        }),
+      "trace" => multi_fn(%{2 => &trace_2/2, 3 => &trace_3/3}),
+      "untrace" => &untrace_1/1,
+      # The client side of `defserver`. Without these a server is only
+      # reachable through raw `:gen_server` interop, which defeats the
+      # point of the form. Names are prefixed `server-` because `call`
+      # and `cast` are far too generic to claim in the core namespace.
+      "server-start-link" =>
+        multi_fn(%{
+          1 => &BeamLisp.Server.start_link/1,
+          2 => &BeamLisp.Server.start_link/2,
+          3 => &BeamLisp.Server.start_link/3
+        }),
+      "server-start" =>
+        multi_fn(%{
+          1 => &BeamLisp.Server.start/1,
+          2 => &BeamLisp.Server.start/2,
+          3 => &BeamLisp.Server.start/3
+        }),
+      "server-call" =>
+        multi_fn(%{2 => &BeamLisp.Server.call/2, 3 => &BeamLisp.Server.call/3}),
+      "server-cast" => &BeamLisp.Server.cast/2,
+      "server-stop" =>
+        multi_fn(%{1 => &BeamLisp.Server.stop/1, 2 => &BeamLisp.Server.stop/2})
+    }
+
+    prims = Map.merge(prims, otp_prims)
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
 
     # cpp/* interop: jank calls its C++ primitives under the `cpp`
