@@ -52,6 +52,9 @@ defmodule BeamLisp.RT do
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
+  @doc "Clojure `not`: truthiness-based — true exactly for `nil` and `false`."
+  def not_(x), do: x == false or x == nil
+
   def first(nil), do: nil
   def first([]), do: nil
   def first([h | _]), do: h
@@ -76,10 +79,53 @@ defmodule BeamLisp.RT do
     end
   end
 
+  @doc """
+  Clojure `next` ≡ `(seq (rest coll))`: nil when the remainder is empty,
+  where `rest` returns an empty seq. Every recursive seq function in
+  core.jank tests `(if (next xs) …)`, so the nil-vs-empty split is the
+  contract. Over a LazySeq it forces exactly one cell and returns the tail
+  without realizing the next one.
+  """
+  def next(nil), do: nil
+  def next([]), do: nil
+  def next(%BeamLisp.Vector{} = v), do: next_tail(BeamLisp.Vector.rest(v))
+  def next([_ | t]), do: next_tail(t)
+
+  def next(%LazySeq{} = l) do
+    case LazySeq.cell(l) do
+      nil -> nil
+      [_ | t] -> next_tail(t)
+    end
+  end
+
+  # `next`'s tail is either a realized list (seq it → nil if empty) or a
+  # LazySeq (return it untouched — forcing it would realize a second cell).
+  defp next_tail(%LazySeq{} = t), do: t
+  defp next_tail(t), do: seq(t)
+
   def cons(x, nil), do: [x]
   def cons(x, xs) when is_list(xs), do: [x | xs]
   def cons(x, %BeamLisp.Vector{} = v), do: [x | BeamLisp.Vector.to_list(v)]
   def cons(x, %LazySeq{} = l), do: [x | l]
+
+  @doc """
+  Clojure `list*`: prepend the leading args onto the final collection, which
+  is treated as a sequence (`(list* a b coll)` ≡ `(cons a (cons b (seq coll)))`).
+  `(list* coll)` is just `(seq coll)`; `(list*)` is nil.
+  """
+  def list_star(arg1, rest_list) when is_list(rest_list) do
+    case rest_list do
+      [] ->
+        seq(arg1)
+
+      _ ->
+        [last | leading_rev] = [arg1 | rest_list] |> Enum.reverse()
+        leading = Enum.reverse(leading_rev)
+        leading ++ seq_to_args(last)
+    end
+  end
+
+  def list_star_0, do: nil
 
   @doc "Clojure `conj`: prepend to a list, append to a vector."
   def conj(nil, x), do: [x]
@@ -137,9 +183,30 @@ defmodule BeamLisp.RT do
   defp empty_contract([]), do: %BeamLisp.Vector{items: {}}
   defp empty_contract(result), do: result
 
-  @doc "`(apply f args)` — accepts lists and vectors, and dispatches tagged fns like any other call."
-  def apply_to(f, args) when is_list(args), do: invoke(f, args)
-  def apply_to(f, %BeamLisp.Vector{} = v), do: invoke(f, BeamLisp.Vector.to_list(v))
+  @doc """
+  `(apply f args)` — accepts lists, vectors and lazy seqs, and dispatches
+  tagged fns like any other call.
+  """
+  def apply_to(f, args), do: invoke(f, seq_to_args(args))
+
+  @doc """
+  Variadic `apply`: `(apply f a b args)` prepends the leading args onto the
+  final seq argument. Invoked by the multi-arity tag with min=2 fixed args
+  plus one rest list, so `arg1` is the first fixed arg and `rest_list` holds
+  everything after it — the last element of `[arg1 | rest_list]` is the seq.
+  """
+  def apply_variadic(f, arg1, rest_list) when is_list(rest_list) do
+    [seq_arg | leading_rev] = [arg1 | rest_list] |> Enum.reverse()
+    leading = Enum.reverse(leading_rev)
+    invoke(f, leading ++ seq_to_args(seq_arg))
+  end
+
+  # Normalize the final seq argument of `apply`/`list*` to a plain list:
+  # nil and empty are `[]`, vectors and lazy seqs are realized.
+  defp seq_to_args(nil), do: []
+  defp seq_to_args(%LazySeq{} = l), do: LazySeq.to_list(l)
+  defp seq_to_args(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.to_list(v)
+  defp seq_to_args(xs) when is_list(xs), do: xs
 
   @doc "Clojure `seq`: nil for empty, the collection (or the lazy seq) otherwise."
   def seq(nil), do: nil
@@ -156,6 +223,72 @@ defmodule BeamLisp.RT do
       _ -> l
     end
   end
+
+  # --- type & collection predicates (Clojure-correct) ---
+
+  @doc "`fn?`: a function value — a compiled fn, a tagged multi-arity fn, or a remote reference."
+  def fn?(x) when is_function(x), do: true
+  def fn?({:"$blfn", _, _}), do: true
+  def fn?({:"$remote", _, _}), do: true
+  def fn?(_), do: false
+
+  @doc "`seq?`: a sequence — a proper list or a lazy seq, never a vector."
+  def seq?(%LazySeq{}), do: true
+  def seq?(xs) when is_list(xs), do: xs != []
+  def seq?(_), do: false
+
+  @doc "`boolean`: coercive truthiness — `true` for anything but `nil`/`false`."
+  def boolean(x), do: x != nil and x != false
+
+  @doc "`find`: the map entry for `k` in map `m` as a `[key value]` vector, else nil."
+  def find(m, k) when is_map(m) do
+    case Map.fetch(m, k) do
+      {:ok, v} -> %BeamLisp.Vector{items: {k, v}}
+      :error -> nil
+    end
+  end
+
+  def find(_m, _k), do: nil
+
+  @doc """
+  `contains?`: KEY membership for maps, index-in-range for vectors — never
+  value membership (the classic Clojure trap).
+  """
+  def contains?(%BeamLisp.Vector{} = v, i) when is_integer(i),
+    do: i >= 0 and i < BeamLisp.Vector.count(v)
+
+  def contains?(m, k) when is_map(m), do: Map.has_key?(m, k)
+  def contains?(_coll, _k), do: false
+
+  # Keywords are BEAM atoms — but so are the booleans and nil, so a bare
+  # `is_atom` would misclassify `true`/`false`/`nil` as keywords.
+  def keyword?(x) when is_atom(x), do: x not in [true, false, nil]
+  def keyword?(_), do: false
+
+  def symbol?({:symbol, _}), do: true
+  def symbol?(_), do: false
+
+  def string?(x), do: is_binary(x)
+  def number?(x), do: is_number(x)
+  def int?(x), do: is_integer(x)
+  def map?(x), do: is_map(x) and not is_struct(x)
+  def vector?(%BeamLisp.Vector{}), do: true
+  def vector?(_), do: false
+
+  @doc "`list?`: a proper list (incl. the empty list) — never a vector, map, or nil."
+  def list?(x) when is_list(x), do: true
+  def list?(_), do: false
+
+  def coll?(x) when is_list(x), do: true
+  def coll?(%BeamLisp.Vector{}), do: true
+  def coll?(m) when is_map(m), do: true
+  def coll?(%LazySeq{}), do: true
+  def coll?(_), do: false
+
+  @doc "`ident?`: a keyword or a symbol."
+  def ident?(x) when is_atom(x), do: x not in [true, false, nil]
+  def ident?({:symbol, _}), do: true
+  def ident?(_), do: false
 
   @doc """
   Clojure `=`: for lazy operands, realize-and-compare element-wise with
@@ -481,7 +614,7 @@ defmodule BeamLisp.RT do
       "<=" => chain.(&Kernel.<=/2),
       ">=" => chain.(&Kernel.>=/2),
       "=" => eqv_chain(),
-      "not" => &Kernel.not/1,
+      "not" => &not_/1,
       "str" => str(),
       "first" => &first/1,
       "rest" => &rest/1,
@@ -493,7 +626,9 @@ defmodule BeamLisp.RT do
       "empty?" => &empty?/1,
       "get" => multi_fn(%{2 => &get/2, 3 => &get/3}),
       "assoc" => multi_fn(%{3 => &assoc/3}, {3, &assoc_variadic/4}),
-      "apply" => &apply_to/2,
+      "apply" => multi_fn(%{2 => &apply_to/2}, {2, &apply_variadic/3}),
+      "next" => &next/1,
+      "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
       "println" => &println/1,
       "pr-str" => &print_str/1,
       "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1}),
@@ -516,7 +651,23 @@ defmodule BeamLisp.RT do
       "odd?" => &odd?/1,
       "zero?" => &zero?/1,
       "pos?" => &pos?/1,
-      "neg?" => &neg?/1
+      "neg?" => &neg?/1,
+      # type & collection predicates (wave 14)
+      "fn?" => &fn?/1,
+      "seq?" => &seq?/1,
+      "boolean" => &boolean/1,
+      "find" => &find/2,
+      "contains?" => &contains?/2,
+      "keyword?" => &keyword?/1,
+      "symbol?" => &symbol?/1,
+      "string?" => &string?/1,
+      "number?" => &number?/1,
+      "int?" => &int?/1,
+      "map?" => &map?/1,
+      "vector?" => &vector?/1,
+      "list?" => &list?/1,
+      "coll?" => &coll?/1,
+      "ident?" => &ident?/1
     })
 
     # Reference types: atoms, futures, promises. All plain Refs
@@ -569,7 +720,7 @@ defmodule BeamLisp.RT do
       "count" => 1,
       "nth" => 2,
       "empty?" => 1,
-      "apply" => :apply_to,
+      "next" => 1,
       "println" => 1,
       "pr-str" => :print_str,
       "reader-macro!" => :reader_macro!,
@@ -587,7 +738,22 @@ defmodule BeamLisp.RT do
       "odd?" => 1,
       "zero?" => 1,
       "pos?" => 1,
-      "neg?" => 1
+      "neg?" => 1,
+      "fn?" => 1,
+      "seq?" => 1,
+      "boolean" => 1,
+      "find" => 2,
+      "contains?" => 2,
+      "keyword?" => 1,
+      "symbol?" => 1,
+      "string?" => 1,
+      "number?" => 1,
+      "int?" => 1,
+      "map?" => 1,
+      "vector?" => 1,
+      "list?" => 1,
+      "coll?" => 1,
+      "ident?" => 1
     }
 
     for {name, spec} <- rt_fns do
@@ -608,6 +774,12 @@ defmodule BeamLisp.RT do
     # path. `drop` is Clojure-ordered (`(drop n coll)`) via `drop_clj`.
     Env.put_link("core", "get", {BeamLisp.RT, %{2 => :get, 3 => :get}, nil})
     Env.put_link("core", "drop", {BeamLisp.RT, %{2 => :drop_clj}, nil})
+
+    # `apply` and `list*` are multi-arity prims: the 2-arity `apply` links
+    # directly, higher arities split into fixed leading args + one rest list
+    # for the variadic handler. `list*` keeps its 0-arity (`(list*)` → nil).
+    Env.put_link("core", "apply", {BeamLisp.RT, %{2 => :apply_to}, {2, :apply_variadic}})
+    Env.put_link("core", "list*", {BeamLisp.RT, %{0 => :list_star_0}, {1, :list_star}})
 
     # Multi-arity lazy constructors.
     Env.put_link("core", "range", {BeamLisp.RT, %{0 => :range, 1 => :range, 2 => :range}, nil})
