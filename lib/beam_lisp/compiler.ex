@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
+  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol defrecord deftype let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -130,6 +130,17 @@ defmodule BeamLisp.Compiler do
     {:%{}, [], Enum.map(kvs, fn {k, v} -> {compile(k, notail(env)), compile(v, notail(env))} end)}
   end
 
+  # A `#Name{...}` (or `#ns/Name{...}`) record literal: the reader emits
+  # `{:record, name, kvs}`. Resolve the name to its struct module at
+  # runtime and build the record from the given (known) fields.
+  defp do_compile({:record, name, kvs}, env) do
+    map_ast = compile({:map, kvs}, notail(env))
+
+    quote do
+      BeamLisp.Record.literal(unquote(env.ns), unquote(name), unquote(map_ast))
+    end
+  end
+
   defp do_compile({:set, items}, env) do
     members = Enum.map(items, &compile(&1, notail(env)))
 
@@ -178,6 +189,17 @@ defmodule BeamLisp.Compiler do
       BeamLisp.RT.invoke(unquote(String.to_atom(kw)), unquote(arg_asts))
     end
   end
+
+  # Deftype field access: `(.-x obj)` and `(.x obj)` both read field `x`.
+  # Records deliberately have no field-access surface — keyword lookup is
+  # their access path — so this reaches only deftype instances.
+  defp do_compile({:list, [{:symbol, ".-" <> field} | args]}, env)
+       when field != "" and length(args) == 1,
+       do: compile_deftype_field(field, args, env)
+
+  defp do_compile({:list, [{:symbol, "." <> field} | args]}, env)
+       when field != "" and length(args) == 1,
+       do: compile_deftype_field(field, args, env)
 
   defp do_compile({:list, [{:symbol, name} | args]}, env) do
     cond do
@@ -510,7 +532,7 @@ defmodule BeamLisp.Compiler do
   defp compile_special("extend-type", [type_form, protocol_form | method_forms], env) do
     protocol = name_of(protocol_form)
     {pns, pname} = multi_var_target(env, protocol)
-    tag = type_tag(type_form)
+    tag = type_tag(type_form, env)
     impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
 
     quote do
@@ -535,7 +557,7 @@ defmodule BeamLisp.Compiler do
     calls =
       for {type_form, method_forms} <- groups ++ [{cur_type, cur_methods}],
           type_form != nil do
-        tag = type_tag(type_form)
+        tag = type_tag(type_form, env)
         impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
 
         quote do
@@ -545,6 +567,43 @@ defmodule BeamLisp.Compiler do
 
     block(calls)
   end
+
+  # `(defrecord Name [fields…] (Proto (m [this]…) …) …)` defines a
+  # struct-backed type (see BeamLisp.Record) plus the `->Name`/`map->Name`
+  # constructors, and interns `Name` as the struct module. Inline protocol
+  # implementations reuse the same compile path as `extend-type`
+  # (`protocol_impl`/`multi_var_target`), so a record implements a protocol
+  # through the one dispatch machinery, not a parallel one. The struct
+  # module is created at runtime, so everything below refers to `mod` (the
+  # runtime value) rather than baking a module name.
+  # One clause for the bare form and one for the form with inline
+  # protocol blocks (`proto_forms` non-empty); the exact-arity clause
+  # must precede the variadic one or it is shadowed.
+  defp compile_special("defrecord", [name_form, fields_form], env) do
+    record_define_ast(env, name_of(name_form), record_fields(fields_form), :record, [])
+  end
+
+  defp compile_special("defrecord", [name_form, fields_form | proto_forms], env) do
+    record_define_ast(env, name_of(name_form), record_fields(fields_form), :record, proto_forms)
+  end
+
+  defp compile_special("defrecord", args, env),
+    do: compile_error(env, "defrecord: expected (defrecord Name [fields…] & protocols), got #{inspect(args)}")
+
+  # `(deftype Name [fields…] …)` is the leaner sibling: no map semantics,
+  # no `map->Name`, just the `->Name` constructor and named-field access
+  # (`.-x`/`.x`). Instances are tagged tuples, so they can never be
+  # mistaken for a map. Inline protocol impls work exactly as for records.
+  defp compile_special("deftype", [name_form, fields_form], env) do
+    record_define_ast(env, name_of(name_form), record_fields(fields_form), :deftype, [])
+  end
+
+  defp compile_special("deftype", [name_form, fields_form | proto_forms], env) do
+    record_define_ast(env, name_of(name_form), record_fields(fields_form), :deftype, proto_forms)
+  end
+
+  defp compile_special("deftype", args, env),
+    do: compile_error(env, "deftype: expected (deftype Name [fields…] & protocols), got #{inspect(args)}")
 
   # Thread a per-syntax-quote-form gensym map through synq so a `x#`
   # symbol is renamed once and reuses that name everywhere inside one
@@ -1808,6 +1867,9 @@ defmodule BeamLisp.Compiler do
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:set, items}), do: BeamLisp.Set.new(Enum.map(items, &datum/1))
   defp datum({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {datum(k), datum(v)} end)
+  # A record literal inside `quote` becomes a tagged `{:record, name, map}`
+  # datum: the type name plus its field map as data, never evaluated.
+  defp datum({:record, name, kvs}), do: {:record, name, datum({:map, kvs})}
   defp datum(lit), do: lit
 
   # One protocol method implementation: `(m [args] body…)` compiles to
@@ -1824,17 +1886,122 @@ defmodule BeamLisp.Compiler do
     end
   end
 
+  # Deftype field access lowers to a lookup against the tagged tuple.
+  defp compile_deftype_field(field, [obj], env) do
+    [obj_ast] = compile_args([obj], env)
+
+    quote do
+      BeamLisp.Record.deftype_field(unquote(obj_ast), unquote(String.to_atom(field)))
+    end
+  end
+
+  # Shared expansion for defrecord/deftype. `kind` picks the record
+  # (struct) or deftype (tuple) representation and whether `map->Name` is
+  # defined. `proto_forms` are the inline `(Proto (method …) …)` blocks.
+  defp record_define_ast(env, name, fields, kind, proto_forms) do
+    mod = Macro.var(:mod, __MODULE__)
+    define_fn = if kind == :record, do: :define, else: :define_type
+    map_ctor = if kind == :record, do: map_ctor_intern(env, name, mod), else: nil
+    extend_asts = record_protocol_extends(proto_forms, mod, env)
+
+    quote do
+      unquote(mod) =
+        BeamLisp.Record.unquote(define_fn)(unquote(env.ns), unquote(name), unquote(fields))
+
+      # The type name itself is a var whose value is the module — that is
+      # what `(extend-type Point …)`, `type_of`, and record literals resolve.
+      BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(mod))
+
+      BeamLisp.Env.intern(
+        unquote(env.ns),
+        unquote("->" <> name),
+        BeamLisp.Record.positional_ctor(unquote(mod))
+      )
+
+      unquote(map_ctor)
+      unquote(block(extend_asts))
+      unquote(mod)
+    end
+  end
+
+  defp map_ctor_intern(env, name, mod) do
+    quote do
+      BeamLisp.Env.intern(
+        unquote(env.ns),
+        unquote("map->" <> name),
+        BeamLisp.Record.map_ctor(unquote(mod))
+      )
+    end
+  end
+
+  # A record's inline protocol blocks: the flat form `(defrecord Name
+  # [f…] Proto (m [args]…) … Proto2 (m2…) …)` alternates a protocol name
+  # (a bare symbol) with its method impls (lists). Group them exactly as
+  # `extend-protocol` does, then emit a `Multi.extend_type` call per
+  # protocol keyed on the runtime `mod`. Method bodies go through
+  # `protocol_impl/2` — the same fn `extend-type`/`extend-protocol` use —
+  # so inline impls and separate `extend-type` impls are interchangeable.
+  defp record_protocol_extends(proto_forms, mod, env) do
+    {groups, cur_proto, cur_methods} =
+      Enum.reduce(proto_forms, {[], nil, []}, fn pf, {groups, proto, methods} ->
+        case unwrap_meta(pf) do
+          {:list, _} = bare -> {groups, proto, methods ++ [bare]}
+          proto_form -> {groups ++ [{proto, methods}], proto_form, []}
+        end
+      end)
+
+    for {proto, method_forms} <- groups ++ [{cur_proto, cur_methods}], proto != nil do
+      {pns, pname} = multi_var_target(env, name_of(proto))
+      impls = {:%{}, [], Enum.map(method_forms, &protocol_impl(&1, env))}
+
+      quote do
+        BeamLisp.Multi.extend_type(unquote(pns), unquote(pname), unquote(mod), unquote(impls))
+      end
+    end
+  end
+
+  # The declared field names of a record/deftype, from the `[x y …]`
+  # vector. Fields are symbols (metadata permitted, as in destructuring).
+  defp record_fields(form) do
+    case unwrap_meta(form) do
+      {:vector, items} -> Enum.map(items, &record_field_name/1)
+      other -> raise "defrecord/deftype: expected a field vector, got #{inspect(other)}"
+    end
+  end
+
+  defp record_field_name(form), do: name_of(form)
+
   # Resolve a type argument to the tag `Multi.type_of/1` would produce
   # for values of that type: keywords are the builtin tags themselves,
   # an uppercase symbol names an Elixir struct module, a lowercase
-  # symbol is a bare tag name.
-  defp type_tag({:keyword, name}), do: String.to_atom(name)
+  # symbol is a bare tag name. A record/deftype symbol resolves against
+  # the current namespace first: `Point` refers to the struct module the
+  # `defrecord`/`deftype` interned, so `(extend-type Point …)` keys the
+  # same tag `type_of/1` yields for a record instance.
+  defp type_tag(form, env) do
+    case unwrap_meta(form) do
+      {:keyword, name} ->
+        String.to_atom(name)
 
-  defp type_tag({:symbol, name}) do
-    if uppercase?(name), do: Module.concat([name]), else: String.to_atom(name)
+      {:symbol, name} ->
+        case Env.fetch(env.ns, name) do
+          {:ok, mod} when is_atom(mod) ->
+            if BeamLisp.Record.record_module?(mod) or BeamLisp.Record.deftype_module?(mod),
+              do: mod,
+              else: plain_type_tag(name)
+
+          _ ->
+            plain_type_tag(name)
+        end
+
+      other ->
+        raise "expected a type tag (keyword) or struct module, got #{inspect(other)}"
+    end
   end
 
-  defp type_tag(other), do: raise("expected a type tag (keyword) or struct module, got #{inspect(other)}")
+  defp plain_type_tag(name) do
+    if uppercase?(name), do: Module.concat([name]), else: String.to_atom(name)
+  end
 
   # Resolve a var name (possibly `alias/name` or `ns/name`) to a
   # `{ns, name}` pair for defmethod / protocol targets.

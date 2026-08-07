@@ -158,6 +158,8 @@ defmodule BeamLisp.Reader do
   defp unwrap_deep({:list, items}), do: {:list, Enum.map(items, &unwrap_deep/1)}
   defp unwrap_deep({:vector, items}), do: {:vector, Enum.map(items, &unwrap_deep/1)}
   defp unwrap_deep({:map, kvs}), do: {:map, Enum.map(kvs, fn {k, v} -> {unwrap_deep(k), unwrap_deep(v)} end)}
+  defp unwrap_deep({:record, name, kvs}),
+    do: {:record, name, Enum.map(kvs, fn {k, v} -> {unwrap_deep(k), unwrap_deep(v)} end)}
   defp unwrap_deep({:set, items}), do: {:set, Enum.map(items, &unwrap_deep/1)}
   defp unwrap_deep(other), do: other
 
@@ -209,6 +211,12 @@ defmodule BeamLisp.Reader do
         collection(rest, advance_pos(pos, [?#, ?{]), ?}, &{:set, &1})
 
       [?#, ?_ | rest] -> discard_form(rest, pos)
+      # `#Name{...}` / `#ns/Name{...}` — a record literal. Matched after
+      # the `#`-dispatch forms it must not steal (`#()`, `#{}`, `#_`); a
+      # `#` followed by anything else falls to record_or_tag, which reads
+      # a record literal when a `{` follows the name and otherwise treats
+      # the whole token as a bare atom (the trailing-`#` auto-gensym path).
+      [?# | rest] -> record_or_tag(rest, pos)
       [?" | rest] -> string(rest, advance_pos(pos, ?"), [])
       rest -> atom_form(rest, pos)
     end
@@ -283,6 +291,33 @@ defmodule BeamLisp.Reader do
         form(rest, pos)
       :none -> {:error, "#_ must be followed by a form"}
       err -> err
+    end
+  end
+
+  # `#Name{...}` / `#ns/Name{...}` — a record literal. Read the type name
+  # after the `#`; if a `{` follows it, read a map and lower to
+  # `{:record, name, kvs}`. A `#` NOT followed by a record brace is just a
+  # bare atom (`#foo` — the trailing-`#` auto-gensym marker is read as one
+  # token), so any non-record read falls back to the whole-token atom path.
+  defp record_or_tag(rest, pos0) do
+    case atom_form(rest, pos0) do
+      {:ok, {:symbol, name}, after_sym, _pos} ->
+        case after_sym do
+          [?{ | map_rest] ->
+            case map_form(map_rest, pos0) do
+              {:ok, {:map, kvs}, rest, pos} ->
+                {:ok, with_pos({:record, name, kvs}, pos0), rest, pos}
+
+              err ->
+                err
+            end
+
+          _ ->
+            atom_form([?# | rest], pos0)
+        end
+
+      _ ->
+        atom_form([?# | rest], pos0)
     end
   end
 

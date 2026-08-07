@@ -79,6 +79,17 @@ defmodule BeamLisp.RT do
   def get(%Set{} = s, x, default),
     do: if(Set.member?(s, x), do: x, else: default)
 
+  # A record is a struct (and so a map), but its `__struct__` key is
+  # internal — field access goes through the public fields only, so
+  # `(:__struct__ p)` is nil, not the module.
+  def get(%{__struct__: mod} = m, key, default) when is_atom(mod) do
+    if BeamLisp.Record.record?(m) do
+      if key == :__struct__, do: default, else: Map.get(m, key, default)
+    else
+      Map.get(m, key, default)
+    end
+  end
+
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
@@ -106,6 +117,13 @@ defmodule BeamLisp.RT do
   # would iterate the struct's fields instead.
   def first(%Set{} = s), do: Set.to_list(s) |> List.first()
 
+  # A record is a struct-map: iterate its public fields (and any assoc'd
+  # extras), never the hidden `__struct__` key. These clauses MUST precede
+  # the is_map clauses or a record leaks `__struct__` into iteration.
+  def first(%{__struct__: mod} = m) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: first(record_entries(m)), else: first(map_entries(m))
+  end
+
   def first(m) when is_map(m), do: first(map_entries(m))
 
   def rest(nil), do: []
@@ -121,6 +139,10 @@ defmodule BeamLisp.RT do
   end
 
   def rest(%Set{} = s), do: Set.to_list(s) |> tl()
+
+  def rest(%{__struct__: mod} = m) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: rest(record_entries(m)), else: rest(map_entries(m))
+  end
 
   def rest(m) when is_map(m), do: rest(map_entries(m))
 
@@ -144,6 +166,10 @@ defmodule BeamLisp.RT do
   end
 
   def next(%Set{} = s), do: next(Set.to_list(s))
+
+  def next(%{__struct__: mod} = m) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: next(record_entries(m)), else: next(map_entries(m))
+  end
 
   def next(m) when is_map(m), do: next(map_entries(m))
 
@@ -194,9 +220,17 @@ defmodule BeamLisp.RT do
   def conj(%Set{} = s, x), do: Set.add(s, x)
 
   # Map conj with a `[k v]` entry (as `find` returns) adds that entry —
-  # what select-keys does: `(conj acc (find m k))`.
+  # what select-keys does: `(conj acc (find m k))`. A record conj's the
+  # entry too, preserving its type (Map.put keeps the struct); a non-record
+  # struct reaching here has no conj contract and fails loudly.
   def conj(m, %BeamLisp.Vector{items: {k, v}}) when is_map(m) and not is_struct(m),
     do: Map.put(m, k, v)
+
+  def conj(%{__struct__: mod} = m, %BeamLisp.Vector{items: {k, v}}) when is_atom(mod) do
+    if BeamLisp.Record.record?(m),
+      do: Map.put(m, k, v),
+      else: raise(ArgumentError, "conj with a map entry is not supported on a struct")
+  end
 
   def count(nil), do: 0
   def count(xs) when is_list(xs), do: length(xs)
@@ -206,6 +240,11 @@ defmodule BeamLisp.RT do
   def count(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.count(v)
   def count(%LazySeq{} = l), do: LazySeq.count(l)
   def count(%Set{} = s), do: Set.count(s)
+  # A record's count is its public fields (plus any assoc'd extras) —
+  # map_size would count the hidden `__struct__` key too.
+  def count(%{__struct__: mod} = m) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: map_size(m) - 1, else: map_size(m)
+  end
   def count(m) when is_map(m), do: map_size(m)
   def count(s) when is_binary(s), do: String.length(s)
 
@@ -303,7 +342,12 @@ defmodule BeamLisp.RT do
   end
 
   # A map's seq is its [k v] entries (nil when empty), so `(seq {:a 1})`
-  # iterates like Clojure.
+  # iterates like Clojure. A record is a struct-map, so its seq reads the
+  # public fields, never the hidden `__struct__` key.
+  def seq(%{__struct__: mod} = m) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: seq(record_entries(m)), else: seq(map_entries(m))
+  end
+
   def seq(m) when is_map(m), do: seq(map_entries(m))
 
   # --- type & collection predicates (Clojure-correct) ---
@@ -323,14 +367,26 @@ defmodule BeamLisp.RT do
   def boolean(x), do: x != nil and x != false
 
   @doc "`find`: the map entry for `k` in map `m` as a `[key value]` vector, else nil."
-  def find(m, k) when is_map(m) do
+  def find(%{__struct__: mod} = m, k) when is_atom(mod) do
+    if BeamLisp.Record.record?(m) do
+      # The internal `__struct__` key is not findable; real keys read the
+      # public fields only (never recursing — the deleted map is a plain map).
+      if k == :__struct__, do: nil, else: find_in_map(Map.delete(m, :__struct__), k)
+    else
+      find_in_map(m, k)
+    end
+  end
+
+  def find(m, k) when is_map(m), do: find_in_map(m, k)
+
+  def find(_m, _k), do: nil
+
+  defp find_in_map(m, k) do
     case Map.fetch(m, k) do
       {:ok, v} -> %BeamLisp.Vector{items: {k, v}}
       :error -> nil
     end
   end
-
-  def find(_m, _k), do: nil
 
   @doc """
   `contains?`: KEY membership for maps, index-in-range for vectors — never
@@ -342,6 +398,12 @@ defmodule BeamLisp.RT do
   # Set contains? is MEMBERSHIP (a set is a struct-map, so this must
   # precede the is_map clause which would check the :members field).
   def contains?(%Set{} = s, x), do: Set.member?(s, x)
+
+  # Records report containment over their public fields only; `__struct__`
+  # is internal.
+  def contains?(%{__struct__: mod} = m, k) when is_atom(mod) do
+    if BeamLisp.Record.record?(m), do: k != :__struct__ and Map.has_key?(m, k), else: Map.has_key?(m, k)
+  end
 
   def contains?(m, k) when is_map(m), do: Map.has_key?(m, k)
   def contains?(_coll, _k), do: false
@@ -581,10 +643,25 @@ defmodule BeamLisp.RT do
   # enumeration is insertion-ordered, keeping key order deterministic.
   defp map_entries(m), do: for({k, v} <- m, do: %BeamLisp.Vector{items: {k, v}})
 
+  # A record's entries: its public fields (plus any assoc'd extras) as
+  # [k v] entry vectors. `for`/`Enum` over a struct raise (no Enumerable),
+  # so records are read through Map.to_list with the internal `__struct__`
+  # key dropped.
+  defp record_entries(r) do
+    r
+    |> Map.to_list()
+    |> Enum.reject(fn {k, _} -> k == :__struct__ end)
+    |> Enum.map(fn {k, v} -> %BeamLisp.Vector{items: {k, v}} end)
+  end
+
   defp seqable(nil), do: []
   # A set is a struct-map; iterating it via Enum would walk its fields,
   # so map/filter read its members instead.
   defp seqable(%Set{} = s), do: Set.to_list(s)
+  # A record iterates as its public entries, not its struct fields.
+  defp seqable(%{__struct__: mod} = r) when is_atom(mod) do
+    if BeamLisp.Record.record?(r), do: record_entries(r), else: r
+  end
   defp seqable(coll), do: coll
 
   def map(f, coll) do
@@ -744,6 +821,13 @@ defmodule BeamLisp.RT do
   # raises; fail loudly instead of corrupting the set's shape.
   def assoc(%Set{}, _k, _v),
     do: raise(ArgumentError, "assoc not supported on a set")
+  # A record's `__struct__` key is internal; assoc'ing it would silently
+  # turn the record into a corrupted plain map, so fail loudly instead.
+  def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod) and k == :__struct__ do
+    if BeamLisp.Record.record?(m),
+      do: raise(ArgumentError, "assoc on the internal :__struct__ key is not allowed on a record"),
+      else: Map.put(m, k, v)
+  end
   def assoc(coll, k, v) when is_map(coll), do: Map.put(coll, k, v)
   def assoc(nil, k, v), do: Map.put(%{}, k, v)
 
@@ -793,12 +877,35 @@ defmodule BeamLisp.RT do
     "#" <> "{" <> body <> "}"
   end
 
-  def print_str(m) when is_map(m) do
+  # A record prints readably as `#ns/Name{field val …}` — the tagged
+  # literal form the reader lowers back into a record, so `pr-str` then
+  # read round-trips to an equal record (a plain map print would come
+  # back as a map, breaking record equality). The `"#" <>` splice avoids
+  # the `#{` Elixir-interpolation pitfall.
+  def print_str(%{__struct__: mod} = r) when is_atom(mod) do
+    if BeamLisp.Record.record?(r) do
+      {_, ns, name, _} = BeamLisp.Record.info(mod)
+
+      body =
+        r
+        |> Map.to_list()
+        |> Enum.reject(fn {k, _} -> k == :__struct__ end)
+        |> Enum.map_join(", ", fn {k, v} -> print_elem(k) <> " " <> print_elem(v) end)
+
+      "#" <> ns <> "/" <> name <> "{" <> body <> "}"
+    else
+      print_str_map(r)
+    end
+  end
+
+  def print_str(m) when is_map(m), do: print_str_map(m)
+
+  def print_str(x), do: inspect(x)
+
+  defp print_str_map(m) do
     pairs = Enum.map_join(m, ", ", fn {k, v} -> print_elem(k) <> " " <> print_elem(v) end)
     "{" <> pairs <> "}"
   end
-
-  def print_str(x), do: inspect(x)
 
   def println(x), do: IO.puts(print_str(x))
 
@@ -922,6 +1029,9 @@ defmodule BeamLisp.RT do
       "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
       "println" => &println/1,
       "pr-str" => &print_str/1,
+      # Clojure's `print-str` returns the printed representation (like
+      # pr-str, minus readably-quoted strings); both share the one printer.
+      "print-str" => &print_str/1,
       "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1}),
       # lazy sequences: hybrid — realized in → realized out, lazy in → lazy out
       "map" => &map/2,
@@ -1100,6 +1210,7 @@ defmodule BeamLisp.RT do
       "next" => 1,
       "println" => 1,
       "pr-str" => :print_str,
+      "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
       "assoc" => 3,
       "map" => 2,

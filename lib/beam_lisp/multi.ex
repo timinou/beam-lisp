@@ -54,6 +54,9 @@ defmodule BeamLisp.Multi do
   def type_of(%{__struct__: mod}) when is_atom(mod), do: mod
   def type_of(v) when is_map(v), do: :map
   def type_of(v) when is_function(v), do: :fn
+  # A deftype instance is a tagged tuple carrying its module; it must
+  # dispatch as that type, so this precedes the bare-tuple clause.
+  def type_of({:bl_deftype, mod, _}) when is_atom(mod), do: mod
   def type_of(v) when is_tuple(v), do: :tuple
   def type_of(v) when is_pid(v), do: :pid
   def type_of(v) when is_reference(v), do: :reference

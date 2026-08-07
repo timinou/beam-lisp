@@ -179,7 +179,64 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_44_for.bl", "jank.accept.for",
      "977712c0fb622d051d800f5ab9fba840ab065717112be7c03ad72f38f21cc437"},
     {"slice_61_lazy_cat.bl", "jank.accept.lazycat",
-     "cc8202e3f4a02c8a39f089ef85a608c88bb04b0923380f604dc2a7e3c03f1efc"}
+     "cc8202e3f4a02c8a39f089ef85a608c88bb04b0923380f604dc2a7e3c03f1efc"},
+    # Promoted by wave 24 (widen-the-sample, third). The reduce/transducer
+    # family, the pure tail-of-file seq fns, and the numeric predicates.
+    # The transducer arities are measured honestly: collection arities
+    # behave, 1-arity transducer paths that need volatile!/reduced are
+    # recorded in docs/jank-compat.md and NOT promoted here.
+    {"slice_70_reduce.bl", "jank.accept.reduce",
+     "19370610dd18dfc6f3b71b8d27d2506f8d03b66cd74cdbbacda221bc9a5117e4"},
+    {"slice_71_completing.bl", "jank.accept.completing",
+     "a5e6ecef044a21661c0aea43d9ded8c9532d57eb76ca46bba324dac02cb7f306"},
+    {"slice_79_not_eq.bl", "jank.accept.noteq",
+     "dc80a0e6ead5dfde546b6d03097be256a3fd58341dade7305fd10eb5184b25ef"},
+    {"slice_84_signed_int_preds.bl", "jank.accept.posint",
+     "6eafad4fc3d1a3487608466aae284c02f5a7bf2608cb73d1d23a56c3ac6f3304"},
+    {"slice_86_nthnext.bl", "jank.accept.nthnext",
+     "d2b4c5ff91f95992f17490d107d1cd098b5aff2df430a6b6cd70a3a496ac06d9"},
+    {"slice_87_nthrest.bl", "jank.accept.nthrest",
+     "98a16c9c55ca013356cef874a616a99378766046c3d358e3cba6a3cb23b0d80c"},
+    {"slice_88_take_nth.bl", "jank.accept.takenth",
+     "12bd2618c253513c0dbb1912e66a60f33963265ed21f2c2b4f30cb915c081ec0"},
+    {"slice_89_map.bl", "jank.accept.map",
+     "97125e0f2de8de29286a0df446fda42779517990bdf52538df9003e03c00c5cb"},
+    {"slice_90_map_indexed.bl", "jank.accept.mapindexed",
+     "bdbdaf048b0533d9c3537b9aa5d84bd0598be718fd2d77ac74ffbeca17e1ce1e"},
+    {"slice_91_keep.bl", "jank.accept.keep",
+     "92484f163ff7e7b1d97f0b81e238378c27c04d42296fc4844d77ffc924cf587d"},
+    {"slice_92_keep_indexed.bl", "jank.accept.keepindexed",
+     "f1c9ca7031538c7ceef097f27c5f9f25ae28e61243005cdde782549e2f336977"},
+    {"slice_94_split_with.bl", "jank.accept.splitwith",
+     "db601d03d8347a1178cc43b41d21412cc38c4b2f539c57d39dbf3e11b323854a"},
+    {"slice_96_dorun.bl", "jank.accept.dorun",
+     "8e16dd25ff37c8b104a7caf105e0a000764b35d58c37bb3e20af2117bd670666"},
+    {"slice_97_doall.bl", "jank.accept.doall",
+     "03e7ef8c1157f7503f1ab9fa42f69ebce2490ef4b88b14db8e66cd8079685137"},
+    {"slice_100_take_last.bl", "jank.accept.takelast",
+     "6c612e02038efa17254f2c3f188ce074aa852f56473c6e6279c0ade845588735"},
+    {"slice_101_mapv.bl", "jank.accept.mapv",
+     "1df3d96917e8d546bb67e9788981942e216f8c22ed206a32127b79bf93742c43"},
+    {"slice_102_filterv.bl", "jank.accept.filterv",
+     "ffb187a6abd250022ab6755e95faab56fedabc563d3665b367b3d201668a0a83"},
+    {"slice_103_distinct_q.bl", "jank.accept.distinctq",
+     "1de4563d8d85bbb5757b8f1870195d3975ae7641145fda7dcaacb76ea3dc7af5"},
+    {"slice_104_filter.bl", "jank.accept.filter",
+     "387bec70616ec2d9accf9171a53b27839c3f7c657acf09eb12b02e8d8fc6460a"},
+    {"slice_105_dedupe.bl", "jank.accept.dedupe",
+     "76be6684e8612d9991c00bd7d0c8b0e0ddc9051a05c6982868e731b8e47e5ded"},
+    {"slice_106_nfirst.bl", "jank.accept.nfirst",
+     "e2c6e082d68ab47d54d714db297a9dacd75b6f80028c148b5843f8c9e6eb290b"},
+    {"slice_107_fnext.bl", "jank.accept.fnext",
+     "17c620149059b65f11b4acb02abadf38e51c7961a1d6c903d4b2df76e3964a52"},
+    {"slice_109_map_entry_q.bl", "jank.accept.mapentryq",
+     "07de9dba71d58aa54fc2fa1349a314171c79c6c3a9ab61d11f45c015169b46f5"},
+    {"slice_111_not_every_q.bl", "jank.accept.noteveryq",
+     "db66d14bb2330bbc5c78af7d747532257409a7243e9db7608cd43696cf775bd6"},
+    {"slice_112_replicate.bl", "jank.accept.replicate",
+     "eaeb33657018c7c33df57a7ba4c7e0c3f93a9bfbf76aca0a952280eab1d51e48"},
+    {"slice_113_comparator.bl", "jank.accept.comparator",
+     "4521c68e92514c724bcb8e56106ac91cb32c3a3940078473765f4d60fcd53237"}
   ]
 
   setup_all do
@@ -754,5 +811,201 @@ defmodule BeamLisp.JankCompatTest do
       # long as nobody asks for all of it.
       assert eval_in("jank.accept.for", "(doall (take 3 (for [x (range)] (* 2 x))))") == [0, 2, 4]
     end
+
+    # --- promoted by wave 24 (widen-the-sample, third). The reduce /
+    # transducer family's pure members, the tail-of-file seq fns, and
+    # the numeric predicates. Transducer 1-arities that need volatile!/
+    # reduced are measured in docs/jank-compat.md, NOT promoted here.
+
+    test "completing adds the arity-1 and arity-0 signatures to a reducing fn" do
+      load_slice("slice_71_completing.bl", "jank.accept.completing")
+      assert eval_in("jank.accept.completing", "((completing +) 1 2)") == 3
+      assert eval_in("jank.accept.completing", "((completing +) 7)") == 7
+      assert eval_in("jank.accept.completing", "((completing +))") == 0
+    end
+
+    test "reduce folds with no init (upstream 2-arity; the 3-arity is a cpp gap)" do
+      # Upstream reduce's [f coll] arity is self-recursive and works;
+      # its [f init coll] arity calls cpp/jank.runtime.reduce, which the
+      # shim does not cover — recorded in docs/jank-compat.md.
+      load_slice("slice_70_reduce.bl", "jank.accept.reduce")
+      assert eval_in("jank.accept.reduce", "(reduce + [1 2 3])") == 6
+      assert eval_in("jank.accept.reduce", "(reduce (fn [a b] (if (> a b) a b)) [3 1 4 1 5])") == 5
+    end
+
+    test "not= negates = at every arity" do
+      load_slice("slice_79_not_eq.bl", "jank.accept.noteq")
+      assert eval_in("jank.accept.noteq", "(not= 1 2)") == true
+      assert eval_in("jank.accept.noteq", "(not= 1 1)") == false
+      assert eval_in("jank.accept.noteq", "(not= 1 2 3)") == true
+    end
+
+    test "pos-int? tests a positive fixed-precision integer" do
+      # Upstream pos-int? calls int?, which resolves to beam-lisp's
+      # native int? (the cpp-based one is measured separately).
+      load_slice("slice_84_signed_int_preds.bl", "jank.accept.posint")
+      assert eval_in("jank.accept.posint", "(pos-int? 5)") == true
+      assert eval_in("jank.accept.posint", "(pos-int? -5)") == false
+      assert eval_in("jank.accept.posint", "(pos-int? 0)") == false
+    end
+
+    test "nthnext returns the nth seq or nil" do
+      load_slice("slice_86_nthnext.bl", "jank.accept.nthnext")
+      assert eval_in("jank.accept.nthnext", "(nthnext [1 2 3] 2)") == [3]
+      # seq of a vector is the vector itself (beam-lisp's hybrid model)
+      assert eval_in("jank.accept.nthnext", "(nthnext [1 2 3] 0)") ==
+               BeamLisp.Vector.new([1, 2, 3])
+      assert eval_in("jank.accept.nthnext", "(nthnext [1 2 3] 5)") == nil
+    end
+
+    test "nthrest returns the nth rest or empty" do
+      load_slice("slice_87_nthrest.bl", "jank.accept.nthrest")
+      assert eval_in("jank.accept.nthrest", "(nthrest [1 2 3] 2)") == [3]
+      assert eval_in("jank.accept.nthrest", "(nthrest [1 2 3] 5)") == []
+      assert eval_in("jank.accept.nthrest", "(nthrest [1 2 3] 0)") ==
+               BeamLisp.Vector.new([1, 2, 3])
+    end
+
+    test "take-nth keeps every nth item (coll arity; transducer needs volatile!)" do
+      load_slice("slice_88_take_nth.bl", "jank.accept.takenth")
+      assert eval_in("jank.accept.takenth", "(doall (take-nth 2 [1 2 3 4]))") == [1, 3]
+      assert eval_in("jank.accept.takenth", "(doall (take-nth 3 (range 10)))") == [0, 3, 6, 9]
+    end
+
+    test "map applies f across one or more colls (vendored upstream arities)" do
+      # The vendored map carries its own multi-coll arities, which recur
+      # into itself — so two-collection map works here even though
+      # core's map is single-coll (the gap drop-last/mapv hit).
+      load_slice("slice_89_map.bl", "jank.accept.map")
+      assert eval_in("jank.accept.map", "(doall (map inc [1 2 3]))") == [2, 3, 4]
+      assert eval_in("jank.accept.map", "(doall (map + [1 2 3] [10 20 30]))") == [11, 22, 33]
+    end
+
+    test "map-indexed threads the index (coll arity; transducer needs volatile!)" do
+      load_slice("slice_90_map_indexed.bl", "jank.accept.mapindexed")
+      assert eval_in("jank.accept.mapindexed", "(doall (map-indexed + [10 20 30]))") ==
+               [10, 21, 32]
+    end
+
+    test "keep drops nil results" do
+      load_slice("slice_91_keep.bl", "jank.accept.keep")
+      assert eval_in("jank.accept.keep", "(doall (keep #(when (odd? %) %) [1 2 3 4]))") == [1, 3]
+    end
+
+    test "keep-indexed drops nil results, threading the index" do
+      load_slice("slice_92_keep_indexed.bl", "jank.accept.keepindexed")
+
+      assert eval_in(
+               "jank.accept.keepindexed",
+               "(doall (keep-indexed (fn [i x] (when (odd? i) x)) [1 2 3 4]))"
+             ) == [2, 4]
+    end
+
+    test "split-with partitions by a predicate (needs upstream juxt)" do
+      # split-with is (juxt take-while drop-while), so it needs the
+      # `juxt` slice co-loaded — core.jank's own dependency.
+      load_slice("slice_05_juxt.bl", "jank.accept.splitwith")
+      load_slice("slice_94_split_with.bl", "jank.accept.splitwith")
+
+      assert eval_in("jank.accept.splitwith", "(doall (split-with even? [2 4 5 6]))") ==
+               BeamLisp.Vector.new([[2, 4], [5, 6]])
+
+      assert eval_in("jank.accept.splitwith", "(doall (split-with pos? [1 -1 2]))") ==
+               BeamLisp.Vector.new([[1], [-1, 2]])
+    end
+
+    test "dorun forces a seq for side effects and returns nil" do
+      load_slice("slice_96_dorun.bl", "jank.accept.dorun")
+      assert eval_in("jank.accept.dorun", "(dorun [1 2 3])") == nil
+      assert eval_in("jank.accept.dorun", "(dorun 2 [1 2 3])") == nil
+    end
+
+    test "doall forces a seq and returns it (needs upstream dorun)" do
+      load_slice("slice_96_dorun.bl", "jank.accept.doall")
+      load_slice("slice_97_doall.bl", "jank.accept.doall")
+      assert eval_in("jank.accept.doall", "(doall [1 2 3])") == BeamLisp.Vector.new([1, 2, 3])
+      assert eval_in("jank.accept.doall", "(doall 2 [1 2 3])") == BeamLisp.Vector.new([1, 2, 3])
+    end
+
+    test "take-last returns the last n items" do
+      load_slice("slice_100_take_last.bl", "jank.accept.takelast")
+      assert eval_in("jank.accept.takelast", "(doall (take-last 2 [1 2 3 4]))") == [3, 4]
+    end
+
+    test "mapv returns a vector (1-arity; multi-coll arities need into/map)" do
+      # The 1-arity goes through transient/conj!/persistent! and works.
+      # The multi-coll arities need `into` and core multi-coll `map`,
+      # both recorded gaps in docs/jank-compat.md.
+      load_slice("slice_101_mapv.bl", "jank.accept.mapv")
+      assert eval_in("jank.accept.mapv", "(mapv inc [1 2 3])") == BeamLisp.Vector.new([2, 3, 4])
+    end
+
+    test "filterv returns a vector of the kept items" do
+      load_slice("slice_102_filterv.bl", "jank.accept.filterv")
+      assert eval_in("jank.accept.filterv", "(filterv even? [1 2 3 4])") ==
+               BeamLisp.Vector.new([2, 4])
+      assert eval_in("jank.accept.filterv", "(filterv odd? [])") == BeamLisp.Vector.new([])
+    end
+
+    test "distinct? is true when no two args are equal" do
+      load_slice("slice_103_distinct_q.bl", "jank.accept.distinctq")
+      assert eval_in("jank.accept.distinctq", "(distinct? 1 2 3)") == true
+      assert eval_in("jank.accept.distinctq", "(distinct? 1 2 1)") == false
+      assert eval_in("jank.accept.distinctq", "(distinct? 1)") == true
+      assert eval_in("jank.accept.distinctq", "(distinct? 1 1)") == false
+    end
+
+    test "filter keeps the items pred accepts (vendored coll arity)" do
+      load_slice("slice_104_filter.bl", "jank.accept.filter")
+      assert eval_in("jank.accept.filter", "(doall (filter even? [1 2 3 4 5]))") == [2, 4]
+      assert eval_in("jank.accept.filter", "(doall (filter odd? (range 10)))") == [1, 3, 5, 7, 9]
+    end
+
+    test "dedupe removes consecutive duplicates (needs upstream when-some)" do
+      # dedupe's coll arity walks with when-some, which is not a core
+      # builtin — its own slice is co-loaded (core.jank's dependency).
+      load_slice("slice_35_when_some.bl", "jank.accept.dedupe")
+      load_slice("slice_105_dedupe.bl", "jank.accept.dedupe")
+      assert eval_in("jank.accept.dedupe", "(doall (dedupe [1 1 2 3 3 1]))") == [1, 2, 3, 1]
+      assert eval_in("jank.accept.dedupe", "(doall (dedupe []))") == []
+    end
+
+    test "nfirst is (next (first x))" do
+      load_slice("slice_106_nfirst.bl", "jank.accept.nfirst")
+      assert eval_in("jank.accept.nfirst", "(nfirst [[1 2] [3 4]])") == [2]
+      assert eval_in("jank.accept.nfirst", "(nfirst [[1]])") == nil
+    end
+
+    test "fnext is (first (next x))" do
+      load_slice("slice_107_fnext.bl", "jank.accept.fnext")
+      assert eval_in("jank.accept.fnext", "(fnext [[1 2] [3 4]])") == BeamLisp.Vector.new([3, 4])
+      assert eval_in("jank.accept.fnext", "(fnext [[1]])") == nil
+    end
+
+    test "map-entry? tests a 2-element vector" do
+      load_slice("slice_109_map_entry_q.bl", "jank.accept.mapentryq")
+      assert eval_in("jank.accept.mapentryq", "(map-entry? [:a 1])") == true
+      assert eval_in("jank.accept.mapentryq", "(map-entry? [1 2 3])") == false
+      assert eval_in("jank.accept.mapentryq", "(map-entry? {:a 1})") == false
+    end
+
+    test "not-every? is the negation of every?" do
+      load_slice("slice_111_not_every_q.bl", "jank.accept.noteveryq")
+      assert eval_in("jank.accept.noteveryq", "(not-every? even? [1 2 3])") == true
+      assert eval_in("jank.accept.noteveryq", "(not-every? even? [2 4])") == false
+    end
+
+    test "replicate builds n copies (deprecated alias of take+repeat)" do
+      load_slice("slice_112_replicate.bl", "jank.accept.replicate")
+      assert eval_in("jank.accept.replicate", "(doall (replicate 3 :x))") == [:x, :x, :x]
+    end
+
+    test "comparator turns a binary pred into a -1/0/1 comparator" do
+      load_slice("slice_113_comparator.bl", "jank.accept.comparator")
+      assert eval_in("jank.accept.comparator", "((comparator <) 1 2)") == -1
+      assert eval_in("jank.accept.comparator", "((comparator <) 2 1)") == 1
+      assert eval_in("jank.accept.comparator", "((comparator <) 2 2)") == 0
+    end
+
   end
 end
