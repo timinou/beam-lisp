@@ -54,38 +54,44 @@ pass, higher arities fail) · **✗ fail** (a recorded gap).
 | 07 | fnil | 2149–2170 | `fnil` | ✓ | needs `apply`(2-arity) |
 | 08 | some | 2172–2180 | `some` | ✓ | *was ✗* — closed by `next` (wave 14) |
 | 09 | not-any? | 2262–2263 | `not-any?` | ✓ | *was ✗* — closed by `next` + the `not` fix (wave 14); needs the `some` slice loaded alongside, which is core.jank's own dependency |
-| 10 | `->` | 2265–2279 | `->` macro | ✗ | `loop*`, `seq?`, `with-meta`, `meta` |
-| 11 | `->>` | 2281–2295 | `->>` macro | ✗ | same as `->` |
+| 10 | `->` | 2265–2279 | `->` macro | ✓ | *was ✗* — closed by `loop*` + form metadata + `seq?` (wave 15) |
+| 11 | `->>` | 2281–2295 | `->>` macro | ✓ | *was ✗* — same as `->` |
 | 12 | key/val | 2298–2307 | `key`, `val` | ✓ | `first`/`second` |
-| 13 | if-let | 2608–2626 | `if-let` macro | ✗ | → `assert-macro-args` |
-| 14 | when-let | 2628–2641 | `when-let` macro | ✗ | → `assert-macro-args` |
+| 13 | if-let | 2608–2626 | `if-let` macro | ✓ | *was ✗* — closed by `assert-macro-args` + `&form` + `clojure.core` alias (wave 15) |
+| 14 | when-let | 2628–2641 | `when-let` macro | ✓ | *was ✗* — same chain; needs the `if-let` slice co-loaded |
 | 15 | if-not | 2662–2667 | `if-not` macro | ✓ | pure |
-| 16 | dotimes | 2686–2701 | `dotimes` macro | ✗ | → `assert-macro-args` |
-| 17 | doseq | 2703–2756 | `doseq` macro | ✗ | → `assert-macro-args` |
-| 18 | doto | 2927–2941 | `doto` macro | ✗ | `with-meta`, `seq?`, `meta` on forms |
+| 16 | dotimes | 2686–2701 | `dotimes` macro | ✓ | *was ✗* — same chain (wave 15) |
+| 17 | doseq | 2703–2756 | `doseq` macro | ✓ | *was ✗* — same chain, plus seqable `~@` splice and vector-as-function |
+| 18 | doto | 2927–2941 | `doto` macro | ✓ | *was ✗* — closed by form metadata (wave 15) |
 | 19 | trampoline | 6999–7013 | `trampoline` | ✓ | *was ✗* — closed by `fn?` + `#()` fn literals (wave 14) |
 | 20 | while | 7015–7022 | `while` macro | ✓ | pure (`loop`/`when`/`recur`) |
-| 21 | memoize | 7024–7036 | `memoize` | ✗ | `if-let` → `assert-macro-args` (`find` now exists) |
+| 21 | memoize | 7024–7036 | `memoize` | ✓ | *was ✗* — closed by `if-let` + `find`; needs the `if-let` and `key/val` slices co-loaded |
 
 ## Counts — the headline
 
-> **13 of 21 slices** load **and** behave correctly (14 definitions:
-> `constantly`, `identity`, `complement`, `comp`, `juxt`, `partial`,
-> `fnil`, `some`, `not-any?`, `key`, `val`, `if-not`, `trampoline`,
-> `while`). **8 fail** on recorded gaps, and every one of those is now a
-> macro-level gap (`assert-macro-args`, form metadata) rather than a
-> missing runtime facility. **All 21 read + compile** — the reader and
-> compiler never rejected a form.
+> **21 of 21 slices** load **and** behave correctly. Every block of
+> jank's `core.jank` attempted in this measurement now runs unmodified
+> on the BEAM, called with upstream's own docstring examples.
 >
-> Wave 14 moved this from **7/21 to 13/21** by building exactly what this
-> document ranked: `next`, `list*`, variadic `apply`, the predicate layer,
-> and `#()` fn literals. Nothing was patched into passing; the fixtures
-> are still byte-for-byte upstream, and the checksum test proves it.
+> The trajectory is the point: **7/21 → 13/21 → 21/21** across two
+> waves, each aimed by this document's ranked gap list. Nothing was
+> patched into passing — the fixtures are still byte-for-byte upstream
+> and the checksum test proves it. Where a slice needs another slice
+> (`memoize` needs `if-let` and `val`; `not-any?` needs `some`), that
+> dependency is `core.jank`'s own, satisfied with unmodified upstream
+> text.
+>
+> What this does and does not prove: it proves beam-lisp reads, compiles
+> and correctly runs real jank source across the leaf and macro bands of
+> the stdlib — including the macro-authoring surface (`&form`, form
+> metadata, `assert-macro-args`) that jank's own macros are written
+> against. It does not prove the whole file loads: the slices were
+> chosen as reachable candidates, and the primitive band built on
+> `cpp/*` interop (see gap 6 below) is untouched.
 
-The 13 passing slices are exercised by `test/beam_lisp/jank_compat_test.exs`
-(accepted only) and demonstrated end-to-end by `examples/jank_slice.bl`
-(unmodified jank `while`/`constantly`/`complement`/`fnil`/`key`/`val`
-running on the BEAM, exit 0).
+All 21 slices are exercised by `test/beam_lisp/jank_compat_test.exs`
+and demonstrated end-to-end by `examples/jank_slice.bl` and
+`examples/threading.bl` (unmodified jank running on the BEAM, exit 0).
 
 ## Gap classification
 
@@ -151,37 +157,35 @@ running on the BEAM, exit 0).
 
 ## What to build next (by unlock count)
 
-*Re-ranked after wave 14, which closed the top of the previous list
-(`next`, `list*`, variadic `apply`, the predicate layer, `#()`
-literals) and took the measurement from 7/21 to 13/21.*
+*Re-ranked after wave 15 took the measurement to 21/21. With every
+attempted slice passing, the next lever is no longer "close a gap" but
+"widen the sample" — the honest next move is to attempt more of
+`core.jank`, because a 21-slice sample that fully passes has stopped
+being informative.*
 
-1. **`assert-macro-args` and the macro-authoring surface it needs** —
-   `&form`/`&env`, form metadata (`meta`/`with-meta` on the form data a
-   macro receives), and a `clojure.core` alias so upstream's qualified
-   references resolve. This single chain gates **six of the eight**
-   remaining slices: `if-let`, `when-let`, `dotimes`, `doseq`, plus
-   `memoize` transitively — by far the largest lever left, and the one
-   that opens the macro-heavy middle of `core.jank`.
-2. **Form metadata for the threading macros** — `->`/`->>`/`doto` build
-   their expansions with `(with-meta … (meta form))` and test shape with
-   `seq?`. beam-lisp's metadata layer is deliberately bounded (values on
-   the BEAM have no attachment slot; see `BeamLisp.Meta`), so the honest
-   move is metadata on *form data* specifically — which the compiler
-   controls end to end — rather than on arbitrary runtime values.
-   Unlocks slices 10, 11, 18.
-3. **`loop*`** — upstream's macros expand to `loop*`, the primitive
-   beneath `loop`. Cheap: alias it to the existing `loop` special form.
-4. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`) — needed
-   by `keys`/`vals`/`set`/`zipmap` upstream, and a natural follow-on to
-   the wave-8 trie, which already has the internal structure for them.
-5. **`namespace`, `rem`/`mod`/`quot`, and the remaining numeric tower** —
-   small, mechanical, each unlocking a leaf.
-6. **`cpp/*`-implemented primitives** — the long tail. jank implements
-   `nth`/`get`/`contains?`/`hash-set`/`peek`/`pop`/bit ops/set ops via
+1. **Attempt the next band of slices.** The current 21 were chosen as
+   reachable candidates. Slice the next tranche — `keys`/`vals`/`set`,
+   `select-keys`, `every-pred`/`some-fn`, `run!`, `group-by`,
+   `partition`, `interleave`, `zipmap` — and re-measure. Expect the
+   score to drop; that drop is the information.
+2. **`cpp/*`-implemented primitives.** jank implements `nth`/`get`/
+   `contains?`/`hash-set`/`peek`/`pop`/bit ops/set ops via
    `(cpp/jank.runtime.*)` interop. beam-lisp needs BEAM equivalents
-   under a mapped namespace before slices built on primitives are
-   reachable at all. This is what makes the *rest* of `core.jank`
-   loadable, and it is a wave of its own.
+   under a mapped namespace before any slice built on primitives is
+   reachable at all. This is the long tail that makes the *rest* of
+   `core.jank` loadable, and it is a wave of its own.
+3. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`) — needed
+   by `keys`/`vals`/`set`/`zipmap` upstream, and a natural follow-on to
+   the wave-8 trie, which already has the structure for them.
+4. **Reader `^{}` / `^:kw` metadata** — the form-metadata machinery now
+   exists (`BeamLisp.FormMeta`), so the reader only needs to attach a
+   map to the following form node. Unblocks upstream's `^:private` and
+   `^{:doc …}` definitions, which the head of `core.jank` is built on.
+5. **Uniform laziness** (`PLAN-010`) — several upstream seq fns assume
+   `map`/`filter` are lazy over any input; beam-lisp's hybrid model
+   will diverge as the sample widens.
+6. **`namespace`, `rem`/`mod`/`quot`, the numeric tower** — small and
+   mechanical, each unlocking a leaf.
 
 ## Keeping this honest
 
