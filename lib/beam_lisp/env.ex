@@ -139,12 +139,22 @@ defmodule BeamLisp.Env do
   end
 
   @doc """
-  Record `meta` (a map, conventionally `%{doc: docstring}`) for `name`
-  in `ns`. The latest write wins; redefining a var with a new
-  docstring replaces the old one. Returns `:ok`.
+  Record `meta` (a map) for `name` in `ns`. This is the general var
+  metadata mechanism — `%{doc: "…"}`, `%{private: true}`,
+  `%{dynamic: true}` and any other Clojure metadata keys all live in
+  the one map. Writes **merge**: redefining a var with a new docstring
+  keeps keys set earlier (so `:private` set on the first def survives a
+  later doc-only redefinition) and the latest value wins per key.
+  Returns `:ok`.
   """
   def put_meta(ns, name, meta) when is_map(meta) do
-    :ets.insert(@table, {{:meta, ns, name}, meta})
+    merged =
+      case :ets.lookup(@table, {:meta, ns, name}) do
+        [{_, existing}] when is_map(existing) -> Map.merge(existing, meta)
+        _ -> meta
+      end
+
+    :ets.insert(@table, {{:meta, ns, name}, merged})
     :ok
   end
 
