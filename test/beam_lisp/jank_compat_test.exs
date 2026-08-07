@@ -113,7 +113,38 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_45_assoc_in.bl", "jank.accept.associn",
      "2df0f403010a8e5a72d1df13ded445ec96dab8b8fc1429dc123782e6e14e8443"},
     {"slice_46_update_in.bl", "jank.accept.updatein",
-     "ed722b49f086d184d7d04eed9570857acace2ad6b508778da72954978cc2a04d"}
+     "ed722b49f086d184d7d04eed9570857acace2ad6b508778da72954978cc2a04d"},
+    # Wave 17: transients (keys/vals/zipmap/frequencies/group-by) and
+    # the prelude seq layer butlast/nthrest/partition/*assert* the
+    # conditional-threading macros are built on.
+    {"slice_41_partition.bl", "jank.accept.partition",
+     "9ba50270a5fb48344fb6049628cec89fcb1090983c023f1cf63cbabf178eeff2"},
+    {"slice_53_cond_arrow.bl", "jank.accept.condarrow",
+     "3980728e6f17474d9d21621d8661576f92a6bb3fb5d9405cc44497026df8281c"},
+    {"slice_54_cond_arrow_last.bl", "jank.accept.condarrowlast",
+     "b3338f0ae1ea4ee0205dcaa685f753f39b23a8e69bb96379abb0d7cd4b682585"},
+    {"slice_55_as_arrow.bl", "jank.accept.asarrow",
+     "bbce6008271cea925045ca741fa6e294e7e1b01a36af8f859d37ce606b5f5192"},
+    {"slice_56_some_arrow.bl", "jank.accept.somearrow",
+     "ead9fc9d9db56490d2d3579b412f834f2952f8eb3660cfb3e4b4b92ce883c2f5"},
+    {"slice_57_some_arrow_last.bl", "jank.accept.somearrowlast",
+     "b5a364ef2efa378293dde55cb3c73939d15955eb5800d675216ef1c10e0d72a6"},
+    {"slice_64_assert.bl", "jank.accept.assert",
+     "aeb91a6e42ecdbe15823826e472fd6e3a443dd39ada97072149db48cbf4235a9"},
+    {"slice_26_keys.bl", "jank.accept.keys",
+     "9c947410891c60e7b1394df86a42b4adfd304ca2885f3839054f1070fa9aca94"},
+    {"slice_27_vals.bl", "jank.accept.vals",
+     "39e254cf5196e78d0eb0814e9e2cf3946205b7176bf92db78c8ee8f3727d5104"},
+    {"slice_29_zipmap.bl", "jank.accept.zipmap",
+     "643ca59090d95edd577566c98798a4df37ca050151ffd5a5377bca1c05dedd00"},
+    {"slice_42_frequencies.bl", "jank.accept.frequencies",
+     "f545d75b4156fe059033984775c2d57d41bce1cf217db36c8c075d678741a1ca"},
+    {"slice_43_group_by.bl", "jank.accept.groupby",
+     "f6e170b41433d38b09ab7e3ecc6c6541cd13c708a24a0fb83a8892656d38e852"},
+    # Unlocked by fixing the `<=` link: Erlang spells it `=<`, so the
+    # 2-arity call linked to a BIF that does not exist.
+    {"slice_63_min_key.bl", "jank.accept.minkey",
+     "32026ae941ec5598e27b64584ff7e3c7f7d9818d5a06c274ec1a5c844dfbf40e"}
   ]
 
   setup_all do
@@ -449,10 +480,98 @@ defmodule BeamLisp.JankCompatTest do
                %{a: %{b: 2}}
     end
 
+    # --- wave 17: transients, and the seq layer under the threading
+    # macros. partition exposed three seq bugs on the way in: count on
+    # a lazy seq counted struct fields, next returned an unforced tail
+    # so an exhausted seq was truthy, and Inspect crashed outright.
+
+    test "partition splits into non-overlapping groups" do
+      load_slice("slice_41_partition.bl", "jank.accept.partition")
+      assert eval_in("jank.accept.partition", "(doall (partition 2 [1 2 3 4]))") == [[1, 2], [3, 4]]
+      # a trailing group smaller than n is dropped, as in Clojure
+      assert eval_in("jank.accept.partition", "(doall (partition 2 [1 2 3]))") == [[1, 2]]
+      assert eval_in("jank.accept.partition", "(doall (partition 2 3 [1 2 3 4 5 6]))") ==
+               [[1, 2], [4, 5]]
+    end
+
+    test "cond-> threads only through the forms whose test is true" do
+      load_slice("slice_41_partition.bl", "jank.accept.condarrow")
+      load_slice("slice_53_cond_arrow.bl", "jank.accept.condarrow")
+      assert eval_in("jank.accept.condarrow", "(cond-> 5 true inc)") == 6
+      assert eval_in("jank.accept.condarrow", "(cond-> 5 false inc)") == 5
+      # unlike cond, it does not stop at the first true test
+      assert eval_in("jank.accept.condarrow", "(cond-> 5 true inc true inc)") == 7
+    end
+
+    test "cond->> threads through the last argument position" do
+      load_slice("slice_41_partition.bl", "jank.accept.condarrowlast")
+      load_slice("slice_54_cond_arrow_last.bl", "jank.accept.condarrowlast")
+      assert eval_in("jank.accept.condarrowlast", "(cond->> 5 true (- 8))") == 3
+    end
+
+    test "as-> binds the threaded value to a name" do
+      load_slice("slice_55_as_arrow.bl", "jank.accept.asarrow")
+      assert eval_in("jank.accept.asarrow", "(as-> 5 x (+ x 1) (* x 2))") == 12
+    end
+
+    test "some-> and some->> stop at the first nil" do
+      load_slice("slice_56_some_arrow.bl", "jank.accept.somearrow")
+      assert eval_in("jank.accept.somearrow", "(some-> 5 inc)") == 6
+      assert eval_in("jank.accept.somearrow", "(some-> nil inc)") == nil
+
+      load_slice("slice_57_some_arrow_last.bl", "jank.accept.somearrowlast")
+      assert eval_in("jank.accept.somearrowlast", "(some->> 5 (- 8))") == 3
+      assert eval_in("jank.accept.somearrowlast", "(some->> nil (- 8))") == nil
+    end
+
+    test "assert passes silently and throws on a false test" do
+      load_slice("slice_64_assert.bl", "jank.accept.assert")
+      assert eval_in("jank.accept.assert", "(assert true)") == nil
+
+      assert eval_in("jank.accept.assert", "(try (assert false) :no-throw (catch e :threw))") ==
+               :threw
+    end
+
+    test "keys and vals walk the map through a transient" do
+      # Upstream builds a vector with transient/conj!/persistent! and
+      # seqs it — its own TODO says "use a proper key seq instead" — so
+      # a vector result is faithful to this code.
+      load_slice("slice_26_keys.bl", "jank.accept.keys")
+      assert eval_in("jank.accept.keys", "(count (keys {:a 1 :b 2}))") == 2
+      assert eval_in("jank.accept.keys", "(keys {})") == nil
+
+      load_slice("slice_27_vals.bl", "jank.accept.vals")
+      assert eval_in("jank.accept.vals", "(count (vals {:a 1 :b 2}))") == 2
+    end
+
+    test "zipmap, frequencies and group-by build maps with transients" do
+      load_slice("slice_29_zipmap.bl", "jank.accept.zipmap")
+      assert eval_in("jank.accept.zipmap", "(zipmap [:a :b] [1 2])") == %{a: 1, b: 2}
+
+      load_slice("slice_42_frequencies.bl", "jank.accept.frequencies")
+      assert eval_in("jank.accept.frequencies", "(frequencies [:a :a :b])") == %{a: 2, b: 1}
+
+      load_slice("slice_43_group_by.bl", "jank.accept.groupby")
+
+      assert eval_in("jank.accept.groupby", "(get (group-by even? [1 2 3 4]) true)") ==
+               BeamLisp.Vector.new([2, 4])
+    end
+
     test "max-key returns the x with the greatest (k x)" do
       load_slice("slice_62_max_key.bl", "jank.accept.maxkey")
       assert eval_in("jank.accept.maxkey", "(max-key count [1 2 3] [4] [5 6])") ==
                BeamLisp.Vector.new([1, 2, 3])
+    end
+
+    test "min-key returns the x with the least (k x)" do
+      # This one was blocked by a link bug, not a missing feature:
+      # `<=` linked to :erlang."<="/2, which does not exist — Erlang
+      # spells it `=<`. The chained arity went through invoke and
+      # worked, so only the 2-arity call failed.
+      load_slice("slice_63_min_key.bl", "jank.accept.minkey")
+
+      assert eval_in("jank.accept.minkey", "(min-key count [1 2 3] [4] [5 6])") ==
+               BeamLisp.Vector.new([4])
     end
   end
 end
