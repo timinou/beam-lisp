@@ -144,7 +144,10 @@ defmodule BeamLisp.JankCompatTest do
     # Unlocked by fixing the `<=` link: Erlang spells it `=<`, so the
     # 2-arity call linked to a BIF that does not exist.
     {"slice_63_min_key.bl", "jank.accept.minkey",
-     "32026ae941ec5598e27b64584ff7e3c7f7d9818d5a06c274ec1a5c844dfbf40e"}
+     "32026ae941ec5598e27b64584ff7e3c7f7d9818d5a06c274ec1a5c844dfbf40e"},
+    # Unlocked by `:as` in sequential destructuring.
+    {"slice_52_condp.bl", "jank.accept.condp",
+     "a724c9bb3ed6db0a5c1546c0aa208f7f394534345ced2c178fcc930a24bb53e0"}
   ]
 
   setup_all do
@@ -572,6 +575,23 @@ defmodule BeamLisp.JankCompatTest do
 
       assert eval_in("jank.accept.minkey", "(min-key count [1 2 3] [4] [5 6])") ==
                BeamLisp.Vector.new([4])
+    end
+
+    test "condp dispatches through a binary predicate" do
+      # condp calls split-at during macro expansion, so upstream's own
+      # split-at slice has to share the namespace.
+      load_slice("slice_39_split_at.bl", "jank.accept.condp")
+      load_slice("slice_52_condp.bl", "jank.accept.condp")
+      assert eval_in("jank.accept.condp", "(condp = 1 1 :one 2 :two)") == :one
+      assert eval_in("jank.accept.condp", "(condp = 2 1 :one 2 :two)") == :two
+      # a trailing odd form is the default
+      assert eval_in("jank.accept.condp", "(condp = 9 1 :one :fallback)") == :fallback
+
+      # and with no default, no matching clause throws
+      assert eval_in(
+               "jank.accept.condp",
+               "(try (condp = 9 1 :one) :no-throw (catch e :threw))"
+             ) == :threw
     end
   end
 end

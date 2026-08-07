@@ -1217,6 +1217,7 @@ defmodule BeamLisp.Compiler do
   end
 
   defp destructure_steps({:vector, elems}, env, whole_ast) do
+    {elems, as_name} = peel_as_bind(elems)
     {fixed, rest} = split_variadic(elems)
 
     {steps, env} =
@@ -1254,7 +1255,21 @@ defmodule BeamLisp.Compiler do
           {[{rest_var, drop_ast}], put_local(env, name, rest_var)}
       end
 
-    {Enum.concat(steps) ++ rest_steps, env}
+    # `:as` mirrors the map clause: bind the ENTIRE original collection
+    # to the name, untouched — a vector stays a vector, a lazy seq stays
+    # lazy. Clojure binds the whole collection, not the remainder, and
+    # it does so even when the `& rest` is exhausted to nil.
+    {as_steps, env} =
+      case as_name do
+        nil ->
+          {[], env}
+
+        name ->
+          as_var = fresh_var(name)
+          {[{as_var, whole_ast}], put_local(env, name, as_var)}
+      end
+
+    {Enum.concat(steps) ++ rest_steps ++ as_steps, env}
   end
 
   defp destructure_steps({:map, kvs}, env, whole_ast) do
@@ -1362,6 +1377,27 @@ defmodule BeamLisp.Compiler do
 
   defp destructure_steps(other, _env, _whole_ast) do
     raise "unsupported binding pattern: #{inspect(other)}"
+  end
+
+  # `[a b & rest :as whole]` peels the trailing `:as name` off the
+  # binding vector so split_variadic still sees `[a b & rest]`. `:as` is
+  # positional at the END: anywhere else, or a missing name after it,
+  # is a loud error rather than a silent mis-bind.
+  defp peel_as_bind(elems) do
+    case Enum.reverse(elems) do
+      [{:symbol, name}, {:keyword, "as"} | rest_rev] ->
+        {Enum.reverse(rest_rev), name}
+
+      [{:keyword, "as"} | _] ->
+        raise "\":as\" in a vector binding must be followed by a name"
+
+      _ ->
+        if {:keyword, "as"} in elems do
+          raise "\":as\" in a vector binding must be its last two elements ([... :as name])"
+        else
+          {elems, nil}
+        end
+    end
   end
 
   defp nest_steps(steps, body_ast) do

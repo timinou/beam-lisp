@@ -92,15 +92,15 @@ columns are the upstream span in `core.jank@3028594`.
 | 41 | partition | 3231–3251 | `partition` | ✓ | *was ✗* — `nthrest`; exposed the lazy `count`/`next`/`Inspect` bugs |
 | 42 | frequencies | 3322–3331 | `frequencies` | ✓ | *was ✗* — transients (wave 17) |
 | 43 | group-by | 3333–3344 | `group-by` | ✓ | *was ✗* — transients (wave 17) |
-| 44 | for | 3604–3689 | `for` | ✗ | reader: `&`+destructuring in fn params, `:as`, chunk-seq prims |
+| 44 | for | 3604–3689 | `for` | ✗ | `& [vector-pattern]` — a rest arg that is itself destructured (`:as` now works) |
 | 45 | assoc-in | 3697–3704 | `assoc-in` | ✓ | *was ✗ (hung)* — closed by nil-terminating `&` rest |
 | 46 | update-in | 3706–3718 | `update-in` | ✓ | *was ✗ (hung)* — same fix; needs the `assoc-in` slice co-loaded |
 | 47 | update | 3720–3734 | `update` | ✓ | `assoc`/`get`/`apply`, variadic |
 | 48 | mapcat | 3790–3796 | `mapcat` | ✓ | coll arity; *transducer 1-arity needs `cat`* (noted) |
-| 49 | distinct | 3813–3836 | `distinct` | ✗ | `[f :as xs]` destructuring unsupported |
+| 49 | distinct | 3813–3836 | `distinct` | ✗ | `:as` now works; blocked only by the `#{}` set literal |
 | 50 | flatten | 3883–3889 | `flatten` | ✗ | `tree-seq`/`sequential?` (+ `complement` dep) |
 | 51 | remove | 3891–3898 | `remove` | ✓ | needs the `complement` slice co-loaded (core dep) |
-| 52 | condp | 3924–3962 | `condp` | ✗ | `[a b c :as clause]` destructuring |
+| 52 | condp | 3924–3962 | `condp` | ✓ | *was ✗* — closed by `:as` in sequential destructuring (wave 18); needs the `split-at` slice co-loaded |
 | 53 | cond-> | 3963–3982 | `cond->` macro | ✓ | *was ✗* — `*assert*`/`butlast`/`partition` (wave 17) |
 | 54 | cond->> | 3984–3998 | `cond->>` macro | ✓ | *was ✗* — same chain |
 | 55 | as-> | 4000–4009 | `as->` macro | ✓ | *was ✗* — `butlast` (wave 17) |
@@ -116,8 +116,8 @@ columns are the upstream span in `core.jank@3028594`.
 
 ## Counts — the headline
 
-> **51 of 64 attempted slices** load **and** behave correctly. The
-> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 51** across six
+> **52 of 64 attempted slices** load **and** behave correctly. The
+> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 52** across seven
 > waves, each aimed by this document's ranked gap list. Nothing was
 > patched into passing — the fixtures are still
 > byte-for-byte upstream and the checksum test proves it. Where a slice
