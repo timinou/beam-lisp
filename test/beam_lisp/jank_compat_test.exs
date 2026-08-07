@@ -106,7 +106,14 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_51_remove.bl", "jank.accept.remove",
      "b1be84ec0aefdb32d950242882e57ffe7baf1ce90db799b8f6b86fb2ab53ef37"},
     {"slice_62_max_key.bl", "jank.accept.maxkey",
-     "d9e57aef2ca626d8c5fb3cd3d6ef584f659d4fa2abbcfd27a286dbdba09f5ff8"}
+     "d9e57aef2ca626d8c5fb3cd3d6ef584f659d4fa2abbcfd27a286dbdba09f5ff8"},
+    # Unlocked by nil-terminating an exhausted `&` rest: these two did
+    # not fail before, they HUNG — upstream recurs while `more` is
+    # truthy, and an empty collection is truthy.
+    {"slice_45_assoc_in.bl", "jank.accept.associn",
+     "2df0f403010a8e5a72d1df13ded445ec96dab8b8fc1429dc123782e6e14e8443"},
+    {"slice_46_update_in.bl", "jank.accept.updatein",
+     "ed722b49f086d184d7d04eed9570857acace2ad6b508778da72954978cc2a04d"}
   ]
 
   setup_all do
@@ -425,6 +432,21 @@ defmodule BeamLisp.JankCompatTest do
       load_slice("slice_03_complement.bl", "jank.accept.remove")
       load_slice("slice_51_remove.bl", "jank.accept.remove")
       assert eval_in("jank.accept.remove", "(remove even? [1 2 3 4 5 6])") == [1, 3, 5]
+    end
+
+    test "assoc-in sets a value at a nested path" do
+      # These two hung before an exhausted `& rest` bound nil: upstream
+      # recurs while `ks` is truthy, and an empty collection is truthy.
+      load_slice("slice_45_assoc_in.bl", "jank.accept.associn")
+      assert eval_in("jank.accept.associn", "(assoc-in {:a {:b 1}} [:a :b] 9)") == %{a: %{b: 9}}
+      assert eval_in("jank.accept.associn", "(assoc-in {} [:a] 1)") == %{a: 1}
+    end
+
+    test "update-in applies a fn at a nested path" do
+      load_slice("slice_45_assoc_in.bl", "jank.accept.updatein")
+      load_slice("slice_46_update_in.bl", "jank.accept.updatein")
+      assert eval_in("jank.accept.updatein", "(update-in {:a {:b 1}} [:a :b] inc)") ==
+               %{a: %{b: 2}}
     end
 
     test "max-key returns the x with the greatest (k x)" do

@@ -93,8 +93,8 @@ columns are the upstream span in `core.jank@3028594`.
 | 42 | frequencies | 3322–3331 | `frequencies` | ✗ | transients |
 | 43 | group-by | 3333–3344 | `group-by` | ✗ | transients |
 | 44 | for | 3604–3689 | `for` | ✗ | reader: `&`+destructuring in fn params, `:as`, chunk-seq prims |
-| 45 | assoc-in | 3697–3704 | `assoc-in` | ✗ | **`&` rest-destructure nil-semantics** (hangs) |
-| 46 | update-in | 3706–3718 | `update-in` | ✗ | same `&` gap (hangs) |
+| 45 | assoc-in | 3697–3704 | `assoc-in` | ✓ | *was ✗ (hung)* — closed by nil-terminating `&` rest |
+| 46 | update-in | 3706–3718 | `update-in` | ✓ | *was ✗ (hung)* — same fix; needs the `assoc-in` slice co-loaded |
 | 47 | update | 3720–3734 | `update` | ✓ | `assoc`/`get`/`apply`, variadic |
 | 48 | mapcat | 3790–3796 | `mapcat` | ✓ | coll arity; *transducer 1-arity needs `cat`* (noted) |
 | 49 | distinct | 3813–3836 | `distinct` | ✗ | `[f :as xs]` destructuring unsupported |
@@ -116,10 +116,10 @@ columns are the upstream span in `core.jank@3028594`.
 
 ## Counts — the headline
 
-> **36 of 64 attempted slices** load **and** behave correctly — 21 of the
-> original 21, plus **15 of 43** new slices from the widened wave-16
-> sample. The trajectory is the point: **7 → 13 → 21 → 36** across three
-> waves. Nothing was patched into passing — the fixtures are still
+> **38 of 64 attempted slices** load **and** behave correctly — 21 of the
+> original 21, plus **17 of 43** new slices from the widened wave-16
+> sample. The trajectory is the point: **7 → 13 → 21 → 36 → 38** across
+> four waves. Nothing was patched into passing — the fixtures are still
 > byte-for-byte upstream and the checksum test proves it. Where a slice
 > needs another slice (`memoize` needs `if-let`+`val`; `some-fn` needs
 > `some`; `remove` needs `complement`), that dependency is `core.jank`'s
