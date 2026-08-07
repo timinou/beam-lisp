@@ -771,10 +771,16 @@ defmodule BeamLisp.RT do
   # seq fns to BeamLisp.RT. Only arities whose semantics match
   # exactly get linked — everything else falls back to invoke.
   defp seed_links do
-    bif2 = [:+, :-, :*, :/, :<, :>, :<=, :>=, :==]
+    # beam-lisp name -> the Erlang BIF that implements it. Most spell
+    # the same, but Erlang writes `=<` where Clojure writes `<=`, so a
+    # name-is-the-BIF assumption silently linked `<=` to a function
+    # that does not exist: `(<= 1 2)` raised :erlang.<=/2 undefined
+    # while the chained `(<= 1 2 3)` went through invoke and worked.
+    bif2 = [{"+", :+}, {"-", :-}, {"*", :*}, {"/", :/}, {"<", :<}, {">", :>},
+            {"<=", :"=<"}, {">=", :>=}, {"==", :==}]
 
-    for op <- bif2 do
-      Env.put_link("core", to_string(op), {:erlang, %{2 => op}, nil})
+    for {name, op} <- bif2 do
+      Env.put_link("core", name, {:erlang, %{2 => op}, nil})
     end
 
     # Unary + - * are identity/negate on the BIFs; (= x) and friends
