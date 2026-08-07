@@ -223,6 +223,60 @@ demanded metadata-tolerance at every one, in exchange for per-symbol
 columns that nothing reports. A list is where evaluation happens, so
 a list is what an error names.
 
+## What a Lisp gets from the BEAM
+
+Clojure has the JVM; jank has LLVM. Neither has preemptive
+scheduling, supervision trees or live code replacement. That is the
+argument for putting a Lisp *here*.
+
+`defserver` compiles to a genuine `:gen_server` — not a lookalike:
+
+```clojure
+(defserver counter
+  (init [start] (ok start))
+  (handle-call :inc [_from state] (reply (inc state) (inc state)))
+  (handle-cast :reset [_state] (noreply 0)))
+
+(def c (server-start-link counter 10))
+(server-call c :inc)   ;=> 11
+(sys/get_state c)      ;=> 11
+```
+
+The generated module declares `@behaviour :gen_server`, so OTP's own
+tooling recognises it: `:sys.get_state/1` reads its state, `:observer`
+sees it, and a real `Supervisor` adopts it. The tests assert this with
+OTP's tools rather than with beam-lisp's client functions, because
+that distinction is the entire point. Every OTP return shape is
+expressible — replies, timeouts, `:hibernate`, `{:continue, term}`,
+`{:stop, …}`.
+
+Supervision trees are data, which is the one place a Lisp can say that
+literally:
+
+```clojure
+(supervise :one-for-one [(worker :w (fn [] (serve)))])
+```
+
+And code can be replaced in a process that never stops running:
+
+```console
+$ mix beam_lisp.run examples/hotswap.bl
+== a process is running, calling (version) in a loop ==
+so far: #{"v1"}
+== redefine (version) while it runs ==
+now:    #{"v1" "v2-HOTSWAPPED"}
+the worker was never restarted: true
+```
+
+Honest about the limits: the next call after a redefinition runs the
+new code, but a process already *inside* the old function finishes it,
+and in-flight state does not migrate. Only the code moves.
+
+Tracing exposes `:dbg` as data — with rails, because `:dbg` can take
+down a production node under load. A call cap (default 1000) is
+enforced inside the tracer process, and asserted in the suite rather
+than trusted.
+
 ## Relationship to jank
 
 Same language family, different host. jank : C++ interop ::
@@ -319,6 +373,9 @@ $ mix beam_lisp.run examples/jank_slice.bl # unmodified jank core.jank on the BE
 $ mix beam_lisp.run examples/threading.bl  # upstream ->, ->>, doto
 $ mix beam_lisp.run examples/transients.bl # transient build, and what it costs
 $ mix beam_lisp.run examples/sets.bl       # sets: membership, conj/disj, distinctness
+$ mix beam_lisp.run examples/server.bl     # a real gen_server, written in beam-lisp
+$ mix beam_lisp.run examples/supervision.bl # a crash, and OTP putting it back
+$ mix beam_lisp.run examples/hotswap.bl    # code replaced in a running process
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -330,7 +387,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 513 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 530 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
