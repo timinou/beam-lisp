@@ -182,6 +182,47 @@ Deliberate gaps, roughly in priority order:
   that remain are one narrow compiler gap and one upstream stub
   (`docs/jank-compat.md`)
 
+## Errors point at your code
+
+A generated module used to claim beam-lisp's own source, so every
+error named the compiler's internals instead of the program:
+
+```
+** (ArithmeticError) bad argument in arithmetic expression: 3 + nil
+    lib/beam_lisp/link.ex:56: BeamLisp.Ns.Errdemo.boom/1
+    (elixir) lib/enum.ex:1725: Enum."-map/2-lists^map/1-1-"/2
+```
+
+Now the reader threads `{line, col, file}` through the existing form
+metadata channel, the compiler stamps `line:` onto the quoted AST it
+emits, and `Module.create` is handed the real path:
+
+```
+** (ArithmeticError) bad argument in arithmetic expression
+    :erlang.+(3, nil)
+    /tmp/err.bl:5: BeamLisp.Ns.Errdemo.boom/1
+    … 6 frames in beam-lisp internals
+```
+
+Compile errors carry the same location, and say which form:
+
+```
+** (BeamLisp.CompileError) /tmp/err2.bl:3: binding forms must be even,
+   each a pattern and a value
+```
+
+AOT-compiled modules carry it too — those `.beam` files persist and
+are what a production stack trace hits long after the compiler that
+built them has exited.
+
+**Positions ride on lists only.** A symbol or a vector is as often a
+*shape token* as a value — a parameter, a binding name, a `def` name,
+a destructuring pattern — and there are ~65 places where the compiler
+matches those structurally. Carrying positions on them would have
+demanded metadata-tolerance at every one, in exchange for per-symbol
+columns that nothing reports. A list is where evaluation happens, so
+a list is what an error names.
+
 ## Relationship to jank
 
 Same language family, different host. jank : C++ interop ::
@@ -289,7 +330,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 488 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 513 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
