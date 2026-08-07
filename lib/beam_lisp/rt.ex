@@ -5,7 +5,7 @@ defmodule BeamLisp.RT do
   value, so compiled beam-lisp code calls them with plain `apply/2`.
   """
 
-  alias BeamLisp.{Env, LazySeq}
+  alias BeamLisp.{Env, LazySeq, Set}
 
   @multi_fn_tag :"$blfn"
 
@@ -74,6 +74,11 @@ defmodule BeamLisp.RT do
   def get({:"$transient", :map, key}, k, default),
     do: BeamLisp.Transient.get({:"$transient", :map, key}, k, default)
 
+  # A set is a function of its members: `(get #{:a :b} :a)` is `:a`,
+  # and `(get s x)` is `x` iff `x` is a member (default otherwise).
+  def get(%Set{} = s, x, default),
+    do: if(Set.member?(s, x), do: x, else: default)
+
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
@@ -96,6 +101,11 @@ defmodule BeamLisp.RT do
   # seq/next just delegate to the entry list — what lets reduce, keys, vals,
   # frequencies and group-by iterate a map. Elixir maps preserve insertion
   # order, so entry order is deterministic.
+  # A set is a collection too — first/rest/next/seq read its members.
+  # A set is a struct, so these MUST precede the is_map clause or they
+  # would iterate the struct's fields instead.
+  def first(%Set{} = s), do: Set.to_list(s) |> List.first()
+
   def first(m) when is_map(m), do: first(map_entries(m))
 
   def rest(nil), do: []
@@ -109,6 +119,8 @@ defmodule BeamLisp.RT do
       [_ | t] -> t
     end
   end
+
+  def rest(%Set{} = s), do: Set.to_list(s) |> tl()
 
   def rest(m) when is_map(m), do: rest(map_entries(m))
 
@@ -130,6 +142,8 @@ defmodule BeamLisp.RT do
       [_ | t] -> next_tail(t)
     end
   end
+
+  def next(%Set{} = s), do: next(Set.to_list(s))
 
   def next(m) when is_map(m), do: next(map_entries(m))
 
@@ -174,6 +188,15 @@ defmodule BeamLisp.RT do
   def conj(xs, x) when is_list(xs), do: [x | xs]
   def conj(%BeamLisp.Vector{} = v, x), do: BeamLisp.Vector.conj(v, x)
   def conj(%LazySeq{} = l, x), do: [x | l]
+  # Set conj adds an element (idempotent). A set is a struct, so this
+  # must precede the map-entry clause below — a set of vectors is legal
+  # and must not be mistaken for a map being conj-ed a [k v] entry.
+  def conj(%Set{} = s, x), do: Set.add(s, x)
+
+  # Map conj with a `[k v]` entry (as `find` returns) adds that entry —
+  # what select-keys does: `(conj acc (find m k))`.
+  def conj(m, %BeamLisp.Vector{items: {k, v}}) when is_map(m) and not is_struct(m),
+    do: Map.put(m, k, v)
 
   def count(nil), do: 0
   def count(xs) when is_list(xs), do: length(xs)
@@ -182,6 +205,7 @@ defmodule BeamLisp.RT do
   # (A lazy seq quietly counted 3, its field count, for any length.)
   def count(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.count(v)
   def count(%LazySeq{} = l), do: LazySeq.count(l)
+  def count(%Set{} = s), do: Set.count(s)
   def count(m) when is_map(m), do: map_size(m)
   def count(s) when is_binary(s), do: String.length(s)
 
@@ -269,6 +293,15 @@ defmodule BeamLisp.RT do
     end
   end
 
+  # A set's seq is its members (nil when empty); the empty set is falsy
+  # in `(when (seq s) …)`, like any other empty collection.
+  def seq(%Set{} = s) do
+    case Set.to_list(s) do
+      [] -> nil
+      members -> members
+    end
+  end
+
   # A map's seq is its [k v] entries (nil when empty), so `(seq {:a 1})`
   # iterates like Clojure.
   def seq(m) when is_map(m), do: seq(map_entries(m))
@@ -306,6 +339,10 @@ defmodule BeamLisp.RT do
   def contains?(%BeamLisp.Vector{} = v, i) when is_integer(i),
     do: i >= 0 and i < BeamLisp.Vector.count(v)
 
+  # Set contains? is MEMBERSHIP (a set is a struct-map, so this must
+  # precede the is_map clause which would check the :members field).
+  def contains?(%Set{} = s, x), do: Set.member?(s, x)
+
   def contains?(m, k) when is_map(m), do: Map.has_key?(m, k)
   def contains?(_coll, _k), do: false
 
@@ -332,12 +369,172 @@ defmodule BeamLisp.RT do
   def coll?(%BeamLisp.Vector{}), do: true
   def coll?(m) when is_map(m), do: true
   def coll?(%LazySeq{}), do: true
+  def coll?(%Set{}), do: true
   def coll?(_), do: false
 
   @doc "`ident?`: a keyword or a symbol."
   def ident?(x) when is_atom(x), do: x not in [true, false, nil]
   def ident?({:symbol, _}), do: true
   def ident?(_), do: false
+
+  # --- sets ---------------------------------------------------------
+  # The set type (BeamLisp.Set, a MapSet wrapper). `#{...}` literals are
+  # a reader concern not yet wired; these fns build and read sets.
+
+  @doc "`(set coll)` — a set of the distinct elements of coll; a set input is returned unchanged."
+  def set(%Set{} = s), do: s
+  def set(coll), do: coll |> seq() |> set_from_seq()
+
+  defp set_from_seq(nil), do: Set.new()
+  defp set_from_seq(s), do: Set.new(seq_to_args(s))
+
+  @doc "`set?`: true for a set."
+  def set?(%Set{}), do: true
+  def set?(_), do: false
+
+  @doc "`(disj set x)` — the set without x (idempotent)."
+  def disj(%Set{} = s, x), do: Set.del(s, x)
+
+  @doc "`sequential?`: a list, vector, or lazy seq — never a map, set, or string."
+  def sequential?(%BeamLisp.Vector{}), do: true
+  def sequential?(%LazySeq{}), do: true
+  def sequential?(x) when is_list(x), do: true
+  def sequential?(_), do: false
+
+  @doc """
+  `(tree-seq branch? children root)` — depth-first traversal of the tree
+  rooted at `root`, yielding `root` then each child subtree in turn.
+  Realized eagerly (a finite flatten input); Clojure's is lazy, but the
+  emitted sequence is identical.
+  """
+  def tree_seq(branch?, children, root) do
+    if invoke(branch?, [root]) do
+      kids = invoke(children, [root]) |> seqable() |> Enum.flat_map(&tree_seq(branch?, children, &1))
+      [root | kids]
+    else
+      [root]
+    end
+  end
+
+  # --- sort / compare ------------------------------------------------
+
+  @doc """
+  `(compare a b)` — a total order over the common beam-lisp types,
+  mirroring Clojure: nil < false < true < numbers < strings < symbols <
+  keywords < collections < anything else. Within a type, natural order
+  (numeric, lexicographic, element-wise for collections). Not covered:
+  the JVM-specific interop cases (chars, regexes, other Java types) —
+  those fall to a generic rank.
+  """
+  def compare(a, b) do
+    cond do
+      a == b -> 0
+      rank(a) != rank(b) -> sign(rank(a) - rank(b))
+      true -> cmp_same(rank(a), a, b)
+    end
+  end
+
+  defp rank(nil), do: 0
+  defp rank(false), do: 1
+  defp rank(true), do: 2
+  defp rank(x) when is_number(x), do: 3
+  defp rank(x) when is_binary(x), do: 4
+  defp rank({:symbol, _}), do: 5
+  defp rank(x) when is_atom(x), do: 6
+  defp rank(%BeamLisp.Vector{}), do: 7
+  defp rank(%LazySeq{}), do: 7
+  defp rank(%Set{}), do: 7
+  defp rank(x) when is_list(x), do: 7
+  defp rank(x) when is_map(x), do: 7
+  defp rank(_), do: 8
+
+  defp cmp_same(3, a, b), do: sign_num(a, b)
+  defp cmp_same(4, a, b), do: sign_str(a, b)
+  defp cmp_same(5, a, b), do: sign_str(sym_name(a), sym_name(b))
+  defp cmp_same(6, a, b), do: sign_str(Atom.to_string(a), Atom.to_string(b))
+  defp cmp_same(7, a, b), do: compare_seqs(a, b)
+  defp cmp_same(_, _, _), do: 0
+
+  defp sign_num(a, b) when a < b, do: -1
+  defp sign_num(_a, _b), do: 1
+  defp sign_str(a, b) when a < b, do: -1
+  defp sign_str(_a, _b), do: 1
+  defp sign(n) when n < 0, do: -1
+  defp sign(n) when n > 0, do: 1
+  defp sign(_), do: 0
+
+  defp sym_name({:symbol, n}), do: n
+
+  defp compare_seqs(a, b) do
+    # seq of a vector is the vector itself (a struct), so normalize both
+    # operands to plain lists before walking element-wise.
+    compare_lists(seq_to_args(seq(a)), seq_to_args(seq(b)))
+  end
+
+  defp compare_lists([], []), do: 0
+  defp compare_lists([], _), do: -1
+  defp compare_lists(_, []), do: 1
+
+  defp compare_lists([ha | ta], [hb | tb]) do
+    case compare(ha, hb) do
+      0 -> compare_lists(ta, tb)
+      c -> c
+    end
+  end
+
+  @doc "`(sort coll)` / `(sort comp coll)` — a stable sorted seq (a list)."
+  def sort(coll), do: sort(&compare/2, coll)
+
+  def sort(comp, coll) do
+    coll |> seqable() |> Enum.sort(fn a, b -> invoke(comp, [a, b]) <= 0 end) |> empty_contract()
+  end
+
+  # --- cpp/* interop ------------------------------------------------
+  # jank writes `(cpp/jank.runtime.name x)` for its C++ primitives.
+  # beam-lisp maps that qualified name onto a BEAM function with the
+  # same semantics, so upstream core.jank slices load unchanged.
+
+  @doc "jank's `cpp/jank.runtime.name`: the name String of a string, symbol, or keyword."
+  def name_of(x) when is_binary(x), do: x
+  def name_of({:symbol, n}), do: name_part(n)
+  def name_of(x) when is_atom(x) and x not in [true, false, nil], do: name_part(Atom.to_string(x))
+  def name_of(_), do: nil
+
+  @doc "jank's `cpp/jank.runtime.namespace_`: the namespace String, or nil."
+  def namespace_of({:symbol, n}), do: ns_part(n)
+  def namespace_of(x) when is_atom(x) and x not in [true, false, nil], do: ns_part(Atom.to_string(x))
+  def namespace_of(_), do: nil
+
+  @doc "jank's `cpp/jank.runtime.keyword`: a keyword with the given namespace and name."
+  def keyword_of(ns, name) when is_binary(name) do
+    {ns, name} = split_keyword(ns, name)
+    if is_nil(ns), do: String.to_atom(name), else: String.to_atom(ns <> "/" <> name)
+  end
+
+  def keyword_of(ns, {:symbol, n}), do: keyword_of(ns, n)
+
+  defp split_keyword(nil, name) do
+    case String.split(name, "/", parts: 2) do
+      [ns, n] -> {ns, n}
+      _ -> {nil, name}
+    end
+  end
+
+  defp split_keyword(ns, name), do: {ns, name}
+
+  defp name_part(n) do
+    case String.split(n, "/", parts: 2) do
+      [_, name] -> name
+      _ -> n
+    end
+  end
+
+  defp ns_part(n) do
+    case String.split(n, "/", parts: 2) do
+      [ns, _] -> ns
+      _ -> nil
+    end
+  end
 
   @doc """
   Clojure `=`: for lazy operands, realize-and-compare element-wise with
@@ -385,6 +582,9 @@ defmodule BeamLisp.RT do
   defp map_entries(m), do: for({k, v} <- m, do: %BeamLisp.Vector{items: {k, v}})
 
   defp seqable(nil), do: []
+  # A set is a struct-map; iterating it via Enum would walk its fields,
+  # so map/filter read its members instead.
+  defp seqable(%Set{} = s), do: Set.to_list(s)
   defp seqable(coll), do: coll
 
   def map(f, coll) do
@@ -539,6 +739,11 @@ defmodule BeamLisp.RT do
   @doc "Clojure `assoc`: maps get a key update, vectors an index update (append at count)."
   def assoc(coll, k, v)
   def assoc(%BeamLisp.Vector{} = v, i, x), do: BeamLisp.Vector.assoc(v, i, x)
+  # A set is a struct (and so a map) — this must precede the is_map
+  # clause or assoc would silently add a field to the struct. Clojure
+  # raises; fail loudly instead of corrupting the set's shape.
+  def assoc(%Set{}, _k, _v),
+    do: raise(ArgumentError, "assoc not supported on a set")
   def assoc(coll, k, v) when is_map(coll), do: Map.put(coll, k, v)
   def assoc(nil, k, v), do: Map.put(%{}, k, v)
 
@@ -578,6 +783,14 @@ defmodule BeamLisp.RT do
     body = Enum.map_join(elems, " ", &print_elem/1)
     suffix = if truncated, do: " …", else: ""
     "(" <> body <> suffix <> ")"
+  end
+
+  # A set prints as `#{…}`. The `"#" <> "{"` splice avoids the `#{`
+  # Elixir-interpolation pitfall. (A set is a struct-map, so this must
+  # precede the is_map clause.)
+  def print_str(%Set{} = s) do
+    body = s |> Set.to_list() |> Enum.map_join(" ", &print_elem/1)
+    "#" <> "{" <> body <> "}"
   end
 
   def print_str(m) when is_map(m) do
@@ -628,6 +841,9 @@ defmodule BeamLisp.RT do
   defp to_str(nil), do: ""
   defp to_str(x) when is_binary(x), do: x
   defp to_str(x) when is_atom(x), do: Atom.to_string(x)
+  # A symbol stringifies to its name — `(str 'foo)` is "foo", which
+  # jank's keyword ctor needs (`(cpp/jank.runtime.keyword nil (str name))`).
+  defp to_str({:symbol, name}), do: name
   defp to_str(x), do: to_string(x)
 
   # Fresh, collision-proof symbol datum for hand-written macros. Shares
@@ -727,7 +943,16 @@ defmodule BeamLisp.RT do
       "vector?" => &vector?/1,
       "list?" => &list?/1,
       "coll?" => &coll?/1,
-      "ident?" => &ident?/1
+      "ident?" => &ident?/1,
+      # sets (wave 18)
+      "set" => &set/1,
+      "set?" => &set?/1,
+      "disj" => &disj/2,
+      "sequential?" => &sequential?/1,
+      "tree-seq" => &tree_seq/3,
+      # sort / compare (wave 18)
+      "compare" => &compare/2,
+      "sort" => multi_fn(%{1 => &sort/1, 2 => &sort/2})
     })
 
     # Reference types: atoms, futures, promises. All plain Refs
@@ -763,6 +988,19 @@ defmodule BeamLisp.RT do
 
     prims = Map.merge(prims, transient_prims)
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
+
+    # cpp/* interop: jank calls its C++ primitives under the `cpp`
+    # namespace (`(cpp/jank.runtime.name x)`). beam-lisp maps that
+    # qualified name onto a BEAM function with the same semantics, so
+    # upstream core.jank slices load and call unchanged — no fixture
+    # edit, the resolution target namespace just happens to be `cpp`.
+    cpp_prims = %{
+      "jank.runtime.name" => &name_of/1,
+      "jank.runtime.namespace_" => &namespace_of/1,
+      "jank.runtime.keyword" => &keyword_of/2
+    }
+
+    Enum.each(cpp_prims, fn {name, f} -> Env.intern("cpp", name, f) end)
     seed_links()
     :ok
   end
@@ -834,7 +1072,12 @@ defmodule BeamLisp.RT do
       "vector?" => 1,
       "list?" => 1,
       "coll?" => 1,
-      "ident?" => 1
+      "ident?" => 1,
+      "set" => 1,
+      "set?" => 1,
+      "disj" => 2,
+      "sequential?" => 1,
+      "compare" => 2
     }
 
     for {name, spec} <- rt_fns do
@@ -846,6 +1089,15 @@ defmodule BeamLisp.RT do
 
       Env.put_link("core", name, {BeamLisp.RT, %{arity => fname}, nil})
     end
+
+    # `sort` is multi-arity: both the comparator-less and comparator
+    # forms link directly to the same fn name (arity splits the call).
+    Env.put_link("core", "sort", {BeamLisp.RT, %{1 => :sort, 2 => :sort}, nil})
+
+    # `tree-seq` is 3-arity and dash-named; the integer-spec loop would
+    # mangle it to `:"tree-seq"`, so link it explicitly (the prelude
+    # loop maps dashed names only for 2-arity fns).
+    Env.put_link("core", "tree-seq", {BeamLisp.RT, %{3 => :tree_seq}, nil})
 
     # gensym links both arities directly — plain name, no mangling.
     Env.put_link("core", "gensym", {BeamLisp.RT, %{0 => :gensym, 1 => :gensym}, nil})
