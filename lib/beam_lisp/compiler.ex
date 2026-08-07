@@ -35,7 +35,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try)
+  @special_forms ~w(ns def fn defn defmacro defmulti defmethod defprotocol extend-type extend-protocol let loop recur if do quote syntax-quote receive throw try loop* let* fn*)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -89,6 +89,11 @@ defmodule BeamLisp.Compiler do
   def compile(form, _env)
       when is_number(form) or is_binary(form) or is_boolean(form) or is_nil(form),
       do: form
+
+  # Form metadata is source-location info: strip it before codegen so a
+  # meta-carrying form compiles identically to the bare form, and the
+  # metadata never reaches a runtime value (= and printing are unaffected).
+  def compile({:meta, form, _m}, env), do: compile(form, env)
 
   def compile({:keyword, name}, _env), do: String.to_atom(name)
 
@@ -148,13 +153,13 @@ defmodule BeamLisp.Compiler do
         # the macro's business, not ours).
         case macro_for(env.ns, name) do
           {:ok, macro_fn} ->
-            compile(expand_macro(macro_fn, args), env)
+            compile(expand_macro(macro_fn, {:list, [{:symbol, name} | args]}, args, env), env)
 
           :error ->
             arg_asts = compile_args(args, env)
 
             linked =
-              case Env.link(env.ns, name) do
+              case Env.link(env.ns, core_qualified(name)) do
                 {:ok, info} -> linked_call(info, arg_asts)
                 :error -> nil
               end
@@ -265,13 +270,12 @@ defmodule BeamLisp.Compiler do
     do: compile_def(name, compile(init, notail(env)), env, doc)
 
   defp compile_special("fn", args, env) do
-    clauses =
-      case args do
-        [{:symbol, _name} | clauses] -> fn_clauses(clauses)
-        clauses -> fn_clauses(clauses)
-      end
-
-    compile_fn(clauses, env)
+    case args do
+      # A named fn binds its own name to the fn value inside its body, so
+      # `(fn step [n] (step (- n 1)))` can recurse (doseq's builder does).
+      [{:symbol, name} | clauses] -> compile_fn(fn_clauses(clauses), env, name: name)
+      clauses -> compile_fn(fn_clauses(clauses), env)
+    end
   end
 
   defp compile_special("defn", [{:symbol, name} | rest], env) do
@@ -302,7 +306,12 @@ defmodule BeamLisp.Compiler do
         raise "defmacro #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
 
       true ->
-        compile_def(name, {:{}, [], [:"$macro", compile_fn(fn_clauses(rest), env)]}, env, doc)
+        compile_def(
+          name,
+          {:{}, [], [:"$macro", compile_fn(macro_clauses(fn_clauses(rest)), env, nil_rest: true)]},
+          env,
+          doc
+        )
     end
   end
 
@@ -436,6 +445,18 @@ defmodule BeamLisp.Compiler do
     self_applied = self_apply(self, inner_fn)
     {{:., [], [self_applied]}, [], arg_asts}
   end
+
+
+  # The star-suffixed primitives beneath loop/let/fn, which upstream
+  # macros expand to (jank's threading macros use loop*, its head uses
+  # fn*/let*). Each shares its unstarred sibling's semantics.
+  defp compile_special("loop*", [{:vector, bindings} | body], env),
+    do: compile_special("loop", [{:vector, bindings} | body], env)
+
+  defp compile_special("let*", [{:vector, bindings} | body], env),
+    do: compile_special("let", [{:vector, bindings} | body], env)
+
+  defp compile_special("fn*", args, env), do: compile_special("fn", args, env)
 
   defp compile_special("recur", args, env) do
     case env.recur do
@@ -804,9 +825,23 @@ defmodule BeamLisp.Compiler do
   # Macros resolve at compile time against the live registry, so a
   # defmacro must precede its callers in the same session.
   defp macro_for(ns, name) do
-    case Env.fetch(ns, name) do
+    case Env.fetch(ns, core_qualified(name)) do
       {:ok, {:"$macro", m}} -> {:ok, m}
       _ -> :error
+    end
+  end
+
+  # jank names its core `clojure.core` for Clojure compatibility; beam-lisp's
+  # core ns is `core`. Rewrite the qualified prefix so upstream
+  # `clojure.core/…` references resolve unchanged. Compiler-side, because
+  # Env.candidates/2 (which owns the resolution rules) lives in env.ex.
+  defp core_alias("clojure.core"), do: "core"
+  defp core_alias(ns), do: ns
+
+  defp core_qualified(name) do
+    case String.split(name, "/", parts: 2) do
+      ["clojure.core", var] -> "core/" <> var
+      _ -> name
     end
   end
 
@@ -815,11 +850,17 @@ defmodule BeamLisp.Compiler do
   # Vectors-as-data round-trip as `%BeamLisp.Vector{}`, which is why
   # macros needed a real vector type: `(fn [x] …)` and `[x]` must
   # not collapse into each other.
-  defp expand_macro(macro_fn, args) do
-    args
-    |> Enum.map(&datum/1)
+  defp expand_macro(macro_fn, form, args, env) do
+    [datum(form), macro_env(env) | Enum.map(args, &datum/1)]
     |> then(&BeamLisp.RT.invoke(macro_fn, &1))
     |> data_to_form()
+  end
+
+  # `&env`: the call site's locals as a map of symbol => name. beam-lisp
+  # locals are compiler AST vars (not inspectable data), so the NAMES are
+  # the useful surface — `(contains? &env 'x)` sees the call site's locals.
+  defp macro_env(env) do
+    Map.new(env.locals, fn {name, _var} -> {{:symbol, name}, name} end)
   end
 
   defp data_to_form({:symbol, _name} = sym), do: sym
@@ -835,6 +876,11 @@ defmodule BeamLisp.Compiler do
 
   defp data_to_form(a) when is_atom(a) and a not in [nil, true, false],
     do: {:keyword, Atom.to_string(a)}
+
+  # A `{:meta, form, m}` datum wrapper survives the boundary as a form
+  # node; nil metadata is cleared (the bare form).
+  defp data_to_form({:meta, form, nil}), do: data_to_form(form)
+  defp data_to_form({:meta, form, m}), do: {:meta, data_to_form(form), m}
 
   defp data_to_form(lit), do: lit
 
@@ -889,7 +935,9 @@ defmodule BeamLisp.Compiler do
   defp synq_list(items, env, g) do
     Enum.reduce(Enum.reverse(items), {[], g}, fn
       {:list, [{:symbol, "unquote-splicing"}, x]}, {acc, gacc} ->
-        {{:++, [], [compile(x, notail(env)), acc]}, gacc}
+        # `~@` splices any seqable, not just a list — jank's own macros
+        # splice binding *vectors*, and `++` demands a list.
+        {quote(do: BeamLisp.RT.splice(unquote(compile(x, notail(env))), unquote(acc))), gacc}
 
       item, {acc, gacc} ->
         {item_ast, g2} = synq_data(item, env, gacc)
@@ -1008,6 +1056,18 @@ defmodule BeamLisp.Compiler do
     end)
   end
 
+  # Every macro fn receives `&form`/`&env` as its first two params — the
+  # whole call form and the compile-time env — whether or not the body
+  # names them. Inject them so `&form`/`&env` resolve as locals;
+  # expand_macro always prepends the matching values.
+  defp macro_clauses([{params, body} | rest]),
+    do: [{macro_params(params), body} | macro_clauses(rest)]
+
+  defp macro_clauses([]), do: []
+
+  defp macro_params([{:symbol, "&form"}, {:symbol, "&env"} | _] = p), do: p
+  defp macro_params(p), do: [{:symbol, "&form"}, {:symbol, "&env"} | p]
+
   # A single-arity fn compiles to a real Elixir fn — passable to
   # `Enum`, storable in a var, callable via `apply/2`. Elixir fns are
   # fixed-arity, so multi-clause and variadic fns get a tag that
@@ -1017,11 +1077,16 @@ defmodule BeamLisp.Compiler do
   # fn is wrapped in self-application, and `recur` in tail position
   # re-enters it in constant stack. Inner fns shadow outer targets,
   # so recur never crosses a fn boundary.
-  defp compile_fn(clauses, env) do
+  defp compile_fn(clauses, env, opts \\ []) do
+    nil_rest = Keyword.get(opts, :nil_rest, false)
+    fn_name = Keyword.get(opts, :name)
+
     compiled =
       Enum.map(clauses, fn {params, body} ->
         self = fresh_var("fnself")
-        {head_vars, body_ast, fixed_count, variadic?} = compile_clause(env, params, body, %{self: self})
+
+        {head_vars, body_ast, fixed_count, variadic?} =
+          compile_clause(env, params, body, %{self: self}, nil_rest, fn_name)
         fn_ast = self_apply(self, {:fn, [], [{:->, [], [head_vars, body_ast]}]})
 
         if variadic? do
@@ -1064,23 +1129,48 @@ defmodule BeamLisp.Compiler do
   # caller picks the recur target via `recur_spec` (`%{self: var}`
   # for anonymous fns, `%{self_call: {mod, fname}}` for linked
   # defns) and decides how to wrap the result.
-  defp compile_clause(env, params, body, recur_spec) do
+  defp compile_clause(env, params, body, recur_spec, nil_rest \\ false, fn_name \\ nil) do
     {fixed, rest} = split_variadic(params)
     {head_vars, preludes, clause_env} = bind_params(env, fixed)
 
-    {head_vars, clause_env} =
+    {head_vars, rest_prelude, clause_env} =
       case rest do
         nil ->
-          {head_vars, clause_env}
+          {head_vars, [], clause_env}
 
         {:symbol, name} ->
           rest_var = fresh_var(name)
-          {head_vars ++ [rest_var], put_local(clause_env, name, rest_var)}
+
+          if nil_rest do
+            # jank binds a macro's trailing `& rest` to nil when there are
+            # no extra args (`(variadic)` == nil in jank's own test); the
+            # if-let/when-let assert-macro-args checks `(nil? oldform)`.
+            # beam-lisp fns keep Clojure's `()` for an empty rest (tested
+            # in wave2); only macros normalize to nil.
+            raw = fresh_var("rest")
+            norm = quote do: (if unquote(raw) == [], do: nil, else: unquote(raw))
+            {head_vars ++ [raw], [{:=, [], [rest_var, norm]}], put_local(clause_env, name, rest_var)}
+          else
+            {head_vars ++ [rest_var], [], put_local(clause_env, name, rest_var)}
+          end
       end
 
     recur = Map.put(recur_spec, :arity, length(head_vars))
     fn_env = %{clause_env | recur: recur, tail: true}
-    body_ast = block(preludes ++ [block_forms(body, fn_env)])
+
+    # A named fn sees its own name bound to the fn itself (`self.(self)`
+    # recovers the real clause fn from the self-application wrapper),
+    # enabling self-recursion. Only anonymous `(fn name …)` sets fn_name.
+    fn_env =
+      if fn_name do
+        self = recur_spec[:self]
+        self_app = {{:., [], [self]}, [], [self]}
+        put_local(fn_env, fn_name, self_app)
+      else
+        fn_env
+      end
+
+    body_ast = block(preludes ++ rest_prelude ++ [block_forms(body, fn_env)])
     {head_vars, body_ast, length(fixed), rest != nil}
   end
 
@@ -1280,6 +1370,7 @@ defmodule BeamLisp.Compiler do
   # recognize them, keywords become atoms, everything else is itself.
   defp datum({:symbol, name}), do: {:symbol, name}
   defp datum({:keyword, name}), do: String.to_atom(name)
+  defp datum({:meta, form, m}), do: {:meta, datum(form), m}
   defp datum({:list, items}), do: Enum.map(items, &datum/1)
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {datum(k), datum(v)} end)
@@ -1312,7 +1403,7 @@ defmodule BeamLisp.Compiler do
   defp multi_var_target(env, name) do
     case String.split(name, "/", parts: 2) do
       ["", _rest] -> {env.ns, name}
-      [prefix, var] -> {Env.alias_target(env.ns, prefix) || prefix, var}
+      [prefix, var] -> {Env.alias_target(env.ns, prefix) || core_alias(prefix), var}
       [plain] -> {env.ns, plain}
     end
   end
@@ -1337,6 +1428,8 @@ defmodule BeamLisp.Compiler do
         {:var, env.ns, name}
 
       [prefix, fun] ->
+        prefix = core_alias(prefix)
+
         cond do
           target = Env.alias_target(env.ns, prefix) -> {:var, target, fun}
           uppercase?(prefix) -> {:remote, Module.concat([prefix]), String.to_atom(fun)}

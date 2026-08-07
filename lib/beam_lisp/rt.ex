@@ -45,10 +45,30 @@ defmodule BeamLisp.RT do
   def invoke(kw, [m]) when is_atom(kw), do: get(m, kw)
   def invoke(kw, [m, default]) when is_atom(kw), do: get(m, kw, default)
 
+  # Vectors are functions of their indices: `([a b] 1)` ≡ `(nth [a b] 1)`,
+  # which is how jank's doseq indexes its binding vector.
+  def invoke(%BeamLisp.Vector{} = v, [i]) when is_integer(i), do: BeamLisp.Vector.nth(v, i)
+
+  @doc """
+  `~@` splicing. Clojure splices any seqable onto the rest of the form,
+  so a spliced vector or lazy seq must flatten like a list — jank's
+  macros splice binding vectors.
+  """
+  def splice(spliced, tail), do: to_list(spliced) ++ tail
+
+  defp to_list(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.to_list(v)
+  defp to_list(nil), do: []
+  defp to_list(xs) when is_list(xs), do: xs
+  defp to_list(other), do: Enum.to_list(other)
+
   @doc "A first-class handle to a remote function, e.g. `(map String/upcase xs)`."
   def remote_fun(module, fun), do: {:"$remote", module, fun}
 
   def get(m, key, default \\ nil)
+  # A vector is a struct, so it is also a map — index access must be
+  # matched before the map clause or `(get [a b] 1)` silently yields
+  # the default.
+  def get(%BeamLisp.Vector{} = v, i, _default), do: BeamLisp.Vector.nth(v, i)
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
