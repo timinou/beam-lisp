@@ -63,5 +63,12 @@ defmodule BeamLisp.Loader do
     end)
   end
 
-  defp search_dirs, do: Env.load_paths() ++ [File.cwd!()]
+  # priv/ ships beam-lisp's own libraries (optics, rewrite, …). They are
+  # not part of the prelude — you pay for them only by requiring them —
+  # but they must be findable without the user knowing where the
+  # application was installed, so priv comes last: a project file of the
+  # same name still wins.
+  defp search_dirs do
+    Env.load_paths() ++ [File.cwd!(), Application.app_dir(:beam_lisp, "priv")]
+  end
 end
