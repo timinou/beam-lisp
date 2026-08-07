@@ -175,9 +175,10 @@ Deliberate gaps, roughly in priority order:
   the strict path, so bounded `(range n)` is eager (`PLAN-010`)
 - **transients** — the trie has the structure for them; bulk builds
   would stop path-copying
-- **jank stdlib convergence** — 13 of 21 attempted `core.jank` slices
-  run unmodified today; the remaining eight are macro-level gaps,
-  measured and ranked in `docs/jank-compat.md`
+- **jank stdlib convergence** — every one of the 21 attempted
+  `core.jank` slices now runs unmodified; the next step is a bigger
+  sample, since one that fully passes has stopped being informative
+  (`docs/jank-compat.md`)
 
 ## Relationship to jank
 
@@ -189,22 +190,34 @@ have to be an opinion. It can be a test.
 `test/fixtures/jank/` holds 21 blocks of jank's `core.jank`, vendored
 byte-for-byte from upstream commit `3028594`, each carrying a sha256
 that the test suite asserts — so making a slice pass by editing it
-would fail the build rather than quietly inflate the claim. All 21
-read and compile. **13 of 21 load and behave correctly**, including
-`comp`, `juxt`, `partial`, `some`, `not-any?`, `trampoline`, `fnil`
-and `complement`, called with upstream's own docstring examples:
+would fail the build rather than quietly inflate the claim. **All 21
+load and behave correctly**, called with upstream's own docstring
+examples: the threading macros, `if-let`, `when-let`, `dotimes`,
+`doseq`, `doto`, `memoize`, `comp`, `juxt`, `partial`, `some`,
+`trampoline` and the rest — jank's own code, unmodified, on the BEAM:
 
 ```console
 $ mix beam_lisp.run examples/jank_slice.bl   # unmodified jank, running on the BEAM
+$ mix beam_lisp.run examples/threading.bl    # upstream ->, ->>, doto
 ```
 
 `docs/jank-compat.md` is the measurement: every slice with its
 verdict, every failure classified, and a build-next list ranked by
-how many slices each gap unlocks. It has already served that purpose
-once — the wave that built its top-ranked items (`next`, `list*`,
-variadic `apply`, the predicate layer, `#()` literals) moved the
-score from 7 to 13, and the eight that remain now hang off a single
-lever: the macro-authoring surface `assert-macro-args` needs.
+how many slices each gap unlocks. It has earned its keep twice — the
+wave that built its top-ranked items (`next`, `list*`, variadic
+`apply`, the predicate layer, `#()` literals) moved the score from 7
+to 13, and the wave after it (`loop*`, `&form`, form metadata,
+`assert-macro-args`) took it to 21. Along the way, loading real
+upstream code found three runtime bugs that beam-lisp's own tests had
+not: `~@` could not splice a vector, `get` on a vector silently
+returned the default because a vector is a struct and so is a map,
+and vectors were not callable as functions of their index.
+
+What that does *not* prove is equally worth stating: the slices were
+chosen as reachable candidates, and the band of `core.jank` built on
+jank's `cpp/*` runtime interop is untouched. A sample that fully
+passes has stopped being informative, so the next move is a larger
+and harder one.
 
 For the alternative design — embedding jank's C++ runtime in the BEAM
 as a NIF — see `!tasks/features/FEAT-001` where the tradeoffs are
