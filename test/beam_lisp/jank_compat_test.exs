@@ -54,7 +54,26 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_09_not_any.bl", "jank.accept.notany",
      "7138ca6278a5802672310d47aecdc3966ae0e1b640d111fa974ef1a19fbc8066"},
     {"slice_19_trampoline.bl", "jank.accept.trampoline",
-     "cfcc184828d5eec2cd564f6086cec74d1c8d21790eeb5bfb915aac4938e4df67"}
+     "cfcc184828d5eec2cd564f6086cec74d1c8d21790eeb5bfb915aac4938e4df67"},
+    # Promoted by wave 15 (loop*/let*/fn*, &form/&env, form metadata,
+    # the clojure.core alias, assert-macro-args) plus the seqable-splice
+    # and vector-as-function fixes. These complete the set.
+    {"slice_10_thread_macro.bl", "jank.accept.thread",
+     "5296714e41323bd79577ad97870205a3df9ff6889ffc38d659a3dfbcdb8f2e94"},
+    {"slice_11_thread_last_macro.bl", "jank.accept.threadlast",
+     "0addfc66e734fdde1b3d7a937744e728bbc31006fe1b6c84bfd700882845c8eb"},
+    {"slice_13_if_let.bl", "jank.accept.iflet",
+     "a812ab2bcf40efe521789516656cd8bb90657ce05534b5c2269cac0b482f91ec"},
+    {"slice_14_when_let.bl", "jank.accept.whenlet",
+     "547eac4f781ff4d30c56a1ebff8b51b5bdb62e208d6f87a3510c46c78e0639fc"},
+    {"slice_16_dotimes.bl", "jank.accept.dotimes",
+     "4d75d74ce628508e005ec1107a61fc2ad573673f95ea3862b88ba29e3d3040d8"},
+    {"slice_17_doseq.bl", "jank.accept.doseq",
+     "059f290bc3d7f605fe3f4635ecb0e4c5753b8b484cae05717611778307cf994d"},
+    {"slice_18_doto.bl", "jank.accept.doto",
+     "e54541f5b3f8c479715d68ef87b00b06ecc20b858400c0f0724e2c9efc3a2856"},
+    {"slice_21_memoize.bl", "jank.accept.memoize",
+     "cfafa7e7689768fb12808200219a1a60a571b1b3a739706113164aafcd0fd707"}
   ]
 
   setup_all do
@@ -189,6 +208,87 @@ defmodule BeamLisp.JankCompatTest do
              (defn od? [n] (if (= n 0) false (fn [] (ev? (- n 1)))))
              (trampoline ev? 100000)
              """) == true
+    end
+    # --- promoted by wave 15: loop*/let*/fn*, &form/&env, form
+    # metadata, the clojure.core alias, assert-macro-args — plus the
+    # seqable `~@` splice and vector-as-function fixes those exposed.
+
+    test "-> threads through the first argument position" do
+      load_slice("slice_10_thread_macro.bl", "jank.accept.thread")
+      assert eval_in("jank.accept.thread", "(-> 5 (+ 3) (* 2))") == 16
+      assert eval_in("jank.accept.thread", "(-> 5 inc)") == 6
+      # a bare symbol form, not a list — the branch that needs seq?
+      assert eval_in("jank.accept.thread", "(-> 5)") == 5
+    end
+
+    test "->> threads through the last argument position" do
+      load_slice("slice_11_thread_last_macro.bl", "jank.accept.threadlast")
+      assert eval_in("jank.accept.threadlast", "(->> 5 (- 8))") == 3
+      assert eval_in("jank.accept.threadlast", "(->> [1 2 3] (map inc) (reduce + 0))") == 9
+    end
+
+    test "if-let binds only when the test is truthy" do
+      load_slice("slice_13_if_let.bl", "jank.accept.iflet")
+      assert eval_in("jank.accept.iflet", "(if-let [x 5] x :none)") == 5
+      assert eval_in("jank.accept.iflet", "(if-let [x nil] x :none)") == :none
+      assert eval_in("jank.accept.iflet", "(if-let [x false] x :none)") == :none
+    end
+
+    test "when-let binds and runs its body only when truthy" do
+      load_slice("slice_13_if_let.bl", "jank.accept.whenlet")
+      load_slice("slice_14_when_let.bl", "jank.accept.whenlet")
+      assert eval_in("jank.accept.whenlet", "(when-let [x 5] (* x 2))") == 10
+      assert eval_in("jank.accept.whenlet", "(when-let [x nil] (* x 2))") == nil
+    end
+
+    test "dotimes runs its body n times, binding the index" do
+      load_slice("slice_16_dotimes.bl", "jank.accept.dotimes")
+
+      assert eval_in("jank.accept.dotimes", """
+             (def acc (atom 0))
+             (dotimes [i 5] (swap! acc (fn [a] (+ a i))))
+             @acc
+             """) == 10
+    end
+
+    test "doseq walks a collection for side effects" do
+      load_slice("slice_13_if_let.bl", "jank.accept.doseq")
+      load_slice("slice_14_when_let.bl", "jank.accept.doseq")
+      load_slice("slice_17_doseq.bl", "jank.accept.doseq")
+
+      assert eval_in("jank.accept.doseq", """
+             (def total (atom 0))
+             (doseq [x [1 2 3 4]] (swap! total (fn [a] (+ a x))))
+             @total
+             """) == 10
+    end
+
+    test "doto threads a value through side-effecting forms and returns it" do
+      load_slice("slice_18_doto.bl", "jank.accept.doto")
+
+      # doto is the reason form metadata had to exist: it rebuilds each
+      # form with (with-meta … (meta f)).
+      assert eval_in("jank.accept.doto", """
+             (def seen (atom []))
+             (doto 7
+               (#(swap! seen conj %))
+               (#(swap! seen conj (* 2 %))))
+             """) == 7
+    end
+
+    test "memoize caches by argument list" do
+      load_slice("slice_13_if_let.bl", "jank.accept.memoize")
+      load_slice("slice_12_map_entries.bl", "jank.accept.memoize")
+      load_slice("slice_21_memoize.bl", "jank.accept.memoize")
+
+      # calls counts real invocations, so a cache hit must not bump it
+      assert eval_in("jank.accept.memoize", """
+             (def calls (atom 0))
+             (def slow (fn [n] (do (swap! calls inc) (* n n))))
+             (def fast (memoize slow))
+             (fast 4) (fast 4) (fast 4)
+             [(fast 4) @calls]
+             """) == BeamLisp.Vector.new([16, 1])
     end
   end
 end
