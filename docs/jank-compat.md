@@ -36,10 +36,11 @@ importantly — what to implement next to unlock the most.
    real verdict lands.
 
 > **`load` ≠ `behave`.** Many of the 120 slices read+compile ("load"); six
-> fail *at the reader/compiler itself* (`for` and `distinct` were reader
-> failures that waves later fixed; wave 24's `^{}`-metadata slices fail
-> there today). And only some of the loaded slices run correctly when
-> called. The verdicts below are behavioral — the checklist marks each.
+> failed at the reader/compiler itself (`for` and `distinct` were reader
+> failures that later waves fixed, and wave 25's reader `^{}`-metadata fix
+> cleared the last of them — every fixture loads now). And only some of the
+> loaded slices run correctly when called. The verdicts below are behavioral
+> — the checklist marks each.
 
 ## The checklist — 120 attempted slices
 
@@ -130,17 +131,17 @@ upstream span in `core.jank@3028594`.
 | 75 | peek | 1203–1208 | `peek` | ✓ | *was ✗* — `cpp/jank.runtime.peek` shimmed (vector-last / list-first) |
 | 76 | pop | 1209–1216 | `pop` | ✓ | *was ✗* — `cpp/jank.runtime.pop` shimmed |
 | 77 | volatile! | 1308–1315 | `volatile!` | ✓ | *was ✗* — reader `^{:inline (fn* …)}` now reads + `volatile_` shimmed (wave 25) |
-| 78 | bit-not | 1426–1432 | `bit-not` | ✗ | loads now (the `^{:inline}` reader gate is clear), but `cpp/jank.runtime.bit_not` is **not shimmed** — still fails at call |
+| 78 | bit-not | 1426–1432 | `bit-not` | ✓ | *was ✗* — the `cpp/jank.runtime.bit_not` shim row shipped (wave 26); its `^{:inline}` reader gate cleared in wave 25 |
 | 79 | not= | 1533–1540 | `not=` | ✓ | `not`/`=`/`apply` |
-| 80 | mod | 1693–1701 | `mod` | ✗ | `rem` still undefined in core |
+| 80 | mod | 1693–1701 | `mod` | ✓ | *was ✗* — `rem` shipped as a core prim (wave 26); truncates toward negative infinity, matching Clojure |
 | 81 | inc' | 1750–1774 | `inc'` | ✓ | *was ✗* — `cpp/jank.runtime.promoting_inc` shimmed (arbitrary-precision integers never overflow) |
 | 82 | unchecked-inc-int | 1825–1831 | `unchecked-inc-int` | ✗ | **upstream TODO stub** — `(throw "TODO: port unchecked-inc-int")` |
 | 83 | int? | 1930–1934 | `int?` | ✓ | *was ✗* — `cpp/jank.runtime.is_integer` shimmed |
 | 84 | pos-int? | 1935–1939 | `pos-int?` | ✓ | `int?` resolves to beam-lisp's native int?; `pos?` |
-| 85 | double? | 1950–1954 | `double?` | ✗ | `float?` still undefined in core |
+| 85 | double? | 1950–1954 | `double?` | ✓ | *was ✗* — `float?` shipped as a core prim (wave 26) |
 | 86 | nthnext | 2839–2847 | `nthnext` | ✓ | `seq`/`next`/`pos?` |
 | 87 | nthrest | 2848–2857 | `nthrest` | ✓ | `if-let`/`seq`/`rest` |
-| 88 | take-nth | 2858–2876 | `take-nth` | ✓ | coll arity; *transducer 1-arity needs `rem`* (new blocker — `volatile!` is done, its xform body uses `(rem i n)`) |
+| 88 | take-nth | 2858–2876 | `take-nth` | ✓ | coll arity; *transducer 1-arity now behaves too* — its xform body is `(rem i n)`, and `rem` shipped (wave 26) |
 | 89 | map | 2877–2926 | `map` | ✓ | all coll arities incl. multi-coll; the `chunked-seq?` branch is dead here (`chunked-seq?` is false), so the lazy path runs. *Transducer 1-arity behaves* (wave 25) |
 | 90 | map-indexed | 2943–2970 | `map-indexed` | ✓ | coll + *transducer 1-arity both behave* (wave 25) |
 | 91 | keep | 2971–3001 | `keep` | ✓ | coll arity; chunked branch dead |
@@ -151,9 +152,9 @@ upstream span in `core.jank@3028594`.
 | 96 | dorun | 3204–3216 | `dorun` | ✓ | `when-let` + top-level `recur` |
 | 97 | doall | 3217–3230 | `doall` | ✓ | needs the `dorun` slice co-loaded |
 | 98 | reductions | 3346–3361 | `reductions` | ✓ | *was ✗* — `reduced?` is now core |
-| 99 | into | 3362–3375 | `into` | ✗ | `transientable?` still undefined in core — loads, fails at call |
+| 99 | into | 3362–3375 | `into` | ◐ | *was ✗* — `transientable?` now ships, so its vector/reduce and `take`-xform paths behave. But it is **not** a full pass: `(into {} …)` still throws (the map-transient `conj!` clause is missing) and `(into [] (map inc) …)` still throws (`map` lacks its 1-arity transducer form). Two small remaining prim gaps, recorded below |
 | 100 | take-last | 3749–3758 | `take-last` | ✓ | `loop`/`drop` |
-| 101 | mapv | 3759–3777 | `mapv` | ◐ | 1-arity (transient) passes; multi-coll arities still need `into` + a multi-coll `map` — both still gaps |
+| 101 | mapv | 3759–3777 | `mapv` | ✓ | *was ◐* — the multi-coll arities are `(into [] (map f c1 c2 …))`; `into` and core multi-coll `map` shipped (wave 26), so all arities behave |
 | 102 | filterv | 3778–3789 | `filterv` | ✓ | transients + `persistent!` |
 | 103 | distinct? | 3838–3852 | `distinct?` | ✓ | the `#{}` set literal + `contains?` + `not=` |
 | 104 | filter | 3853–3882 | `filter` | ✓ | coll arity; chunked branch dead |
@@ -169,54 +170,49 @@ upstream span in `core.jank@3028594`.
 | 114 | ratio? | 5831–5835 | `ratio?` | ✓ | *was ✗* — `is_ratio` shimmed; genuinely always false (beam-lisp has no Ratio type) |
 | 115 | decimal? | 5846–5851 | `decimal?` | ✓ | *was ✗* — `is_big_decimal` shimmed; always false (no BigDecimal) |
 | 116 | sorted? | 6977–6981 | `sorted?` | ✓ | *was ✗* — `is_sorted` shimmed; always false (no sorted coll) |
-| 117 | splitv-at | 7448–7452 | `splitv-at` | ✗ | `(into [] (take n) coll)` — the transducer arity of `into`; loads but `into` (99) still fails on `transientable?`, and the `(take n)` 1-arity needs a transducer `take` |
-| 118 | update-vals | 7721–7735 | `update-vals` | ✗ | `reduce-kv` + `transientable?` undefined in core |
-| 119 | update-keys | 7736–7749 | `update-keys` | ✗ | `reduce-kv` undefined in core |
+| 117 | splitv-at | 7448–7452 | `splitv-at` | ✓ | *was ✗* — `(into [] (take n) coll)` needs `into`'s transducer arity (now on `transientable?`) and the 1-arity transducer `take`, both shipped (wave 26) |
+| 118 | update-vals | 7721–7735 | `update-vals` | ✓ | *was ✗* — `reduce-kv` + `transientable?` both shipped (wave 26) |
+| 119 | update-keys | 7736–7749 | `update-keys` | ✓ | *was ✗* — `reduce-kv` shipped (wave 26) |
 | 120 | NaN? | 7787–7791 | `NaN?` | ✓ | *was ✗* — `is_nan` shimmed; always false because beam-lisp cannot produce a NaN (no `##NaN` literal, `(/ 0.0 0.0)` raises, no Math module) |
 
 ## Counts — the headline
 
-> **109 of 120 attempted slices** load **and** behave correctly. The
-> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62 → 63 → 89 → 109**
-> across eleven waves, each aimed by this document's ranked gap list. Wave 25
+> **115 of 120 attempted slices** load **and** behave correctly. The
+> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62 → 63 → 89 → 109 → 115**
+> across twelve waves, each aimed by this document's ranked gap list. Wave 25
 > was a *re-measure*, not a widening: the wave-24 gap list named exactly what
 > the four headline gaps blocked, the gaps were built, and 20 of the 31
-> then-failing slices turned out to behave once measured. Nothing was patched
-> into passing — the fixtures are still byte-for-byte upstream and the
-> checksum test proves it. Where a slice needs another slice (`split-with`
-> needs `juxt`; `doall` needs `dorun`; `dedupe` needs `when-some`; `mapcat`
-> needs `complement`; `drop-last` needs the vendored multi-coll `map`;
-> `interpose` needs `interleave`), that dependency is `core.jank`'s own,
-> satisfied with unmodified upstream text.
+> then-failing slices turned out to behave once measured. Wave 26 was the
+> *payoff*: the seven remaining failures were exactly the "small core gaps"
+> the wave-24 list had ranked and wave 25 admitted were never built — and
+> this time they were. Nothing was patched into passing — the fixtures are
+> still byte-for-byte upstream and the checksum test proves it. Where a slice
+> needs another slice (`split-with` needs `juxt`; `doall` needs `dorun`;
+> `dedupe` needs `when-some`; `mapcat` needs `complement`; `drop-last` needs
+> the vendored multi-coll `map`; `interpose` needs `interleave`), that
+> dependency is `core.jank`'s own, satisfied with unmodified upstream text.
 >
-> **The re-measure is the deliverable.** The wave-24 ranked list predicted
-> which slices each gap would unlock; the honest check below ("prediction
-> vs outcome") says where that list was right and where it was wrong. The
-> headline: the `cpp/jank.runtime.*` shim, the reader `^{}`-metadata fix,
-> and `volatile!`/`vreset!`/`vswap!` together turned 20 failing slices into
-> behaving ones, and the transducer 1-arities that the shim+volatile pair
-> was built to complete now work. The *small-core-gaps* item in the wave-24
-> list (`rem`, `float?`, `transientable?`, `reduce-kv`, multi-coll `map`,
-> the `interleave` crash) was **not actually built** — only the `interleave`
-> crash was fixed as a side effect of self-hosting `interleave` in
-> `priv/core.bl`. That part of the prediction is where the list was wrong,
-> and the seven remaining failures are exactly those gaps.
+> **Wave 26 shipped the wave-25 failure list.** The seven real failures wave
+> 25 recorded were `transientable?` (into, update-vals, splitv-at),
+> `reduce-kv` (update-vals, update-keys), `rem` (mod, take-nth's transducer),
+> `float?` (double?), and the cpp shim's missing `bit_not` entry (bit-not).
+> Every one of those primitives shipped, and six of the seven affected slices
+> now load **and** behave (`mod`, `double?`, `bit-not`, `splitv-at`,
+> `update-vals`, `update-keys`), `take-nth`'s transducer arity unblocked, and
+> `mapv` upgraded from ◐ to ✓ (its multi-coll arities are `(into [] (map f
+> c1 c2 …))`, and `into` + core multi-coll `map` both shipped).
 >
-> The score now: **109 pass**, **7 real failures**, **4 upstream TODO stubs**.
-> The seven failures load (the reader accepts every form now) but compute a
-> wrong answer or raise at call time:
+> **One slice did not behave, and it was not promoted.** `into` (99) was the
+> worker's ninth claim, and the honest verdict is ◐, not ✓. `transientable?`
+> unblocked its vector/reduce and `take`-xform transducer paths, but two
+> common call shapes still throw at call time: `(into {} …)` (the
+> map-transient `conj!` clause is missing — `BeamLisp.Transient.conj!/2` only
+> handles vector and set transients) and `(into [] (map inc) …)` (core `map`
+> still lacks its 1-arity transducer form). Both are small prim gaps, recorded
+> in the taxonomy below. `into` stays un-promoted until they close.
 >
-> 1. **`transientable?`** (3 slices) — `into` (99), `update-vals` (118),
->    `splitv-at` (117, which also needs the transducer `take`);
-> 2. **`reduce-kv`** (2 slices) — `update-vals` (118), `update-keys` (119);
-> 3. **one-slice gaps** — `rem` (`mod`), `float?` (`double?`), and the
->    cpp shim's missing `bit_not` entry (`bit-not`), whose reader gate is
->    now clear.
+> The score now: **115 pass**, **`into` ◐ partial (2 remaining prim gaps)**, **4 upstream TODO stubs**. The four stubs load but throw by construction; they are recorded, never counted against beam-lisp.
 >
-> The four upstream stubs (`with-open`, `instance?`, `rseq`,
-> `unchecked-inc-int`) throw by construction and cannot pass anywhere,
-> jank included. They are recorded, never counted against beam-lisp.
-
 ### What wave 24 found that the previous sample hid
 
 - **The transducer family is cpp-shaped, not pure.** Every reduce/transduce
@@ -296,6 +292,42 @@ are the honest test of the wave-24 gap list.
   module exists. These are honest passes (correct for every reachable
   input) that happen to exercise no true branch.
 
+### What wave 26 found (the small-core-gaps backlog, actually built)
+
+Wave 26 built the primitives the wave-25 failure list named — `rem`,
+`float?`, `transientable?`, `reduce-kv`, the `cpp/jank.runtime.bit_not` shim
+row, plus `into` in core, a multi-coll `map`, and `take`'s transducer 1-arity
+— and re-measured the nine slices that had been blocked on them. The honest
+findings, each verified by calling the slice with its own docstring semantics:
+
+- **Six of the seven previously-failing slices now behave outright.** `mod`
+  (`rem`), `double?` (`float?`), `bit-not` (the `bit_not` shim row), and the
+  transducer forms `splitv-at` (`into`'s transducer arity + `take` 1-arity),
+  `update-vals` (`reduce-kv` + `transientable?`), and `update-keys`
+  (`reduce-kv`) all load and compute the right answer. `take-nth`'s
+  transducer arity (blocked on `rem`) behaves too.
+- **`mapv` upgraded from ◐ to ✓.** Its multi-coll arities are `(into [] (map
+  f c1 c2 …))`; with `into` and core multi-coll `map` both shipped, every
+  arity computes the right vector. The ◐ was a dependency on two slices that
+  are now both present.
+- **`into` was the one refusal.** `transientable?` unblocked its
+  vector/reduce and `take`-xform paths, but `(into {} …)` still throws —
+  `BeamLisp.Transient.conj!/2` has clauses only for vector and set transients,
+  not map — and `(into [] (map inc) …)` still throws because core `map` has
+  no 1-arity transducer form. Both are genuine call-time failures on common
+  usage, so `into` was **not** promoted; it is recorded ◐ below. Two small
+  prim gaps the wave-25 ranked list did *not* predict (it predicted
+  `transientable?` would fully unblock `into`; the predicate shipped but two
+  unlisted gaps surfaced when `into` was finally measured).
+- **The `conj` 1-arity completing form shipped too.** Wave 25 recorded it as
+  a latent gap; `(conj coll)` now returns `coll`, so `transduce`'s final
+  `(f ret)` step works with `conj` as the reducing fn.
+- **The sample is effectively exhausted.** With `into` ◐ and the four
+  upstream stubs (`with-open`, `instance?`, `rseq`, `unchecked-inc-int`)
+  throwing by construction, there are no *fully* loadable-but-failing slices
+  left to chase. The informative next moves are the two `into` gaps (below)
+  and a fourth widening of the sample — see "What to build next".
+
 ### `deftype` / `defrecord` — nothing to vendor
 
 The task list names `deftype`/`defrecord` users as a widening target. The
@@ -309,55 +341,34 @@ through this file. The one protocol-adjacent machinery `core.jank` does use
 
 ## Gap classification
 
-*Re-derived from the wave-25 sample — every gap is a *call-time* failure now,
-not a load failure. The reader accepts every form in the 120; the remaining
-seven failures load and then compute a wrong answer or raise. Items are
-ordered by unlock count.*
+*Re-derived from the wave-26 sample. The seven wave-25 failures are gone —
+`rem`, `float?`, `transientable?`, `reduce-kv`, and the `bit_not` shim row
+all shipped, and with them `mod`, `double?`, `bit-not`, `splitv-at`,
+`update-vals`, `update-keys`, `mapv` ✓, and `take-nth`'s transducer arity.
+What remains are two small prim gaps inside `into` (99), which stays ◐, and
+nothing else. Items are ordered by unlock count.*
 
-### 1. `transientable?` — the dominant blocker (3 slices + 1 upgrade)
+### 1. `conj!` has no map-transient clause (→ `(into {} …)`)
 
-`into`'s fast path branches on `(transientable? to)`; `update-vals` builds a
-`transient {}` fallback under the same predicate; `splitv-at` goes through
-`into`'s transducer arity; and `mapv`'s multi-coll arities are `(into []
-(map …))`. The predicate simply does not exist in beam-lisp's core. `into`
-remains the single biggest prize — it is the confluence of `reduce`, `conj!`,
-and `transduce` that the whole collection layer leans on, and it was the
-wave-24 list's #4 that was never actually built. `splitv-at` also needs the
-1-arity transducer `take` (`(into [] (take n) coll)`), which folds into the
-same transducer work.
+`into`'s fast path branches on `(transientable? to)`, and for a map target it
+reduces `conj!` over `(transient {})` — but `BeamLisp.Transient.conj!/2` has
+clauses only for vector and set transients. So `(into {} [[:a 1] [:b 2]])`
+— the single most common `into` usage after `(into [] …)` — throws at call
+time. The reduce fallback (`(reduce conj to from)`) would handle it
+correctly; the transient fast path just needs a map clause that `assoc!`s
+the entry, mirroring `conj`/`assoc!`. One clause closes `(into {} …)` and is
+the sole blocker between `into` and ✓ on its non-xform arities.
 
-### 2. `reduce-kv` (2 slices)
+### 2. `map` has no 1-arity transducer form (→ `(into [] (map f) coll)`)
 
-`update-vals` and `update-keys` both build through `(reduce-kv (fn [acc k v]
-(assoc! acc …)) …)`. Neither self-hosted `reduce-kv` nor a core prim exists.
-(`update-vals` is double-blocked — it also needs `transientable?`.)
+`(map f)` — the transducer arity — is undefined in beam-lisp core, so
+`(into [] (map inc) [1 2 3])` fails at xform construction, before `into`'s
+body even runs. Multi-coll `map` (`(map f c1 c2)`) ships; the 1-arity
+transducer form does not. Closing it unblocks `into`'s xform path with
+`map`-style transducers (the canonical idiom) and the standard
+`(transduce (map f) …)` call.
 
-### 3. Small one-slice gaps
-
-| prim | blocks | note |
-|------|--------|------|
-| `rem` | mod · take-nth's transducer (88) | `(rem i n)` — Erlang `:rem`; take-nth's xform is *newly* blocked here, its old `volatile!` blocker being gone |
-| `float?` | double? | upstream `double?` is `(float? x)` |
-| `cpp … bit_not` | bit-not | the one cpp shim entry still missing — its reader `^{:inline}` gate is cleared, so this is now a pure table addition |
-
-### 4. Multi-coll `map` in core (1 upgrade)
-
-`mapv`'s multi-coll arities still need a two-coll core `map` (and `into`).
-`drop-last` no longer counts here — it behaves via core.jank's own vendored
-multi-coll `map` (slice 89) co-loaded — but a *user* calling `(map f a b)`
-still hits beam-lisp's single-coll native `map`. Worth doing for user code;
-worth one slice upgrade (`mapv` ◐→✓).
-
-### 5. `conj` has no 1-arity completing form (latent)
-
-Discovered by the wave-25 transducer pass: `(conj coll)` is valid Clojure and
-is what transduce's final `(f ret)` step needs when `conj` is the reducing
-fn. beam-lisp's `conj` is fixed-2-arity, so `(transduce xform conj [] coll)`
-fails at the completing step. Every transducer xform in the sample works when
-driven with a completing-capable rf (`+`); this gap blocks the *standard*
-Clojure idiom, not any individual slice. One arity on `conj` closes it.
-
-### 6. Upstream stubs (not beam-lisp gaps)
+### 3. Upstream stubs (not beam-lisp gaps)
 
 `instance?`, `rseq`, `unchecked-inc-int`, and the already-known `with-open`
 are `(throw "TODO: port …")` stubs in `core.jank` itself. They load and then
@@ -366,29 +377,28 @@ so a future agent does not chase them.
 
 ## What to build next
 
-*Re-ranked by unlock count from the wave-25 reality. The three biggest
-wave-24 items (the cpp shim, the reader `^{}` fix, `volatile!`) are done and
-paid for — they are the 20 new passes. What remains is a much smaller,
-more precise list, and its top two items are exactly the wave-24 entries
-that were *predicted but never built*.*
+*Re-ranked from the wave-26 reality. Every item on the wave-25 list shipped
+— that backlog is closed. What remains is two one-line prim gaps that
+surface only inside `into` (99), plus the honest observation that this
+sample has no fully-loadable-but-failing slices left. Ordered by unlock
+value.*
 
-1. **`transientable?`** (→ `into`, `update-vals`, `splitv-at`, `mapv`
-   multi-coll). The highest-value remaining single primitive. `into` is
-   the collection layer's confluence point; a one-line predicate plus the
-   transducer arity of `take` closes three slices and upgrades `mapv`.
-2. **`reduce-kv`** (→ `update-vals`, `update-keys`). Self-hosted over the
-   map, or a core prim; two slices.
-3. **`rem`** (→ `mod`, take-nth's transducer). One Erlang BIF call; two
-   slices including the last `volatile!`-era holdout.
-4. **`float?`** (→ `double?`). One slice.
-5. **`cpp/jank.runtime.bit_not`** (→ `bit-not`). One table row in `rt.ex`;
-   completes the shim. `bit-not`'s reader gate is already clear, so this
-   slice is one registry entry from ✓.
-6. **Multi-coll `map` in core** (→ `mapv` ◐→✓, and fixes real user code).
-7. **`conj` 1-arity completing form** (→ the standard `(transduce xform conj
-   …)` idiom). A real core gap the transducer pass exposed.
+1. **`conj!` map-transient clause** (→ `(into {} …)`; makes `into` ✓ on its
+   reduce and `take`-xform paths). One clause in `BeamLisp.Transient.conj!/2`
+   that `assoc!`s the entry, mirroring `conj`/`assoc!`. The highest-value
+   remaining single change — it unblocks the most common `into` usage and
+   is the last blocker between `into` and a full pass.
+2. **`map` 1-arity transducer form** (→ `(into [] (map f) coll)`, and the
+   standard `(transduce (map f) …)` idiom). Multi-coll `map` ships; the
+   `(map f)` transducer form does not. This is a real user-facing gap beyond
+   `into`: `transduce`'s canonical xform is unusable until it exists.
+3. **A fourth widening of the sample.** This one is effectively exhausted —
+   the only non-passing slices are `into` (the two gaps above) and the four
+   upstream stubs that can never pass anywhere. The informative next move is
+   a new widening (another tranche of `core.jank`) or the in-flight W13
+   seq-layer work (uniform laziness), not more re-measuring of these 120.
 
-### Prediction vs outcome — how the wave-24 list fared
+### Prediction vs outcome — how the ranked lists fared
 
 The wave-24 ranked list predicted what each gap would unlock. Checked
 against what the re-measure actually found:
@@ -424,6 +434,40 @@ was checked: the shim, the reader, and `volatile!` were real and paid off;
 the small-prim backlog was listed but not built, and the re-measure catches
 that rather than laundering it into the number.
 
+**Wave 26 closed the loop — the small-core-gaps backlog was built, and it
+delivered, item by item.** Wave 25's honest admission was that its ranked
+list had never been acted on. It has now. Checked against what wave 26
+found:
+
+- **`reduce-kv` (predicted → update-vals, update-keys): delivered exactly.**
+  Both slices behave. No over- or under-claim.
+- **`rem` (predicted → mod, take-nth's transducer): delivered exactly.**
+  `mod` behaves and take-nth's xform (its body is `(rem i n)`) finally
+  reduces correctly.
+- **`float?` (predicted → double?): delivered exactly.** `double?` behaves.
+- **`cpp/jank.runtime.bit_not` (predicted → bit-not): delivered exactly.**
+  One registry row; the slice behaves.
+- **Multi-coll `map` (predicted → mapv ◐→✓): delivered.** `mapv`'s
+  multi-coll arities behave. But the list said nothing about `map`'s
+  *1-arity transducer* form, which is still missing — and that is one of
+  the two gaps now pinning `into`.
+- **`transientable?` (predicted → into, update-vals, splitv-at, mapv):
+  half delivered, one over-claim.** `update-vals`, `splitv-at`, and `mapv`
+  all behave. But the list's headline claim — that `transientable?` would
+  unblock `into` — was wrong: `into` is still ◐ because two *unlisted*
+  prims are missing (`conj!`'s map-transient clause, `map`'s 1-arity). The
+  predicate was necessary but not sufficient. This is exactly the kind of
+  miss only measuring the actual slice surfaces.
+- **`conj` 1-arity (predicted → the transduce-conj idiom): delivered.**
+  `(conj coll)` now returns `coll`; the completing step works.
+
+So of the seven wave-25 items, six delivered exactly as ranked and one
+(`transientable?` → `into`) over-claimed by one slice. The two gaps that
+actually pin `into` today were not on the wave-25 list at all — they are
+new, and they are the whole of "What to build next". The ranked list
+survived this contact; the new list is two one-liners, and the sample has
+nothing else left to unlock.
+
 ## Keeping this honest
 
 - The vendored fixtures carry a sha256 of their code portion; the test
@@ -433,7 +477,8 @@ that rather than laundering it into the number.
 - Big-bang loading of all 7795 lines is explicitly out of scope; the value
   is the per-slice, per-gap measurement above.
 
-All 109 fully-behaving slices (108 clean plus `mapv`, whose 1-arity passes and
-multi-coll arities are recorded ◐) are exercised by
-`test/beam_lisp/jank_compat_test.exs` and demonstrated end-to-end by
-`examples/jank_slice.bl` (unmodified jank running on the BEAM, exit 0).
+All 115 fully-behaving slices are exercised by `test/beam_lisp/jank_compat_test.exs`
+and demonstrated end-to-end by `examples/jank_slice.bl` (unmodified jank
+running on the BEAM, exit 0). `into` (99) is the one ◐ — its vector/reduce
+and `take`-xform paths behave, but `(into {} …)` and `(into [] (map inc) …)`
+still throw on the two prim gaps in "What to build next".

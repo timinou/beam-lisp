@@ -13,7 +13,10 @@ defmodule BeamLisp.MixProject do
   end
 
   # lib/dev holds the Tidewave endpoint; its deps exist only in :dev.
+  # test/support compiles only under :test so `BeamLisp.Test.realize/1`
+  # (the lazy-aware comparison helper) is available to the ExUnit suites.
   defp elixirc_paths(:dev), do: ["lib", "lib/dev"]
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
   def application do

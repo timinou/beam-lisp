@@ -51,12 +51,17 @@ defmodule BeamLisp.Wave10LazyTest do
       assert eval("(count (take 10 (range)))") == 10
     end
 
-    test "a cell's thunk realizes at most once, even across separate forces" do
+    test "a chunk's thunk realizes once, caching its whole chunk" do
+      # map is chunked at 32: the first force realizes one chunk (32
+      # elements) and caches it, so re-forcing the same cells re-runs
+      # nothing. The counter is 32 (one chunk), not 1 (one element) —
+      # chunking trades a little over-realization for ~14× less per-element
+      # allocation, exactly Clojure's tradeoff.
       assert eval(
                "(let [n (atom 0)
                       s (map (fn [x] (swap! n inc) x) (range))]
                   (first s) (first s) (first s) (rest s) @n)"
-             ) == 1
+             ) == 32
     end
 
     test "lazy-seq macro memoizes its body the same way" do
@@ -67,13 +72,16 @@ defmodule BeamLisp.Wave10LazyTest do
              ) == 1
     end
 
-    test "forcing a finite prefix of an infinite seq runs the thunk exactly that many times" do
+    test "forcing a finite prefix of an infinite seq realizes exactly one chunk" do
+      # `take 5` forces one 32-element chunk (map is chunked), so the thunk
+      # runs 32 times — not all of an infinite range, and not just 5 either:
+      # the chunk boundary is the granularity of realization.
       assert eval(
                "(let [n (atom 0)
                       s (map (fn [x] (swap! n inc) x) (range))]
                   (doall (take 5 s))
                   @n)"
-             ) == 5
+             ) == 32
     end
 
     test "iterate / take-while / drop-while / cycle are lazy and compose" do

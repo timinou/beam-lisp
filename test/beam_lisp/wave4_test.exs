@@ -1,7 +1,7 @@
 defmodule BeamLisp.Wave4Test do
   use ExUnit.Case, async: false
 
-  alias BeamLisp.{Env, Loader}
+  alias BeamLisp.{Env, Loader, Test}
 
   setup do
     BeamLisp.init()
@@ -26,7 +26,7 @@ defmodule BeamLisp.Wave4Test do
 
     test "core falls back from any namespace" do
       eval("(ns w4.somewhere)")
-      assert eval("(map inc [1 2 3])") == [2, 3, 4]
+      assert Test.realize(eval("(map inc [1 2 3])")) == [2, 3, 4]
     end
 
     test "aliases qualify calls and values" do

@@ -188,16 +188,18 @@ defmodule BeamLisp.SpecterCompatTest do
       # measurement couldn't even parse, now both private and functional.
       load_slice("16_insert_before_index_list", "specter.accept.insertidx")
 
-      assert eval_in(
-               "specter.accept.insertidx",
-               "(insert-before-index-list [1 2 3 4] 2 :x)"
+      assert BeamLisp.Test.realize(
+               eval_in(
+                 "specter.accept.insertidx",
+                 "(insert-before-index-list [1 2 3 4] 2 :x)"
+               )
              ) == [1, 2, :x, 3, 4]
 
       # index 0 pushes to the front; end-of-list appends
-      assert eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 0 :z)") ==
+      assert BeamLisp.Test.realize(eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 0 :z)")) ==
                [:z, 1, 2]
 
-      assert eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 2 :y)") ==
+      assert BeamLisp.Test.realize(eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 2 :y)")) ==
                [1, 2, :y]
     end
   end

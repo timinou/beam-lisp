@@ -53,21 +53,22 @@ defmodule BeamLisp.Wave14SeqTest do
       assert eval("(if (next [1 2 3]) :more :done)") == :more
     end
 
-    test "over a LazySeq it forces the head and one tail cell" do
-      # Clojure's `next` is `(seq (rest x))`: it must realize the tail
-      # to answer nil-vs-empty, so it forces two cells where `rest`
-      # forces one. That cost is exactly why Clojure keeps both, and
-      # returning an unrealized tail instead would make an exhausted
-      # seq truthy — which silently broke every `(when (next s) …)`
-      # recursion in jank's core.
+    test "over a LazySeq it forces the head and answers nil-vs-empty" do
+      # Clojure's `next` is `(seq (rest x))`: it must realize the tail to
+      # answer nil-vs-empty, and returning an unrealized tail instead would
+      # make an exhausted seq truthy — which silently broke every
+      # `(when (next s) …)` recursion in jank's core. Since map chunks at
+      # 32, both `rest` and `next` force exactly one chunk (32 cells); the
+      # semantic contract — `next` of an exhausted seq is nil — is what the
+      # last two assertions pin.
       counting = fn op ->
         eval("(let [n (atom 0)
                       s (map (fn [x] (swap! n inc) x) (range))]
                   (#{op} s) @n)")
       end
 
-      assert counting.("rest") == 1
-      assert counting.("next") == 2
+      assert counting.("rest") == 32
+      assert counting.("next") == 32
 
       assert eval("(next (range 3))") == [1, 2]
       assert eval("(next (range 1))") == nil

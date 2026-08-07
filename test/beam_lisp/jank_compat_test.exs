@@ -285,7 +285,28 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_116_sorted_preds.bl", "jank.accept.sorted",
      "1c095714c52d0fb864ad8c06f16d6a5516ce7fc2bc0c866b25cb509801885f8d"},
     {"slice_120_nan_q.bl", "jank.accept.nanq",
-     "c0b22754c18091dd7bc134d803764bfa29b33b2b333d0a70fc64a95fad7fd0e4"}
+     "c0b22754c18091dd7bc134d803764bfa29b33b2b333d0a70fc64a95fad7fd0e4"},
+    # Promoted by wave 26 (the core-gaps backlog). The small-prim gaps
+    # the wave-25 re-measure named — `rem`, `float?`, `transientable?`,
+    # `reduce-kv`, `bit_not` — plus `into`, multi-coll `map`, and
+    # `take`'s transducer 1-arity were actually built. Eight of the nine
+    # then-failing slices now load AND behave. `into` (slice 99) is the
+    # exception: its vector/reduce and `take`-xform paths behave, but
+    # `(into {} …)` throws (the map-transient `conj!` clause is missing)
+    # and `(into [] (map inc) …)` throws (`map` still lacks its 1-arity
+    # transducer form) — recorded in docs/jank-compat.md, NOT promoted.
+    {"slice_78_bit_ops.bl", "jank.accept.bitnot",
+     "a3526cc4e40a6c1e6dbc20a7c930f703f58f11077dd4a9e332d407ea23c95b63"},
+    {"slice_80_mod.bl", "jank.accept.mod",
+     "a294d54fcce083c581eb597500ef49299fbef7f70f86b2dd94ba97840f3ce890"},
+    {"slice_85_double_q.bl", "jank.accept.doubleq",
+     "b6351689e09567917469b8711b06f3faf5f3bada7a113fa12bc25b03729661d7"},
+    {"slice_117_splitv_at.bl", "jank.accept.splitvat",
+     "7c0414717303e587b15b81ec2277bf99aa8ec4526900f90867b448a0dc74e117"},
+    {"slice_118_update_vals.bl", "jank.accept.updatevals",
+     "231c6303bbda1e3d4c5733c183405c2865007fa7222cb83760df5c88c52c39a2"},
+    {"slice_119_update_keys.bl", "jank.accept.updatekeys",
+     "9cdffcd4664abbfc73d27002538ee30ccb82f9bb46434bed4abfa6dfcf5ee496"}
   ]
 
   setup_all do
@@ -603,7 +624,10 @@ defmodule BeamLisp.JankCompatTest do
 
     test "mapcat concatenates the mapped results (coll arity)" do
       load_slice("slice_48_mapcat.bl", "jank.accept.mapcat")
-      assert eval_in("jank.accept.mapcat", "(mapcat (fn [x] [x x]) [1 2])") == [1, 1, 2, 2]
+      # mapcat is `(apply concat (map …))` — uniformly lazy since wave 13,
+      # so force it before comparing to a list.
+      assert eval_in("jank.accept.mapcat", "(doall (mapcat (fn [x] [x x]) [1 2]))") ==
+               [1, 1, 2, 2]
     end
 
     test "remove filters out the items pred accepts" do
@@ -611,7 +635,8 @@ defmodule BeamLisp.JankCompatTest do
       # `complement` slice co-loaded (core.jank's own dependency).
       load_slice("slice_03_complement.bl", "jank.accept.remove")
       load_slice("slice_51_remove.bl", "jank.accept.remove")
-      assert eval_in("jank.accept.remove", "(remove even? [1 2 3 4 5 6])") == [1, 3, 5]
+      # remove is `(filter (complement pred))` — lazy since wave 13; force it.
+      assert eval_in("jank.accept.remove", "(doall (remove even? [1 2 3 4 5 6]))") == [1, 3, 5]
     end
 
     test "assoc-in sets a value at a nested path" do
@@ -921,10 +946,15 @@ defmodule BeamLisp.JankCompatTest do
                BeamLisp.Vector.new([1, 2, 3])
     end
 
-    test "take-nth keeps every nth item (coll arity; transducer needs volatile!)" do
+    test "take-nth keeps every nth item (coll + transducer arity; rem now core)" do
       load_slice("slice_88_take_nth.bl", "jank.accept.takenth")
       assert eval_in("jank.accept.takenth", "(doall (take-nth 2 [1 2 3 4]))") == [1, 3]
       assert eval_in("jank.accept.takenth", "(doall (take-nth 3 (range 10)))") == [0, 3, 6, 9]
+
+      # The stateful 1-arity transducer uses `(rem i n)`; its wave-25
+      # blocker was `rem`, not `volatile!` — wave 26 shipped `rem`, so it
+      # now reduces correctly.
+      assert eval_in("jank.accept.takenth", "(transduce (take-nth 2) + 0 [1 2 3 4 5])") == 9
     end
 
     test "map applies f across one or more colls (vendored upstream arities)" do
@@ -958,15 +988,16 @@ defmodule BeamLisp.JankCompatTest do
 
     test "split-with partitions by a predicate (needs upstream juxt)" do
       # split-with is (juxt take-while drop-while), so it needs the
-      # `juxt` slice co-loaded — core.jank's own dependency.
+      # `juxt` slice co-loaded — core.jank's own dependency. Both halves
+      # are lazy since wave 13, so pr-str realizes them for comparison.
       load_slice("slice_05_juxt.bl", "jank.accept.splitwith")
       load_slice("slice_94_split_with.bl", "jank.accept.splitwith")
 
-      assert eval_in("jank.accept.splitwith", "(doall (split-with even? [2 4 5 6]))") ==
-               BeamLisp.Vector.new([[2, 4], [5, 6]])
+      assert eval_in("jank.accept.splitwith", "(pr-str (split-with even? [2 4 5 6]))") ==
+               "[(2 4) (5 6)]"
 
-      assert eval_in("jank.accept.splitwith", "(doall (split-with pos? [1 -1 2]))") ==
-               BeamLisp.Vector.new([[1], [-1, 2]])
+      assert eval_in("jank.accept.splitwith", "(pr-str (split-with pos? [1 -1 2]))") ==
+               "[(1) (-1 2)]"
     end
 
     test "dorun forces a seq for side effects and returns nil" do
@@ -987,12 +1018,16 @@ defmodule BeamLisp.JankCompatTest do
       assert eval_in("jank.accept.takelast", "(doall (take-last 2 [1 2 3 4]))") == [3, 4]
     end
 
-    test "mapv returns a vector (1-arity; multi-coll arities need into/map)" do
-      # The 1-arity goes through transient/conj!/persistent! and works.
-      # The multi-coll arities need `into` and core multi-coll `map`,
-      # both recorded gaps in docs/jank-compat.md.
+    test "mapv returns a vector (all arities, into + multi-coll map ship)" do
+      # The 1-arity goes through transient/conj!/persistent!; the multi-coll
+      # arities are `(into [] (map f c1 c2 …))`. Wave 26 shipped `into` and
+      # core's multi-coll `map`, so all arities behave — mapv is ✓, not ◐.
       load_slice("slice_101_mapv.bl", "jank.accept.mapv")
       assert eval_in("jank.accept.mapv", "(mapv inc [1 2 3])") == BeamLisp.Vector.new([2, 3, 4])
+      assert eval_in("jank.accept.mapv", "(mapv + [1 2 3] [10 20 30])") ==
+               BeamLisp.Vector.new([11, 22, 33])
+      assert eval_in("jank.accept.mapv", "(mapv + [1 2] [3 4] [5 6])") ==
+               BeamLisp.Vector.new([9, 12])
     end
 
     test "filterv returns a vector of the kept items" do
@@ -1252,6 +1287,63 @@ defmodule BeamLisp.JankCompatTest do
              ) == 10
 
       assert eval_in("jank.accept.tx105", "(transduce (dedupe) + 0 [1 1 2 3 3 1])") == 7
+    end
+
+    # --- promoted by wave 26 (the core-gaps backlog). `rem`, `float?`,
+    # `bit_not`, `transientable?`, `reduce-kv`, and `take`'s transducer
+    # 1-arity were the wave-25 failure list's exact small-prim gaps; they
+    # shipped, and with them eight of the nine then-failing slices. The
+    # exceptions and their root causes are recorded in docs/jank-compat.md
+    # (`into` stays un-promoted: its map-target and `map`-xform paths still
+    # throw). Each slice is called with its own docstring semantics.
+
+    test "bit-not is the two's-complement complement" do
+      load_slice("slice_78_bit_ops.bl", "jank.accept.bitnot")
+      assert eval_in("jank.accept.bitnot", "(bit-not 5)") == -6
+      assert eval_in("jank.accept.bitnot", "(bit-not -1)") == 0
+      assert eval_in("jank.accept.bitnot", "(bit-not 0)") == -1
+    end
+
+    test "mod truncates toward negative infinity, matching rem's sign" do
+      load_slice("slice_80_mod.bl", "jank.accept.mod")
+      assert eval_in("jank.accept.mod", "(mod 13 4)") == 1
+      assert eval_in("jank.accept.mod", "(mod -13 4)") == 3
+      assert eval_in("jank.accept.mod", "(mod 13 -4)") == -3
+    end
+
+    test "double? tests a floating-point value via float?" do
+      load_slice("slice_85_double_q.bl", "jank.accept.doubleq")
+      assert eval_in("jank.accept.doubleq", "(double? 3.0)") == true
+      assert eval_in("jank.accept.doubleq", "(double? 0.5)") == true
+      assert eval_in("jank.accept.doubleq", "(double? 3)") == false
+    end
+
+    test "splitv-at returns a vector of an into-take vector and the drop" do
+      load_slice("slice_117_splitv_at.bl", "jank.accept.splitvat")
+
+      assert eval_in("jank.accept.splitvat", "(splitv-at 2 [1 2 3 4 5])") ==
+               BeamLisp.Vector.new([BeamLisp.Vector.new([1, 2]), [3, 4, 5]])
+
+      assert eval_in("jank.accept.splitvat", "(splitv-at 3 (list 1 2 3 4 5 6))") ==
+               BeamLisp.Vector.new([BeamLisp.Vector.new([1, 2, 3]), [4, 5, 6]])
+    end
+
+    test "update-vals maps f over the values, preserving keys and meta" do
+      load_slice("slice_118_update_vals.bl", "jank.accept.updatevals")
+      assert eval_in("jank.accept.updatevals", "(update-vals {:a 1 :b 2} inc)") == %{a: 2, b: 3}
+
+      assert eval_in("jank.accept.updatevals", "(update-vals {:a 1 :b 2} (fn [v] (* v 10)))") ==
+               %{a: 10, b: 20}
+    end
+
+    test "update-keys maps f over the keys, preserving values" do
+      load_slice("slice_119_update_keys.bl", "jank.accept.updatekeys")
+
+      assert eval_in("jank.accept.updatekeys", "(update-keys {1 \"a\" 2 \"b\"} inc)") ==
+               %{2 => "a", 3 => "b"}
+
+      assert eval_in("jank.accept.updatekeys", "(update-keys {:a 1 :b 2} name)") ==
+               %{"a" => 1, "b" => 2}
     end
 
   end

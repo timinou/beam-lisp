@@ -11,6 +11,7 @@ defmodule BeamLisp.Wave14ReaderTest do
 
   alias BeamLisp.Reader
   alias BeamLisp.Reader.SyntaxError
+  alias BeamLisp.Test
 
   # The sharpest read-form check: `#(...)` must desugar to exactly the
   # hand-written `(fn [params] body)` — this pins both the generated
@@ -66,11 +67,11 @@ defmodule BeamLisp.Wave14ReaderTest do
     end
 
     test "map with %", %{env: env} do
-      assert BeamLisp.Compiler.eval_string("(map #(* % 2) [1 2 3])", env) == [2, 4, 6]
+      assert Test.realize(BeamLisp.Compiler.eval_string("(map #(* % 2) [1 2 3])", env)) == [2, 4, 6]
     end
 
     test "filter with %", %{env: env} do
-      assert BeamLisp.Compiler.eval_string("(filter #(> % 2) [1 2 3 4])", env) == [3, 4]
+      assert Test.realize(BeamLisp.Compiler.eval_string("(filter #(> % 2) [1 2 3 4])", env)) == [3, 4]
     end
 
     test "%1 %2 through reduce", %{env: env} do

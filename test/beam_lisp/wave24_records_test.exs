@@ -9,7 +9,7 @@ defmodule BeamLisp.Wave24RecordsTest do
   use ExUnit.Case, async: false
 
   alias BeamLisp.Compiler
-  alias BeamLisp.{Env, RT}
+  alias BeamLisp.{Env, RT, Test}
 
   setup do
     BeamLisp.init()
@@ -80,9 +80,9 @@ defmodule BeamLisp.Wave24RecordsTest do
     test "count/keys/vals/seq read the public fields, never __struct__" do
       assert eval("(count (->W24Point 1 2))") == 2
       assert eval("(count (assoc (->W24Point 1 2) :z 3))") == 3
-      assert eval("(keys (->W24Point 1 2))") == [:x, :y]
-      assert eval("(vals (->W24Point 1 2))") == [1, 2]
-      assert eval("(map first (seq (->W24Point 1 2)))") == [:x, :y]
+      assert Test.realize(eval("(keys (->W24Point 1 2))")) == [:x, :y]
+      assert Test.realize(eval("(vals (->W24Point 1 2))")) == [1, 2]
+      assert Test.realize(eval("(map first (seq (->W24Point 1 2)))")) == [:x, :y]
       assert eval("(contains? (->W24Point 1 2) :x)") == true
       assert eval("(find (->W24Point 1 2) :y)") == %BeamLisp.Vector{items: {:y, 2}}
     end
@@ -227,9 +227,9 @@ defmodule BeamLisp.Wave24RecordsTest do
     end
 
     test "map/filter over a record iterate its entries, not struct fields" do
-      assert eval("(map first (seq (->W24Point 1 2)))") == [:x, :y]
+      assert Test.realize(eval("(map first (seq (->W24Point 1 2)))")) == [:x, :y]
       assert eval("(count (map identity (seq (->W24Point 1 2))))") == 2
-      assert eval("(filter (fn [e] (> (second e) 1)) (seq (->W24Point 1 2)))") ==
+      assert Test.realize(eval("(filter (fn [e] (> (second e) 1)) (seq (->W24Point 1 2)))")) ==
                [%BeamLisp.Vector{items: {:y, 2}}]
     end
 
@@ -250,7 +250,7 @@ defmodule BeamLisp.Wave24RecordsTest do
       # merge starts from {} so the result is a plain map; the point is that
       # seq/assoc over the record never leak __struct__.
       assert eval("(merge (->W24Point 1 2) {:z 3})") == %{x: 1, y: 2, z: 3}
-      assert eval("(keys (merge (->W24Point 1 2) {:z 3}))") == [:x, :y, :z]
+      assert Test.realize(eval("(keys (merge (->W24Point 1 2) {:z 3}))")) == [:x, :y, :z]
     end
 
     test "str and print-str print the record (not its struct fields)" do

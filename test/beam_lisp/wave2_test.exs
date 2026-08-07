@@ -1,4 +1,6 @@
 defmodule BeamLisp.Wave2Test do
+  import BeamLisp.Test, only: [realize: 1]
+
   use ExUnit.Case, async: false
 
   setup do
@@ -139,9 +141,11 @@ defmodule BeamLisp.Wave2Test do
     end
 
     test "range" do
-      assert BeamLisp.eval("(range 5)") == [0, 1, 2, 3, 4]
-      assert BeamLisp.eval("(range 2 5)") == [2, 3, 4]
-      assert BeamLisp.eval("(range 0)") == []
+      # range is lazy now, bounded as well as unbounded — realize/1
+      # forces it, since what these assert is the sequence of values.
+      assert realize(BeamLisp.eval("(range 5)")) == [0, 1, 2, 3, 4]
+      assert realize(BeamLisp.eval("(range 2 5)")) == [2, 3, 4]
+      assert realize(BeamLisp.eval("(range 0)")) == []
     end
 
     test "second" do

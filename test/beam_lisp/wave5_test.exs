@@ -1,6 +1,8 @@
 defmodule BeamLisp.Wave5Test do
   use ExUnit.Case, async: false
 
+  alias BeamLisp.Test
+
   setup do
     BeamLisp.init()
     BeamLisp.Env.in_ns("user")
@@ -27,7 +29,7 @@ defmodule BeamLisp.Wave5Test do
     test "the interned value is a composable capture" do
       eval("(defn w5-double [x] (* 2 x))")
       assert eval("(Enum/map [1 2 3] w5-double)") == [2, 4, 6]
-      assert eval("(map w5-double [1 2])") == [2, 4]
+      assert Test.realize(eval("(map w5-double [1 2])")) == [2, 4]
     end
 
     test "variadic and multi-arity defns link too" do

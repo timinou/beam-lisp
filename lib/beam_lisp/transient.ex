@@ -74,6 +74,16 @@ defmodule BeamLisp.Transient do
           "transient not supported for #{inspect(other)} (only vectors and maps)"
   end
 
+  @doc """
+  `(conj! t)` — the reducing-fn completion arity. A transient is finished by
+  `persistent!` (which `into` calls), not by a 1-arity conj!, so this is a
+  passthrough: `transduce`'s `(f ret)` completion step on a transient
+  accumulator must not mutate anything — the take-nth/take transducers all
+  delegate `([result] (rf result))` to their rf, and jank's `into` runs
+  `(transduce xform conj! …)`, so conj! has to answer a 1-arg call.
+  """
+  def conj!(t), do: t
+
   @doc "`(conj! t x)` — append to a transient vector."
   def conj!({@tag, :vector, key}, x) do
     case state(key) do

@@ -31,15 +31,15 @@ defmodule BeamLisp.Wave23LazySeqTest do
       assert eval("(take 5 (concat (lazy-seq (map inc (range))) (list 99)))") ==
                [1, 2, 3, 4, 5]
 
-      # The counter proves only 5 cells of the infinite seq were forced:
-      # concat's thunk peels the outer lazy-seq and map realizes exactly
-      # the cells `take` consumes, never the tail.
+      # The counter proves the infinite seq is not fully forced: map is
+      # chunked at 32, so `take 5` realizes exactly one 32-element chunk
+      # of the infinite source, never its tail.
       assert eval(
                "(let [n (atom 0)
                       inf (map (fn [x] (swap! n inc) x) (range))]
                   (doall (take 5 (concat (lazy-seq inf) (list 99))))
                   @n)"
-             ) == 5
+             ) == 32
     end
 
     test "thunks returning [], a vector, a set, and nil all normalize" do

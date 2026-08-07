@@ -7,6 +7,11 @@ defmodule BeamLisp.RT do
 
   alias BeamLisp.{Env, LazySeq, Set}
 
+  # `rem` is seeded as a core prim (Clojure's remainder), so the module
+  # must not inherit Kernel.rem/2 — the local def below is the source of
+  # truth and every `rem` here (even?/odd?) resolves to it.
+  import Kernel, except: [rem: 2]
+
   @multi_fn_tag :"$blfn"
 
   @doc "Wraps arity-dispatched clauses; Elixir fns are fixed-arity, so multi-arity and variadic beam-lisp fns need a tag."
@@ -256,6 +261,12 @@ defmodule BeamLisp.RT do
 
   def list_star_0, do: nil
 
+  # `(conj coll)` — the reducing-fn completion arity: returns coll unchanged.
+  # Clojure defines this 1-arity (identity), and `transduce`'s `(f ret)`
+  # completion step delegates to it, so a non-transientable `into` target
+  # (e.g. a list) can be reduced by `(transduce xform conj …)`.
+  def conj(coll), do: coll
+
   @doc "Clojure `conj`: prepend to a list, append to a vector."
   def conj(nil, x), do: [x]
   def conj(xs, x) when is_list(xs), do: [x | xs]
@@ -280,7 +291,9 @@ defmodule BeamLisp.RT do
   end
 
   def count(nil), do: 0
-  def count(xs) when is_list(xs), do: length(xs)
+  # A proper list is O(1) via length; a partially-realized improper one
+  # (`[h | LazySeq]`, what a chunked seq's tail is) must be walked.
+  def count(xs) when is_list(xs), do: if(improper?(xs), do: LazySeq.count(xs), else: length(xs))
   # Both of these are structs, and a struct is a map — they MUST precede
   # the is_map clause or count returns the number of struct fields.
   # (A lazy seq quietly counted 3, its field count, for any length.)
@@ -296,6 +309,11 @@ defmodule BeamLisp.RT do
   def count(s) when is_binary(s), do: String.length(s)
 
   def empty?(%LazySeq{} = l), do: LazySeq.cell(l) == nil
+  # Lists (proper or partially-realized improper ones) answer in O(1) by
+  # their head alone — an improper list always has one, so it is never
+  # empty. Counting here would realize a lazy tail on every call, turning
+  # the self-hosted reduce's per-element `(empty? xs)` into O(n²).
+  def empty?(xs) when is_list(xs), do: xs == []
   def empty?(xs), do: count(xs) == 0
 
   @doc "Lenient element access for sequential destructuring: nil-safe, out-of-range gives nil."
@@ -717,20 +735,71 @@ defmodule BeamLisp.RT do
   def nan?(_), do: false
 
   @doc """
-  Clojure `=`: for lazy operands, realize-and-compare element-wise with
-  short-circuiting, so `(= (range) '(1 2))` stops at the first mismatch
-  instead of realizing an infinite seq. Non-lazy operands take the plain
-  `==` fast path, preserving existing equality exactly.
+  Clojure `rem`: the remainder of a/b, with the sign of the *dividend* a.
+  This is deliberately not `mod` (sign of the divisor) — the two differ on
+  negative operands, which is why upstream defines `mod` in terms of `rem`.
+  Elixir's `rem` is Erlang's, which is exactly Clojure's: rem(-7, 3) is -1.
+  """
+  def rem(a, b), do: :erlang.rem(a, b)
+
+  @doc "jank's `float?`: true for floating-point values. On the BEAM that is `is_float/1`; upstream jank spells the derived predicate `double?`."
+  def float?(x), do: is_float(x)
+
+  @doc """
+  jank's `transientable?`: whether a collection supports `(transient coll)`.
+  Mirrors `BeamLisp.Transient.transient/1` exactly, so it can never lie and
+  silently send `into` down the wrong path: beam-lisp vectors, sets, and maps
+  (a map on the BEAM is any struct or plain map) get a transient view; lists,
+  lazy seqs, and non-collections do not. `(transient coll)` and this predicate
+  must stay in lockstep — a drift here is exactly the silent-slow/ silent-wrong
+  bug the doc warns about.
+  """
+  def transientable?(%BeamLisp.Vector{}), do: true
+  def transientable?(%Set{}), do: true
+  # A lazy seq is a struct, so it is a map — but it is not transientable.
+  # This must precede the is_map clause or every lazy seq would report true.
+  def transientable?(%LazySeq{}), do: false
+  def transientable?(m) when is_map(m), do: true
+  def transientable?(_), do: false
+
+  @doc "jank's `cpp/jank.runtime.bit_not`: bitwise complement, `~x` (two's-complement negation minus one)."
+  def bit_not(x), do: :erlang.bnot(x)
+
+  @doc """
+  Clojure `=`: realize-and-compare element-wise with short-circuiting, so
+  `(= (range) '(1 2))` stops at the first mismatch instead of realizing an
+  infinite seq. A lazy/improper operand always walks; a vector compares
+  element-wise too (so a lazy value nested inside one realizes), but a
+  vector never equals a list — wave 3's `[] ≠ ()` split.
   """
   def eqv(a, b) do
-    # Walk whenever an operand is lazy *or* an improper list (a
-    # partially-realized `[h | LazySeq]`), so a lazy interleave result
-    # compares element-wise against a proper list instead of failing the
-    # structural `==` that distinguishes improper from proper.
-    if LazySeq.lazy?(a) or LazySeq.lazy?(b) or improper?(a) or improper?(b) do
-      eqv_walk(a, b)
+    cond do
+      # Walk whenever an operand is lazy *or* an improper list (a
+      # partially-realized `[h | LazySeq]`), so a lazy interleave result —
+      # or an empty lazy seq against either `()` or `[]` — compares
+      # element-wise instead of failing the structural `==`.
+      LazySeq.lazy?(a) or LazySeq.lazy?(b) or improper?(a) or improper?(b) ->
+        eqv_walk(a, b)
+
+      # A vector is a distinct type: two vectors compare element-wise (so a
+      # lazy element nested inside one — e.g. `(split-with …)` puts
+      # take-while results in a vector — realizes against its sibling), but
+      # a vector vs a non-vector is never equal (empty `[]` stays `≠ ()`).
+      vector?(a) or vector?(b) ->
+        eqv_vector(a, b)
+
+      true ->
+        Kernel.==(a, b)
+    end
+  end
+
+  defp eqv_vector(a, b) do
+    if vector?(a) and vector?(b) do
+      la = BeamLisp.Vector.to_list(a)
+      lb = BeamLisp.Vector.to_list(b)
+      length(la) == length(lb) and Enum.zip(la, lb) |> Enum.all?(fn {x, y} -> eqv(x, y) end)
     else
-      Kernel.==(a, b)
+      false
     end
   end
 
@@ -756,10 +825,11 @@ defmodule BeamLisp.RT do
   end
 
   # --- lazy sequences -------------------------------------------------
-  # The prelude's strict seq fns are *hybrid*: a realized input (list or
-  # vector) flows through the strict `Enum` path so existing equality and
-  # Elixir interop hold unchanged; a `LazySeq` input composes lazily so
-  # `(take 5 (map f (range)))` never realizes what it does not need.
+  # The seq fns (`map`, `filter`, `range`, `concat`, `take-while`, …) are
+  # uniformly lazy, as in Clojure: they compose without realizing what a
+  # consumer never asks for, and they chunk at 32 so a small strict map
+  # does not pay per-element LazySeq overhead. `seq`/`first`/`rest` (and the
+  # forcing folds `reduce`/`take`/`count`/`doall`) are the forcing boundary;
 
   # Clojure treats nil as an empty seq everywhere a seq is expected:
   # `(map f nil)` is `()`, not an error. An exhausted `& rest` binds
@@ -790,38 +860,77 @@ defmodule BeamLisp.RT do
   end
   defp seqable(coll), do: coll
 
-  def map(f, coll) do
-    if LazySeq.lazy?(coll) do
-      lazy_map(f, coll)
-    else
-      coll |> seqable() |> Enum.map(&invoke(f, [&1])) |> empty_contract()
-    end
-  end
+  def map(f, coll), do: lazy_map(f, seqable(coll))
 
   defp lazy_map(f, coll) do
     LazySeq.new(fn ->
       case LazySeq.cell(coll) do
         nil -> nil
-        [h | t] -> [invoke(f, [h]) | lazy_map(f, t)]
+        [h | t] ->
+          {elems, rest} = map_chunk(f, [invoke(f, [h])], t, LazySeq.chunk_size() - 1)
+
+          # An exhausted source ends the chunk as a proper list (no empty
+          # LazySeq tail), so `(map f [1 2 3])` is a proper list a caller
+          # can hand to `Vector.new` or `length`. Only a non-empty rest
+          # appends a lazy tail.
+          if is_nil(rest),
+            do: elems,
+            else: LazySeq.chain(elems, fn -> lazy_map(f, rest) end)
       end
     end)
   end
 
-  def filter(pred, coll) do
-    if LazySeq.lazy?(coll) do
-      lazy_filter(pred, coll)
-    else
-      coll |> seqable() |> Enum.filter(&invoke(pred, [&1])) |> empty_contract()
+  defp map_chunk(_f, acc, rest, 0), do: {Enum.reverse(acc), rest}
+
+  defp map_chunk(f, acc, rest, n) do
+    case LazySeq.cell(rest) do
+      nil -> {Enum.reverse(acc), nil}
+      [h | t] -> map_chunk(f, [invoke(f, [h]) | acc], t, n - 1)
     end
   end
 
+  # Multi-collection `(map f c1 c2 …)` — stops at the *shortest* input,
+  # exactly like Clojure. Each coll is re-seq'd per step so a lazy input is
+  # only ever realized as far as the fold needs it.
+  def map_multi(f, c1, rest_colls), do: lazy_multi_map(f, [c1 | rest_colls])
+
+  defp lazy_multi_map(f, colls) do
+    LazySeq.new(fn ->
+      seqs = Enum.map(colls, &seq/1)
+
+      if Enum.any?(seqs, &is_nil/1) do
+        nil
+      else
+        [invoke(f, Enum.map(seqs, &first/1)) | lazy_multi_map(f, Enum.map(seqs, &rest/1))]
+      end
+    end)
+  end
+
+  def filter(pred, coll), do: lazy_filter(pred, seqable(coll))
+
+  # Chunked like map: each thunk collects up to `@chunk_size` elements that
+  # pass `pred` (skipping non-matches without yielding them), so a consumer
+  # that stops early never realizes more than one source chunk past it.
   defp lazy_filter(pred, coll) do
     LazySeq.new(fn ->
       case skip_filter(pred, coll) do
         nil -> nil
-        [h | t] -> [h | lazy_filter(pred, t)]
+        [h | t] ->
+          {elems, rest} = filter_chunk(pred, [h], t, LazySeq.chunk_size() - 1)
+          if is_nil(rest),
+            do: elems,
+            else: LazySeq.chain(elems, fn -> lazy_filter(pred, rest) end)
       end
     end)
+  end
+
+  defp filter_chunk(_pred, acc, coll, 0), do: {Enum.reverse(acc), coll}
+
+  defp filter_chunk(pred, acc, coll, n) do
+    case skip_filter(pred, coll) do
+      nil -> {Enum.reverse(acc), nil}
+      [h | t] -> filter_chunk(pred, [h | acc], t, n - 1)
+    end
   end
 
   defp skip_filter(pred, coll) do
@@ -833,15 +942,40 @@ defmodule BeamLisp.RT do
 
   @doc """
   `(range)` is an infinite lazy seq. Bounded `(range end)` and
-  `(range start end)` stay eager (realized lists) so `(= (range 5) '(0 1 2 3 4))`
-  holds under structural equality.
+  `(range start end)` are lazy too, so `(take 5 (map f (range 1000000)))`
+  realizes only the chunk `take` asks for instead of every element. An
+  empty or exhausted range is an empty lazy seq (`()`), not a `[]` vector.
   """
-  def range(), do: LazySeq.new(fn -> range_from(0) end)
+  def range(), do: LazySeq.new(fn -> range_chunk(0, nil) end)
   def range(end_), do: range(0, end_)
-  def range(start, end_) when start >= end_, do: []
-  def range(start, end_), do: Enum.to_list(start..(end_ - 1))
+  def range(start, end_), do: LazySeq.new(fn -> range_chunk(start, end_) end)
 
-  defp range_from(i), do: [i | LazySeq.new(fn -> range_from(i + 1) end)]
+  # One chunk of integers (up to @chunk_size) with a lazy tail; `end_` of
+  # nil means unbounded. range_build returns `{next, elems}` where `next` is
+  # the next start index, or nil when the range is exhausted.
+  defp range_chunk(start, end_) do
+    if end_ != nil and start >= end_ do
+      nil
+    else
+      {elems, next} = range_build(start, end_, [], LazySeq.chunk_size())
+
+      # An exhausted bounded range ends as a proper list, so a small
+      # `(range n)` is a proper list rather than an improper tail.
+      if is_nil(next),
+        do: elems,
+        else: LazySeq.chain(elems, fn -> range_chunk(next, end_) end)
+    end
+  end
+
+  defp range_build(i, _end_, acc, 0), do: {Enum.reverse(acc), i}
+
+  defp range_build(i, end_, acc, n) do
+    if end_ != nil and i >= end_ do
+      {Enum.reverse(acc), nil}
+    else
+      range_build(i + 1, end_, [i | acc], n - 1)
+    end
+  end
 
   @doc "`(iterate f x)` yields x, (f x), (f (f x)), … forever, lazily."
   def iterate(f, x), do: LazySeq.new(fn -> iterate_from(f, x) end)
@@ -869,21 +1003,62 @@ defmodule BeamLisp.RT do
     [h | LazySeq.new(fn -> cycle_from(rest, orig) end)]
   end
 
-  @doc "`(concat & seqs)` — lazy when any input is lazy, else a realized flat list."
+  @doc "`(concat & seqs)` — a lazy seq of every input, in order."
   def concat(seqs) when is_list(seqs) do
-    if Enum.any?(seqs, &LazySeq.lazy?/1) do
-      LazySeq.new(fn -> concat_from(seqs) end)
-    else
-      Enum.flat_map(seqs, &(LazySeq.cell(&1) || []))
+    LazySeq.new(fn -> concat_chunk(seqs) end)
+  end
+
+  # A chunk is drawn from ONE source seq (up to @chunk_size elements). It
+  # does not cross into a later seq mid-chunk, so taking the head of a
+  # concat of a realized head + a huge lazy tail never realizes the tail —
+  # Clojure's concat advances seqs lazily too. Returns `:empty`, a proper
+  # list (all consumed), or `{elems, rest_seqs}` for a lazy tail.
+  defp concat_chunk(seqs) do
+    case concat_pull(seqs, LazySeq.chunk_size(), []) do
+      :empty -> nil
+      {[], rest} -> concat_chunk(rest)
+      {elems, []} -> elems
+      {elems, rest} -> LazySeq.chain(elems, fn -> concat_chunk(rest) end)
     end
   end
 
-  defp concat_from([]), do: nil
+  defp concat_pull([], _n, []), do: :empty
+  defp concat_pull([], _n, acc), do: {Enum.reverse(acc), []}
+  defp concat_pull(seqs, 0, acc), do: {Enum.reverse(acc), seqs}
 
-  defp concat_from([s | rest]) do
+  defp concat_pull([s | rest], n, acc) do
     case LazySeq.cell(s) do
-      nil -> concat_from(rest)
-      [h | t] -> [h | LazySeq.new(fn -> concat_from([t | rest]) end)]
+      # An exhausted leading seq is dropped here; the next chunk continues
+      # from the remaining seqs rather than pulling them in this one.
+      nil -> {Enum.reverse(acc), rest}
+      [h | t] -> concat_pull([t | rest], n - 1, [h | acc])
+    end
+  end
+
+  @doc """
+  Clojure `(take n)` transducer: a stateful reducing-fn wrapper that lets the
+  first n inputs through and drops the rest. `n` is held in a volatile, the
+  same mutable-until-persisted trick the vendored take-nth transducer uses,
+  so `into`'s 3-arity and splitv-at resolve `(take n)` as an xform from core.
+  The returned fn answers 0/1/2-arg reducing calls through `invoke`, so a
+  beam-lisp `reduce`/`transduce` fold can drive it.
+  """
+  def take_xform(n) do
+    fn rf ->
+      nv = BeamLisp.Refs.volatile(n)
+
+      # a reducing step must answer 0/1/2-arg calls, so it is a `multi_fn`
+      # tag (a plain Elixir closure is fixed-arity and a 2-arg step call
+      # would blow up with "arity 1 called with 2 arguments")
+      multi_fn(%{
+        0 => fn -> invoke(rf, []) end,
+        1 => fn result -> invoke(rf, [result]) end,
+        2 => fn result, input ->
+          cur = BeamLisp.Refs.deref(nv)
+          BeamLisp.Refs.vreset!(nv, cur - 1)
+          if cur > 0, do: invoke(rf, [result, input]), else: result
+        end
+      })
     end
   end
 
@@ -899,26 +1074,38 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def take_while(pred, coll) do
-    if LazySeq.lazy?(coll) do
-      LazySeq.new(fn ->
-        case LazySeq.cell(coll) do
-          nil -> nil
-          [h | t] -> if invoke(pred, [h]), do: [h | take_while(pred, t)], else: nil
-        end
-      end)
-    else
-      Enum.take_while(coll, &invoke(pred, [&1]))
+  def take_while(pred, coll), do: LazySeq.new(fn -> take_while_seg(pred, seqable(coll)) end)
+
+  # Chunked: collect up to @chunk_size consecutive matches, stopping at the
+  # first non-match (which ends the whole seq, so no tail is produced then).
+  defp take_while_seg(pred, coll) do
+    case take_while_build(pred, coll, [], LazySeq.chunk_size()) do
+      :empty -> nil
+      {elems, rest} when is_nil(rest) -> elems
+      {elems, rest} -> LazySeq.chain(elems, fn -> take_while_seg(pred, rest) end)
     end
   end
 
-  def drop_while(pred, coll) do
-    if LazySeq.lazy?(coll) do
-      LazySeq.new(fn -> drop_while_skip(pred, coll) end)
-    else
-      Enum.drop_while(coll, &invoke(pred, [&1]))
+  defp take_while_build(_pred, _coll, [], 0), do: :empty
+
+  defp take_while_build(_pred, coll, acc, 0) do
+    if acc == [], do: :empty, else: {Enum.reverse(acc), coll}
+  end
+
+  defp take_while_build(pred, coll, acc, n) do
+    case LazySeq.cell(coll) do
+      nil -> if acc == [], do: :empty, else: {Enum.reverse(acc), nil}
+
+      [h | t] ->
+        if invoke(pred, [h]) do
+          take_while_build(pred, t, [h | acc], n - 1)
+        else
+          if acc == [], do: :empty, else: {Enum.reverse(acc), nil}
+        end
     end
   end
+
+  def drop_while(pred, coll), do: LazySeq.new(fn -> drop_while_skip(pred, seqable(coll)) end)
 
   defp drop_while_skip(pred, coll) do
     case LazySeq.cell(coll) do
@@ -1175,7 +1362,7 @@ defmodule BeamLisp.RT do
       "rest" => &rest/1,
       "seq" => &seq/1,
       "cons" => &cons/2,
-      "conj" => &conj/2,
+      "conj" => multi_fn(%{1 => &conj/1, 2 => &conj/2}),
       "count" => &count/1,
       "nth" => &nth/2,
       "empty?" => &empty?/1,
@@ -1190,15 +1377,17 @@ defmodule BeamLisp.RT do
       # pr-str, minus readably-quoted strings); both share the one printer.
       "print-str" => &print_str/1,
       "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1}),
-      # lazy sequences: hybrid — realized in → realized out, lazy in → lazy out
-      "map" => &map/2,
+      # lazy sequences: uniformly lazy (chunked at 32), realized only by
+      # forcing consumers (take/reduce/count/doall/…).
+      # `map` is variadic: the 2-arity is the chunked lazy path, 3+ colls stop at the shortest.
+      "map" => multi_fn(%{2 => &map/2}, {2, &map_multi/3}),
       "filter" => &filter/2,
       "range" => multi_fn(%{0 => &range/0, 1 => &range/1, 2 => &range/2}),
       "iterate" => &iterate/2,
       "repeat" => multi_fn(%{1 => &repeat/1, 2 => &repeat/2}),
       "cycle" => &cycle/1,
       "concat" => multi_fn(%{}, {0, fn args -> concat(args) end}),
-      "take" => &take/2,
+      "take" => multi_fn(%{1 => &take_xform/1, 2 => &take/2}),
       "drop" => &drop_clj/2,
       "take-while" => &take_while/2,
       "drop-while" => &drop_while/2,
@@ -1210,6 +1399,9 @@ defmodule BeamLisp.RT do
       "zero?" => &zero?/1,
       "pos?" => &pos?/1,
       "neg?" => &neg?/1,
+      "rem" => &rem/2,
+      "float?" => &float?/1,
+      "transientable?" => &transientable?/1,
       # type & collection predicates (wave 14)
       "fn?" => &fn?/1,
       "seq?" => &seq?/1,
@@ -1266,7 +1458,8 @@ defmodule BeamLisp.RT do
     transient_prims = %{
       "transient" => &BeamLisp.Transient.transient/1,
       "persistent!" => &BeamLisp.Transient.persistent!/1,
-      "conj!" => &BeamLisp.Transient.conj!/2,
+      "conj!" =>
+        multi_fn(%{1 => &BeamLisp.Transient.conj!/1, 2 => &BeamLisp.Transient.conj!/2}),
       "assoc!" => &BeamLisp.Transient.assoc!/3,
       "dissoc!" => &BeamLisp.Transient.dissoc!/2,
       "hash-map" =>
@@ -1349,7 +1542,10 @@ defmodule BeamLisp.RT do
       "jank.runtime.vreset" => &BeamLisp.Refs.vreset!/2,
       "jank.runtime.vswap" =>
         multi_fn(%{2 => &BeamLisp.Refs.vswap!/2, 3 => &BeamLisp.Refs.vswap!/3}),
-      "jank.runtime.is_volatile" => &BeamLisp.Refs.volatile?/1
+      "jank.runtime.is_volatile" => &BeamLisp.Refs.volatile?/1,
+      # bit-not's inline expands to a call to this (slice_78); the reader
+      # gate was clear, only the table row was missing.
+      "jank.runtime.bit_not" => &bit_not/1
     }
 
     Enum.each(cpp_prims, fn {name, f} -> Env.intern("cpp", name, f) end)
@@ -1367,7 +1563,8 @@ defmodule BeamLisp.RT do
     # that does not exist: `(<= 1 2)` raised :erlang.<=/2 undefined
     # while the chained `(<= 1 2 3)` went through invoke and worked.
     bif2 = [{"+", :+}, {"-", :-}, {"*", :*}, {"/", :/}, {"<", :<}, {">", :>},
-            {"<=", :"=<"}, {">=", :>=}, {"==", :==}]
+            {"<=", :"=<"}, {">=", :>=}, {"==", :==},
+            {"rem", :rem}]
 
     for {name, op} <- bif2 do
       Env.put_link("core", name, {:erlang, %{2 => op}, nil})
@@ -1387,7 +1584,6 @@ defmodule BeamLisp.RT do
       "rest" => 1,
       "seq" => 1,
       "cons" => 2,
-      "conj" => 2,
       "count" => 1,
       "nth" => 2,
       "empty?" => 1,
@@ -1397,9 +1593,7 @@ defmodule BeamLisp.RT do
       "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
       "assoc" => 3,
-      "map" => 2,
       "filter" => 2,
-      "take" => 2,
       "take-while" => :take_while,
       "drop-while" => :drop_while,
       "iterate" => 2,
@@ -1411,6 +1605,8 @@ defmodule BeamLisp.RT do
       "zero?" => 1,
       "pos?" => 1,
       "neg?" => 1,
+      "float?" => 1,
+      "transientable?" => 1,
       "fn?" => 1,
       "seq?" => 1,
       "boolean" => 1,
@@ -1462,6 +1658,15 @@ defmodule BeamLisp.RT do
     Env.put_link("core", "get", {BeamLisp.RT, %{2 => :get, 3 => :get}, nil})
     Env.put_link("core", "drop", {BeamLisp.RT, %{2 => :drop_clj}, nil})
 
+    # `map` links its fixed 2-arity to the chunked lazy path and routes 3+
+    # colls to the multi-coll lazy handler (stops at the shortest input). `take`
+    # gains its 1-arity transducer (used by `into`/splitv-at) alongside the
+    # existing 2-arity coll form.
+    Env.put_link("core", "map", {BeamLisp.RT, %{2 => :map}, {2, :map_multi}})
+    Env.put_link("core", "take", {BeamLisp.RT, %{1 => :take_xform, 2 => :take}, nil})
+    # `conj` links its completion arity (1) beside the value arity (2).
+    Env.put_link("core", "conj", {BeamLisp.RT, %{1 => :conj, 2 => :conj}, nil})
+
     # `apply` and `list*` are multi-arity prims: the 2-arity `apply` links
     # directly, higher arities split into fixed leading args + one rest list
     # for the variadic handler. `list*` keeps its 0-arity (`(list*)` → nil).
@@ -1497,7 +1702,7 @@ defmodule BeamLisp.RT do
     transient_links = %{
       "transient" => {BeamLisp.Transient, %{1 => :transient}, nil},
       "persistent!" => {BeamLisp.Transient, %{1 => :persistent!}, nil},
-      "conj!" => {BeamLisp.Transient, %{2 => :conj!}, nil},
+      "conj!" => {BeamLisp.Transient, %{1 => :conj!, 2 => :conj!}, nil},
       "assoc!" => {BeamLisp.Transient, %{3 => :assoc!}, nil},
       "dissoc!" => {BeamLisp.Transient, %{2 => :dissoc!}, nil},
       "hash-map" => {BeamLisp.Transient, %{0 => :hash_map_empty}, {2, :hash_map}}

@@ -206,8 +206,9 @@ defmodule BeamLisp.Wave18RTTest do
     test "slice 50 flatten loads verbatim and behaves" do
       load_fixture("slice_50_flatten.bl", "wave18.fl")
       ns = "wave18.fl"
-      assert eval_in(ns, "(flatten [1 [2 [3 4]] 5])") == eval_in("'(1 2 3 4 5)")
-      assert eval_in(ns, "(flatten nil)") == eval_in("[]")
+      assert BeamLisp.Test.realize(eval_in(ns, "(flatten [1 [2 [3 4]] 5])")) == eval_in("'(1 2 3 4 5)")
+      # flatten is lazy: flattening nil is an empty lazy seq, realized here
+      assert BeamLisp.Test.realize(eval_in(ns, "(flatten nil)")) == []
     end
   end
 

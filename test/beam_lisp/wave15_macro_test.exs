@@ -12,7 +12,7 @@ defmodule BeamLisp.Wave15MacroTest do
   # RT.invoke gap owned by the runtime (BeamLisp.RT), not this wave.
   use ExUnit.Case, async: false
 
-  alias BeamLisp.{Compiler, Env}
+  alias BeamLisp.{Compiler, Env, Test}
 
   setup do
     BeamLisp.init()
@@ -114,7 +114,7 @@ defmodule BeamLisp.Wave15MacroTest do
       assert eval("(clojure.core/inc 5)") == 6
       assert eval("(clojure.core/str 1 \"a\")") == "1a"
       assert eval("(clojure.core/not 3)") == false
-      assert eval("(clojure.core/map clojure.core/inc [1 2 3])") == [2, 3, 4]
+      assert Test.realize(eval("(clojure.core/map clojure.core/inc [1 2 3])")) == [2, 3, 4]
       # as a value (a var, not a call)
       assert is_function(eval("clojure.core/inc"))
     end
@@ -164,7 +164,7 @@ defmodule BeamLisp.Wave15MacroTest do
 
     test "->> threads the last argument (slice_11)" do
       load_slice("slice_11_thread_last_macro.bl", "w15.threadl")
-      assert eval_in("w15.threadl", "(->> [1 2 3] (map inc) (map inc))") == [3, 4, 5]
+      assert Test.realize(eval_in("w15.threadl", "(->> [1 2 3] (map inc) (map inc))")) == [3, 4, 5]
       assert eval_in("w15.threadl", "(->> 5 (- 1))") == -4
     end
 

@@ -36,6 +36,11 @@ defmodule BeamLisp.LazySeq do
 
   @table :beam_lisp_vars
 
+  # Chunked seq fns realize this many elements per thunk, so the
+  # per-element LazySeq allocation is amortized instead of one struct +
+  # closure per element (the reason Clojure chunks at 32).
+  @chunk_size 32
+
   defstruct key: nil, thunk: nil
 
   @type t :: %__MODULE__{key: reference(), thunk: (-> term)}
@@ -51,6 +56,23 @@ defmodule BeamLisp.LazySeq do
   @doc "Is `x` a lazy seq?"
   def lazy?(%__MODULE__{}), do: true
   def lazy?(_), do: false
+
+  @doc "The chunk size for chunked realization (32, as in Clojure)."
+  def chunk_size, do: @chunk_size
+
+  @doc """
+  Build a realized cons chain `e1 | e2 | … | ek | <lazy tail>` from the
+  non-empty proper list `elems` (k ≤ `@chunk_size`) and a 0-arity `tail_fun`
+  producing the next segment (or nil). Chunked seq fns return one of these
+  from a single thunk: a consumer that stops inside the chunk (like `take 5`)
+  never forces the tail, while each element past the first costs only a cons
+  cell instead of a fresh LazySeq node.
+  """
+  def chain([], _tail_fun), do: nil
+
+  def chain(elems, tail_fun) when is_function(tail_fun, 0) do
+    List.foldr(elems, new(tail_fun), fn e, acc -> [e | acc] end)
+  end
 
   @doc "Run a node's thunk exactly once, caching and returning the result."
   def force(%__MODULE__{key: key, thunk: thunk}) do
@@ -107,7 +129,7 @@ defmodule BeamLisp.LazySeq do
   def cell([]), do: nil
   def cell(%__MODULE__{} = l), do: realize(l)
   def cell(xs) when is_list(xs), do: xs
-  def cell(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.to_list(v)
+  def cell(%BeamLisp.Vector{} = v), do: normalize_cell(BeamLisp.Vector.to_list(v))
   # A lazy-seq body may return any seqable — jank wraps a bare
   # collection in `(lazy-seq c1)` — so anything Enumerable becomes a
   # cell rather than falling through as an opaque value that the walk
