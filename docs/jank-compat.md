@@ -48,13 +48,13 @@ pass, higher arities fail) · **✗ fail** (a recorded gap).
 | 01 | constantly | 1048–1052 | `constantly` | ✓ | — self-contained |
 | 02 | identity | 1054–1057 | `identity` | ✓ | — also in prelude |
 | 03 | complement | 1059–1067 | `complement` | ✓ | needs `apply`(2-arity) + `not` |
-| 04 | comp | 1186–1201 | `comp` | ◐ | 2-arity ✓; 4-arity needs `list*`/`next` |
-| 05 | juxt | 2084–2118 | `juxt` | ◐ | 2-arity ✓; 4-arity needs `list*`/`next` |
-| 06 | partial | 2120–2147 | `partial` | ◐ | ≤3 fixed ✓; 4+ fixed needs variadic `apply` |
+| 04 | comp | 1186–1201 | `comp` | ✓ | *was ◐* — closed by `list*` + variadic `apply` (wave 14) |
+| 05 | juxt | 2084–2118 | `juxt` | ✓ | *was ◐* — closed by `list*` + variadic `apply` + `#()` (wave 14) |
+| 06 | partial | 2120–2147 | `partial` | ✓ | *was ◐* — closed by variadic `apply` (wave 14) |
 | 07 | fnil | 2149–2170 | `fnil` | ✓ | needs `apply`(2-arity) |
-| 08 | some | 2172–2180 | `some` | ✗ | `next` (only hit when first selector is falsy) |
-| 09 | not-any? | 2262–2263 | `not-any?` | ✗ | → `some` → `next` |
-| 10 | `->` | 2265–2279 | `->` macro | ✗ | `loop*`, `next`, `seq?`, `with-meta`, `meta` |
+| 08 | some | 2172–2180 | `some` | ✓ | *was ✗* — closed by `next` (wave 14) |
+| 09 | not-any? | 2262–2263 | `not-any?` | ✓ | *was ✗* — closed by `next` + the `not` fix (wave 14); needs the `some` slice loaded alongside, which is core.jank's own dependency |
+| 10 | `->` | 2265–2279 | `->` macro | ✗ | `loop*`, `seq?`, `with-meta`, `meta` |
 | 11 | `->>` | 2281–2295 | `->>` macro | ✗ | same as `->` |
 | 12 | key/val | 2298–2307 | `key`, `val` | ✓ | `first`/`second` |
 | 13 | if-let | 2608–2626 | `if-let` macro | ✗ | → `assert-macro-args` |
@@ -62,22 +62,27 @@ pass, higher arities fail) · **✗ fail** (a recorded gap).
 | 15 | if-not | 2662–2667 | `if-not` macro | ✓ | pure |
 | 16 | dotimes | 2686–2701 | `dotimes` macro | ✗ | → `assert-macro-args` |
 | 17 | doseq | 2703–2756 | `doseq` macro | ✗ | → `assert-macro-args` |
-| 18 | doto | 2927–2941 | `doto` macro | ✗ | `with-meta`, `seq?`, `meta`, `next` |
-| 19 | trampoline | 6999–7013 | `trampoline` | ✗ | `fn?`, `#()` fn literals |
+| 18 | doto | 2927–2941 | `doto` macro | ✗ | `with-meta`, `seq?`, `meta` on forms |
+| 19 | trampoline | 6999–7013 | `trampoline` | ✓ | *was ✗* — closed by `fn?` + `#()` fn literals (wave 14) |
 | 20 | while | 7015–7022 | `while` macro | ✓ | pure (`loop`/`when`/`recur`) |
-| 21 | memoize | 7024–7036 | `memoize` | ✗ | `if-let` → `assert-macro-args`, `find` |
+| 21 | memoize | 7024–7036 | `memoize` | ✗ | `if-let` → `assert-macro-args` (`find` now exists) |
 
 ## Counts — the headline
 
-> **7 of 21 slices** load **and** behave correctly (8 definitions:
-> `constantly`, `identity`, `complement`, `fnil`, `key`, `val`, `if-not`,
-> `while`). A further **3 are partial** (comp, juxt, partial — they pass
-> their everyday arities and only fail the variadic ones). **11 fail** on
-> recorded gaps. **All 21 read + compile** — the reader and compiler never
-> rejected a form; every failure is a missing runtime facility, not a
-> syntax rejection.
+> **13 of 21 slices** load **and** behave correctly (14 definitions:
+> `constantly`, `identity`, `complement`, `comp`, `juxt`, `partial`,
+> `fnil`, `some`, `not-any?`, `key`, `val`, `if-not`, `trampoline`,
+> `while`). **8 fail** on recorded gaps, and every one of those is now a
+> macro-level gap (`assert-macro-args`, form metadata) rather than a
+> missing runtime facility. **All 21 read + compile** — the reader and
+> compiler never rejected a form.
+>
+> Wave 14 moved this from **7/21 to 13/21** by building exactly what this
+> document ranked: `next`, `list*`, variadic `apply`, the predicate layer,
+> and `#()` fn literals. Nothing was patched into passing; the fixtures
+> are still byte-for-byte upstream, and the checksum test proves it.
 
-The 7 passing slices are the ones exercised by `test/beam_lisp/jank_compat_test.exs`
+The 13 passing slices are exercised by `test/beam_lisp/jank_compat_test.exs`
 (accepted only) and demonstrated end-to-end by `examples/jank_slice.bl`
 (unmodified jank `while`/`constantly`/`complement`/`fnil`/`key`/`val`
 running on the BEAM, exit 0).
@@ -146,27 +151,37 @@ running on the BEAM, exit 0).
 
 ## What to build next (by unlock count)
 
-1. **`next` (+ `list*`/`spread`)** — unlocks `some`, `not-any?`,
-   comp/juxt variadic paths, and `assert-macro-args`. Every recursive seq
-   function in the file leans on it. Biggest single lever (~5 slices now,
-   and unblocks the whole recursive-seq style of `core.jank`).
-2. **`#()` fn literals (+ `%` args), reader-level** — unlocks juxt-4a,
-   trampoline-2a, run!, every-pred, some-fn, and the idiomatic fn-literal
-   body of the file. Gates the largest fraction of readable forms.
-3. **The let-macro family via `assert-macro-args`** — needs `meta`/`list*`/
-   `next` + a `clojure.core` alias + `&form`. Unlocks the *six*-slice
-   family `if-let`/`when-let`/`if-some`/`when-some`/`dotimes`/`doseq` —
-   the largest single family in the measurement.
-4. **`with-meta` / `meta`** — unlocks doto, keys/vals, set, and the
-   metadata pattern the head of core.jank is built on.
-5. **Variadic `apply`** (semantic) — unlocks partial's variadic path and
-   the spread-based `apply` idiom.
-6. **Predicate prims** (`fn?`, `seq?`, `boolean`, `find`, `contains?`,
-   type predicates) — unlock trampoline, select-keys, memoize, keyword/ident.
-7. **`cpp/*`-implemented primitives** — to escape the pure-Clojure leaf
-   band, beam-lisp must supply the primitive layer (nth/get/contains?/
-   hash-set/bit ops/set ops) that jank implements via runtime interop.
-   This is the long tail that makes the *rest* of core.jank loadable.
+*Re-ranked after wave 14, which closed the top of the previous list
+(`next`, `list*`, variadic `apply`, the predicate layer, `#()`
+literals) and took the measurement from 7/21 to 13/21.*
+
+1. **`assert-macro-args` and the macro-authoring surface it needs** —
+   `&form`/`&env`, form metadata (`meta`/`with-meta` on the form data a
+   macro receives), and a `clojure.core` alias so upstream's qualified
+   references resolve. This single chain gates **six of the eight**
+   remaining slices: `if-let`, `when-let`, `dotimes`, `doseq`, plus
+   `memoize` transitively — by far the largest lever left, and the one
+   that opens the macro-heavy middle of `core.jank`.
+2. **Form metadata for the threading macros** — `->`/`->>`/`doto` build
+   their expansions with `(with-meta … (meta form))` and test shape with
+   `seq?`. beam-lisp's metadata layer is deliberately bounded (values on
+   the BEAM have no attachment slot; see `BeamLisp.Meta`), so the honest
+   move is metadata on *form data* specifically — which the compiler
+   controls end to end — rather than on arbitrary runtime values.
+   Unlocks slices 10, 11, 18.
+3. **`loop*`** — upstream's macros expand to `loop*`, the primitive
+   beneath `loop`. Cheap: alias it to the existing `loop` special form.
+4. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`) — needed
+   by `keys`/`vals`/`set`/`zipmap` upstream, and a natural follow-on to
+   the wave-8 trie, which already has the internal structure for them.
+5. **`namespace`, `rem`/`mod`/`quot`, and the remaining numeric tower** —
+   small, mechanical, each unlocking a leaf.
+6. **`cpp/*`-implemented primitives** — the long tail. jank implements
+   `nth`/`get`/`contains?`/`hash-set`/`peek`/`pop`/bit ops/set ops via
+   `(cpp/jank.runtime.*)` interop. beam-lisp needs BEAM equivalents
+   under a mapped namespace before slices built on primitives are
+   reachable at all. This is what makes the *rest* of `core.jank`
+   loadable, and it is a wave of its own.
 
 ## Keeping this honest
 

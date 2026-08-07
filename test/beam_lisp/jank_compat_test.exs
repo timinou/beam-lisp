@@ -37,7 +37,24 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_15_if_not.bl", "jank.accept.ifnot",
      "1b1b4b07fc9887d3b0673a913a31a70a4822441dd1792176a47a7cf4c66378f1"},
     {"slice_20_while.bl", "jank.accept.while",
-     "638ee5ed4e951a6051d1cd076dbd95f2502a8076d677b63f2c3a68fb3fdfb1c4"}
+     "638ee5ed4e951a6051d1cd076dbd95f2502a8076d677b63f2c3a68fb3fdfb1c4"},
+    # Promoted by wave 14 (next / list* / variadic apply / predicates /
+    # reader `#()`). Each was a recorded FAIL before that wave.
+    {"slice_04_comp.bl", "jank.accept.comp",
+     "0d443f90af3b946aaa37aad4b30ffd8972ed201c2993af482d69284db7af13ff"},
+    {"slice_05_juxt.bl", "jank.accept.juxt",
+     "b4b6749ff3721789b6f9ba1164200beacd0bbd2d7c7115eca6a1505da1a44bbe"},
+    {"slice_06_partial.bl", "jank.accept.partial",
+     "91049610d2c834f2ebe48fb4792159b0e20881d2221a627920d964d7c948e7d7"},
+    {"slice_08_some.bl", "jank.accept.some",
+     "bcd75831ce14743d96360be096f31c9b75b0750587abc4cd782b4b073f9d5cf6"},
+    # not-any? is (comp not some) upstream, so its own slice needs the
+    # `some` slice loaded alongside it — a real dependency in core.jank,
+    # not a beam-lisp gap.
+    {"slice_09_not_any.bl", "jank.accept.notany",
+     "7138ca6278a5802672310d47aecdc3966ae0e1b640d111fa974ef1a19fbc8066"},
+    {"slice_19_trampoline.bl", "jank.accept.trampoline",
+     "cfcc184828d5eec2cd564f6086cec74d1c8d21790eeb5bfb915aac4938e4df67"}
   ]
 
   setup_all do
@@ -114,6 +131,64 @@ defmodule BeamLisp.JankCompatTest do
     test "while loops until its test is falsy" do
       load_slice("slice_20_while.bl", "jank.accept.while")
       assert eval_in("jank.accept.while", "(def c (atom 0)) (while (< @c 3) (swap! c inc)) @c") == 3
+    end
+
+    # --- promoted by wave 14: next / list* / variadic apply /
+    # predicates / reader `#()`. Each of these was a recorded FAIL in
+    # docs/jank-compat.md before that wave.
+
+    test "comp composes right to left, at every arity" do
+      load_slice("slice_04_comp.bl", "jank.accept.comp")
+      assert eval_in("jank.accept.comp", "((comp) 7)") == 7
+      assert eval_in("jank.accept.comp", "((comp inc) 1)") == 2
+      assert eval_in("jank.accept.comp", "((comp inc inc) 1)") == 3
+      # the 4-arity path needs list* and variadic apply
+      assert eval_in("jank.accept.comp", "((comp inc inc inc inc) 0)") == 4
+    end
+
+    test "juxt applies every fn to the same args" do
+      load_slice("slice_05_juxt.bl", "jank.accept.juxt")
+      # the 4-fn path goes through reduce and a `#()` literal.
+      # Upstream juxt conjes onto `[]`, so the result is a vector —
+      # beam-lisp keeps vectors and lists structurally distinct.
+      assert eval_in("jank.accept.juxt", "((juxt + - * /) 10 2)") ==
+               BeamLisp.Vector.new([12, 8, 20, 5.0])
+    end
+
+    test "partial fixes leading arguments" do
+      load_slice("slice_06_partial.bl", "jank.accept.partial")
+      assert eval_in("jank.accept.partial", "((partial + 1) 2)") == 3
+      assert eval_in("jank.accept.partial", "((partial + 1 2) 3)") == 6
+      assert eval_in("jank.accept.partial", "((partial + 1 2 3) 4)") == 10
+    end
+
+    test "some returns the first logical-true result, else nil" do
+      load_slice("slice_08_some.bl", "jank.accept.some")
+      assert eval_in("jank.accept.some", "(some even? [1 2 3])") == true
+      assert eval_in("jank.accept.some", "(some even? [1 3 5])") == nil
+    end
+
+    test "not-any? is the complement of some" do
+      # Upstream not-any? is (comp not some), so its slice needs the
+      # `some` slice in the same namespace. That is core.jank's own
+      # dependency, satisfied here with unmodified upstream text.
+      load_slice("slice_08_some.bl", "jank.accept.notany")
+      load_slice("slice_09_not_any.bl", "jank.accept.notany")
+      assert eval_in("jank.accept.notany", "(not-any? even? [1 3 5])") == true
+      assert eval_in("jank.accept.notany", "(not-any? even? [1 2])") == false
+    end
+
+    test "trampoline runs a thunk-returning loop in constant stack" do
+      load_slice("slice_19_trampoline.bl", "jank.accept.trampoline")
+      assert eval_in("jank.accept.trampoline", "(trampoline identity 5)") == 5
+
+      # mutual recursion through thunks — the reason trampoline exists,
+      # and 100k deep to show it really is constant stack
+      assert eval_in("jank.accept.trampoline", """
+             (defn ev? [n] (if (= n 0) true (fn [] (od? (- n 1)))))
+             (defn od? [n] (if (= n 0) false (fn [] (ev? (- n 1)))))
+             (trampoline ev? 100000)
+             """) == true
     end
   end
 end
