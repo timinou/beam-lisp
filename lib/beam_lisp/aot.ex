@@ -84,7 +84,7 @@ defmodule BeamLisp.AOT do
     boot()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      path |> File.read!() |> compile_source(opts)
+      path |> File.read!() |> compile_source(Keyword.put_new(opts, :file, path))
     end)
   end
 
@@ -104,9 +104,15 @@ defmodule BeamLisp.AOT do
     # capturing any defs.
     Env.in_ns("user")
 
+    # The source path rides along so an AOT-compiled module's line table
+    # names the .bl file. These .beam files persist and are what a
+    # production stack trace hits, so this is the attribution that
+    # matters most — an eval module is transient, this is not.
+    file = Keyword.get(opts, :file)
+
     {value_defs, touched, ns_meta} =
       source
-      |> Reader.read_all()
+      |> Reader.read_string(file)
       |> Enum.reduce({%{}, MapSet.new(), %{}}, fn form, {vdefs, nss, nsmeta} ->
         ns = Env.current_ns()
         vdefs = capture_value_def(vdefs, form, ns)
@@ -120,7 +126,7 @@ defmodule BeamLisp.AOT do
     |> Enum.filter(fn ns -> Map.has_key?(value_defs, ns) or Env.ns_defs(ns) != %{} end)
     |> Enum.sort()
     |> Enum.map(fn ns ->
-      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir)
+      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file)
     end)
   end
 
@@ -160,6 +166,11 @@ defmodule BeamLisp.AOT do
   # namespace module can re-run it in `__bl_init__/0`. Latest def wins,
   # but first-definition order is preserved (a later def may reference
   # an earlier one).
+  # Reader forms arrive carrying source positions, so peel the wrapper
+  # before matching shape. Only lists are wrapped, so this one clause
+  # per matcher is the whole cost of position-awareness here.
+  defp capture_value_def(vdefs, {:meta, form, _m}, ns), do: capture_value_def(vdefs, form, ns)
+
   defp capture_value_def(vdefs, {:list, [{:symbol, "def"}, {:symbol, name} | rest]}, ns) do
     case rest do
       [init] -> put_value_def(vdefs, ns, name, nil, init)
@@ -175,6 +186,8 @@ defmodule BeamLisp.AOT do
   # declaration so `__bl_init__/0` can re-run them in a fresh VM (a
   # referred var like `greet` resolves through these at runtime). Latest
   # declaration of an alias/refer wins.
+  defp capture_ns_decl(ns_meta, {:meta, form, _m}), do: capture_ns_decl(ns_meta, form)
+
   defp capture_ns_decl(ns_meta, {:list, [{:symbol, "ns"}, {:symbol, ns} | clauses]}) do
     {aliases, refers} =
       Enum.reduce(clauses, {[], []}, fn
@@ -227,7 +240,7 @@ defmodule BeamLisp.AOT do
   end
 
   # Build and compile the namespace module, then write its beam.
-  defp emit_module(ns, value_defs, ns_meta, output_dir) do
+  defp emit_module(ns, value_defs, ns_meta, output_dir, file) do
     mod = Link.module_for(ns)
     ns_defs = Env.ns_defs(ns)
     fn_asts = Enum.flat_map(ns_defs, fn {_name, defs} -> Enum.map(defs, &elem(&1, 3)) end)
@@ -242,7 +255,7 @@ defmodule BeamLisp.AOT do
         end
       end
 
-    beam = compile_quoted!(quoted, "beam_lisp_aot/#{ns}.bl")
+    beam = compile_quoted!(quoted, file || "beam_lisp_aot/#{ns}.bl")
     path = Path.join(output_dir, Atom.to_string(mod) <> ".beam")
     File.mkdir_p!(output_dir)
     File.write!(path, beam)
