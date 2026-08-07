@@ -27,6 +27,28 @@ defmodule BeamLisp.Reader do
   BeamLisp.RT.reader_macro!/2). `;` starts a line comment and `,`
   is whitespace, same as in jank and Clojure.
 
+  The dispatch `#` prefixes a small set of reader macros, all of which
+  desugar into ordinary forms here — the compiler never sees them.
+
+    * `#(...)` — fn literal. `#(+ % 1)` reads as `(fn [p1__] (+ p1__ 1))`.
+      `%` is `%1`, `%2`… are positional, `%&` is the rest arg. Arity is
+      the highest `%N` used; no `%` at all gives a zero-arg fn. Nested
+      `#()` is an error (as in Clojure). Generated params (`p1__`..`pN__`,
+      `rest__`) are names a human would not write, so they cannot capture
+      a user local the way `p1` might. `%` inside a nested plain `(fn …)`
+      still belongs to the literal (Clojure's rule); unlike Clojure, which
+      only rewrites `%` in list position, the walk here rewrites it inside
+      every collection too, so `#(vector [% %])` works.
+    * `#_ form` — discard: reads and drops the next form, so `(+ 1 #_2 3)`
+      is `(+ 1 3)`. (A trailing `#_` with nothing after is an error.)
+
+  Character literals `\\a` `\\newline` `\\space` `\\tab` `\\return`
+  `\\backspace` `\\formfeed` `\\uNNNN` and `\\\\` read as **integer
+  codepoints**, BEAM's native representation of a character (Elixir's `?a`
+  is an integer too). `(str \\a)` therefore yields `"97"`, diverging from
+  Clojure — closing that needs a runtime char wrapper, a later wave. The
+  reader gap (a bare symbol `\\a`) is closed here; the value is a literal.
+
   ## Atom safety
 
   The reader interns nothing — symbol and keyword names travel as plain
@@ -51,11 +73,13 @@ defmodule BeamLisp.Reader do
   @default_atom_check_interval 256
   @guard_count_key {__MODULE__, :atom_guard_count}
   @guard_cfg_key {__MODULE__, :atom_guard_cfg}
+  @fn_literal_depth_key {__MODULE__, :fn_literal_depth}
 
   @spec read_all(String.t()) :: [term]
   def read_all(source) when is_binary(source) do
     Process.put(@guard_cfg_key, atom_guard_config())
     Process.put(@guard_count_key, 0)
+    Process.put(@fn_literal_depth_key, 0)
 
     case forms(String.to_charlist(source)) do
       {:ok, forms, rest} ->
@@ -115,6 +139,12 @@ defmodule BeamLisp.Reader do
       [?@ | rest] ->
         wrap_form(rest, "@", "deref")
 
+      [?#, ?( | rest] ->
+        fn_literal(rest)
+
+      [?#, ?_ | rest] ->
+        discard_form(rest)
+
       [?" | rest] -> string(rest, [])
       rest -> atom_form(rest)
     end
@@ -146,6 +176,103 @@ defmodule BeamLisp.Reader do
       :none -> {:error, "#{name} with no following form"}
       err -> err
     end
+  end
+
+  # `#(...)` fn literal: read the body, then desugar into the existing
+  # `(fn [params] body)` form the compiler already handles — Clojure does
+  # this as a reader macro too. A nested `#()` inside the body is an error,
+  # tracked via a process-dict depth flag.
+  defp fn_literal(rest) do
+    if Process.get(@fn_literal_depth_key, 0) > 0 do
+      {:error, "nested #() fn literals are not allowed"}
+    else
+      Process.put(@fn_literal_depth_key, 1)
+
+      try do
+        # The `(...)` after `#` is a single list and becomes the fn's one
+        # body form: `#(+ % 1)` → `(fn [p1__] (+ p1__ 1))`.
+        case collection(skip_ignored(rest), ?), &{:list, &1}) do
+          {:ok, {:list, items}, rest} -> {:ok, desugar_fn(items), rest}
+          err -> err
+        end
+      after
+        Process.put(@fn_literal_depth_key, 0)
+      end
+    end
+  end
+
+  # `#_ form` reads and drops the next form, then continues reading from
+  # after it — so `#_` behaves like whitespace that happens to consume a
+  # form: `(+ 1 #_2 3)` is `(+ 1 3)`. A trailing `#_` is an error.
+  defp discard_form(rest) do
+    case form(skip_ignored(rest)) do
+      {:ok, _discarded, rest} -> form(skip_ignored(rest))
+      :none -> {:error, "#_ must be followed by a form"}
+      err -> err
+    end
+  end
+
+  # Rewrite the `#(...)` body into a single-clause `(fn [params] body)`.
+  # Params are p1__..pN__ (rest: rest__) — names with a marker a human
+  # would not write, so they cannot capture a user local the way a plain
+  # `p1` could. Arity is the highest positional `%N` used; `%` is `%1`.
+  defp desugar_fn(items) do
+    {body, {max_arg, has_rest}} = Enum.map_reduce(items, {0, false}, &rewrite_fn_arg/2)
+    {:list, [{:symbol, "fn"}, fn_params(max_arg, has_rest), {:list, body}]}
+  end
+
+  # Deep rewrite: `%`/`%N`/`%&` are replaced inside every collection,
+  # including a nested plain `(fn …)` — the literal's `%`s still belong to
+  # the literal (Clojure's rule). Unlike Clojure, which only rewrites in
+  # list position (a quirk that leaks raw `%` into vectors), this walk
+  # covers vectors and maps too, so `#(vector [% %])` reads as intended.
+  defp rewrite_fn_arg({:symbol, name}, {max_arg, has_rest}) do
+    case fn_arg_index(name) do
+      nil -> {{:symbol, name}, {max_arg, has_rest}}
+      {:arg, n} -> {{:symbol, "p#{n}__"}, {max(max_arg, n), has_rest}}
+      :rest -> {{:symbol, "rest__"}, {max_arg, true}}
+    end
+  end
+
+  defp rewrite_fn_arg({:list, items}, acc) do
+    rewrite_fn_children(items, &{:list, &1}, acc)
+  end
+
+  defp rewrite_fn_arg({:vector, items}, acc) do
+    rewrite_fn_children(items, &{:vector, &1}, acc)
+  end
+
+  defp rewrite_fn_arg({:map, kvs}, acc) do
+    flat = Enum.flat_map(kvs, &Tuple.to_list/1)
+    {rewritten, acc} = Enum.map_reduce(flat, acc, &rewrite_fn_arg/2)
+    kvs = Enum.chunk_every(rewritten, 2) |> Enum.map(&List.to_tuple/1)
+    {{:map, kvs}, acc}
+  end
+
+  defp rewrite_fn_arg(other, acc), do: {other, acc}
+
+  defp rewrite_fn_children(items, wrap, acc) do
+    {rewritten, acc} = Enum.map_reduce(items, acc, &rewrite_fn_arg/2)
+    {wrap.(rewritten), acc}
+  end
+
+  # Recognize a fn-literal arg token. `%` is `%1`; `%2`..`%N` are
+  # positional; `%&` is the rest arg; anything else (e.g. `%foo`, `%0`) is
+  # not an arg and is left untouched.
+  defp fn_arg_index("%"), do: {:arg, 1}
+  defp fn_arg_index("%&"), do: :rest
+  defp fn_arg_index("%" <> digits) do
+    case Integer.parse(digits) do
+      {n, ""} when n >= 1 -> {:arg, n}
+      _ -> nil
+    end
+  end
+  defp fn_arg_index(_), do: nil
+
+  defp fn_params(max_arg, has_rest) do
+    positional = if max_arg >= 1, do: for(i <- 1..max_arg, do: {:symbol, "p#{i}__"}), else: []
+    rest_elems = if has_rest, do: [{:symbol, "&"}, {:symbol, "rest__"}], else: []
+    {:vector, positional ++ rest_elems}
   end
 
   defp collection(rest, closer, wrap) do
@@ -222,6 +349,32 @@ defmodule BeamLisp.Reader do
   defp classify("true"), do: true
   defp classify("false"), do: false
   defp classify(":" <> name), do: {:keyword, name}
+
+  # Character literals read as integer codepoints — BEAM's native
+  # representation of a char (Elixir's `?a` is an integer too). The
+  # str/print consequence is documented in the moduledoc.
+  defp classify("\\newline"), do: ?\n
+  defp classify("\\space"), do: ?\s
+  defp classify("\\tab"), do: ?\t
+  defp classify("\\return"), do: ?\r
+  defp classify("\\backspace"), do: ?\b
+  defp classify("\\formfeed"), do: ?\f
+  defp classify("\\" <> rest) do
+    case rest do
+      "u" <> hex ->
+        if hex =~ ~r/^[0-9a-fA-F]{4}$/ do
+          String.to_integer(hex, 16)
+        else
+          raise SyntaxError, message: "invalid character literal: \\u#{hex}"
+        end
+
+      _ ->
+        case String.to_charlist(rest) do
+          [c] -> c
+          _ -> raise SyntaxError, message: "invalid character literal: \\#{rest}"
+        end
+    end
+  end
 
   defp classify(token) do
     case Integer.parse(token) do
