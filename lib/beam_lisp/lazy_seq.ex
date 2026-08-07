@@ -58,6 +58,13 @@ defmodule BeamLisp.LazySeq do
   def realize(%__MODULE__{} = l) do
     case force(l) do
       [] -> nil
+      # A lazy-seq body may hand back any seqable rather than a cons
+      # cell — jank writes `(lazy-seq c1)` around a bare collection —
+      # so normalize it here, at the one place a thunk's value enters
+      # the walk. Without this a realized vector reached the walk
+      # loops as an opaque value and crashed with no matching clause.
+      %BeamLisp.Vector{} = v -> normalize_cell(BeamLisp.Vector.to_list(v))
+      %BeamLisp.Set{} = s -> normalize_cell(BeamLisp.Set.to_list(s))
       value -> value
     end
   end
@@ -73,7 +80,24 @@ defmodule BeamLisp.LazySeq do
   def cell(%__MODULE__{} = l), do: realize(l)
   def cell(xs) when is_list(xs), do: xs
   def cell(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.to_list(v)
-  def cell(other), do: other
+  # A lazy-seq body may return any seqable — jank wraps a bare
+  # collection in `(lazy-seq c1)` — so anything Enumerable becomes a
+  # cell rather than falling through as an opaque value that the walk
+  # loops then cannot match. Non-seqable values still pass through.
+  def cell(%BeamLisp.Set{} = s), do: normalize_cell(BeamLisp.Set.to_list(s))
+
+  def cell(other) do
+    # Reaching here means `other` is neither nil, a list, nor one of
+    # our collection structs. If it is Enumerable (a range, a map,
+    # a MapSet), treat it as a seq; otherwise pass it through.
+    case Enumerable.impl_for(other) do
+      nil -> other
+      _ -> normalize_cell(Enum.to_list(other))
+    end
+  end
+
+  defp normalize_cell([]), do: nil
+  defp normalize_cell(xs), do: xs
 
   @doc "Fully realize into a proper list (iterative — a 100k `doall` cannot blow the stack)."
   def to_list(lazy), do: to_list_loop(cell(lazy), [])

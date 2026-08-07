@@ -53,6 +53,16 @@ defmodule BeamLisp.Transient do
     {@tag, :vector, key}
   end
 
+  def transient(%BeamLisp.Set{} = s) do
+    # Before the is_map clause: a set is a struct, and a struct is a
+    # map, so without this it would become a map transient and
+    # conj! would fail. jank's `set` is written as
+    # (persistent! (reduce conj! (transient #{}) coll)).
+    key = make_ref()
+    put_state(key, {:alive, {:set, s}})
+    {@tag, :set, key}
+  end
+
   def transient(m) when is_map(m) do
     key = make_ref()
     put_state(key, {:alive, {:map, m}})
@@ -70,6 +80,14 @@ defmodule BeamLisp.Transient do
       {:alive, {:vec, rev}} ->
         put_state(key, {:alive, {:vec, [x | rev]}})
         {@tag, :vector, key}
+    end
+  end
+
+  def conj!({@tag, :set, key}, x) do
+    case state(key) do
+      {:alive, {:set, s}} ->
+        put_state(key, {:alive, {:set, BeamLisp.Set.add(s, x)}})
+        {@tag, :set, key}
     end
   end
 
@@ -95,6 +113,7 @@ defmodule BeamLisp.Transient do
   def persistent!({@tag, kind, key}) do
     case {kind, Process.delete(key)} do
       {:vector, {:alive, {:vec, rev}}} -> Vector.new(Enum.reverse(rev))
+      {:set, {:alive, {:set, s}}} -> s
       {:map, {:alive, {:map, m}}} -> m
       _ -> raise ArgumentError, "persistent! on an already-persisted transient"
     end

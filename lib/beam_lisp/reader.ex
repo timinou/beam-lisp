@@ -142,6 +142,12 @@ defmodule BeamLisp.Reader do
       [?#, ?( | rest] ->
         fn_literal(rest)
 
+      [?#, ?{ | rest] ->
+        # `#{a b}` is a set literal. It must be matched before the bare
+        # `#` token path, and before `{`, since `#` alone is a legal
+        # symbol character (trailing `#` is the auto-gensym marker).
+        collection(rest, ?}, &{:set, &1})
+
       [?#, ?_ | rest] ->
         discard_form(rest)
 

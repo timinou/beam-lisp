@@ -106,6 +106,14 @@ defmodule BeamLisp.Compiler do
     {:%{}, [], Enum.map(kvs, fn {k, v} -> {compile(k, notail(env)), compile(v, notail(env))} end)}
   end
 
+  def compile({:set, items}, env) do
+    members = Enum.map(items, &compile(&1, notail(env)))
+
+    quote do
+      BeamLisp.Set.new(unquote(members))
+    end
+  end
+
   # --- symbols ---
 
   def compile({:symbol, name}, env) do
@@ -868,6 +876,9 @@ defmodule BeamLisp.Compiler do
   defp data_to_form(%BeamLisp.Vector{} = v),
     do: {:vector, Enum.map(BeamLisp.Vector.to_list(v), &data_to_form/1)}
 
+  defp data_to_form(%BeamLisp.Set{} = s),
+    do: {:set, Enum.map(BeamLisp.Set.to_list(s), &data_to_form/1)}
+
   defp data_to_form(items) when is_list(items),
     do: {:list, Enum.map(items, &data_to_form/1)}
 
@@ -1416,6 +1427,7 @@ defmodule BeamLisp.Compiler do
   defp datum({:meta, form, m}), do: {:meta, datum(form), m}
   defp datum({:list, items}), do: Enum.map(items, &datum/1)
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
+  defp datum({:set, items}), do: BeamLisp.Set.new(Enum.map(items, &datum/1))
   defp datum({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {datum(k), datum(v)} end)
   defp datum(lit), do: lit
 
