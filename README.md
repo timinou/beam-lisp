@@ -88,7 +88,11 @@ keywords-as-functions, variadic arithmetic and comparisons
 `compare-and-set!` — Agent-backed; `future` and `promise` with
 blocking `deref`, incl. timeout), `@x` sugar — registered in
 `core.bl` through a **rebindable reader-macro table**, not wired
-into the reader — full Elixir/Erlang interop, and a
+into the reader — **`#()` fn literals** (`%`, `%1`, `%&`), `#_`
+discard and char literals, **open dispatch** (`defmulti`/`defmethod`,
+`defprotocol`/`extend-type`, `derive`/`isa?` hierarchies), **lazy
+sequences** (`lazy-seq`, infinite `(range)`, realize-once cells),
+full Elixir/Erlang interop, and a
 self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
 `range`, `zipmap`, `when`, `case`, `future`, … — itself written in
 beam-lisp).
@@ -144,24 +148,63 @@ turning a would-be crash dump into a catchable `AtomLimitError`.
 Cost on the read path is under 1%. `docs/trust-boundary.md` has the
 full model.
 
+Open dispatch is here too: `(defmulti area :shape)` with
+`(defmethod area :circle [s] …)` gives Clojure's runtime-extensible
+multimethods — add a method for a brand-new shape after the fact and
+every earlier call site keeps working. Dispatch values are arbitrary
+(keywords, vectors for multi-arg dispatch, types), with `:default`
+fallback and `derive`/`isa?` hierarchies. `defprotocol` with
+`extend-type`/`extend-protocol` dispatches on the first argument's
+type, and types can be extended after the fact.
+
+Sequences are lazy where you ask for them: `%BeamLisp.LazySeq{}`
+cells realize at most once, `map`/`filter`/`iterate`/`cycle` compose
+lazily over a lazy input, and `(take 5 (map inc (range)))` walks an
+infinite sequence and stops at five. Printing an infinite seq
+terminates too. The seq model is currently hybrid — realized inputs
+take the strict path — for a reason recorded in `!tasks/plans/`.
+
+And `.bl` files can be compiled ahead of time: `mix compile.beam_lisp`
+emits each namespace as a real `.beam` module in the build path,
+proven by a test that loads and calls them in a fresh VM with no
+runtime compilation — the path from Lisp source to a BEAM release.
+
 Deliberate gaps, roughly in priority order:
 
-- **lazy sequences** — the prelude's `map`/`filter` are strict, so
-  infinite sequences are not yet expressible
-- **AOT compilation** — `defn` links into per-namespace modules at
-  runtime (`BeamLisp.Ns.*`); emitting those as compiled project
-  modules for releases is the remaining step
-- **polymorphism** — no multimethods or protocols yet
-- **jank stdlib convergence** — the prelude is a slice; loading more
-  of jank's `core.jank` unmodified is the long-term test of the
-  dialect claim
+- **uniform laziness** — the seq model is hybrid: realized inputs take
+  the strict path, so bounded `(range n)` is eager (`PLAN-010`)
+- **transients** — the trie has the structure for them; bulk builds
+  would stop path-copying
+- **jank stdlib convergence** — 13 of 21 attempted `core.jank` slices
+  run unmodified today; the remaining eight are macro-level gaps,
+  measured and ranked in `docs/jank-compat.md`
 
 ## Relationship to jank
 
 Same language family, different host. jank : C++ interop ::
-beam-lisp : Elixir interop. As the gaps above close, the plan is to
-load increasingly large, unmodified slices of jank's own `core.jank`
-as beam-lisp's standard library — jank already wrote it for us.
+beam-lisp : Elixir interop. jank ships its stdlib as `core.jank` —
+Clojure source — so "is beam-lisp really the same language?" does not
+have to be an opinion. It can be a test.
+
+`test/fixtures/jank/` holds 21 blocks of jank's `core.jank`, vendored
+byte-for-byte from upstream commit `3028594`, each carrying a sha256
+that the test suite asserts — so making a slice pass by editing it
+would fail the build rather than quietly inflate the claim. All 21
+read and compile. **13 of 21 load and behave correctly**, including
+`comp`, `juxt`, `partial`, `some`, `not-any?`, `trampoline`, `fnil`
+and `complement`, called with upstream's own docstring examples:
+
+```console
+$ mix beam_lisp.run examples/jank_slice.bl   # unmodified jank, running on the BEAM
+```
+
+`docs/jank-compat.md` is the measurement: every slice with its
+verdict, every failure classified, and a build-next list ranked by
+how many slices each gap unlocks. It has already served that purpose
+once — the wave that built its top-ranked items (`next`, `list*`,
+variadic `apply`, the predicate layer, `#()` literals) moved the
+score from 7 to 13, and the eight that remain now hang off a single
+lever: the macro-authoring surface `assert-macro-args` needs.
 
 For the alternative design — embedding jank's C++ runtime in the BEAM
 as a NIF — see `!tasks/features/FEAT-001` where the tradeoffs are
@@ -189,6 +232,11 @@ $ mix beam_lisp.run examples/destructuring.bl  # map destructuring, docstrings
 $ mix beam_lisp.run examples/hygiene.bl    # auto-gensym: macros that can't capture
 $ mix beam_lisp.run examples/vectors.bl    # persistent trie vectors at scale
 $ mix beam_lisp.run examples/testing.bl    # deftest/is/run-tests in beam-lisp
+$ mix beam_lisp.run examples/multimethods.bl # open dispatch, extended after the fact
+$ mix beam_lisp.run examples/protocols.bl  # defprotocol/extend-type
+$ mix beam_lisp.run examples/lazy.bl       # infinite sequences, realized once
+$ mix beam_lisp.run examples/fnlit.bl      # #() fn literals
+$ mix beam_lisp.run examples/jank_slice.bl # unmodified jank core.jank on the BEAM
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -200,8 +248,9 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 254 tests: reader, compiler, prelude, vectors, macros, namespaces, receive, errors, refs, hygiene, examples
+$ mix test     # 368 tests: reader, compiler, prelude, vectors, macros, namespaces, dispatch, lazy seqs, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
+$ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
 
 ### The MCP playground (dev only)
