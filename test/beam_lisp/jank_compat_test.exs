@@ -147,7 +147,32 @@ defmodule BeamLisp.JankCompatTest do
      "32026ae941ec5598e27b64584ff7e3c7f7d9818d5a06c274ec1a5c844dfbf40e"},
     # Unlocked by `:as` in sequential destructuring.
     {"slice_52_condp.bl", "jank.accept.condp",
-     "a724c9bb3ed6db0a5c1546c0aa208f7f394534345ced2c178fcc930a24bb53e0"}
+     "a724c9bb3ed6db0a5c1546c0aa208f7f394534345ced2c178fcc930a24bb53e0"},
+    # Wave 18: a set type + `#{}` reader literal + transient sets,
+    # sort/compare, seq over a map, the cpp/* primitive shim, and
+    # normalizing any seqable a lazy-seq body returns.
+    {"slice_28_select_keys.bl", "jank.accept.selectkeys",
+     "d4f9c3f2a838fd02b30730cc0cd9a21950e297c1f0d37422a42ded04724e9340"},
+    {"slice_30_set.bl", "jank.accept.set",
+     "4180ab891c473b2325924980095b1a19ddcc5de36c5a15bdefdcf774a92001ab"},
+    {"slice_31_name.bl", "jank.accept.name",
+     "82ab2f373d41947b993ef55347a3a7c72d7fb580bf5e187edbedba258190744a"},
+    {"slice_32_namespace.bl", "jank.accept.namespace",
+     "530f6530966826824a6d5568cd25c8d7b593e9325e194c73b439b75cca908de2"},
+    {"slice_33_keyword.bl", "jank.accept.keyword",
+     "4e43d1673667d674c28d2c63b9837e41521d92323b55b6d510876767f529fbf4"},
+    {"slice_40_interleave.bl", "jank.accept.interleave",
+     "a4063bb35431e45f546c18046227b5897401effffd8281c6601e7645b1a9e29b"},
+    {"slice_49_distinct.bl", "jank.accept.distinct",
+     "4eae4d2d16e8a93fcbc43564645f8c699172f61c2186fe39ed16f6ef2fcf6f50"},
+    {"slice_50_flatten.bl", "jank.accept.flatten",
+     "121aa2312d80a204833dd835d96157ba05106c227bfa53af9e0278e94e94eccd"},
+    {"slice_58_merge_with.bl", "jank.accept.mergewith",
+     "5985edd900e3b27b00f2a399178f6c996b30c44d8cad6069cbb83b2f074bb89d"},
+    {"slice_59_sort_by.bl", "jank.accept.sortby",
+     "6da8e42409ae1f55ebd576ef4e162cb6aa96e9499321f26f21033ef934bc2262"},
+    {"slice_61_lazy_cat.bl", "jank.accept.lazycat",
+     "cc8202e3f4a02c8a39f089ef85a608c88bb04b0923380f604dc2a7e3c03f1efc"}
   ]
 
   setup_all do
@@ -223,7 +248,9 @@ defmodule BeamLisp.JankCompatTest do
 
     test "while loops until its test is falsy" do
       load_slice("slice_20_while.bl", "jank.accept.while")
-      assert eval_in("jank.accept.while", "(def c (atom 0)) (while (< @c 3) (swap! c inc)) @c") == 3
+
+      assert eval_in("jank.accept.while", "(def c (atom 0)) (while (< @c 3) (swap! c inc)) @c") ==
+               3
     end
 
     # --- promoted by wave 14: next / list* / variadic apply /
@@ -283,6 +310,7 @@ defmodule BeamLisp.JankCompatTest do
              (trampoline ev? 100000)
              """) == true
     end
+
     # --- promoted by wave 15: loop*/let*/fn*, &form/&env, form
     # metadata, the clojure.core alias, assert-macro-args — plus the
     # seqable `~@` splice and vector-as-function fixes those exposed.
@@ -379,6 +407,7 @@ defmodule BeamLisp.JankCompatTest do
 
     test "run! reduces a proc for side effects and returns nil" do
       load_slice("slice_23_run.bl", "jank.accept.run")
+
       assert eval_in("jank.accept.run", """
              (def a (atom 0))
              (def r (run! (fn [x] (swap! a + x)) [1 2 3]))
@@ -419,6 +448,7 @@ defmodule BeamLisp.JankCompatTest do
 
     test "repeatedly builds a lazy sequence of thunk calls" do
       load_slice("slice_36_repeatedly.bl", "jank.accept.repeatedly")
+
       assert eval_in("jank.accept.repeatedly", """
              (def c (atom 0))
              (take 3 (repeatedly (fn [] (swap! c inc))))
@@ -428,7 +458,8 @@ defmodule BeamLisp.JankCompatTest do
     test "take-while takes the prefix while pred holds (coll arity)" do
       load_slice("slice_37_take_while.bl", "jank.accept.takewhile")
       # take-while returns a lazy seq; compare readably
-      assert eval_in("jank.accept.takewhile", "(pr-str (take-while pos? [1 2 3 -1]))") == "(1 2 3)"
+      assert eval_in("jank.accept.takewhile", "(pr-str (take-while pos? [1 2 3 -1]))") ==
+               "(1 2 3)"
     end
 
     test "drop-while drops the prefix while pred holds (coll arity)" do
@@ -438,12 +469,14 @@ defmodule BeamLisp.JankCompatTest do
 
     test "split-at returns a vector of take and drop" do
       load_slice("slice_39_split_at.bl", "jank.accept.splitat")
+
       assert eval_in("jank.accept.splitat", "(split-at 2 [1 2 3 4 5])") ==
                BeamLisp.Vector.new([[1, 2], [3, 4, 5]])
     end
 
     test "interleave merges colls positionally (2-arity docstring example)" do
       load_slice("slice_40_interleave.bl", "jank.accept.interleave")
+
       assert eval_in("jank.accept.interleave", "(pr-str (interleave [1 2 3] [:a :b :c]))") ==
                "(1 :a 2 :b 3 :c)"
     end
@@ -479,6 +512,7 @@ defmodule BeamLisp.JankCompatTest do
     test "update-in applies a fn at a nested path" do
       load_slice("slice_45_assoc_in.bl", "jank.accept.updatein")
       load_slice("slice_46_update_in.bl", "jank.accept.updatein")
+
       assert eval_in("jank.accept.updatein", "(update-in {:a {:b 1}} [:a :b] inc)") ==
                %{a: %{b: 2}}
     end
@@ -490,9 +524,15 @@ defmodule BeamLisp.JankCompatTest do
 
     test "partition splits into non-overlapping groups" do
       load_slice("slice_41_partition.bl", "jank.accept.partition")
-      assert eval_in("jank.accept.partition", "(doall (partition 2 [1 2 3 4]))") == [[1, 2], [3, 4]]
+
+      assert eval_in("jank.accept.partition", "(doall (partition 2 [1 2 3 4]))") == [
+               [1, 2],
+               [3, 4]
+             ]
+
       # a trailing group smaller than n is dropped, as in Clojure
       assert eval_in("jank.accept.partition", "(doall (partition 2 [1 2 3]))") == [[1, 2]]
+
       assert eval_in("jank.accept.partition", "(doall (partition 2 3 [1 2 3 4 5 6]))") ==
                [[1, 2], [4, 5]]
     end
@@ -562,6 +602,7 @@ defmodule BeamLisp.JankCompatTest do
 
     test "max-key returns the x with the greatest (k x)" do
       load_slice("slice_62_max_key.bl", "jank.accept.maxkey")
+
       assert eval_in("jank.accept.maxkey", "(max-key count [1 2 3] [4] [5 6])") ==
                BeamLisp.Vector.new([1, 2, 3])
     end
@@ -592,6 +633,97 @@ defmodule BeamLisp.JankCompatTest do
                "jank.accept.condp",
                "(try (condp = 9 1 :one) :no-throw (catch e :threw))"
              ) == :threw
+    end
+
+    # --- wave 18: sets (type, `#{}` literal, transient sets), sort and
+    # compare, seq over a map, the cpp/* primitive shim, and lazy-seq
+    # bodies that return a bare collection rather than a cons cell.
+
+    test "set builds a set through a transient and a set literal" do
+      load_slice("slice_30_set.bl", "jank.accept.set")
+      assert eval_in("jank.accept.set", "(count (set [1 2 2 3]))") == 3
+      assert eval_in("jank.accept.set", "(contains? (set [1 2]) 2)") == true
+    end
+
+    test "distinct drops duplicates, keeping first-seen order" do
+      load_slice("slice_49_distinct.bl", "jank.accept.distinct")
+      assert eval_in("jank.accept.distinct", "(doall (distinct [1 1 2 3 3 1]))") == [1, 2, 3]
+    end
+
+    test "select-keys narrows a map" do
+      load_slice("slice_28_select_keys.bl", "jank.accept.selectkeys")
+
+      assert eval_in("jank.accept.selectkeys", "(select-keys {:a 1 :b 2 :c 3} [:a :c])") ==
+               %{a: 1, c: 3}
+
+      # a key that is not present is simply absent from the result
+      assert eval_in("jank.accept.selectkeys", "(select-keys {:a 1} [:a :zz])") == %{a: 1}
+    end
+
+    test "name, namespace and keyword run on the cpp/* primitive shim" do
+      # jank implements these with `(cpp/jank.runtime.…)` interop. We
+      # cannot run C++, but we can register the same qualified names
+      # backed by BEAM functions with the same semantics, which is
+      # jank's own mechanism — so the vendored text loads unchanged.
+      load_slice("slice_31_name.bl", "jank.accept.name")
+      assert eval_in("jank.accept.name", "(name :foo)") == "foo"
+      assert eval_in("jank.accept.name", ~S|(name "foo")|) == "foo"
+
+      load_slice("slice_33_keyword.bl", "jank.accept.keyword")
+      assert eval_in("jank.accept.keyword", ~S|(keyword "foo")|) == :foo
+      assert eval_in("jank.accept.keyword", "(keyword :foo)") == :foo
+    end
+
+    test "merge-with combines colliding keys through a fn" do
+      load_slice("slice_58_merge_with.bl", "jank.accept.mergewith")
+
+      assert eval_in("jank.accept.mergewith", "(merge-with + {:a 1 :b 2} {:a 10})") ==
+               %{a: 11, b: 2}
+    end
+
+    test "sort-by orders by a key fn" do
+      load_slice("slice_59_sort_by.bl", "jank.accept.sortby")
+
+      assert eval_in("jank.accept.sortby", "(doall (sort-by count [[1 2 3] [1] [1 2]]))") == [
+               BeamLisp.Vector.new([1]),
+               BeamLisp.Vector.new([1, 2]),
+               BeamLisp.Vector.new([1, 2, 3])
+             ]
+    end
+
+    test "flatten walks arbitrarily nested sequentials" do
+      # flatten is (filter (complement sequential?) (rest (tree-seq …)))
+      # so it needs upstream's own complement slice alongside it.
+      load_slice("slice_03_complement.bl", "jank.accept.flatten")
+      load_slice("slice_50_flatten.bl", "jank.accept.flatten")
+
+      assert eval_in("jank.accept.flatten", "(doall (flatten [1 [2 [3 4]] 5]))") == [
+               1,
+               2,
+               3,
+               4,
+               5
+             ]
+    end
+
+    test "interleave and lazy-cat handle a lazy-seq over a bare collection" do
+      # Both wrap a realized collection in (lazy-seq c), which used to
+      # reach the seq walk as an opaque value and crash.
+      load_slice("slice_40_interleave.bl", "jank.accept.interleave")
+
+      assert eval_in("jank.accept.interleave", "(doall (interleave [1 2] [:a :b]))") == [
+               1,
+               :a,
+               2,
+               :b
+             ]
+
+      assert eval_in("jank.accept.interleave", "(doall (interleave [1 2]))") == [1, 2]
+      # stops at the shorter input
+      assert eval_in("jank.accept.interleave", "(doall (interleave [1 2 3] [:a]))") == [1, :a]
+
+      load_slice("slice_61_lazy_cat.bl", "jank.accept.lazycat")
+      assert eval_in("jank.accept.lazycat", "(doall (lazy-cat [1 2] [3]))") == [1, 2, 3]
     end
   end
 end

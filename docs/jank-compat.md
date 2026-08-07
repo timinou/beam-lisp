@@ -76,29 +76,29 @@ columns are the upstream span in `core.jank@3028594`.
 | 25 | some-fn | 2222–2259 | `some-fn` | ✓ | needs the `some` slice co-loaded (core dep) |
 | 26 | keys | 2308–2317 | `keys` | ✓ | *was ✗* — closed by transients (wave 17) |
 | 27 | vals | 2319–2328 | `vals` | ✓ | *was ✗* — transients (wave 17) |
-| 28 | select-keys | 2392–2401 | `select-keys` | ✗ | `conj` map-entry arity missing |
+| 28 | select-keys | 2392–2401 | `select-keys` | ✓ | *was ✗* — `conj` of a map entry (wave 18) |
 | 29 | zipmap | 2403–2413 | `zipmap` | ✓ | *was ✗* — transients + `hash-map` (wave 17) |
-| 30 | set | 2459–2467 | `set` | ✗ | `set?` + transients |
-| 31 | name | 2484–2487 | `name` | ✗ | `cpp/*` interop |
-| 32 | namespace | 2489–2492 | `namespace` | ✗ | `cpp/*` interop |
-| 33 | keyword | 2548–2557 | `keyword` | ✗ | `cpp/*` interop |
+| 30 | set | 2459–2467 | `set` | ✓ | *was ✗* — a set type, the `#{}` reader literal, and transient sets (wave 18) |
+| 31 | name | 2484–2487 | `name` | ✓ | *was ✗* — the `cpp/*` primitive shim (wave 18) |
+| 32 | namespace | 2489–2492 | `namespace` | ✓ | *was ✗* — `cpp/*` shim |
+| 33 | keyword | 2548–2557 | `keyword` | ✓ | *was ✗* — `cpp/*` shim |
 | 34 | if-some | 2643–2660 | `if-some` | ✓ | `assert-macro-args`, `temp#` |
 | 35 | when-some | 2669–2684 | `when-some` | ✓ | `assert-macro-args`, `~@` splice |
 | 36 | repeatedly | 3063–3068 | `repeatedly` | ✓ | `lazy-seq`, `cons`, `take` |
 | 37 | take-while | 3070–3087 | `take-while` | ✓ | coll arity; *transducer 1-arity needs `reduced`* (noted below) |
 | 38 | drop-while | 3117–3140 | `drop-while` | ✓ | coll arity; *transducer 1-arity needs `volatile!`* (noted) |
 | 39 | split-at | 3157–3160 | `split-at` | ✓ | `take`/`drop` |
-| 40 | interleave | 3167–3181 | `interleave` | ◐ | 2-arity ✓; 1-arity `(lazy-seq c1)` on a realized vector fails (LazySeq) |
+| 40 | interleave | 3167–3181 | `interleave` | ✓ | *was ◐* — the 1-arity `(lazy-seq c1)` case, same fix as lazy-cat |
 | 41 | partition | 3231–3251 | `partition` | ✓ | *was ✗* — `nthrest`; exposed the lazy `count`/`next`/`Inspect` bugs |
 | 42 | frequencies | 3322–3331 | `frequencies` | ✓ | *was ✗* — transients (wave 17) |
 | 43 | group-by | 3333–3344 | `group-by` | ✓ | *was ✗* — transients (wave 17) |
-| 44 | for | 3604–3689 | `for` | ✗ | `& [vector-pattern]` — a rest arg that is itself destructured (`:as` now works) |
+| 44 | for | 3604–3689 | `for` | ✗ | `& [vector-pattern]` — a rest argument that is itself a destructuring pattern |
 | 45 | assoc-in | 3697–3704 | `assoc-in` | ✓ | *was ✗ (hung)* — closed by nil-terminating `&` rest |
 | 46 | update-in | 3706–3718 | `update-in` | ✓ | *was ✗ (hung)* — same fix; needs the `assoc-in` slice co-loaded |
 | 47 | update | 3720–3734 | `update` | ✓ | `assoc`/`get`/`apply`, variadic |
 | 48 | mapcat | 3790–3796 | `mapcat` | ✓ | coll arity; *transducer 1-arity needs `cat`* (noted) |
-| 49 | distinct | 3813–3836 | `distinct` | ✗ | `:as` now works; blocked only by the `#{}` set literal |
-| 50 | flatten | 3883–3889 | `flatten` | ✗ | `tree-seq`/`sequential?` (+ `complement` dep) |
+| 49 | distinct | 3813–3836 | `distinct` | ✓ | *was ✗* — `:as` (wave 18) then the `#{}` set literal |
+| 50 | flatten | 3883–3889 | `flatten` | ✓ | *was ✗* — `tree-seq`/`sequential?`; needs the `complement` slice co-loaded |
 | 51 | remove | 3891–3898 | `remove` | ✓ | needs the `complement` slice co-loaded (core dep) |
 | 52 | condp | 3924–3962 | `condp` | ✓ | *was ✗* — closed by `:as` in sequential destructuring (wave 18); needs the `split-at` slice co-loaded |
 | 53 | cond-> | 3963–3982 | `cond->` macro | ✓ | *was ✗* — `*assert*`/`butlast`/`partition` (wave 17) |
@@ -106,18 +106,18 @@ columns are the upstream span in `core.jank@3028594`.
 | 55 | as-> | 4000–4009 | `as->` macro | ✓ | *was ✗* — `butlast` (wave 17) |
 | 56 | some-> | 4011–4022 | `some->` macro | ✓ | *was ✗* — `butlast` (wave 17) |
 | 57 | some->> | 4024–4035 | `some->>` macro | ✓ | *was ✗* — `butlast` (wave 17) |
-| 58 | merge-with | 5556–5570 | `merge-with` | ✗ | **`seq` on a map unsupported** (+ some/key/val deps) |
-| 59 | sort-by | 5661–5671 | `sort-by` | ✗ | `sort`/`compare` |
+| 58 | merge-with | 5556–5570 | `merge-with` | ✓ | *was ✗* — `seq` over a map (wave 18) |
+| 59 | sort-by | 5661–5671 | `sort-by` | ✓ | *was ✗* — `sort` + a total-order `compare` (wave 18) |
 | 60 | with-open | 5976–5995 | `with-open` macro | ✗ | **upstream TODO stub** — the slice itself throws |
-| 61 | lazy-cat | 6268–6275 | `lazy-cat` macro | ✗ | `concat` over `(lazy-seq …)` of a vector breaks |
+| 61 | lazy-cat | 6268–6275 | `lazy-cat` macro | ✓ | *was ✗* — a lazy-seq body may return a bare collection, now normalized when realized |
 | 62 | max-key | 6428–6444 | `max-key` | ✓ | `>` / `>=` |
 | 63 | min-key | 6446–6462 | `min-key` | ✓ | *was ✗* — the `<=` link pointed at `:erlang."<="`, which does not exist (Erlang spells it `=<`) |
 | 64 | assert | 903–918 | `assert` macro | ✓ | *was ✗* — `*assert*` + `assert` in the prelude (wave 17) |
 
 ## Counts — the headline
 
-> **52 of 64 attempted slices** load **and** behave correctly. The
-> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 52** across seven
+> **62 of 64 attempted slices** load **and** behave correctly. The
+> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62** across eight
 > waves, each aimed by this document's ranked gap list. Nothing was
 > patched into passing — the fixtures are still
 > byte-for-byte upstream and the checksum test proves it. Where a slice
@@ -134,19 +134,29 @@ columns are the upstream span in `core.jank@3028594`.
 > rules stand between beam-lisp and the rest of `core.jank`, and ranks
 > them by how many slices each unlocks.
 >
+> The two that remain are named exactly: `for` needs a rest argument
+> that is itself a destructuring pattern (`& [[_ next-expr] :as g]`),
+> and `with-open` is an **upstream TODO stub whose body is commented
+> out** — it throws by construction, so it cannot pass anywhere,
+> including in jank. Leaving it as a recorded failure is the honest
+> reading.
+>
 > Running real upstream code has repeatedly found bugs beam-lisp's own
 > tests did not: `~@` could not splice a vector; `get` on a vector
 > returned the default because a vector is a struct and a struct is a
 > map; `count` on a lazy seq returned its struct-field count for every
 > length; `next` returned an unforced tail, so an exhausted lazy seq
 > was truthy and every `(when (next s) …)` recursion silently failed
-> to terminate; and an exhausted `& rest` bound an empty collection
+> to terminate; an exhausted `& rest` bound an empty collection
 > rather than nil, which made `assoc-in` and `update-in` *hang* rather
-> than fail. Each was fixed at the root, not worked around.
+> than fail; `(<= 1 2)` linked to `:erlang."<="`, which does not exist
+> (Erlang spells it `=<`); and a `lazy-seq` body returning a bare
+> collection crashed the seq walk. Eight defects, two of them silent
+> and one a hang. Each was fixed at the root, not worked around.
 
-All 36 behaving slices are exercised by `test/beam_lisp/jank_compat_test.exs`
-and the strongest newcomers are demonstrated end-to-end by
-`examples/jank_slice.bl` (unmodified jank running on the BEAM, exit 0).
+All 62 behaving slices are exercised by `test/beam_lisp/jank_compat_test.exs`
+and demonstrated end-to-end by `examples/jank_slice.bl` and
+`examples/threading.bl` (unmodified jank running on the BEAM, exit 0).
 
 ## Gap classification
 
@@ -227,37 +237,42 @@ but `([c1] (lazy-seq c1))` fails on a realized vector
 is upstream's incompleteness, recorded so a future agent does not chase
 it.
 
-## What to build next (by unlock count)
+## What to build next
 
-*Re-ranked after wave 16 widened the sample from 21 to 64 slices and the
-count dropped to 36/64. The gaps below are now evidence-ranked, not
-guessed: each unlock count is how many of the 43 new slices that change
-turns from FAIL to behave.*
+*Every item on the previous list is done — transients, nil-terminating
+`&` rest, `butlast`/`nthrest`/`*assert*`, `:as`, the `cpp/*` shim,
+sort/compare, `seq` on a map, `tree-seq`, the `<=` link, and the
+lazy-seq/`concat` interplay. At 62 of 64 the ranked-by-unlock-count
+framing has run its course: what remains is one narrow compiler gap and
+one upstream stub. The informative move is again to widen the sample.*
 
-1. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`/
-   `hash-map`) — unlocks `keys`, `vals`, `set`, `zipmap`, `frequencies`,
-   `group-by` (**6 slices**). The wave-8 trie already has the structure;
-   this is the natural next collection layer.
-2. **`&`-rest destructuring → nil-terminate** — unlocks `assoc-in`,
-   `update-in` (**2 slices**, both currently *hanging*, plus removes a
-   latent landmine from every `&`-rest user). Smallest fix, highest
-   leverage per line.
-3. **`butlast`** — unlocks `as->`, `some->`, `some->>` (**3 slices**);
-   add `nthrest` + `*assert*` and `cond->`/`cond->>` (**2 more**).
-4. **`:as` / `&`-in-fn-params destructuring** (compiler/reader) —
-   unlocks `distinct`, `condp`, `for` (**3 slices**; `for` needs
-   chunk-seq prims on top).
-5. **`cpp/*` runtime equivalents** (`name`/`namespace_`/`keyword`, then
-   the primitive layer) — unlocks `name`, `namespace`, `keyword`
-   (**3 slices**) and is the long tail that makes the rest of the file
-   loadable at all.
-6. **Small prims, one each**: `sort`/`compare` (sort-by), `conj`
-   map-entry arity (select-keys), `seq` on map (merge-with), `nthrest`
-   (partition), `tree-seq`/`sequential?` (flatten), `*assert*` (assert),
-   and the **`<=` link fix** (`:erlang.<=` → real BIF; min-key).
-7. **`concat`/`lazy-seq` interplay** (lazy-cat) and **transducers**
-   (`reduced`/`volatile!`/`cat`) — the honest note from §7; these also
-   gate `for` and the transducer arities.
+1. **Widen the sample a third time.** 64 slices, chosen as reachable
+   candidates, is still a small fraction of `core.jank`. Take the next
+   tranche — transducers, the `reduce`/`into` family, `volatile!`,
+   `deftype`/protocol users, the arithmetic and bit-op layer — and
+   expect the score to fall again. Both previous widenings paid for
+   themselves in bugs found.
+2. **`& [pattern]`** — a rest argument that is itself destructured, the
+   last blocker on `for` (slice 44). `split_variadic/1` requires a bare
+   symbol after `&`; the destructuring machinery it would delegate to
+   already exists, so this is plumbing rather than design.
+3. **`cpp/*` coverage.** The shim maps the handful of primitives the
+   attempted slices call. The rest of the file leans on it heavily
+   (`nth`/`get`/`hash-set`/`peek`/`pop`/bit ops/set ops); each is a
+   small honest BEAM implementation registered under the qualified
+   name upstream already uses.
+4. **Transducer arities.** Several accepted slices pass their
+   collection arity while their 1-arity transducer path is untested —
+   `volatile!`/`vswap!`, `reduced`, and `cat` would let those be
+   measured rather than assumed. `distinct` and `drop-while` both carry
+   this caveat today.
+5. **Uniform laziness** (`PLAN-010`) — the hybrid seq model diverges
+   from Clojure on bounded inputs, and transducer-shaped upstream code
+   will feel it.
+6. **Reader `^{}` metadata** — the form-metadata machinery exists
+   (`BeamLisp.FormMeta`); the reader only needs to attach the map to
+   the following form. Unblocks upstream's `^:private` and `^{:doc …}`
+   definitions, which the head of `core.jank` is built on.
 
 ## Keeping this honest
 
