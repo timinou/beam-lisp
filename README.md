@@ -173,12 +173,11 @@ Deliberate gaps, roughly in priority order:
 
 - **uniform laziness** — the seq model is hybrid: realized inputs take
   the strict path, so bounded `(range n)` is eager (`PLAN-010`)
-- **transients** — the trie has the structure for them; bulk builds
-  would stop path-copying
-- **jank stdlib convergence** — every one of the 21 attempted
-  `core.jank` slices now runs unmodified; the next step is a bigger
-  sample, since one that fully passes has stopped being informative
-  (`docs/jank-compat.md`)
+- **sets and sorting** — no set type or `#{}` literal yet, and no
+  `sort`/`compare`
+- **jank stdlib convergence** — 51 of 64 attempted `core.jank` slices
+  run unmodified; the remaining thirteen are measured and ranked in
+  `docs/jank-compat.md`
 
 ## Relationship to jank
 
@@ -187,14 +186,15 @@ beam-lisp : Elixir interop. jank ships its stdlib as `core.jank` —
 Clojure source — so "is beam-lisp really the same language?" does not
 have to be an opinion. It can be a test.
 
-`test/fixtures/jank/` holds 21 blocks of jank's `core.jank`, vendored
-byte-for-byte from upstream commit `3028594`, each carrying a sha256
-that the test suite asserts — so making a slice pass by editing it
-would fail the build rather than quietly inflate the claim. **All 21
-load and behave correctly**, called with upstream's own docstring
-examples: the threading macros, `if-let`, `when-let`, `dotimes`,
-`doseq`, `doto`, `memoize`, `comp`, `juxt`, `partial`, `some`,
-`trampoline` and the rest — jank's own code, unmodified, on the BEAM:
+`test/fixtures/jank/` holds **64 blocks** of jank's `core.jank`,
+vendored byte-for-byte from upstream commit `3028594`, each carrying
+a sha256 that the test suite asserts — so making a slice pass by
+editing it would fail the build rather than quietly inflate the
+claim. **51 of 64 load and behave correctly**, called with upstream's
+own docstring examples: the threading macros, `if-let`, `doseq`,
+`doto`, `memoize`, `comp`, `juxt`, `partial`, `trampoline`, `keys`,
+`vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->` and
+more — jank's own code, unmodified, on the BEAM:
 
 ```console
 $ mix beam_lisp.run examples/jank_slice.bl   # unmodified jank, running on the BEAM
@@ -203,21 +203,32 @@ $ mix beam_lisp.run examples/threading.bl    # upstream ->, ->>, doto
 
 `docs/jank-compat.md` is the measurement: every slice with its
 verdict, every failure classified, and a build-next list ranked by
-how many slices each gap unlocks. It has earned its keep twice — the
-wave that built its top-ranked items (`next`, `list*`, variadic
-`apply`, the predicate layer, `#()` literals) moved the score from 7
-to 13, and the wave after it (`loop*`, `&form`, form metadata,
-`assert-macro-args`) took it to 21. Along the way, loading real
-upstream code found three runtime bugs that beam-lisp's own tests had
-not: `~@` could not splice a vector, `get` on a vector silently
-returned the default because a vector is a struct and so is a map,
-and vectors were not callable as functions of their index.
+how many slices each gap unlocks. The score has moved **7 → 13 → 21
+→ 36 → 38 → 51** across six waves, each aimed by that list — and the
+dip is deliberate: once a 21-slice sample passed completely it had
+stopped being informative, so the sample tripled to 64 and the score
+fell before climbing again.
 
-What that does *not* prove is equally worth stating: the slices were
-chosen as reachable candidates, and the band of `core.jank` built on
-jank's `cpp/*` runtime interop is untouched. A sample that fully
-passes has stopped being informative, so the next move is a larger
-and harder one.
+The most valuable output has been the bugs. Running real upstream
+code found five defects beam-lisp's own 440 tests did not:
+
+- `~@` could not splice a vector, only a list
+- `get` on a vector returned the default — a vector is a struct, a
+  struct is a map, and the map clause matched first
+- `count` on a lazy sequence returned 3 for every length, that being
+  its number of struct fields
+- `next` returned an unforced tail, so an exhausted lazy sequence was
+  truthy and every `(when (next s) …)` recursion failed to terminate
+- an exhausted `& rest` bound an empty collection instead of nil,
+  which made `assoc-in` and `update-in` **hang** rather than fail
+
+Two of those failed silently and one hung. Each was fixed at the
+root. That is the argument for measuring against someone else's
+code: your own tests encode your own assumptions.
+
+What it does *not* prove: the slices were chosen as reachable
+candidates, and the band of `core.jank` built on jank's `cpp/*`
+runtime interop is barely touched.
 
 For the alternative design — embedding jank's C++ runtime in the BEAM
 as a NIF — see `!tasks/features/FEAT-001` where the tradeoffs are
@@ -250,6 +261,8 @@ $ mix beam_lisp.run examples/protocols.bl  # defprotocol/extend-type
 $ mix beam_lisp.run examples/lazy.bl       # infinite sequences, realized once
 $ mix beam_lisp.run examples/fnlit.bl      # #() fn literals
 $ mix beam_lisp.run examples/jank_slice.bl # unmodified jank core.jank on the BEAM
+$ mix beam_lisp.run examples/threading.bl  # upstream ->, ->>, doto
+$ mix beam_lisp.run examples/transients.bl # transient build, and what it costs
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -261,7 +274,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 368 tests: reader, compiler, prelude, vectors, macros, namespaces, dispatch, lazy seqs, AOT, jank fidelity, examples
+$ mix test     # 440 tests: reader, compiler, prelude, vectors, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
