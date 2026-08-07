@@ -19,7 +19,11 @@ defmodule Mix.Tasks.BeamLisp.Test do
     paths =
       case args do
         [] ->
-          Path.wildcard("test/**/*.bl")
+          # Fixtures are compiler inputs, not test suites: only
+          # test/bl (and anything else outside fixtures) is a suite.
+          "test/**/*.bl"
+          |> Path.wildcard()
+          |> Enum.reject(&String.starts_with?(&1, "test/fixtures/"))
 
         [path] when is_binary(path) ->
           cond do
