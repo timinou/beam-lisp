@@ -177,10 +177,15 @@ Deliberate gaps, roughly in priority order:
   the strict path, so bounded `(range n)` is eager (`PLAN-010`)
 - **transducers** — the collection arities of the seq fns are done;
   the 1-arity transducer paths need `volatile!`, `reduced` and `cat`
-- **jank stdlib convergence** — 62 of 64 attempted `core.jank` slices
-  run unmodified; the next step is a bigger sample, since the two
-  that remain are one narrow compiler gap and one upstream stub
+- **jank stdlib convergence** — 89 of 120 attempted `core.jank` slices
+  run unmodified. The sample was doubled once the previous one stopped
+  being informative at 63 of 64; the gap list it refilled is led by the
+  `cpp/jank.runtime.*` shim and reader `^{}` metadata
   (`docs/jank-compat.md`)
+- **Specter** — 1 of 31 slices of Clojure's Specter behave today. The
+  number is low on purpose: it is a measurement, not a claim, and it
+  ranks the remaining work by what each gap unlocks
+  (`docs/specter-compat.md`)
 
 ## Errors point at your code
 
@@ -277,6 +282,59 @@ down a production node under load. A call cap (default 1000) is
 enforced inside the tracer process, and asserted in the suite rather
 than trusted.
 
+## Libraries written in beam-lisp
+
+The prelude has always been `priv/core.bl` — beam-lisp source, not
+Elixir. Two more libraries now ship the same way, because a language
+whose own libraries need a different language has a hole in it:
+
+```clojure
+(ns app (:require [optics] [rewrite]))
+
+;; optics: a path that can say "all of them", which update-in cannot
+(over (*> (in :users) traversed (in :hits)) inc data)
+
+;; rewrite: mechanical, reviewable codemods — rules are ordinary data
+(defrule nil-check (= ?x nil) => (nil? ?x))
+(apply-rules [nil-check] form)
+```
+
+Composition is outside-in: `(*> outer inner)` reads as a path, the
+same direction as `get-in`. The lens laws (get-put, put-get, put-put)
+are asserted on every primitive, because a "lens" that fails them is
+just a pair of functions with pretensions. `apply-rules` runs to a
+fixed point but is **bounded** — two rules that undo each other raise
+rather than hang.
+
+Neither needed a single compiler change, which is the useful part: it
+means the language is now expressive enough to grow in itself. The
+project's own test framework (`priv/test.bl`) and dispatch library
+(`priv/multi.bl`) are written this way too.
+
+## Objects, when you want them
+
+`defrecord` compiles to a **real Elixir struct**, so Clojure's
+equality rule falls out of `Kernel.==` for free — same type and value
+equal, different types never equal, and a record is never equal to a
+plain map with the same entries. Elixir interop, `inspect` and
+pattern matching all work with no translation layer:
+
+```clojure
+(defrecord Point [x y]
+  Shape
+  (area [this] (* (:x this) (:y this))))
+
+(->Point 3 4)          ;=> #app/Point{:x 3, :y 4}
+(:x (->Point 3 4))     ;=> 3 — a record is a map
+(area (->Point 3 4))   ;=> 12 — protocols dispatch on it
+```
+
+`deftype` is deliberately **not** a struct — it is a tagged tuple.
+Clojure's `deftype` has no map semantics, and on this VM a struct
+satisfies `is_map`, so making it one would have invited the bug class
+that has caused about a third of this project's bugs. As a tuple it
+cannot be swallowed by a map clause at all.
+
 ## Relationship to jank
 
 Same language family, different host. jank : C++ interop ::
@@ -284,11 +342,11 @@ beam-lisp : Elixir interop. jank ships its stdlib as `core.jank` —
 Clojure source — so "is beam-lisp really the same language?" does not
 have to be an opinion. It can be a test.
 
-`test/fixtures/jank/` holds **64 blocks** of jank's `core.jank`,
+`test/fixtures/jank/` holds **120 blocks** of jank's `core.jank`,
 vendored byte-for-byte from upstream commit `3028594`, each carrying
 a sha256 that the test suite asserts — so making a slice pass by
 editing it would fail the build rather than quietly inflate the
-claim. **62 of 64 load and behave correctly**, called with upstream's
+claim. **89 of 120 load and behave correctly**, called with upstream's
 own docstring examples: the threading macros, `if-let`, `doseq`,
 `doto`, `memoize`, `comp`, `juxt`, `partial`, `trampoline`, `keys`,
 `vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->`, `set`,
@@ -376,6 +434,9 @@ $ mix beam_lisp.run examples/sets.bl       # sets: membership, conj/disj, distin
 $ mix beam_lisp.run examples/server.bl     # a real gen_server, written in beam-lisp
 $ mix beam_lisp.run examples/supervision.bl # a crash, and OTP putting it back
 $ mix beam_lisp.run examples/hotswap.bl    # code replaced in a running process
+$ mix beam_lisp.run examples/optics.bl     # lenses and traversals, written in beam-lisp
+$ mix beam_lisp.run examples/rewrite.bl    # a codemod as data
+$ mix beam_lisp.run examples/records.bl    # records, types, and inline protocols
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -387,7 +448,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 530 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 624 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
