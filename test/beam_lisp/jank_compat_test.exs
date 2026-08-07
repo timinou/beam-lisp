@@ -73,7 +73,40 @@ defmodule BeamLisp.JankCompatTest do
     {"slice_18_doto.bl", "jank.accept.doto",
      "e54541f5b3f8c479715d68ef87b00b06ecc20b858400c0f0724e2c9efc3a2856"},
     {"slice_21_memoize.bl", "jank.accept.memoize",
-     "cfafa7e7689768fb12808200219a1a60a571b1b3a739706113164aafcd0fd707"}
+     "cfafa7e7689768fb12808200219a1a60a571b1b3a739706113164aafcd0fd707"},
+    # Promoted by wave 16 (widen-the-sample). 43 new slices attempted,
+    # 15 behaved; the rest are recorded FAILs in docs/jank-compat.md.
+    # These complete the sample at 36 of 64.
+    {"slice_22_reverse.bl", "jank.accept.reverse",
+     "79265cf89aab4f747f54b27c984c687c75a1505048f0495c6938573431bd1fbf"},
+    {"slice_23_run.bl", "jank.accept.run",
+     "c589b14414937b5681ca8a05572718e4242759fcce02471f6a4522b07e47594c"},
+    {"slice_24_every_pred.bl", "jank.accept.everypred",
+     "4cc8cfea26d8ea7682b54626edb030239202e154f47574872fcf26b7b9d7f80b"},
+    {"slice_25_some_fn.bl", "jank.accept.somefn",
+     "47d0b4ce578690d35702c16c5c792acb4bf82bd69e929f57b9e70499217c07c7"},
+    {"slice_34_if_some.bl", "jank.accept.ifsome",
+     "ccb169de75f32180ff3f43a03f1ba7473bacee7dd4ddef5483fba877c5fbd460"},
+    {"slice_35_when_some.bl", "jank.accept.whensome",
+     "58ea65a03ef3404e226fde65e7230b9618523827f6f65356e056a8882d911d2d"},
+    {"slice_36_repeatedly.bl", "jank.accept.repeatedly",
+     "3511d9a9dc9c549f326a88d1dce4d71ed075c5e7cd0f5ba5b8aea1633b1463d5"},
+    {"slice_37_take_while.bl", "jank.accept.takewhile",
+     "6a4478916931897c608aa5d0c56c001422073264124cd015fd3cb2f8070a2af2"},
+    {"slice_38_drop_while.bl", "jank.accept.dropwhile",
+     "ad377566a163caf22ee6d2f66804e324e2c9d8522fb02fd8a10f27c6308cf104"},
+    {"slice_39_split_at.bl", "jank.accept.splitat",
+     "3b551dda30e6cfe4120735231458451f4e37e6f52bdd3e158443df410a2782ca"},
+    {"slice_40_interleave.bl", "jank.accept.interleave",
+     "a4063bb35431e45f546c18046227b5897401effffd8281c6601e7645b1a9e29b"},
+    {"slice_47_update.bl", "jank.accept.update",
+     "a19c83c76573376c6d586e787155cdd73d676e059b636456cdb4d0d74d6c9b7a"},
+    {"slice_48_mapcat.bl", "jank.accept.mapcat",
+     "866f203cd2a1bfac9a2301a66e7e7beef082f0297d69e0b0e129edcef5da594d"},
+    {"slice_51_remove.bl", "jank.accept.remove",
+     "b1be84ec0aefdb32d950242882e57ffe7baf1ce90db799b8f6b86fb2ab53ef37"},
+    {"slice_62_max_key.bl", "jank.accept.maxkey",
+     "d9e57aef2ca626d8c5fb3cd3d6ef584f659d4fa2abbcfd27a286dbdba09f5ff8"}
   ]
 
   setup_all do
@@ -289,6 +322,115 @@ defmodule BeamLisp.JankCompatTest do
              (fast 4) (fast 4) (fast 4)
              [(fast 4) @calls]
              """) == BeamLisp.Vector.new([16, 1])
+    end
+
+    # --- promoted by wave 16: the widened sample. 43 new slices were
+    # attempted (docs/jank-compat.md), of which these 15 behaved. Each
+    # is called with its own upstream docstring example. Slices that
+    # need a co-loaded dependency name it (some-fn needs `some`, remove
+    # needs `complement`) — core.jank's own deps, satisfied verbatim.
+
+    test "reverse returns the items in reverse order" do
+      load_slice("slice_22_reverse.bl", "jank.accept.reverse")
+      assert eval_in("jank.accept.reverse", "(reverse [1 2 3])") == [3, 2, 1]
+      assert eval_in("jank.accept.reverse", "(reverse '(1 2 3))") == [3, 2, 1]
+    end
+
+    test "run! reduces a proc for side effects and returns nil" do
+      load_slice("slice_23_run.bl", "jank.accept.run")
+      assert eval_in("jank.accept.run", """
+             (def a (atom 0))
+             (def r (run! (fn [x] (swap! a + x)) [1 2 3]))
+             [r @a]
+             """) == BeamLisp.Vector.new([nil, 6])
+    end
+
+    test "every-pred combines predicates with and" do
+      load_slice("slice_24_every_pred.bl", "jank.accept.everypred")
+      assert eval_in("jank.accept.everypred", "((every-pred even? pos?) 4)") == true
+      assert eval_in("jank.accept.everypred", "((every-pred even? pos?) 3)") == false
+      assert eval_in("jank.accept.everypred", "((every-pred even?) 2 4 6)") == true
+    end
+
+    test "some-fn combines predicates with or, returning the first truthy" do
+      # Upstream some-fn's &-arity calls `some`, so this slice needs the
+      # `some` slice in the same namespace (core.jank's own dependency).
+      load_slice("slice_08_some.bl", "jank.accept.somefn")
+      load_slice("slice_25_some_fn.bl", "jank.accept.somefn")
+      assert eval_in("jank.accept.somefn", "((some-fn even? pos?) 3)") == true
+      assert eval_in("jank.accept.somefn", "((some-fn odd?) 2 4 6)") == false
+      assert eval_in("jank.accept.somefn", "((some-fn even? pos?) 1 3 4)") == true
+    end
+
+    test "if-some binds only when the test is non-nil" do
+      load_slice("slice_34_if_some.bl", "jank.accept.ifsome")
+      assert eval_in("jank.accept.ifsome", "(if-some [x 5] x :none)") == 5
+      assert eval_in("jank.accept.ifsome", "(if-some [x nil] x :none)") == :none
+      # false is not nil, so it binds
+      assert eval_in("jank.accept.ifsome", "(if-some [x false] x :none)") == false
+    end
+
+    test "when-some runs its body only when the test is non-nil" do
+      load_slice("slice_35_when_some.bl", "jank.accept.whensome")
+      assert eval_in("jank.accept.whensome", "(when-some [x 5] (* x 2))") == 10
+      assert eval_in("jank.accept.whensome", "(when-some [x nil] (* x 2))") == nil
+    end
+
+    test "repeatedly builds a lazy sequence of thunk calls" do
+      load_slice("slice_36_repeatedly.bl", "jank.accept.repeatedly")
+      assert eval_in("jank.accept.repeatedly", """
+             (def c (atom 0))
+             (take 3 (repeatedly (fn [] (swap! c inc))))
+             """) == [1, 2, 3]
+    end
+
+    test "take-while takes the prefix while pred holds (coll arity)" do
+      load_slice("slice_37_take_while.bl", "jank.accept.takewhile")
+      # take-while returns a lazy seq; compare readably
+      assert eval_in("jank.accept.takewhile", "(pr-str (take-while pos? [1 2 3 -1]))") == "(1 2 3)"
+    end
+
+    test "drop-while drops the prefix while pred holds (coll arity)" do
+      load_slice("slice_38_drop_while.bl", "jank.accept.dropwhile")
+      assert eval_in("jank.accept.dropwhile", "(pr-str (drop-while pos? [1 2 -1 3]))") == "(-1 3)"
+    end
+
+    test "split-at returns a vector of take and drop" do
+      load_slice("slice_39_split_at.bl", "jank.accept.splitat")
+      assert eval_in("jank.accept.splitat", "(split-at 2 [1 2 3 4 5])") ==
+               BeamLisp.Vector.new([[1, 2], [3, 4, 5]])
+    end
+
+    test "interleave merges colls positionally (2-arity docstring example)" do
+      load_slice("slice_40_interleave.bl", "jank.accept.interleave")
+      assert eval_in("jank.accept.interleave", "(pr-str (interleave [1 2 3] [:a :b :c]))") ==
+               "(1 :a 2 :b 3 :c)"
+    end
+
+    test "update applies f to a key's value" do
+      load_slice("slice_47_update.bl", "jank.accept.update")
+      assert eval_in("jank.accept.update", "(update {:a 1} :a inc)") == %{a: 2}
+      assert eval_in("jank.accept.update", "(update {} :a (fn [x] 0))") == %{a: 0}
+      assert eval_in("jank.accept.update", "(update {:a 1} :a + 10)") == %{a: 11}
+    end
+
+    test "mapcat concatenates the mapped results (coll arity)" do
+      load_slice("slice_48_mapcat.bl", "jank.accept.mapcat")
+      assert eval_in("jank.accept.mapcat", "(mapcat (fn [x] [x x]) [1 2])") == [1, 1, 2, 2]
+    end
+
+    test "remove filters out the items pred accepts" do
+      # remove is (filter (complement pred)) upstream, so it needs the
+      # `complement` slice co-loaded (core.jank's own dependency).
+      load_slice("slice_03_complement.bl", "jank.accept.remove")
+      load_slice("slice_51_remove.bl", "jank.accept.remove")
+      assert eval_in("jank.accept.remove", "(remove even? [1 2 3 4 5 6])") == [1, 3, 5]
+    end
+
+    test "max-key returns the x with the greatest (k x)" do
+      load_slice("slice_62_max_key.bl", "jank.accept.maxkey")
+      assert eval_in("jank.accept.maxkey", "(max-key count [1 2 3] [4] [5 6])") ==
+               BeamLisp.Vector.new([1, 2, 3])
     end
   end
 end

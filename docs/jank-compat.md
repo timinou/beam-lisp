@@ -35,13 +35,17 @@ importantly — what to implement next to unlock the most.
    is then *called* with its own docstring examples. This is where the
    real verdict lands.
 
-> **`load` ≠ `behave`.** All 21 slices read+compile ("load"). Only some
-> run correctly when called. The verdicts below are behavioral.
+> **`load` ≠ `behave`.** Most of the 64 slices read+compile ("load"); three
+> fail *at the reader/compiler itself* (`distinct`, `condp`, `for`). And
+> only some of the loaded slices run correctly when called. The verdicts
+> below are behavioral — the checklist marks each.
 
-## The checklist — 21 attempted slices
+## The checklist — 64 attempted slices
 
 Verdicts: **✓ pass** (loads and behaves) · **◐ partial** (common arities
-pass, higher arities fail) · **✗ fail** (a recorded gap).
+pass, higher arities fail) · **✗ fail** (a recorded gap). Slices 01–21 are
+the original measurement; 22–64 are the wave-16 widening. Row *lines*
+columns are the upstream span in `core.jank@3028594`.
 
 | # | slice | core.jank lines | defines | verdict | blocker |
 |---|-------|-----------------|---------|:-------:|---------|
@@ -66,126 +70,184 @@ pass, higher arities fail) · **✗ fail** (a recorded gap).
 | 19 | trampoline | 6999–7013 | `trampoline` | ✓ | *was ✗* — closed by `fn?` + `#()` fn literals (wave 14) |
 | 20 | while | 7015–7022 | `while` macro | ✓ | pure (`loop`/`when`/`recur`) |
 | 21 | memoize | 7024–7036 | `memoize` | ✓ | *was ✗* — closed by `if-let` + `find`; needs the `if-let` and `key/val` slices co-loaded |
+| 22 | reverse | 1983–1986 | `reverse` | ✓ | `reduce` + `conj` onto `'()` |
+| 23 | run! | 1179–1184 | `run!` | ✓ | `#()` + `reduce` |
+| 24 | every-pred | 2183–2220 | `every-pred` | ✓ | `boolean`, `every?`, `list*` |
+| 25 | some-fn | 2222–2259 | `some-fn` | ✓ | needs the `some` slice co-loaded (core dep) |
+| 26 | keys | 2308–2317 | `keys` | ✗ | **transients** (`persistent!`) |
+| 27 | vals | 2319–2328 | `vals` | ✗ | transients |
+| 28 | select-keys | 2392–2401 | `select-keys` | ✗ | `conj` map-entry arity missing |
+| 29 | zipmap | 2403–2413 | `zipmap` | ✗ | transients + `hash-map` |
+| 30 | set | 2459–2467 | `set` | ✗ | `set?` + transients |
+| 31 | name | 2484–2487 | `name` | ✗ | `cpp/*` interop |
+| 32 | namespace | 2489–2492 | `namespace` | ✗ | `cpp/*` interop |
+| 33 | keyword | 2548–2557 | `keyword` | ✗ | `cpp/*` interop |
+| 34 | if-some | 2643–2660 | `if-some` | ✓ | `assert-macro-args`, `temp#` |
+| 35 | when-some | 2669–2684 | `when-some` | ✓ | `assert-macro-args`, `~@` splice |
+| 36 | repeatedly | 3063–3068 | `repeatedly` | ✓ | `lazy-seq`, `cons`, `take` |
+| 37 | take-while | 3070–3087 | `take-while` | ✓ | coll arity; *transducer 1-arity needs `reduced`* (noted below) |
+| 38 | drop-while | 3117–3140 | `drop-while` | ✓ | coll arity; *transducer 1-arity needs `volatile!`* (noted) |
+| 39 | split-at | 3157–3160 | `split-at` | ✓ | `take`/`drop` |
+| 40 | interleave | 3167–3181 | `interleave` | ◐ | 2-arity ✓; 1-arity `(lazy-seq c1)` on a realized vector fails (LazySeq) |
+| 41 | partition | 3231–3251 | `partition` | ✗ | `nthrest` (+ `doall`/`concat`) |
+| 42 | frequencies | 3322–3331 | `frequencies` | ✗ | transients |
+| 43 | group-by | 3333–3344 | `group-by` | ✗ | transients |
+| 44 | for | 3604–3689 | `for` | ✗ | reader: `&`+destructuring in fn params, `:as`, chunk-seq prims |
+| 45 | assoc-in | 3697–3704 | `assoc-in` | ✗ | **`&` rest-destructure nil-semantics** (hangs) |
+| 46 | update-in | 3706–3718 | `update-in` | ✗ | same `&` gap (hangs) |
+| 47 | update | 3720–3734 | `update` | ✓ | `assoc`/`get`/`apply`, variadic |
+| 48 | mapcat | 3790–3796 | `mapcat` | ✓ | coll arity; *transducer 1-arity needs `cat`* (noted) |
+| 49 | distinct | 3813–3836 | `distinct` | ✗ | `[f :as xs]` destructuring unsupported |
+| 50 | flatten | 3883–3889 | `flatten` | ✗ | `tree-seq`/`sequential?` (+ `complement` dep) |
+| 51 | remove | 3891–3898 | `remove` | ✓ | needs the `complement` slice co-loaded (core dep) |
+| 52 | condp | 3924–3962 | `condp` | ✗ | `[a b c :as clause]` destructuring |
+| 53 | cond-> | 3963–3982 | `cond->` macro | ✗ | `*assert*` + `butlast` + `partition` |
+| 54 | cond->> | 3984–3998 | `cond->>` macro | ✗ | same chain |
+| 55 | as-> | 4000–4009 | `as->` macro | ✗ | `butlast` |
+| 56 | some-> | 4011–4022 | `some->` macro | ✗ | `butlast` (+ `->` dep) |
+| 57 | some->> | 4024–4035 | `some->>` macro | ✗ | `butlast` (+ `->>` dep) |
+| 58 | merge-with | 5556–5570 | `merge-with` | ✗ | **`seq` on a map unsupported** (+ some/key/val deps) |
+| 59 | sort-by | 5661–5671 | `sort-by` | ✗ | `sort`/`compare` |
+| 60 | with-open | 5976–5995 | `with-open` macro | ✗ | **upstream TODO stub** — the slice itself throws |
+| 61 | lazy-cat | 6268–6275 | `lazy-cat` macro | ✗ | `concat` over `(lazy-seq …)` of a vector breaks |
+| 62 | max-key | 6428–6444 | `max-key` | ✓ | `>` / `>=` |
+| 63 | min-key | 6446–6462 | `min-key` | ✗ | **`<=` link bug** (`:erlang.<=/2` undefined) |
+| 64 | assert | 903–918 | `assert` macro | ✗ | `*assert*` var absent |
 
 ## Counts — the headline
 
-> **21 of 21 slices** load **and** behave correctly. Every block of
-> jank's `core.jank` attempted in this measurement now runs unmodified
-> on the BEAM, called with upstream's own docstring examples.
+> **36 of 64 attempted slices** load **and** behave correctly — 21 of the
+> original 21, plus **15 of 43** new slices from the widened wave-16
+> sample. The trajectory is the point: **7 → 13 → 21 → 36** across three
+> waves. Nothing was patched into passing — the fixtures are still
+> byte-for-byte upstream and the checksum test proves it. Where a slice
+> needs another slice (`memoize` needs `if-let`+`val`; `some-fn` needs
+> `some`; `remove` needs `complement`), that dependency is `core.jank`'s
+> own, satisfied with unmodified upstream text.
 >
-> The trajectory is the point: **7/21 → 13/21 → 21/21** across two
-> waves, each aimed by this document's ranked gap list. Nothing was
-> patched into passing — the fixtures are still byte-for-byte upstream
-> and the checksum test proves it. Where a slice needs another slice
-> (`memoize` needs `if-let` and `val`; `not-any?` needs `some`), that
-> dependency is `core.jank`'s own, satisfied with unmodified upstream
-> text.
->
-> What this does and does not prove: it proves beam-lisp reads, compiles
-> and correctly runs real jank source across the leaf and macro bands of
-> the stdlib — including the macro-authoring surface (`&form`, form
-> metadata, `assert-macro-args`) that jank's own macros are written
-> against. It does not prove the whole file loads: the slices were
-> chosen as reachable candidates, and the primitive band built on
-> `cpp/*` interop (see gap 6 below) is untouched.
+> The drop is the deliverable. A 21-slice sample that fully passed had
+> stopped being informative; this wave re-measured over a harder tranche
+> and the honest count is **28 new FAILs with recorded causes** (see the
+> checklist above and the re-ranked gaps below). This is *more* evidence
+> about the real distance to whole-file fidelity than the previous
+> perfect score, not less: it names precisely which primitives and
+> reader rules stand between beam-lisp and the rest of `core.jank`, and
+> ranks them by how many slices each unlocks.
 
-All 21 slices are exercised by `test/beam_lisp/jank_compat_test.exs`
-and demonstrated end-to-end by `examples/jank_slice.bl` and
-`examples/threading.bl` (unmodified jank running on the BEAM, exit 0).
+All 36 behaving slices are exercised by `test/beam_lisp/jank_compat_test.exs`
+and the strongest newcomers are demonstrated end-to-end by
+`examples/jank_slice.bl` (unmodified jank running on the BEAM, exit 0).
 
 ## Gap classification
 
-### 1. Missing prims (the dominant blocker)
+*Re-derived from the wave-16 sample. Unlock counts are the number of the
+43 new slices each gap blocks; items are ordered by unlock count.*
 
-| prim | blocks | notes |
-|------|--------|-------|
-| `next` | some, not-any?, comp/juxt variadic, assert-macro-args | **highest-value single prim**; `rest` exists but Clojure's `next`→nil-on-empty distinction is absent |
-| `list*` (+ `spread`) | comp-4a, juxt-4a, assert-macro-args | variadic cons, built on `next` |
-| `with-meta` / `meta` | doto, keys/vals, set, threading macros | metadata layer entirely absent |
-| `fn?` | trampoline | fn-dispatch primitive |
-| `seq?` | `->`/`->>`, doto | |
-| `boolean` | every-pred, some-fn | |
-| `find` / `contains?` | select-keys, memoize | map entry lookup |
-| `namespace` | simple-ident?/qualified-ident? | |
-| `symbol?`/`keyword?`/`string?`/`vector?`/`list?`/`map?` | keyword, ident?, set, set? | type-predicate layer absent |
-| `transient`/`persistent!`/`conj!`/`assoc!` | keys/vals, set, zipmap | transient collection API |
-| `cpp/*` runtime interop | the primitive layer of core.jank | nth/get/contains?/hash-set/peek/pop/bit-*/set ops are all `(cpp/jank.runtime.*)`; beam-lisp has no `cpp/` namespace, so any slice built on primitives is unreachable until beam-lisp supplies equivalents |
+### 1. Transients — the dominant blocker (6 slices)
 
-### 2. Semantic differences
+`keys`, `vals`, `set`, `zipmap`, `frequencies`, `group-by` all build on
+`(transient …)` / `(persistent! …)` / `conj!` / `assoc!` / `hash-map`.
+beam-lisp has no transient API (the wave-8 trie has the structure but no
+`transient` layer), so every one of these seq-building fns fails with
+`undefined var: …/persistent!`. Smallest fix: `transient`/`persistent!`/
+`conj!`/`assoc!` over the existing trie, plus `hash-map`.
 
-- **`apply` is arity-2 only.** Clojure/jank `apply` is variadic
-  (`(apply f a b … args)`); beam-lisp's `RT.apply` is fixed-arity-2.
-  Blocks partial's 4+-fixed-arg path (`(apply f arg1 arg2 arg3 …)`), and
-  would block complement/fnil/spread-based variadic apply. Smallest fix:
-  make `RT.apply` variadic.
-- **Ratio `1/2` mis-reads.** The reader produces `{:"$remote", "1", "2"}`
-  (a qualified remote call) instead of a numeric ratio — so the head of
-  `core.jank`'s numeric layer is unreachable.
+### 2. `&` rest-destructuring is `rest`-semantics, not `next` (2 slices, silently hangs)
 
-### 3. Reader-level (syntax beam-lisp cannot read as intended)
+`[k & ks]` on an exhausted seq yields `()` (empty list) instead of
+`nil`. In Clojure, `[k & ks]` uses `next`-semantics, so `(if ks …)`
+terminates; here `()` is truthy, so `assoc-in` and `update-in` **recurse
+forever** (each probe had to be killed). This is a *bug* in beam-lisp's
+destructuring, not a missing feature, and it is the highest-leverage fix
+per line of code: change `&`-rest to nil-terminate and two slices pass
+that currently hang. Latent elsewhere too — `comp`/`juxt`/`partial` only
+pass because their tests never hit an exhausted `& rest`.
 
-- **`#(...)` fn literals + `%`/`%1` args** — `#` reads as a bare symbol.
-  Blocks juxt-4a, trampoline-2a, every-pred, some-fn, run!, and a large
-  fraction of idiomatic Clojure.
-- **`^:kw` / `^{:map}` metadata** — `^` reads as a bare symbol. The very
-  head of `core.jank` (`(def ^:dynamic *ns*)`) is unreadable for this
-  reason — why whole-file load is out of scope.
-- **char literals `\a`** — read as a symbol `\a`.
-- **regex `#"…"`** and **`#_` discard** — `#` dispatch unsupported.
-- **`&form`** — not specially bound in macros (resolves as a free symbol).
+### 3. `:as` binding / `&`-in-fn-params destructuring (3 slices, reader-level)
 
-### 4. Missing special forms / ns naming
+`[f :as xs]` and `[a b c :as clause]` destructuring raise
+`unsupported binding pattern: {:keyword, "as"}` at read/compile time.
+Blocks `distinct`, `condp`, and `for` (which additionally needs
+chunk-seq prims and `when-first`). Reader-level FAIL — the slice text
+itself cannot be compiled.
 
-- **`fn*` / `loop*` / `let*`** (raw forms). jank's head uses `fn*`; the
-  threading macros use `loop*`. beam-lisp has `fn`/`loop`/`let` only.
-- **`clojure.core/` qualified refs.** `assert-macro-args` emits
-  `clojure.core/when-not`, `clojure.core/*ns*`, etc. beam-lisp's core ns
-  is named `core`, so `clojure.core/…` never resolves. jank names its ns
-  `clojure.core` for Clojure compatibility; beam-lisp would need an alias
-  (`clojure.core` → `core`) to read such code.
+### 4. `cpp/*` runtime interop (3 slices)
 
-### 5. Requires laziness / protocols / transducers
+`name`, `namespace`, `keyword` call `(cpp/jank.runtime.*)` directly;
+beam-lisp has no `cpp/` namespace, so they fail with `module :cpp is not
+available`. Same family as the primitive layer noted in wave 15 — every
+upstream fn built on `cpp/jank.runtime.*` is unreachable until beam-lisp
+supplies BEAM equivalents under a mapped namespace.
 
-- **Laziness.** beam-lisp's `map`/`filter` return *realized* lists for
-  realized inputs (lazy only for lazy inputs); `(range)` no-arg is lazy.
-  jank implements `map`/`filter`/`take-while`/… as lazy seqs, so slices
-  built on the seq layer assume lazy composition. Not hit by the 21 leaf
-  slices, but it will gate `concat`/`map`/`filter`/`take-while` slices.
-- **Protocols / transducers.** jank's `transduce`/`completing`/`cat`/
-  `preserving-reduced`/`reduced` depend on the `reduced` protocol;
-  beam-lisp has no `reduced`/`reduced?`. Not exercised by the 21.
+### 5. The threading-arrow cluster: `butlast` (+ `partition`, `assert`) (5 slices)
+
+`as->`, `some->`, `some->>` each expand through `butlast` (absent).
+`cond->`/`cond->>` additionally expand through `assert` (→ `*assert*`,
+absent) and `partition` (→ `nthrest`, absent). So `butlast` unlocks 3
+immediately; the two `cond->*` follow once `nthrest`+`*assert*` land.
+
+### 6. Small prims — one slice each
+
+| prim | blocks | note |
+|------|--------|------|
+| `conj` map-entry arity | select-keys | `(conj {} entry)` has no clause |
+| `seq` on a map | merge-with | `(seq {:a 1})` raises; map-walking fns need it |
+| `sort` / `compare` | sort-by | |
+| `nthrest` | partition | also `doall`/`count`/`concat` |
+| `tree-seq` / `sequential?` | flatten | |
+| `*assert*` var | assert | upstream `assert` guards on `(when *assert* …)` |
+| `<=` link | min-key | **`<=` maps to `:erlang.<=/2`, which does not exist** (`:=<` does); `>=` works. Fix the link table and `min-key` passes — and every future `<=` user stops crashing |
+
+### 7. Requires laziness / transducers (partial, recorded honestly)
+
+`take-while`, `drop-while`, `mapcat` behave on their collection arity
+(the docstring contract) and are counted as ✓, but each carries a
+**transducer 1-arity that diverges**: `take-while`'s needs `reduced`,
+`drop-while`'s needs `volatile!`/`vreset!`, `mapcat`'s needs `cat`
+(transducers). `interleave` is **◐**: its 2-arity (and 0-arity) pass,
+but `([c1] (lazy-seq c1))` fails on a realized vector
+(`LazySeq.prefix_loop`). And `lazy-cat` fails outright: `concat` over
+`(lazy-seq …)` of a *vector* hits a case-clause error — a beam-lisp
+`concat`/`lazy-seq` interplay bug worth its own fix.
+
+### 8. Upstream stubs (not beam-lisp gaps)
+
+`with-open` is a **TODO stub in `core.jank` itself** — its body is
+`(throw "TODO: port with-open")`. The slice loads and then throws; that
+is upstream's incompleteness, recorded so a future agent does not chase
+it.
 
 ## What to build next (by unlock count)
 
-*Re-ranked after wave 15 took the measurement to 21/21. With every
-attempted slice passing, the next lever is no longer "close a gap" but
-"widen the sample" — the honest next move is to attempt more of
-`core.jank`, because a 21-slice sample that fully passes has stopped
-being informative.*
+*Re-ranked after wave 16 widened the sample from 21 to 64 slices and the
+count dropped to 36/64. The gaps below are now evidence-ranked, not
+guessed: each unlock count is how many of the 43 new slices that change
+turns from FAIL to behave.*
 
-1. **Attempt the next band of slices.** The current 21 were chosen as
-   reachable candidates. Slice the next tranche — `keys`/`vals`/`set`,
-   `select-keys`, `every-pred`/`some-fn`, `run!`, `group-by`,
-   `partition`, `interleave`, `zipmap` — and re-measure. Expect the
-   score to drop; that drop is the information.
-2. **`cpp/*`-implemented primitives.** jank implements `nth`/`get`/
-   `contains?`/`hash-set`/`peek`/`pop`/bit ops/set ops via
-   `(cpp/jank.runtime.*)` interop. beam-lisp needs BEAM equivalents
-   under a mapped namespace before any slice built on primitives is
-   reachable at all. This is the long tail that makes the *rest* of
-   `core.jank` loadable, and it is a wave of its own.
-3. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`) — needed
-   by `keys`/`vals`/`set`/`zipmap` upstream, and a natural follow-on to
-   the wave-8 trie, which already has the structure for them.
-4. **Reader `^{}` / `^:kw` metadata** — the form-metadata machinery now
-   exists (`BeamLisp.FormMeta`), so the reader only needs to attach a
-   map to the following form node. Unblocks upstream's `^:private` and
-   `^{:doc …}` definitions, which the head of `core.jank` is built on.
-5. **Uniform laziness** (`PLAN-010`) — several upstream seq fns assume
-   `map`/`filter` are lazy over any input; beam-lisp's hybrid model
-   will diverge as the sample widens.
-6. **`namespace`, `rem`/`mod`/`quot`, the numeric tower** — small and
-   mechanical, each unlocking a leaf.
+1. **Transients** (`transient`/`persistent!`/`conj!`/`assoc!`/
+   `hash-map`) — unlocks `keys`, `vals`, `set`, `zipmap`, `frequencies`,
+   `group-by` (**6 slices**). The wave-8 trie already has the structure;
+   this is the natural next collection layer.
+2. **`&`-rest destructuring → nil-terminate** — unlocks `assoc-in`,
+   `update-in` (**2 slices**, both currently *hanging*, plus removes a
+   latent landmine from every `&`-rest user). Smallest fix, highest
+   leverage per line.
+3. **`butlast`** — unlocks `as->`, `some->`, `some->>` (**3 slices**);
+   add `nthrest` + `*assert*` and `cond->`/`cond->>` (**2 more**).
+4. **`:as` / `&`-in-fn-params destructuring** (compiler/reader) —
+   unlocks `distinct`, `condp`, `for` (**3 slices**; `for` needs
+   chunk-seq prims on top).
+5. **`cpp/*` runtime equivalents** (`name`/`namespace_`/`keyword`, then
+   the primitive layer) — unlocks `name`, `namespace`, `keyword`
+   (**3 slices**) and is the long tail that makes the rest of the file
+   loadable at all.
+6. **Small prims, one each**: `sort`/`compare` (sort-by), `conj`
+   map-entry arity (select-keys), `seq` on map (merge-with), `nthrest`
+   (partition), `tree-seq`/`sequential?` (flatten), `*assert*` (assert),
+   and the **`<=` link fix** (`:erlang.<=` → real BIF; min-key).
+7. **`concat`/`lazy-seq` interplay** (lazy-cat) and **transducers**
+   (`reduced`/`volatile!`/`cat`) — the honest note from §7; these also
+   gate `for` and the transducer arities.
 
 ## Keeping this honest
 
