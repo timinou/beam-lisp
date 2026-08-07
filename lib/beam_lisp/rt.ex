@@ -844,6 +844,11 @@ defmodule BeamLisp.RT do
   # A symbol stringifies to its name — `(str 'foo)` is "foo", which
   # jank's keyword ctor needs (`(cpp/jank.runtime.keyword nil (str name))`).
   defp to_str({:symbol, name}), do: name
+  # Clojure's `str` falls back to the printed representation, so
+  # `(str {:a 1})` is "{:a 1}" rather than a String.Chars crash. Maps,
+  # vectors, lists and lazy seqs have no String.Chars impl on the BEAM,
+  # and `print_str/1` is exactly the printer that knows their syntax.
+  defp to_str(x) when is_map(x) or is_list(x) or is_tuple(x), do: print_str(x)
   defp to_str(x), do: to_string(x)
 
   # Fresh, collision-proof symbol datum for hand-written macros. Shares
