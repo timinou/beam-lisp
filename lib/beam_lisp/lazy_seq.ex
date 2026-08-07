@@ -155,9 +155,12 @@ defmodule BeamLisp.LazySeq do
 
       body = Enum.map(elems, &Inspect.inspect(&1, opts))
       body = Enum.intersperse(body, " ")
+      # concat/1 wants a FLAT list of docs; a nested list is not a doc
+      # and crashes the algebra formatter, which made a lazy seq
+      # impossible to inspect — including inside a test failure message.
       body = if truncated, do: body ++ ["…"], else: body
 
-      concat(["(", body, ")"])
+      concat(["("] ++ body ++ [")"])
     end
   end
 end

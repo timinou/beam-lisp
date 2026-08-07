@@ -69,6 +69,11 @@ defmodule BeamLisp.RT do
   # matched before the map clause or `(get [a b] 1)` silently yields
   # the default.
   def get(%BeamLisp.Vector{} = v, i, _default), do: BeamLisp.Vector.nth(v, i)
+  # A transient map is a wrapper (not a struct); read through to its
+  # live state. frequencies/group-by both do `(get transient k d)`.
+  def get({:"$transient", :map, key}, k, default),
+    do: BeamLisp.Transient.get({:"$transient", :map, key}, k, default)
+
   def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
@@ -87,6 +92,12 @@ defmodule BeamLisp.RT do
     end
   end
 
+  # A map is a seq of [k v] entry vectors (Clojure MapEntry); first/rest/
+  # seq/next just delegate to the entry list — what lets reduce, keys, vals,
+  # frequencies and group-by iterate a map. Elixir maps preserve insertion
+  # order, so entry order is deterministic.
+  def first(m) when is_map(m), do: first(map_entries(m))
+
   def rest(nil), do: []
   def rest([]), do: []
   def rest([_ | t]), do: t
@@ -98,6 +109,8 @@ defmodule BeamLisp.RT do
       [_ | t] -> t
     end
   end
+
+  def rest(m) when is_map(m), do: rest(map_entries(m))
 
   @doc """
   Clojure `next` ≡ `(seq (rest coll))`: nil when the remainder is empty,
@@ -118,9 +131,18 @@ defmodule BeamLisp.RT do
     end
   end
 
+  def next(m) when is_map(m), do: next(map_entries(m))
+
   # `next`'s tail is either a realized list (seq it → nil if empty) or a
-  # LazySeq (return it untouched — forcing it would realize a second cell).
-  defp next_tail(%LazySeq{} = t), do: t
+  # LazySeq. Clojure's next is `(seq (rest x))`, so it MUST force one
+  # cell to know whether the tail is empty — returning an unforced
+  # LazySeq made an exhausted seq truthy, and `(when (next s) …)` is
+  # how every recursive seq fn terminates. Realization is memoized, so
+  # the forced cell is not recomputed by the caller.
+  defp next_tail(%LazySeq{} = t) do
+    if LazySeq.cell(t) == nil, do: nil, else: t
+  end
+
   defp next_tail(t), do: seq(t)
 
   def cons(x, nil), do: [x]
@@ -155,10 +177,13 @@ defmodule BeamLisp.RT do
 
   def count(nil), do: 0
   def count(xs) when is_list(xs), do: length(xs)
+  # Both of these are structs, and a struct is a map — they MUST precede
+  # the is_map clause or count returns the number of struct fields.
+  # (A lazy seq quietly counted 3, its field count, for any length.)
   def count(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.count(v)
+  def count(%LazySeq{} = l), do: LazySeq.count(l)
   def count(m) when is_map(m), do: map_size(m)
   def count(s) when is_binary(s), do: String.length(s)
-  def count(%LazySeq{} = l), do: LazySeq.count(l)
 
   def empty?(%LazySeq{} = l), do: LazySeq.cell(l) == nil
   def empty?(xs), do: count(xs) == 0
@@ -243,6 +268,10 @@ defmodule BeamLisp.RT do
       _ -> l
     end
   end
+
+  # A map's seq is its [k v] entries (nil when empty), so `(seq {:a 1})`
+  # iterates like Clojure.
+  def seq(m) when is_map(m), do: seq(map_entries(m))
 
   # --- type & collection predicates (Clojure-correct) ---
 
@@ -350,6 +379,11 @@ defmodule BeamLisp.RT do
   # Clojure treats nil as an empty seq everywhere a seq is expected:
   # `(map f nil)` is `()`, not an error. An exhausted `& rest` binds
   # nil, so upstream code passes nil into seq fns constantly.
+# A map becomes a seq of `[k v]` entry vectors — the Clojure MapEntry
+  # shape — so first/rest/seq/next and reduce all see pairs. Elixir map
+  # enumeration is insertion-ordered, keeping key order deterministic.
+  defp map_entries(m), do: for({k, v} <- m, do: %BeamLisp.Vector{items: {k, v}})
+
   defp seqable(nil), do: []
   defp seqable(coll), do: coll
 
@@ -713,6 +747,21 @@ defmodule BeamLisp.RT do
     }
 
     prims = Map.merge(prims, refs_prims)
+
+    # Transients: mutable-until-persisted views of vectors and maps.
+    # Fixed arities are plain fns; hash-map is variadic (even forms).
+    transient_prims = %{
+      "transient" => &BeamLisp.Transient.transient/1,
+      "persistent!" => &BeamLisp.Transient.persistent!/1,
+      "conj!" => &BeamLisp.Transient.conj!/2,
+      "assoc!" => &BeamLisp.Transient.assoc!/3,
+      "dissoc!" => &BeamLisp.Transient.dissoc!/2,
+      "hash-map" =>
+        multi_fn(%{0 => &BeamLisp.Transient.hash_map_empty/0},
+                 {2, &BeamLisp.Transient.hash_map/3})
+    }
+
+    prims = Map.merge(prims, transient_prims)
     Enum.each(prims, fn {name, f} -> Env.intern("core", name, f) end)
     seed_links()
     :ok
@@ -827,6 +876,22 @@ defmodule BeamLisp.RT do
     }
 
     for {name, info} <- ref_links do
+      Env.put_link("core", name, info)
+    end
+
+    # Transients link to direct calls too. The `!` names are valid
+    # Elixir atoms (like swap!/reset!); hash-map's variadic splits into
+    # 2 fixed args + a rest list against the mangled `hash_map/3`.
+    transient_links = %{
+      "transient" => {BeamLisp.Transient, %{1 => :transient}, nil},
+      "persistent!" => {BeamLisp.Transient, %{1 => :persistent!}, nil},
+      "conj!" => {BeamLisp.Transient, %{2 => :conj!}, nil},
+      "assoc!" => {BeamLisp.Transient, %{3 => :assoc!}, nil},
+      "dissoc!" => {BeamLisp.Transient, %{2 => :dissoc!}, nil},
+      "hash-map" => {BeamLisp.Transient, %{0 => :hash_map_empty}, {2, :hash_map}}
+    }
+
+    for {name, info} <- transient_links do
       Env.put_link("core", name, info)
     end
 
