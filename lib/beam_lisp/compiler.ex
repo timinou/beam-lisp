@@ -1239,9 +1239,16 @@ defmodule BeamLisp.Compiler do
         {:symbol, name} ->
           rest_var = fresh_var(name)
 
+          # Clojure binds an exhausted `& rest` to nil, not to an empty
+          # collection. Upstream code loops on `(when more …)`, and `[]`
+          # is truthy — binding `[]` here made jank's assoc-in/update-in
+          # recurse forever rather than fail visibly.
           drop_ast =
             quote do
-              BeamLisp.RT.drop(unquote(whole_ast), unquote(length(fixed)))
+              case BeamLisp.RT.drop(unquote(whole_ast), unquote(length(fixed))) do
+                [] -> nil
+                dropped -> dropped
+              end
             end
 
           {[{rest_var, drop_ast}], put_local(env, name, rest_var)}

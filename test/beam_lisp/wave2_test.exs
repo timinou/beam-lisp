@@ -72,7 +72,11 @@ defmodule BeamLisp.Wave2Test do
 
     test "sequential with rest" do
       assert eval("(let [[a & rest] [1 2 3]] rest)") == [2, 3]
-      assert eval("(let [[a & rest] [1]] rest)") == []
+      # Clojure binds an exhausted rest to nil, not an empty collection:
+      # upstream code branches on `(when more …)`, and an empty
+      # collection is truthy.
+      assert eval("(let [[a & rest] [1]] rest)") == nil
+      assert eval("(let [[a & rest] [1]] (nil? rest))") == true
     end
 
     test "nested sequential" do

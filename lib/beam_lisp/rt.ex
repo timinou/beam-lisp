@@ -347,11 +347,17 @@ defmodule BeamLisp.RT do
   # Elixir interop hold unchanged; a `LazySeq` input composes lazily so
   # `(take 5 (map f (range)))` never realizes what it does not need.
 
+  # Clojure treats nil as an empty seq everywhere a seq is expected:
+  # `(map f nil)` is `()`, not an error. An exhausted `& rest` binds
+  # nil, so upstream code passes nil into seq fns constantly.
+  defp seqable(nil), do: []
+  defp seqable(coll), do: coll
+
   def map(f, coll) do
     if LazySeq.lazy?(coll) do
       lazy_map(f, coll)
     else
-      coll |> Enum.map(&invoke(f, [&1])) |> empty_contract()
+      coll |> seqable() |> Enum.map(&invoke(f, [&1])) |> empty_contract()
     end
   end
 
@@ -368,7 +374,7 @@ defmodule BeamLisp.RT do
     if LazySeq.lazy?(coll) do
       lazy_filter(pred, coll)
     else
-      coll |> Enum.filter(&invoke(pred, [&1])) |> empty_contract()
+      coll |> seqable() |> Enum.filter(&invoke(pred, [&1])) |> empty_contract()
     end
   end
 
