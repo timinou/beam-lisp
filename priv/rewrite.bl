@@ -1,0 +1,241 @@
+; priv/rewrite.bl — pattern-directed code rewriting: mechanical,
+; reviewable source-to-source transformation.
+;
+; A rewrite is DATA, not a function. A rule is a {pattern, replacement}
+; pair; a ruleset is an ordinary collection; rulesets compose with the
+; same collection ops as any other list. That is the whole argument for
+; doing this in a Lisp — a codemod is a value you can build, share and
+; inspect, not a closure you invoke and hope. `apply-rules` never needs
+; to know where a rule came from, only that it is a {pattern, replacement}
+; map.
+;
+; Convention: a symbol whose name begins with `?` is a PATTERN VARIABLE
+; (`?x`), bound to whatever the corresponding position of the form holds
+; and usable in the replacement. A bare `?` is a valid (if throwaway)
+; variable that matches any one form. Repeated variables unify: `(?x ?x)`
+; matches only when both positions hold equal forms. Real code does not
+; contain `?`-named symbols, so the convention cannot collide with the
+; forms being rewritten — the reason `?` was chosen over `~`-prefixed
+; variables, which clash with syntax-quote's unquote.
+;
+; The walk family mirrors clojure.walk, so existing knowledge transfers:
+; prewalk applies the fn on the way DOWN a form, postwalk on the way UP.
+; Both descend into vectors, maps and sets as well as lists, and rebuild
+; each collection as its own kind — a vector stays a vector, a map stays
+; a map — which is the property a source rewrite relies on. `walk` itself
+; is the split engine: `inner` rebuilds each child, `outer` wraps the
+; finished collection.
+;
+; Rules run to a fixed point: keep taking full postwalk passes until a
+; pass changes nothing, or until a bounded iteration cap trips — a pair
+; of rules that undo each other must RAISE, not hang. A convergent rule
+; set reaches a fixed point in a handful of passes (postwalk rewrites
+; children before parents, so one pass can do a whole nesting); the cap
+; exists purely so a cycle fails loudly instead of spinning.
+(ns rewrite)
+
+(defn walk
+  "Rebuild `form` by applying `inner` to each element and `outer` to each
+   finished collection. Lists become lists, vectors vectors, maps maps,
+   sets sets — a source form keeps its shape. `outer` is what makes a
+   rewrite read top-down or bottom-up: postwalk passes `f` here, prewalk
+   passes identity and calls `f` before walking instead."
+  [inner outer form]
+  (cond
+    (list? form)
+      ; `map` over a proper list returns a fresh list of the same shape.
+      (outer (map inner form))
+    (vector? form)
+      ; `conj` appends to a vector, so folding the walked elements back
+      ; into an empty vector preserves vector-ness (walking `[1 2]` must
+      ; not turn it into the structurally distinct list `(1 2)`).
+      (outer (reduce (fn [v x] (conj v x)) [] (map inner form)))
+    (map? form)
+      ; A map's elements are its [k v] entries (as `seq` yields); rebuild
+      ; by re-assoc'ing the walked entries. An empty map has no entries
+      ; to walk and is returned as-is after `outer`.
+      (if (empty? form)
+        (outer form)
+        (outer (reduce (fn [m e] (assoc m (first e) (second e)))
+                       {} (map inner (seq form)))))
+    (set? form)
+      (if (empty? form)
+        (outer form)
+        (outer (set (map inner (seq form)))))
+    :else
+      (outer form)))
+
+(defn postwalk
+  "Apply `f` to `form` and every subform, innermost first (on the way up).
+   A child is rewritten before its parent sees it, so a rule that rewrites
+   an inner form can feed its parent's match in the same pass."
+  [f form]
+  (walk (fn [x] (postwalk f x)) f form))
+
+(defn prewalk
+  "Apply `f` to `form` and every subform, outermost first (on the way
+   down). The fn sees each form before its children are touched, so a
+   transform that restructures a node changes what gets walked beneath it.
+   The order difference from postwalk is what the tests prove."
+  [f form]
+  (walk (fn [x] (prewalk f x)) identity (f form)))
+
+; --- pattern matching ---
+
+(defn pattern-var?
+  "True when `s` is a pattern variable — a symbol whose name begins with
+   `?`. This is the one convention the whole library rests on; it must
+   agree between match? (bind) and subst (splice)."
+  [s]
+  (and (symbol? s) (String/starts_with? (name s) "?")))
+
+(defn match-each
+  "Match two same-shaped seqs element by element, threading the bindings
+   map through so a repeated variable in the pattern is checked against
+   the form at each of its occurrences. Returns the accumulated bindings,
+   or nil on the first mismatch."
+  [pattern form binds]
+  (loop [pattern pattern form form binds binds]
+    (if (empty? pattern)
+      binds
+      (let [b (match* (first pattern) (first form) binds)]
+        (if (some? b)
+          (recur (rest pattern) (rest form) b)
+          nil)))))
+
+(defn match-map
+  "Match a map pattern against a map form: every pattern key must be
+   present in the form and its pattern value must match the form's value.
+   Equal counts (enforced up front) plus per-key presence means a pattern
+   can neither skip a key nor conjure a missing one."
+  [pattern form binds]
+  (if (not= (count pattern) (count form))
+    nil
+    (loop [entries (seq pattern) binds binds]
+      (if (empty? entries)
+        binds
+        (let [e (first entries)
+              k (key e)
+              v (val e)]
+          (if (contains? form k)
+            (let [b (match* v (get form k) binds)]
+              (if (some? b)
+                (recur (rest entries) b)
+                nil))
+            nil))))))
+
+(defn match*
+  "Core matcher: bind `pattern` against `form`, extending `binds`.
+   Structure must agree — a vector pattern only matches a vector form, a
+   list pattern only a list — so a rewrite never silently coerces shapes."
+  [pattern form binds]
+  (cond
+    ; A variable: first occurrence binds; a repeated occurrence must
+    ; equal the first binding (the `(?x ?x)` rule, decided: unify).
+    (pattern-var? pattern)
+      (if (contains? binds pattern)
+        (if (= (get binds pattern) form) binds nil)
+        (assoc binds pattern form))
+    (list? pattern)
+      (if (and (list? form) (= (count pattern) (count form)))
+        (match-each pattern form binds)
+        nil)
+    (vector? pattern)
+      (if (and (vector? form) (= (count pattern) (count form)))
+        (match-each pattern form binds)
+        nil)
+    (map? pattern)
+      (if (map? form)
+        (match-map pattern form binds)
+        nil)
+    ; Anything else is a literal: it matches only an equal form.
+    :else
+      (if (= pattern form) binds nil)))
+
+(defn match?
+  "Match a form against a pattern. Returns the bindings map (possibly
+   empty) on a match, or nil on no match. A pattern variable is any
+   symbol whose name starts with `?`."
+  [pattern form]
+  (match* pattern form {}))
+
+(defn subst*
+  "Splice `binds` into a pattern, replacing each `?`-variable with its
+   bound form and rebuilding collections in place. Unbound variables are
+   left alone (a variable in the replacement that never appeared in the
+   pattern is an authoring error worth keeping visible, not hiding)."
+  [binds form]
+  (cond
+    (pattern-var? form)
+      (if (contains? binds form) (get binds form) form)
+    (list? form)
+      (map (fn [x] (subst* binds x)) form)
+    (vector? form)
+      (reduce (fn [v x] (conj v x)) [] (map (fn [x] (subst* binds x)) form))
+    (map? form)
+      (reduce (fn [m e]
+                (assoc m (subst* binds (key e)) (subst* binds (val e))))
+              {} (seq form))
+    (set? form)
+      (set (map (fn [x] (subst* binds x)) (seq form)))
+    :else
+      form))
+
+(defn subst
+  "Substitute a bindings map into a pattern, returning the instantiated
+   form. `(subst {'?x 5} '(+ ?x ?x))` is `(+ 5 5)`."
+  [binds pattern]
+  (subst* binds pattern))
+
+; --- rules ---
+
+; A rule is data: a map with `:pattern` and `:replacement` keys. `defrule`
+; is only sugar for naming such a map; the value it binds is a plain
+; collection a caller can store, pass around, or combine with others.
+(defmacro defrule
+  "Bind `name` to a {pattern, replacement} rule. Both arguments are data
+   (quoted for you), so `(defrule nil-eq (= ?x nil) (nil? ?x))` binds a
+   rule that rewrites any `(= x nil)` into `(nil? x)`."
+  [name pattern replacement]
+  `(def ~name {:pattern '~pattern :replacement '~replacement}))
+
+(defn try-rules
+  "Apply the first rule in `rules` whose pattern matches `form`, returning
+   the substituted replacement, or `form` unchanged if none match. First
+   match wins; a ruleset is tried in order, so earlier rules take
+   precedence over later ones."
+  [rules form]
+  (loop [rules rules]
+    (if (empty? rules)
+      form
+      (let [rule (first rules)
+            binds (match? (get rule :pattern nil) form)]
+        (if (some? binds)
+          (subst binds (get rule :replacement nil))
+          (recur (rest rules)))))))
+
+(defn apply-rules
+  "Rewrite `form` by running `rules` over every node, to a fixed point.
+   Each iteration is one full postwalk pass (children before parents);
+   when a pass changes nothing the result is returned. If the form is
+   still changing after `cap` passes the ruleset is cycling — two rules
+   undoing each other, say — and an error is raised rather than hanging.
+   `rules` is an ordinary collection of {pattern, replacement} maps."
+  ([rules form] (apply-rules rules form 1000))
+  ([rules form cap]
+   (let [step (fn [x] (try-rules rules x))]
+     (loop [form form passes 0]
+       (let [next (postwalk step form)]
+         (if (= next form)
+           form
+           (if (>= passes cap)
+             (throw (ex-info
+                      "rewrite did not reach a fixed point within the iteration cap — the rules appear to cycle (two rules undoing each other?)"
+                      {:non-terminating true :passes passes :cap cap}))
+             (recur next (inc passes)))))))))
+
+(defn apply-rule
+  "Rewrite `form` by a single rule, to a fixed point. Sugar over
+   `apply-rules` with a one-rule ruleset."
+  ([rule form] (apply-rules (list rule) form))
+  ([rule form cap] (apply-rules (list rule) form cap)))

@@ -1489,6 +1489,27 @@ defmodule BeamLisp.Compiler do
           else
             {head_vars ++ [rest_var], [], put_local(clause_env, name, rest_var)}
           end
+
+        pattern ->
+          # A destructuring pattern in the rest position: bind the
+          # trailing args to a fresh var, then run the same destructuring
+          # as a fixed param. The rest is always a positional seq, so an
+          # empty rest arrives as `()`; normalize it to nil first, because
+          # Clojure's `&` binds an exhausted rest to nil and jank's
+          # variadic recursion relies on the base case seeing nil: an
+          # empty list is truthy, so `(when more ...)` would loop forever
+          # instead of terminating. The pattern then destructures nil
+          # leniently (every name nil); `:as` in the pattern binds nil too.
+          rest_var = fresh_var("rest")
+          raw = fresh_var("rest_raw")
+          norm = quote do: (if unquote(raw) == [], do: nil, else: unquote(raw))
+          {sub_steps, clause_env} = rest_destructure(pattern, clause_env, rest_var)
+
+          rest_prelude =
+            [{:=, [], [rest_var, norm]} |
+               Enum.map(sub_steps, fn {var, expr} -> {:=, [], [var, expr]} end)]
+
+          {head_vars ++ [raw], rest_prelude, clause_env}
       end
 
     recur = Map.put(recur_spec, :arity, length(head_vars))
@@ -1515,12 +1536,43 @@ defmodule BeamLisp.Compiler do
       {fixed, []} ->
         {fixed, nil}
 
-      {fixed, [{:symbol, "&"}, {:symbol, _} = rest]} ->
+      # The rest position may hold a bare symbol OR a destructuring
+      # pattern (`& [a b]`, `& {:keys [x]}`). Clojure treats the rest
+      # as the collection to destructure; the destructuring sites decide
+      # which shapes they accept. split_variadic's only contract is
+      # "exactly one form follows &".
+      {fixed, [{:symbol, "&"}, rest]} ->
         {fixed, rest}
 
       _ ->
-        raise "& in params must be followed by exactly one symbol"
+        raise "& in params must be followed by exactly one parameter"
     end
+  end
+
+  # Clojure binds an exhausted `& rest` to nil, not to an empty
+  # collection. Upstream code loops on `(when more …)`, and `[]` is
+  # truthy — binding `[]` here made jank's assoc-in/update-in recurse
+  # forever rather than fail visibly. A rest PATTERN then destructures
+  # that nil leniently (every name nil) instead of crashing at the base.
+  defp rest_drop_ast(whole_ast, fixed_count) do
+    quote do
+      case BeamLisp.RT.drop(unquote(whole_ast), unquote(fixed_count)) do
+        [] -> nil
+        dropped -> dropped
+      end
+    end
+  end
+
+  # A rest pattern destructures a positional SEQ, so only sequential
+  # shapes are meaningful there. Clojure compiles `& {:keys [x]}` but it
+  # silently binds every key to nil (a seq is not a map) — a footgun,
+  # not a feature — so beam-lisp refuses a map rest loudly instead.
+  defp rest_destructure({:map, _}, _env, _rest_var) do
+    raise "& rest pattern cannot be a map: the rest is a positional seq; use a vector pattern (& [a b]) or destructure the map as a fixed param"
+  end
+
+  defp rest_destructure(pattern, env, rest_var) do
+    destructure_steps(pattern, env, rest_var)
   end
 
   # Simple symbol params go straight into the fn head; destructured
@@ -1575,20 +1627,15 @@ defmodule BeamLisp.Compiler do
 
         {:symbol, name} ->
           rest_var = fresh_var(name)
+          {[{rest_var, rest_drop_ast(whole_ast, length(fixed))}], put_local(env, name, rest_var)}
 
-          # Clojure binds an exhausted `& rest` to nil, not to an empty
-          # collection. Upstream code loops on `(when more …)`, and `[]`
-          # is truthy — binding `[]` here made jank's assoc-in/update-in
-          # recurse forever rather than fail visibly.
-          drop_ast =
-            quote do
-              case BeamLisp.RT.drop(unquote(whole_ast), unquote(length(fixed))) do
-                [] -> nil
-                dropped -> dropped
-              end
-            end
-
-          {[{rest_var, drop_ast}], put_local(env, name, rest_var)}
+        pattern ->
+          # A pattern in the rest position destructures the trailing seq
+          # exactly like a fixed param, against the same nil-normalized
+          # rest (`:as` binds the whole rest, nested vectors recurse).
+          rest_var = fresh_var("rest")
+          {sub_steps, env} = rest_destructure(pattern, env, rest_var)
+          {[{rest_var, rest_drop_ast(whole_ast, length(fixed))}] ++ sub_steps, env}
       end
 
     # `:as` mirrors the map clause: bind the ENTIRE original collection
