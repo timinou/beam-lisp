@@ -89,9 +89,11 @@ keywords-as-functions, variadic arithmetic and comparisons
 blocking `deref`, incl. timeout), `@x` sugar — registered in
 `core.bl` through a **rebindable reader-macro table**, not wired
 into the reader — **`#()` fn literals** (`%`, `%1`, `%&`), `#_`
-discard and char literals, **open dispatch** (`defmulti`/`defmethod`,
-`defprotocol`/`extend-type`, `derive`/`isa?` hierarchies), **lazy
-sequences** (`lazy-seq`, infinite `(range)`, realize-once cells),
+discard and char literals, **sets** (`#{}` literals, `set`/`disj`,
+transient sets) with `sort` and a total-order `compare`, **open
+dispatch** (`defmulti`/`defmethod`, `defprotocol`/`extend-type`,
+`derive`/`isa?` hierarchies), **lazy sequences**
+(`lazy-seq`, infinite `(range)`, realize-once cells), **transients**,
 full Elixir/Erlang interop, and a
 self-hosted prelude (`priv/core.bl`: `map`, `filter`, `reduce`,
 `range`, `zipmap`, `when`, `case`, `future`, … — itself written in
@@ -173,11 +175,12 @@ Deliberate gaps, roughly in priority order:
 
 - **uniform laziness** — the seq model is hybrid: realized inputs take
   the strict path, so bounded `(range n)` is eager (`PLAN-010`)
-- **sets and sorting** — no set type or `#{}` literal yet, and no
-  `sort`/`compare`
-- **jank stdlib convergence** — 51 of 64 attempted `core.jank` slices
-  run unmodified; the remaining thirteen are measured and ranked in
-  `docs/jank-compat.md`
+- **transducers** — the collection arities of the seq fns are done;
+  the 1-arity transducer paths need `volatile!`, `reduced` and `cat`
+- **jank stdlib convergence** — 62 of 64 attempted `core.jank` slices
+  run unmodified; the next step is a bigger sample, since the two
+  that remain are one narrow compiler gap and one upstream stub
+  (`docs/jank-compat.md`)
 
 ## Relationship to jank
 
@@ -190,11 +193,12 @@ have to be an opinion. It can be a test.
 vendored byte-for-byte from upstream commit `3028594`, each carrying
 a sha256 that the test suite asserts — so making a slice pass by
 editing it would fail the build rather than quietly inflate the
-claim. **51 of 64 load and behave correctly**, called with upstream's
+claim. **62 of 64 load and behave correctly**, called with upstream's
 own docstring examples: the threading macros, `if-let`, `doseq`,
 `doto`, `memoize`, `comp`, `juxt`, `partial`, `trampoline`, `keys`,
-`vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->` and
-more — jank's own code, unmodified, on the BEAM:
+`vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->`, `set`,
+`distinct`, `sort-by`, `merge-with`, `flatten`, `condp` and more —
+jank's own code, unmodified, on the BEAM:
 
 ```console
 $ mix beam_lisp.run examples/jank_slice.bl   # unmodified jank, running on the BEAM
@@ -204,13 +208,18 @@ $ mix beam_lisp.run examples/threading.bl    # upstream ->, ->>, doto
 `docs/jank-compat.md` is the measurement: every slice with its
 verdict, every failure classified, and a build-next list ranked by
 how many slices each gap unlocks. The score has moved **7 → 13 → 21
-→ 36 → 38 → 51** across six waves, each aimed by that list — and the
-dip is deliberate: once a 21-slice sample passed completely it had
-stopped being informative, so the sample tripled to 64 and the score
-fell before climbing again.
+→ 36 → 38 → 62** across eight waves, each aimed by that list — and
+the dip is deliberate: once a 21-slice sample passed completely it
+had stopped being informative, so the sample tripled to 64 and the
+score fell before climbing again.
+
+The two that remain are named exactly. `for` needs a rest argument
+that is itself a destructuring pattern; `with-open` is an upstream
+TODO stub whose body is commented out, so it throws by construction
+and cannot pass anywhere, including in jank.
 
 The most valuable output has been the bugs. Running real upstream
-code found five defects beam-lisp's own 440 tests did not:
+code found eight defects beam-lisp's own suite did not:
 
 - `~@` could not splice a vector, only a list
 - `get` on a vector returned the default — a vector is a struct, a
@@ -221,10 +230,15 @@ code found five defects beam-lisp's own 440 tests did not:
   truthy and every `(when (next s) …)` recursion failed to terminate
 - an exhausted `& rest` bound an empty collection instead of nil,
   which made `assoc-in` and `update-in` **hang** rather than fail
+- `(<= 1 2)` linked to `:erlang."<="`, which does not exist — Erlang
+  spells it `=<`, and only the two-argument form was affected
+- a `lazy-seq` body returning a bare collection crashed the seq walk
+- `Inspect` on a lazy sequence crashed the formatter, so a lazy value
+  could not be printed at all, including inside a failure message
 
-Two of those failed silently and one hung. Each was fixed at the
-root. That is the argument for measuring against someone else's
-code: your own tests encode your own assumptions.
+Two failed silently and one hung. Each was fixed at the root. That
+is the argument for measuring against someone else's code: your own
+tests encode your own assumptions.
 
 What it does *not* prove: the slices were chosen as reachable
 candidates, and the band of `core.jank` built on jank's `cpp/*`
@@ -263,6 +277,7 @@ $ mix beam_lisp.run examples/fnlit.bl      # #() fn literals
 $ mix beam_lisp.run examples/jank_slice.bl # unmodified jank core.jank on the BEAM
 $ mix beam_lisp.run examples/threading.bl  # upstream ->, ->>, doto
 $ mix beam_lisp.run examples/transients.bl # transient build, and what it costs
+$ mix beam_lisp.run examples/sets.bl       # sets: membership, conj/disj, distinctness
 $ mix beam_lisp.run examples/bench.bl     # what var linking buys (~70× on hot loops)
 ```
 
@@ -274,7 +289,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 440 tests: reader, compiler, prelude, vectors, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 488 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
