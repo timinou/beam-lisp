@@ -5,13 +5,23 @@ defmodule BeamLisp.Link do
   ETS lookup + `RT.invoke/2` dispatch.
 
   Namespace `"my.app"` maps to module `BeamLisp.Ns.My.App`. Every
-  `defn` (re)generates the namespace module with all its current
-  defs (O(ns size) per def — defs are rare, calls are hot), then:
+  `defn` (re)generates the namespace module, then:
 
     * interns the var's *value* as a capture of the module fn, so
       `apply`, `map f`, and interop keep working unchanged
     * registers link metadata in `BeamLisp.Env`, so later call
       sites emit `BeamLisp.Ns.User.f(a, b)` directly
+
+  The namespace module only carries *shims* that forward each fn to its
+  own immutable body module (`BeamLisp.Ns.Fn.*`). Splitting the two keeps a
+  stored closure alive no matter how often the namespace is redefined:
+  the BEAM keeps just two versions of a module and purges the oldest, so
+  if closures' code lived in the regenerated namespace module, the third
+  redefinition after a closure was created would kill it. Body modules
+  are never reloaded, so they are never purged; redefinition makes a new
+  body module and repoints the shim, and existing closures keep running
+  their own old code. Hot-swap still works because the shim keeps a
+  stable name that call sites bake and redefinition reloads in place.
 
   Variadic fns get a mangled `name__bl_v/min+1` def (last param is
   the rest list) to avoid colliding with fixed clauses of the same
@@ -34,33 +44,28 @@ defmodule BeamLisp.Link do
   module. `new_defs` is a list of
   `{:fixed, arity, fname, def_ast} | {:variadic, min, fname, def_ast}`.
   Returns the interned value.
+
+  The definition's real body is compiled into a fresh, immutable *body
+  module*; the namespace module only carries a thin shim that forwards
+  to it. See `fresh_body_module/0` and `shim_defs/1` for why.
   """
   def defvar(ns, name, new_defs, location \\ nil) when is_binary(ns) and is_binary(name) do
     mod = module_for(ns)
 
+    # This definition's real code — and every closure it creates — lives
+    # in a fresh body module. Redefinition makes a *new* body module and
+    # repoints the shim; closures from the old body keep pointing at their
+    # own module, which is never loaded again and so never purged.
+    body_mod = fresh_body_module()
+    body_defs = Enum.map(new_defs, fn entry -> Tuple.insert_at(entry, tuple_size(entry), body_mod) end)
+
     all_defs =
       ns
       |> Env.ns_defs()
-      |> Map.put(name, new_defs)
+      |> Map.put(name, body_defs)
 
-    block =
-      {:__block__, [],
-       Enum.flat_map(all_defs, fn {_var, defs} -> Enum.map(defs, &elem(&1, 3)) end)}
-
-    # Redefinition is the normal case (every defn regenerates the
-    # ns module); silence the compiler's module-conflict warning.
-    prev_opts = Code.compiler_options()
-    Code.compiler_options(ignore_module_conflict: true)
-
-    try do
-      # `location` is the `{file, line}` of the defining `.bl` form (nil
-      # when the form carried no position, e.g. a macro-built defn); it
-      # makes the regenerated module's line table point at the user's
-      # source instead of this file.
-      Module.create(mod, block, location || Macro.Env.location(__ENV__))
-    after
-      Code.compiler_options(prev_opts)
-    end
+    build_module(body_mod, body_block(body_defs), location)
+    build_module(mod, shim_block(all_defs), location)
     Env.put_ns_defs(ns, all_defs)
 
     fixed = for {:fixed, arity, fname, _} <- new_defs, do: {arity, fname}
@@ -76,6 +81,71 @@ defmodule BeamLisp.Link do
 
     :ets.insert(@table, {{:link, ns, name}, link_info})
     Env.intern(ns, name, value)
+  end
+
+  # A stable, uniquely-named home for one defn's real code. It is never
+  # reloaded, so BEAM version churn cannot purge it: the VM keeps exactly
+  # two versions of a module and drops the oldest on the third load, and
+  # that drop is what turned stored closures into BadFunctionErrors. It
+  # lives under `BeamLisp.Ns.Fn.*` (not `BeamLisp.Fn.*`) so a stack frame
+  # from code that raises here still carries the `BeamLisp.Ns.*` prefix
+  # that error-reporting tests key on.
+  defp fresh_body_module do
+    Module.concat([BeamLisp.Ns, "Fn", "M" <> Integer.to_string(System.unique_integer([:positive]))])
+  end
+
+  # The real `def` ASTs, one per clause of the defn.
+  defp body_block(body_defs) do
+    {:__block__, [], Enum.map(body_defs, &elem(&1, 3))}
+  end
+
+  @doc """
+  The `def` ASTs that go in the namespace module: one forwarding shim per
+  defn clause. The namespace module is the stable name call sites bake and
+  hot-swap reloads, so AOT must reproduce this exact shape from the defs
+  the compiler drove into `Env.ns_defs/1`.
+  """
+  def shim_defs(ns_defs) do
+    Enum.flat_map(ns_defs, fn {_var, defs} -> Enum.map(defs, &shim_def/1) end)
+  end
+
+  @doc """
+  Group each defn's real `def` ASTs by the body module that hosts them,
+  so AOT can emit one `.beam` per body module alongside the namespace
+  module. Returns `[{body_mod, [def_ast]}]`.
+  """
+  def body_modules(ns_defs) do
+    ns_defs
+    |> Enum.flat_map(fn {_var, defs} -> defs end)
+    |> Enum.group_by(&elem(&1, 4), &elem(&1, 3))
+  end
+
+  defp shim_def({kind, _n, _fname, {:def, line, [{fname, _, head}, [do: _]]}, body_mod})
+       when kind in [:fixed, :variadic] do
+    {:def, line, [{fname, [], head}, [do: {{:., [], [body_mod, fname]}, [], head}]]}
+  end
+
+  # The namespace module: one forwarding shim per defn clause. Shims keep
+  # the stable `BeamLisp.Ns.<Ns>.f/arity` entry points that call sites bake
+  # and hot-swap reloads, while holding no code themselves — so churning
+  # this module (every defn rebuilds it) can never strand a closure.
+  defp shim_block(all_defs) do
+    {:__block__, [], shim_defs(all_defs)}
+  end
+
+  # Create a module from a block, silencing the module-conflict warning:
+  # rebuilding the namespace module on every defn is the normal case, and
+  # a macro-expanded defn arrives with no position, so fall back to this
+  # file's location exactly as before.
+  defp build_module(mod, block, location) do
+    prev_opts = Code.compiler_options()
+    Code.compiler_options(ignore_module_conflict: true)
+
+    try do
+      Module.create(mod, block, location || Macro.Env.location(__ENV__))
+    after
+      Code.compiler_options(prev_opts)
+    end
   end
 
   # A single fixed-arity fn is just a capture of the def — a real

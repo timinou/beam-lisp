@@ -7,6 +7,17 @@ defmodule BeamLisp.LazySeq do
   realized list, so a lazy seq is a chain of deferred cells that each realize
   exactly when they are reached.
 
+  **Thunk contract — what a lazy-seq body may return:** `nil`, a `[h | t]`
+  cons cell, any seqable collection (vector, set), or a bare `LazySeq`.
+  Returning a bare `LazySeq` is idiomatic — Clojure `lazy-seq` bodies
+  routinely hand back another seq (`(lazy-seq (concat …))`) — and
+  `realize/1` peels such nested nodes until it finds `nil` or a cons cell.
+  **What the type guarantees to callers:** `cell/1` and `realize/1` always
+  yield `nil` or a `[h | t]` cell — never a bare `LazySeq` — so every walk
+  (concat, first, next, take, count, Enum) can pattern-match on exactly those
+  two shapes. Only the head is normalized; the tail stays lazy, so an infinite
+  seq realizes one cell at a time.
+
   Realization is memoized **once per node** so re-forcing a shared cell never
   re-runs its thunk (the guarantee Clojure's `lazy-seq` makes): each node
   carries a unique `:ref` key and writes its realized value into the shared
@@ -54,17 +65,34 @@ defmodule BeamLisp.LazySeq do
     end
   end
 
-  @doc "Force a node and normalize an empty list to `nil` (a realized cell)."
-  def realize(%__MODULE__{} = l) do
+  @doc "Force a node and normalize to a realized cell: `nil` or `[head | tail]`."
+  def realize(%__MODULE__{} = l), do: realize_loop(l, 0)
+
+  # A lazy-seq body may hand back any seqable rather than a cons cell —
+  # jank writes `(lazy-seq c1)` around a bare collection — so normalize
+  # it here, at the one place a thunk's value enters the walk. Without
+  # this a realized vector reached the walk loops as an opaque value and
+  # crashed with no matching clause.
+  #
+  # The invariant every walk relies on is: forcing a node yields `nil`
+  # or a `[h | t]` cell, never a bare LazySeq. Clojure `lazy-seq` bodies
+  # routinely *return another seq* — `(lazy-seq (concat …))` nests — so
+  # a thunk that hands back a bare LazySeq is idiomatic, not an error.
+  # Peel those nested nodes here rather than leaving them for every
+  # `case LazySeq.cell(_)` consumer (concat, first, next, take, …) to
+  # rediscover and crash on. Only the HEAD is normalized; the tail stays
+  # lazy, so an infinite seq still realizes one cell at a time.
+  defp realize_loop(%__MODULE__{} = l, depth) do
+    if depth > 100_000 do
+      raise "LazySeq.realize: thunk chain #{depth} deep without a head — " <>
+              "a self-referential lazy seq never produces a cell; it would hang forever"
+    end
+
     case force(l) do
       [] -> nil
-      # A lazy-seq body may hand back any seqable rather than a cons
-      # cell — jank writes `(lazy-seq c1)` around a bare collection —
-      # so normalize it here, at the one place a thunk's value enters
-      # the walk. Without this a realized vector reached the walk
-      # loops as an opaque value and crashed with no matching clause.
       %BeamLisp.Vector{} = v -> normalize_cell(BeamLisp.Vector.to_list(v))
       %BeamLisp.Set{} = s -> normalize_cell(BeamLisp.Set.to_list(s))
+      %__MODULE__{} = nested -> realize_loop(nested, depth + 1)
       value -> value
     end
   end
