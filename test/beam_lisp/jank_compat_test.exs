@@ -171,6 +171,13 @@ defmodule BeamLisp.JankCompatTest do
      "5985edd900e3b27b00f2a399178f6c996b30c44d8cad6069cbb83b2f074bb89d"},
     {"slice_59_sort_by.bl", "jank.accept.sortby",
      "6da8e42409ae1f55ebd576ef4e162cb6aa96e9499321f26f21033ef934bc2262"},
+    # Promoted by wave 23. `for` was the last real compiler gap in the
+    # sample: its signature destructures a rest argument that is itself
+    # a pattern, which split_variadic/1 refused. It also needed the
+    # lazy-seq thunk fix (its emits nest concat inside lazy-seq) and
+    # when-first in core. Three unrelated-looking bugs, one fixture.
+    {"slice_44_for.bl", "jank.accept.for",
+     "977712c0fb622d051d800f5ab9fba840ab065717112be7c03ad72f38f21cc437"},
     {"slice_61_lazy_cat.bl", "jank.accept.lazycat",
      "cc8202e3f4a02c8a39f089ef85a608c88bb04b0923380f604dc2a7e3c03f1efc"}
   ]
@@ -724,6 +731,28 @@ defmodule BeamLisp.JankCompatTest do
 
       load_slice("slice_61_lazy_cat.bl", "jank.accept.lazycat")
       assert eval_in("jank.accept.lazycat", "(doall (lazy-cat [1 2] [3]))") == [1, 2, 3]
+    end
+
+    test "for comprehends, nests, and stays lazy" do
+      load_slice("slice_44_for.bl", "jank.accept.for")
+
+      assert eval_in("jank.accept.for", "(doall (for [x [1 2 3]] (* x x)))") == [1, 4, 9]
+
+      # Nested bindings iterate right-to-left, as Clojure's do.
+      assert eval_in("jank.accept.for", "(doall (for [x [1 2] y [3 4]] [x y]))") ==
+               [
+                 BeamLisp.Vector.new([1, 3]),
+                 BeamLisp.Vector.new([1, 4]),
+                 BeamLisp.Vector.new([2, 3]),
+                 BeamLisp.Vector.new([2, 4])
+               ]
+
+      assert eval_in("jank.accept.for", "(doall (for [x (range 10) :when (even? x)] x))") ==
+               [0, 2, 4, 6, 8]
+
+      # The point of `for` being lazy: an unbounded source is fine as
+      # long as nobody asks for all of it.
+      assert eval_in("jank.accept.for", "(doall (take 3 (for [x (range)] (* 2 x))))") == [0, 2, 4]
     end
   end
 end

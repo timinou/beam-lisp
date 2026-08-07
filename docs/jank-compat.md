@@ -92,7 +92,7 @@ columns are the upstream span in `core.jank@3028594`.
 | 41 | partition | 3231–3251 | `partition` | ✓ | *was ✗* — `nthrest`; exposed the lazy `count`/`next`/`Inspect` bugs |
 | 42 | frequencies | 3322–3331 | `frequencies` | ✓ | *was ✗* — transients (wave 17) |
 | 43 | group-by | 3333–3344 | `group-by` | ✓ | *was ✗* — transients (wave 17) |
-| 44 | for | 3604–3689 | `for` | ✗ | `& [vector-pattern]` — a rest argument that is itself a destructuring pattern |
+| 44 | for | 3145–3216 | `for` macro | ✓ | *was ✗* — needed three unrelated fixes: a rest arg that is itself a pattern, bare-LazySeq normalization, and `when-first` (wave 23) |
 | 45 | assoc-in | 3697–3704 | `assoc-in` | ✓ | *was ✗ (hung)* — closed by nil-terminating `&` rest |
 | 46 | update-in | 3706–3718 | `update-in` | ✓ | *was ✗ (hung)* — same fix; needs the `assoc-in` slice co-loaded |
 | 47 | update | 3720–3734 | `update` | ✓ | `assoc`/`get`/`apply`, variadic |
@@ -116,8 +116,8 @@ columns are the upstream span in `core.jank@3028594`.
 
 ## Counts — the headline
 
-> **62 of 64 attempted slices** load **and** behave correctly. The
-> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62** across eight
+> **63 of 64 attempted slices** load **and** behave correctly. The
+> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62 → 63** across nine
 > waves, each aimed by this document's ranked gap list. Nothing was
 > patched into passing — the fixtures are still
 > byte-for-byte upstream and the checksum test proves it. Where a slice
@@ -134,12 +134,19 @@ columns are the upstream span in `core.jank@3028594`.
 > rules stand between beam-lisp and the rest of `core.jank`, and ranks
 > them by how many slices each unlocks.
 >
-> The two that remain are named exactly: `for` needs a rest argument
-> that is itself a destructuring pattern (`& [[_ next-expr] :as g]`),
-> and `with-open` is an **upstream TODO stub whose body is commented
-> out** — it throws by construction, so it cannot pass anywhere,
-> including in jank. Leaving it as a recorded failure is the honest
-> reading.
+> One remains, and it is not a beam-lisp gap: `with-open` is an
+> **upstream TODO stub whose body is commented out** — it throws by
+> construction, so it cannot pass anywhere, including in jank. Leaving
+> it as a recorded failure is the honest reading. **Every slice in this
+> sample that *can* pass now does.**
+>
+> `for` was the last real one, and it is worth recording what it cost,
+> because a single fixture named three unrelated bugs: a rest argument
+> that is itself a destructuring pattern (the compiler refused
+> anything but a bare symbol after `&`); a lazy-seq thunk returning a
+> bare lazy seq, which `for`'s emits do and which crashed the seq walk;
+> and `when-first`, simply missing from the prelude. None of the three
+> would have been found by reasoning about the compiler.
 >
 > Running real upstream code has repeatedly found bugs beam-lisp's own
 > tests did not: `~@` could not splice a vector; `get` on a vector
@@ -239,12 +246,10 @@ it.
 
 ## What to build next
 
-*Every item on the previous list is done — transients, nil-terminating
-`&` rest, `butlast`/`nthrest`/`*assert*`, `:as`, the `cpp/*` shim,
-sort/compare, `seq` on a map, `tree-seq`, the `<=` link, and the
-lazy-seq/`concat` interplay. At 62 of 64 the ranked-by-unlock-count
-framing has run its course: what remains is one narrow compiler gap and
-one upstream stub. The informative move is again to widen the sample.*
+*Every item on the previous list is done, `& [pattern]` included. At 63
+of 64 — with the 64th unpassable by construction — this sample is
+exhausted as a source of information. Widening is no longer the
+*informative* move, it is the only one.*
 
 1. **Widen the sample a third time.** 64 slices, chosen as reachable
    candidates, is still a small fraction of `core.jank`. Take the next
@@ -252,24 +257,20 @@ one upstream stub. The informative move is again to widen the sample.*
    `deftype`/protocol users, the arithmetic and bit-op layer — and
    expect the score to fall again. Both previous widenings paid for
    themselves in bugs found.
-2. **`& [pattern]`** — a rest argument that is itself destructured, the
-   last blocker on `for` (slice 44). `split_variadic/1` requires a bare
-   symbol after `&`; the destructuring machinery it would delegate to
-   already exists, so this is plumbing rather than design.
-3. **`cpp/*` coverage.** The shim maps the handful of primitives the
+2. **`cpp/*` coverage.** The shim maps the handful of primitives the
    attempted slices call. The rest of the file leans on it heavily
    (`nth`/`get`/`hash-set`/`peek`/`pop`/bit ops/set ops); each is a
    small honest BEAM implementation registered under the qualified
    name upstream already uses.
-4. **Transducer arities.** Several accepted slices pass their
+3. **Transducer arities.** Several accepted slices pass their
    collection arity while their 1-arity transducer path is untested —
    `volatile!`/`vswap!`, `reduced`, and `cat` would let those be
    measured rather than assumed. `distinct` and `drop-while` both carry
    this caveat today.
-5. **Uniform laziness** (`PLAN-010`) — the hybrid seq model diverges
+4. **Uniform laziness** (`PLAN-010`) — the hybrid seq model diverges
    from Clojure on bounded inputs, and transducer-shaped upstream code
    will feel it.
-6. **Reader `^{}` metadata** — the form-metadata machinery exists
+5. **Reader `^{}` metadata** — the form-metadata machinery exists
    (`BeamLisp.FormMeta`); the reader only needs to attach the map to
    the following form. Unblocks upstream's `^:private` and `^{:doc …}`
    definitions, which the head of `core.jank` is built on.
