@@ -14,16 +14,14 @@ defmodule BeamLisp.Wave24RecordsTest do
   setup do
     BeamLisp.init()
     Env.in_ns("user")
-    # `keys`/`vals`/`merge`/`into` are self-hosted in jank's core, not the
-    # beam-lisp prelude; define faithful Clojure versions here so the
-    # record-through-the-map-path assertions exercise the shipped seq /
-    # reduce / conj / assoc primitives they are built on.
-    eval("""
-    (defn keys [m] (map first (seq m)))
-    (defn vals [m] (map second (seq m)))
-    (defn merge [& ms] (reduce (fn [acc m] (reduce (fn [a e] (assoc a (first e) (second e))) acc (seq m))) {} ms))
-    (defn into [to from] (reduce (fn [acc x] (conj acc x)) to (seq from)))
-    """)
+    # `keys`/`vals`/`merge`/`into` used to be defined here, because none of
+    # them shipped in the prelude yet. Wave 27 added all four, so the local
+    # copies are gone: they were being `defn`d into the shared `user`
+    # namespace, which OUTLIVES the test file, and whichever ran last won.
+    # That made `(keys nil)` return `()` instead of nil in roughly two runs
+    # in three -- a real cross-test leak, not a flake. The record assertions
+    # below now exercise the shipped implementations, which is what they were
+    # always trying to prove.
     :ok
   end
 

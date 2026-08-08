@@ -116,6 +116,34 @@ defmodule BeamLisp.Transient do
     end
   end
 
+  # `(conj! t entry)` — add an entry to a transient map. `into`'s fast path
+  # feeds each source element through conj!, and a map entry arrives either
+  # as a `%Vector{items: {k, v}}` (what `seq`/`find` yield over a map, and
+  # what a `[k v]` source vector reduces to) or as a plain 2-element list (a
+  # quoted `'((:a 1))` source).
+  def conj!({@tag, :map, key}, %BeamLisp.Vector{items: {k, v}}) do
+    case state(key) do
+      {:alive, {:map, m}} ->
+        put_state(key, {:alive, {:map, Map.put(m, k, v)}})
+        {@tag, :map, key}
+    end
+  end
+
+  def conj!({@tag, :map, key}, [k, v]) do
+    case state(key) do
+      {:alive, {:map, m}} ->
+        put_state(key, {:alive, {:map, Map.put(m, k, v)}})
+        {@tag, :map, key}
+    end
+  end
+
+  # A 3+-element vector (or anything that is not a `[k v]` entry) on a map
+  # transient must fail loudly rather than mis-bind the first two fields.
+  def conj!({@tag, :map, _key}, other) do
+    raise ArgumentError,
+          "conj! on a transient map needs a [k v] entry, got: #{inspect(other)}"
+  end
+
   @doc "`(assoc! t k v)` — set a transient map entry."
   def assoc!({@tag, :map, key}, k, v) do
     case state(key) do

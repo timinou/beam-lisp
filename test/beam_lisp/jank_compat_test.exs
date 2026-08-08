@@ -278,6 +278,8 @@ defmodule BeamLisp.JankCompatTest do
      "fa6ab662f8d31dccb9890e33c58a060b95ca5151128590e35666ad4a8b3c124d"},
     {"slice_98_reductions.bl", "jank.accept.reductions",
      "b942e3c6048a6e784dd88e72dc6a7e5a09d0bf68d2a28a4334bb840974e59c52"},
+    {"slice_99_into.bl", "jank.accept.into",
+     "137470a3955d15d86263db032b01f47bf55d7997062ff93f562705d62f028bb6"},
     {"slice_114_ratio.bl", "jank.accept.ratio",
      "38ef42cbbb69e854eaba122d526595dc2142c02c29ae30d16a90c8bd75b5ab43"},
     {"slice_115_decimal_rational.bl", "jank.accept.decimal",
@@ -1231,6 +1233,34 @@ defmodule BeamLisp.JankCompatTest do
 
       assert eval_in("jank.accept.reductions", "(doall (reductions + 10 [1 2 3]))") ==
                [10, 11, 13, 16]
+    end
+
+    test "into pours a collection into another, with or without a transducer" do
+      # Promoted in wave 27, after being REFUSED once: an earlier round claimed
+      # it on a passing load, and calling it showed two arities still throwing.
+      # Both root causes are now closed -- `conj!` grew a map-transient clause
+      # and `map`/`filter` grew their 1-arity transducer forms -- so every
+      # arity upstream defines is exercised here, not just the easy one.
+      load_slice("slice_99_into.bl", "jank.accept.into")
+
+      # The zero/one arities upstream declares.
+      assert eval_in("jank.accept.into", "(into)") == BeamLisp.Vector.new([])
+      assert eval_in("jank.accept.into", "(into [9])") == BeamLisp.Vector.new([9])
+
+      # to + from, across every target kind: the transient fast path for
+      # vector/map/set, and a list source for the reduce path.
+      assert eval_in("jank.accept.into", "(into [] [1 2 3])") == BeamLisp.Vector.new([1, 2, 3])
+      assert eval_in("jank.accept.into", "(into [] '(1 2))") == BeamLisp.Vector.new([1, 2])
+      assert eval_in("jank.accept.into", "(into {} [[:a 1] [:b 2]])") == %{a: 1, b: 2}
+      assert eval_in("jank.accept.into", "(into {} {:a 1})") == %{a: 1}
+
+      # to + xform + from -- the arity that failed at xform CONSTRUCTION
+      # before `map`/`filter` had their transducer forms.
+      assert eval_in("jank.accept.into", "(into [] (map inc) [1 2 3])") ==
+               BeamLisp.Vector.new([2, 3, 4])
+
+      assert eval_in("jank.accept.into", "(into [] (filter odd?) [1 2 3])") ==
+               BeamLisp.Vector.new([1, 3])
     end
 
     test "ratio?, decimal? and sorted? are always false on the BEAM" do

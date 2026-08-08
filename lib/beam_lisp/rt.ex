@@ -1101,6 +1101,43 @@ defmodule BeamLisp.RT do
   end
 
   @doc """
+  `(map f)` with no collection -- the transducer arity.
+
+  It lives here beside the collection arity rather than in the prelude for a
+  reason worth recording: an earlier attempt added it by REBINDING `map` in
+  `core.bl` and delegating back to a captured primitive. That worked in
+  isolation and broke under the jank fidelity suite, because upstream's own
+  `map` slice defines a `map` with no transducer arity, and a `defn` is
+  visible past the namespace that made it. Defining the arity on the
+  primitive keeps one implementation and nothing to shadow.
+  """
+  def map_xform(f) do
+    fn rf ->
+      multi_fn(%{
+        0 => fn -> invoke(rf, []) end,
+        1 => fn result -> invoke(rf, [result]) end,
+        2 => fn result, input -> invoke(rf, [result, invoke(f, [input])]) end
+      })
+    end
+  end
+
+  @doc "`(filter pred)` with no collection -- the transducer arity."
+  def filter_xform(pred) do
+    fn rf ->
+      multi_fn(%{
+        0 => fn -> invoke(rf, []) end,
+        1 => fn result -> invoke(rf, [result]) end,
+        2 => fn result, input ->
+          # Elixir's `if` already treats nil/false as falsey, which is exactly
+          # beam-lisp's rule -- the same test `skip_filter/2` uses on the
+          # collection path, so both arities agree on what "passes" means.
+          if invoke(pred, [input]), do: invoke(rf, [result, input]), else: result
+        end
+      })
+    end
+  end
+
+  @doc """
   Clojure `(take n)` transducer: a stateful reducing-fn wrapper that lets the
   first n inputs through and drops the rest. `n` is held in a volatile, the
   same mutable-until-persisted trick the vendored take-nth transducer uses,
@@ -1331,6 +1368,10 @@ defmodule BeamLisp.RT do
     "{" <> pairs <> "}"
   end
 
+  # `(println)` with no arguments prints a blank line, as Clojure's does --
+  # it is how you space output, and an example that has to write
+  # `(println "")` instead reads like a workaround for a missing arity.
+  def println, do: IO.puts("")
   def println(x), do: IO.puts(print_str(x))
 
   # The reader-macro table: dispatch-char → wrapper symbol name.
@@ -1455,7 +1496,7 @@ defmodule BeamLisp.RT do
       "apply" => multi_fn(%{2 => &apply_to/2}, {2, &apply_variadic/3}),
       "next" => &next/1,
       "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
-      "println" => &println/1,
+      "println" => multi_fn(%{0 => &println/0, 1 => &println/1}),
       "pr-str" => &print_str/1,
       # Clojure's `print-str` returns the printed representation (like
       # pr-str, minus readably-quoted strings); both share the one printer.
@@ -1464,8 +1505,8 @@ defmodule BeamLisp.RT do
       # lazy sequences: uniformly lazy (chunked at 32), realized only by
       # forcing consumers (take/reduce/count/doall/…).
       # `map` is variadic: the 2-arity is the chunked lazy path, 3+ colls stop at the shortest.
-      "map" => multi_fn(%{2 => &map/2}, {2, &map_multi/3}),
-      "filter" => &filter/2,
+      "map" => multi_fn(%{1 => &map_xform/1, 2 => &map/2}, {2, &map_multi/3}),
+      "filter" => multi_fn(%{1 => &filter_xform/1, 2 => &filter/2}),
       "range" => multi_fn(%{0 => &range/0, 1 => &range/1, 2 => &range/2}),
       "iterate" => &iterate/2,
       "repeat" => multi_fn(%{1 => &repeat/1, 2 => &repeat/2}),
@@ -1672,12 +1713,14 @@ defmodule BeamLisp.RT do
       "nth" => 2,
       "empty?" => 1,
       "next" => 1,
-      "println" => 1,
       "pr-str" => :print_str,
       "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
       "assoc" => 3,
-      "filter" => 2,
+      # (`filter` is deliberately absent: it grew a 1-arity transducer form, and
+      # this table links a single fixed arity. `take` is absent for the same
+      # reason. A multi-arity prim resolves through `invoke`, which reads the
+      # multi_fn tag -- linking one arity here would make the other unreachable.)
       "take-while" => :take_while,
       "drop-while" => :drop_while,
       "iterate" => 2,
