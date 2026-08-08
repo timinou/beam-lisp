@@ -16,17 +16,17 @@ defmodule BeamLisp.Record do
   semantics — no keyword lookup, no `seq`, no `assoc` — so a beam-lisp
   deftype instance is a bare tagged tuple `{:bl-deftype, module, fields}`
   (see `build_type/2`). Being a tuple, it can never be swallowed by an
-  `is_map` clause and its field surface is reachable only through
+  `is_bl_map` clause and its field surface is reachable only through
   `deftype_field/2` (the `.-field` / `.field` reader forms). The type
   identity still lives in a module atom so protocols can dispatch on it.
 
   **The struct-is-a-map hazard, doubled.** A record struct satisfies
-  `is_map`, so every `when is_map(...)` clause in `BeamLisp.RT` matches
+  `is_map`, so every `when is_bl_map(...)` clause in `BeamLisp.RT` matches
   one. Records are different from the other structs (Vector/LazySeq/Set)
   in that they are *supposed* to behave as maps — but the `__struct__`
   key is internal and must never leak into `seq`/`keys`/`count`. The RT
   routes records through `%{__struct__: mod}` clauses that precede the
-  plain `is_map` clauses and read fields via this module's registry, so
+  plain `is_bl_map` clauses and read fields via this module's registry, so
   iteration sees the declared fields (plus any assoc'd extras) and never
   the struct's hidden key. `seqable` in RT gets the same treatment so
   `map`/`filter` compose records correctly (a struct implements no
@@ -43,6 +43,7 @@ defmodule BeamLisp.Record do
   """
 
   alias BeamLisp.Env
+  import BeamLisp.Guards, only: [is_bl_map: 1]
 
   @registry_key {__MODULE__, :registry}
 
@@ -144,7 +145,9 @@ defmodule BeamLisp.Record do
   def struct_map(mod, kv), do: Map.put(Map.new(kv), :__struct__, mod)
 
   @doc "Build a record from a map, taking only its declared fields."
-  def map_construct(mod, m) when is_map(m) do
+  # A record is built from a *plain* map's declared fields — a struct source
+  # would leak its internal `__struct__` into the new record.
+  def map_construct(mod, m) when is_bl_map(m) do
     fields = fields_of(mod)
     Map.merge(Map.new(fields, &{&1, nil}), Map.take(m, fields)) |> Map.put(:__struct__, mod)
   end

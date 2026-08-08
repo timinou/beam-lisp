@@ -153,6 +153,8 @@ defmodule BeamLisp.Server do
     do: raise(RuntimeError, "server failed to start: #{inspect(reason)}")
 
   # `{:name :counter}` registers locally; anything else starts anonymous.
+  # is_map-ok: opts is the internal option map from `(server ...)` config
+  # (name/timeout), never a user collection value.
   defp server_name(opts) when is_map(opts) do
     case Map.get(opts, :name) do
       nil -> nil
@@ -162,6 +164,7 @@ defmodule BeamLisp.Server do
 
   defp server_name(_), do: nil
 
+  # is_map-ok: opts is the same internal config option map as above.
   defp gen_opts(opts) when is_map(opts) do
     case Map.get(opts, :timeout) do
       nil -> []

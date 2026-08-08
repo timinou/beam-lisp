@@ -158,9 +158,12 @@ defmodule BeamLisp.Env do
   later doc-only redefinition) and the latest value wins per key.
   Returns `:ok`.
   """
+  # is_map-ok: meta is the internal var-metadata map (compiler/REPL side
+  # channel), never a user collection — structs are legitimate here.
   def put_meta(ns, name, meta) when is_map(meta) do
     merged =
       case :ets.lookup(@table, {:meta, ns, name}) do
+        # is_map-ok: `existing` is the same internal metadata map from ETS.
         [{_, existing}] when is_map(existing) -> Map.merge(existing, meta)
         _ -> meta
       end

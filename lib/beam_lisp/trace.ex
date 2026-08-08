@@ -183,6 +183,7 @@ defmodule BeamLisp.Trace do
 
   defp link_in(ns, name) do
     case Env.link(ns, name) do
+      # is_map-ok: fixed is the internal arity→fn map of a multi-fn var link.
       {:ok, {mod, fixed, _variadic}} when is_map(fixed) and map_size(fixed) > 0 -> {mod, fixed}
       _ -> nil
     end

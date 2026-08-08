@@ -4,8 +4,8 @@ defmodule BeamLisp.Set do
   hash-based membership and structural sharing.
 
   **The struct-is-a-map hazard.** A struct IS a map on the BEAM, so every
-  `when is_map(...)` clause in the runtime matches a set too. The set
-  clauses in `BeamLisp.RT` MUST precede the `is_map` clauses (same rule
+  `when is_bl_map(...)` clause in the runtime excludes a set. The set
+  clauses in `BeamLisp.RT` MUST precede the `is_bl_map` clauses (same rule
   as vectors and lazy seqs), or `count`/`seq`/`first` read the struct's
   fields instead of the members. `map?/1` already excludes structs, so a
   set correctly reports false for `map?` while staying a first-class

@@ -41,6 +41,7 @@ defmodule BeamLisp.Transient do
   """
 
   alias BeamLisp.Vector
+  import BeamLisp.Guards, only: [is_bl_map: 1, is_ref_type: 1]
 
   @tag :"$transient"
 
@@ -54,7 +55,7 @@ defmodule BeamLisp.Transient do
   end
 
   def transient(%BeamLisp.Set{} = s) do
-    # Before the is_map clause: a set is a struct, and a struct is a
+    # Before the is_bl_map clause: a set is a struct, and a struct is a
     # map, so without this it would become a map transient and
     # conj! would fail. jank's `set` is written as
     # (persistent! (reduce conj! (transient #{}) coll)).
@@ -63,15 +64,29 @@ defmodule BeamLisp.Transient do
     {@tag, :set, key}
   end
 
-  def transient(m) when is_map(m) do
-    key = make_ref()
-    put_state(key, {:alive, {:map, m}})
-    {@tag, :map, key}
-  end
+  # A reference is a struct (so a map) but not a collection — a map transient
+  # over its internals would be wrong, so it raises like any non-collection.
+  def transient(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do:
+      raise(
+        ArgumentError,
+        "transient not supported for #{inspect(m)} (#{inspect(mod)} is a reference, not a collection)"
+      )
+
+  # A record is a struct too but IS a user-facing map, so it keeps its map
+  # transient view (a plain map matches is_bl_map below).
+  def transient(%{__struct__: mod} = m) when is_atom(mod), do: map_transient(m)
+  def transient(m) when is_bl_map(m), do: map_transient(m)
 
   def transient(other) do
     raise ArgumentError,
           "transient not supported for #{inspect(other)} (only vectors and maps)"
+  end
+
+  defp map_transient(m) do
+    key = make_ref()
+    put_state(key, {:alive, {:map, m}})
+    {@tag, :map, key}
   end
 
   @doc """

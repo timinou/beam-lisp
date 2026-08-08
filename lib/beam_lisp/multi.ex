@@ -32,6 +32,7 @@ defmodule BeamLisp.Multi do
   """
 
   alias BeamLisp.{Env, RT}
+  import BeamLisp.Guards, only: [is_bl_map: 1]
 
   @table :beam_lisp_vars
 
@@ -52,7 +53,7 @@ defmodule BeamLisp.Multi do
   def type_of(%BeamLisp.Vector{}), do: :vector
   def type_of(%BeamLisp.LazySeq{}), do: :seq
   def type_of(%{__struct__: mod}) when is_atom(mod), do: mod
-  def type_of(v) when is_map(v), do: :map
+  def type_of(v) when is_bl_map(v), do: :map
   def type_of(v) when is_function(v), do: :fn
   # A deftype instance is a tagged tuple carrying its module; it must
   # dispatch as that type, so this precedes the bare-tuple clause.

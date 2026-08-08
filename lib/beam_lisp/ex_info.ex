@@ -31,6 +31,9 @@ defmodule BeamLisp.ExInfo do
       is_exception(x) ->
         raise x
 
+      # is_map-ok: a thrown struct is legitimate data whose `data` slot must
+      # be preserved by the error round-trip — this is the throw/error path,
+      # not a collection op, so struct-as-map is intended.
       is_map(x) ->
         raise %__MODULE__{message: BeamLisp.RT.print_str(x), data: x}
 

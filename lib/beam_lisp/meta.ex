@@ -97,6 +97,8 @@ defmodule BeamLisp.Meta do
     %BeamLisp.LazySeq{lazy | key: make_ref()}
   end
 
+  # is_map-ok: m is the internal metadata map (user-provided meta value),
+  # never a collection path — any struct/map is a legal meta payload.
   def with_meta(%BeamLisp.LazySeq{} = lazy, m) when is_map(m) do
     fresh = %BeamLisp.LazySeq{lazy | key: make_ref()}
     :ets.insert(@table, {meta_key(fresh), m})
@@ -104,6 +106,7 @@ defmodule BeamLisp.Meta do
   end
 
   def with_meta(x, nil), do: x
+  # is_map-ok: same as above — m is a metadata map, not a collection value.
   def with_meta(x, m) when is_map(m), do: x
 
   def with_meta(_x, m),

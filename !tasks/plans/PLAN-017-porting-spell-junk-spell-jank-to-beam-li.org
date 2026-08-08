@@ -1,0 +1,342 @@
+#+TITLE: Porting spell-junk (spell.jank) to beam-lisp: feasibility, blockers, and what the BEAM unlocks
+#+STATE: ITEM
+#+SESSION_ID: 155009b8a6089c40
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-08-08T19-55-10-360Z_155009b8a6089c40.jsonl]]
+#+CUSTOM_ID: PLAN-017-porting-spell-junk-spell-jank-to-beam-li
+
+* Initial Message
+
+how hard would it be to port ../spell-junk to beam lisp, and what unique features could be unlocked through that?
+
+This is an *assessment*, written after reading both codebases and measuring
+beam-lisp's actual behaviour on this machine (Erlang/OTP 29, Elixir 1.20.2).
+Every number below was observed in a run, not estimated. Claims I did not
+verify are marked UNVERIFIED.
+
+* Executive answer
+
+Porting is **substantially easier than the line count suggests**, because
+roughly 60% of spell.jank is *jank-workaround*, not harness. The port is
+mostly deletion. But it is **blocked today** by four concrete beam-lisp gaps,
+one of which (an EDN *data* reader) is architectural rather than cosmetic.
+
+| module | jank LOC | fate on BEAM |
+|---|---|---|
+| =src/spell/boot.jank= | 1573 (~1070 of them embedded C++) | ~90% DELETED — the BEAM is the primitive |
+| =src/spell/ui.jank= | 1008 | ~70% transliterates; editing layer gets *simpler* |
+| =src/spell/main.jank= | 817 | transliterates; reload/rollback replaced by OTP code loading |
+| =src/spell/providers.jank= | 508 | rewritten, ~halves (httpc/:json/:crypto replace curl+jq) |
+| =src/spell/clay.jank= | 251 | transliterates onto a Port |
+| =src/clayd/main.cpp= | 1416 | **UNCHANGED** — verified jank-independent (one mention of "jank", in a comment) |
+| =test/spell/test_runner.jank= | 2435 | shrinks hard — in-node, no correlation barriers needed |
+
+* Why boot.jank mostly evaporates
+
+=boot.jank= is the seed image. ~1070 of its 1573 lines are =(cpp/raw "…")=
+blocks implementing, by hand in C++, things the BEAM ships:
+
+| boot.jank C++ | BEAM equivalent | verified |
+|---|---|---|
+| =spell_spawn= / =spell_reap= — fork+exec, pipes, process groups, SIGPIPE | =Port.open {:spawn_executable, …}=, linked, supervised | YES — spawned =/bin/cat=, round-tripped a line |
+| =spell_poll= — poll(2) over child fd + stdin, POLLHUP handling, FIONREAD | =receive= | YES |
+| =spell_recv= — own 64K read-ahead buffer because stdio buffers ahead of poll | Port =({:line, N})= or =({:packet, 4})= | YES — =:eol= framing observed |
+| =spell_read_line= — raw read(2), byte at a time, to keep poll honest | Port stdin / =IO.gets= in its own process | n/a |
+| =spell_shell= — fork/exec + deadline + orphan reaping | =System.cmd= / Port | UNVERIFIED (trivial) |
+| =spell_eval= / =spell_call_timeout= — siglongjmp error+hang fence | spawn + =Task.yield/shutdown= | YES — a =(loop [i 0] (recur …))= abandoned at 300ms, VM unharmed |
+| =spell_u8_count= / =spell_u8_sub= — UTF-8 codepoint arithmetic | Elixir =String= — and it is *grapheme*-aware, which is strictly better | UNVERIFIED (well-known) |
+| =spell_now_ms= | =:erlang.monotonic_time(:millisecond)= | YES |
+| =spell_getenv= / =spell_setenv= | =System.get_env/put_env= | n/a |
+| =spell_contains= | =String.contains?= | n/a |
+| =spell_one_line= — collapse newlines so a multi-line error can't desync the wire | **unnecessary** under packet framing | — |
+| sha256 (shelled to =sha256sum=) | =:crypto.hash(:sha256, …)= | YES |
+| hex4 | =Base.encode16= | YES |
+
+Note the last two rows: several boot.jank primitives exist *only* to defend a
+line-oriented wire. Framed packets make that class structurally impossible, so
+the code does not port — it ceases to have a reason to exist.
+
+** The one thing that gets HARDER, and it is the important one
+
+spell.jank reads untrusted lines from the renderer with =read-safe= — a
+*fenced read*, deliberately not an eval ("Reading is as dangerous as
+evaluating", JANK-GOTCHAS). beam-lisp has **no equivalent**:
+
+- =BeamLisp.Reader.read_string/1= returns *reader forms*
+  (={:map, [{{:keyword,"event"}, …}]}=), not data.
+- =BeamLisp.eval/1= returns real data — measured: =(BeamLisp/eval "{:event :key :key \"z\" :ctrl true}")=
+  → =%{ctrl: true, key: "z", event: :key}= — but it **compiles**, and that costs:
+
+#+begin_example
+eval tiny form          6.55 ms/op
+eval defn+call         32.66 ms/op
+read only (no compile)  0.019 ms/op     ← 340× cheaper
+#+end_example
+
+and it *leaks*:
+
+#+begin_example
+500 evals: modules 800 → 1807 (+1007)   atoms 27275 → 28294 (+1019)
+purge of Elixir.BeamLisp.Eval.* reclaims the MODULES (395 → 1)
+but atoms are monotonic: 27307 → 27928 → 28536 across two purged cycles
+#+end_example
+
+A 60fps event stream through =eval= is therefore not merely slow, it is a
+**scheduled VM abort** — exactly the hazard =docs/trust-boundary.md= names, in
+the section that specifies the fix ("What a *data* reader would have to do
+instead": tagged binaries, bounded intern sites, =String.to_existing_atom=
+first) and does not build. The harness is the first consumer that makes that
+section load-bearing rather than theoretical.
+
+* Blockers, ranked by what each unblocks
+
+** BLOCKER 1 — an EDN *data* reader (no compile, bounded atoms)
+
+Required. Every renderer event, every cassette, every agent tool argument is
+untrusted bytes that must become terms without growing the atom table or
+minting a module. The spec already exists in =docs/trust-boundary.md=; this
+turns it into code. Should live beside the existing reader and share its
+tokenizer, not fork it.
+
+Acceptance: reading 1e6 distinct keywords grows =atom_count= by O(1), and
+round-trips =pr-str= output for the clay tree shape.
+
+** BLOCKER 2 — nested =receive= patterns at depth ≥ 2 crash the compiler
+
+Observed:
+
+#+begin_example
+(receive [:a n] n …)         ; ✓ 1
+(receive [:a {:k n}] n …)    ; ✓ 1
+(receive [:a [:b n]] n …)    ; ✗ MatchError in compile_pattern_bare/2
+#+end_example
+
+=compiler.ex:998-1010=: =compile_pattern_bare({:vector, items})= destructures
+each child as ={[pat], env}= — a single-element list — but a nested vector
+child returns *two* patterns (the tuple form and the =%BeamLisp.Vector{}=
+form). The match fails. A map child returns one, which is why maps nest fine.
+
+This is not academic: a Port message is ={port, {:data, {:eol, line}}}= —
+depth 3. Today the harness would have to read it with =erlang/element=
+(verified working, and ugly).
+
+Fix sketch: nested children must expand combinatorially, or nested positions
+should compile to the tuple form only (a nested *vector value* inside a tuple
+message is not a shape the wire produces). The second is cheaper and probably
+correct; decide deliberately and write down which.
+
+** BLOCKER 3 — no tuple constructor, no interop list coercion
+
+=(tuple :a 1)= does not exist; =(List/to_tuple [:a 1])= fails because a
+beam-lisp vector is not a list. Everything is
+=(List/to_tuple (Enum/to_list [...]))=. Erlang option lists (=Port.open= opts,
+=httpc= headers) are proper lists, and passing a =%BeamLisp.Vector{}= produces
+errors from deep inside OTP (=:httpc.header_parse(%BeamLisp.Vector{})=).
+
+The harness is an interop-heavy program; this boilerplate would be on every
+third line. Wants a =tuple= prim and a documented coercion rule at the
+=Module/fn= call boundary.
+
+** BLOCKER 4 — eval hygiene for a long-lived agent REPL
+
+Each =BeamLisp.eval= mints =BeamLisp.Eval.M<n>= — a permanent module atom.
+An agent-driven harness evaluates continuously for days. =docs/trust-boundary.md=
+calls this inherent ("(2) Long-running REPLs grow the table monotonically") and
+it is inherent *only given the current module-per-eval strategy*. Reusing one
+module name per session, or per namespace, bounds it. Worth deciding before a
+harness makes it the top failure mode.
+
+** Minor gaps (each small, all needed by a harness written in the lisp)
+
+=in-ns=, =read-string=, =slurp=, =spit=, =eval=, =defonce= are absent from the
+lisp surface. All but =defonce= are one-liners over existing Elixir. =defonce=
+should NOT be ported — see below.
+
+* What the BEAM unlocks (the interesting half)
+
+These are not "also possible"; they *delete mechanisms spell.jank had to
+invent*, each of which is documented there as having been a real failure first.
+
+** 1. The single-threaded pump dies, and a whole class of workaround with it
+
+spell.jank: "jank futures plus JIT codegen crash. So the pump is a single loop
+multiplexing clayd events and stdin REPL forms with =poll(2)= in C++."
+
+Consequences it then had to engineer around, all recorded in its own source:
+- =ask-provider= must "PAINT BEFORE BLOCKING" — a hand-drawn "thinking…" frame,
+  because a measured 6.2s API call freezes the window entirely.
+- =safe-on-event= must deliberately carry *no* deadline, because the same
+  deadline that catches a wedged render would abort a healthy HTTP request
+  mid-flight and lose the user's message.
+- Ticks must be folded without redraw so a long call does not build a backlog
+  the pump must chew through.
+
+On the BEAM these are not problems to solve, they are shapes that do not
+arise: the provider call is a =Task= in its own preemptively-scheduled
+process, the renderer port has its own owner, the REPL has its own. The window
+renders at 60fps *during* the API call. Three documented workarounds and the
+reasoning behind them all become unnecessary.
+
+** 2. The fence stops being a lie about C++ frames
+
+spell.jank's timeout fence =siglongjmp=s out of a running call: "leaves C++
+frames without running their destructors… after a timeout, treat the image as
+SUSPECT rather than merely 'that call failed'."
+
+Verified on the BEAM: a non-terminating render abandoned by
+=Task.yield/shutdown(:brutal_kill)= leaks *nothing* — per-process heap, no
+shared state, no destructors to skip. The honest-recovery caveat in that
+docstring simply deletes.
+
+** 3. Supervision replaces ~80 hand-written lines of restart policy
+
+=supervise-crash!=, =restart-log=, =max-restarts= (3), =restart-window-ms=
+(60000), the sliding-window filter, the "reap the corpse on every path out"
+comment, the fork-bomb reasoning — that is =:one_for_one= with
+=max_restarts: 3, max_seconds: 60=, which beam-lisp already exposes as data:
+
+#+begin_src clojure
+(supervise :one-for-one [(worker :renderer (fn [] (clay/start!)))])
+#+end_src
+
+And it is *better* supervision than the hand-rolled version, because a linked
+Port dies with its owner automatically — the orphaned-clayd bug that made the
+test suite look flaky ("the load was the previous run") is not reachable.
+
+** 4. =defonce= is the wrong primitive here; named processes are the right one
+
+spell.jank uses =defonce= for everything that must outlive a reload (=app=,
+=registry=, =ui-handle=, =known-good=, =rescue-fns=, =quitting?=). beam-lisp
+has no =defonce= — and should not grow one for this. Measured instead:
+
+#+begin_example
+eval module v1  → view=VIEW-V1,          Agent :live_state = {:count 7}
+rewrite file, re-eval the WHOLE module
+                → view=VIEW-V2-RELOADED, Agent :live_state = {:count 7}
+same pid: #PID<0.1161.0>
+#+end_example
+
+State survived a full module replacement, same process. Strictly stronger than
+=defonce=: it also survives the code *crashing*, it is inspectable from
+=:observer=, and =:sys.get_state/1= reads it — which is how the beam-lisp
+suite already asserts on =defserver=.
+
+** 5. Rollback stops being a string that might not compile
+
+spell.jank stores known-good **source text** per module and re-=spit=s it.
+Its own README names the resulting hole: "Rollback across modules.
+=known-good= is per-module. Reverting =spell.main= does not restore a sibling
+that changed under it; the harness detects that case and reports
+=:revert-error= instead of claiming a recovery it did not perform."
+
+The BEAM keeps two code versions per module natively (current + old), and
+beam-lisp already AOT-compiles =.bl= to real =.beam= binaries
+(=mix compile.beam_lisp=). So the rollback artifact becomes a **loaded
+binary**, not a source string: =:code.load_binary= to install,
+=:code.soft_purge= to retire. A binary cannot fail to compile against a
+changed sibling, because it already did compile. The =:revert-error= case
+mostly stops existing.
+
+** 6. Node boundaries make the agent sandbox real, and cheap
+
+=docs/trust-boundary.md=: "Protecting against that is a job for process/OS
+boundaries (separate BEAM node, container, OS user), not the compiler."
+
+Verified: =elixir --sname blprobe -S mix …= → =Node.self() = :blprobe@interface=,
+=Node.alive?() = true=. So the agent's =eval= tool can run on a **separate
+node** from the window. A model that writes =(System/halt)= — or exhausts the
+atom table, which is a whole-VM abort and *cannot be caught* — takes down the
+scratch node, and the harness reports it and respawns. spell.jank has no
+equivalent: its agent evaluates in the only process there is, and its own
+README lists no defence for it.
+
+This is the single largest capability difference, and it is a config flag plus
+a supervisor, not a subsystem.
+
+** 7. OTP's tooling is the introspection layer
+
+=:sys.get_state= on the UI server, =:observer= on the process tree, =:dbg=
+tracing (already wrapped in beam-lisp with a 1000-call cap enforced *inside*
+the tracer process). spell.jank's answer to "what is the agent doing to my
+image" is =@spell.ui/app= plus =pr-str= onto a line-oriented wire — which its
+own source notes is a liability, since a realized tree is kilobytes and
+oversized lines truncate and desync (hence =last-tree= being a separate atom
+from =app=). Reading process state out-of-band removes the constraint that
+made that split necessary.
+
+** 8. A framed binary wire, if wanted
+
+Measured on a 200-node tree:
+
+#+begin_example
+pr-str            866 µs/op    8326 bytes
+term_to_binary     39 µs/op    8735 bytes     ← 22× faster
+#+end_example
+
+At 60fps, EDN serialization alone is ~5% of a core before clayd parses it.
+=({:packet, 4})= + =term_to_binary= would also structurally eliminate
+spell.jank's line-desync family: over-long lines splitting mid-value, raylib
+=TraceLog= polluting stdout, =one_line=-ing multi-line error messages.
+
+Tradeoff, stated honestly: EDN-on-the-wire is *hackable* — you can =cat= the
+pipe, and clayd's 121-line =edn.hpp= is why "the UI is data" is inspectable.
+ETF needs =erl_interface= (=ei_decode_*=) in clayd, comparable size, but
+opaque to a human reading the pipe. **Recommendation: keep EDN initially**
+(the port is risky enough), switch only if frame budget demands it. Do not
+bundle this with the port.
+
+** 9. Multiple windows / multiple agents stop being a rewrite
+
+spell.jank is a structural singleton: one global =app= atom, one pump, one
+=ui-handle=. On the BEAM each window is a supervised process owning a Port,
+with its own state. N windows, or one agent driving several harnesses, is the
+same code with a different supervisor spec.
+
+* Effort
+
+Assumes the beam-lisp gaps land first; they are prerequisites, not part of the
+port.
+
+| wave | work | size |
+|---|---|---|
+| A | Blockers 1–4 + minor gaps | the real cost. EDN data reader is the bulk |
+| B | =spell.boot= equivalent: port supervision, fenced eval, module load/reload over AOT binaries | small — ~150 lines, mostly deleting |
+| C | =spell.clay= + =spell.ui=: port owner server, =realize=, element constructors, editing layer | transliteration; editing layer ports 1:1 and *gains* grapheme correctness |
+| D | =spell.providers=: httpc + =:json= + =:crypto=, sqlite for credentials | rewrite, ~halves, drops curl/jq/sha256sum |
+| E | tests | shrinks hard — see below |
+
+** Why the test suite shrinks
+
+spell.jank's suite spawns a real harness process and drives it over stdin,
+which forced its three hardest-won lessons: correlation barriers (jank's JIT
+makes latency vary by orders of magnitude), =is-eventually== instead of
+=sleep=, and whole-process-group reaping. In-node, the test process
+=GenServer.call=s the UI server — synchronous by construction, so barriers are
+unnecessary rather than merely easier. The *physical keyboard* test should
+survive unchanged: its lesson ("synthetic input is not real input" — injected
+events bypassed raylib entirely and were green while the keyboard was
+segfaulting) is host-independent and is the single most valuable test there.
+
+* Risks and honest limits
+
+- **The thesis gets less surprising.** spell.jank's claim is "a REPL plus one
+  persistence primitive bootstraps a self-rewriting harness." On the BEAM, hot
+  code loading is a platform feature, so the demo is less startling. The
+  *engineering* claim gets stronger, and it is a different claim, worth
+  restating deliberately rather than inheriting: *a self-rewriting harness that
+  cannot wedge and cannot lose state, because every failure mode is a
+  supervised process.* Decide this before writing the README, not after.
+- **UNVERIFIED: clayd builds here.** Its jank-independence was established by
+  reading (one "jank" mention, in a comment) and by its build script (clang++,
+  raylib, no jank headers). It was not compiled during this assessment.
+- **UNVERIFIED / open question: =httpc= under Mix.** =:httpc.request= works
+  under plain =elixir -e= (200, 559 bytes) but fails under =mix beam_lisp.run=
+  and =mix run= with =:http_util is not available=; =:code.which(:http_util)=
+  → =:non_existing=. Not root-caused. Likely a Mix code-path artifact, but
+  providers depend on it, so root-cause it in wave D before committing to
+  =httpc= over a curl Port.
+- **Not measured: the full frame loop end to end.** Per-op costs above are
+  real; their composition at 60fps with a live renderer is not.
+- =mix test= baseline at time of assessment: **767 passed, 0 failures**
+  (125s). A first run reported 766/767; the second and third runs were clean,
+  so that is a flake and is *not* diagnosed. Worth catching before building on
+  top of this suite.

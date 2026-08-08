@@ -32,6 +32,8 @@ defmodule BeamLisp.Compiler do
   Runtime values live in `BeamLisp.Env`.
   """
 
+  import BeamLisp.Guards, only: [is_bl_map: 1]
+
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
@@ -1374,7 +1376,11 @@ defmodule BeamLisp.Compiler do
   defp data_to_form(items) when is_list(items),
     do: {:list, Enum.map(items, &data_to_form/1)}
 
-  defp data_to_form(m) when is_map(m),
+  # Only a *plain* map is map data. Every other struct-backed beam-lisp value
+  # (a record, a lazy seq, an atom-ref) is a value in its own right and falls
+  # through to the literal clause below -- mangling one into `{:map, ...}` here
+  # would hand a macro a map where the author passed a record.
+  defp data_to_form(m) when is_bl_map(m),
     do: {:map, Enum.map(m, fn {k, v} -> {data_to_form(k), data_to_form(v)} end)}
 
   defp data_to_form(a) when is_atom(a) and a not in [nil, true, false],
@@ -1505,6 +1511,8 @@ defmodule BeamLisp.Compiler do
   # name symbol. The name form is `{:meta, {:symbol, name}, m}` where `m`
   # holds exactly the author's `^` metadata — positions never attach to
   # symbols, so there is no `:line`/`:file` to filter out.
+  # is_map-ok: reader metadata is a plain internal Elixir map, never a
+  # beam-lisp value -- a struct can never reach this position.
   defp name_meta({:meta, _form, m}) when is_map(m), do: m
   defp name_meta(_), do: nil
 
@@ -1912,10 +1920,9 @@ defmodule BeamLisp.Compiler do
 
               {pattern, key_form} ->
                 key =
-                  case key_form do
-                    {:keyword, k} -> String.to_atom(k)
-                    k when is_binary(k) -> k
-                    other -> raise "unsupported map key in binding: #{inspect(other)}"
+                  case quoted_symbol_key(key_form) do
+                    {:ok, name} -> {:symbol, name}
+                    :error -> plain_map_key(key_form)
                   end
 
                 {:get, pattern, key}
@@ -1968,6 +1975,25 @@ defmodule BeamLisp.Compiler do
   defp destructure_steps(other, _env, _whole_ast) do
     raise "unsupported binding pattern: #{inspect(other)}"
   end
+
+  # A quoted-symbol map key, `{local 'k}` / `{local (quote k)}`: the
+  # reader emits the shorthand as the expanded list, so both forms reach
+  # here as `{:list, [{:symbol, "quote"}, {:symbol, name}]}` — and because
+  # it is a LIST it carries a reader position, so peel `{:meta, _, _}`
+  # before matching (the wave-20 contract: positions ride on lists). The
+  # runtime key is the tagged `{:symbol, name}` tuple that a quoted symbol
+  # evaluates to — the same shape the reader's `datum/1` preserves.
+  defp quoted_symbol_key({:meta, form, _m}), do: quoted_symbol_key(form)
+  defp quoted_symbol_key({:list, [{:symbol, "quote"}, {:symbol, name}]}), do: {:ok, name}
+  defp quoted_symbol_key(_), do: :error
+
+  # Non-quoted map keys: a keyword and a string stay literal. A quoted
+  # `'keys`/`'as`/`'or` is deliberately NOT a directive — the directive
+  # clauses above match only the bare keyword, so a quoted symbol in the
+  # key slot always means "look up by this symbol", never "switch mode".
+  defp plain_map_key({:keyword, k}), do: String.to_atom(k)
+  defp plain_map_key(k) when is_binary(k), do: k
+  defp plain_map_key(other), do: raise("unsupported map key in binding: #{inspect(other)}")
 
   # `[a b & rest :as whole]` peels the trailing `:as name` off the
   # binding vector so split_variadic still sees `[a b & rest]`. `:as` is
@@ -2282,6 +2308,8 @@ defmodule BeamLisp.Compiler do
   # Thread a form's position (from its FormMeta wrapper) into the compile
   # env so the emitters below can stamp `line:` onto the AST. Positions are
   # best-effort: a form with no metadata keeps the env's current position.
+  # is_map-ok: `m` is the reader's own position map (:line/:col/:file), an
+  # internal Elixir map -- not user data.
   defp pos_env(env, m) when is_map(m) do
     env
     |> maybe_put(:line, m[:line], &(is_integer(&1) and &1 > 0))

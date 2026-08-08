@@ -56,6 +56,8 @@ defmodule BeamLisp.FormMeta do
   # nil clears: unwrap a metadata-carrying form back to its bare form.
   def with_meta({:meta, form, _m}, nil), do: form
   def with_meta(form, nil), do: form
+  # is_map-ok: m is the metadata map attached to a form (or the value
+  # metadata case), never a collection value.
   def with_meta(form, m) when is_map(m), do: wrap(form, m)
 
   def with_meta(_form, m),
@@ -87,6 +89,9 @@ defmodule BeamLisp.FormMeta do
   defp form_shape?({:set, _}), do: true
   defp form_shape?(form) when is_list(form), do: true
   defp form_shape?(%BeamLisp.Vector{}), do: true
+  # is_map-ok: form is a source datum (a plain map literal in the form
+  # representation), and a struct form is still form-shaped — this decides
+  # whether metadata attaches, not a collection operation.
   defp form_shape?(form) when is_map(form), do: true
   defp form_shape?(_), do: false
 end

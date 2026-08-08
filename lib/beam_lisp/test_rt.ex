@@ -70,6 +70,8 @@ defmodule BeamLisp.TestRT do
   defp walk({:symbol, _} = s, m), do: Map.get(m, s, s)
   defp walk(l, m) when is_list(l), do: Enum.map(l, &walk(&1, m))
   defp walk(%Vector{} = v, m), do: Vector.new(Enum.map(Vector.to_list(v), &walk(&1, m)))
+  # is_map-ok: walk traverses the test-data substitution map itself; any
+  # struct value in test data is a data element to walk, not a collection op.
   defp walk(mm, m) when is_map(mm), do: Map.new(mm, fn {k, v} -> {walk(k, m), walk(v, m)} end)
   defp walk(x, _m), do: x
 

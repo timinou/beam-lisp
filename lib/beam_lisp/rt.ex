@@ -10,15 +10,19 @@ defmodule BeamLisp.RT do
   # `rem` is seeded as a core prim (Clojure's remainder), so the module
   # must not inherit Kernel.rem/2 — the local def below is the source of
   # truth and every `rem` here (even?/odd?) resolves to it.
+  import BeamLisp.Guards, only: [is_bl_map: 1, is_ref_type: 1]
   import Kernel, except: [rem: 2]
 
   @multi_fn_tag :"$blfn"
 
   @doc "Wraps arity-dispatched clauses; Elixir fns are fixed-arity, so multi-arity and variadic beam-lisp fns need a tag."
+  # is_map-ok: clauses/fixed are internal arity→fn maps built by this
+  # module — never user values, so struct-vs-map never applies.
   def multi_fn(clauses) when is_map(clauses), do: {@multi_fn_tag, clauses, nil}
   def multi_fn(clauses, {min, f}) when is_map(clauses), do: {@multi_fn_tag, clauses, {min, f}}
 
   @doc false
+  # is_map-ok: fixed is the internal arity→fn map from the tag tuple above.
   def invoke({@multi_fn_tag, fixed, variadic}, args) when is_map(fixed) do
     arity = length(args)
 
@@ -108,6 +112,11 @@ defmodule BeamLisp.RT do
   # A record is a struct (and so a map), but its `__struct__` key is
   # internal — field access goes through the public fields only, so
   # `(:__struct__ p)` is nil, not the module.
+  # A reference (atom/volatile/future/promise/reduced) is not a map — a
+  # struct-is-a-map would read its internals or return nil on a miss.
+  def get(%{__struct__: mod} = m, _key, _default) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "get: #{inspect(mod)} is a reference, not a collection")
+
   def get(%{__struct__: mod} = m, key, default) when is_atom(mod) do
     if BeamLisp.Record.record?(m) do
       if key == :__struct__, do: default, else: Map.get(m, key, default)
@@ -116,7 +125,7 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def get(m, key, default) when is_map(m), do: Map.get(m, key, default)
+  def get(m, key, default) when is_bl_map(m), do: Map.get(m, key, default)
   def get(nil, _key, default), do: default
 
   @doc """
@@ -165,18 +174,23 @@ defmodule BeamLisp.RT do
   # frequencies and group-by iterate a map. Elixir maps preserve insertion
   # order, so entry order is deterministic.
   # A set is a collection too — first/rest/next/seq read its members.
-  # A set is a struct, so these MUST precede the is_map clause or they
+  # A set is a struct, so these MUST precede the is_bl_map clause or they
   # would iterate the struct's fields instead.
   def first(%Set{} = s), do: Set.to_list(s) |> List.first()
 
   # A record is a struct-map: iterate its public fields (and any assoc'd
   # extras), never the hidden `__struct__` key. These clauses MUST precede
-  # the is_map clauses or a record leaks `__struct__` into iteration.
+  # the is_bl_map clauses or a record leaks `__struct__` into iteration.
+  # A reference is not a seq-able collection — a struct-is-a-map would
+  # iterate its internals.
+  def first(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "first: #{inspect(mod)} is a reference, not a collection")
+
   def first(%{__struct__: mod} = m) when is_atom(mod) do
     if BeamLisp.Record.record?(m), do: first(record_entries(m)), else: first(map_entries(m))
   end
 
-  def first(m) when is_map(m), do: first(map_entries(m))
+  def first(m) when is_bl_map(m), do: first(map_entries(m))
 
   def rest(nil), do: []
   def rest([]), do: []
@@ -192,11 +206,14 @@ defmodule BeamLisp.RT do
 
   def rest(%Set{} = s), do: Set.to_list(s) |> tl()
 
+  def rest(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "rest: #{inspect(mod)} is a reference, not a collection")
+
   def rest(%{__struct__: mod} = m) when is_atom(mod) do
     if BeamLisp.Record.record?(m), do: rest(record_entries(m)), else: rest(map_entries(m))
   end
 
-  def rest(m) when is_map(m), do: rest(map_entries(m))
+  def rest(m) when is_bl_map(m), do: rest(map_entries(m))
 
   @doc """
   Clojure `next` ≡ `(seq (rest coll))`: nil when the remainder is empty,
@@ -219,11 +236,14 @@ defmodule BeamLisp.RT do
 
   def next(%Set{} = s), do: next(Set.to_list(s))
 
+  def next(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "next: #{inspect(mod)} is a reference, not a collection")
+
   def next(%{__struct__: mod} = m) when is_atom(mod) do
     if BeamLisp.Record.record?(m), do: next(record_entries(m)), else: next(map_entries(m))
   end
 
-  def next(m) when is_map(m), do: next(map_entries(m))
+  def next(m) when is_bl_map(m), do: next(map_entries(m))
 
   # `next`'s tail is either a realized list (seq it → nil if empty) or a
   # LazySeq. Clojure's next is `(seq (rest x))`, so it MUST force one
@@ -281,7 +301,7 @@ defmodule BeamLisp.RT do
   # what select-keys does: `(conj acc (find m k))`. A record conj's the
   # entry too, preserving its type (Map.put keeps the struct); a non-record
   # struct reaching here has no conj contract and fails loudly.
-  def conj(m, %BeamLisp.Vector{items: {k, v}}) when is_map(m) and not is_struct(m),
+  def conj(m, %BeamLisp.Vector{items: {k, v}}) when is_bl_map(m),
     do: Map.put(m, k, v)
 
   def conj(%{__struct__: mod} = m, %BeamLisp.Vector{items: {k, v}}) when is_atom(mod) do
@@ -295,17 +315,19 @@ defmodule BeamLisp.RT do
   # (`[h | LazySeq]`, what a chunked seq's tail is) must be walked.
   def count(xs) when is_list(xs), do: if(improper?(xs), do: LazySeq.count(xs), else: length(xs))
   # Both of these are structs, and a struct is a map — they MUST precede
-  # the is_map clause or count returns the number of struct fields.
+  # the is_bl_map clause or count returns the number of struct fields.
   # (A lazy seq quietly counted 3, its field count, for any length.)
   def count(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.count(v)
   def count(%LazySeq{} = l), do: LazySeq.count(l)
   def count(%Set{} = s), do: Set.count(s)
   # A record's count is its public fields (plus any assoc'd extras) —
-  # map_size would count the hidden `__struct__` key too.
-  def count(%{__struct__: mod} = m) when is_atom(mod) do
-    if BeamLisp.Record.record?(m), do: map_size(m) - 1, else: map_size(m)
-  end
-  def count(m) when is_map(m), do: map_size(m)
+  # map_size would count the hidden `__struct__` key too. References are
+  # not collections, so they raise before this record clause.
+  def count(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "count: #{inspect(mod)} is a reference, not a collection")
+
+  def count(%{__struct__: mod} = m) when is_atom(mod), do: map_size(m) - 1
+  def count(m) when is_bl_map(m), do: map_size(m)
   def count(s) when is_binary(s), do: String.length(s)
 
   def empty?(%LazySeq{} = l), do: LazySeq.cell(l) == nil
@@ -409,11 +431,14 @@ defmodule BeamLisp.RT do
   # A map's seq is its [k v] entries (nil when empty), so `(seq {:a 1})`
   # iterates like Clojure. A record is a struct-map, so its seq reads the
   # public fields, never the hidden `__struct__` key.
+  def seq(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "seq: #{inspect(mod)} is a reference, not a collection")
+
   def seq(%{__struct__: mod} = m) when is_atom(mod) do
     if BeamLisp.Record.record?(m), do: seq(record_entries(m)), else: seq(map_entries(m))
   end
 
-  def seq(m) when is_map(m), do: seq(map_entries(m))
+  def seq(m) when is_bl_map(m), do: seq(map_entries(m))
 
   # --- type & collection predicates (Clojure-correct) ---
 
@@ -432,6 +457,9 @@ defmodule BeamLisp.RT do
   def boolean(x), do: x != nil and x != false
 
   @doc "`find`: the map entry for `k` in map `m` as a `[key value]` vector, else nil."
+  def find(%{__struct__: mod} = m, _k) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "find: #{inspect(mod)} is a reference, not a collection")
+
   def find(%{__struct__: mod} = m, k) when is_atom(mod) do
     if BeamLisp.Record.record?(m) do
       # The internal `__struct__` key is not findable; real keys read the
@@ -442,7 +470,7 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def find(m, k) when is_map(m), do: find_in_map(m, k)
+  def find(m, k) when is_bl_map(m), do: find_in_map(m, k)
 
   def find(_m, _k), do: nil
 
@@ -461,16 +489,20 @@ defmodule BeamLisp.RT do
     do: i >= 0 and i < BeamLisp.Vector.count(v)
 
   # Set contains? is MEMBERSHIP (a set is a struct-map, so this must
-  # precede the is_map clause which would check the :members field).
+  # precede the is_bl_map clause which would check the :members field).
   def contains?(%Set{} = s, x), do: Set.member?(s, x)
 
   # Records report containment over their public fields only; `__struct__`
   # is internal.
+  # References are not collections, so they raise rather than report a miss.
+  def contains?(%{__struct__: mod} = m, _k) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "contains?: #{inspect(mod)} is a reference, not a collection")
+
   def contains?(%{__struct__: mod} = m, k) when is_atom(mod) do
     if BeamLisp.Record.record?(m), do: k != :__struct__ and Map.has_key?(m, k), else: Map.has_key?(m, k)
   end
 
-  def contains?(m, k) when is_map(m), do: Map.has_key?(m, k)
+  def contains?(m, k) when is_bl_map(m), do: Map.has_key?(m, k)
   def contains?(_coll, _k), do: false
 
   # Keywords are BEAM atoms — but so are the booleans and nil, so a bare
@@ -484,7 +516,7 @@ defmodule BeamLisp.RT do
   def string?(x), do: is_binary(x)
   def number?(x), do: is_number(x)
   def int?(x), do: is_integer(x)
-  def map?(x), do: is_map(x) and not is_struct(x)
+  def map?(x), do: is_bl_map(x)
   def vector?(%BeamLisp.Vector{}), do: true
   def vector?(_), do: false
 
@@ -494,9 +526,13 @@ defmodule BeamLisp.RT do
 
   def coll?(x) when is_list(x), do: true
   def coll?(%BeamLisp.Vector{}), do: true
-  def coll?(m) when is_map(m), do: true
   def coll?(%LazySeq{}), do: true
   def coll?(%Set{}), do: true
+  # A reference is a struct but never a collection.
+  def coll?(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m), do: false
+  # Records are user-facing maps, so they are collections.
+  def coll?(%{__struct__: mod}) when is_atom(mod), do: true
+  def coll?(m) when is_bl_map(m), do: true
   def coll?(_), do: false
 
   @doc "`ident?`: a keyword or a symbol."
@@ -572,6 +608,9 @@ defmodule BeamLisp.RT do
   defp rank(%LazySeq{}), do: 7
   defp rank(%Set{}), do: 7
   defp rank(x) when is_list(x), do: 7
+  # is_map-ok: comparison rank deliberately treats any struct or plain map
+  # uniformly at rank 7 for total ordering (reference types sort alongside
+  # collections). This is a compare-ordering choice, not a collection op.
   defp rank(x) when is_map(x), do: 7
   defp rank(_), do: 8
 
@@ -757,9 +796,13 @@ defmodule BeamLisp.RT do
   def transientable?(%BeamLisp.Vector{}), do: true
   def transientable?(%Set{}), do: true
   # A lazy seq is a struct, so it is a map — but it is not transientable.
-  # This must precede the is_map clause or every lazy seq would report true.
   def transientable?(%LazySeq{}), do: false
-  def transientable?(m) when is_map(m), do: true
+  # A reference is a struct but never transientable (its transient view
+  # would be a map transient over the struct's internals).
+  def transientable?(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m), do: false
+  # Records and plain maps get a map transient view.
+  def transientable?(%{__struct__: mod}) when is_atom(mod), do: true
+  def transientable?(m) when is_bl_map(m), do: true
   def transientable?(_), do: false
 
   @doc "jank's `cpp/jank.runtime.bit_not`: bitwise complement, `~x` (two's-complement negation minus one)."
@@ -1148,11 +1191,14 @@ defmodule BeamLisp.RT do
   @doc "Clojure `assoc`: maps get a key update, vectors an index update (append at count)."
   def assoc(coll, k, v)
   def assoc(%BeamLisp.Vector{} = v, i, x), do: BeamLisp.Vector.assoc(v, i, x)
-  # A set is a struct (and so a map) — this must precede the is_map
+  # A set is a struct (and so a map) — this must precede the map
   # clause or assoc would silently add a field to the struct. Clojure
   # raises; fail loudly instead of corrupting the set's shape.
   def assoc(%Set{}, _k, _v),
     do: raise(ArgumentError, "assoc not supported on a set")
+  # A reference is not a map — assoc'ing it would add a field to the struct.
+  def assoc(%{__struct__: mod} = m, _k, _v) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "assoc: #{inspect(mod)} is a reference, not a collection")
   # A record's `__struct__` key is internal; assoc'ing it would silently
   # turn the record into a corrupted plain map, so fail loudly instead.
   def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod) and k == :__struct__ do
@@ -1160,7 +1206,9 @@ defmodule BeamLisp.RT do
       do: raise(ArgumentError, "assoc on the internal :__struct__ key is not allowed on a record"),
       else: Map.put(m, k, v)
   end
-  def assoc(coll, k, v) when is_map(coll), do: Map.put(coll, k, v)
+  # A record assoc's its public fields, preserving its type.
+  def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod), do: Map.put(m, k, v)
+  def assoc(coll, k, v) when is_bl_map(coll), do: Map.put(coll, k, v)
   def assoc(nil, k, v), do: Map.put(%{}, k, v)
 
   @doc "Variadic `(assoc coll k v k2 v2 …)`."
@@ -1203,7 +1251,7 @@ defmodule BeamLisp.RT do
 
   # A set prints as `#{…}`. The `"#" <> "{"` splice avoids the `#{`
   # Elixir-interpolation pitfall. (A set is a struct-map, so this must
-  # precede the is_map clause.)
+  # precede the is_bl_map clause.)
   def print_str(%Set{} = s) do
     body = s |> Set.to_list() |> Enum.map_join(" ", &print_elem/1)
     "#" <> "{" <> body <> "}"
@@ -1214,6 +1262,10 @@ defmodule BeamLisp.RT do
   # read round-trips to an equal record (a plain map print would come
   # back as a map, breaking record equality). The `"#" <>` splice avoids
   # the `#{` Elixir-interpolation pitfall.
+  # A reference is not a map — printing it as a map would leak its backing
+  # process (`{:pid #PID…}`); print it via inspect instead.
+  def print_str(%{__struct__: mod} = r) when is_atom(mod) and is_ref_type(r), do: inspect(r)
+
   def print_str(%{__struct__: mod} = r) when is_atom(mod) do
     if BeamLisp.Record.record?(r) do
       {_, ns, name, _} = BeamLisp.Record.info(mod)
@@ -1230,7 +1282,7 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def print_str(m) when is_map(m), do: print_str_map(m)
+  def print_str(m) when is_bl_map(m), do: print_str_map(m)
 
   def print_str(x), do: inspect(x)
 
@@ -1298,6 +1350,9 @@ defmodule BeamLisp.RT do
   # `(str {:a 1})` is "{:a 1}" rather than a String.Chars crash. Maps,
   # vectors, lists and lazy seqs have no String.Chars impl on the BEAM,
   # and `print_str/1` is exactly the printer that knows their syntax.
+  # is_map-ok: str's fallback must reach print_str for records too (they
+  # have no String.Chars), and print_str already routes references away
+  # from the map path — this only selects the printer, not a collection op.
   defp to_str(x) when is_map(x) or is_list(x) or is_tuple(x), do: print_str(x)
   defp to_str(x), do: to_string(x)
 

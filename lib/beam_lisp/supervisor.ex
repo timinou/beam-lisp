@@ -38,6 +38,8 @@ defmodule BeamLisp.Supervisor do
   """
   def worker(id, start), do: %{id: id, start: start_spec(start)}
 
+  # is_map-ok: opts is the internal supervisor option map (restart/shutdown/type),
+  # never a user collection value.
   def worker(id, start, opts) when is_map(opts) do
     %{id: id, start: start_spec(start)}
     |> maybe_put(opts, :restart)
