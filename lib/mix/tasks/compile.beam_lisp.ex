@@ -144,6 +144,9 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     case File.read(path) do
       {:ok, bin} when bin != <<>> ->
         case :erlang.binary_to_term(bin) do
+          # is_map-ok: this term came off disk via binary_to_term, not from
+          # user code -- it is the build manifest, a plain Elixir map, and a
+          # beam-lisp struct can never appear here.
           term when is_map(term) -> term
           # A corrupt or truncated manifest is treated as empty rather
           # than letting a bad term self-perpetuate.

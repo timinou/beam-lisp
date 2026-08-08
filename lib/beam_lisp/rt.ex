@@ -192,6 +192,11 @@ defmodule BeamLisp.RT do
 
   def first(m) when is_bl_map(m), do: first(map_entries(m))
 
+  # A scalar (string, keyword, number, fn, deftype/reify tag) is not a
+  # sequence, but Clojure's first is lenient — nil, not an error. References
+  # still raise above; only the no-hazard scalars fall through here.
+  def first(_), do: nil
+
   def rest(nil), do: []
   def rest([]), do: []
   def rest([_ | t]), do: t
@@ -214,6 +219,9 @@ defmodule BeamLisp.RT do
   end
 
   def rest(m) when is_bl_map(m), do: rest(map_entries(m))
+
+  # Lenient tail for a non-collection, matching Clojure: () — see first/1.
+  def rest(_), do: []
 
   @doc """
   Clojure `next` ≡ `(seq (rest coll))`: nil when the remainder is empty,
@@ -244,6 +252,9 @@ defmodule BeamLisp.RT do
   end
 
   def next(m) when is_bl_map(m), do: next(map_entries(m))
+
+  # Lenient for a non-collection, matching Clojure: nil — see first/1.
+  def next(_), do: nil
 
   # `next`'s tail is either a realized list (seq it → nil if empty) or a
   # LazySeq. Clojure's next is `(seq (rest x))`, so it MUST force one
@@ -296,6 +307,10 @@ defmodule BeamLisp.RT do
   # must precede the map-entry clause below — a set of vectors is legal
   # and must not be mistaken for a map being conj-ed a [k v] entry.
   def conj(%Set{} = s, x), do: Set.add(s, x)
+  # A reference is not conj-able — conj would otherwise fall through to the
+  # map-entry clauses and silently add a field to the struct.
+  def conj(%{__struct__: mod} = m, _x) when is_atom(mod) and is_ref_type(m),
+    do: raise(ArgumentError, "conj: #{inspect(mod)} is a reference, not a collection")
 
   # Map conj with a `[k v]` entry (as `find` returns) adds that entry —
   # what select-keys does: `(conj acc (find m k))`. A record conj's the
@@ -516,6 +531,13 @@ defmodule BeamLisp.RT do
   def string?(x), do: is_binary(x)
   def number?(x), do: is_number(x)
   def int?(x), do: is_integer(x)
+  # A record answers `true` here, as it does in Clojure, because a record IS a
+  # user-facing map in this language: `count`, `seq`, `get`, `assoc`, `find`
+  # and `coll?` all already treat it as one. `map?` reporting false was the
+  # single dissenter, and a predicate that disagrees with every operation it
+  # is supposed to guard is worse than no predicate. Non-record structs
+  # (LazySeq, Vector, Set, the reference types) are NOT maps and stay false.
+  def map?(%{__struct__: mod} = x) when is_atom(mod), do: BeamLisp.Record.record?(x)
   def map?(x), do: is_bl_map(x)
   def vector?(%BeamLisp.Vector{}), do: true
   def vector?(_), do: false
@@ -1206,8 +1228,15 @@ defmodule BeamLisp.RT do
       do: raise(ArgumentError, "assoc on the internal :__struct__ key is not allowed on a record"),
       else: Map.put(m, k, v)
   end
-  # A record assoc's its public fields, preserving its type.
-  def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod), do: Map.put(m, k, v)
+  # A record assoc's its public fields, preserving its type. Any other
+  # struct reaching here (a LazySeq is the one the earlier clauses do not
+  # own) is not a map and must raise — Map.put would silently grow a
+  # struct with an extra field, corrupting its shape.
+  def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod) do
+    if BeamLisp.Record.record?(m),
+      do: Map.put(m, k, v),
+      else: raise(ArgumentError, "assoc not supported on a struct")
+  end
   def assoc(coll, k, v) when is_bl_map(coll), do: Map.put(coll, k, v)
   def assoc(nil, k, v), do: Map.put(%{}, k, v)
 

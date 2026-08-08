@@ -95,9 +95,18 @@ defmodule BeamLisp.Wave24RecordsTest do
     end
 
     test "map?/coll? report a record the way Clojure does" do
-      # A record is not a map under map? (it is a record), but is a collection.
-      assert eval("(map? (->W24Point 1 2))") == false
+      # Clojure's `(map? record)` is true, and so is ours: a record IS a
+      # user-facing map here -- count/seq/get/assoc/find/coll? all already
+      # treat it as one, so map? answering false made it the lone dissenter.
+      # (This assertion previously claimed the opposite while its name claimed
+      # Clojure fidelity; the wave-27 dispatch table caught the contradiction.)
+      assert eval("(map? (->W24Point 1 2))") == true
       assert eval("(coll? (->W24Point 1 2))") == true
+
+      # But only RECORDS. A non-record struct is not a map.
+      assert eval("(map? (map inc [1 2]))") == false
+      assert eval("(map? [1 2])") == false
+      assert eval("(map? (atom 1))") == false
     end
   end
 
