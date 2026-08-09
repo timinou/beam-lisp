@@ -35,11 +35,13 @@ next, ranked by how many slices each gap unlocks.
 > the `defnav`/`defrichnav` stack materialized at LOAD (23, 24) and at
 > BEHAVE (05).
 >
-> **The honest caveat this measurement adds:** under a *faithful*
-> upstream layout (each slice in its canonical namespace, macros `:use`'d
-> cross-ns as Specter does), the `defnav` stack does **not** unlock —
-> because beam-lisp's syntax-quote does not namespace-qualify symbols
-> (see the prediction-vs-outcome section). Every remaining navigator is
+> **The caveat this measurement raised has since been closed.** The
+> measurement found that under a *faithful* upstream layout (each slice
+> in its canonical namespace, macros used cross-ns as Specter does) the
+> `defnav` stack did not unlock, because beam-lisp's syntax-quote did not
+> namespace-qualify symbols. **That is now fixed** (see the section
+> below), and the whole navigator macro stack — 01, 02, 03, 04, 05, 23,
+> 24 — loads under the canonical cross-namespace layout. Every remaining navigator is
 > now blocked either on that new-found beam-lisp gap or on **Specter's
 > own impl machinery** — `i/NONE`, `i/direct-nav-obj`, the compiled-path
 > cache, the exec interop, `doseqres` — plus non-vendored upstream navs.
@@ -264,7 +266,7 @@ features it has no branch, so the reader correctly raises *no
 conditional matching* — exactly as real Clojure would. On `:clj`,
 `MutableCell` is a Java class. **Correct measurement, not a gap.**
 
-## The newly-found beam-lisp gap: syntax-quote does not namespace-qualify
+## The gap this measurement found — and it is now closed
 
 ```
 ;; in com.rpl.specter.macros
@@ -276,16 +278,26 @@ conditional matching* — exactly as real Clojure would. On `:clj`,
   → undefined var: com.rpl.specter.navs/nav
 ```
 
-Verified this session (and reported, not fixed): `` `nav `` returns the
-bare `{:symbol, "nav"}`, never the qualified form; a macro defined in ns
-A that emits `` `(nav …) `` fails when called from ns B. This blocks a
-faithful canonical cross-ns load of the whole macro stack (slices
-15/23/24 would fail on it), and it is the difference between "the
-measurement's co-loaded `defnav` works" and "a real Specter user's
-`defnav` works". It is the highest-leverage beam-lisp item a future
-wave could build — not to move *this* measurement's number (the same-ns
-convention already works around it), but to make the number honest about
-real usage.
+Verified this session, then **fixed in the same wave**. Syntax-quote now
+resolves a symbol in the namespace that WROTE the template and emits it
+qualified, as Clojure does. The whole navigator macro stack loads under
+the canonical cross-namespace layout as a result: 01, 02, 03, 04, 05, 23
+and 24 all load, and 15/26 now stop inside Specter's own
+`i/direct-nav-obj` rather than in beam-lisp.
+
+Two things about the fix are worth recording, because both were learned
+by breaking something:
+
+- **A macro name must stay bare.** The expander already searches the
+  writing namespace and core; qualifying one sent it down the ordinary
+  var path, where it was invoked as a function. That broke every vendored
+  jank macro nesting `when` or `let` — 8 fidelity slices at once. The
+  vendored suite caught it immediately.
+- **The gap was never Specter-specific.** Any beam-lisp library shipping
+  a macro hit it; it is why `priv/optics.bl` and `priv/rewrite.bl` keep
+  their helpers and macros in a single file. Measuring someone else's
+  code found a bug in our own libraries' constraints.
+
 
 ## What to build next — re-ranked for *behavior*
 
@@ -379,10 +391,17 @@ tells a future reader where the real work is.
 **Newly-identified beam-lisp gap (reported, not fixed — measurement
 only):**
 
-- **syntax-quote does not namespace-qualify symbols** — `` `nav `` in a
-  macro defined in ns A stays `nav` and resolves in the caller ns,
-  instead of becoming `A/nav` as in Clojure. Blocks a faithful canonical
-  cross-ns load of the `defnav`/`defrichnav` stack (would fail slices
-  15/23/24). The same-ns co-load convention used by the test masks it.
-  This is the highest-leverage beam-lisp item a future wave could build,
-  even though it does not move the current measurement's numbers.
+- ~~**syntax-quote does not namespace-qualify symbols**~~ — **BUILT, same
+  wave.** `` `nav `` in a macro defined in ns A now becomes `A/nav`, as in
+  Clojure. The canonical cross-ns `defnav`/`defrichnav` stack loads:
+  01, 02, 03, 04, 05, 23 and 24 all load, and 15/26 now stop inside
+  Specter's `i/direct-nav-obj` instead of in beam-lisp. It was correctly
+  ranked highest-leverage — it was the last beam-lisp gap standing
+  between the measurement's co-load convention and a real user's layout.
+
+**With that closed, there are no known beam-lisp gaps left in this
+measurement.** Every remaining failure is Specter's own impl machinery, a
+non-vendored upstream dependency, or correct-by-construction. Adding
+language features will not move this number further; see FUP-001, which
+exists to decide whether implementing Specter's engine is worth doing at
+all.
