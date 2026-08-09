@@ -1440,13 +1440,59 @@ defmodule BeamLisp.Compiler do
     {{:%{}, [], Enum.reverse(pairs)}, g2}
   end
 
-  defp synq_data({:symbol, name}, _env, g) do
+  # A symbol inside a syntax-quote is resolved IN THE NAMESPACE THAT WROTE IT,
+  # as Clojure does, and emitted qualified. Without this a macro cannot call
+  # its own helper: expanding `(helper x)` at a call site in another namespace
+  # produced a bare `helper`, which resolved against the CALLER and failed with
+  # "undefined var: caller-ns/helper". That is the ordinary shape of every
+  # library macro, so the gap was reachable by anyone writing one.
+  #
+  # Only names that actually resolve where the macro was written are qualified.
+  # A gensym (`x#`), a name that resolves to nothing (a fresh binding the
+  # template introduces), and a name already carrying a `/` are all left alone --
+  # qualifying those would break templates that legitimately bind new locals.
+  defp synq_data({:symbol, name}, env, g) do
     {resolved, g2} = resolve_gensym(name, g)
-    {Macro.escape({:symbol, resolved}), g2}
+    {Macro.escape({:symbol, qualify_synq(resolved, env)}), g2}
   end
 
   defp synq_data({:keyword, name}, _env, g), do: {BeamLisp.AtomGuard.to_atom(name), g}
   defp synq_data(lit, _env, g), do: {lit, g}
+
+  defp qualify_synq(name, env) do
+    cond do
+      String.contains?(name, "/") -> name
+      String.ends_with?(name, "__auto") -> name
+      special_or_local?(name, env) -> name
+      true -> qualified_or_bare(name, env)
+    end
+  end
+
+  # Special forms and the template's own locals must stay bare: they are not
+  # vars and have no namespace to belong to.
+  defp special_or_local?(name, env),
+    do: name in @special_forms or Map.has_key?(env.locals, name)
+
+  defp qualified_or_bare(name, env) do
+    ns = env.ns
+
+    cond do
+      # A MACRO stays bare. Macros are expanded by `macro_for/2`, which already
+      # searches the writing namespace and core, so qualification buys nothing --
+      # and it actively broke `(when …)` inside a template, because a qualified
+      # macro name reached the call path as an ordinary var and was invoked as a
+      # function. Every vendored jank macro that nests `when`/`let` hit this.
+      macro?(name, ns) -> name
+      # A var the writing namespace defines or refers.
+      match?({:ok, _}, Env.fetch(ns, name)) -> ns <> "/" <> name
+      # Anything else is a name the template introduces (a `let` binding, a fn
+      # parameter, a var defined later). Leave it bare so it resolves at the
+      # expansion site, which is what those templates mean.
+      true -> name
+    end
+  end
+
+  defp macro?(name, ns), do: match?({:ok, _}, macro_for(ns, name))
 
   defp synq_list(items, env, g) do
     Enum.reduce(Enum.reverse(items), {[], g}, fn item, {acc, gacc} ->

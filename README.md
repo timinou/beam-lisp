@@ -173,17 +173,19 @@ runtime compilation — the path from Lisp source to a BEAM release.
 
 Deliberate gaps, roughly in priority order:
 
-- **`into` with a map target and a 1-arity `map` transducer** — the
-  last genuine jank-sample failure; map transients lack a `conj!`
-  clause and core `map` has no transducer form
-- **jank stdlib convergence** — 115 of 120 attempted `core.jank` slices
-  run unmodified. Four of the five that remain are upstream TODO stubs
-  whose bodies are commented out — they throw by construction and
-  cannot pass in jank either — and the fifth (`into`) is recorded as
-  partial rather than promoted (`docs/jank-compat.md`)
-- **Specter** — 1 of 31 slices of Clojure's Specter behave today. The
-  number is low on purpose: it is a measurement, not a claim, and it
-  ranks the remaining work by what each gap unlocks
+- **jank stdlib convergence** — 116 of 120 attempted `core.jank` slices
+  run unmodified, and this sample is now **exhausted**: the four that
+  remain are upstream TODO stubs whose bodies are commented out
+  upstream, so they throw by construction and cannot pass in jank
+  either. The informative next move is a fourth widening, and the doc
+  says so rather than re-measuring a solved sample
+  (`docs/jank-compat.md`)
+- **Specter** — a harder, macro-heavy target, deliberately measured
+  because a low score is more informative than a high one. The
+  load-vs-behave split is the finding: syntax work moved *loading*
+  quickly and *behaving* slowly, which said the remaining distance is
+  Specter's own engine (compiled path caching, `i/NONE`, mutable cells,
+  `RichNavigator` internals) rather than beam-lisp's grammar
   (`docs/specter-compat.md`)
 
 ## Errors point at your code
@@ -281,6 +283,49 @@ down a production node under load. A call cap (default 1000) is
 enforced inside the tracer process, and asserted in the suite rather
 than trusted.
 
+## The hazard this language had to name
+
+On the BEAM a struct **is** a map: `is_map(%Vector{})` is true, because a
+struct is a map carrying a hidden `:__struct__` key. beam-lisp's own map
+type is a *plain* map, and eleven other beam-lisp values happen to be
+struct-backed — vectors, sets, lazy seqs, atoms, records. So a guard that
+reads `is_map(x)` and means "a beam-lisp map" silently accepts all of them.
+
+Roughly a third of this project's bugs were that one fact. The symptoms
+were never obviously type errors:
+
+```clojure
+(count (atom 1))       ;=> 2      counting :__struct__ and :pid
+(get (atom 1) :value)  ;=> nil    indistinguishable from a real miss
+(assoc lazy-seq :a 1)  ;=> silently corrupts the seq
+```
+
+The convention was "struct clauses must precede `is_map` clauses". It was
+honoured in **2 of 40** guard sites — everywhere else, correctness was an
+accident of clause *order* in a 1,700-line file, invisible at the call site
+and unenforced by anything.
+
+Three layers replaced the convention, because any one alone leaves the
+footgun reachable:
+
+- **`BeamLisp.Guards.is_bl_map/1`** — a `defguard`, so it expands at compile
+  time and the emitted BEAM guard is identical to the hand-written
+  conjunction. The cost is zero; the win is that the name cannot be written
+  in a way that admits a struct.
+- **A lint test** that fails the build on any bare `is_map(` without an
+  explicit `# is_map-ok: <reason>` comment. It found an unsanctioned site
+  the hand-written census had missed, which is the argument for enforcement
+  over convention in one line.
+- **A 306-cell dispatch table** — every value type against every collection
+  function, each cell asserting a *decided* expectation rather than
+  transcribing current behaviour. It found three more live bugs, including
+  the silent `assoc` corruption above.
+
+`deftype` compiles to a tagged tuple rather than a struct for exactly this
+reason: a tuple can never be swallowed by an `is_map` clause, however
+carelessly a later one is written. `examples/type_safety.bl` runs the whole
+story.
+
 ## Laziness that actually is
 
 The canonical Clojure demonstration holds, which for six waves it did
@@ -367,7 +412,7 @@ have to be an opinion. It can be a test.
 vendored byte-for-byte from upstream commit `3028594`, each carrying
 a sha256 that the test suite asserts — so making a slice pass by
 editing it would fail the build rather than quietly inflate the
-claim. **115 of 120 load and behave correctly**, called with upstream's
+claim. **116 of 120 load and behave correctly**, called with upstream's
 own docstring examples: the threading macros, `if-let`, `doseq`,
 `doto`, `memoize`, `comp`, `juxt`, `partial`, `trampoline`, `keys`,
 `vals`, `group-by`, `frequencies`, `cond->`, `as->`, `some->`, `set`,
@@ -452,6 +497,8 @@ $ mix beam_lisp.run examples/jank_slice.bl # unmodified jank core.jank on the BE
 $ mix beam_lisp.run examples/threading.bl  # upstream ->, ->>, doto
 $ mix beam_lisp.run examples/transients.bl # transient build, and what it costs
 $ mix beam_lisp.run examples/sets.bl       # sets: membership, conj/disj, distinctness
+$ mix beam_lisp.run examples/collections.bl # into, transducers, keys/vals, type
+$ mix beam_lisp.run examples/type_safety.bl # the struct-is-a-map hazard, and the guards
 $ mix beam_lisp.run examples/server.bl     # a real gen_server, written in beam-lisp
 $ mix beam_lisp.run examples/supervision.bl # a crash, and OTP putting it back
 $ mix beam_lisp.run examples/hotswap.bl    # code replaced in a running process
@@ -469,7 +516,7 @@ concurrently, with `Task/await` joining them.
 ## Development
 
 ```console
-$ mix test     # 767 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
+$ mix test     # 863 tests: reader, compiler, prelude, vectors, sets, macros, namespaces, dispatch, lazy seqs, transients, AOT, jank fidelity, examples
 $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```

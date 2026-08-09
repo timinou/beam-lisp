@@ -52,11 +52,30 @@ defmodule BeamLisp.Wave3Test do
 
   describe "syntax-quote" do
     test "quotes structure without evaluation" do
-      assert eval("`(a b c)") == [{:symbol, "a"}, {:symbol, "b"}, {:symbol, "c"}]
+      # A name that resolves where the template was WRITTEN is emitted
+      # qualified, as Clojure does -- that is what lets a library macro call
+      # its own helper from another namespace. A name that resolves to nothing
+      # is a fresh name the template introduces and stays bare.
+      # Pin the namespace explicitly: `Env.current_ns` is process-global and
+      # survives across evaluations, so an earlier test that ran an example
+      # can leave it pointing anywhere. The qualification is BY the current
+      # namespace, so this assertion would otherwise depend on test order.
+      BeamLisp.Env.in_ns("user")
+      eval("(def w3-known 1)")
+      assert eval("`(w3-known w3-unknown)") == [{:symbol, "user/w3-known"}, {:symbol, "w3-unknown"}]
+    end
+
+    test "a macro name inside a template stays bare" do
+      # Macros are resolved by the expander, which already searches the
+      # writing namespace and core. Qualifying one sent it down the ordinary
+      # var path, where it was invoked as a function -- which broke every
+      # vendored macro nesting `when`/`let`.
+      assert eval("`(when true 1)") == [{:symbol, "when"}, true, 1]
     end
 
     test "unquote evaluates" do
-      assert eval("(def x 42) `(a ~x c)") == [{:symbol, "a"}, 42, {:symbol, "c"}]
+      assert eval("(def x 42) `(w3-u1 ~x w3-u2)") ==
+               [{:symbol, "w3-u1"}, 42, {:symbol, "w3-u2"}]
     end
 
     test "splicing flattens" do

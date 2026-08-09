@@ -8,17 +8,19 @@ defmodule BeamLisp.SpecterCompatTest do
   #
   # ONLY slices that load AND behave correctly are tested here. A slice
   # that needs a local edit is a FAIL, recorded in docs/specter-compat.md,
-  # never patched into passing. The measurement (wave 27) is 23 of 31
-  # load, and 8 of 31 load AND behave (slices 01, 02, 03, 04, 12, 16, 17,
-  # 31) — those eight are exercised here. Four of them are new this wave:
-  # 03 (into/keys), 04 (quoted-symbol destructure key), 17 (type), 31
-  # (type over records). The load number is flat (23→23) only because 04
-  # came in while 11 dropped out — the loud unresolved-qualified-name fix
-  # turned 11's silent phantom `(def srange-transform i/srange-transform*)`
-  # into an honest load failure. The gap between loading and behaving is
-  # the point: what remains is Specter's impl machinery (i/NONE, the
-  # compiled path cache, the exec interop) plus three core gaps (`for`,
-  # `vary-meta` variadic, `^Tag`-meta let bindings). docs/specter-compat.md
+  # never patched into passing. The measurement (wave 28) is 25 of 31
+  # load, and 9 of 31 load AND behave (slices 01, 02, 03, 04, 05, 12, 16,
+  # 17, 31) — those nine are exercised here. Slice 05 (defnav/defrichnav)
+  # is new this wave: its expansion needs `for`, `declare`, and `vary-meta`
+  # variadic, all of which landed, so an empty-params defnav now constructs
+  # a working navigator. The load number moved 23 → 25: slices 23 (ALL)
+  # and 24 (MAP-VALS) — empty-params defnav callers — now load too. The
+  # remaining load failures (11, 15, 25, 26, 27, 29) are Specter-internal
+  # (i/direct-nav-obj, n/PosNavigator, eachnav, srange-transform*) or a
+  # correct reader-conditional miss (29). The gap between loading and
+  # behaving is the point: what remains is Specter's impl machinery
+  # (i/NONE, the compiled path cache, the exec interop, .select* host
+  # dispatch) rather than beam-lisp core forms. docs/specter-compat.md
   # holds the full per-slice table and the honest re-ranking.
   use ExUnit.Case, async: false
 
@@ -256,6 +258,47 @@ defmodule BeamLisp.SpecterCompatTest do
         )
 
       assert result == BeamLisp.Vector.new([42, 42])
+    end
+
+    test "defnav/defrichnav macros build a navigator (empty params, for+vary-meta+declare path)" do
+      # The full macro-stack payoff: defnav and defrichnav now *expand*. Co-loaded
+      # with their vendored deps (RichNavigator, determine-params-impls, nav/richnav),
+      # an empty-params `defnav`/`defrichnav` constructs a navigator that dispatches
+      # select*/transform* end to end. Newly behaving this wave because defnav's body
+      # needs `for` (helpers), `declare` (forward decls), and `vary-meta` variadic
+      # (the :arglists stamp) — all three landed. The empty-params path is the half
+      # that avoids `i/direct-nav-obj` (non-vendored), so only it is asserted.
+      env = BeamLisp.Compiler.new_env("specter.accept.defnavstack")
+
+      src =
+        "(ns specter.accept.defnavstack)\n" <>
+          fixture_code("01_rich_navigator_protocol") <>
+          "\n" <>
+          fixture_code("03_determine_params_impls") <>
+          "\n" <>
+          fixture_code("04_richnav_nav") <>
+          "\n" <>
+          fixture_code("05_defnav_defrichnav")
+
+      BeamLisp.Compiler.eval_string(src, env)
+
+      result =
+        BeamLisp.Compiler.eval_string(
+          "(ns specter.accept.defnavstack)\n" <>
+            "(defnav probeALL []\n" <>
+            "  (select* [this structure next-fn] (next-fn structure))\n" <>
+            "  (transform* [this structure next-fn] (inc structure)))\n" <>
+            "(defrichnav probeR []\n" <>
+            "  (select* [this vals structure next-fn] (next-fn vals structure))\n" <>
+            "  (transform* [this vals structure next-fn] (inc structure)))\n" <>
+            "[(select* probeALL [] 41 (fn [v s] (+ s 1)))\n" <>
+            " (transform* probeALL [] 41 (fn [v s] s))\n" <>
+            " (select* probeR [] 41 (fn [v s] (+ s 1)))\n" <>
+            " (transform* probeR [] 41 (fn [v s] s))]",
+          env
+        )
+
+      assert result == BeamLisp.Vector.new([42, 42, 42, 42])
     end
 
     test "dynamic-param? classifies the path-analyzer records via type" do
