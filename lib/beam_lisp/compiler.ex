@@ -1505,7 +1505,25 @@ defmodule BeamLisp.Compiler do
   end
 
   defp attr_value_ast({:symbol, _} = sym, _env), do: sym
-  defp attr_value_ast(form, env), do: compile(form, notail(env))
+
+  # A metadata value written in SOURCE arrives as a reader form. One a MACRO
+  # attached arrives as datum -- `(vary-meta name assoc :arglists '([]))`
+  # stores a bare Elixir list, because by then the quoted form has already
+  # been evaluated into data. `do_compile/2` has no clause for bare data and
+  # crashed with a raw Elixir error naming neither the var nor the key.
+  #
+  # `data_to_form/1` is the existing datum -> form bridge (the same one
+  # syntax-quote uses crossing back), so the two paths converge here instead
+  # of each growing its own compiler clauses.
+  defp attr_value_ast(form, env) do
+    compile(bl_form?(form) && form || data_to_form(form), notail(env))
+  end
+
+  # Reader forms are tagged tuples; anything else reaching a metadata value is
+  # runtime data a macro put there.
+  defp bl_form?({tag, _}) when is_atom(tag), do: true
+  defp bl_form?({:meta, _, _}), do: true
+  defp bl_form?(_), do: false
 
   # The user-metadata map a `^{...}` reader form attached to a def/defn
   # name symbol. The name form is `{:meta, {:symbol, name}, m}` where `m`
@@ -1553,7 +1571,7 @@ defmodule BeamLisp.Compiler do
     Enum.reduce(pairs, {[], [], [], env}, fn [pattern_form, init], {params, entry, arg_asts, acc_env} ->
       init_ast = compile(init, acc_env)
 
-      case pattern_form do
+      case peel_hint(pattern_form) do
         {:symbol, name} ->
           var = fresh_var(name)
           {params ++ [var], entry, arg_asts ++ [init_ast], put_local(acc_env, name, var)}
@@ -1580,7 +1598,7 @@ defmodule BeamLisp.Compiler do
     Enum.reduce(pairs, {[], env}, fn [pattern_form, init], {steps, acc_env} ->
       init_ast = compile(init, acc_env)
 
-      case pattern_form do
+      case peel_hint(pattern_form) do
         {:symbol, name} ->
           var = fresh_var(name)
           {steps ++ [{var, init_ast}], put_local(acc_env, name, var)}
@@ -1794,16 +1812,18 @@ defmodule BeamLisp.Compiler do
   # params bind a fresh var there and destructure in a body prelude.
   defp bind_params(env, params) do
     {vars, preludes, acc_env} =
-      Enum.reduce(params, {[], [], env}, fn
-        {:symbol, name}, {vars, preludes, acc_env} ->
-          var = fresh_var(name)
-          {vars ++ [var], preludes, put_local(acc_env, name, var)}
+      Enum.reduce(params, {[], [], env}, fn param, {vars, preludes, acc_env} ->
+        case peel_hint(param) do
+          {:symbol, name} ->
+            var = fresh_var(name)
+            {vars ++ [var], preludes, put_local(acc_env, name, var)}
 
-        destructure, {vars, preludes, acc_env} ->
-          whole = fresh_var("whole")
-          {sub_steps, acc_env} = destructure_steps(destructure, acc_env, whole)
-          prelude = Enum.map(sub_steps, fn {var, expr_ast} -> {:=, [], [var, expr_ast]} end)
-          {vars ++ [whole], preludes ++ prelude, acc_env}
+          destructure ->
+            whole = fresh_var("whole")
+            {sub_steps, acc_env} = destructure_steps(destructure, acc_env, whole)
+            prelude = Enum.map(sub_steps, fn {var, expr_ast} -> {:=, [], [var, expr_ast]} end)
+            {vars ++ [whole], preludes ++ prelude, acc_env}
+        end
       end)
 
     {vars, preludes, acc_env}
@@ -1814,6 +1834,14 @@ defmodule BeamLisp.Compiler do
   # `{:keys [a] :as m}` compiles to `get` lookups (missing keys nil).
   # Returns `{steps, env'}` where steps are `{var, expr_ast}` pairs
   # whose exprs read from `whole_ast`.
+  # `^Tag x` arrives as `{:meta, {:symbol, x}, %{tag: ...}}`, and `^:a ^Tag x`
+  # merges into one wrapper. A type hint on a binding target is a no-op
+  # optimization hint in Clojure, so peel it and bind exactly as the bare
+  # target would. The clause recurses so even stacked wrappers collapse to
+  # the underlying pattern (the wave-20 contract: LEADING peel clause).
+  defp destructure_steps({:meta, _inner, _m} = form, env, whole_ast),
+    do: destructure_steps(unwrap_meta(form), env, whole_ast)
+
   defp destructure_steps({:symbol, name}, env, whole_ast) do
     var = fresh_var(name)
     {[{var, whole_ast}], put_local(env, name, var)}
@@ -1881,7 +1909,12 @@ defmodule BeamLisp.Compiler do
         {{:keyword, "or"}, {:map, or_kvs}}, {binds, ors} ->
           defaults =
             Map.new(or_kvs, fn
-              {{:symbol, k}, default} -> {k, default}
+              {key_form, default} ->
+                case peel_hint(key_form) do
+                  {:symbol, k} -> {k, default}
+                  other -> raise "unsupported :or binding: #{inspect(other)}"
+                end
+
               other -> raise "unsupported :or binding: #{inspect(other)}"
             end)
 
@@ -1890,8 +1923,11 @@ defmodule BeamLisp.Compiler do
         {{:keyword, "keys"}, {:vector, syms}}, {binds, ors} ->
           key_binds =
             Enum.map(syms, fn
-              {:symbol, name} -> {:get, {:symbol, name}, String.to_atom(name)}
-              other -> raise "unsupported :keys binding: #{inspect(other)}"
+              sym_form ->
+                case peel_hint(sym_form) do
+                  {:symbol, name} -> {:get, {:symbol, name}, String.to_atom(name)}
+                  other -> raise "unsupported :keys binding: #{inspect(other)}"
+                end
             end)
 
           {binds ++ key_binds, ors}
@@ -1899,14 +1935,20 @@ defmodule BeamLisp.Compiler do
         {{:keyword, "strs"}, {:vector, syms}}, {binds, ors} ->
           str_binds =
             Enum.map(syms, fn
-              {:symbol, name} -> {:get, {:symbol, name}, name}
-              other -> raise "unsupported :strs binding: #{inspect(other)}"
+              sym_form ->
+                case peel_hint(sym_form) do
+                  {:symbol, name} -> {:get, {:symbol, name}, name}
+                  other -> raise "unsupported :strs binding: #{inspect(other)}"
+                end
             end)
 
           {binds ++ str_binds, ors}
 
-        {{:keyword, "as"}, {:symbol, name}}, {binds, ors} ->
-          {binds ++ [{:as, name}], ors}
+        {{:keyword, "as"}, as_form}, {binds, ors} ->
+          case peel_hint(as_form) do
+            {:symbol, name} -> {binds ++ [{:as, name}], ors}
+            other -> raise "unsupported :as binding: #{inspect(other)}"
+          end
 
         # `{local :key}` / `{[a b] :pair}`: the binding form sits in
         # the map's key slot, the lookup key in its value slot. The
@@ -2001,8 +2043,11 @@ defmodule BeamLisp.Compiler do
   # is a loud error rather than a silent mis-bind.
   defp peel_as_bind(elems) do
     case Enum.reverse(elems) do
-      [{:symbol, name}, {:keyword, "as"} | rest_rev] ->
-        {Enum.reverse(rest_rev), name}
+      [name_form, {:keyword, "as"} | rest_rev] ->
+        case peel_hint(name_form) do
+          {:symbol, name} -> {Enum.reverse(rest_rev), name}
+          other -> raise "\":as\" in a vector binding must name a symbol, got #{inspect(other)}"
+        end
 
       [{:keyword, "as"} | _] ->
         raise "\":as\" in a vector binding must be followed by a name"
@@ -2365,6 +2410,14 @@ defmodule BeamLisp.Compiler do
   # recurses into stay wrapped so compile/2 re-captures their positions.
   defp unwrap_meta({:meta, form, _m}), do: form
   defp unwrap_meta(other), do: other
+
+  # `^Tag x` lands as `{:meta, {:symbol, x}, %{tag: ...}}`, and `^:a ^Tag x`
+  # merges into one wrapper. A binding's type hint is a no-op optimization
+  # hint in Clojure, so peel it off a direct binding target before routing
+  # to the symbol/destructure shapes. Recursive so stacked wrappers collapse;
+  # `unwrap_meta/1` drops just one layer.
+  defp peel_hint({:meta, form, _m}), do: peel_hint(form)
+  defp peel_hint(form), do: form
 
   # The name of a `{:symbol, name}` token, possibly position-wrapped.
   defp name_of(form), do: name_of_unwrapped(unwrap_meta(form))

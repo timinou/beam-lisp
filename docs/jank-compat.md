@@ -152,7 +152,7 @@ upstream span in `core.jank@3028594`.
 | 96 | dorun | 3204–3216 | `dorun` | ✓ | `when-let` + top-level `recur` |
 | 97 | doall | 3217–3230 | `doall` | ✓ | needs the `dorun` slice co-loaded |
 | 98 | reductions | 3346–3361 | `reductions` | ✓ | *was ✗* — `reduced?` is now core |
-| 99 | into | 3362–3375 | `into` | ◐ | *was ✗* — `transientable?` now ships, so its vector/reduce and `take`-xform paths behave. But it is **not** a full pass: `(into {} …)` still throws (the map-transient `conj!` clause is missing) and `(into [] (map inc) …)` still throws (`map` lacks its 1-arity transducer form). Two small remaining prim gaps, recorded below |
+| 99 | into | 3362–3375 | `into` | ✓ | *was ◐* — both remaining gaps closed in wave 27: `conj!` grew a map-transient clause (accepting either entry spelling) and `map`/`filter` grew 1-arity transducer forms **on the primitive**. All four upstream arities are now called in the compat test, not just the easy one |
 | 100 | take-last | 3749–3758 | `take-last` | ✓ | `loop`/`drop` |
 | 101 | mapv | 3759–3777 | `mapv` | ✓ | *was ◐* — the multi-coll arities are `(into [] (map f c1 c2 …))`; `into` and core multi-coll `map` shipped (wave 26), so all arities behave |
 | 102 | filterv | 3778–3789 | `filterv` | ✓ | transients + `persistent!` |
@@ -177,8 +177,8 @@ upstream span in `core.jank@3028594`.
 
 ## Counts — the headline
 
-> **115 of 120 attempted slices** load **and** behave correctly. The
-> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62 → 63 → 89 → 109 → 115**
+> **116 of 120 attempted slices** load **and** behave correctly. The
+> trajectory is the point: **7 → 13 → 21 → 36 → 38 → 62 → 63 → 89 → 109 → 115 → 116**
 > across twelve waves, each aimed by this document's ranked gap list. Wave 25
 > was a *re-measure*, not a widening: the wave-24 gap list named exactly what
 > the four headline gaps blocked, the gaps were built, and 20 of the 31
@@ -211,7 +211,15 @@ upstream span in `core.jank@3028594`.
 > still lacks its 1-arity transducer form). Both are small prim gaps, recorded
 > in the taxonomy below. `into` stays un-promoted until they close.
 >
-> The score now: **115 pass**, **`into` ◐ partial (2 remaining prim gaps)**, **4 upstream TODO stubs**. The four stubs load but throw by construction; they are recorded, never counted against beam-lisp.
+> The score now: **116 pass**, **4 upstream TODO stubs**, **0 outstanding
+> beam-lisp gaps**. The four stubs (`with-open`, `instance?`, `rseq`,
+> `unchecked-inc-int`) have commented-out bodies in `core.jank` itself: they
+> load and then throw by construction, so they cannot pass in jank either.
+> They are recorded, never counted against beam-lisp.
+>
+> **This sample is now exhausted.** Every slice that can pass, does. The
+> informative next move is a fourth widening, not further work against these
+> 120 — a sample where everything passes has stopped measuring anything.
 >
 ### What wave 24 found that the previous sample hid
 
@@ -339,66 +347,121 @@ and another worker's `deftype`/`defrecord` implementation cannot be measured
 through this file. The one protocol-adjacent machinery `core.jank` does use
 (`defmulti`/`defmethod`, already shipped) was not widened further this wave.
 
+## What wave 27 found (the sample's last useful finding)
+
+Closing `into` took two prim fixes, and the *way* the second one was built
+is the finding worth keeping.
+
+- **`conj!` had no map-transient clause.** `into`'s fast path reduces `conj!`
+  over a transient, and `BeamLisp.Transient.conj!/2` handled only vector and
+  set transients. A map entry arrives in one of two spellings — the
+  2-element `%Vector{}` that `seq` yields over a map, or a 2-element list from
+  a quoted source — and both had to be accepted. A 3-element vector now
+  raises rather than silently binding its first two fields, which would have
+  produced a plausible-looking wrong map.
+
+- **`map`/`filter` had no 1-arity transducer form**, so `(into [] (map inc) c)`
+  failed at *xform construction*, before `into`'s body ran at all.
+
+- **The transducer arities were first built the wrong way, and this sample
+  caught it.** They initially landed as a REBINDING in `core.bl`:
+  `(def map-coll-prim map)` followed by a new `defn map` delegating back to
+  the captured primitive. Every unit test passed. The fidelity suite failed —
+  correctly. Upstream's own `map` slice (89) *defines a `map`* with no
+  transducer arity, a `defn` outlives the namespace that made it, and the
+  captured prim was shadowed globally. The symptom was a `BadArityError` in a
+  test file that had not changed.
+
+  Defining the arity on the primitive instead leaves nothing to shadow, and
+  keeps one implementation of the chunked-lazy path rather than a second
+  Lisp-level copy that would drift. **A rebinding is only safe when nobody
+  else can rebind the same name** — and in a language whose fidelity target
+  is a stdlib full of `defn map`, nobody can promise that.
+
+  This is the second time in as many waves that running someone else's code
+  caught a design error the language's own tests could not.
+
+- **A cross-test namespace leak, found on the way.** Wave 24's records test
+  was `defn`-ing `keys`/`vals`/`merge`/`into` into the shared `user`
+  namespace, which outlives the file. Whichever ran last won, so `(keys nil)`
+  returned `()` instead of `nil` in roughly two runs in three. The shim
+  predated those functions existing; three of the four now ship, and `merge`
+  was added to the prelude to retire the last of it.
+
 ## Gap classification
 
-*Re-derived from the wave-26 sample. The seven wave-25 failures are gone —
-`rem`, `float?`, `transientable?`, `reduce-kv`, and the `bit_not` shim row
-all shipped, and with them `mod`, `double?`, `bit-not`, `splitv-at`,
-`update-vals`, `update-keys`, `mapv` ✓, and `take-nth`'s transducer arity.
-What remains are two small prim gaps inside `into` (99), which stays ◐, and
-nothing else. Items are ordered by unlock count.*
+*Re-derived from the wave-27 sample. **There are no outstanding beam-lisp
+gaps against these 120 slices.** The two prim gaps inside `into` (99) both
+closed — `conj!` grew its map-transient clause and `map`/`filter` grew
+1-arity transducer forms on the primitive — and `into` is promoted to ✓.
+What is left is one category, and it is not ours.*
 
-### 1. `conj!` has no map-transient clause (→ `(into {} …)`)
+### 1. Upstream stubs (not beam-lisp gaps) — 4 slices
 
-`into`'s fast path branches on `(transientable? to)`, and for a map target it
-reduces `conj!` over `(transient {})` — but `BeamLisp.Transient.conj!/2` has
-clauses only for vector and set transients. So `(into {} [[:a 1] [:b 2]])`
-— the single most common `into` usage after `(into [] …)` — throws at call
-time. The reduce fallback (`(reduce conj to from)`) would handle it
-correctly; the transient fast path just needs a map clause that `assoc!`s
-the entry, mirroring `conj`/`assoc!`. One clause closes `(into {} …)` and is
-the sole blocker between `into` and ✓ on its non-xform arities.
+`with-open`, `instance?`, `rseq`, and `unchecked-inc-int` are
+`(throw "TODO: port …")` stubs in `core.jank` itself: their real bodies are
+commented out upstream. They load and then throw by construction, so they
+cannot pass anywhere, jank included. Recorded permanently so a future agent
+does not chase them.
 
-### 2. `map` has no 1-arity transducer form (→ `(into [] (map f) coll)`)
+Note `instance?` is a special case worth stating: beam-lisp *does* ship an
+`instance?` in its prelude (wave 27), defined against beam-lisp's own type
+identities. The SLICE still fails, because the vendored slice is upstream's
+stub, and the fixture is never edited. Both facts are true and neither
+cancels the other.
 
-`(map f)` — the transducer arity — is undefined in beam-lisp core, so
-`(into [] (map inc) [1 2 3])` fails at xform construction, before `into`'s
-body even runs. Multi-coll `map` (`(map f c1 c2)`) ships; the 1-arity
-transducer form does not. Closing it unblocks `into`'s xform path with
-`map`-style transducers (the canonical idiom) and the standard
-`(transduce (map f) …)` call.
+### 2. Nothing else
 
-### 3. Upstream stubs (not beam-lisp gaps)
-
-`instance?`, `rseq`, `unchecked-inc-int`, and the already-known `with-open`
-are `(throw "TODO: port …")` stubs in `core.jank` itself. They load and then
-throw by construction; they cannot pass anywhere, including jank. Recorded
-so a future agent does not chase them.
+This is the honest end of this sample. Every slice that can pass, does.
 
 ## What to build next
 
-*Re-ranked from the wave-26 reality. Every item on the wave-25 list shipped
-— that backlog is closed. What remains is two one-line prim gaps that
-surface only inside `into` (99), plus the honest observation that this
-sample has no fully-loadable-but-failing slices left. Ordered by unlock
-value.*
+*Re-ranked from the wave-27 reality. Every item on the wave-26 list shipped;
+that backlog is closed, and so is this sample. There is no remaining
+beam-lisp gap to rank against these 120 slices.*
 
-1. **`conj!` map-transient clause** (→ `(into {} …)`; makes `into` ✓ on its
-   reduce and `take`-xform paths). One clause in `BeamLisp.Transient.conj!/2`
-   that `assoc!`s the entry, mirroring `conj`/`assoc!`. The highest-value
-   remaining single change — it unblocks the most common `into` usage and
-   is the last blocker between `into` and a full pass.
-2. **`map` 1-arity transducer form** (→ `(into [] (map f) coll)`, and the
-   standard `(transduce (map f) …)` idiom). Multi-coll `map` ships; the
-   `(map f)` transducer form does not. This is a real user-facing gap beyond
-   `into`: `transduce`'s canonical xform is unusable until it exists.
-3. **A fourth widening of the sample.** This one is effectively exhausted —
-   the only non-passing slices are `into` (the two gaps above) and the four
-   upstream stubs that can never pass anywhere. The informative next move is
-   a new widening (another tranche of `core.jank`) or the in-flight W13
-   seq-layer work (uniform laziness), not more re-measuring of these 120.
+1. **A fourth widening of the sample.** This is the only informative move
+   left. The sample is exhausted: 116 pass, and the 4 that do not are
+   upstream stubs that throw by construction. A sample where everything
+   that can pass does pass has stopped measuring anything — it now confirms
+   a result rather than finding new ones. Vendor another tranche of
+   `core.jank`, expect the score to DROP, and treat the drop as the
+   deliverable (it has happened twice before: 63→89 on the 64→120
+   widening, and the list refilled each time).
+2. **A different measured target.** Specter is already vendored and sits far
+   lower (see `specter-compat.md`), and its remaining distance is a
+   *different kind* of work — library impl machinery rather than language
+   surface. Other candidates worth weighing if a third target is wanted:
+   `core.match`, `clojure.spec`, `medley`, `meander`.
+
+**What NOT to do:** re-measure these 120 again. Wave 27 was the last
+re-measure that could move the number, and it moved it by one.
 
 ### Prediction vs outcome — how the ranked lists fared
+
+**Wave 27's check (most recent).** The wave-26 list ranked exactly two items,
+both inside `into`, and predicted they were the last beam-lisp gaps in this
+sample.
+
+- **Both materialised, exactly as ranked.** `conj!`'s map-transient clause
+  closed `(into {} …)`; the 1-arity transducer forms closed
+  `(into [] (map f) …)`. `into` went ◐ → ✓ and the sample went 115 → 116.
+- **The prediction that the sample would then be exhausted also held.** No
+  slice outside the four upstream stubs fails now. That was the useful part
+  of the ranking: it correctly said the end was one item away, rather than
+  refilling itself indefinitely.
+- **What the list did NOT predict, and could not have:** that building item
+  #2 the obvious way would break item #1. The transducer arities were first
+  added by rebinding `map` in the prelude — which upstream's own `map` slice
+  (89) then shadowed globally, because a `defn` outlives its namespace. The
+  ranked list reasons about *what* to build and is silent about *where*; this
+  sample answered the second question by failing. See "What wave 27 found".
+- **Honest note on `instance?`:** wave 27 shipped an `instance?` in the
+  prelude, and slice 08's `instance?` still fails. Those are compatible — the
+  slice is upstream's TODO stub, and fixtures are never edited. A future
+  reader should not read the shipped prim as a contradiction of the recorded
+  failure.
+
 
 The wave-24 ranked list predicted what each gap would unlock. Checked
 against what the re-measure actually found:

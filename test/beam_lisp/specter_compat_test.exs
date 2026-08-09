@@ -8,13 +8,18 @@ defmodule BeamLisp.SpecterCompatTest do
   #
   # ONLY slices that load AND behave correctly are tested here. A slice
   # that needs a local edit is a FAIL, recorded in docs/specter-compat.md,
-  # never patched into passing. The measurement is 23 of 31 load, and
-  # 4 of 31 load AND behave (slices 01, 02, 12, 16) — those four are
-  # exercised here. The gap between loading and behaving is the point:
-  # the syntax is mostly there, but Specter's impl machinery (i/NONE,
-  # the compiled path cache, the exec interop) and a handful of missing
-  # core prims are not. docs/specter-compat.md holds the full per-slice
-  # table and the honest re-ranking.
+  # never patched into passing. The measurement (wave 27) is 23 of 31
+  # load, and 8 of 31 load AND behave (slices 01, 02, 03, 04, 12, 16, 17,
+  # 31) — those eight are exercised here. Four of them are new this wave:
+  # 03 (into/keys), 04 (quoted-symbol destructure key), 17 (type), 31
+  # (type over records). The load number is flat (23→23) only because 04
+  # came in while 11 dropped out — the loud unresolved-qualified-name fix
+  # turned 11's silent phantom `(def srange-transform i/srange-transform*)`
+  # into an honest load failure. The gap between loading and behaving is
+  # the point: what remains is Specter's impl machinery (i/NONE, the
+  # compiled path cache, the exec interop) plus three core gaps (`for`,
+  # `vary-meta` variadic, `^Tag`-meta let bindings). docs/specter-compat.md
+  # holds the full per-slice table and the honest re-ranking.
   use ExUnit.Case, async: false
 
   @moduletag :specter_compat
@@ -201,6 +206,103 @@ defmodule BeamLisp.SpecterCompatTest do
 
       assert BeamLisp.Test.realize(eval_in("specter.accept.insertidx", "(insert-before-index-list [1 2] 2 :y)")) ==
                [1, 2, :y]
+    end
+
+    test "determine-params-impls groups method impls into a method-name keyed map" do
+      # The `nav` macro's destructure-input: a list of `(method params body…)`
+      # forms becomes a map `{'select* …, 'transform* …}`. Newly behaving
+      # because `into` and `keys` landed in wave 27's prim batch.
+      load_slice("03_determine_params_impls", "specter.accept.detparams")
+
+      # both methods are present as symbol keys, each holding params+body
+      assert eval_in(
+               "specter.accept.detparams",
+               "[(= (set (list 'select* 'transform*))" <>
+                 " (set (keys (determine-params-impls" <>
+                 " '((select* [a] b) (transform* [c] d))))))" <>
+                 "  (count (get (determine-params-impls" <>
+                 " '((select* [a] b) (transform* [c] d))) 'select*))]"
+             ) == BeamLisp.Vector.new([true, 2])
+    end
+
+    test "nav/richnav macros build a working navigator (empty params -> reify path)" do
+      # Wave 27's headline fix: the `nav` macro destructures its impls on a
+      # literal quoted-symbol key `'select*`. That now parses, so `nav` can
+      # expand into `richnav` -> `(reify RichNavigator …)`. Co-loaded with its
+      # two vendored deps (RichNavigator protocol + determine-params-impls),
+      # a navigator built by `nav` selects and transforms end to end.
+      # (The non-empty-params path still needs the non-vendored
+      # `i/direct-nav-obj`, so only the empty-params half is asserted.)
+      env = BeamLisp.Compiler.new_env("specter.accept.navstack")
+
+      src =
+        "(ns specter.accept.navstack)\n" <>
+          fixture_code("01_rich_navigator_protocol") <>
+          "\n" <>
+          fixture_code("03_determine_params_impls") <>
+          "\n" <>
+          fixture_code("04_richnav_nav")
+
+      BeamLisp.Compiler.eval_string(src, env)
+
+      result =
+        BeamLisp.Compiler.eval_string(
+          "(ns specter.accept.navstack)\n" <>
+            "(let [nv (nav [] (select* [this structure next-fn] (next-fn structure))\n" <>
+            "                    (transform* [this structure next-fn] (inc structure)))]\n" <>
+            "  [(select* nv [] 41 (fn [vals s] (+ s 1)))\n" <>
+            "   (transform* nv [] 41 (fn [vals s] s))])",
+          env
+        )
+
+      assert result == BeamLisp.Vector.new([42, 42])
+    end
+
+    test "dynamic-param? classifies the path-analyzer records via type" do
+      # The path-analyzer records (LocalSym … DynamicFunction) plus a
+      # predicate over their `type`. Newly behaving because wave 27's `type`
+      # returns the record's module, so `(contains? #{DynamicPath …} (type o))`
+      # actually matches. A keyword/vector is not a dynamic-param.
+      load_slice("31_defrecord_path_forms", "specter.accept.pathforms")
+
+      assert eval_in(
+               "specter.accept.pathforms",
+               "[(dynamic-param? (->DynamicVal 'x))\n" <>
+                 " (dynamic-param? (->DynamicPath [:a]))\n" <>
+                 " (dynamic-param? (->DynamicFunction :f [] 'x))\n" <>
+                 " (dynamic-param? (->LocalSym 'x 'y))\n" <>
+                 " (dynamic-param? :a)]"
+             ) == BeamLisp.Vector.new([true, true, true, false, false])
+    end
+
+    test "static-path? distinguishes static paths from dynamic-path records" do
+      # static-path? (a private fn) recurses over a path; a leaf is static
+      # unless `i/dynamic-param?` says it is a dynamic record. Co-loads slice
+      # 31 into `com.rpl.specter.impl` (its canonical upstream home) and
+      # aliases `i` to it, exactly as Specter's own namespaces do. Newly
+      # behaving because `type` now drives `dynamic-param?` correctly.
+      env = BeamLisp.Compiler.new_env("specter.accept.pathcheck")
+
+      BeamLisp.Compiler.eval_string(
+        "(ns com.rpl.specter.impl)\n" <> fixture_code("31_defrecord_path_forms"),
+        env
+      )
+
+      BeamLisp.Compiler.eval_string(
+        "(ns com.rpl.specter (:require [com.rpl.specter.impl :as i]))\n" <>
+          fixture_code("17_static_path_wrap_dynamic"),
+        env
+      )
+
+      assert BeamLisp.Compiler.eval_string(
+               "(ns com.rpl.specter)\n" <>
+                 "[(static-path? :a)\n" <>
+                 " (static-path? [:a :b])\n" <>
+                 " (static-path? [])\n" <>
+                 " (static-path? (i/->DynamicVal 'x))\n" <>
+                 " (static-path? [(i/->DynamicVal 'x)])]",
+               env
+             ) == BeamLisp.Vector.new([true, true, true, false, false])
     end
   end
 end
