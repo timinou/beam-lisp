@@ -37,7 +37,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defprotocol extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
+  @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defprotocol satisfies? extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -572,6 +572,19 @@ defmodule BeamLisp.Compiler do
 
     quote do
       BeamLisp.Multi.extend_type(unquote(pns), unquote(pname), unquote(tag), unquote(impls))
+    end
+  end
+
+  # `(satisfies? Proto x)` — a special form for the same reason
+  # `extend-type` is one: the protocol is named, not evaluated. Passing
+  # `Proto` as a value would mean resolving a var whose contents are the
+  # method table, when what is wanted is the protocol's identity.
+  defp compile_special("satisfies?", [protocol_form, value_form], env) do
+    {pns, pname} = multi_var_target(env, name_of(protocol_form))
+    value_ast = compile(value_form, notail(env))
+
+    quote do
+      BeamLisp.Multi.satisfies?(unquote(pns), unquote(pname), unquote(value_ast))
     end
   end
 

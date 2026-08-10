@@ -696,7 +696,12 @@ defmodule BeamLisp.RT do
   @doc "jank's `cpp/jank.runtime.keyword`: a keyword with the given namespace and name."
   def keyword_of(ns, name) when is_binary(name) do
     {ns, name} = split_keyword(ns, name)
-    if is_nil(ns), do: String.to_atom(name), else: String.to_atom(ns <> "/" <> name)
+    # Through the guard, not String.to_atom/1: a keyword built at
+    # RUNTIME comes from data, and data can be unbounded in a way source
+    # text is not. A loop interning one atom per input row is exactly
+    # the shape that fills the table, and a full atom table aborts the
+    # VM uncatchably.
+    BeamLisp.AtomGuard.to_atom(if(is_nil(ns), do: name, else: ns <> "/" <> name))
   end
 
   def keyword_of(ns, {:symbol, n}), do: keyword_of(ns, n)

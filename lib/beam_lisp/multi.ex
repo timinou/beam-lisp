@@ -279,6 +279,35 @@ defmodule BeamLisp.Multi do
     end
   end
 
+  @doc """
+  True when `value`'s type has an implementation of every method of
+  protocol `ns`/`protocol`.
+
+  Asks the SAME question `dispatch_protocol/4` answers, keyed the same
+  way, so the predicate cannot disagree with the call it guards. A
+  predicate that says yes where the call raises is worse than no
+  predicate at all --- wave 27 retired `map?`-on-records for exactly
+  that reason.
+
+  Every method must be present, not merely one: a partial extension
+  satisfies nothing, matching `extend_type/4`'s own refusal to register
+  an incomplete one.
+  """
+  def satisfies?(ns, protocol, value) do
+    case :ets.lookup(@table, {:protocol, ns, protocol}) do
+      [{_, %{methods: methods}}] ->
+        tag = type_of(value)
+
+        methods != [] and
+          Enum.all?(methods, fn method ->
+            :ets.member(@table, {{:protocol, ns, protocol, method}, tag})
+          end)
+
+      [] ->
+        false
+    end
+  end
+
   defp protocol!(ns, name) do
     case :ets.lookup(@table, {:protocol, ns, name}) do
       [{_, desc}] -> desc
