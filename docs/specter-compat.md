@@ -538,3 +538,92 @@ composed protocol calls. On present form that finds compiler bugs. If it does
 not, the fallback position is still an improvement — Specter stops being
 "bounded by someone else's internals" and becomes bounded by a number we chose
 not to chase.
+
+## Wave 28 outcome — the engine was built, and what it moved
+
+FUP-001 recommended implementing. PLAN-018 did. This section records what
+that bought, including the part that did not move.
+
+### The number
+
+**Load stays 25 of 31.** Predicted, and worth being explicit about: the
+engine adds no *syntax*, and load measures whether a slice's forms compile.
+An engine cannot move a load score, and a wave that claimed it would have
+been measuring something else.
+
+**Behaviour is where it moved.** Three vendored slices now run against the
+port — not "load", but compute verified answers, with upstream's own code
+calling our `NONE`, our `doseqres` and our `compiled-select-any*`:
+
+- **slice 07 (`all-select`)** — the full reduction contract: a NONE result
+  does not clobber a sibling's, a non-NONE result wins over surrounding
+  NONEs, and a `reduced` terminates the walk after exactly two of five
+  elements.
+- **slice 06 (`selected?*` / `not-selected?*`)** — answers through
+  `compiled-select-any*`.
+- **slice 14 (`do-keypath-transform`)** — rebuilds a map around a new value,
+  leaving everything else untouched.
+
+They are registered in `specter_compat_test.exs` under "verbatim slices
+running on beam-lisp's ported engine". The engine is published as
+`com.rpl.specter.impl`, which is where a vendored slice's `i/` alias
+points — the fixture is not adapted to us, we are adapted to it.
+
+### What the port found that the tests did not
+
+**Slice 06 found a missing arity.** `compiled-select-any*` has two forms
+upstream; the port shipped only the 2-arity one, and every hand-written test
+passed because they all called the arity we had written. `selected?*` calls
+the 3-arity form that threads `vals`. This is the argument for measuring
+against someone else's code in one line: our tests could only ever test our
+understanding.
+
+**`doseqres` had to become a macro.** It was ported as a higher-order
+function, which is the better shape for beam-lisp — and vendored code writes
+`(doseqres NONE [e structure] (next-fn e))`, a binding form. Both surfaces
+now exist, `doseqres` the macro and `doseqres-fn` the function, and both are
+tested, because a macro that disagrees with the function beneath it is a
+trap.
+
+**`println` was 0/1-arity.** Found while writing the example: every caller
+reaching for `(println (str "x: " v))` was working around a missing arity
+rather than choosing a spelling. Now variadic, as Clojure's is.
+
+**A refer does not transit, and two things cannot be re-exported at all.**
+Names referred into `specter.navs` are not referred on to its consumers. A
+protocol cannot be re-exported by `def` (it names a registry entry, not a
+var), and neither can a macro (binding the name captures what it evaluated
+to, not the expander). Both are now written down in `priv/specter/navs.bl`
+where the next person will look.
+
+### The four predictions FUP-001 made
+
+| Prediction | Outcome |
+|---|---|
+| `NONE` ports as a keyword; identity holds on the BEAM by interning | **Held.** It also survives a message send, which copies every other term — there is a test for exactly that |
+| `MutableCell` is a within-call accumulator, replaceable by a fold | **Held.** `compiled-select*` is a `volatile!` collector; nothing needed shared mutation |
+| No runtime codegen required — the `:cljs` branch proves it | **Held.** No `eval`, no module generation, nothing deferred to runtime compilation |
+| ~140 lines of CPS | **Held.** `engine.bl` is the algebra, `exec.bl` the entry points, and the composition core is the ten lines it was measured to be |
+
+Four for four is unusual here, and the reason is worth recording: these
+predictions were made by READING the source rather than by reasoning about
+the ecosystem. The one that was wrong in wave 27 (`reify` unlocking six
+slices) was made the other way.
+
+### What remains, and what will not move it
+
+Six slices still fail to load. All six are Specter's own missing internals
+(`PosNavigator`, `direct-nav-obj`, `eachnav`, `srange-transform*`'s callers)
+or slice 29's reader conditional, which has no `:clj` branch and **must**
+fail to read. None is a beam-lisp gap.
+
+The `magic-precompilation` cache remains deliberately unbuilt. It is
+performance-only, and it carries the one genuinely dangerous design question:
+Specter's cache is a var-interned mutable cell, and "global" on this host is
+either ETS or per-process, where choosing wrongly is a correctness bug rather
+than a slowdown. Nothing has yet forced the choice.
+
+`priv/optics.bl` remains the recommended native optics library. The engine is
+a measurement instrument and a demonstration that the host can carry a hard
+macro-and-protocol-heavy design; it is not a replacement for optics that
+needed no compiler changes to exist.

@@ -348,4 +348,98 @@ defmodule BeamLisp.SpecterCompatTest do
              ) == BeamLisp.Vector.new([true, true, true, false, false])
     end
   end
+  describe "verbatim slices running on beam-lisp's ported engine" do
+    # Wave 28 ported Specter's compiled-path engine (priv/specter/*.bl).
+    # These slices are the payoff and the proof: upstream's OWN code,
+    # byte-for-byte, executing against our NONE, our doseqres and our
+    # compiled-select-any*. A slice here is not "loads" — it computes a
+    # verified answer.
+    #
+    # The engine is published under com.rpl.specter.impl, which is where
+    # a vendored slice's `i/` alias points. That is the honest wiring:
+    # the fixture is not adapted to us, we are adapted to it.
+    defp with_engine(fixture, ns) do
+      env = BeamLisp.Compiler.new_env(ns)
+
+      BeamLisp.Compiler.eval_string(
+        "(ns com.rpl.specter.impl (:require [specter.engine :refer :all] " <>
+          "[specter.exec :refer :all]))",
+        env
+      )
+
+      BeamLisp.Compiler.eval_string(
+        "(ns #{ns} (:require [com.rpl.specter.impl :as i] " <>
+          "[specter.engine :refer :all] [specter.exec :refer :all] " <>
+          "[specter.navs :refer :all]))\n" <>
+          fixture_code(fixture),
+        env
+      )
+
+      env
+    end
+
+    test "slice 07: all-select folds with doseqres, honouring NONE and reduced" do
+      # Upstream's all-select is three lines that exercise the whole
+      # reduction contract: a NONE result must not clobber a sibling's,
+      # and a reduced result must terminate the walk.
+      env = with_engine("07_all_select", "specter.engine.allselect")
+
+      ev = fn src ->
+        BeamLisp.Compiler.eval_string("(ns specter.engine.allselect)\n" <> src, env)
+      end
+
+      # every element reaches next-fn, in order
+      assert ev.("(let [acc (volatile! [])] " <>
+                   "(all-select [1 2 3] (fn [e] (vswap! acc conj e) i/NONE)) @acc)") ==
+               BeamLisp.Vector.new([1, 2, 3])
+
+      # all-NONE stays NONE, rather than degrading to nil or []
+      assert ev.("(i/none? (all-select [1 2 3] (fn [e] i/NONE)))") == true
+
+      # a non-NONE result wins over the NONEs around it
+      assert ev.("(all-select [1 2 3] (fn [e] (if (= e 2) :hit i/NONE)))") == :hit
+
+      # reduced short-circuits: only two of five elements are visited
+      assert ev.("(let [n (volatile! 0)] " <>
+                   "(all-select [1 2 3 4 5] " <>
+                   "(fn [e] (vswap! n inc) (if (= e 2) (reduced e) i/NONE))) @n)") == 2
+
+      # an empty structure selects nothing
+      assert ev.("(i/none? (all-select [] (fn [e] e)))") == true
+    end
+
+    test "slice 06: selected?* answers through compiled-select-any*" do
+      # This slice found a genuine gap: it calls the 3-arity
+      # compiled-select-any* that threads `vals`, and the port had only
+      # the 2-arity form. Measuring against real code is what surfaced
+      # it — the hand-written tests all used the arity we had written.
+      env = with_engine("06_not_selected_selected", "specter.engine.selected")
+
+      ev = fn src ->
+        BeamLisp.Compiler.eval_string("(ns specter.engine.selected)\n" <> src, env)
+      end
+
+      assert ev.("(selected?* (i/comp-paths* [:a]) [] {:a 1})") == true
+      assert ev.("(not-selected?* (i/comp-paths* [:a]) [] {:a 1})") == false
+
+      # a path that navigates nowhere is not selected
+      assert ev.("(selected?* (i/comp-paths* [(pred* odd?)]) [] 2)") == false
+      assert ev.("(not-selected?* (i/comp-paths* [(pred* odd?)]) [] 2)") == true
+    end
+
+    test "slice 14: do-keypath-transform rebuilds the map around the new value" do
+      env = with_engine("14_do_keypath_transform", "specter.engine.keypath")
+
+      ev = fn src ->
+        BeamLisp.Compiler.eval_string("(ns specter.engine.keypath)\n" <> src, env)
+      end
+
+      assert ev.("(do-keypath-transform [] {:a 1} :a (fn [vals v] (inc v)))") == %{a: 2}
+
+      # everything not navigated to is left exactly as it was
+      assert ev.("(do-keypath-transform [] {:a 1 :b 9} :a (fn [vals v] (inc v)))") ==
+               %{a: 2, b: 9}
+    end
+  end
+
 end

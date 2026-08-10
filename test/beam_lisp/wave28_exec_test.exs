@@ -27,7 +27,8 @@ defmodule BeamLisp.Wave28ExecTest do
     BeamLisp.Compiler.eval_string(
       "(ns w28x.#{:erlang.unique_integer([:positive])} " <>
         "(:require [specter.navs :refer :all] " <>
-        "[specter.engine :refer :all]))\n" <> body,
+        "[specter.engine :refer :all] " <>
+        "[specter.exec :refer :all]))\n" <> body,
       BeamLisp.Compiler.new_env("user")
     )
   end
@@ -190,23 +191,39 @@ defmodule BeamLisp.Wave28ExecTest do
   end
 
   describe "doseqres — the NONE-aware reduction" do
+    # Two surfaces, deliberately. `doseqres` is a MACRO binding a name
+    # over a body, because that is how vendored Specter code writes it
+    # (`(doseqres NONE [e structure] (next-fn e))`) and the fixture is
+    # not adapted to us. `doseqres-fn` is the same reduction for callers
+    # who already hold a function. Both are tested, because a macro that
+    # disagrees with the function under it is a trap.
+
     test "a NONE result leaves the accumulator alone" do
       # Otherwise a branch that selected nothing would clobber a sibling
       # that selected something.
-      assert sp("(doseqres NONE [1 2 3] (fn [x] (if (odd? x) x NONE)))") == 3
+      assert sp("(doseqres NONE [x [1 2 3]] (if (odd? x) x NONE))") == 3
+      assert sp("(doseqres-fn NONE [1 2 3] (fn [x] (if (odd? x) x NONE)))") == 3
     end
 
     test "an all-NONE reduction stays NONE" do
-      assert sp("(none? (doseqres NONE [2 4] (fn [x] NONE)))") == true
+      assert sp("(none? (doseqres NONE [x [2 4]] NONE))") == true
+      assert sp("(none? (doseqres-fn NONE [2 4] (fn [x] NONE)))") == true
     end
 
     test "a reduced result terminates and propagates" do
       assert sp("""
              (let [seen (volatile! 0)]
-               (doseqres NONE [1 2 3 4 5]
-                 (fn [x] (vswap! seen inc) (if (= x 2) (reduced x) NONE)))
+               (doseqres NONE [x [1 2 3 4 5]]
+                 (vswap! seen inc)
+                 (if (= x 2) (reduced x) NONE))
                @seen)
              """) == 2
+    end
+
+    test "the macro binds its name hygienically" do
+      # The binding must not capture a caller's `x`, and the body must
+      # see the element rather than the surrounding scope's value.
+      assert sp("(let [x :outer] (doseqres NONE [x [1 2 3]] (if (= x 3) x NONE)))") == 3
     end
   end
 
