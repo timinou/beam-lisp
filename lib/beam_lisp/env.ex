@@ -87,24 +87,105 @@ defmodule BeamLisp.Env do
     end
   end
 
+  @doc """
+  Every public var name interned in `ns`.
+
+  Backs `(:require [ns :refer :all])`. Private vars are filtered here
+  rather than at the refer site, so the blanket form can never smuggle
+  in a name that the explicit `:refer […]` form would have refused.
+  """
+  def public_names(ns) do
+    @table
+    |> :ets.match({{ns, :"$1"}, :_})
+    |> List.flatten()
+    |> Enum.reject(fn name -> match?({:ok, %{private: true}}, meta(ns, name)) end)
+  end
+
   @doc "Refer `name` into `ns` so it resolves bare, as if defined there."
   def add_refer(ns, name, source_ns) do
     :ets.insert(@table, {{:refer, ns, name}, source_ns})
     :ok
   end
 
-  defp refer_candidate(ns, name) do
+  @doc """
+  Refer every public var of `source_ns` into `ns`.
+
+  A snapshot taken when the `(ns …)` form runs, exactly as Clojure's
+  `:refer :all` is: vars interned in the source afterwards do not
+  appear. This has to run *after* the require has loaded the source,
+  which is why it is a runtime op rather than a compile-time expansion.
+  """
+  def add_refer_all(ns, source_ns) do
+    for name <- public_names(source_ns), do: add_refer(ns, name, source_ns)
+    :ok
+  end
+
+  @doc """
+  True when `name` is interned in `ns` itself — no refer, alias or
+  core fallback consulted.
+
+  `fetch/2` deliberately searches all of those; a resolver asking "is
+  this name local, or does it belong to somebody else?" needs the
+  narrow question.
+  """
+  def local_var?(ns, name) do
+    :ets.member(@table, {ns, name})
+  end
+
+  @doc """
+  The namespace `name` was referred into `ns` from, or nil.
+
+  Var lookup consults refers automatically; the compile-time resolvers
+  for protocol and multimethod targets have to ask, because they need
+  the owning namespace rather than the value.
+  """
+  def refer_source(ns, name) do
     case :ets.lookup(@table, {:refer, ns, name}) do
-      [{_, source}] -> [{source, name}]
-      [] -> []
+      [{_, source}] -> source
+      [] -> nil
     end
   end
 
-  @doc "True when any var is interned in `ns`."
+  defp refer_candidate(ns, name) do
+    case refer_source(ns, name) do
+      nil -> []
+      source -> [{source, name}]
+    end
+  end
+
+  @doc """
+  Record that `ns` exists, independently of whether anything is
+  interned in it yet.
+
+  A namespace is brought into being by `(ns …)`, not by its first
+  `def`. Inferring existence from "has at least one var" made an empty
+  or not-yet-populated namespace unrequirable, which is the ordinary
+  shape of a file whose forms have not run yet, of a namespace holding
+  only macros, and of any two namespaces that refer to each other.
+  """
+  def declare_ns(ns) when is_binary(ns) do
+    :ets.insert(@table, {{:ns, ns}, true})
+    :ok
+  end
+
+  @doc """
+  True when `ns` has been declared by an `(ns …)` form, or has any var
+  interned in it.
+
+  The second half keeps namespaces created by other routes — `in_ns`,
+  direct `intern`, the prelude's seeding — visible without each having
+  to announce itself.
+  """
   def ns_exists?(ns) do
-    case :ets.match(@table, {{ns, :_}, :_}, 1) do
-      {[_], _} -> true
-      _ -> false
+    case :ets.lookup(@table, {:ns, ns}) do
+      [{_, true}] ->
+        true
+
+      [] ->
+        case :ets.match(@table, {{ns, :_}, :_}, 1) do
+          {[_], _} -> true
+          _ -> false
+        end
     end
   end
 

@@ -314,14 +314,23 @@ defmodule BeamLisp.Compiler do
           end
 
         refer_ops =
-          for sym <- refer_syms do
-            # Clojure refuses to refer a private var (`var: #'a/f is not
-            # public`); mirror that here so a referred name can never
-            # smuggle a private var past the unqualified lookup path.
-            if private_var?(target, sym) do
-              compile_error(env, "var #{target}/#{sym} is not public")
-            else
-              quote do: BeamLisp.Env.add_refer(unquote(name), unquote(sym), unquote(target))
+          if refer_syms == :all do
+            # The blanket form has to wait for runtime: which names
+            # exist is decided by the require emitted just above, and a
+            # compile-time expansion would see the namespace as it was
+            # before its file loaded. Privacy is enforced inside
+            # add_refer_all/2 for the same reason.
+            [quote do: BeamLisp.Env.add_refer_all(unquote(name), unquote(target))]
+          else
+            for sym <- refer_syms do
+              # Clojure refuses to refer a private var (`var: #'a/f is not
+              # public`); mirror that here so a referred name can never
+              # smuggle a private var past the unqualified lookup path.
+              if private_var?(target, sym) do
+                compile_error(env, "var #{target}/#{sym} is not public")
+              else
+                quote do: BeamLisp.Env.add_refer(unquote(name), unquote(sym), unquote(target))
+              end
             end
           end
 
@@ -330,6 +339,11 @@ defmodule BeamLisp.Compiler do
 
     quote do
       ns = unquote(name)
+      # Declare before requiring. A namespace exists from the moment its
+      # (ns …) form runs, not from its first def, so a required file that
+      # circles back to this one finds it already present instead of
+      # searching the disk for a file that is mid-load.
+      BeamLisp.Env.declare_ns(ns)
       BeamLisp.Env.in_ns(ns)
       unquote(Enum.reverse(loads))
       unquote(block(aliases))
@@ -1312,6 +1326,10 @@ defmodule BeamLisp.Compiler do
         {:keyword, "as"}, {_prev, refers} -> {{:expecting, "as"}, refers}
         {:keyword, "refer"}, {as_alias, _prev} -> {as_alias, {:expecting, "refer"}}
         {:symbol, a}, {{:expecting, "as"}, refers} -> {a, refers}
+        # `:refer :all` — the blanket form. Kept as an atom rather than
+        # expanded here: which names exist is only knowable once the
+        # require has actually loaded the target.
+        {:keyword, "all"}, {as_alias, {:expecting, "refer"}} -> {as_alias, :all}
         {:vector, syms}, {as_alias, {:expecting, "refer"}} ->
           {as_alias, Enum.map(syms, fn {:symbol, s} -> s end)}
         other, _acc -> raise "invalid :require spec for #{target}: #{inspect(other)}"
@@ -1468,6 +1486,12 @@ defmodule BeamLisp.Compiler do
     end
   end
 
+  # Where a var visible from `ns` actually lives: `ns` itself when it is
+  # defined there, otherwise whichever namespace referred it in.
+  defp owner_ns(ns, name) do
+    if Env.local_var?(ns, name), do: ns, else: Env.refer_source(ns, name) || ns
+  end
+
   # Special forms and the template's own locals must stay bare: they are not
   # vars and have no namespace to belong to.
   defp special_or_local?(name, env),
@@ -1483,8 +1507,14 @@ defmodule BeamLisp.Compiler do
       # macro name reached the call path as an ordinary var and was invoked as a
       # function. Every vendored jank macro that nests `when`/`let` hit this.
       macro?(name, ns) -> name
-      # A var the writing namespace defines or refers.
-      match?({:ok, _}, Env.fetch(ns, name)) -> ns <> "/" <> name
+      # A var the writing namespace defines or refers. A referred var is
+      # qualified with the namespace that OWNS it, not the one doing the
+      # referring — `p/RichNavigator` referred into `navs` and then
+      # syntax-quoted must expand to `protocols/RichNavigator`, because
+      # that is where the var lives and where the expansion site will
+      # look. Qualifying it to the writer invented a name resolving
+      # nowhere.
+      match?({:ok, _}, Env.fetch(ns, name)) -> owner_ns(ns, name) <> "/" <> name
       # Anything else is a name the template introduces (a `let` binding, a fn
       # parameter, a var defined later). Leave it bare so it resolves at the
       # expansion site, which is what those templates mean.
@@ -2295,11 +2325,29 @@ defmodule BeamLisp.Compiler do
 
   # Resolve a var name (possibly `alias/name` or `ns/name`) to a
   # `{ns, name}` pair for defmethod / protocol targets.
+  #
+  # A bare name is not necessarily local. `(:require [p :refer :all])`
+  # followed by `(extend-type T Shape …)` is the ordinary Clojure
+  # spelling, and assuming `env.ns` there invented a second, empty
+  # protocol under the extending namespace's name — so the extension
+  # registered against a protocol nobody dispatches on, and the call
+  # failed later with "no implementation", far from the cause. A refer
+  # is checked only when the name is not defined locally, so a local
+  # definition still shadows a referred one.
   defp multi_var_target(env, name) do
     case String.split(name, "/", parts: 2) do
-      ["", _rest] -> {env.ns, name}
-      [prefix, var] -> {Env.alias_target(env.ns, prefix) || core_alias(prefix), var}
-      [plain] -> {env.ns, plain}
+      ["", _rest] ->
+        {env.ns, name}
+
+      [prefix, var] ->
+        {Env.alias_target(env.ns, prefix) || core_alias(prefix), var}
+
+      [plain] ->
+        if Env.local_var?(env.ns, plain) do
+          {env.ns, plain}
+        else
+          {Env.refer_source(env.ns, plain) || env.ns, plain}
+        end
     end
   end
 

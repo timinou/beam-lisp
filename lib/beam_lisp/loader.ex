@@ -45,7 +45,7 @@ defmodule BeamLisp.Loader do
 
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
-    if ns == "core" or Env.loaded_ns?(ns) or Env.ns_exists?(ns) do
+    if ns == "core" or Env.loaded_ns?(ns) do
       :ok
     else
       case find_file(ns) do
@@ -75,8 +75,18 @@ defmodule BeamLisp.Loader do
                   "(a same-named file cannot serve another namespace) " <>
                   "(searched: #{inspect(search_dirs())})"
 
+        # No file — but a namespace does not have to come from one. It
+        # may already exist because an earlier form in this same source
+        # declared it, or the REPL built it live. Requiring it is then a
+        # no-op rather than an error: the vars it aliases are already in
+        # the registry. Only a namespace that exists nowhere is a
+        # genuine miss, and that is the one worth a search-path report.
         nil ->
-          raise "namespace not found: #{ns} (searched: #{inspect(search_dirs())})"
+          if Env.ns_exists?(ns) do
+            :ok
+          else
+            raise "namespace not found: #{ns} (searched: #{inspect(search_dirs())})"
+          end
       end
     end
   end
