@@ -1,0 +1,160 @@
+; The navigation algebra: how a path becomes one callable navigator.
+;
+; This is a port of Specter's compiled-path engine, taking the shape of
+; its :bb and :cljs branches rather than its :clj one. The JVM branch
+; uses a type-hinted interface call, a Java MutableCell and eval-based
+; code generation; all three are optimisations with portable
+; equivalents, and ClojureScript --- a shipping target with no JVM, no
+; class generation and no eval --- is the proof that the architecture
+; survives without them. docs/specter-compat.md records the evidence.
+;
+; The whole engine rests on one idea: a navigator is a pair of functions
+; in continuation-passing style. `select*` calls `next-fn` once per
+; subvalue it navigates to; `transform*` calls `next-fn` on each
+; subvalue and rebuilds the structure around the results. Composing two
+; navigators is therefore nesting one's continuation inside the other's
+; --- which is `combine-two-navs`, the ten lines this file exists for.
+;
+; What deliberately is NOT here: the magic-precompilation cache. It is
+; performance-only --- omitting it recomposes a path per call and
+; changes no semantics --- and it carries the one dangerous design
+; question, because "global" on the BEAM is either ETS or per-process
+; and choosing wrongly is a correctness bug rather than a slowdown. It
+; stays unbuilt until something forces the choice.
+
+(ns specter.engine)
+
+; --- the sentinel -----------------------------------------------------
+;
+; NONE means "no value was selected", and it must never be confusable
+; with a value a user's data could legitimately contain. Upstream is
+; `(def NONE ::NONE)` --- a namespaced keyword compared with identical?.
+;
+; This is the one place where the BEAM is STRONGER than the JVM. An
+; Erlang atom is globally interned: two occurrences of the same atom are
+; the same word in memory, whatever code produced them, even across a
+; message send that copies every other term. So identity holds by
+; construction here, where on the JVM it holds only because the keyword
+; cache happens to guarantee it.
+(def NONE :specter.engine/NONE)
+
+(defn none? [x] (identical? x NONE))
+
+; --- the navigator protocol ------------------------------------------
+;
+; Upstream's contract, restated because it is the whole specification:
+;
+;   select* MUST call next-fn on each subvalue. It returns NONE if
+;   next-fn was never called, NONE if every call returned NONE, and
+;   otherwise any non-NONE return value.
+;
+;   transform* MUST use next-fn to transform subvalues and merge the
+;   results back, leaving everything else in the structure unchanged.
+;
+; `vals` is the collected-values accumulator threaded through a
+; traversal; navigators that collect (Specter's `collect-one`, `putval`)
+; push onto it, and the terminal function receives it alongside the
+; final structure.
+(defprotocol RichNavigator
+  (select* [this vals structure next-fn])
+  (transform* [this vals structure next-fn]))
+
+; --- the identity navigator ------------------------------------------
+;
+; STAY* navigates to the structure itself. It is what an empty path
+; composes to, which is why `(select [] x)` yields x rather than an
+; error: navigating nowhere is still navigating.
+(def STAY*
+  (reify RichNavigator
+    (select* [this vals structure next-fn] (next-fn vals structure))
+    (transform* [this vals structure next-fn] (next-fn vals structure))))
+
+; --- coercion ---------------------------------------------------------
+;
+; A path element is not always a navigator. A keyword is a key lookup, a
+; function is a filter, a vector is a sub-path. `implicit-nav` is the
+; extension point: anything that knows how to become a navigator
+; implements it, and everything else must already be one.
+(defprotocol ImplicitNav
+  (implicit-nav [this]))
+
+(defn rich-nav? [n] (satisfies? RichNavigator n))
+
+; Coercing a single object: pass a navigator through, ask a
+; non-navigator to become one, and refuse anything that cannot. The
+; refusal names the value, because "Not a navigator" alone is the least
+; useful message a path error could carry.
+(defn coerce-object [this]
+  (cond
+    (rich-nav? this) this
+    (satisfies? ImplicitNav this) (implicit-nav this)
+    :else (throw (ex-info "Not a navigator"
+                          {:this this :type (type this)}))))
+
+; --- composition ------------------------------------------------------
+;
+; The core of the engine. Two navigators become one by nesting: nav1
+; navigates, and its continuation runs nav2, whose continuation is the
+; original one. Selecting through [ALL :a] therefore means ALL yields
+; each element, and :a runs on each of those --- with next-fn threaded
+; all the way to the terminal function, so a result can short-circuit
+; back out through every layer at once.
+(defn combine-two-navs [nav1 nav2]
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (select* nav1 vals structure
+               (fn [vals-next structure-next]
+                 (select* nav2 vals-next structure-next next-fn))))
+    (transform* [this vals structure next-fn]
+      (transform* nav1 vals structure
+                  (fn [vals-next structure-next]
+                    (transform* nav2 vals-next structure-next next-fn))))))
+
+; `coerce-path` turns any path shape into a navigator. A vector (or a
+; list, since beam-lisp keeps [] and () structurally distinct and a path
+; may be written either way) is a sequence of steps to compose;
+; everything else is a single element.
+(defn coerce-path [p]
+  (if (or (vector? p) (list? p))
+    (do-comp-paths p)
+    (coerce-object p)))
+
+; Composing a sequence of path elements. An empty path is STAY*, a
+; single element is itself, and the general case folds composition
+; across the coerced elements --- left to right, so the leftmost
+; navigator is the outermost, which is what reading a path aloud
+; suggests it should mean.
+(defn do-comp-paths [navigators]
+  (let [coerced (map coerce-path navigators)]
+    (cond
+      (empty? coerced) STAY*
+      (= 1 (count coerced)) (first coerced)
+      :else (reduce combine-two-navs coerced))))
+
+; `comp-paths*` is the entry point: a navigator is already compiled, and
+; anything else is a path to compose. Everything in the execution layer
+; starts by calling this.
+(defn comp-paths* [p]
+  (if (rich-nav? p) p (coerce-path p)))
+
+; --- traversal --------------------------------------------------------
+;
+; Running a compiled navigator over a structure, with a terminal
+; function called on each navigated value. This is where `vals` is
+; consumed: the terminal function receives the bare structure when
+; nothing was collected, and a vector of collected values plus the
+; structure when something was.
+;
+; The `identical?` check on an empty vals is upstream's, and it matters:
+; a genuinely empty collection of collected values must not be confused
+; with "there were none", because a navigator may legitimately collect
+; nothing on one branch and something on another.
+(defn compiled-traverse-with-vals* [path result-fn vals structure]
+  (select* path vals structure
+           (fn [vals structure]
+             (if (= vals [])
+               (result-fn structure)
+               (result-fn (conj vals structure))))))
+
+(defn compiled-traverse* [path result-fn structure]
+  (compiled-traverse-with-vals* path result-fn [] structure))

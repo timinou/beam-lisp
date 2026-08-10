@@ -1379,6 +1379,15 @@ defmodule BeamLisp.RT do
   def println, do: IO.puts("")
   def println(x), do: IO.puts(print_str(x))
 
+  # Clojure's println is variadic and space-separates its arguments, so
+  # `(println "count:" n)` reads the way it looks. Without it every
+  # caller reaches for `(println (str "count: " n))`, which is the same
+  # thing said less well --- and an example full of that spelling reads
+  # like a workaround for a missing arity, because it is one.
+  def println_multi(x, rest_list) when is_list(rest_list) do
+    IO.puts(Enum.map_join([x | rest_list], " ", &print_str/1))
+  end
+
   # The reader-macro table: dispatch-char → wrapper symbol name.
   # Lives in the vars ETS table (same registry as vars); the reader
   # consults it for `@`, core.bl registers the mapping, users may
@@ -1501,7 +1510,7 @@ defmodule BeamLisp.RT do
       "apply" => multi_fn(%{2 => &apply_to/2}, {2, &apply_variadic/3}),
       "next" => &next/1,
       "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
-      "println" => multi_fn(%{0 => &println/0, 1 => &println/1}),
+      "println" => multi_fn(%{0 => &println/0, 1 => &println/1}, {1, &println_multi/2}),
       "pr-str" => &print_str/1,
       # Clojure's `print-str` returns the printed representation (like
       # pr-str, minus readably-quoted strings); both share the one printer.

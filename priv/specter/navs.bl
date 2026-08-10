@@ -1,0 +1,176 @@
+; The navigators: the things a path is made of.
+;
+; specter/engine.bl composes navigators and specter/exec.bl runs them;
+; this file supplies enough of them to be useful and to prove the
+; engine. Each is a `reify` over RichNavigator, which is all a navigator
+; ever is --- Specter's own `defnav` macro exists to write exactly this
+; shape with less ceremony.
+;
+; The contract each one must honour, restated because every navigator
+; below is an instance of it:
+;
+;   select* calls next-fn once per subvalue it navigates to, and returns
+;   NONE when it navigated to none;
+;
+;   transform* calls next-fn on each subvalue and rebuilds the structure
+;   around the results, leaving everything it did not navigate to
+;   exactly as it found it.
+;
+; That second clause is the one that takes care. A transform that
+; rebuilds a map by iterating its keys will silently reorder it, and on
+; the BEAM will silently change a vector into a list; the tests hold
+; both of those.
+
+(ns specter.navs
+  (:require [specter.engine :refer :all]
+            [specter.exec :refer :all]))
+
+; `specter.navs` is the ONE namespace a user requires. The three-file
+; split is for readers of this code, not for callers of it, so the
+; handful of names a caller legitimately needs are re-exported here
+; rather than making them require the internals to spell a path.
+;
+; A refer does not transit: names referred INTO this namespace are not
+; referred on to namespaces that refer this one. Binding them locally
+; is what carries them across, and it is deliberate that the list is
+; short --- everything else in engine.bl and exec.bl stays internal.
+; NB: a PROTOCOL is not a value and cannot be re-exported this way ---
+; `RichNavigator` names an entry in the protocol registry, not a var,
+; so a caller implementing one requires specter.engine directly. Only
+; ordinary vars appear below.
+(def NONE NONE)
+(def none? none?)
+(def rich-nav? rich-nav?)
+(def doseqres doseqres)
+(def srange-transform* srange-transform*)
+
+; --- ALL --------------------------------------------------------------
+;
+; Every element of a sequential collection, or every entry of a map.
+;
+; `select*` folds with doseqres so that a branch selecting nothing does
+; not clobber a sibling, and so a `reduced` from downstream terminates
+; the whole walk --- that is what makes select-any over ALL cheap.
+;
+; `transform*` maps and rebuilds, preserving the collection's own shape.
+; A vector must come back a vector: beam-lisp keeps [] and ()
+; structurally distinct, so returning a list here would be a silent type
+; change rather than a cosmetic one.
+(def ALL
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (doseqres NONE (seq structure) (fn [e] (next-fn vals e))))
+    (transform* [this vals structure next-fn]
+      (let [xf (fn [e] (next-fn vals e))]
+        (cond
+          (vector? structure) (vec (map xf structure))
+          (map? structure) (into {} (map (fn [kv]
+                                           (let [r (xf kv)]
+                                             [(first r) (second r)]))
+                                         (seq structure)))
+          (set? structure) (set (map xf (seq structure)))
+          :else (map xf structure))))))
+
+; --- keypath ----------------------------------------------------------
+;
+; One key of an associative structure. Navigating to a missing key
+; yields nil rather than failing, which is what makes `[:a :b]` usable
+; against data that may not have got there yet.
+;
+; Setting a value to NONE REMOVES the key --- upstream's contract, and
+; the reason the sentinel has to be a value the engine can recognise
+; coming back out of a user's transform function.
+(defn keypath* [key]
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (next-fn vals (get structure key)))
+    (transform* [this vals structure next-fn]
+      (let [newv (next-fn vals (get structure key))]
+        (if (none? newv)
+          (dissoc structure key)
+          (assoc structure key newv))))))
+
+; `must` differs from keypath in navigating to nothing when the key is
+; absent, rather than to nil. The distinction matters for select: a
+; missing key should contribute no result, not a nil one.
+(defn must* [key]
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (if (contains? structure key)
+        (next-fn vals (get structure key))
+        NONE))
+    (transform* [this vals structure next-fn]
+      (if (contains? structure key)
+        (let [newv (next-fn vals (get structure key))]
+          (if (none? newv)
+            (dissoc structure key)
+            (assoc structure key newv)))
+        structure))))
+
+; --- filtering --------------------------------------------------------
+;
+; `pred*` navigates to the structure itself when a predicate holds, and
+; nowhere otherwise. Composed after ALL it is a filter; composed alone
+; it is a guard.
+;
+; Its transform leaves a non-matching structure untouched, which is what
+; makes `(transform [ALL (pred odd?)] inc coll)` change only the odd
+; elements rather than dropping the even ones.
+(defn pred* [afn]
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (if (afn structure) (next-fn vals structure) NONE))
+    (transform* [this vals structure next-fn]
+      (if (afn structure) (next-fn vals structure) structure))))
+
+; --- indexed ----------------------------------------------------------
+;
+; `srange*` navigates to a subrange as one value, so a transform
+; receives the slice and returns its replacement. Splicing is delegated
+; to srange-transform*, which is where the vector/list distinction is
+; kept honest.
+(defn srange* [start end]
+  (reify RichNavigator
+    (select* [this vals structure next-fn]
+      (next-fn vals (subvec (vec structure) start end)))
+    (transform* [this vals structure next-fn]
+      (srange-transform* structure start end
+                         (fn [slice] (next-fn vals slice))))))
+
+; --- implicit coercion ------------------------------------------------
+;
+; What lets a path be written `[:a :b]` instead of
+; `[(keypath* :a) (keypath* :b)]`. A keyword, string or number in a path
+; is a key lookup; a function is a filter. This is the extension point
+; the engine's `coerce-object` consults, and extending it is how a user
+; adds their own shorthand.
+(extend-protocol ImplicitNav
+  :keyword (implicit-nav [this] (keypath* this))
+  :binary (implicit-nav [this] (keypath* this))
+  :integer (implicit-nav [this] (keypath* this))
+  :fn (implicit-nav [this] (pred* this)))
+
+; --- the user-facing entry points -------------------------------------
+;
+; Thin wrappers over the execution layer that compile the path first.
+; Upstream makes these macros so a statically-known path can be compiled
+; once at the call site and cached; that cache is deliberately not built
+; here (see specter/engine.bl), so these are ordinary functions and a
+; path is composed per call.
+(defn select [path structure]
+  (compiled-select* (comp-paths* path) structure))
+
+(defn select-any [path structure]
+  (compiled-select-any* (comp-paths* path) structure))
+
+(defn select-first [path structure]
+  (compiled-select-first* (comp-paths* path) structure))
+
+(defn selected-any? [path structure]
+  (compiled-selected-any? (comp-paths* path) structure))
+
+(defn transform [path transform-fn structure]
+  (compiled-transform* (comp-paths* path) transform-fn structure))
+
+(defn setval [path val structure]
+  (compiled-setval* (comp-paths* path) val structure))
