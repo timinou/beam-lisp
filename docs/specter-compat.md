@@ -405,3 +405,136 @@ non-vendored upstream dependency, or correct-by-construction. Adding
 language features will not move this number further; see FUP-001, which
 exists to decide whether implementing Specter's engine is worth doing at
 all.
+
+## FUP-001 — the engine spike, and its recommendation
+
+FUP-001 was filed during wave 27 and deliberately held BLOCKED. Its question:
+Specter's remaining distance is its own *compiled-path engine* — should
+beam-lisp **implement** it faithfully, **approximate** it behind the same
+user-facing API, or **decline** and record Specter as measured-and-bounded?
+
+It was gated because this project had already been burned by ranking a feature
+without checking the wall in front of it: `reify` was predicted to unlock six
+navigator slices, was built, and unlocked zero. A spike into an *engine* on the
+same reasoning would be that mistake with a much larger budget.
+
+**Recommendation: implement — scoped to the engine core, and explicitly not to
+the JVM fast paths.**
+
+### Where the wall actually is
+
+The full canonical stack loads, and then every entry point dies in the same
+place:
+
+```
+ALL                     → {:bl_reify, #Reference<…>}   ← navigators CONSTRUCT
+(select [:a] {:a 1})    → undefined var: com.rpl.specter/path
+(transform [:a] inc …)  → undefined var: com.rpl.specter/path
+(setval [:a] 9 {:a 1})  → undefined var: com.rpl.specter.impl/compiled-setval*
+```
+
+That is one wall, not a diffuse absence. Navigator *construction* works;
+navigator *execution* has no engine to run on. Across all 31 fixtures only
+**11 distinct internals** are referenced, and `NONE` is 6 of the uses.
+
+### The four assumptions the spike was filed on — all four refuted
+
+FUP-001 listed the host capabilities the engine was *presumed* to need. Reading
+upstream refutes each one. This is the substance of the recommendation.
+
+| Presumed blocker | What the source says | Verdict |
+|---|---|---|
+| `i/NONE` needs object identity | `(def NONE ::NONE)` — a namespaced keyword (`impl.cljc:24`) | **Safer here.** A BEAM atom is globally interned, so `identical?` holds by construction |
+| `MutableCell` is a Java class | It is; but the `:bb` branch is `(MutableCell. (volatile! v))` (`impl.cljc:231-238`) | beam-lisp already has `volatile!` |
+| Runtime codegen (`eval+`) is intrinsic | `:clj`-only. The `:cljs` branch uses late-resolution closures instead (`impl.cljc:939-945`) | Not required |
+| `.select*` direct dispatch | Three branches; `:bb`/`:cljs` use a plain protocol call (`impl.cljc:101-128`) | A speed hint, not semantics |
+
+No `definterface`, `proxy`, or `gen-class` anywhere in the source. `:inline`
+appears only in comments and one TODO.
+
+**ClojureScript is the proof.** Specter already runs on a host with no JVM, no
+class generation and no `eval`. That branch is the closest available analogue
+to the BEAM, and it is a supported, shipping target — not a degraded mode.
+
+### What the engine IS
+
+Continuation-passing over a two-method protocol. `combine-two-navs` nests
+continuations so that `[ALL :a]` becomes a navigator whose `select*` invokes
+`ALL` with a continuation that invokes `:a` on each yielded subvalue
+(`impl.cljc:185-196`). Closures and protocols. The BEAM has both.
+
+Measured size: the engine core (`impl.cljc` 282-441 — traverse, select,
+transform) is **~138 non-blank lines**. The `path` macro and entry points are
+another ~138. `magic-precompilation` and the dynamic-path layer are a further
+~131, and are separable — see the staging below.
+
+### Host capability probe
+
+Every primitive the engine needs, checked by running it rather than assuming:
+
+| Requirement | Probe | Result |
+|---|---|---|
+| Sentinel with stable identity | `(identical? :x/NONE :x/NONE)` | ✓ true |
+| CPS nesting | 3-deep `next-fn` chain | ✓ |
+| Closure capture of `vals` | ✓ | ✓ |
+| Early termination | `reduced` / `unreduced` / short-circuiting `reduce` | ✓ |
+| Within-call mutable cell | `volatile!` / `vreset!` / `@` | ✓ |
+| Protocol dispatch on a `reify` | navigator roundtrip | ✓ |
+
+Genuinely missing, and small: **`keyword`, `namespace`, `satisfies?`**, and
+`extend-protocol` against primitive type tags.
+
+### Why not the other two routes
+
+**Approximate — rejected, and the reason is the trap FUP-001 itself named.**
+A beam-lisp-native engine behind `select`/`transform`/`setval` would give a
+working Specter-shaped API and *barely move the measurement*, because **15 of
+the 31 fixtures call `i/` internals directly**. It would also buy something
+this project already ships: `priv/optics.bl` provides lenses and traversals
+natively. Paying an engine's cost for an API we have, while the number stays
+put, is the worst of the three.
+
+**Decline — defensible, but on a premise now known to be false.** The case for
+declining was "this is JVM-intrinsic machinery, a port project in its own
+right." Every specific instance of that claim is refuted above. Declining would
+mean stopping in front of ~140 lines of CPS on a host that has each primitive
+it needs.
+
+### Staging, and the two real risks
+
+Order matters, because the last third of the engine is where the `:clj`/`:cljs`
+branches diverge most — which is exactly where a prediction is most likely to
+be wrong.
+
+1. **Prims** — `keyword`, `namespace`, `satisfies?`, `extend-protocol` on
+   primitive tags. Independently useful; unblocks everything below.
+2. **Engine core** — `NONE`, `comp-paths*`/`do-comp-paths`/`combine-two-navs`,
+   `compiled-traverse*`, `compiled-select*`/`-any*`, `compiled-transform*`,
+   `compiled-setval*`, `srange-transform*`, `doseqres`. Port the `:bb`/`:cljs`
+   shape throughout.
+3. **Re-measure, then decide about the dynamic-path layer.** Do not plan step 3
+   in detail before step 2's number is in hand.
+
+**Skip `magic-precompilation`'s caching at first.** It is explicitly
+*performance-only*: omitting it recomposes the path per call and changes no
+semantics. That also defers the single most dangerous design question —
+
+- **Cache lifetime.** Specter's cache is a var-interned mutable cell. "Global"
+  on the BEAM is either ETS or per-process, and choosing wrongly is a
+  *correctness* bug, not a slowdown. Not building the cache avoids the question
+  until there is a reason to answer it.
+- **Erlang term order.** Map iteration order differs from Clojure's. It does
+  not affect the navigation algebra, but it will affect assertions over
+  map-valued results, and tests must state contracts (roundtrip, agreement with
+  `seq`) rather than literal orders — the same discipline `keys`/`vals` already
+  follow.
+
+### What this buys beyond the number
+
+The honest answer FUP-001 demanded. Every prior measurement surfaced a class of
+latent bug, and the engine exercises paths nothing else does: deep continuation
+nesting, a sentinel threaded through every return, and early termination across
+composed protocol calls. On present form that finds compiler bugs. If it does
+not, the fallback position is still an improvement — Specter stops being
+"bounded by someone else's internals" and becomes bounded by a number we chose
+not to chase.
