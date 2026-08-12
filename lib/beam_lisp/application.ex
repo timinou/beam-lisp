@@ -21,8 +21,12 @@ defmodule BeamLisp.Application do
   # mix run --no-halt), never for one-shot CLI tasks — a
   # `mix beam_lisp.run file.bl` or `mix run -e …` must not fight a
   # running playground for port 9837.
+  # The DevServer module only exists when compiled in beam-lisp's own :dev
+  # (lib/dev is excluded from other elixirc_paths, so dependents never see it);
+  # Mix itself may be absent on embedded runtimes (Mob deploys app beams only).
   defp dev_server? do
-    Mix.env() == :dev and not cli_task?()
+    Code.ensure_loaded?(BeamLisp.DevServer) and Code.ensure_loaded?(Mix) and
+      Mix.env() == :dev and not cli_task?()
   end
 
   defp cli_task? do
