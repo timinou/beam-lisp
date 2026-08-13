@@ -1577,6 +1577,10 @@ defmodule BeamLisp.RT do
       "swap!" => multi_fn(%{2 => &BeamLisp.Refs.swap!/2}, {2, &BeamLisp.Refs.swap!/3}),
       "reset!" => &BeamLisp.Refs.reset!/2,
       "compare-and-set!" => &BeamLisp.Refs.compare_and_set!/3,
+      # Clojure names these without the bang; keep the Clojure spelling so
+      # `(add-watch a :k f)` reads the same here as it does there.
+      "add-watch" => &BeamLisp.Refs.add_watch!/3,
+      "remove-watch" => &BeamLisp.Refs.remove_watch!/2,
       "promise" => &BeamLisp.Refs.promise/0,
       "deliver" => &BeamLisp.Refs.deliver/2,
       "future?" => &BeamLisp.Refs.future?/1,
@@ -1827,6 +1831,8 @@ defmodule BeamLisp.RT do
       "swap!" => {BeamLisp.Refs, %{2 => :swap!}, {2, :swap!}},
       "reset!" => {BeamLisp.Refs, %{2 => :reset!}, nil},
       "compare-and-set!" => {BeamLisp.Refs, %{3 => :compare_and_set!}, nil},
+      "add-watch" => {BeamLisp.Refs, %{3 => :add_watch!}, nil},
+      "remove-watch" => {BeamLisp.Refs, %{2 => :remove_watch!}, nil},
       "promise" => {BeamLisp.Refs, %{0 => :promise}, nil},
       "deliver" => {BeamLisp.Refs, %{2 => :deliver}, nil},
       "future?" => {BeamLisp.Refs, %{1 => :future?}, nil},

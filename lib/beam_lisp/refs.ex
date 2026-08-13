@@ -92,19 +92,90 @@ defmodule BeamLisp.Refs do
   # serializes swaps — `{new, new}` stores the new value and returns
   # it to the caller.
   def swap!(%BeamLisp.Atom{} = atom, f, args_list) do
-    Agent.get_and_update(atom.pid, fn current ->
-      new = BeamLisp.RT.invoke(f, [current | args_list])
-      {new, new}
-    end)
+    # Return BOTH values so watches can be told what changed; the swap itself is
+    # unchanged (still one serialized get_and_update inside the Agent).
+    {old, new} =
+      Agent.get_and_update(atom.pid, fn current ->
+        new = BeamLisp.RT.invoke(f, [current | args_list])
+        {{current, new}, new}
+      end)
+
+    notify_watches(atom, old, new)
+    new
   end
 
   def swap!(other, _f, _args_list) do
     raise ArgumentError, message: "swap!: not a reference: #{inspect(other)}"
   end
 
-  def reset!(%BeamLisp.Atom{} = atom, v), do: Agent.get_and_update(atom.pid, fn _ -> {v, v} end)
+  def reset!(%BeamLisp.Atom{} = atom, v) do
+    old = Agent.get_and_update(atom.pid, fn current -> {current, v} end)
+    notify_watches(atom, old, v)
+    v
+  end
 
   def reset!(other, _v), do: raise(ArgumentError, "reset!: not an atom: #{inspect(other)}")
+
+  # --- watches (PLAN-148 W6a) ---
+  #
+  # Clojure's `add-watch` / `remove-watch`, which beam-lisp did not have: atoms
+  # supported deref/swap!/reset!/compare-and-set! but nothing could OBSERVE a
+  # change. That gap is what stands between an atom and an automatic connector
+  # (`st/connect!`), where an ordinary `swap!` must drive a UI.
+  #
+  # The watch table lives in the AGENT's process dictionary, not in the Agent's
+  # state. The state stays exactly the bare value, so `deref` and every existing
+  # operation are untouched and no stored atom changes shape.
+  #
+  # Watches fire in the CALLER's process, after the swap has committed — as in
+  # Clojure. Running them inside the Agent would block it, and a watch that
+  # touched its own atom would deadlock.
+
+  @watch_key {BeamLisp.Atom, :watches}
+
+  @doc "Register `f` under `key`; it is called `(f key ref old new)` on change."
+  def add_watch!(%BeamLisp.Atom{} = atom, key, f) do
+    Agent.update(atom.pid, fn state ->
+      watches = Process.get(@watch_key, %{})
+      Process.put(@watch_key, Map.put(watches, key, f))
+      state
+    end)
+
+    atom
+  end
+
+  def add_watch!(other, _key, _f) do
+    raise ArgumentError, message: "add-watch!: not an atom: #{inspect(other)}"
+  end
+
+  @doc "Remove the watch registered under `key`."
+  def remove_watch!(%BeamLisp.Atom{} = atom, key) do
+    Agent.update(atom.pid, fn state ->
+      watches = Process.get(@watch_key, %{})
+      Process.put(@watch_key, Map.delete(watches, key))
+      state
+    end)
+
+    atom
+  end
+
+  def remove_watch!(other, _key) do
+    raise ArgumentError, message: "remove-watch!: not an atom: #{inspect(other)}"
+  end
+
+  defp notify_watches(%BeamLisp.Atom{} = atom, old, new) do
+    # A no-op change still notifies, matching Clojure: the watch decides what
+    # counts as a change, not the atom.
+    case Agent.get(atom.pid, fn _ -> Process.get(@watch_key, %{}) end) do
+      watches when map_size(watches) == 0 ->
+        :ok
+
+      watches ->
+        Enum.each(watches, fn {key, f} ->
+          BeamLisp.RT.invoke(f, [key, atom, old, new])
+        end)
+    end
+  end
 
   # Clojure's `=` is beam-lisp's `==`; match that.
   def compare_and_set!(%BeamLisp.Atom{} = atom, old, new) do
