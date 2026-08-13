@@ -21,7 +21,14 @@ defmodule BeamLisp.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      # :inets/:ssl are the AGENT cluster's transport. Without them declared,
+      # Mix leaves them off the code path entirely -- `:code.lib_dir(:inets)`
+      # returns {:error, :bad_name}, and `:inets.start()` succeeds anyway
+      # because it only starts what it can find. The failure then surfaces
+      # LATER and misleadingly, as `:http_util.timestamp/0 is undefined`,
+      # which reads like a broken OTP install rather than a missing dep.
+      # (Recorded in PLAN-017 as "the :httpc-under-mix open question".)
+      extra_applications: [:logger, :inets, :ssl, :crypto],
       mod: {BeamLisp.Application, []}
     ]
   end
