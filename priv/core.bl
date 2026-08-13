@@ -1032,3 +1032,280 @@
      (map? m) (Map/delete m k)
      :else m))
   ([m k & ks] (reduce (fn [acc x] (dissoc acc x)) (dissoc m k) ks)))
+
+;; ============================================================================
+;; Nested access, higher-order composition, and the string namespace.
+;;
+;; These are core Clojure vocabulary that beam-lisp was missing. Audited by
+;; probing the live runtime (see PLAN-021): of 66 everyday fns, 22 were absent
+;; — get-in/assoc-in/update-in/update, mapv/filterv, group-by/sort-by/remove,
+;; comp/partial/constantly/juxt, letfn, and the whole `str` surface.
+;;
+;; Written HERE, in beam-lisp, rather than as rt.ex primitives: each one is a
+;; few lines over existing primitives, and a core written in the language is
+;; the flagship argument for the language. Anything genuinely hot can move to
+;; rt.ex later WITHOUT changing these contracts.
+;; ============================================================================
+
+(defn to-list
+  "A plain Erlang list from any beam-lisp collection: vector, list, lazy seq,
+   set, or nil. The normalizing step every Elixir `Enum/*` call needs, since
+   Enum does not know BeamLisp.Vector.
+
+   Exists in `optics` too (deliberately duplicated there so that namespace
+   stays standalone); this is the core copy every other fn uses."
+  [c]
+  (cond
+    (nil? c) (list)
+    (vector? c) (BeamLisp.Vector/to_list c)
+    (set? c) (Enum/to_list c)
+    (BeamLisp.LazySeq/lazy? c) (Enum/to_list (doall c))
+    (map? c) (Enum/to_list c)
+    :else c))
+
+;; ── nested access ───────────────────────────────────────────────────────────
+;; The `not-found` arities matter: `(get-in m ks)` returning nil is ambiguous
+;; between "absent" and "present but nil", and callers that need to tell the
+;; difference otherwise reach for `contains?` at every level.
+
+(defn get-in
+  "The value at path `ks` in a nested associative structure, or `not-found`
+   (default nil) when any level is absent. An empty path returns `m` itself."
+  ([m ks] (get-in m ks nil))
+  ([m ks not-found]
+   (loop [cur m
+          path (seq ks)]
+     (cond
+       (nil? path) cur
+       (nil? cur) not-found
+       :else
+       (let [k (first path)]
+         (if (contains? cur k)
+           (recur (get cur k) (next path))
+           not-found))))))
+
+(defn assoc-in
+  "Associate `v` at path `ks`, creating intermediate MAPS as needed.
+   `(assoc-in {} [:a :b] 1)` → `{:a {:b 1}}`."
+  [m ks v]
+  (let [k (first ks)
+        rest-ks (next ks)]
+    (if (nil? rest-ks)
+      (assoc m k v)
+      (assoc m k (assoc-in (get m k {}) rest-ks v)))))
+
+(defn update
+  "Apply `f` to the value at key `k`, with any extra args. The key may be
+   absent: `f` then receives nil, as in Clojure."
+  ([m k f] (assoc m k (f (get m k))))
+  ([m k f a] (assoc m k (f (get m k) a)))
+  ([m k f a b] (assoc m k (f (get m k) a b)))
+  ([m k f a b & more] (assoc m k (apply f (get m k) a b more))))
+
+(defn update-in
+  "Apply `f` to the value at path `ks`, creating intermediate maps as needed."
+  ([m ks f]
+   (let [k (first ks) rest-ks (next ks)]
+     (if (nil? rest-ks)
+       (assoc m k (f (get m k)))
+       (assoc m k (update-in (get m k {}) rest-ks f)))))
+  ([m ks f & args]
+   (update-in m ks (fn [x] (apply f x args)))))
+
+;; ── eager collection variants ───────────────────────────────────────────────
+;; map/filter are LAZY here (wave 10). `mapv`/`filterv` force to a vector,
+;; which is what you want when the result is about to be indexed or counted.
+
+(defn mapv
+  "Like `map`, but returns a VECTOR (eager)."
+  ([f coll] (vec (map f coll)))
+  ([f c1 c2] (vec (map f c1 c2))))
+
+(defn filterv
+  "Like `filter`, but returns a VECTOR (eager)."
+  [pred coll]
+  (vec (filter pred coll)))
+
+(defn remove
+  "The complement of `filter`: elements for which `(pred x)` is falsey."
+  [pred coll]
+  (filter (fn [x] (not (pred x))) coll))
+
+(defn group-by
+  "A map of `(f x)` → vector of the x's yielding it. Insertion order within
+   each group is preserved."
+  [f coll]
+  (reduce (fn [acc x]
+            (let [k (f x)]
+              (assoc acc k (conj (get acc k []) x))))
+          {}
+          coll))
+
+(defn sort-by
+  "A sorted SEQUENCE of `coll`, ordered by `(keyfn item)`. The 3-arity takes a
+   comparator `(cmp a b)` over the KEYS returning a NEGATIVE number, zero, or
+   a positive number — the three-way shape `sort` and `compare` use, NOT a
+   boolean predicate. Passing `<` here silently mis-sorts: `sort` tests the
+   result with `<= 0`, and `true` fails that, so every pair compares as
+   greater-than and the input comes back in an arbitrary order (observed).
+
+   Built on `sort` rather than on `Enum/sort_by` so the return type is a plain
+   list, matching both `sort` and Clojure. Returning a vector here broke two
+   tests that pin jank's own vendored `sort-by` (`test/fixtures/jank/`), which
+   delegates to `sort` and is byte-for-byte upstream: the fixture is the
+   SPECIFICATION, so core bends to it, never the reverse."
+  ([keyfn coll] (sort-by keyfn compare coll))
+  ([keyfn cmp coll]
+   (sort (fn [x y] (cmp (keyfn x) (keyfn y))) coll)))
+
+;; ── function composition ────────────────────────────────────────────────────
+
+(defn comp
+  "Compose fns right-to-left: `((comp f g) x)` = `(f (g x))`.
+   Zero args yields `identity`, matching Clojure."
+  ([] identity)
+  ([f] f)
+  ([f g] (fn [& args] (f (apply g args))))
+  ([f g h] (fn [& args] (f (g (apply h args)))))
+  ([f g h & fs]
+   (let [all (concat (list f g h) fs)]
+     (fn [& args]
+       (let [rf (reverse all)]
+         (reduce (fn [acc fun] (fun acc))
+                 (apply (first rf) args)
+                 (rest rf)))))))
+
+(defn partial
+  "Partially apply `f` to the leading `args`."
+  ([f] f)
+  ([f a] (fn [& more] (apply f a more)))
+  ([f a b] (fn [& more] (apply f a b more)))
+  ([f a b c] (fn [& more] (apply f a b c more)))
+  ([f a b c & more] (fn [& later] (apply f (concat (list a b c) more later)))))
+
+(defn constantly
+  "A fn of any arity that always returns `x`."
+  [x]
+  (fn [& _] x))
+
+(defn juxt
+  "A fn returning a VECTOR of each supplied fn applied to the args:
+   `((juxt a b) x)` → `[(a x) (b x)]`."
+  ([f] (fn [& args] [(apply f args)]))
+  ([f g] (fn [& args] [(apply f args) (apply g args)]))
+  ([f g h] (fn [& args] [(apply f args) (apply g args) (apply h args)]))
+  ([f g h & fs]
+   (let [all (concat (list f g h) fs)]
+     (fn [& args] (vec (map (fn [fun] (apply fun args)) all))))))
+
+;; ── strings ─────────────────────────────────────────────────────────────────
+;; Named without a `str/` prefix because beam-lisp has no namespace aliasing
+;; for core; these live alongside `str` itself. Every one delegates to Elixir's
+;; String module, so they are GRAPHEME-correct — the same property that made
+;; spell.ui's editing honest where the jank original counted codepoints.
+
+(defn join
+  "Join `coll` into a string. The 1-arity concatenates; the 2-arity puts
+   `sep` between elements. Arg order is Clojure's (sep first), NOT Elixir's."
+  ([coll] (Enum/join (to-list coll) ""))
+  ([sep coll] (Enum/join (to-list coll) sep)))
+
+(defn split
+  "Split `s` on `re-or-str`, returning a vector of parts."
+  [s sep]
+  (vec (String/split s sep)))
+
+(defn trim
+  "Trim leading and trailing whitespace."
+  [s]
+  (String/trim s))
+
+(defn triml [s] (String/trim_leading s))
+(defn trimr [s] (String/trim_trailing s))
+
+(defn starts-with?
+  "Does `s` begin with `prefix`?"
+  [s prefix]
+  (String/starts_with? s prefix))
+
+(defn ends-with?
+  "Does `s` end with `suffix`?"
+  [s suffix]
+  (String/ends_with? s suffix))
+
+(defn includes?
+  "Does `s` contain `sub`?"
+  [s sub]
+  (String/contains? s sub))
+
+(defn upper-case [s] (String/upcase s))
+(defn lower-case [s] (String/downcase s))
+
+(defn blank?
+  "True for nil, \"\", or a string of only whitespace. The check a form
+   validator actually wants — `(empty? \"  \")` is false and misleads."
+  [s]
+  (cond
+    (nil? s) true
+    (not (string? s)) false
+    :else (= "" (String/trim s))))
+
+(defn replace-str
+  "Replace EVERY occurrence of `match` in `s` with `replacement`.
+   Named `replace-str` because Clojure's `replace` is the collection fn."
+  [s match replacement]
+  (String/replace s match replacement))
+
+;; ── hashing ─────────────────────────────────────────────────────────────────
+
+(defn sha256-hex
+  "Lowercase hex SHA-256 of a string. The stable identity used for contract
+   fingerprints, so it must agree byte-for-byte with other runtimes' SHA-256."
+  [s]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 s))))
+
+(defmacro letfn
+  "Bind local functions, MUTUALLY RECURSIVE, then evaluate body:
+
+     (letfn [(even2? [n] (if (= n 0) true  (odd2? (dec n))))
+             (odd2?  [n] (if (= n 0) false (even2? (dec n))))]
+       (even2? 10))
+
+   Why not `let` + `fn`: a `let` binding cannot see its own name, let alone a
+   sibling declared later, so a recursive local written with `let` fails with
+   an unbound-var error at call time. Each fn is therefore bound to a
+   placeholder first and REBOUND to a closure that resolves its siblings
+   through the same scope — the standard letrec construction.
+
+   Implemented with an atom holding the function table: every body resolves a
+   sibling by NAME at call time, so declaration order does not matter and a
+   cycle of any length works."
+  [bindings & body]
+  (assert-macro-args
+    (vector? bindings) "a vector of (name [args] body) forms")
+  (let [specs (map (fn [spec]
+                     {:name (first spec)
+                      :argv (second spec)
+                      :body (rest (rest spec))})
+                   bindings)
+        tbl (gensym "letfn-tbl")]
+    `(let [~tbl (atom {})]
+       ;; each entry closes over the TABLE, not over its siblings directly,
+       ;; so a call resolves the current definition of any sibling.
+       ~@(map (fn [s]
+                `(swap! ~tbl assoc
+                        ~(keyword (str (get s :name)))
+                        (fn ~(get s :argv)
+                          ;; rebind every sibling name inside the body
+                          (let [~@(mapcat (fn [o]
+                                            [(get o :name)
+                                             `(get (deref ~tbl)
+                                                   ~(keyword (str (get o :name))))])
+                                          specs)]
+                            ~@(get s :body)))))
+              specs)
+       (let [~@(mapcat (fn [s]
+                         [(get s :name)
+                          `(get (deref ~tbl) ~(keyword (str (get s :name))))])
+                       specs)]
+         ~@body))))
