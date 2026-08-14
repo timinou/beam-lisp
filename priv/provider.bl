@@ -1,0 +1,244 @@
+; priv/provider.bl — the AGENT cluster: the LLM call, bounded.
+;
+; One provider is a map of {:base-url :model :key}, so switching models is DATA,
+; not a code path. The call itself is deliberately small: build a request, send
+; it, decode the reply. Everything that can hang or crash is somebody else's
+; problem — specifically `spell.fence`'s, which runs the call in an unlinked,
+; monitored process with a deadline.
+;
+; ── why the call is not made here directly ───────────────────────────────────
+;
+; A provider is the least trustworthy thing in the system: it is a network call
+; to a machine we do not control, with no upper bound on how long it can take to
+; not answer. Calling it inline means a slow provider wedges the LiveView that
+; called it. `fence` makes the failure local: the callee owns its heap, a
+; timeout kills it outright, and the caller gets `{:timeout ms}` like any other
+; value.
+;
+; ── streaming ────────────────────────────────────────────────────────────────
+;
+; The chat UI wants tokens as they arrive, not one block at the end. The
+; provider therefore has two entry points with the same shape:
+;
+;   ask     — one request, one reply. Used for tests and for the fallback path.
+;   stream  — one request, many `[:delta id chunk]` messages to a target pid,
+;             then `[:done id]` or `[:failed id reason]`.
+;
+; Both are ordinary sends, which is why the LiveView needs no special mechanism:
+; a streamed token arrives as a message like anything else on the BEAM.
+
+(ns provider)
+
+;; ── configuration ───────────────────────────────────────────────────────────
+
+(defn from-env
+  "A provider config from the environment.
+
+   Kimi's base path is `/coding/v1`, NOT `/v1` — `api.kimi.com/v1/*` returns an
+   nginx 404 while `/coding/v1/models` returns 200, and Moonshot's endpoints
+   reject the same key with 401. Verified 2026-08-13.
+
+   NB it is a REASONING model: completion tokens go to `reasoning_content`
+   BEFORE any `content`. A small `max_tokens` returns finish_reason=length with
+   an EMPTY content string, which reads as a broken provider when it is only a
+   small budget. Hence the generous default below."
+  []
+  {:base-url (or (System/get_env "KIMI_BASE_URL") "https://api.kimi.com/coding/v1")
+   :model (or (System/get_env "KIMI_MODEL") "k3-256k")
+   :key (System/get_env "KIMI_API_KEY")
+   :max-tokens 1024})
+
+(defn configured?
+  "Is there a key to call with? Checked explicitly so a missing credential is a
+   clear message rather than a 401 from the far side."
+  [cfg]
+  (let [k (get cfg :key)]
+    (and (not (nil? k)) (not (= "" k)))))
+
+;; ── request ─────────────────────────────────────────────────────────────────
+
+(defn- json-escape [s]
+  (-> (str s)
+      (replace-str "\\" "\\\\")
+      (replace-str "\"" "\\\"")
+      (replace-str "\n" "\\n")
+      (replace-str "\r" "\\r")
+      (replace-str "\t" "\\t")))
+
+(defn- message-json [m]
+  (str "{\"role\":\"" (get m :role) "\",\"content\":\""
+       (json-escape (get m :content)) "\"}"))
+
+(defn request-body
+  "The chat-completions payload. `messages` is a vector of
+   {:role \"user\"|\"assistant\" :content \"…\"}."
+  [cfg messages stream?]
+  (str "{\"model\":\"" (get cfg :model) "\""
+       ",\"messages\":[" (join "," (map message-json messages)) "]"
+       ",\"max_tokens\":" (get cfg :max-tokens 1024)
+       ",\"stream\":" (if stream? "true" "false")
+       "}"))
+
+;; ── the call ────────────────────────────────────────────────────────────────
+
+(defn- headers
+  "httpc wants a LIST OF TUPLES of charlists. A list of vectors type-checks in
+   beam-lisp and then dies inside `:httpc.header_parse/1`, which is a confusing
+   place to learn about a shape mismatch."
+  [cfg]
+  (list (tuple (String/to_charlist "authorization")
+               (String/to_charlist (str "Bearer " (get cfg :key))))))
+
+(defn ask
+  "One request, one reply. Returns {:ok text} | {:error reason}.
+
+   Call this THROUGH `fence`: it performs a network request with no bound of its
+   own beyond httpc's timeout, and a provider that accepts a connection then
+   stalls is the failure this system must survive."
+  [cfg messages]
+  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
+        body (request-body cfg messages false)
+        req (tuple url
+                   (headers cfg)
+                   (String/to_charlist "application/json")
+                   body)
+        opts (list (tuple :timeout 120000))
+        ;; `httpc/request`, NOT `:httpc/request`: the leading colon makes the
+        ;; reader see a keyword, and the call then resolves as a map lookup.
+        resp (httpc/request :post req opts (list))]
+    (decode-response resp)))
+
+(defn- decode-response [resp]
+  (cond
+    (and (tuple? resp) (= :ok (elem resp 0)))
+    (let [r (elem resp 1)
+          status (elem (elem r 0) 1)
+          payload (elem r 2)]
+      (if (= 200 status)
+        {:ok (extract-content (to-string payload))}
+        {:error {:status status :body (to-string payload)}}))
+
+    :else
+    {:error {:transport resp}}))
+
+(defn- to-string [charlist]
+  (if (string? charlist) charlist (List/to_string charlist)))
+
+(defn extract-content
+  "The assistant text from a chat-completions response.
+
+   Deliberately a targeted scan rather than a JSON parse: the only field this
+   needs is `content`, and a full parser is a dependency plus a surface for a
+   malformed-response crash. A response whose shape changes yields nil here,
+   which the caller reports \u2014 rather than an exception mid-stream."
+  [json]
+  (let [marker "\"content\":\""
+        i (index-of json marker)]
+    (if (nil? i)
+      nil
+      (let [after (subs json (+ i (count marker)))]
+        (unescape-json (take-until-unescaped-quote after))))))
+
+(defn- take-until-unescaped-quote
+  "The run up to the first UNESCAPED quote. A naive split on `\\\"` truncates any
+   answer containing a quotation mark \u2014 common in prose, so worth the loop."
+  [s]
+  (loop [i 0
+         out ""]
+    (if (>= i (count s))
+      out
+      (let [c (subs s i (+ i 1))]
+        (cond
+          (= c "\\") (recur (+ i 2) (str out c (subs s (+ i 1) (+ i 2))))
+          (= c "\"") out
+          :else (recur (+ i 1) (str out c)))))))
+
+(defn- unescape-json [s]
+  (-> s
+      (replace-str "\\n" "\n")
+      (replace-str "\\r" "\r")
+      (replace-str "\\t" "\t")
+      (replace-str "\\\"" "\"")
+      (replace-str "\\\\" "\\")))
+
+;; ── streaming ───────────────────────────────────────────────────────────────
+
+(defn parse-sse-deltas
+  "Content deltas from an SSE body, in order.
+
+   Each event is a `data: {json}` line; `data: [DONE]` terminates. Only
+   `content` deltas are collected \u2014 `reasoning_content` is the model thinking
+   aloud and is NOT the answer, so streaming it to the page would show the user
+   working notes as if they were the reply."
+  [body]
+  (let [lines (split body "\n")]
+    (filterv (fn [x] (not (nil? x)))
+             (mapv (fn [line]
+                     (let [l (trim line)]
+                       (if (and (starts-with? l "data: ")
+                                (not (= l "data: [DONE]")))
+                         (delta-content (subs l 6))
+                         nil)))
+                   lines))))
+
+(defn- delta-content
+  "The `content` field of one SSE delta, or nil when the delta carries only
+   reasoning or a role marker."
+  [json]
+  (let [marker "\"content\":\""
+        i (index-of json marker)]
+    (if (nil? i)
+      nil
+      (let [after (subs json (+ i (count marker)))
+            text (unescape-json (take-until-unescaped-quote after))]
+        (if (= "" text) nil text)))))
+
+(defn stream
+  "Stream a completion to `target`, one message per token.
+
+     [:delta id chunk]  … many
+     [:done id]         … on success
+     [:failed id why]   … on any failure
+
+   Sends rather than returns, because that is what makes streaming free on this
+   runtime: the LiveView receives a token the same way it receives any other
+   message, so there is no second transport to build.
+
+   Spawned UNLINKED by the caller (see `stream-async`), so a provider that dies
+   mid-answer cannot take the page with it."
+  [cfg messages target id]
+  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
+        body (request-body cfg messages true)
+        req (tuple url
+                   (headers cfg)
+                   (String/to_charlist "application/json")
+                   body)
+        opts (list (tuple :timeout 120000))
+        resp (httpc/request :post req opts (list))]
+    (cond
+      (and (tuple? resp) (= :ok (elem resp 0)))
+      (let [r (elem resp 1)
+            status (elem (elem r 0) 1)
+            payload (to-string (elem r 2))]
+        (if (= 200 status)
+          (do
+            ;; Deltas are sent in order, then a single :done. The page appends
+            ;; each one; nothing needs to know the total length in advance.
+            (doseq [d (parse-sse-deltas payload)]
+              (erlang/send target (tuple :delta id d)))
+            (erlang/send target (tuple :done id)))
+          (erlang/send target (tuple :failed id (str "HTTP " status)))))
+
+      :else
+      (erlang/send target (tuple :failed id (str "transport: " (pr-str resp)))))
+    :sent))
+
+(defn stream-async
+  "Spawn `stream` in an UNLINKED process and return its pid.
+
+   Unlinked deliberately: a linked provider process that crashes takes its
+   caller down, which for a LiveView means every connected user loses the page
+   because one answer failed. The same reasoning as `fence`'s spawn+monitor,
+   and the same lesson learned the hard way there."
+  [cfg messages target id]
+  (erlang/spawn (fn [] (stream cfg messages target id))))
