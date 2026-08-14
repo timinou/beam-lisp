@@ -361,6 +361,29 @@ defmodule BeamLisp.RT do
   def nth(%LazySeq{} = _l, _i), do: nil
 
   @doc """
+  Clojure's 3-arity `nth`: the element at `i`, or `not_found` when the index is
+  out of range.
+
+  Without it, reading an OPTIONAL trailing element means pre-checking `count`
+  at every call site — and forgetting the check yields `nil`, which is
+  indistinguishable from an element that is legitimately nil. The explicit
+  default is what lets a caller tell "absent" from "present and nil", the same
+  reason `get`/`get-in` carry one.
+  """
+  def nth(coll, i, not_found) do
+    case nth(coll, i) do
+      nil -> if within?(coll, i), do: nil, else: not_found
+      v -> v
+    end
+  end
+
+  # A nil result is ambiguous, so the bounds are checked rather than assumed:
+  # a present-but-nil element must return nil, not the default.
+  defp within?(nil, _i), do: false
+  defp within?(coll, i) when is_integer(i) and i >= 0, do: i < count(coll)
+  defp within?(_coll, _i), do: false
+
+  @doc """
   Lenient tail access for sequential destructuring: nil-safe. Keeps
   Elixir `(coll, n)` argument order because the compiler's destructuring
   calls `BeamLisp.RT.drop/2` directly.
@@ -1503,7 +1526,7 @@ defmodule BeamLisp.RT do
       "cons" => &cons/2,
       "conj" => multi_fn(%{1 => &conj/1, 2 => &conj/2}),
       "count" => &count/1,
-      "nth" => &nth/2,
+      "nth" => multi_fn(%{2 => &nth/2, 3 => &nth/3}),
       "empty?" => &empty?/1,
       "get" => multi_fn(%{2 => &get/2, 3 => &get/3}),
       "assoc" => multi_fn(%{3 => &assoc/3}, {3, &assoc_variadic/4}),
@@ -1801,6 +1824,11 @@ defmodule BeamLisp.RT do
     # 2-arg call misses the old 3-arity link) and keeps the 3-arity fast
     # path. `drop` is Clojure-ordered (`(drop n coll)`) via `drop_clj`.
     Env.put_link("core", "get", {BeamLisp.RT, %{2 => :get, 3 => :get}, nil})
+
+    # `nth` links both arities: the 3-arity carries Clojure's `not-found`, which
+    # is what lets a caller distinguish an out-of-range index from an element
+    # that is legitimately nil.
+    Env.put_link("core", "nth", {BeamLisp.RT, %{2 => :nth, 3 => :nth}, nil})
     Env.put_link("core", "drop", {BeamLisp.RT, %{2 => :drop_clj}, nil})
 
     # `map` links its fixed 2-arity to the chunked lazy path and routes 3+

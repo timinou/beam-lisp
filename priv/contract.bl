@@ -1,0 +1,213 @@
+; priv/contract.bl — `defcontract`: one term, two runtimes.
+;
+; A contract declares the SEAM between a server half (BEAM) and a client half
+; (a Spacetime page). Both halves are emitted from this one term, so they cannot
+; disagree — the check that verse performs at build time (E0928) becomes a
+; tautology rather than a net that might catch drift.
+;
+; ── the surface ──────────────────────────────────────────────────────────────
+;
+;   (defcontract counter-live
+;     {:bundle "/spacetime/counter/spacetime.js" :root ".counter"}
+;
+;     (assign @count :integer 0)
+;     (push   @flash {:message :string :kind :atom})
+;
+;     (on :inc
+;       (set! @count (inc @count))
+;       (ok @count))
+;
+;     (on :dec
+;       (if (zero? @count)
+;         (err "Count cannot go below zero")
+;         (do (set! @count (dec @count))
+;             (ok @count)))))
+;
+; `@name` marks a binding that CROSSES THE SEAM. How it resolves is this file's
+; problem, never the author's: on the BEAM it reads `socket.assigns.name`, in
+; Spacetime it is the `$name` signal. A page-local binding is simply one that is
+; NOT declared here — the definition of "shared", not a separate annotation.
+;
+; `(ok …)` / `(err …)` are the correlated one-shot reply, kept DISTINCT from the
+; broadcast assign diff that `set!` implies. Collapsing them would repeat
+; BUG-091 in verse, where merging `:` and `<-` silently rerouted a reactive
+; binding between style.setProperty and setAttribute — two routes that look
+; alike and are not.
+;
+; ── why the handler body is data ─────────────────────────────────────────────
+;
+; FUP-143 (verse) records a hole that cannot be closed from Elixir: reply tags
+; live in handler bodies and can be runtime values, so `@on_definition` cannot
+; enumerate them. Here the body is a quoted form, so `seam/reply-tags` walks it.
+; That is the whole reason the source of truth moves up a level.
+
+(ns contract)
+
+;; ── parsing the surface into a term ─────────────────────────────────────────
+;; Each clause is a plain list; we read its head. Unknown heads FAIL rather than
+;; being ignored, because a silently-dropped clause is a seam hole that no later
+;; check can see.
+
+(defn- binding-name
+  "The name a clause declares. Accepts `@count` (which reads as `(deref count)`)
+   or a bare `count`, so the author may write either and the emitter does not
+   care which the reader produced."
+  [form]
+  (cond
+    ; `@count` → (deref count)
+    (and (seq? form) (= (first form) (quote deref)))
+    (name (second form))
+
+    (symbol? form) (name form)
+    (keyword? form) (name form)
+    (string? form) form
+    :else (throw (ex-info "contract: cannot read a binding name" {:form form}))))
+
+(defn- parse-clause [acc clause]
+  (let [head (first clause)]
+    (cond
+      (= head (quote assign))
+      ;; (assign @count :integer 0)
+      (let [nm (binding-name (second clause))
+            ty (nth clause 2 :any)
+            init (nth clause 3 nil)]
+        (assoc-in acc [:assigns (keyword nm)] {:type ty :initial init}))
+
+      (= head (quote push))
+      ;; (push @flash {:message :string})
+      (let [nm (binding-name (second clause))
+            fields (nth clause 2 {})]
+        (assoc-in acc [:pushes (keyword nm)] {:fields fields}))
+
+      (= head (quote on))
+      ;; (on :inc body…)
+      (let [ev (keyword (binding-name (second clause)))
+            body (rest (rest clause))]
+        (assoc-in acc [:events ev]
+                  {:body (if (= 1 (count body))
+                           (first body)
+                           (cons (quote do) body))}))
+
+      (= head (quote on-info))
+      ;; (on-info [:delta id chunk] body…) — a server-internal message, NOT part
+      ;; of the page-facing surface, so it is kept separately and excluded from
+      ;; the fingerprint.
+      (let [pattern (second clause)
+            body (rest (rest clause))]
+        (update acc :infos
+                (fn [v] (conj (or v [])
+                              {:pattern pattern
+                               :body (if (= 1 (count body))
+                                       (first body)
+                                       (cons (quote do) body))}))))
+
+      :else
+      (throw (ex-info "contract: unknown clause" {:head head :clause clause})))))
+
+(defn parse
+  "Read a contract's clauses into a term. `opts` is the {:bundle :root} map."
+  [nm opts clauses]
+  (reduce parse-clause
+          {:name nm :opts opts :events {} :assigns {} :pushes {} :infos []}
+          clauses))
+
+;; ── the BEAM half ───────────────────────────────────────────────────────────
+
+(defn module-name
+  "The Elixir module a contract emits, e.g. counter-live → CounterLive.
+   Matches the `SpacetimeLvWeb.<Name>Live` convention already in the repo."
+  [c prefix]
+  (str prefix "."
+       (join "" (map (fn [part]
+                       (str (upper-case (subs part 0 1)) (subs part 1)))
+                     (split (name (get c :name)) "-")))))
+
+;; ── contract.json ───────────────────────────────────────────────────────────
+;; This is the interop surface: verse's src/analysis/liveview_contract.rs reads
+;; it, and the fingerprint must agree BYTE FOR BYTE with what the Elixir DSL
+;; produces, or the two toolchains silently disagree about identity.
+;;
+;; Two things are load-bearing and easy to get wrong:
+;;   1. entries are sorted BY NAME (contract_entries/2 does `Enum.sort_by(&.name)`)
+;;   2. a metadata field is OMITTED when empty, not emitted as {} or ""
+;; Both are pinned by tests against the real CounterLive fingerprint.
+
+(defn- json-escape [s]
+  (-> s
+      (replace-str "\\" "\\\\")
+      (replace-str "\"" "\\\"")
+      (replace-str "\n" "\\n")))
+
+(defn- json-str [s] (str "\"" (json-escape (str s)) "\""))
+
+(defn- json-fields
+  "A fields map as JSON, keys sorted — Jason encodes an Elixir map in the erlang
+   term order of its keys, which for these small atom-keyed maps is
+   alphabetical. Sorting explicitly makes that a property rather than a
+   coincidence of map size.
+
+   NB the sort is over the KEYS THEMSELVES, not over their printed names: a
+   first version sorted `(map name (keys m))` and then looked the value up with
+   the resulting STRING, which missed every keyword key and emitted
+   `{\"kind\":\"\",\"message\":\"\"}` — structurally perfect JSON with every value
+   silently blank, and a fingerprint that differed from Elixir's."
+  [m]
+  (str "{"
+       (join ","
+             (map (fn [k] (str (json-str (name k)) ":" (json-str (name (get m k)))))
+                  (sort-by name (keys m))))
+       "}"))
+
+(defn- json-entry
+  "One contract entry. `meta-key` is :fields or :type; omitted when empty."
+  [nm meta meta-key]
+  (cond
+    (nil? meta) (str "{\"name\":" (json-str nm) "}")
+
+    (= meta-key :type)
+    (if (or (nil? meta) (= "" (str meta)))
+      (str "{\"name\":" (json-str nm) "}")
+      (str "{\"name\":" (json-str nm) ",\"type\":" (json-str (name meta)) "}"))
+
+    :else
+    (if (empty? meta)
+      (str "{\"name\":" (json-str nm) "}")
+      (str "{\"name\":" (json-str nm) ",\"fields\":" (json-fields meta) "}"))))
+
+(defn- json-array [entries] (str "[" (join "," entries) "]"))
+
+(defn contract-json
+  "The contract as JSON, in the EXACT key order Jason produces for the Elixir
+   DSL's map — module, events, assigns, pushes. Key order changes the bytes and
+   therefore the fingerprint, so it is fixed here rather than derived."
+  [c module]
+  (let [ev (map (fn [k] (json-entry (name k) nil :fields))
+                (sort-by name (keys (get c :events))))
+        as (map (fn [k] (json-entry (name k)
+                                    (get-in c [:assigns k :type])
+                                    :type))
+                (sort-by name (keys (get c :assigns))))
+        pu (map (fn [k] (json-entry (name k)
+                                    (get-in c [:pushes k :fields])
+                                    :fields))
+                (sort-by name (keys (get c :pushes))))]
+    (str "{\"module\":" (json-str module)
+         ",\"events\":" (json-array ev)
+         ",\"assigns\":" (json-array as)
+         ",\"pushes\":" (json-array pu)
+         "}")))
+
+(defn fingerprint
+  "SHA-256 of the contract JSON — the same bytes, hashed the same way, as
+   `Spacetime.LiveView.__before_compile__`. Byte equality with the Elixir DSL is
+   the acceptance test for this whole emitter."
+  [c module]
+  (sha256-hex (contract-json c module)))
+
+(defn contract-json-with-fingerprint
+  "The sidecar file's content: the contract plus its fingerprint."
+  [c module]
+  (let [bare (contract-json c module)
+        fp (sha256-hex bare)]
+    (str (subs bare 0 (- (count bare) 1))
+         ",\"fingerprint\":" (json-str fp) "}")))
