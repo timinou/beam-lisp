@@ -101,4 +101,29 @@ if [ "$SIZE" -lt 6000 ]; then
   exit 1
 fi
 
+# Byte size is a floor, not a check. The host skeleton alone — an input, a
+# button, a background — comfortably clears 6000B, so a page whose bundle bound
+# NOTHING still produces a plausible-looking image. That was a review finding,
+# and it is the same failure mode as the blank screenshot one layer up: the
+# evidence looks like evidence.
+#
+# So ask the DOM. `SHOT_REQUIRE` names a selector that must exist in the
+# rendered page; if the renderer never produced it, the screenshot is a picture
+# of the skeleton and this exits non-zero.
+if [ -n "${SHOT_REQUIRE:-}" ]; then
+  DOM="$WORK/dom.html"
+  "$CHROME" --headless \
+    --disable-gpu \
+    --no-sandbox \
+    --virtual-time-budget=6000 \
+    --dump-dom \
+    "http://127.0.0.1:$PORT/index.html" > "$DOM" 2>/dev/null
+
+  if ! grep -qF -- "$SHOT_REQUIRE" "$DOM"; then
+    echo "shot: the rendered DOM has no '$SHOT_REQUIRE' — the page did not render" >&2
+    exit 1
+  fi
+  echo "shot: verified '$SHOT_REQUIRE' is in the rendered DOM"
+fi
+
 echo "shot: $OUT (${SIZE}B, ${WIDTH}x${HEIGHT}@2x)"
