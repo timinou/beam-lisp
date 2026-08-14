@@ -115,54 +115,152 @@ defmodule LiveChat do
                             m.selector.clone().unwrap_or_else(|| "(file)".into()));
                     }
                 }
-                Err(e) => println!("  {label}: REJECTED — {e}"),
+                Err(e) => {
+                    println!("  {label}: REJECTED — {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }
     """
 
     File.write!("#{@verse}/src/bin/livecheck.rs", src)
-    {out, _} = System.cmd("cargo", ~w(run --quiet --bin livecheck), cd: @verse, stderr_to_stdout: false)
+
+    {out, status} =
+      System.cmd("cargo", ~w(run --quiet --bin livecheck), cd: @verse, stderr_to_stdout: false)
+
     IO.write(out)
     File.rm("#{@verse}/src/bin/livecheck.rs")
+
+    # A validation step that prints REJECTED and carries on is not validation,
+    # it is narration. The reviewer's word for it was fair: the loop reported
+    # five green steps whether or not step four agreed.
+    #
+    # Now a rejected document stops the run, so the LOAD banner below can only
+    # be reached by documents verse actually accepted.
+    if status != 0 do
+      raise """
+      verse rejected an emitted document.
+
+      The loop stops here: rendering a page from a document the compiler
+      refused would produce a screenshot that proves nothing.
+      """
+    end
   end
 
-  # ── render ───────────────────────────────────────────────────────────────
+  # ── render ─────────────────────────────────────────────────────────────
+  #
+  # The page rendered here is built from the EMITTED, VALIDATED documents — the
+  # same `(chat/page-document)` and `(chat/view-page)` that step three produced
+  # and step four checked.
+  #
+  # This used to hand-write its own `@template &bubble` and its own `@each`, so
+  # the screenshot at the end of a five-step loop was a picture of a page the
+  # loop had not produced. A reviewer put it plainly: the steps were real but
+  # disconnected. Emitting a document, validating it, then rendering something
+  # else proves each step in isolation and the seam not at all.
+  #
+  # The model's reply now enters as DATA — the assign a LiveView would push —
+  # while every template, style rule and binding comes from the term.
   defp render(question, reply) do
-    esc = fn s -> s |> String.replace("\\", "\\\\") |> String.replace(~s("), ~s(\\")) end
+    seam = print_st("#{@out}/page.edn")
+    view = print_st("#{@out}/view.edn")
 
     st = """
-    /* Rendered live. The model's reply below came from Kimi k3-256k
-       over HTTPS, streamed token by token, at #{DateTime.utc_now() |> DateTime.to_string()}. */
+    /* Rendered live. The model's reply came from Kimi k3-256k over HTTPS,
+       streamed token by token, at #{DateTime.utc_now() |> DateTime.to_string()}.
+
+       The reply is DATA. Everything between the markers is emitter output,
+       printed from the documents step four validated. */
     @import "stdlib/macros/data-kind"
     @import "stdlib/macros/each"
+    @import "stdlib/macros/on"
+    @import "stdlib/macros/host"
+    @import "stdlib/macros/handle"
 
-    @data inline $messages : [
-      { role: "user",  text: "#{esc.(question)}" },
-      { role: "model", text: "#{esc.(reply)}" }
-    ];
+    @host $chat : live("SpacetimeLvWeb.ChatLive")
+
     @data inline $draft : "";
 
-    @template &bubble($m) {
-      <article class="bubble" data-role="`$m.role`">
-        <p class="bubble__text">`$m.text`</p>
-      </article>
-    }
-
-    .log { @each($messages as $m) { &bubble($m); } }
-    .composer__input { value <- $draft; @on &.input { $draft <- $.value; } }
+    /* ── emitted: the seam (defcontract) ───────────────────────────── */
+    #{seam}
+    /* ── emitted: the view (defview) ─────────────────────────────── */
+    #{view}
 
     #{File.read!("docs/proof/chat.st") |> String.split("body {") |> List.last() |> then(&("body {" <> &1))}
     """
 
     File.write!("#{@out}/live.st", st)
 
+    # `$messages` is a SUBSCRIPTION in the emitted seam: it initialises to null
+    # and waits for the server. Declaring it inline here would declare the same
+    # binding twice and the subscription's null would win — a page that compiles
+    # perfectly and renders an empty log. So the transcript arrives the way the
+    # bridge delivers it: a write to `window.SpacetimeLocal`.
+    seed =
+      JSON.encode!([
+        %{"role" => "user", "text" => question},
+        %{"role" => "model", "text" => reply}
+      ])
+
+    File.write!("#{@out}/live.host.html", """
+    <!doctype html>
+    <html><head><meta charset="utf-8"><link rel="stylesheet" href="spacetime.css"></head>
+    <body>
+      <main class="chat">
+        <div class="log" data-log></div>
+        <form class="composer" onsubmit="return false">
+          <input class="composer__input" placeholder="Say something…">
+          <button class="composer__send" type="button">Send</button>
+        </form>
+      </main>
+      <script src="spacetime.js"></script>
+      <script>
+        (function () {
+          var seed = #{seed};
+          function push() {
+            if (!window.SpacetimeLocal) return false;
+            window.SpacetimeLocal["messages"] = seed;
+            document.dispatchEvent(new CustomEvent("local:messages:updated", { detail: seed }));
+            return true;
+          }
+          if (!push()) {
+            var t = setInterval(function () { if (push()) clearInterval(t); }, 10);
+            setTimeout(function () { clearInterval(t); }, 4000);
+          }
+        })();
+      </script>
+    </body></html>
+    """)
+
     {out, code} =
-      System.cmd("bash", ["scripts/shot.sh", "#{@out}/live.st", "docs/proof/chat-live.png", "960", "620"],
-        stderr_to_stdout: true)
+      System.cmd(
+        "bash",
+        ["scripts/shot.sh", "#{@out}/live.st", "docs/proof/chat-live.png", "960", "620"],
+        env: [
+          {"HOST_HTML", Path.expand("#{@out}/live.host.html")},
+          # The image must show the transcript, not the empty skeleton. Byte
+          # size cannot tell those apart; the DOM can.
+          {"SHOT_REQUIRE", ~s(data-role="model")}
+        ],
+        stderr_to_stdout: true
+      )
 
     IO.write("  " <> out)
-    if code != 0, do: IO.puts("  (render failed)")
+
+    if code != 0 do
+      raise "the live render failed — refusing to leave a stale screenshot in place"
+    end
+  end
+
+  # An emitted EDN document as `.st`, via verse's own printer.
+  defp print_st(path) do
+    {out, 0} =
+      System.cmd("cargo", ["run", "--quiet", "--bin", "spacetime", "--", "st", Path.expand(path)],
+        cd: @verse
+      )
+
+    String.trim(out)
   end
 
   # ── helpers ──────────────────────────────────────────────────────────────
