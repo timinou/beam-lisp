@@ -387,16 +387,36 @@ to the contract. Nothing yet asks it to propose one.
 
 #number("test suites")[#raw(
 "beam-lisp:  10 .bl suites, 256 tests / 822 assertions — 0 failures
-beam-lisp:  990 Elixir tests — 0 failures
+beam-lisp:  990 Elixir tests — 0 failures in 37 of 38 runs (see below)
 verse:      3214 lib tests — 0 failures
 verse:      corpus gate green (403 files, 1491/1491 forms print)
 verse:      match-count drift 19 -> 15, ratchet lowered to match")]
 
-Three reviewer swarms ran over the diffs at milestones. All three returned
-findings; all findings are fixed and pinned as tests. The most valuable were the
-ones that proved a green test suite was measuring the wrong thing — including
-the third swarm, which read this document against the code and found its
-screenshots showing a page the emitter never produced.
+One `mix test` run out of thirty-eight reported a single failure, and the
+command that caught it piped through `tail`, so the name of the failing test was
+discarded before it was written down. It has not reproduced: not across seeds,
+not in the exact command sequence that produced it, not in twelve runs of the
+four timing-sensitive suites, not in twelve of the three that shell out to the
+compiler. The one run that failed was the one competing with a 3214-test Rust
+suite for every core, which points at a sleep-based assertion losing a race under
+load — but that is a hypothesis, not a finding, and it is recorded as PLAN-022
+rather than rounded down to green.
+
+A suite that passes 37 times out of 38 is not a suite that passes. The honest
+number is the one with the denominator.
+
+Four reviewer swarms ran over the diffs — three at milestones, and a fourth over
+the fixes the third produced. All four returned findings; all findings are fixed
+and pinned as tests. The most valuable were the ones that proved a green test
+suite was measuring the wrong thing — including the third swarm, which read this
+document against the code and found its screenshots showing a page the emitter
+never produced.
+
+The fourth swarm is the one worth arguing for. It reviewed only the repairs, and
+found four more defects: one that a repair had introduced, one the third swarm's
+repair had missed, and a screenshot race it called theoretical that failed for
+real on the very next capture. A fix is new code and deserves the scrutiny of
+new code; the instinct to trust it because it is a fix is exactly backwards.
 
 #question[
   What this does NOT yet show: the loop rewriting its own contract. Every step of
