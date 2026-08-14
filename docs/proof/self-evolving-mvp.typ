@@ -148,39 +148,50 @@ The same term emits the page, and verse's own reader accepts it:
 
 #ran("… # EMIT, then VALIDATE through verse's reader")[#raw(
 "  page.edn  1041 bytes
-  view.edn  2645 bytes
+  view.edn  2967 bytes
 
   page: ACCEPTED — 4 forms, 0 scopes (0 templates)
-  view: ACCEPTED — 3 forms, 12 scopes (3 templates)
-      each @ .log
-      on   @ .composer__input
-      on   @ .composer__send")]
+  view: ACCEPTED — 6 forms, 12 scopes (3 templates)
+      template @ (file)
+      template @ (file)
+      template @ (file)
+      each     @ .log
+      on       @ .composer__input
+      on       @ .composer__send")]
 
-Every form carries its selector: the log renders the transcript, the input writes
-the draft, the button fires `send`.
+Every bind carries its selector: the log renders the transcript, the input writes
+the draft, the button fires `send`. The three bare `template` forms are the
+declarations — they were missing until this session, and their absence is one of
+the defects below.
 
 = It renders
 
 #shot("chat.png")[
   The chat, rendered from the EMITTED documents. `scripts/render_emitted.exs`
   prints `(chat/page-document)` and `(chat/view-page)` through `spacetime st`
-  and pastes both verbatim into a page — 967 of its 3162 bytes are emitter
-  output, delimited by markers so the boundary is visible in the source. The
-  rest is the conversation a LiveView would push, plus presentation.
+  and pastes both verbatim between markers: 967 of the compiled page's 3162
+  bytes are emitter output, the rest presentation.
+
+  The DOM skeleton is the emitted `&shell`, lifted out of that same text rather
+  than copied — so a change to the template changes this picture. The
+  conversation is supplied separately, as the assign a LiveView would push.
 
   Right-aligned user bubbles, left-aligned model bubbles, composer with input
-  and Send. `shot.sh` was run with `SHOT_REQUIRE='data-role="user"'`, so this
-  image exists only because that attribute was found in the rendered DOM.
+  and Send. Captured with `SHOT_REQUIRE='data-role="user"'`, which is checked
+  against the rendered DOM BEFORE the shutter — so the image and the assertion
+  are the same page load.
 ]
 
 #shot("chat-thinking.png")[
-  The thinking state. The indicator is the emitted `&thinking` template, lifted
-  out of the printed document by the capture script rather than written again
-  — if the template changes, this picture changes with it.
+  The thinking state, and an honest limit. The indicator IS the emitted
+  `&thinking` template, lifted out of the printed document rather than written
+  again — change the template and this picture changes.
 
-  `@status` drives it in the running app; a static capture has no status to
-  react to, so the markup is placed directly. Verified with
-  `SHOT_REQUIRE='class="thinking"'`.
+  But nothing yet BINDS it. The contract sets `@status` to `:thinking` and back,
+  and the view declares the template and its style; what is missing is the bind
+  that renders one when the other says so. So this is a template preview, not a
+  state the running page reaches on its own. Said plainly because a reviewer had
+  to point it out.
 ]
 
 = It runs
@@ -194,21 +205,26 @@ Chrome.
     a runtime check?
 
 A compiler-checked contract catches violations before the code ever
-runs—shifting bugs from production surprises to build-time errors,
-with zero runtime cost.
+runs—at zero runtime cost and with guaranteed coverage of every call
+site—while a runtime check only fires if execution happens to hit it.
 
-  28 deltas in 37287ms")]
+  38 deltas in 10665ms")]
 
 #shot("chat-live.png")[
-  That reply, rendered. The text came from Kimi k3-256k, streamed token by token
-  over HTTPS, and was compiled to the page shown here.
+  That reply, in the page. The text above came from Kimi k3-256k, streamed token
+  by token over HTTPS, and reached this render as an ASSIGN — written through
+  `window.SpacetimeLocal`, the same channel the LiveView bridge uses to push a
+  changed assign to a running page.
 
-  Stated precisely, because the distinction matters: `live_chat.exs` runs all
-  five steps and each one does real work against a real system — but the model's
-  reply is not what the EMIT step emits. The documents are emitted from the term
-  and validated by verse; the reply is composed into a page beside them. The
-  loop is proven step by step, not yet threaded end to end through a single
-  value. See #emph[Where it stands].
+  Everything else is the emitted view: the `&bubble` template that shapes each
+  turn, the `@each` that walks the transcript, the `&shell` this mounts onto,
+  the binds on the composer. Those documents were emitted from the term and
+  validated by verse before this page was built — the render step now refuses to
+  run if validation rejects.
+
+  Stated precisely, because the distinction is the whole point: the reply is
+  DATA flowing through the seam, not a change to the contract that describes it.
+  See #emph[Where it stands].
 ]
 
 = What running it found
@@ -309,6 +325,27 @@ exists in this form.
   why `shot.sh` now takes `SHOT_REQUIRE` and fails when the selector is absent.
 ]
 
+#caught("The fixes needed reviewing too")[
+  A fourth swarm read the fixes rather than the original claims, and found four
+  more:
+
+  The attribute-quoting rule asked "does the text before the hole end with
+  `=`?" — true of `<p>x={@m.v}</p>` too, which rendered visible quote marks.
+  It now also asks whether that `=` is inside a tag.
+
+  `shot.sh` took the screenshot and THEN launched a second Chrome to check the
+  DOM — two loads that can disagree. It flaked on the very next run: the picture
+  was empty, the check was green. The check now runs first, polls, and gates the
+  shutter.
+
+  The VALIDATE gate rejected malformed documents but accepted `{:st/forms []}`,
+  which parses to nothing at all.
+
+  And the host page still hand-copied the `&shell` markup the view emits — the
+  original mockup failure, surviving in the one plane nobody had checked. Both
+  capture scripts now lift the shell out of the emitted text.
+]
+
 #idea(title: "The pattern")[
   Each of these passed every test that existed. Not because the tests were
   careless, but because each measured a property adjacent to the one that
@@ -334,21 +371,22 @@ exists in this form.
     text(8.5pt, weight: 600, tracking: 0.6pt)[#h(0.4em)],
 
     [read], [contract as data; reply tags enumerated from the term], yes,
-    [reason], [Kimi k3-256k, 28 streamed deltas, 37s], yes,
+    [reason], [Kimi k3-256k, 38 streamed deltas, 10.7s], yes,
     [emit], [page 1041 B, view 2967 B, from one term], yes,
-    [validate], [verse accepts both; E0928 rejects a missing arm], yes,
-    [load], [compiled and rendered in headless Chrome, DOM-verified], yes,
+    [#emph[gap]], [#emph[the reply does not reach EMIT — see below]], [—],
+    [validate], [verse accepts both; rejection now stops the run], yes,
+    [load], [renders the emitted view; DOM checked before capture], yes,
   )
 ]
 
-Each row is real: a real provider over HTTPS, the real compiler, real Chrome.
-What the table does NOT claim is that one value flows through all five. The
-model's reply does not become the emitted document — the documents come from the
-term, and the reply is composed alongside them. Every step works; the thread
-between REASON and EMIT is the piece that is not yet tied.
+The gap has its own row because a table of five yeses reads, to anyone skimming,
+as a closed loop. It is not one. Each step is real — a real provider over HTTPS,
+the real compiler, real Chrome — and LOAD is now genuinely downstream of EMIT and
+VALIDATE. But the model's reply arrives at the page as an assign, not as a change
+to the contract. Nothing yet asks it to propose one.
 
 #number("test suites")[#raw(
-"beam-lisp:  10 .bl suites, 252 tests / 816 assertions — 0 failures
+"beam-lisp:  10 .bl suites, 256 tests / 822 assertions — 0 failures
 beam-lisp:  990 Elixir tests — 0 failures
 verse:      3214 lib tests — 0 failures
 verse:      corpus gate green (403 files, 1491/1491 forms print)

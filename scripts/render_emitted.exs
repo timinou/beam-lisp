@@ -221,6 +221,34 @@ seed =
 # picture changes with it. An indicator hand-written here would keep looking
 # right long after the template stopped saying so — which is exactly the drift
 # that made the previous screenshots a mockup.
+# The DOM skeleton comes from the emitted `&shell`, not from a copy of it.
+#
+# A reviewer caught the copy: the host page hard-coded the same `<main>/<div>/
+# <form>` markup that `&shell` emits, so if the emitter dropped or changed the
+# shell the screenshot would keep rendering the stale copy and stay green. That
+# is the ORIGINAL failure of this document — a picture of a page the emitter did
+# not produce — surviving in the one plane nobody had checked.
+#
+# `&shell` is the mount point the signal renderer binds onto, so it has to exist
+# in the host HTML before the bundle runs; it cannot be instantiated by the page
+# itself. Lifting it out of the emitted text is the way to have both.
+shell_markup =
+  case Regex.run(~r/@template &shell\(\) \{(.*?)\}\s*$/m, emitted) do
+    [_, markup] ->
+      String.trim(markup)
+
+    _ ->
+      raise """
+      could not find the emitted &shell template.
+
+      The host skeleton must come from the view, or the screenshot stops being
+      evidence about the view.
+
+      emitted:
+      #{emitted}
+      """
+  end
+
 thinking_markup =
   if thinking? do
     case Regex.run(~r/@template &thinking\(\) \{(.*?)\}\s*$/m, emitted) do
@@ -246,14 +274,8 @@ host = """
 <!doctype html>
 <html><head><meta charset="utf-8"><link rel="stylesheet" href="spacetime.css"></head>
 <body>
-  <main class="chat">
-    <div class="log" data-log></div>
-    #{thinking_markup}
-    <form class="composer" onsubmit="return false">
-      <input class="composer__input" placeholder="Say something…">
-      <button class="composer__send" type="button">Send</button>
-    </form>
-  </main>
+  #{shell_markup}
+  #{thinking_markup}
   <script src="spacetime.js"></script>
   <script>
     // The assign the LiveView pushes on connect, through the same channel the

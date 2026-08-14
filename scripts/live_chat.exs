@@ -114,6 +114,16 @@ defmodule LiveChat do
                         println!("      {} @ {}", m.macro_name,
                             m.selector.clone().unwrap_or_else(|| "(file)".into()));
                     }
+                    // A document can be structurally valid and say NOTHING.
+                    // An empty file, or `{:st/forms []}`, yields Ok with zero
+                    // matches — the reader has no complaint because there is
+                    // nothing to complain about. Accepting that would let the
+                    // loop render a page from a document with no content, which
+                    // is the failure this gate exists to stop (found by review).
+                    if f.matches.is_empty() {
+                        println!("  {label}: REJECTED — parsed, but declares no forms");
+                        std::process::exit(1);
+                    }
                 }
                 Err(e) => {
                     println!("  {label}: REJECTED — {e}");
@@ -186,7 +196,17 @@ defmodule LiveChat do
     #{seam}
     /* ── emitted: the view (defview) ─────────────────────────────── */
     #{view}
+    /* ── end emitted ───────────────────────────────────────────── */
 
+    /* PRESENTATION — hand-written, borrowed from docs/proof/chat.st.
+
+       These rules come AFTER the emitted ones and can override them at equal
+       specificity, so a regression in the style plane would not necessarily
+       change this picture. A reviewer flagged that, and it is worth being plain
+       about: the screenshot is evidence for the MARKUP and BINDS planes, and
+       only partial evidence for style. The `.log`/`.bubble`/`.composer` rules
+       the term emits are present above; what follows is typography, spacing and
+       colour that no contract has an opinion about. */
     #{File.read!("docs/proof/chat.st") |> String.split("body {") |> List.last() |> then(&("body {" <> &1))}
     """
 
@@ -203,17 +223,21 @@ defmodule LiveChat do
         %{"role" => "model", "text" => reply}
       ])
 
+    # The mount point comes from the emitted `&shell`, not a copy of it. The
+    # renderer binds onto this skeleton, so it must exist before the bundle
+    # runs — but taking it from the emitted text means a change to `&shell`
+    # changes this page, which a hand-copied skeleton would not.
+    shell =
+      case Regex.run(~r/@template &shell\(\) \{(.*?)\}\s*$/m, view) do
+        [_, markup] -> String.trim(markup)
+        _ -> raise "the emitted view declares no &shell — nothing to mount onto"
+      end
+
     File.write!("#{@out}/live.host.html", """
     <!doctype html>
     <html><head><meta charset="utf-8"><link rel="stylesheet" href="spacetime.css"></head>
     <body>
-      <main class="chat">
-        <div class="log" data-log></div>
-        <form class="composer" onsubmit="return false">
-          <input class="composer__input" placeholder="Say something…">
-          <button class="composer__send" type="button">Send</button>
-        </form>
-      </main>
+      #{shell}
       <script src="spacetime.js"></script>
       <script>
         (function () {

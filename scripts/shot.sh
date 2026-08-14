@@ -78,6 +78,38 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
+# ── 3a. verify the DOM BEFORE capturing ───────────────────────────────────
+#
+# The check runs FIRST and polls, so a slow bundle is waited for rather than
+# raced. The previous order — screenshot, then a second Chrome to check — could
+# disagree with itself: if the renderer finished after the screenshot but before
+# the check, the image was wrong and the check was green. A reviewer found that;
+# it then bit for real on the very next run.
+#
+# NB `--dump-dom` serializes comments and inline script text as well as
+# elements, so a literal match is a necessary condition rather than a sufficient
+# one: a page could contain the string in a comment and pass. Give
+# `SHOT_REQUIRE` something the renderer PRODUCES — an attribute the templates
+# write, say `data-role="model"` — and never a word that also appears in the
+# host's own markup, or the check can only confirm what was already there.
+if [ -n "${SHOT_REQUIRE:-}" ]; then
+  found=""
+  for _ in $(seq 1 40); do
+    n=$("$CHROME" --headless --disable-gpu --no-sandbox \
+      --virtual-time-budget=4000 \
+      --dump-dom "http://127.0.0.1:$PORT/index.html" 2>/dev/null \
+      | grep -oF -- "$SHOT_REQUIRE" | wc -l)
+    if [ "${n:-0}" -gt 0 ]; then found=1; break; fi
+    sleep 0.25
+  done
+
+  if [ -z "$found" ]; then
+    echo "shot: the rendered DOM never contained '$SHOT_REQUIRE' — the page did not render" >&2
+    exit 1
+  fi
+  echo "shot: verified '$SHOT_REQUIRE' is in the rendered DOM"
+fi
+
 mkdir -p "$(dirname "$OUT")"
 "$CHROME" \
   --headless \
@@ -101,29 +133,9 @@ if [ "$SIZE" -lt 6000 ]; then
   exit 1
 fi
 
-# Byte size is a floor, not a check. The host skeleton alone — an input, a
-# button, a background — comfortably clears 6000B, so a page whose bundle bound
-# NOTHING still produces a plausible-looking image. That was a review finding,
-# and it is the same failure mode as the blank screenshot one layer up: the
-# evidence looks like evidence.
-#
-# So ask the DOM. `SHOT_REQUIRE` names a selector that must exist in the
-# rendered page; if the renderer never produced it, the screenshot is a picture
-# of the skeleton and this exits non-zero.
-if [ -n "${SHOT_REQUIRE:-}" ]; then
-  DOM="$WORK/dom.html"
-  "$CHROME" --headless \
-    --disable-gpu \
-    --no-sandbox \
-    --virtual-time-budget=6000 \
-    --dump-dom \
-    "http://127.0.0.1:$PORT/index.html" > "$DOM" 2>/dev/null
-
-  if ! grep -qF -- "$SHOT_REQUIRE" "$DOM"; then
-    echo "shot: the rendered DOM has no '$SHOT_REQUIRE' — the page did not render" >&2
-    exit 1
-  fi
-  echo "shot: verified '$SHOT_REQUIRE' is in the rendered DOM"
-fi
+# Byte size is a floor, not a check — the host skeleton alone clears 6000B, so a
+# page whose bundle bound NOTHING still produces a plausible image. That is what
+# `SHOT_REQUIRE` is for, and it runs BEFORE the capture (step 3a) so the thing
+# verified and the thing photographed are the same load.
 
 echo "shot: $OUT (${SIZE}B, ${WIDTH}x${HEIGHT}@2x)"
