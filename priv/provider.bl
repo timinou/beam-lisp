@@ -94,7 +94,14 @@
 
    Call this THROUGH `fence`: it performs a network request with no bound of its
    own beyond httpc's timeout, and a provider that accepts a connection then
-   stalls is the failure this system must survive."
+   stalls is the failure this system must survive.
+
+   NB the two deadlines are deliberately different. httpc's is 120s — a real
+   answer from a reasoning model can take a minute — while `fence`'s DEFAULT is
+   5s. The outer one wins: fence kills the child and returns `{:timeout 5000}`,
+   so a caller wanting the full budget must pass it (`(fence ask args 120000)`),
+   which the chat flow does. Reviewed and kept: the tight default is right for
+   a caller who has not thought about it."
   [cfg messages]
   (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
         body (request-body cfg messages false)
@@ -115,7 +122,14 @@
           status (elem (elem r 0) 1)
           payload (elem r 2)]
       (if (= 200 status)
-        {:ok (extract-content (to-string payload))}
+        ;; A 200 whose body carries no assistant content is a FAILURE, not an
+        ;; empty success: `{:ok nil}` reads as "the model said nothing", and the
+        ;; caller renders a blank bubble instead of reporting the problem.
+        (let [body (to-string payload)
+              text (extract-content body)]
+          (if (nil? text)
+            {:error {:undecodable body}}
+            {:ok text}))
         {:error {:status status :body (to-string payload)}}))
 
     :else
@@ -125,41 +139,77 @@
   (if (string? charlist) charlist (List/to_string charlist)))
 
 (defn extract-content
-  "The assistant text from a chat-completions response.
+  "The assistant text from a chat-completions response, or nil.
 
-   Deliberately a targeted scan rather than a JSON parse: the only field this
-   needs is `content`, and a full parser is a dependency plus a surface for a
-   malformed-response crash. A response whose shape changes yields nil here,
-   which the caller reports \u2014 rather than an exception mid-stream."
+   Deliberately a targeted scan rather than a JSON parse: the only field needed
+   is the assistant's `content`, and a full parser is a dependency plus a
+   surface for a malformed-response crash.
+
+   But `content` is not a unique key. A review found this returning
+   `\"upstream detail\"` for
+
+     {\"error\":{\"content\":\"upstream detail\"},\"choices\":[{\"message\":{\"content\":\"answer\"}}]}
+
+   — the FIRST match anywhere, which is the error's text presented to the user as
+   the model's reply. So the scan is anchored: it looks for `content` inside the
+   `message` object of `choices`, and returns nil when that anchor is absent
+   rather than settling for any `content` in the document."
   [json]
-  (let [marker "\"content\":\""
-        i (index-of json marker)]
-    (if (nil? i)
+  (let [anchor (index-of json "\"choices\"")]
+    (if (nil? anchor)
       nil
-      (let [after (subs json (+ i (count marker)))]
-        (unescape-json (take-until-unescaped-quote after))))))
+      (let [tail (subs json anchor)
+            marker "\"content\":\""
+            i (index-of tail marker)]
+        (if (nil? i)
+          nil
+          (take-until-unescaped-quote (subs tail (+ i (count marker)))))))))
 
 (defn- take-until-unescaped-quote
-  "The run up to the first UNESCAPED quote. A naive split on `\\\"` truncates any
-   answer containing a quotation mark \u2014 common in prose, so worth the loop."
+  "The run up to the first UNESCAPED quote, unescaped; nil when the string never
+   terminates.
+
+   nil rather than the partial run: a truncated body (a dropped connection
+   mid-answer) otherwise renders as a COMPLETE short answer, and neither the
+   caller nor the user can tell. A naive split on the next quote is also wrong —
+   prose contains quotation marks constantly — hence the walk."
   [s]
   (loop [i 0
          out ""]
-    (if (>= i (count s))
-      out
+    (cond
+      (>= i (count s)) nil
+      :else
       (let [c (subs s i (+ i 1))]
         (cond
-          (= c "\\") (recur (+ i 2) (str out c (subs s (+ i 1) (+ i 2))))
+          ;; an escape consumes the NEXT character whatever it is, so a
+          ;; `\\\"` inside the string does not terminate it
+          (= c "\\") (recur (+ i 2) (str out (unescape-pair (subs s (+ i 1) (+ i 2)))))
           (= c "\"") out
           :else (recur (+ i 1) (str out c)))))))
 
-(defn- unescape-json [s]
-  (-> s
-      (replace-str "\\n" "\n")
-      (replace-str "\\r" "\r")
-      (replace-str "\\t" "\t")
-      (replace-str "\\\"" "\"")
-      (replace-str "\\\\" "\\")))
+(defn- unescape-pair
+  "The character an escape sequence denotes.
+
+   Decoded HERE, one escape at a time, rather than by rewriting the finished
+   string. Sequential `replace-str` passes decode their own output: a literal
+   backslash-n (written `\\\\n` in JSON) had its second backslash paired with the
+   `n` and became a NEWLINE, silently corrupting any text containing a Windows
+   path or a regex."
+  [c]
+  (cond
+    (= c "n") "\n"
+    (= c "r") "\r"
+    (= c "t") "\t"
+    (= c "b") "\b"
+    (= c "f") "\f"
+    (= c "\"") "\""
+    (= c "\\") "\\"
+    (= c "/") "/"
+    :else c))
+
+; `unescape-json` is gone: sequential replace-str passes decode their own
+; output, so a literal backslash-n became a newline. `take-until-unescaped-quote`
+; now decodes escape-by-escape as it walks, which cannot double-decode.
 
 ;; ── streaming ───────────────────────────────────────────────────────────────
 
@@ -190,8 +240,10 @@
     (if (nil? i)
       nil
       (let [after (subs json (+ i (count marker)))
-            text (unescape-json (take-until-unescaped-quote after))]
-        (if (= "" text) nil text)))))
+            text (take-until-unescaped-quote after)]
+        ;; nil (unterminated) and "" (an empty delta) are both "nothing to
+        ;; append" here: a partial SSE line is dropped rather than shown.
+        (if (or (nil? text) (= "" text)) nil text)))))
 
 (defn stream
   "Stream a completion to `target`, one message per token.
