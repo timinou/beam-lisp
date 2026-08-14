@@ -1,0 +1,174 @@
+; priv/seam.bl — the seam vocabulary: reading a contract term as DATA.
+;
+; `priv/test.bl` already gives beam-lisp clojure.test (deftest/is/are + an
+; ETS-backed runner). This file adds nothing to that. It adds the layer above:
+; the questions worth asking about a program whose output is a CONTRACT between
+; two runtimes.
+;
+; ── why this is not just (is (= expected actual)) ────────────────────────────
+;
+; Asserting on the SHAPE of an emitted map passes while the seam is broken, and
+; fails on every harmless refactor. The property that matters is:
+;
+;     the two halves cannot disagree
+;
+; so the unit of assertion is the seam itself — which events reach a handler,
+; which assigns are declared, and (the hard one) which reply tags a handler can
+; actually produce.
+;
+; ── the property that motivates `reply-tags` ─────────────────────────────────
+;
+; FUP-143, in the verse repo, records a hole that CANNOT be closed from Elixir:
+;
+;     reply tags live in handler bodies and can be runtime values, so
+;     @on_definition cannot soundly enumerate them
+;
+; Elixir cannot see inside its own handler bodies, so a server can reply with a
+; tag no page decodes and nothing catches it until a user clicks. A beam-lisp
+; body is DATA: `(ok …)` and `(err …)` are literals in a tree, and the tags fall
+; out by walking it.
+;
+; That walk is the load-bearing claim of this whole design, so it is written to
+; fail LOUD rather than quiet: an unrecognised form is DESCENDED INTO, never
+; skipped. A tag hidden inside a form the walk does not know would otherwise
+; vanish silently — and a silently-missing tag turns the seam check into a
+; tautology that passes while the app is broken. Under-reporting is the only
+; unacceptable error here; over-reporting merely asks the page to decode a tag
+; it will never see.
+
+(ns seam)
+
+;; ── projection ──────────────────────────────────────────────────────────────
+;; Plain fns, not macros: they compose with optics and can be poked in a REPL.
+
+(defn events
+  "Every event name the contract declares, sorted."
+  [c]
+  (sort (map name (keys (get c :events {})))))
+
+(defn assigns
+  "Every assign name the contract declares, sorted."
+  [c]
+  (sort (map name (keys (get c :assigns {})))))
+
+(defn pushes
+  "Every transient-effect name the contract declares, sorted."
+  [c]
+  (sort (map name (keys (get c :pushes {})))))
+
+(defn handler-for
+  "The handler body for event `ev`, or nil.
+
+   nil is meaningful: it says the page can fire an event that reaches NOTHING
+   (FUP-143 hole #1). Returned rather than defaulted so the caller must decide."
+  [c ev]
+  (get-in c [:events (keyword ev) :body]))
+
+;; ── reply-tag enumeration ───────────────────────────────────────────────────
+
+(defn- tag-of
+  "The wire tag a form head contributes, or nil."
+  [head]
+  (cond
+    (= head (quote ok)) "ok"
+    (= head (quote err)) "err"
+    :else nil))
+
+(defn reply-tags
+  "Every reply tag `body` can answer with: sorted, deduped, as strings.
+
+   `[]` means fire-and-forget — the handler declares that a page correlating on
+   a reply will wait forever. That is a checkable claim, not an accident.
+
+   Descends into EVERY list, vector and map, including the children of a form
+   that already contributed a tag: `(ok (if p (err \"x\") 1))` is pathological,
+   but losing its inner tag would be worse than reporting both."
+  [body]
+  (sort
+    (distinct
+      (letfn [(walk [form acc]
+                (cond
+                  (seq? form)
+                  (let [t (tag-of (first form))
+                        acc2 (if t (conj acc t) acc)]
+                    (reduce (fn [a f] (walk f a)) acc2 form))
+
+                  (vector? form)
+                  (reduce (fn [a f] (walk f a)) acc form)
+
+                  (map? form)
+                  (reduce (fn [a f] (walk f a)) acc (vals form))
+
+                  :else acc))]
+        (walk body [])))))
+
+;; ── fingerprint ─────────────────────────────────────────────────────────────
+
+(defn fingerprint
+  "A stable, ORDER-INDEPENDENT identity for a contract's surface.
+
+   Order-independent because a pure reordering of declarations is not a contract
+   change; anything else is. Mirrors verse's `contract_hash_of`, which sorts its
+   normalized rows for the same reason."
+  [c]
+  (sha256-hex
+    (join "\n"
+          (sort (concat (map (fn [e] (str "event|" e)) (events c))
+                        (map (fn [a] (str "assign|" a)) (assigns c))
+                        (map (fn [p] (str "push|" p)) (pushes c)))))))
+
+;; ── the seam checks ─────────────────────────────────────────────────────────
+
+(defn handles?
+  "Does the contract declare `ev` AND route it to a handler?
+
+   Both halves are required: a declaration with no handler is the page firing
+   into the void, which is FUP-143 hole #1."
+  [c ev]
+  (and (contains? (get c :events {}) (keyword ev))
+       (not (nil? (handler-for c ev)))))
+
+(defn declares-assign? [c a]
+  (contains? (get c :assigns {}) (keyword a)))
+
+(defn undecoded-tags
+  "The tags `ev` can produce that `page-arms` does NOT decode.
+
+   Data, not a boolean, so a failure NAMES what is missing — a check that prints
+   `false` sends the reader back to the source to work out why."
+  [c ev page-arms]
+  (let [decoded (set (map name page-arms))]
+    (filterv (fn [t] (not (contains? decoded t)))
+             (reply-tags (handler-for c ev)))))
+
+(defn decodes?
+  "Can `page-arms` handle every tag `ev` can produce? FUP-143 hole #2."
+  [c ev page-arms]
+  (empty? (undecoded-tags c ev page-arms)))
+
+(defn disagreements
+  "Every way the halves disagree, as data. `[]` = they agree.
+
+   `page` is {:fires [ev …] :subscribes [assign …] :arms {ev [tag …]}}.
+
+   Checks BOTH directions:
+     page fires    ⊆ server handles   (E0928's direction, verse already has it)
+     server replies ⊆ page decodes    (the direction Elixir cannot check)"
+  [c page]
+  (vec
+    (concat
+      (mapv (fn [ev] {:kind :event-not-handled :event ev})
+            (filterv (fn [ev] (not (handles? c ev))) (get page :fires [])))
+
+      (mapv (fn [a] {:kind :assign-not-declared :assign a})
+            (filterv (fn [a] (not (declares-assign? c a))) (get page :subscribes [])))
+
+      (mapcat (fn [ev]
+                (mapv (fn [t] {:kind :reply-not-decoded :event ev :tag t})
+                      (undecoded-tags c ev (get-in page [:arms (keyword ev)] []))))
+              (get page :fires [])))))
+
+(defn agree?
+  "True when the two halves cannot disagree. The whole point, as one predicate."
+  [c page]
+  (empty? (disagreements c page)))
