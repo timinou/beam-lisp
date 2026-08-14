@@ -642,9 +642,17 @@ defmodule BeamLisp.Reader do
     end
   end
 
+  # String escapes. `\b` and `\f` are Clojure's (and JSON's) and were MISSING:
+  # `"\b"` read as the letter `b`, so a program escaping a backspace silently
+  # got a literal `b` instead — found when a JSON escaper's
+  # `(replace-str "\b" "\\b")` rewrote every letter b in the document.
+  # `\\` and `\"` fall through to the identity clause, which is correct.
   defp unescape(?n), do: ?\n
   defp unescape(?t), do: ?\t
   defp unescape(?r), do: ?\r
+  defp unescape(?b), do: ?\b
+  defp unescape(?f), do: ?\f
+  defp unescape(?0), do: 0
   defp unescape(c), do: c
 
   defp atom_form(rest, pos) do
