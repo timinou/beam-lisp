@@ -211,12 +211,44 @@ seed =
   |> Enum.map(fn {role, text} -> %{"role" => role, "text" => text} end)
   |> JSON.encode!()
 
+# The thinking indicator is the EMITTED `&thinking` template, lifted out of the
+# document rather than written again here. `@status` drives it in the running
+# app (`(assign @status :atom :idle)`); a static capture has no status to react
+# to, so the template's own markup is placed as a SIBLING of the log — inside
+# it, the `@each` renderer owns the subtree and replaces whatever it finds.
+#
+# Taking it from the emitted text is the point: if `&thinking` changed, this
+# picture changes with it. An indicator hand-written here would keep looking
+# right long after the template stopped saying so — which is exactly the drift
+# that made the previous screenshots a mockup.
+thinking_markup =
+  if thinking? do
+    case Regex.run(~r/@template &thinking\(\) \{(.*?)\}\s*$/m, emitted) do
+      [_, markup] ->
+        String.trim(markup)
+
+      _ ->
+        raise """
+        could not find the emitted &thinking template.
+
+        The screenshot must show what the view emits, so falling back to
+        hand-written markup here would defeat the purpose of the capture.
+
+        emitted:
+        #{emitted}
+        """
+    end
+  else
+    ""
+  end
+
 host = """
 <!doctype html>
 <html><head><meta charset="utf-8"><link rel="stylesheet" href="spacetime.css"></head>
 <body>
   <main class="chat">
     <div class="log" data-log></div>
+    #{thinking_markup}
     <form class="composer" onsubmit="return false">
       <input class="composer__input" placeholder="Say something…">
       <button class="composer__send" type="button">Send</button>

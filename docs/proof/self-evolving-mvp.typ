@@ -162,15 +162,25 @@ the draft, the button fires `send`.
 = It renders
 
 #shot("chat.png")[
-  The chat, compiled by the real Spacetime compiler and screenshotted in headless
-  Chrome via `scripts/shot.sh`. Right-aligned user bubbles, left-aligned model
-  bubbles, composer with input and Send — the three planes the `defview` term
-  emits.
+  The chat, rendered from the EMITTED documents. `scripts/render_emitted.exs`
+  prints `(chat/page-document)` and `(chat/view-page)` through `spacetime st`
+  and pastes both verbatim into a page — 967 of its 3162 bytes are emitter
+  output, delimited by markers so the boundary is visible in the source. The
+  rest is the conversation a LiveView would push, plus presentation.
+
+  Right-aligned user bubbles, left-aligned model bubbles, composer with input
+  and Send. `shot.sh` was run with `SHOT_REQUIRE='data-role="user"'`, so this
+  image exists only because that attribute was found in the rendered DOM.
 ]
 
 #shot("chat-thinking.png")[
-  The same page in its thinking state, captured by overriding the host skeleton
-  (`HOST_HTML=…`) rather than by writing a second page.
+  The thinking state. The indicator is the emitted `&thinking` template, lifted
+  out of the printed document by the capture script rather than written again
+  — if the template changes, this picture changes with it.
+
+  `@status` drives it in the running app; a static capture has no status to
+  react to, so the markup is placed directly. Verified with
+  `SHOT_REQUIRE='class="thinking"'`.
 ]
 
 = It runs
@@ -191,13 +201,19 @@ with zero runtime cost.
 
 #shot("chat-live.png")[
   That reply, rendered. The text came from Kimi k3-256k, streamed token by token
-  over HTTPS, folded into the transcript, re-emitted from the term, validated by
-  verse, and compiled to the page shown here.
+  over HTTPS, and was compiled to the page shown here.
+
+  Stated precisely, because the distinction matters: `live_chat.exs` runs all
+  five steps and each one does real work against a real system — but the model's
+  reply is not what the EMIT step emits. The documents are emitted from the term
+  and validated by verse; the reply is composed into a page beside them. The
+  loop is proven step by step, not yet threaded end to end through a single
+  value. See #emph[Where it stands].
 ]
 
 = What running it found
 
-Three defects that passing tests did not catch. They are the reason this document
+Defects that passing tests did not catch. They are the reason this document
 exists in this form.
 
 #caught("An em-dash became â")[
@@ -239,6 +255,60 @@ exists in this form.
   only fails on the property it measures.
 ]
 
+#caught("A screenshot of a page that was never emitted")[
+  The first version of this document showed `docs/proof/chat.st` — a page
+  written by hand to look like what `defview` emits. A reviewer compared the two
+  and found they had drifted: no `&shell`, no `&thinking`, no send binding.
+
+  The image was a picture of a mockup, captioned as a picture of the emitted
+  view. Nothing was fabricated; the page really did compile and really did
+  render. It simply was not the thing the caption claimed.
+
+  Rendering the real emitted documents then surfaced eight further defects —
+  four in the emitter, four in the printer — none of which any test had failed
+  on, because none of them broke STRUCTURE.
+]
+
+#caught("A template with a body and no declaration")[
+  In an `StFile` a template is two things: a `(template …)` form that declares
+  it, and a `Construct("template")` scope holding its markup. The emitter
+  produced only the scope.
+
+  So `@each` invoked a template the file never declared. The document parsed.
+  The page compiled. The log rendered empty.
+
+  Counting is what found it: hand-written `chat.st` yields
+  #raw("matches=7 scopes=13"); the emitted document yielded
+  #raw("matches=3 scopes=12").
+]
+
+#caught("A signal that sent nothing and decoded nothing")[
+  `@data signal` spells its body as `($send:send_clause) ($receive:receive_block)`,
+  but parsing FLATTENS those — their captures land at the top level. The printer
+  looked up `send` by name, found nothing, and printed
+  #raw("@data signal $inc() to $counter;").
+
+  Body gone. This is reachable from the committed reference page: `counter.st`
+  round-tripped to it.
+
+  Fixing it carelessly then INVENTED syntax — descending into `on_mutation`
+  whenever its name was absent rendered the type's literals against unrelated
+  data and emitted a bare #raw("$<-;") into four showcases. The rule that works
+  is to look before descending.
+]
+
+#caught("A binding quoted into a string literal")[
+  `&bubble($m)` printed as #raw("&bubble(\"$m\")"). That re-parses happily — as
+  a string LITERAL. The template received two characters instead of the loop
+  item, so `$m.role` resolved to nothing and `@each` rendered zero rows.
+
+  The page compiled. The bundle built. The screenshot came back at a plausible
+  #raw("76 KB"), showing an empty conversation.
+
+  Byte size proves Chrome ran. Only the DOM proves the page rendered — which is
+  why `shot.sh` now takes `SHOT_REQUIRE` and fails when the selector is absent.
+]
+
 #idea(title: "The pattern")[
   Each of these passed every test that existed. Not because the tests were
   careless, but because each measured a property adjacent to the one that
@@ -265,21 +335,30 @@ exists in this form.
 
     [read], [contract as data; reply tags enumerated from the term], yes,
     [reason], [Kimi k3-256k, 28 streamed deltas, 37s], yes,
-    [emit], [page 1041 B, view 2645 B, from one term], yes,
+    [emit], [page 1041 B, view 2967 B, from one term], yes,
     [validate], [verse accepts both; E0928 rejects a missing arm], yes,
-    [load], [compiled and rendered in headless Chrome], yes,
+    [load], [compiled and rendered in headless Chrome, DOM-verified], yes,
   )
 ]
 
+Each row is real: a real provider over HTTPS, the real compiler, real Chrome.
+What the table does NOT claim is that one value flows through all five. The
+model's reply does not become the emitted document — the documents come from the
+term, and the reply is composed alongside them. Every step works; the thread
+between REASON and EMIT is the piece that is not yet tied.
+
 #number("test suites")[#raw(
-"beam-lisp:  10 .bl suites, 245 tests / 799 assertions — 0 failures
-beam-lisp:  988 Elixir tests — 0 failures
+"beam-lisp:  10 .bl suites, 252 tests / 816 assertions — 0 failures
+beam-lisp:  990 Elixir tests — 0 failures
 verse:      3214 lib tests — 0 failures
-verse:      corpus gate green (403 files, 1491/1491 forms print)")]
+verse:      corpus gate green (403 files, 1491/1491 forms print)
+verse:      match-count drift 19 -> 15, ratchet lowered to match")]
 
 Three reviewer swarms ran over the diffs at milestones. All three returned
 findings; all findings are fixed and pinned as tests. The most valuable were the
-ones that proved a green test suite was measuring the wrong thing.
+ones that proved a green test suite was measuring the wrong thing — including
+the third swarm, which read this document against the code and found its
+screenshots showing a page the emitter never produced.
 
 #question[
   What this does NOT yet show: the loop rewriting its own contract. Every step of

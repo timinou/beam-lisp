@@ -1,6 +1,19 @@
-/* chat.st — rendered from the beam-lisp `defview` term.
-   The three planes below are exactly what `view-page` emits:
-   markup (the shell + bubble templates), style, and binds. */
+/* chat.st — HAND-WRITTEN. Not emitter output.
+
+   This file's header used to claim "the three planes below are exactly what
+   `view-page` emits". That was false, and a milestone-3 reviewer caught it by
+   comparing the two: this page has no `&shell`, no `&thinking`, and no send
+   binding. It is a page written to LOOK like the emitted view, and it drifted.
+
+   It is kept for two reasons. It is the artifact that made the drift visible
+   (`matches=7 scopes=13` here versus `matches=3 scopes=12` emitted, which is
+   how the missing template declarations were found), and `scripts/live_chat.exs`
+   still borrows its stylesheet.
+
+   For the real thing see `chat-emitted.st`, built by
+   `scripts/render_emitted.exs` from `(chat/page-document)` and
+   `(chat/view-page)` — both printed through `spacetime st` and pasted in
+   verbatim between markers. */
 @import "stdlib/macros/data-kind"
 @import "stdlib/macros/each"
 
