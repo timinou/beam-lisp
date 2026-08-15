@@ -103,6 +103,7 @@ defmodule BeamLisp.Spell.Live do
       version: 0,
       transcript: [],
       attempts: [],
+      last_build: :ok,
       publish: Keyword.get(opts, :publish, true)
     }
 
@@ -180,7 +181,14 @@ defmodule BeamLisp.Spell.Live do
         {%{status: :answered, text: answer}, say(state, :model, answer)}
 
       {:tool_calls, calls} ->
-        Enum.reduce(calls, {%{status: :answered, text: ""}, state}, fn call, {_acc, st} ->
+        # Calls are folded with a HALT once one of them retries or fails.
+        #
+        # The first version reduced over every call and recursed per rejection,
+        # so a turn carrying two calls could spend the budget twice — and an
+        # arbitrarily long `tool_calls` array multiplied a bound that is
+        # supposed to be fixed. A reviewer traced it; the budget is the loop's
+        # only protection against a model that proposes forever.
+        Enum.reduce_while(calls, {%{status: :answered, text: ""}, state}, fn call, {_acc, st} ->
           {verdict, st} = apply_proposal(parse_arguments(call), st)
 
           st =
@@ -192,8 +200,8 @@ defmodule BeamLisp.Spell.Live do
             })
 
           case verdict.status do
-            :ok -> {verdict, st}
-            _ -> turn(st, retry_prompt(verdict), attempts_left - 1)
+            :ok -> {:cont, {verdict, st}}
+            _ -> {:halt, turn(st, retry_prompt(verdict), attempts_left - 1)}
           end
         end)
 
@@ -216,8 +224,22 @@ defmodule BeamLisp.Spell.Live do
   defp apply_proposal(proposal, state) do
     case run_ladder(proposal) do
       {:ok, report} ->
+        # Commit, then publish — and if publishing FAILS, say so in the verdict
+        # rather than reporting success. The machine still holds the definition
+        # (it passed every rung; the failure is downstream, in emitting or
+        # building), but a caller told `:ok` while the served page is stale has
+        # been lied to, and the next proposal would accumulate on state the user
+        # never saw.
         Compiler.eval_string("(def live-machine candidate-machine)")
-        {%{status: :ok, report: report}, publish(state)}
+        state = publish(state)
+
+        case state.last_build do
+          :ok ->
+            {%{status: :ok, report: report}, state}
+
+          {:error, reason} ->
+            {%{status: :published_stale, rung: :publish, reason: reason, report: report}, state}
+        end
 
       {:error, verdict} ->
         # The candidate is discarded by simply not binding it: `live-machine`
@@ -228,8 +250,27 @@ defmodule BeamLisp.Spell.Live do
   end
 
   defp run_ladder(proposal) do
-    Compiler.eval_string("(def candidate (spell.define/define live-machine #{to_bl(proposal)}))")
+    # Printing happens BEFORE anything is evaluated, and it refuses a proposal it
+    # cannot print safely (see `to_bl/1`). A refusal here is a schema rejection,
+    # not a crash: a model probing the boundary should get the same bounded
+    # answer as one that simply mistyped a field.
+    case safe_to_bl(proposal) do
+      {:error, reason} ->
+        {:error, %{status: :rejected, rung: :schema, reason: reason}}
 
+      {:ok, src} ->
+        Compiler.eval_string("(def candidate (spell.define/define live-machine #{src}))")
+        ladder_after_build()
+    end
+  end
+
+  defp safe_to_bl(proposal) do
+    {:ok, to_bl(proposal)}
+  rescue
+    e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  defp ladder_after_build do
     status = Compiler.eval_string("(get candidate :status)")
 
     if status == :rejected do
@@ -269,7 +310,7 @@ defmodule BeamLisp.Spell.Live do
 
   # ── publishing ────────────────────────────────────────────────────────────
 
-  defp publish(%{publish: false} = state), do: state
+  defp publish(%{publish: false} = state), do: %{state | last_build: :ok}
 
   defp publish(state) do
     state = %{state | version: state.version + 1}
@@ -282,7 +323,7 @@ defmodule BeamLisp.Spell.Live do
       end
 
     write_report(state, build)
-    state
+    %{state | last_build: build}
   end
 
   defp build_bundle(page, out) do
@@ -381,23 +422,49 @@ defmodule BeamLisp.Spell.Live do
 
   defp bl_json(other), do: other
 
-  # A proposal as beam-lisp source. The values are JSON scalars, lists and
-  # maps — no code — so this is a printer, not an evaluator: the model's
-  # arguments never become forms that could execute.
+  # ── the data boundary ─────────────────────────────────────────────────────
   #
-  # A STRUCT reaching here would be a bug rather than data (a proposal comes
-  # from `JSON.decode!`, which produces only plain maps), and printing one
-  # would emit its `:__struct__` key as part of a definition. It fails loudly
-  # instead — the project's is_map lint asks exactly this question, and the
-  # honest answer is that structs are not merely unexpected here, they are
-  # unrepresentable.
+  # A proposal as beam-lisp source. THIS IS THE SECURITY BOUNDARY OF THE WHOLE
+  # DESIGN: everything here is written by a model, and the result is handed to
+  # `Compiler.eval_string/1`.
+  #
+  # It claimed to be "a printer, not an evaluator" and it was not. Values were
+  # escaped through `inspect/1`, but KEYS were concatenated raw after a colon,
+  # so a JSON object key could close the call and open a new form. Reproduced
+  # by a reviewer and confirmed here — this key:
+  #
+  #   kind "view"}))\n(def pwned 99)\n(def candidate2 (spell.define/define … {:kind
+  #
+  # emitted three top-level forms, the middle one arbitrary, and `pwned`
+  # evaluated to 99 BEFORE any rung ran. A model could have reached anything
+  # the BEAM can reach.
+  #
+  # The fix is not more escaping. It is a WHITELIST: a key must match
+  # `[a-z][a-z0-9-]*` — the shape of every field the tool's schema declares —
+  # and anything else is refused before a character is printed. Escaping asks
+  # "did I remember every metacharacter?"; a whitelist asks "is this one of the
+  # names I expect?", and only the second question has a safe default.
+
+  @key_pattern ~r/\A[a-z][a-z0-9_-]*\z/
+
   defp to_bl(%_{} = struct) do
     raise ArgumentError,
           "a proposal may only contain JSON data; got the struct #{inspect(struct.__struct__)}"
   end
 
   defp to_bl(value) when is_map(value) and not is_struct(value) do
-    "{" <> Enum.map_join(value, " ", fn {k, v} -> ":#{k} #{to_bl(v)}" end) <> "}"
+    "{" <>
+      Enum.map_join(value, " ", fn {k, v} ->
+        key = to_string(k)
+
+        unless Regex.match?(@key_pattern, key) do
+          raise ArgumentError,
+                "a proposal key must be a plain lowercase name, got #{inspect(key)} " <>
+                  "— refusing to print it as source"
+        end
+
+        ":#{key} #{to_bl(v)}"
+      end) <> "}"
   end
 
   defp to_bl(value) when is_list(value), do: "[" <> Enum.map_join(value, " ", &to_bl/1) <> "]"

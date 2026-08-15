@@ -55,12 +55,17 @@ defmodule Demo do
 
     server = serve()
 
-    try do
-      results = Enum.map(steps, fn step -> step.(%{live?: live?}) end)
-      report(results)
-    after
-      stop(server)
-    end
+    failed =
+      try do
+        steps
+        |> Enum.map(fn step -> step.(%{live?: live?}) end)
+        |> report()
+      after
+        stop(server)
+      end
+
+    # Halt AFTER cleanup: System.halt/1 does not run `after` clauses.
+    if failed > 0, do: System.halt(1)
   end
 
   # ── 1 ─────────────────────────────────────────────────────────────────────
@@ -84,12 +89,25 @@ defmodule Demo do
   # for it in prose and its tool call is what lands.
   defp grow_the_machine(%{live?: true}) do
     step("a real model grows the machine", fn ->
+      before = Live.state().version
       result = Live.ask(clock_prompt())
-      views = Live.state().machine["views"]
+      st = Live.state()
 
-      if result.status == :ok and "clock" in views,
-        do: {:ok, "the model's definition was accepted; views #{inspect(views)}"},
-        else: {:fail, "turn was #{inspect(result.status)}; views #{inspect(views)}"}
+      cond do
+        result.status != :ok ->
+          {:fail, "the turn was #{inspect(result.status)}"}
+
+        "clock" not in st.machine["views"] ->
+          {:fail, "the view is not in the machine; views #{inspect(st.machine["views"])}"}
+
+        # Asserted in BOTH modes: a live mode that proves less than the scripted
+        # one is a trap for whoever trusts it.
+        st.version <= before ->
+          {:fail, "accepted but the version did not move: #{before} → #{st.version}"}
+
+        true ->
+          {:ok, "the model's definition was accepted; v#{before} → v#{st.version}; views #{inspect(st.machine["views"])}"}
+      end
     end)
   end
 
@@ -144,12 +162,34 @@ defmodule Demo do
   # ── 4 ─────────────────────────────────────────────────────────────────────
   defp broken_proposal_is_refused(_ctx) do
     step("a broken definition is REFUSED, with the reason", fn ->
-      result = Live.define(ghost_proposal())
+      # Snapshot everything published BEFORE the refusal, for the next step.
+      Process.put(:before_refusal, published_fingerprint())
+
+      ghost = Live.define(ghost_proposal())
+      unmounted = Live.define(unmounted_proposal())
 
       cond do
-        result.status != :rejected -> {:fail, "a page styling a class nothing renders was ACCEPTED"}
-        result[:rung] != :ghosts -> {:fail, "refused at #{inspect(result[:rung])}, expected :ghosts"}
-        true -> {:ok, "refused at the #{result[:rung]} rung: #{first_line(to_string(result[:reason]))}"}
+        ghost.status != :rejected ->
+          {:fail, "a page styling a class nothing renders was ACCEPTED"}
+
+        ghost[:rung] != :ghosts ->
+          {:fail, "styled-ghost refused at #{inspect(ghost[:rung])}, expected :ghosts"}
+
+        # A SECOND fixture, for the bound-but-unrendered half of rung 4. The
+        # ghost proposal alone cannot prove it: it trips the styled join too, so
+        # deleting the unmounted join entirely would leave this step green —
+        # exactly the "check that cannot fail" this project refuses to ship.
+        # (Found by a reviewer mutating the join and watching nothing go red.)
+        unmounted.status != :rejected ->
+          {:fail, "a bind on a selector nothing renders was ACCEPTED"}
+
+        not String.contains?(to_string(unmounted[:reason]), "bind selector") ->
+          {:fail, "the unmounted bind was refused for the wrong reason: #{inspect(unmounted[:reason])}"}
+
+        true ->
+          {:ok,
+           "styled-but-unrendered → #{first_line(to_string(ghost[:reason]))}\n      " <>
+             "bound-but-unrendered → #{first_line(to_string(unmounted[:reason]))}"}
       end
     end)
   end
@@ -162,13 +202,46 @@ defmodule Demo do
   defp machine_survives_refusal(_ctx) do
     step("the refused definition left NOTHING behind", fn ->
       st = Live.state()
+      published = published_fingerprint()
 
       cond do
-        "ghosty" in st.machine["views"] -> {:fail, "the refused view is in the machine"}
-        not File.exists?(Path.join(@out, "report.json")) -> {:fail, "no report.json"}
-        true -> {:ok, "machine holds #{inspect(st.machine["views"])} — the refusal changed nothing"}
+        "ghosty" in st.machine["views"] ->
+          {:fail, "the refused view is in the machine"}
+
+        # Compare EVERYTHING published, not just the view list. A refusal that
+        # accidentally called publish/1 would bump the version and rewrite
+        # page.st, the bundle and report.json while leaving views untouched —
+        # and a check that only looked at views would call that unchanged.
+        published != Process.get(:before_refusal) ->
+          {:fail,
+           "the refusal changed published state:\n" <>
+             "  before: #{inspect(Process.get(:before_refusal))}\n" <>
+             "  after:  #{inspect(published)}"}
+
+        true ->
+          {:ok,
+           "machine holds #{inspect(st.machine["views"])}, v#{st.version} — " <>
+             "version, page and bundle all byte-identical"}
       end
     end)
+  end
+
+  # Everything a refusal must not touch: the version, and the bytes of every
+  # artefact the driver publishes.
+  defp published_fingerprint do
+    %{
+      version: Live.state().version,
+      page: digest(Path.join(@out, "page.st")),
+      bundle: digest(Path.join(@out, "spacetime.js")),
+      report: digest(Path.join(@out, "report.json"))
+    }
+  end
+
+  defp digest(path) do
+    case File.read(path) do
+      {:ok, bytes} -> :crypto.hash(:sha256, bytes) |> Base.encode16() |> String.slice(0, 12)
+      _ -> :missing
+    end
   end
 
   # ── 6 ─────────────────────────────────────────────────────────────────────
@@ -259,7 +332,24 @@ defmodule Demo do
     }
   end
 
-  # ── serving and looking ───────────────────────────────────────────────────
+  # Every styled class RENDERS here, so the styled-ghost join is silent — and
+  # the bind targets `.nowhere`, which nothing renders. This isolates the
+  # bound-but-unrendered half of rung 4, so removing that join turns step 4 red
+  # instead of leaving it green on the ghost fixture's coat-tails.
+  defp unmounted_proposal do
+    %{
+      "kind" => "view",
+      "name" => "floating",
+      "rationale" => "binds a selector no template renders",
+      "templates" => [%{"name" => "drift", "html" => "<i class='drift'>{@m.text}</i>"}],
+      "style" => [%{"selector" => ".drift", "rules" => %{"color" => "#fff"}}],
+      "binds" => [
+        %{"selector" => ".nowhere", "each" => %{"binding" => "messages", "as" => "m", "template" => "drift"}}
+      ]
+    }
+  end
+
+  # ── serving and looking ────────────────────────────────────────────────────
 
   defp serve do
     host = Path.join(@out, "index.html")
@@ -464,7 +554,13 @@ defmodule Demo do
     end
 
     IO.puts("  repl state: #{Path.join(@out, "report.json")}\n")
-    if failed > 0, do: System.halt(1)
+
+    # The exit status is RETURNED, not halted on, so `run/1`'s `after` clause
+    # still stops the detached server. `System.halt/1` does not unwind the
+    # stack, so halting here left python holding the port on exactly the
+    # runs that failed — and the next run would then photograph the previous
+    # one's page.
+    failed
   end
 
   defp banner(t), do: IO.puts("\n\e[1m── #{t} " <> String.duplicate("─", max(0, 58 - String.length(t))) <> "\e[0m")
