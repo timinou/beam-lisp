@@ -50,13 +50,9 @@ defmodule BeamLisp.ViewRoundtripTest do
   end
 
   defp emit_view do
-    BeamLisp.init()
+    BeamLisp.Spell.init!()
 
-    for f <- ~w(seam contract chat) do
-      BeamLisp.Compiler.eval_string(File.read!("priv/#{f}.bl"))
-    end
-
-    BeamLisp.Compiler.eval_string("(chat/view-page)")
+    BeamLisp.Compiler.eval_string("(spell.seed/view-page)")
   end
 
   defp print_back(edn) do

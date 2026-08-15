@@ -6,6 +6,11 @@ defmodule Mix.Tasks.BeamLisp.Test do
   `test/**/*.bl` (or the given path), runs the registered tests via
   `BeamLisp.TestRT.run_suite/1`, prints the clojure.test-shaped
   summary, and exits non-zero when anything failed.
+
+  `--path DIR` adds a library root to the loader's search path (repeatable),
+  as does the `BEAM_LISP_PATH` environment variable. A suite otherwise only
+  sees its OWN directory, cwd and `priv/` — so a library living anywhere else
+  (`spell/src`) could not be required from a test at all.
   """
 
   @shortdoc "Run the beam-lisp test suite"
@@ -15,6 +20,16 @@ defmodule Mix.Tasks.BeamLisp.Test do
   @impl true
   def run(args) do
     Mix.Task.run("app.start")
+
+    {opts, args} = OptionParser.parse!(args, strict: [path: :keep], aliases: [p: :path])
+    for {:path, dir} <- opts, do: BeamLisp.Env.add_search_path(dir)
+
+    # `spell/src` is this repo's own library root, so a suite requiring
+    # `spell.machine` resolves without every invocation repeating `--path`.
+    # Added only when it exists, so the task stays correct in a checkout
+    # that does not carry spell/. An explicit --path still outranks it:
+    # add_search_path preserves insertion order.
+    if File.dir?(BeamLisp.Spell.src_path()), do: BeamLisp.Env.add_search_path(BeamLisp.Spell.src_path())
 
     paths =
       case args do

@@ -1,5 +1,12 @@
 defmodule Mix.Tasks.BeamLisp.Run do
-  @moduledoc "Run a beam-lisp file: `mix beam_lisp.run examples/hello.bl`"
+  @moduledoc """
+  Run a beam-lisp file: `mix beam_lisp.run examples/hello.bl`
+
+  `--path DIR` adds a library root to the loader's search path (repeatable);
+  `BEAM_LISP_PATH` (colon-separated) does the same from the environment. The
+  entry file's own directory is always searched, so a self-contained program
+  needs neither.
+  """
   @shortdoc "Run a beam-lisp file"
 
   use Mix.Task
@@ -19,9 +26,19 @@ defmodule Mix.Tasks.BeamLisp.Run do
   ]
 
   @impl true
-  def run([path]) do
+  def run(argv) do
     Mix.Task.run("app.start")
 
+    {opts, args} = OptionParser.parse!(argv, strict: [path: :keep], aliases: [p: :path])
+    for {:path, dir} <- opts, do: BeamLisp.Env.add_search_path(dir)
+
+    case args do
+      [path] -> run_file(path)
+      _ -> Mix.raise("usage: mix beam_lisp.run [--path DIR] FILE.bl")
+    end
+  end
+
+  defp run_file(path) do
     try do
       path |> BeamLisp.run_file() |> BeamLisp.RT.print_str() |> IO.puts()
     catch
@@ -32,10 +49,6 @@ defmodule Mix.Tasks.BeamLisp.Run do
         IO.puts(:stderr, format(kind, reason, __STACKTRACE__))
         exit({:shutdown, 1})
     end
-  end
-
-  def run(_args) do
-    Mix.raise("usage: mix beam_lisp.run FILE.bl")
   end
 
   defp format(kind, reason, stacktrace) do

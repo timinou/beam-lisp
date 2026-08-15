@@ -14,7 +14,7 @@
 #
 # ── what a page needs that a view does not have
 #
-# `(chat/view-page)` emits three planes: markup, style, binds. That is the whole
+# `(spell.seed/view-page)` emits three planes: markup, style, binds. That is the whole
 # view and it is genuinely all of it — but a view is not a page. A page also
 # needs DATA (`@data inline $messages : […]`) and the SIGNAL declarations the
 # binds fire into, both of which come from the running server: `$messages` is
@@ -32,8 +32,7 @@ verse = Path.expand("~/code/ora/verse")
 [out | rest] = System.argv()
 thinking? = "thinking" in rest
 
-BeamLisp.init()
-for f <- ~w(seam contract chat), do: BeamLisp.Compiler.eval_string(File.read!("priv/#{f}.bl"))
+BeamLisp.Spell.init!()
 
 # BOTH emitted documents, because both halves come from the same term:
 #   page-document — the seam (`@data subscribe/signal/stream`), client side
@@ -51,8 +50,8 @@ print_st = fn edn, label ->
   {out, byte_size(edn)}
 end
 
-{seam, seam_bytes} = print_st.(BeamLisp.Compiler.eval_string("(chat/page-document)"), "page")
-{emitted, view_bytes} = print_st.(BeamLisp.Compiler.eval_string("(chat/view-page)"), "view")
+{seam, seam_bytes} = print_st.(BeamLisp.Compiler.eval_string("(spell.seed/page-document)"), "page")
+{emitted, view_bytes} = print_st.(BeamLisp.Compiler.eval_string("(spell.seed/view-page)"), "view")
 
 # The conversation the server would have assigned. Written as the `@data inline`
 # a LiveView produces, because that is what the page receives.
@@ -306,8 +305,8 @@ total = byte_size(File.read!(out))
 generated = byte_size(seam) + byte_size(emitted)
 
 IO.puts("wrote #{out} (#{total} B)")
-IO.puts("  seam  #{seam_bytes} B EDN -> #{byte_size(seam)} B .st   (chat/page-document)")
-IO.puts("  view  #{view_bytes} B EDN -> #{byte_size(emitted)} B .st   (chat/view-page)")
+IO.puts("  seam  #{seam_bytes} B EDN -> #{byte_size(seam)} B .st   (spell.seed/page-document)")
+IO.puts("  view  #{view_bytes} B EDN -> #{byte_size(emitted)} B .st   (spell.seed/view-page)")
 
 IO.puts(
   "  #{generated} of #{total} B generated; the rest is the conversation a " <>

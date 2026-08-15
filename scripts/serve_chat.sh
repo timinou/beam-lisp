@@ -21,6 +21,16 @@
 set -euo pipefail
 
 PORT="${1:-8800}"
+
+# A stale server holding the port used to fail at the LAST step, after the
+# whole emit+build — and whatever WAS serving then answered peek.sh with a
+# tree this run did not produce. Refuse up front, naming the squatter.
+if ss -tlnp 2>/dev/null | grep -qF ":$PORT "; then
+  echo "serve_chat: port $PORT already held by:" >&2
+  ss -tlnp 2>/dev/null | grep -F ":$PORT " >&2
+  echo "  kill it or pass another PORT" >&2
+  exit 1
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSE="${VERSE:-$HOME/code/ora/verse}"
 WORK="/tmp/chat-serve"
@@ -56,20 +66,43 @@ pathlib.Path(sys.argv[2]).write_text(f"""<!doctype html>
 </style>
 </head><body>
 {shell}
+<pre id="spacetime-snapshot" hidden></pre>
 <script>
   // Seed the transcript the way the LiveView bridge would. `$messages` is a
   // SUBSCRIPTION in the emitted seam: it initialises to null and a sibling
   // `@data inline` would lose to it, so the seed travels through the transport.
+  //
+  // A one-shot DOMContentLoaded dispatch RACES the bundle: if its init lands
+  // after the dispatch it writes null over the seed and the log stays empty
+  // (observed via peek.sh: state.json had messages:null). Push with retry
+  // until the bridge exists — the same discipline live_chat.exs uses — and
+  // keep RE-asserting the seed until it survives a snapshot tick.
   window.SpacetimeLocal = window.SpacetimeLocal || {{}};
-  window.SpacetimeLocal["messages"] = [
+  var SEED = [
     {{role:"user",  text:"what is this?"}},
     {{role:"model", text:"A chat page emitted from one beam-lisp term: contract and view from the same source."}}
   ];
-  window.SpacetimeLocal["status"] = "idle";
-  document.addEventListener("DOMContentLoaded", function () {{
-    document.dispatchEvent(new CustomEvent("local:messages:updated",
-      {{ detail: window.SpacetimeLocal["messages"] }}));
-  }});
+  var seedPushes = 0;
+  var seedTimer = setInterval(function () {{
+    seedPushes += 1;
+    var cur = window.SpacetimeLocal["messages"];
+    if (cur && cur.length === SEED.length) {{ clearInterval(seedTimer); return; }}
+    window.SpacetimeLocal["messages"] = SEED;
+    window.SpacetimeLocal["status"] = window.SpacetimeLocal["status"] || "idle";
+    document.dispatchEvent(new CustomEvent("local:messages:updated", {{ detail: SEED }}));
+    if (seedPushes > 200) clearInterval(seedTimer); // 5s of trying, then fail loud in state.json
+  }}, 25);
+  // peek.sh reads the interface's data state out of this element. Published
+  // on an interval rather than on demand because headless chrome cannot be
+  // asked a question — it can only serialize the DOM, so the state must BE
+  // in the DOM. Scope limit, stated honestly: this is the seam state that
+  // crossed the bridge (SpacetimeLocal). Page-local signals live inside the
+  // bundle and are not reachable without instrumenting verse.
+  setInterval(function () {{
+    var el = document.getElementById("spacetime-snapshot");
+    if (el && window.SpacetimeLocal)
+      el.textContent = JSON.stringify(window.SpacetimeLocal);
+  }}, 250);
 </script>
 <script src="spacetime.js"></script>
 </body></html>

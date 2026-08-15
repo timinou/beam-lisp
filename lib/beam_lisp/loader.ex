@@ -181,7 +181,36 @@ defmodule BeamLisp.Loader do
   # but they must be findable without the user knowing where the
   # application was installed, so priv comes last: a project file of the
   # same name still wins.
+  #
+  # Between cwd and priv sit the EXTRA paths: `BEAM_LISP_PATH` (colon-
+  # separated, like PATH) plus anything pushed by `Env.add_search_path/1`.
+  # They exist because an application that lives outside cwd — `spell/src`
+  # is the one in this repo — was previously reachable ONLY as the entry
+  # file's own directory. That made `spell.machine` loadable by
+  # `mix beam_lisp.run spell/src/main.bl` and by nothing else: no test
+  # suite could require it, because a suite pushes its OWN directory. A
+  # library you cannot write a test against is a library you cannot move
+  # code into, which is what blocked the priv/ → spell/ migration.
+  #
+  # Ordering is deliberate and load-bearing: pushed > cwd > extra > priv.
+  # Extra sits BELOW cwd so a project file still shadows a configured
+  # library, and ABOVE priv so an app can override a shipped library it
+  # deliberately replaces.
   defp search_dirs do
-    Env.load_paths() ++ [File.cwd!(), Application.app_dir(:beam_lisp, "priv")]
+    Env.load_paths() ++ [File.cwd!()] ++ extra_dirs() ++ [Application.app_dir(:beam_lisp, "priv")]
+  end
+
+  # Configured search paths, nearest first: explicitly added (a mix task
+  # flag, a test setup) before environment-provided.
+  defp extra_dirs do
+    Env.search_paths() ++ env_paths()
+  end
+
+  defp env_paths do
+    case System.get_env("BEAM_LISP_PATH") do
+      nil -> []
+      "" -> []
+      s -> s |> String.split(":", trim: true) |> Enum.map(&Path.expand/1)
+    end
   end
 end

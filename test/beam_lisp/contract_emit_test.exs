@@ -32,7 +32,7 @@ defmodule BeamLisp.ContractEmitTest do
   # contract, and a hand-built map would skip that half.
   @counter_term ~S"""
   (def counter
-    (contract/parse :counter-live
+    (spell.contract/parse :counter-live
       {:bundle "/spacetime/counter/spacetime.js" :root ".counter"}
       (list
         (quote (assign @count :integer 0))
@@ -44,8 +44,7 @@ defmodule BeamLisp.ContractEmitTest do
   """
 
   setup_all do
-    BeamLisp.init()
-    for f <- ~w(seam contract), do: BeamLisp.Compiler.eval_string(File.read!("priv/#{f}.bl"))
+    BeamLisp.Spell.init!(~w(spell.seam spell.contract))
     BeamLisp.Compiler.eval_string(@counter_term)
     :ok
   end
@@ -53,12 +52,12 @@ defmodule BeamLisp.ContractEmitTest do
   defp eval(src), do: BeamLisp.Compiler.eval_string(src)
 
   test "a beam-lisp term reproduces CounterLive's contract JSON byte for byte" do
-    assert eval(~s|(contract/contract-json counter "SpacetimeLvWeb.CounterLive")|) ==
+    assert eval(~s|(spell.contract/contract-json counter "SpacetimeLvWeb.CounterLive")|) ==
              @counter_json
   end
 
   test "and therefore its fingerprint" do
-    assert eval(~s|(contract/fingerprint counter "SpacetimeLvWeb.CounterLive")|) ==
+    assert eval(~s|(spell.contract/fingerprint counter "SpacetimeLvWeb.CounterLive")|) ==
              @counter_fingerprint
   end
 
@@ -67,7 +66,7 @@ defmodule BeamLisp.ContractEmitTest do
     # SURFACE, not of how the author happened to order the file.
     eval(~S"""
     (def reordered
-      (contract/parse :counter-live
+      (spell.contract/parse :counter-live
         {:bundle "/spacetime/counter/spacetime.js" :root ".counter"}
         (list
           (quote (on :dec (if (zero? @count)
@@ -78,7 +77,7 @@ defmodule BeamLisp.ContractEmitTest do
           (quote (assign @count :integer 0)))))
     """)
 
-    assert eval(~s|(contract/fingerprint reordered "SpacetimeLvWeb.CounterLive")|) ==
+    assert eval(~s|(spell.contract/fingerprint reordered "SpacetimeLvWeb.CounterLive")|) ==
              @counter_fingerprint
   end
 
@@ -87,7 +86,7 @@ defmodule BeamLisp.ContractEmitTest do
     # would not: the first emitter produced {"kind":"","message":""} — correctly
     # shaped JSON with every value empty — by looking keyword keys up with a
     # string. Shape was right; content was gone.
-    json = eval(~s|(contract/contract-json counter "SpacetimeLvWeb.CounterLive")|)
+    json = eval(~s|(spell.contract/contract-json counter "SpacetimeLvWeb.CounterLive")|)
     assert json =~ ~s("kind":"atom")
     assert json =~ ~s("message":"string")
     refute json =~ ~s(:"")
@@ -98,8 +97,8 @@ defmodule BeamLisp.ContractEmitTest do
     # all. FUP-143: "reply tags live in handler bodies and can be runtime
     # values, so @on_definition cannot soundly enumerate them" — true of Elixir,
     # false of a term.
-    assert eval(~s|(seam/reply-tags (seam/handler-for counter "inc"))|) == ["ok"]
-    assert eval(~s|(seam/reply-tags (seam/handler-for counter "dec"))|) == ["err", "ok"]
+    assert eval(~s|(spell.seam/reply-tags (spell.seam/handler-for counter "inc"))|) == ["ok"]
+    assert eval(~s|(spell.seam/reply-tags (spell.seam/handler-for counter "dec"))|) == ["err", "ok"]
   end
 
   test "a page missing a receive arm is a named disagreement" do
@@ -107,7 +106,7 @@ defmodule BeamLisp.ContractEmitTest do
     # This is the runtime surprise Elixir cannot catch at compile time.
     [d] =
       eval(~S"""
-      (seam/disagreements counter {:fires ["dec"] :subscribes [] :arms {:dec ["ok"]}})
+      (spell.seam/disagreements counter {:fires ["dec"] :subscribes [] :arms {:dec ["ok"]}})
       """)
       |> BeamLisp.Vector.to_list()
 
@@ -118,7 +117,7 @@ defmodule BeamLisp.ContractEmitTest do
 
   test "a correct page agrees" do
     assert eval(~S"""
-           (seam/agree? counter {:fires ["inc" "dec"]
+           (spell.seam/agree? counter {:fires ["inc" "dec"]
                                  :subscribes ["count"]
                                  :arms {:inc ["ok"] :dec ["ok" "err"]}})
            """) == true

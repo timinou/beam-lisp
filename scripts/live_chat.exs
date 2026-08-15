@@ -22,18 +22,15 @@ defmodule LiveChat do
     :ssl.start()
     File.mkdir_p!(@out)
 
-    BeamLisp.init()
-    for f <- ~w(seam contract provider chat) do
-      BeamLisp.Compiler.eval_string(File.read!("priv/#{f}.bl"))
-    end
+    BeamLisp.Spell.init!()
 
     banner("READ — the contract, as data")
-    contract = bl(~s|(chat/server-contract)|)
+    contract = bl(~s|(spell.seed/server-contract)|)
     IO.puts(contract)
 
-    events = bl(~s|(seam/events chat/contract-term)|) |> to_list()
-    assigns = bl(~s|(seam/assigns chat/contract-term)|) |> to_list()
-    tags = bl(~s|(seam/reply-tags (seam/handler-for chat/contract-term "send"))|) |> to_list()
+    events = bl(~s|(spell.seam/events spell.seed/contract-term)|) |> to_list()
+    assigns = bl(~s|(spell.seam/assigns spell.seed/contract-term)|) |> to_list()
+    tags = bl(~s|(spell.seam/reply-tags (spell.seam/handler-for spell.seed/contract-term "send"))|) |> to_list()
     IO.puts("\n  events  : #{inspect(events)}")
     IO.puts("  assigns : #{inspect(assigns)}")
     IO.puts("  send can reply with: #{inspect(tags)}")
@@ -46,8 +43,8 @@ defmodule LiveChat do
     IO.puts("\n\n  #{deltas} deltas in #{ms}ms")
 
     banner("EMIT — the page, from the same term")
-    page = bl(~s|(chat/page-document)|)
-    view = bl(~s|(chat/view-page)|)
+    page = bl(~s|(spell.seed/page-document)|)
+    view = bl(~s|(spell.seed/view-page)|)
     File.write!("#{@out}/page.edn", page)
     File.write!("#{@out}/view.edn", view)
     IO.puts("  page.edn  #{byte_size(page)} bytes")
@@ -68,7 +65,7 @@ defmodule LiveChat do
     t0 = System.monotonic_time(:millisecond)
 
     BeamLisp.Compiler.eval_string("""
-    (provider/stream-async (provider/from-env)
+    (spell.provider/stream-async (spell.provider/from-env)
       [{:role "user" :content #{inspect(question)}}]
       :live_target "turn-1")
     """)
@@ -161,7 +158,7 @@ defmodule LiveChat do
   # ── render ─────────────────────────────────────────────────────────────
   #
   # The page rendered here is built from the EMITTED, VALIDATED documents — the
-  # same `(chat/page-document)` and `(chat/view-page)` that step three produced
+  # same `(spell.seed/page-document)` and `(spell.seed/view-page)` that step three produced
   # and step four checked.
   #
   # This used to hand-write its own `@template &bubble` and its own `@each`, so

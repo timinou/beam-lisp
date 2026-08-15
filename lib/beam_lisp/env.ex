@@ -20,7 +20,7 @@ defmodule BeamLisp.Env do
     Agent.start_link(
       fn ->
         :ets.new(@table, [:named_table, :public, read_concurrency: true])
-        %{ns: "user", seeded: false, loaded: MapSet.new(), load_paths: []}
+        %{ns: "user", seeded: false, loaded: MapSet.new(), load_paths: [], search_paths: []}
       end,
       name: __MODULE__
     )
@@ -295,6 +295,31 @@ defmodule BeamLisp.Env do
   def pop_load_path do
     Agent.update(__MODULE__, &%{&1 | load_paths: tl(&1.load_paths)})
   end
+
+  @doc """
+  Configured search paths — library roots the loader consults after cwd.
+
+  Distinct from `load_paths/0`, and the distinction matters: load paths are a
+  STACK scoped to a load in progress (pushed on entry, popped after), while
+  search paths are ambient configuration for the whole session. Conflating
+  them would make a configured root vanish the moment a nested require
+  finished, which is exactly the bug shape `pop_load_path` exists to create
+  for the stack.
+  """
+  def search_paths, do: Agent.get(__MODULE__, &Map.get(&1, :search_paths, []))
+
+  @doc "Append a search path (idempotent, order-preserving)."
+  def add_search_path(dir) do
+    dir = Path.expand(dir)
+
+    Agent.update(__MODULE__, fn s ->
+      paths = Map.get(s, :search_paths, [])
+      if dir in paths, do: s, else: Map.put(s, :search_paths, paths ++ [dir])
+    end)
+  end
+
+  @doc "Drop all configured search paths (test isolation)."
+  def clear_search_paths, do: Agent.update(__MODULE__, &Map.put(&1, :search_paths, []))
 
   def fetch!(ns, name) do
     case fetch(ns, name) do
