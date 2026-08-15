@@ -78,19 +78,27 @@ defmodule BeamLisp.Spell.Verse do
   # costs ~50ms and is cached by the caller for the session; being right about
   # where the binary is beats being fast about looking in the wrong place.
   defp target_dirs do
+    # Only ask cargo when the root actually exists: `System.cmd` with a bad `cd`
+    # prints a raw `spawn: Could not cd to …` to stderr, which lands on top of
+    # this module's own, actionable "no spacetime binary — build it with …"
+    # message and buries it.
     from_cargo =
-      case System.cmd("cargo", ["metadata", "--format-version", "1", "--no-deps"],
-             cd: verse_root(),
-             stderr_to_stdout: false
-           ) do
-        {out, 0} ->
-          case JSON.decode!(out) do
-            %{"target_directory" => dir} -> [dir]
-            _ -> []
-          end
+      if File.dir?(verse_root()) do
+        case System.cmd("cargo", ["metadata", "--format-version", "1", "--no-deps"],
+               cd: verse_root(),
+               stderr_to_stdout: false
+             ) do
+          {out, 0} ->
+            case JSON.decode!(out) do
+              %{"target_directory" => dir} -> [dir]
+              _ -> []
+            end
 
-        _ ->
-          []
+          _ ->
+            []
+        end
+      else
+        []
       end
 
     env =

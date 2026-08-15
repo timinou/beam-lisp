@@ -1,5 +1,64 @@
 # spell/ — recreating spell.jank on beam-lisp
 
+## The loop, first — what this is now
+
+`spell/` began as a study (below) and now contains a working thing: **a live
+environment an LLM grows**. A model calls ONE tool, `define`, proposing a whole
+contract or view; a four-rung ladder either commits it into an accumulating
+machine or refuses with the compiler's own reason; an accepted definition
+re-emits the machine, rebuilds the page, and the browser reloads itself.
+
+```
+mix run scripts/demo.exs          # 6 asserted steps, no network
+mix run scripts/demo.exs --live   # the same scenario, driven by a real model
+mix run scripts/define_check.exs  # the verse rungs, proved in both directions
+mix beam_lisp.test                # 310 tests / 945 assertions
+
+scripts/serve_chat.sh [PORT]      # serve the page; it auto-reloads as the
+                                  # machine grows
+scripts/peek.sh [PORT] [OUT]      # screenshot + interface state + repl state
+```
+
+Prerequisites, none optional:
+
+| what | why | missing → |
+|---|---|---|
+| verse checkout (`~/code/ora/verse`, or `VERSE_ROOT`) | rungs 3–4 are the compiler | actionable error naming the path |
+| **release** binary: `cargo build --release --bin spacetime` | the loop calls it per definition; `cargo run` costs 10–30s each | "no spacetime binary" + the exact build command |
+| `.env` with `KIMI_API_KEY` | `--live` only | provider error in the transcript |
+| chrome/chromium (or `CHROME_BIN`) | the demo's DOM assertions | the step fails, naming it |
+
+### The pieces
+
+```
+spell/src/spell/
+  app.bl        (ns spell.app)       the manifest: one require head
+  seam.bl       (ns spell.seam)      a contract term, as data
+  contract.bl   (ns spell.contract)  defcontract/defview → EDN + JSON
+  machine.bl    (ns spell.machine)   the accumulating registry + its joins
+  define.bl     (ns spell.define)    rungs 1–2, proposal → term, page-locals
+  live.bl       (ns spell.live)      machine → documents, css, hosts
+  provider.bl   (ns spell.provider)  the LLM call; tool-call decoding
+  seed.bl       (ns spell.seed)      the definition the machine starts with
+
+lib/beam_lisp/spell/
+  verse.ex      rungs 3–4 (compile; styled- and bound-but-unrendered)
+  page.ex       machine → one .st page
+  live.ex       the driver: GenServer, tool loop, report.json
+```
+
+`report.json` beside the bundle IS the repl state: version, transcript, machine
+report, build status. peek.sh reads it, the browser polls it, a human can `cat`
+it — one artefact, three consumers, no protocol.
+
+The full as-built account, including every defect this shook out and what is
+still missing, is `!tasks/plans/PLAN-025-*.org` — read its **AS BUILT** section
+first.
+
+---
+
+## The original study
+
 A parallel study: take the spell.jank harness (`../spell-junk` — a
 self-rewriting agent harness with a clay-rendered GUI, ~5.6k lines of
 jank + ~1.4k lines of C++) and recreate its features in beam-lisp, as
