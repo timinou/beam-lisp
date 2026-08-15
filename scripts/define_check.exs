@@ -39,7 +39,8 @@ defmodule DefineCheck do
           seed_has_no_ghosts(),
           ghost_is_caught(),
           broken_is_caught(),
-          real_error_still_refused()
+          real_error_still_refused(),
+          broken_toolchain_is_not_a_pass()
         ]
 
         report(results)
@@ -132,31 +133,38 @@ defmodule DefineCheck do
 
   # ── 5: the W0201 exemption must not swallow real diagnostics ────────────
   #
-  # Rung 3 drops W0201 ("defined but never used"), a verse false positive that
-  # fires on the page this project ships. An exemption is a hole unless it is
-  # shown to be exactly the size claimed — so here is a page that emits BOTH a
-  # W0201 and a real error. The rung must still refuse it.
+  # Rung 3 exempts W0201 for the three sources verse cannot trace through
+  # `@on`/`@view` (draft, status, send). An exemption is a hole unless it is
+  # shown to be exactly the size claimed, so this page carries BOTH an exempt
+  # warning (an unused `$draft`) and a real error. The rung must still refuse
+  # it, and the refusal must not mention the exempt warning.
   defp real_error_still_refused do
     path = Path.join(@out, "warn_and_error.st")
 
     File.write!(path, """
-    /* An unused data source (W0201, exempt) AND a reference to a template
-       nothing declares (E0916, not exempt). */
+    /* An unused $draft (W0201, exempt) AND a malformed directive (E0946, a real
+       error).
+
+       The malformed `@each` is deliberate: a reference to an UNDECLARED
+       template (`&no-such-template`) turned out not to be an error here at all
+       — verse accepted it with only the W0201 — so using it would have made
+       this case pass while proving nothing about the exemption. Checked before
+       relying on it. */
     @import "stdlib/macros/data-kind"
     @import "stdlib/macros/each"
 
-    @data inline $unused : "";
+    @data inline $draft : "";
     @data inline $items : [];
 
     .list {
-      @each($items, as: $i, template: &no-such-template)
+      @each($items, as: $i, template: &row)
     }
     """)
 
     case Spell.Verse.check(path) do
       {:error, diag} ->
-        if String.contains?(diag, "W0201") do
-          fail("rung 3: the exemption should drop W0201 from the report", diag)
+        if String.contains?(diag, "'draft'") do
+          fail("rung 3: the exemption should drop the draft W0201 from the report", diag)
         else
           pass("rung 3: a real error is still refused alongside an exempt warning")
         end
@@ -164,8 +172,52 @@ defmodule DefineCheck do
       {:ok, :compiled} ->
         fail(
           "rung 3: the W0201 exemption swallowed a real error",
-          "an exemption that hides E0916 is a hole, not a filter"
+          "an exemption that hides a malformed directive is a hole, not a filter"
         )
+    end
+  end
+
+  # ── 6: a broken toolchain must never read as a clean page ───────────────
+  #
+  # The worst failure available to a checker. An earlier version of rung 3
+  # filtered the output for problem lines and passed when it found none — so a
+  # compiler that crashed, or was missing entirely, printed no `error[` marker
+  # and the rung reported success. Every later rung, and the whole loop, would
+  # then be validating nothing while reporting green.
+  defp broken_toolchain_is_not_a_pass do
+    fake = Path.join(@out, "fake_spacetime")
+    File.write!(fake, "#!/bin/sh\necho 'panic: boom'\nexit 101\n")
+    File.chmod!(fake, 0o755)
+
+    result =
+      with_env("VERSE_BIN", fake, fn ->
+        Spell.Verse.check(Path.join(@out, "seed.st"))
+      end)
+
+    case result do
+      {:error, reason} ->
+        if String.contains?(reason, "without emitting a diagnostic") do
+          pass("rung 3: a crashing compiler is refused, not accepted")
+        else
+          pass("rung 3: a crashing compiler is refused (#{first_line(reason)})")
+        end
+
+      {:ok, :compiled} ->
+        fail(
+          "rung 3: a crashing compiler read as a clean page",
+          "exit 101 with no diagnostic must never be {:ok, :compiled}"
+        )
+    end
+  end
+
+  defp with_env(key, value, fun) do
+    previous = System.get_env(key)
+    System.put_env(key, value)
+
+    try do
+      fun.()
+    after
+      if previous, do: System.put_env(key, previous), else: System.delete_env(key)
     end
   end
 

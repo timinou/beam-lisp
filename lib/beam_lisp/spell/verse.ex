@@ -129,23 +129,30 @@ defmodule BeamLisp.Spell.Verse do
   audience on the other end of a rejected proposal, and paraphrasing it would
   only lose the line numbers.
 
-  ## W0201 is not counted, and why that is not a loophole
+  ## W0201 is exempted NARROWLY, and why the narrowness matters
 
   `--deny-warnings` turns every warning into a failure, and verse emits
   `W0201 "data source X is defined but never used"` for signals that ARE used
-  — by `@on` handlers and `@view` arms, which its usage analysis does not
-  currently trace. Measured: the page this project ships, serves and
-  screenshots (`/tmp/chat-serve/page.st`, emitted by the pipeline in
-  `serve_chat.sh`) produces exactly four of them, for `draft`, `status`, `send`
-  and `fx` — all four demonstrably wired, since the composer writes `$draft`,
-  the button fires `$send`, the indicator dispatches on `$status`, and tokens
-  arrive over `$fx`.
+  by `@on` handlers and `@view` arms — constructs its usage analysis does not
+  trace. Measured on the page this project ships and screenshots: four W0201s,
+  for `draft`, `status`, `send` and `fx`.
 
-  A rung that refuses working software gets switched off, and then it protects
-  nothing. So W0201 specifically is dropped and every OTHER warning still
-  fails the rung. The narrow exemption is named here rather than achieved by
-  removing `--deny-warnings`, because dropping the flag would silently exempt
-  every future warning class too.
+  Three of those four are false positives: the composer writes `$draft`, the
+  button fires `$send`, the indicator dispatches on `$status` — each verified
+  in the emitted JS.
+
+  The fourth was NOT. `$fx` is the token stream; the contract pushes
+  `@token`/`@failed` and the server sends them, but no bind consumes the
+  stream, so streamed tokens arrive in the browser and render nothing. A
+  blanket "drop every W0201" hid a real defect behind an exemption written for
+  a different one — exactly the way an exemption becomes a hole. (Found by a
+  reviewer, confirmed against the emitted bundle, recorded as a defect in
+  PLAN-025 for the wave that renders streamed tokens.)
+
+  So the exemption is keyed to the *kinds* of source verse cannot trace — the
+  ones a page consumes through `@on`/`@view` — and a `@data stream` is not one
+  of them: nothing but a bind can consume a stream, so verse is RIGHT about it
+  and the warning must be heard.
 
   If verse's usage analysis learns about `@on`/`@view`, this filter deletes and
   nothing else changes.
@@ -156,25 +163,71 @@ defmodule BeamLisp.Spell.Verse do
         {_out, 0} ->
           {:ok, :compiled}
 
-        {out, _} ->
-          case real_problems(out) do
-            [] -> {:ok, :compiled}
-            lines -> {:error, Enum.join(lines, "\n")}
+        {out, code} ->
+          # A non-zero exit is a REFUSAL by default. Only one thing may downgrade
+          # it: output whose every diagnostic is an exempt W0201.
+          #
+          # The first version of this filtered the output for problem lines and
+          # passed when none were found, which inverted the default — a crashing
+          # or missing compiler prints no `error[` marker, so
+          # `VERSE_BIN=/usr/bin/false` and a binary printing `panic: boom` both
+          # returned {:ok, :compiled}. A broken toolchain reading as a clean page
+          # is the worst failure available to a checker: every later rung, and
+          # the whole loop, would then be validating nothing while reporting
+          # success. Caught by a reviewer; reproduced before fixing.
+          case classify(out) do
+            :only_exempt_warnings -> {:ok, :compiled}
+            {:problems, lines} -> {:error, Enum.join(lines, "\n")}
+            :unrecognised -> {:error, unrecognised_message(code, out)}
           end
       end
     end
   end
 
-  # Diagnostic lines that are not the known false positive. Errors are always
-  # kept; only W0201 warnings are dropped, and only they.
-  defp real_problems(output) do
-    output
-    |> String.split("\n")
-    |> Enum.filter(fn line ->
-      String.contains?(line, "error[") or
-        (String.contains?(line, "warning[") and not String.contains?(line, "W0201"))
-    end)
-    |> Enum.map(&String.trim/1)
+  # What a non-zero `check` run actually said.
+  #
+  #   :only_exempt_warnings — diagnostics found, ALL of them exempt
+  #   {:problems, lines}    — at least one real error or non-exempt warning
+  #   :unrecognised         — no diagnostics at all: a crash, a usage message,
+  #                           a missing file. Never a pass.
+  defp classify(output) do
+    diagnostics =
+      output
+      |> String.split("\n")
+      |> Enum.filter(&(String.contains?(&1, "error[") or String.contains?(&1, "warning[")))
+      |> Enum.map(&String.trim/1)
+
+    problems = Enum.reject(diagnostics, &exempt?/1)
+
+    cond do
+      problems != [] -> {:problems, problems}
+      diagnostics != [] -> :only_exempt_warnings
+      true -> :unrecognised
+    end
+  end
+
+  # A W0201 for a source verse genuinely cannot trace — and ONLY those.
+  #
+  # `@on` and `@view` consume a source without verse's analysis seeing it, so a
+  # W0201 naming a signal a page writes or dispatches on is noise. A stream has
+  # no such blind spot: nothing but a bind can consume one, so an unused stream
+  # is a real finding and stays a refusal. Sources are matched by NAME because
+  # that is all the warning line carries; the list is deliberately explicit
+  # rather than a wildcard, so a new unused source has to be looked at by a
+  # human before it joins.
+  @exempt_sources ~w(draft status send)
+
+  defp exempt?(line) do
+    String.contains?(line, "W0201") and
+      Enum.any?(@exempt_sources, &String.contains?(line, "'#{&1}'"))
+  end
+
+  defp unrecognised_message(code, out) do
+    detail = out |> String.trim() |> String.slice(0, 400)
+
+    "spacetime check exited #{code} without emitting a diagnostic " <>
+      "(a crash, a usage error or a missing file — NOT a clean page): " <>
+      if(detail == "", do: "no output", else: detail)
   end
 
   @doc """

@@ -124,12 +124,22 @@ defmodule BeamLisp.ViewRoundtripTest do
 
       assert status == 0, "the printed .st did not re-parse:\n#{printed}"
 
-      # 3 templates + 1 each + 2 on-driver-body = 6 forms, and all three
-      # template BODIES still present as constructs.
-      assert length(String.split(edn, "(template ")) - 1 == 3,
-             "a template declaration was lost:\n#{edn}"
+      # The counting property, derived rather than hardcoded.
+      #
+      # It used to read `== 3`, and the seed grew a fourth template (the
+      # streaming bubble) — so the test failed for a change that was correct,
+      # which is the shape that gets a test deleted rather than read. The
+      # PROPERTY is "every form that went in comes back", so both sides are
+      # counted from the same emitted view and compared.
+      declared = length(String.split(printed, "@template ")) - 1
+      survived = length(String.split(edn, "(template ")) - 1
 
-      assert length(String.split(edn, "(on-driver-body")) - 1 == 2,
+      assert survived == declared,
+             "#{declared - survived} template declaration(s) lost in the round trip:\n#{edn}"
+
+      binds = length(String.split(printed, "@on ")) - 1
+
+      assert length(String.split(edn, "(on-driver-body")) - 1 == binds,
              "a bind was lost:\n#{edn}"
 
       assert String.contains?(edn, "(each "), "the each form was lost:\n#{edn}"

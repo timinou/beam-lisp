@@ -100,9 +100,20 @@ defmodule BeamLisp.Spell.Page do
     """
   end
 
-  # chat-live → ChatLive, the convention `spell.contract/module-name` uses.
+  # chat-live → ChatLive, matching `spell.contract/module-name` EXACTLY.
+  #
+  # `String.capitalize/1` was wrong and a reviewer caught it: it lowercases the
+  # rest of a segment, so a contract named `HTTP-live` — whose seam says
+  # `from $HTTP-live` and whose BEAM module is `HTTPLive` — would get a page
+  # declaring `@host $HTTP-live : live("…HttpLive")`, pointing at a module the
+  # contract does not describe. Upcase the first character, keep the rest.
   defp module_name(host) do
-    host |> String.split("-") |> Enum.map_join("", &String.capitalize/1)
+    host
+    |> String.split("-")
+    |> Enum.map_join("", fn
+      "" -> ""
+      <<first::utf8, rest::binary>> -> String.upcase(<<first::utf8>>) <> rest
+    end)
   end
 
   # An emitted EDN document as `.st`, via verse's own printer — never by
