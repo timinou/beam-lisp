@@ -66,18 +66,75 @@
       (replace-str "\t" "\\t")))
 
 (defn- message-json [m]
-  (str "{\"role\":\"" (get m :role) "\",\"content\":\""
-       (json-escape (get m :content)) "\"}"))
+  ;; Three message shapes cross this boundary and they are NOT symmetric:
+  ;;
+  ;;   user/assistant  role + content
+  ;;   assistant w/ tool_calls  content "" + the calls it made
+  ;;   tool            role "tool" + tool_call_id + the result as content
+  ;;
+  ;; The assistant's own tool_calls must be echoed back on the next request or
+  ;; the provider rejects the following `tool` message as unsolicited — it has
+  ;; no other way to correlate a result with the call that asked for it.
+  (let [role (get m :role)
+        content (json-str-value (get m :content ""))
+        calls (get m :tool-calls [])
+        call-id (get m :tool-call-id)]
+    (str "{\"role\":\"" role "\""
+         ",\"content\":" content
+         (if (nil? call-id) "" (str ",\"tool_call_id\":\"" (json-escape call-id) "\""))
+         (if (empty? calls)
+           ""
+           (str ",\"tool_calls\":["
+                (join "," (map tool-call-json calls))
+                "]"))
+         "}")))
+
+(defn- json-str-value
+  "A string as a quoted, escaped JSON value."
+  [s]
+  (str "\"" (json-escape s) "\""))
+
+(defn- tool-call-json
+  "One assistant tool call, echoed back in the shape the provider sent it."
+  [c]
+  (str "{\"id\":\"" (json-escape (get c :id "")) "\""
+       ",\"type\":\"function\""
+       ",\"function\":{\"name\":\"" (json-escape (get c :name "")) "\""
+       ",\"arguments\":" (json-str-value (get c :arguments "{}")) "}}"))
+
+(defn- tool-decl-json
+  "One tool DECLARATION, as the chat-completions API wants it.
+
+   `parameters` is a pre-built JSON-schema STRING and is embedded raw. Quoting
+   it as a string value is the mistake worth naming: the provider answers 400,
+   which in this codebase's failure history reads as an auth or endpoint
+   problem and sends you looking in the wrong place entirely."
+  [t]
+  (str "{\"type\":\"function\",\"function\":{"
+       "\"name\":\"" (json-escape (get t :name)) "\""
+       ",\"description\":" (json-str-value (get t :description ""))
+       ",\"parameters\":" (get t :parameters "{\"type\":\"object\"}")
+       "}}"))
 
 (defn request-body
   "The chat-completions payload. `messages` is a vector of
-   {:role \"user\"|\"assistant\" :content \"…\"}."
+   {:role \"user\"|\"assistant\"|\"tool\" :content \"…\"}, optionally carrying
+   `:tool-calls` (assistant) or `:tool-call-id` (tool).
+
+   `cfg`'s `:tools` — when present and non-empty — declares the functions the
+   model may call. An EMPTY `tools` array is deliberately not the same as no
+   key: some providers reject `\"tools\":[]`, and an offered-but-empty tool list
+   is a claim we do not mean to make."
   [cfg messages stream?]
-  (str "{\"model\":\"" (get cfg :model) "\""
-       ",\"messages\":[" (join "," (map message-json messages)) "]"
-       ",\"max_tokens\":" (get cfg :max-tokens 1024)
-       ",\"stream\":" (if stream? "true" "false")
-       "}"))
+  (let [tools (get cfg :tools [])]
+    (str "{\"model\":\"" (get cfg :model) "\""
+         ",\"messages\":[" (join "," (map message-json messages)) "]"
+         (if (empty? tools)
+           ""
+           (str ",\"tools\":[" (join "," (map tool-decl-json tools)) "]"))
+         ",\"max_tokens\":" (get cfg :max-tokens 1024)
+         ",\"stream\":" (if stream? "true" "false")
+         "}")))
 
 ;; ── the call ────────────────────────────────────────────────────────────────
 
@@ -221,6 +278,159 @@
 ; `unescape-json` is gone: sequential replace-str passes decode their own
 ; output, so a literal backslash-n became a newline. `take-until-unescaped-quote`
 ; now decodes escape-by-escape as it walks, which cannot double-decode.
+
+;; ── decoding a turn ─────────────────────────────────────────────────────────
+;;
+;; `extract-content` answers one question — "what did the model SAY?" — and a
+;; tool-calling loop needs a second: "what did it want to DO?". On a tool turn
+;; Kimi sends `content: ""` and puts the request in `tool_calls`, so a caller
+;; using only extract-content sees an empty answer, renders a blank bubble, and
+;; never learns a tool was requested. Nothing raises; the machine simply never
+;; grows. (Shape captured from a live k3-256k probe — PLAN-023.)
+;;
+;; extract-turn is therefore the decoder the LOOP uses, and it always returns
+;; one of three kinds:
+;;
+;;   {:kind :content     :content "…"  :tool-calls []}
+;;   {:kind :tool-calls  :content ""   :tool-calls [{:id :name :arguments}…]}
+;;   {:kind :error       :reason …}
+;;
+;; `:error` covers the case a 200 can still be a failure: no content AND no
+;; tool call. Returning `{:kind :content :content ""}` there would render as
+;; the model choosing to say nothing.
+
+(defn- find-after
+  "Index of `needle` in `s` at or after `from`, or nil."
+  [s needle from]
+  (if (>= from (count s))
+    nil
+    (let [i (index-of (subs s from) needle)]
+      (if (nil? i) nil (+ from i)))))
+
+(defn- json-string-after
+  "The decoded JSON string value that follows `key` at or after `from`, plus the
+   index just past it: [value end] — or nil when the key is absent.
+
+   Returns the END index as well as the value because the tool-call scan walks
+   FORWARD through an array: without it, each field lookup would restart from
+   the top of the document and the second call's `name` would find the first
+   call's."
+  [s key from]
+  (let [marker (str "\"" key "\":\"")
+        i (find-after s marker from)]
+    (if (nil? i)
+      nil
+      (let [start (+ i (count marker))
+            v (take-until-unescaped-quote (subs s start))]
+        (if (nil? v)
+          nil
+          ;; The decoded value can be SHORTER than its source (escapes are two
+          ;; source characters, one decoded), so the end index is computed by
+          ;; re-scanning the raw text rather than by adding the value's length.
+          [v (+ start (raw-string-length (subs s start)))])))))
+
+(defn- raw-string-length
+  "How many characters of `s` the JSON string starting at index 0 occupies, up
+   to but excluding its closing quote."
+  [s]
+  (loop [i 0]
+    (cond
+      (>= i (count s)) i
+      :else
+      (let [c (subs s i (+ i 1))]
+        (cond
+          (= c "\\") (recur (+ i 2))
+          (= c "\"") i
+          :else (recur (+ i 1)))))))
+
+(defn tool-calls
+  "Every tool call in a chat-completions body, in order, as
+   [{:id … :name … :arguments …}]. Empty when the turn requested none.
+
+   `arguments` is returned DECODED (the provider sends it as a JSON string, so
+   its quotes arrive escaped) but NOT parsed: parsing belongs to whoever knows
+   the tool's schema. Decoding here rather than at each call site keeps one
+   unescaping implementation instead of one per tool.
+
+   Anchored inside `choices` for the same reason `extract-content` is: an
+   `error` object is free to contain anything, and a document-wide scan would
+   happily read a tool call out of it."
+  [json]
+  (let [anchor (index-of json "\"choices\"")]
+    (if (nil? anchor)
+      []
+      (loop [pos anchor
+             acc []]
+        (let [i (find-after json "\"function\"" pos)]
+          (if (nil? i)
+            acc
+            ;; `id` belongs to the CALL object, which precedes `function` — so
+            ;; it is searched from the previous position, not from `function`.
+            (let [id-hit (json-string-after json "id" pos)
+                  name-hit (json-string-after json "name" i)
+                  args-hit (json-string-after json "arguments" i)]
+              (if (or (nil? name-hit) (nil? args-hit))
+                acc
+                (recur (get args-hit 1)
+                       (conj acc {:id (if (nil? id-hit) "" (get id-hit 0))
+                                  :name (get name-hit 0)
+                                  :arguments (get args-hit 0)}))))))))))
+
+(defn extract-turn
+  "Decode one chat-completions response into what the loop must do next.
+
+   See the block comment above for the three kinds. This is additive:
+   `extract-content` keeps its contract and its callers."
+  [json]
+  (let [calls (tool-calls json)]
+    (cond
+      (not (empty? calls))
+      {:kind :tool-calls :content "" :tool-calls calls}
+
+      :else
+      (let [text (extract-content json)]
+        (cond
+          ;; nil  — no `choices` anchor at all, or an unterminated string
+          ;; ""   — an assistant message with genuinely nothing in it
+          ;; Both mean the same thing to a caller: this turn carried no answer
+          ;; and no work. Distinguishing them would invite a caller to render
+          ;; one of them.
+          (nil? text) {:kind :error :reason {:undecodable json}}
+          (= "" text) {:kind :error :reason {:empty-turn json}}
+          :else {:kind :content :content text :tool-calls []})))))
+
+(defn ask-turn
+  "One request, one DECODED turn: {:kind :content|:tool-calls|:error …}.
+
+   The tool-aware sibling of `ask`. Same request, same deadline discipline —
+   the difference is that the reply is read with `extract-turn`, so a turn that
+   requests a tool arrives as work to do rather than as an empty answer.
+
+   `ask` is kept, unchanged, for the callers that genuinely only want text
+   (the non-tool path, the tests, the fallback). Two entry points rather than
+   a flag because the RESULT SHAPES differ: a caller of `ask` handles
+   {:ok text}, a caller of this handles three kinds, and collapsing them would
+   push a cond into every call site."
+  [cfg messages]
+  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
+        body (request-body cfg messages false)
+        req (tuple url
+                   (headers cfg)
+                   (String/to_charlist "application/json")
+                   body)
+        opts (list (tuple :timeout 120000))
+        resp (httpc/request :post req opts (list))]
+    (cond
+      (and (tuple? resp) (= :ok (elem resp 0)))
+      (let [r (elem resp 1)
+            status (elem (elem r 0) 1)
+            payload (to-string (elem r 2))]
+        (if (= 200 status)
+          (extract-turn payload)
+          {:kind :error :reason {:status status :body payload}}))
+
+      :else
+      {:kind :error :reason {:transport (pr-str resp)}})))
 
 ;; ── streaming ───────────────────────────────────────────────────────────────
 
