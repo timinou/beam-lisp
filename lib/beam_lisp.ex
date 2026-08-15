@@ -21,6 +21,18 @@ defmodule BeamLisp do
 
   alias BeamLisp.{Compiler, Env, RT}
 
+  # The prelude ships inside the compiled module, not as a runtime
+  # priv file: embedded runtimes (Mob device apps deploy flat .beam
+  # dirs; escripts) have no :code.priv_dir/1 for :beam_lisp, so a
+  # runtime File.read! would crash boot. @external_resource keeps
+  # Mix recompiling when the .bl sources change.
+  @prelude_path Path.join(__DIR__, "../priv/core.bl")
+  @multi_path Path.join(__DIR__, "../priv/multi.bl")
+  @external_resource @prelude_path
+  @external_resource @multi_path
+  @prelude File.read!(@prelude_path)
+  @multi File.read!(@multi_path)
+
   @doc """
   Evaluate beam-lisp source, bootstrapping `core` on first use.
 
@@ -42,13 +54,15 @@ defmodule BeamLisp do
 
   @doc "Seed the `core` namespace and load the prelude, once."
   def init do
+    ensure_env()
+
     unless Env.seeded?() do
       RT.seed_core()
       # The prelude is layered: core.bl is the language, multi.bl the
       # dispatch library that builds on it (derive/isa? and friends
       # are ordinary beam-lisp over BeamLisp.Multi).
-      for file <- [prelude_path(), multi_path()] do
-        Compiler.eval_string(File.read!(file), Compiler.new_env("core"))
+      for source <- [@prelude, @multi] do
+        Compiler.eval_string(source, Compiler.new_env("core"))
       end
 
       Env.mark_seeded()
@@ -58,8 +72,23 @@ defmodule BeamLisp do
     :ok
   end
 
-  defp prelude_path, do: Application.app_dir(:beam_lisp, "priv/core.bl")
-  defp multi_path, do: Application.app_dir(:beam_lisp, "priv/multi.bl")
+  # Embedded runtimes (Mob device apps, escripts, one-shot `-eval`
+  # boots) never start the :beam_lisp OTP application, so the Env
+  # Agent that owns the var table may not exist. Start it on demand;
+  # when the OTP app did start, the whereis check is already
+  # satisfied and this is a no-op.
+  defp ensure_env do
+    case Process.whereis(Env) do
+      nil ->
+        case Env.start_link([]) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+
+      _pid ->
+        :ok
+    end
+  end
 
   @doc "A read-eval-print loop. Exit with Ctrl+C or by evaluating `(System/halt)`."
   def repl do
