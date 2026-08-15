@@ -368,8 +368,9 @@ defmodule BeamLisp.Spell.Live do
   defp bl_json(list) when is_list(list), do: Enum.map(list, &bl_json/1)
   defp bl_json(atom) when is_atom(atom) and not is_boolean(atom) and not is_nil(atom), do: Atom.to_string(atom)
 
-  # is_map-ok: beam-lisp maps and structs both reach here; the Vector clause
-  # above takes the one struct that matters and the rest are plain maps.
+  # is_map-ok: a beam-lisp report is walked structurally here; the Vector clause
+  # above takes the one struct kind that reaches this function, and every other
+  # value is a plain map from `spell.machine/report`.
   defp bl_json(map) when is_map(map) do
     Map.new(map, fn {k, v} -> {to_string(bl_json(k)), bl_json(v)} end)
   end
@@ -379,7 +380,19 @@ defmodule BeamLisp.Spell.Live do
   # A proposal as beam-lisp source. The values are JSON scalars, lists and
   # maps — no code — so this is a printer, not an evaluator: the model's
   # arguments never become forms that could execute.
-  defp to_bl(value) when is_map(value) do
+  #
+  # A STRUCT reaching here would be a bug rather than data (a proposal comes
+  # from `JSON.decode!`, which produces only plain maps), and printing one
+  # would emit its `:__struct__` key as part of a definition. It fails loudly
+  # instead — the project's is_map lint asks exactly this question, and the
+  # honest answer is that structs are not merely unexpected here, they are
+  # unrepresentable.
+  defp to_bl(%_{} = struct) do
+    raise ArgumentError,
+          "a proposal may only contain JSON data; got the struct #{inspect(struct.__struct__)}"
+  end
+
+  defp to_bl(value) when is_map(value) and not is_struct(value) do
     "{" <> Enum.map_join(value, " ", fn {k, v} -> ":#{k} #{to_bl(v)}" end) <> "}"
   end
 
