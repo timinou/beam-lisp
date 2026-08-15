@@ -81,9 +81,17 @@
         (assoc-in acc [:pushes (keyword nm)] {:fields fields}))
 
       (= head (quote on))
-      ;; (on :inc body…)
+      ;; (on :inc body…) or (on :send [text] body…)
       (let [ev (keyword (binding-name (second clause)))
-            body (rest (rest clause))
+            tail (rest (rest clause))
+            ;; A leading VECTOR is the parameter list. It has to be pulled out
+            ;; here or it is not recorded anywhere: `(on :send [text] …)` used
+            ;; to fold `[text]` into the body, where it evaluated as a literal
+            ;; and the NAMES were lost — invisible while nothing executed a
+            ;; body, fatal the moment `spell.server` did, because the wire is
+            ;; positional and the binder has nothing to bind against.
+            params (if (vector? (first tail)) (mapv name (first tail)) [])
+            body (if (vector? (first tail)) (rest tail) tail)
             whole (if (= 1 (count body)) (first body) (cons (quote do) body))]
         ;; Refuse at PARSE time a body whose replies cannot be enumerated.
         ;; A contract that silently under-reports its tags produces a page
@@ -91,7 +99,7 @@
         ;; browser drops a reply. Better to fail here, where the author can see
         ;; it, than there, where nobody can.
         (assert-enumerable! ev whole)
-        (assoc-in acc [:events ev] {:body whole}))
+        (assoc-in acc [:events ev] {:params params :body whole}))
 
       (= head (quote on-info))
       ;; (on-info [:delta id chunk] body…) — a server-internal message, NOT part
@@ -433,6 +441,129 @@
     ;; sidecar with reply tags still identifies the same contract as one without.
     (str (subs bare 0 (- (count bare) 1))
          ",\"fingerprint\":" (json-str (fingerprint c module)) "}")))
+
+;; ── the BEAM half, as a module ──────────────────────────────────────────────
+;;
+;; The projection that closes the loop. Every other emitter here describes the
+;; seam to somebody else — the page's `@data` forms to verse, the sidecar to the
+;; contract checker — while the server the seam names was left for a human to
+;; write by hand, in another language, in another repo. That is the drift this
+;; whole design exists to remove: `spacetime_lv` hand-writes a LiveView and
+;; DERIVES contract.json from it; here the contract is the source and the
+;; LiveView is derived, so the two cannot disagree about events, assigns,
+;; pushes, or which module the page's `@host` names.
+;;
+;; What is generated is PLUMBING, deliberately:
+;;
+;;   * the `use Spacetime.LiveView` head (bundle, root, and the host shell)
+;;   * the `events`/`assigns`/`pushes` declarations — the same three lists the
+;;     sidecar carries, so the bridge's own E0928 check sees them too
+;;   * one LITERAL `handle_event/3` head per declared event — literal because
+;;     that is what proves to `Spacetime.LiveView.__before_compile__` that a
+;;     declared event actually reaches the server; a catch-all only warns
+;;   * one `handle_info/2` head per `on-info` pattern
+;;
+;; and each head delegates straight to `spell.server`, because the BEHAVIOUR is
+;; already written — in the contract, as data. Generating Elixir that re-states
+;; the body would create a second copy of the logic that could rot; generating
+;; Elixir that CALLS the body keeps exactly one.
+
+(defn- ex-str
+  "An Elixir double-quoted string literal.
+
+   `#{` is escaped as well as quote and backslash: an un-escaped `#{` in Elixir
+   source is INTERPOLATION, so a shell containing one would either fail to
+   compile or — far worse — evaluate whatever followed it at module-compile
+   time, in the generated file, from markup the model may have written."
+  [s]
+  (str "\"" (-> (str s)
+                (replace-str "\\" "\\\\")
+                (replace-str "\"" "\\\"")
+                (replace-str "#{" "\\#{"))
+       "\""))
+
+(defn- ex-fields
+  "A push's field map as an Elixir keyword list: `id: :string, text: :string`."
+  [fields]
+  (join ", " (map (fn [k] (str (entry-name k) ": :" (entry-name (get fields k))))
+                  (sort-by entry-name (keys (or fields {}))))))
+
+(defn- ex-info-head
+  "A `handle_info/2` head for one `on-info` pattern.
+
+   `[:delta id chunk]` → `{:delta, _, _}`. The tag is matched and the arity is
+   fixed; the values are ignored here because the CONTRACT binds them — this
+   head exists to route, not to destructure. Matching arity matters: a pattern
+   that ignored it would swallow a longer message from a later protocol and
+   hand `spell.server` something its clause cannot bind."
+  [pattern]
+  (let [tag (entry-name (first pattern))
+        holes (join ", " (map (fn [_] "_") (rest pattern)))]
+    (if (empty? (rest pattern))
+      (str "{:" tag "}")
+      (str "{:" tag ", " holes "}"))))
+
+(defn elixir-module
+  "The contract's BEAM half as Elixir source: a `Spacetime.LiveView` whose every
+   declaration comes from the contract and whose every callback delegates to
+   `spell.server`.
+
+   `shell` is the host markup the bundle hydrates — lifted from the view's own
+   `&shell` template, never retyped. `module` is the fully-qualified name the
+   page's `@host` declares, so the string that appears here and the string that
+   appears in the emitted `.st` have one source."
+  [c module shell]
+  (let [nm (name (get c :name))
+        opts (get c :opts {})
+        ev-decls (map (fn [e] (str "    event(:" e ")")) (events c))
+        as-decls (map (fn [a] (str "    assign(:" a ", :"
+                                   (entry-name (get-in c [:assigns (keyword a) :type]))
+                                   ")"))
+                      (assigns c))
+        pu-decls (map (fn [p]
+                        (let [f (get-in c [:pushes (keyword p) :fields])]
+                          (if (empty? f)
+                            (str "    push(:" p ")")
+                            (str "    push(:" p ", " (ex-fields f) ")"))))
+                      (pushes c))
+        ev-heads (map (fn [e]
+                        (str "  @impl true\n"
+                             "  def handle_event(\"" e "\", payload, socket),\n"
+                             "    do: BeamLisp.Spell.Server.event(socket, @contract, \"" e "\", payload)"))
+                      (events c))
+        info-heads (map (fn [cl]
+                          (str "  @impl true\n"
+                               "  def handle_info(" (ex-info-head (get cl :pattern)) " = message, socket),\n"
+                               "    do: BeamLisp.Spell.Server.info(socket, @contract, message)"))
+                        (get c :infos []))]
+    (str "# GENERATED by spell.contract/elixir-module from the `" nm "` contract.\n"
+         "# Do not edit: the contract is the source, this file is a projection of it.\n"
+         "# fingerprint: " (fingerprint c module) "\n"
+         "defmodule " module " do\n"
+         "  @moduledoc \"\"\"\n"
+         "  The `" nm "` contract's server half.\n\n"
+         "  Generated from the contract term: the declarations below ARE the\n"
+         "  contract's events, assigns and pushes, and every callback delegates to\n"
+         "  `spell.server`, which walks the handler body the contract carries. The\n"
+         "  behaviour lives in the contract; this module is the plumbing that lets\n"
+         "  Phoenix reach it.\n"
+         "  \"\"\"\n\n"
+         "  use Spacetime.LiveView,\n"
+         "    bundle: " (ex-str (get opts :bundle)) ",\n"
+         "    root: " (ex-str (get opts :root)) ",\n"
+         "    shell: " (ex-str shell) "\n\n"
+         "  @contract " (ex-str nm) "\n\n"
+         "  events do\n" (join "\n" ev-decls) "\n  end\n\n"
+         "  assigns do\n" (join "\n" as-decls) "\n  end\n\n"
+         (if (empty? pu-decls)
+           ""
+           (str "  pushes do\n" (join "\n" pu-decls) "\n  end\n\n"))
+         "  @impl true\n"
+         "  def mount(_params, _session, socket),\n"
+         "    do: BeamLisp.Spell.Server.mount(socket, @contract)\n\n"
+         (join "\n\n" ev-heads) "\n\n"
+         (join "\n\n" info-heads) "\n"
+         "end\n")))
 
 ;; ── defview: the page, as three planes ──────────────────────────────────────
 ;;

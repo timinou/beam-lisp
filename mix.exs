@@ -36,7 +36,17 @@ defmodule BeamLisp.MixProject do
   defp deps do
     [
       {:tidewave, "~> 0.5", only: :dev},
-      {:bandit, "~> 1.5", only: :dev}
+      # Bandit is the endpoint's adapter (config/config.exs), so it is no
+      # longer dev-only: the seam's server half needs an HTTP server wherever
+      # spell runs.
+      {:bandit, "~> 1.5"},
+      # The seam's server half: the emitted page declares `@host $chat :
+      # live("SpellWeb.ChatLive")` and its signals ride the LiveView channel
+      # (window.__stLiveBridge). Phoenix is a LIBRARY here — the endpoint
+      # joins this app's own supervision tree; there is no second app.
+      {:phoenix, "~> 1.8"},
+      {:phoenix_live_view, "~> 1.1"},
+      {:phoenix_pubsub, "~> 2.1"}
     ]
   end
 end

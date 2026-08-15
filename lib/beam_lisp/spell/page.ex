@@ -43,7 +43,7 @@ defmodule BeamLisp.Spell.Page do
   var the caller has already bound).
   """
   def emit(machine_expr, path, opts \\ []) do
-    prefix = Keyword.get(opts, :module_prefix, "SpacetimeLvWeb")
+    prefix = Keyword.get(opts, :module_prefix, "SpellWeb")
 
     with {:ok, seam_edn} <- eval_string("(spell.live/machine-seam-edn #{machine_expr})"),
          {:ok, view_edn} <- eval_string("(spell.live/machine-view-edn #{machine_expr})"),

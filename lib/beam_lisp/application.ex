@@ -7,14 +7,65 @@ defmodule BeamLisp.Application do
   def start(_type, _args) do
     children =
       [BeamLisp.Env] ++
-        if dev_server?() do
+        if dev_server?() and port_free?(9837) do
           # Tidewave MCP endpoint: http://127.0.0.1:9837/tidewave/mcp
           [{Bandit, plug: BeamLisp.DevServer, port: 9837, ip: {127, 0, 0, 1}}]
+        else
+          []
+        end ++
+        if spell_endpoint?() and port_free?(spell_port()) do
+          # The seam's server half. PubSub first: Phoenix.Endpoint reads
+          # `pubsub_server` from config and a LiveView that outlives its
+          # process group would find nothing to (re)join.
+          [{Phoenix.PubSub, name: SpellWeb.PubSub}, SpellWeb.Endpoint]
         else
           []
         end
 
     Supervisor.start_link(children, strategy: :one_for_one, name: BeamLisp.Supervisor)
+  end
+
+  # A listener whose port is already held is SKIPPED rather than fatal.
+  #
+  # Both endpoints here are conveniences: an already-running session owns the
+  # port, and a second `mix run -e '…'` must still be able to evaluate
+  # something. Before this, any such command died with `:eaddrinuse` from a
+  # supervisor three levels down — a message about the wrong subsystem
+  # entirely, produced while the user was debugging something else.
+  #
+  # NB this is a check, not a reservation: a race between check and listen is
+  # possible and still fails loudly. The point is that the COMMON case (a
+  # session is already serving) stops being an unrelated crash.
+  defp port_free?(port) do
+    case :gen_tcp.listen(port, [:binary, ip: {127, 0, 0, 1}, reuseaddr: true]) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+
+      {:error, :eaddrinuse} ->
+        require Logger
+        Logger.info("port #{port} is already held — skipping that listener")
+        false
+
+      {:error, _other} ->
+        true
+    end
+  end
+
+  defp spell_port do
+    case Application.get_env(:beam_lisp, SpellWeb.Endpoint) do
+      nil -> 4030
+      cfg -> get_in(cfg, [:http, :port]) || 4030
+    end
+  end
+
+  # The chat endpoint runs for interactive sessions only, and by the same rule
+  # as the Tidewave one: a `mix test` run or a one-shot `mix run script.exs`
+  # must not bind port 4000 out from under a session that is serving the page.
+  # `mix run --no-halt scripts/serve_live.exs` IS interactive by that rule,
+  # which is what makes it the command that serves spell.
+  defp spell_endpoint? do
+    Code.ensure_loaded?(Mix) and Mix.env() == :dev and not cli_task?()
   end
 
   # The Tidewave endpoint is for interactive sessions (iex -S mix,
