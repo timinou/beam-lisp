@@ -103,6 +103,30 @@ pathlib.Path(sys.argv[2]).write_text(f"""<!doctype html>
     if (el && window.SpacetimeLocal)
       el.textContent = JSON.stringify(window.SpacetimeLocal);
   }}, 250);
+
+  // Auto-reload: the page rebuilds itself when the machine grows.
+  //
+  // The live driver writes report.json on every accepted definition, with a
+  // version counter. Polling THAT rather than the bundle's Last-Modified is
+  // deliberate: a rebuild rewrites spacetime.js even when nothing changed
+  // (timestamps move), so the bundle would reload the page on every emit,
+  // while the version only moves when the machine did.
+  //
+  // Cache-busted because a 304 would freeze the version at whatever the browser
+  // saw first, and the page would sit there while the machine grew.
+  (function () {{
+    var seen = null;
+    setInterval(function () {{
+      fetch("report.json?t=" + Date.now(), {{ cache: "no-store" }})
+        .then(function (r) {{ return r.ok ? r.json() : null; }})
+        .then(function (report) {{
+          if (!report) return;
+          if (seen === null) {{ seen = report.version; return; }}
+          if (report.version !== seen) location.reload();
+        }})
+        .catch(function () {{ /* the driver may not be running; that is fine */ }});
+    }}, 1000);
+  }})();
 </script>
 <script src="spacetime.js"></script>
 </body></html>
