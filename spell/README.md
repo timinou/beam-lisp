@@ -277,22 +277,37 @@ spell/
       store.bl         (ns spell.store)     STORE    ✓ verified
       clay.bl          (ns spell.clay)      PROCESS+BOUNDARY  contract, stubbed
       self.bl          (ns spell.self)      SELF              contract, stubbed
-      providers.bl     (ns spell.providers) AGENT             contract, stubbed
+
+      app.bl           (ns spell.app)       manifest: the app's namespaces
+      seam.bl          (ns spell.seam)      contract term as DATA      ✓
+      contract.bl      (ns spell.contract)  defcontract/defview emit   ✓
+      machine.bl       (ns spell.machine)   accumulating registry      ✓
+      provider.bl      (ns spell.provider)  AGENT: the LLM call        ✓
+      seed.bl          (ns spell.seed)      the seed definition        ✓
 ```
 
-Run: `mix beam_lisp.run spell/src/main.bl` (loader resolves
-`spell.ui` → `spell/src/spell/ui.bl` via the entry file's directory).
+The last six arrived from `priv/` in PLAN-025 W1. `provider.bl` REPLACES the
+`providers.bl` stub this document used to list: the stub's wider surface —
+cassettes, `eval-tool!`, the multi-turn `agent-ask` loop, credential loading —
+is unbuilt work, and it is recorded as such in PLAN-025 rather than as a second
+namespace answering the same need.
+
+Run: `mix beam_lisp.run spell/src/main.bl` (loader resolves `spell.ui` →
+`spell/src/spell/ui.bl` via the entry file's directory). From Elixir, load the
+whole application with `BeamLisp.Spell.init!()`, which requires `spell.app`;
+test suites get `spell/src` on the search path automatically.
 
 ## What unblocks what
 
 ```
 BOUNDARY (data reader) ──► clay.bl (events, frames)  ──► full harness loop
                      ──► self.bl (ns forms as data)
-                     ──► providers.bl (EDN cassettes)
+                     ──► provider.bl (EDN cassettes)
 BUG-002 (nested receive) ─► port wrapper readability (workaround exists: erlang/element)
 hotswap API (compile→binary) ──► self.bl
 BUG-003 (pr-str structs) ──► error reporting anywhere (workaround: print ex-message)
-:httpc-under-mix ──► providers.bl transport choice
+:httpc-under-mix ──► provider.bl transport choice (ANSWERED: mix.exs declares
+                     :inets/:ssl in extra_applications; live_chat.exs runs)
 ```
 
 Nothing in the blocked clusters is *designed-but-unwritable* — their

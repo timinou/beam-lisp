@@ -20,10 +20,18 @@ defmodule BeamLisp.Spell do
   @src "spell/src"
 
   @doc """
-  The absolute path to `spell/src`, resolved from the project root.
+  The absolute path to `spell/src`.
 
-  Resolved against the app's own directory rather than `File.cwd!/0` so a
-  script run from elsewhere still finds it.
+  Resolved from the Mix project's own file when running under Mix (correct even
+  when the task is invoked from a subdirectory), and from cwd otherwise. It is
+  deliberately NOT resolved from `Application.app_dir/1`: under `_build` that is
+  a symlink farm containing compiled artefacts, not the `spell/` source tree.
+
+  Consequence worth naming: this locates the spell application inside THIS
+  checkout. A release or an escript that vendored beam-lisp would need its own
+  path (`BEAM_LISP_PATH`, or `Env.add_search_path/1` directly) — which is why
+  those affordances exist and this one is a convenience over them, not the only
+  way in.
   """
   def src_path do
     Path.join(project_root(), @src)
@@ -36,10 +44,18 @@ defmodule BeamLisp.Spell do
   calling this from every script and every test setup costs nothing after the
   first. Requires `BeamLisp.init/0` to have run.
 
-  `nss` defaults to the machinery plus the seed. Pass an explicit list to load
-  a subset (a provider test needs no view emitter).
+  With no argument it loads `spell.app`, the application's MANIFEST namespace,
+  whose `(:require …)` head names the modules that make up spell. That is one
+  list, in beam-lisp, next to the code it describes — rather than a list of
+  namespace strings here in Elixir that a later wave must remember to update.
+  Globbing `spell/src/spell/*.bl` was the other candidate and is worse: it
+  would load whatever happens to be on disk, including a scratch file, and it
+  would decide load ORDER by filename.
+
+  Pass an explicit list to load a subset — a provider test needs no view
+  emitter, and loading less keeps a unit test's failure surface small.
   """
-  def load!(nss \\ ~w(spell.seam spell.contract spell.machine spell.provider spell.seed)) do
+  def load!(nss \\ ["spell.app"]) do
     BeamLisp.Env.add_search_path(src_path())
     Enum.each(nss, &BeamLisp.Loader.ensure_loaded/1)
     :ok
@@ -51,16 +67,18 @@ defmodule BeamLisp.Spell do
     if nss, do: load!(nss), else: load!()
   end
 
-  # The app dir under _build is a symlink farm; Mix.Project gives the real
-  # source root when available, and cwd is the honest fallback for a script
-  # run through `mix run` from the project root.
+  # Under Mix, the project file's directory is the checkout root regardless of
+  # where the task was invoked from. `Mix.Project.get()` returns nil when no
+  # project is loaded (escript, release, plain iex), and Mix may not be loaded
+  # at all — hence the availability check on Mix.Project itself rather than on
+  # an unrelated function. No rescue: a raise here would mean Mix is loaded,
+  # claims a project, and cannot say where it is, which is a broken assumption
+  # worth surfacing rather than silently degrading to cwd.
   defp project_root do
-    if function_exported?(Mix.Project, :deps_path, 0) and Mix.Project.get() do
+    if Code.ensure_loaded?(Mix.Project) and Mix.Project.get() do
       Path.dirname(Mix.Project.project_file())
     else
       File.cwd!()
     end
-  rescue
-    _ -> File.cwd!()
   end
 end
