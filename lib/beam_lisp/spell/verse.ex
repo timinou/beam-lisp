@@ -210,11 +210,10 @@ defmodule BeamLisp.Spell.Verse do
           {:ok, %{"css" => %{"content" => css}, "js" => %{"content" => js}}} ->
             {:ok, css, js}
 
-          # is_map-ok: this is a JSON.decode! result, not a beam-lisp value — a
-          # decoded JSON object is a plain Elixir map and can never be one of
-          # beam-lisp's struct types. The guard exists only to distinguish an
-          # object from a decoded array or scalar, so that `Map.keys/1` below is
-          # safe when verse's inspect output has an unexpected shape.
+          # A JSON.decode! result is a plain Elixir map and can never be one of
+          # beam-lisp's struct types; the guard only separates an object from a
+          # decoded array or scalar so Map.keys/1 below is safe.
+          # is_map-ok: any decoded JSON object, structs are not reachable here
           {:ok, other} when is_map(other) ->
             {:error, "unexpected inspect shape: #{inspect(Map.keys(other))}"}
 
