@@ -247,9 +247,13 @@ defmodule BeamLisp.Spell.Live do
       page = Path.join(System.tmp_dir!(), "spell_candidate_#{System.unique_integer([:positive])}.st")
 
       try do
+        # The bind selectors are handed to rung 4 so it judges OUR page rather
+        # than verse's runtime, which also ships `querySelector` calls.
+        selectors = bl_json(Compiler.eval_string("(spell.live/machine-bind-selectors candidate-machine)"))
+
         with {:ok, _} <- Spell.Page.emit("candidate-machine", page),
-             {:ok, _} <- Spell.Verse.verify(page) do
-          {:ok, Compiler.eval_string("(spell.machine/report candidate-machine [])")}
+             {:ok, _} <- Spell.Verse.verify(page, selectors) do
+          {:ok, Compiler.eval_string("(spell.live/machine-report candidate-machine)")}
         else
           {:error, %{rung: rung, reason: reason}} ->
             {:error, %{status: :rejected, rung: rung, reason: reason}}
@@ -313,7 +317,7 @@ defmodule BeamLisp.Spell.Live do
     %{
       version: state.version,
       transcript: Enum.reverse(state.transcript),
-      machine: bl_json(Compiler.eval_string("(spell.machine/report live-machine [])"))
+      machine: bl_json(Compiler.eval_string("(spell.live/machine-report live-machine)"))
     }
   end
 

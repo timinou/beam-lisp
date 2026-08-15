@@ -231,19 +231,64 @@ defmodule BeamLisp.Spell.Verse do
   end
 
   @doc """
-  Rung 4 — styled selectors that nothing renders.
+  Rung 4 — selectors that name nothing the page renders.
 
-  `{:ok, []}` when clean, `{:ok, ghosts}` when the page styles classes the
-  compiled markup never produces, `{:error, reason}` when verse could not be
-  asked. Note the distinction: an empty ghost list is a PASS, while an error is
-  "this rung did not run" — collapsing them would let a broken toolchain read
-  as a clean page.
+  Two joins over the compiler's own output, both `… minus rendered`:
+
+    * STYLED but not rendered — a rule matching no element. Silent: CSS does
+      not create DOM.
+    * BOUND but not rendered — behaviour attached to an element that does not
+      exist. Worse than silent: the definition looks complete, compiles, styles
+      correctly, and does nothing.
+
+  The second was found by the demo. A model-proposed `clock` view bound
+  `.clock`, no markup rendered a `.clock` element, and the definition passed
+  rungs 1–4 while the browser showed no clock — the page correct about
+  everything except existing.
+
+  ## The bind join takes its LEFT side from our own selectors
+
+  Scanning the bundle for every `querySelector` was the obvious implementation
+  and it is wrong: the emitted JS contains verse's RUNTIME as well as our page,
+  so the seeded machine reported `.ad-form`, `.ad-preview-frame` and friends —
+  library code we did not write and cannot judge. `bound_selectors` is passed in
+  by the caller, who knows which selectors the machine declared; only those are
+  joined against what the compiler rendered.
+
+  `{:ok, %{ghosts: [], unmounted: []}}` when clean; an error when verse could
+  not be asked — never conflated with a clean page.
   """
-  def ghosts(st_path) do
+  def ghosts(st_path, bound_selectors \\ []) do
     with {:ok, bin} <- binary(),
          {:ok, css, js} <- emit_layers(bin, st_path) do
-      {:ok, styled_classes(css) -- rendered_classes(js)}
+      rendered = rendered_classes(js)
+
+      {:ok,
+       %{
+         ghosts: styled_classes(css) -- rendered,
+         unmounted: class_tokens(bound_selectors) -- rendered
+       }}
     end
+  end
+
+  @doc """
+  The single-class tokens among a list of selectors.
+
+  Conservative on purpose: `.log` yields `log`, while `.a .b`, `.a[x]`, `#id`
+  and `main` yield nothing. A compound or attribute selector may legitimately
+  match host markup the machine never emitted — `&shell` is mounted by the host
+  page — so the check fires only where attribution is certain.
+  """
+  def class_tokens(selectors) do
+    selectors
+    |> Enum.flat_map(fn sel ->
+      case Regex.run(~r/\A\.([A-Za-z_][-\w]*)\z/, String.trim(to_string(sel))) do
+        [_, cls] -> [cls]
+        _ -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp emit_layers(bin, st_path) do
@@ -336,17 +381,28 @@ defmodule BeamLisp.Spell.Verse do
   meaningful emit layer to join against, and reporting a ghost-selector list
   derived from a failed compile would be reporting noise as a finding.
   """
-  def verify(st_path) do
+  def verify(st_path, bound_selectors \\ []) do
     case check(st_path) do
       {:error, diag} ->
         {:error, %{rung: :compile, reason: diag}}
 
       {:ok, :compiled} ->
-        case ghosts(st_path) do
-          {:ok, []} ->
-            {:ok, %{ghosts: []}}
+        case ghosts(st_path, bound_selectors) do
+          {:ok, %{ghosts: [], unmounted: []}} ->
+            {:ok, %{ghosts: [], unmounted: []}}
 
-          {:ok, ghosts} ->
+          {:ok, %{ghosts: [], unmounted: unmounted}} ->
+            {:error,
+             %{
+               rung: :ghosts,
+               reason:
+                 "bind selector(s) no template renders: " <>
+                   Enum.map_join(unmounted, ", ", &".#{&1}") <>
+                   " — behaviour attached to an element that does not exist " <>
+                   "compiles, styles correctly and does nothing"
+             }}
+
+          {:ok, %{ghosts: ghosts}} ->
             {:error,
              %{
                rung: :ghosts,

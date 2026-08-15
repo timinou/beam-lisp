@@ -64,9 +64,14 @@ defmodule DefineCheck do
     {:ok, path} = emit_seed()
 
     case Spell.Verse.ghosts(path) do
-      {:ok, []} -> pass("rung 4: the seeded machine has no ghost selectors")
-      {:ok, ghosts} -> fail("rung 4: the shipped page should have no ghosts", inspect(ghosts))
-      {:error, reason} -> fail("rung 4: could not ask verse", reason)
+      {:ok, %{ghosts: [], unmounted: []}} ->
+        pass("rung 4: the seeded machine has no ghost or unmounted selectors")
+
+      {:ok, found} ->
+        fail("rung 4: the shipped page should be clean", inspect(found))
+
+      {:error, reason} ->
+        fail("rung 4: could not ask verse", reason)
     end
   end
 
@@ -82,7 +87,7 @@ defmodule DefineCheck do
     case Spell.Verse.check(path) do
       {:ok, :compiled} ->
         case Spell.Verse.ghosts(path) do
-          {:ok, ghosts} ->
+          {:ok, %{ghosts: ghosts}} ->
             if "phantom-never-rendered" in ghosts do
               pass("rung 4: a styled-but-unrendered class IS caught (#{inspect(ghosts)})")
             else

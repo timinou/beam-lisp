@@ -44,8 +44,14 @@ curl -sf "$URL" >/dev/null 2>&1 \
   || { echo "peek: nothing serving at $URL — is serve_chat.sh running?" >&2; exit 1; }
 
 # ── 1. screenshot ───────────────────────────────────────────────────────────
+#
+# `--timeout` bounds the run in WALL-CLOCK time, which `--virtual-time-budget`
+# does not: the served page polls report.json on an interval that never stops,
+# and virtual time advances while timers are pending — so chrome hung on a page
+# that was rendering perfectly (found by the demo harness hanging on exactly
+# this).
 "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
-  --force-device-scale-factor=2 --virtual-time-budget=6000 \
+  --force-device-scale-factor=2 --virtual-time-budget=6000 --timeout=20000 \
   --window-size=960,800 --screenshot="$OUT/screen.png" "$URL" >/dev/null 2>&1
 
 SIZE=$(stat -c %s "$OUT/screen.png" 2>/dev/null || echo 0)
@@ -58,7 +64,7 @@ echo "peek: screen.png  ${SIZE}B"
 # ── 2. interface data state ─────────────────────────────────────────────────
 # virtual-time-budget lets the host's 250ms snapshot interval actually fire.
 "$CHROME" --headless --disable-gpu --no-sandbox \
-  --virtual-time-budget=4000 --dump-dom "$URL" 2>/dev/null \
+  --virtual-time-budget=4000 --timeout=20000 --dump-dom "$URL" 2>/dev/null \
   | python3 -c '
 import html, json, re, sys
 dom = sys.stdin.read()
