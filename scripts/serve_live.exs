@@ -30,9 +30,6 @@ defmodule ServeLive do
   @out Application.compile_env(:beam_lisp, :spell_static_dir, "/tmp/chat-serve")
   @gen "spell/gen"
 
-  # The name the machine's holder answers to. A named Agent so the resolver
-  # registered with `Spell.Server` can reach it without closing over a pid.
-  @machine ServeLive.Machine
 
   def run do
     load_env()
@@ -41,19 +38,23 @@ defmodule ServeLive do
     File.mkdir_p!(@out)
     File.mkdir_p!(@gen)
 
-    step("LOAD — the machine")
+    step("LOAD — the machine, and the loop that owns it")
     Spell.init!(["spell.app", "spell.live"])
 
-    # The machine is a VALUE, held in a named Agent for the life of the server.
+    # THE LOOP, under its registered name. Not optional, and not a detail:
+    # `BeamLisp.Spell.Server.maybe_ask/3` looks for exactly this process, and
+    # without it every browser turn silently takes the toolless fallback — the
+    # model answers with prose and can propose nothing, which is the ORIGINAL
+    # defect this whole plan exists to fix.
     #
-    # It was `(def live-machine …)` — a var in the process-global BeamLisp.Env —
-    # and `BeamLisp.Spell.Live.init/1` wrote the SAME name. Last writer won,
-    # silently, so whichever started second decided which machine every event
-    # ran against. There was no way to notice: both writes succeed.
+    # It also owns the machine. An Agent holding a second copy was the first
+    # shape of this and it is the same mistake in a new coat: two owners, and
+    # the one the ladder writes to is not the one the page reads from. The loop
+    # is the only writer, so `machine/0` asks it.
     #
-    # An Agent rather than a bare value because the resolver below is called on
-    # every event and must see the CURRENT machine as definitions are accepted.
-    {:ok, _} = Agent.start_link(fn -> seeded_machine() end, name: @machine)
+    # `publish: true` — an accepted definition must re-emit the page and rebuild
+    # the bundle into `@out`, which is what the browser then reloads.
+    {:ok, _} = BeamLisp.Spell.Live.start_link(out: @out)
 
     contracts =
       bl("spell.machine", "contracts", [machine()])
@@ -97,19 +98,30 @@ defmodule ServeLive do
 
     say("chat-live → live-machine's registered contract")
 
-    step("EMIT — the page, from the machine")
-    {:ok, page} = Spell.Page.emit(machine(), Path.join(@out, "page.st"))
-    say("#{page} (#{File.stat!(page).size} B)")
+    step("PUBLISH — the page and the bundle, from the loop")
+    # Emitting here was a SECOND publisher. The loop already emits and builds
+    # into `@out` on start and after every accepted definition — that is what a
+    # browser reloads onto — so a copy here would only differ when they
+    # disagreed, which is exactly when it would be believed.
+    #
+    # `rebuild/1` is the ask: re-emit and rebuild, without changing the
+    # machine. The loop has already done it once during `init`; this reports
+    # the outcome rather than repeating the work silently.
+    :ok = BeamLisp.Spell.Live.rebuild()
 
-    step("BUILD — the bundle (verse)")
+    page = Path.join(@out, "page.st")
 
-    case build(page) do
-      {:ok, dir} ->
-        say("#{dir}/spacetime.js + spacetime.css")
+    case BeamLisp.Spell.Live.state().machine do
+      %{"errors" => []} -> :ok
+      %{"errors" => errors} -> say("machine reports #{length(errors)} error(s): #{inspect(errors)}")
+    end
 
-      {:error, reason} ->
-        say("BUILD FAILED: #{reason}")
-        say("the page will 404 its bundle until this is fixed")
+    if File.exists?(page) do
+      say("#{page} (#{File.stat!(page).size} B)")
+      say("#{bundle_dir()}/spacetime.js + spacetime.css")
+    else
+      say("PUBLISH FAILED: no page at #{page}")
+      say("the browser will 404 its bundle until this is fixed")
     end
 
     step("SERVE")
@@ -126,42 +138,14 @@ defmodule ServeLive do
     """)
   end
 
-  # The bundle is built into the subdirectory the CONTRACT names. `:bundle` is
-  # "/spacetime/chat/spacetime.js" and the endpoint serves `@out` at
-  # `/spacetime`, so the build target is `<out>/chat` — derived from the
-  # contract rather than agreed by convention, because a mismatch here is a
-  # page that loads a 404 and shows nothing, with no error anywhere on the
-  # server.
-  defp bundle_dir do
-    url =
-      BeamLisp.Env.fetch!("spell.seed", "contract-term")
-      |> Map.get(:opts, %{})
-      |> Map.get(:bundle)
-
-    dir =
-      url
-      |> to_string()
-      |> String.replace_prefix("/spacetime", "")
-      |> Path.dirname()
-      |> String.trim_leading("/")
-
-    Path.join([@out | String.split(dir, "/", trim: true)])
-  end
-
-  defp build(page) do
-    out = bundle_dir()
-    File.mkdir_p!(out)
-
-    with {:ok, bin} <- Spell.Verse.binary() do
-      case System.cmd(bin, ["build", Path.expand(page), "-o", Path.expand(out)],
-             cd: Spell.Verse.verse_root(),
-             stderr_to_stdout: true
-           ) do
-        {_out, 0} -> {:ok, out}
-        {out, code} -> {:error, "spacetime build exited #{code}: #{String.trim(out)}"}
-      end
-    end
-  end
+  # Where the bundle lands — asked of the loop, which builds it.
+  #
+  # This function used to derive it here while `Spell.Live` built into `@out`
+  # itself, so an accepted definition rebuilt into a directory the page never
+  # loaded: the browser kept serving the old bundle while `report.json`
+  # announced a new version. One derivation now, in the module that does the
+  # building.
+  defp bundle_dir, do: BeamLisp.Spell.Live.bundle_dir(@out, machine())
 
   # Provider credentials: the real environment, then `.env`, then the agent's
   # credential db. `BeamLisp.Spell.Credentials` owns the precedence — four
@@ -194,17 +178,11 @@ defmodule ServeLive do
     |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
   end
 
-  # The machine every session starts from.
-  defp seeded_machine do
-    bl("spell.live", "seeded", [
-      bl("spell.machine", "empty-machine", []),
-      BeamLisp.Env.fetch!("spell.seed", "contract-term"),
-      BeamLisp.Env.fetch!("spell.seed", "view-term")
-    ])
-  end
-
-  # The current machine. One owner, one answer.
-  defp machine, do: Agent.get(@machine, & &1)
+  # The current machine — asked of the process that owns it.
+  #
+  # One owner, one answer. Anything else is a copy that goes stale the moment a
+  # definition lands.
+  defp machine, do: BeamLisp.Spell.Live.machine()
 
   # `<ns>/<name>` applied to values. Fetched per call so a REDEFINED var is the
   # one that runs — the premise of the whole system.

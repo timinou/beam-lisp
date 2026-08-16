@@ -47,6 +47,10 @@ defmodule SpellWeb.ChatLive do
     do: BeamLisp.Spell.Server.info(socket, @contract, message)
 
   @impl true
+  def handle_info({:defined, _, _} = message, socket),
+    do: BeamLisp.Spell.Server.info(socket, @contract, message)
+
+  @impl true
   def handle_info({:failed, _, _} = message, socket),
     do: BeamLisp.Spell.Server.info(socket, @contract, message)
 end

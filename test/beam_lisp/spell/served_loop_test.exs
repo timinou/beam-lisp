@@ -161,6 +161,62 @@ defmodule BeamLisp.Spell.ServedLoopTest do
     end
   end
 
+  describe "every verdict reaches the user" do
+    test "a refusal and an acceptance in one turn both land in the transcript" do
+      # A turn can carry several `define` calls. When a refusal was sent as a
+      # `[:delta …]` it accumulated into `@partial`, and the next acceptance's
+      # `[:defined …]` CLEARED that buffer — so the user saw the success and
+      # never learned why the other proposal was rejected.
+      #
+      # Driven as raw messages rather than through a provider, because the
+      # shape being tested is the message protocol itself: what the contract
+      # does with two verdicts in one turn.
+      socket = socket()
+
+      messages = [
+        {:defined, "m1", "✗ the definition was refused at the ghosts rung: .nowhere renders nothing"},
+        {:defined, "m1", "✓ defined view \"clock\" — a timestamped clock face"},
+        {:done, "m1"}
+      ]
+
+      socket =
+        Enum.reduce(messages, socket, fn message, acc ->
+          {:noreply, next} = Server.info(acc, "chat-live", message)
+          next
+        end)
+
+      texts = Enum.map(socket.assigns.messages, & &1["text"])
+
+      assert length(texts) == 2,
+             "a verdict was lost: #{inspect(texts)}"
+
+      assert Enum.any?(texts, &(&1 =~ "refused at the ghosts rung")),
+             "the refusal never reached the user"
+
+      assert Enum.any?(texts, &(&1 =~ "defined view")),
+             "the acceptance never reached the user"
+    end
+
+    test "a turn that only streams prose still commits it on done" do
+      # The mirror of the bug above: guarding `done` on `@partial` must not
+      # drop a real answer.
+      socket = socket()
+
+      socket =
+        Enum.reduce(
+          [{:delta, "m1", "hello "}, {:delta, "m1", "world"}, {:done, "m1"}],
+          socket,
+          fn message, acc ->
+            {:noreply, next} = Server.info(acc, "chat-live", message)
+            next
+          end
+        )
+
+      assert List.last(socket.assigns.messages)["text"] == "hello world"
+      assert socket.assigns.partial == ""
+    end
+  end
+
   describe "an ordinary answer still streams" do
     test "content arrives as deltas and joins the transcript" do
       # The tool path must not have replaced the prose path. A model that

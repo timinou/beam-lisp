@@ -187,11 +187,39 @@ defmodule BeamLisp.Spell.Live do
   """
   def ask_async(server \\ __MODULE__, text, reply_to) do
     id = "m#{System.unique_integer([:positive])}"
+
+    # EVERYTHING that can block runs in the spawned process, including the two
+    # calls into the loop.
+    #
+    # They used to run here, in the LiveView's own process, and that is a stall
+    # a user feels: the loop is single-threaded and a ladder run holds it for
+    # ~4s (two `spacetime` invocations). A second tab pressing Send during that
+    # window blocked in `handle_event` — the page frozen, no thinking
+    # indicator, no way to tell whether the click registered.
+    #
+    # Worse, a `GenServer.call` to a dead or overloaded loop EXITS the caller,
+    # and the caller was the LiveView: the browser's socket dropped and the
+    # transcript went with it. Now the failure is a `[:failed …]` message the
+    # contract renders.
+    spawn(fn -> start_turn(server, text, reply_to, id) end)
+    id
+  end
+
+  # A turn, from the spawned process: ask the loop what to send, then stream.
+  #
+  # Wrapped so that NOTHING can leave the page without an answer. A crash here
+  # — the loop down, a timeout, a bug in the ladder — used to mean the
+  # collector never sent `[:done …]`, and the page's thinking indicator ran
+  # forever with no error and no recovery short of a reload. `@status` stuck on
+  # `:thinking` is the single most confusing state this system can produce,
+  # because it is indistinguishable from a slow model.
+  defp start_turn(server, text, reply_to, id) do
     cfg = GenServer.call(server, :turn_cfg, 30_000)
     messages = GenServer.call(server, {:record_user, text}, 30_000)
-
-    spawn(fn -> run_turn(server, cfg, messages, reply_to, id) end)
-    id
+    run_turn(server, cfg, messages, reply_to, id)
+  catch
+    kind, reason ->
+      send(reply_to, {:failed, id, "the turn could not start: #{inspect({kind, reason})}"})
   end
 
   # ── handlers ──────────────────────────────────────────────────────────────
@@ -313,7 +341,19 @@ defmodule BeamLisp.Spell.Live do
     # An answer the page assembled must also reach the TRANSCRIPT, or the next
     # turn is sent a conversation missing its own last reply — and the model
     # answers as if it had said nothing.
-    if text != "", do: GenServer.call(server, {:record_model, text}, 30_000)
+    #
+    # But `[:done …]` is sent WHATEVER happens to that record. A failed
+    # bookkeeping call must not cost the user their answer AND leave the
+    # thinking indicator spinning: the page already holds the streamed text in
+    # `@partial`, and `done` is what commits it. Losing the loop's copy costs
+    # the NEXT turn some context; losing `done` costs this one entirely.
+    try do
+      if text != "", do: GenServer.call(server, {:record_model, text}, 30_000)
+    catch
+      kind, reason ->
+        require Logger
+        Logger.warning("spell.live: the transcript did not record a turn: #{inspect({kind, reason})}")
+    end
 
     send(reply_to, {:done, id})
   end
@@ -325,16 +365,36 @@ defmodule BeamLisp.Spell.Live do
   # fail, the proposal did, and the difference is what the user needs to read.
   defp handle_tool_calls(server, reply_to, id, calls) do
     for call <- calls do
-      verdict = GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
+      # A ladder that crashes is reported, not propagated: the spawned turn
+      # dying here would take `[:done …]` with it and strand the page.
+      verdict =
+        try do
+          GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
+        catch
+          kind, reason ->
+            %{status: :error, rung: :loop, reason: inspect({kind, reason})}
+        end
 
       case verdict.status do
         :ok ->
           send(reply_to, {:defined, id, "✓ " <> definition_summary(call)})
 
         _ ->
+          # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
+          #
+          # As a delta it accumulated into `@partial`, and the next accepted
+          # call's `[:defined …]` cleared that buffer — so on a turn proposing
+          # two things, one refused and one accepted, the user saw only the
+          # success and never learned why the other was rejected. Reproduced by
+          # replaying that message sequence.
+          #
+          # Every verdict is a completed statement about a proposal, so every
+          # verdict lands in the transcript as its own turn. `[:defined …]` is
+          # named for the EVENT (a definition was decided), not for the
+          # outcome; the text carries ✓ or ✗.
           send(
             reply_to,
-            {:delta, id,
+            {:defined, id,
              "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
                "#{first_line(verdict[:reason])}"}
           )
@@ -529,7 +589,7 @@ defmodule BeamLisp.Spell.Live do
 
     build =
       with {:ok, _} <- Spell.Page.emit(state.machine, page),
-           :ok <- build_bundle(page, state.out) do
+           :ok <- build_bundle(page, state.out, state.machine) do
         :ok
       end
 
@@ -537,9 +597,12 @@ defmodule BeamLisp.Spell.Live do
     %{state | last_build: build}
   end
 
-  defp build_bundle(page, out) do
+  defp build_bundle(page, out, machine) do
+    target = bundle_dir(out, machine)
+    File.mkdir_p!(target)
+
     with {:ok, bin} <- Spell.Verse.binary() do
-      case System.cmd(bin, ["build", Path.expand(page), "-o", Path.expand(out)],
+      case System.cmd(bin, ["build", Path.expand(page), "-o", Path.expand(target)],
              cd: Spell.Verse.verse_root(),
              stderr_to_stdout: true
            ) do
@@ -547,6 +610,49 @@ defmodule BeamLisp.Spell.Live do
         {out, code} -> {:error, "spacetime build exited #{code}: #{String.trim(out)}"}
       end
     end
+  end
+
+  @doc """
+  Where the bundle for `machine` belongs under `out`.
+
+  DERIVED from the contract's own `:bundle` option, never agreed by convention.
+  The contract says `"/spacetime/chat/spacetime.js"` and the endpoint serves
+  `out` at `/spacetime`, so the build target is `<out>/chat`.
+
+  This existed only in `scripts/serve_live.exs` while the loop built into `out`
+  itself — so an accepted definition rebuilt into a directory the page never
+  loads. The browser would keep serving the old bundle while `report.json`
+  announced a new version, and the page would reload onto exactly what it was
+  already showing: a machine that grows and a page that never changes, with no
+  error anywhere. One derivation, so the two cannot disagree.
+
+  Falls back to `out` when no contract declares a bundle — a machine with no
+  contracts has no page to place, and guessing a subdirectory would be worse
+  than putting it where the caller asked.
+  """
+  def bundle_dir(out, machine) do
+    case bundle_url(machine) do
+      nil ->
+        out
+
+      url ->
+        sub =
+          url
+          |> to_string()
+          |> String.replace_prefix("/spacetime", "")
+          |> Path.dirname()
+          |> String.trim_leading("/")
+
+        Path.join([out | String.split(sub, "/", trim: true)])
+    end
+  end
+
+  defp bundle_url(machine) do
+    bl("spell.machine", "contracts", [machine])
+    |> BeamLisp.Vector.to_list()
+    |> Enum.find_value(fn contract ->
+      contract |> Map.get(:opts, %{}) |> Map.get(:bundle)
+    end)
   end
 
   # report.json is the repl state, on disk. Written on every publish INCLUDING
