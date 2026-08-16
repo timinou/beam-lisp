@@ -63,9 +63,21 @@ defmodule BeamLisp.Spell.ServedLoopTest do
     :ok
   end
 
+  # A socket whose assigns are the contract's DECLARED initials, with no
+  # restored conversation.
+  #
+  # `Server.mount/2` deliberately seeds from the loop's transcript, so a
+  # reloaded browser finds the conversation it was having. That is correct in
+  # production and wrong for a test asserting what ONE turn produces: every
+  # earlier test's turns would arrive with it, and the assertions would drift
+  # as the suite grew.
+  #
+  # So a test that examines a single turn starts from the declared seed, and
+  # the test that examines RESTORATION mounts through `Server.mount/2` and says
+  # so. Two different questions, two different starting points.
   defp socket do
     {:ok, socket} = Server.mount(%Phoenix.LiveView.Socket{}, "chat-live")
-    socket
+    Phoenix.Component.assign(socket, :messages, [])
   end
 
   # Drain the LiveView's mailbox into a list, feeding each message through the
@@ -119,9 +131,21 @@ defmodule BeamLisp.Spell.ServedLoopTest do
     @tag :verse
     test "send → a recorded tool call → the ladder → a bigger machine" do
       # The end-to-end claim, offline.
-      before = Live.state().machine["views"]
-      refute "clock" in before, "the fixture view already exists — the test proves nothing"
-
+      #
+      # ORDER-INDEPENDENT, deliberately.
+      #
+      # The obvious form — snapshot `views`, assert it grew — depends on no
+      # sibling test having defined `clock` first, and `Server.maybe_ask/3`
+      # finds the loop by its REGISTERED name, so a private loop cannot be
+      # substituted. A guard caught the collision once; a growth test that
+      # depends on execution order will lie eventually.
+      #
+      # So the claim is made two ways that do not care about order:
+      #   1. the view IS in the machine afterwards
+      #   2. the page received a ✓ VERDICT for it during this turn
+      # (2) is what proves the event reached `define` NOW rather than earlier —
+      # a second definition of an existing view is a legitimate no-op, but it
+      # still walks the ladder and still answers.
       socket = with_cassette("stream-tool-call", fn -> ask_and_drain("add a clock") end)
 
       assert "clock" in Live.state().machine["views"],
@@ -158,6 +182,37 @@ defmodule BeamLisp.Spell.ServedLoopTest do
 
       assert socket.assigns.status == "idle",
              "the thinking indicator never stopped after a refusal"
+    end
+  end
+
+  describe "the conversation survives the reload it causes" do
+    @tag :verse
+    test "a remounted page seeds from the loop's transcript" do
+      # The page reloads itself when the machine grows — that is the point —
+      # and a reload REMOUNTS the LiveView, which seeds from the contract's
+      # declared initials: an empty transcript.
+      #
+      # So asking for a clock worked, the page rebuilt, and the message that
+      # asked for it vanished at the exact moment the clock appeared. Observed
+      # in a browser; it reads as the send having failed.
+      with_cassette("stream-tool-call", fn -> ask_and_drain("add a clock please") end)
+
+      # A FRESH mount, as a reloaded browser performs.
+      {:ok, remounted} = Server.mount(%Phoenix.LiveView.Socket{}, "chat-live")
+      texts = Enum.map(remounted.assigns.messages, & &1["text"])
+
+      assert Enum.any?(texts, &(&1 =~ "add a clock please")),
+             "the user's own message did not survive the reload: #{inspect(texts)}"
+
+      assert Enum.any?(texts, &(&1 =~ "defined view")),
+             "the verdict did not survive the reload: #{inspect(texts)}"
+
+      # NOT asserted here: that the machine grew. A sibling test may have
+      # already defined `clock`, and the second definition of a view the
+      # machine holds is legitimately a no-op. What this test is about is the
+      # TRANSCRIPT surviving a remount, and `views` would only make it
+      # order-dependent. The growth claim lives in its own test above.
+      assert length(texts) >= 2
     end
   end
 

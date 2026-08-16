@@ -38,6 +38,40 @@ defmodule SpellWeb.Layouts do
         </script>
         <script src="/assets/js/spacetime_bridge.js">
         </script>
+        <script>
+          // THE PAGE REBUILDS ITSELF WHEN THE MACHINE GROWS.
+          //
+          // An accepted definition re-emits the page, rebuilds the bundle and
+          // bumps a version in `report.json`. Without this poll the browser
+          // keeps running the bundle it loaded: the model says "✓ defined view
+          // clock", the machine really did grow, and the page shows no clock
+          // — which reads as the definition having done nothing.
+          //
+          // Polling the VERSION rather than the bundle's Last-Modified: the
+          // build is not byte-stable across runs (timestamps move), so the
+          // bundle would reload the page on every emit, while the version only
+          // moves when the machine did.
+          //
+          // Cache-busted because a 304 would freeze the version at whatever
+          // the browser first saw. `no-store` is set server-side too; both,
+          // because either alone has been observed to lose this race.
+          (function () {
+            var seen = null;
+            setInterval(function () {
+              fetch("/spacetime/report.json?t=" + Date.now(), { cache: "no-store" })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (report) {
+                  if (!report) return;
+                  // The FIRST reading establishes the baseline. Reloading on
+                  // it would reload every fresh tab exactly once, which looks
+                  // like a flicker nobody can explain.
+                  if (seen === null) { seen = report.version; return; }
+                  if (report.version !== seen) location.reload();
+                })
+                .catch(function () {});
+            }, 1000);
+          })();
+        </script>
       </head>
       <body>
         {@inner_content}

@@ -229,6 +229,9 @@ defmodule BeamLisp.Spell.Live do
 
   def handle_call(:machine, _from, state), do: {:reply, state.machine, state}
 
+  def handle_call(:transcript, _from, state),
+    do: {:reply, Enum.reverse(state.transcript), state}
+
   def handle_call({:define, proposal}, _from, state) do
     {verdict, state} = apply_proposal(proposal, state)
     {:reply, verdict, state}
@@ -375,9 +378,19 @@ defmodule BeamLisp.Spell.Live do
             %{status: :error, rung: :loop, reason: inspect({kind, reason})}
         end
 
+      # A verdict is recorded in the loop's transcript as well as sent to the
+      # page, and that is not bookkeeping — it is what survives the reload.
+      #
+      # An accepted definition rebuilds the page, the browser reloads, and the
+      # LiveView remounts seeding from this transcript. A verdict that lived
+      # only in the socket's assigns disappeared at exactly the moment its
+      # definition arrived: the user saw the clock appear and the sentence
+      # explaining it vanish.
       case verdict.status do
         :ok ->
-          send(reply_to, {:defined, id, "✓ " <> definition_summary(call)})
+          text = "✓ " <> definition_summary(call)
+          record(server, text)
+          send(reply_to, {:defined, id, text})
 
         _ ->
           # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
@@ -392,16 +405,27 @@ defmodule BeamLisp.Spell.Live do
           # verdict lands in the transcript as its own turn. `[:defined …]` is
           # named for the EVENT (a definition was decided), not for the
           # outcome; the text carries ✓ or ✗.
-          send(
-            reply_to,
-            {:defined, id,
-             "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
-               "#{first_line(verdict[:reason])}"}
-          )
+          text =
+            "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
+              "#{first_line(verdict[:reason])}"
+
+          record(server, text)
+          send(reply_to, {:defined, id, text})
       end
     end
 
     finish(server, reply_to, id, [])
+  end
+
+  # Record a model turn, tolerating a loop that cannot answer. See `finish/4`:
+  # losing the record costs the next turn some context, and must never cost
+  # this turn its `[:done …]`.
+  defp record(server, text) do
+    GenServer.call(server, {:record_model, text}, 30_000)
+  catch
+    kind, reason ->
+      require Logger
+      Logger.warning("spell.live: a verdict did not reach the transcript: #{inspect({kind, reason})}")
   end
 
   defp definition_summary(call) do
@@ -688,6 +712,37 @@ defmodule BeamLisp.Spell.Live do
   question with one answer.
   """
   def machine(server \\ __MODULE__), do: GenServer.call(server, :machine, 30_000)
+
+  @doc """
+  The conversation, shaped as the page's `@messages` assign.
+
+  `[%{"role" => "user" | "model", "text" => …}]` — what a mount seeds with, so a
+  browser that reloads finds the conversation it was having.
+
+  ## Why this exists
+
+  The page reloads itself when the machine grows: that is the whole point, and
+  it is triggered by the version in `report.json` moving. But a reload remounts
+  the LiveView, and `mount` seeds from the contract's DECLARED INITIALS — an
+  empty transcript. So asking for a clock worked, the page rebuilt, and the
+  conversation that asked for it disappeared. Observed in a browser: the user
+  sees their message vanish at the exact moment the thing they asked for
+  arrives, which reads as the send having failed.
+
+  The loop already holds the transcript, because it is the thing that survives
+  a page. Seeding from it is what makes the reload invisible.
+
+  Only user and model turns: `:system` notes and `:proposal` entries are for
+  the report and the console, not for a chat bubble.
+  """
+  def transcript_messages(server \\ __MODULE__) do
+    server
+    |> GenServer.call(:transcript, 30_000)
+    |> Enum.filter(&(&1.role in [:user, :model]))
+    |> Enum.map(fn %{role: role, content: content} ->
+      %{"role" => to_string(role), "text" => to_string(content)}
+    end)
+  end
 
   # ── transcript ────────────────────────────────────────────────────────────
 

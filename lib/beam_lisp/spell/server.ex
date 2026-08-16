@@ -128,7 +128,36 @@ defmodule BeamLisp.Spell.Server do
   """
   def mount(socket, contract) do
     seed = Data.from_bl(call("seed-assigns", [contract_term(contract), %{}]))
-    {:ok, assign_all(socket, seed)}
+
+    # The contract's declared initials, then the LOOP's transcript on top.
+    #
+    # The page reloads itself when the machine grows — that is the point — and a
+    # reload remounts this LiveView, which seeds from the declarations: an
+    # empty conversation. So asking for a clock worked, the page rebuilt, and
+    # the message that asked for it vanished at the exact moment the clock
+    # appeared. Observed in a browser; it reads as the send having failed.
+    #
+    # The loop holds the transcript because it is the thing that outlives a
+    # page. Merging it here is what makes the reload invisible.
+    #
+    # Only when a loop is running: without one there is no conversation to
+    # restore, and the declared empty transcript is correct.
+    {:ok, assign_all(socket, Map.merge(seed, restored_messages()))}
+  end
+
+  defp restored_messages do
+    if loop_running?() do
+      case BeamLisp.Spell.Live.transcript_messages() do
+        [] -> %{}
+        messages -> %{"messages" => messages}
+      end
+    else
+      %{}
+    end
+  rescue
+    # A loop that is starting, stopping or wedged must not stop a page from
+    # mounting: an empty transcript is a worse page, a failed mount is no page.
+    _ -> %{}
   end
 
   @doc """
