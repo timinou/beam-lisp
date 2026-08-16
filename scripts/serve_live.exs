@@ -154,6 +154,35 @@ defmodule ServeLive do
     step("SERVE")
     port = Application.get_env(:beam_lisp, SpellWeb.Endpoint)[:http][:port] || 4000
 
+    # The endpoint is a CONVENIENCE for `mix run -e` and a REQUIREMENT here.
+    #
+    # `BeamLisp.Application` skips a listener whose port is already held, so a
+    # throwaway eval can still run beside a live session. For THIS script that
+    # same kindness is a lie: the machine loads, the bundle builds, the URL
+    # prints — and every request on it is answered by the OTHER node, with the
+    # other node's machine and the other node's provider. Observed: a session
+    # left on `PROVIDER=fake` answered turns that a `PROVIDER=glm` boot had
+    # announced, and the only symptom was answers that felt wrong.
+    #
+    # A server that prints a URL has claimed the URL. Verify the claim.
+    started = Enum.map(Supervisor.which_children(BeamLisp.Supervisor), &elem(&1, 0))
+
+    unless SpellWeb.Endpoint in started do
+      holder =
+        case System.cmd("ss", ["-ltnp", "sport = :#{port}"], stderr_to_stdout: true) do
+          {out, 0} -> "\n\n" <> String.trim(out)
+          _ -> ""
+        end
+
+      abort(
+        "port #{port} is held by another process, so this node serves NOTHING.\n" <>
+          "The machine loaded and the bundle built, but every request would go\n" <>
+          "to the other server — a different machine and a different provider.\n\n" <>
+          "Stop it first:  pkill -f serve_live.exs\n" <>
+          "Or use another: PORT=4031 mix run --no-halt scripts/serve_live.exs" <> holder
+      )
+    end
+
     IO.puts("""
 
        ┌────────────────────────────────────────────┐
