@@ -76,7 +76,7 @@ defmodule Demo do
 
       cond do
         views != ["chat-view"] -> {:fail, "expected the seed view only, got #{inspect(views)}"}
-        not File.exists?(Path.join(@out, "spacetime.js")) -> {:fail, "no bundle was built"}
+        not File.exists?(Path.join(bundle_dir(), "spacetime.js")) -> {:fail, "no bundle was built"}
         true -> {:ok, "v#{st.version}, views #{inspect(views)}, bundle built"}
       end
     end)
@@ -232,7 +232,7 @@ defmodule Demo do
     %{
       version: Live.state().version,
       page: digest(Path.join(@out, "page.st")),
-      bundle: digest(Path.join(@out, "spacetime.js")),
+      bundle: digest(Path.join(bundle_dir(), "spacetime.js")),
       report: digest(Path.join(@out, "report.json"))
     }
   end
@@ -351,8 +351,17 @@ defmodule Demo do
 
   # ── serving and looking ────────────────────────────────────────────────────
 
+  # Where the loop actually built the bundle.
+  #
+  # DERIVED from the contract's `:bundle` option, exactly as `Spell.Live` does
+  # when it builds — one derivation, so the page this serves cannot be a
+  # directory the loop never wrote to. Assuming `@out` was correct only while
+  # the loop built there, and the day it started honouring the contract this
+  # demo reported "no bundle was built" beside a bundle that existed.
+  defp bundle_dir, do: Live.bundle_dir(@out, Live.machine())
+
   defp serve do
-    host = Path.join(@out, "index.html")
+    host = Path.join(bundle_dir(), "index.html")
     File.write!(host, host_html())
 
     # A DETACHED server, spawned so that nothing inherits its stdout.
@@ -380,7 +389,7 @@ defmodule Demo do
         "--fork",
         "sh",
         "-c",
-        "cd #{@out} && exec python3 -m http.server #{@port} --bind 127.0.0.1 " <>
+        "cd #{bundle_dir()} && exec python3 -m http.server #{@port} --bind 127.0.0.1 " <>
           ">/dev/null 2>&1 </dev/null"
       ])
 
