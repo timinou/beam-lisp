@@ -244,27 +244,54 @@ defmodule BeamLisp.Spell.Server do
   defp maybe_ask(socket, _contract, nil), do: socket
 
   defp maybe_ask(socket, _contract, text) do
-    id = "m#{System.unique_integer([:positive])}"
-    cfg = apply_bl("spell.provider", "from-env", [])
+    # THE JOIN. `(ask! text)` goes to the LOOP — the process that owns the
+    # machine, offers `define`, and walks the four rungs — not to the provider.
+    #
+    # It used to call `stream-async` directly with `(from-env)`, a cfg carrying
+    # no `:tools`, so `request-body` omitted the array entirely and the model
+    # talking to a BROWSER was structurally incapable of proposing anything.
+    # The loop that could propose was reachable only from a script. Two
+    # programs, one capability, and the half a human can see was the half
+    # without it — which is why "the live chat cannot build its own interface"
+    # was true while every test passed.
+    #
+    # The messages come back to `self()`, this LiveView's pid, and every one of
+    # them is already described by the contract's `on-info` clauses. That is
+    # what makes this a one-line change rather than a transport: a verdict
+    # arrives the same way a token does.
+    #
+    # Falls back to a direct provider call when no loop is running, so a
+    # LiveView started outside `serve_live.exs` still answers instead of
+    # hanging on a dead process. It answers WITHOUT tools, which is honest: no
+    # loop means nothing can validate a proposal, and offering a tool whose
+    # results go nowhere is worse than not offering it.
+    if loop_running?() do
+      BeamLisp.Spell.Live.ask_async(BeamLisp.Spell.Live, text, self())
+    else
+      id = "m#{System.unique_integer([:positive])}"
 
-    apply_bl("spell.provider", "stream-async", [
-      cfg,
-      Data.to_bl(provider_messages(socket, text), :as_written),
-      self(),
-      id
-    ])
+      apply_bl("spell.provider", "stream-async", [
+        apply_bl("spell.provider", "from-env", []),
+        Data.to_bl(provider_messages(socket, text), :as_written),
+        self(),
+        id
+      ])
+    end
 
     socket
   end
 
+  defp loop_running?, do: is_pid(Process.whereis(BeamLisp.Spell.Live))
+
   # The conversation as the provider wants it.
   #
-  # The assembly lives in `Spell.Live.conversation/2` — ONE definition of "what
-  # the model is told", because this module and that one had two, with
+  # Used only by the no-loop fallback: when the loop IS running it owns the
+  # transcript, because it is the thing that must remember a turn across a
+  # reload. The assembly lives in `Spell.Live.conversation/2` — ONE definition
+  # of "what the model is told", because this module and that one had two, with
   # different rules for avoiding a duplicated last turn. What is local here is
   # only the SHAPE: the page's transcript is a list of `%{"role", "text"}`
-  # assigns, so this translates that into the `%{role:, content:}` the shared
-  # function takes.
+  # assigns.
   defp provider_messages(socket, text) do
     socket.assigns
     |> Map.get(:messages, [])

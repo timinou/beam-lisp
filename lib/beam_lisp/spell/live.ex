@@ -149,6 +149,51 @@ defmodule BeamLisp.Spell.Live do
   @doc "Rebuild the page and bump the version, without changing the machine."
   def rebuild(server \\ __MODULE__), do: GenServer.call(server, :rebuild, 120_000)
 
+  @doc """
+  Start a turn for a LiveView, streaming the answer back to `reply_to`.
+
+  This is what joins the two halves that used to be separate programs. The
+  served page's `(ask! text)` called `spell.provider/stream-async` directly —
+  with a cfg carrying NO tools — so the model talking to a browser was
+  structurally incapable of proposing anything, while the loop that offers
+  `define` was only reachable from a script. One capability, two programs, and
+  the one a human can see was the one without it.
+
+  ## The messages
+
+  Sent to `reply_to`, and every one of them is already described by the seed
+  contract's `on-info` clauses — which is why this needs no second transport:
+
+      [:delta id chunk]     content arriving, token by token
+      [:defined id text]    a proposal was accepted; the page should reload
+      [:done id]            the turn ended
+      [:failed id why]      it did not
+
+  ## Why a spawned process
+
+  The LiveView must not block: a turn is a network round trip plus, when the
+  model proposes, ~2s of verse. Streaming to `reply_to` from a separate process
+  is what keeps the page responsive, and it is the same shape
+  `spell.provider/stream-async` already had.
+
+  UNLINKED, for the reason that function documents: a provider process that
+  dies mid-answer must not take the page down with it. The failure is reported
+  as `[:failed …]` instead, which the contract renders.
+
+  The ladder itself runs back INSIDE this GenServer (`define/2`), because the
+  machine is this process's state and definitions must be serialised. Two
+  browser tabs proposing at once is a race the loop resolves by being one
+  process; the ladder answering slowly is what the spawned turn absorbs.
+  """
+  def ask_async(server \\ __MODULE__, text, reply_to) do
+    id = "m#{System.unique_integer([:positive])}"
+    cfg = GenServer.call(server, :turn_cfg, 30_000)
+    messages = GenServer.call(server, {:record_user, text}, 30_000)
+
+    spawn(fn -> run_turn(server, cfg, messages, reply_to, id) end)
+    id
+  end
+
   # ── handlers ──────────────────────────────────────────────────────────────
 
   @impl true
@@ -165,6 +210,25 @@ defmodule BeamLisp.Spell.Live do
     {:reply, :ok, publish(state)}
   end
 
+  # The cfg a turn runs with: the configured provider PLUS the define tool.
+  # Handed out rather than rebuilt by the caller, so "what the model may do"
+  # has one definition and the served page cannot end up with a different one.
+  def handle_call(:turn_cfg, _from, state), do: {:reply, turn_cfg(), state}
+
+  # Record the user's turn and answer with the conversation to send. Both in
+  # one call because they must not interleave: two tabs sending at once would
+  # otherwise each build a history missing the other's message.
+  def handle_call({:record_user, text}, _from, state) do
+    state = say(state, :user, text)
+    {:reply, provider_messages(state, text), state}
+  end
+
+  # A streamed turn's own answer, recorded when it ends. The spawned process
+  # owns the streaming; the transcript stays here, where the machine is.
+  def handle_call({:record_model, text}, _from, state) do
+    {:reply, :ok, say(state, :model, text)}
+  end
+
   def handle_call({:ask, text}, _from, state) do
     state = say(state, :user, text)
     {reply, state} = turn(state, text, @max_attempts)
@@ -178,19 +242,133 @@ defmodule BeamLisp.Spell.Live do
   # not a nicety: a model that keeps proposing the same rejected definition
   # would otherwise loop until the deadline, and the user would watch a page
   # that never changes.
+  @doc """
+  The provider cfg a turn runs with: the configured provider PLUS `define`.
+
+  ONE definition of what the model may do. It was two: this module built a cfg
+  with `:tools`, and `Spell.Server.maybe_ask/3` called
+  `(spell.provider/from-env)` with none — so the model answering a browser
+  could not propose anything, and the difference was invisible because both
+  paths "worked".
+  """
+  def turn_cfg do
+    Map.put(
+      bl("spell.provider", "from-env", []),
+      :tools,
+      # `:as_written` — these keys are literals in `define_tool/0`, and
+      # `spell.provider/tool-decl-json` reads them as keywords.
+      Data.to_bl([define_tool()], :as_written)
+    )
+  end
+
+  # ── a streamed turn, for a LiveView ───────────────────────────────────────
+  #
+  # Runs in a spawned process. Streams content to `reply_to` as it arrives, and
+  # when the model asks for a tool instead, walks the ladder and reports the
+  # verdict as prose the page can render.
+  defp run_turn(server, cfg, messages, reply_to, id) do
+    # `stream` sends to whatever pid it is given, so the turn collects its OWN
+    # messages here and forwards them. That is what lets a tool call be
+    # intercepted: the page never sees `[:tool-calls …]`, it sees the verdict.
+    collector = self()
+    bl("spell.provider", "stream-async", [cfg, messages, collector, id])
+
+    collect(server, reply_to, id, [])
+  end
+
+  defp collect(server, reply_to, id, acc) do
+    receive do
+      {:delta, ^id, chunk} ->
+        send(reply_to, {:delta, id, chunk})
+        collect(server, reply_to, id, [chunk | acc])
+
+      # `:"tool-calls"`, hyphenated: the tuple is built in beam-lisp by
+      # `(tuple :tool-calls id calls)`, and a keyword there prints with the
+      # hyphen it was written with. Matching `:tool_calls` would compile fine
+      # and never fire — the turn would fall through to its timeout.
+      {:"tool-calls", ^id, calls} ->
+        # A tool turn: the ladder answers, not the model's prose. Handled here
+        # rather than forwarded, because `reply_to` is a LiveView and the
+        # contract that decodes its messages has no vocabulary for a proposal.
+        handle_tool_calls(server, reply_to, id, Data.from_bl(calls))
+
+      {:done, ^id} ->
+        finish(server, reply_to, id, acc)
+
+      {:failed, ^id, why} ->
+        send(reply_to, {:failed, id, to_string(why)})
+    after
+      # A provider that accepts a connection and then stalls is the failure this
+      # system must survive: without a deadline the collector waits forever and
+      # the page's thinking indicator never stops. 180s is the httpc timeout
+      # plus room for the ladder.
+      180_000 ->
+        send(reply_to, {:failed, id, "the provider did not answer within 180s"})
+    end
+  end
+
+  defp finish(server, reply_to, id, acc) do
+    text = acc |> Enum.reverse() |> Enum.join()
+
+    # An answer the page assembled must also reach the TRANSCRIPT, or the next
+    # turn is sent a conversation missing its own last reply — and the model
+    # answers as if it had said nothing.
+    if text != "", do: GenServer.call(server, {:record_model, text}, 30_000)
+
+    send(reply_to, {:done, id})
+  end
+
+  # Every call in the turn, walked through the ladder in order.
+  #
+  # The verdict is sent as `[:defined …]` (accepted) or `[:delta …]` prose
+  # (refused). A refusal is DELIBERATELY not `[:failed …]`: the turn did not
+  # fail, the proposal did, and the difference is what the user needs to read.
+  defp handle_tool_calls(server, reply_to, id, calls) do
+    for call <- calls do
+      verdict = GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
+
+      case verdict.status do
+        :ok ->
+          send(reply_to, {:defined, id, "✓ " <> definition_summary(call)})
+
+        _ ->
+          send(
+            reply_to,
+            {:delta, id,
+             "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
+               "#{first_line(verdict[:reason])}"}
+          )
+      end
+    end
+
+    finish(server, reply_to, id, [])
+  end
+
+  defp definition_summary(call) do
+    args = parse_arguments(call)
+    kind = Map.get(args, "kind", "definition")
+    name = Map.get(args, "name", "?")
+    why = Map.get(args, "rationale", "")
+
+    "defined #{kind} #{inspect(name)} — #{why}"
+  end
+
+  defp first_line(reason) do
+    reason
+    |> to_string()
+    |> String.split("\n")
+    |> List.first()
+    |> String.slice(0, 300)
+  end
+
   defp turn(state, _text, 0) do
-    {%{status: :exhausted, attempts: @max_attempts}, say(state, :system, "no definition accepted after #{@max_attempts} attempts — the machine is unchanged")}
+    {%{status: :exhausted, attempts: @max_attempts},
+     say(state, :system,
+       "no definition accepted after #{@max_attempts} attempts — the machine is unchanged")}
   end
 
   defp turn(state, text, attempts_left) do
-    cfg =
-      Map.put(
-        bl("spell.provider", "from-env", []),
-        :tools,
-        # `:as_written` — these keys are literals in `define_tool/0`, and
-        # `spell.provider/tool-decl-json` reads them as keywords.
-        Data.to_bl([define_tool()], :as_written)
-      )
+    cfg = turn_cfg()
 
     turn_result =
       bl("spell.provider", "ask-turn", [
