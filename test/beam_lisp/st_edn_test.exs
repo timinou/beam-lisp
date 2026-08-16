@@ -15,7 +15,7 @@ defmodule BeamLisp.StEdnTest do
 
   use ExUnit.Case, async: false
 
-  @codec "spell/src/spell/st_edn.bl"
+  @codec "spell/src/spell/st-edn.bl"
 
   defp codec(body), do: BeamLisp.eval(File.read!(@codec) <> "\n" <> body)
 
