@@ -124,9 +124,27 @@ defmodule BeamLisp.SpellCase do
   reaching the code, not a per-event leak, and reporting it as one would be
   crying wolf at exactly the assertion that must stay trustworthy.
 
-  This does NOT hide a real leak: a leak is proportional to the work, so
-  warming with `n` iterations and measuring `n` more still sees `n` leaked
-  allocations. Only the fixed cost of arriving is removed.
+  ## What this proves, and what it does not
+
+  It catches a PROPORTIONAL leak -- one allocation per unit of work -- because
+  warming with `n` iterations and then measuring `n` more still sees `n` leaked
+  allocations. That is the leak that existed (`eval_string` compiled a module
+  per event, per token) and the one the assertions below are about.
+
+  It is blind to three shapes, and saying so is the point of this paragraph:
+
+    * once per PROCESS -- the warm-up and the measurement run in the same test
+      process, so a per-process cost is already paid when the reading starts;
+    * once per DISTINCT PAYLOAD -- if the warm-up reuses one input, a leak keyed
+      on the input's shape is already paid. The suites vary their payloads
+      (`m<i>`, `tok<i>`) specifically to keep this partly covered;
+    * on a BRANCH the warm-up does not take -- an allocation behind a condition
+      only some inputs satisfy.
+
+  A per-visitor leak would surface as a per-process one, which is why the mount
+  case measures repeated mounts rather than trusting the event case to cover it.
+  Nothing here proves the ABSENCE of every leak; it proves the absence of the
+  one that was there.
   """
   def allocations(fun, opts \\ []) do
     for _ <- 1..Keyword.get(opts, :warmup, 2), do: fun.()

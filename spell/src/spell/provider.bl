@@ -112,7 +112,13 @@
 
 ;; ── request ─────────────────────────────────────────────────────────────────
 
-(defn- json-escape [s]
+(defn json-escape
+  "A string as JSON-escaped text.
+
+   Public because `spell.cassette` needs the same escaping to render a recorded
+   body, and two implementations of one escape table drift silently — the
+   drift only shows up as a body that decodes wrong."
+  [s]
   (-> (str s)
       (replace-str "\\" "\\\\")
       (replace-str "\"" "\\\"")
@@ -201,6 +207,98 @@
   (list (tuple (String/to_charlist "authorization")
                (String/to_charlist (str "Bearer " (get cfg :key))))))
 
+;; ── the transport seam ──────────────────────────────────────────────────
+;;
+;; Every request in this file went through the same eight lines — url, headers,
+;; body, opts, `httpc/request`, then a `cond` on the response tuple — written
+;; out three times (`ask`, `ask-turn`, `stream`). Three copies of one seam is
+;; three places to change when a provider needs a header, and three places for
+;; them to disagree.
+;;
+;; It is now ONE function, and the thing it does is chosen by DATA:
+;;
+;;   :httpc            a real request        (the default)
+;;   {:cassette name}  replay a recording    (tests, CI, offline work)
+;;   :fake             a canned answer       (no recording needed)
+;;
+;; ── why a cfg key and not an env var ──────────────────────────────────────
+;;
+;; `PROVIDER=fake` was read deep inside `stream-async`, which made the choice
+;; invisible at the call site and impossible to vary per request: a test could
+;; not replay a tool-call turn and a content turn in the same run, and a script
+;; that wanted one fake turn had to mutate the global environment. Worse, the
+;; branch meant the fake path and the real path were DIFFERENT CODE — so a bug
+;; in request building was exactly the kind of bug the offline path could not
+;; catch.
+;;
+;; As a cfg key the same code runs either way: the request is built, and only
+;; the last step — "send these bytes and give me back a response" — differs.
+
+(defn transport
+  "The transport `cfg` selects. `:httpc` unless it says otherwise.
+
+   `PROVIDER=fake` is still honoured, because scripts and muscle memory use it
+   and it means exactly `{:transport :fake}`."
+  [cfg]
+  (let [t (get cfg :transport)]
+    (cond
+      (not (nil? t)) t
+      (= "fake" (System/get_env "PROVIDER")) :fake
+      :else :httpc)))
+
+(defn- httpc-send
+  "POST `body` to the provider's completions endpoint; the raw response tuple."
+  [cfg body]
+  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
+        req (tuple url
+                   (headers cfg)
+                   (String/to_charlist "application/json")
+                   body)
+        ;; 120s: a real answer from a reasoning model can take a minute. The
+        ;; OUTER deadline is `fence`'s, and it is deliberately shorter — see
+        ;; `ask`.
+        opts (list (tuple :timeout 120000))]
+    ;; `httpc/request`, NOT `:httpc/request`: the leading colon makes the reader
+    ;; see a keyword, and the call then resolves as a map lookup.
+    (httpc/request :post req opts (list))))
+
+(defn- response-status
+  "[status body] from an httpc response tuple, or nil when it is not one."
+  [resp]
+  (if (and (tuple? resp) (= :ok (elem resp 0)))
+    (let [r (elem resp 1)]
+      [(elem (elem r 0) 1) (to-string (elem r 2))])
+    nil))
+
+(defn send-request
+  "Perform one completion request through `cfg`'s transport.
+
+   Answers `{:status 200 :body \"…\"}` or `{:error reason}` — one shape, whatever
+   the transport, so every decoder above works against a recording exactly as it
+   does against a provider. That equivalence is the whole point: a test that
+   replays a cassette is exercising the SAME code a live turn runs, minus the
+   socket."
+  [cfg messages stream?]
+  (let [body (request-body cfg messages stream?)]
+    (cond
+      (map? (transport cfg))
+      (spell.cassette/replay (get (transport cfg) :cassette) body stream?)
+
+      (= :fake (transport cfg))
+      ;; The canned answer, in the provider's own JSON/SSE shape. Not a
+      ;; separate code path: the same decoders run over it, which is the point
+      ;; — `stream-fake` used to imitate the message protocol without ever
+      ;; building a request or parsing a frame, so every bug in those was
+      ;; invisible to the offline path that existed to catch bugs.
+      {:status 200 :body (spell.cassette/canned messages stream?)}
+
+      :else
+      (let [resp (httpc-send cfg body)
+            hit (response-status resp)]
+        (if (nil? hit)
+          {:error {:transport (pr-str resp)}}
+          {:status (get hit 0) :body (get hit 1)})))))
+
 (defn ask
   "One request, one reply. Returns {:ok text} | {:error reason}.
 
@@ -215,37 +313,27 @@
    which the chat flow does. Reviewed and kept: the tight default is right for
    a caller who has not thought about it."
   [cfg messages]
-  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
-        body (request-body cfg messages false)
-        req (tuple url
-                   (headers cfg)
-                   (String/to_charlist "application/json")
-                   body)
-        opts (list (tuple :timeout 120000))
-        ;; `httpc/request`, NOT `:httpc/request`: the leading colon makes the
-        ;; reader see a keyword, and the call then resolves as a map lookup.
-        resp (httpc/request :post req opts (list))]
-    (decode-response resp)))
+  (decode-response (send-request cfg messages false)))
 
-(defn- decode-response [resp]
+(defn- decode-response
+  "One `send-request` answer as {:ok text} | {:error reason}."
+  [r]
   (cond
-    (and (tuple? resp) (= :ok (elem resp 0)))
-    (let [r (elem resp 1)
-          status (elem (elem r 0) 1)
-          payload (elem r 2)]
-      (if (= 200 status)
-        ;; A 200 whose body carries no assistant content is a FAILURE, not an
-        ;; empty success: `{:ok nil}` reads as "the model said nothing", and the
-        ;; caller renders a blank bubble instead of reporting the problem.
-        (let [body (to-string payload)
-              text (extract-content body)]
-          (if (nil? text)
-            {:error {:undecodable body}}
-            {:ok text}))
-        {:error {:status status :body (to-string payload)}}))
+    (not (nil? (get r :error)))
+    {:error (get r :error)}
+
+    (= 200 (get r :status))
+    ;; A 200 whose body carries no assistant content is a FAILURE, not an empty
+    ;; success: `{:ok nil}` reads as "the model said nothing", and the caller
+    ;; renders a blank bubble instead of reporting the problem.
+    (let [body (get r :body)
+          text (extract-content body)]
+      (if (nil? text)
+        {:error {:undecodable body}}
+        {:ok text}))
 
     :else
-    {:error {:transport resp}}))
+    {:error {:status (get r :status) :body (get r :body)}}))
 
 (defn- to-string
   "An httpc body as a proper UTF-8 string.
@@ -288,9 +376,14 @@
           nil
           (take-until-unescaped-quote (subs tail (+ i (count marker)))))))))
 
-(defn- take-until-unescaped-quote
+(defn take-until-unescaped-quote
   "The run up to the first UNESCAPED quote, unescaped; nil when the string never
    terminates.
+
+   Public for `spell.cassette`, which reads a recorded body back out of a file
+   written in exactly this shape. Reimplementing the scan there would be a
+   second answer to \"where does this string end\", and the two would disagree
+   on precisely the inputs that motivated it: escaped quotes.
 
    nil rather than the partial run: a truncated body (a dropped connection
    mid-answer) otherwise renders as a COMPLETE short answer, and neither the
@@ -467,25 +560,16 @@
    {:ok text}, a caller of this handles three kinds, and collapsing them would
    push a cond into every call site."
   [cfg messages]
-  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
-        body (request-body cfg messages false)
-        req (tuple url
-                   (headers cfg)
-                   (String/to_charlist "application/json")
-                   body)
-        opts (list (tuple :timeout 120000))
-        resp (httpc/request :post req opts (list))]
+  (let [r (send-request cfg messages false)]
     (cond
-      (and (tuple? resp) (= :ok (elem resp 0)))
-      (let [r (elem resp 1)
-            status (elem (elem r 0) 1)
-            payload (to-string (elem r 2))]
-        (if (= 200 status)
-          (extract-turn payload)
-          {:kind :error :reason {:status status :body payload}}))
+      (not (nil? (get r :error)))
+      {:kind :error :reason (get r :error)}
+
+      (= 200 (get r :status))
+      (extract-turn (get r :body))
 
       :else
-      {:kind :error :reason {:transport (pr-str resp)}})))
+      {:kind :error :reason {:status (get r :status) :body (get r :body)}})))
 
 ;; ── streaming ───────────────────────────────────────────────────────────────
 
@@ -521,74 +605,173 @@
         ;; append" here: a partial SSE line is dropped rather than shown.
         (if (or (nil? text) (= "" text)) nil text)))))
 
+(defn stream-tool-calls
+  "The tool calls an SSE body requested, assembled across its deltas.
+
+   Streaming splits ONE tool call over many frames: the first carries `id`,
+   `name` and the opening of `arguments`; later frames carry more `arguments`
+   text and nothing else. So this is a JOIN — the pieces must be glued back
+   together before the JSON inside `arguments` is even syntactically whole.
+
+   It works by REASSEMBLING the frames into the single-turn document shape and
+   handing that to `tool-calls`, the decoder the non-streaming path already
+   uses. Writing a second decoder here was the alternative and is the mistake
+   this file's header warns about: two implementations of one wire format
+   drift, and the drift is silent because both keep producing plausible output.
+   Reassembly costs one string build per turn and keeps the count at one.
+
+   Empty when the turn requested no tools — the common case, so callers test it
+   first and stream content when it is empty.
+
+   ── why this exists ──────────────────────────────────────────────────────
+
+   `parse-sse-deltas` keeps only `content` fields, so a streamed tool call
+   decoded to nil and was filtered away: the page showed an empty answer and
+   the machine never grew. That was the recorded gap between the two loops —
+   the one with tools could not stream, the one that streamed had no tools."
+  [body]
+  (let [calls (assemble-tool-calls (sse-frames body))]
+    (if (empty? calls)
+      []
+      (tool-calls (assembled-document calls)))))
+
+(defn- sse-frames
+  "The JSON payload of each `data:` frame, `[DONE]` excluded."
+  [body]
+  (filterv (fn [x] (not (nil? x)))
+           (mapv (fn [line]
+                   (let [l (trim line)]
+                     (if (and (starts-with? l "data: ") (not (= l "data: [DONE]")))
+                       (subs l 6)
+                       nil)))
+                 (split body "\n"))))
+
+(defn- raw-field
+  "One `\"key\":\"value\"` field of a frame, still ESCAPED; nil when absent.
+
+   Raw rather than decoded because the pieces are going straight back into a
+   JSON document: decoding here and re-escaping there would be two conversions
+   that have to agree, and `arguments` is itself JSON-in-a-string, which is
+   exactly where such a pair goes wrong."
+  [frame key]
+  (let [marker (str "\"" key "\":\"")
+        i (index-of frame marker)]
+    (if (nil? i)
+      nil
+      (let [after (subs frame (+ i (count marker)))
+            n (raw-string-length after)]
+        (subs after 0 n)))))
+
+(defn- assemble-tool-calls
+  "Frames folded into [{:id :name :arguments}…], every field still escaped.
+
+   A frame carrying a `name` OPENS a call; every `arguments` fragment after it
+   belongs to THAT call until the next `name` appears. Concatenating every
+   fragment regardless would produce one call whose arguments are two JSON
+   documents jammed together, which parses as neither."
+  [frames]
+  (let [acc (atom [])]
+    (doseq [f frames]
+      (let [nm (raw-field f "name")
+            arg (raw-field f "arguments")]
+        (when (not (nil? nm))
+          (swap! acc (fn [cs] (conj cs {:id (or (raw-field f "id") "")
+                                       :name nm
+                                       :arguments ""}))))
+        (when (not (nil? arg))
+          (swap! acc (fn [cs]
+                       (let [n (count cs)]
+                         (if (= 0 n)
+                           cs
+                           (let [c (nth cs (- n 1))]
+                             (assoc cs (- n 1)
+                                    (assoc c :arguments
+                                           (str (get c :arguments) arg)))))))))))
+    (deref acc)))
+
+(defn- assembled-document
+  "The assembled calls as the single-turn document `tool-calls` reads.
+
+   The point of the round trip: whatever `tool-calls` learns about the wire —
+   a new field, a provider quirk, an anchoring rule — applies to streamed turns
+   for free, because they arrive at it in the same shape."
+  [calls]
+  (str "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+       (join ","
+             (map (fn [c]
+                    (str "{\"id\":\"" (get c :id) "\",\"type\":\"function\","
+                         "\"function\":{\"name\":\"" (get c :name) "\","
+                         "\"arguments\":\"" (get c :arguments) "\"}}"))
+                  calls))
+       "]},\"finish_reason\":\"tool_calls\"}]}"))
+
 (defn stream
   "Stream a completion to `target`, one message per token.
 
-     [:delta id chunk]  … many
-     [:done id]         … on success
-     [:failed id why]   … on any failure
+     [:delta id chunk]     … many, as content arrives
+     [:tool-calls id calls] … once, when the turn requested tools instead
+     [:done id]            … on success
+     [:failed id why]      … on any failure
 
    Sends rather than returns, because that is what makes streaming free on this
    runtime: the LiveView receives a token the same way it receives any other
    message, so there is no second transport to build.
 
    Spawned UNLINKED by the caller (see `stream-async`), so a provider that dies
-   mid-answer cannot take the page with it."
+   mid-answer cannot take the page with it.
+
+   ── why [:tool-calls …] exists ────────────────────────────────────────────
+
+   A streamed turn can request a tool, and this function used to be incapable
+   of noticing: `parse-sse-deltas` keeps only `content` fields, so `tool_calls`
+   deltas decoded to nil and were filtered out. The page then showed an empty
+   answer and the machine never grew. That was the recorded gap between the two
+   loops — the one with tools could not stream, the one that streamed had no
+   tools — and it is closed here rather than by a second code path."
   [cfg messages target id]
-  (let [url (String/to_charlist (str (get cfg :base-url) "/chat/completions"))
-        body (request-body cfg messages true)
-        req (tuple url
-                   (headers cfg)
-                   (String/to_charlist "application/json")
-                   body)
-        opts (list (tuple :timeout 120000))
-        resp (httpc/request :post req opts (list))]
+  (let [r (send-request cfg messages true)]
     (cond
-      (and (tuple? resp) (= :ok (elem resp 0)))
-      (let [r (elem resp 1)
-            status (elem (elem r 0) 1)
-            payload (to-string (elem r 2))]
-        (if (= 200 status)
+      (not (nil? (get r :error)))
+      (erlang/send target (tuple :failed id (str "transport: " (pr-str (get r :error)))))
+
+      (= 200 (get r :status))
+      (let [payload (get r :body)
+            calls (stream-tool-calls payload)]
+        (if (empty? calls)
           (do
             ;; Deltas are sent in order, then a single :done. The page appends
             ;; each one; nothing needs to know the total length in advance.
-            (doseq [d (parse-sse-deltas payload)]
-              (erlang/send target (tuple :delta id d)))
+            ;;
+            ;; `:pace` sleeps between deltas. A real provider paces the stream
+            ;; itself — the frames arrive as the model writes them — but a
+            ;; cassette and the canned answer arrive as one complete body, so
+            ;; every delta would be sent in the same instant and the page would
+            ;; render the finished answer in a single frame. The thing being
+            ;; verified is that INTERMEDIATE states render, so an offline turn
+            ;; that cannot show one is not exercising the property. The old
+            ;; `stream-fake` slept 60ms per word for exactly this reason; the
+            ;; sleep survives it, the parallel implementation does not.
+            (let [pace (get cfg :pace 0)]
+              (doseq [d (parse-sse-deltas payload)]
+                (when (> pace 0) (Process/sleep pace))
+                (erlang/send target (tuple :delta id d))))
             (erlang/send target (tuple :done id)))
-          (erlang/send target (tuple :failed id (str "HTTP " status)))))
+          ;; A tool turn carries no prose worth rendering — the assistant's
+          ;; content is "" by construction. Sending the calls INSTEAD of deltas
+          ;; keeps the page from flashing an empty bubble before the machine
+          ;; changes under it.
+          (do
+            (erlang/send target (tuple :tool-calls id calls))
+            (erlang/send target (tuple :done id)))))
 
       :else
-      (erlang/send target (tuple :failed id (str "transport: " (pr-str resp)))))
+      (erlang/send target (tuple :failed id (str "HTTP " (get r :status)))))
     :sent))
 
-(defn stream-fake
-  "Stream a canned answer to `target`, one message per word.
-
-   `PROVIDER=fake` selects it. It exists because the loop's most interesting
-   half — tokens arriving as BEAM messages, decoded by the contract's `on-info`
-   clauses, pushed to the page as `@fx` — is otherwise only observable when a
-   paid API answers. Both configured providers hit their billing wall on
-   2026-08-15 (kimi: HTTP 403 quota; deepseek: Insufficient Balance), and a
-   verification that can only run when someone's card works is not a
-   verification.
-
-   It sends the SAME messages `stream` sends, in the same order, from an
-   unlinked process: `[:delta id chunk]` … then `[:done id]`. Nothing downstream
-   can tell the difference, which is the point — anything that works here works
-   against a real provider unless the provider itself is at fault."
-  [messages target id]
-  (erlang/spawn
-    (fn []
-      (let [prompt (get (last messages) :content "")
-            answer (str "A contract is one term that says what the server owns "
-                        "and what the page may ask of it — you asked: \"" prompt "\"")]
-        (doseq [w (split answer " ")]
-          ;; A small delay per token so the page's streaming bubble is a
-          ;; STREAM rather than a single frame — the thing being verified is
-          ;; that intermediate states render, not just the final one.
-          (Process/sleep 60)
-          (erlang/send target (tuple :delta id (str w " "))))
-        (erlang/send target (tuple :done id))))))
+(defn- offline?
+  "Does this transport deliver a whole body at once?"
+  [cfg]
+  (not (= :httpc (transport cfg))))
 
 (defn stream-async
   "Spawn `stream` in an UNLINKED process and return its pid.
@@ -598,9 +781,19 @@
    because one answer failed. The same reasoning as `fence`'s spawn+monitor,
    and the same lesson learned the hard way there.
 
-   `PROVIDER=fake` routes to `stream-fake`, which speaks the identical message
-   protocol without a network."
+   There is no longer a `stream-fake` beside this. It existed because the fake
+   path had to be different CODE — a hand-rolled word-by-word sender that
+   imitated the message protocol. Imitation is the problem: a bug in request
+   building, in SSE parsing or in tool-call assembly was invisible to it,
+   because it never built a request or parsed a frame. `cfg`'s `:transport`
+   now decides only where the BYTES come from, so `PROVIDER=fake` runs the same
+   parser over a synthetic SSE body and a cassette runs it over a recorded one."
   [cfg messages target id]
-  (if (= "fake" (System/get_env "PROVIDER"))
-    (stream-fake messages target id)
+  ;; An offline transport hands back a complete body, so its deltas would all
+  ;; be sent in one instant. Default it to a visible pace; a caller wanting the
+  ;; raw speed (a unit test asserting the messages, not the timing) sets
+  ;; `:pace 0` explicitly.
+  (let [cfg (if (and (offline? cfg) (nil? (get cfg :pace)))
+              (assoc cfg :pace 60)
+              cfg)]
     (erlang/spawn (fn [] (stream cfg messages target id)))))
