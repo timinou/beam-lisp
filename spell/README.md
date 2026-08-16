@@ -42,14 +42,33 @@ OpenAI-compatible, so a fourth is an entry, not a branch.
 | `fake` | — | none | no network at all |
 
 Each provider's URL and model override individually (`GLM_BASE_URL`,
-`GLM_MODEL`, …). Two traps, both of which cost real time when hit:
+`GLM_MODEL`, …).
+
+**Where a key comes from**, in strict precedence — `BeamLisp.Spell.Credentials`
+owns this, and every script uses it:
+
+1. the real environment — `PROVIDER=glm mix run …`
+2. `.env` in the cwd (mode 600, gitignored)
+3. the agent credential db, `~/.spell/agent/agent.db`
+
+The environment always wins: `.env` is a default set, not an override. (Four
+scripts used to carry their own copy of this loader and three got it backwards,
+so `PROVIDER=fake` was silently replaced by `.env`'s paid provider — which
+failed as "no provider message arrived".) The db is read last and only for a
+variable that is still unset, so a key already given to the machine's other
+tools needs no second copy. `PROVIDER=glm` with a key in the db needs no `.env`
+at all.
+
+Two traps, both of which cost real time when hit:
 
 - **Z.ai splits its API in two and the halves are not interchangeable.** A
   Coding Plan key works only against `/api/coding/paas/v4`; a pay-as-you-go key
   only against `/api/paas/v4`. The wrong pairing answers 401 with a perfectly
   valid key — which reads as a bad credential and sends you to regenerate one
-  that was fine. For the general API set both:
-  `GLM_BASE_URL=https://api.z.ai/api/paas/v4 GLM_MODEL=glm-5.2`.
+  that was fine. Confirmed against a real coding-plan key: the coding endpoint
+  returned an answer, the general endpoint answered *"Insufficient balance or
+  no resource package"* for the same key in the same minute. For the general
+  API set both: `GLM_BASE_URL=https://api.z.ai/api/paas/v4 GLM_MODEL=glm-5.2`.
 - **Kimi's base path is `/coding/v1`, not `/v1`** — `api.kimi.com/v1/*` is an
   nginx 404, and Moonshot's endpoints reject the same key with 401.
 

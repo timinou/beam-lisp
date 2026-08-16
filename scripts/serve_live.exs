@@ -146,30 +146,20 @@ defmodule ServeLive do
     end
   end
 
-  # The provider credentials live in .env (mode 600, gitignored). Loaded here
-  # rather than by the provider so a run without credentials still SERVES the
-  # page — only `ask!` fails, and it fails into the contract's own `on-info`
-  # `[:failed id why]` clause, which the page renders.
+  # Provider credentials: the real environment, then `.env`, then the agent's
+  # credential db. `BeamLisp.Spell.Credentials` owns the precedence — four
+  # scripts each carried their own copy of this loader, and they disagreed:
+  # three used `File.read!` (crashing without a `.env` that is optional) and
+  # three overrode the REAL environment, which silently replaced a caller's
+  # `PROVIDER=fake` with `.env`'s paid provider.
+  #
+  # Loaded here rather than by the provider so a run without credentials still
+  # SERVES the page — only `ask!` fails, into the contract's own `[:failed id
+  # why]` clause, which the page renders.
   defp load_env do
-    case File.read(".env") do
-      {:ok, body} ->
-        body
-        |> String.split("\n")
-        |> Enum.each(fn line ->
-          case String.split(String.trim(line), "=", parts: 2) do
-            # The REAL environment wins over the file. `.env` is a default set,
-            # not an override: `PROVIDER=fake mix run …` must select the fake
-            # provider even though `.env` names a paid one, or the offline
-            # verification path cannot be selected at all.
-            [k, v] ->
-              if not String.starts_with?(k, "#") and k != "" and System.get_env(k) in [nil, ""],
-                do: System.put_env(k, v)
-            _ -> :ok
-          end
-        end)
-
-      _ ->
-        IO.puts("  (no .env — the page serves, but a turn will report a provider error)")
+    case BeamLisp.Spell.Credentials.load() do
+      [] -> IO.puts("  (no credentials found — the page serves, but a turn will report a provider error)")
+      found -> Enum.each(found, fn {k, src} -> IO.puts("  #{k} ← #{src}") end)
     end
   end
 

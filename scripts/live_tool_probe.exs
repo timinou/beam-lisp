@@ -1,10 +1,7 @@
 # Sends a real tools-enabled request and decodes it with extract-turn.
-".env" |> File.read!() |> String.split("\n") |> Enum.each(fn l ->
-  case String.split(String.trim(l), "=", parts: 2) do
-    [k, v] -> if not String.starts_with?(k, "#") and k != "", do: System.put_env(k, v)
-    _ -> :ok
-  end
-end)
+# Credentials: environment, then `.env`, then the agent db — see
+# `BeamLisp.Spell.Credentials`.
+BeamLisp.Spell.Credentials.load()
 
 :inets.start(); :ssl.start()
 BeamLisp.Spell.init!()

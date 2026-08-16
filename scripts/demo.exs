@@ -566,16 +566,10 @@ defmodule Demo do
   defp banner(t), do: IO.puts("\n\e[1m── #{t} " <> String.duplicate("─", max(0, 58 - String.length(t))) <> "\e[0m")
   defp first_line(s), do: s |> String.split("\n") |> List.first() |> String.trim()
 
+  # See `BeamLisp.Spell.Credentials`: environment, then `.env`, then the agent
+  # credential db, never overriding what the caller already set.
   defp load_env do
-    ".env"
-    |> File.read!()
-    |> String.split("\n")
-    |> Enum.each(fn line ->
-      case String.split(String.trim(line), "=", parts: 2) do
-        [k, v] -> if not String.starts_with?(k, "#") and k != "", do: System.put_env(k, v)
-        _ -> :ok
-      end
-    end)
+    BeamLisp.Spell.Credentials.load()
 
     :inets.start()
     :ssl.start()
