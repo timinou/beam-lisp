@@ -192,13 +192,20 @@ defmodule BeamLisp.Spell.Verse do
     end
   end
 
-  # What a non-zero `check` run actually said.
-  #
-  #   :only_exempt_warnings — diagnostics found, ALL of them exempt
-  #   {:problems, lines}    — at least one real error or non-exempt warning
-  #   :unrecognised         — no diagnostics at all: a crash, a usage message,
-  #                           a missing file. Never a pass.
-  defp classify(output) do
+  @doc """
+  What a non-zero `check` run actually said.
+
+      :only_exempt_warnings   diagnostics found, ALL of them exempt
+      {:problems, lines}      at least one real error or non-exempt warning
+      :unrecognised           no diagnostics at all: a crash, a usage message,
+                              a missing file. NEVER a pass.
+
+  Public because it is the POLICY, and policy is the half of this module that
+  can be checked without a compiler. The runner needs cargo and a subprocess;
+  this needs a string. Separating them is what lets the rule that decides
+  whether a model's definition lives or dies run on every `mix test`.
+  """
+  def classify(output) do
     diagnostics =
       output
       |> String.split("\n")
@@ -234,7 +241,14 @@ defmodule BeamLisp.Spell.Verse do
   # untouched: `fx` stays OUT of this list and keeps refusing the page.
   @exempt_sources ~w(draft status send partial error)
 
-  defp exempt?(line) do
+  @doc """
+  Is this diagnostic line a W0201 for a source verse genuinely cannot trace?
+
+  Public for the same reason as `classify/1`: the exemption list is a judgment
+  about which warnings are noise, and a judgment deserves a test. `fx` staying
+  OUT of it is an assertion, not an omission.
+  """
+  def exempt?(line) do
     String.contains?(line, "W0201") and
       Enum.any?(@exempt_sources, &String.contains?(line, "'#{&1}'"))
   end
@@ -357,7 +371,22 @@ defmodule BeamLisp.Spell.Verse do
   can block a definition.
   """
   def styled_classes(css) do
-    Regex.scan(~r/^\s*([^{}\n][^{}]*)\{/m, css)
+    # Every run of non-brace text immediately before a `{` is a selector — the
+    # scan is deliberately NOT anchored to the start of a line.
+    #
+    # It was (`~r/^\s*([^{}\n][^{}]*)\{/m`), and that agreed with verse only
+    # because verse currently pretty-prints one rule per line. On a minified
+    # bundle — or on any rule following a `}` on the same line — the anchor
+    # matches nothing, `styled_classes` answers `[]`, and the ghost join
+    # becomes `[] -- rendered`, which is EMPTY. Rung 4 would then pass every
+    # definition while looking exactly as green as it does now: a check that
+    # cannot fail, disabled by a downstream formatting change nobody here would
+    # think to re-test. Found by a unit test written against a one-line
+    # stylesheet.
+    #
+    # The unanchored form also reaches selectors nested inside an at-rule
+    # (`@media (…) { .a { … } }`), which the anchored one dropped.
+    Regex.scan(~r/([^{}]*)\{/, css)
     |> Enum.map(fn [_, sel] -> sel end)
     |> Enum.flat_map(fn sel ->
       Regex.scan(~r/\.([A-Za-z_][-\w]*)/, sel) |> Enum.map(fn [_, c] -> c end)

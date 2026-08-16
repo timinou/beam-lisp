@@ -57,7 +57,23 @@ defmodule BeamLisp.Spell.Page do
     end
   end
 
-  defp render(seam_st, view_st, locals, hosts, css, prefix) do
+  @doc """
+  The page's text, from already-printed parts. Pure: no machine, no subprocess,
+  no filesystem.
+
+  Public because it is the half that can be checked without a compiler, and
+  because the split is the layering: `emit/3` gathers (asks the machine, shells
+  out to verse's printer, writes a file) and this renders. A caller with the
+  five parts in hand — a test, or a future emitter living in beam-lisp — needs
+  the rendering without the gathering.
+
+    * `seam_st` / `view_st` — documents already printed by `spacetime st`
+    * `locals` — page-local signal names (`spell.live/machine-locals`)
+    * `hosts` — registered contract names (`spell.live/machine-hosts`)
+    * `css` — the style plane (`spell.live/machine-css`)
+    * `prefix` — the module namespace hosts resolve into
+  """
+  def render(seam_st, view_st, locals, hosts, css, prefix) do
     host_decls =
       Enum.map_join(hosts, "\n", fn h ->
         "@host $" <> h <> " : live(\"" <> prefix <> "." <> module_name(h) <> "\")"
