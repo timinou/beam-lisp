@@ -223,7 +223,16 @@ defmodule BeamLisp.Spell.Verse do
   # that is all the warning line carries; the list is deliberately explicit
   # rather than a wildcard, so a new unused source has to be looked at by a
   # human before it joins.
-  @exempt_sources ~w(draft status send)
+  #
+  # `partial` and `error` joined after exactly that look. Both are consumed by
+  # a `@view` arm — the streaming bubble and the failure notice — which is the
+  # same blind spot `status` sits in, and both were verified in the emitted
+  # bundle before being listed: `@view $partial { _ => &streaming; }` and
+  # `@view $error { _ => &error; }` are present in the `.st`, and the browser
+  # renders both (streamed tokens appear word by word; a provider failure shows
+  # its reason). Neither is a stream, so verse's one real signal here is
+  # untouched: `fx` stays OUT of this list and keeps refusing the page.
+  @exempt_sources ~w(draft status send partial error)
 
   defp exempt?(line) do
     String.contains?(line, "W0201") and

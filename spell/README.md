@@ -25,8 +25,40 @@ Prerequisites, none optional:
 |---|---|---|
 | verse checkout (`~/code/ora/verse`, or `VERSE_ROOT`) | rungs 3–4 are the compiler | actionable error naming the path |
 | **release** binary: `cargo build --release --bin spacetime` | the loop calls it per definition; `cargo run` costs 10–30s each | "no spacetime binary" + the exact build command |
-| `.env` with `KIMI_API_KEY` | `--live` only | provider error in the transcript |
+| `.env` with a provider key | `--live` only | provider error in the transcript |
 | chrome/chromium (or `CHROME_BIN`) | the demo's DOM assertions | the step fails, naming it |
+
+### Providers
+
+Which model answers is one variable, because the providers are a table
+(`spell.provider/providers`) rather than a code path — all three are
+OpenAI-compatible, so a fourth is an entry, not a branch.
+
+| `PROVIDER=` | model | key | base URL default |
+|---|---|---|---|
+| `kimi` *(default)* | `k3-256k` | `KIMI_API_KEY` | `https://api.kimi.com/coding/v1` |
+| `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
+| `glm` | `glm-5.3` | `GLM_API_KEY` or `ZAI_API_KEY` | `https://api.z.ai/api/coding/paas/v4` |
+| `fake` | — | none | no network at all |
+
+Each provider's URL and model override individually (`GLM_BASE_URL`,
+`GLM_MODEL`, …). Two traps, both of which cost real time when hit:
+
+- **Z.ai splits its API in two and the halves are not interchangeable.** A
+  Coding Plan key works only against `/api/coding/paas/v4`; a pay-as-you-go key
+  only against `/api/paas/v4`. The wrong pairing answers 401 with a perfectly
+  valid key — which reads as a bad credential and sends you to regenerate one
+  that was fine. For the general API set both:
+  `GLM_BASE_URL=https://api.z.ai/api/paas/v4 GLM_MODEL=glm-5.2`.
+- **Kimi's base path is `/coding/v1`, not `/v1`** — `api.kimi.com/v1/*` is an
+  nginx 404, and Moonshot's endpoints reject the same key with 401.
+
+`PROVIDER=fake` streams a canned answer word by word, sending the identical
+`[:delta id chunk]` … `[:done id]` messages a real provider does. It exists so
+the streaming half of the loop is verifiable when every account is walled — on
+2026-08-15 kimi answered 403 (quota) and deepseek `Insufficient Balance` within
+the same hour. A verification that only runs while someone's card works is not
+a verification.
 
 ### The pieces
 
