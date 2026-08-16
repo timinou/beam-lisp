@@ -91,19 +91,69 @@ defmodule BeamLisp.SpellCase do
   def plain(other), do: other
 
   @doc """
-  Modules and atoms allocated while running `fun`.
+  Modules and atoms allocated by `fun` in STEADY STATE.
 
   The instrument PLAN-027 W1 is built around. `:code.all_loaded/0` is a linear
   scan and `atom_count` is a cheap VM counter; both are read on either side of
   the work, so what is measured is the work and not the measuring.
+
+  ## Why it counts EVAL modules and not all modules
+
+  `:code.all_loaded/0` is VM-global, and `mix test` runs suites concurrently:
+  another suite lazily loading an Elixir stdlib module lands in the same count
+  and reads as a leak here. Measured: a pure `Map.new/2` loop "allocated" 3–4
+  modules when the suite ran alongside others, and 0 when it ran alone.
+
+  What is actually being asserted is narrower and fully attributable:
+  `BeamLisp.Compiler.eval_string/1` compiles each call into a module named
+  `Elixir.BeamLisp.Eval.M<n>`. Nothing else in the VM creates those. Counting
+  exactly them answers the real question — "did this path compile beam-lisp
+  source?" — and is immune to whatever the rest of the suite is doing.
+
+  Atoms stay a global count because there is no attributable equivalent, and a
+  small tolerance covers concurrent noise. `eval_string` interns ~2 atoms PER
+  CALL, so a real leak over 50 events is ~100 — two orders of magnitude above
+  the handful another suite contributes.
+
+  ## Why it runs the work before measuring it
+
+  A first call into a beam-lisp namespace links its module and interns its
+  names, and a first call down a particular BRANCH links whatever that branch
+  reaches. Measured on `Spell.Server.info/3`: the first pass over 200 tokens
+  interned 9 atoms; the second interned none. That is a one-time cost of
+  reaching the code, not a per-event leak, and reporting it as one would be
+  crying wolf at exactly the assertion that must stay trustworthy.
+
+  This does NOT hide a real leak: a leak is proportional to the work, so
+  warming with `n` iterations and measuring `n` more still sees `n` leaked
+  allocations. Only the fixed cost of arriving is removed.
   """
-  def allocations(fun) do
-    modules_before = length(:code.all_loaded())
+  def allocations(fun, opts \\ []) do
+    for _ <- 1..Keyword.get(opts, :warmup, 2), do: fun.()
+
+    eval_before = eval_modules()
     atoms_before = :erlang.system_info(:atom_count)
     fun.()
+
     %{
-      modules: length(:code.all_loaded()) - modules_before,
+      modules: eval_modules() - eval_before,
       atoms: :erlang.system_info(:atom_count) - atoms_before
     }
+  end
+
+  @doc """
+  How many `BeamLisp.Eval.M*` modules exist right now.
+
+  One per `Compiler.eval_string/1` call, ever. The single number that answers
+  "is this path compiling beam-lisp source?" without depending on what the rest
+  of the VM is doing.
+  """
+  def eval_modules do
+    Enum.count(:code.all_loaded(), fn {module, _} ->
+      case Atom.to_string(module) do
+        "Elixir.BeamLisp.Eval.M" <> _ -> true
+        _ -> false
+      end
+    end)
   end
 end

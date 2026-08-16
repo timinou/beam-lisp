@@ -19,6 +19,21 @@ defmodule BeamLisp.Spell.Live do
   where those already live. When the SELF cluster's hotswap API lands, this
   moves.
 
+  ### The machine is a VALUE in this process's state, not a global var
+
+  It used to be `(def live-machine …)` — a var in the process-global
+  `BeamLisp.Env` — and TWO places wrote it: this module's `init/1` and
+  `scripts/serve_live.exs`. Last writer won, silently, so a driver started
+  after the server read a machine the server had overwritten. There was no way
+  to notice: both writes succeed and the loser's definitions simply are not
+  there.
+
+  Now the machine is threaded like any other value — `state.machine` in, a new
+  machine out — and `candidate` never escapes the function that builds it.
+  Rollback becomes what it always claimed to be: not binding the new one.
+  Anything that needs the current machine ASKS this process for it, so there is
+  exactly one owner and the question "which machine?" has one answer.
+
   ## What is published, and why a file
 
   Every accepted definition writes `report.json` next to the bundle: the
@@ -39,7 +54,8 @@ defmodule BeamLisp.Spell.Live do
 
   use GenServer
 
-  alias BeamLisp.{Compiler, Spell}
+  alias BeamLisp.Spell
+  alias BeamLisp.Spell.Data
 
   @max_attempts 3
   @tool_name "define"
@@ -89,17 +105,9 @@ defmodule BeamLisp.Spell.Live do
 
     Spell.init!(["spell.app", "spell.define", "spell.live"])
 
-    # The seed is bound as a var so every later emit can name it; the machine
-    # itself is threaded as a value.
-    Compiler.eval_string("""
-    (def live-machine
-      (spell.live/seeded (spell.machine/empty-machine)
-                         spell.seed/contract-term
-                         spell.seed/view-term))
-    """)
-
     state = %{
       out: out,
+      machine: seeded_machine(),
       version: 0,
       transcript: [],
       attempts: [],
@@ -108,6 +116,17 @@ defmodule BeamLisp.Spell.Live do
     }
 
     {:ok, publish(state)}
+  end
+
+  # The machine every session starts from: the seed contract and the seed view,
+  # registered into an empty machine. A value, held in this process's state —
+  # see the module doc on why it is no longer a global var.
+  defp seeded_machine do
+    bl("spell.live", "seeded", [
+      bl("spell.machine", "empty-machine", []),
+      var("spell.seed", "contract-term"),
+      var("spell.seed", "view-term")
+    ])
   end
 
   # ── API ───────────────────────────────────────────────────────────────────
@@ -134,6 +153,8 @@ defmodule BeamLisp.Spell.Live do
 
   @impl true
   def handle_call(:state, _from, state), do: {:reply, snapshot(state), state}
+
+  def handle_call(:machine, _from, state), do: {:reply, state.machine, state}
 
   def handle_call({:define, proposal}, _from, state) do
     {verdict, state} = apply_proposal(proposal, state)
@@ -162,19 +183,23 @@ defmodule BeamLisp.Spell.Live do
   end
 
   defp turn(state, text, attempts_left) do
-    cfg_src = """
-    (assoc (spell.provider/from-env) :tools
-      [{:name #{inspect(@tool_name)}
-        :description #{inspect(define_tool().description)}
-        :parameters #{inspect(@define_tool_schema)}}])
-    """
-
-    messages = provider_messages(state, text)
+    cfg =
+      Map.put(
+        bl("spell.provider", "from-env", []),
+        :tools,
+        # `:as_written` — these keys are literals in `define_tool/0`, and
+        # `spell.provider/tool-decl-json` reads them as keywords.
+        Data.to_bl([define_tool()], :as_written)
+      )
 
     turn_result =
-      Compiler.eval_string("""
-      (spell.provider/ask-turn #{cfg_src} #{messages})
-      """)
+      bl("spell.provider", "ask-turn", [
+        cfg,
+        # Same: `:role` / `:content` are ours, and `message-json` reads
+        # keywords. Wire data never takes this path — the model's own words
+        # travel as VALUES inside these maps, not as keys.
+        Data.to_bl(provider_messages(state, text), :as_written)
+      ])
 
     case decode_turn(turn_result) do
       {:content, answer} ->
@@ -222,16 +247,15 @@ defmodule BeamLisp.Spell.Live do
   # ── the ladder, all four rungs ────────────────────────────────────────────
 
   defp apply_proposal(proposal, state) do
-    case run_ladder(proposal) do
-      {:ok, report} ->
+    case run_ladder(proposal, state.machine) do
+      {:ok, machine, report} ->
         # Commit, then publish — and if publishing FAILS, say so in the verdict
         # rather than reporting success. The machine still holds the definition
         # (it passed every rung; the failure is downstream, in emitting or
         # building), but a caller told `:ok` while the served page is stale has
         # been lied to, and the next proposal would accumulate on state the user
         # never saw.
-        Compiler.eval_string("(def live-machine candidate-machine)")
-        state = publish(state)
+        state = publish(%{state | machine: machine})
 
         case state.last_build do
           :ok ->
@@ -242,46 +266,55 @@ defmodule BeamLisp.Spell.Live do
         end
 
       {:error, verdict} ->
-        # The candidate is discarded by simply not binding it: `live-machine`
-        # still names the value it named before. Rollback is the absence of a
-        # write, which is the only kind that cannot half-happen.
+        # The candidate is discarded by simply not returning it: `state.machine`
+        # is still the value it was. Rollback is the absence of a write, which
+        # is the only kind that cannot half-happen — and now that the machine is
+        # a value rather than a global var, it is also the only kind available.
         {verdict, state}
     end
   end
 
-  defp run_ladder(proposal) do
-    # Printing happens BEFORE anything is evaluated, and it refuses a proposal it
-    # cannot print safely (see `to_bl/1`). A refusal here is a schema rejection,
+  defp run_ladder(proposal, machine) do
+    # The conversion happens BEFORE anything reaches the language, and it refuses
+    # what it cannot convert (a struct). A refusal here is a schema rejection,
     # not a crash: a model probing the boundary should get the same bounded
     # answer as one that simply mistyped a field.
-    case safe_to_bl(proposal) do
+    #
+    # NB the danger this used to guard is gone rather than handled. The old path
+    # PRINTED the proposal as source, so a crafted map key could close the call
+    # and open a new form. `BeamLisp.Spell.Data` converts instead: there is no
+    # source for a key to break out of, and an unknown key becomes an inert
+    # string that rung 1 then reports as a missing field.
+    case safe_convert(proposal) do
       {:error, reason} ->
         {:error, %{status: :rejected, rung: :schema, reason: reason}}
 
-      {:ok, src} ->
-        Compiler.eval_string("(def candidate (spell.define/define live-machine #{src}))")
-        ladder_after_build()
+      {:ok, converted} ->
+        ladder(bl("spell.define", "define", [machine, converted]))
     end
   end
 
-  defp safe_to_bl(proposal) do
-    {:ok, to_bl(proposal)}
+  defp safe_convert(proposal) do
+    {:ok, Data.to_bl(proposal, Data.proposal_keys())}
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp ladder_after_build do
-    status = Compiler.eval_string("(get candidate :status)")
-
-    if status == :rejected do
+  # Rungs 1–2 answered; run 3–4 against the CANDIDATE's page.
+  #
+  # `candidate` is a local, so a rejected one is unreachable the moment this
+  # returns. It was a global var (`(def candidate …)`), which meant a refused
+  # proposal stayed addressable from anywhere until the next one overwrote it.
+  defp ladder(candidate) do
+    if Map.get(candidate, :status) == :rejected do
       {:error,
        %{
          status: :rejected,
-         rung: Compiler.eval_string("(get candidate :rung)"),
-         reason: inspect(Compiler.eval_string("(get candidate :reason)"))
+         rung: Map.get(candidate, :rung),
+         reason: inspect(Map.get(candidate, :reason))
        }}
     else
-      Compiler.eval_string("(def candidate-machine (get candidate :machine))")
+      machine = Map.get(candidate, :machine)
 
       # Rungs 3–4 run against the page the CANDIDATE would produce, never the
       # committed one: checking the current page would pass every proposal.
@@ -290,11 +323,11 @@ defmodule BeamLisp.Spell.Live do
       try do
         # The bind selectors are handed to rung 4 so it judges OUR page rather
         # than verse's runtime, which also ships `querySelector` calls.
-        selectors = bl_json(Compiler.eval_string("(spell.live/machine-bind-selectors candidate-machine)"))
+        selectors = Data.from_bl(bl("spell.live", "machine-bind-selectors", [machine]))
 
-        with {:ok, _} <- Spell.Page.emit("candidate-machine", page),
+        with {:ok, _} <- Spell.Page.emit(machine, page),
              {:ok, _} <- Spell.Verse.verify(page, selectors) do
-          {:ok, Compiler.eval_string("(spell.live/machine-report candidate-machine)")}
+          {:ok, machine, bl("spell.live", "machine-report", [machine])}
         else
           {:error, %{rung: rung, reason: reason}} ->
             {:error, %{status: :rejected, rung: rung, reason: reason}}
@@ -317,7 +350,7 @@ defmodule BeamLisp.Spell.Live do
     page = Path.join(state.out, "page.st")
 
     build =
-      with {:ok, _} <- Spell.Page.emit("live-machine", page),
+      with {:ok, _} <- Spell.Page.emit(state.machine, page),
            :ok <- build_bundle(page, state.out) do
         :ok
       end
@@ -358,9 +391,19 @@ defmodule BeamLisp.Spell.Live do
     %{
       version: state.version,
       transcript: Enum.reverse(state.transcript),
-      machine: bl_json(Compiler.eval_string("(spell.live/machine-report live-machine)"))
+      machine: Data.from_bl(bl("spell.live", "machine-report", [state.machine]))
     }
   end
+
+  @doc """
+  The machine this loop currently holds, as a value.
+
+  The ONE way to ask. Everything that needs the live machine — the page
+  emitter, the server's contract lookup, a script — asks the process that owns
+  it rather than reading a global var, which is what makes "which machine?" a
+  question with one answer.
+  """
+  def machine(server \\ __MODULE__), do: GenServer.call(server, :machine, 30_000)
 
   # ── transcript ────────────────────────────────────────────────────────────
 
@@ -373,25 +416,68 @@ defmodule BeamLisp.Spell.Live do
   # rejected proposals as prose, on top of the tool result it already got,
   # doubles them.
   defp provider_messages(state, text) do
-    history =
-      state.transcript
-      |> Enum.reverse()
-      |> Enum.filter(&(&1.role in [:user, :model]))
-      |> Enum.reject(&(&1.role == :user and &1.content == text))
-      |> Enum.map(fn %{role: r, content: c} ->
-        "{:role #{inspect(to_role(r))} :content #{inspect(to_string(c))}}"
-      end)
-
-    "[" <> Enum.join(history ++ ["{:role \"user\" :content #{inspect(text)}}"], " ") <> "]"
+    state.transcript
+    |> Enum.reverse()
+    |> Enum.filter(&(&1.role in [:user, :model]))
+    |> Enum.map(&%{role: &1.role, content: &1.content})
+    |> conversation(text)
   end
 
+  @doc """
+  A transcript plus the current turn, as the provider wants it.
+
+  `history` is `[%{role: :user | :model | "user" | "assistant", content: …}]`;
+  the answer is `[%{role: "user" | "assistant", content: …}]` ending in `text`.
+
+  ## Why this is one function and not two
+
+  It was two — here and in `Spell.Server` — and they had already drifted. Both
+  translated `model` to `assistant`, and both tried to avoid sending the user's
+  current turn twice, by DIFFERENT rules: this one filtered the whole history
+  for a matching user entry, the other compared only the last one. The bug that
+  costs is not the duplication itself but that the two answers differ: the same
+  conversation reached the model differently depending on which half of the
+  system asked, and a repeated last message reads to a model as the user
+  repeating themselves.
+
+  ## The one rule
+
+  A turn is appended unless the history ALREADY ends with it. Comparing only
+  the tail is deliberate: a user who genuinely types "yes" twice in a row has
+  said two things, and a whole-history filter silently eats the second.
+  """
+  def conversation(history, text) do
+    messages = Enum.map(history, fn %{role: role, content: content} ->
+      %{role: to_role(role), content: to_string(content)}
+    end)
+
+    turn = %{role: "user", content: to_string(text)}
+
+    if List.last(messages) == turn, do: messages, else: messages ++ [turn]
+  end
+
+  # The contract says `model` (what the page shows); every OpenAI-shaped API
+  # says `assistant`. Translated at this boundary and nowhere else.
   defp to_role(:model), do: "assistant"
+  defp to_role("model"), do: "assistant"
   defp to_role(other), do: to_string(other)
 
   # ── plumbing ──────────────────────────────────────────────────────────────
 
+  # `<ns>/<name>` applied to already-converted arguments.
+  #
+  # Fetched per call rather than cached in a module attribute: `BeamLisp.Env` is
+  # where a REDEFINED var lands, so a cached capture would keep running the
+  # definition that existed at boot — which in the module whose entire job is
+  # growing the system at runtime would be a silent opt-out from its own
+  # premise. The lookup is an ETS read against a 118 µs walk.
+  defp bl(ns, name, args), do: apply(BeamLisp.Env.fetch!(ns, name), args)
+
+  # A var's VALUE, for the vars that are terms rather than functions.
+  defp var(ns, name), do: BeamLisp.Env.fetch!(ns, name)
+
   defp decode_turn(turn) do
-    case bl_json(turn) do
+    case Data.from_bl(turn) do
       %{"kind" => "tool-calls", "tool-calls" => calls} -> {:tool_calls, calls}
       %{"kind" => "content", "content" => text} -> {:content, text}
       %{"kind" => "error", "reason" => reason} -> {:error, reason}
@@ -406,72 +492,4 @@ defmodule BeamLisp.Spell.Live do
   end
 
   defp parse_arguments(other), do: other
-
-  # A beam-lisp value as plain JSON-ish data: vectors become lists, keywords
-  # become strings, nested structures recurse.
-  defp bl_json(%BeamLisp.Vector{} = v), do: Enum.map(BeamLisp.Vector.to_list(v), &bl_json/1)
-  defp bl_json(list) when is_list(list), do: Enum.map(list, &bl_json/1)
-  defp bl_json(atom) when is_atom(atom) and not is_boolean(atom) and not is_nil(atom), do: Atom.to_string(atom)
-
-  # is_map-ok: a beam-lisp report is walked structurally here; the Vector clause
-  # above takes the one struct kind that reaches this function, and every other
-  # value is a plain map from `spell.machine/report`.
-  defp bl_json(map) when is_map(map) do
-    Map.new(map, fn {k, v} -> {to_string(bl_json(k)), bl_json(v)} end)
-  end
-
-  defp bl_json(other), do: other
-
-  # ── the data boundary ─────────────────────────────────────────────────────
-  #
-  # A proposal as beam-lisp source. THIS IS THE SECURITY BOUNDARY OF THE WHOLE
-  # DESIGN: everything here is written by a model, and the result is handed to
-  # `Compiler.eval_string/1`.
-  #
-  # It claimed to be "a printer, not an evaluator" and it was not. Values were
-  # escaped through `inspect/1`, but KEYS were concatenated raw after a colon,
-  # so a JSON object key could close the call and open a new form. Reproduced
-  # by a reviewer and confirmed here — this key:
-  #
-  #   kind "view"}))\n(def pwned 99)\n(def candidate2 (spell.define/define … {:kind
-  #
-  # emitted three top-level forms, the middle one arbitrary, and `pwned`
-  # evaluated to 99 BEFORE any rung ran. A model could have reached anything
-  # the BEAM can reach.
-  #
-  # The fix is not more escaping. It is a WHITELIST: a key must match
-  # `[a-z][a-z0-9-]*` — the shape of every field the tool's schema declares —
-  # and anything else is refused before a character is printed. Escaping asks
-  # "did I remember every metacharacter?"; a whitelist asks "is this one of the
-  # names I expect?", and only the second question has a safe default.
-
-  @key_pattern ~r/\A[a-z][a-z0-9_-]*\z/
-
-  defp to_bl(%_{} = struct) do
-    raise ArgumentError,
-          "a proposal may only contain JSON data; got the struct #{inspect(struct.__struct__)}"
-  end
-
-  defp to_bl(value) when is_map(value) and not is_struct(value) do
-    "{" <>
-      Enum.map_join(value, " ", fn {k, v} ->
-        key = to_string(k)
-
-        unless Regex.match?(@key_pattern, key) do
-          raise ArgumentError,
-                "a proposal key must be a plain lowercase name, got #{inspect(key)} " <>
-                  "— refusing to print it as source"
-        end
-
-        ":#{key} #{to_bl(v)}"
-      end) <> "}"
-  end
-
-  defp to_bl(value) when is_list(value), do: "[" <> Enum.map_join(value, " ", &to_bl/1) <> "]"
-  defp to_bl(value) when is_binary(value), do: inspect(value)
-  defp to_bl(value) when is_number(value), do: to_string(value)
-  defp to_bl(true), do: "true"
-  defp to_bl(false), do: "false"
-  defp to_bl(nil), do: "nil"
-  defp to_bl(value) when is_atom(value), do: inspect(to_string(value))
 end

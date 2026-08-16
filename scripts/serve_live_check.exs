@@ -32,10 +32,11 @@ defmodule ServeLiveCheck do
                          spell.seed/view-term))
     """)
 
-    BeamLisp.Spell.Server.register(
-      "chat-live",
-      ~s|(first (filter (fn [c] (= (name (get c :name)) "chat-live")) (spell.machine/contracts live-machine)))|
-    )
+    # A zero-arity FUNCTION, not beam-lisp source: the registry no longer
+    # evaluates source, because `eval_string` compiled a fresh BEAM module per
+    # call and the atoms interning those names are never reclaimed. Looked up
+    # per call so an event runs against the CURRENT contract.
+    BeamLisp.Spell.Server.register("chat-live", &chat_contract/0)
 
     # The GENERATED module, compiled over the placeholder — exactly what
     # scripts/serve_live.exs does at boot. The fixture socket must name it:
@@ -60,6 +61,15 @@ defmodule ServeLiveCheck do
   end
 
   # ── the checks ─────────────────────────────────────────────────────────────
+
+  # The chat contract from the live machine, resolved per call — the same
+  # helper as scripts/serve_live.exs. `contracts` returns a `BeamLisp.Vector`
+  # and a contract's `:name` is an ATOM (`:"chat-live"`), not a string.
+  defp chat_contract do
+    BeamLisp.Env.fetch!("spell.machine", "contracts").(Compiler.eval_string("live-machine"))
+    |> BeamLisp.Vector.to_list()
+    |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
+  end
 
   defp generate_server_half do
     source =

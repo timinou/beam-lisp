@@ -99,6 +99,28 @@ defmodule BeamLisp.Spell.EmitGoldenTest do
       # diff can explain.
       assert emit("machine-css") == emit("machine-css")
     end
+
+    test "declarations are ordered by NAME, not by atom-table creation order" do
+      # The property the golden caught the absence of, asserted directly —
+      # because within one VM run the weaker test above passes either way.
+      #
+      # `(keys m)` on a small Erlang map answers in TERM order, and the term
+      # order of ATOMS is their atom-table creation order, not their spelling.
+      # That depends on what the VM happened to intern first, so the same code
+      # emitted `.chat` with `grid-template-rows` before `height` in one run and
+      # after it in the next. Two consecutive `mix test` runs disagreed with
+      # nothing changed.
+      #
+      # Sorting by name also makes this agree with `spell.contract/edn-scope`,
+      # which sorts the SAME declarations into `:st/scopes` — so the style plane
+      # verse checks and the style plane the browser loads are now one order.
+      for rule <- rules(emit("machine-css")) do
+        assert rule.declarations == Enum.sort(rule.declarations),
+               "#{rule.selector} declarations are not name-ordered: " <>
+                 "#{inspect(rule.declarations)} — CSS cascades, so this reorders " <>
+                 "meaning between emits"
+      end
+    end
   end
 
   describe "what the page preamble is derived from" do
@@ -159,6 +181,19 @@ defmodule BeamLisp.Spell.EmitGoldenTest do
   end
 
   # ── helpers ────────────────────────────────────────────────────────────────
+
+  # Every `selector { prop: value; … }` block, as its selector and the property
+  # names in the order they appear.
+  defp rules(css) do
+    Regex.scan(~r/([^{}\n]+)\{([^}]*)\}/, css)
+    |> Enum.map(fn [_, selector, body] ->
+      %{
+        selector: String.trim(selector),
+        declarations:
+          Regex.scan(~r/^\s*([-\w]+)\s*:/m, body) |> Enum.map(fn [_, prop] -> prop end)
+      }
+    end)
+  end
 
   defp occurrences(text, needle),
     do: text |> String.split(needle) |> length() |> Kernel.-(1)

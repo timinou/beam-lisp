@@ -34,22 +34,30 @@ defmodule BeamLisp.Spell.Page do
   drifted from the emitter's output, with a caption claiming it was generated.
   """
 
-  alias BeamLisp.{Compiler, Spell}
+  alias BeamLisp.Spell
 
   @doc """
   Write the machine's page to `path`; `{:ok, path}` | `{:error, reason}`.
 
-  `machine_expr` is a beam-lisp expression evaluating to a machine (typically a
-  var the caller has already bound).
+  `machine` is the machine VALUE — what `spell.define/define` returns under
+  `:machine`, or what the loop holds in its state.
+
+  It used to be a beam-lisp EXPRESSION (a string, typically the name of a var
+  the caller had bound), interpolated into five `eval_string` calls. That made
+  emitting cost five compiled BEAM modules, and it forced every caller to first
+  publish its machine to a global var — which is how two writers of
+  `live-machine` came to exist, each silently overwriting the other. A value
+  parameter removes both: nothing is compiled, and nothing has to be global to
+  be passed.
   """
-  def emit(machine_expr, path, opts \\ []) do
+  def emit(machine, path, opts \\ []) do
     prefix = Keyword.get(opts, :module_prefix, "SpellWeb")
 
-    with {:ok, seam_edn} <- eval_string("(spell.live/machine-seam-edn #{machine_expr})"),
-         {:ok, view_edn} <- eval_string("(spell.live/machine-view-edn #{machine_expr})"),
-         {:ok, locals} <- eval_list("(spell.live/machine-locals #{machine_expr})"),
-         {:ok, hosts} <- eval_list("(spell.live/machine-hosts #{machine_expr})"),
-         {:ok, css} <- eval_string("(spell.live/machine-css #{machine_expr})"),
+    with {:ok, seam_edn} <- call("machine-seam-edn", machine),
+         {:ok, view_edn} <- call("machine-view-edn", machine),
+         {:ok, locals} <- call_list("machine-locals", machine),
+         {:ok, hosts} <- call_list("machine-hosts", machine),
+         {:ok, css} <- call("machine-css", machine),
          {:ok, seam_st} <- print_st(seam_edn, "seam"),
          {:ok, view_st} <- print_st(view_edn, "view") do
       File.write!(path, render(seam_st, view_st, locals, hosts, css, prefix))
@@ -157,14 +165,20 @@ defmodule BeamLisp.Spell.Page do
     end
   end
 
-  defp eval_string(src) do
-    {:ok, Compiler.eval_string(src)}
+  # `spell.live/<name>` applied to the machine.
+  #
+  # Fetched per call rather than cached: `BeamLisp.Env` is where a REDEFINED var
+  # lands, and a cached capture would keep running the definition that existed
+  # at boot — which in a system whose entire purpose is growing itself at
+  # runtime is a silent opt-out. The lookup is an ETS read.
+  defp call(name, machine) do
+    {:ok, apply(BeamLisp.Env.fetch!("spell.live", name), [machine])}
   rescue
     e -> {:error, Exception.message(e)}
   end
 
-  defp eval_list(src) do
-    case eval_string(src) do
+  defp call_list(name, machine) do
+    case call(name, machine) do
       {:ok, %BeamLisp.Vector{} = v} -> {:ok, BeamLisp.Vector.to_list(v)}
       {:ok, l} when is_list(l) -> {:ok, l}
       {:ok, other} -> {:error, "expected a list, got #{inspect(other)}"}

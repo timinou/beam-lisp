@@ -17,59 +17,96 @@ defmodule BeamLisp.Spell.Server do
   arrives from the contract, which is why one generated LiveView per contract
   needs no code of its own beyond the delegating heads.
 
-  ## Why `eval_string` rather than `apply/3`
+  ## A beam-lisp fn is an Elixir fn
 
-  beam-lisp namespaces are interpreted through `BeamLisp.Env`, not compiled to
-  BEAM modules, so there is no `:"spell.server".handle/4` to call. Every call
-  therefore prints its arguments as beam-lisp source. That has one property this
-  design leans on: **`eval_string` evaluates in the CALLING process**, so
-  `(erlang/self)` inside these calls is the LiveView's own pid — which is how a
-  streamed provider answer finds its way back to the page without this module
-  ever handling a pid.
+  `spell.server/handle` is reached by FETCHING it and calling it:
 
-  ## The printing boundary
+      {:ok, handle} = BeamLisp.Env.fetch("spell.server", "handle")
+      handle.(contract, event, payload, assigns)
 
-  Values printed into source come from two places: the contract (ours) and the
-  wire (the browser's). `BeamLisp.Spell.Live` records what happened when a
-  printer trusted the second kind — a crafted map KEY closed the form and opened
-  a new one, and arbitrary beam-lisp evaluated before any check ran. The fix
-  there and here is the same and is not escaping: a key must match a plain
-  lowercase name, or it is refused before a character is printed.
+  This module used to print its arguments as beam-lisp source and hand the text
+  to `Compiler.eval_string/1`. Two things were wrong with that, and the second
+  is why it is gone:
+
+    * **it was a leak.** `eval_string` compiles a FRESH BEAM module per call.
+      Modules are reclaimable; the atoms their names intern are not, and a full
+      atom table aborts the VM uncatchably (`BeamLisp.AtomGuard`). Measured on
+      the seed contract: ONE event cost +6 modules and +153 atoms, and
+      `info/3` runs once per STREAMED TOKEN — so a single long answer left
+      hundreds of modules behind, permanently, on the path a user drives with
+      their keyboard.
+    * **it made wire data dangerous.** Printing means a map KEY can close the
+      call and open a new form; `BeamLisp.Spell.Data` records the payload that
+      did exactly that. Whitelisting keys made that payload safe without making
+      printing safe — the shape of every escaping bug ever written.
+
+  Converting instead of printing removes both at once: there is no source for a
+  key to break out of, and no compilation to leak.
+
+  ### What the fn value preserves
+
+  `eval_string` evaluated in the CALLING process, and this design leans on it:
+  the walk records `(ask! text)` rather than performing it, and the caller — the
+  LiveView pid — performs it, so `(erlang/self)` there is the process a streamed
+  answer must return to. Applying a fn value directly keeps that property for
+  the same reason it keeps every other one: nothing about it moves processes.
+  Asserted in `allocation_test.exs` rather than assumed.
   """
 
-  alias BeamLisp.Compiler
+  alias BeamLisp.Spell.Data
 
-  @key_pattern ~r/\A[a-zA-Z][a-zA-Z0-9_-]*\z/
-
-  # Where each contract lives, as a beam-lisp EXPRESSION. Registered at boot by
-  # whoever generated the LiveView (see scripts/serve_live.exs), so this module
-  # never guesses which term a generated module refers to. persistent_term
-  # because it is written once and read on every event: the read is free, the
-  # write cost is irrelevant at boot.
+  # Where each contract lives, as a RESOLVER — a zero-arity function answering
+  # the current term. Registered at boot by whoever generated the LiveView (see
+  # scripts/serve_live.exs), so this module never guesses which term a generated
+  # module refers to. persistent_term because it is written once and read on
+  # every event: the read is free, the write cost is irrelevant at boot.
   @registry {__MODULE__, :contracts}
 
   @doc """
-  Point a contract name at the beam-lisp expression that evaluates to its term.
+  Point a contract name at the term it names.
 
-  `register("chat-live", "spell.seed/contract-term")` — the generated
-  `SpellWeb.ChatLive` carries `@contract "chat-live"` and nothing else; this is
-  what turns that name into the live term. An expression rather than a value so
-  the machine can grow underneath it: point the name at `live-machine`'s lookup
-  and every later event sees the current definition.
+      register("chat-live", fn -> BeamLisp.Env.fetch!("spell.seed", "contract-term") end)
+      register("chat-live", "spell.seed/contract-term")   # convenience
+
+  The generated `SpellWeb.ChatLive` carries `@contract "chat-live"` and nothing
+  else; this is what turns that name into the live term.
+
+  A FUNCTION rather than a value, so the machine can grow underneath it: point
+  the name at the loop's own lookup and every later event sees the current
+  definition without re-registering. That was the whole reason the old registry
+  held a beam-lisp EXPRESSION — a resolver keeps the late binding and drops the
+  evaluation.
+
+  The string form is accepted because it reads well at a call site and is what
+  every existing caller passes. It resolves `"ns/name"` through
+  `BeamLisp.Env.fetch/2` ONCE PER CALL, which is a map lookup, not a compile.
   """
-  def register(name, expression) when is_binary(name) and is_binary(expression) do
+  def register(name, resolver) when is_binary(name) and is_function(resolver, 0) do
     current = :persistent_term.get(@registry, %{})
-    :persistent_term.put(@registry, Map.put(current, name, expression))
+    :persistent_term.put(@registry, Map.put(current, name, resolver))
     :ok
   end
 
-  @doc "The registered expression for `name`, or raise naming what is registered."
-  def contract_expr(name) do
+  def register(name, expression) when is_binary(name) and is_binary(expression) do
+    case String.split(expression, "/", parts: 2) do
+      [ns, var] ->
+        register(name, fn -> BeamLisp.Env.fetch!(ns, var) end)
+
+      _ ->
+        raise ArgumentError,
+              "a contract expression must be \"namespace/var\", got #{inspect(expression)}. " <>
+                "Pass a zero-arity function for anything else — this registry no longer " <>
+                "evaluates beam-lisp source."
+    end
+  end
+
+  @doc "The term registered as `name`, or raise naming what is registered."
+  def contract_term(name) do
     registry = :persistent_term.get(@registry, %{})
 
     case Map.fetch(registry, name) do
-      {:ok, expr} ->
-        expr
+      {:ok, resolver} ->
+        resolver.()
 
       :error ->
         raise ArgumentError,
@@ -90,7 +127,7 @@ defmodule BeamLisp.Spell.Server do
   retrying JS timer, and why its transcript could arrive as `null`.
   """
   def mount(socket, contract) do
-    seed = bl(~s|(spell.server/seed-assigns #{contract_expr(contract)} {})|)
+    seed = Data.from_bl(call("seed-assigns", [contract_term(contract), %{}]))
     {:ok, assign_all(socket, seed)}
   end
 
@@ -103,10 +140,19 @@ defmodule BeamLisp.Spell.Server do
   """
   def event(socket, contract, event_name, payload) do
     result =
-      bl("""
-      (spell.server/handle #{contract_expr(contract)} #{inspect(event_name)}
-                           #{to_bl(payload)} #{to_bl(current_assigns(socket))})
-      """)
+      Data.from_bl(
+        call("handle", [
+          contract_term(contract),
+          to_string(event_name),
+          # `:all_strings` on BOTH — `spell.server/bind-params` looks a
+          # parameter up by string first and by keyword second, and the assigns
+          # map is keyed by the contract's own declared names, which the
+          # interpreter also reads as strings. Converting either to keywords
+          # would intern whatever the browser sent.
+          Data.to_bl(payload, :all_strings),
+          Data.to_bl(current_assigns(socket), :all_strings)
+        ])
+      )
 
     case Map.get(result, "status") do
       "no-handler" ->
@@ -137,11 +183,13 @@ defmodule BeamLisp.Spell.Server do
   """
   def info(socket, contract, message) do
     result =
-      bl("""
-      (spell.server/handle-info #{contract_expr(contract)}
-                                #{to_bl(message_vector(message))}
-                                #{to_bl(current_assigns(socket))})
-      """)
+      Data.from_bl(
+        call("handle-info", [
+          contract_term(contract),
+          Data.to_bl(message_vector(message), :all_strings),
+          Data.to_bl(current_assigns(socket), :all_strings)
+        ])
+      )
 
     case Map.get(result, "status") do
       "unmatched" ->
@@ -197,42 +245,31 @@ defmodule BeamLisp.Spell.Server do
 
   defp maybe_ask(socket, _contract, text) do
     id = "m#{System.unique_integer([:positive])}"
+    cfg = apply_bl("spell.provider", "from-env", [])
 
-    bl("""
-    (spell.provider/stream-async (spell.provider/from-env)
-                                 #{provider_messages(socket, text)}
-                                 (erlang/self)
-                                 #{inspect(id)})
-    """)
+    apply_bl("spell.provider", "stream-async", [
+      cfg,
+      Data.to_bl(provider_messages(socket, text), :as_written),
+      self(),
+      id
+    ])
 
     socket
   end
 
-  # The conversation as the provider wants it. Roles are translated at this
-  # boundary and nowhere else: the contract says "model" (what the page shows),
-  # every OpenAI-shaped API says "assistant".
+  # The conversation as the provider wants it.
+  #
+  # The assembly lives in `Spell.Live.conversation/2` — ONE definition of "what
+  # the model is told", because this module and that one had two, with
+  # different rules for avoiding a duplicated last turn. What is local here is
+  # only the SHAPE: the page's transcript is a list of `%{"role", "text"}`
+  # assigns, so this translates that into the `%{role:, content:}` the shared
+  # function takes.
   defp provider_messages(socket, text) do
-    history =
-      socket.assigns
-      |> Map.get(:messages, [])
-      |> Enum.map(fn m ->
-        role = if to_string(Map.get(m, "role", "user")) == "model", do: "assistant", else: "user"
-        content = to_string(Map.get(m, "text", ""))
-        {role, content}
-      end)
-
-    # The user's own turn is already in `messages` (the handler appended it
-    # before asking), so it is NOT added again here — doing so sent the last
-    # message twice, which a model reads as the user repeating themselves.
-    history =
-      if List.last(history) == {"user", to_string(text)},
-        do: history,
-        else: history ++ [{"user", to_string(text)}]
-
-    "[" <>
-      Enum.map_join(history, " ", fn {role, content} ->
-        "{:role #{inspect(role)} :content #{inspect(content)}}"
-      end) <> "]"
+    socket.assigns
+    |> Map.get(:messages, [])
+    |> Enum.map(&%{role: Map.get(&1, "role", "user"), content: Map.get(&1, "text", "")})
+    |> BeamLisp.Spell.Live.conversation(text)
   end
 
   # ── the two boundaries ─────────────────────────────────────────────────────
@@ -249,51 +286,26 @@ defmodule BeamLisp.Spell.Server do
   defp message_vector(message) when is_list(message), do: message
   defp message_vector(message), do: [message]
 
-  # beam-lisp source for a plain value. See the module doc: KEYS are whitelisted
-  # rather than escaped, because escaping asks "did I remember every
-  # metacharacter?" and a whitelist asks "is this one of the names I expect?".
-  defp to_bl(%_{} = struct),
-    do: raise(ArgumentError, "cannot print the struct #{inspect(struct.__struct__)} as beam-lisp")
+  # ── calling into beam-lisp ─────────────────────────────────────────────────
 
-  # is_map-ok: the struct clause above this one rejects every struct by name
-  # BEFORE this clause is reached, so "any map" here means "a plain map" — the
-  # only shape that may be printed as beam-lisp source.
-  defp to_bl(value) when is_map(value) do
-    "{" <>
-      Enum.map_join(value, " ", fn {k, v} ->
-        key = to_string(k)
+  # `spell.server/<name>` applied to already-converted arguments.
+  #
+  # Fetched per call rather than cached in a module attribute, and that is
+  # deliberate: `BeamLisp.Env` is where a REDEFINED var lands, so a cached
+  # capture would keep running the definition that existed at boot. Hot code
+  # replacement is the point of this whole system — caching the lookup would
+  # quietly opt this module out of it. The lookup is an ETS read (~1 µs against
+  # a 118 µs walk).
+  defp call(name, args), do: apply_bl("spell.server", name, args)
 
-        unless Regex.match?(@key_pattern, key) do
-          raise ArgumentError,
-                "refusing to print #{inspect(key)} as a beam-lisp map key — " <>
-                  "keys crossing this boundary must be plain names"
-        end
+  defp apply_bl(ns, name, args) do
+    fun = BeamLisp.Env.fetch!(ns, name)
 
-        "#{inspect(key)} #{to_bl(v)}"
-      end) <> "}"
+    unless is_function(fun, length(args)) do
+      raise ArgumentError,
+            "#{ns}/#{name} is not a function of #{length(args)} argument(s) — got #{inspect(fun)}"
+    end
+
+    apply(fun, args)
   end
-
-  defp to_bl(value) when is_list(value), do: "[" <> Enum.map_join(value, " ", &to_bl/1) <> "]"
-  defp to_bl(value) when is_binary(value), do: inspect(value)
-  defp to_bl(value) when is_number(value), do: to_string(value)
-  defp to_bl(true), do: "true"
-  defp to_bl(false), do: "false"
-  defp to_bl(nil), do: "nil"
-  defp to_bl(value) when is_atom(value), do: ":#{value}"
-
-  # An interpreter answer as plain data: vectors become lists, keywords become
-  # strings. Everything crossing back into a socket assign must survive JSON
-  # encoding, because the bridge pushes it to the browser verbatim.
-  defp plain(%BeamLisp.Vector{} = v), do: Enum.map(BeamLisp.Vector.to_list(v), &plain/1)
-  defp plain(list) when is_list(list), do: Enum.map(list, &plain/1)
-
-  defp plain(atom) when is_atom(atom) and not is_boolean(atom) and not is_nil(atom),
-    do: Atom.to_string(atom)
-
-  defp plain(map) when is_map(map) and not is_struct(map),
-    do: Map.new(map, fn {k, v} -> {to_string(plain(k)), plain(v)} end)
-
-  defp plain(other), do: other
-
-  defp bl(source), do: source |> Compiler.eval_string() |> plain()
 end

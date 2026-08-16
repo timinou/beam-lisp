@@ -74,12 +74,14 @@ defmodule ServeLive do
           "#{length(module.__spacetime_contract__().pushes)} push(es)")
 
     step("REGISTER — the contract behind the generated module")
-    # The expression, not the value: pointing at `live-machine`'s own lookup
-    # means a definition accepted later is the one the NEXT event runs against.
-    BeamLisp.Spell.Server.register(
-      "chat-live",
-      ~s|(first (filter (fn [c] (= (name (get c :name)) "chat-live")) (spell.machine/contracts live-machine)))|
-    )
+    # A zero-arity FUNCTION, not a value: it runs per event, so a definition
+    # accepted later is the one the NEXT event runs against — the property the
+    # old source-string form had, kept.
+    #
+    # Not source, because the registry no longer evaluates beam-lisp:
+    # `eval_string` compiled a fresh BEAM module per call, and the atoms
+    # interning those module names are never reclaimed.
+    BeamLisp.Spell.Server.register("chat-live", &chat_contract/0)
 
     say("chat-live → live-machine's registered contract")
 
@@ -161,6 +163,20 @@ defmodule ServeLive do
       [] -> IO.puts("  (no credentials found — the page serves, but a turn will report a provider error)")
       found -> Enum.each(found, fn {k, src} -> IO.puts("  #{k} ← #{src}") end)
     end
+  end
+
+  # The chat contract, looked up in the live machine ON EACH CALL.
+  #
+  # Called per event by `BeamLisp.Spell.Server`, which is the point: the machine
+  # grows as definitions are accepted, and an event must run against the CURRENT
+  # contract rather than the one that existed at boot.
+  #
+  # `contracts` returns a `BeamLisp.Vector`; the `:name` is an ATOM (`:"chat-live"`),
+  # not a string, so the comparison converts rather than assuming.
+  defp chat_contract do
+    BeamLisp.Env.fetch!("spell.machine", "contracts").(Compiler.eval_string("live-machine"))
+    |> BeamLisp.Vector.to_list()
+    |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
   end
 
   defp eval(src), do: Compiler.eval_string(src)
