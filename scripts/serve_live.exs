@@ -110,18 +110,45 @@ defmodule ServeLive do
     :ok = BeamLisp.Spell.Live.rebuild()
 
     page = Path.join(@out, "page.st")
+    bundle = Path.join(bundle_dir(), "spacetime.js")
 
     case BeamLisp.Spell.Live.state().machine do
       %{"errors" => []} -> :ok
       %{"errors" => errors} -> say("machine reports #{length(errors)} error(s): #{inspect(errors)}")
     end
 
-    if File.exists?(page) do
-      say("#{page} (#{File.stat!(page).size} B)")
-      say("#{bundle_dir()}/spacetime.js + spacetime.css")
-    else
-      say("PUBLISH FAILED: no page at #{page}")
-      say("the browser will 404 its bundle until this is fixed")
+    # The BUNDLE is what the browser loads, so it is what is checked.
+    #
+    # Checking only `page.st` was not enough and the gap is not theoretical:
+    # `publish/1` writes the page BEFORE running `spacetime build`, so a failed
+    # build leaves a perfectly good page beside no bundle. This step then said
+    # "published" and the next step printed a URL, and the only place the
+    # failure appeared was `report.json`'s `build` field — which nobody reads
+    # while a server is starting.
+    #
+    # `report.json` carries the real verdict, because `publish/1` writes it on
+    # every publish INCLUDING a failed one, with the reason in it.
+    build = published_build_status()
+
+    cond do
+      not File.exists?(page) ->
+        abort("PUBLISH FAILED: no page at #{page}. Nothing to serve.")
+
+      match?(%{"ok" => false}, build) ->
+        abort("""
+        PUBLISH FAILED: #{Map.get(build, "reason")}
+
+        The page emitted but the bundle did not build, so #{bundle} does not
+        exist and the browser would load a 404 with no error on this side.
+        Refusing to advertise a URL that cannot work.
+        """)
+
+      not File.exists?(bundle) ->
+        abort("PUBLISH FAILED: no bundle at #{bundle}. The browser would 404.")
+
+      true ->
+        say("#{page} (#{File.stat!(page).size} B)")
+        say("#{bundle_dir()}/spacetime.js + spacetime.css")
     end
 
     step("SERVE")
@@ -145,6 +172,27 @@ defmodule ServeLive do
   # loaded: the browser kept serving the old bundle while `report.json`
   # announced a new version. One derivation now, in the module that does the
   # building.
+  # What the last publish actually did, from the loop's own report.
+  #
+  # `report.json` is written on every publish INCLUDING a failed build, with
+  # the reason in it — so it is the honest answer to "is this servable?".
+  defp published_build_status do
+    @out
+    |> Path.join("report.json")
+    |> File.read!()
+    |> JSON.decode!()
+    |> Map.get("build", %{})
+  rescue
+    _ -> %{}
+  end
+
+  # A failure loud enough to stop the boot. A server that starts and prints a
+  # URL has CLAIMED to work; the claim must be false only when the page is.
+  defp abort(message) do
+    IO.puts(:stderr, "\n" <> message <> "\n")
+    System.halt(1)
+  end
+
   defp bundle_dir, do: BeamLisp.Spell.Live.bundle_dir(@out, machine())
 
   # Provider credentials: the real environment, then `.env`, then the agent's

@@ -178,9 +178,18 @@ defmodule BeamLisp.StEdnTest do
         """)
 
       # Strip the document wrapper: `spacetime st` takes a form sequence.
+      #
+      # The `:st/imports` key is matched OPTIONALLY. It used to be absent when
+      # a caller supplied no imports, and the strip assumed that — so the day
+      # `emit-document` started delegating to `print-document` (which always
+      # emits the key, because verse accepts an empty vector and a document
+      # with no imports key at all is harder to recognise as a mistake), this
+      # test fed verse a fragment beginning `:st/imports []` and read the
+      # rejection as verse disliking BEAM-generated EDN. The wrapper is ours;
+      # the strip should describe all of it.
       body =
         forms
-        |> String.replace(~r/^\{:st\/forms \[/, "")
+        |> String.replace(~r/^\{(:st\/imports \[[^\]]*\]\s*)?:st\/forms \[/, "")
         |> String.replace(~r/\]\}$/, "")
 
       path = Path.join(System.tmp_dir!(), "bl_parity_#{System.unique_integer([:positive])}.edn")

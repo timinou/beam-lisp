@@ -297,21 +297,21 @@ defmodule BeamLisp.Spell.Live do
   # Runs in a spawned process. Streams content to `reply_to` as it arrives, and
   # when the model asks for a tool instead, walks the ladder and reports the
   # verdict as prose the page can render.
-  defp run_turn(server, cfg, messages, reply_to, id) do
+  defp run_turn(server, cfg, messages, reply_to, id, attempts_left \\ @max_attempts) do
     # `stream` sends to whatever pid it is given, so the turn collects its OWN
     # messages here and forwards them. That is what lets a tool call be
     # intercepted: the page never sees `[:tool-calls …]`, it sees the verdict.
     collector = self()
     bl("spell.provider", "stream-async", [cfg, messages, collector, id])
 
-    collect(server, reply_to, id, [])
+    collect(server, cfg, messages, reply_to, id, [], attempts_left)
   end
 
-  defp collect(server, reply_to, id, acc) do
+  defp collect(server, cfg, messages, reply_to, id, acc, attempts_left) do
     receive do
       {:delta, ^id, chunk} ->
         send(reply_to, {:delta, id, chunk})
-        collect(server, reply_to, id, [chunk | acc])
+        collect(server, cfg, messages, reply_to, id, [chunk | acc], attempts_left)
 
       # `:"tool-calls"`, hyphenated: the tuple is built in beam-lisp by
       # `(tuple :tool-calls id calls)`, and a keyword there prints with the
@@ -321,7 +321,7 @@ defmodule BeamLisp.Spell.Live do
         # A tool turn: the ladder answers, not the model's prose. Handled here
         # rather than forwarded, because `reply_to` is a LiveView and the
         # contract that decodes its messages has no vocabulary for a proposal.
-        handle_tool_calls(server, reply_to, id, Data.from_bl(calls))
+        handle_tool_calls(server, cfg, messages, reply_to, id, Data.from_bl(calls), attempts_left)
 
       {:done, ^id} ->
         finish(server, reply_to, id, acc)
@@ -366,55 +366,128 @@ defmodule BeamLisp.Spell.Live do
   # The verdict is sent as `[:defined …]` (accepted) or `[:delta …]` prose
   # (refused). A refusal is DELIBERATELY not `[:failed …]`: the turn did not
   # fail, the proposal did, and the difference is what the user needs to read.
-  defp handle_tool_calls(server, reply_to, id, calls) do
-    for call <- calls do
-      # A ladder that crashes is reported, not propagated: the spawned turn
-      # dying here would take `[:done …]` with it and strand the page.
-      verdict =
-        try do
-          GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
-        catch
-          kind, reason ->
-            %{status: :error, rung: :loop, reason: inspect({kind, reason})}
+  defp handle_tool_calls(server, cfg, messages, reply_to, id, calls, attempts_left) do
+    verdicts =
+      for call <- calls do
+        # A ladder that crashes is reported, not propagated: the spawned turn
+        # dying here would take `[:done …]` with it and strand the page.
+        verdict =
+          try do
+            GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
+          catch
+            kind, reason ->
+              %{status: :error, rung: :loop, reason: inspect({kind, reason})}
+          end
+
+        # A verdict is recorded in the loop's transcript as well as sent to the
+        # page, and that is not bookkeeping — it is what survives the reload.
+        #
+        # An accepted definition rebuilds the page, the browser reloads, and the
+        # LiveView remounts seeding from this transcript. A verdict that lived
+        # only in the socket's assigns disappeared at exactly the moment its
+        # definition arrived: the user saw the clock appear and the sentence
+        # explaining it vanish.
+        text =
+          case verdict.status do
+            :ok ->
+              "✓ " <> definition_summary(call)
+
+            _ ->
+              # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
+              #
+              # As a delta it accumulated into `@partial`, and the next accepted
+              # call's `[:defined …]` cleared that buffer — so on a turn
+              # proposing two things, one refused and one accepted, the user saw
+              # the success and never learned why the other was rejected.
+              #
+              # Every verdict is a completed statement about a proposal, so every
+              # verdict lands in the transcript as its own turn. `[:defined …]`
+              # is named for the EVENT (a definition was decided), not for the
+              # outcome; the text carries ✓ or ✗.
+              "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
+                "#{first_line(verdict[:reason])}"
+          end
+
+        record(server, text)
+        send(reply_to, {:defined, id, text})
+        verdict
+      end
+
+    retry_or_finish(server, cfg, messages, reply_to, id, verdicts, attempts_left)
+  end
+
+  # A refused proposal is fed BACK to the model, with the failing rung and the
+  # diagnostic, up to `@max_attempts` times.
+  #
+  # This is what `turn/3` — the synchronous path a script drives — has always
+  # done, and the browser path did not: a rejected proposal simply ended the
+  # turn, so a user watching the page got one attempt while a script got three.
+  # Two behaviours behind one capability is the thing PLAN-027 exists to remove,
+  # and joining the loops in W3 joined the CODE without joining this.
+  #
+  # The retry runs in THIS process, which is already the spawned turn, so the
+  # page keeps streaming and the LiveView still never blocks.
+  defp retry_or_finish(server, cfg, messages, reply_to, id, verdicts, attempts_left) do
+    rejected = Enum.reject(verdicts, &(&1.status == :ok))
+
+    cond do
+      rejected == [] ->
+        finish(server, reply_to, id, [])
+
+      attempts_left <= 1 ->
+        # The budget is the loop's only protection against a model that
+        # proposes forever, and the user is TOLD it ran out rather than left
+        # with a silent last refusal.
+        text = "no definition accepted after #{@max_attempts} attempts — the machine is unchanged"
+        record(server, text)
+        send(reply_to, {:defined, id, text})
+        finish(server, reply_to, id, [])
+
+      true ->
+        # DRAIN the `[:done …]` this turn's stream is about to send.
+        #
+        # `stream/4` sends `[:tool-calls …]` and THEN `[:done …]`, so by the
+        # time the ladder has answered, a `:done` for this id is already in
+        # flight. Starting the retry without taking it means the next
+        # `collect` receives the OLD turn's `:done`, finishes immediately, and
+        # the retry's own messages arrive with nobody listening — which is
+        # exactly what happened: one refusal, no second attempt, and the
+        # budget silently unused.
+        #
+        # A short timeout rather than a blocking receive: if the stream failed
+        # instead of completing, no `:done` is coming and waiting for one would
+        # hang the turn.
+        receive do
+          {:done, ^id} -> :ok
+        after
+          5_000 -> :ok
         end
 
-      # A verdict is recorded in the loop's transcript as well as sent to the
-      # page, and that is not bookkeeping — it is what survives the reload.
-      #
-      # An accepted definition rebuilds the page, the browser reloads, and the
-      # LiveView remounts seeding from this transcript. A verdict that lived
-      # only in the socket's assigns disappeared at exactly the moment its
-      # definition arrived: the user saw the clock appear and the sentence
-      # explaining it vanish.
-      case verdict.status do
-        :ok ->
-          text = "✓ " <> definition_summary(call)
-          record(server, text)
-          send(reply_to, {:defined, id, text})
+        # Verse's own text, verbatim: it names lines and codes, and the model
+        # has been trained on far more compiler output than on our prose.
+        prompt = retry_prompt(hd(rejected))
+        next = messages_with_retry(messages, prompt)
 
-        _ ->
-          # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
-          #
-          # As a delta it accumulated into `@partial`, and the next accepted
-          # call's `[:defined …]` cleared that buffer — so on a turn proposing
-          # two things, one refused and one accepted, the user saw only the
-          # success and never learned why the other was rejected. Reproduced by
-          # replaying that message sequence.
-          #
-          # Every verdict is a completed statement about a proposal, so every
-          # verdict lands in the transcript as its own turn. `[:defined …]` is
-          # named for the EVENT (a definition was decided), not for the
-          # outcome; the text carries ✓ or ✗.
-          text =
-            "✗ the definition was refused at the #{verdict[:rung]} rung: " <>
-              "#{first_line(verdict[:reason])}"
-
-          record(server, text)
-          send(reply_to, {:defined, id, text})
-      end
+        run_turn(server, cfg, next, reply_to, id, attempts_left - 1)
     end
+  end
 
-    finish(server, reply_to, id, [])
+  # The conversation plus a correction turn. Built here rather than in the loop
+  # because a retry is not something the USER said, and it must not reach the
+  # transcript the page renders.
+  #
+  # `:as_written` and KEYWORD keys, both load-bearing:
+  # `spell.provider/message-json` reads `(get m :role)`, so a string-keyed map
+  # serialises as `{"role":"","content":""}` — a request full of blank turns,
+  # accepted by the provider and answered as if the user had said nothing.
+  # Caught by printing the request body rather than trusting the round trip.
+  defp messages_with_retry(messages, prompt) do
+    existing =
+      messages
+      |> Data.from_bl()
+      |> Enum.map(&%{role: Map.get(&1, "role", "user"), content: Map.get(&1, "content", "")})
+
+    Data.to_bl(existing ++ [%{role: "user", content: prompt}], :as_written)
   end
 
   # Record a model turn, tolerating a loop that cannot answer. See `finish/4`:

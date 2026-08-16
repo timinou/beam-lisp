@@ -124,20 +124,25 @@ defmodule BeamLisp.Spell.Page do
     """
   end
 
-  # chat-live → ChatLive, matching `spell.contract/module-name` EXACTLY.
+  # chat-live → ChatLive — asked of `spell.contract/module-name`, never
+  # recomputed.
   #
-  # `String.capitalize/1` was wrong and a reviewer caught it: it lowercases the
-  # rest of a segment, so a contract named `HTTP-live` — whose seam says
-  # `from $HTTP-live` and whose BEAM module is `HTTPLive` — would get a page
-  # declaring `@host $HTTP-live : live("…HttpLive")`, pointing at a module the
-  # contract does not describe. Upcase the first character, keep the rest.
+  # This was a second implementation, and its own comment said it had to match
+  # the first "EXACTLY". A comment is not a mechanism: the two agreed only
+  # because someone kept checking. `String.capitalize/1` was the first way they
+  # disagreed — it lowercases the rest of a segment, so `HTTP-live` (module
+  # `HTTPLive`) would get a page declaring `live("…HttpLive")`, pointing at a
+  # module the contract does not describe.
+  #
+  # The contract's own emitter decides what a contract is called, because it is
+  # the thing that GENERATES the module. This asks it.
+  #
+  # The prefix is passed and then stripped: `module-name` answers a fully
+  # qualified name (`SpellWeb.ChatLive`), while the caller composes its own
+  # prefix. Passing an empty prefix would answer `.ChatLive`.
   defp module_name(host) do
-    host
-    |> String.split("-")
-    |> Enum.map_join("", fn
-      "" -> ""
-      <<first::utf8, rest::binary>> -> String.upcase(<<first::utf8>>) <> rest
-    end)
+    BeamLisp.Env.fetch!("spell.contract", "module-name").(%{name: host}, "")
+    |> String.trim_leading(".")
   end
 
   # An emitted EDN document as `.st`, via verse's own printer — never by

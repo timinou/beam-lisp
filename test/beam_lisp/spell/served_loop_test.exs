@@ -175,13 +175,43 @@ defmodule BeamLisp.Spell.ServedLoopTest do
       assert Live.state().machine == before,
              "a refused definition changed the machine"
 
-      last = socket.assigns.messages |> List.last()
+      texts = Enum.map(socket.assigns.messages, & &1["text"])
 
-      assert last["text"] =~ "refused at the ghosts rung",
-             "the user was not told WHY: #{inspect(last["text"])}"
+      # The reason appears in the transcript, not necessarily LAST: a refusal
+      # is retried (see the retry test below), so the final word is the
+      # exhaustion notice and the diagnostics precede it. Asserting on the tail
+      # would pass only while the browser path had no retry.
+      assert Enum.any?(texts, &(&1 =~ "refused at the ghosts rung")),
+             "the user was not told WHY: #{inspect(texts)}"
 
       assert socket.assigns.status == "idle",
              "the thinking indicator never stopped after a refusal"
+    end
+  end
+
+  describe "a refused proposal is retried, as it is from a script" do
+    @tag :verse
+    test "the model gets @max_attempts tries, then the user is told it ran out" do
+      # `turn/3` — the synchronous path a script drives — has always fed a
+      # refusal back to the model with the failing rung and the diagnostic, up
+      # to three times. The browser path did not: a rejected proposal simply
+      # ended the turn, so a user watching the page got ONE attempt while a
+      # script got three.
+      #
+      # Two behaviours behind one capability is what PLAN-027 exists to remove.
+      # W3 joined the code and did not join this.
+      socket = with_cassette("stream-tool-call-unmounted", fn -> ask_and_drain("add a floating clock") end)
+
+      texts = Enum.map(socket.assigns.messages, & &1["text"])
+      refusals = Enum.count(texts, &(&1 =~ "refused at the ghosts rung"))
+
+      assert refusals == 3,
+             "the model got #{refusals} attempt(s), not 3 — the browser path is not retrying"
+
+      assert List.last(texts) =~ "no definition accepted after 3 attempts",
+             "the budget ran out silently: #{inspect(List.last(texts))}"
+
+      assert socket.assigns.status == "idle"
     end
   end
 
