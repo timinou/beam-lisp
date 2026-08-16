@@ -12,7 +12,10 @@
 # providers were walled on the day this was written.
 
 defmodule ServeLiveCheck do
-  alias BeamLisp.{Compiler, Spell}
+  alias BeamLisp.Spell
+
+  # The machine's holder. Named so `chat_contract/0` reaches it without a pid.
+  @machine ServeLiveCheck.Machine
 
   def run do
     # FORCED, not defaulted. An ambient `PROVIDER=kimi` (exported by a shell that
@@ -25,12 +28,10 @@ defmodule ServeLiveCheck do
 
     Spell.init!(["spell.app", "spell.live"])
 
-    Compiler.eval_string("""
-    (def live-machine
-      (spell.live/seeded (spell.machine/empty-machine)
-                         spell.seed/contract-term
-                         spell.seed/view-term))
-    """)
+    # The machine as a VALUE, in a named Agent — the same shape
+    # scripts/serve_live.exs uses, so this check exercises the real wiring
+    # rather than a second one that could pass while serving is broken.
+    {:ok, _} = Agent.start_link(fn -> seeded_machine() end, name: @machine)
 
     # A zero-arity FUNCTION, not beam-lisp source: the registry no longer
     # evaluates source, because `eval_string` compiled a fresh BEAM module per
@@ -66,18 +67,30 @@ defmodule ServeLiveCheck do
   # helper as scripts/serve_live.exs. `contracts` returns a `BeamLisp.Vector`
   # and a contract's `:name` is an ATOM (`:"chat-live"`), not a string.
   defp chat_contract do
-    BeamLisp.Env.fetch!("spell.machine", "contracts").(Compiler.eval_string("live-machine"))
+    bl("spell.machine", "contracts", [machine()])
     |> BeamLisp.Vector.to_list()
     |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
   end
 
+  defp seeded_machine do
+    bl("spell.live", "seeded", [
+      bl("spell.machine", "empty-machine", []),
+      BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+      BeamLisp.Env.fetch!("spell.seed", "view-term")
+    ])
+  end
+
+  defp machine, do: Agent.get(@machine, & &1)
+
+  defp bl(ns, name, args), do: apply(BeamLisp.Env.fetch!(ns, name), args)
+
   defp generate_server_half do
     source =
-      Compiler.eval_string("""
-      (spell.contract/elixir-module spell.seed/contract-term
-                                    spell.seed/module
-                                    (spell.live/machine-shell live-machine))
-      """)
+      bl("spell.contract", "elixir-module", [
+        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+        BeamLisp.Env.fetch!("spell.seed", "module"),
+        bl("spell.live", "machine-shell", [machine()])
+      ])
 
     # The redefinition warning IS the mechanism here (the generated module
     # replaces the placeholder compiled into the app), so it is silenced to keep
@@ -89,15 +102,15 @@ defmodule ServeLiveCheck do
   end
 
   defp generated_module do
-    shell = Compiler.eval_string("(spell.live/machine-shell live-machine)")
+    shell = bl("spell.live", "machine-shell", [machine()])
     if is_nil(shell), do: throw("no &shell in the view term")
 
     source =
-      Compiler.eval_string("""
-      (spell.contract/elixir-module spell.seed/contract-term
-                                    "SpellWeb.CheckLive"
-                                    (spell.live/machine-shell live-machine))
-      """)
+      bl("spell.contract", "elixir-module", [
+        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+        "SpellWeb.CheckLive",
+        shell
+      ])
 
     # Compiled, not merely emitted: `Spacetime.LiveView.__before_compile__`
     # REFUSES a module whose declared event has no literal handle_event head

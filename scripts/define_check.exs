@@ -227,20 +227,28 @@ defmodule DefineCheck do
   end
 
   # ── fixtures ─────────────────────────────────────────────────────────────
+  # The machines below are built from beam-lisp SOURCE deliberately: they are
+  # this script's fixtures, and a fixture written in the language it exercises
+  # is the point (see `ghost_machine/0` — the ghost page must be one the tool
+  # would actually accept, expressed the way a definition is).
+  #
+  # What changed in PLAN-027 W1 is where the value goes afterwards:
+  # `Page.emit/3` takes the machine VALUE, so nothing has to be bound to a
+  # global var for the emitter to find it. That global was how two writers of
+  # one name came to exist.
   defp emit_seed do
-    bl("""
-    (def check-machine
+    machine =
+      bl("""
       (spell.live/seeded (spell.machine/empty-machine)
                          spell.seed/contract-term
-                         spell.seed/view-term))
-    """)
+                         spell.seed/view-term)
+      """)
 
-    Spell.Page.emit("check-machine", Path.join(@out, "seed.st"))
+    Spell.Page.emit(machine, Path.join(@out, "seed.st"))
   end
 
   defp emit_machine(setup_src, label) do
-    bl(setup_src)
-    Spell.Page.emit("check-machine", Path.join(@out, "#{label}.st"))
+    Spell.Page.emit(bl(setup_src), Path.join(@out, "#{label}.st"))
   end
 
   # A machine built THROUGH the define tool, not by hand: the ghost page must be
@@ -248,7 +256,6 @@ defmodule DefineCheck do
   # cannot reach.
   defp ghost_machine do
     """
-    (def check-machine
       (get (spell.define/define
              (spell.machine/register-contract (spell.machine/empty-machine)
                (spell.contract/parse :ghost-live {}
@@ -258,7 +265,7 @@ defmodule DefineCheck do
               :style [{:selector ".real" :rules {:color "#fff"}}
                       {:selector ".phantom-never-rendered" :rules {:color "#f00"}}]
               :binds [{:selector ".real" :each {:binding "items" :as "i" :template "row"}}]})
-           :machine))
+           :machine)
     """
   end
 

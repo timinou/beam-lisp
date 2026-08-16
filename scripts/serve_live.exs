@@ -25,10 +25,14 @@
 # mechanism the SELF cluster will use to let the machine rewrite itself.
 
 defmodule ServeLive do
-  alias BeamLisp.{Compiler, Spell}
+  alias BeamLisp.Spell
 
   @out Application.compile_env(:beam_lisp, :spell_static_dir, "/tmp/chat-serve")
   @gen "spell/gen"
+
+  # The name the machine's holder answers to. A named Agent so the resolver
+  # registered with `Spell.Server` can reach it without closing over a pid.
+  @machine ServeLive.Machine
 
   def run do
     load_env()
@@ -40,29 +44,37 @@ defmodule ServeLive do
     step("LOAD — the machine")
     Spell.init!(["spell.app", "spell.live"])
 
-    Compiler.eval_string("""
-    (def live-machine
-      (spell.live/seeded (spell.machine/empty-machine)
-                         spell.seed/contract-term
-                         spell.seed/view-term))
-    """)
+    # The machine is a VALUE, held in a named Agent for the life of the server.
+    #
+    # It was `(def live-machine …)` — a var in the process-global BeamLisp.Env —
+    # and `BeamLisp.Spell.Live.init/1` wrote the SAME name. Last writer won,
+    # silently, so whichever started second decided which machine every event
+    # ran against. There was no way to notice: both writes succeed.
+    #
+    # An Agent rather than a bare value because the resolver below is called on
+    # every event and must see the CURRENT machine as definitions are accepted.
+    {:ok, _} = Agent.start_link(fn -> seeded_machine() end, name: @machine)
 
-    contracts = eval("(mapv (fn [c] (name (get c :name))) (spell.machine/contracts live-machine))")
-    say("contracts: #{inspect(to_list(contracts))}")
+    contracts =
+      bl("spell.machine", "contracts", [machine()])
+      |> to_list()
+      |> Enum.map(&to_string(Map.get(&1, :name)))
+
+    say("contracts: #{inspect(contracts)}")
 
     step("GENERATE — the contract's server half")
-    shell = eval("(spell.live/machine-shell live-machine)")
+    shell = bl("spell.live", "machine-shell", [machine()])
 
     if is_nil(shell) do
       raise "no view declares an &shell template — there would be nothing for the bundle to hydrate"
     end
 
     source =
-      eval("""
-      (spell.contract/elixir-module spell.seed/contract-term
-                                    spell.seed/module
-                                    (spell.live/machine-shell live-machine))
-      """)
+      bl("spell.contract", "elixir-module", [
+        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+        BeamLisp.Env.fetch!("spell.seed", "module"),
+        shell
+      ])
 
     path = Path.join(@gen, "chat_live.ex")
     File.write!(path, source)
@@ -86,7 +98,7 @@ defmodule ServeLive do
     say("chat-live → live-machine's registered contract")
 
     step("EMIT — the page, from the machine")
-    {:ok, page} = Spell.Page.emit("live-machine", Path.join(@out, "page.st"))
+    {:ok, page} = Spell.Page.emit(machine(), Path.join(@out, "page.st"))
     say("#{page} (#{File.stat!(page).size} B)")
 
     step("BUILD — the bundle (verse)")
@@ -121,7 +133,10 @@ defmodule ServeLive do
   # page that loads a 404 and shows nothing, with no error anywhere on the
   # server.
   defp bundle_dir do
-    url = eval(~s|(get (get spell.seed/contract-term :opts) :bundle)|)
+    url =
+      BeamLisp.Env.fetch!("spell.seed", "contract-term")
+      |> Map.get(:opts, %{})
+      |> Map.get(:bundle)
 
     dir =
       url
@@ -174,12 +189,26 @@ defmodule ServeLive do
   # `contracts` returns a `BeamLisp.Vector`; the `:name` is an ATOM (`:"chat-live"`),
   # not a string, so the comparison converts rather than assuming.
   defp chat_contract do
-    BeamLisp.Env.fetch!("spell.machine", "contracts").(Compiler.eval_string("live-machine"))
-    |> BeamLisp.Vector.to_list()
+    bl("spell.machine", "contracts", [machine()])
+    |> to_list()
     |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
   end
 
-  defp eval(src), do: Compiler.eval_string(src)
+  # The machine every session starts from.
+  defp seeded_machine do
+    bl("spell.live", "seeded", [
+      bl("spell.machine", "empty-machine", []),
+      BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+      BeamLisp.Env.fetch!("spell.seed", "view-term")
+    ])
+  end
+
+  # The current machine. One owner, one answer.
+  defp machine, do: Agent.get(@machine, & &1)
+
+  # `<ns>/<name>` applied to values. Fetched per call so a REDEFINED var is the
+  # one that runs — the premise of the whole system.
+  defp bl(ns, name, args), do: apply(BeamLisp.Env.fetch!(ns, name), args)
   defp to_list(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.to_list(v)
   defp to_list(other), do: other
   defp step(title), do: IO.puts("\n── #{title} " <> String.duplicate("─", max(0, 58 - String.length(title))))
