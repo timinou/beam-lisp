@@ -888,6 +888,32 @@ defmodule BeamLisp.Spell.Live do
   # A var's VALUE, for the vars that are terms rather than functions.
   defp var(ns, name), do: BeamLisp.Env.fetch!(ns, name)
 
+  # CALL a beam-lisp fn with ordinary Elixir data.
+  #
+  # The whole point of PLAN-027: a beam-lisp var IS an Elixir fn value, so
+  # reaching spell's reasoning is `fetch` + `apply` — never printing arguments
+  # as source for `Compiler.eval_string/1`. That printing path cost 8_176 µs
+  # against 118 µs here, and worse than the time: it compiled a FRESH BEAM
+  # module per call, interning atoms that are never reclaimed. `Server.info/3`
+  # ran it once per streamed token, so a 500-token answer leaked ~1000 modules
+  # toward an atom limit whose exhaustion aborts the VM uncatchably.
+  #
+  # The lookup is deliberately NOT cached, for the reason `Spell.Server` states
+  # at its own `apply_bl`: `BeamLisp.Env` is where a REDEFINED var lands, and a
+  # cached capture would keep running the definition that existed at boot —
+  # opting this module out of the hot redefinition that is the system's point.
+  # An ETS read (~1 µs) against a 118 µs walk is not worth that.
+  defp bl(ns, name, args) do
+    fun = BeamLisp.Env.fetch!(ns, name)
+
+    unless is_function(fun, length(args)) do
+      raise ArgumentError,
+            "#{ns}/#{name} is not a function of #{length(args)} argument(s) — got #{inspect(fun)}"
+    end
+
+    apply(fun, args)
+  end
+
   defp decode_turn(turn) do
     case Data.from_bl(turn) do
       %{"kind" => "tool-calls", "tool-calls" => calls} -> {:tool_calls, calls}

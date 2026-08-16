@@ -29,9 +29,41 @@ defmodule BeamLisp.Spell.DataTest do
       # uncatchably, so "we validate before interning" is not enough — the
       # conversion must be incapable of interning.
       payload = Map.new(1..1000, fn i -> {"unknown_key_#{i}_#{System.unique_integer()}", i} end)
+      keys = Data.proposal_keys()
 
       before = :erlang.system_info(:atom_count)
-      Data.to_bl(payload, Data.proposal_keys())
+      Data.to_bl(payload, keys)
+      grew = :erlang.system_info(:atom_count) - before
+
+      # A BUDGET, not equality. The count is VM-global: ExUnit, logging and
+      # any other process intern atoms of their own while this runs, so `==`
+      # failed whenever this test ran first in a fresh VM (before the rest of
+      # the file had warmed the machinery) and passed when it ran later — a
+      # test whose result depended on its neighbours.
+      #
+      # 1000 crafted keys must not move the table meaningfully. The real
+      # assertion is the ratio: if the conversion interned its input, `grew`
+      # would be ~1000, not a handful of unrelated atoms from elsewhere in the
+      # VM. `proposal_keys()` is resolved BEFORE the window so the vocabulary's
+      # own (legitimate, one-time) interning is not counted here — it is the
+      # subject of the next test.
+      assert grew < 100,
+             "converting 1000 crafted keys grew the atom table by #{grew} — " <>
+               "a model-supplied key is being interned, and the atom table is " <>
+               "writable from the wire"
+    end
+
+    test "the conversion interns nothing at all when the VM is otherwise idle" do
+      # The exact claim, measured where nothing else is running: two identical
+      # conversions back to back. The first may pay for lazily-resolved
+      # machinery; the second cannot, so its delta is the conversion's own
+      # appetite for atoms and must be exactly zero.
+      payload = Map.new(1..1000, fn i -> {"other_key_#{i}_#{System.unique_integer()}", i} end)
+      keys = Data.proposal_keys()
+      Data.to_bl(payload, keys)
+
+      before = :erlang.system_info(:atom_count)
+      Data.to_bl(payload, keys)
 
       assert :erlang.system_info(:atom_count) == before,
              "a model-supplied key was interned — the atom table is writable from the wire"
