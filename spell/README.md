@@ -127,7 +127,7 @@ Blockers filed: `BUG-002` (nested receive patterns), `BUG-003`
 (pr-str on structs). This file is the design; `src/` is the code.
 
 **Status: 3 of 7 clusters implemented and verified running**
-(`mix beam_lisp.run spell/src/main.bl`). The other 4 are specified
+(`mix beam_lisp.run spell/study/main.bl`). The other 4 are specified
 here with their exact contracts and the one thing that unblocks each.
 
 ## Method: cluster by force, not by file
@@ -315,7 +315,7 @@ snapshot, verify-render probe, commit/revert.
 
 ## Cluster 6 — VIEW · UI is data · ✅ VERIFIED
 
-Implemented: `spell/src/spell/ui.bl`. The one cluster that is a
+Implemented: `spell/study/spell/ui.bl`. The one cluster that is a
 *copy* — deliberately: the model was already right. `el`, `text`,
 sizing, palette, `realize` (forces thunks, derefs refs, recursively —
 demo-verified), `error-tree`.
@@ -369,7 +369,7 @@ code for the most proof:
 
 The wire protocol itself is unchanged from clayd's (commands in,
 events out, one EDN value per line). It is documented verbatim in
-`src/spell/clay.bl`. Keeping EDN over switching to `term_to_binary`
+`study/spell/clay.bl`. Keeping EDN over switching to `term_to_binary`
 (measured 22× cheaper) is deliberate: the pipe stays `cat`-able, and
 "the UI is data" stays inspectable — revisit only if the frame budget
 demands it.
@@ -379,22 +379,36 @@ demands it.
 ```
 spell/
   README.md            ← this study
-  src/
-    main.bl            (ns main)            composition root; headless demo ✓ runs
-    spell/
-      ui.bl            (ns spell.ui)        VIEW     ✓ verified
-      fence.bl         (ns spell.fence)     FENCE    ✓ verified
-      store.bl         (ns spell.store)     STORE    ✓ verified
-      clay.bl          (ns spell.clay)      PROCESS+BOUNDARY  contract, stubbed
-      self.bl          (ns spell.self)      SELF              contract, stubbed
-
+  src/spell/           THE APPLICATION — everything `spell.app` requires
       app.bl           (ns spell.app)       manifest: the app's namespaces
       seam.bl          (ns spell.seam)      contract term as DATA      ✓
       contract.bl      (ns spell.contract)  defcontract/defview emit   ✓
+      st-edn.bl        (ns spell.st-edn)    the ONE document printer   ✓
       machine.bl       (ns spell.machine)   accumulating registry      ✓
+      define.bl        (ns spell.define)    the tool: rungs 1–2        ✓
+      live.bl          (ns spell.live)      a machine as ONE page      ✓
+      server.bl        (ns spell.server)    contract bodies, walked    ✓
       provider.bl      (ns spell.provider)  AGENT: the LLM call        ✓
+      cassette.bl      (ns spell.cassette)  recorded turns, replayed   ✓
       seed.bl          (ns spell.seed)      the seed definition        ✓
+
+      fence.bl         (ns spell.fence)     FENCE    ✓ verified
+      store.bl         (ns spell.store)     STORE    ✓ verified
+      self.bl          (ns spell.self)      SELF              contract, stubbed
+
+  study/               VERIFIED EXPERIMENTS — not the application, not loaded
+      README.md        ← why each is kept, and why `spell.st` is here
+      main.bl          (ns main)            the harness study ✓ runs
+      spell/ui.bl      (ns spell.ui)        VIEW     ✓ verified
+      spell/st.bl      (ns spell.st)        an atom→browser connector
+      spell/clay.bl    (ns spell.clay)      PROCESS+BOUNDARY  contract, stubbed
 ```
+
+The split is the point. `src/spell/` is what `spell.app` loads and what the
+chat loop runs; `study/` is evidence attached to findings, reachable only by
+naming it explicitly. `spell.st` in particular is a SECOND answer to "how does
+state reach the browser" — a road not taken, with a working demonstration —
+and beside `spell.server` it was an invitation to build on the wrong one.
 
 The last six arrived from `priv/` in PLAN-025 W1. `provider.bl` REPLACES the
 `providers.bl` stub this document used to list: the stub's wider surface —
@@ -402,8 +416,8 @@ cassettes, `eval-tool!`, the multi-turn `agent-ask` loop, credential loading —
 is unbuilt work, and it is recorded as such in PLAN-025 rather than as a second
 namespace answering the same need.
 
-Run: `mix beam_lisp.run spell/src/main.bl` (loader resolves `spell.ui` →
-`spell/src/spell/ui.bl` via the entry file's directory). From Elixir, load the
+Run: `mix beam_lisp.run spell/study/main.bl` (loader resolves `spell.ui` →
+`spell/study/spell/ui.bl` via the entry file's directory). From Elixir, load the
 whole application with `BeamLisp.Spell.init!()`, which requires `spell.app`;
 test suites get `spell/src` on the search path automatically.
 
@@ -426,7 +440,7 @@ clears the board fastest: data reader → hotswap API → BUG-002.
 
 ## Verified today
 
-`mix beam_lisp.run spell/src/main.bl`:
+`mix beam_lisp.run spell/study/main.bl`:
 
 ```
 VIEW:  3 children realized; thunk forced; ref derefed

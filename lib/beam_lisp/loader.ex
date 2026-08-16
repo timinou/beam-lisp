@@ -187,7 +187,8 @@ defmodule BeamLisp.Loader do
   # They exist because an application that lives outside cwd — `spell/src`
   # is the one in this repo — was previously reachable ONLY as the entry
   # file's own directory. That made `spell.machine` loadable by
-  # `mix beam_lisp.run spell/src/main.bl` and by nothing else: no test
+  # `mix beam_lisp.run --path spell/study --path spell/src spell/study/main.bl`
+  # and by nothing else: no test
   # suite could require it, because a suite pushes its OWN directory. A
   # library you cannot write a test against is a library you cannot move
   # code into, which is what blocked the priv/ → spell/ migration.
