@@ -395,7 +395,7 @@ defmodule BeamLisp.Spell.Live do
         text =
           case verdict.status do
             :ok ->
-              "✓ " <> definition_summary(call)
+              "✓ " <> definition_summary(call) <> warning_note(verdict)
 
             _ ->
               # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
@@ -513,6 +513,70 @@ defmodule BeamLisp.Spell.Live do
     why = Map.get(args, "rationale", "")
 
     "defined #{kind} #{inspect(name)} — #{why}"
+  end
+
+  # What the machine NOTICED about an accepted definition, appended to the ✓.
+  #
+  # The rungs decide whether a definition is broken; warnings say it is
+  # INCOMPLETE, and incomplete definitions are accepted on purpose — a machine
+  # that refuses them cannot be grown one definition at a time. But "accepted"
+  # was reported as bare success, so the findings existed only in the report
+  # nobody reads aloud.
+  #
+  # Observed live, and visible in `PLAN-027-repl-after.png`: a model redefined
+  # chat-view, kept the shell's `{@partial}` and `{@error}` holes, and dropped
+  # the `@view` binds that consume them. The machine emitted three
+  # `unrendered-assign` warnings, the verdict said "✓ defined view", and the
+  # page rendered the literal text `{@partial}` and `{@error}` under the
+  # transcript — uninterpolated holes, because nothing bound them.
+  #
+  # The model could have fixed it in the same turn if it had been told. It was
+  # not, so the page shipped with two visible artefacts and the loop reported
+  # unqualified success. Naming them turns a silent regression into the next
+  # thing the model does — which is what a repl is for.
+  #
+  # Appended rather than raised, and capped: this is information for the next
+  # turn, not a refusal, and a machine mid-growth legitimately carries several.
+  defp warning_note(verdict) do
+    case verdict[:report] do
+      %{"warnings" => [_ | _] = warnings} -> format_warnings(warnings)
+      %{warnings: [_ | _] = warnings} -> format_warnings(warnings)
+      _ -> ""
+    end
+  end
+
+  defp format_warnings(warnings) do
+    notes =
+      warnings
+      |> Enum.map(&warning_line/1)
+      |> Enum.reject(&(&1 == nil))
+      |> Enum.take(6)
+
+    if notes == [], do: "", else: "\n⚠ " <> Enum.join(notes, "; ")
+  end
+
+  # Warning maps arrive with string OR atom keys depending on which side of the
+  # data boundary they crossed, so both are read rather than assumed.
+  defp warning_line(w) do
+    get = fn k -> Map.get(w, k) || Map.get(w, to_string(k)) end
+
+    case to_string(get.(:kind)) do
+      "unrendered-assign" ->
+        "@#{get.(:assign)} is declared but no view renders it — if the markup " <>
+          "contains {@#{get.(:assign)}}, it will show as literal text until a bind consumes it"
+
+      "dead-template" ->
+        "template &#{get.(:template)} is declared but never invoked"
+
+      "template-not-bound" ->
+        "template &#{get.(:template)} has no bind connecting it to a binding"
+
+      "" ->
+        nil
+
+      other ->
+        "#{other}: #{inspect(Map.drop(w, [:kind, "kind"]))}"
+    end
   end
 
   defp first_line(reason) do
@@ -730,32 +794,64 @@ defmodule BeamLisp.Spell.Live do
          "no view declares an &shell template — there would be nothing for the bundle to hydrate"}
 
       shell ->
-        source =
-          bl("spell.contract", "elixir-module", [
-            BeamLisp.Env.fetch!("spell.seed", "contract-term"),
-            BeamLisp.Env.fetch!("spell.seed", "module"),
-            shell
-          ])
+        # A hole in the SHELL never interpolates.
+        #
+        # The shell is rendered by the LiveView, server-side, before the bundle
+        # hydrates — and only the bundle's templates interpolate `{@name}`. So
+        # a hole written into the shell reaches the browser as the literal
+        # characters `{@partial}`, sitting in the page forever.
+        #
+        # Observed live: asked to consume `@partial` and `@error`, a model put
+        # `<p class="chat__partial">{@partial}</p>` in the shell AND bound
+        # `.chat__partial` with a view bind. The bind was right; the hole was
+        # not, and every rung passed it — the markup is well-formed, the class
+        # is rendered, the binding is declared. The page shipped showing
+        # `{@partial}` and `{@error}` as text.
+        #
+        # Refused here rather than in a rung because it is a fact about how the
+        # shell is HOSTED, which is exactly what this function knows and the
+        # rungs do not. The seed's shell has no holes, so this cannot fire on
+        # anything that was already working.
+        case Regex.scan(~r/\{@[\w.]+\}/, shell) do
+          [] ->
+            write_host(shell)
 
-        path = Path.join(gen_dir(), "chat_live.ex")
-        File.mkdir_p!(gen_dir())
-        File.write!(path, source)
-
-        # Compiling REPLACES the running module in the code server, which is
-        # the whole point: the next request renders the new shell. Warnings are
-        # silenced because regenerating an existing module legitimately
-        # redefines it, and that warning on every accepted definition would
-        # train the reader to ignore the log.
-        Code.put_compiler_option(:ignore_module_conflict, true)
-
-        try do
-          [{_module, _bin} | _] = Code.compile_file(path)
-          :ok
-        rescue
-          e -> {:error, "the generated host module did not compile: #{Exception.message(e)}"}
-        after
-          Code.put_compiler_option(:ignore_module_conflict, false)
+          holes ->
+            {:error,
+             "the shell contains #{Enum.map_join(Enum.uniq(holes), ", ", &List.first/1)} — " <>
+               "the shell is rendered server-side, where holes are NOT interpolated, so " <>
+               "these would reach the browser as literal text. Put an empty element in " <>
+               "the shell and bind a template to it instead."}
         end
+    end
+  end
+
+  defp write_host(shell) do
+    source =
+      bl("spell.contract", "elixir-module", [
+        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+        BeamLisp.Env.fetch!("spell.seed", "module"),
+        shell
+      ])
+
+    path = Path.join(gen_dir(), "chat_live.ex")
+    File.mkdir_p!(gen_dir())
+    File.write!(path, source)
+
+    # Compiling REPLACES the running module in the code server, which is the
+    # whole point: the next request renders the new shell. Warnings are
+    # silenced because regenerating an existing module legitimately redefines
+    # it, and that warning on every accepted definition would train the reader
+    # to ignore the log.
+    Code.put_compiler_option(:ignore_module_conflict, true)
+
+    try do
+      [{_module, _bin} | _] = Code.compile_file(path)
+      :ok
+    rescue
+      e -> {:error, "the generated host module did not compile: #{Exception.message(e)}"}
+    after
+      Code.put_compiler_option(:ignore_module_conflict, false)
     end
   end
 

@@ -114,4 +114,60 @@ defmodule BeamLisp.Spell.HostRegenTest do
 
     GenServer.stop(pid)
   end
+
+  test "a {@hole} in the shell is REFUSED rather than shipped as literal text", %{out: out} do
+    # The shell is rendered by the LiveView, server-side, before the bundle
+    # hydrates — and only the bundle's templates interpolate `{@name}`. A hole
+    # written into the shell therefore reaches the browser as the literal
+    # characters `{@partial}` and stays there.
+    #
+    # Observed live: asked to consume `@partial` and `@error`, a model put
+    # `<p class="chat__partial">{@partial}</p>` in the shell AND added the
+    # correct view bind. Every rung passed it — the markup is well-formed, the
+    # class is rendered, the binding is declared — and the served page showed
+    # `{@partial}` and `{@error}` as text under the transcript.
+    #
+    # The bind was right and the hole was wrong; nothing could tell the model
+    # that, because the rule was known only to the host renderer. It is checked
+    # where it is known, and stated in `machine-briefing` so a model is told
+    # before it is refused.
+    {:ok, pid} = Live.start_link(out: out, name: nil)
+
+    holed = %{
+      "kind" => "view",
+      "name" => "chat-view",
+      "rationale" => "a hole in the shell, which never interpolates",
+      "templates" => [
+        %{
+          "name" => "shell",
+          "html" =>
+            "<main class=\"chat\"><div class=\"log\" data-log></div>" <>
+              "<p class=\"note\">{@partial}</p></main>"
+        },
+        %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
+      ],
+      "binds" => [
+        %{
+          "selector" => ".log",
+          "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
+        }
+      ]
+    }
+
+    verdict = Live.define(pid, holed)
+
+    assert verdict.status == :published_stale,
+           "a shell hole ships as literal text; it must not be reported as a " <>
+             "clean success: #{inspect(verdict)}"
+
+    reason = to_string(inspect(verdict.reason))
+
+    assert reason =~ "{@partial}",
+           "the refusal must quote the hole it found: #{reason}"
+
+    assert reason =~ "server-side" or reason =~ "literal",
+           "the refusal must say WHY, or the model will simply try again: #{reason}"
+
+    GenServer.stop(pid)
+  end
 end

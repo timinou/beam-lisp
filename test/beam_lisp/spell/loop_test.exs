@@ -257,6 +257,71 @@ defmodule BeamLisp.Spell.LoopTest do
       GenServer.stop(loop)
     end
 
+    test "an accepted definition REPORTS what the machine noticed", %{loop: loop} do
+      # Warnings mean INCOMPLETE, and incomplete definitions are accepted on
+      # purpose — a machine that refuses them cannot be grown one definition at
+      # a time. The defect was reporting acceptance as bare success, so the
+      # findings lived only in a report nobody reads aloud.
+      #
+      # Observed live (`!tasks/artifacts/PLAN-027-repl-after.png`): a model
+      # redefined chat-view, kept the shell's `{@partial}` and `{@error}` holes
+      # and dropped the `@view` binds consuming them. Three `unrendered-assign`
+      # warnings were raised, the verdict said "✓ defined view", and the page
+      # rendered the literal strings `{@partial}` and `{@error}`. The model
+      # could have fixed it that same turn had anyone told it.
+      #
+      # Asserted through `Live.define/2`'s verdict rather than the bubble text
+      # so it holds for every caller of the ladder, and the assertion names the
+      # ASSIGN — a warning the model cannot act on is the same silence in a
+      # different font.
+      # A view that renders NEITHER `@partial` nor `@error` — exactly what the
+      # live model produced. The seed renders both, so the seed's own warnings
+      # would not exercise this; the finding has to be caused, not borrowed.
+      forgetful = %{
+        "kind" => "view",
+        "name" => "chat-view",
+        "rationale" => "drop the binds that consume @partial and @error",
+        "templates" => [
+          %{
+            "name" => "shell",
+            "html" => "<main class=\"chat\"><div class=\"log\" data-log></div></main>"
+          },
+          %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
+        ],
+        "binds" => [
+          %{
+            "selector" => ".log",
+            "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
+          }
+        ]
+      }
+
+      verdict = Live.define(loop, forgetful)
+
+      assert verdict.status == :ok,
+             "an incomplete definition must still be ACCEPTED — refusing it " <>
+               "makes the machine ungrowable: #{inspect(verdict)}"
+
+      warnings = verdict.report["warnings"] || verdict.report[:warnings] || []
+
+      kinds =
+        Enum.map(warnings, fn w ->
+          to_string(Map.get(w, :kind) || Map.get(w, "kind"))
+        end)
+
+      assert "unrendered-assign" in kinds,
+             "the finding that produced two literal holes on a served page is " <>
+               "missing from the verdict: #{inspect(kinds)}"
+
+      assigns =
+        warnings
+        |> Enum.map(fn w -> to_string(Map.get(w, :assign) || Map.get(w, "assign") || "") end)
+
+      assert "partial" in assigns and "error" in assigns,
+             "the warning must NAME the assign the model dropped, or it cannot " <>
+               "act on it: #{inspect(assigns)}"
+    end
+
     test "the version counts PUBLISHES, not acceptances", %{loop: loop} do
       # Worth pinning because it is the browser's reload trigger and the two
       # readings differ. `version` is what `report.json` carries and the page
