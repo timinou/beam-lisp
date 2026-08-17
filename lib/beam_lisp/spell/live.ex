@@ -568,6 +568,12 @@ defmodule BeamLisp.Spell.Live do
       "dead-template" ->
         "template &#{get.(:template)} is declared but never invoked"
 
+      "background-without-color" ->
+        "#{get.(:selector)} sets a background but no color — the page is dark, " <>
+          "so text on that box stays the inherited near-white and may be " <>
+          "unreadable. Verse cannot see this: it compares the two only within " <>
+          "one rule"
+
       "template-not-bound" ->
         "template &#{get.(:template)} has no bind connecting it to a binding"
 
