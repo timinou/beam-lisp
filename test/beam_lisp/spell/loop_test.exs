@@ -185,6 +185,78 @@ defmodule BeamLisp.Spell.LoopTest do
       assert "clock" in Live.state(loop).machine["views"]
     end
 
+    @tag :publishes
+    test "a view that renames the page template away from `shell` reports a STALE publish",
+         %{} do
+      # The live incident. Asked to improve the chat view, a model produced a
+      # correct proposal that named the page template `&chat` instead of
+      # `&shell` — a reasonable name, and nothing had told it otherwise.
+      #
+      # Every rung accepted it, and before the fix the story ended there: the
+      # machine took the definition, the bundle was rebuilt, `report.json`
+      # announced a new version, and the browser kept rendering the PREVIOUS
+      # page — because `machine-shell` returned nil, so the host module (which
+      # renders the shell SERVER-side) was never regenerated. A machine that
+      # grows while the page cannot change, with no error anywhere.
+      #
+      # Note what is asserted and what is NOT. The proposal is structurally
+      # sound — no orphan binding, no unhandled fire — so the RUNGS are right
+      # to pass it, and an errors-level rule refusing it would also refuse the
+      # partial machines `spell.machine.test` builds (tried; 16 failures). The
+      # defect is not that the machine is invalid, it is that the result cannot
+      # be SERVED, which is a publish-time fact and belongs in the publish
+      # verdict.
+      #
+      # So this pins `:published_stale` with a reason naming the shell: the
+      # model is told its definition landed but the page did not, in words it
+      # can act on. `publish: false` cannot see this — hence its own loop.
+      out = Path.join(System.tmp_dir!(), "noshell-#{System.unique_integer([:positive])}")
+      gen = Path.join(out, "gen")
+      File.mkdir_p!(gen)
+      prev = Application.get_env(:beam_lisp, :spell_gen_dir)
+      Application.put_env(:beam_lisp, :spell_gen_dir, gen)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:beam_lisp, :spell_gen_dir, prev),
+          else: Application.delete_env(:beam_lisp, :spell_gen_dir)
+
+        File.rm_rf(out)
+      end)
+
+      {:ok, loop} = Live.start_link(out: out, name: nil)
+
+      shell_renamed = %{
+        "kind" => "view",
+        "name" => "chat-view",
+        "rationale" => "a page template under any other name",
+        "templates" => [
+          %{"name" => "chat", "html" => "<main class=\"chat\"><div class=\"log\" data-log></div></main>"},
+          %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
+        ],
+        "binds" => [
+          %{
+            "selector" => ".log",
+            "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
+          }
+        ]
+      }
+
+      verdict = Live.define(loop, shell_renamed)
+
+      assert verdict.status == :published_stale,
+             "a definition that leaves the page unhostable was reported as a " <>
+               "clean success: #{inspect(verdict)}"
+
+      assert verdict.rung == :publish
+
+      assert to_string(inspect(verdict.reason)) =~ "shell",
+             "the report must NAME what is missing, or the model cannot act " <>
+               "on it: #{inspect(verdict.reason)}"
+
+      GenServer.stop(loop)
+    end
+
     test "the version counts PUBLISHES, not acceptances", %{loop: loop} do
       # Worth pinning because it is the browser's reload trigger and the two
       # readings differ. `version` is what `report.json` carries and the page

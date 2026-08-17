@@ -28,7 +28,6 @@ defmodule ServeLive do
   alias BeamLisp.Spell
 
   @out Application.compile_env(:beam_lisp, :spell_static_dir, "/tmp/chat-serve")
-  @gen "spell/gen"
 
 
   def run do
@@ -36,7 +35,6 @@ defmodule ServeLive do
     :inets.start()
     :ssl.start()
     File.mkdir_p!(@out)
-    File.mkdir_p!(@gen)
 
     step("LOAD — the machine, and the loop that owns it")
     Spell.init!(["spell.app", "spell.live"])
@@ -64,24 +62,32 @@ defmodule ServeLive do
     say("contracts: #{inspect(contracts)}")
 
     step("GENERATE — the contract's server half")
-    shell = bl("spell.live", "machine-shell", [machine()])
+    # The loop generates it, not this script.
+    #
+    # This step used to lift the shell, emit the module and compile it here —
+    # and `Live.publish/1` did not, so the module was written exactly once, at
+    # boot. An accepted view redefinition rebuilt `page.st` and the bundle but
+    # not the host, and since the shell is rendered SERVER-side the browser
+    # kept showing boot's markup through any number of reloads. Observed live:
+    # machine at version 3 with the new markup, DOM still at version 1's.
+    #
+    # Same shape as the PUBLISH step below, which already documents why a
+    # second publisher is worse than none: the copies only differ when they
+    # disagree, and that is precisely when the wrong one is believed. So the
+    # loop owns every artefact an accepted definition invalidates, and this
+    # script REPORTS what the loop produced.
+    #
+    # `Live.start_link/1` above has already published once, so the module
+    # exists by now; this reads it rather than rebuilding it.
+    path = Path.join(BeamLisp.Spell.Live.gen_dir(), "chat_live.ex")
 
-    if is_nil(shell) do
-      raise "no view declares an &shell template — there would be nothing for the bundle to hydrate"
+    unless File.exists?(path) do
+      abort("the loop did not generate #{path} — build status: #{inspect(BeamLisp.Spell.Live.state().last_build)}")
     end
 
-    source =
-      bl("spell.contract", "elixir-module", [
-        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
-        BeamLisp.Env.fetch!("spell.seed", "module"),
-        shell
-      ])
+    say("loop wrote #{path} (#{File.stat!(path).size} B)")
 
-    path = Path.join(@gen, "chat_live.ex")
-    File.write!(path, source)
-    say("wrote #{path} (#{byte_size(source)} B)")
-
-    [{module, _bin} | _] = Code.compile_file(path)
+    module = SpellWeb.ChatLive
     say("compiled #{inspect(module)} — #{length(module.__spacetime_contract__().events)} event(s), " <>
           "#{length(module.__spacetime_contract__().assigns)} assign(s), " <>
           "#{length(module.__spacetime_contract__().pushes)} push(es)")

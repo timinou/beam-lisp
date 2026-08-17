@@ -74,9 +74,14 @@ defmodule BeamLisp.Spell.Live do
   "assigns":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string","enum":["list","atom","integer","string","boolean"]}},"required":["name","type"]}},\
   "events":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"params":{"type":"array","items":{"type":"string"}},"replies":{"type":"array","items":{"type":"string","enum":["ok","err"]}}},"required":["name"]}},\
   "pushes":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"fields":{"type":"object"}},"required":["name"]}},\
-  "templates":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"params":{"type":"array","items":{"type":"string"}},"html":{"type":"string","description":"one element; {@x.field} interpolates"}},"required":["name","html"]}},\
+  "templates":{"type":"array","description":"a view MUST include one named `shell` — the whole-page template the browser hydrates into; any other name and there is no page","items":{"type":"object","properties":{"name":{"type":"string","description":"`shell` for the page itself; anything else for a part it hosts"},"params":{"type":"array","items":{"type":"string"}},"html":{"type":"string","description":"one element; {@x.field} interpolates"}},"required":["name","html"]}},\
   "style":{"type":"array","items":{"type":"object","properties":{"selector":{"type":"string"},"rules":{"type":"object"}},"required":["selector","rules"]}},\
-  "binds":{"type":"array","items":{"type":"object","properties":{"selector":{"type":"string"},"each":{"type":"object"},"on":{"type":"object"},"view":{"type":"object"}},"required":["selector"]}}},\
+  "binds":{"type":"array","description":"each item attaches EXACTLY ONE of each/on/view to a selector","items":{"type":"object","properties":{\
+  "selector":{"type":"string"},\
+  "each":{"type":"object","description":"repeat a template over a list assign","properties":{"binding":{"type":"string","description":"the list assign, e.g. messages"},"as":{"type":"string","description":"name each item is bound to inside the template, e.g. m"},"template":{"type":"string","description":"name of a template defined in this same proposal"}},"required":["binding","template"]},\
+  "on":{"type":"object","description":"a DOM event; MUST carry either fire or value, never neither","properties":{"event":{"type":"string","description":"click, input, keydown… (default click)"},"fire":{"type":"string","description":"name of a declared contract event to send"},"arg":{"type":"string","description":"value passed with the fired event, e.g. a page-local like draft"},"value":{"type":"string","description":"write to a page-local instead of firing, e.g. draft"},"key":{"type":"string","description":"only with event keydown: fire only for this key, e.g. Enter"}}},\
+  "view":{"type":"object","description":"swap templates by the value of an assign","properties":{"binding":{"type":"string","description":"the assign to switch on, e.g. status"},"arms":{"type":"array","description":"[value, template-name] pairs","items":{"type":"array","items":{"type":"string"}}}},"required":["binding","arms"]}},\
+  "required":["selector"]}}},\
   "required":["kind","name","rationale"]}\
   """
 
@@ -686,13 +691,76 @@ defmodule BeamLisp.Spell.Live do
 
     build =
       with {:ok, _} <- Spell.Page.emit(state.machine, page),
-           :ok <- build_bundle(page, state.out, state.machine) do
+           :ok <- build_bundle(page, state.out, state.machine),
+           :ok <- regenerate_host(state.machine) do
         :ok
       end
 
     write_report(state, build)
     %{state | last_build: build}
   end
+
+  # The host module carries the SHELL — the markup a LiveView renders for the
+  # bundle to hydrate into — and `spell.live/machine-shell` lifts that shell
+  # from the machine's `&shell` template. So a view redefinition changes the
+  # shell, and the module must be rebuilt with it.
+  #
+  # This ran only at boot, in `scripts/serve_live.exs`. The consequence, found
+  # by asking a live model to redefine the chat view and then reading the DOM:
+  # the definition was ACCEPTED, `page.st` and the bundle were rebuilt with the
+  # new markup, `report.json` announced version 3 — and the browser kept
+  # rendering the shell generated at boot. A hard reload changed nothing,
+  # because the stale markup was being rendered server-side by a module nobody
+  # had regenerated. Machine grew; page could not.
+  #
+  # That is the SAME defect `bundle_dir/2` below documents ("a machine that
+  # grows and a page that never changes, with no error anywhere") — it was
+  # fixed for the bundle and missed for the host, because the two halves of
+  # publishing lived in two files. Both now live here: whatever an accepted
+  # definition changes, the loop rebuilds all of it, and the boot script asks
+  # the loop rather than doing half the job itself.
+  #
+  # Failure is returned, never raised: a machine whose views declare no shell
+  # is a refusable state, and `last_build` is where refusals are already
+  # reported to the report and the transcript.
+  defp regenerate_host(machine) do
+    case bl("spell.live", "machine-shell", [machine]) do
+      nil ->
+        {:error,
+         "no view declares an &shell template — there would be nothing for the bundle to hydrate"}
+
+      shell ->
+        source =
+          bl("spell.contract", "elixir-module", [
+            BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+            BeamLisp.Env.fetch!("spell.seed", "module"),
+            shell
+          ])
+
+        path = Path.join(gen_dir(), "chat_live.ex")
+        File.mkdir_p!(gen_dir())
+        File.write!(path, source)
+
+        # Compiling REPLACES the running module in the code server, which is
+        # the whole point: the next request renders the new shell. Warnings are
+        # silenced because regenerating an existing module legitimately
+        # redefines it, and that warning on every accepted definition would
+        # train the reader to ignore the log.
+        Code.put_compiler_option(:ignore_module_conflict, true)
+
+        try do
+          [{_module, _bin} | _] = Code.compile_file(path)
+          :ok
+        rescue
+          e -> {:error, "the generated host module did not compile: #{Exception.message(e)}"}
+        after
+          Code.put_compiler_option(:ignore_module_conflict, false)
+        end
+    end
+  end
+
+  @doc "Where the generated server half is written."
+  def gen_dir, do: Application.get_env(:beam_lisp, :spell_gen_dir, "spell/gen")
 
   defp build_bundle(page, out, machine) do
     target = bundle_dir(out, machine)
@@ -828,11 +896,28 @@ defmodule BeamLisp.Spell.Live do
   # rejected proposals as prose, on top of the tool result it already got,
   # doubles them.
   defp provider_messages(state, text) do
-    state.transcript
-    |> Enum.reverse()
-    |> Enum.filter(&(&1.role in [:user, :model]))
-    |> Enum.map(&%{role: &1.role, content: &1.content})
-    |> conversation(text)
+    conversation =
+      state.transcript
+      |> Enum.reverse()
+      |> Enum.filter(&(&1.role in [:user, :model]))
+      |> Enum.map(&%{role: &1.role, content: &1.content})
+      |> conversation(text)
+
+    # The briefing goes FIRST, and it is rebuilt from the CURRENT machine on
+    # every turn rather than captured once.
+    #
+    # Without it the model has a tool for editing a machine and no knowledge of
+    # the machine: asked to improve the chat view, glm-5.3 reasoned "since I
+    # can't inspect the machine, I should define a view that binds to a standard
+    # chat contract shape", invented four names that do not exist, and was
+    # correctly refused by the ladder. The refusal was right; withholding the
+    # vocabulary was ours.
+    #
+    # Rebuilt per turn because the machine is the thing being edited: a view
+    # accepted this turn must appear in the next turn's briefing, or the model
+    # is reasoning about a system one definition out of date — which for a
+    # multi-step change is the same failure in slower motion.
+    [%{role: "system", content: bl("spell.live", "machine-briefing", [state.machine])} | conversation]
   end
 
   @doc """
@@ -875,15 +960,6 @@ defmodule BeamLisp.Spell.Live do
   defp to_role(other), do: to_string(other)
 
   # ── plumbing ──────────────────────────────────────────────────────────────
-
-  # `<ns>/<name>` applied to already-converted arguments.
-  #
-  # Fetched per call rather than cached in a module attribute: `BeamLisp.Env` is
-  # where a REDEFINED var lands, so a cached capture would keep running the
-  # definition that existed at boot — which in the module whose entire job is
-  # growing the system at runtime would be a silent opt-out from its own
-  # premise. The lookup is an ETS read against a 118 µs walk.
-  defp bl(ns, name, args), do: apply(BeamLisp.Env.fetch!(ns, name), args)
 
   # A var's VALUE, for the vars that are terms rather than functions.
   defp var(ns, name), do: BeamLisp.Env.fetch!(ns, name)

@@ -1,0 +1,117 @@
+defmodule BeamLisp.Spell.HostRegenTest do
+  @moduledoc """
+  Publishing regenerates the HOST module, not just the page and the bundle.
+
+  ## The defect
+
+  The shell — the markup a LiveView renders for the bundle to hydrate into — is
+  lifted from the machine by `spell.live/machine-shell` and baked into the
+  generated `SpellWeb.ChatLive` by `spell.contract/elixir-module`. It is
+  rendered SERVER-side, so it reaches the browser through the LiveView, not
+  through the bundle.
+
+  That generation ran in `scripts/serve_live.exs`, once, at boot. `publish/1`
+  re-emitted `page.st` and rebuilt the bundle but never the host. So:
+
+      a live model redefined chat-view (accepted, version 3, build :ok)
+      → page.st and spacetime.js carried the new markup
+      → the DOM kept boot's shell, through hard reloads
+      → nothing anywhere reported an error
+
+  The machine grew and the page could not change. `bundle_dir/2` documents this
+  exact failure ("a machine that grows and a page that never changes, with no
+  error anywhere") for the bundle; the host half was missed because the two
+  halves of publishing lived in two files.
+
+  ## What this asserts
+
+  That the artefact carrying the shell is rebuilt from the CURRENT machine when
+  the loop publishes — by changing the machine's shell and reading the file the
+  loop wrote. Asserting "publish calls regenerate_host" would restate the
+  implementation; asserting the file's CONTENT follows the machine is the
+  property a browser actually depends on.
+
+  Tagged `:verse` with the other rungs that shell out: publishing runs the real
+  emitter and the real `spacetime build`.
+  """
+
+  use BeamLisp.SpellCase, async: false
+
+  alias BeamLisp.Spell.Live
+
+  @moduletag :verse
+
+  setup do
+    out = Path.join(System.tmp_dir!(), "host-regen-#{System.unique_integer([:positive])}")
+    gen = Path.join(out, "gen")
+    File.mkdir_p!(gen)
+
+    prev = Application.get_env(:beam_lisp, :spell_gen_dir)
+    Application.put_env(:beam_lisp, :spell_gen_dir, gen)
+
+    on_exit(fn ->
+      if prev, do: Application.put_env(:beam_lisp, :spell_gen_dir, prev),
+        else: Application.delete_env(:beam_lisp, :spell_gen_dir)
+
+      File.rm_rf(out)
+    end)
+
+    {:ok, out: out, gen: gen}
+  end
+
+  test "the shell in the generated host follows the machine", %{out: out, gen: gen} do
+    {:ok, pid} = Live.start_link(out: out, name: nil)
+
+    host = Path.join(gen, "chat_live.ex")
+
+    assert File.exists?(host),
+           "starting the loop publishes, and publishing must write the host module"
+
+    # The seed's shell, as generated at boot.
+    before = File.read!(host)
+    assert before =~ "shell:", "the generated module must carry a shell"
+
+    # Redefining the view through the loop's own `define/2` — the path a model
+    # takes — rather than reaching for a private function. The property is
+    # about what an ACCEPTED DEFINITION does, so it must be driven by one.
+    #
+    # The proposal is minimal but must survive all four rungs: `&shell` renders
+    # `.log`, and the each-bind mounts into it, so no selector is orphaned.
+    marker = "regen-#{System.unique_integer([:positive])}"
+
+    proposal = %{
+      "kind" => "view",
+      "name" => "chat-view",
+      "rationale" => "prove the host is regenerated from the machine",
+      "templates" => [
+        %{
+          "name" => "shell",
+          "html" =>
+            "<main class=\"chat\" data-marker=\"#{marker}\">" <>
+              "<div class=\"log\" data-log></div></main>"
+        },
+        %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
+      ],
+      "style" => [%{"selector" => ".bubble", "rules" => %{"margin" => "0"}}],
+      "binds" => [
+        %{
+          "selector" => ".log",
+          "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
+        }
+      ]
+    }
+
+    verdict = Live.define(pid, proposal)
+    assert verdict.status == :ok, "the proposal must be accepted: #{inspect(verdict)}"
+
+    after_ = File.read!(host)
+
+    assert after_ =~ marker,
+           "publishing did not rebuild the host from the current machine — " <>
+             "the page would keep rendering a stale shell"
+
+    refute after_ == before
+
+    GenServer.stop(pid)
+  end
+end
