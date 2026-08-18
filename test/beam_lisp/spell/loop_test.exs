@@ -82,8 +82,24 @@ defmodule BeamLisp.Spell.LoopTest do
       assert verdict.rung == :schema
     end
 
-    test "a form that is not a definition is refused", %{loop: loop} do
-      verdict = Loop.run(loop, "(def pwned 99)", "not a defview or defcontract")
+    test "a junk head is refused at the schema rung", %{loop: loop} do
+      verdict = Loop.run(loop, "(println 1)", "not a defview or defcontract")
+
+      assert verdict.status == :rejected
+      assert verdict.rung == :schema
+    end
+
+    test "a def is a code head — it walks the fence, not the refusal", %{loop: loop} do
+      # W4: `(def pwned 99)` is CODE, not junk. Accepted via the fence rung
+      # into spell.vars — this is the tool growing the image, by design.
+      verdict = Loop.run(loop, "(def w4-pwned-marker 99)", "a value def")
+
+      assert verdict.status == :ok
+      assert verdict[:kind] == "code"
+    end
+
+    test "a compile-time head is refused at the schema rung", %{loop: loop} do
+      verdict = Loop.run(loop, "(defmacro pwned [x] x)", "macro attempt")
 
       assert verdict.status == :rejected
       assert verdict.rung == :schema
