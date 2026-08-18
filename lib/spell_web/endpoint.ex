@@ -37,6 +37,13 @@ defmodule SpellWeb.Endpoint do
   # The client JS ships PREBUILT inside the deps (`priv/static/phoenix.js`,
   # `priv/static/phoenix_live_view.js`), so this app needs no npm, no esbuild
   # and no vendored copies that can drift from the library version in mix.lock.
+  # Tidewave: MCP access to THIS running image — an agent (or a human with
+  # `mcp-remote`) can project_eval against the live loop, which is exactly
+  # how the loop's own behaviour gets exercised end-to-end. Dev-only dep.
+  if Code.ensure_loaded?(Tidewave) do
+    plug(Tidewave)
+  end
+
   plug(Plug.Static, at: "/assets/phoenix", from: {:phoenix, "priv/static"}, gzip: false)
 
   plug(Plug.Static,
