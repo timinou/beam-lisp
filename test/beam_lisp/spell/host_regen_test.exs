@@ -81,9 +81,9 @@ defmodule BeamLisp.Spell.HostRegenTest do
     source = """
     (defview chat-view
       (markup (template &shell []
-        "<main class=\\\"chat\\\" data-marker=\\\"#{marker}\\\"><div class=\\\"log\\\" data-log></div></main>")
+        [:main {:class "chat" :data-marker "#{marker}"} [:div {:class "log" :data-log true}]])
                (template &message [$m]
-        "<p class=\\\"bubble\\\">{@m.text}</p>"))
+        [:p {:class "bubble"} @m.text]))
       (binds [".log" (st/each @messages :as @m :template &message)]))
     """
 
@@ -122,9 +122,9 @@ defmodule BeamLisp.Spell.HostRegenTest do
     holed = """
     (defview chat-view
       (markup (template &shell []
-        "<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div><p class=\\\"note\\\">{@partial}</p></main>")
+        [:main {:class "chat"} [:div {:class "log" :data-log true}] [:p {:class "note"} @partial]])
                (template &message [$m]
-        "<p class=\\\"bubble\\\">{@m.text}</p>"))
+        [:p {:class "bubble"} @m.text]))
       (binds [".log" (st/each @messages :as @m :template &message)]))
     """
 

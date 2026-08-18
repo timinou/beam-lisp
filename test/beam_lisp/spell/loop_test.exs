@@ -61,15 +61,15 @@ defmodule BeamLisp.Spell.LoopTest do
   # —— fixtures ——————————————————————————————————————————————————————————————
 
   defp clock_src do
-    "(defview clock (markup (template &clock [$m] \"<div class='clock'>{@m.text}</div>\")) (style [\".clock\" {:font-size \"0.75rem\" :opacity \"0.6\"}]) (binds [\".log\" (st/each @messages :as @m :template &clock)]))"
+    "(defview clock (markup (template &clock [\$m] [:div {:class \"clock\"} @m.text])) (style [\".clock\" {:font-size \"0.75rem\" :opacity \"0.6\"}]) (binds [\".log\" (st/each @messages :as @m :template &clock)]))"
   end
 
   defp ghost_src do
-    "(defview ghosty (markup (template &real [$m] \"<i class='real'>{@m.text}</i>\")) (style [\".real\" {:color \"#fff\"}] [\".phantom-never-rendered\" {:color \"#f00\"}]) (binds [\".real\" (st/each @messages :as @m :template &real)]))"
+    "(defview ghosty (markup (template &real [\$m] [:i {:class \"real\"} @m.text])) (style [\".real\" {:color \"#fff\"}] [\".phantom-never-rendered\" {:color \"#f00\"}]) (binds [\".real\" (st/each @messages :as @m :template &real)]))"
   end
 
   defp unmounted_src do
-    "(defview floating (markup (template &drift [$m] \"<i class='drift'>{@m.text}</i>\")) (style [\".drift\" {:color \"#fff\"}]) (binds [\".nowhere\" (st/each @messages :as @m :template &drift)]))"
+    "(defview floating (markup (template &drift [\$m] [:i {:class \"drift\"} @m.text])) (style [\".drift\" {:color \"#fff\"}]) (binds [\".nowhere\" (st/each @messages :as @m :template &drift)]))"
   end
 
   # —— rungs 1–2: no compiler needed ————————————————————————————————————————
@@ -166,7 +166,7 @@ defmodule BeamLisp.Spell.LoopTest do
       {:ok, loop} = Loop.start_link(out: out, name: nil)
 
       shell_renamed =
-        "(defview chat-view (markup (template &chat [] \"<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div></main>\") (template &message [m] \"<p class=\\\"bubble\\\">{@m.text}</p>\")) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
+        "(defview chat-view (markup (template &chat [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
       verdict = Loop.run(loop, shell_renamed, "a page template under any other name")
 
@@ -204,7 +204,7 @@ defmodule BeamLisp.Spell.LoopTest do
       # live model produced. The seed renders both, so the seed's own warnings
       # would not exercise this; the finding has to be caused, not borrowed.
       forgetful =
-        "(defview chat-view (markup (template &shell [] \"<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div></main>\") (template &message [m] \"<p class=\\\"bubble\\\">{@m.text}</p>\")) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
+        "(defview chat-view (markup (template &shell [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
       verdict = Loop.run(loop, forgetful, "drop the binds that consume @partial and @error")
 
