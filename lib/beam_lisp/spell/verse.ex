@@ -57,9 +57,16 @@ defmodule BeamLisp.Spell.Verse do
   ends up lying about work that was already done.
   """
   def binary do
+    dirs = target_dirs()
+
     candidates =
       [System.get_env("VERSE_BIN")] ++
-        Enum.map(target_dirs(), &Path.join(&1, "release/spacetime"))
+        Enum.map(dirs, &Path.join(&1, "release/spacetime")) ++
+        # A debug build is a last resort, not a silent default: it compiles
+        # fine but serves slowly, so its use is logged by Spell.Serve rather
+        # than hidden. Still a real binary — never `cargo run`, which re-checks
+        # the build graph per invocation.
+        Enum.map(dirs, &Path.join(&1, "debug/spacetime"))
 
     candidates = Enum.reject(candidates, &is_nil/1)
 
@@ -401,22 +408,6 @@ defmodule BeamLisp.Spell.Verse do
     |> Enum.flat_map(fn [_, c] -> String.split(c, ~r/\s+/, trim: true) end)
     |> Enum.uniq()
     |> Enum.sort()
-  end
-
-  @doc """
-  Print an emitted EDN document as `.st`, via verse's own printer.
-
-  Exposed because `BeamLisp.Spell.Page` needs it and the cwd discipline above
-  must not be duplicated: a second call site that forgets it fails with a
-  message about an unknown macro.
-  """
-  def print_st(edn_path) do
-    with {:ok, bin} <- binary() do
-      case verse_cmd(bin, ["st", Path.expand(edn_path)]) do
-        {out, 0} -> {:ok, String.trim(out)}
-        {out, code} -> {:error, "spacetime st failed (exit #{code}): #{String.trim(out)}"}
-      end
-    end
   end
 
   @doc """

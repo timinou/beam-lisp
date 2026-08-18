@@ -39,37 +39,29 @@ defmodule SpellWeb.Layouts do
         <script src="/assets/js/spacetime_bridge.js">
         </script>
         <script>
-          // THE PAGE REBUILDS ITSELF WHEN THE MACHINE GROWS.
+          // THE PAGE RELOADS WHEN VERSE RECOMPILES IT.
           //
-          // An accepted definition re-emits the page, rebuilds the bundle and
-          // bumps a version in `report.json`. Without this poll the browser
-          // keeps running the bundle it loaded: the model says "✓ defined view
-          // clock", the machine really did grow, and the page shows no clock
-          // — which reads as the definition having done nothing.
-          //
-          // Polling the VERSION rather than the bundle's Last-Modified: the
-          // build is not byte-stable across runs (timestamps move), so the
-          // bundle would reload the page on every emit, while the version only
-          // moves when the machine did.
-          //
-          // Cache-busted because a 304 would freeze the version at whatever
-          // the browser first saw. `no-store` is set server-side too; both,
-          // because either alone has been observed to lose this race.
+          // An accepted definition rewrites index.edn; the running
+          // `spacetime serve` watches the site dir, recompiles, and announces
+          // Reload on its dev websocket. This is verse's own mechanism (the
+          // same message its served pages get) — there is no second reload
+          // channel to disagree with it, and nothing polls.
           (function () {
-            var seen = null;
-            setInterval(function () {
-              fetch("/spacetime/report.json?t=" + Date.now(), { cache: "no-store" })
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .then(function (report) {
-                  if (!report) return;
-                  // The FIRST reading establishes the baseline. Reloading on
-                  // it would reload every fresh tab exactly once, which looks
-                  // like a flicker nobody can explain.
-                  if (seen === null) { seen = report.version; return; }
-                  if (report.version !== seen) location.reload();
-                })
-                .catch(function () {});
-            }, 1000);
+            var url = "{BeamLisp.Spell.Build.ws_origin()}/ws";
+            var connect = function () {
+              var ws;
+              try { ws = new WebSocket(url); } catch (err) { return; }
+              ws.onmessage = function (e) {
+                try {
+                  var d = JSON.parse(e.data);
+                  if (d.DevServer && d.DevServer.type === "Reload") location.reload();
+                } catch (err) {}
+              };
+              // A dead serve (or a boot in progress) retries instead of
+              // stranding the page on a stale bundle.
+              ws.onclose = function () { setTimeout(connect, 2000); };
+            };
+            connect();
           })();
         </script>
       </head>

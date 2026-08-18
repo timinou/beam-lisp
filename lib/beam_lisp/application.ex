@@ -13,6 +13,17 @@ defmodule BeamLisp.Application do
         else
           []
         end ++
+        if spell_serve?() and port_free?(verse_port()) do
+          # The verse dev server: the warm compiler the FS protocol
+          # (`Spell.Build`) talks to. Port-gated like the other listeners: a
+          # second session finding 4444 held talks to the FIRST session's
+          # serve — the same kindness, and the same lie if the site dirs
+          # differ, which serve_live.exs' startup report must surface.
+          # `:ignore`d when no binary exists.
+          [BeamLisp.Spell.Serve]
+        else
+          []
+        end ++
         if spell_endpoint?() and port_free?(spell_port()) do
           # The seam's server half. PubSub first: Phoenix.Endpoint reads
           # `pubsub_server` from config and a LiveView that outlives its
@@ -57,6 +68,17 @@ defmodule BeamLisp.Application do
       nil -> 4030
       cfg -> get_in(cfg, [:http, :port]) || 4030
     end
+  end
+
+  defp verse_port, do: Application.get_env(:beam_lisp, :spell_verse_port, 4444)
+
+  # The verse serve has a wider gate than the chat endpoint: it is the run's
+  # verdict, so anything that can accept a definition needs it — interactive
+  # sessions AND the test suite (whose loop tests publish for real). Tests are
+  # `async: false` across the spell suites, so one serve on one site dir is
+  # one writer at a time.
+  defp spell_serve? do
+    Code.ensure_loaded?(Mix) and (Mix.env() == :test or spell_endpoint?())
   end
 
   # The chat endpoint runs for interactive sessions only, and by the same rule

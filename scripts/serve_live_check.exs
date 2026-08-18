@@ -7,9 +7,10 @@
 # protocol — and asserts what comes back. What it does NOT cover is rendering;
 # that needs a browser and is done through `scripts/serve_live.exs` by hand.
 #
-# It runs offline (`PROVIDER=fake`, unless one is already set) because a check
-# that only passes while a paid API answers is not a check. Both configured
-# providers were walled on the day this was written.
+# It runs offline (`PROVIDER=fake`, unless one is already set; `Live.start_link`
+# with `publish: false`) because a check that only passes while a paid API
+# answers is not a check. Both configured providers were walled on the day this
+# was written.
 
 defmodule ServeLiveCheck do
   alias BeamLisp.Spell
@@ -209,13 +210,13 @@ defmodule ServeLiveCheck do
     detail = fun.()
     IO.puts("  ✓ #{name}\n      #{detail}")
     :ok
-  catch
-    reason ->
-      IO.puts("  ✗ #{name}\n      #{inspect(reason)}")
-      :error
   rescue
     e ->
       IO.puts("  ✗ #{name}\n      #{Exception.message(e)}")
+      :error
+  catch
+    reason ->
+      IO.puts("  ✗ #{name}\n      #{inspect(reason)}")
       :error
   end
 end

@@ -21,7 +21,7 @@
 alias BeamLisp.Spell
 
 defmodule DefineCheck do
-  @out "/tmp/define_check"
+  @out "#{System.get_env("TMPDIR", "/tmp")}/define_check_#{:erlang.system_time(:second)}"
 
   def run do
     File.mkdir_p!(@out)
@@ -91,10 +91,7 @@ defmodule DefineCheck do
             if "phantom-never-rendered" in ghosts do
               pass("rung 4: a styled-but-unrendered class IS caught (#{inspect(ghosts)})")
             else
-              fail(
-                "rung 4: should have caught .phantom-never-rendered",
-                "ghosts were #{inspect(ghosts)} — a check that cannot fail is not a check"
-              )
+              fail("rung 4: should have caught .phantom-never-rendered", "ghosts were #{inspect(ghosts)}")
             end
 
           {:error, reason} ->
@@ -102,26 +99,18 @@ defmodule DefineCheck do
         end
 
       {:error, diag} ->
-        # If the ghost page does not even compile, this case proves nothing
-        # about rung 4 — it would be passing for the wrong reason.
         fail("rung 4: the ghost fixture must COMPILE for the case to mean anything", diag)
     end
   end
 
   # ── 4: rung 3 must CATCH a page verse refuses ────────────────────────────
   defp broken_is_caught do
-    path = Path.join(@out, "broken.st")
+    path = Path.join(@out, "broken.edn")
 
     File.write!(path, """
-    /* Deliberately invalid: a template reference nothing declares (E0916). */
-    @import "stdlib/macros/data-kind"
-    @import "stdlib/macros/each"
-
-    @data inline $items : [];
-
-    .list {
-      @each($items, as: $i, template: &no-such-template)
-    }
+    {:st/imports ["stdlib/macros/data-kind" "stdlib/macros/each"]
+     :st/forms [(data-inline :name $items :value [:st/expr "[]"])
+                (sel ".list" (each :source $items :key [:st/expr "null"] :item $i :invocations [:st/array [:st/named {"name" "no-such-template" "args" [:st/array "$i"]}]]))]}
     """)
 
     case Spell.Verse.check(path) do
@@ -144,26 +133,13 @@ defmodule DefineCheck do
   # warning (an unused `$draft`) and a real error. The rung must still refuse
   # it, and the refusal must not mention the exempt warning.
   defp real_error_still_refused do
-    path = Path.join(@out, "warn_and_error.st")
+    path = Path.join(@out, "warn_and_error.edn")
 
     File.write!(path, """
-    /* An unused $draft (W0201, exempt) AND a malformed directive (E0946, a real
-       error).
-
-       The malformed `@each` is deliberate: a reference to an UNDECLARED
-       template (`&no-such-template`) turned out not to be an error here at all
-       — verse accepted it with only the W0201 — so using it would have made
-       this case pass while proving nothing about the exemption. Checked before
-       relying on it. */
-    @import "stdlib/macros/data-kind"
-    @import "stdlib/macros/each"
-
-    @data inline $draft : "";
-    @data inline $items : [];
-
-    .list {
-      @each($items, as: $i, template: &row)
-    }
+    {:st/imports ["stdlib/macros/data-kind" "stdlib/macros/each"]
+     :st/forms [(data-inline :name $draft :value [:st/expr "\"\""])
+                (data-inline :name $items :value [:st/expr "[]"])
+                (sel ".list" (each :source $items :key [:st/expr "null"] :item $i :invocations [:st/array [:st/named {"name" "row" "args" [:st/array "$i"]}]]))]}  
     """)
 
     case Spell.Verse.check(path) do
@@ -196,7 +172,7 @@ defmodule DefineCheck do
 
     result =
       with_env("VERSE_BIN", fake, fn ->
-        Spell.Verse.check(Path.join(@out, "seed.st"))
+        Spell.Verse.check(Path.join(@out, "seed.edn"))
       end)
 
     case result do
@@ -244,11 +220,11 @@ defmodule DefineCheck do
                          spell.seed/view-term)
       """)
 
-    Spell.Page.emit(machine, Path.join(@out, "seed.st"))
+    Spell.Page.emit(machine, Path.join(@out, "seed.edn"))
   end
 
   defp emit_machine(setup_src, label) do
-    Spell.Page.emit(bl(setup_src), Path.join(@out, "#{label}.st"))
+    Spell.Page.emit(bl(setup_src), Path.join(@out, "#{label}.edn"))
   end
 
   # A machine built THROUGH the define tool, not by hand: the ghost page must be
@@ -270,6 +246,8 @@ defmodule DefineCheck do
   end
 
   # ── plumbing ─────────────────────────────────────────────────────────────
+
+
   defp bl(src), do: BeamLisp.Compiler.eval_string(src)
   defp pass(what), do: {:pass, what}
   defp fail(what, why), do: {:fail, what, why}

@@ -49,8 +49,13 @@ config :beam_lisp, SpellWeb.Endpoint,
   pubsub_server: SpellWeb.PubSub,
   live_view: [signing_salt: "O+w+LiUZ8h0="]
 
-# Where the compiled bundle lives. The live driver writes `page.st`,
-# `spacetime.js`, `spacetime.css` and `report.json` here, and the endpoint
-# serves that directory at `/spacetime` — the prefix the contract's
-# `:bundle` option names.
-config :beam_lisp, :spell_static_dir, "/tmp/chat-serve"
+# The served site: the page (`index.edn`) the loop publishes and verse's
+# `build-status.json` verdicts land here. PROJECT-LOCAL — the machine's
+# growth is part of the project, not /tmp. `spacetime serve` watches this
+# directory; the Phoenix endpoint serves only the shell and the channel.
+config :beam_lisp, :spell_site_dir, "spell/ui"
+
+# The verse dev server's loopback port. The browser loads the compiled bundle
+# and stylesheet from this origin; the shell's reload script connects to its
+# websocket. Both are plain loopback HTTP, no proxy.
+config :beam_lisp, :spell_verse_port, 4444

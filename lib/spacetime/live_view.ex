@@ -140,10 +140,26 @@ defmodule Spacetime.LiveView do
         {Phoenix.HTML.raw(@__shell__)}
       </div>
     </div>
-    <link rel="stylesheet" href={String.replace(@__bundle__, ".js", ".css")} />
+    <link rel="stylesheet" href={Spacetime.LiveView.stylesheet_url(@__bundle__)} />
     <script type="module" src={@__bundle__}>
     </script>
     """
+  end
+
+  # The stylesheet sits next to the bundle, but its NAME is not always the
+  # bundle's with a different extension: a `spacetime serve` origin answers
+  # `runtime.js?entry=…` and `styles.css?entry=…`, and a naive `.js`→`.css`
+  # replace produces `runtime.css` — a 404 that fails silently (the page
+  # renders unstyled, with no console error worth the name). Two rules.
+  @doc false
+  def stylesheet_url(bundle) do
+    cond do
+      String.contains?(bundle, "runtime.js") ->
+        String.replace(bundle, "runtime.js", "styles.css")
+
+      true ->
+        String.replace(bundle, ~r/\.js(\?.*)?$/, ".css\\1")
+    end
   end
 
   @reconciler_private_key :spacetime_live_view_assigns

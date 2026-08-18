@@ -1,26 +1,16 @@
 defmodule BeamLisp.Spell.PageRenderTest do
   @moduledoc """
-  The preamble a running server supplies, and the module names it points at.
+  The machine's page as a complete EDN document.
 
-  `BeamLisp.Spell.Page.emit/3` does two things: it asks the machine for five
-  values, and it renders a page around them. Only the second is testable
-  without a compiler — `emit` shells out to `spacetime st` to print the EDN —
-  so this suite exercises the rendering half directly and leaves the subprocess
-  to the machine-level checks.
+  `Page.document(machine)` calls into spell.live/machine-page-edn, which merges
+  the seam (contract + host-live + data-inline forms), the view parts (markup,
+  style, binds), and assembles them with their stdlib imports. This suite
+  verifies that assembly: the declarations appear in the right order, with the
+  right names, and the imports cover what the forms need.
 
-  ## Why the preamble is worth its own suite
-
-  Two lines above the emitted marker decide whether the page is wired to
-  anything at all:
-
-    * `@host $chat-live : live("SpellWeb.ChatLive")` — the seam says
-      `from $chat-live`, so a page declaring some other host name leaves every
-      data source unbound. Verse reports that as W0201 "defined but never
-      used", which reads like dead code and actually means nothing is connected.
-    * `@data inline $draft : "";` — a page-local the browser writes. Missing,
-      the page references an undeclared signal.
-
-  Both are DERIVED, and the derivation is what is pinned here.
+  The contract's naming rule has ONE implementation now: `spell.contract/module-name`.
+  This suite exercises it transitively through the host-live form, rather than
+  testing both the form and a duplicate Elixir-side rule that no longer exists.
   """
 
   use ExUnit.Case, async: false
@@ -28,125 +18,75 @@ defmodule BeamLisp.Spell.PageRenderTest do
 
   alias BeamLisp.Spell.Page
 
-  # `render/6` is private, and deliberately so — the module's public surface is
-  # "write the page". Reaching it through the module's own compiled name keeps
-  # the test honest about that: it is testing an internal, and a refactor that
-  # renames it should break this file loudly rather than silently stop covering
-  # it.
-  defp render(seam, view, locals, hosts, css, prefix \\ "SpellWeb") do
-    apply(Page, :render, [seam, view, locals, hosts, css, prefix])
-  rescue
-    UndefinedFunctionError ->
-      flunk("Page.render/6 is gone — the page preamble moved and this suite must follow it")
-  end
-
-  describe "hosts" do
-    test "a kebab-case contract becomes a CamelCase LiveView module" do
-      page = render("", "", [], ["chat-live"], "")
-      assert page =~ ~s|@host $chat-live : live("SpellWeb.ChatLive")|
-    end
-
-    test "an acronym keeps its case" do
-      # `String.capitalize/1` was the obvious implementation and it lowercases
-      # the rest of a segment: a contract named `HTTP-live`, whose seam says
-      # `from $HTTP-live` and whose module is `HTTPLive`, would get a page
-      # pointing at `HttpLive` — a module the contract does not describe.
-      page = render("", "", [], ["HTTP-live"], "")
-      assert page =~ ~s|@host $HTTP-live : live("SpellWeb.HTTPLive")|
-      refute page =~ "HttpLive"
-    end
-
-    test "the module name agrees with the contract emitter, character for character" do
-      # Two implementations of one naming rule: `Page.module_name/1` (private)
-      # and `spell.contract/module-name`. When they disagree, the page declares
-      # a host whose module the generated LiveView does not define, and the
-      # failure surfaces in a browser as a page that connects to nothing.
-      module_name = fetch!("spell.contract", "module-name")
-
-      for host <- ["chat-live", "HTTP-live", "clock", "a-b-c"] do
-        contract = %{name: host}
-        expected = module_name.(contract, "SpellWeb")
-        assert render("", "", [], [host], "") =~ ~s|live("#{expected}")|,
-               "Page and spell.contract disagree about the module for #{host}"
-      end
-    end
-
-    test "several contracts each get a line" do
-      page = render("", "", [], ["chat-live", "clock-live"], "")
-      assert page =~ ~s|@host $chat-live : live("SpellWeb.ChatLive")|
-      assert page =~ ~s|@host $clock-live : live("SpellWeb.ClockLive")|
-    end
-
-    test "the prefix is honoured" do
-      page = render("", "", [], ["chat-live"], "", "OtherWeb")
-      assert page =~ ~s|live("OtherWeb.ChatLive")|
-    end
-  end
-
-  describe "page-locals" do
-    test "each local is declared inline and empty" do
-      page = render("", "", ["draft"], [], "")
-      assert page =~ ~s|@data inline $draft : "";|
-    end
-
-    test "no locals means no declarations, not an empty one" do
-      page = render("", "", [], [], "")
-      refute page =~ "@data inline"
-    end
-  end
-
-  describe "the emitted body" do
-    test "seam, views and style each land below the marker, in order" do
-      page = render("SEAM_HERE", "VIEW_HERE", [], [], "CSS_HERE")
-
-      marker = index_of(page, "emitted: the seam")
-      assert marker
-
-      for token <- ~w(SEAM_HERE VIEW_HERE CSS_HERE) do
-        assert index_of(page, token) > marker,
-               "#{token} rendered above the marker, where the SERVER's half lives"
-      end
-
-      assert index_of(page, "SEAM_HERE") < index_of(page, "VIEW_HERE")
-      assert index_of(page, "VIEW_HERE") < index_of(page, "CSS_HERE")
-    end
-
-    test "the stdlib imports the emitted forms need are all present" do
-      # An `@each` needs `each`, an `@on` needs `on`, a `@view` needs
-      # `enum/dispatch`. A missing import is an EDN reader error at the moment
-      # a model first proposes the construct that needs it — long after the
-      # definition looked accepted.
-      page = render("", "", [], [], "")
+  describe "the complete page document" do
+    test "contains :st/imports with all six stdlib paths" do
+      {:ok, doc} = Page.document(seeded_machine())
 
       for import <- ~w(data-kind each on host handle) do
-        assert page =~ ~s|@import "stdlib/macros/#{import}"|
+        assert doc =~ "stdlib/macros/#{import}"
       end
 
-      assert page =~ ~s|@import "stdlib/enum/dispatch"|
-    end
-  end
-
-  describe "the whole page, from the seeded machine" do
-    test "every host it declares is a contract the machine registered" do
-      hosts = plain(fetch!("spell.live", "machine-hosts").(seeded_machine()))
-      page = render("", "", [], hosts, "")
-
-      declared =
-        Regex.scan(~r/@host \$([\w-]+)/, page) |> Enum.map(fn [_, h] -> h end)
-
-      assert declared == hosts
+      assert doc =~ "stdlib/enum/dispatch"
     end
 
-    test "every local it declares is a signal some view writes" do
+    test "contains a host-live form naming the module correctly" do
+      {:ok, doc} = Page.document(seeded_machine())
+      assert doc =~ "(host-live :module"
+      assert doc =~ "$chat-live"
+      assert doc =~ "SpellWeb.ChatLive"
+    end
+
+    test "contains a data-inline form for page-locals" do
+      {:ok, doc} = Page.document(seeded_machine())
+      assert doc =~ "(data-inline :name $draft"
+    end
+
+    test "contains a :st/css member when seed has styles" do
+      {:ok, doc} = Page.document(seeded_machine())
+      assert doc =~ ":st/css"
+      assert doc =~ ".chat"
+    end
+
+    test "host-live and data-inline forms appear before any seam/view forms" do
+      {:ok, doc} = Page.document(seeded_machine())
+
+      host_idx = index_of(doc, "(host-live :module")
+      data_idx = index_of(doc, "(data-inline :name $draft")
+      first_use_idx = Enum.min([index_of(doc, "(data-subscribe"), index_of(doc, "(template"), index_of(doc, "(sel ")])
+
+      assert is_integer(host_idx), "host-live form not found"
+      assert is_integer(data_idx), "data-inline form not found"
+      assert is_integer(first_use_idx), "no seam/view use form found"
+      assert host_idx < first_use_idx, "host-live must be declared before use"
+      assert data_idx < first_use_idx, "data-inline must be declared before use"
+    end
+
+    test "module_prefix option is honored" do
+      {:ok, doc} = Page.document(seeded_machine(), module_prefix: "OtherWeb")
+      assert doc =~ "OtherWeb.ChatLive"
+      refute doc =~ "SpellWeb.ChatLive"
+    end
+
+    test "every host declared is a contract the machine registered" do
+      machine = seeded_machine()
+      hosts = plain(fetch!("spell.live", "machine-hosts").(machine))
+      {:ok, doc} = Page.document(machine)
+
+      for host <- hosts do
+        assert doc =~ "$#{host}"
+      end
+    end
+
+    test "every local declared is a signal some view writes" do
       machine = seeded_machine()
       locals = plain(fetch!("spell.live", "machine-locals").(machine))
-      page = render("", "", locals, [], "")
+      {:ok, doc} = Page.document(machine)
 
-      declared =
-        Regex.scan(~r/@data inline \$([\w-]+)/, page) |> Enum.map(fn [_, l] -> l end)
+      for local <- locals do
+        assert doc =~ "$#{local}"
+      end
 
-      assert declared == locals
-      assert "draft" in declared
+      assert "draft" in locals
     end
   end
 

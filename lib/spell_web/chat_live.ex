@@ -18,7 +18,7 @@ defmodule SpellWeb.ChatLive do
   """
 
   use Spacetime.LiveView,
-    bundle: "/spacetime/spacetime.js",
+    bundle: BeamLisp.Spell.Build.bundle_url(),
     root: ".chat",
     shell: "<main class='chat'><div class='log' data-log></div></main>"
 

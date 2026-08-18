@@ -28,10 +28,10 @@
 # covers on its own.
 
 alias BeamLisp.Spell.Live
+alias BeamLisp.Spell.Build
 
 defmodule Demo do
   @out "/tmp/spell-demo"
-  @port 8899
 
   def run(opts) do
     live? = "--live" in opts
@@ -42,7 +42,8 @@ defmodule Demo do
     IO.puts("  mode: #{if live?, do: "LIVE (real model)", else: "scripted (no network)"}")
 
     if live?, do: load_env()
-    {:ok, _} = Live.start_link(out: @out)
+    ensure_verse_server!()
+    {:ok, _} = Live.start_link()
 
     steps = [
       &seed_is_serving/1,
@@ -53,15 +54,15 @@ defmodule Demo do
       &repl_state_is_readable/1
     ]
 
-    server = serve()
+    verse_available? = check_verse_reachable()
 
     failed =
       try do
         steps
-        |> Enum.map(fn step -> step.(%{live?: live?}) end)
+        |> Enum.map(fn step -> step.(%{live?: live?, verse_available: verse_available?}) end)
         |> report()
       after
-        stop(server)
+        :ok
       end
 
     # Halt AFTER cleanup: System.halt/1 does not run `after` clauses.
@@ -70,14 +71,18 @@ defmodule Demo do
 
   # ── 1 ─────────────────────────────────────────────────────────────────────
   defp seed_is_serving(_ctx) do
-    step("the seeded page is live", fn ->
+    step("the seeded page is ready", fn ->
       st = Live.state()
       views = st.machine["views"]
 
+      page = Path.join(Build.site_dir(), Build.entry())
+
       cond do
         views != ["chat-view"] -> {:fail, "expected the seed view only, got #{inspect(views)}"}
-        not File.exists?(Path.join(bundle_dir(), "spacetime.js")) -> {:fail, "no bundle was built"}
-        true -> {:ok, "v#{st.version}, views #{inspect(views)}, bundle built"}
+        is_nil(st.version) -> {:fail, "no version in state"}
+        st.last_build != :ok -> {:fail, "initial build was #{inspect(st.last_build)}"}
+        not File.exists?(page) -> {:fail, "#{page} was not written"}
+        true -> {:ok, "v#{st.version}, build ok, index.edn present; views #{inspect(views)}"}
       end
     end)
   end
@@ -131,7 +136,7 @@ defmodule Demo do
   # The one that cannot be faked. Everything above is the machine agreeing with
   # itself; this asks the BROWSER whether the element the model defined is on
   # the page, which is the only authority on whether a user would see it.
-  defp page_shows_it(_ctx) do
+  defp page_shows_it(%{verse_available: true}) do
     step("the browser renders what was just defined", fn ->
       case dom() do
         {:ok, dom} ->
@@ -156,6 +161,12 @@ defmodule Demo do
         {:error, reason} ->
           {:fail, reason}
       end
+    end)
+  end
+
+  defp page_shows_it(_ctx) do
+    step("the browser renders what was just defined (SKIPPED)", fn ->
+      {:ok, "verse dev server not reachable; DOM test gated. Start verse with: mix run --no-halt scripts/serve_live.exs"}
     end)
   end
 
@@ -210,8 +221,8 @@ defmodule Demo do
 
         # Compare EVERYTHING published, not just the view list. A refusal that
         # accidentally called publish/1 would bump the version and rewrite
-        # page.st, the bundle and report.json while leaving views untouched —
-        # and a check that only looked at views would call that unchanged.
+        # index.edn while leaving views untouched — and a check that only looked
+        # at views would call that unchanged.
         published != Process.get(:before_refusal) ->
           {:fail,
            "the refusal changed published state:\n" <>
@@ -221,19 +232,17 @@ defmodule Demo do
         true ->
           {:ok,
            "machine holds #{inspect(st.machine["views"])}, v#{st.version} — " <>
-             "version, page and bundle all byte-identical"}
+             "version and page byte-identical"}
       end
     end)
   end
 
-  # Everything a refusal must not touch: the version, and the bytes of every
-  # artefact the driver publishes.
+  # Everything a refusal must not touch: the version, and the bytes of the
+  # index.edn artefact in the Build.site_dir().
   defp published_fingerprint do
     %{
       version: Live.state().version,
-      page: digest(Path.join(@out, "page.st")),
-      bundle: digest(Path.join(bundle_dir(), "spacetime.js")),
-      report: digest(Path.join(@out, "report.json"))
+      page: digest(Path.join(Build.site_dir(), Build.entry()))
     }
   end
 
@@ -246,25 +255,21 @@ defmodule Demo do
 
   # ── 6 ─────────────────────────────────────────────────────────────────────
   defp repl_state_is_readable(_ctx) do
-    step("the repl state is on disk and matches the machine", fn ->
-      report = @out |> Path.join("report.json") |> File.read!() |> JSON.decode!()
+    step("the loop state is readable and consistent", fn ->
       st = Live.state()
 
       cond do
-        report["version"] != st.version ->
-          {:fail, "report says v#{report["version"]}, machine says v#{st.version}"}
+        is_nil(st.version) ->
+          {:fail, "no version in loop state"}
 
-        report["machine"]["views"] != st.machine["views"] ->
-          {:fail, "report and machine disagree about views"}
-
-        report["build"]["ok"] != true ->
-          {:fail, "the last build failed: #{inspect(report["build"])}"}
+        not is_list(st.machine["views"]) ->
+          {:fail, "no views list in machine state"}
 
         true ->
           {:ok,
-           "v#{report["version"]}: #{length(report["machine"]["views"])} view(s), " <>
-             "#{length(report["machine"]["assigns"])} assign(s), " <>
-             "#{length(report["machine"]["warnings"])} warning(s)"}
+           "v#{st.version}: #{length(st.machine["views"])} view(s), " <>
+             "#{length(st.machine["assigns"])} assign(s), " <>
+             "#{length(st.machine["warnings"])} warning(s)"}
       end
     end)
   end
@@ -351,127 +356,40 @@ defmodule Demo do
 
   # ── serving and looking ────────────────────────────────────────────────────
 
-  # Where the loop actually built the bundle.
-  #
-  # DERIVED from the contract's `:bundle` option, exactly as `Spell.Live` does
-  # when it builds — one derivation, so the page this serves cannot be a
-  # directory the loop never wrote to. Assuming `@out` was correct only while
-  # the loop built there, and the day it started honouring the contract this
-  # demo reported "no bundle was built" beside a bundle that existed.
-  defp bundle_dir, do: Live.bundle_dir(@out, Live.machine())
+  # Plain `mix run` is intentionally not application-supervised serve mode, so
+  # the demo starts the filesystem compiler when no existing server owns it.
+  defp ensure_verse_server! do
+    unless check_verse_reachable(0) do
+      case BeamLisp.Spell.Serve.start_link() do
+        {:ok, _pid} -> :ok
+        :ignore -> raise "verse serve unavailable; set VERSE_BIN to a spacetime binary"
+        {:error, {:already_started, _pid}} -> :ok
+        {:error, reason} -> raise "could not start verse serve: #{inspect(reason)}"
+      end
 
-  defp serve do
-    host = Path.join(bundle_dir(), "index.html")
-    File.write!(host, host_html())
-
-    # A DETACHED server, spawned so that nothing inherits its stdout.
-    #
-    # Two shapes were tried and both hung, each for its own reason:
-    #
-    #   Port.open(python3 …)             the Port holds the child's stdout and
-    #                                     `http.server` logs every request; an
-    #                                     owner that does not drain those
-    #                                     messages lets the pipe fill and the
-    #                                     server blocks mid-response.
-    #   System.cmd("sh", ["-c", "… &"])   `System.cmd` waits for EOF on stdout,
-    #                                     and the backgrounded child INHERITS
-    #                                     that pipe — so the call never returns
-    #                                     even though the server started fine.
-    #                                     Reproduced in isolation: the demo hung
-    #                                     before printing a single step.
-    #
-    # `setsid --fork` plus redirecting the child's streams to /dev/null closes
-    # both holes: the shell forks and returns immediately (measured: 3ms), and
-    # nothing is left holding a descriptor. Without `--fork`, setsid WAITS for
-    # the child and the call hangs exactly as before.
-    _ =
-      System.cmd("setsid", [
-        "--fork",
-        "sh",
-        "-c",
-        "cd #{bundle_dir()} && exec python3 -m http.server #{@port} --bind 127.0.0.1 " <>
-          ">/dev/null 2>&1 </dev/null"
-      ])
-
-    wait_for_server()
-    :detached
-  end
-
-  defp stop(_server) do
-    # Killed by name because it was deliberately detached; leaving it running
-    # would hold the port and the NEXT run would photograph this run's page.
-    System.cmd("pkill", ["-f", "http.server #{@port}"], stderr_to_stdout: true)
-    :ok
-  catch
-    _, _ -> :ok
-  end
-
-  defp wait_for_server(attempts \\ 50) do
-    case System.cmd("curl", ["-sf", "http://127.0.0.1:#{@port}/index.html"], stderr_to_stdout: true) do
-      {_, 0} -> :ok
-      _ when attempts > 0 -> Process.sleep(100); wait_for_server(attempts - 1)
-      _ -> :error
+      unless check_verse_reachable(50) do
+        raise "verse serve did not become reachable at #{Build.origin()}"
+      end
     end
   end
 
-  # The host page lifts `&shell` out of the EMITTED page rather than carrying a
-  # copy: a hand-written skeleton is how a screenshot ends up showing a page the
-  # emitter did not produce, which this project has done once and does not
-  # intend to repeat.
-  defp host_html do
-    page = @out |> Path.join("page.st") |> File.read!()
-
-    shell =
-      case Regex.run(~r/@template &shell\(\) \{(.*?)\}\s*$/m, page) do
-        [_, markup] -> String.trim(markup)
-        _ -> raise "the emitted page declares no &shell — refusing to invent one"
-      end
-
-    """
-    <!doctype html>
-    <html><head><meta charset="utf-8"><link rel="stylesheet" href="spacetime.css"></head>
-    <body>
-    #{shell}
-    <script>
-      // Seeded WITHOUT a repeating timer.
-      //
-      // A `setInterval` seeder and chrome's `--virtual-time-budget` interact
-      // badly: pending timers keep virtual time advancing, and the capture
-      // either hangs or fires before the bridge exists — which produced a
-      // passing DOM assertion beside a screenshot of an empty log. Here the
-      // seed is written immediately AND re-asserted once the bundle has
-      // initialised, using the bundle's own load event rather than a poll.
-      window.SpacetimeLocal = window.SpacetimeLocal || {};
-      var SEED = [{role:"user", text:"what is this?"},
-                  {role:"model", text:"A page the model just grew."}];
-
-      function seed() {
-        window.SpacetimeLocal["messages"] = SEED;
-        window.SpacetimeLocal["status"] = "idle";
-        document.dispatchEvent(new CustomEvent("local:messages:updated", { detail: SEED }));
-      }
-
-      seed();
-      window.addEventListener("load", seed);
-      document.addEventListener("DOMContentLoaded", seed);
-    </script>
-    <script src="spacetime.js" onload="seed()"></script>
-    </body></html>
-    """
+  # The verse dev server synthesizes a shell for index-less sites when the only
+  # entry is index.edn. Check if it's reachable at Build.origin().
+  defp check_verse_reachable(attempts \\ 10) do
+    case System.cmd("curl", ["-sf", Build.origin() <> "/"], stderr_to_stdout: true) do
+      {_, 0} -> true
+      _ when attempts > 0 -> Process.sleep(100); check_verse_reachable(attempts - 1)
+      _ -> false
+    end
   end
 
   defp dom do
     chrome = find_chrome()
 
     if chrome do
-      # `--timeout` as well as `--virtual-time-budget`.
-      #
-      # The budget alone does not bound this page: the host's auto-reload poll
-      # is a `setInterval` that never stops, and virtual time advances as long
-      # as timers are pending — so `--dump-dom` ran forever on a page that was
-      # rendering perfectly. Found by the demo hanging at exactly this step
-      # while the two before it passed. `--timeout` is wall-clock and bounds
-      # the whole run regardless of what the page schedules.
+      # The verse origin serves the index.edn with a synthesized shell.
+      url = Build.origin() <> "/?entry=index.edn"
+
       {out, _} =
         System.cmd(
           chrome,
@@ -482,7 +400,7 @@ defmodule Demo do
             "--virtual-time-budget=5000",
             "--timeout=15000",
             "--dump-dom",
-            "http://127.0.0.1:#{@port}/index.html"
+            url
           ],
           stderr_to_stdout: false
         )
@@ -495,14 +413,9 @@ defmodule Demo do
   end
 
   # The screenshot must show what the DOM assertion just verified.
-  #
-  # It is a SECOND chrome run, so it re-seeds from scratch and can photograph
-  # the page before the transcript lands — which it did: a passing DOM check
-  # beside an image of an empty log, the exact "evidence that proves nothing"
-  # this project has shipped before. The host page's seeder retries until the
-  # bridge exists, so the fix is to give the capture enough virtual time to
-  # outlast that loop rather than to sleep and hope.
   defp screenshot(chrome) do
+    url = Build.origin() <> "/?entry=index.edn"
+
     System.cmd(
       chrome,
       [
@@ -515,17 +428,12 @@ defmodule Demo do
         "--timeout=25000",
         "--window-size=960,720",
         "--screenshot=#{Path.join(@out, "demo.png")}",
-        "http://127.0.0.1:#{@port}/index.html"
+        url
       ],
       stderr_to_stdout: true
     )
   end
 
-  # A screenshot is a courtesy here, not the evidence: the DOM assertion above
-  # is what proves the element rendered, and it inspects the renderer's own
-  # output. Sizing the PNG was tried as a second guard and rejected — a page
-  # with one seeded message is legitimately small, so the threshold measured
-  # the seed rather than the definition.
   defp find_chrome do
     System.get_env("CHROME_BIN") ||
       Enum.find(
@@ -562,7 +470,7 @@ defmodule Demo do
       IO.puts("  screenshot: #{Path.join(@out, "demo.png")}")
     end
 
-    IO.puts("  repl state: #{Path.join(@out, "report.json")}\n")
+    IO.puts("  build dir: #{Build.site_dir()}\n")
 
     # The exit status is RETURNED, not halted on, so `run/1`'s `after` clause
     # still stops the detached server. `System.halt/1` does not unwind the

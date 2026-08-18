@@ -34,13 +34,15 @@ defmodule BeamLisp.Spell.Live do
   Anything that needs the current machine ASKS this process for it, so there is
   exactly one owner and the question "which machine?" has one answer.
 
-  ## What is published, and why a file
+  ## What is published, and how the browser learns of it
 
-  Every accepted definition writes `report.json` next to the bundle: the
-  machine's contracts, views, assigns, events, warnings, plus the transcript
-  and a version counter. That file IS the repl state — `scripts/peek.sh` reads
-  it, the browser polls it, and a human can `cat` it. One artefact, three
-  consumers, no protocol.
+  An accepted definition writes the whole machine's page as ONE EDN document
+  to the served site dir (`Spell.Build.site_dir/0`). A running `spacetime
+  serve` watches that dir, compiles the document, records its verdict in
+  `build-status.json` (which this process awaits), and announces Reload on
+  its own dev websocket — the browser's shell listens for exactly that. No
+  bundle is built or served by this app; there is no report.json and no
+  polling.
 
   ## Retry policy
 
@@ -105,13 +107,9 @@ defmodule BeamLisp.Spell.Live do
 
   @impl true
   def init(opts) do
-    out = Keyword.get(opts, :out, "/tmp/chat-serve")
-    File.mkdir_p!(out)
-
     Spell.init!(["spell.app", "spell.define", "spell.live"])
 
     state = %{
-      out: out,
       machine: seeded_machine(),
       version: 0,
       transcript: [],
@@ -728,7 +726,11 @@ defmodule BeamLisp.Spell.Live do
 
       # Rungs 3–4 run against the page the CANDIDATE would produce, never the
       # committed one: checking the current page would pass every proposal.
-      page = Path.join(System.tmp_dir!(), "spell_candidate_#{System.unique_integer([:positive])}.st")
+      # The candidate is an `.edn` file in /tmp — NOT the served site dir:
+      # writing it there would make serve compile AND RELOAD browsers onto an
+      # unverified page. The filesystem is the publish channel; candidates
+      # stay off it, checked by the CLI.
+      page = Path.join(System.tmp_dir!(), "spell_candidate_#{System.unique_integer([:positive])}.edn")
 
       try do
         # The bind selectors are handed to rung 4 so it judges OUR page rather
@@ -755,18 +757,20 @@ defmodule BeamLisp.Spell.Live do
 
   defp publish(%{publish: false} = state), do: %{state | last_build: :ok}
 
+  # Publishing is ONE write plus the verse serve verdict on it. The compile
+  # happens inside the long-running serve process (warm registry, no binary
+  # spawn); the reload that follows is verse's own websocket, so this function
+  # has no reload machinery at all.
   defp publish(state) do
     state = %{state | version: state.version + 1}
-    page = Path.join(state.out, "page.st")
 
     build =
-      with {:ok, _} <- Spell.Page.emit(state.machine, page),
-           :ok <- build_bundle(page, state.out, state.machine),
+      with {:ok, doc} <- Spell.Page.document(state.machine),
+           {:ok, _status} <- Spell.Build.write_and_await(Spell.Build.entry(), doc),
            :ok <- regenerate_host(state.machine) do
         :ok
       end
 
-    write_report(state, build)
     %{state | last_build: build}
   end
 
@@ -783,12 +787,10 @@ defmodule BeamLisp.Spell.Live do
   # because the stale markup was being rendered server-side by a module nobody
   # had regenerated. Machine grew; page could not.
   #
-  # That is the SAME defect `bundle_dir/2` below documents ("a machine that
-  # grows and a page that never changes, with no error anywhere") — it was
-  # fixed for the bundle and missed for the host, because the two halves of
-  # publishing lived in two files. Both now live here: whatever an accepted
-  # definition changes, the loop rebuilds all of it, and the boot script asks
-  # the loop rather than doing half the job itself.
+  # That defect — a machine that grows while the browser keeps a stale
+  # artifact — was first fixed for the bundle and missed for the host, because
+  # the two halves of publishing lived in two files. Both now live here:
+  # whatever an accepted definition changes, the loop rebuilds all of it.
   #
   # Failure is returned, never raised: a machine whose views declare no shell
   # is a refusable state, and `last_build` is where refusals are already
@@ -864,80 +866,6 @@ defmodule BeamLisp.Spell.Live do
   @doc "Where the generated server half is written."
   def gen_dir, do: Application.get_env(:beam_lisp, :spell_gen_dir, "spell/gen")
 
-  defp build_bundle(page, out, machine) do
-    target = bundle_dir(out, machine)
-    File.mkdir_p!(target)
-
-    with {:ok, bin} <- Spell.Verse.binary() do
-      case System.cmd(bin, ["build", Path.expand(page), "-o", Path.expand(target)],
-             cd: Spell.Verse.verse_root(),
-             stderr_to_stdout: true
-           ) do
-        {_out, 0} -> :ok
-        {out, code} -> {:error, "spacetime build exited #{code}: #{String.trim(out)}"}
-      end
-    end
-  end
-
-  @doc """
-  Where the bundle for `machine` belongs under `out`.
-
-  DERIVED from the contract's own `:bundle` option, never agreed by convention.
-  The contract says `"/spacetime/chat/spacetime.js"` and the endpoint serves
-  `out` at `/spacetime`, so the build target is `<out>/chat`.
-
-  This existed only in `scripts/serve_live.exs` while the loop built into `out`
-  itself — so an accepted definition rebuilt into a directory the page never
-  loads. The browser would keep serving the old bundle while `report.json`
-  announced a new version, and the page would reload onto exactly what it was
-  already showing: a machine that grows and a page that never changes, with no
-  error anywhere. One derivation, so the two cannot disagree.
-
-  Falls back to `out` when no contract declares a bundle — a machine with no
-  contracts has no page to place, and guessing a subdirectory would be worse
-  than putting it where the caller asked.
-  """
-  def bundle_dir(out, machine) do
-    case bundle_url(machine) do
-      nil ->
-        out
-
-      url ->
-        sub =
-          url
-          |> to_string()
-          |> String.replace_prefix("/spacetime", "")
-          |> Path.dirname()
-          |> String.trim_leading("/")
-
-        Path.join([out | String.split(sub, "/", trim: true)])
-    end
-  end
-
-  defp bundle_url(machine) do
-    bl("spell.machine", "contracts", [machine])
-    |> BeamLisp.Vector.to_list()
-    |> Enum.find_value(fn contract ->
-      contract |> Map.get(:opts, %{}) |> Map.get(:bundle)
-    end)
-  end
-
-  # report.json is the repl state, on disk. Written on every publish INCLUDING
-  # a failed build, with the failure in it: a stale report next to a broken
-  # bundle would tell the reader the machine is fine while the page they are
-  # looking at is not.
-  defp write_report(state, build) do
-    payload =
-      snapshot(state)
-      |> Map.put(:build, build_status(build))
-      |> Map.put(:at, DateTime.utc_now() |> DateTime.to_iso8601())
-
-    File.write!(Path.join(state.out, "report.json"), JSON.encode!(payload))
-  end
-
-  defp build_status(:ok), do: %{ok: true}
-  defp build_status({:error, reason}), do: %{ok: false, reason: to_string(reason)}
-
   defp snapshot(state) do
     %{
       version: state.version,
@@ -965,12 +893,12 @@ defmodule BeamLisp.Spell.Live do
   ## Why this exists
 
   The page reloads itself when the machine grows: that is the whole point, and
-  it is triggered by the version in `report.json` moving. But a reload remounts
-  the LiveView, and `mount` seeds from the contract's DECLARED INITIALS — an
-  empty transcript. So asking for a clock worked, the page rebuilt, and the
-  conversation that asked for it disappeared. Observed in a browser: the user
-  sees their message vanish at the exact moment the thing they asked for
-  arrives, which reads as the send having failed.
+  it is verse's dev websocket announcing Reload after the recompile. But a
+  reload remounts the LiveView, and `mount` seeds from the contract's DECLARED
+  INITIALS — an empty transcript. So asking for a clock worked, the page
+  rebuilt, and the conversation that asked for it disappeared. Observed in a
+  browser: the user sees their message vanish at the exact moment the thing
+  they asked for arrives, which reads as the send having failed.
 
   The loop already holds the transcript, because it is the thing that survives
   a page. Seeding from it is what makes the reload invisible.
