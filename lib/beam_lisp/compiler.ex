@@ -2198,6 +2198,16 @@ defmodule BeamLisp.Compiler do
     source |> BeamLisp.Reader.read_one() |> datum()
   end
 
+  @doc """
+  Read EVERY top-level form of a source file as runtime data — the plural of
+  `read_data/1`, for files we ourselves wrote (the persist journal). Same
+  rule: never evaluated, atom-guarded.
+  """
+  def read_all_data(source) when is_binary(source) do
+    BeamLisp.AtomGuard.check!(source)
+    source |> BeamLisp.Reader.read_all() |> Enum.map(&datum/1)
+  end
+
   # One protocol method implementation: `(m [args] body…)` compiles to
   # a method-name => fn-value map entry. The method form may carry a
   # reader position (it is a list); unwrap it so the shape matches.

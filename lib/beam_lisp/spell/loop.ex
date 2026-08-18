@@ -103,10 +103,72 @@ defmodule BeamLisp.Spell.Loop do
       transcript: [],
       attempts: [],
       last_build: :ok,
-      publish: Keyword.get(opts, :publish, true)
+      publish: Keyword.get(opts, :publish, true),
+      persist: Keyword.get(opts, :persist, persist_default?())
     }
 
+    state = replay_journal(state)
+
     {:ok, publish(state)}
+  end
+
+  # Persistence defaults ON outside test (the repl must remember; that is its
+  # point) and OFF in test, where every loop gets a fresh machine and writing
+  # spell/state/ would make suites order-dependent. Tests that exercise
+  # persistence pass `persist: true` with a tmp `:spell_state_dir`.
+  defp persist_default? do
+    # ON in releases too: a release has no Mix, and a repl that forgets is
+    # the exact thing persistence exists to prevent. Only test turns it off.
+    if Code.ensure_loaded?(Mix), do: Mix.env() != :test, else: true
+  end
+
+  # Grow the seed machine by the journal: every accepted definition, in
+  # acceptance order, through the SAME ladder a live `run` walks — a journal
+  # entry that no longer validates (hand-edited, or the ladder got stricter)
+  # is REFUSED at boot with a log line, not trusted. The machine stays the
+  # last good state; one bad entry cannot strand the boot.
+  #
+  # Publishing happens ONCE after replay (`init` ends in `publish/1`), not
+  # per entry — but rungs 3–4 still run per entry, because a rejected entry
+  # must never reach the served page.
+  defp replay_journal(%{persist: false} = state), do: state
+
+  defp replay_journal(%{persist: true} = state) do
+    machine =
+      Enum.reduce(BeamLisp.Spell.Persist.journal(), state.machine, fn source, machine ->
+        case run_ladder(source, machine) do
+          {:ok, grown, _report, _meta} ->
+            grown
+
+          {:error, verdict} ->
+            require Logger
+
+            Logger.warning(
+              "spell.loop: a journaled definition was refused at boot " <>
+                "(#{verdict[:rung]} rung): #{first_line(verdict[:reason])}"
+            )
+
+            machine
+        end
+      end)
+
+    transcript =
+      BeamLisp.Spell.Persist.read_transcript()
+      |> Enum.map(fn
+        %{"role" => role, "content" => content} ->
+          # Roles are the loop's own closed set (:user/:model/:system), already
+          # interned by this module's code — never model-controlled.
+          %{role: String.to_existing_atom(role), content: content}
+
+        other ->
+          other
+      end)
+
+    # The in-memory transcript is NEWEST-FIRST (say/2 prepends); the file is
+    # chronological. Restoring without reversing would make the next say
+    # prepend onto a chronological list — every turn after a restart landing
+    # BEFORE the restored history.
+    %{state | machine: machine, transcript: Enum.reverse(transcript)}
   end
 
   # The machine every session starts from: the seed contract and the seed view,
@@ -223,6 +285,11 @@ defmodule BeamLisp.Spell.Loop do
 
   def handle_call({:run, source, rationale}, _from, state) do
     {verdict, state} = apply_source(source, rationale, state)
+
+    if verdict.status == :ok and state.persist do
+      BeamLisp.Spell.Persist.append_definition(source, rationale)
+    end
+
     {:reply, verdict, state}
   end
 
@@ -832,6 +899,20 @@ defmodule BeamLisp.Spell.Loop do
   end
 
   # ── transcript ────────────────────────────────────────────────────────────
+
+  defp say(%{persist: true} = state, role, content) do
+    state = %{state | transcript: [%{role: role, content: content} | state.transcript]}
+
+    # The snapshot is display state for a restarted page: chronological, and
+    # through `Data.from_bl` because content may carry keywords (a verdict's
+    # :rejected) that JSON has no spelling for.
+    state.transcript
+    |> Enum.reverse()
+    |> Enum.map(&Data.from_bl/1)
+    |> BeamLisp.Spell.Persist.write_transcript()
+
+    state
+  end
 
   defp say(state, role, content) do
     %{state | transcript: [%{role: role, content: content} | state.transcript]}
