@@ -1,16 +1,16 @@
-defmodule BeamLisp.Spell.Live do
+defmodule BeamLisp.Spell.Loop do
   @moduledoc """
   The loop: a machine, a model, and a page that rebuilds itself.
 
   One process owns the machine and the transcript. A user message goes to the
-  model with the `define` tool offered; a tool call walks the validation ladder;
-  an accepted definition re-emits the whole machine, rebuilds the bundle, and
-  bumps a version the browser is polling. The page then shows what the model
-  just built.
+  model with the `run` tool offered; a tool call's SOURCE walks the validation
+  ladder; an accepted definition re-emits the whole machine, awaits verse's
+  build verdict, and the browser's shell reloads on verse's dev websocket. The
+  page then shows what the model just built.
 
   ## Why the state lives in a process rather than in beam-lisp
 
-  The machine is an immutable value threaded through `spell.define/define`, and
+  The machine is an immutable value threaded through `spell.run/run`, and
   that is deliberate — rollback is "keep the old one". Something still has to
   hold the current value between turns, and on this runtime that is a process.
   It is deliberately a plain `Agent`-shaped GenServer rather than beam-lisp
@@ -46,9 +46,9 @@ defmodule BeamLisp.Spell.Live do
 
   ## Retry policy
 
-  A refused proposal is fed back to the model with the failing rung and the
+  A refused definition is fed back to the model with the failing rung and the
   diagnostic, up to `@max_attempts` times. Every attempt lands in the transcript
-  as a `:proposal` entry with its verdict, because a rejected attempt is the
+  as a `:run` entry with its verdict, because a rejected attempt is the
   most informative thing the loop produces and hiding it in stdout would waste
   it. After the last failure the machine is UNCHANGED and the transcript says
   so.
@@ -60,45 +60,33 @@ defmodule BeamLisp.Spell.Live do
   alias BeamLisp.Spell.Data
 
   @max_attempts 3
-  @tool_name "define"
+  @tool_name "run"
 
   # ── the tool the model is offered ─────────────────────────────────────────
   #
-  # One tool, two kinds. The schema is deliberately close to the shapes
-  # `spell.define/proposal->contract` and `proposal->view` read: a model that
-  # fills this in correctly produces a definition that needs no translation,
-  # and rung 1 rejects the rest with a reason rather than guessing.
-  @define_tool_schema """
-  {"type":"object","properties":{\
-  "kind":{"type":"string","enum":["contract","view"],"description":"contract = server-owned state and events; view = markup, style and bindings"},\
-  "name":{"type":"string","description":"kebab-case, e.g. clock-live or clock"},\
-  "rationale":{"type":"string","description":"why this change, in one sentence — it is shown in the chat"},\
-  "assigns":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string","enum":["list","atom","integer","string","boolean"]}},"required":["name","type"]}},\
-  "events":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"params":{"type":"array","items":{"type":"string"}},"replies":{"type":"array","items":{"type":"string","enum":["ok","err"]}}},"required":["name"]}},\
-  "pushes":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"fields":{"type":"object"}},"required":["name"]}},\
-  "templates":{"type":"array","description":"a view MUST include one named `shell` — the whole-page template the browser hydrates into; any other name and there is no page","items":{"type":"object","properties":{"name":{"type":"string","description":"`shell` for the page itself; anything else for a part it hosts"},"params":{"type":"array","items":{"type":"string"}},"html":{"type":"string","description":"one element; {@x.field} interpolates"}},"required":["name","html"]}},\
-  "style":{"type":"array","items":{"type":"object","properties":{"selector":{"type":"string"},"rules":{"type":"object"}},"required":["selector","rules"]}},\
-  "binds":{"type":"array","description":"each item attaches EXACTLY ONE of each/on/view to a selector","items":{"type":"object","properties":{\
-  "selector":{"type":"string"},\
-  "each":{"type":"object","description":"repeat a template over a list assign","properties":{"binding":{"type":"string","description":"the list assign, e.g. messages"},"as":{"type":"string","description":"name each item is bound to inside the template, e.g. m"},"template":{"type":"string","description":"name of a template defined in this same proposal"}},"required":["binding","template"]},\
-  "on":{"type":"object","description":"a DOM event; MUST carry either fire or value, never neither","properties":{"event":{"type":"string","description":"click, input, keydown… (default click)"},"fire":{"type":"string","description":"name of a declared contract event to send"},"arg":{"type":"string","description":"value passed with the fired event, e.g. a page-local like draft"},"value":{"type":"string","description":"write to a page-local instead of firing, e.g. draft"},"key":{"type":"string","description":"only with event keydown: fire only for this key, e.g. Enter"}}},\
-  "view":{"type":"object","description":"swap templates by the value of an assign","properties":{"binding":{"type":"string","description":"the assign to switch on, e.g. status"},"arms":{"type":"array","description":"[value, template-name] pairs","items":{"type":"array","items":{"type":"string"}}}},"required":["binding","arms"]}},\
-  "required":["selector"]}}},\
-  "required":["kind","name","rationale"]}\
-  """
-
-  @doc "The tool declaration, as `spell.provider/request-body` wants it."
-  def define_tool do
+  # One tool, one argument that matters: SOURCE — the very `(defcontract …)` /
+  # `(defview …)` text a human author would write. The previous schema asked
+  # for a JSON rendering of that form (kind/name/assigns/binds…), and the loop
+  # then translated the JSON BACK into source terms — two spellings of one
+  # idea, with the translation layer being where a model's invention could
+  # pass every check (an invented key is self-consistent everywhere
+  # downstream). Source removes the translation: `spell.run` READS the text
+  # (never evaluates it), classifies by head symbol, sanitizes handler bodies
+  # to their reply tags, and hands the result to the same `parse`/`parse-view`
+  # an author's file takes. Downstream cannot tell the difference, which is
+  # the point.
+  @run_tool_schema "{\"properties\":{\"rationale\":{\"description\":\"why this change, in one sentence — shown in the chat\",\"type\":\"string\"},\"source\":{\"description\":\"the definition, as beam-lisp source: (defcontract name (assign @x :type init) (on :ev [param] (ok ...) ...) ...) for server-owned state and events, or (defview name (markup (template &shell [...] ...) ...) ...) for markup, style and bindings. A contract declares an event's SHAPE; handler bodies are read for their (ok ...)/(err ...) reply tags and replaced by inert stubs.\",\"type\":\"string\"}},\"required\":[\"source\",\"rationale\"],\"type\":\"object\"}"
+  def run_tool do
     %{
       name: @tool_name,
       description:
-        "Add a contract or a view to the running machine. The definition is emitted, " <>
-          "compiled and checked; a rejection returns the compiler's own diagnostic and " <>
-          "the machine is left unchanged.",
-      parameters: @define_tool_schema
+        "Add a contract or a view to the running machine, written in the same source " <>
+          "an author would use. The definition is read (never evaluated), checked against " <>
+          "everything registered so far, compiled by verse and checked for dead bindings; " <>
+          "a rejection returns the compiler's own diagnostic and the machine is left unchanged.",
+      parameters: @run_tool_schema
     }
   end
-
   # ── lifecycle ─────────────────────────────────────────────────────────────
 
   def start_link(opts \\ []) do
@@ -107,7 +95,7 @@ defmodule BeamLisp.Spell.Live do
 
   @impl true
   def init(opts) do
-    Spell.init!(["spell.app", "spell.define", "spell.live"])
+    Spell.init!(["spell.app", "spell.run", "spell.live"])
 
     state = %{
       machine: seeded_machine(),
@@ -138,16 +126,14 @@ defmodule BeamLisp.Spell.Live do
   def state(server \\ __MODULE__), do: GenServer.call(server, :state, 30_000)
 
   @doc """
-  Apply a proposal directly, without a model. Returns the verdict map.
+  Apply a definition's SOURCE directly, without a model. Returns the verdict map.
 
   This is the same path a tool call takes; it exists so the loop can be driven
   by a scenario file (`scripts/demo.exs`) and by tests, which is what makes the
   whole thing verifiable without a network.
   """
-  def define(server \\ __MODULE__, proposal), do: GenServer.call(server, {:define, proposal}, 120_000)
-
-  @doc "One user turn against the real model, with the define tool offered."
-  def ask(server \\ __MODULE__, text), do: GenServer.call(server, {:ask, text}, 300_000)
+  def run(server \\ __MODULE__, source, rationale \\ ""),
+    do: GenServer.call(server, {:run, source, rationale}, 120_000)
 
   @doc "Rebuild the page and bump the version, without changing the machine."
   def rebuild(server \\ __MODULE__), do: GenServer.call(server, :rebuild, 120_000)
@@ -235,8 +221,8 @@ defmodule BeamLisp.Spell.Live do
   def handle_call(:transcript, _from, state),
     do: {:reply, Enum.reverse(state.transcript), state}
 
-  def handle_call({:define, proposal}, _from, state) do
-    {verdict, state} = apply_proposal(proposal, state)
+  def handle_call({:run, source, rationale}, _from, state) do
+    {verdict, state} = apply_source(source, rationale, state)
     {:reply, verdict, state}
   end
 
@@ -263,12 +249,6 @@ defmodule BeamLisp.Spell.Live do
     {:reply, :ok, say(state, :model, text)}
   end
 
-  def handle_call({:ask, text}, _from, state) do
-    state = say(state, :user, text)
-    {reply, state} = turn(state, text, @max_attempts)
-    {:reply, reply, state}
-  end
-
   # ── the turn ──────────────────────────────────────────────────────────────
   #
   # Ask the model; if it calls the tool, run the ladder and answer with the
@@ -289,9 +269,9 @@ defmodule BeamLisp.Spell.Live do
     Map.put(
       bl("spell.provider", "from-env", []),
       :tools,
-      # `:as_written` — these keys are literals in `define_tool/0`, and
+      # `:as_written` — these keys are literals in `run_tool/0`, and
       # `spell.provider/tool-decl-json` reads them as keywords.
-      Data.to_bl([define_tool()], :as_written)
+      Data.to_bl([run_tool()], :as_written)
     )
   end
 
@@ -376,7 +356,7 @@ defmodule BeamLisp.Spell.Live do
         # dying here would take `[:done …]` with it and strand the page.
         verdict =
           try do
-            GenServer.call(server, {:define, parse_arguments(call)}, 300_000)
+            GenServer.call(server, {:run, parse_arguments(call), parse_rationale(call)}, 300_000)
           catch
             kind, reason ->
               %{status: :error, rung: :loop, reason: inspect({kind, reason})}
@@ -393,7 +373,7 @@ defmodule BeamLisp.Spell.Live do
         text =
           case verdict.status do
             :ok ->
-              "✓ " <> definition_summary(call) <> warning_note(verdict)
+              "✓ " <> definition_summary(call, verdict) <> warning_note(verdict)
 
             _ ->
               # A refusal is its OWN `[:defined …]` message, not a `[:delta …]`.
@@ -504,13 +484,15 @@ defmodule BeamLisp.Spell.Live do
       Logger.warning("spell.live: a verdict did not reach the transcript: #{inspect({kind, reason})}")
   end
 
-  defp definition_summary(call) do
-    args = parse_arguments(call)
-    kind = Map.get(args, "kind", "definition")
-    name = Map.get(args, "name", "?")
-    why = Map.get(args, "rationale", "")
+  defp definition_summary(call, verdict) do
+    # kind/name come from the VERDICT, not the call: the ladder read the source
+    # and classified it, so what it found is what happened — a tool call's own
+    # claims would just be the JSON vocabulary leaking back in.
+    kind = Map.get(verdict, :kind, "definition")
+    name = Map.get(verdict, :name, "?")
+    why = parse_rationale(call)
 
-    "defined #{kind} #{inspect(name)} — #{why}"
+    "defined #{kind} #{inspect(to_string(name))} — #{why}"
   end
 
   # What the machine NOTICED about an accepted definition, appended to the ✓.
@@ -591,58 +573,6 @@ defmodule BeamLisp.Spell.Live do
     |> String.slice(0, 300)
   end
 
-  defp turn(state, _text, 0) do
-    {%{status: :exhausted, attempts: @max_attempts},
-     say(state, :system,
-       "no definition accepted after #{@max_attempts} attempts — the machine is unchanged")}
-  end
-
-  defp turn(state, text, attempts_left) do
-    cfg = turn_cfg()
-
-    turn_result =
-      bl("spell.provider", "ask-turn", [
-        cfg,
-        # Same: `:role` / `:content` are ours, and `message-json` reads
-        # keywords. Wire data never takes this path — the model's own words
-        # travel as VALUES inside these maps, not as keys.
-        Data.to_bl(provider_messages(state, text), :as_written)
-      ])
-
-    case decode_turn(turn_result) do
-      {:content, answer} ->
-        {%{status: :answered, text: answer}, say(state, :model, answer)}
-
-      {:tool_calls, calls} ->
-        # Calls are folded with a HALT once one of them retries or fails.
-        #
-        # The first version reduced over every call and recursed per rejection,
-        # so a turn carrying two calls could spend the budget twice — and an
-        # arbitrarily long `tool_calls` array multiplied a bound that is
-        # supposed to be fixed. A reviewer traced it; the budget is the loop's
-        # only protection against a model that proposes forever.
-        Enum.reduce_while(calls, {%{status: :answered, text: ""}, state}, fn call, {_acc, st} ->
-          {verdict, st} = apply_proposal(parse_arguments(call), st)
-
-          st =
-            say(st, :proposal, %{
-              name: Map.get(call, "name"),
-              verdict: verdict.status,
-              rung: Map.get(verdict, :rung),
-              reason: Map.get(verdict, :reason)
-            })
-
-          case verdict.status do
-            :ok -> {:cont, {verdict, st}}
-            _ -> {:halt, turn(st, retry_prompt(verdict), attempts_left - 1)}
-          end
-        end)
-
-      {:error, reason} ->
-        {%{status: :error, reason: reason}, say(state, :system, "provider error: #{inspect(reason)}")}
-    end
-  end
-
   # A rejection, phrased for the model: the rung that refused and the
   # diagnostic, verbatim. Verse's own text is better than any paraphrase — it
   # names lines and codes, and the model has been trained on far more compiler
@@ -654,9 +584,9 @@ defmodule BeamLisp.Spell.Live do
 
   # ── the ladder, all four rungs ────────────────────────────────────────────
 
-  defp apply_proposal(proposal, state) do
-    case run_ladder(proposal, state.machine) do
-      {:ok, machine, report} ->
+  defp apply_source(source, _rationale, state) do
+    case run_ladder(source, state.machine) do
+      {:ok, machine, report, meta} ->
         # Commit, then publish — and if publishing FAILS, say so in the verdict
         # rather than reporting success. The machine still holds the definition
         # (it passed every rung; the failure is downstream, in emitting or
@@ -667,7 +597,7 @@ defmodule BeamLisp.Spell.Live do
 
         case state.last_build do
           :ok ->
-            {%{status: :ok, report: report}, state}
+            {%{status: :ok, kind: meta.kind, name: meta.name, report: report}, state}
 
           {:error, reason} ->
             {%{status: :published_stale, rung: :publish, reason: reason, report: report}, state}
@@ -682,30 +612,14 @@ defmodule BeamLisp.Spell.Live do
     end
   end
 
-  defp run_ladder(proposal, machine) do
-    # The conversion happens BEFORE anything reaches the language, and it refuses
-    # what it cannot convert (a struct). A refusal here is a schema rejection,
-    # not a crash: a model probing the boundary should get the same bounded
-    # answer as one that simply mistyped a field.
-    #
-    # NB the danger this used to guard is gone rather than handled. The old path
-    # PRINTED the proposal as source, so a crafted map key could close the call
-    # and open a new form. `BeamLisp.Spell.Data` converts instead: there is no
-    # source for a key to break out of, and an unknown key becomes an inert
-    # string that rung 1 then reports as a missing field.
-    case safe_convert(proposal) do
-      {:error, reason} ->
-        {:error, %{status: :rejected, rung: :schema, reason: reason}}
-
-      {:ok, converted} ->
-        ladder(bl("spell.define", "define", [machine, converted]))
-    end
-  end
-
-  defp safe_convert(proposal) do
-    {:ok, Data.to_bl(proposal, Data.proposal_keys())}
-  rescue
-    e in ArgumentError -> {:error, Exception.message(e)}
+  defp run_ladder(source, machine) do
+    # The source crosses the language boundary as a VALUE — never printed into
+    # a form, never evaluated. Everything the old JSON proposal boundary
+    # existed to prevent (model text reaching the evaluator) is prevented by
+    # construction: `spell.run/run` READS the text with the reader, classifies
+    # by head symbol, and builds the term through the same `parse`/`parse-view`
+    # an author's file takes.
+    ladder(bl("spell.run", "run", [machine, source]))
   end
 
   # Rungs 1–2 answered; run 3–4 against the CANDIDATE's page.
@@ -739,7 +653,8 @@ defmodule BeamLisp.Spell.Live do
 
         with {:ok, _} <- Spell.Page.emit(machine, page),
              {:ok, _} <- Spell.Verse.verify(page, selectors) do
-          {:ok, machine, bl("spell.live", "machine-report", [machine])}
+          {:ok, machine, bl("spell.live", "machine-report", [machine]),
+           %{kind: Map.get(candidate, :kind), name: Map.get(candidate, :name)}}
         else
           {:error, %{rung: rung, reason: reason}} ->
             {:error, %{status: :rejected, rung: rung, reason: reason}}
@@ -903,8 +818,9 @@ defmodule BeamLisp.Spell.Live do
   The loop already holds the transcript, because it is the thing that survives
   a page. Seeding from it is what makes the reload invisible.
 
-  Only user and model turns: `:system` notes and `:proposal` entries are for
-  the report and the console, not for a chat bubble.
+  Only user and model turns: `:system` notes are for the report and the
+  console, not for a chat bubble. (Verdicts ARE recorded as `:model` turns —
+  see `handle_tool_calls` — because a refusal must survive the reload.)
   """
   def transcript_messages(server \\ __MODULE__) do
     server
@@ -1020,20 +936,27 @@ defmodule BeamLisp.Spell.Live do
     apply(fun, args)
   end
 
-  defp decode_turn(turn) do
-    case Data.from_bl(turn) do
-      %{"kind" => "tool-calls", "tool-calls" => calls} -> {:tool_calls, calls}
-      %{"kind" => "content", "content" => text} -> {:content, text}
-      %{"kind" => "error", "reason" => reason} -> {:error, reason}
-      other -> {:error, other}
+  # Tool-call arguments: the tool is JSON because the PROVIDER's tool-call
+  # channel is, but the payload is now just two strings — `source` and
+  # `rationale` — so there is no keyword conversion left to do. An
+  # undecodable payload becomes an empty source, which rung 1 refuses with a
+  # reason rather than a crash.
+  defp parse_arguments(%{"arguments" => args}) when is_binary(args) do
+    case JSON.decode(args) do
+      {:ok, %{"source" => source}} when is_binary(source) -> source
+      {:ok, other} -> "undecodable tool call: " <> inspect(other)
+      {:error, _} -> "undecodable tool call: " <> args
     end
   end
 
-  defp parse_arguments(%{"arguments" => args}) when is_binary(args) do
-    JSON.decode!(args)
-  rescue
-    e -> %{"_undecodable" => Exception.message(e)}
+  defp parse_arguments(other), do: "undecodable tool call: " <> inspect(other)
+
+  defp parse_rationale(%{"arguments" => args}) when is_binary(args) do
+    case JSON.decode(args) do
+      {:ok, %{"rationale" => rationale}} when is_binary(rationale) -> rationale
+      _ -> ""
+    end
   end
 
-  defp parse_arguments(other), do: other
+  defp parse_rationale(_other), do: ""
 end

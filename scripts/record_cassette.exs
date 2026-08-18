@@ -27,7 +27,7 @@
 # ── the fixtures this records, and why these four ───────────────────────────
 #
 #   content-turn        the ordinary answer
-#   tool-call           the model asks for `define` — the shape the loop runs on
+#   tool-call           the model asks for `run` — the shape the loop runs on
 #   stream-content      the same answer, as SSE deltas
 #   stream-tool-call    a tool call SPLIT ACROSS FRAMES — the one that was
 #                       impossible to handle before W2, because
@@ -41,7 +41,7 @@ alias BeamLisp.Spell
 
 defmodule RecordCassette do
   @tool_prompt """
-  Add a view named "clock" using the define tool.
+  Add a view named "clock" using the run tool.
 
   It needs:
     - one template named "clockface" with html "<div class='clock'>{@m.text}</div>"
@@ -119,12 +119,12 @@ defmodule RecordCassette do
     abort("usage: mix run scripts/record_cassette.exs NAME [--stream] [--tools]")
   end
 
-  # The cfg to record with: the configured provider, plus the `define` tool
-  # declaration when asked. Taken from `Spell.Live.define_tool/0` rather than
+  # The cfg to record with: the configured provider, plus the `run` tool
+  # declaration when asked. Taken from `Spell.Loop.run_tool/0` rather than
   # restated, so a cassette records the tool the loop actually offers.
   defp base_cfg(tools?) do
     cfg = bl("spell.provider", "from-env", [])
-    if tools?, do: Map.put(cfg, :tools, to_bl([Spell.Live.define_tool()])), else: cfg
+    if tools?, do: Map.put(cfg, :tools, to_bl([Spell.Loop.run_tool()])), else: cfg
   end
 
   defp describe(body, true, _tools?) do

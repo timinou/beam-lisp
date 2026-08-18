@@ -1,15 +1,15 @@
 defmodule BeamLisp.Spell.LoopTest do
   @moduledoc """
-  The define ladder, driven without a model.
+  The run ladder, driven without a model.
 
   `scripts/demo.exs` proves this in a browser and is the acceptance artefact.
   What it cannot be is a unit test: it needs verse, a bundle, an HTTP server and
   headless Chrome, so it runs on demand and not in `mix test`. This suite takes
-  the same three proposals and asserts the same verdicts at the level below —
+  the same three definitions and asserts the same verdicts at the level below —
   which is what makes PLAN-027's refactor safe, because a rung that stops
   refusing will fail here in seconds rather than in a demo nobody ran.
 
-  ## What each proposal is FOR
+  ## What each definition is FOR
 
   Three fixtures, and each one exists because it fails a DIFFERENT way:
 
@@ -37,7 +37,7 @@ defmodule BeamLisp.Spell.LoopTest do
   use ExUnit.Case, async: false
   use BeamLisp.SpellCase
 
-  alias BeamLisp.Spell.Live
+  alias BeamLisp.Spell.Loop
 
   @out Path.join(System.tmp_dir!(), "spell-loop-test")
 
@@ -48,7 +48,7 @@ defmodule BeamLisp.Spell.LoopTest do
     # `publish: false` — the loop is exercised, the bundle is not. Building it
     # costs a `spacetime build` per accepted definition and proves nothing this
     # suite claims; `scripts/demo.exs` owns that half.
-    {:ok, pid} = Live.start_link(out: @out, publish: false, name: __MODULE__.Loop)
+    {:ok, pid} = Loop.start_link(out: @out, publish: false, name: __MODULE__.Loop)
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
@@ -58,138 +58,77 @@ defmodule BeamLisp.Spell.LoopTest do
     %{loop: __MODULE__.Loop}
   end
 
-  # ── fixtures ───────────────────────────────────────────────────────────────
+  # —— fixtures ——————————————————————————————————————————————————————————————
 
-  defp clock_proposal do
-    %{
-      "kind" => "view",
-      "name" => "clock",
-      "rationale" => "render each message with a timestamped clock face",
-      "templates" => [%{"name" => "clockface", "html" => "<div class='clock'>{@m.text}</div>"}],
-      "style" => [
-        %{"selector" => ".clock", "rules" => %{"font-size" => "0.75rem", "opacity" => "0.6"}}
-      ],
-      "binds" => [
-        %{
-          "selector" => ".log",
-          "each" => %{"binding" => "messages", "as" => "m", "template" => "clockface"}
-        }
-      ]
-    }
+  defp clock_src do
+    "(defview clock (markup (template &clock [$m] \"<div class='clock'>{@m.text}</div>\")) (style [\".clock\" {:font-size \"0.75rem\" :opacity \"0.6\"}]) (binds [\".log\" (st/each @messages :as @m :template &clock)]))"
   end
 
-  defp ghost_proposal do
-    %{
-      "kind" => "view",
-      "name" => "ghosty",
-      "rationale" => "deliberately styles a class no template renders",
-      "templates" => [%{"name" => "real", "html" => "<i class='real'>{@m.text}</i>"}],
-      "style" => [
-        %{"selector" => ".real", "rules" => %{"color" => "#fff"}},
-        %{"selector" => ".phantom-never-rendered", "rules" => %{"color" => "#f00"}}
-      ],
-      "binds" => [
-        %{
-          "selector" => ".real",
-          "each" => %{"binding" => "messages", "as" => "m", "template" => "real"}
-        }
-      ]
-    }
+  defp ghost_src do
+    "(defview ghosty (markup (template &real [$m] \"<i class='real'>{@m.text}</i>\")) (style [\".real\" {:color \"#fff\"}] [\".phantom-never-rendered\" {:color \"#f00\"}]) (binds [\".real\" (st/each @messages :as @m :template &real)]))"
   end
 
-  defp unmounted_proposal do
-    %{
-      "kind" => "view",
-      "name" => "floating",
-      "rationale" => "binds a selector no template renders",
-      "templates" => [%{"name" => "drift", "html" => "<i class='drift'>{@m.text}</i>"}],
-      "style" => [%{"selector" => ".drift", "rules" => %{"color" => "#fff"}}],
-      "binds" => [
-        %{
-          "selector" => ".nowhere",
-          "each" => %{"binding" => "messages", "as" => "m", "template" => "drift"}
-        }
-      ]
-    }
+  defp unmounted_src do
+    "(defview floating (markup (template &drift [$m] \"<i class='drift'>{@m.text}</i>\")) (style [\".drift\" {:color \"#fff\"}]) (binds [\".nowhere\" (st/each @messages :as @m :template &drift)]))"
   end
 
-  # ── rungs 1–2: no compiler needed ──────────────────────────────────────────
+  # —— rungs 1–2: no compiler needed ————————————————————————————————————————
 
-  describe "rung 1 — the proposal's own shape" do
-    test "a proposal with no rationale is refused, and says which fields are missing", %{
-      loop: loop
-    } do
-      # Rationale is what renders in the chat: a change nobody can read is a
-      # change nobody can review. It is required for that reason, not for
-      # tidiness.
-      verdict = Live.define(loop, %{"kind" => "view", "name" => "x"})
+  describe "rung 1 — the source's own shape" do
+    test "source that does not parse is refused", %{loop: loop} do
+      verdict = Loop.run(loop, "(defview clock (markup", "incomplete source")
 
       assert verdict.status == :rejected
-      assert verdict.rung == :schema or verdict.rung == :proposal
-      assert to_string(verdict.reason) =~ "rationale"
+      assert verdict.rung == :schema
     end
 
-    test "an unknown kind is refused rather than guessed", %{loop: loop} do
-      verdict = Live.define(loop, %{"kind" => "gizmo", "name" => "x", "rationale" => "r"})
+    test "a form that is not a definition is refused", %{loop: loop} do
+      verdict = Loop.run(loop, "(def pwned 99)", "not a defview or defcontract")
+
       assert verdict.status == :rejected
+      assert verdict.rung == :schema
     end
   end
 
   describe "the data boundary" do
-    test "a key that is not a plain name is refused BEFORE anything is evaluated", %{loop: loop} do
-      # The recorded P0. This exact key closed the call and opened a new form,
-      # so `(def pwned 99)` evaluated before any rung ran — a model could have
-      # reached anything the BEAM can reach.
+    test "the source is READ, never evaluated, so injected code cannot run", %{loop: loop} do
+      # The recorded P0. This test outlives its mechanism on purpose: the
+      # source is READ not evaluated, and the definition must still be refused
+      # afterwards. If it ever passes, the boundary regressed.
       #
-      # This test outlives its mechanism on purpose: PLAN-027 W1 replaces the
-      # printer with a value-level boundary, and the payload must still be
-      # refused afterwards. If it ever passes, the boundary regressed however
-      # it is implemented.
-      hostile = %{
-        "kind \"view\"}))\n(def pwned 99)\n(def z {:kind" => "view",
-        "name" => "x",
-        "rationale" => "r"
-      }
+      # Malformed source that would execute code IF the boundary evaluated it:
+      # the string itself closes a form and opens a new one with `(def pwned 99)`.
+      # But since the source is only read as text and then parsed, `pwned` never
+      # gets defined.
+      hostile = "kind \"view\"))\n(def pwned 99)\n(def z {:kind"
 
-      verdict = Live.define(loop, hostile)
+      verdict = Loop.run(loop, hostile, "r")
 
       assert verdict.status == :rejected
       assert BeamLisp.Env.fetch("user", "pwned") == :error,
-             "a model-supplied map key was EVALUATED — the boundary is open"
-    end
-
-    test "a struct is refused rather than printed", %{loop: loop} do
-      verdict =
-        Live.define(loop, %{
-          "kind" => "view",
-          "name" => "x",
-          "rationale" => "r",
-          "when" => ~D[2026-08-16]
-        })
-
-      assert verdict.status == :rejected
+             "a model-supplied source was EVALUATED — the boundary is open"
     end
   end
 
-  # ── rungs 3–4: the compiler's own verdict ──────────────────────────────────
+  # —— rungs 3–4: the compiler's own verdict —————————————————————————————————
 
   describe "rungs 3–4 — what verse says" do
     @describetag :verse
 
     test "a correct view is ACCEPTED and joins the machine", %{loop: loop} do
-      verdict = Live.define(loop, clock_proposal())
+      verdict = Loop.run(loop, clock_src(), "render each message with a timestamped clock face")
 
       assert verdict.status == :ok,
              "the clock view was refused at #{inspect(verdict[:rung])}: #{inspect(verdict[:reason])}"
 
-      assert "clock" in Live.state(loop).machine["views"]
+      assert "clock" in Loop.state(loop).machine["views"]
     end
 
     @tag :publishes
     test "a view that renames the page template away from `shell` reports a STALE publish",
          %{} do
       # The live incident. Asked to improve the chat view, a model produced a
-      # correct proposal that named the page template `&chat` instead of
+      # correct definition that named the page template `&chat` instead of
       # `&shell` — a reasonable name, and nothing had told it otherwise.
       #
       # Every rung accepted it, and before the fix the story ended there: the
@@ -199,7 +138,7 @@ defmodule BeamLisp.Spell.LoopTest do
       # renders the shell SERVER-side) was never regenerated. A machine that
       # grows while the page cannot change, with no error anywhere.
       #
-      # Note what is asserted and what is NOT. The proposal is structurally
+      # Note what is asserted and what is NOT. The definition is structurally
       # sound — no orphan binding, no unhandled fire — so the RUNGS are right
       # to pass it, and an errors-level rule refusing it would also refuse the
       # partial machines `spell.machine.test` builds (tried; 16 failures). The
@@ -224,25 +163,12 @@ defmodule BeamLisp.Spell.LoopTest do
         File.rm_rf(out)
       end)
 
-      {:ok, loop} = Live.start_link(out: out, name: nil)
+      {:ok, loop} = Loop.start_link(out: out, name: nil)
 
-      shell_renamed = %{
-        "kind" => "view",
-        "name" => "chat-view",
-        "rationale" => "a page template under any other name",
-        "templates" => [
-          %{"name" => "chat", "html" => "<main class=\"chat\"><div class=\"log\" data-log></div></main>"},
-          %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
-        ],
-        "binds" => [
-          %{
-            "selector" => ".log",
-            "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
-          }
-        ]
-      }
+      shell_renamed =
+        "(defview chat-view (markup (template &chat [] \"<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div></main>\") (template &message [m] \"<p class=\\\"bubble\\\">{@m.text}</p>\")) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
-      verdict = Live.define(loop, shell_renamed)
+      verdict = Loop.run(loop, shell_renamed, "a page template under any other name")
 
       assert verdict.status == :published_stale,
              "a definition that leaves the page unhostable was reported as a " <>
@@ -270,33 +196,17 @@ defmodule BeamLisp.Spell.LoopTest do
       # rendered the literal strings `{@partial}` and `{@error}`. The model
       # could have fixed it that same turn had anyone told it.
       #
-      # Asserted through `Live.define/2`'s verdict rather than the bubble text
+      # Asserted through `Loop.run/3`'s verdict rather than the bubble text
       # so it holds for every caller of the ladder, and the assertion names the
       # ASSIGN — a warning the model cannot act on is the same silence in a
       # different font.
       # A view that renders NEITHER `@partial` nor `@error` — exactly what the
       # live model produced. The seed renders both, so the seed's own warnings
       # would not exercise this; the finding has to be caused, not borrowed.
-      forgetful = %{
-        "kind" => "view",
-        "name" => "chat-view",
-        "rationale" => "drop the binds that consume @partial and @error",
-        "templates" => [
-          %{
-            "name" => "shell",
-            "html" => "<main class=\"chat\"><div class=\"log\" data-log></div></main>"
-          },
-          %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
-        ],
-        "binds" => [
-          %{
-            "selector" => ".log",
-            "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
-          }
-        ]
-      }
+      forgetful =
+        "(defview chat-view (markup (template &shell [] \"<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div></main>\") (template &message [m] \"<p class=\\\"bubble\\\">{@m.text}</p>\")) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
-      verdict = Live.define(loop, forgetful)
+      verdict = Loop.run(loop, forgetful, "drop the binds that consume @partial and @error")
 
       assert verdict.status == :ok,
              "an incomplete definition must still be ACCEPTED — refusing it " <>
@@ -332,17 +242,17 @@ defmodule BeamLisp.Spell.LoopTest do
       # Under `publish: false` — this suite's mode — the machine grows and the
       # version must NOT move. `scripts/demo.exs` runs the publishing half and
       # asserts the opposite there, which is where that claim belongs.
-      before = Live.state(loop).version
+      before = Loop.state(loop).version
 
-      assert Live.define(loop, clock_proposal()).status == :ok
+      assert Loop.run(loop, clock_src(), "render each message with a clock").status == :ok
 
-      assert Live.state(loop).version == before,
+      assert Loop.state(loop).version == before,
              "the version moved with no publish behind it — a polling browser " <>
                "would reload onto an unchanged bundle"
     end
 
     test "a styled class nothing renders is REFUSED at the ghosts rung", %{loop: loop} do
-      verdict = Live.define(loop, ghost_proposal())
+      verdict = Loop.run(loop, ghost_src(), "deliberately styles a class no template renders")
 
       assert verdict.status == :rejected
       assert verdict.rung == :ghosts
@@ -350,7 +260,7 @@ defmodule BeamLisp.Spell.LoopTest do
     end
 
     test "a bind on a selector nothing renders is REFUSED, for its own reason", %{loop: loop} do
-      verdict = Live.define(loop, unmounted_proposal())
+      verdict = Loop.run(loop, unmounted_src(), "binds a selector no template renders")
 
       assert verdict.status == :rejected
       assert verdict.rung == :ghosts
@@ -361,12 +271,12 @@ defmodule BeamLisp.Spell.LoopTest do
     end
 
     test "a refusal leaves the machine EXACTLY as it was", %{loop: loop} do
-      before = Live.state(loop)
+      before = Loop.state(loop)
 
-      Live.define(loop, ghost_proposal())
-      Live.define(loop, unmounted_proposal())
+      Loop.run(loop, ghost_src(), "ghosty")
+      Loop.run(loop, unmounted_src(), "floating")
 
-      after_refusals = Live.state(loop)
+      after_refusals = Loop.state(loop)
 
       assert after_refusals.machine == before.machine,
              "a refused definition left state behind — every later proposal " <>
@@ -377,11 +287,11 @@ defmodule BeamLisp.Spell.LoopTest do
     end
   end
 
-  # ── the transcript ─────────────────────────────────────────────────────────
+  # —— the transcript ———————————————————————————————————————————————————————
 
   describe "the repl state" do
     test "state/1 answers with a version, a transcript and a machine report", %{loop: loop} do
-      state = Live.state(loop)
+      state = Loop.state(loop)
 
       assert is_integer(state.version)
       assert is_list(state.transcript)

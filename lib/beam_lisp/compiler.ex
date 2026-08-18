@@ -2180,6 +2180,24 @@ defmodule BeamLisp.Compiler do
   defp datum({:record, name, kvs}), do: {:record, name, datum({:map, kvs})}
   defp datum(lit), do: lit
 
+  @doc """
+  Read ONE form of source as a runtime VALUE — the same conversion `quote`
+  compiles to (`datum/1`), without compiling or evaluating anything.
+
+  This is the only safe way model-written text crosses into the image
+  (`spell.run`): the reader's atom guard bounds what can be interned, and no
+  form is ever called. A malformed form raises `BeamLisp.Reader.SyntaxError`.
+  """
+  def read_data(source) when is_binary(source) do
+    # An EAGER table check, not the reader's sampled one: the reader resets
+    # its sampling counter per `read_string`, so a caller that reads many
+    # small hostile sources — exactly the model-tool shape — would never
+    # reach a sample. This entry point is that caller; one system_info pair
+    # per read is nothing next to the network turn that produced the source.
+    BeamLisp.AtomGuard.check!(source)
+    source |> BeamLisp.Reader.read_one() |> datum()
+  end
+
   # One protocol method implementation: `(m [args] body…)` compiles to
   # a method-name => fn-value map entry. The method form may carry a
   # reader position (it is a list); unwrap it so the shape matches.

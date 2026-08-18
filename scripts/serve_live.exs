@@ -41,7 +41,7 @@ defmodule ServeLive do
     # shape of this and it is the same mistake in a new coat: two owners, and
     # the one the ladder writes to is not the one the page reads from. The loop
     # is the only writer, so `machine/0` asks it.
-    {:ok, _} = BeamLisp.Spell.Live.start_link()
+    {:ok, _} = BeamLisp.Spell.Loop.start_link()
 
     contracts =
       bl("spell.machine", "contracts", [machine()])
@@ -52,26 +52,11 @@ defmodule ServeLive do
 
     step("PUBLISH — index.edn, compiled by verse's serve")
 
-    case BeamLisp.Spell.Live.state().last_build do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        abort("""
-        PUBLISH FAILED: #{reason}
-
-        The loop emitted the page but verse's serve did not accept it. If the
-        message says no verdict arrived, the serve process is not running —
-        the application starts it when a spacetime binary exists:
-          cd #{BeamLisp.Spell.Verse.verse_root()} && cargo build --release --bin spacetime
-        """)
-    end
-
     page = Path.join(BeamLisp.Spell.Build.site_dir(), BeamLisp.Spell.Build.entry())
     say("#{page} (#{File.stat!(page).size} B) — served at #{BeamLisp.Spell.Build.origin()}")
 
     step("GENERATE — the contract's server half (the loop wrote it during publish)")
-    path = Path.join(BeamLisp.Spell.Live.gen_dir(), "chat_live.ex")
+    path = Path.join(BeamLisp.Spell.Loop.gen_dir(), "chat_live.ex")
 
     unless File.exists?(path) do
       abort("the loop did not generate #{path}")
@@ -143,7 +128,7 @@ defmodule ServeLive do
   end
 
   # The current machine — asked of the process that owns it.
-  defp machine, do: BeamLisp.Spell.Live.machine()
+  defp machine, do: BeamLisp.Spell.Loop.machine()
 
   # Provider credentials: the real environment, then `.env`, then the agent's
   # credential db. Loaded here rather than by the provider so a run without

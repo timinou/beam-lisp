@@ -13,9 +13,9 @@ defmodule SpellWeb.ChatLive do
   """
 
   use Spacetime.LiveView,
-    bundle: "/spacetime/chat/spacetime.js",
+    bundle: "http://127.0.0.1:4444/__spacetime/runtime.js?entry=index.edn",
     root: ".chat",
-    shell: "<div class=\"chat\"><ol class=\"log\" aria-live=\"polite\"></ol><form class=\"composer\"><input class=\"composer__field\" placeholder=\"Type a message…\" /><button class=\"composer__send\" type=\"button\">Send</button></form></div>"
+    shell: "<main class='chat'><div class='log' data-log></div><div class='composer'><input class='composer__input' placeholder='Say something…'><button class='composer__send' type='button'>Send</button></div></main>"
 
   @contract "chat-live"
 

@@ -42,7 +42,7 @@ defmodule BeamLisp.SpellCase do
         :ok
 
       false ->
-        BeamLisp.Spell.init!(["spell.app", "spell.define", "spell.live"])
+        BeamLisp.Spell.init!(["spell.app", "spell.run", "spell.live"])
         :persistent_term.put({__MODULE__, :loaded}, true)
         :ok
     end

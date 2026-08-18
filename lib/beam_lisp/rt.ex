@@ -1427,6 +1427,17 @@ defmodule BeamLisp.RT do
     name
   end
 
+  @doc """
+  `(read-data s)` — read ONE form of source as DATA. Never evaluates.
+
+  This is the seam a model-written definition crosses (`spell.run`): source
+  arrives as text, and the only safe thing to do with text is READ it — the
+  reader's atom guard (PLAN-009) bounds what reading can intern, and no form
+  is ever compiled or called. Errors raise SyntaxError, which the ladder
+  catches and reports as a rung-1 refusal.
+  """
+  def read_data(source) when is_binary(source), do: BeamLisp.Compiler.read_data(source)
+
   # Inside a collection, strings print readably; at the top level
   # (println, pr-str of a bare string) they print raw.
   defp print_elem(x) when is_binary(x), do: inspect(x)
@@ -1614,7 +1625,8 @@ defmodule BeamLisp.RT do
       "volatile?" => &BeamLisp.Refs.volatile?/1,
       "reduced" => &reduced/1,
       "reduced?" => &reduced?/1,
-      "reader-macro!" => &reader_macro!/2
+      "reader-macro!" => &reader_macro!/2,
+      "read-data" => &read_data/1
     }
 
     prims = Map.merge(prims, refs_prims)
@@ -1757,6 +1769,7 @@ defmodule BeamLisp.RT do
       "pr-str" => :print_str,
       "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
+      "read-data" => :read_data,
       "assoc" => 3,
       # (`filter` is deliberately absent: it grew a 1-arity transducer form, and
       # this table links a single fixed arity. `take` is absent for the same

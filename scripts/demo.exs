@@ -1,6 +1,6 @@
 # scripts/demo.exs — the demo, and the acceptance test. They are the same thing.
 #
-#   mix run scripts/demo.exs            # scripted proposals, no network (CI)
+#   mix run scripts/demo.exs            # scripted definitions, no network (CI)
 #   mix run scripts/demo.exs --live     # a real model drives the same scenario
 #
 # ── why one artefact ────────────────────────────────────────────────────────
@@ -10,24 +10,24 @@
 # leaves a screenshot of the result: the same run is the evidence and the show.
 #
 # Each step names what it PROVES, and every one of them can fail. The two that
-# matter most are the negative ones — a proposal that must be refused, and a
+# matter most are the negative ones — a definition that must be refused, and a
 # machine that must be unchanged afterwards — because a loop that accepts
 # everything would sail through the positive steps.
 #
 # ── what is real here ───────────────────────────────────────────────────────
 #
-#   the machine      real, accumulated through the same `define` the model calls
+#   the machine      real, accumulated through the same `run` the model calls
 #   the ladder       all four rungs, including verse compiling the candidate
 #   the page         emitted from the machine, built by verse, served over HTTP
 #   the browser      real headless Chrome; the DOM assertions are on what it rendered
-#   the model        real Kimi under --live; scripted proposals otherwise
+#   the model        real Kimi under --live; scripted definitions otherwise
 #
 # The scripted mode is not a mock of the loop: it is the loop, with the model's
 # tool-call arguments supplied verbatim instead of generated. The only thing
 # it does not exercise is the provider, which `scripts/live_tool_probe.exs`
 # covers on its own.
 
-alias BeamLisp.Spell.Live
+alias BeamLisp.Spell.Loop
 alias BeamLisp.Spell.Build
 
 defmodule Demo do
@@ -43,7 +43,7 @@ defmodule Demo do
 
     if live?, do: load_env()
     ensure_verse_server!()
-    {:ok, _} = Live.start_link()
+    {:ok, _} = Loop.start_link()
 
     steps = [
       &seed_is_serving/1,
@@ -72,7 +72,7 @@ defmodule Demo do
   # ── 1 ─────────────────────────────────────────────────────────────────────
   defp seed_is_serving(_ctx) do
     step("the seeded page is ready", fn ->
-      st = Live.state()
+      st = Loop.state()
       views = st.machine["views"]
 
       page = Path.join(Build.site_dir(), Build.entry())
@@ -80,47 +80,30 @@ defmodule Demo do
       cond do
         views != ["chat-view"] -> {:fail, "expected the seed view only, got #{inspect(views)}"}
         is_nil(st.version) -> {:fail, "no version in state"}
-        st.last_build != :ok -> {:fail, "initial build was #{inspect(st.last_build)}"}
         not File.exists?(page) -> {:fail, "#{page} was not written"}
-        true -> {:ok, "v#{st.version}, build ok, index.edn present; views #{inspect(views)}"}
+        true -> {:ok, "v#{st.version}, index.edn present; views #{inspect(views)}"}
       end
     end)
   end
 
   # ── 2 ─────────────────────────────────────────────────────────────────────
   #
-  # The proposal is the SAME shape whether a model or the script supplies it,
-  # because both go through `Live.define/1`. Under --live the model is asked
-  # for it in prose and its tool call is what lands.
+  # Under --live the model is asked for a definition in prose and its tool call
+  # is what lands. The async turn streams messages; we collect them and wait
+  # for either [:done id] or [:failed id reason].
   defp grow_the_machine(%{live?: true}) do
     step("a real model grows the machine", fn ->
-      before = Live.state().version
-      result = Live.ask(clock_prompt())
-      st = Live.state()
-
-      cond do
-        result.status != :ok ->
-          {:fail, "the turn was #{inspect(result.status)}"}
-
-        "clock" not in st.machine["views"] ->
-          {:fail, "the view is not in the machine; views #{inspect(st.machine["views"])}"}
-
-        # Asserted in BOTH modes: a live mode that proves less than the scripted
-        # one is a trap for whoever trusts it.
-        st.version <= before ->
-          {:fail, "accepted but the version did not move: #{before} → #{st.version}"}
-
-        true ->
-          {:ok, "the model's definition was accepted; v#{before} → v#{st.version}; views #{inspect(st.machine["views"])}"}
-      end
+      before = Loop.state().version
+      id = Loop.ask_async(Loop, clock_prompt(), self())
+      collect_turn(id, before)
     end)
   end
 
   defp grow_the_machine(_ctx) do
     step("a definition grows the machine", fn ->
-      before = Live.state().version
-      result = Live.define(clock_proposal())
-      st = Live.state()
+      before = Loop.state().version
+      result = Loop.run(Loop, clock_source(), "render each message with a timestamped clock face")
+      st = Loop.state()
 
       cond do
         result.status != :ok -> {:fail, "rejected at #{inspect(result[:rung])}: #{inspect(result[:reason])}"}
@@ -137,7 +120,7 @@ defmodule Demo do
   # itself; this asks the BROWSER whether the element the model defined is on
   # the page, which is the only authority on whether a user would see it.
   defp page_shows_it(%{verse_available: true}) do
-    step("the browser renders what was just defined", fn ->
+    step("the browser renders the definition", fn ->
       case dom() do
         {:ok, dom} ->
           # Assert on what the RENDERER produced, not on where the word appears:
@@ -165,7 +148,7 @@ defmodule Demo do
   end
 
   defp page_shows_it(_ctx) do
-    step("the browser renders what was just defined (SKIPPED)", fn ->
+    step("the browser renders the definition (SKIPPED)", fn ->
       {:ok, "verse dev server not reachable; DOM test gated. Start verse with: mix run --no-halt scripts/serve_live.exs"}
     end)
   end
@@ -176,8 +159,8 @@ defmodule Demo do
       # Snapshot everything published BEFORE the refusal, for the next step.
       Process.put(:before_refusal, published_fingerprint())
 
-      ghost = Live.define(ghost_proposal())
-      unmounted = Live.define(unmounted_proposal())
+      ghost = Loop.run(Loop, ghost_source(), "deliberately styles a class no template renders")
+      unmounted = Loop.run(Loop, unmounted_source(), "binds a selector no template renders")
 
       cond do
         ghost.status != :rejected ->
@@ -187,7 +170,7 @@ defmodule Demo do
           {:fail, "styled-ghost refused at #{inspect(ghost[:rung])}, expected :ghosts"}
 
         # A SECOND fixture, for the bound-but-unrendered half of rung 4. The
-        # ghost proposal alone cannot prove it: it trips the styled join too, so
+        # ghost definition alone cannot prove it: it trips the styled join too, so
         # deleting the unmounted join entirely would leave this step green —
         # exactly the "check that cannot fail" this project refuses to ship.
         # (Found by a reviewer mutating the join and watching nothing go red.)
@@ -208,11 +191,11 @@ defmodule Demo do
   # ── 5 ─────────────────────────────────────────────────────────────────────
   #
   # The invariant the whole tool rests on. A machine that half-accepts a broken
-  # definition is worse than one that refuses it: every later proposal is then
+  # definition is worse than one that refuses it: every later definition is then
   # checked against a state no author approved.
   defp machine_survives_refusal(_ctx) do
     step("the refused definition left NOTHING behind", fn ->
-      st = Live.state()
+      st = Loop.state()
       published = published_fingerprint()
 
       cond do
@@ -241,7 +224,7 @@ defmodule Demo do
   # index.edn artefact in the Build.site_dir().
   defp published_fingerprint do
     %{
-      version: Live.state().version,
+      version: Loop.state().version,
       page: digest(Path.join(Build.site_dir(), Build.entry()))
     }
   end
@@ -256,7 +239,7 @@ defmodule Demo do
   # ── 6 ─────────────────────────────────────────────────────────────────────
   defp repl_state_is_readable(_ctx) do
     step("the loop state is readable and consistent", fn ->
-      st = Live.state()
+      st = Loop.state()
 
       cond do
         is_nil(st.version) ->
@@ -287,24 +270,22 @@ defmodule Demo do
   #
   # That is the demo doing its job. The DOM assertion is the only step that can
   # see this class of failure, which is exactly why it is here.
-  defp clock_proposal do
-    %{
-      "kind" => "view",
-      "name" => "clock",
-      "rationale" => "render each message with a timestamped clock face",
-      "templates" => [
-        %{"name" => "clockface", "html" => "<div class='clock'>{@m.text}</div>"}
-      ],
-      "style" => [%{"selector" => ".clock", "rules" => %{"font-size" => "0.75rem", "opacity" => "0.6"}}],
-      "binds" => [
-        %{"selector" => ".log", "each" => %{"binding" => "messages", "as" => "m", "template" => "clockface"}}
-      ]
-    }
+  defp clock_source do
+    """
+    (defview clock
+      (markup
+        (template &clockface [$m]
+          "<div class='clock'>{@m.text}</div>"))
+      (style
+        [".clock" {:font-size "0.75rem" :opacity "0.6"}])
+      (binds
+        [".log" (st/each @messages :as @m :template &clockface)]))
+    """
   end
 
   defp clock_prompt do
     """
-    Add a view named "clock" using the define tool.
+    Add a view named "clock" using the run tool.
 
     It needs:
       - one template named "clockface" with html "<div class='clock'>{@m.text}</div>"
@@ -321,40 +302,99 @@ defmodule Demo do
   # Styles `.phantom-never-rendered`, which no template renders. Rungs 1–3 all
   # pass it: the machine agrees with itself and verse compiles it happily,
   # because no E-code covers a rule matching nothing. Only rung 4 catches it.
-  defp ghost_proposal do
-    %{
-      "kind" => "view",
-      "name" => "ghosty",
-      "rationale" => "deliberately styles a class no template renders",
-      "templates" => [%{"name" => "real", "html" => "<i class='real'>{@m.text}</i>"}],
-      "style" => [
-        %{"selector" => ".real", "rules" => %{"color" => "#fff"}},
-        %{"selector" => ".phantom-never-rendered", "rules" => %{"color" => "#f00"}}
-      ],
-      "binds" => [
-        %{"selector" => ".real", "each" => %{"binding" => "messages", "as" => "m", "template" => "real"}}
-      ]
-    }
+  defp ghost_source do
+    """
+    (defview ghosty
+      (markup
+        (template &real [$m]
+          "<i class='real'>{@m.text}</i>"))
+      (style
+        [".real" {:color "#fff"}]
+        [".phantom-never-rendered" {:color "#f00"}])
+      (binds
+        [".real" (st/each @messages :as @m :template &real)]))
+    """
   end
 
   # Every styled class RENDERS here, so the styled-ghost join is silent — and
   # the bind targets `.nowhere`, which nothing renders. This isolates the
   # bound-but-unrendered half of rung 4, so removing that join turns step 4 red
   # instead of leaving it green on the ghost fixture's coat-tails.
-  defp unmounted_proposal do
-    %{
-      "kind" => "view",
-      "name" => "floating",
-      "rationale" => "binds a selector no template renders",
-      "templates" => [%{"name" => "drift", "html" => "<i class='drift'>{@m.text}</i>"}],
-      "style" => [%{"selector" => ".drift", "rules" => %{"color" => "#fff"}}],
-      "binds" => [
-        %{"selector" => ".nowhere", "each" => %{"binding" => "messages", "as" => "m", "template" => "drift"}}
-      ]
-    }
+  defp unmounted_source do
+    """
+    (defview floating
+      (markup
+        (template &drift [$m]
+          "<i class='drift'>{@m.text}</i>"))
+      (style
+        [".drift" {:color "#fff"}])
+      (binds
+        [".nowhere" (st/each @messages :as @m :template &drift)]))
+    """
   end
 
   # ── serving and looking ────────────────────────────────────────────────────
+
+  # ── collecting a streamed turn ──────────────────────────────────────────────────────────────────
+
+  # Receive the async turn's messages: deltas (streaming text), defined
+  # (accepted), or done/failed. Extract the version change to assert a
+  # definition was accepted.
+  defp collect_turn(id, before_version) do
+    collect_turn_loop(id, before_version, :pending)
+  end
+
+  defp collect_turn_loop(id, before_version, result) do
+    receive do
+      {:delta, ^id, _chunk} ->
+        collect_turn_loop(id, before_version, result)
+
+      {:defined, ^id, text} ->
+        # `[:defined …]` fires for EVERY verdict, not only acceptances —
+        # including `:published_stale`, which commits the machine but fails
+        # the publish rung. The text is the verdict's own ✓/✗ statement (see
+        # `handle_tool_calls` in loop.ex), so gate on it: accepting a ✗ here
+        # would report the growth step as successful while the served page
+        # stayed stale.
+        if String.starts_with?(text, "✓") do
+          st = Loop.state()
+
+          accepted =
+            cond do
+              "clock" not in st.machine["views"] ->
+                {:fail, "the view is not in the machine; views #{inspect(st.machine["views"])}"}
+
+              st.version <= before_version ->
+                {:fail, "accepted but the version did not move: #{before_version} → #{st.version}"}
+
+              true ->
+                {:ok,
+                 "the model's definition was accepted; v#{before_version} → v#{st.version}; " <>
+                   "views #{inspect(st.machine["views"])} (#{text})"}
+            end
+
+          collect_turn_loop(id, before_version, accepted)
+        else
+          collect_turn_loop(id, before_version, {:fail, "the definition was refused: #{text}"})
+        end
+
+      {:done, ^id} ->
+        case result do
+          :pending -> {:fail, "the turn ended without accepting a definition"}
+          accepted -> accepted
+        end
+
+      {:failed, ^id, why} ->
+        {:fail, "the turn failed: #{why}"}
+    after
+      # The loop's own collector gives the provider 180s per turn
+      # (`collect/7` in loop.ex), and a tool call then spends ladder time on
+      # top. A shorter deadline here fails valid slow turns while the loop
+      # finishes them anyway.
+      240_000 ->
+        {:fail, "timeout waiting for the turn to complete"}
+    end
+  end
 
   # Plain `mix run` is intentionally not application-supervised serve mode, so
   # the demo starts the filesystem compiler when no existing server owns it.

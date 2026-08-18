@@ -25,7 +25,7 @@ defmodule BeamLisp.Spell.ServedLoopTest do
   The whole path, offline, from a REAL recorded turn:
 
       Server.event("send")  →  contract's `(ask! text)`
-                            →  Spell.Live.ask_async
+                            →  Spell.Loop.ask_async
                             →  the provider, WITH the define tool
                             →  a streamed tool call, reassembled
                             →  the 4-rung ladder (verse included)
@@ -41,7 +41,7 @@ defmodule BeamLisp.Spell.ServedLoopTest do
   use ExUnit.Case, async: false
   use BeamLisp.SpellCase
 
-  alias BeamLisp.Spell.{Live, Server}
+  alias BeamLisp.Spell.{Loop, Server}
 
   @out Path.join(System.tmp_dir!(), "spell-served-loop")
 
@@ -50,10 +50,10 @@ defmodule BeamLisp.Spell.ServedLoopTest do
     File.mkdir_p!(@out)
 
     # The loop under its REGISTERED name, because that is how `Spell.Server`
-    # finds it — `Process.whereis(BeamLisp.Spell.Live)`. Naming it anything
-    # else here would test a wiring nobody uses.
-    {:ok, pid} = Live.start_link(out: @out, publish: false)
-    Server.register("chat-live", "spell.seed/contract-term")
+        # finds it — `Process.whereis(BeamLisp.Spell.Loop)`. Naming it anything
+        # else here would test a wiring nobody uses.
+        {:ok, pid} = Loop.start_link(out: @out, publish: false)
+        Server.register("chat-live", "spell.seed/contract-term")
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
@@ -81,7 +81,7 @@ defmodule BeamLisp.Spell.ServedLoopTest do
   end
 
   # Drain the LiveView's mailbox into a list, feeding each message through the
-  # contract exactly as `SpellWeb.ChatLive.handle_info/2` does. What comes back
+  # contract exactly as `SpellWeb.ChatLoop.handle_info/2` does. What comes back
   # is the assigns a browser would have, which is the only thing worth
   # asserting: a message the contract cannot decode changes nothing, and that
   # must be visible as "nothing rendered", not as a passing test.
@@ -100,16 +100,16 @@ defmodule BeamLisp.Spell.ServedLoopTest do
   end
 
   describe "the tool actually reaches the model" do
-    test "the cfg a served turn runs with declares define" do
-      # The defect, asserted at its narrowest point. `turn_cfg/0` is now the ONE
-      # definition of what the model may do, and `Server.maybe_ask/3` gets it by
-      # asking the loop rather than building its own.
-      cfg = Live.turn_cfg()
-      tools = BeamLisp.Vector.to_list(Map.get(cfg, :tools))
+      test "the cfg a served turn runs with declares run" do
+        # The defect, asserted at its narrowest point. `turn_cfg/0` is now the ONE
+        # definition of what the model may do, and `Server.maybe_ask/3` gets it by
+        # asking the loop rather than building its own.
+        cfg = Loop.turn_cfg()
+        tools = BeamLisp.Vector.to_list(Map.get(cfg, :tools))
 
-      assert length(tools) == 1
-      assert Map.get(hd(tools), :name) == "define"
-    end
+        assert length(tools) == 1
+        assert Map.get(hd(tools), :name) == "run"
+      end
 
     test "a cfg with tools actually emits a tools array in the request" do
       # One layer down, because `:tools` being present in the cfg is not the
@@ -117,13 +117,13 @@ defmodule BeamLisp.Spell.ServedLoopTest do
       # list is empty, and an empty list is exactly what the served path had.
       body =
         fetch!("spell.provider", "request-body").(
-          Live.turn_cfg(),
+          Loop.turn_cfg(),
           BeamLisp.Spell.Data.to_bl([%{role: "user", content: "hi"}], :as_written),
           false
         )
 
       assert body =~ ~s|"tools":[|
-      assert body =~ ~s|"name":"define"|
+      assert body =~ ~s|"name":"run"|
     end
   end
 
@@ -148,8 +148,8 @@ defmodule BeamLisp.Spell.ServedLoopTest do
       # still walks the ladder and still answers.
       socket = with_cassette("stream-tool-call", fn -> ask_and_drain("add a clock") end)
 
-      assert "clock" in Live.state().machine["views"],
-             "a browser event did not reach `define` — the two loops are still separate"
+      assert "clock" in Loop.state().machine["views"],
+             "a browser event did not reach `run` — the two loops are still separate"
 
       # And the page must SAY so: a machine that grew silently is a page the
       # user watches not change.
@@ -167,12 +167,12 @@ defmodule BeamLisp.Spell.ServedLoopTest do
       # The fixture is the recorded tool call with its bind selector rewritten
       # to one nothing renders — so it fails at rung 4, exactly as a model's
       # honest mistake would.
-      before = Live.state().machine
+      before = Loop.state().machine
 
       socket =
         with_cassette("stream-tool-call-unmounted", fn -> ask_and_drain("add a floating clock") end)
 
-      assert Live.state().machine == before,
+      assert Loop.state().machine == before,
              "a refused definition changed the machine"
 
       texts = Enum.map(socket.assigns.messages, & &1["text"])

@@ -2,7 +2,7 @@ defmodule BeamLisp.Spell.Verse do
   @moduledoc """
   Rungs 3 and 4 of the define ladder: the checks only the COMPILER can answer.
 
-  Rungs 1–2 (`spell.define`) reason about terms. They can tell you a view binds
+  Rungs 1–2 (`spell.run`) reason about terms. They can tell you a view binds
   a name no contract declares, because both facts are in the machine. They
   cannot tell you whether the page verse produces actually renders an element
   matching a styled selector — that answer lives downstream of an emitter, a

@@ -258,6 +258,74 @@
 ; `rendered-classes` went with it: it existed only to serve this function.
 
 
+;; ── page-locals: what keeps the join checks honest ─────────────────────────
+
+(defn view-signals
+  "Page-locals the browser WRITES: the `@x` in `(st/on :ev (st/value @x))`.
+
+   These are real signals living as long as the page, so a page must DECLARE
+   them (`@data inline $x : \"\";`) or it references an undeclared name."
+  [v]
+  (let [acc (atom [])]
+    (postwalk
+      (fn [node]
+        (when (and (seq? node) (= (first node) (quote st/value)) (= 2 (count node)))
+          (let [b (second node)]
+            (when (and (seq? b) (= (first b) (quote deref)))
+              (swap! acc conj (name (second b))))))
+        node)
+      (get v :binds))
+    (vec (sort (distinct @acc)))))
+
+(defn view-scoped
+  "Names bound per-iteration: the `@row` in `(st/each @xs :as @row …)`.
+
+   Kept distinct from `view-signals` because the page must NOT declare these. A
+   loop variable exists only inside the `@each` that binds it; declaring it as
+   a page signal would create a second, permanently empty name that a template's
+   `{@row.x}` could resolve to instead — a page that compiles and renders blank
+   rows, which is exactly the class of failure the ladder exists to catch."
+  [v]
+  (let [acc (atom [])]
+    (postwalk
+      (fn [node]
+        (when (and (seq? node) (= (first node) (quote st/each)))
+          (loop [items (vec node) i 0]
+            (when (< i (count items))
+              (when (= (get items i) :as)
+                (let [b (get items (+ i 1))]
+                  (when (and (seq? b) (= (first b) (quote deref)))
+                    (swap! acc conj (name (second b))))))
+              (recur items (+ i 1)))))
+        node)
+      (get v :binds))
+    (vec (sort (distinct @acc)))))
+
+(defn view-locals
+  "Every name this view introduces ITSELF — signals it writes plus loop variables
+   it binds — and therefore every name no contract should declare.
+
+   Both kinds are exempt from the orphan-binding check, which is why one
+   function answers it. They are NOT interchangeable downstream: only
+   `view-signals` may be emitted as page declarations.
+
+   Derivation is the whole point. If locals arrived in the source as a
+   declaration, a model could silence any orphan-binding finding by declaring
+   the binding local — the check would be fed its own answer, and `validate`
+   would accept a page reading names nobody publishes. Measured on the real
+   seed view, the naive binding scan returns [draft m messages status]: two of
+   those four are local, so without this the seed's own view reports two
+   orphans."
+  [v]
+  (vec (sort (distinct (concat (view-signals v) (view-scoped v))))))
+
+(defn machine-signals
+  "Page-local signals across EVERY registered view. Collected across views,
+   not per view: a machine holding two views must not report the first view's
+   signal as undeclared while checking the second."
+  [m]
+  (vec (distinct (mapcat view-signals (views m)))))
+
 (defn orphan-bindings
   "Bindings a view reads that NO registered contract declares.
 
@@ -284,6 +352,84 @@
     (vec
       (mapv (fn [a] {:kind :unrendered-assign :assign a})
             (filterv (fn [a] (not (contains? read a))) (all-assigns m))))))
+
+(defn- hole-roots
+  "The root names of `{@x…}` holes in a template's html — `{@m.text}` reads
+   as `m`.
+
+   A manual scan, not a regex, for the reason `hole-markers` in contract.bl
+   is one: an unclosed brace is markup we cannot split, and losing it
+   silently is how truncated documents happen (BUG-368)."
+  [html]
+  (loop [s html
+         acc []]
+    (let [i (index-of s "{@")]
+      (if (nil? i)
+        (vec (sort (distinct acc)))
+        (let [after (subs s (+ i 2))
+              j (index-of after "}")]
+          (if (nil? j)
+            (vec (sort (distinct acc)))
+            (recur (subs after (+ j 1))
+                   (conj acc (first (split (subs after 0 j) "."))))))))))
+
+(defn- strip-sigil
+  "`$m` → `m`, `&row` → `row` — the name a param or template symbol REFERS to."
+  [sym-name]
+  (if (or (starts-with? sym-name "$") (starts-with? sym-name "&"))
+    (subs sym-name 1)
+    sym-name))
+
+(defn undeclared-template-holes
+  "Holes a template interpolates whose root is NEITHER a declared param of
+   that template NOR a name the page can read (an assign, the push channel,
+   a page-local SIGNAL the page declares).
+
+   ERROR. The hole compiles to an unbound reference, which verse accepts —
+   an unbound name in a template body is not a compile error, it is a name
+   that resolves to nothing — so the page renders the right number of
+   elements saying nothing. Found live: a model's template interpolated
+   `{@m.text}` with an EMPTY param list; every rung agreed, the browser
+   rendered two empty divs.
+
+   The exemption is page-local SIGNALS (`signals`), NOT `@each` loop
+   variables: a loop variable is delivered to a template as an ARGUMENT, and
+   a template receives it only by DECLARING the param — which is exactly the
+   declaration this check exists to force.
+
+   In the JSON era the emitter DERIVED params from the holes, which made this
+   class impossible and also made the proposal the only place that could not
+   express an intentional subscription. With author-source, the author (or
+   the model) declares params — and this check is what keeps an under-
+   declared one from shipping blank."
+  [m signals]
+  (let [readable (set (concat (all-assigns m)
+                              ;; `fx` is the push channel: published by ANY
+                              ;; contract that declares pushes, by no contract
+                              ;; that does not.
+                              (if (empty? (all-pushes m)) [] ["fx"])
+                              (or signals [])))]
+    (vec
+      (mapcat (fn [v]
+                (mapcat (fn [t]
+                          (let [raw-params (nth t 2 [])
+                                params (set (mapv (fn [p] (strip-sigil (name p)))
+                                                  (if (vector? raw-params)
+                                                    (to-list raw-params)
+                                                    [])))
+                                html (nth t 3 nil)]
+                            (if (string? html)
+                              (mapv (fn [r] {:kind :undeclared-hole
+                                             :view (get v :name)
+                                             :template (strip-sigil (name (nth t 1)))
+                                             :hole r})
+                                    (filterv (fn [r]
+                                               (and (not (contains? params r))
+                                                    (not (contains? readable r))))
+                                             (hole-roots html)))
+                              [])))
+                        (get v :markup)))
+              (views m)))))
 
 (defn unhandled-fires
   "Events a view fires that no contract routes to a handler. ERROR."
@@ -424,7 +570,8 @@
   "Findings that mean the machine is BROKEN NOW."
   [m locals]
   (vec (concat (orphan-bindings m locals)
-               (unhandled-fires m))))
+               (unhandled-fires m)
+               (undeclared-template-holes m (machine-signals m)))))
 
 (defn warnings
   "Findings that mean the machine is INCOMPLETE — expected while growing."

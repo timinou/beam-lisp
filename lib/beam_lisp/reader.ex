@@ -364,7 +364,15 @@ defmodule BeamLisp.Reader do
   # `{:kw true}`; `^Sym`/`^"str"` are `{:tag …}`; `^{...}` is the map
   # itself (keys must be keywords, as in Clojure). Values stay reader forms
   # — the compiler lowers them when the metadata lands on a var.
-  defp metadata_spec({:keyword, name}), do: %{String.to_atom(name) => true}
+  defp metadata_spec({:keyword, name}) do
+    # `^:kw` interns a keyword that never becomes a datum — `unwrap_deep`
+    # discards the wrapper — so it used to bypass `check_atom_safety!`
+    # entirely: a source of `^:fresh_name (foo)` forms grew the atom table
+    # unboundedly and invisibly. Sampling here joins the same guard every
+    # other name crosses.
+    sample_atom_table!(name)
+    %{String.to_atom(name) => true}
+  end
   defp metadata_spec({:symbol, name}), do: %{:tag => {:symbol, name}}
   defp metadata_spec(str) when is_binary(str), do: %{:tag => str}
   defp metadata_spec({:map, kvs}), do: Map.new(kvs, fn {k, v} -> {metadata_key(k), v} end)
@@ -374,7 +382,10 @@ defmodule BeamLisp.Reader do
       message: "metadata must be a Symbol, Keyword, String or Map, got: #{inspect(other)}"
   end
 
-  defp metadata_key({:keyword, name}), do: String.to_atom(name)
+  defp metadata_key({:keyword, name}) do
+    sample_atom_table!(name)
+    String.to_atom(name)
+  end
 
   defp metadata_key(other) do
     raise SyntaxError, message: "metadata map keys must be keywords, got: #{inspect(other)}"

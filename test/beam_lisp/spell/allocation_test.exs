@@ -99,27 +99,6 @@ defmodule BeamLisp.Spell.AllocationTest do
     end
   end
 
-  describe "the conversion itself" do
-    test "converting a thousand proposals allocates nothing" do
-      keys = Data.proposal_keys()
-
-      proposal = %{
-        "kind" => "view",
-        "name" => "clock",
-        "rationale" => "r",
-        "templates" => [%{"name" => "t", "html" => "<i class='c'/>"}],
-        "style" => [%{"selector" => ".c", "rules" => %{"font-size" => "1rem"}}]
-      }
-
-      Data.to_bl(proposal, keys)
-
-      alloc = allocations(fn -> for _ <- 1..1000, do: Data.to_bl(proposal, keys) end)
-
-      assert alloc.modules == 0
-      assert alloc.atoms <= @atom_noise
-    end
-  end
-
   describe "the served path — through Spell.Server, as a LiveView drives it" do
     # The tests above call the interpreter directly and pass by construction.
     # These go through the module a LiveView actually calls, which is where the
@@ -148,6 +127,14 @@ defmodule BeamLisp.Spell.AllocationTest do
         if previous, do: System.put_env("PROVIDER", previous), else: System.delete_env("PROVIDER")
       end)
 
+      # The loop under its REGISTERED name: `maybe_ask` requires exactly
+      # `Process.whereis(BeamLisp.Spell.Loop)` (there is no no-loop fallback —
+      # a browser path without the loop fails loudly by design). Stopped
+      # SYNCHRONOUSLY on exit: this setup runs per test, and without the stop
+      # the next test's `start_link` races the previous loop's name
+      # unregistration.
+      {:ok, pid} = BeamLisp.Spell.Loop.start_link(out: "/tmp/spell-alloc-test", publish: false)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
       BeamLisp.Spell.Server.register("chat-live", "spell.seed/contract-term")
       {:ok, socket} = BeamLisp.Spell.Server.mount(%Phoenix.LiveView.Socket{}, "chat-live")
       %{socket: socket}

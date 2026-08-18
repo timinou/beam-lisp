@@ -37,7 +37,7 @@ defmodule BeamLisp.Spell.HostRegenTest do
 
   use BeamLisp.SpellCase, async: false
 
-  alias BeamLisp.Spell.Live
+  alias BeamLisp.Spell.Loop
 
   @moduletag :verse
 
@@ -60,49 +60,35 @@ defmodule BeamLisp.Spell.HostRegenTest do
   end
 
   test "the shell in the generated host follows the machine", %{out: out, gen: gen} do
-    {:ok, pid} = Live.start_link(out: out, name: nil)
+    {:ok, pid} = Loop.start_link(out: out, name: nil)
 
     host = Path.join(gen, "chat_live.ex")
+    assert :ok = Loop.rebuild(pid)
+    assert File.exists?(host), "rebuilding must write the host module"
 
-    assert File.exists?(host),
-           "starting the loop publishes, and publishing must write the host module"
-
-    # The seed's shell, as generated at boot.
+    # The seed's shell, as generated before the definition.
     before = File.read!(host)
     assert before =~ "shell:", "the generated module must carry a shell"
 
-    # Redefining the view through the loop's own `define/2` — the path a model
+    # Redefining the view through the loop's own `run/2` — the path a model
     # takes — rather than reaching for a private function. The property is
     # about what an ACCEPTED DEFINITION does, so it must be driven by one.
     #
-    # The proposal is minimal but must survive all four rungs: `&shell` renders
+    # The definition is minimal but must survive all four rungs: `&shell` renders
     # `.log`, and the each-bind mounts into it, so no selector is orphaned.
     marker = "regen-#{System.unique_integer([:positive])}"
 
-    proposal = %{
-      "kind" => "view",
-      "name" => "chat-view",
-      "rationale" => "prove the host is regenerated from the machine",
-      "templates" => [
-        %{
-          "name" => "shell",
-          "html" =>
-            "<main class=\"chat\" data-marker=\"#{marker}\">" <>
-              "<div class=\"log\" data-log></div></main>"
-        },
-        %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
-      ],
-      "style" => [%{"selector" => ".bubble", "rules" => %{"margin" => "0"}}],
-      "binds" => [
-        %{
-          "selector" => ".log",
-          "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
-        }
-      ]
-    }
+    source = """
+    (defview chat-view
+      (markup (template &shell []
+        "<main class=\\\"chat\\\" data-marker=\\\"#{marker}\\\"><div class=\\\"log\\\" data-log></div></main>")
+               (template &message [$m]
+        "<p class=\\\"bubble\\\">{@m.text}</p>"))
+      (binds [".log" (st/each @messages :as @m :template &message)]))
+    """
 
-    verdict = Live.define(pid, proposal)
-    assert verdict.status == :ok, "the proposal must be accepted: #{inspect(verdict)}"
+    verdict = Loop.run(pid, source, "prove the host is regenerated from the machine")
+    assert verdict.status == :ok, "the definition must be accepted: #{inspect(verdict)}"
 
     after_ = File.read!(host)
 
@@ -131,30 +117,18 @@ defmodule BeamLisp.Spell.HostRegenTest do
     # that, because the rule was known only to the host renderer. It is checked
     # where it is known, and stated in `machine-briefing` so a model is told
     # before it is refused.
-    {:ok, pid} = Live.start_link(out: out, name: nil)
+    {:ok, pid} = Loop.start_link(out: out, name: nil)
 
-    holed = %{
-      "kind" => "view",
-      "name" => "chat-view",
-      "rationale" => "a hole in the shell, which never interpolates",
-      "templates" => [
-        %{
-          "name" => "shell",
-          "html" =>
-            "<main class=\"chat\"><div class=\"log\" data-log></div>" <>
-              "<p class=\"note\">{@partial}</p></main>"
-        },
-        %{"name" => "message", "params" => ["m"], "html" => "<p class=\"bubble\">{@m.text}</p>"}
-      ],
-      "binds" => [
-        %{
-          "selector" => ".log",
-          "each" => %{"binding" => "messages", "as" => "m", "template" => "message"}
-        }
-      ]
-    }
+    holed = """
+    (defview chat-view
+      (markup (template &shell []
+        "<main class=\\\"chat\\\"><div class=\\\"log\\\" data-log></div><p class=\\\"note\\\">{@partial}</p></main>")
+               (template &message [$m]
+        "<p class=\\\"bubble\\\">{@m.text}</p>"))
+      (binds [".log" (st/each @messages :as @m :template &message)]))
+    """
 
-    verdict = Live.define(pid, holed)
+    verdict = Loop.run(pid, holed, "a hole in the shell, which never interpolates")
 
     assert verdict.status == :published_stale,
            "a shell hole ships as literal text; it must not be reported as a " <>

@@ -4,7 +4,7 @@ defmodule BeamLisp.Spell.Data do
 
   Everything a model, a browser or a socket sends crosses here, and nothing
   crosses anywhere else. Before this module there were two converters in each
-  direction — `to_bl/1` in `Spell.Live` and in `Spell.Server`, `bl_json/1` and
+  direction — `to_bl/1` in `Spell.Loop` (then `Spell.Live`) and in `Spell.Server`, `bl_json/1` and
   `plain/1` — and the two `to_bl`s had already diverged: one admitted
   `[a-z][a-z0-9_-]*`, the other `[a-zA-Z][a-zA-Z0-9_-]*`. Two copies of a
   security boundary that disagree are one boundary and one hole.
@@ -27,8 +27,8 @@ defmodule BeamLisp.Spell.Data do
 
   A beam-lisp `defn` is an ordinary Elixir function value:
 
-      {:ok, define} = BeamLisp.Env.fetch("spell.define", "define")
-      define.(machine, %{kind: "view", name: "clock", …})
+      {:ok, run} = BeamLisp.Env.fetch("spell.run", "run")
+      run.(machine, "(defview clock …)")
 
   So there is nothing to print, nothing to parse, and no source for a key to
   break out of. What is left is a data conversion, and a data conversion cannot
@@ -53,26 +53,13 @@ defmodule BeamLisp.Spell.Data do
   same question escaping asks, and it still ends in `String.to_atom/1` — making
   the atom table writable by whoever is talking to the model.
 
-  Instead: `to_bl/2` takes the set of names the reader understands
-  (`spell.define/proposal-keys`, which lives beside the `(get p :key)` calls it
-  describes). A key in that set converts to the keyword it names — already
-  interned, because the list is a compile-time constant of a loaded namespace.
-  A key outside it stays a STRING.
+  So there is no third mode: `:all_strings` keeps browser keys as strings, and
+  `:as_written` keeps OUR literal keys untouched. Nothing that crosses here
+  interns anything.
 
-  Staying a string is deliberate and is not a refusal. Two kinds of key arrive
-  and only one is closed:
-
-    * declared fields (`kind`, `templates`, `selector`) — a closed set, read as
-      keywords, converted;
-    * free-form map keys (CSS declarations under `rules`, push field names
-      under `fields`) — an open set by definition, read POSITIONALLY by the
-      emitters (`(keys m)` then print), so a string passes through untouched
-      and correct.
-
-  A hostile key is therefore neither interned nor evaluated: it becomes a
-  string key in a map nobody indexes by it, and rung 1 refuses the proposal for
-  the fields it is missing. Verified in `loop_test.exs` with the recorded
-  payload.
+  Model-written definitions never cross as maps at all anymore: the `run`
+  tool's payload is SOURCE TEXT, a plain string value, read (never evaluated)
+  by `spell.run`. The only maps that cross are ours and the browser's.
   """
 
   alias BeamLisp.Vector
@@ -80,17 +67,20 @@ defmodule BeamLisp.Spell.Data do
   @doc """
   Elixir data → beam-lisp values.
 
-  `keys` says how map KEYS cross, and the three modes correspond to the three
+  `keys` says how map KEYS cross, and the two modes correspond to the two
   kinds of key this system actually has:
 
   | mode | for | keys become |
   |---|---|---|
-  | a list of names | data a MODEL wrote, read by keyword (`spell.define`) | keyword if listed, else string |
   | `:all_strings` | data the BROWSER wrote, read by string (wire payloads, socket assigns) | string |
   | `:as_written` | data WE wrote in an Elixir literal (a provider message, a tool declaration) | unchanged |
 
+  (There used to be a third mode — a keyword vocabulary for data a MODEL
+  wrote, from the JSON-proposal era. The tool now carries source TEXT, which
+  crosses as a plain string value, so the vocabulary and its
+  `to_existing_atom` dance have no caller left.)
+
   ```
-  to_bl(%{"kind" => "view"}, ["kind"])       #=> %{kind: "view"}
   to_bl(%{"kind" => "view"}, :all_strings)   #=> %{"kind" => "view"}
   to_bl(%{role: "user"}, :as_written)        #=> %{role: "user"}
   ```
@@ -135,44 +125,6 @@ defmodule BeamLisp.Spell.Data do
   defp convert_key(key, :all_strings), do: to_string(key)
   defp convert_key(key, :as_written), do: key
 
-  # A declared key becomes the keyword it names. `String.to_existing_atom/1`,
-  # never `String.to_atom/1`: the guarantee is that this function CANNOT grow
-  # the atom table, and `to_existing_atom` enforces it rather than intending it.
-  #
-  # A raise here is a bug in the VOCABULARY, not in the data, and it is
-  # deliberately not rescued. It was: the rescue quietly fell back to a string,
-  # and that hid a real defect for a whole wave — `:rationale` was listed but
-  # never interned (nothing in `spell.define` writes it as a literal; it is
-  # built by `(keyword f)` at runtime), so every proposal carrying a rationale
-  # arrived with a STRING key, and rung 1 reported the field as missing while
-  # naming it in the message. A correct-looking rejection of a correct
-  # proposal, with no error anywhere.
-  #
-  # The vocabulary now spells its names as keywords, so loading the namespace
-  # interns them all and this cannot fire. If it ever does, it means a name was
-  # added to the list in a form that does not intern — which must be loud.
-  defp convert_key(key, keys) when is_list(keys) do
-    string = to_string(key)
-
-    if string in keys do
-      String.to_existing_atom(string)
-    else
-      string
-    end
-  rescue
-    ArgumentError ->
-      reraise ArgumentError,
-              [
-                message:
-                  "the proposal vocabulary lists #{inspect(to_string(key))} but nothing has " <>
-                    "interned it as an atom. Spell it as a keyword in " <>
-                    "spell.define/proposal-keys so loading the namespace interns it — " <>
-                    "otherwise the key silently stays a string and the reader sees a " <>
-                    "field that is not there."
-              ],
-              __STACKTRACE__
-  end
-
   @doc """
   beam-lisp values → plain Elixir data that survives `JSON.encode!/1`.
 
@@ -199,20 +151,4 @@ defmodule BeamLisp.Spell.Data do
     do: Map.new(map, fn {k, v} -> {to_string(from_bl(k)), from_bl(v)} end)
 
   def from_bl(other), do: other
-
-  @doc """
-  The vocabulary `spell.define` reads, as strings.
-
-  Read from the namespace itself rather than restated here. Restating it is
-  exactly how the two `to_bl` regexes drifted: two statements of one fact, and
-  nothing forcing them to agree. `spell.define/proposal-keys` sits beside the
-  `(get p :key)` calls it describes, so a field added to the reader and not to
-  the list is visible in one file.
-  """
-  def proposal_keys do
-    case BeamLisp.Env.fetch("spell.define", "proposal-keys") do
-      {:ok, keys} -> from_bl(keys)
-      :error -> raise "spell.define is not loaded — no proposal vocabulary to convert against"
-    end
-  end
 end
