@@ -778,7 +778,19 @@ defmodule BeamLisp.Spell.Loop do
         {:error, {:exit, reason}}
     after
       5_000 ->
-        Process.exit(pid, :brutal_kill)
+        # `:kill`, not `:brutal_kill`: Process.exit/2's only UNTRAPPABLE
+        # reason is `:kill` — source that set trap_exit before wedging would
+        # otherwise survive the signal. And AWAIT the DOWN: exit signals are
+        # async, so returning here without the DOWN would let the evaluator
+        # keep mutating the image after the loop already answered :rejected.
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _} -> :ok
+        after
+          1_000 -> :ok
+        end
+
         Process.demonitor(ref, [:flush])
         {:error, {:timeout, 5_000}}
     end
