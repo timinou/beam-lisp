@@ -36,6 +36,7 @@ defmodule BeamLisp.Spell.Persist do
   end
 
   def journal_path, do: Path.join(dir(), "journal.bl")
+  def vars_path, do: Path.join([dir(), "vars", "spell.vars.bl"])
   def transcript_path, do: Path.join(dir(), "transcript.json")
 
   @doc """
@@ -43,8 +44,17 @@ defmodule BeamLisp.Spell.Persist do
   line and a comment marker so the journal stays human-diffable — it is a
   project-local artifact the user is expected to read and, if needed, edit.
   """
-  def append_definition(source, rationale) do
-    File.mkdir_p!(dir())
+  def append_definition(source, rationale), do: append_entry(journal_path(), source, rationale)
+
+  @doc """
+  Append one accepted CODE definition (`defn`/`def`) to the vars journal —
+  `vars/spell.vars.bl`, replayed BEFORE the definitions journal at boot so a
+  view can reach for a fn the same session already taught the image.
+  """
+  def append_var(source, rationale), do: append_entry(vars_path(), source, rationale)
+
+  defp append_entry(path, source, rationale) do
+    File.mkdir_p!(Path.dirname(path))
 
     # One physical line: a rationale containing a newline would break out of
     # the comment and land as stray top-level text in the journal — readable
@@ -55,14 +65,19 @@ defmodule BeamLisp.Spell.Persist do
       "\n;; accepted #{DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()}" <>
         if(rationale == "", do: "", else: " — " <> rationale) <> "\n" <> String.trim(source) <> "\n"
 
-    File.write!(journal_path(), entry, [:append])
+    File.write!(path, entry, [:append])
     :ok
   end
 
   @doc "The journal's entries, oldest first. `[]` when there is no journal."
-  def journal do
-    case File.read(journal_path()) do
-      {:ok, text} -> parse_journal(text)
+  def journal, do: entries(journal_path())
+
+  @doc "The vars journal's entries, oldest first. `[]` when absent."
+  def vars, do: entries(vars_path())
+
+  defp entries(path) do
+    case File.read(path) do
+      {:ok, text} -> parse_journal(text, path)
       {:error, :enoent} -> []
     end
   end
@@ -78,14 +93,14 @@ defmodule BeamLisp.Spell.Persist do
   # not strand the boot: set it aside for manual recovery and start from the
   # seed. Refusing to boot over a state file would make persistence itself
   # the most dangerous file in the project.
-  defp parse_journal(text) do
+  defp parse_journal(text, path) do
     text
     |> BeamLisp.Compiler.read_all_data()
     |> Enum.map(&pr_str/1)
   rescue
     e in BeamLisp.Reader.SyntaxError ->
-      aside = journal_path() <> ".corrupt-#{System.unique_integer([:positive])}"
-      File.rename(journal_path(), aside)
+      aside = path <> ".corrupt-#{System.unique_integer([:positive])}"
+      File.rename(path, aside)
 
       require Logger
 

@@ -134,6 +134,25 @@ defmodule BeamLisp.Spell.Loop do
   defp replay_journal(%{persist: false} = state), do: state
 
   defp replay_journal(%{persist: true} = state) do
+    # VARS first: the definitions journal can carry a view whose binds call a
+    # fn the same session taught the image. Replay order is acceptance order
+    # across BOTH journals only by this convention — definitions never define
+    # code the vars journal needs (they can't: views are shape, not code).
+    Enum.each(BeamLisp.Spell.Persist.vars(), fn source ->
+      case fence_eval("(ns spell.vars)\n" <> source) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          require Logger
+
+          Logger.warning(
+            "spell.loop: a journaled VAR was refused at boot (fence rung): " <>
+              first_line(inspect(reason))
+          )
+      end
+    end)
+
     machine =
       Enum.reduce(BeamLisp.Spell.Persist.journal(), state.machine, fn source, machine ->
         case run_ladder(source, machine) do
@@ -287,7 +306,13 @@ defmodule BeamLisp.Spell.Loop do
     {verdict, state} = apply_source(source, rationale, state)
 
     if verdict.status == :ok and state.persist do
-      BeamLisp.Spell.Persist.append_definition(source, rationale)
+      # CODE journals apart from DEFINITIONS: different replay rung (fence
+      # vs ladder), different file (vars/ vs journal.bl), different order
+      # (vars replay first).
+      case verdict[:kind] do
+        "code" -> BeamLisp.Spell.Persist.append_var(source, rationale)
+        _other -> BeamLisp.Spell.Persist.append_definition(source, rationale)
+      end
     end
 
     {:reply, verdict, state}
@@ -686,52 +711,118 @@ defmodule BeamLisp.Spell.Loop do
     # construction: `spell.run/run` READS the text with the reader, classifies
     # by head symbol, and builds the term through the same `parse`/`parse-view`
     # an author's file takes.
-    ladder(bl("spell.run", "run", [machine, source]))
+    ladder(bl("spell.run", "run", [machine, source]), source)
   end
 
-  # Rungs 1–2 answered; run 3–4 against the CANDIDATE's page.
+  # Rungs 1–2 answered; run 3–5 against the CANDIDATE.
   #
   # `candidate` is a local, so a rejected one is unreachable the moment this
   # returns. It was a global var (`(def candidate …)`), which meant a refused
   # proposal stayed addressable from anywhere until the next one overwrote it.
-  defp ladder(candidate) do
-    if Map.get(candidate, :status) == :rejected do
-      {:error,
-       %{
-         status: :rejected,
-         rung: Map.get(candidate, :rung),
-         reason: inspect(Map.get(candidate, :reason))
-       }}
-    else
-      machine = Map.get(candidate, :machine)
+  defp ladder(candidate, source) do
+    cond do
+      Map.get(candidate, :status) == :rejected ->
+        {:error,
+         %{
+           status: :rejected,
+           rung: Map.get(candidate, :rung),
+           reason: inspect(Map.get(candidate, :reason))
+         }}
 
-      # Rungs 3–4 run against the page the CANDIDATE would produce, never the
-      # committed one: checking the current page would pass every proposal.
-      # The candidate is an `.edn` file in /tmp — NOT the served site dir:
-      # writing it there would make serve compile AND RELOAD browsers onto an
-      # unverified page. The filesystem is the publish channel; candidates
-      # stay off it, checked by the CLI.
-      page = Path.join(System.tmp_dir!(), "spell_candidate_#{System.unique_integer([:positive])}.edn")
+      Map.get(candidate, :kind) == "code" ->
+        fence_rung(candidate, source)
 
-      try do
-        # The bind selectors are handed to rung 4 so it judges OUR page rather
-        # than verse's runtime, which also ships `querySelector` calls.
-        selectors = Data.from_bl(bl("spell.live", "machine-bind-selectors", [machine]))
+      true ->
+        page_rungs(candidate)
+    end
+  end
 
-        with {:ok, _} <- Spell.Page.emit(machine, page),
-             {:ok, _} <- Spell.Verse.verify(page, selectors) do
-          {:ok, machine, bl("spell.live", "machine-report", [machine]),
-           %{kind: Map.get(candidate, :kind), name: Map.get(candidate, :name)}}
-        else
-          {:error, %{rung: rung, reason: reason}} ->
-            {:error, %{status: :rejected, rung: rung, reason: reason}}
+  # Rung 5 — CODE. Compile AND load the definition in a bounded, unlinked,
+  # monitored process before the verdict: a syntax error, a crashing macro
+  # expansion, or a wedging `(def x (loop …))` initializer dies THERE, and
+  # the loop is never blocked past the deadline. The process is separate;
+  # the var registry is the IMAGE's, so a successful eval IS the commit to
+  # the live image (the journal append happens in `handle_call`, as for
+  # every other kind). A failed eval can leave partial vars in the image —
+  # the registry is overwritten by the next accepted definition of the same
+  # name, and the journal only ever holds ACCEPTED sources, so replay still
+  # converges to exactly the accepted set.
+  #
+  # Task.async is the WRONG primitive here — it links the callee to the
+  # caller, so a callee dying before the yield trap window takes the loop
+  # down with it (spell.fence documents the same lesson, earned in-repo).
+  # spawn + monitor: the death arrives as a message, pattern-matched.
+  defp fence_rung(candidate, source) do
+    case fence_eval("(ns spell.vars)\n" <> source) do
+      :ok ->
+        {:ok, Map.get(candidate, :machine), Map.get(candidate, :report),
+         %{kind: Map.get(candidate, :kind), name: Map.get(candidate, :name)}}
 
-          {:error, reason} ->
-            {:error, %{status: :rejected, rung: :emit, reason: to_string(reason)}}
-        end
-      after
-        File.rm(page)
+      {:error, reason} ->
+        {:error, %{status: :rejected, rung: :fence, reason: inspect(reason)}}
+    end
+  end
+
+  defp fence_eval(source) do
+    parent = self()
+
+    {pid, ref} =
+      spawn_monitor(fn -> send(parent, {:fence_result, self(), safe_eval(source)}) end)
+
+    receive do
+      {:fence_result, ^pid, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        {:error, {:exit, reason}}
+    after
+      5_000 ->
+        Process.exit(pid, :brutal_kill)
+        Process.demonitor(ref, [:flush])
+        {:error, {:timeout, 5_000}}
+    end
+  end
+
+  defp safe_eval(source) do
+    BeamLisp.Compiler.eval_string(source)
+    :ok
+  rescue
+    e -> {:error, Exception.message(e)}
+  catch
+    kind, value -> {:error, {kind, value}}
+  end
+
+  # Rungs 3–4: the page the CANDIDATE would produce.
+  defp page_rungs(candidate) do
+    machine = Map.get(candidate, :machine)
+
+    # Rungs 3–4 run against the page the CANDIDATE would produce, never the
+    # committed one: checking the current page would pass every proposal.
+    # The candidate is an `.edn` file in /tmp — NOT the served site dir:
+    # writing it there would make serve compile AND RELOAD browsers onto an
+    # unverified page. The filesystem is the publish channel; candidates
+    # stay off it, checked by the CLI.
+    page = Path.join(System.tmp_dir!(), "spell_candidate_#{System.unique_integer([:positive])}.edn")
+
+    try do
+      # The bind selectors are handed to rung 4 so it judges OUR page rather
+      # than verse's runtime, which also ships `querySelector` calls.
+      selectors = Data.from_bl(bl("spell.live", "machine-bind-selectors", [machine]))
+
+      with {:ok, _} <- Spell.Page.emit(machine, page),
+           {:ok, _} <- Spell.Verse.verify(page, selectors) do
+        {:ok, machine, bl("spell.live", "machine-report", [machine]),
+         %{kind: Map.get(candidate, :kind), name: Map.get(candidate, :name)}}
+      else
+        {:error, %{rung: rung, reason: reason}} ->
+          {:error, %{status: :rejected, rung: rung, reason: reason}}
+
+        {:error, reason} ->
+          {:error, %{status: :rejected, rung: :emit, reason: to_string(reason)}}
       end
+    after
+      File.rm(page)
     end
   end
 
