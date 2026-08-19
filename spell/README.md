@@ -8,16 +8,26 @@ contract or view; a four-rung ladder either commits it into an accumulating
 machine or refuses with the compiler's own reason; an accepted definition
 re-emits the machine, rebuilds the page, and the browser reloads itself.
 
-```
-mix run scripts/demo.exs          # 6 asserted steps, no network
-mix run scripts/demo.exs --live   # the same scenario, driven by a real model
-mix run scripts/define_check.exs  # the verse rungs, proved in both directions
-mix beam_lisp.test                # 310 tests / 945 assertions
+The page you get on boot is the DEFAULT SHELL — one contract, one view, and
+alongside the chat a live-state panel (`spell.live-state`): the vars the live
+environment currently holds, refreshed on mount and on demand. The shell is
+where growth LANDS: a new contract's page half joins the same document, its
+server half the same LiveView module.
 
-scripts/serve_chat.sh [PORT]      # serve the page; it auto-reloads as the
-                                  # machine grows
+```
+mix run --no-halt scripts/serve_live.exs  # serve the default shell; it auto-reloads as
+                                  # the machine grows
+# the model's face: POST /spell/mcp — JSON-RPC, tools: run, state, transcript.
+# Point an MCP client (Claude Code: `claude mcp add`, mcp-remote, …) at it.
+
+mix beam_lisp.test                # the beam-lisp suites
 scripts/peek.sh [PORT] [OUT]      # screenshot + interface state + repl state
 ```
+
+The provider/cassette/credentials stack was deleted in W5: the model is
+EXTERNAL, driving the machine through the MCP face rather than being called
+from inside the image. (The narrative sections below predate that cut; their
+provider passages are history, not instructions.)
 
 Prerequisites, none optional:
 
@@ -25,8 +35,7 @@ Prerequisites, none optional:
 |---|---|---|
 | verse checkout (`~/code/ora/verse`, or `VERSE_ROOT`) | rungs 3–4 are the compiler | actionable error naming the path |
 | **release** binary: `cargo build --release --bin spacetime` | the loop calls it per definition; `cargo run` costs 10–30s each | "no spacetime binary" + the exact build command |
-| `.env` with a provider key | `--live` only | provider error in the transcript |
-| chrome/chromium (or `CHROME_BIN`) | the demo's DOM assertions | the step fails, naming it |
+| chrome/chromium (or `CHROME_BIN`) | scripts/peek.sh screenshots | the script fails, naming it |
 
 ### Providers
 

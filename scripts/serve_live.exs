@@ -24,7 +24,6 @@ defmodule ServeLive do
   alias BeamLisp.Spell
 
   def run do
-    load_env()
     :inets.start()
     :ssl.start()
 
@@ -129,17 +128,6 @@ defmodule ServeLive do
 
   # The current machine — asked of the process that owns it.
   defp machine, do: BeamLisp.Spell.Loop.machine()
-
-  # Provider credentials: the real environment, then `.env`, then the agent's
-  # credential db. Loaded here rather than by the provider so a run without
-  # credentials still SERVES the page — only `ask!` fails, into the contract's
-  # own `[:failed id why]` clause, which the page renders.
-  defp load_env do
-    case BeamLisp.Spell.Credentials.load() do
-      [] -> IO.puts("  (no credentials found — the page serves, but a turn will report a provider error)")
-      found -> Enum.each(found, fn {k, src} -> IO.puts("  #{k} ← #{src}") end)
-    end
-  end
 
   # A failure loud enough to stop the boot. A server that starts and prints a
   # URL has CLAIMED to work; the claim must be false only when the page is.

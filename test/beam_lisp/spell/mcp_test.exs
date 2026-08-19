@@ -122,4 +122,53 @@ defmodule BeamLisp.Spell.McpTest do
     conn = conn(:get, "/elsewhere")
     assert Mcp.call(conn, []) == conn
   end
+
+  test "GET on the endpoint is 405 with Allow: POST (no SSE transport)" do
+    conn = conn(:get, "/spell/mcp") |> Mcp.call([])
+    assert conn.status == 405
+    assert get_resp_header(conn, "allow") == ["POST"]
+  end
+
+  test "a browser origin that is not loopback is refused before the body is read" do
+    conn =
+      conn(:post, "/spell/mcp", ~s({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+      |> put_req_header("origin", "https://evil.example")
+      |> Mcp.call([])
+
+    assert conn.status == 403
+  end
+
+  test "loopback origins and no origin (curl, MCP hosts) pass" do
+    {:ok, _pid} = Loop.start_link(publish: false, persist: false)
+
+    for origin <- ["http://127.0.0.1:4173", "http://localhost:4000", nil] do
+      conn = conn(:post, "/spell/mcp", ~s({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+      conn = if origin, do: put_req_header(conn, "origin", origin), else: conn
+      assert Mcp.call(conn, []).status == 200
+    end
+  end
+
+  test "a notification naming an unknown method gets 202, not an error body" do
+    body = ~s({"jsonrpc":"2.0","method":"no.such/method"})
+
+    conn =
+      conn(:post, "/spell/mcp", body)
+      |> put_req_header("content-type", "application/json")
+      |> Mcp.call([])
+
+    assert conn.status == 202
+  end
+
+  test "id:null is -32600, answered with id null" do
+    conn = rpc("tools/list", %{}, nil)
+    decoded = JSON.decode!(conn.resp_body)
+    assert decoded["error"]["code"] == -32600
+    assert Map.has_key?(decoded, "id")
+  end
+
+  test "tools/call with malformed params is -32602, not -32601" do
+    {:ok, _pid} = Loop.start_link(publish: false, persist: false)
+    conn = rpc("tools/call", %{"name" => 42})
+    assert JSON.decode!(conn.resp_body)["error"]["code"] == -32602
+  end
 end

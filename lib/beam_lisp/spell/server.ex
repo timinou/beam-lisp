@@ -10,7 +10,7 @@ defmodule BeamLisp.Spell.Server do
         → spell.server/handle          (walks the contract body)
         → apply assigns to the socket  (the bridge pushes the diff)
         → push declared effects        (Spacetime.LiveView.push_event)
-        → start a provider turn if the body asked for one
+        → answer an (ask! …) if the body asked for one  (the pointer to the MCP face)
         → {:reply, %{tag:, reply:}, socket}
 
   Nothing here knows what a chat is. Every name — `send`, `messages`, `token` —
@@ -265,36 +265,36 @@ defmodule BeamLisp.Spell.Server do
   defp push_all(socket, _), do: socket
 
   # `(ask! text)` recorded a request; performing it is the caller's job because
-  # the caller is the process the answer must come back to. `stream-async` spawns
-  # UNLINKED (its own doc explains why: a provider that dies mid-answer must not
-  # take the page with it) and sends `[:delta id chunk]`, `[:done id]` or
-  # `[:failed id why]` — the exact messages the contract's `on-info` clauses
-  # already describe.
+  # the caller is the process the answer must come back to.
   defp maybe_ask(socket, _contract, nil), do: socket
 
   defp maybe_ask(socket, _contract, text) do
-    # THE JOIN. `(ask! text)` goes to the LOOP — the process that owns the
-    # machine, offers `run`, and walks the four rungs — not to the provider.
-    #
-    # It used to call `stream-async` directly with `(from-env)`, a cfg carrying
-    # no `:tools`, so the model talking to a BROWSER was structurally
-    # incapable of proposing anything. The loop that could propose was
-    # reachable only from a script. Two programs, one capability, and the half
-    # a human can see was the half without it — which is why "the live chat
-    # cannot build its own interface" was true while every test passed.
-    #
-    # There is deliberately NO no-loop fallback: it answered WITHOUT tools,
-    # which meant the browser path silently degraded into the exact half-join
-    # this paragraph describes — a page that talks but cannot build. If the
-    # loop is not running, that is a deployment bug, and it fails LOUDLY here
-    # rather than as a page that politely does nothing.
-    #
-    # The messages come back to `self()`, this LiveView's pid, and every one of
-    # them is already described by the contract's `on-info` clauses. That is
-    # what makes this a one-line change rather than a transport: a verdict
-    # arrives the same way a token does.
+    # THE JOIN MOVED OUT (W5). There is no in-image model anymore: a model
+    # drives this machine through the MCP face at /spell/mcp, and the page's
+    # `(ask! text)` gets the honest answer — where the model lives now —
+    # instead of a simulated turn. The pair is recorded in the loop's
+    # transcript (so it survives the rebuild the answer describes), and the
+    # answer reaches the page through the SAME messages a streamed turn used:
+    # a tuple here is the vector the contract's `on-info` clauses describe.
+    answer =
+      "the model is external now: connect an MCP client to POST /spell/mcp " <>
+        "(tools: run, state, transcript) — that socket is how this machine grows."
+
+    id = "m#{System.unique_integer([:positive])}"
+
     true = loop_running?()
-    BeamLisp.Spell.Loop.ask_async(BeamLisp.Spell.Loop, text, self())
+
+    # The call can still exit — the loop can die after the check, or be busy
+    # in a ladder run past the timeout. The failure becomes a message the
+    # contract renders, never a crashed LiveView.
+    try do
+      BeamLisp.Spell.Loop.say_pair(BeamLisp.Spell.Loop, text, answer)
+      send(self(), {:delta, id, answer})
+      send(self(), {:done, id})
+    catch
+      :exit, reason ->
+        send(self(), {:failed, id, "the loop did not answer: #{inspect(reason)}"})
+    end
 
     socket
   end
@@ -309,8 +309,8 @@ defmodule BeamLisp.Spell.Server do
     |> Map.new(fn {k, v} -> {to_string(k), v} end)
   end
 
-  # A provider message is an Erlang tuple; the contract's patterns are vectors.
-  # One shape crosses, and it is the contract's.
+  # An info message arrives as an Erlang tuple; the contract's patterns are
+  # vectors. One shape crosses, and it is the contract's.
   defp message_vector(message) when is_tuple(message), do: Tuple.to_list(message)
   defp message_vector(message) when is_list(message), do: message
   defp message_vector(message), do: [message]

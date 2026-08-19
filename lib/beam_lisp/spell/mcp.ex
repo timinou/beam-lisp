@@ -49,10 +49,32 @@ defmodule BeamLisp.Spell.Mcp do
   def init(opts), do: opts
 
   @impl true
-  def call(%{path_info: ["spell", "mcp"], method: "POST"} = conn, _opts) do
+  def call(%{path_info: ["spell", "mcp"]} = conn, _opts) do
+    cond do
+      # Streamable HTTP's MUST: a server without auth (this one — loopback is
+      # the whole boundary) validates Origin on every request, or a browser on
+      # a hostile page (DNS rebinding makes even loopback reachable) could call
+      # `run`. Absent Origin is a non-browser client — curl, an MCP host — and
+      # is allowed; present-and-not-loopback is refused.
+      not origin_ok?(conn) ->
+        conn |> send_resp(403, "untrusted origin") |> halt()
+
+      # The transport is POST-only (no SSE): GET gets 405 + Allow, per spec.
+      conn.method != "POST" ->
+        conn |> put_resp_header("allow", "POST") |> send_resp(405, "POST only") |> halt()
+
+      true ->
+        handle_post(conn)
+    end
+  end
+
+  def call(conn, _opts), do: conn
+
+  defp handle_post(conn) do
     {:ok, body, conn} = read_body(conn)
 
     with {:ok, %{"jsonrpc" => "2.0", "method" => method} = msg} <- JSON.decode(body),
+         :ok <- valid_id(msg),
          {:ok, reply} <- dispatch(method, msg) do
       respond(conn, msg, reply)
     else
@@ -61,7 +83,14 @@ defmodule BeamLisp.Spell.Mcp do
         conn |> send_resp(202, "") |> halt()
 
       {:error, %{"code" => _} = err} ->
-        respond_error(conn, msg_id_or_nil(body), err)
+        # A notification (NO id key) gets no response — not even to an error:
+        # the sender asked for none. An id of null DID ask (it is the invalid
+        # id valid_id rejects), and JSON-RPC answers those with id: null.
+        case JSON.decode(body) do
+          {:ok, msg} when not is_map_key(msg, "id") -> conn |> send_resp(202, "") |> halt()
+          {:ok, %{"id" => id}} -> respond_error(conn, id, err)
+          _ -> respond_error(conn, nil, err)
+        end
 
       _ ->
         respond_error(conn, nil, %{
@@ -71,7 +100,16 @@ defmodule BeamLisp.Spell.Mcp do
     end
   end
 
-  def call(conn, _opts), do: conn
+  # JSON-RPC request ids are string or integer; MCP 2025-03-26 forbids null.
+  # A message with NO id is a notification (handled by respond/2's fallback);
+  # a message with id:null gets -32600, and the error reply carries id:null,
+  # which is the one place JSON-RPC reserves that spelling.
+  defp valid_id(%{"id" => nil}) do
+    {:error, %{"code" => -32600, "message" => "invalid request: id must be a string or integer"}}
+  end
+
+  defp valid_id(%{"id" => id}) when is_binary(id) or is_integer(id), do: :ok
+  defp valid_id(_no_id), do: :ok
 
   # ── dispatch ──────────────────────────────────────────────────────────────
 
@@ -94,6 +132,15 @@ defmodule BeamLisp.Spell.Mcp do
       {:ok, text} -> {:ok, %{"content" => [%{"type" => "text", "text" => text}]}}
       {:error, text} -> {:ok, %{"content" => [%{"type" => "text", "text" => text}], "isError" => true}}
     end
+  end
+
+  defp dispatch("tools/call", %{"params" => %{"name" => name}}) when is_binary(name) do
+    # `arguments` is optional per the spec; a call without it means {}.
+    dispatch("tools/call", %{"params" => %{"name" => name, "arguments" => %{}}})
+  end
+
+  defp dispatch("tools/call", _malformed) do
+    {:error, %{"code" => -32602, "message" => "invalid params: tools/call wants {name, arguments}"}}
   end
 
   defp dispatch(other, _msg) do
@@ -152,8 +199,15 @@ defmodule BeamLisp.Spell.Mcp do
   end
 
   defp call_tool(name, args) do
+    # The whereis-then-call race is handled, not checked away: the loop can
+    # exit between ANY availability check and the call, so the call itself is
+    # what is guarded. A dead loop is a clean isError, never a crashed conn.
     if Process.whereis(Loop) do
-      do_call_tool(name, args)
+      try do
+        do_call_tool(name, args)
+      catch
+        :exit, reason -> {:error, "the loop did not answer: #{inspect(reason)}"}
+      end
     else
       {:error,
        "the loop is not running — nothing to grow. Start BeamLisp.Spell.Loop first."}
@@ -233,10 +287,26 @@ defmodule BeamLisp.Spell.Mcp do
     |> halt()
   end
 
-  defp msg_id_or_nil(body) do
-    case JSON.decode(body) do
-      {:ok, %{"id" => id}} -> id
-      _ -> nil
+
+  # The whole boundary: no Origin header (curl, an MCP host process — not a
+  # browser) or a loopback origin. Anything else is a browser on a page we did
+  # not serve, and browsers are the only clients that send Origin on POST.
+  defp origin_ok?(conn) do
+    case get_req_header(conn, "origin") do
+      [] -> true
+      [origin] -> loopback_origin?(origin)
+      _ -> false
+    end
+  end
+
+  defp loopback_origin?(origin) do
+    case URI.parse(origin) do
+      %{host: host, scheme: scheme}
+      when scheme in ["http", "https"] and host in ["127.0.0.1", "localhost", "::1", "[::1]"] ->
+        true
+
+      _ ->
+        false
     end
   end
 end

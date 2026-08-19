@@ -40,8 +40,7 @@ defmodule BeamLisp.Spell.PersistTest do
     {:ok, first} = Loop.start_link(name: nil, publish: false, persist: true)
 
     assert %{status: :ok} = Loop.run(first, @view_src, "a clock in the log")
-    GenServer.call(first, {:record_user, "add a clock"})
-    GenServer.call(first, {:record_model, "done — the clock is live"})
+    Loop.say_pair(first, "add a clock", "done — the clock is live")
     GenServer.stop(first)
 
     # The journal holds the SOURCE, in the file a user can read and diff.

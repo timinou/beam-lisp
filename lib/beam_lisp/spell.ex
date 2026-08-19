@@ -2,10 +2,10 @@ defmodule BeamLisp.Spell do
   @moduledoc """
   Loading the `spell/` application from Elixir.
 
-  `spell/src/spell/*.bl` holds the machinery the chat loop is built from —
-  `spell.seam`, `spell.contract`, `spell.machine`, `spell.provider`, and the
-  seed definition `spell.seed`. Elixir-side consumers (scripts, ExUnit suites)
-  need those namespaces loaded before they can call into them.
+  `spell/src/spell/*.bl` holds the machinery the live machine is built from —
+  `spell.seam`, `spell.contract`, `spell.machine`, and the default shell
+  (`spell.seed`, `spell.live-state`). Elixir-side consumers (scripts, ExUnit
+  suites) need those namespaces loaded before they can call into them.
 
   This exists so exactly ONE place knows where spell lives. The previous shape
   was `for f <- ~w(seam contract chat), do: eval_string(File.read!("priv/\#{f}.bl"))`
