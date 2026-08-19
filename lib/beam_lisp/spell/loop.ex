@@ -57,7 +57,52 @@ defmodule BeamLisp.Spell.Loop do
   use GenServer
 
   alias BeamLisp.Spell
-  alias BeamLisp.Spell.Data
+  alias BeamLisp.Spell.{Data, Provider}
+
+  @max_attempts 3
+  @tool_name "run"
+
+  # ── the tool the model is offered ─────────────────────────────────────────
+  #
+  # One tool, one argument that matters: SOURCE — the very `(defcontract …)` /
+  # `(defview …)` / `(defn …)` text a human author would write. ONE definition
+  # of the schema: `Spell.Mcp` adapts this same map for the MCP face, so the
+  # chat path and the agent path cannot drift apart in what they teach.
+  def run_tool do
+    %{
+      type: "function",
+      function: %{
+        name: @tool_name,
+        description:
+          "Grow the machine. Takes a definition's SOURCE — the same text a " <>
+            "human author writes: `(defcontract name (assign @x :type init) " <>
+            "(on :ev [param] (ok …)) …)` for server state and events, " <>
+            "`(defview name (markup (template &shell [] [:div …]) …) (style " <>
+            "[selector {rules}] …) (binds [selector (st/each @xs :as @x " <>
+            ":template &row)] …))` for markup, style and bindings, and the " <>
+            "code heads `(defn name [args] body)` / `(def name value)` for " <>
+            "functions and values (they land in `spell.vars`). The source " <>
+            "walks the validation ladder — read, machine, verse compile, " <>
+            "ghost selectors, fence for code — and the verdict comes back " <>
+            "with the rung named. A rejection leaves the machine unchanged; " <>
+            "an acceptance rebuilds the page immediately.",
+        parameters: %{
+          type: "object",
+          required: ["source", "rationale"],
+          properties: %{
+            source: %{
+              type: "string",
+              description: "ONE definition form, exactly as an author writes it."
+            },
+            rationale: %{
+              type: "string",
+              description: "One sentence: why. It is journaled with the definition."
+            }
+          }
+        }
+      }
+    }
+  end
 
   # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -188,21 +233,58 @@ defmodule BeamLisp.Spell.Loop do
   def run(server \\ __MODULE__, source, rationale \\ ""),
     do: GenServer.call(server, {:run, source, rationale}, 120_000)
 
-  @doc """
-  Record a question and its answer in the transcript, as one indivisible pair.
-
-  This is the page's whole write access to the transcript since W5 moved the
-  model out of the image: a served page can ASK (`(ask! text)` in a handler),
-  and `Spell.Server.maybe_ask/3` answers with the pointer to the MCP face.
-  Growing the machine is `run/3`, and nothing else writes here.
-  """
-  def say_pair(server \\ __MODULE__, question, answer) do
-    GenServer.call(server, {:say_pair, question, answer}, 30_000)
-  end
-
   @doc "Rebuild the page and bump the version, without changing the machine."
   def rebuild(server \\ __MODULE__), do: GenServer.call(server, :rebuild, 120_000)
 
+
+  @doc """
+  Start a turn for a LiveView, streaming the answer back to `reply_to`.
+
+  ## The messages
+
+  Sent to `reply_to`, and every one of them is already described by the seed
+  contract's `on-info` clauses — which is why this needs no second transport:
+
+      [:delta id chunk]     content arriving, token by token
+      [:defined id text]    a proposal was accepted; the page should reload
+      [:done id]            the turn ended
+      [:failed id why]      it did not
+
+  ## Why a spawned process
+
+  The LiveView must not block: a turn is a network round trip plus, when the
+  model proposes, seconds of verse. The spawned process absorbs both; the
+  ladder itself runs back INSIDE this GenServer (`{:run, …}`), because the
+  machine is this process's state and definitions must be serialised.
+
+  UNLINKED: a provider that dies mid-answer must not take the page down with
+  it. The failure is reported as `[:failed …]` instead, which the contract
+  renders.
+  """
+  def ask_async(server \\ __MODULE__, text, reply_to) do
+    id = "m#{System.unique_integer([:positive])}"
+
+    # EVERYTHING that can block runs in the spawned process, including the two
+    # calls into the loop: a ladder run holds the loop for seconds, and a
+    # `GenServer.call` to a dead or busy loop from the LIVEVIEW would freeze
+    # or kill the page.
+    spawn(fn -> start_turn(server, text, reply_to, id) end)
+    id
+  end
+
+  # A turn, from the spawned process: ask the loop what to send, then stream.
+  #
+  # Wrapped so that NOTHING can leave the page without an answer: a crash here
+  # — the loop down, a timeout — would otherwise strand the page's thinking
+  # indicator forever, a state indistinguishable from a slow model.
+  defp start_turn(server, text, reply_to, id) do
+    cfg = GenServer.call(server, :turn_cfg, 30_000)
+    messages = GenServer.call(server, {:record_user, text}, 30_000)
+    run_turn(server, cfg, messages, reply_to, id)
+  catch
+    kind, reason ->
+      send(reply_to, {:failed, id, "the turn could not start: #{inspect({kind, reason})}"})
+  end
 
   # ── handlers ──────────────────────────────────────────────────────────────
 
@@ -238,13 +320,23 @@ defmodule BeamLisp.Spell.Loop do
     {:reply, :ok, publish(state)}
   end
 
-  # A question-and-answer pair, recorded in one call because they must not
-  # interleave: two tabs asking at once would otherwise land four turns in an
-  # order neither tab said them. This is the whole of the page's write access
-  # to the transcript now that the model is external (W5): the page can ASK,
-  # and the answer is the pointer to /spell/mcp — growing is `run`, below.
-  def handle_call({:say_pair, question, answer}, _from, state) do
-    {:reply, :ok, state |> say(:user, question) |> say(:model, answer)}
+  # The cfg a turn runs with: the configured provider PLUS the run tool.
+  # Handed out rather than rebuilt by the caller, so "what the model may do"
+  # has one definition.
+  def handle_call(:turn_cfg, _from, state), do: {:reply, turn_cfg(), state}
+
+  # Record the user's turn and answer with the conversation to send. Both in
+  # one call because they must not interleave: two tabs sending at once would
+  # otherwise each build a history missing the other's message.
+  def handle_call({:record_user, text}, _from, state) do
+    state = say(state, :user, text)
+    {:reply, provider_messages(state, text), state}
+  end
+
+  # A streamed turn's own answer, recorded when it ends. The spawned process
+  # owns the streaming; the transcript stays here, where the machine is.
+  def handle_call({:record_model, text}, _from, state) do
+    {:reply, :ok, say(state, :model, text)}
   end
 
   # ── verdicts ──────────────────────────────────────────────────────────────
@@ -331,6 +423,191 @@ defmodule BeamLisp.Spell.Loop do
     |> String.split("\n")
     |> List.first()
     |> String.slice(0, 300)
+  end
+
+  # ── the turn ──────────────────────────────────────────────────────────────
+  #
+  # Ask the model; if it calls the tool, run the ladder and answer with the
+  # verdict; repeat while it keeps proposing, bounded by attempts. The bound is
+  # not a nicety: a model that keeps proposing the same rejected definition
+  # would otherwise loop until the deadline.
+  @doc """
+  The provider cfg a turn runs with: the configured provider PLUS `run`.
+
+  ONE definition of what the model may do — the MCP face adapts this same
+  `run_tool/0` map, so the chat and the agent cannot drift apart.
+  """
+  def turn_cfg do
+    Map.put(Provider.from_env(), :tools, [run_tool()])
+  end
+
+  # A turn, run in the spawned process. The TURN process is the httpc
+  # receiver (see Provider.stream_start/2): no second process exists to leak
+  # or to orphan the stream. Frames are parsed as they arrive; deltas forward
+  # to the page immediately; a tool call is held back — the ladder answers it,
+  # and the page sees the verdict, never the proposal's plumbing.
+  defp run_turn(server, cfg, messages, reply_to, id, attempts_left \\ @max_attempts) do
+    cond do
+      not Provider.configured?(cfg) ->
+        send(reply_to, {:failed, id,
+         "no provider key — PROVIDER selects the provider, <NAME>_API_KEY is the key " <>
+           "(a repo-root .env is sourced for unset vars)"})
+
+      true ->
+        case Provider.stream_start(cfg, messages) do
+          {:ok, ref} -> collect(server, cfg, messages, reply_to, id, ref, "", [], %{}, attempts_left)
+          {:error, why} -> send(reply_to, {:failed, id, to_string(why)})
+        end
+    end
+  end
+
+  defp collect(server, cfg, messages, reply_to, id, ref, buf, acc, tools, attempts_left) do
+    receive do
+      {:http, {^ref, :stream_start, _headers}} ->
+        collect(server, cfg, messages, reply_to, id, ref, buf, acc, tools, attempts_left)
+
+      {:http, {^ref, :stream, bin}} ->
+        {events, rest} = Provider.parse_frame(buf, IO.iodata_to_binary(bin))
+        {acc, tools} = apply_events(events, reply_to, id, acc, tools)
+        collect(server, cfg, messages, reply_to, id, ref, rest, acc, tools, attempts_left)
+
+      {:http, {^ref, :stream_end, _headers}} ->
+        if map_size(tools) > 0 do
+          calls = tools |> Enum.sort() |> Enum.map(fn {_idx, call} -> call end)
+          handle_tool_calls(server, cfg, messages, reply_to, id, calls, attempts_left)
+        else
+          finish(server, reply_to, id, acc)
+        end
+
+      {:http, {^ref, {:error, why}}} ->
+        send(reply_to, {:failed, id, "the provider stream failed: #{inspect(why)}"})
+    after
+      # A provider that accepts a connection and then stalls is the failure
+      # this system must survive: without a deadline the turn waits forever
+      # and the page's thinking indicator never stops.
+      180_000 ->
+        send(reply_to, {:failed, id, "the provider did not answer within 180s"})
+    end
+  end
+
+  # Events onto the turn's accumulators. Deltas stream to the page AS THEY
+  # ARRIVE; tool-call fragments accumulate by index (the name arrives once,
+  # the arguments in chunks — that is the OpenAI streaming shape).
+  defp apply_events(events, reply_to, id, acc, tools) do
+    Enum.reduce(events, {acc, tools}, fn
+      {:delta, chunk}, {acc, tools} ->
+        send(reply_to, {:delta, id, chunk})
+        {[chunk | acc], tools}
+
+      {:tool_delta, idx, name, args_chunk}, {acc, tools} ->
+        call =
+          tools
+          |> Map.get(idx, %{"name" => nil, "arguments" => ""})
+          |> then(fn c -> if name, do: Map.put(c, "name", name), else: c end)
+          |> Map.update!("arguments", &(&1 <> (args_chunk || "")))
+
+        {acc, Map.put(tools, idx, call)}
+
+      _finish_done_or_ignore, state ->
+        state
+    end)
+  end
+
+  defp finish(server, reply_to, id, acc) do
+    text = acc |> Enum.reverse() |> Enum.join()
+
+    # An answer the page assembled must also reach the TRANSCRIPT, or the next
+    # turn is sent a conversation missing its own last reply. But `[:done …]`
+    # is sent WHATEVER happens to that record: a failed bookkeeping call must
+    # not cost the user their answer AND leave the thinking indicator
+    # spinning.
+    try do
+      if text != "", do: GenServer.call(server, {:record_model, text}, 30_000)
+    catch
+      kind, reason ->
+        require Logger
+        Logger.warning("spell.loop: the transcript did not record a turn: #{inspect({kind, reason})}")
+    end
+
+    send(reply_to, {:done, id})
+  end
+
+  # Every call in the turn, walked through the ladder in order.
+  #
+  # The verdict is sent as `[:defined …]` — named for the EVENT (a definition
+  # was decided), not the outcome; the text carries ✓ or ✗. A refusal is
+  # deliberately NOT `[:failed …]`: the turn did not fail, the proposal did,
+  # and the difference is what the user needs to read. The transcript copy of
+  # the verdict is recorded by `{:run}` itself — one place, so the MCP face
+  # and the chat face tell the same story.
+  defp handle_tool_calls(server, cfg, messages, reply_to, id, calls, attempts_left) do
+    verdicts =
+      for call <- calls do
+        # A ladder that crashes is reported, not propagated: the turn dying
+        # here would take `[:done …]` with it and strand the page.
+        verdict =
+          try do
+            GenServer.call(server, {:run, parse_arguments(call), parse_rationale(call)}, 300_000)
+          catch
+            kind, reason ->
+              %{status: :error, rung: :loop, reason: inspect({kind, reason})}
+          end
+
+        send(reply_to, {:defined, id, verdict_line(verdict, parse_rationale(call))})
+        verdict
+      end
+
+    retry_or_finish(server, cfg, messages, reply_to, id, verdicts, attempts_left)
+  end
+
+  # A refused proposal is fed BACK to the model, with the failing rung and the
+  # diagnostic, up to `@max_attempts` times. The retry runs in THIS process,
+  # which is already the spawned turn, so the page keeps streaming and the
+  # LiveView still never blocks.
+  defp retry_or_finish(server, cfg, messages, reply_to, id, verdicts, attempts_left) do
+    rejected = Enum.reject(verdicts, &(&1.status == :ok))
+
+    cond do
+      rejected == [] ->
+        finish(server, reply_to, id, [])
+
+      attempts_left <= 1 ->
+        # The budget is the loop's only protection against a model that
+        # proposes forever, and the user is TOLD it ran out rather than left
+        # with a silent last refusal.
+        text = "no definition accepted after #{@max_attempts} attempts — the machine is unchanged"
+        record_model_turn(server, text)
+        send(reply_to, {:defined, id, text})
+        finish(server, reply_to, id, [])
+
+      true ->
+        # Verse's own text, verbatim: it names lines and codes, and the model
+        # has been trained on far more compiler output than on our prose.
+        prompt = retry_prompt(hd(rejected))
+
+        # A retry is not something the USER said, and it must not reach the
+        # transcript the page renders — so it is appended to the message list
+        # going to the provider, not recorded in the loop.
+        run_turn(server, cfg, messages ++ [%{role: "user", content: prompt}], reply_to, id, attempts_left - 1)
+    end
+  end
+
+  # Record a model turn, tolerating a loop that cannot answer. Losing the
+  # record costs the next turn some context, and must never cost this turn
+  # its `[:done …]`.
+  defp record_model_turn(server, text) do
+    GenServer.call(server, {:record_model, text}, 30_000)
+  catch
+    kind, reason ->
+      require Logger
+      Logger.warning("spell.loop: a turn did not reach the transcript: #{inspect({kind, reason})}")
+  end
+
+  # A rejection, phrased for the model: the rung that refused and the
+  # diagnostic, verbatim.
+  defp retry_prompt(verdict) do
+    "The definition was rejected at the #{verdict[:rung]} rung: " <>
+      "#{inspect(verdict[:reason])}. Fix it and call #{@tool_name} again."
   end
 
   # ── the ladder, all four rungs ────────────────────────────────────────────
@@ -681,6 +958,63 @@ defmodule BeamLisp.Spell.Loop do
   end
 
   # ── plumbing ──────────────────────────────────────────────────────────────
+
+  # What the provider sees: the user-visible conversation only — verdicts and
+  # system notes are for the human reading the page (feeding a model its own
+  # rejected proposals as prose, on top of the tool result it already got,
+  # doubles them). The briefing goes FIRST, rebuilt from the CURRENT machine on
+  # every turn: the machine is the thing being edited, so a view accepted this
+  # turn must appear in the next turn's briefing.
+  defp provider_messages(state, text) do
+    conversation =
+      state.transcript
+      |> Enum.reverse()
+      |> Enum.filter(&(&1.role in [:user, :model]))
+      |> Enum.map(&%{role: to_role(&1.role), content: to_string(&1.content)})
+      |> conversation(text)
+
+    [%{role: "system", content: bl("spell.live", "machine-briefing", [state.machine])} | conversation]
+  end
+
+  @doc """
+  A transcript plus the current turn, as the provider wants it.
+
+  A turn is appended unless the history ALREADY ends with it. Comparing only
+  the tail is deliberate: a user who genuinely types "yes" twice in a row has
+  said two things, and a whole-history filter silently eats the second.
+  """
+  def conversation(history, text) do
+    turn = %{role: "user", content: to_string(text)}
+    if List.last(history) == turn, do: history, else: history ++ [turn]
+  end
+
+  # The contract says `model` (what the page shows); every OpenAI-shaped API
+  # says `assistant`. Translated at this boundary and nowhere else.
+  defp to_role(:model), do: "assistant"
+  defp to_role("model"), do: "assistant"
+  defp to_role(other), do: to_string(other)
+
+  # Tool-call arguments arrive as a JSON string (the provider's tool channel
+  # is JSON); an undecodable payload becomes a source that rung 1 refuses
+  # with a reason rather than a crash.
+  defp parse_arguments(%{"arguments" => args}) when is_binary(args) do
+    case JSON.decode(args) do
+      {:ok, %{"source" => source}} when is_binary(source) -> source
+      {:ok, other} -> "undecodable tool call: " <> inspect(other)
+      {:error, _} -> "undecodable tool call: " <> args
+    end
+  end
+
+  defp parse_arguments(other), do: "undecodable tool call: " <> inspect(other)
+
+  defp parse_rationale(%{"arguments" => args}) when is_binary(args) do
+    case JSON.decode(args) do
+      {:ok, %{"rationale" => rationale}} when is_binary(rationale) -> rationale
+      _ -> ""
+    end
+  end
+
+  defp parse_rationale(_other), do: ""
 
   # A var's VALUE, for the vars that are terms rather than functions.
   defp var(ns, name), do: BeamLisp.Env.fetch!(ns, name)

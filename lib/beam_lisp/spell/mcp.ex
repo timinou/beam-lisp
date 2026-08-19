@@ -1,25 +1,24 @@
 defmodule BeamLisp.Spell.Mcp do
   @moduledoc """
-  The model's face: the loop, exposed as an MCP server.
+  The agent's face: the loop, exposed as an MCP server.
 
-  W5 moved the model OUT of the image. The provider/cassette/credentials
-  stack answered "how does this VM call an LLM API" — and the answer was
-  hundreds of lines of auth, streaming, retry and recording machinery for a
-  problem the host already solved: every serious model client (Claude Code,
-  Tidewave's own audience, mcp-remote) already speaks MCP. So the loop stops
-  DRIVING a model and starts ANSWERING one.
+  The CHAT is the main interaction — the page talks to a model in-process
+  (Spell.Provider + the loop's turn machinery) — but a second front door
+  exists for external model clients (Claude Code, mcp-remote): the same
+  ladder, the same `run`, over JSON-RPC.
 
   Three tools, which is the whole surface a growing machine needs:
 
     * `run`        — the one verb: definition SOURCE in, the ladder's verdict
-                     out. Identical to `Spell.Loop.run/3`, because it IS it.
+                     out. Identical to `Spell.Loop.run/3`, because it IS it;
+                     the tool schema is adapted from `Loop.run_tool/0` so the
+                     two faces cannot drift apart in what they teach.
     * `state`      — the machine's report: what exists, what it noticed.
     * `transcript` — the conversation so far.
 
   The briefing — what the model must know about the machine it is editing —
   rides in `initialize`'s `instructions` field, computed FROM THE MACHINE at
-  session start, so it cannot describe a system that changed underneath it
-  (the rule live.bl's machine-briefing established; same function).
+  session start, so it cannot describe a system that changed underneath it.
 
   ## Protocol scope, honestly
 
@@ -31,12 +30,13 @@ defmodule BeamLisp.Spell.Mcp do
 
   ## Safety
 
-  This endpoint is loopback-only by mount (the endpoint binds 127.0.0.1) and
-  carries NO authentication, like Tidewave: the threat model is the
-  operator's own machine. What it does NOT expose matters more: there is no
-  eval here. The only write path is `run`, and `run` walks the ladder —
-  read, machine, verse, ghosts, fence — the same five rungs regardless of
-  whether the source came from a browser, a script, or this socket.
+  This endpoint is loopback-only by mount (the endpoint binds 127.0.0.1),
+  validates Origin per the Streamable HTTP MUST, and carries NO
+  authentication: the threat model is the operator's own machine. What it
+  does NOT expose matters more: there is no eval here. The only write path
+  is `run`, and `run` walks the ladder — read, machine, verse, ghosts,
+  fence — the same rungs regardless of whether the source came from the
+  chat, this socket, or a script.
   """
 
   @behaviour Plug
@@ -150,36 +150,15 @@ defmodule BeamLisp.Spell.Mcp do
   # ── the tools ─────────────────────────────────────────────────────────────
 
   defp tools do
+    # The `run` tool is ADAPTED from the loop's own definition — one schema,
+    # two faces, no drift.
+    run = Loop.run_tool().function
+
     [
       %{
-        "name" => "run",
-        "description" =>
-          "Grow the machine. Takes a definition's SOURCE — the same text a " <>
-            "human author writes: `(defcontract name (assign @x :type init) " <>
-            "(on :ev [param] (ok …)) …)` for server state and events, " <>
-            "`(defview name (markup (template &shell [] [:div …]) …) (style " <>
-            "[selector {rules}] …) (binds [selector (st/each @xs :as @x " <>
-            ":template &row)] …))` for markup, style and bindings, and the " <>
-            "code heads `(defn name [args] body)` / `(def name value)` for " <>
-            "functions and values (they land in `spell.vars`). The source " <>
-            "walks the validation ladder — read, machine, verse compile, " <>
-            "ghost selectors, fence for code — and the verdict comes back " <>
-            "with the rung named. A rejection leaves the machine unchanged; " <>
-            "an acceptance rebuilds the page immediately.",
-        "inputSchema" => %{
-          "type" => "object",
-          "required" => ["source", "rationale"],
-          "properties" => %{
-            "source" => %{
-              "type" => "string",
-              "description" => "ONE definition form, exactly as an author writes it."
-            },
-            "rationale" => %{
-              "type" => "string",
-              "description" => "One sentence: why. It is journaled with the definition."
-            }
-          }
-        }
+        "name" => run.name,
+        "description" => run.description,
+        "inputSchema" => run.parameters
       },
       %{
         "name" => "state",

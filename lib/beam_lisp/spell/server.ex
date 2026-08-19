@@ -10,7 +10,7 @@ defmodule BeamLisp.Spell.Server do
         → spell.server/handle          (walks the contract body)
         → apply assigns to the socket  (the bridge pushes the diff)
         → push declared effects        (Spacetime.LiveView.push_event)
-        → answer an (ask! …) if the body asked for one  (the pointer to the MCP face)
+        → start a model turn if the body asked for one  (the loop streams it back)
         → {:reply, %{tag:, reply:}, socket}
 
   Nothing here knows what a chat is. Every name — `send`, `messages`, `token` —
@@ -269,32 +269,21 @@ defmodule BeamLisp.Spell.Server do
   defp maybe_ask(socket, _contract, nil), do: socket
 
   defp maybe_ask(socket, _contract, text) do
-    # THE JOIN MOVED OUT (W5). There is no in-image model anymore: a model
-    # drives this machine through the MCP face at /spell/mcp, and the page's
-    # `(ask! text)` gets the honest answer — where the model lives now —
-    # instead of a simulated turn. The pair is recorded in the loop's
-    # transcript (so it survives the rebuild the answer describes), and the
-    # answer reaches the page through the SAME messages a streamed turn used:
-    # a tuple here is the vector the contract's `on-info` clauses describe.
-    answer =
-      "the model is external now: connect an MCP client to POST /spell/mcp " <>
-        "(tools: run, state, transcript) — that socket is how this machine grows."
-
-    id = "m#{System.unique_integer([:positive])}"
-
+    # THE JOIN. `(ask! text)` goes to the LOOP — the process that owns the
+    # machine, offers `run`, and walks the rungs. The chat IS the product:
+    # the page talks to a real model, the model proposes source, the ladder
+    # judges, the page reloads. (W5 tried external-only via /spell/mcp; that
+    # face remains for agents, but the main interaction is here.)
+    #
+    # There is deliberately NO no-loop fallback. If the loop is not running
+    # that is a deployment bug, and it fails LOUDLY here rather than as a
+    # page that politely does nothing.
+    #
+    # The messages come back to `self()`, this LiveView's pid, and every one
+    # of them is already described by the contract's `on-info` clauses: a
+    # verdict arrives the same way a token does.
     true = loop_running?()
-
-    # The call can still exit — the loop can die after the check, or be busy
-    # in a ladder run past the timeout. The failure becomes a message the
-    # contract renders, never a crashed LiveView.
-    try do
-      BeamLisp.Spell.Loop.say_pair(BeamLisp.Spell.Loop, text, answer)
-      send(self(), {:delta, id, answer})
-      send(self(), {:done, id})
-    catch
-      :exit, reason ->
-        send(self(), {:failed, id, "the loop did not answer: #{inspect(reason)}"})
-    end
+    BeamLisp.Spell.Loop.ask_async(BeamLisp.Spell.Loop, text, self())
 
     socket
   end

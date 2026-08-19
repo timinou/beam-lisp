@@ -24,10 +24,13 @@ mix beam_lisp.test                # the beam-lisp suites
 scripts/shot.sh <page.st> <out.png>  # compile a Spacetime page, screenshot it
 ```
 
-The provider/cassette/credentials stack was deleted in W5: the model is
-EXTERNAL, driving the machine through the MCP face rather than being called
-from inside the image. (The narrative sections below predate that cut; their
-provider passages are history, not instructions.)
+The chat IS the main interaction: the page's `(ask! text)` drives a real
+model turn in-process (`Spell.Provider` — one lean OpenAI-compatible
+streaming client, ~200 lines; the 863-line provider/cassette/credentials
+stack W5 deleted is NOT back). `POST /spell/mcp` is the second face, for
+external agent clients — same `run`, same ladder, one schema
+(`Loop.run_tool/0`). (The narrative sections below predate W5's cut and its
+correction; their provider passages are history, not instructions.)
 
 Prerequisites, none optional:
 
