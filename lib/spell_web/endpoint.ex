@@ -44,6 +44,11 @@ defmodule SpellWeb.Endpoint do
     plug(Tidewave)
   end
 
+  # The model's face: the loop as an MCP server at /spell/mcp. An external
+  # model client drives the machine through `run`/`state`/`transcript` —
+  # the ONLY write path is the ladder, there is no eval here.
+  plug(BeamLisp.Spell.Mcp)
+
   plug(Plug.Static, at: "/assets/phoenix", from: {:phoenix, "priv/static"}, gzip: false)
 
   plug(Plug.Static,
