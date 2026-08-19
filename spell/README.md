@@ -21,7 +21,7 @@ mix run --no-halt scripts/serve_live.exs  # serve the default shell; it auto-rel
 # Point an MCP client (Claude Code: `claude mcp add`, mcp-remote, …) at it.
 
 mix beam_lisp.test                # the beam-lisp suites
-scripts/peek.sh [PORT] [OUT]      # screenshot + interface state + repl state
+scripts/shot.sh <page.st> <out.png>  # compile a Spacetime page, screenshot it
 ```
 
 The provider/cassette/credentials stack was deleted in W5: the model is
@@ -35,7 +35,7 @@ Prerequisites, none optional:
 |---|---|---|
 | verse checkout (`~/code/ora/verse`, or `VERSE_ROOT`) | rungs 3–4 are the compiler | actionable error naming the path |
 | **release** binary: `cargo build --release --bin spacetime` | the loop calls it per definition; `cargo run` costs 10–30s each | "no spacetime binary" + the exact build command |
-| chrome/chromium (or `CHROME_BIN`) | scripts/peek.sh screenshots | the script fails, naming it |
+| chrome/chromium (or `CHROME_BIN`) | scripts/shot.sh screenshots | the script fails, naming it |
 
 ### Providers
 
@@ -108,8 +108,8 @@ lib/beam_lisp/spell/
 ```
 
 `report.json` beside the bundle IS the repl state: version, transcript, machine
-report, build status. peek.sh reads it, the browser polls it, a human can `cat`
-it — one artefact, three consumers, no protocol.
+report, build status. The browser polls it, a human can `cat` it — one
+artefact, two consumers, no protocol.
 
 The full as-built account, including every defect this shook out and what is
 still missing, is `!tasks/plans/PLAN-025-*.org` — read its **AS BUILT** section
@@ -394,16 +394,10 @@ spell/
       contract.bl      (ns spell.contract)  defcontract/defview emit   ✓
       st-edn.bl        (ns spell.st-edn)    the ONE document printer   ✓
       machine.bl       (ns spell.machine)   accumulating registry      ✓
-      define.bl        (ns spell.define)    the tool: rungs 1–2        ✓
+      run.bl           (ns spell.run)       the one verb: read, classify ✓
       live.bl          (ns spell.live)      a machine as ONE page      ✓
       server.bl        (ns spell.server)    contract bodies, walked    ✓
-      provider.bl      (ns spell.provider)  AGENT: the LLM call        ✓
-      cassette.bl      (ns spell.cassette)  recorded turns, replayed   ✓
       seed.bl          (ns spell.seed)      the seed definition        ✓
-
-      fence.bl         (ns spell.fence)     FENCE    ✓ verified
-      store.bl         (ns spell.store)     STORE    ✓ verified
-      self.bl          (ns spell.self)      SELF              contract, stubbed
 
   study/               VERIFIED EXPERIMENTS — not the application, not loaded
       README.md        ← why each is kept, and why `spell.st` is here
@@ -411,6 +405,9 @@ spell/
       spell/ui.bl      (ns spell.ui)        VIEW     ✓ verified
       spell/st.bl      (ns spell.st)        an atom→browser connector
       spell/clay.bl    (ns spell.clay)      PROCESS+BOUNDARY  contract, stubbed
+      spell/fence.bl   (ns spell.fence)     FENCE    ✓ verified
+      spell/store.bl   (ns spell.store)     STORE    ✓ verified
+      spell/self.bl    (ns spell.self)      SELF              contract, stubbed
 ```
 
 The split is the point. `src/spell/` is what `spell.app` loads and what the

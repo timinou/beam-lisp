@@ -73,7 +73,7 @@ defmodule BeamLisp.Spell.Data do
   | mode | for | keys become |
   |---|---|---|
   | `:all_strings` | data the BROWSER wrote, read by string (wire payloads, socket assigns) | string |
-  | `:as_written` | data WE wrote in an Elixir literal (a provider message, a tool declaration) | unchanged |
+  | `:as_written` | data WE wrote in an Elixir literal, keys fixed in this repository's source | unchanged |
 
   (There used to be a third mode — a keyword vocabulary for data a MODEL
   wrote, from the JSON-proposal era. The tool now carries source TEXT, which

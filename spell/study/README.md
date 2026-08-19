@@ -1,7 +1,7 @@
 # spell/study — verified experiments that are not the application
 
-Four namespaces live here. None of them is loaded by `spell.app`, none is
-reachable from the chat loop, and that is deliberate rather than an oversight:
+Seven namespaces live here. None of them is loaded by `spell.app`, none is
+reachable from the loop, and that is deliberate rather than an oversight:
 each one answered a question, the answer was recorded, and the code is kept
 because it is *evidence* — not because anything calls it.
 
@@ -9,14 +9,19 @@ because it is *evidence* — not because anything calls it.
     spell/ui.bl    VIEW    — a UI tree as pure data, grapheme-exact editing
     spell/st.bl    an atom→browser connector built on `add-watch`
     spell/clay.bl  a written protocol contract (a stub, deliberately)
+    spell/fence.bl FENCE   — run untrusted code with a bounded blast radius
+    spell/store.bl STORE   — state that survives code reload
+    spell/self.bl  SELF    — rewrite yourself, verify, roll back (a stub)
+
+fence, store and self arrived in W6: they are cluster CONTRACTS — lessons
+earned in the jank port, written down — that the application references only
+in comments (`Spell.Loop`'s fence rung and state commentary). The provider
+layer whose debt the earlier paragraph named was deleted in W5; nothing in
+`spell/src` requires these files, so they live here with the other evidence.
 
 Run the study:
 
     mix beam_lisp.run --path spell/study --path spell/src spell/study/main.bl
-
-(Both paths: the study uses `spell.fence` and `spell.store`, which are still in
-`spell/src` because the application's provider layer documents its debt to
-them.)
 
 ## Why they are not deleted
 
