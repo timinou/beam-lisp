@@ -15,7 +15,7 @@ defmodule BeamLisp.Spell.PersistTest do
 
   @view_src """
   (defview clock
-    (markup (template &clock [$m] "<div class='clock'>{@m.text}</div>"))
+    (markup (template &clock [$m] [:div {:class "clock"} @m.text]))
     (style [".clock" {:font-size "0.75rem"}])
     (binds [".log" (st/each @messages :as @m :template &clock)]))
   """
@@ -74,7 +74,7 @@ defmodule BeamLisp.Spell.PersistTest do
     File.write!(
       Path.join(dir, "journal.bl"),
       File.read!(Path.join(dir, "journal.bl")) <>
-        "\n(defview broken (markup (template &b [] \"<button class='b'>x</button>\")) (binds [\".b\" (st/on :click (fire :explode))]))\n"
+        "\n(defview broken (markup (template &b [] [:button {:class \"b\"} \"x\"])) (binds [\".b\" (st/on :click (fire :explode))]))\n"
     )
 
     {:ok, second} = Loop.start_link(name: nil, publish: false, persist: true)
@@ -89,7 +89,8 @@ defmodule BeamLisp.Spell.PersistTest do
   test "no journal means a clean seed machine", %{dir: _dir} do
     {:ok, pid} = Loop.start_link(name: nil, publish: false, persist: true)
     views = Loop.state(pid).machine["views"]
-    assert views == ["chat-view"]
+    # the DEFAULT SHELL: chat + live-state (PLAN-031)
+    assert views == ["chat-view", "live-state-view"]
     GenServer.stop(pid)
   end
 
@@ -108,7 +109,7 @@ defmodule BeamLisp.Spell.PersistTest do
     # The whole journal failed to read, so the seed machine is what boots —
     # the alternative (booting over a corrupt file, or trusting a prefix)
     # both lose worse.
-    assert Loop.state(second).machine["views"] == ["chat-view"]
+    assert Loop.state(second).machine["views"] == ["chat-view", "live-state-view"]
     assert File.ls!(dir) |> Enum.any?(&String.contains?(&1, "corrupt"))
 
     GenServer.stop(second)

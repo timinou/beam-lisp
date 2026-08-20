@@ -207,14 +207,21 @@ defmodule BeamLisp.Spell.Loop do
     %{state | machine: machine, transcript: Enum.reverse(transcript)}
   end
 
-  # The machine every session starts from: the seed contract and the seed view,
-  # registered into an empty machine. A value, held in this process's state —
-  # see the module doc on why it is no longer a global var.
+  # The machine every session starts from: the default shell — the seed
+  # (chat) definition and the live-state definition, chat FIRST because the
+  # first contract names the page's one host (`spell.live/machine-host-name`).
+  # A value, held in this process's state — see the module doc on why it is no
+  # longer a global var.
   defp seeded_machine do
     bl("spell.live", "seeded", [
       bl("spell.machine", "empty-machine", []),
-      var("spell.seed", "contract-term"),
-      var("spell.seed", "view-term")
+      BeamLisp.Vector.new([
+        BeamLisp.Vector.new([var("spell.seed", "contract-term"), var("spell.seed", "view-term")]),
+        BeamLisp.Vector.new([
+          var("spell.live-state", "contract-term"),
+          var("spell.live-state", "view-term")
+        ])
+      ])
     ])
   end
 
@@ -826,28 +833,29 @@ defmodule BeamLisp.Spell.Loop do
         # A hole in the SHELL never interpolates.
         #
         # The shell is rendered by the LiveView, server-side, before the bundle
-        # hydrates — and only the bundle's templates interpolate `{@name}`. So
-        # a hole written into the shell reaches the browser as the literal
-        # characters `{@partial}`, sitting in the page forever.
+        # hydrates — and only the bundle's templates interpolate holes. So a
+        # hole written into the shell reaches the browser as the literal
+        # characters the emitter produced, sitting in the page forever.
         #
         # Observed live: asked to consume `@partial` and `@error`, a model put
-        # `<p class="chat__partial">{@partial}</p>` in the shell AND bound
-        # `.chat__partial` with a view bind. The bind was right; the hole was
-        # not, and every rung passed it — the markup is well-formed, the class
-        # is rendered, the binding is declared. The page shipped showing
-        # `{@partial}` and `{@error}` as text.
+        # them in the shell AND bound `.chat__partial` with a view bind. The
+        # bind was right; the hole was not, and every rung passed it — the
+        # markup is well-formed, the class is rendered, the binding is
+        # declared. The page shipped showing the hole's spelling as text.
         #
         # Refused here rather than in a rung because it is a fact about how the
         # shell is HOSTED, which is exactly what this function knows and the
-        # rungs do not. The seed's shell has no holes, so this cannot fire on
-        # anything that was already working.
-        case Regex.scan(~r/\{@[\w.]+\}/, shell) do
+        # rungs do not. The detection is STRUCTURAL (`machine-shell-holes`
+        # walks the template tree with the emitter's own `hole-name`) — the
+        # string-era regex over `{@name}` died the day markup stopped being a
+        # string, and a dead check reads exactly like a passing one.
+        case bl("spell.live", "machine-shell-holes", [machine]) |> Data.from_bl() do
           [] ->
-            write_host(shell)
+            write_host(machine, shell)
 
           holes ->
             {:error,
-             "the shell contains #{Enum.map_join(Enum.uniq(holes), ", ", &List.first/1)} — " <>
+             "the shell contains #{Enum.map_join(holes, ", ", & &1)} — " <>
                "the shell is rendered server-side, where holes are NOT interpolated, so " <>
                "these would reach the browser as literal text. Put an empty element in " <>
                "the shell and bind a template to it instead."}
@@ -855,10 +863,14 @@ defmodule BeamLisp.Spell.Loop do
     end
   end
 
-  defp write_host(shell) do
+  defp write_host(machine, shell) do
+    # ONE module serving EVERY contract (`spell.contract/machine-module`): the
+    # page is one LiveView socket, so events and assigns from a machine-grown
+    # contract must land in the same module as the seed's — before this, a
+    # contract accepted at runtime had a page half and no server half at all.
     source =
-      bl("spell.contract", "elixir-module", [
-        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+      bl("spell.contract", "machine-module", [
+        bl("spell.machine", "contracts", [machine]),
         BeamLisp.Env.fetch!("spell.seed", "module"),
         shell
       ])

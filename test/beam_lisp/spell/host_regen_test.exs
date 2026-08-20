@@ -75,13 +75,24 @@ defmodule BeamLisp.Spell.HostRegenTest do
     # about what an ACCEPTED DEFINITION does, so it must be driven by one.
     #
     # The definition is minimal but must survive all four rungs: `&shell` renders
-    # `.log`, and the each-bind mounts into it, so no selector is orphaned.
+    # `.log`, and the each-bind mounts into it, so no selector is orphaned. It
+    # must ALSO keep the live-state panel skeleton (`.state` and friends) —
+    # since PLAN-031 the default shell hosts two views, and a chat-view
+    # redefinition omitting the panel ghosts the live-state view's binds and
+    # styles, refused at rung 4 before this test's property is reached.
     marker = "regen-#{System.unique_integer([:positive])}"
 
     source = """
     (defview chat-view
       (markup (template &shell []
-        [:main {:class "chat" :data-marker "#{marker}"} [:div {:class "log" :data-log true}]])
+        [:main {:class "chat" :data-marker "#{marker}"}
+         [:div {:class "log" :data-log true}]
+         [:aside {:class "state"}
+          [:div {:class "state__head"}
+           [:h2 {:class "state__title"} "x"]
+           [:span {:class "state__count"}]
+           [:button {:class "state__refresh" :type "button"} "Refresh"]]
+          [:ul {:class "state__list"}]]])
                (template &message [$m]
         [:p {:class "bubble"} @m.text]))
       (binds [".log" (st/each @messages :as @m :template &message)]))
@@ -92,6 +103,7 @@ defmodule BeamLisp.Spell.HostRegenTest do
 
     after_ = File.read!(host)
 
+    # Literal attrs emit single-quoted in the emitted HTML.
     assert after_ =~ marker,
            "publishing did not rebuild the host from the current machine — " <>
              "the page would keep rendering a stale shell"
@@ -119,10 +131,21 @@ defmodule BeamLisp.Spell.HostRegenTest do
     # before it is refused.
     {:ok, pid} = Loop.start_link(out: out, name: nil)
 
+    # The panel skeleton stays for the same reason as the test above: without
+    # it rung 4 refuses over ghosted `.state*` rules and the SHELL-HOLE rule
+    # this test pins is never reached.
     holed = """
     (defview chat-view
       (markup (template &shell []
-        [:main {:class "chat"} [:div {:class "log" :data-log true}] [:p {:class "note"} @partial]])
+        [:main {:class "chat"}
+         [:div {:class "log" :data-log true}]
+         [:p {:class "note"} @partial]
+         [:aside {:class "state"}
+          [:div {:class "state__head"}
+           [:h2 {:class "state__title"} "x"]
+           [:span {:class "state__count"}]
+           [:button {:class "state__refresh" :type "button"} "Refresh"]]
+          [:ul {:class "state__list"}]]])
                (template &message [$m]
         [:p {:class "bubble"} @m.text]))
       (binds [".log" (st/each @messages :as @m :template &message)]))
@@ -136,7 +159,9 @@ defmodule BeamLisp.Spell.HostRegenTest do
 
     reason = to_string(inspect(verdict.reason))
 
-    assert reason =~ "{@partial}",
+    # The hole is reported in the author's spelling — hiccup markup writes
+    # `@partial`; the `{@partial}` spelling was the string-markup era's.
+    assert reason =~ "@partial",
            "the refusal must quote the hole it found: #{reason}"
 
     assert reason =~ "server-side" or reason =~ "literal",

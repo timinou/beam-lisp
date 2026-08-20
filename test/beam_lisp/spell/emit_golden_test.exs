@@ -140,7 +140,8 @@ defmodule BeamLisp.Spell.EmitGoldenTest do
       # instead reported `.ad-form` and friends — library code we did not write
       # and cannot judge.
       assert plain(emit("machine-bind-selectors")) ==
-               [".composer__input", ".composer__send", ".log"]
+               [".composer__input", ".composer__send", ".log", ".state__count",
+                ".state__list", ".state__refresh"]
     end
   end
 
@@ -175,7 +176,8 @@ defmodule BeamLisp.Spell.EmitGoldenTest do
              "a name the page declares is not exempt from the orphan check — " <>
                "the report would contradict the ladder that just passed"
 
-      assert report["locals"] == ["draft", "m"]
+      # `m` is the chat view's `@each` variable, `v` the live-state view's.
+      assert report["locals"] == ["draft", "m", "v"]
       assert declarable == ["draft"]
     end
   end

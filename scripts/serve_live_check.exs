@@ -29,16 +29,25 @@ defmodule ServeLiveCheck do
 
     Spell.init!(["spell.app", "spell.live"])
 
-    # The machine as a VALUE, in a named Agent — the same shape
-    # scripts/serve_live.exs uses, so this check exercises the real wiring
-    # rather than a second one that could pass while serving is broken.
+    # The machine as a VALUE, in a named Agent — and the LOOP, because `ask!`
+    # is delivered BY the loop: without one, the send check dies at
+    # `maybe_ask`'s deliberate `true = loop_running?()`. `publish: false` —
+    # this script writes nothing to spell/gen or the verse serve — and
+    # `persist: false`, so a check run never appends to the journal.
     {:ok, _} = Agent.start_link(fn -> seeded_machine() end, name: @machine)
+    {:ok, _} = BeamLisp.Spell.Loop.start_link(publish: false, persist: false)
 
-    # A zero-arity FUNCTION, not beam-lisp source: the registry no longer
+    # Zero-arity FUNCTIONS, not beam-lisp source: the registry no longer
     # evaluates source, because `eval_string` compiled a fresh BEAM module per
     # call and the atoms interning those names are never reclaimed. Looked up
     # per call so an event runs against the CURRENT contract.
-    BeamLisp.Spell.Server.register("chat-live", &chat_contract/0)
+    #
+    # BOTH shell contracts are registered: the machine's generated host module
+    # serves every contract (`spell.contract/machine-module`), and no Loop is
+    # running here, so `contract_term/1`'s machine fallback has nothing to ask.
+    for name <- ["chat-live", "live-state"] do
+      BeamLisp.Spell.Server.register(name, fn -> contract_named(name) end)
+    end
 
     # The GENERATED module, compiled over the placeholder — exactly what
     # scripts/serve_live.exs does at boot. The fixture socket must name it:
@@ -64,20 +73,29 @@ defmodule ServeLiveCheck do
 
   # ── the checks ─────────────────────────────────────────────────────────────
 
-  # The chat contract from the live machine, resolved per call — the same
-  # helper as scripts/serve_live.exs. `contracts` returns a `BeamLisp.Vector`
-  # and a contract's `:name` is an ATOM (`:"chat-live"`), not a string.
-  defp chat_contract do
+  # A contract from the live machine, resolved per call — the same lookup
+  # `Spell.Server.contract_term/1`'s machine fallback performs when a loop IS
+  # running. `contracts` returns a `BeamLisp.Vector` and a contract's `:name`
+  # is an ATOM (`:"chat-live"`), not a string.
+  defp contract_named(name) do
     bl("spell.machine", "contracts", [machine()])
     |> BeamLisp.Vector.to_list()
-    |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
+    |> Enum.find(fn c -> to_string(Map.get(c, :name)) == name end)
   end
 
   defp seeded_machine do
     bl("spell.live", "seeded", [
       bl("spell.machine", "empty-machine", []),
-      BeamLisp.Env.fetch!("spell.seed", "contract-term"),
-      BeamLisp.Env.fetch!("spell.seed", "view-term")
+      BeamLisp.Vector.new([
+        BeamLisp.Vector.new([
+          BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+          BeamLisp.Env.fetch!("spell.seed", "view-term")
+        ]),
+        BeamLisp.Vector.new([
+          BeamLisp.Env.fetch!("spell.live-state", "contract-term"),
+          BeamLisp.Env.fetch!("spell.live-state", "view-term")
+        ])
+      ])
     ])
   end
 
@@ -86,9 +104,11 @@ defmodule ServeLiveCheck do
   defp bl(ns, name, args), do: apply(BeamLisp.Env.fetch!(ns, name), args)
 
   defp generate_server_half do
+    # The MERGED module — one LiveView serving every contract the machine
+    # holds, exactly what the loop's publish path writes to spell/gen/.
     source =
-      bl("spell.contract", "elixir-module", [
-        BeamLisp.Env.fetch!("spell.seed", "contract-term"),
+      bl("spell.contract", "machine-module", [
+        bl("spell.machine", "contracts", [machine()]),
         BeamLisp.Env.fetch!("spell.seed", "module"),
         bl("spell.live", "machine-shell", [machine()])
       ])
@@ -128,10 +148,23 @@ defmodule ServeLiveCheck do
   end
 
   defp mount_seeds do
-    {:ok, socket} = BeamLisp.Spell.Server.mount(socket(), "chat-live")
+    {:ok, socket} = BeamLisp.Spell.Server.mount(socket(), ["chat-live", "live-state"])
     keys = socket.assigns |> Map.keys() |> Enum.sort()
     unless :messages in keys and :status in keys and :partial in keys, do: throw(inspect(keys))
-    inspect(keys)
+
+    # The live-state contract's `:mount-event :refresh` ran at mount: the vars
+    # are populated before the first render, not on the user's first click.
+    vars = Map.get(socket.assigns, :vars)
+
+    unless is_list(vars) and vars != [] do
+      throw("mount did not populate :vars (mount-event :refresh did not run)")
+    end
+
+    unless Map.get(socket.assigns, :"vars_count") == length(vars) do
+      throw("vars_count #{inspect(Map.get(socket.assigns, :"vars_count"))} != #{length(vars)}")
+    end
+
+    "#{inspect(keys)}, vars=#{length(vars)} at mount"
   end
 
   defp send_turn do

@@ -10,10 +10,9 @@
 #
 # What this script does, in order:
 #
-#   1. LOAD      the machine (seed contract + seed view)
+#   1. LOAD      the machine (the default shell: chat + live-state)
 #   2. PUBLISH   — the loop emits index.edn and awaits verse's verdict
-#   3. REGISTER  the contract expression, so the generated module's @contract
-#                name resolves to a live term
+#   3. RESOLVE   — verify every contract resolves through the loop's machine
 #   4. VERIFY    the claims above before printing a URL
 #
 # The generated module is written to `spell/gen/` and compiled with
@@ -66,12 +65,16 @@ defmodule ServeLive do
           "#{length(module.__spacetime_contract__().assigns)} assign(s), " <>
           "#{length(module.__spacetime_contract__().pushes)} push(es)")
 
-    step("REGISTER — the contract behind the generated module")
-    # A zero-arity FUNCTION, not a value: it runs per event, so a definition
-    # accepted later is the one the NEXT event runs against.
-    BeamLisp.Spell.Server.register("chat-live", &chat_contract/0)
+    step("RESOLVE — every contract answers through the one host")
+    # Nothing to register: `Spell.Server.contract_term/1` falls back to the
+    # loop's machine, so a contract is resolvable the moment the machine holds
+    # it — including contracts the model adds AFTER this boot. What there is to
+    # do here is verify the resolution works before printing a URL.
+    for name <- contracts do
+      BeamLisp.Spell.Server.contract_term(name)
+    end
 
-    say("chat-live → live-machine's registered contract")
+    say("#{Enum.join(contracts, ", ")} → the loop's live machine")
 
     step("VERIFY — this node is what it claims to be")
     port = Application.get_env(:beam_lisp, SpellWeb.Endpoint)[:http][:port] || 4030
@@ -113,17 +116,6 @@ defmodule ServeLive do
        the view is one `spacetime serve` away.
        Ctrl-C twice to stop.
     """)
-  end
-
-  # The chat contract, looked up in the live machine ON EACH CALL.
-  #
-  # Called per event by `BeamLisp.Spell.Server`, which is the point: the machine
-  # grows as definitions are accepted, and an event must run against the CURRENT
-  # contract rather than the one that existed at boot.
-  defp chat_contract do
-    bl("spell.machine", "contracts", [machine()])
-    |> to_list()
-    |> Enum.find(fn c -> to_string(Map.get(c, :name)) == "chat-live" end)
   end
 
   # The current machine — asked of the process that owns it.

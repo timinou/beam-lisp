@@ -397,10 +397,18 @@ spell/
       contract.bl      (ns spell.contract)  defcontract/defview emit   ✓
       st-edn.bl        (ns spell.st-edn)    the ONE document printer   ✓
       machine.bl       (ns spell.machine)   accumulating registry      ✓
-      run.bl           (ns spell.run)       the one verb: read, classify ✓
+      define.bl        (ns spell.define)    the tool: rungs 1–2        ✓
       live.bl          (ns spell.live)      a machine as ONE page      ✓
       server.bl        (ns spell.server)    contract bodies, walked    ✓
+      provider.bl      (ns spell.provider)  AGENT: the LLM call        ✓
+      cassette.bl      (ns spell.cassette)  recorded turns, replayed   ✓
       seed.bl          (ns spell.seed)      the seed definition        ✓
+      live-state.bl    (ns spell.live-state) the live-env contract     ✓
+                      (vars in BeamLisp.Env, shown in the default shell)
+
+      fence.bl         (ns spell.fence)     FENCE    ✓ verified
+      store.bl         (ns spell.store)     STORE    ✓ verified
+      self.bl          (ns spell.self)      SELF              contract, stubbed
 
   study/               VERIFIED EXPERIMENTS — not the application, not loaded
       README.md        ← why each is kept, and why `spell.st` is here
@@ -408,9 +416,6 @@ spell/
       spell/ui.bl      (ns spell.ui)        VIEW     ✓ verified
       spell/st.bl      (ns spell.st)        an atom→browser connector
       spell/clay.bl    (ns spell.clay)      PROCESS+BOUNDARY  contract, stubbed
-      spell/fence.bl   (ns spell.fence)     FENCE    ✓ verified
-      spell/store.bl   (ns spell.store)     STORE    ✓ verified
-      spell/self.bl    (ns spell.self)      SELF              contract, stubbed
 ```
 
 The split is the point. `src/spell/` is what `spell.app` loads and what the

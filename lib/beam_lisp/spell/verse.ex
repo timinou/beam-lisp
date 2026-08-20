@@ -246,7 +246,13 @@ defmodule BeamLisp.Spell.Verse do
   # renders both (streamed tokens appear word by word; a provider failure shows
   # its reason). Neither is a stream, so verse's one real signal here is
   # untouched: `fx` stays OUT of this list and keeps refusing the page.
-  @exempt_sources ~w(draft status send partial error)
+  #
+  # `refresh` and `vars_count` are the live-state contract's: `refresh` is an
+  # event fired by `@on` (same blind spot as `send`), `vars_count` is consumed
+  # by a `@view` arm (same blind spot as `status`). `vars` is NOT here: it is
+  # consumed by `@each`, which verse traces — the same reason `messages` never
+  # needed listing.
+  @exempt_sources ~w(draft status send partial error refresh vars_count)
 
   @doc """
   Is this diagnostic line a W0201 for a source verse genuinely cannot trace?

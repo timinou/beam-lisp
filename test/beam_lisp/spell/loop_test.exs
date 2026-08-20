@@ -181,8 +181,13 @@ defmodule BeamLisp.Spell.LoopTest do
 
       {:ok, loop} = Loop.start_link(out: out, name: nil)
 
+      # The proposal keeps the live-state PANEL skeleton: since PLAN-031 the
+      # shell hosts two views, and a chat-view redefinition that omits the
+      # `.state` elements ghosts the live-state view's binds and styles —
+      # correctly refused at rung 4 BEFORE the shell question is reached.
+      # Keeping the skeleton is what lets this test exercise the shell rename.
       shell_renamed =
-        "(defview chat-view (markup (template &chat [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
+        "(defview chat-view (markup (template &chat [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}] [:aside {:class \"state\"} [:div {:class \"state__head\"} [:h2 {:class \"state__title\"} \"x\"] [:span {:class \"state__count\"}] [:button {:class \"state__refresh\" :type \"button\"} \"Refresh\"]] [:ul {:class \"state__list\"}]]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
       verdict = Loop.run(loop, shell_renamed, "a page template under any other name")
 
@@ -219,8 +224,11 @@ defmodule BeamLisp.Spell.LoopTest do
       # A view that renders NEITHER `@partial` nor `@error` — exactly what the
       # live model produced. The seed renders both, so the seed's own warnings
       # would not exercise this; the finding has to be caused, not borrowed.
+      # The panel skeleton stays (see the shell-rename test above): dropping
+      # it would be refused at rung 4 for ghosting the live-state view, which
+      # is not the warning this test causes.
       forgetful =
-        "(defview chat-view (markup (template &shell [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
+        "(defview chat-view (markup (template &shell [] [:main {:class \"chat\"} [:div {:class \"log\" :data-log true}] [:aside {:class \"state\"} [:div {:class \"state__head\"} [:h2 {:class \"state__title\"} \"x\"] [:span {:class \"state__count\"}] [:button {:class \"state__refresh\" :type \"button\"} \"Refresh\"]] [:ul {:class \"state__list\"}]]]) (template &message [m] [:p {:class \"bubble\"} @m.text])) (style [\".bubble\" {:margin \"0\"}]) (binds [\".log\" (st/each @messages :as @m :template &message)]))"
 
       verdict = Loop.run(loop, forgetful, "drop the binds that consume @partial and @error")
 

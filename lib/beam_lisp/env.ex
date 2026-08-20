@@ -207,14 +207,22 @@ defmodule BeamLisp.Env do
   def put_ns_defs(ns, defs), do: :ets.insert(@table, {{:ns_defs, ns}, defs})
 
   @doc """
-  Every namespace that has defined something.
+  Every namespace that exists: defined something OR declared by `(ns …)`.
 
   Used to resolve a bare name when the current namespace is not the one
   that defines it — `current_ns/0` is process-global and outlives any
   single evaluation, so it is a hint rather than an answer.
+
+  Declared namespaces are included because a namespace of plain `def`s has
+  no `ns_defs` entry at all — `ns_defs` backs compiled `defn`s — so the
+  narrower reading made a loaded, populated namespace invisible to anyone
+  asking "what is loaded?" (the live-environment panel found exactly that:
+  a contract-only namespace did not appear in its own listing).
   """
   def namespaces do
-    :ets.select(@table, [{{{:ns_defs, :"$1"}, :_}, [], [:"$1"]}])
+    defined = :ets.select(@table, [{{{:ns_defs, :"$1"}, :_}, [], [:"$1"]}])
+    declared = :ets.select(@table, [{{{:ns, :"$1"}, :_}, [], [:"$1"]}])
+    Enum.uniq(defined ++ declared)
   end
 
   @doc "Register link metadata `{module, %{arity => fname}, {min, vfname} | nil}` for a fn var."

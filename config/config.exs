@@ -42,7 +42,10 @@ config :beam_lisp, SpellWeb.Endpoint,
   # anything but loopback, and it would hide a genuinely wrong host later.
   check_origin: [
     "http://127.0.0.1:#{System.get_env("PORT") || "4030"}",
-    "http://localhost:#{System.get_env("PORT") || "4030"}"
+    "http://localhost:#{System.get_env("PORT") || "4030"}",
+    # Some browser profiles reach loopback as `console.localhost` — the same
+    # machine, a third spelling, refused without this line exactly as above.
+    "http://console.localhost:#{System.get_env("PORT") || "4030"}"
   ],
   secret_key_base: "Q6fe7LbG6KXu2sW8/hojavutCZwUqj8ubdwEVtNgCgGqPuBEge3T0fmkUO5fEx0j",
   render_errors: [formats: [html: SpellWeb.ErrorHTML], layout: false],
@@ -57,5 +60,9 @@ config :beam_lisp, :spell_site_dir, "spell/ui"
 
 # The verse dev server's loopback port. The browser loads the compiled bundle
 # and stylesheet from this origin; the shell's reload script connects to its
-# websocket. Both are plain loopback HTTP, no proxy.
-config :beam_lisp, :spell_verse_port, 4444
+# websocket. Both are plain loopback HTTP, no proxy. `VERSE_PORT` overrides,
+# like `PORT` above: two beam-lisp projects on one machine otherwise fight
+# for 4444, and the loser serves ANOTHER project's index.edn without a
+# complaint — observed live as this shell's page loading an empty runtime
+# ("No .st file found at …/fundamental_phone/spell/ui/index.edn").
+config :beam_lisp, :spell_verse_port, String.to_integer(System.get_env("VERSE_PORT") || "4444")

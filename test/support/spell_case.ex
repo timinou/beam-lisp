@@ -59,9 +59,19 @@ defmodule BeamLisp.SpellCase do
   def seeded_machine do
     empty = fetch!("spell.machine", "empty-machine")
     seeded = fetch!("spell.live", "seeded")
-    contract = fetch!("spell.seed", "contract-term")
-    view = fetch!("spell.seed", "view-term")
-    seeded.(empty.(), contract, view)
+
+    # The DEFAULT SHELL: chat first (it names the page's one host), then
+    # live-state — the same composition `Spell.Loop.seeded_machine` builds.
+    defs =
+      BeamLisp.Vector.new([
+        BeamLisp.Vector.new([fetch!("spell.seed", "contract-term"), fetch!("spell.seed", "view-term")]),
+        BeamLisp.Vector.new([
+          fetch!("spell.live-state", "contract-term"),
+          fetch!("spell.live-state", "view-term")
+        ])
+      ])
+
+    seeded.(empty.(), defs)
   end
 
   @doc "A beam-lisp var's value, or a failure naming what was missing."

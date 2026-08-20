@@ -100,7 +100,18 @@ defmodule BeamLisp.Spell.Server do
     end
   end
 
-  @doc "The term registered as `name`, or raise naming what is registered."
+  @doc """
+  The term registered as `name`.
+
+  Resolution order:
+
+    1. the explicit registry (`register/2`) — tests and scripts pin a resolver
+    2. the LOOP's live machine, looked up by contract name — the default, so a
+       contract the machine ACCEPTED is resolvable the moment it lands, with
+       no registration step to forget
+
+  Raises naming what is registered when neither answers.
+  """
   def contract_term(name) do
     registry = :persistent_term.get(@registry, %{})
 
@@ -109,41 +120,106 @@ defmodule BeamLisp.Spell.Server do
         resolver.()
 
       :error ->
-        raise ArgumentError,
-              "no contract registered as #{inspect(name)} " <>
-                "(registered: #{inspect(Map.keys(registry))}). " <>
-                "Call BeamLisp.Spell.Server.register/2 before serving."
+        case machine_contract(name) do
+          nil ->
+            raise ArgumentError,
+                  "no contract named #{inspect(name)} — not in the registry " <>
+                    "(registered: #{inspect(Map.keys(registry))}) and not in the loop's " <>
+                    "machine (or no loop is running)."
+
+          term ->
+            term
+        end
     end
+  end
+
+  # The machine's contract named `name`, or nil. Asks the process that OWNS the
+  # machine — `Spell.Loop.machine/0` is the one way to ask, and the lookup is
+  # per call so a redefinition accepted a second ago is the term answered.
+  # Never called from the loop process itself (its own callers are LiveViews);
+  # a self-call would deadlock the GenServer.
+  defp machine_contract(name) do
+    if loop_running?() do
+      contracts = apply_bl("spell.machine", "contracts", [BeamLisp.Spell.Loop.machine()])
+
+      contracts
+      |> BeamLisp.Vector.to_list()
+      |> Enum.find(fn c -> to_string(Map.get(c, :name)) == name end)
+    end
+  rescue
+    _ -> nil
   end
 
   # ── LiveView callbacks, one per generated head ─────────────────────────────
 
+  # Single-contract form retained for a one-contract caller; the machine's
+  # generated module always passes the LIST.
+  def mount(socket, contract) when is_binary(contract), do: mount(socket, [contract])
+
   @doc """
-  `mount/3`'s body: seed the socket with the contract's declared initials.
+  `mount/3`'s body, over EVERY contract the machine holds.
 
   The seed travels as ordinary assigns, so the bridge's after-render reconciler
   pushes it as the first `st-set` diff on the connected mount. There is no
   separate seeding path — which is what the static host page had to fake with a
   retrying JS timer, and why its transcript could arrive as `null`.
-  """
-  def mount(socket, contract) do
-    seed = Data.from_bl(call("seed-assigns", [contract_term(contract), %{}]))
 
-    # The contract's declared initials, then the LOOP's transcript on top.
-    #
-    # The page reloads itself when the machine grows — that is the point — and a
-    # reload remounts this LiveView, which seeds from the declarations: an
-    # empty conversation. So asking for a clock worked, the page rebuilt, and
-    # the message that asked for it vanished at the exact moment the clock
-    # appeared. Observed in a browser; it reads as the send having failed.
-    #
-    # The loop holds the transcript because it is the thing that outlives a
-    # page. Merging it here is what makes the reload invisible.
-    #
-    # Only when a loop is running: without one there is no conversation to
-    # restore, and the declared empty transcript is correct.
-    {:ok, assign_all(socket, Map.merge(seed, restored_messages()))}
+  The generated host is one LiveView serving the whole machine
+  (`spell.contract/machine-module`), so mount seeds each contract's declared
+  initials, overlays the loop's transcript, and then runs each contract's
+  declared `:mount-event` — an ordinary no-param event (the live-state
+  contract's `:refresh`), run through the SAME `spell.server/handle` walk a
+  page event takes. That is how `@vars` is populated before the first render:
+  the state a page opens with is computed by the contract's own handler, not
+  by a seeding path that could disagree with it. A remount re-runs it, and
+  the browser remounts when the machine grows — so first load and growth are
+  one path.
+  """
+  def mount(socket, contracts) when is_list(contracts) do
+    terms = Enum.map(contracts, &contract_term/1)
+
+    seed =
+      terms
+      |> Enum.map(&Data.from_bl(call("seed-assigns", [&1, %{}])))
+      |> Enum.reduce(%{}, &Map.merge/2)
+
+    socket = assign_all(socket, Map.merge(seed, restored_messages()))
+
+    Enum.reduce(terms, {:ok, socket}, fn term, {:ok, socket} ->
+      case call("mount-event", [term]) do
+        nil -> {:ok, socket}
+        event -> {:ok, run_mount_event(socket, term, to_string(event))}
+      end
+    end)
   end
+
+  # A mount event is just the contract's handler, run once with an empty
+  # payload. It must not `ask!` — a mount is not a turn — but nothing forbids
+  # it structurally; the contract author owns that choice.
+  defp run_mount_event(socket, term, event_name) do
+    result =
+      Data.from_bl(
+        call("handle", [
+          term,
+          event_name,
+          Data.to_bl(%{}, :all_strings),
+          Data.to_bl(current_assigns(socket), :all_strings)
+        ])
+      )
+
+    apply_result(socket, nil, result)
+  end
+
+  # The transcript merge in `mount/2` deserves its history kept: the page
+  # reloads itself when the machine grows — that is the point — and a reload
+  # remounts this LiveView, which seeds from the declarations: an empty
+  # conversation. So asking for a clock worked, the page rebuilt, and the
+  # message that asked for it vanished at the exact moment the clock appeared.
+  # Observed in a browser; it reads as the send having failed. The loop holds
+  # the transcript because it is the thing that outlives a page, and merging
+  # it over the seed is what makes the reload invisible. Only when a loop is
+  # running: without one there is no conversation to restore, and the
+  # declared empty transcript is correct.
 
   defp restored_messages do
     if loop_running?() do
@@ -202,36 +278,49 @@ defmodule BeamLisp.Spell.Server do
     end
   end
 
+  # Single-contract form; the machine's generated module always passes the LIST.
+  def info(socket, contract, message) when is_binary(contract),
+    do: info(socket, [contract], message)
+
   @doc """
-  `handle_info/2`'s body: route a server-internal message through the contract's
-  `on-info` clauses.
+  `handle_info/2`'s body, fanned out over EVERY contract the machine holds.
+
+  One LiveView serves the machine, so a server-internal message is offered to
+  each contract in registration order; a contract whose `on-info` clauses do
+  not match answers "unmatched" and leaves the socket untouched. Two contracts
+  MAY both match one message — each applies its own clause, in order, later
+  contracts seeing earlier ones' assigns.
 
   Provider tokens arrive here. They need no second transport precisely because
   a streamed token is an ordinary BEAM message, decoded by the same contract
   that decodes the page's events.
   """
-  def info(socket, contract, message) do
-    result =
-      Data.from_bl(
-        call("handle-info", [
-          contract_term(contract),
-          Data.to_bl(message_vector(message), :all_strings),
-          Data.to_bl(current_assigns(socket), :all_strings)
-        ])
-      )
+  def info(socket, contracts, message) when is_list(contracts) do
+    {socket, matched?} =
+      Enum.reduce(contracts, {socket, false}, fn contract, {socket, matched?} ->
+        result =
+          Data.from_bl(
+            call("handle-info", [
+              contract_term(contract),
+              Data.to_bl(message_vector(message), :all_strings),
+              Data.to_bl(current_assigns(socket), :all_strings)
+            ])
+          )
 
-    case Map.get(result, "status") do
-      "unmatched" ->
-        # Keep the assigns and say so once. A message the contract does not
-        # describe must not change state, and must not be silent either — this
-        # is how a protocol drift is noticed.
-        require Logger
-        Logger.debug("spell.server: no on-info clause for #{inspect(message)}")
-        {:noreply, socket}
+        case Map.get(result, "status") do
+          "unmatched" -> {socket, matched?}
+          _ -> {apply_result(socket, contract, result), true}
+        end
+      end)
 
-      _ ->
-        {:noreply, apply_result(socket, contract, result)}
+    unless matched? do
+      # A message NO contract describes must not be silent either — this is how
+      # a protocol drift is noticed.
+      require Logger
+      Logger.debug("spell.server: no on-info clause in any contract for #{inspect(message)}")
     end
+
+    {:noreply, socket}
   end
 
   # ── applying an interpreter answer to a socket ─────────────────────────────
