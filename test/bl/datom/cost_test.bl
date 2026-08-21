@@ -28,6 +28,14 @@
 
 (def COUNTER (atom {}))
 
+(def ROWS
+  "How many datoms the store has handed back.
+
+   Ranges count REQUESTS; this counts what came back. Range-bound
+   pushdown does not change the number of requests \u2014 a bounded scan and
+   a full one are both one range \u2014 so it is invisible without this."
+  (atom 0))
+
 (defn- bump
   [k]
   (swap! COUNTER (fn [m] (assoc m k (+ 1 (or (get m k) 0))))))
@@ -39,7 +47,11 @@
   ; tell they are being measured, which is exactly the property that
   ; lets a different substrate arrive later.
   (-get [s k] (bump :get) (datom.store/-get (:inner s) k))
-  (-range [s lo hi] (bump :range) (datom.store/-range (:inner s) lo hi))
+  (-range [s lo hi]
+    (bump :range)
+    (let [result (datom.store/-range (:inner s) lo hi)]
+      (swap! ROWS (fn [n] (+ n (count result))))
+      result))
   (-put [s k v] (bump :put) (datom.store/-put (:inner s) k v))
   (-delete [s k] (bump :delete) (datom.store/-delete (:inner s) k))
   (-update [s k f] (bump :update) (datom.store/-update (:inner s) k f))
@@ -187,3 +199,86 @@
     (datom.conn/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/n (str "n" i)})
                                   (nums 20)))
     (is (= 1 (get (deref COUNTER) :commit)))))
+
+;; ── range predicate pushdown ────────────────────────────────────────
+
+(defn- datoms-read
+  "How many datoms the store handed back while running `f`.
+
+   Ranges alone do not show this optimisation: a bounded scan and a full
+   scan are both ONE range. What changes is how much comes back."
+  [conn f]
+  (reset! COUNTER {})
+  (reset! ROWS 0)
+  (f (datom.conn/db conn))
+  (deref ROWS))
+
+(defn- indexed-fixture
+  [n]
+  (let [c (datom.conn/connect-with
+            (->CountingStore (datom.store-ets/open))
+            [{:db/ident :r/age :db/valueType :db.type/long :db/index true}
+             {:db/ident :r/plain :db/valueType :db.type/long}])]
+    (datom.conn/transact!
+      c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :r/age i :r/plain i}) (nums n)))
+    c))
+
+(deftest a-range-predicate-on-an-indexed-attribute-reads-only-its-window
+  ; `[(> ?age 95)]` used to scan the whole column and filter afterwards:
+  ; cost proportional to the ATTRIBUTE rather than to the answer. AVET
+  ; sorts by value, so the comparison becomes a scan bound.
+  (let [c (indexed-fixture 100)
+        bounded (datoms-read c (fn [db] (datom.query.engine/q
+                                          '[:find ?a :where [?e :r/age ?a] [(> ?a 95)]] db)))
+        whole (datoms-read c (fn [db] (datom.query.engine/q
+                                        '[:find ?a :where [?e :r/age ?a]] db)))]
+    (is (< bounded 15) (str "reads its window, not the column (" bounded " datoms)"))
+    (is (= 100 whole) "while an unbounded scan still reads everything")))
+
+(deftest pushdown-does-not-change-the-ANSWER
+  ; The invariant that matters. An optimiser that changes results is a
+  ; bug generator, so the predicate still runs after the bound: an
+  ; off-by-one in the bounds can only make a query slower, never wrong.
+  (let [c (indexed-fixture 50)
+        db (datom.conn/db c)
+        indexed (datom.query.engine/q '[:find ?a :where [?e :r/age ?a] [(> ?a 45)]] db)
+        plain (datom.query.engine/q '[:find ?a :where [?e :r/plain ?a] [(> ?a 45)]] db)]
+    (is (= indexed plain)
+        "the indexed path and the unindexed path must agree exactly")
+    (is (= (set [[46] [47] [48] [49]]) indexed))))
+
+(deftest every-comparison-operator-bounds-correctly
+  ; Inclusive and exclusive, in both spellings. `[(< 30 ?a)]` says the
+  ; same as `[(> ?a 30)]`, and a language that understood only one would
+  ; be quietly demanding the author guess which.
+  (let [db (datom.conn/db (indexed-fixture 10))
+        ask (fn [q] (datom.query.engine/q q db))]
+    (are [query expected] (= expected (ask query))
+      '[:find ?a :where [?e :r/age ?a] [(> ?a 7)]]   (set [[8] [9]])
+      '[:find ?a :where [?e :r/age ?a] [(>= ?a 8)]]  (set [[8] [9]])
+      '[:find ?a :where [?e :r/age ?a] [(< ?a 2)]]   (set [[0] [1]])
+      '[:find ?a :where [?e :r/age ?a] [(<= ?a 1)]]  (set [[0] [1]])
+      '[:find ?a :where [?e :r/age ?a] [(< 7 ?a)]]   (set [[8] [9]]))))
+
+(deftest a-two-sided-window-is-one-bounded-scan
+  (let [c (indexed-fixture 100)
+        read (datoms-read c (fn [db] (datom.query.engine/q
+                                       '[:find ?a :where [?e :r/age ?a]
+                                                         [(> ?a 40)] [(< ?a 45)]] db)))]
+    (is (< read 15) (str "both bounds narrow the same scan (" read " datoms)"))
+    (is (= (set [[41] [42] [43] [44]])
+           (datom.query.engine/q '[:find ?a :where [?e :r/age ?a]
+                                                   [(> ?a 40)] [(< ?a 45)]]
+                                 (datom.conn/db c))))))
+
+(deftest an-unindexed-attribute-still-answers-correctly
+  ; Correctness must not depend on the schema. Without AVET there is no
+  ; value ordering to bound, so the predicate filters after a full scan —
+  ; slower, and exactly as right.
+  (let [c (indexed-fixture 100)
+        read (datoms-read c (fn [db] (datom.query.engine/q
+                                       '[:find ?a :where [?e :r/plain ?a] [(> ?a 95)]] db)))]
+    (is (= 100 read) "no index, so no bound")
+    (is (= (set [[96] [97] [98] [99]])
+           (datom.query.engine/q '[:find ?a :where [?e :r/plain ?a] [(> ?a 95)]]
+                                 (datom.conn/db c))))))
