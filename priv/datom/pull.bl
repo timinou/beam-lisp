@@ -1,0 +1,190 @@
+; datom/pull.bl — reading a SHAPE out of the graph.
+;
+; ── The question pull answers ─────────────────────────────────────────
+;
+; Datalog answers `which entities satisfy these constraints?` and returns
+; tuples of scalars. But an application usually wants a TREE: this person,
+; their name and age, and each of their friends' names.
+;
+; Expressing that in datalog alone means one query per level and stitching
+; the results together. `pull` does it in one call, with a PATTERN that
+; describes the shape you want:
+;
+;   [:person/name :person/age {:person/friend [:person/name]}]
+;
+;   => {:person/name "Alan"
+;       :person/age 41
+;       :person/friend [{:person/name "Ada"} {:person/name "Grace"}]}
+;
+; The pattern is data, like everything else here, so a program can build
+; one, store one, or derive one from a UI's field list.
+;
+; ── Why this is a separate layer from query ───────────────────────────
+;
+; Datalog is about CONSTRAINT — finding entities. Pull is about
+; PROJECTION — reading a known entity's shape. Datomic keeps them
+; separate for the same reason: mixing them would make the query language
+; answer two different questions with one syntax.
+;
+; They compose: `q` finds the entity ids, `pull` shapes them.
+
+(ns datom.pull
+  (:require [datom.db] [datom.index] [datom.schema]))
+
+;; ── pattern elements ────────────────────────────────────────────────
+;;
+;; An element is one of:
+;;   :attr          take this attribute
+;;   *              take everything (the wildcard)
+;;   {:attr [...]}  follow this reference and pull that pattern from it
+;;   :attr/_reverse follow references POINTING AT this entity
+
+(defn wildcard?
+  "Whether `element` is `*` \u2014 every attribute of the entity."
+  [element]
+  (and (symbol? element) (= "*" (name element))))
+
+(defn reverse-attr?
+  "Whether `attr` is a reverse reference: `:person/_friend`.
+
+   The underscore prefix on the NAME (not the namespace) marks it, the
+   same spelling Datomic uses. `:person/_friend` asks `which entities
+   have me as their :person/friend?` \u2014 navigation against the direction
+   the data was written, which VAET exists to make cheap."
+  [attr]
+  (and (keyword? attr)
+       (let [n (name attr)]
+         (and (> (count n) 1) (= "_" (subs n 0 1))))))
+
+(defn forward-attr
+  "The forward attribute a reverse reference navigates: `:person/_friend`
+   becomes `:person/friend`."
+  [attr]
+  (keyword (str (namespace attr) "/" (subs (name attr) 1))))
+
+;; ── reading one attribute ───────────────────────────────────────────
+
+(defn- values-of
+  "Every current value of `[e attr]`."
+  [db e attr]
+  (mapv datom.index/-v (datom.db/datoms db :eavt e attr)))
+
+(defn- referring-entities
+  "Entities whose `attr` points at `e` \u2014 the reverse navigation.
+
+   Uses VAET, which is written for every `:db.type/ref` attribute. That
+   is the entire reason VAET exists: without it this question means
+   scanning every datom of that attribute and filtering by value."
+  [db attr e]
+  (mapv datom.index/-e (datom.db/datoms db :vaet e attr)))
+
+(defn- single?
+  "Whether `attr` holds one value rather than many."
+  [db attr]
+  (not (datom.schema/many? (datom.db/schema-of db) attr)))
+
+(defn- collapse
+  "A cardinality-one attribute's single value, or a many attribute's
+   vector.
+
+   The shape follows the SCHEMA, not the data: an attribute declared
+   `many` yields a vector even when it currently holds one value, so a
+   consumer never has to test which it got."
+  [db attr values]
+  (if (single? db attr)
+    (first values)
+    values))
+
+;; ── the pull itself ─────────────────────────────────────────────────
+
+(defn- pull-element
+  "Add one pattern element's contribution to the result map."
+  [db acc e element]
+  (cond
+    ; `*` \u2014 every attribute the entity has, unexpanded: references come
+    ; back as ids rather than nested maps, because `*` says nothing about
+    ; how deep to go and guessing could walk the whole graph (or loop).
+    (wildcard? element)
+      (reduce (fn [m d]
+                (let [a (datom.index/-a d)]
+                  (assoc m a (collapse db a (values-of db e a)))))
+              acc
+              (datom.db/entity-datoms db e))
+
+    ; a plain attribute, forward or reverse
+    (keyword? element)
+      (if (reverse-attr? element)
+        (let [refs (referring-entities db (forward-attr element) e)]
+          (if (empty? refs) acc (assoc acc element refs)))
+        (let [vs (values-of db e element)]
+          (if (empty? vs) acc (assoc acc element (collapse db element vs)))))
+
+    ; a nested map: follow the reference and pull recursively
+    (map? element)
+      (reduce (fn [m entry]
+                (let [attr (key entry)
+                      sub-pattern (val entry)]
+                  (if (reverse-attr? attr)
+                    (let [refs (referring-entities db (forward-attr attr) e)]
+                      (if (empty? refs)
+                        m
+                        (assoc m attr (filterv some?
+                                               (mapv (fn [r] (pull db sub-pattern r)) refs)))))
+                    (let [targets (values-of db e attr)]
+                      (if (empty? targets)
+                        m
+                        (assoc m attr
+                               (collapse db attr
+                                         (filterv some?
+                                                  (mapv (fn [t] (pull db sub-pattern t))
+                                                        targets)))))))))
+              acc
+              (seq element))
+
+    :else (throw (ex-info "unrecognised pull pattern element" {:element element}))))
+
+(defn pull
+  "Read `pattern` from entity `e` as a map.
+
+   Returns nil when the entity has no datoms \u2014 distinct from `{}`, which
+   would claim the entity exists but matched nothing in the pattern."
+  [db pattern e]
+  (let [ds (datom.db/entity-datoms db e)]
+    (if (empty? ds)
+      nil
+      (reduce (fn [acc element] (pull-element db acc e element)) {:db/id e} pattern))))
+
+(defn pull-many
+  "Pull the same pattern from several entities, in order."
+  [db pattern entities]
+  (mapv (fn [e] (pull db pattern e)) entities))
+
+;; ── lookup refs ─────────────────────────────────────────────────────
+
+(defn lookup-ref
+  "Resolve `[:attr value]` to an entity id, or nil.
+
+   A lookup ref names an entity by a UNIQUE attribute value rather than
+   by id: `[:person/email \"ada@example.com\"]` is how you refer to a
+   person without knowing their id \u2014 in a transaction, in a query, or
+   here.
+
+   Requires a `:db/unique` attribute, and says so rather than returning
+   an arbitrary match: `find the entity with this value` is only a
+   well-formed question when at most one entity can have it."
+  [db ref]
+  (let [attr (get ref 0)
+        v (get ref 1)]
+    (if (not (datom.schema/unique? (datom.db/schema-of db) attr))
+      (throw (ex-info "a lookup ref needs a :db/unique attribute"
+                      {:attr attr :ref ref}))
+      (let [hits (datom.db/datoms db :avet attr v)]
+        (if (empty? hits) nil (datom.index/-e (first hits)))))))
+
+(defn resolve-entity
+  "An entity id from either an id or a lookup ref.
+
+   Lets every entity-taking function accept both spellings without each
+   one restating the rule."
+  [db e]
+  (if (vector? e) (lookup-ref db e) e))
