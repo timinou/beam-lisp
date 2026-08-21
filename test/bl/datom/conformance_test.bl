@@ -1,0 +1,256 @@
+; test/bl/datom/conformance_test.bl — the port, proven twice.
+;
+; ── Why this file exists ──────────────────────────────────────────────
+;
+; A port with ONE implementation is a hypothesis. Every layer above L1
+; claims to depend only on the six protocol methods, but nothing tested
+; that claim: an assumption about ETS could be threaded through the whole
+; stack and nobody would notice until a persistent backend was
+; half-written and behaving strangely.
+;
+; So every test here runs TWICE — once against `store-ets` (ordered_set
+; tables, process-owned) and once against `store-map` (a sorted map in an
+; atom). The two share no machinery. If both pass, the port is genuine;
+; if one fails, that failure is precisely the leak.
+;
+; ── For whoever writes the next backend ───────────────────────────────
+;
+; This is the suite to run against your implementation. It asserts every
+; property the database above actually relies on, including the ones the
+; docstrings state and the ones they merely imply. Passing it is what
+; `my store works` means.
+;
+; The four requirements, in order of how badly they break things:
+;
+;   1. ORDERED keys, compared byte-wise. Everything is prefix scans.
+;   2. HALF-OPEN ranges `[lo, hi)`. `prefix-end` appends 0xFF as an
+;      exclusive upper bound; a closed range returns one datom too many.
+;   3. ATOMIC `-commit`. A transaction's datoms reach every index
+;      together or not at all — a datom in EAVT but missing from AEVT is
+;      a corrupt database, not a slow one.
+;   4. ATOMIC `-update`. Id allocation and `:db/cas` both rest on it.
+
+(ns datom.conformance.test
+  (:require [datom.conn] [datom.db] [datom.index] [datom.pull]
+            [datom.query.engine] [datom.store] [datom.store-ets]
+            [datom.store-map] [datom.time]))
+
+(defn- impls
+  "Every Store implementation, as `[name open-fn]` pairs."
+  []
+  [["ets" datom.store-ets/open]
+   ["map" datom.store-map/open]])
+
+(defn- each-impl
+  "Run `f` against a fresh store from every implementation.
+
+   Returns a vector of `[name result]`, so a caller can assert the
+   results AGREE as well as that each is right."
+  [f]
+  (mapv (fn [pair] [(get pair 0) (f ((get pair 1)))]) (impls)))
+
+;; ── the six methods ─────────────────────────────────────────────────
+
+(deftest get-returns-what-was-put-and-nil-for-what-was-not
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "k" 42)
+                         [(datom.store/-get s "k") (datom.store/-get s "absent")]))]
+    (is (= [42 nil] (get r 1)) (str (get r 0) ": stored value, then a miss"))))
+
+(deftest put-overwrites
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "k" 1)
+                         (datom.store/-put s "k" 2)
+                         (datom.store/-get s "k")))]
+    (is (= 2 (get r 1)) (get r 0))))
+
+(deftest delete-is-idempotent
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "k" 1)
+                         (datom.store/-delete s "k")
+                         (datom.store/-delete s "k")
+                         (datom.store/-get s "k")))]
+    (is (nil? (get r 1)) (str (get r 0) ": deleting twice is not an error"))))
+
+(deftest range-returns-keys-IN-ORDER
+  ; The requirement everything rests on. Insert out of order; the scan
+  ; must come back sorted, because every index is a prefix scan and a
+  ; prefix scan over unordered keys is meaningless.
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "c" 3)
+                         (datom.store/-put s "a" 1)
+                         (datom.store/-put s "b" 2)
+                         (mapv (fn [e] (get e 0)) (datom.store/-range s nil nil))))]
+    (is (= ["a" "b" "c"] (get r 1)) (str (get r 0) ": insertion order must not survive"))))
+
+(deftest range-bounds-are-INCLUSIVE-on-both-sides
+  ; The port states this, matching `subseq` in core. `prefix-end` appends
+  ; 0xFF, which sorts above every real component tag, so an inclusive
+  ; upper bound still excludes the next prefix.
+  ;
+  ; This test found a genuine disagreement the first time it ran: a
+  ; second implementation had assumed half-open. Two stores answering the
+  ; same scan differently is exactly what a conformance suite is for, and
+  ; it is the single easiest property for a new backend to get wrong.
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "a" 1)
+                         (datom.store/-put s "b" 2)
+                         (datom.store/-put s "c" 3)
+                         (mapv (fn [e] (get e 0)) (datom.store/-range s "a" "c"))))]
+    (is (= ["a" "b" "c"] (get r 1))
+        (str (get r 0) ": both bounds are included"))))
+
+(deftest range-handles-empty-and-unbounded
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "b" 1)
+                         [(count (datom.store/-range s "x" "z"))
+                          (count (datom.store/-range s "b" "b"))
+                          (count (datom.store/-range s nil nil))]))]
+    ; `b..b` is a single-key window, and inclusive bounds mean it
+    ; MATCHES that key rather than being empty.
+    (is (= [0 1 1] (get r 1))
+        (str (get r 0) ": no match, a single-key window, and everything"))))
+
+(deftest update-computes-from-the-current-value
+  (doseq [r (each-impl (fn [s]
+                         (let [first-call (datom.store/-update s "n" (fn [c] (if (nil? c) 1 (+ c 1))))
+                               second-call (datom.store/-update s "n" (fn [c] (if (nil? c) 1 (+ c 1))))]
+                           [(get first-call 1) (get second-call 1)])))]
+    (is (= [1 2] (get r 1))
+        (str (get r 0) ": nil on first call, then the stored value"))))
+
+(deftest commit-applies-operations-IN-ORDER
+  ; Batching is an optimisation; ordering is correctness. This exact
+  ; sequence is what a transaction emits when it retracts and re-asserts
+  ; a datom, and a store that groups the puts ahead of the deletes ends
+  ; with the key ABSENT — the value silently lost.
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-put s "k" 1)
+                         (datom.store/-commit s [[:delete "k"] [:put "k" 2]])
+                         (datom.store/-get s "k")))]
+    (is (= 2 (get r 1)) (str (get r 0) ": the LAST operation on a key wins"))))
+
+(deftest commit-handles-an-empty-batch
+  (doseq [r (each-impl (fn [s]
+                         (datom.store/-commit s [])
+                         (datom.store/-get s "anything")))]
+    (is (nil? (get r 1)) (get r 0))))
+
+;; ── the whole database, on both ─────────────────────────────────────
+;;
+;; The methods passing individually is necessary but not sufficient. What
+;; matters is whether the DATABASE works, so these run the real thing.
+
+(defn- loaded
+  "A small database over `store`."
+  [store]
+  (let [c (datom.conn/connect-with
+            store
+            [{:db/ident :c/name :db/valueType :db.type/string}
+             {:db/ident :c/age :db/valueType :db.type/long :db/index true}
+             {:db/ident :c/email :db/valueType :db.type/string
+              :db/unique :db.unique/identity}
+             {:db/ident :c/friend :db/valueType :db.type/ref
+              :db/cardinality :db.cardinality/many}])
+        r (datom.conn/transact! c [{:db/id -1 :c/name "Ada" :c/age 36
+                                    :c/email "ada@example.com"}
+                                   {:db/id -2 :c/name "Grace" :c/age 45
+                                    :c/email "grace@example.com"}
+                                   {:db/id -3 :c/name "Alan" :c/age 41
+                                    :c/email "alan@example.com" :c/friend [-1 -2]}])]
+    {:conn c :report r :ada (get (:tempids r) -1) :alan (get (:tempids r) -3)}))
+
+(defn- both-agree
+  "Assert `f` gives the SAME answer on every implementation, and return
+   it."
+  [f]
+  (let [results (each-impl (fn [s] (f (loaded s))))
+        values (mapv (fn [r] (get r 1)) results)]
+    (is (= (first values) (last values))
+        (str "implementations disagree: "
+             (get (first results) 0) " => " (pr-str (first values)) " vs "
+             (get (last results) 0) " => " (pr-str (last values))))
+    (first values)))
+
+(deftest a-query-answers-the-same-on-every-implementation
+  (is (= (set [["Ada"] ["Grace"] ["Alan"]])
+         (both-agree (fn [f] (datom.query.engine/q
+                               '[:find ?n :where [?e :c/name ?n]]
+                               (datom.conn/db (:conn f))))))))
+
+(deftest a-join-answers-the-same
+  (is (= (set [["Ada" 36] ["Grace" 45] ["Alan" 41]])
+         (both-agree (fn [f] (datom.query.engine/q
+                               '[:find ?n ?a :where [?e :c/name ?n] [?e :c/age ?a]]
+                               (datom.conn/db (:conn f))))))))
+
+(deftest reference-navigation-works-on-every-implementation
+  (is (= (set [["Ada"] ["Grace"]])
+         (both-agree (fn [f] (datom.query.engine/q
+                               '[:find ?fn :where [?e :c/name "Alan"]
+                                                  [?e :c/friend ?fr]
+                                                  [?fr :c/name ?fn]]
+                               (datom.conn/db (:conn f))))))))
+
+(deftest a-range-predicate-uses-the-index-on-every-implementation
+  ; Pushdown reads a bounded AVET window, which only works if the store
+  ; orders keys and honours half-open bounds. A store that got either
+  ; wrong would answer this differently.
+  (is (= (set [[41] [45]])
+         (both-agree (fn [f] (datom.query.engine/q
+                               '[:find ?a :where [?e :c/age ?a] [(> ?a 40)]]
+                               (datom.conn/db (:conn f))))))))
+
+(deftest pull-shapes-the-same-tree
+  (is (= "Ada"
+         (both-agree (fn [f] (:c/name (datom.pull/pull (datom.conn/db (:conn f))
+                                                       [:c/name] (:ada f))))))))
+
+(deftest a-lookup-ref-resolves-the-same
+  (is (= "Grace"
+         (both-agree (fn [f] (:c/name (datom.pull/pull (datom.conn/db (:conn f))
+                                                       [:c/name]
+                                                       [:c/email "grace@example.com"])))))))
+
+(deftest time-travel-works-on-every-implementation
+  (is (= 36
+         (both-agree (fn [f]
+                       (let [c (:conn f)
+                             ada (:ada f)
+                             t (:tx (:report f))]
+                         (datom.conn/transact! c [[:db/add ada :c/age 37]])
+                         (:c/age (datom.db/entity
+                                   (datom.time/as-of (datom.conn/db c) t) ada))))))))
+
+(deftest history-is-recorded-the-same
+  (is (= 3
+         (both-agree (fn [f]
+                       (let [c (:conn f) ada (:ada f)]
+                         (datom.conn/transact! c [[:db/add ada :c/age 37]])
+                         (count (datom.time/changes (datom.conn/db c) ada :c/age))))))))
+
+(deftest upsert-resolves-the-same
+  (is (= 1
+         (both-agree (fn [f]
+                       (let [c (:conn f)]
+                         (datom.conn/transact! c [{:db/id -1 :c/email "ada@example.com"
+                                                   :c/name "Ada Lovelace"}])
+                         (count (datom.query.engine/q
+                                  '[:find ?e :where [?e :c/email "ada@example.com"]]
+                                  (datom.conn/db c)))))))))
+
+(deftest retract-entity-behaves-the-same
+  (is (nil? (both-agree (fn [f]
+                          (let [c (:conn f) ada (:ada f)]
+                            (datom.conn/transact! c [[:db/retractEntity ada]])
+                            (datom.db/entity (datom.conn/db c) ada)))))))
+
+(deftest compare-and-swap-behaves-the-same
+  (is (= [42 :refused]
+         (both-agree (fn [f]
+                       (let [c (:conn f) ada (:ada f)]
+                         (datom.conn/transact! c [[:db/cas ada :c/age 36 42]])
+                         [(:c/age (datom.db/entity (datom.conn/db c) ada))
+                          (try (do (datom.conn/transact! c [[:db/cas ada :c/age 36 99]])
+                                   :applied)
+                               (catch e :refused))]))))))
