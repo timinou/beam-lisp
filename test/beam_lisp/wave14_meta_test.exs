@@ -151,8 +151,13 @@ defmodule BeamLisp.Wave14MetaTest do
     end
 
     test "doc_string resolves through the core fallback after a merge" do
-      assert Env.doc_string("user", "zipmap") ==
-               %{ns: "core", name: "zipmap", doc: "Builds a map from parallel keys and values."}
+      # Asserts the RESOLUTION path (user ns -> core fallback), not the
+      # prose. Pinning the full docstring made this test fail whenever a
+      # core docstring was improved, which punishes exactly the change it
+      # should be neutral about.
+      resolved = Env.doc_string("user", "zipmap")
+      assert %{ns: "core", name: "zipmap"} = resolved
+      assert String.starts_with?(resolved.doc, "Builds a map from parallel keys and values.")
     end
 
     test "doc_string resolves a referred var" do
@@ -160,6 +165,122 @@ defmodule BeamLisp.Wave14MetaTest do
       Env.put_meta("w14-other", "w14-referred", %{doc: "referred docs"})
       assert Env.doc_string("user", "w14-referred") ==
                %{ns: "w14-other", name: "w14-referred", doc: "referred docs"}
+    end
+  end
+
+  # ── Metadata on VECTORS (BUG-009) ────────────────────────────────────
+  #
+  # `with-meta` routed every collection through `FormMeta`, whose
+  # `{:meta, form, m}` wrapper is a COMPILE-TIME node the compiler strips
+  # before codegen. Applied to a runtime vector, nothing ever strips it,
+  # so the wrapper escaped into user data where `conj`/`count`/`get`/
+  # `vector?` all correctly failed to match it: `with-meta` silently
+  # turned a working vector into an unusable value.
+  #
+  # A vector now carries metadata in a struct FIELD, so it stays a
+  # vector. The contract being pinned is Clojure's: metadata is visible
+  # to `meta` and invisible to EVERYTHING else.
+  describe "metadata on vectors" do
+    test "a vector with metadata is still a usable vector" do
+      assert eval(~S|(vector? (with-meta [1 2] {:k 1}))|) == true
+      assert eval(~S|(count (with-meta [1 2] {:k 1}))|) == 2
+      assert eval(~S|(get (with-meta [1 2] {:k 1}) 0)|) == 1
+      assert eval(~S|(nth (with-meta [1 2] {:k 1}) 1)|) == 2
+      assert RT.eqv(eval(~S|(conj (with-meta [1 2] {:k 1}) 3)|), Vector.new([1, 2, 3]))
+    end
+
+    test "metadata round-trips" do
+      assert eval(~S|(meta (with-meta [1 2] {:k 1}))|) == %{k: 1}
+      assert eval(~S|(meta [1 2])|) == nil
+      assert eval(~S|(meta (with-meta (with-meta [1] {:k 1}) nil))|) == nil
+    end
+
+    test "conj and assoc carry metadata forward, as in Clojure" do
+      assert eval(~S|(meta (conj (with-meta [1] {:k 1}) 2))|) == %{k: 1}
+      assert eval(~S|(meta (assoc (with-meta [1] {:k 1}) 0 9))|) == %{k: 1}
+    end
+
+    test "vary-meta works on a plain vector" do
+      assert eval(~S|(meta (vary-meta [1] assoc :k 1))|) == %{k: 1}
+      assert eval(~S|(meta (vary-meta (with-meta [1] {:k 1}) assoc :j 2))|) == %{k: 1, j: 2}
+    end
+
+    # The half that is easy to forget: `=` must not see metadata. If it
+    # did, every equality test in the language would depend on an
+    # invisible field.
+    test "metadata is invisible to equality and printing" do
+      assert eval(~S|(= (with-meta [1 2] {:k 1}) [1 2])|) == true
+      assert eval(~S|(= [1 2] (with-meta [1 2] {:k 1}))|) == true
+      assert eval(~S|(pr-str (with-meta [1 2] {:k 1}))|) == "[1 2]"
+    end
+
+    # And if `=` ignores metadata then HASHING must too, or the
+    # equality/hash contract breaks in the direction hardest to debug:
+    # two values compare equal, print identically, and still miss each
+    # other as map keys.
+    test "metadata is invisible to hashing" do
+      assert eval(~S|(get {(with-meta [1 2] {:k 1}) :found} [1 2])|) == :found
+      assert eval(~S|(get (assoc {} (with-meta [1 2] {:k 1}) :found) [1 2])|) == :found
+      assert eval(~S|(get {[1 2] :found} (with-meta [1 2] {:k 1}))|) == :found
+      assert eval(~S|(contains? {(with-meta [1 2] {:k 1}) :x} [1 2])|) == true
+      assert eval(~S|(count (distinct [(with-meta [1 2] {:k 1}) [1 2]]))|) == 1
+      assert eval(~S|(count (into #{} [(with-meta [1 2] {:k 1}) [1 2]]))|) == 1
+      assert eval(~S|(get (zipmap [(with-meta [1 2] {:k 1})] [:x]) [1 2])|) == :x
+      assert eval(~S|(get (frequencies [(with-meta [1 2] {:k 1}) [1 2]]) [1 2])|) == 2
+    end
+
+    test "nested metadata is invisible to hashing too" do
+      assert eval(~S|(get {[(with-meta [1] {:k 1})] :x} [[1]])|) == :x
+      assert eval(~S|(get {{:a (with-meta [1] {:k 1})} :x} {:a [1]})|) == :x
+      assert eval(~S|(= {:a (with-meta [1] {:k 1})} {:a [1]})|) == true
+    end
+  end
+
+  # ── `into` chooses by size (BUG-008) ─────────────────────────────────
+  #
+  # `into` took the transient path whenever `to` was transientable, which
+  # is every vector and map. But `transient`/`persistent!` pay a fixed
+  # cost per call and `conj!` pays `Process.get`/`Process.put` per
+  # element, so the transient was SLOWER at every realistic size —
+  # measured 13x at 500 elements and 88x at 2000, and quadratic when
+  # `into` was called per element inside a reduce.
+  describe "into" do
+    test "produces the same results whichever path it takes" do
+      assert RT.eqv(eval(~S|(into [1] [2 3])|), Vector.new([1, 2, 3]))
+      assert eval(~S|(into {} [[:a 1]])|) == %{a: 1}
+      assert eval(~S|(count (into #{} [1 2 2]))|) == 2
+      assert RT.eqv(eval(~S|(into [] (map inc [1 2 3]))|), Vector.new([2, 3, 4]))
+    end
+
+    test "crossing the transient threshold gives identical results" do
+      # 8192 is the measured crossover; span it in both directions.
+      small = eval(~S|(count (into [] (range 100)))|)
+      large = eval(~S|(count (into [] (range 20000)))|)
+      assert small == 100
+      assert large == 20000
+    end
+
+    test "a lazy `from` is not forced merely to pick an accumulator" do
+      # Counting an infinite seq to choose a path would hang; taking from
+      # it must stay lazy.
+      assert eval(~S|(count (into [] (take 5 (iterate inc 0))))|) == 5
+    end
+  end
+
+  # ── A map entry may be any two-element sequential (BUG-010) ──────────
+  describe "map entries" do
+    test "a LIST works as a map entry, not only a vector" do
+      assert eval(~S|(into {} '((:a 1)))|) == %{a: 1}
+      assert eval(~S|(conj {} '(:a 1))|) == %{a: 1}
+      assert eval(~S|(into {} '((:a 1) (:b 2)))|) == %{a: 1, b: 2}
+    end
+
+    test "a wrong-length entry fails with an actionable message" do
+      # A FunctionClauseError names an internal arity; this names the
+      # problem the caller can act on.
+      assert_raise ArgumentError, ~r/two-element entry/, fn ->
+        eval(~S|(conj {} '(:a 1 2))|)
+      end
     end
   end
 end

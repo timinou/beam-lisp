@@ -116,6 +116,29 @@
                        nil)))
                  ops)))
 
+(defn- claims-index
+  "Every tempid's identity claims, built in ONE pass over `ops`.
+
+   `identity-claims` walks all of `ops` for ONE tempid, so calling it per
+   tempid is O(ops x tempids) \u2014 and `resolve-tempids` called it inside a
+   nested loop, making it worse still. A bulk transaction is exactly the
+   case where that bites: 400 entities took over two minutes, and the
+   cost is quadratic in the size of the transaction rather than in the
+   database.
+
+   This is a map from tempid to its `[attr value]` claims, so the callers
+   below index instead of scanning."
+  [schema ops]
+  (reduce (fn [acc op]
+            (let [e (get op 1) a (get op 2) v (get op 3)]
+              (if (and (tempid? e)
+                       (= (get op 0) :db/add)
+                       (datom.schema/identity-attr? schema a))
+                (assoc acc e (conj (or (get acc e) []) [a v]))
+                acc)))
+          {}
+          ops))
+
 (defn- upsert-target
   "The existing entity a tempid's `:db.unique/identity` values resolve to,
    or nil.
@@ -126,11 +149,11 @@
    Raises when one tempid claims identities belonging to DIFFERENT
    existing entities — that transaction has no correct outcome, and
    silently picking the first would merge two people."
-  [store schema ops tempid]
+  [store claims]
   (let [targets (into [] (distinct (filterv some?
                                             (mapv (fn [claim]
                                                     (current-holder store (get claim 0) (get claim 1)))
-                                                  (identity-claims schema ops tempid)))))]
+                                                  claims))))]
     (cond
       (empty? targets) nil
       (= 1 (count targets)) (first targets)
@@ -172,34 +195,47 @@
                                                     (get op 3)
                                                     nil))
                                                 ops)))))
+        ; Every tempid's identity claims, in one pass rather than one
+        ; pass PER TEMPID.
+        claims-by-tempid (claims-index schema ops)
         ; First pass: existing entities an identity claim points at.
         existing (reduce (fn [acc t]
-                           (let [target (upsert-target store schema ops t)]
+                           (let [target (upsert-target store (or (get claims-by-tempid t) []))]
                              (if (some? target) (assoc acc t target) acc)))
                          {}
                          tempids)
         ; Second pass: tempids with no existing target get a fresh id —
-        ; but tempids sharing an identity claim share that id.
+        ; but tempids sharing an identity claim share that id. Indexing
+        ; claim -> tempid makes finding a twin a LOOKUP; scanning every
+        ; other tempid (and recomputing its claims) was the third nested
+        ; walk over the transaction.
         mapping (reduce (fn [acc t]
                           (if (contains? acc t)
                             acc
-                            (let [claims (identity-claims schema ops t)
-                                  twin (reduce (fn [found other]
+                            (let [claims (or (get claims-by-tempid t) [])
+                                  twin (reduce (fn [found c]
                                                  (if (some? found)
                                                    found
-                                                   (if (and (not (= other t))
-                                                            (contains? acc other)
-                                                            (seq claims)
-                                                            (seq (filterv (fn [c]
-                                                                            (contains? (set (identity-claims schema ops other)) c))
-                                                                          claims)))
-                                                     (get acc other)
-                                                     nil)))
+                                                   (get (get acc :by-claim) c)))
                                                nil
-                                               tempids)]
-                              (assoc acc t (or twin (next-id-fn))))))
-                        existing
+                                               claims)
+                                  id (or twin (next-id-fn))]
+                              (assoc (reduce (fn [a c]
+                                               (assoc a :by-claim
+                                                      (assoc (or (get a :by-claim) {}) c id)))
+                                             acc
+                                             claims)
+                                     t id))))
+                        (assoc existing :by-claim
+                               (reduce (fn [a t]
+                                         (reduce (fn [b c] (assoc b c (get existing t)))
+                                                 a
+                                                 (or (get claims-by-tempid t) [])))
+                                       {}
+                                       (filterv (fn [t] (contains? existing t)) tempids)))
                         tempids)
+        ; the claim index is scaffolding, not part of the answer
+        mapping (dissoc mapping :by-claim)
         resolve (fn [x] (if (and (tempid? x) (contains? mapping x)) (get mapping x) x))]
     [(mapv (fn [op]
              ; Resolve the entity position AND the value position: a ref
@@ -232,9 +268,19 @@
    to hold one."
   [store e a pending]
   (let [relevant (into (datom.index/scan store :eavt e a)
-                       (filterv (fn [d] (and (= (datom.index/-e d) e)
-                                             (= (datom.index/-a d) a)))
-                                pending))]
+                       ; `pending` is either a raw vector of datoms or an
+                       ; index of [e a] -> datoms. The index matters
+                       ; because realization calls this once PER
+                       ; OPERATION: filtering the whole pending list each
+                       ; time is O(ops^2) within a single transaction,
+                       ; which made a 400-entity transaction take minutes
+                       ; while the same data in 400 transactions was
+                       ; fast.
+                       (if (map? pending)
+                         (or (get pending [e a]) [])
+                         (filterv (fn [d] (and (= (datom.index/-e d) e)
+                                               (= (datom.index/-a d) a)))
+                                  pending)))]
     ; Replay in tx order: an assertion adds a value, a retraction removes
     ; it. What survives the fold is what currently holds.
     (reduce (fn [acc d]
@@ -298,11 +344,6 @@
   [d]
   [(datom.index/-e d) (datom.index/-a d) (datom.index/-v d)])
 
-(defn- held-before?
-  "Whether `[e a]` held `v` BEFORE this transaction ran."
-  [store e a v]
-  (contains? (set (current-values store e a [])) v))
-
 (defn- net-datoms
   "Reduce a transaction's datoms to its NET effect.
 
@@ -333,7 +374,17 @@
   (let [last-index (reduce (fn [acc pair]
                              (assoc acc (fact-key (get pair 1)) (get pair 0)))
                            {}
-                           (map-indexed (fn [i d] [i d]) datoms))]
+                           (map-indexed (fn [i d] [i d]) datoms))
+        ; The pre-transaction value set for each [e a] touched, scanned
+        ; ONCE. `held-before?` scans per FACT, and a cardinality-many
+        ; attribute with k values would scan k times for the same [e a].
+        held-by-ea (reduce (fn [acc d]
+                             (let [k [(datom.index/-e d) (datom.index/-a d)]]
+                               (if (contains? acc k)
+                                 acc
+                                 (assoc acc k (set (current-values store (get k 0) (get k 1) []))))))
+                           {}
+                           datoms)]
     (filterv some?
              (map-indexed
                (fn [i d]
@@ -341,8 +392,8 @@
                    (if (not (= i (get last-index k)))
                      ; superseded within this transaction
                      nil
-                     (let [held (held-before? store (datom.index/-e d)
-                                              (datom.index/-a d) (datom.index/-v d))]
+                     (let [held (contains? (get held-by-ea [(datom.index/-e d) (datom.index/-a d)])
+                                           (datom.index/-v d))]
                        (if (= (datom.index/assertion? d) held)
                          ; agrees with the pre-transaction state: no change
                          nil
@@ -356,10 +407,22 @@
    sees the transaction's own earlier effects, then reduces the result to
    the transaction's NET effect (see `net-datoms`)."
   [store schema tx ops]
-  (net-datoms store
-              (reduce (fn [acc op] (into acc (realize-op store schema tx op acc)))
-                      []
-                      ops)))
+  (let [result (reduce
+                 (fn [acc op]
+                   (let [produced (realize-op store schema tx op (get acc :index))]
+                     {:datoms (into (get acc :datoms) produced)
+                      ; Keep the pending datoms indexed by [e a] as we
+                      ; go, so each operation looks up only the facts it
+                      ; is about rather than re-scanning everything the
+                      ; transaction has produced so far.
+                      :index (reduce (fn [idx d]
+                                       (let [k [(datom.index/-e d) (datom.index/-a d)]]
+                                         (assoc idx k (conj (or (get idx k) []) d))))
+                                     (get acc :index)
+                                     produced)}))
+                 {:datoms [] :index {}}
+                 ops)]
+    (net-datoms store (get result :datoms))))
 
 ;; ── validation ──────────────────────────────────────────────────────
 

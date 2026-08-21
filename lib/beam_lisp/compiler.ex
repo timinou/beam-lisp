@@ -129,7 +129,16 @@ defmodule BeamLisp.Compiler do
   end
 
   defp do_compile({:map, kvs}, env) do
-    {:%{}, [], Enum.map(kvs, fn {k, v} -> {compile(k, notail(env)), compile(v, notail(env))} end)}
+    # Keys go through `RT.hash_key/1`: metadata is invisible to `=`, so it
+    # must be invisible to hashing too. Without this, `(get {v :x} [1 2])`
+    # is nil for a `v` that compares EQUAL to `[1 2]` — the equality/hash
+    # contract broken in the direction that is hardest to debug, since
+    # every printed representation looks identical.
+    {:%{}, [],
+     Enum.map(kvs, fn {k, v} ->
+       {quote(do: BeamLisp.RT.hash_key(unquote(compile(k, notail(env))))),
+        compile(v, notail(env))}
+     end)}
   end
 
   # A `#Name{...}` (or `#ns/Name{...}`) record literal: the reader emits

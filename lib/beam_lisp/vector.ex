@@ -19,9 +19,19 @@ defmodule BeamLisp.Vector do
   @trie_tag :bl_vec
   @leaf_mask 0x1f
 
-  defstruct items: {}
+  # `meta` carries Clojure metadata. It defaults to nil and is compared
+  # by NOTHING: `RT.eqv/2` routes vectors through `eqv_vector`, which
+  # walks elements, so two vectors differing only in metadata stay equal
+  # — Clojure's contract, where metadata is invisible to `=`.
+  #
+  # It lives on the struct rather than in a side table because a BEAM
+  # term has no identity to key a side table by: `[1]` and `[1]` are the
+  # same term, so keying metadata by value would leak it between
+  # unrelated vectors. (That is exactly why `BeamLisp.Meta` supports only
+  # lazy seqs, which DO carry a per-instance ref.)
+  defstruct items: {}, meta: nil
 
-  @type t :: %__MODULE__{items: tuple}
+  @type t :: %__MODULE__{items: tuple, meta: map | nil}
 
   # A trie only ever holds > 32 elements (≤ 32 lives in the tail tuple),
   # so requiring `cnt > 32` disambiguates the tag from an ordinary
@@ -68,7 +78,11 @@ defmodule BeamLisp.Vector do
   defp tl_or_empty([]), do: []
 
   @doc "Clojure `conj`: append, amortized O(1) via the tail buffer."
-  def conj(%__MODULE__{items: items}, x), do: %__MODULE__{items: conj_items(items, x)}
+  # Metadata survives `conj`/`assoc`, as in Clojure: metadata belongs to
+  # the value and is carried by operations that return a vector of the
+  # same logical thing.
+  def conj(%__MODULE__{items: items, meta: m}, x),
+    do: %__MODULE__{items: conj_items(items, x), meta: m}
 
   defp conj_items(items, x) do
     if trie?(items) do
@@ -83,21 +97,21 @@ defmodule BeamLisp.Vector do
   end
 
   @doc "Clojure `assocN`: replace at `i`; `i == count` appends like `conj`."
-  def assoc(%__MODULE__{items: items}, i, x) when is_integer(i) and i >= 0 do
+  def assoc(%__MODULE__{items: items, meta: m}, i, x) when is_integer(i) and i >= 0 do
     if trie?(items) do
       cnt = elem(items, 1)
 
       cond do
-        i < cnt -> %__MODULE__{items: do_assoc(items, i, x)}
-        i == cnt -> %__MODULE__{items: trie_conj(items, x)}
+        i < cnt -> %__MODULE__{items: do_assoc(items, i, x), meta: m}
+        i == cnt -> %__MODULE__{items: trie_conj(items, x), meta: m}
         true -> raise ArgumentError, "assoc index #{i} out of bounds (count #{cnt})"
       end
     else
       n = tuple_size(items)
 
       cond do
-        i < n -> %__MODULE__{items: put_elem(items, i, x)}
-        i == n -> %__MODULE__{items: conj_items(items, x)}
+        i < n -> %__MODULE__{items: put_elem(items, i, x), meta: m}
+        i == n -> %__MODULE__{items: conj_items(items, x), meta: m}
         true -> raise ArgumentError, "assoc index #{i} out of bounds (count #{n})"
       end
     end

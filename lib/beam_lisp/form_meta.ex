@@ -37,6 +37,10 @@ defmodule BeamLisp.FormMeta do
   """
   def meta({:meta, _form, m}), do: m
   def meta(%BeamLisp.LazySeq{} = lazy), do: BeamLisp.Meta.meta(lazy)
+  # A vector carries metadata in a struct FIELD, so it stays a working
+  # vector: wrapping one in `{:meta, …}` produced a value that `conj`,
+  # `count`, `get` and `vector?` all failed on (BUG-009).
+  def meta(%BeamLisp.Vector{meta: m}), do: m
   def meta(_form), do: nil
 
   @doc """
@@ -52,6 +56,15 @@ defmodule BeamLisp.FormMeta do
   Map".
   """
   def with_meta(%BeamLisp.LazySeq{} = lazy, m), do: BeamLisp.Meta.with_meta(lazy, m)
+
+  # A vector stores metadata in its own field rather than a wrapper node,
+  # so it remains usable by every collection function.
+  def with_meta(%BeamLisp.Vector{} = v, nil), do: %BeamLisp.Vector{v | meta: nil}
+
+  # is_map-ok: `m` is the metadata map the caller attaches, never a
+  # collection value — the same contract as the form clause below.
+  def with_meta(%BeamLisp.Vector{} = v, m) when is_map(m),
+    do: %BeamLisp.Vector{v | meta: m}
 
   # nil clears: unwrap a metadata-carrying form back to its bare form.
   def with_meta({:meta, form, _m}, nil), do: form

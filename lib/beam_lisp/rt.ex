@@ -95,6 +95,89 @@ defmodule BeamLisp.RT do
     end
   end
 
+  @doc """
+  A value normalized for use as a HASH KEY.
+
+  Metadata is invisible to `=` (Clojure's contract, and what `eqv/2`
+  implements for vectors), so it must be invisible to hashing too \u2014
+  otherwise `(= a b)` is true while `(get {a :x} b)` is nil, and the
+  same value counts twice under `distinct` or in a set. Elixir maps and
+  MapSets key on the raw term, which DOES see the struct field, so the
+  metadata is stripped here at every hash boundary.
+
+  Nested collections are normalized recursively: a vector holding a
+  metadata-bearing vector must hash like the plain one.
+  """
+  def hash_key(%BeamLisp.Vector{items: items, meta: m} = v) do
+    normalized = if m == nil, do: v, else: %BeamLisp.Vector{v | meta: nil}
+
+    case items do
+      t when is_tuple(t) and not (tuple_size(t) == 5 and elem(t, 0) == :bl_vec) ->
+        # Rebuild only when something inside actually carries metadata.
+        # `hash_key` runs on EVERY map/set key operation, so the
+        # overwhelmingly common case — no metadata anywhere — must not
+        # allocate a new vector per lookup.
+        if needs_normalizing?(t) do
+          %BeamLisp.Vector{
+            normalized
+            | items: t |> Tuple.to_list() |> Enum.map(&hash_key/1) |> List.to_tuple()
+          }
+        else
+          normalized
+        end
+
+      _ ->
+        normalized
+    end
+  end
+
+  def hash_key(%Set{members: members} = s) do
+    if Enum.any?(members, &carries_meta?/1),
+      do: %Set{members: MapSet.new(Enum.map(members, &hash_key/1))},
+      else: s
+  end
+
+  def hash_key(xs) when is_list(xs) do
+    if Enum.any?(xs, &carries_meta?/1), do: Enum.map(xs, &hash_key/1), else: xs
+  end
+
+  # is_map-ok: normalizing a plain map's keys and values for hashing.
+  def hash_key(m) when is_bl_map(m) do
+    if Enum.any?(m, fn {k, v} -> carries_meta?(k) or carries_meta?(v) end),
+      do: Map.new(m, fn {k, v} -> {hash_key(k), hash_key(v)} end),
+      else: m
+  end
+
+  def hash_key(other), do: other
+
+  defp needs_normalizing?(t) when is_tuple(t) do
+    Enum.any?(Tuple.to_list(t), &carries_meta?/1)
+  end
+
+  # Whether `x` holds metadata anywhere inside it. Cheap for the common
+  # case (a scalar answers immediately) and short-circuits on the first
+  # hit, so a deep structure is only walked as far as its first metadata.
+  defp carries_meta?(%BeamLisp.Vector{meta: m}) when m != nil, do: true
+
+  defp carries_meta?(%BeamLisp.Vector{items: items}) do
+    case items do
+      t when is_tuple(t) and not (tuple_size(t) == 5 and elem(t, 0) == :bl_vec) ->
+        needs_normalizing?(t)
+
+      _ ->
+        false
+    end
+  end
+
+  defp carries_meta?(%Set{members: members}), do: Enum.any?(members, &carries_meta?/1)
+  defp carries_meta?(xs) when is_list(xs), do: Enum.any?(xs, &carries_meta?/1)
+
+  # is_map-ok: scanning a plain map for nested metadata.
+  defp carries_meta?(m) when is_bl_map(m),
+    do: Enum.any?(m, fn {k, v} -> carries_meta?(k) or carries_meta?(v) end)
+
+  defp carries_meta?(_), do: false
+
   def get(m, key, default \\ nil)
   # A vector is a struct, so it is also a map — index access must be
   # matched before the map clause or `(get [a b] 1)` silently yields
@@ -134,7 +217,7 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def get(m, key, default) when is_bl_map(m), do: Map.get(m, key, default)
+  def get(m, key, default) when is_bl_map(m), do: Map.get(m, hash_key(key), default)
   def get(nil, _key, default), do: default
 
   @doc """
@@ -320,6 +403,13 @@ defmodule BeamLisp.RT do
 
   def list_star_0, do: nil
 
+  defp bad_map_entry(entry, n),
+    do:
+      raise(
+        ArgumentError,
+        "conj on a map takes a two-element entry, got #{n} elements: #{print_str(entry)}"
+      )
+
   # `(conj coll)` — the reducing-fn completion arity: returns coll unchanged.
   # Clojure defines this 1-arity (identity), and `transduce`'s `(f ret)`
   # completion step delegates to it, so a non-transientable `into` target
@@ -341,6 +431,7 @@ defmodule BeamLisp.RT do
   def conj(%SortedSet{} = s, x), do: Sorted.set_add(s, x)
 
   def conj(%SortedMap{} = m, %BeamLisp.Vector{items: {k, v}}), do: Sorted.map_put(m, k, v)
+  def conj(%SortedMap{} = m, [k, v]), do: Sorted.map_put(m, k, v)
 
   def conj(%SortedMap{}, other),
     do:
@@ -358,7 +449,29 @@ defmodule BeamLisp.RT do
   # entry too, preserving its type (Map.put keeps the struct); a non-record
   # struct reaching here has no conj contract and fails loudly.
   def conj(m, %BeamLisp.Vector{items: {k, v}}) when is_bl_map(m),
-    do: Map.put(m, k, v)
+    do: Map.put(m, hash_key(k), v)
+
+  # Clojure accepts any two-element SEQUENTIAL as a map entry, not only a
+  # vector — anything producing seqs of pairs (`partition 2`, a `map` over
+  # pairs, a destructured seq) feeds `into {}` naturally. Matching only
+  # the vector shape made those crash with a FunctionClauseError.
+  def conj(m, [k, v]) when is_bl_map(m), do: Map.put(m, hash_key(k), v)
+
+  def conj(m, entry) when is_bl_map(m) and is_list(entry),
+    do: bad_map_entry(entry, length(entry))
+
+  # A wrong-shape VECTOR entry gets the same actionable error as a
+  # wrong-shape list one. It used to fall through to a
+  # FunctionClauseError naming an internal arity, which tells the caller
+  # nothing about the entry they actually passed.
+  def conj(m, %BeamLisp.Vector{} = entry) when is_bl_map(m),
+    do: bad_map_entry(entry, BeamLisp.Vector.count(entry))
+
+  def conj(%{__struct__: mod} = m, [k, v]) when is_atom(mod) do
+    if BeamLisp.Record.record?(m),
+      do: Map.put(m, k, v),
+      else: raise(ArgumentError, "conj with a map entry is not supported on a struct")
+  end
 
   def conj(%{__struct__: mod} = m, %BeamLisp.Vector{items: {k, v}}) when is_atom(mod) do
     if BeamLisp.Record.record?(m),
@@ -581,7 +694,7 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def find(m, k) when is_bl_map(m), do: find_in_map(m, k)
+  def find(m, k) when is_bl_map(m), do: find_in_map(m, hash_key(k))
 
   def find(_m, _k), do: nil
 
@@ -617,7 +730,7 @@ defmodule BeamLisp.RT do
     if BeamLisp.Record.record?(m), do: k != :__struct__ and Map.has_key?(m, k), else: Map.has_key?(m, k)
   end
 
-  def contains?(m, k) when is_bl_map(m), do: Map.has_key?(m, k)
+  def contains?(m, k) when is_bl_map(m), do: Map.has_key?(m, hash_key(k))
   def contains?(_coll, _k), do: false
 
   # Keywords are BEAM atoms — but so are the booleans and nil, so a bare
@@ -1112,6 +1225,18 @@ defmodule BeamLisp.RT do
       sorted_set?(a) or sorted_set?(b) ->
         eqv_as_set(a, b)
 
+      # Two plain maps compare ENTRY-WISE rather than by `Kernel.==`, so a
+      # value carrying metadata equals its plain twin: metadata is
+      # invisible to `=`, including when it sits one level down. The raw
+      # term comparison sees the struct field and answers false for two
+      # maps the language considers equal.
+      is_bl_map(a) and is_bl_map(b) ->
+        eqv_as_map(a, b)
+
+      # Two sets likewise: membership is by normalized value.
+      match?(%Set{}, a) and match?(%Set{}, b) ->
+        eqv_as_set(a, b)
+
       true ->
         Kernel.==(a, b)
     end
@@ -1589,8 +1714,8 @@ defmodule BeamLisp.RT do
       do: Map.put(m, k, v),
       else: raise(ArgumentError, "assoc not supported on a struct")
   end
-  def assoc(coll, k, v) when is_bl_map(coll), do: Map.put(coll, k, v)
-  def assoc(nil, k, v), do: Map.put(%{}, k, v)
+  def assoc(coll, k, v) when is_bl_map(coll), do: Map.put(coll, hash_key(k), v)
+  def assoc(nil, k, v), do: Map.put(%{}, hash_key(k), v)
 
   @doc "Variadic `(assoc coll k v k2 v2 …)`."
   def assoc_variadic(coll, k, v, rest) when is_list(rest) do

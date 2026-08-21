@@ -25,13 +25,18 @@ defmodule BeamLisp.Set do
   def new(enum), do: %__MODULE__{members: MapSet.new(enum)}
 
   @doc "Set with `x` added (idempotent)."
-  def add(%__MODULE__{members: m} = s, x), do: %__MODULE__{s | members: MapSet.put(m, x)}
+  # Metadata is invisible to `=`, so it must be invisible to set
+  # membership too — otherwise a value and its metadata-bearing twin
+  # both live in the set while comparing equal.
+  def add(%__MODULE__{members: m} = s, x),
+    do: %__MODULE__{s | members: MapSet.put(m, BeamLisp.RT.hash_key(x))}
 
   @doc "Set with `x` removed (idempotent)."
-  def del(%__MODULE__{members: m} = s, x), do: %__MODULE__{s | members: MapSet.delete(m, x)}
+  def del(%__MODULE__{members: m} = s, x),
+    do: %__MODULE__{s | members: MapSet.delete(m, BeamLisp.RT.hash_key(x))}
 
   @doc "Membership test."
-  def member?(%__MODULE__{members: m}, x), do: MapSet.member?(m, x)
+  def member?(%__MODULE__{members: m}, x), do: MapSet.member?(m, BeamLisp.RT.hash_key(x))
 
   @doc "Cardinality."
   def count(%__MODULE__{members: m}), do: MapSet.size(m)
