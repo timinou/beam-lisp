@@ -1,0 +1,196 @@
+; datom/index.bl — datoms and the covering indexes over them.
+;
+; ── A datom ───────────────────────────────────────────────────────────
+;
+; `[e a v tx op]` — entity, attribute, value, transaction, and whether the
+; fact was asserted or retracted. Five values in a vector, no wrapper type:
+; a datom IS data, and the language already has the right shape for it.
+; That is the whole reason this layer reads as plain code.
+;
+; Datoms are never updated and never deleted. "Changing" an attribute
+; appends a retraction of the old value and an assertion of the new one.
+; The database is the accumulated log; the indexes are just orderings of
+; it. Time travel then costs nothing extra — it is a bound on `tx`, which
+; is why `as-of` in wave 5 is a filter rather than a copy.
+;
+; ── The four indexes ──────────────────────────────────────────────────
+;
+; The same datoms, ordered four ways. Which one serves a query is decided
+; by WHICH POSITIONS ARE BOUND — that is the planner's whole job (wave 3).
+;
+;   EAVT  e a v tx   "everything about entity 42"        → pull, entity
+;   AEVT  a e v tx   "every :person/name in the db"      → attribute scan
+;   AVET  a v e tx   "who is named Ada?"                 → lookup, ranges
+;   VAET  v a e tx   "what points AT entity 42?"         → reverse refs
+;
+; AVET and VAET are not free — each is another write per datom — so
+; Datomic only maintains them for attributes that ask (`:db/index`,
+; `:db.type/ref`). Wave 4 adds that selectivity; wave 2 writes EAVT and
+; AEVT, which every query needs.
+;
+; ── Keys are BINARIES, not tuples ─────────────────────────────────────
+;
+; See datom/codec.bl. Erlang orders tuples by ARITY before content, so a
+; tuple key cannot support prefix range bounds (BUG-005). Binary keys
+; compare byte-wise, so a proper prefix sorts immediately before its
+; extensions — which is exactly what an index scan needs.
+;
+; A key is: <index tag> <component> <component> …
+;
+; Because components are self-delimiting, a PARTIAL key is a valid prefix
+; bound: `(key-prefix :eavt 42)` brackets every datom about entity 42,
+; regardless of attribute or value.
+
+(ns datom.index
+  (:require [datom.codec] [datom.store]))
+
+;; ── datom construction and access ───────────────────────────────────
+;;
+;; Positional accessors rather than a record: a datom is a vector, and
+;; naming the positions is clearer at every call site than `(get d 2)`.
+
+(defn datom
+  "A datom: entity, attribute, value, transaction, assert/retract.
+
+   `op` is true for an assertion, false for a retraction — the same
+   convention Datomic's `:db/add` / `:db/retract` lower to."
+  [e a v tx op]
+  [e a v tx op])
+
+(defn -e "The entity id." [d] (get d 0))
+(defn -a "The attribute (a keyword)." [d] (get d 1))
+(defn -v "The value." [d] (get d 2))
+(defn -tx "The transaction id that recorded this datom." [d] (get d 3))
+(defn -op "True when asserted, false when retracted." [d] (get d 4))
+
+(defn assertion?
+  "Whether this datom asserts (rather than retracts) its fact."
+  [d]
+  (= true (-op d)))
+
+;; ── index tags ──────────────────────────────────────────────────────
+;;
+;; One leading byte partitions the keyspace, so every index lives in one
+;; store yet each scans independently. Distinct from the codec's VALUE
+;; tags: these name an index, not a type.
+
+(def IDX-EAVT 1)
+(def IDX-AEVT 2)
+(def IDX-AVET 3)
+(def IDX-VAET 4)
+
+(defn- idx-byte [t] (erlang/list_to_binary (to-list [t])))
+
+(defn index-components
+  "The datom components, in the order the named index sorts them.
+
+   This function IS the difference between the four indexes; everything
+   else about them is shared."
+  [index d]
+  (cond
+    (= index :eavt) [(-e d) (-a d) (-v d) (-tx d)]
+    (= index :aevt) [(-a d) (-e d) (-v d) (-tx d)]
+    (= index :avet) [(-a d) (-v d) (-e d) (-tx d)]
+    (= index :vaet) [(-v d) (-a d) (-e d) (-tx d)]
+    :else (throw (ex-info (str "unknown index: " index) {:index index}))))
+
+(defn- index-tag
+  [index]
+  (cond
+    (= index :eavt) IDX-EAVT
+    (= index :aevt) IDX-AEVT
+    (= index :avet) IDX-AVET
+    (= index :vaet) IDX-VAET
+    :else (throw (ex-info (str "unknown index: " index) {:index index}))))
+
+(defn key-for
+  "The full store key for `d` in `index`."
+  [index d]
+  (datom.codec/concat-bins
+    (cons (idx-byte (index-tag index))
+          (mapv datom.codec/encode-value (index-components index d)))))
+
+(defn key-prefix
+  "A partial key: the index tag followed by `components`.
+
+   This is what makes a range scan an index lookup. `(key-prefix :eavt 42)`
+   is a proper byte-prefix of every EAVT key for entity 42, so it is a
+   valid LOWER bound; `prefix-end` gives the matching upper bound."
+  [index & components]
+  (datom.codec/concat-bins
+    (cons (idx-byte (index-tag index))
+          (mapv datom.codec/encode-value (or components '())))))
+
+(defn prefix-end
+  "The exclusive-ish upper bound for a prefix scan.
+
+   Appending a 0xFF byte yields a key that sorts after every key sharing
+   the prefix but before the next prefix — because every real component
+   that follows begins with a type tag well below 0xFF. This is the
+   standard trick for prefix scans over an ordered byte keyspace, and it
+   is why the codec reserves the top of the tag space."
+  [prefix]
+  (datom.codec/concat-bins [prefix (erlang/list_to_binary (to-list [255]))]))
+
+;; ── writing ─────────────────────────────────────────────────────────
+
+(def WRITTEN-INDEXES
+  ; Wave 2 maintains the two indexes every query needs. AVET/VAET are
+  ; selective (per-attribute) and arrive in wave 4 — writing them for
+  ; every datom would double the write cost for facts nobody looks up
+  ; that way.
+  [:eavt :aevt])
+
+(defn put-ops
+  "Store operations that write `d` into every maintained index.
+
+   Returns ops rather than performing them, so a whole transaction's
+   datoms commit as ONE atomic batch. A datom written to two indexes
+   must never be visible in one and missing from the other."
+  [d]
+  (mapv (fn [index] [:put (key-for index d) d]) WRITTEN-INDEXES))
+
+(defn write-datoms
+  "Commit `datoms` to `store`, writing every index, atomically."
+  [store datoms]
+  (datom.store/-commit store (into [] (mapcat put-ops datoms))))
+
+;; ── reading ─────────────────────────────────────────────────────────
+
+(defn scan
+  "Every datom in `index` whose leading components equal `components`.
+
+   The bounded scan the whole system rests on:
+
+     (scan store :eavt 42)              every fact about entity 42
+     (scan store :eavt 42 :person/name) that entity's name datoms
+     (scan store :aevt :person/name)    every name in the database
+
+   Cost is proportional to the RESULT, not the database \u2014 the scan starts
+   at the prefix rather than filtering from the beginning."
+  [store index & components]
+  (let [prefix (apply key-prefix index (or components '()))]
+    (mapv (fn [entry] (get entry 1))
+          (datom.store/-range store prefix (prefix-end prefix)))))
+
+(defn scan-range
+  "Datoms in `index` between two INCLUSIVE value bounds on the component
+   following `components`.
+
+   This is a range predicate — `[?e :person/age ?a]` with `20 <= ?a <= 30`
+   becomes `(scan-range store :avet [:person/age] 20 30)`. It needs an
+   index whose next component is the value being bounded, which is what
+   AVET exists for.
+
+   `nil` on either bound means unbounded on that side."
+  [store index components low high]
+  (let [base (apply key-prefix index components)
+        lo (if (nil? low)
+             base
+             (datom.codec/concat-bins [base (datom.codec/encode-value low)]))
+        hi (if (nil? high)
+             (prefix-end base)
+             (prefix-end (datom.codec/concat-bins
+                           [base (datom.codec/encode-value high)])))]
+    (mapv (fn [entry] (get entry 1))
+          (datom.store/-range store lo hi))))

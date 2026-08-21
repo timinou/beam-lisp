@@ -1,0 +1,134 @@
+; datom/conn.bl — the connection: the one place writes happen.
+;
+; ── Why a single writer ───────────────────────────────────────────────
+;
+; A transaction must read the current state (to supersede cardinality-one
+; values, to resolve upserts) and then write, indivisibly. Two concurrent
+; transactions doing read-then-write would interleave and produce a
+; database where an entity has two values for a one-valued attribute, or
+; two entities share a unique value.
+;
+; Datomic solves this with a single transactor process. On the BEAM that
+; is not an architectural imposition but the natural shape: a GenServer
+; serialises its mailbox by construction, so transactions are atomic
+; because only one runs at a time. No locks, no retries, no CAS loop.
+;
+; READS do not go through here. A db value holds the store directly, so
+; queries run in the CALLING process, concurrently, with no contention
+; \u2014 the single writer is not a bottleneck on reads.
+;
+; ── What the connection holds ─────────────────────────────────────────
+;
+; The store, the schema, and the current basis-t. That is all mutable
+; state in the entire system; everything else is a value derived from it.
+
+(ns datom.conn
+  (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets] [datom.tx]))
+
+;; ── id allocation ───────────────────────────────────────────────────
+;;
+;; Entity and transaction ids come from counters in the store itself, via
+;; the port's atomic `-update`. Keeping them IN the store rather than in
+;; process state means a persistent substrate resumes numbering correctly
+;; after a restart \u2014 process state would forget.
+
+(def ENTITY-COUNTER-KEY :datom/entity-counter)
+(def TX-COUNTER-KEY :datom/tx-counter)
+
+; Transaction ids start high enough to be visually distinct from entity
+; ids in a datom, the same reason Datomic partitions its id space.
+(def FIRST-TX 1000000)
+
+(defn- next-entity-id
+  [store]
+  (get (datom.store/-update store ENTITY-COUNTER-KEY
+                            (fn [cur] (if (nil? cur) 1 (inc cur))))
+       1))
+
+(defn- next-tx-id
+  [store]
+  (get (datom.store/-update store TX-COUNTER-KEY
+                            (fn [cur] (if (nil? cur) FIRST-TX (inc cur))))
+       1))
+
+;; ── the connection ──────────────────────────────────────────────────
+;;
+;; A record holding the store, the schema, and the current basis in an
+;; atom. `transact!` does the read-modify-write directly.
+;;
+;; HONEST LIMITATION, stated rather than buried: this makes transactions
+;; atomic only under a SINGLE WRITER. Two processes transacting the same
+;; connection concurrently can interleave their read-then-write and
+;; produce a database where a cardinality-one attribute holds two values.
+;;
+;; The intended fix is a GenServer per connection — the BEAM's mailbox
+;; serialises by construction, which is exactly Datomic's transactor with
+;; no extra machinery. `defserver` cannot express it yet: it dispatches
+;; on a message VALUE, so a call carrying a payload (the tx-data) has no
+;; spelling. Recorded as FEAT-005 and scheduled before wave 5's review.
+
+(defrecord Conn [store schema basis])
+
+(defn connect
+  "Open a connection over a fresh store.
+
+   `schema-defs` are attribute definitions installed before any data, so
+   the very first transaction already knows its cardinalities."
+  ([] (connect []))
+  ([schema-defs]
+   (->Conn (datom.store-ets/open)
+           (datom.schema/install-all (datom.schema/empty-schema) schema-defs)
+           (atom (- FIRST-TX 1)))))
+
+(defn db
+  "The current database VALUE. O(1) \u2014 it captures a basis, not data."
+  [conn]
+  (datom.db/db-value (:store conn) (:schema conn) (deref (:basis conn))))
+
+(defn schema
+  [conn]
+  (:schema conn))
+
+(defn install-schema!
+  "Add attribute definitions to a live connection.
+
+   Schema is data and evolves like data. Returns the connection so it
+   chains."
+  [conn defs]
+  (->Conn (:store conn)
+          (datom.schema/install-all (:schema conn) defs)
+          (:basis conn)))
+
+(defn transact!
+  "Record `tx-data`, returning a transaction report.
+
+   The report carries what a caller needs to continue:
+
+     :db-before   the value before this transaction
+     :db-after    the value after it
+     :tx          the transaction id
+     :tempids     tempid -> real entity id
+     :tx-datoms   exactly the datoms recorded
+
+   Raises on a schema violation, listing EVERY problem rather than the
+   first \u2014 a partially-valid transaction is never applied."
+  [conn tx-data]
+  (let [store (:store conn)
+        schema (:schema conn)
+        db-before (db conn)
+        ops (datom.tx/expand schema tx-data)
+        problems (datom.tx/validate schema ops)]
+    (if (seq problems)
+      (throw (ex-info "transaction rejected by schema" {:problems problems}))
+      (let [tx (next-tx-id store)
+            resolved (datom.tx/resolve-tempids store schema ops (fn [] (next-entity-id store)))
+            datoms (datom.tx/realize store schema tx (get resolved 0))]
+        ; One atomic commit for every index of every datom: a transaction
+        ; visible in EAVT but not AEVT would be a corrupt database.
+        (datom.index/write-datoms store datoms)
+        (reset! (:basis conn) tx)
+        {:db-before db-before
+         :db-after (db conn)
+         :tx tx
+         :tempids (get resolved 1)
+         :tx-datoms datoms}))))

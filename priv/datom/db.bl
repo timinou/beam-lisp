@@ -1,0 +1,163 @@
+; datom/db.bl — the database as a VALUE.
+;
+; ── The idea Datomic is built on ──────────────────────────────────────
+;
+; A database is not a place you query. It is a VALUE you hold: an
+; immutable snapshot, cheap to pass around, that never changes underneath
+; you. Two queries against the same db value see exactly the same facts,
+; forever, regardless of what anyone else transacts meanwhile.
+;
+; That is the difference from every place-oriented database, and almost
+; everything pleasant about Datomic follows from it:
+;
+;   - a query needs no transaction or isolation level; the snapshot IS
+;     the isolation
+;   - `as-of` is not a special mode, just a different value
+;   - a function taking a db is referentially transparent, so it can be
+;     tested with a literal db rather than a live connection
+;
+; ── How a snapshot can be cheap ───────────────────────────────────────
+;
+; The db does NOT copy any data. It holds the store plus a BASIS: the
+; transaction id it was taken at. Since datoms are never mutated or
+; deleted \u2014 a "change" appends a retraction and an assertion at a NEW tx
+; \u2014 every datom carries the tx that recorded it, and a snapshot is simply
+; "ignore everything after basis-t".
+;
+; So `(db conn)` is O(1), and the db value from an hour ago still answers
+; queries about the world as it was an hour ago. Wave 5's `as-of` is the
+; same mechanism with a different number.
+;
+; ── Current vs historical ─────────────────────────────────────────────
+;
+; `:current` filtering \u2014 the default \u2014 answers "what is true NOW (at
+; basis-t)": a datom counts only if it was asserted at or before the
+; basis and not retracted since.
+;
+; `:history` keeps every datom, assertions and retractions alike. That is
+; what makes "when did this value change, and to what?" answerable, and
+; it is the mode wave 5's `history` selects.
+
+(ns datom.db
+  (:require [datom.index] [datom.schema] [datom.store]))
+
+(defrecord Db [store schema basis-t filter-mode since-t])
+
+(defn db-value
+  "A database value over `store` as of `basis-t`."
+  [store schema basis-t]
+  (->Db store schema basis-t :current nil))
+
+(defn basis-t
+  "The transaction id this value was taken at. Every datom recorded after
+   it is invisible here."
+  [db]
+  (:basis-t db))
+
+(defn schema-of [db] (:schema db))
+(defn store-of [db] (:store db))
+
+;; ── visibility ──────────────────────────────────────────────────────
+
+(defn- within-basis?
+  "Whether a datom was recorded at or before this value's basis."
+  [db d]
+  (<= (datom.index/-tx d) (basis-t db)))
+
+(defn- after-since?
+  "Whether a datom was recorded after this value's `since` bound.
+
+   Only `:since` values set one. It selects facts added in a WINDOW,
+   which is how you answer 'what changed lately?' without diffing two
+   snapshots by hand."
+  [db d]
+  (let [s (:since-t db)]
+    (or (nil? s) (> (datom.index/-tx d) s))))
+
+(defn- visible?
+  [db d]
+  (and (within-basis? db d) (after-since? db d)))
+
+(defn- retracted-later?
+  "Whether `d`'s fact was retracted at or before the basis.
+
+   A retraction datom carries the same `[e a v]` with `op` false, so
+   'is this still true?' is a scan of that exact triple for a later
+   retraction. Correct, and O(datoms for this e+a) rather than O(db)."
+  [db d]
+  (let [same (datom.index/scan (store-of db) :eavt (datom.index/-e d) (datom.index/-a d))]
+    (some? (first (filterv (fn [other]
+                             (and (= (datom.index/-v other) (datom.index/-v d))
+                                  (not (datom.index/assertion? other))
+                                  (> (datom.index/-tx other) (datom.index/-tx d))
+                                  (within-basis? db other)))
+                           same)))))
+
+(defn- current?
+  "Whether `d` is a fact that HOLDS at the basis: asserted, visible, and
+   not retracted since."
+  [db d]
+  (and (visible? db d)
+       (datom.index/assertion? d)
+       (not (retracted-later? db d))))
+
+(defn keep-datom?
+  "Whether `d` passes this value's filter.
+
+   `:history` keeps every visible datom \u2014 including retractions, which
+   are the record of what STOPPED being true and when. `:current` keeps
+   only what holds now."
+  [db d]
+  (if (= (:filter-mode db) :history)
+    (visible? db d)
+    (current? db d)))
+
+;; ── reading ─────────────────────────────────────────────────────────
+
+(defn datoms
+  "Datoms from `index` matching `components`, filtered by this value.
+
+   The single read path: every higher-level read (`entity`, `pull`, and
+   wave 3's query engine) goes through here, so the time-travel filter
+   cannot be bypassed by accident."
+  [db index & components]
+  (filterv (fn [d] (keep-datom? db d))
+           (apply datom.index/scan (store-of db) index (or components '()))))
+
+(defn entity-datoms
+  "Every current datom about `e`."
+  [db e]
+  (datoms db :eavt e))
+
+(defn attr-datoms
+  "Every current datom for attribute `a` across all entities."
+  [db a]
+  (datoms db :aevt a))
+
+(defn entity
+  "Entity `e` as a map of attribute to value.
+
+   A cardinality-many attribute collects into a VECTOR; a cardinality-one
+   attribute holds its single value. `:db/id` is included so the result
+   round-trips as transaction data."
+  [db e]
+  (let [ds (entity-datoms db e)]
+    (if (empty? ds)
+      nil
+      (reduce (fn [acc d]
+                (let [a (datom.index/-a d)
+                      v (datom.index/-v d)]
+                  (if (datom.schema/many? (schema-of db) a)
+                    (assoc acc a (conj (or (get acc a) []) v))
+                    (assoc acc a v))))
+              {:db/id e}
+              ds))))
+
+(defn attr-value
+  "The value of `[e a]`, or nil.
+
+   For a cardinality-many attribute this is the FIRST value, which is
+   rarely what a caller wants \u2014 use `entity` or `datoms` there."
+  [db e a]
+  (let [ds (datoms db :eavt e a)]
+    (if (empty? ds) nil (datom.index/-v (first ds)))))

@@ -1,0 +1,203 @@
+; datom/tx.bl — turning transaction data into datoms.
+;
+; ── What a transaction is ─────────────────────────────────────────────
+;
+; A request to record facts. The caller writes DATA — maps and vectors —
+; and this layer resolves it into datoms, which are then written to every
+; index in one atomic commit.
+;
+;   [{:db/id -1 :person/name "Ada" :person/age 36}]   a map form
+;   [[:db/add 1 :person/age 37]]                       an explicit assert
+;   [[:db/retract 1 :person/age 36]]                   an explicit retract
+;
+; Map form is sugar: it expands to one `:db/add` per attribute-value pair,
+; all sharing the entity id. `:db/id` names the entity; a NEGATIVE id is a
+; tempid, resolved here to a real one.
+;
+; ── The three jobs, in order ──────────────────────────────────────────
+;
+; 1. EXPAND    map forms into individual assertions
+; 2. RESOLVE   tempids to real entity ids (and upsert onto existing
+;              entities when a `:db.unique/identity` value already exists)
+; 3. REALIZE   assertions into datoms, adding retractions where
+;              cardinality-one demands them
+;
+; Step 3 is the one that surprises people. Asserting `:person/age 37` on
+; an entity that already has `:person/age 36` produces TWO datoms: a
+; retraction of 36 and an assertion of 37. The old value is not deleted —
+; nothing is ever deleted — it is superseded, with both facts remaining in
+; the log at different transaction ids. That is precisely why `as-of` can
+; show the database as it was: the past is still there.
+;
+; ── Tempids ───────────────────────────────────────────────────────────
+;
+; A tempid is a negative integer, meaningful only WITHIN one transaction.
+; The same tempid used twice refers to the same new entity, which is how
+; a transaction builds a graph:
+;
+;   [{:db/id -1 :person/name "Ada"}
+;    {:db/id -2 :person/name "Grace" :person/friend -1}]
+;
+; Both entities are created and -2's `:person/friend` points at whatever
+; real id -1 became.
+
+(ns datom.tx
+  (:require [datom.index] [datom.schema] [datom.store]))
+
+;; ── expansion ───────────────────────────────────────────────────────
+
+(defn- map-form->ops
+  "Expand `{:db/id e :attr v …}` into `[:db/add e :attr v]` operations.
+
+   A cardinality-many attribute may carry a VECTOR of values, each
+   becoming its own assertion — `{:person/friend [-1 -2]}` asserts two
+   facts rather than one fact whose value is a vector."
+  [schema m]
+  (let [e (get m :db/id)]
+    (if (nil? e)
+      (throw (ex-info "a transaction map needs a :db/id" {:map m}))
+      (reduce (fn [acc entry]
+                (let [a (key entry)
+                      v (val entry)]
+                  (if (= a :db/id)
+                    acc
+                    (if (and (datom.schema/many? schema a) (vector? v))
+                      (into acc (mapv (fn [each] [:db/add e a each]) v))
+                      (conj acc [:db/add e a v])))))
+              []
+              (seq m)))))
+
+(defn expand
+  "Normalize transaction data into a flat vector of `[:db/add e a v]` and
+   `[:db/retract e a v]` operations."
+  [schema tx-data]
+  (reduce (fn [acc form]
+            (cond
+              (map? form) (into acc (map-form->ops schema form))
+              (vector? form) (conj acc form)
+              :else (throw (ex-info "unrecognised transaction form" {:form form}))))
+          []
+          tx-data))
+
+;; ── tempid resolution ───────────────────────────────────────────────
+
+(defn tempid?
+  "Whether `e` is a tempid: a negative integer, scoped to one transaction."
+  [e]
+  (and (int? e) (< e 0)))
+
+(defn- upsert-target
+  "The existing entity id that `ops` identify via a `:db.unique/identity`
+   value, or nil.
+
+   This is what makes a transaction IDEMPOTENT: asserting a person's
+   unique email twice updates one entity rather than creating a second.
+   Datomic calls this upsert, and it is the reason `:db.unique/identity`
+   exists as something distinct from `:db.unique/value`."
+  [store schema ops tempid]
+  (reduce (fn [found op]
+            (if (some? found)
+              found
+              (let [e (get op 1) a (get op 2) v (get op 3)]
+                (if (and (= e tempid) (datom.schema/identity-attr? schema a))
+                  (let [hits (datom.index/scan store :avet a v)]
+                    (if (empty? hits) nil (datom.index/-e (first hits))))
+                  nil))))
+          nil
+          ops))
+
+(defn resolve-tempids
+  "Map every tempid in `ops` to a real entity id.
+
+   Returns `[resolved-ops tempid->id]`. The mapping is returned because
+   the CALLER needs it: after transacting, `{-1 4711}` is how you learn
+   which entity your tempid became \u2014 the same `:tempids` Datomic's
+   transaction report carries."
+  [store schema ops next-id-fn]
+  (let [tempids (into [] (distinct (filterv tempid? (mapv (fn [op] (get op 1)) ops))))
+        mapping (reduce (fn [acc t]
+                          (assoc acc t (or (upsert-target store schema ops t) (next-id-fn))))
+                        {}
+                        tempids)
+        resolve (fn [x] (if (and (tempid? x) (contains? mapping x)) (get mapping x) x))]
+    [(mapv (fn [op]
+             ; Resolve the entity position AND the value position: a ref
+             ; attribute's value may itself be a tempid, which is what
+             ; lets one transaction build a graph of new entities.
+             (let [a (get op 2)
+                   v (get op 3)]
+               [(get op 0)
+                (resolve (get op 1))
+                a
+                (if (datom.schema/ref? schema a) (resolve v) v)]))
+           ops)
+     mapping]))
+
+;; ── realization ─────────────────────────────────────────────────────
+
+(defn- current-values
+  "Datoms currently asserting `[e a]` \u2014 the values a new assertion must
+   supersede for a cardinality-one attribute."
+  [store e a]
+  (filterv datom.index/assertion? (datom.index/scan store :eavt e a)))
+
+(defn- realize-op
+  "One operation as the datoms it implies.
+
+   An assertion on a cardinality-ONE attribute first RETRACTS whatever
+   that attribute currently holds. Without that retraction the entity
+   would end up with two values for an attribute declared to have one,
+   and every read would have to guess which is current."
+  [store schema tx op]
+  (let [kind (get op 0)
+        e (get op 1)
+        a (get op 2)
+        v (get op 3)]
+    (cond
+      (= kind :db/retract)
+        [(datom.index/datom e a v tx false)]
+
+      (= kind :db/add)
+        (let [existing (current-values store e a)
+              already-true? (some? (first (filterv (fn [d] (= (datom.index/-v d) v)) existing)))]
+          (cond
+            ; A datom is a FACT. Asserting one that already holds is a
+            ; no-op at EVERY cardinality — not just cardinality-one.
+            ; Without this, `[:db/add e :p/tag :a]` twice left the entity
+            ; with `[:a :a]`, and re-running an import doubled every
+            ; many-valued attribute in the database.
+            already-true?
+              []
+
+            ; Cardinality-many accumulates: no supersession, just the
+            ; new fact.
+            (datom.schema/many? schema a)
+              [(datom.index/datom e a v tx true)]
+
+            ; Cardinality-one holds ONE value, so asserting a new one
+            ; retracts whatever is there. Both datoms land in the same
+            ; transaction, which is what makes the change atomic and
+            ; keeps the superseded value readable via `history`.
+            :else
+              (conj (mapv (fn [d] (datom.index/datom e a (datom.index/-v d) tx false)) existing)
+                    (datom.index/datom e a v tx true))))
+
+      :else (throw (ex-info (str "unknown operation: " kind) {:op op})))))
+
+(defn realize
+  "Every datom implied by `ops`, in order."
+  [store schema tx ops]
+  (into [] (mapcat (fn [op] (realize-op store schema tx op)) ops)))
+
+;; ── validation ──────────────────────────────────────────────────────
+
+(defn validate
+  "Every schema violation in `ops`, as data.
+
+   Collected rather than thrown one at a time so a caller learns about
+   all four bad fields at once instead of fixing them one round trip
+   apiece."
+  [schema ops]
+  (into [] (filterv some?
+                    (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
+                          ops))))

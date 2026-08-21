@@ -51,6 +51,22 @@ defmodule BeamLisp.Spell.AllocationTest do
   defp handle_info, do: fetch!("spell.server", "handle-info")
   defp contract, do: fetch!("spell.seed", "contract-term")
 
+  # Poll until a registered name is free. Named processes unregister
+  # ASYNCHRONOUSLY, so "the process stopped" does not imply "the name is
+  # available" — the gap is what leaked into sibling suites (BUG-006).
+  defp wait_for_name_release(_name, 0), do: :ok
+
+  defp wait_for_name_release(name, attempts) do
+    case Process.whereis(name) do
+      nil ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        wait_for_name_release(name, attempts - 1)
+    end
+  end
+
   defp assigns do
     Data.to_bl(%{"messages" => [], "status" => "idle", "error" => "", "partial" => ""}, :all_strings)
   end
@@ -134,7 +150,17 @@ defmodule BeamLisp.Spell.AllocationTest do
       # the next test's `start_link` races the previous loop's name
       # unregistration.
       {:ok, pid} = BeamLisp.Spell.Loop.start_link(out: "/tmp/spell-alloc-test", publish: false)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+      # Stop the loop AND wait for its registered name to be released.
+      # `GenServer.stop/1` is synchronous on the process but NOT on
+      # unregistration, so returning here while the name is still held
+      # made a later suite's `{:ok, _} = Loop.start_link(…)` fail with
+      # `{:error, {:already_started, _}}` — a ~1-in-3 flake in
+      # Spell.McpTest that passed in isolation every time (BUG-006).
+      on_exit(fn ->
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        wait_for_name_release(BeamLisp.Spell.Loop, 50)
+      end)
       BeamLisp.Spell.Server.register("chat-live", "spell.seed/contract-term")
       {:ok, socket} = BeamLisp.Spell.Server.mount(%Phoenix.LiveView.Socket{}, "chat-live")
       %{socket: socket}

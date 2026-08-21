@@ -1,0 +1,148 @@
+; datom/codec.bl — order-preserving key encoding.
+;
+; ── The one job ───────────────────────────────────────────────────────
+;
+; Turn a datom's components into a BINARY whose BYTE order equals the
+; logical order of the values it encodes. Everything the index layer does
+; rests on that single property:
+;
+;   sort(encode(a), encode(b))  ==  sort(a, b)
+;
+; Given it, an index is just "write the components in the right order and
+; range-scan the result". Without it, an index is a lie.
+;
+; ── Why binaries, and not the obvious tuple ───────────────────────────
+;
+; The natural spelling of an index key is a tuple: `[:eavt e a v tx]`.
+; It does not work, and the way it fails is instructive (BUG-005).
+;
+; Erlang compares tuples by ARITY FIRST, then element-wise. So a short
+; "prefix" key does not sort adjacent to the longer keys sharing its
+; prefix — it sorts before ALL of them:
+;
+;   {:eavt} < {:aevt, 1, :age}   → true
+;
+; A prefix scan bounded by `[:eavt] .. [:eavt 999]` therefore brackets
+; the WRONG window: both bounds are lower-arity than any real key, so the
+; window closes before it opens and the scan returns NOTHING. An index
+; built on tuple keys would silently report an empty database.
+;
+; Binaries have no such rule: Erlang compares them byte by byte, and a
+; proper prefix sorts immediately before its extensions — exactly the
+; property a prefix scan needs. This is also what FoundationDB's tuple
+; layer does, and therefore what Hobbes's `lib/enc/` does, so wave 6
+; aligns with the substrate instead of translating at the seam.
+;
+; ── The encoding ──────────────────────────────────────────────────────
+;
+; Each value becomes: <type-tag byte> <payload bytes>
+;
+; The TAG orders types (so cross-type comparison is total and matches the
+; language's own order); the PAYLOAD orders values within a type. Tags
+; mirror `BeamLisp.RT.compare/2`'s ranks so the codec agrees with `sort`
+; and `compare` rather than inventing a second order — the mistake wave 1
+; made in `sorted.ex` and had to correct.
+;
+; Integers are the subtle case. A plain big-endian encoding breaks for
+; negatives (two's complement makes -1 look larger than 1) and for mixed
+; widths. The fix is an OFFSET: shift the signed range into an unsigned
+; one, then encode fixed-width big-endian. 8 bytes covers the entity-id
+; and transaction range with room to spare.
+
+(ns datom.codec)
+
+;; ── type tags ───────────────────────────────────────────────────────
+;;
+;; Mirrors RT.compare's rank order: nil < false < true < number < string
+;; < keyword < ref. Tags are spaced so a type can be inserted later
+;; without renumbering (which would invalidate every stored key).
+
+; Decimal because the reader has no hex literals yet (FEAT-004); the hex
+; value is the meaningful one for a byte tag, so it is named alongside.
+(def TAG-NIL 16)        ; 0x10
+(def TAG-FALSE 32)      ; 0x20
+(def TAG-TRUE 33)       ; 0x21
+(def TAG-INT 48)        ; 0x30
+(def TAG-STR 64)        ; 0x40
+(def TAG-KEYWORD 80)    ; 0x50
+(def TAG-REF 96)        ; 0x60
+
+; Signed 64-bit values are shifted into unsigned space so byte order
+; matches numeric order across the sign boundary.
+(def INT-OFFSET 9223372036854775808)
+
+(defn- byte-at
+  "The `i`-th byte (0 = most significant) of a 64-bit unsigned value."
+  [n i]
+  (rem (erlang/bsr n (* 8 (- 7 i))) 256))
+
+(defn encode-int
+  "A signed integer as 8 order-preserving bytes.
+
+   The offset is what makes negatives work: -1 encodes below 0, which a
+   raw two's-complement byte pattern would not. Fixed width is what makes
+   9 sort before 10 — a variable-width encoding would compare '9' against
+   '1' and stop there."
+  [n]
+  (let [shifted (+ n INT-OFFSET)]
+    (erlang/list_to_binary
+      (to-list (mapv (fn [i] (byte-at shifted i)) [0 1 2 3 4 5 6 7])))))
+
+(defn decode-int
+  "Recover a signed integer from its 8-byte encoding.
+
+   Bytes come from `binary_to_list` rather than `binary_part`: the latter
+   returns a one-byte BINARY, which arithmetic then rejects."
+  [bin]
+  (- (reduce (fn [acc b] (+ (* acc 256) b))
+             0
+             (erlang/binary_to_list bin))
+     INT-OFFSET))
+
+(defn- tag-byte
+  "A one-byte binary holding `t`."
+  [t]
+  (erlang/list_to_binary (to-list [t])))
+
+(defn encode-value
+  "Encode any datom value as a tagged, order-preserving binary.
+
+   Strings encode as their own UTF-8 bytes: byte order IS lexicographic
+   order for UTF-8, so no transformation is needed. Keywords encode as
+   their name — the same treatment `RT.compare` gives them.
+
+   A trailing 0x00 terminates variable-length payloads so that a string
+   which is a PREFIX of another sorts before it (\"ab\" < \"abc\"), and so
+   that a following component cannot be confused with more of this one."
+  [v]
+  (cond
+    (nil? v) (tag-byte TAG-NIL)
+    (= v false) (tag-byte TAG-FALSE)
+    (= v true) (tag-byte TAG-TRUE)
+    (int? v) (erlang/iolist_to_binary (to-list [(tag-byte TAG-INT) (encode-int v)]))
+    ; The string's OWN bytes, never `term_to_binary`: that wraps a value
+    ; in a tagged envelope carrying a LENGTH PREFIX, so encoded strings
+    ; sort by length before content ("z" < "aa", "abc" > "b"). A first
+    ; probe using only same-length pairs missed it entirely.
+    ; UTF-8 byte order IS lexicographic order, so raw bytes need no
+    ; transformation.
+    (string? v) (erlang/iolist_to_binary
+                  (to-list [(tag-byte TAG-STR) v (tag-byte 0)]))
+    (keyword? v) (erlang/iolist_to_binary
+                   (to-list [(tag-byte TAG-KEYWORD)
+                             (erlang/atom_to_binary v :utf8)
+                             (tag-byte 0)]))
+    ; Anything else (a lookup ref, a nested value) has no order-preserving
+    ; byte form, so it gets `term_to_binary` — which orders by the term's
+    ; serialized shape, NOT by value. Acceptable only because such values
+    ; are compared for EQUALITY in an index, never for range: two equal
+    ; values still encode identically, which is the property that matters.
+    ; A range predicate over this type would be silently wrong, so the
+    ; schema layer (wave 2) must reject :db/index on it.
+    :else (erlang/iolist_to_binary
+            (to-list [(tag-byte TAG-REF) (erlang/term_to_binary v) (tag-byte 0)]))))
+
+(defn concat-bins
+  "Concatenate encoded components into one key."
+  [bins]
+  (erlang/iolist_to_binary (to-list bins)))

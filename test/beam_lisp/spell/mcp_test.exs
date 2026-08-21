@@ -14,13 +14,66 @@ defmodule BeamLisp.Spell.McpTest do
     dir = Path.join(System.tmp_dir!(), "spell-mcp-#{System.unique_integer([:positive])}")
     Application.put_env(:beam_lisp, :spell_state_dir, dir)
 
+    # Every test here starts the loop under its REGISTERED name, so the
+    # name must be free before the test body runs. A sibling suite
+    # (allocation_test) also starts a globally-named loop, and
+    # `GenServer.stop/1` returns BEFORE the name is unregistered — so a
+    # leftover process made `{:ok, _pid} = Loop.start_link(…)` fail its
+    # match with `{:error, {:already_started, _}}`.
+    #
+    # The symptom was a ~1-in-3 failure of "tools/list names exactly the
+    # three tools" in FULL runs only, passing 14/14 in isolation — an
+    # intermittently red suite, which is how real regressions get ignored
+    # (BUG-006).
+    ensure_loop_name_free()
+
     on_exit(fn ->
-      if pid = Process.whereis(Loop), do: GenServer.stop(pid)
+      # `whereis` then `stop` is itself a race: the loop can exit between
+      # the two calls (it is linked to the test process, which is dying),
+      # and `GenServer.stop/1` on a dead pid EXITS rather than returning
+      # an error. That surfaced as a test failure attributed to whichever
+      # test happened to be running — misleading, since the assertion had
+      # already passed.
+      case Process.whereis(Loop) do
+        nil ->
+          :ok
+
+        pid ->
+          try do
+            GenServer.stop(pid)
+          catch
+            :exit, _ -> :ok
+          end
+      end
+
       Application.delete_env(:beam_lisp, :spell_state_dir)
       File.rm_rf(dir)
     end)
 
     :ok
+  end
+
+  # Stop any loop holding the registered name and WAIT for the name to be
+  # released. `GenServer.stop/1` is synchronous on the process, not on
+  # unregistration, so polling the name is the honest wait.
+  defp ensure_loop_name_free(attempts \\ 50) do
+    case Process.whereis(Loop) do
+      nil ->
+        :ok
+
+      pid when attempts > 0 ->
+        try do
+          GenServer.stop(pid, :normal, 100)
+        catch
+          :exit, _ -> :ok
+        end
+
+        Process.sleep(10)
+        ensure_loop_name_free(attempts - 1)
+
+      _ ->
+        raise "the #{inspect(Loop)} name is still held after 500ms — a sibling suite leaked a loop"
+    end
   end
 
   defp rpc(method, params \\ %{}, id \\ 1) do
