@@ -1,0 +1,311 @@
+; datom.bl — the whole database, one namespace.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; An immutable, temporal, datalog database in the shape of Datomic,
+; written in beam-lisp. Facts are never updated or deleted: a change
+; APPENDS a retraction of the old value and an assertion of the new one,
+; both stamped with the transaction that made them. Nothing is lost, so
+; the past is not archived anywhere — it is simply still here.
+;
+; Five ideas, and everything else follows from them:
+;
+;   1. A fact is a DATOM: [entity attribute value transaction added?]
+;      Five fields, no schema-shaped rows. Adding an attribute to one
+;      entity does not touch any other.
+;
+;   2. A database is a VALUE. `(db conn)` is O(1) and returns something
+;      immutable that will answer the same question the same way forever,
+;      no matter what the connection does next. Queries are functions of
+;      that value, not requests to a server.
+;
+;   3. Time travel is a FILTER, not a feature. Because nothing is
+;      deleted, `as-of` is a predicate over data that never went
+;      anywhere. It costs nothing to construct and copies nothing.
+;
+;   4. Queries are DATA. A query is a vector you can build, store, and
+;      generate — not a string you assemble and hope parses.
+;
+;   5. The store is a PORT. Everything above `datom.store` is pure logic
+;      over an ordered key/value space; the substrate is swappable.
+;
+; ── This namespace ────────────────────────────────────────────────────
+;
+; Every function an application needs, re-exported here so a caller
+; requires ONE namespace instead of six. The implementation namespaces
+; (`datom.conn`, `datom.db`, `datom.query.engine`, `datom.pull`,
+; `datom.time`, `datom.index`) remain available for anything unusual —
+; this is a facade, not a wall.
+;
+; ── A complete program ────────────────────────────────────────────────
+;
+;   (ns my.app (:require [datom]))
+;
+;   (def conn (datom/connect
+;               [{:db/ident :person/name  :db/valueType :db.type/string}
+;                {:db/ident :person/email :db/valueType :db.type/string
+;                                         :db/unique :db.unique/identity}
+;                {:db/ident :person/friend :db/valueType :db.type/ref
+;                                          :db/cardinality :db.cardinality/many}]))
+;
+;   (def report (datom/transact! conn [{:db/id -1 :person/name "Ada"
+;                                       :person/email "ada@example.com"}]))
+;
+;   (datom/q '[:find ?name
+;              :where [?e :person/name ?name]]
+;            (datom/db conn))
+;   ;; => #{["Ada"]}
+;
+;   (datom/pull (datom/db conn) [:person/name] (get (:tempids report) -1))
+;   ;; => {:db/id 1 :person/name "Ada"}
+;
+;   ;; and the same query, against the past
+;   (datom/q '[:find ?name :where [?e :person/name ?name]]
+;            (datom/as-of (datom/db conn) (:tx report)))
+
+(ns datom
+  (:require [datom.conn] [datom.db] [datom.index] [datom.pull]
+            [datom.query.agg] [datom.query.engine] [datom.schema]
+            [datom.store] [datom.store-ets] [datom.time]))
+
+;; ── connecting ──────────────────────────────────────────────────────
+
+(defn connect
+  "Open a connection over a fresh in-memory store.
+
+   `schema-defs` are attribute definitions, installed before any data so
+   the first transaction already knows its cardinalities:
+
+     (connect [{:db/ident :person/name :db/valueType :db.type/string}])
+
+   A connection is the only mutable thing here. Everything it hands out
+   is a value."
+  ([] (datom.conn/connect))
+  ([schema-defs] (datom.conn/connect schema-defs)))
+
+(defn connect-with
+  "Open a connection over an EXISTING store.
+
+   The seam a different substrate arrives through: anything implementing
+   `datom.store/Store` works, and no layer above can tell the
+   difference."
+  ([store] (datom.conn/connect-with store))
+  ([store schema-defs] (datom.conn/connect-with store schema-defs)))
+
+(defn install-schema!
+  "Add attribute definitions to a live connection. Schema evolves like
+   data, because it IS data."
+  [conn defs]
+  (datom.conn/install-schema! conn defs))
+
+(defn schema
+  "The connection's schema map."
+  [conn]
+  (datom.conn/schema conn))
+
+;; ── writing ─────────────────────────────────────────────────────────
+
+(defn transact!
+  "Record `tx-data`, returning a transaction report.
+
+   Transaction data is DATA \u2014 maps, or `[:db/add e a v]` vectors, mixed
+   freely:
+
+     [{:db/id -1 :person/name \"Ada\"}          ; a map is many assertions
+      [:db/add ada :person/age 36]             ; an explicit assertion
+      [:db/retract ada :person/nickname \"A\"]  ; a retraction
+      [:db/retractEntity old-id]               ; forget an entity entirely
+      [:db/cas ada :person/age 36 37]          ; only if it is still 36
+      {:db/id :db/current-tx :audit/by \"me\"}] ; annotate the change
+
+   A NEGATIVE `:db/id` is a tempid: it becomes a real id, and the report
+   says which. A tempid asserting a `:db.unique/identity` value UPSERTS
+   onto whatever entity already holds it, which is what makes a
+   transaction idempotent.
+
+   The report carries:
+
+     :db-before   the value before this transaction
+     :db-after    the value after it
+     :tx          the transaction id (also an entity \u2014 see `as-of`)
+     :tempids     tempid -> real entity id
+     :tx-datoms   exactly the datoms recorded
+
+   Raises on a schema violation, listing EVERY problem rather than the
+   first \u2014 a partially-valid transaction is never applied."
+  [conn tx-data]
+  (datom.conn/transact! conn tx-data))
+
+;; ── the database value ──────────────────────────────────────────────
+
+(defn db
+  "The current database VALUE.
+
+   O(1): it captures a basis, not data. Hold it as long as you like \u2014 it
+   will answer the same question the same way forever, however many
+   transactions the connection accepts meanwhile. This is the property
+   every other one here rests on."
+  [conn]
+  (datom.conn/db conn))
+
+(defn entity
+  "Entity `e` as a map of attribute to value.
+
+   A cardinality-many attribute collects into a vector; `:db/id` is
+   included so the result round-trips as transaction data. Returns nil
+   when the entity has no datoms."
+  [db e]
+  (datom.db/entity db e))
+
+(defn datoms
+  "Raw datoms from `index` matching `components`, filtered by this db
+   value's basis.
+
+   The low-level read. `index` is `:eavt`, `:aevt`, `:avet` or `:vaet`;
+   components bind a prefix of that index's sort order."
+  [db index & components]
+  (apply datom.db/datoms db index components))
+
+(defn basis-t
+  "The transaction this value reads as of."
+  [db]
+  (datom.db/basis-t db))
+
+;; ── querying ────────────────────────────────────────────────────────
+
+(defn q
+  "Run a datalog `query` against `db`, with optional inputs.
+
+   A query is DATA:
+
+     [:find  ?name ?age
+      :in    $ [?city ...]
+      :where [?e :person/city ?city]
+             [?e :person/name ?name]
+             [?e :person/age ?age]
+             [(> ?age 21)]]
+
+   `:find`  what to return \u2014 variables, or an aggregate like
+            `(count ?e)`, `(sum ?x)`, `(avg ?x)`, `(min ?x)`, `(max ?x)`,
+            `(count-distinct ?e)`.
+   `:in`    what the caller supplies: `?x` one value, `[?x ...]` many
+            (this is how you write `IN`), `[?x ?y]` a tuple, `[[?x ?y]]`
+            a whole TABLE to join against.
+   `:where` clauses: patterns `[?e :attr ?v]` (a fourth term binds the
+            transaction), predicates `[(> ?a 21)]`, functions
+            `[(* ?a 2) ?d]`, and `[:and ...]` `[:or ...]` `[:not ...]`
+            `[:or-join [?e] ...]` `[:not-join [?e] ...]`.
+
+   Returns a SET of tuples \u2014 the semantics ARE set semantics: the same
+   answer arriving by two derivations is one answer."
+  [query db & inputs]
+  (apply datom.query.engine/q query db (or inputs '())))
+
+(defn pull
+  "Read a SHAPE out of the graph.
+
+   Datalog returns tuples of scalars; an application usually wants a
+   tree. A pull pattern describes one:
+
+     [:person/name
+      :person/age
+      {:person/friend [:person/name]}       ; nest through a ref
+      {:person/manager ...}                 ; recurse to any depth
+      {:person/report 3}                    ; or to a bounded depth
+      :person/_friend                       ; REVERSE: who refers to me
+      (default :person/nickname \"none\")     ; a value when absent
+      (limit :person/friend 10)             ; bound an unbounded read
+      (:person/name :as :name)]             ; rename for the consumer
+
+   `[*]` takes every attribute the entity has, unexpanded. `e` may be an
+   entity id or a lookup ref."
+  [db pattern e]
+  (datom.pull/pull db pattern e))
+
+(defn pull-many
+  "Pull the same pattern from several entities, in order."
+  [db pattern entities]
+  (datom.pull/pull-many db pattern entities))
+
+(defn lookup-ref
+  "Resolve `[:attr value]` to an entity id, naming an entity by a UNIQUE
+   value rather than by id. Requires a `:db/unique` attribute."
+  [db ref]
+  (datom.pull/lookup-ref db ref))
+
+;; ── time ────────────────────────────────────────────────────────────
+
+(defn as-of
+  "The database as it stood at transaction `t`.
+
+   O(1) and copies nothing: the historical value shares the same store
+   and differs only in its basis. Every query and every pull works
+   against it unchanged \u2014 no special syntax, no audit table. The query
+   does not know it is looking at the past."
+  [db t]
+  (datom.time/as-of db t))
+
+(defn since
+  "Only what changed AFTER `t` \u2014 the delta, exclusive of `t` itself.
+
+   Together with `as-of` (which is inclusive) this partitions history
+   exactly: every datom falls in one half or the other."
+  [db t]
+  (datom.time/since db t))
+
+(defn history
+  "Every datom ever recorded, assertions and retractions alike.
+
+   The other views answer `what is true?`. This one answers `what
+   CHANGED, and when?` \u2014 a different question, and the reason retractions
+   are kept rather than deleted.
+
+   NOT a database state: an entity may appear to hold several values for
+   a cardinality-one attribute, because it held each at some point.
+   `entity` and `pull` refuse a history view for that reason; ask
+   `changes` instead."
+  [db]
+  (datom.time/history db))
+
+(defn changes
+  "Every change to `[e a]`, oldest first, as maps of
+   `{:value :t :added}`.
+
+   The actionable form of history: what a field has been, and when it
+   became so."
+  [db e a]
+  (datom.time/changes db e a))
+
+(defn value-at
+  "The value of `[e a]` at transaction `t`."
+  [db t e a]
+  (datom.time/value-at db t e a))
+
+(defn tx-of
+  "The transaction at which `[e a v]` became true, or nil.
+
+   `when did this become the case?` \u2014 the question that makes a history
+   view actionable rather than merely interesting."
+  [db e a v]
+  (datom.time/tx-of db e a v))
+
+(defn current?
+  "Whether `db` is an ordinary present-tense view."
+  [db]
+  (datom.time/current? db))
+
+(defn history?
+  "Whether `db` is a history view."
+  [db]
+  (datom.time/history? db))
+
+;; ── datoms, for when you want the facts themselves ──────────────────
+
+(defn datom-e "The entity of a datom." [d] (datom.index/-e d))
+(defn datom-a "The attribute of a datom." [d] (datom.index/-a d))
+(defn datom-v "The value of a datom." [d] (datom.index/-v d))
+(defn datom-tx "The transaction that recorded a datom." [d] (datom.index/-tx d))
+(defn datom-added?
+  "Whether a datom asserts (rather than retracts) its fact."
+  [d]
+  (datom.index/assertion? d))
