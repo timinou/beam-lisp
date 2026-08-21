@@ -86,38 +86,104 @@
   [e]
   (and (int? e) (< e 0)))
 
+(defn current-holder
+  "The entity that currently holds `[a v]`, or nil.
+
+   Goes through `current-values` rather than a raw AVET scan, so a
+   RETRACTED value is not treated as still held. The raw scan version
+   silently upserted new data onto an entity whose identity had been
+   retracted long ago."
+  [store a v]
+  (let [hits (datom.index/scan store :avet a v)]
+    (reduce (fn [found d]
+              (if (some? found)
+                found
+                (let [e (datom.index/-e d)]
+                  (if (contains? (set (current-values store e a [])) v) e nil))))
+            nil
+            hits)))
+
+(defn- identity-claims
+  "The `[attr value]` pairs by which `tempid` claims an identity."
+  [schema ops tempid]
+  (filterv some?
+           (mapv (fn [op]
+                   (let [e (get op 1) a (get op 2) v (get op 3)]
+                     (if (and (= e tempid)
+                              (= (get op 0) :db/add)
+                              (datom.schema/identity-attr? schema a))
+                       [a v]
+                       nil)))
+                 ops)))
+
 (defn- upsert-target
-  "The existing entity id that `ops` identify via a `:db.unique/identity`
-   value, or nil.
+  "The existing entity a tempid's `:db.unique/identity` values resolve to,
+   or nil.
 
    This is what makes a transaction IDEMPOTENT: asserting a person's
    unique email twice updates one entity rather than creating a second.
-   Datomic calls this upsert, and it is the reason `:db.unique/identity`
-   exists as something distinct from `:db.unique/value`."
+
+   Raises when one tempid claims identities belonging to DIFFERENT
+   existing entities — that transaction has no correct outcome, and
+   silently picking the first would merge two people."
   [store schema ops tempid]
-  (reduce (fn [found op]
-            (if (some? found)
-              found
-              (let [e (get op 1) a (get op 2) v (get op 3)]
-                (if (and (= e tempid) (datom.schema/identity-attr? schema a))
-                  (let [hits (datom.index/scan store :avet a v)]
-                    (if (empty? hits) nil (datom.index/-e (first hits))))
-                  nil))))
-          nil
-          ops))
+  (let [targets (into [] (distinct (filterv some?
+                                            (mapv (fn [claim]
+                                                    (current-holder store (get claim 0) (get claim 1)))
+                                                  (identity-claims schema ops tempid)))))]
+    (cond
+      (empty? targets) nil
+      (= 1 (count targets)) (first targets)
+      :else (throw (ex-info "one tempid claims identities held by different entities"
+                            {:tempid tempid :entities targets})))))
+
+;; ── realization ─────────────────────────────────────────────────────
 
 (defn resolve-tempids
   "Map every tempid in `ops` to a real entity id.
 
    Returns `[resolved-ops tempid->id]`. The mapping is returned because
    the CALLER needs it: after transacting, `{-1 4711}` is how you learn
-   which entity your tempid became \u2014 the same `:tempids` Datomic's
-   transaction report carries."
+   which entity your tempid became — the `:tempids` a Datomic transaction
+   report carries.
+
+   Two tempids claiming the SAME identity resolve to the SAME id, even
+   when neither exists yet. Without that, transacting
+
+     [{:db/id -1 :person/email \"a@b.c\"}
+      {:db/id -2 :person/email \"a@b.c\" :person/age 5}]
+
+   created two entities sharing a value declared unique — a database that
+   violates its own schema, with no error."
   [store schema ops next-id-fn]
   (let [tempids (into [] (distinct (filterv tempid? (mapv (fn [op] (get op 1)) ops))))
+        ; First pass: existing entities an identity claim points at.
+        existing (reduce (fn [acc t]
+                           (let [target (upsert-target store schema ops t)]
+                             (if (some? target) (assoc acc t target) acc)))
+                         {}
+                         tempids)
+        ; Second pass: tempids with no existing target get a fresh id —
+        ; but tempids sharing an identity claim share that id.
         mapping (reduce (fn [acc t]
-                          (assoc acc t (or (upsert-target store schema ops t) (next-id-fn))))
-                        {}
+                          (if (contains? acc t)
+                            acc
+                            (let [claims (identity-claims schema ops t)
+                                  twin (reduce (fn [found other]
+                                                 (if (some? found)
+                                                   found
+                                                   (if (and (not (= other t))
+                                                            (contains? acc other)
+                                                            (seq claims)
+                                                            (seq (filterv (fn [c]
+                                                                            (contains? (set (identity-claims schema ops other)) c))
+                                                                          claims)))
+                                                     (get acc other)
+                                                     nil)))
+                                               nil
+                                               tempids)]
+                              (assoc acc t (or twin (next-id-fn))))))
+                        existing
                         tempids)
         resolve (fn [x] (if (and (tempid? x) (contains? mapping x)) (get mapping x) x))]
     [(mapv (fn [op]
@@ -133,71 +199,129 @@
            ops)
      mapping]))
 
-;; ── realization ─────────────────────────────────────────────────────
+(defn current-values
+  "The values `[e a]` currently holds — values, not datoms.
 
-(defn- current-values
-  "Datoms currently asserting `[e a]` \u2014 the values a new assertion must
-   supersede for a cardinality-one attribute."
-  [store e a]
-  (filterv datom.index/assertion? (datom.index/scan store :eavt e a)))
+   CURRENT means asserted and NOT retracted since, which is exactly what
+   `datom.db` computes for reads. An earlier version filtered a raw index
+   scan by `assertion?` alone, which answers a different question: it
+   treats every historical assertion as if it still held. Two silent bugs
+   followed — a superseded value could not be restored (re-asserting it
+   looked like a no-op), and identity upsert matched values retracted
+   long ago.
+
+   `pending` is the transaction's own datoms so far. Realization must see
+   them, or two assertions of one cardinality-one attribute in a SINGLE
+   transaction both read the pre-transaction store and both assert,
+   leaving the entity with two current values for an attribute declared
+   to hold one."
+  [store e a pending]
+  (let [relevant (into (datom.index/scan store :eavt e a)
+                       (filterv (fn [d] (and (= (datom.index/-e d) e)
+                                             (= (datom.index/-a d) a)))
+                                pending))]
+    ; Replay in tx order: an assertion adds a value, a retraction removes
+    ; it. What survives the fold is what currently holds.
+    (reduce (fn [acc d]
+              (let [v (datom.index/-v d)]
+                (if (datom.index/assertion? d)
+                  (if (contains? (set acc) v) acc (conj acc v))
+                  (filterv (fn [x] (not (= x v))) acc))))
+            []
+            (sort-by datom.index/-tx relevant))))
 
 (defn- realize-op
-  "One operation as the datoms it implies.
+  "One operation as the datoms it implies, given the transaction's datoms
+   so far.
 
    An assertion on a cardinality-ONE attribute first RETRACTS whatever
    that attribute currently holds. Without that retraction the entity
-   would end up with two values for an attribute declared to have one,
-   and every read would have to guess which is current."
-  [store schema tx op]
+   ends up with two values for an attribute declared to have one, and
+   every read has to guess which is current."
+  [store schema tx op pending]
   (let [kind (get op 0)
         e (get op 1)
         a (get op 2)
-        v (get op 3)]
+        v (get op 3)
+        held (current-values store e a pending)
+        holds-v? (contains? (set held) v)]
     (cond
+      ; Retracting a value the entity does not hold is a NO-OP, as in
+      ; Datomic. Recording it anyway wrote a datom for a fact that never
+      ; existed, polluting history and the transaction report.
       (= kind :db/retract)
-        [(datom.index/datom e a v tx false)]
+        (if holds-v? [(datom.index/datom e a v tx false)] [])
 
       (= kind :db/add)
-        (let [existing (current-values store e a)
-              already-true? (some? (first (filterv (fn [d] (= (datom.index/-v d) v)) existing)))]
-          (cond
-            ; A datom is a FACT. Asserting one that already holds is a
-            ; no-op at EVERY cardinality — not just cardinality-one.
-            ; Without this, `[:db/add e :p/tag :a]` twice left the entity
-            ; with `[:a :a]`, and re-running an import doubled every
-            ; many-valued attribute in the database.
-            already-true?
-              []
+        (cond
+          ; A datom is a FACT: asserting one that already HOLDS is a
+          ; no-op at every cardinality. `holds-v?` asks about the CURRENT
+          ; value, not about history — re-asserting a value that was
+          ; superseded must genuinely restore it.
+          holds-v?
+            []
 
-            ; Cardinality-many accumulates: no supersession, just the
-            ; new fact.
-            (datom.schema/many? schema a)
-              [(datom.index/datom e a v tx true)]
+          ; Cardinality-many accumulates: no supersession.
+          (datom.schema/many? schema a)
+            [(datom.index/datom e a v tx true)]
 
-            ; Cardinality-one holds ONE value, so asserting a new one
-            ; retracts whatever is there. Both datoms land in the same
-            ; transaction, which is what makes the change atomic and
-            ; keeps the superseded value readable via `history`.
-            :else
-              (conj (mapv (fn [d] (datom.index/datom e a (datom.index/-v d) tx false)) existing)
-                    (datom.index/datom e a v tx true))))
+          ; Cardinality-one holds ONE value, so asserting a new one
+          ; retracts what is currently there. Both datoms carry the same
+          ; tx, which makes the change atomic and keeps the superseded
+          ; value readable through `history`.
+          :else
+            (conj (mapv (fn [old] (datom.index/datom e a old tx false)) held)
+                  (datom.index/datom e a v tx true)))
 
       :else (throw (ex-info (str "unknown operation: " kind) {:op op})))))
 
 (defn realize
-  "Every datom implied by `ops`, in order."
+  "Every datom implied by `ops`, in order.
+
+   Threads the datoms produced so far into each step, so an operation
+   sees the transaction's own earlier effects."
   [store schema tx ops]
-  (into [] (mapcat (fn [op] (realize-op store schema tx op)) ops)))
+  (reduce (fn [acc op] (into acc (realize-op store schema tx op acc)))
+          []
+          ops))
 
 ;; ── validation ──────────────────────────────────────────────────────
+
+(defn- uniqueness-violation
+  "A `:db.unique/value` conflict for `op`, or nil.
+
+   `:db.unique/value` promises the value appears at most once in the
+   database, and asserting a duplicate is an ERROR — that is the whole
+   difference from `:db.unique/identity`, which UPSERTS instead. The
+   schema declared the distinction from the start but nothing enforced
+   it, so two entities could hold the same unique value with no
+   complaint: a database violating its own schema, silently."
+  [store schema op]
+  (let [e (get op 1)
+        a (get op 2)
+        v (get op 3)]
+    (if (and (= (get op 0) :db/add)
+             (= :db.unique/value (datom.schema/unique schema a)))
+      (let [holder (current-holder store a v)]
+        ; A tempid has no id yet, so any existing holder is a conflict.
+        ; For a real id, re-asserting the entity's OWN value is fine.
+        (if (and (some? holder) (not (= holder e)))
+          {:error :unique-value-conflict :attr a :value v :held-by holder}
+          nil))
+      nil)))
 
 (defn validate
   "Every schema violation in `ops`, as data.
 
    Collected rather than thrown one at a time so a caller learns about
    all four bad fields at once instead of fixing them one round trip
-   apiece."
-  [schema ops]
-  (into [] (filterv some?
-                    (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
-                          ops))))
+   apiece.
+
+   Takes the store because uniqueness is not a property of a value in
+   isolation — it is a question about the rest of the database."
+  [store schema ops]
+  (into []
+        (filterv some?
+                 (into (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
+                             ops)
+                       (mapv (fn [op] (uniqueness-violation store schema op)) ops)))))

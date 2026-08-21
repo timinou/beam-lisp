@@ -63,6 +63,7 @@
 (def TAG-FALSE 32)      ; 0x20
 (def TAG-TRUE 33)       ; 0x21
 (def TAG-INT 48)        ; 0x30
+(def TAG-FLOAT 49)      ; 0x31 — adjacent to INT so numbers group together
 (def TAG-STR 64)        ; 0x40
 (def TAG-KEYWORD 80)    ; 0x50
 (def TAG-REF 96)        ; 0x60
@@ -76,17 +77,33 @@
   [n i]
   (rem (erlang/bsr n (* 8 (- 7 i))) 256))
 
+(def INT-MAX 9223372036854775807)
+(def INT-MIN -9223372036854775808)
+
 (defn encode-int
   "A signed integer as 8 order-preserving bytes.
 
    The offset is what makes negatives work: -1 encodes below 0, which a
    raw two's-complement byte pattern would not. Fixed width is what makes
-   9 sort before 10 — a variable-width encoding would compare '9' against
-   '1' and stop there."
+   9 sort before 10 — a variable-width encoding would compare `9` against
+   `1` and stop there.
+
+   RANGE IS CHECKED, loudly. beam-lisp integers are BEAM bignums, so a
+   value outside signed 64-bit silently wrapped in the 8-byte window:
+   `2^63` and `-2^63` encoded to the SAME eight zero bytes, which means
+   one datom overwriting another in the index. Below the range it was
+   worse in a different way — `byte-at` produced negative bytes and
+   `list_to_binary` raised a bare `badarg` from deep inside a write.
+
+   A range error at the boundary is recoverable; a silent key collision
+   is data loss."
   [n]
-  (let [shifted (+ n INT-OFFSET)]
-    (erlang/list_to_binary
-      (to-list (mapv (fn [i] (byte-at shifted i)) [0 1 2 3 4 5 6 7])))))
+  (if (or (> n INT-MAX) (< n INT-MIN))
+    (throw (ex-info "integer out of the encodable 64-bit range"
+                    {:value n :min INT-MIN :max INT-MAX}))
+    (let [shifted (+ n INT-OFFSET)]
+      (erlang/list_to_binary
+        (to-list (mapv (fn [i] (byte-at shifted i)) [0 1 2 3 4 5 6 7]))))))
 
 (defn decode-int
   "Recover a signed integer from its 8-byte encoding.
@@ -99,10 +116,64 @@
              (erlang/binary_to_list bin))
      INT-OFFSET))
 
+(defn- bits-of-float
+  "The raw IEEE-754 double bits of `f` as an unsigned 64-bit integer."
+  [f]
+  (let [bin (erlang/term_to_binary f)]
+    ; `term_to_binary` on a float yields a tagged envelope; the 8 payload
+    ; bytes are the IEEE double. Reading them back as an unsigned integer
+    ; is the portable way to reach the bits without a bitstring literal,
+    ; which the reader does not support yet.
+    (reduce (fn [acc b] (+ (* acc 256) b))
+            0
+            (drop (- (count (erlang/binary_to_list bin)) 8)
+                  (erlang/binary_to_list bin)))))
+
+(defn- encode-uint64
+  "An unsigned 64-bit integer as 8 big-endian bytes."
+  [n]
+  (erlang/list_to_binary
+    (to-list (mapv (fn [i] (rem (erlang/bsr n (* 8 (- 7 i))) 256)) [0 1 2 3 4 5 6 7]))))
+
+(defn encode-float
+  "A float as 8 order-preserving bytes.
+
+   IEEE-754 bit patterns nearly sort correctly already: for POSITIVE
+   values the bit pattern order matches numeric order exactly. Two things
+   break it — the sign bit makes negatives look large, and negatives run
+   BACKWARDS. The standard fix, applied here: set the high bit for
+   positives, invert every bit for negatives."
+  [f]
+  (let [bits (bits-of-float f)]
+    (encode-uint64 (if (>= f 0.0)
+                     (erlang/bor bits 9223372036854775808)
+                     (erlang/bxor bits 18446744073709551615)))))
+
 (defn- tag-byte
   "A one-byte binary holding `t`."
   [t]
   (erlang/list_to_binary (to-list [t])))
+
+(defn escape-nul
+  "Replace every 0x00 byte in `bin` with the two bytes 0x00 0xFF.
+
+   Variable-length components are terminated by a single 0x00, so a value
+   CONTAINING 0x00 could forge a component boundary: the string
+   `a<NUL>Pfoo` encoded byte-for-byte identically to the two components
+   `a` followed by `:foo`. Two different keys, same bytes — one datom
+   silently overwriting another in the index.
+
+   Escaping to 0x00 0xFF is FoundationDB's tuple-layer solution, and it
+   preserves order: the escape byte 0xFF sorts above every byte a real
+   continuation can start with, so an escaped NUL still compares as
+   greater than a true terminator."
+  [bin]
+  (erlang/iolist_to_binary
+    (to-list (mapv (fn [b]
+                     (if (= b 0)
+                       (erlang/list_to_binary (to-list [0 255]))
+                       (erlang/list_to_binary (to-list [b]))))
+                   (erlang/binary_to_list bin)))))
 
 (defn encode-value
   "Encode any datom value as a tagged, order-preserving binary.
@@ -120,17 +191,31 @@
     (= v false) (tag-byte TAG-FALSE)
     (= v true) (tag-byte TAG-TRUE)
     (int? v) (erlang/iolist_to_binary (to-list [(tag-byte TAG-INT) (encode-int v)]))
+    ; A float reaches here whenever an attribute is declared WITHOUT a
+    ; `:db/valueType` (validation then accepts any value). Left to the
+    ; `:else` branch it got `term_to_binary`, which orders by serialized
+    ; SHAPE — so 10.0 sorted before 2.0 and a range predicate over such
+    ; an attribute returned the wrong rows, silently.
+    ;
+    ; Encoded as the IEEE-754 bits with the sign convention flipped:
+    ; positives get their high bit set, negatives are fully inverted.
+    ; That is the standard transform making float bit patterns compare
+    ; as numbers do — and it puts them in their own tag, adjacent to
+    ; integers rather than interleaved (comparing across int and float
+    ; would need a shared representation, which no ordered store gives
+    ; for free).
+    (float? v) (erlang/iolist_to_binary (to-list [(tag-byte TAG-FLOAT) (encode-float v)]))
     ; The string's OWN bytes, never `term_to_binary`: that wraps a value
     ; in a tagged envelope carrying a LENGTH PREFIX, so encoded strings
-    ; sort by length before content ("z" < "aa", "abc" > "b"). A first
+    ; sort by length before content (`z` < `aa`, `abc` > `b`). A first
     ; probe using only same-length pairs missed it entirely.
     ; UTF-8 byte order IS lexicographic order, so raw bytes need no
-    ; transformation.
+    ; transformation — only ESCAPING (see `escape-nul`).
     (string? v) (erlang/iolist_to_binary
-                  (to-list [(tag-byte TAG-STR) v (tag-byte 0)]))
+                  (to-list [(tag-byte TAG-STR) (escape-nul v) (tag-byte 0)]))
     (keyword? v) (erlang/iolist_to_binary
                    (to-list [(tag-byte TAG-KEYWORD)
-                             (erlang/atom_to_binary v :utf8)
+                             (escape-nul (erlang/atom_to_binary v :utf8))
                              (tag-byte 0)]))
     ; Anything else (a lookup ref, a nested value) has no order-preserving
     ; byte form, so it gets `term_to_binary` — which orders by the term's

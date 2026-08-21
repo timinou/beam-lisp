@@ -137,7 +137,8 @@
   ; Four bad fields should cost one round trip, not four.
   (let [s (datom.schema/install-all (datom.schema/empty-schema)
             [{:db/ident :n :db/valueType :db.type/long}])
-        problems (datom.tx/validate s [[:db/add 1 :n "no"] [:db/add 1 :n "also no"]])]
+        problems (datom.tx/validate (datom.store-ets/open) s
+                                    [[:db/add 1 :n "no"] [:db/add 1 :n "also no"]])]
     (is (= 2 (count problems)))
     (is (= :wrong-type (get (first problems) :error)))))
 
@@ -268,3 +269,145 @@
   (let [c (fresh)
         e (new-entity c {:person/name "Ada"})]
     (is (= e (:db/id (datom.db/entity (datom.conn/db c) e))))))
+
+;; ── review-gate regressions (wave 2 swarm) ──────────────────────────────────
+;;
+;; Six defects, one root cause: `tx.bl` realized operations against RAW index
+;; scans and against the pre-transaction store. Raw scans see history as if it
+;; were current, and a pre-transaction view cannot see the transaction's own
+;; earlier operations. Every failure below was silent — a database that
+;; violated its own rules with no error raised.
+
+(deftest two-assertions-of-one-attribute-in-one-transaction
+  ; Both ops read the pre-transaction store, so both asserted: the entity
+  ; ended with TWO current values for a cardinality-one attribute.
+  (let [c (fresh)
+        e (new-entity c {:person/age 36})]
+    (datom.conn/transact! c [[:db/add e :person/age 37]
+                             [:db/add e :person/age 38]])
+    (is (= 1 (count (datom.db/datoms (datom.conn/db c) :eavt e :person/age))))
+    (is (= 38 (:person/age (datom.db/entity (datom.conn/db c) e)))
+        "the LAST assertion in the transaction wins")))
+
+(deftest a-superseded-value-can-be-restored
+  ; `already-true?` consulted history rather than current state, so
+  ; re-asserting a previously-superseded value looked like a no-op and
+  ; silently did nothing.
+  (let [c (fresh)
+        e (new-entity c {:person/age 36})]
+    (datom.conn/transact! c [[:db/add e :person/age 37]])
+    (datom.conn/transact! c [[:db/add e :person/age 36]])
+    (is (= 36 (:person/age (datom.db/entity (datom.conn/db c) e))))))
+
+(deftest upsert-ignores-a-retracted-identity
+  ; A raw AVET scan matched the retracted email, so new data was attached
+  ; to the entity that used to own it instead of creating a new one.
+  (let [c (fresh)
+        old (new-entity c {:person/email "ada@example.com"})]
+    (datom.conn/transact! c [[:db/retract old :person/email "ada@example.com"]])
+    (let [r (datom.conn/transact! c [{:db/id -1 :person/email "ada@example.com"}])]
+      (is (not (= old (get (:tempids r) -1)))
+          "a retracted identity belongs to nobody"))))
+
+(deftest two-tempids-claiming-one-identity-become-one-entity
+  ; Neither tempid existed yet, so each got a fresh id — creating two
+  ; entities sharing a value declared unique.
+  (let [c (fresh)
+        r (datom.conn/transact! c [{:db/id -1 :person/email "same@example.com"}
+                                   {:db/id -2 :person/email "same@example.com"
+                                    :person/age 5}])]
+    (is (= (get (:tempids r) -1) (get (:tempids r) -2)))
+    (is (= 5 (:person/age (datom.db/entity (datom.conn/db c) (get (:tempids r) -1))))
+        "and both maps' facts landed on that one entity")))
+
+(deftest unique-value-rejects-a-duplicate
+  ; The schema distinguished :db.unique/value (error) from
+  ; :db.unique/identity (upsert) from the start, but nothing enforced it.
+  (let [c (datom.conn/connect
+            [{:db/ident :item/sn :db/valueType :db.type/string
+              :db/unique :db.unique/value}])]
+    (datom.conn/transact! c [{:db/id -1 :item/sn "SN-1"}])
+    (is (= :raised (try (datom.conn/transact! c [{:db/id -2 :item/sn "SN-1"}])
+                        :allowed
+                        (catch e :raised))))))
+
+(deftest unique-value-permits-re-asserting-your-own-value
+  ; The conflict is with ANOTHER entity; re-asserting your own is a no-op.
+  (let [c (datom.conn/connect
+            [{:db/ident :item/sn :db/valueType :db.type/string
+              :db/unique :db.unique/value}])
+        e (get (:tempids (datom.conn/transact! c [{:db/id -1 :item/sn "SN-1"}])) -1)]
+    (is (= :ok (try (do (datom.conn/transact! c [[:db/add e :item/sn "SN-1"]]) :ok)
+                    (catch err :raised))))))
+
+(deftest retracting-a-value-the-entity-does-not-hold-is-a-no-op
+  ; It recorded a retraction datom for a fact that never existed,
+  ; polluting both history and the transaction report.
+  (let [c (fresh)
+        e (new-entity c {:person/age 1})
+        r (datom.conn/transact! c [[:db/retract e :person/age 999]])]
+    (is (= 0 (count (:tx-datoms r))))
+    (is (= 1 (:person/age (datom.db/entity (datom.conn/db c) e)))
+        "and the real value is untouched")))
+
+(deftest one-tempid-cannot-claim-two-different-entities
+  ; No correct outcome exists for this transaction; silently picking the
+  ; first target would MERGE two people.
+  (let [c (datom.conn/connect
+            [{:db/ident :p/email :db/valueType :db.type/string
+              :db/unique :db.unique/identity}
+             {:db/ident :p/nick :db/valueType :db.type/string
+              :db/unique :db.unique/identity}])]
+    (datom.conn/transact! c [{:db/id -1 :p/email "a@x"}])
+    (datom.conn/transact! c [{:db/id -1 :p/nick "bee"}])
+    (is (= :raised (try (datom.conn/transact! c [{:db/id -1 :p/email "a@x" :p/nick "bee"}])
+                        :merged
+                        (catch e :raised))))))
+
+;; ── visibility filter: correctness and cost ─────────────────────────────────
+
+(deftest every-scan-shape-agrees-about-what-is-current
+  ; The filter builds its retraction index from the SCAN RESULT rather
+  ; than from a per-datom store lookup. That is only correct because a
+  ; retraction shares [e a v] with the assertion it cancels, so it lands
+  ; in the same prefix — whichever index is scanned. These assertions pin
+  ; that invariant across every scan shape a query might use.
+  (let [c (fresh)
+        e (new-entity c {:person/name "a" :person/tag :x})]
+    (datom.conn/transact! c [[:db/add e :person/name "b"]])
+    (datom.conn/transact! c [[:db/retract e :person/tag :x]])
+    (let [db (datom.conn/db c)]
+      (is (= 1 (count (datom.db/datoms db :eavt e))) "one attribute survives")
+      (is (= "b" (:person/name (datom.db/entity db e))))
+      (is (= 0 (count (datom.db/datoms db :eavt e :person/tag))))
+      (is (= 1 (count (datom.db/datoms db :aevt :person/name))))
+      (is (= 0 (count (datom.db/datoms db :aevt :person/tag))))
+      (is (= 1 (count (filterv (fn [d] (datom.db/keep-datom? db d))
+                               (datom.index/scan (:store c) :eavt e))))
+          "the single-datom path agrees with the bulk path"))))
+
+(deftest filtering-is-linear-not-quadratic
+  ; `retracted-later?` ran a store scan PER DATOM, so reading N datoms
+  ; cost N scans. A reviewer measured 45 SECONDS for 1000 values. Wave 3's
+  ; join engine calls `datoms` in a loop, so a quadratic read path would
+  ; have made every join quadratic too.
+  ;
+  ; Asserting a RATIO rather than a duration: absolute timings vary by
+  ; machine, but the shape of the curve is the contract.
+  (let [c (fresh)
+        n 200]
+    (datom.conn/transact! c (mapv (fn [i] {:db/id (- 0 (inc i))
+                                           :person/name (str "n" i)})
+                                  (range n)))
+    (let [t0 (erlang/monotonic_time :millisecond)
+          raw (count (datom.index/scan (:store c) :aevt :person/name))
+          t1 (erlang/monotonic_time :millisecond)
+          filtered (count (datom.db/datoms (datom.conn/db c) :aevt :person/name))
+          t2 (erlang/monotonic_time :millisecond)
+          raw-ms (max 1 (- t1 t0))
+          filtered-ms (- t2 t1)]
+      (is (= n raw))
+      (is (= n filtered) "the filter keeps every current datom")
+      (is (< filtered-ms (* 25 raw-ms))
+          (str "filtering cost " filtered-ms "ms against a raw scan of "
+               raw-ms "ms — a quadratic filter blows past this bound")))))
