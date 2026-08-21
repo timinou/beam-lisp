@@ -79,32 +79,32 @@ defmodule BeamLisp.SortedTest do
     end
 
     test "inclusive on both bounds", %{s: s} do
-      assert Sorted.subseq_entries(s, 5, 8) |> Enum.map(&elem(&1, 0)) == [5, 6, 7, 8]
+      assert Sorted.subseq_entries(s, {:bound, 5}, {:bound, 8}) |> Enum.map(&elem(&1, 0)) == [5, 6, 7, 8]
     end
 
     test "unbounded below and above", %{s: s} do
-      assert Sorted.subseq_entries(s, :unbounded, 3) |> Enum.map(&elem(&1, 0)) == [1, 2, 3]
-      assert Sorted.subseq_entries(s, 18, :unbounded) |> Enum.map(&elem(&1, 0)) == [18, 19, 20]
+      assert Sorted.subseq_entries(s, :unbounded, {:bound, 3}) |> Enum.map(&elem(&1, 0)) == [1, 2, 3]
+      assert Sorted.subseq_entries(s, {:bound, 18}, :unbounded) |> Enum.map(&elem(&1, 0)) == [18, 19, 20]
     end
 
     test "bounds that fall between keys still bracket correctly" do
       s = Sorted.set_new([10, 20, 30, 40])
-      assert Sorted.subseq_entries(s, 15, 35) |> Enum.map(&elem(&1, 0)) == [20, 30]
+      assert Sorted.subseq_entries(s, {:bound, 15}, {:bound, 35}) |> Enum.map(&elem(&1, 0)) == [20, 30]
     end
 
     test "empty range yields empty, not an error", %{s: s} do
-      assert Sorted.subseq_entries(s, 100, 200) == []
+      assert Sorted.subseq_entries(s, {:bound, 100}, {:bound, 200}) == []
       # inverted bounds are empty rather than a crash
-      assert Sorted.subseq_entries(s, 8, 5) == []
+      assert Sorted.subseq_entries(s, {:bound, 8}, {:bound, 5}) == []
     end
 
     test "descending reverses the same bounded window", %{s: s} do
-      assert Sorted.rsubseq_entries(s, 5, 8) |> Enum.map(&elem(&1, 0)) == [8, 7, 6, 5]
+      assert Sorted.rsubseq_entries(s, {:bound, 5}, {:bound, 8}) |> Enum.map(&elem(&1, 0)) == [8, 7, 6, 5]
     end
 
     test "scan on an empty collection is empty" do
       assert Sorted.subseq_entries(Sorted.set_new([]), :unbounded, :unbounded) == []
-      assert Sorted.subseq_entries(Sorted.map_new(), 1, 5) == []
+      assert Sorted.subseq_entries(Sorted.map_new(), {:bound, 1}, {:bound, 5}) == []
     end
   end
 
@@ -269,6 +269,96 @@ defmodule BeamLisp.SortedTest do
     test "sorted_map_of/1 accepts entry vectors" do
       entries = [%BeamLisp.Vector{items: {:b, 2}}, %BeamLisp.Vector{items: {:a, 1}}]
       assert RT.sorted_map_of(entries) |> Sorted.map_keys() == [:a, :b]
+    end
+  end
+
+  describe "review-gate regressions: the encoder must PROJECT RT.compare" do
+    # The encoder invented its own rank table and disagreed with the
+    # language's authoritative order in three places. Two competing
+    # definitions of "sorted" is how an index silently returns wrong rows.
+
+    test "agrees with RT.compare for every cross-type pair" do
+      values = [nil, false, true, 0, 1.5, "s", :s, [1, 2]]
+
+      for a <- values, b <- values do
+        cmp = RT.compare(a, b)
+        [x | _] = Sorted.set_new([a, b]) |> Sorted.set_to_list()
+
+        cond do
+          cmp < 0 -> assert x === a, "compare says #{inspect(a)} < #{inspect(b)}, encoder disagrees"
+          cmp > 0 -> assert x === b, "compare says #{inspect(b)} < #{inspect(a)}, encoder disagrees"
+          true -> :ok
+        end
+      end
+    end
+
+    test "a sorted set matches RT.sort for a mixed value set" do
+      values = [:kw, "str", 5, nil, true, false, 1.5]
+      sorted_via_sort = RT.sort(values) |> Enum.to_list()
+      assert Sorted.set_new(values) |> Sorted.set_to_list() == sorted_via_sort
+    end
+
+    test "keywords compare by NAME, not by atom identity" do
+      assert Sorted.set_new([:zebra, :apple]) |> Sorted.set_to_list() == [:apple, :zebra]
+    end
+  end
+
+  describe "review-gate regressions: sentinel and improper lists" do
+    test "a legal :unbounded keyword is usable as a real bound" do
+      # `:unbounded` was the raw internal marker, so scanning FOR that
+      # keyword was read as "no bound" and returned everything.
+      s = Sorted.set_new([:a, :unbounded, :z])
+      assert RT.subseq(s, :unbounded, :unbounded) == [:unbounded]
+      assert RT.subseq(s, :a, :unbounded) == [:a, :unbounded]
+    end
+
+    test "an improper [head | LazySeq] key encodes instead of crashing" do
+      # RT.cons/2 legitimately produces these; Enum.map raised on the
+      # non-list tail. A key that crashes on INSERT fails a whole
+      # transaction for a value the language allows.
+      improper = RT.cons(0, BeamLisp.LazySeq.new(fn -> nil end))
+      assert Sorted.set_new([improper]) |> Sorted.set_count() == 1
+    end
+
+    test "a lazy tail is realised into the encoding, so order is by contents" do
+      # A lazy-seq thunk yields a CELL (a list), not a {head, tail} tuple.
+      lazy_23 = BeamLisp.LazySeq.new(fn -> [2, 3] end)
+      improper = RT.cons(1, lazy_23)
+
+      # Encoding must realise the tail, so this sorts by CONTENTS
+      # (1,2,3) rather than by the opaque struct sitting in the tail.
+      s = Sorted.set_new([[1, 9], improper])
+      assert Sorted.set_count(s) == 2
+      assert [first_key | _] = Sorted.set_to_list(s)
+      # [1,2,3] < [1,9] element-wise, so the improper value sorts first.
+      # (It is still an improper list, so realise it before comparing.)
+      assert BeamLisp.LazySeq.to_list(first_key) == [1, 2, 3]
+    end
+  end
+
+  describe "review-gate regressions: equality and stack ops" do
+    test "a sorted map equals a plain map with the same entries" do
+      # Clojure: sortedness is an index property, not part of identity.
+      assert RT.eqv(Sorted.map_new([{:a, 1}]), %{a: 1})
+      assert RT.eqv(%{a: 1}, Sorted.map_new([{:a, 1}]))
+      refute RT.eqv(Sorted.map_new([{:a, 1}]), %{a: 2})
+      refute RT.eqv(Sorted.map_new([{:a, 1}]), %{a: 1, b: 2})
+    end
+
+    test "a sorted set equals a hashed set with the same members" do
+      assert RT.eqv(Sorted.set_new([1, 2]), BeamLisp.Set.new([1, 2]))
+      refute RT.eqv(Sorted.set_new([1, 2]), BeamLisp.Set.new([1, 3]))
+    end
+
+    test "two sorted collections are equal regardless of build order" do
+      assert RT.eqv(Sorted.set_new([1, 2]), Sorted.set_new([2, 1]))
+    end
+
+    test "peek and pop reject ordered collections rather than answering first/rest" do
+      assert_raise ArgumentError, ~r/not a stack/, fn -> RT.peek(Sorted.set_new([1, 2])) end
+      assert_raise ArgumentError, ~r/not a stack/, fn -> RT.pop(Sorted.set_new([1, 2])) end
+      assert_raise ArgumentError, ~r/not a stack/, fn -> RT.peek(Sorted.map_new([{:a, 1}])) end
+      assert_raise ArgumentError, ~r/not a stack/, fn -> RT.pop(Sorted.map_new([{:a, 1}])) end
     end
   end
 end

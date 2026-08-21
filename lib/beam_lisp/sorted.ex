@@ -80,31 +80,73 @@ defmodule BeamLisp.Sorted do
 
   # ── key encoding ─────────────────────────────────────────────────────
   #
-  # {rank, comparable} — rank makes cross-type order total, and within a
-  # rank Erlang's native term order already matches Clojure's.
+  # `BeamLisp.RT.compare/2` is the language's AUTHORITATIVE total order —
+  # what `sort`, `compare` and every Clojure-facing comparison already mean.
+  # This encoder's only job is to project that order into a term whose
+  # NATIVE Erlang comparison agrees, so `:gb_trees` (which compares with
+  # `<`/`>`) sorts the way the language says.
   #
-  # nil sorts before everything (Clojure: (compare nil x) is -1 for all x),
-  # so it gets rank -1 rather than being lumped in with atoms.
+  # It therefore MIRRORS RT.compare's rank table rather than inventing one.
+  # An earlier version invented its own ranks and disagreed with the
+  # language in three places — `false` sorted after `0`, keywords before
+  # strings, `true` after `1`. That is a second, competing definition of a
+  # total order, and the two drifting apart is precisely how an index
+  # silently returns the wrong rows. Keep this in lockstep with `RT.rank/1`:
+  #
+  #   nil=0  false=1  true=2  number=3  binary=4  symbol=5  keyword=6
+  #   collection=7  other=8
 
   @doc """
-  Encode `key` into a term whose Erlang order matches Clojure's `compare`.
+  Encode `key` so its native Erlang order matches `BeamLisp.RT.compare/2`.
 
-  Numbers share a rank so `1 < 1.5 < 2` holds across int/float. `nil` sorts
-  first. Booleans are separated from keywords because Erlang would order
-  them as the atoms `false`/`true` interleaved among keyword names.
+  Ranks mirror `RT.rank/1` exactly. Within a rank the payload is chosen so
+  Erlang's own comparison gives the answer `RT.compare/2` would: numbers
+  compare numerically (ints and floats share rank 3, so `1 < 1.5 < 2` holds
+  across kinds), strings and atom NAMES compare by text, and sequences
+  compare element-wise on ENCODED elements — which is what makes a proper
+  prefix sort before its extensions.
+
+  Collections share rank 7 and encode to a list, so a vector and a list
+  with equal contents encode identically — matching `RT.compare/2`, which
+  normalises both through `seq` before walking them.
   """
-  def encode_key(nil), do: {-1, nil}
-  def encode_key(x) when is_number(x), do: {0, x}
-  def encode_key(x) when is_boolean(x), do: {1, x}
-  def encode_key(x) when is_atom(x), do: {2, x}
-  def encode_key(x) when is_binary(x), do: {3, x}
-  def encode_key(%BeamLisp.Vector{} = v), do: {4, Enum.map(BeamLisp.Vector.to_list(v), &encode_key/1)}
-  def encode_key(x) when is_list(x), do: {4, Enum.map(x, &encode_key/1)}
-  def encode_key(x) when is_tuple(x), do: {5, x |> Tuple.to_list() |> Enum.map(&encode_key/1)}
-  # Anything else (maps, fns, pids) has no meaningful Clojure order; rank 6
-  # keeps the tree total rather than crashing, and equal keys still collide
-  # correctly because the raw term is the tiebreaker.
-  def encode_key(x), do: {6, x}
+  def encode_key(nil), do: {0, nil}
+  def encode_key(false), do: {1, false}
+  def encode_key(true), do: {2, true}
+  def encode_key(x) when is_number(x), do: {3, x}
+  def encode_key(x) when is_binary(x), do: {4, x}
+  def encode_key({:symbol, n}), do: {5, n}
+  # Keywords are atoms, compared by NAME (as `RT.cmp_same(6, …)` does).
+  # `is_atom` also matches nil/booleans, so those clauses must precede this.
+  def encode_key(x) when is_atom(x), do: {6, Atom.to_string(x)}
+  def encode_key(%BeamLisp.Vector{} = v), do: {7, encode_seq(BeamLisp.Vector.to_list(v))}
+  def encode_key(%BeamLisp.Set{} = s), do: {7, encode_seq(BeamLisp.Set.to_list(s))}
+  def encode_key(%SortedSet{} = s), do: {7, encode_seq(set_to_list(s))}
+  def encode_key(%SortedMap{} = m), do: {7, encode_seq(map_to_list(m))}
+  def encode_key(x) when is_list(x), do: {7, encode_seq(x)}
+  def encode_key(x) when is_tuple(x), do: {7, x |> Tuple.to_list() |> encode_seq()}
+  # Rank 8 is RT.compare's catch-all (fns, pids, refs, plain maps, lazy
+  # seqs). No meaningful Clojure order, but the tree still needs a total
+  # one, so the raw term breaks ties via Erlang's native order.
+  def encode_key(x), do: {8, x}
+
+  # A sequence encodes to a LIST of encoded elements so Erlang compares it
+  # element-wise — and a proper prefix sorts before its extensions, unlike
+  # a raw tuple (Erlang orders those by ARITY first; see BUG-005).
+  #
+  # `Enum.map/2` would crash on the improper `[head | %LazySeq{}]` lists
+  # that `RT.cons/2` legitimately produces, so the walk is explicit: a lazy
+  # tail is realised, and any other improper tail is encoded as a final
+  # element rather than raising. A key that CRASHES on insert would fail a
+  # whole transaction for a value the language considers legal.
+  defp encode_seq([]), do: []
+  defp encode_seq([h | t]) when is_list(t), do: [encode_key(h) | encode_seq(t)]
+
+  defp encode_seq([h | %BeamLisp.LazySeq{} = t]),
+    do: [encode_key(h) | encode_seq(BeamLisp.LazySeq.to_list(t))]
+
+  defp encode_seq([h | t]), do: [encode_key(h), encode_key(t)]
+  defp encode_seq(other), do: [encode_key(other)]
 
   # ── construction ─────────────────────────────────────────────────────
 
@@ -217,7 +259,13 @@ defmodule BeamLisp.Sorted do
   @doc """
   Ascending entries whose key satisfies the bound, as `{k, v}` pairs.
 
-  `start` and `stop` are inclusive bounds; `:unbounded` omits that side.
+  Bounds are `{:bound, key}` (inclusive) or `:unbounded`. The TAGGED form
+  matters: a bare sentinel atom would be indistinguishable from a user key
+  of the same value, so `(range-of s :unbounded :unbounded)` could not
+  scan for the legal keyword `:unbounded`. Callers at the RT boundary
+  translate `nil` into `:unbounded` and every other value into
+  `{:bound, k}`, so no user value can forge the sentinel.
+
   The walk begins at `iterator_from/2`, so a scan over a narrow range does
   NOT traverse the keys below it — this is the property index scanning
   depends on.
@@ -228,7 +276,7 @@ defmodule BeamLisp.Sorted do
     iter =
       case start do
         :unbounded -> :gb_trees.iterator(t)
-        k -> :gb_trees.iterator_from(encode_key(k), t)
+        {:bound, k} -> :gb_trees.iterator_from(encode_key(k), t)
       end
 
     take_while_le(iter, stop_encoded(stop), [])
@@ -250,7 +298,7 @@ defmodule BeamLisp.Sorted do
   defp tree(%SortedSet{tree: t}), do: t
 
   defp stop_encoded(:unbounded), do: :unbounded
-  defp stop_encoded(k), do: encode_key(k)
+  defp stop_encoded({:bound, k}), do: encode_key(k)
 
   defp take_while_le(iter, stop, acc) do
     case :gb_trees.next(iter) do

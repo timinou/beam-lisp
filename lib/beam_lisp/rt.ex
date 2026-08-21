@@ -729,6 +729,16 @@ defmodule BeamLisp.RT do
   def sorted?(%SortedSet{}), do: true
   def sorted?(_), do: false
 
+  @doc """
+  `(sorted-dissoc m k)` — an ordered map without `k` (idempotent).
+
+  Exists because `dissoc` in `priv/core.bl` reaches for `Map/delete`, which
+  on a SortedMap would delete a struct FIELD (or silently no-op) rather
+  than a tree entry — leaving the key still present. core dispatches here
+  for ordered maps.
+  """
+  def sorted_dissoc(%SortedMap{} = m, k), do: Sorted.map_delete(m, k)
+
   @doc "`sorted-map?`: true only for an ordered MAP (a sorted set answers false)."
   def sorted_map?(%SortedMap{}), do: true
   def sorted_map?(_), do: false
@@ -762,8 +772,12 @@ defmodule BeamLisp.RT do
   def rsubseq(coll, start, stop), do: range_seq(coll, start, stop, :desc)
 
   defp range_seq(coll, start, stop, dir) do
-    lo = if start == nil, do: :unbounded, else: start
-    hi = if stop == nil, do: :unbounded, else: stop
+    # `nil` is the language-level "unbounded" marker; every other value is
+    # a real key, TAGGED so it can never be confused with the sentinel.
+    # (Untagged, a scan for the legal keyword `:unbounded` was silently
+    # read as "no bound" and returned the whole collection.)
+    lo = if start == nil, do: :unbounded, else: {:bound, start}
+    hi = if stop == nil, do: :unbounded, else: {:bound, stop}
 
     entries =
       case dir do
@@ -963,6 +977,17 @@ defmodule BeamLisp.RT do
 
   def peek([]), do: nil
   def peek(nil), do: nil
+  # An ordered collection is not a STACK. Clojure's peek/pop are defined on
+  # list/queue/vector only, and raise otherwise. Without these clauses the
+  # catch-all below answers `first`/`rest`, which looks plausible — `(peek
+  # sorted-set)` returning the smallest element reads like a feature — but
+  # it is a different operation wearing the same name. Fail loudly.
+  def peek(%SortedSet{}),
+    do: raise(ArgumentError, "peek: a sorted set is not a stack (use first / last-key)")
+
+  def peek(%SortedMap{}),
+    do: raise(ArgumentError, "peek: a sorted map is not a stack (use first / last-entry)")
+
   def peek(coll), do: first(coll)
 
   @doc "jank's `cpp/jank.runtime.pop`: a vector without its last, a seq without its first; empty throws."
@@ -976,6 +1001,15 @@ defmodule BeamLisp.RT do
   def pop([]), do: raise(ArgumentError, "Can't pop empty list")
   def pop(nil), do: raise(ArgumentError, "Can't pop empty list")
   def pop([_ | t]), do: t
+  # See `peek/1`: not stacks. `pop` was worse than `peek` — it returned a
+  # plain LIST, silently changing the collection's type as well as its
+  # meaning.
+  def pop(%SortedSet{}),
+    do: raise(ArgumentError, "pop: a sorted set is not a stack (use disj)")
+
+  def pop(%SortedMap{}),
+    do: raise(ArgumentError, "pop: a sorted map is not a stack (use dissoc)")
+
   def pop(coll), do: rest(coll)
 
   @doc """
@@ -1066,10 +1100,61 @@ defmodule BeamLisp.RT do
       vector?(a) or vector?(b) ->
         eqv_vector(a, b)
 
+      # An ordered collection equals its HASHED sibling with the same
+      # contents — Clojure's contract: sortedness is an index property, not
+      # part of a value's identity. `Kernel.==` would compare the backing
+      # `:gb_trees` against a `MapSet` and answer false for two collections
+      # the language considers equal, which would then break `distinct`,
+      # set membership, and any test asserting against a plain literal.
+      sorted_map?(a) or sorted_map?(b) ->
+        eqv_as_map(a, b)
+
+      sorted_set?(a) or sorted_set?(b) ->
+        eqv_as_set(a, b)
+
       true ->
         Kernel.==(a, b)
     end
   end
+
+  # Compare any two map-shaped values (sorted or plain) by entries. Keys
+  # are compared with `==` via lookup; VALUES go through `eqv/2` so a lazy
+  # or vector value nested inside still compares element-wise.
+  defp eqv_as_map(a, b) do
+    if map?(a) and map?(b) do
+      ea = map_entry_pairs(a)
+      eb = map_entry_pairs(b)
+
+      length(ea) == length(eb) and
+        Enum.all?(ea, fn {k, v} ->
+          case find(b, k) do
+            %BeamLisp.Vector{items: {_k, bv}} -> eqv(v, bv)
+            nil -> false
+          end
+        end)
+    else
+      false
+    end
+  end
+
+  defp eqv_as_set(a, b) do
+    if set?(a) and set?(b) do
+      la = set_members(a)
+      lb = set_members(b)
+      length(la) == length(lb) and Enum.all?(la, &contains?(b, &1))
+    else
+      false
+    end
+  end
+
+  defp map_entry_pairs(%SortedMap{} = m), do: Sorted.map_to_list(m)
+
+  defp map_entry_pairs(m) do
+    m |> seq() |> seq_to_args() |> Enum.map(fn %BeamLisp.Vector{items: {k, v}} -> {k, v} end)
+  end
+
+  defp set_members(%SortedSet{} = s), do: Sorted.set_to_list(s)
+  defp set_members(%Set{} = s), do: Set.to_list(s)
 
   defp eqv_vector(a, b) do
     if vector?(a) and vector?(b) do
@@ -1824,6 +1909,7 @@ defmodule BeamLisp.RT do
       "rsubseq" => &rsubseq/3,
       "sorted-map?" => &sorted_map?/1,
       "sorted-set?" => &sorted_set?/1,
+      "sorted-dissoc" => &sorted_dissoc/2,
       "set?" => &set?/1,
       "disj" => &disj/2,
       "sequential?" => &sequential?/1,
@@ -2078,6 +2164,7 @@ defmodule BeamLisp.RT do
     Env.put_link("core", "last-entry", {BeamLisp.RT, %{1 => :last_entry}, nil})
     Env.put_link("core", "sorted-map?", {BeamLisp.RT, %{1 => :sorted_map?}, nil})
     Env.put_link("core", "sorted-set?", {BeamLisp.RT, %{1 => :sorted_set?}, nil})
+    Env.put_link("core", "sorted-dissoc", {BeamLisp.RT, %{2 => :sorted_dissoc}, nil})
 
     # gensym links both arities directly — plain name, no mangling.
     Env.put_link("core", "gensym", {BeamLisp.RT, %{0 => :gensym, 1 => :gensym}, nil})
