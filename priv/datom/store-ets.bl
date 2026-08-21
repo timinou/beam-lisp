@@ -1,0 +1,162 @@
+; datom/store_ets.bl — the Store port, filled by ETS `:ordered_set`.
+;
+; ── What this is for ──────────────────────────────────────────────────
+;
+; This is the substrate the database is DEVELOPED against. Hobbes is the
+; eventual production target (PLAN-033 wave 6), but it is pre-alpha with
+; no public API, so making it a prerequisite would put a churning
+; dependency on the critical path of every wave. Instead: build the whole
+; database on ETS, prove it with the conformance suite, then fill the same
+; five methods with Hobbes and run the SAME suite unchanged.
+;
+; ── Why `:ordered_set` specifically ───────────────────────────────────
+;
+; `:set` is a hash table — O(1) lookup, no ordering, no ranges. An EAV
+; index needs ordered range scans (see datom/store.bl), so the table type
+; is load-bearing, not a preference. `:ordered_set` gives O(log n) lookup
+; and, critically, `:ets.next/2` — a cursor that walks keys in term order
+; from an arbitrary starting point. That cursor is what `-range` is built
+; from, and it is why a range scan costs the size of its RESULT rather
+; than the size of the table.
+;
+; ── The honest limitation: atomicity ──────────────────────────────────
+;
+; ETS has no transactions. `-commit` here applies its operations in a
+; single `:ets.insert` call where it can (insert of a LIST of tuples is
+; atomic per the ETS docs) but a mixed put/delete batch is NOT atomic:
+; a process killed mid-batch can leave some operations applied.
+;
+; That is stated loudly rather than papered over, because a torn index is
+; a corrupt database. For the development substrate this is acceptable —
+; single test process, no concurrent writers, no crash recovery story.
+; It is ALSO the single strongest argument for Hobbes: strict
+; serializability is exactly the property this impl cannot provide, and
+; the layers above are written against the protocol's promise, not this
+; impl's shortcut.
+
+(ns datom.store-ets
+  (:require [datom.store]))
+
+(defrecord EtsStore [table])
+
+(defn open
+  "Open a fresh ETS-backed store.
+
+   The table is `:ordered_set` (ordering is required — see above) and
+   `:public` so any process can read it; ownership stays with the
+   creating process, so the table dies when that process does. For a
+   development substrate that lifetime is a feature: no cleanup, no
+   leaks between test runs."
+  ([] (open (keyword (str "datom_store_" (name (gensym "t"))))))
+  ([nm] (->EtsStore (ets/new nm (to-list [:ordered_set :public])))))
+
+(defn close
+  "Delete the backing table. Idempotent in practice: a second call on a
+   dead table raises, so callers that may double-close should guard."
+  [store]
+  (ets/delete (:table store))
+  nil)
+
+;; ── internals ───────────────────────────────────────────────────────
+;;
+;; Every Erlang boundary needs a vector→list conversion: `:ets` speaks
+;; tuples and lists, beam-lisp speaks vectors. These two helpers are the
+;; only places that translation happens, so the protocol impl below reads
+;; as plain data code.
+
+(defn- ->tuple
+  "A beam-lisp `[k v]` pair as the `{k, v}` tuple ETS stores."
+  [k v]
+  (erlang/list_to_tuple (to-list [k v])))
+
+(defn- tuple->entry
+  "An ETS `{k, v}` tuple back as a beam-lisp `[k v]` vector."
+  [t]
+  [(erlang/element 1 t) (erlang/element 2 t)])
+
+(def ^:private END-OF-TABLE
+  ; ETS signals exhaustion with the atom `$end_of_table`. Spelled via
+  ; `keyword` rather than as the literal `:"$end_of_table"` because the
+  ; reader does not yet support quoted keyword literals — it silently
+  ; misparses them into two forms (BUG-004). Swap to the literal once
+  ; that lands.
+  (keyword "$end_of_table"))
+
+(defn- end-of-table?
+  "Whether an ETS cursor position is the exhaustion sentinel.
+
+   Naming it once matters: calling `:ets.next` WITH that sentinel raises
+   `not a key that exists in the table`, so every cursor step must test
+   for it first. (Observed as a crash on the empty-table range scan —
+   `ets/first` returns the sentinel, which was then handed straight to
+   `ets/next`.)"
+  [k]
+  (= k END-OF-TABLE))
+
+(defn- walk-from
+  "Ascending `[k v]` entries starting at ETS key `k`, up to `stop`
+   inclusive, accumulated in reverse.
+
+   Uses `:ets.next/2` as a cursor rather than `tab2list` + filter: the
+   cursor stops as soon as the upper bound is passed, so a scan of ten
+   keys in a million-row table touches ten keys. That difference is the
+   entire reason an index is faster than a scan."
+  [table k stop acc]
+  (if (end-of-table? k)
+    (reverse acc)
+    (if (and (some? stop) (> (compare k stop) 0))
+      (reverse acc)
+      (let [hit (ets/lookup table k)]
+        (recur table
+               (ets/next table k)
+               stop
+               (if (empty? hit)
+                 acc
+                 (cons (tuple->entry (first hit)) acc)))))))
+
+(defn- start-key
+  "The ETS key a scan should begin at.
+
+   `nil` start means unbounded below, so begin at the table's first key.
+   Otherwise begin at `start` itself when present, or at the next key
+   after it — `:ets.next` skips a key that does not exist, which is
+   exactly the semantics an inclusive lower bound wants.
+
+   Guards the sentinel on BOTH paths: an empty table has no first key,
+   and a `start` past the last key has no successor."
+  [table start]
+  (if (nil? start)
+    (ets/first table)
+    (if (empty? (ets/lookup table start))
+      (if (end-of-table? start) start (ets/next table start))
+      start)))
+
+(extend-type EtsStore datom.store/Store
+  (-get [store k]
+    (let [hit (ets/lookup (:table store) k)]
+      (if (empty? hit) nil (erlang/element 2 (first hit)))))
+
+  (-range [store start stop]
+    (walk-from (:table store) (start-key (:table store) start) stop '()))
+
+  (-put [store k v]
+    (ets/insert (:table store) (->tuple k v))
+    store)
+
+  (-delete [store k]
+    (ets/delete (:table store) k)
+    store)
+
+  (-commit [store ops]
+    ; Puts are batched into ONE `:ets.insert` (atomic for a list of
+    ; tuples); deletes must go one at a time, so a mixed batch is not
+    ; atomic overall. Documented at the top of this file as the known
+    ; gap this substrate cannot close.
+    (let [puts (filterv (fn [op] (= (get op 0) :put)) ops)
+          dels (filterv (fn [op] (= (get op 0) :delete)) ops)]
+      (when (seq puts)
+        (ets/insert (:table store)
+                    (to-list (mapv (fn [op] (->tuple (get op 1) (get op 2))) puts))))
+      (doseq [op dels]
+        (ets/delete (:table store) (get op 1)))
+      store)))

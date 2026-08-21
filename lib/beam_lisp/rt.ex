@@ -5,7 +5,8 @@ defmodule BeamLisp.RT do
   value, so compiled beam-lisp code calls them with plain `apply/2`.
   """
 
-  alias BeamLisp.{Env, LazySeq, Set}
+  alias BeamLisp.{Env, LazySeq, Set, Sorted}
+  alias BeamLisp.Sorted.{SortedMap, SortedSet}
 
   # `rem` is seeded as a core prim (Clojure's remainder), so the module
   # must not inherit Kernel.rem/2 — the local def below is the source of
@@ -109,6 +110,14 @@ defmodule BeamLisp.RT do
   def get(%Set{} = s, x, default),
     do: if(Set.member?(s, x), do: x, else: default)
 
+  # Ordered collections mirror their hashed siblings: a sorted map looks
+  # up by key, a sorted set is a function of its members. Both are structs,
+  # so these MUST precede the is_bl_map clause.
+  def get(%SortedMap{} = m, k, default), do: Sorted.map_get(m, k, default)
+
+  def get(%SortedSet{} = s, x, default),
+    do: if(Sorted.set_member?(s, x), do: x, else: default)
+
   # A record is a struct (and so a map), but its `__struct__` key is
   # internal — field access goes through the public fields only, so
   # `(:__struct__ p)` is nil, not the module.
@@ -178,6 +187,17 @@ defmodule BeamLisp.RT do
   # would iterate the struct's fields instead.
   def first(%Set{} = s), do: Set.to_list(s) |> List.first()
 
+  # An ordered collection's first is its SMALLEST element — O(log n) via
+  # :gb_trees.smallest, never a full materialisation.
+  def first(%SortedSet{} = s), do: Sorted.first_key(s)
+
+  def first(%SortedMap{} = m) do
+    case Sorted.first_entry(m) do
+      nil -> nil
+      {k, v} -> %BeamLisp.Vector{items: {k, v}}
+    end
+  end
+
   # A record is a struct-map: iterate its public fields (and any assoc'd
   # extras), never the hidden `__struct__` key. These clauses MUST precede
   # the is_bl_map clauses or a record leaks `__struct__` into iteration.
@@ -211,6 +231,10 @@ defmodule BeamLisp.RT do
 
   def rest(%Set{} = s), do: Set.to_list(s) |> tl()
 
+  def rest(%SortedSet{} = s), do: Sorted.set_to_list(s) |> rest()
+
+  def rest(%SortedMap{} = m), do: sorted_map_entries(m) |> rest()
+
   def rest(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
     do: raise(ArgumentError, "rest: #{inspect(mod)} is a reference, not a collection")
 
@@ -243,6 +267,10 @@ defmodule BeamLisp.RT do
   end
 
   def next(%Set{} = s), do: next(Set.to_list(s))
+
+  def next(%SortedSet{} = s), do: next(Sorted.set_to_list(s))
+
+  def next(%SortedMap{} = m), do: next(sorted_map_entries(m))
 
   def next(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m),
     do: raise(ArgumentError, "next: #{inspect(mod)} is a reference, not a collection")
@@ -307,6 +335,19 @@ defmodule BeamLisp.RT do
   # must precede the map-entry clause below — a set of vectors is legal
   # and must not be mistaken for a map being conj-ed a [k v] entry.
   def conj(%Set{} = s, x), do: Set.add(s, x)
+  # A sorted set conj's a member; a sorted map conj's a [k v] entry, the
+  # same contract as a plain map. Both precede the map-entry clause below
+  # for the same reason %Set{} does.
+  def conj(%SortedSet{} = s, x), do: Sorted.set_add(s, x)
+
+  def conj(%SortedMap{} = m, %BeamLisp.Vector{items: {k, v}}), do: Sorted.map_put(m, k, v)
+
+  def conj(%SortedMap{}, other),
+    do:
+      raise(
+        ArgumentError,
+        "conj on a sorted map expects a [k v] entry, got: #{inspect(other)}"
+      )
   # A reference is not conj-able — conj would otherwise fall through to the
   # map-entry clauses and silently add a field to the struct.
   def conj(%{__struct__: mod} = m, _x) when is_atom(mod) and is_ref_type(m),
@@ -335,6 +376,8 @@ defmodule BeamLisp.RT do
   def count(%BeamLisp.Vector{} = v), do: BeamLisp.Vector.count(v)
   def count(%LazySeq{} = l), do: LazySeq.count(l)
   def count(%Set{} = s), do: Set.count(s)
+  def count(%SortedSet{} = s), do: Sorted.set_count(s)
+  def count(%SortedMap{} = m), do: Sorted.map_count(m)
   # A record's count is its public fields (plus any assoc'd extras) —
   # map_size would count the hidden `__struct__` key too. References are
   # not collections, so they raise before this record clause.
@@ -459,6 +502,22 @@ defmodule BeamLisp.RT do
 
   # A set's seq is its members (nil when empty); the empty set is falsy
   # in `(when (seq s) …)`, like any other empty collection.
+  def seq(%SortedSet{} = s) do
+    case Sorted.set_to_list(s) do
+      [] -> nil
+      members -> members
+    end
+  end
+
+  # A sorted map seqs as ordered map entries, exactly like a plain map —
+  # but with a GUARANTEED order rather than an incidental one.
+  def seq(%SortedMap{} = m) do
+    case sorted_map_entries(m) do
+      [] -> nil
+      entries -> entries
+    end
+  end
+
   def seq(%Set{} = s) do
     case Set.to_list(s) do
       [] -> nil
@@ -498,6 +557,20 @@ defmodule BeamLisp.RT do
   def find(%{__struct__: mod} = m, _k) when is_atom(mod) and is_ref_type(m),
     do: raise(ArgumentError, "find: #{inspect(mod)} is a reference, not a collection")
 
+  # A sorted map finds like a plain map — `nil` for absent, a `[k v]` entry
+  # for present, so absence stays distinguishable from a nil VALUE.
+  #
+  # This MUST precede the generic `%{__struct__: mod}` record clause below:
+  # a SortedMap is a struct, so that clause matches it first, asks
+  # `Record.record?/1` (false), and falls into `find_in_map/2`, which reads
+  # the STRUCT's fields (`:tree`) instead of the map's contents — returning
+  # nil for every key that actually exists. Caught by probe, not by reading.
+  def find(%SortedMap{} = m, k) do
+    if Sorted.map_has_key?(m, k),
+      do: %BeamLisp.Vector{items: {k, Sorted.map_get(m, k)}},
+      else: nil
+  end
+
   def find(%{__struct__: mod} = m, k) when is_atom(mod) do
     if BeamLisp.Record.record?(m) do
       # The internal `__struct__` key is not findable; real keys read the
@@ -529,6 +602,10 @@ defmodule BeamLisp.RT do
   # Set contains? is MEMBERSHIP (a set is a struct-map, so this must
   # precede the is_bl_map clause which would check the :members field).
   def contains?(%Set{} = s, x), do: Set.member?(s, x)
+  # Sorted set contains? is membership; sorted map contains? is KEY
+  # presence — the same asymmetry Clojure has between sets and maps.
+  def contains?(%SortedSet{} = s, x), do: Sorted.set_member?(s, x)
+  def contains?(%SortedMap{} = m, k), do: Sorted.map_has_key?(m, k)
 
   # Records report containment over their public fields only; `__struct__`
   # is internal.
@@ -560,6 +637,10 @@ defmodule BeamLisp.RT do
   # single dissenter, and a predicate that disagrees with every operation it
   # is supposed to guard is worse than no predicate. Non-record structs
   # (LazySeq, Vector, Set, the reference types) are NOT maps and stay false.
+  # A sorted map IS a map by every operation that matters (get, assoc,
+  # find, count, seq, conj), so the predicate must agree — the same
+  # argument that makes a record report true.
+  def map?(%SortedMap{}), do: true
   def map?(%{__struct__: mod} = x) when is_atom(mod), do: BeamLisp.Record.record?(x)
   def map?(x), do: is_bl_map(x)
   def vector?(%BeamLisp.Vector{}), do: true
@@ -573,6 +654,8 @@ defmodule BeamLisp.RT do
   def coll?(%BeamLisp.Vector{}), do: true
   def coll?(%LazySeq{}), do: true
   def coll?(%Set{}), do: true
+  def coll?(%SortedSet{}), do: true
+  def coll?(%SortedMap{}), do: true
   # A reference is a struct but never a collection.
   def coll?(%{__struct__: mod} = m) when is_atom(mod) and is_ref_type(m), do: false
   # Records are user-facing maps, so they are collections.
@@ -596,12 +679,103 @@ defmodule BeamLisp.RT do
   defp set_from_seq(nil), do: Set.new()
   defp set_from_seq(s), do: Set.new(seq_to_args(s))
 
-  @doc "`set?`: true for a set."
+  @doc "`set?`: true for a set — hashed or ordered."
   def set?(%Set{}), do: true
+  def set?(%SortedSet{}), do: true
   def set?(_), do: false
 
   @doc "`(disj set x)` — the set without x (idempotent)."
   def disj(%Set{} = s, x), do: Set.del(s, x)
+  def disj(%SortedSet{} = s, x), do: Sorted.set_del(s, x)
+
+  # --- sorted collections ------------------------------------------
+  # The ordered siblings of `set`/map. Their vocabulary (sorted-map,
+  # sorted-set, subseq, rsubseq) is defined in priv/core.bl over these
+  # primitives — Elixir keeps only what needs :gb_trees.
+
+  @doc "`(sorted-map & kvs)` — an ordered map from flat key/value args."
+  def sorted_map(args) do
+    args
+    |> seq_to_args()
+    |> Enum.chunk_every(2)
+    |> Enum.reduce(Sorted.map_new(), fn
+      [k, v], acc ->
+        Sorted.map_put(acc, k, v)
+
+      [k], _acc ->
+        raise(ArgumentError, "sorted-map: no value supplied for key #{inspect(k)}")
+    end)
+  end
+
+  @doc "`(sorted-set & xs)` — an ordered set of the given elements."
+  def sorted_set(args), do: Sorted.set_new(seq_to_args(args))
+
+  @doc "`(sorted-map-of coll)` — an ordered map from a collection of `[k v]` entries."
+  def sorted_map_of(coll) do
+    coll
+    |> seqable()
+    |> Enum.reduce(Sorted.map_new(), fn
+      %BeamLisp.Vector{items: {k, v}}, acc -> Sorted.map_put(acc, k, v)
+      [k, v], acc -> Sorted.map_put(acc, k, v)
+      other, _acc -> raise(ArgumentError, "sorted-map-of: not a [k v] entry: #{inspect(other)}")
+    end)
+  end
+
+  @doc "`(sorted-set-of coll)` — an ordered set of a collection's distinct elements."
+  def sorted_set_of(coll), do: Sorted.set_new(seqable(coll))
+
+  @doc "`sorted?`: true for an ordered map or set."
+  def sorted?(%SortedMap{}), do: true
+  def sorted?(%SortedSet{}), do: true
+  def sorted?(_), do: false
+
+  @doc "`sorted-map?`: true only for an ordered MAP (a sorted set answers false)."
+  def sorted_map?(%SortedMap{}), do: true
+  def sorted_map?(_), do: false
+
+  @doc "`sorted-set?`: true only for an ordered SET (a sorted map answers false)."
+  def sorted_set?(%SortedSet{}), do: true
+  def sorted_set?(_), do: false
+
+  @doc "`(last-key coll)` — the largest key/member, or nil when empty. O(log n)."
+  def last_key(%SortedMap{} = m), do: Sorted.last_key(m)
+  def last_key(%SortedSet{} = s), do: Sorted.last_key(s)
+
+  @doc "`(last-entry m)` — the largest `[k v]` entry of a sorted map, or nil."
+  def last_entry(%SortedMap{} = m) do
+    case Sorted.last_entry(m) do
+      nil -> nil
+      {k, v} -> %BeamLisp.Vector{items: {k, v}}
+    end
+  end
+
+  @doc """
+  `(subseq coll start stop)` — ascending elements between inclusive bounds.
+
+  `nil` bounds are unbounded. A sorted set yields members; a sorted map
+  yields `[k v]` entries. The scan starts AT the lower bound rather than
+  filtering from the beginning — the property index range-scans need.
+  """
+  def subseq(coll, start, stop), do: range_seq(coll, start, stop, :asc)
+
+  @doc "`(rsubseq coll start stop)` — as `subseq`, descending."
+  def rsubseq(coll, start, stop), do: range_seq(coll, start, stop, :desc)
+
+  defp range_seq(coll, start, stop, dir) do
+    lo = if start == nil, do: :unbounded, else: start
+    hi = if stop == nil, do: :unbounded, else: stop
+
+    entries =
+      case dir do
+        :asc -> Sorted.subseq_entries(coll, lo, hi)
+        :desc -> Sorted.rsubseq_entries(coll, lo, hi)
+      end
+
+    case coll do
+      %SortedSet{} -> Enum.map(entries, fn {k, _} -> k end)
+      %SortedMap{} -> Enum.map(entries, fn {k, v} -> %BeamLisp.Vector{items: {k, v}} end)
+    end
+  end
 
   @doc "`sequential?`: a list, vector, or lazy seq — never a map, set, or string."
   def sequential?(%BeamLisp.Vector{}), do: true
@@ -652,6 +826,8 @@ defmodule BeamLisp.RT do
   defp rank(%BeamLisp.Vector{}), do: 7
   defp rank(%LazySeq{}), do: 7
   defp rank(%Set{}), do: 7
+  defp rank(%SortedSet{}), do: 7
+  defp rank(%SortedMap{}), do: 7
   defp rank(x) when is_list(x), do: 7
   # is_map-ok: comparison rank deliberately treats any struct or plain map
   # uniformly at rank 7 for total ordering (reference types sort alongside
@@ -816,8 +992,12 @@ defmodule BeamLisp.RT do
   @doc "jank's `cpp/jank.runtime.is_big_decimal`: beam-lisp has no BigDecimal type, so nothing is one."
   def decimal?(_), do: false
 
-  @doc "jank's `cpp/jank.runtime.is_sorted`: beam-lisp has no sorted collection type, so nothing is one."
-  def sorted?(_), do: false
+  # NB: `sorted?/1` now lives with the sorted-collection primitives above
+  # (it answers true for SortedMap/SortedSet since PLAN-033 wave 1). jank's
+  # `cpp/jank.runtime.is_sorted` maps onto that same fn — the vendored
+  # slice's `(sorted? {})` stays false because a PLAIN map is still
+  # unsorted, but a genuine ordered collection now answers true, which is
+  # the more faithful answer to jank's question rather than a stub.
 
   @doc "jank's `cpp/jank.runtime.is_nan`: true for a NaN float (the only value unequal to itself)."
   def nan?(x) when is_float(x), do: x != x
@@ -845,6 +1025,11 @@ defmodule BeamLisp.RT do
   """
   def transientable?(%BeamLisp.Vector{}), do: true
   def transientable?(%Set{}), do: true
+  # Ordered collections have no transient view: :gb_trees is already a
+  # persistent structure with cheap updates, and a mutable ordered
+  # transient would need a second implementation for no measured gain.
+  def transientable?(%SortedSet{}), do: false
+  def transientable?(%SortedMap{}), do: false
   # A lazy seq is a struct, so it is a map — but it is not transientable.
   def transientable?(%LazySeq{}), do: false
   # A reference is a struct but never transientable (its transient view
@@ -932,6 +1117,12 @@ defmodule BeamLisp.RT do
   # enumeration is insertion-ordered, keeping key order deterministic.
   defp map_entries(m), do: for({k, v} <- m, do: %BeamLisp.Vector{items: {k, v}})
 
+  # A sorted map's entries, in KEY ORDER — the same `[k v]` entry vectors a
+  # plain map produces, so every downstream consumer (destructuring, `into`,
+  # `for`) works unchanged; only the order is now guaranteed.
+  defp sorted_map_entries(%SortedMap{} = m),
+    do: Sorted.map_to_list(m) |> Enum.map(fn {k, v} -> %BeamLisp.Vector{items: {k, v}} end)
+
   # A record's entries: its public fields (plus any assoc'd extras) as
   # [k v] entry vectors. `for`/`Enum` over a struct raise (no Enumerable),
   # so records are read through Map.to_list with the internal `__struct__`
@@ -947,6 +1138,10 @@ defmodule BeamLisp.RT do
   # A set is a struct-map; iterating it via Enum would walk its fields,
   # so map/filter read its members instead.
   defp seqable(%Set{} = s), do: Set.to_list(s)
+  # Ordered collections iterate in key order — that guarantee is the
+  # entire reason they exist, so map/filter/reduce must honour it.
+  defp seqable(%SortedSet{} = s), do: Sorted.set_to_list(s)
+  defp seqable(%SortedMap{} = m), do: sorted_map_entries(m)
   # A record iterates as its public entries, not its struct fields.
   defp seqable(%{__struct__: mod} = r) when is_atom(mod) do
     if BeamLisp.Record.record?(r), do: record_entries(r), else: r
@@ -1283,6 +1478,13 @@ defmodule BeamLisp.RT do
   # raises; fail loudly instead of corrupting the set's shape.
   def assoc(%Set{}, _k, _v),
     do: raise(ArgumentError, "assoc not supported on a set")
+
+  # A sorted map assoc's like a map (order maintained by the tree); a
+  # sorted set raises exactly as a hashed set does.
+  def assoc(%SortedMap{} = m, k, v), do: Sorted.map_put(m, k, v)
+
+  def assoc(%SortedSet{}, _k, _v),
+    do: raise(ArgumentError, "assoc not supported on a sorted set")
   # A reference is not a map — assoc'ing it would add a field to the struct.
   def assoc(%{__struct__: mod} = m, _k, _v) when is_atom(mod) and is_ref_type(m),
     do: raise(ArgumentError, "assoc: #{inspect(mod)} is a reference, not a collection")
@@ -1349,6 +1551,23 @@ defmodule BeamLisp.RT do
   def print_str(%Set{} = s) do
     body = s |> Set.to_list() |> Enum.map_join(" ", &print_elem/1)
     "#" <> "{" <> body <> "}"
+  end
+
+  # Ordered collections print like their hashed siblings — the ORDER is the
+  # visible difference, and it is deterministic, which is what makes these
+  # printable forms usable in test assertions.
+  def print_str(%SortedSet{} = s) do
+    body = s |> Sorted.set_to_list() |> Enum.map_join(" ", &print_elem/1)
+    "#" <> "{" <> body <> "}"
+  end
+
+  def print_str(%SortedMap{} = m) do
+    body =
+      m
+      |> Sorted.map_to_list()
+      |> Enum.map_join(", ", fn {k, v} -> print_elem(k) <> " " <> print_elem(v) end)
+
+    "{" <> body <> "}"
   end
 
   # A record prints readably as `#ns/Name{field val …}` — the tagged
@@ -1593,6 +1812,18 @@ defmodule BeamLisp.RT do
       "ident?" => &ident?/1,
       # sets (wave 18)
       "set" => &set/1,
+      # Ordered collections. The variadic surface (sorted-map, sorted-set)
+      # is defined in priv/core.bl over these; what lands here is only
+      # what needs :gb_trees underneath.
+      "sorted-map-of" => &sorted_map_of/1,
+      "sorted-set-of" => &sorted_set_of/1,
+      "sorted?" => &sorted?/1,
+      "last-key" => &last_key/1,
+      "last-entry" => &last_entry/1,
+      "subseq" => &subseq/3,
+      "rsubseq" => &rsubseq/3,
+      "sorted-map?" => &sorted_map?/1,
+      "sorted-set?" => &sorted_set?/1,
       "set?" => &set?/1,
       "disj" => &disj/2,
       "sequential?" => &sequential?/1,
@@ -1702,8 +1933,10 @@ defmodule BeamLisp.RT do
       "jank.runtime.keyword" => &keyword_of/2,
       # The reduce/transducer core and the numeric layer. `reduce` is
       # honest: it actually short-circuits on a Reduced, and the is_*
-      # predicates report beam-lisp's real type space (no Ratio, no
-      # BigDecimal, no sorted coll, so those are genuinely always false).
+      # predicates report beam-lisp's real type space (no Ratio and no
+      # BigDecimal, so those are genuinely always false; `is_sorted` was
+      # in that list until PLAN-033 wave 1 gave the language real ordered
+      # collections, and it now answers truthfully for them).
       "jank.runtime.reduce" => &reduce/3,
       "jank.runtime.reduced" => &reduced/1,
       "jank.runtime.is_reduced" => &reduced?/1,
@@ -1804,6 +2037,9 @@ defmodule BeamLisp.RT do
       "coll?" => 1,
       "ident?" => 1,
       "set" => 1,
+      "sorted?" => 1,
+      "subseq" => 3,
+      "rsubseq" => 3,
       "set?" => 1,
       "disj" => 2,
       "sequential?" => 1,
@@ -1829,6 +2065,19 @@ defmodule BeamLisp.RT do
     # mangle it to `:"tree-seq"`, so link it explicitly (the prelude
     # loop maps dashed names only for 2-arity fns).
     Env.put_link("core", "tree-seq", {BeamLisp.RT, %{3 => :tree_seq}, nil})
+
+    # The dash-named sorted prims have the same problem as `tree-seq`: the
+    # integer-spec loop above would mangle `sorted-map-of` into the atom
+    # `:"sorted-map-of"`, which is not the fn's name. Link them explicitly
+    # to their underscored definitions. (Symptom when missed: a call raises
+    # `function BeamLisp.RT."sorted-map-of"/1 is undefined` at RUNTIME, not
+    # at compile time — the link table is only consulted on invocation.)
+    Env.put_link("core", "sorted-map-of", {BeamLisp.RT, %{1 => :sorted_map_of}, nil})
+    Env.put_link("core", "sorted-set-of", {BeamLisp.RT, %{1 => :sorted_set_of}, nil})
+    Env.put_link("core", "last-key", {BeamLisp.RT, %{1 => :last_key}, nil})
+    Env.put_link("core", "last-entry", {BeamLisp.RT, %{1 => :last_entry}, nil})
+    Env.put_link("core", "sorted-map?", {BeamLisp.RT, %{1 => :sorted_map?}, nil})
+    Env.put_link("core", "sorted-set?", {BeamLisp.RT, %{1 => :sorted_set?}, nil})
 
     # gensym links both arities directly — plain name, no mangling.
     Env.put_link("core", "gensym", {BeamLisp.RT, %{0 => :gensym, 1 => :gensym}, nil})

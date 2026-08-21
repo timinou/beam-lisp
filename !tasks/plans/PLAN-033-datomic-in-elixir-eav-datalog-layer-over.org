@@ -1,0 +1,184 @@
+#+TITLE: Datomic in Elixir: EAV/datalog layer over Hobbes
+#+STATE: ITEM
+#+SESSION_ID: 155f259267abecdc
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-08-20T13-34-04-190Z_155f259267abecdc.jsonl]]
+#+CUSTOM_ID: PLAN-033-datomic-in-elixir-eav-datalog-layer-over
+
+* Initial Message
+
+how hward would it be to support datahike in beam lisp?
+
+* Goal
+
+A Datomic — immutable EAV database with datalog query, db-as-value, and
+time travel (=as-of=/=since=/=history=) — implemented natively in
+Elixir/beam-lisp. NOT a bridge to datahike, Datomic, or any pod. The
+datahike pod investigation (see conversation log) is CLOSED: it solves
+"reach a datalog DB from beam-lisp", which is not the goal.
+
+* Why Hobbes fits (verified 2026-08-20)
+
+Read of https://tangled.org/corporate.fm/hobbes (978 commits, 100% Elixir,
+active — last commit 6 days ago; README status: "experimental, working
+toward an alpha release").
+
+Hobbes is a FoundationDB-architecture reimplementation for the BEAM:
+- transactional ordered key/value API, strict serializability
+- keyspace-spanning transactions, even across machines
+- sharded + replicated, fault-tolerant, scales horizontally
+- =lib/enc/= (=Enc.Tuple=, formerly =Keyset=) = FDB-style tuple layer
+- =lib/btree/=, XKS leveled-LSM on-disk engine (RFD #1)
+- deterministic simulation testing / fault injection as the primary
+  development methodology (author: "has never written a single byte to
+  an actual disk"; unit tests deliberately abandoned in favor of fuzzing)
+
+This matters because **Datomic's own architecture is exactly this split**:
+Datomic = indexing/datalog/time-travel layer over a dumb transactional
+sorted KV store (DynamoDB, Cassandra, JDBC). FDB's tuple layer + ordered
+keyspace + serializable transactions is the ideal substrate — ordered keys
+give index prefix scans, which is the one primitive EAV indexing requires.
+
+The author's stated roadmap (Memex, a relational DB on Hobbes) confirms the
+intended layering: Hobbes is the storage abstraction, higher DBs sit on top.
+A Datomic layer is the same shape as Memex, different data model.
+
+* Architecture
+
+Four layers, bottom-up. Each is independently testable and useful.
+
+** L0 — substrate (Hobbes, submoduled; NOT vendored/forked)
+
+Pin as a git submodule. NO modifications to Hobbes source — if something is
+missing, upstream it or wrap it. Fork = permanent maintenance tax on a
+codebase whose whole value is its fuzz-tested correctness.
+
+RISK (must be resolved before committing to this path):
+- no public API yet (author: "the lack of examples is very intentional,
+  because there is no public API"); private API visible in =lib/workloads/=
+  and =lib/transaction.ex=
+- has not yet written real bytes to disk — durability path is simulated
+- pre-alpha, single author, hosted on Tangled (not GitHub/Hex)
+∴ API WILL churn. Mitigation: L1 is the ONLY module that touches Hobbes.
+Everything above talks to L1's port behaviour.
+
+** L1 — =BeamLisp.Datom.Store= (storage port behaviour)
+
+One behaviour, two impls:
+- =Store.Hobbes= — the real substrate
+- =Store.Ets= — in-memory, ordered (=:ordered_set=), for tests/dev/REPL
+
+Callback surface, deliberately tiny (this IS the isolation boundary):
+=get/2=, =range/3= (ordered prefix scan), =put/3=, =delete/2=,
+=transact/2= (atomic multi-key CAS), =watch/2= (optional).
+
+Everything above L1 is substrate-agnostic. Swap Hobbes for FDB proper,
+or for a single-node LSM, without touching L2+.
+
+** L2 — =BeamLisp.Datom= (the EAV core — this is the actual Datomic)
+
+- datom: =[e a v tx op]=, =op= ∈ add/retract
+- entity ids: 64-bit, partitioned (like Datomic: =:db.part/tx=, =/user=)
+- covering indexes as key encodings over the ordered keyspace:
+  | index | key layout | serves |
+  |-------+------------+--------|
+  | EAVT  | e/a/v/tx   | entity lookup, pull |
+  | AEVT  | a/e/v/tx   | attribute scan |
+  | AVET  | a/v/e/tx   | unique/lookup refs, range preds |
+  | VAET  | v/a/e/tx   | reverse ref navigation |
+  AVET/VAET only for attrs flagged =:db/index= / =:db.type/ref= (Datomic
+  semantics — do not index everything, write amplification)
+- value encoding: order-preserving (this is the subtle part — encoded
+  bytes must sort in value order for range preds to work). Hobbes's
+  =Enc.Tuple= likely already solves this; verify before writing our own.
+- transactions: tempid resolution, =:db/unique= upsert, cardinality
+  one/many, =:db/valueType= validation, reified tx entities (tx metadata
+  as datoms — free time travel)
+- db value: =%Db{store, basis_t, schema}= — immutable, cheap to pass
+  around. =as-of=/=since=/=history= = filters over the same indexes at a
+  different =t=. NO data copying — this is why the tx-in-key layout above
+  matters.
+
+** L3 — datalog query engine (=BeamLisp.Datom.Query=)
+
+- parse =[:find … :in … :where …]= from beam-lisp data (vectors/keywords),
+  NOT from strings. Query is a value, per Datomic/EDN.
+- pattern clauses → index scans; the planner picks the index by which
+  positions are bound (this is why L2's four indexes exist)
+- joins: hash join by default; the "unification" is variable binding
+  propagation across clauses
+- predicates =[(< ?a 30)]=, function clauses =[(f ?x) ?y]=, =or=/=not=,
+  rules (=%=) — rules can land in a later wave
+- =pull= API: recursive entity trees, =[*]=, nested maps, reverse refs
+- aggregates: =count=, =sum=, =max=, =min=, =avg=
+
+** L4 — beam-lisp surface
+
+Zero new language machinery — the API is remote-module interop, exactly
+as =examples/interop.bl= demonstrates. `.bl` code:
+
+#+begin_src clojure
+(def conn (Datom/connect cfg))
+(Datom/transact conn [{:db/id -1 :person/name "Ada"}])
+(Datom/q [:find ?n :where [?e :person/name ?n]] (Datom/db conn))
+(Datom/pull (Datom/db conn) [:person/name] eid)
+#+end_src
+
+Fidelity win, already present in the language: =q= returns a set of
+tuples, and =lib/beam_lisp/set.ex= is a real Clojure set; queries are
+vectors + keywords, which are native EDN. The data model needs no
+translation at any layer — unlike the pod path, where every call crossed
+a transit boundary.
+
+* Prerequisite (blocks L2, independently useful)
+
+=lib/beam_lisp/sorted_set.ex= — Clojure-shaped sorted set/map over
+=:gb_trees= with =subseq=/=rsubseq=/=slice=. Verified absent: no
+=:gb_trees=/=:gb_sets=/sorted-set anywhere in =lib/= or =examples/=;
+=lib/beam_lisp/set.ex= is =MapSet=-backed (hash, no ordering).
+The in-memory index path and =Store.Ets= both need ordered iteration.
+
+* Wave plan
+
+| wave | deliverable | est |
+|------+-------------+-----|
+| 1 | =sorted_set.ex= + tests; =Store= behaviour + =Store.Ets= | 3-4d |
+| 2 | L2 datoms, EAVT/AEVT indexes, transact, tempids, schema | 1.5-2w |
+| 3 | L3 query: patterns, joins, =:in=, predicates | 1.5-2w |
+| 4 | =pull=, AVET/VAET, uniqueness, reverse refs, aggregates | 1w |
+| 5 | time travel: =as-of=/=since=/=history=, tx reification | 1w |
+| 6 | =Store.Hobbes= behind the L1 port; submodule pin | 1-2w? |
+| 7 | =.bl= surface + =examples/datom.bl= + docs | 3-4d |
+
+Waves 1-5 and 7 are substrate-independent: they run on =Store.Ets= and are
+fully useful without Hobbes. Wave 6 is the only Hobbes-coupled wave, and
+its estimate is the least trustworthy (pre-alpha private API).
+
+∴ **Sequencing decision: do NOT start with Hobbes.** Build L2/L3 against
+=Store.Ets= first. Hobbes lands when it has a public API, and the port
+boundary means that landing is a wave, not a rewrite.
+
+Total ≈ 7-9 weeks to a credible single-node Datomic; distribution and
+durability arrive with Hobbes.
+
+* Non-goals
+
+- datahike/Datomic wire compatibility
+- SQL
+- replacing Ecto/Postgres for CRUD workloads
+- distributed transactions authored by us (that is Hobbes's whole job —
+  if we find ourselves writing consensus code, the layering has failed)
+
+* Open questions
+
+1. Does Hobbes's =Enc.Tuple= give order-preserving encoding for the value
+   types we need (ints, floats, strings, refs, instants, uuids)? Read
+   =lib/enc/= before designing L2's key codec — do not reinvent it.
+2. Transaction size limits: Datomic tx = one atomic unit; FDB caps
+   transactions (10MB/5s in FDB proper). What does Hobbes cap?
+3. Does the =:db.part/tx= monotonic counter become a hot shard under
+   Hobbes's sharding? (Datomic centralizes the transactor for exactly
+   this reason.) May need a single-writer process per DB — which is
+   natural on the BEAM anyway.
+4. Indexing strategy: Datomic keeps a memory index + periodic merge into
+   durable trees. Do we replicate that, or write straight through to
+   Hobbes and let XKS's LSM absorb the write amplification?
