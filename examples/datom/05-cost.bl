@@ -1,0 +1,202 @@
+; examples/datom/05-cost.bl — what it costs, and why that picks a backend.
+; Run: mix beam_lisp.run --path priv examples/datom/05-cost.bl
+;
+; ── Why counts, not milliseconds ──────────────────────────────────────
+;
+; This file measures the database twice, and the two measurements answer
+; different questions.
+;
+; TIMINGS tell you about the machine as much as the code. While this was
+; being written the host sat at load average 16 with 48 GB of swap in
+; use, and two identical runs of the same benchmark differed by 2.2x. A
+; threshold written against wall-clock time would have been noise
+; dressed as a contract.
+;
+; STORE OPERATIONS are exact. They do not move with load, need no
+; warm-up, and — this is the point — they are what actually decides what
+; happens when the store stops being local. Every `-range` is one round
+; trip against a networked backend. `N+1 ranges` and `2 ranges` are the
+; difference between a query that fits in one packet and one that spends
+; half a second in latency.
+;
+; So: measure counts to reason about the DESIGN, and timings only to
+; notice something has gone badly wrong.
+
+(ns example.datom.cost
+  (:require [datom] [datom.store] [datom.store-ets] [datom.index]))
+
+(defn- heading [text] (println (str "\n" text)))
+(defn- row [& cells] (println (str "  " (join "  " cells))))
+(defn- pad [s n] (let [t (str s)] (str t (join "" (repeat (max 0 (- n (count t))) " ")))))
+
+;; ── a store that counts what is asked of it ─────────────────────────
+;;
+;; This is only possible because L1 is a PROTOCOL. The layers above
+;; cannot tell they are being measured, which is the same property that
+;; will let a different substrate arrive later.
+
+(def COUNTER (atom {}))
+(defn- bump [k] (swap! COUNTER (fn [m] (assoc m k (+ 1 (or (get m k) 0))))))
+(defn- ranges [] (or (get (deref COUNTER) :range) 0))
+
+(defrecord CountingStore [inner]
+  datom.store/Store
+  (-get [s k] (bump :get) (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (bump :range) (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (bump :put) (datom.store/-put (:inner s) k v))
+  (-delete [s k] (bump :delete) (datom.store/-delete (:inner s) k))
+  (-update [s k f] (bump :update) (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (bump :commit) (datom.store/-commit (:inner s) ops)))
+
+(defn- nums [n] (loop [i 0 acc []] (if (>= i n) acc (recur (+ i 1) (conj acc i)))))
+(defn- now [] (erlang/monotonic_time :millisecond))
+
+(def SCHEMA
+  [{:db/ident :p/name :db/valueType :db.type/string}
+   {:db/ident :p/age :db/valueType :db.type/long}
+   {:db/ident :p/city :db/valueType :db.type/string}])
+
+(defn- loaded
+  "A connection holding `n` people, over a counting store."
+  [n]
+  (let [c (datom/connect-with (->CountingStore (datom.store-ets/open)) SCHEMA)]
+    (datom/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                                      :p/name (str "n" i)
+                                      :p/age i
+                                      :p/city (if (even? i) "London" "NY")})
+                             (nums n)))
+    c))
+
+(defn- read-cost
+  "Store ranges `f` performs against a database of `n` people."
+  [n f]
+  (let [c (loaded n)
+        db (datom/db c)]
+    (reset! COUNTER {})
+    (f db)
+    (ranges)))
+
+;; ── reads ───────────────────────────────────────────────────────────
+
+(heading "── store ranges per read, at two sizes ──")
+(row (pad "operation" 26) (pad "N=10" 8) (pad "N=40" 8) "shape")
+
+(defn- compare-sizes
+  [label f]
+  (let [small (read-cost 10 f)
+        large (read-cost 40 f)]
+    (row (pad label 26) (pad small 8) (pad large 8)
+         (if (= small large) "CONSTANT" "grows with N"))))
+
+(compare-sizes "entity (point read)" (fn [db] (datom/entity db 1)))
+(compare-sizes "column scan" (fn [db] (datom/q '[:find ?v :where [?e :p/age ?v]] db)))
+(compare-sizes "two-clause join"
+               (fn [db] (datom/q '[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] db)))
+(compare-sizes "three-clause join"
+               (fn [db] (datom/q '[:find ?n :where [?e :p/name ?n] [?e :p/age ?a]
+                                                   [?e :p/city "London"]] db)))
+(compare-sizes "pull (2 attributes)" (fn [db] (datom/pull db [:p/name :p/age] 1)))
+(compare-sizes "aggregate (count)"
+               (fn [db] (datom/q '[:find (count ?e) :where [?e :p/age ?v]] db)))
+(compare-sizes "as-of column scan"
+               (fn [db] (datom/q '[:find ?v :where [?e :p/age ?v]]
+                                 (datom/as-of db 1000001))))
+
+(heading "── what that table says ──")
+(println "  Every read is CONSTANT in store operations.")
+(println "")
+(println "  The join was not always. It used to evaluate each clause once")
+(println "  PER BINDING ROW: 11 ranges at N=10, 41 at N=40. Against ETS a")
+(println "  range is a local call and nobody notices. Against a networked")
+(println "  store a join over 1000 entities is 1001 round trips — at")
+(println "  0.5ms RTT, half a second of latency for data that fits in one")
+(println "  packet.")
+(println "")
+(println "  Each pattern is now scanned ONCE for the whole binding set and")
+(println "  unified in memory. That is the single most important number")
+(println "  here for choosing a backend.")
+
+;; ── writes ──────────────────────────────────────────────────────────
+
+(heading "── store operations per bulk transaction ──")
+(row (pad "entities" 12) (pad "ranges" 10) (pad "updates" 10) "commits")
+
+(defn- write-cost
+  "Cost of ONE bulk transaction, counted from an already-open connection
+   so the schema installation (itself a transaction, since schema is
+   written as datoms) is excluded."
+  [n]
+  (let [c (datom/connect-with (->CountingStore (datom.store-ets/open)) SCHEMA)]
+    (reset! COUNTER {})
+    (datom/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                                      :p/name (str "n" i)
+                                      :p/age i
+                                      :p/city (if (even? i) "London" "NY")})
+                             (nums n)))
+    (let [m (deref COUNTER)]
+      (row (pad n 12) (pad (or (get m :range) 0) 10)
+           (pad (or (get m :update) 0) 10) (or (get m :commit) 0)))))
+
+(doseq [n [10 20 40]] (write-cost n))
+
+(heading "── what that table says ──")
+(println "  Writes are LINEAR, not constant — a transaction must check")
+(println "  what each entity currently holds. Doubling the transaction")
+(println "  doubles the work, which is the property that makes bulk")
+(println "  loading possible at all.")
+(println "")
+(println "  One COMMIT per transaction, whatever its size. Every datom")
+(println "  reaches the store together or not at all; a transaction that")
+(println "  committed per operation could be observed half-applied.")
+
+;; ── and now the timings, with a warning ────────────────────────────
+
+(heading "── wall-clock, for orientation only ──")
+(row (pad "operation" 26) "ms")
+
+(defn- timed
+  [label n f]
+  (let [c (loaded n)
+        db (datom/db c)
+        t0 (now)]
+    (f db)
+    (row (pad label 26) (- (now) t0))))
+
+(def SIZE 200)
+(println (str "  (over " SIZE " entities)"))
+(timed "column scan" SIZE (fn [db] (datom/q '[:find ?v :where [?e :p/age ?v]] db)))
+(timed "two-clause join" SIZE
+       (fn [db] (datom/q '[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] db)))
+(timed "aggregate" SIZE (fn [db] (datom/q '[:find (count ?e) :where [?e :p/age ?v]] db)))
+(timed "point read" SIZE (fn [db] (datom/entity db 1)))
+
+(let [t0 (now) _ (loaded SIZE) elapsed (- (now) t0)]
+  (row (pad "bulk transact" 26) elapsed))
+
+(heading "── how to read those numbers ──")
+(println "  Do not. Not as thresholds, anyway.")
+(println "")
+(println "  They are here to catch a change that makes something")
+(println "  catastrophically slower, not to establish what is fast. On a")
+(println "  loaded machine the same run varies by more than 2x, so any")
+(println "  conclusion drawn from a single number is a conclusion about")
+(println "  the machine.")
+(println "")
+(println "  The COUNTS above are the contract. test/bl/datom/cost_test.bl")
+(println "  asserts them, so a regression appears as a failing number")
+(println "  rather than as a benchmark somebody has to interpret.")
+
+(heading "── what this means for the backend ──")
+(println "  Reads are O(1) in store operations, so a networked store")
+(println "  costs one round trip per read regardless of database size.")
+(println "")
+(println "  Writes are O(n) in the size of the TRANSACTION. A large")
+(println "  import is many round trips today; batching the per-operation")
+(println "  lookups into one range over the affected span is the obvious")
+(println "  next optimisation, and it is filed as FEAT-011.")
+(println "")
+(println "  The store protocol is six methods. Everything above it is")
+(println "  pure logic over an ordered key/value space, so what the")
+(println "  substrate must provide is: ordered keys, prefix range scans,")
+(println "  atomic multi-key commit, and compare-and-swap. Anything")
+(println "  offering those can carry this database unchanged.")

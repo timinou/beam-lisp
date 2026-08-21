@@ -193,10 +193,19 @@ defmodule BeamLisp.DispatchTableTest do
     },
     "string" => %{
       "count" => {:eq, 2},
-      "seq" => {:gap, {:raises, FunctionClauseError}, :string_seq},
-      "first" => {:gap, {:eq, nil}, :string_seq},
-      "rest" => {:gap, {:eq, []}, :string_seq},
-      "next" => {:gap, {:eq, nil}, :string_seq},
+      # A string is seqable, as in Clojure. Elements are single-character
+      # STRINGS (beam-lisp has no character type), which is what `count`
+      # and `subs` already assumed — both are char-based, so `seq` had to
+      # agree or the language disagreed with itself about one value.
+      #
+      # This was the `:string_seq` gap. It closed when `(into [] "ab")`
+      # was found to answer `[nil]`: silently wrong, which is worse than
+      # the FunctionClauseError beside it, because nothing about a
+      # plausible vector looks wrong.
+      "seq" => {:eq, ["a", "b"]},
+      "first" => {:eq, "a"},
+      "rest" => {:eq, ["b"]},
+      "next" => {:eq, ["b"]},
       "get" => {:raises, FunctionClauseError},
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
@@ -440,8 +449,11 @@ defmodule BeamLisp.DispatchTableTest do
   # (`:record_map_deliberate_false` was retired in wave 27 -- `map?` now
   # answers true for a record, as Clojure does, so the gap no longer exists.
   # This list shrinking is the point: a resolved gap must leave the inventory.)
+  # (`:string_seq` was retired: strings are now seqable, so `seq`/`first`/
+  # `rest`/`next` answer as Clojure does rather than raising. Same rule as
+  # `:record_map_deliberate_false` above -- a resolved gap leaves the
+  # inventory.)
   @known_gap_reasons [
-    :string_seq,
     :transient_map_ops,
     :transient_coll_false
   ]
