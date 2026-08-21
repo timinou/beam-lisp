@@ -1,0 +1,184 @@
+; test/bl/datom/time_test.bl — the database remembers.
+; Run: mix beam_lisp.test test/bl/datom/time_test.bl
+;
+; Time travel is not a feature bolted onto this database; it is a
+; consequence of never deleting anything. These assertions pin that
+; consequence — and, just as importantly, pin that the old values are
+; reached by FILTERING rather than by copying.
+
+(ns datom.time.test
+  (:require [datom.conn] [datom.db] [datom.index] [datom.pull]
+            [datom.query.engine] [datom.time]))
+
+(defn- history-fixture
+  "One person whose age changes twice, and a second added later.
+
+   Returns the connection plus every transaction id, so a test can name
+   the moment it means."
+  []
+  (let [c (datom.conn/connect
+            [{:db/ident :p/name :db/valueType :db.type/string}
+             {:db/ident :p/age :db/valueType :db.type/long}
+             {:db/ident :p/tag :db/valueType :db.type/keyword
+              :db/cardinality :db.cardinality/many}])
+        r1 (datom.conn/transact! c [{:db/id -1 :p/name "Ada" :p/age 36}])
+        ada (get (:tempids r1) -1)
+        r2 (datom.conn/transact! c [[:db/add ada :p/age 37]])
+        r3 (datom.conn/transact! c [{:db/id -2 :p/name "Grace" :p/age 45}])
+        r4 (datom.conn/transact! c [[:db/add ada :p/age 38]])]
+    {:conn c :ada ada :grace (get (:tempids r3) -2)
+     :t1 (:tx r1) :t2 (:tx r2) :t3 (:tx r3) :t4 (:tx r4)
+     :db (datom.conn/db c)}))
+
+;; ── as-of ───────────────────────────────────────────────────────────
+
+(deftest as-of-shows-the-world-as-it-was
+  (let [f (history-fixture)]
+    (are [t expected] (= expected (:p/age (datom.db/entity (datom.time/as-of (:db f) t)
+                                                           (:ada f))))
+      (:t1 f) 36
+      (:t2 f) 37
+      (:t4 f) 38)))
+
+(deftest as-of-hides-entities-that-did-not-exist-yet
+  ; Grace was added at t3, so at t1 she is not merely aged differently —
+  ; she is absent.
+  (let [f (history-fixture)]
+    (is (nil? (datom.db/entity (datom.time/as-of (:db f) (:t1 f)) (:grace f))))
+    (is (some? (datom.db/entity (datom.time/as-of (:db f) (:t3 f)) (:grace f))))))
+
+(deftest as-of-is-inclusive-of-its-transaction
+  ; The transaction's own datoms are visible at its `t`, which is what
+  ; makes `(as-of db (:tx report))` mean `just after that transaction`.
+  (let [f (history-fixture)]
+    (is (= 37 (:p/age (datom.db/entity (datom.time/as-of (:db f) (:t2 f)) (:ada f)))))))
+
+(deftest as-of-does-not-copy-anything
+  ; The point of db-as-value: constructing a historical view is a
+  ; parameter change, not a snapshot. Both values share one store.
+  (let [f (history-fixture)
+        old (datom.time/as-of (:db f) (:t1 f))]
+    (is (= (datom.db/store-of (:db f)) (datom.db/store-of old)))
+    (is (= (:t1 f) (datom.db/basis-t old)))))
+
+(deftest a-query-runs-unchanged-against-a-historical-value
+  ; No special syntax, no `FOR SYSTEM_TIME`, no separate audit table —
+  ; the query does not know it is looking at the past.
+  (let [f (history-fixture)]
+    (is (= (set [[36]])
+           (datom.query.engine/q '[:find ?a :where [?e :p/age ?a] [?e :p/name "Ada"]]
+                                 (datom.time/as-of (:db f) (:t1 f)))))
+    (is (= (set [[38]])
+           (datom.query.engine/q '[:find ?a :where [?e :p/age ?a] [?e :p/name "Ada"]]
+                                 (:db f))))))
+
+(deftest pull-works-against-a-historical-value-too
+  (let [f (history-fixture)]
+    (is (= 36 (:p/age (datom.pull/pull (datom.time/as-of (:db f) (:t1 f))
+                                       [:p/age] (:ada f)))))))
+
+;; ── since ───────────────────────────────────────────────────────────
+
+(deftest since-shows-only-what-changed-after-a-point
+  (let [f (history-fixture)]
+    ; after t3, only Ada's age changed (at t4)
+    (is (= 1 (count (datom.db/datoms (datom.time/since (:db f) (:t3 f))
+                                     :eavt (:ada f)))))))
+
+(deftest since-and-as-of-partition-history
+  ; `as-of` is inclusive and `since` exclusive, so together they cover
+  ; every datom exactly once — no datom in both, none missing.
+  (let [f (history-fixture)
+        t (:t2 f)
+        all (count (datom.index/scan (:store (:conn f)) :eavt (:ada f)))
+        before (count (datom.db/datoms (datom.time/history
+                                         (datom.time/as-of (:db f) t))
+                                       :eavt (:ada f)))
+        after (count (datom.db/datoms (datom.time/history
+                                        (datom.time/since (:db f) t))
+                                      :eavt (:ada f)))]
+    (is (= all (+ before after))
+        (str "history splits " all " datoms into " before " + " after))))
+
+;; ── history ─────────────────────────────────────────────────────────
+
+(deftest history-keeps-retractions-as-well-as-assertions
+  ; The record of what STOPPED being true is what makes `when did this
+  ; change?` answerable, and it is why retractions are datoms rather
+  ; than deletions.
+  (let [f (history-fixture)
+        h (datom.time/history (:db f))
+        ds (datom.db/datoms h :eavt (:ada f) :p/age)]
+    ; assert 36, retract 36 + assert 37, retract 37 + assert 38
+    (is (= 5 (count ds)))
+    (is (= 3 (count (filterv datom.index/assertion? ds))))
+    (is (= 2 (count (filterv (fn [d] (not (datom.index/assertion? d))) ds))))))
+
+(deftest entity-refuses-on-a-history-view
+  ; A history db holds every value the attribute ever had, so folding it
+  ; into a map would report an entity with three simultaneous ages — a
+  ; value that existed at no point in time. A category error, so it
+  ; fails loudly rather than returning nonsense.
+  (let [f (history-fixture)]
+    (is (= :raised (try (do (datom.db/entity (datom.time/history (:db f)) (:ada f)) :ran)
+                        (catch e :raised))))))
+
+(deftest changes-reports-one-row-per-change-oldest-first
+  (let [f (history-fixture)
+        cs (datom.time/changes (:db f) (:ada f) :p/age)]
+    (is (= 5 (count cs)))
+    (is (= 36 (:value (first cs))))
+    (is (:added (first cs)))
+    (is (= 38 (:value (last cs))))
+    ; transaction order is non-decreasing (`sort` returns a list, so
+    ; compare against a list rather than the mapv's vector)
+    (let [ts (mapv (fn [c] (:t c)) cs)]
+      (is (= (into [] (sort ts)) ts)))))
+
+(deftest tx-of-answers-when-something-became-true
+  (let [f (history-fixture)]
+    (is (= (:t1 f) (datom.time/tx-of (:db f) (:ada f) :p/age 36)))
+    (is (= (:t2 f) (datom.time/tx-of (:db f) (:ada f) :p/age 37)))
+    (is (= (:t4 f) (datom.time/tx-of (:db f) (:ada f) :p/age 38)))
+    (is (nil? (datom.time/tx-of (:db f) (:ada f) :p/age 99))
+        "a value that was never asserted has no transaction")))
+
+(deftest value-at-reads-one-field-at-a-moment
+  (let [f (history-fixture)]
+    (is (= 36 (datom.time/value-at (:db f) (:t1 f) (:ada f) :p/age)))
+    (is (= 38 (datom.time/value-at (:db f) (:t4 f) (:ada f) :p/age)))))
+
+;; ── retraction and time ─────────────────────────────────────────────
+
+(deftest a-retracted-fact-is-still-visible-in-the-past
+  ; Retraction ends a fact's validity; it does not erase that the fact
+  ; was once true. This is the difference between a database that
+  ; remembers and one that merely stores.
+  (let [f (history-fixture)
+        c (:conn f)
+        r (datom.conn/transact! c [[:db/retract (:ada f) :p/name "Ada"]])
+        after (datom.conn/db c)]
+    (is (nil? (:p/name (datom.db/entity after (:ada f)))) "gone from the present")
+    (is (= "Ada" (:p/name (datom.db/entity (datom.time/as-of after (:t1 f)) (:ada f))))
+        "still true in the past")
+    (is (some? (datom.time/tx-of after (:ada f) :p/name "Ada"))
+        "and we can still say when it was asserted")))
+
+;; ── view predicates ─────────────────────────────────────────────────
+
+(deftest the-view-kind-is-inspectable
+  (let [f (history-fixture)]
+    (is (datom.time/current? (:db f)))
+    (is (not (datom.time/current? (datom.time/history (:db f)))))
+    (is (not (datom.time/current? (datom.time/since (:db f) (:t1 f)))))
+    (is (datom.time/history? (datom.time/history (:db f))))
+    (is (not (datom.time/history? (:db f))))))
+
+(deftest as-of-clears-a-since-bound
+  ; The views are alternatives, not layers: asking for `as-of` after
+  ; `since` must give a plain historical view rather than a window whose
+  ; bounds silently disagree.
+  (let [f (history-fixture)
+        combined (datom.time/as-of (datom.time/since (:db f) (:t3 f)) (:t2 f))]
+    (is (datom.time/current? combined))
+    (is (= 37 (:p/age (datom.db/entity combined (:ada f)))))))
