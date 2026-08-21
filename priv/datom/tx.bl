@@ -156,7 +156,22 @@
    created two entities sharing a value declared unique — a database that
    violates its own schema, with no error."
   [store schema ops next-id-fn]
-  (let [tempids (into [] (distinct (filterv tempid? (mapv (fn [op] (get op 1)) ops))))
+  (let [; Tempids come from the entity slot AND from the value slot of a
+        ; ref attribute. A tempid appearing ONLY as a ref value is how you
+        ; say `link to the entity this transaction is about to create`
+        ; without giving it a map of its own. Collecting from the entity
+        ; slot alone left such a tempid unmapped, so the resolver passed
+        ; it through and the raw NEGATIVE id was persisted as the ref
+        ; value: a transaction-scoped placeholder leaked into durable
+        ; data, pointing at an entity that never existed.
+        tempids (into [] (distinct
+                           (filterv tempid?
+                                    (into (mapv (fn [op] (get op 1)) ops)
+                                          (mapv (fn [op]
+                                                  (if (datom.schema/ref? schema (get op 2))
+                                                    (get op 3)
+                                                    nil))
+                                                ops)))))
         ; First pass: existing entities an identity claim points at.
         existing (reduce (fn [acc t]
                            (let [target (upsert-target store schema ops t)]
@@ -275,15 +290,76 @@
 
       :else (throw (ex-info (str "unknown operation: " kind) {:op op})))))
 
+(defn- fact-key
+  "The identity of the FACT a datom is about: `[e a v]`.
+
+   Assertion and retraction of one fact share this key; `op` is what
+   distinguishes them."
+  [d]
+  [(datom.index/-e d) (datom.index/-a d) (datom.index/-v d)])
+
+(defn- held-before?
+  "Whether `[e a]` held `v` BEFORE this transaction ran."
+  [store e a v]
+  (contains? (set (current-values store e a [])) v))
+
+(defn- net-datoms
+  "Reduce a transaction's datoms to its NET effect.
+
+   A transaction is ATOMIC, so its intermediate states never existed to
+   any observer. Recording them is not merely wasteful, it is false: it
+   writes history describing moments that never happened, and it leaves
+   contradictory datoms that a reader then has to adjudicate.
+
+   Two operations on one fact within a transaction collapse to whichever
+   came LAST, and that survivor is dropped when it agrees with the state
+   before the transaction. So:
+
+     [[:db/add e :age 37] [:db/add e :age 38]]
+       naively: assert 37, retract 36, retract 37, assert 38
+       net:     retract 36, assert 38        (37 never existed)
+
+     [[:db/retract e :n 7] [:db/add e :n 7]]
+       naively: retract 7, assert 7
+       net:     nothing                      (nothing changed)
+
+   Without this, a same-tx retract-then-re-add left BOTH datoms at one
+   tx, and no reader could tell which came last: `tx` alone cannot order
+   two operations inside a single transaction. Reading it one way made
+   the re-added value vanish; the other way made a superseded value
+   linger. The fix is not a better tiebreak \u2014 it is to never write the
+   contradiction."
+  [store datoms]
+  (let [last-index (reduce (fn [acc pair]
+                             (assoc acc (fact-key (get pair 1)) (get pair 0)))
+                           {}
+                           (map-indexed (fn [i d] [i d]) datoms))]
+    (filterv some?
+             (map-indexed
+               (fn [i d]
+                 (let [k (fact-key d)]
+                   (if (not (= i (get last-index k)))
+                     ; superseded within this transaction
+                     nil
+                     (let [held (held-before? store (datom.index/-e d)
+                                              (datom.index/-a d) (datom.index/-v d))]
+                       (if (= (datom.index/assertion? d) held)
+                         ; agrees with the pre-transaction state: no change
+                         nil
+                         d)))))
+               datoms))))
+
 (defn realize
   "Every datom implied by `ops`, in order.
 
    Threads the datoms produced so far into each step, so an operation
-   sees the transaction's own earlier effects."
+   sees the transaction's own earlier effects, then reduces the result to
+   the transaction's NET effect (see `net-datoms`)."
   [store schema tx ops]
-  (reduce (fn [acc op] (into acc (realize-op store schema tx op acc)))
-          []
-          ops))
+  (net-datoms store
+              (reduce (fn [acc op] (into acc (realize-op store schema tx op acc)))
+                      []
+                      ops)))
 
 ;; ── validation ──────────────────────────────────────────────────────
 
@@ -310,6 +386,26 @@
           nil))
       nil)))
 
+(defn- entity-id-problem
+  "An unusable entity id in `op`, or nil.
+
+   An entity id is an INTEGER \u2014 that is what `:db.type/ref` values are,
+   and it is what the codec encodes. Nothing checked the entity slot, so
+   `{:db/id \u0022abc\u0022 ...}` and `{:db/id :named ...}` were accepted and became
+   readable entities that no ref could ever point at: the database
+   happily stored a graph node unreachable by its own reference type.
+
+   Tempids (negative integers) are legal here; they are resolved to real
+   ids before this runs. A lookup ref is not accepted in the entity slot
+   yet, so it is named explicitly rather than falling into the generic
+   message."
+  [op]
+  (let [e (get op 1)]
+    (cond
+      (int? e) nil
+      (vector? e) {:error :lookup-ref-in-entity-position :entity e}
+      :else {:error :invalid-entity-id :entity e})))
+
 (defn validate
   "Every schema violation in `ops`, as data.
 
@@ -322,6 +418,7 @@
   [store schema ops]
   (into []
         (filterv some?
-                 (into (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
-                             ops)
+                 (into (into (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
+                                   ops)
+                             (mapv entity-id-problem ops))
                        (mapv (fn [op] (uniqueness-violation store schema op)) ops)))))
