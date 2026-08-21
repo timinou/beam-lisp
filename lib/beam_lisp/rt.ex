@@ -268,6 +268,10 @@ defmodule BeamLisp.RT do
   # A set is a collection too — first/rest/next/seq read its members.
   # A set is a struct, so these MUST precede the is_bl_map clause or they
   # would iterate the struct's fields instead.
+  # A string is seqable (elements are 1-char strings), so every
+  # seq-consuming entry point needs its clause — `seq` alone is not
+  # enough because these dispatch on the concrete type.
+  def first(str) when is_binary(str), do: str |> seq() |> first()
   def first(%Set{} = s), do: Set.to_list(s) |> List.first()
 
   # An ordered collection's first is its SMALLEST element — O(log n) via
@@ -300,6 +304,9 @@ defmodule BeamLisp.RT do
   # still raise above; only the no-hazard scalars fall through here.
   def first(_), do: nil
 
+  defp rest_or_empty(nil), do: []
+  defp rest_or_empty(xs), do: rest(xs)
+
   def rest(nil), do: []
   def rest([]), do: []
   def rest([_ | t]), do: t
@@ -312,6 +319,7 @@ defmodule BeamLisp.RT do
     end
   end
 
+  def rest(str) when is_binary(str), do: str |> seq() |> rest_or_empty()
   def rest(%Set{} = s), do: Set.to_list(s) |> tl()
 
   def rest(%SortedSet{} = s), do: Sorted.set_to_list(s) |> rest()
@@ -349,6 +357,7 @@ defmodule BeamLisp.RT do
     end
   end
 
+  def next(str) when is_binary(str), do: next(seq(str))
   def next(%Set{} = s), do: next(Set.to_list(s))
 
   def next(%SortedSet{} = s), do: next(Sorted.set_to_list(s))
@@ -601,6 +610,19 @@ defmodule BeamLisp.RT do
   def seq(nil), do: nil
   def seq([]), do: nil
   def seq(xs) when is_list(xs), do: xs
+
+  # A string is seqable, as in Clojure. Elements are single-character
+  # STRINGS (beam-lisp has no character type), which is what `count` and
+  # `subs` already assume: both are char-based, so `seq` must agree or
+  # the language disagrees with itself about the same value.
+  #
+  # `(seq "")` is nil, matching every other empty collection.
+  def seq(s) when is_binary(s) do
+    case String.graphemes(s) do
+      [] -> nil
+      gs -> gs
+    end
+  end
 
   def seq(%BeamLisp.Vector{} = v) do
     if BeamLisp.Vector.count(v) == 0, do: nil, else: v

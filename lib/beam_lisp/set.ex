@@ -43,4 +43,18 @@ defmodule BeamLisp.Set do
 
   @doc "The members as a list (iteration order is set-internal, as in Clojure)."
   def to_list(%__MODULE__{members: m}), do: MapSet.to_list(m)
+
+  # Vectors implement Enumerable and sets did not, so every `Enum.*` /
+  # `Stream.*` call on a set raised — including the one inside `to-list`,
+  # whose own docstring promised sets were handled. Interop should work
+  # in both directions for both collection types, not just one.
+  defimpl Enumerable do
+    def count(s), do: {:ok, BeamLisp.Set.count(s)}
+
+    def member?(s, x), do: {:ok, BeamLisp.Set.member?(s, x)}
+
+    def reduce(s, acc, fun), do: Enumerable.List.reduce(BeamLisp.Set.to_list(s), acc, fun)
+
+    def slice(_s), do: {:error, __MODULE__}
+  end
 end

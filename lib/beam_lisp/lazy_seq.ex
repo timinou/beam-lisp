@@ -136,6 +136,13 @@ defmodule BeamLisp.LazySeq do
   # loops then cannot match. Non-seqable values still pass through.
   def cell(%BeamLisp.Set{} = s), do: normalize_cell(BeamLisp.Set.to_list(s))
 
+  # A string is seqable (elements are 1-char strings, matching `count`
+  # and `subs`). Without this it fell through as an opaque value, and
+  # `reduce` — which every `into` goes through — produced `[nil]` for
+  # `(into [] "ab")`: no error, a plausible vector, and a nil surfacing
+  # far from its cause.
+  def cell(str) when is_binary(str), do: normalize_cell(String.graphemes(str))
+
   def cell(other) do
     # Reaching here means `other` is neither nil, a list, nor one of
     # our collection structs. If it is Enumerable (a range, a map,

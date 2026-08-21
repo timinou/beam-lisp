@@ -1,0 +1,174 @@
+; test/bl/datom/cost_test.bl — what a query COSTS the store.
+; Run: mix beam_lisp.test test/bl/datom/cost_test.bl --path priv
+;
+; ── Why counts, and not timings ──────────────────────────────────────
+;
+; A benchmark measures the machine as much as the code. While this suite
+; was being written the host sat at load average 16 with 48 GB of swap in
+; use, and two identical bulk-transaction runs differed by 2.2x — the
+; same code, minutes apart. Any threshold written against wall-clock time
+; would have been noise dressed up as a contract.
+;
+; Store OPERATIONS are exact. They do not vary with load, they do not
+; need a warm-up, and they are the thing that actually decides what
+; happens when the store stops being local: every `-range` is a network
+; round trip against a distributed backend, so `N+1 ranges` and
+; `2 ranges` are the difference between a query that fits in one packet
+; and one that spends half a second in latency.
+;
+; So these tests assert COUNTS. They caught the join defect (N+1 ranges,
+; measured 41 at N=40) that no timing test noticed, and they are what a
+; future backend swap must keep true.
+
+(ns datom.cost.test
+  (:require [datom.conn] [datom.db] [datom.pull] [datom.query.engine]
+            [datom.store] [datom.store-ets] [datom.time]))
+
+;; ── the counting store ──────────────────────────────────────────────
+
+(def COUNTER (atom {}))
+
+(defn- bump
+  [k]
+  (swap! COUNTER (fn [m] (assoc m k (+ 1 (or (get m k) 0))))))
+
+(defrecord CountingStore [inner]
+  datom.store/Store
+  ; A decorator over the real store: it counts, then delegates. This is
+  ; only possible because L1 is a protocol — the layers above cannot
+  ; tell they are being measured, which is exactly the property that
+  ; lets a different substrate arrive later.
+  (-get [s k] (bump :get) (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (bump :range) (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (bump :put) (datom.store/-put (:inner s) k v))
+  (-delete [s k] (bump :delete) (datom.store/-delete (:inner s) k))
+  (-update [s k f] (bump :update) (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (bump :commit) (datom.store/-commit (:inner s) ops)))
+
+(defn- ranges [] (or (get (deref COUNTER) :range) 0))
+
+(defn- nums
+  [n]
+  (loop [i 0 acc []] (if (>= i n) acc (recur (+ i 1) (conj acc i)))))
+
+(defn- fixture
+  "`n` people, each with a name, an age and a city."
+  [n]
+  (let [c (datom.conn/connect-with
+            (->CountingStore (datom.store-ets/open))
+            [{:db/ident :p/n :db/valueType :db.type/string}
+             {:db/ident :p/a :db/valueType :db.type/long}
+             {:db/ident :p/city :db/valueType :db.type/string}
+             {:db/ident :p/f :db/valueType :db.type/ref}])]
+    (datom.conn/transact!
+      c
+      (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                     :p/n (str "n" i)
+                     :p/a i
+                     :p/city (if (even? i) "London" "NY")})
+            (nums n)))
+    c))
+
+(defn- cost-of
+  "Store operations `f` performs, with the fixture's own writes excluded."
+  [n f]
+  (let [c (fixture n)
+        db (datom.conn/db c)]
+    (reset! COUNTER {})
+    (f db c)
+    (ranges)))
+
+;; ── reads are O(1) in store operations ──────────────────────────────
+
+(deftest a-point-read-is-one-range-at-any-size
+  ; `entity` is a prefix scan over one entity's datoms, so the database
+  ; can grow without the read costing more.
+  (is (= 1 (cost-of 10 (fn [db c] (datom.db/entity db 1)))))
+  (is (= 1 (cost-of 40 (fn [db c] (datom.db/entity db 1))))))
+
+(deftest a-column-scan-is-one-range-at-any-size
+  ; One AEVT range covers an entire attribute — the scan returns more
+  ; rows as the database grows, but it is still ONE request.
+  (is (= 1 (cost-of 10 (fn [db c] (datom.query.engine/q '[:find ?v :where [?e :p/a ?v]] db)))))
+  (is (= 1 (cost-of 40 (fn [db c] (datom.query.engine/q '[:find ?v :where [?e :p/a ?v]] db))))))
+
+(deftest a-two-clause-join-is-a-CONSTANT-number-of-ranges
+  ; THE regression test of this file.
+  ;
+  ; The join used to evaluate each clause once PER BINDING ROW, so a
+  ; two-clause join over N entities issued N+1 ranges: 11 at N=10 and 41
+  ; at N=40, measured. Against ETS that is invisible — a range is a local
+  ; call. Against a networked store it is N+1 round trips.
+  ;
+  ; Each pattern is now scanned ONCE for the whole binding set and joined
+  ; in memory, so the count stops depending on N. If this test starts
+  ; growing with the fixture size, the nested-loop shape is back.
+  (let [small (cost-of 10 (fn [db c]
+                            (datom.query.engine/q
+                              '[:find ?n ?a :where [?e :p/n ?n] [?e :p/a ?a]] db)))
+        large (cost-of 40 (fn [db c]
+                            (datom.query.engine/q
+                              '[:find ?n ?a :where [?e :p/n ?n] [?e :p/a ?a]] db)))]
+    (is (= small large)
+        (str "join cost must not grow with the database: "
+             small " ranges at N=10 vs " large " at N=40"))
+    (is (<= large 4) (str "one range per clause, not per row (got " large ")"))))
+
+(deftest a-three-clause-join-stays-constant-too
+  (let [small (cost-of 10 (fn [db c]
+                            (datom.query.engine/q
+                              '[:find ?n :where [?e :p/n ?n] [?e :p/a ?a] [?e :p/city "London"]] db)))
+        large (cost-of 40 (fn [db c]
+                            (datom.query.engine/q
+                              '[:find ?n :where [?e :p/n ?n] [?e :p/a ?a] [?e :p/city "London"]] db)))]
+    (is (= small large))))
+
+(deftest pull-costs-one-range-per-attribute-not-per-entity
+  (is (= (cost-of 10 (fn [db c] (datom.pull/pull db [:p/n :p/a] 1)))
+         (cost-of 40 (fn [db c] (datom.pull/pull db [:p/n :p/a] 1))))))
+
+(deftest an-aggregate-costs-what-its-query-costs
+  ; Aggregation folds rows already in memory, so it adds no store work.
+  (is (= (cost-of 10 (fn [db c] (datom.query.engine/q '[:find (count ?e) :where [?e :p/a ?v]] db)))
+         (cost-of 40 (fn [db c] (datom.query.engine/q '[:find (count ?e) :where [?e :p/a ?v]] db))))))
+
+(deftest time-travel-is-free-at-the-store
+  ; `as-of` is a filter over the same scan, not a different or larger
+  ; one: reading the past costs exactly what reading the present costs.
+  ; This is the db-as-value claim, stated as a number.
+  (let [now (cost-of 20 (fn [db c] (datom.query.engine/q '[:find ?v :where [?e :p/a ?v]] db)))
+        past (cost-of 20 (fn [db c]
+                           (datom.query.engine/q '[:find ?v :where [?e :p/a ?v]]
+                                                 (datom.time/as-of db 1000000))))]
+    (is (= now past))))
+
+;; ── writes are linear, and that is the contract ─────────────────────
+
+(deftest a-bulk-transaction-is-LINEAR-in-store-operations
+  ; Not constant — a transaction must check what each entity currently
+  ; holds — but linear, with a fixed cost per operation rather than a
+  ; growing one. Doubling the transaction doubles the work.
+  ;
+  ; Superlinear here would mean a large import degrades as it proceeds,
+  ; which is the failure mode that makes bulk loading impossible.
+  (let [_ (reset! COUNTER {})
+        _ (fixture 10)
+        ten (ranges)
+        _ (reset! COUNTER {})
+        _ (fixture 20)
+        twenty (ranges)
+        _ (reset! COUNTER {})
+        _ (fixture 40)
+        forty (ranges)]
+    (is (= (* 2 ten) twenty)
+        (str "doubling the transaction must double the reads: " ten " -> " twenty))
+    (is (= (* 2 twenty) forty)
+        (str "and again: " twenty " -> " forty))))
+
+(deftest a-transaction-commits-exactly-once
+  ; Every datom of a transaction reaches the store in ONE commit. A
+  ; transaction that committed per operation could be observed
+  ; half-applied, which is the property the whole design rests on.
+  (reset! COUNTER {})
+  (fixture 20)
+  (is (= 1 (get (deref COUNTER) :commit))))
