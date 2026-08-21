@@ -1,0 +1,220 @@
+; datom/query/engine.bl — the join.
+;
+; ── How datalog actually evaluates ────────────────────────────────────
+;
+; A query is a set of clauses that must ALL hold. Evaluation carries a
+; set of BINDING MAPS — each one a candidate answer, mapping variables to
+; values:
+;
+;   [{?e 1 ?n "Ada"} {?e 2 ?n "Grace"}]
+;
+; Start with one empty binding (`[{}]` — no commitments, one candidate).
+; Each clause then transforms the set: for every binding so far, find the
+; datoms matching the clause under that binding, and emit one EXTENDED
+; binding per match.
+;
+; Two things fall out of that, and they are the whole of datalog:
+;
+;   - a clause with a FREE variable multiplies the rows (each match is a
+;     separate candidate) — that is the cartesian part
+;   - a clause with an ALREADY-BOUND variable filters them (only datoms
+;     agreeing with the existing binding survive) — that is the JOIN
+;
+; So there is no separate join operator. Two clauses sharing `?e` join on
+; `?e` because the second clause's `?e` is already bound when it runs.
+; Unification is just "does this datom agree with what we already know?"
+;
+; ── Why this is a nested-loop join, and when that matters ─────────────
+;
+; Each clause scans per binding, so cost is (rows so far) x (scan cost).
+; The planner's job is to make `rows so far` small early — which is why
+; clause ordering is a correctness-adjacent concern rather than a nicety.
+;
+; A hash join would beat this on large intermediate results. It is not
+; here yet because the honest bottleneck at this stage is the per-scan
+; cost, and a hash join over the same scans would not change the shape.
+; Recorded rather than pretended away.
+
+(ns datom.query.engine
+  (:require [datom.db] [datom.index] [datom.query.parse] [datom.query.plan] [datom.schema]))
+
+;; ── unification ─────────────────────────────────────────────────────
+
+(defn unify-term
+  "Extend `bindings` so `term` matches `value`, or nil if it cannot.
+
+   Three cases, and the third is the join:
+     - a wildcard matches anything and binds nothing
+     - an unbound variable binds to the value
+     - a BOUND variable (or a constant) must EQUAL the value, else no match
+
+   nil means `no match`, distinct from `{}` which means `matched, bound
+   nothing`."
+  [bindings term value]
+  (cond
+    (datom.query.parse/blank? term) bindings
+    (datom.query.parse/variable? term)
+      (if (contains? bindings term)
+        (if (= (get bindings term) value) bindings nil)
+        (assoc bindings term value))
+    :else (if (= term value) bindings nil)))
+
+(defn unify-pattern
+  "Extend `bindings` so `clause` matches `datom`, or nil.
+
+   Terms unify left to right, and a failure anywhere aborts \u2014 so
+   `[?e :person/name ?e]` correctly matches only datoms whose entity and
+   value are equal, without any special handling for the repeated
+   variable."
+  [bindings clause datom]
+  (let [terms (datom.query.plan/pattern-terms clause)
+        values [(datom.index/-e datom) (datom.index/-a datom) (datom.index/-v datom)]]
+    (reduce (fn [acc i]
+              (if (nil? acc)
+                nil
+                (unify-term acc (get terms i) (get values i))))
+            bindings
+            [0 1 2])))
+
+;; ── clause evaluation ───────────────────────────────────────────────
+
+(defn- resolve-term
+  "A term's value under `bindings`, or the term itself when it is a
+   constant."
+  [bindings term]
+  (if (datom.query.parse/variable? term) (get bindings term) term))
+
+(defn eval-pattern
+  "Every extension of `bindings` under which `clause` holds.
+
+   The scan is chosen by the planner and bounded by whatever is already
+   known, so a clause with `?e` bound reads one entity's datoms rather
+   than the database."
+  [db bindings clause]
+  (let [selection (datom.query.plan/index-for (datom.db/schema-of db) bindings clause)
+        index (get selection 0)
+        components (get selection 1)
+        candidates (apply datom.db/datoms db index components)]
+    (filterv some? (mapv (fn [d] (unify-pattern bindings clause d)) candidates))))
+
+(defn- call-form
+  "The `(f arg …)` inside a predicate clause."
+  [clause]
+  (get clause 0))
+
+(defn eval-predicate
+  "`bindings` if the predicate holds, else nothing.
+
+   A predicate clause is `[(op arg \u2026)]`: the op is resolved in the
+   calling namespace's scope, and its arguments are terms resolved
+   against the bindings. Predicates FILTER \u2014 they never bind.
+
+   The two-element form `[(f arg \u2026) ?out]` is a FUNCTION clause: it
+   binds `?out` to the call's result, which is how computed values enter
+   a query."
+  [bindings clause resolve-fn]
+  (let [form (call-form clause)
+        op (first form)
+        args (mapv (fn [t] (resolve-term bindings t)) (into [] (rest form)))
+        f (resolve-fn op)]
+    (if (nil? f)
+      (throw (ex-info (str "unknown predicate: " op) {:clause clause}))
+      (let [result (apply f args)]
+        (if (> (count clause) 1)
+          ; function clause: bind the output term to the result
+          (let [out (get clause 1)
+                extended (unify-term bindings out result)]
+            (if (nil? extended) [] [extended]))
+          ; predicate clause: keep the binding only when truthy
+          (if result [bindings] []))))))
+
+;; ── the driver ──────────────────────────────────────────────────────
+
+(defn eval-clause
+  "Apply one clause to one binding, yielding zero or more bindings."
+  [db bindings clause resolve-fn]
+  (cond
+    (datom.query.parse/pattern-clause? clause)
+      (eval-pattern db bindings clause)
+    (datom.query.parse/predicate-clause? clause)
+      (eval-predicate bindings clause resolve-fn)
+    (datom.query.parse/rule-clause? clause)
+      (eval-rule db bindings clause resolve-fn)
+    :else (throw (ex-info "unrecognised clause" {:clause clause}))))
+
+(defn eval-rule
+  "`:or`, `:not` and `:and` over sub-clauses.
+
+   `:not` is the interesting one: it succeeds when the sub-clauses yield
+   NOTHING, and it binds nothing \u2014 negation-as-failure. It must therefore
+   run with its variables already bound, or it asks a question with no
+   answer (`is there no ?x` over an unbound `?x` is either trivially true
+   or meaningless). The planner emits it once its inputs are ready."
+  [db bindings clause resolve-fn]
+  (let [op (get clause 0)
+        subs (into [] (rest clause))]
+    (cond
+      (= op :and)
+        (reduce (fn [acc sub]
+                  (into [] (mapcat (fn [b] (eval-clause db b sub resolve-fn)) acc)))
+                [bindings]
+                subs)
+
+      (= op :or)
+        ; Any sub-clause succeeding keeps the binding. Distinct, because
+        ; two branches matching the same way must not double a row.
+        (into [] (distinct (into [] (mapcat (fn [sub] (eval-clause db bindings sub resolve-fn))
+                                            subs))))
+
+      (= op :not)
+        (let [matches (reduce (fn [acc sub]
+                                (into [] (mapcat (fn [b] (eval-clause db b sub resolve-fn)) acc)))
+                              [bindings]
+                              subs)]
+          (if (empty? matches) [bindings] []))
+
+      :else (throw (ex-info (str "unknown rule operator: " op) {:clause clause})))))
+
+(defn run-clauses
+  "Fold every clause over the binding set."
+  [db initial clauses resolve-fn]
+  (reduce (fn [bindings clause]
+            (into [] (mapcat (fn [b] (eval-clause db b clause resolve-fn)) bindings)))
+          initial
+          clauses))
+
+;; ── the public entry ────────────────────────────────────────────────
+
+(defn- default-resolve
+  "Resolve a predicate symbol to a function.
+
+   Looks in `core`, so the arithmetic and comparison vocabulary a query
+   would reach for is available without ceremony."
+  [op]
+  (try (BeamLisp.Env/fetch! "core" (name op)) (catch e nil)))
+
+(defn q
+  "Run `query` against `db` with optional `inputs`.
+
+   Returns a SET of result tuples \u2014 a set because datalog answers a
+   question about what is true, and the same answer arriving by two
+   derivations is one answer. This is also why `q` returns a beam-lisp
+   set rather than a vector: the semantics ARE set semantics, and the
+   language already has the type."
+  [query db & inputs]
+  (let [parsed (datom.query.parse/parse query)
+        problems (datom.query.parse/validate parsed)]
+    (if (seq problems)
+      (throw (ex-info "invalid query" {:problems problems}))
+      (let [in-vars (datom.query.parse/input-variables parsed)
+            supplied (into [] (or inputs '()))
+            initial (if (= (count in-vars) (count supplied))
+                      [(zipmap in-vars supplied)]
+                      (throw (ex-info "wrong number of query inputs"
+                                      {:expected (count in-vars)
+                                       :given (count supplied)
+                                       :variables in-vars})))
+            planned (datom.query.plan/plan parsed)
+            bindings (run-clauses db initial (:where planned) default-resolve)
+            find-vars (datom.query.parse/find-variables parsed)]
+        (set (mapv (fn [b] (mapv (fn [v] (get b v)) find-vars)) bindings))))))

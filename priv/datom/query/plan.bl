@@ -1,0 +1,213 @@
+; datom/query/plan.bl — which index serves a pattern, and in what order.
+;
+; ── The planner's whole job ───────────────────────────────────────────
+;
+; A pattern `[?e :person/name "Ada"]` has three positions. At the moment
+; it is evaluated, each position is either BOUND (a literal, or a variable
+; already bound by an earlier clause) or FREE.
+;
+; Which positions are bound decides which index can answer it with a
+; PREFIX SCAN rather than a full scan. That is the entire reason wave 2
+; built four orderings of the same datoms:
+;
+;   e bound          → EAVT   prefix [e]        "facts about this entity"
+;   a + v bound      → AVET   prefix [a v]      "who has this value?"
+;   a bound          → AEVT   prefix [a]        "every value of this attr"
+;   v bound (ref)    → VAET   prefix [v]        "what points here?"
+;   nothing bound    → EAVT   full scan         (unavoidable)
+;
+; Get this wrong and queries still return CORRECT answers — they just
+; read the whole database to do it. That is the failure mode to fear: it
+; is invisible until the dataset grows.
+;
+; ── Clause ordering ───────────────────────────────────────────────────
+;
+; Bindings flow left to right, so clause ORDER decides how much is bound
+; when each clause runs. `[?e :person/age 36]` first, then
+; `[?e :person/name ?n]`, is fast: the second clause has `?e` bound.
+; Reversed, the first clause scans every name in the database.
+;
+; So the planner reorders clauses to run the most selective first. The
+; heuristic is deliberately simple and explained below — a cost model
+; based on real statistics is a later wave's problem, and a WRONG cost
+; model is worse than an honest heuristic.
+
+(ns datom.query.plan
+  (:require [datom.query.parse] [datom.schema]))
+
+;; ── binding state ───────────────────────────────────────────────────
+
+(defn bound?
+  "Whether `term` is known at evaluation time: a constant, or a variable
+   already in `bindings`."
+  [bindings term]
+  (cond
+    (datom.query.parse/blank? term) false
+    (datom.query.parse/variable? term) (contains? bindings term)
+    :else true))
+
+(defn pattern-terms
+  "The `[e a v]` terms of a pattern, padded with wildcards.
+
+   A pattern may be shorter than three: `[?e :person/name]` asks for
+   every value of that attribute on that entity."
+  [clause]
+  [(if (> (count clause) 0) (get clause 0) '_)
+   (if (> (count clause) 1) (get clause 1) '_)
+   (if (> (count clause) 2) (get clause 2) '_)])
+
+;; ── index selection ─────────────────────────────────────────────────
+
+(defn index-for
+  "The index that best serves `clause` given `bindings`, and the leading
+   components to bind the scan with.
+
+   Returns `[index components]`. The components are VALUES, resolved from
+   bindings where the term is a bound variable.
+
+   Selection follows from which positions are bound \u2014 there is no cost
+   model here, because for a single pattern the choice is forced: an
+   index can only prefix-scan on its LEADING components, so the bound
+   positions determine which orderings are usable at all."
+  [schema bindings clause]
+  (let [terms (pattern-terms clause)
+        e (get terms 0)
+        a (get terms 1)
+        v (get terms 2)
+        resolve (fn [t] (if (datom.query.parse/variable? t) (get bindings t) t))
+        e? (bound? bindings e)
+        a? (bound? bindings a)
+        v? (bound? bindings v)]
+    (cond
+      ; Entity known: EAVT, narrowed by attribute when that is known too.
+      (and e? a?) [:eavt [(resolve e) (resolve a)]]
+      e? [:eavt [(resolve e)]]
+
+      ; Attribute and value known: AVET answers `who has this value?` in
+      ; one prefix scan. This is the lookup that makes `:db/unique`
+      ; enforcement and lookup refs cheap.
+      (and a? v? (datom.schema/indexed? schema (resolve a)))
+        [:avet [(resolve a) (resolve v)]]
+
+      ; Value known and it is a reference: VAET is the reverse-navigation
+      ; index \u2014 `what points AT this entity?`
+      (and v? (not a?)) [:vaet [(resolve v)]]
+
+      ; Attribute known: scan that attribute's column. If the value is
+      ; also known but the attribute is not AVET-indexed, this is the
+      ; best available \u2014 the value becomes a filter rather than a bound.
+      a? [:aevt [(resolve a)]]
+
+      ; Nothing bound: a full scan, honestly.
+      :else [:eavt []])))
+
+;; ── clause ordering ─────────────────────────────────────────────────
+
+(defn clause-cost
+  "A rough selectivity score for `clause` given `bindings` \u2014 LOWER runs
+   earlier.
+
+   The heuristic, in order of confidence:
+     0  every position bound        \u2014 an existence check
+     1  entity bound                \u2014 one entity's facts, always small
+     2  attribute + value bound     \u2014 an indexed lookup
+     3  value bound only            \u2014 reverse-ref navigation
+     4  attribute bound only        \u2014 a whole column
+     5  nothing bound               \u2014 the whole database
+
+   Deliberately NOT a statistics-based cost model. A model that estimates
+   cardinality from real data would beat this, but a model estimating it
+   WRONG is worse than a heuristic everyone can predict: a query planner
+   that reorders unpredictably is one nobody can reason about."
+  [bindings clause]
+  (let [terms (pattern-terms clause)
+        e? (bound? bindings (get terms 0))
+        a? (bound? bindings (get terms 1))
+        v? (bound? bindings (get terms 2))]
+    (cond
+      (and e? a? v?) 0
+      e? 1
+      (and a? v?) 2
+      v? 3
+      a? 4
+      :else 5)))
+
+(defn clause-variables
+  "Every variable mentioned anywhere in `clause`, however deeply nested.
+
+   Delegates to the parser, which owns the notion of what a variable is.
+   Keeping a second copy here would let the two drift — and this exact
+   logic already had one bug: a top-level-only scan found NO variables in
+   a predicate, so the planner judged `[(> ?a 40)]` ready immediately and
+   emitted it FIRST. `?a` was unbound, the comparison saw nil, every row
+   survived, and the filter silently did nothing."
+  [clause]
+  (datom.query.parse/all-variables clause))
+
+(defn- negation-inputs
+  "The variables a `:not` clause shares with the rest of the query.
+
+   Variables appearing ONLY inside the negation are its own locals: in
+   `[:not [?e :p/friend ?f]]` the question is `does ?e have any friend`,
+   and `?f` is bound by that question, not required by it. Requiring it
+   would make the clause unrunnable; ignoring the sharing rule entirely
+   would let the clause run before `?e` is bound, asking a question with
+   no subject."
+  [clause outer-variables]
+  (filterv (fn [v] (contains? (set outer-variables) v)) (clause-variables clause)))
+
+(defn order-clauses
+  "Order `clauses` so each runs with as much bound as possible.
+
+   Greedy: repeatedly take the cheapest clause given what is bound so
+   far, then add its variables to the bound set. Greedy is the right
+   shape here because binding is monotonic \u2014 running a clause never
+   UNBINDS anything, so a locally cheapest choice cannot make a later
+   clause more expensive than it would otherwise have been.
+
+   Predicate and rule clauses are NOT reordered ahead of the patterns
+   that bind their variables; they are emitted as soon as their inputs
+   are available, which is as early as they can legally run."
+  [initial-bindings clauses]
+  (let [outer (into [] (mapcat (fn [c]
+                                 (if (and (datom.query.parse/rule-clause? c)
+                                          (= :not (get c 0)))
+                                   []
+                                   (clause-variables c)))
+                               clauses))]
+  (loop [remaining (into [] clauses)
+         bound (set initial-bindings)
+         ordered []]
+    (if (empty? remaining)
+      ordered
+      (let [patterns (filterv datom.query.parse/pattern-clause? remaining)
+            others (filterv (fn [c] (not (datom.query.parse/pattern-clause? c))) remaining)
+            ; A non-pattern whose variables are all bound can run NOW,
+            ; and running it early shrinks the rows every later clause
+            ; sees \u2014 the cheapest possible filter placement.
+            ready (filterv (fn [c]
+                             (every? (fn [v] (contains? bound v))
+                                     (if (and (datom.query.parse/rule-clause? c)
+                                              (= :not (get c 0)))
+                                       (negation-inputs c outer)
+                                       (clause-variables c))))
+                           others)]
+        (if (seq ready)
+          (recur (filterv (fn [c] (not (= c (first ready)))) remaining)
+                 bound
+                 (conj ordered (first ready)))
+          (if (empty? patterns)
+            ; Only non-ready predicates left: emit them in order and let
+            ; the engine report the unbound variable.
+            (into ordered remaining)
+            (let [best (first (sort-by (fn [c] (clause-cost bound c)) patterns))]
+              (recur (filterv (fn [c] (not (= c best))) remaining)
+                     (into bound (clause-variables best))
+                     (conj ordered best))))))))))
+
+(defn plan
+  "A parsed query with its `:where` clauses ordered for evaluation."
+  [parsed]
+  (assoc parsed
+         :where
+         (order-clauses (datom.query.parse/input-variables parsed) (:where parsed))))

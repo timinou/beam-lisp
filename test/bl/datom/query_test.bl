@@ -1,0 +1,226 @@
+; test/bl/datom/query_test.bl — the datalog engine.
+; Run: mix beam_lisp.test test/bl/datom/query_test.bl
+;
+; Datalog's semantics, pinned in-language. The assertions state what
+; DATALOG promises rather than what this implementation happens to do, so
+; a change that drifts fails here rather than surprising someone later.
+
+(ns datom.query.test
+  (:require [datom.conn] [datom.db] [datom.query.engine] [datom.query.parse]
+            [datom.query.plan]))
+
+(defn- people
+  "A small graph: three people, two of them Alan's friends."
+  []
+  (let [c (datom.conn/connect
+            [{:db/ident :p/name :db/valueType :db.type/string}
+             {:db/ident :p/age :db/valueType :db.type/long :db/index true}
+             {:db/ident :p/city :db/valueType :db.type/string}
+             {:db/ident :p/friend :db/valueType :db.type/ref
+              :db/cardinality :db.cardinality/many}])]
+    (datom.conn/transact! c [{:db/id -1 :p/name "Ada" :p/age 36 :p/city "London"}
+                             {:db/id -2 :p/name "Grace" :p/age 45 :p/city "New York"}
+                             {:db/id -3 :p/name "Alan" :p/age 41 :p/city "London"
+                              :p/friend [-1 -2]}])
+    c))
+
+(defn- q [query db & inputs] (apply datom.query.engine/q query db (or inputs '())))
+
+;; ── a query is DATA ─────────────────────────────────────────────────
+
+(deftest a-query-is-a-value-that-can-be-built-programmatically
+  ; The point of datalog-as-data: no string concatenation, no injection,
+  ; no query builder. `conj` is the query builder.
+  (let [db (datom.conn/db (people))
+        base '[:find ?n :where [?e :p/name ?n]]
+        narrowed (conj base '[?e :p/city "London"])]
+    (is (= 3 (count (q base db))))
+    (is (= 2 (count (q narrowed db))) "a clause added with conj narrows it")))
+
+(deftest the-map-form-and-the-vector-form-agree
+  (let [db (datom.conn/db (people))]
+    (is (= (q '[:find ?n :where [?e :p/name ?n]] db)
+           (q {:find '[?n] :where '[[?e :p/name ?n]]} db)))))
+
+;; ── results are a SET ───────────────────────────────────────────────
+
+(deftest results-are-a-set-because-datalog-answers-are-facts
+  ; The same answer reached by two derivations is ONE answer. Returning a
+  ; bag would make the result depend on evaluation order.
+  (let [db (datom.conn/db (people))
+        result (q '[:find ?city :where [?e :p/city ?city]] db)]
+    (is (set? result))
+    (is (= 2 (count result)) "London appears twice in the data, once in the result")
+    (is (= (set [["London"] ["New York"]]) result))))
+
+;; ── patterns and unification ────────────────────────────────────────
+
+(deftest a-constant-in-a-pattern-filters
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Ada"]]) (q '[:find ?n :where [?e :p/name ?n] [?e :p/age 36]] db)))))
+
+(deftest a-repeated-variable-must-agree-in-both-positions
+  ; This is unification, not pattern matching: the second occurrence of
+  ; ?e is a CONSTRAINT, which is exactly what makes the join work.
+  (let [db (datom.conn/db (people))]
+    (is (= 3 (count (q '[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] db)))
+        "each name pairs only with its OWN age")))
+
+(deftest a-wildcard-binds-nothing-and-matches-anything
+  (let [db (datom.conn/db (people))]
+    (is (= 3 (count (q '[:find ?e :where [?e :p/name _]] db))))))
+
+(deftest two-clauses-sharing-a-variable-join-on-it
+  ; Traversing a reference: Alan -> his friends -> their names.
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Ada"] ["Grace"]])
+           (q '[:find ?fn
+                :where
+                [?e :p/name "Alan"]
+                [?e :p/friend ?f]
+                [?f :p/name ?fn]]
+              db)))))
+
+(deftest an-unmatched-pattern-yields-no-results
+  (let [db (datom.conn/db (people))]
+    (is (= 0 (count (q '[:find ?n :where [?e :p/name ?n] [?e :p/age 999]] db))))))
+
+;; ── inputs ──────────────────────────────────────────────────────────
+
+(deftest in-parameters-bind-before-evaluation
+  ; Parameters, not interpolation \u2014 the value never becomes part of the
+  ; query, which is the structural reason injection is impossible here.
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Grace"]])
+           (q '[:find ?n :in $ ?min
+                :where [?e :p/name ?n] [?e :p/age ?a] [(>= ?a ?min)]]
+              db 45)))))
+
+(deftest the-wrong-number-of-inputs-is-rejected
+  (let [db (datom.conn/db (people))]
+    (is (= :raised (try (do (q '[:find ?n :in $ ?min :where [?e :p/name ?n]] db) :ran)
+                        (catch e :raised))))))
+
+;; ── predicates and functions ────────────────────────────────────────
+
+(deftest a-predicate-filters-without-binding
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Grace"] ["Alan"]])
+           (q '[:find ?n :where [?e :p/name ?n] [?e :p/age ?a] [(> ?a 40)]] db)))))
+
+(deftest a-predicate-runs-only-once-its-variables-are-bound
+  ; THE regression. Predicate variables live INSIDE the call form, so a
+  ; top-level scan found none and the planner emitted the predicate
+  ; FIRST. It then compared nil against 40, every row survived, and the
+  ; filter silently did nothing.
+  (let [planned (datom.query.plan/plan
+                  (datom.query.parse/parse
+                    '[:find ?n :where [?e :p/name ?n] [?e :p/age ?a] [(> ?a 40)]]))]
+    (is (datom.query.parse/predicate-clause? (get (:where planned) 2))
+        "the predicate must be ordered AFTER the clauses that bind it")))
+
+(deftest a-function-clause-binds-its-result
+  (let [db (datom.conn/db (people))]
+    (is (= (set [[72]])
+           (q '[:find ?d :where [?e :p/name "Ada"] [?e :p/age ?a] [(* ?a 2) ?d]] db)))))
+
+;; ── rules ───────────────────────────────────────────────────────────
+
+(deftest or-keeps-a-binding-that-satisfies-any-branch
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Ada"] ["Grace"]])
+           (q '[:find ?n :where [?e :p/name ?n]
+                [:or [?e :p/age 36] [?e :p/age 45]]]
+              db)))))
+
+(deftest or-does-not-double-a-row-matched-by-two-branches
+  (let [db (datom.conn/db (people))]
+    (is (= 1 (count (q '[:find ?n :where [?e :p/name ?n] [?e :p/age 36]
+                         [:or [?e :p/city "London"] [?e :p/age 36]]]
+                       db))))))
+
+(deftest not-succeeds-when-the-sub-clauses-find-nothing
+  ; Negation as failure: who has NO friends?
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Ada"] ["Grace"]])
+           (q '[:find ?n :where [?e :p/name ?n] [:not [?e :p/friend ?f]]] db)))))
+
+(deftest not-introduces-its-own-local-variables
+  ; `?f` in `[:not [?e :p/friend ?f]]` is the negation's own variable,
+  ; not an input it requires. Treating it as required made the clause
+  ; unrunnable and the query returned nothing at all.
+  (let [db (datom.conn/db (people))]
+    (is (< 0 (count (q '[:find ?n :where [?e :p/name ?n] [:not [?e :p/friend ?f]]] db))))))
+
+(deftest and-requires-every-sub-clause
+  (let [db (datom.conn/db (people))]
+    (is (= (set [["Alan"]])
+           (q '[:find ?n :where [?e :p/name ?n]
+                [:and [?e :p/city "London"] [?e :p/age 41]]]
+              db)))))
+
+;; ── the planner ─────────────────────────────────────────────────────
+
+(deftest the-planner-picks-the-index-the-bound-positions-allow
+  ; Wrong choices still return CORRECT answers — they just read the whole
+  ; database. That is the failure mode to fear, because it is invisible
+  ; until the data grows.
+  (let [schema (datom.conn/schema (people))]
+    (are [bindings clause expected]
+         (= expected (get (datom.query.plan/index-for schema bindings clause) 0))
+      #{}        '[?e :p/name ?n]   :aevt
+      #{'?e}     '[?e :p/name ?n]   :eavt
+      #{}        '[1 :p/name ?n]    :eavt
+      #{}        '[?e :p/age 36]    :avet
+      #{}        '[?e ?a ?v]        :eavt)))
+
+(deftest the-planner-runs-the-most-selective-clause-first
+  ; Bindings flow left to right, so order decides how much is bound when
+  ; each clause runs. An entity-bound clause is always cheaper than a
+  ; column scan.
+  (let [planned (datom.query.plan/plan
+                  (datom.query.parse/parse
+                    '[:find ?n :where [?e :p/name ?n] [?e :p/age 36]]))]
+    (is (= '[?e :p/age 36] (first (:where planned)))
+        "the clause with a bound value runs before the open one")))
+
+(deftest planning-never-drops-or-duplicates-a-clause
+  ; A reordering bug that LOSES a clause silently widens the result.
+  (let [parsed (datom.query.parse/parse
+                 '[:find ?n :where [?e :p/name ?n] [?e :p/age ?a]
+                   [(> ?a 20)] [:not [?e :p/city "Mars"]]])
+        planned (datom.query.plan/plan parsed)]
+    (is (= (count (:where parsed)) (count (:where planned))))
+    (is (= (set (:where parsed)) (set (:where planned))))))
+
+;; ── validation ──────────────────────────────────────────────────────
+
+(deftest a-find-variable-bound-by-nothing-is-rejected
+  ; It could never be bound, so the query would silently return nils.
+  (let [db (datom.conn/db (people))]
+    (is (= :raised (try (do (q '[:find ?nope :where [?e :p/name ?n]] db) :ran)
+                        (catch e :raised))))))
+
+(deftest a-variable-bound-by-a-function-clause-counts-as-bound
+  ; Validation collected variables from PATTERNS only, so every query
+  ; using a computed value was rejected as unbound.
+  (let [db (datom.conn/db (people))]
+    (is (= 3 (count (q '[:find ?d :where [?e :p/age ?a] [(* ?a 2) ?d]] db))))))
+
+;; ── time travel through queries ─────────────────────────────────────
+
+(deftest a-query-against-an-old-db-value-sees-the-old-world
+  ; The db-as-value payoff: no special syntax, no transaction, no
+  ; isolation level — just an older value.
+  (let [c (people)
+        before (datom.conn/db c)]
+    (datom.conn/transact! c [{:db/id -1 :p/name "Zaha" :p/age 30}])
+    (is (= 3 (count (q '[:find ?n :where [?e :p/name ?n]] before))))
+    (is (= 4 (count (q '[:find ?n :where [?e :p/name ?n]] (datom.conn/db c)))))))
+
+(deftest a-query-does-not-see-retracted-facts
+  (let [c (people)
+        db1 (datom.conn/db c)
+        ada (get (first (q '[:find ?e :where [?e :p/name "Ada"]] db1)) 0)]
+    (datom.conn/transact! c [[:db/retract ada :p/name "Ada"]])
+    (is (= 2 (count (q '[:find ?n :where [?e :p/name ?n]] (datom.conn/db c)))))))
