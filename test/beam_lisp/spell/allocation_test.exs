@@ -157,8 +157,18 @@ defmodule BeamLisp.Spell.AllocationTest do
       # made a later suite's `{:ok, _} = Loop.start_link(…)` fail with
       # `{:error, {:already_started, _}}` — a ~1-in-3 flake in
       # Spell.McpTest that passed in isolation every time (BUG-006).
+      #
+      # `Process.alive?` then `stop` is a TOCTOU race: the process can
+      # begin shutting down between the two, and `GenServer.stop` on a
+      # dying process EXITS rather than returning an error tuple — so it
+      # cannot be handled with a `case`, only caught (BUG-015).
       on_exit(fn ->
-        if Process.alive?(pid), do: GenServer.stop(pid)
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+
         wait_for_name_release(BeamLisp.Spell.Loop, 50)
       end)
       BeamLisp.Spell.Server.register("chat-live", "spell.seed/contract-term")

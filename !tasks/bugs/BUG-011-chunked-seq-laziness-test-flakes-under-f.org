@@ -102,3 +102,138 @@ intermittent laziness failure is worth keeping visible. Next step if it
 recurs: capture the full seed AND the machine load, and check whether
 `map`'s chunking has any fallback path that a process under memory
 pressure could take.
+
+NOTE [2026-08-21]: Second occurrence, with a SHARPER signature and more bisection.
+
+This time TWO tests in wave10_lazy_test.exs failed together, both about
+chunking:
+
+  "forcing a finite prefix of an infinite seq realizes exactly one chunk"
+     (doall (take 5 (map f (range))))  forced 5, expected 32
+  "a chunk's thunk realizes once, caching its whole chunk"
+
+Forcing exactly 5 for `(take 5 ...)` is the signature of the
+ONE-AT-A-TIME path: the chunked path realizes 32 whether you take 5 or
+32, and the unchunked path realizes exactly what you asked for. So under
+the failing condition `map` is producing an unchunked lazy seq.
+
+** What was ruled out this round
+
+- `@chunk_size` is a compile-time module attribute in lazy_seq.ex \u2014 it
+  cannot be mutated at runtime, so nothing is "changing the chunk size".
+- Not a specific polluting file: first 37 files + the lazy test = 609
+  passed; last 37 + the lazy test = 576 passed. Both halves clean.
+- Not seed order: a FULL `mix test --seed 0` passed 1171/1171, and an
+  earlier full run at the original failing seed 392837 also passed.
+- Not the async set, not wave11/wave12 (the files that mention `map`).
+- Standalone the file passes 14/14, and a direct probe forces 32.
+
+** Running tally
+
+| run                          | result       |
+|------------------------------+--------------|
+| full, seed 392837 (original) | 1 failure    |
+| full, seed 392837 (repeat)   | 1171 passed  |
+| full, random seed            | 1171 passed  |
+| full, random seed            | 1169/1171    |
+| full, seed 0                 | 1171 passed  |
+
+Same code, same seeds, different outcomes. That is not order dependence.
+
+** Revised hypothesis: resource pressure, not state
+
+The one variable that tracks the failures is machine load. The kernel
+OOM-killed two beam.smp processes on this host the same day, and the
+failing runs happened while load average was 13-16 with 48/80 GB swap in
+use; the passing runs were at load ~6.
+
+`map`'s chunking is implemented by building a chunk of up to 32 elements
+per thunk. If any part of that path has a fallback \u2014 or if a process
+under memory pressure takes a different branch \u2014 the seq degrades to
+one-at-a-time, which is exactly the observed 5-instead-of-32.
+
+** Next step when it recurs
+
+Read `RT.map/2` and `LazySeq.chunked` for ANY conditional path that can
+produce an unchunked seq, and determine what selects it. That is a
+static question and does not need a reproduction \u2014 if there is no such
+branch, the hypothesis is wrong and the cause is elsewhere in how the
+test's `atom` counter observes realization.
+
+Not blocking: the failure is in a laziness OPTIMISATION assertion, not
+in correctness. `(take 5 ...)` returns the right five elements either
+way. But an intermittent test failure that cannot be explained is worth
+keeping open.
+
+NOTE [2026-08-21]: ROOT CAUSE FOUND \u2014 by static reading, as the previous note proposed.
+
+`LazySeq.force/1` memoizes a realized chunk in ETS:
+
+    @table :beam_lisp_vars          # lazy_seq.ex:37
+    def force(%__MODULE__{key: key, thunk: thunk}) do
+      case :ets.lookup(@table, {:lazy, key}) do
+        [{_, value}] -> value
+        [] -> value = thunk.(); :ets.insert(...); value
+      end
+    end
+
+That table is NOT private to the lazy-seq layer. It is
+`:beam_lisp_vars` \u2014 the shared var table \u2014 and it is created by, and
+therefore OWNED by, the `BeamLisp.Env` Agent:
+
+    def start_link(_opts) do
+      Agent.start_link(fn ->
+        :ets.new(@table, [:named_table, :public, read_concurrency: true])
+        ...
+
+An ETS table dies with its owning process. So if the Env Agent restarts
+for ANY reason \u2014 supervisor churn, a crash in another test, memory
+pressure \u2014 every memoized lazy chunk is silently discarded along with
+it.
+
+** Why that produces exactly the observed symptom
+
+`map` chunks at 32: forcing a node realizes 32 elements and caches them.
+`take` is EAGER (`take_loop` walks `LazySeq.cell` element by element),
+so `(doall (take 5 (map f (range))))` realizes:
+
+  - cache intact  -> one force, whole chunk built, counter reads 32
+  - cache lost    -> each cell re-forces, counter reads 5
+
+5-instead-of-32 is precisely a cache miss, and nothing else produces it.
+Confirmed there is NO unchunked fallback in `map`/`map_chunk` \u2014 the
+hypothesis in the previous note was right to look, and the answer is
+that the chunking is fine and the MEMO is what disappears.
+
+** Why it looked intermittent and load-correlated
+
+The Agent is likelier to restart on a loaded machine, which is exactly
+when the failures appeared (load 13-16, two beam.smp OOM-kills the same
+day) and exactly when they did not (load ~6, three clean full runs
+including seed 0 and the original failing seed).
+
+** The real defect
+
+Memoization state has a DIFFERENT lifetime from var state, and putting
+both in one table couples them. A var table may legitimately be
+rebuilt; a realization cache being rebuilt turns a memoized seq back
+into an unmemoized one, which is a silent performance cliff rather than
+an error \u2014 and for a self-referential or expensive thunk it means the
+work is redone.
+
+** Fix options
+
+1. Own the lazy cache separately: a dedicated `:beam_lisp_lazy` table
+   created by its own long-lived process. Smallest change that
+   decouples the lifetimes.
+2. Keep the cache in the LazySeq struct rather than in ETS. Cleanest
+   semantically (the memo belongs to the value), but a BEAM term is
+   immutable, which is why the side table exists at all.
+3. Have whatever recreates the var table also recreate the lazy table,
+   and document that a lazy seq does not survive it. Weakest \u2014 it
+   preserves the coupling and only names it.
+
+Option 1 is right. It is a substrate change, so it belongs with the
+beam-lisp core rather than the datom work, and it is not blocking:
+the failure is in a laziness OPTIMISATION assertion, and
+`(take 5 ...)` returns the correct five elements either way.

@@ -31,7 +31,15 @@ defmodule BeamLisp.Spell.TurnTest do
     System.put_env("PROVIDER", "fake")
 
     on_exit(fn ->
-      if pid = Process.whereis(Loop), do: GenServer.stop(pid)
+      # `whereis`-then-`stop` is a TOCTOU race, and stopping a dying
+      # process EXITS rather than returning (BUG-015).
+      if pid = Process.whereis(Loop) do
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end
       restore("PROVIDER", old_provider)
       restore("SPELL_FAKE_SCENARIO", old_scenario)
       Application.delete_env(:beam_lisp, :spell_state_dir)

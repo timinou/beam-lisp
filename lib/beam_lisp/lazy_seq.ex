@@ -34,7 +34,18 @@ defmodule BeamLisp.LazySeq do
   (`(1 2 3 …)`) so an infinite seq can never hang the printer.
   """
 
-  @table :beam_lisp_vars
+  # The realization cache lives in its OWN table, not in the shared var
+  # table. An ETS table dies with the process that created it, and the
+  # var table is created by (and so owned by) the `Env` Agent — so an
+  # Env restart silently discarded every memoized chunk. A seq that had
+  # realized 32 elements went back to realizing one at a time: not an
+  # error, just the memo quietly gone, which is why it surfaced as an
+  # intermittent laziness test failure correlated with machine load
+  # rather than as anything diagnosable (BUG-011).
+  #
+  # Memoization state and var state have different lifetimes. Keeping
+  # them in one table coupled them.
+  @table :beam_lisp_lazy_cache
 
   # Chunked seq fns realize this many elements per thunk, so the
   # per-element LazySeq allocation is amortized instead of one struct +
@@ -76,6 +87,8 @@ defmodule BeamLisp.LazySeq do
 
   @doc "Run a node's thunk exactly once, caching and returning the result."
   def force(%__MODULE__{key: key, thunk: thunk}) do
+    ensure_table()
+
     case :ets.lookup(@table, {:lazy, key}) do
       [{_, value}] ->
         value
@@ -84,6 +97,25 @@ defmodule BeamLisp.LazySeq do
         value = thunk.()
         :ets.insert(@table, {{:lazy, key}, value})
         value
+    end
+  end
+
+  # Created on first use and owned by whichever process gets there first.
+  # That is still a process-lifetime dependency, but a much longer one:
+  # this table is never rebuilt as part of resetting the language, which
+  # is the coupling that actually bit.
+  defp ensure_table do
+    case :ets.whereis(@table) do
+      :undefined ->
+        try do
+          :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+        rescue
+          # Another process won the race; its table is the one we want.
+          ArgumentError -> :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 

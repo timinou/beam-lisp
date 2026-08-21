@@ -51,7 +51,13 @@ defmodule BeamLisp.Spell.LoopTest do
     {:ok, pid} = Loop.start_link(out: @out, publish: false, name: __MODULE__.Loop)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      # `GenServer.stop` on a dying process EXITS rather than returning,
+      # and `alive?`-then-`stop` is a TOCTOU race (BUG-015).
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
       File.rm_rf(@out)
     end)
 

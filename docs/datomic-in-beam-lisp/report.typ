@@ -476,6 +476,23 @@ A substrate must provide: *ordered keys*, *prefix range scans*, *atomic
 multi-key commit*, and *compare-and-swap*. Anything offering those four can
 carry this database unchanged.
 
+== The port is proven, not assumed
+
+A port with one implementation is a hypothesis. `priv/datom/store-map.bl`
+is a second one — a sorted map in an atom, sharing no machinery with ETS: no
+tables, no process ownership, a different concurrency story. The entire
+database runs on it unchanged.
+
+`test/bl/datom/conformance_test.bl` runs twenty tests against *both*
+implementations, and asserts they give identical answers. It earned its keep on
+its first run: the two stores disagreed about range bounds, because the second
+implementation had assumed half-open where the port specifies inclusive. That
+is the single easiest property for a backend author to get wrong, and it now
+fails loudly rather than silently returning one datom too few from every scan.
+
+*This suite is what makes the next backend safe.* Run it against a new store
+and "it works" has a definition rather than being a hope.
+
 == What the ETS implementation does not provide
 
 Stated rather than buried, because these are exactly what a real substrate is
@@ -535,6 +552,29 @@ memory. This is the single most important number here for choosing a backend,
 and it is asserted as a test so a regression shows up as a failing count rather
 than as a slow benchmark somebody has to interpret.
 
+== Range predicates read their window, not the column
+
+A comparison on an AVET-indexed attribute lowers into scan bounds. Measured
+over 100 entities, counting datoms *returned* rather than ranges issued — a
+bounded scan and a full scan are both one range, so this is invisible in range
+counts:
+
+#table(
+  columns: (auto, auto, auto),
+  stroke: 0.4pt + gray,
+  [*query*], [*answers*], [*datoms read*],
+  [indexed `(> ?a 95)`], [4], [5],
+  [indexed, no predicate], [100], [100],
+  [unindexed `(> ?a 95)`], [4], [100],
+  [two-sided window], [4], [6],
+)
+
+The predicate still runs after the bounded scan. The bound narrows what is
+read; it does not replace the test — so an off-by-one in the bounds can only
+make a query slower, never wrong. That is the property that makes the
+optimisation safe to have, and the acceptance test asserts the indexed and
+unindexed paths give *identical* answers rather than asserting a speed.
+
 == Writes
 
 #table(
@@ -566,7 +606,7 @@ every program in the language:
 
 = What a review found that tests did not
 
-Five review rounds, 38 defects. The distribution is the interesting part:
+Seven review rounds, 51 defects. The distribution is the interesting part:
 almost none were crashes.
 
 #table(
@@ -590,10 +630,6 @@ a list of what it does.
 - *Recursive rules* (`%`), Datomic's `[(ancestor ?a ?b)]` — the query language
   has no user-defined rules at all.
 - *Multiple data sources* — one `$` only, so no cross-database joins.
-- *Range predicate pushdown.* `datom.index/scan-range` is complete and tested
-  but nothing calls it: `[(> ?age 30)]` filters after a full column scan.
-  Correct answers, cost proportional to the column rather than the result.
-  Filed as FEAT-009.
 - *Schema as-of.* A historical view reads through today's schema (FEAT-010).
 - *Durability.* There is no persistent substrate yet — which is the point of
   the next section.
