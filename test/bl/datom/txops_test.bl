@@ -1,0 +1,175 @@
+; test/bl/datom/txops_test.bl — the two transaction forms that READ.
+;
+; `:db/add` and `:db/retract` say exactly what they do. These two do not:
+;
+;   [:db/retractEntity e]      "forget this entity"  -> which datoms?
+;   [:db/cas e a old new]      "set it, if"          -> if WHAT?
+;
+; Both are questions about current state, so both expand by reading the
+; database. That is why they live in `expand-store-ops` rather than in
+; the purely syntactic `expand`, and why each has a failure mode worth
+; pinning: retractEntity that forgets incoming references leaves dangling
+; pointers, and a cas that does not actually compare is just an assert.
+
+(ns datom.txops.test
+  (:require [datom.conn] [datom.db] [datom.index] [datom.pull]
+            [datom.query.engine] [datom.time]))
+
+(defn- fixture
+  []
+  (datom.conn/connect
+    [{:db/ident :p/name :db/valueType :db.type/string}
+     {:db/ident :p/age :db/valueType :db.type/long}
+     {:db/ident :p/email :db/valueType :db.type/string :db/unique :db.unique/identity}
+     {:db/ident :p/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]))
+
+;; ── retractEntity ───────────────────────────────────────────────────
+
+(deftest retract-entity-removes-every-datom-the-entity-holds
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "Ada" :p/age 36}])
+        ada (get (:tempids r) -1)]
+    (is (some? (datom.db/entity (datom.conn/db c) ada)))
+    (datom.conn/transact! c [[:db/retractEntity ada]])
+    (is (nil? (datom.db/entity (datom.conn/db c) ada))
+        "no attribute of the entity survives")))
+
+(deftest retract-entity-also-removes-references-TO-it
+  ; The half that is easy to forget and impossible to repair later.
+  ; Retracting a person while `:p/friend` still points at them leaves a
+  ; dangling reference: `pull` would follow it into an entity with no
+  ; datoms, and every reader would have to defend against a value the
+  ; database should never have contained.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "Ada"}
+                                   {:db/id -2 :p/name "Alan" :p/friend [-1]}])
+        ada (get (:tempids r) -1)
+        alan (get (:tempids r) -2)]
+    (is (= [ada] (:p/friend (datom.db/entity (datom.conn/db c) alan))))
+    (datom.conn/transact! c [[:db/retractEntity ada]])
+    (is (nil? (:p/friend (datom.db/entity (datom.conn/db c) alan)))
+        "the reference goes with the entity it pointed at")
+    (is (empty? (datom.query.engine/q '[:find ?e :where [?e :p/friend ?f]]
+                                      (datom.conn/db c)))
+        "and no query can still reach it")))
+
+(deftest retracting-an-entity-twice-records-nothing-the-second-time
+  ; Values are read from the CURRENT database, so the second retraction
+  ; finds nothing to retract. Recording it anyway would write datoms for
+  ; facts that had already stopped being true — history describing a
+  ; change that did not happen.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "Ada"}])
+        ada (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/retractEntity ada]])
+    (is (= [] (:tx-datoms (datom.conn/transact! c [[:db/retractEntity ada]]))))))
+
+(deftest a-retracted-entity-is-still-there-in-the-past
+  ; Retraction ends a fact's validity; it does not erase that the fact
+  ; was once true. An entity forgotten today was still real yesterday.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "Ada" :p/age 36}])
+        ada (get (:tempids r) -1)
+        t1 (:tx r)]
+    (datom.conn/transact! c [[:db/retractEntity ada]])
+    (let [db (datom.conn/db c)]
+      (is (nil? (datom.db/entity db ada)))
+      (is (= "Ada" (:p/name (datom.db/entity (datom.time/as-of db t1) ada)))))))
+
+(deftest a-retracted-identity-can-be-reused
+  ; `:db.unique/identity` promises at most one holder among CURRENT
+  ; facts. Once the entity is retracted the value is free again, and a
+  ; new entity may claim it — otherwise a deleted user's email could
+  ; never be re-registered.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/email "ada@example.com"}])
+        ada (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/retractEntity ada]])
+    (let [r2 (datom.conn/transact! c [{:db/id -1 :p/email "ada@example.com" :p/name "New"}])
+          fresh (get (:tempids r2) -1)]
+      (is (not (= ada fresh)) "a NEW entity, not an upsert onto the retracted one")
+      (is (= "New" (:p/name (datom.db/entity (datom.conn/db c) fresh)))))))
+
+;; ── compare-and-swap ────────────────────────────────────────────────
+
+(deftest cas-applies-when-the-value-is-what-the-caller-read
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/age 41}])
+        e (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/cas e :p/age 41 42]])
+    (is (= 42 (:p/age (datom.db/entity (datom.conn/db c) e))))))
+
+(deftest cas-REFUSES-when-the-world-moved-underneath
+  ; This is the whole point. Without it, a read-modify-write
+  ;
+  ;   (transact! conn [[:db/add e :p/age (inc current)]])
+  ;
+  ; silently loses a concurrent writer's change: both read 41, both write
+  ; 42, one increment vanishes with no error anywhere. cas turns that
+  ; into a refusal the caller can retry.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/age 41}])
+        e (get (:tempids r) -1)]
+    ; somebody else got there first
+    (datom.conn/transact! c [[:db/add e :p/age 50]])
+    (is (= :refused
+           (try (do (datom.conn/transact! c [[:db/cas e :p/age 41 42]]) :applied)
+                (catch x :refused))))
+    (is (= 50 (:p/age (datom.db/entity (datom.conn/db c) e)))
+        "and the other writer's value is untouched")))
+
+(deftest a-failed-cas-says-what-it-expected-and-what-it-found
+  ; An error a caller can act on: retry with the actual value, or report
+  ; the conflict. `compare-and-swap failed` alone would leave them
+  ; guessing.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/age 41}])
+        e (get (:tempids r) -1)
+        data (try (do (datom.conn/transact! c [[:db/cas e :p/age 99 42]]) nil)
+                  (catch x (ex-data x)))]
+    (is (some? data))
+    (is (= 99 (:expected data)))
+    (is (= [41] (:actual data)))))
+
+(deftest cas-with-nil-asserts-the-attribute-is-empty
+  ; `create exactly once`: the transaction succeeds only if nobody has
+  ; set the attribute yet, which is how you claim a slot without a lock.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "Ada"}])
+        e (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/cas e :p/age nil 1]])
+    (is (= 1 (:p/age (datom.db/entity (datom.conn/db c) e))))
+    (is (= :refused
+           (try (do (datom.conn/transact! c [[:db/cas e :p/age nil 2]]) :applied)
+                (catch x :refused)))
+        "the second claim finds the slot taken")))
+
+(deftest cas-resolves-a-tempid-in-its-new-value
+  ; The five-element form must survive tempid resolution intact.
+  ; Rebuilding every operation to a fixed four-element shape truncated
+  ; the new value, and the op then failed validation complaining about a
+  ; nil it had itself created — an error pointing at the wrong thing.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/name "A"} {:db/id -2 :p/name "B"}])
+        a (get (:tempids r) -1)
+        b (get (:tempids r) -2)
+        r2 (datom.conn/transact! c [{:db/id -9 :p/name "C"}
+                                    [:db/cas a :p/friend nil -9]])
+        c-id (get (:tempids r2) -9)]
+    (is (some? c-id))
+    (is (= [c-id] (:p/friend (datom.db/entity (datom.conn/db c) a)))
+        "the tempid in the NEW position resolved to a real entity")))
+
+;; ── they compose with everything else ───────────────────────────────
+
+(deftest the-reading-forms-go-through-normal-validation
+  ; They expand into ordinary assertions and retractions, so they meet
+  ; the same schema rules. A cas writing the wrong type is rejected like
+  ; any other bad write, rather than bypassing validation because it
+  ; arrived by a different door.
+  (let [c (fixture)
+        r (datom.conn/transact! c [{:db/id -1 :p/age 41}])
+        e (get (:tempids r) -1)]
+    (is (= :rejected
+           (try (do (datom.conn/transact! c [[:db/cas e :p/age 41 "not a number"]]) :accepted)
+                (catch x :rejected))))))

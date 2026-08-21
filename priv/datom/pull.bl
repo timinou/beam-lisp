@@ -104,7 +104,99 @@
     (first values)
     values))
 
+;; ── pattern option forms ───────────────────────────────────
+;;
+;; A pattern element may be a LIST carrying an option:
+;;
+;;   (default :p/name "unknown")   a value when the attribute is absent
+;;   (limit :p/friend 10)           at most N values of a many attribute
+;;   (:p/name :as :name)            rename the key in the result
+;;
+;; Each answers a question the bare attribute cannot. `default` is the
+;; difference between `absent` and `absent, and here is what to assume`.
+;; `limit` is what makes pulling a popular entity safe — without it, one
+;; entity with a million inbound refs is one unbounded read. `:as` lets a
+;; pull shape its output for a consumer that has its own vocabulary.
+
+(defn option-form?
+  "Whether `element` is an option list rather than a plain attribute."
+  [element]
+  (and (list? element) (> (count element) 1)))
+
+(defn- option-attr
+  "The attribute an option form applies to."
+  [element]
+  (let [head (first element)]
+    (if (keyword? head) head (second element))))
+
+(defn- option-kind
+  [element]
+  (let [head (first element)]
+    (cond
+      (keyword? head) :as
+      (= head (quote default)) :default
+      (= head (quote limit)) :limit
+      :else nil)))
+
+(defn- option-arg
+  [element]
+  (let [xs (into [] element)]
+    (get xs (- (count xs) 1))))
+
 ;; ── the pull itself ─────────────────────────────────────────────────
+
+(defn recursive-spec?
+  "Whether a nested value is a RECURSION spec rather than a pattern.
+
+     {:p/friend 3}     descend at most 3 levels
+     {:p/friend ...}   descend until nothing new is reachable
+
+   Datomic spells the unbounded form `...`, which reads as `and so on`."
+  [spec]
+  (or (int? spec) (= spec (quote ...))))
+
+(defn- recur-deeper
+  "The spec one level down, or nil when the descent stops here."
+  [spec]
+  (cond
+    (= spec (quote ...)) spec
+    (and (int? spec) (> spec 1)) (- spec 1)
+    :else nil))
+
+(defn- pull-recursive
+  "One level of a recursive pull, tracking `seen` to terminate cycles.
+
+   A revisited entity comes back as a bare `{:db/id N}` rather than
+   recurring \u2014 Datomic's behaviour, and the only sane one: the entity is
+   already in the result above this point, so repeating it would either
+   loop forever or duplicate a subtree without end.
+
+   `seen` is the path from the ROOT, not a global set: two siblings may
+   legitimately reference the same entity and each should expand it.
+   Only an ancestor makes it a cycle."
+  [db attr spec e seen]
+  (if (contains? seen e)
+    {:db/id e}
+    (let [ds (datom.db/entity-datoms db e)]
+      (if (empty? ds)
+        nil
+        (let [base (reduce (fn [m d]
+                             (let [a (datom.index/-a d)]
+                               (if (= a attr)
+                                 m
+                                 (assoc m a (collapse db a (values-of db e a))))))
+                           {:db/id e}
+                           ds)
+              deeper (recur-deeper spec)
+              targets (values-of db e attr)]
+          (if (or (nil? deeper) (empty? targets))
+            base
+            (let [children (filterv some?
+                                    (mapv (fn [t] (pull-recursive db attr deeper t (conj seen e)))
+                                          targets))]
+              (if (empty? children)
+                base
+                (assoc base attr (collapse db attr children))))))))))
 
 (defn- pull-element
   "Add one pattern element's contribution to the result map."
@@ -120,6 +212,34 @@
               acc
               (datom.db/entity-datoms db e))
 
+    ; an option form: (default a v) / (limit a n) / (a :as k)
+    (option-form? element)
+      (let [attr (option-attr element)
+            kind (option-kind element)
+            arg (option-arg element)]
+        (cond
+          (= kind :default)
+            (let [vs (values-of db e attr)]
+              (assoc acc attr (if (empty? vs) arg (collapse db attr vs))))
+
+          (= kind :limit)
+            (let [vs (if (reverse-attr? attr)
+                       (referring-entities db (forward-attr attr) e)
+                       (values-of db e attr))]
+              (if (empty? vs)
+                acc
+                (assoc acc attr (into [] (take arg vs)))))
+
+          (= kind :as)
+            (let [vs (if (reverse-attr? attr)
+                       (referring-entities db (forward-attr attr) e)
+                       (values-of db e attr))]
+              (if (empty? vs)
+                acc
+                (assoc acc arg (if (reverse-attr? attr) vs (collapse db attr vs)))))
+
+          :else (throw (ex-info "unrecognised pull option" {:element element}))))
+
     ; a plain attribute, forward or reverse
     (keyword? element)
       (if (reverse-attr? element)
@@ -133,29 +253,51 @@
       (reduce (fn [m entry]
                 (let [attr (key entry)
                       sub-pattern (val entry)]
-                  ; A nested pattern navigates a REFERENCE. Following a
-                  ; non-ref attribute treated its value as an entity id,
-                  ; found nothing, and produced `{:p/name nil}` \u2014 a
-                  ; plausible map instead of the pattern error this API
-                  ; promises. A scalar has no sub-structure to pull.
-                  (if (and (not (reverse-attr? attr))
-                           (not (datom.schema/ref? (:schema db) attr)))
-                    (throw (ex-info (str "nested pull requires a :db.type/ref attribute: " attr)
-                                    {:attr attr :pattern sub-pattern}))
-                  (if (reverse-attr? attr)
-                    (let [refs (referring-entities db (forward-attr attr) e)]
-                      (if (empty? refs)
-                        m
-                        (assoc m attr (filterv some?
-                                               (mapv (fn [r] (pull db sub-pattern r)) refs)))))
-                    (let [targets (values-of db e attr)]
-                      (if (empty? targets)
-                        m
-                        (assoc m attr
-                               (collapse db attr
-                                         (filterv some?
-                                                  (mapv (fn [t] (pull db sub-pattern t))
-                                                        targets))))))))))
+                  (cond
+                    ; A nested pattern navigates a REFERENCE. Following a
+                    ; non-ref attribute treated its value as an entity id,
+                    ; found nothing, and produced `{:p/name nil}` \u2014 a
+                    ; plausible map instead of the pattern error this API
+                    ; promises. A scalar has no sub-structure to pull.
+                    (and (not (reverse-attr? attr))
+                         (not (datom.schema/ref? (:schema db) attr)))
+                      (throw (ex-info (str "nested pull requires a :db.type/ref attribute: " attr)
+                                      {:attr attr :pattern sub-pattern}))
+
+                    ; RECURSION: `{:attr N}` descends N levels, `{:attr ...}`
+                    ; until nothing new is reachable. Both track the path
+                    ; from the root so a cycle terminates \u2014 and cycles are
+                    ; ordinary rather than exotic: mutual friendship is one.
+                    (recursive-spec? sub-pattern)
+                      (let [targets (if (reverse-attr? attr)
+                                      (referring-entities db (forward-attr attr) e)
+                                      (values-of db e attr))
+                            results (filterv some?
+                                             (mapv (fn [t]
+                                                     (pull-recursive db attr sub-pattern t #{e}))
+                                                   targets))]
+                        (if (empty? results)
+                          m
+                          (assoc m attr (if (reverse-attr? attr)
+                                          results
+                                          (collapse db attr results)))))
+
+                    (reverse-attr? attr)
+                      (let [refs (referring-entities db (forward-attr attr) e)]
+                        (if (empty? refs)
+                          m
+                          (assoc m attr (filterv some?
+                                                 (mapv (fn [r] (pull db sub-pattern r)) refs)))))
+
+                    :else
+                      (let [targets (values-of db e attr)]
+                        (if (empty? targets)
+                          m
+                          (assoc m attr
+                                 (collapse db attr
+                                           (filterv some?
+                                                    (mapv (fn [t] (pull db sub-pattern t))
+                                                          targets)))))))))
               acc
               (seq element))
 
