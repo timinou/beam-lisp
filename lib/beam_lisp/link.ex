@@ -120,6 +120,27 @@ defmodule BeamLisp.Link do
     |> Enum.group_by(&elem(&1, 4), &elem(&1, 3))
   end
 
+  # A guarded clause's head is `{:when, _, params ++ [guard]}`, so the
+  # shim MUST carry the guard too. Two reasons, both load-bearing:
+  #
+  #   * clause selection happens at whichever module the caller enters.
+  #     A bare shim would forward every call to the body module's first
+  #     clause-by-arity and let it raise FunctionClauseError, instead of
+  #     falling through to the next clause.
+  #   * without this clause the generic one below binds `fname` to `:when`
+  #     and builds `def when(f(x), guard)`, whose body calls itself — a
+  #     silent infinite loop the moment the fn is called.
+  defp shim_def({kind, _n, _fname, {:def, line, [{:when, wmeta, when_args}, [do: _]]}, body_mod})
+       when kind in [:fixed, :variadic] do
+    {[{fname, _, head}], [guard]} = Enum.split(when_args, length(when_args) - 1)
+
+    {:def, line,
+     [
+       {:when, wmeta, [{fname, [], head}, guard]},
+       [do: {{:., [], [body_mod, fname]}, [], head}]
+     ]}
+  end
+
   defp shim_def({kind, _n, _fname, {:def, line, [{fname, _, head}, [do: _]]}, body_mod})
        when kind in [:fixed, :variadic] do
     {:def, line, [{fname, [], head}, [do: {{:., [], [body_mod, fname]}, [], head}]]}

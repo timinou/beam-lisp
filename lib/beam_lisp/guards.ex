@@ -47,4 +47,73 @@ defmodule BeamLisp.Guards do
            when is_struct(x, BeamLisp.Atom) or is_struct(x, BeamLisp.Volatile) or
                   is_struct(x, BeamLisp.Promise) or is_struct(x, BeamLisp.Future) or
                   is_struct(x, BeamLisp.Reduced)
+
+  # The tags that mark a tuple as language machinery rather than data.
+  # Declared before the docs below so the `@doc` attribute lands on the
+  # guard it describes (an attribute between a `@doc` and its definition
+  # steals it, which Elixir warns about).
+  # NOT here, deliberately:
+  #   :bl_set / :bl_set_ack / :bl_deref / :bl_value — those are MESSAGES
+  #   between a ref and its holder process (see refs.ex), never values a
+  #   user holds. Excluding them would have made `(first (tuple :bl_set x))`
+  #   — an ordinary, spellable data tuple — mysteriously opaque.
+  @internal_tuple_tags [
+    :"$blfn",
+    :"$remote",
+    :"$macro",
+    :"$protocol",
+    :"$transient",
+    :symbol,
+    :meta,
+    :bl_deftype,
+    :bl_reify,
+    :bl_vec
+  ]
+
+  @doc "The tuple tags that mark a value as language machinery, not data."
+  def internal_tuple_tags, do: @internal_tuple_tags
+
+  @doc """
+  True for an Erlang tuple that is *data* — a positional collection the
+  user can read with `first`/`nth`/`count`/`seq` — as opposed to one of
+  the language's own TAGGED values, which merely happen to be tuples.
+
+  A tuple is genuinely positional on this VM, and beam-lisp's pattern
+  layer already says so: `[p q]` matches an Erlang tuple and a beam-lisp
+  vector alike. But the implementation also encodes several internal
+  values as tagged tuples, and those must stay opaque:
+
+      {:"$blfn", fixed, variadic}   a multi-arity fn
+      {:"$remote", mod, fun}        a remote fn handle
+      {:"$macro", fn}               a macro value
+      {:"$protocol", …}             a protocol value
+      {:"$transient", …}            a transient handle
+      {:symbol, name}               a symbol
+      {:meta, form, m}              a reader form carrying metadata — a macro
+                                    receives these, so they ARE user-reachable
+      {:bl_deftype, mod, fields}    a deftype instance (no map/seq semantics
+                                    BY DESIGN — Clojure's deftype has none)
+      {:bl_reify, ref, captures}    a reify instance (same reason)
+      {:bl_vec, cnt, shift, …}      a vector's internal trie node
+
+  Without this exclusion, making tuples positional would have quietly
+  given every one of them a collection surface: `(count some-fn)` would
+  answer 3, and a `deftype`'s or `reify`'s fields would become readable
+  through `nth` — the exact encapsulation those forms exist to provide.
+
+  The test is the leading element: every internal tag is an atom in a
+  known set, and no user tuple can hold one, because those atoms are not
+  spellable as beam-lisp keywords (`$blfn`) or are reserved names.
+
+  **Adding a new tagged-tuple representation means adding it here.** The
+  list is the single place that decides what is data and what is
+  machinery; `@internal_tuple_tags` is public so a test can assert the
+  two stay in step rather than discovering the omission as `(count
+  some-value)` answering a field count.
+  """
+  defguard is_data_tuple(x)
+           when is_tuple(x) and
+                  (tuple_size(x) == 0 or
+                     not (:erlang.is_atom(:erlang.element(1, x)) and
+                            :erlang.element(1, x) in @internal_tuple_tags))
 end

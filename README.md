@@ -79,7 +79,15 @@ multi-arity and docstrings), **`defmacro` with syntax-quote** (` ` ,
 `recur` with compile-time tail-position checking (loops and fns
 are both targets), `if`, `do`, `quote`, **`receive` with patterns**
 (keywords match themselves, symbols bind, `[p q]` matches tuples
-*and* vectors, `{:k p}` matches maps, `(after ms …)`),
+*and* vectors, `{:k p}` matches maps, nested freely, `(after ms …)`),
+**guards and clause dispatch** — a `:when` guard on any `defn`, `fn`,
+`receive` or `defserver` clause, so same-arity clauses are chosen by
+what is TRUE of their arguments and not just by how many there are
+(`(defn f ([n] :when (pos? n) …) ([n] …))`); guards compile into the
+real BEAM clause head, so a `receive` guard leaves a non-matching
+message in the mailbox rather than consuming it, and anything outside
+the VM's side-effect-free guard dialect is refused at compile time with
+the permitted vocabulary named,
 keywords-as-functions, variadic arithmetic and comparisons
 (`(< 1 2 3)` chains, as Clojure), **`try`/`catch`/`finally` +
 `throw`** (untyped catch-all with normalized errors, typed

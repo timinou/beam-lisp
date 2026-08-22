@@ -41,6 +41,14 @@ defmodule BeamLisp.Wave9AotTest do
     assert math.describe() == "answer=42"
     # macro defined and used in the same file
     assert math.double(21) == 42
+
+    # Three clauses of ONE arity, chosen by their `:when` guards. This is
+    # the AOT-specific risk: the generated namespace module holds shims,
+    # and a shim that dropped its guard would forward every call to the
+    # first clause — `sign(-1)` would answer `:positive`.
+    assert math.sign(5) == :positive
+    assert math.sign(-5) == :negative
+    assert math.sign(0) == :zero
     assert hello.greet("world") == "hi, world!"
     assert hello.shout("loud") == "LOUD"
     # cross-ns :require + :refer + :as all resolve

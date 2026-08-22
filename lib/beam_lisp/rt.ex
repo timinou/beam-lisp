@@ -11,7 +11,7 @@ defmodule BeamLisp.RT do
   # `rem` is seeded as a core prim (Clojure's remainder), so the module
   # must not inherit Kernel.rem/2 — the local def below is the source of
   # truth and every `rem` here (even?/odd?) resolves to it.
-  import BeamLisp.Guards, only: [is_bl_map: 1, is_ref_type: 1]
+  import BeamLisp.Guards, only: [is_bl_map: 1, is_ref_type: 1, is_data_tuple: 1]
   import Kernel, except: [rem: 2]
 
   @multi_fn_tag :"$blfn"
@@ -274,6 +274,10 @@ defmodule BeamLisp.RT do
   def first(str) when is_binary(str), do: str |> seq() |> first()
   def first(%Set{} = s), do: Set.to_list(s) |> List.first()
 
+  # A tuple reads positionally, exactly as a vector does — the same
+  # invariant `nth/2` states. An empty tuple has no first, so nil.
+  def first(t) when is_data_tuple(t), do: if(tuple_size(t) == 0, do: nil, else: elem(t, 0))
+
   # An ordered collection's first is its SMALLEST element — O(log n) via
   # :gb_trees.smallest, never a full materialisation.
   def first(%SortedSet{} = s), do: Sorted.first_key(s)
@@ -322,6 +326,11 @@ defmodule BeamLisp.RT do
   def rest(str) when is_binary(str), do: str |> seq() |> rest_or_empty()
   def rest(%Set{} = s), do: Set.to_list(s) |> tl()
 
+  # A tuple's rest is a LIST, not a tuple: `rest` answers a sequence in
+  # this language (that is why `(rest [1 2])` is not a vector either), and
+  # a shrinking tuple would be a different type at every step.
+  def rest(t) when is_data_tuple(t), do: t |> Tuple.to_list() |> rest_or_empty()
+
   def rest(%SortedSet{} = s), do: Sorted.set_to_list(s) |> rest()
 
   def rest(%SortedMap{} = m), do: sorted_map_entries(m) |> rest()
@@ -359,6 +368,7 @@ defmodule BeamLisp.RT do
 
   def next(str) when is_binary(str), do: next(seq(str))
   def next(%Set{} = s), do: next(Set.to_list(s))
+  def next(t) when is_data_tuple(t), do: next(Tuple.to_list(t))
 
   def next(%SortedSet{} = s), do: next(Sorted.set_to_list(s))
 
@@ -500,6 +510,10 @@ defmodule BeamLisp.RT do
   def count(%Set{} = s), do: Set.count(s)
   def count(%SortedSet{} = s), do: Sorted.set_count(s)
   def count(%SortedMap{} = m), do: Sorted.map_count(m)
+  # A tuple counts its elements. MUST precede the struct clauses below:
+  # a struct is a map, not a tuple, so there is no overlap — but the
+  # ordering keeps the positional shapes together and readable.
+  def count(t) when is_data_tuple(t), do: tuple_size(t)
   # A record's count is its public fields (plus any assoc'd extras) —
   # map_size would count the hidden `__struct__` key too. References are
   # not collections, so they raise before this record clause.
@@ -522,6 +536,22 @@ defmodule BeamLisp.RT do
   def nth(nil, _i), do: nil
   def nth(xs, i) when is_list(xs), do: Enum.at(xs, i)
   def nth(%BeamLisp.Vector{} = v, i), do: BeamLisp.Vector.nth(v, i)
+
+  # An Erlang tuple is a POSITIONAL collection, and the language already
+  # says so where it matters most: a `[p q]` pattern matches a tuple and a
+  # beam-lisp vector alike. The runtime disagreeing with the pattern layer
+  # was the defect — `(let [[a b] some-tuple] …)` raised FunctionClauseError
+  # from inside RT.nth, so every interop site that received a `{:ok, v}`
+  # wrote `(to-list (erlang/tuple_to_list r))` by hand to get a shape the
+  # language could read. That is a conversion the BEAM never needed.
+  #
+  # Lenient like every other sequential access here: out of range is nil,
+  # never an error, so a too-short tuple destructures exactly as a
+  # too-short vector does.
+  def nth(t, i) when is_data_tuple(t) and is_integer(i) and i >= 0,
+    do: if(i < tuple_size(t), do: elem(t, i), else: nil)
+
+  def nth(t, _i) when is_data_tuple(t), do: nil
   def nth(%LazySeq{} = l, i) when is_integer(i) and i >= 0, do: LazySeq.nth(l, i)
   def nth(%LazySeq{} = _l, _i), do: nil
 
@@ -652,6 +682,11 @@ defmodule BeamLisp.RT do
       entries -> entries
     end
   end
+
+  # A tuple seqs to its elements, so `seq`, `first`, `rest`, `nth` and
+  # `count` all agree that a tuple is positional. `nil` for the empty
+  # tuple, matching every other empty collection here.
+  def seq(t) when is_data_tuple(t), do: seq(Tuple.to_list(t))
 
   def seq(%Set{} = s) do
     case Set.to_list(s) do

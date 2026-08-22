@@ -373,12 +373,12 @@ defmodule BeamLisp.Compiler do
       # `(fn step [n] (step (- n 1)))` can recurse (doseq's builder does).
       [first | clauses] ->
         case unwrap_meta(first) do
-          {:symbol, name} -> compile_fn(fn_clauses(clauses), env, name: name)
-          _ -> compile_fn(fn_clauses(args), env)
+          {:symbol, name} -> compile_fn(fn_clauses(clauses, env), env, name: name)
+          _ -> compile_fn(fn_clauses(args, env), env)
         end
 
       clauses ->
-        compile_fn(fn_clauses(clauses), env)
+        compile_fn(fn_clauses(clauses, env), env)
     end
   end
 
@@ -413,7 +413,7 @@ defmodule BeamLisp.Compiler do
       true ->
         compile_def(
           name,
-          {:{}, [], [:"$macro", compile_fn(macro_clauses(fn_clauses(rest)), env, nil_rest: true)]},
+          {:{}, [], [:"$macro", compile_fn(macro_clauses(fn_clauses(rest, env)), env, nil_rest: true)]},
           env,
           doc,
           name_meta(name_form)
@@ -520,7 +520,7 @@ defmodule BeamLisp.Compiler do
 
     {mns, mname} = multi_var_target(env, name)
     dispatch_ast = compile(dispatch_val, notail(env))
-    method_ast = compile_fn(fn_clauses(rest), env)
+    method_ast = compile_fn(fn_clauses(rest, env), env)
 
     quote do
       BeamLisp.Multi.add_method(unquote(mns), unquote(mname), unquote(dispatch_ast), unquote(method_ast))
@@ -883,21 +883,27 @@ defmodule BeamLisp.Compiler do
   # with beam-lisp pattern syntax: literals and keywords match
   # themselves, symbols bind, [p q] is a 2-or-more-tuple, {:k p} a
   # map match. Clause bodies see their pattern's bindings.
+  #
+  # A clause may carry a guard between its pattern and its body:
+  # `(receive [:take n] :when (pos? n) …)`. That is not sugar for an `if`
+  # — a message failing the guard is NOT received, so it stays in the
+  # mailbox for a later clause or a later receive, which is the whole
+  # reason selective receive exists.
   defp compile_special("receive", clauses, env) do
     {after_clauses, normal} =
       Enum.split_with(clauses, &match?({:list, [{:symbol, "after"} | _]}, unwrap_meta(&1)))
 
-    pairs = Enum.chunk_every(normal, 2)
-
-    unless Enum.all?(pairs, &(length(&1) == 2)) do
-      compile_error(env, "receive clauses must be pattern/body pairs")
-    end
-
     do_clauses =
-      Enum.flat_map(pairs, fn [pattern_form, body] ->
+      normal
+      |> receive_clauses(env)
+      |> Enum.flat_map(fn {pattern_form, guard_form, body} ->
         {pat_asts, pat_env} = compile_pattern(pattern_form, env)
+        guard_ast = compile_guard(guard_form, pat_env)
         body_ast = compile(body, pat_env)
-        Enum.map(pat_asts, &{:->, [], [[&1], body_ast]})
+
+        Enum.map(pat_asts, fn pat ->
+          {:->, [], [[guarded(pat, guard_ast)], body_ast]}
+        end)
       end)
 
     block =
@@ -916,6 +922,44 @@ defmodule BeamLisp.Compiler do
 
     {:receive, [], [block]}
   end
+
+  # Split a receive's clause forms into `{pattern, guard | nil, body}`
+  # triples. Written as an explicit walk rather than `chunk_every(2)`
+  # because a guard makes a clause three forms instead of two, and a
+  # fixed chunk silently re-pairs everything after the first guard:
+  # the pattern of clause 2 would become the BODY of clause 1.
+  defp receive_clauses([], _env), do: []
+
+  defp receive_clauses([pattern_form | rest], env) do
+    case split_guard(rest) do
+      {:missing, _} ->
+        compile_error(env, "a receive clause's `:when` must be followed by a guard expression")
+
+      {guard_form, [body | tail]} ->
+        [{pattern_form, guard_form, body} | receive_clauses(tail, env)]
+
+      {_guard_form, []} ->
+        compile_error(
+          env,
+          "receive clauses are pattern/body pairs (with an optional `:when` guard " <>
+            "between them); the last clause has a pattern but no body"
+        )
+    end
+  end
+
+  # Attach a guard to a clause head, or leave the head bare when there is
+  # none. One helper so `receive` and `defserver` cannot drift on how a
+  # guard is spliced.
+  defp guarded(pat, nil), do: pat
+  defp guarded(pat, guard_ast), do: {:when, [], [pat, guard_ast]}
+
+  # The same, for a head that is a LIST of parameters (an `fn` clause).
+  # Elixir spells a guarded multi-parameter head as ONE `when` node whose
+  # children are the params followed by the guard, so the args list
+  # collapses to a single element — which is why this cannot just call
+  # `guarded/2` per param.
+  defp guarded_head(head_vars, nil), do: head_vars
+  defp guarded_head(head_vars, guard_ast), do: [{:when, [], head_vars ++ [guard_ast]}]
 
   # A docstring is a string literal followed by more forms; anything
   # else keeps today's meaning (first form is a clause / the value).
@@ -1056,13 +1100,88 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  # A receive pattern, compiled with its bindings added to the env.
-  # Returns one or more pattern ASTs (a vector pattern matches both
-  # Erlang tuples and beam-lisp vectors — one clause each).
-  # A receive pattern may carry a reader position wrapper; unwrap it for
-  # the shape clauses below while nested items stay wrapped so their own
-  # positions re-capture when compiled.
-  defp compile_pattern(form, env), do: compile_pattern_bare(unwrap_meta(form), env)
+  # A message pattern, compiled with its bindings added to the env.
+  # Shared by `receive` and by `defserver`'s dispatching callbacks.
+  #
+  # Returns one or more pattern ASTs — ALTERNATIVES, all binding the same
+  # variables, which the caller emits as sibling clauses with one body.
+  # A vector pattern is the reason there is ever more than one: `[p q]`
+  # matches an Erlang tuple AND a beam-lisp vector, and those are two
+  # different BEAM shapes, so each needs its own clause.
+  #
+  # Alternatives MULTIPLY through nesting: `[:a [:b n]]` is two shapes for
+  # the outer times two for the inner. That product is what the callers
+  # need and what compile_alternatives/2 computes; the previous code
+  # assumed every sub-pattern yielded exactly one AST and crashed with a
+  # raw MatchError from inside the compiler the moment a vector held a
+  # vector (BUG-002).
+  #
+  # A pattern may carry a reader position wrapper; unwrap it for the shape
+  # clauses below while nested items stay wrapped so their own positions
+  # re-capture when compiled.
+
+  # The product is bounded: each nested vector doubles the clause count,
+  # and past a ceiling this refuses BY NAME rather than quietly emitting
+  # hundreds of identical bodies. Checked HERE, the one place every
+  # pattern node passes through, so the number in the message is the
+  # number of clauses that would really be emitted.
+  @max_pattern_alternatives 64
+
+  defp compile_pattern(form, env) do
+    {alts, env} = compile_pattern_bare(unwrap_meta(form), env)
+
+    if length(alts) > @max_pattern_alternatives do
+      too_many_alternatives(env, length(alts))
+    end
+
+    {alts, env}
+  end
+
+  # Compile sub-patterns left to right, threading the env, and return the
+  # product of their alternatives: `[[a1, b1], [a1, b2], [a2, b1], …]`.
+  #
+  # Every alternative of one sub-pattern binds the SAME fresh vars (they
+  # are generated once, before the shapes are built), so the env threads
+  # linearly even though the shapes multiply — which is exactly why one
+  # body can serve every clause.
+  defp compile_alternatives(forms, env) do
+    {alt_lists, env} =
+      Enum.map_reduce(forms, env, fn form, acc_env ->
+        compile_pattern(form, acc_env)
+      end)
+
+    # The product is counted BEFORE it is built. Each child is individually
+    # under the ceiling (compile_pattern/2 enforces that), but the product
+    # of several such children is not: six items at 16 alternatives each is
+    # 16^6 ≈ 17 million combinations, which would exhaust the compiler while
+    # building the very list whose length was going to be rejected.
+    #
+    # Multiplying the lengths answers the same question for the cost of a
+    # few integers, so an over-large pattern is refused instantly.
+    count = Enum.reduce(alt_lists, 1, fn alts, acc -> acc * length(alts) end)
+
+    if count > @max_pattern_alternatives do
+      too_many_alternatives(env, count)
+    end
+
+    combos =
+      Enum.reduce(alt_lists, [[]], fn alts, acc ->
+        for prefix <- acc, alt <- alts, do: prefix ++ [alt]
+      end)
+
+    {combos, env}
+  end
+
+  defp too_many_alternatives(env, count) do
+    compile_error(
+      env,
+      "this pattern nests too deeply: a vector pattern matches both a tuple and a " <>
+        "beam-lisp vector, and those alternatives multiply through nesting, so " <>
+        "#{count} clauses would be generated (the ceiling is " <>
+        "#{@max_pattern_alternatives}). Match the outer shape and destructure the " <>
+        "rest in the body with `let`."
+    )
+  end
 
   defp compile_pattern_bare({:symbol, "_"}, env), do: {[{:_, [], __MODULE__}], env}
 
@@ -1073,37 +1192,42 @@ defmodule BeamLisp.Compiler do
 
   defp compile_pattern_bare({:keyword, name}, env), do: {[BeamLisp.AtomGuard.to_atom(name)], env}
 
+  # `[p q]` matches an Erlang tuple and a beam-lisp vector alike, because
+  # a small vector IS an element tuple wrapped in a struct. Both shapes
+  # are emitted for every combination of the items' own alternatives, so
+  # a nested `[:a [:b n]]` names all four and the body is written once.
   defp compile_pattern_bare({:vector, items}, env) do
-    {pats, env} =
-      Enum.map_reduce(items, env, fn item, acc_env ->
-        {[pat], acc_env} = compile_pattern(item, acc_env)
-        {pat, acc_env}
+    {combos, env} = compile_alternatives(items, env)
+
+    pats =
+      Enum.flat_map(combos, fn pats ->
+        tuple_pat = {:{}, [], pats}
+
+        vector_pat =
+          {:%, [],
+           [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_pat]}]}
+
+        [tuple_pat, vector_pat]
       end)
 
-    tuple_pat = {:{}, [], pats}
-
-    vector_pat =
-      {:%, [],
-       [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_pat]}]}
-
-    {[tuple_pat, vector_pat], env}
+    {pats, env}
   end
 
   defp compile_pattern_bare({:map, kvs}, env) do
-    {pairs, env} =
-      Enum.map_reduce(kvs, env, fn {k, v}, acc_env ->
-        key =
-          case unwrap_meta(k) do
-            {:keyword, name} -> String.to_atom(name)
-            lit when is_number(lit) or is_binary(lit) -> lit
-            other -> raise "unsupported map pattern key: #{inspect(other)}"
-          end
-
-        {[pat], acc_env} = compile_pattern(v, acc_env)
-        {{key, pat}, acc_env}
+    keys =
+      Enum.map(kvs, fn {k, _v} ->
+        case unwrap_meta(k) do
+          {:keyword, name} -> BeamLisp.AtomGuard.to_atom(name)
+          lit when is_number(lit) or is_binary(lit) -> lit
+          other -> compile_error(env, "unsupported map pattern key: #{inspect(other)}")
+        end
       end)
 
-    {[{:%{}, [], pairs}], env}
+    {combos, env} = compile_alternatives(Enum.map(kvs, &elem(&1, 1)), env)
+
+    pats = Enum.map(combos, fn vals -> {:%{}, [], Enum.zip(keys, vals)} end)
+
+    {pats, env}
   end
 
   defp compile_pattern_bare({:list, [{:symbol, "quote"}, form]}, env) do
@@ -1114,8 +1238,13 @@ defmodule BeamLisp.Compiler do
        when is_number(lit) or is_binary(lit) or is_boolean(lit) or is_nil(lit),
        do: {[lit], env}
 
-  defp compile_pattern_bare(other, _env),
-    do: raise("unsupported receive pattern: #{inspect(other)}")
+  defp compile_pattern_bare(other, env),
+    do:
+      compile_error(
+        env,
+        "unsupported message pattern: #{inspect(other)} " <>
+          "(a pattern is a literal, a keyword, a symbol, `[p q]`, `{:k p}` or `(quote datum)`)"
+      )
 
   # Shared expansion for `defn` and `defn-`: peel the optional leading
   # docstring, then hand the clauses to compile_defn with the private
@@ -1137,7 +1266,7 @@ defmodule BeamLisp.Compiler do
         )
 
       true ->
-        compile_defn(name, fn_clauses(rest), env, doc, private, attr)
+        compile_defn(name, fn_clauses(rest, env), env, doc, private, attr)
     end
   end
 
@@ -1182,8 +1311,21 @@ defmodule BeamLisp.Compiler do
         do: [file: env[:file], line: pos_line(env[:line]) || 1],
         else: [file: __ENV__.file, line: __ENV__.line]
 
+    # Compiled in SOURCE order, then EMITTED grouped by shape.
+    #
+    # Same-name/arity `def` clauses must be adjacent in an Elixir module —
+    # interleaving arities (`[x]`, `[x y]`, `[x]`) still compiles correctly
+    # but earns a "clauses with the same name should be grouped together"
+    # warning per clause, blaming generated code for the author's ordering.
+    #
+    # The two orders are separated deliberately. Compiling a body EXPANDS
+    # ITS MACROS, which is observable (a macro may gensym or carry state),
+    # so compilation follows the source. Only the emitted list is
+    # rearranged, and within each shape the clauses keep their written
+    # order — which is the order their guards are tried in.
     entries =
-      Enum.map(clauses, fn {params, body} ->
+      clauses
+      |> Enum.map(fn {params, guard, body} ->
         {_fixed, rest} = split_variadic(params)
 
         {kind, fname} =
@@ -1192,12 +1334,16 @@ defmodule BeamLisp.Compiler do
             _ -> {:variadic, String.to_atom(name <> "__bl_v")}
           end
 
-        {head_vars, body_ast, fixed_count, _v?} =
-          compile_clause(env, params, body, %{self_call: {mod, fname}})
+        {head_vars, guard_ast, body_ast, fixed_count, _v?} =
+          compile_clause(env, params, guard, body, %{self_call: {mod, fname}})
 
-        def_ast = {:def, def_line, [{fname, [], head_vars}, [do: body_ast]]}
+        def_ast =
+          {:def, def_line, [guarded({fname, [], head_vars}, guard_ast), [do: body_ast]]}
+
         {kind, fixed_count, fname, def_ast}
       end)
+      |> group_by_shape(fn {kind, fixed_count, _fname, _def} -> {kind, fixed_count} end)
+      |> Enum.concat()
 
     defvar_ast =
       quote do
@@ -1259,13 +1405,49 @@ defmodule BeamLisp.Compiler do
   # A `:pattern` callback (`handle-call`, `handle-cast`, `handle-info`) carries
   # a message pattern before the param vector; the pattern lands in the def
   # head so OTP dispatches on it, and the remaining params bind like a fn.
+  #
+  # An optional `:when` guard sits between the pattern and the param
+  # vector: `(handle-call [:take n] :when (pos? n) [_from state] …)`. It
+  # compiles into the def head, so OTP's own dispatch rejects the clause
+  # and a later one answers — a validity test that lives in the CONTRACT
+  # rather than in the body, which is what lets a server reply differently
+  # to a bad request without a nested `if` in every handler.
+  #
+  # The guard is compiled against the message env only: the param vector
+  # binds `from`/`state` AFTER it, and a guard cannot see a variable bound
+  # to its right in the head anyway.
   defp server_clause_defs({:list, [_head | rest]}, fname, :pattern, env, def_line) do
-    [pat_form, params_form | body] = rest
-    {params, body} = server_params(params_form, body)
-    {pat_asts, msg_env} = compile_pattern(pat_form, env)
-    {head_vars, preludes, clause_env} = bind_params(msg_env, params)
-    body_ast = compile_server_body(preludes ++ body, clause_env)
-    Enum.map(pat_asts, &{:def, def_line, [{fname, [], [&1 | head_vars]}, [do: body_ast]]})
+    [pat_form | rest] = rest
+
+    {guard_form, rest} =
+      case split_guard(rest) do
+        {:missing, _} ->
+          compile_error(env, "defserver: `:when` must be followed by a guard expression")
+
+        pair ->
+          pair
+      end
+
+    case rest do
+      [params_form | body] ->
+        {params, body} = server_params(params_form, body)
+        {pat_asts, msg_env} = compile_pattern(pat_form, env)
+        guard_ast = compile_guard(guard_form, msg_env)
+        {head_vars, preludes, clause_env} = bind_params(msg_env, params)
+        body_ast = compile_server_body(preludes ++ body, clause_env)
+
+        Enum.map(pat_asts, fn pat ->
+          head = {fname, [], [pat | head_vars]}
+          {:def, def_line, [guarded(head, guard_ast), [do: body_ast]]}
+        end)
+
+      [] ->
+        compile_error(
+          env,
+          "defserver: a #{fname} clause is `(#{String.replace(to_string(fname), "_", "-")} " <>
+            "PATTERN [params…] body…)` — this one has a pattern but no parameter vector"
+        )
+    end
   end
 
   defp server_params({:vector, params}, body), do: {params, body}
@@ -1316,8 +1498,13 @@ defmodule BeamLisp.Compiler do
   defp server_defaults(:handle_cast),
     do: [default_def(:handle_cast, [:msg, :state], stuple([:stop, stuple([:bad_cast, {:var, :msg}]), {:var, :state}]))]
 
+  # `_msg`, not `msg`: this default DISCARDS the message (an unexpected
+  # info is not an error — OTP delivers monitor and system messages here),
+  # and naming a variable it never reads made every server that omitted
+  # `handle-info` emit an "unused variable" warning pointing at the user's
+  # `defserver` line, blaming their code for the compiler's default.
   defp server_defaults(:handle_info),
-    do: [default_def(:handle_info, [:msg, :state], stuple([:noreply, {:var, :state}]))]
+    do: [default_def(:handle_info, [:_msg, :state], stuple([:noreply, {:var, :state}]))]
 
   defp server_defaults(:terminate), do: [default_def(:terminate, [:_reason, :_state], :ok)]
   defp server_defaults(:code_change), do: [default_def(:code_change, [:_old_vsn, :state, :_extra], stuple([:ok, {:var, :state}]))]
@@ -1752,25 +1939,55 @@ defmodule BeamLisp.Compiler do
   end
 
   # `(fn [p…] body…)` and `(fn ([p…] body…) ([p q…] body…))` both
-  # normalize to a list of `{params, body}` clauses; the same
+  # normalize to a list of `{params, guard, body}` clauses; the same
   # normalization covers single- and multi-arity `defn`.
-  defp fn_clauses([{:vector, params} | body]), do: [{params, body}]
+  #
+  # A clause may carry a `:when` guard between its parameter vector and
+  # its body. That keyword was previously READ AS A BODY FORM — it
+  # evaluated to itself and was discarded, so `(defn f [x] :when (number? x)
+  # …)` compiled, ran, and applied no guard whatsoever. Silence on a
+  # construct the author clearly meant is the worst of the three options
+  # (guard / error / ignore), so it now means what it looks like.
+  defp fn_clauses([{:vector, params} | body], env) do
+    {guard, body} = clause_guard(body, env)
+    [{params, guard, body}]
+  end
 
-  defp fn_clauses(clauses) do
+  defp fn_clauses(clauses, env) do
     Enum.map(clauses, fn clause ->
       case unwrap_meta(clause) do
-        {:list, [{:vector, params} | body]} -> {params, body}
-        other -> raise "invalid fn clause: #{inspect(other)}"
+        {:list, [{:vector, params} | body]} ->
+          {guard, body} = clause_guard(body, env)
+          {params, guard, body}
+
+        other ->
+          compile_error(
+            env,
+            "invalid fn clause: #{inspect(other)} (a clause is `([params…] body…)`)"
+          )
       end
     end)
+  end
+
+  defp clause_guard(body, env) do
+    case split_guard(body) do
+      {:missing, _} ->
+        compile_error(env, "`:when` must be followed by a guard expression")
+
+      {guard, []} when guard != nil ->
+        compile_error(env, "a guarded clause still needs a body after its `:when` guard")
+
+      pair ->
+        pair
+    end
   end
 
   # Every macro fn receives `&form`/`&env` as its first two params — the
   # whole call form and the compile-time env — whether or not the body
   # names them. Inject them so `&form`/`&env` resolve as locals;
   # expand_macro always prepends the matching values.
-  defp macro_clauses([{params, body} | rest]),
-    do: [{macro_params(params), body} | macro_clauses(rest)]
+  defp macro_clauses([{params, guard, body} | rest]),
+    do: [{macro_params(params), guard, body} | macro_clauses(rest)]
 
   defp macro_clauses([]), do: []
 
@@ -1786,24 +2003,48 @@ defmodule BeamLisp.Compiler do
   # fn is wrapped in self-application, and `recur` in tail position
   # re-enters it in constant stack. Inner fns shadow outer targets,
   # so recur never crosses a fn boundary.
+  #
+  # Clauses of the SAME arity are grouped into ONE Elixir fn with several
+  # `->` clauses, which is how a guard earns its keep here: the BEAM picks
+  # the first whose guard holds. Before grouping, `$blfn`'s dispatch map
+  # was keyed by arity alone, so a second same-arity clause silently
+  # replaced the first — dead code that looked live.
+  #
+  # `recur` inside a grouped fn re-enters the DISPATCHER, not the clause it
+  # was written in, so a recur whose new arguments fail this clause's guard
+  # lands in the next one. That is the useful reading (it is what makes a
+  # guarded loop able to change mode) and the only one available: the
+  # clauses share a self-application wrapper, because they share one fn.
   defp compile_fn(clauses, env, opts \\ []) do
     nil_rest = Keyword.get(opts, :nil_rest, false)
     fn_name = Keyword.get(opts, :name)
 
-    compiled =
-      Enum.map(clauses, fn {params, body} ->
-        self = fresh_var("fnself")
+    # One `self` var per SHAPE, allocated before anything is compiled: the
+    # shape is readable from the params alone, and every clause of a shape
+    # must recur into the same dispatcher.
+    selves =
+      clauses
+      |> Enum.map(fn {params, _, _} -> clause_shape(params) end)
+      |> Enum.uniq()
+      |> Map.new(fn shape -> {shape, fresh_var("fnself")} end)
 
-        {head_vars, body_ast, fixed_count, variadic?} =
-          compile_clause(env, params, body, %{self: self}, nil_rest, fn_name)
-        fn_ast = self_apply(self, {:fn, [], [{:->, [], [head_vars, body_ast]}]})
+    # Compiled in SOURCE order (macro expansion is observable), then grouped
+    # for emission.
+    compiled_clauses =
+      Enum.map(clauses, fn {params, guard, body} ->
+        shape = clause_shape(params)
+        self = Map.fetch!(selves, shape)
 
-        if variadic? do
-          {:variadic, fixed_count, fn_ast}
-        else
-          {:fixed, fixed_count, fn_ast}
-        end
+        {head_vars, guard_ast, body_ast, _n, _v?} =
+          compile_clause(env, params, guard, body, %{self: self}, nil_rest, fn_name)
+
+        {shape, self, guard_ast, {head_vars, body_ast}}
       end)
+
+    compiled =
+      compiled_clauses
+      |> group_by_shape(fn {shape, _, _, _} -> shape end)
+      |> Enum.map(&compile_fn_group/1)
 
     case compiled do
       [{:fixed, _arity, fn_ast}] ->
@@ -1826,6 +2067,54 @@ defmodule BeamLisp.Compiler do
     end
   end
 
+  # The dispatch identity of a clause: `{:fixed, n}` or `{:variadic, n}`.
+  # Two clauses share an Elixir fn exactly when they share this.
+  defp clause_shape(params) do
+    {fixed, rest} = split_variadic(params)
+    if rest == nil, do: {:fixed, length(fixed)}, else: {:variadic, length(fixed)}
+  end
+
+  # Group ALREADY-COMPILED items by shape, keeping source order within each
+  # group and ordering groups by first appearance.
+  #
+  # Grouping is by shape, NOT by adjacency: Clojure conventionally writes
+  # arities in ascending order, but nothing enforces it, and a chunk of
+  # adjacent clauses would put two non-adjacent same-arity clauses in two
+  # groups — reintroducing the silent-overwrite bug for exactly the
+  # authors who interleaved.
+  #
+  # It takes COMPILED items rather than source clauses because compiling a
+  # body EXPANDS ITS MACROS, and macro expansion is observable: a macro
+  # that gensyms, counts, or otherwise carries state would see clauses in
+  # grouped order rather than the order they were written. Compilation
+  # order is the author's; emission order is the BEAM's requirement. Only
+  # the second one gets rearranged.
+  defp group_by_shape(items, shape_of) do
+    items
+    |> Enum.group_by(shape_of)
+    |> Enum.sort_by(fn {shape, _} ->
+      Enum.find_index(items, fn item -> shape_of.(item) == shape end)
+    end)
+    |> Enum.map(fn {_shape, group} -> group end)
+  end
+
+  # One arity's clauses → one self-applied Elixir fn. The `self` var is
+  # created ONCE for the group, because every clause recurs into the same
+  # dispatcher.
+  defp compile_fn_group([{shape, self, _, _} | _] = group) do
+    fn_clause_asts =
+      Enum.map(group, fn {_shape, _self, guard_ast, {head_vars, body_ast}} ->
+        {:->, [], [guarded_head(head_vars, guard_ast), body_ast]}
+      end)
+
+    fn_ast = self_apply(self, {:fn, [], fn_clause_asts})
+
+    case shape do
+      {:fixed, n} -> {:fixed, n, fn_ast}
+      {:variadic, n} -> {:variadic, n, fn_ast}
+    end
+  end
+
   # `(fn s -> fn … -> body end end).(itself)` — self-application,
   # tail-call-optimized on the BEAM; shared by loop and fn recur.
   defp self_apply(self, inner_fn) do
@@ -1833,12 +2122,19 @@ defmodule BeamLisp.Compiler do
     {{:., [], [outer_fn]}, [], [outer_fn]}
   end
 
-  # Compile one `{params, body}` fn clause. Returns
-  # `{head_vars, body_ast, fixed_param_count, variadic?}`; the
+  # Compile one `{params, guard, body}` fn clause. Returns
+  # `{head_vars, guard_ast, body_ast, fixed_param_count, variadic?}`; the
   # caller picks the recur target via `recur_spec` (`%{self: var}`
   # for anonymous fns, `%{self_call: {mod, fname}}` for linked
   # defns) and decides how to wrap the result.
-  defp compile_clause(env, params, body, recur_spec, nil_rest \\ false, fn_name \\ nil) do
+  #
+  # The guard is compiled against the env AFTER the params bind, so it
+  # sees every name the head established — including destructured ones,
+  # whose bindings are body preludes rather than head vars. A guard over
+  # a destructured name would therefore reference a variable that is not
+  # yet bound when the BEAM evaluates the head, which is why
+  # `guardable_env/2` narrows what a guard may see to the head vars.
+  defp compile_clause(env, params, guard, body, recur_spec, nil_rest \\ false, fn_name \\ nil) do
     {fixed, rest} = split_variadic(params)
     {head_vars, preludes, clause_env} = bind_params(env, fixed)
 
@@ -1900,8 +2196,23 @@ defmodule BeamLisp.Compiler do
         fn_env
       end
 
+    # A guard runs BEFORE the body, so it can only see the head's own
+    # variables — a destructured name is bound by a body prelude that has
+    # not run yet. Compiling against the narrowed env turns what would be
+    # an "undefined variable" from generated Elixir into this language's
+    # own message, naming the parameter and the reason.
+    guard_ast = compile_guard(guard, guardable_env(clause_env, head_vars))
+
     body_ast = block(preludes ++ rest_prelude ++ [block_forms(body, fn_env)])
-    {head_vars, body_ast, length(fixed), rest != nil}
+    {head_vars, guard_ast, body_ast, length(fixed), rest != nil}
+  end
+
+  # The env a guard may read: only the locals bound to a variable that is
+  # actually in the clause head. Everything else — destructured names,
+  # outer closure locals — is out of scope for a BEAM guard.
+  defp guardable_env(env, head_vars) do
+    in_head = MapSet.new(head_vars)
+    %{env | locals: Map.filter(env.locals, fn {_name, ast} -> MapSet.member?(in_head, ast) end)}
   end
 
   defp split_variadic(params) do
@@ -2266,7 +2577,7 @@ defmodule BeamLisp.Compiler do
     case unwrap_meta(form) do
       {:list, [{:symbol, m} | rest]} ->
         if rest == [], do: raise("defprotocol method #{m}: expected a body")
-        {m, compile_fn(fn_clauses(rest), env)}
+        {m, compile_fn(fn_clauses(rest, env), env)}
 
       other ->
         raise("expected (method-name [args]…) implementation, got #{inspect(other)}")
@@ -2622,6 +2933,290 @@ defmodule BeamLisp.Compiler do
       n when is_integer(n) -> n
       other -> raise "expected an integer literal, got #{inspect(other)}"
     end
+  end
+
+  # ── guards ─────────────────────────────────────────────────────────
+  #
+  # A pattern says what SHAPE a message has; a guard says what must be
+  # TRUE of the values it bound. The BEAM tests both before committing to
+  # a clause, which is what makes `(handle-call [:take n] :when (> n 0) …)`
+  # different from an `if` in the body: a message that fails the guard was
+  # never received by that clause, so a later clause — or the mailbox —
+  # still gets it.
+  #
+  # Guards are a RESTRICTED dialect on every BEAM language, not a subset
+  # anyone chose here: the VM evaluates them without calling user code, so
+  # only BIFs it can prove side-effect-free are allowed. A guard that
+  # reaches outside that set is refused BY NAME, at compile time, with the
+  # allowed set named — the alternative is `illegal guard expression` from
+  # deep inside Elixir, pointing at generated AST rather than at the
+  # source line the user wrote.
+
+  # beam-lisp name -> the guard-safe test it emits. The type predicates
+  # are the language's own spellings (`int?`, `keyword?`, `vector?`),
+  # mapped onto the BIF or the `defguard` that means the same thing, so a
+  # guard reads like the rest of the language rather than like Erlang.
+  # Two kinds of entry, tagged so they cannot be confused: `{:bif, mod,
+  # fun, arity}` emits a direct BIF call, `{:expand, tag, arity}` expands
+  # through guard_special/2 because no single BIF means the same thing.
+  # (Discriminating on the module being an atom does NOT work — `:guard_nil`
+  # is an atom too, and Elixir's type checker caught exactly that.)
+  @guard_bifs %{
+    "=" => {:bif, :erlang, :==, 2},
+    "==" => {:bif, :erlang, :==, 2},
+    "not=" => {:bif, :erlang, :"/=", 2},
+    "<" => {:bif, :erlang, :<, 2},
+    ">" => {:bif, :erlang, :>, 2},
+    "<=" => {:bif, :erlang, :"=<", 2},
+    ">=" => {:bif, :erlang, :>=, 2},
+    "+" => {:bif, :erlang, :+, 2},
+    "-" => {:bif, :erlang, :-, 2},
+    "*" => {:bif, :erlang, :*, 2},
+    "rem" => {:bif, :erlang, :rem, 2},
+    "tuple-size" => {:bif, :erlang, :tuple_size, 1},
+    "int?" => {:bif, :erlang, :is_integer, 1},
+    "float?" => {:bif, :erlang, :is_float, 1},
+    "number?" => {:bif, :erlang, :is_number, 1},
+    "string?" => {:bif, :erlang, :is_binary, 1},
+    "fn?" => {:expand, :guard_fn, 1},
+    "tuple?" => {:bif, :erlang, :is_tuple, 1},
+    "list?" => {:bif, :erlang, :is_list, 1},
+    "pid?" => {:bif, :erlang, :is_pid, 1},
+    "ref?" => {:bif, :erlang, :is_reference, 1},
+    "port?" => {:bif, :erlang, :is_port, 1},
+    "nil?" => {:expand, :guard_nil, 1},
+    "some?" => {:expand, :guard_some, 1},
+    "true?" => {:expand, :guard_true, 1},
+    "keyword?" => {:expand, :guard_keyword, 1},
+    "map?" => {:expand, :guard_map, 1},
+    "vector?" => {:expand, :guard_vector, 1},
+    "zero?" => {:expand, :guard_zero, 1},
+    "pos?" => {:expand, :guard_pos, 1},
+    "neg?" => {:expand, :guard_neg, 1}
+  }
+
+  # `(when guard)` peeled off a clause: `{guard_form | nil, rest}`.
+  # `:when` is a KEYWORD in the clause, not a symbol, so it can never
+  # collide with a user's var and it reads the way Elixir's `when` does.
+  defp split_guard([{:keyword, "when"}, guard | rest]), do: {guard, rest}
+
+  defp split_guard([form | rest] = all) do
+    case unwrap_meta(form) do
+      {:keyword, "when"} ->
+        case rest do
+          [guard | tail] -> {guard, tail}
+          [] -> {:missing, all}
+        end
+
+      _ ->
+        {nil, all}
+    end
+  end
+
+  defp split_guard([]), do: {nil, []}
+
+  # Compile a guard expression in the restricted dialect. `nil` in means
+  # no guard, so callers can pass the result straight through.
+  defp compile_guard(nil, _env), do: nil
+  defp compile_guard(form, env), do: compile_guard_form(unwrap_meta(form), env)
+
+  # `and`/`or`/`not` are guard-legal as the short-circuit operators
+  # (`andalso`/`orelse`), which is what beam-lisp's macros mean anyway.
+  defp compile_guard_form({:list, [{:symbol, "and"} | args]}, env),
+    do: guard_fold(:andalso, args, env, true)
+
+  defp compile_guard_form({:list, [{:symbol, "or"} | args]}, env),
+    do: guard_fold(:orelse, args, env, false)
+
+  defp compile_guard_form({:list, [{:symbol, "not"}, arg]}, env),
+    do: {{:., [], [:erlang, :not]}, [], [compile_guard(arg, env)]}
+
+  defp compile_guard_form({:list, [head | args]} = form, env) do
+    name = name_of_guard_head(head, env, form)
+
+    case Map.fetch(@guard_bifs, name) do
+      {:ok, {:bif, mod, fun, arity}} ->
+        check_guard_arity(name, arity, args, env, form)
+        {{:., [], [mod, fun]}, [], Enum.map(args, &compile_guard(&1, env))}
+
+      {:ok, {:expand, tag, arity}} ->
+        check_guard_arity(name, arity, args, env, form)
+        guard_special(tag, Enum.map(args, &compile_guard(&1, env)))
+
+      :error ->
+        compile_error(
+          env,
+          "`#{name}` is not allowed in a guard. The BEAM evaluates guards without " <>
+            "calling user code, so only side-effect-free tests are permitted: " <>
+            "#{guard_vocabulary()}. Move the rest into the clause body.",
+          form
+        )
+    end
+  end
+
+  # A bare symbol in a guard is a variable the pattern bound (or a local);
+  # anything else has no meaning there. `local?` is the check because a
+  # guard can only see what the clause head established.
+  defp compile_guard_form({:symbol, name} = form, env) do
+    if local?(env, name) do
+      local(env, name)
+    else
+      compile_error(
+        env,
+        "`#{name}` is not bound by this clause's pattern, so it cannot appear in its " <>
+          "guard — a guard sees only the variables the head binds.",
+        form
+      )
+    end
+  end
+
+  defp compile_guard_form({:keyword, name}, _env), do: BeamLisp.AtomGuard.to_atom(name)
+
+  defp compile_guard_form(lit, _env)
+       when is_number(lit) or is_binary(lit) or is_boolean(lit) or is_nil(lit),
+       do: lit
+
+  defp compile_guard_form(other, env),
+    do:
+      compile_error(
+        env,
+        "a guard is a test over the variables the pattern bound, built from " <>
+          "#{guard_vocabulary()} — got #{inspect(other)}.",
+        other
+      )
+
+  defp name_of_guard_head(head, env, form) do
+    case unwrap_meta(head) do
+      {:symbol, name} ->
+        name
+
+      other ->
+        compile_error(
+          env,
+          "a guard call needs a named test in head position, got #{inspect(other)}.",
+          form
+        )
+    end
+  end
+
+  defp check_guard_arity(name, arity, args, env, form) do
+    unless length(args) == arity do
+      compile_error(
+        env,
+        "`#{name}` takes #{arity} argument(s) in a guard, got #{length(args)}.",
+        form
+      )
+    end
+  end
+
+  # Variadic `and`/`or` fold into nested short-circuit pairs; the empty
+  # case is the identity, matching the macros in core.bl.
+  defp guard_fold(_op, [], _env, identity), do: identity
+  defp guard_fold(_op, [one], env, _identity), do: compile_guard(one, env)
+
+  defp guard_fold(op, [h | t], env, identity),
+    do: {{:., [], [:erlang, op]}, [], [compile_guard(h, env), guard_fold(op, t, env, identity)]}
+
+  # The predicates with no single BIF behind them. Each expands to the
+  # guard an author would hand-write, so the emitted guard is exactly as
+  # cheap as the hand-written one — `defguard`'s whole point.
+  defp guard_special(:guard_nil, [x]), do: {{:., [], [:erlang, :"=:="]}, [], [x, nil]}
+  defp guard_special(:guard_some, [x]), do: {{:., [], [:erlang, :"=/="]}, [], [x, nil]}
+  defp guard_special(:guard_true, [x]), do: {{:., [], [:erlang, :"=:="]}, [], [x, true]}
+
+  # `fn?` is TRUE for a tagged multi-arity fn and a remote handle, not just
+  # a bare BEAM function — `RT.fn?/1` says so, and a guard that answered
+  # differently would make `(fn? f)` and `:when (fn? f)` disagree about the
+  # same value. A predicate whose guard form means something narrower than
+  # its function form is a trap, not an optimization.
+  defp guard_special(:guard_fn, [x]) do
+    quote do
+      :erlang.is_function(unquote(x)) or
+        (:erlang.is_tuple(unquote(x)) and :erlang.tuple_size(unquote(x)) == 3 and
+           :erlang.element(1, unquote(x)) in [:"$blfn", :"$remote"])
+    end
+  end
+
+  # A keyword IS an atom here, minus the three atoms that are not
+  # keywords in this language — the same rule `RT.keyword?/1` applies.
+  defp guard_special(:guard_keyword, [x]) do
+    quote do
+      :erlang.is_atom(unquote(x)) and unquote(x) !== true and unquote(x) !== false and
+        unquote(x) !== nil
+    end
+  end
+
+  # `map?` must mean here exactly what `RT.map?/1` means, which is NOT
+  # "a plain map": a RECORD is a user-facing map in this language (`count`,
+  # `seq`, `get`, `assoc` all treat it as one), and a sorted map is a map
+  # too. Only the non-map structs — vectors, sets, lazy seqs, refs — are
+  # excluded.
+  #
+  # An earlier version of this guard excluded EVERY struct. It was the
+  # `is_bl_map/1` invariant misapplied: that guard exists for RT's internal
+  # clause dispatch, where records are routed by a separate earlier clause.
+  # Copying it here dropped the records that clause would have caught, so
+  # `(map? rec)` was true while `:when (map? rec)` fell through.
+  #
+  # Records cannot be recognised in a guard by name (the registry is a
+  # runtime lookup), so the test is structural and matches RT's clause
+  # order: a plain map, a SortedMap, or a struct that is NOT one of the
+  # known non-map struct kinds.
+  # is_map-ok (below): emitted AST for a USER module, where is_bl_map/1 is
+  # unavailable — and this is deliberately the "any map, then discriminate"
+  # case, since records and sorted maps must be ACCEPTED. The struct kinds
+  # to exclude are listed inline right after.
+  defp guard_special(:guard_map, [x]) do
+    quote do
+      # is_map-ok: any map, discriminated by the struct list below.
+      :erlang.is_map(unquote(x)) and
+        (not :erlang.is_map_key(:__struct__, unquote(x)) or
+           not (:erlang.map_get(:__struct__, unquote(x)) in [
+                  BeamLisp.Vector,
+                  BeamLisp.Set,
+                  BeamLisp.LazySeq,
+                  BeamLisp.Sorted.SortedSet,
+                  BeamLisp.Atom,
+                  BeamLisp.Volatile,
+                  BeamLisp.Promise,
+                  BeamLisp.Future,
+                  BeamLisp.Reduced
+                ]))
+    end
+  end
+
+  # The OPPOSITE case to `map?`: this guard WANTS a struct, and one
+  # specific struct at that (`BeamLisp.Vector`), so `is_bl_map/1` — which
+  # exists to EXCLUDE structs — would be exactly wrong here.
+  defp guard_special(:guard_vector, [x]) do
+    quote do
+      # is_map-ok: a struct test, not a map test — the is_map is the BEAM's
+      # precondition for reading :__struct__, and the very next term
+      # requires that key to be present.
+      :erlang.is_map(unquote(x)) and :erlang.is_map_key(:__struct__, unquote(x)) and
+        :erlang.map_get(:__struct__, unquote(x)) === BeamLisp.Vector
+    end
+  end
+
+  # `zero?`/`pos?`/`neg?` are BARE comparisons, exactly as `RT.zero?/1` and
+  # friends are (`def pos?(x), do: x > 0`). On the BEAM `>` is a total order
+  # over every term, so `(pos? :a)` is TRUE — surprising, but it is the
+  # language's existing answer, and a guard that said otherwise would make
+  # `(pos? x)` and `:when (pos? x)` disagree.
+  #
+  # An earlier version added an `is_number` conjunct here "so a guard never
+  # raises". It cannot raise either way (comparison is total), so the
+  # conjunct bought nothing and cost agreement with the function of the same
+  # name. Where a numeric test is what is meant, `(and (number? x) (pos? x))`
+  # says so — and says it identically in a guard and in a body.
+  defp guard_special(:guard_zero, [x]), do: {{:., [], [:erlang, :==]}, [], [x, 0]}
+  defp guard_special(:guard_pos, [x]), do: {{:., [], [:erlang, :>]}, [], [x, 0]}
+  defp guard_special(:guard_neg, [x]), do: {{:., [], [:erlang, :<]}, [], [x, 0]}
+
+  defp guard_vocabulary do
+    (Map.keys(@guard_bifs) ++ ["and", "or", "not"])
+    |> Enum.sort()
+    |> Enum.map_join(", ", &"`#{&1}`")
   end
 
   # Raise a compile error carrying the current position and offending form.

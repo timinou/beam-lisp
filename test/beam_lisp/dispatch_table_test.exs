@@ -7,7 +7,7 @@ defmodule BeamLisp.DispatchTableTest do
   # exact class were found one at a time by accident over the project's life;
   # this table checks them ALL at once.
   #
-  # The table is the cartesian product of 17 values x 18 fns (306 cells). It
+  # The table is the cartesian product of 18 values x 18 fns (324 cells). It
   # is structured as DATA — values, fn call-shapes, and a big expectation map
   # — so the whole matrix is visible at a glance and a wrong expectation is a
   # one-line diff, not a buried assertion. Expectations were decided against
@@ -44,7 +44,17 @@ defmodule BeamLisp.DispatchTableTest do
     {"deftype", "(->DT 1 2)"},
     {"reify", "(reify RP (rm [this] :v))"},
     {"fn", "(fn ([x] x) ([x y] y))"},
-    {"transient", "(transient {:a 1})"}
+    {"transient", "(transient {:a 1})"},
+    # An Erlang tuple: POSITIONAL data, not associative. It reads with
+    # first/rest/nth/seq/count exactly as a vector does — the language's
+    # pattern layer already treats the two alike (`[p q]` matches both) —
+    # while the associative ops refuse, because a tuple has no keys.
+    #
+    # `coll?`/`vector?`/`seq?` are all FALSE: a tuple is a distinct type
+    # that happens to be readable positionally, not a beam-lisp collection
+    # literal, and conflating them would make `(vector? t)` lie about what
+    # `conj` will accept.
+    {"tuple", "(tuple 1 2 3)"}
   ]
 
   # Each fn's call shape; `%s` is replaced by the value expression. One shape
@@ -421,6 +431,28 @@ defmodule BeamLisp.DispatchTableTest do
       "transientable?" => {:eq, false},
       "print-str" => {:eq, "#fn[multi-arity]"}
     },
+    "tuple" => %{
+      "count" => {:eq, 3},
+      "seq" => {:eq, [1, 2, 3]},
+      "first" => {:eq, 1},
+      "rest" => {:eq, [2, 3]},
+      "next" => {:eq, [2, 3]},
+      # No keys, so every associative op refuses rather than inventing a
+      # meaning for `(get {1,2,3} :a)`.
+      "get" => {:raises, FunctionClauseError},
+      "assoc" => {:raises, FunctionClauseError},
+      "conj" => {:raises, FunctionClauseError},
+      "contains?" => {:eq, false},
+      "find" => {:eq, nil},
+      "empty?" => {:eq, false},
+      "coll?" => {:eq, false},
+      "map?" => {:eq, false},
+      "vector?" => {:eq, false},
+      "set?" => {:eq, false},
+      "seq?" => {:eq, false},
+      "transientable?" => {:eq, false},
+      "print-str" => {:eq, "{1, 2, 3}"}
+    },
     "transient" => %{
       "count" => {:raises, FunctionClauseError},
       "seq" => {:raises, FunctionClauseError},
@@ -528,9 +560,9 @@ defmodule BeamLisp.DispatchTableTest do
       run_cell(src, exp)
     end
 
-    # Every value was actually exercised (306 = 17 x 18); the loop above
+    # Every value was actually exercised (324 = 18 x 18); the loop above
     # already asserts each cell, so this count guards the table's own shape.
-    assert total == 306
+    assert total == 324
   end
 
   test "the known-gap inventory is exactly what is recorded (no silent drift)" do
