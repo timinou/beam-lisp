@@ -645,6 +645,22 @@ defmodule BeamLisp.Reader do
       [?" | rest] ->
         {:ok, List.to_string(Enum.reverse(acc)), rest, advance_pos(pos, ?")}
 
+      # `\uXXXX` and `\u{X...}` — a CODEPOINT, not a character escape.
+      # Handled before the single-character clause because `unescape/1`
+      # cannot see past its one byte: it received `?u` and, finding no
+      # clause, fell through to identity and dropped the backslash. The
+      # string `"\u2713"` then read as the four characters `u2713`,
+      # silently, which is how 32 mangled escapes once reached 8 files
+      # in this repository (BUG-020).
+      [?\\, ?u | rest] ->
+        case unicode_escape(rest) do
+          {:ok, codepoint, rest, consumed} ->
+            string(rest, advance_pos(pos, [?\\, ?u | consumed]), [codepoint | acc])
+
+          :error ->
+            {:error, "invalid \\u escape: expected four hex digits or {hex}"}
+        end
+
       [?\\, c | rest] ->
         string(rest, advance_pos(pos, [?\\, c]), [unescape(c) | acc])
 
@@ -665,6 +681,47 @@ defmodule BeamLisp.Reader do
   defp unescape(?f), do: ?\f
   defp unescape(?0), do: 0
   defp unescape(c), do: c
+
+  # `\uXXXX` (exactly four hex digits) or `\u{X...}` (one to six, which
+  # is how Elixir spells codepoints above the BMP without surrogate
+  # pairs).
+  defp unicode_escape([?{ | rest]) do
+    {digits, tail} = Enum.split_while(rest, &hex_digit?/1)
+
+    case tail do
+      [?} | tail] when digits != [] ->
+        decode_codepoint(digits, tail, [?{ | digits] ++ [?}])
+
+      _ ->
+        :error
+    end
+  end
+
+  defp unicode_escape([a, b, c, d | rest]) do
+    digits = [a, b, c, d]
+
+    if Enum.all?(digits, &hex_digit?/1) do
+      decode_codepoint(digits, rest, digits)
+    else
+      :error
+    end
+  end
+
+  defp unicode_escape(_), do: :error
+
+  defp decode_codepoint(digits, rest, consumed) do
+    codepoint = List.to_integer(digits, 16)
+
+    # A surrogate half is not a codepoint; encoding one produces invalid
+    # UTF-8 that fails much later, at whatever tries to print it.
+    if codepoint in 0xD800..0xDFFF or codepoint > 0x10FFFF do
+      :error
+    else
+      {:ok, codepoint, rest, consumed}
+    end
+  end
+
+  defp hex_digit?(c), do: c in ?0..?9 or c in ?a..?f or c in ?A..?F
 
   defp atom_form(rest, pos) do
     {token, rest} = Enum.split_while(rest, fn c -> c not in @delimiters end)

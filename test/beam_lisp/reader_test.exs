@@ -66,4 +66,52 @@ defmodule BeamLisp.ReaderTest do
     assert_raise SyntaxError, fn -> Reader.read_one("{:a}") end
     assert_raise SyntaxError, fn -> Reader.read_one(~s("open)) end
   end
+
+  describe "unicode escapes" do
+    # `\uXXXX` used to drop its backslash and keep the letter, so
+    # `"\u2713"` read as the four characters `u2713` — silently, with no
+    # error, and only visible wherever the string was eventually
+    # displayed. That is how 32 mangled escapes once reached 8 files in
+    # this repository (BUG-020).
+    test "four-digit escapes decode to one character" do
+      assert Reader.read_one(~S|"\u2713"|) == "✓"
+      assert Reader.read_one(~S|"\u00e9"|) == "é"
+      assert String.length(Reader.read_one(~S|"\u2713"|)) == 1
+    end
+
+    test "braced escapes reach above the BMP" do
+      # Elixir's spelling, and the only way to write a codepoint past
+      # 0xFFFF without surrogate pairs.
+      assert Reader.read_one(~S|"\u{1D11E}"|) == "𝄞"
+      assert Reader.read_one(~S|"\u{41}"|) == "A"
+    end
+
+    test "escapes compose with surrounding text" do
+      assert Reader.read_one(~S|"a\u2713b"|) == "a✓b"
+      assert Reader.read_one(~S|"\u2713\u2713"|) == "✓✓"
+    end
+
+    test "the other escapes still work" do
+      assert Reader.read_one(~S|"a\nb"|) == "a\nb"
+      assert Reader.read_one(~S|"a\tb"|) == "a\tb"
+      assert String.length(Reader.read_one(~S|"a\\b"|)) == 3
+    end
+
+    test "a malformed escape is an ERROR, not a mangled string" do
+      # The whole point: accepting the syntax and corrupting it is worse
+      # than rejecting it, because the syntax looks supported.
+      # Raised, not returned: the reader's contract is that a syntax
+      # error stops the read rather than producing a value the caller
+      # has to inspect.
+      assert_raise Reader.SyntaxError, fn -> Reader.read_all(~S|"\u27"|) end
+      assert_raise Reader.SyntaxError, fn -> Reader.read_all(~S|"\uZZZZ"|) end
+      assert_raise Reader.SyntaxError, fn -> Reader.read_all(~S|"\u{}"|) end
+    end
+
+    test "a surrogate half is rejected" do
+      # Not a codepoint. Encoding one yields invalid UTF-8 that fails
+      # much later, at whatever tries to print it.
+      assert_raise Reader.SyntaxError, fn -> Reader.read_all(~S|"\uD800"|) end
+    end
+  end
 end

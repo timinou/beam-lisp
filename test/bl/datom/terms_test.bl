@@ -1,0 +1,208 @@
+; test/bl/datom/terms_test.bl — any BEAM term is a value.
+;
+; ── The claim ─────────────────────────────────────────────────────────
+;
+; Datomic's value types are a closed set: string, long, float, instant,
+; uuid, keyword, ref, bytes. That set exists because Datomic runs on the
+; JVM and had to pick a serialization.
+;
+; This database runs on the BEAM, where a term is already a universal
+; data type with a total order. So the value type is: ANY BEAM TERM.
+; A tuple, a nested map, a set, an arbitrary-precision integer, a pid.
+;
+; ── What that requires ────────────────────────────────────────────────
+;
+; Storing them is easy — `term_to_binary` round-trips anything. INDEXING
+; them is the work, because an index is an order-preserving encoding
+; plus a range scan, and `term_to_binary` orders by serialized SHAPE
+; rather than by value.
+;
+; So the codec has to project the language's own order into bytes for
+; every term shape, and these tests are how that claim is checked:
+;
+;   sort(encode(a), encode(b))  ==  sort(a, b)      for all a, b
+;   a = b                       ⟺   encode(a) = encode(b)
+;
+; The second half matters as much as the first. If two `=` values encode
+; differently, an index holds two keys for one value and a caller can
+; store something and fail to find it. If two DIFFERENT values encode
+; identically, one silently overwrites the other.
+
+(ns datom.terms.test
+  (:require [datom.codec] [datom.conn] [datom.db] [datom.query.engine] [datom.time]))
+
+(def T erlang/list_to_tuple)
+
+(defn- enc [v] (datom.codec/encode-value v))
+
+(defn- byte-order
+  "How the ENCODINGS of `a` and `b` compare: -1, 0 or 1."
+  [a b]
+  (cond (erlang/< (enc a) (enc b)) -1
+        (erlang/> (enc a) (enc b)) 1
+        :else 0))
+
+(defn- term-order
+  "How the LANGUAGE compares them."
+  [a b]
+  (let [c (compare a b)]
+    (cond (< c 0) -1 (> c 0) 1 :else 0)))
+
+;; ── the ordering property ───────────────────────────────────────────
+
+(def SAMPLES
+  "Deliberately spans every branch of the encoder, and every BOUNDARY
+   between them: sign changes, empty collections, prefixes, mixed
+   numeric types, nesting."
+  [nil false true
+   0 1 -1 42 -42 0.0 3.14 -3.14
+   9007199254740992 -9007199254740992        ; 2^53, the float precision edge
+   123456789012345678901234567890            ; past 64 bits entirely
+   -123456789012345678901234567890
+   "" "a" "ab" "abc" "z" "aa"
+   :k :kw :a/b
+   [] [1] [2] [1 2] [1 2 3] [[1]] [[2]]
+   {} {:a 1} {:a 2} {:b 1} {:a 1 :b 2}
+   (T (to-list [])) (T (to-list [1])) (T (to-list [2]))
+   (T (to-list [1 1])) (T (to-list [9]))])
+
+(deftest the-codec-projects-the-languages-order-exactly
+  ; THE property. Every pair, both directions — quadratic in the sample
+  ; count and worth it, because a single disagreeing pair is an index
+  ; that returns the wrong rows for some range query nobody thought to
+  ; test.
+  (let [pairs (into [] (mapcat (fn [a] (mapv (fn [b] [a b]) SAMPLES)) SAMPLES))
+        wrong (filterv (fn [p] (not (= (term-order (get p 0) (get p 1))
+                                       (byte-order (get p 0) (get p 1)))))
+                       pairs)]
+    (is (= [] wrong)
+        (str (count wrong) " of " (count pairs) " pairs disagree, e.g. "
+             (pr-str (take 3 wrong))))))
+
+(deftest equal-values-encode-identically
+  ; Otherwise an index holds two keys for one value, and a caller can
+  ; store `0` and fail to find it with `0.0`.
+  (let [pairs (into [] (mapcat (fn [a] (mapv (fn [b] [a b]) SAMPLES)) SAMPLES))
+        wrong (filterv (fn [p] (and (= (get p 0) (get p 1))
+                                    (not (= (enc (get p 0)) (enc (get p 1))))))
+                       pairs)]
+    (is (= [] wrong) (str "equal but differently encoded: " (pr-str (take 3 wrong))))))
+
+(deftest different-values-never-collide
+  ; The other direction: one encoding for two values means one silently
+  ; overwrites the other.
+  (let [pairs (into [] (mapcat (fn [a] (mapv (fn [b] [a b]) SAMPLES)) SAMPLES))
+        wrong (filterv (fn [p] (and (not (= (get p 0) (get p 1)))
+                                    (= (enc (get p 0)) (enc (get p 1)))))
+                       pairs)]
+    (is (= [] wrong) (str "collisions: " (pr-str (take 3 wrong))))))
+
+;; ── the shapes, named ───────────────────────────────────────────────
+
+(deftest a-tuple-orders-by-arity-then-elements
+  ; Erlang's own rule, and `compare`'s since BUG-018. An encoding that
+  ; compared elements first would disagree with every `<` in the
+  ; language it lives in.
+  (is (= -1 (byte-order (T (to-list [9])) (T (to-list [1 1])))))
+  (is (= -1 (byte-order (T (to-list [1 1])) (T (to-list [1 2])))))
+  (is (= -1 (byte-order (T (to-list [])) (T (to-list [1]))))))
+
+(deftest a-sequential-prefix-sorts-before-its-extensions
+  (is (= -1 (byte-order [1] [1 2])))
+  (is (= -1 (byte-order [] [1])))
+  (is (= 1 (byte-order [2] [1 9])) "element-wise, not by length"))
+
+(deftest a-map-encodes-independently-of-insertion-order
+  ; The property that makes a map usable as an indexed value: two equal
+  ; maps built differently must reach the same key.
+  (is (= (enc {:a 1 :b 2}) (enc {:b 2 :a 1})))
+  (is (= (enc {:a {:x 1 :y 2}}) (enc {:a {:y 2 :x 1}}))))
+
+(deftest a-set-encodes-independently-of-member-order
+  (is (= (enc (into #{} [1 2 3])) (enc (into #{} [3 2 1])))))
+
+(deftest numbers-interleave-regardless-of-int-or-float
+  ; Separate tags for int and float broke this in both directions at
+  ; once: `0` and `0.0` are `=` yet encoded differently, and every
+  ; integer sorted below every float regardless of magnitude — so
+  ; `(> ?n 0)` over a mixed column returned the wrong rows.
+  (is (= (enc 0) (enc 0.0)))
+  (is (= -1 (byte-order 1 3.14)))
+  (is (= 1 (byte-order 4 3.14)))
+  (is (= -1 (byte-order -3.14 0))))
+
+(deftest arbitrary-precision-integers-order-correctly
+  ; The BEAM has bignums, so a database that refuses them is less
+  ; capable than the language it is written in.
+  (let [big 123456789012345678901234567890
+        bigger 123456789012345678901234567891]
+    (is (= -1 (byte-order big bigger)))
+    (is (= -1 (byte-order (- 0 big) big)))
+    (is (= -1 (byte-order (- 0 bigger) (- 0 big))) "negatives run backwards")
+    (is (= -1 (byte-order 42 big)) "an int is smaller than any bignum")
+    (is (= -1 (byte-order (- 0 big) 42)))
+    (is (= -1 (byte-order 3.14 big)) "and so is a float")))
+
+(deftest nesting-orders-all-the-way-down
+  (is (= -1 (byte-order [[1 2]] [[1 3]])))
+  (is (= -1 (byte-order {:k (T (to-list [1]))} {:k (T (to-list [2]))})))
+  (is (= -1 (byte-order [{:a 1}] [{:a 2}])))
+  (is (= -1 (byte-order {:a [1 [2]]} {:a [1 [3]]}))))
+
+;; ── end to end, through the database ────────────────────────────────
+
+(defn- roundtrip-fixture
+  []
+  (datom.conn/connect
+    [{:db/ident :t/label :db/valueType :db.type/string}
+     ; No `:db/valueType`, so any term is accepted — which is the point.
+     {:db/ident :t/any}]))
+
+(deftest every-term-shape-round-trips-through-the-database
+  (let [c (roundtrip-fixture)
+        values [(T (to-list [1 :two "three"]))
+                {:config {:host "localhost" :port 8080} :tags [:a :b]}
+                [1 [2 [3 [4]]]]
+                (to-list [1 2 3])
+                (into #{} [1 2 3])
+                3.14159
+                123456789012345678901234567890
+                :some/keyword
+                "with unicode: naive cafe"
+                {:a [(T (to-list [1 {:b (into #{} [2 3])}]))]}]]
+    (doseq [v values]
+      (let [r (datom.conn/transact! c [{:db/id -1 :t/any v}])
+            e (get (:tempids r) -1)]
+        (is (= v (:t/any (datom.db/entity (datom.conn/db c) e)))
+            (str "round trip: " (pr-str v)))))))
+
+(deftest a-composite-value-is-QUERYABLE-by-equality
+  ; Round-tripping only proves storage. This proves the INDEX: finding
+  ; an entity by a tuple value means the encoding was deterministic
+  ; enough to look up.
+  (let [c (roundtrip-fixture)
+        tup (T (to-list [1 :two "three"]))
+        m {:deep {:nested true} :list [1 2 3]}]
+    (datom.conn/transact! c [{:db/id -1 :t/label "tuple" :t/any tup}
+                             {:db/id -2 :t/label "map" :t/any m}
+                             {:db/id -3 :t/label "set" :t/any (into #{} [9 8 7])}])
+    (let [db (datom.conn/db c)
+          find-by (fn [v] (datom.query.engine/q
+                            '[:find ?l :in $ ?v :where [?e :t/any ?v] [?e :t/label ?l]]
+                            db v))]
+      (is (= (set [["tuple"]]) (find-by tup)))
+      (is (= (set [["map"]]) (find-by m)))
+      (is (= (set [["set"]]) (find-by (into #{} [7 8 9])))
+          "a set found by an equal set built in another order"))))
+
+(deftest a-composite-value-participates-in-history
+  ; Nothing about time travel is special-cased per type: a tuple value
+  ; is retracted and superseded like a string.
+  (let [c (roundtrip-fixture)
+        r (datom.conn/transact! c [{:db/id -1 :t/any (T (to-list [1]))}])
+        e (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/add e :t/any (T (to-list [2]))]])
+    (let [db (datom.conn/db c)]
+      (is (= (T (to-list [2])) (:t/any (datom.db/entity db e))))
+      (is (= 3 (count (datom.time/changes db e :t/any)))
+          "asserted, retracted, re-asserted"))))
