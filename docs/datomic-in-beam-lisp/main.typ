@@ -9,7 +9,7 @@
   #v(0.4em)
   #text(size: 12pt, style: "italic")[An immutable temporal database, built in the language it is written in]
   #v(0.4em)
-  #text(size: 9pt)[2026-08-21 · implemented, in-memory · status: feature-complete, awaiting a persistent substrate]
+  #text(size: 9pt)[2026-08-21 · implemented · status: feature-complete, persistent on redb]
 ]
 
 #v(1em)
@@ -106,6 +106,69 @@ the surviving datom looked perfectly well-formed.
 `op` now terminates every index key. Its position is deliberate: last, so it
 separates two otherwise-identical keys without disturbing sort order within a
 transaction.
+
+= Any BEAM term is a value
+
+Datomic's value types are a closed set: string, long, float, instant, uuid,
+keyword, ref, bytes. That set exists because Datomic runs on the JVM and had to
+choose a serialization. Want to store a nested map? Serialize it to a string,
+and give up querying it.
+
+This database runs on the BEAM, where a term is *already* a universal data type
+with a total order. So the value type is: any BEAM term.
+
+```clojure
+(transact! conn
+  [{:db/id -1 :doc/payload {:server {:host "localhost" :port 8080}
+                            :retries [100 200 400]
+                            :flags #{:tls :http2}}}])
+
+;; and it is findable BY VALUE, not merely retrievable
+(q '[:find ?e :in $ ?v :where [?e :doc/payload ?v]] db
+   {:server {:host "localhost" :port 8080}
+    :retries [100 200 400]
+    :flags #{:tls :http2}})
+```
+
+== Storing is easy; indexing is the work
+
+`term_to_binary` round-trips anything. But an index is an order-preserving
+encoding plus a range scan, and `term_to_binary` orders by serialized *shape*
+rather than by value. So the codec must project the language's own order into
+bytes for every term shape:
+
+#table(
+  columns: (auto, 1fr),
+  stroke: 0.4pt + gray,
+  [*tuple*], [arity first, then elements — Erlang's rule (`{9} < {1,1}`)],
+  [*sequential*], [element-wise, terminated so a prefix sorts before its extensions],
+  [*map / set*], [keys sorted before encoding, so two equal collections built in different insertion orders encode *identically*],
+  [*number*], [one tag for int and float, because `(= 0 0.0)` is true and `(compare 1 3.14)` is -1],
+  [*bignum*], [length-prefixed, with complemented length and inverted magnitude for negatives],
+  [*pid / port / ref / fun*], [faithful round trip, stable arbitrary order — the BEAM promises no more than that either],
+)
+
+Verified as three exhaustive properties over 1,225 pairs
+(`test/bl/datom/terms_test.bl`):
+
++ the codec's byte order equals the language's `compare`, for every pair
++ equal values encode identically — or an index holds two keys for one value
++ different values never collide — or one silently overwrites the other
+
+== Which found three defects in the language itself
+
+Writing an encoder needs an oracle, and the oracle was broken:
+
+- `compare` reported *distinct* tuples as EQUAL. Anything past its known ranks
+  fell to a clause returning 0, so `sorted-set` could silently hold one member
+  where two were inserted (BUG-018).
+- `(compare [] {})` was 0 while `(= [] {})` was false — the same defect one
+  type family up.
+- `=` and `compare` disagreed about vector-vs-list, and a lazy seq equalled a
+  vector while a list did not (BUG-019).
+
+All three are fixed. The codec is faithful to `=` and `compare`, and those two
+now agree with each other.
 
 = The four indexes
 
@@ -661,14 +724,97 @@ store that is fine; against a networked one it is the thing to fix first, and
 the fix is known: a transaction knows all its entities up front, so the
 per-operation lookups can be hoisted into one range over the affected span.
 
-== The honest summary for the decision
+== The choice, and what was built
 
-The database is feature-complete in memory and does not depend on any property
-ETS has. The port is six methods wide, one of which (`-commit`) carries the only
-requirement that is hard: *atomicity across many keys*.
+*redb via Rustler*, with RocksDB `TransactionDB` as the maturity-first
+alternative. The full comparison across eight candidates is in FEAT-014; the
+deciding requirement was atomic multi-key commit, and the axis separating the
+two finalists is production evidence versus integration simplicity.
 
-That single requirement is the axis the substrate choice should turn on. A
-store that provides it — whether an embedded engine reached through a NIF, a
-distributed one, or something assembled from parts — lets everything above L1
-stay exactly as it is. A store that does not provide it forces the atomicity
-problem upward into code that is currently, and correctly, unaware of it.
+Rejected with reasons: sled (unmaintained since 2021, self-described beta),
+`:dets` / `:disk_log` (no ordered disk storage in OTP at all), `:mnesia` (wrong
+abstraction; `ordered_set` unsupported for `disc_only_copies`), and Hobbes —
+which is pre-alpha and says so. Read at source, Hobbes scores 2 of 4: its
+`read_range` uses an *exclusive* upper bound where this port specifies
+inclusive, it has no CAS, and its BTree path writes bytes without fsync. Its
+`Enc.Tuple` is a genuinely order-preserving binary encoding that converged
+independently on nearly the same design as this codec, which is a good sign for
+both.
+
+`priv/datom/store-redb.bl` implements the port over
+`native/datom_redb` — one `WriteTransaction` per commit, `Durability::Immediate`
+with no way to weaken it, CAS inside a single transaction, and dirty-IO
+scheduling so a filesystem call cannot stall a BEAM scheduler.
+
+== No Elixir in the datom layer
+
+Reaching Rust used to mean hand-writing an Elixir module whose function bodies
+all read `:erlang.nif_error(:nif_not_loaded)` — a file containing no logic,
+existing only to declare that certain names are native, and forcing every
+native capability to enter through Elixir.
+
+`defnative` moves that declaration into the namespace that uses it:
+
+```clojure
+(ns datom.store-redb)
+
+(defnative "datom_redb"
+  (redb-open 1)
+  (redb-get 2)
+  (redb-range 3)
+  (redb-commit 2))
+```
+
+A NIF is substrate. The declaration that one exists is not. The datom layer is
+now 17 beam-lisp files and one Rust crate, with *zero* Elixir modules of its
+own.
+
+== Measured, on an actual disk
+
+500 entities, redb, after the optimisation pass:
+
+#table(
+  columns: (auto, auto, auto, auto),
+  stroke: 0.4pt + gray,
+  [*operation*], [*before*], [*after*], [*factor*],
+  [bulk write], [3486 ms], [551 ms], [6.3×],
+  [two-clause join], [5117 ms], [155 ms], [33×],
+  [column scan], [67 ms], [41 ms], [],
+  [range predicate], [16 ms], [14 ms], [],
+)
+
+And the write path is finally linear — 2.06× on ETS and 2.43× on redb for 2×
+the data, where it had been ~3.3×.
+
+Three fixes, each found only by measuring: the join's *match* was quadratic
+even after its scans became constant; `net-datoms` walked the datoms three
+times over lazy seqs; and `write-datoms` spent more time assembling its batch
+than encoding its contents.
+
+Three *other* hypotheses were tried and rejected by measurement — a scan memo
+that made things slower, an `into`→`reduce` change that did nothing, and an
+obvious-looking lazy `cons` that was never the cost. "Which function is slow"
+and "which function looks slow" are different questions.
+
+== The lesson about cost tests
+
+`cost_test.bl` asserts that a two-clause join costs a constant number of store
+ranges. *That test passed the entire time the join took five seconds.* The scans
+were constant and correct; the in-memory match after them was quadratic.
+
+Store operation counts are the right measure for a networked backend and say
+nothing about the work done between the operations. Both measures are needed,
+and neither file is sufficient alone.
+
+== The honest summary
+
+The port is six methods wide, one of which (`-commit`) carries the only hard
+requirement: *atomicity across many keys*. redb provides it directly, so
+`-commit` delegates rather than implements — which is the whole argument for
+using a storage engine instead of a file.
+
+Three implementations now satisfy the same 24-test conformance suite: ETS, a
+sorted map in an atom, and redb on disk. A store that provides ordered
+byte-wise keys, inclusive-bound prefix scans, atomic multi-key commit and
+compare-and-swap can carry this database unchanged. That claim is no longer an
+argument; it is a suite that runs.
