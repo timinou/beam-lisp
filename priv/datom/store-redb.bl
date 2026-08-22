@@ -1,0 +1,152 @@
+; datom/store-redb.bl — the port, over a real disk.
+;
+; ── The third implementation ──────────────────────────────────────────
+;
+; `store-ets` is the development substrate. `store-map` exists to prove
+; the port is a port. This one is the answer to the question both of
+; them dodge: what happens when the database has to survive the process
+; that made it.
+;
+; It is forty lines of beam-lisp over a Rust NIF, and that ratio is the
+; point. Durability, crash recovery, B-tree maintenance and fsync are
+; somebody else's solved problems; what this file contributes is the
+; translation between our key encoding and theirs, which is nothing,
+; because our keys are already binaries.
+;
+; ── Why redb ──────────────────────────────────────────────────────────
+;
+; Three of the four requirements are common to every ordered store.
+; The fourth is not:
+;
+;   ATOMIC MULTI-KEY COMMIT
+;
+; A transaction writes one datom into two to four index orderings. If
+; three land and one does not, a query through AEVT reports the fact
+; absent while a query through EAVT reports it present. That is not a
+; slow database, it is a corrupt one, and no amount of care above L1 can
+; repair it after the fact.
+;
+; redb's `WriteTransaction` gives it directly, so `-commit` here does not
+; IMPLEMENT atomicity — it DELEGATES it. That delegation is the entire
+; argument for using a storage engine instead of a file.
+;
+; Rejected, with reasons, in FEAT-014: sled (unmaintained since 2021),
+; dets/disk_log (no ordered disk storage in OTP at all), mnesia (wrong
+; abstraction, and `ordered_set` is unsupported for disc_only_copies),
+; Hobbes (pre-alpha; exclusive range bounds, no CAS, no fsync yet).
+;
+; ── The one thing to be careful about ─────────────────────────────────
+;
+; `Durability::Immediate` is set on every write in the NIF and cannot be
+; changed from here. redb also offers `Durability::None`, which returns
+; from commit without the data reaching disk — a fine mode for a cache
+; and a catastrophic default for a database, because a commit that
+; returns is a commit the caller believes.
+
+(ns datom.store-redb
+  (:require [datom.store]))
+
+(defrecord RedbStore [handle])
+
+;; ── values ───────────────────────────────────────────────────
+;;
+;; KEYS are order-preserving binaries — that encoding is the database's
+;; own, and it is what every index depends on, so the store must never
+;; reinterpret it.
+;;
+;; VALUES are not. They are whatever the layer above stored: a datom
+;; record, an integer counter. Their bytes are never compared, only
+;; returned, so any faithful round trip will do and `term_to_binary` is
+;; the obvious one.
+;;
+;; This asymmetry is worth stating because it is the opposite of what a
+;; reader expects: the SORTABLE side is hand-rolled and the opaque side
+;; uses the built-in serializer, precisely because sorting is the thing
+;; the built-in serializer cannot promise.
+
+(defn- encode-value
+  [v]
+  (erlang/term_to_binary v))
+
+(defn- decode-value
+  [b]
+  (if (nil? b) nil (erlang/binary_to_term b)))
+
+(defn open
+  "Open (or create) a database at `path`.
+
+   The file persists after the process exits \u2014 which is the whole point,
+   and also the thing to remember when a test leaves one behind."
+  [path]
+  (->RedbStore (BeamLisp.Datom.Redb/open path)))
+
+(defn available?
+  "Whether the native backend loaded.
+
+   The database runs perfectly well without it on `store-ets`, so this is
+   a capability question rather than a health check. A persistent
+   backend that fails to load should read as ABSENT, never as present
+   but not actually durable."
+  []
+  (BeamLisp.Datom.Redb/available?))
+
+(extend-type RedbStore
+  datom.store/Store
+
+  (-get [store k]
+    (decode-value (BeamLisp.Datom.Redb/get (:handle store) k)))
+
+  (-range [store lo hi]
+    ; Bounds are INCLUSIVE on both sides, as the port specifies. The NIF
+    ; uses `Bound::Included` for each; a half-open upper bound would drop
+    ; exactly one datom from the end of every scan, which reads as
+    ; sporadically missing data rather than as an error. The conformance
+    ; suite asserts this directly, and it caught precisely this mistake
+    ; in `store-map` on its first run.
+    (mapv (fn [pair] [(erlang/element 1 pair) (decode-value (erlang/element 2 pair))])
+          (to-list (BeamLisp.Datom.Redb/range (:handle store) lo hi))))
+
+  (-put [store k v]
+    (BeamLisp.Datom.Redb/put (:handle store) k (encode-value v))
+    store)
+
+  (-delete [store k]
+    (BeamLisp.Datom.Redb/delete (:handle store) k)
+    store)
+
+  (-update [store k f]
+    ; Read-modify-write as a compare-and-swap LOOP, because the port
+    ; promises atomicity and `-get` then `-put` does not provide it: two
+    ; writers both read `t=41`, both write `t=42`, and the database has
+    ; two transactions claiming one basis.
+    ;
+    ; The NIF performs its read and its write inside ONE redb write
+    ; transaction, so a losing attempt is detected rather than lost. `f`
+    ; must be pure \u2014 the port says so precisely because it may be run
+    ; more than once here.
+    (loop [attempt 0]
+      (if (> attempt 100)
+        (throw (ex-info "compare-and-swap did not settle" {:key k :attempts attempt}))
+        (let [raw (BeamLisp.Datom.Redb/get (:handle store) k)
+              next (f (decode-value raw))
+              encoded (encode-value next)
+              result (BeamLisp.Datom.Redb/compare_and_swap (:handle store) k raw encoded)]
+          (if (= result encoded)
+            [store next]
+            (recur (+ attempt 1)))))))
+
+  (-commit [store ops]
+    ; THE method this backend exists for. The whole batch reaches disk
+    ; together or not at all, and the operations apply IN ORDER \u2014
+    ; `[[:delete k] [:put k v]]` is what a transaction emits when it
+    ; retracts and re-asserts a datom, so a backend that grouped puts
+    ; ahead of deletes would end with the key absent.
+    (BeamLisp.Datom.Redb/commit
+      (:handle store)
+      (to-list (mapv (fn [op]
+                       (if (= (get op 0) :put)
+                         (erlang/list_to_tuple
+                           (to-list [:put (get op 1) (encode-value (get op 2))]))
+                         (erlang/list_to_tuple (to-list [:delete (get op 1)]))))
+                     ops)))
+    store))

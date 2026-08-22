@@ -972,24 +972,80 @@ defmodule BeamLisp.RT do
   defp rank(x) when is_binary(x), do: 4
   defp rank({:symbol, _}), do: 5
   defp rank(x) when is_atom(x), do: 6
-  defp rank(%BeamLisp.Vector{}), do: 7
+  # SEQUENTIAL collections share rank 7 and compare element-wise: a
+  # vector, a lazy seq and a list holding the same elements ARE equal in
+  # this language, so they must also compare equal.
+  # A VECTOR ranks just above a cons list, because `=` keeps them
+  # distinct (wave 3's `[] ≠ ()` split, pinned in wave26_laziness_test).
+  # Sharing one rank made `compare` answer 0 for a pair `=` calls
+  # different — the same defect as BUG-018, and it left the datom codec
+  # with no single order to project (BUG-019).
+  #
+  # They stay ADJACENT so the two still sort together; only the tie
+  # between them is broken, and broken the way `=` already breaks it.
   defp rank(%LazySeq{}), do: 7
-  defp rank(%Set{}), do: 7
-  defp rank(%SortedSet{}), do: 7
-  defp rank(%SortedMap{}), do: 7
   defp rank(x) when is_list(x), do: 7
-  # is_map-ok: comparison rank deliberately treats any struct or plain map
-  # uniformly at rank 7 for total ordering (reference types sort alongside
-  # collections). This is a compare-ordering choice, not a collection op.
-  defp rank(x) when is_map(x), do: 7
-  defp rank(_), do: 8
+  defp rank(%BeamLisp.Vector{}), do: 7.1
+
+  # Sets and maps are NOT sequential and are not equal to a vector, so
+  # they get their own ranks. Sharing rank 7 made `(compare [] {})`
+  # answer 0 while `(= [] {})` answered false — the same
+  # distinct-values-declared-equal defect as BUG-018, one type family up.
+  defp rank(%Set{}), do: 7.3
+  defp rank(%SortedSet{}), do: 7.3
+  defp rank(%SortedMap{}), do: 7.6
+  # is_map-ok: assigning a comparison rank to plain maps and structs, not
+  # performing a collection operation.
+  defp rank(x) when is_map(x), do: 7.6
+
+  # Ranks past the Clojure-shaped ones, in ERLANG's term order:
+  #
+  #   number < atom < reference < fun < port < pid < tuple < map < list
+  #
+  # These used to share a single rank 8 whose comparator returned 0, so
+  # any two DISTINCT tuples (or pids, ports, refs, funs) compared EQUAL.
+  # That is not an imprecision, it is an inconsistency, and `sort`,
+  # `distinct` and `sorted-set` all inherit it: a sorted set could
+  # silently hold one element where two were put in (BUG-018).
+  defp rank(x) when is_reference(x), do: 8
+  defp rank(x) when is_function(x), do: 9
+  defp rank(x) when is_port(x), do: 10
+  defp rank(x) when is_pid(x), do: 11
+  defp rank(x) when is_tuple(x), do: 12
+  defp rank(_), do: 13
 
   defp cmp_same(3, a, b), do: sign_num(a, b)
   defp cmp_same(4, a, b), do: sign_str(a, b)
   defp cmp_same(5, a, b), do: sign_str(sym_name(a), sym_name(b))
   defp cmp_same(6, a, b), do: sign_str(Atom.to_string(a), Atom.to_string(b))
   defp cmp_same(7, a, b), do: compare_seqs(a, b)
-  defp cmp_same(_, _, _), do: 0
+  defp cmp_same(7.1, a, b), do: compare_seqs(a, b)
+  defp cmp_same(7.3, a, b), do: compare_seqs(seq(a), seq(b))
+  defp cmp_same(7.6, a, b), do: compare_seqs(seq(a), seq(b))
+
+  # A tuple compares by ARITY FIRST, then element-wise. That is Erlang's
+  # own rule (`{9} < {1,1}`), and the datom codec encodes tuples the same
+  # way, so the two agree.
+  defp cmp_same(12, a, b) do
+    sa = tuple_size(a)
+    sb = tuple_size(b)
+
+    if sa != sb do
+      sign(sa - sb)
+    else
+      compare_seqs(Tuple.to_list(a), Tuple.to_list(b))
+    end
+  end
+
+  # Reference, fun, port, pid, and anything unforeseen: no meaningful
+  # VALUE order exists, so defer to Erlang's — consistent and stable,
+  # even though arbitrary. Returning 0 here was the bug: it claimed two
+  # different terms were the same term.
+  defp cmp_same(_, a, b), do: erlang_order(a, b)
+
+  defp erlang_order(a, b) when a < b, do: -1
+  defp erlang_order(a, b) when a > b, do: 1
+  defp erlang_order(_, _), do: 0
 
   defp sign_num(a, b) when a < b, do: -1
   defp sign_num(_a, _b), do: 1

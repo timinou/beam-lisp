@@ -62,11 +62,67 @@
 (def TAG-NIL 16)        ; 0x10
 (def TAG-FALSE 32)      ; 0x20
 (def TAG-TRUE 33)       ; 0x21
-(def TAG-INT 48)        ; 0x30
-(def TAG-FLOAT 49)      ; 0x31 — adjacent to INT so numbers group together
+; ONE tag for all numbers. `(= 0 0.0)` is true in this language, so `0`
+; and `0.0` must encode identically or an index holds two keys for one
+; value; and `(compare 1 3.14)` is -1, so integers and floats must
+; interleave rather than occupying separate ranges.
+(def TAG-NUM 48)        ; 0x30
+; Integers too large for a float's 53-bit mantissa keep an exact
+; encoding, and sort ABOVE every float — numerically correct, since any
+; such integer exceeds every float it could be confused with.
+; Integers beyond 64 bits. The BEAM has arbitrary-precision integers, so
+; a database that refuses them is less capable than the language it is
+; written in \u2014 and `(* big big)` reaching an attribute is not exotic.
+;
+; NEGBIG sorts BELOW every float/int (tag 48), POSBIG above: a bignum is
+; by definition outside the range where confusion with a float is
+; possible, so the tag boundary is also the numeric boundary.
+(def TAG-NEGBIG 44)     ; 0x2C \u2014 below TAG-NUM
+(def TAG-BIGINT 50)     ; 0x32 \u2014 64-bit ints past float precision
+(def TAG-POSBIG 52)     ; 0x34 \u2014 above TAG-BIGINT
+(def MAX-EXACT-INT 9007199254740992)   ; 2^53
 (def TAG-STR 64)        ; 0x40
 (def TAG-KEYWORD 80)    ; 0x50
 (def TAG-REF 96)        ; 0x60
+
+;; ── composite and opaque BEAM terms ──────────────────────────────
+;;
+;; A datom value may be ANY BEAM term. These tags continue the ranking
+;; above, and their order is Erlang's own term order for these types:
+;;
+;;   number < atom < reference < fun < port < pid < tuple < map < list
+;;                                                            < bitstring
+;;
+;; The database's own tags (nil/false/true/int/float/str/keyword) sit
+;; below, because those are the types it understands well enough to give
+;; a value-preserving encoding. Everything from here on is encoded
+;; faithfully but ordered by BEAM rules rather than by any
+;; domain meaning — which is exactly what the BEAM itself does.
+(def TAG-PID 100)       ; 0x64
+(def TAG-PORT 101)      ; 0x65
+(def TAG-ERLREF 102)    ; 0x66 — an erlang reference, not a datom :db.type/ref
+(def TAG-FUN 103)       ; 0x67
+; Tag order follows `RT.compare`'s RANKS, not Erlang's term order, for
+; the same reason the scalar tags do: the codec's job is to PROJECT the
+; language's order into bytes, never to invent a second one. Where the
+; two disagree — Erlang puts tuple < map < list; compare puts sequential
+; < set < map — compare wins, because that is what `sort`, `sorted-set`
+; and every query predicate use.
+(def TAG-LIST 112)      ; 0x70  a cons list / lazy seq
+; A VECTOR gets its own tag because this language keeps `[]` and `()`
+; DISTINCT — wave 3's deliberate split, pinned in wave26_laziness_test.
+; `(= [1 2] '(1 2))` is false here, so encoding them identically would
+; put two `=`-distinct values at one key: a caller could store `[1 2]`
+; and fail to find it, or find it under a value they never wrote.
+;
+; The codec follows `=` rather than arguing with it. Both tags sit
+; adjacent so the two still sort together, which is what `compare`'s
+; shared rank asks for.
+(def TAG-VECTOR 113)    ; 0x71
+(def TAG-SET 114)       ; 0x72
+(def TAG-MAP 116)       ; 0x74
+(def TAG-TUPLE 120)     ; 0x78  past the collections, as compare ranks it
+(def TAG-BITSTRING 124) ; 0x7C
 
 ; Signed 64-bit values are shifted into unsigned space so byte order
 ; matches numeric order across the sign boundary.
@@ -186,6 +242,73 @@
     bin
     (binary/replace bin NUL-BIN NUL-ESCAPED (to-list [:global]))))
 
+(defn- big-magnitude-bytes
+  "The base-256 digits of a non-negative integer, most significant first."
+  [n]
+  (if (= n 0)
+    []
+    (loop [v n acc []]
+      (if (= v 0)
+        acc
+        (recur (erlang/bsr v 8) (into [(rem v 256)] acc))))))
+
+(defn- encode-bignum
+  "An integer of ANY magnitude, order-preserving.
+
+   LENGTH FIRST, then magnitude. For positives that is exactly right:
+   more digits means a larger number, and equal digit counts compare
+   byte-wise. For negatives BOTH are inverted \u2014 a longer negative is
+   SMALLER, and within one length the ordering runs backwards \u2014 so the
+   length is complemented and every magnitude byte is flipped.
+
+   Four length bytes, so the encoding covers integers up to 2^(8*2^32),
+   which is past anything the BEAM will hold in memory."
+  [n]
+  (if (>= n 0)
+    (let [digits (big-magnitude-bytes n)]
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte TAG-POSBIG)
+                  (encode-count (count digits))
+                  (erlang/list_to_binary (to-list digits))])))
+    (let [digits (big-magnitude-bytes (- 0 n))
+          flipped (mapv (fn [b] (- 255 b)) digits)]
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte TAG-NEGBIG)
+                  ; complemented length: a longer negative is smaller
+                  (encode-count (- 4294967295 (count digits)))
+                  (erlang/list_to_binary (to-list flipped))])))))
+
+(defn- tagged-opaque
+  "A term with no value order: its tag, then its escaped serialization.
+
+   `escape-nul` matters even here. Without it a serialized term
+   containing a 0x00 byte could end its own component early and let the
+   NEXT component be read as more of this one \u2014 the same forgery the
+   string encoding guards against."
+  [tag v]
+  (erlang/iolist_to_binary
+    (to-list [(tag-byte tag) (escape-nul (erlang/term_to_binary v)) (tag-byte 0)])))
+
+(defn- encode-count
+  "A collection's size, fixed-width, so it sorts numerically.
+
+   Four bytes, big-endian. Fixed width matters: a variable-length count
+   would sort `10` before `2`, which is the same mistake `term_to_binary`
+   makes with strings."
+  [n]
+  (erlang/list_to_binary
+    (to-list [(rem (erlang/bsr n 24) 256)
+              (rem (erlang/bsr n 16) 256)
+              (rem (erlang/bsr n 8) 256)
+              (rem n 256)])))
+
+(declare encode-value)
+
+(defn- encode-seq
+  "Encode elements in order, each already self-delimiting."
+  [xs]
+  (erlang/iolist_to_binary (to-list (mapv encode-value xs))))
+
 (defn encode-value
   "Encode any datom value as a tagged, order-preserving binary.
 
@@ -201,7 +324,38 @@
     (nil? v) (tag-byte TAG-NIL)
     (= v false) (tag-byte TAG-FALSE)
     (= v true) (tag-byte TAG-TRUE)
-    (int? v) (erlang/iolist_to_binary (to-list [(tag-byte TAG-INT) (encode-int v)]))
+    ; ── numbers ───────────────────────────────────────────
+    ;
+    ; Integers and floats share ONE tag and one representation, because
+    ; the language considers them one type for both equality and order:
+    ; `(= 0 0.0)` is true and `(compare 1 3.14)` is -1.
+    ;
+    ; Separate tags broke that in both directions at once. `0` and `0.0`
+    ; are EQUAL yet encoded differently, so an index held them as two
+    ; keys for one value; and every integer sorted below every float
+    ; regardless of magnitude, so `(> ?n 0)` over a mixed column silently
+    ; returned the wrong rows. A property test over 1849 pairs found 272
+    ; disagreements, all of this shape.
+    ;
+    ; The float encoding is already order-preserving across the whole
+    ; real line, so an integer is encoded as the float it equals. The
+    ; cost is 53 bits of mantissa: an integer beyond 2^53 cannot be
+    ; represented exactly, so those keep the integer path and sort ABOVE
+    ; every float — which is where they belong numerically, since any
+    ; such integer exceeds the floats that could be confused with it.
+    (int? v)
+      (cond
+        ; Exactly representable as a float: share the numeric tag so
+        ; ints and floats interleave.
+        (and (<= v MAX-EXACT-INT) (>= v (- 0 MAX-EXACT-INT)))
+          (erlang/iolist_to_binary
+            (to-list [(tag-byte TAG-NUM) (encode-float (erlang/float v))]))
+        ; Past float precision but inside 64 bits: exact, fixed-width.
+        (and (<= v INT-MAX) (>= v INT-MIN))
+          (erlang/iolist_to_binary
+            (to-list [(tag-byte TAG-BIGINT) (encode-int v)]))
+        ; Arbitrary precision. The BEAM has it, so this database has it.
+        :else (encode-bignum v))
     ; A float reaches here whenever an attribute is declared WITHOUT a
     ; `:db/valueType` (validation then accepts any value). Left to the
     ; `:else` branch it got `term_to_binary`, which orders by serialized
@@ -215,7 +369,8 @@
     ; integers rather than interleaved (comparing across int and float
     ; would need a shared representation, which no ordered store gives
     ; for free).
-    (float? v) (erlang/iolist_to_binary (to-list [(tag-byte TAG-FLOAT) (encode-float v)]))
+    (float? v) (erlang/iolist_to_binary
+                 (to-list [(tag-byte TAG-NUM) (encode-float v)]))
     ; The string's OWN bytes, never `term_to_binary`: that wraps a value
     ; in a tagged envelope carrying a LENGTH PREFIX, so encoded strings
     ; sort by length before content (`z` < `aa`, `abc` > `b`). A first
@@ -228,15 +383,83 @@
                    (to-list [(tag-byte TAG-KEYWORD)
                              (escape-nul (erlang/atom_to_binary v :utf8))
                              (tag-byte 0)]))
-    ; Anything else (a lookup ref, a nested value) has no order-preserving
-    ; byte form, so it gets `term_to_binary` — which orders by the term's
-    ; serialized shape, NOT by value. Acceptable only because such values
-    ; are compared for EQUALITY in an index, never for range: two equal
-    ; values still encode identically, which is the property that matters.
-    ; A range predicate over this type would be silently wrong, so the
-    ; schema layer (wave 2) must reject :db/index on it.
+    ; ── composites ───────────────────────────────────────
+    ;
+    ; A tuple encodes its ARITY FIRST, then its elements. That is not a
+    ; stylistic choice — it is Erlang's own rule (`{9}` < `{1,1}`), and
+    ; an encoding that compared elements first would disagree with every
+    ; `<` in the language it lives in.
+    ;
+    ; The elements are encoded recursively, so a tuple of tuples sorts
+    ; correctly all the way down.
+    (erlang/is_tuple v)
+      (let [elements (to-list (erlang/tuple_to_list v))]
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-TUPLE)
+                    (encode-count (count elements))
+                    (encode-seq elements)])))
+
+    ; A LIST compares element-wise with no leading arity — `[1]` < `[1 2]`
+    ; because the shorter runs out first, not because it is shorter. The
+    ; 0x00 terminator produces exactly that: a proper prefix ends before
+    ; its extensions continue.
+    ;
+    ; Beam-lisp vectors are lists to the layers above, so they take this
+    ; path and sort with them.
+    (vector? v)
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte TAG-VECTOR) (encode-seq (to-list v)) (tag-byte 0)]))
+
+    (erlang/is_list v)
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte TAG-LIST) (encode-seq (to-list v)) (tag-byte 0)]))
+
+    ; A SET encodes its members in sorted order, so two equal sets built
+    ; by different insertion orders encode identically — the property
+    ; that makes a set usable as an indexed value.
+    (set? v)
+      (let [ms (sort (to-list v))]
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-SET) (encode-count (count ms)) (encode-seq ms)])))
+
+    ; A MAP sorts by size, then keys, then values — Erlang's rule. Keys
+    ; are sorted before encoding so that two equal maps built in
+    ; different insertion orders encode IDENTICALLY, which is what makes
+    ; a map usable as an index value at all.
+    (map? v)
+      (let [ks (sort (to-list (keys v)))]
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-MAP)
+                    (encode-count (count ks))
+                    (encode-seq ks)
+                    (encode-seq (mapv (fn [k] (get v k)) ks))])))
+
+    ; ── opaque runtime terms ─────────────────────────────────
+    ;
+    ; A pid, port, reference or fun has no meaningful VALUE order — even
+    ; the BEAM only promises a consistent one. They are encoded
+    ; faithfully so they round-trip and compare EQUAL to themselves,
+    ; which is what an index needs; their relative order is arbitrary but
+    ; stable, and each type gets its own tag so at least the type
+    ; boundary is respected.
+    ;
+    ; Storing a pid is rarely a good idea — it does not survive a node
+    ; restart — but refusing it would mean the database is less capable
+    ; than the language it is written in, and that is a worse failure.
+    (erlang/is_pid v) (tagged-opaque TAG-PID v)
+    (erlang/is_port v) (tagged-opaque TAG-PORT v)
+    (erlang/is_reference v) (tagged-opaque TAG-ERLREF v)
+    (erlang/is_function v) (tagged-opaque TAG-FUN v)
+
+    ; A bitstring that is not a valid binary string (a partial byte).
+    (erlang/is_bitstring v) (tagged-opaque TAG-BITSTRING v)
+
+    ; Anything still unrecognised: encoded faithfully, ordered by
+    ; serialized shape. Reaching here means a type the codec has not been
+    ; taught, so `datom.schema` refuses `:db/index` on such an attribute
+    ; rather than letting a range scan be silently wrong.
     :else (erlang/iolist_to_binary
-            (to-list [(tag-byte TAG-REF) (erlang/term_to_binary v) (tag-byte 0)]))))
+            (to-list [(tag-byte TAG-REF) (escape-nul (erlang/term_to_binary v)) (tag-byte 0)]))))
 
 (defn concat-bins
   "Concatenate encoded components into one key."

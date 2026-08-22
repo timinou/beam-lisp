@@ -46,7 +46,11 @@ defmodule BeamLisp.MixProject do
       # joins this app's own supervision tree; there is no second app.
       {:phoenix, "~> 1.8"},
       {:phoenix_live_view, "~> 1.1"},
-      {:phoenix_pubsub, "~> 2.1"}
+      {:phoenix_pubsub, "~> 2.1"},
+      # Rustler carries the datom layer's persistent storage backend
+      # (native/datom_redb). It is a BUILD-time dep for the NIF; the
+      # database runs on its in-memory stores without it.
+      {:rustler, "~> 0.38", runtime: false}
     ]
   end
 end
