@@ -278,6 +278,29 @@ defmodule BeamLisp.AOT do
         quote do: BeamLisp.Env.add_refer(unquote(ns), unquote(sym), unquote(target))
       end
 
+    # A `defnative` declaration is replayed BEFORE the fn links, so the
+    # host module exists and its names are bound by the time anything
+    # resolves against them. Without this an AOT build had no native
+    # backend at all: the host is created by `Module.create` at runtime,
+    # so it was never written to disk, and nothing recreated it
+    # (BUG-021).
+    native_ops =
+      case BeamLisp.Native.declaration(ns) do
+        nil ->
+          []
+
+        {crate, signatures} ->
+          [
+            quote do
+              BeamLisp.Native.declare(
+                unquote(ns),
+                unquote(crate),
+                unquote(Macro.escape(signatures))
+              )
+            end
+          ]
+      end
+
     # fn values + link metadata, so `map f`, interop and later call
     # compilation all resolve against this module.
     fn_ops =
@@ -320,6 +343,7 @@ defmodule BeamLisp.AOT do
       @doc "Re-populates this namespace's var registry; idempotent."
       def __bl_init__ do
         unquote_splicing(ns_ops)
+        unquote_splicing(native_ops)
         unquote_splicing(fn_ops)
         unquote_splicing(value_ops)
         BeamLisp.Env.put_ns_defs(unquote(ns), unquote(ns_defs_escaped))

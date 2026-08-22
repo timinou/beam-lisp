@@ -146,4 +146,48 @@ defmodule BeamLisp.NativeTest do
       refute BeamLisp.Native.available?("my.cool.ns")
     end
   end
+
+  describe "AOT" do
+    test "an emitted namespace replays its native declaration" do
+      # The host module is built by `Module.create` at RUNTIME, so AOT
+      # never wrote it to disk and nothing recreated it. An
+      # AOT-compiled deployment therefore started with NO native
+      # backend: `available?` answered false, the layer above quietly
+      # chose an in-memory store, and a database meant to be durable
+      # was not.
+      #
+      # Silent loss of durability is the worst shape this could take —
+      # no crash, no warning, and the only symptom is data missing
+      # after a restart (BUG-021).
+      BeamLisp.run_file("priv/datom/store-redb.bl")
+
+      out = Path.join(System.tmp_dir!(), "aot_native_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(out)
+
+      mods = BeamLisp.AOT.compile_file("priv/datom/store-redb.bl", output_dir: out)
+      assert length(mods) >= 1
+
+      # The declaration is recorded, which is what `__bl_init__` replays.
+      assert BeamLisp.Native.declaration("datom.store-redb") != nil
+
+      # And the emitted module's init carries it: loading the AOT output
+      # in a deployment brings the host module and the NIF with it.
+      {mod, path} = hd(mods)
+      assert File.exists?(path)
+      assert function_exported?(mod, :__bl_init__, 0)
+
+      assert Code.ensure_loaded?(BeamLisp.Native.Datom.StoreRedb)
+      assert BeamLisp.Native.available?("datom.store-redb")
+    end
+
+    test "the native functions work through the AOT-loaded module" do
+      BeamLisp.run_file("priv/datom/store-redb.bl")
+
+      db_path = Path.join(System.tmp_dir!(), "aot_rt_#{System.unique_integer([:positive])}.redb")
+      db = BeamLisp.Native.Datom.StoreRedb.redb_open(db_path)
+
+      assert :ok = BeamLisp.Native.Datom.StoreRedb.redb_put(db, "k", "v")
+      assert "v" == BeamLisp.Native.Datom.StoreRedb.redb_get(db, "k")
+    end
+  end
 end

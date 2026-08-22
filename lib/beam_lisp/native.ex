@@ -85,6 +85,16 @@ defmodule BeamLisp.Native do
   def declare(ns, crate, signatures) do
     guard_against_duplicates!(ns, signatures)
     guard_against_shadowing!(ns, signatures)
+
+    # Record it, so an AOT build can replay it from the namespace
+    # module's `__bl_init__/0`. The host module is built at RUNTIME by
+    # `Module.create`, so AOT never wrote it to disk — an AOT-compiled
+    # deployment started with no native backend at all, `available?`
+    # answered false, and the layer above quietly chose an in-memory
+    # store. Silent loss of durability, discovered only when data failed
+    # to survive a restart (BUG-021).
+    :ets.insert(table(), {{:native, ns}, {crate, signatures}})
+
     mod = host_module(ns)
 
     unless Code.ensure_loaded?(mod) do
@@ -96,6 +106,42 @@ defmodule BeamLisp.Native do
     end
 
     mod
+  end
+
+  @doc """
+  Every native declaration made so far, as `{ns, {crate, signatures}}`.
+
+  AOT reads this to replay declarations into the modules it emits.
+  """
+  @spec declarations() :: [{String.t(), {String.t(), [{String.t(), non_neg_integer()}]}}]
+  def declarations do
+    :ets.match_object(table(), {{:native, :_}, :_})
+    |> Enum.map(fn {{:native, ns}, decl} -> {ns, decl} end)
+  end
+
+  @doc "The declaration for `ns`, or nil."
+  @spec declaration(String.t()) :: {String.t(), [{String.t(), non_neg_integer()}]} | nil
+  def declaration(ns) do
+    case :ets.lookup(table(), {:native, ns}) do
+      [{_, decl}] -> decl
+      [] -> nil
+    end
+  end
+
+  @table :beam_lisp_native_declarations
+
+  defp table do
+    case :ets.whereis(@table) do
+      :undefined ->
+        try do
+          :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+        rescue
+          ArgumentError -> @table
+        end
+
+      _ ->
+        @table
+    end
   end
 
   @doc """
