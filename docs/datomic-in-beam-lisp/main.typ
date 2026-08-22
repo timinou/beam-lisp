@@ -685,6 +685,51 @@ Two defects *cancelled each other into a passing test*: the datom key collision
 destroyed one of two datoms before the reader's `≤` bug could misjudge them.
 Fixing the writer turned the reader's bug red.
 
+= What the last review found
+
+Two reviewers ran against the substrate changes. Both returned
+"incorrect" with high confidence, and both were right — the 1,225-pair
+property test used only scalars and simple composites, so it never reached
+the shapes that broke. Seven defects, and the pattern in them is worth more
+than the list.
+
+#table(
+  columns: (auto, 1fr),
+  stroke: 0.4pt + gray,
+  [*mixed numerics past 2#super[53]*], [splitting large integers into their own tag assumed a bignum exceeds every float. `1.0e20` is larger than `2^53+1`. Tag order is not numeric order],
+  [*non-uniform encoding shape*], [`-2^53` took a short encoding and `-2^53-1` a long one, so their comparison ended at the length difference, backwards],
+  [*sorted collections*], [a sorted-set is a struct, fell to the map branch, and crashed the encoder outright],
+  [*lazy seqs*], [encoded by their unrealized thunk — neither stable nor comparable, so two equal seqs landed at different keys],
+  [*set vs sequence equality*], [`(= #{1 2} (map identity [1 2]))` was TRUE while `(= #{1 2} [1 2])` was false. Same set, same elements, opposite answers],
+  [*CAS could not report failure*], [it returned the value at the key, so a failed swap was indistinguishable from a successful one whenever the key already held `new` — precisely the case a retry loop exists to detect],
+  [*the retry loop gave up*], [a 100-attempt ceiling was reached under ten concurrent writers, and callers got an exception instead of a slower answer],
+)
+
+Two more were found by following the review's leads rather than by the
+reviewers themselves:
+
+- Deleting the last `use Rustler` removed the only thing that BUILT the
+  crate. The checked-in `.so` kept working until it was deleted, and then
+  the NIF simply stopped existing — with no error except `available?`
+  quietly answering false.
+- An AOT build silently lost its native backend entirely (BUG-021). The
+  host module is created at runtime, so AOT never wrote it to disk. An
+  AOT-compiled deployment started without durability, and the only symptom
+  would have been data missing after a restart.
+
+== The shape of these
+
+Almost none were crashes. They were *silent disagreements* — between
+`=` and `compare`, between an encoding and the order it claims to
+project, between what a CAS returns and what it means, between what runs
+in development and what an AOT build contains.
+
+A bounded retry loop deserves particular note, because it looked
+prudent. A CAS loop that gives up has not made the operation safe, it has
+made it unreliable — and it cannot spin forever anyway, since every failed
+iteration means another writer *succeeded*. The system makes progress even
+when one caller does not.
+
 = What is not implemented
 
 Stated plainly, because a list of what a system does not do is more useful than
