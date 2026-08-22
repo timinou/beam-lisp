@@ -37,7 +37,7 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
-  @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defprotocol satisfies? extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
+  @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defnative defprotocol satisfies? extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
   def new_env(ns \\ Env.current_ns()), do: %{ns: ns, locals: %{}, recur: nil, tail: true}
@@ -542,6 +542,48 @@ defmodule BeamLisp.Compiler do
   # it as the protocol's `:doc` var metadata rather than discarding it —
   # the same split defn/defmacro use, so a docstring is a string in the
   # same position a method list is not confused with one.
+  # (defnative "crate_name" (fn-name arity) ...)
+  #
+  # Declares that this namespace's functions are implemented in NATIVE
+  # code — a Rust NIF built from `native/<crate_name>`. The namespace's
+  # own module becomes the NIF host, so beam-lisp reaches native code
+  # without an Elixir module standing between them.
+  #
+  # This exists because the alternative was worse in a specific way: a
+  # NIF must be loaded into a BEAM module, and before this the only way
+  # to get one was to write an Elixir module of stub functions whose
+  # bodies all read `:erlang.nif_error(:nif_not_loaded)`. That file
+  # contained no logic — it was a DECLARATION that some names are native
+  # — and yet it forced every native capability to enter through Elixir,
+  # which contradicts the doctrine that Elixir keeps only substrate.
+  #
+  # A NIF *is* substrate. The declaration that one exists is not.
+  defp compile_special("defnative", [crate_form | sig_forms], env) do
+    crate = string_of(crate_form)
+
+    signatures =
+      Enum.map(sig_forms, fn sf ->
+        case unwrap_meta(sf) do
+          {:list, [name_f, arity_f]} ->
+            {name_of(name_f), literal_int(arity_f)}
+
+          other ->
+            raise "defnative: expected (fn-name arity), got #{inspect(other)}"
+        end
+      end)
+
+    quote do
+      BeamLisp.Native.declare(unquote(env.ns), unquote(crate), unquote(Macro.escape(signatures)))
+    end
+  end
+
+  defp compile_special("defnative", args, env),
+    do:
+      compile_error(
+        env,
+        "defnative: expected (defnative \"crate\" (fn-name arity)…), got #{inspect(args)}"
+      )
+
   defp compile_special("defprotocol", [name_form | method_forms], env) do
     name = name_of(name_form)
     {doc, method_forms} = split_docstring(method_forms)
@@ -2566,6 +2608,21 @@ defmodule BeamLisp.Compiler do
   # The name of a `{:symbol, name}` token, possibly position-wrapped.
   defp name_of(form), do: name_of_unwrapped(unwrap_meta(form))
   defp name_of_unwrapped({:symbol, name}), do: name
+
+  # A literal string in a form (reader-produced literals are bare terms).
+  defp string_of(form) do
+    case unwrap_meta(form) do
+      s when is_binary(s) -> s
+      other -> raise "expected a string literal, got #{inspect(other)}"
+    end
+  end
+
+  defp literal_int(form) do
+    case unwrap_meta(form) do
+      n when is_integer(n) -> n
+      other -> raise "expected an integer literal, got #{inspect(other)}"
+    end
+  end
 
   # Raise a compile error carrying the current position and offending form.
   defp compile_error(env, message, form \\ nil) do

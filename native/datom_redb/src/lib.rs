@@ -107,7 +107,7 @@ fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 ///
 /// Dirty IO: this creates and mmaps a file.
 #[rustler::nif(schedule = "DirtyIo")]
-fn open(path: String) -> NifResult<ResourceArc<DbHandle>> {
+fn redb_open(path: String) -> NifResult<ResourceArc<DbHandle>> {
     let db = Database::create(Path::new(&path)).map_err(|e| err(e))?;
 
     // Create the table eagerly so that a read against a brand-new
@@ -130,7 +130,7 @@ fn open(path: String) -> NifResult<ResourceArc<DbHandle>> {
 
 /// `-get`: the value at `key`, or `nil`.
 #[rustler::nif(schedule = "DirtyIo")]
-fn get<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Term<'a>> {
+fn redb_get<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Term<'a>> {
     let db = handle.db.lock().map_err(|e| err(e))?;
     let txn = db.begin_read().map_err(|e| err(e))?;
     let table = txn.open_table(DATOMS).map_err(|e| err(e))?;
@@ -151,7 +151,7 @@ fn get<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>, key: Binary) -> NifResul
 ///
 /// A `nil` bound (passed as an empty option) means unbounded.
 #[rustler::nif(schedule = "DirtyIo")]
-fn range<'a>(
+fn redb_range<'a>(
     env: Env<'a>,
     handle: ResourceArc<DbHandle>,
     start: Option<Binary>,
@@ -189,7 +189,7 @@ fn range<'a>(
 
 /// `-put`: store `value` at `key`.
 #[rustler::nif(schedule = "DirtyIo")]
-fn put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifResult<Atom> {
+fn redb_put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifResult<Atom> {
     let db = handle.db.lock().map_err(|e| err(e))?;
     let mut txn = db.begin_write().map_err(|e| err(e))?;
     txn.set_durability(Durability::Immediate)
@@ -206,7 +206,7 @@ fn put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifResult<A
 
 /// `-delete`: remove `key`. Idempotent.
 #[rustler::nif(schedule = "DirtyIo")]
-fn delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
+fn redb_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
     let db = handle.db.lock().map_err(|e| err(e))?;
     let mut txn = db.begin_write().map_err(|e| err(e))?;
     txn.set_durability(Durability::Immediate)
@@ -232,7 +232,7 @@ fn delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
 /// getting the transaction boundary wrong silently reintroduces lost
 /// updates.
 #[rustler::nif(schedule = "DirtyIo")]
-fn compare_and_swap<'a>(
+fn redb_cas<'a>(
     env: Env<'a>,
     handle: ResourceArc<DbHandle>,
     key: Binary,
@@ -284,7 +284,7 @@ fn compare_and_swap<'a>(
 /// and a backend that grouped the puts ahead of the deletes would end
 /// with the key absent — the value silently lost.
 #[rustler::nif(schedule = "DirtyIo")]
-fn commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom> {
+fn redb_commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom> {
     let db = handle.db.lock().map_err(|e| err(e))?;
     let mut txn = db.begin_write().map_err(|e| err(e))?;
     txn.set_durability(Durability::Immediate)
@@ -328,4 +328,16 @@ fn commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom> {
 
 use rustler::Encoder;
 
-rustler::init!("Elixir.BeamLisp.Datom.Redb");
+/// A marker the host module only has once the NIF has actually
+/// replaced its stubs. `BeamLisp.Native.available?/1` tests for it,
+/// which is how a beam-lisp store decides whether to offer itself.
+#[rustler::nif]
+fn __nif_loaded__() -> bool {
+    true
+}
+
+// The host module is created by `defnative` in the beam-lisp namespace
+// that uses it — `datom.store-redb` — so there is no Elixir module in
+// the path. The name here must match what `BeamLisp.Native.host_module/1`
+// derives from that namespace.
+rustler::init!("Elixir.BeamLisp.Native.Datom.StoreRedb");
