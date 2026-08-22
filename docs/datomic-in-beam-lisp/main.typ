@@ -685,6 +685,80 @@ Two defects *cancelled each other into a passing test*: the datom key collision
 destroyed one of two datoms before the reader's `≤` bug could misjudge them.
 Fixing the writer turned the reader's bug red.
 
+= The database and the scheduler
+
+Datomic's central claim is that a database is a VALUE: immutable, safe
+to hold, safe to pass around. On the JVM that is mostly about safety —
+you still have threads, and threads sharing a value is the absence of a
+problem rather than the presence of a capability.
+
+On the BEAM it becomes something more. A process is cheap enough to make
+one per request. Isolation is the default. `You may share this safely`
+turns into `every one of ten thousand processes can hold its own
+consistent view, and none can interfere with another`.
+
+That is not a feature either system lists, because neither can see it
+alone.
+
+== What the pairing makes possible
+
+- A snapshot per process, at no cost. `(db conn)` captures a basis, not
+  data, so 200 processes taking 200 views copy nothing. There is no
+  connection to pool, because a db value is not a resource.
+- A process registry that remembers. A pid is a term, terms are values,
+  and `:db.type/term` makes one an indexed, uniquely-identifying
+  attribute — so `what is this worker doing?` and `what WAS it doing?`
+  are the same query against the same data.
+- Supervision that restores rather than repairs. A crashed process held
+  a reference to an immutable value; the restarted one takes another.
+  There is nothing to fix because nothing was mutated.
+- A migration with a `before`. `code_change/3` is handed the old state
+  and asked to produce the new one, and the hard part has always been
+  knowing whether it was right. Here the previous version is still
+  addressable.
+
+`Let it crash` and `never destroy a fact` turn out to be the same
+instinct approached from opposite directions: a failure is information,
+so record it rather than overwrite it.
+
+== The writer
+
+Readers were never the risk. Writers sharing a connection are, and the
+BEAM makes that case ORDINARY rather than exotic.
+
+Writes are serialized through one process per store. The BEAM answer to
+a race is not a mutex, it is a process that owns the thing. Reads do not
+go through it — `db` reads an atom and never blocks — which is the
+correct asymmetry for a database whose central claim is that a database
+is a value.
+
+Four details that are not incidental, each of which was a reproduced
+defect before it was a decision:
+
+#table(
+  columns: (auto, 1fr),
+  stroke: 0.4pt + gray,
+  [*it belongs to the store*], [keyed by handle, two connections over one store were two databases wearing one store: a write through either was invisible to the other],
+  [*every mutation, not the obvious one*], [`install-schema!` is also a read-modify-write. Outside the writer, 80 concurrent installs all returned OK and 74 survived a reopen],
+  [*re-entrancy*], [`install-schema!` ends by transacting, so the writer called itself. The guard is not a workaround: the guarantee is one writer at a time, and this IS that writer],
+  [*death, and errors*], [the pid lived in an immutable field, so a replacement was started that nothing called. And an exception raised inside the writer killed it, losing the structured problem list and breaking the NEXT caller],
+)
+
+== A note on writing examples
+
+Both concurrency tutorials were written to demonstrate finished work.
+The first one to spawn a process found a bug in ten seconds: twenty
+transactions committed, twenty acknowledged, sixteen visible.
+
+Nothing was lost — every datom was on disk. The basis was updated with
+`reset!`, so a slower transaction holding a LOWER id could land last and
+rewind the high-water mark. The caller held a success report that was
+true and a later read that disagreed with it.
+
+An example uses an API the way its NAME invites, which is not how its
+tests use it. That is the third time in this project that writing a
+tutorial found defects a passing suite did not.
+
 = What the last review found
 
 Two reviewers ran against the substrate changes. Both returned
