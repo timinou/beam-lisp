@@ -7,6 +7,26 @@ defmodule BeamLisp.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
+      # AFTER :elixir, not before. A Mix compiler task must itself be
+      # compiled before Mix can find it, so putting it first made a
+      # clean checkout (or a fresh MIX_ENV) fail with "the task could
+      # not be found" — the classic bootstrap trap, and one that only
+      # appears when `_build` is empty, which is exactly when a new
+      # contributor meets it.
+      #
+      # Running after :elixir is also correct on the merits: the NIF is
+      # loaded lazily by `defnative` at namespace-require time, not at
+      # module-compile time, so it only has to exist before the first
+      # CALL.
+      compilers: Mix.compilers() ++ [:beam_lisp_native],
+      # `beam_lisp_native` builds the Rust crates that `defnative`
+      # namespaces load. It runs BEFORE :elixir so a NIF is present
+      # before anything tries to load it.
+
+      # `beam_lisp_native` builds the Rust crates that `defnative`
+      # namespaces load. It runs BEFORE :elixir so a NIF is present
+      # before anything tries to load it.
+
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -47,9 +67,9 @@ defmodule BeamLisp.MixProject do
       {:phoenix, "~> 1.8"},
       {:phoenix_live_view, "~> 1.1"},
       {:phoenix_pubsub, "~> 2.1"},
-      # Rustler carries the datom layer's persistent storage backend
-      # (native/datom_redb). It is a BUILD-time dep for the NIF; the
-      # database runs on its in-memory stores without it.
+      # Rustler is a Rust-side dependency of native/datom_redb (see its
+      # Cargo.toml). It is NOT needed as a Mix dep: `defnative` builds
+      # and loads the crate itself, via the :beam_lisp_native compiler.
       {:rustler, "~> 0.38", runtime: false}
     ]
   end

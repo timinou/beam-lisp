@@ -222,8 +222,14 @@ fn redb_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
 /// Compare-and-swap: write `new` at `key` only if the current value is
 /// `expected` (or the key is absent, when `expected` is `None`).
 ///
-/// Returns the value now at the key. The caller compares it against
-/// what they asked for to learn whether they won.
+/// Returns `{swapped?, value_now_at_key}`.
+///
+/// The boolean is not redundant. Returning only the value made a FAILED
+/// swap indistinguishable from a successful one whenever the current
+/// value already equalled `new` — a caller comparing the result against
+/// what they asked for would conclude they had won a race they lost.
+/// That is precisely the situation a retry loop must detect, and the
+/// one where two writers converge on the same value by different paths.
 ///
 /// **The read and the write are inside ONE write transaction.** A `get`
 /// followed by a separate `put` is not a CAS — it is a race with a
@@ -245,6 +251,7 @@ fn redb_cas<'a>(
         .map_err(|e| err(e))?;
 
     let result: Vec<u8>;
+    let swapped: bool;
     {
         let mut table = txn.open_table(DATOMS).map_err(|e| err(e))?;
 
@@ -264,13 +271,20 @@ fn redb_cas<'a>(
                 .insert(key.as_slice(), new.as_slice())
                 .map_err(|e| err(e))?;
             result = new.as_slice().to_vec();
+            swapped = true;
         } else {
             result = current.unwrap_or_default();
+            swapped = false;
         }
     }
 
     txn.commit().map_err(|e| err(e))?;
-    to_binary(env, &result).map(|b| b.to_term(env))
+
+    let value = to_binary(env, &result)?.to_term(env);
+    Ok(rustler::types::tuple::make_tuple(
+        env,
+        &[swapped.encode(env), value],
+    ))
 }
 
 /// `-commit`: apply a whole batch atomically.

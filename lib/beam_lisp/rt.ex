@@ -983,8 +983,13 @@ defmodule BeamLisp.RT do
   #
   # They stay ADJACENT so the two still sort together; only the tie
   # between them is broken, and broken the way `=` already breaks it.
-  defp rank(%LazySeq{}), do: 7
   defp rank(x) when is_list(x), do: 7
+  # A LAZY SEQ ranks with VECTORS, not with cons lists, because `=`
+  # puts it there: `(= [1 2] (map identity [1 2]))` is true while
+  # `(= [1 2] '(1 2))` is false. Ranking it as a list made `compare`
+  # disagree with `=` about the same pair — the defect BUG-019 fixed for
+  # vector-vs-list, reappearing one type over.
+  defp rank(%LazySeq{}), do: 7.1
   defp rank(%BeamLisp.Vector{}), do: 7.1
 
   # Sets and maps are NOT sequential and are not equal to a vector, so
@@ -1268,6 +1273,19 @@ defmodule BeamLisp.RT do
   @doc "jank's `cpp/jank.runtime.bit_not`: bitwise complement, `~x` (two's-complement negation minus one)."
   def bit_not(x), do: :erlang.bnot(x)
 
+  # Whether `x` is an unordered collection (set or map) rather than a
+  # sequence. Records are maps by design, so they count.
+  defp set_or_map?(%Set{}), do: true
+  defp set_or_map?(%SortedSet{}), do: true
+  defp set_or_map?(%SortedMap{}), do: true
+  # is_map-ok: classifying a value for equality dispatch, not performing
+  # a collection operation.
+  defp set_or_map?(x) when is_map(x) and not is_struct(x), do: true
+  defp set_or_map?(%BeamLisp.Vector{}), do: false
+  defp set_or_map?(%LazySeq{}), do: false
+  defp set_or_map?(x) when is_struct(x), do: BeamLisp.Record.record?(x)
+  defp set_or_map?(_), do: false
+
   @doc """
   Clojure `=`: realize-and-compare element-wise with short-circuiting, so
   `(= (range) '(1 2))` stops at the first mismatch instead of realizing an
@@ -1277,6 +1295,19 @@ defmodule BeamLisp.RT do
   """
   def eqv(a, b) do
     cond do
+      # Walk whenever an operand is lazy *or* an improper list (a
+      # partially-realized `[h | LazySeq]`), so a lazy interleave result —
+      # or an empty lazy seq against either `()` or `[]` — compares
+      # element-wise instead of failing the structural `==`.
+      # A SET or MAP is never equal to a sequence, however its elements
+      # line up. Checked BEFORE the lazy walk, which realizes both sides
+      # and compares element-wise without asking what kind of thing it
+      # is holding — so `(= #{1 2} (map identity [1 2]))` answered TRUE
+      # while `(= #{1 2} [1 2])` answered false, for the same set and
+      # the same two elements.
+      set_or_map?(a) != set_or_map?(b) ->
+        false
+
       # Walk whenever an operand is lazy *or* an improper list (a
       # partially-realized `[h | LazySeq]`), so a lazy interleave result —
       # or an empty lazy seq against either `()` or `[]` — compares

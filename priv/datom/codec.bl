@@ -252,6 +252,28 @@
         acc
         (recur (erlang/bsr v 8) (into [(rem v 256)] acc))))))
 
+(defn encode-bignum-magnitude
+  "An integer's exact value as order-preserving bytes, for use as a
+   TIE-BREAK after a float prefix.
+
+   Only reached for integers past 2^53, where several distinct integers
+   share one float. Those need distinguishing from each other but never
+   from a value whose float already differs \u2014 that comparison is settled
+   by the prefix."
+  [n]
+  (if (>= n 0)
+    (let [digits (big-magnitude-bytes n)]
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte 1)
+                  (encode-count (count digits))
+                  (erlang/list_to_binary (to-list digits))])))
+    (let [digits (big-magnitude-bytes (- 0 n))]
+      (erlang/iolist_to_binary
+        (to-list [(tag-byte 0)
+                  (encode-count (- 4294967295 (count digits)))
+                  (erlang/list_to_binary
+                    (to-list (mapv (fn [b] (- 255 b)) digits)))])))))
+
 (defn- encode-bignum
   "An integer of ANY magnitude, order-preserving.
 
@@ -343,34 +365,47 @@
     ; represented exactly, so those keep the integer path and sort ABOVE
     ; every float — which is where they belong numerically, since any
     ; such integer exceeds the floats that could be confused with it.
-    (int? v)
-      (cond
-        ; Exactly representable as a float: share the numeric tag so
-        ; ints and floats interleave.
-        (and (<= v MAX-EXACT-INT) (>= v (- 0 MAX-EXACT-INT)))
-          (erlang/iolist_to_binary
-            (to-list [(tag-byte TAG-NUM) (encode-float (erlang/float v))]))
-        ; Past float precision but inside 64 bits: exact, fixed-width.
-        (and (<= v INT-MAX) (>= v INT-MIN))
-          (erlang/iolist_to_binary
-            (to-list [(tag-byte TAG-BIGINT) (encode-int v)]))
-        ; Arbitrary precision. The BEAM has it, so this database has it.
-        :else (encode-bignum v))
-    ; A float reaches here whenever an attribute is declared WITHOUT a
-    ; `:db/valueType` (validation then accepts any value). Left to the
-    ; `:else` branch it got `term_to_binary`, which orders by serialized
-    ; SHAPE — so 10.0 sorted before 2.0 and a range predicate over such
-    ; an attribute returned the wrong rows, silently.
+    ; EVERY number under one tag, ordered by its float magnitude.
     ;
-    ; Encoded as the IEEE-754 bits with the sign convention flipped:
-    ; positives get their high bit set, negatives are fully inverted.
-    ; That is the standard transform making float bit patterns compare
-    ; as numbers do — and it puts them in their own tag, adjacent to
-    ; integers rather than interleaved (comparing across int and float
-    ; would need a shared representation, which no ordered store gives
-    ; for free).
+    ; Splitting large integers into their own tags was wrong in a way
+    ; that only shows past 2^53: it assumed a bignum exceeds every
+    ; float, but `1.0e20` is larger than `2^53 + 1` and `1.0e40` is
+    ; larger than most bignums anyone writes. Tag order is not numeric
+    ; order, so the tags had to go.
+    ;
+    ; The float encoding is order-preserving across the whole real line,
+    ; so it orders every number correctly. Where two distinct integers
+    ; share a float (past 2^53, where floats are sparse), an exact
+    ; SUFFIX breaks the tie — it never affects values whose floats
+    ; already differ, because those differ in the leading 8 bytes.
+    ; EVERY number: the same tag, the same 8-byte float prefix, and the
+    ; same one-byte class marker. Uniform SHAPE is the requirement —
+    ; when two numbers share a float, the comparison continues into the
+    ; suffix, and it can only do that if both have one.
+    ;
+    ; -2^53 and -2^53-1 collapse onto the same float. Giving the first a
+    ; short encoding and the second a long one meant the comparison
+    ; ended at the length difference, in the wrong direction.
+    ;
+    ;   marker 0  a negative integer needing an exact tie-break
+    ;   marker 1  a float, or an integer a float represents exactly
+    ;   marker 2  a positive integer needing an exact tie-break
+    ;
+    ; So among values sharing a float, exact-negatives sort below the
+    ; float, which sorts below exact-positives — which is right, since
+    ; an integer needing a tie-break is one the float ROUNDED to.
+    (int? v)
+      (if (and (<= v MAX-EXACT-INT) (>= v (- 0 MAX-EXACT-INT)))
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-NUM) (encode-float (erlang/float v)) (tag-byte 1)]))
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-NUM)
+                    (encode-float (erlang/float v))
+                    (tag-byte (if (>= v 0) 2 0))
+                    (encode-bignum-magnitude v)])))
+
     (float? v) (erlang/iolist_to_binary
-                 (to-list [(tag-byte TAG-NUM) (encode-float v)]))
+                 (to-list [(tag-byte TAG-NUM) (encode-float v) (tag-byte 1)]))
     ; The string's OWN bytes, never `term_to_binary`: that wraps a value
     ; in a tagged envelope carrying a LENGTH PREFIX, so encoded strings
     ; sort by length before content (`z` < `aa`, `abc` > `b`). A first
@@ -406,13 +441,43 @@
     ;
     ; Beam-lisp vectors are lists to the layers above, so they take this
     ; path and sort with them.
-    (vector? v)
+    ; A LAZY SEQ is `=` to a vector with the same elements (wave 3's
+    ; rule: `[] ≠ ()` but a realized lazy seq equals either), so it
+    ; encodes as one. Falling through to the opaque branch encoded it by
+    ; its unrealized THUNK, which is neither stable nor comparable — two
+    ; equal seqs would have landed at different keys.
+    (or (vector? v) (BeamLisp.LazySeq/lazy? v))
       (erlang/iolist_to_binary
-        (to-list [(tag-byte TAG-VECTOR) (encode-seq (to-list v)) (tag-byte 0)]))
+        (to-list [(tag-byte TAG-VECTOR) (encode-seq (into [] (seq v))) (tag-byte 0)]))
 
     (erlang/is_list v)
       (erlang/iolist_to_binary
         (to-list [(tag-byte TAG-LIST) (encode-seq (to-list v)) (tag-byte 0)]))
+
+    ; A SORTED collection encodes exactly as its hashed sibling.
+    ; `(= (sorted-set 1 2) #{1 2})` is true — sortedness is an INDEX
+    ; property, not part of a value's identity — so the encodings must
+    ; match or an index holds two keys for one value.
+    ;
+    ; Without these branches a sorted-set fell through to `map?` (it is
+    ; a struct) and crashed the encoder outright: `keys` does not apply
+    ; to it. A hard crash on a legitimate value, reached the moment
+    ; anyone stored one.
+    (sorted-set? v)
+      ; `seq`, not `to-list`: `to-list` has no sorted-set clause and
+      ; raises. They are already in order, but sorting is harmless and
+      ; keeps this identical to the hashed-set branch.
+      (let [ms (sort (into [] (seq v)))]
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-SET) (encode-count (count ms)) (encode-seq ms)])))
+
+    (sorted-map? v)
+      (let [ks (sort (into [] (keys v)))]
+        (erlang/iolist_to_binary
+          (to-list [(tag-byte TAG-MAP)
+                    (encode-count (count ks))
+                    (encode-seq ks)
+                    (encode-seq (mapv (fn [k] (get v k)) ks))])))
 
     ; A SET encodes its members in sorted order, so two equal sets built
     ; by different insertion orders encode identically — the property
