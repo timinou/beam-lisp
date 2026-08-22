@@ -42,6 +42,23 @@ defmodule BeamLisp.Native do
   var, so callers cannot tell it apart from a `.bl` function — which is
   the point.
 
+  ## One crate, one namespace
+
+  `rustler::init!("Elixir.BeamLisp.Native.Datom.StoreRedb")` names its
+  host module at COMPILE time, so a crate can be loaded by exactly one
+  namespace — the one whose name it was built for. A second namespace
+  declaring the same crate gets `{:bad_lib, "Library module name ...
+  does not match calling module ..."}` and `available?/1` answers false.
+
+  That is a real constraint rather than an oversight, and it is the
+  right one: the crate and the namespace are two halves of one
+  interface, and the module name is how they agree on it. Sharing a
+  crate between namespaces would mean the Rust side no longer knows who
+  it is talking to.
+
+  A crate meant for several namespaces should be split, or should export
+  a single namespace that the others require.
+
   ## Name translation
 
   beam-lisp names are kebab-case; NIF names must match what
@@ -66,11 +83,12 @@ defmodule BeamLisp.Native do
   """
   @spec declare(String.t(), String.t(), [{String.t(), non_neg_integer()}]) :: module()
   def declare(ns, crate, signatures) do
+    guard_against_duplicates!(ns, signatures)
     guard_against_shadowing!(ns, signatures)
     mod = host_module(ns)
 
     unless Code.ensure_loaded?(mod) do
-      create_host(mod, crate, signatures)
+      create_host(mod, ns, crate, signatures)
     end
 
     for {name, arity} <- signatures do
@@ -98,6 +116,24 @@ defmodule BeamLisp.Native do
     _ -> false
   catch
     _, _ -> false
+  end
+
+  # One name, one arity. A repeated name would register two links for
+  # it, and the second would win — so the first declaration would
+  # silently do nothing, and a call meant for it would reach a function
+  # of a different arity. Erlang allows the same name at several
+  # arities; this does not, because a beam-lisp var binds one function.
+  defp guard_against_duplicates!(ns, signatures) do
+    duplicates =
+      signatures
+      |> Enum.map(fn {name, _} -> name end)
+      |> Enum.frequencies()
+      |> Enum.filter(fn {_, count} -> count > 1 end)
+      |> Enum.map(fn {name, _} -> name end)
+
+    if duplicates != [] do
+      raise "defnative in #{ns}: #{Enum.join(duplicates, ", ")} declared more than once"
+    end
   end
 
   # A native name that collides with a core function is REFUSED, because
@@ -142,7 +178,7 @@ defmodule BeamLisp.Native do
     Module.concat([BeamLisp.Native | segments])
   end
 
-  defp create_host(mod, crate, signatures) do
+  defp create_host(mod, ns, crate, signatures) do
     # Rustler installs as `priv/native/<crate>.so` (no `lib` prefix), and
     # `:erlang.load_nif/2` wants the path WITHOUT the extension.
     lib_path = Path.join(:code.priv_dir(:beam_lisp), "native/#{crate}")
@@ -170,10 +206,27 @@ defmodule BeamLisp.Native do
             # A missing or unbuildable NIF leaves the module unloaded
             # rather than crashing the whole compile. `available?/1`
             # then answers false and a caller can choose another store.
+            # A load failure is REPORTED, always. It used to be silent
+            # behind an env var, so an arity that disagreed with the
+            # Rust function — or a stub list that had drifted from the
+            # crate — left `available?` quietly answering false and the
+            # backend simply absent. The caller then chose an in-memory
+            # store and never learned why.
+            #
+            # `{:bad_lib, "Function not found"}` in particular names the
+            # exact function whose signature does not match, which is
+            # the whole diagnosis. Swallowing it wasted that.
             {:error, reason} ->
-              if System.get_env("BEAM_LISP_NIF_DEBUG") do
-                IO.warn("NIF #{unquote(crate)} did not load: #{inspect(reason)}")
-              end
+              IO.warn("""
+              the NIF for #{unquote(ns)} did not load: #{inspect(reason)}
+
+              crate:   #{unquote(crate)}
+              library: #{unquote(lib_path)}.so
+
+              A "Function not found" reason means a declared name or
+              arity disagrees with the crate; run `mix compile` if the
+              library is simply missing.
+              """)
 
               :ok
           end
