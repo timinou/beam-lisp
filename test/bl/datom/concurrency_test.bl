@@ -1,0 +1,100 @@
+; concurrency_test.bl — what happens when writers overlap.
+;
+; A db value is immutable, so readers were never the risk. Writers
+; sharing one connection are, and the BEAM makes that case ORDINARY
+; rather than exotic: a process per request is the default shape of a
+; program here, so twenty concurrent transactions is not a stress test,
+; it is Tuesday.
+;
+; These tests exist because the first example that spawned writers found
+; a bug in the first ten seconds (BUG-022).
+
+(ns datom.concurrency.test
+  (:require [datom] [datom.conn] [datom.db]))
+
+(defn- unique-conn []
+  (datom/connect
+    [{:db/ident :o/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :o/tag :db/valueType :db.type/string}]))
+
+(defn- await-all [tasks]
+  (to-list (map (fn [t] (Task/await t)) tasks)))
+
+(defn- concurrent-writes [conn n]
+  (await-all
+    (to-list (map (fn [i]
+                    (Task/async
+                      (fn [] (datom/transact! conn [{:db/id -1 :o/id (+ 1000 i)}]))))
+                  (range n)))))
+
+(deftest every-committed-write-is-visible
+  ; The defect this pins was not data loss — every datom was on disk the
+  ; whole time. The basis was updated with `reset!`, so a slower
+  ; transaction holding a LOWER tx id could land last and rewind the
+  ; high-water mark, filtering every datom above it out of every read.
+  ;
+  ; Twenty writes, all committed, all acknowledged, all durable, and
+  ; sixteen visible. The caller held a success report that was true, and
+  ; a subsequent read that disagreed with it.
+  (let [conn (unique-conn)
+        reports (concurrent-writes conn 20)]
+    (is (= 20 (count reports)) "every transaction returned")
+    (is (= 20 (count (into #{} (map :tx reports)))) "no two shared a tx id")
+    (is (= 20 (count (into #{} (map (fn [r] (get (:tempids r) -1)) reports))))
+        "no two shared an entity id")
+    (is (= 20 (count (datom/q '[:find ?v :where [?e :o/id ?v]] (datom/db conn))))
+        "and every one of them is VISIBLE")))
+
+(deftest the-basis-only-moves-forward
+  (let [conn (unique-conn)
+        reports (concurrent-writes conn 20)
+        highest (apply max (map :tx reports))]
+    (is (= highest (datom/basis-t (datom/db conn)))
+        "the basis is the highest committed transaction, never a lower one")))
+
+(deftest a-snapshot-is-unmoved-by-concurrent-writers
+  ; The property the whole design rests on. If this can fail, `db as a
+  ; value` is a claim rather than a guarantee.
+  (let [conn (unique-conn)
+        _ (datom/transact! conn [{:db/id -1 :o/id 1}])
+        snapshot (datom/db conn)
+        q '[:find (count ?e) :where [?e :o/id _]]
+        before (datom/q q snapshot)]
+    (concurrent-writes conn 16)
+    (is (= before (datom/q q snapshot))
+        "the value answers the same question the same way, afterwards")
+    (is (= (set [[17]]) (datom/q q (datom/db conn)))
+        "while the connection has moved on")))
+
+(deftest concurrent-readers-in-their-own-processes-agree
+  ; Each query runs in a separate BEAM process against the same value.
+  (let [conn (unique-conn)
+        _ (concurrent-writes conn 12)
+        db (datom/db conn)
+        q '[:find (count ?e) :where [?e :o/id _]]
+        results (to-list
+                  (Enum/to_list
+                    (Task/async_stream (range 8) (fn [_] (datom/q q db)))))]
+    (is (= 8 (count results)))
+    (is (= 1 (count (into #{} (map (fn [r]
+                                     (let [[_ok v] (to-list (erlang/tuple_to_list r))]
+                                       v))
+                                   results))))
+        "eight processes, one answer")))
+
+(deftest a-unique-value-is-still-unique-under-concurrency
+  ; Two processes racing to claim the SAME identity. One must win and one
+  ; must upsert onto it; they must not produce two entities.
+  (let [conn (unique-conn)
+        tasks (to-list (map (fn [i]
+                              (Task/async
+                                (fn [] (try
+                                         (datom/transact! conn
+                                           [{:db/id -1 :o/id 7 :o/tag (str "w" i)}])
+                                         :ok
+                                         (catch e :rejected)))))
+                            (range 8)))]
+    (await-all tasks)
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :o/id 7]] (datom/db conn))))
+        "one identity, one entity, however many writers raced for it")))

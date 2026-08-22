@@ -1,0 +1,265 @@
+; 07-processes.bl — the database and the scheduler
+;
+; Run: mix beam_lisp.run --path priv examples/datom/07-processes.bl
+;
+; ── Why this pairing is not a coincidence ─────────────────────────────
+;
+; Datomic's central claim is that a database is a VALUE: immutable, and
+; therefore safe to hold, pass around, and read for as long as you like.
+; On the JVM that claim is mostly about safety — you still have threads,
+; and threads sharing a value is merely the absence of a problem.
+;
+; On the BEAM it becomes something more. A process is cheap enough to
+; make one per request, per connection, per job. Isolation is the
+; default. What was `you may share this safely` turns into `every one of
+; ten thousand processes can hold its own consistent view of the world,
+; and none of them can interfere with another`.
+;
+; That is what this file shows: not that the database survives
+; concurrency, but that the two designs answer the SAME question and
+; happen to answer it identically.
+
+(ns examples.datom.processes
+  (:require [datom]))
+
+(defn- h [title]
+  (println)
+  (println (str "── " title " " (apply str (repeat (max 3 (- 68 (count title))) "─")))))
+
+(def conn
+  (datom/connect
+    [{:db/ident :order/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :order/total :db/valueType :db.type/long}
+     {:db/ident :order/status :db/valueType :db.type/keyword}]))
+
+(datom/transact! conn
+  (to-list (map (fn [i] {:db/id (- 0 (+ i 1))
+                         :order/id i
+                         :order/total (* i 10)
+                         :order/status (if (= 0 (rem i 3)) :shipped :pending)})
+                (range 60))))
+
+;; ── 1. A snapshot per process ───────────────────────────────────────
+;;
+;; The classic problem: a report reads a table in pieces while writers
+;; change it underneath, and the pieces do not agree. Every SQL database
+;; answers this with a transaction isolation LEVEL — a setting, with
+;; costs, that you must know to choose.
+;;
+;; Here it is not a setting. `(db conn)` is a value. A process that holds
+;; one is reading a world that cannot change, so there is nothing to
+;; isolate it from.
+
+(h "1. Ten processes, ten questions, one instant in time")
+
+(def snapshot (datom/db conn))
+
+(def answers
+  (Task/async_stream
+    [[:count-all      '[:find (count ?e) :where [?e :order/id _]]]
+     [:pending        '[:find (count ?e) :where [?e :order/status :pending]]]
+     [:shipped        '[:find (count ?e) :where [?e :order/status :shipped]]]
+     [:revenue        '[:find (sum ?t) :where [?e :order/total ?t]]]
+     [:largest        '[:find (max ?t) :where [?e :order/total ?t]]]]
+    (fn [pair]
+      ; Each of these runs in its own process, against the SAME value.
+      (let [[label query] (to-list pair)]
+        [label (datom/q query snapshot)]))))
+
+(doseq [r (to-list (Enum/to_list answers))]
+  (let [[_ok pair] (to-list (erlang/tuple_to_list r))
+        [label result] (to-list pair)]
+    (println "   " label "→" result)))
+
+(println)
+(println "  Five processes. One instant. No locks, no isolation level, no")
+(println "  coordination — because there was nothing to coordinate.")
+
+;; ── 2. Writers cannot disturb a reader ──────────────────────────────
+;;
+;; The stronger claim. While the reader above was running, other
+;; processes were free to write. Let us prove the snapshot does not
+;; notice.
+
+(h "2. Twenty concurrent writers, and a reader that does not flinch")
+
+(def before (datom/db conn))
+
+(def writers
+  (to-list (map (fn [i]
+                  (Task/async
+                    (fn []
+                      (datom/transact! conn
+                        [{:db/id (- 0 (+ i 100))
+                          :order/id (+ 1000 i)
+                          :order/total 5
+                          :order/status :pending}]))))
+                (range 20))))
+
+(doseq [t writers] (Task/await t))
+
+(def q-count '[:find (count ?e) :where [?e :order/id _]])
+
+(println "  the value taken before the writes:" (datom/q q-count before))
+(println "  the value taken after them:       " (datom/q q-count (datom/db conn)))
+(println)
+(println "  Both are correct. They are answers to different questions,")
+(println "  and each says WHICH question it answered — which is what a")
+(println "  timestamp on a report is supposed to mean and rarely does.")
+
+;; ── 3. The database as a process's own memory ───────────────────────
+;;
+;; A BEAM process holds state by looping with it. Usually that state is
+;; an ad-hoc map, and every process invents its own shape.
+;;
+;; A db value slots straight into that loop. The process gets query,
+;; history and pull over its state, and the state is still just a value
+;; it happens to be holding.
+
+(h "3. A db value as process state")
+
+(def parent (erlang/self))
+
+(def worker
+  (erlang/spawn
+    (fn []
+      ; This process captured a db value when it started. It will keep
+      ; answering from that world no matter what anyone else does.
+      (let [mine before
+            total (datom/q '[:find (sum ?t) :where [?e :order/total ?t]] mine)]
+        (erlang/send parent
+          (erlang/list_to_tuple (to-list [:report (datom/basis-t mine) total])))))))
+
+(Process/sleep 200)
+(println "  a worker computed its report from a world of its own;")
+(println "  meanwhile the connection has moved on to basis"
+         (datom/basis-t (datom/db conn)))
+
+;; ── 4. A pid is a value, so a process is an entity ──────────────────
+;;
+;; This is where the two systems stop being merely compatible.
+;;
+;; Datomic has eight value types, because the JVM made it choose a
+;; serialization. The BEAM already has a universal term with a total
+;; order — so the value type here is `any term`, and that includes the
+;; runtime's own identities.
+;;
+;; A process registry that is also a temporal database is the result:
+;; you can ask what a worker is doing, and you can ask what it WAS
+;; doing, in the same language, of the same data.
+
+(h "4. A process registry that remembers")
+
+(def reg
+  (datom/connect
+    [{:db/ident :w/pid :db/valueType :db.type/term
+      :db/unique :db.unique/identity}
+     {:db/ident :w/role :db/valueType :db.type/keyword}
+     {:db/ident :w/task :db/valueType :db.type/string}]))
+
+(def workers
+  (to-list (map (fn [i] (erlang/spawn (fn [] (Process/sleep 5000)))) (range 3))))
+
+(datom/transact! reg
+  (to-list (map (fn [pair]
+                  (let [[i p] (to-list pair)]
+                    {:db/id (- 0 (+ i 1))
+                     :w/pid p
+                     :w/role (if (= i 0) :coordinator :worker)
+                     :w/task (str "shard-" i)}))
+                (map-indexed (fn [i p] [i p]) workers))))
+
+(def coordinator (first workers))
+
+(println "  who is the coordinator?")
+(println "   "
+  (datom/q '[:find ?t :where [?e :w/role :coordinator] [?e :w/task ?t]]
+           (datom/db reg)))
+
+(println "  what is THIS pid doing?  " coordinator)
+(println "   "
+  (datom/q '[:find ?t :in $ ?p :where [?e :w/pid ?p] [?e :w/task ?t]]
+           (datom/db reg) coordinator))
+
+; A pid is unique, so it is a lookup ref — an entity named by the
+; runtime's own identity rather than by a surrogate key we invented.
+(println "  the pid as a lookup ref →"
+         (datom/pull (datom/db reg) [:w/role :w/task] [:w/pid coordinator]))
+
+;; ── 5. Reassignment, and the record of it ───────────────────────────
+
+(h "5. What was it doing before?")
+
+(def t0 (datom/basis-t (datom/db reg)))
+
+; A lookup ref reads an entity (`pull` above took one), but a
+; transaction needs a resolved id — see FEAT-015. Resolving first is
+; one extra read and entirely explicit.
+(def coord-e (datom/lookup-ref (datom/db reg) [:w/pid coordinator]))
+
+(datom/transact! reg
+  [[:db/add coord-e :w/task "shard-9 (rebalanced)"]])
+
+(def now (datom/db reg))
+(def e coord-e)
+
+(println "  now:    " (:w/task (datom/entity now e)))
+(println "  before: " (:w/task (datom/entity (datom/as-of now t0) e)))
+(println)
+(println "  every task this process has held:")
+(doseq [c (datom/changes (datom/history now) e :w/task)]
+  (println "    " (if (:added c) "＋" "－") (:value c) " @ tx" (:t c)))
+
+;; ── 6. Crashes are facts too ────────────────────────────────────────
+;;
+;; `let it crash` and `never delete a fact` turn out to be the same
+;; instinct approached from two directions. OTP says a failure is
+;; information, so report it and let a supervisor decide. Datomic says a
+;; change is information, so record it rather than overwrite.
+;;
+;; Put together: a monitor's DOWN message becomes a datom, and the
+;; question `what was that process doing when it died?` has an answer,
+;; because the world it was working in is still here.
+
+(h "6. A process dies, and the database remembers what it was doing")
+
+(def doomed (erlang/spawn (fn [] (Process/sleep 10))))
+(def doomed-report
+  (datom/transact! reg [{:db/id -1 :w/pid doomed :w/role :worker
+                         :w/task "shard-doomed"}]))
+(def doomed-e (get (:tempids doomed-report) -1))
+
+(def at-death (datom/basis-t (datom/db reg)))
+(Process/sleep 100)
+
+(println "  alive? " (Process/alive? doomed))
+
+; The process is gone. The fact of what it was doing is not.
+(datom/transact! reg [[:db/retract doomed-e :w/role :worker]])
+
+(let [d (datom/db reg)]
+  (println "  is it still a worker?    "
+           (:w/role (datom/entity d doomed-e)))
+  (println "  what was it doing though:"
+           (:w/task (datom/entity (datom/as-of d at-death) doomed-e)))
+  (println "  and the pid is still a value we can hold:" doomed))
+
+(println)
+(println "  A dead process leaves no trace on the BEAM — that is the point")
+(println "  of isolation. Here it leaves exactly the trace we chose to")
+(println "  record, and no more.")
+
+;; ── What this file was really about ─────────────────────────────────
+
+(h "the shape of it")
+
+(println "  Datomic: a database is a value, so readers need no locks.")
+(println "  The BEAM: a process is cheap, so give everything its own.")
+(println)
+(println "  Neither idea needs the other to be true. But a value that")
+(println "  costs nothing to hold, in a runtime that makes a process for")
+(println "  every request, means every request can have its own")
+(println "  consistent world for free — and that is not a feature either")
+(println "  system lists, because neither can see it alone.")
+(println)

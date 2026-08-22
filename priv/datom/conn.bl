@@ -90,7 +90,83 @@
 ; name promises mutation silently pure (BUG-014). A caller who followed
 ; the naming convention lost their schema and learned about it later,
 ; from an unrelated `transact!` complaining about the data.
-(defrecord Conn [store schema basis])
+(defrecord Conn [store schema basis writer])
+
+;; ── the single writer ───────────────────────────────────────────────
+;;
+;; Every write for a connection runs INSIDE one process, one at a time.
+;;
+;; This is not a lock bolted on afterwards. It is the shape the whole
+;; design already assumed: `datom.store/-update` on the ETS substrate is
+;; a plain read-modify-write, documented as safe only under a single
+;; writer, and the transaction itself is a read-modify-write across
+;; several keys (the entity counter, the tx counter, the indexes) that no
+;; store port can make atomic as a unit.
+;;
+;; Without it, twenty concurrent transactions produced five distinct
+;; transaction ids, colliding entity ids, and seven entities all claiming
+;; one `:db.unique/identity` value — uniqueness is checked by reading the
+;; index and then writing, and two processes can both read `absent`.
+;;
+;; An Agent is exactly the right primitive: it is a process whose only
+;; job is to hold something and serialize access to it. The BEAM answer
+;; to a race is not a mutex, it is a process that owns the thing.
+;;
+;; READS DO NOT GO THROUGH HERE. `db` builds a value from the basis atom
+;; and never blocks, so ten thousand readers proceed in parallel while
+;; writes queue behind one another — which is the correct asymmetry for a
+;; database whose central claim is that a database is a value.
+
+(defn- start-writer
+  []
+  ; `start` and NOT `start_link`. A linked writer would take its caller
+  ; down with it, and the caller is whoever happened to open the
+  ; connection — usually a request process with no business dying because
+  ; a different request wrote bad data.
+  ;
+  ; It is not supervised for the same reason it is not linked: this
+  ; process holds no state. It exists to serialize, so losing it loses
+  ; nothing, and `transact!` restarts one on demand. Everything durable
+  ; is in the store.
+  (let [started (Agent/start (fn [] :writer))]
+    ; `{:ok pid}` — an Agent that fails to start is not something to
+    ; paper over, since every write would then be unserialized.
+    (if (= :ok (erlang/element 1 started))
+      (erlang/element 2 started)
+      (throw (ex-info "could not start the connection writer"
+                      {:reason (erlang/element 2 started)})))))
+
+(defn- with-writer
+  "Run `f` inside the connection's writer process, one caller at a time.
+
+   `Agent/get_and_update` is used rather than `Agent/update` because the
+   caller needs the transaction report BACK. The Agent's own state is
+   irrelevant — the process IS the lock, and its serialization is the
+   only thing being borrowed.
+
+   The timeout is generous rather than absent: a write that genuinely
+   takes minutes is a bug worth surfacing, and an infinite wait would
+   hide a deadlock as a hang."
+  [conn f]
+  ; A transaction REJECTED by schema is an ordinary outcome, not a
+  ; crash: the caller asked for something invalid and must hear so. But
+  ; an exception raised inside an Agent kills the Agent and reaches the
+  ; caller as an opaque `:exit`, losing the problem list that made the
+  ; rejection useful — and taking the connection's writer with it, so the
+  ; NEXT caller fails for an unrelated reason.
+  ;
+  ; So the result is returned as data and re-raised out here, in the
+  ; caller's own process, where a `try` around `transact!` can see it.
+  (let [outcome (Agent/get_and_update
+                  (:writer conn)
+                  (fn [state]
+                    (let [r (try [:ok (f)]
+                                 (catch e [:raised e]))]
+                      (erlang/list_to_tuple (to-list [r state]))))
+                  30000)]
+    (if (= :ok (first outcome))
+      (second outcome)
+      (throw (second outcome)))))
 
 (defn connect-with
   "Open a connection over an EXISTING store.
@@ -140,7 +216,8 @@
          base (merge (datom.schema/empty-schema) recovered)
          conn (->Conn store
                       (atom (datom.schema/install-all base schema-defs))
-                      (atom basis))]
+                      (atom basis)
+                      (start-writer))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -235,7 +312,20 @@
      :tx-datoms   exactly the datoms recorded
 
    Raises on a schema violation, listing EVERY problem rather than the
-   first — a partially-valid transaction is never applied."
+   first — a partially-valid transaction is never applied.
+
+   Writes are SERIALIZED per connection: this runs inside the
+   connection's writer process, one at a time. Readers are unaffected
+   and never block."
+  [conn tx-data]
+  (with-writer conn (fn [] (transact-in-writer conn tx-data))))
+
+(defn- transact-in-writer
+  "The body of `transact!`, already inside the writer process.
+
+   Everything here is a read-modify-write — allocating a tx id, checking
+   a unique value, appending to the indexes — and none of it is atomic as
+   a unit. It is correct because exactly one process runs it at a time."
   [conn tx-data]
   (let [store (:store conn)
         schema (deref (:schema conn))
@@ -276,7 +366,22 @@
         ; One atomic commit for every index of every datom: a transaction
         ; visible in EAVT but not AEVT would be a corrupt database.
         (datom.index/write-datoms store schema datoms)
-        (reset! (:basis conn) tx)
+
+        ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
+        ; let a slower transaction with a LOWER id land last and rewind
+        ; it, which filtered every datom above the rewound mark out of
+        ; every subsequent read — twenty concurrent writes, all
+        ; committed, all acknowledged, all durable, and sixteen visible.
+        ;
+        ; Nothing was lost: the datoms were on disk the whole time. That
+        ; is what made it dangerous. The caller held a report saying the
+        ; write succeeded, because it had, and a later read disagreed
+        ; (BUG-022).
+        ;
+        ; `max` rather than a compare-and-set loop because advancing a
+        ; high-water mark is monotone and idempotent: two writers racing
+        ; can apply theirs in either order for the same result.
+        (swap! (:basis conn) (fn [cur] (max cur tx)))
         {:db-before db-before
          :db-after (db conn)
          :tx tx

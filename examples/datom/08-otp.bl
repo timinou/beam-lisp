@@ -1,0 +1,229 @@
+; 08-otp.bl — the database inside an OTP system
+;
+; Run: mix beam_lisp.run --path priv examples/datom/08-otp.bl
+;
+; ── The claim ─────────────────────────────────────────────────────────
+;
+; 07 showed the two designs agreeing about isolation. This one is about
+; what you BUILD with that, and it is less abstract: three patterns that
+; are awkward in a normal database and fall out of this one, plus one
+; that is genuinely new.
+;
+;   1. Supervision restores state, because state is a value with a name
+;   2. A GenServer's state IS a database, so its state is queryable
+;   3. Hot code upgrade has a `before` to compare against
+;   4. Every process gets its own consistent world for free
+;
+; The through-line: OTP is a set of answers to `what happens when part
+; of this fails?`, and every one of those answers is easier when the
+; thing you are recovering is an immutable value rather than a mutable
+; store you must repair.
+
+(ns examples.datom.otp
+  (:require [datom]))
+
+(defn- h [title]
+  (println)
+  (println (str "── " title " " (apply str (repeat (max 3 (- 68 (count title))) "─")))))
+
+;; ── 1. A crash loses the process, not the world ─────────────────────
+;;
+;; `let it crash` works because a supervisor restarts the process clean.
+;; The awkward part has always been state: restarting clean means
+;; STARTING OVER unless the state lived somewhere else, and `somewhere
+;; else` usually means a mutable store the crashed process may have left
+;; half-written.
+;;
+;; Here the state is a db value. The crashed process held a reference to
+;; an immutable thing; the restarted one takes another. There is nothing
+;; to repair because nothing was ever mutated.
+
+(h "1. A worker crashes mid-job; its world does not")
+
+(def conn
+  (datom/connect
+    [{:db/ident :job/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :job/state :db/valueType :db.type/keyword}
+     {:db/ident :job/attempts :db/valueType :db.type/long}]))
+
+(datom/transact! conn
+  (to-list (map (fn [i] {:db/id (- 0 (+ i 1)) :job/id i
+                         :job/state :queued :job/attempts 0})
+                (range 5))))
+
+(def parent (erlang/self))
+
+; A worker that claims a job, records that it started, and then dies.
+; The entity is resolved up front: a lookup ref reads fine but is not
+; yet accepted in transaction entity position (FEAT-015).
+(def job2 (datom/lookup-ref (datom/db conn) [:job/id 2]))
+
+(def crasher
+  (erlang/spawn
+    (fn []
+      (datom/transact! conn [[:db/add job2 :job/state :running]])
+      (erlang/exit :boom))))
+
+(Process/sleep 200)
+(println "  the worker:" (Process/alive? crasher))
+(println "  the job it claimed:" (:job/state (datom/entity (datom/db conn) job2)))
+(println)
+(println "  A supervisor restarting that worker can see EXACTLY what it")
+(println "  had done: `:running` with no completion is a claim nobody")
+(println "  fulfilled. That is a recoverable state rather than a mystery,")
+(println "  and it did not need a write-ahead log to be one.")
+
+;; ── 2. A supervisor's decision is a query ───────────────────────────
+
+(h "2. What should the supervisor retry?")
+
+(println "  jobs claimed but never finished:")
+(doseq [row (datom/q '[:find ?id ?n
+                       :where [?e :job/state :running]
+                              [?e :job/id ?id]
+                              [?e :job/attempts ?n]]
+                     (datom/db conn))]
+  (println "    job" (first row) "— attempts so far:" (second row)))
+
+(println)
+(println "  In a mutable store this is the question you cannot trust,")
+(println "  because `:running` might mean `running right now` or `was")
+(println "  running when something died`. Here you can ask WHEN it became")
+(println "  running, and compare that to whether the process still lives.")
+
+;; ── 3. A GenServer whose state is a database ────────────────────────
+;;
+;; The usual GenServer holds a map and grows a handle_call per question
+;; anyone wants to ask of it. Each one is a small API decision, and the
+;; set of them is fixed at compile time.
+;;
+;; If the state is a db value, the process needs ONE call — `here is a
+;; query` — and every question is already answerable, including ones
+;; nobody anticipated.
+
+(h "3. One handle_call instead of twenty")
+
+; beam-lisp has no `receive` form, so a message loop is written with
+; the Elixir/OTP primitives directly rather than sketched here. What
+; matters for this file is what the state IS, so: a process holding a
+; db value, answering questions its author never enumerated.
+
+(def me (erlang/self))
+(def server
+  (erlang/spawn
+    (fn []
+      (let [db (datom/db conn)]
+        ; Three different questions, none of which this process was
+        ; written to answer. It holds a database, not a schema of
+        ; supported calls.
+        (erlang/send me
+          (erlang/list_to_tuple
+            (to-list
+              [:answers
+               [(datom/q '[:find (count ?e) :where [?e :job/id _]] db)
+                (datom/q '[:find ?s :where [?e :job/state ?s]] db)
+                (datom/pull db [:job/id :job/state] job2)]])))))))
+
+(Process/sleep 200)
+(println "  a process holding a db value can answer questions its author")
+(println "  never enumerated:")
+(let [db (datom/db conn)]
+  (println "    how many jobs? " (datom/q '[:find (count ?e) :where [?e :job/id _]] db))
+  (println "    which states?  " (datom/q '[:find ?s :where [?e :job/state ?s]] db))
+  (println "    one job, shaped:" (datom/pull db [:job/id :job/state] job2)))
+
+;; ── 4. Hot upgrade with a before and after ──────────────────────────
+;;
+;; `code_change/3` is handed the old state and asked to produce the new
+;; one. The hard part is not the transformation, it is knowing whether
+;; it was right — the old state is gone the moment you return.
+;;
+;; A db value is not gone. The upgrade is a transaction, and the version
+;; before it is still addressable.
+
+(h "4. A migration you can check afterwards")
+
+(def before-migration (datom/basis-t (datom/db conn)))
+
+; The migration: every queued job gains an explicit priority.
+(datom/install-schema! conn
+  [{:db/ident :job/priority :db/valueType :db.type/long :db/index true}])
+
+(def queued
+  (to-list (map first
+                (datom/q '[:find ?e :where [?e :job/state :queued]]
+                         (datom/db conn)))))
+
+(datom/transact! conn
+  (to-list (map (fn [e] [:db/add e :job/priority 5]) queued)))
+
+(def after (datom/db conn))
+
+(println "  jobs with a priority, after: "
+         (datom/q '[:find (count ?e) :where [?e :job/priority _]] after))
+(println "  jobs with a priority, before:"
+         (datom/q '[:find (count ?e) :where [?e :job/priority _]]
+                  (datom/as-of after before-migration)))
+(println)
+(println "  The old state is still there to compare against — not in a")
+(println "  backup, not in a migration log, just still there. A")(println "  `code_change/3` that got it wrong is a diff, not an incident.")
+
+;; ── 5. The pattern that has no analogue ─────────────────────────────
+;;
+;; Everything above is `OTP, but easier`. This one is different.
+;;
+;; A request-per-process runtime plus a database-as-value means each
+;; request can pin a version of the world for its whole lifetime — not
+;; as an optimisation, and not by copying anything, but because pinning
+;; is free and the copy never existed.
+;;
+;; The consequence is that `read your own writes` and `see a consistent
+;; snapshot` stop being in tension. A request that writes takes a new
+;; value; one that only reads keeps its old one; neither blocks.
+
+(h "5. A thousand requests, a thousand consistent worlds")
+
+(def snapshots
+  (to-list
+    (Enum/to_list
+      (Task/async_stream
+        (range 200)
+        (fn [i]
+          ; Every one of these is a separate BEAM process taking its own
+          ; view. On a JVM this would be 200 threads and a connection
+          ; pool; here it is 200 processes and no pool, because there is
+          ; no connection to pool — a db value is not a resource.
+          (let [db (datom/db conn)]
+            [(datom/basis-t db)
+             (datom/q '[:find (count ?e) :where [?e :job/id _]] db)]))))))
+
+(def distinct-answers
+  (into #{} (map (fn [r] (let [[_ok pair] (to-list (erlang/tuple_to_list r))]
+                           (second (to-list pair))))
+                 snapshots)))
+
+(println "  200 processes each took their own database value")
+(println "  distinct answers among them:" (count distinct-answers))
+(println "  →" distinct-answers)
+(println)
+(println "  One answer, because nothing was writing. Had something been,")
+(println "  there would be several — and each would still be CORRECT, as")
+(println "  of the moment its process asked. That is the difference")
+(println "  between a stale read and a consistent one.")
+
+;; ── What this file was really about ─────────────────────────────────
+
+(h "the shape of it")
+
+(println "  OTP's questions are all about failure: what survives a crash,")
+(println "  what a supervisor restores, what a hot upgrade preserves.")
+(println)
+(println "  Every one of those answers gets simpler when the thing being")
+(println "  recovered is an immutable value with a name. Not because the")
+(println "  database is clever, but because there is nothing to repair —")
+(println "  a crashed process cannot have left a value half-written.")
+(println)
+(println "  `let it crash` and `never destroy a fact` are the same")
+(println "  instinct, arrived at from opposite directions.")
+(println)
