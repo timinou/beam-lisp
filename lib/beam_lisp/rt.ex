@@ -1295,6 +1295,19 @@ defmodule BeamLisp.RT do
   """
   def eqv(a, b) do
     cond do
+      # A FUNCTION is compared by identity and never walked. Elixir's
+      # `Enumerable` is implemented for arity-2 functions (that is how a
+      # reducer is enumerated), so a lazy walk over one silently tried to
+      # ENUMERATE it, and comparing any other arity raised
+      # `protocol Enumerable not implemented for Function`.
+      #
+      # `=` must be total: it answers true or false for any two values a
+      # caller can hold. Raising for one of them makes every collection
+      # containing a function a landmine — `distinct`, set membership and
+      # `contains?` all route through here.
+      is_function(a) or is_function(b) ->
+        a === b
+
       # Walk whenever an operand is lazy *or* an improper list (a
       # partially-realized `[h | LazySeq]`), so a lazy interleave result —
       # or an empty lazy seq against either `()` or `[]` — compares

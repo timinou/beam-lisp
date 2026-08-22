@@ -10,7 +10,7 @@
 ; a bug in the first ten seconds (BUG-022).
 
 (ns datom.concurrency.test
-  (:require [datom] [datom.conn] [datom.db]))
+  (:require [datom] [datom.conn] [datom.db] [datom.store-ets]))
 
 (defn- unique-conn []
   (datom/connect
@@ -77,11 +77,17 @@
                   (Enum/to_list
                     (Task/async_stream (range 8) (fn [_] (datom/q q db)))))]
     (is (= 8 (count results)))
-    (is (= 1 (count (into #{} (map (fn [r]
-                                     (let [[_ok v] (to-list (erlang/tuple_to_list r))]
-                                       v))
-                                   results))))
-        "eight processes, one answer")))
+    (let [answers (into #{} (map (fn [r]
+                                   (let [[_ok v] (to-list (erlang/tuple_to_list r))]
+                                     v))
+                                 results))]
+      (is (= 1 (count answers)) "eight processes, one answer")
+      ; And that answer must be the RIGHT one. Agreement alone is not
+      ; evidence: before the basis fix, eight readers agreed perfectly
+      ; on a database missing sixteen of its twenty acknowledged writes.
+      ; A unanimous wrong answer is the failure this whole file is about.
+      (is (= (set [[12]]) (first (to-list answers)))
+          "and it is the correct count, not merely a consistent one"))))
 
 (deftest a-unique-value-is-still-unique-under-concurrency
   ; Two processes racing to claim the SAME identity. One must win and one
@@ -94,7 +100,71 @@
                                            [{:db/id -1 :o/id 7 :o/tag (str "w" i)}])
                                          :ok
                                          (catch e :rejected)))))
-                            (range 8)))]
-    (await-all tasks)
+                            (range 8)))
+        outcomes (await-all tasks)]
+    ; Every writer must SUCCEED, upserting onto the one entity. Checking
+    ; only the entity count let seven writers fail and still pass: one
+    ; success produces one entity, which is exactly what a total failure
+    ; of serialization would also look like.
+    (is (= 8 (count (filterv (fn [o] (= :ok o)) outcomes)))
+        "all eight upserts succeeded — none was rejected")
     (is (= 1 (count (datom/q '[:find ?e :where [?e :o/id 7]] (datom/db conn))))
         "one identity, one entity, however many writers raced for it")))
+
+(deftest two-connections-over-one-store-are-one-database
+  ; They were two. Each `connect-with` built a private writer and a
+  ; private basis, so a write committed through one was INVISIBLE
+  ; through the other — not stale, invisible, because the other basis
+  ; had never advanced past it. Uniqueness was enforced per writer too,
+  ; so one identity could be claimed once on each side.
+  (let [store (datom.store-ets/open)
+        defs [{:db/ident :o/id :db/valueType :db.type/long
+               :db/unique :db.unique/identity}]
+        c1 (datom/connect-with store defs)
+        c2 (datom/connect-with store defs)]
+    (datom/transact! c1 [{:db/id -1 :o/id 1}])
+    (is (= (set [[1]]) (datom/q '[:find ?v :where [?e :o/id ?v]] (datom/db c2)))
+        "a write through one connection is visible through the other")
+    (is (= (datom/basis-t (datom/db c1)) (datom/basis-t (datom/db c2)))
+        "and they share one basis")
+    (let [a (Task/async (fn [] (datom/transact! c1 [{:db/id -1 :o/id 9}])))
+          b (Task/async (fn [] (datom/transact! c2 [{:db/id -1 :o/id 9}])))]
+      (Task/await a) (Task/await b)
+      (is (= 1 (count (datom/q '[:find ?e :where [?e :o/id 9]] (datom/db c1))))
+          "one identity, one entity, across both connections"))))
+
+(deftest a-dead-writer-is-replaced
+  ; The writer holds no state, which is why it is neither linked nor
+  ; supervised. It follows that losing it must cost nothing — but the
+  ; pid lives in an immutable record field, so a replacement was started
+  ; that nothing ever called, and one `exit` permanently disabled every
+  ; future write on a connection whose data was perfectly intact.
+  (let [conn (unique-conn)]
+    (erlang/exit (:writer conn) :kill)
+    (Process/sleep 50)
+    (datom/transact! conn [{:db/id -1 :o/id 3}])
+    (is (= (set [[3]]) (datom/q '[:find ?v :where [?e :o/id ?v]] (datom/db conn)))
+        "the connection recovered and the write landed")))
+
+(deftest concurrent-schema-installs-all-survive-a-reopen
+  ; Installing schema reads the schema, mutates it, scans for backfill
+  ; and commits — a read-modify-write across several keys that no store
+  ; makes atomic as a unit. Outside the writer, eighty concurrent
+  ; installs all returned successfully and all eighty were live in
+  ; memory, while reopening the store recovered seventy-four.
+  (let [store (datom.store-ets/open)
+        conn (datom/connect-with store [])
+        n 24
+        tasks (to-list (map (fn [i]
+                              (Task/async
+                                (fn [] (datom/install-schema! conn
+                                         [{:db/ident (keyword (str "gen" i))
+                                           :db/valueType :db.type/long}]))))
+                            (range n)))
+        _ (await-all tasks)
+        generated? (fn [k] (= "gen" (subs (name k) 0 (min 3 (count (name k))))))
+        live (count (filterv generated? (keys (datom/schema conn))))
+        reopened (count (filterv generated?
+                                 (keys (datom/schema (datom/connect-with store [])))))]
+    (is (= n live) "every install is live")
+    (is (= n reopened) "and every one of them survived the reopen")))

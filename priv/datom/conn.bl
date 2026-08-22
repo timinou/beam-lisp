@@ -117,6 +117,65 @@
 ;; writes queue behind one another — which is the correct asymmetry for a
 ;; database whose central claim is that a database is a value.
 
+(def REGISTRY :datom-conn-registry)
+
+(defn- registry
+  "The process-wide map from a store to its writer and basis.
+
+   Two connections over the SAME store are two views of ONE database,
+   and they must share both. When they did not, each got a private
+   writer (so a unique value could be claimed twice, once per writer)
+   and a private basis (so a write committed through one connection was
+   invisible through the other — not stale, INVISIBLE, because the
+   other basis had never advanced past it).
+
+   Registered by name so the lookup is race-safe: two processes calling
+   `connect-with` at once both reach the same Agent, because
+   `Agent/start` with a `:name` fails with `already_started` for the
+   loser rather than creating a second one."
+  []
+  (let [existing (erlang/whereis REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(->tuple-2 :name REGISTRY)]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          ; Lost the race — the winner's pid is in the error.
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+(defn- ->tuple-2
+  [a b]
+  (erlang/list_to_tuple (to-list [a b])))
+
+(defn- store-cell
+  "The `{:writer pid :basis atom}` shared by every connection over
+   `store`, created once.
+
+   `Agent/get_and_update` does the check-and-create in ONE serialized
+   step, so two connections opening the same store concurrently cannot
+   both decide it is absent."
+  [store initial-basis]
+  (Agent/get_and_update
+    (registry)
+    (fn [reg]
+      (let [k (store-key store)
+            hit (get reg k)]
+        (if (some? hit)
+          (->tuple-2 hit reg)
+          (let [cell {:writer (start-writer) :basis (atom initial-basis)}]
+            (->tuple-2 cell (assoc reg k cell))))))
+    30000))
+
+(defn- store-key
+  "An identity for a store, stable across the connections that share it.
+
+   The store record itself: two `connect-with` calls over one store are
+   passed the SAME value, so it keys them together, while two separately
+   opened stores differ in their table or path and key apart."
+  [store]
+  store)
+
 (defn- start-writer
   []
   ; `start` and NOT `start_link`. A linked writer would take its caller
@@ -136,6 +195,31 @@
       (throw (ex-info "could not start the connection writer"
                       {:reason (erlang/element 2 started)})))))
 
+(defn- ensure-writer
+  "Replace the connection's writer if it has died.
+
+   Serialized through the registry, so two callers noticing the same
+   death do not start two writers — which would silently un-serialize
+   every subsequent write, the exact failure the writer exists to
+   prevent."
+  [conn]
+  (let [current (:writer conn)]
+    (if (Process/alive? current)
+      current
+      (Agent/get_and_update
+        (registry)
+        (fn [reg]
+          (let [k (store-key (:store conn))
+                cell (get reg k)]
+            ; Re-check INSIDE the serialized step: another caller may
+            ; have replaced it between our liveness test and here.
+            (if (and (some? cell) (Process/alive? (:writer cell)))
+              (->tuple-2 (:writer cell) reg)
+              (let [fresh (start-writer)
+                    updated (assoc (or cell {:basis (:basis conn)}) :writer fresh)]
+                (->tuple-2 fresh (assoc reg k updated))))))
+        30000))))
+
 (defn- with-writer
   "Run `f` inside the connection's writer process, one caller at a time.
 
@@ -148,6 +232,11 @@
    takes minutes is a bug worth surfacing, and an infinite wait would
    hide a deadlock as a hang."
   [conn f]
+  ; A dead writer must not disable the connection FOREVER. It holds no
+  ; state — that is why it is neither linked nor supervised — so a
+  ; replacement is as good as the original, and the alternative is that
+  ; one `Process/exit` permanently breaks every future write on a
+  ; connection whose data is perfectly intact.
   ; A transaction REJECTED by schema is an ordinary outcome, not a
   ; crash: the caller asked for something invalid and must hear so. But
   ; an exception raised inside an Agent kills the Agent and reaches the
@@ -157,8 +246,29 @@
   ;
   ; So the result is returned as data and re-raised out here, in the
   ; caller's own process, where a `try` around `transact!` can see it.
-  (let [outcome (Agent/get_and_update
-                  (:writer conn)
+  (if (= (erlang/self) (:writer conn))
+    ; ALREADY inside the writer. `install-schema!` ends by transacting
+    ; the schema datoms, so entering the writer again would be a
+    ; GenServer calling itself — `:calling_self`, which the BEAM catches
+    ; as an error but which is a deadlock in every design that does not.
+    ;
+    ; Running `f` directly is correct rather than a workaround: the
+    ; guarantee being asked for is `one writer at a time`, and this IS
+    ; that writer. Re-entering would be asking a question already
+    ; answered.
+    (f)
+    (with-writer-call conn f)))
+
+(defn- with-writer-call
+  [conn f]
+  (let [; The record's `:writer` field is immutable, so a replacement
+        ; started after a death is NOT visible there. Resolving the live
+        ; pid here is what makes recovery actually take effect — without
+        ; it `ensure-writer` started a fresh process that nothing ever
+        ; called, and every write still failed against the dead one.
+        pid (ensure-writer conn)
+        outcome (Agent/get_and_update
+                  pid
                   (fn [state]
                     (let [r (try [:ok (f)]
                                  (catch e [:raised e]))]
@@ -214,10 +324,14 @@
                                                  (datom.index/scan store :eavt ae))))
                                 attr-entities)))
          base (merge (datom.schema/empty-schema) recovered)
+         ; The writer and the basis belong to the STORE, not to this
+         ; connection: a second connection over the same store is another
+         ; view of one database and must share both.
+         cell (store-cell store basis)
          conn (->Conn store
                       (atom (datom.schema/install-all base schema-defs))
-                      (atom basis)
-                      (start-writer))]
+                      (:basis cell)
+                      (:writer cell))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -262,10 +376,22 @@
    Schema is data and evolves like data. Returns the connection so it
    chains."
   [conn defs]
-  ; Genuinely mutates, as the name says. Installing schema also WRITES
-  ; datoms, so it is a transaction like any other change — which a pure
-  ; version could not be, since the caller would hold a connection whose
-  ; store had grown facts its schema did not know about.
+  ; Through the WRITER, like every other mutation. This reads the
+  ; schema, mutates it, scans for backfill and commits — a
+  ; read-modify-write across several keys, which no store port makes
+  ; atomic as a unit.
+  ;
+  ; Outside the writer, eighty concurrent installs all returned
+  ; successfully and all eighty definitions were live in memory, but
+  ; reopening the store recovered SEVENTY-FOUR: the schema datoms raced
+  ; through the non-atomic ETS counter and overwrote each other. Six
+  ; acknowledged schema changes existed only until restart, which is the
+  ; worst place for a schema to disagree with itself.
+  (with-writer conn (fn [] (install-schema-in-writer conn defs))))
+
+(defn- install-schema-in-writer
+  "The body of `install-schema!`, already inside the writer process."
+  [conn defs]
   (let [before (deref (:schema conn))]
     (swap! (:schema conn) (fn [cur] (datom.schema/install-all cur defs)))
     ; BACKFILL. An attribute that gains an index must have its EXISTING
