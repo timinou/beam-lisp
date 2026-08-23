@@ -152,15 +152,25 @@ defmodule BeamLisp.Spell.IntentTest do
       use_contract("two-contract")
       me = self()
 
-      Server.register_performer("first", fn _o, _p -> send(me, :first) && nil end)
-      Server.register_performer("second", fn _o, _p -> send(me, :second) && nil end)
+      Server.register_performer("first", fn _o, _p -> send(me, {:ran, :first}) && nil end)
+      Server.register_performer("second", fn _o, _p -> send(me, {:ran, :second}) && nil end)
 
       Server.event(socket(), "intent-test", "create", "x")
 
-      # Order, not merely presence: two intents in one body are two steps of one
-      # story, and a mailbox preserves per-sender order, so this is a real check.
-      assert_receive :first
-      assert_receive :second
+      # ONE pattern, twice, then compare — not `assert_receive :first` followed
+      # by `assert_receive :second`.
+      #
+      # That spelling cannot fail, which a reviewer caught: `assert_receive` is
+      # a SELECTIVE receive, so with the intents performed backwards it scans
+      # past the queued `:second`, matches `:first`, and the next assertion
+      # then matches what is left. Both pass either way, and the load-bearing
+      # ordering this test exists for would be unprotected.
+      #
+      # Matching `{:ran, _}` twice takes the messages in ARRIVAL order, which
+      # is the thing under test.
+      assert_receive {:ran, one}
+      assert_receive {:ran, two}
+      assert [one, two] == [:first, :second]
     end
   end
 
@@ -193,10 +203,83 @@ defmodule BeamLisp.Spell.IntentTest do
     end
   end
 
+  describe "the atom-table boundary" do
+    test "a performer answering an UNDECLARED assign is refused by name" do
+      # The hole a reviewer found, closed. `assign_all/2` interns every key it
+      # is given — safe for the contract's own declared names (a handful, fixed
+      # at definition time), unsafe for anything a performer derived from wire
+      # data. This performer echoes the payload's title as a KEY, which is
+      # exactly the shape that would intern one permanent atom per request; a
+      # full atom table aborts the VM uncatchably.
+      Server.register_performer("create-task", "spell.intent-fixture/perform-undeclared")
+
+      error =
+        assert_raise ArgumentError, fn ->
+          Server.event(socket(), "intent-test", "create", "attacker-chosen-key")
+        end
+
+      assert error.message =~ "undeclared assign"
+      assert error.message =~ "attacker-chosen-key"
+      # And it names the vocabulary, because the ordinary cause is a typo.
+      assert error.message =~ "status"
+    end
+
+    test "a DECLARED assign still passes" do
+      # The bound must not cost the feature: `status` is declared by the
+      # fixture contract, so the performer's answer lands.
+      Server.register_performer("create-task", "spell.intent-fixture/perform-probe")
+      {:reply, _reply, socket} = Server.event(socket(), "intent-test", "create", "Ship")
+      assert socket.assigns.status == "performed:Ship"
+    end
+
+    test "a performer answering a non-map is refused" do
+      Server.register_performer("create-task", "spell.intent-fixture/perform-nonsense")
+
+      error =
+        assert_raise ArgumentError, fn ->
+          Server.event(socket(), "intent-test", "create", "x")
+        end
+
+      assert error.message =~ "must answer a map of assigns or nil"
+    end
+  end
+
+  describe "a mount event may read, not write" do
+    test "a mount event that records an intent is refused, naming the op" do
+      # Phoenix mounts TWICE for a live navigation — disconnected, then
+      # connected — so an intent in a mount event is a write per page load,
+      # performed twice, half of it in a request process that exits
+      # immediately afterwards. That is not a behaviour any contract author
+      # would choose, and it would show up only in production.
+      use_contract("mount-writes-contract")
+      Server.register_performer("create-task", fn _o, _p -> nil end)
+
+      error =
+        assert_raise ArgumentError, fn ->
+          Server.mount(socket(), ["intent-test"])
+        end
+
+      assert error.message =~ "mount event"
+      assert error.message =~ "create-task"
+    end
+
+    test "a mount event that only computes state still works" do
+      # The refusal must not take the legitimate affordance with it: computing
+      # the state a page opens with is what a mount event is FOR, and the
+      # live-state contract's `:refresh` does exactly this.
+      use_contract("mount-reads-contract")
+      {:ok, socket} = Server.mount(socket(), ["intent-test"])
+      assert socket.assigns.status == "mounted"
+    end
+  end
+
   describe "nothing else changed" do
     test "the seed contract still runs with no performer registered at all" do
       # The existing path takes `intents: []` and must not notice the feature
-      # exists — a `nil` where `[]` belongs would crash exactly here.
+      # exists. The host tolerates a missing key and a nil alike, so this does
+      # not guard a crash — it guards the SHAPE: every result map carries the
+      # key, so a caller reading `result["intents"]` never has to ask which of
+      # three spellings of "none" it got.
       {:reply, reply, socket} =
         Server.event(socket(%{messages: [], status: "idle"}), "chat-live", "send", "")
 

@@ -119,6 +119,35 @@ defmodule BeamLisp.Spell.Server do
   The performer is `(op, payload) -> assigns | nil`. Returning assigns is how a
   write reaches the page — the board a `create-task` answers with is the board
   AFTER the write, read back from the database, not a guess the handler made.
+  Those assigns must be ones the CONTRACT DECLARED; anything else is refused by
+  name, because `assign_all/2` interns its keys and a performer's answer is the
+  one place a browser-derived string could reach `String.to_atom/1`.
+
+  ## Intents are ORDERED, not TRANSACTIONAL
+
+  Intents run in body order, each fully, before the next. They are NOT an
+  all-or-nothing batch, and this is worth stating because the shape invites the
+  assumption:
+
+      (do (do! :charge-card {…})
+          (do! :book-room {…}))
+
+  If `:book-room` raises, the card is still charged. The LiveView callback
+  crashes before it returns, so nothing is pushed, no reply is sent, and the
+  socket's assigns are discarded — they were threaded through a reduce and were
+  never committed — but the external effect of intent 1 already happened.
+
+  That is inherent: this module has no idea what a performer touches, so it has
+  nothing to roll back. An application needing atomicity across two writes must
+  express them as ONE intent whose performer owns the transaction — which for a
+  `datom`-backed app is the natural shape anyway, since one `transact!` is
+  already atomic across every datom in it.
+
+  ## A mount event may read, not write
+
+  `mount-event` intents are REFUSED rather than performed — see
+  `run_mount_event/3`. Phoenix mounts twice per live navigation, so a write
+  there would happen twice per page load.
 
   The string form resolves a beam-lisp `"namespace/var"` once per registration,
   which is how an application keeps its domain in beam-lisp: the performer is a
@@ -247,6 +276,24 @@ defmodule BeamLisp.Spell.Server do
   # A mount event is just the contract's handler, run once with an empty
   # payload. It must not `ask!` — a mount is not a turn — but nothing forbids
   # it structurally; the contract author owns that choice.
+  #
+  # Its INTENTS are dropped, and that is the one place in this module where a
+  # recorded intent is deliberately not performed.
+  #
+  # Phoenix calls `mount/3` TWICE for a live navigation: once for the
+  # disconnected static render, once when the socket connects. An event handler
+  # runs once per click, so `do!` there is a write per user action; a mount
+  # event runs once per RENDER PASS, so the same form would be a write per page
+  # load — doubled, and half of it in a request process that exits immediately
+  # afterwards, taking any async reply with it. "Create a task twice because
+  # the browser connected" is not a behaviour any contract author would choose,
+  # and it would appear only in production, only under a connected mount.
+  #
+  # A mount event exists to COMPUTE the state a page opens with (the live-state
+  # contract's `:refresh` populating `@vars`), which is a read. So the read is
+  # kept and the writes are refused by name — loudly, because a contract whose
+  # mount event says `do!` is expressing an intention this path cannot honour,
+  # and silence would make it look like it had.
   defp run_mount_event(socket, term, event_name) do
     result =
       Data.from_bl(
@@ -258,7 +305,19 @@ defmodule BeamLisp.Spell.Server do
         ])
       )
 
-    apply_result(socket, nil, result)
+    case Map.get(result, "intents", []) do
+      [] ->
+        apply_result(socket, nil, Map.put(result, "intents", []), declared_assigns([term]))
+
+      intents ->
+        raise ArgumentError,
+              "the mount event #{inspect(event_name)} recorded intent(s) " <>
+                "#{inspect(Enum.map(intents, &Map.get(&1, "op")))} — a mount runs once per " <>
+                "RENDER PASS (Phoenix mounts twice: disconnected, then connected), so an " <>
+                "intent there is a write per page load, performed twice. A mount event may " <>
+                "compute the state a page opens with; it may not change the world. Move the " <>
+                "write to an event the page fires."
+    end
   end
 
   # The transcript merge in `mount/2` deserves its history kept: the page
@@ -320,7 +379,7 @@ defmodule BeamLisp.Spell.Server do
         {:reply, %{tag: "err", reply: "no handler for #{event_name}"}, socket}
 
       _ ->
-        socket = apply_result(socket, contract, result)
+        socket = apply_result(socket, contract, result, declared_assigns([contract_term(contract)]))
 
         case Map.get(result, "reply") do
           nil -> {:noreply, socket}
@@ -360,7 +419,9 @@ defmodule BeamLisp.Spell.Server do
 
         case Map.get(result, "status") do
           "unmatched" -> {socket, matched?}
-          _ -> {apply_result(socket, contract, result), true}
+          _ ->
+            {apply_result(socket, contract, result, declared_assigns([contract_term(contract)])),
+             true}
         end
       end)
 
@@ -376,12 +437,33 @@ defmodule BeamLisp.Spell.Server do
 
   # ── applying an interpreter answer to a socket ─────────────────────────────
 
-  defp apply_result(socket, contract, result) do
+  defp apply_result(socket, contract, result, declared) do
     socket
     |> assign_all(Map.get(result, "assigns", %{}))
-    |> perform_intents(Map.get(result, "intents", []))
+    |> perform_intents(Map.get(result, "intents", []), declared)
     |> push_all(Map.get(result, "pushes", []))
     |> maybe_ask(contract, Map.get(result, "ask"))
+  end
+
+  # The assign names a contract DECLARED, as a MapSet of strings.
+  #
+  # This is the vocabulary a performer's answer is filtered against, and the
+  # filter is not tidiness — it is the atom-table boundary. `assign_all/2`
+  # calls `String.to_atom/1` on every key it is given, which is safe for the
+  # walk's own assigns because those names come from the contract and are fixed
+  # at definition time. A performer's answer has no such guarantee: it receives
+  # a payload derived from the browser, and a performer that echoes a key from
+  # it (`Map.put(board, user_supplied, …)`) would intern one fresh,永久 atom
+  # per request. A full atom table aborts the VM uncatchably
+  # (`BeamLisp.AtomGuard`), so the bound has to be structural rather than a
+  # rule performers are asked to follow.
+  defp declared_assigns(terms) when is_list(terms) do
+    terms
+    |> Enum.flat_map(fn term ->
+      apply_bl("spell.seam", "assigns", [term]) |> Data.from_bl()
+    end)
+    |> Enum.map(&to_string/1)
+    |> MapSet.new()
   end
 
   # `(do! :op payload)` recorded an intent; THIS is where it happens.
@@ -409,9 +491,9 @@ defmodule BeamLisp.Spell.Server do
   # The performer is a beam-lisp fn (`register_performer/2`), so an
   # application's domain logic stays in beam-lisp: this function knows only
   # how to look one up, call it, and refuse by name when none is registered.
-  defp perform_intents(socket, []), do: socket
+  defp perform_intents(socket, [], _declared), do: socket
 
-  defp perform_intents(socket, intents) when is_list(intents) do
+  defp perform_intents(socket, intents, declared) when is_list(intents) do
     Enum.reduce(intents, socket, fn intent, acc ->
       op = Map.get(intent, "op")
       payload = Map.get(intent, "payload")
@@ -442,7 +524,7 @@ defmodule BeamLisp.Spell.Server do
             # struct, so anything still a map here is a plain map — the same
             # reasoning `assign_all/2` records one screen down.
             assigns when is_map(assigns) ->
-              assign_all(acc, assigns)
+              assign_all(acc, declared_only(assigns, declared, op))
 
             other ->
               # A performer that answers something else is a bug in the
@@ -468,7 +550,34 @@ defmodule BeamLisp.Spell.Server do
     end)
   end
 
-  defp perform_intents(socket, _), do: socket
+  defp perform_intents(socket, _, _declared), do: socket
+
+  # Keep only the assigns the contract DECLARED, and refuse the rest by name.
+  #
+  # A performer answering a key no contract declares is either a typo or a page
+  # that will never render the value — both worth saying out loud — and, more
+  # sharply, it is the one path on which a browser-derived string could reach
+  # `String.to_atom/1`. Refusing is therefore both the safe answer and the
+  # useful one; silently dropping the key would hide the typo, and accepting it
+  # would hand the atom table to the wire.
+  #
+  # `declared` is derived from the contract term at every call site, so there
+  # is no "unknown vocabulary" arm: a caller that could not name the contract
+  # could not have resolved a handler to run either.
+  defp declared_only(assigns, declared, op) do
+    case Enum.reject(Map.keys(assigns), &MapSet.member?(declared, to_string(&1))) do
+      [] ->
+        assigns
+
+      undeclared ->
+        raise ArgumentError,
+              "the performer for intent #{inspect(op)} answered undeclared assign(s) " <>
+                "#{inspect(undeclared)} — a contract's declared assigns are " <>
+                "#{inspect(Enum.sort(MapSet.to_list(declared)))}. An assign the page never " <>
+                "declared cannot render, and accepting an arbitrary key here would let " <>
+                "wire-derived names reach String.to_atom/1."
+    end
+  end
 
   # Assign names are turned into atoms, which is safe BECAUSE the set is closed:
   # they are the contract's declared assigns, printed by our own emitter. An
