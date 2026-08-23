@@ -62,6 +62,10 @@ defmodule BeamLisp.Spell.Server do
   # every event: the read is free, the write cost is irrelevant at boot.
   @registry {__MODULE__, :contracts}
 
+  # Where each INTENT is performed. Same storage and the same reasoning as the
+  # contract registry: written once at boot, read on every event that acts.
+  @performers {__MODULE__, :performers}
+
   @doc """
   Point a contract name at the term it names.
 
@@ -99,6 +103,53 @@ defmodule BeamLisp.Spell.Server do
                 "evaluates beam-lisp source."
     end
   end
+
+  @doc """
+  Point an intent name at the function that performs it.
+
+      register_performer("create-task", &Reel.Boot.perform/2)
+      register_performer("create-task", "reel.intent/perform")   # a beam-lisp fn
+
+  A contract body says `(do! :create-task {:title …})`; `spell.server` records
+  that and performs nothing. This registry is the ONLY place the two meet, and
+  it lives here rather than in the walker on purpose: the walker's whole value
+  is that it has no ambient authority, and a body that could name a performer
+  it can also call would give that away.
+
+  The performer is `(op, payload) -> assigns | nil`. Returning assigns is how a
+  write reaches the page — the board a `create-task` answers with is the board
+  AFTER the write, read back from the database, not a guess the handler made.
+
+  The string form resolves a beam-lisp `"namespace/var"` once per registration,
+  which is how an application keeps its domain in beam-lisp: the performer is a
+  beam-lisp fn and this module never learns what it does.
+  """
+  def register_performer(op, performer) when is_binary(op) and is_function(performer, 2) do
+    current = :persistent_term.get(@performers, %{})
+    :persistent_term.put(@performers, Map.put(current, op, performer))
+    :ok
+  end
+
+  def register_performer(op, expression) when is_binary(op) and is_binary(expression) do
+    case String.split(expression, "/", parts: 2) do
+      [ns, var] ->
+        # Fetched ONCE, at registration, and closed over: an application's
+        # performer is loaded before its pages are served, and a per-call fetch
+        # would put a map lookup on every write for no late binding anyone
+        # asked for. (Contrast `register/2`, whose late binding IS the point:
+        # the machine grows under a running page.)
+        f = BeamLisp.Env.fetch!(ns, var)
+        register_performer(op, fn o, payload -> f.(o, payload) end)
+
+      _ ->
+        raise ArgumentError,
+              "an intent performer must be \"namespace/var\" or a 2-arity function, " <>
+                "got #{inspect(expression)}"
+    end
+  end
+
+  @doc "The intent ops that currently have a performer."
+  def performers, do: Map.keys(:persistent_term.get(@performers, %{}))
 
   @doc """
   The term registered as `name`.
@@ -328,9 +379,96 @@ defmodule BeamLisp.Spell.Server do
   defp apply_result(socket, contract, result) do
     socket
     |> assign_all(Map.get(result, "assigns", %{}))
+    |> perform_intents(Map.get(result, "intents", []))
     |> push_all(Map.get(result, "pushes", []))
     |> maybe_ask(contract, Map.get(result, "ask"))
   end
+
+  # `(do! :op payload)` recorded an intent; THIS is where it happens.
+  #
+  # Ordered AFTER the walk's own assigns, and that ordering is load-bearing
+  # rather than arbitrary. A handler that creates a task and then wants the
+  # board to show it writes:
+  #
+  #     (do (set! @status "saving")
+  #         (do! :create-task {:title title})
+  #         (ok "created"))
+  #
+  # and the fresh board comes back from the PERFORMER, which read the database
+  # AFTER the write. The two answers MERGE — `@status` from the walk, `@board`
+  # from the performer — and where they name the same assign the performer
+  # must win, because the walk only ever knew what the page already had.
+  #
+  # Written the other way round first, and a test caught it: with the intents
+  # performed before `assign_all`, the handler's pre-write copy overwrote the
+  # database's current one, which in a browser reads as "the task was created
+  # and the list did not change" — the exact failure that makes people click
+  # twice. The comment claiming the correct behaviour sat directly above the
+  # code that did the opposite, which is the argument for the test.
+  #
+  # The performer is a beam-lisp fn (`register_performer/2`), so an
+  # application's domain logic stays in beam-lisp: this function knows only
+  # how to look one up, call it, and refuse by name when none is registered.
+  defp perform_intents(socket, []), do: socket
+
+  defp perform_intents(socket, intents) when is_list(intents) do
+    Enum.reduce(intents, socket, fn intent, acc ->
+      op = Map.get(intent, "op")
+      payload = Map.get(intent, "payload")
+
+      case :persistent_term.get(@performers, %{}) |> Map.fetch(op) do
+        {:ok, performer} ->
+          # The performer answers a map of assigns to merge — or nil when the
+          # intent changed the world without changing this page's state.
+          #
+          # It runs in the LiveView's OWN process, deliberately: a performer
+          # that starts something asynchronous (as `ask!` does) needs
+          # `self()` to be the pid the answer must return to, and a task
+          # started in a borrowed process sends its result somewhere nobody
+          # is listening.
+          # CONVERT FIRST, then decide. A performer is a beam-lisp fn, so what
+          # it answers with may be any beam-lisp value — and several of those
+          # (Vector, Set, LazySeq) are STRUCTS, which `is_map/1` says yes to.
+          # Matching on the raw answer would therefore route a returned vector
+          # down the assigns path and hand `assign_all` a `:__struct__` key to
+          # set on the socket. `Data.from_bl/1` is the one boundary that
+          # unwraps every beam-lisp struct, so the shape question is only
+          # meaningful on its far side.
+          case Data.from_bl(performer.(op, payload)) do
+            nil ->
+              acc
+
+            # is_map-ok: `from_bl/1` has already unwrapped every beam-lisp
+            # struct, so anything still a map here is a plain map — the same
+            # reasoning `assign_all/2` records one screen down.
+            assigns when is_map(assigns) ->
+              assign_all(acc, assigns)
+
+            other ->
+              # A performer that answers something else is a bug in the
+              # application, and it is worth naming at the moment it happens:
+              # silently ignoring it would leave a write that succeeded and a
+              # page that never heard about it.
+              raise ArgumentError,
+                    "the performer for intent #{inspect(op)} must answer a map of " <>
+                      "assigns or nil, got #{inspect(other)}"
+          end
+
+        :error ->
+          # LOUD, by name. A body may say `(do! :whatever …)` — the walker
+          # cannot know what an application performs, and deliberately does
+          # not try. The authority to perform lives here, so the refusal does
+          # too, and it names every op that IS registered because the usual
+          # cause is a typo or a boot step that did not run.
+          raise ArgumentError,
+                "no performer for intent #{inspect(op)} — registered: " <>
+                  "#{inspect(Map.keys(:persistent_term.get(@performers, %{})))}. " <>
+                  "Register one at boot: Server.register_performer(#{inspect(op)}, fn op, payload -> … end)"
+      end
+    end)
+  end
+
+  defp perform_intents(socket, _), do: socket
 
   # Assign names are turned into atoms, which is safe BECAUSE the set is closed:
   # they are the contract's declared assigns, printed by our own emitter. An
