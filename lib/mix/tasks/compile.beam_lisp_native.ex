@@ -56,6 +56,54 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
 
   defp build(crate) do
     crate_dir = Path.join(@native_dir, crate)
+
+    if fresh?(crate, crate_dir) do
+      {:ok, []}
+    else
+      compile(crate, crate_dir)
+    end
+  end
+
+  # Is the installed `.so` newer than every source file of the crate?
+  #
+  # Cargo answers this itself, in about a second, and for a single build that
+  # is a fine price. It is not fine for a CONCURRENT one: cargo takes an
+  # exclusive lock on its target directory and waits — politely, silently, and
+  # for as long as it takes — so a second `mix` invoked while the first still
+  # holds the lock stops dead at "Compiling NIF", with no output to say why.
+  #
+  # That is not hypothetical. A test that shells out to `mix run` (the honest
+  # way to prove a database file survives the process that wrote it) hangs
+  # forever, and the failure presents as a timeout in the test rather than as
+  # contention in the build.
+  #
+  # An mtime check is a weaker answer than cargo's fingerprint and the right
+  # one HERE, because the question is only "may I skip asking cargo?". A false
+  # "stale" costs a rebuild; a false "fresh" needs the source to be older than
+  # the artefact, which a checkout or an edit does not produce.
+  defp fresh?(crate, crate_dir) do
+    case File.stat(installed_path(crate)) do
+      {:ok, %{mtime: built}} ->
+        newest_source(crate_dir) < built
+
+      _ ->
+        false
+    end
+  end
+
+  defp newest_source(crate_dir) do
+    [Path.join(crate_dir, "src/**/*.rs"), Path.join(crate_dir, "Cargo.toml")]
+    |> Enum.flat_map(&Path.wildcard/1)
+    |> Enum.map(fn f ->
+      case File.stat(f) do
+        {:ok, %{mtime: m}} -> m
+        _ -> {{9999, 1, 1}, {0, 0, 0}}
+      end
+    end)
+    |> Enum.max(fn -> {{0, 1, 1}, {0, 0, 0}} end)
+  end
+
+  defp compile(crate, crate_dir) do
     Mix.shell().info([:green, "Compiling NIF ", :reset, crate])
 
     # No RUSTFLAGS here: each crate carries its own `.cargo/config.toml`
@@ -129,6 +177,12 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
 
     # `BeamLisp.Native` loads `priv/native/<crate>` (no `lib` prefix,
     # no extension — `:erlang.load_nif/2` appends it).
-    File.cp!(built, Path.join(dest_dir, "#{crate}.so"))
+    File.cp!(built, installed_path(crate))
   end
+
+  # Where the loadable artefact lives once installed. Named because
+  # `fresh?/2` asks the same question the install answers, and two spellings
+  # of one path is how a freshness check quietly starts checking the wrong
+  # file.
+  defp installed_path(crate), do: Path.join(["priv", "native", "#{crate}.so"])
 end
