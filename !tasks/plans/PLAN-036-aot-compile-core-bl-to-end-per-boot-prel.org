@@ -1,0 +1,160 @@
+#+TITLE: AOT-compile core.bl to end per-boot prelude recompilation
+#+STATE: DOING
+#+SESSION_ID: 1565592d6a65a227
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-08-25T09-10-25-449Z_1565592d6a65a227.jsonl]]
+#+CUSTOM_ID: PLAN-036-aot-compile-core-bl-to-end-per-boot-prel
+
+* Initial Message
+
+why is the AOT redb datom still taking 4s to load? that's a lot...
+
+## Problem
+
+Every VM boot pays 6–8s recompiling `priv/core.bl` (65KB, 152 defs incl. 20 `defmacro`) from source. This was misattributed to the "AOT redb datom load" — but **datom loads via AOT in ~150ms**; the cost is `BeamLisp.init/0`.
+
+Commit `e72b76d` wired AOT into `Loader.ensure_loaded/1` (datom: 41s → 150ms). But `core` never goes through the loader — `init/0` hardcodes `Compiler.eval_string(@prelude)`, recompiling on every boot.
+
+### Measured (fresh VM, proven)
+```
+BeamLisp.init()                    6–8 s
+  ├─ RT.seed_core()                  0 ms
+  ├─ eval_string(core.bl 65KB)    5921 / 7788 ms   ← the entire cost
+  └─ eval_string(multi.bl)        ~130 ms
+Loader.ensure_loaded("datom")     ~150 ms          ← AOT already works
+```
+
+## Root cause (two defects)
+
+1. **core.bl has no `(ns …)` head.** `AOT.compile_source` resets to `user` ns per file and only names a module from the ns in scope, so core's 152 defs currently emit into `Ns.User.beam` (verified: `Ns.User` exports 147 core fns incl `inc`, `dec`, `comp`). No `Ns.Core.beam` is ever produced.
+
+2. **`init/0` never consults AOT.** Unlike `Loader.ensure_loaded/1`, it unconditionally evals `@prelude`/`@multi` from source — so even if a core beam existed it would be ignored.
+
+## Fix (structural, not workaround)
+
+Route core+multi through the same AOT path datom uses.
+
+### Change A — give core.bl an ns head
+- `priv/core.bl`: add `(ns core)` as the first form (after the comment header, before `(defn identity …)`).
+- `priv/multi.bl`: already declares `(ns multi)` and already emits `Ns.Multi.beam` — no change, include in verification.
+- Effect: `mix compile.beam_lisp` emits `Elixir.BeamLisp.Ns.Core.beam` carrying `__bl_init__/0`. **Verified**: patched core.bl compiled to a clean `Ns.Core.beam` with `__bl_init__/0` + 142 fn exports; loaded cold it interned 130 core defs.
+
+### Change B — make `init/0` prefer AOT, fall back to source
+In `lib/beam_lisp.ex::init/0`, replace unconditional prelude/multi eval with an AOT-first branch mirroring `Loader.ensure_loaded/1`:
+```elixir
+def init do
+  ensure_env()
+  unless Env.seeded?() do
+    RT.seed_core()
+    for ns <- ["core", "multi"] do
+      case BeamLisp.AOT.ensure_loaded(ns) do
+        :loaded    -> :ok                       # disk beam + __bl_init__
+        :no_module -> eval_prelude_source(ns)   # uncompiled checkout, slow+correct
+      end
+    end
+    Env.mark_seeded()
+    Env.in_ns("user")
+  end
+  :ok
+end
+```
+- `eval_prelude_source/1` keeps current `Compiler.eval_string(@prelude|@multi, new_env("core"))` for the `:no_module` fallback, so an uncompiled checkout still boots. Same contract as datom's source fallback.
+- `@prelude`/`@multi`/`@external_resource` stay (they ARE the fallback + trigger Elixir recompile when core.bl changes).
+
+### Change C — resolve the compile-phase shadow (critical, else fix is silently defeated)
+`mix compile.beam_lisp` calls `BeamLisp.init()` (task line ~86) to seed the reader. With Change B, that init would AOT-load core — but on a **clean build the beam doesn't exist yet**, so it hits `:no_module` and evals source, which via `Link.defvar` does `Module.create(Ns.Core, ignore_module_conflict: true)` **in memory without `__bl_init__`**, shadowing the disk beam emitted later in the same VM (`:code.which(Ns.Core)` → `[]`).
+
+This is why the integration test only passed under `mix run --no-compile`. Options, preferred first:
+- **C1 (preferred): don't seed core into the ns registry from the compile task's init.** The task needs the *reader* runtime (`:beam_lisp_vars` ETS + reader macros), not 152 interned core vars. Narrow the task's boot to reader prerequisites, or seed core without `Module.create`-ing the ns module. Spike whether `RT.seed_core()` + reader-macro table alone suffices to read `.bl`.
+- **C2: compile core.bl FIRST and load its beam before init seeds**, so `ensure_loaded("core")` returns `:loaded` and the `Module.create` path never runs. Fragile — depends on compile order + core having no `(:require)`.
+- **C3: after emitting each beam, purge+reload from disk** to replace the in-memory shadow. Heavy-handed.
+
+C1 is the structural answer: the compile task should depend on the *reader*, not a fully-seeded core. Decide via spike during implementation.
+
+## Acceptance
+
+1. `mix compile.beam_lisp --force` emits `_build/dev/lib/beam_lisp/ebin/Elixir.BeamLisp.Ns.Core.beam` with `__bl_init__/0` in exports (`:beam_lib.chunks`).
+2. Fresh-VM `BeamLisp.init()` wall time 6–8s → <300ms (measure via `System.monotonic_time` around `init/0` in a `mix run` script).
+3. Correctness — all pass in a booted VM: `(inc 41)`→42, `(when true :yes)`→:yes, `(cond false 1 :else 3)`→3, `(-> 5 inc (* 2))`→12, `(map inc [1 2 3])`→(2 3 4), `(reduce + 0 (range 5))`→10. (Exact checks already verified against a hand-patched core beam.)
+4. Macros offered to downstream compilation: a namespace read from source after boot can use core macros (`when`, `->`, `cond`, `and`, `or`, `lazy-seq`) — guards the `defmacro`-not-replayed bug class the datom fix hit.
+5. Uncompiled-checkout fallback: `rm` the core beam, boot → still works via `:no_module` source path.
+6. Full suite green: `mix test` (baseline 1238 passing per commit e72b76d).
+7. No `Ns.User.beam` regression: core defs land in `Ns.Core`; genuine `user` ns handling still works.
+
+## Risk / watch
+
+- **Bootstrap order in core.bl**: macros defined mid-file (`lazy-seq` L100, `cond` L109, `when` L118) and used later. AOT replay via `__bl_init__` must preserve def order + offer macros to later compilation. `build_init_ast` orders requires→native→fn→value and `@replayed_forms` includes `defmacro` — but core is larger/earlier than anything tested; verify explicitly (acceptance #4).
+- **`(ns core)` semantics**: must not change core's refers/aliases. core.bl leans only on RT-seeded prims; confirm the head introduces no implicit `(:require)`/self-refer perturbing seeding.
+- **`multi.bl` builds on core** (`derive`/`isa?`): core must load before multi (list order `["core","multi"]` ensures it).
+- **Downstream `@external_resource`**: keep module attrs so editing core.bl forces an Elixir recompile of `beam_lisp.ex` (fallback string stays fresh).
+
+## Out of scope
+- AOT-compiling `test.bl`/`optics.bl`/`rewrite.bl` (already emit beams via their `(ns …)` heads; reached only on explicit require, not per-boot).
+- The `Ns.User.beam` holding core's defs disappears once core owns its ns — a correctness improvement, not a separate task.
+
+NOTE [2026-08-25]: SPIKE C1 RESULT (resolved): C1 (reader-only boot for compile task) REJECTED. Proof: `and`/`or`/`when`/`cond`/`->` are NOT in @special_forms (compiler.ex:40) — they are core macros. priv/datom.bl, optics.bl, rewrite.bl use `or`/`and` at compile time, so mix compile.beam_lisp genuinely needs core seeded to macroexpand them. Reader itself needs only the ETS table + has a builtin `@→deref` default (reader.ex:219), but macroexpansion needs core.
+
+∴ Adopt C3-refined (purge the shadow). Mechanism PROVEN: after source-seeding core (the in-memory Module.create shadow, which=[], no __bl_init__, PERSISTS into run-phase same VM), calling :code.purge(mod);:code.delete(mod);:code.purge(mod) makes :code.which resolve to the disk beam; a fresh unseeded Env then gets ensure_loaded("core")=:loaded, 130 defs, macros (-> =12) and HOFs (map) all correct. :code.load_file alone fails :not_purged — must purge first.
+
+Placement decision for change C: after the compile task emits the core beam, purge Ns.Core (+Ns.Multi) so the in-memory shadow from the task's own BeamLisp.init() seeding doesn't outlive the emit. Then run-phase init/0 (change B) hits :loaded. Alternatively/additionally guard in AOT.ensure_loaded: treat which==[] (in-memory, no beam file) as NOT a usable AOT module. Will decide exact placement during impl — leaning: purge in compile task after emit (localized to the one VM that has the problem) rather than complicating ensure_loaded's contract.
+
+NOTE [2026-08-25]: REGRESSION ROOT CAUSE FOUND (deterministic repro). Changes A+B+C as written cause 195+ test failures, 158 of them BadFunctionError. NOT a wiring bug — a real AOT-emitter gap exposed by core.
+
+Baseline confirmed: HEAD = 0 failures on the exact failing files (wave18/wave9/wave23 = 37 passed). The regression is mine.
+
+MECHANISM: A `defmacro` is a @replayed_form — AOT re-evaluates the whole form inside `Ns.Core.__bl_init__/0`. The resulting macro closure is `{:"$macro", {:"$blfn", %{}, {3, #Function<...in BeamLisp.Ns.Core.__bl_init__/0>}}}` — i.e. the expander CLOSURE is captured in the `Ns.Core` module's code version. Runtime `(def …)` into the `core` ns calls `Link.defvar` → rebuilds+reloads the `Ns.Core` shim module. BEAM keeps 2 versions; the 2nd runtime core def purges the `__bl_init__` version, and every macro closure captured there goes stale → BadFunctionError on next macro use (`when`, `cond`, `->`, transducer macros, etc).
+
+DETERMINISTIC REPRO: AOT-load core, mark seeded, then eval two `(defn zzzN [] N)` in core ns; the 2nd def makes `(when true 1)` raise BadFunctionError %Function<445...in BeamLisp.Ns.Core>. Confirmed.
+
+WHY runtime source-seed (HEAD) is immune: runtime `defmacro` → compile_special → Link.defvar → `fresh_body_module` (Ns.Fn.M<n>), a stable module that is NEVER reloaded, so version churn on Ns.Core can't invalidate it. The macro closure lives in Eval.M<n>/Ns.Fn.M<n>, not the ns module.
+
+WHY datom AOT is immune: nothing does runtime `(def)` into the datom.* namespaces during tests, so Ns.Datom.* never churns versions. Core is special: user/core defs are ubiquitous in tests.
+
+THE STRUCTURAL FIX (new scope, beyond A/B/C): AOT must house replayed macro/fn closures in stable, uniquely-named modules mirroring Link.fresh_body_module — NOT inline in __bl_init__/0. Options:
+ (1) In build_init_ast, for @replayed_forms macros, emit the expander fn into a sibling stable module `Ns.Fn.<ns>Macro<name>` compiled alongside Ns.Core, and have __bl_init__ intern a capture of THAT (never-reloaded) module. Mirrors the runtime body-module design exactly.
+ (2) Make Link.defvar NOT reload the ns module for a plain new def (append vs rebuild) — bigger blast radius, risky.
+ (3) Emit macros as real functions in Ns.Core (like fn_asts) so they're not closures-in-init; but a macro isn't in ns_defs, and its capture would still tie to Ns.Core version.
+LEANING (1): most faithful to the existing shim/body-module split that already makes runtime macros survive. Needs care: the macro fn AST is available in the replayed FORM; AOT must compile it to a named module fn rather than re-eval it in init.
+
+NEXT: prototype (1). Until then, changes A/B/C must NOT ship — they trade a 6s boot win for 195 broken tests. Do not mark verify complete.
+
+NOTE [2026-08-25]: From the PLAN-037 session (reel affordance work), as an observation from
+the outside — the in-tree state of this plan currently blocks
+`mix beam_lisp.test` entirely, before a single test runs:
+
+    ** (BadFunctionError) function #Function<320.23143100/4 in
+       BeamLisp.Ns.Core> is invalid, likely because it points to an old
+       version of the code
+        (beam_lisp) lib/beam_lisp/rt.ex:40: BeamLisp.RT.invoke/2
+        (beam_lisp) lib/beam_lisp/compiler.ex:1626:
+                    BeamLisp.Compiler.expand_macro/4
+
+What was ruled OUT, so it is not re-litigated:
+
+- NOT stale artefacts. `rm -rf _build/dev/lib/beam_lisp` followed by a
+  full `mix compile` reproduces it exactly. Deleting only the
+  `Elixir.BeamLisp.Ns.*.beam` files reproduces it. Moving
+  `Ns.Core.beam` and `Ns.Multi.beam` out of ebin ALSO reproduces it,
+  which is the interesting one: the failing closure is reached even with
+  no core beam on disk, so something has captured it in an Env snapshot
+  rather than resolving it per call.
+- NOT the working tree generally. A clean clone of this repo at HEAD
+  (5a8d7e1) WITHOUT the four uncommitted files runs green:
+  655 tests / 1731 assertions, 0 failures.
+
+∴ it is reproducible from the uncommitted source change alone.
+
+The signature points at `expand_macro/4` — core.bl has 20 `defmacro`,
+and a macro is a compile-time closure. `@replayed_forms` in aot.ex
+captures `defmacro` and replays the FORM in `__bl_init__/0` (commit
+d6f244d, "macros vanished in AOT builds"), so an AOT'd core would hold
+macro closures created by one instance of the module and then invoked
+after the module is reloaded — which is precisely what
+BadFunctionError reports. Worth checking whether the prelude's macros
+need re-expansion on load rather than closure capture, since core is the
+one namespace guaranteed to be loaded before everything else that
+consumes it.
+
+No files of this plan were touched from that session. Flagging only
+because the failure looks like an unrelated regression to anyone who
+runs the suite meanwhile — it cost an hour here before the clone
+isolated it.
