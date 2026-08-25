@@ -177,6 +177,39 @@ defmodule BeamLisp.Spell.Server do
     end
   end
 
+  @doc """
+  Tell every page listening on `topic` that the world moved.
+
+  The payload is a BASIS — a number — and deliberately not a board. At the
+  instant of a write the only thing that is true is that the data advanced;
+  which rows changed, and what any given page should now show, is derived by
+  the READER from its own question. A projection is a function of (data, who
+  is asking), and a writer knows only its own half: reel's board answers
+  `[doing dropped]` to a tech lead and `[dropped]` to a product lead for the
+  same task, so broadcasting a rendered board would hand every other page
+  affordances computed for whoever happened to write.
+
+  Called from a DOMAIN write — `reel.store/transact-as!` — rather than from
+  `perform_intents`, and that placement is forced rather than chosen: a
+  performer answers a map of assigns for a REFUSAL exactly as it does for a
+  success, so this module cannot tell the two apart. The domain can. It is the
+  same split `do!` already makes, in the other direction: the domain decides
+  WHETHER, the host owns the AUTHORITY.
+
+  A missing PubSub is not an error. Reel starts it only in serve mode, so a
+  `mix run --no-start` script — the corpus loader, `scripts/check.exs` — has
+  none, and it is not wrong for having no web stack. Losing a write because
+  nobody could be notified about it would be a spectacular trade.
+  """
+  def announce(topic, basis) do
+    with server when not is_nil(server) <- pubsub_server(),
+         true <- is_pid(Process.whereis(server)) do
+      Phoenix.PubSub.broadcast(server, to_string(topic), {:"spell/changed", basis})
+    end
+
+    :ok
+  end
+
   @doc "The intent ops that currently have a performer."
   def performers, do: Map.keys(:persistent_term.get(@performers, %{}))
 
