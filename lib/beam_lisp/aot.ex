@@ -133,7 +133,12 @@ defmodule BeamLisp.AOT do
   @doc """
   Ensure namespace `ns` is usable in this VM: load its AOT module if a
   `.beam` exists on the code path, and run its `__bl_init__/0` (no-op
-  for namespaces with no AOT module). Idempotent; returns `:ok`.
+  for namespaces with no AOT module). Idempotent.
+
+  Returns `:loaded` when a compiled module was found and made usable — the
+  namespace is then marked loaded, so `Env.loaded_ns?/1` says yes and a
+  source load is neither needed nor performed — or `:no_module` when nothing
+  was on the code path and the caller should fall back to reading source.
 
   Call after `BeamLisp.init/0` so `core` is seeded for value-def
   initializers. This is the runtime-side hook a loader or application
@@ -145,9 +150,22 @@ defmodule BeamLisp.AOT do
     if code_path_module?(mod) do
       Code.ensure_loaded(mod)
       if function_exported?(mod, :__bl_init__, 0), do: mod.__bl_init__()
-    end
 
-    :ok
+      # MARK IT, exactly as a source load does. The namespace is now fully
+      # usable — its functions are on the code path and its value defs have
+      # run — so anything that asks `Env.loaded_ns?/1` deserves a truthful
+      # yes. Without this the answer was `false` and `Loader.ensure_loaded/1`
+      # went on to read and compile the source it had just been handed,
+      # doing the expensive thing anyway: `datom` took 41s through the loader
+      # against 14.7s calling this function directly.
+      Env.mark_loaded(ns)
+      :loaded
+    else
+      # SAY SO. A bare `:ok` for both outcomes is what hid the bug above:
+      # the caller could not distinguish "loaded from disk" from "there was
+      # nothing to load", so it could not skip the fallback.
+      :no_module
+    end
   end
 
   @doc "Start `BeamLisp.Env` if needed and seed `core` (idempotent)."

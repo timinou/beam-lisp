@@ -45,6 +45,31 @@ defmodule BeamLisp.Loader do
 
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
+    # AOT FIRST, and this is the one place it can go.
+    #
+    # `mix compile.beam_lisp` emits each namespace as a real BEAM module, and
+    # loading one from disk costs nothing next to reading and compiling its
+    # source. Putting the preference HERE rather than in each caller is what
+    # makes it reach TRANSITIVE requires: `(:require [datom])` comes back
+    # through this function, so a project that never mentions `datom.tx` still
+    # gets the compiled one.
+    #
+    # Measured, loading `datom` (seventeen files) in a fresh VM:
+    #
+    #     via AOT      14.7s
+    #     via source   3m20s+ (timed out)
+    #
+    # That is not a nicety at the top of a scale — it was the difference
+    # between a durability test that spawns two child VMs and one that times
+    # out, and it was paid by every `mix run` of every script downstream.
+    #
+    # `AOT.ensure_loaded/1` returns `:no_module` when nothing is on the code
+    # path, so an uncompiled checkout still works through the branch below —
+    # slowly, and correctly. On `:loaded` it marks the namespace, so the
+    # `loaded_ns?` guard immediately below short-circuits and the source is
+    # never read.
+    BeamLisp.AOT.ensure_loaded(ns)
+
     if ns == "core" or Env.loaded_ns?(ns) do
       :ok
     else

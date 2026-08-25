@@ -64,6 +64,19 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         {:noop, []}
 
       true ->
+        # THE RUNTIME FIRST. Reading a `.bl` file is not a pure parse: the
+        # reader consults a table of reader macros (`@x` → `(deref x)` among
+        # them), and that table is created by `BeamLisp.init/0`. Without it
+        # the very first `@` in a source fails with "the table identifier
+        # does not refer to an existing ETS table" — a message that names
+        # `:beam_lisp_vars` and says nothing about the missing init.
+        #
+        # It surfaced only when a project whose sources use `@` wired this
+        # task in: the fixtures under `test/fixtures/aot` do not, so the task
+        # had never needed the runtime it was reading with. Idempotent, so
+        # calling it here costs nothing when something already has.
+        BeamLisp.init()
+
         sources = discover(source_dir)
         manifest = read_manifest(manifest_path)
         ordered = order_by_requires(sources)

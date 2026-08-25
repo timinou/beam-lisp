@@ -18,7 +18,19 @@ defmodule BeamLisp.MixProject do
       # loaded lazily by `defnative` at namespace-require time, not at
       # module-compile time, so it only has to exist before the first
       # CALL.
-      compilers: Mix.compilers() ++ [:beam_lisp_native],
+      # `beam_lisp` AOT-compiles its OWN `priv/` sources — core, datom,
+      # optics, specter — into real BEAM modules, so a consumer loads them
+      # from disk instead of reading and compiling them at every boot.
+      #
+      # Measured on a project that requires `datom` (seventeen files): ~30s
+      # of runtime compilation per VM start, which is not merely slow. It is
+      # the difference between a durability test that spawns two child VMs
+      # and one that times out, and it is paid by every `mix run` of every
+      # script in every downstream project.
+      #
+      # AFTER :elixir for the usual bootstrap reason: a Mix compiler task
+      # must itself be compiled before Mix can find it.
+      compilers: Mix.compilers() ++ [:beam_lisp_native, :beam_lisp],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present
       # before anything tries to load it.
