@@ -5,7 +5,9 @@ defmodule BeamLisp.Spell.Build do
   beam-lisp owns the machine; verse owns the view compile. The seam between
   them is two files in the served site directory:
 
-    * `index.edn`        — written here on publish (tmp + rename)
+    * `index.edn`        — written here on publish, in place (see
+      `write_and_await/3`: a rename swaps the inode and serve's watcher
+      never sees the change)
     * `build-status.json` — written by serve after every compile, carrying
       `content_sha256` of the source it compiled
 
@@ -50,22 +52,52 @@ defmodule BeamLisp.Spell.Build do
   def write_and_await(entry, content, timeout_ms \\ 30_000) do
     File.mkdir_p!(site_dir())
     target = Path.join(site_dir(), entry)
-    tmp = target <> ".tmp"
     status_path = Path.join(site_dir(), "build-status.json")
 
-    # Retire the previous verdict BEFORE writing: the page is deterministic,
-    # so a restart with no serve running would otherwise find the LAST
-    # session's status carrying this very hash and report :ok for a compile
-    # that never happened. With the old status gone, a matching status can
-    # only be written by a serve that compiled THESE bytes. (Single-writer
-    # protocol: a second publisher sharing the site would see its own await
-    # disturbed by this delete — the same reason the tests stay async:false.)
-    File.rm(status_path)
-
-    File.write!(tmp, content)
-    File.rename!(tmp, target)
-
+    # Retire the previous verdict ONLY when the bytes actually change.
+    #
+    # The original rule was to always delete: the page is deterministic, so a
+    # restart with no serve running could otherwise find the LAST session's
+    # status carrying this very hash and report `:ok` for a compile that
+    # never happened. Sound, but it assumed a rewrite always produces a new
+    # verdict — and it does not. Serve recompiles on a CHANGE event, and
+    # writing identical bytes is not a change: no event, no compile, no
+    # status. Having just deleted the only verdict, this function then waited
+    # out its full deadline and blamed a serve that was running perfectly.
+    #
+    # It presented as a flake — the first check after any real edit passed,
+    # every repeat run failed — which is exactly what an unpublished race
+    # looks like from the outside.
+    #
+    # Identical bytes + a verdict already carrying this hash means a serve
+    # has compiled precisely these bytes into precisely this site dir. That
+    # is the thing the delete was protecting, so keep the verdict and let the
+    # await below match it immediately.
+    # The verdict must name THIS content, not merely exist: a status left by
+    # a different page is exactly the stale verdict the delete guards against.
     hash = sha256_hex(content)
+
+    unchanged? =
+      match?({:ok, %{"content_sha256" => ^hash}}, status()) and
+        File.read(target) == {:ok, content}
+
+    unless unchanged?, do: File.rm(status_path)
+
+    # IN PLACE, not through a rename. An atomic rename replaces the file's
+    # INODE, and serve's watcher is registered against the inode it saw at
+    # boot — so the new entry is invisible to it, no compile runs, no status
+    # is written, and this function waits out its full deadline before
+    # blaming a serve that is running perfectly well.
+    #
+    # Measured against a live `spacetime serve`: three renames produced no
+    # rebuild in 61s each; an in-place write produced one every time. The
+    # rename was there for atomicity, but the reader is a watcher rather
+    # than a concurrent parser, and a torn read simply triggers a second
+    # compile when the write completes. Losing the rebuild entirely is the
+    # worse failure — and it presented as a flake, passing whenever some
+    # earlier write happened to leave a matching verdict behind.
+    File.write!(target, content)
+
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     await(hash, deadline)
   end
