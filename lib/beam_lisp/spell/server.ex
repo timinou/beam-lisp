@@ -265,6 +265,8 @@ defmodule BeamLisp.Spell.Server do
 
     socket = assign_all(socket, Map.merge(seed, restored_messages()))
 
+    Enum.each(terms, &subscribe_topic(socket, &1))
+
     Enum.reduce(terms, {:ok, socket}, fn term, {:ok, socket} ->
       case call("mount-event", [term]) do
         nil -> {:ok, socket}
@@ -272,6 +274,43 @@ defmodule BeamLisp.Spell.Server do
       end
     end)
   end
+
+  # Join the topic a contract names, so a page learns that the world moved
+  # WITHOUT being told what to think about it.
+  #
+  # What travels on the topic is a basis, never a rendered board. At the
+  # instant of a write the only thing that is true is that the database
+  # advanced; which rows changed, and what any given page should now show, is
+  # derived by the READER from its own question. A projection is a function of
+  # (data, who is asking), and a writer knows only its own half — reel's board
+  # answers `[doing dropped]` to a tech lead and `[dropped]` to a product lead
+  # for the same task, so a page rendering somebody else's broadcast board
+  # would show affordances computed for the wrong person. That failure appears
+  # only with two tabs open as two different leads, which is to say almost
+  # never in a test and immediately in use.
+  #
+  # CONNECTED ONLY. Phoenix calls `mount/3` twice for a live navigation: once
+  # for the disconnected static render, once when the socket connects. The
+  # first runs in a request process that exits immediately afterwards, so
+  # subscribing there registers a pid that is about to die and doubles every
+  # delivery until it does.
+  #
+  # No topic ⇒ no subscription, which is what keeps every contract written
+  # before this feature mounting exactly as it did.
+  defp subscribe_topic(socket, term) do
+    with true <- Phoenix.LiveView.connected?(socket),
+         t when not is_nil(t) <- call("topic", [term]),
+         server when not is_nil(server) <- pubsub_server() do
+      Phoenix.PubSub.subscribe(server, to_string(t))
+    end
+
+    :ok
+  end
+
+  # The PubSub server is the HOST APPLICATION's, named in its own supervision
+  # tree — `SpellWeb.PubSub` here, `Reel.PubSub` in reel. A literal would bind
+  # this module to one of them and silently do nothing in the other.
+  defp pubsub_server, do: Application.get_env(:beam_lisp, :spell_pubsub)
 
   # A mount event is just the contract's handler, run once with an empty
   # payload. It must not `ask!` — a mount is not a turn — but nothing forbids
