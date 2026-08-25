@@ -34,7 +34,10 @@ defmodule BeamLisp.MixProject do
       # Per-project, NOT `config :beam_lisp` — the compiler is recursive, so
       # an app that depends on this one would otherwise impose its own
       # source dir here and `priv/` would never be compiled.
-      beam_lisp: [source_dir: "priv"],
+      # Both trees this library ships: `priv/` (core, datom, optics) and
+      # `spell/src` (the contract/view stack). A consumer AOT-compiling a
+      # namespace that requires `spell.contract` needs the second one too.
+      beam_lisp: [source_dirs: ["priv", "spell/src"]],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present
       # before anything tries to load it.

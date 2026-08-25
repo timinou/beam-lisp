@@ -223,7 +223,15 @@ defmodule BeamLisp.AOT do
   # definition, and re-evaluating it in `__bl_init__/0` reconstructs exactly
   # what evaluating the source would. All of them are idempotent by
   # construction (module creates set `ignore_module_conflict`).
-  @replayed_forms ~w(defserver defrecord deftype defprotocol defmulti extend-type extend-protocol)
+  # `defmacro` is here for a different reason than the rest, and it matters.
+  # A macro is a compile-time expander held in the var registry; the emitted
+  # module has no function for it, because by the time a caller is compiled
+  # the macro has already done its work. But a namespace loaded from a
+  # `.beam` still has to OFFER its macros to whatever compiles next — a
+  # script, the REPL, another namespace read from source — and without this
+  # they were simply gone: "undefined var: rewrite.test/defrule", from a
+  # namespace that had loaded successfully.
+  @replayed_forms ~w(defmacro defserver defrecord deftype defprotocol defmulti extend-type extend-protocol)
 
   defp capture_value_def(vdefs, {:list, [{:symbol, head}, name_form | _]} = form, ns)
        when head in @replayed_forms do
@@ -298,23 +306,28 @@ defmodule BeamLisp.AOT do
     Map.update(ns_meta, ns, meta, fn _prev -> meta end)
   end
 
+  defp capture_ns_decl(ns_meta, _form), do: ns_meta
+
   # The namespace a require spec names, in either accepted shape.
   defp require_target(spec) do
     case unmeta(spec) do
-      {:symbol, target} -> target
-      {:vector, [head | _flags]} -> case unmeta(head) do
-        {:symbol, target} -> target
-        _ -> nil
-      end
-      _ -> nil
+      {:symbol, target} ->
+        target
+
+      {:vector, [head | _flags]} ->
+        case unmeta(head) do
+          {:symbol, target} -> target
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
   # Strip one layer of reader position metadata.
   defp unmeta({:meta, form, _m}), do: form
   defp unmeta(form), do: form
-
-  defp capture_ns_decl(ns_meta, _form), do: ns_meta
 
   # Like Compiler.parse_require_spec/1: `[target :as a :refer [x y]]` or
   # a bare `target`. The task compiles required files first, so the
@@ -324,17 +337,36 @@ defmodule BeamLisp.AOT do
 
   defp capture_require_spec({:symbol, _target}, acc), do: acc
 
+  # A require spec whose TARGET carries metadata, e.g. `[^:x foo :as f]`.
+  defp capture_require_spec({:vector, [{:meta, head, _m} | flags]}, acc),
+    do: capture_require_spec({:vector, [head | flags]}, acc)
+
   defp capture_require_spec({:vector, [{:symbol, target} | flags]}, acc) do
+    # PEEL EACH FLAG. The reader wraps them in position metadata, so
+    # `{:keyword, "refer"}` arrived as `{:meta, {:keyword, "refer"}, _}` and
+    # fell to the catch-all — leaving the accumulator holding the
+    # `{:expecting, "refer"}` SENTINEL instead of a list of symbols. The
+    # sentinel then reached the comprehension below, where a tuple is not
+    # enumerable: "protocol Enumerable not implemented for Tuple", raised
+    # from a require clause that is perfectly well formed.
     {as_alias, refer_syms} =
-      Enum.reduce(flags, {nil, []}, fn
+      flags
+      |> Enum.map(&unmeta/1)
+      |> Enum.reduce({nil, []}, fn
         {:keyword, "as"}, {_a, rf} -> {{:expecting, "as"}, rf}
         {:keyword, "refer"}, {al, _rf} -> {al, {:expecting, "refer"}}
         {:symbol, a}, {{:expecting, "as"}, rf} -> {a, rf}
-        {:vector, syms}, {al, {:expecting, "refer"}} -> {al, Enum.map(syms, fn {:symbol, s} -> s end)}
+        {:vector, syms}, {al, {:expecting, "refer"}} -> {al, Enum.map(syms, &bare_name/1)}
         _other, acc -> acc
       end)
 
     {aliases, refers} = acc
+
+    # An `:as`/`:refer` never followed by its argument leaves the sentinel
+    # behind. Treat it as absent rather than letting a tuple downstream.
+    as_alias = if is_binary(as_alias), do: as_alias
+    refer_syms = if is_list(refer_syms), do: refer_syms, else: []
+
     aliases = if as_alias, do: aliases ++ [{as_alias, target}], else: aliases
     refers = refers ++ for sym <- refer_syms, do: {sym, target}
     {aliases, refers}

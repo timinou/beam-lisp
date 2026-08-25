@@ -52,15 +52,15 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         strict: [source_dir: :string, force: :boolean]
       )
 
-    source_dir = opts[:source_dir] || source_dir_from_config()
+    source_dirs = if d = opts[:source_dir], do: [d], else: source_dirs_from_config()
     compile_path = Mix.Project.compile_path()
     manifest_path = Path.join(Mix.Project.manifest_path(), @manifest)
 
     cond do
-      not File.dir?(source_dir) ->
+      not Enum.any?(source_dirs, &File.dir?/1) ->
         {:noop, []}
 
-      discover(source_dir) == [] ->
+      discover(source_dirs) == [] ->
         {:noop, []}
 
       true ->
@@ -75,9 +75,17 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         # task in: the fixtures under `test/fixtures/aot` do not, so the task
         # had never needed the runtime it was reading with. Idempotent, so
         # calling it here costs nothing when something already has.
+        #
+        # Note whether the runtime was ALREADY up, because Mix runs
+        # compilers in the same VM that later starts the application — and
+        # the application starts `BeamLisp.Env` under its own supervisor.
+        # An `Env` left running by this task made that fail with "already
+        # started", so `mix test` died before a single test ran in a
+        # project whose code was perfectly fine. Cleaned up below.
+        env_was_running? = Process.whereis(BeamLisp.Env) != nil
         BeamLisp.init()
 
-        sources = discover(source_dir)
+        sources = discover(source_dirs)
         manifest = read_manifest(manifest_path)
         ordered = order_by_requires(sources)
 
@@ -108,6 +116,10 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         end)
 
         write_manifest(manifest_path, Map.new(kept))
+
+        # Leave the VM as we found it. Only if WE started it — a project
+        # that had `Env` running before this task is entitled to keep it.
+        if not env_was_running?, do: stop_env()
 
         cond do
           errors != [] -> {:error, Enum.reverse(errors)}
@@ -153,17 +165,49 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   # project answers for itself. The application env stays as a fallback —
   # for a project that sets it and has no `:beam_lisp` project key — but the
   # project key wins, which is what makes an umbrella correct.
-  defp source_dir_from_config do
+  # A LIST, because one project can own more than one tree of `.bl`. This
+  # library ships two — `priv/` (core, datom) and `spell/src` (the
+  # contract/view stack) — and a consumer that AOT-compiles a namespace
+  # requiring `spell.contract` needs both on the path or the compile fails
+  # with "namespace not found: spell.contract".
+  #
+  # `:source_dir` still accepts a single string, which is what every
+  # existing config passes.
+  defp source_dirs_from_config do
     project_config = Mix.Project.config()[:beam_lisp] || []
 
-    project_config[:source_dir] ||
-      Application.get_env(:beam_lisp, :source_dir, "bl")
+    configured =
+      project_config[:source_dirs] || project_config[:source_dir] ||
+        Application.get_env(:beam_lisp, :source_dirs) ||
+        Application.get_env(:beam_lisp, :source_dir, "bl")
+
+    List.wrap(configured)
   end
 
-  defp discover(source_dir) do
-    source_dir
-    |> Path.join("**/*.bl")
-    |> Path.wildcard()
+  # Stop the `Env` this task started, so the application can start its own.
+  # `GenServer.stop/1` rather than `Process.exit/2`: the registry owns ETS
+  # tables, and an orderly terminate releases them.
+  defp stop_env do
+    case Process.whereis(BeamLisp.Env) do
+      nil -> :ok
+      pid -> try_stop(pid)
+    end
+  end
+
+  defp try_stop(pid) do
+    GenServer.stop(pid, :normal, 5_000)
+  catch
+    # Already gone, or refusing to stop. Neither is worth failing a
+    # compile over — the next `init/0` is idempotent either way.
+    _, _ -> :ok
+  end
+
+  defp discover(source_dirs) do
+    source_dirs
+    |> List.wrap()
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.flat_map(&Path.wildcard(Path.join(&1, "**/*.bl")))
+    |> Enum.uniq()
     |> Enum.sort()
   end
 
@@ -212,7 +256,17 @@ defmodule Mix.Tasks.Compile.BeamLisp do
       mods = BeamLisp.AOT.compile_file(path, output_dir: compile_path)
       {:ok, Enum.map(mods, &elem(&1, 0))}
     rescue
-      e -> {:error, "beam-lisp AOT: #{path}: " <> Exception.message(e)}
+      e ->
+        # PRINT IT HERE. These strings are returned to `Mix.Task.Compiler`,
+        # which renders `%Diagnostic{}` structs and quietly discards plain
+        # strings — so a failing AOT compile printed "Generated beam_lisp
+        # app" followed by mix's generic "could not compile dependency"
+        # and NOTHING about which file or why. Two real bugs hid behind
+        # that for an hour. The return value stays as it was, so the task
+        # still fails; this only makes the reason visible.
+        message = "beam-lisp AOT: #{path}: " <> Exception.message(e)
+        Mix.shell().error(message)
+        {:error, message}
     end
   end
 
