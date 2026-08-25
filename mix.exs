@@ -31,6 +31,10 @@ defmodule BeamLisp.MixProject do
       # AFTER :elixir for the usual bootstrap reason: a Mix compiler task
       # must itself be compiled before Mix can find it.
       compilers: Mix.compilers() ++ [:beam_lisp_native, :beam_lisp],
+      # Per-project, NOT `config :beam_lisp` — the compiler is recursive, so
+      # an app that depends on this one would otherwise impose its own
+      # source dir here and `priv/` would never be compiled.
+      beam_lisp: [source_dir: "priv"],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present
       # before anything tries to load it.

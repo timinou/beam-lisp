@@ -139,8 +139,25 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
   # --- discovery ---
 
+  # THE PROJECT BEING COMPILED, not the application environment.
+  #
+  # This task is `@recursive`, so it runs once per project in the tree — the
+  # dep and the app that depends on it. `Application.get_env/3` reads ONE
+  # global, so the top app's `config :beam_lisp, source_dir: "src"` was the
+  # answer given while compiling `beam_lisp` ITSELF, whose sources are in
+  # `priv/`. The dep found no `src/`, no-op'd, and emitted nothing; the
+  # failure surfaced much later and elsewhere, as a `datom` module missing
+  # from the code path at runtime.
+  #
+  # `Mix.Project.config/1` is per-project and follows the recursion, so each
+  # project answers for itself. The application env stays as a fallback —
+  # for a project that sets it and has no `:beam_lisp` project key — but the
+  # project key wins, which is what makes an umbrella correct.
   defp source_dir_from_config do
-    Application.get_env(:beam_lisp, :source_dir, "bl")
+    project_config = Mix.Project.config()[:beam_lisp] || []
+
+    project_config[:source_dir] ||
+      Application.get_env(:beam_lisp, :source_dir, "bl")
   end
 
   defp discover(source_dir) do

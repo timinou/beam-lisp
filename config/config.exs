@@ -66,9 +66,3 @@ config :beam_lisp, :spell_site_dir, "spell/ui"
 # complaint — observed live as this shell's page loading an empty runtime
 # ("No .st file found at …/fundamental_phone/spell/ui/index.edn").
 config :beam_lisp, :spell_verse_port, String.to_integer(System.get_env("VERSE_PORT") || "4444")
-
-# `mix compile.beam_lisp` AOT-compiles these into real BEAM modules, so a
-# consumer loads `datom`, `core` and the rest from disk rather than reading
-# and compiling them at every boot (~30s per VM start for a project that
-# requires datom).
-config :beam_lisp, source_dir: "priv"

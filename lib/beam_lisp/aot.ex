@@ -149,16 +149,22 @@ defmodule BeamLisp.AOT do
 
     if code_path_module?(mod) do
       Code.ensure_loaded(mod)
+
+      # MARK IT BEFORE RUNNING IT, exactly as the source loader does.
+      #
+      # Two reasons, and the order matters for the second. First, the mark is
+      # what lets `Loader.ensure_loaded/1` skip the source: without it the
+      # answer to `loaded_ns?` was `false` and the loader read and compiled
+      # the source it had just been handed — `datom` cost 41s through the
+      # loader against 14.7s calling this directly.
+      #
+      # Second, `__bl_init__/0` now replays this namespace's requires, and a
+      # require cycle would come back around to here. Marking first makes the
+      # loader's guard cut the cycle; marking afterwards would recurse until
+      # the stack gave out.
+      Env.mark_loaded(ns)
       if function_exported?(mod, :__bl_init__, 0), do: mod.__bl_init__()
 
-      # MARK IT, exactly as a source load does. The namespace is now fully
-      # usable — its functions are on the code path and its value defs have
-      # run — so anything that asks `Env.loaded_ns?/1` deserves a truthful
-      # yes. Without this the answer was `false` and `Loader.ensure_loaded/1`
-      # went on to read and compile the source it had just been handed,
-      # doing the expensive thing anyway: `datom` took 41s through the loader
-      # against 14.7s calling this function directly.
-      Env.mark_loaded(ns)
       :loaded
     else
       # SAY SO. A bare `:ok` for both outcomes is what hid the bug above:
@@ -189,6 +195,41 @@ defmodule BeamLisp.AOT do
   # per matcher is the whole cost of position-awareness here.
   defp capture_value_def(vdefs, {:meta, form, _m}, ns), do: capture_value_def(vdefs, form, ns)
 
+  # THE NAME can carry metadata too, and `^:private` is the common case.
+  # `(def ^:private T :x)` reaches here as a meta-wrapped SYMBOL in the name
+  # position, which matched no clause below — so the def was silently
+  # dropped from `__bl_init__/0` and the var simply did not exist in an AOT
+  # build. It surfaced as "undefined var: reel.film/TEMPIDS" raised from a
+  # function that plainly referenced it, in a namespace that had loaded
+  # without complaint. Peel the name, then match as usual.
+  defp capture_value_def(vdefs, {:list, [{:symbol, "def"}, {:meta, name_form, _m} | rest]}, ns) do
+    capture_value_def(vdefs, {:list, [{:symbol, "def"}, name_form | rest]}, ns)
+  end
+
+  # DEFINE-BY-INTERNING forms, replayed whole.
+  #
+  # `defn`/`defmacro` become real functions in the emitted module, so the
+  # `fn_ops` above reconstruct them. These do not: each one builds something
+  # at EVAL time — a gen_server module via `Module.create`, a record's
+  # constructor and accessors, a protocol's dispatch table — and interns the
+  # result. An AOT build wrote none of it to disk and nothing recreated it,
+  # so the namespace loaded cleanly and then failed at first use:
+  # "undefined var: reel.store/store", "undefined var:
+  # datom.store-redb/->RedbStore". The same shape as the `defnative` hole
+  # (BUG-021), which was fixed one form at a time; this is that fix
+  # generalised, because the property is shared and the list is closed.
+  #
+  # Replaying the FORM is right rather than expedient: the form is the
+  # definition, and re-evaluating it in `__bl_init__/0` reconstructs exactly
+  # what evaluating the source would. All of them are idempotent by
+  # construction (module creates set `ignore_module_conflict`).
+  @replayed_forms ~w(defserver defrecord deftype defprotocol defmulti extend-type extend-protocol)
+
+  defp capture_value_def(vdefs, {:list, [{:symbol, head}, name_form | _]} = form, ns)
+       when head in @replayed_forms do
+    put_value_def(vdefs, ns, definition_name(head, name_form), nil, form)
+  end
+
   defp capture_value_def(vdefs, {:list, [{:symbol, "def"}, {:symbol, name} | rest]}, ns) do
     case rest do
       [init] -> put_value_def(vdefs, ns, name, nil, init)
@@ -200,6 +241,24 @@ defmodule BeamLisp.AOT do
 
   defp capture_value_def(vdefs, _form, _ns), do: vdefs
 
+  # The key a replayed form is stored under. It only has to be STABLE and
+  # unique per definition — `put_value_def` uses it for "latest wins", and
+  # the extra `Env.intern` the emitter wraps around the form is harmless
+  # because the form has already interned the real vars itself.
+  #
+  # `extend-type`/`extend-protocol` intern nothing and name a type rather
+  # than a var, so they are keyed by a prefix that cannot collide with a
+  # legal var name.
+  defp definition_name(head, name_form) when head in ~w(extend-type extend-protocol),
+    do: "#{head} #{bare_name(name_form)}"
+
+  defp definition_name(_head, name_form), do: bare_name(name_form)
+
+  # A definition's name, with or without metadata on it.
+  defp bare_name({:meta, form, _m}), do: bare_name(form)
+  defp bare_name({:symbol, name}), do: name
+  defp bare_name(other), do: inspect(other)
+
   # Capture the alias/refer side effects of an `(ns name (:require ...))`
   # declaration so `__bl_init__/0` can re-run them in a fresh VM (a
   # referred var like `greet` resolves through these at runtime). Latest
@@ -207,6 +266,13 @@ defmodule BeamLisp.AOT do
   defp capture_ns_decl(ns_meta, {:meta, form, _m}), do: capture_ns_decl(ns_meta, form)
 
   defp capture_ns_decl(ns_meta, {:list, [{:symbol, "ns"}, {:symbol, ns} | clauses]}) do
+    # PEEL THE CLAUSES FIRST. The reader wraps each one in `{:meta, _, _}`
+    # to carry its source position, so matching `{:list, [{:keyword,
+    # "require"} | _]}` directly matched nothing and every `(:require …)`
+    # read as absent — silently, because these are pattern-matching
+    # comprehensions that filter rather than raise.
+    clauses = Enum.map(clauses, &unmeta/1)
+
     {aliases, refers} =
       Enum.reduce(clauses, {[], []}, fn
         {:list, [{:keyword, "require"} | specs]}, {al, rf} ->
@@ -216,10 +282,37 @@ defmodule BeamLisp.AOT do
           acc
       end)
 
-    Map.update(ns_meta, ns, %{aliases: aliases, refers: refers}, fn _prev ->
-      %{aliases: aliases, refers: refers}
-    end)
+    # The require TARGETS, separately from the alias/refer pairs they carry.
+    # A bare `(:require [datom.tx])` contributes no alias and no refer, so it
+    # left no trace in the two lists above — and yet the requiring namespace
+    # cannot run without it.
+    requires =
+      Enum.flat_map(clauses, fn
+        {:list, [{:keyword, "require"} | specs]} -> Enum.map(specs, &require_target/1)
+        _ -> []
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    meta = %{aliases: aliases, refers: refers, requires: requires}
+    Map.update(ns_meta, ns, meta, fn _prev -> meta end)
   end
+
+  # The namespace a require spec names, in either accepted shape.
+  defp require_target(spec) do
+    case unmeta(spec) do
+      {:symbol, target} -> target
+      {:vector, [head | _flags]} -> case unmeta(head) do
+        {:symbol, target} -> target
+        _ -> nil
+      end
+      _ -> nil
+    end
+  end
+
+  # Strip one layer of reader position metadata.
+  defp unmeta({:meta, form, _m}), do: form
+  defp unmeta(form), do: form
 
   defp capture_ns_decl(ns_meta, _form), do: ns_meta
 
@@ -227,6 +320,8 @@ defmodule BeamLisp.AOT do
   # a bare `target`. The task compiles required files first, so the
   # require graph is the compilation-order signal; here we only need the
   # alias/refer pairs to re-instantiate at runtime.
+  defp capture_require_spec({:meta, form, _m}, acc), do: capture_require_spec(form, acc)
+
   defp capture_require_spec({:symbol, _target}, acc), do: acc
 
   defp capture_require_spec({:vector, [{:symbol, target} | flags]}, acc) do
@@ -280,15 +375,37 @@ defmodule BeamLisp.AOT do
     {mod, path}
   end
 
+  # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
+  # `%{aliases:, refers:, requires:}`.
   defp build_init_ast(ns, mod, ns_defs, value_defs, ns_meta) do
     env = Compiler.new_env(ns)
 
     aliases = Map.get(ns_meta, :aliases, [])
     refers = Map.get(ns_meta, :refers, [])
+    requires = Map.get(ns_meta, :requires, [])
 
-    # Re-instantiate the ns declaration's alias/refer metadata first, so
+    # THE REQUIRES FIRST, before this namespace's own init touches anything.
+    #
+    # A value def's initializer can CALL into a required namespace, and
+    # `__bl_init__/0` runs those initializers for real. `reel.corpus` does
+    # exactly this — a top-level def that calls `reel.film/tempid-for` — and
+    # it failed with "undefined var: reel.film/TEMPIDS": the module for
+    # `reel.film` was loaded, but its own value defs had not run yet, so the
+    # table its function reaches for did not exist.
+    #
+    # Compilation order was already right (the task compiles required files
+    # first); LOAD order was not, because nothing recorded what to load.
+    # Recursing through the loader is what fixes it, and the loader's
+    # `loaded_ns?` guard is what stops a require cycle from spinning.
+    require_ops =
+      for target <- requires do
+        quote do: BeamLisp.Loader.ensure_loaded(unquote(target))
+      end
+
+    # Then re-instantiate the ns declaration's alias/refer metadata, so
     # any referred/aliased resolution in this namespace works at runtime.
     ns_ops =
+      require_ops ++
       for {alias_, target} <- aliases do
         quote do: BeamLisp.Env.add_alias(unquote(ns), unquote(alias_), unquote(target))
       end ++
@@ -323,11 +440,25 @@ defmodule BeamLisp.AOT do
     # compilation all resolve against this module.
     fn_ops =
       Enum.flat_map(ns_defs, fn {name, defs} ->
-        fixed = for {:fixed, arity, fname, _} <- defs, do: {arity, fname}
-        variadic = Enum.find_value(defs, fn
-          {:variadic, min, fname, _} -> {min, fname}
-          _ -> nil
-        end)
+        # MATCH ON THE TAG AND READ BY INDEX, not on the tuple's width. These
+        # arrive as `{:fixed, arity, fname, ast, meta}` — five elements — and
+        # a four-element pattern here matched NOTHING. A comprehension filters
+        # rather than raises, so `fixed` came out `[]` and the emitted var was
+        # `{:"$blfn", %{}, nil}`: a function value with an empty dispatch
+        # table, which fails at the call site with "wrong number of args (1)"
+        # for an argument count the module plainly exports.
+        #
+        # Single-arity fns were unaffected — they take the one-clause branch
+        # in `fn_value_expr/3` — so this was invisible until a namespace with
+        # a multi-arity `defn` was AOT-compiled.
+        fixed =
+          for d <- defs, elem(d, 0) == :fixed, do: {elem(d, 1), elem(d, 2)}
+
+        variadic =
+          Enum.find_value(defs, fn
+            d when elem(d, 0) == :variadic -> {elem(d, 1), elem(d, 2)}
+            _ -> nil
+          end)
 
         [
           quote do
