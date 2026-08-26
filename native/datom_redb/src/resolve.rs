@@ -29,7 +29,6 @@
 use crate::{err, DbHandle, DATOMS};
 use redb::ReadableDatabase;
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
-use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Bound;
 
@@ -85,16 +84,12 @@ fn decode_payload(p: &[u8]) -> Option<Val> {
     })
 }
 
-/// One decoded datom's relevant fields. `a` is carried as its raw payload bytes
-/// because callers of `resolve` scan a single attribute (AEVT/AVET) and don't
-/// need it decoded per row — but we keep it to reconstruct identity for the
-/// retraction filter, which keys on `[e, a-bytes, v-bytes]`.
+/// One decoded datom's fields, ready to become column cells.
 struct Row {
     e: i64,
     tx: i64,
     op: bool,
-    a_bytes: Vec<u8>,
-    v_bytes: Vec<u8>,
+    a: Val,
     v: Val,
 }
 
@@ -117,17 +112,9 @@ fn parse_record(slot: &[u8]) -> Option<Row> {
     if slot.len() < a_end {
         return None;
     }
-    let a_bytes = slot[a_start..a_end].to_vec();
-    let v_bytes = slot[a_end..].to_vec();
-    let v = decode_payload(&v_bytes)?;
-    Some(Row {
-        e,
-        tx,
-        op,
-        a_bytes,
-        v_bytes,
-        v,
-    })
+    let a = decode_payload(&slot[a_start..a_end])?;
+    let v = decode_payload(&slot[a_end..])?;
+    Some(Row { e, tx, op, a, v })
 }
 
 fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
@@ -153,15 +140,16 @@ fn encode_val<'a>(env: Env<'a>, v: &Val) -> NifResult<Term<'a>> {
 
 /// `resolve(handle, lo, hi)` — scan the datom index range `[lo, hi]` inclusive,
 /// decode each packed value record, apply the retraction filter in Rust, and
-/// return three parallel columns: `{e_list, v_list, tx_list}`.
+/// return four parallel columns: `{e_list, a_list, v_list, tx_list}`.
 ///
 /// - `e_list`  : `[i64]`         entity ids
+/// - `a_list`  : `[{lane, val}]` attributes (a keyword; carried because an EAVT
+///                               scan spans many attributes of one entity)
 /// - `v_list`  : `[{lane, val}]` typed values (see `encode_val`)
 /// - `tx_list` : `[i64]`         transaction ids
 ///
-/// `a` is constant per scan (an AEVT/AVET range fixes one attribute), so it is
-/// not returned. The retraction filter drops a datom whose `[e, a, v]` is later
-/// retracted (a higher `tx` with `op = false`), matching `db/filter-datoms`.
+/// The retraction filter drops a datom whose `[e, a, v]` is later retracted (a
+/// higher `tx` with `op = false`), matching `db/filter-datoms`.
 #[rustler::nif(schedule = "DirtyIo")]
 pub fn datom_resolve<'a>(
     env: Env<'a>,
@@ -184,53 +172,40 @@ pub fn datom_resolve<'a>(
 
     let iter = table.range::<&[u8]>((lower, upper)).map_err(err)?;
 
-    // Collect decoded rows, then apply the retraction filter. The filter keys
-    // on identity `[e, a_bytes, v_bytes]`: the latest op for a given fact wins;
-    // if it is a retraction the fact is currently absent and drops.
-    let mut rows: Vec<Row> = Vec::new();
+    // Decode every record in the range into raw columns. NO filtering happens
+    // here: retraction AND time-travel (as-of/since/history) filtering both
+    // live in `datom.db/filter-datoms`, which is basis-aware and already the
+    // system's single, tested filter. The NIF's one job is to eliminate the
+    // per-datom ETF decode (the ~40% tax) — it returns exactly what a scan
+    // would, as columns, and bl filters them with the same logic on every
+    // backend. Mixing a second filter in here would fork that semantics.
+    let mut es: Vec<i64> = Vec::new();
+    let mut as_: Vec<Term<'a>> = Vec::new();
+    let mut vs: Vec<Term<'a>> = Vec::new();
+    let mut txs: Vec<i64> = Vec::new();
+    let mut ops: Vec<bool> = Vec::new();
     for entry in iter {
         let (_k, val) = entry.map_err(err)?;
-        if let Some(row) = parse_record(val.value()) {
-            rows.push(row);
-        }
         // a non-datom slot (a counter) inside a datom range should not occur —
-        // counter keys live outside every index prefix — so skipping is safe.
-    }
-
-    // Retraction filter: latest-tx op per identity decides presence.
-    // key = (e, a_bytes, v_bytes) → (max_tx, op_at_max_tx)
-    let mut latest: HashMap<(i64, Vec<u8>, Vec<u8>), (i64, bool)> = HashMap::new();
-    for r in &rows {
-        let key = (r.e, r.a_bytes.clone(), r.v_bytes.clone());
-        match latest.get(&key) {
-            Some(&(t, _)) if t >= r.tx => {}
-            _ => {
-                latest.insert(key, (r.tx, r.op));
-            }
+        // counter keys live outside every index prefix — so a None just skips.
+        if let Some(r) = parse_record(val.value()) {
+            es.push(r.e);
+            as_.push(encode_val(env, &r.a)?);
+            vs.push(encode_val(env, &r.v)?);
+            txs.push(r.tx);
+            ops.push(r.op);
         }
     }
 
-    let mut es: Vec<i64> = Vec::with_capacity(rows.len());
-    let mut vs: Vec<Term<'a>> = Vec::with_capacity(rows.len());
-    let mut txs: Vec<i64> = Vec::with_capacity(rows.len());
-    // Emit each present fact once, at the row that carries its latest assertion.
-    for r in &rows {
-        let key = (r.e, r.a_bytes.clone(), r.v_bytes.clone());
-        if let Some(&(t, op)) = latest.get(&key) {
-            if op && t == r.tx {
-                es.push(r.e);
-                vs.push(encode_val(env, &r.v)?);
-                txs.push(r.tx);
-            }
-        }
-    }
-
-    let e_term = es.encode(env);
-    let v_term = vs.encode(env);
-    let tx_term = txs.encode(env);
     Ok(rustler::types::tuple::make_tuple(
         env,
-        &[e_term, v_term, tx_term],
+        &[
+            es.encode(env),
+            as_.encode(env),
+            vs.encode(env),
+            txs.encode(env),
+            ops.encode(env),
+        ],
     ))
 }
 
