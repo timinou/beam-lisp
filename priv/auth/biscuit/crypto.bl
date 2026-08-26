@@ -1,0 +1,275 @@
+; auth/biscuit/crypto.bl — the Biscuit signature chain, in pure beam-lisp.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; A Biscuit token is an append-only list of blocks protected by a CHAIN
+; of Ed25519 signatures, exactly like a certificate chain. The root
+; secret signs the authority block; each block carries the NEXT public
+; key and is signed by the PREVIOUS secret. To attenuate, you generate a
+; fresh keypair, sign your new block with the previous secret, and hand
+; on the new secret in the token's `proof`. To verify, you walk the chain
+; from the root public key, and finally check the proof key matches the
+; last block.
+;
+; This file is the crypto MATH only: it works over already-parsed blocks
+; (raw datalog bytes + raw 32-byte keys + 64-byte sigs). The protobuf
+; codec (auth/biscuit/codec) turns wire bytes into these and back. Keeping
+; the two apart is what lets each be tested in isolation — the chain logic
+; here is provable without a single byte of protobuf.
+;
+; ── The signed payload (v0), proven against the reference corpus ──────
+;
+; The bytes fed to Ed25519 for block n+1 are the concatenation:
+;
+;     data_{n+1}  ‖  alg_le32  ‖  pk_next_raw
+;
+;   data      the serialized Datalog block bytes
+;   alg_le32  the signature algorithm of the NEXT key, as a little-endian
+;             u32 (Ed25519 = 0, secp256r1 = 1)
+;   pk_next   the next public key, raw (32 bytes for Ed25519)
+;
+; This is "block signature payload v0" from the Biscuit SPECIFICATIONS —
+; the layout used by every token in biscuit-rust/samples whose SignedBlock
+; carries no `version` field. It was confirmed empirically: reconstructing
+; this payload for test001_basic and calling `:crypto.verify` against the
+; sample root public key returns true, and the three other candidate
+; layouts return false. So this is not a reading of the prose — it is the
+; layout the reference signatures actually check against.
+;
+; v1 (the domain-separated "\0BLOCK\0…\0NEXTKEY\0…" payload, mandatory for
+; third-party blocks) is a later concern; `sign-payload` centralises the
+; layout so adding v1 is one function, not a scatter of concatenations.
+
+(ns auth.biscuit.crypto)
+
+;; ── algorithms ──────────────────────────────────────────────────────
+
+(def ED25519 0)
+(def SECP256R1 1)
+
+(defn- alg-le32
+  "The signature algorithm as a little-endian unsigned 32-bit binary.
+
+   Only the low byte is ever non-zero for the algorithms we support, but
+   the width is fixed at four bytes because the payload the reference
+   signs uses a u32 there — a shorter encoding would change the signed
+   bytes and break verification."
+  [alg]
+  (erlang/list_to_binary (list (erlang/band alg 255) 0 0 0)))
+
+;; ── keys ────────────────────────────────────────────────────────────
+
+(defn keypair
+  "A fresh Ed25519 keypair as `{:public <32B> :private <32B>}`.
+
+   The public key is the compressed Edwards-Y form Biscuit stores on the
+   wire; the private key is the 32-byte seed, which is also what a token's
+   `proof` carries for an attenuable token."
+  []
+  (let [kp (crypto/generate_key :eddsa :ed25519)]
+    {:public (elem kp 0) :private (elem kp 1)}))
+
+(defn public-of
+  "The public key for a private seed.
+
+   Ed25519 derives the public key deterministically from the seed, so a
+   token that carries only the last SECRET in its proof still pins the
+   last PUBLIC key — the verifier recomputes it here and checks it against
+   the last block. Proven: this derivation reproduces the sample corpus's
+   published root public key from its published root secret."
+  [private]
+  (elem (crypto/generate_key :eddsa :ed25519 private) 0))
+
+;; ── the signed payload ──────────────────────────────────────────────
+
+(defn sign-payload
+  "The exact bytes signed for a block whose NEXT key is `next-pub`
+   (raw, `next-alg`).
+
+   `data` is the serialized Datalog. This is the one place the payload
+   layout lives, so verification and signing cannot disagree about it."
+  [data next-pub next-alg]
+  (erlang/iolist_to_binary (list data (alg-le32 next-alg) next-pub)))
+
+(defn sign-block
+  "Sign a block's `data` + next key with the PREVIOUS secret `prev-priv`.
+
+   Returns the 64-byte Ed25519 signature (R‖S). This is the operation the
+   root performs on the authority block, and the holder performs on each
+   attenuation block."
+  [prev-priv data next-pub next-alg]
+  (crypto/sign :eddsa :none (sign-payload data next-pub next-alg)
+               (list prev-priv :ed25519)))
+
+(defn verify-block-sig
+  "Whether `sig` is a valid signature of (`data`, `next-pub`, `next-alg`)
+   under `signer-pub`.
+
+   `signer-pub` is the previous block's public key (the root public key,
+   for the authority block). A false here means a block was tampered with,
+   reordered, or signed by the wrong key — the three things the chain
+   exists to catch."
+  [signer-pub sig data next-pub next-alg]
+  (crypto/verify :eddsa :none (sign-payload data next-pub next-alg) sig
+                 (list signer-pub :ed25519)))
+
+;; ── the chain ───────────────────────────────────────────────────────
+;;
+;; A token, for this layer, is:
+;;   {:authority <block> :blocks [<block> …] :proof {:secret <32B>}}
+;; where each <block> is:
+;;   {:data <bytes> :next-pub <32B> :next-alg <int> :sig <64B>}
+;;
+;; The codec produces this shape from wire bytes; nothing here parses
+;; protobuf.
+
+(defn- block-signer-chain
+  "The sequence of `[signer-pub block]` pairs, in signature order.
+
+   The authority block is signed by the root; every later block is signed
+   by the key the PREVIOUS block handed on. Expressing the walk as a list
+   of pairs means `verify` is a plain `every?` over it — the ordering is
+   captured once, here, rather than re-derived at each check."
+  [root-pub token]
+  (let [all (cons (:authority token) (:blocks token))]
+    (loop [signer root-pub
+           remaining all
+           acc []]
+      (if (empty? remaining)
+        acc
+        (let [b (first remaining)]
+          (recur (:next-pub b)
+                 (rest remaining)
+                 (conj acc [signer b])))))))
+
+(defn verify-chain
+  "Whether every block signature in `token` verifies, starting from
+   `root-pub`.
+
+   This is signature verification ONLY — it proves no block was altered,
+   dropped, or reordered, and that the whole chain descends from the root.
+   It does NOT check the proof key (see `verify-proof`) nor run any
+   datalog; authorization is a separate, later concern. Verification is
+   split this way because the corpus tests the signature failure modes
+   (wrong root, tampered block, reordered blocks) independently of logic."
+  [root-pub token]
+  (every? (fn [pair]
+            (let [signer (first pair)
+                  b (second pair)]
+              (verify-block-sig signer (:sig b) (:data b)
+                                (:next-pub b) (:next-alg b))))
+          (block-signer-chain root-pub token)))
+
+(defn- last-block
+  "The last block in the chain — the one the proof must correspond to."
+  [token]
+  (if (empty? (:blocks token))
+    (:authority token)
+    (last (:blocks token))))
+
+(defn verify-proof
+  "Whether `token`'s proof matches its last block.
+
+   For an ATTENUABLE token the proof holds the last SECRET; a valid token
+   is one where that secret derives the last block's `next-pub`. This is
+   what stops an attacker from truncating the chain and presenting an
+   earlier block as the last one: they would need the secret for that
+   block's next key, which only the legitimate holder ever had.
+
+   For a SEALED token the proof is instead a signature of the last block
+   by the last secret (see `seal`/`verify-sealed`); this fn handles the
+   attenuable case and returns false for a sealed proof."
+  [token]
+  (let [proof (:proof token)]
+    (if (contains? proof :secret)
+      (= (public-of (:secret proof)) (:next-pub (last-block token)))
+      false)))
+
+(defn verify
+  "Full cryptographic verification: chain + proof.
+
+   True means the token is authentic and untampered and descends from
+   `root-pub`. It says NOTHING about whether the token authorizes any
+   given request — that is the datalog engine's job. Keeping the two
+   apart is the whole design: a token can be cryptographically valid and
+   still deny every request because its checks fail."
+  [root-pub token]
+  (and (verify-chain root-pub token)
+       (or (verify-proof token)
+           (verify-sealed root-pub token))))
+
+;; ── sealing ─────────────────────────────────────────────────────────
+
+(defn seal
+  "Seal `token` so it can never be attenuated again.
+
+   Attenuation needs the last SECRET (to sign a further block). Sealing
+   replaces that secret in the proof with a SIGNATURE of the last block by
+   that secret, then throws the secret away. A verifier can still confirm
+   the holder possessed the last secret (the signature proves it) but no
+   one can ever append again, because the secret is gone.
+
+   `last-priv` is the current last secret (from the attenuable proof)."
+  [token last-priv]
+  (let [lb (last-block token)
+        payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb))
+        final-sig (crypto/sign :eddsa :none payload (list last-priv :ed25519))]
+    (assoc token :proof {:sealed final-sig})))
+
+(defn verify-sealed
+  "Whether a sealed token's final signature is valid.
+
+   The sealed proof is a signature, by the last secret, over the last
+   block's own signed payload. It verifies under the last block's
+   `next-pub` — the key that secret corresponds to — which is exactly the
+   proof that the sealer held the last secret without revealing it."
+  [_root-pub token]
+  (let [proof (:proof token)]
+    (if (contains? proof :sealed)
+      (let [lb (last-block token)
+            payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb))]
+        (crypto/verify :eddsa :none payload (:sealed proof)
+                       (list (:next-pub lb) :ed25519)))
+      false)))
+
+;; ── building & appending ────────────────────────────────────────────
+
+(defn authority
+  "Build a one-block token: `data` signed by `root-priv`.
+
+   Generates the first attenuation keypair, signs the authority block with
+   the root secret, and puts the new SECRET in the proof so the token can
+   still be attenuated. The returned token verifies under the root public
+   key derived from `root-priv`."
+  [root-priv data]
+  (let [kp (keypair)
+        next-pub (:public kp)
+        sig (sign-block root-priv data next-pub ED25519)]
+    {:authority {:data data :next-pub next-pub :next-alg ED25519 :sig sig}
+     :blocks []
+     :proof {:secret (:private kp)}}))
+
+(defn append
+  "Append a block carrying `data`, attenuating `token`.
+
+   Uses the token's current last SECRET (from the proof) to sign the new
+   block, generates a fresh keypair for the NEXT link, and moves the new
+   secret into the proof. Refuses a sealed token — its secret is gone by
+   design, so there is nothing to sign with, and that refusal is the
+   cryptographic half of 'sealing prevents attenuation'.
+
+   The new block can only ADD checks; it cannot alter or remove any
+   existing block without breaking a signature already in the chain. That
+   is the append-only guarantee that makes attenuation monotonic."
+  [token data]
+  (let [proof (:proof token)]
+    (if (not (contains? proof :secret))
+      (throw (ex-info "cannot append to a sealed token" {:token-proof (keys proof)}))
+      (let [prev-priv (:secret proof)
+            kp (keypair)
+            next-pub (:public kp)
+            sig (sign-block prev-priv data next-pub ED25519)
+            new-block {:data data :next-pub next-pub :next-alg ED25519 :sig sig}]
+        (assoc token
+               :blocks (conj (:blocks token) new-block)
+               :proof {:secret (:private kp)})))))
