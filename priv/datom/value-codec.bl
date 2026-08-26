@@ -1,0 +1,202 @@
+; datom/value-codec.bl — scheme-C typed value payload.
+;
+; ── Two encodings, one asymmetry (again) ──────────────────────────────
+;
+; codec.bl encodes the order-preserving KEY: its bytes must SORT, so it
+; is hand-rolled (type tags, IEEE bit-twiddling, nul-escaping). This file
+; encodes the VALUE slot, whose bytes are never compared, only decoded
+; back into a column — so it optimises for DECODE SPEED, not order.
+;
+; The win it exists for: a datom's value on the durable (redb) path is
+; today `term_to_binary` of the whole datom, and reading it back costs a
+; `binary_to_term` per datom — ~40% of a query. A value typed by its
+; attribute's `:db/valueType` needs no self-description: a `:db.type/long`
+; is 8 raw little-endian bytes, decoded by a fixed-width read, and a Rust
+; NIF can build a typed column from a scan with no ETF parse at all.
+;
+; ── The lanes ─────────────────────────────────────────────────────────
+;
+;   long / ref / instant  → 8 bytes, little-endian i64        (fixed)
+;   boolean               → 1 byte, 0 or 1                     (fixed)
+;   string / keyword      → raw UTF-8 (keyword: its name)      (variable)
+;   float                 → 8 bytes, IEEE-754 little-endian    (fixed)
+;   ELSE (term/bignum/nil,
+;         or a value that
+;         does not fit its
+;         declared lane)   → 1-byte ESC tag + term_to_binary   (escape)
+;
+; The escape hatch is what keeps datom's promise that a value may be ANY
+; BEAM term (`:db.type/term`): such a value round-trips through the BEAM's
+; own serializer, handed back whole, never interpreted. It also catches a
+; bignum past 64 bits and a nil in an otherwise-typed column, so the
+; typed lanes stay strictly fixed-width — which is what lets the NIF build
+; a contiguous column later.
+;
+; The FIRST BYTE of every payload is a lane tag, so decode never needs the
+; schema to choose a lane — it needs the schema only to VALIDATE. This is
+; deliberate: the redb value slot is self-delimiting even though the
+; column it feeds is homogeneous, because a single stray value (a nil, a
+; bignum) must not corrupt the read of its neighbours.
+
+(ns datom.value-codec)
+
+;; ── lane tags (first byte of the payload) ───────────────────────────
+;;
+;; Distinct from codec.bl's KEY tags: those rank for ORDER, these select a
+;; DECODE. Kept in their own space so neither constrains the other.
+
+(def LANE-LONG 1)      ; 8B LE i64  (also :db.type/ref, :db.type/instant)
+(def LANE-BOOL 2)      ; 1B 0/1
+(def LANE-STR 3)       ; raw UTF-8 (string)
+(def LANE-KEYWORD 4)   ; raw UTF-8 (keyword name)
+(def LANE-FLOAT 5)     ; 8B LE IEEE-754
+(def LANE-ESC 255)     ; term_to_binary escape: any BEAM term
+
+(def INT-MAX 9223372036854775807)
+(def INT-MIN -9223372036854775808)
+
+;; ── little-endian fixed-width integer ───────────────────────────────
+
+(defn- u64-le-bytes
+  "An unsigned 64-bit integer as 8 little-endian bytes (a list)."
+  [n]
+  (mapv (fn [i] (rem (erlang/bsr n (* 8 i)) 256)) [0 1 2 3 4 5 6 7]))
+
+(defn- bytes-le->u64
+  "Recover an unsigned 64-bit integer from 8 little-endian bytes.
+
+   `bytes` is a bl vector of 8 byte values (the caller lifts the erlang
+   binary_to_list result into a vector so positional `get` applies)."
+  [bytes]
+  (reduce (fn [acc i] (+ acc (* (get bytes i) (erlang/bsl 1 (* 8 i)))))
+          0
+          [0 1 2 3 4 5 6 7]))
+
+(def TWO-64 18446744073709551616)  ; 2^64
+(def TWO-63 9223372036854775808)   ; 2^63
+
+(defn- i64->u64
+  "Two's-complement wrap of a signed 64-bit int into unsigned space."
+  [n]
+  (if (< n 0) (+ n TWO-64) n))
+
+(defn- u64->i64
+  "Interpret an unsigned 64-bit int as signed two's-complement."
+  [u]
+  (if (>= u TWO-63) (- u TWO-64) u))
+
+(defn- encode-i64-le
+  "A signed i64 as a binary of 8 little-endian bytes."
+  [n]
+  (erlang/list_to_binary (to-list (u64-le-bytes (i64->u64 n)))))
+
+(defn- decode-i64-le
+  "Recover a signed i64 from an 8-byte little-endian binary."
+  [bin]
+  (u64->i64 (bytes-le->u64 (into [] (erlang/binary_to_list bin)))))
+
+;; ── float payload: reuse the BEAM's IEEE bytes ──────────────────────
+
+(defn- encode-float-le
+  "The 8 IEEE-754 bytes of `f`, little-endian.
+
+   `term_to_binary` on a float emits a tagged envelope whose last 8 bytes
+   are the big-endian IEEE double; we take those and reverse to LE so the
+   Rust side reads `f64::from_le_bytes` directly."
+  [f]
+  (let [bytes (erlang/binary_to_list (erlang/term_to_binary f))
+        ieee-be (drop (- (count bytes) 8) bytes)]
+    (erlang/list_to_binary (to-list (reverse (to-list ieee-be))))))
+
+(defn- decode-float-le
+  "Recover a float from its 8 little-endian IEEE bytes.
+
+   Rebuild the big-endian IEEE payload and wrap it in the minimal ETF
+   float envelope (`131 70` = version + NEW_FLOAT_EXT) so `binary_to_term`
+   reconstructs the double."
+  [bin]
+  (let [ieee-be (reverse (to-list (erlang/binary_to_list bin)))]
+    (erlang/binary_to_term
+      (erlang/list_to_binary (to-list (concat [131 70] ieee-be))))))
+
+;; ── the escape hatch ────────────────────────────────────────────────
+
+(defn- esc
+  "Tag byte + `term_to_binary(v)`: the any-term lane."
+  [v]
+  (erlang/list_to_binary
+    (to-list (concat [LANE-ESC]
+                     (erlang/binary_to_list (erlang/term_to_binary v))))))
+
+(defn- fits-i64?
+  [n]
+  (and (int? n) (<= INT-MIN n) (<= n INT-MAX)))
+
+;; ── public: encode a value by its RUNTIME TYPE ──────────────────────
+;;
+;; No schema is consulted. The lane is chosen from what the value IS, and
+;; decode reads it back from the lane tag — so the codec is a pure,
+;; mechanical value↔bytes translation that any layer can call without the
+;; schema in hand (the store, in particular, holds counters AND datoms and
+;; has no schema). Type VALIDATION against `:db/valueType` is a separate
+;; concern that already runs at transact time (`schema/validate-value`);
+;; here every value the database accepts simply gets a faithful payload,
+;; with the ESC lane catching whatever the fixed lanes cannot represent
+;; (nil, a bignum past 64 bits, a composite term). Encoding is TOTAL.
+;;
+;; `:db.type/ref` and `:db.type/instant` are integers at rest, so they
+;; ride the LONG lane; the schema — not the payload — is what tells a
+;; reader they mean an entity or a moment.
+
+(defn encode
+  "Encode `v` as a scheme-C payload, choosing the lane from `v`'s runtime
+   type. Total: any accepted value gets a payload (ESC for the rest)."
+  [v]
+  (cond
+    (nil? v) (esc v)
+    (= v true) (erlang/list_to_binary (to-list [LANE-BOOL 1]))
+    (= v false) (erlang/list_to_binary (to-list [LANE-BOOL 0]))
+    (float? v)
+      (erlang/list_to_binary
+        (to-list (concat [LANE-FLOAT]
+                         (erlang/binary_to_list (encode-float-le v)))))
+    (int? v)
+      (if (fits-i64? v)
+        (erlang/list_to_binary (to-list (concat [LANE-LONG]
+                                                (u64-le-bytes (i64->u64 v)))))
+        (esc v))                       ; bignum past 64 bits
+    (string? v)
+      (erlang/list_to_binary
+        (to-list (concat [LANE-STR] (erlang/binary_to_list v))))
+    (keyword? v)
+      ; The FULL keyword string, namespace included: `str` on `:spend/model`
+      ; yields `"spend/model"` (no leading colon), which `(keyword s)`
+      ; reconstructs exactly. `name` would drop the qualifier.
+      (erlang/list_to_binary
+        (to-list (concat [LANE-KEYWORD]
+                         (erlang/binary_to_list (str v)))))
+    ; a tuple, map, set, list, pid — any BEAM term → the any-term lane.
+    :else (esc v)))
+
+;; ── public: decode a payload back to a value ────────────────────────
+
+(defn decode
+  "Recover the value from a scheme-C payload. The lane tag in the first
+   byte selects the decode, so the schema is not consulted here — a
+   payload is self-describing enough to decode, even though the column it
+   came from is homogeneous."
+  [payload]
+  (let [size (erlang/byte_size payload)
+        lane (erlang/hd (erlang/binary_to_list (erlang/binary_part payload 0 1)))
+        rest-bin (if (> size 1)
+                   (erlang/binary_part payload 1 (- size 1))
+                   (erlang/list_to_binary (to-list [])))]
+    (cond
+      (= lane LANE-LONG) (decode-i64-le rest-bin)
+      (= lane LANE-BOOL) (= (erlang/hd (erlang/binary_to_list rest-bin)) 1)
+      (= lane LANE-STR) rest-bin
+      (= lane LANE-KEYWORD) (keyword rest-bin)
+      (= lane LANE-FLOAT) (decode-float-le rest-bin)
+      (= lane LANE-ESC) (erlang/binary_to_term rest-bin)
+      :else (throw (ex-info (str "unknown value-codec lane: " lane)
+                            {:lane lane})))))

@@ -44,7 +44,7 @@
 ; returns is a commit the caller believes.
 
 (ns datom.store-redb
-  (:require [datom.store]))
+  (:require [datom.store] [datom.value-codec]))
 
 ;; ── the native backend, declared here rather than in Elixir ─────────
 ;;
@@ -87,13 +87,100 @@
 ;; uses the built-in serializer, precisely because sorting is the thing
 ;; the built-in serializer cannot promise.
 
+; ── scheme C: the datom value slot is a packed typed record ──────────
+;;
+;; A datom `[e a v tx op]` no longer round-trips through `term_to_binary`.
+;; Instead its value slot is a PACKED RECORD the `datom_resolve` NIF reads
+;; by fixed offsets, with the value `v` in a schema-free typed lane
+;; (`datom.value-codec`). The read path's ~40% ETF-decode tax on this,
+;; the durable, backend is what that removes.
+;;
+;;   datom record layout (value slot):
+;;     [ TAG-DATOM(1B) | e:8B LE i64 | tx:8B LE i64 | op:1B
+;;       | a-len:2B LE | a-payload… | v-payload… ]
+;;
+;; `e` and `tx` are integers by construction; `op` is a bool; `a` and `v`
+;; are `datom.value-codec` payloads (each lane-tagged), with `a` length-
+;; prefixed so both variable-width fields are delimited. Storing `a`
+;; (rather than recovering it from the key) keeps the store a black box:
+;; `-range`/`-get` return a COMPLETE `[e a v tx op]` datom exactly as
+;; before, so nothing above L1 changes. The NIF reads only this slot and
+;; never touches the sortable key. (Dropping `a` — it is redundant with
+;; the key — is a future size optimization the resolve NIF can add once it
+;; parses keys; out of scope here.)
+;;
+;; NON-datom values also live in this store — the entity/tx COUNTERS are
+;; bare integers written through `-update`. They take the ESC path
+;; (`TAG-OPAQUE` + `term_to_binary`), so the counter machinery is
+;; unchanged and the discriminator is the leading tag byte.
+
+(def TAG-DATOM 1)     ; a packed [e|tx|op|v] datom record
+(def TAG-OPAQUE 2)    ; any non-datom value (counters): term_to_binary
+
+(defn- i64-le
+  "A signed i64 as 8 little-endian bytes (a list)."
+  [n]
+  (let [u (if (< n 0) (+ n 18446744073709551616) n)]
+    (mapv (fn [i] (rem (erlang/bsr u (* 8 i)) 256)) [0 1 2 3 4 5 6 7])))
+
+(defn- le->i64
+  "Recover a signed i64 from a bl vector of 8 little-endian bytes."
+  [bytes]
+  (let [u (reduce (fn [acc i] (+ acc (* (get bytes i) (erlang/bsl 1 (* 8 i)))))
+                  0 [0 1 2 3 4 5 6 7])]
+    (if (>= u 9223372036854775808) (- u 18446744073709551616) u)))
+
+(defn- datom?
+  "A datom is a 5-element vector `[e a v tx op]`."
+  [v]
+  (and (vector? v) (= (count v) 5)))
+
+(defn- u16-le
+  "An unsigned 16-bit length as 2 little-endian bytes (a list)."
+  [n]
+  [(rem n 256) (rem (erlang/bsr n 8) 256)])
+
 (defn- encode-value
   [v]
-  (erlang/term_to_binary v))
+  (if (datom? v)
+    (let [e (get v 0) a (get v 1) vv (get v 2) tx (get v 3) op (get v 4)
+          a-pay (datom.value-codec/encode a)
+          a-bytes (erlang/binary_to_list a-pay)
+          v-bytes (erlang/binary_to_list (datom.value-codec/encode vv))]
+      (erlang/list_to_binary
+        (to-list (concat [TAG-DATOM]
+                         (i64-le e)
+                         (i64-le tx)
+                         [(if op 1 0)]
+                         (u16-le (erlang/byte_size a-pay))
+                         a-bytes
+                         v-bytes))))
+    ; a counter or any other opaque value
+    (erlang/list_to_binary
+      (to-list (concat [TAG-OPAQUE]
+                       (erlang/binary_to_list (erlang/term_to_binary v)))))))
 
 (defn- decode-value
   [b]
-  (if (nil? b) nil (erlang/binary_to_term b)))
+  (if (nil? b)
+    nil
+    (let [size (erlang/byte_size b)
+          tag (erlang/hd (erlang/binary_to_list (erlang/binary_part b 0 1)))]
+      (if (= tag TAG-OPAQUE)
+        (erlang/binary_to_term (erlang/binary_part b 1 (- size 1)))
+        ; TAG-DATOM: a full [e a v tx op] — the slot carries everything.
+        (let [e (le->i64 (into [] (erlang/binary_to_list (erlang/binary_part b 1 8))))
+              tx (le->i64 (into [] (erlang/binary_to_list (erlang/binary_part b 9 8))))
+              op (= 1 (erlang/hd (erlang/binary_to_list (erlang/binary_part b 17 1))))
+              a-len (let [lo (erlang/hd (erlang/binary_to_list (erlang/binary_part b 18 1)))
+                          hi (erlang/hd (erlang/binary_to_list (erlang/binary_part b 19 1)))]
+                      (+ lo (* hi 256)))
+              a-pay (erlang/binary_part b 20 a-len)
+              v-off (+ 20 a-len)
+              v-pay (erlang/binary_part b v-off (- size v-off))
+              a (datom.value-codec/decode a-pay)
+              v (datom.value-codec/decode v-pay)]
+          [e a v tx op])))))
 
 (defn open
   "Open (or create) a database at `path`.
