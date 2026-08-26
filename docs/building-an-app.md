@@ -256,6 +256,52 @@ values and cannot ask how many there are:
 `empty-says` belongs to the caller, because only the caller knows what
 nothing *means*: no unproven requirements is good, no showable films is bad.
 
+### A produced stream must be built lazily, or it is not a stream
+
+When a read model *produces* a value that its caller consumes incrementally —
+Server-Sent Events to a browser, a chunked HTTP body, anything written to a
+socket as it is realized — **how** the sequence is built decides whether it
+streams at all, and the two ways look identical at the call site.
+
+`Enum/*` is **eager**: `(Enum/map coll f)` walks all of `coll` and returns a
+finished list. `Stream/*` is **lazy**: `(Stream/map coll f)` returns a
+description that produces each element only when the consumer pulls it. So a
+function that maps provider chunks into SSE frames with `Enum/flat_map`
+**buffers the entire upstream response** before the consumer sees byte one —
+the request "streams" to no one, and a slow or endless upstream hangs the whole
+response. Switch the same code to `Stream/flat_map` + `Stream/concat` and each
+frame reaches the socket the moment the provider emits it.
+
+```clojure
+; EAGER — realizes every chunk before the caller gets the first frame
+(defn frames [chunks]
+  (Enum/flat_map chunks (fn [c] [(encode c)])))
+
+; LAZY — one frame produced per chunk pulled; TRUE streaming
+(defn frames [chunks]
+  (Stream/flat_map chunks (fn [c] [(encode c)])))
+```
+
+The trap is that laziness is **invisible in a test**: both versions pass
+`(is (= expected (Enum/to_list (frames input))))`, because the assertion
+realizes the whole sequence anyway. The difference shows only under a real
+consumer, as latency-to-first-byte or a hang. Diagnose it deliberately — put a
+side effect in the mapping fn and count how many times it ran before you pull
+the second element:
+
+```clojure
+(let [n (atom 0)
+      s (Stream/map (range) (fn [x] (swap! n inc) x))]
+  (Enum/to_list (Stream/take s 2))
+  (deref n))            ; lazy → 2, eager → would never terminate on (range)
+```
+
+The rule: **a value the caller consumes lazily MUST be built with `Stream/*`;
+`Enum/*` realizes eagerly.** beam-lisp's own `lazy-seq` (and the hybrid
+`map`/`filter`/`take` over a `LazySeq`, section notes in `core.bl`) compose
+lazily too — but the moment the sequence crosses into an Elixir library that
+speaks `Stream`, it is `Stream/*` that keeps the laziness the boundary needs.
+
 ---
 
 ## 5. Store — the one mutable thing, as a supervised process
@@ -871,6 +917,7 @@ application is testable before any of it is wired.
 | `{:ok, pid} = …start!` | "no match … #PID<…>" | it returns a bare pid |
 | absent attribute in a query | entity binds nothing, blocks nothing | query absence separately; absent = unsafe |
 | empty list rendered bare | best result looks like a crash | compose a verdict sentence server-side |
+| `Enum/*` to build a consumed stream | no streaming; buffers, or hangs on an endless upstream | build produced streams with `Stream/*` (lazy) |
 | bare `@x` in a CSS value | verse refuses `value: (deref draft);` | `(inject @x)` for the reactive arrow |
 | input value not bound to signal | second entry is `"firstsecond"` | bind `:value (inject @sig)` |
 | `<select>` with no empty option | first action refused for a visibly-selected role | first option is `""`, and says so |
