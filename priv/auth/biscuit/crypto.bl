@@ -82,14 +82,45 @@
 
 ;; ── the signed payload ──────────────────────────────────────────────
 
-(defn sign-payload
-  "The exact bytes signed for a block whose NEXT key is `next-pub`
-   (raw, `next-alg`).
+(defn- le32
+  "A non-negative integer as a little-endian unsigned 32-bit binary."
+  [n]
+  (erlang/list_to_binary
+    (list (erlang/band n 255)
+          (erlang/band (erlang/bsr n 8) 255)
+          (erlang/band (erlang/bsr n 16) 255)
+          (erlang/band (erlang/bsr n 24) 255))))
 
-   `data` is the serialized Datalog. This is the one place the payload
-   layout lives, so verification and signing cannot disagree about it."
-  [data next-pub next-alg]
-  (erlang/iolist_to_binary (list data (alg-le32 next-alg) next-pub)))
+(defn sign-payload
+  "The exact bytes signed for a block, dispatched on the signed-payload
+   version.
+
+   VERSION 0 (`version` nil or 0) — the concatenation
+     `data ‖ alg_le32 ‖ next_pub`
+   used by every version-3.0 token in the corpus. Proven empirically
+   against test001's authority signature.
+
+   VERSION 1 (`version` = 1) — the domain-separated payload
+     `\0BLOCK\0\0VERSION\0 ver_le32 \0PAYLOAD\0 data`
+     `\0ALGORITHM\0 alg_le32 \0NEXTKEY\0 next_pub`
+   and, for a non-authority block, a trailing `\0PREVSIG\0 prev_sig`.
+   The ASCII separators make the payload unambiguous across fields, which
+   is why v1 is mandatory for third-party blocks. Proven empirically
+   against test030's v1 authority signature.
+
+   `prev-sig` is nil for the authority block (nothing precedes it) and the
+   previous block's signature otherwise. It is ignored under v0."
+  [data next-pub next-alg version prev-sig]
+  (if (= version 1)
+    (let [base (list "\0BLOCK\0" "\0VERSION\0" (le32 1)
+                     "\0PAYLOAD\0" data
+                     "\0ALGORITHM\0" (le32 next-alg)
+                     "\0NEXTKEY\0" next-pub)
+          with-prev (if (nil? prev-sig)
+                      base
+                      (concat base (list "\0PREVSIG\0" prev-sig)))]
+      (erlang/iolist_to_binary (Enum/to_list with-prev)))
+    (erlang/iolist_to_binary (list data (alg-le32 next-alg) next-pub))))
 
 (defn sign-block
   "Sign a block's `data` + next key with the PREVIOUS secret `prev-priv`.
@@ -97,8 +128,8 @@
    Returns the 64-byte Ed25519 signature (R‖S). This is the operation the
    root performs on the authority block, and the holder performs on each
    attenuation block."
-  [prev-priv data next-pub next-alg]
-  (crypto/sign :eddsa :none (sign-payload data next-pub next-alg)
+  [prev-priv data next-pub next-alg version prev-sig]
+  (crypto/sign :eddsa :none (sign-payload data next-pub next-alg version prev-sig)
                (list prev-priv :ed25519)))
 
 (defn verify-block-sig
@@ -109,8 +140,8 @@
    for the authority block). A false here means a block was tampered with,
    reordered, or signed by the wrong key — the three things the chain
    exists to catch."
-  [signer-pub sig data next-pub next-alg]
-  (crypto/verify :eddsa :none (sign-payload data next-pub next-alg) sig
+  [signer-pub sig data next-pub next-alg version prev-sig]
+  (crypto/verify :eddsa :none (sign-payload data next-pub next-alg version prev-sig) sig
                  (list signer-pub :ed25519)))
 
 ;; ── the chain ───────────────────────────────────────────────────────
@@ -133,14 +164,16 @@
   [root-pub token]
   (let [all (cons (:authority token) (:blocks token))]
     (loop [signer root-pub
+           prev-sig nil
            remaining all
            acc []]
       (if (empty? remaining)
         acc
         (let [b (first remaining)]
           (recur (:next-pub b)
+                 (:sig b)
                  (rest remaining)
-                 (conj acc [signer b])))))))
+                 (conj acc [signer prev-sig b])))))))
 
 (defn verify-chain
   "Whether every block signature in `token` verifies, starting from
@@ -153,11 +186,13 @@
    split this way because the corpus tests the signature failure modes
    (wrong root, tampered block, reordered blocks) independently of logic."
   [root-pub token]
-  (every? (fn [pair]
-            (let [signer (first pair)
-                  b (second pair)]
+  (every? (fn [entry]
+            (let [signer (nth entry 0)
+                  prev-sig (nth entry 1)
+                  b (nth entry 2)]
               (verify-block-sig signer (:sig b) (:data b)
-                                (:next-pub b) (:next-alg b))))
+                                (:next-pub b) (:next-alg b)
+                                (:version b) prev-sig)))
           (block-signer-chain root-pub token)))
 
 (defn- last-block
@@ -212,7 +247,8 @@
    `last-priv` is the current last secret (from the attenuable proof)."
   [token last-priv]
   (let [lb (last-block token)
-        payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb))
+        payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb)
+                              (:version lb) nil)
         final-sig (crypto/sign :eddsa :none payload (list last-priv :ed25519))]
     (assoc token :proof {:sealed final-sig})))
 
@@ -227,7 +263,8 @@
   (let [proof (:proof token)]
     (if (contains? proof :sealed)
       (let [lb (last-block token)
-            payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb))]
+            payload (sign-payload (:data lb) (:next-pub lb) (:next-alg lb)
+                                  (:version lb) nil)]
         (crypto/verify :eddsa :none payload (:sealed proof)
                        (list (:next-pub lb) :ed25519)))
       false)))
@@ -244,8 +281,11 @@
   [root-priv data]
   (let [kp (keypair)
         next-pub (:public kp)
-        sig (sign-block root-priv data next-pub ED25519)]
-    {:authority {:data data :next-pub next-pub :next-alg ED25519 :sig sig}
+        ;; we mint v0 tokens: nil version, no previous signature. v0 is the
+        ;; corpus default and the simplest interoperable form.
+        sig (sign-block root-priv data next-pub ED25519 nil nil)]
+    {:authority {:data data :next-pub next-pub :next-alg ED25519
+                 :sig sig :version nil :external nil}
      :blocks []
      :proof {:secret (:private kp)}}))
 
@@ -268,8 +308,9 @@
       (let [prev-priv (:secret proof)
             kp (keypair)
             next-pub (:public kp)
-            sig (sign-block prev-priv data next-pub ED25519)
-            new-block {:data data :next-pub next-pub :next-alg ED25519 :sig sig}]
+            sig (sign-block prev-priv data next-pub ED25519 nil nil)
+            new-block {:data data :next-pub next-pub :next-alg ED25519
+                       :sig sig :version nil :external nil}]
         (assoc token
                :blocks (conj (:blocks token) new-block)
                :proof {:secret (:private kp)})))))

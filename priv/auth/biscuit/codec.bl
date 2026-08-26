@@ -1,0 +1,318 @@
+; auth/biscuit/codec.bl — Biscuit protobuf wire format, in pure beam-lisp.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; The bytes on the wire are Protocol Buffers (proto2). This file turns
+; those bytes into the block/token VALUES the rest of `auth` works with,
+; and back again. It is deliberately the ONLY place that knows about
+; protobuf: the crypto chain sees parsed blocks, the datalog bridge sees
+; parsed facts, and neither knows a varint from a hole in the ground.
+;
+; ── Why a hand-rolled decoder rather than a library ──────────────────
+;
+; Biscuit uses a small, fixed subset of protobuf: varints, length-
+; delimited fields, and nothing exotic. A hand-rolled reader over that
+; subset is a few dozen lines, has no dependency, and — crucially — lets
+; us hold the SIGNED BYTES exactly. Signatures cover the serialized block
+; bytes, so the decoder must hand the verifier the block field's bytes
+; verbatim, and the encoder must reproduce them byte-for-byte. A general
+; protobuf library that normalises or reorders fields would silently break
+; verification; controlling the bytes ourselves is the point.
+;
+; ── The atom discipline (trust-boundary.md) ──────────────────────────
+;
+; A token is hostile machine-generated input. This decoder NEVER interns
+; an atom from token content: symbols stay STRINGS here, and are matched
+; against known predicate names (via String.to_existing_atom, at bounded
+; sites) only later, in the datalog bridge. A million junk symbols in a
+; token cost a million list entries that get garbage-collected — never a
+; million permanent atoms. The wire's own symbol table (strings stored
+; once, referenced by index) is what makes that cheap.
+;
+; ── Wire types used ───────────────────────────────────────────────────
+;
+;   0  varint            (int32/64, uint32/64, enums, bool)
+;   2  length-delimited  (bytes, strings, embedded messages, packed)
+;
+; fixed32/fixed64 do not appear in the Biscuit schema, so they are not
+; implemented; a fixed-width field would surface as an explicit failure
+; rather than a silent misparse.
+
+(ns auth.biscuit.codec)
+
+;; ── low-level reads ─────────────────────────────────────────────────
+
+(defn- read-varint
+  "Read a base-128 varint from `bin` at `pos`. Returns `[value next-pos]`.
+
+   Each byte contributes seven bits, low group first; the high bit is the
+   continuation flag. This is the encoding under every protobuf integer,
+   tag, and length, so it is the primitive everything else calls."
+  [bin pos]
+  (loop [p pos
+         shift 0
+         acc 0]
+    (let [byte (binary/at bin p)
+          acc' (erlang/bor acc (erlang/bsl (erlang/band byte 127) shift))]
+      (if (= 0 (erlang/band byte 128))
+        [acc' (+ p 1)]
+        (recur (+ p 1) (+ shift 7) acc')))))
+
+(defn- read-tag
+  "Read a field tag. Returns `[field-number wire-type next-pos]`.
+
+   A tag is a varint whose low three bits are the wire type and whose
+   remaining bits are the field number — so one varint read plus two bit
+   ops recovers both."
+  [bin pos]
+  (let [pair (read-varint bin pos)
+        tag (first pair)
+        next (second pair)]
+    [(erlang/bsr tag 3) (erlang/band tag 7) next]))
+
+(defn- read-len-delimited
+  "Read a length-delimited field's bytes. Returns `[bytes next-pos]`.
+
+   The length is a varint; the value is exactly that many bytes taken
+   verbatim. Verbatim matters: for the `block` field these bytes are what
+   the signature covers, so they must be preserved without reinterpretation."
+  [bin pos]
+  (let [lp (read-varint bin pos)
+        len (first lp)
+        start (second lp)]
+    [(binary/part bin start len) (+ start len)]))
+
+;; ── message walker ──────────────────────────────────────────────────
+
+(defn- skip-field
+  "Advance past a field of `wire-type` at `pos`, returning the next pos.
+
+   Only the two wire types Biscuit uses are known; anything else is a
+   malformed or newer-than-supported token and fails loudly rather than
+   guessing a width."
+  [bin pos wire-type]
+  (cond
+    (= wire-type 0) (second (read-varint bin pos))
+    (= wire-type 2) (second (read-len-delimited bin pos))
+    :else (throw (ex-info "unsupported protobuf wire type"
+                          {:wire-type wire-type :pos pos}))))
+
+(defn parse-message
+  "Decode a protobuf message into `{field-number [values…]}`.
+
+   Every field collects into a VECTOR because protobuf allows a field to
+   repeat, and for `repeated` fields it legitimately does. A caller that
+   knows a field is singular takes the first; one that knows it repeats
+   takes them all. Varint fields yield integers; length-delimited fields
+   yield raw byte binaries (embedded messages are decoded lazily by the
+   caller, so this walker stays flat and total)."
+  [bin]
+  (let [size (erlang/byte_size bin)]
+    (loop [pos 0
+           acc {}]
+      (if (>= pos size)
+        acc
+        (let [t (read-tag bin pos)
+              field (first t)
+              wire (second t)
+              after-tag (nth t 2)]
+          (cond
+            (= wire 0)
+              (let [vp (read-varint bin after-tag)]
+                (recur (second vp)
+                       (update acc field (fn [xs] (conj (or xs []) (first vp))))))
+            (= wire 2)
+              (let [dp (read-len-delimited bin after-tag)]
+                (recur (second dp)
+                       (update acc field (fn [xs] (conj (or xs []) (first dp))))))
+            :else
+              (throw (ex-info "unsupported protobuf wire type"
+                              {:wire-type wire :field field :pos pos}))))))))
+
+(defn- field1
+  "The single value of `field` in a parsed message, or nil."
+  [msg field]
+  (first (get msg field)))
+
+;; ── Biscuit structure ───────────────────────────────────────────────
+;;
+;; Biscuit  = { rootKeyId?:1 varint, authority:2 SignedBlock,
+;;              blocks:3 repeated SignedBlock, proof:4 Proof }
+;; SignedBlock = { block:1 bytes, nextKey:2 PublicKey, signature:3 bytes,
+;;                 externalSignature?:4, version?:5 varint }
+;; PublicKey   = { algorithm:1 enum(Ed25519=0,SECP256R1=1), key:2 bytes }
+;; Proof       = oneof { nextSecret:1 bytes | finalSignature:2 bytes }
+
+(defn- parse-public-key
+  "A PublicKey message into `{:alg <int> :key <raw bytes>}`.
+
+   `alg` defaults to 0 (Ed25519) when absent, matching proto2's default
+   for the enum — the corpus's Ed25519 tokens omit it."
+  [bytes]
+  (let [m (parse-message bytes)]
+    {:alg (or (field1 m 1) 0)
+     :key (field1 m 2)}))
+
+(defn- parse-signed-block
+  "A SignedBlock into the shape the crypto chain consumes:
+   `{:data :next-pub :next-alg :sig :external :version}`.
+
+   `:data` is the raw serialized Datalog (the signed bytes, preserved
+   verbatim); `:next-pub`/`:next-alg` come from the embedded PublicKey;
+   `:version` distinguishes the v0 signed-payload layout (absent/0) from
+   v1 (present), which is why it is surfaced rather than dropped."
+  [bytes]
+  (let [m (parse-message bytes)
+        pk (parse-public-key (field1 m 2))]
+    {:data (field1 m 1)
+     :next-pub (:key pk)
+     :next-alg (:alg pk)
+     :sig (field1 m 3)
+     :external (field1 m 4)
+     :version (field1 m 5)}))
+
+(defn- parse-proof
+  "A Proof into `{:secret <bytes>}` (attenuable) or `{:sealed <bytes>}`
+   (sealed).
+
+   The oneof is decoded by which field is present: nextSecret (1) is an
+   attenuable token's last secret; finalSignature (2) is a sealed token's
+   proof. Exactly one is set on a well-formed token."
+  [bytes]
+  (let [m (parse-message bytes)]
+    (cond
+      (field1 m 1) {:secret (field1 m 1)}
+      (field1 m 2) {:sealed (field1 m 2)}
+      :else (throw (ex-info "proof carries neither secret nor signature" {})))))
+
+(defn decode
+  "Decode Biscuit wire bytes into a token value.
+
+   The result is exactly the shape `auth.biscuit.crypto/verify` expects:
+   `{:root-key-id? :authority <block> :blocks [<block>…] :proof <proof>}`.
+   Signature verification is a SEPARATE step — a decoded token is
+   'unverified' until the crypto chain checks it, which is the vocabulary
+   the spec uses and the separation the corpus's failure cases rely on."
+  [bin]
+  (let [m (parse-message bin)]
+    {:root-key-id (field1 m 1)
+     :authority (parse-signed-block (field1 m 2))
+     :blocks (mapv parse-signed-block (or (get m 3) []))
+     :proof (parse-proof (field1 m 4))}))
+
+;; ── revocation identifiers ──────────────────────────────────────────
+
+(defn revocation-ids
+  "The revocation identifier of every block, in order.
+
+   Per the spec, a block's revocation id IS its signature bytes — the
+   signature uniquely identifies the block, so it needs no separate
+   derivation. Returned as raw byte binaries; compare these by BYTES, not
+   by any textual encoding (base64 is non-canonical and would make two
+   encodings of one id compare unequal)."
+  [token]
+  (mapv :sig (cons (:authority token) (:blocks token))))
+
+;; ── encoding ────────────────────────────────────────────────────────
+
+(defn- write-varint
+  "Encode a non-negative integer as a base-128 varint (a byte list).
+
+   The inverse of `read-varint`: seven bits per byte, low group first,
+   continuation bit set on every byte but the last."
+  [n]
+  (erlang/list_to_binary
+    (Enum/to_list
+      (loop [v n
+             acc []]
+        (if (< v 128)
+          (conj acc v)
+          (recur (erlang/bsr v 7)
+                 (conj acc (erlang/bor (erlang/band v 127) 128))))))))
+
+(defn- write-tag
+  "Encode a field tag (field number + wire type) as a byte list."
+  [field wire]
+  (write-varint (erlang/bor (erlang/bsl field 3) wire)))
+
+(defn- write-len-field
+  "Encode a length-delimited field `field` carrying `bytes` (a binary):
+   tag, length varint, then the bytes. Returns an iolist."
+  [field bytes]
+  (list (write-tag field 2)
+        (write-varint (erlang/byte_size bytes))
+        bytes))
+
+(defn- write-varint-field
+  "Encode a varint field `field` = `n`. Returns an iolist."
+  [field n]
+  (list (write-tag field 0) (write-varint n)))
+
+(defn- encode-public-key
+  "Re-encode `{:alg :key}` as a PublicKey message binary.
+
+   The algorithm field is ALWAYS emitted, even for Ed25519 (0). Proto2
+   would normally omit a zero-valued field, but the reference producer
+   writes it explicitly — verified against the corpus, whose Ed25519 keys
+   carry `algorithm = 0` on the wire. Omitting it makes the re-encoding 2
+   bytes shorter per key and breaks the byte-identical round trip (and any
+   signature computed over the re-encoded key)."
+  [pk]
+  (erlang/iolist_to_binary
+    (list (write-varint-field 1 (:alg pk))
+          (write-len-field 2 (:key pk)))))
+
+(defn- encode-signed-block
+  "Re-encode a parsed block as a SignedBlock message binary.
+
+   Fields are emitted in ascending number order (1 block, 2 nextKey, 3
+   signature, 5 version), which is the canonical order the reference
+   producer uses — required for the re-encoding to match the signed bytes."
+  [b]
+  (let [pk (encode-public-key {:alg (:next-alg b) :key (:next-pub b)})
+        ;; fields in ascending number order: 1 block, 2 nextKey, 3 sig,
+        ;; 4 externalSignature (raw message bytes, preserved verbatim),
+        ;; 5 version. Optional fields are appended only when present, and
+        ;; the whole thing is forced to a proper list before iolist so the
+        ;; lazy `concat` seq cannot reach `iolist_to_binary`.
+        parts (concat
+                (list (write-len-field 1 (:data b))
+                      (write-len-field 2 pk)
+                      (write-len-field 3 (:sig b)))
+                (if (:external b)
+                  (list (write-len-field 4 (:external b)))
+                  (list))
+                (if (:version b)
+                  (list (write-varint-field 5 (:version b)))
+                  (list)))]
+    (erlang/iolist_to_binary (Enum/to_list parts))))
+
+(defn- encode-proof
+  "Re-encode a proof as a Proof message binary."
+  [proof]
+  (erlang/iolist_to_binary
+    (cond
+      (contains? proof :secret) (list (write-len-field 1 (:secret proof)))
+      (contains? proof :sealed) (list (write-len-field 2 (:sealed proof)))
+      :else (throw (ex-info "proof carries neither secret nor signature" {})))))
+
+(defn encode
+  "Encode a token value back to Biscuit wire bytes.
+
+   Canonical by construction: fields ascend, defaults are omitted, and the
+   `block` bytes are re-emitted verbatim — so `(encode (decode bytes))`
+   reproduces the original wire bytes for a well-formed token, and the
+   signatures still verify. That round-trip is a Wave-2 gate, because a
+   codec that cannot reproduce what it read cannot be trusted to produce
+   what a verifier elsewhere will check."
+  [token]
+  (let [root-part (if (:root-key-id token)
+                    (list (write-varint-field 1 (:root-key-id token)))
+                    (list))
+        auth-part (list (write-len-field 2 (encode-signed-block (:authority token))))
+        block-parts (Enum/to_list
+                      (mapv (fn [b] (write-len-field 3 (encode-signed-block b)))
+                            (:blocks token)))
+        proof-part (list (write-len-field 4 (encode-proof (:proof token))))]
+    (erlang/iolist_to_binary
+      (Enum/to_list (concat root-part auth-part block-parts proof-part)))))
