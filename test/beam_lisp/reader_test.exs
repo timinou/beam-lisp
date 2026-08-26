@@ -24,6 +24,24 @@ defmodule BeamLisp.ReaderTest do
     assert Reader.read_one(":ok") == {:keyword, "ok"}
   end
 
+  test "quoted keyword literals (BUG-004)" do
+    # A `:"..."` name may hold chars no bare symbol can. Before the fix the
+    # `:` terminated at the `"` and the input read as TWO forms — the empty
+    # keyword then a string.
+    assert Reader.read_one(~s(:"a b")) == {:keyword, "a b"}
+    assert Reader.read_one(~s(:"$end_of_table")) == {:keyword, "$end_of_table"}
+    assert Reader.read_one(~s(:"Elixir.ReqLLM.Response")) == {:keyword, "Elixir.ReqLLM.Response"}
+
+    # The precise regression: ONE form out, not two.
+    assert length(Reader.read_string(~s(:"a b"))) == 1
+
+    # Escapes behave as in a normal string (shared string/3).
+    assert Reader.read_one(~s(:"tab\there")) == {:keyword, "tab\there"}
+
+    # A quoted keyword is a map key like any other.
+    assert Reader.read_one(~s({:"weird key" 1})) == {:map, [{{:keyword, "weird key"}, 1}]}
+  end
+
   test "collections" do
     assert Reader.read_one("(+ 1 2)") == {:list, [{:symbol, "+"}, 1, 2]}
     assert Reader.read_one("[1 2 3]") == {:vector, [1, 2, 3]}

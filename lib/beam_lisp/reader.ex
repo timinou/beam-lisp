@@ -242,6 +242,17 @@ defmodule BeamLisp.Reader do
       # a record literal when a `{` follows the name and otherwise treats
       # the whole token as a bare atom (the trailing-`#` auto-gensym path).
       [?# | rest] -> record_or_tag(rest, pos)
+      # `:"..."` — a quoted keyword literal, whose NAME is an arbitrary string
+      # (spaces, dots, `$`) that is not a legal bare symbol. Without this
+      # clause the `:` terminated immediately at the `"` delimiter, yielding
+      # the empty keyword `:""` FOLLOWED BY a separate string form — a silent
+      # two-form misparse (BUG-004) that detonated downstream as a wrong-arity
+      # call or an "invalid fn clause". It must precede the bare-string and
+      # `atom_form` paths. The string body is read by the SAME `string/3` the
+      # `"` path uses (so every escape behaves identically) and the result is
+      # wrapped as a keyword. This is also how a fully-qualified module is
+      # named as a value: `:"Elixir.ReqLLM.Response"`.
+      [?:, ?" | rest] -> quoted_keyword(rest, advance_pos(pos, [?:, ?"]))
       [?" | rest] -> string(rest, advance_pos(pos, ?"), [])
       rest -> atom_form(rest, pos)
     end
@@ -634,6 +645,22 @@ defmodule BeamLisp.Reader do
 
       err ->
         err
+    end
+  end
+
+  # `:"name"` — the string body shares `string/3`, then the read name is
+  # interned as a keyword. The atom-safety guard runs on the resulting keyword
+  # exactly as the bare `:name` path does, so a hostile `:"..."` cannot grow
+  # the atom table any faster than `:...` can.
+  defp quoted_keyword(rest, pos) do
+    case string(rest, pos, []) do
+      {:ok, name, rest, pos_after} ->
+        form = {:keyword, name}
+        check_atom_safety!(form, name)
+        {:ok, form, rest, pos_after}
+
+      error ->
+        error
     end
   end
 

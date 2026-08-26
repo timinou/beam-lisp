@@ -816,6 +816,55 @@ defmodule BeamLisp.RT do
   def vector?(%BeamLisp.Vector{}), do: true
   def vector?(_), do: false
 
+  # `struct?` / `associative?` — the trichotomy `map?` alone could not express,
+  # and the source of a whole class of interop bug.
+  #
+  # `map?` answers "is this a beam-lisp MAP?" — true for a bl map or a bl
+  # record, FALSE for a foreign BEAM struct (a `%ReqLLM.Response{}`, an Ecto
+  # schema), by the deliberate decision documented above. But a foreign struct
+  # is still an ASSOCIATIVE value: `(Map/get s :field)` reads it, `get-in`
+  # walks it. Code that branched on `map?` to decide "can I read fields off
+  # this?" took the wrong arm on every foreign struct and mishandled it
+  # silently (a gateway once leaked a raw error struct into a 500 exactly
+  # here). The missing predicate is WHY `map?` was misused.
+  #
+  #   map?         ⊆ associative?      — every bl map is associative
+  #   struct?      the foreign side     — any %_{} , bl record OR foreign
+  #   associative? = struct? ∪ bl-map ∪ vector   — "I can `get` by key/index"
+  #
+  # `struct?` is true for a bl RECORD or a FOREIGN struct, but NOT for
+  # beam-lisp's own internal value structs — a vector, set, sorted map/set and
+  # lazy-seq are all `%_{}` under the hood, yet they are the language's
+  # collections, not "structs" a user reasons about. Excluding them keeps the
+  # predicate meaningful: `(and (struct? x) (not (map? x)))` names "a foreign
+  # struct" precisely, which is the guard interop code wants, and a vector
+  # (which `map?` already reports false) does not sneak through it.
+  @doc """
+  `struct?`: a user/foreign BEAM struct — a bl record OR a foreign struct (a
+  `%Date{}`, `%ReqLLM.Response{}`). FALSE for beam-lisp's own collection
+  structs (vector, set, sorted map/set, lazy-seq) and reference types, which
+  are the language's values rather than structs a program inspects.
+  """
+  def struct?(%BeamLisp.Vector{}), do: false
+  def struct?(%Set{}), do: false
+  def struct?(%SortedMap{}), do: false
+  def struct?(%SortedSet{}), do: false
+  def struct?(%LazySeq{}), do: false
+  def struct?(%{__struct__: mod} = x) when is_atom(mod), do: not is_ref_type(x)
+  def struct?(_), do: false
+
+  @doc """
+  `associative?`: a value fields can be read from by key or index — a bl map,
+  a bl record, a foreign struct, or a vector. The predicate to branch on when
+  the question is "can I `get` into this?", where `map?` is the wrong one
+  because it excludes foreign structs that `Map/get` reads fine.
+  """
+  # bl map (incl. SortedMap, which map? already covers) ∪ vector ∪ any
+  # user/foreign struct. Built ON `struct?`/`map?`/`vector?` so the internal
+  # non-associative structs (Set, SortedSet, LazySeq) are excluded for free:
+  # none of the three is true for them.
+  def associative?(x), do: struct?(x) or map?(x) or vector?(x)
+
   @doc "`list?`: a proper list (incl. the empty list) — never a vector, map, or nil."
   def list?(x) when is_list(x), do: true
   def list?(_), do: false
@@ -2173,6 +2222,8 @@ defmodule BeamLisp.RT do
       "number?" => &number?/1,
       "int?" => &int?/1,
       "map?" => &map?/1,
+      "struct?" => &struct?/1,
+      "associative?" => &associative?/1,
       "vector?" => &vector?/1,
       "list?" => &list?/1,
       "coll?" => &coll?/1,
@@ -2400,6 +2451,8 @@ defmodule BeamLisp.RT do
       "number?" => 1,
       "int?" => 1,
       "map?" => 1,
+      "struct?" => 1,
+      "associative?" => 1,
       "vector?" => 1,
       "list?" => 1,
       "coll?" => 1,
