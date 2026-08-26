@@ -1,0 +1,129 @@
+; test/bl/datom/resolve_test.bl — the datom_resolve NIF (Fix A), end to end.
+; Run: mix beam_lisp.test test/bl/datom/resolve_test.bl
+;
+; ── What this locks ───────────────────────────────────────────────────
+;
+; This IS the golden-vector conformance suite: beam-lisp encodes datom
+; values through `store-redb`'s packed writer, the Rust NIF decodes them
+; back into typed columns, and we assert the columns equal what a plain
+; `index/scan` (the bl decode path) produces. Same bytes, two decoders,
+; zero disagreements — across every dtype, the retraction filter, and the
+; any-term escape lane that carries arbitrary EDN/BEAM structures.
+;
+; It is skipped when the redb NIF is absent (a BEAM-only checkout), the
+; same gate the conformance suite uses.
+
+(ns datom.resolve.test
+  (:require [datom.store-redb] [datom.index] [datom.store]))
+
+(defn- temp-path []
+  (str "/tmp/datom-resolve-test-"
+       (erlang/integer_to_binary (erlang/unique_integer (to-list [:positive])))
+       ".redb"))
+
+;; A tiny schema-free write: build datoms and commit them straight to the
+;; store via the index write path, then read them two ways.
+
+(defn- put-datoms [store datoms]
+  ; write only EAVT/AEVT (the base indexes); the resolve test scans AEVT.
+  (datom.store/-commit
+    store
+    (to-list (mapcat (fn [d]
+                       (mapv (fn [index] [:put (datom.index/key-for index d) d])
+                             [:eavt :aevt]))
+                     datoms))))
+
+(defn- aevt-bounds [a]
+  ; the AEVT key range for one attribute: prefix [a] .. its end.
+  (let [prefix (datom.index/key-prefix :aevt a)]
+    [prefix (datom.index/prefix-end prefix)]))
+
+;; scan-based column extraction (the bl decode path) for comparison.
+(defn- scan-cols [store a]
+  (let [datoms (datom.index/scan store :aevt a)
+        live (filterv datom.index/assertion? datoms)]
+    {:e (mapv datom.index/-e live)
+     :v (mapv datom.index/-v live)
+     :tx (mapv datom.index/-tx live)}))
+
+(defn- sort-cols
+  "Order a {:e :v :tx} column set by [e v] so two producers compare
+   regardless of scan order."
+  [cols]
+  (let [rows (mapv (fn [i] [(get (:e cols) i) (get (:v cols) i) (get (:tx cols) i)])
+                   (range (count (:e cols))))
+        sorted (sort-by (fn [r] [(get r 0) (str (get r 1))]) rows)]
+    {:e (mapv (fn [r] (get r 0)) sorted)
+     :v (mapv (fn [r] (get r 1)) sorted)
+     :tx (mapv (fn [r] (get r 2)) sorted)}))
+
+(defmacro when-redb [& body]
+  `(if (datom.store-redb/available?)
+     (do ~@body)
+     (is true)))   ; NIF absent: vacuously pass, like the conformance gate.
+
+;; ── the golden equivalence: NIF columns == scan columns ─────────────
+
+(deftest resolve-matches-scan-for-scalars
+  (when-redb
+    (let [store (datom.store-redb/open (temp-path))
+          ; :spend/model (keyword-ish string values), :spend/cost (long)
+          datoms [[1000 :spend/cost 42 7000 true]
+                  [1001 :spend/cost 99 7000 true]
+                  [1002 :spend/cost 7 7001 true]]
+          _ (put-datoms store datoms)
+          bounds (aevt-bounds :spend/cost)
+          resolved (datom.store-redb/resolve store (get bounds 0) (get bounds 1))
+          scanned (scan-cols store :spend/cost)]
+      (is (= (sort-cols scanned) (sort-cols resolved))))))
+
+(defn- resolve-eq-scan? [store a]
+  (let [bounds (aevt-bounds a)
+        resolved (datom.store-redb/resolve store (get bounds 0) (get bounds 1))
+        scanned (scan-cols store a)]
+    (= (sort-cols scanned) (sort-cols resolved))))
+
+(deftest resolve-decodes-every-lane
+  (when-redb
+    (let [store (datom.store-redb/open (temp-path))
+          datoms [[1 :a/long 42 7000 true]
+                  [2 :a/long -9223372036854775808 7000 true]   ; i64 min
+                  [3 :a/str "gpt-4o" 7000 true]
+                  [4 :a/kw :provider/anthropic 7000 true]
+                  [5 :a/bool true 7000 true]
+                  [6 :a/float 3.14 7000 true]]]
+      ; each attribute scanned on its own so the column is homogeneous
+      (put-datoms store datoms)
+      (is (resolve-eq-scan? store :a/long))
+      (is (resolve-eq-scan? store :a/str))
+      (is (resolve-eq-scan? store :a/kw))
+      (is (resolve-eq-scan? store :a/bool))
+      (is (resolve-eq-scan? store :a/float)))))
+
+(deftest resolve-applies-the-retraction-filter
+  (when-redb
+    (let [store (datom.store-redb/open (temp-path))
+          ; assert cost 42, then retract it, then assert 99 — only 99 lives.
+          datoms [[500 :bal/cost 42 7000 true]
+                  [500 :bal/cost 42 7001 false]
+                  [500 :bal/cost 99 7002 true]]
+          _ (put-datoms store datoms)
+          bounds (aevt-bounds :bal/cost)
+          resolved (datom.store-redb/resolve store (get bounds 0) (get bounds 1))]
+      ; the NIF drops the retracted [500 :bal/cost 42]; 99 remains.
+      (is (= [500] (:e (sort-cols resolved))))
+      (is (= [99] (:v (sort-cols resolved)))))))
+
+(deftest resolve-round-trips-arbitrary-structures
+  (when-redb
+    (let [store (datom.store-redb/open (temp-path))
+          body {:blocks [{:type :h1 :text "Title"}
+                         {:type :list :items #{:a :b :c}}]
+                :meta {:tags [:draft :urgent] :rev 7}}
+          datoms [[900 :doc/body body 7000 true]]
+          _ (put-datoms store datoms)
+          bounds (aevt-bounds :doc/body)
+          resolved (datom.store-redb/resolve store (get bounds 0) (get bounds 1))]
+      ; the any-term escape lane hands the nested structure back intact.
+      (is (= [body] (:v resolved)))
+      (is (= [900] (:e resolved))))))

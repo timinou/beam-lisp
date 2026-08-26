@@ -71,7 +71,9 @@ mod atoms {
 /// them into four redb tables would add nothing and would make an
 /// atomic cross-index commit a cross-table concern rather than a
 /// single-table one.
-const DATOMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("datoms");
+pub(crate) const DATOMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("datoms");
+
+mod resolve;
 
 /// A handle to an open database, held by the BEAM as a resource.
 ///
@@ -81,14 +83,14 @@ const DATOMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("datoms");
 /// another `-update` on the same key between its read and its write.
 /// redb would serialize the two *transactions*, but the read in one and
 /// the write in the other could still straddle.
-struct DbHandle {
-    db: Mutex<Database>,
+pub(crate) struct DbHandle {
+    pub(crate) db: Mutex<Database>,
 }
 
 #[rustler::resource_impl]
 impl Resource for DbHandle {}
 
-fn err(msg: impl std::fmt::Display) -> Error {
+pub(crate) fn err(msg: impl std::fmt::Display) -> Error {
     Error::Term(Box::new(format!("{}", msg)))
 }
 
