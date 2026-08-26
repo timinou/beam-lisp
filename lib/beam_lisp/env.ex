@@ -63,13 +63,13 @@ defmodule BeamLisp.Env do
   defp candidates(ns, name) do
     case String.split(name, "/", parts: 2) do
       ["" | _] ->
-        [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}]
+        [{ns, name}] ++ refer_candidate(ns, name) ++ [{"core", name}, {"sugar", name}]
 
       [prefix, var_name] ->
         [{alias_target(ns, prefix) || prefix, var_name}]
 
       [plain] ->
-        [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}]
+        [{ns, plain}] ++ refer_candidate(ns, plain) ++ [{"core", plain}, {"sugar", plain}]
     end
   end
 

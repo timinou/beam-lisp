@@ -1,0 +1,147 @@
+; priv/interop.bl — the seam between beam-lisp values and the BEAM libraries
+; they wrap.
+;
+; ── Why this exists ─────────────────────────────────────────────────────────
+;
+; A beam-lisp program that wraps an Elixir library (req_llm, Ecto, Finch, a
+; Phoenix endpoint) keeps hitting the same three shape-mismatches, because the
+; shapes Elixir speaks are NOT the shapes beam-lisp produces:
+;
+;   1. Elixir returns `{:ok, v}` / `{:error, e}` TWO-TUPLES; a beam-lisp result
+;      map is `{:ok v}` / `{:error e}`. `contains?` on the tuple silently
+;      misfires — it is not a map.
+;   2. Elixir option-taking fns want a KEYWORD LIST (`[k: v]`); a beam-lisp map
+;      handed to `Keyword.get` raises.
+;   3. A beam-lisp `[…]` literal is a `%BeamLisp.Vector{}` struct, and Jason
+;      cannot encode it — every JSON boundary fails deep in the encoder naming
+;      a struct the caller never wrote.
+;
+; Each conversion is mechanical, total, and — measured — written IDENTICALLY in
+; every downstream app (a language-learning game and an LLM gateway each carried
+; a private `jsonable` and a private kwlist converter). This namespace is that
+; code, written once.
+;
+; ── Why opt-in, not default ─────────────────────────────────────────────────
+;
+; Unlike `sugar`, this is NOT referred into every namespace: it is for programs
+; that bridge Elixir, and a program that never leaves beam-lisp should not carry
+; a JSON encoder in its floor. Use it with `(:require [interop])` (or `:as`),
+; the same way `datom` is required.
+
+(ns interop)
+
+;; ── result tuples ────────────────────────────────────────────────────────────
+
+(defn result
+  "Normalize an Elixir `{:ok, v}` / `{:error, e}` two-tuple into a beam-lisp
+   result MAP (`{:ok v}` / `{:error e}`) that `contains?` and `:ok`/`:error`
+   can test. A value already a map passes through unchanged — so a real call
+   and a stubbed one that returns a map share one shape. Any other value is
+   treated as a bare success.
+
+     (result (File/read \"x\"))  ;=> {:ok \"...\"} | {:error :enoent}"
+  [x]
+  (cond
+    (map? x) x
+    (and (erlang/is_tuple x) (= :ok (erlang/element 1 x)))    {:ok (erlang/element 2 x)}
+    (and (erlang/is_tuple x) (= :error (erlang/element 1 x)))  {:error (erlang/element 2 x)}
+    :else {:ok x}))
+
+(defn ok?
+  "True when a result map is a success. Pair with `result` on an Elixir tuple."
+  [r]
+  (and (map? r) (contains? r :ok)))
+
+(defn err?
+  "True when a result map is a failure."
+  [r]
+  (and (map? r) (contains? r :error)))
+
+(defn unwrap
+  "The success value of a result map, or raise. For the call site that has
+   already decided a failure is a bug."
+  [r]
+  (if (ok? r)
+    (:ok r)
+    (throw (ex-info "interop/unwrap on a non-ok result" {:result r}))))
+
+(defn unwrap-or
+  "The success value of a result map, or `default` on failure — the total
+   counterpart to `unwrap`."
+  [r default]
+  (if (ok? r) (:ok r) default))
+
+;; ── keyword lists (Elixir options) ───────────────────────────────────────────
+
+(defn ->kwlist
+  "A beam-lisp map → an Erlang KEYWORD LIST (`[{:k, v}]`), the convention nearly
+   every Elixir option-taking fn expects. A map handed straight to such a fn
+   hits `Keyword.get`'s raise; this is the crossing.
+
+     (Req/get url (->kwlist {:receive_timeout 5000}))"
+  [m]
+  (Enum/to_list
+    (Enum/map (Enum/to_list m)
+      (fn [t] (erlang/list_to_tuple
+                (list (erlang/element 1 t) (erlang/element 2 t)))))))
+
+(defn kwlist->
+  "An Erlang keyword list back into a beam-lisp map — the inverse of
+   `->kwlist`, for reading options a library handed back."
+  [kw]
+  (Map/new
+    (Enum/map (Enum/to_list kw)
+      (fn [t] (erlang/list_to_tuple
+                (list (erlang/element 1 t) (erlang/element 2 t)))))))
+
+;; ── JSON (the vector hazard) ─────────────────────────────────────────────────
+
+(defn jsonable
+  "Deep-convert beam-lisp collections into values Jason can encode: vectors and
+   lists become Erlang lists, maps are rebuilt with converted values, scalars
+   and keywords pass through (Jason renders a keyword as a string). The hazard
+   this closes: a `[…]` literal is a `%BeamLisp.Vector{}` struct that Jason
+   rejects deep in the encoder — convert once, here, at the boundary.
+
+   Foreign STRUCTS are left as-is: a struct with its own `Jason.Encoder`
+   (a `%DateTime{}`, a library response) must reach Jason intact to be encoded
+   the way its owner intends, so `struct?` values are passed through untouched."
+  [x]
+  (cond
+    (struct? x) x
+    (map? x)
+    (Map/new
+      (Enum/map (Enum/to_list x)
+        (fn [t] (erlang/list_to_tuple
+                  (list (erlang/element 1 t) (jsonable (erlang/element 2 t)))))))
+    (vector? x) (Enum/to_list (Enum/map (Enum/to_list x) jsonable))
+    (list? x)   (Enum/to_list (Enum/map (Enum/to_list x) jsonable))
+    :else x))
+
+(defn ->json
+  "A beam-lisp value → a JSON string, vector-safe (see `jsonable`)."
+  [x]
+  (Jason/encode! (jsonable x)))
+
+(defn json->
+  "A JSON string → beam-lisp data (`Jason/decode!`). The inverse of `->json`
+   for the common case; a decoded JSON object is a beam-lisp map, its arrays
+   are lists."
+  [s]
+  (Jason/decode! s))
+
+;; ── module atoms ─────────────────────────────────────────────────────────────
+
+(defn module
+  "Name an Elixir/Erlang module as a VALUE from its dotted string — what
+   `Kernel/struct`, `apply`, and `make_fun` need and which cannot be written as
+   a bare symbol. Uses `binary_to_existing_atom`, so a module that was never
+   loaded (a typo) fails loudly rather than growing the atom table.
+
+     (Kernel/struct (module \"Elixir.ReqLLM.Response\") fields)
+
+   With the reader's quoted-keyword literal this also reads directly as
+   `:\"Elixir.ReqLLM.Response\"`; `module` is the form for a name computed at
+   runtime."
+  [name]
+  (erlang/binary_to_existing_atom name :utf8))
