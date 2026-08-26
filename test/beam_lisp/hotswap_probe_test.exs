@@ -18,12 +18,31 @@ defmodule BeamLisp.HotswapProbeTest do
 
   @moduletag :tmp_dir
 
-  # `compile_source/2` returns a module per namespace TOUCHED, and the `user`
-  # namespace accumulates whatever earlier tests def'd into it in this VM. So
-  # it can hand back `[{Ns.Hotswapprobe, _}, {Ns.User, _}]` in a full-suite run
-  # and only `[{Ns.Hotswapprobe, _}]` when run alone. Select by name; matching a
-  # one-element list passes in isolation and fails in the suite.
-  defp pick(emitted, mod), do: Enum.find_value(emitted, fn {m, p} -> m == mod && p end)
+  # `compile_source/2` emits SEVERAL beams per namespace — the `BeamLisp.Ns.<Ns>`
+  # shim module, its `BeamLisp.Ns.Body.<Ns>` body module (where the real fn code
+  # lives), and a `BeamLisp.Ns.Init.<Ns>` companion when there are value/macro
+  # defs — plus a `Ns.User` entry for whatever earlier tests def'd into `user`
+  # in this VM. The hot-swap UNIT is therefore the set of beams whose module is
+  # the namespace module or lives under its `Body`/`Init` children; loading only
+  # the shim would leave the old body code in place. `ns_beams/2` selects that
+  # set (by module-name prefix), and `paths/1` returns their `.beam` paths.
+  defp ns_beams(emitted, ns_mod) do
+    # tail after `BeamLisp.Ns`, e.g. ["Hotswapprobe"] — the namespace's own
+    # segment(s), shared by its `Body`/`Init` children.
+    ["BeamLisp", "Ns" | tail] = Module.split(ns_mod)
+    body = Module.concat([BeamLisp.Ns, "Body" | tail])
+    init = Module.concat([BeamLisp.Ns, "Init" | tail])
+    set = [ns_mod, body, init]
+    Enum.filter(emitted, fn {m, _p} -> m in set end)
+  end
+
+  # Load every beam in an emitted set from disk, newest code wins.
+  defp load_all(emitted) do
+    for {m, p} <- emitted do
+      :code.purge(m)
+      {:module, ^m} = :code.load_abs(String.to_charlist(Path.rootname(p)))
+    end
+  end
 
   setup do
     BeamLisp.init()
@@ -38,32 +57,32 @@ defmodule BeamLisp.HotswapProbeTest do
     v2 = "(ns hotswapprobe)\n(defn greet [x] \"v2\")\n"
     bad = "(ns hotswapprobe)\n(defn greet [x] (throw (ex-info \"boom\" {})))\n"
 
-    load = fn path, mod ->
-      :code.purge(mod)
-      {:module, ^mod} = :code.load_abs(String.to_charlist(Path.rootname(path)))
-      BeamLisp.AOT.ensure_loaded("hotswapprobe")
-    end
-
     call = fn mod -> apply(mod, :greet, [1]) end
 
-    # ── read/emit: compile a namespace to a real .beam ──
+    # ── read/emit: compile a namespace to a real beam SET ──
+    # The hot-swap unit is the namespace's shim + body (+ init) beams; the real
+    # `greet` code lives in the body module, so all of them move together.
     mod = BeamLisp.Ns.Hotswapprobe
-    p1 = pick(BeamLisp.AOT.compile_source(v1, output_dir: tmp), mod)
+    e1 = ns_beams(BeamLisp.AOT.compile_source(v1, output_dir: tmp), mod)
+    load_all(e1)
     BeamLisp.AOT.ensure_loaded("hotswapprobe")
     assert call.(mod) == "v1"
 
-    # The known-good artifact is the BINARY. This is the whole decision.
-    good_binary = File.read!(p1)
+    # The known-good artifact is the BINARY set. This is the whole decision:
+    # remembered bytes cannot fail to recompile because they already compiled.
+    good_binaries = for {m, p} <- e1, do: {m, File.read!(p)}
 
     # ── load: a compatible revision swaps in live, no restart ──
-    p2 = pick(BeamLisp.AOT.compile_source(v2, output_dir: tmp), mod)
-    load.(p2, mod)
+    e2 = ns_beams(BeamLisp.AOT.compile_source(v2, output_dir: tmp), mod)
+    load_all(e2)
+    BeamLisp.AOT.ensure_loaded("hotswapprobe")
     assert call.(mod) == "v2"
 
     # ── validate: a bad revision loads fine and fails only when RUN ──
     # This is exactly why `validate` cannot be "did it compile?" -- it did.
-    p3 = pick(BeamLisp.AOT.compile_source(bad, output_dir: tmp), mod)
-    load.(p3, mod)
+    e3 = ns_beams(BeamLisp.AOT.compile_source(bad, output_dir: tmp), mod)
+    load_all(e3)
+    BeamLisp.AOT.ensure_loaded("hotswapprobe")
     assert {:error, _} = (try do
                             {:ok, call.(mod)}
                           rescue
@@ -71,8 +90,11 @@ defmodule BeamLisp.HotswapProbeTest do
                           end)
 
     # ── revert: load the remembered bytes; cannot fail to compile ──
-    :code.purge(mod)
-    {:module, ^mod} = :code.load_binary(mod, ~c"revert", good_binary)
+    for {m, bin} <- good_binaries do
+      :code.purge(m)
+      {:module, ^m} = :code.load_binary(m, ~c"revert", bin)
+    end
+
     BeamLisp.AOT.ensure_loaded("hotswapprobe")
     assert call.(mod) == "v1"
   end

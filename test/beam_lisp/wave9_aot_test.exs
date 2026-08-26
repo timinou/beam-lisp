@@ -9,15 +9,26 @@ defmodule BeamLisp.Wave9AotTest do
   alias BeamLisp.Env
 
   @fixture_dir "test/fixtures/aot"
-  @compile_path Mix.Project.compile_path()
+
+  # Build the fixtures into an ISOLATED directory, not the shared production
+  # code path. Compiling fixtures into `Mix.Project.compile_path()` (with the
+  # `clean` that precedes it) deleted the real AOT beams the rest of the suite
+  # depends on and left a fixture-only manifest, so a later module purge hit a
+  # missing body beam (nondeterministic `UndefinedFunctionError`) and the next
+  # `mix test` recompiled every source from scratch. A throwaway dir added to
+  # the code path keeps this module hermetic.
+  @compile_path Path.join(System.tmp_dir!(), "beam_lisp_aot_fixtures")
 
   setup_all do
     BeamLisp.init()
 
     # Start from a clean slate, then compile the fixture set once for all
-    # tests in this module.
-    Mix.Tasks.Compile.BeamLisp.clean()
-    assert {:ok, []} = Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir])
+    # tests in this module, into the isolated output dir.
+    Mix.Tasks.Compile.BeamLisp.clean(@compile_path)
+    assert {:ok, []} =
+             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
+
+    Code.append_path(@compile_path)
     :ok
   end
 
@@ -77,8 +88,15 @@ defmodule BeamLisp.Wave9AotTest do
     IO.puts("report=" <> BeamLisp.Ns.Greeter.report(3))
     """
 
+    # Two code paths: the app's real ebin supplies `BeamLisp.Env`/`AOT`, the
+    # isolated fixture dir supplies the AOT-emitted `Ns.Math` etc. The
+    # `loaded_from` assertion below still pins `Ns.Math` to @compile_path.
     {out, 0} =
-      System.cmd("elixir", ["-pa", @compile_path, "-e", script], stderr_to_stdout: true)
+      System.cmd(
+        "elixir",
+        ["-pa", Mix.Project.compile_path(), "-pa", @compile_path, "-e", script],
+        stderr_to_stdout: true
+      )
 
     # Loaded from disk, carries the AOT init hook, answers correctly.
     assert out =~ "loaded_from=" <> @compile_path
@@ -93,7 +111,8 @@ defmodule BeamLisp.Wave9AotTest do
   test "second run recompiles nothing" do
     before = for mod <- [BeamLisp.Ns.Math, BeamLisp.Ns.Hello], do: {mod, beam_mtime(mod)}
 
-    assert {:noop, []} = Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir])
+    assert {:noop, []} =
+             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
 
     for {mod, mtime} <- before do
       assert beam_mtime(mod) == mtime
@@ -103,14 +122,56 @@ defmodule BeamLisp.Wave9AotTest do
   test "clean removes generated modules and the manifest" do
     assert File.exists?(beam_path(BeamLisp.Ns.Math))
 
-    Mix.Tasks.Compile.BeamLisp.clean()
+    Mix.Tasks.Compile.BeamLisp.clean(@compile_path)
 
     refute File.exists?(beam_path(BeamLisp.Ns.Math))
-    refute File.exists?(Path.join(Mix.Project.manifest_path(), "compile.beam_lisp"))
+    refute File.exists?(Path.join(@compile_path, "compile.beam_lisp"))
 
     # Recompile so the rest of the suite still sees them.
-    assert {:ok, []} = Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir])
+    assert {:ok, []} =
+             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
   end
 
   defp beam_mtime(mod), do: File.stat!(beam_path(mod)).mtime
+
+  # ------------------------------------------------------------------
+  # Regression: an AOT-loaded namespace must survive module version churn.
+  #
+  # This is the failure that motivated the shim/body/companion split. AOT
+  # used to splice real fn code and macro-expander closures directly into the
+  # `BeamLisp.Ns.<Ns>` module. A later runtime `(def)` into that namespace
+  # reloads it; the BEAM keeps two versions and purges the oldest on the third
+  # load, stranding every fn capture and macro closure that lived in the
+  # reloaded module — `(math/square 3)` and the `twice` macro would raise
+  # BadFunctionError / "undefined function …Ns.Fn.M<n>". The fix houses real
+  # code in a never-reloaded `BeamLisp.Ns.Body.<Ns>` and macro closures in
+  # `BeamLisp.Ns.Init.<Ns>`; only the thin shim module churns. This test locks
+  # that in by churning `math` and then using both a fn and a macro from it.
+  # ------------------------------------------------------------------
+  test "an AOT-loaded namespace survives runtime (def) churn of its module" do
+    BeamLisp.AOT.ensure_loaded("math")
+
+    # Sanity: the fn and the macro work before any churn.
+    assert BeamLisp.eval("(math/square 5)") == 25
+    assert BeamLisp.eval("(math/twice 7)") == 14
+
+    # Churn the `math` namespace hard: each `(def)` rebuilds the shim module,
+    # and the BEAM purges an old version every third load. Four is comfortably
+    # past the purge threshold.
+    for i <- 1..4 do
+      BeamLisp.Compiler.eval_string(
+        "(defn churn#{i} [] #{i})",
+        BeamLisp.Compiler.new_env("math")
+      )
+    end
+
+    # The AOT-loaded fn still runs: its code lives in Ns.Body.Math, never
+    # reloaded, so the capture the shim forwards to was never purged.
+    assert BeamLisp.eval("(math/square 6)") == 36
+    assert BeamLisp.eval("(math/add 9 10)") == 19
+
+    # The AOT-loaded MACRO still expands: its expander closure lives in
+    # Ns.Init.Math, also never reloaded.
+    assert BeamLisp.eval("(math/twice 8)") == 16
+  end
 end

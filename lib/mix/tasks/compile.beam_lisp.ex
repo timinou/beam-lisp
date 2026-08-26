@@ -49,12 +49,27 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   def run(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        strict: [source_dir: :string, force: :boolean]
+        strict: [source_dir: :string, force: :boolean, out: :string]
       )
 
     source_dirs = if d = opts[:source_dir], do: [d], else: source_dirs_from_config()
-    compile_path = Mix.Project.compile_path()
-    manifest_path = Path.join(Mix.Project.manifest_path(), @manifest)
+
+    # `--out DIR` scopes the WHOLE build to an isolated directory: beams land
+    # in DIR and the manifest lives at DIR/compile.beam_lisp, decoupled from
+    # the production `Mix.Project.compile_path()` + `manifest_path()`. Without
+    # it a test that compiles a fixture set (`--source-dir test/fixtures/aot`)
+    # would `clean` and rebuild INTO the shared code path -- deleting the real
+    # AOT beams every other test depends on and leaving a fixture-only
+    # manifest, so the next `mix test` recompiled all sources from scratch.
+    # An isolated build never touches the production tree.
+    compile_path = opts[:out] || Mix.Project.compile_path()
+
+    manifest_path =
+      if out = opts[:out],
+        do: Path.join(out, @manifest),
+        else: Path.join(Mix.Project.manifest_path(), @manifest)
+
+    if opts[:out], do: File.mkdir_p!(opts[:out])
 
     cond do
       not Enum.any?(source_dirs, &File.dir?/1) ->
@@ -96,7 +111,30 @@ defmodule Mix.Tasks.Compile.BeamLisp do
             if opts[:force] || not up_to_date?(m, path, hash, compile_path) do
               case compile_file(path, compile_path) do
                 {:ok, modules} ->
-                  {Map.put(m, path, %{hash: hash, modules: modules}), true, errs}
+                  # Delete beams this source used to emit but no longer does.
+                  # A namespace emits one namespace module plus one body module
+                  # per var and a value/macro companion — all deterministically
+                  # named. When a var is removed or renamed its body beam would
+                  # otherwise linger on the code path, outside the new manifest
+                  # and so invisible to `clean`. Remove `old -- new` on every
+                  # recompile so the on-disk module set exactly matches what the
+                  # source now defines.
+                  old_modules = (m[path] || %{}) |> Map.get(:modules, [])
+                  Enum.each(old_modules -- modules, &delete_beam(&1, compile_path))
+
+                  m2 = Map.put(m, path, %{hash: hash, modules: modules})
+                  # Checkpoint the manifest after each successful source. The
+                  # build writes beams to ebin incrementally, but this manifest
+                  # was historically persisted only after the whole reduce
+                  # finished -- so an interrupted cold build (timeout/kill) left
+                  # a populated ebin with NO manifest. The next run then saw a
+                  # partial beam set (shims whose body modules were not emitted
+                  # yet -> UndefinedFunctionError at test time) and, finding no
+                  # manifest, recompiled every source from scratch with no
+                  # resume. Persisting per source makes the cold build resumable
+                  # and keeps manifest and ebin in step at every observable point.
+                  write_manifest(manifest_path, m2)
+                  {m2, true, errs}
 
                 {:error, err} ->
                   {m, rc, [err | errs]}
@@ -130,12 +168,18 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   end
 
   @impl Mix.Task.Compiler
-  def clean do
-    manifest_path = Path.join(Mix.Project.manifest_path(), @manifest)
+  def clean, do: clean_at(Mix.Project.compile_path(), Path.join(Mix.Project.manifest_path(), @manifest))
 
+  @doc """
+  Clean an isolated build produced with `run([\"--out\", dir])`. Removes every
+  beam the manifest recorded plus the manifest itself, scoped to `dir` — the
+  shared production code path is never touched. Used by tests that compile a
+  fixture set into a throwaway directory.
+  """
+  def clean(out) when is_binary(out), do: clean_at(out, Path.join(out, @manifest))
+
+  defp clean_at(compile_path, manifest_path) do
     if File.exists?(manifest_path) do
-      compile_path = Mix.Project.compile_path()
-
       manifest_path
       |> read_manifest()
       |> Map.values()
