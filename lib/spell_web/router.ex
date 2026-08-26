@@ -36,7 +36,7 @@ defmodule SpellWeb.Layouts do
         </script>
         <script src="/assets/phoenix_live_view/phoenix_live_view.js">
         </script>
-        <script src="/assets/js/spacetime_bridge.js">
+        <script src="/assets/js/spacetime_bridge.global.js">
         </script>
         <script>
           // THE PAGE RELOADS WHEN VERSE RECOMPILES IT.

@@ -79,6 +79,12 @@ defmodule BeamLisp.MixProject do
       # longer dev-only: the seam's server half needs an HTTP server wherever
       # spell runs.
       {:bandit, "~> 1.5"},
+      # The seam's client+server halves: `Spacetime.LiveView` and the
+      # `SpacetimeBridge` hook. Both used to be PORTED copies in this repo —
+      # lib/spacetime/live_view.ex said so in its own moduledoc — and a copied
+      # wire protocol drifts from the one it was copied from. It is a
+      # dependency now, so a fix lands once.
+      {:spacetime_phoenix, path: "../../ora/verse/elixir/spacetime_phoenix"},
       # The seam's server half: the emitted page declares `@host $chat :
       # live("SpellWeb.ChatLive")` and its signals ride the LiveView channel
       # (window.__stLiveBridge). Phoenix is a LIBRARY here — the endpoint

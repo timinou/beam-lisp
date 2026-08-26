@@ -57,7 +57,15 @@ defmodule SpellWeb.Endpoint do
     gzip: false
   )
 
-  plug(Plug.Static, at: "/assets", from: {:beam_lisp, "priv/static"}, gzip: false, only: ["js"])
+  # The bridge hook, from the library that defines it. The `.global.js` build is
+  # the one to serve here: this app has no bundler, and in a plain <script> the
+  # ESM `export` keyword is a syntax error that kills the whole file — which
+  # presents as a page that hydrates and then answers no signal.
+  plug(Plug.Static,
+    at: "/assets/js",
+    from: {:spacetime_phoenix, "priv/static/js"},
+    gzip: false
+  )
 
   plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
