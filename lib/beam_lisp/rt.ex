@@ -2063,6 +2063,40 @@ defmodule BeamLisp.RT do
   end
 
   @doc """
+  A registered data-reader for the `#tag[...]` / `#tag{...}` literal, or
+  `:error`. Mirrors `reader_macro/1` but keyed by a TAG NAME rather than a
+  single dispatch char, so `#d[…]` looks up the symbol `d`. The reader
+  wraps the following collection as `(<fn-symbol> <collection>)`, exactly
+  as Clojure's `*data-readers*` expands `#inst "…"`.
+  """
+  def data_reader(tag) when is_binary(tag) do
+    case :ets.lookup(:beam_lisp_vars, {:data_reader, tag}) do
+      [{{:data_reader, ^tag}, name}] -> {:ok, name}
+      [] -> data_reader_default(tag)
+    end
+  end
+
+  # Builtin data-reader defaults, mirroring the `@`→`deref` fallback in the
+  # reader: a whole file is READ before any form (including the `data-reader!`
+  # registration in `priv/datom.bl`) EVALUATES, so a `#d[…]` literal in a file
+  # that merely `:require`s datom would not see a purely runtime registration.
+  # Naming the builtin here keeps `#d[…]` readable from first boot; a runtime
+  # `data-reader!` still overrides it (checked first, above).
+  defp data_reader_default("d"), do: {:ok, {:symbol, "datom/read-query"}}
+  defp data_reader_default(_), do: :error
+
+  @doc """
+  `(data-reader! "d" 'datom/read-query)` registers a data-reader so
+  `#d[…]` reads as `(datom/read-query […])`. Rebindable, like
+  `reader-macro!`, and registered from beam-lisp source rather than wired
+  into the reader.
+  """
+  def data_reader!(tag, {:symbol, name}) when is_binary(tag) do
+    :ets.insert(:beam_lisp_vars, {{:data_reader, tag}, name})
+    name
+  end
+
+  @doc """
   `(read-data s)` — read ONE form of source as DATA. Never evaluates.
 
   This is the seam a model-written definition crosses (`spell.run`): source
@@ -2276,6 +2310,7 @@ defmodule BeamLisp.RT do
       "reduced" => &reduced/1,
       "reduced?" => &reduced?/1,
       "reader-macro!" => &reader_macro!/2,
+      "data-reader!" => &data_reader!/2,
       "read-data" => &read_data/1
     }
 
@@ -2421,6 +2456,7 @@ defmodule BeamLisp.RT do
       "pr-str" => :print_str,
       "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
+      "data-reader!" => :data_reader!,
       "read-data" => :read_data,
       "assoc" => 3,
       # (`filter` is deliberately absent: it grew a 1-arity transducer form, and

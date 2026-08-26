@@ -410,22 +410,64 @@ defmodule BeamLisp.Reader do
   defp record_or_tag(rest, pos0) do
     case atom_form(rest, pos0) do
       {:ok, {:symbol, name}, after_sym, _pos} ->
-        case after_sym do
-          [?{ | map_rest] ->
-            case map_form(map_rest, pos0) do
-              {:ok, {:map, kvs}, rest, pos} ->
-                {:ok, with_pos({:record, name, kvs}, pos0), rest, pos}
+        # A registered DATA-READER (`#d[…]`, `#d{…}`) takes precedence: read
+        # the following collection and wrap it as `(<fn> <collection>)`, the
+        # way Clojure's `*data-readers*` expands a tagged literal. The fn is
+        # a beam-lisp symbol registered via `data-reader!` from source, so
+        # `#d[…]` can validate-at-read-time and carry source position — and
+        # the whole feature is one branch here plus one ETS lookup.
+        case BeamLisp.RT.data_reader(name) do
+          {:ok, {:symbol, _} = fn_sym} ->
+            case after_sym do
+              [?[ | _] = coll_rest ->
+                wrap_data_reader(fn_sym, coll_rest, pos0)
 
-              err ->
-                err
+              [?{ | _] = coll_rest ->
+                wrap_data_reader(fn_sym, coll_rest, pos0)
+
+              _ ->
+                record_or_bare(name, after_sym, rest, pos0)
             end
 
-          _ ->
-            atom_form([?# | rest], pos0)
+          :error ->
+            record_or_bare(name, after_sym, rest, pos0)
         end
 
       _ ->
         atom_form([?# | rest], pos0)
+    end
+  end
+
+  # `#Name{…}` record literal, or the bare-symbol fallback when no `{`
+  # follows (the trailing-`#` auto-gensym path).
+  defp record_or_bare(name, after_sym, rest, pos0) do
+    case after_sym do
+      [?{ | map_rest] ->
+        case map_form(map_rest, pos0) do
+          {:ok, {:map, kvs}, rest, pos} ->
+            {:ok, with_pos({:record, name, kvs}, pos0), rest, pos}
+
+          err ->
+            err
+        end
+
+      _ ->
+        atom_form([?# | rest], pos0)
+    end
+  end
+
+  # Read the collection after a data-reader tag and wrap it as a call to the
+  # registered fn symbol: `#d[…]` → `(datom/read-query […])`.
+  defp wrap_data_reader(fn_sym, coll_rest, pos0) do
+    case form(coll_rest, pos0) do
+      {:ok, coll, rest, pos} ->
+        {:ok, with_pos({:list, [fn_sym, coll]}, pos0), rest, pos}
+
+      :none ->
+        {:error, "a data-reader tag must be followed by a collection"}
+
+      err ->
+        err
     end
   end
 
