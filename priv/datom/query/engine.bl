@@ -37,7 +37,8 @@
 
 (ns datom.query.engine
   (:require [datom.db] [datom.index] [datom.query.agg] [datom.query.parse]
-            [datom.query.plan] [datom.schema] [datom.query.analytic]))
+            [datom.query.plan] [datom.schema] [datom.query.analytic]
+            [datom.query.rules]))
 
 ;; ── unification ─────────────────────────────────────────────────────
 
@@ -195,8 +196,14 @@
                rows)))
 
 (defn eval-clause
-  "Apply one clause to one binding, yielding zero or more bindings."
-  [db bindings clause resolve-fn]
+  "Apply one clause to one binding, yielding zero or more bindings.
+
+   `rules-rel` maps each user-defined rule NAME to its materialised
+   relation (a set of value tuples), or is empty when the query uses no
+   rules. A clause invoking a rule reads that relation — the rules were
+   evaluated to a fixpoint before the main query began (see `q`), so a
+   recursive query becomes an ordinary relation read here."
+  [db bindings clause resolve-fn rules-rel]
   (cond
     (datom.query.parse/pattern-clause? clause)
       (eval-pattern db bindings clause)
@@ -205,10 +212,18 @@
     ; path would try to resolve `similar-to` as an ordinary function.
     (datom.query.parse/analytic-clause? clause)
       (eval-analytic db bindings clause resolve-fn)
+    ; a rule INVOCATION — also a call form, so it must be claimed before the
+    ; plain predicate path, and only when its name is a defined rule.
+    (and (seq rules-rel)
+         (datom.query.parse/rule-invocation? clause (set (keys rules-rel))))
+      (datom.query.rules/relation-for rules-rel
+                                      (first (get clause 0))
+                                      (into [] (rest (get clause 0)))
+                                      bindings)
     (datom.query.parse/predicate-clause? clause)
       (eval-predicate bindings clause resolve-fn)
     (datom.query.parse/rule-clause? clause)
-      (eval-rule db bindings clause resolve-fn)
+      (eval-rule db bindings clause resolve-fn rules-rel)
     :else (throw (ex-info "unrecognised clause" {:clause clause}))))
 
 (defn eval-rule
@@ -219,7 +234,7 @@
    run with its variables already bound, or it asks a question with no
    answer (`is there no ?x` over an unbound `?x` is either trivially true
    or meaningless). The planner emits it once its inputs are ready."
-  [db bindings clause resolve-fn]
+  [db bindings clause resolve-fn rules-rel]
   (let [op (get clause 0)
         subs (into [] (rest clause))]
     (cond
@@ -229,19 +244,19 @@
         ; ran the predicate first against an unbound `?a` — nil compared
         ; against 40, no filtering, every row survived.
         (reduce (fn [acc sub]
-                  (flat-into (fn [b] (eval-clause db b sub resolve-fn)) acc))
+                  (flat-into (fn [b] (eval-clause db b sub resolve-fn rules-rel)) acc))
                 [bindings]
                 (datom.query.plan/order-clauses (keys bindings) subs))
 
       (= op :or)
         ; Any sub-clause succeeding keeps the binding. Distinct, because
         ; two branches matching the same way must not double a row.
-        (into [] (distinct (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn))
+        (into [] (distinct (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn rules-rel))
                                       subs)))
 
       (= op :not)
         (let [matches (reduce (fn [acc sub]
-                                (flat-into (fn [b] (eval-clause db b sub resolve-fn)) acc))
+                                (flat-into (fn [b] (eval-clause db b sub resolve-fn rules-rel)) acc))
                               [bindings]
                               (datom.query.plan/order-clauses (keys bindings) subs))]
           (if (empty? matches) [bindings] []))
@@ -274,7 +289,7 @@
               project (fn [b] (select-keys b (into (into [] (keys bindings)) shared)))]
           (into [] (distinct
                      (mapv project
-                           (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn))
+                           (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn rules-rel))
                                       branches)))))
 
       ; `not-join` is negation with an explicit scope: it asks whether
@@ -288,7 +303,7 @@
               body (into [] (rest subs))
               scoped (select-keys bindings shared)
               matches (reduce (fn [acc sub]
-                                (flat-into (fn [b] (eval-clause db b sub resolve-fn)) acc))
+                                (flat-into (fn [b] (eval-clause db b sub resolve-fn rules-rel)) acc))
                               [scoped]
                               (datom.query.plan/order-clauses shared body))]
           (if (empty? matches) [bindings] []))
@@ -425,7 +440,7 @@
    (see `pattern-scan-once`); everything else \u2014 predicates, functions,
    rules \u2014 is per-binding, because those are pure computation over a row
    and cost the store nothing."
-  [db initial clauses resolve-fn]
+  [db initial clauses resolve-fn rules-rel]
   (get (reduce (fn [state clause]
                  (let [bindings (get state 0)
                        ; The clauses still to come. A pattern can use a
@@ -436,7 +451,7 @@
                        next-bindings
                          (if (and (datom.query.parse/pattern-clause? clause) (seq bindings))
                            (pattern-scan-once db bindings clause later)
-                           (flat-into (fn [b] (eval-clause db b clause resolve-fn))
+                           (flat-into (fn [b] (eval-clause db b clause resolve-fn rules-rel))
                                       bindings))]
                    [next-bindings later]))
                [initial (into [] clauses)]
@@ -535,16 +550,46 @@
                        (datom.query.agg/validate-find (:find parsed)))]
     (if (seq problems)
       (throw (ex-info "invalid query" {:problems problems}))
-      (let [forms (datom.query.parse/binding-forms parsed)
+      (let [; `input-forms` includes the `%` rules source, so arguments line
+            ; up positionally; `binding-forms` (variables only) is what
+            ; `bind-inputs` consumes. When a `%` form is present we split its
+            ; argument off, materialise the rules to a fixpoint, and thread
+            ; the resulting relations into evaluation.
+            in-forms (datom.query.parse/input-forms parsed)
             supplied (into [] (or inputs '()))
-            initial (if (= (count forms) (count supplied))
-                      (bind-inputs forms supplied)
-                      (throw (ex-info "wrong number of query inputs"
-                                      {:expected (count forms)
-                                       :given (count supplied)
-                                       :forms forms})))
+            _ (when (not (= (count in-forms) (count supplied)))
+                (throw (ex-info "wrong number of query inputs"
+                                {:expected (count in-forms)
+                                 :given (count supplied)
+                                 :forms in-forms})))
+            ; pair each input form with its argument, then separate the rules
+            ; argument (the one whose form is `%`) from the binding arguments.
+            rules-arg (loop [i 0]
+                        (cond
+                          (>= i (count in-forms)) nil
+                          (datom.query.parse/rules-var? (get in-forms i)) (get supplied i)
+                          :else (recur (+ i 1))))
+            binding-forms (filterv (fn [f] (not (datom.query.parse/rules-var? f))) in-forms)
+            binding-args (filterv some?
+                                  (mapv (fn [i]
+                                          (if (datom.query.parse/rules-var? (get in-forms i))
+                                            nil
+                                            [(get supplied i)]))
+                                        (range (count in-forms))))
+            binding-args (mapv (fn [w] (get w 0)) binding-args)
+            initial (bind-inputs binding-forms binding-args)
+            ; materialise the rules (if any) to their least fixpoint BEFORE
+            ; the main query runs. `eval-plain` is the callback the rules
+            ; engine uses for ordinary (non-invocation) clauses — an
+            ; `eval-clause` with no rules, since invocations are expanded by
+            ; the rules engine itself against the in-progress relations.
+            rules-rel (if (some? rules-arg)
+                        (datom.query.rules/materialise
+                          db rules-arg
+                          (fn [d b clause] (eval-clause d b clause default-resolve {})))
+                        {})
             planned (datom.query.plan/plan parsed)
-            bindings (run-clauses db initial (:where planned) default-resolve)
+            bindings (run-clauses db initial (:where planned) default-resolve rules-rel)
             find-elements (:find parsed)]
         ; With an aggregate present, the fold runs over the raw BINDINGS
         ; rather than over projected tuples — projecting first would

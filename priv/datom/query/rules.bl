@@ -1,0 +1,299 @@
+; datom/query/rules.bl — user-defined recursive rules (Datalog's `%`).
+;
+; ── What this adds, and why it is the missing half ────────────────────
+;
+; Until now the engine could JOIN and FILTER and NEGATE, but it could not
+; RECURSE: there was no way to say "reachable is an edge, OR an edge
+; followed by something reachable". That single missing primitive is what
+; separates a query language from a Datalog: transitive closure, connected
+; components, shortest paths, PageRank, same-generation — the whole family
+; of graph and fixpoint computations — are all *recursion over a relation
+; until nothing new appears*. This file is that primitive.
+;
+; A RULE is a named relation defined by one or more implications:
+;
+;   [(reachable ?a ?b) [?a :edge ?b]]                    ; base case
+;   [(reachable ?a ?b) [?a :edge ?x] (reachable ?x ?b)]  ; recursive case
+;
+; Read each as "the head holds when the body holds". The head is a call
+; form `(name arg…)`; the body is ordinary `:where` clauses, and a body
+; clause that is itself a `(name arg…)` call is a RULE INVOCATION — the
+; recursion. A query supplies rules through `:in` with the `%` symbol
+; (Datomic's spelling) and invokes them like any clause:
+;
+;   [:find ?b :in $ % ?start
+;    :where [(reachable ?start ?b)]]
+;
+; ── How it evaluates: bottom-up to a fixpoint ─────────────────────────
+;
+; Rules are materialised BOTTOM-UP: start from the facts the base rules
+; derive, then repeatedly apply the recursive rules to what is known,
+; adding whatever is new, until a round adds nothing — the least fixpoint.
+; The engine's existing top-down `run-clauses` then reads the finished
+; relation like any other source. Bottom-up is what guarantees termination
+; on cyclic graphs (a set of derived tuples cannot grow forever) where a
+; naive top-down expansion would loop.
+;
+; Two evaluators live here on purpose:
+;
+;   * `derive-naive` recomputes the WHOLE relation every round. Simple,
+;     obviously correct — the reference.
+;   * `derive-semi-naive` joins only the DELTA (facts new last round)
+;     against the base relations each round, because a fact can only be
+;     NEW this round if it used a fact that was new last round. Each
+;     derivation is done ~once instead of once per remaining round.
+;
+; They must return identical relations; `derive-semi-naive` is the one the
+; engine uses, and the profiling example measures how much the delta
+; restriction saves (it is asymptotic on deep graphs). Keeping the naive
+; version is not dead weight — it is the differential oracle that proves
+; the fast one right.
+
+(ns datom.query.rules
+  (:require [datom.query.parse]))
+
+;; `flat-into` — map a function returning a vector over a collection and
+;; concatenate the results (the engine's own helper, local here so this
+;; namespace does not depend on the engine's private surface).
+(defn- flat-into
+  [f coll]
+  (reduce (fn [acc x] (into acc (f x))) [] coll))
+
+;; ── shape ───────────────────────────────────────────────────────────
+
+(defn rule-definition?
+  "Whether `x` is a rule DEFINITION: `[(name arg…) body-clause…]` — a
+   vector whose first element is a call form (a list)."
+  [x]
+  (and (vector? x)
+       (> (count x) 0)
+       (list? (get x 0))))
+
+(defn rules?
+  "Whether `x` is a rule SET: a vector of rule definitions. This is what a
+   query's `%` input carries."
+  [x]
+  (and (vector? x)
+       (> (count x) 0)
+       (every? rule-definition? (to-list x))))
+
+(defn- rule-name [definition] (first (get definition 0)))
+(defn- rule-head-args [definition] (into [] (rest (get definition 0))))
+(defn- rule-body [definition] (into [] (rest definition)))
+
+(defn- invocation?
+  "Whether a body clause is a RULE INVOCATION of one of `names`: a call
+   form `(name arg…)` whose operator is a defined rule (not a predicate or
+   an analytic op). It is the recursion site."
+  [clause names]
+  (and (list? clause)
+       (contains? names (first clause))))
+
+(defn rule-names
+  "The set of names a rule set defines."
+  [rules]
+  (set (mapv rule-name (to-list rules))))
+
+;; ── grouping ────────────────────────────────────────────────────────
+
+(defn- rules-by-name
+  "Group definitions by head name: `{name [definition …]}`. A rule may
+   have several definitions (base + recursive cases), all contributing to
+   the one relation."
+  [rules]
+  (reduce (fn [m d]
+            (let [n (rule-name d)]
+              (assoc m n (conj (or (get m n) []) d))))
+          {}
+          (to-list rules)))
+
+;; ── one rule application over a known relation state ─────────────────
+;;
+;; `state` maps each rule name to the SET of tuples derived for it so far
+;; (each tuple a vector of values, positionally matching the head args).
+;; `eval-body` is supplied by the engine: it evaluates a NON-recursive
+;; clause list against the db and an initial binding set, returning
+;; extended bindings. That keeps this file free of the join engine — it
+;; only orchestrates the fixpoint and delegates ordinary evaluation.
+
+(defn- relation->rows
+  "Turn a relation (set of value tuples) for a rule into binding rows over
+   the invocation's argument variables. `[[1 2] [3 4]]` invoked as
+   `(reach ?x ?y)` becomes `[{?x 1 ?y 2} {?x 3 ?y 4}]`, but only tuples
+   consistent with what `binding` already fixes survive (that is the join
+   on a bound argument)."
+  [relation call-args binding]
+  (filterv some?
+           (mapv (fn [tuple]
+                   (reduce (fn [b i]
+                             (if (nil? b)
+                               nil
+                               (let [arg (get call-args i)
+                                     val (get tuple i)]
+                                 (cond
+                                   ; a variable: bind it (or check it agrees)
+                                   (datom.query.parse/variable? arg)
+                                     (if (contains? b arg)
+                                       (if (= (get b arg) val) b nil)
+                                       (assoc b arg val))
+                                   ; a constant argument: must equal the tuple
+                                   (= arg val) b
+                                   :else nil))))
+                           binding
+                           (range (count call-args))))
+                 (to-list relation))))
+
+(defn- eval-body-with-relations
+  "Evaluate one rule body against the db, treating rule-invocation clauses
+   as reads from `state` (the relations known so far) and everything else
+   as ordinary clauses via `eval-plain`.
+
+   Returns the set of value tuples the body derives for `head-args`.
+   `use-delta` names ONE rule whose invocation should read `delta` instead
+   of its full relation — the semi-naive restriction. When nil, every
+   invocation reads the full relation (the naive step)."
+  [db body head-args names state delta use-delta eval-plain]
+  ; Split the body into rule invocations and plain clauses. Plain clauses
+  ; go to the engine as a block; invocations are expanded here, each
+  ; multiplying the binding set by its relation's matching tuples.
+  (let [step (fn [rows clause]
+               (if (invocation? clause names)
+                 (let [nm (first clause)
+                       call-args (into [] (rest clause))
+                       ; the relation this invocation reads: the delta for
+                       ; the designated recursive predicate, else its full
+                       ; set. This single choice is the whole naive /
+                       ; semi-naive difference.
+                       relation (if (and (some? use-delta) (= nm use-delta))
+                                  (or (get delta nm) #{})
+                                  (or (get state nm) #{}))]
+                   (flat-into (fn [b] (relation->rows relation call-args b)) rows))
+                 ; a plain clause block: hand this single clause to the
+                 ; engine, per current row.
+                 (flat-into (fn [b] (eval-plain db b clause)) rows)))
+        final (reduce step [{}] (to-list body))]
+    (set (mapv (fn [b] (mapv (fn [a]
+                               (if (datom.query.parse/variable? a) (get b a) a))
+                             head-args))
+               final))))
+
+(defn- apply-rules-once
+  "One round of applying every definition. Returns the map of NEW tuples
+   per rule name (those not already in `state`). `use-delta` selects
+   naive (nil) vs semi-naive (read deltas for recursive self-reference)."
+  [db grouped names state delta use-delta eval-plain]
+  (reduce
+    (fn [new-map nm]
+      (let [defs (get grouped nm)
+            derived (reduce
+                      (fn [acc d]
+                        (into acc
+                              (eval-body-with-relations
+                                db (rule-body d) (rule-head-args d)
+                                names state delta use-delta eval-plain)))
+                      #{}
+                      defs)
+            known (or (get state nm) #{})
+            fresh (into #{} (filterv (fn [t] (not (contains? known t)))
+                                     (into [] derived)))]
+        (assoc new-map nm fresh)))
+    {}
+    (into [] names)))
+
+;; ── the two fixpoint evaluators ─────────────────────────────────────
+
+(defn derive-naive
+  "Least fixpoint by NAIVE evaluation: every round recomputes each rule
+   from the FULL current state, stopping when a round adds nothing. The
+   reference implementation — obviously correct, quadratically wasteful."
+  [db rules eval-plain]
+  (let [grouped (rules-by-name rules)
+        names (rule-names rules)]
+    (loop [state (reduce (fn [m n] (assoc m n #{})) {} (into [] names))
+           rounds 0]
+      (let [new-map (apply-rules-once db grouped names state {} nil eval-plain)
+            any-new (some (fn [n] (seq (get new-map n))) (into [] names))]
+        (if (not any-new)
+          [state rounds]
+          (recur (reduce (fn [m n] (assoc m n (into (get m n) (get new-map n))))
+                         state (into [] names))
+                 (+ rounds 1)))))))
+
+(defn derive-semi-naive
+  "Least fixpoint by SEMI-NAIVE evaluation.
+
+   The insight: a fact is newly derivable this round only if its
+   derivation used a fact that was newly derived LAST round. So instead of
+   re-joining the whole relation each round, join only the DELTA (last
+   round's new tuples) against the base relations. Each derivation happens
+   about once rather than once per remaining round \u2014 the asymptotic win the
+   profiling example measures.
+
+   Round 0 seeds the deltas from the base (non-recursive) derivations; each
+   later round applies rules with self-invocations reading the delta, then
+   the new tuples become the next delta."
+  [db rules eval-plain]
+  (let [grouped (rules-by-name rules)
+        names (rule-names rules)
+        empty-state (reduce (fn [m n] (assoc m n #{})) {} (into [] names))]
+    ; seed: one naive round from empty state derives the base facts.
+    (let [seed (apply-rules-once db grouped names empty-state {} nil eval-plain)
+          state0 (reduce (fn [m n] (assoc m n (get seed n))) empty-state (into [] names))]
+      (loop [state state0 delta seed rounds 1]
+        (let [any-delta (some (fn [n] (seq (get delta n))) (into [] names))]
+          (if (not any-delta)
+            [state rounds]
+            ; apply rules with self-invocations reading the delta. For each
+            ; rule we run once per recursive predicate that could feed it,
+            ; restricting THAT invocation to the delta; here we take the
+            ; simple, correct form: read the delta for the rule's own name
+            ; (direct recursion), full state for any other invocation.
+            (let [new-map (reduce
+                            (fn [acc nm]
+                              (assoc acc nm
+                                     (get (apply-rules-once
+                                            db grouped names state delta nm eval-plain)
+                                          nm)))
+                            {}
+                            (into [] names))
+                  ; keep only genuinely-new tuples (not already in state)
+                  fresh (reduce (fn [m n]
+                                  (let [known (get state n)
+                                        cand (get new-map n)]
+                                    (assoc m n (into #{} (filterv (fn [t] (not (contains? known t)))
+                                                                  (into [] cand))))))
+                                {}
+                                (into [] names))
+                  any-fresh (some (fn [n] (seq (get fresh n))) (into [] names))]
+              (if (not any-fresh)
+                [state rounds]
+                (recur (reduce (fn [m n] (assoc m n (into (get m n) (get fresh n))))
+                               state (into [] names))
+                       fresh
+                       (+ rounds 1))))))))))
+
+;; ── public: materialise a rule set to relations ─────────────────────
+
+(defn materialise
+  "Evaluate `rules` against `db` to their least fixpoint, returning
+   `{name relation}` where each relation is a set of value tuples. Uses
+   semi-naive evaluation. `eval-plain` is the engine callback for ordinary
+   (non-invocation) clauses."
+  [db rules eval-plain]
+  (get (derive-semi-naive db rules eval-plain) 0))
+
+(defn materialise-with
+  "Like `materialise` but selects the strategy (`:naive` or `:semi-naive`)
+   and returns `[relations rounds]` \u2014 used by the profiling example to
+   compare the two on identical inputs."
+  [db rules eval-plain strategy]
+  (if (= strategy :naive)
+    (derive-naive db rules eval-plain)
+    (derive-semi-naive db rules eval-plain)))
+
+(defn relation-for
+  "The materialised relation for a rule `name`, as binding rows over an
+   invocation's `call-args` consistent with `binding`. This is what the
+   engine calls when it meets a rule-invocation clause in `:where`."
+  [relations name call-args binding]
+  (relation->rows (or (get relations name) #{}) call-args binding))
