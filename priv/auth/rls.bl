@@ -1,0 +1,108 @@
+; auth/rls.bl — row-level security by clause injection.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; The token side of `auth` answers "may this principal do X?". This file
+; answers the other half — "WHICH ROWS may they see?" — and it answers it
+; the beam-lisp way: not by translating a policy into a SQL filter, but by
+; INJECTING datalog `:where` clauses into the caller's own query before it
+; runs. The app writes one query, RLS-innocent; `auth` rewrites it, for
+; this principal, into a query that can only return their rows.
+;
+; This is the payoff of the "one datalog" thesis on the query side. A
+; token's `check if …` and an RLS `:where` clause are the SAME kind of
+; value, evaluated by the SAME datom engine — so a capability and a row
+; filter compose without a translation layer between two worlds.
+;
+; ── Why injection, not post-filtering ────────────────────────────────
+;
+; Filtering rows AFTER the query has read them leaks two things: work (the
+; store reads rows the principal will never see) and existence (a
+; forbidden row that is fetched-then-dropped can still be timed or
+; counted). Injecting the constraint into the `:where` means the store
+; never selects the forbidden rows at all — enumeration-safe by
+; construction, the same reason Ash's filter-checks filter rather than
+; forbid. A hidden row is ABSENT, never an error.
+;
+; ── Composition with time-travel ─────────────────────────────────────
+;
+; The injected clauses are just more `:where` clauses; they carry no basis
+; of their own. They are evaluated against whatever db value the caller
+; holds — current, `as-of`, or `since` — uniformly, because the datom
+; engine neither knows nor cares which basis it runs against. So a
+; capability filters a historical view exactly as it filters the present
+; one, with no extra machinery. A grant scoped to "current only" is
+; expressible as an ordinary clause on the basis, not a special case here.
+
+(ns auth.rls
+  (:require [datom.query.parse :as parse]))
+
+;; ── the core: splice clauses into a query ───────────────────────────
+
+(defn inject
+  "Return `query` with `extra-clauses` appended to its `:where`.
+
+   Accepts either query form (the flat `[:find … :where …]` vector or the
+   `{:find … :where …}` map) and always returns the MAP form, because the
+   map is what a programmatically-assembled query wants and it round-trips
+   through datom's `q` unchanged. Appending (rather than prepending) keeps
+   the caller's clauses first, so the planner still sees the user's most
+   selective clause where it expects it; the scoping clauses narrow the
+   result further, never widen it.
+
+   Injection is monotonic on results: adding a conjunctive `:where` clause
+   can only REMOVE rows from the answer, never add any. That is the
+   property that makes this safe — an injected filter is incapable of
+   granting access to a row the unfiltered query would not have returned."
+  [query extra-clauses]
+  (let [parsed (parse/parse query)]
+    {:find (:find parsed)
+     :in (:in parsed)
+     :where (into (:where parsed) extra-clauses)}))
+
+;; ── deriving the filter for a principal ─────────────────────────────
+
+(defn owner-filter
+  "Clauses that restrict `row-var` to rows owned by `principal` via
+   `owner-attr`.
+
+   e.g. `(owner-filter '?doc :doc/owner \"alice\")` yields
+   `[[?doc :doc/owner \"alice\"]]` — the single clause that, joined into a
+   query binding `?doc`, keeps only Alice's documents. The principal is a
+   CONSTANT here (the bearer's identity, already known), so the clause
+   binds nothing new; it only constrains `?doc`.
+
+   This is the simplest and most common row filter — direct ownership.
+   Richer filters (membership, role, hierarchy) are just more clauses, and
+   `inject` takes any vector of them, so this is a convenience for the
+   ownership case rather than the only shape RLS supports."
+  [row-var owner-attr principal]
+  [[row-var owner-attr principal]])
+
+(defn attribute-filter
+  "Clauses restricting `row-var`'s `attr` to the constant `value`.
+
+   Generalises `owner-filter` to any attribute equality — e.g. limiting
+   rows to a tenant (`[?row :row/tenant \"acme\"]`) or a visibility flag
+   (`[?row :row/public true]`). Composable: several attribute filters in
+   one `inject` call AND together, because conjunctive clauses intersect."
+  [row-var attr value]
+  [[row-var attr value]])
+
+;; ── guarded query assembly ──────────────────────────────────────────
+
+(defn guarded
+  "Rewrite `query` for a principal, injecting every clause in `filters`.
+
+   `filters` is a vector of clause-vectors (each what `owner-filter` /
+   `attribute-filter` returns); they are concatenated and appended to the
+   query's `:where`. The result is a normal datom query the caller runs
+   with `datom/q` against any db value — the RLS is now IN the query, so
+   there is no separate enforcement step to forget.
+
+   Returning the query (rather than running it) keeps this layer pure and
+   composable: the caller supplies the db and the basis, and can inspect
+   or further-compose the guarded query before executing it — the same
+   'query is a value' property datom rests on."
+  [query filters]
+  (inject query (into [] (mapcat (fn [f] f) filters))))
