@@ -804,6 +804,130 @@ made it unreliable — and it cannot spin forever anyway, since every failed
 iteration means another writer *succeeded*. The system makes progress even
 when one caller does not.
 
+= Schema migrations
+
+Growing a schema is safe: a new attribute breaks nothing, because no existing
+datom mentions it. The dangerous changes are the ones that *tighten* an
+invariant --- "email is now unique", "role is now single-valued". Whether such a
+change is safe is not a fact about the schema. It is a fact about the *data*.
+"Email is unique" is fine on a database where emails happen to be unique and a
+corruption on one where they are not.
+
+And the database that decides is *production*, whose data shapes a developer's
+laptop has never seen. A migration that passes every local test can still break
+against the one database that matters. This is the problem `datom.migrate`
+exists to solve, and it can only be solved because two properties of the system
+below it were already true.
+
+== A migration is one value
+
+```
+{:migration/id     :2026-08-26-unique-email   ; ordered, immutable name
+ :migration/grows  [{:db/ident :person/email  ; the schema delta (data)
+                     :db/valueType :db.type/string
+                     :db/unique :db.unique/identity}]
+ :migration/checks [{:check :unique :attr :person/email}]  ; the invariant
+ :migration/fn     (fn [db] (dedup-unique db :person/email))} ; the remediation
+```
+
+The schema delta, the invariant it tightens, and the remediation that makes that
+invariant true travel together, because they are one decision. `:grows` is
+ordinary transaction data. `:checks` are questions only the data can answer,
+expressed as queries. `:fn` is a function of a database value returning the
+retractions that fix the invariant --- a *transaction function*, run in the
+writer against the transaction's own before-value.
+
+== `plan`: walk production before you deploy
+
+Because a database is a *value*, previewing a migration against production is a
+read. `plan` takes a database value --- a local one, or one pulled from a
+production replica --- and reports every way the migration would break against
+the data actually present, naming the offending entities. It commits nothing; it
+cannot, because a value has nowhere to commit to.
+
+```
+(datom.migrate/plan prod-db migration)
+;; => {:status :breaking
+;;     :breaking [{:check :unique :attr :person/email
+;;                 :value "dup@x" :entities [7 8]}]
+;;     ...}
+```
+
+This is the feature the value model uniquely affords. A place-oriented
+migration tool cannot preview a data-dependent constraint against production
+without running it, because its migrations are not values and its database is
+not one either. Here it is the deploy gate: run `plan` against production in CI,
+and a breaking migration is a non-zero exit before anything ships --- caught by
+data shapes the local database has never had.
+
+== `apply!`: remediate, re-check, grow --- atomically
+
+Applying a tightening migration to messy data is a sequence that must not tear:
+first make the invariant true (the remediation), then enforce it (the grow),
+then record that it happened (the ledger). If a crash could land between the
+remediation and the record, a resumed migration would not know it had already
+fixed the data.
+
+So `apply!` folds all three into *one transaction*. The remediation's
+retractions, the schema deltas (written as tempid maps that *upsert* on
+`:db/ident`, so re-running creates no duplicate attribute entity), and the
+ledger stamp commit as a single unit --- atomic on redb by its
+`WriteTransaction`, serialized by the single writer. Either the whole migration
+committed or none of it did.
+
+Before committing, `apply!` previews the remediation through `with` (the
+speculative transaction described below) and re-checks the invariants on the result. If the
+remediation leaves any invariant still broken --- the migration author's
+assumption about the data was wrong --- it *refuses*, returning `:blocked` with
+the residual violations rather than committing a schema its data violates.
+
+== The ledger is a query
+
+Which migrations have run is answered by `[?m :migration/id ?id]`, not by a
+`schema_migrations` table beside the data. A database whose premise is one
+uniform store should not keep this record somewhere else --- and a
+query-derived ledger is automatically consistent with the transaction that
+wrote it, because it *is* that transaction's datom. Idempotence and
+crash-resume follow for free: applying an already-recorded migration is a no-op,
+and a reopened database recovers the ledger from datoms like everything else.
+
+== The two primitives underneath
+
+Migrations added almost no new machinery. They rest on two small, general
+primitives, each of which was already half-built in the layers below.
+
+`with` --- a *speculative transaction*. `(with conn tx-data)` runs the exact
+pipeline `transact!` runs, but commits into an *overlay* of the store (a
+read-through view whose writes land in a private buffer the base never sees) and
+advances no basis. It returns the database value that *would* result. The writer
+path already built that value; `with` is that path minus the commit. It needed
+one insight to be cheap: datom writes are all `:put` of new keys --- a
+retraction is a new key, never a delete --- so the overlay only ever *adds*
+keys and never has to mask the base. Zero copy, and a dry-run transfers only the
+columns it reads.
+
+`:db/fn` --- a *transaction function*. `[:db/fn f & args]` in transaction data
+runs `f` against the before-value and splices its output into the same
+transaction, which then flows through the identical resolve, validate, realize and
+commit path as hand-written ops. A transaction function is a macro over
+transaction data, not a second write path; its datoms are validated like any
+others and commit atomically with them. This is what lets a migration's
+remediation and the record of it share one commit.
+
+== One bug the atomicity surfaced
+
+Folding a remediation and a schema grow into one transaction exposed a latent
+defect in index backfill. When an attribute gains an index, its existing datoms
+must be written into the new index. The backfill read them with a *raw store
+scan* --- which returns tombstoned assertions, because a retraction appends
+rather than deletes. So a migration that retracted a value and indexed the
+attribute in the same commit had its retraction silently *undone* by the
+backfill that followed: the raw scan re-indexed the value the transaction had
+just retracted. The fix is to backfill from a basis- and retraction-filtered
+database value, not the raw store --- the same filter every other read already
+goes through. The bug predated migrations; only a change that retracts and
+indexes at once could reach it.
+
 = What is not implemented
 
 Stated plainly, because a list of what a system does not do is more useful than
