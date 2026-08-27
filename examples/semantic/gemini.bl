@@ -32,7 +32,7 @@
 ; `embed-doc` and `embed-query` set these; `embed` defaults to document.
 
 (ns semantic.gemini
-  (:require [datom.vector]))
+  (:require [datom.vector] [semantic.shape]))
 
 (def MODEL "gemini-embedding-001")
 (def DIM 768)                      ; Matryoshka-truncated from 3072; smaller
@@ -150,3 +150,142 @@
    progress readout during a bulk ingest."
   [text task]
   (File/exists? (cache-path text task)))
+
+;; ── text generation (for entity extraction & community summaries) ───
+;;
+;; GraphRAG needs the model to WRITE as well as embed: to read a passage and
+;; name the entities in it (example 13), and to summarise a community of
+;; entities (example 14). These go to the generateContent endpoint. Same
+;; caching discipline — a prompt's completion is cached by its hash, so an
+;; extraction pass is paid once.
+
+(def GEN-MODEL "gemini-3.6-flash")
+(def GEN-CACHE-DIR ".gencache")
+
+(defn- gen-cache-path
+  [prompt]
+  (str GEN-CACHE-DIR "/"
+       (subs (String/downcase (Base/encode16 (crypto/hash :sha256 (str GEN-MODEL "|" prompt))))
+             0 32)
+       ".txt"))
+
+(defn- call-generate
+  "POST `prompt` to generateContent, returning the model's text reply."
+  [prompt]
+  (ensure-inets)
+  (let [url (erlang/binary_to_list
+              (str "https://generativelanguage.googleapis.com/v1beta/models/"
+                   GEN-MODEL ":generateContent"))
+        payload (Jason/encode!
+                  {"contents" (to-list [{"parts" (to-list [{"text" prompt}])}])
+                   "generationConfig" {"temperature" 0.2}})
+        headers (to-list [(erlang/list_to_tuple
+                            (to-list [(erlang/binary_to_list "x-goog-api-key")
+                                      (erlang/binary_to_list (api-key))]))])
+        request (erlang/list_to_tuple
+                  (to-list [url headers
+                            (erlang/binary_to_list "application/json")
+                            payload]))
+        result (httpc/request :post request (to-list []) (to-list []))]
+    (if (= (erlang/element 1 result) :ok)
+      (let [resp (erlang/element 2 result)
+            status (erlang/element 2 (erlang/element 1 resp))
+            body (erlang/list_to_binary (erlang/element 3 resp))]
+        (if (= status 200)
+          (let [parsed (Jason/decode! body)
+                candidate (get (into [] (get parsed "candidates")) 0)
+                parts (into [] (get (get candidate "content") "parts"))]
+            ; a part carries `text` (and possibly a `thoughtSignature` we
+            ; ignore); the answer is the first part's text.
+            (get (get parts 0) "text"))
+          (throw (ex-info (str "Gemini generateContent failed (HTTP " status ")")
+                          {:status status :body body}))))
+      (throw (ex-info "Gemini generate transport error"
+                      {:error (erlang/element 2 result)})))))
+
+(defn generate
+  "The model's text reply to `prompt`, cached by prompt hash. Deterministic
+   enough (low temperature) that a cached extraction is stable across runs."
+  [prompt]
+  (let [path (gen-cache-path prompt)]
+    (if (File/exists? path)
+      (File/read! path)
+      (let [reply (call-generate prompt)]
+        (File/mkdir_p! GEN-CACHE-DIR)
+        (File/write! path reply)
+        reply))))
+
+;; ── STRUCTURED generation (schema-constrained JSON) ────────────────
+;;
+;; The beam-lispy way to get DATA out of the model instead of prose. The
+;; caller passes a SHAPE (semantic.shape's data grammar); we derive the JSON
+;; Schema from it and hand it to Gemini's `responseSchema`, so the reply is
+;; guaranteed-shaped JSON we decode straight to a value — no regex, no
+;; "parse the model's markdown". One shape declaration drives both the
+;; request (schema) and, if you want it, the validation (semantic.shape's
+;; `valid?`). This is "one definition, many representations" applied to an
+;; LLM call.
+
+(defn- call-generate-structured
+  "POST `prompt` with a `responseSchema` derived from `shape`, returning the
+   decoded value (already JSON-parsed)."
+  [prompt shape]
+  (ensure-inets)
+  (let [url (erlang/binary_to_list
+              (str "https://generativelanguage.googleapis.com/v1beta/models/"
+                   GEN-MODEL ":generateContent"))
+        payload (Jason/encode!
+                  {"contents" (to-list [{"parts" (to-list [{"text" prompt}])}])
+                   "generationConfig"
+                   {"temperature" 0.2
+                    "responseMimeType" "application/json"
+                    ; the schema is DERIVED from the shape, never hand-written
+                    "responseSchema" (semantic.shape/->json-schema shape)}})
+        headers (to-list [(erlang/list_to_tuple
+                            (to-list [(erlang/binary_to_list "x-goog-api-key")
+                                      (erlang/binary_to_list (api-key))]))])
+        request (erlang/list_to_tuple
+                  (to-list [url headers
+                            (erlang/binary_to_list "application/json")
+                            payload]))
+        result (httpc/request :post request (to-list []) (to-list []))]
+    (if (= (erlang/element 1 result) :ok)
+      (let [resp (erlang/element 2 result)
+            status (erlang/element 2 (erlang/element 1 resp))
+            body (erlang/list_to_binary (erlang/element 3 resp))]
+        (if (= status 200)
+          (let [parsed (Jason/decode! body)
+                candidate (get (into [] (get parsed "candidates")) 0)
+                parts (into [] (get (get candidate "content") "parts"))
+                json-text (get (get parts 0) "text")]
+            ; the model's reply is itself JSON (responseMimeType), so decode
+            ; it once more into the actual value the shape describes.
+            (Jason/decode! json-text))
+          (throw (ex-info (str "Gemini structured generate failed (HTTP " status ")")
+                          {:status status :body body}))))
+      (throw (ex-info "Gemini structured transport error"
+                      {:error (erlang/element 2 result)})))))
+
+(defn generate-structured
+  "Generate a VALUE conforming to `shape` from `prompt`, cached.
+
+   `shape` is a `semantic.shape` declaration (e.g.
+   `[:list {:name :string :kind [:enum \"person\" \"place\"]}]`). The JSON
+   Schema handed to the model is derived from it, the reply is decoded, and
+   — because the shape is data — checked against the SAME declaration before
+   it is returned or cached. A reply that fails the shape raises rather than
+   poisoning the cache with malformed data."
+  [prompt shape]
+  (let [; the cache key folds in the shape, so changing the schema
+        ; invalidates stale completions.
+        key-prompt (str (pr-str shape) "|" prompt)
+        path (gen-cache-path key-prompt)]
+    (if (File/exists? path)
+      (Jason/decode! (File/read! path))
+      (let [value (call-generate-structured prompt shape)]
+        (if (semantic.shape/valid? shape value)
+          (do (File/mkdir_p! GEN-CACHE-DIR)
+              (File/write! path (Jason/encode! value))
+              value)
+          (throw (ex-info "model reply did not conform to shape"
+                          {:shape shape :value value})))))))
