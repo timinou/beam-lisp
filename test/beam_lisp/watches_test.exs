@@ -100,7 +100,7 @@ defmodule BeamLisp.WatchesTest do
   end
 
   describe "spell.st connector" do
-    defp connector(body), do: eval(File.read!("spell/study/spell/st.bl") <> "\n" <> body)
+    defp connector(body), do: eval(File.read!("test/fixtures/bl/st-connector.bl") <> "\n" <> body)
 
     test "an ordinary swap! pushes the declared signals" do
       result =

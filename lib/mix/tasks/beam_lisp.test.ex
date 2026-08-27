@@ -24,12 +24,15 @@ defmodule Mix.Tasks.BeamLisp.Test do
     {opts, args} = OptionParser.parse!(args, strict: [path: :keep], aliases: [p: :path])
     for {:path, dir} <- opts, do: BeamLisp.Env.add_search_path(dir)
 
-    # `spell/src` is this repo's own library root, so a suite requiring
-    # `spell.machine` resolves without every invocation repeating `--path`.
-    # Added only when it exists, so the task stays correct in a checkout
-    # that does not carry spell/. An explicit --path still outranks it:
-    # add_search_path preserves insertion order.
-    if File.dir?(BeamLisp.Spell.src_path()), do: BeamLisp.Env.add_search_path(BeamLisp.Spell.src_path())
+    # The CURRENT project's `src/` is the library-root convention (the
+    # consumer apps — interface, spell, relay — keep their namespaces there),
+    # so a suite requiring the project's own namespaces resolves without
+    # every invocation repeating `--path`. Added only when it exists, so the
+    # task stays correct in a checkout (like this one) with no src/. An
+    # explicit --path still outranks it: add_search_path preserves insertion
+    # order.
+    src = Path.join(File.cwd!(), "src")
+    if File.dir?(src), do: BeamLisp.Env.add_search_path(src)
 
     paths =
       case args do

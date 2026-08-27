@@ -34,10 +34,10 @@ defmodule BeamLisp.MixProject do
       # Per-project, NOT `config :beam_lisp` — the compiler is recursive, so
       # an app that depends on this one would otherwise impose its own
       # source dir here and `priv/` would never be compiled.
-      # Both trees this library ships: `priv/` (core, datom, optics) and
-      # `spell/src` (the contract/view stack). A consumer AOT-compiling a
-      # namespace that requires `spell.contract` needs the second one too.
-      beam_lisp: [source_dirs: ["priv", "spell/src"]],
+      # `priv/` (core, datom, optics) — the language libraries. The
+      # contract/view stack lives in the :interface app of the spell repo
+      # since the extraction; beam-lisp is the language again.
+      beam_lisp: [source_dirs: ["priv"]],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present
       # before anything tries to load it.
@@ -60,14 +60,7 @@ defmodule BeamLisp.MixProject do
 
   def application do
     [
-      # :inets/:ssl are the AGENT cluster's transport. Without them declared,
-      # Mix leaves them off the code path entirely -- `:code.lib_dir(:inets)`
-      # returns {:error, :bad_name}, and `:inets.start()` succeeds anyway
-      # because it only starts what it can find. The failure then surfaces
-      # LATER and misleadingly, as `:http_util.timestamp/0 is undefined`,
-      # which reads like a broken OTP install rather than a missing dep.
-      # (Recorded in PLAN-017 as "the :httpc-under-mix open question".)
-      extra_applications: [:logger, :inets, :ssl, :crypto],
+      extra_applications: [:logger],
       mod: {BeamLisp.Application, []}
     ]
   end
@@ -75,23 +68,13 @@ defmodule BeamLisp.MixProject do
   defp deps do
     [
       {:tidewave, "~> 0.5", only: :dev},
-      # Bandit is the endpoint's adapter (config/config.exs), so it is no
-      # longer dev-only: the seam's server half needs an HTTP server wherever
-      # spell runs.
-      {:bandit, "~> 1.5"},
-      # The seam's client+server halves: `Spacetime.LiveView` and the
-      # `SpacetimeBridge` hook. Both used to be PORTED copies in this repo —
-      # lib/spacetime/live_view.ex said so in its own moduledoc — and a copied
-      # wire protocol drifts from the one it was copied from. It is a
-      # dependency now, so a fix lands once.
-      {:spacetime_phoenix, path: "../../ora/verse/elixir/spacetime_phoenix"},
-      # The seam's server half: the emitted page declares `@host $chat :
-      # live("SpellWeb.ChatLive")` and its signals ride the LiveView channel
-      # (window.__stLiveBridge). Phoenix is a LIBRARY here — the endpoint
-      # joins this app's own supervision tree; there is no second app.
-      {:phoenix, "~> 1.8"},
-      {:phoenix_live_view, "~> 1.1"},
-      {:phoenix_pubsub, "~> 2.1"},
+      # Bandit backs the dev-only Tidewave playground (lib/dev/dev_server.ex).
+      # `only: :dev` again: the spell endpoint it used to serve moved to the
+      # spell repo with the extraction.
+      {:bandit, "~> 1.5", only: :dev},
+      # examples/datom/live/06-projector.bl starts a PubSub as its broadcast
+      # transport; the examples run only under `mix test`.
+      {:phoenix_pubsub, "~> 2.1", only: :test},
       # Rustler is a Rust-side dependency of native/datom_redb (see its
       # Cargo.toml). It is NOT needed as a Mix dep: `defnative` builds
       # and loads the crate itself, via the :beam_lisp_native compiler.
