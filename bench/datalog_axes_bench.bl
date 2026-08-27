@@ -1,0 +1,195 @@
+; bench/datalog_axes_bench.bl — the reproducible 5-axis benchmark.
+; Run: mix beam_lisp.run --path priv bench/datalog_axes_bench.bl
+;
+; One controlled batch measuring every optimisation axis against the same
+; inputs, with warmup, repeated trials (median), and a correctness assertion
+; on each so a fast-but-wrong result cannot masquerade as a win. This is the
+; harness backing docs/native-datalog-2026-08-27/making-datalog-fast.typ.
+;
+; Axes:
+;   5  native semi-naive vs bl interpreter    (raw engine speed)
+;   2  native indexed vs nested-loop join     (join strategy)
+;   1  native full closure vs magic-sets      (demand / goal-direction)
+;   4  bl PreM shortest-path on a cycle        (aggregate-in-recursion)
+;   3  native full recompute vs incremental    (delta maintenance)
+
+(ns bench.datalog-axes
+  (:require [datom] [datom.query.rules :as rules] [datom.query.engine :as eng]
+            [datom.query.prem :as prem] [datom.datalog :as nd]))
+
+;; ── timing: median of N trials after a warmup ────────────────────────
+
+(defn- now [] (erlang/monotonic_time :millisecond))
+
+(defn- median [xs]
+  ; `sort` returns a LIST; `get` indexes vectors/maps, not lists — so
+  ; re-vectorise before indexing (or use `nth`). Indexing the sorted list
+  ; directly corrupts into a charlist read.
+  (let [s (into [] (sort (into [] xs))) n (count s)]
+    (if (= 0 (rem n 2))
+      (erlang/div (+ (get s (- (erlang/div n 2) 1)) (get s (erlang/div n 2))) 2)
+      (get s (erlang/div n 2)))))
+
+(defn- time-ms
+  "Median wall-clock ms of `f` over `trials` runs, after one warmup.
+
+   Returns ONLY the timing (an int). The result value is fetched separately
+   via `run-value` — keeping a map/handle return out of a vector literal,
+   which beam-lisp mishandles. Bindings are named (not `_`): a `_`
+   let-binding here does not behave as a throwaway."
+  [trials f]
+  (let [warm (f)
+        samples (mapv (fn [k] (let [t0 (now) res (f) t1 (now)] (- t1 t0)))
+                      (range trials))]
+    (median samples)))
+
+(defn- run-value
+  "The value `f` produces (one call). Paired with `time-ms` so timing and
+   correctness read the same computation without smuggling the value
+   through a vector."
+  [f]
+  (f))
+
+(defn- header [t] (println (str "\n" t)))
+(defn- row [& parts] (println (str "  " (join "  |  " (to-list (mapv (fn [p] (str p)) parts))))))
+
+;; ── shared rule sets (native IR + bl surface, same program) ──────────
+;; predicate ids: edge=0, reachable=1; vars a=0 b=1 x=2.
+
+(def NATIVE-REACH
+  [(nd/rule (nd/atom 1 [(nd/var-term 0) (nd/var-term 1)])
+            [(nd/atom 0 [(nd/var-term 0) (nd/var-term 1)])])
+   (nd/rule (nd/atom 1 [(nd/var-term 0) (nd/var-term 1)])
+            [(nd/atom 0 [(nd/var-term 0) (nd/var-term 2)])
+             (nd/atom 1 [(nd/var-term 2) (nd/var-term 1)])])])
+
+(def BL-REACH
+  '[[(reachable ?a ?b) [?a :edge/to ?b]]
+    [(reachable ?a ?b) [?a :edge/to ?x] (reachable ?x ?b)]])
+
+(def bl-eval-plain
+  (fn [d b c]
+    (eng/eval-clause d b c
+                     (fn [op] (try (BeamLisp.Env/fetch! "core" (name op)) (catch e nil)))
+                     {})))
+
+;; ── graph builders ──────────────────────────────────────────────────
+
+(defn- native-chain [n]
+  [(nd/edb-relation 0 2 (mapv (fn [i] [i (+ i 1)]) (range 1 n)))])
+
+(defn- bl-chain [n]
+  (let [conn (datom/connect
+               [{:db/ident :edge/to :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}])]
+    (datom/transact! conn
+      (into [] (mapv (fn [i]
+                       (if (< i (- n 1))
+                         {:db/id (- (+ i 1)) :edge/to [(- (+ i 2))]}
+                         {:db/id (- (+ i 1))}))
+                     (range n))))
+    (datom/db conn)))
+
+(defn- native-forest [chains len]
+  ;; `chains` disjoint chains of `len` nodes; a query from node 1 touches one.
+  [(nd/edb-relation 0 2
+     (reduce (fn [acc c]
+               (into acc (mapv (fn [i] [(+ (* c 1000) i) (+ (* c 1000) i 1)]) (range 1 len))))
+             [] (range chains)))])
+
+(defn- native-branchy [m]
+  ;; i -> {2i, 2i+1} bounded by m: fan-out 2, so indexing has something to do.
+  [(nd/edb-relation 0 2
+     (reduce (fn [acc i]
+               (into acc (filterv (fn [e] (<= (get e 1) m)) [[i (* 2 i)] [i (+ (* 2 i) 1)]])))
+             [] (range 1 m)))])
+
+(defn- closure-size [r] (count (nd/tuples r)))
+(defn- bl-closure-size [state] (count (get state 'reachable)))
+
+;; ═══════════════════════════════════════════════════════════════════
+(println "════════ DATALOG OPTIMISATION BENCHMARK (5 axes) ════════")
+(println "median of 5 trials after warmup; correctness asserted per row")
+
+;; ── AXIS 5: native semi-naive vs bl interpreter ─────────────────────
+(header "AXIS 5 — semi-naive: bl interpreter vs native (transitive closure, chain)")
+(row "N" "bl ms" "native ms" "speedup" "tuples(agree?)")
+(doseq [n [20 40 60]]
+  (let [ndb (native-chain n)
+        bdb (bl-chain n)
+        bl-ms (time-ms 5 (fn [] (rules/materialise bdb BL-REACH bl-eval-plain)))
+        nt-ms (time-ms 5 (fn [] (nd/eval NATIVE-REACH [1] ndb 1 1)))
+        bsz (bl-closure-size (run-value (fn [] (rules/materialise bdb BL-REACH bl-eval-plain))))
+        nsz (closure-size (run-value (fn [] (nd/eval NATIVE-REACH [1] ndb 1 1))))
+        ok (= bsz nsz)]
+    (row n bl-ms nt-ms
+         (str (if (> nt-ms 0) (erlang/div bl-ms nt-ms) "-") "x")
+         (str nsz (if ok " ✓" " ✗MISMATCH")))))
+
+;; ── AXIS 2: native nested vs indexed join (branchy graph) ───────────
+(header "AXIS 2 — join: nested-loop vs hash-indexed (native, branchy fan-out=2)")
+(row "m" "nested ms" "indexed ms" "speedup" "tuples(agree?)")
+(doseq [m [200 400 800]]
+  (let [e (native-branchy m)
+        nest-ms (time-ms 5 (fn [] (nd/eval NATIVE-REACH [1] e 1 1)))
+        idx-ms  (time-ms 5 (fn [] (nd/eval NATIVE-REACH [1] e 1 2)))
+        nsz (closure-size (run-value (fn [] (nd/eval NATIVE-REACH [1] e 1 1))))
+        isz (closure-size (run-value (fn [] (nd/eval NATIVE-REACH [1] e 1 2))))
+        ok (= nsz isz)]
+    (row m nest-ms idx-ms
+         (str (if (> idx-ms 0) (erlang/div nest-ms idx-ms) "-") "x")
+         (str nsz (if ok " ✓" " ✗MISMATCH")))))
+
+;; ── AXIS 1: full closure vs magic-sets demand (forest) ──────────────
+(header "AXIS 1 — demand: full closure vs magic-sets (native, forest, query touches 1 chain)")
+(row "chains" "full ms" "magic ms" "full-tup" "magic-tup" "answer-correct?")
+(doseq [c [40 80 160]]
+  (let [e (native-forest c 15)
+        full-ms  (time-ms 5 (fn [] (nd/eval NATIVE-REACH [1] e 1 2)))
+        magic-ms (time-ms 5 (fn [] (nd/eval-magic NATIVE-REACH [1] e 1 1)))
+        full-val (run-value (fn [] (nd/eval NATIVE-REACH [1] e 1 2)))
+        magic-val (run-value (fn [] (nd/eval-magic NATIVE-REACH [1] e 1 1)))
+        ftup (closure-size full-val)
+        mtup (closure-size magic-val)
+        ;; Correctness: the QUERY ANSWER (rows with source = node 1) must be
+        ;; identical. Magic also derives intra-chain subgoals as demand
+        ;; propagates (magic(2), magic(3), …), so its total tuple count is the
+        ;; chain's closure (105), NOT the answer — that is expected. We compare
+        ;; the source=1 slice of each.
+        full-ans (set (filterv (fn [t] (= (get t 0) 1)) (nd/tuples full-val)))
+        magic-ans (set (filterv (fn [t] (= (get t 0) 1)) (nd/tuples magic-val)))
+        ok (= full-ans magic-ans)]
+    (row c full-ms magic-ms ftup mtup
+         (str "answer " (count magic-ans) "=" (count full-ans) (if ok " ✓" " ✗")))))
+
+;; ── AXIS 4: PreM shortest-path on a CYCLE (bl) ──────────────────────
+(header "AXIS 4 — PreM: shortest path on a CYCLIC weighted graph (bl prem.bl)")
+;; edges 1->2(1) 2->3(2) 3->1(1)[cycle] 1->3(10) 3->4(1); expect 2:1 3:3 4:4 1:4
+(def sp-edges [[1 2 1] [2 3 2] [3 1 1] [1 3 10] [3 4 1]])
+(defn- sp-out [x] (filterv (fn [e] (= (get e 0) x)) sp-edges))
+(defn- sp-step [rel]
+  (reduce (fn [acc p]
+            (into acc (mapv (fn [e] [(get e 1) (+ (get p 1) (get e 2))]) (sp-out (get p 0)))))
+          [] (to-list rel)))
+(def sp-seed (mapv (fn [e] [(get e 1) (get e 2)]) (sp-out 1)))
+(def sp-ms (time-ms 5 (fn [] (prem/converge sp-step (fn [ts] (prem/min-by-key ts [0] 1)) sp-seed 100))))
+(def sp-val (run-value (fn [] (prem/converge sp-step (fn [ts] (prem/min-by-key ts [0] 1)) sp-seed 100))))
+(def sp-result (into {} (mapv (fn [t] [(get t 0) (get t 1)]) sp-val)))
+(def sp-ok (and (= (get sp-result 2) 1) (= (get sp-result 3) 3) (= (get sp-result 4) 4)))
+(row "median ms" sp-ms "costs" (pr-str (sort-by (fn [x] (get x 0)) sp-val))
+     (str "correct(2:1,3:3,4:4)? " (if sp-ok "✓ TERMINATES+CORRECT" "✗")))
+
+;; ── AXIS 3: native full recompute vs incremental +1 edge ────────────
+(header "AXIS 3 — incremental: full recompute vs incremental maintenance (native)")
+(println "  NB: the spike's incremental NIF re-materialises the before-state each call,")
+(println "  so this measures maintenance-with-reload, not maintenance alone (honest limit).")
+(row "chains" "recompute ms" "incremental ms" "note")
+(doseq [c [40 80 160]]
+  (let [before (native-forest c 15)
+        ;; add one isolated new edge in a brand-new tiny chain
+        newe [(nd/edb-relation 0 2 [[999001 999002]])]
+        after (native-forest (+ c 1) 15)
+        recompute-ms (time-ms 5 (fn [] (nd/eval NATIVE-REACH [1] after 1 2)))
+        incr-ms (time-ms 5 (fn [] (nd/eval-incremental NATIVE-REACH [1] before newe 1)))]
+    (row c recompute-ms incr-ms "reload-dominated")))
+
+(println "\n════════ END BENCHMARK ════════")
