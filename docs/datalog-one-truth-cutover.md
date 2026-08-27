@@ -38,16 +38,16 @@ responsibilities do not overlap — that is what makes it one truth.
   evaluator: `ir.rs` gained `BodyItem::Computed` + `Op` (saturating
   `+ - * min max` and the six comparisons), so arithmetic-in-recursion
   (shortest path) runs natively. `eval.rs` walks `BodyItem`s.
-- `priv/datom/query/rules-native.bl` — **`materialise-native`**, a drop-in for
+- `priv/datom/query/fixpoint.bl` — **`materialise`**, a drop-in for
   `rules/materialise` (same signature, same `{name tuple-set}` output). It:
   1. evaluates each pattern/plain clause with bl's engine → **base relations**;
   2. translates rules → native IR (atoms + computed items);
   3. runs the native fixpoint **once** (one boundary crossing);
   4. decodes tuples → values.
-  Plus **`native-compatible?`** — the exact boundary (below).
-- `test/bl/datom/rules_native_test.bl` — 6 tests / 14 assertions, checked
+  Plus **`compatible?`** — the exact boundary (below).
+- `test/bl/datom/fixpoint_test.bl` — 6 tests / 14 assertions, checked
   against **closed-form math**, never a bl twin.
-- `bench/rules_native_bench.bl` — the end-to-end benchmark.
+- `bench/fixpoint_bench.bl` — the end-to-end benchmark.
 
 ## Verification: against the spec, not a twin
 
@@ -66,7 +66,7 @@ specification. The tests assert:
 A property that holds against math proves correctness; a bl mirror would prove
 only that two copies agree.
 
-## The boundary (exact, enforced by `native-compatible?`)
+## The boundary (exact, enforced by `compatible?`)
 
 The native fixpoint is complete for a body clause that is one of:
 
@@ -119,19 +119,19 @@ dispatch point — so `q` changed **not at all** and now runs native for free.
 
 ```clojure
 (defn materialise [db rules eval-plain]
-  (if (datom.query.rules-native/native-compatible? rules)
-    (datom.query.rules-native/materialise-native db rules eval-plain)  ; native kernel
+  (if (datom.query.fixpoint/compatible? rules)
+    (datom.query.fixpoint/materialise db rules eval-plain)  ; native kernel
     (get (derive-semi-naive db rules eval-plain) 0)))                  ; bl fallback
 ```
 
-`rules` requires `rules-native` (no cycle: `rules-native` → {`parse`,
+`rules` requires `fixpoint` (no cycle: `fixpoint` → {`parse`,
 `datalog`}, neither back to `rules`). Every `q` with `%` rules now flows through
 here; the 409 datom tests (incl. reachability, components, shortest path,
 same-generation, all via `q`) pass unchanged.
 
 ### Step 2 — full spec adherence: interning ANY value ✅ DONE
 
-The driver no longer asserts integer values. `rules-native` classifies each
+The driver no longer asserts integer values. `fixpoint` classifies each
 predicate **column** as `:num` (a real number, may feed arithmetic; passes
 through) or `:sym` (an opaque value; interned to a dense i64 and decoded back).
 The classification is a **closed numeric-variable set**: seed = every variable
@@ -160,13 +160,13 @@ is already covered by the graceful fallback.
 
 - **Deleted** `derive-naive` (the naive O(N³) oracle) — it existed only to check
   `derive-semi-naive`; correctness is now checked against **closed-form math**
-  in `rules_native_test.bl`, so the oracle is dead weight.
+  in `fixpoint_test.bl`, so the oracle is dead weight.
 - **Deleted** `materialise-with` (the `:naive`/`:semi-naive` profiling split).
 - **Kept** `derive-semi-naive` — now the **sole** evaluator for the one disjoint
   class the native kernel cannot serve: recursion that calls an arbitrary bl
   predicate on a recursive variable (`[(similar-to ?x ?b)]`). This is **not** a
   duplicate of the native fixpoint; it is the evaluator for inputs the native
-  kernel provably cannot take. `native-compatible?` selects; a program takes
+  kernel provably cannot take. `compatible?` selects; a program takes
   exactly one path.
 
 Every caller of the deleted functions was updated: `rules_test.bl` test 4
@@ -178,7 +178,7 @@ remain anywhere in `priv/ examples/ test/ bench/`.
 
 ### Step 4 — the equivalence gate ✅ DONE (as spec + fallback checks)
 
-`rules_native_test.bl` is the standing gate: native output checked against
+`fixpoint_test.bl` is the standing gate: native output checked against
 closed-form math (chain `n(n-1)/2`, cycle `n²`, Dijkstra, same-generation) AND
 against the bl fallback on an interned (keyword) program. The bl reference is a
 *test oracle*, never a production path — using it to **check** is fine; the sin
