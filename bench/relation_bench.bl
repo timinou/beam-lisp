@@ -1,0 +1,249 @@
+; bench/relation_bench.bl — benchmark + pressure-test the relation abstraction.
+; Run: mix beam_lisp.run --path priv bench/relation_bench.bl
+;
+; What this measures, and why each number is honest:
+;
+;   1  REGISTRY DISPATCH   the per-clause cost of asking "is this attribute a
+;                          computed relation?" — an Agent round-trip vs a bare
+;                          map lookup. This fires on EVERY pattern clause, so
+;                          if it were expensive the whole engine would pay.
+;
+;   2  PROVIDER SCALING    knn-adjacency in :ff (all-pairs) mode is O(N²) edges
+;                          over an O(N) corpus scan each — the honest cost of
+;                          materialising the whole semantic graph. Shown at
+;                          N = 8…200 so the curve is visible, not asserted.
+;
+;   3  ADORNMENT PAYOFF    the same relation, :bf (one bound source) vs :ff
+;                          (all sources). Access modes exist precisely so a
+;                          bound ?a costs ONE search, not N. This is the win a
+;                          bolted-on vector DB (generate-only) cannot give.
+;
+;   4  RE-INVOCATION CLIFF the sharp edge: a FREE-?a computed pattern placed
+;                          AFTER a clause that already produced M rows recomputes
+;                          the whole O(N²) graph M times. Measured, not hidden —
+;                          this is the one place a user can foot-gun the model,
+;                          and the planner's job is to keep it first.
+;
+;   5  SEMANTIC RECURSION  end-to-end: recursion over :~similar on the native
+;                          fixpoint (the graph materialises once as a base
+;                          relation), at growing N.
+;
+;   6  PRESSURE (CORRECT)  degenerate inputs that must NOT crash or lie: empty
+;                          corpus, k > N, threshold = 1.0 (no edges), a demanded
+;                          mode the relation doesn't support (graceful :bf),
+;                          and a polymorphic attribute left unbound.
+
+(ns bench.relation
+  (:require [datom] [datom.vector :as v]
+            [datom.query.relation :as rel] [datom.query.relations :as rels]
+            [datom.query.fixpoint :as fp] [datom.query.engine :as eng]))
+
+;; ── timing (median of trials after warmup) — same harness as the others ──
+
+(defn- now [] (erlang/monotonic_time :millisecond))
+(defn- median [xs]
+  (let [s (into [] (sort (into [] xs))) n (count s)]
+    (if (= 0 (rem n 2))
+      (erlang/div (+ (get s (- (erlang/div n 2) 1)) (get s (erlang/div n 2))) 2)
+      (get s (erlang/div n 2)))))
+(defn- time-ms [trials f]
+  (let [warm (f)
+        samples (mapv (fn [k] (let [t0 (now) res (f) t1 (now)] (- t1 t0))) (range trials))]
+    (median samples)))
+(defn- time-us [trials f]
+  ; microsecond resolution for the sub-ms registry probe
+  (let [warm (f)
+        samples (mapv (fn [k]
+                        (let [t0 (erlang/monotonic_time :microsecond)
+                              res (f)
+                              t1 (erlang/monotonic_time :microsecond)]
+                          (- t1 t0)))
+                      (range trials))]
+    (median samples)))
+(defn- header [t] (println (str "\n" t)))
+(defn- row [& parts] (println (str "  " (join "  |  " (to-list (mapv (fn [p] (str p)) parts))))))
+
+;; ── a synthetic embedded corpus with real cluster structure ─────────
+;;
+;; Deterministic pseudo-random vectors around G cluster centres, so k-NN finds
+;; genuine neighbours (not noise) and edge counts are meaningful. No model call.
+
+(def DIM 32)
+(defn- lcg [seed] (rem (+ (* seed 1103515245) 12345) 2147483648))
+(defn- rand-seq [seed n]
+  ; n pseudo-random floats in [-1,1] from a linear congruential generator
+  (get (reduce (fn [acc i]
+                 (let [s (lcg (get acc 1))]
+                   [(conj (get acc 0) (- (/ (rem s 2000) 1000.0) 1.0)) s]))
+               [[] seed] (range n))
+       0))
+(defn- cluster-vec [cluster tok]
+  ; a vector that is mostly the cluster centre plus a little per-token jitter
+  (let [centre (rand-seq (* (+ cluster 1) 7919) DIM)
+        jitter (rand-seq (+ (* tok 104729) 1) DIM)]
+    (v/embedding (mapv (fn [c j] (+ (* 4.0 c) (* 0.4 j))) centre jitter))))
+
+(def SCHEMA
+  [{:db/ident :s/vec :db/valueType :db.type/vector}
+   {:db/ident :s/grp :db/valueType :db.type/long}])
+
+(defn- corpus-db [n groups]
+  (let [conn (datom/connect SCHEMA)]
+    (datom/transact! conn
+      (into [] (mapv (fn [i] {:db/id (- (+ i 1))
+                              :s/grp (rem i groups)
+                              :s/vec (cluster-vec (rem i groups) i)})
+                     (range n))))
+    (datom/db conn)))
+
+;; the relation under test (registered once; k neighbours, mild threshold)
+(rel/register-relation! :~sim
+  {:arity 2 :modes #{:bf :bb :fb} :tags #{:semantic} :args []
+   :provider (rels/knn-adjacency :s/vec {:k 4 :threshold 0.0})})
+
+(def eval-plain
+  (fn [d b c] (eng/eval-clause d b c
+                (fn [op] (try (BeamLisp.Env/fetch! "core" (name op)) (catch e nil))) {})))
+
+(println "════════ RELATION-AS-CITIZEN — BENCHMARK + PRESSURE TEST ════════")
+(println "median of trials after warmup; correctness asserted where it matters")
+
+;; ── 1. REGISTRY DISPATCH: Agent round-trip vs the cost it guards ────
+(header "1 — REGISTRY DISPATCH: cost of the computed?/relation lookup (per clause)")
+(row "operation" "median µs" "note")
+(let [hit  (time-us 2000 (fn [] (rel/computed? :~sim)))
+      miss (time-us 2000 (fn [] (rel/computed? :s/grp)))
+      spec (time-us 2000 (fn [] (rel/relation :~sim)))]
+  (row "computed? (registered)"   hit  "Agent get — the per-pattern gate")
+  (row "computed? (plain attr)"   miss "the common case: a stored attribute")
+  (row "relation (fetch spec)"    spec "one more get on the computed path")
+  (println (str "  → the gate is ~" miss "µs on the stored-attribute path; a query with")
+           "\n    P patterns pays P× this. Non-zero but dwarfed by any datom scan.")
+  ;; assert it is genuinely cheap (single-digit-to-low-double µs), not a hidden cliff
+  (row "verdict" (if (< miss 200) "✓ negligible (<200µs)" "✗ REVIEW — dispatch is hot") ""))
+
+;; ── 2. PROVIDER SCALING: the all-pairs semantic graph is O(N²) ──────
+(header "2 — PROVIDER SCALING: knn-adjacency :ff (materialise the whole graph)")
+(row "N docs" "edges" "median ms" "ms/1k-edges")
+(doseq [n [8 50 100 200]]
+  (let [db (corpus-db n 4)
+        ms (time-ms 3 (fn [] (rel/eval-relation db :~sim [] nil (rel/mode-of [false false]))))
+        edges (count (into [] (rel/eval-relation db :~sim [] nil (rel/mode-of [false false]))))]
+    (row n edges ms (if (> edges 0) (erlang/div (* ms 1000) edges) "-"))))
+(println "  → k=4 caps out-degree, so edges ≈ 4N and the curve is the O(N) corpus")
+(println "    scan per source × N sources. This is the cost of the WHOLE graph;")
+(println "    a recursion pays it ONCE (§5), a bound query never pays it (§3).")
+
+;; ── 3. ADORNMENT PAYOFF: :bf (one source) vs :ff (all sources) ──────
+(header "3 — ADORNMENT PAYOFF: bound ?a (:bf) vs free ?a (:ff), same relation")
+(row "N docs" ":ff all-pairs ms" ":bf one-source ms" "speedup" "same edges from src?")
+(doseq [n [50 100 200]]
+  (let [db (corpus-db n 4)
+        ; a REAL entity id (tempids were resolved on transact; id 1 need not
+        ; exist). Take the smallest entity that actually has an :s/vec.
+        src (first (sort (mapv (fn [r] (get r 0))
+                               (into [] (datom/q '[:find ?e :where [?e :s/vec ?v]] db)))))
+        ff-ms (time-ms 3 (fn [] (rel/eval-relation db :~sim [] nil (rel/mode-of [false false]))))
+        bf-ms (time-ms 3 (fn [] (rel/eval-relation db :~sim [] #{src} (rel/mode-of [true false]))))
+        ; the :bf result must equal the src-slice of the :ff result — same meaning
+        ff-src (set (filterv (fn [e] (= (get e 0) src))
+                             (into [] (rel/eval-relation db :~sim [] nil (rel/mode-of [false false])))))
+        bf-out (set (into [] (rel/eval-relation db :~sim [] #{src} (rel/mode-of [true false]))))
+        ok (= ff-src bf-out)]
+    (row n ff-ms bf-ms
+         (str (if (> bf-ms 0) (erlang/div ff-ms bf-ms) ">") "x")
+         (str (count bf-out) (if ok " ✓" " ✗MISMATCH")))))
+(println "  → binding ?a turns generate into a single search. The adornment is")
+(println "    not a nicety — it is the difference between O(N²) and O(N).")
+
+;; ── 4. RE-INVOCATION CLIFF: free-?a computed pattern after M rows ───
+(header "4 — RE-INVOCATION CLIFF: a FREE-?a computed pattern must go FIRST")
+(println "  A computed pattern with ?a FREE recomputes the whole graph once PER")
+(println "  upstream binding. With the pattern first (1 empty binding) that is 1×;")
+(println "  placed after a clause yielding M rows it is M×. The planner keeps it")
+(println "  first — this measures the penalty when it can't.")
+(row "N docs" "M upstream" "pattern-first ms" "pattern-after ms" "penalty" "same answer?")
+(doseq [n [50 100]]
+  (let [db (corpus-db n 4)
+        ; a query where :~sim is naturally first (free ?a) → graph built once
+        q-first '[:find ?a ?b :where [?a :~sim ?b] [?a :s/grp ?g]]
+        ; force it after: bind ?g's M rows first, THEN the free-?a similar.
+        ; (M = N, one :s/grp datom per doc.) The planner would reorder; we call
+        ; the engine internals in fixed order to expose the raw cost.
+        first-ms (time-ms 3 (fn [] (into [] (datom/q q-first db))))
+        m (count (into [] (datom/q '[:find ?a :where [?a :s/grp ?g]] db)))
+        ; manual fixed-order run: grp pattern first (M rows), sim second (free ?a)
+        after-ms (time-ms 3
+                   (fn []
+                     (eng/run-clauses db [{}]
+                       '[[?a :s/grp ?g] [?a :~sim ?b]]
+                       (fn [op] (try (BeamLisp.Env/fetch! "core" (name op)) (catch e nil)))
+                       nil)))
+        ans-first (set (mapv (fn [r] [(get r 0) (get r 1)]) (into [] (datom/q q-first db))))
+        ans-after (set (mapv (fn [b] [(get b '?a) (get b '?b)])
+                             (into [] (eng/run-clauses db [{}]
+                                        '[[?a :s/grp ?g] [?a :~sim ?b]]
+                                        (fn [op] (try (BeamLisp.Env/fetch! "core" (name op)) (catch e nil)))
+                                        nil))))
+        ok (= ans-first ans-after)]
+    (row n m first-ms after-ms
+         (str (if (> first-ms 0) (erlang/div after-ms first-ms) "-") "x")
+         (if ok "✓ identical" "✗ DIFFERS"))))
+(println "  → same answer either way (correctness is order-independent), but the")
+(println "    cost is not. Lesson: a free-mode computed relation belongs FIRST;")
+(println "    bound it (§3) or the planner orders it, and the cliff disappears.")
+
+;; ── 5. SEMANTIC RECURSION END-TO-END on the native fixpoint ─────────
+(header "5 — SEMANTIC RECURSION: closure over :~similar, native fixpoint")
+(def MEANING
+  '[[(reach ?a ?b) [?a :~sim ?b]]
+    [(reach ?a ?b) [?a :~sim ?x] (reach ?x ?b)]])
+(row "N docs" "native? " "closure tuples" "median ms")
+(doseq [n [30 60 100]]
+  (let [db (corpus-db n 4)
+        compat (fp/compatible? MEANING)
+        ms (time-ms 3 (fn [] (fp/materialise db MEANING eval-plain)))
+        tuples (count (get (fp/materialise db MEANING eval-plain) 'reach))]
+    (row n (if compat "✓ native" "bl") tuples ms)))
+(println "  → the k-NN graph materialises ONCE as a base relation, then the")
+(println "    transitive closure runs on the native kernel. Semantic reachability")
+(println "    at native fixpoint speed — the payoff of one codec, one fixpoint.")
+
+;; ── 6. PRESSURE: degenerate inputs must not crash or lie ────────────
+(header "6 — PRESSURE: degenerate inputs (must be correct, not merely not-crash)")
+(row "case" "result" "expected")
+;; empty corpus → no edges, no crash
+(let [db (corpus-db 0 1)
+      edges (count (into [] (rel/eval-relation db :~sim [] nil (rel/mode-of [false false]))))]
+  (row "empty corpus" (str edges " edges") (if (= 0 edges) "0 ✓" "✗")))
+;; k larger than the corpus → at most N-1 neighbours each, no crash
+(rel/register-relation! :~bigk
+  {:arity 2 :modes #{:bf} :tags #{:semantic} :args []
+   :provider (rels/knn-adjacency :s/vec {:k 1000 :threshold 0.0})})
+(let [db (corpus-db 5 1)
+      src (first (sort (mapv (fn [r] (get r 0))
+                             (into [] (datom/q '[:find ?e :where [?e :s/vec ?v]] db)))))
+      out (into [] (rel/eval-relation db :~bigk [] #{src} (rel/mode-of [true false])))
+      deg (count out)]
+  (row "k=1000 on N=5" (str deg " neighbours of src") (if (and (> deg 0) (<= deg 4)) "1..4 ✓" "✗ over/zero-degree")))
+;; threshold 1.0 → (almost) nothing passes; must be empty-or-tiny, never error
+(rel/register-relation! :~strict
+  {:arity 2 :modes #{:bf} :tags #{:semantic} :args []
+   :provider (rels/knn-adjacency :s/vec {:k 4 :threshold 1.0})})
+(let [db (corpus-db 40 4)
+      edges (count (into [] (rel/eval-relation db :~strict [] nil (rel/mode-of [false false]))))]
+  (row "threshold=1.0" (str edges " edges") (if (< edges 40) "sparse ✓" "✗ too many")))
+;; demanded mode not supported → graceful degrade to :bf (generate), not error
+(rel/register-relation! :~bfonly
+  {:arity 2 :modes #{:bf} :tags #{:semantic} :args []
+   :provider (rels/knn-adjacency :s/vec {:k 4 :threshold 0.0})})
+(let [chosen (rel/supported-mode (rel/relation :~bfonly) :fb)]
+  (row "demand :fb on :bf-only" (str chosen) (if (= :bf chosen) ":bf ✓ (degrade)" "✗")))
+;; polymorphic attribute unbound → computed? is false (nothing to route), so a
+;; plain scan happens; the pattern binds nothing rather than exploding.
+(let [db (corpus-db 8 2)
+      poly (into [] (datom/q '[:find ?a ?b :in $ ?rel :where [?a ?rel ?b]] db :~sim))]
+  (row "polymorphic ?rel=:~sim" (str (count poly) " edges via variable attr")
+       (if (> (count poly) 0) "resolved ✓" "✗")))
+
+(println "\n════════ END — benchmark + pressure test ════════")
