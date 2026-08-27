@@ -56,7 +56,7 @@ use rustler::{Binary, Env, Error, NifResult, OwnedBinary};
 use std::io::Write;
 
 /// Wrap a message as a BEAM-raisable error term.
-fn err(msg: impl std::fmt::Display) -> Error {
+pub(crate) fn err(msg: impl std::fmt::Display) -> Error {
     Error::Term(Box::new(format!("{}", msg)))
 }
 
@@ -231,7 +231,7 @@ fn top_k_by_score(hits: &mut Vec<Hit>, k: usize) {
 
 /// Read `dim` little-endian f32s out of a byte slice into an f64 vector (the
 /// BEAM's only float type). Returns None if the length is wrong.
-fn unpack_f32(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
+pub(crate) fn unpack_f32(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
     if bytes.len() != dim * 4 {
         return None;
     }
@@ -244,7 +244,7 @@ fn unpack_f32(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
     Some(v)
 }
 
-fn pack_f32(v: &[f32]) -> Vec<u8> {
+pub(crate) fn pack_f32(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for &x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -615,7 +615,8 @@ fn __nif_loaded__() -> bool {
 
 // The host module name must match what `BeamLisp.Native.host_module/1` derives
 // from the `datom.vector` namespace: `BeamLisp.Native.Datom.Vector`.
-rustler::init!("Elixir.BeamLisp.Native.Datom.Vector");
+mod hnsw;
+rustler::init!("Elixir.BeamLisp.Native.Datom.Vector", load = hnsw::load);
 
 #[cfg(test)]
 mod bench {
