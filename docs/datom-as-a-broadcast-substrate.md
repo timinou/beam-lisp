@@ -270,7 +270,7 @@ sends *after* commit, off the hot path — it never blocks the writer (§7.4).
 
 ---
 
-## 6. Payload: delta by default, never a projection — and what FEAT-016 really said
+## 6. Payload: delta by default; the WRITER never projects (§6.1) — what FEAT-016 really said
 
 `docs/the-application-is-a-value.md` (FEAT-016) is often quoted as *"broadcast
 the moment, never the projection"* and read as *"broadcast only a basis."* Those
@@ -320,6 +320,135 @@ path always carries the delta (local subscribers are in one consistency domain
 and the T1 matcher needs `:tx-datoms`). A per-principal RLS feed (§2) is the one
 case with **no** single projection to broadcast — there the reader-side filter is
 forced by the problem, not by doctrine, and the delta is exactly what it filters.
+
+---
+
+### 6.1 Where projections live — the reactive-binding tiers
+
+"The writer never projects" is scoped to **one process**: the commit path inside
+the single-writer Agent (`transact-in-writer`, `conn.bl`). It is emphatically
+*not* "no projections exist." Projections — including reactive frontend bindings —
+are first-class; they just live one process to the left of the writer. The rule
+protects three things, all about *that one process*:
+
+1. **It is blind to consumers.** A projection is `f(data, principal, query)`; the
+   writer holds only `data`. To project, it would enumerate every subscriber ×
+   query × identity — O(subscribers) work it has no inputs for.
+2. **It is the serialized critical section.** Every other write queues behind it.
+   Rendering a view there blocks the *next commit* for the render's duration.
+   Correctness (write-ordering) and view-rendering must not share a lock.
+3. **It must not crash.** A rendering bug in the writer takes down the process
+   that holds the ordering guarantee. `let it crash` wants the projector to be a
+   *different*, supervised process.
+
+So the real statement is: **keep projection off the serialized correctness path
+and out of the layer blind to consumers.** Everywhere else, projections are the
+point. There are six canonical shapes; each maps to an `examples/datom/live/`
+file so this doc is the spec for how live rendering actually works in beam-lisp.
+
+| case | who projects | for whom | payload it consumes | example |
+|---|---|---|---|---|
+| **A** per-socket binding | the LiveView / view-server process | one viewer | `:basis` | `10-reactive-socket.bl` |
+| **B** shared materialized view | a `defserver` subscriber | N identical viewers | `:tx-datoms` (T0) | `06-projector.bl` |
+| **C** diff / patch binding | a `defserver` subscriber | one principal-group | `:tx-datoms` (delta) | `11-reactive-diff.bl` |
+| **D** derived state | *the writer, as a FACT* (tx-fn) | everyone | — (it's a datom) | `12-derived-fact.bl` |
+| **E** presence binding | `Phoenix.Presence` (CRDT) | a topic's viewers | membership events | `13-presence.bl` |
+| ~~writer projection~~ | ~~commit path~~ | ~~—~~ | — | **forbidden** (1–3 above) |
+
+**Case A — per-socket reactive binding.** The canonical frontend case, and where
+`:basis` is *optimal*, not arcane: a LiveView re-renders its whole assign map and
+Phoenix diffs the DOM, so "reader re-projects from a coordinate" is exactly what
+a page already does. This is the shape `lib/beam_lisp/spell/server.ex` runs
+today. The projection is per-principal because the *socket process* holds who is
+asking — the guard clause the writer never had.
+
+```clojure
+(defserver socket-view                    ; models one connected viewer
+  (init [ctx]
+    (let [principal (:principal ctx)
+          q (auth/guard '[:find ?id ?title
+                          :where [?doc :doc/id ?id] [?doc :doc/title ?title]]
+                        [(auth/owner-filter '?doc :doc/owner principal)])]
+      (datom/listen! CONN {:payload :basis})           ; Case A: a basis is enough
+      (ok {:id (:id ctx) :q q})))
+  (handle-info [:datom/changed basis _attrs]
+    [state]
+    (let [db   (datom/as-of (datom/db CONN) basis)     ; coordinate → value
+          rows (datom/q (:q state) db)]                ; the per-viewer projection
+      (Phoenix.PubSub/broadcast SpellWeb.PubSub
+        (str "socket:" (:id state)) [:render rows])    ; → LiveView assign → DOM diff
+      (noreply state))))
+```
+
+**Case B — shared materialized view.** "10k viewers of one public board." Compute
+ONCE, fan out. A projection on the wire — legitimately, because the projector is
+a *subscriber* that fixed *(query, principal=public)*, not a writer guessing one.
+See §8.1.
+
+**Case C — diff / patch binding.** A true reactive binding wants *minimal
+patches*, not a full re-render. A projector holds the answer set and emits only
+the delta between successive results — and the `:tx-datoms` payload is what makes
+the pre-filter cheap (recompute only if this commit *could* touch the answer).
+
+```clojure
+(defn- diff [before after]
+  (let [b (set before) a (set after)]
+    {:added (into [] (remove b a)) :removed (into [] (remove a b))}))
+
+(defserver reactive-feed
+  (init [ctx]
+    (let [principal (:principal ctx)
+          q (auth/guard '[:find ?id :where [?doc :doc/id ?id]]
+                        [(auth/owner-filter '?doc :doc/owner principal)])]
+      (datom/listen! CONN {:attrs #{:doc/owner :doc/id}})    ; delta path
+      (ok {:principal principal :q q
+           :answer (set (datom/q q (datom/db CONN)))})))
+  (handle-info [:datom/tx _basis tx-datoms]
+    [state]
+    (if (touches? tx-datoms (:principal state))            ; cheap prefilter on the DELTA
+      (let [next (set (datom/q (:q state) (datom/db CONN)))
+            d    (diff (:answer state) next)]
+        (when (or (seq (:added d)) (seq (:removed d)))
+          (Phoenix.PubSub/broadcast SpellWeb.PubSub
+            (str "feed:" (:principal state)) [:patch d]))   ; the reactive binding
+        (noreply (assoc state :answer next)))
+      (noreply state))))
+```
+
+Write → delta → per-principal projector diffs → minimal patch → DOM. The delta,
+not the basis, is what keeps the prefilter O(tx-datoms) instead of O(corpus).
+
+**Case D — derived state is a FACT, not a projection.** When the frontend binds to
+a value that is a function of other facts (`:order/total` = Σ line items), do
+*not* "project at write." Record it as a datom via a tx-fn (`register-tx-fn!`,
+already in the tree). Then it broadcasts through the ordinary delta and every
+binding above sees it with zero special-casing.
+
+```clojure
+(datom/register-tx-fn! CONN :recalc-total
+  (fn [db order] [[:db/add order :order/total (sum-line-items db order)]]))
+;; the total is a normal datom now — delta-carried, watchable, time-travelled.
+```
+
+This is the boundary line: **the writer emits facts (which may be *derived*);
+projectors and readers emit views.** Derived-at-write is a fact; derived-per-
+viewer is a projection.
+
+**Case E — presence binding.** "Who is looking at this?" is replicated *state*, not
+a message, so it is a CRDT (`Phoenix.Presence`) at L4 — not a datom broadcast.
+A presence binding and a datom binding compose on one page: the datom feed says
+*what the data is*, presence says *who else is here*.
+
+```clojure
+(Phoenix.Presence/track (erlang/self) "doc:42" principal {:cursor 0})
+(Phoenix.Presence/list "doc:42")     ; → reactive "3 people editing" binding
+```
+
+The synthesis: the **writer emits facts** (delta/basis — cheap, consumer-blind,
+on the correctness path); **projections live at the reader (A), a shared
+projector (B/C), or a CRDT (E)**; **derived state is pushed back as a fact (D)**.
+Basis-vs-delta is a per-binding knob, not a doctrine — A wants basis, C wants the
+delta, and both are reactive frontend bindings.
 
 ---
 
