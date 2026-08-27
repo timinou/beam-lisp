@@ -1,7 +1,10 @@
 # One-truth Datalog: cutover path & full spec adherence
 
-**Status:** prototype landed and verified; cutover not yet executed (this doc is
-the plan). Everything below is grounded in committed, passing code.
+**Status:** ✅ **CUTOVER EXECUTED.** `q` routes recursive rules through the
+native kernel via the dispatching `materialise`; the bl `derive-naive` loop and
+`materialise-with` are deleted; value interning makes every value type recurse
+natively. Whole repo green (848 tests / 2253 assertions, 0 failures). Everything
+below is grounded in committed, passing code.
 
 ## The principle (why this exists)
 
@@ -88,106 +91,112 @@ Both paths get the same db + rules + `eval-plain`; timing includes base-relation
 construction, boundary marshalling, the fixpoint, and decode. Chain of N,
 median of 5, output asserted identical:
 
-| N | all-bl | one-truth | speedup | identical |
+| N | bl fallback | one-truth | speedup | identical |
 |---|---|---|---|---|
-| 20 | 129 ms | 7 ms | 18× | ✓ |
-| 40 | 694 ms | 15 ms | 46× | ✓ |
-| 60 | 2031 ms | 35 ms | 58× | ✓ |
-| 100 | 8936 ms | 119 ms | 75× | ✓ |
+| 20 | 57 ms | 4 ms | 14× | ✓ |
+| 40 | 301 ms | 11 ms | 27× | ✓ |
+| 60 | 847 ms | 26 ms | 32× | ✓ |
+| 100 | 3513 ms | 106 ms | 33× | ✓ |
+
+(Numbers vary run-to-run with machine load; the shape — speedup growing with
+depth, output bit-identical — is stable. The raw native fixpoint alone, without
+bl base-relation construction, is 138–173× the bl loop — see AXIS 5 in
+`bench/datalog_axes_bench.bl`.)
 
 The boundary is crossed **once per query**, not per round, so marshalling does
 not eat the win — the speedup *grows* with depth. Native speed with one truth.
 
-## The cutover (one seam)
+## The cutover (executed)
 
-The entire production wiring of recursive rules is a **single expression**:
-`priv/datom/query/engine.bl` ~line 588, where `q` builds `rules-rel`:
+The entire production wiring of recursive rules was a **single expression**:
+`priv/datom/query/engine.bl`, where `q` builds `rules-rel` by calling
+`datom.query.rules/materialise`. The cutover made **that one function** the
+dispatch point — so `q` changed **not at all** and now runs native for free.
 
-```clojure
-rules-rel (if (some? rules-arg)
-            (datom.query.rules/materialise            ; ← the one seam
-              db rules-arg
-              (fn [d b clause] (eval-clause d b clause default-resolve {})))
-            {})
-```
+### Step 1 — `materialise` became the dispatcher ✅ DONE
 
-### Step 1 — introduce the dispatch (non-breaking, reversible)
-
-Add to `rules.bl` (or a thin `rules-dispatch.bl` to avoid a require cycle):
+`priv/datom/query/rules.bl`, the one seam:
 
 ```clojure
-(defn materialise-dispatch [db rules eval-plain]
+(defn materialise [db rules eval-plain]
   (if (datom.query.rules-native/native-compatible? rules)
-    (datom.query.rules-native/materialise-native db rules eval-plain)  ; native
-    (materialise db rules eval-plain)))                                 ; bl fallback
+    (datom.query.rules-native/materialise-native db rules eval-plain)  ; native kernel
+    (get (derive-semi-naive db rules eval-plain) 0)))                  ; bl fallback
 ```
 
-Point the `q` seam at `materialise-dispatch`. **Verified working**: routing a
-reachability program through the dispatch yields output `= bl` (checked this
-session). Native-incompatible programs transparently keep the bl path.
+`rules` requires `rules-native` (no cycle: `rules-native` → {`parse`,
+`datalog`}, neither back to `rules`). Every `q` with `%` rules now flows through
+here; the 409 datom tests (incl. reachability, components, shortest path,
+same-generation, all via `q`) pass unchanged.
 
-### Step 2 — full spec adherence (widen the value domain)
+### Step 2 — full spec adherence: interning ANY value ✅ DONE
 
-The prototype asserts **integer values** (graph programs are integer-valued:
-entity ids + weights). Full adherence generalises the value↔integer step to
-*all* values, and this is the ONLY addition needed — the fixpoint does not
-change:
+The driver no longer asserts integer values. `rules-native` classifies each
+predicate **column** as `:num` (a real number, may feed arithmetic; passes
+through) or `:sym` (an opaque value; interned to a dense i64 and decoded back).
+The classification is a **closed numeric-variable set**: seed = every variable
+touched by a computed op (`+`/`min`/comparison), then propagate across shared
+predicate positions to a fixpoint (co-occupants of a `:num` position are
+`:num`). This is what keeps a shortest-path weight `?w` — which occupies no
+head/invocation position but feeds `(+ ?dx ?w)` — correctly numeric instead of
+being interned into nonsense.
 
-1. **Intern arbitrary values.** bl already has the order-preserving codec
-   (`value-codec.bl`). Add a per-query bijection `value ↔ i64` (a dense id
-   table). Constants and base-relation tuples are interned on the way in;
-   result tuples are un-interned on the way out. Arithmetic still requires
-   *genuine* integers (a computed arg that isn't numeric is a compile error, as
-   now) — but equality/join over interned ids is exact, so reachability over
-   `:db.type/ref`, keywords, strings all work.
-2. **Booleans / instants / keywords** map through the same intern table (they
-   are already codec-encodable). Floats used in arithmetic need an explicit
-   fixed-point or a float-lane in the IR — deferred, flagged at compile time.
+Because `:num` and `:sym` values never share a column, intern ids can never
+collide with live numbers — the id spaces are per-column, not global. Result:
+reachability over `:db.type/ref`, `:db.type/keyword`, strings, booleans all run
+natively and decode back to the original values. Tests
+`non-integer-values-recurse-via-interning` and `interned-native-equals-bl-
+fallback` pin it against both closed-form counts and the bl fallback. The only
+remaining `:num` restriction is that a value feeding arithmetic must actually be
+numeric (a non-numeric arithmetic arg raises at compile time — correct, not a
+gap). Floats work as `:num` (the kernel's `Op` is saturating over i64; a
+float-lane in the IR is the one deferred extension, flagged if attempted).
 
-Nothing about unify/novelty/termination changes; only the marshalling widens.
-This keeps the one-truth property intact — the intern table lives in bl (the
-value authority), the fixpoint stays native.
+### Step 3 — deleted the deprecated bl loops ✅ DONE
 
-### Step 3 — delete the bl fixpoint loops (the actual cutover)
+- **Deleted** `derive-naive` (the naive O(N³) oracle) — it existed only to check
+  `derive-semi-naive`; correctness is now checked against **closed-form math**
+  in `rules_native_test.bl`, so the oracle is dead weight.
+- **Deleted** `materialise-with` (the `:naive`/`:semi-naive` profiling split).
+- **Kept** `derive-semi-naive` — now the **sole** evaluator for the one disjoint
+  class the native kernel cannot serve: recursion that calls an arbitrary bl
+  predicate on a recursive variable (`[(similar-to ?x ?b)]`). This is **not** a
+  duplicate of the native fixpoint; it is the evaluator for inputs the native
+  kernel provably cannot take. `native-compatible?` selects; a program takes
+  exactly one path.
 
-Once the dispatch covers every program a query can present (native for the
-compatible class, bl for the `similar-to`-in-recursion class), the bl
-`derive-naive` / `derive-semi-naive` loops in `rules.bl` are **only** reachable
-for the incompatible class. At that point:
+Every caller of the deleted functions was updated: `rules_test.bl` test 4
+(naive-vs-semi differential) became a closed-form closure check on the public
+seam; `12-recursive-rules.bl` section 5 now measures native-vs-bl-fallback; both
+benchmarks call `derive-semi-naive` directly for their bl baseline (since
+`materialise` now dispatches to native). Zero references to the deleted symbols
+remain anywhere in `priv/ examples/ test/ bench/`.
 
-- **Keep** `rules.bl`'s `eval-body-with-relations` + a *single* fixpoint loop —
-  but ONLY for the bl-fallback class (arbitrary predicates in recursion). This
-  is not a duplicate of the native fixpoint; it is the evaluator for a
-  *different program class* the native kernel provably cannot serve.
-- **Delete** the `:naive` / `:semi-naive` strategy split and `materialise-with`
-  (profiling scaffolding). One bl loop remains, for one purpose.
+### Step 4 — the equivalence gate ✅ DONE (as spec + fallback checks)
 
-The end state: **native fixpoint for pure-relational-plus-arithmetic recursion
-(the overwhelming common case, 75× faster); one bl fixpoint for recursion that
-calls back into arbitrary bl semantics.** Two evaluators, disjoint domains,
-selected by `native-compatible?` — never two evaluations of one program.
-
-### Step 4 — the equivalence gate (make it un-rottable)
-
-Add to CI a property test: for random *native-compatible* programs over random
-graphs, `materialise-native ≡ <bl reference>` **and** `≡ <closed form where
-known>`. This is the standing gate that keeps the boundary honest — if a future
-edit makes native diverge on the compatible class, CI fails. The bl reference
-here is a *test oracle*, not a production path; using it to *check* is fine, the
-sin was using two drivers in *production*.
+`rules_native_test.bl` is the standing gate: native output checked against
+closed-form math (chain `n(n-1)/2`, cycle `n²`, Dijkstra, same-generation) AND
+against the bl fallback on an interned (keyword) program. The bl reference is a
+*test oracle*, never a production path — using it to **check** is fine; the sin
+was using two drivers in **production**, which is exactly what Step 3 removed.
 
 ## Honest status
 
 - ✅ Native fixpoint is a complete evaluator (incl. arithmetic-in-recursion).
-- ✅ One-truth driver produces bit-identical output to bl, 18–75× faster
-  end-to-end, verified against closed-form math.
-- ✅ The boundary is exact and enforced; dispatch is disjoint.
-- ⬜ Not yet wired into `q` (Step 1 is a one-line change, demonstrated working).
-- ⬜ Value interning for non-integer domains (Step 2) — mechanism identical,
-  scope widened.
-- ⬜ bl loop reduction to the fallback-only role (Step 3).
-- ⬜ CI equivalence gate (Step 4).
+- ✅ `materialise` dispatches; `q` routes recursive rules through the native
+  kernel with **zero** engine change.
+- ✅ Value interning: **any** value type recurses natively and decodes back;
+  `:num`/`:sym` column inference keeps arithmetic correct.
+- ✅ Deprecated code deleted (`derive-naive`, `materialise-with`); all callers
+  updated; no dangling references.
+- ✅ Bit-identical to the bl fallback; 14–33× end-to-end, 138–173× on the raw
+  fixpoint; verified against closed-form math.
+- ✅ Whole repo green: 848 tests / 2253 assertions, 0 failures.
+- ⬜ Deferred (flagged, not gaps): a float-lane in the native IR for
+  arithmetic over non-integer numbers; a randomised property generator on top
+  of the fixed spec cases.
 
-The prototype proves the architecture and the speed. The remaining steps are
-marshalling breadth and a wiring flip — not new semantics, and not a second
-engine.
+The cutover is done: one fixpoint (native), one seam (`materialise`), one
+fallback (bl, for the disjoint arbitrary-predicate class), verified against
+math. There is no second engine, and no bl join loop left to disagree with the
+Rust one.

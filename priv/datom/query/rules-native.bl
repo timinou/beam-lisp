@@ -1,4 +1,4 @@
-; datom/query/rules-native.bl — the ONE-TRUTH driver.
+; datom/query/rules-native.bl — the ONE-TRUTH native driver.
 ;
 ; ── What this is, and why it is not a "second engine" ─────────────────
 ;
@@ -8,29 +8,48 @@
 ; COMPILER + MARSHALLER that lets beam-lisp drive that one fixpoint:
 ;
 ;   1. beam-lisp evaluates the non-recursive body clauses (patterns,
-;      predicates) using its OWN engine \u2014 the single authority on what a
+;      predicates) using its OWN engine — the single authority on what a
 ;      pattern means, including retraction and `as-of`. Those become BASE
-;      RELATIONS (sets of integer tuples). This is bl's existing job; no new
-;      semantics are invented here.
+;      RELATIONS (sets of tuples). This is bl's existing job.
 ;   2. The recursive rules are translated to the native IR (atoms + computed
 ;      items for arithmetic). No evaluation happens in bl.
 ;   3. The native fixpoint runs ONCE (one boundary crossing) and returns the
 ;      closure as integer tuples.
 ;   4. bl decodes the tuples back to values.
 ;
-; So bl owns: value\u2194integer, pattern meaning, decode. Native owns: the whole
-; fixpoint. The responsibilities are DISJOINT \u2014 there is no join loop in bl to
-; disagree with the join loop in Rust, because bl has none. The bl `derive-*`
-; loops in `rules.bl` are what this REPLACES (see the cutover doc).
+; So bl owns: value↔integer, pattern meaning, decode. Native owns: the whole
+; fixpoint. The responsibilities are DISJOINT — there is no join loop in bl to
+; disagree with the join loop in Rust, because bl has none.
 ;
-; ── Scope of the prototype ────────────────────────────────────────────
+; ── Full spec adherence: interning ANY value, not just integers ───────
 ;
-; The native kernel works over i64 tuples. Graph programs \u2014 reachability,
-; connected components, shortest path, same-generation \u2014 are already integer
-; valued (entity ids, weights), so they pass through directly. The full-spec
-; generalisation (interning arbitrary values to integers and back) is
-; described in the cutover doc; the mechanism here is identical, only the
-; value\u2194integer step widens.
+; The native kernel joins and stores i64 tuples. To make EVERY Datalog program
+; run natively — not only integer-valued graph programs — this driver interns
+; arbitrary values (entity refs, keywords, strings, booleans, instants) to
+; dense i64 ids and decodes back on the way out. The one thing that must stay
+; a *genuine* integer is a value that feeds ARITHMETIC (`+`/`min`/… in a
+; recursive rule, e.g. a shortest-path cost): you cannot add two intern ids.
+;
+; So each predicate POSITION is classified as one of two column kinds:
+;
+;   :num  — carries a real number; passes through unchanged; may feed a
+;           computed item. (Datalog costs, weights, counts.)
+;   :sym  — carries an opaque value; interned to an id; never arithmetic.
+;           (Entity ids used as identities, keywords, strings, …)
+;
+; A variable has ONE kind everywhere it appears (it is a single logic
+; variable), so kinds are inferred by unifying positions a variable links
+; (a small fixpoint, `infer-column-kinds`). A position touched by a computed
+; op is :num; everything else defaults to :sym. Because :num and :sym values
+; never share a column, intern ids can never collide with live numbers — the
+; two id spaces are per-column, not global.
+;
+; The ONLY program the native path cannot serve: recursion whose body calls an
+; ARBITRARY bl function on a RECURSIVE variable (`[(similar-to ?x ?b)]` where
+; ?x comes from a recursive invocation) — that value exists only mid-fixpoint
+; and its meaning lives in bl. `native-compatible?` detects it; such programs
+; run on the all-bl fixpoint (datom.query.rules/derive-semi-naive), the single
+; evaluator for that disjoint class. No input is ever evaluated two ways.
 
 (ns datom.query.rules-native
   (:require [datom.query.parse] [datom.datalog :as nd]))
@@ -41,12 +60,13 @@
 (defn- rule-head-args [d] (into [] (rest (get d 0))))
 (defn- rule-body [d] (into [] (rest d)))
 
-(defn- call-form? [c] (list? c))
 (defn- invocation? [c names] (and (list? c) (contains? names (first c))))
 
 ;; arithmetic/comparison operators the native kernel understands
 (def COMPUTED-OPS
   #{'+ '- '* 'min 'max '< '<= '> '>= '== '!=})
+(def PREDICATE-OPS
+  #{'< '<= '> '>= '== '!=})
 (def OP->KW
   {'+ :+ '- :- '* :* 'min :min 'max :max
    '< :< '<= :<= '> :> '>= :>= '== :== '!= :!=})
@@ -60,105 +80,164 @@
        (list? (get c 0))
        (contains? COMPUTED-OPS (first (get c 0)))))
 
-;; ── interning: symbols/keywords → dense integer ids ─────────────────
+;; ── a tiny mutable table (process-dict backed) ──────────────────────
+
+(defn- new-table [init] (let [k (erlang/make_ref)] (erlang/put k init) k))
+(defn- tget [k] (erlang/get k))
+(defn- tset! [k v] (erlang/put k v))
+
+;; ── value interning: opaque value ↔ dense i64 (per driver run) ──────
 ;;
-;; Predicate names and variables become small ints for the IR. VALUES that
-;; are already integers pass through unchanged (so arithmetic is real). A
-;; value that is NOT an integer would need a value-intern table; the
-;; prototype asserts integer values and points at the generalisation.
+;; ONE bijection for all :sym columns of a program. A value maps to a stable
+;; id; decoding inverts it. Integers that happen to be :sym values are
+;; interned too (so a :sym column of small ints and a :num column of small
+;; ints never clash — they live in different id spaces by construction).
 
-(defn- interner []
-  ; a mutable-ish intern via an atom-like closure over a map in process dict
-  (let [key (erlang/make_ref)]
-    (erlang/put key {:fwd {} :next 0})
-    key))
+(defn- new-interner [] (new-table {:fwd {} :rev {} :next 0}))
 
-(defn- intern! [tbl sym]
-  (let [st (erlang/get tbl)
-        fwd (get st :fwd)]
-    (if (contains? fwd sym)
-      (get fwd sym)
+(defn- intern-value! [tbl v]
+  (let [st (tget tbl) fwd (get st :fwd)]
+    (if (contains? fwd v)
+      (get fwd v)
       (let [id (get st :next)]
-        (erlang/put tbl (assoc (assoc st :fwd (assoc fwd sym id)) :next (+ id 1)))
+        (tset! tbl (assoc st :fwd (assoc fwd v id)
+                             :rev (assoc (get st :rev) id v)
+                             :next (+ id 1)))
         id))))
 
-;; ── translate a body clause to IR items ─────────────────────────────
+(defn- unintern [tbl id] (get (get (tget tbl) :rev) id))
 
-(defn- term->ir
-  "A rule argument → IR term. A variable → {0 slot}; an integer constant →
-   {1 int}. `vslot` interns variables to slots."
-  [vslot arg]
-  (if (datom.query.parse/variable? arg)
-    (nd/var-term (intern! vslot arg))
-    (if (erlang/is_integer arg)
-      (nd/const-term arg)
-      (throw (ex-info "non-integer constant in a native rule (needs value interning)"
-                      {:arg arg})))))
+;; ── symbol → dense id (predicate names, variable slots) ─────────────
 
-(defn- invocation->atom-item
-  "A rule-invocation clause `(name a b)` → an atom body item."
-  [pred-id vslot call]
-  (nd/atom-item (nd/atom pred-id (mapv (fn [a] (term->ir vslot a)) (into [] (rest call))))))
+(defn- new-symtab [] (new-table {:fwd {} :next 0}))
+(defn- intern-sym! [tbl s]
+  (let [st (tget tbl) fwd (get st :fwd)]
+    (if (contains? fwd s)
+      (get fwd s)
+      (let [id (get st :next)]
+        (tset! tbl (assoc st :fwd (assoc fwd s id) :next (+ id 1)))
+        id))))
 
-(defn- computed->item
-  "A `[(op args…) out]` computed clause → a computed body item. A bare
-   comparison `[(< a b)]` (no out) is a guard."
-  [vslot clause]
-  (let [call (get clause 0)
-        op (get OP->KW (first call))
-        args (mapv (fn [a] (term->ir vslot a)) (into [] (rest call)))]
-    (if (> (count clause) 1)
-      (nd/computed-item op args (term->ir vslot (get clause 1)))
-      ;; comparison guard: out is a dummy const 1 (kernel ignores out for cmp)
-      (nd/computed-item op args (nd/const-term 1)))))
-
-;; ── base relations from pattern/plain clauses (bl's authority) ──────
+;; ── column-kind inference ───────────────────────────────────────────
 ;;
-;; A plain (non-recursive) body clause is evaluated by bl's OWN engine into
-;; a set of value tuples, then interned to an integer relation the kernel
-;; joins. This is where retraction / as-of / pattern semantics live \u2014 in
-;; the one bl engine, computed once, not re-decided natively.
+;; A POSITION is (pred-name . index). Two positions a variable co-occupies
+;; must share a kind. A position feeding a computed op's numeric slot is
+;; :num; otherwise :sym. We propagate :num across variable links to a
+;; fixpoint, then default the rest to :sym.
 
-(defn- plain-clause-relation
-  "Evaluate a plain clause via `eval-plain` over the whole db, projecting
-   the clause's variables in a fixed order. Returns [pred-id var-order
-   tuples] where tuples are integer rows."
-  [db eval-plain vslot clause]
-  ; the clause's variables, in first-appearance order = the base relation's columns
-  (let [vars (filterv datom.query.parse/variable?
-                      (cond
-                        (vector? clause) (into [] clause)
-                        :else []))
-        ; run the clause against an empty binding: yields binding rows
-        rows (eval-plain db {} clause)
-        tuples (mapv (fn [b]
-                       (mapv (fn [v]
-                               (let [val (get b v)]
-                                 (if (erlang/is_integer val)
-                                   val
-                                   (throw (ex-info "non-integer value in base relation (needs interning)"
-                                                   {:var v :val val})))))
-                             vars))
-                     (into [] rows))]
-    [vars tuples]))
+(defn- pos [pred idx] [pred idx])
+
+(defn- var-positions
+  "Map var → set of positions it occupies across the whole program
+   (rule heads + rule-invocation body atoms). Plain patterns don't define
+   named predicate positions; their variables get kinds from where they
+   ALSO appear in an invocation/head/computed slot."
+  [defs names]
+  (let [acc (new-table {})]
+    (doseq [d (to-list defs)]
+      (let [hn (rule-name d) hargs (rule-head-args d)]
+        ;; head positions
+        (doseq [i (range (count hargs))]
+          (let [a (get hargs i)]
+            (when (datom.query.parse/variable? a)
+              (tset! acc (assoc (tget acc) a
+                                (conj (or (get (tget acc) a) #{}) (pos hn i)))))))
+        ;; invocation positions in the body
+        (doseq [c (to-list (rule-body d))]
+          (when (invocation? c names)
+            (let [cn (first c) cargs (into [] (rest c))]
+              (doseq [i (range (count cargs))]
+                (let [a (get cargs i)]
+                  (when (datom.query.parse/variable? a)
+                    (tset! acc (assoc (tget acc) a
+                                      (conj (or (get (tget acc) a) #{}) (pos cn i))))))))))))
+    (tget acc)))
+
+(defn- numeric-vars
+  "Variables that MUST be numeric: any var appearing in a computed clause —
+   an argument to arithmetic/comparison, or its output. These force their
+   positions to :num."
+  [defs]
+  (reduce
+    (fn [s d]
+      (reduce
+        (fn [s2 c]
+          (if (computed-clause? c)
+            (let [call (get c 0)
+                  args (filterv datom.query.parse/variable? (into [] (rest call)))
+                  out (if (> (count c) 1) (get c 1) nil)
+                  s3 (into s2 args)]
+              (if (and (some? out) (datom.query.parse/variable? out))
+                (conj s3 out) s3))
+            s2))
+        s
+        (to-list (rule-body d))))
+    #{}
+    (to-list defs)))
+
+(defn- positions->vars
+  "Invert var-positions: `{position #{vars}}` — which variables share each
+   named predicate position. Two vars at one position must share a kind."
+  [vpos]
+  (reduce (fn [m v]
+            (reduce (fn [m2 p]
+                      (assoc m2 p (conj (or (get m2 p) #{}) v)))
+                    m (into [] (or (get vpos v) #{}))))
+          {}
+          (into [] (keys vpos))))
+
+(defn- numeric-var-set
+  "The CLOSED set of numeric variables. Seeded from variables that appear in
+   a computed clause (direct arithmetic/comparison), then propagated across
+   shared predicate positions to a fixpoint: if any variable at a position is
+   numeric, every variable at that position is numeric (they unify to one
+   column, which must be a real number for the kernel's arithmetic). This is
+   what keeps a weight `?w` — which occupies no head/invocation position but
+   feeds `(+ ?dx ?w)` — correctly :num, so it passes through as a raw number
+   instead of being interned."
+  [defs names vpos]
+  (let [seed (numeric-vars defs)
+        pvars (positions->vars vpos)]
+    (loop [num seed]
+      (let [grown (reduce
+                    (fn [s v]
+                      ;; every position v occupies pulls in its co-occupants
+                      (reduce (fn [s2 p] (into s2 (or (get pvars p) #{})))
+                              s (into [] (or (get vpos v) #{}))))
+                    num
+                    (into [] num))]
+        (if (= (count grown) (count num)) num (recur grown))))))
+
+;; a variable's kind is authoritative from the CLOSED numeric var set:
+;; :num iff numeric (arithmetic-touched or position-linked to one), else :sym.
+;; Correct even for a var with no named predicate position (a weight that
+;; appears only in a base clause and a computed op).
+(defn- var-kind [num-vars v]
+  (if (contains? num-vars v) :num :sym))
+
+;; ── encode a value for a column of a given kind ─────────────────────
+
+(defn- encode-val [ival kind v]
+  (cond
+    (= kind :num)
+      (if (or (erlang/is_integer v) (erlang/is_float v)) v
+        (throw (ex-info "native-datalog: non-numeric value in an arithmetic column"
+                        {:val v})))
+    :else (intern-value! ival v)))     ; :sym → intern (any value)
+
+(defn- decode-val [ival kind v]
+  (if (= kind :num) v (unintern ival v)))
+
+;; ── IR term construction ────────────────────────────────────────────
+
+(defn- var-term [vslot v] (nd/var-term (intern-sym! vslot v)))
+(defn- const-term-for [ival kind c] (nd/const-term (encode-val ival kind c)))
 
 ;; ── the boundary: what the native kernel can and cannot evaluate ────
-;;
-;; The native path is complete for programs whose body clauses are one of:
-;;   * a rule invocation             (the recursion)
-;;   * a native computed primitive   (+ - * min max, comparisons)
-;;   * a PLAIN pattern/predicate     bl pre-evaluates to a fixed base relation
-;; The one thing it CANNOT do is an ARBITRARY bl function whose argument is a
-;; RECURSIVE variable — e.g. `[(similar-to …)]` inside a recursive rule —
-;; because that value only exists mid-fixpoint and its meaning lives in bl.
-;; Such a program is not rejected outright; it runs on the ALL-BL fixpoint
-;; (datom.query.rules), which is the single evaluator for that class. The
-;; dispatch below is disjoint: a program is either fully native-evaluable or
-;; fully bl-evaluated, so no input is ever evaluated two ways.
 
 (defn- recursive-vars
-  "Variables bound by a rule-invocation clause in `body` (the ones whose
-   values only exist during the fixpoint)."
+  "Variables bound by a rule-invocation clause in `body` — their values only
+   exist during the fixpoint."
   [body names]
   (set (reduce (fn [acc c]
                  (if (invocation? c names)
@@ -168,10 +247,8 @@
                (to-list body))))
 
 (defn- non-native-predicate?
-  "Whether `clause` is a CALL-form predicate/function that the native kernel
-   does NOT understand — i.e. a `[(op …)]`/`[(op …) out]` whose op is not one
-   of the native primitives. `similar-to` and arbitrary bl functions are
-   here; `+`/`<`/etc are not."
+  "A call-form predicate/function whose op the native kernel does NOT know —
+   `[(similar-to …)]`, an arbitrary bl fn. Native primitives are excluded."
   [clause names]
   (and (vector? clause)
        (> (count clause) 0)
@@ -180,126 +257,149 @@
        (not (contains? COMPUTED-OPS (first (get clause 0))))))
 
 (defn- native-compatible-clause?
-  "Whether one body clause is native-evaluable.
-
-   The ONLY incompatible shape is an ARBITRARY (non-primitive) call-form
-   predicate/function — `[(similar-to …)]`, a bl fn — because bl must
-   evaluate it and, if its input is a recursive variable, it cannot be
-   pre-baked into a base relation. A pattern is always fine: even a pattern
-   mentioning a recursive variable (`[?e :attr ?x]` after `(rule ?x)`)
-   becomes a base RELATION that the kernel joins the recursive tuples
-   against — the join is the kernel's job, and the relation is fixed.
-   Rule invocations and native primitives are fine by construction."
+  "Whether one body clause is native-evaluable. The ONLY incompatible shape
+   is an arbitrary (non-primitive) call-form predicate consuming a RECURSIVE
+   variable — bl must evaluate it and its input isn't known until mid-
+   fixpoint. A pattern is always fine (it becomes a fixed base relation, even
+   if it mentions a recursive var — the kernel joins against it). Rule
+   invocations and native primitives are fine by construction."
   [clause names rec-vars]
   (cond
     (invocation? clause names) true
     (computed-clause? clause) true
-    ;; an arbitrary bl predicate consuming a recursive var is the one
-    ;; genuinely incompatible case — bl-only fixpoint handles it.
     (non-native-predicate? clause names)
       (let [vars (filterv datom.query.parse/variable?
                           (into [] (rest (get clause 0))))]
         (not (some (fn [v] (contains? rec-vars v)) vars)))
-    ;; a plain pattern (vector, not a call form) is always a base relation
     (vector? clause) true
     :else false))
 
 (defn native-compatible?
-  "Whether an entire rule set can be evaluated by the native kernel. False
-   ⇒ the caller must use the all-bl fixpoint for this program."
+  "Whether an entire rule set can be evaluated by the native kernel. False ⇒
+   the caller must use the all-bl fixpoint for this program. Value type is NO
+   LONGER a constraint (interning handles any value); the only bar is an
+   arbitrary bl predicate over a recursive variable."
   [rules]
   (let [defs (to-list rules)
         names (set (mapv rule-name defs))]
     (every?
       (fn [d]
         (let [body (rule-body d)
-              rec-vars (recursive-vars body names)
-              ;; every constant in head/body must be an integer, else interning
-              ;; is required (out of prototype scope)
-              all-int? (every? (fn [c]
-                                 (cond
-                                   (invocation? c names)
-                                     (every? (fn [a] (or (datom.query.parse/variable? a)
-                                                         (erlang/is_integer a)))
-                                             (into [] (rest c)))
-                                   :else true))
-                               (to-list body))]
-          (and all-int?
-               (every? (fn [c] (native-compatible-clause? c names rec-vars))
-                       (to-list body)))))
+              rec-vars (recursive-vars body names)]
+          (every? (fn [c] (native-compatible-clause? c names rec-vars))
+                  (to-list body))))
       defs)))
+
+;; ── base relations from a plain clause (bl's authority) ─────────────
+;;
+;; bl evaluates the clause with its OWN engine, projecting the clause's
+;; variables in first-appearance order; each row is encoded per the column
+;; kind of the position the variable links to elsewhere in the program.
+
+(defn- clause-vars [clause]
+  (if (vector? clause)
+    (filterv datom.query.parse/variable? (into [] clause))
+    []))
+
+(defn- plain-clause-relation
+  "[vars encoded-tuples] for a plain clause. Encoding uses each variable's
+   inferred kind so :sym values intern and :num values pass through."
+  [db eval-plain ival num-vars clause]
+  (let [vars (clause-vars clause)
+        rows (eval-plain db {} clause)
+        tuples (mapv (fn [b]
+                       (mapv (fn [v] (encode-val ival (var-kind num-vars v) (get b v)))
+                             vars))
+                     (into [] rows))]
+    [vars tuples]))
 
 ;; ── the driver ──────────────────────────────────────────────────────
 
 (defn materialise-native
   "Least fixpoint of `rules` over `db`, via the native kernel. Same signature
-   and output shape as datom.query.rules/materialise: returns `{name
-   tuple-set}` with value tuples.
-
-   `strategy` (optional) picks the join: :indexed (default) or :nested.
-
-   The program must be integer-valued (graph programs are). A non-integer
-   value raises with a pointer to the interning generalisation."
+   and output shape as datom.query.rules/materialise: `{name tuple-set}` with
+   DECODED value tuples. Works for any value type (interning); requires that
+   the program be `native-compatible?` (checked by the caller/dispatcher)."
   [db rules eval-plain]
   (let [defs (to-list rules)
         names (set (mapv rule-name defs))
-        ;; intern predicate names (rule heads + invocations) and plain-clause
-        ;; source predicates to dense ids
-        pred-tbl (interner)
-        ;; assign each rule-name a predicate id
-        name->id (reduce (fn [m nm] (assoc m nm (intern! pred-tbl nm))) {} (into [] names))
-        id->name (reduce (fn [m nm] (assoc m (get name->id nm) nm)) {} (into [] names))]
-    ;; ── collect base relations from every distinct plain clause ──
-    ;; Each plain clause becomes a fresh EDB predicate; its atom in the rule
-    ;; references that predicate over the clause's variables.
-    (let [edb-acc (erlang/make_ref)
-          _ (erlang/put edb-acc {:rels [] :next-pred 1000000})   ; base preds start high
-          ir-rules
-          (reduce
-            (fn [acc d]
-              (let [head-id (get name->id (rule-name d))
-                    vslot (interner)
-                    ;; head atom
-                    head-atom (nd/atom head-id
-                                       (mapv (fn [a] (term->ir vslot a)) (rule-head-args d)))
-                    ;; body items
-                    body-items
-                    (mapv
-                      (fn [clause]
-                        (cond
-                          ;; recursive/rule invocation → atom over the rule pred id
-                          (invocation? clause names)
-                            (invocation->atom-item (get name->id (first clause)) vslot clause)
-                          ;; computed arithmetic/comparison → computed item
-                          (computed-clause? clause)
-                            (computed->item vslot clause)
-                          ;; plain clause (pattern/predicate) → evaluate to a base
-                          ;; relation, allocate a fresh pred, reference it as an atom
-                          :else
-                            (let [rel (plain-clause-relation db eval-plain vslot clause)
-                                  vars (get rel 0)
-                                  tuples (get rel 1)
-                                  st (erlang/get edb-acc)
-                                  pid (get st :next-pred)]
-                              (erlang/put edb-acc
-                                          (assoc (assoc st :next-pred (+ pid 1))
-                                                 :rels (conj (get st :rels)
-                                                             (nd/edb-relation pid (count vars) tuples))))
-                              (nd/atom-item (nd/atom pid (mapv (fn [v] (term->ir vslot v)) vars)))))
-                        )
-                      (rule-body d))]
-                (conj acc (nd/rule head-atom body-items))))
-            []
-            defs)
-          edb (get (erlang/get edb-acc) :rels)
-          idb-ids (mapv (fn [nm] (get name->id nm)) (into [] names))]
-      ;; ── run the native fixpoint, once ──
-      ;; We materialise ALL idb predicates: call per rule-name, decode.
-      (reduce
-        (fn [out nm]
-          (let [pid (get name->id nm)
-                result (nd/eval ir-rules (to-list idb-ids) (to-list edb) pid 2)
-                tuples (nd/tuples result)]
-            (assoc out nm (set (into [] tuples)))))
-        {}
-        (into [] names)))))
+        vpos (var-positions defs names)
+        num-vars (numeric-var-set defs names vpos)
+        ival (new-interner)
+        pred-tbl (new-symtab)
+        name->id (reduce (fn [m nm] (assoc m nm (intern-sym! pred-tbl nm))) {} (into [] names))
+        ;; head-arg kinds per rule name, so we can decode results
+        head-kinds (reduce
+                     (fn [m d]
+                       (let [hn (rule-name d)]
+                         (if (contains? m hn) m
+                           (assoc m hn (mapv (fn [a] (var-kind num-vars a)) (rule-head-args d))))))
+                     {} (to-list defs))
+        edb-acc (new-table {:rels [] :next-pred 1000000})
+        ir-rules
+        (reduce
+          (fn [acc d]
+            (let [head-id (get name->id (rule-name d))
+                  vslot (new-symtab)
+                  head-atom (nd/atom head-id
+                                     (mapv (fn [a]
+                                             (if (datom.query.parse/variable? a)
+                                               (var-term vslot a)
+                                               (const-term-for ival (var-kind num-vars a) a)))
+                                           (rule-head-args d)))
+                  body-items
+                  (mapv
+                    (fn [clause]
+                      (cond
+                        (invocation? clause names)
+                          (nd/atom-item
+                            (nd/atom (get name->id (first clause))
+                                     (mapv (fn [a]
+                                             (if (datom.query.parse/variable? a)
+                                               (var-term vslot a)
+                                               (const-term-for ival (var-kind num-vars a) a)))
+                                           (into [] (rest clause)))))
+                        (computed-clause? clause)
+                          (let [call (get clause 0)
+                                op (get OP->KW (first call))
+                                args (mapv (fn [a]
+                                             (if (datom.query.parse/variable? a)
+                                               (var-term vslot a)
+                                               (nd/const-term a)))     ; numeric literal
+                                           (into [] (rest call)))]
+                            (if (> (count clause) 1)
+                              (nd/computed-item op args
+                                                (if (datom.query.parse/variable? (get clause 1))
+                                                  (var-term vslot (get clause 1))
+                                                  (nd/const-term (get clause 1))))
+                              (nd/computed-item op args (nd/const-term 1))))
+                        :else
+                          (let [rel (plain-clause-relation db eval-plain ival num-vars clause)
+                                vars (get rel 0)
+                                tuples (get rel 1)
+                                st (tget edb-acc)
+                                pid (get st :next-pred)]
+                            (tset! edb-acc
+                                   (assoc st :next-pred (+ pid 1)
+                                             :rels (conj (get st :rels)
+                                                         (nd/edb-relation pid (count vars) tuples))))
+                            (nd/atom-item (nd/atom pid (mapv (fn [v] (var-term vslot v)) vars))))))
+                    (rule-body d))]
+              (conj acc (nd/rule head-atom body-items))))
+          []
+          defs)
+        edb (get (tget edb-acc) :rels)
+        idb-ids (mapv (fn [nm] (get name->id nm)) (into [] names))]
+    (reduce
+      (fn [out nm]
+        (let [pid (get name->id nm)
+              hk (get head-kinds nm)
+              result (nd/eval ir-rules (to-list idb-ids) (to-list edb) pid 2)
+              tuples (nd/tuples result)
+              decoded (mapv (fn [t]
+                              (mapv (fn [i] (decode-val ival (get hk i) (get t i)))
+                                    (range (count t))))
+                            (into [] tuples))]
+          (assoc out nm (set decoded))))
+      {}
+      (into [] names))))
