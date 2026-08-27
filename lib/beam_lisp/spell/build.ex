@@ -35,11 +35,39 @@ defmodule BeamLisp.Spell.Build do
   @doc "WebSocket origin of the verse dev server (live reload)."
   def ws_origin, do: String.replace_prefix(origin(), "http", "ws")
 
-  @doc "The URL the page's bundle script loads from."
-  def bundle_url, do: "#{origin()}/__spacetime/runtime.js?entry=#{entry()}"
+  @doc """
+  The URL the page's bundle script loads from.
 
-  @doc "The URL of the page's stylesheet."
-  def stylesheet_url, do: "#{origin()}/__spacetime/styles.css?entry=#{entry()}"
+  Root-relative by default: the bundle is a build artifact in `priv/static`
+  (see the host app's page task), served by `Plug.Static` from the SAME origin
+  as the app. One origin means no CORS, no second port in any instruction, and
+  no way to point a browser at the bundle server by mistake — where the page's
+  assigns resolve to nothing and every derived signal throws on undefined.
+
+  Under `live?/0` the URLs point at a running `spacetime serve` instead, which
+  recompiles on change. That is a developer's inner loop, opt-in.
+  """
+  def bundle_url do
+    if live?(),
+      do: "#{origin()}/__spacetime/runtime.js?entry=#{entry()}",
+      else: "/spacetime/spacetime.js"
+  end
+
+  @doc "The URL of the page's stylesheet. See `bundle_url/0`."
+  def stylesheet_url do
+    if live?(),
+      do: "#{origin()}/__spacetime/styles.css?entry=#{entry()}",
+      else: "/spacetime/spacetime.css"
+  end
+
+  @doc """
+  Whether the page is served by a live `spacetime serve` rather than from
+  `priv/static`.
+
+  One switch, read in every place the choice matters, so the boot's publish and
+  the page's URLs can never disagree about which mode this is.
+  """
+  def live?, do: System.get_env("REEL_LIVE") in ["1", "true"]
 
   @doc """
   Write `content` as `<site>/<entry>` and await serve's verdict for exactly

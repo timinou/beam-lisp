@@ -72,13 +72,23 @@ defmodule BeamLisp.Application do
 
   defp verse_port, do: Application.get_env(:beam_lisp, :spell_verse_port, 4444)
 
-  # The verse serve has a wider gate than the chat endpoint: it is the run's
-  # verdict, so anything that can accept a definition needs it — interactive
-  # sessions AND the test suite (whose loop tests publish for real). Tests are
-  # `async: false` across the spell suites, so one serve on one site dir is
-  # one writer at a time.
+  # The verse dev server is a LIVE-RELOAD tool, so it starts only in live mode.
+  #
+  # Tests are `async: false` across the spell suites, so one serve on one site
+  # dir is one writer at a time.
+  #
+  # It used to start alongside the endpoint, which made a dev server part of
+  # booting an application: the app spawned its own `spacetime serve`, the page
+  # was published to it at runtime, and the browser fetched the bundle from a
+  # second origin. A page that is a deterministic artifact of its terms has no
+  # business being compiled at boot — it is built ahead of time and served from
+  # `priv/static` like any other asset.
+  #
+  # `mix test` keeps it: the publish tests exercise the FS protocol itself, and
+  # that protocol is exactly what needs a warm compiler to talk to.
   defp spell_serve? do
-    Code.ensure_loaded?(Mix) and (Mix.env() == :test or spell_endpoint?())
+    Code.ensure_loaded?(Mix) and
+      (Mix.env() == :test or (BeamLisp.Spell.Build.live?() and spell_endpoint?()))
   end
 
   # The chat endpoint runs for interactive sessions only, and by the same rule
