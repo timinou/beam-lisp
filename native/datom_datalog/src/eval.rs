@@ -46,6 +46,62 @@ fn unify(atom: &Atom, tuple: &[i64], binding: &Binding) -> Option<Binding> {
 /// with their required values. Used to probe a hash index instead of scanning.
 
 
+/// Resolve a term to its integer value under a binding: a constant is itself,
+/// a variable must already be bound (None if not).
+fn term_val(t: &Term, b: &Binding) -> Option<i64> {
+    match t {
+        Term::Const(c) => Some(*c),
+        Term::Var(v) => b[*v as usize],
+    }
+}
+
+/// Apply a computed item to a binding, returning the extended binding or None
+/// (arg unbound — a caller error — or a guard that failed / dropped the row).
+///
+/// Arithmetic (`+ - * min max`) folds its args left-to-right and binds `out`
+/// (or checks equality if `out` is already bound/const). A comparison keeps the
+/// row iff it holds. Semantics are pinned in `Op::apply` (saturating), so this
+/// is universal integer math, not a bl-defined predicate that could drift.
+fn apply_computed(c: &Computed, b: &Binding) -> Option<Binding> {
+    // gather argument values; any unbound arg means the rule was mis-ordered
+    let mut vals: Vec<i64> = Vec::with_capacity(c.args.len());
+    for a in &c.args {
+        vals.push(term_val(a, b)?);
+    }
+    if c.op.is_predicate() {
+        // binary comparison guard: needs exactly two args
+        if vals.len() != 2 || c.op.apply(vals[0], vals[1]) == 0 {
+            return None;
+        }
+        return Some(b.clone());
+    }
+    // arithmetic: fold
+    if vals.is_empty() {
+        return None;
+    }
+    let mut acc = vals[0];
+    for &v in &vals[1..] {
+        acc = c.op.apply(acc, v);
+    }
+    // bind or check the output
+    let mut nb = b.clone();
+    match &c.out {
+        Term::Const(k) => {
+            if *k != acc {
+                return None;
+            }
+        }
+        Term::Var(v) => {
+            let slot = *v as usize;
+            match nb[slot] {
+                Some(existing) if existing != acc => return None,
+                _ => nb[slot] = Some(acc),
+            }
+        }
+    }
+    Some(nb)
+}
+
 /// Evaluate a rule body against a set of relations, returning the head tuples
 /// it derives. `indexed` selects the Axis-2 join strategy:
 ///   * false → NESTED LOOP: for each partial binding, scan the whole relation.
@@ -59,7 +115,27 @@ where
     // start with one empty binding
     let mut partials: Vec<Binding> = vec![vec![None; rule.nvars as usize]];
 
-    for (bi, atom) in rule.body.iter().enumerate() {
+    for (bi, item) in rule.body.iter().enumerate() {
+        // A COMPUTED item is applied per-partial: evaluate the op over its
+        // (already-bound) argument variables, then bind the output var or
+        // apply the guard. This is the arithmetic-in-recursion path; it reads
+        // no relation, so it never touches `rel_of`.
+        let atom = match item {
+            BodyItem::Computed(c) => {
+                let mut next: Vec<Binding> = Vec::new();
+                for b in &partials {
+                    if let Some(nb) = apply_computed(c, b) {
+                        next.push(nb);
+                    }
+                }
+                partials = next;
+                if partials.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            BodyItem::Atom(a) => a,
+        };
         let rel = rel_of(bi);
         let mut next: Vec<Binding> = Vec::new();
 
@@ -165,7 +241,7 @@ fn arity_of(prog: &Program, edb: &Db, p: u32) -> usize {
         if r.head.pred == p {
             return r.head.terms.len();
         }
-        for a in &r.body {
+        for a in r.atoms() {
             if a.pred == p {
                 return a.terms.len();
             }
@@ -197,7 +273,10 @@ fn apply_round(
                 .body
                 .iter()
                 .enumerate()
-                .filter(|(_, a)| prog.idb.contains(&a.pred))
+                .filter(|(_, item)| match item {
+                    BodyItem::Atom(a) => prog.idb.contains(&a.pred),
+                    BodyItem::Computed(_) => false,
+                })
                 .map(|(i, _)| i)
                 .collect();
 
@@ -214,7 +293,14 @@ fn apply_round(
                 let out = eval_body(
                     rule,
                     |bi| {
-                        let atom = &rule.body[bi];
+                        // Only atoms consult a relation; a computed item's
+                        // body index never reaches `rel_of` (eval_body
+                        // `continue`s past it). If somehow queried, the empty
+                        // relation is harmless.
+                        let atom = match &rule.body[bi] {
+                            BodyItem::Atom(a) => a,
+                            BodyItem::Computed(_) => return empty_rel(edb, 0),
+                        };
                         // EDB predicate: always the base relation.
                         if !prog.idb.contains(&atom.pred) {
                             return edb.get(atom.pred).unwrap_or_else(|| {

@@ -71,11 +71,16 @@ pub fn transform(prog: &Program, query_pred: u32, seed: i64) -> (Program, Db) {
             }
         };
 
+        // the magic guard atom, as a body item
+        let magic_guard = || {
+            BodyItem::Atom(Atom {
+                pred: mp,
+                terms: vec![Term::Var(guard_var)],
+            })
+        };
+
         // guarded version of the original rule: magic_p(A), <body...>
-        let mut guarded_body = vec![Atom {
-            pred: mp,
-            terms: vec![Term::Var(guard_var)],
-        }];
+        let mut guarded_body: Vec<BodyItem> = vec![magic_guard()];
         guarded_body.extend(rule.body.iter().cloned());
         rules.push(Rule {
             head: rule.head.clone(),
@@ -83,25 +88,24 @@ pub fn transform(prog: &Program, query_pred: u32, seed: i64) -> (Program, Db) {
             nvars: rule.nvars,
         });
 
-        // demand rules: for each recursive body atom, propagate magic to its
+        // demand rules: for each recursive body ATOM, propagate magic to its
         // first argument, guarded by magic on the head var and any preceding
-        // non-recursive atoms (sideways information passing).
-        for (i, atom) in rule.body.iter().enumerate() {
-            if atom.pred != query_pred {
-                continue;
-            }
+        // non-recursive items (sideways information passing). Computed items
+        // among the preceding are carried along unchanged.
+        for (i, item) in rule.body.iter().enumerate() {
+            let atom = match item {
+                BodyItem::Atom(a) if a.pred == query_pred => a,
+                _ => continue,
+            };
             let rec_first = match atom.terms.first() {
                 Some(Term::Var(v)) => *v,
                 _ => continue,
             };
-            // body = magic_p(A) + preceding non-recursive atoms
-            let mut dbody = vec![Atom {
-                pred: mp,
-                terms: vec![Term::Var(guard_var)],
-            }];
+            let mut dbody: Vec<BodyItem> = vec![magic_guard()];
             for prev in rule.body.iter().take(i) {
-                if prev.pred != query_pred {
-                    dbody.push(prev.clone());
+                match prev {
+                    BodyItem::Atom(a) if a.pred == query_pred => {}
+                    other => dbody.push(other.clone()),
                 }
             }
             rules.push(Rule {

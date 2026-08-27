@@ -37,19 +37,59 @@ fn decode_atom(t: T) -> NifResult<Atom> {
     Ok(Atom { pred, terms })
 }
 
+/// A body item on the wire is tagged:
+///   {0, {pred, terms}}          an atom (a relation to join)
+///   {1, op_code, [args], out}   a computed value (arithmetic / comparison)
+fn decode_body_item(t: T) -> NifResult<BodyItem> {
+    // peek the tag
+    let tag: i64 = t.decode::<(i64, T)>().map(|(g, _)| g).or_else(|_| {
+        t.decode::<(i64, i64, Vec<T>, T)>().map(|(g, _, _, _)| g)
+    })?;
+    if tag == 0 {
+        let (_g, atom): (i64, T) = t.decode()?;
+        Ok(BodyItem::Atom(decode_atom(atom)?))
+    } else {
+        let (_g, op_code, args, out): (i64, i64, Vec<T>, T) = t.decode()?;
+        let op = crate::ir::Op::from_code(op_code)
+            .ok_or_else(|| crate::err(format!("unknown computed op code {}", op_code)))?;
+        let args = args
+            .into_iter()
+            .map(decode_term)
+            .collect::<NifResult<Vec<_>>>()?;
+        let out = decode_term(out)?;
+        Ok(BodyItem::Computed(Computed { op, args, out }))
+    }
+}
+
 fn decode_rule(t: T) -> NifResult<Rule> {
     let (head, body): (T, Vec<T>) = t.decode()?;
     let head = decode_atom(head)?;
     let body = body
         .into_iter()
-        .map(decode_atom)
+        .map(decode_body_item)
         .collect::<NifResult<Vec<_>>>()?;
-    // nvars = 1 + max variable slot mentioned
+    // nvars = 1 + max variable slot mentioned, across head + all body items
     let mut nvars = 0u32;
-    for a in std::iter::once(&head).chain(body.iter()) {
-        for term in &a.terms {
-            if let Term::Var(v) = term {
-                nvars = nvars.max(v + 1);
+    let mut note = |t: &Term| {
+        if let Term::Var(v) = t {
+            nvars = nvars.max(v + 1);
+        }
+    };
+    for term in &head.terms {
+        note(term);
+    }
+    for item in &body {
+        match item {
+            BodyItem::Atom(a) => {
+                for term in &a.terms {
+                    note(term);
+                }
+            }
+            BodyItem::Computed(c) => {
+                for term in &c.args {
+                    note(term);
+                }
+                note(&c.out);
             }
         }
     }

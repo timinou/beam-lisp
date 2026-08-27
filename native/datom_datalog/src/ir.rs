@@ -39,20 +39,114 @@ impl Atom {
     }
 }
 
+/// A COMPUTED atom: a value derived from bound variables by a primitive
+/// operation, then bound to (or checked against) a target term. This is the
+/// ONLY thing a rule body needs that a pre-materialised base relation cannot
+/// supply, because its inputs may be recursive variables (`d = dx + w` in
+/// shortest-path). The operation set is CLOSED and universal — `+ - * min max`
+/// and the comparisons — so it introduces no bl-defined semantics that could
+/// drift; `+` means `+`. Anything outside this set is rejected at compile time
+/// (see the bl compiler), which keeps the boundary exact.
+#[derive(Clone, Debug)]
+pub struct Computed {
+    pub op: Op,
+    /// argument terms (variables must already be bound by an earlier body atom)
+    pub args: Vec<Term>,
+    /// where the result goes: a Var binds it, a Const asserts equality (a guard)
+    pub out: Term,
+}
+
+/// The closed primitive vocabulary. Integer semantics are pinned: wrapping is
+/// forbidden (overflow saturates to i64::MIN/MAX so a runaway cost can't wrap
+/// negative and corrupt a min-fixpoint); division by zero yields no binding
+/// (the row is dropped) rather than trapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Add,
+    Sub,
+    Mul,
+    Min,
+    Max,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl Op {
+    pub fn from_code(c: i64) -> Option<Op> {
+        Some(match c {
+            0 => Op::Add,
+            1 => Op::Sub,
+            2 => Op::Mul,
+            3 => Op::Min,
+            4 => Op::Max,
+            10 => Op::Lt,
+            11 => Op::Le,
+            12 => Op::Gt,
+            13 => Op::Ge,
+            14 => Op::Eq,
+            15 => Op::Ne,
+            _ => return None,
+        })
+    }
+
+    /// Whether this op is a COMPARISON (returns a guard, binds nothing).
+    pub fn is_predicate(&self) -> bool {
+        matches!(self, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Ne)
+    }
+
+    /// Evaluate over two integers. Arithmetic saturates; comparisons return
+    /// 1/0. Returns None only if a comparison — the caller treats a false
+    /// comparison as "drop the row".
+    pub fn apply(&self, a: i64, b: i64) -> i64 {
+        match self {
+            Op::Add => a.saturating_add(b),
+            Op::Sub => a.saturating_sub(b),
+            Op::Mul => a.saturating_mul(b),
+            Op::Min => a.min(b),
+            Op::Max => a.max(b),
+            Op::Lt => (a < b) as i64,
+            Op::Le => (a <= b) as i64,
+            Op::Gt => (a > b) as i64,
+            Op::Ge => (a >= b) as i64,
+            Op::Eq => (a == b) as i64,
+            Op::Ne => (a != b) as i64,
+        }
+    }
+}
+
+/// A body element: either an atom (a relation to join) or a computed value.
+#[derive(Clone, Debug)]
+pub enum BodyItem {
+    Atom(Atom),
+    Computed(Computed),
+}
+
 /// A rule: `head :- body`. `nvars` is how many variable slots the rule uses
 /// (so a binding row can be a fixed-width `Vec<Option<i64>>`).
 #[derive(Clone, Debug)]
 pub struct Rule {
     pub head: Atom,
-    pub body: Vec<Atom>,
+    pub body: Vec<BodyItem>,
     pub nvars: u32,
 }
 
 impl Rule {
+    /// The relation-atoms in the body (skipping computed items).
+    pub fn atoms(&self) -> impl Iterator<Item = &Atom> {
+        self.body.iter().filter_map(|b| match b {
+            BodyItem::Atom(a) => Some(a),
+            _ => None,
+        })
+    }
+
     /// Whether the body references any of the given IDB predicates — i.e. the
     /// rule is recursive with respect to them.
     pub fn is_recursive(&self, idb: &[u32]) -> bool {
-        self.body.iter().any(|a| idb.contains(&a.pred))
+        self.atoms().any(|a| idb.contains(&a.pred))
     }
 }
 
