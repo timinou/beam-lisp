@@ -95,7 +95,13 @@ defmodule BeamLisp.MixProject do
       # Rustler is a Rust-side dependency of native/datom_redb (see its
       # Cargo.toml). It is NOT needed as a Mix dep: `defnative` builds
       # and loads the crate itself, via the :beam_lisp_native compiler.
-      {:rustler, "~> 0.38", runtime: false}
+      {:rustler, "~> 0.38", runtime: false},
+      # Explorer (Polars) is the DataFrame surface `datom.frame/q-df` maps a
+      # query result onto — the Session-A analytical backend. It is OPTIONAL at
+      # runtime: `datom/q` and the whole datalog core never touch it, and
+      # `q-df` degrades to a clear "add :explorer" error when it is absent, so a
+      # deployment that only wants set-valued datalog carries no Polars weight.
+      {:explorer, "~> 0.12"}
     ]
   end
 end

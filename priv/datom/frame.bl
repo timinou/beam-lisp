@@ -1,0 +1,179 @@
+; datom/frame.bl — the DataFrame surface over datalog.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; `datom/q` answers a question and returns a SET of tuples — the right shape for
+; logic, the wrong shape for arithmetic. Grouping, summing, percentiles over a
+; hundred thousand rows want COLUMNS, and a column engine (Polars, via Explorer)
+; is what makes that fast. This module is the thin bridge:
+;
+;   q-df     : a query  → an Explorer.DataFrame (one column per :find element)
+;   pull->df : entities → an Explorer.DataFrame (one column per attribute)
+;
+; It is the LAST tenth of the datom→Polars story. PLAN-042 already did the hard
+; nine tenths — the typed tag-free value slot, the `datom_resolve` NIF, and the
+; columnar query engine — so a query already runs column-native inside datom.
+; This module only reshapes the ANSWER into the DataFrame a downstream analytics
+; layer (relay, a notebook) consumes. `datom/q` stays set-valued and untouched;
+; a DataFrame is a projection of the same answer, not a second query path.
+;
+; ══ EXPLORER IS OPTIONAL ════════════════════════════════════════════════════
+;
+; The whole datalog core — connect, transact, q, pull, time-travel — never
+; touches Explorer. Only THIS surface does, so a deployment that wants only
+; set-valued datalog carries no Polars weight: Explorer is an optional dep, and
+; when it is absent `q-df`/`pull->df` raise a single clear "add :explorer"
+; error instead of a cryptic UndefinedFunctionError. `available?` is the gate.
+;
+; ══ COLUMN ORDER AND NAMES ══════════════════════════════════════════════════
+;
+; A DataFrame's columns are ORDERED and NAMED; a datalog answer is an unordered
+; SET of positional tuples. The bridge:
+;   · order  — Explorer.DataFrame.new is fed a LIST of {name, column} pairs (not
+;              a map, which Explorer sorts alphabetically). The list preserves
+;              the :find order, so column i is find-element i.
+;   · names  — a plain variable `?spend/cost` → the column "spend/cost" (the ?
+;              dropped); an aggregate `(sum ?x)` → "sum_x", `(count ?e)` →
+;              "count_e", `(count)` → "count". Names collide only if the query
+;              names two find elements identically, which datalog already
+;              disallows.
+;   · rows   — the set is materialised to a stable vector first (a set has no
+;              order, a DataFrame's rows do), so two runs of the same query
+;              yield row-identical frames — required for the conformance test.
+
+(ns datom.frame
+  (:require [datom.db :as db]
+            [datom.query.parse :as parse]
+            [datom.query.agg :as agg]
+            [datom.query.engine :as engine]))
+
+; ── the Explorer gate ───────────────────────────────────────────────────────
+
+(defn available?
+  "Whether Explorer is loaded — the one gate every DataFrame entry point checks
+   so an absent optional dep fails with a clear message, not a raw
+   UndefinedFunctionError deep in a call. `Code.ensure_loaded?` both loads and
+   tests the module, so it answers true whenever the dep is present, without
+   needing the app to have been started first."
+  []
+  (Code/ensure_loaded? (erlang/binary_to_atom "Elixir.Explorer.DataFrame")))
+
+(defn- require-explorer! []
+  (when (not (available?))
+    (throw (ex-info "datom.frame needs Explorer — add {:explorer, \"~> 0.12\"} to your deps to use q-df/pull->df (datom/q itself needs no DataFrame library)"
+                    {:missing :explorer}))))
+
+; ── naming ──────────────────────────────────────────────────────────────────
+
+(defn- var->name
+  "A datalog variable symbol `?ns/name` → the column string `ns/name` (the `?`
+   dropped). The leading `?` is the variable sigil, not part of the name a
+   DataFrame column should carry."
+  [v]
+  (let [s (str v)]
+    (if (String/starts_with? s "?") (String/slice s 1 (String/length s)) s)))
+
+(defn- find-element->name
+  "A `:find` element → its column name. A plain variable keeps its name; an
+   aggregate `(op ?var)` becomes `op_var` (and `(count)` → `count`), a stable,
+   readable, collision-free label for the aggregated column."
+  [element]
+  (if (agg/aggregate-form? element)
+    (let [op  (str (agg/aggregate-op element))
+          var (agg/aggregate-variable element)]
+      (if (nil? var) op (str op "_" (var->name var))))
+    (var->name element)))
+
+; ── the projection ──────────────────────────────────────────────────────────
+
+(defn- column-names
+  "The ordered column names for a parsed query's `:find` elements. Positional:
+   name i labels the value at tuple position i, because both `engine/q` and
+   `agg/aggregate` project tuples in `:find`-element order."
+  [find-elements]
+  (mapv find-element->name find-elements))
+
+(defn- rows->columns
+  "A vector of same-width row tuples + n column names → a LIST of
+   {name, column-values} pairs in name order, ready for Explorer.DataFrame.new.
+   Column j gathers position j from every row. An empty result still yields one
+   empty column per name, so the frame has the right SHAPE (0 rows, n columns)
+   rather than collapsing to nothing."
+  [names rows]
+  ; A LIST (not a bl vector) of {name, column} tuples: Explorer.DataFrame.new
+  ; dispatches on Table.Reader, which is implemented for an Elixir List but not
+  ; for a %BeamLisp.Vector{} — so the pairs, AND each column inside them, must
+  ; be Erlang lists, not bl vectors.
+  (Enum/to_list
+    (mapv (fn [j]
+            (let [nm  (nth names j)
+                  col (Enum/to_list (mapv (fn [row] (nth row j)) rows))]
+              (erlang/list_to_tuple (list nm col))))
+          (range (count names)))))
+
+(defn- build-df
+  "Ordered {name, column} pairs → an Explorer.DataFrame. The list form (not a
+   map) is what preserves column order; Explorer infers each column's dtype
+   from its values (long/float/string/boolean), which is exactly the schema the
+   typed value slot already carried, recovered here from the projected values."
+  [pairs]
+  (Explorer.DataFrame/new pairs))
+
+; ── q-df ─────────────────────────────────────────────────────────────────────
+
+(defn q-df
+  "Run datalog `query` against `db` (with optional `inputs`) and return an
+   Explorer.DataFrame — one column per `:find` element, in `:find` order, named
+   by `find-element->name`. The analytical sibling of `datom/q`: same query,
+   same engine, same answer, reshaped into columns a DataFrame pipeline (group,
+   agg, join, plot) consumes at Polars speed.
+
+   `q-df` is EXACTLY `q` then hand-built columns — value-for-value — so anything
+   `q` returns, `q-df` returns as a frame, and the two never disagree. It adds
+   nothing to the query semantics; it only changes the container.
+
+   Requires Explorer (an optional dep); raises a clear error when it is absent."
+  [query db & inputs]
+  (require-explorer!)
+  (let [parsed        (parse/parse query)
+        find-elements (:find parsed)
+        names         (column-names find-elements)
+        ; The answer is a SET (unordered); a DataFrame's rows are ordered, so
+        ; materialise to a stable vector before columnising. Sorting makes the
+        ; row order deterministic across runs — a DataFrame invariant the
+        ; set-valued q does not (and should not) promise.
+        result        (apply engine/q query db inputs)
+        rows          (sort (Enum/to_list result))]
+    (build-df (rows->columns names rows))))
+
+; ── pull->df ─────────────────────────────────────────────────────────────────
+
+(defn pull->df
+  "Pull `attrs` for each entity id in `eids` into an Explorer.DataFrame — one
+   ROW per entity, one COLUMN per attribute (plus a leading `:db/id` column),
+   in the given attribute order. The tabular face of `pull`/`pull-many`: where
+   `pull` returns a list of maps, this returns the same data column-oriented for
+   analytics.
+
+   A missing attribute on an entity is a nil cell (Explorer's null), so entities
+   with different attribute sets still tabulate into one rectangular frame.
+   `attrs` are plain attribute keywords (no pull-pattern nesting) — the flat
+   projection a DataFrame column needs; nested pulls stay `pull`'s job.
+
+   Requires Explorer (an optional dep); raises a clear error when it is absent."
+  [db eids attrs]
+  (require-explorer!)
+  (let [eid-list (Enum/to_list eids)
+        ; Column names: db/id first, then each attribute by its ns/name. `str`
+        ; on a namespaced keyword already yields "ns/name" (no leading colon in
+        ; beam-lisp), so it IS the column label — no trimming.
+        names    (into ["db/id"] (mapv (fn [a] (str a)) attrs))
+        ; One row per entity: [eid, (entity attr) …] in attribute order. A
+        ; datom/entity read gives the current value of each attribute; absent →
+        ; nil, which Explorer stores as null and keeps the frame rectangular.
+        rows     (mapv (fn [eid]
+                         (let [ent (db/entity db eid)]
+                           (into [eid]
+                                 (mapv (fn [a] (Map/get ent a)) attrs))))
+                       eid-list)]
+    (build-df (rows->columns names rows))))
