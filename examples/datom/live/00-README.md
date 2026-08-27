@@ -61,16 +61,17 @@ the design doc.
 | 12 | `12-derived-fact.bl` | D | derived state is a **fact** (a tx-fn), not a writer projection — the boundary line |
 | 13 | `13-presence.bl` | E | presence binding: ephemeral membership (`:pg`) composed with the datom feed on one page |
 
-### Filtered live queries — L3 (arriving with PLAN-045)
+### Filtered live queries — L3 (`datom/watch`)
 
-These need the `datom/watch` layer (pattern / guarded / semantic interest) and
-land with that item:
+The `watch` layer fires a callback only when a commit affects a declared
+interest. All three interests are the *same* datalog the query engine already
+speaks, so there is no second matcher to keep in agreement.
 
 | # | file | shows |
 |---|---|---|
-| 07 | `07-pattern-watch.bl` | T1 `datom/watch` on a `:where` pattern, matched against the delta |
-| 08 | `08-guarded-feed.bl` | `auth/guard` ∘ `datom/watch` — a per-principal live feed, no leak |
-| 09 | `09-semantic-feed.bl` | `similar-to` bound-mode changefeed; scores only the delta; time-travels |
+| 07 | `07-pattern-watch.bl` | T1 `datom/watch` on a `:where` pattern, matched against the delta (reuses `unify-pattern`); assertions **and** retractions fire |
+| 08 | `08-guarded-feed.bl` | `auth/guard` ∘ `datom/watch` — two principals, one app query, disjoint feeds, no leak (mirrors `examples/auth/05`) |
+| 09 | `09-semantic-feed.bl` | `similar-to` bound-mode changefeed: scores only the delta's touched embeddings, and time-travels via the db value's basis |
 
 ## The guarantee, in one line
 

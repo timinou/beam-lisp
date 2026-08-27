@@ -1,0 +1,223 @@
+; datom/watch.bl — L3: filtered, per-principal, live queries.
+;
+; ── What this adds over L2 ────────────────────────────────────────────
+;
+; L2 (datom.broadcast) delivers the raw commit stream: every commit, as a
+; delta. That is the right primitive, but a subscriber usually cares about
+; a SLICE — "orders that became :shipped", "alice's documents", "notes near
+; this query vector". L3 is that filter, and it fires the callback ONLY when
+; a commit actually affects the interest.
+;
+; ── The filter already exists (why this file is thin) ─────────────────
+;
+; Three seams already in the tree compose, so watch writes almost no new
+; logic:
+;
+;   1. auth/rls — a per-principal scope is the SAME `:where` clause
+;      injection RLS does. `(auth/guard query filters)` returns a guarded
+;      query; `watch` takes it verbatim. The monotonicity of injection (a
+;      conjunctive clause only REMOVES rows) is exactly the soundness a
+;      subscription needs: a feed can never carry a fact its guard excludes.
+;
+;   2. query.engine/unify-pattern — already matches ONE `:where` pattern
+;      against ONE datom [e a v tx]. A commit's :tx-datoms is a list of
+;      those. So the datom-level filter is: ∃ d ∈ tx-datoms . pattern
+;      unifies with d. We REUSE that matcher — no second engine to keep in
+;      agreement with query semantics (the anti-pattern datom.datalog warns
+;      of).
+;
+;   3. datom.q — for a full query, we do not re-derive incrementally; we
+;      re-RUN the query over :db-before and :db-after and diff the answers.
+;      The answer is by definition the query engine's, so it cannot drift.
+;
+; ── The two tiers ─────────────────────────────────────────────────────
+;
+;   T1  a bare pattern   [?e :order/status :shipped]
+;         → match tx-datoms directly with unify-pattern. Cheapest, and the
+;           callback gets the matching DATOMS (with add/retract).
+;
+;   T2a a full query     (guarded or plain, `:find … :where …`, maybe `:in`)
+;         → prefilter: does the commit touch any attribute the query reads?
+;           If yes, run the query over db-before and db-after and hand the
+;           callback the DIFF {:added :removed}. Semantic (`similar-to`) is
+;           just a T2a query whose clause happens to be analytic — the bound
+;           entity turns it into a filter, so a commit's touched entities are
+;           the only ones scored.
+;
+; ── A watch is a PROCESS ──────────────────────────────────────────────
+;
+; `watch` spawns a subscriber process that listens to the L2 stream and runs
+; the matcher. That is deliberate: a matcher or callback that crashes takes
+; down only the watch, never the writer that holds the ordering guarantee
+; (let-it-crash), and the callback's backpressure is the watch's mailbox,
+; never the writer's. `unwatch` stops it. FEAT-016 holds: the callback
+; receives DATOMS or result ROWS — the reader's own material — never a
+; projection computed by the writer.
+
+(ns datom.watch
+  (:require [datom.conn] [datom.db] [datom.index]
+            [datom.query.engine] [datom.query.parse]))
+
+;; ── recognising the interest shape ──────────────────────────────────
+
+(defn- query-interest?
+  "Whether `interest` is a full query (a `:find` vector or a map), as
+   opposed to a bare T1 pattern like `[?e :a ?v]`.
+
+   A query vector begins with the `:find` section keyword; a map is the
+   assembled query form; anything else is a bare pattern clause."
+  [interest]
+  (or (map? interest)
+      (and (vector? interest)
+           (> (count interest) 0)
+           (= :find (get interest 0)))))
+
+;; ── T1: match a bare pattern against the delta ──────────────────────
+
+(defn- pattern-matches
+  "Every tx-datom that unifies with `pattern`, as change maps.
+
+   Reuses `query.engine/unify-pattern` — the SAME matcher the query engine
+   runs — so a T1 watch and a T1 query agree by construction. Each result
+   carries the datom, its bindings, and whether it was asserted or retracted
+   (invariant 5: retractions fire too)."
+  [pattern tx-datoms]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [b (datom.query.engine/unify-pattern {} pattern d)]
+                     (if (nil? b)
+                       nil
+                       {:datom d
+                        :bindings b
+                        :e (datom.index/-e d)
+                        :a (datom.index/-a d)
+                        :v (datom.index/-v d)
+                        :added (datom.index/assertion? d)})))
+                 tx-datoms)))
+
+;; ── T2a: prefilter by attribute, then diff the query result ─────────
+
+(defn- pattern-clauses
+  "The pattern clauses of a parsed query's `:where` (skipping predicates,
+   analytic and rule clauses — only patterns name attributes to watch)."
+  [where]
+  (filterv datom.query.parse/pattern-clause? where))
+
+(defn- clause-attr
+  "The attribute a pattern clause constrains, if it is a constant keyword.
+
+   `[?e :order/status ?v]` → `:order/status`. A clause whose attribute is a
+   variable constrains no single attribute, so it contributes nothing to the
+   prefilter and returns nil (the query still runs on any commit that clears
+   another clause's attribute — a variable-attribute query is rare and the
+   prefilter stays conservative)."
+  [clause]
+  (let [a (if (> (count clause) 1) (get clause 1) nil)]
+    (if (keyword? a) a nil)))
+
+(defn- query-attrs
+  "The set of attributes a query reads through its pattern clauses."
+  [parsed]
+  (reduce (fn [acc c]
+            (let [a (clause-attr c)]
+              (if (nil? a) acc (conj acc a))))
+          #{}
+          (pattern-clauses (:where parsed))))
+
+(defn- touches?
+  "Whether a commit's tx-datoms touch any attribute in `attrs`.
+
+   The cheap T0-style prefilter: a set-membership test over what changed,
+   so a commit that cannot possibly affect the query is discarded WITHOUT
+   running it. An empty `attrs` (a query with only variable attributes) is
+   treated as 'always relevant' — correctness over the optimisation."
+  [attrs tx-datoms]
+  (if (empty? attrs)
+    true
+    (reduce (fn [_ d]
+              (if (contains? attrs (datom.index/-a d)) (reduced true) false))
+            false
+            tx-datoms)))
+
+(defn- query-diff
+  "Run `query` over db-before and db-after and return `{:added :removed}`
+   as sets of result tuples, or nil if nothing changed.
+
+   The answer is the query engine's on both sides, so the diff cannot drift
+   from query semantics (invariant 3). `inputs` are the query's `:in`
+   arguments (a query vector for the semantic case)."
+  [query inputs db-before db-after]
+  (let [before (apply datom.query.engine/q query db-before inputs)
+        after  (apply datom.query.engine/q query db-after inputs)]
+    (if (= before after)
+      nil
+      {:added   (reduce (fn [s x] (if (contains? before x) s (conj s x))) #{} after)
+       :removed (reduce (fn [s x] (if (contains? after x) s (conj s x))) #{} before)})))
+
+;; ── the watch process ───────────────────────────────────────────────
+
+(defn- run-t1
+  "The T1 loop: listen, match each commit's delta against `pattern`, fire
+   `callback` with the matching change maps."
+  [conn pattern callback]
+  (datom.conn/listen! conn)
+  (loop []
+    (receive
+      [:datom/tx _basis tx-datoms]
+        (let [changes (pattern-matches pattern tx-datoms)]
+          (when (seq changes) (callback changes))
+          (recur))
+      [:datom/watch-stop] (datom.conn/unlisten! conn)
+      (after 3600000 (recur)))))
+
+(defn- run-t2a
+  "The T2a loop: listen, prefilter on touched attributes, and on a
+   relevant commit run the query over before/after and fire `callback`
+   with the diff. Holds the last db value to diff against."
+  [conn query inputs callback]
+  (datom.conn/listen! conn)
+  (let [parsed (datom.query.parse/parse query)
+        attrs (query-attrs parsed)]
+    (loop [db-before (datom.conn/db conn)]
+      (receive
+        [:datom/tx _basis tx-datoms]
+          (if (touches? attrs tx-datoms)
+            (let [db-after (datom.conn/db conn)
+                  d (query-diff query inputs db-before db-after)]
+              (when (some? d) (callback d))
+              (recur db-after))
+            (recur db-before))
+        [:datom/watch-stop] (datom.conn/unlisten! conn)
+        (after 3600000 (recur db-before))))))
+
+(defn watch
+  "Spawn a watch over `conn`, returning a watch reference (a pid) to pass
+   to `unwatch`.
+
+   `interest` is either:
+     * a bare PATTERN `[?e :order/status :shipped]` (T1) — `callback` gets a
+       vector of change maps `{:datom :e :a :v :bindings :added}`, one per
+       matching tx-datom;
+     * a full QUERY (T2a), a `[:find … :where …]` vector or map, possibly
+       `auth/guard`'d — `callback` gets a diff `{:added :removed}` of result
+       tuples whenever a relevant commit changes the answer.
+
+   `inputs` are the query's `:in` arguments (e.g. a query vector for a
+   `similar-to` clause); omit for T1 or an input-free query.
+
+   The watch runs in its own process: a crashing callback takes down only
+   the watch, and its backpressure never reaches the writer."
+  ([conn interest callback] (watch conn interest [] callback))
+  ([conn interest inputs callback]
+   (erlang/spawn
+     (fn []
+       (if (query-interest? interest)
+         (run-t2a conn interest inputs callback)
+         (run-t1 conn interest callback))))))
+
+(defn unwatch
+  "Stop a watch started by `watch`. Idempotent and safe on a dead watch."
+  [watch-ref]
+  (if (Process/alive? watch-ref)
+    (do (erlang/send watch-ref [:datom/watch-stop]) :ok)
+    :ok))

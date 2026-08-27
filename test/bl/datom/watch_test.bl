@@ -1,0 +1,163 @@
+; watch_test.bl — L3: filtered live queries (the five soundness invariants).
+;
+; A watch must be SOUND: it fires exactly when its interest is affected,
+; never for an unrelated commit, and its verdict must agree with the query
+; engine it reuses. Each test here pins one invariant from
+; docs/datom-as-a-broadcast-substrate.md §§2–4 and PLAN-045.
+;
+; A watch runs in its own process and calls back there, so a test routes
+; the callback's result to its own mailbox with `send` and asserts by
+; receiving (a fire) or timing out (silence).
+
+(ns datom.watch.test
+  (:require [datom] [datom.watch] [datom.vector]))
+
+(defn- order-conn []
+  (datom/connect
+    [{:db/ident :order/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :order/status :db/valueType :db.type/keyword}
+     {:db/ident :order/total :db/valueType :db.type/long}]))
+
+;; receive the next callback result, or :silent
+(defn- fired [ms]
+  (receive
+    [:cb payload] payload
+    (after ms :silent)))
+
+;; a T1 watch that forwards its change vector to `me`
+(defn- watch-t1 [conn pattern me]
+  (datom.watch/watch conn pattern
+    (fn [changes] (erlang/send me [:cb changes]))))
+
+;; a T2a watch that forwards its diff to `me`
+(defn- watch-t2a
+  ([conn query me] (watch-t2a conn query [] me))
+  ([conn query inputs me]
+   (datom.watch/watch conn query inputs
+     (fn [d] (erlang/send me [:cb d])))))
+
+;; ── invariant 1: filter soundness (no false positives) ──────────────
+
+(deftest a-pattern-watch-fires-only-on-a-match
+  (let [conn (order-conn)
+        me (erlang/self)
+        w (watch-t1 conn '[?e :order/status :shipped] me)]
+    (Process/sleep 30)
+    ; a non-matching status must NOT fire
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (is (= :silent (fired 300)) ":pending does not fire a :shipped watch")
+    ; a matching status MUST fire, with the right entity
+    (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :shipped}])
+    (let [changes (fired 1000)]
+      (is (not (= :silent changes)) ":shipped fires the watch")
+      (is (= 1 (count changes)) "exactly one matching datom")
+      (is (= :shipped (:v (first changes))) "and it carries the matched value"))
+    (datom.watch/unwatch w)))
+
+;; ── invariant 5: retraction fires too ───────────────────────────────
+
+(deftest a-watch-sees-retractions-not-only-assertions
+  (let [conn (order-conn)
+        me (erlang/self)]
+    ; establish a :shipped fact
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :shipped}])
+    (def o1 (datom/lookup-ref (datom/db conn) [:order/id 1]))
+    (let [w (watch-t1 conn '[?e :order/status :shipped] me)]
+      (Process/sleep 30)
+      ; changing the status RETRACTS :shipped (and asserts the new one) —
+      ; the retraction of :shipped must reach the watch
+      (datom/transact! conn [[:db/add o1 :order/status :delivered]])
+      (let [changes (fired 1000)]
+        (is (not (= :silent changes)) "the retraction of :shipped fires")
+        (let [ship (first (filterv (fn [c] (= :shipped (:v c))) changes))]
+          (is (some? ship) "the :shipped change is present")
+          (is (= false (:added ship)) "and it is a RETRACTION, not an assertion")))
+      (datom.watch/unwatch w))))
+
+;; ── invariant 3: matcher = query semantics (diff agrees with q) ─────
+
+(deftest a-query-watch-diff-agrees-with-the-engine
+  (let [conn (order-conn)
+        me (erlang/self)
+        q '[:find ?id :where [?e :order/status :shipped] [?e :order/id ?id]]
+        w (watch-t2a conn q me)]
+    (Process/sleep 30)
+    (let [before (datom/q q (datom/db conn))]
+      (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :shipped}])
+      (let [d (fired 1000)
+            after (datom/q q (datom/db conn))]
+        (is (not (= :silent d)) "a relevant commit fires the query watch")
+        ; the diff the watch reported must reconstruct the engine's answer:
+        ; before ∪ added − removed = after
+        (let [reconstructed (reduce (fn [s x] (conj s x))
+                                    (reduce (fn [s x] (if (contains? (:removed d) x) s (conj s x)))
+                                            #{} before)
+                                    (:added d))]
+          (is (= after reconstructed)
+              "before + added - removed = the engine's after (no drift)"))))
+    (datom.watch/unwatch w)))
+
+;; ── invariant 1 (query tier): an unrelated commit is silent ─────────
+
+(deftest a-query-watch-ignores-an-unrelated-commit
+  (let [conn (order-conn)
+        me (erlang/self)
+        ; interest reads only :order/status and :order/id
+        q '[:find ?id :where [?e :order/status :shipped] [?e :order/id ?id]]
+        w (watch-t2a conn q me)]
+    (Process/sleep 30)
+    ; a commit touching only :order/total cannot change the answer
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/total 99}])
+    (is (= :silent (fired 300))
+        "a commit touching only :order/total does not fire the watch")
+    ; and one touching :order/status does
+    (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :shipped}])
+    (is (not (= :silent (fired 1000))) ":order/status fires it")
+    (datom.watch/unwatch w)))
+
+;; ── invariant 4: semantic bound-mode scores only touched entities ───
+
+(deftest a-semantic-watch-scores-only-the-commit
+  (let [conn (datom/connect
+               [{:db/ident :doc/id :db/valueType :db.type/long
+                 :db/unique :db.unique/identity}
+                {:db/ident :doc/embedding :db/valueType :db.type/vector}])
+        me (erlang/self)
+        ; a corpus already present, far from the query vector
+        _ (datom/transact! conn [{:db/id -1 :doc/id 1
+                                  :doc/embedding (datom.vector/embedding [0.0 0.0 1.0])}])
+        qv (datom.vector/embedding [1.0 0.0 0.0])
+        w (watch-t2a conn
+            '[:find ?e ?score :in $ ?q
+              :where [?e :doc/embedding _]
+                     [(similar-to :doc/embedding ?q 5) [?e ?score]]]
+            [qv] me)]
+    (Process/sleep 30)
+    ; write a NEAR doc — it should appear in the diff with a high score
+    (datom/transact! conn [{:db/id -2 :doc/id 2
+                            :doc/embedding (datom.vector/embedding [1.0 0.05 0.0])}])
+    (let [d (fired 1000)]
+      (is (not (= :silent d)) "writing a near doc fires the semantic watch")
+      ; the added row is the NEW entity, scored — bound-?e restricted the
+      ; corpus to what changed, so entity 1 (far, untouched) is not rescored
+      ; into this diff as an addition.
+      (let [added-entities (into #{} (map first (:added d)))]
+        (is (seq (:added d)) "the near doc is in the diff")
+        (is (every? (fn [row] (> (second row) 0.5)) (:added d))
+            "and every added row scored as a genuine neighbour")))
+    (datom.watch/unwatch w)))
+
+;; ── unwatch stops delivery ──────────────────────────────────────────
+
+(deftest unwatch-stops-a-watch
+  (let [conn (order-conn)
+        me (erlang/self)
+        w (watch-t1 conn '[?e :order/status :shipped] me)]
+    (Process/sleep 30)
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :shipped}])
+    (is (not (= :silent (fired 1000))) "fires while watching")
+    (datom.watch/unwatch w)
+    (Process/sleep 50)
+    (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :shipped}])
+    (is (= :silent (fired 300)) "silent after unwatch")))

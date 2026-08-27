@@ -1,0 +1,103 @@
+; watch_rls_test.bl — the security invariant: a guarded watch never leaks.
+;
+; This is invariant 2 of PLAN-045, and it is the one that MUST be a test
+; rather than a comment: a per-principal live feed built with
+; `auth/guard ∘ datom/watch` must NEVER deliver a fact scoped to another
+; principal. If it can, the whole "filter = security" claim is empty.
+;
+; The mechanism is the same monotonic clause injection RLS uses for reads
+; (priv/auth/rls.bl): a conjunctive `:where` clause can only REMOVE rows,
+; never add one, so a guarded query — and therefore a guarded watch — is
+; incapable of returning a row the guard excludes. This test proves the
+; property holds for the LIVE feed, mirroring examples/auth/05.
+
+(ns datom.watch.rls.test
+  (:require [datom] [datom.watch] [auth]))
+
+(defn- docs-conn []
+  (datom/connect
+    [{:db/ident :doc/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :doc/owner :db/valueType :db.type/string}
+     {:db/ident :doc/title :db/valueType :db.type/string}]))
+
+;; a guarded live feed for `principal`, forwarding its diffs to `me`
+(defn- feed-for [conn principal me]
+  (let [q (auth/guard '[:find ?id :where [?e :doc/id ?id] [?e :doc/title _]]
+                      [(auth/owner-filter '?e :doc/owner principal)])]
+    (datom.watch/watch conn q
+      (fn [d] (erlang/send me [:feed principal d])))))
+
+;; drain everything currently delivered for a principal, collecting added rows
+(defn- drain-added [principal ms]
+  (loop [acc #{}]
+    (receive
+      [:feed p d]
+        (if (= p principal)
+          (recur (reduce (fn [s row] (conj s row)) acc (:added d)))
+          (recur acc))
+      (after ms acc))))
+
+;; drain ALL principals' feeds in one pass → {principal -> #{rows}}. Needed
+;; when two feeds deliver concurrently: draining one principal first would
+;; consume and discard the other's messages.
+(defn- drain-all [ms]
+  (loop [acc {}]
+    (receive
+      [:feed p d]
+        (recur (assoc acc p (reduce (fn [s row] (conj s row))
+                                    (or (get acc p) #{}) (:added d))))
+      (after ms acc))))
+
+;; ── the leak test ───────────────────────────────────────────────────
+
+(deftest a-guarded-watch-never-delivers-another-principals-rows
+  (let [conn (docs-conn)
+        me (erlang/self)
+        wa (feed-for conn "alice" me)]
+    (Process/sleep 30)
+    ; a write to BOB's document must reach alice's feed ZERO times
+    (datom/transact! conn [{:db/id -1 :doc/id 1 :doc/owner "bob" :doc/title "Bob's secret"}])
+    (is (= #{} (drain-added "alice" 400))
+        "bob's document never appears in alice's guarded feed")
+    ; a write to ALICE's document MUST reach her feed
+    (datom/transact! conn [{:db/id -2 :doc/id 2 :doc/owner "alice" :doc/title "Alice's plan"}])
+    (is (= #{[2]} (drain-added "alice" 1000))
+        "alice's own document does reach her feed")
+    (datom.watch/unwatch wa)))
+
+(deftest two-principals-get-disjoint-feeds
+  ; The same app query, two principals, two watches — each sees only its
+  ; own rows, exactly as examples/auth/05 shows for reads.
+  (let [conn (docs-conn)
+        me (erlang/self)
+        wa (feed-for conn "alice" me)
+        wb (feed-for conn "bob" me)]
+    (Process/sleep 30)
+    ; interleave writes to both owners in one transaction each
+    (datom/transact! conn [{:db/id -1 :doc/id 1 :doc/owner "alice" :doc/title "A1"}])
+    (datom/transact! conn [{:db/id -2 :doc/id 2 :doc/owner "bob"   :doc/title "B1"}])
+    (datom/transact! conn [{:db/id -3 :doc/id 3 :doc/owner "alice" :doc/title "A2"}])
+    (let [seen (drain-all 800)
+          alice-saw (or (get seen "alice") #{})
+          bob-saw   (or (get seen "bob") #{})]
+      (is (= #{[1] [3]} alice-saw) "alice sees only her two documents")
+      (is (= #{[2]} bob-saw) "bob sees only his one document")
+      (is (= #{} (reduce (fn [s x] (if (contains? bob-saw x) (conj s x) s)) #{} alice-saw))
+          "and the two feeds are disjoint — no shared row"))
+    (datom.watch/unwatch wa)
+    (datom.watch/unwatch wb)))
+
+(deftest a-guarded-watch-is-silent-when-only-forbidden-rows-change
+  ; If every change in a commit belongs to another principal, the guarded
+  ; watch must not fire AT ALL — not fire-with-empty-diff, but stay silent,
+  ; because the guarded query's answer did not move.
+  (let [conn (docs-conn)
+        me (erlang/self)
+        wa (feed-for conn "alice" me)]
+    (Process/sleep 30)
+    (datom/transact! conn [{:db/id -1 :doc/id 1 :doc/owner "carol" :doc/title "C1"}
+                           {:db/id -2 :doc/id 2 :doc/owner "dave"  :doc/title "D1"}])
+    (is (= :silent (receive [:feed _ _] :fired (after 400 :silent)))
+        "a commit of only other principals' rows leaves alice's feed silent")
+    (datom.watch/unwatch wa)))
