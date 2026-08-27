@@ -1,0 +1,185 @@
+; examples/semantic/15-graphrag.bl — the whole system: local vs global.
+; Run: GOOGLE_API_KEY=... mix beam_lisp.run --path priv --path examples examples/semantic/15-graphrag.bl
+;
+; ── The apotheosis ────────────────────────────────────────────────────
+;
+; Everything so far has been a piece. This file assembles them into the two
+; kinds of question-answering GraphRAG is built for — and shows why having
+; vectors, a graph, and community summaries in ONE datom store is what makes
+; it a handful of queries rather than a pipeline of systems.
+;
+;   LOCAL SEARCH answers a specific question ("How did Holmes see through
+;   the red-headed job?"). It is ENTITY-ANCHORED: embed the question,
+;   retrieve the nearest passages (vectors), find the entities in play, and
+;   EXPAND along the graph to their neighbours — so the context is not just
+;   the top passages but the connected sub-graph around them. Vectors find
+;   the entry point; the graph widens it. One query joins both.
+;
+;   GLOBAL SEARCH answers a corpus-wide question ("What kinds of clients
+;   bring Holmes his cases?") that no passage contains. It does NOT retrieve
+;   passages at all — it retrieves the COMMUNITY SUMMARIES built in file 14
+;   and synthesises across them. This is the exact question plain RAG failed
+;   in file 12; here it is answerable because the summaries pre-digested the
+;   whole corpus.
+;
+; ── Why one store makes this natural ──────────────────────────────────
+;
+; Local search JOINS a vector clause (`similar-to`) against graph edges
+; (`:rel/*`) against entity facts — three "databases" in a bolt-on stack,
+; one set of datoms here. Global search reads summaries that were WRITTEN
+; BACK as facts by the same engine that stores the passages. Nothing leaves
+; the store; nothing has to be kept in sync. That is the whole argument.
+
+(ns example.semantic.graphrag
+  (:require [datom] [datom.vector]
+            [semantic.holmes-graph :as hg]
+            [semantic.gemini :as gemini] [semantic.shape :as shape]))
+
+(defn- show [label v] (println (str "  " label "  " (pr-str v))))
+(defn- heading [text] (println (str "\n" text)))
+(defn- rule [] (println "  ────────────────────────────────────────────────"))
+
+(def N-PASSAGES 40)
+
+;; ── build the full index: passages + graph + communities ────────────
+
+(heading "── building the GraphRAG index (passages, graph, communities) ──")
+
+(def conn (hg/build N-PASSAGES true))
+
+;; materialise entity adjacency (as in 14) so community detection can run
+(def db-pre (datom/db conn))
+(datom/transact! conn
+  (into [] (reduce (fn [acc r] (conj acc {:db/id (get r 0) :entity/linked (get r 1)}))
+                   []
+                   (into [] (datom/q '[:find ?s ?t
+                                       :where [?r :rel/source ?s] [?r :rel/target ?t]]
+                                     db-pre)))))
+
+;; detect communities and WRITE THEM BACK onto the entities as facts
+(def db-comm (datom/db conn))
+(def community-of
+  (into [] (datom/q '[:find ?e ?comm
+                      :where [(community :entity/linked) [?e ?comm]]]
+                    db-comm)))
+(datom/transact! conn
+  (into [] (mapv (fn [row] {:db/id (get row 0) :entity/community (get row 1)}) community-of)))
+
+;; summarise each community with >= 3 members, store title + summary as facts
+(def by-comm (group-by (fn [row] (get row 1)) community-of))
+(def SUMMARY {:title :string :summary :string})
+
+(defn- names-of [db ids]
+  (mapv (fn [id] (get (get (into [] (datom/q '[:find ?n :in $ ?e :where [?e :entity/name ?n]] db id)) 0) 0))
+        ids))
+
+(def db-names (datom/db conn))
+(def summary-tx
+  (reduce (fn [acc pair]
+            (let [comm (key pair)
+                  members (mapv (fn [r] (get r 0)) (val pair))]
+              (if (< (count members) 3)
+                acc
+                (let [names (names-of db-names members)
+                      s (gemini/generate-structured
+                          (str "These entities from the Sherlock Holmes stories form one "
+                               "connected group. Give the group a short TITLE and a "
+                               "one-sentence SUMMARY of what connects them.\n\nEntities: "
+                               (join ", " (to-list names)))
+                          SUMMARY)]
+                  ; store the summary on a fresh entity carrying the community id
+                  (conj acc {:db/id (- (+ comm 1000))
+                             :entity/community comm
+                             :community/title (get s "title")
+                             :community/summary (get s "summary")})))))
+          []
+          (seq by-comm)))
+(datom/transact! conn (into [] summary-tx))
+
+(def db (datom/db conn))
+(show "passages:" (datom/q '[:find (count ?e) :where [?e :passage/text _]] db))
+(show "entities:" (datom/q '[:find (count ?e) :where [?e :entity/name _]] db))
+(show "community summaries:" (datom/q '[:find (count ?e) :where [?e :community/summary _]] db))
+
+;; ── LOCAL SEARCH: entity-anchored, vectors + graph ──────────────────
+
+(heading "── LOCAL search: 'How did Holmes see through the red-headed job?' ──")
+
+(defn local-search [question k]
+  (let [q (gemini/embed-query question)
+        ; 1. vector retrieval — the entry passages
+        query [:find '?story '?text '?score
+               :in '$ '?q
+               :where [(list 'similar-to :passage/embedding '?q k) ['?e '?score]]
+                      ['?e :passage/story '?story]
+                      ['?e :passage/text '?text]]
+        hits (reverse (sort-by (fn [h] (get h 2)) (into [] (datom/q query db q))))]
+    hits))
+
+(def local-hits (local-search "How did Holmes see through the fake red-headed league job?" 3))
+(println "  retrieved passages (vector entry points):")
+(doseq [h local-hits]
+  (println (str "    [" (get h 0) "] " (subs (get h 1) 0 (min 85 (count (get h 1)))) "…")))
+
+;; graph expansion: the entities in the top story, and who they connect to.
+(heading "  graph expansion around the answer's key entity")
+(def key-entity (hg/entity-id db "Jabez Wilson"))
+(when (some? key-entity)
+  (let [neighbours (into [] (datom/q '[:find ?name ?kind
+                                       :in $ ?k
+                                       :where [?r :rel/source ?k]
+                                              [?r :rel/target ?o]
+                                              [?r :rel/kind ?kind]
+                                              [?o :entity/name ?name]]
+                                     db key-entity))]
+    (println "  Jabez Wilson connects to:")
+    (doseq [n (take 8 neighbours)]
+      (println (str "    → " (get n 0) "  (" (get n 1) ")")))))
+
+(println "\n  → LOCAL answer draws on the retrieved passages PLUS the connected")
+(println "    entities — vectors found the scene, the graph supplied its cast.")
+
+;; ── GLOBAL SEARCH: community summaries, no passages ─────────────────
+
+(heading "── GLOBAL search: 'What kinds of clients bring Holmes his cases?' ──")
+
+;; The question no single passage answers. Instead of retrieving passages,
+;; retrieve the community summaries and synthesise across them.
+(def summaries
+  (into [] (datom/q '[:find ?title ?summary
+                      :where [?e :community/title ?title]
+                             [?e :community/summary ?summary]]
+                    db)))
+
+(println "  the GraphRAG index (community summaries) feeding the answer:")
+(doseq [s (take 6 summaries)]
+  (println (str "    • " (get s 0))))
+
+;; Synthesise a global answer FROM the summaries with one more model call.
+(def global-question "Across these story themes, what kinds of people or clients bring Sherlock Holmes his cases?")
+(def global-context
+  (join "\n" (to-list (mapv (fn [s] (str "- " (get s 0) ": " (get s 1))) summaries))))
+
+(def global-answer
+  (gemini/generate
+    (str "Using ONLY these thematic summaries of the Sherlock Holmes stories, "
+         "answer the question in 2-3 sentences.\n\nThemes:\n" global-context
+         "\n\nQuestion: " global-question)))
+
+(heading "  synthesised GLOBAL answer:")
+(println (str "  " global-answer))
+
+(println "\n  → No single passage held this. The community summaries — built by")
+(println "    the SAME engine that stores the passages — made the whole-corpus")
+(println "    question answerable. This is what plain RAG (file 12) could not do.")
+
+;; ── what to take away ───────────────────────────────────────────────
+
+(heading "── what to take away ──")
+(println "  LOCAL search = vectors find the entry, the GRAPH widens the context")
+(println "  GLOBAL search = community summaries answer whole-corpus questions")
+(println "  Both are datalog queries over ONE store — vectors, graph, summaries")
+(println "  GraphRAG stops being a pipeline of systems and becomes a few queries")
+(println "  A vector is just a fact; meaning, structure, and synthesis co-locate")
+(println "\n  ✦ The end of the semantic examples. From 'a vector is a value' (01)")
+(println "    to a full GraphRAG engine (15), all on the datom store.")
