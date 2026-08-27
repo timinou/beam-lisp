@@ -1,0 +1,104 @@
+; datom/query/analytic.bl — generating clauses that read the store.
+;
+; ── What sets these apart from predicates ─────────────────────────────
+;
+; A predicate clause `[(> ?a 40)]` is a pure function of a row: it reads
+; variables already bound and either keeps the row or drops it. It never
+; touches the database and never invents a row.
+;
+; An analytic clause does both. `[(similar-to :doc/embedding ?q 10) [?e ?score]]`
+; READS the store (every embedding in that column) and GENERATES rows (one
+; per near neighbour), binding `?e` and `?score` that nothing bound before.
+; It is, in datalog terms, closer to a pattern than a predicate — a source
+; of bindings — which is why it gets its own evaluator rather than riding
+; the function-resolution path.
+;
+; ── The two modes, and why the second is the whole point ──────────────
+;
+; `similar-to` behaves differently depending on whether its output entity
+; is already bound, and this falls straight out of unification:
+;
+;   FREE ?e   — generate: emit the k nearest as new rows. Ordinary kNN.
+;   BOUND ?e  — filter: score only the entities upstream clauses already
+;               selected, keep those that are genuine neighbours.
+;
+; The bound case is the one a bolted-on vector database cannot do. When a
+; query says "notes tagged :work AND semantically near ?q", the tag clause
+; runs first and binds ?e to a handful of entities; `similar-to` then scores
+; exactly those, in the same engine, transactionally consistent with the
+; facts it just joined against. No copying a candidate set out to a separate
+; system and back. The similarity is a JOIN KEY like any other.
+;
+; ── Where the DB semantics live ───────────────────────────────────────
+;
+; This layer reads CURRENT datoms through `datom.db/attr-datoms`, so
+; retraction and time-travel filtering have already happened — a
+; similarity search `as-of` last week sees last week's corpus for free,
+; because it reads the same filtered datoms every other query reads. The
+; vector MATH is in Rust (`datom.vector/search`); the choice of WHICH
+; vectors to compare is datalog's, here, basis-aware.
+
+(ns datom.query.analytic
+  (:require [datom.db] [datom.index] [datom.query.parse] [datom.vector]))
+
+(defn- resolve-arg
+  "A clause argument's value: looked up in `bindings` when it is a
+   variable, taken literally otherwise. The same resolution a predicate's
+   arguments get."
+  [bindings term]
+  (if (datom.query.parse/variable? term)
+    (get bindings term)
+    term))
+
+(defn- as-embedding
+  "Coerce a query argument to a `DVec`.
+
+   Accepts a `DVec` directly (the usual case: an embedding computed
+   outside and passed via `:in`), or a sequence of numbers (convenience
+   for a literal query vector written inline). Anything else is a caller
+   error worth failing on rather than scoring as garbage."
+  [v]
+  (cond
+    (datom.vector/vec? v) v
+    (or (vector? v) (seq? v)) (datom.vector/embedding v)
+    :else (throw (ex-info "similar-to: query is not an embedding or number sequence"
+                          {:value v}))))
+
+(defn- similar-to
+  "Evaluate `(similar-to attr query k [rerank])`, returning `[[e score] …]`.
+
+   `attr` is the embedding column, `query` an embedding (or numbers), `k`
+   how many neighbours. Optional `rerank` overrides the binary-quantisation
+   candidate width (see datom.vector); omitted, it scales with k, and `0`
+   forces an exact flat scan.
+
+   The corpus is every CURRENT datom of `attr` (basis-filtered upstream),
+   paired as `[entity embedding]`. A datom whose value is not a `DVec`
+   (a mis-typed column) is skipped rather than crashing the query."
+  [db args]
+  (let [attr (get args 0)
+        query (as-embedding (get args 1))
+        k (get args 2)
+        rerank (if (> (count args) 3) (get args 3) (datom.vector/default-rerank k))
+        candidates (filterv some?
+                            (mapv (fn [d]
+                                    (let [e (datom.index/-e d)
+                                          v (datom.index/-v d)]
+                                      (if (datom.vector/vec? v) [e v] nil)))
+                                  (datom.db/attr-datoms db attr)))]
+    (datom.vector/search query candidates k rerank)))
+
+(defn eval-op
+  "Dispatch an analytic operator to its implementation, returning a
+   sequence of OUTPUT TUPLES the engine unifies against the clause's
+   output terms.
+
+   One entry per analytic verb. `similar-to` is wave B; `cluster`,
+   `community`, `components` and `project-2d` join it in wave C, each
+   reading the store and returning `[entity group-or-coord]` tuples the
+   same shape."
+  [db bindings op arg-terms]
+  (let [args (mapv (fn [t] (resolve-arg bindings t)) arg-terms)]
+    (cond
+      (= op 'similar-to) (similar-to db args)
+      :else (throw (ex-info (str "unknown analytic operator: " op) {:op op})))))

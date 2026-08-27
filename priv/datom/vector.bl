@@ -1,0 +1,151 @@
+; datom/vector.bl — embeddings as values, similarity as a scan.
+;
+; ── The one idea that makes this fit ──────────────────────────────────
+;
+; Every index this database has — EAVT, AEVT, AVET, VAET — is the same
+; datoms under a different TOTAL BYTE ORDER, and every query is a range
+; scan over that order. A vector is the first thing the system holds that
+; a total order cannot express: nearest-neighbour in a high-dimensional
+; metric space has no order-preserving 1-D key (you cannot sort a 768-d
+; space onto a line without shredding its neighbourhoods). So similarity
+; is NOT a fifth index. It is a different ACCESS METHOD that lives beside
+; the ordered ones — a scan that computes a distance rather than a range.
+;
+; And yet an embedding is still just a FACT. It is stored as an ordinary
+; datom `[e :doc/embedding <vector> tx op]`, so it is durable, it time-
+; travels, it commits atomically with the entity it describes — all the
+; properties the rest of the database already guarantees, for free. What
+; is special is only how we READ it: not `=` or a range, but "closest to".
+;
+; ── Why a distinct value type, not a plain vector of numbers ──────────
+;
+; A `:db.type/term` attribute can already hold `[0.1 0.2 …]` — a bl vector
+; of floats — and the value-codec round-trips it bit-identically. We do
+; NOT reuse that. An embedding is given its own value type (`:db.type/vector`)
+; and its own value shape (a `DVec`: a dimensionality plus a packed,
+; normalised little-endian f32 block) for three reasons:
+;
+;   1. Storage. A 768-d vector as a bl term is 768 boxed BEAM floats plus
+;      list overhead; the DVec carries 3072 CONTIGUOUS f32 bytes that the
+;      search NIF reads with zero per-element decode. That contiguity is
+;      the whole speed argument (Prototype A). NB: on the durable backend
+;      the DVec currently rides the value-codec's any-term (ESC) lane, so
+;      the packed bytes survive a round trip inside an ETF envelope — one
+;      `binary_to_term` per candidate at scan time. A dedicated packed
+;      `LANE-VECTOR` that stores the body raw (dropping that envelope) is a
+;      storage optimisation the format allows and a later step will add;
+;      it changes nothing above this file, because search reads the DVec's
+;      body directly whatever slot held it.
+;   2. Meaning. `:db.type/vector` tells the schema "this column is
+;      searchable by similarity", exactly as `:db.type/ref` tells it "this
+;      column is reverse-navigable". A column's type is how it declares
+;      what you can DO with it.
+;   3. Safety. Not hijacking the number-vector path means the 322 existing
+;      datom tests — which assert arbitrary terms round-trip unchanged —
+;      keep passing untouched. A new capability must not quietly reinterpret
+;      an old value.
+;
+; ── The math, and where it runs ───────────────────────────────────────
+;
+; Vectors are L2-NORMALISED at pack time, so cosine similarity is a bare
+; dot product. The distance scan (and the binary-quantised two-pass method
+; that makes it ~100x faster) runs in Rust — the BEAM is poor at tight
+; numeric loops and this is nothing but one. The NIF is PURE: it knows no
+; redb and no key encoding. The datalog layer scans the CURRENT embedding
+; datoms (its own basis-aware, retraction-aware job) and hands the corpus
+; down as packed bytes; the NIF returns the k nearest ids and scores. DB
+; semantics stay in one place; only the arithmetic crosses to Rust.
+
+(ns datom.vector)
+
+;; ── the native surface ──────────────────────────────────────────────
+;;
+;; Same crate as the store (`datom_redb`); these three are the vector math
+;; entry points, all DirtyCpu (compute-bound, not IO — mis-labelling a
+;; 5ms SIMD scan as DirtyIo would put it on the wrong scheduler pool).
+
+(defnative "datom_vector"
+  (vec-pack 1)      ; (floats)            -> normalised packed LE-f32 body
+  (vec-unpack 2)    ; (body dim)          -> list of floats (unit vector)
+  (vec-search 6))   ; (query ids corpus dim k rerank) -> [[id score] …]
+
+;; ── the value ───────────────────────────────────────────────────────
+;;
+;; A `DVec` is an embedding at rest in beam-lisp: its dimensionality and
+;; the packed, normalised bytes. It is what a `:db.type/vector` attribute
+;; holds. The bytes are already f32-packed (by `vec-pack`), so storing one
+;; is free — the value-codec just tags and copies them.
+
+(defrecord DVec [dim body])
+
+(defn vec?
+  "Whether `v` is an embedding value."
+  [v]
+  (instance? DVec v))
+
+(defn embedding
+  "Make an embedding value from a sequence of numbers.
+
+   The numbers are normalised and packed to f32 ONCE, here, so every later
+   comparison is a dot product over contiguous bytes. `dim` is remembered
+   because a packed body is just bytes — the reader needs the width to
+   unpack it, and a search needs it to stride the corpus."
+  [nums]
+  (let [floats (mapv (fn [x] (erlang/float x)) (to-list nums))
+        dim (count floats)]
+    (->DVec dim (vec-pack (to-list floats)))))
+
+(defn to-floats
+  "The embedding as a list of floats (the unit vector). The inverse of
+   `embedding` except that normalisation is not undone — the stored vector
+   IS the unit vector."
+  [dv]
+  (vec-unpack (:body dv) (:dim dv)))
+
+(defn dim
+  "The dimensionality of an embedding."
+  [dv]
+  (:dim dv))
+
+;; ── search ──────────────────────────────────────────────────────────
+
+(defn search
+  "The `k` nearest of `candidates` to `query`, as `[[id score] …]` in
+   descending similarity.
+
+   `candidates` is a sequence of `[id dvec]` pairs — the id is whatever the
+   caller wants back (an entity id, in the datalog clause), and the dvec is
+   that entity's embedding. `query` is a `DVec`. All embeddings must share
+   one dimensionality; a mismatch is a caller error the NIF rejects rather
+   than silently scoring garbage.
+
+   `rerank` is the binary-quantisation candidate width from Prototype A:
+   the coarse Hamming pass keeps this many, then they are re-scored exactly.
+   `0` means exact flat scan (no quantisation) — precise, and the right
+   choice when the corpus is small or recall must be perfect. The default
+   scales with k."
+  [query candidates k rerank]
+  (if (empty? candidates)
+    []
+    (let [ids (mapv (fn [c] (get c 0)) candidates)
+          d (:dim query)
+          ; concatenate every candidate body into one contiguous corpus —
+          ; one binary the NIF strides by `dim`, one crossing.
+          corpus (erlang/iolist_to_binary
+                   (to-list (mapv (fn [c] (:body (get c 1))) candidates)))
+          q-floats (to-floats query)]
+      (mapv (fn [pair] [(erlang/element 1 pair) (erlang/element 2 pair)])
+            (to-list
+              (vec-search (to-list q-floats)
+                          (to-list ids)
+                          corpus
+                          d
+                          k
+                          rerank))))))
+
+(defn default-rerank
+  "A reasonable coarse-pass width for `k`: wide enough to recover most of
+   brute force's recall, narrow enough to stay sub-millisecond. Prototype
+   A's sweep put the knee around 20·k for this regime."
+  [k]
+  (max 200 (* k 20)))

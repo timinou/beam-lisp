@@ -1,0 +1,141 @@
+; test/bl/datom/vector_test.bl — embeddings as values, similarity as a scan.
+; Run: mix beam_lisp.test test/bl/datom/vector_test.bl
+;
+; ── What must hold ────────────────────────────────────────────────────
+;
+; 1. An embedding round-trips: pack → store → read → unpack recovers the
+;    same UNIT vector (normalised, so not the raw input — its direction).
+; 2. Similarity ORDERS correctly: a query's nearest neighbour is the datom
+;    whose vector points most nearly the same way.
+; 3. The quantised path AGREES with the exact path on clearly-separated
+;    data (the two-pass method is an approximation, so this asserts on data
+;    where the top-k is unambiguous, exactly as the Rust benchmark does).
+; 4. A BOUND entity turns `similar-to` into a filter — the join that makes
+;    hybrid queries possible.
+; 5. The schema REFUSES to AVET-index a vector column: a metric space has
+;    no order-preserving key, so an index over it would be silently wrong.
+
+(ns datom.vector.test
+  (:require [datom] [datom.vector] [datom.schema]))
+
+(defn- close?
+  "Whether two floats agree to a small tolerance — float paths (f32 pack,
+   normalisation) never reproduce a decimal exactly."
+  [a b]
+  (erlang/< (erlang/abs (- a b)) 0.001))
+
+;; ── the value ───────────────────────────────────────────────────────
+
+(deftest embedding-normalises-and-round-trips
+  ; The stored vector is the UNIT vector: [3 4] has length 5, so it packs
+  ; to [0.6 0.8]. Reading it back recovers that direction, not the input.
+  (let [dv (datom.vector/embedding [3.0 4.0])
+        floats (datom.vector/to-floats dv)]
+    (is (= 2 (datom.vector/dim dv)))
+    (is (close? 0.6 (get (into [] floats) 0)))
+    (is (close? 0.8 (get (into [] floats) 1)))))
+
+(deftest embedding-is-a-vector-value
+  (is (datom.vector/vec? (datom.vector/embedding [1.0 0.0])))
+  (is (not (datom.vector/vec? [1.0 0.0])))
+  (is (not (datom.vector/vec? "not a vector"))))
+
+;; ── search ordering ─────────────────────────────────────────────────
+
+(defn- fixture
+  "A connection with five docs pointing along clear axes."
+  []
+  (let [conn (datom/connect
+               [{:db/ident :doc/title :db/valueType :db.type/string}
+                {:db/ident :doc/embedding :db/valueType :db.type/vector}])]
+    (datom/transact! conn
+      [{:db/id -1 :doc/title "a" :doc/embedding (datom.vector/embedding [1.0 0.0 0.0])}
+       {:db/id -2 :doc/title "b" :doc/embedding (datom.vector/embedding [0.9 0.1 0.0])}
+       {:db/id -3 :doc/title "c" :doc/embedding (datom.vector/embedding [0.0 1.0 0.0])}
+       {:db/id -4 :doc/title "d" :doc/embedding (datom.vector/embedding [0.0 0.0 1.0])}])
+    conn))
+
+(deftest nearest-neighbour-is-the-aligned-vector
+  (let [db (datom/db (fixture))
+        q (datom.vector/embedding [1.0 0.0 0.0])
+        result (datom/q '[:find ?title ?score
+                          :in $ ?q
+                          :where [(similar-to :doc/embedding ?q 2) [?e ?score]]
+                                 [?e :doc/title ?title]]
+                        db q)
+        titles (set (mapv (fn [row] (get row 0)) (into [] result)))]
+    ; the two nearest to [1 0 0] are "a" (itself) and "b" (0.9 0.1 0)
+    (is (contains? titles "a"))
+    (is (contains? titles "b"))
+    (is (not (contains? titles "c")))))
+
+(deftest score-is-cosine-similarity
+  ; "a" is [1 0 0]; a query along the same axis scores ~1.0.
+  (let [db (datom/db (fixture))
+        q (datom.vector/embedding [1.0 0.0 0.0])
+        result (into [] (datom/q '[:find ?title ?score
+                                   :in $ ?q
+                                   :where [(similar-to :doc/embedding ?q 1) [?e ?score]]
+                                          [?e :doc/title ?title]]
+                                 db q))]
+    (is (= 1 (count result)))
+    (is (= "a" (get (get result 0) 0)))
+    (is (close? 1.0 (get (get result 0) 1)))))
+
+;; ── the pre-filter: a BOUND entity turns search into a filter ────────
+
+(deftest bound-entity-filters-rather-than-generates
+  ; Restrict to entities whose title is "c" FIRST, then score only those.
+  ; "c" is [0 1 0]; a query along [1 0 0] scores it ~0, but it is the only
+  ; row that survives the title filter — the hybrid join.
+  (let [db (datom/db (fixture))
+        q (datom.vector/embedding [1.0 0.0 0.0])
+        result (into [] (datom/q '[:find ?title ?score
+                                   :in $ ?q
+                                   :where [?e :doc/title ?title]
+                                          [(= ?title "c")]
+                                          [(similar-to :doc/embedding ?q 4) [?e ?score]]]
+                                 db q))]
+    (is (= 1 (count result)))
+    (is (= "c" (get (get result 0) 0)))
+    (is (close? 0.0 (get (get result 0) 1)))))
+
+;; ── exact vs quantised agree on separated data ──────────────────────
+
+(deftest exact-and-quantised-agree-on-top-1
+  ; rerank 0 = exact flat; a positive rerank = binary-quant two-pass. On
+  ; clearly-separated axes the nearest is unambiguous, so both must name it.
+  (let [candidates (mapv (fn [i]
+                           [i (datom.vector/embedding
+                                (mapv (fn [j] (if (= j (rem i 8)) 1.0 0.0)) (range 8)))])
+                         (range 40))
+        q (datom.vector/embedding (mapv (fn [j] (if (= j 3) 1.0 0.0)) (range 8)))
+        exact (datom.vector/search q candidates 1 0)
+        approx (datom.vector/search q candidates 1 200)]
+    (is (= (get (get (into [] exact) 0) 0)
+           (get (get (into [] approx) 0) 0))
+        "exact and quantised name the same nearest neighbour")))
+
+;; ── schema guard ────────────────────────────────────────────────────
+
+(deftest vector-type-is-a-known-value-type
+  (is (contains? datom.schema/VALUE-TYPES :db.type/vector)))
+
+(deftest a-vector-column-cannot-be-avet-indexed
+  ; A metric space has no order-preserving key, so `:db/index` on a vector
+  ; would ask AVET to range-scan it — silently wrong. The schema refuses it
+  ; at declaration time.
+  (is (some? (datom.schema/validate-attr-def
+               {:db/ident :doc/embedding
+                :db/valueType :db.type/vector
+                :db/index true})))
+  (is (some? (datom.schema/validate-attr-def
+               {:db/ident :doc/embedding
+                :db/valueType :db.type/vector
+                :db/unique :db.unique/value}))))
+
+(deftest a-plain-vector-column-is-fine
+  ; Without an index request, a vector attribute is valid.
+  (is (nil? (datom.schema/validate-attr-def
+              {:db/ident :doc/embedding
+               :db/valueType :db.type/vector}))))
