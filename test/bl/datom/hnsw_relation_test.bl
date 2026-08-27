@@ -1,0 +1,204 @@
+; test/bl/datom/hnsw_relation_test.bl — the indexed semantic relation.
+; Run: mix beam_lisp.test test/bl/datom/hnsw_relation_test.bl
+;
+; Locks in the HNSW-backed relation: the lifecycle state machine (cold build,
+; catch-up, tombstone, rebuild trigger, as-of bypass), the exact escape
+; hatch, and the honesty contract — approximate results are RECALL-BOUNDED
+; (measured against the exact oracle, never just "didn't crash"), and the
+; catalog says which relations are approximate.
+
+(ns datom.hnsw-relation.test
+  (:require [datom] [datom.db] [datom.time] [datom.vector :as v]
+            [datom.query.relation :as rel] [datom.query.relations :as rels]))
+
+;; ── a deterministic clustered corpus (same LCG as the benches) ──────
+
+(def DIM 16)
+(defn- lcg [seed] (rem (+ (* seed 1103515245) 12345) 2147483648))
+(defn- rand-seq [seed n]
+  (get (reduce (fn [acc i]
+                 (let [s (lcg (get acc 1))]
+                   [(conj (get acc 0) (- (/ (rem s 2000) 1000.0) 1.0)) s]))
+               [[] seed] (range n))
+       0))
+(defn- cluster-vec [cluster tok]
+  (let [centre (rand-seq (* (+ cluster 1) 7919) DIM)
+        jitter (rand-seq (+ (* tok 104729) 1) DIM)]
+    (v/embedding (mapv (fn [c j] (+ (* 4.0 c) (* 0.4 j))) centre jitter))))
+
+(def SCHEMA [{:db/ident :h/vec :db/valueType :db.type/vector}])
+
+(defn- world [n groups]
+  (let [conn (datom/connect SCHEMA)]
+    (datom/transact! conn
+      (into [] (mapv (fn [i] {:db/id (+ i 1) :h/vec (cluster-vec (rem i groups) i)})
+                     (range n))))
+    conn))
+
+(defn- register-indexed! [ident opts]
+  (rel/register-relation! ident
+    {:arity 2 :modes #{:bf :bb :fb} :tags #{:semantic}
+     :maintenance :incremental
+     :index {:strategy :incremental}
+     :provider (rels/hnsw-adjacency :h/vec opts)}))
+
+(defn- register-exact! [ident opts]
+  (rel/register-relation! ident
+    {:arity 2 :modes #{:bf :bb :fb} :tags #{:semantic}
+     :index {:strategy :exact}
+     :provider (rels/hnsw-adjacency :h/vec (assoc opts :index {:strategy :exact}))}))
+
+(defn- edges [ident db]
+  (into #{} (mapv (fn [t] (into [] t))
+                  (into [] (rel/eval-relation db ident [] nil (rel/mode-of [false false]))))))
+
+(defn- recall [approx exact]
+  (/ (* 1.0 (count (into [] (filter (fn [e] (contains? exact e)) (into [] approx)))))
+     (max 1 (count exact))))
+
+;; ── 1. recall: the approximate index finds the true neighbours ──────
+
+(deftest recall-on-clustered-corpus
+  (register-indexed! :~h {:k 4 :threshold 0.0})
+  (rel/register-relation! :~oracle
+    {:arity 2 :modes #{:bf :bb :fb}
+     :provider (rels/knn-adjacency :h/vec {:k 4 :threshold 0.0})})
+  (let [db (datom/db (world 60 4))
+        approx (edges :~h db)
+        exact (edges :~oracle db)
+        r (recall approx exact)]
+    (is (> (count exact) 200) "the oracle produces a real graph")
+    (is (>= r 0.95) (str "recall vs exact oracle ≥ 0.95 (got " r ")"))))
+
+;; ── 2. cold build + steady state ────────────────────────────────────
+
+(deftest cold-build-then-zero-reads
+  (register-indexed! :~h2 {:k 4 :threshold 0.0})
+  (let [conn (world 30 4)
+        db (datom/db conn)
+        e1 (edges :~h2 db)
+        st1 (rels/index-state db :h/vec nil)
+        reads1 (get st1 :reads)
+        e2 (edges :~h2 db)
+        st2 (rels/index-state db :h/vec nil)]
+    (is (= e1 e2) "two evals at one basis agree")
+    (is (= 1 (get st1 :builds)) "first eval built the index once")
+    (is (= reads1 (get st2 :reads)) "steady state: zero store reads")
+    (is (= 30 (count (get st2 :live))) "every doc is live in the index")))
+
+;; ── 3. catch-up: inserts and retractions absorbed incrementally ─────
+
+(deftest catch-up-insert-and-retract
+  (register-indexed! :~h3 {:k 4 :threshold 0.0})
+  (let [conn (world 30 4)
+        db0 (datom/db conn)
+        before (edges :~h3 db0)]
+    (datom/transact! conn
+      (into [] (mapv (fn [i] {:db/id (+ i 101) :h/vec (cluster-vec (rem i 4) i)})
+                     (range 10))))
+    (let [db1 (datom/db conn)
+          after (edges :~h3 db1)
+          st (rels/index-state db1 :h/vec nil)]
+      (is (= 40 (count (get st :live))) "10 new docs caught up into the index")
+      (is (= 1 (get st :builds)) "catch-up, not rebuild")
+      (is (< (count before) (count after)) "new edges exist for the new docs"))
+    ; retract 2 → tombstoned, still no rebuild (2/38 < 0.25)
+    (datom/transact! conn [[:db/retractEntity 1] [:db/retractEntity 2]])
+    (let [db2 (datom/db conn)
+          after2 (edges :~h3 db2)   ; the EVAL drives the catch-up
+          st (rels/index-state db2 :h/vec nil)
+          stats (v/hnsw-stats (get st :index))]
+      (is (= 38 (count (get st :live))) "retracted docs leave the live map")
+      (is (= 2 (erlang/element 2 stats)) "and become tombstones in the graph")
+      (is (= 1 (get st :builds)) "still no rebuild below the ratio"))))
+
+;; ── 4. re-embed: the old vector is orphaned, the new one serves ─────
+
+(deftest reembed-replaces-not-duplicates
+  (register-indexed! :~h4 {:k 2 :threshold 0.0})
+  (let [conn (world 20 4)
+        db0 (datom/db conn)
+        e0 (edges :~h4 db0)
+        ; entity 1 moves to cluster 3's neighbourhood
+        new-vec (cluster-vec 3 999)]
+    (datom/transact! conn [{:db/id 1 :h/vec new-vec}])
+    (let [db1 (datom/db conn)
+          e1 (edges :~h4 db1)       ; the EVAL drives the catch-up
+          st (rels/index-state db1 :h/vec nil)
+          stats (v/hnsw-stats (get st :index))]
+      (is (= 20 (count (get st :live))) "still 20 live entities")
+      (is (= 1 (erlang/element 2 stats)) "the old point is a tombstone")
+      (is (= new-vec (get (get st :live) 1)) "the live map holds the new vector"))))
+
+;; ── 5. rebuild trigger: crossing the tombstone ratio rebuilds ───────
+
+(deftest tombstone-ratio-triggers-rebuild
+  (register-indexed! :~h5 {:k 4 :threshold 0.0})
+  (let [conn (world 20 4)
+        db0 (datom/db conn)
+        e0 (edges :~h5 db0)]
+    ; retract 6 of 20 → ratio 6/14 ≈ 0.43 > 0.25
+    (datom/transact! conn (into [] (mapv (fn [e] [:db/retractEntity e]) (range 1 7))))
+    (let [db1 (datom/db conn)
+          e1 (edges :~h5 db1)
+          st (rels/index-state db1 :h/vec nil)
+          stats (v/hnsw-stats (get st :index))]
+      (is (= 2 (get st :builds)) "the ratio trigger rebuilt the index")
+      (is (= 0 (erlang/element 2 stats)) "tombstones are gone after rebuild")
+      (is (= 14 (count (get st :live))) "only the surviving docs are indexed"))))
+
+;; ── 6. as-of: past bases bypass the index and stay bit-exact ────────
+
+(deftest as-of-bypasses-to-exact
+  (register-indexed! :~h6 {:k 4 :threshold 0.0})
+  (rel/register-relation! :~oracle6
+    {:arity 2 :modes #{:bf :bb :fb}
+     :provider (rels/knn-adjacency :h/vec {:k 4 :threshold 0.0})})
+  (let [conn (world 30 4)
+        db0 (datom/db conn)
+        t0 (datom.db/basis-t db0)
+        built (edges :~h6 db0)]
+    (datom/transact! conn
+      (into [] (mapv (fn [i] {:db/id (+ i 101) :h/vec (cluster-vec (rem i 4) i)})
+                     (range 5))))
+    (let [db1 (datom/db conn)
+          caught-up (edges :~h6 db1)
+          st (rels/index-state db1 :h/vec nil)
+          db-old (datom.time/as-of db1 t0)
+          via-index (edges :~h6 db-old)
+          oracle (edges :~oracle6 db-old)]
+      (is (= (count (get st :live)) 35) "the index is at head (35 docs)")
+      (is (= via-index oracle) "as-of the OLD basis the answer is bit-exact (exact path)")
+      (is (= 30 (count (into #{} (mapv (fn [e] (get e 0)) (into [] via-index)))))
+          "and describes 30 docs, not 35 — no index leakage across bases"))))
+
+;; ── 7. the exact strategy: bit-identical to the oracle ──────────────
+
+(deftest exact-strategy-is-bit-identical
+  (register-exact! :~x7 {:k 4 :threshold 0.0})
+  (rel/register-relation! :~oracle7
+    {:arity 2 :modes #{:bf :bb :fb}
+     :provider (rels/knn-adjacency :h/vec {:k 4 :threshold 0.0})})
+  (let [db (datom/db (world 60 4))]
+    (is (= (edges :~x7 db) (edges :~oracle7 db))
+        ":exact edges are bit-identical to the unindexed oracle")))
+
+;; ── 8. the catalog says which relations are approximate ─────────────
+
+(deftest catalog-marks-approximate
+  (register-indexed! :~h8 {:k 4 :threshold 0.0})
+  (register-exact! :~x8 {:k 4 :threshold 0.0})
+  (let [cat (rel/catalog-datoms)
+        approx-idents (into #{} (mapv (fn [t] (get t 0))
+                                      (filterv (fn [t] (= :relation/approximate (get t 1))) cat)))]
+    (is (contains? approx-idents :~h8) "incremental strategy is marked approximate")
+    (is (not (contains? approx-idents :~x8)) "exact strategy is not")))
+
+;; ── 9. bound mode through the index ─────────────────────────────────
+
+(deftest bound-mode-through-index
+  (register-indexed! :~h9 {:k 2 :threshold 0.0})
+  (let [db (datom/db (world 20 4))
+        got (into [] (rel/eval-relation db :~h9 [] #{1} (rel/mode-of [true false])))]
+    (is (every? (fn [t] (= 1 (get t 0))) (into [] got)) ":bf edges all start at the bound source")
+    (is (<= (count got) 2) "k caps the out-degree")))

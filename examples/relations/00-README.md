@@ -53,9 +53,20 @@ mix beam_lisp.run --path priv --path examples examples/relations/01-defrelation.
 (rel/defrelation :~similar
   {:arity 2 :modes #{:bf :bb :fb} :tags #{:semantic}
    :args []                                    ; fixed at declaration (attr spelling)
-   :provider (rels/knn-adjacency :doc/embedding {:k 8 :threshold 0.75})})
+   :maintenance :incremental                   ; a resident index, kept current
+   :index {:strategy :incremental              ; the default: HNSW, recall-bounded
+           :params {:m 16 :ef-construction 100 :ef-search 64}
+           :rebuild {:tombstone-ratio 0.25}    ; retractions accumulate → rebuild
+           :as-of :exact}                      ; past bases bypass to exact k-NN
+   :provider (rels/hnsw-adjacency :doc/embedding {:k 8 :threshold 0.75})})
 ```
 
 Then `[?a :~similar ?b]` is an edge — join it, recurse it, reverse it, ask the
-catalog about it. Swap `knn-adjacency` for `threshold-adjacency`,
-`fn-adjacency`, or `union-adjacency` and every query is unchanged.
+catalog about it. The default provider is HNSW-indexed: the graph builds once
+(O(N log N)), catches up incrementally as you transact, and warm queries read
+the resident index instead of rescanning the store. It is APPROXIMATE
+(recall-bounded, and the catalog says so: `:relation/approximate true`) — for
+bit-exact k-NN, `:index {:strategy :exact}` or the plain `knn-adjacency`
+provider; both are one keyword away and no query changes. Swap for
+`threshold-adjacency`, `fn-adjacency`, or `union-adjacency` and every query is
+unchanged.

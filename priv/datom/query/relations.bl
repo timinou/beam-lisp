@@ -28,7 +28,7 @@
 ; DB gives you generate only.
 
 (ns datom.query.relations
-  (:require [datom.db] [datom.index] [datom.vector]))
+  (:require [datom.db] [datom.index] [datom.time] [datom.vector :as v]))
 
 ;; ── the embedding corpus of a column ────────────────────────────────
 
@@ -51,53 +51,57 @@
 ;; ── k-NN adjacency ──────────────────────────────────────────────────
 
 (defn knn-adjacency
-  "A provider: the k-NN semantic graph over embedding column `attr`. Each
-   entity links to its `k` nearest neighbours (excluding itself). Optional
-   `threshold` drops edges below a cosine score. Emits `[a b score]` when
-   `weighted?`, else `[a b]`.
+  "A provider: the EXACT k-NN semantic graph over embedding column `attr`.
+   Each entity links to its `k` nearest neighbours (excluding itself).
+   Optional `threshold` drops edges below a cosine score. Emits `[a b score]`
+   when `weighted?`, else `[a b]`.
 
    opts: {:k 8 :threshold 0.0 :weighted? false}
 
    Modes:
-     :bf  — search from the ONE bound `a` (bound = #{a}); fast, no all-pairs.
+     :bf  — search from the ONE bound `a` (bound = #{a}); one exact flat scan.
      :bb  — score the single pair (a,b) and keep it iff ≥ threshold.
      :fb  — reverse: neighbours of `a` that include a bound `b` (rare; falls
             back to scanning a's-of-everyone, still correct).
-     :ff / default — the full all-pairs graph (materialised once; this is what
-            a recursion over :~similar demands, and the fixpoint caches it as
-            a base relation)."
+     :ff / default — the full all-pairs graph as ONE batched native call
+            (`vec-knn-all`): the honest O(N²), but with the autovectorised
+            constant instead of N per-call marshalls. This is the path the
+            fixpoint materialises as a base relation, and the exact oracle
+            `hnsw-adjacency`'s recall is measured against."
   [attr opts]
   (let [k (or (get opts :k) 8)
         threshold (or (get opts :threshold) 0.0)
         weighted? (or (get opts :weighted?) false)
         emit (fn [a b s] (if weighted? [a b s] [a b]))]
     (fn [db mode bound args]
-      (let [all (corpus db attr)
-            ; neighbours of one source entity: search the corpus, drop self,
-            ; drop below-threshold, take k.
-            neighbours-of
-              (fn [src-e src-vec]
-                (let [hits (datom.vector/search src-vec all (+ k 1)
-                                                (datom.vector/default-rerank (+ k 1)))]
-                  (reduce (fn [acc hit]
-                            (let [e (get hit 0) s (get hit 1)]
-                              (if (and (not (= e src-e)) (>= s threshold) (< (count acc) k))
-                                (conj acc (emit src-e e s))
-                                acc)))
-                          []
-                          (into [] hits))))]
-        (cond
-          ; a bound → just that source's neighbours (fast path, no all-pairs)
-          (and (some? bound) (= 1 (count bound)))
-            (let [a (first (into [] bound))
-                  av (lookup db attr a)]
-              (if (nil? av) [] (neighbours-of a av)))
-          ; otherwise the full graph: every entity's neighbours
-          :else
-            (reduce (fn [acc pair]
-                      (into acc (neighbours-of (get pair 0) (get pair 1))))
-                    []
-                    all))))))
+      (let [all (corpus db attr)]
+        (if (and (some? bound) (= 1 (count bound)))
+          ; a bound → just that source's neighbours (one exact flat scan)
+          (let [a (first (into [] bound))
+                av (lookup db attr a)]
+            (if (nil? av)
+              []
+              (let [hits (datom.vector/search av all (+ k 1) 0)]
+                (reduce (fn [acc hit]
+                          (let [e (get hit 0) s (get hit 1)]
+                            (if (and (not (= e a)) (>= s threshold) (< (count acc) k))
+                              (conj acc (emit a e s))
+                              acc)))
+                        []
+                        (into [] hits)))))
+          ; otherwise the full graph: one batched native all-pairs call
+          (if (empty? all)
+            []
+            (let [ids (mapv (fn [p] (get p 0)) all)
+                  dim (datom.vector/dim (get (first all) 1))
+                  body (erlang/iolist_to_binary
+                         (to-list (mapv (fn [p] (:body (get p 1))) all)))]
+              (mapv (fn [trip]
+                      (emit (erlang/element 1 trip)
+                            (erlang/element 2 trip)
+                            (erlang/element 3 trip)))
+                    (into [] (datom.vector/vec-knn-all
+                               (to-list ids) body dim k threshold))))))))))
 
 ;; ── threshold adjacency (no embeddings — a business rule) ───────────
 
@@ -161,3 +165,223 @@
                (reduce (fn [acc p] (into acc (p db mode bound args)))
                        []
                        providers)))))
+
+;; ── HNSW-indexed adjacency (the DEFAULT semantic relation) ──────────
+;;
+;; knn-adjacency recomputes from the store on every eval — O(N²) for the
+;; whole graph, paid per query. `hnsw-adjacency` keeps a RESIDENT index and
+;; reconciles it against the immutable basis, which turns the whole graph
+;; into O(N log N): the index builds once, then each eval pays only for what
+;; changed (usually nothing).
+;;
+;; The lifecycle is the state machine proven in
+;; bench/proto_index_lifecycle.bl (8/8 transitions asserted against the
+;; unindexed oracle before any Rust existed):
+;;
+;;   COLD BUILD  first eval at basis T builds from attr-datoms
+;;   STEADY      same basis — zero store reads, pure index serving
+;;   CATCH-UP    basis T' > cursor — tail the WAL
+;;               ((history (since db cursor)) over the attr), inserting
+;;               assertions and tombstoning retractions
+;;   REBUILD     the policy's tombstone-ratio trigger fires — hnsw_rs cannot
+;;               unlink a point, so tombstones accumulate and periodically
+;;               the index is rebuilt from the current basis
+;;   AS-OF       basis T < cursor — the index cannot go backward, so the
+;;               eval BYPASSES to the exact path. Degrade, never lie.
+;;
+;; Soundness: the as-of/since partition property (datom.time) means the WAL
+;; tail is EXACTLY the datoms separating two bases, so index-content ≡
+;; corpus(basis) by induction. The provider sig is unchanged; the index
+;; lives behind it.
+;;
+;; The state map keeps a bl-side `:live` {eid → dvec} NEXT TO the Rust
+;; resource. That is deliberate, not redundant: `hnsw_tombstone` is keyed by
+;; eid, but a retraction is about a VALUE — after a re-embed, retracting the
+;; OLD vector must not tombstone the NEW point. The value check lives here;
+;; the Rust side stays value-blind graph arithmetic.
+
+(def INDEX-STORE :datom-relation-index-store)
+
+(defn- index-store
+  "The process-wide index-state Agent, created once by name (same pattern
+   as the relation registry)."
+  []
+  (let [existing (erlang/whereis INDEX-STORE)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(erlang/list_to_tuple (to-list [:name INDEX-STORE]))]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+(defn- fold-delta
+  "The WAL tail for `attr` in (cursor, basis], folded to one verdict per
+   FACT [e v]: the op at the greatest tx; a retraction at the SAME tx as an
+   assertion wins (mirrors datom.db/current-in?)."
+  [db attr cursor]
+  (let [hdb (datom.time/history (datom.time/since db cursor))]
+    (reduce (fn [acc d]
+              (let [k [(datom.index/-e d) (datom.index/-v d)]
+                    tx (datom.index/-tx d)
+                    op (if (datom.index/assertion? d) :add :retract)
+                    cur (get acc k)]
+                (if (or (nil? cur)
+                        (> tx (get cur 0))
+                        (and (= tx (get cur 0)) (= op :retract)))
+                  (assoc acc k [tx op])
+                  acc)))
+            {}
+            (datom.db/datoms hdb :aevt attr))))
+
+(defn- hnsw-build
+  "COLD BUILD / REBUILD: a fresh resource over the corpus at db's basis."
+  [db attr cfg builds reads]
+  (let [rows (corpus db attr)
+        dim (if (empty? rows) 1 (v/dim (get (first rows) 1)))
+        params (get cfg :params)
+        m (or (get params :m) 16)
+        efc (or (get params :ef-construction) 100)
+        efs (or (get params :ef-search) 64)
+        idx (v/hnsw-new dim m efc efs (max 16 (count rows)))]
+    (doseq [p rows]
+      (v/hnsw-insert-packed idx (get p 0) (:body (get p 1))))
+    {:cursor (datom.db/basis-t db) :index idx
+     :live (into {} (mapv (fn [p] [(get p 0) (get p 1)]) rows))
+     :builds (+ builds 1) :reads (+ reads 1)}))
+
+(defn- hnsw-catch-up
+  "Advance `st` to db's basis by applying the WAL delta to BOTH the resource
+   and the live map. Value-checked: a retraction only tombstones when the
+   live vector IS the retracted one (see the design note above)."
+  [st db attr]
+  (let [idx (get st :index)
+        delta (fold-delta db attr (get st :cursor))]
+    (assoc (reduce (fn [s kv]
+                     (let [fact (get kv 0) op (get (get kv 1) 1)
+                           e (get fact 0) val (get fact 1)
+                           live (get s :live)
+                           cur (get live e)]
+                       (if (= op :add)
+                         (if (or (nil? val) (not (v/vec? val))
+                                 (and (some? cur) (= cur val)))
+                           s
+                           (do (v/hnsw-insert-packed idx e (:body val))
+                               (assoc s :live (assoc live e val))))
+                         (if (= cur val)
+                           (do (v/hnsw-tombstone idx e)
+                               (assoc s :live (dissoc live e)))
+                           s))))
+                   st
+                   (into [] delta))
+           :cursor (datom.db/basis-t db)
+           :reads (+ (get st :reads) 1))))
+
+(defn- hnsw-advance
+  "The state machine, one step: build if cold, catch up if behind, rebuild
+   when the policy's tombstone-ratio trigger fires. Pure fn of (state, db);
+   the Agent just serialises callers."
+  [st db attr cfg]
+  (let [built (cond (nil? st) (hnsw-build db attr cfg 0 0)
+                    (> (datom.db/basis-t db) (get st :cursor)) (hnsw-catch-up st db attr)
+                    :else st)
+        ratio (get-in cfg [:rebuild :tombstone-ratio])]
+    (if (some? ratio)
+      (let [stats (v/hnsw-stats (get built :index))
+            live-n (max 1 (erlang/element 1 stats))
+            tomb (erlang/element 2 stats)]
+        (if (> (/ tomb live-n) ratio)
+          (hnsw-build db attr cfg (get built :builds) (get built :reads))
+          built))
+      built)))
+
+(defn index-state
+  "The index state of the relation serving `attr` with build `params`
+   (nil = defaults) at this db's store, for introspection and tests
+   (nil if never built)."
+  [db attr params]
+  (Agent/get (index-store) (fn [m] (get m [(datom.db/store-of db) attr params]))))
+
+(defn hnsw-adjacency
+  "The DEFAULT semantic-relation provider: the k-NN graph over `attr`,
+   served from a resident HNSW index reconciled against the basis.
+
+   opts: {:k 8 :threshold 0.0 :weighted? false
+          :index {:strategy :incremental        ; :incremental | :exact
+                  :params {:m 16 :ef-construction 100 :ef-search 64}
+                  :rebuild {:tombstone-ratio 0.25}   ; nil ratio = never
+                  :as-of :exact}}                     ; past bases → exact path
+
+   `:strategy :exact` skips the index entirely and computes bit-exact k-NN
+   (one batched NIF call) — the escape hatch when recall must be perfect,
+   and the path as-of queries always take. APPROXIMATE otherwise: results
+   are recall-bounded, not bit-identical to `knn-adjacency`."
+  [attr opts]
+  (let [k (or (get opts :k) 8)
+        threshold (or (get opts :threshold) 0.0)
+        weighted? (or (get opts :weighted?) false)
+        cfg (merge {:strategy :incremental
+                    :rebuild {:tombstone-ratio 0.25}
+                    :as-of :exact}
+                   (or (get opts :index) {}))
+        strategy (get cfg :strategy)
+        emit (fn [a b s] (if weighted? [a b s] [a b]))
+        ; the exact path: one batched NIF call for the whole graph, a flat
+        ; exact scan for a single bound source. Bit-identical to the oracle.
+        exact-eval
+          (fn [db mode bound]
+            (let [all (corpus db attr)]
+              (if (and (some? bound) (= 1 (count bound)))
+                (let [a (first (into [] bound))
+                      av (lookup db attr a)]
+                  (if (nil? av)
+                    []
+                    (let [hits (v/search av all (+ k 1) 0)]
+                      (reduce (fn [acc hit]
+                                (let [e (get hit 0) s (get hit 1)]
+                                  (if (and (not (= e a)) (>= s threshold) (< (count acc) k))
+                                    (conj acc (emit a e s))
+                                    acc)))
+                              []
+                              (into [] hits)))))
+                (if (empty? all)
+                  []
+                  (let [ids (mapv (fn [p] (get p 0)) all)
+                        dim (v/dim (get (first all) 1))
+                        body (erlang/iolist_to_binary
+                               (to-list (mapv (fn [p] (:body (get p 1))) all)))]
+                    (mapv (fn [trip]
+                            (emit (erlang/element 1 trip)
+                                  (erlang/element 2 trip)
+                                  (erlang/element 3 trip)))
+                          (into [] (v/vec-knn-all (to-list ids) body dim k threshold))))))))
+        neighbours-of (fn [idx live src-e src-dv]
+                        (let [hits (v/hnsw-search-packed idx (:body src-dv) (+ k 1))]
+                          (reduce (fn [acc hit]
+                                    (let [e (erlang/element 1 hit) s (erlang/element 2 hit)]
+                                      (if (and (not (= e src-e)) (contains? live e)
+                                               (>= s threshold) (< (count acc) k))
+                                        (conj acc (emit src-e e s))
+                                        acc)))
+                                  []
+                                  (into [] hits))))]
+    (fn [db mode bound args]
+      (let [key [(datom.db/store-of db) attr (get cfg :params)]
+            st (Agent/get (index-store) (fn [m] (get m key)))]
+        (if (or (= strategy :exact)
+                (not (datom.time/current? db))
+                (and (some? st) (< (datom.db/basis-t db) (get st :cursor))))
+          ; bypass: exact semantics, index untouched
+          (exact-eval db mode bound)
+          (do (Agent/update (index-store)
+                            (fn [m] (assoc m key (hnsw-advance (get m key) db attr cfg))))
+              (let [st2 (Agent/get (index-store) (fn [m] (get m key)))
+                    idx (get st2 :index)
+                    live (get st2 :live)]
+                (if (and (some? bound) (= 1 (count bound)))
+                  (let [a (first (into [] bound)) av (get live a)]
+                    (if (nil? av) [] (neighbours-of idx live a av)))
+                  (reduce (fn [acc kv]
+                            (into acc (neighbours-of idx live (get kv 0) (get kv 1))))
+                          []
+                          (into [] live))))))))))
