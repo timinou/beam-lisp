@@ -1,192 +1,46 @@
-; examples/datom/09-migrations.bl — a migration system, pressure-tested.
+; examples/datom/09-migrations.bl — evolving a schema without breaking it.
 ; Run: mix beam_lisp.run --path priv examples/datom/09-migrations.bl
 ;
-; ── What this prototype is testing ────────────────────────────────────
+; ── The one hard problem in schema change ─────────────────────────────
 ;
-; Five claims from the migration design, each turned into something that
-; either runs or does not:
+; Adding an attribute is free — no existing datom mentions it, so nothing
+; can break. The dangerous changes are the ones that TIGHTEN an
+; invariant: "email is now unique", "role is now single-valued". Whether
+; such a change is safe is not a fact about the schema. It is a fact about
+; the DATA. "Email is unique" is fine on a database where emails happen to
+; be unique and a corruption on one where they are not.
 ;
-;   Q1  a migration is ONE value: schema deltas + data transform together
-;   Q2  a function is attached to the shape change (the "migration" proper)
-;   Q3  a PRODUCTION db can be walked from local, so breakage that depends
-;       on data shapes ABSENT locally is known before deploy
-;   Q4  it is ACID: a blocked or invalid migration commits NOTHING
-;   Q5  (out of scope, noted where the seams are)
+; And the database that decides is PRODUCTION — whose data shapes your
+; laptop has never seen. A migration that passes every local test can
+; still break against the one database that matters.
 ;
-; Everything here is built on the PUBLIC datom API — no changes to priv/.
-; That is deliberate: it shows how far the substrate already carries the
-; design, and marks precisely where a new primitive (`with`) would be
-; needed to go further. Those spots are called out as ── FINDING ──.
+; `datom.migrate` answers this with three moves, each resting on a
+; primitive the earlier examples did not have:
+;
+;   plan   — walk ANY database (a local db, or a production replica) and
+;            report what would break, committing nothing. Rests on the
+;            database being a VALUE.
+;   apply! — remediate the data, re-check, then grow the schema and record
+;            the migration as ONE atomic transaction. Rests on `:db/fn`
+;            transaction functions and `with`.
+;   the ledger is a QUERY, not a side table.
 
-(ns example.datom.migrations (:require [datom]))
+(ns example.datom.migrations (:require [datom] [datom.migrate]))
 
 (defn- show [label value] (println (str "  " label "  " (pr-str value))))
 (defn- heading [text] (println (str "\n" text)))
 (defn- note [text] (println (str "  · " text)))
 
-;; ═══════════════════════════════════════════════════════════════════
-;; THE LIBRARY — a migration system in ~a page, over the public API
-;; ═══════════════════════════════════════════════════════════════════
+;; ── two databases: clean local, messy production ────────────────────
 ;;
-;; A migration is a plain map (Q1). It carries:
-;;
-;;   :migration/id      an ordered, immutable name — the ledger key
-;;   :migration/grows   schema deltas (data), applied additively
-;;   :migration/checks  invariants the deltas TIGHTEN — the things that
-;;                      can break against real data
-;;   :migration/fn      (fn [db] -> tx-data): the remediation that makes
-;;                      the invariants TRUE before they are enforced (Q2)
-;;
-;; The whole point: :checks are questions only the DATA can answer, so
-;; they are run as datalog against whatever db value you hand them —
-;; local or production (Q3).
-
-;; ── invariant checks: derive violations from data, as data ──────────
-;;
-;; Each check builds a QUERY (queries are data, so the attribute is a
-;; parameter) and reads the given db value. Nothing here knows or cares
-;; whether that value is local or a production replica.
-
-(defn- rows-e-v
-  "Every [entity value] pair for `attr` in `db`, as a vector of tuples."
-  [db attr]
-  (into [] (datom/q [:find '?e '?v :where ['?e attr '?v]] db)))
-
-(defn check-unique
-  "Violations of a uniqueness invariant on `attr`: values held by more
-   than one entity. Returns a vector of violation maps (empty = clean)."
-  [db attr]
-  (let [by-v (group-by (fn [t] (get t 1)) (rows-e-v db attr))]
-    (filterv some?
-      (mapv (fn [entry]
-              (let [grp (val entry)]
-                (if (> (count grp) 1)
-                  {:check :unique :attr attr :value (key entry)
-                   :entities (mapv (fn [t] (get t 0)) grp)}
-                  nil)))
-            (seq by-v)))))
-
-(defn check-cardinality-one
-  "Violations of a cardinality-one invariant on `attr`: entities holding
-   more than one value."
-  [db attr]
-  (let [by-e (group-by (fn [t] (get t 0)) (rows-e-v db attr))]
-    (filterv some?
-      (mapv (fn [entry]
-              (let [grp (val entry)]
-                (if (> (count grp) 1)
-                  {:check :cardinality-one :attr attr :entity (key entry)
-                   :values (mapv (fn [t] (get t 1)) grp)}
-                  nil)))
-            (seq by-e)))))
-
-(defn- run-check
-  [db check]
-  (let [kind (get check :check) attr (get check :attr)]
-    (cond
-      (= kind :unique) (check-unique db attr)
-      (= kind :cardinality-one) (check-cardinality-one db attr)
-      :else [])))
-
-(defn plan
-  "Walk `db` and return every way `migration` would BREAK against the
-   data actually present. Reads only — commits nothing, mutates nothing.
-
-   This is the load-bearing function (Q3): hand it a production db value
-   and it reports breakage caused by shapes your local db has never
-   seen."
-  [db migration]
-  (into [] (mapcat (fn [c] (run-check db c)) (get migration :migration/checks []))))
-
-;; ── remediation helpers: the tx-fns a migration attaches (Q2) ───────
-;;
-;; A migration's :fn is just a function of a db value that returns
-;; tx-data. These two are the corrective transforms for the two checks
-;; above — retractions that make the invariant true. Because they are
-;; pure functions of the db VALUE, running one against a production
-;; replica previews exactly the datoms it would write there.
-
-(defn dedup-unique
-  "Retract a duplicated `attr` value from every entity but the first that
-   holds it, so the value becomes unique."
-  [db attr]
-  (into []
-    (mapcat (fn [v]
-              (mapv (fn [e] [:db/retract e attr (get v :value)])
-                    (rest (get v :entities))))
-            (check-unique db attr))))
-
-(defn collapse-cardinality-one
-  "Retract all but the first value of `attr` on any entity holding
-   several, so the attribute becomes single-valued."
-  [db attr]
-  (into []
-    (mapcat (fn [v]
-              (mapv (fn [val] [:db/retract (get v :entity) attr val])
-                    (rest (get v :values))))
-            (check-cardinality-one db attr))))
-
-;; ── the ledger: applied migrations are datoms, not a side table ─────
-;;
-;; The set of applied migrations is a QUERY, consistent with "one uniform
-;; store". No schema_migrations table drifting beside the data.
-
-(defn applied-ids
-  [db]
-  (into #{} (mapv (fn [t] (get t 0))
-                  (into [] (datom/q '[:find ?id :where [?m :migration/id ?id]] db)))))
-
-(defn applied?
-  [db migration]
-  (contains? (applied-ids db) (get migration :migration/id)))
-
-;; ── apply!: gated, ordered, idempotent ──────────────────────────────
-
-(defn apply!
-  "Apply `migration` to `conn`, in three movements:
-
-     1. run the attached :fn to REMEDIATE the data       (Q2)
-     2. verify — on the remediated db — that no invariant still breaks
-     3. only then GROW the schema and record the ledger entry
-
-   If step 2 still finds breakage, or the migration was already applied,
-   NOTHING new is committed. Returns a report."
-  [conn migration]
-  (let [db0 (datom/db conn)]
-    (if (applied? db0 migration)
-      {:status :already-applied :id (get migration :migration/id)}
-      (let [f (get migration :migration/fn)
-            corrective (if (some? f) (f db0) [])]
-        ; 1. remediate (its own writer turn — see FINDING on atomicity)
-        (if (seq corrective) (datom/transact! conn corrective) nil)
-        ; 2. re-plan against the NOW-remediated data
-        (let [db1 (datom/db conn)
-              residual (plan db1 migration)]
-          (if (seq residual)
-            {:status :blocked :id (get migration :migration/id)
-             :violations residual :remediated corrective}
-            (do
-              ; 3. grow schema, then stamp the ledger
-              (datom/install-schema! conn (get migration :migration/grows []))
-              (datom/transact! conn [{:db/id -1 :migration/id (get migration :migration/id)}])
-              {:status :applied :id (get migration :migration/id)
-               :remediated corrective})))))))
-
-;; ═══════════════════════════════════════════════════════════════════
-;; THE PRESSURE TEST
-;; ═══════════════════════════════════════════════════════════════════
-;;
-;; Two databases with the SAME schema and DIFFERENT data. "local" is the
-;; clean dev database. "prod" carries shapes local has never seen: a
-;; duplicated email across two people, and one person with two roles.
+;; Same schema. `local` is what you develop against; `prod` carries shapes
+;; local has never had — a duplicated email across two people, and one
+;; person with two roles.
 
 (def base-schema
-  [{:db/ident :migration/id :db/valueType :db.type/keyword
-    :db/unique :db.unique/identity}
-   {:db/ident :person/name :db/valueType :db.type/string}
+  [{:db/ident :person/name  :db/valueType :db.type/string}
    {:db/ident :person/email :db/valueType :db.type/string}
-   ; role starts cardinality-MANY: the migration will tighten it to one
-   {:db/ident :person/role :db/valueType :db.type/keyword
+   {:db/ident :person/role  :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/many}])
 
 (def local (datom/connect base-schema))
@@ -202,9 +56,14 @@
    {:db/id -3 :person/name "Alan"   :person/email "dup@x"    :person/role :user}
    {:db/id -4 :person/name "Edsger" :person/email "dup@x"    :person/role [:user :admin]}])
 
-;; ── the migration: one value, schema + transform together (Q1, Q2) ──
+;; ── the migration: ONE value ────────────────────────────────────────
+;;
+;; It carries its schema deltas (:grows), the invariants they tighten
+;; (:checks), and the remediation that makes those invariants true (:fn).
+;; The fn is built from the library's remediation helpers — pure functions
+;; of a db value that return the retractions which fix each invariant.
 
-(def M-tighten
+(def tighten
   {:migration/id :2026-08-26-tighten-identity
    :migration/grows
      [{:db/ident :person/email :db/valueType :db.type/string
@@ -216,116 +75,99 @@
       {:check :cardinality-one :attr :person/role}]
    :migration/fn
      (fn [db]
-       (into (dedup-unique db :person/email)
-             (collapse-cardinality-one db :person/role)))})
+       (into (datom.migrate/dedup-unique db :person/email)
+             (datom.migrate/collapse-cardinality-one db :person/role)))})
 
-;; ── Q3: walk each database, BEFORE touching either ──────────────────
+;; ── plan: the same migration, against two databases ─────────────────
 
-(heading "── Q3: the same migration, planned against two databases ──")
+(heading "── plan(local): clean ──")
+(show "status:  " (get (datom.migrate/plan (datom/db local) tighten) :status))
+(note "nothing local violates the new invariants")
 
-(show "plan(local):" (plan (datom/db local) M-tighten))
-(note "clean — nothing local violates the new invariants")
+(heading "── plan(prod): breaking, with the offending entities named ──")
+(def prod-plan (datom.migrate/plan (datom/db prod) tighten))
+(show "status:  " (get prod-plan :status))
+(show "breaking:" (get prod-plan :breaking))
+(note "these shapes exist only in production; local could never surface them")
+(note "plan takes a db VALUE — point it at a prod replica and this is your")
+(note "deploy gate: a breaking migration is known before anything ships")
 
-(def prod-breakage (plan (datom/db prod) M-tighten))
-(show "plan(prod): " prod-breakage)
-(note "BREAKING — and every offending entity is named, from data local never had")
-(note "this is the deploy gate: known at plan time, against real shapes")
+;; ── plan commits nothing ────────────────────────────────────────────
 
-;; ── FINDING: this is only possible because a db is a VALUE and the
-;;    store is a PORT. `(datom/db prod)` is an immutable snapshot a
-;;    laptop can hold and query with zero coordination. Point it at a
-;;    production redb replica and the same `plan` call reports the same
-;;    breakage. No dev DB can simulate this — breakage is a fact about
-;;    prod's data, and only prod's data knows it.
-
-;; ── Q2 + speculative preview: what the fn WOULD write, no commit ─────
-
-(heading "── Q2: the attached fn, previewed against prod (no commit) ──")
-
-(def would-write ((get M-tighten :migration/fn) (datom/db prod)))
-(show "corrective tx-data:" would-write)
-(note "pure fn of the db value — this is a value-level speculative preview")
-
-;; ── FINDING (the `with` gap): this previews the FN's output purely, but
-;;    it cannot preview the SCHEMA grow's downstream effect without
-;;    committing, because there is no store-level `with` (speculative
-;;    transaction returning db-after) yet. The writer path in conn.bl
-;;    already BUILDS :db-after; a `with` is that path minus `-commit`.
-;;    Adding it would let `plan` dry-run the entire migration — fn AND
-;;    grow — against a prod replica as one speculative step. Small,
-;;    high-leverage, and useful far beyond migrations.
-
-;; ── Q4: prod is untouched by all the planning above ─────────────────
-
-(heading "── Q4: planning and previewing committed nothing ──")
+(heading "── plan mutated nothing ──")
 (show "prod still has the duplicate:"
-      (datom/q '[:find ?name ?email
-                 :where [?e :person/email "dup@x"] [?e :person/name ?name]
-                        [?e :person/email ?email]]
-               (datom/db prod)))
-(note "read-only walks are values; they cannot mutate the source")
+      (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db prod))))
 
 ;; ── apply to local: fn is a no-op, schema grows, ledger stamped ─────
 
-(heading "── apply to LOCAL (already conforms) ──")
-(show "apply!(local):" (get (apply! local M-tighten) :status))
-(show "local applied ids:" (applied-ids (datom/db local)))
+(heading "── apply! to LOCAL (already conforms) ──")
+(show "status:     " (get (datom.migrate/apply! local tighten) :status))
+(show "applied ids:" (datom.migrate/applied-ids (datom/db local)))
 
-;; ── apply to prod: fn remediates, re-plan clears, THEN grow ─────────
+;; ── apply to prod: fn remediates first, atomically ──────────────────
 
-(heading "── apply to PROD (fn must remediate first) ──")
-(def prod-report (apply! prod M-tighten))
-(show "status:      " (get prod-report :status))
-(show "remediated:  " (get prod-report :remediated))
-(show "prod breakage now:" (plan (datom/db prod) M-tighten))
-(note "the duplicate and the extra role were retracted before enforcement")
+(heading "── apply! to PROD (remediates, then grows, in one transaction) ──")
+(def prod-report (datom.migrate/apply! prod tighten))
+(show "status:    " (get prod-report :status))
+(show "remediated:" (get prod-report :remediated))
+(show "dup@x now held by:"
+      (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db prod))))
+(note "the duplicate email and the extra role were retracted BEFORE the")
+(note "invariants were enforced — and it all committed as one transaction")
 
-;; ── idempotent + ordered: re-applying is a no-op (Q1/Q4 resume) ─────
+;; ── the whole migration is ONE transaction (atomicity) ──────────────
 
-(heading "── idempotence: re-applying does nothing ──")
-(show "apply!(prod) again:" (get (apply! prod M-tighten) :status))
+(heading "── atomicity: remediation and stamp share one tx ──")
+(def stamp-tx
+  (get (first (datom/q '[:find ?tx
+                         :where [?m :migration/id :2026-08-26-tighten-identity ?tx]]
+                       (datom/db prod))) 0))
+(show "migration recorded at tx:" stamp-tx)
+(show "and apply! reported tx:  " (get prod-report :tx))
+(note "same tx — the data fix and the record of it can never disagree")
 
-;; ── Q4 the sharp edge: an INVALID migration commits nothing ─────────
+;; ── idempotence: re-applying is a no-op ─────────────────────────────
+
+(heading "── idempotence ──")
+(show "apply! again:" (get (datom.migrate/apply! prod tighten) :status))
+
+;; ── post-migration, the invariants actually bite ────────────────────
+
+(heading "── enforcement is real after the migration ──")
+(datom/transact! prod [{:db/id -9 :person/email "ada@x" :person/name "Ada again"}])
+(show "asserting an existing email UPSERTS (identity), still one holder:"
+      (count (datom/q '[:find ?e :where [?e :person/email "ada@x"]] (datom/db prod))))
+
+;; ── a migration whose remediation is insufficient is REFUSED ────────
 ;;
-;; A migration whose grow is fine but whose fn returns a type-invalid
-;; datom. transact! rejects the whole batch, listing every problem; the
-;; ledger and data are untouched.
+;; The gate: if the fn does not fully fix the invariant, apply! commits
+;; nothing and returns :blocked with the residual violations.
 
-(heading "── Q4: an invalid transform aborts wholesale ──")
-
-(def M-bad
-  {:migration/id :2026-08-26-bad
-   :migration/grows []
-   :migration/checks []
-   :migration/fn (fn [db] [[:db/add 1 :person/email 12345]])}) ; long, not string
-
-(def before-bad (applied-ids (datom/db prod)))
-(def bad-outcome
-  (try (do (apply! prod M-bad) :no-error)
-       (catch e :rejected)))
-(show "outcome:" bad-outcome)
-(show "ledger unchanged:" (= before-bad (applied-ids (datom/db prod))))
-(note "consistency: a partially-valid migration is never partially applied")
-
-;; ── FINDING (atomicity seam, honest): apply! is THREE writer turns —
-;;    remediate, grow, stamp. Each is individually ACID (single writer +
-;;    redb WriteTransaction), but the migration as a WHOLE is not one
-;;    commit. If the VM dies between remediate and grow, the data is
-;;    fixed and the schema is not — recoverable, because the ledger is a
-;;    query and the migration is idempotent: re-running resumes cleanly.
-;;    For true whole-migration atomicity you would fold fn-output + grow
-;;    + stamp into ONE transact! (the tx-fn runs in-writer, its datoms
-;;    commit with the grow). That needs :db/fn support in tx.bl — the
-;;    second new primitive the design calls for.
+(heading "── the gate: an under-remediating migration is blocked ──")
+(def messy (datom/connect base-schema))
+(datom/transact! messy [{:db/id -1 :person/email "d@x"} {:db/id -2 :person/email "d@x"}])
+(def bad
+  {:migration/id :bad
+   :migration/grows [{:db/ident :person/email :db/valueType :db.type/string
+                      :db/unique :db.unique/identity}]
+   :migration/checks [{:check :unique :attr :person/email}]
+   :migration/fn (fn [db] [])})   ; remediates nothing
+(def bad-report (datom.migrate/apply! messy bad))
+(show "status:  " (get bad-report :status))
+(show "breaking:" (get bad-report :breaking))
+(show "recorded?" (contains? (datom.migrate/applied-ids (datom/db messy)) :bad))
+(note "the migration author's data assumption was wrong — refused, not")
+(note "corrupted, with the offending value named")
 
 ;; ── what to take away ───────────────────────────────────────────────
 
 (heading "── what to take away ──")
-(println "  Q1  a migration is one value: grows + checks + fn travel together")
-(println "  Q2  the fn is a plain function of a db value — a tx-fn in waiting")
-(println "  Q3  plan() walks prod as a VALUE; breakage is known before deploy ✓")
-(println "  Q4  blocked/invalid migrations commit nothing; each turn is ACID ✓")
-(println "  gaps: store-level `with` (speculative) and :db/fn (in-writer) —")
-(println "        both small, both already half-built in conn.bl/tx.bl")
-(println "\n  The substrate carried a working migration system on the PUBLIC")
-(println "  API alone. The two gaps are additive primitives, not redesigns.")
+(println "  A migration is one value: schema deltas, invariants, remediation")
+(println "  plan walks a db VALUE — including production — and commits nothing")
+(println "  apply! remediates, re-checks, grows and records as ONE transaction")
+(println "  the ledger is a query; applying twice is a no-op")
+(println "  an under-remediating migration is refused, not applied halfway")
+(println "\n  This rests on two primitives the earlier examples lacked:")
+(println "  `with` (speculative transaction) and `:db/fn` (transaction")
+(println "  functions) — see 10-with-efficiency.bl and 11-txfn-efficiency.bl")
+(println "  for how each works and what it costs.")
