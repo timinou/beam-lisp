@@ -125,18 +125,19 @@ checking each answer matched the trusted slow version exactly.
   inset: 6pt,
   fill: (_, row) => if row == 0 { panel2 },
   [*chain length*], [*interpreted*], [*native*], [*speed-up*],
-  [20 links], [97 ms], [3 ms], [*32×*],
-  [40 links], [329 ms], [5 ms], [*65×*],
-  [60 links], [1117 ms], [8 ms], [*139×*],
+  [20 links], [61 ms], [1 ms], [*61×*],
+  [40 links], [386 ms], [4 ms], [*96×*],
+  [60 links], [1281 ms], [8 ms], [*160×*],
 )
 #cap[Same algorithm, same answers (verified identical). The only change is
 where it runs. The speed-up grows because the interpreter's per-fact overhead
 piles up as the work grows.]
 
 #result(
-  "32× to 139×, and widening",
+  "61× to 160×, and widening",
   [The native engine is not a little faster — it is a different league, and the
-   gap grows with the size of the problem.],
+   gap grows with the size of the problem. (Single controlled batch, median of
+   5 runs, closures verified identical.)],
 )
 
 == Axis 1 — Magic Sets (compute only what's asked)
@@ -148,20 +149,22 @@ On a graph made of 80 separate little chains, asking about *one* chain:
   inset: 6pt,
   fill: (_, row) => if row == 0 { panel2 },
   [*approach*], [*facts computed*], [*time*],
-  [full computation], [8400], [25 ms],
-  [Magic Sets], [*105*], [*12 ms*],
+  [full computation (80 chains)], [8400], [29 ms],
+  [full computation (160 chains)], [16800], [62 ms],
+  [Magic Sets (any size)], [*105*], [*16–33 ms*],
 )
-#cap[Magic Sets touched only the chain the question was about, and *ignored the
-other 79 entirely*. Its cost stays flat no matter how big the irrelevant part
-of the graph grows.]
+#cap[Magic Sets touched only the chain the question was about and ignored all
+the others: its fact count stays *flat at 105* whether there are 40, 80, or 160
+chains, while full computation scales with the whole graph. The query answer
+(14 pairs from node 1) was verified identical to full computation.]
 
 == Axis 2 — indexed joins
 
 On a branching graph (where each node leads to several others), the index paid
-off — 61 ms dropped to 14 ms, a 4× win that grows with size. On a plain chain
-(each node leads to exactly one other) the index had nothing to accelerate, and
-correctly showed no benefit. The technique helps exactly when there is fan-out
-to exploit.
+off — 82 ms dropped to 19 ms, a 4× win that grows with size (2× at the smaller
+sizes). On a plain chain (each node leads to exactly one other) the index had
+nothing to accelerate, and correctly showed no benefit. The technique helps
+exactly when there is fan-out to exploit.
 
 == Axis 4 — PreM (shortest paths, even with loops)
 
@@ -219,9 +222,9 @@ principle that keeps the system coherent.
   fill: (_, row) => if row == 0 { panel2 },
   [*technique*], [*verdict*], [*home*],
   [Semi-naïve], [baseline, shipped], [language],
-  [Magic Sets], [#chip("WORKS") 80× fewer facts], [language (rewrite)],
+  [Magic Sets], [#chip("WORKS") 160× fewer facts], [language (rewrite)],
   [PreM], [#chip("WORKS") converges on cycles], [language (rewrite)],
-  [Native engine], [#chip("WORKS") 32–139×], [scoped Rust muscle],
+  [Native engine], [#chip("WORKS") 61–160×], [scoped Rust muscle],
   [Indexed joins], [#chip("WORKS") 4× on fan-out], [inside the muscle],
   [Incremental], [#chip-light("PARTIAL") needs resident state], [future work],
 )
@@ -238,8 +241,11 @@ technique that didn't pay off is reported as such rather than hidden.
 #line(length: 100%, stroke: 0.6pt + hair)
 #v(0.2em)
 #text(size: 8.5pt, fill: g3)[
-  All five prototypes and their benchmarks live in the repository under
-  `native/datom_datalog/` (the Rust spike) and `priv/datom/query/`
-  (`rules.bl`, `magic.bl`, `prem.bl`). 401 existing tests still pass — every
+  All five prototypes live in the repository under `native/datom_datalog/`
+  (the Rust spike) and `priv/datom/query/` (`rules.bl`, `magic.bl`,
+  `prem.bl`). Every number above comes from ONE reproducible harness —
+  `bench/datalog_axes_bench.bl` — run as a single batch with a warmup, the
+  median of five trials, and a correctness assertion on every row (a
+  fast-but-wrong result cannot pass). 401 existing tests still pass; every
   addition here was purely additive.
 ]
