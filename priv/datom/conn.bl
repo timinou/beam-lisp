@@ -24,7 +24,7 @@
 
 (ns datom.conn
   (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
-            [datom.store-overlay] [datom.tx]))
+            [datom.store-overlay] [datom.tx] [datom.broadcast]))
 
 ;; ── id allocation ───────────────────────────────────────────────────
 ;;
@@ -105,7 +105,21 @@
 ; name promises mutation silently pure (BUG-014). A caller who followed
 ; the naming convention lost their schema and learned about it later,
 ; from an unrelated `transact!` complaining about the data.
-(defrecord Conn [store schema basis writer])
+(defrecord Conn [store schema basis writer subs])
+
+;; ── the cross-node PubSub resolver ──────────────────────────────────
+;;
+;; The cluster path is OPT-IN and configured, exactly like
+;; spell/server.ex's `Application.get_env(:beam_lisp, :spell_pubsub)`. A
+;; store with no web stack — a plain `mix run` script, a test — has none,
+;; and that is not an error: `nil` means local-only. Losing a subscriber
+;; because no cluster transport was configured would be a spectacular
+;; trade against a database that is otherwise perfectly functional.
+(defn- pubsub-server
+  "The configured Phoenix.PubSub server as `{:server name}`, or nil."
+  []
+  (let [name (Application/get_env :beam_lisp :datom_pubsub)]
+    (if (nil? name) nil {:server name})))
 
 ;; ── the single writer ───────────────────────────────────────────────
 ;;
@@ -178,7 +192,8 @@
             hit (get reg k)]
         (if (some? hit)
           (->tuple-2 hit reg)
-          (let [cell {:writer (start-writer) :basis (atom initial-basis)}]
+          (let [cell {:writer (start-writer) :basis (atom initial-basis)
+                      :subs (datom.broadcast/new-subs)}]
             (->tuple-2 cell (assoc reg k cell))))))
     30000))
 
@@ -231,7 +246,8 @@
             (if (and (some? cell) (Process/alive? (:writer cell)))
               (->tuple-2 (:writer cell) reg)
               (let [fresh (start-writer)
-                    updated (assoc (or cell {:basis (:basis conn)}) :writer fresh)]
+                    updated (assoc (or cell {:basis (:basis conn) :subs (:subs conn)})
+                                   :writer fresh)]
                 (->tuple-2 fresh (assoc reg k updated))))))
         30000))))
 
@@ -346,7 +362,8 @@
          conn (->Conn store
                       (atom (datom.schema/install-all base schema-defs))
                       (:basis cell)
-                      (:writer cell))]
+                      (:writer cell)
+                      (:subs cell))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -430,6 +447,36 @@
   "The connection's current schema map."
   [conn]
   (deref (:schema conn)))
+
+;; ── subscribing to the commit stream (L2) ───────────────────────────
+;;
+;; A subscription is a plain registration in the store's subscriber table;
+;; it does NOT go through the writer, because subscribing is not a write and
+;; must not queue behind one. `transact!` broadcasts to whatever the table
+;; holds at commit time, so a subscription registered concurrently with a
+;; write simply starts at the next commit — exactly the semantics a caller
+;; wants, and the log makes any gap recoverable via `since` regardless.
+
+(defn listen!
+  "Subscribe the CALLING process to `conn`'s commit stream.
+
+   Delivers `[:datom/tx basis tx-datoms]` (the delta) by default. `opts`:
+     :attrs   #{…}   — wake only on commits touching one of these attributes
+     :payload :basis — receive `[:datom/changed basis attrs]` instead
+
+   Returns the subscriber pid (the caller). Idempotent per process."
+  ([conn] (listen! conn {}))
+  ([conn opts] (datom.broadcast/listen! (:subs conn) (erlang/self) opts)))
+
+(defn unlisten!
+  "Unsubscribe the calling process (or `pid`) from `conn`."
+  ([conn] (unlisten! conn (erlang/self)))
+  ([conn pid] (datom.broadcast/unlisten! (:subs conn) pid)))
+
+(defn subscribers
+  "The pids currently subscribed to `conn` — for tests and introspection."
+  [conn]
+  (datom.broadcast/subscribers (:subs conn)))
 
 (defn install-schema!
   "Add attribute definitions to a live connection.
@@ -692,8 +739,16 @@
     ; high-water mark is monotone and idempotent: two writers racing
     ; can apply theirs in either order for the same result.
     (swap! (:basis conn) (fn [cur] (max cur tx)))
-    {:db-before db-before
-     :db-after (db conn)
-     :tx tx
-     :tempids (get result :tempids)
-     :tx-datoms (get result :tx-datoms)}))
+    (let [report {:db-before db-before
+                  :db-after (db conn)
+                  :tx tx
+                  :tempids (get result :tempids)
+                  :tx-datoms (get result :tx-datoms)}]
+      ; Broadcast AFTER the basis advances, still inside the writer, so
+      ; reports leave in commit order (invariant 1). `with` and
+      ; `run-tx-pipeline` never reach here, so a speculative or rejected
+      ; transaction never broadcasts (invariant 2). The fan-out is cheap
+      ; non-blocking `send`s, so a slow subscriber cannot stall the writer
+      ; (invariant 4).
+      (datom.broadcast/publish! (:subs conn) (pubsub-server) report)
+      report)))

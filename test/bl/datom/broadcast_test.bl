@@ -1,0 +1,211 @@
+; broadcast_test.bl — L2: the transaction-report broadcast.
+;
+; The design's promise is that datom's feed is STRONGER than raw BEAM
+; messaging: totally ordered, gap-detectable, and never emitted for a
+; write that did not commit. Each test here pins one of the five
+; invariants from docs/datom-as-a-broadcast-substrate.md §7, plus the
+; payload-shape guarantees of §6.
+;
+; A subscription delivers to the CALLING process's mailbox, so a test can
+; subscribe as itself and `receive` with an `after` timeout: a message
+; that must arrive is asserted by receiving it; a message that must NOT
+; arrive is asserted by timing out. The timeouts are generous enough to
+; be reliable and short enough to keep the suite quick.
+
+(ns datom.broadcast.test
+  (:require [datom] [datom.conn] [datom.broadcast]))
+
+(defn- order-conn []
+  (datom/connect
+    [{:db/ident :order/id :db/valueType :db.type/long
+      :db/unique :db.unique/identity}
+     {:db/ident :order/status :db/valueType :db.type/keyword}
+     {:db/ident :order/total :db/valueType :db.type/long}]))
+
+;; A blocking receive of the next delta, or `:timeout`.
+(defn- next-delta [ms]
+  (receive
+    [:datom/tx basis tx-datoms] {:basis basis :datoms tx-datoms}
+    (after ms :timeout)))
+
+(defn- next-msg [ms]
+  (receive
+    m m
+    (after ms :timeout)))
+
+;; ── §6: payload shapes ──────────────────────────────────────────────
+
+(deftest the-default-payload-is-the-delta
+  ; The store already produced the datoms; the reader must get them with
+  ; NO re-query. A delta is `[:datom/tx basis tx-datoms]`.
+  (let [conn (order-conn)]
+    (datom/listen! conn)
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (let [got (next-delta 2000)]
+      (is (not (= :timeout got)) "a delta arrived")
+      (is (= 1000001 (:basis got)) "the delta carries the new basis")
+      ; three datoms: :order/id, :order/status, and the tx's :db/txInstant
+      (is (= 3 (count (:datoms got))) "the delta carries the committed datoms")
+      (let [statuses (filterv (fn [d] (= :order/status (datom/datom-a d))) (:datoms got))]
+        (is (= 1 (count statuses)) "including the :order/status datom")
+        (is (= :pending (datom/datom-v (first statuses))) "with its value, query-free")))))
+
+(deftest the-basis-knob-suppresses-the-delta
+  ; A `{:payload :basis}` subscriber gets a coordinate + the changed
+  ; attributes, and NEVER the datoms. This is the FEAT-016 shape for a
+  ; consumer that re-derives.
+  (let [conn (order-conn)]
+    (datom/listen! conn {:payload :basis})
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (let [m (next-msg 2000)]
+      (is (not (= :timeout m)) "a basis message arrived")
+      (is (= :datom/changed (get m 0)) "it is the :datom/changed shape, not :datom/tx")
+      (is (= 1000001 (get m 1)) "it carries the basis")
+      (is (contains? (get m 2) :order/status) "and the changed-attribute set")
+      (is (not (contains? (get m 2) :db/txInstant))
+          "which excludes the :db/txInstant self-datom noise"))))
+
+(deftest the-writer-never-projects
+  ; No payload — delta or basis — is a rendered/per-principal value. Both
+  ; are pure facts. FEAT-016's kernel, as a test rather than a comment.
+  (let [conn (order-conn)]
+    (datom/listen! conn)
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (let [m (next-msg 2000)]
+      (is (= :datom/tx (get m 0)) "the message head is a fact tag, never a view")
+      ; a delta's third slot is a list of datoms (vectors), not a map of
+      ; assigns or rendered rows.
+      (is (every? (fn [d] (= 5 (count d))) (get m 2))
+          "every element is a 5-tuple datom, not a projection"))))
+
+;; ── §7 invariant 1: report order = commit order ─────────────────────
+
+(deftest reports-arrive-in-commit-order
+  ; The single writer stamps a monotonic basis and broadcasts inside its
+  ; serialized step, so a subscriber sees bases strictly increasing even
+  ; under concurrent writers.
+  (let [conn (order-conn)
+        n 20]
+    (datom/listen! conn)
+    ; fire n concurrent writers
+    (to-list (map (fn [t] (Task/await t))
+                  (to-list (map (fn [i]
+                                  (Task/async
+                                    (fn [] (datom/transact! conn [{:db/id -1 :order/id (+ 100 i)}]))))
+                                (range n)))))
+    ; drain n deltas and check their bases are strictly increasing
+    (let [bases (mapv (fn [_] (:basis (next-delta 2000))) (range n))]
+      (is (= n (count bases)) "every commit produced exactly one delta")
+      (is (apply < bases) "and the bases are strictly increasing — commit order"))))
+
+;; ── §7 invariant 2: no broadcast on failed/speculative tx ───────────
+
+(deftest with-does-not-broadcast
+  ; A speculative transaction changes nothing durable, so no subscriber
+  ; must hear of it.
+  (let [conn (order-conn)]
+    (datom/listen! conn)
+    (datom/with conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (is (= :timeout (next-msg 300)) "with produced no broadcast")))
+
+(deftest a-rejected-transaction-does-not-broadcast
+  ; A schema violation raises and commits nothing. The subscriber must
+  ; stay silent — a broadcast here would announce a write that never was.
+  (let [conn (order-conn)]
+    (datom/listen! conn)
+    (try (datom/transact! conn [{:db/id -1 :order/id 1 :order/status "not-a-keyword"}])
+         (catch _e :rejected))
+    (is (= :timeout (next-msg 300)) "a rejected transaction produced no broadcast")))
+
+;; ── §7 invariant 3: no undetectable gap (replay) ────────────────────
+
+(deftest a-missed-message-is-recoverable-from-the-log
+  ; The broadcast is an accelerator; the log is the truth. A subscriber
+  ; that misses a message detects the basis jump and replays `since`.
+  (let [conn (order-conn)]
+    ; commit BEFORE subscribing — the subscriber never saw this one
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/status :pending}])
+    (let [t0 (datom/basis-t (datom/db conn))]
+      (datom/listen! conn)
+      ; two more commits arrive on the stream
+      (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :pending}])
+      (datom/transact! conn [{:db/id -3 :order/id 3 :order/status :shipped}])
+      ; simulate a DROP: read only the SECOND delta, discard the first.
+      (let [_first-delta (next-delta 2000)
+            second-delta (next-delta 2000)]
+        (is (not (= :timeout second-delta)) "later deltas still arrive")
+        ; the subscriber's last CONFIRMED point is t0 (before it subscribed).
+        ; `since t0` reconstructs everything after it, straight from the log.
+        (let [recovered (datom/since (datom/db conn) t0)
+              ids (datom/q '[:find ?id :where [?e :order/id ?id]] recovered)]
+          (is (contains? ids [2]) "the missed entity 2 is recovered from the log")
+          (is (contains? ids [3]) "as is entity 3")
+          (is (not (contains? ids [1]))
+              "and `since t0` excludes what was already confirmed — no double-count"))))))
+
+;; ── §7 invariant 4: backpressure is the subscriber's ────────────────
+
+(deftest a-stalled-subscriber-does-not-block-the-writer
+  ; Fan-out is `send`, which never blocks. A subscriber that never drains
+  ; its mailbox must not slow a concurrent writer. We spawn a subscriber
+  ; that subscribes and then sleeps forever, and assert the writer still
+  ; commits promptly.
+  (let [conn (order-conn)
+        me (erlang/self)
+        ; a process that subscribes on the conn's behalf, then goes silent
+        stalled (erlang/spawn
+                  (fn []
+                    (datom/listen! conn)
+                    (erlang/send me :subscribed)
+                    (Process/sleep 60000)))]
+    ; wait until it has actually subscribed
+    (receive :subscribed :ok (after 2000 :ok))
+    (let [t0 (erlang/system_time :millisecond)]
+      (to-list (map (fn [t] (Task/await t))
+                    (to-list (map (fn [i]
+                                    (Task/async
+                                      (fn [] (datom/transact! conn [{:db/id -1 :order/id (+ 200 i)}]))))
+                                  (range 50)))))
+      (let [elapsed (- (erlang/system_time :millisecond) t0)]
+        (is (= 50 (count (datom/q '[:find ?e :where [?e :order/id _]] (datom/db conn))))
+            "every write committed despite a stalled subscriber")
+        (is (< elapsed 5000)
+            "and the writer was not blocked by the full mailbox")))
+    (erlang/exit stalled :kill)))
+
+;; ── §7 invariant 5: T0 attribute filter is sound ───────────────────
+
+(deftest an-attr-filter-wakes-only-on-its-attributes
+  (let [conn (order-conn)]
+    (datom/listen! conn {:attrs #{:order/status}})
+    ; a commit touching only :order/total must NOT wake the subscriber
+    (datom/transact! conn [{:db/id -1 :order/id 1 :order/total 50}])
+    (is (= :timeout (next-msg 300))
+        "a commit touching only :order/total does not wake an :order/status listener")
+    ; a commit touching :order/status MUST wake it
+    (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :shipped}])
+    (let [got (next-delta 2000)]
+      (is (not (= :timeout got)) "a commit touching :order/status wakes it")
+      (is (some (fn [d] (= :order/status (datom/datom-a d))) (:datoms got))
+          "and the delta carries the :order/status datom"))))
+
+;; ── unsubscribe ─────────────────────────────────────────────────────
+
+(deftest unlisten-stops-delivery
+  (let [conn (order-conn)]
+    (datom/listen! conn)
+    (datom/transact! conn [{:db/id -1 :order/id 1}])
+    (is (not (= :timeout (next-msg 2000))) "delivery while subscribed")
+    (datom/unlisten! conn)
+    (datom/transact! conn [{:db/id -2 :order/id 2}])
+    (is (= :timeout (next-msg 300)) "no delivery after unlisten!")))
+
+(deftest subscribers-reflects-registration
+  (let [conn (order-conn)]
+    (is (= 0 (count (datom/subscribers conn))) "none at first")
+    (datom/listen! conn)
+    (is (= 1 (count (datom/subscribers conn))) "one after listen!")
+    (is (some (fn [p] (= p (erlang/self))) (datom/subscribers conn))
+        "and it is this process")
+    (datom/unlisten! conn)
+    (is (= 0 (count (datom/subscribers conn))) "none after unlisten!")))

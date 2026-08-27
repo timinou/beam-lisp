@@ -1,0 +1,165 @@
+; datom/broadcast.bl — L2: the transaction-report broadcast.
+;
+; ── The one primitive datom lacked ────────────────────────────────────
+;
+; datom already keeps a durable, totally-ordered log of facts and lets any
+; process hold a consistent value of it for free. The only thing it could
+; not do was say *"it changed."* This layer adds that: after a commit, the
+; writer broadcasts a report so any process can subscribe to a store's
+; commit stream.
+;
+; Datomic answers this with a pull-based `tx-report-queue`. The BEAM-native
+; reframe is PUSH: a commit is a message, the tx-log is the topic, and every
+; BEAM broadcast primitive is a transport for it.
+;
+; ── Payload: delta by default, never a projection ─────────────────────
+;
+; The writer emits FACTS, never a projection (a projection is a function of
+; (data, who is asking), and the writer knows only its half). Two shapes:
+;
+;   delta   [:datom/tx      basis tx-datoms]   ; DEFAULT — query-free for the reader
+;   basis   [:datom/changed basis changed-attrs] ; the KNOB {:payload :basis}
+;
+; The delta is the subscriber-agnostic middle the store already produced:
+; the reader filters it locally with NO store access. Basis-only is for a
+; large write, or a subscriber that will re-derive a complex view from
+; `as-of` anyway. See docs/datom-as-a-broadcast-substrate.md §6.
+;
+; ── Why a lazily-pruned atom map, and not :pg ─────────────────────────
+;
+; :pg is the native process-group broadcast, and it auto-prunes dead members
+; — genuinely the right tool when all you need is cluster-wide membership.
+; But a subscriber here carries OPTIONS (`:attrs`, `:payload`) that :pg cannot
+; hold, so :pg would force a SECOND structure (a side table pid -> opts) for
+; one fact. One structure is better than two that must agree.
+;
+; So local subscribers live in ONE atom map `{pid -> opts}` per store, and
+; the liveness check IS the prune: `publish!` drops any pid that is no longer
+; alive as it iterates. That check is also the honest shape of invariant 4 —
+; fan-out is `send`, which never blocks, so a slow subscriber's mailbox grows
+; while the writer is untouched. The cluster reach is Phoenix.PubSub, which
+; maintains its own subscriptions, so :pg's membership is never needed here.
+;
+; ── Ordering (invariant 1) ────────────────────────────────────────────
+;
+; `publish!` runs INSIDE the writer's serialized step, after the basis
+; high-water mark advances. So reports leave in commit order for free — the
+; single writer that makes transactions atomic makes the feed ordered. The
+; sends are cheap non-blocking `erlang/send`s; doing them in the writer costs
+; the next commit only O(subscribers) message copies, never a block.
+
+(ns datom.broadcast
+  (:require [datom.db] [datom.index]))
+
+;; ── the per-store subscriber table ──────────────────────────────────
+;;
+;; Created once per store, alongside the writer and basis in the connection
+;; registry cell (see datom.conn/store-cell). A plain atom holding
+;; `{pid -> opts}`; `listen!` assocs, `unlisten!` dissocs, and `publish!`
+;; prunes the dead lazily.
+
+(defn new-subs
+  "A fresh, empty subscriber table for a store."
+  []
+  (atom {}))
+
+(defn listen!
+  "Register `pid` as a local subscriber with `opts`, returning `pid`.
+
+   `opts` may carry:
+     :attrs   #{…}     — wake only on commits touching one of these attributes
+     :payload :basis   — receive `[:datom/changed basis attrs]` instead of the
+                         default delta `[:datom/tx basis tx-datoms]`
+
+   Idempotent: listening twice replaces the options, never doubles delivery."
+  [subs pid opts]
+  (swap! subs (fn [m] (assoc m pid (or opts {}))))
+  pid)
+
+(defn unlisten!
+  "Remove `pid` from the subscriber table. Safe if it was never subscribed."
+  [subs pid]
+  (swap! subs (fn [m] (dissoc m pid)))
+  :ok)
+
+(defn subscribers
+  "The pids currently subscribed — for tests and introspection."
+  [subs]
+  (into [] (keys (deref subs))))
+
+;; ── the payload ─────────────────────────────────────────────────────
+
+(defn changed-attrs
+  "The set of attributes a commit touched, EXCLUDING `:db/txInstant`.
+
+   Every transaction writes a `:db/txInstant` self-datom, so including it
+   would make every commit 'touch' it — noise that would wake an attribute
+   filter that never asked for it. A subscriber that genuinely wants
+   'any commit' uses no `:attrs` filter and is woken regardless."
+  [tx-datoms]
+  (reduce (fn [acc d]
+            (let [a (datom.index/-a d)]
+              (if (= a :db/txInstant) acc (conj acc a))))
+          #{}
+          tx-datoms))
+
+(defn- interested?
+  "Whether a subscriber with `opts` should be woken by a commit whose
+   changed-attribute set is `attrs`. No `:attrs` filter ⇒ always."
+  [opts attrs]
+  (let [want (get opts :attrs)]
+    (if (nil? want)
+      true
+      (reduce (fn [_ a] (if (contains? want a) (reduced true) false))
+              false
+              attrs))))
+
+(defn- payload-for
+  "The message term for a subscriber, by its chosen payload shape."
+  [opts basis tx-datoms attrs]
+  (if (= :basis (get opts :payload))
+    [:datom/changed basis attrs]
+    [:datom/tx basis tx-datoms]))
+
+;; ── publishing (inside the writer) ──────────────────────────────────
+
+(defn publish!
+  "Broadcast a transaction `report` to every interested subscriber.
+
+   Called from the writer AFTER the basis advances (see
+   datom.conn/transact-in-writer), so delivery order is commit order.
+
+   `pubsub` is nil for local-only, or a map `{:server name}` naming a
+   running Phoenix.PubSub for the cross-node path. When present, the delta
+   goes to topic \"datom/tx\" and the basis form to \"datom/tx/basis\", so a
+   remote `{:payload :basis}` subscriber can pick the smaller channel.
+
+   Returns the number of LOCAL subscribers delivered to (for tests)."
+  [subs pubsub report]
+  (let [basis  (datom.db/basis-t (get report :db-after))
+        datoms (get report :tx-datoms)
+        attrs  (changed-attrs datoms)]
+    ;; ── local subscribers: the default path, always on ──
+    (let [snapshot (deref subs)
+          delivered
+          (reduce
+            (fn [n entry]
+              (let [pid  (get entry 0)
+                    opts (get entry 1)]
+                (if (Process/alive? pid)
+                  (if (interested? opts attrs)
+                    (do (erlang/send pid (payload-for opts basis datoms attrs))
+                        (inc n))
+                    n)
+                  ;; the liveness check IS the prune (invariant 4)
+                  (do (swap! subs (fn [m] (dissoc m pid))) n))))
+            0
+            (to-list snapshot))]
+      ;; ── cross-node: opt-in, Phoenix.PubSub, delta + basis channels ──
+      (when (some? pubsub)
+        (let [server (get pubsub :server)]
+          (when (some? server)
+            (Phoenix.PubSub/broadcast server "datom/tx" [:datom/tx basis datoms])
+            (Phoenix.PubSub/broadcast server "datom/tx/basis"
+                                      [:datom/changed basis attrs]))))
+      delivered)))
