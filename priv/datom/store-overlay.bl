@@ -1,0 +1,124 @@
+; datom/store-overlay.bl — a read-through store for SPECULATIVE writes.
+;
+; ── What this is for ──────────────────────────────────────────────────
+;
+; `with` (datom.conn/with) applies a transaction and returns the database
+; value that WOULD result, without committing anything to the connection.
+; The migration system's dry-run (datom.migrate/plan) rests on it: preview
+; a whole migration — its data transform AND its schema grow — against a
+; production database value, and learn what breaks before deploying.
+;
+; The hard part is not "don't advance the basis". It is the STORE. A
+; speculative write must not mutate the base, and the development
+; substrate (store-ets) is a shared mutable table with NO transactions:
+; writing into it and retracting afterwards would be visible to concurrent
+; readers mid-flight and unrecoverable on a crash. Speculation must not be
+; a PLACE — the same reason a database is a value.
+;
+; ── How it works ──────────────────────────────────────────────────────
+;
+; An overlay holds a BASE store (read-only to it) and a small speculative
+; BUFFER (a sorted map in an atom). Reads consult the buffer first, then
+; fall through to the base. Writes land ONLY in the buffer. The base is
+; never touched, so the same base can back any number of independent
+; speculations at once.
+;
+; ── Why no deletion-masking is needed ─────────────────────────────────
+;
+; A subtlety that makes this forty lines instead of two hundred: datom
+; writes are ALL `[:put k v]` of NEW keys. A retraction is a new datom
+; with `op` encoded IN its key (see codec.bl), never a store `-delete` of
+; an existing key. So a speculative transaction only ever ADDS keys the
+; base does not have; it never needs to hide a base key. The buffer is a
+; pure addition, and `-range` is a straight merge with the buffer winning
+; only on the id COUNTER keys it re-increments.
+;
+; ── Cost ──────────────────────────────────────────────────────────────
+;
+; Zero up front (no copy). Each speculative read is one base range plus a
+; buffer merge; a dry-run therefore transfers only the columns it actually
+; reads. That is the right shape for "plan THIS migration" against a large
+; remote store — measured against the clone alternative in
+; examples/datom/10-with-efficiency.bl.
+
+(ns datom.store-overlay
+  (:require [datom.store]))
+
+(defrecord OverlayStore [base buffer])          ; buffer: atom of sorted-map
+
+(defn open
+  "An overlay over `base`. Reads fall through to `base`; writes stay in a
+   private buffer `base` never sees."
+  [base]
+  (->OverlayStore base (atom (sorted-map))))
+
+(defn- buffer-get
+  "The buffer's value at `k`, or the sentinel `:datom.store-overlay/miss`
+   when the buffer does not hold `k` (distinct from a stored nil, though
+   the layers above never store nil)."
+  [store k]
+  (get (deref (:buffer store)) k :datom.store-overlay/miss))
+
+(extend-type OverlayStore
+  datom.store/Store
+
+  (-get [store k]
+    (let [b (buffer-get store k)]
+      (if (= b :datom.store-overlay/miss)
+        (datom.store/-get (:base store) k)
+        b)))
+
+  (-range [store lo hi]
+    ; base ∪ buffer within [lo,hi], buffer winning on a key collision
+    ; (only the counters collide), returned in ascending key order. The
+    ; merge builds a sorted map so ordering is the map's, not a re-sort.
+    (let [base-entries (datom.store/-range (:base store) lo hi)
+          in-bounds (filterv (fn [e]
+                               (let [k (get e 0)]
+                                 (and (or (nil? lo) (not (erlang/< k lo)))
+                                      (or (nil? hi) (not (erlang/> k hi))))))
+                             (into [] (seq (deref (:buffer store)))))
+          merged (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                         (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                                 (sorted-map) base-entries)
+                         in-bounds)]
+      (into [] (seq merged))))
+
+  (-put [store k v]
+    (swap! (:buffer store) (fn [m] (assoc m k v)))
+    store)
+
+  (-delete [store k]
+    ; Included for protocol completeness. Datom writes never delete a base
+    ; key, so this only ever removes a key the SPECULATION itself wrote.
+    (swap! (:buffer store) (fn [m] (dissoc m k)))
+    store)
+
+  (-update [store k f]
+    ; Atomic read-modify-write against the OVERLAID value: read through to
+    ; base when the buffer has not seen `k` yet, apply `f`, write the
+    ; result to the buffer. This is how the id counters advance during a
+    ; speculation without touching the base counters — the next real
+    ; transaction on the base allocates the SAME ids the speculation used,
+    ; which is correct: the speculation never happened.
+    (let [cur (let [b (buffer-get store k)]
+                (if (= b :datom.store-overlay/miss)
+                  (datom.store/-get (:base store) k)
+                  b))
+          nv (f cur)]
+      (swap! (:buffer store) (fn [m] (assoc m k nv)))
+      [store nv]))
+
+  (-commit [store ops]
+    ; One swap! for the whole batch, so a reader never observes a
+    ; half-applied speculative transaction — the same atomicity the map
+    ; store provides, over the buffer alone.
+    (swap! (:buffer store)
+           (fn [m]
+             (reduce (fn [acc op]
+                       (if (= (get op 0) :put)
+                         (assoc acc (get op 1) (get op 2))
+                         (dissoc acc (get op 1))))
+                     m
+                     ops)))
+    store))

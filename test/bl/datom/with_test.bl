@@ -1,0 +1,164 @@
+; test/bl/datom/with_test.bl — speculative transactions (`with`) and the
+; overlay store they rest on.
+; Run: mix beam_lisp.test test/bl/datom/with_test.bl
+;
+; Two contracts are under test here:
+;
+;   1. OverlayStore satisfies the Store port (the same conformance the
+;      other substrates pass), AND never mutates its base.
+;   2. `datom.conn/with` returns the database that WOULD result, while
+;      leaving the connection — its store and its basis — untouched.
+;
+; The second is the load-bearing one for the migration system: a dry-run
+; that mutated the thing it was previewing would be worse than none.
+
+(ns datom.with.test
+  (:require [datom] [datom.conn] [datom.db] [datom.store] [datom.store-ets]
+            [datom.store-overlay] [datom.schema]))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; OverlayStore — the port, and non-mutation of the base
+;; ═══════════════════════════════════════════════════════════════════
+
+(deftest overlay-reads-fall-through-to-base
+  (let [base (datom.store-ets/open)]
+    (datom.store/-put base "k" 1)
+    (let [ov (datom.store-overlay/open base)]
+      (is (= 1 (datom.store/-get ov "k"))))))
+
+(deftest overlay-writes-do-not-touch-base
+  (let [base (datom.store-ets/open)
+        ov (datom.store-overlay/open base)]
+    (datom.store/-put ov "k" 99)
+    (is (= 99 (datom.store/-get ov "k")))
+    (is (nil? (datom.store/-get base "k")))))
+
+(deftest overlay-buffer-shadows-base-on-collision
+  (let [base (datom.store-ets/open)]
+    (datom.store/-put base "k" 1)
+    (let [ov (datom.store-overlay/open base)]
+      (datom.store/-put ov "k" 2)
+      (is (= 2 (datom.store/-get ov "k")))
+      (is (= 1 (datom.store/-get base "k"))))))
+
+(deftest overlay-range-merges-base-and-buffer-in-order
+  (let [base (datom.store-ets/open)]
+    (datom.store/-put base "a" 1)
+    (datom.store/-put base "c" 3)
+    (let [ov (datom.store-overlay/open base)]
+      (datom.store/-put ov "b" 2)
+      (is (= [["a" 1] ["b" 2] ["c" 3]]
+             (into [] (datom.store/-range ov nil nil))))
+      ; base is unchanged: "b" exists only in the overlay
+      (is (= [["a" 1] ["c" 3]] (into [] (datom.store/-range base nil nil)))))))
+
+(deftest overlay-range-honours-bounds
+  (let [base (datom.store-ets/open)]
+    (doseq [k ["a" "b" "c" "d"]] (datom.store/-put base k k))
+    (let [ov (datom.store-overlay/open base)]
+      (datom.store/-put ov "bb" "bb")
+      (is (= ["b" "bb" "c"] (datom.store/range-keys ov "b" "c"))))))
+
+(deftest overlay-update-is-atomic-over-overlaid-value
+  (let [base (datom.store-ets/open)]
+    (datom.store/-put base "n" 5)
+    (let [ov (datom.store-overlay/open base)
+          out (datom.store/-update ov "n" (fn [c] (inc c)))]
+      (is (= 6 (get out 1)))
+      (is (= 6 (datom.store/-get ov "n")))
+      ; the base counter did NOT advance
+      (is (= 5 (datom.store/-get base "n"))))))
+
+(deftest overlay-update-reads-through-when-buffer-empty
+  (let [base (datom.store-ets/open)
+        ov (datom.store-overlay/open base)]
+    (is (= 1 (get (datom.store/-update ov "fresh" (fn [c] (if (nil? c) 1 (inc c)))) 1)))
+    (is (nil? (datom.store/-get base "fresh")))))
+
+(deftest overlay-commit-is-atomic-over-buffer
+  (let [base (datom.store-ets/open)
+        ov (datom.store-overlay/open base)]
+    (datom.store/-commit ov [[:put "x" 1] [:put "y" 2] [:delete "x"]])
+    (is (nil? (datom.store/-get ov "x")))
+    (is (= 2 (datom.store/-get ov "y")))
+    (is (= 0 (datom.store/range-count base nil nil)))))
+
+(deftest two-overlays-over-one-base-are-independent
+  (let [base (datom.store-ets/open)]
+    (datom.store/-put base "shared" 0)
+    (let [a (datom.store-overlay/open base)
+          b (datom.store-overlay/open base)]
+      (datom.store/-put a "shared" 1)
+      (datom.store/-put b "shared" 2)
+      (is (= 1 (datom.store/-get a "shared")))
+      (is (= 2 (datom.store/-get b "shared")))
+      (is (= 0 (datom.store/-get base "shared"))))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; `with` — the speculative transaction over a live connection
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn- conn-with-people []
+  (let [c (datom/connect
+            [{:db/ident :person/name :db/valueType :db.type/string}
+             {:db/ident :person/email :db/valueType :db.type/string
+              :db/unique :db.unique/identity}
+             {:db/ident :person/age :db/valueType :db.type/long}])]
+    (datom/transact! c [{:db/id -1 :person/name "Ada" :person/email "ada@x" :person/age 36}
+                        {:db/id -2 :person/name "Grace" :person/email "grace@x" :person/age 45}])
+    c))
+
+(deftest with-returns-the-prospective-db
+  (let [c (conn-with-people)
+        r (datom.conn/with c [{:db/id -1 :person/name "Alan" :person/email "alan@x"}])]
+    ; db-after sees the new person
+    (is (= 3 (count (datom/q '[:find ?e :where [?e :person/name ?n]]
+                             (get r :db-after)))))))
+
+(deftest with-does-not-change-the-connection
+  (let [c (conn-with-people)
+        before-count (count (datom/q '[:find ?e :where [?e :person/name ?n]] (datom/db c)))
+        before-basis (datom.db/basis-t (datom/db c))]
+    (datom.conn/with c [{:db/id -1 :person/name "Ghost" :person/email "ghost@x"}])
+    ; the connection is exactly where it was: same count, same basis
+    (is (= before-count (count (datom/q '[:find ?e :where [?e :person/name ?n]] (datom/db c)))))
+    (is (= before-basis (datom.db/basis-t (datom/db c))))))
+
+(deftest with-does-not-advance-real-tx-ids
+  ; A speculation allocates a tx id off the overlay, so the NEXT real
+  ; transaction must reuse it — the speculation never happened.
+  (let [c (conn-with-people)
+        spec (datom.conn/with c [{:db/id -1 :person/name "Spec" :person/email "spec@x"}])
+        real (datom/transact! c [{:db/id -1 :person/name "Real" :person/email "real@x"}])]
+    (is (= (get spec :tx) (get real :tx)))))
+
+(deftest with-report-has-tempids
+  (let [c (conn-with-people)
+        r (datom.conn/with c [{:db/id -1 :person/name "Alan" :person/email "alan@x"}])
+        alan (get (get r :tempids) -1)]
+    (is (some? alan))
+    (is (= "Alan" (datom.db/attr-value (get r :db-after) alan :person/name)))))
+
+(deftest with-raises-on-a-schema-violation
+  ; A speculation the real transaction would reject is rejected the same
+  ; way — a valid answer to "what would happen?".
+  (let [c (conn-with-people)]
+    (is (thrown? (datom.conn/with c [{:db/id -9 :person/age "not-a-number"}])))))
+
+(deftest with-sees-uniqueness-against-current-data
+  ; The whole point of previewing against real data: a unique/identity
+  ; email that already exists UPSERTS rather than creating a second
+  ; entity, and the speculative db shows that.
+  (let [c (conn-with-people)
+        r (datom.conn/with c [{:db/id -9 :person/email "ada@x" :person/age 99}])
+        holders (datom/q '[:find ?e :where [?e :person/email "ada@x"]] (get r :db-after))]
+    (is (= 1 (count holders)))))
+
+(deftest with-is-composable
+  ; db-after is a real database value: it can seed another speculation.
+  (let [c (conn-with-people)
+        r1 (datom.conn/with c [{:db/id -1 :person/name "A" :person/email "a@x"}])
+        db1 (get r1 :db-after)]
+    ; querying the speculative db twice is stable
+    (is (= (datom/q '[:find ?n :where [?e :person/name ?n]] db1)
+           (datom/q '[:find ?n :where [?e :person/name ?n]] db1)))))

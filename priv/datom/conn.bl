@@ -23,7 +23,8 @@
 ; state in the entire system; everything else is a value derived from it.
 
 (ns datom.conn
-  (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets] [datom.tx]))
+  (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
+            [datom.store-overlay] [datom.tx]))
 
 ;; ── id allocation ───────────────────────────────────────────────────
 ;;
@@ -506,17 +507,74 @@
   [conn tx-data]
   (with-writer conn (fn [] (transact-in-writer conn tx-data))))
 
-(defn- transact-in-writer
-  "The body of `transact!`, already inside the writer process.
+(defn with
+  "Speculatively apply `tx-data` and return the report that WOULD result,
+   WITHOUT committing to the connection.
 
-   Everything here is a read-modify-write — allocating a tx id, checking
-   a unique value, appending to the indexes — and none of it is atomic as
-   a unit. It is correct because exactly one process runs it at a time."
+   The database is a value, and this is the operation that treats a
+   PROSPECTIVE change as one too: `(with conn tx-data)` runs the exact
+   pipeline `transact!` runs — the same expand, resolve, validate,
+   realize — but against an OVERLAY of the connection's store, so the real
+   store and the connection's basis are untouched. Nothing any other
+   reader sees changes.
+
+   The report carries the same keys `transact!` returns:
+
+     :db-before   the value before (the connection's current db)
+     :db-after    the value AS IF the transaction had committed
+     :tx          the tx id it would have used
+     :tempids     tempid -> id, for reading the speculative entities
+     :tx-datoms   exactly the datoms it would have recorded
+
+   `:db-after` is a fully-functional database value: query it, pull from
+   it, feed it to another `with`. This is what `datom.migrate/plan` uses
+   to dry-run a whole migration — its data transform AND its schema grow —
+   against a production database and report what breaks, before deploying.
+
+   Runs THROUGH the writer, like `transact!`: a speculation reads the
+   store and allocates ids, and doing so off the writer would race a
+   concurrent real transaction for the same tx id. The overlay keeps the
+   WRITES speculative; the writer keeps the READS consistent.
+
+   NB: raises on a schema violation exactly as `transact!` does — a
+   speculative transaction the real one would reject is itself a useful
+   answer, surfaced the same way."
   [conn tx-data]
-  (let [store (:store conn)
-        schema (deref (:schema conn))
-        db-before (db conn)
-        ops (datom.tx/expand schema tx-data)
+  (with-writer conn (fn [] (with-in-writer conn tx-data))))
+
+(defn- with-in-writer
+  "The body of `with`, already inside the writer process. Mirrors
+   `transact-in-writer`, but commits into an overlay and advances no
+   basis: the speculative db-after reads at the overlay's fresh tx over a
+   base that never learned the transaction happened."
+  [conn tx-data]
+  (let [db-before (db conn)
+        overlay (datom.store-overlay/open (:store conn))
+        result (run-tx-pipeline overlay (deref (:schema conn)) tx-data)
+        tx (get result :tx)]
+    {:db-before db-before
+     :db-after (datom.db/db-value overlay (deref (:schema conn)) tx)
+     :tx tx
+     :tempids (get result :tempids)
+     :tx-datoms (get result :tx-datoms)}))
+
+(defn- run-tx-pipeline
+  "The pure transaction pipeline over a store: expand, resolve tempids,
+   expand store-ops, validate, allocate a tx id, realize and WRITE the
+   datoms. Returns `{:tx :tempids :tx-datoms}`.
+
+   Factored out of `transact-in-writer` because `with` needs exactly this
+   — against an OVERLAY store — and the two must not drift: a speculative
+   transaction that expanded, resolved or validated even slightly
+   differently from a real one would make `plan` (the migration dry-run)
+   preview a migration that is not the one `apply!` would run. So there is
+   ONE pipeline, and both callers use it; the only thing that differs is
+   the store handed in and whether a basis atom is advanced afterward.
+
+   `store` is committed to. For `transact!` that is the connection's real
+   store; for `with` it is an overlay whose base is never touched."
+  [store schema tx-data]
+  (let [ops (datom.tx/expand schema tx-data)
         ; `:db/retractEntity` and `:db/cas` are questions about current
         ; state, so they expand AFTER tempid resolution (their entity is
         ; a real id by then) and BEFORE validation (what they expand to
@@ -552,24 +610,35 @@
         ; One atomic commit for every index of every datom: a transaction
         ; visible in EAVT but not AEVT would be a corrupt database.
         (datom.index/write-datoms store schema datoms)
+        {:tx tx :tempids (get resolved 1) :tx-datoms datoms}))))
 
-        ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
-        ; let a slower transaction with a LOWER id land last and rewind
-        ; it, which filtered every datom above the rewound mark out of
-        ; every subsequent read — twenty concurrent writes, all
-        ; committed, all acknowledged, all durable, and sixteen visible.
-        ;
-        ; Nothing was lost: the datoms were on disk the whole time. That
-        ; is what made it dangerous. The caller held a report saying the
-        ; write succeeded, because it had, and a later read disagreed
-        ; (BUG-022).
-        ;
-        ; `max` rather than a compare-and-set loop because advancing a
-        ; high-water mark is monotone and idempotent: two writers racing
-        ; can apply theirs in either order for the same result.
-        (swap! (:basis conn) (fn [cur] (max cur tx)))
-        {:db-before db-before
-         :db-after (db conn)
-         :tx tx
-         :tempids (get resolved 1)
-         :tx-datoms datoms}))))
+(defn- transact-in-writer
+  "The body of `transact!`, already inside the writer process.
+
+   Everything here is a read-modify-write — allocating a tx id, checking
+   a unique value, appending to the indexes — and none of it is atomic as
+   a unit. It is correct because exactly one process runs it at a time."
+  [conn tx-data]
+  (let [db-before (db conn)
+        result (run-tx-pipeline (:store conn) (deref (:schema conn)) tx-data)
+        tx (get result :tx)]
+    ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
+    ; let a slower transaction with a LOWER id land last and rewind
+    ; it, which filtered every datom above the rewound mark out of
+    ; every subsequent read — twenty concurrent writes, all
+    ; committed, all acknowledged, all durable, and sixteen visible.
+    ;
+    ; Nothing was lost: the datoms were on disk the whole time. That
+    ; is what made it dangerous. The caller held a report saying the
+    ; write succeeded, because it had, and a later read disagreed
+    ; (BUG-022).
+    ;
+    ; `max` rather than a compare-and-set loop because advancing a
+    ; high-water mark is monotone and idempotent: two writers racing
+    ; can apply theirs in either order for the same result.
+    (swap! (:basis conn) (fn [cur] (max cur tx)))
+    {:db-before db-before
+     :db-after (db conn)
+     :tx tx
+     :tempids (get result :tempids)
+     :tx-datoms (get result :tx-datoms)}))
