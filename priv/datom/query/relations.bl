@@ -1,0 +1,163 @@
+; datom/query/relations.bl — a library of computed-relation PROVIDERS.
+;
+; ── Not married to k-NN ───────────────────────────────────────────────
+;
+; `defrelation` takes a provider — any `(fn [db mode bound args] → tuples)`.
+; This file is a menu of ready-made providers so a user declares a semantic
+; relation without writing search code, AND can swap the mechanism without
+; touching a single query. `[?a :~similar ?b]` can be backed by k-NN today,
+; BM25 tomorrow, a hybrid fusion next week — the recursion over it never
+; changes, because the query names the MEANING (:~similar), the provider is a
+; configuration decision.
+;
+;   knn-adjacency        vector cosine top-k, as an all-pairs edge relation
+;   threshold-adjacency  "similar" = any stored numeric attr ≥ τ (a business
+;                        rule; no embeddings needed)
+;   fn-adjacency         a caller-supplied pair-scoring fn (learned relatedness)
+;   union-adjacency      combine providers (ensemble / hybrid recall)
+;
+; Every one produces the SAME shape — `[a b]` edges (or `[a b score]` when
+; weighted) — and honours the three access modes an adjacency relation has:
+;
+;   :bf   ?a bound, ?b free   — a's neighbours          (the forward index)
+;   :bb   both bound          — is (a,b) an edge?        (the filter/probe)
+;   :fb   ?a free, ?b bound   — who has b as a neighbour (the reverse index)
+;
+; The engine picks the mode from how the query bound the clause (adornment),
+; so ONE relation serves generate, filter, and reverse — a bolted-on vector
+; DB gives you generate only.
+
+(ns datom.query.relations
+  (:require [datom.db] [datom.index] [datom.vector]))
+
+;; ── the embedding corpus of a column ────────────────────────────────
+
+(defn- corpus
+  "Every `[entity dvec]` for an embedding column at the current basis.
+   Skips a mis-typed value rather than crashing (same as analytic)."
+  [db attr]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [e (datom.index/-e d) v (datom.index/-v d)]
+                     (if (datom.vector/vec? v) [e v] nil)))
+                 (datom.db/attr-datoms db attr))))
+
+(defn- lookup
+  "The dvec of one entity in `attr`, or nil."
+  [db attr e]
+  (let [hit (first (filterv (fn [p] (= (get p 0) e)) (corpus db attr)))]
+    (if (nil? hit) nil (get hit 1))))
+
+;; ── k-NN adjacency ──────────────────────────────────────────────────
+
+(defn knn-adjacency
+  "A provider: the k-NN semantic graph over embedding column `attr`. Each
+   entity links to its `k` nearest neighbours (excluding itself). Optional
+   `threshold` drops edges below a cosine score. Emits `[a b score]` when
+   `weighted?`, else `[a b]`.
+
+   opts: {:k 8 :threshold 0.0 :weighted? false}
+
+   Modes:
+     :bf  — search from the ONE bound `a` (bound = #{a}); fast, no all-pairs.
+     :bb  — score the single pair (a,b) and keep it iff ≥ threshold.
+     :fb  — reverse: neighbours of `a` that include a bound `b` (rare; falls
+            back to scanning a's-of-everyone, still correct).
+     :ff / default — the full all-pairs graph (materialised once; this is what
+            a recursion over :~similar demands, and the fixpoint caches it as
+            a base relation)."
+  [attr opts]
+  (let [k (or (get opts :k) 8)
+        threshold (or (get opts :threshold) 0.0)
+        weighted? (or (get opts :weighted?) false)
+        emit (fn [a b s] (if weighted? [a b s] [a b]))]
+    (fn [db mode bound args]
+      (let [all (corpus db attr)
+            ; neighbours of one source entity: search the corpus, drop self,
+            ; drop below-threshold, take k.
+            neighbours-of
+              (fn [src-e src-vec]
+                (let [hits (datom.vector/search src-vec all (+ k 1)
+                                                (datom.vector/default-rerank (+ k 1)))]
+                  (reduce (fn [acc hit]
+                            (let [e (get hit 0) s (get hit 1)]
+                              (if (and (not (= e src-e)) (>= s threshold) (< (count acc) k))
+                                (conj acc (emit src-e e s))
+                                acc)))
+                          []
+                          (into [] hits))))]
+        (cond
+          ; a bound → just that source's neighbours (fast path, no all-pairs)
+          (and (some? bound) (= 1 (count bound)))
+            (let [a (first (into [] bound))
+                  av (lookup db attr a)]
+              (if (nil? av) [] (neighbours-of a av)))
+          ; otherwise the full graph: every entity's neighbours
+          :else
+            (reduce (fn [acc pair]
+                      (into acc (neighbours-of (get pair 0) (get pair 1))))
+                    []
+                    all))))))
+
+;; ── threshold adjacency (no embeddings — a business rule) ───────────
+
+(defn threshold-adjacency
+  "A provider where `[?a :~rel ?b]` means a and b BOTH hold `attr` and their
+   values are within `tol` (for numbers) or equal (otherwise). \"Similar\" as
+   a stored-attribute predicate — proves the abstraction is not tied to
+   vectors. opts: {:tol 0}."
+  [attr opts]
+  (let [tol (or (get opts :tol) 0)]
+    (fn [db mode bound args]
+      (let [rows (mapv (fn [d] [(datom.index/-e d) (datom.index/-v d)])
+                       (datom.db/attr-datoms db attr))
+            close? (fn [x y]
+                     (if (and (number? x) (number? y))
+                       (<= (erlang/abs (- x y)) tol)
+                       (= x y)))]
+        (reduce (fn [acc ra]
+                  (reduce (fn [a2 rb]
+                            (let [ea (get ra 0) eb (get rb 0)]
+                              (if (and (not (= ea eb)) (close? (get ra 1) (get rb 1)))
+                                (conj a2 [ea eb])
+                                a2)))
+                          acc rows))
+                []
+                rows)))))
+
+;; ── fn adjacency (learned / domain relatedness) ─────────────────────
+
+(defn fn-adjacency
+  "A provider from a caller pair-scorer `(score-fn db a b) → number|nil`.
+   An edge `[a b]` exists iff the score is non-nil and ≥ `threshold`. The
+   candidate entities come from `attr` (its datoms' entities). This is the
+   escape hatch: ANY notion of relatedness a function can express becomes a
+   first-class, joinable, recursable relation. opts: {:threshold 0.0}."
+  [attr score-fn opts]
+  (let [threshold (or (get opts :threshold) 0.0)]
+    (fn [db mode bound args]
+      (let [ents (into [] (distinct (mapv (fn [d] (datom.index/-e d))
+                                          (datom.db/attr-datoms db attr))))]
+        (reduce (fn [acc a]
+                  (reduce (fn [a2 b]
+                            (if (= a b) a2
+                              (let [s (score-fn db a b)]
+                                (if (and (some? s) (>= s threshold))
+                                  (conj a2 [a b]) a2))))
+                          acc ents))
+                []
+                ents)))))
+
+;; ── union adjacency (ensemble / hybrid) ─────────────────────────────
+
+(defn union-adjacency
+  "A provider that is the UNION of several providers — the simplest hybrid.
+   Edges from any member relation are included (deduplicated). Swap a single
+   `knn-adjacency` for `(union-adjacency [knn bm25])` and every query over the
+   relation gains the fused recall, unchanged."
+  [providers]
+  (fn [db mode bound args]
+    (into [] (distinct
+               (reduce (fn [acc p] (into acc (p db mode bound args)))
+                       []
+                       providers)))))

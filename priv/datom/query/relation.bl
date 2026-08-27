@@ -1,0 +1,225 @@
+; datom/query/relation.bl — a relation is a first-class citizen.
+;
+; ── The thesis ────────────────────────────────────────────────────────
+;
+; In this ecosystem a RELATION is not "a set of tuples". Three kinds already
+; exist and they were being treated as three unrelated mechanisms:
+;
+;   STORED    an attribute — `[?a :cites ?b]` — tuples live in the datom log,
+;             self-describing (:db/valueType…), indexed, time-travels.
+;   DERIVED   a rule — `(reachable ?a ?b)` — tuples are a least fixpoint,
+;             composes and recurses (see datom.query.fixpoint).
+;   COMPUTED  an analytic op — `(similar-to …)`, `(community …)` — tuples are
+;             produced by a function over the store.
+;
+; The COMPUTED ones were second-class: hardcoded in a `cond`, unable to appear
+; in a rule head, absent from the schema, unaskable ("what are you?"), one
+; direction only. This file makes a computed relation a FULL CITIZEN with every
+; dignity a stored attribute has. It is not "a k-NN cache" — it is the general
+; form of which stored/derived/computed are special cases.
+;
+; ── What a relation carries (the seven axes) ──────────────────────────
+;
+;   1 extension   where tuples come from      :stored | :derived | :computed
+;   2 schema      self-describing datoms       catalog-datoms → the log
+;   3 modes       bound/free access patterns   {:bf …, :bb …, :fb …}
+;   4 basis       a pure fn of the db value    provider takes `db` (as-of safe)
+;   5 maintenance behaviour under a delta       :recompute | :incremental
+;   6 provenance  why each tuple exists         optional extra output column
+;   7 cost        estimate for the planner      per-mode hint
+;
+; ── The universal interface ───────────────────────────────────────────
+;
+; Every computed relation is one function:
+;
+;     (provider db mode bound args) → sequence of output tuples
+;        db     the immutable basis (retraction/as-of already applied)
+;        mode   which columns are bound — the ADORNMENT (:ff :bf :fb :bb…)
+;        bound  the set of already-bound entity values (nil = none) — this is
+;               what turns similar-to from generate into FILTER
+;        args   the literal operator arguments (attr, k, opts…)
+;
+; A stored attribute and a derived rule already implement the moral equivalent
+; (index lookup; fixpoint). Registering computed relations here makes them
+; speak the SAME interface, so the engine, the planner, magic-sets, and the
+; fixpoint cannot tell a computed edge from a stored one. That indistinguish-
+; ability is the whole payoff: `[?a :~similar ?b]` joins, recurses, reverses,
+; and introspects exactly like `[?a :cites ?b]`.
+
+(ns datom.query.relation)
+
+;; ── the provider registry (process-wide, load-populated) ────────────
+;;
+;; Provider FUNCTIONS are closures — they cannot live in the datom log (only
+;; their DESCRIPTION can, see catalog-datoms). So the runtime dispatch table
+;; is a named Agent, mirroring datom.conn's registry: registered by name so
+;; two processes racing to create it both reach the same one. `defrelation`
+;; forms run at namespace load and populate it once.
+
+(def REGISTRY :datom-relation-registry)
+
+(defn- registry
+  "The process-wide relation catalog Agent, created once by name."
+  []
+  (let [existing (erlang/whereis REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(erlang/list_to_tuple (to-list [:name REGISTRY]))]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+;; ── registration ────────────────────────────────────────────────────
+
+(defn register-relation!
+  "Register a COMPUTED relation under `ident` (a keyword). `spec` is a map:
+
+     :arity      total width of an output tuple, entity included   (required)
+     :extension  :computed (default; :stored/:derived are implicit for
+                 attributes and rules, not registered here)
+     :modes      set of supported adornments, e.g. #{:bf :bb :fb}  (default #{:bf})
+     :provider   (fn [db mode bound args] → tuples)                (required)
+     :maintenance :recompute (default) | :incremental
+     :provenance boolean — does the last output column carry a `why`?
+     :cost       {mode → hint} rough per-mode cost for the planner
+     :doc        human documentation
+
+   Returns `ident`. Idempotent per ident: a later registration replaces the
+   earlier (so reloading a namespace re-registers cleanly)."
+  [ident spec]
+  (when (nil? (get spec :provider))
+    (throw (ex-info "register-relation!: :provider is required" {:ident ident})))
+  (when (nil? (get spec :arity))
+    (throw (ex-info "register-relation!: :arity is required" {:ident ident})))
+  (let [full (merge {:extension :computed
+                     :modes #{:bf}
+                     :maintenance :recompute
+                     :provenance false}
+                    (assoc spec :ident ident))]
+    (Agent/update (registry) (fn [m] (assoc m ident full)))
+    ident))
+
+;; ── lookup ──────────────────────────────────────────────────────────
+
+(defn relation
+  "The full spec of the computed relation `ident`, or nil if not one."
+  [ident]
+  (Agent/get (registry) (fn [m] (get m ident))))
+
+(defn computed?
+  "Whether `ident` names a registered computed relation."
+  [ident]
+  (Agent/get (registry) (fn [m] (contains? m ident))))
+
+(defn idents
+  "Every registered computed-relation ident."
+  []
+  (Agent/get (registry) (fn [m] (into [] (keys m)))))
+
+(defn all-specs
+  "Every registered relation spec (for introspection / catalog-datoms)."
+  []
+  (Agent/get (registry) (fn [m] (into [] (vals m)))))
+
+;; ── mode inference (the adornment) ──────────────────────────────────
+;;
+;; The engine calls `mode-of` with which output columns arrived already bound.
+;; Column 0 is the ENTITY by convention (every analytic op emits `[e value…]`).
+;; A relation declares which modes it supports; if the demanded mode is not
+;; supported it falls to :bf (generate) — the always-available default.
+
+(defn mode-of
+  "The adornment for a relation call: a keyword of b/f flags, entity column
+   first. `[true false]` (entity bound, value free) → :bf. Only the first two
+   columns matter for dispatch (entity + primary value); wider tuples still
+   report a 2-char mode, since providers key on entity-boundness."
+  [bound-flags]
+  (let [e (if (and (> (count bound-flags) 0) (get bound-flags 0)) "b" "f")
+        v (if (and (> (count bound-flags) 1) (get bound-flags 1)) "b" "f")]
+    (keyword (str e v))))
+
+(defn supported-mode
+  "The mode the relation will actually run for a demanded `mode`: the demanded
+   one if supported, else :bf (generate everything, let the engine filter)."
+  [spec mode]
+  (if (contains? (get spec :modes) mode) mode :bf))
+
+;; ── evaluation (the universal call) ─────────────────────────────────
+
+(defn eval-relation
+  "Run a computed relation to its output tuples. This is the single entry the
+   engine uses for any registered relation, replacing the old per-op `cond`.
+
+     db     the basis
+     ident  the relation keyword
+     args   literal operator arguments (attr, k, opts…)
+     bound  set of already-bound entity values, or nil (drives :bb filter mode)
+     mode   the demanded adornment (from mode-of); coerced to a supported one
+
+   The provider owns the semantics; this only routes and picks the mode."
+  [db ident args bound mode]
+  (let [spec (relation ident)]
+    (when (nil? spec)
+      (throw (ex-info "eval-relation: not a registered relation" {:ident ident})))
+    ((get spec :provider) db (supported-mode spec mode) bound args)))
+
+;; ── catalog as data (axis 2: relations describe relations) ──────────
+;;
+;; A relation's DESCRIPTION is emitted as ordinary datoms so the catalog is
+;; queryable like anything else — `[?rel :relation/extension :computed]`. The
+;; provider closure is NOT a datom (it cannot be), but everything about it that
+;; a program might reason over is. This is the same move datom makes with
+;; attributes: the schema is data in the same log as the facts.
+
+(defn catalog-datoms
+  "Every registered relation as a vector of catalog tuples
+   `[ident attribute value]`, ready to transact or to feed a query as a
+   relation-binding. Emits one tuple per describable facet:
+
+     [:~x :relation/ident      :~x]
+     [:~x :relation/extension  :computed]
+     [:~x :relation/arity      3]
+     [:~x :relation/mode       :bf]        (one per supported mode)
+     [:~x :relation/maintenance :recompute]
+     [:~x :relation/provenance false]
+     [:~x :relation/tag        :semantic]  (one per tag, if :tags present)
+     [:~x :relation/doc        \"…\"]"
+  []
+  (reduce
+    (fn [acc spec]
+      (let [id (get spec :ident)
+            base [[id :relation/ident id]
+                  [id :relation/extension (get spec :extension)]
+                  [id :relation/arity (get spec :arity)]
+                  [id :relation/maintenance (get spec :maintenance)]
+                  [id :relation/provenance (get spec :provenance)]]
+            with-doc (if (get spec :doc)
+                       (conj base [id :relation/doc (get spec :doc)])
+                       base)
+            with-modes (reduce (fn [a m] (conj a [id :relation/mode m]))
+                               with-doc (into [] (get spec :modes)))
+            with-tags (reduce (fn [a t] (conj a [id :relation/tag t]))
+                              with-modes (into [] (or (get spec :tags) [])))]
+        (into acc with-tags)))
+    []
+    (all-specs)))
+
+;; ── defrelation (the ergonomic surface) ─────────────────────────────
+
+(defmacro defrelation
+  "Declare a computed relation. Sugar over `register-relation!`.
+
+     (defrelation :~similar
+       {:arity 3
+        :modes #{:bf :bb :fb}
+        :tags #{:semantic}
+        :doc \"k-NN semantic neighbours over :doc/embedding\"
+        :provider (fn [db mode bound args] …)})
+
+   Runs at namespace load, registering the relation process-wide. The keyword
+   `ident` becomes usable as a clause attribute `[?a :~similar ?b]` and as a
+   generating clause `[(:~similar …) [?a ?b]]` — same relation, two spellings,
+   because a computed relation is a full citizen."
+  [ident spec]
+  `(datom.query.relation/register-relation! ~ident ~spec))
