@@ -1,0 +1,232 @@
+#+TITLE: datom L2 — transaction-report broadcast (listen!/unlisten!, :pg + Phoenix.PubSub, basis-not-projection)
+#+STATE: ITEM
+#+SESSION_ID: 1567fa8a0074424e
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-08-27T10-12-23-169Z_1567fa8a0074424e.jsonl]]
+#+CUSTOM_ID: PLAN-044-datom-l2-transaction-report-broadcast-li
+
+* Initial Message
+
+List the broadcasting/communications primitives of Erlang, then Elixir, then Phoenix, and show me how they look like with beam lisp (read the priv/ and the examples/ to see how Beam Lisp wants us to write them).
+
+Then tell me how it would make sense for datom to interface with all these primitives. We want a clean architecture that can scale horizontally and vertically, and is at least as good at the guarantees that the BEAM gives us as BEAM itself.
+
+* Goal
+
+Give datom the one primitive it lacks: the ability to say *"it changed."* Add a
+transaction-report broadcast at the connection writer, so any process can
+subscribe to a store's commit stream. This is L2 in
+=docs/datom-as-a-broadcast-substrate.md=. L3 (filtered/guarded/semantic watch)
+is PLAN-044 and blocks on this.
+
+Design doc (authoritative): =docs/datom-as-a-broadcast-substrate.md=.
+
+* Why
+
+datom already keeps a durable, totally-ordered fact log and lets any process
+hold a consistent value for free. The only missing capability is notification.
+Datomic answers this with a pull-based =tx-report-queue=; the BEAM-native
+reframe is *push*: a commit is a message, the tx-log is the topic, and every
+BEAM broadcast primitive (=:pg=, =Phoenix.PubSub=) is a transport for it.
+
+* Non-goals (this item)
+
+- Filtering by pattern / guarded query / similarity — that is L3 (PLAN-044).
+  This item ships T0 attribute-set filtering ONLY (a set membership test), which
+  the writer can do without the query engine.
+- Incremental view maintenance (=dl-eval-incremental=) — later, T2.
+- Presence / distributed ownership CRDT (L4) — later.
+- Distributed multi-store vector-clock reads — later (PLAN-033 substrate).
+
+* Payload: delta by default, never a projection (FEAT-016, corrected)
+
+See =docs/datom-as-a-broadcast-substrate.md= §6. FEAT-016's real, load-bearing
+rule is *the writer must never emit a PROJECTION* (a projection is a function of
+(data, who is asking); a writer knows only its half). FEAT-016 ALSO chose a
+basis-only payload — but that was right for a LiveView PAGE (whose only
+subscriber-agnostic delta is a re-rendered board = a projection), and it is the
+WRONG default for a datom subscriber, for which =:tx-datoms= IS the
+subscriber-agnostic delta the store already produced. Basis-only there would
+manufacture an extraneous re-query.
+
+Three payloads; this item ships DELTA by default:
+
+| payload | who emits | reader re-queries? | this item |
+|---------|-----------|--------------------|-----------|
+| moment (=basis=) | writer | YES (as-of + re-run) | KNOB (=:payload :basis=) |
+| delta (=:tx-datoms= + basis) | writer | NO (filter locally) | DEFAULT |
+| projection (rows for query×principal) | NEVER the writer | n/a | via a projector subscriber (§8.1, PLAN-045) |
+
+This item MUST honour:
+- *Writer never projects.* No per-principal answer, no rendered view, ever, on
+  any path. (The kernel of FEAT-016 — preserved.)
+- *Default payload = DELTA.* Same-node (:pg) ALWAYS carries the delta. Cross-node
+  (Phoenix.PubSub) carries the delta too, UNLESS a subscriber chose
+  ={:payload :basis}=. The delta is query-free for the reader — that is the whole
+  point of not defaulting to basis-only.
+- *Basis-only is a KNOB.* ={:payload :basis}= exists for large writes and
+  replica/complex-view subscribers that re-derive anyway: they get
+  =[:datom/changed basis changed-attrs]= and reconstruct =basis → (as-of db
+  basis) → run interest=.
+- Per-principal filtering (the reader-side =auth/guard= case) is L3 (PLAN-045),
+  not here; but its payload need is the delta, which this item delivers.
+
+* Where the code goes
+
+- =priv/datom/conn.bl= — =publish-report!=, called from =transact-in-writer=
+  AFTER the basis high-water mark advances (=swap! (:basis conn) max=). Inside
+  the writer's serialized step, so report order = commit order (invariant 1).
+- =priv/datom/conn.bl= — the pg group topic per store: =report-topic= keyed by
+  =store-key= (same identity the registry already uses).
+- =priv/datom.bl= — facade: =listen!=, =listen!/{:attrs}=, =unlisten!=,
+  optionally =tx-report-queue= (a blocking Datomic-compatible pull wrapper over
+  the same stream, for parity).
+- =priv/datom/conn.bl= — =pubsub-server= resolver: reads an app-configured
+  PubSub name (mirror =spell/server.ex='s =Application.get_env= pattern); nil ⇒
+  local-only, never an error (invariant: a store with no web stack still works).
+- =publish-report!= builds ONE delta term =[:datom/tx basis tx-datoms]= and
+  =send=s it to every =pg/get_members= (local, always). Cross-node: the same
+  delta on the store topic; a =[:datom/changed basis changed-attrs]= on a
+  SEPARATE basis-topic for =:payload :basis= subscribers. Snapshot the member
+  list, then send OUTSIDE the Agent's critical section so fan-out never holds the
+  writer (invariant 4).
+
+* Public surface (proposed)
+
+#+begin_src clojure
+(datom/listen!   conn)                            ; delta stream: [:datom/tx basis tx-datoms]
+(datom/listen!   conn {:attrs #{:order/status}})  ; T0: only commits touching these attrs
+(datom/listen!   conn {:payload :basis})          ; KNOB: basis-only, reader re-derives
+(datom/unlisten! conn)
+#+end_src
+
+Consumer is a plain =receive= or a =defserver handle-info=, in the
+=spell/server.ex= =spell/changed= family. DEFAULT path reads the delta with NO
+store access:
+
+#+begin_src clojure
+(datom/listen! conn {:attrs #{:order/status}})
+(receive
+  ;; delta in hand — no re-query, no as-of
+  [:datom/tx _basis tx-datoms]
+    (doseq [d tx-datoms]
+      (when (= :order/status (datom/datom-a d))
+        (handle-status (datom/datom-e d) (datom/datom-v d))))
+  (after 5000 :idle))
+#+end_src
+
+* The five invariants (acceptance = each is a test)
+
+1. *Report order = commit order.* =publish-report!= runs inside the writer,
+   after the basis advances. TEST: N concurrent =transact!=; every subscriber
+   observes bases strictly monotonic and in the same order.
+2. *No broadcast on failed/speculative tx.* =with= and =run-tx-pipeline= NEVER
+   publish; only the real =transact!= path does, after commit. TEST: =(with …)=
+   and a schema-rejected =transact!= produce zero notifications.
+3. *No undetectable gap.* Every notification carries the new basis; a subscriber
+   detects a jump vs last-seen =t= and can replay =(datom/since db last-t)=.
+   TEST: drop a message (don't deliver), assert the subscriber reconstructs the
+   missed datoms from the log.
+4. *Backpressure is the subscriber's, never the writer's.* Fan-out is =send=
+   (never blocks). TEST: a subscriber that never drains its mailbox does not slow
+   or block a concurrent writer (measure writer throughput with 1 healthy + 1
+   stalled subscriber).
+5. *T0 filter is monotonic/sound.* =:attrs= membership: a subscriber is notified
+   iff some tx-datom's attribute ∈ its set. TEST: a commit touching only
+   =:order/total= does not wake an =:attrs #{:order/status}= subscriber; one
+   touching =:order/status= does.
+
+* Cross-node behaviour (Phoenix.PubSub path)
+
+- Opt-in via configured PubSub server; =SpellWeb.PubSub= already runs in the
+  supervision tree (=lib/beam_lisp/application.ex=).
+- TEST (single-node stand-in, DEFAULT delta): subscribe via
+  =Phoenix.PubSub/subscribe= to the store topic, transact, assert a
+  =[:datom/tx basis tx-datoms]= arrives — the delta, query-free.
+- TEST (basis KNOB): a =:payload :basis= subscriber on the basis-topic gets
+  =[:datom/changed basis changed-attrs]= and NO =:tx-datoms= / =:db-after=.
+- TEST (writer-never-projects): NO path — delta or basis — ever carries a
+  per-principal or rendered value. FEAT-016's kernel is a test, not a comment.
+
+* Tests
+
+- =test/bl/datom/broadcast_test.bl= (new) — the five invariants + the three
+  cross-node payload tests above. Follow the store conformance-suite convention
+  (=test/bl/datom/store_test.bl=).
+
+* The examples folder: =examples/datom/live/= (a first-class deliverable)
+
+A NEW folder showing the full range of the design, one well-crafted narrated
+file per shape, house style of =examples/datom/07-processes.bl= /
+=08-otp.bl= (a =(defn- h [title] …)= section header, prose that teaches, a
+runnable body). EVERY file MUST run clean under
+=mix beam_lisp.run --path priv examples/datom/live/NN-*.bl= by the end.
+
+A =README.md= in the folder indexes them (like =examples/semantic/00-README.md=
+/ =examples/datom/df/README.md=).
+
+The nine files and the layer each needs:
+
+| # | file | shows | needs |
+|---|------|-------|-------|
+| 00 | =README.md= | the index + the delta-vs-basis-vs-projection framing | — |
+| 01 | =01-listen-delta.bl= | =listen!=; the delta in the mailbox, ZERO re-query | L2 |
+| 02 | =02-live-defserver.bl= | a =defserver= whose db state stays live via =handle-info= | L2 |
+| 03 | =03-attr-filter.bl= | T0 =:attrs= filtering; a =:order/total= write does not wake a =:order/status= listener | L2 |
+| 04 | =04-replay-gap.bl= | drop a message → =datom/since= reconstructs it (effectively exactly-once) | L2 |
+| 05 | =05-basis-knob.bl= | ={:payload :basis}=; reader re-derives via =as-of=; when to choose it | L2 |
+| 06 | =06-projector.bl= | §8.1 — compute one board once, fan out to N identical viewers | L2 (+ PubSub) |
+| 07 | =07-pattern-watch.bl= | T1 =datom/watch= on a =:where= pattern, matched against the delta | L3 (PLAN-045) |
+| 08 | =08-guarded-feed.bl= | =auth/guard= ∘ =datom/watch= — per-principal live feed, no leak | L3 (PLAN-045) |
+| 09 | =09-semantic-feed.bl= | =similar-to= bound-mode changefeed; scores only the delta; time-travels | L3 (PLAN-045) |
+
+Split of ownership:
+- THIS item (PLAN-044) creates the folder, =00=README, and =01=–=06= (all L2),
+  and they MUST run clean here.
+- PLAN-045 adds =07=–=09= (they consume L2's delta stream) and they MUST run
+  clean by the end of that item.
+- A file that a layer does not yet support is NOT committed half-working: it
+  lands with its layer. "All run perfectly by the end" is per-item: 00–06 green
+  at PLAN-044 close, 07–09 green at PLAN-045 close.
+
+Acceptance for the examples (this item): a scripted run of every =0[1-6]-*.bl=
+exits 0 and prints its narration; wire it into whatever the repo uses to smoke
+examples (grep the mix tasks / scripts in review) so a regression is caught.
+
+* Risks / decisions to pin in review
+
+- =:pg= requires =pg/start_link= under a supervisor. WHERE does it start? Either
+  datom starts its own scope lazily (like the conn registry's named Agent in
+  =conn.bl=) or the host app owns it. Prefer: a datom-owned named pg scope,
+  started once, race-safe like =registry= — so a plain =mix run= script (no web
+  stack) still gets local subscriptions. DECIDE in review.
+- Writer hot-path cost: fan-out is off the critical section? Confirm
+  =publish-report!= runs after the =swap!= but the =send=s do not hold the Agent.
+  If they do, move the member snapshot inside and the sends outside.
+- =changed-attrs= computation: a set over =:tx-datoms='s =a= positions — cheap,
+  but confirm it excludes the =:db/txInstant= self-datom noise or documents why
+  not.
+
+- =06-projector.bl= broadcasts a PROJECTION (a rendered board) on a PubSub
+  topic. This is ALLOWED and does not violate §6: the projector is a SUBSCRIBER
+  choosing to share a view whose (query, principal) it fixed, not the writer
+  guessing one. The example must make that distinction explicit in its prose, or
+  a reader will think it contradicts the writer-never-projects rule.
+- =06-projector.bl= needs a running =Phoenix.PubSub= (=SpellWeb.PubSub=). Under a
+  plain =mix beam_lisp.run= the endpoint is gated off (see
+  =lib/beam_lisp/application.ex=). DECIDE: either the example starts its own
+  =Phoenix.PubSub= child (=(Phoenix.PubSub/start_link …)= / a supervisor) so it
+  is self-contained like the others, or it degrades to a local =pg= re-broadcast
+  and NARRATES that the cluster path is the PubSub swap. Prefer self-contained.
+* Definition of done
+
+- =examples/datom/live/= exists with =00-README.md= and =01=–=06= all running
+  clean under =mix beam_lisp.run --path priv examples/datom/live/0[1-6]-*.bl=.
+- =test/bl/datom/broadcast_test.bl= green; all five invariants + the three
+  cross-node payload tests asserted.
+- Default payload is the DELTA (=[:datom/tx basis tx-datoms]=); =:payload :basis=
+  knob works; NO path ever carries a projection (tested).
+- =priv/datom.bl= facade documents =listen!/unlisten!= (incl. =:attrs= and
+  =:payload=) in the house doc style.
+- No change to any existing datom test (additive only).
+- Reviewed against =docs/datom-as-a-broadcast-substrate.md= §6 (delta-default,
+  writer-never-projects) and §7 (invariants).
