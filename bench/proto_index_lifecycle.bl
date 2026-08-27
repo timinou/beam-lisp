@@ -1,0 +1,330 @@
+; bench/proto_index_lifecycle.bl — PROTOTYPE: the indexed-relation lifecycle.
+; Run: mix beam_lisp.run --path priv bench/proto_index_lifecycle.bl
+;
+; ── What this prototypes, and why before any Rust ────────────────────
+;
+; Making HNSW the default similarity relation means a MUTABLE, APPROXIMATE
+; index behind an interface that promised a pure fn of an immutable basis:
+;
+;     (provider db mode bound args) → tuples        ← pure
+;     HNSW: insert/tombstone/search                 ← stateful
+;
+; The reconciliation is a STATE MACHINE, and it is the risky part — the
+; Rust that follows is mechanical. So this file proves the state machine in
+; pure bl, using a cached corpus + exact v/search as the STAND-IN index.
+; Every transition HNSW will inherit is exercised and asserted against the
+; unindexed provider (the oracle):
+;
+;     COLD BUILD   first eval at basis T builds the index from attr-datoms
+;     STEADY       eval at the same basis reads the store ZERO times
+;     CATCH-UP     eval at basis T' > cursor tails the WAL:
+;                  (history (since db cursor)) restricted to the attr —
+;                  assertions insert, retractions tombstone, re-assert =
+;                  replace (old vector orphaned → tombstone)
+;     REBUILD      tombstone-ratio trigger rebuilds from the current basis
+;     AS-OF        eval at basis T < cursor CANNOT go backward in HNSW →
+;                  bypasses the index to the exact path (the same graceful
+;                  degradation unsupported modes already use)
+;
+; Soundness rests on the as-of/since partition property (datom.time): the
+; delta datoms are EXACTLY the facts separating two bases — none missing,
+; none double-counted — so by induction index-content ≡ corpus(basis).
+;
+; When HNSW lands, `:live` becomes {hnsw-resource, filter-set} and every
+; transition above is unchanged. When the native batch k-NN lands, it powers
+; the exact path this prototype uses for the oracle and the as-of bypass.
+
+(ns bench.proto-index
+  (:require [datom] [datom.db] [datom.index] [datom.time] [datom.vector :as v]
+            [datom.query.relations :as rels]))
+
+;; ── harness ─────────────────────────────────────────────────────────
+
+(def DIM 16)
+(defn- lcg [seed] (rem (+ (* seed 1103515245) 12345) 2147483648))
+(defn- rand-seq [seed n]
+  (get (reduce (fn [acc i]
+                 (let [s (lcg (get acc 1))]
+                   [(conj (get acc 0) (- (/ (rem s 2000) 1000.0) 1.0)) s]))
+               [[] seed] (range n))
+       0))
+(defn- cluster-vec [cluster tok]
+  (let [centre (rand-seq (* (+ cluster 1) 7919) DIM)
+        jitter (rand-seq (+ (* tok 104729) 1) DIM)]
+    (v/embedding (mapv (fn [c j] (+ (* 4.0 c) (* 0.4 j))) centre jitter))))
+
+(def SCHEMA
+  [{:db/ident :s/vec :db/valueType :db.type/vector}
+   {:db/ident :s/grp :db/valueType :db.type/long}])
+
+(defn- add-docs! [conn start n groups]
+  (datom/transact! conn
+    (into [] (mapv (fn [i] {:db/id (- (+ i 1))
+                            :s/grp (rem i groups)
+                            :s/vec (cluster-vec (rem i groups) i)})
+                   (range start (+ start n))))))
+
+(defn- eids [db]
+  (into [] (sort (mapv (fn [r] (get r 0))
+                       (into [] (datom/q '[:find ?e :where [?e :s/vec ?v]] db))))))
+
+(defn- header [t] (println (str "\n" t)))
+(defn- row [& parts] (println (str "  " (join "  |  " (to-list (mapv (fn [p] (str p)) parts))))))
+(def CHECKS (into [] []))
+(defn- check [label ok?] (row label (if ok? "✓" "✗ FAIL")))
+
+;; ── the index store ─────────────────────────────────────────────────
+;;
+;; One named Agent (same pattern as the relation registry) holding
+;; {ident → index-state}:
+;;
+;;   :cursor      tx the index content corresponds to
+;;   :live        {eid → dvec} — the indexed content (HNSW: the resource)
+;;   :tombstones  retractions absorbed since the last build (HNSW: filter-set)
+;;   :inserts     assertions absorbed since the last build
+;;   :builds      how many full builds happened
+;;   :reads       store scans performed (the cost this whole design amortises)
+
+(def STORE :datom-proto-index-store)
+
+(defn- store []
+  (let [existing (erlang/whereis STORE)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(erlang/list_to_tuple (to-list [:name STORE]))]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+(defn- corpus
+  "Every [entity dvec] for the column at this basis (the COLD-BUILD source).
+   Same mis-typed-tolerance as the analytic path."
+  [db attr]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [e (datom.index/-e d) val (datom.index/-v d)]
+                     (if (v/vec? val) [e val] nil)))
+                 (datom.db/attr-datoms db attr))))
+
+(defn- cold-build [db attr builds reads]
+  {:cursor (datom.db/basis-t db)
+   :live (into {} (mapv (fn [p] [(get p 0) (get p 1)]) (corpus db attr)))
+   :tombstones 0 :inserts 0 :builds (+ builds 1) :reads (+ reads 1)})
+
+(defn- fold-delta
+  "The WAL tail for `attr` in (cursor, basis], folded to one verdict per FACT
+   [e v]: the op at the greatest tx; a retraction at the SAME tx as an
+   assertion wins (mirrors datom.db/current-in?)."
+  [db attr cursor]
+  (let [hdb (datom.time/history (datom.time/since db cursor))]
+    (reduce (fn [acc d]
+              (let [k [(datom.index/-e d) (datom.index/-v d)]
+                    tx (datom.index/-tx d)
+                    op (if (datom.index/assertion? d) :add :retract)
+                    cur (get acc k)]
+                (if (or (nil? cur)
+                        (> tx (get cur 0))
+                        (and (= tx (get cur 0)) (= op :retract)))
+                  (assoc acc k [tx op])
+                  acc)))
+            {}
+            (datom.db/datoms hdb :aevt attr))))
+
+(defn- catch-up
+  "Advance `state` from its cursor to db's basis by applying the WAL delta.
+   assertion:  insert; replacing a live different vector orphans it (tombstone)
+   retraction: tombstone the fact if the live vector is the retracted one"
+  [state db attr]
+  (let [delta (fold-delta db attr (get state :cursor))]
+    (reduce (fn [st kv]
+              (let [fact (get kv 0) op (get (get kv 1) 1)
+                    e (get fact 0) val (get fact 1)
+                    live (get st :live)
+                    cur (get live e)]
+                (if (= op :add)
+                  (assoc st
+                         :live (assoc live e val)
+                         :inserts (+ (get st :inserts) 1)
+                         :tombstones (if (and (some? cur) (not (= cur val)))
+                                       (+ (get st :tombstones) 1)
+                                       (get st :tombstones)))
+                  (if (= cur val)
+                    (assoc st :live (dissoc live e)
+                           :tombstones (+ (get st :tombstones) 1))
+                    st))))
+            (assoc state :cursor (datom.db/basis-t db)
+                         :reads (+ (get state :reads) 1))
+            (into [] delta))))
+
+(defn- advance
+  "The state machine, one step: build if cold, catch up if behind, rebuild
+   if the tombstone ratio passed the policy trigger. Pure fn of
+   (state, db) — the Agent just serialises callers."
+  [state db attr policy]
+  (let [ratio (or (get policy :tombstone-ratio) 0.25)
+        built (if (nil? state)
+                (cold-build db attr 0 0)
+                (if (> (datom.db/basis-t db) (get state :cursor))
+                  (catch-up state db attr)
+                  state))
+        live-n (max 1 (count (get built :live)))]
+    (if (> (/ (get built :tombstones) live-n) ratio)
+      (cold-build db attr (get built :builds) (get built :reads))
+      built)))
+
+;; ── the provider: same universal sig, index behind it ───────────────
+
+(defn indexed-adjacency
+  "A provider with the SAME sig as knn-adjacency, but backed by an incrementally
+   maintained index (the stand-in: a live corpus map; HNSW slots in behind the
+   identical transitions). opts: {:k 8 :threshold 0.0 :rebuild {:tombstone-ratio 0.25}}
+
+   Basis rule: the index serves only :current views at basis >= its cursor.
+   Anything else (as-of into the past, since/history views) BYPASSES to the
+   exact path — the graceful degradation this design prefers over staleness."
+  [ident attr opts]
+  (let [k (or (get opts :k) 8)
+        threshold (or (get opts :threshold) 0.0)
+        policy (or (get opts :rebuild) {})
+        oracle (rels/knn-adjacency attr opts)
+        neighbours-of (fn [live src-e src-vec]
+                        (let [hits (v/search src-vec (mapv (fn [kv] [(get kv 0) (get kv 1)])
+                                                           (into [] live))
+                                             (+ k 1) (v/default-rerank (+ k 1)))]
+                          (reduce (fn [acc hit]
+                                    (let [e (get hit 0) s (get hit 1)]
+                                      (if (and (not (= e src-e)) (>= s threshold) (< (count acc) k))
+                                        (conj acc [src-e e])
+                                        acc)))
+                                  []
+                                  (into [] hits))))]
+    (fn [db mode bound args]
+      (let [st (Agent/get (store) (fn [m] (get m ident)))]
+        (if (or (and (some? st) (not (datom.time/current? db)))
+                (and (some? st) (< (datom.db/basis-t db) (get st :cursor))))
+          ; bypass: the index cannot answer for this basis — exact, untouched
+          (oracle db mode bound args)
+          (do (Agent/update (store) (fn [m] (assoc m ident (advance (get m ident) db attr policy))))
+              (let [live (get (Agent/get (store) (fn [m] (get m ident))) :live)]
+                (if (and (some? bound) (= 1 (count bound)))
+                  (let [a (first (into [] bound)) av (get live a)]
+                    (if (nil? av) [] (neighbours-of live a av)))
+                  (reduce (fn [acc kv]
+                            (into acc (neighbours-of live (get kv 0) (get kv 1))))
+                          []
+                          (into [] live))))))))))
+
+(defn- state-of [ident] (Agent/get (store) (fn [m] (get m ident))))
+
+;; ── scenario: every transition, asserted against the oracle ─────────
+
+(println "════════ PROTOTYPE: indexed-relation lifecycle (stand-in index) ════════")
+(println "oracle = unindexed knn-adjacency on the same basis; sets must match")
+
+(def K 4)
+(def ORACLE (rels/knn-adjacency :s/vec {:k K :threshold 0.0}))
+(def INDEXED (indexed-adjacency :proto/sim :s/vec
+                                {:k K :threshold 0.0 :rebuild {:tombstone-ratio 0.25}}))
+(defn- edges [f db] (into #{} (mapv (fn [t] (into [] t)) (into [] (f db :ff nil [])))))
+
+(def conn (datom/connect SCHEMA))
+(add-docs! conn 0 60 4)
+
+;; 1 COLD BUILD — first eval builds, matches the oracle
+(header "1 — COLD BUILD: first eval builds the index, identical edges")
+(let [db (datom/db conn)
+      got (edges INDEXED db)
+      want (edges ORACLE db)
+      st (state-of :proto/sim)]
+  (check "edges == oracle" (= got want))
+  (row "index state" (str "cursor=" (get st :cursor) " live=" (count (get st :live))
+                           " builds=" (get st :builds) " reads=" (get st :reads))))
+
+;; 2 STEADY STATE — same basis again: zero store reads
+(header "2 — STEADY STATE: same basis, zero store reads")
+(let [db (datom/db conn)
+      before (get (state-of :proto/sim) :reads)
+      got (edges INDEXED db)
+      after (get (state-of :proto/sim) :reads)
+      want (edges ORACLE db)]
+  (check "edges == oracle" (= got want))
+  (check "zero store reads" (= before after)))
+
+;; 3 CATCH-UP INSERT — +10 docs: WAL tail, not a rebuild
+(header "3 — CATCH-UP: +10 docs absorbed incrementally (no rebuild)")
+(add-docs! conn 60 10 4)
+(let [db (datom/db conn)
+      before (state-of :proto/sim)
+      got (edges INDEXED db)
+      st (state-of :proto/sim)
+      want (edges ORACLE db)]
+  (check "edges == oracle" (= got want))
+  (check "inserts counted = 10" (= 10 (get st :inserts)))
+  (check "no rebuild" (= (get before :builds) (get st :builds)))
+  (row "state" (str "live=" (count (get st :live)) " reads=" (get st :reads))))
+
+;; 4 CATCH-UP RETRACT — retractEntity 3 docs: tombstones counted
+(header "4 — CATCH-UP: retract 3 docs → tombstones, still exact")
+(let [db0 (datom/db conn)
+      victims (take 3 (eids db0))]
+  (datom/transact! conn (into [] (mapv (fn [e] [:db/retractEntity e]) victims)))
+  (let [db (datom/db conn)
+        got (edges INDEXED db)
+        st (state-of :proto/sim)
+        want (edges ORACLE db)]
+    (check "edges == oracle" (= got want))
+    (check "live shrank by 3" (= 67 (count (get st :live))))
+    (row "tombstones" (get st :tombstones) "(3 retracts)")
+    (check "no rebuild yet (3/67 < 0.25)" (= 1 (get st :builds)))))
+
+;; 5 CATCH-UP REPLACE — re-embed 2 docs: old vec orphaned + new inserted
+(header "5 — CATCH-UP: re-embed 2 docs (retract+assert at new tx)")
+(let [db0 (datom/db conn)
+      targets (into [] (drop 10 (take 12 (eids db0))))]
+  (datom/transact! conn
+    (into [] (mapv (fn [pair e] {:db/id e :s/vec (cluster-vec 7 (+ 900 (get pair 0)))})
+                 (mapv (fn [i] [i]) (range (count targets))) targets)))
+  (let [db (datom/db conn)
+        before-t (get (state-of :proto/sim) :tombstones)
+        got (edges INDEXED db)
+        st (state-of :proto/sim)
+        want (edges ORACLE db)]
+    (check "edges == oracle" (= got want))
+    (check "2 orphans tombstoned" (= (+ before-t 2) (get st :tombstones)))))
+
+;; 6 REBUILD TRIGGER — retract enough to pass the 0.25 ratio
+(header "6 — REBUILD: tombstone ratio 0.25 crossed → full rebuild, still exact")
+(let [db0 (datom/db conn)
+      victims (into [] (drop 20 (take 40 (eids db0))))]
+  (datom/transact! conn (into [] (mapv (fn [e] [:db/retractEntity e]) victims)))
+  (let [db (datom/db conn)
+        got (edges INDEXED db)
+        st (state-of :proto/sim)
+        want (edges ORACLE db)]
+    (check "edges == oracle" (= got want))
+    (check "rebuild happened" (= 2 (get st :builds)))
+    (check "tombstones reset" (= 0 (get st :tombstones)))
+    (row "state" (str "live=" (count (get st :live)) " cursor=" (get st :cursor)))))
+
+;; 7 AS-OF BYPASS — a past basis gets the exact path, index untouched
+(header "7 — AS-OF: past basis bypasses the index (exact), index untouched")
+(let [cursor (get (state-of :proto/sim) :cursor)
+      db-now (datom/db conn)
+      db-old (datom.time/as-of db-now 1)
+      got (edges INDEXED db-old)
+      want (edges ORACLE db-old)
+      st (state-of :proto/sim)]
+  (check "edges == oracle at t=1" (= got want))
+  (check "index cursor unchanged" (= cursor (get st :cursor)))
+  (check "no extra build" (= 2 (get st :builds))))
+
+;; 8 BOUND MODE — :bf through the index equals the oracle's fast path
+(header "8 — MODES: :bf (one bound source) through the index")
+(let [db (datom/db conn)
+      src (first (eids db))
+      got (into #{} (mapv (fn [t] (into [] t)) (into [] (INDEXED db :bf #{src} []))))
+      want (into #{} (mapv (fn [t] (into [] t)) (into [] (ORACLE db :bf #{src} []))))]
+  (check ":bf edges == oracle" (= got want)))
+
+(println "\n════════ END — lifecycle prototype ════════")
