@@ -1,0 +1,193 @@
+; examples/semantic/13-entity-graph.bl — the prose becomes a graph.
+; Run: GOOGLE_API_KEY=... mix beam_lisp.run --path priv --path examples examples/semantic/13-entity-graph.bl
+;
+; ── The GraphRAG move ─────────────────────────────────────────────────
+;
+; Plain RAG (file 12) treats the corpus as a bag of passages. GraphRAG adds
+; a second view: it reads the passages and EXTRACTS A GRAPH — the entities
+; (people, places, objects) and the relationships between them. "Holmes —
+; lives-at — Baker Street", "Watson — friend-of — Holmes". Now the book is
+; not just text you search; it is a graph you can traverse.
+;
+; This file builds that graph, and it does so with STRUCTURED OUTPUT: we
+; hand Gemini a SHAPE (semantic.shape) describing what an extraction looks
+; like, it returns DATA conforming to that shape, and we store it as datoms.
+; No parsing prose, no brittle regex — the model's reply is already the
+; shape we asked for, validated before it lands.
+;
+; ── Why the graph is just more datoms ─────────────────────────────────
+;
+; An entity is an entity; a relationship is a ref datom `[a :rel b]`. So the
+; extracted graph lives in the SAME database as the passages and their
+; embeddings — one store holding text, vectors, and now a typed graph, all
+; joinable. That co-location is the whole reason GraphRAG is natural here
+; and awkward in a stack of separate systems.
+
+(ns example.semantic.entity-graph
+  (:require [datom] [datom.vector]
+            [semantic.corpus-util :as corpus]
+            [semantic.gemini :as gemini] [semantic.shape :as shape]))
+
+(defn- show [label v] (println (str "  " label "  " (pr-str v))))
+(defn- heading [text] (println (str "\n" text)))
+
+(def CORPUS "examples/semantic/corpus/holmes.txt")
+(def N-PASSAGES 40)     ; extraction is a model call per passage; keep it modest
+
+;; ── the extraction shape, declared ONCE ─────────────────────────────
+;;
+;; This is the beam-lispy structured-output surface: the shape IS the
+;; contract. From it we derive the JSON Schema Gemini must obey, and against
+;; it we validate the reply. Change this declaration and both move together.
+
+(def EXTRACTION
+  {:entities [:list {:name :string
+                     :kind [:enum "person" "place" "object" "organization"]}]
+   :relationships [:list {:source :string
+                          :target :string
+                          :relation :string}]})
+
+;; ── read passages ───────────────────────────────────────────────────
+
+(heading "── extracting an entity graph from the passages ──")
+
+(def passages (into [] (take N-PASSAGES (corpus/load-passages CORPUS 3))))
+(show "passages to read:" (count passages))
+
+(defn extract
+  "Ask the model for the entities and relationships in one passage, as DATA
+   conforming to EXTRACTION. Cached, so a re-run is offline."
+  [text]
+  (gemini/generate-structured
+    (str "You are building a knowledge graph from Sherlock Holmes stories. "
+         "Extract the named entities and the relationships between them from "
+         "this passage. Use canonical names (e.g. 'Sherlock Holmes', not 'he'). "
+         "Only include relationships where BOTH endpoints are named entities.\n\n"
+         "Passage:\n" text)
+    EXTRACTION))
+
+;; Extract from every passage, accumulating unique entities and all edges.
+(def extractions (mapv (fn [p] (extract (get p 1))) passages))
+
+;; ── fold the extractions into a graph store ─────────────────────────
+
+(heading "── storing entities and relationships as datoms ──")
+
+(def conn
+  (datom/connect
+    [{:db/ident :entity/name :db/valueType :db.type/string :db/unique :db.unique/identity}
+     {:db/ident :entity/kind :db/valueType :db.type/keyword}
+     {:db/ident :rel/source :db/valueType :db.type/ref}
+     {:db/ident :rel/target :db/valueType :db.type/ref}
+     {:db/ident :rel/kind :db/valueType :db.type/string}]))
+
+;; First pass: assert every distinct entity by its (unique) name. The
+;; :db.unique/identity on :entity/name means re-asserting the same name is
+;; idempotent — "Sherlock Holmes" mentioned in 30 passages is ONE entity.
+(def all-entities
+  (into [] (distinct
+             (reduce (fn [acc ex]
+                       (reduce (fn [a e] (conj a [(get e "name") (get e "kind")]))
+                               acc
+                               (to-list (get ex "entities"))))
+                     []
+                     extractions))))
+
+(datom/transact! conn
+  (into [] (map-indexed
+             (fn [i e]
+               {:db/id (- (+ i 1))
+                :entity/name (get e 0)
+                :entity/kind (keyword (get e 1))})
+             all-entities)))
+
+(show "distinct entities:" (count all-entities))
+
+;; Second pass: assert relationships as ref edges, looking up each endpoint
+;; by name. An edge whose endpoint was not stored as an entity is skipped.
+(def db0 (datom/db conn))
+
+(defn entity-id [db nm]
+  (let [r (into [] (datom/q '[:find ?e :in $ ?n :where [?e :entity/name ?n]] db nm))]
+    (if (empty? r) nil (get (get r 0) 0))))
+
+(def edge-tx
+  (reduce (fn [acc ex]
+            (reduce (fn [a rel]
+                      (let [s (entity-id db0 (get rel "source"))
+                            t (entity-id db0 (get rel "target"))]
+                        (if (and (some? s) (some? t) (not (= s t)))
+                          (conj a {:rel/source s :rel/target t :rel/kind (get rel "relation")})
+                          a)))
+                    acc
+                    (to-list (get ex "relationships"))))
+          []
+          extractions))
+
+(datom/transact! conn (into [] (map-indexed (fn [i e] (assoc e :db/id (- (+ i 1)))) edge-tx)))
+
+(def db (datom/db conn))
+(show "relationship edges:" (count edge-tx))
+
+;; ── query the graph directly ────────────────────────────────────────
+
+(heading "── who is connected to Sherlock Holmes? ──")
+
+;; A plain graph traversal: find edges touching Holmes, name the other end.
+(def holmes (entity-id db "Sherlock Holmes"))
+(when (some? holmes)
+  ; outgoing and incoming edges as two straightforward joins, unioned in
+  ; beam-lisp. (An `:or` of two `:and` branches would need both branches to
+  ; bind exactly the same variables; two queries is clearer here.)
+  (let [outgoing (into [] (datom/q '[:find ?other-name ?kind
+                                     :in $ ?holmes
+                                     :where [?r :rel/source ?holmes]
+                                            [?r :rel/target ?o]
+                                            [?r :rel/kind ?kind]
+                                            [?o :entity/name ?other-name]]
+                                   db holmes))
+        incoming (into [] (datom/q '[:find ?other-name ?kind
+                                     :in $ ?holmes
+                                     :where [?r :rel/target ?holmes]
+                                            [?r :rel/source ?o]
+                                            [?r :rel/kind ?kind]
+                                            [?o :entity/name ?other-name]]
+                                   db holmes))
+        connected (into [] (distinct (into outgoing incoming)))]
+    (doseq [c (take 12 connected)]
+      (println (str "    " (get c 0) "  (" (get c 1) ")")))))
+
+;; ── the most-connected entities (degree) ────────────────────────────
+
+(heading "── the most-mentioned entities in the graph ──")
+
+; degree = out-edges + in-edges per entity. Two count queries, summed in
+; beam-lisp — clearer than one `or`-joined aggregate and avoids binding a
+; ref var across two attributes in a single clause.
+(def out-deg
+  (into {} (mapv (fn [r] [(get r 0) (get r 1)])
+                 (into [] (datom/q '[:find ?name (count ?r)
+                                     :where [?r :rel/source ?e]
+                                            [?e :entity/name ?name]]
+                                   db)))))
+(def in-deg
+  (into {} (mapv (fn [r] [(get r 0) (get r 1)])
+                 (into [] (datom/q '[:find ?name (count ?r)
+                                     :where [?r :rel/target ?e]
+                                            [?e :entity/name ?name]]
+                                   db)))))
+(def degree
+  (mapv (fn [nm] [nm (+ (or (get out-deg nm) 0) (or (get in-deg nm) 0))])
+        (into [] (distinct (into (into [] (keys out-deg)) (into [] (keys in-deg)))))))
+
+(doseq [row (take 10 (reverse (sort-by (fn [r] (get r 1)) (into [] degree))))]
+  (println (str "    " (get row 1) "  " (get row 0))))
+
+;; ── what to take away ───────────────────────────────────────────────
+
+(heading "── what to take away ──")
+(println "  Structured output turns a passage into DATA — entities + relations")
+(println "  The shape is declared once; the JSON Schema and validation derive from it")
+(println "  Entities and edges are ordinary datoms, joinable with text + vectors")
+(println "  The prose is now a GRAPH you traverse — the missing half of RAG")
+(println "\n  Next: 14-communities.bl — find and summarise clusters in this graph")
