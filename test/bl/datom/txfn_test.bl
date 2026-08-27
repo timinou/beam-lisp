@@ -1,0 +1,140 @@
+; test/bl/datom/txfn_test.bl — transaction functions (:db/fn).
+; Run: mix beam_lisp.test test/bl/datom/txfn_test.bl
+;
+; A tx-fn is (fn [db & args] -> tx-data) named in a transaction as
+; [:db/fn f & args]. It runs against the transaction's before-value and
+; its output is spliced into the same transaction, then resolved,
+; validated and committed like hand-written ops — atomically with them.
+;
+; The contracts under test:
+;   - a tx-fn reads current state and writes a derived result (the RMW a
+;     hand-written op cannot express)
+;   - its output is validated like any op (bad output rejects the whole tx)
+;   - it commits atomically with the rest of the transaction
+;   - direct function values AND registered names both work
+;   - a tx-fn composes (may return another :db/fn) and may return maps
+
+(ns datom.txfn.test
+  (:require [datom] [datom.conn] [datom.db] [datom.tx] [datom.schema]))
+
+(defn- bank-conn []
+  (datom/connect
+    [{:db/ident :account/id :db/valueType :db.type/keyword :db/unique :db.unique/identity}
+     {:db/ident :account/balance :db/valueType :db.type/long}
+     {:db/ident :person/name :db/valueType :db.type/string}
+     {:db/ident :person/email :db/valueType :db.type/string}
+     {:db/ident :mig/id :db/valueType :db.type/keyword :db/unique :db.unique/identity}]))
+
+;; ── the canonical tx-fn: a read-modify-write ────────────────────────
+
+(defn- deposit [db account amount]
+  (let [cur (or (datom.db/attr-value db account :account/balance) 0)]
+    [[:db/add account :account/balance (+ cur amount)]]))
+
+(deftest tx-fn-reads-current-state-and-writes-the-delta
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 100}])
+        acc (get (:tempids r) -1)]
+    (datom.conn/transact! c [[:db/fn deposit acc 50]])
+    (is (= 150 (datom.db/attr-value (datom/db c) acc :account/balance)))))
+
+(deftest tx-fn-as-direct-function-value
+  ; f is the function itself, no registry needed.
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 10}])
+        acc (get (:tempids r) -1)]
+    (datom/transact! c [[:db/fn deposit acc 5]])
+    (is (= 15 (datom.db/attr-value (datom/db c) acc :account/balance)))))
+
+(deftest tx-fn-by-registered-name
+  (datom.tx/register-fn! :deposit deposit)
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 20}])
+        acc (get (:tempids r) -1)]
+    (datom/transact! c [[:db/fn :deposit acc 30]])
+    (is (= 50 (datom.db/attr-value (datom/db c) acc :account/balance)))))
+
+(deftest unknown-tx-fn-name-raises
+  (let [c (bank-conn)]
+    (is (thrown-with-msg? "unknown transaction function"
+          (datom/transact! c [[:db/fn :no-such-fn 1]])))))
+
+;; ── output is validated like any op ─────────────────────────────────
+
+(deftest tx-fn-output-is-schema-validated
+  ; deposit-shaped fn that writes a STRING into a long attribute: the tx
+  ; is rejected wholesale, exactly as if the bad datom were hand-written.
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 0}])
+        acc (get (:tempids r) -1)
+        bad-fn (fn [db] [[:db/add acc :account/balance "not-a-number"]])]
+    (is (thrown? (datom/transact! c [[:db/fn bad-fn]])))
+    ; and nothing partial committed
+    (is (= 0 (datom.db/attr-value (datom/db c) acc :account/balance)))))
+
+;; ── atomicity: fn output + sibling ops in ONE transaction ───────────
+
+(deftest tx-fn-commits-atomically-with-sibling-ops
+  ; A migration shape: a dedup fn's retractions PLUS a ledger stamp, in
+  ; one transact!. Either both land or neither does.
+  (let [c (bank-conn)]
+    (datom/transact! c [{:db/id -1 :person/name "Ada"  :person/email "dup@x"}
+                        {:db/id -2 :person/name "Alan" :person/email "dup@x"}])
+    (let [dedup (fn [db]
+                  (let [rows (into [] (datom/q '[:find ?e ?v :where [?e :person/email ?v]] db))
+                        by-v (group-by (fn [t] (get t 1)) rows)]
+                    (into []
+                      (mapcat (fn [entry]
+                                (let [holders (mapv (fn [t] (get t 0)) (val entry))]
+                                  (mapv (fn [e] [:db/retract e :person/email (key entry)])
+                                        (rest holders))))
+                              (seq by-v)))))]
+      (datom/transact! c (into [[:db/fn dedup]]
+                               [{:db/id -1 :mig/id :dedup-emails}]))
+      ; dup@x now held by exactly one entity
+      (is (= 1 (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db c)))))
+      ; and the ledger stamp landed in the SAME transaction
+      (is (= 1 (count (datom/q '[:find ?e :where [?e :mig/id :dedup-emails]] (datom/db c))))))))
+
+;; ── composition + map output ────────────────────────────────────────
+
+(deftest tx-fn-may-return-map-forms
+  (let [c (bank-conn)
+        make (fn [db] [{:db/id -1 :person/name "Made" :person/email "made@x"}])]
+    (datom/transact! c [[:db/fn make]])
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :person/name "Made"]] (datom/db c)))))))
+
+(deftest tx-fn-may-return-another-tx-fn
+  ; Composition: outer fn returns a :db/fn form, which is expanded too.
+  (let [c (bank-conn)
+        inner (fn [db] [{:db/id -1 :person/name "Inner" :person/email "inner@x"}])
+        outer (fn [db] [[:db/fn inner]])]
+    (datom/transact! c [[:db/fn outer]])
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :person/name "Inner"]] (datom/db c)))))))
+
+;; ── tx-fns work under `with` (speculative), against current data ────
+
+(deftest tx-fn-runs-under-with-without-committing
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 100}])
+        acc (get (:tempids r) -1)
+        spec (datom.conn/with c [[:db/fn deposit acc 25]])]
+    ; speculative db shows the deposit
+    (is (= 125 (datom.db/attr-value (get spec :db-after) acc :account/balance)))
+    ; the real connection did NOT change
+    (is (= 100 (datom.db/attr-value (datom/db c) acc :account/balance)))))
+
+;; ── one snapshot: all tx-fns in a tx see the same before-value ──────
+
+(deftest all-tx-fns-see-the-same-snapshot
+  ; Two deposit fns in one transaction both read the ORIGINAL balance
+  ; (100), not each other's pending effect — the shared before-snapshot.
+  ; So the net effect is the LATER of the two cardinality-one asserts;
+  ; both computed +X from 100 independently.
+  (let [c (bank-conn)
+        r (datom/transact! c [{:db/id -1 :account/id :acc :account/balance 100}])
+        acc (get (:tempids r) -1)]
+    (datom/transact! c [[:db/fn deposit acc 10] [:db/fn deposit acc 20]])
+    ; each read 100; asserts were 110 then 120; cardinality-one keeps the
+    ; net (last) value. This documents the shared-snapshot semantics.
+    (is (= 120 (datom.db/attr-value (datom/db c) acc :account/balance)))))

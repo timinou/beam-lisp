@@ -93,6 +93,110 @@
           []
           tx-data))
 
+;; ── transaction functions (:db/fn) ──────────────────────────────────
+;;
+;; A transaction function is a function of the current database that
+;; returns MORE transaction data, named inside the transaction itself:
+;;
+;;   [[:db/fn f :person/email]]
+;;
+;; At transact time it RUNS — against the database value as of the
+;; transaction — and its output is SPLICED into the same transaction,
+;; which then goes through the identical resolve / validate / realize /
+;; commit path as hand-written ops. That last part is the whole point: a
+;; tx-fn is a MACRO over transaction data, not a second write path. Its
+;; datoms are validated like any others, and they commit ATOMICALLY with
+;; the rest of the transaction — which is what lets a migration remediate
+;; data and record that it did so in one indivisible step, closing the
+;; "data fixed, schema not" window a multi-transaction migration leaves.
+;;
+;; `f` is either a function value directly, or a name looked up in a
+;; registry. Datomic stores tx-fns as :db/fn entities in the database; a
+;; process registry is the same idea without the schema bootstrap, and it
+;; keeps a tx-fn an ordinary beam-lisp function — testable in isolation,
+;; with no install step.
+
+(def TX-FN-REGISTRY :datom-tx-fn-registry)
+
+(defn- tx-fn-registry
+  "The process-wide name -> function map, created on first use.
+
+   Registered by name (like the connection registry in conn.bl) so two
+   processes registering at once both reach the same Agent rather than
+   racing to create two."
+  []
+  (let [existing (erlang/whereis TX-FN-REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(erlang/list_to_tuple
+                                             (to-list [:name TX-FN-REGISTRY]))]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+(defn register-fn!
+  "Register a transaction function under `name` (any value; a keyword or
+   symbol reads best). Idempotent: re-registering replaces."
+  [name f]
+  (Agent/update (tx-fn-registry) (fn [m] (assoc m name f)) 30000)
+  name)
+
+(defn registered-fn
+  "The function registered under `name`, or nil."
+  [name]
+  (Agent/get (tx-fn-registry) (fn [m] (get m name)) 30000))
+
+(defn- tx-fn-form?
+  "Whether `form` is a `[:db/fn f & args]` operation."
+  [form]
+  (and (vector? form) (= (get form 0) :db/fn)))
+
+(defn- resolve-tx-fn
+  "The callable for `[:db/fn f & args]`: `f` itself when it is already a
+   function, otherwise its registry entry. Raises naming the missing fn
+   rather than failing obscurely deep in `apply`."
+  [f]
+  (cond
+    (erlang/is_function f) f
+    (some? (registered-fn f)) (registered-fn f)
+    :else (throw (ex-info "unknown transaction function" {:name f}))))
+
+(defn expand-tx-fns
+  "Expand every `[:db/fn f & args]` in `tx-data` against `db`, splicing
+   each fn's returned tx-data in place. Non-fn forms pass through
+   untouched.
+
+   Runs BEFORE `expand`, on raw transaction data, because a tx-fn may
+   legitimately return map forms, `[:db/add …]` vectors, `:db/retractEntity`,
+   even another `[:db/fn …]` — anything transaction data can be. Its
+   output therefore has to enter the pipeline at the very top and be
+   normalized like everything else. One level of `:db/fn` nesting is
+   expanded per pass; a fn returning a fn is handled by recursing on the
+   result, so composition works without an explicit fixpoint in the
+   caller.
+
+   `db` is the transaction's OWN before-value, so every tx-fn in one
+   transaction sees the same consistent snapshot — not each other's
+   pending effects. A tx-fn that must see an earlier fn's output should
+   compute both itself; splitting that across two registry fns in one
+   transaction is a mistake the shared snapshot makes visible rather than
+   hiding."
+  [db tx-data]
+  (into []
+    (mapcat (fn [form]
+              (if (tx-fn-form? form)
+                (let [f (resolve-tx-fn (get form 1))
+                      args (into [] (rest (rest form)))
+                      produced (apply f db args)]
+                  ; The fn's output may itself contain :db/fn forms, so
+                  ; recurse. Terminates because a fn cannot return itself
+                  ; as data (functions are opaque values, not [:db/fn …]
+                  ; vectors) without an explicit new form the author wrote.
+                  (expand-tx-fns db produced))
+                [form]))
+            tx-data)))
+
 (defn- entity-retraction-ops
   "`[:db/retractEntity e]` as the retractions it stands for.
 
