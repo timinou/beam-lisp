@@ -1,0 +1,116 @@
+; test/bl/datom/migrate_durable_test.bl — migrations recover from datoms.
+; Run: mix beam_lisp.test test/bl/datom/migrate_durable_test.bl
+;
+; A migration's guarantees only matter if they survive the connection
+; that made them. The durable property is RECOVERY FROM DATOMS: everything
+; a migration does — the data change, the schema tightening, the record
+; that it ran — is written as datoms, so a second connection over the same
+; store reconstructs all of it without being told anything.
+;
+; This is tested the way the conformance suite tests reopening (see
+; `reopening-a-store-recovers-its-data`): reuse the STORE HANDLE for the
+; second connection. That exercises the recover-from-datoms path — the one
+; that runs when a durable file is reopened — without the same-VM file
+; lock (redb frees its handle on GC, so an immediate file reopen races the
+; collector; reusing the handle is both idiomatic here and the true test
+; of recovery). It runs against every substrate, redb included, from
+; `impls`.
+
+(ns datom.migrate.durable.test
+  (:require [datom.conn] [datom.db] [datom.migrate] [datom.query.engine]
+            [datom.schema] [datom.store-ets] [datom.store-map] [datom.store-redb]))
+
+(defn- temp-path []
+  (str "/tmp/beam_lisp_migrate_"
+       (erlang/list_to_binary (os/getpid)) "_"
+       (erlang/monotonic_time :nanosecond) "_"
+       (erlang/unique_integer (to-list [:positive]))
+       ".redb"))
+
+(defn- impls
+  "Every Store implementation as `[name open-fn]`. redb only when its NIF
+   loaded — a missing backend is absent, not broken."
+  []
+  (let [base [["ets" datom.store-ets/open]
+              ["map" datom.store-map/open]]]
+    (if (datom.store-redb/available?)
+      (conj base ["redb" (fn [] (datom.store-redb/open (temp-path)))])
+      base)))
+
+(def base-schema
+  [{:db/ident :person/name  :db/valueType :db.type/string}
+   {:db/ident :person/email :db/valueType :db.type/string}])
+
+(defn- tighten []
+  {:migration/id :make-email-unique
+   :migration/grows [{:db/ident :person/email :db/valueType :db.type/string
+                      :db/unique :db.unique/identity}]
+   :migration/checks [{:check :unique :attr :person/email}]
+   :migration/fn (fn [db] (datom.migrate/dedup-unique db :person/email))})
+
+(defn- q [query db] (into [] (datom.query.engine/q query db)))
+
+;; ── 1. the data change and the ledger recover from datoms ───────────
+
+(deftest applied-migration-recovers-across-connections
+  (doseq [pair (impls)]
+    (let [store ((get pair 1))
+          c1 (datom.conn/connect-with store base-schema)]
+      (datom.conn/transact! c1 [{:db/id -1 :person/name "Ada"  :person/email "dup@x"}
+                                {:db/id -2 :person/name "Alan" :person/email "dup@x"}])
+      (datom.migrate/apply! c1 (tighten))
+      ; a second connection over the SAME store, told nothing
+      (let [c2 (datom.conn/connect-with store [])]
+        (is (= 1 (count (q '[:find ?e :where [?e :person/email "dup@x"]] (datom.conn/db c2))))
+            (str (get pair 0) ": the remediation persisted"))
+        (is (contains? (datom.migrate/applied-ids (datom.conn/db c2)) :make-email-unique)
+            (str (get pair 0) ": the ledger entry persisted"))))))
+
+;; ── 2. re-running the migration on the reopened connection is a no-op ─
+
+(deftest reapplying-after-reopen-is-a-noop
+  (doseq [pair (impls)]
+    (let [store ((get pair 1))
+          c1 (datom.conn/connect-with store base-schema)]
+      (datom.conn/transact! c1 [{:db/id -1 :person/email "a@x"}])
+      (datom.migrate/apply! c1 (tighten))
+      (let [c2 (datom.conn/connect-with store [])
+            again (datom.migrate/apply! c2 (tighten))]
+        (is (= :already-applied (get again :status))
+            (str (get pair 0) ": the ledger is a query, so resume sees it applied"))))))
+
+;; ── 3. the tightened invariant is recovered and enforced ────────────
+
+(deftest recovered-schema-enforces-the-new-invariant
+  (doseq [pair (impls)]
+    (let [store ((get pair 1))
+          c1 (datom.conn/connect-with store base-schema)]
+      (datom.conn/transact! c1 [{:db/id -1 :person/name "Ada" :person/email "ada@x"}])
+      (datom.migrate/apply! c1 (tighten))
+      ; reopen WITHOUT re-passing the tightened def — it comes back from
+      ; the schema datoms and enforces uniqueness (an existing email
+      ; UPSERTS rather than creating a second entity).
+      (let [c2 (datom.conn/connect-with store [])]
+        (is (= :db.unique/identity (datom.schema/unique (datom.conn/schema c2) :person/email))
+            (str (get pair 0) ": uniqueness recovered from schema datoms"))
+        (datom.conn/transact! c2 [{:db/id -9 :person/email "ada@x" :person/name "Ada2"}])
+        (is (= 1 (count (q '[:find ?e :where [?e :person/email "ada@x"]] (datom.conn/db c2))))
+            (str (get pair 0) ": and the recovered invariant is enforced"))))))
+
+;; ── 4. a migration never applied in session 1 completes on resume ───
+
+(deftest unapplied-migration-completes-on-resume
+  (doseq [pair (impls)]
+    (let [store ((get pair 1))
+          c1 (datom.conn/connect-with store base-schema)]
+      ; session 1 seeds a duplicate but never runs the migration (a crash
+      ; before it ran)
+      (datom.conn/transact! c1 [{:db/id -1 :person/email "x@x"}
+                                {:db/id -2 :person/email "x@x"}])
+      (let [c2 (datom.conn/connect-with store [])]
+        (is (not (contains? (datom.migrate/applied-ids (datom.conn/db c2)) :make-email-unique))
+            (str (get pair 0) ": not yet applied"))
+        (is (= :applied (get (datom.migrate/apply! c2 (tighten)) :status))
+            (str (get pair 0) ": it applies now"))
+        (is (= 1 (count (q '[:find ?e :where [?e :person/email "x@x"]] (datom.conn/db c2))))
+            (str (get pair 0) ": and the data now conforms"))))))
