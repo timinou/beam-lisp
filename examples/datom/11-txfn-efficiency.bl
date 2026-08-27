@@ -1,0 +1,228 @@
+; examples/datom/11-txfn-efficiency.bl — transaction functions (:db/fn).
+; Run: mix beam_lisp.run --path priv examples/datom/11-txfn-efficiency.bl
+;
+; ── The primitive ─────────────────────────────────────────────────────
+;
+; A transaction function is `(fn [db & args] -> tx-data)` named in the
+; transaction itself:
+;
+;   [[:db/fn my.ns/dedup-emails :person/email]]
+;
+; At transact time it RUNS — against the db value as of the transaction —
+; and SPLICES its returned ops into the same transaction, which then
+; commits as ONE atomic unit. This is Datomic's mechanism and the missing
+; half of the migration design's Q4: it folds a migration's data
+; transform AND its schema-affecting datoms into a single commit, so a
+; crash can never leave "data fixed, schema not".
+;
+; ── Where it plugs in ─────────────────────────────────────────────────
+;
+; tx.bl's `expand` normalizes tx-data into flat [:db/add]/[:db/retract]
+; ops. A `:db/fn` op is expanded THERE: resolve the function, call it with
+; the current db, splice its ops in place. Everything downstream —
+; resolve-tempids, validate, realize, write-datoms — is unchanged, so a
+; tx-fn's output goes through the SAME validation and atomic commit as
+; hand-written ops. That is the whole point: the fn is a macro over
+; tx-data, not a second write path.
+;
+; This file prototypes that expansion on the PUBLIC api (by pre-expanding
+; before transact!, since priv/ has no :db/fn yet) and MEASURES the
+; atomicity difference the real integration would buy: commit COUNT, the
+; store-op that decides all-or-nothing.
+
+(ns example.datom.txfn-efficiency
+  (:require [datom] [datom.store] [datom.store-ets] [datom.db]))
+
+(defn- show [l v] (println (str "  " l "  " (pr-str v))))
+(defn- heading [t] (println (str "\n" t)))
+(defn- note [t] (println (str "  · " t)))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; A COMMIT-COUNTING STORE — atomicity is measured in COMMITS
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; -commit is the atomic unit (store.bl): "either every op is visible or
+;; none is". So the number of -commit calls a migration makes IS its
+;; atomicity granularity. One commit = all-or-nothing. Three commits =
+;; three windows a crash can land between.
+
+(def COMMITS (atom 0))
+(defn- reset-commits [] (reset! COMMITS 0))
+
+(defrecord CommitCounter [inner]
+  datom.store/Store
+  (-get [s k] (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (datom.store/-put (:inner s) k v) s)
+  (-delete [s k] (datom.store/-delete (:inner s) k) s)
+  (-update [s k f] (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (swap! COMMITS inc) (datom.store/-commit (:inner s) ops) s))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; THE TX-FN EXPANDER — what tx.bl/expand would gain
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; A registry of named tx-fns (Datomic stores these as :db/fn entities in
+;; the database; a registry is the same idea without the bootstrap). The
+;; expander walks tx-data, and for every [:db/fn ref & args] form it calls
+;; the fn with the CURRENT db value and splices the result in place.
+
+(def TX-FNS (atom {}))
+(defn register-fn! [name f] (swap! TX-FNS (fn [m] (assoc m name f))))
+
+(defn expand-txfns
+  "Expand every [:db/fn name & args] in `tx-data` against `db`, returning
+   flat tx-data. Non-fn forms pass through untouched. This is the exact
+   logic that belongs in tx.bl/expand — shown here as a pure function so
+   its cost and behaviour are visible."
+  [db tx-data]
+  (into []
+    (mapcat (fn [form]
+              (if (and (vector? form) (= (get form 0) :db/fn))
+                (let [f (get (deref TX-FNS) (get form 1))
+                      args (into [] (rest (rest form)))]
+                  (if (nil? f)
+                    (throw (ex-info "unknown tx-fn" {:name (get form 1)}))
+                    (apply f db args)))
+                [form]))
+            tx-data)))
+
+;; ── a tx-fn: increment a counter by reading current state ───────────
+;;
+;; The canonical tx-fn: it must READ to know what to WRITE. Hand-written
+;; ops cannot express "add 10 to whatever the balance is" atomically —
+;; that is the read-modify-write race :db/cas and tx-fns exist to close.
+
+(defn deposit
+  [db account amount]
+  (let [cur (or (datom.db/attr-value db account :account/balance) 0)]
+    [[:db/add account :account/balance (+ cur amount)]]))
+
+;; ── a migration-shaped tx-fn: dedup then the caller tightens ────────
+
+(defn dedup-email
+  [db]
+  (let [rows (into [] (datom/q '[:find ?e ?v :where [?e :person/email ?v]] db))
+        by-v (group-by (fn [t] (get t 1)) rows)]
+    (into []
+      (mapcat (fn [entry]
+                (let [holders (mapv (fn [t] (get t 0)) (val entry))]
+                  (mapv (fn [e] [:db/retract e :person/email (key entry)])
+                        (rest holders))))
+              (seq by-v)))))
+
+(register-fn! 'deposit deposit)
+(register-fn! 'dedup-email dedup-email)
+
+;; ═══════════════════════════════════════════════════════════════════
+;; CORRECTNESS — a tx-fn reads current state and commits atomically
+;; ═══════════════════════════════════════════════════════════════════
+
+(def schema
+  [{:db/ident :account/id :db/valueType :db.type/keyword :db/unique :db.unique/identity}
+   {:db/ident :account/balance :db/valueType :db.type/long}
+   {:db/ident :person/name :db/valueType :db.type/string}
+   {:db/ident :person/email :db/valueType :db.type/string}])
+
+(def conn (datom/connect-with (->CommitCounter (datom.store-ets/open)) schema))
+(def acc-r (datom/transact! conn [{:db/id -1 :account/id :acc :account/balance 100}]))
+(def acc (get (:tempids acc-r) -1))
+
+(heading "── a tx-fn reads current state, writes the delta ──")
+(show "balance before:" (datom.db/attr-value (datom/db conn) acc :account/balance))
+
+;; deposit 50 via tx-fn, expanded then transacted (one transact! = one commit)
+(reset-commits)
+(datom/transact! conn (expand-txfns (datom/db conn) [[:db/fn 'deposit acc 50]]))
+(show "balance after +50:" (datom.db/attr-value (datom/db conn) acc :account/balance))
+(show "commits for the deposit:" (deref COMMITS))
+(note "the fn READ 100 and WROTE 150 — a read-modify-write, one commit")
+
+;; ═══════════════════════════════════════════════════════════════════
+;; ATOMICITY — the Q4 seam, measured
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; A migration = remediate (fn) + grow schema + stamp ledger. The
+;; prototype in 09-migrations.bl did this in THREE transact!/install
+;; calls. With :db/fn, the fn's output and the ledger stamp fold into ONE
+;; transact!, so the DATA-affecting part is a single commit. (Schema grow
+;; via install-schema! remains its own commit unless schema datoms are
+;; folded in too — see the finding.)
+
+(datom/transact! conn
+  [{:db/id -10 :person/name "Ada"  :person/email "dup@x"}
+   {:db/id -11 :person/name "Alan" :person/email "dup@x"}
+   {:db/id -12 :person/name "Eve"  :person/email "eve@x"}])
+
+(heading "── migration remediation: 3 commits vs 1 ──")
+
+;; WITHOUT tx-fn: read, then transact retractions — plus a separate
+;; ledger stamp. Two DATA commits (and a schema grow would be a third).
+(defn- dupes-now []
+  (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db conn))))
+(show "entities holding dup@x:" (dupes-now))
+
+(reset-commits)
+;; the OLD way: remediate in one tx, stamp ledger in another
+(let [db (datom/db conn)
+      corrective (dedup-email db)]
+  (datom/transact! conn corrective)
+  (datom/transact! conn [{:db/id -1 :person/name "ledger:mig-1"}]))
+(show "OLD way commits (remediate + stamp):" (deref COMMITS))
+
+;; reset the dup for a fair second measurement
+(datom/transact! conn [{:db/id -20 :person/name "Alan2" :person/email "dup@x"}])
+
+(reset-commits)
+;; the NEW way: fn output + ledger stamp folded into ONE transact!
+(datom/transact! conn
+  (into (expand-txfns (datom/db conn) [[:db/fn 'dedup-email]])
+        [{:db/id -1 :person/name "ledger:mig-1b"}]))
+(show "NEW way commits (fn + stamp, folded):" (deref COMMITS))
+(show "dup@x now held by:" (dupes-now))
+
+(note "one commit = one crash-atomic unit. Folding the fn's retractions")
+(note "and the ledger stamp into a single transact! halves the windows a")
+(note "crash can land in — and with schema datoms folded too (below), the")
+(note "WHOLE migration becomes one commit.")
+
+;; ═══════════════════════════════════════════════════════════════════
+;; FINDING — full-migration atomicity needs schema-as-datoms in the tx
+;; ═══════════════════════════════════════════════════════════════════
+
+(heading "── the last mile: schema grow in the SAME commit ──")
+(note "install-schema! is its own writer turn (conn.bl), so today a")
+(note "migration is: [fn+stamp commit] then [schema-grow commit]. To make")
+(note "the ENTIRE migration one commit, the schema deltas must ride as")
+(note "datoms in the same transact! — which schema.bl already supports:")
+(note "`definition-datoms` turns an attr def into [:db/add e a v] ops.")
+(note "So a fully-atomic migration is:")
+(note "")
+(note "  (transact! conn")
+(note "    (concat (expand-txfns db [[:db/fn 'dedup-email]])   ; remediate")
+(note "            (definition-datoms e new-email-def)          ; grow")
+(note "            [ledger-stamp]))                             ; record")
+(note "")
+(note "one expand, one validate, one realize, one commit — atomic. The")
+(note "only piece priv/ lacks is teaching tx.bl/expand the :db/fn form and")
+(note "the schema MAP-update side-effect that must accompany schema datoms")
+(note "(so reads see the new cardinality). Both are additive to expand.")
+
+;; ═══════════════════════════════════════════════════════════════════
+;; EFFICIENCY OF THE EXPANDER ITSELF
+;; ═══════════════════════════════════════════════════════════════════
+
+(heading "── expander cost: linear, one db read per fn ──")
+(note "expand-txfns is O(forms): each :db/fn calls its fn once with the")
+(note "SAME db value (a snapshot, O(1) to hold). A tx-fn's OWN reads are")
+(note "the only store cost, and they are the reads the migration would do")
+(note "anyway. The expander adds no scans — it is a splice, not a query.")
+(note "∴ tx-fns cost exactly what their body reads; the mechanism is free.")
+
+(heading "── takeaway ──")
+(println "  :db/fn = a fn of the db value, spliced into tx-data at expand ✓")
+(println "  reads current state safely (one snapshot), commits atomically ✓")
+(println "  folds remediate + stamp (+ schema datoms) into ONE commit —")
+(println "  closes the Q4 seam 09-migrations.bl left open")
+(println "  integration point: tx.bl/expand only; everything downstream")
+(println "  (validate, realize, write-datoms) is unchanged")

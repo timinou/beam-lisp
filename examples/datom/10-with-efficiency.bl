@@ -1,0 +1,290 @@
+; examples/datom/10-with-efficiency.bl — `with` (speculative tx), two ways.
+; Run: mix beam_lisp.run --path priv examples/datom/10-with-efficiency.bl
+;
+; ── The primitive ─────────────────────────────────────────────────────
+;
+; `with` applies tx-data to a db and returns :db-after WITHOUT committing
+; to the connection. It is what lets `plan` (migration dry-run) preview a
+; WHOLE migration — the fn's datoms AND the schema grow's downstream
+; effect — against a production replica as one value-level step.
+;
+; conn.bl's writer already BUILDS :db-after; `with` is that path minus the
+; final basis advance. The only real question is the STORE: a speculative
+; write must not mutate the base. There are two faithful ways to arrange
+; that, with OPPOSITE cost curves — and this file measures both the way
+; 05-cost.bl insists on: STORE OPERATIONS against the base, not
+; wall-clock. Each `-range` against a networked prod store is one round
+; trip; the entries it returns are the payload. Those are what decide the
+; design; milliseconds are noise dressed as a contract.
+;
+;   Strategy A — OVERLAY : base is read-through; speculative datoms live
+;                          in a small buffer. Base is never touched.
+;                          Cost: 0 up front; each dry-run scan hits base.
+;   Strategy B — CLONE   : copy the whole base into a private store, then
+;                          transact into the copy natively.
+;                          Cost: O(N) copy up front; then base untouched.
+
+(ns example.datom.with-efficiency
+  (:require [datom] [datom.store] [datom.store-ets] [datom.store-map]
+            [datom.db] [datom.tx] [datom.index] [datom.schema]))
+
+(defn- show [l v] (println (str "  " l "  " (pr-str v))))
+(defn- heading [t] (println (str "\n" t)))
+(defn- note [t] (println (str "  · " t)))
+(defn- pad [s n] (let [t (str s)] (str t (join "" (repeat (max 0 (- n (count t))) " ")))))
+(defn- row [& cells] (println (str "  " (join "" (mapv (fn [c] (pad c 14)) cells)))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; A COUNTING BASE — every range/entry served to a speculative view
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; Wraps a real store and tallies what a speculative view PULLS OUT of the
+;; base: how many round trips (`:range`) and how many entries (payload).
+;; This is the honest cost of a dry-run against a remote prod store.
+
+(def TALLY (atom {}))
+(defn- bump [k n] (swap! TALLY (fn [m] (assoc m k (+ n (or (get m k) 0))))))
+(defn- reset-tally [] (reset! TALLY {}))
+(defn- roundtrips [] (or (get (deref TALLY) :range) 0))
+(defn- entries [] (or (get (deref TALLY) :entries) 0))
+
+(defrecord CountingBase [inner]
+  datom.store/Store
+  (-get [s k] (bump :get 1) (datom.store/-get (:inner s) k))
+  (-range [s lo hi]
+    (let [res (datom.store/-range (:inner s) lo hi)]
+      (bump :range 1) (bump :entries (count res)) res))
+  (-put [s k v] (datom.store/-put (:inner s) k v) s)
+  (-delete [s k] (datom.store/-delete (:inner s) k) s)
+  (-update [s k f] (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (datom.store/-commit (:inner s) ops) s))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; STRATEGY A — OVERLAY STORE (non-mutating `with`, zero copy)
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; A read-through view: reads consult a speculative BUFFER first, then the
+;; base. Writes land ONLY in the buffer. Because datom writes are all
+;; `:put` of NEW keys (op is part of the key), the buffer only ever ADDS
+;; keys — base keys never change, so no deletion-masking is needed. The
+;; buffer also absorbs the id counters (`-update`), so a speculative
+;; transaction allocates ids without advancing the real ones.
+
+(defrecord OverlayStore [base buffer]           ; buffer: atom of sorted-map
+  datom.store/Store
+
+  (-get [s k]
+    (let [b (get (deref (:buffer s)) k :MISS)]
+      (if (= b :MISS) (datom.store/-get (:base s) k) b)))
+
+  (-range [s lo hi]
+    ; base ∪ buffer within [lo,hi], buffer winning on key collision
+    ; (the counters), returned in key order.
+    (let [base-entries (datom.store/-range (:base s) lo hi)
+          buf (deref (:buffer s))
+          in-bounds (filterv (fn [e]
+                               (let [k (get e 0)]
+                                 (and (or (nil? lo) (not (erlang/< k lo)))
+                                      (or (nil? hi) (not (erlang/> k hi))))))
+                             (into [] (seq buf)))
+          merged (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                         (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                                 (sorted-map) base-entries)
+                         in-bounds)]
+      (into [] (seq merged))))
+
+  (-put [s k v] (swap! (:buffer s) (fn [m] (assoc m k v))) s)
+  (-delete [s k] (swap! (:buffer s) (fn [m] (dissoc m k))) s)
+
+  (-update [s k f]
+    (let [cur (let [b (get (deref (:buffer s)) k :MISS)]
+                (if (= b :MISS) (datom.store/-get (:base s) k) b))
+          nv (f cur)]
+      (swap! (:buffer s) (fn [m] (assoc m k nv)))
+      [s nv]))
+
+  (-commit [s ops]
+    (swap! (:buffer s)
+           (fn [m] (reduce (fn [acc op]
+                             (if (= (get op 0) :put)
+                               (assoc acc (get op 1) (get op 2))
+                               (dissoc acc (get op 1))))
+                           m ops)))
+    s))
+
+(defn overlay [base] (->OverlayStore base (atom (sorted-map))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; STRATEGY B — CLONE (copy base into a private map store)
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn clone-of
+  "A private MapStore holding a full copy of `base`. The copy is the
+   whole keyspace, so it is ONE range returning every entry — O(N)."
+  [base]
+  (let [all (datom.store/-range base nil nil)
+        m (datom.store-map/open)]
+    (datom.store/-commit m (mapv (fn [e] [:put (get e 0) (get e 1)]) all))
+    m))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; A FAITHFUL `with` — the real tx pipeline, against a chosen store
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; This is transact-in-writer (conn.bl) with the connection removed: it
+;; runs the SAME expand → resolve → expand-store → validate → realize →
+;; write-datoms pipeline, committing to whatever store it is given, and
+;; returns a db VALUE over that store. No basis atom, no writer — a `with`
+;; is a pure function of (store, schema, tx-data).
+
+(def ENTITY-COUNTER (erlang/list_to_binary (to-list [0 101])))
+(def TX-COUNTER (erlang/list_to_binary (to-list [0 116])))
+(def FIRST-TX 1000000)
+
+(defn- next-eid [store]
+  (get (datom.store/-update store ENTITY-COUNTER
+                            (fn [c] (if (nil? c) 1 (inc c)))) 1))
+(defn- next-tx [store]
+  (get (datom.store/-update store TX-COUNTER
+                            (fn [c] (if (nil? c) FIRST-TX (inc c)))) 1))
+
+(defn with-into
+  "Speculatively apply `tx-data` to `store`+`schema`, returning the db
+   value AFTER — committing into `store` (which for a `with` is an overlay
+   or a clone, never the base). Mirrors conn.bl's writer body."
+  [store schema tx-data]
+  (let [ops (datom.tx/expand schema tx-data)
+        resolved (datom.tx/resolve-tempids store schema ops (fn [] (next-eid store)))
+        expanded (datom.tx/expand-store-ops store schema (get resolved 0))
+        problems (datom.tx/validate store schema expanded)]
+    (if (seq problems)
+      (throw (ex-info "speculative tx rejected" {:problems problems}))
+      (let [tx (next-tx store)
+            instant [:db/add tx :db/txInstant (erlang/system_time :millisecond)]
+            with-self (mapv (fn [op] (if (= (get op 1) datom.tx/TX-SELF)
+                                       (assoc op 1 tx) op))
+                            expanded)
+            datoms (datom.tx/realize store schema tx (conj with-self instant))]
+        (datom.index/write-datoms store schema datoms)
+        (datom.db/db-value store schema tx)))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; CORRECTNESS FIRST — both strategies must be non-mutating and equal
+;; ═══════════════════════════════════════════════════════════════════
+
+(def schema-defs
+  [{:db/ident :p/name :db/valueType :db.type/string}
+   {:db/ident :p/age :db/valueType :db.type/long}
+   {:db/ident :p/city :db/valueType :db.type/string}])
+
+(def schema
+  (datom.schema/install-all (datom.schema/empty-schema) schema-defs))
+
+(defn- seed
+  "A base store (ETS) holding `n` people, wrapped so we can count."
+  [n]
+  (let [base (->CountingBase (datom.store-ets/open))
+        conn (datom/connect-with base schema-defs)]
+    (datom/transact! conn
+      (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/name (str "n" i) :p/age i
+                     :p/city (if (even? i) "London" "NY")})
+            (loop [i 0 a []] (if (>= i n) a (recur (inc i) (conj a i))))))
+    base))
+
+(heading "── correctness: `with` does not touch the base ──")
+
+(def base (seed 5))
+(def db-now (datom.db/db-value base schema 9999999))
+(def before-count
+  (count (datom/q '[:find ?e :where [?e :p/name ?n]] db-now)))
+
+;; speculative insert via OVERLAY
+(def ov (overlay base))
+(def db-spec (with-into ov schema [{:db/id -1 :p/name "GHOST" :p/age 999 :p/city "Nowhere"}]))
+(def spec-count (count (datom/q '[:find ?e :where [?e :p/name ?n]] db-spec)))
+(def base-after (count (datom/q '[:find ?e :where [?e :p/name ?n]]
+                                (datom.db/db-value base schema 9999999))))
+
+(show "people in base before:" before-count)
+(show "people in speculative db-after:" spec-count)
+(show "people in base AFTER the with:" base-after)
+(show "ghost visible only in speculation:"
+      (and (= spec-count (inc before-count)) (= base-after before-count)))
+(note "the overlay saw base+ghost; the base never learned the ghost existed")
+
+;; CLONE gives the same db-after, base still untouched
+(def cl (clone-of base))
+(def db-spec2 (with-into cl schema [{:db/id -1 :p/name "GHOST" :p/age 999 :p/city "Nowhere"}]))
+(show "clone strategy agrees:"
+      (= spec-count (count (datom/q '[:find ?e :where [?e :p/name ?n]] db-spec2))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; EFFICIENCY — cost of a MIGRATION DRY-RUN, both strategies, two sizes
+;; ═══════════════════════════════════════════════════════════════════
+;;
+;; The realistic workload (Q3): dry-run a migration that TIGHTENS two
+;; invariants — unique :p/name-like + cardinality-one — which means the
+;; plan scans TWO of the store's columns. We measure what each strategy
+;; pulls out of the BASE (round trips + entries), because that is the
+;; networked-prod cost that actually decides this.
+
+(defn- dry-run-cost
+  "Round trips and entries pulled from BASE when previewing a 2-column
+   check + a speculative insert, using `mk-store` to derive the private
+   view from base."
+  [n mk-store]
+  (let [base (seed n)]
+    (reset-tally)
+    (let [store (mk-store base)
+          ; a speculative migration insert (the fn's output), then the
+          ; plan's two column scans against the resulting db value
+          db-after (with-into store schema
+                     [{:db/id -1 :p/name "probe" :p/age 0 :p/city "London"}])]
+      (datom/q '[:find ?e ?v :where [?e :p/age ?v]] db-after)     ; check 1
+      (datom/q '[:find ?e ?v :where [?e :p/city ?v]] db-after)    ; check 2
+      {:trips (roundtrips) :entries (entries)})))
+
+(heading "── cost of one migration dry-run (hits against BASE) ──")
+(row "strategy" "N=20 trips" "N=20 ent" "N=80 trips" "N=80 ent")
+
+(defn- report [label mk]
+  (let [a (dry-run-cost 20 mk) b (dry-run-cost 80 mk)]
+    (row label (str (get a :trips)) (str (get a :entries))
+               (str (get b :trips)) (str (get b :entries)))))
+
+(report "OVERLAY" overlay)
+(report "CLONE  " clone-of)
+
+(heading "── reading the table ──")
+(note "OVERLAY: base round trips = number of dry-run SCANS (touches only")
+(note "         the columns the migration reads); entries grow with those")
+(note "         columns. Zero cost for columns the migration never checks.")
+(note "CLONE:   one big round trip up front returning the ENTIRE keyspace")
+(note "         (~all datoms); then every scan is local (0 further base).")
+(note "")
+(note "∴ OVERLAY wins for a targeted dry-run against a large prod store:")
+(note "  it transfers only the columns under test. CLONE wins only when a")
+(note "  session dry-runs MANY migrations touching MOST columns — then the")
+(note "  one-time copy amortizes. For CI 'plan this PR's migration', overlay.")
+(note "")
+(note "The design's `with` should therefore default to OVERLAY, exposing")
+(note "CLONE for the batch-audit case. Both are ~40 lines; neither edits a")
+(note "layer above the store port.")
+
+;; ═══════════════════════════════════════════════════════════════════
+;; NON-MUTATION vs MUTATION — why overlay, not 'transact then rollback'
+;; ═══════════════════════════════════════════════════════════════════
+
+(heading "── why not just transact into base and undo? ──")
+(note "base is ETS: a shared mutable table with no transactions (store-")
+(note "ets.bl says so). A 'write then retract' speculative would be VISIBLE")
+(note "to concurrent readers mid-flight and unrecoverable on crash. The")
+(note "overlay keeps speculation in a per-call buffer the base never sees —")
+(note "the same reason a db is a VALUE: speculation must not be a place.")
+
+(heading "── takeaway ──")
+(println "  `with` = the writer pipeline minus the basis advance ✓ (runs above)")
+(println "  non-mutating against a shared base ✓ (overlay buffer)")
+(println "  two strategies, measured: OVERLAY for targeted dry-run,")
+(println "  CLONE for batch audit — pick per workload, both tiny")
+(println "  unblocks full-migration dry-run (fn + grow) against prod")
