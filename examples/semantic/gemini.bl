@@ -1,0 +1,152 @@
+; examples/semantic/gemini.bl — real embeddings, from Google's Gemini.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; Examples 01–10 used a fake offline embedder so they run anywhere with no
+; network. Examples 11–15 (GraphRAG over the Sherlock Holmes canon) need
+; REAL embeddings — vectors from a model that actually understands English —
+; and this namespace is the one line that changes: `embed` here calls
+; Google's `gemini-embedding-001` instead of hashing words.
+;
+; Everything downstream is identical. `(gemini/embed text)` returns a
+; `DVec` exactly as `(embed/embed text)` did, so the storage, `similar-to`,
+; clustering and community code all work unchanged. That is the payoff of
+; making an embedding just a value: the SOURCE of the numbers is swappable.
+;
+; ── Caching: embed once, then run offline forever ─────────────────────
+;
+; Every `embed` call would otherwise be a network round trip that costs
+; money and time. So each result is CACHED to disk, keyed by a hash of the
+; text (and the task type and dimensionality — different tasks give
+; different vectors). Embed the whole Holmes corpus once; every run after
+; that reads the cache and needs no network at all. Delete the cache dir to
+; re-embed.
+;
+; ── Task types ────────────────────────────────────────────────────────
+;
+; Gemini embeddings are better when you tell the model what the embedding
+; is FOR. A document being stored for retrieval and a query searching for
+; it are asymmetric, and the API takes a `taskType` to optimise each:
+;   RETRIEVAL_DOCUMENT — text you store and later search over
+;   RETRIEVAL_QUERY    — a search query against those documents
+; `embed-doc` and `embed-query` set these; `embed` defaults to document.
+
+(ns semantic.gemini
+  (:require [datom.vector]))
+
+(def MODEL "gemini-embedding-001")
+(def DIM 768)                      ; Matryoshka-truncated from 3072; smaller
+                                   ; index, still strong. Normalised on our side.
+(def CACHE-DIR ".embcache")
+
+;; ── the network call ────────────────────────────────────────────────
+
+(defn- ensure-inets []
+  ; httpc is the inets HTTP client, already on this app's code path
+  ; (extra_applications). Starting twice is harmless — it returns
+  ; {:error, {:already_started, _}}, which we ignore.
+  (inets/start)
+  (ssl/start))
+
+(defn- api-key []
+  (let [k (System/get_env "GOOGLE_API_KEY")]
+    (if (or (nil? k) (= k ""))
+      (throw (ex-info "GOOGLE_API_KEY is not set — needed for real embeddings"
+                      {:hint "export GOOGLE_API_KEY=... (see .env)"}))
+      k)))
+
+(defn- call-gemini
+  "POST one text to the embedContent endpoint, returning a vector of
+   floats. Raises with the API's own message on a non-200."
+  [text task]
+  (ensure-inets)
+  (let [url (erlang/binary_to_list
+              (str "https://generativelanguage.googleapis.com/v1beta/models/"
+                   MODEL ":embedContent"))
+        payload (Jason/encode!
+                  {"model" (str "models/" MODEL)
+                   "content" {"parts" (to-list [{"text" text}])}
+                   "taskType" task
+                   "outputDimensionality" DIM}
+                  ; the request map is plain; no vectors to convert here.
+                  )
+        headers (to-list [(erlang/list_to_tuple
+                            (to-list [(erlang/binary_to_list "x-goog-api-key")
+                                      (erlang/binary_to_list (api-key))]))])
+        request (erlang/list_to_tuple
+                  (to-list [url headers
+                            (erlang/binary_to_list "application/json")
+                            payload]))
+        result (httpc/request :post request (to-list []) (to-list []))]
+    (if (= (erlang/element 1 result) :ok)
+      (let [resp (erlang/element 2 result)
+            ; httpc's status line is `{HttpVersion, StatusCode, ReasonPhrase}`,
+            ; so the code is element 2 (element 1 is "HTTP/1.1").
+            status (erlang/element 2 (erlang/element 1 resp))
+            body (erlang/list_to_binary (erlang/element 3 resp))]
+        (if (= status 200)
+          (into [] (get (get (Jason/decode! body) "embedding") "values"))
+          (throw (ex-info (str "Gemini embedContent failed (HTTP " status ")")
+                          {:status status :body body}))))
+      (throw (ex-info "Gemini request transport error"
+                      {:error (erlang/element 2 result)})))))
+
+;; ── caching ─────────────────────────────────────────────────────────
+
+(defn- cache-key
+  [text task]
+  (subs (String/downcase (Base/encode16 (crypto/hash :sha256 (str task "|" DIM "|" text))))
+        0 32))
+
+(defn- cache-path
+  [text task]
+  (str CACHE-DIR "/" (cache-key text task) ".json"))
+
+(defn- read-cache
+  "The cached float vector for `text`+`task`, or nil."
+  [text task]
+  (let [path (cache-path text task)]
+    (if (File/exists? path)
+      (into [] (Jason/decode! (File/read! path)))
+      nil)))
+
+(defn- write-cache
+  [text task floats]
+  (File/mkdir_p! CACHE-DIR)
+  ; `to-list`: Jason encodes a plain Erlang list, not a BeamLisp.Vector.
+  (File/write! (cache-path text task) (Jason/encode! (to-list floats))))
+
+;; ── the public surface ──────────────────────────────────────────────
+
+(defn embed-with
+  "A `DVec` for `text` under Gemini `task`, cached. The network is touched
+   only on a cache miss."
+  [text task]
+  (let [cached (read-cache text task)]
+    (if (some? cached)
+      (datom.vector/embedding cached)
+      (let [floats (call-gemini text task)]
+        (write-cache text task floats)
+        (datom.vector/embedding floats)))))
+
+(defn embed-doc
+  "Embed a DOCUMENT for storage/retrieval (RETRIEVAL_DOCUMENT)."
+  [text]
+  (embed-with text "RETRIEVAL_DOCUMENT"))
+
+(defn embed-query
+  "Embed a QUERY that searches over documents (RETRIEVAL_QUERY)."
+  [text]
+  (embed-with text "RETRIEVAL_QUERY"))
+
+(defn embed
+  "Default embedding (document task). The drop-in for the fake embedder's
+   `embed/embed`."
+  [text]
+  (embed-doc text))
+
+(defn cached?
+  "Whether `text` is already embedded on disk under `task` — useful for a
+   progress readout during a bulk ingest."
+  [text task]
+  (File/exists? (cache-path text task)))
