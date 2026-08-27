@@ -3,7 +3,7 @@
 **Status:** ✅ **CUTOVER EXECUTED.** `q` routes recursive rules through the
 native kernel via the dispatching `materialise`; the bl `derive-naive` loop and
 `materialise-with` are deleted; value interning makes every value type recurse
-natively. Whole repo green (848 tests / 2253 assertions, 0 failures). Everything
+natively. Whole repo green (850 tests / 2258 assertions, 0 failures). Everything
 below is grounded in committed, passing code.
 
 ## The principle (why this exists)
@@ -149,8 +149,12 @@ natively and decode back to the original values. Tests
 fallback` pin it against both closed-form counts and the bl fallback. The only
 remaining `:num` restriction is that a value feeding arithmetic must actually be
 numeric (a non-numeric arithmetic arg raises at compile time — correct, not a
-gap). Floats work as `:num` (the kernel's `Op` is saturating over i64; a
-float-lane in the IR is the one deferred extension, flagged if attempted).
+gap). A float in an arithmetic column is beyond the i64 kernel: the driver
+raises a **tagged fallback signal** and `materialise` catches exactly it to
+re-run the program on the bl fixpoint — a valid float-weighted shortest path
+computes correctly (via bl), it just does not use the kernel. A native
+float-lane in the IR is the one deferred *performance* extension; correctness
+is already covered by the graceful fallback.
 
 ### Step 3 — deleted the deprecated bl loops ✅ DONE
 
@@ -191,10 +195,12 @@ was using two drivers in **production**, which is exactly what Step 3 removed.
   updated; no dangling references.
 - ✅ Bit-identical to the bl fallback; 14–33× end-to-end, 138–173× on the raw
   fixpoint; verified against closed-form math.
-- ✅ Whole repo green: 848 tests / 2253 assertions, 0 failures.
-- ⬜ Deferred (flagged, not gaps): a float-lane in the native IR for
-  arithmetic over non-integer numbers; a randomised property generator on top
-  of the fixed spec cases.
+- ✅ Whole repo green: 850 tests / 2258 assertions, 0 failures.
+- ✅ Float-in-arithmetic falls back gracefully (tagged signal → bl), so a
+  valid float-weighted program computes correctly rather than crashing.
+- ⬜ Deferred (a PERFORMANCE extension, not a correctness gap): a float-lane
+  in the native IR so float arithmetic runs in-kernel instead of on bl; a
+  randomised property generator on top of the fixed spec cases.
 
 The cutover is done: one fixpoint (native), one seam (`materialise`), one
 fallback (bl, for the disjoint arbitrary-predicate class), verified against
