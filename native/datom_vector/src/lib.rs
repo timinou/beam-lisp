@@ -334,6 +334,256 @@ pub fn vec_search(
         .collect())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Clustering and dimensionality reduction
+//
+// Two more things a corpus of embeddings makes possible, both pure numeric
+// loops that belong in Rust for the same reason search does. Neither knows the
+// database; the datalog layer gathers the vectors and hands them down.
+
+/// Decode a packed corpus binary into a contiguous f32 matrix (row-major).
+fn decode_corpus(bytes: &[u8], dim: usize) -> Result<(usize, Vec<f32>), Error> {
+    if dim == 0 || bytes.len() % (dim * 4) != 0 {
+        return Err(err("corpus length is not a whole number of vectors"));
+    }
+    let n = bytes.len() / (dim * 4);
+    let mut flat = vec![0.0f32; n * dim];
+    for i in 0..n {
+        let row = unpack_f32(&bytes[i * dim * 4..(i + 1) * dim * 4], dim)
+            .ok_or_else(|| err("corpus row length mismatch"))?;
+        flat[i * dim..(i + 1) * dim].copy_from_slice(&row);
+    }
+    Ok((n, flat))
+}
+
+/// `vec_kmeans(corpus, dim, k, iters, seed)` → a cluster id (0..k) per row.
+///
+/// Lloyd's algorithm: assign each point to its nearest centroid, move each
+/// centroid to the mean of its points, repeat. Vectors are unit-normalised, so
+/// "nearest" by Euclidean distance and by cosine agree, and the mean is
+/// re-normalised so centroids stay on the sphere.
+///
+/// Deterministic given `seed` (k-means++ style spread initialisation over a
+/// seeded PRNG), so a demo clusters the same way every run. Empty clusters are
+/// left where they are rather than re-seeded — simpler, and harmless at the
+/// sizes this serves.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_kmeans(
+    corpus: Binary,
+    dim: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+) -> NifResult<Vec<i64>> {
+    let (n, flat) = decode_corpus(corpus.as_slice(), dim).map_err(|e| e)?;
+    if k == 0 || n == 0 {
+        return Ok(vec![0i64; n]);
+    }
+    let k = k.min(n);
+
+    // k-means++ init: first centroid random, each next chosen with probability
+    // proportional to squared distance from the nearest chosen centroid. Spread
+    // initialisation is what keeps Lloyd's from collapsing two centroids onto
+    // one cluster.
+    let mut rng = seed ^ 0x9E3779B97F4A7C15;
+    let mut next = || {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        (rng.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut centroids = vec![0.0f32; k * dim];
+    let first = (next() * n as f64) as usize % n;
+    centroids[0..dim].copy_from_slice(&flat[first * dim..(first + 1) * dim]);
+    for c in 1..k {
+        // distance of each point to its nearest already-chosen centroid
+        let mut d2 = vec![0.0f64; n];
+        let mut total = 0.0f64;
+        for i in 0..n {
+            let row = &flat[i * dim..(i + 1) * dim];
+            let mut best = f32::INFINITY;
+            for cc in 0..c {
+                let cen = &centroids[cc * dim..(cc + 1) * dim];
+                let mut s = 0.0f32;
+                for d in 0..dim {
+                    let diff = row[d] - cen[d];
+                    s += diff * diff;
+                }
+                if s < best {
+                    best = s;
+                }
+            }
+            d2[i] = best as f64;
+            total += best as f64;
+        }
+        // sample proportional to d2
+        let mut target = next() * total;
+        let mut chosen = n - 1;
+        for i in 0..n {
+            target -= d2[i];
+            if target <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centroids[c * dim..(c + 1) * dim].copy_from_slice(&flat[chosen * dim..(chosen + 1) * dim]);
+    }
+
+    let mut assign = vec![0i64; n];
+    for _ in 0..iters.max(1) {
+        // assignment step
+        let mut changed = false;
+        for i in 0..n {
+            let row = &flat[i * dim..(i + 1) * dim];
+            let mut best = 0usize;
+            let mut best_d = f32::INFINITY;
+            for c in 0..k {
+                let cen = &centroids[c * dim..(c + 1) * dim];
+                let mut s = 0.0f32;
+                for d in 0..dim {
+                    let diff = row[d] - cen[d];
+                    s += diff * diff;
+                }
+                if s < best_d {
+                    best_d = s;
+                    best = c;
+                }
+            }
+            if assign[i] != best as i64 {
+                assign[i] = best as i64;
+                changed = true;
+            }
+        }
+        // update step: centroid = normalised mean of its members
+        let mut sums = vec![0.0f32; k * dim];
+        let mut counts = vec![0u32; k];
+        for i in 0..n {
+            let c = assign[i] as usize;
+            counts[c] += 1;
+            let row = &flat[i * dim..(i + 1) * dim];
+            let cen = &mut sums[c * dim..(c + 1) * dim];
+            for d in 0..dim {
+                cen[d] += row[d];
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                let cen = &mut sums[c * dim..(c + 1) * dim];
+                for x in cen.iter_mut() {
+                    *x /= counts[c] as f32;
+                }
+                normalize(cen);
+                centroids[c * dim..(c + 1) * dim].copy_from_slice(cen);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(assign)
+}
+
+/// `vec_pca_2d(corpus, dim)` → `[[x, y], …]`, each row's coordinates on the top
+/// two principal components.
+///
+/// PCA the honest way for two components: centre the data, then find the two
+/// directions of greatest variance by POWER ITERATION on the covariance
+/// (implicitly, via repeated matrix-vector products against the data), with
+/// deflation between them. No linear-algebra dependency — the covariance is
+/// never materialised (it would be dim×dim); each iteration is O(n·dim).
+///
+/// This is what turns "10,000 embeddings" into a scatter plot a human can read:
+/// clusters of related items become visible clouds.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_pca_2d(corpus: Binary, dim: usize) -> NifResult<Vec<(f64, f64)>> {
+    let (n, mut flat) = decode_corpus(corpus.as_slice(), dim).map_err(|e| e)?;
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    // centre: subtract the mean vector
+    let mut mean = vec![0.0f32; dim];
+    for i in 0..n {
+        for d in 0..dim {
+            mean[d] += flat[i * dim + d];
+        }
+    }
+    for d in 0..dim {
+        mean[d] /= n as f32;
+    }
+    for i in 0..n {
+        for d in 0..dim {
+            flat[i * dim + d] -= mean[d];
+        }
+    }
+
+    // power iteration for the leading eigenvector of X^T X (the covariance,
+    // up to a scale): v ← normalise(X^T (X v)).
+    let power_iter = |data: &[f32], seed: u64| -> Vec<f32> {
+        let mut rng = seed | 1;
+        let mut v = vec![0.0f32; dim];
+        for x in v.iter_mut() {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            *x = ((rng.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32 / (1u32 << 24) as f32) - 0.5;
+        }
+        normalize(&mut v);
+        for _ in 0..50 {
+            // u = X v   (length n)
+            let mut u = vec![0.0f32; n];
+            for i in 0..n {
+                let row = &data[i * dim..(i + 1) * dim];
+                let mut s = 0.0f32;
+                for d in 0..dim {
+                    s += row[d] * v[d];
+                }
+                u[i] = s;
+            }
+            // w = X^T u   (length dim)
+            let mut w = vec![0.0f32; dim];
+            for i in 0..n {
+                let row = &data[i * dim..(i + 1) * dim];
+                let ui = u[i];
+                for d in 0..dim {
+                    w[d] += row[d] * ui;
+                }
+            }
+            normalize(&mut w);
+            v = w;
+        }
+        v
+    };
+
+    let pc1 = power_iter(&flat, 0x1234_5678);
+    // deflate: remove the pc1 component from every row, then find pc2
+    let mut deflated = flat.clone();
+    for i in 0..n {
+        let row = &mut deflated[i * dim..(i + 1) * dim];
+        let mut proj = 0.0f32;
+        for d in 0..dim {
+            proj += row[d] * pc1[d];
+        }
+        for d in 0..dim {
+            row[d] -= proj * pc1[d];
+        }
+    }
+    let pc2 = power_iter(&deflated, 0x8765_4321);
+
+    // project each centred row onto (pc1, pc2)
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = &flat[i * dim..(i + 1) * dim];
+        let mut x = 0.0f32;
+        let mut y = 0.0f32;
+        for d in 0..dim {
+            x += row[d] * pc1[d];
+            y += row[d] * pc2[d];
+        }
+        out.push((x as f64, y as f64));
+    }
+    Ok(out)
+}
+
 /// A marker `BeamLisp.Native.available?/1` calls to tell a loaded NIF from the
 /// unloaded stub. Present here for symmetry with `datom_redb`, so a checkout
 /// without a Rust toolchain reads the vector backend as ABSENT rather than

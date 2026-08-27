@@ -88,17 +88,152 @@
                                   (datom.db/attr-datoms db attr)))]
     (datom.vector/search query candidates k rerank)))
 
+;; ── the corpus of an embedding column ───────────────────────────────
+
+(defn- embedding-corpus
+  "Every `[entity dvec]` for a `:db.type/vector` attribute, current-basis.
+   The input to clustering and projection, exactly as for search."
+  [db attr]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [e (datom.index/-e d) v (datom.index/-v d)]
+                     (if (datom.vector/vec? v) [e v] nil)))
+                 (datom.db/attr-datoms db attr))))
+
+;; ── clustering by embedding ─────────────────────────────────────────
+
+(defn- cluster-op
+  "`(cluster attr opts)` → `[[e cluster-id] …]`.
+
+   `opts` is a map: `{:method :k-means :k 5}` (only k-means in this wave;
+   the verb is named generically so density methods can join later without
+   a syntax change). `:iters` and `:seed` are optional refinement controls."
+  [db args]
+  (let [attr (get args 0)
+        opts (or (get args 1) {})
+        k (or (get opts :k) 5)
+        iters (or (get opts :iters) 20)
+        seed (or (get opts :seed) 42)]
+    (datom.vector/cluster (embedding-corpus db attr) k iters seed)))
+
+;; ── dimensionality reduction ────────────────────────────────────────
+
+(defn- project-2d-op
+  "`(project-2d attr)` → `[[e x y] …]`, PCA coordinates per entity."
+  [db args]
+  (datom.vector/project-2d (embedding-corpus db (get args 0))))
+
+;; ── community detection over the reference graph ─────────────────────
+;;
+;; These do NOT use embeddings. They read the GRAPH the ref attributes
+;; already form — `[?a :person/friend ?b]` is an edge — and group entities
+;; by CONNECTION rather than by content. This is datalog's home turf: the
+;; canonical recursive-datalog examples (connected components, label
+;; propagation) are exactly these, and here they run over the same datoms.
+
+(defn- edges-of
+  "Undirected edges of a ref attribute, as `[[a b] …]`. Each ref datom
+   `[a attr b]` contributes the pair; reverse is added so reachability is
+   symmetric (a friendship graph is undirected even when stored one way)."
+  [db attr]
+  (reduce (fn [acc d]
+            (let [a (datom.index/-e d) b (datom.index/-v d)]
+              (conj acc [a b])))
+          []
+          (datom.db/attr-datoms db attr)))
+
+(defn- nodes-of
+  "Every entity that appears as either endpoint of `edges`."
+  [edges]
+  (into [] (distinct (reduce (fn [acc e] (conj (conj acc (get e 0)) (get e 1))) [] edges))))
+
+(defn- components-op
+  "`(components attr)` → `[[e component-id] …]`, connected components of the
+   ref graph by union-find. Two entities share a component id iff a path of
+   references connects them. The simplest community structure: who is
+   reachable from whom."
+  [db args]
+  (let [edges (edges-of db (get args 0))
+        nodes (nodes-of edges)
+        ; union-find over a plain map parent
+        parent (reduce (fn [m n] (assoc m n n)) {} nodes)]
+    (letfn [(find-root [p x]
+              (if (= (get p x) x) x (find-root p (get p x))))]
+      (let [merged (reduce (fn [p edge]
+                             (let [ra (find-root p (get edge 0))
+                                   rb (find-root p (get edge 1))]
+                               (if (= ra rb) p (assoc p ra rb))))
+                           parent
+                           edges)]
+        (mapv (fn [n] [n (find-root merged n)]) nodes)))))
+
+(defn- community-op
+  "`(community attr opts)` → `[[e community-id] …]` by LABEL PROPAGATION.
+
+   Each node starts as its own community; repeatedly, every node adopts the
+   community that most of its neighbours hold, until labels stop changing
+   (a fixpoint). This finds finer structure than connected components — two
+   densely-linked groups joined by a single edge stay separate — and it is
+   the classic recursive-datalog community algorithm, here as a bounded
+   fixpoint loop. `opts` may set `:iters` (default 10)."
+  [db args]
+  (let [attr (get args 0)
+        opts (or (get args 1) {})
+        iters (or (get opts :iters) 10)
+        edges (edges-of db attr)
+        nodes (nodes-of edges)
+        ; adjacency: node -> vector of neighbours (both directions)
+        adj (reduce (fn [m edge]
+                      (let [a (get edge 0) b (get edge 1)]
+                        (assoc (assoc m a (conj (or (get m a) []) b))
+                               b (conj (or (get m b) []) a))))
+                    {}
+                    edges)
+        ; the most frequent label among a node's neighbours (ties: smallest
+        ; label, so the result is deterministic)
+        majority (fn [labels node]
+                   (let [neigh (or (get adj node) [])]
+                     (if (empty? neigh)
+                       (get labels node)
+                       (let [counts (reduce (fn [c nb]
+                                              (let [l (get labels nb)]
+                                                (assoc c l (+ 1 (or (get c l) 0)))))
+                                            {}
+                                            neigh)
+                             best (reduce (fn [acc entry]
+                                            (let [l (key entry) n (val entry)]
+                                              (cond
+                                                (nil? acc) [l n]
+                                                (> n (get acc 1)) [l n]
+                                                (and (= n (get acc 1)) (< l (get acc 0))) [l n]
+                                                :else acc)))
+                                          nil
+                                          (seq counts))]
+                         (get best 0)))))
+        init (reduce (fn [m n] (assoc m n n)) {} nodes)]
+    (loop [labels init attempt 0]
+      (if (>= attempt iters)
+        (mapv (fn [n] [n (get labels n)]) nodes)
+        (let [next-labels (reduce (fn [m n] (assoc m n (majority labels n))) {} nodes)]
+          (if (= next-labels labels)
+            (mapv (fn [n] [n (get labels n)]) nodes)
+            (recur next-labels (+ attempt 1))))))))
+
 (defn eval-op
   "Dispatch an analytic operator to its implementation, returning a
    sequence of OUTPUT TUPLES the engine unifies against the clause's
    output terms.
 
-   One entry per analytic verb. `similar-to` is wave B; `cluster`,
-   `community`, `components` and `project-2d` join it in wave C, each
-   reading the store and returning `[entity group-or-coord]` tuples the
-   same shape."
+   `similar-to` searches an embedding column; `cluster` and `project-2d`
+   partition/plot it; `community` and `components` group the REFERENCE
+   graph by connection. Each returns `[entity value…]` tuples the engine
+   unifies against the clause's output terms."
   [db bindings op arg-terms]
   (let [args (mapv (fn [t] (resolve-arg bindings t)) arg-terms)]
     (cond
       (= op 'similar-to) (similar-to db args)
+      (= op 'cluster) (cluster-op db args)
+      (= op 'project-2d) (project-2d-op db args)
+      (= op 'community) (community-op db args)
+      (= op 'components) (components-op db args)
       :else (throw (ex-info (str "unknown analytic operator: " op) {:op op})))))
