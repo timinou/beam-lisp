@@ -450,35 +450,84 @@
   ; worst place for a schema to disagree with itself.
   (with-writer conn (fn [] (install-schema-in-writer conn defs))))
 
+(defn sync-schema!
+  "Update the connection's in-memory schema MAP (and any newly-demanded
+   index) to reflect `defs`, WITHOUT writing schema datoms.
+
+   For a caller that already wrote the schema deltas as datoms in its own
+   transaction — `datom.migrate/apply!` folds them into one atomic commit
+   with the migration's data changes, so the schema change and the data
+   change it guards can never be half-applied. This brings the live
+   connection's read path in line with those already-durable datoms.
+
+   Idempotent and safe to call after a crash-resume: it only installs
+   into the map, and a reopened connection recovers the same map from the
+   datoms regardless."
+  [conn defs]
+  (with-writer conn (fn [] (sync-schema-map-in-writer conn defs))))
+
+(defn- backfill-newly-indexed!
+  "Write the EXISTING datoms of any attribute that just gained an index
+   into that index. Given the schema BEFORE and AFTER a change, plus the
+   defs that changed.
+
+   An attribute that gains an index must have its existing datoms written
+   into it, or the index is half-built: the new datoms are there and the
+   old ones are not.
+
+   That is not merely incomplete, it is WRONG, because the query planner
+   trusts the index. A range predicate on a newly-indexed attribute read
+   the bounded AVET window and silently missed every value written before
+   the index existed — a correct-looking answer with rows quietly absent."
+  [store before after basis defs]
+  (let [newly-indexed (filterv (fn [d]
+                                 (let [a (get d :db/ident)]
+                                   (and (datom.schema/indexed? after a)
+                                        (not (datom.schema/indexed? before a)))))
+                               defs)]
+    (doseq [d newly-indexed]
+      (let [a (get d :db/ident)
+            ; Only datoms that are CURRENTLY TRUE get re-indexed — read
+            ; through a db value so basis and retraction filtering apply.
+            ; A raw store scan returns tombstoned assertions too (a
+            ; retraction APPENDS, it does not delete), so backfilling from
+            ; one would resurrect a value the same transaction retracted:
+            ; the exact corruption a migration that retracts-then-indexes
+            ; in one commit would hit, its retraction silently undone by
+            ; the index build that follows.
+            current (datom.db/datoms (datom.db/db-value store after basis) :aevt a)]
+        (if (seq current)
+          (datom.store/-commit
+            store
+            (into [] (mapcat (fn [dt] (datom.index/put-ops after dt)) current)))
+          nil)))))
+
+(defn- sync-schema-map-in-writer
+  "Bring the connection's in-memory schema MAP up to date with `defs`,
+   and backfill any index they newly demand — WITHOUT writing any schema
+   datoms.
+
+   The counterpart to `install-schema!` for a caller that has ALREADY
+   written the schema deltas as datoms itself (as `datom.migrate/apply!`
+   does, folding them into one atomic transaction with the migration's
+   data changes). Those datoms are the durable record; this only updates
+   the map that reads consult and the indexes those datoms belong in.
+
+   Crash safety does not depend on this running: `connect-with` recovers
+   the map from the schema datoms on reopen. This keeps a LIVE connection
+   current so the next read enforces the new cardinality or uniqueness."
+  [conn defs]
+  (let [before (deref (:schema conn))]
+    (swap! (:schema conn) (fn [cur] (datom.schema/install-all cur defs)))
+    (backfill-newly-indexed! (:store conn) before (deref (:schema conn)) (deref (:basis conn)) defs)
+    conn))
+
 (defn- install-schema-in-writer
   "The body of `install-schema!`, already inside the writer process."
   [conn defs]
   (let [before (deref (:schema conn))]
     (swap! (:schema conn) (fn [cur] (datom.schema/install-all cur defs)))
-    ; BACKFILL. An attribute that gains an index must have its EXISTING
-    ; datoms written into it, or the index is half-built: the new datoms
-    ; are there and the old ones are not.
-    ;
-    ; That is not merely incomplete, it is WRONG, because the query
-    ; planner trusts the index. A range predicate on a newly-indexed
-    ; attribute read the bounded AVET window and silently missed every
-    ; value written before the index existed — a correct-looking answer
-    ; with rows quietly absent.
-    (let [after (deref (:schema conn))
-          newly-indexed (filterv (fn [d]
-                                   (let [a (get d :db/ident)]
-                                     (and (datom.schema/indexed? after a)
-                                          (not (datom.schema/indexed? before a)))))
-                                 defs)]
-      (doseq [d newly-indexed]
-        (let [a (get d :db/ident)
-              existing (filterv datom.index/assertion?
-                                (datom.index/scan (:store conn) :aevt a))]
-          (if (seq existing)
-            (datom.store/-commit
-              (:store conn)
-              (into [] (mapcat (fn [dt] (datom.index/put-ops after dt)) existing)))
-            nil)))))
+    (backfill-newly-indexed! (:store conn) before (deref (:schema conn)) (deref (:basis conn)) defs))
   (if (empty? defs)
     conn
     (do (transact! conn (into [] (mapcat (fn [d]

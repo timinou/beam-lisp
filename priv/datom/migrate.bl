@@ -1,0 +1,398 @@
+; datom/migrate.bl — schema evolution you can trust against real data.
+;
+; ── The problem migrations actually solve ─────────────────────────────
+;
+; Growing a schema is safe: a new attribute breaks nothing, because no
+; existing datom mentions it. The dangerous changes are the ones that
+; TIGHTEN an invariant — "email is now unique", "role is now single-
+; valued". Whether such a change is safe is not a fact about the schema;
+; it is a fact about the DATA. Email-is-unique is fine on a database where
+; emails happen to be unique and a corruption waiting to happen on one
+; where they are not.
+;
+; And here is the twist that makes this hard: the database that decides is
+; PRODUCTION, whose data shapes your laptop has never seen. A migration
+; that passes every local test can still be a breaking change against the
+; one database that matters.
+;
+; ── What this namespace gives you ─────────────────────────────────────
+;
+; A migration is ONE value carrying everything a change needs:
+;
+;   {:migration/id     :2026-08-26-unique-email   ; ordered, immutable name
+;    :migration/grows  [{:db/ident :person/email  ; the schema delta (data)
+;                        :db/valueType :db.type/string
+;                        :db/unique :db.unique/identity}]
+;    :migration/checks [{:check :unique :attr :person/email}]  ; invariants
+;    :migration/fn     dedup-emails}              ; the remediation (a tx-fn)
+;
+;   plan   — walk ANY database (local or a production replica) and report
+;            every way the migration would BREAK against the data present,
+;            WITHOUT committing anything. This is the deploy gate.
+;   apply! — remediate, re-check, then grow the schema and record the
+;            migration, folding the data transform and the schema change
+;            into ONE atomic transaction.
+;
+; ── Why it rests on `with` and `:db/fn` ───────────────────────────────
+;
+; `plan` previews the WHOLE migration — the remediation fn AND the schema
+; grow — by running it through `datom.conn/with` against a db value.
+; Because a database is a value and `with` mutates nothing, previewing a
+; migration against production is a read, safe to run from anywhere.
+;
+; `apply!` folds the remediation, the schema deltas and the ledger stamp
+; into a single `transact!` (the remediation rides as a `:db/fn`, the
+; schema deltas as tempid maps that UPSERT on `:db/ident`). So a crash can
+; never leave data fixed but schema unrecorded: either the whole migration
+; committed or none of it did. The in-memory schema map is synced after,
+; from those same durable datoms.
+;
+; ── The ledger is a query, not a side table ───────────────────────────
+;
+; Which migrations have run is answered by `[?m :migration/id ?id]`, not
+; by a `schema_migrations` table beside the data. A database whose premise
+; is one uniform store should not keep this record somewhere else — and a
+; query-derived ledger is automatically consistent with the transaction
+; that wrote it, because it IS that transaction's datom.
+
+(ns datom.migrate
+  (:require [datom.conn] [datom.db] [datom.query.engine] [datom.schema]))
+
+;; ── the migration ledger attribute ──────────────────────────────────
+
+(def LEDGER-ATTR
+  "The attribute a recorded migration asserts about itself. Installed on
+   first `apply!`; `:db.unique/identity` so recording the same migration
+   twice UPSERTS rather than duplicating — the datom-level idempotence a
+   crash-resumed migration depends on."
+  {:db/ident :migration/id
+   :db/valueType :db.type/keyword
+   :db/cardinality :db.cardinality/one
+   :db/unique :db.unique/identity})
+
+(defn- ledger-installed?
+  [conn]
+  (datom.schema/known? (datom.conn/schema conn) :migration/id))
+
+(defn- ensure-ledger!
+  "Install the ledger attribute if this connection has never seen it.
+   Idempotent."
+  [conn]
+  (if (ledger-installed? conn)
+    conn
+    (datom.conn/install-schema! conn [LEDGER-ATTR])))
+
+;; ── reading the ledger ──────────────────────────────────────────────
+
+(defn applied-ids
+  "The set of migration ids recorded in `db`."
+  [db]
+  (if (datom.schema/known? (datom.db/schema-of db) :migration/id)
+    (into #{} (mapv (fn [t] (get t 0))
+                    (into [] (datom.query.engine/q
+                               '[:find ?id :where [?m :migration/id ?id]] db))))
+    #{}))
+
+(defn applied?
+  "Whether `migration` is recorded as applied in `db`."
+  [db migration]
+  (contains? (applied-ids db) (get migration :migration/id)))
+
+;; ── invariant checks: violations derived from data, as data ─────────
+;;
+;; Each check is a QUESTION only the data can answer, expressed as a query
+;; over whatever db value it is handed. A check returns a vector of
+;; violation maps — empty means the invariant already holds.
+
+(defn- rows-e-v
+  "Every `[entity value]` pair for `attr` in `db`."
+  [db attr]
+  (into [] (datom.query.engine/q [:find '?e '?v :where ['?e attr '?v]] db)))
+
+(defn check-unique
+  "Violations of a uniqueness invariant on `attr`: any value held by more
+   than one entity."
+  [db attr]
+  (let [by-v (group-by (fn [t] (get t 1)) (rows-e-v db attr))]
+    (filterv some?
+      (mapv (fn [entry]
+              (let [grp (val entry)]
+                (if (> (count grp) 1)
+                  {:check :unique :attr attr :value (key entry)
+                   :entities (mapv (fn [t] (get t 0)) grp)}
+                  nil)))
+            (seq by-v)))))
+
+(defn check-cardinality-one
+  "Violations of a cardinality-one invariant on `attr`: any entity holding
+   more than one value."
+  [db attr]
+  (let [by-e (group-by (fn [t] (get t 0)) (rows-e-v db attr))]
+    (filterv some?
+      (mapv (fn [entry]
+              (let [grp (val entry)]
+                (if (> (count grp) 1)
+                  {:check :cardinality-one :attr attr :entity (key entry)
+                   :values (mapv (fn [t] (get t 1)) grp)}
+                  nil)))
+            (seq by-e)))))
+
+(defn- run-check
+  "Run one check spec against `db`, returning its violations."
+  [db spec]
+  (let [kind (get spec :check) attr (get spec :attr)]
+    (cond
+      (= kind :unique) (check-unique db attr)
+      (= kind :cardinality-one) (check-cardinality-one db attr)
+      :else (throw (ex-info "unknown migration check" {:check spec})))))
+
+(defn- check-all
+  "Every violation of `migration`'s checks against `db`, flattened."
+  [db migration]
+  (into [] (mapcat (fn [spec] (run-check db spec))
+                   (get migration :migration/checks []))))
+
+;; ── remediation ─────────────────────────────────────────────────────
+
+;; The remediation HELPERS: pure functions of a db value that return the
+;; retractions which make a tightening invariant true. A migration's
+;; `:migration/fn` is typically built from these — they are the corrective
+;; counterpart of the checks above.
+
+(defn dedup-unique
+  "Retract a duplicated `attr` value from every entity but the first that
+   holds it, so the value becomes unique. The corrective for
+   `check-unique`."
+  [db attr]
+  (into []
+    (mapcat (fn [v]
+              (mapv (fn [e] [:db/retract e attr (get v :value)])
+                    (rest (get v :entities))))
+            (check-unique db attr))))
+
+(defn collapse-cardinality-one
+  "Retract all but the first value of `attr` on any entity holding
+   several, so the attribute becomes single-valued. The corrective for
+   `check-cardinality-one`."
+  [db attr]
+  (into []
+    (mapcat (fn [v]
+              (mapv (fn [each] [:db/retract (get v :entity) attr each])
+                    (rest (get v :values))))
+            (check-cardinality-one db attr))))
+
+
+(defn- remediation-tx-data
+  "The migration's remediation as transaction data: its `:migration/fn`
+   applied to `db`, or `[]` when it has none.
+
+   The fn is a tx-fn (`(fn [db] -> tx-data)`), so this is exactly what
+   `[:db/fn f]` would splice — computed here directly so `plan` can
+   preview it and `apply!` can fold it in."
+  [db migration]
+  (let [f (get migration :migration/fn)]
+    (if (some? f) (into [] (f db)) [])))
+
+;; ── the deltas that GROW the schema, as one transaction ─────────────
+
+(defn- grow-tx-data
+  "The migration's schema deltas as tempid maps that UPSERT on
+   `:db/ident`. Written this way they land in the SAME transaction as the
+   remediation and the ledger stamp, and re-running is a no-op at the
+   datom level rather than a second attribute entity.
+
+   Each definition gets a DISTINCT tempid: they are different attribute
+   entities, and sharing one tempid across two `:db.unique/identity`
+   idents makes the resolver try to unify them onto one entity — a
+   genuine error, since one entity cannot be both `:person/email` and
+   `:person/role`. Tempids here start below -1 (the migration's own stamp
+   uses -2, so these start at -10) to stay clear of any tempid a caller's
+   remediation fn might have used."
+  [migration]
+  (let [defs (get migration :migration/grows [])]
+    (into []
+      (map-indexed (fn [i definition] (assoc definition :db/id (- 0 (+ 10 i))))
+                   defs))))
+
+(defn- migration-tx-data
+  "The full transaction a migration commits: remediation, then schema
+   grow, then the ledger stamp — in that order, as one atomic unit.
+
+   Order matters: the remediation must make an invariant TRUE before the
+   grow that enforces it lands, and both must precede recording that the
+   migration ran. `transact!` applies the ops as one commit regardless,
+   but the order is what makes the intermediate state within the
+   transaction consistent."
+  [db migration]
+  (into (into (remediation-tx-data db migration)
+              (grow-tx-data migration))
+        [{:db/id -2 :migration/id (get migration :migration/id)}]))
+
+;; ── plan: the deploy gate ───────────────────────────────────────────
+
+(defn plan
+  "Walk `db` and report how `migration` would behave against the data
+   actually present, WITHOUT committing anything.
+
+   Returns a report map:
+
+     :id          the migration id
+     :status      :clean | :breaking | :already-applied
+     :breaking    invariant violations present in `db` (empty on :clean)
+     :remediated  the remediation tx-data the migration's fn would run
+     :would-tx    the full transaction `apply!` would commit
+
+   `plan` takes a DB VALUE, not a connection, precisely so it can run
+   against a read-only production replica opened from anywhere. It reports
+   the breakage PRESENT in the data — the shapes that make the migration
+   dangerous, named down to the offending entities. This is the deploy
+   gate: run it against production in CI and a migration that would break
+   is a non-zero exit before anything is deployed.
+
+   The violations here are checked against `db` as it stands. To see what
+   remains AFTER the migration's remediation fn runs — the exact residual
+   `apply!` gates on — use `plan-with` against a live connection, which
+   previews the remediation through `with`. `plan` answers 'is there
+   anything to remediate?'; `plan-with` answers 'does the remediation
+   fully handle it?'. Both commit nothing."
+  [db migration]
+  (if (applied? db migration)
+    {:id (get migration :migration/id) :status :already-applied
+     :breaking [] :remediated [] :would-tx []}
+    (let [violations (check-all db migration)]
+      {:id (get migration :migration/id)
+       :status (if (seq violations) :breaking :clean)
+       :breaking violations
+       :remediated (remediation-tx-data db migration)
+       :would-tx (migration-tx-data db migration)})))
+
+;; ── plan-with: the EXACT preview, through a live connection ─────────
+
+(defn plan-with
+  "Like `plan`, but previews the migration through `datom.conn/with` on a
+   live `conn`, so the residual invariants are checked against the TRUE
+   speculative result — including remediations that assert, not just
+   retract. Commits nothing.
+
+   Use `plan` for a db value pulled from a replica (the common CI case:
+   'is this migration safe against prod?'). Use `plan-with` when you have
+   a live connection and want the remediation's full effect — asserts and
+   all — reflected exactly."
+  [conn migration]
+  (let [db (datom.conn/db conn)]
+    (if (applied? db migration)
+      {:id (get migration :migration/id) :status :already-applied
+       :breaking [] :remediated [] :would-tx []}
+      (let [remediated (remediation-tx-data db migration)
+            ; Speculatively apply ONLY the remediation, then check the
+            ; invariants on the resulting db-after. This is exact: the
+            ; residual violations are precisely what would remain after
+            ; the fn runs, whatever shape its output takes.
+            spec (if (seq remediated)
+                   (get (datom.conn/with conn remediated) :db-after)
+                   db)
+            residual (check-all spec migration)]
+        {:id (get migration :migration/id)
+         :status (if (seq residual) :breaking :clean)
+         :breaking residual
+         :remediated remediated
+         :would-tx (migration-tx-data db migration)}))))
+
+;; ── apply!: gated, atomic, idempotent ───────────────────────────────
+
+(defn apply!
+  "Apply `migration` to `conn`. Returns a report.
+
+     1. skip if already applied (idempotent, ordered resume)
+     2. preview through `with`: if remediation leaves any invariant still
+        broken, REFUSE — commit nothing, return :blocked with the residual
+        violations (the migration author's data assumptions were wrong)
+     3. otherwise commit remediation + schema grow + ledger stamp as ONE
+        transaction, then sync the in-memory schema map from those datoms
+
+   The gate in step 2 is what makes a broken migration a returned value
+   rather than a corrupt database: enforcing `:db/unique` on data that
+   still has duplicates would either error deep in the transaction or, on
+   a store that does not check, silently accept a schema its data
+   violates. Better to refuse, with the offending entities named."
+  [conn migration]
+  (ensure-ledger! conn)
+  (let [preview (plan-with conn migration)]
+    (cond
+      (= (get preview :status) :already-applied)
+        {:id (get migration :migration/id) :status :already-applied}
+      (= (get preview :status) :breaking)
+        {:id (get migration :migration/id) :status :blocked
+         :breaking (get preview :breaking)
+         :remediated (get preview :remediated)}
+      :else
+        (let [db (datom.conn/db conn)
+              report (datom.conn/transact! conn (migration-tx-data db migration))]
+          ; The schema deltas are now durable datoms. Bring the live
+          ; connection's read path in line with them (map + any new
+          ; index), from those same datoms — no new writes.
+          (datom.conn/sync-schema! conn (get migration :migration/grows []))
+          {:id (get migration :migration/id) :status :applied
+           :remediated (remediation-tx-data db migration)
+           :tx (get report :tx)}))))
+
+;; ── running a set of migrations, in order ───────────────────────────
+
+(defn apply-all!
+  "Apply `migrations` to `conn` in order, stopping at the first that is
+   :blocked. Returns a vector of per-migration reports.
+
+   Each migration is its own transaction (they are individually named,
+   ordered and idempotent), so a stop is a clean resume point: fix the
+   blocked migration's data assumption and re-run — the applied ones are
+   skipped."
+  [conn migrations]
+  (loop [pending migrations acc []]
+    (if (empty? pending)
+      acc
+      (let [report (apply! conn (first pending))]
+        (if (= (get report :status) :blocked)
+          (conj acc report)
+          (recur (rest pending) (conj acc report)))))))
+
+;; ── batched remediation, for migrations too large for one commit ────
+
+(defn apply-batched!
+  "Apply a migration whose remediation is too large for a single
+   transaction, in BATCHES that each commit and yield the writer.
+
+   `batch-fn` is `(fn [db] -> [tx-data more?])`: it returns the next
+   chunk of remediation tx-data and whether more remains. Called
+   repeatedly until `more?` is false, each chunk its own transaction, so
+   normal traffic interleaves between batches rather than waiting for the
+   whole migration. The schema grow and ledger stamp commit LAST, once the
+   data conforms.
+
+   This trades whole-migration atomicity for online applicability — the
+   standard tradeoff. Because the ledger stamp is last, a crash mid-
+   remediation leaves the migration UNRECORDED, so a resume re-runs it;
+   the remediation must therefore be idempotent (retractions are)."
+  [conn migration batch-fn]
+  (ensure-ledger! conn)
+  (if (applied? (datom.conn/db conn) migration)
+    {:id (get migration :migration/id) :status :already-applied}
+    (do
+      (loop []
+        (let [result (batch-fn (datom.conn/db conn))
+              tx-data (get result 0)
+              more? (get result 1)]
+          (if (seq tx-data)
+            (datom.conn/transact! conn tx-data)
+            nil)
+          (if more? (recur) nil)))
+      ; data now conforms — check, then grow + stamp atomically
+      (let [preview (plan-with conn migration)]
+        (if (= (get preview :status) :breaking)
+          {:id (get migration :migration/id) :status :blocked
+           :breaking (get preview :breaking)}
+          (let [db (datom.conn/db conn)]
+            (datom.conn/transact! conn
+              (into (grow-tx-data migration)
+                    [{:db/id -2 :migration/id (get migration :migration/id)}]))
+            (datom.conn/sync-schema! conn (get migration :migration/grows []))
+            {:id (get migration :migration/id) :status :applied}))))))

@@ -1,0 +1,212 @@
+; test/bl/datom/migrate_test.bl — the migration system, end to end.
+; Run: mix beam_lisp.test test/bl/datom/migrate_test.bl
+;
+; Contracts under test:
+;   plan     — reports breakage present in a db value; commits nothing
+;   plan-with— reports the RESIDUAL after remediation, via with; nothing
+;   apply!   — gated (blocks when remediation is insufficient), atomic
+;              (remediation + grow + stamp in one tx), idempotent
+;   ledger   — applied set is query-derived
+;   post-grow enforcement actually bites (identity upserts, value rejects)
+;   apply-all! stops at the first blocked
+;   apply-batched! applies a large remediation in chunks
+
+(ns datom.migrate.test
+  (:require [datom] [datom.conn] [datom.db] [datom.migrate] [datom.schema]))
+
+;; ── two databases, same schema, different data ──────────────────────
+;;
+;; local is clean; prod carries shapes local never had (a duplicated email
+;; and a person with two roles).
+
+(def base-schema
+  [{:db/ident :person/name :db/valueType :db.type/string}
+   {:db/ident :person/email :db/valueType :db.type/string}
+   {:db/ident :person/role :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many}])
+
+(defn- local-conn []
+  (let [c (datom/connect base-schema)]
+    (datom/transact! c
+      [{:db/id -1 :person/name "Ada"   :person/email "ada@x"   :person/role :admin}
+       {:db/id -2 :person/name "Grace" :person/email "grace@x" :person/role :user}])
+    c))
+
+(defn- prod-conn []
+  (let [c (datom/connect base-schema)]
+    (datom/transact! c
+      [{:db/id -1 :person/name "Ada"    :person/email "ada@x"    :person/role :admin}
+       {:db/id -2 :person/name "Grace"  :person/email "grace@x"  :person/role :user}
+       {:db/id -3 :person/name "Alan"   :person/email "dup@x"    :person/role :user}
+       {:db/id -4 :person/name "Edsger" :person/email "dup@x"    :person/role [:user :admin]}])
+    c))
+
+(defn- tighten-migration []
+  {:migration/id :tighten-identity
+   :migration/grows
+     [{:db/ident :person/email :db/valueType :db.type/string
+       :db/unique :db.unique/identity}
+      {:db/ident :person/role :db/valueType :db.type/keyword
+       :db/cardinality :db.cardinality/one}]
+   :migration/checks
+     [{:check :unique :attr :person/email}
+      {:check :cardinality-one :attr :person/role}]
+   :migration/fn
+     (fn [db]
+       (into (datom.migrate/dedup-unique db :person/email)
+             (datom.migrate/collapse-cardinality-one db :person/role)))})
+
+;; ── plan: breakage is a fact about the data ─────────────────────────
+
+(deftest plan-is-clean-on-conforming-data
+  (let [c (local-conn)
+        r (datom.migrate/plan (datom/db c) (tighten-migration))]
+    (is (= :clean (get r :status)))
+    (is (= [] (get r :breaking)))))
+
+(deftest plan-reports-breakage-with-offending-entities
+  (let [c (prod-conn)
+        r (datom.migrate/plan (datom/db c) (tighten-migration))]
+    (is (= :breaking (get r :status)))
+    ; two violations: the duplicate email and the double role
+    (is (= 2 (count (get r :breaking))))))
+
+(deftest plan-commits-nothing
+  (let [c (prod-conn)
+        before (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db c)))]
+    (datom.migrate/plan (datom/db c) (tighten-migration))
+    (is (= before (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db c)))))))
+
+;; ── plan-with: the residual AFTER remediation ───────────────────────
+
+(deftest plan-with-clears-after-remediation
+  ; prod HAS breakage, but the migration's fn fully remediates it, so the
+  ; residual through `with` is clean.
+  (let [c (prod-conn)
+        r (datom.migrate/plan-with c (tighten-migration))]
+    (is (= :clean (get r :status)))
+    (is (< 0 (count (get r :remediated))))))
+
+(deftest plan-with-blocks-when-remediation-insufficient
+  ; a migration that CHECKS uniqueness but whose fn does nothing: the
+  ; residual is still broken.
+  (let [c (prod-conn)
+        m {:migration/id :bad-tighten
+           :migration/grows [{:db/ident :person/email :db/valueType :db.type/string
+                              :db/unique :db.unique/identity}]
+           :migration/checks [{:check :unique :attr :person/email}]
+           :migration/fn (fn [db] [])}
+        r (datom.migrate/plan-with c m)]
+    (is (= :breaking (get r :status)))))
+
+;; ── apply!: gated, atomic, idempotent ───────────────────────────────
+
+(deftest apply-on-clean-data-succeeds
+  (let [c (local-conn)
+        r (datom.migrate/apply! c (tighten-migration))]
+    (is (= :applied (get r :status)))
+    (is (contains? (datom.migrate/applied-ids (datom/db c)) :tighten-identity))))
+
+(deftest apply-remediates-then-grows
+  (let [c (prod-conn)
+        r (datom.migrate/apply! c (tighten-migration))]
+    (is (= :applied (get r :status)))
+    ; the duplicate is gone
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db c)))))
+    ; and the migration recorded
+    (is (contains? (datom.migrate/applied-ids (datom/db c)) :tighten-identity))))
+
+(deftest apply-is-idempotent
+  (let [c (prod-conn)]
+    (datom.migrate/apply! c (tighten-migration))
+    (let [again (datom.migrate/apply! c (tighten-migration))]
+      (is (= :already-applied (get again :status))))))
+
+(deftest apply-blocks-when-remediation-insufficient
+  (let [c (prod-conn)
+        m {:migration/id :bad-tighten
+           :migration/grows [{:db/ident :person/email :db/valueType :db.type/string
+                              :db/unique :db.unique/identity}]
+           :migration/checks [{:check :unique :attr :person/email}]
+           :migration/fn (fn [db] [])}
+        r (datom.migrate/apply! c m)]
+    (is (= :blocked (get r :status)))
+    ; nothing recorded, schema NOT grown
+    (is (not (contains? (datom.migrate/applied-ids (datom/db c)) :bad-tighten)))
+    (is (nil? (datom.schema/unique (datom.conn/schema c) :person/email)))))
+
+;; ── post-grow enforcement actually bites ────────────────────────────
+
+(deftest after-migration-uniqueness-is-enforced
+  (let [c (prod-conn)]
+    (datom.migrate/apply! c (tighten-migration))
+    ; :db.unique/identity now live: asserting an existing email UPSERTS
+    ; onto the holder rather than creating a second entity.
+    (datom/transact! c [{:db/id -9 :person/email "ada@x" :person/name "Ada2"}])
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :person/email "ada@x"]] (datom/db c)))))))
+
+(deftest after-migration-cardinality-is-enforced
+  (let [c (prod-conn)]
+    (datom.migrate/apply! c (tighten-migration))
+    (let [ada (get (first (datom/q '[:find ?e :where [?e :person/email "ada@x"]] (datom/db c))) 0)]
+      ; role is now cardinality-one: a new assert REPLACES
+      (datom/transact! c [[:db/add ada :person/role :superadmin]])
+      (is (= :superadmin (datom.db/attr-value (datom/db c) ada :person/role))))))
+
+;; ── atomicity: the whole migration is one transaction ───────────────
+
+(deftest migration-commits-as-one-transaction
+  (let [c (prod-conn)
+        r (datom.migrate/apply! c (tighten-migration))
+        tx (get r :tx)]
+    ; the ledger stamp and the remediation share ONE tx id
+    (let [stamp-tx (get (first (datom/q '[:find ?tx :where [?m :migration/id :tighten-identity ?tx]]
+                                 (datom/db c))) 0)]
+      (is (= tx stamp-tx)))))
+
+;; ── apply-all!: ordered, stops at first blocked ─────────────────────
+
+(deftest apply-all-runs-in-order
+  (let [c (local-conn)
+        m1 {:migration/id :m1 :migration/grows [] :migration/checks [] :migration/fn nil}
+        m2 {:migration/id :m2 :migration/grows [] :migration/checks [] :migration/fn nil}
+        reports (datom.migrate/apply-all! c [m1 m2])]
+    (is (= 2 (count reports)))
+    (is (= :applied (get (get reports 0) :status)))
+    (is (= :applied (get (get reports 1) :status)))
+    (is (contains? (datom.migrate/applied-ids (datom/db c)) :m1))
+    (is (contains? (datom.migrate/applied-ids (datom/db c)) :m2))))
+
+(deftest apply-all-stops-at-first-blocked
+  (let [c (prod-conn)
+        blocking {:migration/id :blocker
+                  :migration/grows [{:db/ident :person/email :db/valueType :db.type/string
+                                     :db/unique :db.unique/identity}]
+                  :migration/checks [{:check :unique :attr :person/email}]
+                  :migration/fn (fn [db] [])}
+        after {:migration/id :after :migration/grows [] :migration/checks [] :migration/fn nil}
+        reports (datom.migrate/apply-all! c [blocking after])]
+    ; stopped at the blocker — :after never ran
+    (is (= :blocked (get (get reports 0) :status)))
+    (is (= 1 (count reports)))
+    (is (not (contains? (datom.migrate/applied-ids (datom/db c)) :after)))))
+
+;; ── apply-batched!: large remediation in chunks ─────────────────────
+
+(deftest apply-batched-remediates-in-chunks
+  (let [c (prod-conn)
+        m (tighten-migration)
+        ; a batch-fn that retracts ONE offending email per batch
+        batch-fn (fn [db]
+                   (let [dupes (datom.migrate/check-unique db :person/email)]
+                     (if (empty? dupes)
+                       [[] false]
+                       (let [v (first dupes)
+                             extra (rest (get v :entities))]
+                         (if (empty? extra)
+                           [[] false]
+                           [[[:db/retract (first extra) :person/email (get v :value)]] true])))))
+        r (datom.migrate/apply-batched! c m batch-fn)]
+    (is (= :applied (get r :status)))
+    (is (= 1 (count (datom/q '[:find ?e :where [?e :person/email "dup@x"]] (datom/db c)))))
+    (is (contains? (datom.migrate/applied-ids (datom/db c)) :tighten-identity))))
