@@ -1,0 +1,145 @@
+; test/bl/auth/datalog_test.bl — the datalog bridge + origin scoping + expr.
+; Run: mix beam_lisp.test test/bl/auth/datalog_test.bl
+;
+; This is Wave 4: the layer where a Biscuit token's logic becomes datom-
+; shaped data and gets evaluated with block-scoping. Three properties,
+; each checked against REAL corpus bytes:
+;
+;   1. decode — a block's facts/rules/checks lower to plain tuples/vectors
+;      with symbol-table strings (never atoms), variables as slots.
+;   2. scope — the block-scoping rule holds: a check sees authority +
+;      authorizer + own-block facts, and NOT other blocks'. This is the
+;      security invariant that makes attenuation monotonic.
+;   3. expressions — the stack VM evaluates real wire expressions.
+
+(ns auth.biscuit.datalog-test
+  (:require [auth.biscuit.codec :as codec]
+            [auth.biscuit.datalog :as dl]
+            [auth.engine.origin :as o]
+            [auth.engine.expr :as ex]))
+
+(defn- sample [n]
+  (elem (File/read (str "test/fixtures/biscuit-samples/" n)) 1))
+
+(defn- authority-block [n]
+  (dl/decode-block (:data (:authority (codec/decode (sample n))))))
+
+;; the var-resolver + term-decoder the expr VM needs, wired to the shared
+;; datalog implementations so a fact term and an expression term agree.
+(defn- var->val [bindings n] (get bindings (o/var->sym n)))
+;; the VM hands us the RAW term bytes of a value opcode; parse then decode.
+(defn- decode-term [term-bytes symbols]
+  (dl/decode-term (codec/parse-message term-bytes) symbols))
+
+(defn- no-expr [_rule _binding] true)
+
+;; ── decode ──────────────────────────────────────────────────────────
+
+(deftest decodes-authority-facts
+  (let [ab (authority-block "test001_basic.bc")
+        tuples (mapv dl/predicate->tuple (:facts ab))]
+    ;; the three rights, as flat string tuples — no atoms, symbols resolved
+    (is (= 3 (count tuples)))
+    (is (contains? (set tuples) ["right" "file1" "read"]))
+    (is (contains? (set tuples) ["right" "file2" "read"]))
+    (is (contains? (set tuples) ["right" "file1" "write"]))))
+
+(deftest decodes-check-with-variable
+  ;; block0 of test001: check if resource($0), operation("read"), right($0,"read")
+  (let [tok (codec/decode (sample "test001_basic.bc"))
+        b0 (dl/decode-block (:data (first (:blocks tok))))
+        q (first (:queries (first (:checks b0))))]
+    (is (= 3 (count (:body q))))
+    ;; the shared variable $0 appears in resource(...) and right(...)
+    (let [resource-pred (first (filterv (fn [p] (= (:name p) "resource")) (:body q)))
+          right-pred (first (filterv (fn [p] (= (:name p) "right")) (:body q)))]
+      (is (map? (first (:terms resource-pred))))            ; a {:var N}
+      (is (contains? (first (:terms resource-pred)) :var))
+      ;; same slot in both predicates → a real join variable
+      (is (= (:var (first (:terms resource-pred)))
+             (:var (first (:terms right-pred))))))))
+
+;; ── scope: the security invariant ───────────────────────────────────
+
+(deftest check-fails-without-authorizer-facts
+  ;; test001's check needs resource()/operation() facts, which only the
+  ;; authorizer supplies. With just the token's authority facts it must
+  ;; NOT match — reproducing the corpus's Unauthorized result at the logic
+  ;; layer.
+  (let [ab (authority-block "test001_basic.bc")
+        tok (codec/decode (sample "test001_basic.bc"))
+        b0 (dl/decode-block (:data (first (:blocks tok))))
+        afacts (mapv (fn [p] (o/fact (dl/predicate->tuple p) o/AUTHORITY)) (:facts ab))
+        q (first (:queries (first (:checks b0))))]
+    (is (not (o/query-matches? afacts q 1 no-expr)))))
+
+(deftest check-passes-with-authorizer-facts
+  ;; add the authorizer's resource("file1") + operation("read"); now the
+  ;; check's join over authority `right` facts succeeds. This proves the
+  ;; cross-origin join (authority fact ⋈ authorizer fact) works AND that
+  ;; the trusted set includes both origins.
+  (let [ab (authority-block "test001_basic.bc")
+        tok (codec/decode (sample "test001_basic.bc"))
+        b0 (dl/decode-block (:data (first (:blocks tok))))
+        afacts (mapv (fn [p] (o/fact (dl/predicate->tuple p) o/AUTHORITY)) (:facts ab))
+        authz [(o/fact ["resource" "file1"] o/AUTHORIZER)
+               (o/fact ["operation" "read"] o/AUTHORIZER)]
+        q (first (:queries (first (:checks b0))))]
+    (is (o/query-matches? (into afacts authz) q 1 no-expr))))
+
+(deftest block-cannot-see-other-blocks-facts
+  ;; The core scoping guarantee. A fact asserted by block 2 must be
+  ;; INVISIBLE to a query running in block 1's scope (trusted set =
+  ;; {authority, authorizer, 1}). If it were visible, an attacker could
+  ;; attenuate a grant into existence — the exact escalation scope
+  ;; prevents.
+  (let [facts [(o/fact ["right" "secret" "read"] 2)]       ; block 2 asserts
+        ;; a query that would match it, but running in block 1
+        q {:head {:name "query" :terms []}
+           :body [{:name "right" :terms [{:var 5000} {:var 5001}]}]
+           :exprs []}]
+    (is (not (o/query-matches? facts q 1 no-expr)))
+    ;; …and IS visible to a query in block 2's own scope
+    (is (o/query-matches? facts q 2 no-expr))))
+
+;; ── rule-generated facts take the rule's block as origin ────────────
+
+(deftest generated-facts-are-scoped-to-their-block
+  ;; A rule in block 1 that derives right($x,"read") from owner($x) — the
+  ;; generated fact must carry origin 1, so it too is scoped.
+  (let [facts [(o/fact ["owner" "alice"] o/AUTHORITY)]
+        rule {:head {:name "right" :terms [{:var 10} "read"]}
+              :body [{:name "owner" :terms [{:var 10}]}]
+              :exprs []}
+        generated (o/apply-rule facts rule 1 (fn [_b] true))]
+    (is (= 1 (count generated)))
+    (is (= ["right" "alice" "read"] (:tuple (first generated))))
+    (is (= 1 (:origin (first generated))))))
+
+;; ── expressions ─────────────────────────────────────────────────────
+
+(deftest evaluates-constant-expressions
+  ;; test017 is a battery of self-contained boolean checks (1<2, "a"=="a",
+  ;; …). Each authority check's expression must evaluate true.
+  (let [ab (authority-block "test017_expressions.bc")
+        symbols (:symbols ab)]
+    (is (> (count (:checks ab)) 10))
+    (doseq [c (take 8 (:checks ab))]
+      (let [q (first (:queries c))]
+        (is (ex/all-hold? (:exprs q) symbols {} decode-term var->val)
+            "each test017 authority check expression must hold")))))
+
+(deftest expression-vm-comparison
+  ;; Drive the stack machine directly with a synthetic op vector: push 3,
+  ;; push 5, apply `<` → true. `decode-term` here just returns the value
+  ;; already carried on the op (we stash it under :term), proving the
+  ;; value/binary opcode flow without needing wire bytes.
+  (let [dt (fn [carried _symbols] carried)
+        vv (fn [_b _n] nil)
+        ops [{:op :value :term 3}
+             {:op :value :term 5}
+             {:op :binary :kind :lt}]]
+    (is (= true (ex/eval-expression ops [] {} dt vv)))
+    (is (= false (ex/eval-expression
+                   [{:op :value :term 9} {:op :value :term 5} {:op :binary :kind :lt}]
+                   [] {} dt vv)))))

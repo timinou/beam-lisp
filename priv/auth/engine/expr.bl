@@ -1,0 +1,225 @@
+; auth/engine/expr.bl — Biscuit datalog expressions, a stack VM.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; A Biscuit rule can carry EXPRESSIONS — boolean tests over the variables
+; its body binds, like `$date < 2024-01-01T00:00:00Z` or
+; `$path.starts_with("/public/")`. They are how a check narrows beyond
+; mere predicate matching, and they are what makes `time`-based expiry and
+; path/prefix constraints work.
+;
+; Expressions are compiled, on the wire, to a sequence of opcodes for a
+; STACK machine (reverse-Polish): a value op pushes; a unary op pops one
+; and pushes one; a binary op pops two and pushes one. After running, the
+; stack holds exactly one boolean — the expression's result. This file is
+; that machine.
+;
+; ── Scope ─────────────────────────────────────────────────────────────
+;
+; Covered: the operators the corpus exercises for Ed25519 tokens —
+; comparison (< > <= >= == !=), string tests (starts_with/ends_with/
+; contains/matches/length), arithmetic (+ - * /), boolean (and/or/not),
+; set membership. Closures (used for short-circuiting && / || and for
+; any/all) are a v3.3 feature slated for a later sub-wave; an unknown op
+; fails LOUD rather than silently yielding a wrong boolean, because a
+; misread expression is a security bug.
+
+(ns auth.engine.expr
+  (:require [auth.biscuit.codec :as codec]))
+
+;; ── opcode decoding ─────────────────────────────────────────────────
+;;
+;; Op = oneof { value:1 Term, unary:2 OpUnary, binary:3 OpBinary,
+;;              closure:4 OpClosure }
+;; OpUnary  = { kind:1 enum, ffiName?:2 }
+;; OpBinary = { kind:1 enum, ffiName?:2 }
+;; The kinds are the enums from schema.proto, mapped to keywords here so
+;; the evaluator reads by name rather than by magic number.
+
+(def unary-kinds
+  {0 :negate 1 :parens 2 :length 3 :typeof 4 :ffi})
+
+(def binary-kinds
+  {0 :lt 1 :gt 2 :le 3 :ge 4 :equal 5 :contains 6 :prefix 7 :suffix
+   8 :regex 9 :add 10 :sub 11 :mul 12 :div 13 :and 14 :or
+   15 :intersection 16 :union 17 :bitand 18 :bitor 19 :bitxor
+   20 :not-equal 21 :heq 22 :hne 23 :lazy-and 24 :lazy-or
+   25 :all 26 :any 27 :get 28 :ffi 29 :try-or})
+
+(defn- decode-op
+  "Decode one Op message into a tagged opcode.
+
+   `{:op :value :term <raw-term-bytes>}` for a value (the term is decoded
+   lazily against the block symbols at run time, since a value op may be a
+   variable that only gets its value from the bindings);
+   `{:op :unary :kind kw}` / `{:op :binary :kind kw}` for operations."
+  [bytes]
+  (let [m (codec/parse-message bytes)]
+    (cond
+      (get m 1) {:op :value :term (first (get m 1))}
+      (get m 2) {:op :unary
+                 :kind (get unary-kinds
+                            (or (first (get (codec/parse-message (first (get m 2))) 1)) 0))}
+      (get m 3) {:op :binary
+                 :kind (get binary-kinds
+                            (or (first (get (codec/parse-message (first (get m 3))) 1)) 0))}
+      (get m 4) {:op :closure :raw (first (get m 4))}
+      :else (throw (ex-info "unknown expression op" {:fields (keys m)})))))
+
+(defn decode-expression
+  "Decode an Expression message (repeated Op = field 1) into an opcode
+   vector, in evaluation order."
+  [bytes]
+  (let [m (codec/parse-message bytes)]
+    (mapv decode-op (or (get m 1) []))))
+
+;; ── value resolution ────────────────────────────────────────────────
+
+(defn- resolve-value
+  "The runtime value of a `:value` opcode's term under `bindings`.
+
+   A variable term resolves through the bindings (it must be bound, having
+   appeared in a body predicate); any other term is its literal decoded
+   value. `symbols` resolves string indices, `var->val` maps a variable
+   slot to its bound value."
+  [term-bytes symbols bindings decode-term var->val]
+  (let [t (decode-term term-bytes symbols)]
+    (if (and (map? t) (contains? t :var))
+      (var->val bindings (:var t))
+      t)))
+
+;; ── the operations ──────────────────────────────────────────────────
+
+(defn- str-contains?
+  "Whether `hay` contains `needle` as a substring."
+  [hay needle]
+  (String/contains? hay needle))
+
+(defn- set-intersection
+  "The intersection of two beam-lisp sets, as a set. Implemented directly
+   (filter members of one that the other holds) because the runtime has no
+   built-in set-algebra namespace and the corpus's sets are small."
+  [a b]
+  (set (filterv (fn [x] (contains? b x)) (Enum/to_list a))))
+
+(defn- set-union
+  "The union of two beam-lisp sets, as a set."
+  [a b]
+  (reduce (fn [s x] (conj s x)) a (Enum/to_list b)))
+
+(defn- apply-unary
+  "Apply a unary op to the top-of-stack value."
+  [kind x]
+  (cond
+    (= kind :negate) (not x)
+    (= kind :parens) x
+    (= kind :length) (cond (binary? x) (erlang/byte_size x)
+                           (string? x) (String/length x)
+                           (vector? x) (count x)
+                           :else (throw (ex-info "length on unsupported type" {:x x})))
+    :else (throw (ex-info "unsupported unary op" {:kind kind}))))
+
+(defn- as-set
+  "A set-typed value as a beam-lisp set, for set operations."
+  [x]
+  (cond (set? x) x
+        (and (map? x) (contains? x :set)) (set (:set x))
+        :else (throw (ex-info "expected a set" {:x x}))))
+
+(defn- apply-binary
+  "Apply a binary op to the two values popped from the stack.
+
+   `a` is the deeper value (pushed first), `b` the top — matching the
+   spec's pop order, so `a < b` reads as written. Comparison and equality
+   cover the integer/string/date cases the corpus uses; string ops cover
+   prefix/suffix/substring/regex; set membership covers `contains` on a
+   set."
+  [kind a b]
+  (cond
+    (= kind :lt) (< a b)
+    (= kind :gt) (> a b)
+    (= kind :le) (<= a b)
+    (= kind :ge) (>= a b)
+    (= kind :equal) (= a b)
+    (= kind :not-equal) (not (= a b))
+    (= kind :heq) (= a b)
+    (= kind :hne) (not (= a b))
+    (= kind :and) (and a b)
+    (= kind :or) (or a b)
+    (= kind :add) (if (string? a) (str a b) (+ a b))
+    (= kind :sub) (- a b)
+    (= kind :mul) (* a b)
+    (= kind :div) (erlang/div a b)
+    (= kind :prefix) (String/starts_with? a b)
+    (= kind :suffix) (String/ends_with? a b)
+    (= kind :regex) (regex-match? a b)
+    (= kind :contains) (if (or (set? a) (and (map? a) (contains? a :set)))
+                         (contains? (as-set a) b)
+                         (str-contains? a b))
+    (= kind :intersection) (set-intersection (as-set a) (as-set b))
+    (= kind :union) (set-union (as-set a) (as-set b))
+    :else (throw (ex-info "unsupported binary op" {:kind kind}))))
+
+(defn- regex-match?
+  "Whether string `s` matches the (Rust-regex-style) pattern `re`.
+
+   Biscuit's `.matches()` is an unanchored search. Erlang's `:re` uses a
+   compatible enough syntax for the corpus's simple patterns; a pattern
+   that fails to compile is a malformed expression and raises."
+  [s re]
+  (let [result (re/run s re (list (tuple :capture :none)))]
+    (= result :match)))
+
+;; ── the machine ─────────────────────────────────────────────────────
+
+(defn eval-expression
+  "Run a decoded opcode vector, returning its single result value.
+
+   Straight stack machine: values push, unary ops pop-1-push-1, binary
+   ops pop-2-push-1. The spec guarantees a well-formed expression leaves
+   exactly one value on the stack; a stack that is empty when an op needs
+   an argument, or that ends with more than one value, is a malformed
+   expression and raises rather than guessing.
+
+   `symbols`, `decode-term`, and `var->val` are threaded so a `:value`
+   opcode can resolve a variable to its bound value; `bindings` is the
+   current row of variable values from the rule body."
+  [ops symbols bindings decode-term var->val]
+  (let [final
+        (reduce
+          (fn [stack op]
+            (cond
+              (= (:op op) :value)
+                (cons (resolve-value (:term op) symbols bindings decode-term var->val)
+                      stack)
+              (= (:op op) :unary)
+                (let [x (first stack)]
+                  (cons (apply-unary (:kind op) x) (rest stack)))
+              (= (:op op) :binary)
+                (let [b (first stack)
+                      a (second stack)]
+                  (cons (apply-binary (:kind op) a b) (rest (rest stack))))
+              (= (:op op) :closure)
+                (throw (ex-info "closures not yet supported" {:op op}))
+              :else (throw (ex-info "unknown opcode" {:op op}))))
+          '()
+          ops)]
+    (if (= 1 (count final))
+      (first final)
+      (throw (ex-info "expression did not reduce to a single value"
+                      {:stack-size (count final)})))))
+
+(defn all-hold?
+  "Whether EVERY expression in `raw-exprs` evaluates to true under
+   `bindings`.
+
+   A rule's expressions are conjunctive: all must hold for the rule to
+   apply to a binding. An expression that returns a non-boolean is treated
+   as a malformed rule (the spec requires the final value be boolean), so
+   only an explicit true passes — a defensive default that fails closed."
+  [raw-exprs symbols bindings decode-term var->val]
+  (every? (fn [raw]
+            (let [ops (decode-expression raw)
+                  result (eval-expression ops symbols bindings decode-term var->val)]
+              (= result true)))
+          raw-exprs))

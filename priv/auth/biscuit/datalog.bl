@@ -1,0 +1,195 @@
+; auth/biscuit/datalog.bl — Biscuit datalog ⇄ datom-shaped clauses.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; A Biscuit block carries its authorization logic as protobuf: facts,
+; rules, and checks whose predicate names and string values are INDICES
+; into a symbol table. This file turns those wire structures into plain
+; beam-lisp data the authorizer can evaluate — predicates as vectors,
+; terms as strings/ints/variables — reusing the exact fact SHAPE datom's
+; own datalog uses so one engine can serve both.
+;
+; It is the bridge in the "one datalog" thesis: the token's `check if …`
+; and a datom RLS `:where` clause must be the SAME kind of value, and this
+; is where a token's wire form is lowered to that value.
+;
+; ── The atom discipline is the whole point here ──────────────────────
+;
+; Symbol indices in a HOSTILE token are attacker-controlled. A predicate
+; name or string value is resolved to a beam-lisp STRING, never an atom —
+; so a token full of junk symbols costs GC-able strings, never permanent
+; atoms (trust-boundary.md). Interning to a keyword happens later and
+; only at bounded sites, when a name is matched against a KNOWN predicate.
+;
+; ── Representation ────────────────────────────────────────────────────
+;
+; A decoded predicate is `{:name "right" :terms [<term> …]}`.
+; A term is one of:
+;   {:var N}            a variable (symbol index; stays numeric — a
+;                       variable's identity is its slot, not a name)
+;   "a string"          a string value (resolved through the symbol table)
+;   42                  an integer
+;   {:bytes <bin>}      a byte array
+;   {:date N}           a date (unix seconds)
+;   true / false        a boolean
+;   {:set [<term> …]}   a set
+;   :null               the null value
+; This mirrors datom term values closely enough that the authorizer's
+; unification (which reuses datom.query.engine/unify-term) treats a
+; resolved string or int exactly as datom does.
+
+(ns auth.biscuit.datalog
+  (:require [auth.biscuit.codec :as codec]))
+
+;; ── the default symbol table ────────────────────────────────────────
+;;
+;; Indices 0–1023 are RESERVED for these fixed default symbols (only the
+;; first 28 are defined); a token's own symbols begin at index 1024. This
+;; table is part of the wire contract — a fact `right(0,"read")` means
+;; `right` because index 4 is "right" here, so the table must match the
+;; spec exactly or every fact decodes to the wrong predicate.
+
+(def default-symbols
+  ["read" "write" "resource" "operation" "right" "time" "role" "owner"
+   "tenant" "namespace" "user" "team" "service" "admin" "email" "group"
+   "member" "ip_address" "client" "client_ip" "domain" "path" "version"
+   "cluster" "node" "hostname" "nonce" "query"])
+
+(def CUSTOM-BASE 1024)
+
+(defn symbol-lookup
+  "Resolve a symbol INDEX to its string, given a block's own `symbols`.
+
+   Indices below 1024 hit the default table; from 1024 up they index the
+   block's symbol list (offset by 1024). An out-of-range index is a
+   malformed token and fails loudly rather than silently resolving to nil
+   — a wrong predicate name is a security-relevant misparse, not a
+   cosmetic one."
+  [symbols idx]
+  (if (< idx CUSTOM-BASE)
+    (if (< idx (count default-symbols))
+      (nth default-symbols idx)
+      (throw (ex-info "reserved symbol index out of range"
+                      {:index idx :max (count default-symbols)})))
+    (let [local (- idx CUSTOM-BASE)]
+      (if (< local (count symbols))
+        (nth symbols local)
+        (throw (ex-info "custom symbol index out of range"
+                        {:index idx :local local :count (count symbols)}))))))
+
+;; ── term decoding ───────────────────────────────────────────────────
+;;
+;; A Term is a protobuf `oneof` — exactly one field set, identifying the
+;; type. We decode by which field is present.
+
+(defn decode-term
+  "Decode a Term message (already parsed to `{field [val]}`) using
+   `symbols` to resolve string indices.
+
+   Public because the expression VM (auth.engine.expr) resolves value
+   opcodes through the SAME term decoder — one implementation of 'what a
+   wire term means', shared, so a fact term and an expression term can
+   never disagree.
+
+   Variables stay NUMERIC (their identity is the slot); strings resolve
+   through the table; everything else is its literal value. Sets recurse."
+  [m symbols]
+  (let [f (fn [n] (first (get m n)))]
+    (cond
+      (get m 1) {:var (f 1)}
+      (get m 2) (f 2)                                  ; integer
+      (get m 3) (symbol-lookup symbols (f 3))          ; string
+      (get m 4) {:date (f 4)}
+      (get m 5) {:bytes (f 5)}
+      (contains? m 6) (not (= 0 (f 6)))                ; bool
+      (get m 7) {:set (mapv (fn [t] (decode-term (codec/parse-message t) symbols))
+                            (get (codec/parse-message (f 7)) 1))}
+      (contains? m 8) :null
+      :else (throw (ex-info "unknown or empty term" {:fields (keys m)})))))
+
+(defn- decode-predicate
+  "Decode a Predicate message bytes into `{:name <string> :terms […]}`.
+
+   The name is a symbol index resolved to a string (never an atom); terms
+   decode left to right. This is the shared shape a fact, a rule head, and
+   a rule-body predicate all take."
+  [bytes symbols]
+  (let [m (codec/parse-message bytes)
+        name-idx (first (get m 1))
+        term-msgs (or (get m 2) [])]
+    {:name (symbol-lookup symbols name-idx)
+     :terms (mapv (fn [t] (decode-term (codec/parse-message t) symbols)) term-msgs)}))
+
+;; ── fact / rule / check decoding ────────────────────────────────────
+
+(defn- decode-fact
+  "Decode a Fact message (just a wrapped predicate)."
+  [bytes symbols]
+  (decode-predicate (first (get (codec/parse-message bytes) 1)) symbols))
+
+(defn- decode-rule
+  "Decode a Rule into `{:head <pred> :body [<pred>…] :exprs [<raw>…]}`.
+
+   Expressions are kept as RAW op bytes here; `auth.engine.expr` compiles
+   them. Separating decode from expression evaluation keeps this file
+   about STRUCTURE and lets the operator semantics live in one place."
+  [bytes symbols]
+  (let [m (codec/parse-message bytes)
+        head (first (get m 1))
+        body (or (get m 2) [])
+        exprs (or (get m 3) [])]
+    {:head (decode-predicate head symbols)
+     :body (mapv (fn [p] (decode-predicate p symbols)) body)
+     :exprs exprs
+     :symbols symbols}))
+
+(defn- decode-check
+  "Decode a Check into `{:queries [<rule>…] :kind <int>}`.
+
+   A check is a set of queries (rules) plus a Kind (0 One / 1 All /
+   2 Reject). The kind changes how the queries' results are read — One
+   means any query matching passes; Reject inverts — so it is surfaced,
+   not dropped."
+  [bytes symbols]
+  (let [m (codec/parse-message bytes)
+        queries (or (get m 1) [])
+        kind (or (first (get m 2)) 0)]
+    {:queries (mapv (fn [q] (decode-rule q symbols)) queries)
+     :kind kind}))
+
+;; ── the block ───────────────────────────────────────────────────────
+
+(defn decode-block
+  "Decode a block's raw Datalog bytes into `{:symbols :facts :rules
+   :checks :version :context}`.
+
+   `raw` is the `:data` field a decoded SignedBlock carries — the exact
+   bytes the signature covers. The block's own `symbols` are read first
+   because every predicate and string in the block resolves through them."
+  [raw]
+  (let [m (codec/parse-message raw)
+        ;; repeated string symbols = field 1; each is raw UTF-8 bytes,
+        ;; kept as a string (a binary IS a beam-lisp string), never atom'd.
+        symbols (mapv (fn [b] b) (or (get m 1) []))
+        facts (or (get m 4) [])
+        rules (or (get m 5) [])
+        checks (or (get m 6) [])]
+    {:symbols symbols
+     :context (first (get m 2))
+     :version (first (get m 3))
+     :facts (mapv (fn [f] (decode-fact f symbols)) facts)
+     :rules (mapv (fn [r] (decode-rule r symbols)) rules)
+     :checks (mapv (fn [c] (decode-check c symbols)) checks)}))
+
+;; ── projection to datom-shaped tuples ───────────────────────────────
+
+(defn predicate->tuple
+  "A decoded predicate as a flat tuple `[name term…]`, the form the
+   authorizer stores and matches as a FACT.
+
+   `right(\"file1\",\"read\")` becomes `[\"right\" \"file1\" \"read\"]`. A
+   fact tuple has no variables; a query predicate may, and those stay as
+   `{:var N}` for unification to bind. Keeping facts as plain vectors lets
+   the authorizer reuse datom's `unify-term` position by position."
+  [pred]
+  (into [(:name pred)] (:terms pred)))

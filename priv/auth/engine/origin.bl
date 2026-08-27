@@ -1,0 +1,257 @@
+; auth/engine/origin.bl — origin-scoped datalog evaluation.
+;
+; ── Why this file exists (the one genuinely new evaluation rule) ─────
+;
+; datom's engine evaluates datalog over a STORED database whose facts have
+; no notion of "which block asserted me". Biscuit's security rests on
+; exactly that notion: a fact's ORIGIN — the block that produced it —
+; determines which rules may see it. This file adds origin to the fact and
+; the trust filter to the scan, reusing datom's pure unification
+; primitive (`unify-term`) for the matching itself.
+;
+; This is the deliberate answer to the "origin seam" fork in PLAN-041:
+; origin-scoping lives HERE, in auth, not as a hook inside datom's engine.
+; The evidence for that choice: datom's resolver (`eval-pattern`,
+; `pattern-scan-once`) is bound to a persistent store and an index planner;
+; Biscuit facts are a small, ephemeral, in-memory set rebuilt per
+; authorization. Forcing them through the store resolver would mean
+; materialising a datom db per request (absurd, and an atom hazard on every
+; symbol) or an invasive hook on datom's hot path for a feature only auth
+; uses. What reuses cleanly is `unify-term` — pure, store-independent — and
+; that is exactly what this evaluator calls.
+;
+; ── Block scoping, precisely (from the spec) ─────────────────────────
+;
+; Each fact carries an ORIGIN: the id of the block that defined it, or a
+; dedicated id for authorizer facts. By default a rule/check/policy trusts
+; facts whose origin is in its TRUSTED SET, which is:
+;   - the authority block (id 0), always
+;   - the authorizer, always
+;   - the block the rule itself lives in, always
+; A block CANNOT see facts from OTHER attenuation blocks by default. This
+; is what makes attenuation monotonic: an appended block can add checks
+; that consume authority/authorizer facts, but cannot introduce a fact
+; that some other block's rule would pick up to manufacture a right.
+;
+; `trusting` scope annotations widen the trusted set (to `previous`, or to
+; a specific third-party public key); those are represented as an explicit
+; trusted-origin set on a rule and honoured here, defaulting to the base
+; set when absent.
+
+(ns auth.engine.origin
+  (:require [datom.query.engine :as dq]
+            [auth.biscuit.datalog :as dl]))
+
+;; ── ids ─────────────────────────────────────────────────────────────
+
+(def AUTHORITY 0)
+;; The authorizer's facts get an id distinct from any block. Block ids are
+;; 0..N for the token's blocks, so a large sentinel keeps the authorizer
+;; separate without colliding with a real block.
+(def AUTHORIZER 1000000)
+
+(defn base-trust
+  "The origins a rule in `block-id` trusts by default: authority, the
+   authorizer, and its own block. Every scan starts from this set; a
+   `trusting` annotation only ADDS to it."
+  [block-id]
+  #{AUTHORITY AUTHORIZER block-id})
+
+;; ── the fact set ────────────────────────────────────────────────────
+;;
+;; A fact is `{:tuple ["right" "file1" "read"] :origin <block-id>}`. The
+;; tuple is the datom-shaped flat vector `dl/predicate->tuple` produces;
+;; origin is the block that asserted it. The set is a plain vector — small
+;; (a token has tens of facts, not millions), so a linear scan filtered by
+;; trust is both correct and fast enough; there is no store to index.
+
+(defn fact
+  "A fact tuple tagged with its origin block id."
+  [tuple origin]
+  {:tuple tuple :origin origin})
+
+(defn- visible
+  "The facts in `facts` whose origin is trusted by `trusted` set."
+  [facts trusted]
+  (filterv (fn [f] (contains? trusted (:origin f))) facts))
+
+;; ── unification against a fact ──────────────────────────────────────
+
+(defn- unify-tuple
+  "Extend `bindings` so query `pattern` (a tuple whose terms may be
+   `{:var N}`) matches fact `tuple`, or nil.
+
+   Position by position, reusing datom's `unify-term`: a variable binds or
+   must agree, a constant must equal. The predicate NAME is position 0 and
+   unifies like any other term, so a query with a fixed name only matches
+   facts of that name. Arities must match — a 2-term query never matches a
+   3-term fact."
+  [bindings pattern tuple]
+  (if (not (= (count pattern) (count tuple)))
+    nil
+    (loop [i 0
+           b bindings]
+      (if (>= i (count pattern))
+        b
+        (let [term (nth pattern i)
+              ;; a Biscuit variable {:var N} becomes the symbol datom's
+              ;; unifier expects; a constant passes straight through.
+              dt (if (and (map? term) (contains? term :var))
+                   (var->sym (:var term))
+                   term)
+              b' (dq/unify-term b dt (nth tuple i))]
+          (if (nil? b')
+            nil
+            (recur (+ i 1) b')))))))
+
+(defn var->sym
+  "A Biscuit variable index as a datom query variable symbol.
+
+   datom's `unify-term` treats a symbol whose name starts with `?` as a
+   variable; we synthesise `?v<N>` so variable slots become datom
+   variables and everything else is a constant. The mapping is total and
+   collision-free because N is the wire's own unique slot id."
+  [n]
+  (symbol (str "?v" n)))
+
+;; ── evaluating a rule body ──────────────────────────────────────────
+
+(defn- match-predicate
+  "Every extension of `bindings` under which body-predicate `pred`
+   (a decoded `{:name :terms}`) holds against the trusted `facts`.
+
+   The predicate is flattened to a query tuple and unified against every
+   visible fact. Returns a vector of extended binding maps — the standard
+   datalog 'join one more predicate' step."
+  [facts bindings pred]
+  (let [pattern (dl/predicate->tuple pred)]
+    (filterv some?
+             (mapv (fn [f] (unify-tuple bindings pattern (:tuple f))) facts))))
+
+(defn eval-body
+  "All binding sets satisfying a rule `body` (a vector of predicates) over
+   `facts` visible under `trusted`.
+
+   A fold over the body: start with one empty binding, and for each
+   predicate expand every surviving binding by every fact it matches. This
+   is naive bottom-up datalog — correct and clear; the fact sets are tiny,
+   so the naive join is the right complexity trade. Expressions are applied
+   by the caller (`auth.engine.expr`) after the predicates bind the
+   variables they read."
+  [facts trusted body]
+  (let [vis (visible facts trusted)]
+    (reduce (fn [binding-sets pred]
+              (into [] (mapcat (fn [b] (match-predicate vis b pred)) binding-sets)))
+            [{}]
+            body)))
+
+;; ── rule application (fact generation) ──────────────────────────────
+
+(defn apply-rule
+  "The facts a `rule` generates, each tagged with `block-id` as origin.
+
+   For every binding that satisfies the body, instantiate the head by
+   substituting bound variables — producing a new fact. A rule's generated
+   facts take the rule's OWN block as origin (per spec), which is what
+   keeps a generated right from silently escaping its block's scope.
+
+   `expr-ok?` is a predicate the caller supplies to apply the rule's
+   expressions to a binding; a binding that fails an expression generates
+   no fact. Defaulting it to always-true lets rules with no expressions
+   work unchanged."
+  [facts rule block-id expr-ok?]
+  (let [trusted (rule-trust rule block-id)
+        bindings (eval-body facts trusted (:body rule))
+        head (:head rule)]
+    (into []
+          (mapcat
+            (fn [b]
+              (if (expr-ok? b)
+                [(fact (instantiate head b) block-id)]
+                []))
+            bindings))))
+
+(defn rule-trust
+  "The trusted-origin set for `rule` in `block-id`.
+
+   The base set (authority + authorizer + own block) is widened by any
+   explicit `:trusted` origins the rule carries from a `trusting`
+   annotation. Absent an annotation, only the base set is trusted — the
+   default that makes attenuation safe."
+  [rule block-id]
+  (let [base (base-trust block-id)]
+    (if (contains? rule :trusted)
+      (reduce (fn [s o] (conj s o)) base (:trusted rule))
+      base)))
+
+(defn- instantiate
+  "The head predicate as a ground fact tuple under `bindings`.
+
+   Each head term that is a variable is replaced by its bound value; a
+   constant stays. A safe rule (spec requirement) has every head variable
+   bound by the body, so a well-formed rule never leaves a variable in the
+   generated fact — but an unbound head variable, if it occurs, surfaces
+   as the unresolved marker rather than silently vanishing."
+  [head bindings]
+  (into [(:name head)]
+        (mapv (fn [term]
+                (if (and (map? term) (contains? term :var))
+                  (let [v (get bindings (var->sym (:var term)))]
+                    (if (nil? v) {:unbound (:var term)} v))
+                  term))
+              (:terms head))))
+
+;; ── saturation ──────────────────────────────────────────────────────
+
+(defn saturate
+  "Repeatedly apply `rules` to `facts` until no new fact appears.
+
+   Datalog is monotone: applying rules only ADDS facts, and a finite fact
+   universe means the fixpoint is reached in finitely many rounds. Each
+   round runs every rule over the CURRENT facts and unions the results;
+   when a round adds nothing, the set is saturated. `rule-block` maps a
+   rule to its block id (its origin and scope); `expr-eval` applies its
+   expressions.
+
+   Naive (re-runs every rule each round) rather than semi-naive: token
+   rule sets are tiny, so the simpler fixpoint is the right call and reads
+   as the definition of datalog closure."
+  [facts rules rule-block expr-eval]
+  (loop [current facts]
+    (let [generated (into []
+                          (mapcat (fn [r]
+                                    (apply-rule current r (rule-block r)
+                                                (fn [b] (expr-eval r b))))
+                                  rules))
+          novel (filterv (fn [f] (not (contains-fact? current f))) generated)]
+      (if (empty? novel)
+        current
+        (recur (into current novel))))))
+
+(defn- contains-fact?
+  "Whether `facts` already holds a fact with the same tuple AND origin.
+
+   Origin is part of identity here: the same tuple asserted by two blocks
+   is two facts, because scope treats them differently. Dedup on tuple
+   alone would merge them and leak one block's fact into another's scope."
+  [facts f]
+  (some? (some (fn [g] (and (= (:tuple g) (:tuple f))
+                            (= (:origin g) (:origin f))))
+               facts)))
+
+;; ── querying (checks and policies) ──────────────────────────────────
+
+(defn query-matches?
+  "Whether `rule` (used as a query — its body only) produces ANY binding
+   over `facts`, honouring the rule's scope and `expr-eval`.
+
+   A check passes when its query matches; a policy fires when its query
+   matches. Both reduce to 'does this rule body have a satisfying binding',
+   which is this predicate. Expressions filter bindings before the answer
+   is taken, so a query with an expression that no binding satisfies
+   correctly reports no match."
+  [facts rule block-id expr-eval]
+  (let [trusted (rule-trust rule block-id)
+        bindings (eval-body facts trusted (:body rule))
+        surviving (filterv (fn [b] (expr-eval rule b)) bindings)]
+    (not (empty? surviving))))
