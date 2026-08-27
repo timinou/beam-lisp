@@ -1,0 +1,133 @@
+; test/bl/auth/strategy_test.bl — strategies, issuance, revocation.
+; Run: mix beam_lisp.test test/bl/auth/strategy_test.bl
+;
+; Wave 7. Three concerns, each a thin layer over the proven core:
+;   - strategies: identity method = a function params → authority facts.
+;   - issuance: fact tuples → a real, verifiable minted token (round-trip).
+;   - revocation: the per-call offline↔online choice, both oracle shapes.
+
+(ns auth.strategy-test
+  (:require [auth.strategy :as strat]
+            [auth.revocation :as rev]
+            [auth.biscuit.datalog :as dl]
+            [auth.biscuit.crypto :as crypto]
+            [auth.biscuit.codec :as codec]
+            [auth.authorizer :as az]))
+
+;; ── strategies ──────────────────────────────────────────────────────
+
+(deftest password-strategy-verifies
+  ;; verify-fn injected; success emits (user <identity>), failure nil.
+  (let [verify (fn [id pw] (= pw "correct-horse"))
+        s (strat/password-strategy :email :password verify)]
+    (is (= [["user" "ada@x.com"]]
+           (s {:email "ada@x.com" :password "correct-horse"})))
+    (is (nil? (s {:email "ada@x.com" :password "wrong"})))
+    ;; missing params → nil, never a crash
+    (is (nil? (s {:email "ada@x.com"})))))
+
+(deftest claims-strategy-maps-verified-claims
+  ;; already-verified claims → facts; the provider dance happened elsewhere.
+  (let [s (strat/claims-strategy :claims
+            (fn [c] [["user" (:sub c)] ["email" (:email c)]]))]
+    (is (= [["user" "gh|42"] ["email" "a@b.com"]]
+           (s {:claims {:sub "gh|42" :email "a@b.com"}})))
+    (is (nil? (s {})))))
+
+(deftest api-key-strategy-looks-up
+  (let [keys {"key-abc" [["service" "ci"] ["right" "*" "read"]]}
+        s (strat/api-key-strategy :key (fn [k] (get keys k)))]
+    (is (= [["service" "ci"] ["right" "*" "read"]] (s {:key "key-abc"})))
+    (is (nil? (s {:key "unknown"})))))
+
+(deftest registry-runs-and-rejects-unknown
+  (let [reg (-> (strat/registry)
+                (strat/register :pw (strat/password-strategy :u :p (fn [_ _] true))))]
+    (is (= [["user" "x"]] (strat/run reg :pw {:u "x" :p "y"})))
+    (is (thrown? (strat/run reg :missing {})))))
+
+;; ── issuance round-trip ─────────────────────────────────────────────
+
+(deftest issued-token-round-trips-and-verifies
+  ;; fact tuples → block bytes → decode → same facts; and the minted token
+  ;; verifies, and its wire form round-trips and still verifies.
+  (let [tuples [["user" "alice"] ["right" "doc-42" "read"] ["right" "doc-42" "write"]]
+        block (dl/encode-block tuples)
+        decoded (dl/decode-block block)
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)]
+    (is (= (set tuples) (set (mapv dl/predicate->tuple (:facts decoded)))))
+    (is (crypto/verify (:public root) tok))
+    ;; wire round-trip
+    (let [back (codec/decode (codec/encode tok))]
+      (is (crypto/verify (:public root) back)))))
+
+(deftest issued-token-authorizes
+  ;; a minted token grants what its facts say. Mint (user alice)+(right
+  ;; doc read); an authorizer that checks nothing and allows should permit,
+  ;; and the token's facts are visible to a check for right(doc,read).
+  (let [block (dl/encode-block [["user" "alice"] ["right" "doc-42" "read"]])
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)
+        ;; authorizer with a check that the token must satisfy from its own
+        ;; authority facts: right("doc-42","read")
+        check-right {:queries [{:head {:name "q" :terms []}
+                                :body [{:name "right" :terms ["doc-42" "read"]}]
+                                :exprs [] :symbols []}]
+                     :kind 0}
+        authorizer {:facts [] :rules []
+                    :checks [check-right]
+                    :policies [{:kind :allow
+                                :query {:head {:name "q" :terms []}
+                                        :body [] :exprs [] :symbols []}}]}
+        d (az/authorize (:public root) tok authorizer)]
+    (is (= :allow (:verdict d)))))
+
+;; ── revocation ──────────────────────────────────────────────────────
+
+(deftest offline-no-oracle-does-not-check
+  ;; nil oracle → pure offline; a token authorizes regardless of any
+  ;; revocation list (there is none).
+  (let [block (dl/encode-block [["user" "alice"]])
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)]
+    (is (not (rev/revoked? nil tok)))))
+
+(deftest set-oracle-revokes-by-block-signature
+  ;; revoke the token's authority-block signature; the set oracle then
+  ;; reports it revoked, by BYTES.
+  (let [block (dl/encode-block [["user" "alice"]])
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)
+        ids (codec/revocation-ids tok)
+        oracle (rev/set-oracle [(first ids)])]
+    (is (rev/revoked? oracle tok))
+    ;; an oracle over an UNRELATED id does not revoke it (a fixed 64-byte
+    ;; value, distinct from any real signature)
+    (is (not (rev/revoked?
+               (rev/set-oracle [(Base/decode16! (String/duplicate "AB" 64))])
+               tok)))))
+
+(deftest fn-oracle-supports-temporal-lookup
+  ;; the function-backed oracle: the app closes over its own store/basis.
+  (let [block (dl/encode-block [["user" "alice"]])
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)
+        revoked-ids (set (codec/revocation-ids tok))
+        oracle (rev/fn-oracle (fn [id] (contains? revoked-ids id)))]
+    (is (rev/revoked? oracle tok))))
+
+(deftest revoked-token-denied-by-authorizer
+  ;; end-to-end: a revoked token is denied with :reason :revoked, before
+  ;; any logic runs.
+  (let [block (dl/encode-block [["user" "alice"] ["right" "doc" "read"]])
+        root (crypto/keypair)
+        tok (crypto/authority (:private root) block)
+        oracle (rev/set-oracle (codec/revocation-ids tok))
+        authorizer {:facts [] :rules [] :checks []
+                    :policies [{:kind :allow :query {:head {:name "q" :terms []}
+                                                     :body [] :exprs [] :symbols []}}]
+                    :revocation oracle}
+        d (az/authorize (:public root) tok authorizer)]
+    (is (= :deny (:verdict d)))
+    (is (= :revoked (:reason d)))))
