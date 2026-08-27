@@ -1,0 +1,224 @@
+; auth/authorizer.bl — the one authorization function.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; Everything below this file produced VALUES: a verified signature chain,
+; decoded blocks, an origin-tagged fact set, a datalog evaluator. This
+; file is where they compose into the single question the whole package
+; exists to answer:
+;
+;     (authorize root-pub token authorizer) → {:verdict :allow|:deny :why …}
+;
+; It is a PURE function: same token, same authorizer, same root key ⇒ same
+; decision, forever, with no I/O. That referential transparency is the
+; beam-lisp inversion of Ash's stateful pipeline — a decision you can
+; reproduce, diff, and test against a literal fact set.
+;
+; ── The Biscuit decision procedure (from the spec) ───────────────────
+;
+;   1. verify the signature chain from the root public key. A bad chain is
+;      a hard reject before any logic runs.
+;   2. load facts/rules from every block, each tagged with its ORIGIN
+;      block id, plus the authorizer's own facts/rules (origin AUTHORIZER).
+;   3. run rules to a fixpoint (saturation), respecting block scope.
+;   4. run every CHECK — the token's (per block) and the authorizer's. A
+;      check fails if its query produces no binding. If ANY check fails,
+;      the token is unauthorized.
+;   5. run the authorizer's POLICIES in order. The first that matches
+;      decides: an allow policy authorizes (given all checks passed), a
+;      deny policy rejects. If none matches, reject.
+;
+; This file implements exactly that order, and reports WHY — which check
+; failed, or which policy matched — because the datalog already knows and
+; throwing that away would waste the one audit trail the design gives for
+; free.
+
+(ns auth.authorizer
+  (:require [auth.biscuit.crypto :as crypto]
+            [auth.biscuit.datalog :as dl]
+            [auth.biscuit.codec :as codec]
+            [auth.engine.origin :as o]
+            [auth.engine.expr :as ex]))
+
+;; ── the expression hook ─────────────────────────────────────────────
+;;
+;; The origin engine takes an `expr-eval` callback `(rule binding) → bool`
+;; so it stays independent of the expression VM. Here we close that gap:
+;; a rule's `:exprs` (raw op bytes) are run against a binding through the
+;; stack machine, resolving terms via the rule's own block symbols.
+
+(defn- var->val [bindings n] (get bindings (o/var->sym n)))
+
+(defn- term-decoder
+  "The term decoder the expression VM needs: raw term bytes → value,
+   resolved through `symbols`. Bytes are parsed here so the VM never
+   touches protobuf."
+  [term-bytes symbols]
+  (dl/decode-term (codec/parse-message term-bytes) symbols))
+
+(defn- expr-eval
+  "Whether every expression on `rule` holds under `binding`.
+
+   A rule with no expressions trivially holds — the common case for a
+   plain predicate check. Expressions resolve their variables through the
+   binding the rule body produced, using the rule's block symbols."
+  [rule binding]
+  (ex/all-hold? (or (:exprs rule) [])
+                (:symbols rule)
+                binding
+                term-decoder
+                var->val))
+
+;; ── fact assembly ───────────────────────────────────────────────────
+
+(defn- block-facts
+  "The facts a decoded block asserts, tagged with `origin`."
+  [block origin]
+  (mapv (fn [p] (o/fact (dl/predicate->tuple p) origin)) (:facts block)))
+
+(defn- block-rules
+  "The rules a decoded block carries, each paired with its `origin` block
+   id (its scope). The rule keeps its `:symbols` so its expressions can
+   resolve later."
+  [block origin]
+  (mapv (fn [r] {:rule r :block origin}) (:rules block)))
+
+(defn- gather
+  "Decode every block of `token` and the `authorizer`, returning the full
+   `{:facts :rules :checks}` with correct origins.
+
+   Block ids: authority = 0, appended blocks = 1..N in order, authorizer =
+   the dedicated AUTHORIZER id. Every fact and rule is tagged so the scope
+   filter can do its job; checks carry the block they came from because a
+   check runs in its own block's scope."
+  [token authorizer]
+  (let [auth-block (dl/decode-block (:data (:authority token)))
+        extra (mapv (fn [b] (dl/decode-block (:data b))) (:blocks token))
+        ;; authority is block 0; extra blocks are 1..N
+        indexed (map-indexed (fn [i b] [(+ i 1) b]) extra)
+        all-blocks (cons [o/AUTHORITY auth-block] indexed)
+        facts (into [] (mapcat (fn [pair] (block-facts (second pair) (first pair)))
+                               all-blocks))
+        rules (into [] (mapcat (fn [pair] (block-rules (second pair) (first pair)))
+                               all-blocks))
+        ;; checks, each with the block id it runs in
+        checks (into [] (mapcat
+                          (fn [pair]
+                            (mapv (fn [c] {:check c :block (first pair)})
+                                  (:checks (second pair))))
+                          all-blocks))
+        ;; authorizer facts/rules/checks (origin AUTHORIZER)
+        az-facts (mapv (fn [t] (o/fact t o/AUTHORIZER)) (:facts authorizer))
+        az-rules (mapv (fn [r] {:rule r :block o/AUTHORIZER}) (:rules authorizer))
+        az-checks (mapv (fn [c] {:check c :block o/AUTHORIZER}) (:checks authorizer))]
+    {:facts (into facts az-facts)
+     :rules (into rules az-rules)
+     :checks (into checks az-checks)
+     :policies (:policies authorizer)}))
+
+;; ── saturation over all rules ───────────────────────────────────────
+
+(defn- saturate-all
+  "Close `facts` under every rule, respecting each rule's block scope.
+
+   Wraps the origin engine's `saturate`, supplying the block-of-rule and
+   expression-eval callbacks. After this returns, every derivable fact is
+   present with its correct origin, so checks and policies see the full
+   picture the way the reference authorizer does."
+  [facts rules]
+  (let [rule-list (mapv :rule rules)
+        rule-block (fn [r] (block-of r rules))]
+    (o/saturate facts rule-list rule-block expr-eval)))
+
+(defn- block-of
+  "The block id a rule belongs to, looked up in the `rules` pairing.
+
+   Identity comparison on the rule map recovers its scope; a rule appears
+   once, so the first match is it."
+  [rule rules]
+  (:block (first (filterv (fn [p] (= (:rule p) rule)) rules))))
+
+;; ── checks ──────────────────────────────────────────────────────────
+
+(defn- check-passes?
+  "Whether one check passes over the saturated `facts`.
+
+   A check is a set of queries with a Kind. Kind One (0): the check passes
+   if ANY query matches. Kind All (1): every query must match. Kind Reject
+   (2): the check passes if NO query matches (an inverted check). Each
+   query runs in the check's block scope."
+  [facts checkpair]
+  (let [check (:check checkpair)
+        block (:block checkpair)
+        kind (:kind check)
+        matches (mapv (fn [q] (o/query-matches? facts q block expr-eval))
+                      (:queries check))]
+    (cond
+      (= kind 2) (not (some? (some (fn [m] m) matches)))     ; Reject
+      (= kind 1) (every? (fn [m] m) matches)                 ; All
+      :else (some? (some (fn [m] m) matches)))))             ; One (default)
+
+(defn- failing-check
+  "The first check that does NOT pass, or nil if all pass.
+
+   Returned rather than a bare boolean so `:why` can name the exact check
+   that sank the authorization — the audit trail the spec's error type
+   also carries (block id + check id)."
+  [facts checks]
+  (loop [i 0]
+    (if (>= i (count checks))
+      nil
+      (if (check-passes? facts (nth checks i))
+        (recur (+ i 1))
+        {:index i :check (nth checks i)}))))
+
+;; ── policies ────────────────────────────────────────────────────────
+
+(defn- policy-decision
+  "Evaluate `policies` in order over `facts`, returning the first match as
+   `{:kind :allow|:deny :index i}`, or nil if none match.
+
+   A policy is `{:kind :allow|:deny :query <rule>}`. The authorizer's
+   policies run in the authorizer's own scope. First match wins — the
+   spec's ordered evaluation — so a deny placed before an allow takes
+   precedence, which is how deny-overrides is expressed."
+  [facts policies]
+  (loop [i 0]
+    (if (>= i (count policies))
+      nil
+      (let [p (nth policies i)]
+        (if (o/query-matches? facts (:query p) o/AUTHORIZER expr-eval)
+          {:kind (:kind p) :index i}
+          (recur (+ i 1)))))))
+
+;; ── the entry point ─────────────────────────────────────────────────
+
+(defn authorize
+  "Authorize `token` against `authorizer`, verifying under `root-pub`.
+
+   `authorizer` is `{:facts [tuple…] :rules [rule…] :checks [check…]
+   :policies [{:kind :query}…]}` — the context the verifier supplies
+   (what resource, what operation, what time, plus the allow/deny rules).
+
+   Returns:
+     {:verdict :allow  :policy i :why …}     when a check-clean allow fires
+     {:verdict :deny   :reason …}            otherwise, with the cause
+
+   The order is the spec's: signature first (a forged token never reaches
+   the logic), then checks (all must pass), then policies (first match
+   decides). `:why` distinguishes the causes so a denial is explainable,
+   never a bare false."
+  [root-pub token authorizer]
+  (if (not (crypto/verify root-pub token))
+    {:verdict :deny :reason :invalid-signature}
+    (let [gathered (gather token authorizer)
+          facts (saturate-all (:facts gathered) (:rules gathered))
+          bad-check (failing-check facts (:checks gathered))]
+      (if (some? bad-check)
+        {:verdict :deny :reason :failed-check :check-index (:index bad-check)}
+        (let [decision (policy-decision facts (:policies gathered))]
+          (cond
+            (nil? decision) {:verdict :deny :reason :no-matching-policy}
+            (= (:kind decision) :deny) {:verdict :deny :reason :deny-policy
+                                        :policy (:index decision)}
+            :else {:verdict :allow :policy (:index decision)}))))))
