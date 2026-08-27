@@ -1,0 +1,222 @@
+; auth.bl — the facade: the whole package, one require.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; `datom.bl` set the precedent: a facade namespace that re-exports the
+; implementation namespaces, so a downstream app writes `(:require [auth])`
+; and has the entire surface. This file is that facade for `auth`.
+;
+; Below it, the package is layered:
+;   biscuit/{crypto,codec,token,datalog}  — the wire-compatible Biscuit
+;   engine/{origin,expr}                  — origin-scoped datalog over datom
+;   authorizer                            — the one decision function
+;   strategy, revocation, rls             — the surrounding ergonomics
+;
+; The functions here are thin: they name the surface and, where a raw
+; lower-level call would be awkward, wrap it into the shape the design's
+; getting-started (docs §9) promises. Nothing here re-implements logic;
+; it composes the proven layers.
+;
+; ── The mental model an app author needs ─────────────────────────────
+;
+;   a KEYPAIR mints and verifies.       (auth/keypair) → {:public :private}
+;   a TOKEN is a value you hold.         (auth/issue root facts) → token
+;   you ATTENUATE it — only ever narrowing.
+;   you AUTHORIZE a request against it — a pure function → {:verdict …}.
+;   you GUARD a query — RLS clause injection for this principal.
+;
+; Everything is a value: print it, store it, diff it, generate it.
+
+(ns auth
+  (:require [auth.biscuit.crypto :as crypto]
+            [auth.biscuit.codec :as codec]
+            [auth.biscuit.datalog :as datalog]
+            [auth.authorizer :as authorizer]
+            [auth.strategy :as strategy]
+            [auth.revocation :as revocation]
+            [auth.rls :as rls]))
+
+;; ── keys ────────────────────────────────────────────────────────────
+
+(defn keypair
+  "A fresh Ed25519 keypair `{:public :private}`. The private key mints and
+   attenuates; the public key verifies."
+  []
+  (crypto/keypair))
+
+(defn public
+  "The public key of a keypair (or derived from a private seed)."
+  [kp-or-priv]
+  (if (map? kp-or-priv)
+    (:public kp-or-priv)
+    (crypto/public-of kp-or-priv)))
+
+;; ── issuing & attenuating ───────────────────────────────────────────
+
+(defn issue
+  "Mint an authority token carrying `facts`, signed by `root`.
+
+   `root` is a keypair (or a private seed); `facts` is a vector of fact
+   tuples like `[[\"user\" \"alice\"] [\"right\" \"doc-42\" \"read\"]]`. The
+   returned token is a VALUE — verifiable by anyone holding the root public
+   key, and attenuable by whoever holds it. This is the entry point of a
+   capability's life."
+  [root facts]
+  (let [priv (if (map? root) (:private root) root)
+        block (datalog/encode-block facts)]
+    (crypto/authority priv block)))
+
+(defn attenuate
+  "Append a block of `facts` to `token`, narrowing it.
+
+   By the append-only chain and datalog block-scoping, this can only ever
+   RESTRICT what the token authorizes — there is no `facts` that grants a
+   right the token did not already carry. The bearer needs no secret but
+   the token's own proof key; the issuer is never contacted."
+  [token facts]
+  (crypto/append token (datalog/encode-block facts)))
+
+(defn seal
+  "Seal `token` so it can never be attenuated again.
+
+   Replaces the token's last secret (which attenuation needs) with a
+   signature proving the holder possessed it, then discards it. A sealed
+   token still verifies but is frozen — the shape an API key takes."
+  [token]
+  (let [proof (:proof token)]
+    (if (contains? proof :secret)
+      (crypto/seal token (:secret proof))
+      (throw (ex-info "token is already sealed" {})))))
+
+;; ── serialization ───────────────────────────────────────────────────
+
+(defn encode
+  "Serialize `token` to Biscuit wire bytes (protobuf). Wire-compatible —
+   a real `.bc` any Biscuit implementation can verify."
+  [token]
+  (codec/encode token))
+
+(defn decode
+  "Parse Biscuit wire bytes into a token value. The token is UNVERIFIED
+   until `authorize` (or `crypto/verify`) checks it."
+  [bytes]
+  (codec/decode bytes))
+
+(defn encode-base64
+  "Serialize `token` to a URL-safe base64 string — the text form for
+   carrying a token in a header or cookie."
+  [token]
+  (Base/url_encode64 (codec/encode token)))
+
+(defn decode-base64
+  "Parse a URL-safe base64 token string into a token value."
+  [s]
+  (codec/decode (Base/url_decode64! s)))
+
+;; ── verifying & authorizing ─────────────────────────────────────────
+
+(defn verify
+  "Whether `token` is cryptographically authentic under `root-pub` — chain
+   + proof. Says nothing about authorization; a valid token can still deny
+   every request."
+  [root-pub token]
+  (crypto/verify root-pub token))
+
+(defn authorize
+  "The one decision function: authorize `token` against `authorizer`,
+   verifying under `root-pub`.
+
+   `authorizer` is `{:facts :rules :checks :policies :revocation}` — the
+   request context (resource, operation, time), the allow/deny policies,
+   and an optional revocation oracle. Returns `{:verdict :allow|:deny :why
+   …}`. Pure: same inputs, same decision, always."
+  [root-pub token authorizer-ctx]
+  (authorizer/authorize root-pub token authorizer-ctx))
+
+;; ── policy construction ─────────────────────────────────────────────
+
+(defn allow
+  "An allow policy whose query is `body` (a vector of predicates, possibly
+   empty for `allow if true`). Data, not a macro."
+  [body]
+  {:kind :allow :query {:head {:name "q" :terms []}
+                        :body body :exprs [] :symbols []}})
+
+(defn deny
+  "A deny policy whose query is `body`. Placed before an allow, it takes
+   precedence — the deny-overrides ordering."
+  [body]
+  {:kind :deny :query {:head {:name "q" :terms []}
+                       :body body :exprs [] :symbols []}})
+
+(defn context
+  "Assemble an authorizer context. `opts` may carry `:facts :rules :checks
+   :policies :revocation`; omitted keys default empty (nil revocation ⇒
+   pure offline)."
+  [opts]
+  {:facts (or (:facts opts) [])
+   :rules (or (:rules opts) [])
+   :checks (or (:checks opts) [])
+   :policies (or (:policies opts) [])
+   :revocation (:revocation opts)})
+
+;; ── RLS ─────────────────────────────────────────────────────────────
+
+(defn guard
+  "Rewrite `query` for a principal, injecting `filters` (clause vectors)
+   into its `:where`. The app writes one query; this returns the guarded
+   query to run with `datom/q` against any db value. Enumeration-safe:
+   forbidden rows are absent, never errors."
+  [query filters]
+  (rls/guarded query filters))
+
+(defn owner-filter
+  "A row filter keeping only rows where `row-var`'s `owner-attr` = the
+   principal. The common ownership scope."
+  [row-var owner-attr principal]
+  (rls/owner-filter row-var owner-attr principal))
+
+;; ── strategies ──────────────────────────────────────────────────────
+
+(defn strategies
+  "An empty strategy registry — extend with `register-strategy`."
+  []
+  (strategy/registry))
+
+(defn register-strategy
+  "Register identity strategy `name` (a keyword) with resolver `f`
+   (`params → facts | nil`)."
+  [reg name f]
+  (strategy/register reg name f))
+
+(defn run-strategy
+  "Run strategy `name` against `params`, yielding authority facts or nil."
+  [reg name params]
+  (strategy/run reg name params))
+
+(defn password-strategy [identity-key password-key verify-fn]
+  (strategy/password-strategy identity-key password-key verify-fn))
+(defn claims-strategy [claims-key claims->facts]
+  (strategy/claims-strategy claims-key claims->facts))
+(defn api-key-strategy [key-key lookup-fn]
+  (strategy/api-key-strategy key-key lookup-fn))
+
+;; ── revocation ──────────────────────────────────────────────────────
+
+(defn revocation-set
+  "An in-memory revocation oracle over `revoked-ids` (raw signature
+   bytes)."
+  [revoked-ids]
+  (revocation/set-oracle revoked-ids))
+
+(defn revocation-oracle
+  "A revocation oracle backed by a lookup fn `(id) → bool` — the hook for
+   a datom-backed, temporally-queryable revocation store."
+  [lookup]
+  (revocation/fn-oracle lookup))
+
+(defn revocation-ids
+  "Every block's revocation id (its signature bytes). Revoke a token by
+   adding any of these to an oracle."
+  [token]
+  (codec/revocation-ids token))
