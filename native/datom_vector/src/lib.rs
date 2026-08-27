@@ -75,7 +75,12 @@ pub fn normalize(v: &mut [f32]) {
     for &x in v.iter() {
         sum += x * x;
     }
-    if sum > 0.0 {
+    // `sum` is finite and > 0 for any real embedding. A non-finite sum (an Inf
+    // or NaN slipped in) or a zero sum would make the scale Inf/NaN and poison
+    // every later dot product — and `partial_cmp` treats NaN as equal, so the
+    // ranking would go arbitrary rather than loud. Guard it: only scale when
+    // the norm is a finite positive number.
+    if sum.is_finite() && sum > 0.0 {
         let inv = 1.0 / sum.sqrt();
         for x in v.iter_mut() {
             *x *= inv;
@@ -167,6 +172,9 @@ pub fn search_quantized(
     k: usize,
     rerank: usize,
 ) -> Vec<Hit> {
+    if n == 0 {
+        return Vec::new();
+    }
     // Coarse pass: Hamming against every code. We keep (id, distance) and take
     // the `rerank` smallest distances.
     let mut coarse: Vec<(u32, u32)> = Vec::with_capacity(n);
@@ -174,7 +182,10 @@ pub fn search_quantized(
         let code = &codes[i * words..(i + 1) * words];
         coarse.push((i as u32, hamming(query_bits, code)));
     }
-    let m = rerank.min(n);
+    // The coarse set must be at least `k` wide or the fine pass cannot return k
+    // hits; widen `rerank` up to k, and never exceed n. `m >= 1` here because
+    // n > 0 (guarded above), so the `m - 1` select index cannot underflow.
+    let m = rerank.max(k).min(n).max(1);
     // partial selection of the m smallest by distance
     coarse.select_nth_unstable_by(m - 1, |a, b| a.1.cmp(&b.1));
     coarse.truncate(m);
@@ -253,6 +264,15 @@ fn bin<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 /// bare dot product. The BEAM hands floats as f64; we narrow to f32 for storage.
 #[rustler::nif(schedule = "DirtyCpu")]
 pub fn vec_pack<'a>(env: Env<'a>, floats: Vec<f64>) -> NifResult<Binary<'a>> {
+    // Reject non-finite inputs at the door. A NaN/Inf component (or a value
+    // like 1e308 that overflows f32) would normalise to NaN bytes and silently
+    // corrupt every future comparison against this vector; better a loud error
+    // at insert than arbitrary rankings at query time.
+    for &x in floats.iter() {
+        if !x.is_finite() || (x as f32).is_infinite() {
+            return Err(err("vector contains a non-finite or out-of-f32-range value"));
+        }
+    }
     let mut v: Vec<f32> = floats.iter().map(|&x| x as f32).collect();
     normalize(&mut v);
     Ok(bin(env, &pack_f32(&v))?)

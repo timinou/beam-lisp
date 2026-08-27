@@ -75,17 +75,29 @@
    The corpus is every CURRENT datom of `attr` (basis-filtered upstream),
    paired as `[entity embedding]`. A datom whose value is not a `DVec`
    (a mis-typed column) is skipped rather than crashing the query."
-  [db args]
+  [db args bound-entities]
   (let [attr (get args 0)
         query (as-embedding (get args 1))
         k (get args 2)
         rerank (if (> (count args) 3) (get args 3) (datom.vector/default-rerank k))
-        candidates (filterv some?
-                            (mapv (fn [d]
-                                    (let [e (datom.index/-e d)
-                                          v (datom.index/-v d)]
-                                      (if (datom.vector/vec? v) [e v] nil)))
-                                  (datom.db/attr-datoms db attr)))]
+        ; The full corpus for this column, `[entity dvec]` per current datom.
+        all (filterv some?
+                     (mapv (fn [d]
+                             (let [e (datom.index/-e d)
+                                   v (datom.index/-v d)]
+                               (if (datom.vector/vec? v) [e v] nil)))
+                           (datom.db/attr-datoms db attr)))
+        ; If upstream clauses already bound the output entity, PREFILTER the
+        ; corpus to those entities before searching — so the k nearest are the
+        ; k nearest OF THE CANDIDATE SET, not the k nearest globally that then
+        ; happen to survive a filter. This is what lets `[?e :tag :x]
+        ; [(similar-to …) [?e ?score]]` return the best-matching tagged entity
+        ; even when it is far down the global ranking. When the entity is free,
+        ; `bound-entities` is nil and the whole corpus is searched (ordinary
+        ; kNN).
+        candidates (if (nil? bound-entities)
+                     all
+                     (filterv (fn [c] (contains? bound-entities (get c 0))) all))]
     (datom.vector/search query candidates k rerank)))
 
 ;; ── the corpus of an embedding column ───────────────────────────────
@@ -155,17 +167,25 @@
   [db args]
   (let [edges (edges-of db (get args 0))
         nodes (nodes-of edges)
-        ; union-find over a plain map parent
+        ; Union-find over a plain parent map. `root` walks the chain
+        ; ITERATIVELY (a recursive walk would overflow the stack on a long
+        ; `(a b)(b c)…` chain), and unions attach the larger root under the
+        ; smaller — deterministic, and a consistent direction that keeps the
+        ; chains from growing without bound (the unbalanced version was O(n²)).
         parent (reduce (fn [m n] (assoc m n n)) {} nodes)]
-    (letfn [(find-root [p x]
-              (if (= (get p x) x) x (find-root p (get p x))))]
+    (letfn [(root [p x]
+              (loop [cur x]
+                (if (= (get p cur) cur) cur (recur (get p cur)))))]
       (let [merged (reduce (fn [p edge]
-                             (let [ra (find-root p (get edge 0))
-                                   rb (find-root p (get edge 1))]
-                               (if (= ra rb) p (assoc p ra rb))))
+                             (let [ra (root p (get edge 0))
+                                   rb (root p (get edge 1))]
+                               (cond
+                                 (= ra rb) p
+                                 (< ra rb) (assoc p rb ra)
+                                 :else (assoc p ra rb))))
                            parent
                            edges)]
-        (mapv (fn [n] [n (find-root merged n)]) nodes)))))
+        (mapv (fn [n] [n (root merged n)]) nodes)))))
 
 (defn- community-op
   "`(community attr opts)` → `[[e community-id] …]` by LABEL PROPAGATION.
@@ -211,13 +231,20 @@
                                           (seq counts))]
                          (get best 0)))))
         init (reduce (fn [m n] (assoc m n n)) {} nodes)]
+    ; ASYNCHRONOUS propagation: within a sweep, fold over the nodes updating
+    ; the label map IN PLACE, so a node sees the labels its already-processed
+    ; neighbours took THIS pass. Synchronous (all-at-once) updates oscillate on
+    ; a bipartite graph — two nodes joined by one edge would swap labels every
+    ; sweep and never converge; the asynchronous rule settles them. A sweep
+    ; that changes nothing is the fixpoint. `nodes` is walked in a stable order
+    ; so the result is deterministic.
     (loop [labels init attempt 0]
       (if (>= attempt iters)
         (mapv (fn [n] [n (get labels n)]) nodes)
-        (let [next-labels (reduce (fn [m n] (assoc m n (majority labels n))) {} nodes)]
-          (if (= next-labels labels)
+        (let [swept (reduce (fn [m n] (assoc m n (majority m n))) labels nodes)]
+          (if (= swept labels)
             (mapv (fn [n] [n (get labels n)]) nodes)
-            (recur next-labels (+ attempt 1))))))))
+            (recur swept (+ attempt 1))))))))
 
 (defn eval-op
   "Dispatch an analytic operator to its implementation, returning a
@@ -228,10 +255,23 @@
    partition/plot it; `community` and `components` group the REFERENCE
    graph by connection. Each returns `[entity value…]` tuples the engine
    unifies against the clause's output terms."
-  [db bindings op arg-terms]
-  (let [args (mapv (fn [t] (resolve-arg bindings t)) arg-terms)]
+  [db bindings op arg-terms out-terms]
+  (let [args (mapv (fn [t] (resolve-arg bindings t)) arg-terms)
+        ; The first output term is the ENTITY. If it is a variable already
+        ; bound in this row, the clause is a prefiltered search: restrict the
+        ; corpus to that entity. A free (or wildcard) entity leaves it nil,
+        ; meaning "search everything". Only `similar-to` consults this; the
+        ; other verbs partition/plot the whole column regardless.
+        entity-term (if (and (some? out-terms) (> (count out-terms) 0))
+                      (get out-terms 0)
+                      nil)
+        bound-entities (if (and (some? entity-term)
+                                (datom.query.parse/variable? entity-term)
+                                (contains? bindings entity-term))
+                         #{(get bindings entity-term)}
+                         nil)]
     (cond
-      (= op 'similar-to) (similar-to db args)
+      (= op 'similar-to) (similar-to db args bound-entities)
       (= op 'cluster) (cluster-op db args)
       (= op 'project-2d) (project-2d-op db args)
       (= op 'community) (community-op db args)
