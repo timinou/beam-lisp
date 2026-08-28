@@ -262,6 +262,17 @@ defmodule BeamLisp.AOT do
     end
   end
 
+  defp capture_value_def(vdefs, {:list, [{:symbol, head} | _]} = form, ns)
+       when is_binary(head) do
+    # See through defining macros: `(defsmell …)`, `(defrule …)` expand
+    # to `def` — capture the EXPANSION, so a macro-produced definition
+    # replays at `__bl_init__` exactly like a literal one.
+    case BeamLisp.Compiler.macroexpand_1(form, ns) do
+      ^form -> vdefs
+      expanded -> capture_value_def(vdefs, expanded, ns)
+    end
+  end
+
   defp capture_value_def(vdefs, _form, _ns), do: vdefs
 
   # The key a replayed form is stored under. It only has to be STABLE and

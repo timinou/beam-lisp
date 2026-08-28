@@ -1604,6 +1604,29 @@ defmodule BeamLisp.Compiler do
 
   # --- macros ---
 
+  @doc """
+  One top-level macroexpansion step: if `form` is a call to a macro
+  visible in `ns`, expand it once; otherwise return it unchanged.
+
+  AOT's value-def capture uses this to see through defining macros —
+  `(defsmell …)`, `(defrule …)` and any user macro that EXPANDS TO a
+  `def`. Without it the capture classified the unexpanded call (not a
+  `def`), the definition was never replayed by `__bl_init__`, and the
+  var simply did not exist after an AOT load.
+  """
+  def macroexpand_1({:list, [{:symbol, name} | args]} = form, ns) do
+    if name in @special_forms do
+      form
+    else
+      case macro_for(ns, name) do
+        {:ok, m} -> expand_macro(m, form, args, new_env(ns))
+        :error -> form
+      end
+    end
+  end
+
+  def macroexpand_1(form, _ns), do: form
+
   # Macros resolve at compile time against the live registry, so a
   # defmacro must precede its callers in the same session.
   defp macro_for(ns, name) do
