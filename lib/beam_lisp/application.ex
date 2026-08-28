@@ -5,11 +5,15 @@ defmodule BeamLisp.Application do
 
   @impl true
   def start(_type, _args) do
+    port = dev_port()
+
     children =
       [BeamLisp.Env] ++
-        if dev_server?() and port_free?(9837) do
+        if dev_server?() and port_free?(port) do
           # Tidewave MCP endpoint: http://127.0.0.1:9837/tidewave/mcp
-          [{Bandit, plug: BeamLisp.DevServer, port: 9837, ip: {127, 0, 0, 1}}]
+          # BEAMLISP_DEV_PORT overrides the port — test/CI harnesses set a
+          # random high port so parallel one-shot runs never collide.
+          [{Bandit, plug: BeamLisp.DevServer, port: port, ip: {127, 0, 0, 1}}]
         else
           []
         end
@@ -28,6 +32,19 @@ defmodule BeamLisp.Application do
   # NB this is a check, not a reservation: a race between check and listen is
   # possible and still fails loudly. The point is that the COMMON case (a
   # session is already serving) stops being an unrelated crash.
+  defp dev_port do
+    case System.get_env("BEAMLISP_DEV_PORT") do
+      nil ->
+        9837
+
+      s ->
+        case Integer.parse(s) do
+          {p, ""} when p > 0 and p < 65_536 -> p
+          _ -> 9837
+        end
+    end
+  end
+
   defp port_free?(port) do
     case :gen_tcp.listen(port, [:binary, ip: {127, 0, 0, 1}, reuseaddr: true]) do
       {:ok, socket} ->
