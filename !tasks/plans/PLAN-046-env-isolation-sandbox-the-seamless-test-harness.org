@@ -1,0 +1,350 @@
+#+TITLE: DESIGN: env isolation → Sandbox — the seamless beam-lisp test harness
+#+STATE: DESIGN
+#+SESSION_ID: 15682fd4e8a0be8a
+#+CUSTOM_ID: PLAN-046-env-isolation-sandbox-the-seamless-test-harness
+
+* Intent
+
+FEAT-003's spike proved per-process env isolation is viable (+6% read cost,
+fallback overlay works, spawn leak confirmed and closable). This plan designs
+what that mechanism is FOR: a test harness where
+
+1. every ExUnit case and every bl deftest can be `async: true` — suites use
+   all cores;
+2. any downstream beam-lisp app (spell, relay, anything future) gets warm and
+   cold runtime state with one line of setup, no knowledge of Env internals;
+3. the single-VM programming model applications already have (`:global` env)
+   is untouched — isolation is opt-in per process.
+
+The design has three layers, each independently shippable and each gated by
+the full suite:
+
+  L1 Environments   — the mechanism: env-scoped state with read-through
+  L2 Propagation    — the leak fix: env crosses spawn/Task boundaries
+  L3 Sandbox        — the product: warm base images + checkout/checkin API
+                      + ExUnit template + parallel bl suite runner
+
+L1+L2 alone make `async: true` possible. L3 makes it EASY. Downstream apps
+adopt only L3's surface; L1/L2 are invisible machinery.
+
+* Design principles
+
+1. `:global` is the zero env. Every code path that works today must work
+   byte-identically when no env is bound (pdict key absent). The rollback IS
+   the default.
+2. Reads may cross env boundaries (read-through to ancestors); writes never
+   do. This is what makes warm forks cheap: no copying, ever.
+3. The harness product (L3) is the ONLY thing downstream apps touch. If an
+   app's test needs more than `use BeamLisp.ExUnitCase`, the design has
+   leaked.
+4. Spawn propagation is closed in the RUNTIME (Refs.future_exec /
+   Refs.promise), not by convention — bl code spawns opaquely, an opt-in
+   helper will be forgotten.
+
+* L1 — Environments (mechanism)
+
+** Env id and the pdict binding
+
+- `Env.env_id/0` → `Process.get(:bl_env, :global)`. One pdict read (~32ns,
+  spike-measured) on the hot path.
+- `Env.with_env(env, fun)` / `Env.fork(parent \\ env_id())` → fresh env id
+  `{reference}` or `{:env, uniq}`; binds in the CALLING process; `fun` runs;
+  pdict restored in `after`.
+- An env is just a key prefix + a parent pointer. Metadata (parent, liveness)
+  lives in ONE registry row: `{:envs, env_id} → %{parent: pid_or_id}` in the
+  same ETS table, or in the Agent's map — decision: Agent map, because env
+  metadata is small and write-once, and it keeps the table's key shapes
+  uniform (all `{env_id, …}`).
+
+** Key prefixing (the 44 sites from the spike)
+
+Every ETS key gains the env prefix as its FIRST element:
+
+| today                    | becomes                          |
+|--------------------------+----------------------------------|
+| `{ns, name}`             | `{env, ns, name}`                |
+| `{:alias, ns, a}`        | `{env, :alias, ns, a}`           |
+| `{:refer, ns, name}`     | `{env, :refer, ns, name}`        |
+| `{:ns, ns}`              | `{env, :ns, ns}`                 |
+| `{:ns_defs, ns}`         | `{env, :ns_defs, ns}`            |
+| `{:link, ns, name}`      | `{env, :link, ns, name}`         |
+| `{:meta, ns, name}`      | `{env, :meta, ns, name}`         |
+| TestRT `{:test_registry…`| `{env, :test_registry, ns}` etc. |
+| Trace registries         | `{env, …}`                       |
+
+Files: env.ex (22 sites), multi.ex (15), rt.ex (4), meta.ex (2), link.ex (1),
+test_rt.ex (14), trace.ex (6). All changes are mechanical: each
+`:ets.lookup/insert/match/delete` call threads `env_id()` into the key. A
+private `key/1` helper in Env (`def key(rest), do: {env_id(), rest}` … per
+shape) keeps call sites one-token diffs.
+
+** Read-through chain (the warm-fork enabler)
+
+`fetch/2`'s candidate walk gains an OUTER loop over the env chain:
+`[env, parent, …, :global]`. Depth is ≤ 3 in every designed use
+(test env → warm base → :global core+prelude). Spike measured +6% for one
+fallback hop; a second hop adds the same order — still ns-scale, and it only
+applies on a miss in the local env (warm: app vars resolve at depth 1).
+
+Same treatment for: `meta`, `link`, `refer_source`, `alias_target`,
+`ns_exists?`, `public_names` (UNION across chain — refer :all must see
+ancestor names), `ns_defs`, `namespaces`.
+
+Writes (`intern`, `put_meta`, `put_link`, `add_alias`, `add_refer`,
+`put_ns_defs`, `declare_ns`, `mark_*`) ALWAYS target `env_id()` — never an
+ancestor. Redefining `map` in a test shadows core's `map` locally; core is
+untouched.
+
+** Agent state per env
+
+Agent map gains an `envs: %{env_id => %{loaded: MapSet, search_paths: [],
+seeded: bool}}` layer; `:global` state stays at the top level so today's
+shape is the default branch.
+
+- `current_ns`: becomes pdict-first — `Process.get(:bl_ns)` falling back to
+  the Agent's per-env value, written on `in_ns/1`. It is per-process
+  conceptually already (a compile in progress owns "current ns"); making it
+  pdict removes the last cross-process mutable cell. REPL/session behavior
+  unchanged at :global (Agent fallback covers non-pdict callers).
+- `loaded`/`mark_loaded`: per env. A warm fork inherits loadedness through
+  read-through (`loaded_ns?` consults the chain); loads triggered inside a
+  test mark only the test's env. Loader's `ensure_loaded` cycle guard keeps
+  working because marks are chain-visible DURING a load.
+- `search_paths`: per env with chain fallback (a test can add a fixture root
+  without polluting the base).
+
+** Teardown
+
+`Env.destroy(env_id)`:
+- `:ets.match_delete(@table, {{env_id, :_}, :_})` won't match the 3+-tuple
+  keys in one spec — use `:ets.select_delete/2` with a guard on
+  `element(1, key) == env_id` (single scan, one spec, works ∀ shapes);
+- Agent: drop the envs entry.
+Called from ExUnit `on_exit`. A leaked destroy is a slow leak of ETS rows,
+not a correctness bug — acceptable; a monitor-based sweeper is a later nicety
+(NOT in this plan; noted as FUP material).
+
+** What stays global (documented, with clash caveats)
+
+- `BeamLisp.Record` persistent_term registry (module-keyed): two envs
+  redefining the same record name clash. Document now; key by `{env, mod}`
+  later IF a suite actually needs it.
+- `BeamLisp.Native` table, `BeamLisp.LazySeq` table: global; lazy seqs are
+  thunk-state, tests that realize them concurrently get correct (shared)
+  memoization — the only clash is a test that expects to re-realize.
+- App-level singletons (Interface.Server agent registry, relay backend swap,
+  persistent_term `:loaded` flags): OUT OF SCOPE — they are app state, not
+  lisp runtime state. The harness design must not pretend to isolate them.
+
+* L2 — Propagation (the leak fix)
+
+Spike Q3: pdict does not cross `Task.async`/`spawn`. The ENTIRE bl-visible
+spawn surface is two functions in BeamLisp.Refs:
+
+- `Refs.future_exec/1` (refs.ex:235) — `Task.async(thunk_fn)`
+- `Refs.promise/0`   (refs.ex:255) — `spawn(fn -> promise_loop(…) end)`
+
+Fix: capture at spawn, re-put in child.
+
+#+begin_src elixir
+def future_exec(thunk_fn) do
+  token = Env.capture()                       # %{env: env_id(), ns: pdict ns}
+  %BeamLisp.Future{task: Task.async(fn -> Env.bind(token); thunk_fn.() end)}
+end
+#+end_src
+
+`Env.capture/0` → opaque `%{env:, ns:}`; `Env.bind/1` → puts both pdict keys.
+Two spawn sites in beam-lisp, ZERO compiler-emitted spawn forms (the spike's
+worst case does not exist — future/promise are library-level and already
+funnel through Refs).
+
+Host-Elixir spawn sites that run bl inside a spawned process must opt in
+explicitly — inventory (grep-verified today):
+
+- spell/apps/spell/lib/spell/loop.ex:391 (turn process) and :833 (spawn +
+  monitor) — add `Env.capture` before spawn, `Env.bind` first line of the
+  spawned fn. Required for spell's own async tests to drive turns.
+- relay engine/server: no Task/spawn around bl evaluation found (grep clean);
+  verify again at implementation time.
+
+Contract: host code that spawns around bl work captures+binds. This is
+documented in the module doc of `Env` and asserted by a test that spawns a
+future inside an isolated env and reads an env-local var from it.
+
+* L3 — Sandbox (the product)
+
+The harness surface downstream apps use. New module `BeamLisp.Sandbox`
+(beam-lisp lib/, because every consumer needs it and it is pure runtime —
+no test-only placement; `BeamLisp.ExUnitCase` in the same file or a sibling).
+
+** Concepts
+
+- A BASE IMAGE is an env holding evaluated namespaces: `:global` always
+  exists (prelude); an app creates one warm base per "world" its tests need.
+- CHECKOUT forks a child env of a base; CHECKIN destroys it. Checkout is
+  µs-cheap (one env id + one Agent entry + pdict write). No copying, ever.
+
+** API sketch
+
+#+begin_src elixir
+defmodule BeamLisp.Sandbox do
+  @doc "Evaluate `paths` into a fresh warm base env (parent :global). Once per VM/suite."
+  def warm!(name, paths, opts \\ [])           # -> :ok (idempotent by name)
+
+  @doc "Fork a child of base `name` (default :global). Binds THIS process."
+  def checkout(base \\ :global)                # -> env token
+
+  @doc "Destroy a checked-out env (on_exit)."
+  def checkin(token)                           # -> :ok
+
+  @doc "Evaluate a file/string INTO the checked-out env (cold-loading app code per test)."
+  def load(path_or_string)                     # -> :ok — Loader/eval with env bound
+end
+#+end_src
+
+warm vs cold is then a one-token choice at the checkout site:
+
+- WARM test: `checkout(:my_app)` — sees every var the base loaded, isolates
+  its own defs. Cost: fork + read-through. This is the default for unit tests
+  of pure fns over loaded namespaces.
+- COLD test: `checkout()` (base :global = prelude only) then
+  `Sandbox.load("src/my/thing.bl")` — re-evals exactly what the test names.
+  With FEAT-002's cache the compile is cache-hot; the eval interns into the
+  test env only. This is the default for loader/compiler tests and for bl
+  suite files.
+
+** ExUnit integration — the one line
+
+#+begin_src elixir
+defmodule BeamLisp.ExUnitCase do
+  defmacro __using__(opts) do
+    base = Keyword.get(opts, :base, :global)   # or {:warm, name, paths}
+    quote do
+      use ExUnit.Case, async: true
+      setup do
+        env = BeamLisp.Sandbox.checkout(unquote(base_resolved))
+        on_exit(fn -> BeamLisp.Sandbox.checkin(env) end)
+        {:ok, bl_env: env}
+      end
+    end
+  end
+end
+#+end_src
+
+Downstream adoption diff (spell_case.ex, relay's bl wrapper):
+
+#+begin_src elixir
+use BeamLisp.ExUnitCase, warm: {:spell, ["spell.app", "interface.run", "interface.live"]}
+#+end_src
+
+replaces today's `setup_all ensure_loaded!` + `async: false`. Spell's
+`persistent_term` load-guard is replaced by `Sandbox.warm!`'s idempotency.
+
+** bl-side parallel suites (TestRT)
+
+- Registry/run-state/ctx keys gain the env prefix (already in L1's table
+  list) — deftest collection is per-env with read-through, so a test file
+  sees the base's registered tests but registers its own locally.
+  DECISION: `run-tests` in a forked env runs ONLY locally-registered tests
+  (registry read does NOT walk the chain — registering into a fork must not
+  re-run the base's tests). Implemented by keying `registered_tests` /
+  `test_namespaces` to the exact env only.
+- `TestRT.run_suite(paths, async: true)`: warm base gets prelude + test.bl
+  once; each FILE evals in its own fork (Task.async_stream, capped at
+  System.schedulers_online); namespaces within a file stay sequential
+  (deftest context stack is per-ns single-slot by design). Aggregates totals
+  across forks. `async: false` (today's behavior) remains the default until
+  consumers opt in.
+- `{:test_ctx}` (current test + `testing` stack): moves to pdict — it is
+  already "the running process's context"; per-process is its true shape.
+
+** The seamless end-state (what "done" feels like)
+
+#+begin_src bash
+mix test                    # beam-lisp: max_cases saturates cores
+mix relay.test              # relay bl files run concurrently, each isolated
+mix test                    # spell: async: true everywhere SpellCase was
+#+end_src
+
+and in code, the entirety of a downstream app's harness knowledge is:
+
+#+begin_src elixir
+use BeamLisp.ExUnitCase, warm: {:my_app, ~w[my.app my.other]}
+#+end_src
+
+* Migration order (each step separately committable, suite-gated)
+
+1. L1a: `env_id/0`, `key` helpers, prefix ALL 44 table sites, `:global`
+   behavior byte-identical. Gate: full `mix test` + `mix beam_lisp.test
+   --path examples` — this step must be a pure refactor.
+2. L1b: Agent per-env state + pdict current_ns + `with_env`/`fork`/`destroy`
+   + read-through chain. Gate: new unit tests (isolation, shadowing,
+   fallback, destroy) + full suite.
+3. L2: Refs capture/bind + Env.capture/bind + loop.ex opt-ins + propagation
+   test (future reads env-local var). Gate: suite + a concurrent-future
+   stress test.
+4. L3a: Sandbox warm!/checkout/checkin/load + ExUnitCase. Gate: new sandbox
+   tests + suite.
+5. L3b: TestRT per-env registry + `run_suite(async: true)`. Gate:
+   beam_lisp.test examples serial AND async runs both green, diff the totals.
+6. Flip suites, file by file, in this order: beam-lisp ExUnit files (most
+   are pure RT tests — cheapest first), then relay bltest
+   (`run_suite(async: true)`), then spell_case → `use BeamLisp.ExUnitCase`.
+   Each flip is its own commit with suite gate. Files that touch the
+   documented-global registries (Record/Native/LazySeq) stay `async: false`
+   with a comment naming the registry.
+
+* Costs, quantified (from the spike + FEAT-002 numbers)
+
+- Hot-path read: +6% (~40ns/op) at one fallback hop; ≤3 hops worst case.
+- Checkout: µs-scale (no copying).
+- Per-test COLD load of a cache-hot namespace: FEAT-002 measured ~9s for
+  beam-lisp's whole AOT closure; a single app namespace is ms-scale.
+- Implementation: ~44 mechanical sites + Agent layer + 2 spawn sites +
+  Sandbox/TestRT/ExUnitCase ≈ 2–3 focused days (spike estimate 2 for L1/L2;
+  L3 adds ~1).
+- Alternative rejected: explicit env handle threaded through every call —
+  spike estimated a large mechanical diff across 4 codebases and a permanent
+  signature tax on every future RT fn.
+- Alternative complementary: OS-process sharding (CI `--partitions`) — costs
+  a VM boot per partition (FEAT-002: ~10s warm) and parallelizes NOTHING
+  within a partition. Keep for CI; not a substitute.
+
+* Risks and honest edges
+
+- `select_delete` by env prefix is O(table size) per checkin. At suite scale
+  (thousands of tests × small tables) fine; if a profile says otherwise, the
+  FUP is a per-env named ETS table (the spike's option B) behind the same
+  `key/1` seam.
+- Read-through chains make "why did this var resolve" one level harder to
+  answer. Mitigation: `Env.explain(ns, name)` debug fn returning the chain
+  walk (cheap to add in L1b, pays for itself the first confusing test).
+- `defmulti`/`defprotocol` dispatch tables (multi.ex) are prefixed like
+  everything else; a warm fork that ADDS a defmethod shadows dispatch
+  locally — intended, and matches how Clojure tests that re-def behave
+  per-namespace.
+- Host Elixir code holding bl fns across process boundaries (spell's
+  seeded_machine pattern) is unaffected: VALUES cross freely; only env
+  LOOKUP is scoped.
+
+* Verification
+
+Per-step gates above, plus the standing pair:
+
+    cd /home/user/code/undefine/beam-lisp && mix test
+    cd /home/user/code/undefine/beam-lisp && mix beam_lisp.test --path examples
+
+End-state acceptance: `mix test` in beam-lisp runs with async cases
+(nonzero `async` time in the summary line); relay `.local/bltest` async
+mode green; spell `mix test` green with `use BeamLisp.ExUnitCase` and
+`async: true` in every suite that used SpellCase.
+
+* Related
+
+- FEAT-003 (spell repo): the spike whose findings this design consumes.
+- FEAT-001 (spell repo): session-safe harness daemon serializes RUNS across
+  sessions; this parallelizes TESTS within a run. Complementary; the daemon
+  stays the outer lock.
+- FEAT-002: AOT cache is what makes cold checkouts cheap.
+- PLAN-006: compile-speed fix is what makes eval-into-fork (cold loads)
+  ms-scale instead of seconds.
