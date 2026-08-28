@@ -1,0 +1,297 @@
+; research/p2_positions/poswalk.bl — P2: positions × macros.
+;
+; The question: do FormMeta positions survive the checker's whole
+; pipeline, including macro-shaped code — WITHOUT macroexpanding the
+; common cases? Answer shape: a form walker that
+;   - consumes Reader/read_string output ({:meta, node, %{line col}})
+;   - records an EVIDENCE TABLE {[line col] → tagset} (Lean L1 preview)
+;   - whitelists the binding/threading macros (when, when-not, cond,
+;     and, or, ->, ->>) with structural walk rules — never expanding them
+;   - falls back to Compiler/macroexpand_1 for unknown macros, keeping
+;     the OUTER position (expansion nodes carry none — that is honest)
+;   - warns with file:line:col of what the user actually wrote
+;
+; Reuses P1's lattice (tags as sets) and sigs-from-env (the P0 pipe).
+
+(ns poswalk
+  (:require [lattice :as t]))
+
+; --- node plumbing -----------------------------------------------------------
+;
+; Reader nodes are Elixir tuples: {:meta, node, pos} / {:list, items} /
+; {:vector, items} / {:symbol, name} / {:map, pairs}. Scalars pass through.
+
+(defn node-tag [n]
+  (if (erlang/is_tuple n)
+    (first (erlang/tuple_to_list n))
+    :scalar))
+
+(defn node-form
+  "Peel one {:meta, _, _} layer. The reader wraps COMPOSITE nodes
+   (lists, sometimes vectors); scalars and bare tuples pass through."
+  [n]
+  (if (and (erlang/is_tuple n)
+           (= :meta (first (erlang/tuple_to_list n))))
+    (second (erlang/tuple_to_list n))
+    n))
+
+(defn node-items [n] (second (erlang/tuple_to_list (node-form n))))
+
+(defn node-pos [n]
+  (if (and (erlang/is_tuple n)
+           (= :meta (first (erlang/tuple_to_list n))))
+    (nth (erlang/tuple_to_list n) 2)
+    nil))
+
+(defn node-name [n] (second (erlang/tuple_to_list n)))
+
+; Building reader-shaped nodes from bl: bl has NO tuple literal, so
+; nodes go through erlang/list_to_tuple over a real list. ([:list …] is
+; a Vector STRUCT — erlang fns reject it; {:symbol …} is a MAP.)
+(defn ->tuple [xs] (erlang/list_to_tuple (apply list xs)))
+(defn sym-node [s] (->tuple [:symbol s]))
+(defn list-node [items] (->tuple [:list items]))
+(defn meta-node [n pos] (->tuple [:meta n pos]))
+
+; --- state --------------------------------------------------------------------
+
+(def warnings (atom []))
+(def evidence (atom {}))
+
+(defn warn! [msg pos form]
+  (swap! warnings
+         (fn [ws]
+           (conj ws {:msg msg
+                     :line (if (nil? pos) 0 (:line pos))
+                     :col  (if (nil? pos) 0 (:col pos))
+                     :form (pr-str form)}))))
+
+(defn record! [pos type]
+  (if (nil? pos)
+    nil
+    (swap! evidence (fn [ev] (assoc ev [(:line pos) (:col pos)] type)))))
+
+; --- the walker -----------------------------------------------------------------
+
+(declare walk)
+
+(defn eff-pos
+  "Position for warnings: the node's own, else the enclosing meta
+   wrapper's (threaded through the env by the :meta case — synthesized
+   nodes from threading honestly have none of their own)."
+  [env node]
+  (let [p (node-pos node)]
+    (if (nil? p) (:__pos env) p)))
+
+(defn sym-type [env n]
+  (get env (node-name n) t/any))
+
+(defn call-sig [sigs n] (get sigs (node-name n) nil))
+
+(defn walk-call [sigs env items pos whole]
+  (let [head (first items)
+        arg-types (into [] (map (fn [a] (walk sigs env a)) (rest items)))]
+    (if (= :symbol (node-tag head))
+      (let [sig (call-sig sigs head)]
+        (if (nil? sig)
+          t/any
+          (do
+            (doall
+              (map-indexed
+                (fn [i declared]
+                  (let [actual (get arg-types i nil)]
+                    (if (and (some? actual)
+                             (empty? (t/t-meet actual declared)))
+                      (warn! (str (node-name head) ": argument " (+ i 1) " is "
+                                  (pr-str (sort (into [] actual)))
+                                  ", declared "
+                                  (pr-str (sort (into [] declared))))
+                             pos whole)
+                      nil)))
+                (:args sig)))
+            (:ret sig))))
+      t/any)))
+
+(defn walk-if [sigs env items pos whole]
+  (let [test (second items)
+        then (nth items 2)
+        else (get (into [] items) 3 nil)]
+    (walk sigs env test)
+    (let [[then-env else-env]
+          (if (and (= :list (node-tag (node-form test)))
+                   (= 2 (count (node-items test)))
+                   (= :symbol (node-tag (node-form (first (node-items test)))))
+                   (= :symbol (node-tag (node-form (second (node-items test))))))
+            (let [pred (node-name (first (node-items test)))
+                  x    (node-name (second (node-items test)))
+                  tags (get t/guard-tags (symbol pred) nil)]
+              (if (nil? tags)
+                [env env]
+                (let [cur (get env x t/any)
+                      in  (t/t-meet cur tags)
+                      out (t/t-diff cur tags)]
+                  (if (empty? in)
+                    (warn! (str "branch unreachable: " x " is provably not "
+                                (pr-str (sort (into [] tags))))
+                           (let [p (node-pos test)] (if (nil? p) (:__pos env) p))
+                           test)
+                    nil)
+                  [(assoc env x in) (assoc env x out)])))
+            [env env])]
+      (t/t-union (walk sigs then-env then)
+                 (if (nil? else) t/never (walk sigs else-env else))))))
+
+(defn walk-let [sigs env bindings body]
+  (let [bs (node-items (node-form bindings))
+        env2 (loop [xs bs e env]
+               (if (empty? xs)
+                 e
+                 (recur (rest (rest xs))
+                        (assoc e (node-name (first xs))
+                                 (walk sigs e (second xs))))))]
+    (reduce (fn [_ b] (walk sigs env2 b)) t/never body)))
+
+; Threading: (-> x (f a) g) is walked AS (g (f x a)) — but every
+; synthesized call borrows the position of the form the user wrote.
+; This is the InfoTree move: elaborated, position-attributed.
+
+(defn desugar-thread
+  "Returns the nested call the thread means, with each synthesized call
+   wrapped in {:meta, _, pos} carrying the position of the STEP the user
+   wrote — InfoTree-style: elaborated, position-attributed. `first?`:
+   -> inserts at arg 1, ->> at the end."
+  [first? x steps]
+  (loop [acc x
+         ss steps]
+    (if (empty? ss)
+      acc
+      (let [s (first ss)
+            pos (node-pos s)
+            core (node-form s)]
+        (if (= :list (node-tag core))
+          (let [its (node-items core)
+                args (if first?
+                       (concat [(first its)] [acc] (rest its))
+                       (concat [(first its)] (rest its) [acc]))
+                syn (list-node (apply list args))]
+            (recur (if (nil? pos) syn (meta-node syn pos))
+                   (rest ss)))
+          (let [syn (list-node (list s acc))]
+            (recur (if (nil? pos) syn (meta-node syn pos))
+                   (rest ss))))))))
+
+(defn walk-cond [sigs env pairs]
+  (loop [ps pairs acc t/never]
+    (if (empty? ps)
+      acc
+      (do
+        (walk sigs env (first ps))
+        (recur (rest (rest ps))
+               (t/t-union acc (walk sigs env (second ps))))))))
+
+(def specials #{"if" "let" "do" "fn" "quote" "loop"})
+
+(defn walk [sigs env node]
+  (let [tag (node-tag node)]
+    (cond
+      (= tag :meta)
+        (let [pos (node-pos node)
+              ty  (walk sigs (assoc env :__pos pos)
+                        (second (erlang/tuple_to_list node)))]
+          (record! pos ty)
+          ty)
+
+      (= tag :symbol) (sym-type env node)
+
+      (= tag :vector)
+        (do (doall (map (fn [x] (walk sigs env x)) (node-items node)))
+            #{:vec})
+
+      (= tag :list)
+        (let [items (node-items node)
+              head  (first items)
+              pos   (eff-pos env node)
+              hname (if (= :symbol (node-tag head)) (node-name head) "")]
+          (cond
+            (= hname "if")   (walk-if sigs env items pos node)
+            (= hname "let")  (walk-let sigs env (second items) (rest (rest items)))
+            (= hname "do")   (reduce (fn [_ b] (walk sigs env b)) t/never (rest items))
+            (= hname "quote") #{:sym}
+
+            ; whitelisted macros — walked structurally, NEVER expanded
+            (= hname "when")
+              (walk-if sigs env
+                       (apply list [head (second items)
+                                    (list-node
+                                      (apply list
+                                             (concat [(sym-node "do")]
+                                                     (rest (rest items)))))])
+                       pos node)
+            (= hname "when-not")
+              (walk-if sigs env
+                       (list head (second items)
+                             (list-node
+                               (apply list
+                                      (concat [(sym-node "do")]
+                                              (rest (rest items))))))
+                       pos node)
+            (= hname "cond") (walk-cond sigs env (rest items))
+            (= hname "and")
+              (do (doall (map (fn [x] (walk sigs env x)) (rest items)))
+                  (t/t-union #{:bool} t/any))
+            (= hname "or")
+              (do (doall (map (fn [x] (walk sigs env x)) (rest items)))
+                  t/any)
+            (= hname "->")
+              (walk sigs env (desugar-thread true (second items) (rest (rest items))))
+            (= hname "->>")
+              (walk sigs env (desugar-thread false (second items) (rest (rest items))))
+
+            ; unknown macro? expand once via the compiler's own oracle,
+            ; keep OUR position, walk the expansion (its generated nodes
+            ; honestly carry none).
+            :else
+              (let [orig     (list-node items)
+                    expanded (BeamLisp.Compiler/macroexpand_1 orig "p2demo")]
+                (if (identical? expanded orig)
+                  (walk-call sigs env items pos node)
+                  (walk sigs (assoc env :__pos pos) expanded)))))
+
+      :else (t/lit-type node))))
+
+; --- entry: check a defn-bearing source -----------------------------------------
+
+(defn check-forms
+  "Walk top-level forms. defn bodies get params bound from the
+   ^{:args} annotation via the P0 pipe (lattice/sigs-from-env)."
+  [forms ns]
+  (let [sigs (merge t/core-sigs (t/sigs-from-env ns))]
+    (doall
+      (map
+        (fn [form]
+          (let [f (if (= :meta (node-tag form))
+                    (second (erlang/tuple_to_list form))
+                    form)]
+            (if (and (= :list (node-tag f))
+                     (= :symbol (node-tag (first (node-items f))))
+                     (= "defn" (node-name (first (node-items f)))))
+              (let [items (node-items f)
+                    name  (node-name (second items))
+                    sig   (get sigs name nil)
+                    params (node-items (node-form (nth items 2)))
+                    env   (if (nil? sig)
+                            {}
+                            (zipmap (map node-name params) (:args sig)))]
+                (doall (map (fn [b] (walk sigs env b)) (rest (rest (rest items)))))
+                t/never)
+              (walk sigs {} form))))
+        forms))
+    {:warnings (deref warnings) :evidence (deref evidence)}))
+
+(defn hover
+  "The L1/L12 demo: type at [line col], delaborated for a human."
+  [ev line col]
+  (let [ty (get ev [line col] nil)]
+    (if (nil? ty)
+      "∅ no evidence"
+      (pr-str (sort (into [] ty))))))
