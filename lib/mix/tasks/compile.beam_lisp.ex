@@ -102,14 +102,42 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
         sources = discover(source_dirs)
         manifest = read_manifest(manifest_path)
-        ordered = order_by_requires(sources)
+        {ordered, deps} = order_and_deps(sources)
+
+        hashes = Map.new(ordered, fn path -> {path, content_hash(path)} end)
+
+        cache_key =
+          if BeamLisp.AOTCache.enabled?() and opts[:force] != true do
+            BeamLisp.AOTCache.compiler_key()
+          end
 
         {manifest, recompiled, errors} =
           Enum.reduce(ordered, {manifest, false, []}, fn path, {m, rc, errs} ->
-            hash = content_hash(path)
+            hash = Map.fetch!(hashes, path)
 
             if opts[:force] || not up_to_date?(m, path, hash, compile_path) do
-              case compile_file(path, compile_path) do
+              closure_key =
+                if cache_key, do: BeamLisp.AOTCache.closure_key(path, deps, hashes)
+
+              cached =
+                if closure_key do
+                  BeamLisp.AOTCache.fetch(cache_key, closure_key, compile_path)
+                end
+
+              result =
+                case cached do
+                  {:ok, modules} ->
+                    # A fetch evaluates nothing; run each namespace's init
+                    # hook so value defs are interned as a fresh compile
+                    # would have interned them.
+                    BeamLisp.AOTCache.run_init_modules(modules, compile_path)
+                    {:ok, modules}
+
+                  _ ->
+                    compile_file(path, compile_path)
+                end
+
+              case result do
                 {:ok, modules} ->
                   # Delete beams this source used to emit but no longer does.
                   # A namespace emits one namespace module plus one body module
@@ -134,6 +162,13 @@ defmodule Mix.Tasks.Compile.BeamLisp do
                   # resume. Persisting per source makes the cold build resumable
                   # and keeps manifest and ebin in step at every observable point.
                   write_manifest(manifest_path, m2)
+
+                  # Publish freshly compiled beams; cache hits and failed
+                  # stores alike fall through to the normal flow.
+                  if closure_key != nil and not match?({:ok, _}, cached) do
+                    BeamLisp.AOTCache.store(cache_key, closure_key, compile_path, modules)
+                  end
+
                   {m2, true, errs}
 
                 {:error, err} ->
@@ -323,8 +358,9 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
   # Compile sources in dependency order: a source's `ns :require`
   # targets that are themselves sources must compile first. Returns the
-  # list in compile order, or raises on a cycle.
-  defp order_by_requires(sources) do
+  # list in compile order plus the resolved path → required-paths map
+  # (the AOT cache keys on the transitive closure), or raises on a cycle.
+  defp order_and_deps(sources) do
     # primary ns and require targets per source
     info =
       Enum.map(sources, fn path ->
@@ -349,7 +385,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         {acc ++ sub, vs}
       end)
 
-    ordered
+    {ordered, deps}
   end
 
   defp visit(path, deps, vs) do
