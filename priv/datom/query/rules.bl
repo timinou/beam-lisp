@@ -219,14 +219,18 @@
 ;;
 ;; Bottom-up materialisation computes each rule's relation with an EMPTY
 ;; initial binding — so a body predicate over a HEAD argument
-;; (`[(<= ?from ?date)]` with `?date` bound only at the call site) can
-;; never fire. This is the bounded-recursion problem; the lightweight
-;; answer (magic sets' little sibling) is ADORNMENT: find the rule
-;; invocations in the query, take the positions bound at EVERY call site
-;; (constants, or variables bound by query inputs), and evaluate bodies
-;; with those constants already in the initial rows. Soundness rule:
-;; a position free in ANY invocation is never seeded — a free call site
-;; must see the full relation.
+;; ([(<= ?from ?date)] with ?date bound only at the call site) never fires.
+;; The answer is ADORNMENT (magic sets' little sibling): find the rule
+;; invocations, take positions bound by constants or query inputs at EVERY
+;; call site, and evaluate bodies with those constants in the initial rows.
+;; Constants then PROPAGATE: a seeded head var passed to another rule's
+;; invocation seeds that rule too (fixpoint below) — so a precondition rule
+;; invoking a temporal rule carries its date down.
+;;
+;; Soundness: a position free in ANY invocation (query or rule body) is
+;; never seeded — a free call site must see the full relation. Seeds carry
+;; only constants drawn from the query, so the lattice is finite and the
+;; fixpoint terminates.
 
 (def ^:private composite-ops #{:or :and :not :or-join :not-join})
 
@@ -234,7 +238,7 @@
   (and (vector? c) (contains? composite-ops (get c 0))))
 
 (defn- scan-invocations
-  "Every rule-invocation clause in a where tree, descending into
+  "Every rule-invocation clause in a where/body tree, descending into
    :or/:and/:not composites. Anything not an invocation is ignored — a
    MISSED invocation would under-seed, so the walker favours recall."
   [clauses names]
@@ -264,58 +268,97 @@
                           (to-list pm)))
                 (to-list posmaps)))))
 
+(defn- invocation-posmap
+  "The positional seeds one invocation contributes: constant args directly,
+   variable args through `bound-map` (query inputs, or the enclosing rule's
+   seeded head vars during propagation)."
+  [call-args head-arity bound-map]
+  (reduce
+    (fn [m i]
+      (let [arg (get call-args i)]
+        (cond
+          (not (datom.query.parse/variable? arg))
+            (assoc m i arg)
+          (contains? bound-map arg)
+            (assoc m i (get bound-map arg))
+          :else m)))
+    {}
+    (range (min head-arity (count call-args)))))
+
+(defn- intersect-positions
+  "Positions present in EVERY posmap; values kept per posmap."
+  [posmaps]
+  (if (empty? posmaps)
+    []
+    (let [common (reduce
+                   (fn [ks m] (filterv (fn [k] (contains? m k)) ks))
+                   (into [] (mapv (fn [kv] (key kv))
+                                  (to-list (get posmaps 0))))
+                   posmaps)]
+      (into []
+            (distinct
+              (mapv (fn [m]
+                      (reduce (fn [r k] (assoc r k (get m k))) {} common))
+                    posmaps))))))
+
+(defn- normalize-seeds [m]
+  (reduce (fn [a kv]
+            (assoc a (key kv) (into [] (distinct (to-list (val kv))))))
+          {}
+          (to-list m)))
+
 (defn invocation-seeds
   "Per-rule seed positions for a query: `{rule-name [{position value} …]}`.
-   One positional map per invocation; a position survives only if bound in
-   EVERY invocation of that rule. `input-binding` is the query's :in row
-   (single-row only — the caller passes {} when inputs are multi-row)."
+   Computed from the where tree, then propagated through rule bodies to a
+   fixpoint. `input-binding` is the query's :in row (single-row only — the
+   caller passes {} when inputs are multi-row)."
   [rules where-clauses input-binding]
   (let [grouped (rules-by-name rules)
         names (rule-names rules)
-        invs (scan-invocations where-clauses names)
-        by-name
+        arity-of (fn [nm] (count (rule-head-args (get (get grouped nm) 0))))
+        query-maps
         (reduce
           (fn [acc c]
             (let [nm (first c)
                   call-args (into [] (rest c))
-                  head-arity (count (rule-head-args (get (get grouped nm) 0)))
-                  posmap
-                  (reduce
-                    (fn [m i]
-                      (let [arg (get call-args i)]
-                        (cond
-                          (not (datom.query.parse/variable? arg))
-                            (assoc m i arg)
-                          (contains? input-binding arg)
-                            (assoc m i (get input-binding arg))
-                          :else m)))
-                    {}
-                    (range (min head-arity (count call-args))))]
-              (assoc acc nm (conj (or (get acc nm) []) posmap))))
+                  pm (invocation-posmap call-args (arity-of nm) input-binding)]
+              (assoc acc nm (conj (or (get acc nm) []) pm))))
           {}
-          invs)
-        nms (into [] (mapv (fn [kv] (key kv)) (to-list by-name)))]
-    (reduce
-      (fn [acc nm]
-        (let [posmaps (get by-name nm)
-              common
-              (reduce
-                (fn [ks m]
-                  (filterv (fn [k] (contains? m k)) ks))
-                (into [] (mapv (fn [kv] (key kv))
-                               (to-list (get posmaps 0))))
-                posmaps)
-              kept
-              (into []
-                    (distinct
-                      (mapv (fn [m]
-                              (reduce (fn [r k] (assoc r k (get m k)))
-                                      {}
-                                      common))
-                            posmaps)))]
-          (assoc acc nm kept)))
-      {}
-      nms)))
+          (scan-invocations where-clauses names))]
+    (loop [seeds query-maps]
+      (let [grown
+            (reduce
+              (fn [acc d]
+                (let [nm (rule-name d)
+                      hargs (rule-head-args d)
+                      sub-invs (scan-invocations (rule-body d) names)]
+                  (reduce
+                    (fn [acc2 pm]
+                      (let [var-vals
+                            (reduce (fn [m kv]
+                                      (assoc m (get hargs (key kv)) (val kv)))
+                                    {}
+                                    (to-list pm))]
+                        (reduce
+                          (fn [acc3 sub]
+                            (let [snm (first sub)
+                                  sargs (into [] (rest sub))
+                                  spm (invocation-posmap sargs (arity-of snm)
+                                                         var-vals)]
+                              (assoc acc3 snm
+                                     (conj (or (get acc3 snm) []) spm))))
+                          acc2
+                          sub-invs)))
+                    acc
+                    (or (get acc nm) []))))
+              seeds
+              (to-list rules))]
+        (if (= (normalize-seeds grown) (normalize-seeds seeds))
+          (reduce (fn [a kv]
+                    (assoc a (key kv) (intersect-positions (val kv))))
+                  {}
+                  (to-list seeds))
+          (recur grown))))))
 
 ;; ── the two fixpoint evaluators ─────────────────────────────────────
 
