@@ -157,7 +157,8 @@ defmodule BeamLisp.Env do
   Run `fun` with `env` bound in the calling process; restores the previous
   binding (and process-local current-ns) afterwards.
   """
-  def with_env(env, fun) when is_function(fun, 0) do
+  def with_env(env, fun) do
+    fun = as_thunk(fun)
     prev_env = Process.get(@pdict_env)
     prev_chain = Process.get(@pdict_chain)
     prev_ns = Process.get(@pdict_ns)
@@ -183,9 +184,9 @@ defmodule BeamLisp.Env do
   Fork an env (parent: the current env), bind it for `fun`, and destroy it
   afterwards. The one-call shape of "run this in a clean room".
   """
-  def isolated(fun) when is_function(fun, 0), do: isolated(env_id(), fun)
+  def isolated(fun), do: isolated(env_id(), fun)
 
-  def isolated(parent, fun) when is_function(fun, 0) do
+  def isolated(parent, fun) do
     env = fork(parent)
 
     try do
@@ -194,6 +195,12 @@ defmodule BeamLisp.Env do
       destroy(env)
     end
   end
+
+  # bl fns are tagged structs, not Elixir fns — normalize any invocable
+  # thunk to a zero-arity Elixir fn so `env/with-env` works from bl source
+  # without the caller hand-wrapping through RT.invoke.
+  defp as_thunk(fun) when is_function(fun, 0), do: fun
+  defp as_thunk(fun), do: fn -> BeamLisp.RT.invoke(fun, []) end
 
   @doc """
   Drop every row belonging to `env` and forget its bookkeeping.
