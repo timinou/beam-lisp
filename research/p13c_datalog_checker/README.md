@@ -31,14 +31,14 @@ checks expressed as QUERIES:
   "no definition has BOTH" shape checkers need.
 - **Recursive rules: YES** — bottom-up fixpoint with the native kernel;
   rule invocation composes with ordinary clauses.
-- **fn calls in clauses: YES, flat only.** Predicate clauses like
-  `[(> ?x 3)]` work, but `(not (contains? …))` does NOT evaluate
-  (nesting unsupported), and a local `defn` is invisible to the engine
-  ("unknown predicate" — resolution happens against the engine's env,
-  not the caller's). **Design consequence: keep queries structural;
-  do value-level filtering in the host language on query results.**
-  This is a convention the checker can live with — or a future engine
-  improvement (resolve predicates against the query's `:source-ns`).
+- **fn calls in clauses: YES, and arbitrarily nested.** Predicate clauses
+  like `[(> ?x 3)]` work; this spike originally found that nested calls
+  (`(not (contains? …))`) silently filtered all rows and that ops resolved
+  against `core` only. Both were root-caused and fixed the same day
+  (BUG-024, BUG-025): predicate clauses are now EXPRESSIONS (recursive
+  evaluation under the row's bindings), and ops resolve in the QUERYING
+  namespace via the compiler's own candidate order. The check-2 query
+  below uses the natural nested spelling — no workaround remains.
 
 ## The Formulog argument holds
 
