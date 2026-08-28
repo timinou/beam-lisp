@@ -46,6 +46,7 @@ defmodule BeamLisp.Env do
   @pdict_env :bl_env
   @pdict_chain :bl_env_chain
   @pdict_ns :bl_ns
+  @pdict_caps :bl_caps
   @max_chain_depth 8
 
   def start_link(_opts) do
@@ -85,19 +86,72 @@ defmodule BeamLisp.Env do
   @doc """
   Create a new env whose reads fall through to `parent` (default: the
   current env). Returns the env id; does NOT bind it — see `with_env/2`.
+
+  Options:
+
+    * `:caps` — the host-interop capability set for the new env: `:all`
+      (default) or a list/`MapSet` of Elixir/Erlang modules the env's code
+      may call (e.g. `[File, String]`). Attenuation is STRUCTURAL, the
+      same monotonic-weakening invariant as Biscuit tokens: the child's
+      effective caps are `parent ∩ spec` — a fork can only ever narrow,
+      never grant a module the parent did not hold. `:global` holds `:all`.
   """
-  def fork(parent \\ env_id()) do
+  def fork(parent \\ env_id(), opts \\ []) do
     id = {:env, make_ref()}
+    caps = intersect_caps(caps_of(parent), Keyword.get(opts, :caps, :all))
 
     Agent.update(__MODULE__, fn s ->
       envs = Map.get(s, :envs, %{})
-      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent)))
+      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent, caps)))
     end)
 
     id
   end
 
-  defp fresh_env_state(parent), do: %{parent: parent, loaded: MapSet.new(), search_paths: []}
+  defp fresh_env_state(parent, caps \\ :all),
+    do: %{parent: parent, loaded: MapSet.new(), search_paths: [], caps: caps}
+
+  defp intersect_caps(:all, :all), do: :all
+  defp intersect_caps(:all, spec), do: MapSet.new(spec)
+  defp intersect_caps(set, :all), do: set
+  defp intersect_caps(set, spec), do: MapSet.intersection(set, MapSet.new(spec))
+
+  # ------------------------------------------------------------------
+  # Capabilities (host-interop rights per env)
+  # ------------------------------------------------------------------
+
+  @doc """
+  The effective capability set of `env`: `:all` or a `MapSet` of allowed
+  modules. `:global` holds `:all`; a forked env's caps were intersected at
+  fork time, so this lookup never walks the chain.
+  """
+  def caps_of(:global), do: :all
+
+  def caps_of(env) do
+    Agent.get(__MODULE__, fn s ->
+      case get_in(s, [:envs, env]) do
+        # Absent from the registry = never forked or already destroyed.
+        # Caps are a security boundary: fail CLOSED (no host interop),
+        # unlike reads, which degrade past dead envs.
+        nil -> MapSet.new()
+        %{caps: caps} -> caps
+      end
+    end)
+  end
+
+  @doc "The current process's capability set (`:all` when unbound)."
+  def caps, do: Process.get(@pdict_caps, :all)
+
+  @doc """
+  Whether the current process's env grants interop to `module`. The hot
+  path of the capability gate: one pdict read + set-membership check.
+  """
+  def caps_allowed?(module) do
+    case caps() do
+      :all -> true
+      set -> MapSet.member?(set, module)
+    end
+  end
 
   @doc """
   Run `fun` with `env` bound in the calling process; restores the previous
@@ -107,9 +161,11 @@ defmodule BeamLisp.Env do
     prev_env = Process.get(@pdict_env)
     prev_chain = Process.get(@pdict_chain)
     prev_ns = Process.get(@pdict_ns)
+    prev_caps = Process.get(@pdict_caps)
 
     Process.put(@pdict_env, env)
     Process.put(@pdict_chain, compute_chain(env))
+    Process.put(@pdict_caps, caps_of(env))
     # A fresh env means a fresh `*ns*`: Clojure thread-local semantics.
     Process.delete(@pdict_ns)
 
@@ -119,6 +175,7 @@ defmodule BeamLisp.Env do
       restore_pdict(@pdict_env, prev_env)
       restore_pdict(@pdict_chain, prev_chain)
       restore_pdict(@pdict_ns, prev_ns)
+      restore_pdict(@pdict_caps, prev_caps)
     end
   end
 
@@ -169,6 +226,7 @@ defmodule BeamLisp.Env do
   def attach(env) do
     Process.put(@pdict_env, env)
     Process.put(@pdict_chain, compute_chain(env))
+    Process.put(@pdict_caps, caps_of(env))
     Process.delete(@pdict_ns)
     :ok
   end
@@ -179,14 +237,26 @@ defmodule BeamLisp.Env do
   beam-lisp work should capture before spawning and bind in the child.
   """
   def capture do
-    %{env: Process.get(@pdict_env), chain: Process.get(@pdict_chain), ns: Process.get(@pdict_ns)}
+    %{
+      env: Process.get(@pdict_env),
+      chain: Process.get(@pdict_chain),
+      ns: Process.get(@pdict_ns),
+      caps: Process.get(@pdict_caps)
+    }
   end
 
-  @doc "Install a token from `capture/0` in the calling process."
+  @doc """
+  Install a token from `capture/0` in the calling process.
+
+  Caps are RE-DERIVED from `caps_of(env)`, never taken from the token:
+  a token is a value and can be stale (env destroyed → fail closed) or
+  smuggled across a boundary — the registry is the only source of truth.
+  """
   def bind(%{env: env, chain: chain, ns: ns}) do
     restore_pdict(@pdict_env, env)
     restore_pdict(@pdict_chain, chain)
     restore_pdict(@pdict_ns, ns)
+    restore_pdict(@pdict_caps, env && caps_of(env))
     :ok
   end
 

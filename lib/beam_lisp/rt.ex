@@ -46,7 +46,18 @@ defmodule BeamLisp.RT do
   end
 
   @doc false
-  def invoke({:"$remote", module, fun}, args), do: apply(module, fun, args)
+  def invoke({:"$remote", module, fun}, args) do
+    # Dynamic invocation of a host-module handle: the runtime half of the
+    # capability gate (static remote calls are rejected at compile time).
+    if BeamLisp.Env.caps_allowed?(module) do
+      apply(module, fun, args)
+    else
+      raise BeamLisp.CompileError,
+        message:
+          "module #{inspect(module)} is not granted in this environment " <>
+            "(dynamic invocation of #{inspect(module)}.#{fun}/#{length(args)} denied)"
+    end
+  end
 
   @doc false
   def invoke(f, args) when is_function(f), do: apply(f, args)
@@ -83,6 +94,15 @@ defmodule BeamLisp.RT do
   mistake while the reference is still in view.
   """
   def remote_fun(module, fun) do
+    # Creating a host-module handle is itself interop: gate it, so a
+    # capped env cannot even FORGE a handle it would later sneak past a
+    # caller that forgot to check (the $remote invoke clause checks too —
+    # belt and suspenders, since handles travel between processes).
+    unless BeamLisp.Env.caps_allowed?(module) do
+      raise BeamLisp.CompileError,
+        message: "module #{inspect(module)} is not granted in this environment"
+    end
+
     if Code.ensure_loaded?(module) do
       {:"$remote", module, fun}
     else
