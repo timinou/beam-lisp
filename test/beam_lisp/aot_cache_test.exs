@@ -86,6 +86,21 @@ defmodule BeamLisp.AOTCacheTest do
     assert AOTCache.enabled?()
   end
 
+  test "run_init_modules invokes __bl_init__/0 on shim modules" do
+    parent = self()
+    uniq = System.unique_integer([:positive])
+    shim = Module.concat([BeamLisp.Ns, "Spike#{uniq}"])
+    companion = Module.concat([BeamLisp.Ns, "Init", "Spike#{uniq}"])
+
+    Module.create(shim, quote(do: (def __bl_init__, do: send(unquote(parent), :init_ran))), Macro.Env.location(__ENV__))
+    # The companion shape: holds __bl_init_values__, NOT __bl_init__ —
+    # must be skipped silently.
+    Module.create(companion, quote(do: (def __bl_init_values__, do: :ok)), Macro.Env.location(__ENV__))
+
+    assert :ok = AOTCache.run_init_modules([companion, shim], System.tmp_dir!())
+    assert_received :init_ran
+  end
+
   test "changing a dependency's content changes the closure key" do
     hashes_a = %{"a.bl" => "1", "b.bl" => "2", "c.bl" => "9"}
     hashes_b = %{"a.bl" => "1", "b.bl" => "3", "c.bl" => "9"}

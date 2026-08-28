@@ -189,25 +189,24 @@ defmodule BeamLisp.AOTCache do
   Compiling a source evaluates its forms, which interns value defs into
   the live VM's `BeamLisp.Env`. A fetch links beams without evaluating,
   so same-VM consumers (tests calling a var the compile would have
-  interned) see `undefined var` unless the namespace's `__bl_init__/0`
-  runs — the same hook a fresh-VM boot uses (`BeamLisp.AOT.ensure_loaded/1`).
-  Idempotent per the AOT contract.
+  interned) see `undefined var` unless the namespace's init runs — the
+  same hook a fresh-VM boot uses (`BeamLisp.AOT.ensure_loaded/1`).
+
+  `__bl_init__/0` lives on the namespace SHIM module (`BeamLisp.Ns.<Ns>`);
+  the companion `BeamLisp.Ns.Init.<Ns>` only holds `__bl_init_values__/0`,
+  which the shim calls. Match on the export, not the name. Idempotent per
+  the AOT contract.
   """
   def run_init_modules(modules, compile_path) do
-    for mod <- modules, init_module?(mod) do
-      with {:module, _} <- ensure_module_loaded(mod, compile_path),
-           true <- function_exported?(mod, :__bl_init__, 0) do
-        mod.__bl_init__()
-      else
-        _ -> :ok
-      end
+    # Load EVERYTHING first: a shim's __bl_init__ calls its companion's
+    # __bl_init_values__, so iteration order must not decide availability.
+    Enum.each(modules, &ensure_module_loaded(&1, compile_path))
+
+    for mod <- modules, function_exported?(mod, :__bl_init__, 0) do
+      mod.__bl_init__()
     end
 
     :ok
-  end
-
-  defp init_module?(mod) do
-    mod |> Atom.to_string() |> String.starts_with?("Elixir.BeamLisp.Ns.Init.")
   end
 
   defp ensure_module_loaded(mod, compile_path) do
