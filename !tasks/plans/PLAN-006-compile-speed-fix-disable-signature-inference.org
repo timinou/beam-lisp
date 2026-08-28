@@ -1,0 +1,77 @@
+#+TITLE: Compile-speed fix: disable signature inference on beam-lisp's generated modules (Elixir 1.20 Module.Types.Descr tax)
+#+STATE: ITEM
+#+SESSION_ID: 15682fd4e8a0be8a
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-spell/2026-08-27T14-05-13-506Z_15682fd4e8a0be8a.jsonl]]
+#+CUSTOM_ID: PLAN-006-compile-speed-fix-disable-signature-inference
+
+* Initial Message
+
+do the beam-lisp codegen fix first (write a nice org plan from zero context about this), then FEAT-002, then FEAT-003 spike. Every time, show the performance improvements. Also add a note to maybe backport the Descr work onto beam lisp specifically? (FUP)
+
+* Zero-context brief
+
+beam-lisp (this repo) is a Lisp that compiles to Elixir AST. Two paths turn bl source into BEAM modules:
+
+1. *Interpreted / eval path* — ~BeamLisp.Compiler.eval_form/2~ (lib/beam_lisp/compiler.ex): every top-level form (each ~defn~, ~def~, ~defmacro~…) is compiled into a fresh throwaway Elixir module (~BeamLisp.Eval.M<n>~) via ~Module.create/3~ and immediately executed. ~defn~ expands to a *nested* ~defmodule~ holding the function(s) plus an ~Ns.Fn~ wrapper interned as a var. Loading a ~.bl~ file whose AOT beams are absent or stale evaluates every form this way — this is what ~mix test~ / ~mix beam_lisp.test~ do for any namespace whose compiled artifacts are missing.
+
+2. *AOT path* — ~BeamLisp.AOT.compile_source/2~ (lib/beam_lisp/aot.ex): batches a whole namespace into one ~Body~ module + one ~Init~ module per file, written as .beam files under the build dir. Used by the ~compile.beam_lisp~ Mix compiler. Note: it still *evaluates* every top-level form at compile time (to run macros and capture value defs), so BOTH paths pay the per-form module-creation cost.
+
+* Symptom
+
+Compiling the datom query stack (priv/datom/**) presents as a hang: 40+ minutes of silent 100%-CPU time for a cold test run; a single orphaned probe burned 2h09m CPU without finishing. Per-file warm-ish measurements (2026-08-27, contended): relation.bl 80s, relations.bl 28s, fixpoint.bl stuck >7min on one defn.
+
+* Root cause (stack-proven 2026-08-28)
+
+Every ~Module.create~ runs ~elixir_module.compile/7~, which runs ~Elixir.Module.Types.infer/7~ — Elixir 1.20's set-theoretic type system. The generated defn bodies are dense in small tuple literals (e.g. ~[id :relation/mode m]~ datom tuples), and ~Module.Types.Descr.non_empty_tuple_literals_intersection/1~ / ~empty?/1~ explode super-linearly on them. Stack sample of a spinning compiler child:
+
+: :elixir_erl_compiler.spawn/1 <- :elixir_module.compile/7 <- :elixir_lexical.run/3 <- BeamLisp.Compiler.eval_form/2, child in Module.Types.Descr.non_empty_tuple_literals_intersection/1
+
+Measured on ONE defn (relation.bl form #12, ~catalog-datoms~): *93,410 ms*. With ~Code.put_compiler_option(:module_definition, :interpreted)~: 110,896 ms (no help — the .beam is still produced and checked).
+
+Two dead ends already in-tree / upstream:
+- eval_form's generated module already carries ~@compile no_type_check: true~ — *the atom exists nowhere in Elixir 1.20.2's beams*; the annotation is silently ignored. It has never done anything.
+- There is NO public opt-out flag for the type pass in Elixir 1.20 (only ~elixir_config:is_bootstrap()~ skips ~Module.Types.infer~ internally).
+
+* The actual lever (measured)
+
+~Module.Types.infer/7~ computes ~infer_signatures? = :elixir_config.get(:infer_signatures) != false and cache != nil~. When false, every def falls to ~infer_mode = :traverse~ — the checker still walks for undefined functions but skips signature construction, which is where the Descr tuple-intersection cost lives. The docs for ~:infer_signatures~ say "Type checking will be executed regardless" — true, but the expensive part is precisely the signature construction.
+
+Same defn with ~Code.put_compiler_option(:infer_signatures, false)~ scoped around eval_form: *63 ms* (93,410 → 63, ≈1,480×). Probe: /tmp/build-mine/probe7.exs (vs probe6.exs for the baseline).
+
+Trade-off: bl-generated modules lose inferred-signature precision, so *remote-call type warnings against them* get weaker. Generated code never wanted these warnings — they type-check try/catch-heavy generated AST and produce noise, not signal. Hand-written Elixir in the repo is unaffected (the option is scoped around bl compilation only).
+
+* Fix
+
+Scope ~infer_signatures: false~ (save/restore via ~:elixir_config.get~ / ~Code.put_compiler_option~) around module creation in BOTH paths:
+
+- ~BeamLisp.Compiler.eval_form/2~ — around the ~Module.create~ call. Also delete or correct the no-op ~@compile no_type_check: true~ annotation (keep it harmlessly if future Elixir versions honor it, but add a comment that it is inert on ≤1.20).
+- ~BeamLisp.AOT.compile_block!/2~ (lib/beam_lisp/aot.ex) — the Body/Init module compilation pays the same tax per namespace.
+
+Implementation sketch:
+#+begin_src elixir
+prev = :elixir_config.get(:infer_signatures)
+Code.put_compiler_option(:infer_signatures, false)
+try do
+  # Module.create / compile_block!
+after
+  Code.put_compiler_option(:infer_signatures, prev)
+end
+#+end_src
+Note ~:elixir_config.get~ returns a list (~[:elixir]~ by default) or ~false~; restore verbatim.
+
+* Benchmark protocol (required evidence)
+
+Before/after, same machine, warm shared build path where possible; report wall AND CPU:
+1. Single-defn: probe6/probe7 pattern on relation.bl form #12 (93,410 ms → expect <200 ms).
+2. Cold closure: fresh MIX_BUILD_PATH, ~rm~ all Elixir.BeamLisp.Datom* beams, compile priv/datom chain (datalog → relation → relations → parse → fixpoint → magic → plan → rules → engine). Before: >40 min observed. Expect: minutes.
+3. Full ~MIX_ENV=test mix test~ (or ~mix beam_lisp.test~) cold build: compare suite wall time.
+4. Correctness gate: beam-lisp test suite passes identically (24 failures pre-existing from in-flight WIP on main are the baseline — attribute, don't fix).
+
+* Out of scope
+- Batching all defns of a file into one module on the eval path (the original hypothesis). NOT needed if infer_signatures=false lands the measured win; revisit only if per-module overhead still dominates after.
+- Upgrading Elixir (1.21-dev changelog: "Improve performance of type constructors and complex intersections" — upstream is fixing the underlying cost; see the backport FUP).
+- FEAT-002 global AOT cache (spell repo) — complementary, keyed artifact reuse; this fix makes cache misses cheap.
+
+* Cross-refs
+- FEAT-002 (spell repo): global AOT artifact cache.
+- FUP-007 (this repo): AOT macro-replay gap — orthogonal correctness issue in the same file.

@@ -765,7 +765,10 @@ defmodule BeamLisp.AOT do
   # call for the whole block restores near-single-module cost.
   defp compile_block!(block, filename) do
     prev = Code.compiler_options()
-    Code.compiler_options(ignore_module_conflict: true)
+    # infer_signatures: false — see BeamLisp.Emit.build_module/3; the
+    # signature-construction pass costs orders of magnitude more than the
+    # rest of compilation on tuple-dense generated code.
+    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
 
     try do
       case Code.compile_quoted(block, filename) do

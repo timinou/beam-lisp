@@ -193,7 +193,11 @@ defmodule BeamLisp.Emit do
   """
   def build_module(mod, block, location) do
     prev_opts = Code.compiler_options()
-    Code.compiler_options(ignore_module_conflict: true)
+    # infer_signatures: false drops Elixir's type checker to :traverse mode
+    # for the generated module — signature construction (Module.Types.Descr
+    # tuple intersections) dominates compile time on tuple-literal-dense
+    # generated code: one heavy defn measured 93s with, 63ms without.
+    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
 
     try do
       Module.create(mod, block, location || Macro.Env.location(__ENV__))

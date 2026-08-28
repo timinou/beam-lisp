@@ -76,23 +76,34 @@ defmodule BeamLisp.Compiler do
     ast = compile(form, env)
     mod = Module.concat(BeamLisp.Eval, "M#{System.unique_integer([:positive])}")
 
-    Module.create(
-      mod,
-      quote do
-        # Generated eval modules are throwaway codegen; signature
-        # inference would type-check their try/catch AST, so it is
-        # disabled for the module regardless of the session option.
-        @compile no_type_check: true
-        def run, do: unquote(ast)
-      end,
-      # Claim the form's own `.bl` file (and line) so the module's line
-      # table points at the user's source, not beam-lisp's compiler. A
-      # macro-built form with no position falls back to the old
-      # behaviour.
-      module_location(form, env) || Macro.Env.location(__ENV__)
-    )
+    # Signature inference is disabled for the whole create+run scope: the
+    # throwaway module itself, and any nested Module.create the form
+    # performs at run time (defserver hosts, defn value modules). Elixir
+    # 1.20's signature construction (Module.Types.Descr tuple intersections)
+    # explodes on tuple-literal-dense generated code — one heavy defn
+    # measured 93s with inference, 63ms without. There is no per-module
+    # opt-out on <= 1.20; the `@compile no_type_check: true` previously
+    # emitted here matches no known attribute and was silently ignored.
+    prev_opts = Code.compiler_options()
+    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
 
-    mod.run()
+    try do
+      Module.create(
+        mod,
+        quote do
+          def run, do: unquote(ast)
+        end,
+        # Claim the form's own `.bl` file (and line) so the module's line
+        # table points at the user's source, not beam-lisp's compiler. A
+        # macro-built form with no position falls back to the old
+        # behaviour.
+        module_location(form, env) || Macro.Env.location(__ENV__)
+      )
+
+      mod.run()
+    after
+      Code.compiler_options(prev_opts)
+    end
   end
 
   @doc "Compile one reader form to an Elixir quoted expression."
