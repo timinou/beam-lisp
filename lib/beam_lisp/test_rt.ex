@@ -168,18 +168,24 @@ defmodule BeamLisp.TestRT do
     reset_run(ns)
     IO.puts("\nTesting #{ns}")
 
-    Enum.each(registered_tests(ns), fn {name, f} ->
-      begin_test(ns, name)
+    # Each test thunk belongs to `ns`: run the batch with current_ns bound
+    # to it. Anything that consults the executing namespace (the query
+    # engine's predicate resolution) must see the test's own ns, not
+    # whatever file happened to load last.
+    Env.with_ns(to_string(ns), fn ->
+      Enum.each(registered_tests(ns), fn {name, f} ->
+        begin_test(ns, name)
 
-      try do
-        RT.invoke(f, [])
-      rescue
-        e -> record(ns, :error, name, nil, name, e)
-      catch
-        kind, value -> record(ns, :error, name, nil, name, {kind, value})
-      after
-        end_test(ns)
-      end
+        try do
+          RT.invoke(f, [])
+        rescue
+          e -> record(ns, :error, name, nil, name, e)
+        catch
+          kind, value -> record(ns, :error, name, nil, name, {kind, value})
+        after
+          end_test(ns)
+        end
+      end)
     end)
 
     Map.put(fetch_run(ns), :ns, ns)
