@@ -1,0 +1,212 @@
+; research/p8_shapes/shapes.bl — P8: are map shapes worth it?
+;
+; The question (go/no-go): does tracking literal map SHAPES —
+; {:ok int} | {:err string} — pay over tag-level :map, and at what
+; false-positive rate? Motivated by P6's residue: get/kw-call results
+; were the #1 source of surviving anys on real code.
+;
+; Repr: a shape is a first-class set element [:shape {kw → tagset}]
+; living alongside the plain tags. Union = set union (several shapes =
+; a union type, exactly {:ok int}|{:err string}). Meet: keyword tags
+; intersect as before; shape elements merge per-key. A map literal
+; whose keys are all literal keywords gets BOTH :map and its shape —
+; the shape is extra precision, never a replacement (old rules keep
+; working, so the FP rate is measurable).
+;
+; Rules under test:
+;   1. map literals → shape with per-key tagsets
+;   2. (:k m) / (get m :k) on shaped m → the KEY's type, unioned over
+;      shapes; :k present in NO shape → #{:nil} + a "key never present"
+;      warning (sound: literal shapes are exact)
+;   3. if-branches with different literals → union of shapes, and
+;      downstream kw-calls narrow correctly
+
+(ns shapes
+  (:require [typed]))
+
+(def any typed/any)
+(def never typed/never)
+(def core-sigs typed/core-sigs)
+
+; --- shape-aware lattice ops ---------------------------------------------------
+
+(defn shapes-of [t] (filter (fn [x] (and (vector? x) (= :shape (first x)))) t))
+(defn plain-of  [t] (set (filter (fn [x] (keyword? x)) t)))
+
+(defn shape-meet
+  "Per-key meet; a key whose meet empties drops out (that branch of the
+   union cannot occur)."
+  [s1 s2]
+  (let [ks (filter (fn [k] (contains? s2 k)) (keys s1))]
+    (reduce (fn [acc k]
+              (let [m (typed/t-meet (get s1 k) (get s2 k))]
+                (if (empty? m) acc (assoc acc k m))))
+            {} ks)))
+
+(defn s-meet [a b]
+  (let [pa (plain-of a) pb (plain-of b)
+        sa (shapes-of a) sb (shapes-of b)
+        plain (typed/t-meet pa pb)
+        both-maps (and (contains? pa :map) (contains? pb :map))]
+    (if (not both-maps)
+      plain
+      (let [sh (cond
+                 (and (empty? sa) (empty? sb)) []
+                 (empty? sa) sb          ; one side untracked: trust the other
+                 (empty? sb) sa
+                 :else (let [m (reduce (fn [acc x]
+                                         (concat acc
+                                           (map (fn [y] (shape-meet (second x) (second y))) sb)))
+                                       [] sa)]
+                         (filter (fn [s] (not (empty? s))) m)))]
+        (reduce (fn [acc s] (conj acc [:shape s])) plain sh)))))
+
+(defn s-union [a b] (set (concat a b)))
+
+; --- shape-aware walk (wraps typed/walk at the three rule sites) -----------------
+
+(declare swalk)
+
+(defn map-literal-type
+  "Walk values; if every key is a literal keyword, attach the shape."
+  [sigs env node]
+  (let [pairs  (typed/node-items node)
+        ks     (map (fn [p] (first (erlang/tuple_to_list p))) pairs)
+        vs     (map (fn [p] (second (erlang/tuple_to_list p))) pairs)
+        vtypes (into [] (map (fn [v] (swalk sigs env v)) vs))]
+    (if (every? (fn [k] (= :keyword (typed/node-tag (typed/node-form k)))) ks)
+      (let [sh (reduce (fn [acc [k t]]
+                         (assoc acc (keyword (typed/node-name (typed/node-form k))) t))
+                       {} (map (fn [k t] [k t]) ks vtypes))]
+        #{:map [:shape sh]})
+      #{:map})))
+
+(defn kw-on-shaped
+  "(:k m) / (get m :k): the key's type unioned over shapes; absent in
+   ALL shapes → #{:nil} + warning."
+  [k mt pos]
+  (let [shs (shapes-of mt)]
+    (if (empty? shs)
+      any
+      (let [present (filter (fn [s] (contains? (second s) k)) shs)]
+        (if (empty? present)
+          (do
+            (swap! typed/warnings
+                   (fn [ws]
+                     (conj ws {:msg (str "key " (pr-str k) " is never present in "
+                                         (pr-str (into [] (map (fn [s] (sort (into [] (keys (second s))))) shs))))
+                               :line (if (nil? pos) 0 (:line pos))
+                               :col  (if (nil? pos) 0 (:col pos))
+                               :form ""})))
+            #{:nil})
+          ; some shape lacks the key → nil is possible at runtime
+          (let [r (reduce (fn [acc s] (s-union acc (get (second s) k))) never present)]
+            (if (< (count present) (count shs))
+              (conj r :nil)
+              r)))))))
+
+(defn swalk
+  "typed/walk with shape rules at: map literals, kw-calls, get with a
+   literal key, if (shape union via s-union). Everything else delegates."
+  [sigs env node]
+  (let [tag (typed/node-tag node)]
+    (cond
+      (= tag :meta)
+        (swalk sigs (assoc env :__pos (typed/node-pos node))
+               (second (erlang/tuple_to_list node)))
+
+      (= tag :map)
+        (map-literal-type sigs env node)
+
+      (= tag :list)
+        (let [items (typed/node-items node)
+              head  (first items)
+              hf    (typed/node-form head)]
+          (cond
+            ; (:k m)
+            (= :keyword (typed/node-tag hf))
+              (let [mt (if (= 2 (count items))
+                         (swalk sigs env (second items))
+                         any)
+                    p0 (typed/node-pos node)
+                    pos (if (nil? p0) (:__pos env) p0)]
+                (kw-on-shaped (keyword (typed/node-name hf)) mt pos))
+
+            ; (get m :k) / (get m :k default)
+            (and (= :symbol (typed/node-tag hf))
+                 (= "get" (typed/node-name hf))
+                 (>= (count items) 3)
+                 (= :keyword (typed/node-tag (typed/node-form (nth items 2)))))
+              (let [mt (swalk sigs env (second items))
+                    p0 (typed/node-pos node)
+                    pos (if (nil? p0) (:__pos env) p0)]
+                (kw-on-shaped (keyword (typed/node-name (typed/node-form (nth items 2))))
+                              mt pos))
+
+            ; (if t a b): shape union over branches (narrowing delegated:
+            ; typed's walk-if handles the env; we re-join with s-union)
+            (and (= :symbol (typed/node-tag hf))
+                 (= "if" (typed/node-name hf)))
+              (let [_  (swalk sigs env (second items))
+                    t1 (swalk sigs env (nth items 2))
+                    t2 (if (>= (count items) 4)
+                         (swalk sigs env (nth items 3))
+                         never)]
+                (s-union t1 t2))
+
+            ; (let [x v] body): bind shapes so (:k x) downstream narrows
+            (and (= :symbol (typed/node-tag hf))
+                 (= "let" (typed/node-name hf)))
+              (let [bs (typed/node-items (typed/node-form (second items)))
+                    env2 (loop [xs bs e env]
+                           (if (empty? xs)
+                             e
+                             (recur (rest (rest xs))
+                                    (assoc e (typed/node-name (typed/node-form (first xs)))
+                                           (swalk sigs e (second xs))))))]
+                (reduce (fn [_ b] (swalk sigs env2 b)) never (rest (rest items))))
+
+            ; (do …)
+            (and (= :symbol (typed/node-tag hf))
+                 (= "do" (typed/node-name hf)))
+              (reduce (fn [_ b] (swalk sigs env b)) never (rest items))
+
+            :else
+              (typed/walk sigs env node)))
+
+      :else (typed/walk sigs env node))))
+
+(defn check-source
+  "Shapes-ON check of top-level forms (defs get init types; defn bodies
+   walked with params any). Returns {:warnings :evidence}."
+  [src ns]
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+        sigs  (merge core-sigs typed/core-seeds-v2 typed/host-seeds
+                     (typed/sigs-from-env ns))]
+    (doall
+      (map (fn [form]
+             (let [f (typed/node-form form)]
+               (cond
+                 (not (= :list (typed/node-tag f)))
+                   (swalk sigs {} form)
+
+                 (= "ns" (typed/node-name
+                           (typed/node-form (first (typed/node-items f)))))
+                   nil
+
+                 (and (= :symbol (typed/node-tag
+                                   (typed/node-form (first (typed/node-items f)))))
+                      (contains? #{"defn" "defn-"}
+                                 (typed/node-name
+                                   (typed/node-form (first (typed/node-items f))))))
+                   (let [items (typed/node-items f)
+                         rest1 (rest (rest items))
+                         rest2 (if (string? (first rest1)) (rest rest1) rest1)
+                         params (typed/node-items (typed/node-form (first rest2)))
+                         env (reduce (fn [e p] (typed/bind-pattern e p any))
+                                     {} params)]
+                     (doall (map (fn [b] (swalk sigs env b)) (rest rest2))))
+
+                 :else (swalk sigs {} form))))
+           forms))
+    {:warnings (deref typed/warnings) :evidence (deref typed/evidence)}))
