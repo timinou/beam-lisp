@@ -1,0 +1,193 @@
+; research/p5_protocols/protos.bl — P5: the checked-interface story.
+;
+; Protocol dispatch runs on Multi.type_of/1 tags — :integer, :binary,
+; :seq, :tuple, struct modules — NOT the lattice's tags. So the first
+; rule is a TAG MAP. Then:
+;
+;   1. A call to a protocol method needs arg-1's tagset to MEET the
+;      registered impl tags (mapped). Disjoint → "no implementation".
+;   2. The ret is the union over ONLY the impls whose tag meets arg-1 —
+;      protocol calls type PRECISELY when arg-1 is precise. (Better
+;      than P4's union-of-all: dispatch on arg-1 narrows the union.)
+;   3. extend-type/extend-protocol arriving later REVOKES "no
+;      implementation" warnings — the P4 fingerprint rule again, now
+;      per (protocol, type-tag).
+;   4. extend-type missing a method is a structural warning
+;      ("implements 1 of 2").
+
+(ns protos
+  (:require [typed]))
+
+(def any typed/any)
+(def never typed/never)
+(def t-union typed/t-union)
+(def t-meet typed/t-meet)
+(def core-sigs typed/core-sigs)
+(def sigs-from-env typed/sigs-from-env)
+
+; dispatch-tag → lattice tag. Deliberately partial: :list/:seq/:tuple/
+; :pid/:reference and struct-module tags have NO lattice tag today —
+; they map to any (sound: no coverage claimed, no warning). Recorded
+; as the lattice-v2 question this spike surfaces.
+(def dispatch->lattice
+  {:integer :int   :float :float   :binary :string
+   :keyword :kw    :map :map       :vector :vec
+   :boolean :bool  :nil :nil       :fn :fn})
+
+(def proto-table (atom {}))
+; {proto-name → {:methods [m…] :impls {dispatch-tag → {method → ret}}}}
+
+(defn proto-fingerprint [t]
+  (apply concat
+         (map (fn [[p e]]
+                (map (fn [[tag _]] [p tag]) (:impls e)))
+              t)))
+
+(declare proto-call-ret proto-covered?)
+
+(defn walk-method-bodies
+  "Method impls: ([this] body…) forms. Params at any (no annotation
+   surface — same finding as defmethod, P4)."
+  [sigs bodies]
+  (reduce
+    (fn [acc m]
+      (let [its    (typed/node-items m)
+            mname  (typed/node-name (typed/node-form (first its)))
+            params (typed/node-items (typed/node-form (second its)))
+            env    (reduce (fn [e p] (typed/bind-pattern e p any)) {} params)
+            ret    (reduce (fn [_ b] (typed/walk sigs env b)) never
+                           (rest (rest its)))]
+        (assoc acc mname ret)))
+    {} bodies))
+
+(defn walk-proto-def [sigs form]
+  (let [f     (typed/node-form form)
+        items (typed/node-items f)
+        head  (typed/node-name (typed/node-form (first items)))]
+    (cond
+      (= head "defprotocol")
+        (let [pname (typed/node-name (typed/node-form (second items)))
+              mforms (filter (fn [x] (= :list (typed/node-tag (typed/node-form x))))
+                             (rest (rest items)))
+              mnames (map (fn [m]
+                            (typed/node-name
+                              (typed/node-form (first (typed/node-items m)))))
+                          mforms)]
+          (swap! proto-table
+                 (fn [t] (assoc t pname {:methods (into [] mnames)
+                                         :impls (get-in t [pname :impls] {})})))
+          nil)
+
+      (= head "extend-type")
+        (let [its    (rest items)
+              tag    (first its)
+              dtag   (if (= :keyword (typed/node-tag (typed/node-form tag)))
+                       (keyword (typed/node-name (typed/node-form tag)))
+                       :unknown)
+              pname  (typed/node-name (typed/node-form (second its)))
+              bodies (rest (rest its))
+              impl   (walk-method-bodies sigs bodies)
+              declared (get-in (deref proto-table) [pname :methods] [])]
+          (swap! proto-table
+                 (fn [t]
+                   (assoc-in t [pname :impls dtag]
+                             (merge (get-in t [pname :impls dtag] {}) impl))))
+          ; rule 4: completeness — every declared method implemented?
+          (let [missing (filter (fn [m] (not (contains? impl m))) declared)]
+            (if (empty? missing)
+              nil
+              (swap! typed/warnings
+                     (fn [ws]
+                       (conj ws {:msg (str "extend-type " (pr-str dtag) " " pname
+                                           " is missing methods: "
+                                           (pr-str (into [] missing)))
+                                 :line (:line (typed/node-pos form))
+                                 :col  (:col (typed/node-pos form))
+                                 :form ""})))))
+          nil)
+
+      :else nil)))
+
+; --- protocol call typing -------------------------------------------------------
+
+(defn proto-of-method
+  "Which protocol declares method `m`? (Spike: linear scan; the real
+   checker indexes.)"
+  [m]
+  (first (filter (fn [[p e]] (some (fn [x] (= x m)) (:methods e)))
+                 (deref proto-table))))
+
+(defn proto-covered?
+  "The impl tags of `proto` that meet arg-1's lattice tagset."
+  [proto arg1-type]
+  (let [impls (:impls (get (deref proto-table) proto {}))]
+    (filter (fn [[dtag _]]
+              (let [ltag (get dispatch->lattice dtag nil)]
+                (if (nil? ltag)
+                  false   ; unmappable tag: claims nothing (sound)
+                  (contains? arg1-type ltag))))
+            impls)))
+
+(defn proto-call-ret [proto covered]
+  (let [impls (:impls (get (deref proto-table) proto {}))]
+    (reduce (fn [acc [dtag methods]]
+              (if (some (fn [[t _]] (= t dtag)) covered)
+                (reduce (fn [a [_ r]] (t-union a r)) acc methods)
+                acc))
+            never impls)))
+
+(defn check-source
+  "typed/check-source + protocol forms + protocol-call typing. A call
+   (m a …) where m is a protocol method: arg-1's tags must meet SOME
+   impl tag, else 'no implementation'; ret = union over meeting impls."
+  [src ns]
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+        base  (merge core-sigs (sigs-from-env ns))]
+    (doall
+      (map (fn [form]
+             (let [f (typed/node-form form)
+                   is-proto (and (= :list (typed/node-tag f))
+                                 (contains? #{"defprotocol" "extend-type"}
+                                   (typed/node-name
+                                     (typed/node-form
+                                       (first (typed/node-items f))))))]
+               (if is-proto
+                 (walk-proto-def base form)
+                 (walk-with-protos base form))))
+           forms))
+    {:warnings (deref typed/warnings)
+     :fingerprint (proto-fingerprint (deref proto-table))}))
+
+(defn walk-with-protos
+  "typed/walk, but protocol-method calls get covered/ret checked.
+   (Spike: pre-pass only over TOP-LEVEL calls; nested calls inside
+   bodies are typed's any. The real checker hooks walk-call.)"
+  [sigs form]
+  (let [f (typed/node-form form)]
+    (if (and (= :list (typed/node-tag f))
+             (not (empty? (typed/node-items f)))
+             (= :symbol (typed/node-tag
+                          (typed/node-form (first (typed/node-items f))))))
+      (let [items (typed/node-items f)
+            m     (typed/node-name (typed/node-form (first items)))
+            hit   (proto-of-method m)]
+        (if (nil? hit)
+          (typed/walk sigs {} form)
+          (let [proto    (first hit)
+                arg1     (second items)
+                arg1-ty  (typed/walk sigs {} arg1)
+                _        (doall (map (fn [a] (typed/walk sigs {} a))
+                                     (rest (rest items))))
+                covered  (proto-covered? proto arg1-ty)]
+            (if (empty? covered)
+              (swap! typed/warnings
+                     (fn [ws]
+                       (conj ws {:msg (str m ": no implementation of " proto
+                                           " for "
+                                           (pr-str (sort (into [] arg1-ty))))
+                                 :line (:line (typed/node-pos form))
+                                 :col  (:col (typed/node-pos form))
+                                 :form ""})))
+              nil)
+            (proto-call-ret proto covered))))
+      (typed/walk sigs {} form))))
