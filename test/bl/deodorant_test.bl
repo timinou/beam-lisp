@@ -1,0 +1,167 @@
+; test/bl/deodorant_test.bl — the smell registry, guards, tiers, and the
+; span-preserving fixer, tested in beam-lisp.
+; Run: mix beam_lisp.test test/bl/deodorant_test.bl
+;
+; The Map/get smells are the load-bearing case for GUARDS: `(Map/get m
+; :k)` is the smell, `(Map/get m k)` with a variable key is not — the key
+; might not be a keyword at runtime. Every claim here is asserted both
+; structurally (the rewrite produces the idiomatic form) and by value
+; (the two spellings evaluate identically on real maps).
+
+(ns deodorant.test
+  (:require [deodorant :as d]))
+
+(defn- smell-named [n]
+  (first (filter (fn [s] (= (:name s) n)) (d/all-smells))))
+
+; ── registry ──────────────────────────────────────────────────────────
+
+(deftest registry-has-the-map-smells
+  (let [names (map :name (d/all-smells))]
+    (is (some (fn [n] (= n 'map-get->kw-access)) names))
+    (is (some (fn [n] (= n 'map-get-default->get)) names))
+    (is (some (fn [n] (= n 'kw-of-get-default->get-in)) names))
+    (is (some (fn [n] (= n 'nested-kw->get-in)) names))))
+
+(deftest tiers-filter-the-registry
+  (let [safe-names  (map :name (d/safe-rules))
+        all-names   (map :name (d/all-rules))
+        every-names (map :name (d/every-rule))]
+    ; the map smells are :idiomatic — never in the apply-blind :safe set,
+    ; always in the default deodorize set
+    (is (not (some (fn [n] (= n 'map-get->kw-access)) safe-names)))
+    (is (some (fn [n] (= n 'map-get->kw-access)) all-names))
+    ; :reinvention is opt-in only
+    (is (not (some (fn [n] (= n 'reduce->count)) all-names)))
+    (is (some (fn [n] (= n 'reduce->count)) every-names))))
+
+; ── guards ────────────────────────────────────────────────────────────
+;
+; A guard receives the match's bindings map keyed by the PATTERN VARIABLE
+; and can veto the rewrite. These use a raw smell map so the global
+; registry is not touched.
+
+(deftest guard-can-veto-a-matched-pattern
+  (let [s {:name 't :tier :idiomatic
+           :pattern '(Map/get ?m ?k) :replacement '(?k ?m)
+           :when (fn [b] (keyword? (get b '?k)))}]
+    (is (some? (d/smell-match s '(Map/get req :opts))))
+    (is (nil? (d/smell-match s '(Map/get m k))))
+    (is (nil? (d/smell-match s '(Map/get headers "authorization"))))
+    ; a pattern that does not match at all never reaches the guard
+    (is (nil? (d/smell-match s '(other req :opts))))))
+
+(deftest builtin-guards-hold
+  (let [s (smell-named 'map-get->kw-access)]
+    (is (some? (d/smell-match s '(Map/get req :opts))))
+    (is (nil? (d/smell-match s '(Map/get m k))))
+    (is (nil? (d/smell-match s '(Map/get headers "authorization")))))
+  (let [s2 (smell-named 'map-get-default->get)]
+    (is (some? (d/smell-match s2 '(Map/get req :opts {}))))
+    (is (nil? (d/smell-match s2 '(Map/get m k {})))))
+  (let [s3 (smell-named 'nested-kw->get-in)]
+    (is (some? (d/smell-match s3 '(:cache? (:opts req)))))
+    ; inner head is a CALL, not a keyword — no rewrite
+    (is (nil? (d/smell-match s3 '(:b (f m)))))))
+
+; ── rewrites (structural) ─────────────────────────────────────────────
+
+(deftest map-get-rewrites-to-idiomatic-forms
+  (is (= (d/deodorize '(Map/get req :opts))
+         '(:opts req)))
+  (is (= (d/deodorize '(Map/get req :opts {}))
+         '(get req :opts {})))
+  ; fixed-point: inner rewrites first, the get-in rules collapse on
+  ; the next pass
+  (is (= (d/deodorize '(Map/get (Map/get req :opts {}) :cache?))
+         '(get-in req [:opts :cache?])))
+  (is (= (d/deodorize '(:cache? (:opts req)))
+         '(get-in req [:opts :cache?]))))
+
+(deftest non-keyword-keys-are-untouched
+  (is (= (d/deodorize '(Map/get m k)) '(Map/get m k)))
+  (is (= (d/deodorize '(Map/get headers "authorization"))
+         '(Map/get headers "authorization")))
+  (is (= (d/deodorize '(Map/get m (name k))) '(Map/get m (name k)))))
+
+; ── rewrites (by value) ───────────────────────────────────────────────
+
+(deftest map-access-rewrites-are-value-identical
+  (let [m {:opts {:cache? true} :model "gpt"}]
+    (is (= (:opts m) (Map/get m :opts)))
+    (is (= (get m :missing {}) (Map/get m :missing {})))
+    (is (= (get-in m [:opts :cache?]) (:cache? (:opts m))))
+    (is (= (get-in m [:opts :cache?])
+           (Map/get (Map/get m :opts {}) :cache?))))
+  ; the ONE divergence, pinned so the tiering note stays honest:
+  ; keyword-as-fn on nil returns nil where Map/get on nil would raise —
+  ; the rewrite trades a crash for a nil on that edge alone.
+  (is (nil? (:opts nil))))
+
+; ── detect ────────────────────────────────────────────────────────────
+
+(deftest scan-reports-guarded-hits-only
+  (let [form '(defn f [m k] [(Map/get m :opts) (Map/get m k)])
+        hits (d/scan (d/all-rules) form)]
+    (is (= 1 (count (filter (fn [h] (= (:rule h) 'map-get->kw-access))
+                            hits))))))
+
+(deftest report-counts-by-smell-name
+  (let [r (d/report (d/all-rules) '(defn f [m] [(Map/get m :a) (Map/get m :b)]))]
+    (is (= 2 (get r 'map-get->kw-access)))))
+
+; ── the fixer: span-preserving source rewrite ─────────────────────────
+
+(deftest fixer-splices-and-preserves-comments
+  (let [src "(defn f [req]\n  ; this comment survives\n  (Map/get req :opts {}))\n\n; trailing note\n"
+        res (d/fix-source (d/all-rules) src)
+        out (:source res)]
+    (is (= (:changed res) 1))
+    (is (String/contains? out "; this comment survives"))
+    (is (String/contains? out "; trailing note"))
+    (is (String/contains? out "(get req :opts {})"))
+    (is (not (String/contains? out "Map/get")))))
+
+(deftest fixer-touches-only-smelled-spans
+  (let [src "(defn a [m] (Map/get m :x))\n(defn b [m] (Map/get m k))\n"
+        res (d/fix-source (d/all-rules) src)]
+    ; the variable-key sibling is not a smell — byte-for-byte untouched
+    (is (= (:changed res) 1))
+    (is (String/contains? (:source res) "(:x m)"))
+    (is (String/contains? (:source res) "(defn b [m] (Map/get m k))"))))
+
+(deftest fixer-ignores-delimiters-inside-strings
+  ; the span scanner must not count parens inside a string literal
+  (let [src "(defn h [m] (str (Map/get m :k) \"))))\"))\n"
+        res (d/fix-source (d/all-rules) src)]
+    (is (= (:changed res) 1))
+    (is (String/contains? (:source res) "(:k m)"))
+    (is (String/contains? (:source res) "\"))))\""))))
+
+(deftest fixer-is-idempotent
+  (let [src   "(defn g [m] (:b (:a m)))\n"
+        once  (d/fix-source (d/all-rules) src)
+        twice (d/fix-source (d/all-rules) (:source once))]
+    (is (= (:changed once) 1))
+    (is (String/contains? (:source once) "(get-in m [:a :b])"))
+    (is (= (:changed twice) 0))))
+
+(deftest fix-file-roundtrip
+  (let [path "/tmp/deodorant-test-fixme.bl"
+        src  "; header comment\n(defn f [m] (Map/get m :x))\n"]
+    (File/write path src)
+    (let [res (d/fix-file! (d/all-rules) path)
+          out (second (File/read path))]
+      (is (= (:changed res) 1))
+      (is (String/contains? out "; header comment"))
+      (is (String/contains? out "(:x m)"))
+      ; second run: nothing left to do, no write
+      (is (= (:changed (d/fix-file! (d/all-rules) path)) 0)))))
+
+; ── user extension ────────────────────────────────────────────────────
+
+(deftest defsmell-extends-the-registry
+  (let [before (count (d/all-smells))]
+    (d/defsmell inc-inc->plus-two :idiomatic (inc (inc ?x)) => (+ ?x 2))
+    (is (= (count (d/all-smells)) (+ before 1)))
+    (is (= (d/deodorize '(inc (inc 5))) '(+ 5 2)))))
