@@ -161,6 +161,19 @@ defmodule BeamLisp.Env do
   end
 
   @doc """
+  Bind `env` in the calling process without a block form — the harness
+  primitive behind `Sandbox.checkout/1`, where teardown is a separate
+  `on_exit` rather than a function boundary. Prefer `with_env/2` unless
+  you own the process lifetime.
+  """
+  def attach(env) do
+    Process.put(@pdict_env, env)
+    Process.put(@pdict_chain, compute_chain(env))
+    Process.delete(@pdict_ns)
+    :ok
+  end
+
+  @doc """
   Capture the current env binding (id + chain + process-local ns) as an
   opaque token for `bind/1`. Host Elixir code that spawns a process to run
   beam-lisp work should capture before spawning and bind in the child.

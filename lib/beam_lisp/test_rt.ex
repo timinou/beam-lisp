@@ -207,8 +207,25 @@ defmodule BeamLisp.TestRT do
   Load and run a beam-lisp test suite: prelude, the `priv/test.bl`
   library, then each `path`, then every registered namespace via the
   beam-lisp `run-tests` fn. Returns the grand totals map.
+
+  With `async: true` (PLAN-046 L3b), the test library loads once into a
+  warm base env and each FILE runs in its own fork of it, concurrently
+  (capped at `System.schedulers_online/0`): per-env registries mean a
+  fork's `run-tests` runs only that file's tests, and per-file output is
+  buffered through a StringIO group leader so concurrent runs never
+  interleave a FAIL report with another file's header. Namespaces within
+  one file stay sequential — the `testing` context stack is a per-ns
+  single slot by design.
   """
-  def run_suite(paths) do
+  def run_suite(paths, opts \\ []) do
+    if Keyword.get(opts, :async, false) do
+      run_suite_async(paths)
+    else
+      run_suite_serial(paths)
+    end
+  end
+
+  defp run_suite_serial(paths) do
     BeamLisp.init()
     Compiler.eval_string(File.read!(test_lib_path()), Compiler.new_env("core"))
 
@@ -223,12 +240,68 @@ defmodule BeamLisp.TestRT do
     RT.invoke(Env.fetch!("core", "run-tests"), [:all])
   end
 
+  defp run_suite_async(paths) do
+    BeamLisp.init()
+    base = Env.fork(:global)
+
+    Env.with_env(base, fn ->
+      Compiler.eval_string(File.read!(test_lib_path()), Compiler.new_env("core"))
+    end)
+
+    # Streams in the ORIGINAL path order so output reads like the serial
+    # run's; concurrency happens inside, ordered output outside.
+    results =
+      Task.async_stream(
+        paths,
+        fn path -> {path, run_file_isolated(base, path)} end,
+        max_concurrency: System.schedulers_online(),
+        ordered: true,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, r} -> r end)
+
+    Enum.each(results, fn {_path, {_totals, output}} -> IO.write(output) end)
+
+    totals =
+      results
+      |> Enum.map(fn {_path, {totals, _output}} -> totals end)
+      |> aggregate()
+
+    print_summary(totals)
+    totals
+  end
+
+  # One file in its own fork of the base: eval its source, run ITS tests
+  # (the registry is exact-env, so the base's registrations never re-run),
+  # and capture all printed output for ordered replay by the caller.
+  defp run_file_isolated(base, path) do
+    Env.isolated(base, fn ->
+      {:ok, io} = StringIO.open("")
+      prev_gl = Process.group_leader()
+      :erlang.group_leader(io, self())
+
+      try do
+        Env.in_ns("user")
+
+        BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
+          Compiler.eval_string(File.read!(path))
+        end)
+
+        totals = RT.invoke(Env.fetch!("core", "run-tests"), [:all])
+        {totals, StringIO.contents(io) |> elem(1)}
+      after
+        :erlang.group_leader(prev_gl, self())
+        StringIO.close(io)
+      end
+    end)
+  end
+
   @doc "True when a totals map has no failures or errors."
   def passed?(totals), do: totals.fail == 0 and totals.error == 0
 
   @doc "The mix task entry: run the suite and exit non-zero on any failure/error."
-  def cli(paths) do
-    totals = run_suite(paths)
+  def cli(paths, opts \\ []) do
+    totals = run_suite(paths, opts)
     unless passed?(totals), do: System.halt(1)
   end
 

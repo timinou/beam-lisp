@@ -83,6 +83,14 @@ defmodule BeamLisp.Native do
   """
   @spec declare(String.t(), String.t(), [{String.t(), non_neg_integer()}]) :: module()
   def declare(ns, crate, signatures) do
+    # VM-wide critical section: the host module is created at RUNTIME, so
+    # two envs loading the same native-backed namespace concurrently would
+    # race Module.create ("currently being defined") — same fix as
+    # BeamLisp.Record.define/3 (PLAN-046).
+    :global.trans({host_module(ns), self()}, fn -> do_declare(ns, crate, signatures) end)
+  end
+
+  defp do_declare(ns, crate, signatures) do
     guard_against_duplicates!(ns, signatures)
     guard_against_shadowing!(ns, signatures)
 
