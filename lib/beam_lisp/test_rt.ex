@@ -16,9 +16,8 @@ defmodule BeamLisp.TestRT do
 
   alias BeamLisp.{Compiler, Env, RT, Vector}
 
-  @table :beam_lisp_vars
-
-  # registry: {:test_registry, ns} -> [{name, fn}]
+  # registry: {:test_registry, ns} -> [{name, fn}]   (per env — exact-env
+  # reads: a forked suite runs only ITS registered tests, never the base's)
   # run state: {:test_run, ns}     -> %{tests:, pass:, fail:, error:, reports: []}
   # current context: {:test_ctx}   -> %{ns:, test:, context: [str]}
 
@@ -39,20 +38,20 @@ defmodule BeamLisp.TestRT do
     key = {:test_registry, ns}
 
     tests =
-      case :ets.lookup(@table, key) do
-        [{_, t}] -> Enum.reject(t, fn {n, _} -> n == name end)
-        [] -> []
+      case Env.lookup_own(key) do
+        {:ok, t} -> Enum.reject(t, fn {n, _} -> n == name end)
+        :error -> []
       end
 
-    :ets.insert(@table, {key, tests ++ [{name, f}]})
+    Env.put_key(key, tests ++ [{name, f}])
     :ok
   end
 
   @doc "Registered `[{name, fn}]` for `ns`, in definition order."
   def registered_tests(ns) do
-    case :ets.lookup(@table, {:test_registry, ns}) do
-      [{_, t}] -> t
-      [] -> []
+    case Env.lookup_own({:test_registry, ns}) do
+      {:ok, t} -> t
+      :error -> []
     end
   end
 
@@ -77,63 +76,63 @@ defmodule BeamLisp.TestRT do
 
   @doc "Drop every registered test (used to isolate ExUnit runs of run_suite/1)."
   def clear_registry do
-    :ets.match_delete(@table, {{:test_registry, :_}, :_})
+    Env.match_delete_own({{:test_registry, :_}, :_})
     :ok
   end
 
   @doc "Namespaces that have registered tests, in first-registration order."
   def test_namespaces do
     # `match/2` (no limit) returns the list of matches directly.
-    :ets.match(@table, {{:test_registry, :"$1"}, :_})
+    Env.match_own({{:test_registry, :"$1"}, :_})
     |> Enum.map(fn [ns] -> ns end)
   end
 
   # --- run state ---
 
   defp fetch_run(ns) do
-    case :ets.lookup(@table, {:test_run, ns}) do
-      [{_, r}] -> r
-      [] -> %{tests: 0, pass: 0, fail: 0, error: 0, reports: []}
+    case Env.lookup_own({:test_run, ns}) do
+      {:ok, r} -> r
+      :error -> %{tests: 0, pass: 0, fail: 0, error: 0, reports: []}
     end
   end
 
   defp fetch_ctx do
-    case :ets.lookup(@table, {:test_ctx}) do
-      [{_, c}] -> c
-      [] -> %{ns: nil, test: nil, context: []}
+    case Env.lookup_own({:test_ctx}) do
+      {:ok, c} -> c
+      :error -> %{ns: nil, test: nil, context: []}
     end
   end
 
   @doc "Clear `ns`'s counters and reports before a run."
   def reset_run(ns) do
-    :ets.insert(@table, {{:test_run, ns}, %{tests: 0, pass: 0, fail: 0, error: 0, reports: []}})
+    Env.put_key({:test_run, ns}, %{tests: 0, pass: 0, fail: 0, error: 0, reports: []})
     :ok
   end
 
   @doc "Mark `name` (of `ns`) as the test currently executing; increments the test count."
   def begin_test(ns, name) do
     run = Map.update!(fetch_run(ns), :tests, &(&1 + 1))
-    :ets.insert(@table, {{:test_run, ns}, run})
-    :ets.insert(@table, {{:test_ctx}, %{ns: ns, test: name, context: []}})
+    Env.put_key({:test_run, ns}, run)
+    Env.put_key({:test_ctx}, %{ns: ns, test: name, context: []})
     :ok
   end
 
   @doc "End the current test and clear the context slot."
   def end_test(ns) do
-    :ets.insert(@table, {{:test_ctx}, %{ns: ns, test: nil, context: []}})
+    Env.put_key({:test_ctx}, %{ns: ns, test: nil, context: []})
     :ok
   end
 
   @doc "Run `f` with `str` pushed onto the current `testing` context."
   def with_context(str, f) do
     ctx = fetch_ctx()
-    :ets.insert(@table, {{:test_ctx}, %{ctx | context: ctx.context ++ [str]}})
+    Env.put_key({:test_ctx}, %{ctx | context: ctx.context ++ [str]})
 
     try do
       RT.invoke(f, [])
     after
       ctx = fetch_ctx()
-      :ets.insert(@table, {{:test_ctx}, %{ctx | context: Enum.drop(ctx.context, -1)}})
+      Env.put_key({:test_ctx}, %{ctx | context: Enum.drop(ctx.context, -1)})
     end
   end
 
@@ -157,7 +156,7 @@ defmodule BeamLisp.TestRT do
 
     run = fetch_run(ns)
     run = Map.update!(run, type, &(&1 + 1))
-    :ets.insert(@table, {{:test_run, ns}, %{run | reports: run.reports ++ [report]}})
+    Env.put_key({:test_run, ns}, %{run | reports: run.reports ++ [report]})
 
     if type in [:fail, :error], do: print_report(report)
     type

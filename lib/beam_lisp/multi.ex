@@ -34,7 +34,6 @@ defmodule BeamLisp.Multi do
   alias BeamLisp.{Env, RT}
   import BeamLisp.Guards, only: [is_bl_map: 1]
 
-  @table :beam_lisp_vars
 
   # --- type tagging (the whole protocol abstraction) ---
 
@@ -82,18 +81,19 @@ defmodule BeamLisp.Multi do
   methods survive.
   """
   def define_multi(ns, name, dispatch_fn) do
-    key = {:multi, ns, name}
-
+    # Chain-visible merge base: re-defining in a fork reuses the
+    # ANCESTOR's method table and writes the result locally (CLJ-1351
+    # survives read-through — the fork shadows, the base is untouched).
     entry =
-      case :ets.lookup(@table, key) do
-        [{_, %{methods: methods}}] ->
+      case Env.lookup({:multi, ns, name}) do
+        {:ok, %{methods: methods}} ->
           %{dispatch: dispatch_fn, methods: methods}
 
-        [] ->
+        :error ->
           %{dispatch: dispatch_fn, methods: %{}}
       end
 
-    :ets.insert(@table, {key, entry})
+    Env.put_key({:multi, ns, name}, entry)
     # RT.invoke spreads call args over the fn's parameters (apply/2),
     # so a fixed-arity closure would only ever see one arg. A tagged
     # variadic value ({min, f} with min 0) makes RT.invoke hand the fn
@@ -105,13 +105,12 @@ defmodule BeamLisp.Multi do
 
   @doc "Add or replace the method for `dispatch_val` on the multi `ns/name`."
   def add_method(ns, name, dispatch_val, method_fn) do
-    key = {:multi, ns, name}
     entry = multi!(ns, name)
 
     methods =
       Map.put(entry.methods, normalize_key(dispatch_val), method_fn)
 
-    :ets.insert(@table, {key, %{entry | methods: methods}})
+    Env.put_key({:multi, ns, name}, %{entry | methods: methods})
     method_fn
   end
 
@@ -149,9 +148,9 @@ defmodule BeamLisp.Multi do
   end
 
   defp multi!(ns, name) do
-    case :ets.lookup(@table, {:multi, ns, name}) do
-      [{_, entry}] -> entry
-      [] -> raise "No multimethod named #{ns}/#{name} — defmulti it before adding methods"
+    case Env.lookup({:multi, ns, name}) do
+      {:ok, entry} -> entry
+      :error -> raise "No multimethod named #{ns}/#{name} — defmulti it before adding methods"
     end
   end
 
@@ -164,23 +163,23 @@ defmodule BeamLisp.Multi do
   @doc "Record `child` as derived from `parent` in ns's hierarchy. Returns true."
   def derive(ns, child, parent) do
     parents =
-      case :ets.lookup(@table, {:hierarchy, ns}) do
-        [{_, h}] ->
+      case Env.lookup({:hierarchy, ns}) do
+        {:ok, h} ->
           Map.update(h, child, [parent], &[parent | Enum.reject(&1, fn p -> p == parent end)])
 
-        [] ->
+        :error ->
           %{child => [parent]}
       end
 
-    :ets.insert(@table, {{:hierarchy, ns}, parents})
+    Env.put_key({:hierarchy, ns}, parents)
     true
   end
 
   @doc "Direct parents of `x` in ns's hierarchy."
   def parents(ns, x) do
-    case :ets.lookup(@table, {:hierarchy, ns}) do
-      [{_, h}] -> Map.get(h, x, [])
-      [] -> []
+    case Env.lookup({:hierarchy, ns}) do
+      {:ok, h} -> Map.get(h, x, [])
+      :error -> []
     end
   end
 
@@ -212,11 +211,11 @@ defmodule BeamLisp.Multi do
 
   @doc "Remove `child`'s derivation from `parent` in ns's hierarchy. Returns false."
   def underive(ns, child, parent) do
-    case :ets.lookup(@table, {:hierarchy, ns}) do
-      [{_, h}] when is_map_key(h, child) ->
+    case Env.lookup({:hierarchy, ns}) do
+      {:ok, h} when is_map_key(h, child) ->
         rest = Enum.reject(Map.get(h, child), &(&1 == parent))
         h = if rest == [], do: Map.delete(h, child), else: Map.put(h, child, rest)
-        :ets.insert(@table, {{:hierarchy, ns}, h})
+        Env.put_key({:hierarchy, ns}, h)
 
       _ ->
         :ok
@@ -233,7 +232,7 @@ defmodule BeamLisp.Multi do
   tag of its first argument (via `type_of/1`).
   """
   def define_protocol(ns, name, method_names) do
-    :ets.insert(@table, {{:protocol, ns, name}, %{methods: method_names}})
+    Env.put_key({:protocol, ns, name}, %{methods: method_names})
     Env.intern(ns, name, {:"$protocol", ns, name, method_names})
 
     for method <- method_names do
@@ -258,8 +257,7 @@ defmodule BeamLisp.Multi do
     end
 
     for {method, fn_value} <- impls do
-      key = {{:protocol, ns, protocol, method}, type_tag}
-      :ets.insert(@table, {key, fn_value})
+      Env.put_key({{:protocol, ns, protocol, method}, type_tag}, fn_value)
     end
 
     :ok
@@ -268,13 +266,12 @@ defmodule BeamLisp.Multi do
   @doc "Dispatch a protocol method on the first argument's type tag."
   def dispatch_protocol(ns, protocol, method, args) do
     tag = type_of(hd(args))
-    key = {{:protocol, ns, protocol, method}, tag}
 
-    case :ets.lookup(@table, key) do
-      [{_, mfn}] ->
+    case Env.lookup({{:protocol, ns, protocol, method}, tag}) do
+      {:ok, mfn} ->
         RT.invoke(mfn, args)
 
-      [] ->
+      :error ->
         raise "No implementation of method #{method} of protocol #{ns}/#{protocol} for type #{inspect(tag)}"
     end
   end
@@ -294,24 +291,24 @@ defmodule BeamLisp.Multi do
   an incomplete one.
   """
   def satisfies?(ns, protocol, value) do
-    case :ets.lookup(@table, {:protocol, ns, protocol}) do
-      [{_, %{methods: methods}}] ->
+    case Env.lookup({:protocol, ns, protocol}) do
+      {:ok, %{methods: methods}} ->
         tag = type_of(value)
 
         methods != [] and
           Enum.all?(methods, fn method ->
-            :ets.member(@table, {{:protocol, ns, protocol, method}, tag})
+            Env.member?({{:protocol, ns, protocol, method}, tag})
           end)
 
-      [] ->
+      :error ->
         false
     end
   end
 
   defp protocol!(ns, name) do
-    case :ets.lookup(@table, {:protocol, ns, name}) do
-      [{_, desc}] -> desc
-      [] -> raise "No protocol named #{ns}/#{name} — defprotocol it before extending"
+    case Env.lookup({:protocol, ns, name}) do
+      {:ok, desc} -> desc
+      :error -> raise "No protocol named #{ns}/#{name} — defprotocol it before extending"
     end
   end
 end

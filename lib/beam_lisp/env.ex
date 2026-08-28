@@ -1,39 +1,308 @@
 defmodule BeamLisp.Env do
   @moduledoc """
-  The var registry.
+  The var registry — process-scoped environments with a read-through chain.
 
-  Vars live in a public ETS table keyed `{ns, name}`: reads are
-  lock-free and happen in the caller's process, which keeps compiled
-  code fast and free of a global message bottleneck. Namespace and
-  bootstrap state (small, compile-time only) stays in the Agent,
-  which also owns the table.
+  Vars live in a public ETS table. Reads are lock-free and happen in the
+  caller's process, which keeps compiled code fast and free of a global
+  message bottleneck. Namespace and bootstrap state (small, compile-time
+  only) stays in the Agent, which also owns the table.
 
   Unqualified lookups fall back to `core`, mirroring how jank and
   Clojure refer `clojure.core` into every namespace.
+
+  ## Environments (PLAN-046)
+
+  Every table key carries an environment id as its first element. The id
+  comes from the process dictionary (`env_id/0`), defaulting to `:global` —
+  the zero env, in which every call behaves exactly as it did before envs
+  existed.
+
+  An env created by `fork/1` has a PARENT. Reads walk the chain
+  `env → parent → … → :global` and resolve at the first hit; writes always
+  land in the current env. A fork therefore sees everything its ancestors
+  see (read-through) while nothing it defines leaks sideways or upward
+  (shadowing). That pair of properties is what makes a per-test env a
+  zero-copy checkout of a warm base image.
+
+  The chain is cached in the process dictionary at bind time
+  (`with_env/2`, `bind/1`), so the hot path pays one pdict read per op and
+  never talks to the Agent. Fork/destroy/mark are cold ops and do.
+
+  `with_env/2` binds an env for the calling process; `isolated/2` forks,
+  binds, and destroys. Binding does NOT cross `spawn`/`Task.async` — see
+  `capture/0` and `bind/1` (and note `BeamLisp.Refs.future_exec/1` and
+  `BeamLisp.Refs.promise/0` already propagate for you; host code spawning
+  around beam-lisp work must capture/bind explicitly).
+
+  `current_ns` is process-local inside a fork (Clojure's thread-local
+  `*ns*` semantics): `in_ns/1` writes the pdict, and two processes in the
+  same env cannot fight over it. At `:global` it stays Agent-backed, so
+  REPL and session behavior are unchanged.
   """
 
   use Agent
 
   @table :beam_lisp_vars
+  @pdict_env :bl_env
+  @pdict_chain :bl_env_chain
+  @pdict_ns :bl_ns
+  @max_chain_depth 8
 
   def start_link(_opts) do
     Agent.start_link(
       fn ->
         :ets.new(@table, [:named_table, :public, read_concurrency: true])
-        %{ns: "user", seeded: false, loaded: MapSet.new(), load_paths: [], search_paths: []}
+
+        %{
+          ns: "user",
+          seeded: false,
+          loaded: MapSet.new(),
+          load_paths: [],
+          search_paths: [],
+          envs: %{}
+        }
       end,
       name: __MODULE__
     )
   end
 
-  @doc "The namespace new defs land in."
-  def current_ns, do: Agent.get(__MODULE__, & &1.ns)
+  # ------------------------------------------------------------------
+  # Environments
+  # ------------------------------------------------------------------
 
-  def in_ns(ns) when is_binary(ns), do: Agent.update(__MODULE__, &%{&1 | ns: ns})
+  @doc "The current process's env id (`:global` when unbound)."
+  def env_id, do: Process.get(@pdict_env, :global)
+
+  @doc """
+  The read-through chain for the current process, innermost first.
+
+  Cached in the pdict at bind time; a destroyed ancestor simply misses in
+  ETS and the walk degrades to the next link, so a stale cached chain is
+  never a correctness problem.
+  """
+  def chain, do: Process.get(@pdict_chain, [:global])
+
+  @doc """
+  Create a new env whose reads fall through to `parent` (default: the
+  current env). Returns the env id; does NOT bind it — see `with_env/2`.
+  """
+  def fork(parent \\ env_id()) do
+    id = {:env, make_ref()}
+
+    Agent.update(__MODULE__, fn s ->
+      envs = Map.get(s, :envs, %{})
+      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent)))
+    end)
+
+    id
+  end
+
+  defp fresh_env_state(parent), do: %{parent: parent, loaded: MapSet.new(), search_paths: []}
+
+  @doc """
+  Run `fun` with `env` bound in the calling process; restores the previous
+  binding (and process-local current-ns) afterwards.
+  """
+  def with_env(env, fun) when is_function(fun, 0) do
+    prev_env = Process.get(@pdict_env)
+    prev_chain = Process.get(@pdict_chain)
+    prev_ns = Process.get(@pdict_ns)
+
+    Process.put(@pdict_env, env)
+    Process.put(@pdict_chain, compute_chain(env))
+    # A fresh env means a fresh `*ns*`: Clojure thread-local semantics.
+    Process.delete(@pdict_ns)
+
+    try do
+      fun.()
+    after
+      restore_pdict(@pdict_env, prev_env)
+      restore_pdict(@pdict_chain, prev_chain)
+      restore_pdict(@pdict_ns, prev_ns)
+    end
+  end
+
+  @doc """
+  Fork an env (parent: the current env), bind it for `fun`, and destroy it
+  afterwards. The one-call shape of "run this in a clean room".
+  """
+  def isolated(fun) when is_function(fun, 0), do: isolated(env_id(), fun)
+
+  def isolated(parent, fun) when is_function(fun, 0) do
+    env = fork(parent)
+
+    try do
+      with_env(env, fun)
+    after
+      destroy(env)
+    end
+  end
+
+  @doc """
+  Drop every row belonging to `env` and forget its bookkeeping.
+
+  One `select_delete` scan guarded on the key's first element, so it works
+  for every key shape without enumerating them. A missed destroy leaks ETS
+  rows, never correctness — `chain/0` degrades past dead envs.
+  """
+  def destroy(env) do
+    spec = [
+      {{:"$1", :_},
+       [{:andalso, {:is_tuple, :"$1"}, {:==, {:element, 1, :"$1"}, {:const, env}}}], [true]}
+    ]
+
+    :ets.select_delete(@table, spec)
+
+    Agent.update(__MODULE__, fn s ->
+      Map.update(s, :envs, %{}, &Map.delete(&1, env))
+    end)
+
+    :ok
+  end
+
+  @doc """
+  Capture the current env binding (id + chain + process-local ns) as an
+  opaque token for `bind/1`. Host Elixir code that spawns a process to run
+  beam-lisp work should capture before spawning and bind in the child.
+  """
+  def capture do
+    %{env: Process.get(@pdict_env), chain: Process.get(@pdict_chain), ns: Process.get(@pdict_ns)}
+  end
+
+  @doc "Install a token from `capture/0` in the calling process."
+  def bind(%{env: env, chain: chain, ns: ns}) do
+    restore_pdict(@pdict_env, env)
+    restore_pdict(@pdict_chain, chain)
+    restore_pdict(@pdict_ns, ns)
+    :ok
+  end
+
+  @doc """
+  Debug aid: for each env in the chain and each resolution candidate, show
+  whether the var is present. Answers "why did this var resolve?" — the one
+  question read-through chains make harder.
+  """
+  def explain(ns, name) do
+    for env <- chain(), {cns, cname} <- candidates(ns, name) do
+      %{env: env, ns: cns, name: cname, found: :ets.member(@table, pfx(env, {cns, cname}))}
+    end
+  end
+
+  defp restore_pdict(key, nil), do: Process.delete(key)
+  defp restore_pdict(key, value), do: Process.put(key, value)
+
+  # Walk the env metadata to build the read-through chain. Cold: runs once
+  # per bind, not per lookup. Degrades past unknown (destroyed) envs.
+  defp compute_chain(env), do: compute_chain(env, @max_chain_depth, [])
+
+  defp compute_chain(:global, _depth, acc), do: Enum.reverse([:global | acc])
+
+  defp compute_chain(_env, 0, acc), do: Enum.reverse([:global | acc])
+
+  defp compute_chain(env, depth, acc) do
+    case env_state(env) do
+      %{parent: :global} -> Enum.reverse([:global, env | acc])
+      %{parent: parent} -> compute_chain(parent, depth - 1, [env | acc])
+      nil -> Enum.reverse([:global, env | acc])
+    end
+  end
+
+  defp env_state(env), do: Agent.get(__MODULE__, &get_in(&1, [:envs, env]))
+
+  defp update_env_state(env, fun) do
+    Agent.update(__MODULE__, fn s ->
+      envs = Map.get(s, :envs, %{})
+      state = Map.get(envs, env, fresh_env_state(:global))
+      Map.put(s, :envs, Map.put(envs, env, fun.(state)))
+    end)
+  end
+
+  # ------------------------------------------------------------------
+  # Key plumbing (shared by the registry modules)
+  # ------------------------------------------------------------------
+
+  # Prefix an old-shape key with an env id. Atoms (trace state) become
+  # `{env, atom}`; tuples gain env as element 0. `:global` rows are exactly
+  # the old shape plus one leading element — the format change is total,
+  # there is no mixed-mode table.
+  @doc false
+  def pfx(env, k) when is_tuple(k), do: Tuple.insert_at(k, 0, env)
+  @doc false
+  def pfx(env, k) when is_atom(k), do: {env, k}
+
+  @doc false
+  def key(k), do: pfx(env_id(), k)
+
+  @doc "Chain-walking lookup of an old-shape key: `{:ok, value}` or `:error`."
+  def lookup(k) do
+    Enum.find_value(chain(), :error, fn env ->
+      case :ets.lookup(@table, pfx(env, k)) do
+        [{_, value}] -> {:ok, value}
+        [] -> nil
+      end
+    end)
+  end
+
+  @doc "Chain-walking membership test of an old-shape key."
+  def member?(k), do: Enum.any?(chain(), &:ets.member(@table, pfx(&1, k)))
+
+  @doc "Insert `{key, value}` into the CURRENT env (writes never cross envs)."
+  def put_key(k, value) do
+    :ets.insert(@table, {key(k), value})
+  end
+
+  @doc "Delete an old-shape key from the CURRENT env only."
+  def delete_key(k), do: :ets.delete(@table, key(k))
+
+  @doc """
+  Chain-walking `:ets.match/2`: the whole-row pattern's key half gets the
+  env prefix per chain link, results concatenated innermost-first.
+  """
+  def match({key_pat, val_pat}) do
+    Enum.flat_map(chain(), fn env -> :ets.match(@table, {pfx(env, key_pat), val_pat}) end)
+  end
+
+  # Exact-env variants: registries that must NOT read through (the bl test
+  # registry — a forked suite runs its own tests, never the base's).
+
+  @doc false
+  def lookup_own(k) do
+    case :ets.lookup(@table, key(k)) do
+      [{_, value}] -> {:ok, value}
+      [] -> :error
+    end
+  end
+
+  @doc false
+  def match_own({key_pat, val_pat}), do: :ets.match(@table, {key(key_pat), val_pat})
+
+  @doc false
+  def match_delete_own({key_pat, val_pat}), do: :ets.match_delete(@table, {key(key_pat), val_pat})
+
+  # ------------------------------------------------------------------
+  # Namespaces and vars
+  # ------------------------------------------------------------------
+
+  @doc "The namespace new defs land in."
+  def current_ns do
+    case env_id() do
+      :global -> Agent.get(__MODULE__, & &1.ns)
+      _ -> Process.get(@pdict_ns, "user")
+    end
+  end
+
+  def in_ns(ns) when is_binary(ns) do
+    case env_id() do
+      :global -> Agent.update(__MODULE__, &%{&1 | ns: ns})
+      _ -> Process.put(@pdict_ns, ns)
+    end
+
+    :ok
+  end
 
   @doc "Bind `name` to `value` in `ns`. Returns the value, like Clojure's def returns the var root."
   def intern(ns, name, value) do
-    :ets.insert(@table, {{ns, name}, value})
+    put_key({ns, name}, value)
     value
   end
 
@@ -42,23 +311,31 @@ defmodule BeamLisp.Env do
   falling back to `core` (mirroring how jank and Clojure refer
   `clojure.core` into every namespace).
 
+  Each candidate pair is tried across the whole env chain before moving to
+  the next candidate: an env fully shadows its ancestors, candidate by
+  candidate.
+
   A name containing a `/` is split into `{ns, var}`; if the prefix
   is an alias in `ns`, it resolves to the alias target instead.
   """
   def fetch(ns, name) do
-    Enum.find_value(candidates(ns, name), :error, fn key ->
-      case :ets.lookup(@table, key) do
-        [{^key, value}] -> {:ok, value}
-        [] -> nil
-      end
+    cands = candidates(ns, name)
+
+    Enum.find_value(chain(), :error, fn env ->
+      Enum.find_value(cands, nil, fn key ->
+        case :ets.lookup(@table, pfx(env, key)) do
+          [{_, value}] -> {:ok, value}
+          [] -> nil
+        end
+      end)
     end)
   end
 
   # The candidate `{ns, name}` pairs a lookup should try, in order:
   # the namespace itself, then referred vars, then `core` (mirroring
   # how jank and Clojure refer `clojure.core` into every namespace).
-  # A name containing a `/` splits into `{ns, var}`; if the prefix is
-  # an alias in `ns`, it resolves to the alias target instead. A
+  # A name containing a `/` splits into `{ns, var}`; if the prefix
+  # is an alias in `ns`, it resolves to the alias target instead. A
   # leading slash (`/`, `/x`) is part of the var name itself.
   defp candidates(ns, name) do
     case String.split(name, "/", parts: 2) do
@@ -75,35 +352,37 @@ defmodule BeamLisp.Env do
 
   @doc "Record `alias` as shorthand for `target` inside `ns`."
   def add_alias(ns, alias_, target) do
-    :ets.insert(@table, {{:alias, ns, alias_}, target})
+    put_key({:alias, ns, alias_}, target)
     :ok
   end
 
   @doc "The namespace `alias` points to inside `ns`, if any."
   def alias_target(ns, alias_) do
-    case :ets.lookup(@table, {:alias, ns, alias_}) do
-      [{_, target}] -> target
-      [] -> nil
+    case lookup({:alias, ns, alias_}) do
+      {:ok, target} -> target
+      :error -> nil
     end
   end
 
   @doc """
-  Every public var name interned in `ns`.
+  Every public var name interned in `ns` — the UNION over the env chain.
 
   Backs `(:require [ns :refer :all])`. Private vars are filtered here
   rather than at the refer site, so the blanket form can never smuggle
   in a name that the explicit `:refer […]` form would have refused.
   """
   def public_names(ns) do
-    @table
-    |> :ets.match({{ns, :"$1"}, :_})
-    |> List.flatten()
-    |> Enum.reject(fn name -> match?({:ok, %{private: true}}, meta(ns, name)) end)
+    names =
+      match({{ns, :"$1"}, :_})
+      |> List.flatten()
+      |> Enum.uniq()
+
+    Enum.reject(names, fn name -> match?({:ok, %{private: true}}, meta(ns, name)) end)
   end
 
   @doc "Refer `name` into `ns` so it resolves bare, as if defined there."
   def add_refer(ns, name, source_ns) do
-    :ets.insert(@table, {{:refer, ns, name}, source_ns})
+    put_key({:refer, ns, name}, source_ns)
     :ok
   end
 
@@ -122,14 +401,14 @@ defmodule BeamLisp.Env do
 
   @doc """
   True when `name` is interned in `ns` itself — no refer, alias or
-  core fallback consulted.
+  core fallback consulted, but ancestors count (read-through).
 
   `fetch/2` deliberately searches all of those; a resolver asking "is
   this name local, or does it belong to somebody else?" needs the
   narrow question.
   """
   def local_var?(ns, name) do
-    :ets.member(@table, {ns, name})
+    member?({ns, name})
   end
 
   @doc """
@@ -140,9 +419,9 @@ defmodule BeamLisp.Env do
   the owning namespace rather than the value.
   """
   def refer_source(ns, name) do
-    case :ets.lookup(@table, {:refer, ns, name}) do
-      [{_, source}] -> source
-      [] -> nil
+    case lookup({:refer, ns, name}) do
+      {:ok, source} -> source
+      :error -> nil
     end
   end
 
@@ -164,33 +443,55 @@ defmodule BeamLisp.Env do
   only macros, and of any two namespaces that refer to each other.
   """
   def declare_ns(ns) when is_binary(ns) do
-    :ets.insert(@table, {{:ns, ns}, true})
+    put_key({:ns, ns}, true)
     :ok
   end
 
   @doc """
   True when `ns` has been declared by an `(ns …)` form, or has any var
-  interned in it.
+  interned in it, anywhere in the env chain.
 
   The second half keeps namespaces created by other routes — `in_ns`,
   direct `intern`, the prelude's seeding — visible without each having
   to announce itself.
   """
   def ns_exists?(ns) do
-    case :ets.lookup(@table, {:ns, ns}) do
-      [{_, true}] ->
-        true
+    Enum.any?(chain(), fn env ->
+      case :ets.lookup(@table, pfx(env, {:ns, ns})) do
+        [{_, true}] ->
+          true
 
-      [] ->
-        case :ets.match(@table, {{ns, :_}, :_}, 1) do
-          {[_], _} -> true
-          _ -> false
-        end
-    end
+        [] ->
+          case :ets.match(@table, {pfx(env, {ns, :_}), :_}, 1) do
+            {[_], _} -> true
+            _ -> false
+          end
+      end
+    end)
   end
 
-  def loaded_ns?(ns), do: Agent.get(__MODULE__, &MapSet.member?(&1.loaded, ns))
-  def mark_loaded(ns), do: Agent.update(__MODULE__, &%{&1 | loaded: MapSet.put(&1.loaded, ns)})
+  def loaded_ns?(ns) do
+    Enum.any?(chain(), fn
+      :global ->
+        Agent.get(__MODULE__, &MapSet.member?(&1.loaded, ns))
+
+      env ->
+        case env_state(env) do
+          %{loaded: loaded} -> MapSet.member?(loaded, ns)
+          _ -> false
+        end
+    end)
+  end
+
+  def mark_loaded(ns) do
+    case env_id() do
+      :global ->
+        Agent.update(__MODULE__, &%{&1 | loaded: MapSet.put(&1.loaded, ns)})
+
+      env ->
+        update_env_state(env, fn st -> %{st | loaded: MapSet.put(st.loaded, ns)} end)
+    end
+  end
 
   # --- var linking (BeamLisp.Link) ---
   # fn vars also live as named functions in a per-ns module; the
@@ -198,13 +499,13 @@ defmodule BeamLisp.Env do
 
   @doc "The def entries `{name => [{kind, arity, fname, def_ast}]}` backing ns's module."
   def ns_defs(ns) do
-    case :ets.lookup(@table, {:ns_defs, ns}) do
-      [{_, defs}] -> defs
-      [] -> %{}
+    case lookup({:ns_defs, ns}) do
+      {:ok, defs} -> defs
+      :error -> %{}
     end
   end
 
-  def put_ns_defs(ns, defs), do: :ets.insert(@table, {{:ns_defs, ns}, defs})
+  def put_ns_defs(ns, defs), do: put_key({:ns_defs, ns}, defs)
 
   @doc """
   Every namespace that exists: defined something OR declared by `(ns …)`.
@@ -220,21 +521,28 @@ defmodule BeamLisp.Env do
   a contract-only namespace did not appear in its own listing).
   """
   def namespaces do
-    defined = :ets.select(@table, [{{{:ns_defs, :"$1"}, :_}, [], [:"$1"]}])
-    declared = :ets.select(@table, [{{{:ns, :"$1"}, :_}, [], [:"$1"]}])
-    Enum.uniq(defined ++ declared)
+    chain()
+    |> Enum.flat_map(fn env ->
+      :ets.select(@table, [{{pfx(env, {:ns_defs, :"$1"}), :_}, [], [:"$1"]}]) ++
+        :ets.select(@table, [{{pfx(env, {:ns, :"$1"}), :_}, [], [:"$1"]}])
+    end)
+    |> Enum.uniq()
   end
 
   @doc "Register link metadata `{module, %{arity => fname}, {min, vfname} | nil}` for a fn var."
-  def put_link(ns, name, info), do: :ets.insert(@table, {{:link, ns, name}, info})
+  def put_link(ns, name, info), do: put_key({:link, ns, name}, info)
 
   @doc "Resolve link metadata with the same alias/refer/core rules as fetch/2."
   def link(ns, name) do
-    Enum.find_value(candidates(ns, name), :error, fn {cns, cname} ->
-      case :ets.lookup(@table, {:link, cns, cname}) do
-        [{_, info}] -> {:ok, info}
-        [] -> nil
-      end
+    cands = candidates(ns, name)
+
+    Enum.find_value(chain(), :error, fn env ->
+      Enum.find_value(cands, nil, fn {cns, cname} ->
+        case :ets.lookup(@table, pfx(env, {:link, cns, cname})) do
+          [{_, info}] -> {:ok, info}
+          [] -> nil
+        end
+      end)
     end)
   end
 
@@ -244,30 +552,28 @@ defmodule BeamLisp.Env do
   `%{dynamic: true}` and any other Clojure metadata keys all live in
   the one map. Writes **merge**: redefining a var with a new docstring
   keeps keys set earlier (so `:private` set on the first def survives a
-  later doc-only redefinition) and the latest value wins per key.
+  later doc-only redefinition) and the latest value wins per key. The
+  merge base is chain-visible, so a fork refining a var's metadata merges
+  onto the ancestor's copy and writes the result locally — the ancestor
+  keeps its own.
   Returns `:ok`.
   """
   # is_map-ok: meta is the internal var-metadata map (compiler/REPL side
   # channel), never a user collection — structs are legitimate here.
   def put_meta(ns, name, meta) when is_map(meta) do
     merged =
-      case :ets.lookup(@table, {:meta, ns, name}) do
+      case lookup({:meta, ns, name}) do
         # is_map-ok: `existing` is the same internal metadata map from ETS.
-        [{_, existing}] when is_map(existing) -> Map.merge(existing, meta)
+        {:ok, existing} when is_map(existing) -> Map.merge(existing, meta)
         _ -> meta
       end
 
-    :ets.insert(@table, {{:meta, ns, name}, merged})
+    put_key({:meta, ns, name}, merged)
     :ok
   end
 
   @doc "Read the metadata map recorded by `put_meta/3` for `name` in `ns` (no resolution)."
-  def meta(ns, name) do
-    case :ets.lookup(@table, {:meta, ns, name}) do
-      [{_, meta}] -> {:ok, meta}
-      [] -> :error
-    end
-  end
+  def meta(ns, name), do: lookup({:meta, ns, name})
 
   @doc """
   Resolve `name` through the same alias/refer/core rules as `fetch/2`
@@ -280,13 +586,17 @@ defmodule BeamLisp.Env do
   """
   def doc_string(ns, name) do
     name = unwrap_doc_name(name)
+    cands = candidates(ns, name)
 
-    case Enum.find_value(candidates(ns, name), fn {cns, cname} ->
-           case :ets.lookup(@table, {:meta, cns, cname}) do
-             [{_, %{doc: doc}}] -> {cns, cname, doc}
-             [] -> nil
-           end
-         end) do
+    Enum.find_value(chain(), fn env ->
+      Enum.find_value(cands, fn {cns, cname} ->
+        case :ets.lookup(@table, pfx(env, {:meta, cns, cname})) do
+          [{_, %{doc: doc}}] -> {cns, cname, doc}
+          [] -> nil
+        end
+      end)
+    end)
+    |> case do
       {cns, cname, doc} -> %{ns: cns, name: cname, doc: doc}
       nil -> nil
     end
@@ -295,13 +605,37 @@ defmodule BeamLisp.Env do
   defp unwrap_doc_name({:symbol, name}), do: name
   defp unwrap_doc_name(name) when is_binary(name), do: name
 
-  @doc "Directories the loader searches for `<ns>.bl` files, innermost first."
-  def load_paths, do: Agent.get(__MODULE__, & &1.load_paths)
+  @doc """
+  Directories the loader searches for `<ns>.bl` files, innermost first.
 
-  def push_load_path(dir), do: Agent.update(__MODULE__, &%{&1 | load_paths: [dir | &1.load_paths]})
+  The stack is a load-in-progress affair: at `:global` it stays in the
+  Agent (byte-identical session behavior); in a fork it is process-local,
+  so two processes loading concurrently in one env cannot corrupt each
+  other's stack.
+  """
+  def load_paths do
+    case env_id() do
+      :global -> Agent.get(__MODULE__, & &1.load_paths)
+      _ -> Process.get(:bl_load_paths, [])
+    end
+  end
+
+  def push_load_path(dir) do
+    case env_id() do
+      :global -> Agent.update(__MODULE__, &%{&1 | load_paths: [dir | &1.load_paths]})
+      _ -> Process.put(:bl_load_paths, [dir | load_paths()])
+    end
+
+    :ok
+  end
 
   def pop_load_path do
-    Agent.update(__MODULE__, &%{&1 | load_paths: tl(&1.load_paths)})
+    case env_id() do
+      :global -> Agent.update(__MODULE__, &%{&1 | load_paths: tl(&1.load_paths)})
+      _ -> Process.put(:bl_load_paths, tl(load_paths()))
+    end
+
+    :ok
   end
 
   @doc """
@@ -313,21 +647,49 @@ defmodule BeamLisp.Env do
   them would make a configured root vanish the moment a nested require
   finished, which is exactly the bug shape `pop_load_path` exists to create
   for the stack.
+
+  Reads walk the chain (own env's roots first, then ancestors'); writes
+  land in the current env, so a test can add a fixture root without
+  polluting its base image.
   """
-  def search_paths, do: Agent.get(__MODULE__, &Map.get(&1, :search_paths, []))
+  def search_paths do
+    chain()
+    |> Enum.flat_map(fn
+      :global -> Agent.get(__MODULE__, &Map.get(&1, :search_paths, []))
+      env ->
+        case env_state(env) do
+          %{search_paths: paths} -> paths
+          _ -> []
+        end
+    end)
+    |> Enum.uniq()
+  end
 
   @doc "Append a search path (idempotent, order-preserving)."
   def add_search_path(dir) do
     dir = Path.expand(dir)
 
-    Agent.update(__MODULE__, fn s ->
-      paths = Map.get(s, :search_paths, [])
-      if dir in paths, do: s, else: Map.put(s, :search_paths, paths ++ [dir])
-    end)
+    case env_id() do
+      :global ->
+        Agent.update(__MODULE__, fn s ->
+          paths = Map.get(s, :search_paths, [])
+          if dir in paths, do: s, else: Map.put(s, :search_paths, paths ++ [dir])
+        end)
+
+      env ->
+        update_env_state(env, fn st ->
+          if dir in st.search_paths, do: st, else: %{st | search_paths: st.search_paths ++ [dir]}
+        end)
+    end
   end
 
-  @doc "Drop all configured search paths (test isolation)."
-  def clear_search_paths, do: Agent.update(__MODULE__, &Map.put(&1, :search_paths, []))
+  @doc "Drop the current env's configured search paths (test isolation)."
+  def clear_search_paths do
+    case env_id() do
+      :global -> Agent.update(__MODULE__, &Map.put(&1, :search_paths, []))
+      env -> update_env_state(env, &%{&1 | search_paths: []})
+    end
+  end
 
   def fetch!(ns, name) do
     case fetch(ns, name) do
@@ -336,6 +698,17 @@ defmodule BeamLisp.Env do
     end
   end
 
-  def seeded?, do: Agent.get(__MODULE__, & &1.seeded)
-  def mark_seeded, do: Agent.update(__MODULE__, &%{&1 | seeded: true})
+  def seeded? do
+    Enum.any?(chain(), fn
+      :global -> Agent.get(__MODULE__, & &1.seeded)
+      _env -> false
+    end)
+  end
+
+  def mark_seeded do
+    case env_id() do
+      :global -> Agent.update(__MODULE__, &%{&1 | seeded: true})
+      _env -> :ok
+    end
+  end
 end

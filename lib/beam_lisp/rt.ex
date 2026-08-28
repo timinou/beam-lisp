@@ -2051,14 +2051,14 @@ defmodule BeamLisp.RT do
   # consults it for `@`, core.bl registers the mapping, users may
   # rebind it. `(reader-macro! "@" (quote deref))`.
   def reader_macro(char) do
-    case :ets.lookup(:beam_lisp_vars, {:reader_macro, char}) do
-      [{{:reader_macro, ^char}, name}] -> {:ok, name}
-      [] -> :error
+    case BeamLisp.Env.lookup({:reader_macro, char}) do
+      {:ok, name} -> {:ok, name}
+      :error -> :error
     end
   end
 
   def reader_macro!(char, {:symbol, name}) when is_binary(char) do
-    :ets.insert(:beam_lisp_vars, {{:reader_macro, char}, name})
+    BeamLisp.Env.put_key({:reader_macro, char}, name)
     name
   end
 
@@ -2070,9 +2070,9 @@ defmodule BeamLisp.RT do
   as Clojure's `*data-readers*` expands `#inst "…"`.
   """
   def data_reader(tag) when is_binary(tag) do
-    case :ets.lookup(:beam_lisp_vars, {:data_reader, tag}) do
-      [{{:data_reader, ^tag}, name}] -> {:ok, name}
-      [] -> data_reader_default(tag)
+    case BeamLisp.Env.lookup({:data_reader, tag}) do
+      {:ok, name} -> {:ok, name}
+      :error -> data_reader_default(tag)
     end
   end
 
@@ -2092,7 +2092,7 @@ defmodule BeamLisp.RT do
   into the reader.
   """
   def data_reader!(tag, {:symbol, name}) when is_binary(tag) do
-    :ets.insert(:beam_lisp_vars, {{:data_reader, tag}, name})
+    BeamLisp.Env.put_key({:data_reader, tag}, name)
     name
   end
 
