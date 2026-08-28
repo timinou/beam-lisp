@@ -105,6 +105,30 @@ inside its own process* (e.g. `datom-conn-registry`), those functions run
 at `:global` and won't see your env — FUP-009 tracks fixing that pattern.
 Until then, suites exercising such singletons stay serial.
 
+## Sandboxing the sandbox: per-env capabilities
+
+An env can also carry RIGHTS, not just state: which host modules its code
+may call. Fork with `caps:` to narrow them — a test that should be pure
+gets an env that structurally cannot touch the filesystem:
+
+```elixir
+env = BeamLisp.Env.fork(:global, caps: [String])   # ONLY String interop
+BeamLisp.Env.with_env(env, fn ->
+  BeamLisp.eval(~s|(ns t) (File/read "/etc/passwd")|)
+  # ** CompileError: module File is not granted in this environment
+end)
+```
+
+Attenuation is structural — a fork's caps are `parent ∩ spec`, never more
+(the same monotonic-weakening invariant as the auth package's Biscuit
+tokens, one level down). Static calls are rejected at COMPILE time (denied
+code never becomes bytecode); dynamic handles are checked at invocation;
+`defnative` is unavailable in any capped env. `:global` holds `:all`, so
+nothing existing changes. Hot path: 28–42ns per check.
+
+See `test/beam_lisp/caps_test.exs` — the deny-corpus that keeps every
+escape spelling failing closed.
+
 ## Debugging resolution surprises
 
 "Why did this var resolve to THAT?" Ask the chain, from IEx or a failing
