@@ -36,8 +36,11 @@ defmodule BeamLisp.Sandbox do
   Evaluate `sources` into a fresh base env named `name`, once per VM.
 
   `sources` are namespace names (`"my.app"` — loaded through the loader,
-  honoring search paths) or file paths (anything that exists on disk —
-  evaluated like a test file, with its directory pushed as a load path).
+  honoring search paths), file paths (anything that exists on disk —
+  evaluated like a test file, with its directory pushed as a load path),
+  or zero-arg functions (called inside the base env — the escape hatch for
+  apps whose load does more than `ensure_loaded`, e.g. setting search
+  paths first).
 
   Idempotent by `name`: a second call returns the existing base. A
   concurrent double-warm does the work twice and leaks one base's rows —
@@ -50,6 +53,13 @@ defmodule BeamLisp.Sandbox do
         base = Env.fork(:global)
 
         Env.with_env(base, fn ->
+          # The `src/` library-root convention, same as `mix beam_lisp.test`:
+          # a base image for THIS project's namespaces resolves them without
+          # every test repeating a search path. Lands in the base env, so
+          # forks see it through the chain.
+          src = Path.join(File.cwd!(), "src")
+          if File.dir?(src), do: Env.add_search_path(src)
+
           Enum.each(sources, &load_source/1)
         end)
 
@@ -111,6 +121,8 @@ defmodule BeamLisp.Sandbox do
     Compiler.eval_string(source)
     :ok
   end
+
+  defp load_source(source) when is_function(source, 0), do: source.()
 
   defp load_source(source) do
     if File.exists?(source), do: load_file(source), else: load_ns(source)

@@ -72,7 +72,13 @@ defmodule Mix.Tasks.BeamLisp.Gen.Case do
       `BeamLisp.Sandbox.load_ns/1`, `load_file/1`, or `eval/1`.
       \"\"\"
 
-      use BeamLisp.ExUnitCase
+      use ExUnit.CaseTemplate
+
+      using do
+        quote do
+          use BeamLisp.ExUnitCase
+        end
+      end
     end
     """
   end
@@ -87,7 +93,13 @@ defmodule Mix.Tasks.BeamLisp.Gen.Case do
       (`async: true` is on). A test's defs never leak.
       \"\"\"
 
-      use BeamLisp.ExUnitCase, warm: {#{inspect(base_name(module))}, #{inspect(warm)}}
+      use ExUnit.CaseTemplate
+
+      using do
+        quote do
+          use BeamLisp.ExUnitCase, warm: {#{inspect(base_name(module))}, #{inspect(warm)}}
+        end
+      end
     end
     """
   end
