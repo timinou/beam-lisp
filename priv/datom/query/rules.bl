@@ -156,8 +156,14 @@
    Returns the set of value tuples the body derives for `head-args`.
    `use-delta` names ONE rule whose invocation should read `delta` instead
    of its full relation — the semi-naive restriction. When nil, every
-   invocation reads the full relation (the naive step)."
-  [db body head-args names state delta use-delta eval-plain]
+   invocation reads the full relation (the naive step).
+
+   `seed-rows` are initial bindings over THIS definition's head vars,
+   computed from the call sites (FEAT-025): a rule invoked with a bound
+   argument evaluates its body with that constant in scope, so predicates
+   over head args (in-force on ?date) fire instead of silently deriving
+   nothing. Empty/nil seed-rows = the classic [{}] start (full relation)."
+  [db body head-args names state delta use-delta eval-plain seed-rows]
   ; Split the body into rule invocations and plain clauses. Plain clauses
   ; go to the engine as a block; invocations are expanded here, each
   ; multiplying the binding set by its relation's matching tuples.
@@ -176,7 +182,8 @@
                  ; a plain clause block: hand this single clause to the
                  ; engine, per current row.
                  (flat-into (fn [b] (eval-plain db b clause)) rows)))
-        final (reduce step [{}] (to-list body))]
+        start (if (seq seed-rows) seed-rows [{}])
+        final (reduce step start (to-list body))]
     (set (mapv (fn [b] (mapv (fn [a]
                                (if (datom.query.parse/variable? a) (get b a) a))
                              head-args))
@@ -185,8 +192,10 @@
 (defn- apply-rules-once
   "One round of applying every definition. Returns the map of NEW tuples
    per rule name (those not already in `state`). `use-delta` selects
-   naive (nil) vs semi-naive (read deltas for recursive self-reference)."
-  [db grouped names state delta use-delta eval-plain]
+   naive (nil) vs semi-naive (read deltas for recursive self-reference).
+   `seeds` maps rule name → positional seed maps `{position value}` from
+   the call sites; each definition maps positions onto its own head vars."
+  [db grouped names state delta use-delta eval-plain seeds]
   (reduce
     (fn [new-map nm]
       (let [defs (get grouped nm)
@@ -195,7 +204,8 @@
                         (into acc
                               (eval-body-with-relations
                                 db (rule-body d) (rule-head-args d)
-                                names state delta use-delta eval-plain)))
+                                names state delta use-delta eval-plain
+                                (seed-rows-for d (get seeds nm)))))
                       #{}
                       defs)
             known (or (get state nm) #{})
@@ -204,6 +214,108 @@
         (assoc new-map nm fresh)))
     {}
     (into [] names)))
+
+;; ── call-site seeds (FEAT-025) ──────────────────────────────────────
+;;
+;; Bottom-up materialisation computes each rule's relation with an EMPTY
+;; initial binding — so a body predicate over a HEAD argument
+;; (`[(<= ?from ?date)]` with `?date` bound only at the call site) can
+;; never fire. This is the bounded-recursion problem; the lightweight
+;; answer (magic sets' little sibling) is ADORNMENT: find the rule
+;; invocations in the query, take the positions bound at EVERY call site
+;; (constants, or variables bound by query inputs), and evaluate bodies
+;; with those constants already in the initial rows. Soundness rule:
+;; a position free in ANY invocation is never seeded — a free call site
+;; must see the full relation.
+
+(def ^:private composite-ops #{:or :and :not :or-join :not-join})
+
+(defn- composite-clause? [c]
+  (and (vector? c) (contains? composite-ops (get c 0))))
+
+(defn- scan-invocations
+  "Every rule-invocation clause in a where tree, descending into
+   :or/:and/:not composites. Anything not an invocation is ignored — a
+   MISSED invocation would under-seed, so the walker favours recall."
+  [clauses names]
+  (flat-into
+    (fn [c]
+      (cond
+        (invocation? c names) [c]
+        (composite-clause? c)
+          (scan-invocations
+            (filterv (fn [x] (or (list? x) (composite-clause? x)))
+                     (into [] (rest c)))
+            names)
+        :else []))
+    clauses))
+
+(defn- seed-rows-for
+  "Initial binding rows for one DEFINITION, mapping positional seeds onto
+   the definition's own head vars (different defs may name them
+   differently)."
+  [definition posmaps]
+  (let [hargs (rule-head-args definition)]
+    (into []
+          (mapv (fn [pm]
+                  (reduce (fn [row kv]
+                            (assoc row (get hargs (key kv)) (val kv)))
+                          {}
+                          (to-list pm)))
+                (to-list posmaps)))))
+
+(defn invocation-seeds
+  "Per-rule seed positions for a query: `{rule-name [{position value} …]}`.
+   One positional map per invocation; a position survives only if bound in
+   EVERY invocation of that rule. `input-binding` is the query's :in row
+   (single-row only — the caller passes {} when inputs are multi-row)."
+  [rules where-clauses input-binding]
+  (let [grouped (rules-by-name rules)
+        names (rule-names rules)
+        invs (scan-invocations where-clauses names)
+        by-name
+        (reduce
+          (fn [acc c]
+            (let [nm (first c)
+                  call-args (into [] (rest c))
+                  head-arity (count (rule-head-args (get (get grouped nm) 0)))
+                  posmap
+                  (reduce
+                    (fn [m i]
+                      (let [arg (get call-args i)]
+                        (cond
+                          (not (datom.query.parse/variable? arg))
+                            (assoc m i arg)
+                          (contains? input-binding arg)
+                            (assoc m i (get input-binding arg))
+                          :else m)))
+                    {}
+                    (range (min head-arity (count call-args))))]
+              (assoc acc nm (conj (or (get acc nm) []) posmap))))
+          {}
+          invs)
+        nms (into [] (mapv (fn [kv] (key kv)) (to-list by-name)))]
+    (reduce
+      (fn [acc nm]
+        (let [posmaps (get by-name nm)
+              common
+              (reduce
+                (fn [ks m]
+                  (filterv (fn [k] (contains? m k)) ks))
+                (into [] (mapv (fn [kv] (key kv))
+                               (to-list (get posmaps 0))))
+                posmaps)
+              kept
+              (into []
+                    (distinct
+                      (mapv (fn [m]
+                              (reduce (fn [r k] (assoc r k (get m k)))
+                                      {}
+                                      common))
+                            posmaps)))]
+          (assoc acc nm kept)))
+      {}
+      nms)))
 
 ;; ── the two fixpoint evaluators ─────────────────────────────────────
 
@@ -226,12 +338,14 @@
    Round 0 seeds the deltas from the base (non-recursive) derivations; each
    later round applies rules with self-invocations reading the delta, then
    the new tuples become the next delta."
-  [db rules eval-plain]
-  (let [grouped (rules-by-name rules)
-        names (rule-names rules)
-        empty-state (reduce (fn [m n] (assoc m n #{})) {} (into [] names))]
+  ([db rules eval-plain]
+   (derive-semi-naive db rules eval-plain {}))
+  ([db rules eval-plain seeds]
+   (let [grouped (rules-by-name rules)
+         names (rule-names rules)
+         empty-state (reduce (fn [m n] (assoc m n #{})) {} (into [] names))]
     ; seed: one naive round from empty state derives the base facts.
-    (let [seed (apply-rules-once db grouped names empty-state {} nil eval-plain)
+    (let [seed (apply-rules-once db grouped names empty-state {} nil eval-plain seeds)
           state0 (reduce (fn [m n] (assoc m n (get seed n))) empty-state (into [] names))]
       (loop [state state0 delta seed rounds 1]
         (let [any-delta (some (fn [n] (seq (get delta n))) (into [] names))]
@@ -246,7 +360,7 @@
                             (fn [acc nm]
                               (assoc acc nm
                                      (get (apply-rules-once
-                                            db grouped names state delta nm eval-plain)
+                                            db grouped names state delta nm eval-plain seeds)
                                           nm)))
                             {}
                             (into [] names))
@@ -264,7 +378,7 @@
                 (recur (reduce (fn [m n] (assoc m n (into (get m n) (get fresh n))))
                                state (into [] names))
                        fresh
-                       (+ rounds 1))))))))))
+                       (+ rounds 1)))))))))))
 
 ;; ── public: materialise a rule set to relations ─────────────────────
 
@@ -280,18 +394,24 @@
    for that disjoint class. Dispatch is total and disjoint: one path per
    program, no input evaluated two ways. `eval-plain` is the engine callback
    for ordinary clauses (base relations on the native path; direct evaluation
-   on the bl path)."
-  [db rules eval-plain]
-  (if (datom.query.fixpoint/compatible? rules)
+   on the bl path).
+   `seeds` (FEAT-025) maps rule name → positional seed maps from the call
+   sites. The native kernel does not know seeds: any seeded program takes
+   the bl fixpoint. Correctness first — an unseeded program's dispatch is
+   unchanged."
+  ([db rules eval-plain]
+   (materialise db rules eval-plain {}))
+  ([db rules eval-plain seeds]
+   (if (and (empty? seeds) (datom.query.fixpoint/compatible? rules))
     ;; structurally native. Try the kernel; if the DATA is beyond i64 (a float
     ;; in an arithmetic column), the driver raises a tagged fallback signal —
     ;; catch exactly that and re-run on the bl fixpoint (the program is still
     ;; computable, just not by the i64 kernel). Any other error propagates.
     (try (datom.query.fixpoint/materialise db rules eval-plain)
          (catch e (if (datom.query.fixpoint/fallback-signal? e)
-                    (get (derive-semi-naive db rules eval-plain) 0)
+                    (get (derive-semi-naive db rules eval-plain seeds) 0)
                     (throw e))))
-    (get (derive-semi-naive db rules eval-plain) 0)))
+    (get (derive-semi-naive db rules eval-plain seeds) 0))))
 
 
 (defn relation-for
