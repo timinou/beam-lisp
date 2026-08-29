@@ -1,0 +1,235 @@
+; promote.bl — MVP-E: deodorant × types. Type-discharged smell promotion.
+;
+; The pipeline, end to end:
+;   1. A smell declares TYPE ASSUMPTIONS:  :needs {?x int}
+;      (the rule is sound only when ?x is a number — the same assumption
+;      z3 derives when prove-equiv answers sat: see priv/z3.bl and the
+;      solver demo, where `(= x 0) ⇒ (zero? x)` needed exactly `x:int`).
+;   2. promote/walk matches idiomatic smells against every form of the
+;      source with the LOCAL TYPE ENVIRONMENT in hand (guard narrowing,
+;      lets, params — the same narrowing typed/walk applies).
+;   3. Every needed var whose proven type fits its need is DISCHARGED;
+;      a fully discharged idiomatic match is PROMOTED to safe — the
+;      checker has proven what the tier was only assuming.
+;
+; Sound contract, unchanged: unproven means "stays idiomatic", never a
+; veto. Promotion only ever moves a match idiomatic → safe.
+
+(ns promote
+  (:require [typed] [deodorant] [codebase]))
+
+(def smells-with-needs
+  "Idiomatic smells declaring :needs. Computed lazily via the fn below —
+   the registry grows by load order."
+  nil)
+
+(defn needs-smells []
+  (filter (fn [s] (map? (:needs s)))
+          (deodorant/all-smells)))
+
+(defn form-data
+  "A form as plain DATA (meta peeled recursively) — the shape
+   deodorant's matcher expects."
+  [node]
+  (let [f (typed/node-form node)
+        t (typed/node-tag f)]
+    (cond
+      (= t :list)   (apply list (map form-data (typed/node-items f)))
+      (= t :vector) (into [] (map form-data (typed/node-items f)))
+      (= t :set)    (into #{} (map form-data (typed/node-items f)))
+      (= t :map)    (into {} (map (fn [[k v]] [(form-data k) (form-data v)])
+                                  (typed/node-items f)))
+      (= t :symbol) (symbol (typed/node-name f))
+      :else f)))
+
+(defn discharge
+  "The proven type of the form a pattern var bound, in env:
+   a symbol resolves through env (narrowed by enclosing guards);
+   anything else walks closed (literals are precise). any if neither."
+  [env subform]
+  (let [f (typed/node-form subform)]
+    (if (= :symbol (typed/node-tag f))
+      (get env (typed/node-name f) typed/any)
+      (typed/walk (merge typed/core-sigs typed/core-seeds-v2)
+                  {} subform))))
+
+(defn check-match
+  "One match of one smell: which needs are discharged, which not.
+   Returns {:smell name :needs {?v {:need T :got T :ok bool}}} — ok
+   false also when the type is any (unproven ≠ disproven)."
+  [smell binds env]
+  {:smell (:name smell)
+   :needs (into {}
+            (map (fn [[v need-expr]]
+                   (let [need (typed/type-expr need-expr)
+                         sub (get binds v nil)]
+                     [v {:need need
+                         :got (if (some? sub) (discharge env sub) typed/any)
+                         :ok (and (some? sub)
+                                  (typed/t-sub? (discharge env sub) need))}]))
+                 (:needs smell)))})
+
+(defn promoted?
+  "Fully discharged → this match may apply as if it were :safe."
+  [check]
+  (and (seq (:needs check))
+       (every? (fn [[_ v]] (:ok v)) (:needs check))))
+
+; --- the env-carrying walker ---------------------------------------------
+;
+; The smells match PEELED data (deodorant/smell-match — the registry's
+; own matcher, no parallel impl); the walker carries the same narrowing
+; env typed/walk-if computes (single-predicate guards and and-chains —
+; the full lattice of guard shapes is typed/check-defn's job). A smell
+; matched inside (if (int? x) …) sees x:int; matched outside, x:any,
+; and any discharges nothing.
+
+(defn discharge
+  "The proven type of what a pattern var bound, in env. Bound values
+   are DATA from form-data: a string is a variable (resolves through
+   env, guard-narrowed); a literal types via typed/lit-type; anything
+   compound is any (unproven ≠ disproven)."
+  [env bound]
+  (cond
+    (symbol? bound) (get env (name bound) typed/any)
+    (string? bound) (get env bound typed/any)
+    :else           (typed/lit-type bound)))
+
+(defn check-match
+  "One smell's bindings under env: which :needs are discharged.
+   Returns {:smell name :needs {?v {:need T :got T :ok bool}} :promoted
+   bool}."
+  [smell binds env]
+  (let [needs (into {}
+                (map (fn [[v need-expr]]
+                       (let [need (typed/type-expr need-expr)
+                             bound (get binds v nil)
+                             got (if (some? bound)
+                                   (discharge env bound)
+                                   typed/any)]
+                         [v {:need need :got got
+                             :ok (and (some? bound)
+                                      (typed/t-sub? got need))}]))
+                     (:needs smell)))]
+    {:smell (:name smell)
+     :needs needs
+     :promoted (and (seq needs)
+                    (every? (fn [[_ d]] (:ok d)) needs))}))
+
+(defn narrow-guard
+  "The then-env of a guard form: (pred x) or an and-chain of them.
+   Mirrors typed/walk-if's inline narrowing, kept honest: unknown preds
+   narrow nothing."
+  [env guard]
+  (let [g (typed/node-form guard)]
+    (if (= :list (typed/node-tag g))
+      (let [items (typed/node-items g)
+            h (typed/node-form (first items))]
+        (if (= :symbol (typed/node-tag h))
+          (let [hn (typed/node-name h)]
+            (if (= hn "and")
+              (reduce narrow-guard env (rest items))
+              (if (= 2 (count items))
+                (let [x-node (typed/node-form (second items))]
+                  (if (= :symbol (typed/node-tag x-node))
+                    (let [tags (get typed/guard-tags (symbol hn) nil)]
+                      (if (nil? tags)
+                        env
+                        (assoc env (typed/node-name x-node)
+                                   (typed/t-meet (get env (typed/node-name x-node)
+                                                      typed/any)
+                                                 tags))))
+                    env))
+                env)))
+          env))
+      env)))
+
+(declare walk)
+
+(defn walk-list [env nodes]
+  (reduce (fn [acc x] (concat acc (walk env x))) [] nodes))
+
+(defn walk
+  "Every idiomatic-with-needs smell matched at or under node, with its
+   discharge verdict and the node's position."
+  [env node]
+  (let [f (typed/node-form node)
+        t (typed/node-tag f)
+        p (typed/node-pos node)
+        line (if (nil? p) 0 (:line p))
+        col  (if (nil? p) 0 (:col p))]
+    (cond
+      (= t :list)
+        (let [items (typed/node-items f)
+              head  (typed/node-form (first items))
+              h     (if (= :symbol (typed/node-tag head))
+                      (typed/node-name head) "")
+              data  (form-data node)
+              hits  (reduce
+                      (fn [acc s]
+                        (let [b (deodorant/smell-match s data)]
+                          (if (some? b)
+                            (conj acc (assoc (check-match s b env)
+                                             :line line :col col))
+                            acc)))
+                      [] (needs-smells))]
+          (cond
+            (= h "if")
+              (concat hits
+                      (walk env (nth items 1))
+                      (walk (narrow-guard env (nth items 1)) (nth items 2))
+                      (if (> (count items) 3)
+                        (walk env (nth items 3))
+                        []))
+            (= h "when")
+              (concat hits
+                      (walk env (nth items 1))
+                      (walk-list (narrow-guard env (nth items 1))
+                                 (rest (rest items))))
+            (= h "let")
+              (let [bs (typed/node-items (typed/node-form (nth items 1)))
+                    e2 (reduce
+                         (fn [e i]
+                           (if (< (+ i 1) (count bs))
+                             (assoc e (typed/node-name
+                                        (typed/node-form (nth bs i)))
+                                    (typed/walk (merge typed/core-sigs
+                                                       typed/core-seeds-v2)
+                                                e (nth bs (+ i 1))))
+                             e))
+                         env (range 0 (count bs) 2))]
+                (concat hits
+                        (walk env (nth items 1))
+                        (walk-list e2 (rest (rest items)))))
+            (contains? #{"def" "defn" "defn-" "defmacro" "fn" "do"
+                         "cond" "and" "or" "doseq"} h)
+              (concat hits (walk-list env (rest items)))
+            (= h "ns")
+              hits
+            :else
+              (concat hits (walk-list env items))))
+      (contains? #{:vector :set} t)
+        (concat [] (walk-list env (typed/node-items f)))
+      :else [])))
+
+(defn report
+  "Walk src; returns {:promoted […] :idiomatic […]}, entries
+   {:smell n :line l :col c :missing [[?v need]…]}."
+  [src]
+  (let [forms (BeamLisp.Reader/read_string src)]
+    (reduce
+      (fn [acc form]
+        (reduce
+          (fn [a h]
+            (let [entry {:smell (:smell h)
+                         :line (:line h) :col (:col h)
+                         :missing (into []
+                                    (map (fn [[v d]] [v (:need d)])
+                                         (filter (fn [[_ d]] (not (:ok d)))
+                                                 (:needs h))))}]
+              (if (:promoted h)
+                (update a :promoted (fn [xs] (conj xs entry)))
+                (update a :idiomatic (fn [xs] (conj xs entry))))))
+          acc (walk {} form)))
+      {:promoted [] :idiomatic []}
+      forms)))
