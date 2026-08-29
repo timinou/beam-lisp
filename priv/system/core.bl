@@ -337,52 +337,161 @@
   [s from to]
   (join to (split s from)))
 
+; ── Rung 1 (P18): N state variables, jointly ────────────────────────────────
+;
+; The state is a TUPLE of ints, not one int. `ordered-svars` reads the tuple's
+; order from the init binding; each transition's :next is a vector mapped
+; positionally; the invariant becomes a z3 `define-fun` so priming the whole
+; tuple needs NO textual substitution — z3 binds the params. N=1 is the special
+; case (one param), so this generalizes the P17 seam, no parallel path.
+
+(defn- vec-elems
+  "A next-state SOURCE string → its element source strings when it is a vector
+   ([balance (+ reserved amt)] → [\"balance\" \"(+ reserved amt)\"]), else [src]."
+  [src]
+  (let [node (first (BeamLisp.Reader/read_string src))
+        f (typed/node-form node)]
+    (if (= :vector (typed/node-tag f))
+      (into [] (map (fn [it] (errors/delaborate it)) (typed/node-items f)))
+      [src])))
+
+(defn- ordered-svars
+  "The ORDERED state-var names: the init binding's next-state vector, in order
+   (the tuple's shape). Falls back to the invariant's mentioned vars when init
+   is scalar or absent (a set, fine for the single-var case)."
+  [inv-node clauses]
+  (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))]
+    (if (and init-c (:next init-c))
+      (let [node (first (BeamLisp.Reader/read_string (:next init-c)))
+            f (typed/node-form node)]
+        (if (= :vector (typed/node-tag f))
+          (into [] (keep (fn [it]
+                           (let [ff (typed/node-form it)]
+                             (if (= :symbol (typed/node-tag ff))
+                               (typed/node-name ff) nil)))
+                         (typed/node-items f)))
+          (into [] (state-vars inv-node clauses))))
+      (into [] (state-vars inv-node clauses)))))
+
+(defn- next-map
+  "{svar → next-SMT} for a transition: its :next vector mapped positionally to
+   the ordered svars. nil when arity mismatches or any element is
+   untranslatable (the transition is then dropped — sound: unproven, not
+   falsely proven)."
+  [svars nextsrc]
+  (let [elems (vec-elems nextsrc)]
+    (if (not (= (count elems) (count svars)))
+      nil
+      (loop [i 0 m {}]
+        (if (>= i (count svars))
+          m
+          (let [smt (smt/of-source (set svars) (nth elems i))]
+            (if (or (nil? smt) (= smt :untranslatable))
+              nil
+              (recur (+ i 1) (assoc m (nth svars i) smt)))))))))
+
+(defn- keep-translatable-multi
+  "Message transitions whose guard AND every next element translate, each as
+   {:label :guard smt|nil :nexts {svar→smt}}."
+  [svars clauses]
+  (keep (fn [c]
+          (let [g (:guard c)
+                gsmt (if (nil? g) nil (smt/of-source (set svars) g))
+                nmap (next-map svars (:next c))]
+            (if (or (= gsmt :untranslatable) (nil? nmap))
+              nil
+              {:label (:label c) :guard gsmt :nexts nmap})))
+        clauses))
+
+(defn- inv-define-fun
+  "(define-fun Inv ((v Int)…) Bool <inv-smt>) — the invariant as a z3 function
+   of the whole tuple. Applying it to primed args needs no substitution."
+  [svars inv-smt]
+  (str "(define-fun Inv ("
+       (join " " (map (fn [v] (str "(" v " Int)")) svars))
+       ") Bool " inv-smt ")\n"))
+
+(defn- preserves-joint?
+  "Does the transition preserve the tuple invariant? Assert Inv(s) ∧ guard ∧
+   (⋀ vᵢ2=nextᵢ) ∧ ¬Inv(s2); unsat ⟹ preserved. Returns {:preserved bool}."
+  [port svars inv-smt decls guard nexts]
+  (let [prime-decls (join "" (map (fn [v] (str "(declare-const " v "2 Int)\n")) svars))
+        prime-eqs   (join "" (map (fn [v] (str "(assert (= " v "2 " (get nexts v v) "))\n")) svars))
+        cur-args (join " " svars)
+        pri-args (join " " (map (fn [v] (str v "2")) svars))
+        smt (str (inv-define-fun svars inv-smt)
+                 decls prime-decls
+                 "(assert (Inv " cur-args "))\n"
+                 (if guard (str "(assert " guard ")\n") "")
+                 prime-eqs
+                 "(assert (not (Inv " pri-args ")))\n")]
+    {:preserved (= "unsat" (z3/check port smt))}))
+
+(defn- establishes-joint?
+  "Does the init tuple establish the invariant? Assert ¬Inv(init-exprs); unsat
+   ⟹ established."
+  [port svars inv-smt decls init-exprs]
+  (let [smt (str (inv-define-fun svars inv-smt)
+                 decls
+                 "(assert (not (Inv " (join " " init-exprs) ")))\n")]
+    (= "unsat" (z3/check port smt))))
+
 (defn verify-process
   "Verify a process SOURCE FORM end to end. Returns:
      {:name :holds :warnings [{:msg :line :col}] :checked bool}
    :checked=false when there is no ^{:invariant} or it is untranslatable (the
-   checker stays silent on what it cannot model — sound-warnings-only)."
+   checker stays silent on what it cannot model — sound-warnings-only).
+   Handles N state variables jointly (P18 Rung 1): a relational invariant over
+   a tuple (balance ≥ reserved) is proven for the whole primed tuple at once."
   [port node]
   (let [sm (model/system-model node)
         clauses (:transitions sm)
         inv-node (invariant-node node)]
     (if (nil? inv-node)
       {:name (:name sm) :holds nil :checked false :warnings []}
-      (let [svars (state-vars inv-node clauses)
-            svar (if (empty? svars) nil (first (into [] svars)))
-            inv-smt (if svar (smt/translate #{svar} inv-node) :untranslatable)]
-        (if (or (nil? svar) (= inv-smt :untranslatable))
+      (let [svars (ordered-svars inv-node clauses)
+            inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) inv-node))]
+        (if (or (empty? svars) (= inv-smt :untranslatable))
           {:name (:name sm) :holds nil :checked false :warnings []
            :reason "invariant not translatable to integer arithmetic"}
-          (let [decls (str "(declare-const " svar " Int)\n"
-                           ; declare every other free symbol in guards as an input
-                           (input-decls svar clauses))
-                inv (inv-fn inv-node svar)
-                ; separate the init (establishment) from message transitions
-                init-c (first (filter (fn [c] (= :init (:label c))) clauses))
+          (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))
                 msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
-                ; translate each MESSAGE transition's guard + next; skip untranslatable
-                ts (keep-translatable svar msg-cs)
+                ts (keep-translatable-multi svars msg-cs)
                 pos (typed/node-pos node)
-                ; init establishes: the invariant must hold on init's next-state.
-                ; A bare-symbol init (e.g. (ok balance)) passes the OPENING value
-                ; through — the caller's contract, trusted. Only a COMPUTED init
-                ; next-state (e.g. (ok (- balance fee))) is checked.
-                init-smt (if init-c (smt/of-source #{svar} (:next init-c)) svar)
+                svarset (set svars)
+                ; inputs: free syms across the TRANSLATED guards + nexts (clean
+                ; SMT, no leftover brackets), minus the state vars.
+                input-names (reduce
+                              (fn [acc t]
+                                (reduce (fn [a s] (if (nil? s) a (into a (free-syms s))))
+                                        acc (cons (:guard t) (into [] (vals (:nexts t))))))
+                              #{} ts)
+                inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
+                decls (str (join "" (map (fn [v] (str "(declare-const " v " Int)\n")) svars))
+                           (join "" (map (fn [nm] (str "(declare-const " nm " Int)\n")) inputs)))
+                ; establishment: a pure pass-through init (the opening tuple) is
+                ; the caller's contract, trusted. A computed init is checked.
+                init-elems (if init-c (vec-elems (:next init-c)) nil)
+                passthrough? (and (some? init-elems)
+                                  (= (count init-elems) (count svars))
+                                  (every? (fn [e] (contains? svarset e)) init-elems))
                 init-est (cond
-                           (nil? init-smt) {:established true}
-                           (= init-smt :untranslatable) {:established true}
-                           (= init-smt svar) {:established true}   ; passes arg through
-                           :else (establishes? port inv decls init-smt))
-                ; each message transition must PRESERVE the invariant (preserves?,
-                ; NOT prove-box — prove-box re-runs establishment on its own).
+                           (nil? init-c) true
+                           passthrough? true
+                           (nil? init-elems) true
+                           (not (= (count init-elems) (count svars))) true
+                           :else
+                             (let [ies (map (fn [e] (smt/of-source svarset e)) init-elems)]
+                               (if (some (fn [s] (or (nil? s) (= s :untranslatable))) ies)
+                                 true
+                                 (establishes-joint? port svars inv-smt decls (into [] ies)))))
                 step-rs (map (fn [t]
-                               (assoc (preserves? port inv svar decls (:guard t) (:next t))
+                               (assoc (preserves-joint? port svars inv-smt decls (:guard t) (:nexts t))
                                       :label (:label t)))
                              ts)
                 failures (filter (fn [x] (not (:preserved x))) step-rs)]
             {:name (:name sm)
-             :holds (and (:established init-est) (empty? failures))
+             :holds (and init-est (empty? failures))
              :checked true
              :warnings (box-warnings {:failures failures} pos)}))))))
 
