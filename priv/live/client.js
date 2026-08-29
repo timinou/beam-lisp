@@ -1,0 +1,218 @@
+// live/client.js — the browser half: apply patch ops to the DOM.
+//
+// This is a direct port of the reference semantics in priv/live/diff.bl
+// (`apply-ops`). The server computes the ops by diffing hiccup TREES; the
+// client applies the SAME ops to the real DOM. Because the op set is small
+// and keyed, this is ~120 lines with no virtual DOM and no heuristics.
+//
+// Wire protocol (JSON over a WebSocket):
+//   server → client:  ["mount", html]            first paint (full HTML)
+//                     ["patch", ops]              a list of patch ops
+//                     ["denied", why]             an intent was refused
+//   client → server:  ["event", term, data]      a fired event + its data
+//
+// Op set (mirrors diff.bl):
+//   ["set-attr",    path, k, v]
+//   ["remove-attr", path, k]
+//   ["text",        path, s]
+//   ["replace",     path, subtree]       subtree is hiccup-as-array
+//   ["insert",      path, key, idx, subtree]
+//   ["remove",      path, key]
+//   ["move",        path, key, idx]
+//
+// `path` is a vector of child indices from the mount root. A keyed op names
+// its child by the element's `key` attribute (the server strips `:key` from
+// HTML but re-emits it as `data-key` on rendered elements — see render()).
+
+(function () {
+  "use strict";
+
+  // ── resolve a path (array of child indices) to a DOM element ──────────
+  //
+  // The diff paths are relative to the VIEW's root element (the single
+  // element the view returns, e.g. the `<ul>`), which the mount renders as
+  // the first element child of the mount container. So a path of [] is that
+  // element, [0] its first child, etc. `rootEl` normalises the container to
+  // its mounted view element.
+  function rootEl(container) {
+    // if the container IS the view root already (has a tag other than the
+    // mount wrapper), use it; otherwise descend to its first element child.
+    const kids = elementChildren(container);
+    return kids.length === 1 && container.id === "live-root" ? kids[0] : container;
+  }
+
+  function at(container, path) {
+    let el = rootEl(container);
+    for (const i of path) el = elementChildren(el)[i];
+    return el;
+  }
+
+  // element children only (skip text nodes, so indices match the tree)
+  function elementChildren(el) {
+    return Array.prototype.filter.call(el.childNodes, function (n) {
+      return n.nodeType === 1;
+    });
+  }
+
+  function childByKey(parent, key) {
+    return elementChildren(parent).find(function (c) {
+      return c.getAttribute("data-key") === String(key);
+    });
+  }
+
+  // ── render a hiccup-as-array subtree to a DOM node ────────────────────
+  // ["tag", {attrs}, ...children]  |  "text"  |  number
+  function render(node) {
+    if (node === null || node === undefined) return document.createTextNode("");
+    if (typeof node === "string" || typeof node === "number") {
+      return document.createTextNode(String(node));
+    }
+    // element: [tag, attrs?, ...children]
+    const tag = node[0];
+    let attrs = {};
+    let rest = node.slice(1);
+    if (rest.length && isPlainObject(rest[0])) {
+      attrs = rest[0];
+      rest = rest.slice(1);
+    }
+    const el = document.createElement(String(tag).replace(/[#.].*$/, "") || "div");
+    // shorthand id/classes on the tag (e.g. "li.task")
+    applyShorthand(el, String(tag));
+    for (const k in attrs) {
+      setAttr(el, k, attrs[k]);
+    }
+    for (const child of rest) {
+      // a nested array of children (a spliced seq) flattens
+      if (Array.isArray(child) && typeof child[0] !== "string") {
+        for (const c of child) el.appendChild(render(c));
+      } else {
+        el.appendChild(render(child));
+      }
+    }
+    return el;
+  }
+
+  function applyShorthand(el, tag) {
+    const hashI = tag.indexOf("#");
+    const dotI = tag.indexOf(".");
+    let cut = tag.length;
+    if (hashI >= 0 && dotI >= 0) cut = Math.min(hashI, dotI);
+    else if (hashI >= 0) cut = hashI;
+    else if (dotI >= 0) cut = dotI;
+    const rest = tag.slice(cut).replace(/#/g, ".#").split(".").filter(Boolean);
+    for (const seg of rest) {
+      if (seg[0] === "#") el.id = seg.slice(1);
+      else el.classList.add(seg);
+    }
+  }
+
+  function isPlainObject(x) {
+    return x && typeof x === "object" && !Array.isArray(x);
+  }
+
+  function setAttr(el, k, v) {
+    if (k === "key") {
+      el.setAttribute("data-key", String(v));
+      return;
+    }
+    if (k.indexOf("on-") === 0) {
+      el.setAttribute("data-ev-" + k.slice(3), "");
+      return;
+    }
+    if (v === true) el.setAttribute(k, "");
+    else if (v === false || v === null || v === undefined) el.removeAttribute(k);
+    else el.setAttribute(k, String(v));
+  }
+
+  // ── apply one op ──────────────────────────────────────────────────────
+  function applyOp(root, op) {
+    const kind = op[0];
+    const path = op[1];
+    if (kind === "set-attr") {
+      at(root, path).setAttribute(op[2], String(op[3]));
+    } else if (kind === "remove-attr") {
+      at(root, path).removeAttribute(op[2]);
+    } else if (kind === "text") {
+      // a text op's path ends at a child slot that is a TEXT node. Walk the
+      // parent's ALL child nodes (text + element) to the slot and set its
+      // data, so a text change beside sibling elements does not clobber them.
+      const parent = at(root, path.slice(0, -1));
+      const slot = path[path.length - 1];
+      const node = parent.childNodes[slot];
+      if (node && node.nodeType === 3) {
+        node.data = String(op[2]);
+      } else if (node) {
+        parent.replaceChild(document.createTextNode(String(op[2])), node);
+      } else {
+        parent.appendChild(document.createTextNode(String(op[2])));
+      }
+    } else if (kind === "replace") {
+      const parent = at(root, path.slice(0, -1));
+      const idx = path[path.length - 1];
+      const el = elementChildren(parent)[idx];
+      parent.replaceChild(render(op[2]), el);
+    } else if (kind === "remove") {
+      const parent = at(root, path);
+      const el = childByKey(parent, op[2]);
+      if (el) parent.removeChild(el);
+    } else if (kind === "insert") {
+      const parent = at(root, path);
+      const idx = op[3];
+      const node = render(op[4]);
+      const ref = elementChildren(parent)[idx] || null;
+      parent.insertBefore(node, ref);
+    } else if (kind === "move") {
+      const parent = at(root, path);
+      const el = childByKey(parent, op[2]);
+      const idx = op[3];
+      if (el) {
+        // absolute-index placement, matching diff.bl's apply-ops: remove the
+        // node, then insert it before the element now at `idx` among the
+        // REMAINING children (null → append). This is the anchor-fill
+        // reconciliation the differ assumes.
+        parent.removeChild(el);
+        const remaining = elementChildren(parent);
+        const ref = remaining[idx] || null;
+        parent.insertBefore(el, ref);
+      }
+    }
+  }
+
+  // ── the socket ────────────────────────────────────────────────────────
+  function connect(opts) {
+    const root = opts.root || document.getElementById("live-root");
+    const ws = new WebSocket(opts.url);
+
+    ws.onmessage = function (msg) {
+      const [kind, a, b] = JSON.parse(msg.data);
+      if (kind === "mount") {
+        root.innerHTML = a;
+      } else if (kind === "patch") {
+        for (const op of a) applyOp(root, op);
+      } else if (kind === "denied") {
+        if (opts.onDenied) opts.onDenied(a);
+      }
+    };
+
+    // event delegation: a click/input on a [data-ev-*] node fires its event
+    root.addEventListener("click", function (e) {
+      fireFrom(e.target, "click", ws);
+    });
+    root.addEventListener("input", function (e) {
+      fireFrom(e.target, "input", ws, { value: e.target.value });
+    });
+
+    return ws;
+  }
+
+  function fireFrom(target, evName, ws, data) {
+    const el = target.closest("[data-ev-" + evName + "]");
+    if (!el) return;
+    // the event TERM is carried by the server; the client only names the
+    // event and the source element's key, plus any DOM data (input value).
+    const key = el.getAttribute("data-key");
+    ws.send(JSON.stringify(["event", { event: evName, key: key }, data || {}]));
+  }
+
+  window.Live = { connect: connect, applyOp: applyOp, render: render };
+})();

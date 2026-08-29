@@ -42,7 +42,47 @@ defmodule BeamLisp.Loader do
       Env.pop_load_path()
     end
   end
+  @doc """
+  The provenance hash of `ns`'s source `.bl` on the current search path, or
+  `nil` when no source is findable (a prod release ships beams, not sources).
 
+  Byte-identical to the AOT stamp (`__bl_provenance__/0`) and the Mix manifest:
+  `sha256(content) |> Base.encode16()`. Used by the drift-aware AOT load gate to
+  decide whether a compiled beam still matches the source it was built from.
+  Runs inside `Loader.Server` (where `find_file/1`'s search dirs resolve), the
+  same context `AOT.ensure_loaded/1` is called from.
+  """
+  def source_hash(ns) when is_binary(ns) do
+    case find_file(ns) do
+      {:ok, _path, content} -> :crypto.hash(:sha256, content) |> Base.encode16()
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Run `fun` with `dir` pinned as the sole ambient search directory, so
+  `find_file/1` / `source_hash/1` / `AOT.ensure_loaded/1` resolve `.bl` sources
+  from there. Restores the prior binding after. Used by the drift gate's tests
+  and any caller that must resolve a namespace against a known directory rather
+  than the process's ambient roots.
+  """
+  def with_search_dir(dir, fun) do
+    prev = Process.get(:bl_search_dirs)
+    Process.put(:bl_search_dirs, [dir])
+
+    try do
+      fun.()
+    after
+      if is_nil(prev),
+        do: Process.delete(:bl_search_dirs),
+        else: Process.put(:bl_search_dirs, prev)
+    end
+  end
+
+  @doc "`source_hash/1` for `ns` resolved against `dir` alone."
+  def source_hash_in(dir, ns) do
+    with_search_dir(dir, fn -> source_hash(ns) end)
+  end
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
     # AOT FIRST, and this is the one place it can go.

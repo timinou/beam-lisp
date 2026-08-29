@@ -155,10 +155,22 @@ defmodule BeamLisp.AOT do
       # Fast path BEFORE the lock: require cycles (A's __bl_init__ requires
       # A) are cut by the mark-first protocol below, and that cut must not
       # depend on re-acquiring the same trans lock from the same process.
-      if Env.loaded_ns?(ns) do
-        :loaded
-      else
-        # MARK IT BEFORE RUNNING IT, exactly as the source loader does.
+      cond do
+        # Already interned in THIS VM. It was drift-vetted when first loaded
+        # (the `stale?` branch below), so trust it — no per-call re-hash.
+        Env.loaded_ns?(ns) ->
+          :loaded
+
+        # DRIFT GATE (Wave 1 / L2): the on-disk beam no longer matches its
+        # source (or a different toolchain built it). Return `:no_module` so
+        # `Loader` falls to the SOURCE path, which reinterns via `Link.defvar`
+        # — an in-place hot swap that shadows the stale beam and closes the
+        # `undefined var` window it caused. Strict mode raises inside `stale?/2`.
+        stale?(ns, mod) ->
+          :no_module
+
+        true ->
+          # MARK IT BEFORE RUNNING IT, exactly as the source loader does.
         #
         # Two reasons, and the order matters for the second. First, the mark is
         # what lets `Loader.ensure_loaded/1` skip the source: without it the
@@ -500,10 +512,31 @@ defmodule BeamLisp.AOT do
     shim_asts = Emit.shim_defs(ns_defs)
     {init_ast, companion_quoted} = build_init_ast(ns, mod, ns_defs, value_defs, ns_meta)
 
+    # PROVENANCE (Wave 1 / L1): stamp the source content-hash and the toolchain
+    # key INTO the shim module as attributes, plus a `__bl_provenance__/0`
+    # reader. This makes a compiled `.beam` self-certify against its `.bl`
+    # source — read back with `module_info(:attributes)` or the reader with NO
+    # load, NO `__bl_init__`, NO eval. A drift-aware loader compares these to
+    # the live source; a stale beam (compiled before a def existed) is then
+    # detectable instead of silently serving the old code. `source_hash` uses
+    # the SAME sha256/Base.encode16 the Mix manifest uses, so a beam's stamp
+    # equals the manifest hash for the same bytes. `nil` when the source is not
+    # a readable file (in-memory compile) — the loader treats an unstampable
+    # beam as "trust" (prod-release path), never as stale.
+    source_hash = provenance_source_hash(file)
+    compiler_key = BeamLisp.AOTCache.compiler_key()
+
     ns_module_quoted =
       quote do
         defmodule unquote(mod) do
           @moduledoc false
+          # `__bl_provenance__/0` is the provenance read path: `:code.ensure_loaded/1`
+          # makes it callable WITHOUT running `__bl_init__/0` (loading module code
+          # ≠ running the init hook), so a drift check reads {source_hash,
+          # compiler_key} for the cost of a function call and no eval. Returns
+          # `{nil, key}` for an in-memory compile (unstampable — loader trusts it).
+          @doc false
+          def __bl_provenance__, do: {unquote(source_hash), unquote(compiler_key)}
           unquote_splicing(shim_asts)
           unquote(init_ast)
         end
@@ -532,7 +565,19 @@ defmodule BeamLisp.AOT do
     File.write!(path, beam)
     {mod, path}
   end
+  # The provenance hash for a source file: sha256 of its bytes, hex-encoded,
+  # byte-identical to the Mix manifest's `content_hash/1` (so a stamp compares
+  # equal to the manifest entry for the same source). `nil` for an in-memory
+  # compile (no file) or an unreadable path — an unstampable beam is trusted by
+  # the loader (prod-release path), never judged stale.
+  defp provenance_source_hash(nil), do: nil
 
+  defp provenance_source_hash(file) do
+    case File.read(file) do
+      {:ok, bytes} -> :crypto.hash(:sha256, bytes) |> Base.encode16()
+      {:error, _} -> nil
+    end
+  end
   # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
   # `%{aliases:, refers:, requires:}`.
   defp build_init_ast(ns, mod, ns_defs, value_defs, ns_meta) do
@@ -822,6 +867,71 @@ defmodule BeamLisp.AOT do
   end
 
   defp code_path_module?(mod), do: :code.which(mod) != :non_existing
+
+  # DRIFT GATE (Wave 1 / L2). A compiled beam is trusted only when it still
+  # matches the source it was built from. Reads the beam's `__bl_provenance__/0`
+  # stamp (source hash + toolchain key) and compares to the LIVE source.
+  #
+  #   source absent (prod release: no `.bl` ships)  -> NOT stale (trust the beam;
+  #                                                    nothing to compare against)
+  #   beam unstampable (older emitter, in-memory)    -> NOT stale (trust; a beam
+  #                                                    with no stamp predates this
+  #                                                    gate and has no claim to check)
+  #   hash + compiler_key match                       -> NOT stale (fresh)
+  #   mismatch, dev/source present                    -> STALE
+  #
+  # A `true` return routes the caller to `:no_module`, i.e. the SOURCE path,
+  # which reloads via `Link.defvar` — an in-place hot swap that shadows the
+  # stale beam immediately, closing the exact `undefined var` window the stale
+  # beam caused. Set `BEAM_LISP_AOT_STRICT=1` to REFUSE LOUD instead of healing
+  # (for a packaged build that must never silently fall back to source).
+  #
+  # Content hash ONLY, never mtime: mtime is scrambled by git checkout, worktrees,
+  # tar, and hardlinks; the content hash survives all of them and equals the Mix
+  # manifest's own hash for the same bytes.
+  defp stale?(ns, mod) do
+    case beam_provenance(mod) do
+      nil ->
+        false
+
+      {beam_hash, beam_key} ->
+        src_hash = BeamLisp.Loader.source_hash(ns)
+
+        cond do
+          is_nil(src_hash) -> false
+          beam_hash == src_hash and beam_key == BeamLisp.AOTCache.compiler_key() -> false
+          strict_aot?() -> raise stale_beam_error(ns, mod, beam_hash, src_hash)
+          true -> true
+        end
+    end
+  end
+
+  # `{source_hash, compiler_key}` from a compiled shim, or `nil` when the module
+  # carries no stamp (predates L1) or its code cannot be loaded. `ensure_loaded/1`
+  # already made the module code-loadable, so this is a plain call — NO
+  # `__bl_init__/0`, no eval.
+  defp beam_provenance(mod) do
+    if function_exported?(mod, :__bl_provenance__, 0) do
+      case mod.__bl_provenance__() do
+        {nil, _} -> nil
+        {_, _} = prov -> prov
+        _ -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  defp strict_aot?, do: System.get_env("BEAM_LISP_AOT_STRICT") in ["1", "true"]
+
+  defp stale_beam_error(ns, mod, beam_hash, src_hash) do
+    "stale AOT beam for #{ns} (#{inspect(mod)}): compiled from source " <>
+      "#{short(beam_hash)}, current source hashes #{short(src_hash)}. " <>
+      "Run `mix compile.beam_lisp --force` (or `mix clean`) to rebuild."
+  end
+
+  defp short(nil), do: "<none>"
+  defp short(h), do: String.slice(h, 0, 12)
 
   defp default_output_dir do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix.Project, :compile_path, 0) do
