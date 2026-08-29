@@ -68,28 +68,119 @@ defmodule BeamLisp.Loader do
     # slowly, and correctly. On `:loaded` it marks the namespace, so the
     # `loaded_ns?` guard immediately below short-circuits and the source is
     # never read.
-    BeamLisp.AOT.ensure_loaded(ns)
+    loading = Process.get(:bl_loading, MapSet.new())
 
-    if ns == "core" or Env.loaded_ns?(ns) do
+    cond do
+      ns == "core" or Env.loaded_ns?(ns) ->
+        :ok
+
+      # A require CYCLE coming back around (A requires B requires A):
+      # A is in-progress ON THIS PROCESS CHAIN. Cut it — the cyclic
+      # reference resolves at call time, after both loads finish. This
+      # replaces mark-first, whose window a CONCURRENT require could see:
+      # marked-loaded but vars not yet interned (relay.sse/to-sse-stream
+      # undefined under BL_ASYNC=1).
+      MapSet.member?(loading, ns) ->
+        :ok
+
+      true ->
+        # All library loads run in the pinned Loader.Server process:
+        # load-time process-owned state (ETS tables!) must outlive the
+        # requiring process, and a single loader process makes the per-path
+        # trans locks below self-serialized — never contended across
+        # processes, so no lock-order inversion. Nested requires detect the
+        # server via its pdict flag and run inline.
+        BeamLisp.Loader.Server.run(fn -> ensure_loaded_locked(ns) end)
+    end
+  end
+
+  defp ensure_loaded_locked(ns) do
+    if ns == "core" or Env.loaded_ns?(ns) or
+         MapSet.member?(Process.get(:bl_loading, MapSet.new()), ns) do
       :ok
     else
+      Process.put(:bl_loading, MapSet.put(Process.get(:bl_loading, MapSet.new()), ns))
+
+      try do
+        case BeamLisp.AOT.ensure_loaded(ns) do
+          :loaded ->
+            :ok
+
+          :no_module ->
+            ensure_loaded_source(ns)
+        end
+      after
+        Process.put(:bl_loading, MapSet.delete(Process.get(:bl_loading), ns))
+      end
+    end
+  end
+
+  defp ensure_loaded_source(ns) do
+    if Env.loaded_ns?(ns) do
+      :ok
+    else
+      # One loader per FILE VM-wide: two forked envs requiring the same
+      # namespace CONCURRENTLY would otherwise both compile it —
+      # Module.create("currently being defined") races plus double eval.
+      # Keyed on the resolved PATH, not the ns: a multi-namespace file
+      # (usage.bl defining relay.error forms inline) raced a concurrent
+      # require of error.bl under ns-keyed locks — different locks, same
+      # module, boom. find_file runs BEFORE the lock (its cost is a
+      # read); the loser re-checks `loaded_ns?` inside and short-circuits.
+      # Lock ids are {resource, requester} 2-tuples (:global.trans).
       case find_file(ns) do
         {:ok, path, content} ->
+          :global.trans({{:bl_load, path}, self()}, fn ->
+            if Env.loaded_ns?(ns), do: :ok, else: do_load(ns, path, content)
+          end)
+
+        other ->
+          do_load_miss(ns, other)
+      end
+    end
+  end
+
+  # do_load is the REQUIRE path — a namespace another namespace depends
+  # on, i.e. LIBRARY code. Libraries load at `:global`: one shared copy
+  # every env reads through its chain, like core and the prelude. Loading
+  # a library into the requiring env instead gave each async test fork
+  # its own private datom/auth/relay.* namespaces: compiled fn modules
+  # are VM-global but the var registry entries were per-env, so a process
+  # bound to fork F1 missed vars interned under F2 (PLAN-047 W1:
+  # "undefined var: env/convey" in the datom conn registry Agent;
+  # "undefined var: relay.ratelimit/WINDOW-SECONDS" in relay's singletons
+  # under BL_ASYNC=1).
+  #
+  # Clojure's model, exactly: libraries are global, YOUR namespaces are
+  # yours. Isolation is untouched where it matters — the test file itself
+  # is EVALUATED (not required) into its fork, so its defs, its tests,
+  # and its shadows (a fork-local `(ns relay.ratelimit) (defn …)` beats
+  # the global var on that fork's chain) stay private.
+  defp do_load(ns, path, content) do
+    prev_ns = Env.current_ns()
+
+    try do
+      with_load_path(Path.dirname(path), fn ->
+        Env.with_env(:global, fn ->
+          Compiler.eval_string(content, Compiler.new_env(ns), path)
+          # Mark AFTER the eval: marking first opened a window where a
+          # concurrent require saw "loaded" with no vars interned. Cycle
+          # safety is the :bl_loading set in ensure_loaded_locked/1, not
+          # the mark. A crashed load is retried by the next require.
           Env.mark_loaded(ns)
-          prev_ns = Env.current_ns()
+        end)
+      end)
+    after
+      # A required file's (ns …) is scoped to that file; the
+      # requiring namespace must survive the load.
+      Env.in_ns(prev_ns)
+    end
 
-          try do
-            with_load_path(Path.dirname(path), fn ->
-              Compiler.eval_string(content, Compiler.new_env(ns), path)
-            end)
-          after
-            # A required file's (ns …) is scoped to that file; the
-            # requiring namespace must survive the load.
-            Env.in_ns(prev_ns)
-          end
+    :ok
+  end
 
-          :ok
-
+  defp do_load_miss(ns, miss) do
+    case miss do
         {:wrong_ns, path, nil} ->
           raise "namespace #{ns}: #{path} exists but declares no (ns …) form " <>
                   "(a file's namespace comes from its (ns …), not its name) " <>
@@ -113,7 +204,6 @@ defmodule BeamLisp.Loader do
             raise "namespace not found: #{ns} (searched: #{inspect(search_dirs())})"
           end
       end
-    end
   end
 
   # Search the load paths for a regular `<ns>.bl` whose declared ns

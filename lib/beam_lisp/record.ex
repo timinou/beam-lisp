@@ -88,12 +88,19 @@ defmodule BeamLisp.Record do
   records the field list.
   """
   def define(ns, name, fields) do
+    # The whole define is a VM-wide critical section: two envs loading
+    # the same namespace concurrently would otherwise race Module.create
+    # ("currently being defined" CompileError) — the record registry is
+    # deliberately global (PLAN-046), so its creation must serialize.
     mod = module_name(ns, name)
-    field_atoms = Enum.map(fields, &String.to_atom/1)
-    struct_fields = Enum.map(field_atoms, &{&1, nil})
-    create_module(mod, quote do: defstruct(unquote(struct_fields)))
-    register(mod, :record, ns, name, field_atoms)
-    mod
+    # {resource, requester}: :global lock ids must be that 2-tuple shape.
+    :global.trans({mod, self()}, fn ->
+      field_atoms = Enum.map(fields, &String.to_atom/1)
+      struct_fields = Enum.map(field_atoms, &{&1, nil})
+      create_module(mod, quote do: defstruct(unquote(struct_fields)))
+      register(mod, :record, ns, name, field_atoms)
+      mod
+    end)
   end
 
   @doc """
@@ -102,10 +109,14 @@ defmodule BeamLisp.Record do
   as a type identity for protocol dispatch.
   """
   def define_type(ns, name, fields) do
+    # Serialized for the same reason as define/3.
     mod = module_name(ns, name)
-    create_module(mod, quote do: :ok)
-    register(mod, :deftype, ns, name, Enum.map(fields, &String.to_atom/1))
-    mod
+
+    :global.trans({mod, self()}, fn ->
+      create_module(mod, quote do: :ok)
+      register(mod, :deftype, ns, name, Enum.map(fields, &String.to_atom/1))
+      mod
+    end)
   end
 
   # --- construction ----------------------------------------------------

@@ -46,7 +46,18 @@ defmodule BeamLisp.RT do
   end
 
   @doc false
-  def invoke({:"$remote", module, fun}, args), do: apply(module, fun, args)
+  def invoke({:"$remote", module, fun}, args) do
+    # Dynamic invocation of a host-module handle: the runtime half of the
+    # capability gate (static remote calls are rejected at compile time).
+    if BeamLisp.Env.caps_allowed?(module, BeamLisp.Env.op_of(module, fun)) do
+      apply(module, fun, args)
+    else
+      raise BeamLisp.CompileError,
+        message:
+          "module #{inspect(module)} is not granted in this environment " <>
+            "(dynamic invocation of #{inspect(module)}.#{fun}/#{length(args)} denied)"
+    end
+  end
 
   @doc false
   def invoke(f, args) when is_function(f), do: apply(f, args)
@@ -83,6 +94,15 @@ defmodule BeamLisp.RT do
   mistake while the reference is still in view.
   """
   def remote_fun(module, fun) do
+    # Creating a host-module handle is itself interop: gate it, so a
+    # capped env cannot even FORGE a handle it would later sneak past a
+    # caller that forgot to check (the $remote invoke clause checks too —
+    # belt and suspenders, since handles travel between processes).
+    unless BeamLisp.Env.caps_allowed?(module, BeamLisp.Env.op_of(module, fun)) do
+      raise BeamLisp.CompileError,
+        message: "module #{inspect(module)} is not granted in this environment"
+    end
+
     if Code.ensure_loaded?(module) do
       {:"$remote", module, fun}
     else
@@ -2051,14 +2071,14 @@ defmodule BeamLisp.RT do
   # consults it for `@`, core.bl registers the mapping, users may
   # rebind it. `(reader-macro! "@" (quote deref))`.
   def reader_macro(char) do
-    case :ets.lookup(:beam_lisp_vars, {:reader_macro, char}) do
-      [{{:reader_macro, ^char}, name}] -> {:ok, name}
-      [] -> :error
+    case BeamLisp.Env.lookup({:reader_macro, char}) do
+      {:ok, name} -> {:ok, name}
+      :error -> :error
     end
   end
 
   def reader_macro!(char, {:symbol, name}) when is_binary(char) do
-    :ets.insert(:beam_lisp_vars, {{:reader_macro, char}, name})
+    BeamLisp.Env.put_key({:reader_macro, char}, name)
     name
   end
 
@@ -2070,9 +2090,9 @@ defmodule BeamLisp.RT do
   as Clojure's `*data-readers*` expands `#inst "…"`.
   """
   def data_reader(tag) when is_binary(tag) do
-    case :ets.lookup(:beam_lisp_vars, {:data_reader, tag}) do
-      [{{:data_reader, ^tag}, name}] -> {:ok, name}
-      [] -> data_reader_default(tag)
+    case BeamLisp.Env.lookup({:data_reader, tag}) do
+      {:ok, name} -> {:ok, name}
+      :error -> data_reader_default(tag)
     end
   end
 
@@ -2092,7 +2112,7 @@ defmodule BeamLisp.RT do
   into the reader.
   """
   def data_reader!(tag, {:symbol, name}) when is_binary(tag) do
-    :ets.insert(:beam_lisp_vars, {{:data_reader, tag}, name})
+    BeamLisp.Env.put_key({:data_reader, tag}, name)
     name
   end
 

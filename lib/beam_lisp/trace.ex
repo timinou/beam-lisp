@@ -87,7 +87,7 @@ defmodule BeamLisp.Trace do
     for {m, f, a} <- installed, do: :dbg.tpl(m, f, a, @match_spec)
     :dbg.p(me, [:c])
 
-    :ets.insert(:beam_lisp_vars, {@state_key, %{active: true, name: name, installed: installed}})
+    BeamLisp.Env.put_key(@state_key, %{active: true, name: name, installed: installed})
     :ok
   end
 
@@ -99,11 +99,11 @@ defmodule BeamLisp.Trace do
   def untrace(ns, {:symbol, name}), do: untrace(ns, name)
 
   def untrace(_ns, _name) do
-    case :ets.lookup(:beam_lisp_vars, @state_key) do
-      [{_, %{installed: installed}}] ->
+    case BeamLisp.Env.lookup(@state_key) do
+      {:ok, %{installed: installed}} ->
         clear_patterns(installed)
         :dbg.stop_clear()
-        :ets.delete(:beam_lisp_vars, @state_key)
+        BeamLisp.Env.delete_key(@state_key)
         :ok
 
       _ ->
@@ -190,8 +190,8 @@ defmodule BeamLisp.Trace do
   end
 
   defp ensure_inactive!(name) do
-    case :ets.lookup(:beam_lisp_vars, @state_key) do
-      [{_, %{active: true}}] ->
+    case BeamLisp.Env.lookup(@state_key) do
+      {:ok, %{active: true}} ->
         raise "trace: #{name} — a trace is already active (untrace first)"
 
       _ ->
@@ -205,8 +205,8 @@ defmodule BeamLisp.Trace do
   end
 
   defp mark_inactive do
-    case :ets.lookup(:beam_lisp_vars, @state_key) do
-      [{_, st}] -> :ets.insert(:beam_lisp_vars, {@state_key, Map.put(st, :active, false)})
+    case BeamLisp.Env.lookup(@state_key) do
+      {:ok, st} -> BeamLisp.Env.put_key(@state_key, Map.put(st, :active, false))
       _ -> :ok
     end
   end

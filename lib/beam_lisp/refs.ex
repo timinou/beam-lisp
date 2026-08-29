@@ -232,7 +232,28 @@ defmodule BeamLisp.Refs do
   # --- futures ---
 
 
-  def future_exec(thunk_fn), do: %BeamLisp.Future{task: Task.async(thunk_fn)}
+  # A fork's :max_heap_words bound is enforced per spawned process
+  # (PLAN-047 W5): the token carries it, and the process sets its own
+  # max_heap_size flag — overflow kills THIS process, never the VM.
+  defp apply_heap_bound do
+    case BeamLisp.Env.max_heap() do
+      nil -> :ok
+      # Map form, kill: false — the integer form exits :killed, which is
+      # UNTRAPPABLE and would take the awaiting caller down through the
+      # task link. Non-kill overflow raises in the bounded process, so
+      # deref surfaces it like any other error.
+      words ->
+        :erlang.process_flag(:max_heap_size, %{size: words, kill: false, error_logger: false})
+    end
+  end
+
+  def future_exec(thunk_fn) do
+    # Carry the caller's env binding into the task: pdict does not
+    # propagate across spawn, and a future that landed in :global would
+    # silently escape its test's isolated env (PLAN-046 L2).
+    token = BeamLisp.Env.capture()
+    %BeamLisp.Future{task: Task.async(fn -> BeamLisp.Env.bind(token); apply_heap_bound(); thunk_fn.() end)}
+  end
   def future?(%BeamLisp.Future{}), do: true
   def future?(_), do: false
 
@@ -252,7 +273,12 @@ defmodule BeamLisp.Refs do
 
   # --- promises ---
 
-  def promise, do: %BeamLisp.Promise{pid: spawn(fn -> promise_loop(:unset, []) end)}
+  def promise do
+    # Same propagation as future_exec/1: the promise's loop process
+    # inherits the caller's env binding.
+    token = BeamLisp.Env.capture()
+    %BeamLisp.Promise{pid: spawn(fn -> BeamLisp.Env.bind(token); apply_heap_bound(); promise_loop(:unset, []) end)}
+  end
 
   # deliver returns the promise on first delivery, nil on any later
   # one — Clojure allows only a single delivery, and the nil return

@@ -193,6 +193,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         # Leave the VM as we found it. Only if WE started it — a project
         # that had `Env` running before this task is entitled to keep it.
         if not env_was_running?, do: stop_env()
+        stop_loader_server()
 
         cond do
           errors != [] -> {:error, Enum.reverse(errors)}
@@ -279,6 +280,16 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     # Already gone, or refusing to stop. Neither is worth failing a
     # compile over — the next `init/0` is idempotent either way.
     _, _ -> :ok
+  end
+
+  # Same discipline as stop_env/0: a Loader.Server started on demand by a
+  # compile-time library load would otherwise block the application's own
+  # supervisor child with "already started".
+  defp stop_loader_server do
+    case Process.whereis(BeamLisp.Loader.Server) do
+      nil -> :ok
+      pid -> try_stop(pid)
+    end
   end
 
   defp discover(source_dirs) do

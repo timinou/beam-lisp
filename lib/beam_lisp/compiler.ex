@@ -570,6 +570,18 @@ defmodule BeamLisp.Compiler do
   #
   # A NIF *is* substrate. The declaration that one exists is not.
   defp compile_special("defnative", [crate_form | sig_forms], env) do
+    # A NIF is arbitrary host code entering the VM; installing one is a
+    # capability a restricted env must not hold. `Native.declare` stays
+    # callable from host Elixir (the host is not sandboxed) — this gate is
+    # the bl-language path.
+    unless Env.caps() == :all do
+      compile_error(
+        env,
+        "defnative is not available in a capability-restricted environment: " <>
+          "a NIF is substrate, and only `:global`-capability code installs substrate"
+      )
+    end
+
     crate = string_of(crate_form)
 
     signatures =
@@ -2817,10 +2829,36 @@ defmodule BeamLisp.Compiler do
 
         cond do
           target = Env.alias_target(env.ns, prefix) -> {:var, target, fun}
-          uppercase?(prefix) -> {:remote, Module.concat([prefix]), String.to_atom(fun)}
+          uppercase?(prefix) -> gate_remote!(env, Module.concat([prefix]), String.to_atom(fun))
           Env.ns_exists?(prefix) -> {:var, prefix, fun}
-          true -> {:remote, String.to_atom(prefix), String.to_atom(fun)}
+          true -> gate_remote!(env, String.to_atom(prefix), String.to_atom(fun))
         end
+    end
+  end
+
+  # The capability gate at COMPILE time: a qualified name resolving to a
+  # host module (Elixir `Foo/bar`, Erlang `:erlang/atom_to_binary`, …) is
+  # a remote call into the host — allowed only when the current env's caps
+  # grant that module. Rejecting HERE means denied code never exists as
+  # bytecode at all: the strongest form of the gate, and zero runtime cost
+  # for static calls. Dynamic paths are gated in `RT.remote_fun/2` and
+  # `RT.invoke/2`.
+  defp gate_remote!(env, module, fun) do
+    if Env.caps_allowed?(module, Env.op_of(module, fun)) do
+      {:remote, module, fun}
+    else
+      compile_error(
+        env,
+        "module #{inspect(module)} is not granted in this environment " <>
+          "(env #{inspect(Process.get(:bl_env, :global))} holds caps: #{caps_description()})"
+      )
+    end
+  end
+
+  defp caps_description do
+    case Env.caps() do
+      :all -> "all"
+      set -> set |> Enum.map(&inspect/1) |> Enum.sort() |> Enum.join(", ")
     end
   end
 

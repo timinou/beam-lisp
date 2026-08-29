@@ -31,7 +31,6 @@ defmodule BeamLisp.Link do
 
   alias BeamLisp.{Emit, Env}
 
-  @table :beam_lisp_vars
 
   @doc "The module backing namespace `ns`. Delegates to `BeamLisp.Emit`."
   defdelegate module_for(ns), to: BeamLisp.Emit
@@ -70,7 +69,7 @@ defmodule BeamLisp.Link do
     value = Emit.fn_value(mod, fixed, variadic)
     link_info = {mod, Map.new(fixed), variadic}
 
-    :ets.insert(@table, {{:link, ns, name}, link_info})
+    BeamLisp.Env.put_key({:link, ns, name}, link_info)
     Env.intern(ns, name, value)
   end
 

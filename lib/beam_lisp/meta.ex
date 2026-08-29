@@ -63,7 +63,6 @@ defmodule BeamLisp.Meta do
   cache already documents.
   """
 
-  @table :beam_lisp_vars
 
   @doc """
   The metadata map attached to `x`, or `nil` when it has none.
@@ -72,9 +71,9 @@ defmodule BeamLisp.Meta do
   (see the module doc), so the Clojure idiom `(meta x)` is always safe.
   """
   def meta(%BeamLisp.LazySeq{} = lazy) do
-    case :ets.lookup(@table, meta_key(lazy)) do
-      [{_, m}] -> m
-      [] -> nil
+    case BeamLisp.Env.lookup(meta_key(lazy)) do
+      {:ok, m} -> m
+      :error -> nil
     end
   end
 
@@ -101,7 +100,7 @@ defmodule BeamLisp.Meta do
   # never a collection path — any struct/map is a legal meta payload.
   def with_meta(%BeamLisp.LazySeq{} = lazy, m) when is_map(m) do
     fresh = %BeamLisp.LazySeq{lazy | key: make_ref()}
-    :ets.insert(@table, {meta_key(fresh), m})
+    BeamLisp.Env.put_key(meta_key(fresh), m)
     fresh
   end
 

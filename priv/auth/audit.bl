@@ -1,0 +1,117 @@
+; auth/audit.bl — verdicts as data.
+;
+; ── The one idea ────────────────────────────────────────────────────
+;
+; authorizer/authorize is pure: same inputs, same decision, nothing
+; remembered. But "what was env X allowed to call, and when?" is an
+; AUDIT question, and the honest place for it is the store that already
+; answers temporal questions: datom. Every decision — allow AND deny —
+; becomes one entity; the transaction entity carries the time for free
+; (as-of/since). Denials are the audit's reason to exist: "who was
+; turned away, and why" is the query a security review actually runs.
+;
+; The record is deliberately scalar: token identity (hex of the
+; authority signature), verdict, reason, policy index, and the
+; operation/resource the context asserted. The full ctx stays with the
+; caller — the audit row is the INDEX into the decision, not a copy of
+; the world.
+;
+; ── The RLS tie-in ──────────────────────────────────────────────────
+;
+; One token, two enforcement points. The same authority block that
+; drives env caps (auth.sandbox) carries the principal fact
+; (user $p) — so it can also scope datom queries through auth.rls's
+; owner-filter. verified-facts refuses to read an unverified token:
+; facts from a forged token are fiction, and no query may ever be
+; scoped by fiction.
+
+(ns auth.audit
+  (:require [auth.biscuit.codec :as codec]
+            [auth.biscuit.crypto :as crypto]
+            [auth.biscuit.datalog :as dl]
+            [auth.rls :as rls]
+            [datom]))
+
+;; ── token identity ──────────────────────────────────────────────────
+
+(defn token-id
+  "A stable audit identity for `token`: hex of its first revocation id
+   (the authority block's signature). Identifies WHO signed off; says
+   nothing about what was decided."
+  [token]
+  (Base/encode16 (first (codec/revocation-ids token))))
+
+;; ── the record ──────────────────────────────────────────────────────
+
+(defn- ctx-scalar
+  "The value of the first `fact-name` fact in an authorizer ctx — e.g.
+   (ctx-scalar ctx \"operation\") → \"read\". nil when absent."
+  [ctx fact-name]
+  (let [hits (filter (fn [t] (= (first t) fact-name)) (:facts ctx))]
+    (if (empty? hits) nil (second (first hits)))))
+
+(defn verdict->tx-data
+  "An authorization verdict as transaction DATA — a one-entity vector
+   ready for datom/transact!. Records the token identity, the verdict,
+   and — when present — the denial reason, the firing policy's index,
+   and the operation/resource the ctx asserted."
+  [token verdict ctx]
+  (let [reason (:reason verdict)
+        policy (:policy verdict)
+        op (ctx-scalar ctx "operation")
+        res (ctx-scalar ctx "resource")
+        e {:db/id -1
+           :audit/token (token-id token)
+           :audit/verdict (:verdict verdict)}
+        e (if (nil? reason) e (assoc e :audit/reason reason))
+        e (if (nil? policy) e (assoc e :audit/policy-index policy))
+        e (if (nil? op) e (assoc e :audit/operation op))
+        e (if (nil? res) e (assoc e :audit/resource res))]
+    [e]))
+
+(defn record!
+  "Transact the audit record of `verdict` into `conn`, returning the
+   transaction report. Deny verdicts are recorded too — deliberately."
+  [conn token verdict ctx]
+  (datom/transact! conn (verdict->tx-data token verdict ctx)))
+
+;; ── the RLS tie-in ──────────────────────────────────────────────────
+
+(defn verified-facts
+  "The authority block's fact tuples — but ONLY after the signature
+   verifies under `root-pub`. Facts from an unverified token are
+   fiction; this accessor refuses to read them. nil on forgery."
+  [root-pub token]
+  (if (crypto/verify root-pub token)
+    (mapv dl/predicate->tuple
+          (:facts (dl/decode-block (:data (:authority token)))))
+    nil))
+
+(defn principal
+  "The principal a verified token speaks for: the argument of its first
+   (user $p) fact. nil when the token carries no identity or fails
+   verification."
+  [root-pub token]
+  (let [facts (verified-facts root-pub token)
+        users (if (nil? facts) [] (filter (fn [t] (= (first t) "user")) facts))]
+    (if (empty? users) nil (second (first users)))))
+
+(defn owner-scope
+  "One token, two enforcement points: verify `token`, take its
+   principal, and return the guard filters scoping `row-var` to rows
+   owned by that principal — ready for auth/guard. The token that
+   narrowed the env's calls now narrows the query's rows.
+
+   {:ok filters} | {:error :forged} | {:error :no-principal}.
+
+   Verification only — no policy evaluation. Revocation-aware scoping
+   belongs to the flow's earlier authorize (sandbox-fork); by the time
+   queries run, the env is already entered."
+  [root-pub token row-var owner-attr]
+  (let [facts (verified-facts root-pub token)]
+    (if (nil? facts)
+      {:error :forged}
+      (let [users (filter (fn [t] (= (first t) "user")) facts)]
+        (if (empty? users)
+          {:error :no-principal}
+          {:ok (rls/owner-filter row-var owner-attr (second (first users)))})))))

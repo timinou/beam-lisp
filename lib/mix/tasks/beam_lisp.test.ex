@@ -11,6 +11,11 @@ defmodule Mix.Tasks.BeamLisp.Test do
   as does the `BEAM_LISP_PATH` environment variable. A suite otherwise only
   sees its OWN directory, cwd and `priv/` — so a library living anywhere else
   (`spell/src`) could not be required from a test at all.
+
+  `--async` runs each test FILE in its own forked env, concurrently
+  (PLAN-046): the test library loads once into a warm base, files fork
+  from it, and per-file output is buffered and replayed in order. Totals
+  are identical to the serial run's; wall-clock is not.
   """
 
   @shortdoc "Run the beam-lisp test suite"
@@ -21,7 +26,9 @@ defmodule Mix.Tasks.BeamLisp.Test do
   def run(args) do
     Mix.Task.run("app.start")
 
-    {opts, args} = OptionParser.parse!(args, strict: [path: :keep], aliases: [p: :path])
+    {opts, args} =
+      OptionParser.parse!(args, strict: [path: :keep, async: :boolean], aliases: [p: :path])
+
     for {:path, dir} <- opts, do: BeamLisp.Env.add_search_path(dir)
 
     # The CURRENT project's `src/` is the library-root convention (the
@@ -56,6 +63,6 @@ defmodule Mix.Tasks.BeamLisp.Test do
 
     if paths == [], do: Mix.raise("no beam-lisp test files found")
 
-    BeamLisp.TestRT.cli(paths)
+    BeamLisp.TestRT.cli(paths, async: Keyword.get(opts, :async, false))
   end
 end
