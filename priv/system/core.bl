@@ -347,6 +347,107 @@
   (let [s (smt/sort-of-value valnode)]
     (if (= s :unknown) "Int" s)))
 
+; ── enum (sum-type) universe gathering (R1a) ───────────────────────────
+;
+; A field whose init value is a KEYWORD is a finite enum — a z3 datatype. Its
+; sort name is derived per field (E_<field>) so two enum fields never share a
+; constructor namespace. The variant UNIVERSE is every tag that mentions the
+; field anywhere — assigned in init/next, or compared in a guard/invariant — so
+; the declare-datatypes is complete and z3's no-junk axiom fences the field to
+; exactly those tags (structural, zero-cost: no phase=99 leak an Int allows).
+
+(defn- kw-node? [n] (= :keyword (typed/node-tag (typed/node-form n))))
+(defn- kw-name [n] (typed/node-name (typed/node-form n)))
+(defn- enum-sort-name [field] (str "E_" field))
+
+(defn- assigned-keyword
+  "The keyword tag a next-state NODE assigns to `field` (map value), or nil."
+  [field next-node]
+  (if (nil? next-node) nil
+    (let [f (typed/node-form next-node)]
+      (if (= :map (typed/node-tag f))
+        (some (fn [pair]
+                (let [k (first (erlang/tuple_to_list pair))
+                      v (second (erlang/tuple_to_list pair))]
+                  (if (and (= field (typed/node-name (typed/node-form k))) (kw-node? v))
+                    (kw-name v) nil)))
+              (typed/node-items f))
+        nil))))
+
+(defn- keywords-near
+  "Every keyword tag appearing in a LIST that also mentions the symbol `field`,
+   recursively through `node`. Catches (= field :open) and (= :open field)."
+  [field node]
+  (if (nil? node) []
+    (let [f (typed/node-form node)
+          tg (typed/node-tag f)]
+      (cond
+        (= tg :list)
+          (let [items (into [] (typed/node-items f))
+                mentions (some (fn [it]
+                                 (let [ff (typed/node-form it)]
+                                   (and (= :symbol (typed/node-tag ff))
+                                        (= field (typed/node-name ff)))))
+                               items)
+                here (if mentions (keep (fn [it] (if (kw-node? it) (kw-name it) nil)) items) [])]
+            (concat here (mapcat (fn [it] (keywords-near field it)) items)))
+        (= tg :vector)
+          (mapcat (fn [it] (keywords-near field it)) (typed/node-items f))
+        (= tg :map)
+          (mapcat (fn [pair]
+                    (concat (keywords-near field (first (erlang/tuple_to_list pair)))
+                            (keywords-near field (second (erlang/tuple_to_list pair)))))
+                  (typed/node-items f))
+        :else []))))
+
+(defn- enum-universe
+  "The complete tag set for an enum `field`: assigned in init + every message
+   next, and compared in every guard + the invariant. A set of tag strings."
+  [field inv-node init-c msg-cs]
+  (into #{} (distinct
+              (concat
+                (let [ik (assigned-keyword field (:next-node init-c))] (if ik [ik] []))
+                (keep (fn [c] (assigned-keyword field (:next-node c))) msg-cs)
+                (mapcat (fn [c] (keywords-near field (:guard-node c))) msg-cs)
+                (keywords-near field inv-node)))))
+
+; ── phase graph: the enum's implicit STRUCTURE, reasoned by datalog (R1a) ──
+;
+; An enum field's transitions form a finite labelled graph over its tags: a
+; clause guarded (= field :from) that assigns :to is an edge from→to. That graph
+; is code-as-data — the implicit protocol properties are datalog queries over it,
+; not z3 (structure is the tag lattice's job; z3 decides only arithmetic). This
+; is the same move model.bl's REACHABLE rule + the coverage anti-joins already
+; make; here it answers "which tags are reachable / dead / terminal" for free.
+
+(defn phase-edges
+  "The (from-tag → to-tag) edges of enum `field`: for each message clause, the
+   tag its guard REQUIRES (= field :from) and the tag its next ASSIGNS to field.
+   Both present ⇒ an edge. A clause with no phase guard starts from the init tag."
+  [field init-tag msg-cs]
+  (keep (fn [c]
+          (let [froms (keywords-near field (:guard-node c))
+                to    (assigned-keyword field (:next-node c))
+                from  (if (seq froms) (first froms) init-tag)]
+            (if (and from to) [from to] nil)))
+        msg-cs))
+
+(defn phase-analysis
+  "Implicit structural facts about enum `field`, from datalog over its phase
+   graph. `reachable-from` is (edges init-tag)→#{tags reachable from init},
+   injected so system.core need not require datom — the caller wires the shipped
+   datom.query.fixpoint REACHABLE rule (see examples/system). Returns
+     {:reachable #{tags} :dead #{declared-but-unreachable} :terminal #{no-outgoing}}.
+   dead tags = a variant the machine can never be in (a spec/impl mismatch);
+   terminal tags = a variant nothing leaves (a sink — often correct, e.g. closed)."
+  [field universe init-tag msg-cs reachable-from]
+  (let [edges (phase-edges field init-tag msg-cs)
+        reachable (conj (reachable-from edges init-tag) init-tag)
+        dead (into #{} (filter (fn [t] (not (contains? reachable t))) (into [] universe)))
+        has-out (into #{} (map first edges))
+        terminal (into #{} (filter (fn [t] (not (contains? has-out t))) (into [] universe)))]
+    {:reachable reachable :dead dead :terminal terminal}))
+
 (defn- state-shape
   "{:svars [ordered names] :sorts {name→sort}} read from the init next-state.
    A map → named fields whose sorts come from the tag-lattice FUNCTOR on each
@@ -373,9 +474,11 @@
           (= tg :map)
             (let [pairs (map (fn [pair]
                                (let [k (first (erlang/tuple_to_list pair))
-                                     v (second (erlang/tuple_to_list pair))]
-                                 [(typed/node-name (typed/node-form k))
-                                  (node-sort v)]))     ; sort from the tag lattice
+                                     v (second (erlang/tuple_to_list pair))
+                                     field (typed/node-name (typed/node-form k))]
+                                 ; a keyword init value ⇒ enum field: sort = E_<field>,
+                                 ; the datatype whose universe is gathered later.
+                                 [field (if (kw-node? v) (enum-sort-name field) (node-sort v))]))
                              (typed/node-items f))]
               {:svars (into [] (map first pairs))
                :sorts (into {} pairs)})
@@ -390,10 +493,10 @@
    maps to the single field. nil when the shape/arity mismatches or any element
    is untranslatable (the transition is then dropped — sound). Takes the reader
    NODE and translates each child node DIRECTLY — no delaborate→re-read."
-  [svars sorts next-node]
+  [svars sorts variants next-node]
   (let [f (typed/node-form next-node)
         tg (typed/node-tag f)
-        one (fn [nd] (smt/of-node (set svars) nd))
+        one (fn [nd] (smt/of-node (set svars) variants nd))
         build (fn [assocs]
                 (loop [xs assocs m {}]
                   (if (empty? xs)
@@ -421,22 +524,25 @@
 (defn- keep-translatable-multi
   "Message transitions whose guard AND every next field translate, each as
    {:label :guard smt|nil :nexts {svar→smt}}. Translates the reader NODES the
-   clause carries — no re-read."
-  [svars sorts clauses]
+   clause carries — no re-read. `variants` maps enum tags to z3 constructors."
+  [svars sorts variants clauses]
   (keep (fn [c]
           (let [g (:guard-node c)
-                gsmt (if (nil? g) nil (smt/of-node (set svars) g))
-                nmap (next-fields svars sorts (:next-node c))]
+                gsmt (if (nil? g) nil (smt/of-node (set svars) variants g))
+                nmap (next-fields svars sorts variants (:next-node c))]
             (if (or (= gsmt :untranslatable) (nil? nmap))
               nil
               {:label (:label c) :guard gsmt :nexts nmap})))
         clauses))
 
 (defn- inv-define-fun
-  "(define-fun Inv ((v Sort)…) Bool <inv-smt>) — the invariant as a z3 function
-   of the whole sorted state. Applying it to primed args needs no substitution."
-  [svars sorts inv-smt]
-  (str "(define-fun Inv ("
+  "prelude + (define-fun Inv ((v Sort)…) Bool <inv-smt>) — the invariant as a z3
+   function of the whole sorted state. `prelude` is any (declare-datatypes …)
+   the enum sorts need, emitted BEFORE the define-fun that references them.
+   Applying Inv to primed args needs no substitution."
+  [prelude svars sorts inv-smt]
+  (str prelude
+       "(define-fun Inv ("
        (join " " (map (fn [v] (str "(" v " " (get sorts v "Int") ")")) svars))
        ") Bool " inv-smt ")\n"))
 
@@ -445,12 +551,12 @@
 (defn- preserves-joint?
   "Does the transition preserve the sorted-state invariant? Assert Inv(s) ∧
    guard ∧ (⋀ vᵢ2=nextᵢ) ∧ ¬Inv(s2); unsat ⟹ preserved."
-  [port svars sorts inv-smt decls guard nexts]
+  [port prelude svars sorts inv-smt decls guard nexts]
   (let [prime-decls (join "" (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars))
         prime-eqs   (join "" (map (fn [v] (str "(assert (= " v "2 " (get nexts v v) "))\n")) svars))
         cur-args (join " " svars)
         pri-args (join " " (map (fn [v] (str v "2")) svars))
-        smt (str (inv-define-fun svars sorts inv-smt)
+        smt (str (inv-define-fun prelude svars sorts inv-smt)
                  decls prime-decls
                  "(assert (Inv " cur-args "))\n"
                  (if guard (str "(assert " guard ")\n") "")
@@ -461,8 +567,8 @@
 (defn- establishes-joint?
   "Does the init state establish the invariant? Assert ¬Inv(init-exprs); unsat
    ⟹ established."
-  [port svars sorts inv-smt decls init-exprs]
-  (let [smt (str (inv-define-fun svars sorts inv-smt)
+  [port prelude svars sorts inv-smt decls init-exprs]
+  (let [smt (str (inv-define-fun prelude svars sorts inv-smt)
                  decls
                  "(assert (not (Inv " (join " " init-exprs) ")))\n")]
     (= "unsat" (z3/check port smt))))
@@ -484,13 +590,22 @@
       (let [shape (state-shape inv-node clauses)
             svars (:svars shape)
             sorts (:sorts shape)
-            inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) inv-node))]
+            init-c0 (first (filter (fn [c] (= :init (:label c))) clauses))
+            msg-cs0 (filter (fn [c] (not (= :init (:label c)))) clauses)
+            ; ENUM fields (sort E_*): gather each one's tag universe, build the
+            ; combined declare-datatypes prelude + the tag→constructor map.
+            enum-fields (filter (fn [v] (= (get sorts v) (enum-sort-name v))) svars)
+            universes (into {} (map (fn [v] [v (enum-universe v inv-node init-c0 msg-cs0)]) enum-fields))
+            prelude (join "" (map (fn [v] (smt/datatype-decl (enum-sort-name v) (get universes v))) enum-fields))
+            variants (reduce (fn [m v] (merge m (smt/variants-map (enum-sort-name v) (get universes v))))
+                             {} enum-fields)
+            inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) variants inv-node))]
         (if (or (empty? svars) (= inv-smt :untranslatable))
           {:name (:name sm) :holds nil :checked false :warnings []
            :reason "invariant not translatable to integer/bool arithmetic"}
-          (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))
-                msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
-                ts (keep-translatable-multi svars sorts msg-cs)
+          (let [init-c init-c0
+                msg-cs msg-cs0
+                ts (keep-translatable-multi svars sorts variants msg-cs)
                 pos (typed/node-pos node)
                 svarset (set svars)
                 ; inputs: free syms across the TRANSLATED guards + nexts, minus
@@ -501,7 +616,13 @@
                                 (reduce (fn [a s] (if (nil? s) a (into a (free-syms s))))
                                         acc (cons (:guard t) (into [] (vals (:nexts t))))))
                               #{} ts)
-                inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
+                ; enum CONSTRUCTORS (E_phase-open, …) appear in translated guards/
+                ; nexts but are VALUES, not inputs — declaring them shadows the
+                ; datatype and desyncs z3 (same class as the true/false exclusion).
+                ctor-set (into #{} (vals variants))
+                inputs (filter (fn [nm] (and (not (contains? svarset nm))
+                                             (not (contains? ctor-set nm))))
+                               (into [] input-names))
                 ; INPUT SORTS by flow: an input that appears in field v's :next
                 ; must share v's sort (z3 has no Int+Real). Scan each transition's
                 ; nexts; an input inherits the sort of the FIRST field whose next
@@ -520,17 +641,17 @@
                            (join "" (map (fn [nm] (decl-of nm (input-sort nm))) inputs)))
                 ; establishment: a pure pass-through init (the opening state) is
                 ; the caller's contract, trusted. A computed init is checked.
-                init-nexts (if init-c (next-fields svars sorts (:next-node init-c)) nil)
+                init-nexts (if init-c (next-fields svars sorts variants (:next-node init-c)) nil)
                 passthrough? (and (some? init-nexts)
                                   (every? (fn [v] (= (get init-nexts v) v)) svars))
                 init-est (cond
                            (nil? init-c) true
                            (nil? init-nexts) true
                            passthrough? true
-                           :else (establishes-joint? port svars sorts inv-smt decls
+                           :else (establishes-joint? port prelude svars sorts inv-smt decls
                                     (into [] (map (fn [v] (get init-nexts v v)) svars))))
                 step-rs (map (fn [t]
-                               (assoc (preserves-joint? port svars sorts inv-smt decls (:guard t) (:nexts t))
+                               (assoc (preserves-joint? port prelude svars sorts inv-smt decls (:guard t) (:nexts t))
                                       :label (:label t)))
                              ts)
                 failures (filter (fn [x] (not (:preserved x))) step-rs)]
@@ -675,7 +796,7 @@
     (if (empty? svars)
       {:name (:name sm) :discovered nil :conjuncts [] :checked false}
       (let [msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
-            ts (keep-translatable-multi svars sorts msg-cs)
+            ts (keep-translatable-multi svars sorts {} msg-cs)
             svarset (set svars)
             input-names (reduce
                           (fn [acc t]
@@ -685,7 +806,7 @@
             inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
             decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
                        (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
-            init-vals (if init-c (next-fields svars sorts (:next-node init-c)) {})
+            init-vals (if init-c (next-fields svars sorts {} (:next-node init-c)) {})
             cands (candidate-invariants svars)
             ; 1. establishment filter → a CONSISTENT seed
             established (filter (fn [c] (holds-at-init? port svars sorts decls init-vals c)) cands)
