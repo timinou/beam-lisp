@@ -178,4 +178,28 @@ defmodule BeamLisp.LoaderPathTest do
 
     assert ["/tmp/one", "/tmp/two"] == Env.search_paths()
   end
+
+  test "a path added inside a forked env reaches the pinned loader" do
+    # The load runs in Loader.Server, a pinned process whose env binding is
+    # :global. A search path the CALLER added to a forked env used to be
+    # invisible across that hop — Env.search_paths/0 resolves through the
+    # caller's chain, and the binding does not cross processes — so a warm
+    # base or test fork could not load a namespace its own env could see
+    # (found from spell's SpellCase warmup, which adds the app's src/ to the
+    # base env exactly like Sandbox.warm!/2's own cwd/src convention).
+    dir = Path.join(System.tmp_dir!(), "blfork_#{System.unique_integer([:positive])}")
+    ns = uniq_ns("forkpath_lib")
+    write_ns!(dir, ns, "(defn answer [] 42)")
+
+    fork = Env.fork(:global)
+
+    Env.with_env(fork, fn ->
+      Env.add_search_path(dir)
+      assert :ok = Loader.ensure_loaded(ns)
+    end)
+
+    assert 42 == BeamLisp.Compiler.eval_string("(#{ns}/answer)")
+
+    File.rm_rf!(dir)
+  end
 end
