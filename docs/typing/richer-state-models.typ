@@ -72,7 +72,7 @@ between them. Here is the inventory.
   [signatures from source], [`sigs-from-env` reads `^{:args :ret}` off name meta
     through the real compile pipe — no re-declaration], [✓ shipped],
   [multi-var SMT], [`preserves?` already declares `svar` + `svar2` + inputs and
-    primes; N is a loop where there is a `first`], [◐ one line away],
+    primes; N was a loop where there was a `first` — now generalized], [✓ shipped],
   [candidate predicates], [`system.core/candidates` — miniKanren enumerates
     `(op a b)` over a domain, deduped], [✓ shipped],
   [z3 preservation], [`preserves?` / `sufficient?` / `establishes?` — the Hoare
@@ -81,11 +81,11 @@ between them. Here is the inventory.
     body — never annotated], [✓ shipped],
 )
 
-The only ◐ in the table is Rung 1, and it is genuinely a truncation bug:
-`state-vars` #term[collects the set] of state variables, and `verify-process`
-#term[keeps one]. The z3 layer beneath it (`preserves?`) already handles a
-current var, a primed var, and declared inputs — it was always N-ary; only the
-seam narrows it to one.
+Every row is now #term[shipped]. The last to land, Rung 1, was genuinely a
+truncation bug: `state-vars` #term[collected the set] of state variables, and
+`verify-process` #term[kept one]. The z3 layer beneath it (`preserves?`) already
+handled a current var, a primed var, and declared inputs — it was always N-ary;
+only the seam narrowed it to one. Fixing that opened the whole ladder.
 
 == Proof: multi-variable relational invariants (Rung 1)
 
@@ -217,21 +217,20 @@ already ships (`exact-guarantees` vs `approximate-guarantees`).
   columns: (auto, 1fr, auto),
   inset: 7pt,
   align: (left, left, center),
-  table.header([*rung*], [*state model → what it buys*], [*lift*]),
+  table.header([*rung*], [*state model → what it buys*], [*warm*]),
   [1 · multi-var], [tuple of ints; relational invariants (`balance ≥ reserved`).
-    Rate limiters, pools, any coupled counters. #term[Shipped] — live in
-    `verify-process`, demo 10, tests green.], [small],
-  [2 · records], [product of typed fields (int + bool + …); mode/flag machines
-    (`frozen ⇒ balance = 0`). Projection: each field its own z3 sort — the
-    lattice already knows the sorts], [medium],
-  [3 · collections], [z3 arrays / sequences / sets; queue bounds, no-duplicate,
-    mailbox growth. Crosses into #term[bounded] guarantees — the catalog already
-    distinguishes them], [high],
-  [4 · sum types], [tagged variants (`:idle | (:running job) | :done`); legal-
-    transition protocols, session types. Recruits all four engines; connects to
-    the existing `simulates?` / verified-hot-upgrade machinery], [high],
-  [★ · discovery], [invariant synthesis over any rung's vocabulary via Houdini.
-    No annotation. #term[Proven above] at Rung 1's vocabulary], [medium],
+    Rate limiters, pools, coupled counters. #term[Shipped] — demo 10.], [21 ms],
+  [2 · records], [product of typed fields (int × bool); mode/flag machines
+    (`frozen ⇒ balance = 0`). Each field its own z3 sort, read from init.
+    #term[Shipped] — demo 11.], [23 ms],
+  [3 · collections], [capacity via length abstraction (`count ≤ 10`), EXACT;
+    content (no-duplicate) is the bounded companion. The catalog keeps them
+    apart. #term[Shipped] — demo 12.], [19 ms],
+  [4 · sum types], [tagged variant as a phase (`:idle | :open | :closed`);
+    session-type conformance (`send ⇒ open`), use-after-close caught. #term[Shipped]
+    — demo 13.], [17 ms],
+  [★ · discovery], [invariant synthesis via Houdini over the state vars. No
+    annotation. #term[Shipped] — demo 14.], [99 ms],
 )
 
 #idea(title: "Type-directed translation is the whole mechanism")[
@@ -272,11 +271,11 @@ discovery is the same search with a wider target")[
   state vars — the last "annotate-only" property becomes inferred.
 ]
 
-= The build plan, and the demos it produces
+= The demos it produced
 
-The work is filed as `PLAN-050`. Six pieces, dependency-ordered, each shipping as
-#term[tests and a demo] (the tier's graduation contract). The demos are the proof
-surface — here is what will exist when the plan is done:
+The work was filed as `PLAN-050` — six pieces, dependency-ordered, each shipping
+as #term[tests and a demo] (the tier's graduation contract) — and all six are
+done. The demos are the proof surface; every one runs clean:
 
 #table(
   columns: (auto, 1fr),
@@ -305,21 +304,30 @@ surface — here is what will exist when the plan is done:
 
 = Where it stands
 
-Rung 1 is no longer a spike — it is #term[shipped]: `verify-process` now handles N
-state variables jointly, the reservation account with its relational invariant
-`balance ≥ reserved` proves end-to-end through the real checker, the
-reservation-ignoring withdraw is caught, and the single-variable seam is
-unchanged (N=1 is one param in the `define-fun`). `examples/system/10_multivar_invariant.bl`
-demonstrates it; the seam tests gain two cases; the non-auth suite stays green at
-637 tests / 1736 assertions / 0 failures.
+The whole ladder is #term[shipped], not spiked. One `verify-process` proves an
+invariant over five state shapes — a scalar int, a tuple of ints with a
+relational invariant, a mixed-sort record (int × bool), a phase-coded variant
+(protocol conformance), and a collection abstracted to its length — each by
+reading the field sorts from the init state, each with its bug caught and
+rendered like an ordinary compiler warning. And the invariant itself is
+#term[discovered from nothing] by a Houdini fixpoint when there is no annotation.
+`examples/system/10`–`15` demonstrate every rung; the seam tests grew from 9 to
+21 cases; the non-auth suite is green at #term[647 tests / 1760 assertions / 0
+failures].
 
-The second claim — invariants #term[discovered from nothing] via a Houdini
-fixpoint over the existing abduce vocabulary — is proven in `spike_discover` and
-filed as `p18-discover` for graduation. The lift to Rungs 2–4 is type-directed
-SMT translation: consulting the tag lattice for each state var's sort instead of
-assuming `Int`. Nothing here is a new engine; all of it is a wire between two
-phases that were, in retrospect, built to be connected. That is the sense in
-which most of the work was already done — and the sense in which the way it was
-done reaches further than the original proposal: a relation that synthesizes,
-four engines that compose, and an invariant that no longer needs a human to state
-it.
+Two bugs were fixed at the root along the way, both found by a rung disagreeing
+with an obviously-correct case: `errors/delaborate` had no map case (record
+state rendered as a raw tuple), and `free-syms` declared the boolean literals
+`true`/`false` as integer inputs, shadowing SMT's booleans and silently breaking
+any transition that assigned a bool literal. Neither was worked around.
+
+Nothing here is a new engine. All of it is the wire between two phases that
+were, in retrospect, built to be connected: the type lattice infers the shape,
+the guarantee engine proves over it, and “richer state models” was the
+type-directed translation between them. That is the sense in which most of the
+work was already done — and the sense in which the way it was done reached
+further than the original proposal: a relation that synthesizes, four engines
+that compose, and an invariant that no longer needs a human to state it. The
+remaining depth is genuine (z3-sequence CONTENT invariants beyond length; a
+richer candidate vocabulary for discovery) but it is depth on a shipped
+foundation, not a missing floor.
