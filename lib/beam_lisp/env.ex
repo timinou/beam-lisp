@@ -194,6 +194,20 @@ defmodule BeamLisp.Env do
   end
 
   @doc """
+  Whether this env can touch `module` for AT LEAST ONE op — the reflective
+  "is this module reachable?" question, distinct from `caps_allowed?/2`'s
+  "may I call THIS fn?". A bare-module grant or any `{module, op}` grant
+  counts. Used by `env/allowed?`; the compile gate uses `caps_allowed?/2`
+  with the specific op, so this looser check never widens a call site.
+  """
+  def reachable?(module) do
+    case caps() do
+      :all -> true
+      set -> MapSet.member?(set, module) or Enum.any?(set, &match?({^module, _}, &1))
+    end
+  end
+
+  @doc """
   The op a module's fn performs, per `op_table/0` — or nil when the table
   doesn't say. Data, not code: extend via `register_op/3`.
   """

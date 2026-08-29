@@ -87,52 +87,64 @@ defmodule BeamLisp.TestRT do
     |> Enum.map(fn [ns] -> ns end)
   end
 
-  # --- run state ---
+  # --- run state (PROCESS-local, not env-scoped) ---
+  #
+  # Counters and the current-test context belong to the PROCESS running a
+  # suite, never to its env. Both run modes isolate by process (serial is
+  # sequential in one process; async forks a process per file), so the
+  # process dictionary is the correct home. Storing them env-prefixed was
+  # a latent bug: a test body that asserts inside `(env/with-env fork …)`
+  # wrote its :fail/:error record under the FORK's key, where the summary
+  # — reading under the suite env — never saw it. The FAIL printed but the
+  # total said 0. (The registry above stays env-scoped: a forked suite
+  # must run only ITS registered tests.)
+
+  defp run_key(ns), do: {:test_run, ns}
 
   defp fetch_run(ns) do
-    case Env.lookup_own({:test_run, ns}) do
-      {:ok, r} -> r
-      :error -> %{tests: 0, pass: 0, fail: 0, error: 0, reports: []}
+    case Process.get(run_key(ns)) do
+      nil -> %{tests: 0, pass: 0, fail: 0, error: 0, reports: []}
+      r -> r
     end
   end
 
   defp fetch_ctx do
-    case Env.lookup_own({:test_ctx}) do
-      {:ok, c} -> c
-      :error -> %{ns: nil, test: nil, context: []}
+    case Process.get(:test_ctx) do
+      nil -> %{ns: nil, test: nil, context: []}
+      c -> c
     end
   end
 
   @doc "Clear `ns`'s counters and reports before a run."
   def reset_run(ns) do
-    Env.put_key({:test_run, ns}, %{tests: 0, pass: 0, fail: 0, error: 0, reports: []})
+    Process.put(run_key(ns), %{tests: 0, pass: 0, fail: 0, error: 0, reports: []})
     :ok
   end
 
   @doc "Mark `name` (of `ns`) as the test currently executing; increments the test count."
   def begin_test(ns, name) do
     run = Map.update!(fetch_run(ns), :tests, &(&1 + 1))
-    Env.put_key({:test_run, ns}, run)
-    Env.put_key({:test_ctx}, %{ns: ns, test: name, context: []})
+    Process.put(run_key(ns), run)
+    Process.put(:test_ctx, %{ns: ns, test: name, context: []})
     :ok
   end
 
   @doc "End the current test and clear the context slot."
   def end_test(ns) do
-    Env.put_key({:test_ctx}, %{ns: ns, test: nil, context: []})
+    Process.put(:test_ctx, %{ns: ns, test: nil, context: []})
     :ok
   end
 
   @doc "Run `f` with `str` pushed onto the current `testing` context."
   def with_context(str, f) do
     ctx = fetch_ctx()
-    Env.put_key({:test_ctx}, %{ctx | context: ctx.context ++ [str]})
+    Process.put(:test_ctx, %{ctx | context: ctx.context ++ [str]})
 
     try do
       RT.invoke(f, [])
     after
       ctx = fetch_ctx()
-      Env.put_key({:test_ctx}, %{ctx | context: Enum.drop(ctx.context, -1)})
+      Process.put(:test_ctx, %{ctx | context: Enum.drop(ctx.context, -1)})
     end
   end
 
@@ -156,7 +168,7 @@ defmodule BeamLisp.TestRT do
 
     run = fetch_run(ns)
     run = Map.update!(run, type, &(&1 + 1))
-    Env.put_key({:test_run, ns}, %{run | reports: run.reports ++ [report]})
+    Process.put(run_key(ns), %{run | reports: run.reports ++ [report]})
 
     if type in [:fail, :error], do: print_report(report)
     type
