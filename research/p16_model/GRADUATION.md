@@ -42,3 +42,48 @@ load-order issue in the auth/biscuit module, not a graduation regression.
 z3 per-query ~2–6 ms (MVP-C's measured p50), so the arithmetic guarantees scale
 with the number of transitions, not the state space — the whole point of proof
 over search.
+
+---
+
+# P17 — the checker seam (2026-08-29)
+
+The tier is now ONE package (`priv/system/`, ns `system.*`) and a point-and-verify
+checker, not a set of libraries you hand-feed.
+
+## Package
+- `priv/system/footprint.bl` → `system.footprint`
+- `priv/system/model.bl`     → `system.model`
+- `priv/system/smt.bl`       → `system.smt`   (source→SMT-LIB translator)
+- `priv/system/step.bl`      → `system.step`  (:~step as a defrelation)
+- `priv/system/core.bl`      → `system.core`  (guarantee engine + the seam)
+
+## The seam
+- `(system/verify-process port node)` — annotate a defserver name with
+  `^{:invariant …}`, get `{:name :holds :checked :warnings}`. No hand-written SMT.
+- `(system/verify-file port file src)` — every process form → rendered
+  `file:line:col` + caret warnings (via errors/render).
+- message coverage: `handled-labels` / `unhandled-messages` / `sent-to-labels`.
+- dispatch determinism: `guards-overlap?` / `nondeterministic-pairs` (z3).
+
+## Tests
+- `test/bl/system/seam_test.bl` — 9 tests / 25 assertions, PASS.
+  (model_test 4/10 + system_test 15/30 + seam_test 9/25 = 28 tests / 65 assertions.)
+
+## Demos
+- `examples/system/09_point_and_verify.bl` — the flagship: annotated server
+  proves true, buggy one renders a caret'd warning, unhandled message caught.
+  All 9 examples/system demos run clean.
+
+## Regression
+Non-auth suite: **635 tests / 1730 assertions / 0F 0E** (auth still pre-broken,
+out of scope). The package reorg + seam regressed nothing.
+
+## Numbers (P17)
+| operation | time |
+|---|---|
+| verify-process (full seam, 2 transitions, z3) | 24 ms |
+| smt translate one compound guard | 1 ms |
+
+Bugs fixed at root: extract-defserver dropped :when guards; verify-process
+conflated init-establishment with preservation; state-vars picked the operator
+symbol (>=) instead of the state var; abduce's double check-sat (earlier).
