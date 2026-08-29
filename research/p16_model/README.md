@@ -204,3 +204,23 @@ footprint as :opaque-world. Same verdict, cleaner mechanism at graduation —
 needs the env-convey analysis (capture/bind sites) which the spike stubs.
 
 Files: `run_sandbox.bl` (reuses footprint.bl; caps as resource sets).
+
+---
+
+# P16f — structural deadlock-freedom: a datalog cycle query (PASS)
+
+A synchronous `call` blocks until reply; a CYCLE in the waits-for graph
+(A waits on B, B on C, C on A) is a deadlock. The waits-for relation is datoms
+(`[?a :waits/on ?b]` per sync call site; async cast/send contribute no edge —
+they never block). A deadlock is `A reachable from A` — a recursive datalog
+query on the SHIPPED fixpoint engine. No z3, no state exploration.
+
+- acyclic call graph → deadlock-free, proven from the graph.
+- orders→billing→shipping→orders cycle → the three cycle members NAMED; audit
+  (acyclic) correctly excluded. The cause, not a searched stuck state.
+- make one back-edge async → cycle broken; the same query confirms the fix.
+
+Beats TLA+ ergonomically: TLA+ reports a deadlock STATE after search; we report
+the structural CYCLE — the actual cause, servers named — from the call graph.
+
+Files: `run_deadlock.bl` (BLOCKED recursive rule; deadlocked = blocked-on-self).
