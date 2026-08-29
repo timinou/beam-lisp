@@ -1,0 +1,300 @@
+; live/socket.bl — the live view socket: a view fn bound to a datom conn.
+;
+; ── The whole loop, in one place ──────────────────────────────────────
+;
+; A live socket is a process (a defserver, see `deflive` below) that mirrors
+; a slice of the database to one viewer. It holds:
+;
+;   :view     a pure fn  (db locals) → hiccup        — the projection
+;   :shared   a datom conn — the durable, shared world
+;   :session  a datom conn — this socket's OWN in-memory state (ETS)
+;   :locals   a map — ephemeral per-socket values (draft text, ui toggles)
+;   :tree     the last hiccup value it rendered (to diff against)
+;   :sink     where patch messages go (a pid; in prod the LiveView channel)
+;   :auth     {:root pub :token biscuit :principal p} or nil
+;
+; The loop:
+;   mount   → render the view once → push [:mount html], remember the tree
+;   commit  → (shared OR session changed) → re-render → diff → push [:patch ops]
+;   event   → :assign mutates locals (re-render now) | :intent authorizes then
+;             transacts shared (DOES NOT render; the commit path re-renders)
+;
+; The inversion that is the concurrency model: a LOCAL mutation renders here;
+; a FACT mutation renders everywhere, through the log. So N viewers converge
+; on one committed fact, and a dropped patch is replayable from the basis.
+;
+; This file holds the loop as PLAIN FUNCTIONS so it is testable with a bare
+; pid as the sink — no browser, no channel. `deflive` is the thin macro that
+; wraps these in a defserver.
+
+(ns live.socket
+  (:require [live.hiccup :as hiccup]
+            [live.diff :as diff]
+            [datom]
+            [datom.store-ets]
+            [auth]))
+
+;; ── the event vocabulary (closed, refused by name) ──────────────────
+;;
+;; An event term is DATA, drawn from a closed vocabulary — never a closure.
+;; This is the same discipline the contract handler uses: a view may be
+;; proposed by a model, so an event it declares must be inspectable and
+;; incapable of running arbitrary code. Three heads:
+;;
+;;   [:assign path source]   mutate THIS socket's locals (source may be a
+;;                           literal, or [:from field] read at fire time)
+;;   [:intent op payload]    request a FACT — authorized, then transacted
+;;   [:navigate target]      change this socket's route/params (locals-level)
+;;
+;; A list of two events (a vector of event terms) fires them in order — the
+;; "assign then intent" shape optimistic UI needs.
+
+(def ^:private event-heads #{:assign :intent :navigate})
+
+(defn event-term?
+  "Whether `t` is a single legal event term."
+  [t]
+  (and (vector? t) (> (count t) 0) (contains? event-heads (first t))))
+
+(defn validate-event
+  "Return `t` if it is a legal event term (or a vector of them), else throw
+   naming the offending head — the closed-vocabulary gate. A view's `:on-*`
+   value passes through here at expansion so an illegal event is refused
+   before it can reach a socket."
+  [t]
+  (cond
+    (event-term? t) t
+    ;; a vector of event terms: [[:assign …] [:intent …]]
+    (and (vector? t) (> (count t) 0) (every? event-term? t)) t
+    :else (throw (str "live: illegal event term " (pr-str t)
+                      " — an :on-* value must be [:assign …], [:intent …], "
+                      "[:navigate …], or a vector of those"))))
+
+;; ── locals: nested key-path addressing ──────────────────────────────
+;;
+;; `[:assign path source]` writes `path` (a key or a key-vector) into the
+;; locals map. A key-vector namespaces per-component state by the component's
+;; own key, so two rows never collide — the key path IS the namespace.
+
+(defn- assign-path [locals path value]
+  (if (vector? path)
+    (assoc-in locals path value)
+    (assoc locals path value)))
+
+(defn- resolve-source
+  "The value an :assign writes. A literal is itself; `[:from field]` is
+   resolved from `event-data` (the payload the client sends with the fire,
+   e.g. the DOM field value read at fire time)."
+  [source event-data]
+  (if (and (vector? source) (= :from (first source)))
+    (get event-data (second source))
+    source))
+
+;; ── rendering ───────────────────────────────────────────────────────
+
+(defn render
+  "Call the view with the current db values and locals, returning hiccup.
+   The view takes (shared-db session-db locals) — the explicit two-value
+   composition (PLAN-052 R7): each world read where it belongs."
+  [state]
+  ((:view state)
+   (datom/db (:shared state))
+   (if (:session state) (datom/db (:session state)) nil)
+   (:locals state)))
+
+(defn- push! [state msg]
+  (erlang/send (:sink state) msg)
+  state)
+
+;; ── mount ───────────────────────────────────────────────────────────
+
+(defn mount
+  "First paint. Render the view, push the full HTML, remember the tree.
+   `opts` = {:view :shared :session :locals :sink :auth}. Returns the
+   socket state map."
+  [opts]
+  (let [state (merge {:locals {}} opts)
+        tree (render state)]
+    (push! (assoc state :tree tree)
+           [:mount (hiccup/hiccup->html tree)])))
+
+;; ── a commit landed: re-project this viewer, ship minimal patches ───
+
+(defn on-commit
+  "The shared or session world moved. Re-render, diff against the last
+   tree, push the patch ops (only if non-empty), remember the new tree."
+  [state]
+  (let [next (render state)
+        ops (diff/diff (:tree state) next)]
+    (if (seq ops)
+      (push! (assoc state :tree next) [:patch ops])
+      (assoc state :tree next))))
+
+;; ── an event fired ──────────────────────────────────────────────────
+
+;; Authorization is PLUGGABLE, so the socket does not hardcode biscuit:
+;;   :auth nil                       -> allow (no gate; dev / trusted)
+;;   :auth {:fn (fn [op payload principal] -> {:verdict ...})}
+;;                                   -> call it (tests, custom policy engines)
+;;   :auth {:root pub :token biscuit ...}
+;;                                   -> the real offline biscuit decision
+;; Every path returns a decision map {:verdict :allow|:deny :why?}, so
+;; perform-intent treats them uniformly. A denied decision NEVER writes.
+(defn- authorize-intent
+  [auth-info op payload]
+  (cond
+    (nil? auth-info) {:verdict :allow}
+    (some? (:fn auth-info))
+      ((:fn auth-info) op payload (:principal auth-info))
+    :else
+      (auth/authorize (:root auth-info) (:token auth-info)
+                      (auth/context
+                        {:facts [["operation" (name op)]]
+                         :checks (or (:checks auth-info) [])
+                         :policies (or (:policies auth-info) [(auth/allow [])])}))))
+
+(defn- perform-intent
+  "Authorize (if :auth is set) then transact an intent. The intent's op is
+   looked up in the socket's :intents registry — a map of op → a fn
+   (shared-conn payload principal) → tx-or-nil. Returns {:ok state} on a
+   commit (or a no-op), or {:denied why} when authorization refuses.
+
+   The authority to perform lives HERE, not in the view: the view only
+   NAMED the intent. A denied intent NEVER reaches transact!."
+  [state op payload]
+  (let [auth-info (:auth state)
+        decision (authorize-intent auth-info op payload)]
+    (if (not= :allow (:verdict decision))
+      {:denied (:why decision)}
+      (let [performer (get (:intents state) op)]
+        (if (nil? performer)
+          (throw (str "live: no performer registered for intent " (pr-str op)
+                      " — register it in :intents"))
+          (let [principal (if auth-info (:principal auth-info) nil)
+                tx (performer (:shared state) payload principal)]
+            ;; a nil tx is a legitimate no-op (the performer validated and
+            ;; chose not to write); a tx is committed to the SHARED world,
+            ;; whose commit lands on on-commit and re-renders everyone.
+            (when (some? tx) (datom/transact! (:shared state) tx))
+            {:ok state}))))))
+
+(defn handle-event
+  "Apply one fired event. Returns the new socket state.
+
+   :assign  — mutate locals, re-render NOW (socket-local; no one else cares).
+   :intent  — authorize + transact SHARED; do NOT render here (the commit
+              path renders everyone). On denial, push [:denied why], no write.
+   :navigate — mutate locals (route/params), re-render now.
+
+   `event-data` is the payload the client sent with the fire (DOM field
+   values for [:from …] sources)."
+  ([state ev] (handle-event state ev {}))
+  ([state ev event-data]
+   (cond
+     ;; a vector of events: fold them in order (optimistic assign; then intent)
+     (and (vector? ev) (> (count ev) 0) (every? event-term? ev))
+       (reduce (fn [s e] (handle-event s e event-data)) state ev)
+
+     (= :assign (first ev))
+       (let [path (nth ev 1)
+             source (nth ev 2)
+             value (resolve-source source event-data)
+             state2 (assoc state :locals (assign-path (:locals state) path value))]
+         (on-commit state2))
+
+     (= :navigate (first ev))
+       (let [target (nth ev 1)
+             state2 (assoc state :locals (assoc (:locals state) :route target))]
+         (on-commit state2))
+
+     (= :intent (first ev))
+       (let [op (nth ev 1)
+             payload (if (> (count ev) 2) (nth ev 2) {})
+             result (perform-intent state op payload)]
+         (if (contains? result :denied)
+           (push! state [:denied (:denied result)])   ; NO render, NO write
+           (:ok result)))                              ; commit path renders
+
+     :else (throw (str "live: unknown event " (pr-str ev))))))
+
+;; ── session conn: the per-socket in-memory world ────────────────────
+
+(defn open-session
+  "Open a fresh in-memory (ETS) session conn with `schema`. Owned by the
+   calling process, so it dies when the socket does — self-cleaning, no
+   teardown. The socket's ephemeral-but-structured state (a cart, a wizard,
+   an undo stack) lives here as datoms, inheriting q/pull/as-of/watch."
+  [schema]
+  (datom/connect-with (datom.store-ets/open) schema))
+
+;; ── deflive: the socket, as a genuine gen_server ────────────────────
+;;
+;; `deflive` expands to a `defserver` — a real OTP process, one per viewer,
+;; that :observer and :sys recognise. It wraps the plain functions above so
+;; the LOOP is testable without a macro and the MACRO is only plumbing.
+;;
+;;   (deflive board-socket
+;;     :view    board                 ; (shared-db session-db locals) → hiccup
+;;     :intents {:create create-task} ; op → performer fn
+;;     :session task-ui-schema        ; opens an in-memory session conn (opt)
+;;     :listen  {:payload :basis})    ; datom listen opts (opt)
+;;
+;; init ctx = {:shared conn :sink pid :locals {…} :auth {…}}. The generated
+;; server:
+;;   - opens the session conn (if :session schema given), listens to both
+;;     worlds, mounts (first paint), and holds the socket state;
+;;   - on [:datom/tx …]/[:datom/changed …] (a commit) re-projects via
+;;     on-commit;
+;;   - on {:event ev data} (a browser event, as a call) applies handle-event.
+;;
+;; The MOUNT TRAP is closed by construction: init opens worlds and paints,
+;; but has no intent in scope — a write at mount is unrepresentable.
+
+(defmacro deflive [name & kvs]
+  (let [opts (apply hash-map kvs)
+        view (get opts :view)
+        intents (get opts :intents {})
+        session-schema (get opts :session)
+        listen-opts (get opts :listen {})]
+    `(defserver ~name
+       (init [ctx#]
+         (let [session# ~(if (nil? session-schema)
+                           nil
+                           `(open-session ~session-schema))
+               _# (datom/listen! (:shared ctx#) ~listen-opts)
+               _# (if (some? session#) (datom/listen! session# ~listen-opts) nil)
+               st# (mount {:view ~view
+                           :shared (:shared ctx#)
+                           :session session#
+                           :sink (:sink ctx#)
+                           :locals (or (:locals ctx#) {})
+                           :auth (:auth ctx#)
+                           :intents ~intents})]
+           (ok st#)))
+
+       ;; a commit landed (shared OR session) — re-project this viewer
+       (handle-info [:datom/tx _basis# _datoms#] [st#]
+         (noreply (on-commit st#)))
+       (handle-info [:datom/changed _basis# _attrs#] [st#]
+         (noreply (on-commit st#)))
+
+       ;; a browser event, delivered as a call so the client can await :ok
+       (handle-call [:event ev#] [_from# st#]
+         (reply :ok (handle-event st# ev#)))
+       (handle-call [:event ev# data#] [_from# st#]
+         (reply :ok (handle-event st# ev# data#)))
+
+       ;; introspection for tests
+       (handle-call [:state] [_from# st#] (reply st# st#)))))
+
+;; ── defview: mark a view fn, validating its event vocabulary ────────
+;;
+;; A view is just a fn `(shared-db session-db locals) → hiccup`, so `defview`
+;; expands to `defn`. It exists to NAME the role and to be the hook where a
+;; future static check walks the body's `:on-*` values through
+;; `validate-event` (the closed-vocabulary gate). For now it is a thin,
+;; honest alias — the validation runs at fire time in `handle-event`, and
+;; the static walk is a documented extension point, not a claimed feature.
+
+(defmacro defview [name params & body]
+  `(defn ~name ~params ~@body))

@@ -1,0 +1,207 @@
+; socket_test.bl — W3: the live socket loop, headless.
+;
+; The test socket's :sink is the test process itself, so every push! lands
+; in the mailbox and is asserted by receiving (the watch_test.bl pattern).
+; No browser, no channel — the whole server-side loop, deterministically.
+
+(ns live.socket.test
+  (:require [live.socket :as s] [datom] [datom.store-ets]))
+
+;; ── a shared world + a view + a performer, reused across tests ──────
+
+(defn- fresh-conn []
+  (let [c (datom/connect
+            [{:db/ident :task/slug :db/valueType :db.type/string
+              :db/unique :db.unique/identity}
+             {:db/ident :task/title :db/valueType :db.type/string}
+             {:db/ident :task/owner :db/valueType :db.type/string}])]
+    c))
+
+;; view: (shared-db session-db locals) → hiccup. Optionally owner-scoped.
+(defn- board [db _session locals]
+  (let [owner (:owner locals)
+        q (if (nil? owner)
+            '[:find ?slug ?title
+              :where [?e :task/slug ?slug] [?e :task/title ?title]]
+            ['(:find ?slug ?title
+               :where [?e :task/slug ?slug] [?e :task/title ?title]
+                      [?e :task/owner ?owner])])
+        rows (if (nil? owner)
+               (datom/q '[:find ?slug ?title
+                          :where [?e :task/slug ?slug] [?e :task/title ?title]] db)
+               (datom/q '[:find ?slug ?title
+                          :in $ ?owner
+                          :where [?e :task/slug ?slug] [?e :task/title ?title]
+                                 [?e :task/owner ?owner]] db owner))]
+    [:main {:data-draft (or (:draft locals) "")}
+     [:ul (for [t (sort rows)]
+            [:li {:key (first t)} (second t)])]]))
+
+(defn- create-task [conn payload _principal]
+  [{:db/id -1 :task/slug (:slug payload) :task/title (:title payload)
+    :task/owner (or (:owner payload) "nobody")}])
+
+(defn- drain
+  "Receive the next socket message, or :none after ms."
+  [ms]
+  (receive
+    [:mount html] [:mount html]
+    [:patch ops] [:patch ops]
+    [:denied why] [:denied why]
+    (after ms :none)))
+
+;; ── mount ───────────────────────────────────────────────────────────
+
+(deftest mount-paints-full-html
+  (let [conn (fresh-conn)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (s/mount {:view board :shared conn :sink (erlang/self) :intents {}})
+    (let [[tag html] (drain 200)]
+      (is (= :mount tag))
+      (is (includes? html "<li>First</li>")))))
+
+;; ── assign: a local change re-renders immediately ──────────────────
+
+(deftest assign-is-local-and-immediate
+  (let [conn (fresh-conn)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (let [st (s/mount {:view board :shared conn :sink (erlang/self) :intents {}})]
+      (drain 200)  ; consume mount
+      (s/handle-event st [:assign :draft "hello"] {})
+      (let [[tag ops] (drain 200)]
+        (is (= :patch tag))
+        ; exactly the draft attr changed, nothing else
+        (is (= [[:set-attr [] "data-draft" "hello"]] ops))))))
+
+;; ── from-source: a value read at fire time ─────────────────────────
+
+(deftest assign-from-event-data
+  (let [conn (fresh-conn)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (let [st (s/mount {:view board :shared conn :sink (erlang/self) :intents {}})]
+      (drain 200)
+      ; [:from :value] pulls from the event-data map the client sends
+      (s/handle-event st [:assign :draft [:from :value]] {:value "typed"})
+      (let [[_ ops] (drain 200)]
+        (is (= [[:set-attr [] "data-draft" "typed"]] ops))))))
+
+;; ── intent: commits SHARED, does not render here ───────────────────
+
+(deftest intent-commits-and-does-not-render-locally
+  (let [conn (fresh-conn)]
+    (let [st (s/mount {:view board :shared conn :sink (erlang/self)
+                       :intents {:create create-task}})]
+      (drain 200)  ; mount
+      ; an intent must NOT push a patch from handle-event itself
+      (s/handle-event st [:intent :create {:slug "b" :title "Second"}] {})
+      (is (= :none (drain 150)) "intent renders via the commit path, not inline")
+      ; but the shared world DID change
+      (is (= 1 (count (datom/q '[:find ?s :where [_ :task/slug ?s]] (datom/db conn))))))))
+
+;; ── intent → commit path re-renders with a minimal patch ───────────
+
+(deftest commit-path-emits-minimal-insert
+  (let [conn (fresh-conn)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (let [st (s/mount {:view board :shared conn :sink (erlang/self)
+                       :intents {:create create-task}})]
+      (drain 200)  ; mount
+      (let [st2 (s/handle-event st [:intent :create {:slug "b" :title "Second"}] {})]
+        ; simulate the datom commit landing → on-commit
+        (s/on-commit st2)
+        (let [[tag ops] (drain 200)]
+          (is (= :patch tag))
+          ; one keyed insert, not a re-render of the list
+          (is (= 1 (count ops)))
+          (is (= :insert (first (first ops)))))))))
+
+;; ── the deflive MACRO: a real gen_server ────────────────────────────
+
+(s/deflive board-socket
+  :view board
+  :intents {:create create-task})
+
+(deftest deflive-is-a-real-server
+  (let [conn (fresh-conn)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (let [sock (server-start-link board-socket {:shared conn :sink (erlang/self)})]
+      ; mount pushed on init
+      (let [[tag html] (drain 300)]
+        (is (= :mount tag))
+        (is (includes? html "First")))
+      ; fire an event as a call
+      (server-call sock [:event [:assign :draft "x"]])
+      (let [[tag ops] (drain 300)]
+        (is (= :patch tag))
+        (is (= [[:set-attr [] "data-draft" "x"]] ops)))
+      (server-stop sock))))
+
+;; ── auth: a DENIED intent never commits ────────────────────────────
+
+(deftest denied-intent-never-commits
+  (let [conn (fresh-conn)
+        ; a pluggable authorizer: deny :create for everyone
+        deny-create (fn [op _payload _principal]
+                      (if (= op :create)
+                        {:verdict :deny :why :not-allowed}
+                        {:verdict :allow}))
+        st (s/mount {:view board :shared conn :sink (erlang/self)
+                     :intents {:create create-task}
+                     :auth {:fn deny-create :principal "alice"}})]
+    (drain 200)  ; mount
+    (s/handle-event st [:intent :create {:slug "x" :title "Nope"}] {})
+    ; a [:denied …] is pushed, and the shared world is UNCHANGED
+    (let [[tag why] (drain 200)]
+      (is (= :denied tag))
+      (is (= :not-allowed why)))
+    (is (= 0 (count (datom/q '[:find ?s :where [_ :task/slug ?s]] (datom/db conn))))
+        "a denied intent must never reach transact!")))
+
+(deftest allowed-intent-commits
+  (let [conn (fresh-conn)
+        allow-all (fn [_op _payload _principal] {:verdict :allow})
+        st (s/mount {:view board :shared conn :sink (erlang/self)
+                     :intents {:create create-task}
+                     :auth {:fn allow-all :principal "alice"}})]
+    (drain 200)
+    (s/handle-event st [:intent :create {:slug "x" :title "Yes"}] {})
+    (is (= 1 (count (datom/q '[:find ?s :where [_ :task/slug ?s]] (datom/db conn))))
+        "an allowed intent commits")))
+
+;; ── two viewers converge on ONE write, through the log ──────────────
+
+(s/deflive convergent-socket
+  :view board
+  :intents {:create create-task}
+  :listen {})
+
+(deftest two-sockets-converge-on-one-write
+  (let [conn (fresh-conn)
+        me (erlang/self)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    ; two sockets, each sinking to a labelled collector so we can tell them apart
+    (let [collector (fn [label]
+                      (erlang/spawn
+                        (fn []
+                          (loop []
+                            (receive
+                              [:mount _] (recur)
+                              [:patch ops] (do (erlang/send me [label ops]) (recur))
+                              (after 2000 nil))))))
+          a (collector :a)
+          b (collector :b)
+          sa (server-start-link convergent-socket {:shared conn :sink a})
+          sb (server-start-link convergent-socket {:shared conn :sink b})]
+      (Process/sleep 50)
+      ; ONE write to the shared world
+      (datom/transact! conn [{:db/id -1 :task/slug "b" :task/title "Second"}])
+      (Process/sleep 100)
+      ; BOTH sockets should have pushed a patch inserting "b"
+      (let [got-a (receive [:a ops] ops (after 500 :none))
+            got-b (receive [:b ops] ops (after 500 :none))]
+        (is (not= :none got-a) "socket A re-rendered on the shared commit")
+        (is (not= :none got-b) "socket B re-rendered on the shared commit")
+        (is (= :insert (first (first got-a))))
+        (is (= :insert (first (first got-b)))))
+      (server-stop sa)
+      (server-stop sb))))
