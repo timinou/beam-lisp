@@ -39,7 +39,8 @@
 ; resolved string or int exactly as datom does.
 
 (ns auth.biscuit.datalog
-  (:require [auth.biscuit.codec :as codec]))
+  (:require [auth.biscuit.codec :as codec]
+            [auth.engine.expr :as expr]))
 
 ;; ── the default symbol table ────────────────────────────────────────
 ;;
@@ -204,19 +205,30 @@
 ;; it is a VALID one that any conformant verifier accepts, and simplicity
 ;; here means fewer ways to mis-encode a security token.
 
+(def default-symbol-index
+  "The inverse of default-symbols: string → reserved index. Strings the
+   spec already defines encode as their DEFAULT index — reusing them
+   keeps the custom table minimal and matches what biscuit-rust writes
+   (byte-compatible blocks, not merely equivalent ones)."
+  (into {} (map-indexed (fn [i s] [s i]) default-symbols)))
+
 (defn- intern-symbol
-  "Add `s` to the symbol table `state` if absent, returning
-   `[state index]`. The index is 1024 + position, the custom-symbol range."
+  "The symbol index for `s`, extending the custom table `state` only when
+   `s` is not a default symbol and not already interned. Returns
+   `[state index]`: default indices (< 1024) or 1024 + position."
   [state s]
-  (let [syms (:symbols state)
-        existing (loop [i 0]
-                   (cond (>= i (count syms)) nil
-                         (= (nth syms i) s) i
-                         :else (recur (+ i 1))))]
-    (if (some? existing)
-      [state (+ CUSTOM-BASE existing)]
-      [(assoc state :symbols (conj syms s))
-       (+ CUSTOM-BASE (count syms))])))
+  (let [default-idx (get default-symbol-index s)]
+    (if (some? default-idx)
+      [state default-idx]
+      (let [syms (:symbols state)
+            existing (loop [i 0]
+                       (cond (>= i (count syms)) nil
+                             (= (nth syms i) s) i
+                             :else (recur (+ i 1))))]
+        (if (some? existing)
+          [state (+ CUSTOM-BASE existing)]
+          [(assoc state :symbols (conj syms s))
+           (+ CUSTOM-BASE (count syms))])))))
 
 (defn- encode-string-term
   "Encode a string term: intern it, emit a Term with the string index
@@ -242,7 +254,7 @@
   [state term]
   (cond
     (string? term) (encode-string-term state term)
-    (integer? term) (encode-int-term state term)
+    (erlang/is_integer term) (encode-int-term state term)
     (= term true) [state (erlang/iolist_to_binary (codec/write-varint-field 6 1))]
     (= term false) [state (erlang/iolist_to_binary (codec/write-varint-field 6 0))]
     :else (throw (ex-info "cannot encode term kind for issuance" {:term term}))))
@@ -301,3 +313,289 @@
                           pred-msgs)]
     (erlang/iolist_to_binary
       (Enum/to_list (concat symbol-fields (list version-field) fact-fields)))))
+
+;; ── encoding rules, checks, expressions (for attenuation) ──────────
+;;
+;; Minting grants via facts; ATTENUATION narrows via checks, and checks
+;; carry queries with EXPRESSIONS (`check if time($t), $t < T`). This
+;; half of the wire encoder inverts decode-rule/decode-check/decode-op.
+;; Variable slots follow the spec rule — every slot must exceed
+;; 1023 + (count symbols) — with named vars ({"$t" as {:var "t"}})
+;; allocated deterministically in first-appearance order.
+
+(def unary-kind->idx
+  "The inverse of expr/unary-kinds — one source of truth for the enum."
+  (into {} (map (fn [p] [(second p) (first p)]) expr/unary-kinds)))
+
+(def binary-kind->idx
+  "The inverse of expr/binary-kinds."
+  (into {} (map (fn [p] [(second p) (first p)]) expr/binary-kinds)))
+
+(defn- walk-collect
+  "Collect [strings var-names] from authoring data, in encounter order.
+   Strings intern into the block's symbol table; named vars get slots."
+  [x acc]
+  (cond
+    (string? x)
+      [(conj (first acc) x) (second acc)]
+    (and (map? x) (contains? x :var) (string? (:var x)))
+      ;; the corpus interns a variable's NAME into the symbol table (for
+      ;; printing); its SLOT is separate. Collect into both.
+      [(conj (first acc) (:var x)) (conj (second acc) (:var x))]
+    (map? x)
+      (reduce (fn [a v] (walk-collect v a)) acc (vals x))
+    (or (vector? x) (erlang/is_list x))
+      (reduce (fn [a v] (walk-collect v a)) acc x)
+    :else acc))
+
+(defn- var-resolver
+  "A fn mapping a var (name string or explicit slot int) to its slot.
+   Slots start past 1023 + (count strings), per the spec; an unknown
+   NAME fails loud — a silently misnumbered variable in a check is a
+   security bug."
+  [strings var-names]
+  (let [base (+ CUSTOM-BASE (count (distinct strings)))
+        slots (into {} (map-indexed (fn [i n] [n (+ base i)])
+                                    (distinct var-names)))]
+    (fn [v]
+      (if (erlang/is_integer v)
+        v
+        (let [slot (get slots v)]
+          (if (nil? slot)
+            (throw (ex-info "unbound variable name in check" {:var v}))
+            slot))))))
+
+(defn- encode-term*
+  "encode-term plus the term kinds checks need: `{:var slot-or-name}`
+   (field 1) and `{:date unix}` (field 4). `resolve-var` maps named vars
+   to slots; explicit slots pass through."
+  [state resolve-var term]
+  (cond
+    (and (map? term) (contains? term :var))
+      [state (erlang/iolist_to_binary
+               (codec/write-varint-field 1 (resolve-var (:var term))))]
+    (and (map? term) (contains? term :date))
+      [state (erlang/iolist_to_binary
+               (codec/write-varint-field 4 (:date term)))]
+    (and (map? term) (contains? term :bytes))
+      [state (erlang/iolist_to_binary
+               (codec/write-len-field 5 (:bytes term)))]
+    (= term :null)
+      [state (erlang/iolist_to_binary
+               (codec/write-varint-field 8 1))]
+    (and (map? term) (contains? term :set))
+      (let [result (reduce (fn [acc t]
+                             (let [tp (encode-term* (first acc) resolve-var t)]
+                               [(first tp) (conj (second acc) (second tp))]))
+                           [state []]
+                           (:set term))
+            st (first result)
+            term-fields (mapv (fn [tb] (codec/write-len-field 1 tb)) (second result))]
+        [st (erlang/iolist_to_binary
+              (codec/write-len-field 7
+                (erlang/iolist_to_binary (Enum/to_list term-fields))))])
+    :else (encode-term state term)))
+
+(defn- pred->tuple
+  "A predicate from either authoring shape: the decoded map
+   `{:name :terms}` or the fact-style tuple `[name term…]`."
+  [p]
+  (if (map? p) (into [(:name p)] (:terms p)) p))
+
+(defn- encode-predicate*
+  [state resolve-var p]
+  (let [tuple (pred->tuple p)
+        name-pair (intern-symbol state (first tuple))
+        st1 (first name-pair)
+        name-idx (second name-pair)
+        result (reduce (fn [acc term]
+                         (let [tp (encode-term* (first acc) resolve-var term)]
+                           [(first tp) (conj (second acc) (second tp))]))
+                       [st1 []]
+                       (into [] (rest tuple)))
+        st2 (first result)
+        name-field (codec/write-varint-field 1 name-idx)
+        term-fields (mapv (fn [tb] (codec/write-len-field 2 tb)) (second result))]
+    [st2 (erlang/iolist_to_binary
+           (Enum/to_list (concat (list name-field) term-fields)))]))
+
+(defn- encode-op
+  "One Expression op: `{:op :value :term t}` (field 1, a Term),
+   `{:op :unary :kind kw}` (field 2) or `{:op :binary :kind kw}`
+   (field 3). Unknown kinds fail loud via the inverse tables."
+  [state resolve-var op]
+  (let [kind (:op op)]
+    (cond
+      (= kind :value)
+        (let [tp (encode-term* state resolve-var (:term op))]
+          [(first tp)
+           (erlang/iolist_to_binary (codec/write-len-field 1 (second tp)))])
+      (= kind :unary)
+        (let [idx (get unary-kind->idx (:kind op))]
+          (if (nil? idx) (throw (ex-info "unknown unary op kind" {:op op})))
+          [state (erlang/iolist_to_binary
+                   (codec/write-len-field 2
+                     (erlang/iolist_to_binary (codec/write-varint-field 1 idx))))])
+      (= kind :binary)
+        (let [idx (get binary-kind->idx (:kind op))]
+          (if (nil? idx) (throw (ex-info "unknown binary op kind" {:op op})))
+          [state (erlang/iolist_to_binary
+                   (codec/write-len-field 3
+                     (erlang/iolist_to_binary (codec/write-varint-field 1 idx))))])
+      :else (throw (ex-info "unknown expression op" {:op op})))))
+
+(defn encode-expression
+  "Encode an RPN op vector as an Expression message (repeated Op, field
+   1), threading the symbol-table state. Raw BINARY entries pass through
+   untouched — the round-trip path, where decoded rules keep their exprs
+   as raw bytes."
+  [state resolve-var ops-or-bytes]
+  (if (erlang/is_binary ops-or-bytes)
+    [state ops-or-bytes]
+    (let [result (reduce (fn [acc op]
+                           (let [op-p (encode-op (first acc) resolve-var op)]
+                             [(first op-p) (conj (second acc) (second op-p))]))
+                         [state []]
+                         ops-or-bytes)
+          st (first result)
+          op-fields (mapv (fn [ob] (codec/write-len-field 1 ob)) (second result))]
+      [st (erlang/iolist_to_binary (Enum/to_list op-fields))])))
+
+(defn encode-rule
+  "Encode a rule `{:head :body :exprs}` — head defaults to `query()`, the
+   check-query head; body predicates take either authoring shape; exprs
+   are op vectors or raw bytes. Threads the symbol state."
+  [state resolve-var rule]
+  (let [head (or (:head rule) ["query"])
+        hp (encode-predicate* state resolve-var head)
+        st1 (first hp)
+        body-result (reduce (fn [acc p]
+                              (let [pp (encode-predicate* (first acc) resolve-var p)]
+                                [(first pp) (conj (second acc) (second pp))]))
+                            [st1 []]
+                            (or (:body rule) []))
+        st2 (first body-result)
+        expr-result (reduce (fn [acc e]
+                              (let [ep (encode-expression (first acc) resolve-var e)]
+                                [(first ep) (conj (second acc) (second ep))]))
+                            [st2 []]
+                            (or (:exprs rule) []))
+        st3 (first expr-result)
+        head-field (codec/write-len-field 1 (second hp))
+        body-fields (mapv (fn [pb] (codec/write-len-field 2 pb)) (second body-result))
+        expr-fields (mapv (fn [eb] (codec/write-len-field 3 eb)) (second expr-result))]
+    [st3 (erlang/iolist_to_binary
+           (Enum/to_list (concat (list head-field) body-fields expr-fields)))]))
+
+(defn encode-check
+  "Encode a check `{:kind :queries}` into Check bytes: queries (field 1,
+   repeated Rule) then kind (field 2, elided when 0 — protobuf default)."
+  [check]
+  (let [pair (reduce (fn [acc q]
+                       (let [collected (walk-collect (concat (or (:body q) [])
+                                                             (or (:exprs q) []))
+                                                     [(first (first acc)) (second (first acc))])
+                             strings (first collected)
+                             vars (second collected)]
+                         [[strings vars] (second acc)]))
+                     [[[] []] []]
+                     (:queries check))
+        strings (vec (distinct (filter (fn [s] (nil? (get default-symbol-index s)))
+                                       (first (first pair)))))
+        var-names (second (first pair))
+        resolve-var (var-resolver strings var-names)
+        ;; the symbol table's strings are known UP FRONT (var slots
+        ;; depend on its final size), so seed the state with all of them
+        state {:symbols (vec (distinct (filter (fn [s] (nil? (get default-symbol-index s)))
+                                                strings)))}
+        result (reduce (fn [acc q]
+                         (let [rp (encode-rule (first acc) resolve-var q)]
+                           [(first rp) (conj (second acc) (second rp))]))
+                       [state []]
+                       (:queries check))
+        query-fields (mapv (fn [rb] (codec/write-len-field 1 rb)) (second result))
+        kind (:kind check)
+        kind-field (if (or (nil? kind) (= kind 0)) []
+                     [(codec/write-varint-field 2 kind)])]
+    (erlang/iolist_to_binary
+      (Enum/to_list (concat query-fields kind-field)))))
+
+(defn encode-block*
+  "The general block encoder: `{:facts :rules :checks}` (all optional).
+   Fields emit in schema order — symbols(1), context(2, when present),
+   version(3), facts(4), rules(5), checks(6). `encode-block` remains the
+   facts-only fast path for minting; this is the attenuation path.
+
+   Facts are tuples; rules take `encode-rule`'s shapes; checks take
+   `encode-check`'s. Facts and rules share one symbol state; each CHECK
+   owns its table by the same walk-collect discipline — for blocks WE
+   author, one walk over the whole block keeps the table minimal."
+  [spec]
+  (let [facts (or (:facts spec) [])
+        rules (or (:rules spec) [])
+        checks (or (:checks spec) [])
+        ;; collect strings + var names across EVERYTHING, so the symbol
+        ;; table is final before var slots are computed
+        collected (reduce (fn [acc x] (walk-collect x acc)) [[] []]
+                    (concat facts
+                            (mapcat (fn [r] (concat (or (:body r) []) (or (:exprs r) [])))
+                                    rules)
+                            (mapcat (fn [c] (mapcat (fn [q] (concat (or (:body q) []) (or (:exprs q) [])))
+                                                    (:queries c)))
+                                    checks)))
+        ;; an explicit :symbols seed (round-trip: the decoded block's own
+        ;; table) wins — var NAMES are not recoverable from numeric slots
+        strings (or (:symbols spec)
+                    (vec (distinct (filter (fn [s] (nil? (get default-symbol-index s)))
+                                           (first collected)))))
+        resolve-var (var-resolver strings (second collected))
+        ;; the table is KNOWN up front — seed it, so encounter order
+        ;; during encoding cannot reorder it (byte-stability)
+        fact-result (reduce (fn [acc tuple]
+                              (let [pp (encode-predicate* (first acc) resolve-var tuple)]
+                                [(first pp) (conj (second acc) (second pp))]))
+                            [{:symbols strings} []]
+                            facts)
+        st1 (first fact-result)
+        ;; encode rules
+        rule-result (reduce (fn [acc r]
+                              (let [rp (encode-rule (first acc) resolve-var r)]
+                                [(first rp) (conj (second acc) (second rp))]))
+                            [st1 []]
+                            rules)
+        st2 (first rule-result)
+        ;; checks: predicates thread st2's table; walk-collect already
+        ;; interned their strings into `strings`, and intern-symbol is
+        ;; idempotent — so encode them through encode-rule with the
+        ;; SHARED state rather than encode-check's fresh one
+        check-result
+        (reduce (fn [acc c]
+                  (let [qr (reduce (fn [acc2 q]
+                                     (let [rp (encode-rule (first acc2) resolve-var q)]
+                                       [(first rp) (conj (second acc2) (second rp))]))
+                                   [(first acc) []]
+                                   (:queries c))
+                        st3 (first qr)
+                        query-fields (mapv (fn [rb] (codec/write-len-field 1 rb)) (second qr))
+                        kind (:kind c)
+                        kind-field (if (or (nil? kind) (= kind 0)) []
+                                     [(codec/write-varint-field 2 kind)])
+                        check-bytes (erlang/iolist_to_binary
+                                      (Enum/to_list (concat query-fields kind-field)))]
+                    [st3 (conj (second acc) check-bytes)]))
+                [st2 []]
+                checks)
+        st3 (first check-result)
+        symbol-fields (mapv (fn [s] (codec/write-len-field 1 s)) (:symbols st3))
+        context (:context spec)
+        context-field (if (nil? context) [] [(codec/write-len-field 2 context)])
+        version-field (codec/write-varint-field 3 (or (:version spec) 3))
+        fact-fields (mapv (fn [pm]
+                            (codec/write-len-field 4
+                              (erlang/iolist_to_binary (codec/write-len-field 1 pm))))
+                          (second fact-result))
+        rule-fields (mapv (fn [rb] (codec/write-len-field 5 rb)) (second rule-result))
+        check-fields (mapv (fn [cb] (codec/write-len-field 6 cb)) (second check-result))]
+    (erlang/iolist_to_binary
+      (Enum/to_list (concat symbol-fields context-field (list version-field)
+                            fact-fields rule-fields check-fields)))))
