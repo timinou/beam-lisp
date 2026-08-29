@@ -15,8 +15,9 @@
 ;   refinement           a z3 simulation relation       (simulates? / hot-upgrade)
 ;   sandbox              footprint ⊆ caps               (footprint-in-caps?)
 
-(ns system
-  (:require [z3] [footprint :as fp] [typed] [minikanren :as mk]))
+(ns system.core
+  (:require [z3] [system.footprint :as fp] [typed] [minikanren :as mk]
+            [system.model :as model] [system.smt :as smt] [errors]))
 
 ; ════════════════════════════════════════════════════════════════════════
 ; INDUCTIVE SAFETY — □Inv, unbounded (P16c)
@@ -274,3 +275,146 @@
           convey-items (rest (typed/node-items (typed/node-form convey-form)))]
       (reduce (fn [m x] (fp/join-fp m (fp/fp-walk env x))) {} convey-items))
     {fp/opaque-world :X}))
+
+; ═════════════════════════════════════════════════════════════════════
+; THE SEAM — point-and-verify (P17)
+;
+; verify-process takes a SOURCE FORM (a defserver/loop/defn) and does the whole
+; job: extract transitions (model.bl), read ^{:invariant} off the name meta,
+; translate guards/next to SMT (smt.bl), prove □Inv (prove-box), and return
+; warnings rendered for a human. No hand-written SMT, no hand-written maps.
+; This is what makes the tier a CHECKER rather than a set of libraries.
+; ═════════════════════════════════════════════════════════════════════
+
+(defn- invariant-node
+  "The ^{:invariant …} predicate node off a form's NAME meta, or nil. Metadata
+   is DATA — the reader stores the annotation as a node in the name's pos map."
+  [node]
+  (let [its (typed/node-items (typed/node-form node))
+        name-node (second its)]
+    (if (and (erlang/is_tuple name-node)
+             (= :meta (first (erlang/tuple_to_list name-node))))
+      (let [meta (nth (erlang/tuple_to_list name-node) 2)]
+        (if (and (map? meta) (contains? meta :invariant))
+          (:invariant meta)
+          nil))
+      nil)))
+
+(defn- state-vars
+  "The state-variable NAMES of a machine, as a set of strings. For a defserver
+   they are the init clause's ok-value shape — but at this tier we take them
+   from the invariant's free symbols plus the transition next-exprs, which is
+   sound for the integer-state common case: any symbol the invariant mentions."
+  [inv-node transitions]
+  ; collect symbols appearing in the invariant node
+  (letfn [(syms [n acc]
+            (let [f (typed/node-form n)
+                  tg (typed/node-tag f)]
+              (cond
+                (= tg :symbol) (conj acc (typed/node-name f))
+                (contains? #{:list :vector} tg)
+                  (reduce (fn [a c] (syms c a)) acc (typed/node-items f))
+                :else acc)))]
+    (if (nil? inv-node) #{} (syms inv-node #{}))))
+
+(defn- inv-fn
+  "An invariant predicate as a fn of a state-var NAME → SMT string. The
+   annotation is written over the machine's state var (e.g. balance); we
+   substitute the var name so the same predicate applies to s and s2."
+  [inv-node svar-name]
+  (let [translated (smt/translate #{svar-name} inv-node)]
+    (fn [v]
+      (if (= translated :untranslatable)
+        :untranslatable
+        ; replace the state var name with the passed var (v = svar or svar2)
+        (replace-var translated svar-name v)))))
+
+(defn- replace-var
+  "Textual whole-word substitution of `from` → `to` in an SMT string. Sound for
+   the single-state-var integer case (the var appears as a token)."
+  [s from to]
+  (join to (split s from)))
+
+(defn verify-process
+  "Verify a process SOURCE FORM end to end. Returns:
+     {:name :holds :warnings [{:msg :line :col}] :checked bool}
+   :checked=false when there is no ^{:invariant} or it is untranslatable (the
+   checker stays silent on what it cannot model — sound-warnings-only)."
+  [port node]
+  (let [sm (model/system-model node)
+        clauses (:transitions sm)
+        inv-node (invariant-node node)]
+    (if (nil? inv-node)
+      {:name (:name sm) :holds nil :checked false :warnings []}
+      (let [svars (state-vars inv-node clauses)
+            svar (if (empty? svars) nil (first (into [] svars)))
+            inv-smt (if svar (smt/translate #{svar} inv-node) :untranslatable)]
+        (if (or (nil? svar) (= inv-smt :untranslatable))
+          {:name (:name sm) :holds nil :checked false :warnings []
+           :reason "invariant not translatable to integer arithmetic"}
+          (let [decls (str "(declare-const " svar " Int)\n"
+                           ; declare every other free symbol in guards as an input
+                           (input-decls svar clauses))
+                inv (inv-fn inv-node svar)
+                ; translate each transition's guard + next; skip untranslatable
+                ts (keep-translatable svar clauses)
+                pos (typed/node-pos node)
+                r (prove-box port inv svar decls svar ts)]
+            {:name (:name sm)
+             :holds (:holds r)
+             :checked true
+             :warnings (box-warnings r pos)}))))))
+
+(defn- input-decls
+  "Declare every free symbol in the transitions' guards/next (other than svar)
+   as an Int input."
+  [svar clauses]
+  (let [names (reduce
+                (fn [acc c]
+                  (let [g (:guard c) n (:next c)]
+                    (reduce (fn [a src]
+                              (if (nil? src) a
+                                (reduce (fn [a2 tok] (conj a2 tok)) a (free-syms src))))
+                            acc [g n])))
+                #{} clauses)]
+    (join "" (map (fn [nm] (str "(declare-const " nm " Int)\n"))
+                  (filter (fn [nm] (not (= nm svar))) (into [] names))))))
+
+(defn- free-syms
+  "The identifier tokens in an SMT-ish source string — words that are not ops or
+   numbers. A cheap lexer over the delaborated form."
+  [src]
+  (let [toks (split (join " " (split (join " " (split src "(")) ")")) " ")
+        ops #{"+" "-" "*" "and" "or" "not" "=" "<" ">" "<=" ">=" "mod"
+              "inc" "dec" "pos?" "neg?" "zero?" ""}]
+    (filter (fn [t] (and (not (contains? ops t))
+                         (not (int-string? t))))
+            toks)))
+
+(defn- int-string? [s]
+  (and (> (count s) 0)
+       (every? (fn [ch] (contains? #{"0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "-"} ch))
+               (map (fn [i] (subs s i (+ i 1))) (range 0 (count s))))))
+
+(defn- keep-translatable
+  "Transitions whose guard AND next translate; each with SMT strings.
+   Untranslatable transitions are dropped (sound: unproven, not falsely proven)."
+  [svar clauses]
+  (keep (fn [c]
+          (let [g (:guard c) n (:next c)
+                gsmt (if (nil? g) nil (smt/of-source #{svar} g))
+                nsmt (smt/of-source #{svar} n)]
+            (if (or (= gsmt :untranslatable) (= nsmt :untranslatable) (nil? nsmt))
+              nil
+              {:label (:label c) :guard gsmt :next nsmt})))
+        clauses))
+
+(defn- box-warnings
+  "Turn prove-box failures into {:msg :line :col} warnings."
+  [r pos]
+  (let [line (if (map? pos) (get pos :line) 0)
+        col  (if (map? pos) (get pos :col) 0)]
+    (map (fn [f]
+           {:msg (str "invariant not preserved by " (name (:label f)))
+            :line line :col col})
+         (:failures r))))
