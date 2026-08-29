@@ -89,3 +89,26 @@ Then, over the extracted graph (finite instance n ∈ 0..3):
 ## Files
 - `extract.bl` — the extractor (5 surface forms → normalized clauses).
 - `run.bl` — the three-claim driver (PASS).
+
+---
+
+# P16c — inductive invariant: □Inv, unbounded (PASS)
+
+The leap from P16a's finite BFS to PROOF. z3 discharges the Hoare triple
+`Inv(s) ∧ guard ∧ s'=next(s) ⊢ Inv(s')` for EVERY state and EVERY input —
+unbounded. Bank account, invariant `balance ≥ 0`:
+
+- **□(balance ≥ 0) proven** — init establishes it; deposit and (guarded)
+  withdraw each preserve it for every amount. No bound on state or input.
+- **Bug B1** (unguarded withdraw) → z3 returns the concrete witness
+  `balance=0, amt=1 → balance2=-1`. Not "unsound" — the exact overdrawing state.
+- **Bug B2** (withdraw allows amt<0) → honestly reported as NOT breaking
+  `balance≥0` (a negative withdraw raises the balance). The amt≥0 bug needs a
+  different invariant — P16d's abduction target. The checker invents no failure.
+
+Encoding: assert the triple's NEGATION, check-sat. unsat ⟹ preserved. beam-lisp
+prefix source is already valid SMT-LIB integer arithmetic, so extracted
+transition → proof obligation is near-identity. Direct extension of MVP-C
+(z3.bl): rewrite-equivalence there, state-invariant preservation here, same port.
+
+Files: `inductive.bl` (preserves?/establishes?/prove-box), `run_inductive.bl`.
