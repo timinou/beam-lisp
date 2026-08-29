@@ -144,3 +144,67 @@ priv/*.bl compile into ebin at build; a prelude ns (errors, typed) or a lazily
 required ns edit needs `mix compile.beam_lisp` (and MIX_ENV=test for the suite)
 before the direct-elixir harness sees it. Learned the hard way when a delaborate
 edit appeared inert.
+
+---
+
+# P19 continuation — sum types, gfp, clause facts, synthesis (2026-08-29)
+
+Built out the whole remaining PLAN-051 ladder. Five capabilities, each graduated
+as tests + a demo, all through the checker.
+
+## R1a/R1b — sum types are shapes (one unified scheme)
+The tag is structural, not a reserved key. A variant value is read by shape:
+`:paused` (nullary arm, the tag is the keyword), `{:on 7}` (payload arm, the key
+is the tag). A field holding either is a sum type; the enum (R1a) is the
+all-nullary special case. Sum-vs-product falls out of field-shape heterogeneity.
+- z3 datatype: `(declare-datatypes () ((E_mode E_mode-paused (E_mode-on (E_mode-on.val Int)))))`.
+  No-junk axiom fences the field to exactly its arms — no phase=99 leak an Int allows.
+- Discriminate/access are ordinary bl map ops that ALSO translate: `(= x :paused)`
+  → nullary test, `(some? (:on x))`/`(is? (:on x))` → `((_ is E_mode-on) x)`,
+  `(:on x)` → `(E_mode-on.val x)`. An invariant evaluates as bl AND verifies as z3.
+- Root fix: RT.get is now nil-safe on non-associative values (Clojure-compat) so
+  `(:on :paused)` is nil, making the discriminant total in plain bl. `is?` added.
+- Constructors excluded from z3 inputs; an input feeding a variant field is a
+  payload scalar (default Int), never the datatype (two false-positive bugs fixed).
+- Demos 13 (enum protocol + datalog phase graph), 19 (payload dimmer).
+
+## R2 — the greatest-fixpoint primitive (system.gfp)
+The dual of datom's least-fixpoint recursion: seed full, shrink to the largest
+stable set. One driver hosts Houdini discovery (z3 decision), CTL safe-regions
+(pure relation), bisimulation/minimization (structural). gfp + gfp-delta
+(semi-naive, counts checks) + gfp-explained (provenance log). Ready-made
+safe-region + bisimulation wrappers over a transition system. Demo 20.
+Soundness obligation (survives? monotone in the set) documented, not checked.
+
+## R4 — clause topology as datom facts (system.facts)
+model.bl's clauses projected into datom facts so the STRUCTURAL invariants are
+datalog queries, not hand-walks (engine split: datom owns structure). handled-
+labels / always-fireable (unguarded = total handler) / guarded-only (partial) /
+guard-preconditions (the precondition spec read from :when, not annotated).
+Dependency-injected like the coverage helpers. z3 never runs. Demo 21.
+
+## R5 — capacity synthesis (the verifier backwards)
+verify-capacity CHECKS an annotated (count c ≤ k); synthesize-capacity DISCOVERS
+the smallest inductive k. k-inductiveness is monotone, so the smallest inductive
+k is the exact capacity. Guarded queue → synthesized 5; unguarded → honestly
+:unbounded (never a wrong number). The annotation becomes an output. Demo 22.
+
+## Also: the string-round-trip smell + docs
+- model.bl clauses now carry reader NODES; the SMT path translates them directly
+  (no delaborate→re-read round-trip — the source of the earlier quoting bug).
+  Dead single-var string helpers deleted (inv-fn/replace-var/parse1/keep-
+  translatable/input-decls).
+- The demo/test defserver-as-STRING is NOT the smell: `quote` yields a
+  position-less scalar (no file:line:col, name→content-hash), so read_string is
+  the only source of the position-bearing reader nodes the checker needs.
+- Docs rewritten timeless per docs/AGENTS.md (how-it-is, not what-was):
+  how-state-picks-its-theory.bl.md, sum-types-are-shapes.bl.md.
+
+## Regression
+Non-auth suite: **680 tests / 1833 assertions / 0F 0E** (P19 start 647/1760).
+All 22 examples/system demos run clean. New system tests: gfp_test (9t), facts_
+test (5t), seam_test grew to 40t/105a.
+
+## Commit chain (P19 cont)
+9f5d08b(is?/nil-safe get) → 342011b(R1b) → b573316(R2 gfp) → 451bc23(R4 facts)
+→ af2c7c7(R5 synth). Prior R1a: 0451a8e.
