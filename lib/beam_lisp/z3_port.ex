@@ -16,10 +16,30 @@ defmodule BeamLisp.Z3Port do
 
   @timeout 10_000
 
-  @doc "Start z3 reading SMT-LIB from stdin. Raises if z3 is absent."
+  @doc """
+  Start z3 reading SMT-LIB from stdin.
+
+  The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the
+  pinned binary fetched by `mix beam_lisp.z3.fetch` — never the PATH:
+  what proves your rules is the artifact the repo pinned, not whatever
+  a shell happens to resolve. Raises with the remedy when absent.
+  """
   def open do
-    exe = System.find_executable("z3") || raise "z3 not on PATH"
+    exe = bundled_exe()
+
+    unless File.exists?(exe) do
+      raise """
+      bundled z3 missing at #{exe}
+      run: mix beam_lisp.z3.fetch\
+      """
+    end
+
     Port.open({:spawn_executable, exe}, [:binary, :stream, :use_stdio, args: ["-in"]])
+  end
+
+  defp bundled_exe do
+    exe = if match?({:win32, _}, :os.type()), do: "z3.exe", else: "z3"
+    Path.join([:code.priv_dir(:beam_lisp) |> to_string(), "z3", "bin", exe])
   end
 
   @doc """
