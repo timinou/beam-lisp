@@ -219,7 +219,8 @@ already ships (`exact-guarantees` vs `approximate-guarantees`).
   align: (left, left, center),
   table.header([*rung*], [*state model → what it buys*], [*lift*]),
   [1 · multi-var], [tuple of ints; relational invariants (`balance ≥ reserved`).
-    Rate limiters, pools, any coupled counters. #term[Proven above.]], [small],
+    Rate limiters, pools, any coupled counters. #term[Shipped] — live in
+    `verify-process`, demo 10, tests green.], [small],
   [2 · records], [product of typed fields (int + bool + …); mode/flag machines
     (`frozen ⇒ balance = 0`). Projection: each field its own z3 sort — the
     lattice already knows the sorts], [medium],
@@ -304,14 +305,21 @@ surface — here is what will exist when the plan is done:
 
 = Where it stands
 
-Two claims, both proven with runnable spikes, not asserted: the machinery
-generalizes to multi-variable relational invariants (Rung 1, `spike_multivar`),
-and invariants can be #term[discovered from nothing] via a Houdini fixpoint over
-the existing abduce vocabulary (`spike_discover`). The lift to Rungs 2–4 is
-type-directed SMT translation — consulting the tag lattice for each state var's
-sort instead of assuming `Int`. Nothing here is a new engine; all of it is a wire
-between two phases that were, in retrospect, built to be connected. That is the
-sense in which most of the work was already done — and the sense in which the way
-it was done reaches further than the original proposal: a relation that synthesizes,
+Rung 1 is no longer a spike — it is #term[shipped]: `verify-process` now handles N
+state variables jointly, the reservation account with its relational invariant
+`balance ≥ reserved` proves end-to-end through the real checker, the
+reservation-ignoring withdraw is caught, and the single-variable seam is
+unchanged (N=1 is one param in the `define-fun`). `examples/system/10_multivar_invariant.bl`
+demonstrates it; the seam tests gain two cases; the non-auth suite stays green at
+637 tests / 1736 assertions / 0 failures.
+
+The second claim — invariants #term[discovered from nothing] via a Houdini
+fixpoint over the existing abduce vocabulary — is proven in `spike_discover` and
+filed as `p18-discover` for graduation. The lift to Rungs 2–4 is type-directed
+SMT translation: consulting the tag lattice for each state var's sort instead of
+assuming `Int`. Nothing here is a new engine; all of it is a wire between two
+phases that were, in retrospect, built to be connected. That is the sense in
+which most of the work was already done — and the sense in which the way it was
+done reaches further than the original proposal: a relation that synthesizes,
 four engines that compose, and an invariant that no longer needs a human to state
 it.
