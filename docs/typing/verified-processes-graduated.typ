@@ -196,15 +196,81 @@ Two rough edges the prototype README flagged, now fixed in the shipped modules:
   bounded body footprint.
 ]
 
+= The seam: point-and-verify (P17)
+
+The graduation above left the tier as libraries you hand-fed: every test wrote
+the transition maps and the SMT strings by hand. P17 closes that seam. The
+modules are now one package (`priv/system/`, namespace `system.*`), and one
+function does the whole job.
+
+#idea(title: "Annotate a server, it gets verified")[
+  ```clojure
+  (defserver ^{:invariant (>= balance 0)} account
+    (init [balance] (ok balance))
+    (handle-call [:deposit amt]  [_ balance] :when (>= amt 0)
+      (reply :ok (+ balance amt)))
+    (handle-call [:withdraw amt] [_ balance] :when (and (>= amt 0) (>= balance amt))
+      (reply :ok (- balance amt))))
+
+  (system/verify-process port (read account))
+  ;; → {:name "account" :checked true :holds true :warnings ()}
+  ```
+
+  The only thing that makes this ordinary server verifiable is the
+  `^{:invariant}` on its name. `verify-process` extracts the transitions, reads
+  the annotation (metadata is data), translates the guards to SMT (`system.smt`,
+  which desugars `inc`→`+1`, `pos?`→`>0`, and flags anything it cannot model
+  rather than emitting a false proof), proves `□Inv`, and returns the verdict.
+]
+
+Remove the withdraw guard and the checker renders the failure exactly like every
+other beam-lisp warning — `file:line:col`, the source line, a caret:
+
+#ran("mix beam_lisp.run --path priv examples/system/09_point_and_verify.bl")[
+  ```
+  account.bl:1:1: invariant not preserved by withdraw
+    1 │ (defserver ^{:invariant (>= balance 0)} account
+      │ ^
+  ```
+]
+
+And the two structural guarantees the earlier scorecard listed but had not built
+are now real. Message coverage is the headline one — the check a specification
+without an implementation structurally cannot make:
+
+#ran("examples/system/09_point_and_verify.bl")[
+  ```
+  the server handles:  #{:deposit :withdraw}
+  a caller sends :deposit, :withdraw, and :close …
+  unhandled (latent FunctionClauseError): (:close)
+  ```
+]
+
+#verified[
+  A message sent to the server that it does not handle is a latent
+  `FunctionClauseError`, found from the whole call graph by a join of the
+  senders (`:call/*` datoms) against the handled labels. Dispatch determinism is
+  its z3 companion: two same-label clauses whose guards can hold at once are a
+  nondeterministic dispatch, and z3 finds the overlap. Both ship in
+  `system.core`, both tested.
+]
+
+The state graph also graduated to the repo's own relation algebra: `:~step` is a
+`defrelation` (a computed relation registered in the datom catalog), so
+reachability is a fixpoint over it and the counterexample is a backward path
+query — the model as a queryable view, not a bespoke search.
+
 = Where it stands
 
-The system-model tier is graduated: four `priv/` modules, 45 test assertions
-green, eight runnable demos, one unified effect model, and the measured numbers
-above. Everything runs on the bundled z3 with no JVM. The one honest debt is
-external — the pre-existing `auth.*` breakage — and it is out of this tier's
-scope. The next natural steps, none blocking: the `:~step` computed relation as
-a full `defrelation` over the datom engine (the model as a queryable view), and
-the TLA#super[+] export for anyone wanting a TLC second opinion on liveness.
+The system-model tier is graduated and integrated: one package (`priv/system/`,
+five modules under `system.*`), 65 test assertions green across model, guarantee
+engine, and seam, ten runnable demos, one unified effect model, a
+point-and-verify checker that reads `^{:invariant}` off an ordinary server, and
+the measured numbers above. Everything runs on the bundled z3 with no JVM. The
+one honest debt is external — the pre-existing `auth.*` breakage — and it is out
+of this tier's scope. What remains is depth, not gaps: richer state models
+(beyond single-integer state) for `verify-process`, and wiring `:~step` into the
+full query planner so reachability is a plain `datom/q` rather than a helper.
 
 #v(1em)
 #line(length: 100%, stroke: 0.4pt + rule-hair)
