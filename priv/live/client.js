@@ -110,13 +110,23 @@
     return x && typeof x === "object" && !Array.isArray(x);
   }
 
+  // Set one attribute, translating the reserved keys the same way the server
+  // renderer (live/hiccup render-attr) does — this is what keeps a rendered
+  // subtree and a patched attribute in the SAME namespace:
+  //   :key       -> data-key
+  //   :on-EVENT  -> data-ev-EVENT, VALUE is the JSON event term (so the fire
+  //                handler relays exactly what the view now declares; this is
+  //                what makes a changed intent — e.g. a new room — take effect)
+  // For `render` the value `v` is the raw hiccup value (an array term); for a
+  // patch (`set-attr`) it arrives already JSON-encoded as a string. `evJson`
+  // normalizes both to the JSON string the attribute must hold.
   function setAttr(el, k, v) {
     if (k === "key") {
       el.setAttribute("data-key", String(v));
       return;
     }
     if (k.indexOf("on-") === 0) {
-      el.setAttribute("data-ev-" + k.slice(3), "");
+      el.setAttribute("data-ev-" + k.slice(3), evJson(v));
       return;
     }
     if (v === true) el.setAttribute(k, "");
@@ -124,14 +134,27 @@
     else el.setAttribute(k, String(v));
   }
 
+  // the JSON string an event attribute holds: a string is already encoded
+  // (a patch value), anything else is a live term to stringify (a render value)
+  function evJson(v) {
+    return typeof v === "string" ? v : JSON.stringify(v);
+  }
+
   // ── apply one op ──────────────────────────────────────────────────────
   function applyOp(root, op) {
     const kind = op[0];
     const path = op[1];
     if (kind === "set-attr") {
-      at(root, path).setAttribute(op[2], String(op[3]));
+      // route through setAttr so on-EVENT/key are translated to data-ev-*/
+      // data-key exactly as render does — a raw setAttribute here would write
+      // a dead `on-keydown.enter` attr the fire handler never reads.
+      setAttr(at(root, path), op[2], op[3]);
     } else if (kind === "remove-attr") {
-      at(root, path).removeAttribute(op[2]);
+      var el = at(root, path);
+      var k = op[2];
+      if (k === "key") el.removeAttribute("data-key");
+      else if (k.indexOf("on-") === 0) el.removeAttribute("data-ev-" + k.slice(3));
+      else el.removeAttribute(k);
     } else if (kind === "text") {
       // a text op's path ends at a child slot that is a TEXT node. Walk the
       // parent's ALL child nodes (text + element) to the slot and set its
