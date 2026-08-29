@@ -112,3 +112,33 @@ transition → proof obligation is near-identity. Direct extension of MVP-C
 (z3.bl): rewrite-equivalence there, state-invariant preservation here, same port.
 
 Files: `inductive.bl` (preserves?/establishes?/prove-box), `run_inductive.bl`.
+
+---
+
+# P16d — abduction ladder: three engines, strict non-overlap (PASS)
+
+When an invariant is TRUE but not inductive, abduction searches for the missing
+precondition P closing `Inv ∧ P ∧ guard ∧ s'=next ⊢ Inv'`. Three engines, no
+overlap: miniKanren ENUMERATES candidate predicate structures (FEAT-027
+backwards-search pointed at predicates), z3 DECIDES validity, datalog DISCHARGES
+against the call graph.
+
+Four rungs:
+1. already inductive → nothing to abduce.
+2. unguarded withdraw → miniKanren enumerates, z3 decides, finds `(<= amt 0)`
+   (sound: a non-positive withdrawal cannot overdraw).
+3. datalog discharge → every caller of :withdraw already guarantees the
+   precondition ⟹ NO annotation needed; add one careless caller and the exact
+   site is found. TLA+ cannot do this — it has no callers.
+4. domain-relative honesty → too small a vocabulary ({amt} only) → nothing
+   found, no fabricated proof; widen the domain and the fix appears.
+
+**Bug caught at root** (the MVP-C protocol lesson resurfacing): `fireable?`
+appended `(check-sat)` to a string `z3/check` already terminates with
+`(check-sat)` — two answers per query desynced the line reader, so a vacuous
+`(<= 0 0)` read as "sufficient". Fixed by removing the inline check-sat. The
+tool disagreeing with the claim ("(<= 0 0) is sufficient" — absurd) is what
+surfaced it.
+
+Files: `abduce.bl` (candidates/sufficient?/fireable?/abduce/all-senders-guarantee?),
+`run_abduce.bl`.
