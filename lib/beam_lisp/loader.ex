@@ -90,7 +90,31 @@ defmodule BeamLisp.Loader do
         # trans locks below self-serialized — never contended across
         # processes, so no lock-order inversion. Nested requires detect the
         # server via its pdict flag and run inline.
-        BeamLisp.Loader.Server.run(fn -> ensure_loaded_locked(ns) end)
+        #
+        # The AMBIENT search dirs (cwd + configured paths) are captured
+        # HERE, in the caller: Env.search_paths/0 resolves through the
+        # caller's env chain (a warm base, a test fork), and that binding
+        # does not survive the hop into the server process — a sandboxed
+        # caller whose roots live in its own env would otherwise load
+        # against :global's paths alone and miss namespaces its own env
+        # can see (Sandbox.warm! adds cwd/src to the BASE env — exactly
+        # this case). The per-load load-path stack is NOT captured: it
+        # belongs to whatever load is in progress and reads correctly
+        # inside the server.
+        dirs = [File.cwd!()] ++ extra_dirs()
+
+        BeamLisp.Loader.Server.run(fn ->
+          prev = Process.get(:bl_search_dirs)
+          Process.put(:bl_search_dirs, dirs)
+
+          try do
+            ensure_loaded_locked(ns)
+          after
+            if is_nil(prev),
+              do: Process.delete(:bl_search_dirs),
+              else: Process.put(:bl_search_dirs, prev)
+          end
+        end)
     end
   end
 
@@ -313,7 +337,17 @@ defmodule BeamLisp.Loader do
   # library, and ABOVE priv so an app can override a shipped library it
   # deliberately replaces.
   defp search_dirs do
-    Env.load_paths() ++ [File.cwd!()] ++ extra_dirs() ++ [Application.app_dir(:beam_lisp, "priv")]
+    Env.load_paths() ++ ambient_dirs() ++ [Application.app_dir(:beam_lisp, "priv")]
+  end
+
+  # The ambient segment of `search_dirs/0`: the CALLER's captured roots
+  # while a load runs inside Loader.Server (see ensure_loaded/1), else this
+  # process's own env configuration.
+  defp ambient_dirs do
+    case Process.get(:bl_search_dirs) do
+      nil -> [File.cwd!()] ++ extra_dirs()
+      dirs -> dirs
+    end
   end
 
   # Configured search paths, nearest first: explicitly added (a mix task
