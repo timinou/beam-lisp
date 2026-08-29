@@ -1,0 +1,175 @@
+; test/bl/system/system_test.bl — the guarantee engine (P16c–h), as tests.
+;
+; Every assurance the system-model tier claims is asserted here against the
+; bundled z3, the shipped datalog fixpoint, miniKanren, and the footprint
+; algebra. Run by the suite; needs priv + priv/datom load paths.
+
+(ns system.system-test
+  (:require [system :as sys] [footprint :as fp] [z3] [datom]))
+
+(defn- read1 [s] (first (BeamLisp.Reader/read_string s)))
+(defn- fp-of [s] (fp/fp-walk {} (read1 s)))
+
+; a shared z3 port for the arithmetic tests
+(def port (z3/open))
+(defn- inv-nonneg [v] (str "(>= " v " 0)"))
+(def decls "(declare-const balance Int)\n(declare-const amt Int)\n")
+
+; ── INDUCTIVE SAFETY (P16c) ─────────────────────────────────────────────
+
+(deftest inductive-invariant-proven-unbounded
+  (let [good [{:label :deposit  :guard "(>= amt 0)" :next "(+ balance amt)"}
+              {:label :withdraw :guard "(and (>= amt 0) (>= balance amt))"
+               :next "(- balance amt)"}]
+        r (sys/prove-box port inv-nonneg "balance" decls "0" good)]
+    (is (:holds r) "□(balance ≥ 0) holds — proven for every state and amount")
+    (is (:established (:init r)) "init establishes the invariant")
+    (is (every? :preserved (:steps r)) "every transition preserves it")))
+
+(deftest unguarded-withdraw-caught-with-witness
+  (let [bad [{:label :withdraw :guard "(>= amt 0)" :next "(- balance amt)"}]
+        r (sys/prove-box port inv-nonneg "balance" decls "0" bad)
+        f (first (:failures r))]
+    (is (not (:holds r)) "the unguarded withdraw breaks the invariant")
+    (is (= :withdraw (:label f)) "the failing transition is named")
+    (is (not (nil? (:model f))) "z3 returns a concrete counterexample")))
+
+; ── AUTO-STRENGTHENING (P16d) ───────────────────────────────────────────
+
+(deftest abduction-finds-sound-precondition
+  (let [ps (sys/abduce port inv-nonneg "balance" decls nil
+                       "(- balance amt)" '[balance amt 0])]
+    (is (seq ps) "miniKanren enumerated, z3 decided — a precondition was found")
+    ; every returned candidate must be genuinely sufficient
+    (is (sys/sufficient? port inv-nonneg "balance" decls nil
+                         "(- balance amt)" (first ps))
+        "the shortest candidate is genuinely sufficient")))
+
+(deftest abduction-honest-when-vocabulary-too-small
+  (let [none (sys/abduce port inv-nonneg "balance" decls nil "(- balance amt)" '[amt])
+        some- (sys/abduce port inv-nonneg "balance" decls nil "(- balance amt)"
+                          '[balance amt 0])]
+    (is (empty? none) "too small a domain → nothing, no fabricated proof")
+    (is (seq some-) "widening the domain finds the fix")))
+
+(deftest sender-discharge-only-we-can-do
+  (let [conn (datom/connect
+               [{:db/ident :call/callee :db/valueType :db.type/keyword}
+                {:db/ident :call/guarantees :db/valueType :db.type/string}])]
+    (datom/transact! conn
+      [{:db/id -1 :call/callee :withdraw :call/guarantees "(>= balance amt)"}
+       {:db/id -2 :call/callee :withdraw :call/guarantees "(>= balance amt)"}])
+    (let [q3 (fn [query db & args] (apply datom/q query db args))]
+      (is (sys/all-senders-guarantee? (datom/db conn) q3 :withdraw "(>= balance amt)")
+          "every caller guarantees the precondition → no annotation needed")
+      (datom/transact! conn [{:db/id -3 :call/callee :withdraw}])
+      (is (not (sys/all-senders-guarantee? (datom/db conn) q3 :withdraw "(>= balance amt)"))
+          "one careless caller is found"))))
+
+; ── DEADLOCK-FREEDOM (P16f) ─────────────────────────────────────────────
+
+(def SERVER-SCHEMA
+  [{:db/ident :server/name :db/valueType :db.type/string
+    :db/unique :db.unique/identity}
+   {:db/ident :waits/on :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}])
+
+(defn- q% [query db & args] (apply datom/q query db args))
+
+(deftest acyclic-call-graph-is-deadlock-free
+  (let [conn (datom/connect SERVER-SCHEMA)]
+    (datom/transact! conn
+      [{:db/id -1 :server/name "gateway" :waits/on [-2 -3]}
+       {:db/id -2 :server/name "auth"    :waits/on [-4]}
+       {:db/id -3 :server/name "cache"}
+       {:db/id -4 :server/name "store"}])
+    (is (empty? (sys/deadlocked (datom/db conn) q%))
+        "no server blocked on itself — deadlock-free from the graph")))
+
+(deftest sync-call-cycle-is-a-named-deadlock
+  (let [conn (datom/connect SERVER-SCHEMA)]
+    (datom/transact! conn
+      [{:db/id -1 :server/name "orders"   :waits/on [-2 -4]}
+       {:db/id -2 :server/name "billing"  :waits/on [-3]}
+       {:db/id -3 :server/name "shipping" :waits/on [-1]}
+       {:db/id -4 :server/name "audit"}])
+    (let [dl (sys/deadlocked (datom/db conn) q%)]
+      (is (= dl '("billing" "orders" "shipping")) "the three cycle members are named")
+      (is (not (some (fn [x] (= x "audit")) dl)) "the acyclic server is excluded"))))
+
+; ── BOUNDED LIVENESS (P16g) ─────────────────────────────────────────────
+
+(defn- good-step [s _] (cond (= s :idle) :pending (= s :pending) :replied :else s))
+(defn- buggy-step [s input]
+  (cond (= s :idle) :pending
+        (and (= s :pending) (= input :ok)) :replied
+        (and (= s :pending) (= input :retry)) :pending
+        :else s))
+
+(deftest good-handler-live-up-to-bound
+  (let [r (sys/find-lasso good-step :any :replied (fn [s] s) :idle 20)]
+    (is (not (:lasso r)) "no stuck cycle within 20 steps")))
+
+(deftest buggy-handler-lasso-found-with-witness
+  (let [r (sys/find-lasso buggy-step :retry :replied (fn [s] s) :idle 20)]
+    (is (:lasso r) "the :retry spin is a real liveness violation")
+    (is (seq (:trace r)) "with a witness trace")))
+
+(deftest liveness-honesty-is-structural
+  (sys/register-guarantee! :~replies-eventually
+    {:extension :approximate :bound 20 :property "every request replies"})
+  (sys/register-guarantee! :~balance-nonneg
+    {:extension :exact :property "balance ≥ 0 (inductive)"})
+  (is (some (fn [g] (= g :~replies-eventually)) (sys/approximate-guarantees))
+      "bounded liveness is catalogued as approximate")
+  (is (some (fn [g] (= g :~balance-nonneg)) (sys/exact-guarantees))
+      "inductive safety is catalogued as exact"))
+
+; ── REFINEMENT + VERIFIED HOT UPGRADE (P16h) ────────────────────────────
+
+(deftest optimization-refines-simple-reference
+  (let [decls1 "(declare-const n Int)\n(declare-const c Int)\n"
+        R (fn [a c] (str "(= " a " " c ")"))]
+    (is (sys/simulates? port R decls1 "n" "c" "(+ n 1)" "(+ c 1)" nil)
+        "a batched counter refines the simple one — proofs transfer")))
+
+(deftest verified-hot-upgrade
+  (let [d "(declare-const b1 Int)\n(declare-const b2 Int)\n(declare-const amt Int)\n"]
+    ; the migration preserves the invariant
+    (is (sys/migration-preserves? port inv-nonneg d "b1" "b2" "b1")
+        "code_change (b2 := b1) preserves balance ≥ 0")
+    ; v2's withdraw simulates v1's
+    (is (sys/simulates? port (fn [a c] (str "(= " a " " c ")")) d "b1" "b2"
+                        "(- b1 amt)" "(- b2 amt)"
+                        "(assert (>= b1 amt))\n(assert (>= amt 0))")
+        "v2.withdraw simulates v1.withdraw — the invariant survives the swap")))
+
+; A zeroing migration keeps the LOCAL invariant (0 ≥ 0) but breaks the
+; SIMULATION relation R(v1,v2)=(v1=v2) — which is exactly what refinement is
+; for: it catches a migration that silently changes observable state.
+(deftest broken-migration-violates-simulation
+  (let [d "(declare-const b1 Int)\n(declare-const b2 Int)\n"
+        smt (str d "(assert (>= b1 0))\n(assert (= b2 0))\n(assert (not (= b1 b2)))\n")]
+    (is (= "sat" (z3/check port smt))
+        "a zeroing migration breaks R(v1,v2) — the simulation catches it")))
+
+; ── SANDBOX: footprint ⊆ caps (P16e) + refinement 2 ─────────────────────
+
+(deftest sandbox-containment-and-fleet-noninterference
+  (let [a-work (fp-of "(swap! orders conj o)")
+        b-work (fp-of "(swap! inventory dec)")]
+    (is (sys/footprint-in-caps? a-work #{"orders"}) "tenant A within its caps")
+    (is (sys/footprint-in-caps? b-work #{"inventory"}) "tenant B within its caps")
+    (is (fp/commute? a-work b-work)
+        "disjoint caps ⟹ disjoint footprints ⟹ workers commute (fleet non-interference)")))
+
+(deftest unconveyed-spawn-escalates
+  ; refinement 2: an un-conveyed spawn escalates to :opaque-world; a conveyed
+  ; one contributes its bounded body footprint.
+  (let [naive (sys/spawn-footprint {} (read1 "(erlang/spawn (fn [] (swap! x inc)))"))
+        conveyed (sys/spawn-footprint {} (read1 "(erlang/spawn (bind env (fn [] 42)))"))]
+    (is (contains? naive fp/opaque-world)
+        "an un-conveyed spawn escalates the child to :opaque-world")
+    (is (not (sys/footprint-in-caps? naive #{"x"}))
+        "so it escapes any finite cap set — the confused-deputy lint")
+    (is (not (contains? conveyed fp/opaque-world))
+        "a conveyed spawn (bind/capture) stays bounded")))

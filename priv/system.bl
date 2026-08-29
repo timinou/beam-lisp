@@ -1,0 +1,276 @@
+; system.bl — the guarantee engine over a transition model (P16c–h, graduated).
+;
+; Everything here is a function of a transition system (model.bl) plus, for the
+; arithmetic guarantees, the bundled z3 (z3.bl). The engine division holds:
+;   datalog  owns structure/reachability (deadlock, message coverage)
+;   z3       owns arithmetic decisions (inductive invariants, refinement)
+;   miniKanren owns synthesis/abduction (auto-strengthening)
+;   footprint owns effect structure (purity/monotone/commute/frame, sandbox)
+;
+; The guarantees:
+;   inductive safety     □Inv, unbounded              (prove-box)
+;   auto-strengthening   abduce a missing precondition (abduce)
+;   deadlock-freedom     a datalog cycle query          (REACHABLE / deadlocked)
+;   bounded liveness     a BMC lasso, approximate       (find-lasso)
+;   refinement           a z3 simulation relation       (simulates? / hot-upgrade)
+;   sandbox              footprint ⊆ caps               (footprint-in-caps?)
+
+(ns system
+  (:require [z3] [footprint :as fp] [typed] [minikanren :as mk]))
+
+; ════════════════════════════════════════════════════════════════════════
+; INDUCTIVE SAFETY — □Inv, unbounded (P16c)
+;
+; z3 discharges the Hoare triple Inv(s) ∧ guard ∧ s'=next(s) ⊢ Inv(s') for
+; EVERY state and input. `inv` is a fn of a state-var NAME → an SMT predicate;
+; `decls` declares the state var(s) + input(s) as free ints; a transition is
+; {:label :guard :next} with guard/next as SMT strings (beam-lisp prefix source
+; is already valid SMT-LIB arithmetic).
+; ════════════════════════════════════════════════════════════════════════
+
+(defn preserves?
+  "Does the transition preserve Inv? Assert Inv(s) ∧ guard ∧ s2=next ∧ ¬Inv(s2);
+   unsat ⟹ preserved. Returns {:preserved bool :model countermodel-or-nil}."
+  [port inv svar decls guard next]
+  (let [smt (str decls
+                 "(declare-const " svar "2 Int)\n"
+                 "(assert " (inv svar) ")\n"
+                 (if guard (str "(assert " guard ")\n") "")
+                 "(assert (= " svar "2 " next "))\n"
+                 "(assert (not " (inv (str svar "2")) "))\n")
+        r (z3/check-model port smt)]
+    {:preserved (= "unsat" (:status r)) :model (:model r)}))
+
+(defn establishes?
+  "Does the initial state expression establish Inv?"
+  [port inv decls init]
+  (let [smt (str decls "(assert (not " (inv init) "))\n")
+        r (z3/check-model port smt)]
+    {:established (= "unsat" (:status r)) :model (:model r)}))
+
+(defn prove-box
+  "□Inv iff init establishes AND every transition preserves. `transitions` is
+   [{:label :guard :next} …]. Returns {:holds :init :steps :failures}."
+  [port inv svar decls init transitions]
+  (let [init-r (establishes? port inv decls init)
+        step-rs (map (fn [t]
+                       (assoc (preserves? port inv svar decls (:guard t) (:next t))
+                              :label (:label t)))
+                     transitions)
+        failures (filter (fn [r] (not (:preserved r))) step-rs)]
+    {:holds (and (:established init-r) (empty? failures))
+     :init init-r :steps step-rs :failures failures}))
+
+; ════════════════════════════════════════════════════════════════════════
+; AUTO-STRENGTHENING — abduce a missing precondition (P16d)
+;
+; When Inv is true but not inductive, search for P closing the triple. Three
+; engines, strict non-overlap: miniKanren ENUMERATES candidate predicates, z3
+; DECIDES sufficiency, datalog DISCHARGES against senders.
+; ════════════════════════════════════════════════════════════════════════
+
+(defn- render-term [t]
+  (cond
+    (list? t)   (str "(" (join " " (map render-term t)) ")")
+    (symbol? t) (str t)
+    :else       (pr-str t)))
+
+(defn- oneof [x xs] (mk/disj* (map (fn [v] (mk/=== x v)) xs)))
+
+(defn candidates
+  "Every (op a b), op ∈ {<= >=}, a,b ∈ domain — enumerated relationally by
+   miniKanren, as deduped SMT strings."
+  [domain]
+  (let [terms (mk/run 400 q
+                (mk/fresh [op a b]
+                  (mk/=== q (list op a b))
+                  (oneof op (list '<= '>=))
+                  (oneof a domain)
+                  (oneof b domain)))]
+    (distinct (map render-term terms))))
+
+(defn sufficient?
+  "Does `cand` close the triple Inv ∧ cand ∧ guard ∧ s2=next ⊢ Inv(s2)?"
+  [port inv svar decls guard next cand]
+  (let [smt (str decls
+                 "(declare-const " svar "2 Int)\n"
+                 "(assert " (inv svar) ")\n"
+                 "(assert " cand ")\n"
+                 (if guard (str "(assert " guard ")\n") "")
+                 "(assert (= " svar "2 " next "))\n"
+                 "(assert (not " (inv (str svar "2")) "))\n")]
+    (= "unsat" (z3/check port smt))))
+
+(defn fireable?
+  "Is `cand` satisfiable with Inv and the guard? (rejects contradictory
+   candidates that 'close' the triple by forbidding the transition). NB: no
+   inline (check-sat) — z3/check appends it; a second one desyncs the reader."
+  [port inv svar decls guard cand]
+  (let [smt (str decls
+                 "(assert " (inv svar) ")\n"
+                 "(assert " cand ")\n"
+                 (if guard (str "(assert " guard ")\n") ""))]
+    (= "sat" (z3/check port smt))))
+
+(defn abduce
+  "Sufficient + fireable candidates over `domain`, shortest first (a shorter
+   predicate is a weaker, more general precondition)."
+  [port inv svar decls guard next domain]
+  (sort-by count
+           (filter (fn [c] (and (sufficient? port inv svar decls guard next c)
+                                (fireable? port inv svar decls guard c)))
+                   (candidates domain))))
+
+(defn all-senders-guarantee?
+  "True when every sender of `label` in `db` guarantees `pred` — the discharge
+   only we can do (TLA+ has no callers). `q-fn` is (query db & args) → rows."
+  [db q-fn label pred]
+  (let [senders (q-fn '[:find ?c :in $ ?label
+                        :where [?c :call/callee ?label]]
+                      db label)
+        establishing (q-fn '[:find ?c :in $ ?label ?pred
+                             :where [?c :call/callee ?label]
+                                    [?c :call/guarantees ?pred]]
+                           db label pred)]
+    (and (seq senders) (= (count senders) (count establishing)))))
+
+; ════════════════════════════════════════════════════════════════════════
+; DEADLOCK-FREEDOM — a datalog cycle query (P16f)
+;
+; A synchronous call blocks; a cycle in the waits-for graph is a deadlock —
+; A reachable from A. The recursive rule runs on the SHIPPED fixpoint engine.
+; Callers assert :waits/on edges and pass this rule to datom/q.
+; ════════════════════════════════════════════════════════════════════════
+
+(def BLOCKED
+  '[[(blocked ?a ?b) [?a :waits/on ?b]]
+    [(blocked ?a ?b) [?a :waits/on ?x] (blocked ?x ?b)]])
+
+(defn deadlocked
+  "The names of servers in a deadlock (blocked on themselves). `q-fn` is
+   (query db & args) → rows; caller supplies a db with :server/name +
+   :waits/on and the BLOCKED rule."
+  [db q-fn]
+  (sort (map (fn [row] (get row 0))
+             (q-fn '[:find ?n :in $ %
+                     :where [(blocked ?a ?a)] [?a :server/name ?n]]
+                   db BLOCKED))))
+
+; ════════════════════════════════════════════════════════════════════════
+; BOUNDED LIVENESS — a BMC lasso, honestly approximate (P16g)
+;
+; Search for a lasso (a reachable loop that never reaches a progress state) up
+; to depth k. A found lasso is a real violation with a witness; no lasso ≤ k is
+; live UP TO k — registered as an APPROXIMATE guarantee.
+; ════════════════════════════════════════════════════════════════════════
+
+(defn find-lasso
+  "BFS/DFS the machine under `worst-input`; a phase repeat with no `progress`
+   phase between is a lasso. Returns {:lasso bool :depth :trace}."
+  [step-fn worst-input progress-phase phase-of init-state k]
+  (loop [s init-state seen [] i 0]
+    (let [ph (phase-of s)]
+      (cond
+        (>= i k) {:lasso false :depth i :trace (conj seen ph)}
+        (and (some (fn [p] (= p ph)) seen)
+             (not (some (fn [p] (= p progress-phase)) seen)))
+          {:lasso true :depth i :trace (conj seen ph)}
+        :else
+          (recur (step-fn s worst-input) (conj seen ph) (+ i 1))))))
+
+; the approximate-guarantee catalog: honesty is structural, queryable.
+(def guarantee-catalog (atom {}))
+
+(defn register-guarantee!
+  "Register a guarantee under `ident` with :extension :exact | :approximate
+   (and :bound when approximate). Idempotent per ident."
+  [ident spec]
+  (swap! guarantee-catalog assoc ident spec) ident)
+
+(defn approximate-guarantees []
+  (sort (map (fn [p] (first p))
+             (filter (fn [p] (= :approximate (:extension (second p))))
+                     (into [] (deref guarantee-catalog))))))
+
+(defn exact-guarantees []
+  (sort (map (fn [p] (first p))
+             (filter (fn [p] (= :exact (:extension (second p))))
+                     (into [] (deref guarantee-catalog))))))
+
+; ════════════════════════════════════════════════════════════════════════
+; REFINEMENT — a z3 simulation relation, incl. VERIFIED HOT UPGRADE (P16h)
+;
+; Concrete C refines abstract A via a simulation R(a,c): related states step to
+; related states. Discharged by z3: assume R, step both, ask if R(a',c') can
+; fail. unsat ⟹ preserved ⟹ C simulates A. `rel` is (a-var c-var) → SMT string.
+; ════════════════════════════════════════════════════════════════════════
+
+(defn simulates?
+  "Does the concrete step simulate the abstract one under R? decls declares
+   a-var, c-var, input; a-next/c-next are the two next-state SMT exprs; extra
+   is extra premise SMT (guards, initial-phase constraints), or nil."
+  [port rel decls a-var c-var a-next c-next extra]
+  (let [smt (str decls
+                 "(declare-const " a-var "2 Int)\n"
+                 "(declare-const " c-var "2 Int)\n"
+                 "(assert " (rel a-var c-var) ")\n"
+                 (if extra (str extra "\n") "")
+                 "(assert (= " a-var "2 " a-next "))\n"
+                 "(assert (= " c-var "2 " c-next "))\n"
+                 "(assert (not " (rel (str a-var "2") (str c-var "2")) "))\n")]
+    (= "unsat" (z3/check port smt))))
+
+(defn migration-preserves?
+  "A hot upgrade's code_change: does migrating v1 → v2 preserve v2's invariant
+   given v1's held? `inv` is state-var → SMT; migrate is the SMT expr for
+   v2's var in terms of v1's. Assert inv(v1) ∧ v2=migrate ∧ ¬inv(v2); unsat ⟹
+   the migration is safe."
+  [port inv decls v1 v2 migrate]
+  (let [smt (str decls
+                 "(assert " (inv v1) ")\n"
+                 "(assert (= " v2 " " migrate "))\n"
+                 "(assert (not " (inv v2) "))\n")]
+    (= "unsat" (z3/check port smt))))
+
+; ════════════════════════════════════════════════════════════════════════
+; SANDBOX — footprint ⊆ caps, incl. refinement 2 (P16e)
+;
+; Capabilities and effect-footprints are one lattice: granted caps are the
+; upper bound, inferred footprint the lower. Verification = containment.
+; ════════════════════════════════════════════════════════════════════════
+
+(defn footprint-in-caps?
+  "Every resource the footprint touches is granted by `caps` (a set of
+   resource names). :opaque-world is in no finite cap set ⟹ escalation fails."
+  [footprint caps]
+  (every? (fn [r] (contains? caps r)) (into [] (fp/resources footprint))))
+
+; refinement 2: an UN-CONVEYED spawn escalates the spawned BODY's footprint to
+; :opaque-world (the child runs at :global authority). A spawn is conveyed when
+; its body is wrapped by capture/bind/with-env. We inspect the spawn form.
+(def convey-heads #{"capture" "bind" "with-env" "convey"})
+
+(defn- conveyed-spawn? [spawn-node]
+  ; (erlang/spawn (capture …)) or (erlang/spawn (bind env (fn …))) is conveyed;
+  ; (erlang/spawn (fn …)) is not.
+  (let [its (typed/node-items (typed/node-form spawn-node))]
+    (and (>= (count its) 2)
+         (let [arg (typed/node-form (second its))]
+           (and (= :list (typed/node-tag arg))
+                (let [h (typed/node-form (first (typed/node-items arg)))]
+                  (and (= :symbol (typed/node-tag h))
+                       (contains? convey-heads (typed/node-name h)))))))))
+
+(defn spawn-footprint
+  "The footprint contribution of a spawn form. A conveyed spawn contributes its
+   body's footprint (bounded by the env); an un-conveyed spawn escalates to
+   {:opaque-world :X} — the security-relevant refinement over the naive model."
+  [env spawn-node]
+  (if (conveyed-spawn? spawn-node)
+    ; conveyed: walk the CONVEY form's body, not the spawn wrapper (which would
+    ; read as an unknown op → opaque). The body is the args of capture/bind.
+    (let [its (typed/node-items (typed/node-form spawn-node))
+          convey-form (second its)
+          convey-items (rest (typed/node-items (typed/node-form convey-form)))]
+      (reduce (fn [m x] (fp/join-fp m (fp/fp-walk env x))) {} convey-items))
+    {fp/opaque-world :X}))
