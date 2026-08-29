@@ -129,6 +129,28 @@ nothing existing changes. Hot path: 28–42ns per check.
 See `test/beam_lisp/caps_test.exs` — the deny-corpus that keeps every
 escape spelling failing closed.
 
+### Tokens drive the fork — and the audit, and the rows
+
+`auth/caps-for` and `auth/sandbox-fork` close the loop: a Biscuit token's
+`right($module, $op)` facts authorize, project to caps, and fork in one
+call. W6 adds the two consequences of "everything is data":
+
+```clojure
+;; the DECISION is a row — allow AND deny, with reason, operation,
+;; resource, and tx-time. "What was this token allowed to do, when?"
+;; is a datalog query over history:
+(auth/sandbox-fork-audited root-pub token ctx :global audit-conn)
+;; => {:ok env :report tx-report} | {:error verdict :report tx-report}
+
+;; ONE token, two enforcement points: the (user $p) fact that identifies
+;; the bearer also scopes their queries. verified-facts refuses a forgery
+;; — no query is ever scoped by fiction:
+(auth/owner-scope root-pub token '?doc :doc/owner)
+;; => {:ok [[?doc :doc/owner "alice"]]} — ready for auth/guard
+```
+
+See `test/bl/auth/audit_test.bl` — the use cases, green.
+
 ## Debugging resolution surprises
 
 "Why did this var resolve to THAT?" Ask the chain, from IEx or a failing
