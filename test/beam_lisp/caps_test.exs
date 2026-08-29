@@ -141,4 +141,106 @@ defmodule BeamLisp.CapsTest do
   test "ungranted pure-bl code is unaffected (the gate only mediates host calls)" do
     assert eval_in([], ~s|(ns t.pure) (defn dbl [x] (* x 2)) (dbl 21)|) == 42
   end
+
+  # ══ doctrine boundary ═══════════════════════════════════════════════
+  #
+  # The gate governs NEW compilation and dynamic forging inside a capped
+  # env. It does NOT re-mediate code that was already compiled at :global
+  # — by doctrine the base image is part of the parent's authority
+  # (setuid-helper semantics, PLAN-047 "Known limits"). These two tests
+  # PIN that boundary: they document exactly where authority leaks by
+  # design, and assert the mitigation. A change in EITHER direction —
+  # the escape starting to deny, or the mitigation starting to leak — is
+  # a semantic shift someone must notice on purpose.
+
+  defp tmp_secret! do
+    path = Path.join(System.tmp_dir!(), "caps_secret_#{System.unique_integer([:positive])}")
+    File.write!(path, "TOP-SECRET")
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  test "DOCTRINE: a closure compiled at :global carries its authority past the gate" do
+    secret = tmp_secret!()
+    # Built where File IS granted — the static (File/read …) baked a DIRECT
+    # apply, not a gated $remote handle. Nothing re-checks it later.
+    leak = BeamLisp.eval(~s|(ns atk.forge) (fn [p] (File/read p))|)
+
+    # Invoked inside an env that grants ONLY String, it STILL reads the
+    # file. This is the setuid leak, stated out loud: a :global-compiled
+    # wrapper reachable from a sandbox lends the sandbox its authority.
+    assert {:ok, "TOP-SECRET"} =
+             Env.isolated(Env.fork(:global, caps: [String]), fn ->
+               BeamLisp.RT.invoke(leak, [secret])
+             end)
+
+    # The mitigation is compile-time: writing that SAME call *inside* the
+    # capped env never produces bytecode. The rule for operators follows
+    # directly — anything a sandbox must not DO must not be reachable
+    # through a :global-loaded wrapper either.
+    assert_raise BeamLisp.CompileError, ~r/module File is not granted/, fn ->
+      eval_in([String], ~s|(ns atk.inline) (File/read "#{secret}")|)
+    end
+  end
+
+  test "DOCTRINE: a confused deputy leaks unless it CONVEYS the caller's env" do
+    secret = tmp_secret!()
+    parent = self()
+
+    # A naive deputy serves whoever asks, using its OWN :global authority.
+    naive =
+      spawn(fn ->
+        receive do
+          {:read, path, from} -> send(from, {:served, File.read!(path)})
+        end
+      end)
+
+    naive_result =
+      Env.isolated(Env.fork(:global, caps: [String]), fn ->
+        send(naive, {:read, secret, self()})
+        receive do
+          msg -> msg
+        after
+          1000 -> :timeout
+        end
+      end)
+
+    # The capped client could not read the file itself, yet the deputy did
+    # it on their behalf — the classic confused-deputy exposure.
+    assert {:served, "TOP-SECRET"} = naive_result
+
+    # The fix: the deputy re-enters the CALLER's conveyed env before doing
+    # the work, and reaches the resource through the gated interop path.
+    # Now the caller's caps (String only) govern, and File is denied.
+    fileread = BeamLisp.RT.remote_fun(File, :read)
+
+    convey =
+      spawn(fn ->
+        receive do
+          {:read, path, token, from} ->
+            result =
+              try do
+                Env.bind(token)
+                {:served, BeamLisp.RT.invoke(fileread, [path])}
+              rescue
+                e -> {:denied, e.__struct__}
+              end
+
+            send(from, result)
+        end
+      end)
+
+    convey_result =
+      Env.isolated(Env.fork(:global, caps: [String]), fn ->
+        send(convey, {:read, secret, Env.capture(), self()})
+        receive do
+          msg -> msg
+        after
+          1000 -> :timeout
+        end
+      end)
+
+    assert {:denied, BeamLisp.CompileError} = convey_result
+    _ = parent
+  end
 end
