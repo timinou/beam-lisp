@@ -337,89 +337,127 @@
   [s from to]
   (join to (split s from)))
 
-; ── Rung 1 (P18): N state variables, jointly ────────────────────────────────
+; ── Rungs 1–2 (P18): N state variables of MIXED SORTS, jointly ─────────────
 ;
-; The state is a TUPLE of ints, not one int. `ordered-svars` reads the tuple's
-; order from the init binding; each transition's :next is a vector mapped
-; positionally; the invariant becomes a z3 `define-fun` so priming the whole
-; tuple needs NO textual substitution — z3 binds the params. N=1 is the special
-; case (one param), so this generalizes the P17 seam, no parallel path.
+; State is a PRODUCT of typed fields — a tuple of ints (Rung 1) or a record
+; whose fields have different sorts (Rung 2: {:balance Int, :frozen Bool}). The
+; shape and the per-field SORTS are read from the init state; each transition's
+; :next is a vector (positional) or a map (named) mapped to those fields; the
+; invariant becomes a z3 `define-fun` over the sorted fields, so priming needs
+; NO textual substitution. All-Int single-var is the special case — one path.
+;
+; The sort is the TYPE-DIRECTED part: smt.bl already emits true/false + not/and/
+; or, so the ONLY thing a bool field changes is its (declare-const v Bool). The
+; sorts come from the init literals here; the tag lattice is the fuller source.
 
-(defn- vec-elems
-  "A next-state SOURCE string → its element source strings when it is a vector
-   ([balance (+ reserved amt)] → [\"balance\" \"(+ reserved amt)\"]), else [src]."
-  [src]
-  (let [node (first (BeamLisp.Reader/read_string src))
-        f (typed/node-form node)]
-    (if (= :vector (typed/node-tag f))
-      (into [] (map (fn [it] (errors/delaborate it)) (typed/node-items f)))
-      [src])))
+(defn- parse1 [src] (first (BeamLisp.Reader/read_string src)))
 
-(defn- ordered-svars
-  "The ORDERED state-var names: the init binding's next-state vector, in order
-   (the tuple's shape). Falls back to the invariant's mentioned vars when init
-   is scalar or absent (a set, fine for the single-var case)."
+(defn- lit-sort
+  "The z3 sort implied by an init field VALUE source: Bool for true/false, else
+   Int (the common case; a symbol pass-through or integer is Int)."
+  [valsrc]
+  (if (or (= valsrc "true") (= valsrc "false")) "Bool" "Int"))
+
+(defn- state-shape
+  "{:svars [ordered names] :sorts {name→sort}} read from the init next-state.
+   A vector → positional int fields; a map → named fields with per-value sorts;
+   a bare symbol → one int field. Falls back to the invariant's mentioned vars
+   (all Int) when init is absent/opaque — the Rung-1 behaviour."
   [inv-node clauses]
-  (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))]
+  (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))
+        fallback {:svars (into [] (state-vars inv-node clauses))
+                  :sorts (into {} (map (fn [v] [v "Int"]) (state-vars inv-node clauses)))}]
     (if (and init-c (:next init-c))
-      (let [node (first (BeamLisp.Reader/read_string (:next init-c)))
-            f (typed/node-form node)]
-        (if (= :vector (typed/node-tag f))
-          (into [] (keep (fn [it]
-                           (let [ff (typed/node-form it)]
-                             (if (= :symbol (typed/node-tag ff))
-                               (typed/node-name ff) nil)))
-                         (typed/node-items f)))
-          (into [] (state-vars inv-node clauses))))
-      (into [] (state-vars inv-node clauses)))))
+      (let [f (typed/node-form (parse1 (:next init-c)))
+            tg (typed/node-tag f)]
+        (cond
+          (= tg :vector)
+            (let [names (into [] (keep (fn [it]
+                                        (let [ff (typed/node-form it)]
+                                          (if (= :symbol (typed/node-tag ff))
+                                            (typed/node-name ff) nil)))
+                                      (typed/node-items f)))]
+              {:svars names :sorts (into {} (map (fn [v] [v "Int"]) names))})
+          (= tg :map)
+            (let [pairs (map (fn [pair]
+                               (let [k (first (erlang/tuple_to_list pair))
+                                     v (second (erlang/tuple_to_list pair))]
+                                 [(typed/node-name (typed/node-form k))
+                                  (lit-sort (errors/delaborate v))]))
+                             (typed/node-items f))]
+              {:svars (into [] (map first pairs))
+               :sorts (into {} pairs)})
+          (= tg :symbol)
+            {:svars [(typed/node-name f)] :sorts {(typed/node-name f) "Int"}}
+          :else fallback))
+      fallback)))
 
-(defn- next-map
-  "{svar → next-SMT} for a transition: its :next vector mapped positionally to
-   the ordered svars. nil when arity mismatches or any element is
-   untranslatable (the transition is then dropped — sound: unproven, not
-   falsely proven)."
-  [svars nextsrc]
-  (let [elems (vec-elems nextsrc)]
-    (if (not (= (count elems) (count svars)))
-      nil
-      (loop [i 0 m {}]
-        (if (>= i (count svars))
-          m
-          (let [smt (smt/of-source (set svars) (nth elems i))]
-            (if (or (nil? smt) (= smt :untranslatable))
-              nil
-              (recur (+ i 1) (assoc m (nth svars i) smt)))))))))
+(defn- next-fields
+  "{svar → next-SMT} for a transition: its :next mapped to the state fields.
+   A vector maps positionally to `svars`; a map maps by field name; a bare
+   value maps to the single field. nil when the shape/arity mismatches or any
+   element is untranslatable (the transition is then dropped — sound)."
+  [svars sorts nextsrc]
+  (let [f (typed/node-form (parse1 nextsrc))
+        tg (typed/node-tag f)
+        one (fn [src] (smt/of-source (set svars) src))
+        build (fn [assocs]
+                (loop [xs assocs m {}]
+                  (if (empty? xs)
+                    m
+                    (let [[v src] (first xs)
+                          smt (one src)]
+                      (if (or (nil? smt) (= smt :untranslatable))
+                        nil
+                        (recur (rest xs) (assoc m v smt)))))))]
+    (cond
+      (= tg :vector)
+        (let [elems (into [] (map (fn [it] (errors/delaborate it)) (typed/node-items f)))]
+          (if (not (= (count elems) (count svars))) nil
+            (build (map (fn [v e] [v e]) svars elems))))
+      (= tg :map)
+        (let [fm (into {} (map (fn [pair]
+                                 (let [k (first (erlang/tuple_to_list pair))
+                                       v (second (erlang/tuple_to_list pair))]
+                                   [(typed/node-name (typed/node-form k))
+                                    (errors/delaborate v)]))
+                               (typed/node-items f)))]
+          (build (map (fn [v] [v (get fm v v)]) svars)))
+      :else
+        (if (= 1 (count svars)) (build [[(first svars) nextsrc]]) nil))))
 
 (defn- keep-translatable-multi
-  "Message transitions whose guard AND every next element translate, each as
+  "Message transitions whose guard AND every next field translate, each as
    {:label :guard smt|nil :nexts {svar→smt}}."
-  [svars clauses]
+  [svars sorts clauses]
   (keep (fn [c]
           (let [g (:guard c)
                 gsmt (if (nil? g) nil (smt/of-source (set svars) g))
-                nmap (next-map svars (:next c))]
+                nmap (next-fields svars sorts (:next c))]
             (if (or (= gsmt :untranslatable) (nil? nmap))
               nil
               {:label (:label c) :guard gsmt :nexts nmap})))
         clauses))
 
 (defn- inv-define-fun
-  "(define-fun Inv ((v Int)…) Bool <inv-smt>) — the invariant as a z3 function
-   of the whole tuple. Applying it to primed args needs no substitution."
-  [svars inv-smt]
+  "(define-fun Inv ((v Sort)…) Bool <inv-smt>) — the invariant as a z3 function
+   of the whole sorted state. Applying it to primed args needs no substitution."
+  [svars sorts inv-smt]
   (str "(define-fun Inv ("
-       (join " " (map (fn [v] (str "(" v " Int)")) svars))
+       (join " " (map (fn [v] (str "(" v " " (get sorts v "Int") ")")) svars))
        ") Bool " inv-smt ")\n"))
 
+(defn- decl-of [nm sort] (str "(declare-const " nm " " sort ")\n"))
+
 (defn- preserves-joint?
-  "Does the transition preserve the tuple invariant? Assert Inv(s) ∧ guard ∧
-   (⋀ vᵢ2=nextᵢ) ∧ ¬Inv(s2); unsat ⟹ preserved. Returns {:preserved bool}."
-  [port svars inv-smt decls guard nexts]
-  (let [prime-decls (join "" (map (fn [v] (str "(declare-const " v "2 Int)\n")) svars))
+  "Does the transition preserve the sorted-state invariant? Assert Inv(s) ∧
+   guard ∧ (⋀ vᵢ2=nextᵢ) ∧ ¬Inv(s2); unsat ⟹ preserved."
+  [port svars sorts inv-smt decls guard nexts]
+  (let [prime-decls (join "" (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars))
         prime-eqs   (join "" (map (fn [v] (str "(assert (= " v "2 " (get nexts v v) "))\n")) svars))
         cur-args (join " " svars)
         pri-args (join " " (map (fn [v] (str v "2")) svars))
-        smt (str (inv-define-fun svars inv-smt)
+        smt (str (inv-define-fun svars sorts inv-smt)
                  decls prime-decls
                  "(assert (Inv " cur-args "))\n"
                  (if guard (str "(assert " guard ")\n") "")
@@ -428,10 +466,10 @@
     {:preserved (= "unsat" (z3/check port smt))}))
 
 (defn- establishes-joint?
-  "Does the init tuple establish the invariant? Assert ¬Inv(init-exprs); unsat
+  "Does the init state establish the invariant? Assert ¬Inv(init-exprs); unsat
    ⟹ established."
-  [port svars inv-smt decls init-exprs]
-  (let [smt (str (inv-define-fun svars inv-smt)
+  [port svars sorts inv-smt decls init-exprs]
+  (let [smt (str (inv-define-fun svars sorts inv-smt)
                  decls
                  "(assert (not (Inv " (join " " init-exprs) ")))\n")]
     (= "unsat" (z3/check port smt))))
@@ -441,52 +479,51 @@
      {:name :holds :warnings [{:msg :line :col}] :checked bool}
    :checked=false when there is no ^{:invariant} or it is untranslatable (the
    checker stays silent on what it cannot model — sound-warnings-only).
-   Handles N state variables jointly (P18 Rung 1): a relational invariant over
-   a tuple (balance ≥ reserved) is proven for the whole primed tuple at once."
+   Handles N state variables of MIXED SORTS jointly (P18 Rungs 1–2): a relational
+   invariant over a tuple (balance ≥ reserved) or a record ((or (not frozen)
+   (= balance 0))) is proven for the whole primed state at once."
   [port node]
   (let [sm (model/system-model node)
         clauses (:transitions sm)
         inv-node (invariant-node node)]
     (if (nil? inv-node)
       {:name (:name sm) :holds nil :checked false :warnings []}
-      (let [svars (ordered-svars inv-node clauses)
+      (let [shape (state-shape inv-node clauses)
+            svars (:svars shape)
+            sorts (:sorts shape)
             inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) inv-node))]
         (if (or (empty? svars) (= inv-smt :untranslatable))
           {:name (:name sm) :holds nil :checked false :warnings []
-           :reason "invariant not translatable to integer arithmetic"}
+           :reason "invariant not translatable to integer/bool arithmetic"}
           (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))
                 msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
-                ts (keep-translatable-multi svars msg-cs)
+                ts (keep-translatable-multi svars sorts msg-cs)
                 pos (typed/node-pos node)
                 svarset (set svars)
-                ; inputs: free syms across the TRANSLATED guards + nexts (clean
-                ; SMT, no leftover brackets), minus the state vars.
+                ; inputs: free syms across the TRANSLATED guards + nexts, minus
+                ; the state vars. Inputs default to Int (amounts/counters); a
+                ; bool input is rare and would surface as an untranslatable use.
                 input-names (reduce
                               (fn [acc t]
                                 (reduce (fn [a s] (if (nil? s) a (into a (free-syms s))))
                                         acc (cons (:guard t) (into [] (vals (:nexts t))))))
                               #{} ts)
                 inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
-                decls (str (join "" (map (fn [v] (str "(declare-const " v " Int)\n")) svars))
-                           (join "" (map (fn [nm] (str "(declare-const " nm " Int)\n")) inputs)))
-                ; establishment: a pure pass-through init (the opening tuple) is
+                decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
+                           (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
+                ; establishment: a pure pass-through init (the opening state) is
                 ; the caller's contract, trusted. A computed init is checked.
-                init-elems (if init-c (vec-elems (:next init-c)) nil)
-                passthrough? (and (some? init-elems)
-                                  (= (count init-elems) (count svars))
-                                  (every? (fn [e] (contains? svarset e)) init-elems))
+                init-nexts (if init-c (next-fields svars sorts (:next init-c)) nil)
+                passthrough? (and (some? init-nexts)
+                                  (every? (fn [v] (= (get init-nexts v) v)) svars))
                 init-est (cond
                            (nil? init-c) true
+                           (nil? init-nexts) true
                            passthrough? true
-                           (nil? init-elems) true
-                           (not (= (count init-elems) (count svars))) true
-                           :else
-                             (let [ies (map (fn [e] (smt/of-source svarset e)) init-elems)]
-                               (if (some (fn [s] (or (nil? s) (= s :untranslatable))) ies)
-                                 true
-                                 (establishes-joint? port svars inv-smt decls (into [] ies)))))
+                           :else (establishes-joint? port svars sorts inv-smt decls
+                                    (into [] (map (fn [v] (get init-nexts v v)) svars))))
                 step-rs (map (fn [t]
-                               (assoc (preserves-joint? port svars inv-smt decls (:guard t) (:nexts t))
+                               (assoc (preserves-joint? port svars sorts inv-smt decls (:guard t) (:nexts t))
                                       :label (:label t)))
                              ts)
                 failures (filter (fn [x] (not (:preserved x))) step-rs)]
@@ -494,7 +531,6 @@
              :holds (and init-est (empty? failures))
              :checked true
              :warnings (box-warnings {:failures failures} pos)}))))))
-
 (defn- input-decls
   "Declare every free symbol in the transitions' guards/next (other than svar)
    as an Int input."
