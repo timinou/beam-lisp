@@ -242,3 +242,45 @@ Found lasso ⟹ a real violation (sound); no lasso ≤ k ⟹ live up to k (appro
   is a QUERY — honesty is structural, in the catalog, never a footnote.
 
 Files: `run_liveness.bl` (find-lasso BMC; approximate-relation catalog).
+
+---
+
+# P16h — refinement & VERIFIED HOT UPGRADE (PASS)
+
+Refinement: concrete C implements abstract A via a simulation relation R(a,c),
+`R(a,c) ∧ c→c' ⊢ ∃a'. a→a' ∧ R(a',c')`, discharged by z3 (edge-check). If C
+refines A, every property proven on A transfers to C free.
+
+1. **optimization** — a batched counter refines the simple one → balance≥0 and
+   all proofs transfer.
+2. **protocol conformance** — a connection refines the abstract open/close
+   protocol → it can never emit out of order. The abstract machine IS the
+   session type.
+3. **VERIFIED HOT UPGRADE (the crown)** — code_change is just another transition
+   R must respect. v1 {:balance} → v2 {:balance :currency}: the migration
+   preserves balance≥0, v2.withdraw simulates v1.withdraw, and a broken
+   migration that zeroes the balance is CAUGHT before it ships. Correctness
+   ACROSS a hot code change, the process never stopping — a property almost no
+   system checks. code_change respects the simulation relation ⟹ every guarantee
+   proven on v1 survives the live swap.
+
+Files: `run_refine.bl` (simulation edge-checks via z3; hot-upgrade obligations).
+
+---
+
+# P16 tier: all eight spikes PASS
+
+| spike | guarantee | engine |
+|---|---|---|
+| P16a | extraction: 5 forms → 1 transition graph | typed plumbing |
+| P16b | effect-footprint: purity/monotone/commute/frame | lattice |
+| P16c | inductive invariant □Inv, unbounded | z3 |
+| P16d | abduction ladder (auto-strengthen) | z3+miniKanren+datalog |
+| P16e | sandbox: footprint ⊆ caps | lattice |
+| P16f | structural deadlock-freedom | datalog fixpoint |
+| P16g | bounded liveness, approximate relation | BMC |
+| P16h | refinement + verified hot upgrade | z3 |
+
+Division of labor held throughout (strict non-overlap): datalog owns
+structure/reachability, z3 owns arithmetic decisions, miniKanren owns
+synthesis/abduction, the lattice owns effect structure. Next: Typst doc #1.
