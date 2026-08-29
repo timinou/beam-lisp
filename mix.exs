@@ -72,6 +72,11 @@ defmodule BeamLisp.MixProject do
       # `only: :dev` again: the spell endpoint it used to serve moved to the
       # spell repo with the extraction.
       {:bandit, "~> 1.5", only: :dev},
+      # file_system drives the live-reload watcher (lib/beam_lisp/reload_watcher.ex):
+      # it emits filesystem events for `.bl` saves, which the watcher stages into
+      # the reload bundle. Dev + test only — production trusts compiled beams and
+      # runs no watcher (the guarantee lives in the running image, not the build).
+      {:file_system, "~> 1.0", only: [:dev, :test]},
       # examples/datom/live/06-projector.bl starts a PubSub as its broadcast
       # transport; the examples run only under `mix test`.
       {:phoenix_pubsub, "~> 2.1", only: :test},
