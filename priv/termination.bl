@@ -1,0 +1,168 @@
+; termination.bl — L13, graduated — P15d: termination for loop/recur.
+;
+; The rule under test: a (recur …) is ACCEPTED when its argument is
+; provably shrinking along a measure, REJECTED with the counterexample
+; path otherwise, and a ^{:decreasing …} annotation on the loop is the
+; trusted escape hatch (L13).
+;
+; Shrinking, spike scope (sound — acceptance means the rule PROVED it):
+;   (dec x) / (- x <positive-literal>)   — x an int-bound loop var
+;   (rest xs) / (next xs)                — a seq-bound loop var
+; Loop var boundness comes from the loop's binding vector; the var's
+; initial LITERAL decides int vs seq. Anything else (identity, inc, a
+; var-free expr, an unknown fn call) is not provably shrinking →
+; rejected, with the failing recur form printed.
+;
+; The measure annotation: ^{:decreasing expr} on the loop's binding
+; vector trusts the author's measure — the spike records it as accepted
+; and reports WHICH measure was trusted (auditable, not silent).
+
+(ns termination
+  (:require [typed] [errors]))
+
+(defn- unwrap [n] (typed/node-form n))
+
+(defn head-sym [node]
+  (if (and (= :list (typed/node-tag node))
+           (not (empty? (typed/node-items node)))
+           (= :symbol (typed/node-tag (unwrap (first (typed/node-items node))))))
+    (typed/node-name (unwrap (first (typed/node-items node))))
+    nil))
+
+(defn- literal-kind
+  "The init form's kind: :int, :seq, or :unknown."
+  [node]
+  (let [n (unwrap node)]
+    (cond
+      (int? n) :int
+      (= :vector (typed/node-tag n)) :seq
+      (and (= :list (typed/node-tag n))
+           (= "quote" (head-sym n))) :seq
+      :else :unknown)))
+
+(defn shrinking-expr?
+  "Is `node` a provably-shrinking expression of loop var `v` (kind k)?"
+  [node v k]
+  (let [n (unwrap node)
+        h (head-sym n)]
+    (if (nil? h)
+      false
+      (let [args (rest (typed/node-items n))]
+        ; Shape, not kind: (dec v) / (rest v) are structurally shrinking
+        ; WHEN v is the right type — and whether it is, is the type
+        ; checker's obligation (P1), not the termination checker's.
+        ; A type-wrong loop crashes; a shape-wrong one diverges. We own
+        ; the second. (`-` still wants a positive literal: subtraction
+        ; from a non-int is a type error AND not a measure.)
+        (cond
+          (= h "dec")
+            (and (= 1 (count args))
+                 (= :symbol (typed/node-tag (unwrap (first args))))
+                 (= v (typed/node-name (unwrap (first args)))))
+          (= h "-")
+            (and (= 2 (count args))
+                 (= :symbol (typed/node-tag (unwrap (first args))))
+                 (= v (typed/node-name (unwrap (first args))))
+                 (int? (unwrap (nth args 1)))
+                 (> (unwrap (nth args 1)) 0))
+          (contains? #{"rest" "next"} h)
+            (and (= 1 (count args))
+                 (= :symbol (typed/node-tag (unwrap (first args))))
+                 (= v (typed/node-name (unwrap (first args)))))
+          :else false)))))
+
+(declare find-recurs)
+
+(defn find-recurs
+  "All (recur …) forms under node (not descending into nested loop/fn —
+   those are their own obligations)."
+  [node acc]
+  (let [n (unwrap node)
+        tag (typed/node-tag n)]
+    (cond
+      (= tag :list)
+        (let [h (head-sym n)]
+          (cond
+            (= h "recur") (conj acc n)
+            (contains? #{"loop" "fn"} h) acc
+            :else (reduce (fn [a x] (find-recurs x a)) acc (typed/node-items n))))
+      (contains? #{:vector :set} tag)
+        (reduce (fn [a x] (find-recurs x a)) acc (typed/node-items n))
+      (= tag :map)
+        (reduce (fn [a p] (find-recurs (second (erlang/tuple_to_list p)) a))
+                acc (typed/node-items n))
+      :else acc)))
+
+(defn check-loop
+  "The termination verdict for one loop form. Returns
+   {:status :accepted|:rejected|:trusted :detail …}."
+  [node]
+  (let [items (typed/node-items node)
+        bindings-node (second items)
+        ; ^{:decreasing …} on the bindings vector is the escape hatch
+        bmeta (if (= :meta (typed/node-tag bindings-node))
+                (nth (erlang/tuple_to_list bindings-node) 2)
+                nil)
+        decreasing (if (and (map? bmeta) (contains? bmeta :decreasing))
+                     (:decreasing bmeta)
+                     nil)]
+    (if (some? decreasing)
+      {:status :trusted :detail (str "trusted measure: " (errors/delaborate decreasing))}
+      (let [bs (typed/node-items (unwrap bindings-node))
+            vars (loop [xs bs m {}]
+                   (if (empty? xs)
+                     m
+                     (let [b (first xs)
+                           init (second xs)]
+                       (recur (rest (rest xs))
+                              (if (= :symbol (typed/node-tag (unwrap b)))
+                                (assoc m (typed/node-name (unwrap b))
+                                         (literal-kind init))
+                                m)))))
+            body (rest (rest items))
+            recurs (reduce (fn [a b] (find-recurs b a)) [] body)]
+        (let [bad (filter
+                    (fn [r]
+                      (let [args (rest (typed/node-items r))]
+                        ; each recur arg must shrink its OWN loop var
+                        (some (fn [[i arg]]
+                                (let [b (nth bs (* 2 i))
+                                      v (if (= :symbol (typed/node-tag (unwrap b)))
+                                          (typed/node-name (unwrap b)) nil)
+                                      k (if (nil? v) :unknown (get vars v :unknown))]
+                                  (not (or (nil? v) (shrinking-expr? arg v k)))))
+                              (map (fn [i] [i (nth args i)]) (range (count args))))))
+                    recurs)]
+          (if (empty? bad)
+            {:status :accepted :detail "all recurs provably shrinking"}
+            {:status :rejected
+             :detail (str "recur not provably shrinking: "
+                          (errors/delaborate (first bad)))}))))))
+
+(defn check-source
+  "Verdicts for every top-level (and nested-in-defn) loop in src."
+  [src]
+  (let [forms (BeamLisp.Reader/read_string src)]
+    (reduce
+      (fn [acc form]
+        (concat acc (find-loops form)))
+      [] forms)))
+
+(defn find-loops
+  "All loop forms under node, with their verdicts."
+  [node]
+  (let [n (unwrap node)
+        tag (typed/node-tag n)]
+    (cond
+      (= tag :list)
+        (let [h (head-sym n)
+              here (if (= h "loop") [(check-loop n)] [])
+              kids (reduce (fn [a x] (concat a (find-loops x))) []
+                           (typed/node-items n))]
+          (concat here kids))
+      (contains? #{:vector :set} tag)
+        (reduce (fn [a x] (concat a (find-loops x))) [] (typed/node-items n))
+      (= tag :map)
+        (reduce (fn [a p] (concat a (find-loops (second (erlang/tuple_to_list p)))))
+                [] (typed/node-items n))
+      :else [])))

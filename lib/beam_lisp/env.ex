@@ -536,6 +536,24 @@ defmodule BeamLisp.Env do
     :ok
   end
 
+  @doc """
+  Run `fun` with `current_ns` bound to `ns`, restoring the previous value
+  afterwards — even on raise. The dynamic-scope discipline: code executes
+  with `current_ns` naming the namespace the code belongs to, and callers
+  who run code ON BEHALF of a namespace (the test runner, tooling) must
+  rebind it rather than leak their own.
+  """
+  def with_ns(ns, fun) when is_binary(ns) and is_function(fun, 0) do
+    prev = current_ns()
+    in_ns(ns)
+
+    try do
+      fun.()
+    after
+      in_ns(prev)
+    end
+  end
+
   @doc "Bind `name` to `value` in `ns`. Returns the value, like Clojure's def returns the var root."
   def intern(ns, name, value) do
     put_key({ns, name}, value)

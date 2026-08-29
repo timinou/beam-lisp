@@ -1,0 +1,256 @@
+; research/p1_lattice/lattice.bl — P1: the core tag lattice.
+;
+; The question: can a tag-lattice inferencer over beam-lisp data forms
+; stay under ~500 LOC, run in microseconds per form, and catch real bug
+; shapes with ZERO false positives on clean code? Contract: sound
+; warnings only — never a wrong warning, occasionally a missed one;
+; unknown means silent.
+;
+; A type is a SET OF TAGS (the union is the type). `never` is the empty
+; set, `any` is all of them. Meet is intersection; a disjoint meet at a
+; required position is the one thing we warn about. No negation, no
+; intersection types, no arithmetic — the lattice cannot go super-linear
+; by construction.
+
+(ns lattice)
+
+; --- the lattice -----------------------------------------------------------
+
+(def all-tags #{:int :float :kw :string :bool :map :vec :set :fn :nil :sym})
+(def any all-tags)
+(def never #{})
+
+(defn t-union [a b] (set (concat a b)))
+(defn t-meet [a b] (set (filter (fn [t] (contains? a t)) b)))
+(defn t-sub? [a b] (every? (fn [t] (contains? b t)) a))
+
+; Type EXPRESSIONS (P0 convention: annotations are data).
+;   int, string, …     a tag
+;   number             int ∪ float
+;   any                the top
+;   (U a b …)          a union
+;   (fn [a…] r)        fn — shallow in v1: the tag, not the columns
+(defn type-expr [e]
+  (cond
+    (and (symbol? e) (= (str e) "any"))    any
+    (and (symbol? e) (= (str e) "number")) #{:int :float}
+    (symbol? e)
+      (let [t (keyword (str e))]
+        (if (contains? all-tags t) #{t} any))
+    (and (list? e) (= (str (first e)) "U"))
+      (reduce (fn [acc x] (t-union acc (type-expr x))) never (rest e))
+    :else any))
+
+; --- guard narrowing ---------------------------------------------------------
+;
+; The whitelist. Each predicate maps to the EXACT tag set it accepts, so
+; both branches are sound: then = meet, else = difference. An unlisted
+; guard narrows nothing, warns nothing.
+
+(def guard-tags
+  {'int?     #{:int}
+   'float?   #{:float}
+   'number?  #{:int :float}
+   'string?  #{:string}
+   'keyword? #{:kw}
+   'symbol?  #{:sym}
+   'map?     #{:map}
+   'vector?  #{:vec}
+   'set?     #{:set}
+   'fn?      #{:fn}
+   'boolean? #{:bool}
+   'nil?     #{:nil}
+   'pos?     #{:int :float}
+   'neg?     #{:int :float}
+   'zero?    #{:int :float}
+   'some?    #{:int :float :kw :string :bool :map :vec :set :fn :sym}})
+
+(defn t-diff [a b] (set (filter (fn [t] (not (contains? b t))) a)))
+
+; --- the checker --------------------------------------------------------------
+;
+; Warnings collect in an atom (this is a spike; the real checker threads
+; them). env is {symbol → tagset}; sigs is {name → {:args [ts…] :ret ts}}
+; pulled from Env meta by the driver below.
+
+(def warnings (atom []))
+
+(defn warn! [msg form]
+  (swap! warnings (fn [ws] (conj ws {:msg msg :form (pr-str form)}))))
+
+(declare infer)
+
+(defn lit-type [x]
+  (cond
+    (int? x)     #{:int}
+    (float? x)   #{:float}
+    (string? x)  #{:string}
+    (keyword? x) #{:kw}
+    (symbol? x)  #{:sym}
+    (= x true)   #{:bool}
+    (= x false)  #{:bool}
+    (nil? x)     #{:nil}
+    (map? x)     #{:map}
+    (vector? x)  #{:vec}
+    (set? x)     #{:set}
+    (fn? x)      #{:fn}
+    :else        any))
+
+(defn check-call
+  "`f` applied to arg tagsets. Seed-table and annotated fns: each arg
+   must MEET its declared position non-emptily. A keyword in call
+   position needs a map. Unknown callee: silent (any)."
+  [sigs f args arg-types form]
+  (cond
+    (keyword? f)
+      (if (and (= 1 (count arg-types))
+               (empty? (t-meet (first arg-types) #{:map})))
+        (warn! (str "keyword " (pr-str f) " called on a value that is provably not a map")
+               form)
+        nil)
+    (symbol? f)
+      (let [sig (get sigs (str f) nil)]
+        (if (nil? sig)
+          nil
+          (doall
+            (map-indexed
+              (fn [i declared]
+                (let [actual (get arg-types i any)]
+                  (if (and (some? actual)
+                           (empty? (t-meet actual declared)))
+                    (warn! (str f ": argument " (+ i 1) " is "
+                                (pr-str (sort (into [] actual)))
+                                ", declared " (pr-str (sort (into [] declared))))
+                           form)
+                    nil)))
+              (:args sig)))))
+    :else nil))
+
+(defn infer-if [sigs env test then else form]
+  (infer sigs env test)
+  (let [[then-env else-env]
+        (if (and (list? test)
+                 (= 2 (count test))
+                 (symbol? (first test))
+                 (symbol? (second test)))
+          (let [pred (first test)
+                x    (second test)
+                tags (get guard-tags pred nil)]
+            (if (nil? tags)
+              [env env]
+              (let [cur (get env x any)
+                    in  (t-meet cur tags)
+                    out (t-diff cur tags)]
+                (if (empty? in)
+                  (warn! (str "branch unreachable: " (pr-str x) " is provably not "
+                              (pr-str (sort (into [] tags))))
+                         form)
+                  nil)
+                [(assoc env x in) (assoc env x out)])))
+          [env env])
+        t1 (infer sigs then-env then)
+        t2 (if (nil? else) never (infer sigs else-env else))]
+    (t-union t1 t2)))
+
+(defn infer-let [sigs env bindings body]
+  (let [pairs (loop [bs (into [] bindings) acc []]
+                (if (empty? bs)
+                  acc
+                  (recur (rest (rest bs))
+                         (conj acc [(first bs) (second bs)]))))
+        env2 (reduce (fn [e [x v]]
+                       (assoc e x (infer sigs e v)))
+                     env pairs)]
+    (reduce (fn [_ b] (infer sigs env2 b)) never body)))
+
+(defn infer [sigs env form]
+  (cond
+    (symbol? form)
+      (get env form any)
+
+    (list? form)
+      (let [head (first form)]
+        (cond
+          (and (symbol? head) (= (str head) "if"))
+            (infer-if sigs env (second form)
+                      (first (rest (rest form)))
+                      (first (rest (rest (rest form)))) form)
+
+          (and (symbol? head) (= (str head) "let"))
+            (infer-let sigs env (second form) (rest (rest form)))
+
+          (and (symbol? head) (= (str head) "do"))
+            (reduce (fn [_ b] (infer sigs env b)) never (rest form))
+
+          (and (symbol? head) (= (str head) "quote")) #{:sym}
+
+          :else
+            (let [arg-forms (rest form)
+                  arg-types (map (fn [a] (infer sigs env a)) arg-forms)]
+              (check-call sigs head [] (into [] arg-types) form)
+              (let [sig (if (symbol? head) (get sigs (str head) nil) nil)]
+                (if (nil? sig) any (:ret sig))))))
+
+    (vector? form)
+      (do (doall (map (fn [x] (infer sigs env x)) form)) #{:vec})
+
+    :else (lit-type form)))
+
+; --- the driver: annotations flow through the REAL pipe (P0) ------------------
+;
+; The demo file is run first (its defs + ^ meta land in Env), then checked
+; from source data. Signatures come from Env.meta — nothing is re-declared
+; for the checker's benefit.
+
+(defn sigs-from-env
+  "The {name → {:args [tagset…] :ret tagset}} table for `ns`, from the
+   ^{:args :ret} metadata the compiler already stores (P0)."
+  [ns]
+  (reduce
+    (fn [acc name]
+      (let [m (BeamLisp.Env/meta ns name)]
+        (if (and (not (= m :error)) (contains? (second m) :args))
+          (let [mm (second m)]
+            (assoc acc name
+                   {:args (into [] (map type-expr (:args mm)))
+                    :ret  (type-expr (:ret mm))}))
+          acc)))
+    {}
+    (BeamLisp.Env/public_names ns)))
+
+; A small core seed table — P6 owns the full survey; the spike seeds only
+; what the demo calls.
+(def core-sigs
+  {"+"    {:args [#{:int :float} #{:int :float}] :ret #{:int :float}}
+   "*"    {:args [#{:int :float} #{:int :float}] :ret #{:int :float}}
+   "str"  {:args [any] :ret #{:string}}
+   "get"  {:args [#{:map} any] :ret any}
+   "-"    {:args [#{:int :float} #{:int :float}] :ret #{:int :float}}
+   "count" {:args [any] :ret #{:int}}
+   "max"  {:args [#{:int :float} #{:int :float}] :ret #{:int :float}}
+   "pr-str" {:args [any] :ret #{:string}}
+   "println" {:args [any] :ret #{:nil}}})
+
+(defn check-source
+  "Check every top-level form of source text. Returns the warnings."
+  [src ns]
+  (let [sigs (merge core-sigs (sigs-from-env ns))
+        forms (BeamLisp.Compiler/read_all_data src)]
+    (doall
+      (map (fn [form]
+             (if (and (list? form)
+                      (symbol? (first form))
+                      (= (str (first form)) "defn"))
+               ; check the body with params bound to their declared tags
+               (let [name (second form)
+                     sig  (get sigs (str name) nil)
+                     params (into [] (nth form 2))
+                     env (if (nil? sig)
+                           {}
+                           (zipmap params (:args sig)))]
+                 (doall (map (fn [b] (infer sigs env b))
+                             (rest (rest (rest form)))))
+                 never)
+               (infer sigs {} form)))
+           forms))
+    (deref warnings)))

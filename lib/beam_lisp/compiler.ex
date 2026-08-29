@@ -1616,6 +1616,29 @@ defmodule BeamLisp.Compiler do
 
   # --- macros ---
 
+  @doc """
+  One top-level macroexpansion step: if `form` is a call to a macro
+  visible in `ns`, expand it once; otherwise return it unchanged.
+
+  AOT's value-def capture uses this to see through defining macros —
+  `(defsmell …)`, `(defrule …)` and any user macro that EXPANDS TO a
+  `def`. Without it the capture classified the unexpanded call (not a
+  `def`), the definition was never replayed by `__bl_init__`, and the
+  var simply did not exist after an AOT load.
+  """
+  def macroexpand_1({:list, [{:symbol, name} | args]} = form, ns) do
+    if name in @special_forms do
+      form
+    else
+      case macro_for(ns, name) do
+        {:ok, m} -> expand_macro(m, form, args, new_env(ns))
+        :error -> form
+      end
+    end
+  end
+
+  def macroexpand_1(form, _ns), do: form
+
   # Macros resolve at compile time against the live registry, so a
   # defmacro must precede its callers in the same session.
   defp macro_for(ns, name) do
@@ -1854,20 +1877,25 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  defp attr_value_ast({:symbol, _} = sym, _env), do: sym
-
-  # A metadata value written in SOURCE arrives as a reader form. One a MACRO
-  # attached arrives as datum -- `(vary-meta name assoc :arglists '([]))`
-  # stores a bare Elixir list, because by then the quoted form has already
-  # been evaluated into data. `do_compile/2` has no clause for bare data and
-  # crashed with a raw Elixir error naming neither the var nor the key.
-  #
-  # `data_to_form/1` is the existing datum -> form bridge (the same one
-  # syntax-quote uses crossing back), so the two paths converge here instead
-  # of each growing its own compiler clauses.
-  defp attr_value_ast(form, env) do
-    compile(bl_form?(form) && form || data_to_form(form), notail(env))
+  # Metadata values are DATA, not code. `^{:args [int]}` stores the
+  # vector [int] of SYMBOLS — exactly what Clojure's reader metadata does.
+  # The earlier behaviour compiled each value as a form: `[int]` became a
+  # runtime fn capture (&Core.int/1), bare symbols stayed raw reader
+  # tuples, and type-expression metadata (unions, fn types, holes) was
+  # impossible because storing it meant CALLING it. `datum/1` is quote's
+  # own form → data bridge; macro-attached values arrive as runtime data
+  # already (vary-meta), so they escape directly.
+  defp attr_value_ast(form, _env) do
+    data = if bl_form?(form), do: datum(form), else: form
+    Macro.escape(unquote_data(data))
   end
+
+  # `'(…)` written in source and `(list 'quote …)` built by a macro (the
+  # defnav :arglists stamp) both use one quote layer to MEAN "the datum,
+  # literally". Now that metadata is stored as data rather than evaluated,
+  # that layer is intent, not content — strip exactly one.
+  defp unquote_data([{:symbol, "quote"}, x]), do: x
+  defp unquote_data(x), do: x
 
   # Reader forms are tagged tuples; anything else reaching a metadata value is
   # runtime data a macro put there.
