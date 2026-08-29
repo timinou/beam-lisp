@@ -112,6 +112,30 @@
 
 (defn- untranslatable? [x] (= x :untranslatable))
 
+; ── payload-variant discriminant recognition (R1b) ──────────────────────
+; (some? (:on mode)) is the discriminant "the :on arm is present". Recognize the
+; inner (:on mode) as a payload-accessor over a known variant tag, and emit the
+; z3 tester ((_ is E_mode-on) mode).
+(defn- variant-access?
+  "Is `node` a payload accessor (:tag field) over a known payload variant?"
+  [variants node]
+  (let [f (typed/node-form node)]
+    (and (= :list (typed/node-tag f))
+         (let [its (typed/node-items f)]
+           (and (= 2 (count its))
+                (= :keyword (typed/node-tag (typed/node-form (first its))))
+                (let [v (get variants (typed/node-name (typed/node-form (first its))))]
+                  (and (map? v) (:field v))))))))
+
+(defn- variant-is-test
+  "The z3 discriminant ((_ is Ctor) arg) for a recognized (:tag arg) accessor."
+  [variants node]
+  (let [its (typed/node-items (typed/node-form node))
+        k (typed/node-name (typed/node-form (first its)))
+        v (get variants k)
+        arg (typed/node-name (typed/node-form (second its)))]
+    (str "((_ is " (:ctor v) ") " arg ")")))
+
 (defn- translate-args
   "Translate every child; if any is untranslatable, the whole form is."
   [vars variants nodes]
@@ -138,12 +162,31 @@
                :else         :untranslatable)
 
        ; a keyword literal → its z3 constructor. A finite tagged variant is a z3
-       ; algebraic datatype; :open becomes the SORT-PREFIXED constructor the
-       ; caller registered (Phase-open) — bare `open` collides across datatypes.
-       ; A keyword absent from `variants` is not a modelled enum → untranslatable.
+       ; algebraic datatype; a NULLARY arm :open becomes the sort-prefixed
+       ; constructor the caller registered (E_phase-open) — bare `open` collides
+       ; across datatypes. A keyword absent from `variants` → untranslatable.
        (= tg :keyword)
-         (let [k (typed/node-name f)]
-           (if (contains? variants k) (get variants k) :untranslatable))
+         (let [k (typed/node-name f)
+               v (get variants k)]
+           (cond (nil? v) :untranslatable
+                 (map? v) (:ctor v)      ; a payload arm named bare = its 0-ary use is rare; emit ctor
+                 :else v))               ; nullary arm: the constructor string
+
+       ; a single-key MAP literal {:on lvl} → a PAYLOAD-arm constructor call
+       ; (E_mode-on <lvl>). The key is the tag; its value is the payload arg.
+       (= tg :map)
+         (let [items (typed/node-items f)]
+           (if (not (= 1 (count items)))
+             :untranslatable
+             (let [pair (first items)
+                   k (typed/node-name (typed/node-form (first (erlang/tuple_to_list pair))))
+                   vnode (second (erlang/tuple_to_list pair))
+                   v (get variants k)]
+               (if (and (map? v) (:field v))
+                 (let [a (translate vars variants vnode)]
+                   (if (untranslatable? a) :untranslatable
+                     (str "(" (:ctor v) " " a ")")))
+                 :untranslatable))))
 
        ; a symbol: emit its name (state var or declared input)
        (= tg :symbol)
@@ -155,11 +198,27 @@
            (if (empty? its)
              :untranslatable
              (let [head (typed/node-form (first its))]
-               (if (not (= :symbol (typed/node-tag head)))
+               (cond
+                 ; a KEYWORD head applied to a variant field: (:on mode) — the
+                 ; PAYLOAD ACCESSOR. Emits the z3 field selector (E_mode-on.val mode).
+                 (and (= :keyword (typed/node-tag head)) (= 1 (count (rest its))))
+                   (let [k (typed/node-name head)
+                         v (get variants k)
+                         argsmt (translate vars variants (second its))]
+                     (if (and (map? v) (:field v) (not (untranslatable? argsmt)))
+                       (str "(" (:field v) " " argsmt ")")
+                       :untranslatable))
+                 (not (= :symbol (typed/node-tag head)))
                  :untranslatable
+                 :else
                  (let [op (typed/node-name head)
                        args (rest its)]
                    (cond
+                     ; (some? (:on mode)) / (is? (:on mode)) — the DISCRIMINANT:
+                     ; "the :on arm is present" → ((_ is E_mode-on) mode).
+                     (and (contains? #{"some?" "is?"} op) (= 1 (count args))
+                          (variant-access? variants (first args)))
+                       (variant-is-test variants (first args))
                      ; unary desugar: (pos? x) etc — exactly one arg
                      (and (contains? unary-desugar op) (= 1 (count args)))
                        (let [a (translate vars variants (first args))]
@@ -288,22 +347,47 @@
 
 (defn variant-ctor
   "The z3 constructor name for tag `k` in the enum sort named `sort`:
-   sort \"Phase\", k \"open\" → \"Phase-open\"."
+   sort \"E_phase\", k \"open\" → \"E_phase-open\"."
   [sort k]
   (str sort "-" k))
 
+(defn variant-field
+  "The z3 accessor (field selector) name for a payload arm `k` of `sort`:
+   \"E_mode\", \"on\" → \"E_mode-on.val\"."
+  [sort k]
+  (str sort "-" k ".val"))
+
+; A variant sort's `arms` is {tag → payload-sort-or-nil}: nil = a NULLARY arm
+; (:paused), a sort string = a PAYLOAD arm ({:on Int}). This one shape drives
+; both the map the translator reads and the declare-datatypes prelude.
+
 (defn variants-map
-  "{tag → constructor} for an enum sort over a universe of tag strings:
-   \"Phase\" #{\"idle\" \"open\"} → {\"idle\" \"Phase-idle\" \"open\" \"Phase-open\"}."
-  [sort universe]
-  (into {} (map (fn [k] [k (variant-ctor sort k)]) (into [] universe))))
+  "{tag → entry} for a variant `sort` over `arms` {tag→payload-sort|nil}. A
+   nullary arm maps to its constructor STRING; a payload arm to a MAP
+   {:ctor :field :sort} the translator uses for constructor/accessor/discriminant."
+  [sort arms]
+  (into {} (map (fn [pair]
+                  (let [k (first pair) psort (second pair)]
+                    (if (nil? psort)
+                      [k (variant-ctor sort k)]
+                      [k {:ctor (variant-ctor sort k)
+                          :field (variant-field sort k)
+                          :sort psort}])))
+                (into [] arms))))
 
 (defn datatype-decl
-  "The (declare-datatypes …) prelude line for an enum `sort` over `universe`
-   (a set of tag strings). All constructors sort-prefixed."
-  [sort universe]
+  "The (declare-datatypes …) prelude line for a variant `sort` over `arms`
+   {tag→payload-sort|nil}. A nullary arm is a bare constructor; a payload arm is
+   (Ctor (Ctor.val Sort)). All constructors sort-prefixed (no cross-sort clash)."
+  [sort arms]
   (str "(declare-datatypes () ((" sort " "
-       (join " " (map (fn [k] (variant-ctor sort k)) (into [] universe)))
+       (join " " (map (fn [pair]
+                        (let [k (first pair) psort (second pair)]
+                          (if (nil? psort)
+                            (variant-ctor sort k)
+                            (str "(" (variant-ctor sort k)
+                                 " (" (variant-field sort k) " " psort "))"))))
+                      (into [] arms)))
        ")))\n"))
 
 (defn of-node-len

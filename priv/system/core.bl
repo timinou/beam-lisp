@@ -360,6 +360,14 @@
 (defn- kw-name [n] (typed/node-name (typed/node-form n)))
 (defn- enum-sort-name [field] (str "E_" field))
 
+(defn- variant-value?
+  "Is a field's init VALUE node a variant arm? A bare keyword (:idle, nullary) or
+   a single-key map ({:on 5}, payload). A multi-key map is a record (Rung 2)."
+  [v]
+  (let [f (typed/node-form v) tg (typed/node-tag f)]
+    (or (= tg :keyword)
+        (and (= tg :map) (= 1 (count (typed/node-items f)))))))
+
 (defn- assigned-keyword
   "The keyword tag a next-state NODE assigns to `field` (map value), or nil."
   [field next-node]
@@ -373,6 +381,41 @@
                     (kw-name v) nil)))
               (typed/node-items f))
         nil))))
+
+(defn- field-value-node
+  "The NODE assigned to `field` in a next-state map node, or nil."
+  [field next-node]
+  (if (nil? next-node) nil
+    (let [f (typed/node-form next-node)]
+      (if (= :map (typed/node-tag f))
+        (some (fn [pair]
+                (let [k (first (erlang/tuple_to_list pair))
+                      v (second (erlang/tuple_to_list pair))]
+                  (if (= field (typed/node-name (typed/node-form k))) v nil)))
+              (typed/node-items f))
+        nil))))
+
+(defn- assigned-arm
+  "The [tag payload-sort|nil] a next assigns to `field`, or nil when it assigns
+   no variant. A bare keyword :paused → [\"paused\" nil] (nullary). A single-key
+   map {:on lvl} → [\"on\" sort] where sort is the payload value's tag-lattice
+   sort (a literal's type; a symbol/expr defaults to Int)."
+  [field next-node]
+  (let [v (field-value-node field next-node)]
+    (if (nil? v) nil
+      (let [vf (typed/node-form v) vtg (typed/node-tag vf)]
+        (cond
+          (= vtg :keyword) [(kw-name v) nil]
+          (= vtg :map)
+            (let [items (typed/node-items vf)]
+              (if (= 1 (count items))
+                (let [pair (first items)
+                      k (typed/node-name (typed/node-form (first (erlang/tuple_to_list pair))))
+                      pv (second (erlang/tuple_to_list pair))
+                      ps (smt/sort-of-value pv)]
+                  [k (if (= ps :unknown) "Int" ps)])
+                nil))
+          :else nil)))))
 
 (defn- keywords-near
   "Every keyword tag appearing in a LIST that also mentions the symbol `field`,
@@ -400,16 +443,21 @@
                   (typed/node-items f))
         :else []))))
 
-(defn- enum-universe
-  "The complete tag set for an enum `field`: assigned in init + every message
-   next, and compared in every guard + the invariant. A set of tag strings."
+(defn- variant-arms
+  "{tag → payload-sort|nil} — the complete arm set of variant `field`. A PAYLOAD
+   arm (a sort) comes from an assignment {:on lvl}; a NULLARY arm (nil) from a
+   bare-keyword assignment :paused OR a tag only mentioned in a guard/invariant
+   (= field :error). Payload sort wins over nullary if a tag appears both ways.
+   The universe is complete — init + every next + guards + invariant — so the
+   declare-datatypes is total and z3's no-junk axiom is exact."
   [field inv-node init-c msg-cs]
-  (into #{} (distinct
-              (concat
-                (let [ik (assigned-keyword field (:next-node init-c))] (if ik [ik] []))
-                (keep (fn [c] (assigned-keyword field (:next-node c))) msg-cs)
-                (mapcat (fn [c] (keywords-near field (:guard-node c))) msg-cs)
-                (keywords-near field inv-node)))))
+  (let [assigns (keep (fn [c] (assigned-arm field (:next-node c)))
+                      (cons init-c msg-cs))
+        mentioned (distinct (concat (mapcat (fn [c] (keywords-near field (:guard-node c))) msg-cs)
+                                    (keywords-near field inv-node)))]
+    (reduce (fn [m k] (if (contains? m k) m (assoc m k nil)))   ; nullary unless already payload
+            (into {} (map (fn [a] [(first a) (second a)]) assigns))
+            mentioned)))
 
 ; ── phase graph: the enum's implicit STRUCTURE, reasoned by datalog (R1a) ──
 ;
@@ -476,9 +524,10 @@
                                (let [k (first (erlang/tuple_to_list pair))
                                      v (second (erlang/tuple_to_list pair))
                                      field (typed/node-name (typed/node-form k))]
-                                 ; a keyword init value ⇒ enum field: sort = E_<field>,
-                                 ; the datatype whose universe is gathered later.
-                                 [field (if (kw-node? v) (enum-sort-name field) (node-sort v))]))
+                                 ; a variant init value (keyword or single-key map)
+                                 ; ⇒ a sum-type field: sort = E_<field>, arms gathered
+                                 ; later. A multi-key map / scalar keeps its functor sort.
+                                 [field (if (variant-value? v) (enum-sort-name field) (node-sort v))]))
                              (typed/node-items f))]
               {:svars (into [] (map first pairs))
                :sorts (into {} pairs)})
@@ -592,12 +641,13 @@
             sorts (:sorts shape)
             init-c0 (first (filter (fn [c] (= :init (:label c))) clauses))
             msg-cs0 (filter (fn [c] (not (= :init (:label c)))) clauses)
-            ; ENUM fields (sort E_*): gather each one's tag universe, build the
-            ; combined declare-datatypes prelude + the tag→constructor map.
+            ; VARIANT fields (sort E_*): gather each one's arm map {tag→sort|nil}
+            ; (nullary + payload), build the combined declare-datatypes prelude +
+            ; the tag→entry map the translator reads.
             enum-fields (filter (fn [v] (= (get sorts v) (enum-sort-name v))) svars)
-            universes (into {} (map (fn [v] [v (enum-universe v inv-node init-c0 msg-cs0)]) enum-fields))
-            prelude (join "" (map (fn [v] (smt/datatype-decl (enum-sort-name v) (get universes v))) enum-fields))
-            variants (reduce (fn [m v] (merge m (smt/variants-map (enum-sort-name v) (get universes v))))
+            arm-maps (into {} (map (fn [v] [v (variant-arms v inv-node init-c0 msg-cs0)]) enum-fields))
+            prelude (join "" (map (fn [v] (smt/datatype-decl (enum-sort-name v) (get arm-maps v))) enum-fields))
+            variants (reduce (fn [m v] (merge m (smt/variants-map (enum-sort-name v) (get arm-maps v))))
                              {} enum-fields)
             inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) variants inv-node))]
         (if (or (empty? svars) (= inv-smt :untranslatable))
@@ -619,21 +669,30 @@
                 ; enum CONSTRUCTORS (E_phase-open, …) appear in translated guards/
                 ; nexts but are VALUES, not inputs — declaring them shadows the
                 ; datatype and desyncs z3 (same class as the true/false exclusion).
-                ctor-set (into #{} (vals variants))
+                ; a variant entry is a constructor STRING (nullary) or a MAP
+                ; {:ctor :field} (payload). All of ctor/field are z3 datatype
+                ; names, never inputs — exclude every one from input decls.
+                ctor-set (into #{} (mapcat (fn [e] (if (map? e) [(:ctor e) (:field e)] [e]))
+                                           (into [] (vals variants))))
                 inputs (filter (fn [nm] (and (not (contains? svarset nm))
                                              (not (contains? ctor-set nm))))
                                (into [] input-names))
                 ; INPUT SORTS by flow: an input that appears in field v's :next
                 ; must share v's sort (z3 has no Int+Real). Scan each transition's
-                ; nexts; an input inherits the sort of the FIRST field whose next
-                ; mentions it; unmentioned inputs default Int. Keeps the integer
-                ; common case, lifts a Real/String amount to its field's theory.
+                ; nexts; an input inherits the sort of the FIRST SCALAR field whose
+                ; next mentions it; unmentioned inputs default Int. A VARIANT field
+                ; (sort E_*) is skipped — an input feeding it is a PAYLOAD arg (a
+                ; scalar), not the datatype itself, so it defaults Int (R1b payloads
+                ; are scalars; a Real/String payload would need arm-sort lookup).
+                scalar-sort? (fn [s] (contains? #{"Int" "Real" "Bool" "String"} s))
                 input-sort (fn [nm]
                              (or (some (fn [t]
                                          (some (fn [v]
-                                                 (let [nx (get (:nexts t) v)]
-                                                   (if (and nx (contains? (into #{} (free-syms nx)) nm))
-                                                     (get sorts v) nil)))
+                                                 (let [nx (get (:nexts t) v)
+                                                       vs (get sorts v)]
+                                                   (if (and nx (scalar-sort? vs)
+                                                            (contains? (into #{} (free-syms nx)) nm))
+                                                     vs nil)))
                                                svars))
                                        ts)
                                  "Int"))
@@ -927,6 +986,102 @@
              :checked true
              :extension :exact
              :warnings (box-warnings {:failures step-fails} pos)}))))))
+
+; ── R5: capacity SYNTHESIS — discover the tightest bound, don't check one ──
+;
+; verify-capacity CHECKS an annotated (count c ≤ k). Synthesis instead DISCOVERS
+; the smallest k for which (count c ≤ k) is INDUCTIVE (established at init AND
+; preserved by every transition). k-inductiveness is monotone in k — if k works,
+; k+1 works — so the smallest inductive k is the tightest safe capacity, found by
+; searching upward. A machine whose length can grow without bound has no finite
+; k (search hits the ceiling → :unbounded). This is the verifier run backwards:
+; the annotation stops being an input and becomes an output.
+
+(defn- len-bound-inductive?
+  "Is (<= len-var k) established at init AND preserved by all transitions `ts`?
+   Reuses the length-abstraction SMT the capacity checker builds."
+  [port len-var idef-k decls nonneg init-len ts]
+  (let [est (if (or (nil? init-len) (= init-len :untranslatable)) true
+              (= "unsat" (z3/check port (str idef-k decls nonneg
+                                             "(assert (not (Inv " init-len ")))\n"))))
+        preserved (every? (fn [t]
+                            (let [prime (str "(declare-const " len-var "2 Int)\n")
+                                  smt (str idef-k decls prime
+                                           "(assert (>= " len-var " 0))\n"
+                                           "(assert (Inv " len-var "))\n"
+                                           (if (:guard t) (str "(assert " (:guard t) ")\n") "")
+                                           "(assert (= " len-var "2 " (:next t) "))\n"
+                                           "(assert (not (Inv " len-var "2)))\n")]
+                              (= "unsat" (z3/check port smt))))
+                          ts)]
+    (and est preserved)))
+
+(defn synthesize-capacity
+  "DISCOVER the tightest capacity of a single-collection process: the smallest k
+   for which (count c ≤ k) is inductive, searched over 0..`ceiling` (default 64).
+   Returns {:name :synthesized k|nil :bounded bool}. :synthesized nil + :bounded
+   false ⇒ no finite bound ≤ ceiling (the length can grow unboundedly). No
+   annotation needed — the invariant is the OUTPUT."
+  ([port node] (synthesize-capacity port node 64))
+  ([port node ceiling]
+   (let [sm (model/system-model node)
+         clauses (:transitions sm)
+         colls (collection-vars-any clauses)
+         svars (into [] colls)
+         len-var (str (first svars) "_len")
+         len-vars [len-var]]
+     (if (empty? colls)
+       {:name (:name sm) :synthesized nil :bounded false :reason "no collection state"}
+       (let [init-c (first (filter (fn [c] (= :init (:label c))) clauses))
+             msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
+             coll (first svars)
+             ts (keep (fn [c]
+                        (let [g (:guard-node c)
+                              gsmt (if (nil? g) nil (smt/of-node-len (set svars) colls g))
+                              ; the collection field's VALUE node (unpack the map),
+                              ; then length-abstract THAT — not the whole next map.
+                              vnode (field-value-node coll (:next-node c))
+                              nsmt (if (nil? vnode) nil (smt/of-node-len (set svars) colls vnode))]
+                          (if (or (= gsmt :untranslatable) (= nsmt :untranslatable) (nil? nsmt))
+                            nil {:label (:label c) :guard gsmt :next nsmt})))
+                      msg-cs)
+             decls (str "(declare-const " len-var " Int)\n")
+             nonneg (str "(assert (>= " len-var " 0))\n")
+             init-vnode (if init-c (field-value-node coll (:next-node init-c)) nil)
+             init-len (if init-vnode (smt/of-node-len (set svars) colls init-vnode) nil)
+             idef-of (fn [k] (str "(define-fun Inv ((" len-var " Int)) Bool (<= " len-var " " k "))\n"))
+             found (some (fn [k]
+                           (if (len-bound-inductive? port len-var (idef-of k) decls nonneg init-len ts)
+                             k nil))
+                         (range 0 (+ ceiling 1)))]
+         (if (nil? found)
+           {:name (:name sm) :synthesized nil :bounded false}
+           {:name (:name sm) :synthesized found :bounded true}))))))
+
+(defn- collection-vars-any
+  "Collection var names inferred from the transitions (not the invariant): a
+   field a next grows/shrinks with conj/rest, or count/empty? reads. Used by
+   synthesis, which has NO invariant to read collections from."
+  [clauses]
+  (into #{}
+    (distinct
+      (mapcat (fn [c]
+                (let [n (:next-node c)]
+                  (if (nil? n) []
+                    (let [f (typed/node-form n)]
+                      (if (= :map (typed/node-tag f))
+                        (keep (fn [pair]
+                                (let [k (typed/node-name (typed/node-form (first (erlang/tuple_to_list pair))))
+                                      v (second (erlang/tuple_to_list pair))
+                                      vf (typed/node-form v)]
+                                  ; a field whose next is (conj field _)/(rest field) is a collection
+                                  (if (and (= :list (typed/node-tag vf))
+                                           (contains? #{"conj" "rest" "pop" "next"}
+                                                      (typed/node-name (typed/node-form (first (typed/node-items vf))))))
+                                    k nil)))
+                              (typed/node-items f))
+                        [])))))
+              clauses))))
 
 (defn verify-process-report
   "verify-process, with its warnings RENDERED through errors/render for a human:
