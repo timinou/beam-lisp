@@ -122,6 +122,42 @@
                                 (fireable? port inv svar decls guard c)))
                    (candidates domain))))
 
+; ── P21: repair — the checker run backwards, ranked by permissiveness ────────
+;
+; abduce yields every SOUND guard that closes the triple. Several may qualify:
+; for a broken withdraw both (>= balance amt) and (<= amt 0) preserve balance≥0
+; — but (<= amt 0) forbids the useful case (withdrawing a positive amount). The
+; RIGHT repair is the WEAKEST sound guard: the one admitting the most behaviour.
+; "G1 weaker than G2" ≡ G2 ⇒ G1 under the invariant — z3 decides it.
+
+(defn- guard-implies?
+  "Under the invariant, does g2 imply g1? (g2 ⇒ g1 means g1 is WEAKER/more
+   permissive). Assert inv ∧ g2 ∧ ¬g1; unsat ⇒ the implication holds."
+  [port inv svar decls g1 g2]
+  (= "unsat" (z3/check port (str decls
+                                "(assert " (inv svar) ")\n"
+                                "(assert " g2 ")\n"
+                                "(assert (not " g1 "))\n"))))
+
+(defn repair-transition
+  "The WEAKEST sound guard that repairs a broken transition, or nil if none in
+   the candidate vocabulary works. `inv`/`svar`/`decls`/`next` describe the
+   transition (as abduce takes them); `domain` seeds the candidate predicates.
+   Returns {:repair guard :alternatives [all sound guards]} — the repair is the
+   maximal element under 'weaker-than' (implied by every other sound guard), so
+   it forbids the least. nil :repair ⇒ unrepairable from this vocabulary."
+  [port inv svar decls next domain]
+  (let [sound (abduce port inv svar decls nil next domain)]
+    (if (empty? sound)
+      {:repair nil :alternatives []}
+      ; the weakest: a g implied by every other sound candidate (g is the most
+      ; permissive — everything else is a special case of it).
+      (let [weakest (some (fn [g]
+                            (if (every? (fn [g2] (guard-implies? port inv svar decls g g2)) sound)
+                              g nil))
+                          sound)]
+        {:repair (or weakest (first sound)) :alternatives sound}))))
+
 (defn all-senders-guarantee?
   "True when every sender of `label` in `db` guarantees `pred` — the discharge
    only we can do (TLA+ has no callers). `q-fn` is (query db & args) → rows."
@@ -718,6 +754,78 @@
              :holds (and init-est (empty? failures))
              :checked true
              :warnings (box-warnings {:failures failures} pos)}))))))
+
+(defn repair-process
+  "For each transition that BREAKS the invariant, synthesize the weakest extra
+   guard that repairs it — the checker run backwards over the whole process.
+   Returns {:name :repairs [{:label :guard} …] :holds bool}. :holds true ⇒
+   nothing to repair; a :guard of nil ⇒ that transition is unrepairable from the
+   candidate vocabulary. The synthesized guard is ROUND-TRIPPED: it is accepted
+   only when, ADDED to the transition, the joint preservation check passes — so a
+   repair is verified by the same forward checker that found the break."
+  [port node]
+  (let [sm (model/system-model node)
+        clauses (:transitions sm)
+        inv-node (invariant-node node)]
+    (if (nil? inv-node)
+      {:name (:name sm) :repairs [] :holds nil :checked false}
+      (let [shape (state-shape inv-node clauses)
+            svars (:svars shape)
+            sorts (:sorts shape)
+            inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) {} inv-node))]
+        (if (or (empty? svars) (= inv-smt :untranslatable))
+          {:name (:name sm) :repairs [] :holds nil :checked false}
+          (let [msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
+                ts (keep-translatable-multi svars sorts {} msg-cs)
+                svarset (set svars)
+                input-names (reduce (fn [acc t]
+                                      (reduce (fn [a s] (if (nil? s) a (into a (free-syms s))))
+                                              acc (cons (:guard t) (into [] (vals (:nexts t))))))
+                                    #{} ts)
+                inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
+                decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
+                           (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
+                ; candidate domain: state vars + inputs + {0}, the abduce vocabulary
+                domain (concat svars inputs (list "0"))
+                cands (candidates domain)
+                ; a strengthened guard G repairs t iff (Inv ∧ guard ∧ G ∧ s2=next)
+                ; preserves Inv AND is still fireable (not vacuously false).
+                repair-for (fn [t]
+                             (let [g0 (:guard t)
+                                   works (filter (fn [c]
+                                                   (let [combined (if g0 (str "(and " g0 " " c ")") c)]
+                                                     (and (:preserved (preserves-joint? port "" svars sorts inv-smt decls combined (:nexts t)))
+                                                          (joint-fireable? port svars sorts inv-smt decls g0 c))))
+                                                 cands)]
+                               (if (empty? works) nil
+                                 (or (some (fn [g] (if (every? (fn [g2] (guard-implies-multi? port svars sorts inv-smt decls g g2)) works) g nil)) works)
+                                     (first (sort-by count works))))))
+                broken (filter (fn [t]
+                                 (not (:preserved (preserves-joint? port "" svars sorts inv-smt decls (:guard t) (:nexts t)))))
+                               ts)
+                repairs (map (fn [t] {:label (:label t) :guard (repair-for t)}) broken)]
+            {:name (:name sm)
+             :repairs (into [] repairs)
+             :holds (empty? broken)
+             :checked true}))))))
+
+(defn- joint-fireable?
+  "Is the strengthened guard (and guard cand) satisfiable with the invariant?
+   Rejects a candidate that 'repairs' by making the transition impossible."
+  [port svars sorts inv-smt decls guard cand]
+  (let [smt (str (inv-define-fun "" svars sorts inv-smt) decls
+                 "(assert (Inv " (join " " svars) "))\n"
+                 (if guard (str "(assert " guard ")\n") "")
+                 "(assert " cand ")\n")]
+    (= "sat" (z3/check port smt))))
+
+(defn- guard-implies-multi?
+  "Under the invariant (joint), does g2 imply g1? g2 ⇒ g1 ≡ g1 is weaker."
+  [port svars sorts inv-smt decls g1 g2]
+  (= "unsat" (z3/check port (str (inv-define-fun "" svars sorts inv-smt) decls
+                                 "(assert (Inv " (join " " svars) "))\n"
+                                 "(assert " g2 ")\n"
+                                 "(assert (not " g1 "))\n"))))
 
 (defn- free-syms
   "The identifier tokens in an SMT-ish or source string — words that are not ops,
