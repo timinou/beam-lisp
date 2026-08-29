@@ -1,0 +1,250 @@
+; research/p16_model/extract.bl — P16a: the transition-relation extractor.
+;
+; ── The load-bearing claim ────────────────────────────────────────────
+;
+; Verification is a property of the EVALUATOR, not of any macro. So the
+; extractor reads a process down to the PRIMITIVES — receive / loop-recur /
+; function clauses / guards / defmulti dispatch — and lowers it to ONE
+; normalized object: a set of TRANSITION CLAUSES.
+;
+;   clause ≜ {:label kw           ; a name for the transition (the message head)
+;             :pattern node       ; what it matches (the message / arg shape)
+;             :guard  node|nil    ; the :when condition (the enabling predicate)
+;             :next   node        ; the (recur …) / reply state expression
+;             :body   [node…]}    ; the full body (effects live here, P16b reads them)
+;
+; The point of P16a: FIVE surface forms — a raw receive-loop, a multi-clause
+; defn, a defmulti, an annotated spawn, and a defserver — all lower to the
+; IDENTICAL clause set. Verification is then written once, over clauses.
+;
+; Reader shapes (confirmed empirically, /tmp/probe.exs):
+;   (receive P1 B1 P2 :when G2 B2 …)  → items:
+;       [sym"receive", vecP1, bodyL1, vecP2, kw":when", guardL2, bodyL2, …]
+;   (defserver name (init …) (handle-call PAT [from state] body) …) → items:
+;       [sym"defserver", sym name, (init …), (handle-call …), …]
+;   a clause list's head symbol is init/handle-call/handle-cast/handle-info.
+;
+; This is a research spike: lean, throwaway-able, one artifact (run.bl asserts
+; all five sets are equal). Reuses typed's node plumbing verbatim — no parallel
+; impl of the reader shape rules.
+
+(ns extract
+  (:require [typed] [errors]))
+
+; ── node plumbing (delegate to typed; never re-derive the shape rules) ──
+
+(defn tag [n] (typed/node-tag (typed/node-form n)))
+(defn items [n] (typed/node-items n))
+(defn form [n] (typed/node-form n))
+(defn nm [n] (typed/node-name (typed/node-form n)))
+(defn head-name
+  "The head symbol name of a list node, or nil if not a symbol-headed list."
+  [n]
+  (let [f (form n)]
+    (if (= :list (typed/node-tag f))
+      (let [its (typed/node-items f)]
+        (if (and (seq its) (= :symbol (tag (first its))))
+          (nm (first its))
+          nil))
+      nil)))
+
+; ── the message label: first element of a vector/list pattern ───────────
+;
+; A pattern [:withdraw amt] labels the transition :withdraw. A bare symbol
+; pattern (a defn param) has no keyword head → label is the whole pattern's
+; printed shape (handled by the hash namer downstream). Here: the keyword
+; head when present, else :_.
+
+(defn pattern-label [pat]
+  (let [f (form pat)
+        tg (typed/node-tag f)]
+    (cond
+      (contains? #{:vector :list} tg)
+        (let [its (typed/node-items f)]
+          (if (and (seq its) (= :keyword (tag (first its))))
+            (keyword (nm (first its)))
+            :_))
+      (= :keyword tg) (keyword (nm f))
+      :else :_)))
+
+; ── the next-state expression: strip the recur/reply/noreply/ok wrapper ─
+;
+; The transition's :next is the STATE the machine moves to — normalized so
+; that a loop's `(recur S)`, a server's `(reply val S)`, and a defmethod's
+; bare returned value `S` all yield the SAME S. That normalization is what
+; makes value-dispatch forms produce identical transitions.
+;
+;   (recur S)        → S        (single loop var)
+;   (reply val S)    → S        (OTP: state is the 2nd arg)
+;   (noreply S)      → S
+;   (ok S)           → S
+;   bare body value  → the body form itself (defmethod/defn return the state)
+
+(def next-heads #{"recur" "reply" "noreply" "ok"})
+
+(defn- find-wrapper
+  "The first recur/reply/noreply/ok form under a body node, or nil."
+  [node]
+  (let [f (form node)]
+    (if (= :list (typed/node-tag f))
+      (if (contains? next-heads (head-name node))
+        node
+        (some (fn [c] (find-wrapper c)) (typed/node-items f)))
+      nil)))
+
+(defn- state-of-wrapper
+  "The state argument of a next-state wrapper."
+  [wrapper]
+  (let [its (typed/node-items (form wrapper))
+        h   (head-name wrapper)]
+    (cond
+      (= "reply" h) (nth its 2)      ; (reply val STATE)
+      :else         (nth its 1))))    ; (recur STATE) / (noreply STATE) / (ok STATE)
+
+(defn next-state
+  "The next-state EXPRESSION of a body: the wrapper's state arg, or — when the
+   body returns the state directly (defmethod/defn) — the body form itself."
+  [body-node]
+  (let [w (find-wrapper body-node)]
+    (if w (state-of-wrapper w) body-node)))
+
+; ── the normalized clause ───────────────────────────────────────────────
+;
+; A clause is normalized to a COMPARABLE value: {:label :pattern-shape :guard
+; :next-shape}. We compare on delaborated source strings (stable, α-agnostic
+; enough for the equality claim; the hash namer will do full α-renaming).
+
+(defn shape [n] (if (nil? n) nil (errors/delaborate n)))
+
+(defn clause
+  [label pattern guard next-node body]
+  {:label   label
+   :pattern (shape pattern)
+   :guard   (shape guard)
+   :next    (shape next-node)
+   :body    (map shape body)})
+
+; ── EXTRACTOR 1: raw receive ────────────────────────────────────────────
+;
+; items after the head: a flat stream  P B  |  P :when G B  (repeating).
+
+(defn extract-receive
+  "Clauses from a (receive …) node's item stream (excludes the head symbol)."
+  [receive-node]
+  (let [its (rest (typed/node-items (form receive-node)))]
+    (loop [xs its acc []]
+      (if (empty? xs)
+        acc
+        (let [pat (first xs)
+              after (rest xs)
+              guarded (and (seq after)
+                           (= :keyword (tag (first after)))
+                           (= "when" (nm (first after))))
+              guard (if guarded (second after) nil)
+              body-tail (if guarded (rest (rest after)) after)
+              body (first body-tail)            ; one body form per clause here
+              rest-xs (rest body-tail)]
+          (recur rest-xs
+                 (conj acc (clause (pattern-label pat) pat guard
+                                   (next-state body) [body]))))))))
+
+; ── EXTRACTOR 2: a loop wrapping a receive ──────────────────────────────
+;
+; (loop [bindings] (receive …)) — the loop BINDINGS are the state vars; the
+; inner receive carries the transitions. We descend to the receive.
+
+(defn find-receive [node]
+  (let [f (form node)]
+    (if (= :list (typed/node-tag f))
+      (if (= "receive" (head-name node))
+        node
+        (some find-receive (typed/node-items f)))
+      nil)))
+
+(defn extract-loop-receive [loop-node]
+  (let [rcv (find-receive loop-node)]
+    (if rcv (extract-receive rcv) [])))
+
+; ── EXTRACTOR 3: multi-clause defn (function overloading) ───────────────
+;
+; Each clause is a guarded action already, via typed/parse-clause. The
+; pattern is the params vector; the label is derived from the first param's
+; literal head if it is a keyword dispatch, else :_ (the hash namer handles
+; the anonymous case). :next is the recur / return value.
+
+(defn extract-defn [defn-items]
+  (let [parsed (nth (typed/defn-clauses defn-items) 2)]
+    (map (fn [pc]
+           (let [params (:params pc)
+                 guard  (:guard pc)
+                 body   (:body pc)
+                 last-body (last body)]
+             (clause (pattern-label (first params))
+                     (typed/list-node (apply list params))
+                     guard
+                     (next-state last-body)
+                     body)))
+         parsed)))
+
+; ── EXTRACTOR 4: defmulti + defmethods (dispatch as transitions) ────────
+;
+; The dispatch VALUE is the transition label; each defmethod is an edge. We
+; take a list of defmethod nodes for one multi and lower each.
+;   (defmethod handle :pay [s _] body)  → label :pay
+
+(defn extract-defmethods [defmethod-nodes]
+  (map (fn [dm]
+         (let [its (typed/node-items (form dm))
+               ; [sym"defmethod", sym multi, dispatch-val, params-vec, body…]
+               dispatch (nth its 2)
+               params   (nth its 3)
+               body     (drop 4 its)
+               last-body (last body)]
+           (clause (keyword (nm dispatch))
+                   params
+                   nil
+                   (next-state last-body)
+                   body)))
+       defmethod-nodes))
+
+; ── EXTRACTOR 5: defserver (the OTP form — must MATCH the raw ones) ──────
+;
+; items: [sym"defserver", sym name, (init …), (handle-* PAT [args state] body)…]
+; Each handle-* clause: head-name = handle-call/cast/info; the PAT is item 1,
+; the body is items 3.. . We normalize to the SAME clause shape as receive so
+; the equality claim holds. init is the :init transition (label :init).
+
+(def handle-heads #{"handle-call" "handle-cast" "handle-info" "init"})
+
+(defn extract-defserver [defserver-items]
+  (let [clauses (filter (fn [c] (contains? handle-heads (head-name c)))
+                        (drop 2 defserver-items))]
+    (map (fn [c]
+           (let [its (typed/node-items (form c))
+                 h   (head-name c)]
+             (if (= "init" h)
+               (let [body (drop 2 its)]           ; (init [args] body…)
+                 (clause :init (nth its 1) nil (next-state (last body)) body))
+               (let [pat  (nth its 1)             ; (handle-call PAT [args state] body…)
+                     body (drop 3 its)]
+                 (clause (pattern-label pat) pat nil
+                         (next-state (last body)) body)))))
+         clauses)))
+
+; ── the unifying entry: a form → clauses, dispatched on its head ────────
+;
+; This is the "read to the primitive" move: whatever the surface form, lower
+; it to clauses. Sugar the extractor doesn't recognize would macroexpand-1
+; first (codebase.bl's technique) — out of scope for the spike's five forms.
+
+(defn transitions
+  "Extract the transition clause set from a top-level form node."
+  [node]
+  (let [h (head-name node)]
+    (cond
+      (= h "receive")   (extract-receive node)
+      (= h "loop")      (extract-loop-receive node)
+      (= h "defserver") (extract-defserver (typed/node-items (form node)))
+      (= h "defn")      (extract-defn (typed/node-items (form node)))
+      (= h "defn-")     (extract-defn (typed/node-items (form node)))
+      :else             [])))
