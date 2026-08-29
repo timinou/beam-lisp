@@ -1,0 +1,290 @@
+; reload.bl — the coherent live-reload loop: the running image is the source of
+; truth, and every edit is a TRANSACTION over it.
+;
+; ── The one idea ────────────────────────────────────────────────────────
+;
+; A `.bl` file on disk is a live handle to a running namespace. You stage edits
+; into a BUNDLE (the set of changes since the last coherent image), and `commit`
+; either applies the whole bundle atomically — or holds it, printing every
+; reason it does not yet make sense, WITH THE OLD CODE STILL SERVING, until a
+; later edit completes the bundle. Nothing half-applied is ever observable.
+;
+; ── Why a bundle, not a file ────────────────────────────────────────────
+;
+; Rename a fn across its definition and its five callers: each individual save
+; is incoherent (the callers dangle, or the def is gone), yet the WHOLE change
+; is fine. The transaction unit must be the edit set, or a mid-rename save would
+; go live with a dangling reference — exactly the `undefined var` class the
+; provenance gate (aot.ex) already closes for stale beams, lifted to live edits.
+;
+; ── How it stays safe: coherence is STATIC ──────────────────────────────
+;
+; `commit` decides coherence from the bundle SOURCES plus the live image's
+; public names — WITHOUT executing the bundle. This is load-bearing: evaluating a
+; `defn` rebuilds its global shim module (`BeamLisp.Ns.<Ns>`), a side effect an
+; env fork does NOT contain (a fork isolates the var REGISTRY, not compiled BEAM
+; modules). So an eval-based "candidate image" would leak an incoherent def into
+; the live module the instant it validated. The predicates — dangling ref,
+; promise, type — are all statically decidable, so no evaluation is needed to
+; judge a bundle. Only a bundle PROVEN coherent is then evaluated into `:global`,
+; where each `defn` is a `Link.defvar` in place — an atomic hot swap. Callers
+; mid-flight finish on their captured body module (never reloaded, never purged);
+; the next call resolves the new one. No caller observes a missing or half-updated
+; var, and an incoherent bundle never touches the live image at all.
+;
+; ── Coherence = predicates over shipped machinery ───────────────────────
+;
+;   dangling ref  — a call whose head neither the bundle nor the image provides
+;                   (deferred/collect-unknown-calls, the L7 deferral layer)
+;   promise       — a `(declare x)` with no later `(defn x)` in bundle or image
+;   type          — an inferred-type conflict (typed/check-source, sound-only)
+;   message       — a queued message whose contract the bundle changed
+;                   (reload.migrate, Wave 3 — attached to the bundle, not here)
+;
+; A message-migration attached to a bundle is what makes an otherwise-incoherent
+; (contract-changing) bundle coherent again — see reload/attach and reload.migrate.
+
+(ns reload
+  (:require [env] [typed] [deferred]))
+
+;; ── the bundle: staged edits since the last coherent image ──────────────
+
+; {:staged {ns-string → source-string}   ; edits buffered, not yet applied
+;  :migration migration-or-nil           ; a reload.migrate spec bound to this bundle
+;  :status :empty|:staged|:applied|:held|:blocked
+;  :errors [error-map …]                 ; why a held/blocked bundle does not fit
+;  :applied [ns-string …]}               ; namespaces swapped by the last commit
+(def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []}))
+
+(declare status)
+(declare print-errors)
+
+(defn- declared-ns
+  "The namespace a source string declares — the symbol after a leading `(ns …)`.
+   nil when the first form is not `(ns …)`; a staged edit must name its ns so the
+   bundle keys are stable and match the running image."
+  [src]
+  (try
+    (let [forms (BeamLisp.Reader/read_string src)
+          f     (first forms)]
+      (if (and f (= :list (typed/node-tag (typed/node-form f))))
+        (let [items (typed/node-items (typed/node-form f))
+              head  (typed/node-form (first items))]
+          (if (and (= :symbol (typed/node-tag head))
+                   (= "ns" (typed/node-name (first items))))
+            (typed/node-name (second items))
+            nil))
+        nil))
+    (catch _ nil)))
+
+;; ── staging ─────────────────────────────────────────────────────────────
+
+(defn stage
+  "Buffer an edit into the pending bundle. Does NOT touch the live image — the
+   edit becomes visible only on a coherent `commit`. `ns` may be given, else it
+   is read from the source's `(ns …)` form. Returns the bundle status map."
+  ([src] (stage (declared-ns src) src))
+  ([ns src]
+   (when (nil? ns)
+     (throw (ex-info "reload/stage: source declares no (ns …); pass ns explicitly"
+                     {})))
+   (swap! state
+          (fn [s]
+            (-> s
+                (assoc :staged (assoc (:staged s) ns src))
+                (assoc :status :staged))))
+   (status)))
+
+(defn attach
+  "Bind a message-migration spec (reload.migrate) to the current bundle. A
+   bundle that changes a live process's message contract is incoherent until a
+   migration is attached — the migration is what fulfils the in-flight messages
+   under the new contract. See reload.migrate for the spec shape."
+  [migration]
+  (swap! state (fn [s] (assoc s :migration migration)))
+  (status))
+
+(defn abort
+  "Discard the pending bundle without touching the live image."
+  []
+  (reset! state {:staged {} :migration nil :status :empty :errors [] :applied []})
+  (status))
+
+(defn status
+  "The current bundle: what is staged, its coherence status, and why it is held."
+  []
+  (let [s (deref state)]
+    {:status  (:status s)
+     :bundle  (vec (keys (:staged s)))
+     :migration (some? (:migration s))
+     :errors  (:errors s)
+     :applied (:applied s)}))
+
+;; ── coherence pass (STATIC — never evaluates the bundle) ─────────────────
+
+(defn- defn-name
+  "If a form is a top-level definition (defn/defn-/def/defmacro), the name it
+   binds; else nil."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (= :list (typed/node-tag f))
+      (let [items (typed/node-items f)
+            head  (typed/node-name (first items))]
+        (if (contains? #{"defn" "defn-" "def" "defmacro"} head)
+          (typed/node-name (second items))
+          nil))
+      nil)))
+
+(defn- declared-names
+  "The names introduced by a `(declare a b …)` form, else []."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (and (= :list (typed/node-tag f))
+             (= "declare" (typed/node-name (first (typed/node-items f)))))
+      (map typed/node-name (rest (typed/node-items f)))
+      [])))
+
+(defn- bundle-defs
+  "The set of names the bundle DEFINES, per namespace: {ns → #{name …}}. A
+   forward reference to a name defined later in the same bundle is therefore not
+   dangling — the whole edit set is judged together, which is the point."
+  [staged]
+  (reduce (fn [acc pair]
+            (let [ns (first pair) src (second pair)
+                  names (set (filter some?
+                                     (map defn-name (BeamLisp.Reader/read_string src))))]
+              (assoc acc ns (into (get acc ns #{}) names))))
+          {} staged))
+
+(defn- provides?
+  "Whether `name` resolves in `ns`: defined by the bundle, or already a public
+   var of the live image (this ns or core). The union that makes a bundle
+   coherent as a whole."
+  [defs ns name]
+  (or (contains? (get defs ns #{}) name)
+      (not (= :error (BeamLisp.Env/fetch ns name)))
+      (contains? (set (BeamLisp.Env/public_names "core")) name)))
+
+(defn- dangling-errors
+  "Dangling references in one source: same-ns calls whose head neither the
+   bundle nor the image provides. Qualified heads (`other.ns/f`) resolve at their
+   target ns and are skipped by the deferral collector — we judge only what
+   truly resolves to nothing once the whole bundle is accounted for."
+  [defs ns src]
+  (let [unknown (deferred/collect-unknown-calls (BeamLisp.Reader/read_string src) ns)
+        still   (filter (fn [u] (not (provides? defs ns (:callee u)))) unknown)]
+    (map (fn [u] {:kind :dangling :ns ns :var (:callee u)
+                  :msg (str "undefined var: " ns "/" (:callee u)
+                            " — nothing in the bundle or image defines it")})
+         still)))
+
+(defn- promise-errors
+  "Unfulfilled-promise errors: a `(declare x)` with no `(defn x)`/`(def x …)`
+   binding it in the bundle or image. A promise is the static analogue of a
+   queued message — a commitment the bundle must honour before it goes live."
+  [defs ns src]
+  (let [forms    (BeamLisp.Reader/read_string src)
+        declared (mapcat declared-names forms)
+        unbound  (filter (fn [nm] (not (provides? defs ns nm))) declared)]
+    (map (fn [nm] {:kind :promise :ns ns :var nm
+                   :msg (str "declared but never defined in this bundle: " ns "/" nm)})
+         unbound)))
+
+(defn- type-errors
+  "Inferred-type conflicts for one staged source (typed/check-source warnings).
+   Sound-warnings-only: an untypable form is silent, never falsely flagged."
+  [ns src]
+  (let [ws (:warnings (deferred/check-file-deferring src ns))]
+    (map (fn [w] {:kind :type :ns ns :msg (str w)}) ws)))
+
+(defn coherence
+  "Every coherence error across the whole bundle, computed STATICALLY from the
+   sources and the live image's public names. Empty ⇒ the bundle is coherent and
+   may be committed. Exposed for the demos/tests to inspect a bundle without
+   committing it. The message predicate is applied by `commit` via the attached
+   migration (Wave 3), not here."
+  [staged]
+  (let [defs (bundle-defs staged)]
+    (vec (mapcat (fn [pair]
+                   (let [ns (first pair) src (second pair)]
+                     (concat (dangling-errors defs ns src)
+                             (promise-errors defs ns src)
+                             (type-errors ns src))))
+                 staged))))
+
+;; ── commit: prove coherent, then swap atomically; else hold ─────────────
+
+(defn- apply-bundle!
+  "Evaluate every staged source into the live `:global` image. Called ONLY after
+   the whole bundle is proven coherent. Each `defn` is a `Link.defvar` in place —
+   an atomic per-var hot swap; a caller in flight finishes on its captured
+   (never-purged) body module, the next call resolves the new one.
+
+   Every bundle ns is marked LOADED before evaluation so a `(:require [sibling])`
+   between two nses in the SAME bundle resolves to the live sibling instead of
+   searching the disk for a file that does not exist — the whole edit set is one
+   image, so its internal requires are satisfied by the image, not the loader."
+  [staged]
+  (env/with-env :global
+    (fn []
+      (doseq [pair staged]
+        (env/eval (second pair))
+        ;; mark loaded AFTER a ns evaluates, so a later bundle ns that
+        ;; `(:require)`s it resolves to the live sibling. Author-ordered:
+        ;; a required sibling is staged before its requirer, exactly as
+        ;; source files are ordered by the require DAG.
+        (BeamLisp.Env/mark_loaded (first pair))))))
+
+(defn commit
+  "Prove the whole pending bundle coherent (statically); on success apply it
+   atomically to the live image; otherwise HOLD it — old code keeps serving, the
+   errors are returned, and the bundle stays staged for the next edit to complete.
+
+   Returns the bundle status. `:status` is:
+     :applied — the bundle was coherent and is now live
+     :held    — incoherent (dangling / type / promise); old code still serves
+     :blocked — a message-migration was required or rejected (Wave 3)
+     :empty   — nothing staged"
+  []
+  (let [s      (deref state)
+        staged (vec (:staged s))]
+    (if (empty? staged)
+      (do (swap! state (fn [s] (assoc s :status :empty))) (status))
+      (let [errors (coherence staged)]
+        (if (seq errors)
+          (do
+            (swap! state (fn [s] (assoc s :status :held :errors errors)))
+            (print-errors errors)
+            (status))
+          (do
+            (apply-bundle! staged)
+            (swap! state
+                   (fn [s]
+                     (-> s
+                         (assoc :status :applied)
+                         (assoc :errors [])
+                         (assoc :applied (vec (keys (:staged s))))
+                         (assoc :staged {})
+                         (assoc :migration nil))))
+            (status)))))))
+
+(defn- print-errors
+  "Render a held bundle's errors — one line per reason, so a developer sees the
+   whole picture of why the bundle does not yet fit, not just the first failure."
+  [errors]
+  (println (str "reload: bundle HELD — " (count errors)
+                " reason(s); old code still serving:"))
+  (doseq [e errors]
+    (println (str "  [" (name (:kind e)) "] " (:msg e)))))
+
+;; ── drain: deterministic settle point (used by the Wave 4 watcher/tests) ──
+
+(defn drain
+  "A synchronous barrier: returns the current status once any in-progress commit
+   has settled. The watcher (Wave 4) stages on a real file save; a test saves a
+   file then calls `drain` to observe the resulting image deterministically
+   instead of sleeping. Because staging and commit are synchronous swaps on
+   `state`, this is the current status — the barrier exists so callers have one
+   honest place to read the settled image."
+  []
+  (status))
