@@ -47,6 +47,7 @@ defmodule BeamLisp.Env do
   @pdict_chain :bl_env_chain
   @pdict_ns :bl_ns
   @pdict_caps :bl_caps
+  @pdict_heap :bl_max_heap
   @op_table :beam_lisp_ops
   @max_chain_depth 8
 
@@ -100,17 +101,39 @@ defmodule BeamLisp.Env do
   def fork(parent \\ env_id(), opts \\ []) do
     id = {:env, make_ref()}
     caps = intersect_caps(caps_of(parent), Keyword.get(opts, :caps, :all))
+    # Resource bounds narrow like caps: a child never gets MORE heap than
+    # its parent. nil = unbounded (the VM default).
+    heap = min_heap(heap_of(parent), Keyword.get(opts, :max_heap_words))
 
     Agent.update(__MODULE__, fn s ->
       envs = Map.get(s, :envs, %{})
-      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent, caps)))
+      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent, caps, heap)))
     end)
 
     id
   end
 
-  defp fresh_env_state(parent, caps \\ :all),
-    do: %{parent: parent, loaded: MapSet.new(), search_paths: [], caps: caps}
+  defp fresh_env_state(parent, caps \\ :all, heap \\ nil),
+    do: %{parent: parent, loaded: MapSet.new(), search_paths: [], caps: caps, max_heap: heap}
+
+  defp min_heap(nil, spec), do: spec
+  defp min_heap(parent, nil), do: parent
+  defp min_heap(parent, spec), do: min(parent, spec)
+
+  @doc "The env's max-heap bound in words (nil = unbounded)."
+  def heap_of(:global), do: nil
+
+  def heap_of(env) do
+    Agent.get(__MODULE__, fn s ->
+      case get_in(s, [:envs, env]) do
+        nil -> nil
+        %{max_heap: heap} -> heap
+      end
+    end)
+  end
+
+  @doc "This process's max-heap bound in words (nil = unbounded)."
+  def max_heap, do: Process.get(@pdict_heap)
 
   defp intersect_caps(:all, :all), do: :all
   defp intersect_caps(:all, spec), do: MapSet.new(spec)
@@ -236,10 +259,12 @@ defmodule BeamLisp.Env do
     prev_chain = Process.get(@pdict_chain)
     prev_ns = Process.get(@pdict_ns)
     prev_caps = Process.get(@pdict_caps)
+    prev_heap = Process.get(@pdict_heap)
 
     Process.put(@pdict_env, env)
     Process.put(@pdict_chain, compute_chain(env))
     Process.put(@pdict_caps, caps_of(env))
+    restore_pdict(@pdict_heap, heap_of(env))
     # A fresh env means a fresh `*ns*`: Clojure thread-local semantics.
     Process.delete(@pdict_ns)
 
@@ -250,6 +275,7 @@ defmodule BeamLisp.Env do
       restore_pdict(@pdict_chain, prev_chain)
       restore_pdict(@pdict_ns, prev_ns)
       restore_pdict(@pdict_caps, prev_caps)
+      restore_pdict(@pdict_heap, prev_heap)
     end
   end
 
@@ -325,6 +351,7 @@ defmodule BeamLisp.Env do
     Process.put(@pdict_env, env)
     Process.put(@pdict_chain, compute_chain(env))
     Process.put(@pdict_caps, caps_of(env))
+    restore_pdict(@pdict_heap, heap_of(env))
     Process.delete(@pdict_ns)
     :ok
   end
@@ -339,7 +366,8 @@ defmodule BeamLisp.Env do
       env: Process.get(@pdict_env),
       chain: Process.get(@pdict_chain),
       ns: Process.get(@pdict_ns),
-      caps: Process.get(@pdict_caps)
+      caps: Process.get(@pdict_caps),
+      max_heap: Process.get(@pdict_heap)
     }
   end
 
@@ -350,11 +378,12 @@ defmodule BeamLisp.Env do
   a token is a value and can be stale (env destroyed → fail closed) or
   smuggled across a boundary — the registry is the only source of truth.
   """
-  def bind(%{env: env, chain: chain, ns: ns}) do
+  def bind(%{env: env, chain: chain, ns: ns} = token) do
     restore_pdict(@pdict_env, env)
     restore_pdict(@pdict_chain, chain)
     restore_pdict(@pdict_ns, ns)
     restore_pdict(@pdict_caps, env && caps_of(env))
+    restore_pdict(@pdict_heap, Map.get(token, :max_heap))
     :ok
   end
 
