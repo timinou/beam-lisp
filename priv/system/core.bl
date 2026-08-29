@@ -16,7 +16,7 @@
 ;   sandbox              footprint ⊆ caps               (footprint-in-caps?)
 
 (ns system.core
-  (:require [z3] [system.footprint :as fp] [typed] [minikanren :as mk]
+  (:require [z3] [system.footprint :as fp] [typed] [minikanren :as mk] [system.gfp :as gfp]
             [system.model :as model] [system.smt :as smt] [errors]))
 
 ; ════════════════════════════════════════════════════════════════════════
@@ -1190,6 +1190,119 @@
                               (typed/node-items f))
                         [])))))
               clauses))))
+
+; ── P22: collection CONTENT invariants over the z3 Array theory ─────────────
+;
+; Length-abstraction (verify-capacity) sees how MANY items a collection holds,
+; never WHAT. z3's Array theory reasons about the elements: this proves a
+; collection stays DUPLICATE-FREE. The collection is (Array Int T) + a length;
+; an enqueue (conj items x) appends x at index len; distinctness is
+;   ∀ i,j. 0≤i<j<len ⇒ a[i] ≠ a[j]
+; established by the empty init and preserved by a FRESH-guarded enqueue
+; (∀ i<len. a[i] ≠ x). An enqueue without the freshness guard is a duplicate risk.
+; Quantified array reasoning can return :unknown — then the guarantee is
+; :approximate, never a false proof (reachable ≠ decidable).
+
+(def ^:private distinct-def
+  (str "(define-fun Distinct ((a (Array Int Int)) (len Int)) Bool "
+       "(forall ((i Int) (j Int)) "
+       "(=> (and (<= 0 i) (< i j) (< j len)) (not (= (select a i) (select a j))))))\n"))
+
+(defn- enqueue-fresh-guarded?
+  "Does clause `c` append a value to `coll` UNDER a freshness guard — i.e. its
+   guard entails the appended element is not already present? We recognise the
+   syntactic freshness guard (not (includes? coll x)) / (not (contains? coll x)),
+   the way a programmer writes 'only add if absent'."
+  [coll c]
+  (let [g (:guard c)]
+    (if (nil? g) false
+      (let [gs (errors/delaborate (:guard-node c))]
+        (or (includes? gs (str "(not (includes? " coll))
+            (includes? gs (str "(not (contains? " coll)))))))
+
+(defn- appends-to?
+  "Does clause `c`'s next assign (conj coll _) to field `coll`?"
+  [coll c]
+  (let [v (field-value-node coll (:next-node c))]
+    (if (nil? v) false
+      (let [vf (typed/node-form v)]
+        (and (= :list (typed/node-tag vf))
+             (= "conj" (typed/node-name (typed/node-form (first (typed/node-items vf)))))
+             (= coll (typed/node-name (typed/node-form (second (typed/node-items vf))))))))))
+
+(defn verify-content
+  "Prove a collection-valued process keeps its collection DUPLICATE-FREE, over
+   the z3 Array theory. Returns {:name :holds :checked :extension :warnings}.
+   :checked=false when there is no single collection field. The distinctness is
+   established by the empty init and must be preserved by every append: an append
+   guarded by a freshness test (not (includes? coll x)) preserves it; an
+   unguarded append is flagged. Registers an :approximate guarantee (quantified
+   array reasoning is not always decidable)."
+  [port node]
+  (let [sm (model/system-model node)
+        clauses (:transitions sm)
+        colls (collection-vars-any clauses)]
+    (if (not (= 1 (count colls)))
+      {:name (:name sm) :holds nil :checked false
+       :reason "content check needs exactly one collection field"}
+      (let [coll (first (into [] colls))
+            msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
+            appends (filter (fn [c] (appends-to? coll c)) msg-cs)
+            ; establishment: the empty queue (len 0) is trivially distinct.
+            est (= "unsat" (z3/check port
+                  (str distinct-def "(declare-const a (Array Int Int))\n"
+                       "(assert (not (Distinct a 0)))\n")))
+            ; each append preserves distinctness iff it is freshness-guarded.
+            unguarded (filter (fn [c] (not (enqueue-fresh-guarded? coll c))) appends)
+            ; z3 confirms: a fresh-guarded append DOES preserve distinctness.
+            fresh-preserves (= "unsat" (z3/check port
+                              (str distinct-def
+                                   "(declare-const a (Array Int Int))\n(declare-const len Int)\n(declare-const x Int)\n"
+                                   "(assert (>= len 0))\n(assert (Distinct a len))\n"
+                                   "(assert (forall ((i Int)) (=> (and (<= 0 i) (< i len)) (not (= (select a i) x)))))\n"
+                                   "(assert (not (Distinct (store a len x) (+ len 1))))\n")))
+            pos (typed/node-pos node)
+            fails (map (fn [c] {:label (:label c)}) unguarded)]
+        (register-guarantee! (keyword (str (:name sm) "-distinct"))
+                             {:extension :approximate :kind :content})
+        {:name (:name sm)
+         :holds (and est fresh-preserves (empty? unguarded))
+         :checked true
+         :extension :approximate
+         :warnings (box-warnings {:failures fails} pos)}))))
+
+; ── P22: LIVENESS (◇ eventually) over the phase graph ─────────────────────
+;
+; Everything else here is SAFETY (□, nothing bad). Liveness is the other half:
+; from the init phase, is a GOAL phase UNAVOIDABLE — does every path eventually
+; reach it? That is AF, a least fixpoint over the phase graph (system.gfp/af),
+; the dual of the safe-region greatest fixpoint. A phase that can loop forever
+; without reaching the goal (a starvation trap) fails.
+
+(defn verify-liveness
+  "Prove that from its initial phase, `field` always eventually reaches a phase
+   in `goal-tags` (a set of tag strings). Returns {:name :holds :checked
+   :reachable-goal bool :from init-tag}. :checked=false when `field` is not an
+   enum phase. Uses the phase graph + AF (least fixpoint); a starvation loop — a
+   cycle that never reaches a goal — makes :holds false."
+  [node field goal-tags]
+  (let [sm (model/system-model node)
+        clauses (:transitions sm)
+        inv-node (invariant-node node)
+        init-c (first (filter (fn [c] (= :init (:label c))) clauses))
+        msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
+        init-tag (assigned-keyword field (:next-node init-c))]
+    (if (nil? init-tag)
+      {:name (:name sm) :holds nil :checked false :reason "field is not an init'd enum phase"}
+      (let [arms (variant-arms field inv-node init-c msg-cs)
+            states (into [] (keys arms))
+            edges (phase-edges field init-tag msg-cs)
+            succ (fn [s] (into [] (keep (fn [e] (if (= (first e) s) (second e) nil)) edges)))
+            goal? (fn [s] (contains? goal-tags s))
+            holds (gfp/af-holds? states succ goal? init-tag)]
+        {:name (:name sm) :holds holds :checked true
+         :from init-tag :reachable-goal holds
+         :af (gfp/af states succ goal?)}))))
 
 (defn verify-process-report
   "verify-process, with its warnings RENDERED through errors/render for a human:
