@@ -117,15 +117,36 @@ defmodule BeamLisp.Compiler do
   # value (= and printing are unaffected); a form with no position compiles
   # identically to today, just without line attribution.
   def compile(form, env) do
-    {inner, env} =
-      case form do
-        {:meta, inner, m} -> {inner, pos_env(env, m)}
-        _ -> {form, env}
-      end
+    case form do
+      {:meta, inner, m} ->
+        # A form's metadata carries two kinds of key. Positional keys
+        # (:line/:col/:file) are the reader's SOURCE-LOCATION channel: they
+        # thread into the compile env and stamp the BEAM line table, never
+        # reaching a runtime value. Author keys (everything else -- e.g. a
+        # hiccup `^{:key (:slug t)}`) are USER DATA and MUST survive onto the
+        # value, exactly as in Clojure. Split the two: compile the bare form
+        # with the position threaded, then, if any author key remains, wrap
+        # the result in a runtime `with-meta` whose map VALUES are themselves
+        # compiled (so `^{:key (:slug t)}` evaluates rather than quotes).
+        {pos, user} = Map.split(m, [:line, :col, :file])
+        penv = pos_env(env, pos)
+        ast = inner |> do_compile(penv) |> stamp_line(penv)
 
-    inner
-    |> do_compile(env)
-    |> stamp_line(env)
+        if map_size(user) == 0 do
+          ast
+        else
+          meta_ast =
+            {:%{}, [], Enum.map(user, fn {k, v} -> {k, compile(v, notail(penv))} end)}
+
+          {{:., [], [{:__aliases__, [], [:BeamLisp, :FormMeta]}, :with_meta]}, [],
+           [ast, meta_ast]}
+        end
+
+      _ ->
+        form
+        |> do_compile(env)
+        |> stamp_line(env)
+    end
   end
 
   defp do_compile(form, _env)
@@ -1682,8 +1703,13 @@ defmodule BeamLisp.Compiler do
 
   defp data_to_form({:symbol, _name} = sym), do: sym
 
-  defp data_to_form(%BeamLisp.Vector{} = v),
-    do: {:vector, Enum.map(BeamLisp.Vector.to_list(v), &data_to_form/1)}
+  defp data_to_form(%BeamLisp.Vector{meta: m} = v) do
+    vform = {:vector, Enum.map(BeamLisp.Vector.to_list(v), &data_to_form/1)}
+    # A vector produced/returned by a macro may carry AUTHOR metadata
+    # (`^{:key …}`); re-wrap it so `compile/2` lowers the key back onto the
+    # value. `nil`/empty meta round-trips as a bare vector form, unchanged.
+    if is_map(m) and map_size(m) > 0, do: {:meta, vform, m}, else: vform
+  end
 
   defp data_to_form(%BeamLisp.Set{} = s),
     do: {:set, Enum.map(BeamLisp.Set.to_list(s), &data_to_form/1)}
@@ -2583,7 +2609,23 @@ defmodule BeamLisp.Compiler do
   # one-argument call, because `->`'s `rest` saw a wrapper where a list
   # was promised. Positions are read off the form BEFORE it becomes a
   # datum (see `compile/2`); past this boundary they are dropped.
-  defp datum({:meta, form, _m}), do: datum(form)
+  # Source positions are a COMPILER channel, not data; but AUTHOR metadata
+  # (`^{:key …}`) IS data and must survive the macro-argument boundary, the
+  # same as it survives `compile/2`. Split the two: positions are dropped
+  # (a `{:meta, list, m}` wrapper would break `rest`-based macros like `->`,
+  # the reason this clause existed), while author keys re-attach to the
+  # datum'd VALUE. Only a vector carries them: it holds metadata in a struct
+  # field, so `first`/`rest`/`seq`/`count` still work (BUG-009) — a list has
+  # no such field, so list metadata stays dropped and `->` is unaffected.
+  defp datum({:meta, form, m}) do
+    {_pos, user} = Map.split(m, [:line, :col, :file])
+    base = datum(form)
+
+    case base do
+      %BeamLisp.Vector{} when map_size(user) > 0 -> %BeamLisp.Vector{base | meta: user}
+      _ -> base
+    end
+  end
   defp datum({:list, items}), do: Enum.map(items, &datum/1)
   defp datum({:vector, items}), do: BeamLisp.Vector.new(Enum.map(items, &datum/1))
   defp datum({:set, items}), do: BeamLisp.Set.new(Enum.map(items, &datum/1))

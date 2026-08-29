@@ -1,0 +1,353 @@
+; live/diff.bl — a keyed structural diff of two hiccup trees → patch ops.
+;
+; ── Why this exists ───────────────────────────────────────────────────
+;
+; After first paint (live/hiccup), the socket holds the current hiccup VALUE.
+; On every update it computes the next value (a pure `db → hiccup` call) and
+; diffs the two trees into a minimal list of patch ops. The client applies
+; them against the real DOM. This is the thing LiveView approximates by
+; diffing rendered STRINGS; here we diff the tree with real keys, so a
+; reorder moves DOM nodes instead of rewriting them.
+;
+; ── The op set (the wire; serialises to JSON via interop/->json) ──────
+;
+;   [:set-attr    path k v]         an attribute gained/changed
+;   [:remove-attr path k]           an attribute dropped
+;   [:text        path s]           a text node changed
+;   [:replace     path subtree]     node kind (tag) changed — full swap
+;   [:insert      path key subtree] a keyed child appeared
+;   [:remove      path key]         a keyed child left
+;   [:move        path key idx]     a keyed child moved to index `idx`
+;
+; `path` is a vector of child indices from the root ([] is the root itself).
+; A keyed op names the child by its `:key`, not its index, because the whole
+; point of keys is that an index is unstable under insert/remove/reorder.
+;
+; ── Keys: attr or metadata, one reader ────────────────────────────────
+;
+; A node's key is `:key` in its attrs map OR `^{:key …}` metadata on the
+; vector (W0 made the latter reach runtime). `node-key` reads either, so a
+; view author may write whichever reads better; the differ sees one thing.
+;
+; ── Correctness contract ──────────────────────────────────────────────
+;
+; `apply-ops` (below) is the reference semantics the JS client mirrors. The
+; property the test pins: (apply-ops (diff a b) a) == b, for every pair of
+; trees. So the ops are not merely "plausible" — applying them to the old
+; tree reconstructs the new one exactly.
+
+(ns live.diff)
+
+;; ── node accessors (a node is [:tag attrs? child*]) ─────────────────
+
+(defn- element? [n] (and (vector? n) (> (count n) 0) (keyword? (first n))))
+(defn- tag-of [n] (first n))
+(defn- has-attrs? [n] (and (> (count n) 1) (map? (nth n 1))))
+(defn- attrs-of [n] (if (has-attrs? n) (nth n 1) {}))
+(defn- children-of [n] (into [] (if (has-attrs? n) (drop 2 n) (rest n))))
+
+(defn node-key
+  "A node's stable identity: `:key` in its attrs, else `^{:key …}` vector
+   metadata, else nil. One reader so the differ never cares which the
+   author wrote."
+  [n]
+  (cond
+    (not (vector? n)) nil
+    (contains? (attrs-of n) :key) (get (attrs-of n) :key)
+    :else (get (meta n) :key)))
+
+(defn- all-keyed?
+  "Whether every element in `nodes` carries a key (the condition for a
+   keyed reconcile; a single unkeyed child falls back to positional)."
+  [nodes]
+  (and (seq nodes)
+       (reduce (fn [_ n] (if (nil? (node-key n)) (reduced false) true)) true nodes)))
+
+;; ── attribute diff ──────────────────────────────────────────────────
+;;
+;; `:key` is identity, not a DOM attribute, so it is excluded from the attr
+;; diff (it never renders — live/hiccup strips it). Every other key is
+;; compared: present-and-changed → :set-attr; gone → :remove-attr.
+
+(defn- attr-ops
+  [path old-attrs new-attrs]
+  (let [oa (dissoc old-attrs :key)
+        na (dissoc new-attrs :key)
+        changed (mapcat (fn [kv]
+                          (let [k (first kv) v (second kv)]
+                            (if (= (get oa k :live.diff/absent) v)
+                              []
+                              [[:set-attr path (name k) v]])))
+                        (seq na))
+        removed (mapcat (fn [kv]
+                          (let [k (first kv)]
+                            (if (contains? na k) [] [[:remove-attr path (name k)]])))
+                        (seq oa))]
+    (concat changed removed)))
+
+;; ── keyed child reconcile ───────────────────────────────────────────
+;;
+;; Match children by key. A key present only in NEW is an insert; only in
+;; OLD is a remove; in both at a different index is a move; in both at the
+;; same index recurses (its content may still have changed). Order: removes
+;; first (so indices the client computes for inserts/moves are against the
+;; surviving set), then inserts/moves/recursion walked in NEW order.
+
+(defn- index-by-key [nodes]
+  (reduce (fn [m pair]
+            (assoc m (node-key (second pair)) (first pair)))
+          {} (map-indexed (fn [i n] [i n]) nodes)))
+
+;; The longest strictly-increasing subsequence of a vector of integers,
+;; returned as a SET of the values it contains. O(n^2) — child lists are
+;; short, and clarity beats the O(n log n) patience-sort here. These are the
+;; kept children whose relative order is already correct: the anchors that
+;; need no move. Every other kept child moves. This is the snabbdom insight —
+;; minimise moves by keeping the largest already-ordered run in place.
+(defn- lis-set
+  [xs]
+  (let [v (into [] xs)
+        n (count v)]
+    (if (= n 0)
+      #{}
+      (let [;; len[i] = length of LIS ending at i; prev[i] = predecessor index
+            init {:len (into [] (repeat n 1)) :prev (into [] (repeat n -1))}
+            filled (reduce
+                     (fn [st i]
+                       (reduce
+                         (fn [s j]
+                           (if (and (< (nth (:v-old s) j) (nth (:v-old s) i))
+                                    (> (+ 1 (nth (:len s) j)) (nth (:len s) i)))
+                             (assoc s :len (assoc (:len s) i (+ 1 (nth (:len s) j)))
+                                      :prev (assoc (:prev s) i j))
+                             s))
+                         st
+                         (range i)))
+                     (assoc init :v-old v)
+                     (range n))
+            lens (:len filled)
+            prevs (:prev filled)
+            ;; best endpoint = index of max len
+            best (reduce (fn [b i] (if (> (nth lens i) (nth lens b)) i b)) 0 (range n))]
+        ;; walk the prev chain, collecting the VALUES
+        (loop [i best acc #{}]
+          (if (= i -1)
+            acc
+            (recur (nth prevs i) (conj acc (nth v i)))))))))
+
+(defn- keyed-child-ops
+  [path old-children new-children diff-fn]
+  (let [old-idx (index-by-key old-children)
+        new-idx (index-by-key new-children)
+        removes (mapcat (fn [pair]
+                          (let [k (node-key (second pair))]
+                            (if (contains? new-idx k) [] [[:remove path k]])))
+                        (map-indexed (fn [i n] [i n]) old-children))
+        ;; kept keys, in NEW order, tagged with their OLD index. The anchors
+        ;; that need no move are those whose old-index sits on the LIS of
+        ;; this sequence — their relative order already matches.
+        kept-old-indices (filterv some?
+                                  (mapv (fn [n]
+                                          (let [k (node-key n)]
+                                            (if (contains? old-idx k) (get old-idx k) nil)))
+                                        new-children))
+        anchors (lis-set kept-old-indices)
+        placements-recur
+          (mapcat
+            (fn [pair]
+              (let [i (first pair) n (second pair) k (node-key n)]
+                (if (contains? old-idx k)
+                  ;; existing key: recurse for content; move unless it is an
+                  ;; anchor (already correctly ordered relative to its peers)
+                  (let [oi (get old-idx k)
+                        old-child (nth old-children oi)
+                        move (if (contains? anchors oi) [] [[:move path k i]])
+                        inner (diff-fn (conj path i) old-child n)]
+                    (concat inner move))
+                  ;; new key: insert the whole subtree at index i
+                  [[:insert path k i n]])))
+            (map-indexed (fn [i n] [i n]) new-children))]
+    (concat removes placements-recur)))
+
+;; ── positional child reconcile (no keys) ────────────────────────────
+
+(defn- positional-child-ops
+  [path old-children new-children diff-fn]
+  (let [n (max (count old-children) (count new-children))]
+    (mapcat (fn [i]
+              (let [o (if (< i (count old-children)) (nth old-children i) nil)
+                    m (if (< i (count new-children)) (nth new-children i) nil)]
+                (diff-fn (conj path i) o m)))
+            (range n))))
+
+;; ── the diff ────────────────────────────────────────────────────────
+
+(defn diff
+  "Structural diff of two hiccup nodes at `path` (default root []), a vector
+   of patch ops. Applying them to `old` reconstructs `new` exactly."
+  ([old new] (diff [] old new))
+  ([path old new]
+   (cond
+     ;; identical: nothing to do (cheap short-circuit on unchanged subtrees)
+     (= old new) []
+     ;; both text (string/number): a text replacement
+     (and (not (element? old)) (not (element? new))
+          (not (vector? old)) (not (vector? new)))
+       [[:text path (if (nil? new) "" (str new))]]
+     ;; kind changed (text↔element, or different tag): a full replace
+     (or (not (element? old)) (not (element? new))
+         (not= (tag-of old) (tag-of new)))
+       [[:replace path new]]
+     ;; same tag: diff attrs, then children. `into []` REALIZES the op seq:
+     ;; `concat`/`mapcat` are lazy, and a lazy seq that reaches the wire
+     ;; (interop/->json) has no Jason encoder — the ops must be a plain
+     ;; vector before they leave this fn.
+     :else
+       (let [oc (children-of old)
+             nc (children-of new)
+             child-ops (if (or (all-keyed? oc) (all-keyed? nc))
+                         (keyed-child-ops path oc nc diff)
+                         (positional-child-ops path oc nc diff))]
+         (into [] (concat (attr-ops path (attrs-of old) (attrs-of new))
+                          child-ops))))))
+
+;; ── apply-ops: the REFERENCE semantics (mirrored by the JS client) ──
+;;
+;; Not used in production (the client applies ops to the DOM); it exists so
+;; the property test can assert (apply-ops (diff a b) a) == b, and so the
+;; wire contract has an executable definition the JS is a port of.
+
+(defn- get-at [node path]
+  (if (empty? path)
+    node
+    (let [children (children-of node)
+          i (first path)]
+      (get-at (nth children i) (rest path)))))
+
+(defn- update-children [node f]
+  (let [t (tag-of node)
+        a (attrs-of node)
+        cs (f (children-of node))]
+    (into [t a] cs)))
+
+(defn- update-at [node path f]
+  (if (empty? path)
+    (f node)
+    (update-children node
+      (fn [cs]
+        (let [i (first path)]
+          (into [] (map-indexed
+                     (fn [j c] (if (= j i) (update-at c (rest path) f) c))
+                     cs)))))))
+
+(defn- apply-op [tree op]
+  (let [kind (first op) path (second op)]
+    (cond
+      (= kind :set-attr)
+        (update-at tree path (fn [n]
+          (into [(tag-of n) (assoc (attrs-of n) (keyword (nth op 2)) (nth op 3))]
+                (children-of n))))
+      (= kind :remove-attr)
+        (update-at tree path (fn [n]
+          (into [(tag-of n) (dissoc (attrs-of n) (keyword (nth op 2)))]
+                (children-of n))))
+      (= kind :text)
+        (if (empty? path) (nth op 2)
+          (update-at tree (butlast path) (fn [n]
+            (update-children n (fn [cs]
+              (let [i (last path)]
+                (into [] (map-indexed (fn [j c] (if (= j i) (nth op 2) c)) cs))))))))
+      (= kind :replace)
+        (if (empty? path) (nth op 2)
+          (update-at tree (butlast path) (fn [n]
+            (update-children n (fn [cs]
+              (let [i (last path)]
+                (into [] (map-indexed (fn [j c] (if (= j i) (nth op 2) c)) cs))))))))
+      (= kind :remove)
+        (update-at tree path (fn [n]
+          (update-children n (fn [cs]
+            (filterv (fn [c] (not= (node-key c) (nth op 2))) cs)))))
+      (= kind :insert)
+        ;; insert the subtree (nth op 4) at index (nth op 3). Inserts are
+        ;; applied in NEW order, so inserting at the target index builds the
+        ;; right positions; the move pass then fixes any anchor ordering.
+        (update-at tree path (fn [n]
+          (update-children n (fn [cs]
+            (let [idx (nth op 3) sub (nth op 4)]
+              (into [] (concat (take idx cs) [sub] (drop idx cs))))))))
+      (= kind :move)
+        tree  ;; a move is a reorder; final positions are fixed by the pass below
+      :else tree)))
+
+(defn normalize
+  "Rewrite a tree so every element has an EXPLICIT attrs map. `apply-ops`
+   reconstructs in this form (its `update-children` always re-emits the
+   attrs slot), so comparing a reconstruction to a target means comparing
+   normalized to normalized — structural equality, not the incidental
+   presence of an empty `{}`. Text/number nodes pass through."
+  [node]
+  (if (element? node)
+    (into [(tag-of node) (attrs-of node)] (map normalize (children-of node)))
+    node))
+
+;; Structural (child-order) vs deep (in-place) op kinds. Structural ops
+;; rebuild a parent's child list; deep ops mutate a node found by path. They
+;; are applied in that order — structure first, so deep ops' NEW-index paths
+;; land on the reordered tree, exactly as a DOM client patches attributes
+;; after it has reconciled the keyed children.
+(defn- structural-op? [op] (contains? #{:remove :insert :move} (first op)))
+
+(defn- rebuild-children
+  "Rebuild one parent's child vector from its structural ops via anchor-fill:
+   moved/inserted children claim their absolute NEW index; the untouched
+   'anchor' children fill the remaining slots in their existing order. This
+   is the minimal-move reconciliation a keyed DOM differ performs, made
+   explicit as a pure function."
+  [old-children ops]
+  (let [removed (reduce (fn [s op] (if (= (first op) :remove) (conj s (nth op 2)) s))
+                        #{} ops)
+        survivors (filterv (fn [c] (not (contains? removed (node-key c)))) old-children)
+        moves (filterv (fn [op] (= (first op) :move)) ops)
+        inserts (filterv (fn [op] (= (first op) :insert)) ops)
+        moved-keys (reduce (fn [s op] (conj s (nth op 2))) #{} moves)
+        ;; index → node it must occupy
+        placed (merge
+                 (reduce (fn [m op]
+                           (let [k (nth op 2) idx (nth op 3)
+                                 node (first (filterv (fn [c] (= (node-key c) k)) survivors))]
+                             (assoc m idx node)))
+                         {} moves)
+                 (reduce (fn [m op] (assoc m (nth op 3) (nth op 4))) {} inserts))
+        ;; anchors: survivors that did not move, in their existing order
+        anchors (filterv (fn [c] (not (contains? moved-keys (node-key c)))) survivors)
+        total (+ (count anchors) (count placed))]
+    (loop [i 0 ai 0 acc []]
+      (if (= i total)
+        acc
+        (if (contains? placed i)
+          (recur (+ i 1) ai (conj acc (get placed i)))
+          (recur (+ i 1) (+ ai 1) (conj acc (nth anchors ai))))))))
+
+(defn- apply-structural [tree ops]
+  ;; group structural ops by parent path, deepest paths first so an inner
+  ;; parent is rebuilt before an outer reorder could shift its index.
+  (let [by-path (reduce (fn [m op]
+                          (let [p (second op)]
+                            (assoc m p (conj (get m p []) op))))
+                        {} ops)
+        paths (sort-by count > (into [] (keys by-path)))]
+    (reduce (fn [t p]
+              (update-at t p (fn [n]
+                              (update-children n (fn [cs] (rebuild-children cs (get by-path p)))))))
+            tree paths)))
+
+(defn apply-ops
+  "Apply patch ops to a tree, reconstructing the diff's target. The reference
+   semantics the JS client mirrors: reconcile keyed children (anchor-fill),
+   then patch attributes/text on the reordered tree."
+  [ops tree]
+  (let [structural (filterv structural-op? ops)
+        deep (filterv (fn [op] (not (structural-op? op))) ops)
+        reordered (apply-structural tree structural)
+        patched (reduce apply-op reordered deep)]
+    (normalize patched)))
