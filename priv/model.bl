@@ -1,0 +1,290 @@
+; model.bl — a process is a transition relation (P16a, graduated).
+;
+; ── The load-bearing claim ────────────────────────────────────────────
+;
+; Verification is a property of the EVALUATOR, not of any macro. So this
+; module reads a process down to the PRIMITIVES — receive / loop-recur /
+; function clauses / guards / defmulti dispatch / defserver — and lowers each
+; to ONE normalized object: a set of TRANSITION CLAUSES.
+;
+;   clause ≜ {:label kw           ; a name for the transition (the message head)
+;             :pattern str        ; what it matches (delaborated source)
+;             :guard  str|nil     ; the :when enabling predicate
+;             :next   str         ; the next-state expression (wrapper-stripped)
+;             :body   [str…]}     ; the full body (footprint.bl reads effects here)
+;
+; FIVE surface forms lower to the IDENTICAL transition graph, so verification
+; written once over clauses is inherited by every form — including defserver,
+; unchanged.
+;
+; It reuses typed's plumbing verbatim (parse-clause / defn-clauses / node
+; accessors) — this is ~dispatch, not parsing.
+
+(ns model
+  (:require [typed] [errors]))
+
+; ── node plumbing (delegate to typed; never re-derive the shape rules) ──
+
+(defn tag [n] (typed/node-tag (typed/node-form n)))
+(defn items [n] (typed/node-items n))
+(defn form [n] (typed/node-form n))
+(defn nm [n] (typed/node-name (typed/node-form n)))
+
+(defn head-name
+  "The head symbol name of a list node, or nil if not a symbol-headed list."
+  [n]
+  (let [f (form n)]
+    (if (= :list (typed/node-tag f))
+      (let [its (typed/node-items f)]
+        (if (and (seq its) (= :symbol (tag (first its))))
+          (nm (first its))
+          nil))
+      nil)))
+
+; ── the message label ───────────────────────────────────────────────────
+
+(defn pattern-label [pat]
+  (let [f (form pat)
+        tg (typed/node-tag f)]
+    (cond
+      (contains? #{:vector :list} tg)
+        (let [its (typed/node-items f)]
+          (if (and (seq its) (= :keyword (tag (first its))))
+            (keyword (nm (first its)))
+            :_))
+      (= :keyword tg) (keyword (nm f))
+      :else :_)))
+
+; ── next-state: strip the recur/reply/noreply/ok wrapper ────────────────
+;
+; Normalize so a loop's (recur S), a server's (reply val S), and a defmethod's
+; bare returned S all yield the SAME S. That normalization is what makes
+; value-dispatch and message-dispatch forms produce identical transitions.
+
+(def next-heads #{"recur" "reply" "noreply" "ok"})
+
+(defn- find-wrapper [node]
+  (let [f (form node)]
+    (if (= :list (typed/node-tag f))
+      (if (contains? next-heads (head-name node))
+        node
+        (some (fn [c] (find-wrapper c)) (typed/node-items f)))
+      nil)))
+
+(defn- state-of-wrapper [wrapper]
+  (let [its (typed/node-items (form wrapper))
+        h   (head-name wrapper)]
+    (cond
+      (= "reply" h) (nth its 2)      ; (reply val STATE)
+      :else         (nth its 1))))    ; (recur STATE) / (noreply STATE) / (ok STATE)
+
+(defn next-state
+  "The next-state EXPRESSION of a body: the wrapper's state arg, or — when the
+   body returns the state directly (defmethod/defn) — the body form itself."
+  [body-node]
+  (let [w (find-wrapper body-node)]
+    (if w (state-of-wrapper w) body-node)))
+
+; ── the normalized clause ───────────────────────────────────────────────
+
+(defn shape [n] (if (nil? n) nil (errors/delaborate n)))
+
+(defn clause [label pattern guard next-node body]
+  {:label   label
+   :pattern (shape pattern)
+   :guard   (shape guard)
+   :next    (shape next-node)
+   :body    (map shape body)})
+
+; ── EXTRACTOR 1: raw receive ────────────────────────────────────────────
+
+(defn extract-receive [receive-node]
+  (let [its (rest (typed/node-items (form receive-node)))]
+    (loop [xs its acc []]
+      (if (empty? xs)
+        acc
+        (let [pat (first xs)
+              after (rest xs)
+              guarded (and (seq after)
+                           (= :keyword (tag (first after)))
+                           (= "when" (nm (first after))))
+              guard (if guarded (second after) nil)
+              body-tail (if guarded (rest (rest after)) after)
+              body (first body-tail)
+              rest-xs (rest body-tail)]
+          (recur rest-xs
+                 (conj acc (clause (pattern-label pat) pat guard
+                                   (next-state body) [body]))))))))
+
+; ── EXTRACTOR 2: a loop wrapping a receive ──────────────────────────────
+
+(defn find-receive [node]
+  (let [f (form node)]
+    (if (= :list (typed/node-tag f))
+      (if (= "receive" (head-name node))
+        node
+        (some find-receive (typed/node-items f)))
+      nil)))
+
+(defn extract-loop-receive [loop-node]
+  (let [rcv (find-receive loop-node)]
+    (if rcv (extract-receive rcv) [])))
+
+; ── EXTRACTOR 3: multi-clause defn ──────────────────────────────────────
+
+(defn extract-defn [defn-items]
+  (let [parsed (nth (typed/defn-clauses defn-items) 2)]
+    (map (fn [pc]
+           (let [params (:params pc)
+                 guard  (:guard pc)
+                 body   (:body pc)
+                 last-body (last body)]
+             (clause (pattern-label (first params))
+                     (typed/list-node (apply list params))
+                     guard
+                     (next-state last-body)
+                     body)))
+         parsed)))
+
+; ── EXTRACTOR 4: defmulti + defmethods ──────────────────────────────────
+
+(defn extract-defmethods [defmethod-nodes]
+  (map (fn [dm]
+         (let [its (typed/node-items (form dm))
+               dispatch (nth its 2)
+               params   (nth its 3)
+               body     (drop 4 its)
+               last-body (last body)]
+           (clause (keyword (nm dispatch))
+                   params
+                   nil
+                   (next-state last-body)
+                   body)))
+       defmethod-nodes))
+
+; ── EXTRACTOR 5: defserver (OTP — must MATCH the raw ones) ───────────────
+
+(def handle-heads #{"handle-call" "handle-cast" "handle-info" "init"})
+
+(defn extract-defserver [defserver-items]
+  (let [clauses (filter (fn [c] (contains? handle-heads (head-name c)))
+                        (drop 2 defserver-items))]
+    (map (fn [c]
+           (let [its (typed/node-items (form c))
+                 h   (head-name c)]
+             (if (= "init" h)
+               (let [body (drop 2 its)]
+                 (clause :init (nth its 1) nil (next-state (last body)) body))
+               (let [pat  (nth its 1)
+                     body (drop 3 its)]
+                 (clause (pattern-label pat) pat nil
+                         (next-state (last body)) body)))))
+         clauses)))
+
+; ── the unifying entry: a form → clauses, dispatched on its head ────────
+;
+; This is the "read to the primitive" move: whatever the surface form, lower
+; it to clauses. Sugar the extractor doesn't recognize would macroexpand-1
+; first (codebase.bl's technique).
+
+(defn transitions
+  "Extract the transition clause set from a top-level form node."
+  [node]
+  (let [h (head-name node)]
+    (cond
+      (= h "receive")   (extract-receive node)
+      (= h "loop")      (extract-loop-receive node)
+      (= h "defserver") (extract-defserver (typed/node-items (form node)))
+      (= h "defn")      (extract-defn (typed/node-items (form node)))
+      (= h "defn-")     (extract-defn (typed/node-items (form node)))
+      :else             [])))
+
+; ── the transition GRAPH: (label, next) pairs — the comparison metric ───
+;
+; Patterns differ by surface syntax (a defn param vector vs a receive message
+; vector), but the ABSTRACT transition — what enables it and where it goes —
+; is invariant across dispatch forms. The graph is (label → next).
+
+(defn graph
+  "The (label, next) pairs of a clause set, sorted by label — the machine's
+   shape, independent of how the surface spells dispatch."
+  [clauses]
+  (sort-by (fn [p] (str (first p)))
+           (map (fn [c] [(:label c) (:next c)]) clauses)))
+
+; ── the naming trichotomy ───────────────────────────────────────────────
+;
+; A machine needs a stable identity to be named in datalog, annotated, and
+; refined. Three tiers, one always applies — no new process form required:
+;   1. BINDING name  — defserver/defn already name it.
+;   2. ANNOTATION    — ^{:name :x} on an anonymous fn/spawn (metadata is data).
+;   3. CONTENT-HASH  — the normalized transition structure, human-readable.
+; Content-addressed ⟹ stable across line drift; structurally-identical machines
+; share a name (correct: they ARE the same machine, verified once).
+
+(defn binding-name
+  "The binding name of a named top-level form (defserver/defn), or nil."
+  [node]
+  (let [h (head-name node)]
+    (if (contains? #{"defserver" "defn" "defn-"} h)
+      (let [its (typed/node-items (form node))]
+        (nm (second its)))
+      nil)))
+
+(defn content-hash
+  "A stable, human-readable name for an anonymous machine: the sorted
+   transition labels rendered as ↻⟨a|b|c⟩·<hash>. Content-addressed over the
+   (label,next) graph, so identical machines share a name."
+  [clauses]
+  (let [g (graph clauses)
+        labels (map (fn [p] (nm-of (first p))) g)
+        joined (join "|" labels)
+        h (erlang/phash2 g)]
+    (str "↻⟨" joined "⟩·" (subs (str h) 0 (min 4 (count (str h)))))))
+
+(defn- nm-of [label]
+  (if (keyword? label) (name label) (str label)))
+
+(defn machine-name
+  "The name of a machine: binding name if present, else annotation :name, else
+   the content hash. `node` is the source form; `clauses` its transitions."
+  [node clauses]
+  (or (binding-name node)
+      (annotation-name node)
+      (content-hash clauses)))
+
+(defn annotation-name
+  "The :name from a form's metadata, or nil. Metadata is DATA (never evaluated);
+   we read the wrapper's pos-map slot for a :name key."
+  [node]
+  (let [pos (typed/node-pos node)]
+    (if (and (map? pos) (contains? pos :name))
+      (name (:name pos))
+      nil)))
+
+; ── :~step and :~reachable as computed / derived relations ──────────────
+;
+; The transition CLAUSES are STORED facts (extracted once from source). :~step
+; is a COMPUTED relation over a finite state instance — its provider expands a
+; state through the clauses. :~reachable is a DERIVED fixpoint over :~step,
+; evaluated by the SHIPPED datom.query.fixpoint engine, which cannot tell a
+; computed edge from a stored one.
+;
+; Here we expose the model as data + the step function; the datalog rule
+; REACHABLE (below) is what a caller feeds to datom/q with the extracted edges
+; asserted as :edge/to facts. See examples/system for the end-to-end wiring.
+
+(def REACHABLE
+  '[[(reachable ?a ?b) [?a :edge/to ?b]]
+    [(reachable ?a ?b) [?a :edge/to ?x] (reachable ?x ?b)]])
+
+; ── the SystemModel: everything extracted, as one object ────────────────
+
+(defn system-model
+  "Extract the full model of a top-level process form: its name, transitions,
+   and transition graph. The single object all guarantees are functions of."
+  [node]
+  (let [clauses (transitions node)]
+    {:name        (machine-name node clauses)
+     :transitions clauses
+     :graph       (graph clauses)}))
