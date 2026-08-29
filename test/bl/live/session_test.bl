@@ -1,0 +1,96 @@
+; session_test.bl — W4: shared + session composition, and self-cleaning.
+;
+; The view is `(shared-db session-db locals) → hiccup` — the explicit
+; two-value composition (PLAN-052 R7). This pins two properties:
+;   1. a view reads BOTH worlds; a session-only write re-renders THIS socket
+;      without touching the shared world (no cross-viewer effect);
+;   2. the session conn is in-memory (ETS), owned by the socket process, so
+;      it dies with the socket — leak-free by process lifetime, no teardown.
+
+(ns live.session.test
+  (:require [live.socket :as s] [datom] [datom.store-ets] [datom.store]))
+
+(defn- shared-conn []
+  (datom/connect
+    [{:db/ident :task/slug :db/valueType :db.type/string :db/unique :db.unique/identity}
+     {:db/ident :task/title :db/valueType :db.type/string}]))
+
+(def cart-schema
+  [{:db/ident :cart/slug :db/valueType :db.type/string :db/unique :db.unique/identity}])
+
+;; a view over BOTH worlds: task titles from shared, cart flag from session
+(defn- board [db sess _locals]
+  (let [tasks (sort (datom/q '[:find ?s ?t
+                               :where [?e :task/slug ?s] [?e :task/title ?t]] db))
+        in-cart (if sess
+                  (into #{} (map first (datom/q '[:find ?s :where [_ :cart/slug ?s]] sess)))
+                  #{})]
+    [:ul (for [t tasks]
+           [:li {:key (first t)
+                 :data-in-cart (if (contains? in-cart (first t)) "yes" "no")}
+            (second t)])]))
+
+(defn- drain [ms]
+  (receive
+    [:mount html] [:mount html]
+    [:patch ops] [:patch ops]
+    (after ms :none)))
+
+;; ── composition: a session write re-renders this socket only ────────
+
+(deftest session-write-rerenders-locally
+  (let [shared (shared-conn)
+        sess (s/open-session cart-schema)]
+    (datom/transact! shared [{:db/id -1 :task/slug "a" :task/title "First"}
+                             {:db/id -2 :task/slug "b" :task/title "Second"}])
+    (let [st (s/mount {:view board :shared shared :session sess
+                       :sink (erlang/self) :intents {}})]
+      (let [[tag html] (drain 200)]
+        (is (= :mount tag))
+        (is (includes? html "data-in-cart=\"no\"")))
+      ; a SESSION-only write: add task "a" to this socket's cart
+      (datom/transact! sess [{:db/id -1 :cart/slug "a"}])
+      (s/on-commit st)
+      (let [[tag ops] (drain 200)]
+        (is (= :patch tag))
+        ; exactly the cart flag on the first row flipped; shared untouched
+        (is (= [[:set-attr [0] "data-in-cart" "yes"]] ops)))
+      ; the SHARED world never changed
+      (is (= 2 (count (datom/q '[:find ?s :where [_ :task/slug ?s]] (datom/db shared))))))))
+
+;; ── self-cleaning: the session table dies with the socket process ───
+
+(deftest session-conn-dies-with-owner
+  (let [me (erlang/self)
+        pid (erlang/spawn
+              (fn []
+                (let [sess (s/open-session cart-schema)
+                      tbl (:table (:store sess))]
+                  (datom/transact! sess [{:db/id -1 :cart/slug "x"}])
+                  (erlang/send me [:tbl tbl])
+                  (receive [:die] nil (after 5000 nil)))))
+        tbl (receive [:tbl t] t (after 1000 nil))]
+    ; while the owner lives, the table holds the session's datoms (a commit
+    ; writes many index entries — EAV/AEV + schema + tx-instant — so assert
+    ; non-empty, not an exact count)
+    (is (> (ets/info tbl :size) 0) "session table holds data while owner lives")
+    (is (= pid (ets/info tbl :owner)) "the socket process owns the table")
+    ; kill the owner → the ETS table is reclaimed, no teardown code
+    (erlang/send pid [:die])
+    (Process/sleep 150)
+    (is (not (Process/alive? pid)))
+    (is (= :undefined (ets/info tbl :size))
+        "the session conn is gone with its process — leak-free by lifetime")))
+
+;; ── a session with NO shared coupling still renders ─────────────────
+
+(deftest session-only-view
+  (let [shared (shared-conn)
+        sess (s/open-session cart-schema)]
+    (datom/transact! shared [{:db/id -1 :task/slug "a" :task/title "Only"}])
+    (datom/transact! sess [{:db/id -1 :cart/slug "a"}])
+    (let [st (s/mount {:view board :shared shared :session sess
+                       :sink (erlang/self) :intents {}})]
+      (let [[_ html] (drain 200)]
+        ; the cart flag is already "yes" at mount — both worlds read at once
+        (is (includes? html "data-in-cart=\"yes\""))))))
