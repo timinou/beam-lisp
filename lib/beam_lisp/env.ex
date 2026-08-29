@@ -47,6 +47,7 @@ defmodule BeamLisp.Env do
   @pdict_chain :bl_env_chain
   @pdict_ns :bl_ns
   @pdict_caps :bl_caps
+  @op_table :beam_lisp_ops
   @max_chain_depth 8
 
   def start_link(_opts) do
@@ -143,13 +144,85 @@ defmodule BeamLisp.Env do
   def caps, do: Process.get(@pdict_caps, :all)
 
   @doc """
-  Whether the current process's env grants interop to `module`. The hot
-  path of the capability gate: one pdict read + set-membership check.
+  Whether the current process's env grants interop to `module`,
+  optionally narrowed to `op` (an atom like `:read` — see `op_of/2`).
+
+  Grant shapes in a caps set:
+
+    * `File` (bare module)           → every op of that module
+    * `{File, :read}` (module-op)    → only fns the op table maps to :read
+
+  A {module, op} grant for an fn the table does NOT list allows nothing
+  extra — unlisted fns of an op-scoped module are denied. Unknown modules
+  have no table entry: a bare-module grant still covers them, an op-scoped
+  grant denies (fail closed on a grant we cannot interpret).
+
+  The hot path of the capability gate: one pdict read + set membership.
   """
-  def caps_allowed?(module) do
+  def caps_allowed?(module, op \\ nil) do
     case caps() do
-      :all -> true
-      set -> MapSet.member?(set, module)
+      :all ->
+        true
+
+      set ->
+        MapSet.member?(set, module) or
+          (not is_nil(op) and MapSet.member?(set, {module, op}))
+    end
+  end
+
+  @doc """
+  The op a module's fn performs, per `op_table/0` — or nil when the table
+  doesn't say. Data, not code: extend via `register_op/3`.
+  """
+  def op_of(module, fun) do
+    ensure_op_table()
+
+    case :ets.lookup(@op_table, {module, fun}) do
+      [{_, op}] -> op
+      [] -> nil
+    end
+  end
+
+  @doc "Add `{module, fn} → op` to the op table (app-specific modules)."
+  def register_op(module, fun, op) when is_atom(op) do
+    ensure_op_table()
+    :ets.insert(@op_table, {{module, fun}, op})
+    :ok
+  end
+
+  # The default table: the dangerous-shape modules, read/write/env/exec
+  # split. Deliberately small and data-shaped — a deployment audits ONE
+  # table, not the compiler.
+  @default_ops [
+    {File, :read, :read}, {File, :read!, :read}, {File, :exists?, :read},
+    {File, :ls, :read}, {File, :ls!, :read}, {File, :stat, :read},
+    {File, :cwd, :read}, {File, :cwd!, :read},
+    {File, :write, :write}, {File, :write!, :write}, {File, :rm, :write},
+    {File, :rm!, :write}, {File, :rm_rf, :write}, {File, :mkdir, :write},
+    {File, :mkdir_p, :write}, {File, :cp, :write}, {File, :rename, :write},
+    {System, :get_env, :env_read}, {System, :fetch_env, :env_read},
+    {System, :put_env, :env_write}, {System, :delete_env, :env_write},
+    {System, :cmd, :exec}, {System, :shell, :exec},
+    {:os, :cmd, :exec}, {:os, :getenv, :env_read}, {:os, :putenv, :env_write},
+    {Code, :eval_string, :eval}, {Code, :eval_quoted, :eval},
+    {Code, :compile_string, :eval}, {:erlang, :apply, :eval}
+  ]
+
+  defp ensure_op_table do
+    case :ets.whereis(@op_table) do
+      :undefined ->
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@op_table, [:named_table, :public, :set, read_concurrency: true])
+          rescue
+            ArgumentError -> :ok
+          end
+        end)
+
+        for {m, f, op} <- @default_ops, do: :ets.insert(@op_table, {{m, f}, op})
+
+      _ ->
+        :ok
     end
   end
 

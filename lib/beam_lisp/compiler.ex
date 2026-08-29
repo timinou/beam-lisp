@@ -2816,7 +2816,7 @@ defmodule BeamLisp.Compiler do
   # for static calls. Dynamic paths are gated in `RT.remote_fun/2` and
   # `RT.invoke/2`.
   defp gate_remote!(env, module, fun) do
-    if Env.caps_allowed?(module) do
+    if Env.caps_allowed?(module, Env.op_of(module, fun)) do
       {:remote, module, fun}
     else
       compile_error(
