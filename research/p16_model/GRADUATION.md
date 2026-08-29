@@ -87,3 +87,60 @@ out of scope). The package reorg + seam regressed nothing.
 Bugs fixed at root: extract-defserver dropped :when guards; verify-process
 conflated init-establishment with preservation; state-vars picked the operator
 symbol (>=) instead of the state var; abduce's double check-sat (earlier).
+
+---
+
+# P18 — richer state models (2026-08-29)
+
+State is no longer one integer. verify-process reads each field's z3 SORT from
+the init state and proves the invariant over the whole shape. The whole ladder
+graduated, each rung as tests + a demo.
+
+## The ladder (all shipped)
+| rung | state model | function | warm |
+|---|---|---|---|
+| 1 · multi-var | tuple of ints, relational invariant (balance ≥ reserved) | verify-process | 21 ms |
+| 2 · records | mixed-sort record (int × bool), (frozen ⇒ balance=0) | verify-process | 23 ms |
+| 3 · collections | capacity via length abstraction (count ≤ 10), EXACT | verify-capacity | 19 ms |
+| 4 · sum types | phase-coded variant, session-type conformance (send ⇒ open) | verify-process | 17 ms |
+| ★ discovery | invariant from nothing, Houdini fixpoint | discover-invariant | 99 ms |
+
+## Mechanism
+- `system.core/state-shape` reads field order + per-field sorts from the init
+  state: vector → positional Int (Rung 1); map → named fields, false/true → Bool
+  else Int (Rung 2); bare symbol → one Int. N=1 all-Int is the special case.
+- `inv-define-fun` / `preserves-joint?` / `establishes-joint?` declare each field
+  (and its primed copy) at its own sort; the invariant is a z3 define-fun, so
+  priming the whole state needs no textual substitution.
+- `system.smt/translate-len` abstracts a collection to its length: (count c)→c_len,
+  (conj c x)→(+ c_len 1), (rest c)→(- c_len 1), (empty? c)→(= c_len 0), []→0.
+  Capacity is EXACT; content (no-duplicate) stays untranslatable → the bounded
+  Rung-3(b) companion. guarantee-catalog keeps exact vs approximate apart.
+- `discover-invariant` is a Houdini fixpoint over candidate-invariants: establish
+  filter (holds-at-init, also makes the seed consistent) BEFORE induction. State
+  vars without an invariant come from the transitions — a message INPUT is bound
+  by its pattern, a STATE VAR appears in guards/nexts but no pattern.
+- A sum-typed variant is a phase = integer-coded enum; protocol conformance is
+  Rung 1 over the phase var, through the same verify-process (no new checker).
+
+## Root-fixed bugs (found by a rung disagreeing with an obvious case)
+- errors/delaborate had no :map / :keyword case → record :next rendered as a raw
+  {:map,…} tuple. Added both.
+- free-syms declared the boolean literals true/false as Int inputs, shadowing
+  SMT's true/false and silently breaking any transition assigning a bool literal.
+  Excluded them (they are VALUES). Hardened Rung 2 as well.
+
+## Tests + demos
+- test/bl/system/seam_test.bl grew 9 → 21 tests (25 → 55 assertions).
+- examples/system/10–15 (multivar, record, collection, protocol, discover,
+  type-directed) — all 15 system demos run clean.
+
+## Regression
+Non-auth suite: **647 tests / 1760 assertions / 0F 0E** (auth still pre-broken,
+out of scope). All rungs regressed nothing; N=1 stayed a true special case.
+
+## Infra note
+priv/*.bl compile into ebin at build; a prelude ns (errors, typed) or a lazily
+required ns edit needs `mix compile.beam_lisp` (and MIX_ENV=test for the suite)
+before the direct-elixir harness sees it. Learned the hard way when a delaborate
+edit appeared inert.
