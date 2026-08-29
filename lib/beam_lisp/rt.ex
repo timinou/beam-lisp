@@ -239,6 +239,12 @@ defmodule BeamLisp.RT do
 
   def get(m, key, default) when is_bl_map(m), do: Map.get(m, hash_key(key), default)
   def get(nil, _key, default), do: default
+  # Clojure: (get non-associative k) is the default (nil), never an error.
+  # A keyword/atom/number/string is not a lookup target, so `(:k :some-kw)` and
+  # `(:k 7)` yield nil rather than raising. This also makes a sum-type
+  # discriminant `(some? (:tag x))` total: when x is a NULLARY arm (a bare
+  # keyword), `(:tag x)` is nil, so presence correctly reports "not this arm".
+  def get(_other, _key, default), do: default
 
   @doc """
   Clojure `identical?`: reference equality.
