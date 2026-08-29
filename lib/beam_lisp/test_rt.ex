@@ -184,6 +184,14 @@ defmodule BeamLisp.TestRT do
     Map.put(fetch_run(ns), :ns, ns)
   end
 
+  @doc "Sum two suite totals maps — the shape multi-pass runners need."
+  def merge_totals(a, b) do
+    Map.merge(a, b, fn
+      k, x, y when k in [:tests, :pass, :fail, :error] -> x + y
+      _k, x, _y -> x
+    end)
+  end
+
   @doc "Sum a list of per-ns results into one totals map."
   def aggregate(results) do
     Enum.reduce(results, %{tests: 0, pass: 0, fail: 0, error: 0}, fn r, acc ->

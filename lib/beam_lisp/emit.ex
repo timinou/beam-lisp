@@ -192,17 +192,26 @@ defmodule BeamLisp.Emit do
   `.beam` binaries instead of calling this.
   """
   def build_module(mod, block, location) do
-    prev_opts = Code.compiler_options()
-    # infer_signatures: false drops Elixir's type checker to :traverse mode
-    # for the generated module — signature construction (Module.Types.Descr
-    # tuple intersections) dominates compile time on tuple-literal-dense
-    # generated code: one heavy defn measured 93s with, 63ms without.
-    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
+    # VM-wide critical section per module: with async test forks requiring
+    # libraries concurrently, two loaders can compile the SAME module at
+    # once (multi-ns files defeat per-file load locks: usage.bl and
+    # error.bl both define relay.error) — Module.create raises "currently
+    # being defined". Same fix as Record.define/3 and Native.declare/3
+    # (PLAN-046); lock ids are {resource, requester} 2-tuples. The loser
+    # simply redefines identically under ignore_module_conflict.
+    :global.trans({{:bl_module, mod}, self()}, fn ->
+      prev_opts = Code.compiler_options()
+      # infer_signatures: false drops Elixir's type checker to :traverse mode
+      # for the generated module — signature construction (Module.Types.Descr
+      # tuple intersections) dominates compile time on tuple-literal-dense
+      # generated code: one heavy defn measured 93s with, 63ms without.
+      Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
 
-    try do
-      Module.create(mod, block, location || Macro.Env.location(__ENV__))
-    after
-      Code.compiler_options(prev_opts)
-    end
+      try do
+        Module.create(mod, block, location || Macro.Env.location(__ENV__))
+      after
+        Code.compiler_options(prev_opts)
+      end
+    end)
   end
 end

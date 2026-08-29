@@ -203,6 +203,24 @@ defmodule BeamLisp.Env do
   defp as_thunk(fun), do: fn -> BeamLisp.RT.invoke(fun, []) end
 
   @doc """
+  Wrap a one-argument invocable (bl fn or Elixir fn) as an ELIXIR
+  arity-1 fn that first binds the CALLER's env, then invokes.
+
+  The Agent-action shape of the propagation rule: `Agent.get_and_update`
+  validates `is_function`, and a raw bl fn struct fails that — and even
+  past the validation it would resolve its vars (and its interop caps) in
+  the AGENT's process at `:global`. Conveyance keeps Clojure-dynamic
+  semantics across the process boundary: the action resolves exactly as
+  if the caller had run it. Caps re-derive in `bind/1`, so a capped
+  caller's rights ride along — the confused-deputy fix (FUP-009).
+  """
+  def convey(fun) do
+    token = capture()
+    inner = fn arg -> BeamLisp.RT.invoke(fun, [arg]) end
+    fn arg -> bind(token); inner.(arg) end
+  end
+
+  @doc """
   Drop every row belonging to `env` and forget its bookkeeping.
 
   One `select_delete` scan guarded on the key's first element, so it works
@@ -375,16 +393,28 @@ defmodule BeamLisp.Env do
 
   @doc "The namespace new defs land in."
   def current_ns do
-    case env_id() do
-      :global -> Agent.get(__MODULE__, & &1.ns)
-      _ -> Process.get(@pdict_ns, "user")
-    end
+    # pdict FIRST, at every env — `*ns*` is thread-local (Clojure's model).
+    # The Agent value is the ambient default for processes that never set
+    # one (the REPL's published ns, the live panel's display), NOT the
+    # compiling process's state: concurrent `:global` library loads used
+    # to share the Agent cell and compiled each other's forms under the
+    # wrong namespace (relay.completion's def referencing
+    # relay.provider.openai-compat/req-llm-generate, PLAN-047 W1).
+    Process.get(@pdict_ns) ||
+      case env_id() do
+        :global -> Agent.get(__MODULE__, & &1.ns)
+        _ -> "user"
+      end
   end
 
   def in_ns(ns) when is_binary(ns) do
-    case env_id() do
-      :global -> Agent.update(__MODULE__, &%{&1 | ns: ns})
-      _ -> Process.put(@pdict_ns, ns)
+    Process.put(@pdict_ns, ns)
+
+    # Mirror to the Agent at :global so unbound observers (REPL display,
+    # live panel) see the ambient namespace. Compilation never reads the
+    # mirror — pdict wins — so concurrent writers cannot cross-compile.
+    if env_id() == :global do
+      Agent.update(__MODULE__, &%{&1 | ns: ns})
     end
 
     :ok

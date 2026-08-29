@@ -100,19 +100,22 @@ defmodule BeamLisp.LazySeq do
     end
   end
 
-  # Created on first use and owned by whichever process gets there first.
-  # That is still a process-lifetime dependency, but a much longer one:
-  # this table is never rebuilt as part of resetting the language, which
-  # is the coupling that actually bit.
+  # Created on first use. The creator MUST be a VM-lifetime process: under
+  # async test suites the first toucher was a short-lived per-file Task, the
+  # table died with it, and every later lazy-seq access VM-wide raised
+  # "the table identifier does not refer to an existing ETS table" — flaky,
+  # order-dependent (PLAN-047 W1). The pinned Loader.Server owns it.
   defp ensure_table do
     case :ets.whereis(@table) do
       :undefined ->
-        try do
-          :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-        rescue
-          # Another process won the race; its table is the one we want.
-          ArgumentError -> :ok
-        end
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+          rescue
+            # Another process won the race; its table is the one we want.
+            ArgumentError -> :ok
+          end
+        end)
 
       _ ->
         :ok

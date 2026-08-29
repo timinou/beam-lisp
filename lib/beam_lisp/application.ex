@@ -8,7 +8,7 @@ defmodule BeamLisp.Application do
     port = dev_port()
 
     children =
-      [BeamLisp.Env] ++
+      [BeamLisp.Env, BeamLisp.Loader.Server] ++
         if dev_server?() and port_free?(port) do
           # Tidewave MCP endpoint: http://127.0.0.1:9837/tidewave/mcp
           # BEAMLISP_DEV_PORT overrides the port — test/CI harnesses set a

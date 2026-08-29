@@ -152,22 +152,48 @@ defmodule BeamLisp.AOT do
 
     if code_path_module?(mod) and Code.ensure_loaded?(mod) and
          function_exported?(mod, :__bl_init__, 0) do
-      # MARK IT BEFORE RUNNING IT, exactly as the source loader does.
-      #
-      # Two reasons, and the order matters for the second. First, the mark is
-      # what lets `Loader.ensure_loaded/1` skip the source: without it the
-      # answer to `loaded_ns?` was `false` and the loader read and compiled
-      # the source it had just been handed — `datom` cost 41s through the
-      # loader against 14.7s calling this directly.
-      #
-      # Second, `__bl_init__/0` now replays this namespace's requires, and a
-      # require cycle would come back around to here. Marking first makes the
-      # loader's guard cut the cycle; marking afterwards would recurse until
-      # the stack gave out.
-      Env.mark_loaded(ns)
-      mod.__bl_init__()
+      # Fast path BEFORE the lock: require cycles (A's __bl_init__ requires
+      # A) are cut by the mark-first protocol below, and that cut must not
+      # depend on re-acquiring the same trans lock from the same process.
+      if Env.loaded_ns?(ns) do
+        :loaded
+      else
+        # MARK IT BEFORE RUNNING IT, exactly as the source loader does.
+        #
+        # Two reasons, and the order matters for the second. First, the mark is
+        # what lets `Loader.ensure_loaded/1` skip the source: without it the
+        # answer to `loaded_ns?` was `false` and the loader read and compiled
+        # the source it had just been handed — `datom` cost 41s through the
+        # loader against 14.7s calling this directly.
+        #
+        # Second, `__bl_init__/0` now replays this namespace's requires, and a
+        # require cycle would come back around to here. Marking first makes the
+        # loader's guard cut the cycle; marking afterwards would recurse until
+        # the stack gave out.
+        #
+        # The lock + `:global` wrap are the async-fork fixes (PLAN-047 W1):
+        # two forks requiring the same AOT namespace concurrently raced the
+        # replay, and the replay's interns landed in the CALLER's fork — every
+        # other process then missed the vars (`undefined var: relay.keys/create`
+        # under BL_ASYNC=1). A required namespace is LIBRARY code: it interns
+        # at `:global`, once, VM-wide — same rule as the source path.
+        :global.trans({{:bl_load, mod}, self()}, fn ->
+          if Env.loaded_ns?(ns) do
+            :loaded
+          else
+            BeamLisp.Loader.Server.run(fn ->
+              Env.with_env(:global, fn ->
+                mod.__bl_init__()
+                # Mark AFTER the replay — see Loader.do_load; cycle safety
+                # is the :bl_loading set, not the mark.
+                Env.mark_loaded(ns)
+              end)
+            end)
 
-      :loaded
+            :loaded
+          end
+        end)
+      end
     else
       # SAY SO. A bare `:ok` for both outcomes is what hid the bug this return
       # value fixed: the caller could not distinguish "loaded from disk" from
@@ -193,6 +219,10 @@ defmodule BeamLisp.AOT do
   def boot do
     unless Process.whereis(BeamLisp.Env) do
       {:ok, _} = BeamLisp.Env.start_link([])
+    end
+
+    unless Process.whereis(BeamLisp.Loader.Server) do
+      {:ok, _} = BeamLisp.Loader.Server.start_link([])
     end
 
     BeamLisp.init()
