@@ -194,24 +194,85 @@
       }
     };
 
-    // event delegation: a click/input on a [data-ev-*] node fires its event
+    // event delegation. A [data-ev-EVENT] node carries its intent as a JSON
+    // attribute; on fire we relay that term plus the value of the nearest
+    // input (so a Send button and an Enter key both carry the field text).
     root.addEventListener("click", function (e) {
-      fireFrom(e.target, "click", ws);
+      fireFrom(e.target, "click", ws, formData(e.target));
     });
     root.addEventListener("input", function (e) {
       fireFrom(e.target, "input", ws, { value: e.target.value });
+    });
+    // Enter in an input fires its `on-keydown.enter` intent (if any), and
+    // clears the field — the chat-composer gesture. The `.enter` modifier is
+    // part of the attribute name (data-ev-keydown.enter), so match by prefix.
+    root.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter" || e.shiftKey) return;
+      var el = closestAttrPrefix(e.target, "data-ev-keydown");
+      if (!el) return;
+      e.preventDefault();
+      var attr = el.__evAttr;
+      // honour a `.enter` modifier if present; a bare keydown fires on any key
+      if (attr.indexOf(".enter") >= 0 || attr === "data-ev-keydown") {
+        relay(el, attr, ws, { value: e.target.value });
+        if (el.tagName === "INPUT") el.value = "";
+      }
     });
 
     return ws;
   }
 
+  // the value of the input nearest `el` (itself, or one in its container),
+  // so a button click carries the message the user typed
+  function formData(el) {
+    if (el.tagName === "INPUT") return { value: el.value };
+    var box = el.closest("div,footer,form,section") || el.parentElement;
+    var input = box && box.querySelector("input");
+    var data = input ? { value: input.value } : {};
+    if (input) input.__clear = true;
+    return data;
+  }
+
+  // walk up from `node` to the first element carrying an attribute whose name
+  // starts with `prefix` (so `data-ev-keydown` matches `data-ev-keydown.enter`).
+  // Stashes the matched attribute name on the element as `__evAttr`.
+  function closestAttrPrefix(node, prefix) {
+    var el = node;
+    while (el && el.nodeType === 1) {
+      if (el.attributes) {
+        for (var i = 0; i < el.attributes.length; i++) {
+          var name = el.attributes[i].name;
+          if (name.indexOf(prefix) === 0) { el.__evAttr = name; return el; }
+        }
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // relay the JSON term stored in attribute `attr` of `el` to the server
+  function relay(el, attr, ws, data) {
+    var raw = el.getAttribute(attr);
+    var term = null;
+    try { term = raw ? JSON.parse(raw) : null; } catch (e) { term = null; }
+    ws.send(JSON.stringify(["event", term, data || {}]));
+    return true;
+  }
+
   function fireFrom(target, evName, ws, data) {
-    const el = target.closest("[data-ev-" + evName + "]");
-    if (!el) return;
-    // the event TERM is carried by the server; the client only names the
-    // event and the source element's key, plus any DOM data (input value).
-    const key = el.getAttribute("data-key");
-    ws.send(JSON.stringify(["event", { event: evName, key: key }, data || {}]));
+    var el = closestAttrPrefix(target, "data-ev-" + evName);
+    if (!el) return false;
+    // the event TERM travels as a JSON attribute (data-ev-EVENT='<json>').
+    // Send it back verbatim so the server performs exactly what the view
+    // declared — the client never invents an intent, it only relays one.
+    relay(el, el.__evAttr, ws, data);
+    // clear a composer input after a click-send
+    if (evName === "click") {
+      var box = target.closest("div,footer,form,section");
+      var input = box && box.querySelector("input");
+      if (input && input.__clear) { input.value = ""; input.__clear = false; }
+    }
+    return true;
   }
 
   window.Live = { connect: connect, applyOp: applyOp, render: render };
