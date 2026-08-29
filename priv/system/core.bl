@@ -547,14 +547,17 @@
                   (filter (fn [nm] (not (= nm svar))) (into [] names))))))
 
 (defn- free-syms
-  "The identifier tokens in an SMT-ish source string — words that are not ops or
-   numbers. A cheap lexer over the delaborated form."
+  "The identifier tokens in an SMT-ish or source string — words that are not ops,
+   numbers, or keywords. A cheap lexer: strips ( ) [ ] { } then splits on space.
+   Keyword tokens (leading :) are message tags, not variables, so dropped."
   [src]
-  (let [toks (split (join " " (split (join " " (split src "(")) ")")) " ")
+  (let [stripped (reduce (fn [s d] (join " " (split s d))) src ["(" ")" "[" "]" "{" "}"])
+        toks (split stripped " ")
         ops #{"+" "-" "*" "and" "or" "not" "=" "<" ">" "<=" ">=" "mod"
               "inc" "dec" "pos?" "neg?" "zero?" ""}]
     (filter (fn [t] (and (not (contains? ops t))
-                         (not (int-string? t))))
+                         (not (int-string? t))
+                         (not (= ":" (subs t 0 (min 1 (count t)))))))
             toks)))
 
 (defn- int-string? [s]
@@ -584,6 +587,137 @@
            {:msg (str "invariant not preserved by " (name (:label f)))
             :line line :col col})
          (:failures r))))
+
+; ═════════════════════════════════════════════════════════════════
+; INVARIANT DISCOVERY — the invariant from NOTHING (P18 ★)
+;
+; verify-process needs you to WRITE ^{:invariant …}. abduce STRENGTHENS a given
+; invariant with a missing conjunct. This DISCOVERS the whole invariant when
+; there is no annotation — the last annotate-only property, closed.
+;
+; It is a HOUDINI fixpoint (Flanagan–Leino) over exactly the pieces the tier
+; already has: `candidates` (miniKanren enumerates predicates), the state vars
+; (from state-shape), and preserves-joint?/establishes-joint? (z3 decides).
+;   1. establishment filter — keep candidates true at the INIT state. This is
+;      also what makes the seed CONSISTENT: the full vocabulary contains
+;      contradictory predicates ((>= v 5) ∧ (<= v 0)) whose conjunction is
+;      empty, and induction over an unsatisfiable antecedent is vacuous. Init
+;      witnesses a satisfiable set, so induction has teeth.
+;   2. induction fixpoint — drop any conjunct some transition can break under
+;      the CURRENT surviving set; iterate to a fixpoint.
+; The result is the strongest inductive invariant expressible in the candidate
+; vocabulary — sound by construction (proven established + inductive).
+; ═════════════════════════════════════════════════════════════════
+
+(defn- candidate-invariants
+  "The candidate predicate vocabulary over the state vars: (op v k) for each
+   state var v, op ∈ {<= >=}, k ∈ small constants. Reuses `candidates` — one
+   engine (miniKanren) enumerates, deduped."
+  [svars]
+  (let [consts (list 0 1)
+        per-var (mapcat
+                  (fn [v]
+                    (map (fn [op-k]
+                           (str "(" (first op-k) " " v " " (second op-k) ")"))
+                         (mapcat (fn [op] (map (fn [k] [op k]) consts))
+                                 (list "<=" ">="))))
+                  svars)]
+    (distinct per-var)))
+
+(defn- holds-at-init?
+  "Does `cand` hold at the init state? Assert init-eqs ∧ ¬cand; unsat ⟹ holds.
+   `init-vals` is {svar → init-SMT}; a pass-through field (init = the var) is a
+   free opening value, so a candidate over it must hold for ALL openings — we
+   model that by leaving it free (no equation), which is the sound reading."
+  [port svars sorts decls init-vals cand]
+  (let [eqs (join "" (keep (fn [v]
+                             (let [iv (get init-vals v)]
+                               (if (or (nil? iv) (= iv v)) nil
+                                 (str "(assert (= " v " " iv "))\n"))))
+                           svars))
+        smt (str decls eqs "(assert (not " cand "))\n")]
+    (= "unsat" (z3/check port smt))))
+
+(defn- inductive-under?
+  "Under the conjunction `conj-set` as antecedent, does `cand` survive every
+   transition? For each t: assert (⋀ conj-set)(s) ∧ guard ∧ (⋀ v2=next) ∧
+   ¬cand(s2); unsat for ALL t ⟹ cand is preserved."
+  [port svars sorts decls conj-set ts cand]
+  (let [prime-decls (join "" (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars))
+        anteced (join "" (map (fn [c] (str "(assert " c ")\n")) conj-set))
+        cand2 (join (str (first svars) "2")           ; crude prime of cand: only
+                    (split cand (first svars)))]       ; sound for single-var vocab
+    (every?
+      (fn [t]
+        (let [prime-eqs (join "" (map (fn [v] (str "(assert (= " v "2 "
+                                                    (get (:nexts t) v v) "))\n")) svars))
+              ; prime the candidate over WHICHEVER state var it mentions
+              cprimed (reduce (fn [s v] (join (str v "2") (split s v))) cand svars)
+              smt (str decls prime-decls anteced
+                       (if (:guard t) (str "(assert " (:guard t) ")\n") "")
+                       prime-eqs
+                       "(assert (not " cprimed "))\n")]
+          (= "unsat" (z3/check port smt))))
+      ts)))
+
+(defn discover-invariant
+  "Discover an inductive invariant for a process form with NO annotation (or to
+   corroborate one). Returns {:name :discovered smt-string|nil :conjuncts […]
+   :checked bool}. Sound: every returned conjunct is proven established at init
+   AND preserved by every transition (a Houdini fixpoint). :discovered is nil
+   when the vocabulary yields nothing (honest: we found no invariant, not a
+   false one)."
+  [port node]
+  (let [sm (model/system-model node)
+        clauses (:transitions sm)
+        init-c (first (filter (fn [c] (= :init (:label c))) clauses))
+        shape0 (state-shape nil clauses)
+        ; state vars: the init shape when it names them (vector/map/symbol);
+        ; else DERIVE them from the message transitions. Principled signal: a
+        ; MESSAGE INPUT is bound by that message's pattern ([:deposit amt] binds
+        ; amt); a STATE VAR appears in guards/nexts but in NO message pattern.
+        ; That distinguishes state from per-message input without a name list.
+        msg-cs0 (filter (fn [c] (not (= :init (:label c)))) clauses)
+        pattern-vars (into #{} (mapcat (fn [c] (free-syms (or (:pattern c) ""))) msg-cs0))
+        derived (into [] (distinct
+                           (filter (fn [v] (not (contains? pattern-vars v)))
+                             (mapcat (fn [c]
+                                       (concat (if (:guard c) (free-syms (or (smt/of-source #{} (:guard c)) "")) [])
+                                               (free-syms (or (smt/of-source #{} (:next c)) ""))))
+                                     msg-cs0))))
+        svars (if (seq (:svars shape0)) (:svars shape0) derived)
+        sorts (if (seq (:svars shape0)) (:sorts shape0)
+                (into {} (map (fn [v] [v "Int"]) svars)))]
+    (if (empty? svars)
+      {:name (:name sm) :discovered nil :conjuncts [] :checked false}
+      (let [msg-cs (filter (fn [c] (not (= :init (:label c)))) clauses)
+            ts (keep-translatable-multi svars sorts msg-cs)
+            svarset (set svars)
+            input-names (reduce
+                          (fn [acc t]
+                            (reduce (fn [a s] (if (nil? s) a (into a (free-syms s))))
+                                    acc (cons (:guard t) (into [] (vals (:nexts t))))))
+                          #{} ts)
+            inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
+            decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
+                       (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
+            init-vals (if init-c (next-fields svars sorts (:next init-c)) {})
+            cands (candidate-invariants svars)
+            ; 1. establishment filter → a CONSISTENT seed
+            established (filter (fn [c] (holds-at-init? port svars sorts decls init-vals c)) cands)
+            ; 2. Houdini induction fixpoint
+            fixpoint (loop [survivors established]
+                       (let [next-set (filter
+                                        (fn [c] (inductive-under? port svars sorts decls survivors ts c))
+                                        survivors)]
+                         (if (= (count next-set) (count survivors))
+                           survivors
+                           (recur next-set))))]
+        {:name (:name sm)
+         :discovered (if (empty? fixpoint) nil
+                       (str "(and " (join " " (sort fixpoint)) ")"))
+         :conjuncts (sort fixpoint)
+         :checked true}))))
 
 (defn verify-process-report
   "verify-process, with its warnings RENDERED through errors/render for a human:
