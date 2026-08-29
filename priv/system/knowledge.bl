@@ -1,0 +1,131 @@
+; knowledge.bl — the composition flywheel: every guarantee as ONE relation.
+;
+; The tier's guarantees are computed by separate functions — clause topology
+; (facts.bl), the phase graph (core.bl), message coverage (core.bl), the
+; invariant (model.bl). Each answers a WITHIN-process question. The questions
+; that matter across a system — "which send could violate the receiver's
+; invariant?", "which precondition does no sender establish?" — are CROSS-cutting,
+; and unanswerable by any one of them alone.
+;
+; This layer projects them all into a single datom store with one schema. Once
+; each capability is a RELATION, they JOIN: a cross-cutting question is a datalog
+; query, not a new checker. N capabilities → N² answers, for the cost of the
+; projection (the data already exists — this is projection, not re-derivation).
+;
+; Dependency-injected (mk-conn / transact / q-fn) exactly like facts.bl and the
+; coverage helpers, so this module need not require datom directly.
+
+(ns system.knowledge
+  (:require [system.model :as model] [system.facts :as facts]))
+
+(def SCHEMA
+  [; a process and its (optional) invariant
+   {:db/ident :process/name      :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :process/invariant :db/valueType :db.type/string}
+   ; a message-handling clause of a process
+   {:db/ident :clause/proc       :db/valueType :db.type/string}
+   {:db/ident :clause/label      :db/valueType :db.type/keyword}
+   {:db/ident :clause/guarded    :db/valueType :db.type/boolean}
+   {:db/ident :clause/guard      :db/valueType :db.type/string}
+   ; a phase-graph edge (enum/variant state field)
+   {:db/ident :phase/proc        :db/valueType :db.type/string}
+   {:db/ident :phase/from        :db/valueType :db.type/string}
+   {:db/ident :phase/to          :db/valueType :db.type/string}
+   ; a send from one process to another (call site)
+   {:db/ident :send/from         :db/valueType :db.type/string}
+   {:db/ident :send/to           :db/valueType :db.type/string}
+   {:db/ident :send/label        :db/valueType :db.type/keyword}])
+
+; ── projectors: each turns a shipped capability into facts ───────────────────
+; A projector returns a vector of fact maps; the caller transacts them. The
+; :db/id scheme keeps ids disjoint across projectors (hash of a role tag + name).
+
+(defn- pid [role nm i] (- (+ (* 1000000 (erlang/rem (erlang/phash2 (str role nm)) 900)) i 1)))
+
+(defn project-process
+  "The process node → its :process/name + :process/invariant fact."
+  [node]
+  (let [sm (model/system-model node)
+        nm (:name sm)
+        inv (:invariant sm)]
+    [(merge {:db/id (pid "proc" nm 0) :process/name nm}
+            (if inv {:process/invariant inv} {}))]))
+
+(defn project-clauses
+  "The process's message clauses → :clause/* facts (reusing facts/clause-facts,
+   re-tagged with the owning process)."
+  [node]
+  (let [nm (:name (model/system-model node))]
+    (into [] (map-indexed
+               (fn [i c]
+                 (merge {:db/id (pid "clause" nm i)
+                         :clause/proc nm
+                         :clause/label (:clause/label c)
+                         :clause/guarded (:clause/guarded c)}
+                        (if (contains? c :clause/guard) {:clause/guard (:clause/guard c)} {})))
+               (facts/clause-facts node)))))
+
+(defn project-sends
+  "Explicit sends between processes → :send/* facts. `sends` is a vector of
+   [from to label] tuples (in the full system these come from call-site
+   extraction; here the caller supplies the wiring)."
+  [sends]
+  (into [] (map-indexed
+             (fn [i s] {:db/id (pid "send" (str (first s) (nth s 2)) i)
+                        :send/from (first s) :send/to (second s) :send/label (nth s 2)})
+             sends)))
+
+(defn knowledge
+  "Build a unified knowledge db from process NODES + inter-process SENDS.
+   `mk-conn`/`transact` inject datom; returns the conn. Every guarantee of every
+   process, plus the wiring between them, in one queryable relation."
+  [nodes sends mk-conn transact]
+  (let [conn (mk-conn SCHEMA)]
+    (doseq [n nodes]
+      (transact conn (project-process n))
+      (transact conn (project-clauses n)))
+    (transact conn (project-sends sends))
+    conn))
+
+; ── the cross-cutting queries (each a JOIN no single function can do) ────────
+
+(defn guarded-sends
+  "Every send that lands on a GUARDED handler — a precondition the SENDER must
+   satisfy but the type system can't force. Join: send × receiver clause × guard.
+   Returns [{:from :to :label :guard} …]."
+  [db q-fn]
+  (map (fn [row] {:from (nth row 0) :to (nth row 1) :label (nth row 2) :guard (nth row 3)})
+       (q-fn db '[:find ?from ?to ?label ?guard
+                  :where [?s :send/from ?from] [?s :send/to ?to] [?s :send/label ?label]
+                         [?c :clause/proc ?to] [?c :clause/label ?label]
+                         [?c :clause/guarded true] [?c :clause/guard ?guard]])))
+
+(defn unhandled-sends
+  "Every send whose label the receiver does NOT handle — a message that will be
+   dropped. Datalog anti-join: send with no matching clause."
+  [db q-fn]
+  (map (fn [row] {:from (nth row 0) :to (nth row 1) :label (nth row 2)})
+       (q-fn db '[:find ?from ?to ?label
+                  :where [?s :send/from ?from] [?s :send/to ?to] [?s :send/label ?label]
+                         [:not-join [?to ?label]
+                           [?c :clause/proc ?to] [?c :clause/label ?label]]])))
+
+(defn processes-with-invariant
+  "Processes carrying an invariant, with it — the guarantees a receiver relies
+   on, so a cross-process check knows what a send must not break."
+  [db q-fn]
+  (map (fn [row] {:process (first row) :invariant (second row)})
+       (q-fn db '[:find ?n ?inv :where [?p :process/name ?n] [?p :process/invariant ?inv]])))
+
+(defn invariant-bearing-guarded-sends
+  "The composition seed: sends that hit a guarded handler on a receiver that
+   ALSO carries an invariant — the sites where a precondition violation could
+   break a downstream guarantee. Join across send × clause × guard × invariant."
+  [db q-fn]
+  (map (fn [row] {:from (nth row 0) :to (nth row 1) :label (nth row 2)
+                  :guard (nth row 3) :receiver-invariant (nth row 4)})
+       (q-fn db '[:find ?from ?to ?label ?guard ?inv
+                  :where [?s :send/from ?from] [?s :send/to ?to] [?s :send/label ?label]
+                         [?c :clause/proc ?to] [?c :clause/label ?label]
+                         [?c :clause/guarded true] [?c :clause/guard ?guard]
+                         [?p :process/name ?to] [?p :process/invariant ?inv]])))
