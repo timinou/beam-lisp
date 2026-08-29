@@ -1,0 +1,369 @@
+; codebase.bl — MVP-B: the codebase as a database.
+;
+; Graduated from research/p13c_datalog_checker (P13c) + typed (MVP-A)
+; after their questions were answered. Source is FACTS; checks and
+; program-comprehension questions are QUERIES over them:
+;
+;   [?d :fn/name "double"] [?d :fn/arity 1] [?d :fn/line 12]
+;   [?d :fn/ret-tag "int"] [?d :fn/ret-source "annotated"]
+;   [?c :call/caller "main"] [?c :call/callee "double"] [?c :call/line 34]
+;
+; Return types come from the REAL pipe: ^{:ret} annotations read from
+; source meta (no loading required), falling back to typed/walk
+; inference over the body. Queries shipped:
+;
+;   arity-mismatches · unknown-callees · reachable · impact (reverse
+;   reachability: "what breaks if I change X") · find-by-type /
+;   find-returning-only (L10: "which fns return string?")
+;
+; Head forms the walker understands: defn/defn-/def (incl. multi-clause,
+; docstrings, destructuring via typed), defmulti/defmethod, defprotocol/
+; extend-type/extend-protocol, defserver, defnative. Unknown macros are
+; expanded ONCE via Compiler/macroexpand_1 and the expansion walked —
+; the call graph sees through ->> and friends.
+
+(ns codebase
+  (:require [typed] [datom]))
+
+; --- schema -------------------------------------------------------------------
+
+(def SCHEMA
+  [{:db/ident :fn/name        :db/valueType :db.type/string}
+   {:db/ident :fn/ns          :db/valueType :db.type/string}
+   {:db/ident :fn/arity       :db/valueType :db.type/long}
+   {:db/ident :fn/line        :db/valueType :db.type/long}
+   {:db/ident :fn/variadic    :db/valueType :db.type/boolean}
+   {:db/ident :fn/ret-tag     :db/valueType :db.type/string}
+   {:db/ident :fn/ret-source  :db/valueType :db.type/string}
+   {:db/ident :call/caller    :db/valueType :db.type/string}
+   {:db/ident :call/callee    :db/valueType :db.type/string}
+   {:db/ident :call/arity     :db/valueType :db.type/long}
+   {:db/ident :call/line      :db/valueType :db.type/long}])
+
+; Heads that are NOT calls: special forms and the whitelisted macros the
+; walker handles structurally. A name containing "/" is interop or an
+; aliased var — resolved elsewhere, never "unknown".
+(defn interop-name?
+  "Interop or alias-qualified callees (contain a /) resolve elsewhere."
+  [s]
+  (some? (index-of s "/")))
+
+(def special-heads
+  #{"ns" "def" "fn" "if" "do" "quote" "syntax-quote" "let" "loop" "recur"
+    "throw" "try" "receive" "and" "or" "when" "when-not" "cond" "doseq"
+    "defn" "defn-" "defmacro" "defmulti" "defmethod" "defprotocol"
+    "extend-type" "extend-protocol" "defrecord" "deftype" "reify"
+    "defnative" "defserver" "satisfies?"})
+
+; --- form plumbing (reader nodes; see typed for the shape rules) ------------------
+
+(defn node-form [n] (typed/node-form n))
+(defn node-tag [n] (typed/node-tag n))
+(defn node-items [n] (typed/node-items n))
+(defn node-name [n] (typed/node-name n))
+(defn node-pos [n] (typed/node-pos n))
+
+(defn line-of [n fallback]
+  (let [p (node-pos n)]
+    (if (nil? p) fallback (:line p))))
+
+; --- meta → types ----------------------------------------------------------------
+
+(defn name-annotation
+  "The ^ map on a defn name node, as {kw → form-node}, or nil."
+  [name-node]
+  (if (= :meta (node-tag name-node))
+    (nth (erlang/tuple_to_list name-node) 2)
+    nil))
+
+(defn annotated-ret
+  "^{:ret T} from source meta → tagset, or nil. Meta values are form
+   nodes; symbols double as data symbols, which is all type-expr needs."
+  [name-node]
+  (let [m (name-annotation name-node)]
+    (if (and (map? m) (contains? m :ret))
+      (typed/type-expr (:ret m))
+      nil)))
+
+(defn annotated-args
+  "^{:args [T…]} → vector of tagsets, or nil."
+  [name-node]
+  (let [m (name-annotation name-node)]
+    (if (and (map? m) (contains? m :args))
+      (into [] (map (fn [a] (typed/type-expr a))
+                    (node-items (node-form (:args m)))))
+      nil)))
+
+; --- call extraction -----------------------------------------------------------
+
+(declare walk-calls)
+
+(defn walk-children [caller ns-str node acc next-id]
+  (reduce (fn [[a i] sub] (walk-calls caller ns-str sub a i))
+          [acc next-id] (node-items node)))
+
+(defn walk-calls
+  "Every (head …) call under `node`, as facts. `caller` is the
+   enclosing fn name (string). Returns [facts next-id]. Meta wrappers
+   carry the position; the inner list records against the WRAPPER's
+   line (via the :__pos env-style hint, same rule as typed)."
+  [caller ns-str node acc next-id]
+  (walk-calls-at caller ns-str node acc next-id nil))
+
+(defn walk-calls-at [caller ns-str node acc next-id hint]
+  (let [tag (node-tag node)]
+    (cond
+      (= tag :meta)
+        (walk-calls-at caller ns-str (second (erlang/tuple_to_list node))
+                       acc next-id (node-pos node))
+
+      (contains? #{:vector :set} tag)
+        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint))
+                [acc next-id] (node-items node))
+
+      (= tag :map)
+        (reduce (fn [[a i] pair]
+                  (let [[a2 i2] (walk-calls-at caller ns-str
+                                            (first (erlang/tuple_to_list pair)) a i hint)]
+                    (walk-calls-at caller ns-str
+                                (second (erlang/tuple_to_list pair)) a2 i2 hint)))
+                [acc next-id] (node-items node))
+
+      (= tag :list)
+        (let [items (node-items node)
+              head  (node-form (first items))]
+          (if (not (= :symbol (node-tag head)))
+            (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint))
+                    [acc next-id] items)
+            (let [hname (node-name head)
+                  rec-children (fn [a i]
+                                 (reduce (fn [[a2 i2] sub]
+                                           (walk-calls-at caller ns-str sub a2 i2 hint))
+                                         [a i] (rest items)))]
+              (cond
+                (contains? special-heads hname)
+                  (rec-children acc next-id)
+
+                ; unknown head: macro? expand once, walk the expansion —
+                ; the call graph sees through threading. Not a macro:
+                ; it is a call.
+                :else
+                  (let [orig   (typed/->tuple [:list items])
+                        grew?  (BeamLisp.Compiler/macroexpand_1 orig ns-str)]
+                    (if (not (identical? grew? orig))
+                      (walk-calls-at caller ns-str grew? acc next-id hint)
+                      (let [p (node-pos node)
+                            line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                            fact {:db/id next-id
+                                  :call/caller caller
+                                  :call/callee hname
+                                  :call/arity (count (rest items))
+                                  :call/line line}]
+                        (rec-children (conj acc fact) (+ next-id 1)))))))))
+      :else [acc next-id])))
+
+; --- defn extraction ------------------------------------------------------------
+
+(defn variadic? [params]
+  (some (fn [p]
+          (and (= :symbol (node-tag (node-form p)))
+               (= "&" (node-name (node-form p)))))
+        params))
+
+(defn infer-clause-ret
+  "typed/walk over a clause body, params bound to declared tags or any."
+  [sigs clause args]
+  (let [params (:params clause)
+        env (if (nil? args)
+              (reduce (fn [e p] (typed/bind-pattern e p typed/any)) {} params)
+              (reduce (fn [e [p t]] (typed/bind-pattern e p t))
+                      {} (map (fn [p t] [p t]) params args)))
+        body (:body clause)]
+    (reduce (fn [_ b] (typed/walk sigs env b)) typed/never body)))
+
+(defn defn-facts
+  "Facts for one defn/defn- form: fn entities (one per arity), ret-tag
+   facts (annotated wins over inferred), and every call in the bodies."
+  [sigs ns-str form next-fn-id next-call-id]
+  (let [f (typed/node-form form)
+        items (node-items f)
+        name-node (second items)
+        name (node-name (node-form name-node))
+        line (line-of form 0)
+        [cname doc clauses] (typed/defn-clauses items)
+        aret (annotated-ret name-node)
+        aargs (annotated-args name-node)
+        by-arity (reduce (fn [m c]
+                           (let [a (count (:params c))]
+                             (assoc m a (conj (get m a []) c))))
+                         {} clauses)
+        ; fn facts
+        [fn-facts fid]
+          (reduce
+            (fn [[facts i] [arity cs]]
+              [(conj facts
+                     {:db/id i :fn/name name :fn/ns ns-str
+                      :fn/arity arity :fn/line line
+                      :fn/variadic (if (variadic? (:params (first cs))) true false)})
+               (+ i 1)])
+            [[] next-fn-id] by-arity)
+        ; ret facts: annotation or inference. An `any` ret records
+        ; NOTHING — unknown stays silent, and does not flood
+        ; find-by-type with every tag.
+        inferred (if (some? aret)
+                   nil
+                   (reduce (fn [acc c]
+                             (typed/t-union acc (infer-clause-ret sigs c aargs)))
+                           typed/never clauses))
+        ret (if (some? aret) aret inferred)
+        ret-src (if (some? aret) "annotated" "inferred")
+        ret-tags (if (or (nil? ret) (= ret typed/all-tags))
+                   []
+                   (filter keyword? ret))
+        [ret-facts fid2]
+          (reduce (fn [[facts i] t]
+                    [(conj facts {:db/id i :fn/name name :fn/ns ns-str
+                                  :fn/ret-tag (str t) :fn/ret-source ret-src})
+                     (+ i 1)])
+                  [[] fid] ret-tags)
+        ; call facts from every clause body
+        [call-facts cid]
+          (reduce
+            (fn [[a i] c]
+              (reduce (fn [[a2 i2] b] (walk-calls name ns-str b a2 i2))
+                      [a i] (:body c)))
+            [[] next-call-id] clauses)]
+    {:fn (concat fn-facts ret-facts)
+     :calls call-facts
+     :next-fn fid2
+     :next-call cid}))
+
+; --- other def-bearing forms ------------------------------------------------------
+
+(defn method-body-facts
+  "Calls inside defmethod/extend-type/defserver bodies, attributed to a
+   synthetic caller name."
+  [ns-str caller node acc next-id]
+  (walk-calls caller ns-str node acc next-id))
+
+; --- the index ---------------------------------------------------------------------
+
+(defn index-forms
+  "All facts from a seq of top-level reader forms."
+  [sigs ns-str forms]
+  (loop [fs forms fid 1000 cid 100000 fn-acc [] call-acc []]
+    (if (empty? fs)
+      {:fn fn-acc :calls call-acc}
+      (let [form (first fs)
+            f (node-form form)]
+        (if (and (= :list (node-tag f))
+                 (not (empty? (node-items f)))
+                 (= :symbol (node-tag (node-form (first (node-items f)))))
+                 (contains? #{"defn" "defn-"}
+                            (node-name (node-form (first (node-items f))))))
+          (let [r (defn-facts sigs ns-str form fid cid)]
+            (recur (rest fs) (:next-fn r) (:next-call r)
+                   (concat fn-acc (:fn r)) (concat call-acc (:calls r))))
+          ; non-defn top level: record calls under "<top>"
+          (let [[cf cid2] (walk-calls "<top>" ns-str form [] cid)]
+            (recur (rest fs) fid cid2
+                   fn-acc (concat call-acc cf))))))))
+
+(defn index-source
+  "Source text → {:fn […] :calls […]}."
+  [sigs ns-str src]
+  (index-forms sigs ns-str (BeamLisp.Reader/read_string src)))
+
+(defn connect-codebase
+  "A fresh datom conn with the codebase schema."
+  []
+  (datom/connect SCHEMA))
+
+(defn transact-source! [conn sigs ns-str src]
+  (let [facts (index-source sigs ns-str src)]
+    (datom/transact! conn (concat (:fn facts) (:calls facts)))
+    facts))
+
+; --- the queries ----------------------------------------------------------------
+
+(def REACH
+  '[[(calls ?from ?to) [?c :call/caller ?from] [?c :call/callee ?to]]
+    [(reaches ?a ?b) (calls ?a ?b)]
+    [(reaches ?a ?b) (calls ?a ?x) (reaches ?x ?b)]])
+
+(defn arity-mismatches
+  "Calls whose callee is defined but never at the called arity
+   (variadic fns excluded — their min-arity check is v2)."
+  [db]
+  (sort (into []
+    (datom/q '[:find ?caller ?callee ?n ?line
+               :where
+               [?c :call/caller ?caller]
+               [?c :call/callee ?callee]
+               [?c :call/arity ?n]
+               [?c :call/line ?line]
+               [?d :fn/name ?callee]
+               [:not-join [?callee] [?v :fn/name ?callee] [?v :fn/variadic true]]
+               [:not-join [?callee ?n] [?d2 :fn/name ?callee] [?d2 :fn/arity ?n]]]
+             db))))
+
+(defn unknown-callees
+  "Calls to names that are never defn'd, not core, not interop/aliased."
+  [db core-names]
+  (sort (into []
+    (datom/q '[:find ?caller ?callee ?line
+               :in $ ?core
+               :where
+               [?c :call/caller ?caller]
+               [?c :call/callee ?callee]
+               [?c :call/line ?line]
+               [:not-join [?callee] [?d :fn/name ?callee]]
+               [(not (contains? ?core ?callee))]
+               [(not (codebase/interop-name? ?callee))]]
+             db core-names))))
+
+(defn reachable [db from]
+  (sort (into []
+    (datom/q '[:find ?to :in $ % :where (reaches ?from ?to)]
+             db REACH))))
+
+(defn impact
+  "Reverse reachability: every fn that transitively calls `name` —
+   what breaks if `name` changes."
+  [db name]
+  (sort (into []
+    (datom/q '[:find ?who :in $ % :where (reaches ?who ?name)]
+             db REACH))))
+
+(defn find-by-type
+  "Fns whose return MAY include `tag` (string, e.g. \"string\") — L10."
+  [db tag]
+  (sort (into []
+    (datom/q '[:find ?name ?src
+               :in $ ?wanted
+               :where
+               [?d :fn/name ?name]
+               [?d :fn/ret-tag ?wanted]
+               [?d :fn/ret-source ?src]]
+             db tag))))
+
+(defn find-returning-only
+  "Fns whose return is entirely within `tags` (a set of strings)."
+  [db tags]
+  (sort (into []
+    (datom/q '[:find ?name
+               :in $ ?tags
+               :where
+               [?d :fn/name ?name]
+               [?d :fn/ret-tag ?t]
+               [:not-join [?name ?tags]
+                [?d2 :fn/name ?name]
+                [?d2 :fn/ret-tag ?t2]
+                [(not (contains? ?tags ?t2))]]]
+             db tags))))
+
+(defn core-callee-names
+  "The always-defined set: every public core name, plus this ns's."
+  [ns-str]
+  (set (concat (BeamLisp.Env/public_names "core")
+               (BeamLisp.Env/public_names ns-str))))
