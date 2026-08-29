@@ -174,3 +174,33 @@ so nothing downstream regresses.
 
 Files: `footprint.bl` (fp-walk/rung/pure?/monotone?/commute?/frame-independent?),
 `run_footprint.bl`.
+
+---
+
+# P16e — footprint ⊆ caps: the sandbox unification (PASS)
+
+Capabilities and effect-footprints are ONE lattice from opposite ends: granted
+caps are the UPPER bound (sandbox enforces at compile time, fork narrows
+child⊆parent); inferred footprint is the LOWER bound (effect inference).
+Verifying a sandboxed process = the containment `footprint ⊆ caps`. Four payoffs,
+against real examples/sandbox mechanics:
+
+1. **fork tree = free fleet non-interference** — disjoint caps ⟹ disjoint
+   footprints ⟹ all A-workers commute with all B-workers. A thousand-worker
+   fleet's race-freedom falls out of the fork tree, zero per-pair checks.
+2. **un-conveyed spawn escalates** — a spawn whose child does not carry the env
+   escapes the cap set → flagged. The operator rule (file 04 trap, file 05
+   confused deputy) becomes a machine-checked obligation.
+3. **ghost worker inert** — destroyed env → ∅ caps; a worker touching anything
+   violates ⊆∅ and is caught; one touching nothing is provably inert.
+   Fail-closed becomes fail-PROVEN-closed.
+4. **:global-wrapper doctrine** — an unverified :global call is :opaque-world →
+   flagged; a verified helper contributes its own contained footprint → passes.
+   The setuid-helper hole the README warns about becomes a discharged obligation.
+
+Graduation note (honest): payoff 2's `(erlang/spawn worker)` is caught because
+"worker" ∉ caps; the more precise model marks the SPAWNED BODY's un-conveyed
+footprint as :opaque-world. Same verdict, cleaner mechanism at graduation —
+needs the env-convey analysis (capture/bind sites) which the spike stubs.
+
+Files: `run_sandbox.bl` (reuses footprint.bl; caps as resource sets).
