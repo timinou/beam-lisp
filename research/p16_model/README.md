@@ -142,3 +142,35 @@ surfaced it.
 
 Files: `abduce.bl` (candidates/sufficient?/fireable?/abduce/all-senders-guarantee?),
 `run_abduce.bl`.
+
+---
+
+# P16b — effect as a footprint: the algebra IS the guarantees (PASS)
+
+An effect is promoted from a RUNG (pure<atom<process<io, a lossy join) to a
+FOOTPRINT {resource → mode}, mode ∈ {:R read :A append :W write :S send :K recv
+:X spawn}. Five claims:
+
+1. **rung recovered** — rank(footprint) reproduces the shipped ladder exactly;
+   the retrofit regresses nothing.
+2. **purity** = footprint touches only :R (per-resource).
+3. **monotonicity** = footprint touches only :R/:A — `datom/transact!` is :A
+   (a log only grows), which is EXACTLY why MVP-F's live query over it is safe.
+   MVP-F's gate is now the single predicate `(monotone? fp)`.
+4. **commutativity** = no shared resource with a conflicting mode. Disjoint
+   writes commute; two writes to the same atom do not. Confluence by ALGEBRA,
+   not by exploring interleavings.
+5. **frame rule** = disjoint resources ⟹ independent. The :orders handler
+   provably cannot break a :balance invariant — Separation Logic, decided
+   structurally, no annotation. This is what makes verification SCALE.
+
+Un-nameable resources (runtime pids, message contents) collapse to :opaque-world
+(user-confirmed floor) — precise where nameable, sound where not.
+
+Graduation note: pure arithmetic (`+`, `count`) currently names an
+:opaque-world :R resource (harmless — still :R, purity holds); refine to name
+no resource at graduation. Retrofit into priv/effects.bl: keep rung = rank(fp)
+so nothing downstream regresses.
+
+Files: `footprint.bl` (fp-walk/rung/pure?/monotone?/commute?/frame-independent?),
+`run_footprint.bl`.
