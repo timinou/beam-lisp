@@ -224,3 +224,21 @@ Beats TLA+ ergonomically: TLA+ reports a deadlock STATE after search; we report
 the structural CYCLE — the actual cause, servers named — from the call graph.
 
 Files: `run_deadlock.bl` (BLOCKED recursive rule; deadlocked = blocked-on-self).
+
+---
+
+# P16g — bounded liveness: BMC lasso, honesty is structural (PASS)
+
+Safety we prove unbounded (P16c). Liveness ("every request eventually replies")
+is about infinite behaviours — the practical method is bounded model checking:
+search for a LASSO (a reachable loop that never progresses) up to depth k.
+Found lasso ⟹ a real violation (sound); no lasso ≤ k ⟹ live up to k (approximate).
+
+- good handler: no lasso ≤ 20 → live up to the bound, registered APPROXIMATE.
+- buggy handler (:retry spins): lasso found at depth 2, trace [:idle :pending
+  :pending] — a sound violation with a witness.
+- the catalog distinguishes :~replies-eventually (approximate, bound 20) from
+  :~balance-nonneg (exact, inductive). "Which guarantees are exact vs bounded?"
+  is a QUERY — honesty is structural, in the catalog, never a footnote.
+
+Files: `run_liveness.bl` (find-lasso BMC; approximate-relation catalog).
