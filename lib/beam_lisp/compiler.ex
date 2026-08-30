@@ -58,7 +58,15 @@ defmodule BeamLisp.Compiler do
 
     source
     |> Reader.read_string(file)
-    |> Enum.map(&eval_form(&1, %{env | ns: Env.current_ns()}))
+    |> Enum.map(fn form ->
+      # Give an interactive / script eval the same located, source-quoted
+      # diagnostic the AOT path gets: a compiler crash on a form becomes a
+      # `BeamLisp.CompileError` naming file:line and the offending form,
+      # never a bare `badarg`. A deliberate `CompileError` passes through.
+      BeamLisp.CompileDiagnostic.with_diagnostic(form, [file: file, source: source, phase: "compiling"], fn ->
+        eval_form(form, %{env | ns: Env.current_ns()})
+      end)
+    end)
     |> List.last()
   end
 

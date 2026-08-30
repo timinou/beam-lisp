@@ -117,7 +117,16 @@ defmodule BeamLisp.AOT do
         ns = Env.current_ns()
         vdefs = capture_value_def(vdefs, form, ns)
         nsmeta = capture_ns_decl(nsmeta, form)
-        _ = Compiler.eval_form(form, %{Compiler.new_env() | ns: Env.current_ns()})
+        # A compiler crash on ONE form used to bubble up as a bare Erlang
+        # `badarg` ("not a tuple") naming nothing in the source. Wrap the
+        # per-form eval so any failure becomes a located, source-quoted
+        # `BeamLisp.CompileError` — the file:line, the offending form, the
+        # cause, and a hint. A deliberate `CompileError` passes through.
+        _ =
+          BeamLisp.CompileDiagnostic.with_diagnostic(form, [file: file, phase: "compiling"], fn ->
+            Compiler.eval_form(form, %{Compiler.new_env() | ns: Env.current_ns()})
+          end)
+
         {vdefs, MapSet.put(nss, ns), nsmeta}
       end)
 
@@ -272,7 +281,7 @@ defmodule BeamLisp.AOT do
   # result. An AOT build wrote none of it to disk and nothing recreated it,
   # so the namespace loaded cleanly and then failed at first use:
   # "undefined var: reel.store/store", "undefined var:
-  # datom.store-redb/->RedbStore". The same shape as the `defnative` hole
+  # datom.store-fjall/->FjallStore". The same shape as the `defnative` hole
   # (BUG-021), which was fixed one form at a time; this is that fix
   # generalised, because the property is shared and the list is closed.
   #

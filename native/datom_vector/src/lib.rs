@@ -46,11 +46,12 @@
 //! # Its own crate, on purpose
 //!
 //! Vector math is backend-agnostic: it works over embeddings held in the
-//! in-memory ETS store exactly as over the durable redb one, because it never
+//! in-memory ETS store exactly as over the durable one, because it never
 //! touches a store at all — the datalog layer hands it packed bytes. So it is
-//! NOT part of `datom_redb`; a separate crate gives it its own `init!` module
-//! (rustler binds every `#[nif]` in a crate to one Erlang module) and keeps the
-//! layering honest: `datom.vector` depends on this, not on the redb store.
+//! NOT part of the store crate; a separate crate gives it its own `init!`
+//! module (rustler binds every `#[nif]` in a crate to one Erlang module) and
+//! keeps the layering honest: `datom.vector` depends on this, not on any store
+//! backend.
 
 use rustler::{Binary, Env, Error, NifResult, OwnedBinary};
 use std::io::Write;
@@ -217,7 +218,7 @@ fn top_k_by_score(hits: &mut Vec<Hit>, k: usize) {
 // NIF surface
 //
 // These are the BEAM entry points. They are deliberately PURE with respect to
-// the database: none of them opens redb or knows a key encoding. The datalog
+// the database: none of them opens a store or knows a key encoding. The datalog
 // layer scans the current embedding datoms (its own basis-aware job) and hands
 // the corpus down as packed bytes; the NIF does only vector math and returns
 // the k nearest. This is PLAN-039's step-1 rule — the numeric NIF stays
@@ -605,7 +606,7 @@ pub fn vec_pca_2d(corpus: Binary, dim: usize) -> NifResult<Vec<(f64, f64)>> {
 }
 
 /// A marker `BeamLisp.Native.available?/1` calls to tell a loaded NIF from the
-/// unloaded stub. Present here for symmetry with `datom_redb`, so a checkout
+/// unloaded stub. Present here for symmetry with the store crate, so a checkout
 /// without a Rust toolchain reads the vector backend as ABSENT rather than
 /// crashing at require time.
 #[rustler::nif]

@@ -18,18 +18,14 @@ defmodule BeamLisp.Native do
   A NIF is substrate. The *declaration* that one exists is not, and it
   belongs in the namespace that uses it:
 
-      (ns datom.store-redb)
+      (ns datom.store-fjall)
 
-      (defnative "datom_redb"
-        (open 1)
-        (get 2)
-        (range 3)
-        (put 3)
-        (delete 2)
-        (compare-and-swap 4)
-        (commit 2))
+      (defnative "datom_fjall"
+        (fjall-open 1)
+        (fjall-get 2)
+        (fjall-put 3))
 
-  After that, `(open "/tmp/db.redb")` in that namespace calls Rust
+  After that, `(fjall-open "/tmp/db.fjall")` in that namespace calls Rust
   directly. No intermediate module, no stub file, nothing to keep in
   sync with the crate.
 
@@ -44,7 +40,7 @@ defmodule BeamLisp.Native do
 
   ## One crate, one namespace
 
-  `rustler::init!("Elixir.BeamLisp.Native.Datom.StoreRedb")` names its
+  `rustler::init!("Elixir.BeamLisp.Native.Datom.StoreFjall")` names its
   host module at COMPILE time, so a crate can be loaded by exactly one
   namespace — the one whose name it was built for. A second namespace
   declaring the same crate gets `{:bad_lib, "Library module name ...
@@ -200,7 +196,7 @@ defmodule BeamLisp.Native do
   # deep in a lazy map, hundreds of lines from the declaration, and says
   # nothing about shadowing.
   #
-  # Prefixing (`redb-get`) costs one word and removes the whole class.
+  # Prefixing (`fjall-get`) costs one word and removes the whole class.
   defp guard_against_shadowing!(ns, signatures) do
     clashes =
       signatures
@@ -222,7 +218,7 @@ defmodule BeamLisp.Native do
 
   defp tag(ns), do: ns |> String.split(".") |> List.last() |> String.replace("store-", "")
 
-  # `datom.store-redb` → `BeamLisp.Native.Datom.StoreRedb`
+  # `datom.store-fjall` → `BeamLisp.Native.Datom.StoreFjall`
   defp host_module(ns) do
     segments =
       ns

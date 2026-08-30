@@ -80,8 +80,8 @@ defmodule BeamLisp.MixProject do
       # examples/datom/live/06-projector.bl starts a PubSub as its broadcast
       # transport; the examples run only under `mix test`.
       {:phoenix_pubsub, "~> 2.1", only: :test},
-      # Rustler is a Rust-side dependency of native/datom_redb (see its
-      # Cargo.toml). It is NOT needed as a Mix dep: `defnative` builds
+      # Rustler is a Rust-side dependency of the native datom crates (datom_fjall, datom_vector, datom_datalog).
+      # It is NOT needed as a Mix dep: `defnative` builds
       # and loads the crate itself, via the :beam_lisp_native compiler.
       {:rustler, "~> 0.38", runtime: false},
       # Explorer (Polars) is the DataFrame surface `datom.frame/q-df` maps a

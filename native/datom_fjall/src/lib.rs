@@ -1,21 +1,22 @@
 //! datom_fjall — the storage port, in Rust, over fjall (an LSM engine).
 //!
-//! # Why a second backend
+//! # A backend under a six-method protocol
 //!
 //! `datom.store/Store` is six methods over an ordered key/value space
-//! (get, range, put, delete, cas, commit). redb (a copy-on-write B-tree)
-//! is one substrate under it; this crate is another. They are
-//! interchangeable — everything above L1 is written against the protocol.
+//! (get, range, put, delete, cas, commit). This crate is the durable
+//! substrate under it; the in-memory ETS and map stores are the others.
+//! They are interchangeable — everything above L1 is written against the
+//! protocol, never against a specific engine.
 //!
 //! # Why fjall specifically
 //!
 //! The datom log is APPEND-DOMINATED: a transaction writes each datom into
 //! two-to-four index orderings, monotonically, and reads are ordered range
 //! scans. That is the exact shape an LSM tree is built for — writes land in
-//! a memtable and flush sequentially, range scans merge sorted runs. redb's
-//! B-tree pays copy-on-write page churn on every commit (measured: ~13s to
-//! bulk-load the compiler's 11k-datom codebase graph); fjall's LSM amortises
-//! the same writes through the memtable.
+//! a memtable and flush sequentially, range scans merge sorted runs. A
+//! copy-on-write B-tree would instead pay page churn on every commit
+//! (measured: ~13s to bulk-load the compiler's 11k-datom codebase graph);
+//! fjall's LSM amortises the same writes through the memtable.
 //!
 //! # The one requirement that matters: atomic cross-index commit
 //!
@@ -24,14 +25,14 @@
 //! key byte — EAVT=1 AEVT=2 AVET=3 VAET=4), so an atomic commit is a single
 //! atomic batch. fjall gives that via a keyspace-level `Batch`: every write in
 //! the batch becomes durable together at `commit()`, or none does. `-commit`
-//! delegates to that batch, exactly as the redb adapter delegates to a write
-//! transaction.
+//! delegates to that batch — the same all-or-nothing guarantee a write
+//! transaction would give on a B-tree engine.
 //!
 //! # Durability
 //!
 //! Every commit is persisted (fjall persists the batch to the write-ahead log
 //! before returning). A faster mode (defer the fsync) would be an explicit,
-//! named choice, never a silent default — same policy as the redb adapter.
+//! named choice, never a silent default.
 //!
 //! # The BEAM boundary
 //!
@@ -60,7 +61,7 @@ mod atoms {
 
 /// A handle to an open keyspace + its single datom partition.
 ///
-/// The `Mutex` is here for the same reason as the redb adapter's: a `-cas`
+/// The `Mutex` is here for the reason any durable adapter needs it: a `-cas`
 /// (read, compare, write) must not interleave with another writer between its
 /// read and its write. fjall serialises its own writes, but the read in one
 /// operation and the write in another could still straddle without this.

@@ -40,7 +40,12 @@ defmodule BeamLisp.CompileError do
       end
 
     prefix = if location, do: "#{location}: ", else: ""
-    form_suffix = if form, do: "\n  offending form: #{inspect(form)}", else: ""
+    # A whole top-level form can be enormous (a full `defn` body). Cap the
+    # inspected form so the report stays readable — the location + snippet
+    # already point at the source; this is a shape reminder, not the source.
+    form_suffix =
+      if form, do: "\n  offending form: #{inspect(form, printable_limit: 240, limit: 12)}", else: ""
+
     "#{prefix}#{message}#{form_suffix}"
   end
 end

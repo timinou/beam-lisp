@@ -2,11 +2,11 @@ defmodule BeamLisp.NativeTest do
   @moduledoc """
   `defnative` — a beam-lisp namespace hosting a Rust NIF.
 
-  These tests are about the DECLARATION mechanism, not about redb. They
-  use the `datom_redb` crate because it is the one that exists, but
-  what is being checked is: does a `.bl` namespace get its native names
-  bound, does a bad declaration fail loudly, and does an absent NIF read
-  as absent rather than as broken?
+  These tests are about the DECLARATION mechanism, not about any one
+  backend. They use the `datom_fjall` crate because it is the durable
+  store that exists, but what is being checked is: does a `.bl` namespace
+  get its native names bound, does a bad declaration fail loudly, and does
+  an absent NIF read as absent rather than as broken?
 
   That last one carries weight beyond tidiness. A native backend that
   fails to load must not appear present-but-degraded, because the layer
@@ -25,22 +25,22 @@ defmodule BeamLisp.NativeTest do
 
   describe "declaring native functions" do
     test "a namespace can call its own NIF" do
-      # `datom.store-redb` is the namespace the crate was BUILT for:
+      # `datom.store-fjall` is the namespace the crate was BUILT for:
       # `rustler::init!` names its host module at compile time, so a
       # crate loads into exactly one namespace. See the moduledoc.
-      BeamLisp.run_file("priv/datom/store-redb.bl")
+      BeamLisp.run_file("priv/datom/store-fjall.bl")
 
-      assert BeamLisp.Native.available?("datom.store-redb")
+      assert BeamLisp.Native.available?("datom.store-fjall")
 
-      path = Path.join(System.tmp_dir!(), "native_test_#{System.unique_integer([:positive])}.redb")
+      path = Path.join(System.tmp_dir!(), "native_test_#{System.unique_integer([:positive])}.fjall")
 
       # Round-trip through the NIF, called as ordinary beam-lisp
       # functions with no Elixir module between them.
       assert eval("""
-             (ns native.test.basic (:require [datom.store-redb]))
-             (let [db (datom.store-redb/redb-open "#{path}")]
-               (datom.store-redb/redb-put db "k" "v")
-               (datom.store-redb/redb-get db "k"))
+             (ns native.test.basic (:require [datom.store-fjall]))
+             (let [db (datom.store-fjall/fjall-open "#{path}")]
+               (datom.store-fjall/fjall-put db "k" "v")
+               (datom.store-fjall/fjall-get db "k"))
              """) == "v"
     end
 
@@ -49,11 +49,11 @@ defmodule BeamLisp.NativeTest do
       # and `intern` so the name can be passed around. A native function
       # that could only be called and never passed would be
       # second-class in a language where functions are values.
-      BeamLisp.run_file("priv/datom/store-redb.bl")
+      BeamLisp.run_file("priv/datom/store-fjall.bl")
 
       assert eval("""
-             (ns native.test.value (:require [datom.store-redb]))
-             (fn? datom.store-redb/redb-get)
+             (ns native.test.value (:require [datom.store-fjall]))
+             (fn? datom.store-fjall/fjall-get)
              """) == true
     end
   end
@@ -67,7 +67,7 @@ defmodule BeamLisp.NativeTest do
         assert_raise RuntimeError, fn ->
           eval("""
           (ns native.test.shadow)
-          (defnative "datom_redb" (get 2))
+          (defnative "datom_fjall" (get 2))
           """)
         end
 
@@ -82,7 +82,7 @@ defmodule BeamLisp.NativeTest do
         assert_raise RuntimeError, fn ->
           eval("""
           (ns native.test.dup)
-          (defnative "datom_redb" (redb-get 2) (redb-get 3))
+          (defnative "datom_fjall" (fjall-get 2) (fjall-get 3))
           """)
         end
 
@@ -93,7 +93,7 @@ defmodule BeamLisp.NativeTest do
       assert_raise RuntimeError, fn ->
         eval("""
         (ns native.test.malformed)
-        (defnative "datom_redb" redb-get)
+        (defnative "datom_fjall" fjall-get)
         """)
       end
     end
@@ -122,7 +122,7 @@ defmodule BeamLisp.NativeTest do
       # declaration left the backend quietly absent.
       eval("""
       (ns native.test.arity)
-      (defnative "datom_redb" (redb-get 99))
+      (defnative "datom_fjall" (fjall-get 99))
       """)
 
       refute BeamLisp.Native.available?("native.test.arity")
@@ -139,7 +139,7 @@ defmodule BeamLisp.NativeTest do
       # answers false.
       eval("""
       (ns my.cool.ns)
-      (defnative "datom_redb" (redb-open 1))
+      (defnative "datom_fjall" (fjall-open 1))
       """)
 
       assert Code.ensure_loaded?(BeamLisp.Native.My.Cool.Ns)
@@ -159,16 +159,16 @@ defmodule BeamLisp.NativeTest do
       # Silent loss of durability is the worst shape this could take —
       # no crash, no warning, and the only symptom is data missing
       # after a restart (BUG-021).
-      BeamLisp.run_file("priv/datom/store-redb.bl")
+      BeamLisp.run_file("priv/datom/store-fjall.bl")
 
       out = Path.join(System.tmp_dir!(), "aot_native_#{System.unique_integer([:positive])}")
       File.mkdir_p!(out)
 
-      mods = BeamLisp.AOT.compile_file("priv/datom/store-redb.bl", output_dir: out)
+      mods = BeamLisp.AOT.compile_file("priv/datom/store-fjall.bl", output_dir: out)
       assert length(mods) >= 1
 
       # The declaration is recorded, which is what `__bl_init__` replays.
-      assert BeamLisp.Native.declaration("datom.store-redb") != nil
+      assert BeamLisp.Native.declaration("datom.store-fjall") != nil
 
       # And the emitted module's init carries it: loading the AOT output
       # in a deployment brings the host module and the NIF with it.
@@ -176,18 +176,18 @@ defmodule BeamLisp.NativeTest do
       assert File.exists?(path)
       assert function_exported?(mod, :__bl_init__, 0)
 
-      assert Code.ensure_loaded?(BeamLisp.Native.Datom.StoreRedb)
-      assert BeamLisp.Native.available?("datom.store-redb")
+      assert Code.ensure_loaded?(BeamLisp.Native.Datom.StoreFjall)
+      assert BeamLisp.Native.available?("datom.store-fjall")
     end
 
     test "the native functions work through the AOT-loaded module" do
-      BeamLisp.run_file("priv/datom/store-redb.bl")
+      BeamLisp.run_file("priv/datom/store-fjall.bl")
 
-      db_path = Path.join(System.tmp_dir!(), "aot_rt_#{System.unique_integer([:positive])}.redb")
-      db = BeamLisp.Native.Datom.StoreRedb.redb_open(db_path)
+      db_path = Path.join(System.tmp_dir!(), "aot_rt_#{System.unique_integer([:positive])}.fjall")
+      db = BeamLisp.Native.Datom.StoreFjall.fjall_open(db_path)
 
-      assert :ok = BeamLisp.Native.Datom.StoreRedb.redb_put(db, "k", "v")
-      assert "v" == BeamLisp.Native.Datom.StoreRedb.redb_get(db, "k")
+      assert :ok = BeamLisp.Native.Datom.StoreFjall.fjall_put(db, "k", "v")
+      assert "v" == BeamLisp.Native.Datom.StoreFjall.fjall_get(db, "k")
     end
   end
 end
