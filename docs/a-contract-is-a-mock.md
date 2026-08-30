@@ -97,7 +97,8 @@ by definition, a violation:
 This is fault injection whose *fault type is derived from the contract itself*.
 You cannot inject a "failure" the contract actually permits and mistake it for a
 violation — the solver would refuse to produce one. Your negative tests can
-never accidentally test a valid case.
+never accidentally test a valid case. (Section 7 turns this into errors you can
+request *by name*.)
 
 ### 4. A contradictory spec is caught before any code exists
 
@@ -173,6 +174,91 @@ And the swap is *safe* because the mock answers to the very contract the real
 endpoint is held to: anything the caller may assume of a real response holds of
 the mock too.
 
+### 7. Wrong on purpose: errors for tests, and the fault space as data
+
+A valid mock is half the sturdiness. The other half is *wrong* responses — and
+not one wrong value, but the whole **surface** of wrong, with every point on it
+nameable so a test can ask for the fault it means to exercise. This is where the
+second engine earns its place. z3 finds *a* witness; **datalog reasons about the
+set**. The division is exactly the one the state-machine checker already draws:
+z3 owns arithmetic decisions, datalog owns structure and coverage.
+
+**An error you request by the law it breaks.** To make a response wrong for
+*exactly* one law, assert the negation of that law and every *other* law as-is.
+If the solver finds a value, it breaks that one law and nothing else — an
+**isolated mutant**:
+
+```clojure
+(fault/error-for port weather 1)   ;; clause 1 is (<= temp 60)
+;; => {:temp 61 :humidity 0 :code 200}   — wrong for temp<=60, valid everywhere else
+```
+
+So "give me an error" stops being vague. `errors` returns the whole catalogue,
+one entry per law, keyed by the law it breaks:
+
+```clojure
+(fault/errors port weather)
+;; => {0 {:temp -41 ...}    ; breaks (>= temp -40)
+;;     1 {:temp 61 ...}     ; breaks (<= temp 60)
+;;     3 {:humidity -1 ...} ; breaks (>= humidity 0)
+;;     ...}
+```
+
+A negative test built from these can never accidentally assert against a valid
+response: the error's identity *is* the law it violates.
+
+**A mock server that injects errors for tests.** Wrap that in a server and the
+fault becomes a request. Valid by default; a chosen error when the request asks
+for it; and the verdict travels *with* the response, so the test knows which case
+it got — no branch in the caller:
+
+```clojure
+(def server (fault/make-server port weather "temp" {:bad-temp 1 :bad-code 6}))
+(fault/serve server :normal)    ;; => {:ok? true  :reason nil :value {...valid...}}
+(fault/serve server :bad-temp)  ;; => {:ok? false :reason 1   :value {:temp 61 ...}}
+(fault/serve server :bad-code)  ;; => {:ok? false :reason 6   :value {:code 600 ...}}
+```
+
+The injection is data. A test drives the server through its happy path and any
+chosen fault without the server code changing — the fault is requested by name.
+
+**Sturdiness is a datalog query.** Generate every isolated mutant, load them as
+datoms — each clause an entity, each mutant an entity, each `:fault/violates` a
+*measured* edge (the value is re-checked against every law, not trusted to break
+what it was built to break) — and the hard questions become ordinary queries:
+
+- **Coverage.** Which laws does no fault exercise? A negation query, the same
+  shape the explorer uses to find undemonstrated functions:
+  ```clojure
+  [:find ?idx :where [?c :clause/idx ?idx]
+                     [:not-join [?c] [?f :fault/violates ?c]]]
+  ```
+  A law with no incoming fault edge is a blind spot in the suite.
+- **Redundancy.** Which mutants violate the identical set of laws? Group faults
+  by their violation signature; a group of size > 1 is duplicate tests — keep one
+  and the suite is smaller and just as strong.
+- **Independence.** Which laws can be broken *alone*? A law whose isolated mutant
+  comes back `unsat` cannot be violated while the others hold — it is **implied
+  by them**, a redundant clause in the *contract itself*.
+
+One call runs all of it:
+
+```clojure
+(fault/report port weather)
+;; => {:clauses 7 :faults 6
+;;     :covered   (0 1 3 4 5 6)
+;;     :uncovered (2)                          ; a blind spot...
+;;     :laws {:independent (0 1 3 4 5 6)
+;;            :implied     (2)}}               ; ...because clause 2 is redundant
+```
+
+In that example clause 2 was `(>= temp -50)` — implied by `(>= temp -40)`, so no
+value can break it alone. The tool reported a **redundant law in the spec**,
+unprompted, purely from the shape of its own fault space. That is the datalog
+half doing what z3 cannot: not finding a value, but reasoning about the whole
+set of them.
+
+
 ## The guarantee: synthesize backward, verify forward
 
 A synthesized response is trusted only when it survives the **forward** check —
@@ -216,24 +302,35 @@ constraints are decided both ways; nonlinear ones synthesize but may not prove.
   objective) and reads z3's model. The model text is valid s-expression; the
   beam-lisp reader parses it, and each `(define-fun name () Sort value)` becomes
   one field of the response map.
+- **The fault space** is z3 (generate isolated mutants) + datalog (load them as
+  datoms and query coverage / redundancy / independence). Two engines, each doing
+  only what it is best at — the engine division `system.core` already runs on.
 - **Selection** is `env/allowed?` over the impl's capability. No branch in the
   contract; the world decides.
 
 ## Where it lives
 
-- `priv/mock.bl` — the engine: `synth`, `synth-seeded`, `synth-boundary`,
-  `synth-invalid`, `satisfiable-status`, `check`, `contract-from`.
+- `priv/mock.bl` — the synthesis engine: `synth`, `synth-seeded`,
+  `synth-boundary`, `synth-invalid`, `satisfiable-status`, `check`,
+  `contract-from`.
+- `priv/mock/fault.bl` — the fault space: `error-for`, `errors`, `make-server`,
+  `serve`, `isolate`/`isolate-all`, and the datalog analysis (`report`,
+  `uncovered-clauses`, `faults-per-clause`, `redundant-mutants`,
+  `independent-laws`).
 - `examples/mock/00-a-contract-is-a-mock.bl` — the core loop on integer fields.
 - `examples/mock/01-how-far-it-reaches.bl` — strings, reals, relations, and the
   honest `unknown`.
 - `examples/mock/02-the-sandbox-picks-the-mock.bl` — the world chooses real vs
   mock, with no branch in the caller.
+- `examples/mock/03-the-fault-space-is-data.bl` — errors on demand, a mock server
+  that injects them, and the datalog robustness report.
 
 ## What is proven, and what is next
 
 Proven, running against z3 4.16: all six synthesis modes, the forward round-trip,
-the string/real/relational reach, deterministic seeding, and capability-driven
-selection.
+the string/real/relational reach, deterministic seeding, capability-driven
+selection, errors-by-name, the injecting mock server, and the datalog fault
+analysis (which found a redundant contract law unprompted).
 
 The natural next steps, each a real extension rather than a rewrite:
 
