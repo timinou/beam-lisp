@@ -117,16 +117,11 @@ defmodule BeamLisp.AOT do
         ns = Env.current_ns()
         vdefs = capture_value_def(vdefs, form, ns)
         nsmeta = capture_ns_decl(nsmeta, form)
-        # A compiler crash on ONE form used to bubble up as a bare Erlang
-        # `badarg` ("not a tuple") naming nothing in the source. Wrap the
-        # per-form eval so any failure becomes a located, source-quoted
-        # `BeamLisp.CompileError` — the file:line, the offending form, the
-        # cause, and a hint. A deliberate `CompileError` passes through.
-        _ =
-          BeamLisp.CompileDiagnostic.with_diagnostic(form, [file: file, phase: "compiling"], fn ->
-            Compiler.eval_form(form, %{Compiler.new_env() | ns: Env.current_ns()})
-          end)
-
+        # `eval_form` wraps its own compile step in the diagnostic. Thread the
+        # source `file` into the env so a compiler crash on this form is
+        # reported with file:line + the offending form, instead of a bare
+        # Erlang `badarg` ("not a tuple") that names nothing.
+        _ = Compiler.eval_form(form, Map.put(%{Compiler.new_env() | ns: Env.current_ns()}, :file, file))
         {vdefs, MapSet.put(nss, ns), nsmeta}
       end)
 

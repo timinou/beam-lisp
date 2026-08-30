@@ -58,15 +58,11 @@ defmodule BeamLisp.Compiler do
 
     source
     |> Reader.read_string(file)
-    |> Enum.map(fn form ->
-      # Give an interactive / script eval the same located, source-quoted
-      # diagnostic the AOT path gets: a compiler crash on a form becomes a
-      # `BeamLisp.CompileError` naming file:line and the offending form,
-      # never a bare `badarg`. A deliberate `CompileError` passes through.
-      BeamLisp.CompileDiagnostic.with_diagnostic(form, [file: file, source: source, phase: "compiling"], fn ->
-        eval_form(form, %{env | ns: Env.current_ns()})
-      end)
-    end)
+    # `eval_form` wraps its OWN compile step in the diagnostic, so a compiler
+    # crash on any form is already reported with file:line + source. Nothing
+    # to wrap here — wrapping the whole `eval_form` (compile AND run) would
+    # mislabel a runtime error as a compile error.
+    |> Enum.map(&eval_form(&1, %{env | ns: Env.current_ns()}))
     |> List.last()
   end
 
@@ -81,7 +77,13 @@ defmodule BeamLisp.Compiler do
   lifecycle (purge/reuse) and an AOT counterpart.
   """
   def eval_form(form, env) do
-    ast = compile(form, env)
+    # Wrap ONLY compilation in the diagnostic — not evaluation. `eval_form`
+    # both compiles the form and RUNS it; a failure while running (a `(throw
+    # …)`, an arithmetic error, an undefined var resolved at run time) is the
+    # program executing, and must keep its real type so callers can
+    # `assert_raise` on it. Only a crash INSIDE `compile/2` is a compile error,
+    # and that is what earns the located, source-quoted report.
+    ast = BeamLisp.CompileDiagnostic.with_diagnostic(form, [file: env[:file]], fn -> compile(form, env) end)
     mod = Module.concat(BeamLisp.Eval, "M#{System.unique_integer([:positive])}")
 
     # Signature inference is disabled for the whole create+run scope: the
