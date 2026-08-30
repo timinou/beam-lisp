@@ -1708,6 +1708,8 @@ defmodule BeamLisp.Compiler do
     # A vector produced/returned by a macro may carry AUTHOR metadata
     # (`^{:key …}`); re-wrap it so `compile/2` lowers the key back onto the
     # value. `nil`/empty meta round-trips as a bare vector form, unchanged.
+    # is_map-ok: `m` is the reader's author-metadata map (a plain internal
+    # Elixir map), never a beam-lisp map value.
     if is_map(m) and map_size(m) > 0, do: {:meta, vform, m}, else: vform
   end
 
