@@ -459,7 +459,7 @@
    A list whose head is one of these is compiled by its own rule."
   #{"if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
-    "defrecord" "deftype" "reify" "defnative"
+    "defrecord" "deftype" "reify" "defnative" "defserver"
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
 
 (defn- compile-body
@@ -824,8 +824,12 @@
           (list (apply list
                   (mapcat (fn [pats]
                             (let [tuple-pat (erlang/list_to_tuple (list tuple-head (list) (apply list pats)))
+                                  ; in a PATTERN the alias carries plain `[]`
+                                  ; metadata, not `[alias: false]`
+                                  vec-alias (erlang/list_to_tuple
+                                              (list :__aliases__ (list) (list :BeamLisp :Vector)))
                                   vector-pat (ast-node struct-head
-                                                       (list (ast-alias (list :BeamLisp :Vector))
+                                                       (list vec-alias
                                                              (ast-node map-head
                                                                        (list (erlang/list_to_tuple (list :items tuple-pat))))))]
                               (list tuple-pat vector-pat)))
@@ -1895,6 +1899,208 @@
         stmts (concat base (list map-ctor-slot empty-block mod-var))]
     (ast-node :__block__ (apply list stmts))))
 
+; ---- defserver (real gen_server) ---------------------------------------------
+;
+; (defserver name (init [arg] body) (handle-call PAT [from state] body) ...)
+; compiles to a genuine OTP gen_server module: a fresh module with
+; `@behaviour :gen_server`, one function per callback, defaults for any callback
+; the user omitted, and the client API (start/start_link/call/cast/stop). The
+; module is created at run time with Module.create; the compiler builds its
+; body as escaped data.
+
+(defn- svar
+  "A plain Elixir variable node {name, [], nil} for the generated server
+   module — nil context, so it stays a local there."
+  [name]
+  (erlang/list_to_tuple (list name (list) nil)))
+
+(defn- server-body
+  "Compile a callback body with the return constructors (ok/reply/noreply/stop/
+   ...) bound as locals, so `(reply v state)` etc. resolve anywhere in the body
+   and lower to the right OTP return tuple."
+  [forms env]
+  (let [ctors (BeamLisp.Server/return_constructors)
+        ; return_constructors is a map name->ctor; bind each NAME as a local
+        ; that fetches its constructor at run time
+        ret-env (reduce (fn [e cname]
+                          (put-local e cname
+                                     (ast-mod-call (list :Map) :fetch!
+                                                   (list (ast-mod-call (list :BeamLisp :Server) :return_constructors (list))
+                                                         cname))))
+                        env (maps/keys ctors))]
+    (compile-body forms ret-env)))
+
+(defn- server-clause-defs
+  "Compile one (callback ...) clause into a list of def-ast entries.
+
+   The init callback has a `:vector` shape: `(init [arg] body)`. The message
+   callbacks have a `:pattern` shape: `(handle-call PATTERN [from state] body)`,
+   where the pattern matches the message (and may expand to several def clauses,
+   one per pattern alternative). `fname` is the OTP callback name, `shape` is
+   :vector or :pattern."
+  [clause fname shape env]
+  (let [items (rn/node-items (rn/node-form clause))
+        rest-forms (rest items)]
+    (if (= shape :vector)
+      ; (init [arg] body...)
+      (let [params (rn/node-items (rn/node-form (first rest-forms)))
+            body (rest rest-forms)
+            built (reduce (fn [acc pform]
+                            (let [b (bind-param pform (:env acc))]
+                              {:params (cons (:param b) (:params acc))
+                               :steps (concat (:steps acc) (:steps b))
+                               :env (:env b)}))
+                          {:params (list) :steps (list) :env env}
+                          params)
+            head-vars (reverse (:params built))
+            prelude (map (fn [s] (ast-node := (list (first s) (second s)))) (:steps built))
+            body-ast (server-body (concat prelude body) (:env built))]
+        (list (ast-node :def (list (ast-node fname head-vars)
+                                   (list (erlang/list_to_tuple (list :do body-ast)))))))
+      ; (handle-call PATTERN [params...] body...) with an optional :when guard
+      (let [pat-form (first rest-forms)
+            after-pat (rest rest-forms)
+            gb (split-when after-pat)
+            guard (first gb)
+            rest2 (second gb)
+            params-form (first rest2)
+            body (rest rest2)
+            pr (compile-pattern pat-form env)
+            pats (first pr)
+            msg-env (second pr)
+            guard-ast (if (nil? guard) nil (compile-guard guard msg-env))
+            built (reduce (fn [acc pform]
+                            (let [b (bind-param pform (:env acc))]
+                              {:params (cons (:param b) (:params acc))
+                               :steps (concat (:steps acc) (:steps b))
+                               :env (:env b)}))
+                          {:params (list) :steps (list) :env msg-env}
+                          (rn/node-items (rn/node-form params-form)))
+            head-vars (reverse (:params built))
+            prelude (map (fn [s] (ast-node := (list (first s) (second s)))) (:steps built))
+            body-ast (server-body (concat prelude body) (:env built))]
+        (map (fn [pat]
+               (let [head (ast-node fname (cons pat head-vars))
+                     ghead (if (nil? guard-ast) head (ast-node :when (list head guard-ast)))]
+                 (ast-node :def (list ghead (list (erlang/list_to_tuple (list :do body-ast)))))))
+             pats)))))
+
+(defn- server-client-defs
+  "The fixed client-API def-asts every server gets: start, start_link, call,
+   cast, stop — thin wrappers over GenServer with default arguments."
+  []
+  (let [gsdot (fn [f args] (ast-node (erlang/list_to_tuple (list :. (list) (list (ast-alias (list :GenServer)) f))) args))
+        deflt (fn [name d] (ast-node (erlang/binary_to_atom "\\\\") (list (svar name) d)))
+        mkdef (fn [fname params body] (ast-node :def (list (ast-node fname params)
+                                                           (list (erlang/list_to_tuple (list :do body))))))
+        ; __MODULE__ carries the compiler context, like the oracle emits
+        modv (erlang/list_to_tuple (list :__MODULE__ (list) var-context))]
+    (list
+      (mkdef :start (list (svar :init_arg) (deflt :opts (list)))
+             (gsdot :start (list modv (svar :init_arg) (svar :opts))))
+      (mkdef :start_link (list (svar :init_arg) (deflt :opts (list)))
+             (gsdot :start_link (list modv (svar :init_arg) (svar :opts))))
+      (mkdef :call (list (svar :server) (svar :request) (deflt :timeout 5000))
+             (gsdot :call (list (svar :server) (svar :request) (svar :timeout))))
+      (mkdef :cast (list (svar :server) (svar :request))
+             (gsdot :cast (list (svar :server) (svar :request))))
+      (mkdef :stop (list (svar :server) (deflt :reason :normal) (deflt :timeout :infinity))
+             (gsdot :stop (list (svar :server) (svar :reason) (svar :timeout)))))))
+
+(defn- server-default-defs
+  "Default def-asts for callbacks the user omitted, so the module always
+   implements the full gen_server behaviour. `cb` is the OTP callback atom."
+  [cb]
+  (let [d (fn [fname params body] (ast-node :def (list (ast-node fname (apply list (map svar params)))
+                                                       (list (erlang/list_to_tuple (list :do body))))))
+        st (fn [xs] (erlang/list_to_tuple (apply list (cons tuple-head (cons (list) (list (apply list xs)))))))]
+    (cond
+      (= cb :handle_call)
+        (list (d :handle_call (list :msg :_from :state)
+                 (erlang/list_to_tuple (list tuple-head (list) (list :stop
+                     (erlang/list_to_tuple (list tuple-head (list) (list :bad_call (svar :msg))))
+                     (svar :state))))))
+      (= cb :handle_cast)
+        (list (d :handle_cast (list :msg :state)
+                 (erlang/list_to_tuple (list tuple-head (list) (list :stop
+                     (erlang/list_to_tuple (list tuple-head (list) (list :bad_cast (svar :msg))))
+                     (svar :state))))))
+      (= cb :handle_info)
+        (list (d :handle_info (list :_msg :state)
+                 (erlang/list_to_tuple (list tuple-head (list) (list :noreply (svar :state))))))
+      (= cb :terminate)
+        (list (d :terminate (list :_reason :_state) :ok))
+      (= cb :code_change)
+        (list (d :code_change (list :_old_vsn :state :_extra)
+                 (erlang/list_to_tuple (list tuple-head (list) (list :ok (svar :state))))))
+      :else (list))))
+
+(defn- compile-defserver
+  "Compile (defserver name (callback ...) ...) into a real gen_server module.
+
+   Parses each callback clause into def-asts, groups them by callback, orders
+   them by OTP's callback order (filling in defaults for omitted callbacks),
+   appends the client API, and builds a module body with `@behaviour
+   :gen_server`. The module is created at run time with Module.create and the
+   name is interned to the module."
+  [name-form clauses env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        mod (BeamLisp.Server/module_for (:ns env) name)
+        ; each clause -> {fname, [def-asts]}
+        clause-defs (map (fn [clause]
+                           (let [cb-name (rn/node-name (rn/node-form (first (rn/node-items (rn/node-form clause)))))
+                                 cb (BeamLisp.Server/callback cb-name)
+                                 fname (first (erlang/tuple_to_list cb))
+                                 shape (nth (erlang/tuple_to_list cb) 2)]
+                             (list fname (server-clause-defs clause fname shape env))))
+                         clauses)
+        ; group def-asts by fname
+        grouped (reduce (fn [m cd]
+                          (assoc m (first cd)
+                                   (concat (get m (first cd) (list)) (second cd))))
+                        {} clause-defs)
+        ; order by callback_order, adding defaults for missing callbacks
+        ordered (mapcat (fn [cb]
+                          (let [user (get grouped cb (list))]
+                            (if (empty? user)
+                              (server-default-defs cb)
+                              user)))
+                        (BeamLisp.Server/callback_order))
+        ; @behaviour :gen_server node with the metadata Elixir stamps
+        kernel-atom (erlang/binary_to_atom "Elixir.Kernel")
+        behaviour-node (erlang/list_to_tuple
+                         (list (erlang/binary_to_atom "@")
+                               (list (erlang/list_to_tuple (list :context var-context))
+                                     (erlang/list_to_tuple (list :imports (list (erlang/list_to_tuple (list 1 kernel-atom))))))
+                               (list (erlang/list_to_tuple
+                                       (list :behaviour
+                                             (list (erlang/list_to_tuple (list :context var-context)))
+                                             (list :gen_server))))))
+        module-body (ast-node :__block__
+                              (apply list (concat (list behaviour-node) ordered (server-client-defs))))
+        location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
+                       (erlang/list_to_tuple (list :line (or (:line env) 1))))
+        ; the create call: Module.create(mod, <escaped body>, location)
+        create-call (ast-mod-call (list :Module) :create
+                                  (list mod (Macro/escape module-body) location))
+        ; a FIXED `previous` var (not gensym'd), matching the oracle; one per
+        ; defserver so no collision
+        prev-var (erlang/list_to_tuple (list :previous (list) var-context))
+        opts-call (fn [arg] (ast-mod-call (list :Code) :compiler_options (list arg)))
+        ; try do create after Code.compiler_options(previous) end
+        try-node (ast-node :try
+                           (list (list (erlang/list_to_tuple (list :do create-call))
+                                       (erlang/list_to_tuple (list :after (opts-call prev-var))))))]
+    ; previous = Code.compiler_options()
+    ; Code.compiler_options([ignore_module_conflict: true])
+    ; try ... ; Env.intern(ns, name, mod) ; mod
+    (ast-node :__block__
+              (list (ast-node := (list prev-var (ast-mod-call (list :Code) :compiler_options (list))))
+                    (opts-call (list (erlang/list_to_tuple (list :ignore_module_conflict true))))
+                    try-node
+                    (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name mod))
+                    mod))))
+
 (defn- compile-def
   "Compile (def name value) into the tree that records a namespace variable.
 
@@ -2076,6 +2282,7 @@
     (= head "deftype") (compile-defrecord (first args) (second args) :deftype env)
     (= head "reify") (compile-reify args env)
     (= head "defnative") (compile-defnative (first args) (rest args) env)
+    (= head "defserver") (compile-defserver (first args) (rest args) env)
     (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
     (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
