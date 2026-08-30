@@ -1,0 +1,411 @@
+; reader.bl — turn beam-lisp source text into bare reader-node trees.
+;
+; Parsing happens over a charlist so delimiters and escapes remain integer
+; codepoints until a complete token or string is converted back to a binary.
+; Reader nodes intentionally carry no source metadata: this namespace is the
+; position-free reader used to prove the language can read itself.
+
+(ns reader
+  (:require [reader-node :as rn]))
+
+(defn- syntax-error
+  "Raise a reader error with `message` when source text cannot form a valid reader tree."
+  [message]
+  (throw (ex-info message {})))
+
+(defn- tuple2
+  "Build the two-element Erlang tuple used for one key/value pair in a map reader node."
+  [a b]
+  (erlang/list_to_tuple (list a b)))
+
+(defn- node
+  "Build a reader-node tuple tagged by `tag` and carrying `value`."
+  [tag value]
+  (rn/->tuple [tag value]))
+
+(defn- symbol-node
+  "Build the bare reader node for a symbol whose source spelling is `name`."
+  [name]
+  (node :symbol name))
+
+(defn- ignored-char?
+  "Return true when codepoint `c` separates forms without contributing a value."
+  [c]
+  (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 44)))
+
+(defn- delimiter?
+  "Return true when codepoint `c` ends an unquoted symbol, keyword, number, or character token."
+  [c]
+  (or (ignored-char? c)
+      (= c 40) (= c 41) (= c 91) (= c 93) (= c 123) (= c 125)
+      (= c 34) (= c 59)))
+
+(defn- skip-comment
+  "Consume a line comment charlist and return the newline and following input, or an empty list at end of input."
+  [chars]
+  (cond
+    (empty? chars) chars
+    (= 10 (first chars)) chars
+    :else (recur (rest chars))))
+
+(defn- skip-ignored
+  "Consume whitespace, commas, and semicolon line comments and return the next source charlist to parse."
+  [chars]
+  (cond
+    (empty? chars) chars
+    (ignored-char? (first chars)) (recur (rest chars))
+    (= 59 (first chars)) (recur (skip-comment (rest chars)))
+    :else chars))
+
+(defn- take-token
+  "Split a source charlist into its next delimiter-bounded token chars and the unconsumed input."
+  [chars]
+  (loop [remaining chars acc (list)]
+    (if (or (empty? remaining) (delimiter? (first remaining)))
+      [(reverse acc) remaining]
+      (recur (rest remaining) (cons (first remaining) acc)))))
+
+(defn- chars->string
+  "Convert a charlist of Unicode codepoints into the binary string used by beam-lisp values."
+  [chars]
+  (unicode/characters_to_binary (to-list chars)))
+
+(defn- hex-value
+  "Return the numeric value of one ASCII hexadecimal digit, or nil when `c` is not hexadecimal."
+  [c]
+  (cond
+    (and (>= c 48) (<= c 57)) (- c 48)
+    (and (>= c 65) (<= c 70)) (+ 10 (- c 65))
+    (and (>= c 97) (<= c 102)) (+ 10 (- c 97))
+    :else nil))
+
+(defn- parse-hex
+  "Convert a non-empty charlist of hexadecimal digits into an integer, or return nil for invalid input."
+  [digits]
+  (if (empty? digits)
+    nil
+    (loop [remaining digits value 0]
+      (if (empty? remaining)
+        value
+        (let [digit (hex-value (first remaining))]
+          (if (nil? digit)
+            nil
+            (recur (rest remaining) (+ (* value 16) digit))))))))
+
+(defn- valid-codepoint?
+  "Return true when integer `n` is a Unicode scalar value that may appear in a string."
+  [n]
+  (and (<= 0 n) (<= n 1114111) (or (< n 55296) (> n 57343))))
+
+(defn- parse-fixed-unicode
+  "Read exactly four hexadecimal digits from `chars` and return `[codepoint rest]`, raising for malformed escapes."
+  [chars]
+  (let [digits (take 4 chars) tail (drop 4 chars)]
+    (if (= 4 (count digits))
+      (let [value (parse-hex digits)]
+        (if (and (some? value) (valid-codepoint? value))
+          [value tail]
+          (syntax-error "invalid \\u escape: expected four hex digits or {hex}")))
+      (syntax-error "invalid \\u escape: expected four hex digits or {hex}"))))
+
+(defn- parse-braced-unicode
+  "Read a one-to-six-digit braced hexadecimal escape from `chars` and return `[codepoint rest]`."
+  [chars]
+  (loop [remaining chars digits (list)]
+    (cond
+      (empty? remaining) (syntax-error "invalid \\u escape: expected four hex digits or {hex}")
+      (= 125 (first remaining))
+        (let [ordered (reverse digits) value (parse-hex ordered)]
+          (if (and (<= 1 (count ordered)) (<= (count ordered) 6)
+                   (some? value) (valid-codepoint? value))
+            [value (rest remaining)]
+            (syntax-error "invalid \\u escape: expected four hex digits or {hex}")))
+      (nil? (hex-value (first remaining)))
+        (syntax-error "invalid \\u escape: expected four hex digits or {hex}")
+      :else (recur (rest remaining) (cons (first remaining) digits)))))
+
+(defn- parse-unicode-escape
+  "Read either a four-digit or braced Unicode escape body and return `[codepoint rest]`."
+  [chars]
+  (if (and (not (empty? chars)) (= 123 (first chars)))
+    (parse-braced-unicode (rest chars))
+    (parse-fixed-unicode chars)))
+
+(defn- escaped-codepoint
+  "Translate one ordinary string escape codepoint into the character it denotes."
+  [c]
+  (cond
+    (= c 110) 10
+    (= c 116) 9
+    (= c 114) 13
+    (= c 98) 8
+    (= c 102) 12
+    (= c 48) 0
+    :else c))
+
+(defn- read-string-body
+  "Read characters through the closing quote and return `[binary-value remaining-source]`, interpreting string escapes."
+  [chars]
+  (loop [remaining chars acc (list)]
+    (cond
+      (empty? remaining) (syntax-error "unterminated string")
+      (= 34 (first remaining)) [(chars->string (reverse acc)) (rest remaining)]
+      (= 92 (first remaining))
+        (let [tail (rest remaining)]
+          (cond
+            (empty? tail) (syntax-error "unterminated string")
+            (= 117 (first tail))
+              (let [[value after] (parse-unicode-escape (rest tail))]
+                (recur after (cons value acc)))
+            :else (recur (rest tail) (cons (escaped-codepoint (first tail)) acc))))
+      :else (recur (rest remaining) (cons (first remaining) acc)))))
+
+(defn- whole-number
+  "Parse token charlist `chars` as a whole integer or float and return nil when any characters remain or parsing fails."
+  [chars]
+  (let [integer-result (string/to_integer (to-list chars))
+        integer-value (erlang/element 1 integer-result)
+        integer-rest (erlang/element 2 integer-result)]
+    (if (and (not= integer-value :error) (empty? integer-rest))
+      integer-value
+      (let [float-result (string/to_float (to-list chars))
+            float-value (erlang/element 1 float-result)
+            float-rest (erlang/element 2 float-result)]
+        (if (and (not= float-value :error) (empty? float-rest))
+          float-value
+          nil)))))
+
+(defn- character-literal
+  "Parse a backslash-prefixed token string as one character codepoint, or return nil when the token is not a character literal."
+  [token chars]
+  (cond
+    (= token "\\newline") 10
+    (= token "\\space") 32
+    (= token "\\tab") 9
+    (= token "\\return") 13
+    (= token "\\backspace") 8
+    (= token "\\formfeed") 12
+    (and (>= (count chars) 2) (= 92 (first chars)) (= 117 (second chars)))
+      (let [digits (drop 2 chars) value (parse-hex digits)]
+        (if (and (= 4 (count digits)) (some? value))
+          value
+          (syntax-error (str "invalid character literal: " token))))
+    (and (= 2 (count chars)) (= 92 (first chars))) (second chars)
+    (= 92 (first chars)) (syntax-error (str "invalid character literal: " token))
+    :else nil))
+
+(defn- classify
+  "Turn one complete atom token charlist into nil, a boolean, number, character codepoint, keyword node, or symbol node."
+  [chars]
+  (let [token (chars->string chars)]
+    (cond
+      (= token "nil") nil
+      (= token "true") true
+      (= token "false") false
+      (= 58 (first chars)) (node :keyword (chars->string (rest chars)))
+      (= 92 (first chars)) (character-literal token chars)
+      :else (let [number (whole-number chars)]
+              (if (nil? number) (symbol-node token) number)))))
+
+(defn- pair-items
+  "Turn an even sequence of map forms into Erlang key/value tuples, raising when one key lacks a value."
+  [items]
+  (loop [remaining items acc (list)]
+    (cond
+      (empty? remaining) (reverse acc)
+      (empty? (rest remaining)) (syntax-error "map literal has an odd number of forms")
+      :else (recur (rest (rest remaining))
+                   (cons (tuple2 (first remaining) (second remaining)) acc)))))
+
+(defn- wrap-prefix
+  "Read one form after a reader prefix and return its `(name form)` list node plus remaining source."
+  [chars name in-fn?]
+  (let [remaining (skip-ignored chars)]
+    (if (empty? remaining)
+      (syntax-error (str name " with no following form"))
+      (let [[form after] (read-form remaining in-fn?)]
+        [(node :list (list (symbol-node name) form)) after]))))
+
+(defn- read-meta
+  "Read a `^metadata target` form and return just the target, plus remaining source.
+
+   The `^` reader macro attaches metadata to the form after it — `^{:ret int}
+   double` tags the symbol `double`, `^:private x` tags `x`. That metadata is
+   used elsewhere (the type checker reads `^{:ret …}`), but the plain form
+   tree this reader produces does not carry it: the answer key
+   (`BeamLisp.Reader/read_all`) drops all metadata before returning, so to
+   match it we read the metadata spec, throw it away, and return the target
+   form alone. First skip whitespace, read the spec form, skip whitespace
+   again, then read and return the target."
+  [chars in-fn?]
+  (let [after-caret (skip-ignored chars)]
+    (if (empty? after-caret)
+      (syntax-error "^ with no following metadata")
+      (let [[_spec after-spec] (read-form after-caret in-fn?)
+            remaining (skip-ignored after-spec)]
+        (if (empty? remaining)
+          (syntax-error "^ metadata with no target form")
+          (read-form remaining in-fn?))))))
+
+(defn- read-until
+  "Read forms until codepoint `closer` and return `[items remaining-source]`, raising when the collection is unterminated."
+  [chars closer in-fn?]
+  (loop [remaining (skip-ignored chars) acc (list)]
+    (cond
+      (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer))))
+      (= closer (first remaining)) [(reverse acc) (rest remaining)]
+      :else (let [[form after] (read-form remaining in-fn?)]
+              (if (= form :reader-discard)
+                (recur (skip-ignored after) acc)
+                (recur (skip-ignored after) (cons form acc)))))))
+
+(defn- fn-arg-index
+  "Return the positive position named by `%` or `%N`, `:rest` for `%&`, and nil for an ordinary symbol name."
+  [name]
+  (cond
+    (= name "%") 1
+    (= name "%&") :rest
+    (and (> (count name) 1) (= "%" (subs name 0 1)))
+      (let [digits (erlang/binary_to_list (subs name 1)) value (whole-number digits)]
+        (if (and (erlang/is_integer value) (>= value 1)) value nil))
+    :else nil))
+
+(defn- rewrite-fn-seq
+  "Rewrite anonymous-function arguments throughout `items` and return `[rewritten-items max-position has-rest]`."
+  [items max-position has-rest]
+  (loop [remaining items rewritten (list) maximum max-position rest? has-rest]
+    (if (empty? remaining)
+      [(reverse rewritten) maximum rest?]
+      (let [[item next-max next-rest] (rewrite-fn-arg (first remaining) maximum rest?)]
+        (recur (rest remaining) (cons item rewritten) next-max next-rest)))))
+
+(defn- rewrite-fn-arg
+  "Rewrite `%`, `%N`, and `%&` within one reader tree and return the rewritten form with accumulated parameter facts."
+  [form max-position has-rest]
+  (if (erlang/is_tuple form)
+    (let [parts (erlang/tuple_to_list form) tag (first parts) value (second parts)]
+      (cond
+        (= tag :symbol)
+          (let [index (fn-arg-index value)]
+            (cond
+              (= index :rest) [(symbol-node "rest__") max-position true]
+              (erlang/is_integer index) [(symbol-node (str "p" index "__")) (max max-position index) has-rest]
+              :else [form max-position has-rest]))
+        (or (= tag :list) (= tag :vector))
+          (let [[items next-max next-rest] (rewrite-fn-seq value max-position has-rest)]
+            [(node tag items) next-max next-rest])
+        (= tag :map)
+          (let [flat (reduce (fn [acc pair] (concat acc (erlang/tuple_to_list pair))) (list) value)
+                [items next-max next-rest] (rewrite-fn-seq flat max-position has-rest)]
+            [(node :map (pair-items items)) next-max next-rest])
+        :else [form max-position has-rest]))
+    [form max-position has-rest]))
+
+(defn- positional-params
+  "Build symbol nodes named `p1__` through `pN__` for anonymous-function positional arguments."
+  [n]
+  (loop [i 1 acc (list)]
+    (if (> i n)
+      (reverse acc)
+      (recur (+ i 1) (cons (symbol-node (str "p" i "__")) acc)))))
+
+(defn- desugar-fn
+  "Turn anonymous-function body `items` into the bare `(fn [params] (body-items...))` reader tree."
+  [items]
+  (let [[body maximum rest?] (rewrite-fn-seq items 0 false)
+        positional (positional-params maximum)
+        params (if rest?
+                 (concat positional (list (symbol-node "&") (symbol-node "rest__")))
+                 positional)]
+    (node :list
+      (list (symbol-node "fn")
+            (node :vector params)
+            (node :list body)))))
+
+(defn- deferred-reader-conditional
+  "Reject a reader conditional explicitly until platform branch selection is ported."
+  []
+  ; TODO(P2-tail): port #? and #?@ branch selection and collection splicing.
+  (syntax-error "reader.bl: reader conditionals not yet ported"))
+
+(defn- deferred-record-or-tag
+  "Reject a record or tagged-data dispatch explicitly until those extension forms are ported."
+  []
+  ; TODO(P2-tail): port #Name{...} records and #tag[...] data readers.
+  (syntax-error "reader.bl: records and tagged data not yet ported"))
+
+(defn- read-dispatch
+  "Read a hash-prefixed reader form and return `[form remaining-source]`, including sets, discards, and anonymous functions."
+  [chars in-fn?]
+  (cond
+    (empty? chars) [(symbol-node "#") chars]
+    (= 40 (first chars))
+      (if in-fn?
+        (syntax-error "nested #() fn literals are not allowed")
+        (let [[items after] (read-until (rest chars) 41 true)]
+          [(desugar-fn items) after]))
+    (= 123 (first chars))
+      (let [[items after] (read-until (rest chars) 125 in-fn?)]
+        [(node :set items) after])
+    (= 95 (first chars))
+      (let [remaining (skip-ignored (rest chars))]
+        (if (empty? remaining)
+          (syntax-error "#_ must be followed by a form")
+          (let [[_ after-discard] (read-form remaining in-fn?)]
+            [:reader-discard after-discard])))
+    (= 63 (first chars)) (deferred-reader-conditional)
+    :else
+      (let [[token after] (take-token chars)]
+        (if (and (not (empty? after))
+                 (or (= 91 (first after)) (= 123 (first after))))
+          (deferred-record-or-tag)
+          [(classify (cons 35 token)) after]))))
+
+(defn- read-atom
+  "Read one delimiter-bounded atom from `chars` and return its classified value with remaining source."
+  [chars]
+  (let [[token after] (take-token chars)]
+    (if (empty? token)
+      (syntax-error (str "unexpected character " (first chars)))
+      [(classify token) after])))
+
+(defn- read-form
+  "Read one form from a non-empty source charlist and return `[bare-reader-node remaining-source]`."
+  [chars in-fn?]
+  (let [head (first chars) tail (rest chars)]
+    (cond
+      (= head 40) (let [[items after] (read-until tail 41 in-fn?)] [(node :list items) after])
+      (= head 91) (let [[items after] (read-until tail 93 in-fn?)] [(node :vector items) after])
+      (= head 123) (let [[items after] (read-until tail 125 in-fn?)] [(node :map (pair-items items)) after])
+      (= head 41) (syntax-error "unexpected )")
+      (= head 93) (syntax-error "unexpected ]")
+      (= head 125) (syntax-error "unexpected }")
+      (= head 39) (wrap-prefix tail "quote" in-fn?)
+      (= head 96) (wrap-prefix tail "syntax-quote" in-fn?)
+      (= head 126)
+        (if (and (not (empty? tail)) (= 64 (first tail)))
+          (wrap-prefix (rest tail) "unquote-splicing" in-fn?)
+          (wrap-prefix tail "unquote" in-fn?))
+      (= head 64) (wrap-prefix tail "deref" in-fn?)
+      (= head 35) (read-dispatch tail in-fn?)
+      (= head 94) (read-meta tail in-fn?)
+      (= head 34) (read-string-body tail)
+      (and (= head 58) (not (empty? tail)) (= 34 (first tail)))
+        (let [[name after] (read-string-body (rest tail))] [(node :keyword name) after])
+      :else (read-atom chars))))
+
+(defn read-all
+  "Read binary source text `src` into a list of bare reader-node forms so compilers and tools can consume its structure."
+  [src]
+  ; `unicode/characters_to_list`, not `binary_to_list`: source text is UTF-8,
+  ; so a multi-byte character (an em-dash, an accented letter) must become ONE
+  ; codepoint, not several raw bytes. `binary_to_list` would split it into
+  ; bytes and a later re-encode would mangle it — the answer key reads with
+  ; the codepoint-aware conversion, so this must too.
+  (loop [chars (skip-ignored (unicode/characters_to_list src)) forms (list)]
+    (if (empty? chars)
+      (reverse forms)
+      (let [[form after] (read-form chars false)]
+        (if (= form :reader-discard)
+          (recur (skip-ignored after) forms)
+          (recur (skip-ignored after) (cons form forms)))))))
