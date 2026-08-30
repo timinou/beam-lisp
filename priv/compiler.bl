@@ -205,10 +205,14 @@
 ; ─────────────────────────────────────────────────────────────────────────────
 
 (defn- has-slash?
-  "Say whether a name contains a `/`, which marks it as qualified \u2014 either
-   `alias/var` or `Module/function`."
+  "Say whether a name is qualified: alias/var or Module/function.
+
+   A name that IS `/` (the division operator) or merely starts with `/` is NOT
+   qualified: the `/` there is the name itself, not a separator. Only a `/`
+   with something before it splits a name into a module/alias and a member."
   [name]
-  (some? (index-of name "/")))
+  (let [i (index-of name "/")]
+    (and (some? i) (> i 0))))
 
 (defn- uppercase-first?
   "Say whether the first character of `s` is an uppercase letter A\u2013Z, which is
@@ -739,6 +743,180 @@
   [form]
   (Macro/escape (datum form)))
 
+; ── guards ────────────────────────────────────────────────────────────────────
+;
+; A clause can carry a `:when` guard — a test the BEAM checks BEFORE running
+; the clause body, using only side-effect-free operations. Because the BEAM
+; evaluates guards specially, a guard is compiled in a RESTRICTED dialect:
+; comparisons and type tests become direct `:erlang` calls, `and`/`or`/`not`
+; become the short-circuit `andalso`/`orelse`/`not`, and a fixed set of
+; predicates (`int?`, `pos?`, `nil?`, `vector?`, …) expand to their guard-safe
+; definitions. Anything else is refused, matching what the BEAM allows.
+
+(defn- erl-call
+  "The tree for a direct Erlang call `:mod.fun(args)` — the building block of
+   guard expressions."
+  [mod fun args]
+  (ast-node (erlang/list_to_tuple (list :. (list) (list mod fun))) args))
+
+(def ^:private guard-bifs
+  "The guard vocabulary: each allowed name mapped to how it compiles. A
+   `[:bif mod fun arity]` entry becomes a direct Erlang call; a
+   `[:expand tag arity]` entry expands to a guard-safe expression built by
+   guard-special."
+  {"="  (list :bif :erlang :== 2)   "==" (list :bif :erlang :== 2)
+   "not=" (list :bif :erlang :"/=" 2)
+   "<"  (list :bif :erlang :< 2)    ">"  (list :bif :erlang :> 2)
+   "<=" (list :bif :erlang :"=<" 2) ">=" (list :bif :erlang :>= 2)
+   "+"  (list :bif :erlang :+ 2)    "-"  (list :bif :erlang :- 2)
+   "*"  (list :bif :erlang :* 2)    "rem" (list :bif :erlang :rem 2)
+   "tuple-size" (list :bif :erlang :tuple_size 1)
+   "int?" (list :bif :erlang :is_integer 1)
+   "float?" (list :bif :erlang :is_float 1)
+   "number?" (list :bif :erlang :is_number 1)
+   "string?" (list :bif :erlang :is_binary 1)
+   "tuple?" (list :bif :erlang :is_tuple 1)
+   "list?" (list :bif :erlang :is_list 1)
+   "pid?" (list :bif :erlang :is_pid 1)
+   "ref?" (list :bif :erlang :is_reference 1)
+   "port?" (list :bif :erlang :is_port 1)
+   "fn?" (list :expand :guard_fn 1)
+   "nil?" (list :expand :guard_nil 1)
+   "some?" (list :expand :guard_some 1)
+   "true?" (list :expand :guard_true 1)
+   "keyword?" (list :expand :guard_keyword 1)
+   "map?" (list :expand :guard_map 1)
+   "vector?" (list :expand :guard_vector 1)
+   "zero?" (list :expand :guard_zero 1)
+   "pos?" (list :expand :guard_pos 1)
+   "neg?" (list :expand :guard_neg 1)})
+
+(defn- g-and
+  "An Elixir `a and b` operator node — what `guard-special` uses to combine
+   sub-tests (the compiler's own guard expansions emit the `and` operator, not
+   an `:erlang.andalso` call)."
+  [a b]
+  (ast-node :and (list a b)))
+
+(defn- g-or
+  "An Elixir `a or b` operator node."
+  [a b]
+  (ast-node :or (list a b)))
+
+(defn- g-eq3
+  "An Elixir `a === b` operator node (strict equality)."
+  [a b]
+  (ast-node :=== (list a b)))
+
+(defn- g-ne3
+  "An Elixir `a !== b` operator node (strict inequality)."
+  [a b]
+  (ast-node :!== (list a b)))
+
+(defn- guard-special
+  "Expand a guard predicate that no single Erlang BIF captures into a
+   guard-safe expression. `tag` names the predicate; `args` are the already-
+   compiled argument trees (each predicate takes one)."
+  [tag args]
+  (let [x (first args)]
+    (cond
+      (= tag :guard_nil) (erl-call :erlang :"=:=" (list x nil))
+      (= tag :guard_some) (erl-call :erlang :"=/=" (list x nil))
+      (= tag :guard_true) (erl-call :erlang :"=:=" (list x true))
+      (= tag :guard_zero) (erl-call :erlang :== (list x 0))
+      (= tag :guard_pos) (erl-call :erlang :> (list x 0))
+      (= tag :guard_neg) (erl-call :erlang :< (list x 0))
+      (= tag :guard_keyword)
+        ; an atom that is not true/false/nil, using the `and`/`!==` operators
+        (g-and (erl-call :erlang :is_atom (list x))
+               (g-and (g-ne3 x true)
+                      (g-and (g-ne3 x false) (g-ne3 x nil))))
+      (= tag :guard_vector)
+        ; a map carrying a :__struct__ of BeamLisp.Vector (left-nested `and`,
+        ; the shape Elixir's compiler emits: ((is_map and has_key) and eq))
+        (g-and (g-and (erl-call :erlang :is_map (list x))
+                      (erl-call :erlang :is_map_key (list :__struct__ x)))
+               (g-eq3 (erl-call :erlang :map_get (list :__struct__ x))
+                      (ast-alias (list :BeamLisp :Vector))))
+      (= tag :guard_fn)
+        (g-or (erl-call :erlang :is_function (list x))
+              (g-and (erl-call :erlang :is_tuple (list x))
+                     (g-and (ast-node :==
+                                      (list (erl-call :erlang :tuple_size (list x)) 3))
+                            (ast-node :in
+                                      (list (erl-call :erlang :element (list 1 x))
+                                            (apply list (list (erlang/binary_to_atom "$blfn")
+                                                              (erlang/binary_to_atom "$remote"))))))))
+      (= tag :guard_map)
+        ; a plain map that is not one of the wrapper structs
+        (let [wrapper-aliases (apply list
+                                (map (fn [m] (ast-alias m))
+                                     (list (list :BeamLisp :Vector)
+                                           (list :BeamLisp :Set)
+                                           (list :BeamLisp :LazySeq)
+                                           (list :BeamLisp :Sorted :SortedSet)
+                                           (list :BeamLisp :Atom)
+                                           (list :BeamLisp :Volatile)
+                                           (list :BeamLisp :Promise)
+                                           (list :BeamLisp :Future)
+                                           (list :BeamLisp :Reduced))))
+              has-struct (erl-call :erlang :is_map_key (list :__struct__ x))
+              struct-val (erl-call :erlang :map_get (list :__struct__ x))
+              in-wrappers (ast-node :in (list struct-val wrapper-aliases))]
+          (g-and (erl-call :erlang :is_map (list x))
+                 (g-or (ast-node :not (list has-struct))
+                       (ast-node :not (list in-wrappers)))))
+      :else (throw (str "compiler: unknown guard expansion " tag)))))
+
+(declare compile-guard)
+
+(defn- compile-guard-list
+  "Compile a guard call `(op args...)` into a guard-safe tree.
+
+   `and`/`or`/`not` become the short-circuit `andalso`/`orelse`/`not`; a name
+   in the guard vocabulary becomes its BIF call or its expansion; anything
+   else is refused, matching the BEAM's rule that a guard calls no user code."
+  [items env]
+  (let [head (rn/node-form (first items))
+        name (rn/node-name head)
+        args (rest items)]
+    (cond
+      (= name "and")
+        (reduce (fn [acc a] (erl-call :erlang :andalso (list acc (compile-guard a env))))
+                (compile-guard (first args) env) (rest args))
+      (= name "or")
+        (reduce (fn [acc a] (erl-call :erlang :orelse (list acc (compile-guard a env))))
+                (compile-guard (first args) env) (rest args))
+      (= name "not")
+        (erl-call :erlang :not (list (compile-guard (first args) env)))
+      (contains? guard-bifs name)
+        (let [entry (get guard-bifs name)
+              arg-asts (apply list (map (fn [a] (compile-guard a env)) args))]
+          (if (= :bif (first entry))
+            (erl-call (second entry) (nth entry 2) arg-asts)
+            (guard-special (second entry) arg-asts)))
+      :else
+        (throw (str "`" name "` is not allowed in a guard")))))
+
+(defn- compile-guard
+  "Compile one guard expression into a guard-safe Elixir tree.
+
+   A bound local becomes its variable; a keyword becomes its atom; a number,
+   string, or boolean is itself; a list is a guard call (see
+   compile-guard-list). A name not bound by the clause head is refused — a
+   guard can only see what the head binds."
+  [form env]
+  (let [f (rn/node-form form)
+        tag (rn/node-tag f)]
+    (cond
+      (= tag :symbol)
+        (if (local? env (rn/node-name f))
+          (local-var env (rn/node-name f))
+          (throw (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
+      (= tag :keyword) (erlang/binary_to_atom (rn/node-name f))
+      (= tag :list) (compile-guard-list (rn/node-items f) env)
+      :else f)))
+
 (defn- amp-node?
   "Say whether a param node is the `&` marking the start of a rest parameter."
   [pform]
@@ -791,7 +969,7 @@
    body with match statements); a trailing `& rest` becomes one more ordinary
    parameter bound to the collected rest list. The body runs in tail position
    with the given recur target. Returns {:shape shape :clause ->node}."
-  [param-forms body self fn-name base-env]
+  [param-forms guard body self fn-name base-env]
   (let [sv (split-variadic param-forms)
         fixed-forms (first sv)
         rest-form (second sv)
@@ -829,27 +1007,49 @@
                                        (map (fn [step]
                                               (ast-node := (list (first step) (second step))))
                                             prelude-steps)
-                                       (list body-ast)))))]
+                                       (list body-ast)))))
+        ; a :when guard wraps the clause head as {:when, [], params ++ [guard]},
+        ; compiled in the restricted guard dialect against the head's variables
+        head (if (nil? guard)
+               params
+               (list (ast-node :when
+                               (apply list (concat params
+                                                   (list (compile-guard guard body-env)))))))]
     {:shape (clause-shape param-forms)
-     :clause (ast-node :-> (list params full-body))}))
+     :clause (ast-node :-> (list head full-body))}))
+
+(defn- split-when
+  "Split a clause's forms into [guard body] at a leading `:when`.
+
+   `(:when g rest...)` -> [g (rest...)]; forms with no `:when` -> [nil forms].
+   The guard is the test that must hold before the body runs."
+  [forms]
+  (if (and (not (empty? forms))
+           (= :keyword (rn/node-tag (rn/node-form (first forms))))
+           (= "when" (rn/node-name (rn/node-form (first forms)))))
+    (list (second forms) (rest (rest forms)))
+    (list nil forms)))
 
 (defn- parse-fn-clauses
   "Pull the clauses out of a (fn ...) form's arguments.
 
    Two shapes: a single clause written inline `(fn [params] body...)`, or
    several clauses each wrapped in parentheses
-   `(fn ([params] body...) ([params] body...))`. Returns a list of
-   {:params param-forms :body body-forms}."
+   `(fn ([params] :when guard body...) ([params] body...))`. A clause may
+   carry a `:when` guard between its parameters and its body. Returns a list
+   of {:params param-forms :guard guard-or-nil :body body-forms}."
   [args]
   (let [first-arg (rn/node-form (first args))]
     (if (= :vector (rn/node-tag first-arg))
       ; single inline clause
-      (list {:params (rn/node-items first-arg) :body (rest args)})
+      (let [gb (split-when (rest args))]
+        (list {:params (rn/node-items first-arg) :guard (first gb) :body (second gb)}))
       ; several parenthesised clauses
       (map (fn [clause]
-             (let [items (rn/node-items (rn/node-form clause))]
+             (let [items (rn/node-items (rn/node-form clause))
+                   gb (split-when (rest items))]
                {:params (rn/node-items (rn/node-form (first items)))
-                :body (rest items)}))
+                :guard (first gb) :body (second gb)}))
            args))))
 
 (defn- assemble-fn
@@ -919,7 +1119,7 @@
         self-map (reduce (fn [m s] (assoc m s (fresh-var "fnself"))) {} shapes)
         compiled (apply list
                    (map (fn [c]
-                          (compile-fn-clause (:params c) (:body c)
+                          (compile-fn-clause (:params c) (:guard c) (:body c)
                                              (get self-map (clause-shape (:params c)))
                                              fn-name env))
                         clauses))]
