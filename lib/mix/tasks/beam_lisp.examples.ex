@@ -46,6 +46,21 @@ defmodule Mix.Tasks.BeamLisp.Examples do
     BeamLisp.Loader.ensure_loaded("reload")
     BeamLisp.Loader.ensure_loaded("reload.ward")
 
+    # Pre-load the heavy libraries the examples require most (datom 57×, auth
+    # 12×, …) ONCE at :global, so every example fork inherits them through the
+    # env chain instead of recompiling ~17 datom files from source per example.
+    # Each is guarded: a lib whose own optional dep is absent (system.core needs
+    # z3) simply stays unloaded, and the examples that need it are skipped later.
+    for ns <- ~w(datom auth reload.migrate) do
+      try do
+        BeamLisp.Loader.ensure_loaded(ns)
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
+      end
+    end
+
     # Hand ward the {path, source} entries as data; it runs + reports in bl.
     entries =
       Enum.map(paths, fn p ->

@@ -37,6 +37,20 @@ defmodule BeamLisp.ExamplesTest do
     BeamLisp.Loader.ensure_loaded("reload")
     BeamLisp.Loader.ensure_loaded("reload.ward")
 
+    # Pre-load the heavy shared libraries ONCE at :global so every example fork
+    # inherits them through the env chain (a ~8x speedup vs recompiling datom's
+    # ~17 files from source per example). Guarded: a lib whose optional dep is
+    # absent stays unloaded and its examples are skipped later.
+    for ns <- ~w(datom auth reload.migrate) do
+      try do
+        BeamLisp.Loader.ensure_loaded(ns)
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
+      end
+    end
+
     entries = Enum.map(@examples, fn p -> %{"path" => p, "src" => File.read!(p)} end)
     BeamLisp.Env.intern("user", "__ward_examples__", entries)
 

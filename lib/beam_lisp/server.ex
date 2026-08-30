@@ -106,9 +106,11 @@ defmodule BeamLisp.Server do
   # OTP has no "no name" value: an anonymous server uses the /3 arity,
   # a registered one the /4. Passing [] as a name is an ArgumentError.
   def start_link(mod, arg, opts) do
+    conveyed = convey_arg(arg)
+
     case server_name(opts) do
-      nil -> :gen_server.start_link(mod, arg, gen_opts(opts))
-      name -> :gen_server.start_link(name, mod, arg, gen_opts(opts))
+      nil -> :gen_server.start_link(mod, conveyed, gen_opts(opts))
+      name -> :gen_server.start_link(name, mod, conveyed, gen_opts(opts))
     end
     |> unwrap()
   end
@@ -118,12 +120,42 @@ defmodule BeamLisp.Server do
   def start(mod, arg), do: start(mod, arg, %{})
 
   def start(mod, arg, opts) do
+    conveyed = convey_arg(arg)
+
     case server_name(opts) do
-      nil -> :gen_server.start(mod, arg, gen_opts(opts))
-      name -> :gen_server.start(name, mod, arg, gen_opts(opts))
+      nil -> :gen_server.start(mod, conveyed, gen_opts(opts))
+      name -> :gen_server.start(name, mod, conveyed, gen_opts(opts))
     end
     |> unwrap()
   end
+
+  # ── environment conveyance across the OTP start boundary ──
+  #
+  # A gen_server's `init/1` runs in the NEWLY spawned server process, which
+  # (like any spawned process) begins with an empty process dictionary and so
+  # resolves its names at :global — not in the fork that started it. A
+  # `defserver` whose `init` body references vars its own namespace defined
+  # would then fail with `undefined var` when started inside an isolated env (a
+  # test, a sandbox, an example under ward). So the start CONVEYS the caller's
+  # env, exactly as `future`/`spawn` do: capture the token here, tuck it beside
+  # the user's init arg, and bind it as the first thing `init` does (via
+  # `bind_init/1`). The wrapper tuple is private and always stripped, so the
+  # user's `init` sees only its own arg.
+  defp convey_arg(arg), do: {:"$bl_conveyed_env", BeamLisp.Env.capture(), arg}
+
+  @doc """
+  Bind a conveyed env token (if present) and return the user's real init arg.
+  The generated `init/1` calls this on its argument before running the user
+  body, so the server process runs in the world that started it. A plain
+  (non-wrapped) arg passes through untouched — a server started through raw OTP
+  still works, just without conveyance.
+  """
+  def bind_init({:"$bl_conveyed_env", token, arg}) do
+    BeamLisp.Env.bind(token)
+    arg
+  end
+
+  def bind_init(arg), do: arg
 
   @doc "Synchronous call. Default timeout matches OTP's 5s."
   def call(server, msg), do: :gen_server.call(server, msg)
