@@ -26,6 +26,16 @@ jank-flavored Clojure, and a small compiler that lowers forms to
 Elixir quoted. There is no VM, no FFI, no runtime of our own — just
 `mix compile`'s younger sibling.
 
+**And that middle is now written in beam-lisp itself.** The reader
+(`priv/reader.bl`) and the compiler (`priv/compiler.bl`) are beam-lisp
+programs that read and compile beam-lisp — they compile the language's
+entire standard library byte-identically to the original Elixir
+compiler, reproduce their own source (the self-hosting fixpoint), and
+are analyzed by the language's own tools ("what breaks if I change
+`compile-let`?" is a datalog query over the compiler). Elixir is kept,
+on purpose, as the final Elixir-quoted → BEAM step and the OTP host.
+See [docs/self-hosting.md](docs/self-hosting.md).
+
 ```
 "(map inc [1 2 3])"
   │  BeamLisp.Reader        — text → forms
