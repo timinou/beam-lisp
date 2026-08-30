@@ -2595,23 +2595,68 @@
         entries (concat author-entries doc-entries private-entries)]
     (if (empty? entries) nil (ast-node map-head (apply list entries)))))
 
-(defn- lower-meta-value
-  "Lower an author-metadata VALUE to its Elixir AST. A scalar (string, number,
-   keyword/atom, boolean, nil) is already valid quoted AST and passes through.
-   Anything richer — a nested map, a vector, a reader-node tuple carried in
-   `^{:test (quote [x])}` — is a runtime VALUE, not AST, so it must be escaped
-   with `Macro.escape` before it can sit inside a quoted map, exactly as the
-   genesis compiler escapes attr-map values."
+(defn- reader-form?
+  "Say whether `v` is a RAW READER FORM (a tagged tuple straight from the
+   reader: {:symbol …}, {:list …}, {:meta inner pos} …), as opposed to a
+   plain runtime value a macro placed into metadata via `vary-meta`.
+
+   Mirrors the genesis `bl_form?`: a tuple whose head is an atom is a reader
+   node; anything else — a string, a number, a beam-lisp Vector struct — is
+   already a value. Used to decide whether a metadata value must first be
+   turned into DATA (`datum`) before it is escaped into AST."
   [v]
-  (cond
-    (erlang/is_binary v) v
-    (erlang/is_integer v) v
-    (erlang/is_float v) v
-    (nil? v) nil
-    (= v true) true
-    (= v false) false
-    (erlang/is_atom v) v
-    :else (Macro/escape v)))
+  (and (erlang/is_tuple v)
+       (erlang/is_atom (first (erlang/tuple_to_list v)))))
+
+(defn- strip-one-quote
+  "Strip exactly ONE `quote` layer from a datum, matching genesis `unquote_data`.
+
+   `^{:arglists '([x])}` reads its value as `(quote ([x]))`; once metadata is
+   stored as DATA (not evaluated), that quote layer is intent — 'the datum,
+   literally' — not content, so remove it. A datum that is not a two-element
+   `(quote x)` list is returned unchanged."
+  [data]
+  (if (and (erlang/is_list data)
+           (= 2 (count data))
+           (erlang/is_tuple (first data))
+           (= :symbol (first (erlang/tuple_to_list (first data))))
+           (= "quote" (second (erlang/tuple_to_list (first data)))))
+    (second data)
+    data))
+
+(defn- attr-kvs->map
+  "Turn a `{:map …}` reader node written after a defn docstring into a plain
+   metadata map `{key-atom => value-node}`.
+
+   In `(defn f <docstring> {:inline (fn* [o] o)} [x] …)` Clojure's defn takes
+   an optional metadata-map literal between the docstring and the parameter
+   vector. Each key is a keyword node (lowered to its atom); each value is kept
+   as its RAW reader node, so it merges uniformly with the `^{…}` author map
+   and is later lowered to stored DATA by `lower-meta-value`, exactly as the
+   genesis `attr_map`/`attr_value_ast` pair does."
+  [map-node]
+  (maps/from_list
+    (apply list
+      (map (fn [pair]
+             (erlang/list_to_tuple
+               (list (erlang/binary_to_atom (rn/node-name (rn/node-form (kv-key pair))))
+                     (kv-val pair))))
+           (rn/node-items map-node)))))
+
+(defn- lower-meta-value
+  "Lower an author-metadata VALUE to the Elixir AST that reconstructs it,
+   exactly as the genesis `attr_value_ast` does.
+
+   Metadata values are DATA, not code: `^{:arglists '([x])}` stores the list
+   `([x])` of symbols, not a compiled function. A raw reader form is first
+   turned into its datum (`datum`), one `quote` layer is stripped
+   (`strip-one-quote`), and the result is `Macro.escape`d into a literal AST.
+   A value a macro already placed there (a real string, number, or Vector)
+   skips `datum` and is escaped directly. This is what lets rich metadata —
+   quoted arglists, type expressions — be STORED rather than CALLED."
+  [v]
+  (let [data (if (reader-form? v) (datum v) v)]
+    (Macro/escape (strip-one-quote data))))
 
 (defn- compile-defn*
   "The general defn compiler, with an explicit `private?` flag (for defn-).
@@ -2622,6 +2667,7 @@
   [args private? env]
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
+        kind (if private? "defn-" "defn")
         rest-args (rest args)
         has-doc (and (not (empty? rest-args))
                      (erlang/is_binary (rn/node-form (first rest-args)))
@@ -2629,8 +2675,25 @@
                      (not (empty? (rest rest-args))))
         doc (if has-doc (rn/node-form (first rest-args)) nil)
         after-doc (if has-doc (rest rest-args) rest-args)
+        ; a `{:map …}` literal after the docstring is Clojure's attr-map: peel
+        ; it and merge into the `^{…}` author metadata (attr keys win on a clash,
+        ; matching genesis `merge_attr`). What remains are the parameter clauses.
+        has-attr (and (not (empty? after-doc))
+                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
+        attr-map (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})
+        after-attr (if has-attr (rest after-doc) after-doc)
+        author (maps/merge (name-author-meta (first args)) attr-map)
+        ; Parity guards (genesis compile_def_special): a defn with no clauses,
+        ; or a docstring followed by another string instead of a parameter
+        ; vector, is a source error — caught here with the exact message.
+        _ (cond
+            (empty? after-attr)
+              (compile-error env (str kind " " name ": expected at least one parameter vector"))
+            (erlang/is_binary (rn/node-form (first after-attr)))
+              (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
+            :else nil)
         mod (BeamLisp.Link/module_for (:ns env))
-        clauses (parse-fn-clauses after-doc)
+        clauses (parse-fn-clauses after-attr)
         entries (apply list
                   (map (fn [c]
                          (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
@@ -2639,7 +2702,7 @@
                        (erlang/list_to_tuple (list :line (or (:line env) 1))))
         defvar-ast (ast-mod-call (list :BeamLisp :Link) :defvar
                                  (list (:ns env) name (Macro/escape entries) location))
-        meta (var-meta-map doc private? (name-author-meta (first args)))]
+        meta (var-meta-map doc private? author)]
     (if (nil? meta)
       defvar-ast
       ; value = defvar(...); Env.put_meta(ns, name, meta); value
