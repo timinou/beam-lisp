@@ -1,0 +1,972 @@
+; tooling/catalog.bl — a catalog that builds itself from a datalog query over code.
+;
+; Run (index + serve a directory of showcase files):
+;   mix beam_lisp.run --path priv tooling/run-catalog.bl
+;   BL_CATALOG_DIR=some/other/dir mix beam_lisp.run --path priv tooling/run-catalog.bl
+;   (BL_CATALOG_DIR defaults to examples/loom)
+; Open: http://127.0.0.1:4050
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; Point it at a directory of `.bl` files. It EVALUATES each (so their defns
+; become live, callable functions) and READS each (so it knows every defn's
+; line and source text). Every defn becomes a FACT in a datom database:
+;
+;   [?e :entry/name "demo-button"] [?e :entry/ns "…"] [?e :entry/line 28]
+;   [?e :entry/catalogued true] [?e :entry/group "Inputs"]
+;   [?e :entry/title "Button"] [?e :entry/doc "…"] [?e :entry/tag :input]
+;
+; A defn carrying `^:catalog {…}` metadata is a catalog entry; a defn WITHOUT
+; it is still recorded (`:entry/catalogued false`) so the tool can report
+; documentation COVERAGE — what is undocumented.
+;
+; The catalog page is then a pure function of a DATALOG QUERY over those facts:
+; the nav is `distinct :entry/group`, a group's contents are the entries with
+; that group, the badges are counts. And each entry's LIVE EXAMPLE is the fn
+; itself, resolved by ns+name and called — so the doc (metadata) and the demo
+; (the body) can never drift, because they are the same form.
+;
+; This mirrors priv/codebase.bl (source → facts → datalog), aimed at UI.
+
+(ns tooling.catalog
+  (:require [typed]
+            [datom]
+            [live.hiccup :as h]
+            [live.socket :as sock]
+            [live.lint :as lint]
+            [loom.transform :as tf]
+            [loom.ui :as ui]
+            [loom.box :as b]
+            [loom.token :as t]
+            [interop]
+            [web]))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. THE SCHEMA — one entity per defn found
+;; ════════════════════════════════════════════════════════════════════
+
+(def SCHEMA
+  [;; ── an EXAMPLE: one showcase defn (a demonstration) ──
+   {:db/ident :entry/name       :db/valueType :db.type/string}
+   {:db/ident :entry/ns         :db/valueType :db.type/string}
+   {:db/ident :entry/line       :db/valueType :db.type/long}
+   {:db/ident :entry/catalogued :db/valueType :db.type/boolean}
+   {:db/ident :entry/group      :db/valueType :db.type/string}
+   {:db/ident :entry/title      :db/valueType :db.type/string}
+   {:db/ident :entry/doc        :db/valueType :db.type/string}
+   {:db/ident :entry/src        :db/valueType :db.type/string}
+   {:db/ident :entry/tag        :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many}
+   ;; every library primitive this entry REFERENCES ("loom.box/row", …).
+   ;; A catalogued entry that uses a prim is a DEMONSTRATION of it (D3/R1).
+   {:db/ident :entry/uses       :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
+   ;; how many raw escape hatches (:style / raw-string) this entry leans on —
+   ;; where the grammar was insufficient and the author reached past it (R2).
+   {:db/ident :entry/escape     :db/valueType :db.type/long}
+
+   ;; ── a PRIMITIVE: one public defn in the indexed LIBRARY itself ──
+   {:db/ident :prim/name        :db/valueType :db.type/string}
+   {:db/ident :prim/ns          :db/valueType :db.type/string}
+   {:db/ident :prim/module      :db/valueType :db.type/string}
+   {:db/ident :prim/line        :db/valueType :db.type/long}
+   {:db/ident :prim/public      :db/valueType :db.type/boolean}
+   ;; which grammar THREAD(s) a primitive weaves (D1). A thread is an
+   ;; orthogonal concern the whole cloth is woven from — see `module-threads`.
+   {:db/ident :prim/thread      :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many}])
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. SOURCE PLUMBING — reader nodes (same rules as codebase.bl)
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- unwrap [r] (if (and (tuple? r) (= :ok (elem r 0))) (elem r 1) nil))
+
+(defn- form-head
+  "The head symbol name of a top-level form (\"ns\", \"defn\", …), or nil."
+  [form]
+  (let [f (typed/node-form form)
+        items (typed/node-items f)]
+    (if (and items (seq items)
+             (= :symbol (typed/node-tag (typed/node-form (first items)))))
+      (typed/node-name (typed/node-form (first items)))
+      nil)))
+
+(defn- defn-name
+  "The name a defn form defines (unwrapping the ^meta wrapper on the name node)."
+  [form]
+  (let [items (typed/node-items (typed/node-form form))
+        nn (typed/node-form (second items))]
+    (typed/node-name (if (= :meta (typed/node-tag nn))
+                       (second (erlang/tuple_to_list nn)) nn))))
+
+(defn- defn-meta-map
+  "The raw `^{…}` metadata map on a defn's name node, or nil. The reader stores
+   it as the 3rd element of the name's `{:meta inner meta-map}` tuple; each
+   VALUE in that map is itself a reader node (e.g. a `{:vector …}`), not plain
+   data — callers unwrap the specific keys they need."
+  [form]
+  (let [items (typed/node-items (typed/node-form form))
+        raw-name (second items)]
+    (if (and (erlang/is_tuple raw-name)
+             (= :meta (first (erlang/tuple_to_list raw-name))))
+      (nth (erlang/tuple_to_list raw-name) 2)
+      nil)))
+
+(defn- meta-keywords
+  "Extract a list of keyword strings from a metadata value that is a `{:vector
+   [keyword: …]}` node or a single `{:keyword …}` node. Returns [] otherwise."
+  [v]
+  (cond
+    (and (erlang/is_tuple v) (= :vector (first (erlang/tuple_to_list v))))
+      (into [] (keep (fn [it]
+                       (if (and (erlang/is_tuple it)
+                                (= :keyword (first (erlang/tuple_to_list it))))
+                         (keyword (second (erlang/tuple_to_list it)))
+                         nil))
+                     (second (erlang/tuple_to_list v))))
+    (and (erlang/is_tuple v) (= :keyword (first (erlang/tuple_to_list v))))
+      [(keyword (second (erlang/tuple_to_list v)))]
+    :else []))
+
+(defn- declared-ns
+  "The ns a source file declares (its first `ns` form's name)."
+  [forms]
+  (let [ns-form (first (filter (fn [f] (= "ns" (form-head f))) forms))]
+    (if (nil? ns-form) nil
+      (typed/node-name (typed/node-form
+        (second (typed/node-items (typed/node-form ns-form))))))))
+
+(defn- defn-forms
+  "Every top-level defn/defn- form, as {name → form-node}."
+  [forms]
+  (reduce (fn [m f]
+            (if (contains? #{"defn" "defn-"} (form-head f))
+              (let [nm (try (defn-name f) (catch e nil))]
+                (if nm (assoc m nm f) m))
+              m))
+          {} forms))
+
+;; ── library indexing: a defn's publicness, and a file's :require aliases ──
+
+(defn- public-defn?
+  "A `(defn …)` is public; a `(defn- …)` is private."
+  [form]
+  (= "defn" (form-head form)))
+
+(defn- module-of
+  "\"priv/loom/box.bl\" → \"box\" — the file stem, a human module label."
+  [path]
+  (let [segs (String/split path "/")
+        file (last segs)]
+    (String/replace file ".bl" "")))
+
+(defn- require-aliases
+  "Map of {alias-string → full-ns-string} from a file's `(ns … (:require …))`.
+   Reads each `[full.ns :as al]` vector in the :require list. A require with no
+   `:as` contributes nothing (calls would be fully qualified already)."
+  [forms]
+  (let [ns-form (first (filter (fn [f] (= "ns" (form-head f))) forms))]
+    (if (nil? ns-form) {}
+      (let [items (typed/node-items (typed/node-form ns-form))
+            req   (first (filter (fn [i]
+                                   (= :list (typed/node-tag (typed/node-form i))))
+                                 items))]
+        (if (nil? req) {}
+          (reduce
+            (fn [m v]
+              (if (not= :vector (typed/node-tag (typed/node-form v))) m
+                (let [vs (typed/node-items (typed/node-form v))
+                      full (try (typed/node-name (typed/node-form (first vs))) (catch e nil))
+                      ;; find the token right after an `:as` keyword
+                      al (loop [xs vs]
+                           (cond
+                             (or (empty? xs) (empty? (rest xs))) nil
+                             (= "as" (try (typed/node-name (typed/node-form (first xs))) (catch e nil)))
+                               (try (typed/node-name (typed/node-form (second xs))) (catch e nil))
+                             :else (recur (rest xs))))]
+                  (if (and full al) (assoc m al full) m))))
+            {} (typed/node-items (typed/node-form req))))))))
+
+(defn- node-children
+  "The child NODES of a composite node. A :map node's items are `{k v}` pair
+   tuples — NOT nodes — so we flatten each pair into its key and value nodes;
+   every other composite (:list :vector :set) exposes its items directly."
+  [f tag]
+  (if (= :map tag)
+    (reduce (fn [acc pair]
+              ;; a pair is a raw 2-tuple {key-node value-node}
+              (let [kv (erlang/tuple_to_list pair)]
+                (conj (conj acc (first kv)) (second kv))))
+            [] (typed/node-items f))
+    (typed/node-items f)))
+
+(defn- walk-nodes
+  "Fold `f` over every node in the tree rooted at `form`, descending through
+   lists, vectors, sets, AND map keys+values. `f` is (acc node-form tag) → acc."
+  [form f init]
+  (letfn [(go [n acc]
+            (let [nf (typed/node-form n)
+                  tag (typed/node-tag nf)
+                  acc2 (f acc nf tag)]
+              (if (contains? #{:list :vector :map :set} tag)
+                (reduce (fn [a s] (go s a)) acc2 (node-children nf tag))
+                acc2)))]
+    (go form init)))
+
+(defn- qualified-syms
+  "Every qualified symbol name (\"b/row\", \"t/color\") anywhere inside a form,
+   deep-walked — including inside :style / :class maps, where token calls live."
+  [form]
+  (walk-nodes form
+    (fn [acc nf tag]
+      (if (= :symbol tag)
+        (let [nm (typed/node-name nf)]
+          (if (index-of nm "/") (conj acc nm) acc))
+        acc))
+    []))
+
+(defn- uses-of
+  "The set of fully-qualified prim-names an entry references, resolving each
+   `alias/local` through the file's :require aliases. `b/row` + {b→loom.box}
+   → \"loom.box/row\". Unaliased or unknown prefixes are dropped."
+  [form aliases]
+  (into []
+    (distinct
+      (keep
+        (fn [qs]
+          (let [ix   (index-of qs "/")
+                pre  (String/slice qs 0 ix)
+                loc  (String/slice qs (+ ix 1) (String/length qs))
+                full (get aliases pre)]
+            (if full (str full "/" loc) nil)))
+        (qualified-syms form)))))
+
+(defn- escape-count
+  "How many raw escape hatches a form leans on: each `:style` key (raw CSS) is
+   the canonical one — a signal of where the token grammar fell short and the
+   author reached past it (R2). Counts every `:style` keyword in the tree."
+  [form]
+  (walk-nodes form
+    (fn [acc nf tag]
+      (if (and (= :keyword tag) (= "style" (typed/node-name nf))) (+ acc 1) acc))
+    0))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. INDEX — eval a file, read it, project every defn to facts
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- bl-files
+  "Every `.bl` path under `dir`, sorted."
+  [dir]
+  (map (fn [p] (str dir "/" p))
+       (filter (fn [p] (String/ends_with? p ".bl"))
+               (sort (File/ls! dir)))))
+
+(defn- entry-facts
+  "Facts for one source file: evaluate it (defns become live), read it (line +
+   source), and project one entity per defn. `next-id` threads db/ids."
+  [path next-id]
+  (let [src (File/read! path)
+        here (BeamLisp.Env/current_ns)
+        _ (BeamLisp.Compiler/eval_string src)
+        _ (BeamLisp.Env/in_ns here)          ; eval switched ns; restore ours
+        forms (BeamLisp.Reader/read_string src)
+        ns-str (declared-ns forms)
+        aliases (require-aliases forms)
+        forms-by-name (defn-forms forms)]
+    (if (nil? ns-str)
+      [[] next-id]
+      (loop [names (sort (into [] (BeamLisp.Env/own_names ns-str)))
+             id next-id
+             acc []]
+        (if (empty? names)
+          [acc id]
+          (let [nm (first names)
+                form (get forms-by-name nm)]
+            (if (nil? form)
+              ;; a name with no top-level defn form (helper def, macro output) — skip
+              (recur (rest names) id acc)
+              (let [meta (unwrap (BeamLisp.Env/meta ns-str nm))
+                    cat (if (map? meta) (get meta :catalog) nil)
+                    line (or (:line (typed/node-pos form)) 0)
+                    base {:db/id id
+                          :entry/name nm
+                          :entry/ns ns-str
+                          :entry/line line
+                          :entry/catalogued (some? cat)
+                          ;; the prims this entry references + escape-hatch count
+                          :entry/uses (uses-of form aliases)
+                          :entry/escape (escape-count form)}
+                    fact (if (nil? cat)
+                           base
+                           (merge base
+                                  {:entry/group (str (get cat :group "Ungrouped"))
+                                   :entry/title (str (get cat :title nm))
+                                   :entry/doc   (str (get cat :doc ""))
+                                   :entry/tag   (into [] (get cat :tags []))}))]
+                (recur (rest names) (+ id 1) (conj acc fact))))))))))
+
+;; ── D1: the grammar THREADS — orthogonal concerns woven into one cloth ──
+;;
+;; A thread is a dimension of what web UI IS: a mark on the page, its style, its
+;; layout, how data is encoded into it, the data itself, events it raises, and
+;; how it reconciles on change. Every loom module serves one or two threads;
+;; this map is that demarcation, expressed once as DATA. It is a view over the
+;; library, not a property baked into each defn — so re-threading is a one-line
+;; edit here, and a per-defn `^:thread […]` (read from source below) can refine
+;; any individual primitive without touching this table.
+
+(def threads
+  "The closed set of grammar threads, in weaving order."
+  [:mark :style :layout :encoding :data :event :reconcile])
+
+(def ^:private module-threads
+  "Which thread(s) each library module weaves, by module stem."
+  {"token"     [:style]
+   "box"       [:layout :style]
+   "ui"        [:mark :style]
+   "form"      [:mark :encoding :event]
+   "transform" [:encoding :reconcile]})
+
+(defn- prim-threads
+  "The threads a primitive weaves: a per-defn `^{:thread […]}` on the source
+   form if present, else the module's default threads, else none. The metadata
+   value is a reader node, so `meta-keywords` unwraps it to plain keywords."
+  [form mod]
+  (let [mm (defn-meta-map form)
+        declared (if (map? mm) (get mm :thread) nil)
+        from-meta (if (nil? declared) [] (meta-keywords declared))]
+    (if (seq from-meta) from-meta (get module-threads mod []))))
+
+(defn- prim-facts
+  "Facts for one LIBRARY file: one `:prim` entity per top-level defn/defn-,
+   recording module, line, publicness, and grammar thread(s). No eval needed —
+   a primitive is a fact about the source, not a thing we run."
+  [path next-id]
+  (let [src   (File/read! path)
+        forms (BeamLisp.Reader/read_string src)
+        ns-str (declared-ns forms)
+        mod   (module-of path)]
+    (if (nil? ns-str)
+      [[] next-id]
+      (loop [fs (filter (fn [f] (contains? #{"defn" "defn-"} (form-head f))) forms)
+             id next-id
+             acc []]
+        (if (empty? fs)
+          [acc id]
+          (let [f  (first fs)
+                nm (try (defn-name f) (catch e nil))]
+            (if (nil? nm)
+              (recur (rest fs) id acc)
+              (recur (rest fs) (+ id 1)
+                     (conj acc {:db/id id
+                                :prim/name (str ns-str "/" nm)
+                                :prim/ns ns-str
+                                :prim/module mod
+                                :prim/line (or (:line (typed/node-pos f)) 0)
+                                :prim/public (public-defn? f)
+                                :prim/thread (prim-threads f mod)})))))))))
+
+(def library-dir
+  "The library whose primitives the catalog measures coverage against. Defaults
+   to loom; override with BL_CATALOG_LIB to point the explorer at any package."
+  (let [d (System/get_env "BL_CATALOG_LIB")]
+    (if (and d (not (= d ""))) d "priv/loom")))
+
+(defn- index-into!
+  "Transact facts from every `.bl` under `dir` via `fact-fn` (which returns
+   [facts next-id]), threading ids from `start-id`. Returns the next free id."
+  [conn dir fact-fn start-id]
+  (loop [files (bl-files dir) id start-id]
+    (if (empty? files) id
+      (let [[facts next-id] (fact-fn (first files) id)]
+        (when (seq facts) (datom/transact! conn facts))
+        (recur (rest files) next-id)))))
+
+(defn index-dir
+  "Evaluate + read every `.bl` under `dir` (the showcase) AND read the library
+   (`library-dir`), returning ONE datom db that holds both `:entry/*` example
+   facts and `:prim/*` primitive facts. The join between them (which prim is
+   demonstrated) is the coverage report — a query, not a bookkeeping step.
+
+   Pointable at any directory — the whole tool takes the dir as an argument.
+   Sets a process flag while evaluating so a showcase file's own run-tail (its
+   `(when indexing? …)` guard) stays inert — indexing must not launch servers."
+  [dir]
+  (Process/put :loom.catalog/indexing true)
+  (let [conn (datom/connect SCHEMA)
+        ;; primitives first (ids 1…N), then examples (N+1…) — disjoint id spaces
+        next-id (index-into! conn library-dir prim-facts 1)]
+    (index-into! conn dir entry-facts next-id)
+    (Process/put :loom.catalog/indexing nil)
+    (datom/db conn)))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. THE QUERIES — the catalog IS datalog over the code
+;; ════════════════════════════════════════════════════════════════════
+
+(defn groups
+  "Distinct catalog groups, ordered."
+  [db]
+  (sort (into [] (map first
+    (datom/q '[:find ?g :where [?e :entry/group ?g] [?e :entry/catalogued true]] db)))))
+
+(defn entries-in
+  "Entries in a group, as maps, ordered by line."
+  [db group]
+  (sort-by :line
+    (map (fn [row] {:name (nth row 0) :title (nth row 1) :doc (nth row 2)
+                    :ns (nth row 3) :line (nth row 4)})
+      (datom/q '[:find ?n ?t ?d ?ns ?l
+                 :in $ ?g
+                 :where
+                 [?e :entry/group ?g] [?e :entry/name ?n] [?e :entry/title ?t]
+                 [?e :entry/doc ?d] [?e :entry/ns ?ns] [?e :entry/line ?l]]
+               db group))))
+
+(defn entries-by-tag
+  "Catalogued entry names carrying `tag`."
+  [db tag]
+  (sort (into [] (map first
+    (datom/q '[:find ?n :in $ ?tag
+               :where [?e :entry/tag ?tag] [?e :entry/name ?n]] db tag)))))
+
+(defn count-in-group
+  "How many entries a group holds (the nav badge)."
+  [db group]
+  (count (datom/q '[:find ?e :in $ ?g :where [?e :entry/group ?g]] db group)))
+
+(defn uncatalogued
+  "Defns with NO ^:catalog metadata — the documentation-coverage report."
+  [db]
+  (sort (into [] (map first
+    (datom/q '[:find ?n :where [?e :entry/name ?n] [?e :entry/catalogued false]] db)))))
+
+(defn all-catalogued
+  "Every catalogued entry name."
+  [db]
+  (into [] (map first
+    (datom/q '[:find ?n :where [?e :entry/catalogued true] [?e :entry/name ?n]] db))))
+
+;; ── SELF-MEASUREMENT: the catalog measured against the library it documents ──
+;;
+;; These queries JOIN `:prim/*` (the library surface) against `:entry/uses`
+;; (what the showcase actually references). A primitive is DEMONSTRATED when
+;; some catalogued entry uses it. The gap — public prims no example touches —
+;; is the coverage report, computed live, never hand-maintained.
+
+(defn public-prims
+  "Every public primitive name in the indexed library."
+  [db]
+  (sort (into [] (map first
+    (datom/q '[:find ?name :where
+               [?p :prim/public true] [?p :prim/name ?name]] db)))))
+
+(defn demonstrated-prims
+  "Public prims that at least one CATALOGUED entry references — the ones with a
+   live demo. `entry/uses` carries fully-qualified prim-names, so the join is a
+   plain equality on `?name`."
+  [db]
+  (sort (into [] (map first
+    (datom/q '[:find ?name :where
+               [?p :prim/public true] [?p :prim/name ?name]
+               [?e :entry/catalogued true] [?e :entry/uses ?name]] db)))))
+
+(defn undemonstrated-prims
+  "Public prims NO catalogued entry references — the coverage gap. `not-join`
+   scopes the negation to the primitive, asking 'does any entry use it?'."
+  [db]
+  (sort (into [] (map first
+    (datom/q '[:find ?name :where
+               [?p :prim/public true] [?p :prim/name ?name]
+               [:not-join [?name]
+                 [?e :entry/catalogued true] [?e :entry/uses ?name]]] db)))))
+
+(defn coverage
+  "Overall primitive-coverage: {:shown n :total n :pct 0–100 :gap [names]}."
+  [db]
+  (let [total (count (public-prims db))
+        shown (count (demonstrated-prims db))]
+    {:shown shown :total total
+     :pct (if (zero? total) 100 (erlang/round (* 100.0 (/ shown total))))
+     :gap (undemonstrated-prims db)}))
+
+(defn coverage-by-module
+  "Per-module demonstrated/total — which corner of the library is under-shown.
+   Modules come from `:prim/module` (the file stem: box, token, ui, …)."
+  [db]
+  (let [mods (sort (into [] (map first
+               (datom/q '[:find ?m :where [?p :prim/module ?m] [?p :prim/public true]] db))))]
+    (map
+      (fn [m]
+        (let [total (count (datom/q '[:find ?p :in $ ?m :where
+                                      [?p :prim/module ?m] [?p :prim/public true]] db m))
+              shown (count (datom/q '[:find ?p :in $ ?m :where
+                                      [?p :prim/module ?m] [?p :prim/public true]
+                                      [?p :prim/name ?name]
+                                      [?e :entry/catalogued true] [?e :entry/uses ?name]] db m))]
+          {:module m :shown shown :total total
+           :pct (if (zero? total) 100 (erlang/round (* 100.0 (/ shown total))))}))
+      mods)))
+
+(defn coverage-by-thread
+  "Per-thread demonstrated/total — coverage projected onto the grammar's own
+   axes (D1). A prim can weave several threads, so it counts toward each; the
+   thread totals therefore need not sum to the whole surface. Threads with no
+   primitives are omitted."
+  [db]
+  (into []
+    (keep
+      (fn [th]
+        (let [total (count (datom/q '[:find ?p :in $ ?th :where
+                                      [?p :prim/thread ?th] [?p :prim/public true]] db th))
+              shown (count (datom/q '[:find ?p :in $ ?th :where
+                                      [?p :prim/thread ?th] [?p :prim/public true]
+                                      [?p :prim/name ?name]
+                                      [?e :entry/catalogued true] [?e :entry/uses ?name]] db th))]
+          (if (zero? total) nil
+            {:thread th :shown shown :total total
+             :pct (erlang/round (* 100.0 (/ shown total)))})))
+      threads)))
+
+(defn co-occurrence
+  "Prim pairs that appear together in some entry — the composition graph (R1).
+   Returns [[[a b] count] …] sorted by frequency; only a<b pairs (undirected)."
+  [db]
+  (reverse (sort-by second
+    (into [] (frequencies
+      (keep
+        (fn [row]
+          (let [a (nth row 0) b (nth row 1)]
+            (if (< (compare a b) 0) [a b] nil)))
+        (datom/q '[:find ?a ?b :where
+                   [?e :entry/catalogued true]
+                   [?e :entry/uses ?a] [?e :entry/uses ?b]] db)))))))
+
+(defn escape-leaders
+  "Entries leaning hardest on the raw `:style` escape hatch (R2) — where the
+   token grammar fell short. [{:name :n} …] for entries with ≥1, worst first."
+  [db]
+  (reverse (sort-by :n
+    (into [] (keep
+      (fn [row]
+        (let [nm (nth row 0) n (nth row 1)]
+          (if (> n 0) {:name nm :n n} nil)))
+      (datom/q '[:find ?n ?esc :where
+                 [?e :entry/catalogued true] [?e :entry/name ?n]
+                 [?e :entry/escape ?esc]] db))))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. THE LIVE EXAMPLE — resolve an entry fn by ns+name and call it
+;; ════════════════════════════════════════════════════════════════════
+
+(defn render-example
+  "Resolve the entry fn (by ns+name) and call it → its live hiccup. On any
+   failure, a calm placeholder rather than a crashed page."
+  [entry]
+  (let [r (BeamLisp.Env/fetch (:ns entry) (:name entry))]
+    (if (and (tuple? r) (= :ok (elem r 0)) (fn? (elem r 1)))
+      (try ((elem r 1))
+           (catch e (ui/alert {:tone :danger} (str "example failed: " (pr-str e)))))
+      (ui/alert {:tone :warning} (str "could not resolve " (:ns entry) "/" (:name entry))))))
+
+;; ── R3: static a11y audit — render each demo, audit its TREE for unlabelled
+;; inputs, project the findings as warnings. This reuses the real runtime
+;; auditor (`transform/audit-missing-labels`) over the same value the browser
+;; would paint, so it catches exactly what a user of assistive tech would hit —
+;; before anyone opens the page.
+
+(defn- resolve-entry-fn [ns nm]
+  (let [r (BeamLisp.Env/fetch ns nm)]
+    (if (and (tuple? r) (= :ok (elem r 0)) (fn? (elem r 1))) (elem r 1) nil)))
+
+(defn a11y-warnings
+  "For every catalogued entry: render it and audit the tree for inputs with no
+   label link. Returns [{:name :ns :count} …] for entries with ≥1 finding — the
+   static a11y counterpart to the unkeyed-list lint. Auditing the RENDERED tree
+   (not the source) catches exactly what assistive tech would hit."
+  [db]
+  (let [rows (datom/q '[:find ?n ?ns :where
+                        [?e :entry/catalogued true] [?e :entry/name ?n] [?e :entry/ns ?ns]] db)]
+    (into []
+      (keep
+        (fn [row]
+          (let [nm (nth row 0) ns (nth row 1)
+                f (resolve-entry-fn ns nm)]
+            (if (nil? f) nil
+              (let [tree (try (f) (catch e nil))
+                    misses (if (nil? tree) [] (tf/audit-missing-labels tree))]
+                (if (seq misses) {:name nm :ns ns :count (count misses)} nil)))))
+        rows))))
+
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. THE VIEW — a pure function of (db, selected group)
+;; ════════════════════════════════════════════════════════════════════
+
+;; ── the SELF panel: the catalog's own metrics, rendered from its own db ──
+;;
+;; A pseudo-group — not a demo, but a live datalog dashboard OVER the same db
+;; the demos come from. Built from the very primitives it measures (box/ui/
+;; token), so the panel is itself a demonstration: the instrument shows its
+;; own readings, in its own language.
+
+(def self-group "◈ Self")
+
+(defn- pct-color [pct]
+  (cond (>= pct 80) (t/color :success)
+        (>= pct 40) (t/color :warning)
+        :else       (t/color :danger)))
+
+(defn- coverage-bar
+  "A thin proportion bar: `pct` filled, colour graded by health."
+  [pct]
+  (b/box {:w "100%" :h "7px" :bg :surface-2 :radius :full
+          :style {:overflow "hidden"}}
+    (b/box {:h "100%" :radius :full
+            :style {:width (str pct "%") :background (pct-color pct)
+                    :transition "width .3s ease"}})))
+
+(defn- metric-row
+  "One labelled coverage line: name · bar · shown/total."
+  [label shown total pct]
+  (b/row {:key label :gap :3 :align :center}
+    [:span {:class (t/sx {:width "92px" :color (t/color :muted)
+                          :font-size (t/text :sm)})} label]
+    (b/box {:grow 1} (coverage-bar pct))
+    [:span {:class (t/sx {:font-family (t/tok :font :mono) :font-size (t/text :xs)
+                          :color (t/color :faint) :width "52px"
+                          :text-align "right"})}
+     (str shown "/" total)]))
+
+(defn- self-panel
+  "The catalog measured against the library it documents — every figure below
+   is a datalog query over this same db."
+  [db]
+  (let [cov (coverage db)
+        gap (:gap cov)
+        pairs (co-occurrence db)]
+    ;; keyed so the content column's diff treats this as ONE stable child —
+    ;; the entry-panel list is keyed by name, so the self panel must carry a
+    ;; key too, else swapping between them mixes keyed + unkeyed siblings.
+    (b/col {:key "self-panel" :gap :5}
+      (b/col {:gap :1}
+        (ui/heading 2 "The catalog, measured")
+        (ui/prose {:tone :muted}
+          "Every number here is a datalog query over this catalog's own db: the library's primitives joined against what the showcase demonstrates."))
+
+      ;; ── primitive coverage, overall + per module ──
+      (ui/card {:key "coverage"}
+        (b/row {:gap :2 :align :baseline :justify :between}
+          (ui/heading 3 "Primitive coverage")
+          [:span {:class (t/sx {:font-family (t/tok :font :mono)
+                                :color (t/color :text)})}
+           (str (:shown cov) "/" (:total cov) " · " (:pct cov) "%")])
+        (b/box {:style {:margin-top (t/space :2) :margin-bottom (t/space :4)}}
+          (coverage-bar (:pct cov)))
+        (b/col {:gap :2}
+          (for [m (coverage-by-module db)]
+            (metric-row (:module m) (:shown m) (:total m) (:pct m)))))
+
+      ;; ── coverage projected onto the grammar's own threads (D1) ──
+      (ui/card {:key "threads"}
+        (ui/heading 3 "Coverage by thread")
+        (ui/prose {:tone :muted}
+          "The same coverage, projected onto the orthogonal threads the grammar weaves — a primitive counts toward every thread it serves.")
+        (b/col {:gap :2 :style {:margin-top (t/space :2)}}
+          (for [th (coverage-by-thread db)]
+            (metric-row (name (:thread th)) (:shown th) (:total th) (:pct th)))))
+
+      ;; ── the gap list: public prims with no live demo ──
+      (when (seq gap)
+        (ui/card {:key "gap"}
+          (b/row {:gap :2 :align :baseline :justify :between}
+            (ui/heading 3 "Undemonstrated primitives")
+            (ui/badge {:tone :warning} (str (count gap))))
+          (ui/prose {:tone :muted}
+            "Public functions the showcase never references — each wants a gallery entry.")
+          (b/wrap {:gap :2 :style {:margin-top (t/space :2)}}
+            (for [g gap]
+              [:span {:key g
+                      :class (t/sx {:font-family (t/tok :font :mono) :font-size (t/text :xs)
+                                    :color (t/color :muted) :background (t/color :surface-2)
+                                    :padding (str (t/space :1) " " (t/space :2))
+                                    :border-radius (t/radius :sm)})}
+               g]))))
+
+      ;; ── health: the static lints, as live self-metrics (R3 + the keyless lint) ──
+      (let [a11y (a11y-warnings db)]
+        (ui/card {:key "health"}
+          (ui/heading 3 "Health")
+          (ui/prose {:tone :muted}
+            "Static checks over the showcase: rendered lists that lack a :key, and inputs an assistive-tech user could not label.")
+          (b/col {:gap :2 :style {:margin-top (t/space :2)}}
+            ;; a11y: unlabelled inputs, audited over each demo's rendered tree
+            (if (empty? a11y)
+              (b/row {:gap :2 :align :center}
+                (ui/badge {:tone :success} "✓")
+                [:span {:class (t/sx {:color (t/color :muted) :font-size (t/text :sm)})}
+                 "Every input is labelled."])
+              (b/col {:gap :1}
+                (for [w a11y]
+                  (b/row {:key (:name w) :gap :2 :align :center :justify :between}
+                    [:span {:class (t/sx {:font-family (t/tok :font :mono) :font-size (t/text :xs)
+                                          :color (t/color :muted)})}
+                     (str (:ns w) "/" (:name w))]
+                    (ui/badge {:tone :danger} (str (:count w) " unlabelled")))))))))
+
+      ;; ── composition graph: which primitives co-occur (R1) ──
+      (when (seq pairs)
+        (ui/card {:key "compose"}
+          (ui/heading 3 "Composition")
+          (ui/prose {:tone :muted}
+            "Primitive pairs that appear together in one entry — the grammar composing itself.")
+          (b/col {:gap :1 :style {:margin-top (t/space :2)}}
+            (for [pair (take 8 pairs)]
+              (let [[ab n] pair]
+                (b/row {:key (str (first ab) (second ab)) :gap :2 :align :center :justify :between}
+                  [:span {:class (t/sx {:font-family (t/tok :font :mono) :font-size (t/text :xs)
+                                        :color (t/color :muted)})}
+                   (str (first ab) "  +  " (second ab))]
+                  (ui/badge {:tone :default} (str n)))))))))))
+
+(defn- nav [db selected]
+  (b/col {:gap :1 :basis "220px" :shrink 0}
+    (ui/heading 4 "Catalog")
+    ;; the Self dashboard sits at the top — the catalog measuring itself first
+    (b/row {:key self-group :gap :2 :align :center :justify :between :pad [:2 :3] :radius :md
+            :bg (if (= self-group selected) :surface-2 "transparent")
+            :on {:hover {:background (t/color :surface)}}
+            :style {:cursor "pointer"}
+            :on-click [:assign :group self-group]}
+      [:span {:class (t/sx {:color (if (= self-group selected) (t/color :text) (t/color :muted))
+                            :font-weight (t/weight (if (= self-group selected) :semibold :normal))})}
+       self-group]
+      (ui/badge {:tone :default} (str (:pct (coverage db)) "%")))
+    (ui/divider)
+    (for [g (groups db)]
+      ;; a live event: clicking assigns :group into THIS socket's session, and
+      ;; the view re-projects — a keyed patch, no full reload.
+      (b/row {:key g :gap :2 :align :center :justify :between :pad [:2 :3] :radius :md
+              :bg (if (= g selected) :surface-2 "transparent")
+              :on {:hover {:background (t/color :surface)}}
+              :style {:cursor "pointer"}
+              :on-click [:assign :group g]}
+        [:span {:class (t/sx {:color (if (= g selected) (t/color :text) (t/color :muted))
+                              :font-weight (t/weight (if (= g selected) :semibold :normal))})} g]
+        (ui/badge {:tone :default} (str (count-in-group db g)))))
+    (let [un (uncatalogued db)]
+      (when (seq un)
+        (b/col {:gap :1 :style {:margin-top (t/space :4)}}
+          (ui/divider)
+          [:span {:class (t/sx {:font-size (t/text :xs) :color (t/color :faint)})}
+           (str (count un) " undocumented")])))))
+
+(defn- entry-panel [entry]
+  (ui/card {:key (:name entry)}
+    (b/row {:gap :2 :align :center :justify :between}
+      (ui/heading 3 (:title entry))
+      [:span {:class (t/sx {:font-size (t/text :xs) :color (t/color :faint)
+                            :font-family (t/tok :font :mono)})}
+       (str (:name entry) " · L" (:line entry))])
+    (when (not= "" (:doc entry))
+      (ui/prose {:tone :muted} (:doc entry)))
+    (ui/divider)
+    ;; the LIVE example
+    (b/box {:pad :4 :bg :bg :radius :md} (render-example entry))))
+
+(defn- matches? [q entry]
+  ;; a case-insensitive substring over title + doc. `str` coerces every part
+  ;; to a string first (a nil doc, a non-string field) so downcase never sees
+  ;; a non-string.
+  (let [needle (String/downcase (str q))
+        hay (String/downcase (str (str (:title entry)) " " (str (:doc entry))))]
+    (not (nil? (index-of hay needle)))))
+
+(defn view [_shared _session locals]
+  (let [db (get locals :db)
+        selected (or (get locals :group) (first (groups db)))
+        self? (= selected self-group)
+        query (or (get locals :q) "")
+        in-group (if self? [] (entries-in db selected))
+        entries (if (= query "") in-group (filter (fn [e] (matches? query e)) in-group))]
+    (b/col {:gap :6 :pad [:6 :5] :max-w "1100px" :style {:margin "0 auto"}}
+      (b/col {:gap :1}
+        (ui/heading 1 "loom · catalog")
+        (ui/prose {:tone :muted}
+          "Generated from a datalog query over the showcase source. Each example is the live function; its docs are the same form.")
+        ;; the search box filters demos within a group; the Self dashboard has
+        ;; none to filter, so it is hidden there.
+        (when (not self?)
+          (b/box {:style {:margin-top (t/space :2) :max-width "320px"}}
+            [:input {:type "text" :value query
+                     :placeholder "filter this group…"
+                     :on-input [:assign :q [:from :value]]
+                     :class (t/sx {:width "100%" :padding (str (t/space :2) " " (t/space :3))
+                                   :font-size (t/text :sm) :color (t/color :text)
+                                   :background (t/color :surface)
+                                   :border (str "1px solid " (t/color :border))
+                                   :border-radius (t/radius :md)})}])))
+      (b/row {:gap :6 :align :start}
+        (nav db selected)
+        (b/col {:gap :4 :grow 1}
+          (cond
+            self?           (self-panel db)
+            (empty? entries) (ui/prose {:tone :faint} "No entries match your filter.")
+            :else           (for [e entries] (entry-panel e))))))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. SERVE — a LIVE socket, one per viewer (nav + search re-project)
+;; ════════════════════════════════════════════════════════════════════
+;;
+;; The catalog db is fixed at boot, but the VIEW is live: clicking a group or
+;; typing in the search box assigns into this socket's session locals, and the
+;; socket re-projects and ships a keyed patch — no reload. A `?group=` in the
+;; URL seeds the initial group (so links stay shareable), then live events take
+;; over.
+
+(def source-dir
+  (let [d (System/get_env "BL_CATALOG_DIR")]
+    (if (and d (not (= d ""))) d "examples/loom")))
+
+(def ^:private URI (erlang/binary_to_atom "Elixir.URI"))
+(defn- url-encode [s] (erlang/apply URI :encode_www_form (list s)))
+
+;; the live socket: the view, bound to a session that holds :group/:q. The db
+;; travels in the socket's initial locals (set at ws-init), so requiring this
+;; module defines the socket but indexes NOTHING — index happens only in `main`.
+(sock/deflive catalog-socket
+  :view view
+  :listen {})
+
+;; ── the stylesheet: warm it with EVERY reachable class ──────────────
+;;
+;; Atomic classes are content-hashed and deterministic, but a live patch only
+;; ships class NAMES — the rules must already be in the page <style>. Since the
+;; db is fixed, we render every group once at boot so the head sheet holds every
+;; class any state can reach; later patches reference rules already present.
+(defn- warm-style [db]
+  (t/reset-sheet!)
+  ;; every real group …
+  (doseq [g (groups db)]
+    (h/hiccup->html (view nil nil {:db db :group g})))
+  ;; … the Self dashboard (its bars/rows use classes no demo does) …
+  (h/hiccup->html (view nil nil {:db db :group self-group}))
+  ;; … and the empty-filter state, so live search never ships a cold class.
+  (h/hiccup->html (view nil nil {:db db :group (first (groups db)) :q "zzz-no-match"}))
+  (t/style-tag))
+
+;; ── the first paint: SSR the view for the requested group ───────────
+
+(defn- initial-group [db conn]
+  (let [q (web/query conn)]
+    (if (and q (String/starts_with? q "group="))
+      (web/url-decode (subs q 6))
+      (first (groups db)))))
+
+(defn- page [db style-tag group]
+  ;; render the body for first paint; the <style> is the warmed, complete sheet
+  (t/reset-sheet!)
+  (let [body (h/hiccup->html (view nil nil {:db db :group group}))]
+    (str "<!doctype html><html lang=\"en\"><head>"
+         "<meta charset=\"utf-8\">"
+         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+         "<title>loom · catalog</title>"
+         (h/hiccup->html style-tag)
+         "</head><body>"
+         "<div id=\"live-root\">" body "</div>"
+         "<script src=\"/client.js\"></script>"
+         "<script>Live.connect({url:(location.protocol==='https:'?'wss://':'ws://')"
+         "+location.host+'/ws'+location.search,root:document.getElementById('live-root')})</script>"
+         "</body></html>")))
+
+;; ── the WebSocket boundary: one deflive socket per connection ────────
+
+(defn- keywordize [m]
+  (if (map? m)
+    (reduce (fn [acc kv] (assoc acc (keyword (str (first kv))) (second kv))) {} (seq m))
+    m))
+
+;; :init receives the init-state we hand `upgrade` (a {:db :group} map), and
+;; starts a live socket whose SINK is this WebSocket process. The socket's
+;; initial locals carry the db + the ?group= seed from the connecting URL.
+;; deflive listens to its :shared conn for commits. The catalog's world is
+;; STATIC (the indexed db is a value, not a live log), so we hand it a real but
+;; empty conn that never commits — no re-projection ever fires from it; every
+;; update instead flows through an :assign event, re-projected in handle-event.
+(defn- ws-init [init-state]
+  (let [srv (server-start-link catalog-socket
+              {:shared (:conn init-state) :sink (erlang/self)
+               :locals {:db (:db init-state) :group (:group init-state)}
+               :auth {:fn (fn [_op _p _pr] {:verdict :allow}) :principal "catalog"}})]
+    [:ok {:srv srv}]))
+
+(defn- ws-handle-in [frame state]
+  (let [decoded (interop/json-> (nth frame 1))]
+    (if (and (sequential? decoded) (= "event" (first decoded)))
+      (let [term (nth decoded 1)
+            data (if (> (count decoded) 2) (nth decoded 2) {})]
+        (server-call (:srv state) [:event (sock/normalize-event term) (keywordize data)])
+        [:ok state])
+      [:ok state])))
+
+(defn- ws-handle-info [msg state]
+  [:push [[:text (interop/->json msg)]] state])
+
+;; the handler map is static; per-connection state (db + group) is passed as
+;; `upgrade`'s init-state and arrives at `:init`.
+(def ws-handlers
+  {:init ws-init
+   :handle-in ws-handle-in
+   :handle-info ws-handle-info})
+
+;; the JS client, read from priv at boot
+(def client-js (File/read! (str (web/priv-dir) "/live/client.js")))
+
+(defn router [db style-tag shared-conn conn]
+  (web/route conn
+    [:get "/"]
+    (web/html conn (page db style-tag (initial-group db conn)))
+
+    [:get "/client.js"]
+    (web/js conn client-js)
+
+    [:get "/ws"]
+    ;; the socket's initial group comes from the ws url's ?group= (forwarded by
+    ;; the page's Live.connect), so a shared link opens on the right group live.
+    ;; db + group + the (empty) shared conn ride as init-state → `:init`.
+    (web/upgrade conn ws-handlers
+                 {:db db :group (initial-group db conn) :conn shared-conn})
+
+    :else (web/text conn 404 "not found")))
+
+;; ── entrypoint ───────────────────────────────────────────────────────
+
+(defn main
+  "Index `source-dir`, warm the stylesheet, and serve the LIVE catalog. Called
+   only from the entrypoint below — so REQUIRING this module (a test, another
+   tool) runs NOTHING, indexes nothing, prints nothing."
+  []
+  (let [db (index-dir source-dir)
+        style-tag (warm-style db)
+        ;; an empty shared conn for deflive to listen to (never commits)
+        shared-conn (datom/connect [])
+        ;; START-TIME LINT: statically scan the showcase source for rendered
+        ;; lists missing :key — caught here, before anyone clicks, the static
+        ;; counterpart to diff.bl's runtime warning. This is the datalog-over-
+        ;; code check: the view is data, so is the code that builds it.
+        lint-warnings (lint/check! (bl-files source-dir))]
+    (println "\n-- loom catalog (live) --")
+    (println (str "  indexed:  " source-dir))
+    (println (str "  groups:   " (pr-str (groups db))))
+    (println (str "  entries:  " (count (all-catalogued db))))
+    (println (str "  undocumented: " (count (uncatalogued db))))
+    (println (str "  unkeyed lists: " (count lint-warnings) " (static lint)"))
+    (web/serve {:port 4050 :plug (fn [conn] (router db style-tag shared-conn conn))})
+    (println "  open:     http://127.0.0.1:4050  (nav + search are live)\n")
+    (Process/sleep 86400000)))
+
+;; No auto-run: this file is a LIBRARY (the engine + queries + view), safe to
+;; `require` from a test or another tool with zero side effects. The runnable
+;; entrypoint is `tooling/run-catalog.bl`, which requires this and calls `main`.

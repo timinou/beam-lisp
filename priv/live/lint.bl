@@ -1,0 +1,238 @@
+; live/lint.bl — a compile/start-time lint for unkeyed rendered lists.
+;
+; ── Why this exists ───────────────────────────────────────────────────
+;
+; live/diff.bl warns at RUNTIME when it actually reconciles an unkeyed sibling
+; list whose length changed — but only for code a running app exercises. This
+; module is the static counterpart: it reads source, finds every `(for …)` /
+; `(map …)` whose body is a hiccup element literal `[:tag …]` with no `:key`,
+; and reports it BEFORE the app runs. A view you have not clicked yet still
+; gets flagged.
+;
+; The whole thing is the codebase.bl idea aimed at UI: the view is DATA, and so
+; is the code that builds it — so "find the unkeyed rendered lists" is a query
+; over reader nodes projected into datom facts. `lint-db` returns a datom db;
+; the datalog queries below (or your own) read it.
+;
+; ── The fact ──────────────────────────────────────────────────────────
+;
+;   [?w :warn/kind :unkeyed-list]      one per offending for/map
+;   [?w :warn/ns   "example.app"]      the namespace
+;   [?w :warn/form "for"]              the producing form (for | map | mapv | …)
+;   [?w :warn/tag  "li"]               the hiccup tag rendered without a key
+;   [?w :warn/line 42]                 source line of the element
+;
+; ── What it flags (high signal, low noise) ────────────────────────────
+;
+; ONLY a seq-producing head (for/map/mapv/keep/map-indexed/for-indexed) whose
+; result element is a hiccup VECTOR literal `[:kw …]` lacking `:key` (in attrs
+; OR `^{:key …}` metadata). This is almost always a rendered list. A seq of
+; non-hiccup values, or an element that already carries a key, is never flagged.
+
+(ns live.lint
+  (:require [typed] [datom]))
+
+;; ── node helpers (same idiom as codebase.bl) ────────────────────────
+
+(defn- nform [n] (typed/node-form n))
+(defn- ntag [n] (typed/node-tag (nform n)))
+(defn- nitems [n] (typed/node-items (nform n)))
+(defn- nname [n] (typed/node-name (nform n)))
+(defn- npos [n] (typed/node-pos n))   ; pos lives on the RAW node, not its peeled form
+
+;; the seq-producing heads whose body/last-arg is a per-item element
+(def ^:private seq-heads
+  #{"for" "map" "mapv" "keep" "map-indexed" "for-indexed" "keep-indexed"})
+
+;; ── key detection ───────────────────────────────────────────────────
+
+(defn- map-node-has-key?
+  "Whether a :map node contains a literal `:key` entry."
+  [map-node]
+  (reduce (fn [_ pair]
+            (let [k (nform (first (erlang/tuple_to_list pair)))]
+              (if (and (= :keyword (typed/node-tag k)) (= "key" (typed/node-name k)))
+                (reduced true) false)))
+          false (typed/node-items map-node)))
+
+(defn- unwrap-meta
+  "Strip a `^{…}` wrapper, returning [inner-node meta-map|nil]. A meta node is
+   the RAW tuple {:meta inner meta-map}; `nform` would PEEL it and lose the
+   meta map, so we read the raw tuple directly."
+  [node]
+  (if (and (erlang/is_tuple node)
+           (= :meta (first (erlang/tuple_to_list node))))
+    (let [parts (erlang/tuple_to_list node)]
+      [(nth parts 1) (if (>= (count parts) 3) (nth parts 2) nil)])
+    [node nil]))
+
+(defn- hiccup-element?
+  "Whether `node` is a hiccup element literal: a :vector whose first item is a
+   keyword tag."
+  [node]
+  (and (= :vector (ntag node))
+       (let [its (nitems node)]
+         (and (seq its) (= :keyword (ntag (first its)))))))
+
+(defn- element-key?
+  "Whether a hiccup element literal carries a key — in its attrs :map, or via
+   a `^{:key …}` meta wrapper around the vector."
+  [wrapped-node]
+  (let [[node meta-map] (unwrap-meta wrapped-node)]
+    (or
+      ;; ^{:key …} metadata on the vector
+      (and (map? meta-map) (contains? meta-map :key))
+      ;; :key in the attrs map (second item, when it is a :map)
+      (let [its (nitems node)]
+        (and (> (count its) 1)
+             (= :map (ntag (nth its 1)))
+             (map-node-has-key? (nform (nth its 1))))))))
+
+;; ── the per-item result of a seq head ───────────────────────────────
+;;
+;; for      → (for [binds] BODY)          — BODY is the last item
+;; map/mapv → (map (fn [x] BODY) coll)    — BODY is the fn's last item
+;; map …    → (map some-fn coll)          — no literal element, skip
+;; We only inspect a DIRECT hiccup element literal; an element built by a named
+;; component fn is invisible here (and is that fn's concern, flagged where IT
+;; renders the list).
+
+(defn- fn-body-last
+  "If `node` is an (fn [..] BODY…) / #(...) literal, its last body node, else nil."
+  [node]
+  (if (= :list (ntag node))
+    (let [its (nitems node)
+          head (first its)]
+      (if (and head (= :symbol (ntag head)) (contains? #{"fn" "fn*"} (nname head)))
+        (last its)
+        nil))
+    nil))
+
+(defn- item-result
+  "The per-item result node a seq head produces, or nil if not a literal."
+  [head-name items]
+  (cond
+    ;; (for [binds] body) → last item
+    (= head-name "for") (last items)
+    (= head-name "for-indexed") (last items)
+    ;; (map f coll) → f's body if f is a fn literal
+    :else (let [f (if (> (count items) 1) (nth items 1) nil)]
+            (if (nil? f) nil (fn-body-last f)))))
+
+;; ── walk: collect unkeyed-list warnings from a form ─────────────────
+
+(defn- walk
+  "Accumulate warning maps under `node`. `ns-str` tags each."
+  [ns-str node acc]
+  (let [t (ntag node)]
+    (cond
+      (contains? #{:vector :set} t)
+        (reduce (fn [a sub] (walk ns-str sub a)) acc (nitems node))
+
+      (= :map t)
+        (reduce (fn [a pair]
+                  ;; a :map item is a {k v} pair tuple; k and v are raw nodes
+                  (let [a2 (walk ns-str (first (erlang/tuple_to_list pair)) a)]
+                    (walk ns-str (second (erlang/tuple_to_list pair)) a2)))
+                acc (nitems node))
+
+      (= :meta t)
+        (walk ns-str (nth (erlang/tuple_to_list (nform node)) 1) acc)
+
+      (= :list t)
+        (let [items (nitems node)
+              head (first items)
+              acc2 (if (and head (= :symbol (ntag head)) (contains? seq-heads (nname head)))
+                     (let [result (item-result (nname head) items)]
+                       (if (and (some? result)
+                                (hiccup-element? (first (unwrap-meta result)))
+                                (not (element-key? result)))
+                         (let [[inner _] (unwrap-meta result)
+                               tag-node (first (nitems inner))
+                               ;; position: the for/map LIST node carries the
+                               ;; reliable line; fall back to the element/result
+                               p (or (npos node) (npos result) (npos inner) (npos head))]
+                           (conj acc {:kind :unkeyed-list
+                                      :ns ns-str
+                                      :form (nname head)
+                                      :tag (nname tag-node)
+                                      :line (if (nil? p) 0 (:line p))}))
+                         acc))
+                     acc)]
+          ;; recurse into all children regardless (nested lists, etc.)
+          (reduce (fn [a sub] (walk ns-str sub a)) acc2 items))
+
+      :else acc)))
+
+;; ── declared ns of a source file ────────────────────────────────────
+
+(defn- declared-ns [forms]
+  (let [nsf (first (filter (fn [f]
+                             (let [its (nitems f)]
+                               (and (seq its) (= :symbol (ntag (first its)))
+                                    (= "ns" (nname (first its))))))
+                           forms))]
+    (if (nil? nsf) "?" (nname (nth (nitems nsf) 1)))))
+
+;; ── public: lint source / files → warnings and a datom db ───────────
+
+(defn lint-source
+  "Every unkeyed-list warning in a source STRING, as a vector of maps."
+  [src]
+  (let [forms (BeamLisp.Reader/read_string src)
+        ns-str (declared-ns forms)]
+    (reduce (fn [acc form] (walk ns-str form acc)) [] forms)))
+
+(defn lint-file
+  "Every unkeyed-list warning in a `.bl` file path."
+  [path]
+  (lint-source (File/read! path)))
+
+(def ^:private SCHEMA
+  [{:db/ident :warn/kind :db/valueType :db.type/keyword}
+   {:db/ident :warn/ns   :db/valueType :db.type/string}
+   {:db/ident :warn/form :db/valueType :db.type/string}
+   {:db/ident :warn/tag  :db/valueType :db.type/string}
+   {:db/ident :warn/line :db/valueType :db.type/long}])
+
+(defn lint-db
+  "Lint every warning in `warnings` into a datom db you can query with datalog:
+     [?w :warn/kind :unkeyed-list] [?w :warn/tag ?tag] [?w :warn/line ?l]"
+  [warnings]
+  (let [conn (datom/connect SCHEMA)]
+    (when (seq warnings)
+      (datom/transact! conn
+        (into [] (map-indexed
+                   (fn [i w] {:db/id (+ i 1)
+                              :warn/kind (:kind w) :warn/ns (:ns w)
+                              :warn/form (:form w) :warn/tag (:tag w)
+                              :warn/line (:line w)})
+                   warnings))))
+    (datom/db conn)))
+
+;; ── report: a human-readable block, and a start-time hook ───────────
+
+(defn format-warnings
+  "A readable multi-line report for a vector of warnings, or \"\" if none."
+  [warnings]
+  (if (empty? warnings)
+    ""
+    (str
+      "\n[loom/lint] " (count warnings) " rendered list(s) without :key on children:\n"
+      (join "\n"
+        (map (fn [w]
+               (str "  " (:ns w) "  L" (:line w) "  (" (:form w) " … [:" (:tag w) " …]) "
+                    "\u2192 add :key so a reorder MOVES a node instead of re-diffing it"))
+             warnings))
+      "\n  A view still renders correctly without keys; keys make the live diff\n"
+      "  minimal. Silence at runtime with (live.diff/set-keyless-warning! false).\n")))
+
+(defn check!
+  "Lint `paths` (a seq of .bl files) and print any warnings to stderr. Returns
+   the warnings. Call at app START (after requiring your view modules) to catch
+   unkeyed rendered lists before a user ever clicks."
+  [paths]
+  (let [warnings (into [] (mapcat lint-file paths))]
+    (when (seq warnings)
+      (erlang/apply :io :put_chars (list :standard_error (format-warnings warnings))))
+    warnings))
