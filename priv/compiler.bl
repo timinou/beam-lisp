@@ -408,6 +408,27 @@
     (str "core/" (subs name (count "clojure.core/")))
     name))
 
+(defn- macro-lookup
+  "The macro FUNCTION bound to `name` in namespace `ns`, or nil when `name` is
+   not a macro.
+
+   A macro is stored as a variable whose value is the tagged pair
+   `{:\"$macro\", fn}` — the tag says ‘this is a macro’ and the second element
+   is the function that does the expanding. This looks the name up (normalized
+   the same way calls are, so `clojure.core/x` finds `core/x`) and, when the
+   value is that tagged pair, hands back just the function. Anything else —
+   an ordinary value, an unbound name — yields nil."
+  [ns name]
+  (let [r (BeamLisp.Env/fetch ns (core-qualified name))]
+    (if (and (erlang/is_tuple r)
+             (= :ok (erlang/element 1 r)))
+      (let [v (erlang/element 2 r)]
+        (if (and (erlang/is_tuple v)
+                 (= (erlang/binary_to_atom "$macro") (erlang/element 1 v)))
+          (erlang/element 2 v)
+          nil))
+      nil)))
+
 (defn- macro?
   "Say whether `name` names a macro visible in this environment's namespace.
 
@@ -416,12 +437,7 @@
    — that is what makes `when`, `and`, `->`, and the rest work. Looked up
    through the same name normalization calls use."
   [env name]
-  (let [r (BeamLisp.Env/fetch (:ns env) (core-qualified name))]
-    (and (erlang/is_tuple r)
-         (= :ok (erlang/element 1 r))
-         (let [v (erlang/element 2 r)]
-           (and (erlang/is_tuple v)
-                (= (erlang/binary_to_atom "$macro") (erlang/element 1 v)))))))
+  (some? (macro-lookup (:ns env) name)))
 
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
@@ -2490,6 +2506,136 @@
     (= head "recur") (compile-recur args env)
     :else (throw (str "compiler: unknown special form " head))))
 
+(defn- data->form
+  "Turn a DATA value back into the reader form that denotes it — the exact
+   inverse of `datum`.
+
+   A macro is a function from data to data: it receives the call's parts as
+   plain values and returns a new value that stands for the code to compile
+   next. That returned value has to be turned back into reader-form shape so
+   the compiler can lower it. This walks the value and rebuilds nodes:
+     * a symbol node (already form-shaped) passes straight through;
+     * a metadata wrapper `{:meta form m}` keeps its wrapper, rebuilding the
+       form inside — a nil metadata is dropped (the bare form);
+     * a beam-lisp vector becomes a `:vector` node; if it carries author
+       metadata that metadata is re-wrapped so a later compile puts it back
+       onto the value, exactly as Clojure preserves `^{...}` on returned data;
+     * a set becomes a `:set` node, a list becomes a `:list` node;
+     * a plain map becomes a `:map` node of rebuilt key/value pairs;
+     * an atom that is not nil/true/false becomes a `:keyword` node;
+     * any other literal (number, string, boolean, nil) is already itself."
+  [d]
+  (cond
+    ; a reader node is a tuple whose head names its kind. A symbol node is
+    ; already form-shaped; a meta wrapper rebuilds its inner form; any other
+    ; tuple is an opaque literal value and passes through unchanged.
+    (erlang/is_tuple d)
+      (let [h (erlang/element 1 d)]
+        (cond
+          (= h :symbol) d
+          (= h :meta)
+            (let [f (erlang/element 2 d)
+                  m (erlang/element 3 d)]
+              (if (nil? m)
+                (data->form f)
+                (rn/meta-node (data->form f) m)))
+          :else d))
+
+    ; a vector: rebuild the items, then re-wrap author metadata if present
+    (vector? d)
+      (let [vform (rn/->tuple
+                    (list :vector
+                          (apply list (map data->form (BeamLisp.Vector/to_list d)))))
+            m (erlang/map_get :meta d)]
+        (if (and (erlang/is_map m) (> (erlang/map_size m) 0))
+          (rn/meta-node vform m)
+          vform))
+
+    (set? d)
+      (rn/->tuple (list :set
+                        (apply list (map data->form (BeamLisp.Set/to_list d)))))
+
+    (erlang/is_list d)
+      (rn/list-node (apply list (map data->form d)))
+
+    ; a plain map (not one of the struct-backed values vector?/set? caught)
+    (map? d)
+      (rn/->tuple
+        (list :map
+              (apply list
+                (map (fn [kv]
+                       (erlang/list_to_tuple
+                         (list (data->form (erlang/element 1 kv))
+                               (data->form (erlang/element 2 kv)))))
+                     (maps/to_list d)))))
+
+    ; a keyword is an atom other than nil/true/false; its node carries the name
+    (and (erlang/is_atom d) (not (nil? d)) (not= d true) (not= d false))
+      (rn/->tuple (list :keyword (erlang/atom_to_binary d)))
+
+    :else d))
+
+(defn- macro-env
+  "The `&env` a macro sees: the call site's locals as data.
+
+   A macro can ask what names are bound where it was called — that is `&env`.
+   beam-lisp locals are compiler variables, not inspectable values, so the
+   useful surface is their NAMES. This builds a map from each local's symbol
+   node to its name string, which is what a macro inspects with, e.g.,
+   `(contains? &env 'x)`."
+  [env]
+  (maps/from_list
+    (apply list
+      (map (fn [name]
+             (erlang/list_to_tuple (list (rn/sym-node name) name)))
+           (maps/keys (:locals env))))))
+
+(defn- expand-macro
+  "Run a macro once and turn its result back into a form.
+
+   The macro function is called with the call as data: first the whole form,
+   then the `&env` map, then each argument as its own datum — the arguments
+   are handed over UNEVALUATED, because a macro works on code, not values. The
+   value it returns is data, so `data->form` turns it back into a reader form
+   ready to compile.
+
+   `macro-fn` is the function from `macro-lookup`; `form` is the whole call
+   node; `args` are the argument nodes; `env` is a fresh compile environment."
+  [macro-fn form args env]
+  (data->form
+    (BeamLisp.RT/invoke macro-fn
+      (apply list
+        (concat (list (datum form) (macro-env env))
+                (map datum args))))))
+
+(defn macroexpand-1
+  "Expand a macro call by one step, or return the form unchanged.
+
+   If `form` is a list whose head is a plain symbol naming a macro (and not a
+   special form, which always wins), run that macro once and hand back what it
+   produced. Anything else — a non-list, a list headed by a non-symbol, a
+   special form, or an ordinary call — is returned exactly as given. This is
+   the one place macro expansion happens; the compiler calls it, then compiles
+   the result, and the language's own analysis tools call it to see through
+   defining macros.
+
+   `form` is a reader node; `ns` is the namespace name whose macros are in
+   scope."
+  [form ns]
+  (let [items (if (= :list (rn/node-tag form)) (rn/node-items form) nil)]
+    (if (and (some? items)
+             (not (empty? items))
+             (= :symbol (rn/node-tag (first items))))
+      (let [name (rn/node-name (first items))
+            args (rest items)]
+        (if (contains? special-forms name)
+          form
+          (let [macro-fn (macro-lookup ns name)]
+            (if (some? macro-fn)
+              (expand-macro macro-fn form args (new-env ns))
+              form))))
+      form)))
+
 (defn compile
   "Turn one reader form into its Elixir syntax tree.
 
@@ -2558,7 +2704,7 @@
                 ; The arguments are NOT pre-compiled — a macro receives them as
                 ; data. `local?` names shadow macros, so a bound local wins.
                 (and (some? name) (not (local? env name)) (macro? env name))
-                  (compile (BeamLisp.Compiler/macroexpand_1 form (:ns env)) env)
+                  (compile (macroexpand-1 form (:ns env)) env)
                 ; an ordinary call
                 :else (compile-call items env)))))
 
