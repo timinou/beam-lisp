@@ -871,24 +871,53 @@
     (nest-lets steps body-ast)))
 
 (defn- compile-loop
-  "Turn (loop [name value ...] body...) into a self-re-entrant function."
+  "Turn (loop [pattern value ...] body...) into a self-re-entrant function.
+
+   A binding whose pattern is a plain name becomes a loop PARAMETER directly.
+   A destructuring pattern (`[x :as xs]`, `{:keys [a]}`) instead binds a fresh
+   `whole` parameter and emits destructure steps that run at the TOP of the
+   body — so a `recur` that hands back a new value re-destructures it every
+   iteration, exactly as the genesis `loop_bindings` does. This is what lets
+   `(loop [[x :as xs] (list 1 2 3)] … (recur (rest xs)))` rebind x/xs each turn
+   and terminate on the exhausted-rest nil."
   [bindings-form body env]
   (let [items (rn/node-items (rn/node-form bindings-form))
         pairs (binding-pairs items env)
         built (reduce
                 (fn [acc pair]
-                  (let [pat (rn/node-form (first pair))
-                        name (rn/node-name pat)
-                        var (fresh-var name)]
-                    {:params (cons var (:params acc))
-                     :args (cons (compile (second pair) env) (:args acc))
-                     :env (put-local (:env acc) name var)}))
-                {:params (list) :args (list) :env env} pairs)
+                  (let [pat-node (first pair)
+                        pat (rn/node-form pat-node)]
+                    (if (= :symbol (rn/node-tag pat))
+                      ; a plain name is a loop parameter
+                      (let [name (rn/node-name pat)
+                            var (fresh-var name)]
+                        {:params (cons var (:params acc))
+                         :args (cons (compile (second pair) env) (:args acc))
+                         :steps (:steps acc)
+                         :env (put-local (:env acc) name var)})
+                      ; a destructuring pattern: a `whole` param + prelude steps
+                      (let [whole (fresh-var "whole")
+                            r (destructure-steps pat-node whole (:env acc))]
+                        {:params (cons whole (:params acc))
+                         :args (cons (compile (second pair) env) (:args acc))
+                         :steps (concat (:steps acc) (:steps r))
+                         :env (:env r)}))))
+                {:params (list) :args (list) :steps (list) :env env} pairs)
         params (reverse (:params built))
         arg-asts (reverse (:args built))
+        prelude-steps (:steps built)
         self (fresh-var "loop")
         loop-env (assoc (:env built) :recur {:self self :arity (count params)} :tail true)
-        body-ast (compile-body body loop-env)
+        body-core (compile-body body loop-env)
+        body-ast (if (empty? prelude-steps)
+                   body-core
+                   (ast-node :__block__
+                             (apply list
+                                    (concat
+                                      (map (fn [step]
+                                             (ast-node := (list (first step) (second step))))
+                                           prelude-steps)
+                                      (list body-core)))))
         inner-fn (ast-node :fn (list (ast-node :-> (list params body-ast))))
         self-applied (self-apply self inner-fn)]
     (ast-node (erlang/list_to_tuple (list :. (list) (list self-applied))) arg-asts)))
@@ -1459,6 +1488,26 @@
                 {:params (cons raw (:params fixed-built))
                  :steps (concat (:steps fixed-built) (list (list rest-var norm)))
                  :env (put-local (:env fixed-built) rname rest-var)})
+            ; a COMPOSITE rest pattern `[& [a b :as all]]`: the trailing args
+            ; arrive as the actual parameter `raw`. Clojure binds an EXHAUSTED
+            ; rest to nil, not `()`, and its variadic recursion relies on the
+            ; base case seeing nil (an empty list is truthy, so `(when more …)`
+            ; would loop forever). So normalize `raw == [] -> nil` FIRST, then
+            ; destructure the pattern against that normalized value — every name
+            ; (and an `:as`) binds nil when the rest is exhausted. This mirrors
+            ; the genesis `compile_clause` pattern branch.
+            (not (symbol-pattern? rest-form))
+              (let [raw (fresh-var "rest")
+                    rest-var (fresh-var "rest")
+                    norm (ast-node :if
+                                   (list (ast-node :== (list raw (list)))
+                                         (list (erlang/list_to_tuple (list :do nil))
+                                               (erlang/list_to_tuple (list :else raw)))))
+                    r (destructure-steps rest-form rest-var (:env fixed-built))]
+                {:params (cons raw (:params fixed-built))
+                 :steps (concat (:steps fixed-built)
+                                (cons (list rest-var norm) (:steps r)))
+                 :env (:env r)})
             :else
               (let [b (bind-param rest-form (:env fixed-built))]
                 {:params (cons (:param b) (:params fixed-built))
@@ -2451,12 +2500,33 @@
                                  :env (:env b)}))
                             {:params (list) :steps (list) :env env}
                             fixed-forms)
-        rest-built (if (nil? rest-form)
-                     fixed-built
-                     (let [b (bind-param rest-form (:env fixed-built))]
-                       {:params (cons (:param b) (:params fixed-built))
-                        :steps (concat (:steps fixed-built) (:steps b))
-                        :env (:env b)}))
+        rest-built (cond
+                     (nil? rest-form) fixed-built
+                     ; a plain-name rest binds the collected list directly
+                     (symbol-pattern? rest-form)
+                       (let [b (bind-param rest-form (:env fixed-built))]
+                         {:params (cons (:param b) (:params fixed-built))
+                          :steps (concat (:steps fixed-built) (:steps b))
+                          :env (:env b)})
+                     ; a COMPOSITE rest pattern `[& [a b :as all]]`: bind the
+                     ; raw trailing args, normalize an exhausted `[]` rest to
+                     ; nil (Clojure binds `&` to nil, not `()`, and variadic
+                     ; recursion terminates on that nil), then destructure the
+                     ; pattern against the normalized value so every name and
+                     ; an `:as` bind nil when the rest is empty. Mirrors the
+                     ; genesis `compile_clause` pattern branch.
+                     :else
+                       (let [raw (fresh-var "rest")
+                             rest-var (fresh-var "rest")
+                             norm (ast-node :if
+                                            (list (ast-node :== (list raw (list)))
+                                                  (list (erlang/list_to_tuple (list :do nil))
+                                                        (erlang/list_to_tuple (list :else raw)))))
+                             r (destructure-steps rest-form rest-var (:env fixed-built))]
+                         {:params (cons raw (:params fixed-built))
+                          :steps (concat (:steps fixed-built)
+                                         (cons (list rest-var norm) (:steps r)))
+                          :env (:env r)}))
         params (reverse (:params rest-built))
         prelude-steps (:steps rest-built)
         fixed-count (count fixed-forms)
