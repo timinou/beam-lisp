@@ -45,6 +45,9 @@ use std::sync::Mutex;
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
+mod keycodec;
+use keycodec::KeyVal;
+
 mod atoms {
     rustler::atoms! {
         ok,
@@ -279,6 +282,40 @@ fn fjall_commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom
     batch.commit().map_err(|e| err(e))?;
     Ok(atoms::ok())
 }
+
+/// Encode ONE value to its order-preserving key bytes (the codec.bl oracle
+/// path, in Rust). `tag` names the lane the caller classified the value into
+/// ("int"/"str"/"kw"/"bool"); the payload is the raw value. Returns the key
+/// binary, or `nil` when the value is outside the four bulk lanes (e.g. a bignum
+/// past 2^53) so the caller falls back to the bl codec. This exists so a
+/// differential test can assert byte-identity with codec.bl before the fan-out
+/// relies on it.
+#[rustler::nif]
+fn keycodec_encode<'a>(env: Env<'a>, tag: Atom, ival: i64, sval: Binary, bval: bool) -> NifResult<Term<'a>> {
+    let kv = if tag == int_atom() {
+        KeyVal::Int(ival)
+    } else if tag == str_atom() {
+        KeyVal::Str(sval.as_slice())
+    } else if tag == kw_atom() {
+        KeyVal::Keyword(sval.as_slice())
+    } else if tag == bool_atom() {
+        KeyVal::Bool(bval)
+    } else {
+        return Ok(atoms::nil().to_term(env));
+    };
+    match keycodec::encode(&kv) {
+        Some(bytes) => Ok(to_binary(env, &bytes)?.to_term(env)),
+        None => Ok(atoms::nil().to_term(env)),
+    }
+}
+
+mod lane_atoms {
+    rustler::atoms! { int, str, kw, boolean }
+}
+fn int_atom() -> Atom { lane_atoms::int() }
+fn str_atom() -> Atom { lane_atoms::str() }
+fn kw_atom() -> Atom { lane_atoms::kw() }
+fn bool_atom() -> Atom { lane_atoms::boolean() }
 
 /// A marker the host module only has once the NIF has replaced its stubs.
 #[rustler::nif]
