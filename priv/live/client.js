@@ -178,6 +178,13 @@
       const parent = at(root, path);
       const el = childByKey(parent, op[2]);
       if (el) parent.removeChild(el);
+    } else if (kind === "remove-at") {
+      // positional remove (unkeyed list): drop the element child at index.
+      // The differ emits these high-index-first, so sequential application
+      // keeps the remaining indices valid.
+      const parent = at(root, path);
+      const el = elementChildren(parent)[op[2]];
+      if (el) parent.removeChild(el);
     } else if (kind === "insert") {
       const parent = at(root, path);
       const idx = op[3];
@@ -205,6 +212,53 @@
   function connect(opts) {
     const root = opts.root || document.getElementById("live-root");
     const ws = new WebSocket(opts.url);
+
+    // An event can fire BEFORE the handshake finishes (a fast click on first
+    // paint) or AFTER the socket drops. Calling ws.send() in either state
+    // throws ("…object that is not, or is no longer, usable"). Buffer sends
+    // made while CONNECTING and flush them on open; drop sends once CLOSED.
+    // `ws.__send` is what relay() uses, never ws.send directly.
+    var pending = [];
+    ws.__send = function (payload) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        pending.push(payload);
+      }
+      // CLOSING/CLOSED: drop — the view will re-sync on reconnect
+    };
+
+    // Observable connection state. The client mirrors the live socket's health
+    // onto `document.documentElement[data-live]` ("1" connected, "0" dropped)
+    // and dispatches a `live:state` CustomEvent. Two audiences need this: a
+    // reconnect indicator in the UI, and an out-of-band watcher (e.g. a
+    // scenario-film liveness watchdog) that must certify the socket stayed up
+    // across a whole take — a point-in-time check cannot. Backward-compatible:
+    // a page that ignores the attribute is unaffected.
+    function setLive(up) {
+      try {
+        document.documentElement.setAttribute("data-live", up ? "1" : "0");
+        document.dispatchEvent(
+          new CustomEvent("live:state", { detail: { up: up } }),
+        );
+      } catch (_e) {
+        /* non-DOM host (tests) — ignore */
+      }
+      if (opts.onLive) opts.onLive(up);
+    }
+
+    ws.onopen = function () {
+      for (var i = 0; i < pending.length; i++) ws.send(pending[i]);
+      pending = [];
+      setLive(true);
+    };
+
+    ws.onclose = function () {
+      setLive(false);
+    };
+    ws.onerror = function () {
+      setLive(false);
+    };
 
     ws.onmessage = function (msg) {
       const [kind, a, b] = JSON.parse(msg.data);
@@ -278,7 +332,9 @@
     var raw = el.getAttribute(attr);
     var term = null;
     try { term = raw ? JSON.parse(raw) : null; } catch (e) { term = null; }
-    ws.send(JSON.stringify(["event", term, data || {}]));
+    // __send guards readyState (buffer while CONNECTING, drop when CLOSED) so a
+    // fire before the handshake or after a drop never throws.
+    (ws.__send || ws.send.bind(ws))(JSON.stringify(["event", term, data || {}]));
     return true;
   }
 
