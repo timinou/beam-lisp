@@ -41,7 +41,7 @@
 ; there is no shared mutable ground for one file to pull out from under another.
 
 (ns reload.ward
-  (:require [reload] [env]))
+  (:require [reload] [env] [system.core :as sys] [z3]))
 
 ;; ── coherence pre-check ───────────────────────────────────────────────────
 
@@ -60,6 +60,45 @@
    reader so a file with no `(ns …)` is reported cleanly rather than mis-run."
   [src]
   (reload/declared-ns src))
+
+;; ── Tier-B diagnosis: an SMT repair for a failing stateful process ────────
+;;
+;; When a FAILING file defines a process (a `defserver`) whose invariant the
+;; checker can repair, ward offers the synthesized missing guard — the same
+;; abduction (`repair-process`) that fixes a bad migration, turned on a red test.
+;; This is NARROW BY CONSTRUCTION and HONEST: it fires only for a process form,
+;; only when z3 is available, and `repair-process` itself returns `:checked
+;; false` for anything it cannot model. A plain unit failure gets Tier A alone.
+
+(defn- process-nodes
+  "The top-level `defserver` forms in `src` (the only shape the checker models),
+   as read nodes. Empty when the file defines no process."
+  [src]
+  (try
+    (filter (fn [f]
+              (let [nf (typed/node-form f)]
+                (and (= :list (typed/node-tag nf))
+                     (= "defserver" (typed/node-name (first (typed/node-items nf)))))))
+            (BeamLisp.Reader/read_string src))
+    (catch _ [])))
+
+(defn- diagnose-processes
+  "Best-effort Tier-B repair for a failing file: for each process it defines, run
+   `repair-process` and return the first result that actually found a repair
+   (`:checked` true with a non-empty `:repairs`). nil when the file defines no
+   process, z3 is absent, or nothing was repairable. NEVER throws — a diagnosis
+   that cannot run is simply absent, never a crash on top of a failure."
+  [src]
+  (let [procs (process-nodes src)]
+    (if (empty? procs)
+      nil
+      (try
+        (let [port (z3/open)]                 ; raises if z3 is not fetched
+          (some (fn [node]
+                  (let [r (sys/repair-process port node)]
+                    (if (and (:checked r) (seq (:repairs r))) r nil)))
+                procs))
+        (catch _ nil)))))                       ; z3 absent / untranslatable → no Tier B
 
 (defn run-file
   "Run one test file's SOURCE in a fresh isolated fork of `base`. Returns a
@@ -96,11 +135,21 @@
               (try
                 (do
                   (env/eval src)
-                  (let [totals (BeamLisp.TestRT/run_ns ns)]
+                  (let [result (BeamLisp.TestRT/run_ns ns)
+                        totals  {:tests (:tests result) :pass (:pass result)
+                                 :fail (:fail result) :error (:error result)}
+                        ; the per-assertion failure/error reports — the WHY,
+                        ; Tier A: expected/actual/form/test/context for each.
+                        failures (filter (fn [r] (contains? #{:fail :error} (:type r)))
+                                         (:reports result))
+                        failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
                     {:ns ns
-                     :status (if (and (= 0 (:fail totals)) (= 0 (:error totals)))
-                               :passed :failed)
+                     :status (if failed? :failed :passed)
                      :totals totals
+                     :reports (vec failures)
+                     ; Tier B (best-effort): a synthesized guard for a failing
+                     ; stateful process; nil/absent for a plain unit failure.
+                     :repair (if failed? (diagnose-processes src) nil)
                      :warnings warns}))
                 (catch e
                   {:ns ns :status :incoherent :warnings warns
@@ -245,14 +294,53 @@
              (if (> (:fail t) 0) (str ", " (:fail t) " failed") "")
              (if (> (:error t) 0) (str ", " (:error t) " errored") ""))))))
 
+(defn- failure-block
+  "One failing assertion rendered as an indented block: the test name, the form,
+   and expected-vs-actual — the WHY a bare red line hides. `context` (a `testing`
+   stack) is shown when present."
+  [rep]
+  (let [ctx (:context rep)
+        head (str "      ✗ " (:test rep)
+                  (if (= :error (:type rep)) "  (errored)" ""))]
+    (join "\n"
+      (filter (fn [s] (not (= s nil)))
+        (list head
+              (if (and ctx (not (= ctx ""))) (str "        ctx:      " ctx) nil)
+              (str "        form:     " (pr-str (:form rep)))
+              (str "        expected: " (pr-str (:expected rep)))
+              (str "        actual:   " (pr-str (:actual rep))))))))
+
+(defn- repair-block
+  "The Tier-B repair, when the failing file is a stateful process whose invariant
+   the checker could repair: the synthesized guard that would restore it."
+  [rep]
+  (let [rs (:repairs (:repair rep))]
+    (join "\n"
+      (map (fn [g]
+             (str "      ⚡ " (name (:label g)) ": suggested guard "
+                  (if (:guard g) (str "→ " (:guard g))
+                      "— unrepairable from the candidate vocabulary")))
+           rs))))
+
 (defn report
-  "Render a `run` result for a human: one line per file, then a summary. Returns
-   the text; the caller prints it."
+  "Render a `run` result for a human: one line per file, then — for a failing file
+   — a block per failing assertion with expected/actual (Tier A) and, when the
+   file is a stateful process the checker could repair, the synthesized guard
+   (Tier B). Then a summary. Returns the text; the caller prints it."
   [result]
   (join "\n"
     (concat
       ["── ward: warm isolated test run ──" ""]
-      (map file-line (:files result))
+      (mapcat
+        (fn [r]
+          (concat
+            [(file-line r)]
+            ;; Tier A: per-assertion why, only for a failing file
+            (map failure-block (or (:reports r) []))
+            ;; Tier B: an SMT repair, only when one was found
+            (if (and (:repair r) (:checked (:repair r)) (seq (:repairs (:repair r))))
+              [(repair-block r)] [])))
+        (:files result))
       [""
        (str "  " (:passed result) " file(s) passed, "
             (:failed result) " failed, "
