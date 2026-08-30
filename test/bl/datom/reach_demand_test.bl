@@ -1,0 +1,125 @@
+; test/bl/datom/reach_demand_test.bl — demand-scoped recursive queries.
+; Run: mix beam_lisp.test test/bl/datom/reach_demand_test.bl
+;
+; A recursive `reaches` query can be asked three ways, and the ANSWER must be
+; the same however the engine evaluates it underneath (full native closure,
+; native magic-sets demand, or the bl semi-naive fallback). These tests are the
+; oracle for that equivalence — the property that a performance optimisation
+; (routing a seeded query to a demand-scoped kernel) must never change the
+; result.
+;
+; The bug this suite exists to catch: a demand-scoped path that ignores the seed
+; and returns the FULL closure. On a graph with a DISCONNECTED component that is
+; a wrong answer — `reachable(a)` must NOT include nodes only reachable from a
+; different root. A single-chain graph cannot catch it (everything is reachable
+; from the head); the disconnected graph is the discriminating oracle.
+
+(ns datom.reach-demand.test
+  (:require [datom] [datom.query.rules] [datom.query.engine]))
+
+;; ── graphs ──────────────────────────────────────────────────────────
+
+(defn- graph
+  "A call graph from `[caller callee]` string pairs, as :call/caller+:call/callee
+   datoms (one entity per edge — the same shape codebase.bl emits)."
+  [edges]
+  (let [conn (datom/connect
+               [{:db/ident :call/caller :db/valueType :db.type/string}
+                {:db/ident :call/callee :db/valueType :db.type/string}])]
+    (datom/transact! conn
+      (into [] (mapv (fn [i]
+                       (let [e (get edges i)]
+                         {:db/id (- (+ i 1))
+                          :call/caller (get e 0)
+                          :call/callee (get e 1)}))
+                     (range (count edges)))))
+    conn))
+
+(def REACH
+  '[[(calls ?from ?to) [?c :call/caller ?from] [?c :call/callee ?to]]
+    [(reaches ?a ?b) (calls ?a ?b)]
+    [(reaches ?a ?b) (calls ?a ?x) (reaches ?x ?b)]])
+
+;; the canonical tiny oracle: a->b->c->d (one chain) — closure is 6 pairs
+(def CHAIN [["a" "b"] ["b" "c"] ["c" "d"]])
+;; the DISCRIMINATING oracle: two disconnected components a->b->c and x->y
+(def SPLIT [["a" "b"] ["b" "c"] ["x" "y"]])
+
+(defn- reachable-from [db a]
+  (into [] (sort (into [] (mapv (fn [r] (get r 0))
+                       (into [] (datom/q '[:find ?to :in $ % ?from
+                                           :where (reaches ?from ?to)]
+                                         db REACH a)))))))
+
+(defn- impact-of [db b]
+  (into [] (sort (into [] (mapv (fn [r] (get r 0))
+                       (into [] (datom/q '[:find ?who :in $ % ?target
+                                           :where (reaches ?who ?target)]
+                                         db REACH b)))))))
+
+(defn- full-closure [db]
+  (into [] (sort (into [] (mapv (fn [r] (str (get r 0) "->" (get r 1)))
+                       (into [] (datom/q '[:find ?a ?b :in $ %
+                                           :where (reaches ?a ?b)]
+                                         db REACH)))))))
+
+;; ── 1. full closure over a chain (the baseline oracle) ──────────────
+
+(deftest full-closure-over-a-chain
+  (let [db (datom/db (graph CHAIN))]
+    (is (= ["a->b" "a->c" "a->d" "b->c" "b->d" "c->d"] (full-closure db))
+        "transitive closure of a->b->c->d is all 6 ordered pairs")))
+
+;; ── 2. forward demand: reachable(a) — the FIRST-ARG-SEED path ────────
+;;
+;; This is the query the native magic-sets kernel demand-scopes. On the SPLIT
+;; graph it MUST return only a's cone {b c}, never y (reachable only from x).
+
+(deftest reachable-is-demand-scoped-not-full-closure
+  (let [db (datom/db (graph SPLIT))]
+    (is (= ["b" "c"] (reachable-from db "a"))
+        "reachable(a) is a's cone only — NOT the full closure (no y)")
+    (is (= ["y"] (reachable-from db "x"))
+        "reachable(x) is {y} only — NOT b/c from the other component")
+    (is (= [] (reachable-from db "y"))
+        "reachable(y) is empty — y is a sink")))
+
+;; ── 3. reverse demand: impact(b) — the SECOND-ARG seed path ─────────
+;;
+;; impact pins the SECOND argument (who reaches ?target). On the SPLIT graph
+;; impact(c) is {a b} and MUST NOT include x (which reaches only y).
+
+(deftest impact-is-demand-scoped-not-full-closure
+  (let [db (datom/db (graph SPLIT))]
+    (is (= ["a" "b"] (impact-of db "c"))
+        "impact(c) is everyone who reaches c — NOT x")
+    (is (= ["x"] (impact-of db "y"))
+        "impact(y) is {x} only")
+    (is (= [] (impact-of db "a"))
+        "impact(a) is empty — nothing reaches the root")))
+
+;; ── 4. equivalence: seeded answers agree with the filtered full closure ──
+;;
+;; Whatever kernel a seeded query takes, its result MUST equal the full closure
+;; filtered to that seed. This is the invariant an optimisation cannot break.
+
+(deftest seeded-agrees-with-full-closure
+  (let [db (datom/db (graph SPLIT))
+        pairs (into [] (datom/q '[:find ?a ?b :in $ % :where (reaches ?a ?b)]
+                                db REACH))
+        fwd-a (into [] (sort (into [] (distinct (mapv (fn [t] (get t 1))
+                               (filterv (fn [t] (= (get t 0) "a")) pairs))))))
+        rev-c (into [] (sort (into [] (distinct (mapv (fn [t] (get t 0))
+                               (filterv (fn [t] (= (get t 1) "c")) pairs))))))]
+    (is (= fwd-a (reachable-from db "a"))
+        "forward seeded == full closure filtered by ?from=a")
+    (is (= rev-c (impact-of db "c"))
+        "reverse seeded == full closure filtered by ?to=c")))
+
+;; ── 5. termination on a cycle with a disconnected sink ──────────────
+
+(deftest demand-scoped-terminates-on-a-cycle
+  (let [db (datom/db (graph [["a" "b"] ["b" "a"] ["b" "c"] ["x" "y"]]))]
+    ; a<->b cycle, b->c, disconnected x->y. reachable(a) = {a b c} (cycle closes)
+    (is (= ["a" "b" "c"] (reachable-from db "a"))
+        "reachable over a cycle terminates and excludes the other component")))
