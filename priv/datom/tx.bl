@@ -405,7 +405,15 @@
                                                   (if (datom.schema/ref? schema (get op 2))
                                                     (get op 3)
                                                     nil))
-                                                ops)))))
+                                                ops)))))]
+    ; FAST PATH: no tempids to resolve (a bulk load of entities that already
+    ; carry real :db/ids) — return the ops untouched. The full path below
+    ; rebuilds EVERY op (a nested per-op loop) even when the mapping is empty,
+    ; so short-circuiting here removes that whole allocation pass for the common
+    ; already-resolved case.
+    (if (empty? tempids)
+      [(into [] ops) {}]
+      (let [
         ; Every tempid's identity claims, in one pass rather than one
         ; pass PER TEMPID.
         claims-by-tempid (claims-index schema ops)
@@ -467,7 +475,7 @@
                            (loop [i 2 acc []]
                              (if (>= i (count op)) acc (recur (+ i 1) (conj acc i))))))))
            ops)
-     mapping]))
+       mapping]))))
 
 (defn current-values
   "The values `[e a]` currently holds — values, not datoms.
@@ -486,29 +494,31 @@
    leaving the entity with two current values for an attribute declared
    to hold one."
   [store e a pending]
-  (let [relevant (into (datom.index/scan store :eavt e a)
-                       ; `pending` is either a raw vector of datoms or an
-                       ; index of [e a] -> datoms. The index matters
-                       ; because realization calls this once PER
-                       ; OPERATION: filtering the whole pending list each
-                       ; time is O(ops^2) within a single transaction,
-                       ; which made a 400-entity transaction take minutes
-                       ; while the same data in 400 transactions was
-                       ; fast.
-                       (if (map? pending)
-                         (or (get pending [e a]) [])
-                         (filterv (fn [d] (and (= (datom.index/-e d) e)
-                                               (= (datom.index/-a d) a)))
-                                  pending)))]
-    ; Replay in tx order: an assertion adds a value, a retraction removes
-    ; it. What survives the fold is what currently holds.
-    (reduce (fn [acc d]
-              (let [v (datom.index/-v d)]
-                (if (datom.index/assertion? d)
-                  (if (contains? (set acc) v) acc (conj acc v))
-                  (filterv (fn [x] (not (= x v))) acc))))
-            []
-            (sort-by datom.index/-tx relevant))))
+  (let [stored (datom.index/scan store :eavt e a)
+        pend (if (map? pending)
+               (or (get pending [e a]) [])
+               ; `pending` is either a raw vector of datoms or an index of
+               ; [e a] -> datoms. The index matters because realization calls
+               ; this once PER OPERATION: filtering the whole pending list each
+               ; time is O(ops^2) within one transaction.
+               (filterv (fn [d] (and (= (datom.index/-e d) e)
+                                     (= (datom.index/-a d) a)))
+                        pending))]
+    ; FAST PATH: a fresh [e a] (nothing stored, nothing pending) holds nothing.
+    ; A bulk load of all-new entities hits this for EVERY op, so skipping the
+    ; `into` + `sort-by` + fold here (all allocating) removes that per-op cost
+    ; when there is provably nothing to compute.
+    (if (and (empty? stored) (empty? pend))
+      []
+      (let [relevant (into stored pend)]
+        ; Replay in tx order: an assertion adds a value, a retraction removes it.
+        (reduce (fn [acc d]
+                  (let [v (datom.index/-v d)]
+                    (if (datom.index/assertion? d)
+                      (if (contains? (set acc) v) acc (conj acc v))
+                      (filterv (fn [x] (not (= x v))) acc))))
+                []
+                (sort-by datom.index/-tx relevant))))))
 
 (defn- realize-op
   "One operation as the datoms it implies, given the transaction's datoms
@@ -524,7 +534,10 @@
         a (get op 2)
         v (get op 3)
         held (current-values store e a pending)
-        holds-v? (contains? (set held) v)]
+        ; `(set held)` allocates; skip it when `held` is empty (the fresh-load
+        ; case current-values fast-paths to `[]`), where holds-v? is trivially
+        ; false. Only build the set when there is something to check.
+        holds-v? (if (empty? held) false (contains? (set held) v))]
     (cond
       ; Retracting a value the entity does not hold is a NO-OP, as in
       ; Datomic. Recording it anyway wrote a datom for a fact that never
@@ -736,9 +749,21 @@
    Takes the store because uniqueness is not a property of a value in
    isolation — it is a question about the rest of the database."
   [store schema ops]
-  (into []
-        (filterv some?
-                 (into (into (mapv (fn [op] (datom.schema/validate-value schema (get op 2) (get op 3)))
-                                   ops)
-                             (mapv entity-id-problem ops))
-                       (mapv (fn [op] (uniqueness-violation store schema ops op)) ops)))))
+  ; ONE pass, one accumulator. The previous form built THREE full vectors
+  ; (`mapv` value-checks, `mapv` id-checks, `mapv` uniqueness-checks) then
+  ; `into`+`filterv`'d them — 4 allocations of an ops-sized collection and 3N
+  ; lambda calls to usually produce `[]`. On the compiler's 11k ops that was
+  ; ~2s of pure allocation. Folding the three checks into a single reduce that
+  ; conj's only the actual problems keeps the same semantics (all violations
+  ; collected, not thrown one at a time) at one pass and one allocation.
+  (reduce
+    (fn [problems op]
+      (let [vp (datom.schema/validate-value schema (get op 2) (get op 3))
+            ip (entity-id-problem op)
+            up (uniqueness-violation store schema ops op)]
+        (cond-> problems
+          (some? vp) (conj vp)
+          (some? ip) (conj ip)
+          (some? up) (conj up))))
+    []
+    ops))
