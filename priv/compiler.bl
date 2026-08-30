@@ -249,6 +249,28 @@
     (erlang/binary_to_atom (str "Elixir." prefix))
     (erlang/binary_to_atom prefix)))
 
+(defn- slash-target
+  "Decide what a qualified name `prefix/member` refers to.
+
+   Returns [:var ns member] for a reference to a variable in another
+   namespace, or [:remote module member] for a call into a host module. The
+   order matters and matches how a name resolves: an ALIAS wins, then an
+   UPPERCASE prefix is an Elixir module, then an existing NAMESPACE is a var
+   (so `core/not` is the var `not` in ns `core`, not a call to a `core`
+   module), and finally a lowercase unknown prefix is an Erlang module."
+  [env name]
+  (let [[prefix member] (split-slash name)
+        prefix (if (= "clojure.core" prefix) "core" prefix)
+        alias (BeamLisp.Env/alias_target (:ns env) prefix)]
+    (cond
+      (some? alias) (list :var alias member)
+      (uppercase-first? prefix)
+        (list :remote (erlang/binary_to_atom (str "Elixir." prefix))
+                      (erlang/binary_to_atom member))
+      (BeamLisp.Env/ns_exists? prefix) (list :var prefix member)
+      :else (list :remote (erlang/binary_to_atom prefix)
+                          (erlang/binary_to_atom member)))))
+
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Compiling a symbol
 ; ─────────────────────────────────────────────────────────────────────────────
@@ -272,10 +294,12 @@
     (local? env name)
       (local-var env name)
     (has-slash? name)
-      (let [[prefix fun] (split-slash name)]
-        ; Module/fun (or erlang-module/fun) as a VALUE: a remote function
-        ; reference. module-atom prepends Elixir. for an uppercase prefix.
-        (ast-remote-fun (module-atom prefix) (erlang/binary_to_atom fun)))
+      (let [tgt (slash-target env name)]
+        (if (= :remote (first tgt))
+          ; Module/fun as a VALUE: a remote function reference
+          (ast-remote-fun (second tgt) (nth tgt 2))
+          ; a var in another namespace: fetch its value
+          (ast-fetch (second tgt) (nth tgt 2))))
     :else
       (ast-fetch (:ns env) name)))
 
@@ -362,6 +386,21 @@
     (str "core/" (subs name (count "clojure.core/")))
     name))
 
+(defn- macro?
+  "Say whether `name` names a macro visible in this environment's namespace.
+
+   A macro is a variable whose value is tagged `{:\"$macro\", fn}`. When a call
+   head is a macro, the call is expanded at compile time instead of being run
+   — that is what makes `when`, `and`, `->`, and the rest work. Looked up
+   through the same name normalization calls use."
+  [env name]
+  (let [r (BeamLisp.Env/fetch (:ns env) (core-qualified name))]
+    (and (erlang/is_tuple r)
+         (= :ok (erlang/element 1 r))
+         (let [v (erlang/element 2 r)]
+           (and (erlang/is_tuple v)
+                (= (erlang/binary_to_atom "$macro") (erlang/element 1 v)))))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -389,15 +428,14 @@
       (= tag :keyword)
         (ast-invoke (erlang/binary_to_atom (rn/node-name head)) arg-asts)
 
-      ; (Module/fun args) or (alias/var args)
+      ; (Module/fun args), (alias/var args), or (ns/var args)
       (and (= tag :symbol) (has-slash? (rn/node-name head)))
-        (let [name (rn/node-name head)
-              [prefix fun] (split-slash name)]
-          ; a remote call compiles to apply(Module, :fun, [args])
-          (ast-node :apply
-                    (list (module-atom prefix)
-                          (erlang/binary_to_atom fun)
-                          arg-asts)))
+        (let [tgt (slash-target env (rn/node-name head))]
+          (if (= :remote (first tgt))
+            ; a host-module call: apply(Module, :fun, [args])
+            (ast-node :apply (list (second tgt) (nth tgt 2) arg-asts))
+            ; a var in another namespace: invoke its fetched value
+            (ast-invoke (ast-fetch (second tgt) (nth tgt 2)) arg-asts)))
 
       ; (name args) with a plain name — try the linked direct call first,
       ; then fall back to the general lookup-and-invoke path
@@ -419,7 +457,8 @@
 (def special-forms
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
-  #{"if" "do" "throw" "quote" "def" "defn" "defn-" "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
+  #{"if" "do" "throw" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
+    "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
 
 (defn- compile-body
   "Compile body forms into one Elixir tree (a single form, or a __block__)."
@@ -988,7 +1027,7 @@
    body with match statements); a trailing `& rest` becomes one more ordinary
    parameter bound to the collected rest list. The body runs in tail position
    with the given recur target. Returns {:shape shape :clause ->node}."
-  [param-forms guard body self fn-name base-env]
+  [param-forms guard body self fn-name nil-rest? base-env]
   (let [sv (split-variadic param-forms)
         fixed-forms (first sv)
         rest-form (second sv)
@@ -1000,13 +1039,29 @@
                                  :env (:env b)}))
                             {:params (list) :steps (list) :env base-env}
                             fixed-forms)
-        ; a rest parameter is one more Elixir parameter (the collected list)
-        rest-built (if (nil? rest-form)
-                     fixed-built
-                     (let [b (bind-param rest-form (:env fixed-built))]
-                       {:params (cons (:param b) (:params fixed-built))
-                        :steps (concat (:steps fixed-built) (:steps b))
-                        :env (:env b)}))
+        ; a rest parameter is one more Elixir parameter (the collected list).
+        ; For a macro (nil-rest?), an empty rest is normalized to nil rather
+        ; than `[]`, so the actual parameter is a raw var and a body prelude
+        ; binds the rest name to `if raw == [] then nil else raw`.
+        rest-built
+          (cond
+            (nil? rest-form) fixed-built
+            (and nil-rest? (symbol-pattern? rest-form))
+              (let [rname (rn/node-name (rn/node-form rest-form))
+                    raw (fresh-var "rest")
+                    rest-var (fresh-var rname)
+                    norm (ast-node :if
+                                   (list (ast-node :== (list raw (list)))
+                                         (list (erlang/list_to_tuple (list :do nil))
+                                               (erlang/list_to_tuple (list :else raw)))))]
+                {:params (cons raw (:params fixed-built))
+                 :steps (concat (:steps fixed-built) (list (list rest-var norm)))
+                 :env (put-local (:env fixed-built) rname rest-var)})
+            :else
+              (let [b (bind-param rest-form (:env fixed-built))]
+                {:params (cons (:param b) (:params fixed-built))
+                 :steps (concat (:steps fixed-built) (:steps b))
+                 :env (:env b)}))
         params (reverse (:params rest-built))
         prelude-steps (:steps rest-built)
         arity (count params)
@@ -1127,6 +1182,15 @@
    function with more than one arity (or a variadic clause) becomes a `$blfn`
    dispatch tuple the runtime selects on by argument count."
   [args env]
+  (compile-fn* args false env))
+
+(defn- compile-fn*
+  "The general fn compiler, with an explicit `nil-rest?` flag.
+
+   `nil-rest?` is true only for macro functions, whose trailing `& rest` binds
+   to nil (not `[]`) when there are no extra arguments. Ordinary fns keep the
+   Clojure `()` empty rest."
+  [args nil-rest? env]
   (let [first-arg (rn/node-form (first args))
         fn-name (if (= :symbol (rn/node-tag first-arg))
                   (rn/node-name first-arg) nil)
@@ -1140,11 +1204,159 @@
                    (map (fn [c]
                           (compile-fn-clause (:params c) (:guard c) (:body c)
                                              (get self-map (clause-shape (:params c)))
-                                             fn-name env))
+                                             fn-name nil-rest? env))
                         clauses))]
     (assemble-fn compiled self-map)))
 
-; ── def and defn (var linking) ────────────────────────────────────────────────
+; ---- syntax-quote (backtick, ~, ~@, x#) --------------------------------------
+;
+; A syntax-quote (written with a backtick) is a TEMPLATE for building a form.
+; Most of it is data to reproduce as-is, but ~x (unquote) splices in the value
+; of x, ~@xs (unquote-splicing) splices in each element of xs, and x# (auto-
+; gensym) becomes a fresh unique name, stable within one template. Plain
+; symbols resolve in the namespace that WROTE the template and are emitted
+; qualified, so a macro can name its own helpers.
+;
+; `synq` builds the Elixir tree that CONSTRUCTS the templated form at run time,
+; threading a gensym map g so repeated x# share one generated name.
+
+(declare synq)
+
+(defn- cons-cell
+  "An Elixir list-cons AST for `[head | tail]`. In Elixir's syntax tree a cons
+   is a one-element LIST holding a `|` node: `[{:|, [], [head, tail]}]`. The
+   list wrapper matters — it is what makes the nested result read as
+   `[a | [b | [c | []]]]`, the shape the answer key produces."
+  [head tail]
+  (list (ast-node :| (list head tail))))
+
+(defn- gensym-hash?
+  "Say whether a template symbol name ends in # (and is longer than one char),
+   the auto-gensym marker x#."
+  [name]
+  (and (> (count name) 1)
+       (= "#" (subs name (- (count name) 1) (count name)))))
+
+(defn- resolve-gensym
+  "Resolve an auto-gensym name x# to a stable generated name within a template.
+   Returns [resolved-name new-gensym-map]. A non-gensym name is unchanged. The
+   same x# twice yields the same name."
+  [name g]
+  (if (gensym-hash? name)
+    (if (contains? g name)
+      (list (get g name) g)
+      (let [base (subs name 0 (- (count name) 1))
+            gen (str base "__" (erlang/unique_integer (list :positive :monotonic)) "__auto")]
+        (list gen (assoc g name gen))))
+    (list name g)))
+
+(defn- owner-ns
+  "The namespace a var visible from ns actually lives in: ns itself when it is
+   defined there, otherwise the namespace that referred it in."
+  [ns name]
+  (if (BeamLisp.Env/local_var? ns name)
+    ns
+    (or (BeamLisp.Env/refer_source ns name) ns)))
+
+(defn- qualify-synq
+  "Resolve a plain template symbol to the name it should expand to. A name with
+   a slash, an auto-gensym, a special form, a template local, or a macro stays
+   bare. A var the writing namespace defines or refers is qualified with the
+   namespace that OWNS it. Anything else stays bare."
+  [name env]
+  (cond
+    (has-slash? name) name
+    (and (> (count name) 6)
+         (= "__auto" (subs name (- (count name) 6) (count name)))) name
+    (contains? special-forms name) name
+    (local? env name) name
+    (macro? env name) name
+    :else
+      (let [ns (:ns env)
+            r (BeamLisp.Env/fetch ns name)]
+        (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
+          (str (owner-ns ns name) "/" name)
+          name))))
+
+(defn- unquote-form?
+  "Say whether a form is (unquote x), a ~x splice point."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "unquote" (rn/node-name (rn/node-form (first items)))))))))
+
+(defn- splice-form?
+  "Say whether a form is (unquote-splicing x), a ~@x splice point."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "unquote-splicing" (rn/node-name (rn/node-form (first items)))))))))
+
+(defn- synq-list
+  "Build the constructor for a template list's items, right to left. Each
+   ordinary item is consed onto the growing tail; a ~@xs item splices its whole
+   sequence with BeamLisp.RT.splice. Returns [ast new-gensym-map]."
+  [items env g]
+  (reduce (fn [acc item]
+            (let [built-ast (first acc)
+                  gacc (second acc)]
+              (if (splice-form? item)
+                (let [x (second (rn/node-items (rn/node-form item)))]
+                  (list (ast-mod-call (list :BeamLisp :RT) :splice
+                                      (list (compile x (notail env)) built-ast))
+                        gacc))
+                (let [r (synq item env gacc)]
+                  (list (cons-cell (first r) built-ast) (second r))))))
+          (list (list) g)
+          (reverse items)))
+
+(defn- synq
+  "Build the Elixir tree that constructs one templated form at run time.
+   Returns [ast new-gensym-map]."
+  [form env g]
+  (let [f (rn/node-form form)
+        tag (rn/node-tag f)]
+    (cond
+      (unquote-form? form)
+        (list (compile (second (rn/node-items f)) (notail env)) g)
+      (= tag :list)
+        (synq-list (rn/node-items f) env g)
+      (= tag :vector)
+        (let [r (synq-list (rn/node-items f) env g)]
+          (list (ast-mod-call (list :BeamLisp :Vector) :new (list (first r))) (second r)))
+      (= tag :map)
+        (let [built (reduce (fn [acc pair]
+                              (let [k (kv-key pair) v (kv-val pair)
+                                    rk (synq k env (second acc))
+                                    rv (synq v env (second rk))]
+                                (list (cons (erlang/list_to_tuple (list (first rk) (first rv)))
+                                            (first acc))
+                                      (second rv))))
+                            (list (list) g)
+                            (rn/node-items f))]
+          (list (ast-node map-head (apply list (reverse (first built)))) (second built)))
+      (= tag :symbol)
+        (let [rg (resolve-gensym (rn/node-name f) g)
+              resolved (first rg)
+              g2 (second rg)]
+          (list (Macro/escape (rn/->tuple (list :symbol (qualify-synq resolved env)))) g2))
+      (= tag :keyword)
+        (list (erlang/binary_to_atom (rn/node-name f)) g)
+      :else (list f g))))
+
+(defn- compile-syntax-quote
+  "Compile a (syntax-quote form) into the tree that builds the templated form."
+  [form env]
+  (first (synq form env {})))
+
+; ---- def and defn (var linking) ----------------------------------------------
+
 ;
 ; `(def x value)` records a namespace variable. `(defn name [params] body)`
 ; records a FUNCTION variable, but not as a closure — it emits real Elixir
@@ -1230,6 +1442,55 @@
     ; entry shape Link.defvar wants: {kind, fixed-count, fname, def-ast}
     (erlang/list_to_tuple (list kind fixed-count fname def-ast))))
 
+(defn- macro-fn-form
+  "Build the anonymous-fn form for a macro's clauses.
+
+   A macro is really a function that receives the call FORM and the call-site
+   environment ahead of its declared parameters, so each clause's parameter
+   vector gets `&form` and `&env` prepended. The clauses are assembled into a
+   `(fn ...)`-shaped argument list for the ordinary fn compiler."
+  [clauses]
+  ; produce args shaped like the tail of (fn ([p...] body) ...): one
+  ; parenthesised clause per macro clause, with &form/&env prepended
+  (map (fn [c]
+         (let [params (:params c)
+               ; prepend &form and &env symbol nodes
+               new-params (concat (list (rn/sym-node "&form") (rn/sym-node "&env")) params)
+               body (:body c)
+               guard (:guard c)]
+           ; rebuild a clause form: (list [params...] :when guard? body...)
+           (rn/list-node
+             (concat (list (rn/->tuple (list :vector (apply list new-params))))
+                     (if (nil? guard)
+                       (apply list body)
+                       (concat (list (rn/->tuple (list :keyword "when")) guard) (apply list body)))))))
+       clauses))
+
+(defn- compile-defmacro
+  "Compile (defmacro name [params] body...) into the tree that records a macro.
+
+   A macro is a variable whose value is tagged `{:\"$macro\", fn}`. The function
+   is an ordinary compiled fn whose parameters are `&form`, `&env`, then the
+   declared parameters, so at expansion time it receives the call form, the
+   call-site environment, and the unevaluated arguments. It is interned like a
+   `def`."
+  [args env]
+  (let [name-form (rn/node-form (first args))
+        name (rn/node-name name-form)
+        rest-args (rest args)
+        after-doc (if (and (not (empty? rest-args))
+                           (erlang/is_binary (rn/node-form (first rest-args))))
+                    (rest rest-args)
+                    rest-args)
+        clauses (parse-fn-clauses after-doc)
+        fn-args (macro-fn-form clauses)
+        ; macro fns use nil-rest: a trailing `& body` is nil when empty
+        fn-ast (compile-fn* (apply list fn-args) true env)
+        macro-val (erlang/list_to_tuple
+                    (list tuple-head (list)
+                          (list (erlang/binary_to_atom "$macro") fn-ast)))]
+    (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name macro-val))))
+
 (defn- compile-defn
   "Compile (defn name [params] body...) — or its multi-clause form — into the
    tree that records a linked function variable.
@@ -1269,8 +1530,10 @@
     (= head "do") (compile-body args env)
     (= head "throw") (compile-throw (first args) env)
     (= head "quote") (compile-quote (first args))
+    (= head "syntax-quote") (compile-syntax-quote (first args) env)
     (= head "def") (compile-def (first args) (second args) env)
     (or (= head "defn") (= head "defn-")) (compile-defn args env)
+    (= head "defmacro") (compile-defmacro args env)
     (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
     (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
@@ -1309,16 +1572,25 @@
           ; symbols are namespace variables or remote references
           (compile-symbol name env))
 
-      ; a list is a special form or a call (an empty list is an empty list value)
+      ; a list is a special form, a macro call, or an ordinary call
+      ; (an empty list is just an empty list value)
       (= tag :list)
         (let [items (rn/node-items form)]
           (if (empty? items)
             (list)
-            (let [head (rn/node-form (first items))]
-              (if (and (= :symbol (rn/node-tag head))
-                       (contains? special-forms (rn/node-name head)))
-                (compile-special (rn/node-name head) (rest items) env)
-                (compile-call items env)))))
+            (let [head (rn/node-form (first items))
+                  name (if (= :symbol (rn/node-tag head)) (rn/node-name head) nil)]
+              (cond
+                ; a special form has its own rule
+                (and (some? name) (contains? special-forms name))
+                  (compile-special name (rest items) env)
+                ; a macro call: expand it once, then compile what it produced.
+                ; The arguments are NOT pre-compiled — a macro receives them as
+                ; data. `local?` names shadow macros, so a bound local wins.
+                (and (some? name) (not (local? env name)) (macro? env name))
+                  (compile (BeamLisp.Compiler/macroexpand_1 form (:ns env)) env)
+                ; an ordinary call
+                :else (compile-call items env)))))
 
       ; a plain number, string, boolean, or nil is already its own value
       :else form)))
