@@ -998,6 +998,14 @@
 ; Elixir patterns; the caller emits one clause per alternative, sharing one
 ; body. `compile-pattern` returns [alternatives env-with-bindings].
 
+(def ^:private max-pattern-alternatives
+  "The most Elixir clauses one beam-lisp pattern may expand into before the
+   compiler refuses it. A vector pattern matches both a tuple and a vector, so
+   alternatives double per nesting level; this ceiling (64) stops a deeply
+   nested pattern from generating an explosion of clauses. Matches the genesis
+   `@max_pattern_alternatives`."
+  64)
+
 (declare compile-pattern)
 
 (defn- pattern-product
@@ -1013,6 +1021,22 @@
                       {:alts (list) :env env}
                       forms)
         alt-lists (:alts built)
+        ; count the product BEFORE building it. A vector pattern matches both a
+        ; tuple and a beam-lisp vector, so each nesting level DOUBLES the count;
+        ; seven levels deep is 128 combinations. Multiplying the child lengths
+        ; answers 'how big would this get?' for a few integers, so an over-large
+        ; pattern is refused instantly instead of exhausting the compiler while
+        ; building the very list whose size is illegal. Mirrors the genesis
+        ; `compile_alternatives` ceiling (max-pattern-alternatives).
+        product-count (reduce (fn [n alts] (* n (count alts))) 1 alt-lists)
+        _ (if (> product-count max-pattern-alternatives)
+            (compile-error env
+              (str "this pattern nests too deeply: a vector pattern matches both a tuple and a "
+                   "beam-lisp vector, and those alternatives multiply through nesting, so "
+                   product-count " clauses would be generated (the ceiling is "
+                   max-pattern-alternatives "). Match the outer shape and destructure the "
+                   "rest in the body with `let`."))
+            nil)
         ; cartesian product of the alternative lists
         combos (reduce (fn [acc alts]
                          (apply list
@@ -1043,21 +1067,34 @@
         (list (list (erlang/binary_to_atom (rn/node-name f))) env)
       (= tag :vector)
         (let [pr (pattern-product (rn/node-items f) env)
-              combos (first pr)]
-          (list (apply list
-                  (mapcat (fn [pats]
-                            (let [tuple-pat (erlang/list_to_tuple (list tuple-head (list) (apply list pats)))
-                                  ; in a PATTERN the alias carries plain `[]`
-                                  ; metadata, not `[alias: false]`
-                                  vec-alias (erlang/list_to_tuple
-                                              (list :__aliases__ (list) (list :BeamLisp :Vector)))
-                                  vector-pat (ast-node struct-head
-                                                       (list vec-alias
-                                                             (ast-node map-head
-                                                                       (list (erlang/list_to_tuple (list :items tuple-pat))))))]
-                              (list tuple-pat vector-pat)))
-                          combos))
-                (second pr)))
+              combos (first pr)
+              alts (apply list
+                     (mapcat (fn [pats]
+                               (let [tuple-pat (erlang/list_to_tuple (list tuple-head (list) (apply list pats)))
+                                     ; in a PATTERN the alias carries plain `[]`
+                                     ; metadata, not `[alias: false]`
+                                     vec-alias (erlang/list_to_tuple
+                                                 (list :__aliases__ (list) (list :BeamLisp :Vector)))
+                                     vector-pat (ast-node struct-head
+                                                          (list vec-alias
+                                                                (ast-node map-head
+                                                                          (list (erlang/list_to_tuple (list :items tuple-pat))))))]
+                                 (list tuple-pat vector-pat)))
+                             combos))]
+          ; a vector matches a tuple OR a beam-lisp vector, so this doubles the
+          ; child count. Refuse once the doubled alternatives cross the ceiling
+          ; — the check the product-count in `pattern-product` cannot see,
+          ; because the doubling happens HERE. Mirrors the genesis per-pattern
+          ; `compile_pattern` length gate.
+          (if (> (count alts) max-pattern-alternatives)
+            (compile-error env
+              (str "this pattern nests too deeply: a vector pattern matches both a tuple and a "
+                   "beam-lisp vector, and those alternatives multiply through nesting, so "
+                   (count alts) " clauses would be generated (the ceiling is "
+                   max-pattern-alternatives "). Match the outer shape and destructure the "
+                   "rest in the body with `let`."))
+            nil)
+          (list alts (second pr)))
       (= tag :map)
         (let [kvs (rn/node-items f)
               keys (apply list (map (fn [pair]
@@ -1146,16 +1183,20 @@
   "Group a receive's forms into {pattern guard body} triples.
 
    Each clause is a pattern, an optional `:when guard`, then a single body
-   form. Returns a list of {:pattern :guard :body}."
-  [forms]
+   form. Returns a list of {:pattern :guard :body}. A clause whose `:when`
+   guard has no body form after it is refused (`env` carries the position)."
+  [forms env]
   (loop [fs forms acc (list)]
     (if (empty? fs)
       (reverse acc)
       (let [pattern (first fs)
             after-pat (rest fs)
-            gb (split-when after-pat)          ; [guard-or-nil rest]
+            gb (split-when after-pat env)      ; [guard-or-nil rest]
             guard (first gb)
             body-and-more (second gb)
+            _ (if (and (some? guard) (empty? body-and-more))
+                (compile-error env "a receive clause needs a body after its `:when` guard")
+                nil)
             body (first body-and-more)]
         (recur (rest body-and-more)
                (cons {:pattern pattern :guard guard :body body} acc))))))
@@ -1170,7 +1211,7 @@
   [forms env]
   (let [after-forms (filter after-clause-form? forms)
         normal (filter (fn [f] (not (after-clause-form? f))) forms)
-        clauses (receive-clause-forms normal)
+        clauses (receive-clause-forms normal env)
         ; each clause -> one -> node per pattern alternative
         do-clauses (apply list
                      (mapcat (fn [cl]
@@ -1421,6 +1462,18 @@
 
 (declare compile-guard)
 
+(defn- guard-vocabulary
+  "The guard vocabulary as a human-readable, comma-separated, backtick-quoted
+   list — every allowed predicate/operator name, sorted. Named in the
+   'not allowed in a guard' error so the reader learns what a guard MAY call
+   instead of just what it may not. Matches the genesis `guard_vocabulary`."
+  []
+  (let [names (lists/sort (apply list (concat (maps/keys guard-bifs) (list "and" "or" "not"))))]
+    (reduce (fn [acc n]
+              (let [quoted (str "`" n "`")]
+                (if (= acc "") quoted (str acc ", " quoted))))
+            "" names)))
+
 (defn- compile-guard-list
   "Compile a guard call `(op args...)` into a guard-safe tree.
 
@@ -1447,7 +1500,10 @@
             (erl-call (second entry) (nth entry 2) arg-asts)
             (guard-special (second entry) arg-asts)))
       :else
-        (compile-error env (str "`" name "` is not allowed in a guard")))))
+        (compile-error env
+          (str "`" name "` is not allowed in a guard. The BEAM evaluates guards without "
+               "calling user code, so only side-effect-free tests are permitted: "
+               (guard-vocabulary) ". Move the rest into the clause body.")))))
 
 (defn- compile-guard
   "Compile one guard expression into a guard-safe Elixir tree.
@@ -1467,6 +1523,22 @@
       (= tag :keyword) (erlang/binary_to_atom (rn/node-name f))
       (= tag :list) (compile-guard-list (rn/node-items f) env)
       :else f)))
+
+(defn- guardable-env
+  "Narrow an env so a guard may read ONLY the variables the clause head binds.
+
+   A BEAM guard runs BEFORE the body, so it can see the head's own parameters
+   but NOT a destructured name (those are bound by a body prelude that has not
+   run yet) nor any outer local. `head-vars` is the list of parameter var-ASTs
+   in the clause head; this keeps only the `:locals` entries whose variable is
+   one of them, so a guard reading a destructured or unbound name is refused
+   with 'not bound by this clause's pattern' instead of leaking an undefined
+   variable from generated Elixir. Mirrors the genesis `guardable_env`."
+  [env head-vars]
+  (let [head-set (into #{} head-vars)]
+    (assoc env :locals
+           (maps/filter (fn [_name var] (contains? head-set var))
+                        (:locals env)))))
 
 (defn- amp-node?
   "Say whether a param node is the `&` marking the start of a rest parameter."
@@ -1597,11 +1669,14 @@
                                        (list body-ast)))))
         ; a :when guard wraps the clause head as {:when, [], params ++ [guard]},
         ; compiled in the restricted guard dialect against the head's variables
+        ; a guard reads only the head's parameter variables (guardable-env),
+        ; so a destructured or unbound name in the guard is refused rather than
+        ; leaking an undefined variable from the generated clause head.
         head (if (nil? guard)
                params
                (list (ast-node :when
                                (apply list (concat params
-                                                   (list (compile-guard guard body-env)))))))]
+                                                   (list (compile-guard guard (guardable-env body-env params))))))))]
     {:shape (clause-shape param-forms)
      :clause (ast-node :-> (list head full-body))}))
 
@@ -1609,12 +1684,18 @@
   "Split a clause's forms into [guard body] at a leading `:when`.
 
    `(:when g rest...)` -> [g (rest...)]; forms with no `:when` -> [nil forms].
-   The guard is the test that must hold before the body runs."
-  [forms]
+   The guard is the test that must hold before the body runs. A DANGLING
+   `:when` — one with no guard expression after it — is refused here (rather
+   than silently read as a body form) so `(defn f [x] :when)` is a clear
+   compile error, not a mysterious runtime one. `env` carries the source
+   position for that error."
+  [forms env]
   (if (and (not (empty? forms))
            (= :keyword (rn/node-tag (rn/node-form (first forms))))
            (= "when" (rn/node-name (rn/node-form (first forms)))))
-    (list (second forms) (rest (rest forms)))
+    (if (empty? (rest forms))
+      (compile-error env "`:when` must be followed by a guard expression")
+      (list (second forms) (rest (rest forms))))
     (list nil forms)))
 
 (defn- parse-fn-clauses
@@ -1624,17 +1705,26 @@
    several clauses each wrapped in parentheses
    `(fn ([params] :when guard body...) ([params] body...))`. A clause may
    carry a `:when` guard between its parameters and its body. Returns a list
-   of {:params param-forms :guard guard-or-nil :body body-forms}."
-  [args]
-  (let [first-arg (rn/node-form (first args))]
+   of {:params param-forms :guard guard-or-nil :body body-forms}. A guarded
+   clause with a guard but NO body after it is refused, so
+   `(defn f [x] :when (int? x))` is a clear compile error. `env` carries the
+   source position for these errors."
+  [args env]
+  (let [first-arg (rn/node-form (first args))
+        check-body (fn [guard body]
+                     (if (and (some? guard) (empty? body))
+                       (compile-error env "a guarded clause needs a body after its `:when` guard")
+                       nil))]
     (if (= :vector (rn/node-tag first-arg))
       ; single inline clause
-      (let [gb (split-when (rest args))]
+      (let [gb (split-when (rest args) env)]
+        (check-body (first gb) (second gb))
         (list {:params (rn/node-items first-arg) :guard (first gb) :body (second gb)}))
       ; several parenthesised clauses
       (map (fn [clause]
              (let [items (rn/node-items (rn/node-form clause))
-                   gb (split-when (rest items))]
+                   gb (split-when (rest items) env)]
+               (check-body (first gb) (second gb))
                {:params (rn/node-items (rn/node-form (first items)))
                 :guard (first gb) :body (second gb)}))
            args))))
@@ -1708,7 +1798,7 @@
         fn-name (if (= :symbol (rn/node-tag first-arg))
                   (rn/node-name first-arg) nil)
         clause-args (if (nil? fn-name) args (rest args))
-        clauses (parse-fn-clauses clause-args)
+        clauses (parse-fn-clauses clause-args env)
         ; one shared self variable per distinct shape (all clauses of a shape
         ; recur into the same dispatcher)
         shapes (distinct (map (fn [c] (clause-shape (:params c))) clauses))
@@ -2300,7 +2390,7 @@
       ; (handle-call PATTERN [params...] body...) with an optional :when guard
       (let [pat-form (first rest-forms)
             after-pat (rest rest-forms)
-            gb (split-when after-pat)
+            gb (split-when after-pat env)
             guard (first gb)
             rest2 (second gb)
             params-form (first rest2)
@@ -2648,7 +2738,10 @@
                                               (ast-node := (list (first step) (second step))))
                                             prelude-steps)
                                        (list body-ast)))))
-        guard-ast (if (nil? guard) nil (compile-guard guard body-env))
+        ; a guard sees ONLY the head's parameter variables — not the
+        ; destructured names bound by the body prelude, which have not run when
+        ; the BEAM evaluates the guard.
+        guard-ast (if (nil? guard) nil (compile-guard guard (guardable-env body-env params)))
         ; the clause head: fname(params), guarded if needed
         head (ast-node fname params)
         def-ast (ast-node :def (list (guarded-def-head head guard-ast)
@@ -2698,7 +2791,7 @@
                      (not (empty? (rest rest-args))))
         doc (if has-doc (rn/node-form (first rest-args)) nil)
         after-doc (if has-doc (rest rest-args) rest-args)
-        clauses (parse-fn-clauses after-doc)
+        clauses (parse-fn-clauses after-doc env)
         fn-args (macro-fn-form clauses)
         ; macro fns use nil-rest: a trailing `& body` is nil when empty
         fn-ast (compile-fn* (apply list fn-args) true env)
@@ -2867,7 +2960,7 @@
               (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
             :else nil)
         mod (BeamLisp.Link/module_for (:ns env))
-        clauses (parse-fn-clauses after-attr)
+        clauses (parse-fn-clauses after-attr env)
         entries (apply list
                   (map (fn [c]
                          (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
