@@ -60,6 +60,37 @@ pub enum KeyVal<'a> {
     Bool(bool),
 }
 
+/// Append one value's key bytes to `out`, in place. Returns false (and leaves
+/// `out` in an unspecified state the caller discards) when the value is out of
+/// lane. The in-place form is for the BATCH path, which builds one key across
+/// several components without an allocation per component.
+pub fn encode_into(v: &KeyVal, out: &mut Vec<u8>) -> bool {
+    match v {
+        KeyVal::Bool(false) => out.push(TAG_FALSE),
+        KeyVal::Bool(true) => out.push(TAG_TRUE),
+        KeyVal::Int(n) => {
+            if *n <= MAX_EXACT_INT && *n >= -MAX_EXACT_INT {
+                out.push(TAG_NUM);
+                out.extend_from_slice(&encode_float(*n as f64));
+                out.push(1);
+            } else {
+                return false;
+            }
+        }
+        KeyVal::Str(bytes) => {
+            out.push(TAG_STR);
+            escape_nul(bytes, out);
+            out.push(0);
+        }
+        KeyVal::Keyword(bytes) => {
+            out.push(TAG_KEYWORD);
+            escape_nul(bytes, out);
+            out.push(0);
+        }
+    }
+    true
+}
+
 /// Encode one value to its order-preserving key bytes, byte-identical to
 /// codec.bl. Returns None only for an Int past 2^53 (the bignum tie-break lane),
 /// which the caller routes to the bl codec.

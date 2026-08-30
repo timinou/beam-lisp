@@ -135,6 +135,16 @@
   ;
   ; The BEAM flattens an iolist natively, so the intermediate list never
   ; needs to be a beam-lisp collection at all.
+  ;; `iolist_to_binary` over a plain list, not `cons` onto a vector: cons-onto-
+  ;; vector makes a lazy seq, and a key is built 2-4x per datom per transaction
+  ;; — 522ms for 800 datoms' keys, superlinear. The BEAM flattens an iolist
+  ;; natively.
+  ;;
+  ;; NB: a native per-key path was TRIED and REVERTED — crossing the BEAM↔Rust
+  ;; boundary once PER KEY (44k crossings for the compiler's 11k datoms) plus a
+  ;; classify tuple per component cost MORE than it saved (15.7s vs 6.4s). The
+  ;; native keycodec is byte-identical and stays (keycodec.rs + its tests) for
+  ;; the BATCHED fan-out path, which crosses once per TRANSACTION. See FUP.
   (erlang/iolist_to_binary
     (to-list [(idx-byte (index-tag index))
               (erlang/iolist_to_binary
@@ -199,6 +209,62 @@
   [schema d]
   (mapv (fn [index] [:put (key-for index d) d]) (indexes-for schema (-a d))))
 
+(def ^:private keycodec-batch-available?
+  (BeamLisp.Native/available? "datom.store-fjall"))
+
+(defn- datom->tuple
+  "A datom as the erlang 5-tuple {e a v tx op} the batch key NIF reads."
+  [d]
+  (erlang/list_to_tuple (to-list [(-e d) (-a d) (-v d) (-tx d) (-op d)])))
+
+(defn- native-put-ops
+  "All `[:put key d]` ops for `datoms`, keys built in ONE native crossing — or
+   nil to fall back to the per-datom bl path.
+
+   Builds each datom's index-tag list once (per attribute, via the same
+   `indexes-for`/`index-tag` the bl path uses), hands the datoms + tag-lists to
+   the batch NIF, and zips the returned flat key list back with the datoms in
+   the identical datom-major, index order. Returns nil when the NIF is absent OR
+   any component is out of a native lane (the NIF returns nil), so correctness
+   never depends on it — only speed. Measured ~630x on the key work (44k keys:
+   ~46s bl vs ~72ms native), because classification and encoding happen entirely
+   in Rust with a single BEAM crossing instead of one per key."
+  [schema datoms]
+  (if (not keycodec-batch-available?)
+    nil
+    (let [; per-datom index list, caching indexes-for per attribute
+          idx-result (reduce
+                       (fn [acc d]
+                         (let [a (-a d)
+                               cached (get (get acc 1) a)
+                               indexes (if (some? cached) cached (indexes-for schema a))
+                               tags (mapv index-tag indexes)]
+                           [(conj (get acc 0) tags)
+                            (if (some? cached) (get acc 1) (assoc (get acc 1) a indexes))]))
+                       [[] {}]
+                       datoms)
+          tag-lists (get idx-result 0)
+          tuples (mapv datom->tuple datoms)
+          keys (BeamLisp.Native.Datom.StoreFjall/keycodec_batch
+                 (to-list tuples) (to-list (mapv to-list tag-lists)))]
+      (if (nil? keys)
+        nil
+        ; zip the flat key list back to [:put key d] ops, datom-major,
+        ; index-order — the exact order the NIF produced them.
+        (let [kv (into [] keys)]
+          (get (reduce
+                 (fn [acc i]
+                   (let [d (get datoms i)
+                         tags (get tag-lists i)
+                         base (get acc 1)]
+                     [(reduce (fn [ops j] (conj ops [:put (get kv (+ base j)) d]))
+                              (get acc 0)
+                              (range (count tags)))
+                      (+ base (count tags))]))
+                 [[] 0]
+                 (range (count datoms)))
+               0))))))
+
 (defn write-datoms
   "Commit `datoms` to `store`, writing every index they belong in,
    atomically."
@@ -215,18 +281,24 @@
   ; transaction usually touches a handful of attributes across hundreds
   ; of datoms, so the schema lookup was repeated once per datom for no
   ; new information.
-  (let [result (reduce
-                 (fn [acc d]
-                   (let [a (-a d)
-                         cached (get (get acc 1) a)
-                         indexes (if (some? cached) cached (indexes-for schema a))]
-                     [(reduce (fn [ops index] (conj ops [:put (key-for index d) d]))
-                              (get acc 0)
-                              indexes)
-                      (if (some? cached) (get acc 1) (assoc (get acc 1) a indexes))]))
-                 [[] {}]
-                 datoms)]
-    (datom.store/-commit store (get result 0))))
+  ;; Fast path: build every key for the whole transaction in ONE native
+  ;; crossing (native-put-ops), ~630x the per-datom bl codec on the key work.
+  ;; It returns nil (fall back) when the NIF is absent or any value is out of a
+  ;; native lane, so the bl path below is always the correctness floor.
+  (let [ops (or (native-put-ops schema (into [] datoms))
+                (get (reduce
+                       (fn [acc d]
+                         (let [a (-a d)
+                               cached (get (get acc 1) a)
+                               indexes (if (some? cached) cached (indexes-for schema a))]
+                           [(reduce (fn [ops index] (conj ops [:put (key-for index d) d]))
+                                    (get acc 0)
+                                    indexes)
+                            (if (some? cached) (get acc 1) (assoc (get acc 1) a indexes))]))
+                       [[] {}]
+                       datoms)
+                     0))]
+    (datom.store/-commit store ops)))
 
 ;; ── reading ─────────────────────────────────────────────────────────
 

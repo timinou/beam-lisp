@@ -317,6 +317,154 @@ fn str_atom() -> Atom { lane_atoms::str() }
 fn kw_atom() -> Atom { lane_atoms::kw() }
 fn bool_atom() -> Atom { lane_atoms::boolean() }
 
+/// Build a WHOLE index key from `idx_tag` and the datom's components already
+/// ordered for that index, each pre-classified by the caller as one of the four
+/// bulk lanes. `comps` is a list of `{lane_tag, ival, sval, bval}` tuples (the
+/// caller reads the datom's [e a v tx op] and tags each). The key is
+///   [idx_tag] ++ concat(encode(component))
+/// byte-identical to codec.bl's `key-for`. Returns the key binary, or `nil` if
+/// ANY component is out of lane — then the caller builds that one key with the
+/// bl codec. One BEAM crossing per key (not one per component).
+#[rustler::nif]
+fn keycodec_key<'a>(env: Env<'a>, idx_tag: u8, comps: Vec<Term<'a>>) -> NifResult<Term<'a>> {
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    out.push(idx_tag);
+    for c in comps {
+        let t = rustler::types::tuple::get_tuple(c)?;
+        if t.len() != 4 {
+            return Err(err("a component must be {lane, ival, sval, bval}"));
+        }
+        let lane: Atom = t[0].decode()?;
+        let kv = if lane == int_atom() {
+            KeyVal::Int(t[1].decode()?)
+        } else if lane == str_atom() {
+            let b: Binary = t[2].decode()?;
+            match keycodec::encode(&KeyVal::Str(b.as_slice())) {
+                Some(bytes) => { out.extend_from_slice(&bytes); continue; }
+                None => return Ok(atoms::nil().to_term(env)),
+            }
+        } else if lane == kw_atom() {
+            let b: Binary = t[2].decode()?;
+            match keycodec::encode(&KeyVal::Keyword(b.as_slice())) {
+                Some(bytes) => { out.extend_from_slice(&bytes); continue; }
+                None => return Ok(atoms::nil().to_term(env)),
+            }
+        } else if lane == bool_atom() {
+            KeyVal::Bool(t[3].decode()?)
+        } else {
+            return Ok(atoms::nil().to_term(env));
+        };
+        match keycodec::encode(&kv) {
+            Some(bytes) => out.extend_from_slice(&bytes),
+            None => return Ok(atoms::nil().to_term(env)),
+        }
+    }
+    Ok(to_binary(env, &out)?.to_term(env))
+}
+
+/// Classify a raw BEAM datom-component term into a KeyVal, inspecting the term
+/// type in Rust (so the caller does NOT allocate a classify tuple per component
+/// — that per-component allocation is what made a per-key path lose). Returns
+/// None for a term outside the four bulk lanes. `owned` collects any binary we
+/// must materialise (atom names) so its slice outlives the KeyVal.
+fn classify_term<'a>(t: Term<'a>) -> Option<ClassifiedVal> {
+    use rustler::TermType;
+    match t.get_type() {
+        TermType::Integer => t.decode::<i64>().ok().map(ClassifiedVal::Int),
+        TermType::Binary => t.decode::<Binary>().ok().map(|b| ClassifiedVal::Str(b.as_slice().to_vec())),
+        TermType::Atom => {
+            // true/false are atoms -> bool lane; any other atom -> keyword name.
+            let name: String = t.atom_to_string().ok()?;
+            match name.as_str() {
+                "true" => Some(ClassifiedVal::Bool(true)),
+                "false" => Some(ClassifiedVal::Bool(false)),
+                _ => Some(ClassifiedVal::Keyword(name.into_bytes())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// An owned classification (owns its bytes so it lives past term decoding).
+enum ClassifiedVal {
+    Int(i64),
+    Str(Vec<u8>),
+    Keyword(Vec<u8>),
+    Bool(bool),
+}
+impl ClassifiedVal {
+    fn as_keyval(&self) -> KeyVal {
+        match self {
+            ClassifiedVal::Int(n) => KeyVal::Int(*n),
+            ClassifiedVal::Str(b) => KeyVal::Str(b),
+            ClassifiedVal::Keyword(b) => KeyVal::Keyword(b),
+            ClassifiedVal::Bool(b) => KeyVal::Bool(*b),
+        }
+    }
+}
+
+/// The component order for an index tag, as indices into a datom `[e a v tx op]`
+/// (0=e 1=a 2=v 3=tx 4=op). Matches datom.index/index-components.
+fn index_order(idx_tag: u8) -> Option<[usize; 5]> {
+    match idx_tag {
+        1 => Some([0, 1, 2, 3, 4]), // EAVT
+        2 => Some([1, 0, 2, 3, 4]), // AEVT
+        3 => Some([1, 2, 0, 3, 4]), // AVET
+        4 => Some([2, 1, 0, 3, 4]), // VAET
+        _ => None,
+    }
+}
+
+/// BATCH key encoding: the whole transaction's keys in ONE crossing.
+///
+/// `datoms` is a list of `{e, a, v, tx, op}` 5-tuples (raw BEAM terms). `idx_lists`
+/// is a parallel list: for datom i, the list of index tags (1-4) it must be
+/// written into (the schema decided that on the bl side, cheaply, per-attribute).
+/// Returns a flat list of key binaries in datom-major, index-order — exactly the
+/// order `write-datoms` would produce — or `nil` if ANY component is out of lane
+/// (then the caller builds the whole batch with the bl codec). One crossing, no
+/// per-component BEAM allocation: classification and encoding are entirely native.
+#[rustler::nif]
+fn keycodec_batch<'a>(
+    env: Env<'a>,
+    datoms: Vec<Term<'a>>,
+    idx_lists: Vec<Vec<u8>>,
+) -> NifResult<Term<'a>> {
+    if datoms.len() != idx_lists.len() {
+        return Err(err("datoms and idx_lists must be the same length"));
+    }
+    let mut keys: Vec<Term<'a>> = Vec::with_capacity(datoms.len() * 4);
+    for (d, idxs) in datoms.iter().zip(idx_lists.iter()) {
+        let fields = rustler::types::tuple::get_tuple(*d)?;
+        if fields.len() != 5 {
+            return Err(err("a datom must be a 5-tuple {e a v tx op}"));
+        }
+        // classify all five components once per datom
+        let mut classified: Vec<ClassifiedVal> = Vec::with_capacity(5);
+        for f in &fields {
+            match classify_term(*f) {
+                Some(cv) => classified.push(cv),
+                None => return Ok(atoms::nil().to_term(env)), // out of lane: whole batch to bl
+            }
+        }
+        for &idx_tag in idxs {
+            let order = match index_order(idx_tag) {
+                Some(o) => o,
+                None => return Err(err("unknown index tag")),
+            };
+            let mut buf: Vec<u8> = Vec::with_capacity(48);
+            buf.push(idx_tag);
+            for &pos in &order {
+                if !keycodec::encode_into(&classified[pos].as_keyval(), &mut buf) {
+                    return Ok(atoms::nil().to_term(env));
+                }
+            }
+            keys.push(to_binary(env, &buf)?.to_term(env));
+        }
+    }
+    Ok(keys.encode(env))
+}
+
 /// A marker the host module only has once the NIF has replaced its stubs.
 #[rustler::nif]
 fn __nif_loaded__() -> bool {
