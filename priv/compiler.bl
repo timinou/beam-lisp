@@ -123,15 +123,55 @@
 
    `:locals` starts empty: at the top level nothing is bound locally, so every
    name is a namespace variable until a `let` or a function parameter adds to
-   it."
+   it. `:recur` is nil until a `loop` (or, later, a function) sets a target for
+   `recur` to jump back to. `:tail` says whether the form being compiled is in
+   tail position — the last thing its enclosing body does — which is where
+   `recur` is allowed."
   [ns]
-  {:ns ns :locals #{}})
+  {:ns ns :locals {} :recur nil :tail true})
 
 (defn- local?
   "Say whether `name` is bound locally in this environment (a parameter or a
    let binding), as opposed to being a namespace variable."
   [env name]
   (contains? (:locals env) name))
+
+(defn- local-var
+  "The Elixir variable a local `name` was bound to in this environment."
+  [env name]
+  (get (:locals env) name))
+
+(defn- put-local
+  "Add a local binding `name` -> Elixir variable `var` to the environment,
+   returning the updated environment."
+  [env name var]
+  (assoc env :locals (assoc (:locals env) name var)))
+
+(defn- notail
+  "A copy of the environment with tail position turned OFF.
+
+   Arguments to a call, the test of an `if`, and the non-last forms of a body
+   are not in tail position, so `recur` is not allowed there. Threading this
+   env into those places is what makes `recur must be in tail position` fire
+   exactly where it should."
+  [env]
+  (assoc env :tail false))
+
+(def ^:private var-context (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Compiler"))
+
+(defn- fresh-var
+  "Invent a brand-new Elixir variable node for a local binding named `base`.
+
+   Every `let` binding and loop parameter needs its own unique Elixir
+   variable, so nested bindings of the same source name do not collide. The
+   node shape is {unique-name, [], context}: a unique atom (base plus a number
+   that never repeats), empty metadata, and a context atom that marks it as a
+   compiler-made variable. The exact number does not matter — the differential
+   oracle compares local variables by role, not by name."
+  [base]
+  (let [n (erlang/unique_integer (list :positive :monotonic))
+        name (erlang/binary_to_atom (str base "_" n))]
+    (erlang/list_to_tuple (list name (list) var-context))))
 
 (defn- compile-each
   "Compile a sequence of forms and return the results as a PLAIN list.
@@ -142,6 +182,23 @@
    plain list the tree needs."
   [forms env]
   (apply list (map (fn [f] (compile f env)) forms)))
+
+(defn- compile-each-notail
+  "Compile a sequence of forms with tail position turned off, as a plain list.
+   Used for call and recur arguments, which are never in tail position."
+  [forms env]
+  (apply list (map (fn [f] (compile f (notail env))) forms)))
+
+(defn- compile-quote
+  "Turn (quote form) into the DATA the form denotes, as a literal.
+
+   `quote` says ‘do not evaluate this, hand it back as data’. A quoted symbol
+   becomes its reader node, a quoted list becomes a list of the quoted items,
+   and a quoted literal is just itself. The result is the plain reader data
+   with source-location wrappers removed — the same shape the reader would give
+   for the datum."
+  [form]
+  (quoted-datum form))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Small helpers over reader forms and text
@@ -199,6 +256,9 @@
    `name` is the symbol's text; `env` says which namespace to resolve against."
   [name env]
   (cond
+    ; a local (let binding or parameter) resolves to its Elixir variable
+    (local? env name)
+      (local-var env name)
     (has-slash? name)
       (let [[prefix fun] (split-slash name)]
         ; Module/fun (or erlang-module/fun) as a VALUE: a remote function
@@ -308,7 +368,9 @@
   [items env]
   (let [head (rn/node-form (first items))
         args (rest items)
-        arg-asts (compile-each args env)
+        ; call arguments are never in tail position — a recur inside an
+        ; argument is an error, so compile them with tail turned off
+        arg-asts (compile-each-notail args env)
         tag (rn/node-tag head)]
     (cond
       ; (:keyword m ...) — the keyword looks itself up in its argument
@@ -342,6 +404,167 @@
 ; The one entry point
 ; ─────────────────────────────────────────────────────────────────────────────
 
+(def special-forms
+  "The names the compiler treats as special forms rather than function calls.
+   A list whose head is one of these is compiled by its own rule."
+  #{"if" "do" "throw" "quote" "let" "let*" "loop" "loop*" "recur"})
+
+(defn- compile-body
+  "Compile body forms into one Elixir tree (a single form, or a __block__)."
+  [body env]
+  (cond
+    (empty? body) nil
+    (empty? (rest body)) (compile (first body) env)
+    :else (ast-node :__block__ (apply list (map (fn [f] (compile f env)) body)))))
+
+(defn- compile-if
+  "Turn (if test then else) into the Elixir if tree."
+  [test then else env]
+  (let [test-ast (compile test env)
+        then-ast (compile then env)
+        else-ast (if (nil? else) nil (compile else env))]
+    (ast-node :if (list test-ast
+                        (list (erlang/list_to_tuple (list :do then-ast))
+                              (erlang/list_to_tuple (list :else else-ast)))))))
+
+(defn- nest-lets
+  "Wrap body-ast in one immediately-called function per binding step."
+  [steps body-ast]
+  (reduce (fn [inner step]
+            (let [var (first step) arg-ast (second step)
+                  fn-ast (ast-node :fn (list (ast-node :-> (list (list var) inner))))]
+              (ast-node (erlang/list_to_tuple (list :. (list) (list fn-ast))) (list arg-ast))))
+          body-ast (reverse steps)))
+
+(defn- self-apply
+  "Build the self-application scaffold a loop uses to call itself."
+  [self inner-fn]
+  (let [outer-fn (ast-node :fn (list (ast-node :-> (list (list self) inner-fn))))]
+    (ast-node (erlang/list_to_tuple (list :. (list) (list outer-fn))) (list outer-fn))))
+
+(defn- compile-recur
+  "Turn (recur value ...) into a jump back to the enclosing loop start."
+  [args env]
+  (let [target (:recur env)]
+    (cond
+      (nil? target) (throw "recur used with no enclosing loop or fn")
+      (not (:tail env)) (throw "recur must be in tail position")
+      (not= (count args) (:arity target)) (throw "recur arity mismatch")
+      :else
+        (let [arg-asts (compile-each-notail args env)
+              self (:self target)
+              self-app (ast-node (erlang/list_to_tuple (list :. (list) (list self))) (list self))]
+          (ast-node (erlang/list_to_tuple (list :. (list) (list self-app))) arg-asts)))))
+
+(defn- binding-pairs
+  "Split a binding vector's items into [pattern value] pairs."
+  [items]
+  (if (odd? (count items))
+    (throw "binding forms must be even, each a pattern and a value")
+    (loop [xs items acc (list)]
+      (if (empty? xs)
+        (reverse acc)
+        (recur (rest (rest xs)) (cons (list (first xs) (second xs)) acc))))))
+
+(defn- compile-let
+  "Turn (let [name value ...] body...) into nested immediately-called fns."
+  [bindings-form body env]
+  (let [items (rn/node-items (rn/node-form bindings-form))
+        pairs (binding-pairs items)
+        result (reduce
+                 (fn [acc pair]
+                   (let [e (:env acc)
+                         pat (rn/node-form (first pair))
+                         init-ast (compile (second pair) e)
+                         name (rn/node-name pat)
+                         var (fresh-var name)]
+                     {:steps (cons (list var init-ast) (:steps acc))
+                      :env (put-local e name var)}))
+                 {:steps (list) :env env} pairs)
+        final-env (:env result)
+        steps (reverse (:steps result))
+        body-ast (compile-body body final-env)]
+    (nest-lets steps body-ast)))
+
+(defn- compile-loop
+  "Turn (loop [name value ...] body...) into a self-re-entrant function."
+  [bindings-form body env]
+  (let [items (rn/node-items (rn/node-form bindings-form))
+        pairs (binding-pairs items)
+        built (reduce
+                (fn [acc pair]
+                  (let [pat (rn/node-form (first pair))
+                        name (rn/node-name pat)
+                        var (fresh-var name)]
+                    {:params (cons var (:params acc))
+                     :args (cons (compile (second pair) env) (:args acc))
+                     :env (put-local (:env acc) name var)}))
+                {:params (list) :args (list) :env env} pairs)
+        params (reverse (:params built))
+        arg-asts (reverse (:args built))
+        self (fresh-var "loop")
+        loop-env (assoc (:env built) :recur {:self self :arity (count params)} :tail true)
+        body-ast (compile-body body loop-env)
+        inner-fn (ast-node :fn (list (ast-node :-> (list params body-ast))))
+        self-applied (self-apply self inner-fn)]
+    (ast-node (erlang/list_to_tuple (list :. (list) (list self-applied))) arg-asts)))
+
+(defn- compile-throw
+  "Turn (throw x) into BeamLisp.ExInfo.raise_payload(x)."
+  [x env]
+  (ast-mod-call (list :BeamLisp :ExInfo) :raise_payload (list (compile x env))))
+
+(defn- datum
+  "Turn a reader form into the plain DATA value it denotes.
+
+   This is what `quote` hands back: the form as data, not as running code. A
+   symbol stays a symbol node, a list becomes a list of data, a vector becomes
+   a real beam-lisp vector, a keyword becomes its atom, and a plain literal is
+   itself. Source-location wrappers are peeled first."
+  [form]
+  (let [tag (rn/node-tag form)]
+    (cond
+      (= tag :meta) (datum (rn/node-form form))
+      (= tag :symbol) form
+      (= tag :keyword) (erlang/binary_to_atom (rn/node-name form))
+      (= tag :list) (apply list (map datum (rn/node-items form)))
+      (= tag :vector) (BeamLisp.Vector/new (apply list (map datum (rn/node-items form))))
+      (= tag :set) (BeamLisp.Set/new (apply list (map datum (rn/node-items form))))
+      (= tag :map)
+        ; build a plain map value from the key/value data; :maps.from_list
+        ; takes a list of {k, v} tuples, which is what each pair becomes
+        (maps/from_list
+          (apply list (map (fn [pair]
+                             (let [kv (erlang/tuple_to_list pair)]
+                               (erlang/list_to_tuple
+                                 (list (datum (first kv)) (datum (second kv))))))
+                           (rn/node-items form))))
+      :else form)))
+
+(defn- compile-quote
+  "Turn (quote form) into the data the form denotes, as a literal value.
+
+   `quote` says ‘do not evaluate this — give it back as data’. We build the
+   datum (the form as a plain value) and then `Macro.escape` it, which turns a
+   value into the Elixir syntax tree that reconstructs it. That is exactly how
+   a quoted list, symbol, or literal becomes a constant in the compiled code."
+  [form]
+  (Macro/escape (datum form)))
+
+(defn- compile-special
+  "Compile a special form by name."
+  [head args env]
+  (cond
+    (= head "if") (compile-if (first args) (second args)
+                              (if (>= (count args) 3) (nth args 2) nil) env)
+    (= head "do") (compile-body args env)
+    (= head "throw") (compile-throw (first args) env)
+    (= head "quote") (compile-quote (first args))
+    (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
+    (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
+    (= head "recur") (compile-recur args env)
+    :else (throw (str "compiler: unknown special form " head))))
+
 (defn compile
   "Turn one reader form into its Elixir syntax tree.
 
@@ -374,12 +597,16 @@
           ; symbols are namespace variables or remote references
           (compile-symbol name env))
 
-      ; a list is a call (an empty list is just an empty list value)
+      ; a list is a special form or a call (an empty list is an empty list value)
       (= tag :list)
         (let [items (rn/node-items form)]
           (if (empty? items)
             (list)
-            (compile-call items env)))
+            (let [head (rn/node-form (first items))]
+              (if (and (= :symbol (rn/node-tag head))
+                       (contains? special-forms (rn/node-name head)))
+                (compile-special (rn/node-name head) (rest items) env)
+                (compile-call items env)))))
 
       ; a plain number, string, boolean, or nil is already its own value
       :else form)))
