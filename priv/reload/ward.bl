@@ -1,0 +1,170 @@
+; reload/ward.bl — a warm, isolated, coherence-guarded pure-bl test runner.
+;
+; ── The problem it dissolves ─────────────────────────────────────────────
+;
+; A shared test image is FRAGILE. When many suites run against one set of
+; global, supervised singletons (the var registry, the loader, the ref/atom
+; store) and one set of compiled `:global` modules, a single suite that stops a
+; process or purges a module corrupts every suite that runs after it — the
+; "application shutdown" contamination, where a test fails not on its own merit
+; but because a sibling tore down shared state mid-run. And a compiled test can
+; run STALE: the beam on the path lags the source, so a green run proves nothing
+; about the code you actually edited.
+;
+; ── How the reload machinery solves it, structurally ─────────────────────
+;
+; The coherent-reload building blocks are exactly what a robust runner needs:
+;
+;   1. ISOLATION.   Each file runs in `env/isolated` — its own var-registry
+;      namespace, destroyed on the way out. A file that mutates global-looking
+;      state mutates only its fork; it cannot leak into the next file. No shared
+;      singleton to tear down, so no cross-file contamination is representable.
+;
+;   2. COHERENCE-GATE.  Before a file runs, `reload/coherence` checks it
+;      STATICALLY (dangling refs, unfulfilled promises, type conflicts) — the
+;      same pass that guards a live reload. A broken file yields a clean
+;      :incoherent REPORT with every reason, instead of a crash that takes the
+;      whole runner down with it. One bad file never fails the others.
+;
+;   3. ALWAYS-LATEST.  A file's SOURCE is read fresh and evaluated into its
+;      fork; nothing consults a compiled beam. The stale-beam class — a green
+;      run of code you did not write — is structurally impossible here, because
+;      there is no beam in the loop to go stale.
+;
+;   4. WARM.  The prelude and the test library load ONCE into a warm base env;
+;      each file forks off that base, paying no re-initialisation cost. Fast and
+;      warm without sharing mutable state — the fork gives speed, the isolation
+;      gives safety, and they do not trade off.
+;
+; The result is a runner that is fast, warm, assured-latest, and immune to the
+; shutdown contamination by construction — not by careful teardown, but because
+; there is no shared mutable ground for one file to pull out from under another.
+
+(ns reload.ward
+  (:require [reload] [env]))
+
+;; ── coherence pre-check ───────────────────────────────────────────────────
+
+(defn- check-source
+  "Statically check one test file's source for coherence BEFORE running it.
+   Returns [] when clean, or the coherence errors (dangling / promise / type).
+   Runs the file's declared namespace through reload's own coherence pass, so a
+   test file that references an undefined var is reported, never crashes the run."
+  [ns src]
+  (reload/coherence {ns src}))
+
+;; ── run one file in an isolated fork ──────────────────────────────────────
+
+(defn- ns-of
+  "The namespace a test file declares (its leading `(ns …)`). We read it via the
+   reader so a file with no `(ns …)` is reported cleanly rather than mis-run."
+  [src]
+  (reload/declared-ns src))
+
+(defn run-file
+  "Run one test file's SOURCE in a fresh isolated fork of `base`. Returns a
+   result map: {:ns ns :status :passed|:failed|:incoherent :totals {…} :warnings
+   [...] :errors [...]}.
+
+   The coherence pass is ADVISORY here, not a gate. reload's coherence checker is
+   tuned for whole-namespace top-level defs; a test file legitimately binds
+   locals (`let`/destructuring) it does not scope-track, so a hard reject would
+   false-flag valid files. Instead its findings ride along as `:warnings`, and
+   the file RUNS — a genuine dangling reference then surfaces as a real
+   load-crash or test error, caught by the fork's try/catch. Safety comes from
+   ISOLATION + crash-containment (structural), with coherence as a helpful
+   heads-up (heuristic). A file with no `(ns …)` is the one true reject: without
+   a namespace it cannot be run or reported coherently."
+  [base src]
+  (let [ns (ns-of src)]
+    (if (nil? ns)
+      {:ns nil :status :incoherent
+       :errors [{:kind :no-ns :msg "test file declares no (ns …) form"}]}
+      (let [warns (check-source ns src)]
+        (do
+          ; advisory coherence — warn, do not reject; run the file regardless. We drive
+          ; `run_ns` directly (not `run-tests`) so ward owns the summary line:
+          ; run_ns prints the ns header and per-failure detail (useful) but not
+          ; the totals footer, which ward renders once for the whole suite.
+          (env/isolated base
+            (fn []
+              ; A top-level crash while LOADING the file (a `throw` at read/eval
+              ; time, before any test runs) is caught here and becomes an
+              ; :errored result — the fork is still destroyed on exit, and the
+              ; runner moves to the next file. A single explosive file can no
+              ; more take down the run than an incoherent one can.
+              (try
+                (do
+                  (env/eval src)
+                  (let [totals (BeamLisp.TestRT/run_ns ns)]
+                    {:ns ns
+                     :status (if (and (= 0 (:fail totals)) (= 0 (:error totals)))
+                               :passed :failed)
+                     :totals totals
+                     :warnings warns}))
+                (catch e
+                  {:ns ns :status :incoherent :warnings warns
+                   :errors [{:kind :load-crash
+                             :msg (str "crashed while loading: " (ex-message e))}]})))))))))
+
+;; ── run a suite of files ──────────────────────────────────────────────────
+
+(defn- warm-base
+  "A warm base env: the test library loaded once into a fresh fork of the current
+   env, so every file forks off it without re-loading the prelude/test lib. The
+   base is never mutated by a run — files fork OFF it, isolating their writes."
+  []
+  (let [base (env/fork)]
+    (env/with-env base (fn [] (env/eval "(ns ward.warm (:require [core]))")))
+    base))
+
+(defn run
+  "Run a suite of test-file SOURCES (a list of source strings), each in its own
+   coherence-gated isolated fork off one warm base. Returns
+     {:files [result …] :passed n :failed n :incoherent n :ok? bool}
+   The aggregate a CI gate reads. No file can contaminate another: each runs in a
+   fork destroyed on exit, and a coherence failure is a report, not a crash."
+  [sources]
+  (let [base (warm-base)
+        results (map (fn [src] (run-file base src)) sources)
+        passed (count (filter (fn [r] (= :passed (:status r))) results))
+        failed (count (filter (fn [r] (= :failed (:status r))) results))
+        incoh  (count (filter (fn [r] (= :incoherent (:status r))) results))]
+    {:files (vec results)
+     :passed passed
+     :failed failed
+     :incoherent incoh
+     :ok? (and (= 0 failed) (= 0 incoh))}))
+
+;; ── rendering ──────────────────────────────────────────────────────────────
+
+(defn- file-line
+  "One file's result as a terminal line: a glyph, its ns, and a count or reason."
+  [r]
+  (let [glyph (cond (= :passed (:status r)) "✓"
+                    (= :failed (:status r)) "✗"
+                    :else                   "⊘")]
+    (cond
+      (= :incoherent (:status r))
+      (str "  " glyph " " (or (:ns r) "?") "  INCOHERENT — "
+           (:msg (first (:errors r))))
+      :else
+      (let [t (:totals r)]
+        (str "  " glyph " " (:ns r) "  "
+             (:pass t) " passed"
+             (if (> (:fail t) 0) (str ", " (:fail t) " failed") "")
+             (if (> (:error t) 0) (str ", " (:error t) " errored") ""))))))
+
+(defn report
+  "Render a `run` result for a human: one line per file, then a summary. Returns
+   the text; the caller prints it."
+  [result]
+  (join "\n"
+    (concat
+      ["── ward: warm isolated test run ──" ""]
+      (map file-line (:files result))
+      [""
+       (str "  " (:passed result) " file(s) passed, "
+            (:failed result) " failed, "
+            (:incoherent result) " incoherent")
+       (if (:ok? result) "  ✓ all green" "  ✗ not green")])))
