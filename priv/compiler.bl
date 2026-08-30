@@ -291,6 +291,19 @@
   (let [i (index-of name "/")]
     [(subs name 0 i) (subs name (+ i 1))]))
 
+(defn- split-dots
+  "Split a dotted name like A.B.C into its parts at each `.` (here: A, B, C).
+   Used to turn a catch's `Module.Name` into the atom segments an Elixir
+   `:__aliases__` node carries."
+  [name]
+  (loop [s name acc (list)]
+    (let [i (index-of s ".")]
+      ; index-of yields nil (not -1) when there is no more `.`: that is the last
+      ; segment, so emit it and stop.
+      (if (nil? i)
+        (reverse (cons s acc))
+        (recur (subs s (+ i 1)) (cons (subs s 0 i) acc))))))
+
 (defn- module-atom
   "Turn a qualified name's module prefix into the atom the BEAM uses for it.
 
@@ -1181,27 +1194,79 @@
                 (= :symbol (rn/node-tag (rn/node-form (first items))))
                 (= "finally" (rn/node-name (rn/node-form (first items)))))))))
 
-(defn- compile-catch-branch
-  "Compile an untyped (catch e handler...) into the catch clause's dispatch.
-
-   Builds the `kind, value -> ...` clause: capture the stacktrace, normalize
-   the caught value into `e-var`, then `if true do (name = e; handler) else
-   reraise end`. `(catch Module.Name e ...)` typed catches are not yet handled."
-  [catch-form e-var kind-var value-var stack-var env]
-  (let [items (rn/node-items (rn/node-form catch-form))
-        e-name (rn/node-name (rn/node-form (second items)))
-        handler-forms (rest (rest items))
-        handler-var (fresh-var e-name)
+(defn- catch-handler-ast
+  "Build the body a catch clause runs once it matches: bind the handler's name
+   to the normalized exception value, then run the handler forms. Shared by the
+   typed and untyped branches, mirroring the genesis `run_handler`."
+  [e-name handler-forms e-var env]
+  (let [handler-var (fresh-var e-name)
         handler-env (put-local env e-name handler-var)
-        handler-body (compile-body handler-forms handler-env)
-        ; handler runs as: name = e-var; body
-        handler (ast-node :__block__
-                          (list (ast-node := (list handler-var e-var))
-                                handler-body))
-        reraise (erl-call :erlang :raise (list kind-var value-var stack-var))]
-    ; if true do handler else reraise
-    (ast-node :if (list true (list (erlang/list_to_tuple (list :do handler))
-                                   (erlang/list_to_tuple (list :else reraise)))))))
+        handler-body (compile-body handler-forms handler-env)]
+    (ast-node :__block__
+              (list (ast-node := (list handler-var e-var))
+                    handler-body))))
+
+(defn- catch-cond-branch
+  "Compile ONE (catch …) clause into a `cond` branch `[test] -> handler`.
+
+   Two shapes, decided by the clause's first element:
+     * `(catch e handler…)`         — an untyped catch-all: the test is `true`,
+       so it matches every caught value. `e` binds the exception.
+     * `(catch Module.Name e handler…)` — a typed catch: the test is
+       `is_struct(e, Module.Name)`, so it matches only that exception struct;
+       `e` binds it.
+   A first element that is neither a bare variable nor a dotted Module.Name
+   (e.g. `(catch :bad e …)`) is refused with the same message the genesis
+   compiler raises, because a keyword/literal names no catchable shape."
+  [catch-form e-var env]
+  (let [items (rn/node-items (rn/node-form catch-form))
+        first-node (rn/node-form (second items))
+        first-tag (rn/node-tag first-node)]
+    (if (not (= :symbol first-tag))
+      (compile-error env (str "catch requires a variable or Module.Name, got a " (rn/node-tag first-node)))
+      (let [name (rn/node-name first-node)]
+        (if (uppercase-first? name)
+          ; typed: (catch Module.Name e handler…)
+          (let [rest-items (rest (rest items))
+                e-name (rn/node-name (rn/node-form (first rest-items)))
+                handler-forms (rest rest-items)
+                ; a dotted module symbol -> :__aliases__ node of its atom parts
+                segs (apply list (map erlang/binary_to_atom (split-dots name)))
+                mod-ast (ast-alias segs)
+                ; `is_struct(e, Mod)` is a Kernel guard, not an :erlang BIF, so
+                ; build its expansion directly: e is a map whose :__struct__ is
+                ; exactly Mod. This is the same shape the guard compiler emits
+                ; for `vector?`/`map?`, and is valid in an ordinary expression.
+                test (ast-node :and
+                               (list (ast-node :and
+                                               (list (erl-call :erlang :is_map (list e-var))
+                                                     (erl-call :erlang :is_map_key (list :__struct__ e-var))))
+                                     (ast-node :===
+                                               (list (erl-call :erlang :map_get (list :__struct__ e-var))
+                                                     mod-ast))))
+                handler (catch-handler-ast e-name handler-forms e-var env)]
+            (ast-node :-> (list (list test) handler)))
+          ; untyped: (catch e handler…)
+          (let [handler-forms (rest (rest items))
+                handler (catch-handler-ast name handler-forms e-var env)]
+            (ast-node :-> (list (list true) handler))))))))
+
+(defn- compile-catch-dispatch
+  "Compile ALL of a try's catch clauses into a single `cond` dispatch.
+
+   Each clause becomes one `cond` branch (typed or untyped, see
+   `catch-cond-branch`); the FIRST branch whose test holds wins, so an earlier
+   clause shadows a later one — the `first matching clause wins` rule. A final
+   `true -> reraise` branch re-raises the original kind/value/stack when every
+   clause is typed and none matched, so an unmatched typed catch propagates
+   instead of being swallowed. Mirrors the genesis catch dispatch."
+  [catches e-var kind-var value-var stack-var env]
+  (let [branches (apply list (map (fn [c] (catch-cond-branch c e-var env)) catches))
+        reraise (erl-call :erlang :raise (list kind-var value-var stack-var))
+        fallthrough (ast-node :-> (list (list true) reraise))
+        all-branches (apply list (concat branches (list fallthrough)))]
+    (ast-node :cond
+              (list (list (erlang/list_to_tuple (list :do all-branches)))))))
 
 (defn- after-clause-form?
   "Say whether a receive sub-form is an (after ms body) clause."
@@ -1314,7 +1379,7 @@
             do-opt (list (erlang/list_to_tuple (list :do body-ast)))
             with-catch (if (empty? catches)
                          do-opt
-                         (let [dispatch-body (compile-catch-branch (first catches) e-var kind-var value-var stack-var env)
+                         (let [dispatch-body (compile-catch-dispatch catches e-var kind-var value-var stack-var env)
                                ; stack = __STACKTRACE__; e = normalize; dispatch
                                catch-body (ast-node :__block__
                                                     ; __STACKTRACE__ is a bare special variable

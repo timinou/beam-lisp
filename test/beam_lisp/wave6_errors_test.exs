@@ -101,7 +101,7 @@ defmodule BeamLisp.Wave6ErrorsTest do
 
   describe "compile errors" do
     test "a catch whose first arg is not a symbol is a compile error" do
-      assert_raise RuntimeError, ~r/catch requires a variable or Module.Name/, fn ->
+      assert_raise BeamLisp.CompileError, ~r/catch requires a variable or Module.Name/, fn ->
         eval("(try :x (catch :bad e :h))")
       end
     end
