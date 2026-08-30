@@ -32,6 +32,17 @@
 ; the next call resolves the new one. No caller observes a missing or half-updated
 ; var, and an incoherent bundle never touches the live image at all.
 ;
+; ── The unit is the NAMESPACE, not the var ────────────────────────────
+;
+; A staged source IS the whole namespace. A name the new source no longer
+; defines is genuinely REMOVED from the image on commit — not left additively
+; shadow-callable. This is 'the whole renaming ethics': rename a fn and every
+; reference must move, because the old name really disappears. Coherence enforces
+; both faces — a same-ns reference to a dropped name is dangling (held), and a
+; dropped PUBLIC var that another live namespace still calls is a :removal error
+; (held until that caller is staged too). So a rename is atomic across every
+; namespace it touches, or it does not land at all.
+;
 ; ── Coherence = predicates over shipped machinery ───────────────────────
 ;
 ;   dangling ref  — a call whose head neither the bundle nor the image provides
@@ -122,15 +133,23 @@
 
 ;; ── coherence pass (STATIC — never evaluates the bundle) ─────────────────
 
+; Every top-level form that BINDS A NAME in its namespace. A whole-namespace
+; reload must know the complete set the new source defines — anything omitted
+; would be seen as "vanished" and wrongly removed, or leave a real removal
+; undetected. This is the full def-vocabulary of the language.
+(def def-forms
+  #{"defn" "defn-" "def" "defmacro" "defmulti" "defmethod"
+    "defrecord" "deftype" "defprotocol" "defserver" "defnative"})
+
 (defn- defn-name
-  "If a form is a top-level definition (defn/defn-/def/defmacro), the name it
-   binds; else nil."
+  "If a form is a top-level definition, the name it binds; else nil. `defmethod`
+   binds no NEW name (it extends an existing defmulti), so it contributes none."
   [node]
   (let [f (typed/node-form node)]
     (if (= :list (typed/node-tag f))
       (let [items (typed/node-items f)
             head  (typed/node-name (first items))]
-        (if (contains? #{"defn" "defn-" "def" "defmacro"} head)
+        (if (and (contains? def-forms head) (not (= "defmethod" head)))
           (typed/node-name (second items))
           nil))
       nil)))
@@ -156,23 +175,48 @@
               (assoc acc ns (into (get acc ns #{}) names))))
           {} staged))
 
+(defn- staged?
+  "Whether `ns` is part of THIS bundle — i.e. its whole source is being replaced."
+  [defs ns]
+  (contains? defs ns))
+
 (defn- provides?
-  "Whether `name` resolves in `ns`: defined by the bundle, or already a public
-   var of the live image (this ns or core). The union that makes a bundle
-   coherent as a whole."
+  "Whether `name` resolves in `ns` under NAMESPACE-LEVEL semantics.
+
+   The distinction that makes reload namespace-level rather than variable-level:
+   for a ns IN the bundle, only the names its NEW source defines count — an old
+   var the new source dropped is genuinely gone, so a reference to it is dangling
+   (this is 'the whole renaming ethics': rename `helper`→`helper2` and the old
+   `helper` is removed, not left shadow-callable). For a ns NOT in the bundle,
+   the live image is authoritative (its vars are untouched). core is always
+   available."
   [defs ns name]
   (or (contains? (get defs ns #{}) name)
-      (not (= :error (BeamLisp.Env/fetch ns name)))
+      (and (not (staged? defs ns))
+           (not (= :error (BeamLisp.Env/fetch ns name))))
       (contains? (set (BeamLisp.Env/public_names "core")) name)))
 
+(defn- unqualified-call-heads
+  "Every unqualified, non-core, non-special same-ns call head in one source. By
+   passing an EMPTY `defined` set to the deferral collector's `unknowns-in`, we
+   collect ALL such heads independent of the live image — which is load-bearing
+   for namespace-level reload: a call to a var the new source DROPPED must be
+   seen, and it is still present in the live image (until commit), so a
+   live-baseline collector would wrongly treat it as resolved."
+  [src ns]
+  (let [core (set (BeamLisp.Env/public_names "core"))
+        forms (BeamLisp.Reader/read_string src)]
+    (reduce (fn [acc form] (concat acc (deferred/unknowns-in form #{} core)))
+            [] forms)))
+
 (defn- dangling-errors
-  "Dangling references in one source: same-ns calls whose head neither the
-   bundle nor the image provides. Qualified heads (`other.ns/f`) resolve at their
-   target ns and are skipped by the deferral collector — we judge only what
-   truly resolves to nothing once the whole bundle is accounted for."
+  "Dangling references in one source: same-ns calls whose head the WHOLE bundle
+   does not provide under namespace-level semantics. Qualified heads
+   (`other.ns/f`) resolve at their target ns and are excluded by the collector;
+   cross-ns removals are caught separately by `removal-errors`."
   [defs ns src]
-  (let [unknown (deferred/collect-unknown-calls (BeamLisp.Reader/read_string src) ns)
-        still   (filter (fn [u] (not (provides? defs ns (:callee u)))) unknown)]
+  (let [heads (unqualified-call-heads src ns)
+        still (filter (fn [u] (not (provides? defs ns (:callee u)))) heads)]
     (map (fn [u] {:kind :dangling :ns ns :var (:callee u)
                   :msg (str "undefined var: " ns "/" (:callee u)
                             " — nothing in the bundle or image defines it")})
@@ -197,6 +241,36 @@
   (let [ws (:warnings (deferred/check-file-deferring src ns))]
     (map (fn [w] {:kind :type :ns ns :msg (str w)}) ws)))
 
+(defn- removed-names
+  "Names the live namespace `ns` currently OWNS but the bundle's new source no
+   longer defines — the vars a whole-namespace reload will drop. Empty when `ns`
+   is new (nothing to remove) or the source is purely additive."
+  [defs ns]
+  (let [new-names (get defs ns #{})
+        live      (set (BeamLisp.Env/own_names ns))]
+    (filter (fn [nm] (not (contains? new-names nm))) live)))
+
+(defn- removal-errors
+  "Cross-namespace dangling from a REMOVAL: for each var this bundle drops from a
+   namespace, any live caller in ANOTHER namespace that is not itself being
+   updated in this bundle. This is the cross-ns half of the renaming ethics — you
+   may not silently delete a var that another live namespace still calls; the
+   bundle is held until those callers are staged too (typically the rename's
+   other half)."
+  [defs ns]
+  (mapcat
+    (fn [nm]
+      (let [outside (filter (fn [pair] (not (staged? defs (first pair))))
+                            (BeamLisp.Env/callers_of ns nm))]
+        (map (fn [pair]
+               {:kind :removal :ns ns :var nm
+                :caller-ns (first pair) :caller (second pair)
+                :msg (str "removing " ns "/" nm " would break live caller "
+                          (first pair) "/" (second pair)
+                          " — stage that namespace too, or keep the var")})
+             outside)))
+    (removed-names defs ns)))
+
 (defn coherence
   "Every coherence error across the whole bundle, computed STATICALLY from the
    sources and the live image's public names. Empty ⇒ the bundle is coherent and
@@ -209,6 +283,7 @@
                    (let [ns (first pair) src (second pair)]
                      (concat (dangling-errors defs ns src)
                              (promise-errors defs ns src)
+                             (removal-errors defs ns)
                              (type-errors ns src))))
                  staged))))
 
@@ -225,15 +300,31 @@
    searching the disk for a file that does not exist — the whole edit set is one
    image, so its internal requires are satisfied by the image, not the loader."
   [staged]
-  (env/with-env :global
-    (fn []
-      (doseq [pair staged]
-        (env/eval (second pair))
-        ;; mark loaded AFTER a ns evaluates, so a later bundle ns that
-        ;; `(:require)`s it resolves to the live sibling. Author-ordered:
-        ;; a required sibling is staged before its requirer, exactly as
-        ;; source files are ordered by the require DAG.
-        (BeamLisp.Env/mark_loaded (first pair))))))
+  (let [defs (bundle-defs staged)]
+    (env/with-env :global
+      (fn []
+        ;; Declare EVERY bundle namespace up front, so a qualified cross-ns call
+        ;; `(other.ns/f)` compiles as a bl var reference rather than Erlang
+        ;; interop — the compiler's ns-vs-interop decision (`Env.ns_exists?`) must
+        ;; see the sibling exist regardless of eval order within the bundle.
+        (doseq [pair staged] (BeamLisp.Env/declare_ns (first pair)))
+        (doseq [pair staged]
+          (let [ns (first pair)
+                ;; compute the drop set BEFORE eval — eval interns the new names,
+                ;; which would otherwise mask what the old image owned.
+                gone (removed-names defs ns)]
+            (env/eval (second pair))
+            ;; NAMESPACE-LEVEL replacement: a var the new source dropped is
+            ;; genuinely removed from the image, so nothing can still reach the
+            ;; stale definition. The coherence pass already proved no live caller
+            ;; depends on any of these (dangling + removal errors), so this is
+            ;; safe by construction.
+            (doseq [nm gone] (BeamLisp.Env/undefine_var ns nm))
+            ;; mark loaded AFTER a ns evaluates, so a later bundle ns that
+            ;; `(:require)`s it resolves to the live sibling. Author-ordered:
+            ;; a required sibling is staged before its requirer, exactly as
+            ;; source files are ordered by the require DAG.
+            (BeamLisp.Env/mark_loaded ns)))))))
 
 (defn commit
   "Prove the whole pending bundle coherent (statically); on success apply it

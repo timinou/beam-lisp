@@ -40,12 +40,15 @@ mix beam_lisp.run --path priv examples/reload/NN-name.bl
 
 - **01** — a live namespace is downstream of its source, so redefining a pure fn
   is an atomic per-var swap; a caller in flight finishes on its captured body.
-- **02** — the transaction unit is the *bundle*, not the file. A dangling
-  reference holds the whole bundle; the old code serves the entire time.
+- **02** — the transaction unit is the *bundle*, not the file, and reload is
+  *namespace-level*: the staged source IS the namespace, so a name it drops is
+  truly removed. A dangling reference — or a rename that leaves a reference on a
+  removed name — holds the whole bundle; the old code serves the entire time.
 - **03** — an unfulfilled promise is the static analogue of a queued message: a
   commitment the bundle must honour before it can go live.
-- **04** — reload is additive; introducing a caller of a *new* name requires the
-  callee in the same bundle, or the caller would dangle. All-or-nothing.
+- **04** — namespace-level atomicity, the additive face: introducing a caller of
+  a *new* name requires the callee in the same bundle, or the caller would
+  dangle. All-or-nothing (removal is the other face — see 02).
 - **05** — a message queued in a mailbox is an unfulfilled promise; a migration
   fulfils it under the new contract, and `:reroute` verification is **mandatory**
   — the relation it must preserve is *discovered*, no annotation.
