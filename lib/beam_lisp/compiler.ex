@@ -117,6 +117,100 @@ defmodule BeamLisp.Compiler do
   # value (= and printing are unaffected); a form with no position compiles
   # identically to today, just without line attribution.
   def compile(form, env) do
+    # THE CUTOVER SEAM. beam-lisp's compiler is written in beam-lisp
+    # (priv/compiler.bl). Once that source is AOT-compiled into the
+    # `BeamLisp.Ns.Compiler` module, THIS function delegates every form to it —
+    # the language compiles itself. The Elixir `compile_elixir/2` below is the
+    # GENESIS seed: the original hand-written lowering, kept for exactly two
+    # jobs. (1) Bootstrap of last resort: on a fresh tree where the .bl seed is
+    # not yet built, it compiles the first `Ns.Compiler` (after which each build
+    # is compiled by the previous stage — the staged-bootstrap ladder). (2) The
+    # differential oracle: `priv/self/oracle.bl` compiles a form with BOTH this
+    # seed and the .bl compiler and asserts the ASTs are byte-identical, which
+    # is the proof the two agree. So the seed is never dead code — it is the
+    # floor the tower stands on and the yardstick it is measured against.
+    #
+    # Backend selection (`:beam_lisp, :compiler_backend`):
+    #   :auto (default) — delegate to the .bl seed when it is loaded, else genesis
+    #   :genesis        — always the Elixir seed (used to rebuild after a .bl
+    #                     compiler change that an older seed cannot compile)
+    #   :bl             — always the .bl seed (fail loudly if it is absent)
+    if use_bl_compiler?() do
+      apply(BeamLisp.Ns.Compiler, :compile, [form, env])
+    else
+      compile_elixir(form, env)
+    end
+  end
+
+  # Whether to route `compile/2` through the self-hosted beam-lisp compiler.
+  # `:auto` delegates whenever the AOT-built seed module is on the code path
+  # and exports `compile/2`; on a fresh tree it is absent, so genesis runs and
+  # builds it. The check is a cheap `function_exported?` (no Env work), so it
+  # is fine on the hot compile path.
+  defp use_bl_compiler? do
+    case Application.get_env(:beam_lisp, :compiler_backend, :auto) do
+      :genesis ->
+        false
+
+      :bl ->
+        true
+
+      :auto ->
+        # Delegate only when the `compiler` namespace's vars are actually
+        # INTERNED in this node's Env. The self-hosted `compile` reaches its
+        # sibling vars (its own recursion, `macroexpand-1`, every `compile-*`
+        # helper) through the Env var table, so they MUST exist before the
+        # first delegated form or the fetch raises `undefined var`.
+        #
+        # Keying on the live interning state — not a persistent flag — is what
+        # makes this self-consistent and leak-proof. `:persistent_term` is
+        # node-global and `mix run`/`mix test` compile in the SAME node they
+        # run in, so a flag set during the AOT compile phase would bleed into
+        # the run phase where the ns may not be interned. `loaded_ns?` reflects
+        # reality: interned ⇒ delegation resolves; not interned ⇒ genesis.
+        Env.loaded_ns?("compiler")
+    end
+  end
+
+  @doc """
+  Ensure the self-hosted beam-lisp compiler is ready to serve `compile/2`.
+
+  Interns the `compiler` namespace (runs its `__bl_init__`, which replays the
+  compiler's own `def`s into the Env var table). Once interned, `compile/2`
+  with the default `:auto` backend delegates every form to it — the language
+  compiles itself. Idempotent and safe before the seed exists: if the compiler
+  beam is not built (a fresh tree), loading is a no-op, the ns stays
+  un-interned, and `compile/2` keeps running the genesis Elixir seed — which is
+  exactly what compiles that seed in the first place. Returns `:bl` when the
+  self-hosted compiler is now active, `:genesis` otherwise.
+  """
+  def enable_bl_backend do
+    unless Env.loaded_ns?("compiler") do
+      # Force genesis for the duration of this load: interning the compiler ns
+      # replays its own forms, and until it is fully interned those forms must
+      # be compiled by the seed, never by the half-built self-hosted compiler.
+      prev = Application.get_env(:beam_lisp, :compiler_backend, :auto)
+      Application.put_env(:beam_lisp, :compiler_backend, :genesis)
+
+      try do
+        BeamLisp.Loader.ensure_loaded("compiler")
+      after
+        Application.put_env(:beam_lisp, :compiler_backend, prev)
+      end
+    end
+
+    if Env.loaded_ns?("compiler"), do: :bl, else: :genesis
+  end
+
+  @doc """
+  The genesis (Elixir) compiler: lower one reader form to Elixir quoted AST.
+
+  This is the original hand-written compiler. `compile/2` delegates to the
+  self-hosted beam-lisp compiler once it is built; this stays as the bootstrap
+  seed and as the differential oracle's yardstick. Callers that MUST have the
+  Elixir lowering specifically (the oracle) call this directly.
+  """
+  def compile_elixir(form, env) do
     case form do
       {:meta, inner, m} ->
         # A form's metadata carries two kinds of key. Positional keys
@@ -136,7 +230,7 @@ defmodule BeamLisp.Compiler do
           ast
         else
           meta_ast =
-            {:%{}, [], Enum.map(user, fn {k, v} -> {k, compile(v, notail(penv))} end)}
+            {:%{}, [], Enum.map(user, fn {k, v} -> {k, compile_elixir(v, notail(penv))} end)}
 
           {{:., [], [{:__aliases__, [], [:BeamLisp, :FormMeta]}, :with_meta]}, [],
            [ast, meta_ast]}
@@ -156,7 +250,7 @@ defmodule BeamLisp.Compiler do
   defp do_compile({:keyword, name}, _env), do: BeamLisp.AtomGuard.to_atom(name)
 
   defp do_compile({:vector, items}, env) do
-    tuple_ast = {:{}, [], Enum.map(items, &compile(&1, notail(env)))}
+    tuple_ast = {:{}, [], Enum.map(items, &compile_elixir(&1, notail(env)))}
     {:%, [], [{:__aliases__, [], [:BeamLisp, :Vector]}, {:%{}, [], [items: tuple_ast]}]}
   end
 
@@ -168,8 +262,8 @@ defmodule BeamLisp.Compiler do
     # every printed representation looks identical.
     {:%{}, [],
      Enum.map(kvs, fn {k, v} ->
-       {quote(do: BeamLisp.RT.hash_key(unquote(compile(k, notail(env))))),
-        compile(v, notail(env))}
+       {quote(do: BeamLisp.RT.hash_key(unquote(compile_elixir(k, notail(env))))),
+        compile_elixir(v, notail(env))}
      end)}
   end
 
@@ -177,7 +271,7 @@ defmodule BeamLisp.Compiler do
   # `{:record, name, kvs}`. Resolve the name to its struct module at
   # runtime and build the record from the given (known) fields.
   defp do_compile({:record, name, kvs}, env) do
-    map_ast = compile({:map, kvs}, notail(env))
+    map_ast = compile_elixir({:map, kvs}, notail(env))
 
     quote do
       BeamLisp.Record.literal(unquote(env.ns), unquote(name), unquote(map_ast))
@@ -185,7 +279,7 @@ defmodule BeamLisp.Compiler do
   end
 
   defp do_compile({:set, items}, env) do
-    members = Enum.map(items, &compile(&1, notail(env)))
+    members = Enum.map(items, &compile_elixir(&1, notail(env)))
 
     quote do
       BeamLisp.Set.new(unquote(members))
@@ -226,7 +320,7 @@ defmodule BeamLisp.Compiler do
   end
 
   defp do_compile({:list, [{:keyword, kw} | args]}, env) do
-    arg_asts = Enum.map(args, &compile(&1, notail(env)))
+    arg_asts = Enum.map(args, &compile_elixir(&1, notail(env)))
 
     quote do
       BeamLisp.RT.invoke(unquote(String.to_atom(kw)), unquote(arg_asts))
@@ -257,7 +351,7 @@ defmodule BeamLisp.Compiler do
         # the macro's business, not ours).
         case macro_for(env.ns, name) do
           {:ok, macro_fn} ->
-            compile(expand_macro(macro_fn, {:list, [{:symbol, name} | args]}, args, env), env)
+            compile_elixir(expand_macro(macro_fn, {:list, [{:symbol, name} | args]}, args, env), env)
 
           :error ->
             arg_asts = compile_args(args, env)
@@ -293,12 +387,12 @@ defmodule BeamLisp.Compiler do
 
   defp do_compile({:list, [head | args]}, env) do
     arg_env = notail(env)
-    invoke_quoted(compile(head, arg_env), Enum.map(args, &compile(&1, arg_env)))
+    invoke_quoted(compile_elixir(head, arg_env), Enum.map(args, &compile_elixir(&1, arg_env)))
   end
 
   defp compile_args(args, env) do
     arg_env = notail(env)
-    Enum.map(args, &compile(&1, arg_env))
+    Enum.map(args, &compile_elixir(&1, arg_env))
   end
 
   # Direct remote call to a linked fn var: fixed arity hits the def
@@ -394,10 +488,10 @@ defmodule BeamLisp.Compiler do
   end
 
   defp compile_special("def", [name_form, init], env),
-    do: compile_def(name_of(name_form), compile(init, notail(env)), env, nil, name_meta(name_form))
+    do: compile_def(name_of(name_form), compile_elixir(init, notail(env)), env, nil, name_meta(name_form))
 
   defp compile_special("def", [name_form, doc, init], env) when is_binary(doc),
-    do: compile_def(name_of(name_form), compile(init, notail(env)), env, doc, name_meta(name_form))
+    do: compile_def(name_of(name_form), compile_elixir(init, notail(env)), env, doc, name_meta(name_form))
 
   defp compile_special("fn", args, env) do
     case args do
@@ -528,13 +622,13 @@ defmodule BeamLisp.Compiler do
   # an ordinary expression evaluated at definition time.
   defp compile_special("defmulti", [name_form, dispatch], env) do
     name = name_of(name_form)
-    dispatch_ast = compile(dispatch, notail(env))
+    dispatch_ast = compile_elixir(dispatch, notail(env))
     quote do: BeamLisp.Multi.define_multi(unquote(env.ns), unquote(name), unquote(dispatch_ast))
   end
 
   defp compile_special("defmulti", [name_form, doc, dispatch], env) when is_binary(doc) do
     name = name_of(name_form)
-    dispatch_ast = compile(dispatch, notail(env))
+    dispatch_ast = compile_elixir(dispatch, notail(env))
 
     quote do
       value = BeamLisp.Multi.define_multi(unquote(env.ns), unquote(name), unquote(dispatch_ast))
@@ -551,7 +645,7 @@ defmodule BeamLisp.Compiler do
     if rest == [], do: compile_error(env, "defmethod #{name}: expected a method body")
 
     {mns, mname} = multi_var_target(env, name)
-    dispatch_ast = compile(dispatch_val, notail(env))
+    dispatch_ast = compile_elixir(dispatch_val, notail(env))
     method_ast = compile_fn(fn_clauses(rest, env), env)
 
     quote do
@@ -676,7 +770,7 @@ defmodule BeamLisp.Compiler do
   # method table, when what is wanted is the protocol's identity.
   defp compile_special("satisfies?", [protocol_form, value_form], env) do
     {pns, pname} = multi_var_target(env, name_of(protocol_form))
-    value_ast = compile(value_form, notail(env))
+    value_ast = compile_elixir(value_form, notail(env))
 
     quote do
       BeamLisp.Multi.satisfies?(unquote(pns), unquote(pname), unquote(value_ast))
@@ -856,7 +950,7 @@ defmodule BeamLisp.Compiler do
         unless length(args) == arity,
           do: compile_error(env, "recur arity mismatch: target takes #{arity}, got #{length(args)}")
 
-        arg_asts = Enum.map(args, &compile(&1, notail(env)))
+        arg_asts = Enum.map(args, &compile_elixir(&1, notail(env)))
 
         case target do
           # Anonymous fn / loop: re-enter via self-application.
@@ -881,7 +975,7 @@ defmodule BeamLisp.Compiler do
   # value survives the round trip; an existing exception re-raises.
   defp compile_special("throw", [x], env) do
     quote do
-      BeamLisp.ExInfo.raise_payload(unquote(compile(x, notail(env))))
+      BeamLisp.ExInfo.raise_payload(unquote(compile_elixir(x, notail(env))))
     end
   end
 
@@ -943,7 +1037,7 @@ defmodule BeamLisp.Compiler do
       |> Enum.flat_map(fn {pattern_form, guard_form, body} ->
         {pat_asts, pat_env} = compile_pattern(pattern_form, env)
         guard_ast = compile_guard(guard_form, pat_env)
-        body_ast = compile(body, pat_env)
+        body_ast = compile_elixir(body, pat_env)
 
         Enum.map(pat_asts, fn pat ->
           {:->, [], [[guarded(pat, guard_ast)], body_ast]}
@@ -957,7 +1051,7 @@ defmodule BeamLisp.Compiler do
 
         [after_form] ->
           {:list, [{:symbol, "after"}, timeout, body]} = unwrap_meta(after_form)
-          after_clause = {:->, [], [[compile(timeout, notail(env))], compile(body, env)]}
+          after_clause = {:->, [], [[compile_elixir(timeout, notail(env))], compile_elixir(body, env)]}
           [do: do_clauses, after: [after_clause]]
 
         _ ->
@@ -1750,7 +1844,7 @@ defmodule BeamLisp.Compiler do
   defp synq_data({:meta, _inner, _m} = form, env, g), do: synq_data(unwrap_meta(form), env, g)
 
   defp synq_data({:list, [{:symbol, "unquote"}, x]}, env, g),
-    do: {compile(x, notail(env)), g}
+    do: {compile_elixir(x, notail(env)), g}
 
   defp synq_data({:list, [{:symbol, "unquote-splicing"}, _]}, _env, _g),
     do: raise("~@ is only valid inside a syntax-quoted list or vector")
@@ -1855,7 +1949,7 @@ defmodule BeamLisp.Compiler do
         # `~@` splices any seqable, not just a list — jank's own macros
         # splice binding *vectors*, and `++` demands a list.
         {:list, [{:symbol, "unquote-splicing"}, x]} ->
-          {quote(do: BeamLisp.RT.splice(unquote(compile(x, notail(env))), unquote(acc))), gacc}
+          {quote(do: BeamLisp.RT.splice(unquote(compile_elixir(x, notail(env))), unquote(acc))), gacc}
 
         _ ->
           {item_ast, g2} = synq_data(item, env, gacc)
@@ -1960,7 +2054,7 @@ defmodule BeamLisp.Compiler do
 
   defp compile_if(test, then, else_, env) do
     {:if, [],
-     [compile(test, notail(env)), [do: compile(then, env), else: compile(else_, env)]]}
+     [compile_elixir(test, notail(env)), [do: compile_elixir(then, env), else: compile_elixir(else_, env)]]}
   end
 
   # Like compile_bindings, but split for loop: `params` are the recur
@@ -1975,7 +2069,7 @@ defmodule BeamLisp.Compiler do
     end
 
     Enum.reduce(pairs, {[], [], [], env}, fn [pattern_form, init], {params, entry, arg_asts, acc_env} ->
-      init_ast = compile(init, acc_env)
+      init_ast = compile_elixir(init, acc_env)
 
       case peel_hint(pattern_form) do
         {:symbol, name} ->
@@ -2002,7 +2096,7 @@ defmodule BeamLisp.Compiler do
     end
 
     Enum.reduce(pairs, {[], env}, fn [pattern_form, init], {steps, acc_env} ->
-      init_ast = compile(init, acc_env)
+      init_ast = compile_elixir(init, acc_env)
 
       case peel_hint(pattern_form) do
         {:symbol, name} ->
@@ -2508,7 +2602,7 @@ defmodule BeamLisp.Compiler do
 
     # Compile the :or defaults in the entering scope (before any bind
     # in this map), as Clojure does.
-    ors_asts = Map.new(ors, fn {k, default} -> {k, compile(default, env)} end)
+    ors_asts = Map.new(ors, fn {k, default} -> {k, compile_elixir(default, env)} end)
 
     {steps, env} =
       Enum.reduce(binds, {[], env}, fn bind, {steps, acc_env} ->
@@ -2961,7 +3055,7 @@ defmodule BeamLisp.Compiler do
 
   defp block_forms(forms, env) do
     {inits, [last]} = Enum.split(forms, -1)
-    block(Enum.map(inits, &compile(&1, notail(env))) ++ [compile(last, env)])
+    block(Enum.map(inits, &compile_elixir(&1, notail(env))) ++ [compile_elixir(last, env)])
   end
 
   # --- compile-time env ---

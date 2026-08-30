@@ -86,6 +86,19 @@ defmodule BeamLisp do
       end
 
       Env.mark_seeded()
+
+      # Cutover: route the compiler through the self-hosted beam-lisp compiler
+      # (priv/compiler.bl) now that the prelude it needs is seeded. On a tree
+      # where the compiler beam is built this flips `Compiler.compile/2` onto
+      # the .bl compiler VM-wide; on a fresh tree the seed is absent and this
+      # is a no-op, so boot still works via the genesis Elixir compiler (which
+      # is what builds the seed). Never lets a compiler-load failure break boot.
+      try do
+        BeamLisp.Compiler.enable_bl_backend()
+      rescue
+        _ -> :genesis
+      end
+
       Env.in_ns("user")
     end
 
