@@ -1,0 +1,154 @@
+; executor/store.bl — the executor's principal directory, as datoms.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; A real deployment needs to answer, per SSH connection: "this public key — whose
+; is it, is it still valid, and what token + policy does it carry?" That is a
+; DIRECTORY, and (like relay's key store) it is datoms, not a config file:
+;
+;   principal   an enrolled identity: a user string, an authorized-keys line,
+;               a base64 exec-token, and an enabled flag.
+;
+; The three questions map to three reads:
+;
+;   authorized? line  → is this exact authorized_keys line enrolled + enabled?
+;   user-for   line   → which user does this key belong to?
+;   token-for  user   → the current exec-token string for a user (nil if none).
+;
+; ══ WHY THE KEY IS THE authorized_keys LINE ═════════════════════════════════
+;
+; OTP's is_auth_key/3 hands us a decoded key record, but the STABLE, printable,
+; enrollable identity a human pastes is the one-line `ssh-ed25519 AAAA… comment`.
+; So we store that line and, at auth time, RE-ENCODE the presented key to a line
+; and compare — the same discipline as relay hashing a token: store the durable
+; form, match against it. (executor_ssh does the encode; this store compares.)
+;
+; ══ ROTATION + REVOCATION ARE JUST TRANSACTIONS ═════════════════════════════
+;
+; rotate! swaps a user's token (a new base64 string); revoke! flips :enabled.
+; Because the store is datoms, "what token did alice carry last Tuesday" is an
+; as-of query — the audit trail is free. No token secret is ever stored beyond
+; the base64 the holder already has; a leaked store leaks tokens (like relay),
+; so the store lives on the executor host behind the tailnet, same as its keys.
+
+(ns executor.store
+  (:require [datom]))
+
+(def ^:private SCHEMA
+  [{:db/ident :principal/user      :db/valueType :db.type/string
+    :db/unique :db.unique/identity}
+   {:db/ident :principal/key-line  :db/valueType :db.type/string
+    :db/unique :db.unique/identity}
+   {:db/ident :principal/token     :db/valueType :db.type/string}
+   {:db/ident :principal/enabled   :db/valueType :db.type/boolean}])
+
+(defn open
+  "A fresh principal directory (in-memory). Returns a datom conn. Durable
+   backends arrive through datom/connect-with without changing this ns."
+  []
+  (datom/connect SCHEMA))
+
+(defn normalize-line
+  "Reduce an authorized_keys line to its canonical `<type> <base64>` form,
+   dropping any trailing comment/options. Enrollment and auth-time lookup both
+   normalize, so a key stored with a comment still matches the comment-stripped
+   line the SSH layer reconstructs from the presented key."
+  [line]
+  (let [parts (String/split (String/trim line) " ")]
+    (if (>= (count parts) 2)
+      (str (nth parts 0) " " (nth parts 1))
+      (String/trim line))))
+
+;; ── enrollment ───────────────────────────────────────────────────────
+
+(defn enroll!
+  "Enroll (or update) a principal: `user` owns `key-line` (a full authorized_keys
+   line) and carries `token` (a base64 exec-token). Enabled on enrollment.
+   Upserts on the user identity, so re-enrolling rotates the key+token in one
+   step. Returns the tx report."
+  [conn user key-line token]
+  (datom/transact! conn
+    [{:db/id -1
+      :principal/user user
+      :principal/key-line (normalize-line key-line)
+      :principal/token token
+      :principal/enabled true}]))
+
+(defn rotate-token!
+  "Replace `user`'s exec-token with `token`. The key stays; only authority
+   changes. Returns the tx report (nil-safe: a missing user is a no-op upsert
+   creating a disabled-less record, so callers should enroll first)."
+  [conn user token]
+  (datom/transact! conn
+    [{:db/id -1 :principal/user user :principal/token token}]))
+
+(defn revoke!
+  "Disable `user`: their key no longer authorizes and their token is refused.
+   The record stays (for audit); :enabled flips false."
+  [conn user]
+  (datom/transact! conn
+    [{:db/id -1 :principal/user user :principal/enabled false}]))
+
+(defn enable!
+  "Re-enable a previously revoked `user`."
+  [conn user]
+  (datom/transact! conn
+    [{:db/id -1 :principal/user user :principal/enabled true}]))
+
+;; ── the three auth-time reads ────────────────────────────────────────
+
+(defn- enabled-principal-by-line [conn key-line-raw]
+  (let [key-line (normalize-line key-line-raw)
+        db (datom/db conn)
+        r (datom/q
+            [:find (quote ?u) (quote ?en)
+             :in (quote $) (quote ?line)
+             :where
+             [(quote ?e) :principal/key-line (quote ?line)]
+             [(quote ?e) :principal/user (quote ?u)]
+             [(quote ?e) :principal/enabled (quote ?en)]]
+            db key-line)]
+    (first r)))
+
+(defn authorized?
+  "True when `key-line` is enrolled AND enabled. The is_auth_key predicate."
+  [conn key-line]
+  (let [row (enabled-principal-by-line conn key-line)]
+    (if (nil? row) false (nth row 1))))
+
+(defn user-for
+  "The user owning `key-line`, or nil — only when enabled (a revoked key names
+   no one for authorization purposes)."
+  [conn key-line]
+  (let [row (enabled-principal-by-line conn key-line)]
+    (if (nil? row) nil (if (nth row 1) (nth row 0) nil))))
+
+(defn token-for
+  "The current base64 exec-token for `user`, or nil when the user is unknown,
+   disabled, or has no token. The token_for seam executor_ssh consumes."
+  [conn user]
+  (let [db (datom/db conn)
+        r (datom/q
+            [:find (quote ?tok) (quote ?en)
+             :in (quote $) (quote ?u)
+             :where
+             [(quote ?e) :principal/user (quote ?u)]
+             [(quote ?e) :principal/enabled (quote ?en)]
+             [(quote ?e) :principal/token (quote ?tok)]]
+            db user)
+        row (first r)]
+    (if (nil? row) nil (if (nth row 1) (nth row 0) nil))))
+
+;; ── introspection ────────────────────────────────────────────────────
+
+(defn list-principals
+  "Every enrolled principal as {:user :enabled} — for an ops listing."
+  [conn]
+  (let [db (datom/db conn)
+        r (datom/q
+            [:find (quote ?u) (quote ?en)
+             :where
+             [(quote ?e) :principal/user (quote ?u)]
+             [(quote ?e) :principal/enabled (quote ?en)]]
+            db)]
+    (map (fn [row] {:user (nth row 0) :enabled (nth row 1)}) r)))

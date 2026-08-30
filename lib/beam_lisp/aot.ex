@@ -259,8 +259,20 @@ defmodule BeamLisp.AOT do
   # build. It surfaced as "undefined var: reel.film/TEMPIDS" raised from a
   # function that plainly referenced it, in a namespace that had loaded
   # without complaint. Peel the name, then match as usual.
-  defp capture_value_def(vdefs, {:list, [{:symbol, "def"}, {:meta, name_form, _m} | rest]}, ns) do
-    capture_value_def(vdefs, {:list, [{:symbol, "def"}, name_form | rest]}, ns)
+  defp capture_value_def(vdefs, {:list, [{:symbol, "def"}, {:meta, name_form, m} | rest]}, ns) do
+    # A `^:per-env` marked value def must replay as a per-env descriptor, not an
+    # eager intern — carry the flag past the name-meta peel (which otherwise
+    # discards `m`). Every other marker (e.g. `^:private`) is metadata only and
+    # does not change how the value is registered.
+    if is_map(m) and m[:"per-env"] == true do
+      case rest do
+        [init] -> put_value_def(vdefs, ns, bare_name(name_form), nil, init, per_env: true)
+        [doc, init] when is_binary(doc) -> put_value_def(vdefs, ns, bare_name(name_form), doc, init, per_env: true)
+        _ -> vdefs
+      end
+    else
+      capture_value_def(vdefs, {:list, [{:symbol, "def"}, name_form | rest]}, ns)
+    end
   end
 
   # DEFINE-BY-INTERNING forms, replayed whole.
@@ -449,13 +461,15 @@ defmodule BeamLisp.AOT do
   defp capture_require_spec(_other, acc), do: acc
 
 
-  defp put_value_def(vdefs, ns, name, doc, init) do
+  defp put_value_def(vdefs, ns, name, doc, init, opts \\ []) do
+    per_env? = Keyword.get(opts, :per_env, false)
+
     entries =
       vdefs
       |> Map.get(ns, [])
-      |> Enum.reject(fn {n, _, _} -> n == name end)
+      |> Enum.reject(fn {n, _, _, _} -> n == name end)
 
-    Map.put(vdefs, ns, entries ++ [{name, doc, init}])
+    Map.put(vdefs, ns, entries ++ [{name, doc, init, per_env?}])
   end
 
   # Emit a namespace as the SAME shim/body split the runtime uses, so an
@@ -720,17 +734,28 @@ defmodule BeamLisp.AOT do
     # module and survive namespace churn. When there are no value defs the
     # companion is omitted and no call is emitted.
     value_ops =
-      for {name, doc, init_form} <- value_defs do
+      for {name, doc, init_form, per_env?} <- value_defs do
         init_ast = Compiler.compile(init_form, env)
-        intern = quote do: BeamLisp.Env.intern(unquote(ns), unquote(name), unquote(init_ast))
+
+        # A `^:per-env` value replays as a per-env descriptor (a re-runnable
+        # thunk each consuming env materializes once), NOT an eager global
+        # intern. Wrapping the compiled initializer in `fn -> … end` here anchors
+        # any closure it builds to this stable Init companion module (never
+        # reloaded), exactly as the eager path relies on for macro expanders.
+        register =
+          if per_env? do
+            quote do: BeamLisp.Env.define_per_env(unquote(ns), unquote(name), fn -> unquote(init_ast) end)
+          else
+            quote do: BeamLisp.Env.intern(unquote(ns), unquote(name), unquote(init_ast))
+          end
 
         if doc do
           quote do
-            _value = unquote(intern)
+            _value = unquote(register)
             BeamLisp.Env.put_meta(unquote(ns), unquote(name), %{doc: unquote(doc)})
           end
         else
-          intern
+          register
         end
       end
 

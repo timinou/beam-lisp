@@ -1,0 +1,196 @@
+; mock/fault.bl — the fault space of a contract, as data.
+;
+; ── Why this is not just "one wrong value" ─────────────────────────────────
+;
+; mock.bl synthesizes a value that violates a contract. That is ONE witness —
+; z3's job (find a value). A STURDY mock needs the whole fault SURFACE: which
+; laws can be broken, alone or together; whether the test suite exercises each
+; one; whether two faults are really the same fault wearing different numbers.
+;
+; Those are not "find a value" questions — they are questions ABOUT A SET, and
+; that is datalog's half of the engine division. So this module runs in two
+; movements, each engine doing only what it is best at:
+;
+;   z3       GENERATES the fault space   — per law i, a value that breaks EXACTLY
+;                                          law i (an isolated mutant), the boundary
+;                                          value, and the all-laws-broken value.
+;   datalog  ANALYSES  the fault space   — every mutant, law, and violation becomes
+;                                          a datom; sturdiness is then a QUERY:
+;                                          coverage (not-join), redundancy (group),
+;                                          independence (which laws break alone).
+;
+; The contract is the same {:fields :ensures} mock.bl uses. An isolated mutant is
+; the sharpest possible negative test: it fails for ONE named reason, so a suite
+; built from isolated mutants tells you exactly which law each test defends.
+
+(ns mock.fault
+  (:require [z3] [mock] [datom] [typed] [core]))
+
+(def TIMEOUT-MS 3000)
+(defn- timed [smt] (str "(set-option :timeout " TIMEOUT-MS ")\n" smt))
+
+; ── z3: generate an ISOLATED mutant (exactly one law broken) ───────────────
+;
+; The heart of "wrong, but precisely wrong". To break law i alone: assert
+; (not law_i) AND every other law j≠i. If SAT, the model violates i and nothing
+; else — a value whose ONLY fault is nameable. If unsat, law i CANNOT be broken
+; while the others hold: it is IMPLIED by them (a redundant law — a real finding
+; about the contract, surfaced not hidden).
+
+(defn- assert-except
+  "Assert every ensures clause except index `i`, and the NEGATION of clause i."
+  [ensures i]
+  (core/join ""
+    (map-indexed (fn [j e]
+                   (if (= j i)
+                     (str "(assert (not " e "))\n")
+                     (str "(assert " e ")\n")))
+                 ensures)))
+
+(defn- decls-of [fields]
+  (core/join "" (map (fn [f] (str "(declare-const " (first f) " " (second f) ")\n")) fields)))
+
+(defn isolate
+  "A value that violates EXACTLY clause `i` of `contract`, or a verdict why not.
+   Returns {:clause i :status \"sat\"|\"unsat\"|\"unknown\" :value {…}|nil}. unsat ⟹
+   clause i is implied by the other clauses (redundant); unknown ⟹ undecidable."
+  [port contract i]
+  (let [smt (timed (str (decls-of (:fields contract))
+                        (assert-except (:ensures contract) i)))
+        r (z3/check-model port smt)]
+    {:clause i
+     :status (:status r)
+     :value (if (= "sat" (:status r)) (mock/keywordize (mock/parse-model (:model r))) nil)}))
+
+(defn isolate-all
+  "One isolated mutant per clause: [{:clause i :status :value} …]. The full
+   single-fault surface of the contract, each fault broken for one named reason."
+  [port contract]
+  (into [] (map (fn [i] (isolate port contract i))
+                (range 0 (count (:ensures contract))))))
+
+; ── the fault suite as datoms ──────────────────────────────────────────────
+;
+; Every clause is an entity; every generated mutant is an entity; a mutant that
+; violates a clause is an edge. Once the fault surface is a db, sturdiness stops
+; being ad-hoc bookkeeping and becomes ordinary queries over :fault/violates.
+
+(def SCHEMA
+  [{:db/ident :clause/idx      :db/valueType :db.type/long :db/unique :db.unique/identity}
+   {:db/ident :clause/text     :db/valueType :db.type/string}
+   {:db/ident :fault/id        :db/valueType :db.type/long :db/unique :db.unique/identity}
+   {:db/ident :fault/kind      :db/valueType :db.type/keyword}   ; :isolated | :boundary | :total
+   {:db/ident :fault/violates  :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   {:db/ident :fault/reason    :db/valueType :db.type/long}])    ; the clause it was BUILT to break
+
+(defn- violated-clauses
+  "Which clause INDICES a concrete value breaks — computed by `mock/check` on a
+   one-clause contract per index. This is the datalog-facing fact: it does not
+   trust the generator's intent, it MEASURES what the value actually violates."
+  [port contract value]
+  (into []
+    (keep (fn [i]
+            (let [one {:fields (:fields contract) :ensures [(nth (:ensures contract) i)]}]
+              (if (mock/check port one value) nil i)))    ; check=false ⟹ violates i
+          (range 0 (count (:ensures contract))))))
+
+(defn build-db
+  "Generate the fault space of `contract` and load it as a datom db. Each clause
+   and each mutant is an entity; :fault/violates edges are MEASURED (not assumed)
+   by re-checking every mutant against every clause. Returns {:conn :db :faults}.
+   `mutants` is the generated set — from isolate-all, boundary, total, or a mix."
+  [port contract mutants]
+  (let [conn (datom/connect SCHEMA)
+        clause-tx (into [] (map-indexed
+                             (fn [i e] {:db/id (+ 1 i) :clause/idx i :clause/text e})
+                             (:ensures contract)))
+        fault-tx (into []
+                   (keep (fn [m]
+                           (if (nil? (:value m)) nil
+                             (let [vio (violated-clauses port contract (:value m))]
+                               {:db/id (+ 1000 (:fault/id m))
+                                :fault/id (:fault/id m)
+                                :fault/kind (:kind m)
+                                :fault/reason (or (:clause m) -1)
+                                :fault/violates (into [] (map (fn [i] (+ 1 i)) vio))})))
+                         mutants))]
+    (datom/transact! conn (into clause-tx fault-tx))
+    {:conn conn :db (datom/db conn) :faults fault-tx}))
+
+; ── datalog: sturdiness is a query ─────────────────────────────────────────
+
+(defn uncovered-clauses
+  "Clause indices NO fault in the db exercises — the suite's blind spots. A
+   negation query: a clause with no incoming :fault/violates edge. This is the
+   coverage gap, computed the same way the explorer finds undemonstrated fns."
+  [db]
+  (sort (map (fn [r] (get r 0))
+             (into [] (datom/q '[:find ?idx
+                                 :where [?c :clause/idx ?idx]
+                                        [:not-join [?c] [?f :fault/violates ?c]]]
+                               db)))))
+
+(defn covered-clauses
+  "Clause indices at least one fault exercises."
+  [db]
+  (sort (distinct (map (fn [r] (get r 0))
+                       (into [] (datom/q '[:find ?idx
+                                           :where [?f :fault/violates ?c]
+                                                  [?c :clause/idx ?idx]]
+                                         db))))))
+
+(defn faults-per-clause
+  "{clause-idx → count of faults that break it}. A clause broken by many faults
+   is well-defended; a clause broken by one is fragile to that test's removal."
+  [db]
+  (let [rows (into [] (datom/q '[:find ?idx ?f
+                                 :where [?f :fault/violates ?c] [?c :clause/idx ?idx]]
+                               db))]
+    (core/update-vals (group-by (fn [r] (get r 0)) rows) count)))
+
+(defn redundant-mutants
+  "Groups of fault ids whose violated-clause SET is identical — duplicates that
+   test the same thing. Keeping one per group is a smaller, equally-strong suite.
+   Computed by grouping faults on their sorted violation signature."
+  [db]
+  (let [rows (into [] (datom/q '[:find ?f ?idx
+                                 :where [?fe :fault/id ?f] [?fe :fault/violates ?c]
+                                        [?c :clause/idx ?idx]]
+                               db))
+        by-fault (core/update-vals (group-by (fn [r] (get r 0)) rows)
+                                   (fn [rs] (sort (map (fn [r] (get r 1)) rs))))
+        by-sig (group-by (fn [p] (second p)) (into [] by-fault))]
+    (into []
+      (keep (fn [p]
+              (let [ids (sort (map first (second p)))]
+                (if (> (count ids) 1) {:signature (first p) :faults ids} nil)))
+            (into [] by-sig)))))
+
+(defn independent-laws
+  "Clause indices that CAN be broken in isolation (an isolated mutant exists) vs
+   those that cannot (implied by the others — redundant contract laws). Reads
+   the isolate-all result directly: sat ⟹ independent, unsat ⟹ implied."
+  [isolated]
+  {:independent (sort (keep (fn [m] (if (= "sat" (:status m)) (:clause m) nil)) isolated))
+   :implied     (sort (keep (fn [m] (if (= "unsat" (:status m)) (:clause m) nil)) isolated))
+   :undecidable (sort (keep (fn [m] (if (= "unknown" (:status m)) (:clause m) nil)) isolated))})
+
+; ── convenience: the whole robustness report in one call ───────────────────
+
+(defn report
+  "The full sturdiness picture of `contract`: generate isolated mutants, load the
+   fault db, and answer every coverage/redundancy/independence query. One value,
+   fully queryable, honest about undecidable laws."
+  [port contract]
+  (let [isolated (isolate-all port contract)
+        mutants (into [] (map-indexed (fn [i m] (assoc m :fault/id i :kind :isolated)) isolated))
+        world (build-db port contract mutants)
+        db (:db world)]
+    {:clauses (count (:ensures contract))
+     :faults (count (filter (fn [m] (some? (:value m))) mutants))
+     :covered (covered-clauses db)
+     :uncovered (uncovered-clauses db)
+     :faults-per-clause (faults-per-clause db)
+     :redundant (redundant-mutants db)
+     :laws (independent-laws isolated)
+     :db db}))

@@ -275,6 +275,24 @@
     // attribute; on fire we relay that term plus the value of the nearest
     // input (so a Send button and an Enter key both carry the field text).
     root.addEventListener("click", function (e) {
+      // A plain in-app <a href="/…"> becomes LIVE navigation automatically:
+      // intercept the click, push the URL, and fire a navigate event so the
+      // dispatcher re-projects with a keyed patch (no reload). Falls back to a
+      // real page load when JS is off, when it's a modified click (new tab),
+      // or when the link is external/hash — so links stay honest and
+      // bookmarkable. This is what makes EVERY screen-to-screen move live
+      // without wiring a single link by hand.
+      var a = e.target.closest && e.target.closest("a[href]");
+      if (a && !e.defaultPrevented && !e.metaKey && !e.ctrlKey &&
+          !e.shiftKey && !e.altKey && (a.getAttribute("target") || "") === "") {
+        var href = a.getAttribute("href") || "";
+        if (href.indexOf("/") === 0 && href.indexOf("//") !== 0 &&
+            href.indexOf("#") !== 0) {
+          e.preventDefault();
+          if (ws.__navigate) ws.__navigate(href);
+          return;
+        }
+      }
       fireFrom(e.target, "click", ws, formData(e.target));
     });
     root.addEventListener("input", function (e) {
@@ -295,6 +313,23 @@
         if (el.tagName === "INPUT") el.value = "";
       }
     });
+
+    // Back/Forward: the browser restored a previous URL, so tell the server to
+    // re-route to it (a plain navigate event → the dispatcher re-projects).
+    // No pushState here — the history entry already moved; we only sync state.
+    window.addEventListener("popstate", function () {
+      var path = location.pathname + location.search;
+      (ws.__send || ws.send.bind(ws))(
+        JSON.stringify(["event", ["navigate", path], {}]));
+    });
+
+    // programmatic navigation: push the URL and tell the server. Lets app code
+    // (or a film driver) move routes without a synthetic click.
+    ws.__navigate = function (path) {
+      try { history.pushState({ live: path }, "", path); } catch (_e) {}
+      (ws.__send || ws.send.bind(ws))(
+        JSON.stringify(["event", ["navigate", path], {}]));
+    };
 
     return ws;
   }
@@ -327,11 +362,33 @@
     return null;
   }
 
+  // A `:navigate` event term carries the app-route to move to. live.app turns
+  // it into a keyed PATCH (no reload), but the URL bar must follow so links
+  // stay real and shareable, and Back/Forward work. `navTarget` finds the
+  // navigate path in a term — a single ["navigate", "/x"] or the second slot
+  // of a [["assign",…],["navigate","/x"]] batch — or null when there is none.
+  function navTarget(term) {
+    if (!Array.isArray(term) || term.length === 0) return null;
+    if (term[0] === "navigate") return term[1];
+    // a vector of terms: scan for a navigate among them
+    if (Array.isArray(term[0])) {
+      for (var i = 0; i < term.length; i++) {
+        if (Array.isArray(term[i]) && term[i][0] === "navigate") return term[i][1];
+      }
+    }
+    return null;
+  }
+
   // relay the JSON term stored in attribute `attr` of `el` to the server
   function relay(el, attr, ws, data) {
     var raw = el.getAttribute(attr);
     var term = null;
     try { term = raw ? JSON.parse(raw) : null; } catch (e) { term = null; }
+    // a navigate term also moves the URL bar (pushState), so the address
+    // reflects the live route — a bookmarkable SPA over one socket. The
+    // server still gets the SAME event and re-routes; this only syncs the URL.
+    var nav = navTarget(term);
+    if (nav) { try { history.pushState({ live: nav }, "", nav); } catch (_e) {} }
     // __send guards readyState (buffer while CONNECTING, drop when CLOSED) so a
     // fire before the handshake or after a drop never throws.
     (ws.__send || ws.send.bind(ws))(JSON.stringify(["event", term, data || {}]));

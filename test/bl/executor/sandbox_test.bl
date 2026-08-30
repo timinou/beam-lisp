@@ -1,0 +1,254 @@
+; executor/sandbox_test.bl — adversarial tests for the capped session substrate.
+;
+; Each test pins one way an attacker (or a bug) could breach a ceiling, and
+; proves the breach is refused. Three ceilings, probed adversarially:
+;   caps   — forgery, foreign-root, attenuation-escalation, missing identity
+;   memory — per-process hard kill, per-user admission ceiling
+;   disk   — per-session quota, per-user quota, accounting integrity
+;
+; The discipline: a test that "passes" by never exercising the dangerous path is
+; worthless, so each adversarial test first shows the SAFE path works, then shows
+; the attack is refused — the deny is meaningful only against a live allow.
+
+(ns executor.sandbox.test
+  (:require [executor.sandbox :as ex] [auth] [env]))
+
+;; ── fixtures ─────────────────────────────────────────────────────────
+
+(defn- open-policy []
+  ; generous mem so cap/disk tests are not accidentally mem-gated; disk on.
+  {:mem-per-session 3000000 :mem-per-user 12000000
+   :disk-per-session 1000 :disk-per-user 2500})
+
+(defn- ctx []
+  (auth/context {:policies [(auth/allow [])]}))
+
+(defn- string-token [root user]
+  (auth/issue root [["user" user] ["right" "Elixir.String" "call"]]))
+
+;; ── CAPS: the happy path is real (so the denials below mean something) ──
+
+(deftest granted-cap-runs
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        adm (ex/admit reg (auth/public root) (string-token root "alice")
+                      (ctx) (open-policy) nil)]
+    (is (contains? adm :ok))
+    (let [s (:ok adm)]
+      (is (= {:ok "HI"} (ex/run s "(String/upcase \"hi\")")))
+      (ex/close reg s))))
+
+(deftest ungranted-cap-denied-at-compile-time
+  ; File was never granted → the eval cannot even COMPILE a File call.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        s (:ok (ex/admit reg (auth/public root) (string-token root "alice")
+                         (ctx) (open-policy) nil))]
+    (let [r (ex/run s "(File/read \"/etc/passwd\")")]
+      (is (contains? r :error))
+      (is (= :eval (:reason (:error r)))))
+    (ex/close reg s)))
+
+(deftest system-cmd-denied-without-exec-grant
+  ; A String-only session must not shell out. System/cmd is :exec in the op
+  ; table; absent the grant, it is unspeakable.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        s (:ok (ex/admit reg (auth/public root) (string-token root "eve")
+                         (ctx) (open-policy) nil))]
+    (is (contains? (ex/run s "(System/cmd \"id\" [])") :error))
+    (ex/close reg s)))
+
+;; ── CAPS adversarial: forgery + foreign root ─────────────────────────
+
+(deftest forged-foreign-root-admits-nothing
+  ; Token signed by a DIFFERENT root than the executor trusts → no admission,
+  ; no env, no identity. The signature check is the wall.
+  (let [real (auth/keypair)
+        forger (auth/keypair)
+        reg (ex/registry)
+        token (auth/issue forger [["user" "mallory"]
+                                  ["right" "Elixir.File" "write"]])
+        adm (ex/admit reg (auth/public real) token (ctx) (open-policy) nil)]
+    (is (contains? adm :error))
+    (is (= :authorize (:stage (:error adm))))))
+
+(deftest tampered-token-admits-nothing
+  ; Take a valid token, corrupt its bytes, and it must fail to decode/verify —
+  ; never silently admit with garbage caps.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        good (auth/encode-base64 (string-token root "alice"))
+        ; flip the tail: a different base64 body, structurally invalid chain
+        bad  (str (String/slice good 0 (- (String/length good) 6)) "AAAAAA")
+        adm  (try
+               (ex/admit reg (auth/public root) (auth/decode-base64 bad)
+                         (ctx) (open-policy) nil)
+               (catch e {:error {:reason :decode-threw}}))]
+    ; either a clean {:error …} verdict or a decode throw we mapped — never {:ok}
+    (is (contains? adm :error))))
+
+;; ── CAPS adversarial: attenuation cannot ESCALATE ────────────────────
+
+(deftest attenuation-cannot-add-a-right
+  ; Alice holds String only. She attenuates, TRYING to add File. Biscuit's
+  ; append-only chain is monotonic: a later block cannot GRANT — it can only
+  ; further restrict. So the attenuated token still yields String only (File
+  ; stays denied). This is the crypto guarantee, exercised end to end.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        base (string-token root "alice")
+        ; a well-meaning-looking but powerless "grant" appended by the holder
+        attd (auth/attenuate base [["right" "Elixir.File" "write"]])
+        s (:ok (ex/admit reg (auth/public root) attd (ctx) (open-policy) nil))]
+    ; String still works…
+    (is (= {:ok "HI"} (ex/run s "(String/upcase \"hi\")")))
+    ; …and the self-appended File right granted NOTHING.
+    (is (contains? (ex/run s "(File/read \"/etc/passwd\")") :error))
+    (ex/close reg s)))
+
+(deftest attenuation-can-still-narrow
+  ; The dual: attenuation that adds a failing CHECK (an already-expired TTL)
+  ; must make the token deny — narrowing works even as widening cannot.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        base (string-token root "alice")
+        expired (auth/attenuate base
+                  {:facts [] :checks [(auth/ttl-check "t" {:date 0})]})
+        ; ctx supplies a `time` fact AFTER the cutoff → the check fails
+        c (auth/context {:policies [(auth/allow [])]
+                         :facts [["time" {:date 9999999999}]]})
+        adm (ex/admit reg (auth/public root) expired c (open-policy) nil)]
+    (is (contains? adm :error))))
+
+;; ── CAPS adversarial: identity cannot be spoofed ─────────────────────
+
+(deftest no-user-fact-is-refused
+  ; A token with rights but NO user fact cannot be attributed to a principal,
+  ; so per-user accounting is impossible → refuse. Fail closed on identity.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        anon (auth/issue root [["right" "Elixir.String" "call"]])
+        adm (ex/admit reg (auth/public root) anon (ctx) (open-policy) nil)]
+    (is (contains? adm :error))
+    (is (= :identity (:stage (:error adm))))))
+
+;; ── MEMORY: per-process hard kill ────────────────────────────────────
+
+(deftest runaway-alloc-is-killed-vm-survives
+  ; A granted-cap session that allocates past its heap ceiling is KILLED at the
+  ; process level (max_heap_size kill:true). The run returns an error; the VM
+  ; and the test process live on. Uses Enum (granted) to build a huge list.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        token (auth/issue root [["user" "alice"]
+                                ["right" "Elixir.String" "call"]
+                                ["right" "Elixir.Enum" "call"]])
+        ; a deliberately TINY heap so a modest alloc overflows fast
+        tiny {:mem-per-session 200000 :mem-per-user 1000000
+              :disk-per-session 0 :disk-per-user 0}
+        s (:ok (ex/admit reg (auth/public root) token (ctx) tiny nil))]
+    ; small work still returns
+    (is (= {:ok "HI"} (ex/run s "(String/upcase \"hi\")")))
+    ; runaway allocation → the eval process is killed, surfaced as an error,
+    ; NOT a value and NOT a VM crash (if the VM died this test could not assert)
+    (let [r (ex/run s "(count (Enum/to_list (range 1 50000000)))")]
+      (is (contains? r :error)))
+    ; the session is still usable afterwards — the kill was contained
+    (is (= {:ok "HELLO"} (ex/run s "(String/upcase \"hello\")")))
+    (ex/close reg s)))
+
+;; ── MEMORY: per-user admission ceiling ───────────────────────────────
+
+(deftest per-user-memory-ceiling-blocks-third-session
+  ; mem-per-user = 2× mem-per-session → the third concurrent session for one
+  ; user is refused at admission, BEFORE any code runs. A different user is
+  ; unaffected (the ceiling is per-principal).
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        pol {:mem-per-session 1000000 :mem-per-user 2000000
+             :disk-per-session 0 :disk-per-user 0}
+        rp (auth/public root)
+        a1 (ex/admit reg rp (string-token root "alice") (ctx) pol nil)
+        a2 (ex/admit reg rp (string-token root "alice") (ctx) pol nil)
+        a3 (ex/admit reg rp (string-token root "alice") (ctx) pol nil)
+        ; bob is a separate principal → his first session still admits
+        b1 (ex/admit reg rp (string-token root "bob") (ctx) pol nil)]
+    (is (contains? a1 :ok))
+    (is (contains? a2 :ok))
+    (is (contains? a3 :error))
+    (is (= :mem-quota-user (:reason (:error a3))))
+    (is (contains? b1 :ok))
+    ; freeing one of alice's sessions lets a new one in again
+    (ex/close reg (:ok a1))
+    (let [a4 (ex/admit reg rp (string-token root "alice") (ctx) pol nil)]
+      (is (contains? a4 :ok))
+      (ex/close reg (:ok a4)))
+    (ex/close reg (:ok a2))
+    (ex/close reg (:ok b1))))
+
+;; ── DISK: per-session and per-user quotas ────────────────────────────
+
+(deftest disk-per-session-quota-refuses-overflow
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        pol {:mem-per-session 2000000 :mem-per-user 8000000
+             :disk-per-session 1000 :disk-per-user 100000}
+        s (:ok (ex/admit reg (auth/public root) (string-token root "alice")
+                         (ctx) pol nil))]
+    ; write within quota
+    (is (= {:ok 600} (ex/account-write! s 600)))
+    ; a second write that would exceed 1000 is refused, tally unchanged
+    (let [r (ex/account-write! s 500)]
+      (is (contains? r :error))
+      (is (= :disk-quota-session (:reason (:error r)))))
+    ; a write that exactly fills the remainder is allowed
+    (is (= {:ok 1000} (ex/account-write! s 400)))
+    (ex/close reg s)))
+
+(deftest disk-per-user-quota-spans-sessions
+  ; Two sessions for one user share a per-USER disk ceiling: session A fills
+  ; most of it, session B is refused even though B's own per-session quota is
+  ; untouched. The quota is the principal's, not the connection's.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        pol {:mem-per-session 1000000 :mem-per-user 8000000
+             :disk-per-session 1000 :disk-per-user 1200}
+        rp (auth/public root)
+        sa (:ok (ex/admit reg rp (string-token root "alice") (ctx) pol nil))
+        sb (:ok (ex/admit reg rp (string-token root "alice") (ctx) pol nil))]
+    (is (= {:ok 900} (ex/account-write! sa 900)))
+    ; sb's per-session quota (1000) would allow 900, but the per-USER quota
+    ; (1200, already 900 used) leaves only 300 → 900 is refused.
+    (let [r (ex/account-write! sb 900)]
+      (is (contains? r :error))
+      (is (= :disk-quota-user (:reason (:error r)))))
+    ; sb CAN write the 300 that remains under the user ceiling
+    (is (= {:ok 300} (ex/account-write! sb 300)))
+    (ex/close reg sa)
+    (ex/close reg sb)))
+
+(deftest disk-default-policy-denies-all-writes
+  ; With no disk grant in policy (default 0), a session cannot write a byte —
+  ; fail closed. Disk access is opt-in per policy.
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        s (:ok (ex/admit reg (auth/public root) (string-token root "alice")
+                         (ctx) {:mem-per-session 1000000 :mem-per-user 4000000} nil))]
+    (is (contains? (ex/account-write! s 1) :error))
+    (ex/close reg s)))
+
+;; ── accounting integrity: close frees, usage reflects truth ──────────
+
+(deftest close-frees-memory-reservation
+  (let [root (auth/keypair)
+        reg (ex/registry)
+        pol {:mem-per-session 1000000 :mem-per-user 4000000
+             :disk-per-session 0 :disk-per-user 0}
+        s (:ok (ex/admit reg (auth/public root) (string-token root "alice")
+                         (ctx) pol nil))]
+    (is (= 1000000 (:mem-used (ex/usage reg "alice"))))
+    (is (= 1 (:sessions (ex/usage reg "alice"))))
+    (ex/close reg s)
+    (is (= 0 (:mem-used (ex/usage reg "alice"))))
+    (is (= 0 (:sessions (ex/usage reg "alice"))))))

@@ -51,6 +51,24 @@ defmodule BeamLisp.Env do
   @op_table :beam_lisp_ops
   @max_chain_depth 8
 
+  defmodule PerEnvDef do
+    @moduledoc """
+    The opaque descriptor a `^:per-env` def interns into the var slot (at
+    `:global` for a required library, or the current env for a directly
+    evaluated marked def). It carries NOT a value but a zero-arity `init`
+    thunk that is re-run once per consuming env on first read, plus a
+    `generation` ref so a redefinition invalidates already-materialized
+    instances (a live env re-runs the new thunk on next read).
+
+    Kept in the ORDINARY `{ns, name}` slot so namespace existence, public-name
+    enumeration, and alias/refer/shadowing precedence all keep working; only
+    `fetch/2` treats a hit on this struct specially. See `define_per_env/3`
+    and the per-env cold path in `fetch/2`.
+    """
+    @enforce_keys [:generation, :init]
+    defstruct [:generation, :init]
+  end
+
   def start_link(_opts) do
     Agent.start_link(
       fn ->
@@ -408,7 +426,22 @@ defmodule BeamLisp.Env do
   """
   def explain(ns, name) do
     for env <- chain(), {cns, cname} <- candidates(ns, name) do
-      %{env: env, ns: cns, name: cname, found: :ets.member(@table, pfx(env, {cns, cname}))}
+      # A per-env def splits across envs: the DESCRIPTOR usually lives at
+      # `:global` (library code), while a materialized INSTANCE lives in the
+      # consuming env. Report both facts per chain entry so a reader can see
+      # where the definition is AND which env(s) have their own instance.
+      instance? = :ets.member(@table, pfx(env, per_env_instance_key(cns, cname)))
+
+      kind =
+        case :ets.lookup(@table, pfx(env, {cns, cname})) do
+          [{_, %PerEnvDef{}}] -> :per_env_definition
+          [{_, _}] -> :normal
+          [] -> if instance?, do: :per_env_materialized_here, else: :absent
+        end
+
+      kind = if kind == :per_env_definition and instance?, do: :per_env_materialized_here, else: kind
+
+      %{env: env, ns: cns, name: cname, found: kind != :absent, kind: kind}
     end
   end
 
@@ -561,6 +594,112 @@ defmodule BeamLisp.Env do
   end
 
   @doc """
+  Register a `^:per-env` def: intern a `PerEnvDef` descriptor (a re-runnable
+  `init` thunk) into the CURRENT env's `{ns, name}` slot instead of a value.
+
+  The value is NOT created here. Each env that first READS `ns/name` runs the
+  thunk once, in that env, and caches the result in a hidden exact-env
+  instance row (see `fetch/2`). So two sibling forks that both read the var
+  get independent instances, while un-marked defs keep one global instance.
+
+  Returns `:ok` — a marked def is opt-in and deliberately does NOT return the
+  value (returning it would force eager materialization at definition time,
+  defeating the whole point).
+  """
+  def define_per_env(ns, name, init) when is_function(init, 0) do
+    put_key({ns, name}, %PerEnvDef{generation: make_ref(), init: init})
+    :ok
+  end
+
+  # The hidden, exact-env instance key for a materialized per-env value. NOT
+  # chain-walked: a lookup checks ONLY the current env, so a child env never
+  # inherits a parent's already-materialized instance (real isolation).
+  defp per_env_instance_key(resolved_ns, resolved_name),
+    do: {:per_env_instance, resolved_ns, resolved_name}
+
+  # Resolve a `PerEnvDef` hit to a concrete value for the CURRENT env: return a
+  # cached instance if its generation matches the descriptor, else materialize
+  # once (pinned) and cache. `resolved_ns`/`resolved_name` are the candidate
+  # pair that actually hit (an aliased/referred read materializes under the
+  # DEFINING ns/name, so every alias shares one instance per env).
+  defp resolve_per_env(%PerEnvDef{generation: gen} = desc, resolved_ns, resolved_name) do
+    env = env_id()
+    ikey = per_env_instance_key(resolved_ns, resolved_name)
+
+    case :ets.lookup(@table, pfx(env, ikey)) do
+      [{_, {^gen, value}}] ->
+        # Fresh instance already materialized in THIS env.
+        {:ok, value}
+
+      _ ->
+        # Miss, or a stale generation (descriptor was redefined) — (re)materialize.
+        materialize_per_env(desc, env, resolved_ns, resolved_name, ikey)
+    end
+  end
+
+  # Run a per-env init thunk once, pinned in the loader process, bound to the
+  # TARGET env + defining ns, and cache under the exact-env instance key. The
+  # pin matters: the stateful value may own a process/ETS (a datom conn's ETS,
+  # an atom's Agent), which must outlive whatever transient reader triggered
+  # the first read — the loader process is long-lived and serializes cold
+  # starts, so a double first-read collapses to one instance. A cyclic per-env
+  # init (A's thunk reads B's, B's reads A's) is caught deterministically.
+  defp materialize_per_env(%PerEnvDef{generation: gen, init: init}, env, resolved_ns, resolved_name, ikey) do
+    BeamLisp.Loader.Server.run(fn ->
+      # Re-check inside the pin: another queued reader may have just materialized
+      # this exact (env, var) at this generation.
+      case :ets.lookup(@table, pfx(env, ikey)) do
+        [{_, {^gen, value}}] ->
+          {:ok, value}
+
+        _ ->
+          guard_per_env_cycle!(env, resolved_ns, resolved_name)
+
+          try do
+            with_env(env, fn ->
+              with_ns(resolved_ns, fn ->
+                # The env may have been destroyed while queued — fail closed
+                # rather than resurrect an instance row into a dead env.
+                if env != :global and env_state(env) == nil do
+                  :error
+                else
+                  value = init.()
+                  :ets.insert(@table, {pfx(env, ikey), {gen, value}})
+                  {:ok, value}
+                end
+              end)
+            end)
+          after
+            unguard_per_env_cycle(env, resolved_ns, resolved_name)
+          end
+      end
+    end)
+  end
+
+  @pdict_per_env_stack :bl_per_env_init_stack
+
+  defp guard_per_env_cycle!(env, ns, name) do
+    key = {env, ns, name}
+    stack = Process.get(@pdict_per_env_stack, [])
+
+    if key in stack do
+      raise "cyclic per-env initialization: " <>
+              Enum.map_join([key | stack], " <- ", fn {e, n, nm} -> "#{inspect(e)} #{n}/#{nm}" end)
+    end
+
+    Process.put(@pdict_per_env_stack, [key | stack])
+  end
+
+  defp unguard_per_env_cycle(env, ns, name) do
+    key = {env, ns, name}
+
+    case Process.get(@pdict_per_env_stack, []) do
+      [^key | rest] -> Process.put(@pdict_per_env_stack, rest)
+      other -> Process.put(@pdict_per_env_stack, List.delete(other, key))
+    end
+  end
+
+  @doc """
   Resolve `name`, looking in `ns` first, then referred vars, and
   falling back to `core` (mirroring how jank and Clojure refer
   `clojure.core` into every namespace).
@@ -576,6 +715,29 @@ defmodule BeamLisp.Env do
     cands = candidates(ns, name)
 
     Enum.find_value(chain(), :error, fn env ->
+      Enum.find_value(cands, nil, fn {cns, cname} = key ->
+        case :ets.lookup(@table, pfx(env, key)) do
+          # Fast path: an ordinary value returns immediately. The only extra cost
+          # on the hot path is this struct pattern-branch on a HIT.
+          [{_, %PerEnvDef{} = desc}] -> resolve_per_env(desc, cns, cname)
+          [{_, value}] -> {:ok, value}
+          [] -> nil
+        end
+      end)
+    end)
+  end
+
+  @doc """
+  Like `fetch/2` but NON-materializing: a `^:per-env` var resolves to its
+  `PerEnvDef` descriptor, never a value. This is the compile-time / reflective
+  probe — asking "does this name bind?" or "is it a macro?" must NOT run a
+  per-env init thunk merely because some code references the var. Runtime var
+  resolution uses `fetch/2`, which materializes.
+  """
+  def peek(ns, name) do
+    cands = candidates(ns, name)
+
+    Enum.find_value(chain(), :error, fn env ->
       Enum.find_value(cands, nil, fn key ->
         case :ets.lookup(@table, pfx(env, key)) do
           [{_, value}] -> {:ok, value}
@@ -584,6 +746,9 @@ defmodule BeamLisp.Env do
       end)
     end)
   end
+
+  @doc "Whether `ns/name` binds at all (per-env descriptor counts), without materializing."
+  def bound?(ns, name), do: match?({:ok, _}, peek(ns, name))
 
   # The candidate `{ns, name}` pairs a lookup should try, in order:
   # the namespace itself, then referred vars, then `core` (mirroring
@@ -775,6 +940,11 @@ defmodule BeamLisp.Env do
   def undefine_var(ns, name) when is_binary(ns) and is_binary(name) do
     delete_key({ns, name})
     delete_key({:link, ns, name})
+    # A per-env def also caches a hidden instance row in this env; drop it so a
+    # re-defined or vanished var does not leave a stale materialized value
+    # behind. Descendant envs' instance rows become unreachable once the
+    # descriptor is gone and are swept when those envs are destroyed.
+    delete_key(per_env_instance_key(ns, name))
     put_ns_defs(ns, Map.delete(ns_defs(ns), name))
     :ok
   end
