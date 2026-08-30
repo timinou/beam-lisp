@@ -119,6 +119,55 @@
 (declare status)
 (declare print-errors)
 
+;; ── the prod policy: inspect always, MUTATE gated ────────────────────────
+;;
+;; The reload module is pure bl — it is in the image in EVERY environment, dev
+;; and prod alike. What differs is the blast radius we allow. Reading the live
+;; image (inspect / status / journal / namespaces) is always safe, everywhere.
+;; MUTATING it (commit → apply-bundle!) is gated:
+;;
+;;   dev   (Mix loaded) — allowed by default; this is the developer's own image.
+;;   prod  (a release, no Mix) — REFUSED unless BEAM_LISP_RELOAD=1 is set, so an
+;;         operator opts in deliberately, per node, with a bounded window.
+;;
+;; This mirrors the Wave-1 AOT gate (BEAM_LISP_AOT_STRICT): the guarantee lives
+;; in the running system, and a dangerous capability in prod is off until asked
+;; for. A staged, coherent bundle that is refused is HELD like any other — the
+;; edit is not lost, it simply does not go live until reload is enabled.
+
+(defn- mix-present?
+  "Whether Mix is loaded — true in dev/test, false in a production release. The
+   honest 'am I in a dev image' signal without threading Mix.env through bl. Uses
+   `:erlang.module_loaded`, which is a pure boolean predicate over already-loaded
+   modules — in a release Mix is simply not there."
+  []
+  (try (erlang/apply :erlang :module_loaded (list :Elixir.Mix))
+       (catch _ false)))
+
+; A runtime override for the policy: nil ⇒ decide from environment (the default);
+; true/false ⇒ force enabled/disabled. Lets an operator disable reload on a live
+; dev node (a canary), and lets tests exercise the refused path without a real
+; release. Set via `set-enabled!`.
+(def policy-override (atom nil))
+
+(defn set-enabled!
+  "Force the reload mutation policy on (`true`) or off (`false`), overriding the
+   environment decision; `nil` restores environment-based detection. Returns the
+   new override value."
+  [v]
+  (reset! policy-override v))
+
+(defn reload-enabled?
+  "Whether MUTATING reloads (commit) are permitted in this image. An explicit
+   `set-enabled!` override wins; otherwise dev (Mix loaded) is yes, and prod (a
+   release) is no unless BEAM_LISP_RELOAD is set — opt-in, bounded."
+  []
+  (let [o (deref policy-override)]
+    (if (not (nil? o))
+      o
+      (or (mix-present?)
+          (contains? #{"1" "true"} (System/get_env "BEAM_LISP_RELOAD"))))))
+
 (defn- declared-ns
   "The namespace a source string declares — the symbol after a leading `(ns …)`.
    nil when the first form is not `(ns …)`; a staged edit must name its ns so the
@@ -385,36 +434,58 @@
 
    Returns the bundle status. `:status` is:
      :applied — the bundle was coherent and is now live
-     :held    — incoherent (dangling / type / promise); old code still serves
+     :held    — incoherent (dangling / type / promise); or refused by the prod
+                policy (reload disabled) — the old code keeps serving either way
      :blocked — a message-migration was required or rejected (Wave 3)
      :empty   — nothing staged"
   []
   (let [s      (deref state)
         staged (vec (:staged s))]
-    (if (empty? staged)
+    (cond
+      (empty? staged)
       (do (swap! state (fn [s] (assoc s :status :empty))) (status))
-      (let [errors (coherence staged)
-            nses   (vec (keys (:staged s)))]
-        (if (seq errors)
-          (do
-            (swap! state (fn [s] (assoc s :status :held :errors errors)))
-            (journal! {:event :held :nses nses
-                       :errors (map (fn [e] {:kind (:kind e) :msg (:msg e)}) errors)})
-            (print-errors errors)
-            (status))
-          (do
-            (apply-bundle! staged)
-            (swap! state
-                   (fn [s]
-                     (-> s
-                         (assoc :status :applied)
-                         (assoc :errors [])
-                         (assoc :applied (vec (keys (:staged s))))
-                         (assoc :staged {})
-                         (assoc :migration nil))))
-            (journal! {:event :applied :nses nses
-                       :migration (some? (:migration s))})
-            (status)))))))
+
+      ;; the prod gate: mutating reloads are off in a release unless opted in.
+      ;; A refused bundle is HELD, not lost — identical treatment to an
+      ;; incoherent one: the old code serves and the edit waits.
+      (not (reload-enabled?))
+      (let [err {:kind :policy :ns (first (keys (:staged s)))
+                 :msg (str "reload is disabled in this image — set BEAM_LISP_RELOAD=1 "
+                           "to enable mutating reloads in production")}]
+        (swap! state (fn [s] (assoc s :status :held :errors [err])))
+        (journal! {:event :held :nses (vec (keys (:staged s))) :errors [err]})
+        (print-errors [err])
+        (status))
+
+      :else
+      (commit-coherent s staged))))
+
+(defn- commit-coherent
+  "The coherence-and-apply half of commit, once the prod policy has allowed a
+   mutation. Split out so the policy gate reads as one clear cond in `commit`."
+  [s staged]
+  (let [errors (coherence staged)
+        nses   (vec (keys (:staged s)))]
+    (if (seq errors)
+      (do
+        (swap! state (fn [s] (assoc s :status :held :errors errors)))
+        (journal! {:event :held :nses nses
+                   :errors (map (fn [e] {:kind (:kind e) :msg (:msg e)}) errors)})
+        (print-errors errors)
+        (status))
+      (do
+        (apply-bundle! staged)
+        (swap! state
+               (fn [s]
+                 (-> s
+                     (assoc :status :applied)
+                     (assoc :errors [])
+                     (assoc :applied (vec (keys (:staged s))))
+                     (assoc :staged {})
+                     (assoc :migration nil))))
+        (journal! {:event :applied :nses nses
+                   :migration (some? (:migration s))})
+        (status)))))
 
 (defn- print-errors
   "Render a held bundle's errors — one line per reason, so a developer sees the
