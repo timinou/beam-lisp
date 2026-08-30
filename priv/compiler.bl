@@ -369,12 +369,25 @@
   (let [parts (erlang/tuple_to_list link-info)
         mod (first parts)
         fixed (second parts)
+        variadic (nth parts 2)
         arity (count arg-asts)]
-    (if (contains? fixed arity)
-      ; Module.fname(args) — a direct remote call
-      (let [fname (get fixed arity)]
-        (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname))) arg-asts))
-      nil)))
+    (cond
+      ; a fixed arity match: Module.fname(args)
+      (contains? fixed arity)
+        (let [fname (get fixed arity)]
+          (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname))) arg-asts))
+      ; a variadic match {min, fname}: pass the first `min` args plus the rest
+      ; collected into a list — Module.fname(a1, ..., amin, [rest...])
+      (and (erlang/is_tuple variadic)
+           (>= arity (first (erlang/tuple_to_list variadic))))
+        (let [vparts (erlang/tuple_to_list variadic)
+              min (first vparts)
+              fname (second vparts)
+              fixed-args (apply list (take min arg-asts))
+              rest-args (apply list (drop min arg-asts))]
+          (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname)))
+                    (apply list (concat fixed-args (list rest-args)))))
+      :else nil)))
 
 (defn- core-qualified
   "Map `clojure.core/x` to `core/x`, leaving every other name unchanged.
@@ -457,7 +470,7 @@
 (def special-forms
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
-  #{"if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
+  #{"ns" "if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
     "defrecord" "deftype" "reify" "defnative" "defserver"
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
@@ -2101,6 +2114,100 @@
                     (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name mod))
                     mod))))
 
+; ---- ns (namespace declaration) ----------------------------------------------
+;
+; (ns name (:require [other :as o] [lib :refer [x y]] ...)) declares and enters
+; a namespace and loads/aliases/refers its dependencies. It compiles to a block
+; that declares the namespace, enters it, runs the requires, installs aliases
+; and refers, and returns the namespace name as an atom.
+
+(defn- parse-require-spec
+  "Parse one :require spec into [target as-alias refer]. A bare symbol is just a
+   target; a vector `[target :as a :refer [x y]]` carries an alias and/or refer
+   list (or :all)."
+  [spec]
+  (let [f (rn/node-form spec)]
+    (if (= :symbol (rn/node-tag f))
+      (list (rn/node-name f) nil (list))
+      ; a vector [target flags...]
+      (let [items (rn/node-items f)
+            target (rn/node-name (rn/node-form (first items)))]
+        (loop [fs (rest items) as-alias nil refer (list) expect nil]
+          (if (empty? fs)
+            (list target as-alias refer)
+            (let [x (rn/node-form (first fs))
+                  tag (rn/node-tag x)]
+              (cond
+                (and (= tag :keyword) (= "as" (rn/node-name x)))
+                  (recur (rest fs) as-alias refer :as)
+                (and (= tag :keyword) (= "refer" (rn/node-name x)))
+                  (recur (rest fs) as-alias refer :refer)
+                (= expect :as)
+                  (recur (rest fs) (rn/node-name x) refer nil)
+                (and (= expect :refer) (= tag :keyword) (= "all" (rn/node-name x)))
+                  (recur (rest fs) as-alias :all nil)
+                (and (= expect :refer) (= tag :vector))
+                  (recur (rest fs) as-alias
+                         (apply list (map (fn [s] (rn/node-name (rn/node-form s))) (rn/node-items x)))
+                         nil)
+                :else (throw (str "invalid :require spec for " target))))))))))
+
+(defn- compile-ns
+  "Compile (ns name clauses...) into the block that declares and enters the
+   namespace and processes its :require clauses.
+
+   Emits: bind `ns` = name, declare it, enter it, load each required target,
+   install aliases and refers, and return the namespace as an atom. The
+   namespace is declared BEFORE requiring so a circular require finds it
+   present."
+  [name-form clauses env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        ; gather all :require specs across the clauses
+        specs (mapcat (fn [clause]
+                        (let [items (rn/node-items (rn/node-form clause))
+                              head (rn/node-form (first items))]
+                          (if (and (= :keyword (rn/node-tag head)) (= "require" (rn/node-name head)))
+                            (rest items)
+                            (throw "ns supports only :require clauses"))))
+                      clauses)
+        ns-var (erlang/list_to_tuple (list :ns (list) var-context))
+        parsed (map parse-require-spec specs)
+        loads (apply list
+                (map (fn [p] (ast-mod-call (list :BeamLisp :Loader) :ensure_loaded (list (first p))))
+                     parsed))
+        ; aliases/refers accumulate in REVERSE spec order (the existing compiler
+        ; prepends each spec's op-group), but ops WITHIN a spec stay forward.
+        ; So build a per-spec op-list, reverse the outer, then flatten.
+        alias-groups (map (fn [p]
+                            (if (nil? (second p))
+                              (list)
+                              (list (ast-mod-call (list :BeamLisp :Env) :add_alias
+                                                  (list name (second p) (first p))))))
+                          parsed)
+        aliases (apply concat (reverse alias-groups))
+        refer-groups (map (fn [p]
+                            (let [r (nth p 2)]
+                              (cond
+                                (= r :all)
+                                  (list (ast-mod-call (list :BeamLisp :Env) :add_refer_all (list name (first p))))
+                                (empty? r) (list)
+                                :else
+                                  (apply list
+                                    (map (fn [sym] (ast-mod-call (list :BeamLisp :Env) :add_refer
+                                                               (list name sym (first p))))
+                                         r)))))
+                          parsed)
+        refers (apply concat (reverse refer-groups))
+        block-of (fn [stmts] (if (= 1 (count stmts)) (first stmts) (ast-node :__block__ (apply list stmts))))]
+    (ast-node :__block__
+              (list (ast-node := (list ns-var name))
+                    (ast-mod-call (list :BeamLisp :Env) :declare_ns (list ns-var))
+                    (ast-mod-call (list :BeamLisp :Env) :in_ns (list ns-var))
+                    loads
+                    (block-of aliases)
+                    (block-of refers)
+                    (ast-mod-call (list :String) :to_atom (list ns-var))))))
+
 (defn- compile-def
   "Compile (def name value) into the tree that records a namespace variable.
 
@@ -2235,26 +2342,56 @@
    `defvar` call tree, which at run time interns the function and returns it.
    A leading docstring is skipped (metadata handling is a later refinement)."
   [args env]
+  (compile-defn* args false env))
+
+(defn- var-meta-map
+  "Build the metadata-map AST for a var, or nil when there is none.
+
+   A docstring becomes `%{doc: \"...\"}`; a private var adds `private: true`.
+   Returns the `%{...}` map AST node, or nil when both are absent."
+  [doc private?]
+  (let [entries (concat (if (nil? doc) (list)
+                          (list (erlang/list_to_tuple (list :doc doc))))
+                        (if private?
+                          (list (erlang/list_to_tuple (list :private true)))
+                          (list)))]
+    (if (empty? entries) nil (ast-node map-head (apply list entries)))))
+
+(defn- compile-defn*
+  "The general defn compiler, with an explicit `private?` flag (for defn-).
+
+   Records a linked function variable via Link.defvar. When the definition has
+   a docstring or is private, the result is wrapped so the metadata is written
+   after interning: `value = defvar(...); Env.put_meta(ns, name, %{...}); value`."
+  [args private? env]
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
         rest-args (rest args)
-        ; skip an optional docstring (a leading string literal)
-        after-doc (if (and (not (empty? rest-args))
-                           (erlang/is_binary (rn/node-form (first rest-args))))
-                    (rest rest-args)
-                    rest-args)
+        has-doc (and (not (empty? rest-args))
+                     (erlang/is_binary (rn/node-form (first rest-args)))
+                     ; a lone string with nothing after is the body, not a doc
+                     (not (empty? (rest rest-args))))
+        doc (if has-doc (rn/node-form (first rest-args)) nil)
+        after-doc (if has-doc (rest rest-args) rest-args)
         mod (BeamLisp.Link/module_for (:ns env))
         clauses (parse-fn-clauses after-doc)
         entries (apply list
                   (map (fn [c]
                          (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
                        clauses))
-        ; Link.defvar takes the entries as DATA, so escape them into a literal;
-        ; location is a keyword list [file: ..., line: ...]
         location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
-                       (erlang/list_to_tuple (list :line (or (:line env) 1))))]
-    (ast-mod-call (list :BeamLisp :Link) :defvar
-                  (list (:ns env) name (Macro/escape entries) location))))
+                       (erlang/list_to_tuple (list :line (or (:line env) 1))))
+        defvar-ast (ast-mod-call (list :BeamLisp :Link) :defvar
+                                 (list (:ns env) name (Macro/escape entries) location))
+        meta (var-meta-map doc private?)]
+    (if (nil? meta)
+      defvar-ast
+      ; value = defvar(...); Env.put_meta(ns, name, meta); value
+      (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
+        (ast-node :__block__
+                  (list (ast-node := (list value-var defvar-ast))
+                        (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
+                        value-var))))))
 
 (defn- compile-special
   "Compile a special form by name."
@@ -2268,8 +2405,10 @@
     (= head "receive") (compile-receive args env)
     (= head "quote") (compile-quote (first args))
     (= head "syntax-quote") (compile-syntax-quote (first args) env)
+    (= head "ns") (compile-ns (first args) (rest args) env)
     (= head "def") (compile-def (first args) (second args) env)
-    (or (= head "defn") (= head "defn-")) (compile-defn args env)
+    (= head "defn") (compile-defn* args false env)
+    (= head "defn-") (compile-defn* args true env)
     (= head "defmacro") (compile-defmacro args env)
     (= head "defmulti") (compile-defmulti (first args) (second args) env)
     (= head "defmethod") (compile-defmethod (first args) (second args) (rest (rest args)) env)
