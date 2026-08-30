@@ -466,23 +466,211 @@
         (reverse acc)
         (recur (rest (rest xs)) (cons (list (first xs) (second xs)) acc))))))
 
+; ── destructuring ────────────────────────────────────────────────────────────
+;
+; A binding pattern can be more than a plain name. `[a b]` pulls the first two
+; elements out of a sequence; `{:keys [x y]}` pulls named keys out of a map.
+; Clojure compiles these into EXTRA plain bindings: bind the whole value to a
+; temporary, then bind each name to a lookup into that temporary. So
+; destructuring is not a new kind of step — it is a way to turn one fancy
+; binding into several plain ones, which the existing `let` machinery then
+; nests as usual.
+
+(declare destructure-steps)
+
+(defn- rt-nth-ast
+  "The tree for `BeamLisp.RT.nth(whole, i)` — the i-th element of a sequence."
+  [whole-ast i]
+  (ast-mod-call (list :BeamLisp :RT) :nth (list whole-ast i)))
+
+(defn- rt-get-ast
+  "The tree for `BeamLisp.RT.get(whole, key, default)` — a map lookup with a
+   fallback used when the key is absent."
+  [whole-ast key default-ast]
+  (ast-mod-call (list :BeamLisp :RT) :get (list whole-ast key default-ast)))
+
+(defn- rt-drop-ast
+  "The tree for the trailing part of a sequence after the first `n` elements —
+   what an `& rest` parameter binds.
+
+   Clojure binds an EXHAUSTED rest to nil, not to an empty list, so this is a
+   `case` over `RT.drop(whole, n)`: an empty result becomes nil, anything else
+   is the remaining sequence. Matching Clojure here matters — `(when (next s))`
+   loops depend on an exhausted rest being falsey."
+  [whole-ast n]
+  (let [dropped (fresh-var "dropped")
+        drop-call (ast-mod-call (list :BeamLisp :RT) :drop (list whole-ast n))
+        empty-clause (ast-node :-> (list (list (list)) nil))
+        keep-clause (ast-node :-> (list (list dropped) dropped))]
+    (ast-node :case
+              (list drop-call
+                    (list (erlang/list_to_tuple
+                            (list :do (list empty-clause keep-clause))))))))
+
+(defn- symbol-pattern?
+  "Say whether a pattern node is a plain symbol (a simple name binding) rather
+   than a vector or map pattern."
+  [pat]
+  (= :symbol (rn/node-tag (rn/node-form pat))))
+
+(defn- amp?
+  "Say whether a pattern node is the `&` that marks a rest parameter."
+  [pat]
+  (and (symbol-pattern? pat) (= "&" (rn/node-name (rn/node-form pat)))))
+
+(defn- destructure-symbol
+  "Bind a plain-name pattern to `value-ast`: one step, and the name recorded
+   as a local."
+  [name value-ast env]
+  (let [var (fresh-var name)]
+    {:steps (list (list var value-ast)) :env (put-local env name var)}))
+
+(defn- destructure-vector
+  "Expand a vector pattern `[a b & rest :as all]` against `whole-ast`.
+
+   Each element binds to `RT.nth(whole-ast, i)` (recursively, so `[[a] b]`
+   works by indexing into an index), an `& rest` name to the trailing sequence,
+   and an `:as name` to the whole value. `whole-ast` is the expression for the
+   value being taken apart — already a simple variable at the top level (the
+   caller binds a temporary), or an `RT.nth(...)` expression when nested."
+  [elems whole-ast env]
+  (loop [items elems i 0 acc {:steps (list) :env env}]
+    (cond
+      (empty? items) acc
+      ; :as name  — bind the whole value to name
+      (and (= :keyword (rn/node-tag (rn/node-form (first items))))
+           (= "as" (rn/node-name (rn/node-form (first items)))))
+        (let [name (rn/node-name (rn/node-form (second items)))
+              r (destructure-symbol name whole-ast (:env acc))]
+          (recur (rest (rest items)) i
+                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))
+      ; & rest  — bind the trailing sequence
+      (amp? (first items))
+        (let [rest-pat (second items)
+              r (destructure-steps rest-pat (rt-drop-ast whole-ast i) (:env acc))]
+          (recur (rest (rest items)) i
+                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))
+      ; an ordinary element at position i
+      :else
+        (let [r (destructure-steps (first items) (rt-nth-ast whole-ast i) (:env acc))]
+          (recur (rest items) (+ i 1)
+                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)})))))
+
+(defn- kv-key
+  "The key node of a map-node key/value pair (a 2-tuple)."
+  [pair]
+  (first (erlang/tuple_to_list pair)))
+
+(defn- kv-val
+  "The value node of a map-node key/value pair (a 2-tuple)."
+  [pair]
+  (second (erlang/tuple_to_list pair)))
+
+(defn- destructure-map
+  "Expand a map pattern against `whole-ast`.
+
+   Binds the whole value to a temporary, then each named key to a
+   `RT.get(whole, key, default)`. Handles `{:keys [x y]}` (bind x and y to keys
+   :x and :y), `{:as name}` (bind the whole value), `{:or {x 0}}` (defaults for
+   absent keys), and `{local :key}` (bind local to the value at :key). `kvs` is
+   the list of key/value pair tuples from the map pattern node."
+  [kvs whole-ast env]
+  (let [whole-var whole-ast
+        ; collect :or defaults first so any binding can use them
+        ors (reduce (fn [m pair]
+                      (let [k (rn/node-form (kv-key pair))]
+                        (if (and (= :keyword (rn/node-tag k)) (= "or" (rn/node-name k)))
+                          (reduce (fn [mm orpair]
+                                    (assoc mm (rn/node-name (rn/node-form (kv-key orpair)))
+                                              (kv-val orpair)))
+                                  m (rn/node-items (rn/node-form (kv-val pair))))
+                          m)))
+                    {} kvs)
+        base {:steps (list) :env env}]
+    (reduce
+      (fn [acc pair]
+        (let [k (rn/node-form (kv-key pair))
+              v (kv-val pair)]
+          (cond
+            ; :keys [a b] — bind each symbol to its keyword key
+            (and (= :keyword (rn/node-tag k)) (= "keys" (rn/node-name k)))
+              (reduce (fn [a2 sym]
+                        (let [name (rn/node-name (rn/node-form sym))
+                              default (get ors name)
+                              default-ast (if (nil? default) nil (compile default (:env a2)))
+                              r (destructure-symbol name
+                                   (rt-get-ast whole-var (erlang/binary_to_atom name) default-ast)
+                                   (:env a2))]
+                          {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
+                      acc (rn/node-items (rn/node-form v)))
+            ; :as name — bind the whole value
+            (and (= :keyword (rn/node-tag k)) (= "as" (rn/node-name k)))
+              (let [name (rn/node-name (rn/node-form v))
+                    r (destructure-symbol name whole-var (:env acc))]
+                {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
+            ; :or — already collected
+            (and (= :keyword (rn/node-tag k)) (= "or" (rn/node-name k)))
+              acc
+            ; {local :key} — pattern in key slot, lookup key in value slot
+            :else
+              (let [key-node (rn/node-form v)
+                    key-ast (if (= :keyword (rn/node-tag key-node))
+                              (erlang/binary_to_atom (rn/node-name key-node))
+                              (compile v (:env acc)))
+                    name (rn/node-name k)
+                    default (get ors name)
+                    default-ast (if (nil? default) nil (compile default (:env acc)))
+                    r (destructure-symbol name (rt-get-ast whole-var key-ast default-ast) (:env acc))]
+                {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))))
+      base kvs)))
+
+(defn- destructure-steps
+  "Turn one binding pattern against `value-ast` into a list of plain
+   [variable value-tree] steps plus the updated environment.
+
+   A plain name is one step. A vector pattern `[a b]` or a map pattern
+   `{:keys [..]}` expands into several — a temporary for the whole value, then
+   one step per destructured name. Nested patterns recurse."
+  [pattern value-ast env]
+  (let [pat (rn/node-form pattern)
+        tag (rn/node-tag pat)]
+    (cond
+      (= tag :symbol) (destructure-symbol (rn/node-name pat) value-ast env)
+      (= tag :vector) (destructure-vector (rn/node-items pat) value-ast env)
+      (= tag :map) (destructure-map (rn/node-items pat) value-ast env)
+      :else (throw (str "compiler: unsupported binding pattern")))))
+
 (defn- compile-let
-  "Turn (let [name value ...] body...) into nested immediately-called fns."
+  "Turn (let [pattern value ...] body...) into nested immediately-called fns.
+
+   Each binding's value is compiled against the environment so far, then the
+   binding's pattern is expanded into one or more plain steps (a plain name is
+   one step; a vector or map pattern expands into several). The steps nest as
+   immediately-called functions, and the body runs with all the bound names in
+   scope."
   [bindings-form body env]
   (let [items (rn/node-items (rn/node-form bindings-form))
         pairs (binding-pairs items)
         result (reduce
                  (fn [acc pair]
                    (let [e (:env acc)
-                         pat (rn/node-form (first pair))
-                         init-ast (compile (second pair) e)
-                         name (rn/node-name pat)
-                         var (fresh-var name)]
-                     {:steps (cons (list var init-ast) (:steps acc))
-                      :env (put-local e name var)}))
+                         init-ast (compile (second pair) e)]
+                     (if (symbol-pattern? (first pair))
+                       ; a plain name: one step, no temporary
+                       (let [r (destructure-symbol (rn/node-name (rn/node-form (first pair)))
+                                                   init-ast e)]
+                         {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
+                       ; a destructuring pattern: bind the value to a temporary
+                       ; ONCE (so it is not recomputed for each name), then
+                       ; index into that temporary
+                       (let [whole-var (fresh-var "whole")
+                             r (destructure-steps (first pair) whole-var e)]
+                         {:steps (concat (:steps acc)
+                                         (cons (list whole-var init-ast) (:steps r)))
+                          :env (:env r)}))))
                  {:steps (list) :env env} pairs)
         final-env (:env result)
-        steps (reverse (:steps result))
+        steps (:steps result)
         body-ast (compile-body body final-env)]
     (nest-lets steps body-ast)))
 
