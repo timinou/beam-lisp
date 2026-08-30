@@ -98,6 +98,20 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         # started", so `mix test` died before a single test ran in a
         # project whose code was perfectly fine. Cleaned up below.
         env_was_running? = Process.whereis(BeamLisp.Env) != nil
+
+        # INSTALL THE BOOTSTRAP SEED before init. beam-lisp's compiler is
+        # self-hosted (priv/compiler.bl) with no Elixir genesis fallback, so
+        # `BeamLisp.init/0` → `enable_bl_backend/0` must find the compiler beam
+        # already on the code path. On a fresh clone the build's ebin has no
+        # such beam yet; the committed seed under priv/bootstrap/seed/ is copied
+        # into the REAL compile path (where the loader looks) so the very first
+        # form compiles through the self-hosted compiler. Verified + repairing:
+        # a foreign-toolchain or corrupt seed fails loud here, never a silent
+        # boot. Idempotent — a warm build whose beam already matches does no
+        # work. Always the production compile path, even under `--out`, because
+        # that is where `Code`/the loader resolve `BeamLisp.Ns.Compiler`.
+        BeamLisp.Bootstrap.install!(Mix.Project.compile_path())
+
         BeamLisp.init()
 
         sources = discover(source_dirs)
