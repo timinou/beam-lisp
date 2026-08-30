@@ -457,7 +457,7 @@
 (def special-forms
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
-  #{"if" "do" "throw" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
+  #{"if" "do" "throw" "try" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
     "defrecord" "deftype"
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
@@ -765,6 +765,107 @@
   "Turn (throw x) into BeamLisp.ExInfo.raise_payload(x)."
   [x env]
   (ast-mod-call (list :BeamLisp :ExInfo) :raise_payload (list (compile x env))))
+
+; ---- try / catch / finally ---------------------------------------------------
+;
+; `(try body... (catch e handler...) (finally cleanup...))` becomes an Elixir
+; `try/catch/after`. The single catch clause catches ALL exit kinds, normalizes
+; the raised value the way Clojure expects (a thrown value stays itself; an
+; error becomes an exception struct; an exit becomes {:exit, v}), binds it to
+; the handler's name, and runs the handler. A `finally` becomes the `after`
+; block that always runs.
+
+(defn- catch-clause-form?
+  "Say whether a try sub-form is a (catch ...) clause."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "catch" (rn/node-name (rn/node-form (first items)))))))))
+
+(defn- finally-clause-form?
+  "Say whether a try sub-form is a (finally ...) clause."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "finally" (rn/node-name (rn/node-form (first items)))))))))
+
+(defn- compile-catch-branch
+  "Compile an untyped (catch e handler...) into the catch clause's dispatch.
+
+   Builds the `kind, value -> ...` clause: capture the stacktrace, normalize
+   the caught value into `e-var`, then `if true do (name = e; handler) else
+   reraise end`. `(catch Module.Name e ...)` typed catches are not yet handled."
+  [catch-form e-var kind-var value-var stack-var env]
+  (let [items (rn/node-items (rn/node-form catch-form))
+        e-name (rn/node-name (rn/node-form (second items)))
+        handler-forms (rest (rest items))
+        handler-var (fresh-var e-name)
+        handler-env (put-local env e-name handler-var)
+        handler-body (compile-body handler-forms handler-env)
+        ; handler runs as: name = e-var; body
+        handler (ast-node :__block__
+                          (list (ast-node := (list handler-var e-var))
+                                handler-body))
+        reraise (erl-call :erlang :raise (list kind-var value-var stack-var))]
+    ; if true do handler else reraise
+    (ast-node :if (list true (list (erlang/list_to_tuple (list :do handler))
+                                   (erlang/list_to_tuple (list :else reraise)))))))
+
+(defn- compile-try
+  "Compile (try body... (catch e h...) (finally f...)) into Elixir try/catch.
+
+   A try with neither catch nor finally is just its body. Otherwise it builds a
+   `try` with a single catch-all clause (normalizing the caught value) and an
+   optional `after` block."
+  [forms env]
+  (let [catches (filter catch-clause-form? forms)
+        finallies (filter finally-clause-form? forms)
+        body (filter (fn [f] (not (or (catch-clause-form? f) (finally-clause-form? f)))) forms)]
+    (if (and (empty? catches) (empty? finallies))
+      (compile-body body env)
+      (let [body-ast (compile-body body env)
+            kind-var (fresh-var "kind")
+            value-var (fresh-var "value")
+            e-var (fresh-var "e")
+            stack-var (fresh-var "stack")
+            ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
+            normalize (ast-node :case
+                                (list kind-var
+                                      (list (erlang/list_to_tuple
+                                              (list :do
+                                                    (list (ast-node :-> (list (list :throw) value-var))
+                                                          (ast-node :-> (list (list :error)
+                                                                              (ast-mod-call (list :Exception) :normalize
+                                                                                            (list :error value-var stack-var))))
+                                                          (ast-node :-> (list (list :exit)
+                                                                              ; a 2-tuple literal {:exit, v} is a BARE
+                                                                              ; tuple in Elixir AST, not a {:{},[],..} node
+                                                                              (erlang/list_to_tuple (list :exit value-var))))))))))
+            dispatch-body (compile-catch-branch (first catches) e-var kind-var value-var stack-var env)
+            ; stack = __STACKTRACE__; e = normalize; dispatch
+            catch-body (ast-node :__block__
+                                 ; __STACKTRACE__ is a bare special variable
+                                 ; {:__STACKTRACE__, [], nil}, not a call
+                                 (list (ast-node := (list stack-var
+                                                          (erlang/list_to_tuple (list :__STACKTRACE__ (list) var-context))))
+                                       (ast-node := (list e-var normalize))
+                                       dispatch-body))
+            catch-clause (ast-node :-> (list (list kind-var value-var) catch-body))
+            ; assemble the try opts: [do: body, catch: [clause], after: fin?]
+            base-opts (list (erlang/list_to_tuple (list :do body-ast))
+                            (erlang/list_to_tuple (list :catch (list catch-clause))))
+            opts (if (empty? finallies)
+                   base-opts
+                   (let [fin-items (rest (rn/node-items (rn/node-form (first finallies))))
+                         fin-ast (compile-body fin-items (notail env))]
+                     (concat base-opts (list (erlang/list_to_tuple (list :after fin-ast))))))]
+        (ast-node :try (list (apply list opts)))))))
 
 (defn- datum
   "Turn a reader form into the plain DATA value it denotes.
@@ -1736,6 +1837,7 @@
                               (if (>= (count args) 3) (nth args 2) nil) env)
     (= head "do") (compile-body args env)
     (= head "throw") (compile-throw (first args) env)
+    (= head "try") (compile-try args env)
     (= head "quote") (compile-quote (first args))
     (= head "syntax-quote") (compile-syntax-quote (first args) env)
     (= head "def") (compile-def (first args) (second args) env)
