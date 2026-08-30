@@ -762,6 +762,100 @@ defmodule BeamLisp.Env do
   def put_ns_defs(ns, defs), do: put_key({:ns_defs, ns}, defs)
 
   @doc """
+  Remove `name` from `ns` entirely: its value binding, its link-info, and its
+  entry in the ns_defs registry. The compiled body module is left as-is (it is
+  immutable and simply becomes unreferenced — same discipline as redefinition,
+  where an old body module is never purged so in-flight closures survive).
+
+  This is the primitive behind NAMESPACE-LEVEL reload: a var that a namespace's
+  new source no longer defines is genuinely gone from the image, so a surviving
+  reference to it resolves to nothing (dangling) rather than silently calling the
+  stale definition. Deletes only in the CURRENT env.
+  """
+  def undefine_var(ns, name) when is_binary(ns) and is_binary(name) do
+    delete_key({ns, name})
+    delete_key({:link, ns, name})
+    put_ns_defs(ns, Map.delete(ns_defs(ns), name))
+    :ok
+  end
+
+  @doc """
+  Names interned directly in `ns` in the CURRENT env only (no read-through to
+  ancestors, no refers, no core). The honest "what does this namespace own right
+  here" question a whole-namespace reload must ask before deciding what vanished.
+  """
+  def own_names(ns) when is_binary(ns) do
+    :ets.match(@table, {key({ns, :"$1"}), :_}) |> List.flatten() |> Enum.uniq()
+  end
+
+  @doc """
+  Every live var, across ALL namespaces, that statically calls `target_ns/name`
+  as a qualified remote call — returned as `[{caller_ns, caller_name} …]`,
+  excluding the target's own namespace (same-ns references are judged by the
+  reload dangling pass).
+
+  This is the cross-namespace half of "the whole renaming ethics": a namespace
+  reload that DROPS a public var must know whether any OTHER live namespace still
+  depends on it, so the bundle can be held until those callers are updated too.
+  The walk reads each var's compiled def AST from `ns_defs` and looks for the
+  remote-call node `{:., _, [Module, fname]}` whose module is the target ns's
+  module and whose function is `name`.
+  """
+  def callers_of(target_ns, name) when is_binary(target_ns) and is_binary(name) do
+    target_mod = BeamLisp.Emit.module_for(target_ns)
+    fname = String.to_atom(name)
+
+    for caller_ns <- namespaces(),
+        caller_ns != target_ns,
+        {vname, entries} <- ns_defs(caller_ns),
+        ast_calls_remote?(entries, {target_ns, name, target_mod, fname}),
+        uniq: true do
+      {caller_ns, vname}
+    end
+  end
+
+  defp ast_calls_remote?(entries, target) when is_list(entries) do
+    Enum.any?(entries, fn entry ->
+      node_calls_remote?(elem(entry, 3), target)
+    end)
+  end
+
+  defp ast_calls_remote?(_entries, _target), do: false
+
+  # A depth-first walk of a compiled def AST for a reference to the target var,
+  # matching BOTH shapes the compiler emits for a qualified cross-ns call:
+  #   * static  — `{:., _, [TargetModule, :fname]}` (remote call to the ns module)
+  #   * dynamic — `BeamLisp.Env.fetch!("target.ns", "name")` / `fetch(…)`
+  #     (a runtime var lookup, emitted when the callee's ns is known-but-forked)
+  # Either proves a live static dependency on the target var.
+  defp node_calls_remote?({{:., _, [mod, f]}, _, _args}, {_tns, _name, target_mod, fname})
+       when mod == target_mod and f == fname do
+    true
+  end
+
+  defp node_calls_remote?(
+         {{:., _, [{:__aliases__, _, [:BeamLisp, :Env]}, fetch]}, _, [tns, nm | _]},
+         {target_ns, name, _tm, _fn}
+       )
+       when fetch in [:fetch!, :fetch] and tns == target_ns and nm == name do
+    true
+  end
+
+  defp node_calls_remote?({_a, _meta, args}, target) do
+    node_calls_remote?(args, target)
+  end
+
+  defp node_calls_remote?([h | t], target) do
+    node_calls_remote?(h, target) or node_calls_remote?(t, target)
+  end
+
+  defp node_calls_remote?({a, b}, target) do
+    node_calls_remote?(a, target) or node_calls_remote?(b, target)
+  end
+
+  defp node_calls_remote?(_other, _target), do: false
+
+  @doc """
   Every namespace that exists: defined something OR declared by `(ns …)`.
 
   Used to resolve a bare name when the current namespace is not the one

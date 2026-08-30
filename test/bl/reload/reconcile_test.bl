@@ -1,0 +1,222 @@
+; test/bl/reload/reconcile_test.bl — the coherent live-reload loop, by use case.
+;
+; Each deftest is a scenario a developer actually hits: swap a fn and callers
+; never notice; half-finish a rename and the old code keeps serving; declare a
+; promise and hold until it is kept. The invariant under all of them: an
+; incoherent bundle NEVER touches the live image, and a coherent one applies
+; atomically.
+;
+; NB reload creates namespaces at RUNTIME, so a test cannot name their fns with
+; static `ns/fn` syntax (the compiler would read an unknown `ns/fn` as Erlang
+; interop when THIS file compiles, before the ns exists). We invoke through
+; `call`, which evaluates the reference against the live image after a commit —
+; exactly how a real caller reaches a freshly-reloaded var.
+
+(ns reload.reconcile-test
+  (:require [reload] [env]))
+
+(defn- call
+  "Evaluate `expr` (a source string) against the live image — the runtime way to
+   reach a reload-created var from a pre-compiled test."
+  [expr]
+  (env/eval expr))
+
+; ── use case 1: identity swap — redefine a pure fn, callers unaffected ──
+
+(deftest identity-swap-applies
+  (reload/abort)
+  (reload/stage "(ns rc.id)\n(defn greet [] \"v1\")\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= "v1" (call "(rc.id/greet)")))
+  (reload/stage "(ns rc.id)\n(defn greet [] \"v2\")\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= "v2" (call "(rc.id/greet)"))))
+
+; ── use case 2: a dangling reference HOLDS — old code still serves ──────
+
+(deftest dangling-holds-old-serves
+  (reload/abort)
+  (reload/stage "(ns rc.dang)\n(defn f [] :orig)\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :orig (call "(rc.dang/f)")))
+  ; edit f to call something that exists nowhere → incoherent
+  (reload/stage "(ns rc.dang)\n(defn f [] (nonexistent-helper))\n")
+  (let [r (reload/commit)]
+    (is (= :held (:status r)))
+    (is (= 1 (count (:errors r))))
+    (is (= :dangling (:kind (first (:errors r))))))
+  ; the live image is untouched: f still answers :orig
+  (is (= :orig (call "(rc.dang/f)"))))
+
+; ── use case 3: reload is NAMESPACE-LEVEL — a whole-ns replacement ───────
+;
+; The staged source IS the namespace: a name the new source omits is genuinely
+; DROPPED, not left shadow-callable. This is 'the whole renaming ethics' — a
+; rename must move every reference, because the old name really disappears.
+;
+;   (a) rename helper→helper2 but leave a caller on the OLD name → dangling, held
+;   (b) rename BOTH the callee and its caller in one source → coherent, and the
+;       old `helper` is gone afterwards (a call to it now fails).
+
+(deftest namespace-level-rename
+  (reload/abort)
+  (reload/stage "(ns rc.rn)\n(defn helper [] :h)\n(defn use-it [] (helper))\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :h (call "(rc.rn/use-it)")))
+  ; (a) half-rename: define helper2, but use-it still calls the now-removed helper
+  (reload/stage "(ns rc.rn)\n(defn helper2 [] :h2)\n(defn use-it [] (helper))\n")
+  (is (= :held (:status (reload/commit))))
+  (is (= :h (call "(rc.rn/use-it)")))             ; old whole-ns still serves
+  ; (b) complete the rename: move the caller onto helper2 in the same source
+  (reload/stage "(ns rc.rn)\n(defn helper2 [] :h2)\n(defn use-it [] (helper2))\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :h2 (call "(rc.rn/use-it)")))
+  ; the old `helper` is genuinely GONE — a reference to it no longer resolves
+  (is (= :removed
+         (env/eval "(try (rc.rn/helper) (catch _ :removed))"))))
+
+; ── use case 3b: cross-ns removal is held until the caller is updated too ─
+;
+; Dropping a PUBLIC var that another live namespace still calls is refused —
+; the bundle holds with a :removal error naming the outside caller, until that
+; caller is staged in the same bundle.
+
+(deftest cross-ns-removal-held
+  (reload/abort)
+  (reload/stage "(ns rc.lib)\n(defn thing [] :orig)\n")
+  (reload/stage "(ns rc.app)\n(defn run [] (rc.lib/thing))\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :orig (call "(rc.app/run)")))
+  ; drop rc.lib/thing (rename to thing2) WITHOUT updating rc.app → held
+  (reload/stage "(ns rc.lib)\n(defn thing2 [] :new)\n")
+  (let [r (reload/commit)]
+    (is (= :held (:status r)))
+    (is (some? (some (fn [e] (= :removal (:kind e))) (:errors r)))))
+  (is (= :orig (call "(rc.app/run)")))            ; caller unbroken through the hold
+  ; stage BOTH the library rename and the caller update together → coherent
+  (reload/stage "(ns rc.lib)\n(defn thing2 [] :new)\n")
+  (reload/stage "(ns rc.app)\n(defn run [] (rc.lib/thing2))\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :new (call "(rc.app/run)"))))
+
+; ── use case 4: forward reference within one bundle is fine ─────────────
+
+(deftest forward-reference-in-bundle
+  (reload/abort)
+  ; b calls a; a is defined LATER in the same source — the bundle is judged
+  ; as a whole, so this is coherent, not dangling.
+  (reload/stage "(ns rc.fwd)\n(defn b [] (a))\n(defn a [] :ok)\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :ok (call "(rc.fwd/b)"))))
+
+; ── use case 5: an unfulfilled promise HOLDS, then is kept ──────────────
+
+(deftest promise-holds-then-kept
+  (reload/abort)
+  (reload/stage "(ns rc.prom)\n(declare later)\n(defn now [] (later))\n")
+  (let [r (reload/commit)]
+    (is (= :held (:status r)))
+    ; the promise is reported among the reasons
+    (is (some? (some (fn [e] (= :promise (:kind e))) (:errors r)))))
+  ; keep the promise in a later edit → coherent
+  (reload/stage "(ns rc.prom)\n(declare later)\n(defn now [] (later))\n(defn later [] :kept)\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :kept (call "(rc.prom/now)"))))
+
+; ── use case 6: abort discards a staged bundle, image untouched ─────────
+
+(deftest abort-discards
+  (reload/abort)
+  (reload/stage "(ns rc.ab)\n(defn v [] :first)\n")
+  (is (= :applied (:status (reload/commit))))
+  (reload/stage "(ns rc.ab)\n(defn v [] :second)\n")
+  (is (= ["rc.ab"] (:bundle (reload/status))))
+  (reload/abort)
+  (is (= :empty (:status (reload/status))))
+  (is (= :first (call "(rc.ab/v)"))))             ; the aborted edit never applied
+
+; ── use case 7: status/drain report the settled image honestly ─────────
+
+(deftest status-and-drain
+  (reload/abort)
+  (is (= :empty (:status (reload/drain))))
+  (reload/stage "(ns rc.st)\n(defn ok [] 1)\n")
+  (is (= :staged (:status (reload/status))))
+  (reload/commit)
+  (is (= :applied (:status (reload/drain))))
+  (is (= ["rc.st"] (:applied (reload/status)))))
+
+; ── use case 8: inspect exposes a queryable live image + event journal ──
+;
+; The read-model behind every monitor (CLI, web). A commit records an event; a
+; hold records why; `namespaces` lists the live application image with its vars.
+
+(deftest inspect-and-journal
+  (reload/abort)
+  (reload/stage "(ns rc.insp)\n(defn a [] 1)\n(defn b [] 2)\n")
+  (reload/commit)
+  ; the namespace shows up with its vars in the app image
+  (let [nses (reload/namespaces)
+        mine (some (fn [e] (if (= "rc.insp" (:ns e)) e nil)) nses)]
+    (is (some? mine))
+    (is (= 2 (:count mine)))
+    (is (= ["a" "b"] (vec (:vars mine)))))
+  ; a hold records a :held event with its reason in the journal
+  (reload/stage "(ns rc.insp)\n(defn a [] (gone))\n")
+  (reload/commit)
+  (let [j (reload/journal)
+        last-ev (last j)]
+    (is (= :held (:event last-ev)))
+    (is (= :dangling (:kind (first (:errors last-ev))))))
+  ; inspect bundles status + namespaces + journal into one snapshot
+  (let [snap (reload/inspect)]
+    (is (contains? snap :status))
+    (is (contains? snap :namespaces))
+    (is (contains? snap :journal))))
+
+; ── use case 9: live subscribers are pushed a [:reload/event …] per commit ─
+;
+; The backbone of the web monitor: a process subscribes, and every commit
+; outcome is delivered to it as a message. This is verified without a browser —
+; the socket is just a subscribed process.
+
+(deftest live-subscription-push
+  (reload/abort)
+  (reload/subscribe (erlang/self))
+  (reload/stage "(ns rc.sub)\n(defn ok [] 1)\n")
+  (reload/commit)
+  ; the commit was pushed to us as a [:reload/event ev] message
+  (let [ev (receive [:reload/event e] e (after 1000 :none))]
+    (is (not (= :none ev)))
+    (is (= :applied (:event ev)))
+    (is (= ["rc.sub"] (vec (:nses ev)))))
+  (reload/unsubscribe (erlang/self)))
+
+; ── use case 10: the prod policy gates MUTATION, never inspection ───────
+;
+; reload is in the image everywhere; what differs is blast radius. With the
+; mutation policy forced OFF (as in a production release without opt-in), a
+; commit is REFUSED — held with a :policy reason, old code serving — while
+; reading the image stays available. Flip it on and the same bundle lands.
+
+(deftest prod-policy-gates-mutation
+  (reload/abort)
+  ; seed with reload enabled, then force the policy OFF (simulate a release)
+  (reload/set-enabled! true)
+  (reload/stage "(ns rc.pol)\n(defn v [] :one)\n")
+  (is (= :applied (:status (reload/commit))))
+  (reload/set-enabled! false)
+  ; a coherent edit is now REFUSED, held with a :policy reason
+  (reload/stage "(ns rc.pol)\n(defn v [] :two)\n")
+  (let [r (reload/commit)]
+    (is (= :held (:status r)))
+    (is (= :policy (:kind (first (:errors r))))))
+  ; inspection still works while mutation is gated
+  (is (some? (reload/inspect)))
+  (is (= :one (call "(rc.pol/v)")))            ; old code serves through the refusal
+  ; re-enable → the same bundle applies
+  (reload/set-enabled! true)
+  (reload/stage "(ns rc.pol)\n(defn v [] :two)\n")
+  (is (= :applied (:status (reload/commit))))
+  (is (= :two (call "(rc.pol/v)")))
+  (reload/set-enabled! nil))                    ; restore env-based policy

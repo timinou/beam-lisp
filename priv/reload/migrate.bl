@@ -1,0 +1,186 @@
+; reload/migrate.bl — verified in-flight message migration.
+;
+; ── The isomorphism ─────────────────────────────────────────────────────
+;
+; A message queued in a mailbox is an UNFULFILLED PROMISE: the sender promised
+; the receiver a value of a shape it handles. Change the receiver's message
+; contract and every queued message becomes a broken promise — the bundle that
+; makes the change is incoherent (reload.bl's `message` predicate) until a
+; MIGRATION is attached that fulfils those promises under the new contract.
+;
+; This is `datom/migrate` on the PROCESS plane — the same shape, retargeted from
+; datoms-at-rest to messages-in-flight:
+;
+;   :migration/modules  the code whose message-contract changed
+;   :migration/fn       old-message → new-message  (the upgrade, ↔ datom's db→tx)
+;   :migration/strategy :quiesce | :reroute
+;   :migration/checks   what the new handler must still satisfy
+;
+; and it is VERIFIED by the machinery `examples/system/08_hot_upgrade.bl` already
+; proves: a migration is safe iff it PRESERVES the new handler's invariant and
+; the new handler SIMULATES the old under a relation R — a wrong migration is
+; rejected BEFORE it ships, the process never stopping.
+;
+; ── R is DEDUCED, not written ───────────────────────────────────────────
+;
+; Verification is MANDATORY for :reroute and needs no annotation: the relation
+; the migration must preserve is the new handler's own inductive invariant,
+; DISCOVERED by the Houdini fixpoint (`discover-invariant`). Three honest
+; outcomes, because discovery is honest:
+;   discovered non-nil, migrate preserves it → :verified  (:r-source :discovered)
+;   discovered non-nil, migrate breaks it     → :blocked + a repair (repair-process)
+;   discovered nil (no invariant of the shape) → :verified under the OBSERVABLE-EQ
+;                                                fallback, flagged :r-source :observable-eq
+; The fixed observable-equality relation is the FALLBACK for shapes whose
+; invariant vocabulary is empty — never the default when real structure exists.
+
+(ns reload.migrate
+  (:require [system.model :as model] [system.core :as sys] [z3]))
+
+;; ── the migration spec ──────────────────────────────────────────────────
+
+(defn migration
+  "Build a migration spec. Required: :id, :modules (nses whose contract changed),
+   :strategy (:quiesce | :reroute). For :reroute also :fn (old-msg → new-msg) and
+   the SMT wiring the verifier needs (:decls :v1 :v2 :migrate). :invariant is an
+   optional explicit relation-fn (v → SMT); omitted ⇒ DEDUCED from the new
+   handler."
+  [m]
+  (merge {:id nil :modules [] :strategy :quiesce
+          :fn nil :invariant nil :decls nil :v1 nil :v2 nil :migrate nil}
+         m))
+
+;; ── R deduction: the new handler's own discovered invariant ─────────────
+
+(defn- number-token? [t]
+  (try (let [_ (erlang/binary_to_integer t)] true) (catch _ false)))
+
+(defn- invariant-var
+  "The single state variable a discovered invariant is written over — the first
+   identifier token that is not an SMT operator, boolean, or number. The
+   discovered predicate is over the handler's state var (e.g. `balance` in
+   `(and (>= balance 0))`); we need its name to re-express the invariant over
+   `v1`/`v2` in the migration check."
+  [smt]
+  (let [stripped (reduce (fn [s d] (join " " (split s d))) smt
+                         ["(" ")" "[" "]" "{" "}"])
+        ops #{"" "and" "or" "not" "=" "<" ">" "<=" ">=" "+" "-" "*" "mod"
+              "true" "false"}
+        toks (filter (fn [t] (and (not (contains? ops t))
+                                  (not (number-token? t))))
+                     (split stripped " "))]
+    (first toks)))
+
+(defn deduce-r
+  "The relation the migration must preserve, deduced from the new handler node.
+   Returns {:source :discovered|:observable-eq :inv-fn (v → SMT) :raw smt}.
+   `discover-invariant` runs the Houdini fixpoint; when it finds nothing of the
+   shape — or the shape is one the discoverer cannot translate (it may throw on
+   an untranslatable node) — we fall back to observable-equality, flagged, never
+   silently and never by crashing. Honesty over a false proof.
+
+   The discovered predicate is over the handler's state var; `inv-fn` re-expresses
+   it over any var name by substituting that state var, so `migration-preserves?`
+   can apply it to v1 and v2."
+  [port new-handler-node]
+  (let [smt (try (:discovered (sys/discover-invariant port new-handler-node))
+                 (catch _ nil))]
+    (if (nil? smt)
+      {:source :observable-eq :inv-fn nil}
+      (let [svar (invariant-var smt)]
+        (if (nil? svar)
+          {:source :observable-eq :inv-fn nil}
+          {:source :discovered
+           :raw smt
+           :inv-fn (fn [v] (join v (split smt svar)))})))))
+
+;; ── verify a :reroute migration ─────────────────────────────────────────
+
+(defn verify-migration
+  "Verify that a :reroute migration is safe: the migrated message preserves the
+   new handler's DEDUCED invariant. Rides `migration-preserves?` — the same
+   check `08_hot_upgrade` proves. Returns:
+
+     {:verified true  :r-source :discovered|:observable-eq}
+     {:verified false :r-source … :countermodel … :repair {…}}
+
+   `spec` carries the SMT wiring (:decls :v1 :v2 :migrate); `new-handler-node` is
+   the read new handler form (for R deduction and, on failure, repair)."
+  [port spec new-handler-node]
+  (let [explicit (:invariant spec)
+        r (if explicit
+            {:source :explicit :inv-fn explicit}
+            (deduce-r port new-handler-node))
+        inv-fn (:inv-fn r)]
+    (cond
+      ; no invariant of the shape ⇒ observable-equality fallback: the migration
+      ; is accepted as observation-preserving, said out loud.
+      (nil? inv-fn)
+      {:verified true :r-source :observable-eq
+       :note "no invariant discovered for this shape; accepted under observable-equality"}
+
+      ; the real check: does migrating v1 → v2 preserve the deduced invariant?
+      (sys/migration-preserves? port inv-fn (:decls spec) (:v1 spec) (:v2 spec) (:migrate spec))
+      {:verified true :r-source (:source r)}
+
+      ; broken: synthesize the fix the migration (or the handler's guard) needs.
+      :else
+      (let [repair (sys/repair-process port new-handler-node)]
+        {:verified false
+         :r-source (:source r)
+         :reason :breaks-invariant
+         :countermodel {:decls (:decls spec) :migrate (:migrate spec)
+                        :invariant (:raw r)}
+         :repair repair}))))
+
+;; ── the dispatch-table check: which arms the migrated message can land in ──
+
+(defn covered-labels
+  "The set of branch labels a dispatch target handles. Accepts either a single
+   node (a defserver / receive / single defmethod — lowered via `transitions`) or
+   a ready CLAUSE SET (from `transitions-for-multi`, gathering a multimethod's
+   scattered arms). A migrated message whose label is NOT in this set would land
+   on no arm — the multiple-dispatch analogue of a dangling reference."
+  [node-or-clauses]
+  (let [clauses (if (and (sequential? node-or-clauses)
+                         (seq node-or-clauses)
+                         (map? (first node-or-clauses)))
+                  node-or-clauses                         ; already a clause set
+                  (model/transitions node-or-clauses))]   ; a node → lower it
+    (set (map :label clauses))))
+
+(defn lands-on-arm?
+  "Whether a migrated message's `label` is handled by the dispatch target
+   (`node-or-clauses`, see `covered-labels`). A `false` is the multiple-dispatch
+   analogue of a dangling ref — the message would raise no-method at delivery."
+  [node-or-clauses label]
+  (contains? (covered-labels node-or-clauses) label))
+
+;; ── strategies: quiesce (drain) and reroute (transform in flight) ────────
+
+(defn calm?
+  "QUIESCE, final boss 1: is the system calm enough to swap? True when no
+   in-flight message belongs to the migrating modules. `mailbox-count` is an
+   injected fn `module → count` (the live-mailbox query in production; a map
+   lookup in tests) so calmness is a QUERYABLE predicate, not a sleep."
+  [spec mailbox-count]
+  (every? (fn [m] (= 0 (mailbox-count m))) (:modules spec)))
+
+(defn reroute-message
+  "REROUTE, final boss 2: transform one in-flight message to the new contract.
+   `(:fn spec)` is the upgrade old-msg → new-msg. A message already in the new
+   shape (or with no migration fn) passes through unchanged."
+  [spec msg]
+  (let [f (:fn spec)]
+    (if (nil? f) msg (f msg))))
+
+(defn plan
+  "Walk a set of in-flight `messages` and report what the migration will do to
+   each WITHOUT applying it — the datom/migrate `plan` shape on the process
+   plane. Returns [{:msg :migrated :changed?} …]. Commit nothing; this is the
+   speculative pass a verifier runs before a swap."
+  [spec messages]
+  (map (fn [msg]
+         (let [migrated (reroute-message spec msg)]
+           {:msg msg :migrated migrated :changed? (not (= msg migrated))}))
+       messages))

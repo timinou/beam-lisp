@@ -113,7 +113,19 @@ defmodule BeamLisp.Multi do
     Env.put_key({:multi, ns, name}, %{entry | methods: methods})
     method_fn
   end
-
+  @doc """
+  The dispatch keys registered for multimethod `ns`/`name` right now, or `[]`
+  when no such multimethod exists. Used by the reload migration verifier to
+  fuse SOURCE methods (verifiable from text) with RUNTIME-added ones (keys only,
+  no source body) so a dispatch table extended by `add_method/4` is enumerated,
+  not silently missed — the source-absent keys are reported :approximate.
+  """
+  def method_keys(ns, name) do
+    case Env.lookup({:multi, ns, name}) do
+      {:ok, entry} -> Map.keys(entry.methods)
+      :error -> []
+    end
+  end
   @doc """
   Run a multimethod: apply its dispatch fn to `args`, look up the
   method by the normalized result, falling back to the `:default`

@@ -1,0 +1,591 @@
+; reload.bl — the coherent live-reload loop: the running image is the source of
+; truth, and every edit is a TRANSACTION over it.
+;
+; ── The one idea ────────────────────────────────────────────────────────
+;
+; A `.bl` file on disk is a live handle to a running namespace. You stage edits
+; into a BUNDLE (the set of changes since the last coherent image), and `commit`
+; either applies the whole bundle atomically — or holds it, printing every
+; reason it does not yet make sense, WITH THE OLD CODE STILL SERVING, until a
+; later edit completes the bundle. Nothing half-applied is ever observable.
+;
+; ── Why a bundle, not a file ────────────────────────────────────────────
+;
+; Rename a fn across its definition and its five callers: each individual save
+; is incoherent (the callers dangle, or the def is gone), yet the WHOLE change
+; is fine. The transaction unit must be the edit set, or a mid-rename save would
+; go live with a dangling reference — exactly the `undefined var` class the
+; provenance gate (aot.ex) already closes for stale beams, lifted to live edits.
+;
+; ── How it stays safe: coherence is STATIC ──────────────────────────────
+;
+; `commit` decides coherence from the bundle SOURCES plus the live image's
+; public names — WITHOUT executing the bundle. This is load-bearing: evaluating a
+; `defn` rebuilds its global shim module (`BeamLisp.Ns.<Ns>`), a side effect an
+; env fork does NOT contain (a fork isolates the var REGISTRY, not compiled BEAM
+; modules). So an eval-based "candidate image" would leak an incoherent def into
+; the live module the instant it validated. The predicates — dangling ref,
+; promise, type — are all statically decidable, so no evaluation is needed to
+; judge a bundle. Only a bundle PROVEN coherent is then evaluated into `:global`,
+; where each `defn` is a `Link.defvar` in place — an atomic hot swap. Callers
+; mid-flight finish on their captured body module (never reloaded, never purged);
+; the next call resolves the new one. No caller observes a missing or half-updated
+; var, and an incoherent bundle never touches the live image at all.
+;
+; ── The unit is the NAMESPACE, not the var ────────────────────────────
+;
+; A staged source IS the whole namespace. A name the new source no longer
+; defines is genuinely REMOVED from the image on commit — not left additively
+; shadow-callable. This is 'the whole renaming ethics': rename a fn and every
+; reference must move, because the old name really disappears. Coherence enforces
+; both faces — a same-ns reference to a dropped name is dangling (held), and a
+; dropped PUBLIC var that another live namespace still calls is a :removal error
+; (held until that caller is staged too). So a rename is atomic across every
+; namespace it touches, or it does not land at all.
+;
+; ── Coherence = predicates over shipped machinery ───────────────────────
+;
+;   dangling ref  — a call whose head neither the bundle nor the image provides
+;                   (deferred/collect-unknown-calls, the L7 deferral layer)
+;   promise       — a `(declare x)` with no later `(defn x)` in bundle or image
+;   type          — an inferred-type conflict (typed/check-source, sound-only)
+;   message       — a queued message whose contract the bundle changed
+;                   (reload.migrate, Wave 3 — attached to the bundle, not here)
+;
+; A message-migration attached to a bundle is what makes an otherwise-incoherent
+; (contract-changing) bundle coherent again — see reload/attach and reload.migrate.
+
+(ns reload
+  (:require [env] [typed] [deferred]))
+
+;; ── the bundle: staged edits since the last coherent image ──────────────
+
+; {:staged {ns-string → source-string}   ; edits buffered, not yet applied
+;  :migration migration-or-nil           ; a reload.migrate spec bound to this bundle
+;  :status :empty|:staged|:applied|:held|:blocked
+;  :errors [error-map …]                 ; why a held/blocked bundle does not fit
+;  :applied [ns-string …]}               ; namespaces swapped by the last commit
+(def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []
+                  :journal []}))
+
+(def journal-limit 200)
+
+;; ── the commit target: WHERE a coherent bundle is made live ──────────────
+;;
+;; A commit evaluates the bundle into an env. In production and normal dev that
+;; env is `:global` — the one running image. But a TEST that drives reload wants
+;; the commit to land in ITS OWN env (a ward fork), not the shared global image,
+;; so the test is isolated AND its coherence checks (which read the same env it
+;; writes) agree. This is the BEAM way to make an effectful module testable: not
+;; by stubbing functions, but by injecting the RESOURCE the effect targets — here
+;; the env id. Bound per-process (process dict), so concurrent runs never share
+;; a target and the binding cannot leak across processes.
+
+(def commit-target-key :reload/commit-target)
+
+(defn commit-target
+  "The env a commit makes live in THIS process — `:global` unless rebound by
+   `with-target`. The injectable sink that makes reload isolatable."
+  []
+  (let [t (erlang/get commit-target-key)]
+    (if (= t :undefined) :global t)))
+
+(defn with-target
+  "Run `thunk` with the commit target bound to `env` for its dynamic extent, then
+   restore the previous target. A test (or ward) binds the target to its own fork
+   so a commit lands there, never in the shared `:global` image."
+  [env thunk]
+  (let [prev (erlang/get commit-target-key)]
+    (erlang/put commit-target-key env)
+    (try (thunk)
+         (finally
+           (if (= prev :undefined)
+             (erlang/erase commit-target-key)
+             (erlang/put commit-target-key prev))))))
+
+(defn- now-ms [] (erlang/system_time :millisecond))
+
+; live subscribers: a set of pids to notify on every reload event, so a web
+; monitor pushes a frame the instant the image changes. Mirrors
+; datom.broadcast's lazily-pruned pid table — a dead pid is dropped on the next
+; send, so no liveness bookkeeping is needed.
+(def subscribers (atom #{}))
+
+(defn subscribe
+  "Register the calling process (or `pid`) to receive `[:reload/event ev]`
+   messages on every commit outcome. Returns the pid. Idempotent."
+  ([] (subscribe (erlang/self)))
+  ([pid] (swap! subscribers (fn [s] (conj s pid))) pid))
+
+(defn unsubscribe
+  "Stop notifying `pid` (default: the caller). Safe if never subscribed."
+  ([] (unsubscribe (erlang/self)))
+  ([pid] (swap! subscribers (fn [s] (disj s pid))) :ok))
+
+(defn- notify!
+  "Send `[:reload/event ev]` to every live subscriber, pruning any dead pid. A
+   non-blocking `erlang/send` per subscriber — the same cheap fan-out
+   datom.broadcast uses inside the writer step."
+  [ev]
+  (let [pids (deref subscribers)
+        alive (filter (fn [p] (erlang/is_process_alive p)) pids)]
+    (when (not (= (count alive) (count pids)))
+      (reset! subscribers (set alive)))
+    (doseq [p alive] (erlang/send p [:reload/event ev]))))
+
+(defn- journal!
+  "Append one event to the bounded journal (newest-last), so a monitor can replay
+   what the image did, and notify live subscribers so a web monitor pushes a
+   frame immediately. Oldest events drop past `journal-limit` — a long-running
+   image never grows unbounded."
+  [event]
+  (let [ev (assoc event :at (now-ms))]
+    (swap! state
+           (fn [s]
+             (let [j (conj (:journal s) ev)]
+               (assoc s :journal
+                      (if (> (count j) journal-limit)
+                        (vec (drop (- (count j) journal-limit) j))
+                        j)))))
+    (notify! ev)))
+
+(declare status)
+(declare print-errors)
+
+;; ── the prod policy: inspect always, MUTATE gated ────────────────────────
+;;
+;; The reload module is pure bl — it is in the image in EVERY environment, dev
+;; and prod alike. What differs is the blast radius we allow. Reading the live
+;; image (inspect / status / journal / namespaces) is always safe, everywhere.
+;; MUTATING it (commit → apply-bundle!) is gated:
+;;
+;;   dev   (Mix loaded) — allowed by default; this is the developer's own image.
+;;   prod  (a release, no Mix) — REFUSED unless BEAM_LISP_RELOAD=1 is set, so an
+;;         operator opts in deliberately, per node, with a bounded window.
+;;
+;; This mirrors the Wave-1 AOT gate (BEAM_LISP_AOT_STRICT): the guarantee lives
+;; in the running system, and a dangerous capability in prod is off until asked
+;; for. A staged, coherent bundle that is refused is HELD like any other — the
+;; edit is not lost, it simply does not go live until reload is enabled.
+
+(defn- mix-present?
+  "Whether Mix is loaded — true in dev/test, false in a production release. The
+   honest 'am I in a dev image' signal without threading Mix.env through bl. Uses
+   `:erlang.module_loaded`, which is a pure boolean predicate over already-loaded
+   modules — in a release Mix is simply not there."
+  []
+  (try (erlang/apply :erlang :module_loaded (list :Elixir.Mix))
+       (catch _ false)))
+
+; A runtime override for the policy: nil ⇒ decide from environment (the default);
+; true/false ⇒ force enabled/disabled. Lets an operator disable reload on a live
+; dev node (a canary), and lets tests exercise the refused path without a real
+; release. Set via `set-enabled!`.
+(def policy-override (atom nil))
+
+(defn set-enabled!
+  "Force the reload mutation policy on (`true`) or off (`false`), overriding the
+   environment decision; `nil` restores environment-based detection. Returns the
+   new override value."
+  [v]
+  (reset! policy-override v))
+
+(defn reload-enabled?
+  "Whether MUTATING reloads (commit) are permitted in this image. An explicit
+   `set-enabled!` override wins; otherwise dev (Mix loaded) is yes, and prod (a
+   release) is no unless BEAM_LISP_RELOAD is set — opt-in, bounded."
+  []
+  (let [o (deref policy-override)]
+    (if (not (nil? o))
+      o
+      (or (mix-present?)
+          (contains? #{"1" "true"} (System/get_env "BEAM_LISP_RELOAD"))))))
+
+(defn declared-ns
+  "The namespace a source string declares — the symbol after a leading `(ns …)`.
+   nil when the first form is not `(ns …)`; a staged edit must name its ns so the
+   bundle keys are stable and match the running image."
+  [src]
+  (try
+    (let [forms (BeamLisp.Reader/read_string src)
+          f     (first forms)]
+      (if (and f (= :list (typed/node-tag (typed/node-form f))))
+        (let [items (typed/node-items (typed/node-form f))
+              head  (typed/node-form (first items))]
+          (if (and (= :symbol (typed/node-tag head))
+                   (= "ns" (typed/node-name (first items))))
+            (typed/node-name (second items))
+            nil))
+        nil))
+    (catch _ nil)))
+
+;; ── staging ─────────────────────────────────────────────────────────────
+
+(defn stage
+  "Buffer an edit into the pending bundle. Does NOT touch the live image — the
+   edit becomes visible only on a coherent `commit`. `ns` may be given, else it
+   is read from the source's `(ns …)` form. Returns the bundle status map."
+  ([src] (stage (declared-ns src) src))
+  ([ns src]
+   (when (nil? ns)
+     (throw (ex-info "reload/stage: source declares no (ns …); pass ns explicitly"
+                     {})))
+   (swap! state
+          (fn [s]
+            (-> s
+                (assoc :staged (assoc (:staged s) ns src))
+                (assoc :status :staged))))
+   (status)))
+
+(defn attach
+  "Bind a message-migration spec (reload.migrate) to the current bundle. A
+   bundle that changes a live process's message contract is incoherent until a
+   migration is attached — the migration is what fulfils the in-flight messages
+   under the new contract. See reload.migrate for the spec shape."
+  [migration]
+  (swap! state (fn [s] (assoc s :migration migration)))
+  (status))
+
+(defn abort
+  "Discard the pending bundle without touching the live image. The JOURNAL is
+   preserved — abort discards uncommitted intent, not the record of what already
+   happened."
+  []
+  (swap! state (fn [s] {:staged {} :migration nil :status :empty :errors []
+                        :applied [] :journal (:journal s)}))
+  (status))
+
+(defn status
+  "The current bundle: what is staged, its coherence status, and why it is held."
+  []
+  (let [s (deref state)]
+    {:status  (:status s)
+     :bundle  (vec (keys (:staged s)))
+     :migration (some? (:migration s))
+     :errors  (:errors s)
+     :applied (:applied s)}))
+
+;; ── coherence pass (STATIC — never evaluates the bundle) ─────────────────
+
+; Every top-level form that BINDS A NAME in its namespace. A whole-namespace
+; reload must know the complete set the new source defines — anything omitted
+; would be seen as "vanished" and wrongly removed, or leave a real removal
+; undetected. This is the full def-vocabulary of the language.
+(def def-forms
+  #{"defn" "defn-" "def" "defmacro" "defmulti" "defmethod"
+    "defrecord" "deftype" "defprotocol" "defserver" "defnative"})
+
+(defn- defn-name
+  "If a form is a top-level definition, the name it binds; else nil. `defmethod`
+   binds no NEW name (it extends an existing defmulti), so it contributes none."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (= :list (typed/node-tag f))
+      (let [items (typed/node-items f)
+            head  (typed/node-name (first items))]
+        (if (and (contains? def-forms head) (not (= "defmethod" head)))
+          (typed/node-name (second items))
+          nil))
+      nil)))
+
+(defn- declared-names
+  "The names introduced by a `(declare a b …)` form, else []."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (and (= :list (typed/node-tag f))
+             (= "declare" (typed/node-name (first (typed/node-items f)))))
+      (map typed/node-name (rest (typed/node-items f)))
+      [])))
+
+(defn- bundle-defs
+  "The set of names the bundle DEFINES, per namespace: {ns → #{name …}}. A
+   forward reference to a name defined later in the same bundle is therefore not
+   dangling — the whole edit set is judged together, which is the point."
+  [staged]
+  (reduce (fn [acc pair]
+            (let [ns (first pair) src (second pair)
+                  names (set (filter some?
+                                     (map defn-name (BeamLisp.Reader/read_string src))))]
+              (assoc acc ns (into (get acc ns #{}) names))))
+          {} staged))
+
+(defn- staged?
+  "Whether `ns` is part of THIS bundle — i.e. its whole source is being replaced."
+  [defs ns]
+  (contains? defs ns))
+
+(defn- provides?
+  "Whether `name` resolves in `ns` under NAMESPACE-LEVEL semantics.
+
+   The distinction that makes reload namespace-level rather than variable-level:
+   for a ns IN the bundle, only the names its NEW source defines count — an old
+   var the new source dropped is genuinely gone, so a reference to it is dangling
+   (this is 'the whole renaming ethics': rename `helper`→`helper2` and the old
+   `helper` is removed, not left shadow-callable). For a ns NOT in the bundle,
+   the live image is authoritative (its vars are untouched). core is always
+   available."
+  [defs ns name]
+  (or (contains? (get defs ns #{}) name)
+      (and (not (staged? defs ns))
+           (not (= :error (BeamLisp.Env/fetch ns name))))
+      (contains? (set (BeamLisp.Env/public_names "core")) name)))
+
+(defn- unqualified-call-heads
+  "Every unqualified, non-core, non-special same-ns call head in one source. By
+   passing an EMPTY `defined` set to the deferral collector's `unknowns-in`, we
+   collect ALL such heads independent of the live image — which is load-bearing
+   for namespace-level reload: a call to a var the new source DROPPED must be
+   seen, and it is still present in the live image (until commit), so a
+   live-baseline collector would wrongly treat it as resolved."
+  [src ns]
+  (let [core (set (BeamLisp.Env/public_names "core"))
+        forms (BeamLisp.Reader/read_string src)]
+    (reduce (fn [acc form] (concat acc (deferred/unknowns-in form #{} core)))
+            [] forms)))
+
+(defn- dangling-errors
+  "Dangling references in one source: same-ns calls whose head the WHOLE bundle
+   does not provide under namespace-level semantics. Qualified heads
+   (`other.ns/f`) resolve at their target ns and are excluded by the collector;
+   cross-ns removals are caught separately by `removal-errors`."
+  [defs ns src]
+  (let [heads (unqualified-call-heads src ns)
+        still (filter (fn [u] (not (provides? defs ns (:callee u)))) heads)]
+    (map (fn [u] {:kind :dangling :ns ns :var (:callee u)
+                  :msg (str "undefined var: " ns "/" (:callee u)
+                            " — nothing in the bundle or image defines it")})
+         still)))
+
+(defn- promise-errors
+  "Unfulfilled-promise errors: a `(declare x)` with no `(defn x)`/`(def x …)`
+   binding it in the bundle or image. A promise is the static analogue of a
+   queued message — a commitment the bundle must honour before it goes live."
+  [defs ns src]
+  (let [forms    (BeamLisp.Reader/read_string src)
+        declared (mapcat declared-names forms)
+        unbound  (filter (fn [nm] (not (provides? defs ns nm))) declared)]
+    (map (fn [nm] {:kind :promise :ns ns :var nm
+                   :msg (str "declared but never defined in this bundle: " ns "/" nm)})
+         unbound)))
+
+(defn- type-errors
+  "Inferred-type conflicts for one staged source (typed/check-source warnings).
+   Sound-warnings-only: an untypable form is silent, never falsely flagged."
+  [ns src]
+  (let [ws (:warnings (deferred/check-file-deferring src ns))]
+    (map (fn [w] {:kind :type :ns ns :msg (str w)}) ws)))
+
+(defn- removed-names
+  "Names the live namespace `ns` currently OWNS but the bundle's new source no
+   longer defines — the vars a whole-namespace reload will drop. Empty when `ns`
+   is new (nothing to remove) or the source is purely additive."
+  [defs ns]
+  (let [new-names (get defs ns #{})
+        live      (set (BeamLisp.Env/own_names ns))]
+    (filter (fn [nm] (not (contains? new-names nm))) live)))
+
+(defn- removal-errors
+  "Cross-namespace dangling from a REMOVAL: for each var this bundle drops from a
+   namespace, any live caller in ANOTHER namespace that is not itself being
+   updated in this bundle. This is the cross-ns half of the renaming ethics — you
+   may not silently delete a var that another live namespace still calls; the
+   bundle is held until those callers are staged too (typically the rename's
+   other half)."
+  [defs ns]
+  (mapcat
+    (fn [nm]
+      (let [outside (filter (fn [pair] (not (staged? defs (first pair))))
+                            (BeamLisp.Env/callers_of ns nm))]
+        (map (fn [pair]
+               {:kind :removal :ns ns :var nm
+                :caller-ns (first pair) :caller (second pair)
+                :msg (str "removing " ns "/" nm " would break live caller "
+                          (first pair) "/" (second pair)
+                          " — stage that namespace too, or keep the var")})
+             outside)))
+    (removed-names defs ns)))
+
+(defn coherence
+  "Every coherence error across the whole bundle, computed STATICALLY from the
+   sources and the live image's public names. Empty ⇒ the bundle is coherent and
+   may be committed. Exposed for the demos/tests to inspect a bundle without
+   committing it. The message predicate is applied by `commit` via the attached
+   migration (Wave 3), not here."
+  [staged]
+  (let [defs (bundle-defs staged)]
+    (vec (mapcat (fn [pair]
+                   (let [ns (first pair) src (second pair)]
+                     (concat (dangling-errors defs ns src)
+                             (promise-errors defs ns src)
+                             (removal-errors defs ns)
+                             (type-errors ns src))))
+                 staged))))
+
+;; ── commit: prove coherent, then swap atomically; else hold ─────────────
+
+(defn- apply-bundle!
+  "Evaluate every staged source into the live `:global` image. Called ONLY after
+   the whole bundle is proven coherent. Each `defn` is a `Link.defvar` in place —
+   an atomic per-var hot swap; a caller in flight finishes on its captured
+   (never-purged) body module, the next call resolves the new one.
+
+   Every bundle ns is marked LOADED before evaluation so a `(:require [sibling])`
+   between two nses in the SAME bundle resolves to the live sibling instead of
+   searching the disk for a file that does not exist — the whole edit set is one
+   image, so its internal requires are satisfied by the image, not the loader."
+  [staged]
+  (let [defs (bundle-defs staged)]
+    (env/with-env (commit-target)
+      (fn []
+        ;; Declare EVERY bundle namespace up front, so a qualified cross-ns call
+        ;; `(other.ns/f)` compiles as a bl var reference rather than Erlang
+        ;; interop — the compiler's ns-vs-interop decision (`Env.ns_exists?`) must
+        ;; see the sibling exist regardless of eval order within the bundle.
+        (doseq [pair staged] (BeamLisp.Env/declare_ns (first pair)))
+        (doseq [pair staged]
+          (let [ns (first pair)
+                ;; compute the drop set BEFORE eval — eval interns the new names,
+                ;; which would otherwise mask what the old image owned.
+                gone (removed-names defs ns)]
+            (env/eval (second pair))
+            ;; NAMESPACE-LEVEL replacement: a var the new source dropped is
+            ;; genuinely removed from the image, so nothing can still reach the
+            ;; stale definition. The coherence pass already proved no live caller
+            ;; depends on any of these (dangling + removal errors), so this is
+            ;; safe by construction.
+            (doseq [nm gone] (BeamLisp.Env/undefine_var ns nm))
+            ;; mark loaded AFTER a ns evaluates, so a later bundle ns that
+            ;; `(:require)`s it resolves to the live sibling. Author-ordered:
+            ;; a required sibling is staged before its requirer, exactly as
+            ;; source files are ordered by the require DAG.
+            (BeamLisp.Env/mark_loaded ns)))))))
+
+(defn commit
+  "Prove the whole pending bundle coherent (statically); on success apply it
+   atomically to the live image; otherwise HOLD it — old code keeps serving, the
+   errors are returned, and the bundle stays staged for the next edit to complete.
+
+   Returns the bundle status. `:status` is:
+     :applied — the bundle was coherent and is now live
+     :held    — incoherent (dangling / type / promise); or refused by the prod
+                policy (reload disabled) — the old code keeps serving either way
+     :blocked — a message-migration was required or rejected (Wave 3)
+     :empty   — nothing staged"
+  []
+  (let [s      (deref state)
+        staged (vec (:staged s))]
+    (cond
+      (empty? staged)
+      (do (swap! state (fn [s] (assoc s :status :empty))) (status))
+
+      ;; the prod gate: mutating reloads are off in a release unless opted in.
+      ;; A refused bundle is HELD, not lost — identical treatment to an
+      ;; incoherent one: the old code serves and the edit waits.
+      (not (reload-enabled?))
+      (let [err {:kind :policy :ns (first (keys (:staged s)))
+                 :msg (str "reload is disabled in this image — set BEAM_LISP_RELOAD=1 "
+                           "to enable mutating reloads in production")}]
+        (swap! state (fn [s] (assoc s :status :held :errors [err])))
+        (journal! {:event :held :nses (vec (keys (:staged s))) :errors [err]})
+        (print-errors [err])
+        (status))
+
+      :else
+      (commit-coherent s staged))))
+
+(defn- commit-coherent
+  "The coherence-and-apply half of commit, once the prod policy has allowed a
+   mutation. Split out so the policy gate reads as one clear cond in `commit`."
+  [s staged]
+  (let [errors (coherence staged)
+        nses   (vec (keys (:staged s)))]
+    (if (seq errors)
+      (do
+        (swap! state (fn [s] (assoc s :status :held :errors errors)))
+        (journal! {:event :held :nses nses
+                   :errors (map (fn [e] {:kind (:kind e) :msg (:msg e)}) errors)})
+        (print-errors errors)
+        (status))
+      (do
+        (apply-bundle! staged)
+        (swap! state
+               (fn [s]
+                 (-> s
+                     (assoc :status :applied)
+                     (assoc :errors [])
+                     (assoc :applied (vec (keys (:staged s))))
+                     (assoc :staged {})
+                     (assoc :migration nil))))
+        (journal! {:event :applied :nses nses
+                   :migration (some? (:migration s))})
+        (status)))))
+
+(defn- print-errors
+  "Render a held bundle's errors — one line per reason, so a developer sees the
+   whole picture of why the bundle does not yet fit, not just the first failure."
+  [errors]
+  (println (str "reload: bundle HELD — " (count errors)
+                " reason(s); old code still serving:"))
+  (doseq [e errors]
+    (println (str "  [" (name (:kind e)) "] " (:msg e)))))
+
+;; ── drain: deterministic settle point (used by the Wave 4 watcher/tests) ──
+
+(defn drain
+  "A synchronous barrier: returns the current status once any in-progress commit
+   has settled. The watcher (Wave 4) stages on a real file save; a test saves a
+   file then calls `drain` to observe the resulting image deterministically
+   instead of sleeping. Because staging and commit are synchronous swaps on
+   `state`, this is the current status — the barrier exists so callers have one
+   honest place to read the settled image."
+  []
+  (status))
+
+;; ── inspect: the queryable live-image read-model (CLI + web monitors) ───
+
+(defn- app-ns?
+  "Whether `ns` is application code worth showing in a monitor — excludes the
+   language's own runtime/system namespaces, which are infrastructure, not the
+   app the developer is watching. A monitor wants to see THEIR image, not ours."
+  [ns]
+  (not (or (contains? #{"core" "user" "reload" "reload.migrate" "env" "typed"
+                        "deferred" "z3" "multi" "web" "interop" "sugar"
+                        "datom" "hiccup" "style" "diff" "socket" "ui"} ns)
+           (some? (index-of ns "system."))
+           (some? (index-of ns "reload."))
+           (some? (index-of ns "live.")))))
+
+(defn namespaces
+  "Every application namespace live in the image, each with its public var names
+   — the shape a monitor lists. Pass `:all` to include the language's own system
+   namespaces too. Returns [{:ns :vars [name …] :count n} …], sorted by name."
+  ([] (namespaces false))
+  ([all?]
+   (let [all-ns (BeamLisp.Env/namespaces)
+         keep   (if all? all-ns (filter app-ns? all-ns))]
+     (sort-by :ns
+              (map (fn [ns]
+                     (let [vars (sort (BeamLisp.Env/own_names ns))]
+                       {:ns ns :vars vars :count (count vars)}))
+                   keep)))))
+
+(defn journal
+  "The reload event journal, newest LAST: every commit's outcome (:applied /
+   :held) with the namespaces it touched and — for a hold — why. The history a
+   monitor replays. Optional `n` caps to the most recent n events."
+  ([] (:journal (deref state)))
+  ([n] (let [j (:journal (deref state))]
+         (if (> (count j) n) (vec (drop (- (count j) n) j)) j))))
+
+(defn inspect
+  "A full, JSON-friendly snapshot of the live image for a monitor to render:
+   the current bundle status, every application namespace with its vars, and the
+   recent event journal. One call the CLI prints and the web pushes over a socket
+   — the single read-model behind every view of the running system."
+  ([] (inspect false))
+  ([all?]
+   {:status   (:status (deref state))
+    :bundle   (status)
+    :namespaces (namespaces all?)
+    :journal  (journal 50)
+    :at       (now-ms)}))
