@@ -107,34 +107,86 @@
     {:files (vec seen) :passed passed :failed failed :incoherent incoh
      :ok? (and (= 0 failed) (= 0 incoh))}))
 
+(defn- run-suite-into
+  "Spawn a run of the suite that pushes frames to `sock`. Each file emits a
+   :file-start (tile goes RUNNING) then a :file-done (tile resolves); every event
+   pushes a fresh frame. run-sandboxed ⇒ multiple open dashboards / overlapping
+   re-runs never collide."
+  [sock]
+  (erlang/spawn
+    (fn []
+      (let [seen (atom []) running (atom [])]
+        (ward/run-sandboxed
+          (bl-files test-dir)
+          (fn [ev]
+            (if (= :file-start (:phase ev))
+              (swap! running (fn [s] (conj s (:ns ev))))
+              (do
+                (swap! running (fn [s] (vec (filter (fn [n] (not (= n (:ns ev)))) s))))
+                (swap! seen (fn [s] (conj s (:result ev))))))
+            (erlang/send sock
+              [:ward-frame (dashboard-html (partial-result (deref seen))
+                                           (deref running))])))))))
+
+(defn- start-fs-watch
+  "Start a FileSystem watcher on `test-dir` subscribed to the socket process, so
+   a `.bl` save arrives as a `[:file_event fs {path events}]` message. Returns
+   the fs pid (kept so its inotify port lives as long as the socket)."
+  [sock]
+  (let [res (erlang/apply :"Elixir.FileSystem" :start_link
+                          (list (interop/->kwlist {:dirs (list test-dir)})))
+        fs  (second res)]
+    (erlang/apply :"Elixir.FileSystem" :subscribe (list fs))
+    fs))
+
+(def rerun-debounce-ms 150)
+
 (defn- ws-init [_p]
-  ;; Run the suite in a background process so init returns promptly. The runner
-  ;; emits two events per file: :file-start (add the ns to `running`) and
-  ;; :file-done (drop it from `running`, append its result to `seen`). Each event
-  ;; pushes a fresh frame — so a tile appears as RUNNING, then resolves to
-  ;; pass/fail/contained. run-sandboxed ⇒ multiple open dashboards never collide.
-  (let [sock (erlang/self)]
-    (erlang/spawn
-      (fn []
-        (let [seen (atom []) running (atom [])]
-          (ward/run-sandboxed
-            (bl-files test-dir)
-            (fn [ev]
-              (if (= :file-start (:phase ev))
-                (swap! running (fn [s] (conj s (:ns ev))))
-                (do
-                  (swap! running (fn [s] (vec (filter (fn [n] (not (= n (:ns ev)))) s))))
-                  (swap! seen (fn [s] (conj s (:result ev))))))
-              (erlang/send sock
-                [:ward-frame (dashboard-html (partial-result (deref seen))
-                                             (deref running))]))))))
-    [:push (list (list :text (dashboard-html (empty-result)))) {}]))
+  ;; Kick the initial run, then start watching the dir so a save RE-RUNS the
+  ;; suite. A `gen` counter (per socket) tags each pending re-run; only the
+  ;; latest fires, so a burst of save events (editors emit several) collapses to
+  ;; one run.
+  (run-suite-into (erlang/self))
+  (start-fs-watch (erlang/self))
+  [:push (list (list :text (dashboard-html (empty-result)))) {:gen 0}])
 
 (defn- ws-handle-in [_frame state] [:ok state])
+
+(defn- msg-tag
+  "The leading tag of a message, whether it arrives as a bl vector (our own
+   [:ward-frame …] / [:rerun …]) or an Erlang tuple (FileSystem's
+   {:file_event fs payload}). Tuples are NOT `sequential?` in bl, so we normalise
+   with `first`, which reads the head of either."
+  [msg]
+  (try (first msg) (catch _ nil)))
+
 (defn- ws-handle-info [msg state]
-  (if (and (sequential? msg) (= :ward-frame (first msg)))
-    [:push (list (list :text (second msg))) state]
-    [:ok state]))
+  (let [tag (msg-tag msg)]
+    (cond
+      ;; a rendered frame from a run → forward to the browser
+      (= :ward-frame tag)
+      [:push (list (list :text (second msg))) state]
+
+      ;; a filesystem event for a `.bl` file → schedule a debounced re-run: bump
+      ;; the generation and send ourselves a delayed :rerun carrying it. The
+      ;; event is an Erlang tuple {:file_event fs {path events}}; nth reads its
+      ;; payload, first the path.
+      (and (= :file_event tag)
+           (let [payload (nth msg 2)]
+             (and payload (String/ends_with? (str (first payload)) ".bl"))))
+      (let [g (+ 1 (get (or state {}) :gen 0))]
+        (erlang/apply :erlang :send_after
+                      (list rerun-debounce-ms (erlang/self) [:rerun g]))
+        [:ok (assoc (or state {}) :gen g)])
+
+      ;; the debounce timer fired → re-run ONLY if this is still the latest gen
+      (= :rerun tag)
+      (do
+        (when (= (second msg) (get (or state {}) :gen 0))
+          (run-suite-into (erlang/self)))
+        [:ok state])
+
+      :else [:ok state])))
 
 (def ws-handlers
   {:init ws-init :handle-in ws-handle-in :handle-info ws-handle-info})
