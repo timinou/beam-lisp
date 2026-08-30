@@ -123,7 +123,7 @@ about, so it short-circuits ①→⑧ for just this socket.
            │                   │                 │
            └─────────┬─────────┴────────┬────────┘
                      ▼                   ▼
-              live.ui components   (auth.bl guard scopes the
+              loom.ui components   (auth.bl guard scopes the
               (card, badge, field,  shared query BEFORE it runs:
                button, stack…)      a forbidden row is never
                      │              selected — absent, not filtered)
@@ -204,8 +204,9 @@ names the *intent*, never the actor. A check-in cannot lie about who checked in.
 ```
   concept in the loop          file                       key symbol
   ─────────────────────        ──────────────────────     ─────────────────────
-  brand as a value             priv/live/style.bl         install-theme!, tok, sx
-  accessible components        priv/live/ui.bl            button, field, card…
+  brand as a value             priv/loom/token.bl         install-theme!, tok, sx
+  layout algebra               priv/loom/box.bl           box, col, row, grid
+  accessible components        priv/loom/ui.bl            button, field, card…
   view → HTML                  priv/live/hiccup.bl        hiccup->html
   minimal patches              priv/live/diff.bl          diff, apply-ops
   bind view ↔ conn (the loop)  priv/live/socket.bl        defview, deflive,

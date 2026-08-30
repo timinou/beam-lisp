@@ -188,14 +188,63 @@
 
 ;; ── positional child reconcile (no keys) ────────────────────────────
 
+;; Positional reconcile pairs children by INDEX. It is correct only for the
+;; overlap [0, min): beyond it, a longer NEW list has genuinely-new trailing
+;; children (an :insert, never a :replace of a nonexistent index) and a longer
+;; OLD list has trailing children to drop (a :remove-at, never a blanking
+;; :text). Emitting :replace/:text on an out-of-range index silently DROPS the
+;; extra node — the bug keys exist to avoid. Length/order changes without keys
+;; are handled correctly here, but sub-optimally (every shifted child re-diffs
+;; in place); `warn-unkeyed` flags exactly that case so a view author adds keys.
 (defn- positional-child-ops
   [path old-children new-children diff-fn]
-  (let [n (max (count old-children) (count new-children))]
-    (mapcat (fn [i]
-              (let [o (if (< i (count old-children)) (nth old-children i) nil)
-                    m (if (< i (count new-children)) (nth new-children i) nil)]
-                (diff-fn (conj path i) o m)))
-            (range n))))
+  (let [oc (count old-children)
+        nc (count new-children)
+        overlap (min oc nc)
+        ;; [0, overlap): diff the paired children in place
+        paired (mapcat (fn [i]
+                         (diff-fn (conj path i) (nth old-children i) (nth new-children i)))
+                       (range overlap))
+        ;; NEW longer → append the surplus (index-based insert, nil key)
+        inserts (mapcat (fn [i] [[:insert path nil i (nth new-children i)]])
+                        (range overlap nc))
+        ;; OLD longer → drop the surplus, HIGH index first so earlier indices
+        ;; stay valid as each removal shrinks the list
+        removes (mapv (fn [i] [:remove-at path i])
+                      (reverse (into [] (range overlap oc))))]
+    (concat paired inserts removes)))
+
+;; ── self-awareness: warn when a diffed list should be keyed ─────────
+;;
+;; A hiccup tree is DATA the differ reconciles by re-running the view and
+;; comparing. When a list of sibling elements changes length or order and the
+;; children carry no `:key`, the differ falls back to positional reconcile:
+;; still correct (the property test holds), but it re-diffs every shifted child
+;; in place instead of moving a node. beam-lisp can SEE this happening — so it
+;; says so, once, pointing at the parent tag, so the author adds keys where it
+;; actually matters. Silence it with `(set-keyless-warning! false)`.
+
+(def ^:private warn-flag :live.diff/warned-keyless)
+(def ^:private warn-enabled (atom true))
+
+(defn set-keyless-warning!
+  "Enable/disable the dev warning about unkeyed diffed lists (default on)."
+  [on?]
+  (reset! warn-enabled on?))
+
+(defn- warn-keyless! [tag old-n new-n]
+  ;; fire at most once per process — a nudge, not a per-frame flood
+  (when (and @warn-enabled (nil? (Process/get warn-flag)))
+    (Process/put warn-flag true)
+    (erlang/apply :io :put_chars
+      (list :standard_error
+        (str "\n[loom/diff] a <" (name tag) "> child list changed length ("
+             old-n " → " new-n ") without :key on its children.\n"
+             "           The view still renders correctly, but it is being\n"
+             "           reconciled POSITIONALLY — add a :key to each child so a\n"
+             "           reorder MOVES a node instead of re-diffing it in place.\n"
+             "           e.g. (for [x xs] (row {:key (:id x)} …))\n"
+             "           (silence: (live.diff/set-keyless-warning! false))\n\n")))))
 
 ;; ── the diff ────────────────────────────────────────────────────────
 
@@ -222,7 +271,16 @@
      :else
        (let [oc (children-of old)
              nc (children-of new)
-             child-ops (if (or (all-keyed? oc) (all-keyed? nc))
+             keyed (or (all-keyed? oc) (all-keyed? nc))
+             ;; warn only where keys would actually help: an UNKEYED list of
+             ;; several element children whose length changed — the exact case
+             ;; that reconciles positionally when it wanted to move nodes.
+             _ (when (and (not keyed)
+                          (not= (count oc) (count nc))
+                          (> (max (count oc) (count nc)) 1)
+                          (element? old))
+                 (warn-keyless! (tag-of old) (count oc) (count nc)))
+             child-ops (if keyed
                          (keyed-child-ops path oc nc diff)
                          (positional-child-ops path oc nc diff))]
          (into [] (concat (attr-ops path (attrs-of old) (attrs-of new))
@@ -312,15 +370,44 @@
 ;; are applied in that order — structure first, so deep ops' NEW-index paths
 ;; land on the reordered tree, exactly as a DOM client patches attributes
 ;; after it has reconciled the keyed children.
-(defn- structural-op? [op] (contains? #{:remove :insert :move} (first op)))
+(defn- structural-op? [op] (contains? #{:remove :remove-at :insert :move} (first op)))
+
+;; Positional structural ops (`:remove-at idx`, `:insert path nil idx sub`)
+;; are index-based, not key-based: reconcile by splicing. Removes apply high
+;; index first (so lower indices stay valid), then inserts apply low index
+;; first (each builds the growing list). This is the no-keys counterpart to
+;; the keyed anchor-fill below.
+(defn- rebuild-children-positional
+  [old-children ops]
+  (let [;; descending index order so each splice keeps lower indices valid.
+        ;; NB: `(sort > …)` does not reliably descend here — sort ascending then
+        ;; reverse.
+        remove-idxs (reverse (sort (into [] (mapcat (fn [op] (if (= (first op) :remove-at) [(nth op 2)] [])) ops))))
+        after-remove (reduce (fn [cs i] (into [] (concat (take i cs) (drop (+ i 1) cs))))
+                             (into [] old-children) remove-idxs)
+        insert-ops (sort-by (fn [op] (nth op 3))
+                            (filterv (fn [op] (= (first op) :insert)) ops))]
+    (reduce (fn [cs op]
+              (let [idx (nth op 3) sub (nth op 4)]
+                (into [] (concat (take idx cs) [sub] (drop idx cs)))))
+            after-remove insert-ops)))
+
+(defn- positional-ops?
+  "Whether this parent's structural ops are positional (index-based) rather
+   than keyed — the two never mix for one parent (the diff picks one path)."
+  [ops]
+  (reduce (fn [_ op]
+            (if (or (= (first op) :remove-at)
+                    (and (= (first op) :insert) (nil? (nth op 2))))
+              (reduced true) false))
+          false ops))
 
 (defn- rebuild-children
-  "Rebuild one parent's child vector from its structural ops via anchor-fill:
-   moved/inserted children claim their absolute NEW index; the untouched
-   'anchor' children fill the remaining slots in their existing order. This
-   is the minimal-move reconciliation a keyed DOM differ performs, made
-   explicit as a pure function."
+  "Rebuild one parent's child vector from its structural ops. Keyed ops use
+   anchor-fill (minimal-move reconciliation); positional ops splice by index."
   [old-children ops]
+  (if (positional-ops? ops)
+    (rebuild-children-positional old-children ops)
   (let [removed (reduce (fn [s op] (if (= (first op) :remove) (conj s (nth op 2)) s))
                         #{} ops)
         survivors (filterv (fn [c] (not (contains? removed (node-key c)))) old-children)
@@ -343,7 +430,7 @@
         acc
         (if (contains? placed i)
           (recur (+ i 1) ai (conj acc (get placed i)))
-          (recur (+ i 1) (+ ai 1) (conj acc (nth anchors ai))))))))
+          (recur (+ i 1) (+ ai 1) (conj acc (nth anchors ai)))))))))
 
 (defn- apply-structural [tree ops]
   ;; group structural ops by parent path, deepest paths first so an inner
