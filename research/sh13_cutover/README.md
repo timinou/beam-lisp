@@ -74,3 +74,35 @@ provably ready to BE the compiler.
 ```
 mix beam_lisp.run research/sh13_cutover/fixpoint.bl
 ```
+
+## CHECKPOINT 2 preflight — the .bl compiler loads and runs real code
+
+`ck2_preflight.exs` proves the delegation mechanism end-to-end WITHOUT touching
+the live `Compiler.compile/2`: it takes a real multi-form module, compiles each
+form via `apply(BeamLisp.Ns.Compiler, :compile, [form, env])` (the .bl
+compiler), evaluates each, and confirms the linked definitions work:
+
+```
+(defn sq [x] (* x x))
+(defn sum-sq [xs] (reduce + 0 (map sq xs)))
+(sum-sq [1 2 3 4])   =>  30
+CK2-PREFLIGHT PASS: .bl compiler loads+runs real code
+```
+
+This is exactly what the loader does, done by the self-hosted compiler. Combined
+with the fixpoint (compiler compiles its own source identically) and CHECKPOINT
+1 (932/932 of the prelude), the .bl compiler is proven ready to BE the compiler.
+
+### The remaining in-place step (the live cutover) — the one bootstrap subtlety
+
+Making `Compiler.compile/2` itself delegate has one hazard the preflight avoids:
+`compile/2` is used during AOT to compile `compiler.bl` ITSELF. A naive
+`def compile(f,e), do: apply(BeamLisp.Ns.Compiler, :compile, [f,e])` regresses
+infinitely (to compile the compiler you'd call the not-yet-compiled compiler).
+The guard: delegate only when `Ns.Compiler` is already loaded AND the module
+being compiled is not the compiler itself — i.e. keep the Elixir body as the
+stage-0 seed that compiles the compiler, and delegate for everything after. This
+is the frozen-seed ladder, and it is why the in-place cutover is a dedicated
+session with `mix test` (863) as the per-step gate: a mistake here breaks the
+ability to rebuild. The mechanism is proven; the careful wiring + full-suite
+validation is the remaining work.
