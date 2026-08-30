@@ -1,0 +1,116 @@
+; datom/store-fjall.bl — the storage port, over fjall (an LSM engine).
+;
+; A second substrate under datom.store/Store, beside store-redb. redb is a
+; copy-on-write B-tree; fjall is a log-structured merge tree. The datom log is
+; append-dominated (each datom writes into 2-4 index orderings, monotonically)
+; and reads are ordered range scans — the exact shape an LSM is built for. This
+; wrapper is the bl side of native/datom_fjall; it implements the SAME six-method
+; protocol store-redb does, so everything above L1 cannot tell them apart.
+;
+; SPIKE SCOPE: values round-trip through term_to_binary (the port only requires
+; a faithful value round trip; only KEYS must be order-preserving, and those are
+; passed through untouched). The redb backend additionally packs datoms for a
+; columnar `resolve` fast path — that optimisation is deferred; the generic
+; -range scan is correct and is what this spike measures.
+
+(ns datom.store-fjall
+  (:require [datom.store]))
+
+;; ── the native backend, declared here (defnative makes this ns the host) ──
+
+(defnative "datom_fjall"
+  (fjall-open 1)
+  (fjall-get 2)
+  (fjall-range 3)
+  (fjall-put 3)
+  (fjall-delete 2)
+  (fjall-cas 4)
+  (fjall-commit 2))
+
+(defrecord FjallStore [handle])
+
+;; ── values: faithful round trip, nothing more ───────────────────────
+;; KEYS are the database's own order-preserving binaries — never reinterpreted.
+;; VALUES are whatever the layer above stored; their bytes are only returned,
+;; never compared, so term_to_binary is the obvious faithful codec.
+
+(defn- encode-value [v] (erlang/term_to_binary v))
+(defn- decode-value [b] (if (nil? b) nil (erlang/binary_to_term b)))
+
+(defn open
+  "Open (or create) a fjall-backed store at `path`. The keyspace persists after
+   the process exits — which is the whole point: reopening recovers every datom."
+  [path]
+  (->FjallStore (fjall-open path)))
+
+(defn available?
+  "Whether the native fjall backend loaded. A persistent backend that fails to
+   load should read as ABSENT, never as present-but-not-durable."
+  []
+  (BeamLisp.Native/available? "datom.store-fjall"))
+
+(extend-type FjallStore
+  datom.store/Store
+
+  (-get [store k]
+    (decode-value (fjall-get (:handle store) k)))
+
+  (-range [store lo hi]
+    ; Bounds INCLUSIVE on both sides, as the port specifies (the NIF uses
+    ; inclusive bounds); a half-open upper bound silently drops one datom per
+    ; scan. The conformance suite asserts this.
+    (mapv (fn [pair] [(erlang/element 1 pair) (decode-value (erlang/element 2 pair))])
+          (to-list (fjall-range (:handle store) lo hi))))
+
+  (-put [store k v]
+    (fjall-put (:handle store) k (encode-value v))
+    store)
+
+  (-delete [store k]
+    (fjall-delete (:handle store) k)
+    store)
+
+  (-update [store k f]
+    ; A compare-and-swap LOOP: -get then -put is not atomic, so two writers can
+    ; both read t=41 and both write t=42. The NIF does its read+write under the
+    ; handle lock, so a losing attempt is DETECTED (the {swapped?, value} flag),
+    ; and the loop re-reads. `f` must be pure — it may run more than once. No
+    ; attempt ceiling: every failed iteration failed BECAUSE another writer won,
+    ; so the system always makes progress; yield after a few spins to avoid a
+    ; livelock under heavy contention.
+    (loop [attempt 0]
+      (let [raw (fjall-get (:handle store) k)
+            next (f (decode-value raw))
+            encoded (encode-value next)
+            result (fjall-cas (:handle store) k raw encoded)]
+        (if (erlang/element 1 result)
+          [store next]
+          (do (if (> attempt 8) (erlang/yield) nil)
+              (recur (+ attempt 1)))))))
+
+  (-commit [store ops]
+    ; THE method this backend exists for: the whole batch lands together or not
+    ; at all, applied IN ORDER — [[:delete k] [:put k v]] is a retract-then-
+    ; reassert, so grouping puts ahead of deletes would lose the value.
+    (fjall-commit
+      (:handle store)
+      (to-list (mapv (fn [op]
+                       (if (= (get op 0) :put)
+                         (erlang/list_to_tuple
+                           (to-list [:put (get op 1) (encode-value (get op 2))]))
+                         (erlang/list_to_tuple (to-list [:delete (get op 1)]))))
+                     ops)))
+    store))
+
+;; fjall is a DIRECTORY keyspace (segment files), not a single file; `.fjall`
+;; names that. Extending from the protocol side, the same AOT-safe way store-redb
+;; and Scan do (two `extend-type <Type>` blocks would collide under AOT).
+(extend-protocol datom.store/FileBacked
+  FjallStore
+  (-path-suffix [store] ".fjall"))
+
+(defn open-fresh
+  "Open a fjall store at a fresh unique path. The engine owns its naming
+   convention (a directory keyspace), so a caller never hardcodes a suffix."
+  []
+  (open (datom.store/fresh-path ".fjall")))
