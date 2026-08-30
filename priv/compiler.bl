@@ -1,0 +1,385 @@
+; compiler.bl — the compiler, written in beam-lisp.
+;
+; A compiler turns a program you wrote into something the machine can run. In
+; beam-lisp's case the target is an ELIXIR SYNTAX TREE: the same shape Elixir's
+; own compiler accepts, which it then turns into real BEAM bytecode. So this
+; file's whole job is: given a reader form (the tree the reader produced),
+; return the matching Elixir syntax tree.
+;
+; An Elixir syntax tree is built from three-part tuples {head, metadata, args}.
+; For example the call (+ 1 2) becomes, in the end, a call to a runtime helper:
+;
+;   {{:., [], [{:__aliases__, [], [:BeamLisp, :RT]}, :invoke]}, [],
+;    [<the + function>, [1, 2]]}
+;
+; That looks heavy written out, so this file builds such trees with small
+; named helpers (ast-call, ast-remote, …) instead of by hand. The helpers are
+; the vocabulary; the compile functions below are the grammar.
+;
+; This is the KERNEL: it handles literals, the collection literals, symbols,
+; and ordinary calls. The special forms (let, if, fn, def, and the rest) are
+; layered on top in later work. Everything here is checked against the existing
+; Elixir compiler by the differential oracle (self/oracle.bl): for every form,
+; the tree this produces must equal the tree the old compiler produces.
+
+(ns compiler
+  (:require [reader-node :as rn]))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Building Elixir syntax trees
+;
+; Every helper here returns a piece of Elixir syntax tree as data. They exist
+; so the compile functions below read as intent ("a remote call to String
+; upcase") rather than as tuple plumbing.
+; ─────────────────────────────────────────────────────────────────────────────
+
+; beam-lisp cannot write `:{}`, `:%{}`, or `:%` as keyword literals (the reader
+; does not treat braces/percent as an atom name), yet those are the exact atom
+; heads Elixir uses for a tuple literal, a map literal, and a struct literal.
+; Build them from their text instead.
+(def ^:private tuple-head (erlang/binary_to_atom "{}"))
+(def ^:private map-head (erlang/binary_to_atom "%{}"))
+(def ^:private struct-head (erlang/binary_to_atom "%"))
+
+(defn- ast-node
+  "Build one Elixir syntax-tree node {head, metadata, args}.
+
+   Every call, operator, and construct in an Elixir tree is a three-part
+   tuple: what is being invoked, a slot for metadata (we leave it empty), and
+   the list of arguments. This is the one place that shape is written."
+  [head args]
+  (erlang/list_to_tuple (list head (list) args)))
+
+(defn- ast-alias
+  "Build the Elixir syntax for a module name like `BeamLisp.RT`.
+
+   In an Elixir tree a module name is written as an `:__aliases__` node
+   carrying the dotted parts as atoms: `BeamLisp.RT` is
+   {:__aliases__, [], [:BeamLisp, :RT]}. `parts` is a list of atoms."
+  [parts]
+  (ast-node :__aliases__ parts))
+
+(defn- ast-dot
+  "Build the Elixir syntax for reaching a function `fun` inside module `mod`.
+
+   A qualified call like `BeamLisp.RT.invoke(...)` is represented in two
+   layers: first a `.` node that names the module and the function, then a
+   call node that applies it to arguments. This builds the inner `.` node;
+   `ast-remote-call` wraps it with the arguments."
+  [mod-parts fun]
+  (ast-node (erlang/list_to_tuple (list :. (list) (list (ast-alias mod-parts) fun)))
+            (list)))
+
+(defn- ast-mod-call
+  "Build a call to `fun` in module `mod-parts` with `args`.
+
+   This is the everyday shape `Module.fun(args)` as an Elixir tree: the `.`
+   node from `ast-dot`, applied to the argument list. Used for every call
+   into beam-lisp's own runtime (BeamLisp.RT.invoke, BeamLisp.Env.fetch!, …)."
+  [mod-parts fun args]
+  (let [dot (erlang/list_to_tuple (list :. (list) (list (ast-alias mod-parts) fun)))]
+    (ast-node dot args)))
+
+(defn- ast-fetch
+  "Build the tree that looks up the value of a variable `name` in namespace `ns`.
+
+   An unqualified name that is not a local (like `map` or a user's `foo`)
+   refers to a namespace variable, fetched at run time with
+   `BeamLisp.Env.fetch!(ns, name)`. This builds exactly that call."
+  [ns name]
+  (ast-mod-call (list :BeamLisp :Env) :fetch! (list ns name)))
+
+(defn- ast-invoke
+  "Build the tree that calls a beam-lisp function value `f-ast` with `arg-asts`.
+
+   beam-lisp calls go through one runtime entry point,
+   `BeamLisp.RT.invoke(f, args)`, which knows how to apply a plain function, a
+   keyword, a remote reference, and so on. `f-ast` is the already-compiled
+   tree for the thing being called; `arg-asts` is the list of compiled
+   arguments."
+  [f-ast arg-asts]
+  (ast-mod-call (list :BeamLisp :RT) :invoke (list f-ast arg-asts)))
+
+(defn- ast-remote-fun
+  "Build the tree for a remote function used as a VALUE (not called yet).
+
+   `String/upcase` written on its own \u2014 passed to `map`, say \u2014 becomes a
+   runtime reference `BeamLisp.RT.remote_fun(String, :upcase)`. `module` is an
+   atom like `String` or `:lists`; `fun` is the function-name atom."
+  [module fun]
+  (ast-mod-call (list :BeamLisp :RT) :remote_fun (list module fun)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The compile environment
+;
+; A tiny map threaded through every compile step. `:ns` is the namespace whose
+; variables an unqualified name resolves against; `:locals` is the set of names
+; bound right here (function parameters, let bindings) which resolve to
+; themselves rather than to a namespace variable.
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn new-env
+  "Make a fresh compile environment for namespace `ns`.
+
+   `:locals` starts empty: at the top level nothing is bound locally, so every
+   name is a namespace variable until a `let` or a function parameter adds to
+   it."
+  [ns]
+  {:ns ns :locals #{}})
+
+(defn- local?
+  "Say whether `name` is bound locally in this environment (a parameter or a
+   let binding), as opposed to being a namespace variable."
+  [env name]
+  (contains? (:locals env) name))
+
+(defn- compile-each
+  "Compile a sequence of forms and return the results as a PLAIN list.
+
+   Elixir syntax trees are built from plain lists, so the compiled children
+   must be an ordinary list — not a beam-lisp vector. `map` here is lazy and
+   `into []` would make a vector, so `apply list` forces the results into the
+   plain list the tree needs."
+  [forms env]
+  (apply list (map (fn [f] (compile f env)) forms)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Small helpers over reader forms and text
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn- has-slash?
+  "Say whether a name contains a `/`, which marks it as qualified \u2014 either
+   `alias/var` or `Module/function`."
+  [name]
+  (some? (index-of name "/")))
+
+(defn- uppercase-first?
+  "Say whether the first character of `s` is an uppercase letter A\u2013Z, which is
+   how a qualified name's prefix signals an Elixir module (`String/upcase`)
+   rather than an Erlang one (`lists/reverse`)."
+  [s]
+  (let [c (first (erlang/binary_to_list s))]
+    (and (>= c 65) (<= c 90))))
+
+(defn- split-slash
+  "Split a qualified name `a/b` into the pair [prefix suffix] at the first `/`.
+   `prefix` is the module or alias, `suffix` the function or variable."
+  [name]
+  (let [i (index-of name "/")]
+    [(subs name 0 i) (subs name (+ i 1))]))
+
+(defn- module-atom
+  "Turn a qualified name's module prefix into the atom the BEAM uses for it.
+
+   An Elixir module written `String` is really the atom `:\"Elixir.String\"`
+   on the BEAM — the compiler prepends `Elixir.` to any prefix that starts
+   with an uppercase letter. A lowercase prefix (`lists`, `erlang`) is an
+   Erlang module and becomes the bare atom `:lists`."
+  [prefix]
+  (if (uppercase-first? prefix)
+    (erlang/binary_to_atom (str "Elixir." prefix))
+    (erlang/binary_to_atom prefix)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Compiling a symbol
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn- compile-symbol
+  "Turn a symbol into the tree that produces its VALUE.
+
+   Three cases, in order:
+     * a local (parameter or let binding) compiles to itself \u2014 handled by the
+       caller, which holds the real Elixir variable; here we only reach the
+       non-local cases;
+     * a qualified name `Module/fun` or `alias/var` compiles to a remote
+       function value or a variable fetch;
+     * a plain name compiles to a namespace-variable fetch,
+       `BeamLisp.Env.fetch!(ns, name)`.
+
+   `name` is the symbol's text; `env` says which namespace to resolve against."
+  [name env]
+  (cond
+    (has-slash? name)
+      (let [[prefix fun] (split-slash name)]
+        ; Module/fun (or erlang-module/fun) as a VALUE: a remote function
+        ; reference. module-atom prepends Elixir. for an uppercase prefix.
+        (ast-remote-fun (module-atom prefix) (erlang/binary_to_atom fun)))
+    :else
+      (ast-fetch (:ns env) name)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Compiling collection literals
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn- compile-vector
+  "Turn a vector literal like [1 2 3] into the tree that builds a beam-lisp
+   vector value.
+
+   A beam-lisp vector is a struct wrapping a tuple of its elements. The tree
+   is the Elixir struct-construction syntax for `%BeamLisp.Vector{items: {..}}`
+   with each element compiled in turn."
+  [items env]
+  (let [elem-asts (compile-each items env)
+        ; the elements packed into an Elixir tuple literal {e1, e2, ...},
+        ; whose tree is a {:{}, [], [elems]} node
+        items-tuple (erlang/list_to_tuple (list tuple-head (list) elem-asts))]
+    ; %BeamLisp.Vector{items: {e1, e2, ...}}
+    (ast-node struct-head
+              (list (ast-alias (list :BeamLisp :Vector))
+                    (ast-node map-head
+                              (list (erlang/list_to_tuple (list :items items-tuple))))))))
+
+(defn- compile-map
+  "Turn a map literal like {:a 1} into the tree that builds a beam-lisp map.
+
+   Every key is wrapped in `BeamLisp.RT.hash_key(...)` so that keys compare
+   the way beam-lisp expects (metadata on a key is invisible to equality, so
+   it must be invisible to the map too). The result is Elixir's map syntax
+   `%{k => v, ...}` with each key and value compiled."
+  [pairs env]
+  (let [entries (apply list (map (fn [pair]
+                                (let [kv (erlang/tuple_to_list pair)
+                                      k (compile (first kv) env)
+                                      v (compile (second kv) env)]
+                                  (erlang/list_to_tuple
+                                    (list (ast-mod-call (list :BeamLisp :RT) :hash_key (list k))
+                                          v))))
+                              pairs))]
+    (ast-node map-head entries)))
+
+(defn- compile-set
+  "Turn a set literal like #{1 2} into the tree that builds a beam-lisp set,
+   `BeamLisp.Set.new([...])` with each member compiled."
+  [items env]
+  (let [elem-asts (compile-each items env)]
+    (ast-mod-call (list :BeamLisp :Set) :new (list elem-asts))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Compiling a call
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn- linked-call
+  "Try to build a DIRECT call to a linked function, or return nil.
+
+   Some names are linked to a specific implementation: `+` to the Erlang BIF
+   `:erlang.+`, `first` to `BeamLisp.RT.first`, and so on. When a name is
+   linked and the call's argument count matches, the call compiles to a direct
+   `Module.function(args)` — no lookup, no dispatch, which is what makes hot
+   loops fast. `link-info` is what `BeamLisp.Env/link` returned: a
+   `{module, arity=>function-name map, variadic-or-nil}` triple. Returns the
+   direct-call tree, or nil when the arity does not match (so the caller falls
+   back to the general path)."
+  [link-info arg-asts]
+  (let [parts (erlang/tuple_to_list link-info)
+        mod (first parts)
+        fixed (second parts)
+        arity (count arg-asts)]
+    (if (contains? fixed arity)
+      ; Module.fname(args) — a direct remote call
+      (let [fname (get fixed arity)]
+        (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname))) arg-asts))
+      nil)))
+
+(defn- core-qualified
+  "Map `clojure.core/x` to `core/x`, leaving every other name unchanged.
+
+   A name written the Clojure way (`clojure.core/map`) refers to the same
+   thing as beam-lisp's own `core/map`, so link lookup normalizes it first."
+  [name]
+  (if (some? (index-of name "clojure.core/"))
+    (str "core/" (subs name (count "clojure.core/")))
+    name))
+
+(defn- compile-call
+  "Turn a call form (head arg ...) into the tree that runs it.
+
+   The kernel handles ordinary calls (special forms come later). Cases, in
+   order:
+     * a keyword head like (:a m): compiles to `RT.invoke(:a, [m])`, which
+       looks the keyword up in its argument;
+     * a qualified head `Module/fun`: compiles to a direct remote call
+       `apply(Module, :fun, [args])`;
+     * a plain name that is LINKED (like `+` or `map`): compiles to a direct
+       `Module.function(args)` call when the argument count matches;
+     * any other plain name: compiles to `RT.invoke(fetch(name), [args])`;
+     * a compound head: compiles the head to a value and calls it.
+
+   `items` is the whole form's children: the head followed by the arguments."
+  [items env]
+  (let [head (rn/node-form (first items))
+        args (rest items)
+        arg-asts (compile-each args env)
+        tag (rn/node-tag head)]
+    (cond
+      ; (:keyword m ...) — the keyword looks itself up in its argument
+      (= tag :keyword)
+        (ast-invoke (erlang/binary_to_atom (rn/node-name head)) arg-asts)
+
+      ; (Module/fun args) or (alias/var args)
+      (and (= tag :symbol) (has-slash? (rn/node-name head)))
+        (let [name (rn/node-name head)
+              [prefix fun] (split-slash name)]
+          ; a remote call compiles to apply(Module, :fun, [args])
+          (ast-node :apply
+                    (list (module-atom prefix)
+                          (erlang/binary_to_atom fun)
+                          arg-asts)))
+
+      ; (name args) with a plain name — try the linked direct call first,
+      ; then fall back to the general lookup-and-invoke path
+      (= tag :symbol)
+        (let [name (rn/node-name head)
+              link (BeamLisp.Env/link (:ns env) (core-qualified name))]
+          (or (and (not= link :error)
+                   (linked-call (second (erlang/tuple_to_list link)) arg-asts))
+              (ast-invoke (compile-symbol name env) arg-asts)))
+
+      ; (expr args) with a compound head — compile it, then call it
+      :else
+        (ast-invoke (compile head env) arg-asts))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The one entry point
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn compile
+  "Turn one reader form into its Elixir syntax tree.
+
+   This is the compiler's front door. It looks at what KIND of form it was
+   handed and routes to the matching builder: a plain value passes through, a
+   collection literal builds its runtime value, a symbol resolves to a
+   variable or remote reference, and a list is a call. Metadata wrappers are
+   peeled first so the real form underneath is what gets compiled.
+
+   `form` is a reader node (from reader.bl or the reader); `env` is a compile
+   environment from `new-env`."
+  [form env]
+  (let [tag (rn/node-tag form)]
+    (cond
+      ; peel a source-location wrapper and compile what is inside
+      (= tag :meta) (compile (rn/node-form form) env)
+
+      ; keyword literal: its value is the plain atom
+      (= tag :keyword) (erlang/binary_to_atom (rn/node-name form))
+
+      ; collection literals
+      (= tag :vector) (compile-vector (rn/node-items form) env)
+      (= tag :map)    (compile-map (rn/node-items form) env)
+      (= tag :set)    (compile-set (rn/node-items form) env)
+
+      ; a symbol names a value
+      (= tag :symbol)
+        (let [name (rn/node-name form)]
+          ; a local resolves to itself; the kernel has no locals yet, so all
+          ; symbols are namespace variables or remote references
+          (compile-symbol name env))
+
+      ; a list is a call (an empty list is just an empty list value)
+      (= tag :list)
+        (let [items (rn/node-items form)]
+          (if (empty? items)
+            (list)
+            (compile-call items env)))
+
+      ; a plain number, string, boolean, or nil is already its own value
+      :else form)))
