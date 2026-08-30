@@ -147,7 +147,15 @@ fn fjall_range<'a>(
     Ok(pairs.encode(env))
 }
 
-/// `-put`: store `value` at `key`, persisted before returning.
+/// `-put`: store `value` at `key`.
+///
+/// The write lands in the journal (WAL, crash-recoverable) and the memtable
+/// synchronously; it is NOT fsync'd per call. Durability-to-disk is a separate,
+/// explicit `fjall_sync` — because a per-write fsync is the single biggest cost
+/// in a bulk load (measured: it made a 2721-group transaction 26s instead of
+/// the memtable's few hundred ms), and the datom layer commits in GROUPS, so
+/// the right place to fsync is once per transaction, not once per datom-group.
+/// The keyspace also persists `SyncAll` on drop, so a clean shutdown is durable.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifResult<Atom> {
     let _g = handle.lock.lock().map_err(|e| err(e))?;
@@ -155,18 +163,25 @@ fn fjall_put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifRe
         .datoms
         .insert(key.as_slice(), value.as_slice())
         .map_err(|e| err(e))?;
-    handle
-        .keyspace
-        .persist(PersistMode::SyncAll)
-        .map_err(|e| err(e))?;
     Ok(atoms::ok())
 }
 
-/// `-delete`: remove `key`. Idempotent.
+/// `-delete`: remove `key`. Idempotent. Journaled, not fsync'd per call — see
+/// `fjall_put` and `fjall_sync`.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
     let _g = handle.lock.lock().map_err(|e| err(e))?;
     handle.datoms.remove(key.as_slice()).map_err(|e| err(e))?;
+    Ok(atoms::ok())
+}
+
+/// `-sync`: force everything written so far to disk. The datom layer calls this
+/// once at the end of a transaction (or a bulk load), turning N per-group
+/// fsyncs into one. This is the durability boundary a caller can rely on: after
+/// it returns, every prior put/delete/commit is on disk.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_sync(handle: ResourceArc<DbHandle>) -> NifResult<Atom> {
+    let _g = handle.lock.lock().map_err(|e| err(e))?;
     handle
         .keyspace
         .persist(PersistMode::SyncAll)
@@ -208,10 +223,6 @@ fn fjall_cas<'a>(
         handle
             .datoms
             .insert(key.as_slice(), new.as_slice())
-            .map_err(|e| err(e))?;
-        handle
-            .keyspace
-            .persist(PersistMode::SyncAll)
             .map_err(|e| err(e))?;
         (new.as_slice().to_vec(), true)
     } else {
@@ -260,12 +271,12 @@ fn fjall_commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom
         }
     }
 
-    // Everything above becomes durable here, or none of it does.
+    // The whole batch is journaled atomically here (crash-recoverable). It is
+    // NOT fsync'd per commit — the datom layer commits per datom-group, so a
+    // fsync here would be one-per-group; durability-to-disk is the explicit
+    // `fjall_sync` the caller invokes once per transaction. Atomicity (all or
+    // none) holds regardless of the fsync boundary.
     batch.commit().map_err(|e| err(e))?;
-    handle
-        .keyspace
-        .persist(PersistMode::SyncAll)
-        .map_err(|e| err(e))?;
     Ok(atoms::ok())
 }
 
