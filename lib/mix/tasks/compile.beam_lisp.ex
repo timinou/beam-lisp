@@ -111,11 +111,29 @@ defmodule Mix.Tasks.Compile.BeamLisp do
             BeamLisp.AOTCache.compiler_key()
           end
 
-        {manifest, recompiled, errors} =
-          Enum.reduce(ordered, {manifest, false, []}, fn path, {m, rc, errs} ->
+        # How many sources actually need building this run. On a warm tree
+        # this is 0 (everything up to date); on a COLD build it is every
+        # source, and a cold build of the full prelude is hundreds of
+        # namespaces taking tens of minutes. Without a running count the
+        # cold build looks like a silent hang, so we print `[n/total] path`
+        # as each source compiles — the difference between "stuck" and
+        # "working through 400 files". Counted up front so the total is known.
+        to_build =
+          Enum.count(ordered, fn path ->
+            opts[:force] || not up_to_date?(manifest, path, Map.fetch!(hashes, path), compile_path)
+          end)
+
+        if to_build > 0 do
+          Mix.shell().info("beam-lisp AOT: building #{to_build} source(s)")
+        end
+
+        {manifest, recompiled, errors, _built} =
+          Enum.reduce(ordered, {manifest, false, [], 0}, fn path, {m, rc, errs, built} ->
             hash = Map.fetch!(hashes, path)
 
             if opts[:force] || not up_to_date?(m, path, hash, compile_path) do
+              built = built + 1
+              Mix.shell().info("  [#{built}/#{to_build}] #{Path.relative_to_cwd(path)}")
               closure_key =
                 if cache_key, do: BeamLisp.AOTCache.closure_key(path, deps, hashes)
 
@@ -169,13 +187,13 @@ defmodule Mix.Tasks.Compile.BeamLisp do
                     BeamLisp.AOTCache.store(cache_key, closure_key, compile_path, modules)
                   end
 
-                  {m2, true, errs}
+                  {m2, true, errs, built}
 
                 {:error, err} ->
-                  {m, rc, [err | errs]}
+                  {m, rc, [err | errs], built}
               end
             else
-              {m, rc, errs}
+              {m, rc, errs, built}
             end
           end)
 

@@ -529,6 +529,14 @@ $ mix beam_lisp.test  # beam-lisp's own suite, written in beam-lisp
 $ mix compile.beam_lisp  # .bl sources to real .beam modules
 ```
 
+The first build in a fresh checkout is the slow one. Every `.bl` source in
+the prelude is compiled ahead of time into its own `.beam` file, and there
+are a few hundred of them, so a cold build takes many minutes and prints a
+`[n/total]` line per source as it works. After that the build is
+incremental: a source is recompiled only when its own text changes, so
+day-to-day builds are fast. If a cold build is interrupted it resumes from
+where it stopped rather than starting over.
+
 ### The MCP playground (dev only)
 
 Start the app interactively and Tidewave's MCP endpoint comes up on
