@@ -145,6 +145,49 @@
   [ns]
   {:ns ns :locals {} :recur nil :tail true})
 
+(defn- pos-env
+  "Thread a form's source position into the compile environment.
+
+   The reader wraps a form in a `:meta` node whose map carries `:line`/`:file`
+   — where in the user's source this form was written. Copying those onto the
+   env means every compile step below has them in hand, so when something is
+   wrong the error can name the user's file and line instead of the compiler's
+   own frames. Only sane values are copied (a positive integer line, a string
+   file); a form with no position leaves the env untouched, and compiles
+   exactly as before."
+  [env m]
+  (if (erlang/is_map m)
+    (let [line (maps/get :line m)
+          file (maps/get :file m)
+          e1 (if (and (erlang/is_integer line) (> line 0)) (assoc env :line line) env)]
+      (if (erlang/is_binary file) (assoc e1 :file file) e1))
+    env))
+
+(defn- compile-error
+  "Stop compiling and report a typed, source-located error.
+
+   Raises a `BeamLisp.CompileError` — the same rich error the original compiler
+   raised — carrying the message plus the `:file` and `:line` threaded onto the
+   env by `pos-env`, and optionally the offending form. The message is prefixed
+   with `file:line` when known, so the reader of the error sees WHERE in their
+   own source the problem is, not a stack of compiler internals. Use this for
+   every compile-time rejection instead of a bare `throw`: a `throw` becomes a
+   generic runtime error with no position and no type, which is exactly the
+   information a good error message must not lose.
+
+   `env` is the current compile environment; `message` is the human sentence;
+   `form` (optional) is the reader node the error is about."
+  ([env message] (compile-error env message nil))
+  ([env message form]
+   (erlang/error
+     (BeamLisp.CompileError/exception
+       (apply list
+         (concat
+           (list (erlang/list_to_tuple (list :message message)))
+           (if (some? (:file env)) (list (erlang/list_to_tuple (list :file (:file env)))) (list))
+           (if (some? (:line env)) (list (erlang/list_to_tuple (list :line (:line env)))) (list))
+           (if (some? form) (list (erlang/list_to_tuple (list :form form))) (list))))))))
+
 (defn- local?
   "Say whether `name` is bound locally in this environment (a parameter or a
    let binding), as opposed to being a namespace variable."
@@ -555,9 +598,11 @@
   [args env]
   (let [target (:recur env)]
     (cond
-      (nil? target) (throw "recur used with no enclosing loop or fn")
-      (not (:tail env)) (throw "recur must be in tail position")
-      (not= (count args) (:arity target)) (throw "recur arity mismatch")
+      (nil? target) (compile-error env "recur used with no enclosing loop or fn")
+      (not (:tail env)) (compile-error env "recur must be in tail position")
+      (not= (count args) (:arity target))
+        (compile-error env (str "recur arity mismatch: target takes " (:arity target)
+                                ", got " (count args)))
       :else
         (let [arg-asts (compile-each-notail args env)]
           (if (contains? target :self-call)
@@ -571,10 +616,13 @@
               (ast-node (erlang/list_to_tuple (list :. (list) (list self-app))) arg-asts)))))))
 
 (defn- binding-pairs
-  "Split a binding vector's items into [pattern value] pairs."
-  [items]
+  "Split a binding vector's items into [pattern value] pairs.
+
+   `env` is threaded only so a malformed binding vector reports with the user's
+   file and line through `compile-error`."
+  [items env]
   (if (odd? (count items))
-    (throw "binding forms must be even, each a pattern and a value")
+    (compile-error env "binding forms must be even, each a pattern and a value")
     (loop [xs items acc (list)]
       (if (empty? xs)
         (reverse acc)
@@ -739,16 +787,36 @@
             ; :or — already collected
             (and (= :keyword (rn/node-tag k)) (= "or" (rn/node-name k)))
               acc
-            ; {local :key} — pattern in key slot, lookup key in value slot
+            ; Two spellings bind a single key. Clojure's canonical form is
+            ; `{local :key}` (a binding PATTERN in the key slot, the lookup
+            ; keyword in the value slot). The codebase also uses the mirror
+            ; `{:key local}` (keyword in the key slot, the binding symbol in
+            ; the value slot); both mean the same thing, so accept both.
+            ; `{:key local}` — keyword key, symbol value: bind the VALUE symbol
+            ; to a lookup of the KEY keyword. (Matches genesis exactly; without
+            ; this branch the value symbol was compiled as a namespace var and
+            ; failed with `undefined var`.)
+            (and (= :keyword (rn/node-tag k))
+                 (= :symbol (rn/node-tag (rn/node-form v))))
+              (let [name (rn/node-name (rn/node-form v))
+                    default (get ors name)
+                    default-ast (if (nil? default) nil (compile default (:env acc)))
+                    r (destructure-symbol name
+                         (rt-get-ast whole-var (erlang/binary_to_atom (rn/node-name k)) default-ast)
+                         (:env acc))]
+                {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
+            ; `{local :key}` / `{[a b] :pair}` — a binding pattern in the key
+            ; slot, the lookup key in the value slot. The pattern may be a plain
+            ; symbol or a nested destructuring pattern, so recurse through
+            ; destructure-steps rather than assuming a bare name.
             :else
               (let [key-node (rn/node-form v)
                     key-ast (if (= :keyword (rn/node-tag key-node))
                               (erlang/binary_to_atom (rn/node-name key-node))
                               (compile v (:env acc)))
-                    name (rn/node-name k)
-                    default (get ors name)
-                    default-ast (if (nil? default) nil (compile default (:env acc)))
-                    r (destructure-symbol name (rt-get-ast whole-var key-ast default-ast) (:env acc))]
+                    r (destructure-steps (kv-key pair)
+                                         (rt-get-ast whole-var key-ast nil)
+                                         (:env acc))]
                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))))
       base kvs)))
 
@@ -766,7 +834,7 @@
       (= tag :symbol) (destructure-symbol (rn/node-name pat) value-ast env)
       (= tag :vector) (destructure-vector (rn/node-items pat) value-ast env)
       (= tag :map) (destructure-map (rn/node-items pat) value-ast env)
-      :else (throw (str "compiler: unsupported binding pattern")))))
+      :else (compile-error env "unsupported binding pattern: expected a symbol, vector, or map" pattern))))
 
 (defn- compile-let
   "Turn (let [pattern value ...] body...) into nested immediately-called fns.
@@ -778,7 +846,7 @@
    scope."
   [bindings-form body env]
   (let [items (rn/node-items (rn/node-form bindings-form))
-        pairs (binding-pairs items)
+        pairs (binding-pairs items env)
         result (reduce
                  (fn [acc pair]
                    (let [e (:env acc)
@@ -806,7 +874,7 @@
   "Turn (loop [name value ...] body...) into a self-re-entrant function."
   [bindings-form body env]
   (let [items (rn/node-items (rn/node-form bindings-form))
-        pairs (binding-pairs items)
+        pairs (binding-pairs items env)
         built (reduce
                 (fn [acc pair]
                   (let [pat (rn/node-form (first pair))
@@ -1277,7 +1345,7 @@
             (erl-call (second entry) (nth entry 2) arg-asts)
             (guard-special (second entry) arg-asts)))
       :else
-        (throw (str "`" name "` is not allowed in a guard")))))
+        (compile-error env (str "`" name "` is not allowed in a guard")))))
 
 (defn- compile-guard
   "Compile one guard expression into a guard-safe Elixir tree.
@@ -1293,7 +1361,7 @@
       (= tag :symbol)
         (if (local? env (rn/node-name f))
           (local-var env (rn/node-name f))
-          (throw (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
+          (compile-error env (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
       (= tag :keyword) (erlang/binary_to_atom (rn/node-name f))
       (= tag :list) (compile-guard-list (rn/node-items f) env)
       :else f)))
@@ -1732,7 +1800,7 @@
                        (BeamLisp.Record/deftype_module? (erlang/element 2 r))))
             (erlang/element 2 r)
             (erlang/binary_to_atom name)))
-      :else (throw "expected a type tag (keyword) or struct module"))))
+      :else (compile-error env "expected a type tag (keyword) or struct module"))))
 
 (defn- protocol-impl
   "Compile one `(method-name [args] body...)` implementation into a
@@ -2176,7 +2244,7 @@
   "Parse one :require spec into [target as-alias refer]. A bare symbol is just a
    target; a vector `[target :as a :refer [x y]]` carries an alias and/or refer
    list (or :all)."
-  [spec]
+  [spec env]
   (let [f (rn/node-form spec)]
     (if (= :symbol (rn/node-tag f))
       (list (rn/node-name f) nil (list))
@@ -2201,7 +2269,7 @@
                   (recur (rest fs) as-alias
                          (apply list (map (fn [s] (rn/node-name (rn/node-form s))) (rn/node-items x)))
                          nil)
-                :else (throw (str "invalid :require spec for " target))))))))))
+                :else (compile-error env (str "invalid :require spec for " target))))))))))
 
 (defn- compile-ns
   "Compile (ns name clauses...) into the block that declares and enters the
@@ -2219,10 +2287,10 @@
                               head (rn/node-form (first items))]
                           (if (and (= :keyword (rn/node-tag head)) (= "require" (rn/node-name head)))
                             (rest items)
-                            (throw "ns supports only :require clauses"))))
+                            (compile-error env "ns supports only :require clauses"))))
                       clauses)
         ns-var (erlang/list_to_tuple (list :ns (list) var-context))
-        parsed (map parse-require-spec specs)
+        parsed (map (fn [s] (parse-require-spec s env)) specs)
         loads (apply list
                 (map (fn [p] (ast-mod-call (list :BeamLisp :Loader) :ensure_loaded (list (first p))))
                      parsed))
@@ -2504,7 +2572,7 @@
     (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
     (= head "recur") (compile-recur args env)
-    :else (throw (str "compiler: unknown special form " head))))
+    :else (compile-error env (str "unknown special form `" head "`"))))
 
 (defn- data->form
   "Turn a DATA value back into the reader form that denotes it — the exact
@@ -2658,17 +2726,20 @@
       (= tag :meta)
         (let [inner (rn/node-form form)
               m (rn/node-pos form)
+              ; thread this form's source position (:line/:file) onto the env so
+              ; every step below can name the user's file and line in an error
+              penv (pos-env env m)
               author (if (erlang/is_map m)
                        (maps/without (list :line :col :file) m)
                        {})
-              inner-ast (compile inner env)]
+              inner-ast (compile inner penv)]
           (if (or (not (erlang/is_map author)) (= 0 (erlang/map_size author)))
             inner-ast
             (let [author-map (ast-node map-head
                                (apply list
                                  (map (fn [k]
                                         (erlang/list_to_tuple
-                                          (list k (compile (maps/get k author) (notail env)))))
+                                          (list k (compile (maps/get k author) (notail penv)))))
                                       (maps/keys author))))]
               (ast-mod-call (list :BeamLisp :FormMeta) :with_meta
                             (list inner-ast author-map)))))
