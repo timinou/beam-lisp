@@ -58,3 +58,31 @@ mix beam_lisp.run --path priv examples/reload/NN-name.bl
   datalog-style query over live mailboxes, not a sleep.
 - **08** — reroute moves *data*: rewrite each in-flight message to the new shape,
   so a contract change costs no dropped messages.
+- **09** — the final boss of monitorability: a pure-`.bl` web server that renders
+  the live image and pushes a fresh view to the browser on every reload, so you
+  watch namespaces change, holds appear in red with their reason, and migrations
+  land — live, no page reload. `reload/subscribe` is the push; `reload/inspect`
+  is the read-model behind both this and the CLI monitor.
+- **10** — `ward`, a warm isolated test runner built on the reload machinery:
+  each file runs in its own env fork (isolation), a load-time crash is contained,
+  the source is always-latest, and the base is warm. One misbehaving file can
+  never contaminate another — the app-shutdown fragility dissolved by construction.
+
+## Beyond the ladder — the live tooling
+
+The same `reload/inspect` read-model drives two monitors and a runner:
+
+- **CLI monitor** — `mix beam_lisp.reload.monitor DIR` watches a directory and
+  repaints the live image (namespaces, vars, journal) after every commit.
+- **Web monitor** — demo 09; the browser view of the same snapshot, pushed live.
+- **ward** — `mix beam_lisp.ward FILE...` runs `.bl` test files warm, isolated,
+  coherence-advised, and always-latest; exits non-zero unless every file is green.
+
+## Namespace-level, and prod-safe
+
+Reload is **namespace-level**: the staged source *is* the namespace, so a name it
+no longer defines is genuinely removed (demo 02) — a rename must move every
+reference, in-namespace and across namespaces, or the bundle is held. And it is
+**prod-safe**: reading the live image is always available, but *mutating* it is
+gated — allowed in dev, refused in a release unless `BEAM_LISP_RELOAD=1` opts in,
+per node, with a bounded window. The guarantee lives in the running system.
