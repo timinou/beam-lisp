@@ -159,7 +159,9 @@ context as its parent. The intuition is simple and should feel obviously right:
 beam-lisp already applied this principle to two of its concurrency primitives.
 `future` (run this and let me ask for the answer later) and `promise` (a slot a
 result will arrive in) both **carry the parent's environment into the child.**
-The mechanism is two small operations:
+And, since this work, so do a first-class `spawn` and a `defserver` (an OTP
+gen_server whose `init` runs in a freshly started process) — see §5 and §6. The
+mechanism is two small operations:
 
 - **capture** — take a snapshot of the current process's environment (all the
   entries from the table in §3): "here is the world I am standing in."
@@ -222,9 +224,18 @@ it, the two features contradict each other — you cannot both isolate work and
 freely parallelize it.
 
 The general rule, then, is uniformity: **every** process-creating primitive in
-the language — `future`, `promise`, and now `spawn` — conveys the environment. A
-reader learns the rule once and it holds everywhere. One need ("run this
-elsewhere, in my world"), one implementation.
+the language — `future`, `promise`, `spawn`, and a `defserver`'s OTP start —
+conveys the environment. A reader learns the rule once and it holds everywhere.
+One need ("run this elsewhere, in my world"), one implementation.
+
+The `defserver` case is worth a sentence because its process is started by OTP,
+not by beam-lisp directly: a gen_server's `init` callback runs in the newly
+spawned server process. The same conveyance applies — the generated `start_link`
+captures the caller's env token beside the init argument, and the generated
+`init` binds it before running the user's body — so a server started inside an
+isolated fork resolves its own namespace's names in `init` instead of crashing
+at `:global`. The principle did not change; only the boundary it crosses did (an
+OTP start instead of a bare spawn).
 
 ### The specific case, and its honest edge
 
