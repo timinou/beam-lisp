@@ -402,3 +402,147 @@
             (:failed result) " failed, "
             (:incoherent result) " incoherent")
        (if (:ok? result) "  ✓ all green" "  ✗ not green")])))
+
+;; ── example runner ─────────────────────────────────────────────────────────
+;;
+;; The examples under examples/ are executable documentation, NOT deftest
+;; suites: a bare script with side effects and often no `(ns …)` header. They
+;; still deserve the same guarantee a test file gets — run in isolation, never
+;; contaminate a sibling, never wedge the whole run — so ward runs them too,
+;; through a purpose-built entry that differs from `run-file` in three ways an
+;; example needs and a test suite does not:
+;;
+;;   1. NO ns REQUIRED. `run-file` rejects a file with no `(ns …)`; an example
+;;      is a script, so this runs it as-is (the fork is the isolation, the ns
+;;      header is not what provides it).
+;;   2. TIMED OUT. An example may spawn a worker and `receive`, or load a large
+;;      library from source; a genuine block must FAIL that one example, never
+;;      hang the runner. Each runs inside a `future` and is deref'd with a
+;;      deadline — a timeout is a result, not a wedge.
+;;   3. OPTIONAL-DEP AWARE. An example that needs a binary this host has not
+;;      fetched (the z3 solver) or an optional library (Phoenix.PubSub, Bandit)
+;;      is SKIPPED with its reason, not failed: absence of an optional
+;;      dependency is an environment fact, not a defect in the example.
+
+(def ^:private example-timeout-ms
+  "How long one example may run before it is judged hung. Generous, because an
+   example that loads a big library FROM SOURCE (the auth biscuit chain, say) is
+   slow but correct; a real deadlock still resolves well within twice this."
+  30000)
+
+(defn- optional-dep-skip
+  "If an error message names an ABSENT OPTIONAL dependency, return a short
+   human reason to SKIP the example; otherwise nil (a real failure). The set is
+   deliberately small and explicit — a bundled solver binary and two optional
+   web libraries — so a genuine error is never silently swallowed as a skip."
+  [msg]
+  ;; NB `index-of` returns nil (NOT -1) on a miss, and `(>= nil 0)` is TRUE in
+  ;; BEAM term order — so presence MUST be tested with `some?`, never `>= 0`,
+  ;; or every message would match the first branch.
+  (cond
+    (some? (index-of msg "bundled z3 missing")) "z3 solver not fetched"
+    (some? (index-of msg "Phoenix.PubSub"))     "Phoenix.PubSub not available"
+    (some? (index-of msg "module Bandit"))      "Bandit not available"
+    :else nil))
+
+(defn- classify-example
+  "Turn one example's raw outcome into a status map. `outcome` is `:ok`, or
+   `[:err message]` from a caught error, or `:timeout` from the deadline.
+   An error naming an absent optional dep becomes `:skipped`; any other error
+   is `:failed`."
+  [path outcome]
+  (cond
+    (= outcome :ok) {:path path :status :passed}
+    (= outcome :timeout)
+      {:path path :status :failed :reason (str "timed out after " example-timeout-ms "ms")}
+    :else
+      (let [msg (second outcome)
+            skip (optional-dep-skip msg)]
+        (if (some? skip)
+          {:path path :status :skipped :reason skip}
+          {:path path :status :failed :reason msg}))))
+
+(defn- run-example-src
+  "Run one example SOURCE in a fresh isolated fork off `base`, with a deadline.
+   Returns `:ok`, `[:err message]`, or `:timeout`.
+
+   The runner process is MONITORED, not linked: an example may spawn a worker
+   that OUTLIVES the run (a process holding an old database snapshot 'no matter
+   what anyone else does'), and when the example's fork is destroyed that orphan
+   crashes on its next lookup. With a link that crash would propagate and take
+   the whole runner down; a monitor turns it into a harmless `:DOWN` message the
+   runner never even waits for. So: the example runs in its own isolated fork
+   (destroyed on exit); its result is sent back in a message; a monitor DOWN or
+   the deadline both resolve the run without the runner ever being at risk from
+   a detached orphan. Multi-process examples whose workers finish WITHIN the run
+   pass, because `spawn` conveys the fork's env into every child."
+  [base src]
+  (let [parent (erlang/self)
+        [pid ref]
+          (spawn-monitor
+            (fn []
+              (let [r (try
+                        (do (env/isolated base (fn [] (env/eval src))) :ok)
+                        (catch e [:err (ex-message e)]))]
+                (erlang/send parent [:example-done r]))))]
+    ;; The result message is AUTHORITATIVE: the child computes it, sends it, and
+    ;; only then exits normally, so a `:DOWN :normal` that races in is just the
+    ;; clean-exit signal — loop back and take the pending done message. A `:DOWN`
+    ;; with any OTHER reason means the child died BEFORE reporting (an orphan it
+    ;; spawned crashed and killed it through a link); that is a real failure.
+    (loop []
+      (receive
+        [:example-done r] r
+        [:DOWN ref :process pid :normal] (recur)
+        [:DOWN ref :process pid reason] [:err (str "process exited: " (pr-str reason))]
+        (after example-timeout-ms :timeout)))))
+
+(defn run-examples
+  "Run a list of example files, each in its own isolated, timed, dep-aware fork,
+   and return the aggregate a CI gate reads:
+     {:files [{:path :status :reason?} …]
+      :passed n :skipped n :failed n :ok? bool}
+   `entries` is a list of `{:path p :src s}` maps (the path is carried only so
+   the report can name the file). `:ok?` is true when NOTHING failed — a skip
+   is not a failure, because an absent optional dependency is not the example's
+   fault. No example can contaminate another (each is its own fork) or wedge the
+   run (each is deadlined)."
+  [entries]
+  (let [base (warm-base)
+        ;; entries arrive from the mix task as string-keyed maps ({"path" "src"}),
+        ;; because a map interned from Elixir keeps its string keys; read them
+        ;; with `get` rather than keyword access.
+        results (map (fn [entry]
+                       (classify-example (get entry "path")
+                                         (run-example-src base (get entry "src"))))
+                     entries)
+        passed  (count (filter (fn [r] (= :passed  (:status r))) results))
+        skipped (count (filter (fn [r] (= :skipped (:status r))) results))
+        failed  (count (filter (fn [r] (= :failed  (:status r))) results))]
+    {:files (vec results)
+     :passed passed
+     :skipped skipped
+     :failed failed
+     :ok? (= 0 failed)}))
+
+(defn report-examples
+  "Render a `run-examples` result for a human: a glyph line per example, then a
+   summary. `✓` passed, `⊛` skipped (with why), `✗` failed (with why). Returns
+   the text; the caller prints it."
+  [result]
+  (join "\n"
+    (concat
+      ["── ward: examples (isolated, timed, dep-aware) ──" ""]
+      (map (fn [r]
+             (let [glyph (cond (= :passed  (:status r)) "✓"
+                               (= :skipped (:status r)) "⊛"
+                               :else                    "✗")]
+               (str "  " glyph " " (:path r)
+                    (if (some? (:reason r)) (str "  — " (:reason r)) ""))))
+           (:files result))
+      [""
+       (str "  " (:passed result) " passed, "
+            (:skipped result) " skipped, "
+            (:failed result) " failed")
+       (if (:ok? result) "  ✓ all green (skips are not failures)" "  ✗ not green")])))
+
