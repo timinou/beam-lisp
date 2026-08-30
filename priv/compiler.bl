@@ -57,7 +57,15 @@
    carrying the dotted parts as atoms: `BeamLisp.RT` is
    {:__aliases__, [], [:BeamLisp, :RT]}. `parts` is a list of atoms."
   [parts]
-  (ast-node :__aliases__ parts))
+  ; The metadata is `[alias: false]`, not `[]`: that is what Elixir's own
+  ; compiler stamps on a module alias, and matching it matters when an alias
+  ; is escaped into `defn` data (where the metadata becomes comparable data,
+  ; not a blank-able AST metadata slot). Built directly so the metadata sits
+  ; in the node's middle slot.
+  (erlang/list_to_tuple
+    (list :__aliases__
+          (list (erlang/list_to_tuple (list :alias false)))
+          parts)))
 
 (defn- ast-dot
   "Build the Elixir syntax for reaching a function `fun` inside module `mod`.
@@ -157,7 +165,7 @@
   [env]
   (assoc env :tail false))
 
-(def ^:private var-context (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Compiler"))
+(def ^:private var-context (erlang/binary_to_atom "Elixir.BeamLisp.Compiler"))
 
 (defn- fresh-var
   "Invent a brand-new Elixir variable node for a local binding named `base`.
@@ -411,7 +419,7 @@
 (def special-forms
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
-  #{"if" "do" "throw" "quote" "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
+  #{"if" "do" "throw" "quote" "def" "defn" "defn-" "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
 
 (defn- compile-body
   "Compile body forms into one Elixir tree (a single form, or a __block__)."
@@ -447,7 +455,12 @@
     (ast-node (erlang/list_to_tuple (list :. (list) (list outer-fn))) (list outer-fn))))
 
 (defn- compile-recur
-  "Turn (recur value ...) into a jump back to the enclosing loop start."
+  "Turn (recur value ...) into a jump back to the enclosing loop or function.
+
+   Two ways to re-enter: a loop or anonymous fn re-enters by self-application;
+   a linked defn re-enters by a direct named self-call Module.fname(args),
+   which the BEAM tail-call-optimizes. recur must be in tail position, inside a
+   loop or fn, with the right number of values."
   [args env]
   (let [target (:recur env)]
     (cond
@@ -455,10 +468,16 @@
       (not (:tail env)) (throw "recur must be in tail position")
       (not= (count args) (:arity target)) (throw "recur arity mismatch")
       :else
-        (let [arg-asts (compile-each-notail args env)
-              self (:self target)
-              self-app (ast-node (erlang/list_to_tuple (list :. (list) (list self))) (list self))]
-          (ast-node (erlang/list_to_tuple (list :. (list) (list self-app))) arg-asts)))))
+        (let [arg-asts (compile-each-notail args env)]
+          (if (contains? target :self-call)
+            ; a linked defn: a direct named self-call Module.fname(args)
+            (let [mf (:self-call target)]
+              (ast-node (erlang/list_to_tuple (list :. (list) (list (first mf) (second mf))))
+                        arg-asts))
+            ; a loop / anonymous fn: re-enter by self-application
+            (let [self (:self target)
+                  self-app (ast-node (erlang/list_to_tuple (list :. (list) (list self))) (list self))]
+              (ast-node (erlang/list_to_tuple (list :. (list) (list self-app))) arg-asts)))))))
 
 (defn- binding-pairs
   "Split a binding vector's items into [pattern value] pairs."
@@ -1125,6 +1144,122 @@
                         clauses))]
     (assemble-fn compiled self-map)))
 
+; ── def and defn (var linking) ────────────────────────────────────────────────
+;
+; `(def x value)` records a namespace variable. `(defn name [params] body)`
+; records a FUNCTION variable, but not as a closure — it emits real Elixir
+; `def name(params), do: body` clauses into a per-namespace module, so a call
+; to it is a direct BEAM function call (fast), and a self-call recurs by name
+; (tail-call-optimized). `BeamLisp.Link.defvar` installs those clauses and
+; regenerates the namespace module; the compiler's job is to build the clause
+; data it takes.
+
+(defn- compile-def
+  "Compile (def name value) into the tree that records a namespace variable.
+
+   The value is compiled (not in tail position) and interned under the name in
+   the current namespace with `BeamLisp.Env.intern`."
+  [name-form init env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        init-ast (compile init (notail env))]
+    (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name init-ast))))
+
+(defn- guarded-def-head
+  "Wrap a def clause head with its guard, if any.
+
+   `(fname params)` with no guard is the bare head; with a guard it becomes
+   `(fname params) when guard`, the shape a `def` clause uses."
+  [head guard-ast]
+  (if (nil? guard-ast)
+    head
+    (ast-node :when (list head guard-ast))))
+
+(defn- compile-defn-clause
+  "Compile one defn clause into a def-clause entry {kind fixed-count fname def-ast}.
+
+   Unlike an anonymous fn clause (a `->` inside a closure), a defn clause is a
+   real named `def fname(params), do: body`. Parameters bind as Elixir
+   variables (destructuring ones prefix the body with matches); a `& rest`
+   becomes one more parameter. The body recurs by a direct named self-call to
+   `mod.fname`, which the BEAM tail-call-optimizes. A variadic clause uses the
+   function name `name__bl_v` so it does not collide with the fixed arities."
+  [name param-forms guard body mod env]
+  (let [sv (split-variadic param-forms)
+        fixed-forms (first sv)
+        rest-form (second sv)
+        variadic? (not (nil? rest-form))
+        fname (if variadic?
+                (erlang/binary_to_atom (str name "__bl_v"))
+                (erlang/binary_to_atom name))
+        fixed-built (reduce (fn [acc pform]
+                              (let [b (bind-param pform (:env acc))]
+                                {:params (cons (:param b) (:params acc))
+                                 :steps (concat (:steps acc) (:steps b))
+                                 :env (:env b)}))
+                            {:params (list) :steps (list) :env env}
+                            fixed-forms)
+        rest-built (if (nil? rest-form)
+                     fixed-built
+                     (let [b (bind-param rest-form (:env fixed-built))]
+                       {:params (cons (:param b) (:params fixed-built))
+                        :steps (concat (:steps fixed-built) (:steps b))
+                        :env (:env b)}))
+        params (reverse (:params rest-built))
+        prelude-steps (:steps rest-built)
+        fixed-count (count fixed-forms)
+        ; the fn can call itself by name; recur is a direct Module.fname call
+        body-env (assoc (:env rest-built)
+                        :recur {:self-call (list mod fname) :arity (count params)}
+                        :tail true)
+        body-ast (compile-body body body-env)
+        full-body (if (empty? prelude-steps)
+                    body-ast
+                    (ast-node :__block__
+                              (apply list
+                                     (concat
+                                       (map (fn [step]
+                                              (ast-node := (list (first step) (second step))))
+                                            prelude-steps)
+                                       (list body-ast)))))
+        guard-ast (if (nil? guard) nil (compile-guard guard body-env))
+        ; the clause head: fname(params), guarded if needed
+        head (ast-node fname params)
+        def-ast (ast-node :def (list (guarded-def-head head guard-ast)
+                                     (list (erlang/list_to_tuple (list :do full-body)))))
+        kind (if variadic? :variadic :fixed)]
+    ; entry shape Link.defvar wants: {kind, fixed-count, fname, def-ast}
+    (erlang/list_to_tuple (list kind fixed-count fname def-ast))))
+
+(defn- compile-defn
+  "Compile (defn name [params] body...) — or its multi-clause form — into the
+   tree that records a linked function variable.
+
+   Each clause becomes a real `def` clause installed into the namespace's own
+   module by `BeamLisp.Link.defvar`, so calls are direct and fast. Returns the
+   `defvar` call tree, which at run time interns the function and returns it.
+   A leading docstring is skipped (metadata handling is a later refinement)."
+  [args env]
+  (let [name-form (rn/node-form (first args))
+        name (rn/node-name name-form)
+        rest-args (rest args)
+        ; skip an optional docstring (a leading string literal)
+        after-doc (if (and (not (empty? rest-args))
+                           (erlang/is_binary (rn/node-form (first rest-args))))
+                    (rest rest-args)
+                    rest-args)
+        mod (BeamLisp.Link/module_for (:ns env))
+        clauses (parse-fn-clauses after-doc)
+        entries (apply list
+                  (map (fn [c]
+                         (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
+                       clauses))
+        ; Link.defvar takes the entries as DATA, so escape them into a literal;
+        ; location is a keyword list [file: ..., line: ...]
+        location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
+                       (erlang/list_to_tuple (list :line (or (:line env) 1))))]
+    (ast-mod-call (list :BeamLisp :Link) :defvar
+                  (list (:ns env) name (Macro/escape entries) location))))
+
 (defn- compile-special
   "Compile a special form by name."
   [head args env]
@@ -1134,6 +1269,8 @@
     (= head "do") (compile-body args env)
     (= head "throw") (compile-throw (first args) env)
     (= head "quote") (compile-quote (first args))
+    (= head "def") (compile-def (first args) (second args) env)
+    (or (= head "defn") (= head "defn-")) (compile-defn args env)
     (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
     (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
