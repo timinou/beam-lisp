@@ -457,7 +457,7 @@
 (def special-forms
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
-  #{"if" "do" "throw" "try" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
+  #{"if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
     "defrecord" "deftype"
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
@@ -766,6 +766,94 @@
   [x env]
   (ast-mod-call (list :BeamLisp :ExInfo) :raise_payload (list (compile x env))))
 
+; ---- pattern matching (receive) ----------------------------------------------
+;
+; A message pattern matches the shape of a value. beam-lisp patterns compile to
+; Elixir match patterns, with one twist: a vector pattern `[a b]` matches BOTH
+; an Erlang tuple `{a, b}` AND a beam-lisp `%Vector{}`, because a small vector
+; is a tuple wrapped in a struct. So a pattern can produce SEVERAL alternative
+; Elixir patterns; the caller emits one clause per alternative, sharing one
+; body. `compile-pattern` returns [alternatives env-with-bindings].
+
+(declare compile-pattern)
+
+(defn- pattern-product
+  "Combine sub-pattern alternatives into the product of Elixir patterns.
+
+   Each sub-pattern may have several alternatives; the result is every
+   combination, threading the environment so all combinations share the same
+   fresh binding variables. Returns [list-of-combos env]."
+  [forms env]
+  (let [built (reduce (fn [acc form]
+                        (let [r (compile-pattern form (:env acc))]
+                          {:alts (concat (:alts acc) (list (first r))) :env (second r)}))
+                      {:alts (list) :env env}
+                      forms)
+        alt-lists (:alts built)
+        ; cartesian product of the alternative lists
+        combos (reduce (fn [acc alts]
+                         (apply list
+                           (mapcat (fn [prefix]
+                                     (map (fn [alt] (concat prefix (list alt))) alts))
+                                   acc)))
+                       (list (list))
+                       alt-lists)]
+    (list combos (:env built))))
+
+(defn- compile-pattern
+  "Compile a message pattern into [alternatives env].
+
+   `_` matches anything (no binding); a symbol binds a fresh variable; a keyword
+   or literal matches itself; `[p q]` matches a tuple OR a vector (both
+   alternatives, for every combination of the items' own alternatives); `{:k p}`
+   matches a map; `(quote datum)` matches literal data."
+  [form env]
+  (let [f (rn/node-form form)
+        tag (rn/node-tag f)]
+    (cond
+      (and (= tag :symbol) (= "_" (rn/node-name f)))
+        (list (list (erlang/list_to_tuple (list :_ (list) var-context))) env)
+      (= tag :symbol)
+        (let [name (rn/node-name f) var (fresh-var name)]
+          (list (list var) (put-local env name var)))
+      (= tag :keyword)
+        (list (list (erlang/binary_to_atom (rn/node-name f))) env)
+      (= tag :vector)
+        (let [pr (pattern-product (rn/node-items f) env)
+              combos (first pr)]
+          (list (apply list
+                  (mapcat (fn [pats]
+                            (let [tuple-pat (erlang/list_to_tuple (list tuple-head (list) (apply list pats)))
+                                  vector-pat (ast-node struct-head
+                                                       (list (ast-alias (list :BeamLisp :Vector))
+                                                             (ast-node map-head
+                                                                       (list (erlang/list_to_tuple (list :items tuple-pat))))))]
+                              (list tuple-pat vector-pat)))
+                          combos))
+                (second pr)))
+      (= tag :map)
+        (let [kvs (rn/node-items f)
+              keys (apply list (map (fn [pair]
+                                      (let [k (rn/node-form (kv-key pair))]
+                                        (erlang/binary_to_atom (rn/node-name k))))
+                                    kvs))
+              pr (pattern-product (apply list (map kv-val kvs)) env)
+              combos (first pr)]
+          (list (apply list
+                  (map (fn [vals]
+                         (ast-node map-head
+                                   (apply list
+                                     (loop [ks keys vs vals acc (list)]
+                                       (if (or (empty? ks) (empty? vs))
+                                         (reverse acc)
+                                         (recur (rest ks) (rest vs)
+                                                (cons (erlang/list_to_tuple (list (first ks) (first vs))) acc)))))))
+                       combos))
+                (second pr)))
+      :else
+        ; a number, string, boolean, or nil matches itself
+        (list (list f) env))))
+
 ; ---- try / catch / finally ---------------------------------------------------
 ;
 ; `(try body... (catch e handler...) (finally cleanup...))` becomes an Elixir
@@ -816,6 +904,70 @@
     ; if true do handler else reraise
     (ast-node :if (list true (list (erlang/list_to_tuple (list :do handler))
                                    (erlang/list_to_tuple (list :else reraise)))))))
+
+(defn- after-clause-form?
+  "Say whether a receive sub-form is an (after ms body) clause."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "after" (rn/node-name (rn/node-form (first items)))))))))
+
+(defn- receive-clause-forms
+  "Group a receive's forms into {pattern guard body} triples.
+
+   Each clause is a pattern, an optional `:when guard`, then a single body
+   form. Returns a list of {:pattern :guard :body}."
+  [forms]
+  (loop [fs forms acc (list)]
+    (if (empty? fs)
+      (reverse acc)
+      (let [pattern (first fs)
+            after-pat (rest fs)
+            gb (split-when after-pat)          ; [guard-or-nil rest]
+            guard (first gb)
+            body-and-more (second gb)
+            body (first body-and-more)]
+        (recur (rest body-and-more)
+               (cons {:pattern pattern :guard guard :body body} acc))))))
+
+(defn- compile-receive
+  "Compile (receive pattern body... (after ms body)) into an Elixir receive.
+
+   Each clause's pattern may match several shapes (a vector matches a tuple and
+   a beam-lisp vector), so it expands to one `->` clause per alternative,
+   sharing the clause's body. A `:when` guard rides on the clause head. An
+   optional `(after ms body)` becomes the receive timeout."
+  [forms env]
+  (let [after-forms (filter after-clause-form? forms)
+        normal (filter (fn [f] (not (after-clause-form? f))) forms)
+        clauses (receive-clause-forms normal)
+        ; each clause -> one -> node per pattern alternative
+        do-clauses (apply list
+                     (mapcat (fn [cl]
+                               (let [pr (compile-pattern (:pattern cl) env)
+                                     pats (first pr)
+                                     pat-env (second pr)
+                                     guard-ast (if (nil? (:guard cl)) nil
+                                                 (compile-guard (:guard cl) pat-env))
+                                     body-ast (compile (:body cl) pat-env)]
+                                 (map (fn [pat]
+                                        (let [head (if (nil? guard-ast) pat
+                                                     (ast-node :when (list pat guard-ast)))]
+                                          (ast-node :-> (list (list head) body-ast))))
+                                      pats)))
+                             clauses))
+        base-opts (list (erlang/list_to_tuple (list :do do-clauses)))
+        opts (if (empty? after-forms)
+               base-opts
+               (let [af-items (rn/node-items (rn/node-form (first after-forms)))
+                     timeout (compile (second af-items) (notail env))
+                     after-body (compile (nth af-items 2) env)
+                     after-clause (ast-node :-> (list (list timeout) after-body))]
+                 (concat base-opts (list (erlang/list_to_tuple (list :after (list after-clause)))))))]
+    (ast-node :receive (list (apply list opts)))))
 
 (defn- compile-try
   "Compile (try body... (catch e h...) (finally f...)) into Elixir try/catch.
@@ -1838,6 +1990,7 @@
     (= head "do") (compile-body args env)
     (= head "throw") (compile-throw (first args) env)
     (= head "try") (compile-try args env)
+    (= head "receive") (compile-receive args env)
     (= head "quote") (compile-quote (first args))
     (= head "syntax-quote") (compile-syntax-quote (first args) env)
     (= head "def") (compile-def (first args) (second args) env)
