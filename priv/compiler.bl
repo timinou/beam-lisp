@@ -458,6 +458,8 @@
   "The names the compiler treats as special forms rather than function calls.
    A list whose head is one of these is compiled by its own rule."
   #{"if" "do" "throw" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
+    "defmulti" "defmethod" "defprotocol" "extend-type" "satisfies?"
+    "defrecord" "deftype"
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
 
 (defn- compile-body
@@ -1366,6 +1368,165 @@
 ; regenerates the namespace module; the compiler's job is to build the clause
 ; data it takes.
 
+; ---- dispatch and objects ----------------------------------------------------
+;
+; Multimethods, protocols, records, and types. These mostly hand work to
+; runtime modules (BeamLisp.Multi for dispatch, BeamLisp.Record for structs):
+; the compiler builds the DECLARATION, the runtime does the installation. That
+; keeps the compiler small and the object system's behavior in one place.
+
+(defn- multi-var-target
+  "Resolve a protocol/multimethod name to the [ns name] where it lives.
+
+   A bare name resolves to the namespace that defines or referred it; a
+   qualified `alias/name` resolves through the alias. This is how
+   `(extend-type T Proto ...)` finds the protocol var even when it was referred
+   in from another namespace."
+  [env name]
+  (if (has-slash? name)
+    (let [[prefix var] (split-slash name)
+          target (or (BeamLisp.Env/alias_target (:ns env) prefix)
+                     (if (= "clojure.core" prefix) "core" prefix))]
+      (list target var))
+    (if (BeamLisp.Env/local_var? (:ns env) name)
+      (list (:ns env) name)
+      (list (or (BeamLisp.Env/refer_source (:ns env) name) (:ns env)) name))))
+
+(defn- type-tag
+  "The dispatch tag for a type in an `extend-type`/`defrecord` protocol block.
+
+   A keyword tag (`:circle`) is its atom. A symbol naming a record or deftype
+   module resolves to that module; any other symbol becomes a plain type tag
+   (its atom)."
+  [form env]
+  (let [f (rn/node-form form)]
+    (cond
+      (= :keyword (rn/node-tag f)) (erlang/binary_to_atom (rn/node-name f))
+      (= :symbol (rn/node-tag f))
+        (let [name (rn/node-name f)
+              r (BeamLisp.Env/fetch (:ns env) name)]
+          (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r))
+                   (erlang/is_atom (erlang/element 2 r))
+                   (or (BeamLisp.Record/record_module? (erlang/element 2 r))
+                       (BeamLisp.Record/deftype_module? (erlang/element 2 r))))
+            (erlang/element 2 r)
+            (erlang/binary_to_atom name)))
+      :else (throw "expected a type tag (keyword) or struct module"))))
+
+(defn- protocol-impl
+  "Compile one `(method-name [args] body...)` implementation into a
+   {method-name-string, fn-ast} tuple for a protocol's method map."
+  [form env]
+  (let [f (rn/node-form form)
+        items (rn/node-items f)
+        m (rn/node-name (rn/node-form (first items)))]
+    (erlang/list_to_tuple
+      (list m (compile-fn (apply list (parse-fn-clauses-as-args (rest items))) env)))))
+
+(defn- parse-fn-clauses-as-args
+  "Wrap a method body (a single `[params] body...` clause) as the argument list
+   the fn compiler expects."
+  [clause-items]
+  clause-items)
+
+(defn- compile-defmulti
+  "Compile (defmulti name dispatch-fn) into a Multi.define_multi call."
+  [name-form dispatch env]
+  (let [name (rn/node-name (rn/node-form name-form))]
+    (ast-mod-call (list :BeamLisp :Multi) :define_multi
+                  (list (:ns env) name (compile dispatch (notail env))))))
+
+(defn- compile-defmethod
+  "Compile (defmethod name dispatch-val [params] body...) into a
+   Multi.add_method call. The method body is compiled as an ordinary fn."
+  [name-form dispatch-val rest-forms env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        tgt (multi-var-target env name)]
+    (ast-mod-call (list :BeamLisp :Multi) :add_method
+                  (list (first tgt) (second tgt)
+                        (compile dispatch-val (notail env))
+                        (compile-fn (apply list rest-forms) env)))))
+
+(defn- compile-defprotocol
+  "Compile (defprotocol Name (method [args])...) into a Multi.define_protocol
+   call listing the method names."
+  [name-form method-forms env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        ; a leading string is a docstring; skip it
+        methods (if (and (not (empty? method-forms))
+                         (erlang/is_binary (rn/node-form (first method-forms))))
+                  (rest method-forms)
+                  method-forms)
+        method-names (apply list
+                       (map (fn [mf]
+                              (rn/node-name (rn/node-form (first (rn/node-items (rn/node-form mf))))))
+                            methods))]
+    (ast-mod-call (list :BeamLisp :Multi) :define_protocol
+                  (list (:ns env) name method-names))))
+
+(defn- compile-extend-type
+  "Compile (extend-type Type Protocol (method [args] body)...) into a
+   Multi.extend_type call installing the method map for the type's tag."
+  [type-form protocol-form method-forms env]
+  (let [protocol (rn/node-name (rn/node-form protocol-form))
+        tgt (multi-var-target env protocol)
+        tag (type-tag type-form env)
+        impls (ast-node map-head
+                        (apply list (map (fn [mf] (protocol-impl mf env)) method-forms)))]
+    (ast-mod-call (list :BeamLisp :Multi) :extend_type
+                  (list (first tgt) (second tgt) tag impls))))
+
+(defn- compile-satisfies?
+  "Compile (satisfies? Protocol value) into a Multi.satisfies? call."
+  [protocol-form value-form env]
+  (let [tgt (multi-var-target env (rn/node-name (rn/node-form protocol-form)))]
+    (ast-mod-call (list :BeamLisp :Multi) :satisfies?
+                  (list (first tgt) (second tgt) (compile value-form (notail env))))))
+
+(defn- record-field-names
+  "The field names of a record/deftype field vector, as strings."
+  [fields-form]
+  (apply list (map (fn [it] (rn/node-name (rn/node-form it)))
+                   (rn/node-items (rn/node-form fields-form)))))
+
+(defn- compile-defrecord
+  "Compile (defrecord Name [fields...]) into the block that defines a
+   struct-backed type and interns its constructors.
+
+   Emits: a `mod = Record.define(ns, Name, fields)` binding, then interns of
+   `Name` (the module), `->Name` (positional constructor), and `map->Name`
+   (map constructor). Inline protocol blocks are not yet handled here."
+  [name-form fields-form kind env]
+  (let [name (rn/node-name (rn/node-form name-form))
+        fields (record-field-names fields-form)
+        ; a FIXED variable named `mod` (not gensym'd), matching the existing
+        ; compiler — there is only one per record definition, so no collision
+        mod-var (erlang/list_to_tuple (list :mod (list) var-context))
+        define-fn (if (= kind :record) :define :define_type)
+        base (list
+               ; mod = Record.define(ns, Name, fields)
+               (ast-node := (list mod-var
+                                  (ast-mod-call (list :BeamLisp :Record) define-fn
+                                                (list (:ns env) name fields))))
+               ; intern Name -> mod
+               (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name mod-var))
+               ; intern ->Name -> positional constructor
+               (ast-mod-call (list :BeamLisp :Env) :intern
+                             (list (:ns env) (str "->" name)
+                                   (ast-mod-call (list :BeamLisp :Record) :positional_ctor (list mod-var)))))
+        ; the map-constructor slot: a record interns `map->Name`; a deftype has
+        ; none, so the slot is `nil` (the existing compiler emits it either way)
+        map-ctor-slot (if (= kind :record)
+                        (ast-mod-call (list :BeamLisp :Env) :intern
+                                      (list (:ns env) (str "map->" name)
+                                            (ast-mod-call (list :BeamLisp :Record) :map_ctor (list mod-var))))
+                        nil)
+        ; an empty `__block__` stands for the (empty) inline-protocol-extends
+        ; block the full form allows; then the block returns the module value
+        empty-block (ast-node :__block__ (list))
+        stmts (concat base (list map-ctor-slot empty-block mod-var))]
+    (ast-node :__block__ (apply list stmts))))
+
 (defn- compile-def
   "Compile (def name value) into the tree that records a namespace variable.
 
@@ -1534,6 +1695,14 @@
     (= head "def") (compile-def (first args) (second args) env)
     (or (= head "defn") (= head "defn-")) (compile-defn args env)
     (= head "defmacro") (compile-defmacro args env)
+    (= head "defmulti") (compile-defmulti (first args) (second args) env)
+    (= head "defmethod") (compile-defmethod (first args) (second args) (rest (rest args)) env)
+    (= head "defprotocol") (compile-defprotocol (first args) (rest args) env)
+    (= head "extend-type")
+      (compile-extend-type (first args) (second args) (rest (rest args)) env)
+    (= head "satisfies?") (compile-satisfies? (first args) (second args) env)
+    (= head "defrecord") (compile-defrecord (first args) (second args) :record env)
+    (= head "deftype") (compile-defrecord (first args) (second args) :deftype env)
     (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
     (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
