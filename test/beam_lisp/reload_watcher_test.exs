@@ -15,10 +15,10 @@ defmodule BeamLisp.ReloadWatcherTest do
     ensure_named(BeamLisp.Env, fn -> BeamLisp.Env.start_link([]) end)
     ensure_named(BeamLisp.Loader.Server, fn -> BeamLisp.Loader.Server.start_link([]) end)
     BeamLisp.init()
-    # Load the reload ns into the image (AOT beam or source), so `reload/*` is
-    # reachable from the bare evals the watcher and assertions run.
-    BeamLisp.Loader.ensure_loaded("reload")
-    # clear any bundle a prior test left staged in the shared reload state
+    # reload's `state` atom is an Agent created at ns-load; if a sibling suite
+    # stopped the app that Agent may be dead, so re-seed the ns under a live
+    # process before clearing any staged bundle.
+    reseed_reload()
     BeamLisp.eval("(reload/abort)")
 
     dir = Path.join(System.tmp_dir!(), "bl_watch_#{System.unique_integer([:positive])}")
@@ -39,6 +39,33 @@ defmodule BeamLisp.ReloadWatcherTest do
   # — wait for it once, then all subsequent saves are observed deterministically
   # via `sync/2` (which counts real events, no further sleeping).
   defp await_watching, do: Process.sleep(900)
+
+  # Ensure `reload` is loaded and its `state` atom is backed by a LIVE Agent.
+  # `reload/abort` touches the atom; if that raises (a dead Agent from a stopped
+  # app), re-evaluate the atom definition into the reload ns to rebuild it under
+  # the current, live process.
+  defp reseed_reload do
+    BeamLisp.Loader.ensure_loaded("reload")
+
+    try do
+      BeamLisp.eval("(reload/status)")
+      :ok
+    rescue
+      _ ->
+        BeamLisp.eval(
+          "(ns reload) (def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []}))"
+        )
+
+        :ok
+    catch
+      _, _ ->
+        BeamLisp.eval(
+          "(ns reload) (def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []}))"
+        )
+
+        :ok
+    end
+  end
 
   # Eval that yields nil instead of raising when the var is not defined yet — so
   # a `wait_until` predicate can poll for a value before the ns exists.
