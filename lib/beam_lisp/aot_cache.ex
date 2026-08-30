@@ -15,8 +15,10 @@ defmodule BeamLisp.AOTCache do
 
     * `compiler_key/0` — the toolchain: beam_lisp's version, Elixir and
       OTP versions, the contents of the codegen modules' beams
-      (Compiler/AOT/Emit/Link/Ns/Reader/AtomGuard/Native) and of
-      beam_lisp's own `priv/**/*.bl` (the core prelude is evaluated
+      (AOT/Emit/Link/Ns/Reader/AtomGuard/Native — NOT the Compiler
+      orchestration module, whose bytes no longer affect emitted code) and
+      of beam_lisp's own `priv/**/*.bl`, which now includes the self-hosted
+      compiler source `compiler.bl` itself (the core prelude is evaluated
       against every compile).
     * `closure_key/2` — the source: sha256 over the absolute path and
       content hash of the file plus its transitive `:require` closure.
@@ -40,10 +42,20 @@ defmodule BeamLisp.AOTCache do
   @env_off "BEAM_LISP_AOT_CACHE"
   @env_dir "BEAM_LISP_AOT_CACHE_DIR"
 
+  # The host modules whose bytes can change EMITTED code. `BeamLisp.Compiler` is
+  # deliberately ABSENT: the lowering now lives entirely in the self-hosted
+  # `priv/compiler.bl` (hashed below via the `priv/**/*.bl` prelude), so the
+  # Elixir `BeamLisp.Compiler` is pure orchestration — the thin `compile/2`
+  # delegator, `eval_form`, `new_env`, reader interop — that does not affect a
+  # single emitted byte. Hashing it would make the seed's provenance depend on
+  # orchestration edits (and, historically, on the now-deleted genesis body),
+  # reopening the bootstrap cycle for no soundness gain. What DOES affect
+  # emitted code — the reader, the emitter, linking, ns topology, atom interning,
+  # native decls — stays hashed here; a real change to the compiler's behaviour
+  # lives in `compiler.bl` and is caught by the `.bl` source hash.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
-    BeamLisp.Compiler,
     BeamLisp.Emit,
     BeamLisp.Link,
     BeamLisp.Native,
