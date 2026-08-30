@@ -254,6 +254,30 @@ defmodule BeamLisp.Refs do
     token = BeamLisp.Env.capture()
     %BeamLisp.Future{task: Task.async(fn -> BeamLisp.Env.bind(token); apply_heap_bound(); thunk_fn.() end)}
   end
+
+  # A beam-lisp process that INHERITS the spawning env, the same
+  # binding-conveyance `future_exec/1` and `promise/0` use. Raw
+  # `:erlang.spawn` starts a child with an EMPTY process dict, so the
+  # child resolves its vars and caps at `:global` — a child spawned
+  # inside an isolated fork (a test, a sandbox, an example under ward)
+  # cannot see the very namespace that spawned it, and blocks or crashes.
+  # Capturing the token here and binding it first makes `spawn` env-
+  # transparent: the child runs in the SAME world as its parent, exactly
+  # as Clojure conveys dynamic bindings across `future`. `spawn_kind` is
+  # `:plain | :link | :monitor`, mirroring the three `:erlang.spawn*`
+  # shapes; `:monitor` returns a `{pid, ref}` tuple as Erlang does.
+  def spawn_exec(thunk_fn), do: spawn_exec(thunk_fn, :plain)
+
+  def spawn_exec(thunk_fn, kind) do
+    token = BeamLisp.Env.capture()
+    wrapped = fn -> BeamLisp.Env.bind(token); apply_heap_bound(); thunk_fn.() end
+
+    case kind do
+      :plain -> :erlang.spawn(wrapped)
+      :link -> :erlang.spawn_link(wrapped)
+      :monitor -> :erlang.spawn_monitor(wrapped)
+    end
+  end
   def future?(%BeamLisp.Future{}), do: true
   def future?(_), do: false
 
