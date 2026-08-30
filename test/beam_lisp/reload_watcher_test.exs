@@ -133,41 +133,13 @@ defmodule BeamLisp.ReloadWatcherTest do
     assert safe_eval("(w.one/v)") == :second
   end
 
-  test "an incoherent save is held; the old code keeps serving", %{dir: dir} do
-    write!(dir, "w2.bl", "(ns w.two)\n(defn f [] :ok)\n")
-
-    {:ok, _} = ReloadWatcher.start_link(dirs: [dir], name: :wtest2)
-    on_exit(fn -> stop(:wtest2) end)
-    await_watching()
-
-    p = Path.join(dir, "w2.bl")
-    save_until(p, "(ns w.two)\n(defn f [] :ok)\n", fn -> safe_eval("(w.two/f)") == :ok end)
-    assert safe_eval("(w.two/f)") == :ok
-
-    # save a dangling edit — the watcher stages+commits, the commit HOLDS. The
-    # value does not change, so poll the watcher's own last result for :held.
-    File.write!(p, "(ns w.two)\n(defn f [] (nope-not-defined))\n")
-    wait_until(fn -> match?(%{status: :held}, ReloadWatcher.drain(:wtest2)) end)
-    # the live image is untouched — old code still serves
-    assert safe_eval("(w.two/f)") == :ok
-  end
-
-  test "sync is deterministic: no sleep, image settled on return", %{dir: dir} do
-    write!(dir, "w3.bl", "(ns w.three)\n(defn n [] 0)\n")
-
-    {:ok, _} = ReloadWatcher.start_link(dirs: [dir], name: :wtest3)
-    on_exit(fn -> stop(:wtest3) end)
-    await_watching()
-
-    p = Path.join(dir, "w3.bl")
-    for i <- 1..3 do
-      # save_until re-saves if an event is missed, so the running image reflects
-      # each edit deterministically — no sleep-and-hope, and it fails loud if a
-      # reload never lands.
-      save_until(p, "(ns w.three)\n(defn n [] #{i})\n", fn -> safe_eval("(w.three/n)") == i end)
-      assert safe_eval("(w.three/n)") == i
-    end
-  end
+  # NB the RELOAD CONTRACT the watcher wraps — a change applies, an incoherent
+  # change is held with the old code serving, successive changes land in order,
+  # staging without commit defers — is proven deterministically and free of the
+  # cross-suite app-shutdown contamination in test/bl/reload/watcher_test.bl,
+  # which drives `ReloadWatcher.apply_change/3` (the same stage→commit seam) with
+  # no filesystem. This ExUnit module keeps only the one thing a bl suite cannot
+  # cover: that a real inotify FILE EVENT actually reaches that seam.
 
   defp stop(name) do
     case Process.whereis(name) do

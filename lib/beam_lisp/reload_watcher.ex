@@ -141,26 +141,39 @@ defmodule BeamLisp.ReloadWatcher do
   # the static coherence pass and either applies the edit or holds it with the
   # old code serving — exactly the reconcile-loop contract, driven by a save.
   defp handle_bl_change(path, state) do
-    source = File.read!(path)
-    escaped = escape_bl_string(source)
-
-    result =
-      try do
-        _ = BeamLisp.eval(~s|(reload/stage "#{escaped}")|)
-
-        if state.auto_commit do
-          BeamLisp.eval("(reload/commit)")
-        else
-          BeamLisp.eval("(reload/status)")
-        end
-      rescue
-        e ->
-          Logger.warning("reload watcher: #{Path.relative_to_cwd(path)}: #{Exception.message(e)}")
-          {:error, Exception.message(e)}
-      end
-
+    result = apply_change(File.read!(path), path, state.auto_commit)
     if state.on_result, do: state.on_result.(result)
     %{state | last: result}
+  end
+
+  @doc """
+  Apply one source change through the reload loop and return the commit status —
+  the exact reload integration a file save drives, WITHOUT the filesystem. Stage
+  `source` into the bundle, then (when `commit?`) commit it: the static coherence
+  pass applies the edit or HOLDS it with the old code serving. `label` is only
+  used for a warning on error.
+
+  This is the deterministic seam the FS watcher rides (`handle_bl_change` calls
+  it) and the seam a test drives directly — proving the watcher's reload contract
+  (stage → commit → applied|held) without inotify's timing. Returns the commit
+  status map, or `{:error, msg}` if staging/committing raised.
+  """
+  def apply_change(source, label \\ "<source>", commit? \\ true) do
+    escaped = escape_bl_string(source)
+
+    try do
+      _ = BeamLisp.eval(~s|(reload/stage "#{escaped}")|)
+
+      if commit? do
+        BeamLisp.eval("(reload/commit)")
+      else
+        BeamLisp.eval("(reload/status)")
+      end
+    rescue
+      e ->
+        Logger.warning("reload watcher: #{label}: #{Exception.message(e)}")
+        {:error, Exception.message(e)}
+    end
   end
 
   # Encode a source string as a bl double-quoted literal: escape backslashes and
