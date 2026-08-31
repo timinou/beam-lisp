@@ -2109,6 +2109,11 @@ defmodule BeamLisp.RT do
   # Naming the builtin here keeps `#d[…]` readable from first boot; a runtime
   # `data-reader!` still overrides it (checked first, above).
   defp data_reader_default("d"), do: {:ok, {:symbol, "datom/read-query"}}
+  # `#o"…"` — the temporal literal, read by `datom.time/read-iso8601`. Same
+  # bootstrap as `#d`: a file that merely `:require`s `datom.time` reads its
+  # `#o` literals before the runtime `data-reader!` registration evaluates,
+  # so the builtin default makes `#o` readable from first boot.
+  defp data_reader_default("o"), do: {:ok, {:symbol, "datom.time/read-iso8601"}}
   defp data_reader_default(_), do: :error
 
   @doc """

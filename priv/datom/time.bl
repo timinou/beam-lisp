@@ -27,7 +27,7 @@
 ; parameters. If this file were long, the design would be wrong.
 
 (ns datom.time
-  (:require [datom.db] [datom.index]))
+  (:require [datom.db] [datom.index] [minikanren] [z3]))
 
 (defn as-of
   "The database as it was at transaction `t`.
@@ -132,3 +132,448 @@
   (let [matching (filterv (fn [c] (and (= (:value c) value) (:added c)))
                           (changes db e a))]
     (if (empty? matching) nil (:t (last matching)))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; VALID TIME — the second axis (tempo, maximalist)
+;;
+;; Everything above is TRANSACTION time: when the store learned a fact.
+;; Everything below is VALID time: when a fact is true in the world. A
+;; temporal value is a bounded half-open interval [from, to) at a
+;; resolution — one type for a year, a month, a day, an instant. See
+;; docs/tempo-maximalist.md and examples/datom/time/.
+;;
+;; from/to are integer SECONDS on one monotone proleptic scale, so
+;; ordering, Allen's algebra and set operations are integer arithmetic.
+;; The scale's zero is arbitrary (proleptic-Gregorian day 0 = 0000-03-01
+;; per the civil-day algorithm); only differences and order are used.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ── civil-day arithmetic (Howard Hinnant's algorithm) ───────────────
+;;
+;; days-from-civil maps a (y,m,d) proleptic-Gregorian date to a day
+;; number with March-based internal years, so leap days fall at the end
+;; and the formula is branch-free. Correct for the whole proleptic range,
+;; which is what lets a masked year in the 1560s and a meeting next
+;; Tuesday share one integer axis.
+
+(defn days-from-civil
+  "Proleptic-Gregorian (y,m,d) -> an integer day number."
+  [y m d]
+  (let [y2 (if (<= m 2) (- y 1) y)
+        era (quot (if (>= y2 0) y2 (- y2 399)) 400)
+        yoe (- y2 (* era 400))
+        mp (if (> m 2) (- m 3) (+ m 9))
+        doy (+ (quot (+ (* 153 mp) 2) 5) (- d 1))
+        doe (+ (- (+ (* yoe 365) (quot yoe 4)) (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(def SECS-PER-DAY 86400)
+
+;; ── resolutions ─────────────────────────────────────────────────────
+;;
+;; Ordered coarse->fine. The resolution of a value is its finest present
+;; component; the interval's WIDTH is one unit of that resolution.
+
+(def RESOLUTIONS [:year :month :day :hour :minute :second])
+
+(def ^:private RES-RANK
+  {:year 0 :month 1 :day 2 :hour 3 :minute 4 :second 5})
+
+(defn- finer? [a b]
+  (> (get RES-RANK a) (get RES-RANK b)))
+
+;; ── the type ────────────────────────────────────────────────────────
+;;
+;; An Interval is a map-shaped record carrying its half-open bounds (as
+;; seconds on the monotone scale) and its resolution. :from/:to are the
+;; keys schema/validate-value checks structurally — this record IS a
+;; :db.type/time value, and round-trips through the store like any value.
+
+(defrecord Interval [from to resolution calendar])
+
+(defn interval?
+  "Whether `x` is a datom.time interval value."
+  [x]
+  (and (map? x) (int? (:from x)) (int? (:to x)) (keyword? (:resolution x))))
+
+;; ── the width of one unit at a resolution, given the anchor date ────
+;;
+;; Days, hours, minutes, seconds are fixed multiples of a second. Months
+;; and years are NOT — their width depends on WHICH month/year — so the
+;; end bound is computed by advancing the calendar component, not by
+;; adding a constant. That is the half-open [from,to) done correctly:
+;; a month is [first-of-month, first-of-next-month), whatever its length.
+
+(defn- ymd->secs [y m d] (* (days-from-civil y m d) SECS-PER-DAY))
+
+(defn- year-of
+  "The proleptic-Gregorian year containing a scale second. Binary search
+   over days-from-civil, which is monotone in the year."
+  [secs]
+  ; floor division: `quot` truncates toward zero, so a pre-epoch (negative)
+  ; second would land on the wrong side of a day boundary. days-from-civil
+  ; is defined on the FLOORED day, so floor here too.
+  (let [target-day (let [q (quot secs SECS-PER-DAY) r (rem secs SECS-PER-DAY)]
+                     (if (< r 0) (- q 1) q))]
+    (loop [lo -5000 hi 5000]
+      (if (>= lo hi)
+        lo
+        (let [mid (quot (+ lo hi 1) 2)]
+          (if (<= (days-from-civil mid 1 1) target-day)
+            (recur mid hi)
+            (recur lo (- mid 1))))))))
+
+(defn- hms->secs [h mi s] (+ (* h 3600) (* mi 60) s))
+
+;; ── the constructor ─────────────────────────────────────────────────
+
+(defn interval
+  "Build a :db.type/time value from coarse->fine components, in any order.
+
+   (interval :year 2026 :month 6 :day 15) is the day
+   [2026-06-15, 2026-06-16). Missing fine components default to their
+   first value; the resolution is the finest component you supplied, and
+   the upper bound advances exactly one unit of it — so a year is a whole
+   year wide, a day a whole day, an instant one second."
+  [& kvs]
+  (let [m (apply hash-map kvs)
+        y  (get m :year 0)
+        mo (get m :month 1)
+        d  (get m :day 1)
+        h  (get m :hour 0)
+        mi (get m :minute 0)
+        s  (get m :second 0)
+        res (cond (contains? m :second) :second
+                  (contains? m :minute) :minute
+                  (contains? m :hour)   :hour
+                  (contains? m :day)    :day
+                  (contains? m :month)  :month
+                  :else                 :year)
+        from (+ (ymd->secs y mo d) (hms->secs h mi s))
+        to (cond
+             (= res :year)   (ymd->secs (+ y 1) mo d)
+             (= res :month)  (let [ny (if (= mo 12) (+ y 1) y)
+                                   nm (if (= mo 12) 1 (+ mo 1))]
+                               (ymd->secs ny nm d))
+             (= res :day)    (+ from SECS-PER-DAY)
+             (= res :hour)   (+ from 3600)
+             (= res :minute) (+ from 60)
+             :else           (+ from 1))]
+    (->Interval from to res (get m :calendar :gregorian))))
+
+;; ── accessors: the from/to "components" are projections of the value ─
+
+(defn from       "The inclusive lower bound (seconds on the scale)."       [iv] (:from iv))
+(defn to         "The exclusive upper bound (seconds on the scale)."       [iv] (:to iv))
+(defn resolution "The finest component present — the interval's width."    [iv] (:resolution iv))
+(defn width      "The span in seconds, `to - from`."                       [iv] (- (:to iv) (:from iv)))
+
+;; ── Allen's 13 interval relations ───────────────────────────────────
+;;
+;; For two intervals a,b, exactly ONE of the 13 holds. The predicate
+;; families (overlaps?/contains?/…) are named unions of these. Pure
+;; integer comparison on the two half-open bounds.
+
+(defn- inverse [rel]
+  (get {:precedes :preceded-by :meets :met-by :overlaps :overlapped-by
+        :starts :started-by :during :contains :finishes :finished-by
+        :preceded-by :precedes :met-by :meets :overlapped-by :overlaps
+        :started-by :starts :contains :during :finished-by :finishes
+        :equals :equals}
+       rel))
+
+(defn allen
+  "The single Allen relation between intervals `a` and `b`."
+  [a b]
+  (let [a0 (:from a) a1 (:to a) b0 (:from b) b1 (:to b)]
+    (cond
+      (and (= a0 b0) (= a1 b1)) :equals
+      (= a0 b0) (if (< a1 b1) :starts :started-by)
+      (= a1 b1) (if (< a0 b0) :finished-by :finishes)
+      (<= a1 b0) (if (= a1 b0) :meets :precedes)
+      (<= b1 a0) (if (= b1 a0) :met-by :preceded-by)
+      (and (< a0 b0) (< b0 a1) (< a1 b1)) :overlaps
+      (and (< b0 a0) (< a0 b1) (< b1 a1)) :overlapped-by
+      (and (< b0 a0) (< a1 b1)) :during
+      (and (< a0 b0) (< b1 a1)) :contains
+      :else (inverse (allen b a)))))
+
+(def ^:private OVERLAPPING-FAMILY
+  #{:overlaps :overlapped-by :starts :started-by :during :contains
+    :finishes :finished-by :equals})
+
+(defn overlaps?
+  "Whether a and b share any positive-width instant (Allen's overlapping
+   family). Adjacent intervals that merely touch (:meets) do NOT overlap."
+  [a b]
+  (contains? OVERLAPPING-FAMILY (allen a b)))
+
+(defn meets?
+  "Whether a ends exactly where b begins (no gap, no overlap)."
+  [a b]
+  (= :meets (allen a b)))
+
+(defn precedes?
+  "Whether a ends before b begins (strictly, with a gap)."
+  [a b]
+  (= :precedes (allen a b)))
+
+(defn contains?
+  "Whether a fully covers b (b starts at or after a, ends at or before)."
+  [a b]
+  (and (<= (:from a) (:from b)) (>= (:to a) (:to b))))
+
+(defn subset? "Whether a falls entirely within b." [a b] (contains? b a))
+
+(defn disjoint?
+  "Whether a and b share no instant (they precede or meet, either way)."
+  [a b]
+  (or (<= (:to a) (:from b)) (<= (:to b) (:from a))))
+
+(defn before?
+  "Whether a lies entirely at or before b's start — a total-ish order on
+   intervals by their lower bound, for take-while bounds on lazy walks."
+  [a b]
+  (<= (:to a) (:from b)))
+
+(defn starts-before?
+  "Whether a's lower bound precedes b's — the AVET range-scan predicate."
+  [a b]
+  (< (:from a) (:from b)))
+
+;; ── set algebra over the value ──────────────────────────────────────
+;;
+;; intersect / union return an interval when the result is a single
+;; contiguous span, else nil (a gap). The store's query layer is where
+;; multi-span results live (difference = not-join); these are the
+;; value-in-hand primitives the optics traversals in 05 call.
+
+(defn intersect
+  "The overlap of a and b as an interval, or nil when they are disjoint.
+   Resolution follows the finer operand."
+  [a b]
+  (let [lo (max (:from a) (:from b))
+        hi (min (:to a) (:to b))]
+    (if (< lo hi)
+      (->Interval lo hi
+                  (if (finer? (:resolution a) (:resolution b))
+                    (:resolution a) (:resolution b))
+                  (:calendar a))
+      nil)))
+
+(defn union
+  "The union of a and b as a SINGLE interval when they overlap or meet
+   (adjacency concatenates: [a,b) ++ [b,c) == [a,c)), else nil — a
+   disjoint union is two spans, which the query layer represents."
+  [a b]
+  (if (or (overlaps? a b) (meets? a b) (meets? b a))
+    (->Interval (min (:from a) (:from b)) (max (:to a) (:to b))
+                (if (finer? (:resolution a) (:resolution b))
+                  (:resolution a) (:resolution b))
+                (:calendar a))
+    nil))
+
+(defn subtract
+  "a minus b: the parts of a that b does not cover, as a vector of 0, 1
+   or 2 intervals. The difference operator behind free-busy — the
+   value-in-hand sibling of the store's not-join."
+  [a b]
+  (let [i (intersect a b)]
+    (if (nil? i)
+      [a]
+      (let [left  (when (< (:from a) (:from i))
+                    (->Interval (:from a) (:from i) (:resolution a) (:calendar a)))
+            right (when (< (:to i) (:to a))
+                    (->Interval (:to i) (:to a) (:resolution a) (:calendar a)))]
+        (filterv some? [left right])))))
+
+;; ── the ISO 8601 reader (crisp Part-1 grammar) ──────────────────────
+;;
+;; read-iso8601 backs the #o"…" data-reader (registered at the bottom of
+;; this file). It parses the crisp ISO 8601 Part-1 shapes the demos use:
+;;
+;;   "2026"                       a year
+;;   "2026-06"                    a month
+;;   "2026-06-15"                 a day
+;;   "2026-06-15T14:30"           a minute
+;;   "2026-06-15T14:30:00"        a second
+;;   "<from>/<to>"                a closed interval spanning both
+;;
+;; EDTF masks (156X), qualifications (1984?/2004~) and IXDTF suffixes are
+;; the uncertain/zone extensions (see 07); this crisp core is what makes
+;; 01-06 run. A malformed literal raises HERE, at read time.
+
+(defn- parse-int [s] (erlang/binary_to_integer s))
+
+(defn- strip-suffix
+  "Drop an IXDTF suffix ([zone], [u-ca=…]) and any EDTF qualification
+   flags (? ~ %) from a point string; those refine MEANING (zone,
+   certainty — see 07) but not the crisp span this core computes."
+  [s]
+  (let [no-brackets (first (split s "["))
+        drop-flags (fn [x] (first (split (first (split (first (split x "?")) "~")) "%")))]
+    (drop-flags no-brackets)))
+
+(defn- masked-year
+  "An EDTF masked year like `156X` -> the decade interval [1560,1570),
+   or nil when `s` carries no trailing X mask. `19XX` widens to a century."
+  [s]
+  (let [xs (count (filter (fn [c] (= c 88)) (to-list (erlang/binary_to_list s))))]  ; 88 = \X
+    (if (and (> xs 0) (= (erlang/byte_size s) 4))
+      (let [base (parse-int (subs s 0 (- 4 xs)))
+            scale (cond (= xs 1) 10 (= xs 2) 100 (= xs 3) 1000 :else 10000)
+            lo (* base scale)]
+        (->Interval (ymd->secs lo 1 1) (ymd->secs (+ lo scale) 1 1) :year :gregorian))
+      nil)))
+
+(defn- parse-point
+  "One ISO point string -> {:kvs [...] :res kw}: the coarse->fine
+   components present and the finest one."
+  [s0]
+  (let [    ; strip IXDTF/EDTF suffix flags, then split date and time on T
+        s (strip-suffix s0)
+        parts (split s "T")
+        date (first parts)
+        time (second parts)
+        dfields (split date "-")
+        y (parse-int (first dfields))
+        kvs (concat [:year y]
+                    (when (>= (count dfields) 2) [:month (parse-int (nth dfields 1))])
+                    (when (>= (count dfields) 3) [:day (parse-int (nth dfields 2))]))
+        tfields (if (some? time) (split time ":") [])
+        kvs (concat kvs
+                    (when (>= (count tfields) 1) [:hour (parse-int (nth tfields 0))])
+                    (when (>= (count tfields) 2) [:minute (parse-int (nth tfields 1))])
+                    (when (>= (count tfields) 3) [:second (parse-int (nth tfields 2))]))]
+    (into [] kvs)))
+
+(defn read-iso8601
+  "Parse an ISO 8601 Part-1 string into a :db.type/time interval. Backs
+   the #o\"…\" literal; raises on a malformed string, at read time."
+  [s0]
+  (let [    ; strip an IXDTF suffix FIRST — a zone like [Australia/Sydney]
+        ; carries a `/` that must not be mistaken for an interval split.
+        s (first (split s0 "["))
+        mask (masked-year s)]
+   (if (some? mask)
+    mask
+    (let [halves (split s "/")]
+     (cond
+      ; open-ended `1985/..` — from the left point onward. Represented as a
+      ; very wide interval whose upper bound is the far future sentinel.
+      (and (= (count halves) 2) (= (second halves) ".."))
+        (let [a (apply interval (parse-point (first halves)))]
+          (->Interval (:from a) (ymd->secs 9999 12 31) (:resolution a) :gregorian))
+      (= (count halves) 2)
+      ; a closed interval `A/B` is [from(A), from(B)) — the END point is
+      ; EXCLUSIVE, its START, per ISO 8601-2 / EDTF (tempo: `1984/2004`
+      ; is "[1984-01-01, 2004-01-01), 2004-01-01 exclusive"). So a day
+      ; range `2026-06-15/2026-06-16` is exactly the 15th, and an hour
+      ; range `T09/T17` is [09:00, 17:00), the 8-hour working window.
+      (let [a (apply interval (parse-point (first halves)))
+            b (apply interval (parse-point (second halves)))]
+        (->Interval (:from a) (:from b)
+                    (if (finer? (:resolution a) (:resolution b))
+                      (:resolution a) (:resolution b))
+                    :gregorian))
+      :else (apply interval (parse-point s)))))))
+
+;; #o"2026-06-15" reads as (datom.time/read-iso8601 "2026-06-15"). The
+;; reader accepts a string after a tag (like Clojure's #inst); the parse
+;; and its validation run at read time.
+(data-reader! "o" (quote datom.time/read-iso8601))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; UNCERTAINTY — masks enumerate (miniKanren), overlap proves (z3)
+;;
+;; A masked or qualified value is not a single span but a SMEAR. Two
+;; engines that already ship take the two halves (docs/tempo-maximalist
+;; §4): masks/one-of-sets enumerate through miniKanren; qualified overlap
+;; is a z3 satisfiability verdict — certain / possible / impossible.
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn expand
+  "Enumerate a masked/coarse interval into its member intervals one
+   resolution finer. A decade-wide :year interval (from `#o\"156X\"`)
+   expands to its ten years; a masked-month value to its months.
+
+   The enumeration is a miniKanren run over the member offsets — a mask
+   is a relation (∃ d. member = base + d), and expansion is running it
+   forward. Kept in datom.time as the thin bridge; minikanren does the
+   work."
+  [iv]
+  (let [base-year (year-of (:from iv))
+        end-year  (year-of (- (:to iv) 1))
+        n (max 1 (+ 1 (- end-year base-year)))
+        ; the enumeration is a miniKanren run: the member offset is a
+        ; logic variable constrained to 0..n-1 by a disjunction of ===
+        ; goals (a mask is exactly ∃ d ∈ 0..n-1). Running it forward
+        ; yields the offsets; each maps to one year interval.
+        offsets (sort (minikanren/run* n
+                        (fn [q]
+                          (minikanren/disj*
+                            (mapv (fn [d] (minikanren/=== q d)) (range n))))))]
+    (mapv (fn [d] (interval :year (+ base-year d))) offsets)))
+
+(defn count-set
+  "How many member intervals a masked value denotes."
+  [iv]
+  (count (expand iv)))
+
+;; ── z3-backed overlap verdict ───────────────────────────────────
+;;
+;; "Do a and b overlap?" over uncertain spans has THREE honest answers.
+;; We ask z3 twice, encoding the intervals as integer bounds:
+;;   overlap possible?   sat of (a0 < b1 ∧ b0 < a1)
+;;   overlap forced?     unsat of its negation
+;; certain = forced; impossible = not-possible; possible = the rest.
+
+(defn- overlap-smt [a b]
+  (str "(declare-const a0 Int)(declare-const a1 Int)"
+       "(declare-const b0 Int)(declare-const b1 Int)"
+       "(assert (= a0 " (:from a) "))(assert (= a1 " (:to a) "))"
+       "(assert (= b0 " (:from b) "))(assert (= b1 " (:to b) "))"))
+
+(defn overlap-verdict
+  "The three-valued overlap verdict for two intervals, proven by z3:
+   :certain | :possible | :impossible. `port` is an open z3 process.
+
+   Crisp intervals collapse to :certain / :impossible (a boolean is the
+   degenerate case); a genuine smear — modelled by widening one bound to
+   a variable — is where :possible appears. Here the demo passes crisp
+   bounds, so this proves the certain/impossible poles; the smeared case
+   widens a0/a1 to a range in the SMT, the next build in §4."
+  [port a b]
+  (let [decls (overlap-smt a b)
+        overlaps "(assert (and (< a0 b1) (< b0 a1)))"
+        possible (= "sat" (z3/check port (str decls overlaps)))
+        disjoint "(assert (or (>= a0 b1) (>= b0 a1)))"
+        can-miss (= "sat" (z3/check port (str decls disjoint)))]
+    (cond (and possible (not can-miss)) :certain
+          (and (not possible) can-miss) :impossible
+          :else :possible)))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; CHRONOLOG — a chronology is a db; its questions are engines you have
+;;
+;; Partially-known intervals with ordering constraints. "tighten" is a
+;; bound propagation; "consistent?" is a z3 check. See §7. These are the
+;; value-level primitives; the datom-fixpoint and provenance spellings
+;; are the next builds named in the doc.
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn consistent?
+  "Whether a set of ordering constraints over intervals is satisfiable,
+   proven by z3. `constraints` is a vector of [before-key after-key]
+   pairs over `bounds`, a map of key -> [lo hi] permitted start range.
+   Returns true | {:consistent false}."
+  [port bounds constraints]
+  (let [decls (join "" (map (fn [k]
+                              (str "(declare-const " (name k) " Int)"
+                                   "(assert (>= " (name k) " " (first (get bounds k)) "))"
+                                   "(assert (<= " (name k) " " (second (get bounds k)) "))"))
+                            (keys bounds)))
+        ords (join "" (map (fn [c] (str "(assert (< " (name (first c)) " " (name (second c)) "))"))
+                           constraints))]
+    (if (= "sat" (z3/check port (str decls ords))) true {:consistent false})))
+
