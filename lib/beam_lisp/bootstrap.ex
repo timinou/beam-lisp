@@ -58,15 +58,30 @@ defmodule BeamLisp.Bootstrap do
     ebin = to_string(compile_path)
     File.mkdir_p!(ebin)
 
-    verify_key!(manifest)
+    # The seed is a bootstrap FLOOR, not a mandate. Install it only when its
+    # `compiler_key` matches this toolchain: a matching seed is a pre-built,
+    # trustworthy `compiler` beam that lets a genesis-less tree boot with no
+    # source compile. A MISMATCH (a different Elixir/OTP, or — as during active
+    # development — a change to a hashed input since the seed was frozen) means
+    # the committed beams would produce or intern the wrong code, so we do NOT
+    # install them. We skip instead of raising: while the genesis seed still
+    # exists, `compile.beam_lisp` rebuilds fresh, correctly-keyed `.bl` beams
+    # from source, so a stale committed seed is simply unused, not fatal. When
+    # genesis is finally deleted the seed becomes load-bearing and a mismatch
+    # surfaces at compile time as a clear "compiler seed not loaded" error whose
+    # fix is to regenerate the seed on this toolchain. Returns `:ok` when the
+    # seed was installed, `{:skipped, reason}` when it was not.
+    if key_matches?(manifest) do
+      Enum.each(manifest["modules"], fn {name, want_sha} ->
+        src = Path.join(seed_dir, name)
+        verify_seed_file!(src, name, want_sha)
+        install_one(src, Path.join(ebin, name), want_sha)
+      end)
 
-    Enum.each(manifest["modules"], fn {name, want_sha} ->
-      src = Path.join(seed_dir, name)
-      verify_seed_file!(src, name, want_sha)
-      install_one(src, Path.join(ebin, name), want_sha)
-    end)
-
-    :ok
+      :ok
+    else
+      {:skipped, :compiler_key_mismatch}
+    end
   end
 
   @doc "Absolute path to the committed seed directory (best-effort, dev + release)."
@@ -77,27 +92,12 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
-  # A seed built for a different toolchain (Elixir/OTP, or a real compiler
-  # change) cannot be trusted to produce correct code here. Fail loud: the fix
-  # is to rebuild the seed on this toolchain, not to boot on a foreign one.
-  defp verify_key!(manifest) do
-    want = manifest["compiler_key"]
-    have = BeamLisp.AOTCache.compiler_key()
-
-    unless want == have do
-      raise """
-      beam-lisp bootstrap seed was built for a different toolchain.
-
-        seed compiler_key: #{want}
-        this  compiler_key: #{have}
-        seed elixir/otp:   #{manifest["elixir"]} / #{manifest["otp"]}
-        this elixir/otp:   #{System.version()} / #{:erlang.system_info(:otp_release)}
-
-      The committed seed is pinned to the toolchain it was built on. Rebuild the
-      seed on this toolchain (mix run priv/bootstrap/gen_manifest.exs after a
-      keyed build), or build on the pinned Elixir/OTP.
-      """
-    end
+  # Whether the committed seed's `compiler_key` matches this toolchain's. A seed
+  # built for a different key cannot be trusted to intern correct code here, so
+  # the installer skips it rather than seeding a foreign beam. (The genesis path,
+  # while it exists, rebuilds fresh beams regardless; see `install!/1`.)
+  defp key_matches?(manifest) do
+    manifest["compiler_key"] == BeamLisp.AOTCache.compiler_key()
   end
 
   defp verify_seed_file!(src, name, want_sha) do
