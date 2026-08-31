@@ -1,0 +1,412 @@
+; veritas.bl — one verb over generators: exists / for-all, with a modal verdict
+; that never confuses a sample for a proof.
+;
+; ── The unification ─────────────────────────────────────────────────────────
+;
+; mock (∃ value satisfying a spec), fuzz (∀ input, a property holds), and
+; coverage (which inputs fall through the guards) were three tools. They are ONE
+; operation: (quantifier [var generator] predicate) → verdict. The only things
+; that differed were the generator (ad-hoc ranges), the predicate (stringly),
+; and the verdict (which hid its own confidence). Unify those and there is one
+; verb.
+;
+; ── The three nouns ─────────────────────────────────────────────────────────
+;
+;   GEN   a typed generator (a defrecord, so its TYPE tag dispatches a protocol
+;         GLOBALLY across require boundaries — multimethods are namespace-local
+;         and would not dispatch from a requiring module). One generator feeds
+;         all three engines:
+;           gen-sample    → witnesses         → the FUZZ engine
+;           gen-enumerate → finite set|:inf   → the exhaustive engine
+;           gen-constrain → z3 decls+asserts  → the SYMBOLIC engine
+;           gen-tag       → the type it spans  → coverage completeness
+;
+;   SPEC  a predicate over the bound value as bl SOURCE, evaluated as a
+;         self-contained lambda so it composes and cannot leak the caller's scope.
+;
+;   CHECK one verb whose verdict carries its own MODALITY, so honesty is
+;         structural, not a footnote:
+;           :proven     symbolically (z3) or exhaustively (finite) discharged — a real proof
+;           :witnessed  sampled; no counterexample found — NOT a proof
+;           :refuted    a definite counterexample (+ :witness, +:shrunk)
+;           :unknown    undecidable / timed out — the honest nothing
+;
+; CHECK runs an ENGINE ESCALATOR: the strongest modality the (gen, pred) pair
+; supports. constrain-able ∧ z3-decidable → symbolic; else finite → exhaustive;
+; else → sample+shrink.
+
+(ns veritas
+  (:require [z3] [mock] [core] [env] [system.smt :as smt]
+            [system.model :as model] [typed]))
+
+; ═════════════════════════════════════════════════════════════════════════
+; GEN — typed generators as records; the Gen protocol dispatches on their type
+; ═════════════════════════════════════════════════════════════════════════
+
+(defrecord IntGen [lo hi])       ; a bounded integer — all three engines
+(defrecord AnyGen [])            ; the union of all types — sample only (coverage keystone)
+
+(defprotocol Gen
+  (gen-sample    [g seed n])     ; → [witnesses]
+  (gen-enumerate [g])            ; → finite [values] | :infinite
+  (gen-constrain [g var])        ; → {:decls str :assert str} | nil (nil ⇒ not symbolic)
+  (gen-tag       [g]))           ; → the type keyword it spans
+
+; ── IntGen ──────────────────────────────────────────────────────────────────
+
+(extend-type IntGen Gen
+  (gen-sample [g seed n]
+    ; deterministic: endpoints + zero + ±1 always, then a hash-spread interior.
+    (let [lo (:lo g) hi (:hi g)
+          span (+ 1 (- hi lo))
+          edges (filter (fn [v] (and (>= v lo) (<= v hi))) (list lo hi 0 1 -1))
+          interior (map (fn [i] (+ lo (core/mod (* (+ i seed 1) 2654435761) span))) (range 0 n))]
+      (into [] (distinct (concat edges interior)))))
+  (gen-enumerate [g]
+    (let [span (+ 1 (- (:hi g) (:lo g)))]
+      (if (> span 10000) :infinite
+        (into [] (range (:lo g) (+ 1 (:hi g)))))))
+  (gen-constrain [g var]
+    {:decls (str "(declare-const " var " Int)\n")
+     :assert (str "(assert (>= " var " " (:lo g) "))\n(assert (<= " var " " (:hi g) "))\n")})
+  (gen-tag [g] :int))
+
+; ── AnyGen : one representative of every type — witnesses type-partiality ───
+
+(extend-type AnyGen Gen
+  (gen-sample [g seed n]
+    (into [] (list 0 1 -1 (core/mod (* (+ seed 1) 7) 100)
+                   1.5 -2.5 "" "hi" :kw true false [1 2] {:a 1} nil)))
+  (gen-enumerate [g] :infinite)     ; the type universe is open
+  (gen-constrain [g var] nil)        ; no single z3 sort spans all types — sample only
+  (gen-tag [g] :any))
+
+; ── RealGen : a bounded real (z3 Real theory) ───────────────────────────────
+
+(defrecord RealGen [lo hi])
+
+(extend-type RealGen Gen
+  (gen-sample [g seed n]
+    (let [lo (:lo g) hi (:hi g)
+          mid (/ (+ lo hi) 2)]
+      (into [] (distinct (list lo hi mid
+                               (+ lo (* (/ (core/mod (* (+ seed 1) 2654435761) 1000) 1000.0) (- hi lo))))))))
+  (gen-enumerate [g] :infinite)                 ; the reals are dense — never finite
+  (gen-constrain [g var]
+    {:decls (str "(declare-const " var " Real)\n")
+     :assert (str "(assert (>= " var " " (:lo g) "))\n(assert (<= " var " " (:hi g) "))\n")})
+  (gen-tag [g] :float))
+
+; ── BoolGen : the two booleans (finite ⇒ exhaustive proofs) ─────────────────
+
+(defrecord BoolGen [])
+
+(extend-type BoolGen Gen
+  (gen-sample [g seed n] [true false])
+  (gen-enumerate [g] [true false])
+  (gen-constrain [g var] {:decls (str "(declare-const " var " Bool)\n") :assert ""})
+  (gen-tag [g] :bool))
+
+; ── OneOf : a finite value set (enumerate = the set; constrain = a disjunction)
+
+(defrecord OneOf [values])
+
+(extend-type OneOf Gen
+  (gen-sample [g seed n] (into [] (:values g)))
+  (gen-enumerate [g] (into [] (:values g)))
+  (gen-constrain [g var]
+    ; only integer members translate to a z3 disjunction; else nil (sample).
+    (if (every? core/int? (:values g))
+      {:decls (str "(declare-const " var " Int)\n")
+       :assert (str "(assert (or " (core/join " " (map (fn [v] (str "(= " var " " v ")")) (:values g))) "))\n")}
+      nil))
+  (gen-tag [g]
+    (let [v (core/first (:values g))]
+      (cond (core/int? v) :int (string? v) :string (keyword? v) :kw :else :any))))
+
+; ── StringGen : a prefixed, length-bounded string (z3 String theory) ────────
+
+(defrecord StringGen [prefix minlen maxlen])
+
+(extend-type StringGen Gen
+  (gen-sample [g seed n]
+    (let [p (:prefix g)
+          pad (fn [k] (core/join "" (map (fn [_] "x") (range 0 k))))]
+      (into [] (distinct (list (str p (pad (:minlen g)))
+                               (str p (pad (core/mod (+ seed 3) (+ 1 (:maxlen g)))))
+                               (str p "ABCDEF"))))))
+  (gen-enumerate [g] :infinite)
+  (gen-constrain [g var]
+    {:decls (str "(declare-const " var " String)\n")
+     :assert (str "(assert (str.prefixof \"" (:prefix g) "\" " var "))\n"
+                  "(assert (>= (str.len " var ") " (:minlen g) "))\n"
+                  "(assert (<= (str.len " var ") " (:maxlen g) "))\n")})
+  (gen-tag [g] :string))
+
+; ── TupleGen : a fixed-arity product of generators (multi-var queries) ───────
+;
+; A tuple candidate is a VECTOR of one sample per child. constrain conjoins the
+; children's decls/asserts under positional variable names <var>_0, <var>_1 … so
+; a joint ∀/∃ over (a b) becomes one z3 query. Only symbolic when EVERY child is.
+
+(defrecord TupleGen [gens])
+
+(defn- cartesian [colls]
+  (reduce (fn [acc c] (into [] (mapcat (fn [row] (map (fn [x] (conj row x)) c)) acc)))
+          [[]] colls))
+
+(extend-type TupleGen Gen
+  (gen-sample [g seed n]
+    (let [per (map (fn [gg] (gen-sample gg seed n)) (:gens g))]
+      (into [] (take 64 (cartesian per)))))
+  (gen-enumerate [g]
+    (let [es (map (fn [gg] (gen-enumerate gg)) (:gens g))]
+      (if (core/some? (core/some (fn [e] (if (= e :infinite) true nil)) es))
+        :infinite
+        (into [] (cartesian es)))))
+  (gen-constrain [g var]
+    (let [cons (map-indexed (fn [i gg] (gen-constrain gg (str var "_" i))) (:gens g))]
+      (if (core/some? (core/some (fn [c] (if (nil? c) true nil)) cons))
+        nil
+        {:decls (core/join "" (map :decls cons))
+         :assert (core/join "" (map :assert cons))})))
+  (gen-tag [g] :tuple))
+
+; ── the public gen constructors ─────────────────────────────────────────────
+
+(defn int-of    [lo hi] (->IntGen lo hi))
+(defn real-of   [lo hi] (->RealGen lo hi))
+(defn bool-of   [] (->BoolGen))
+(defn one-of    [& values] (->OneOf (into [] values)))
+(defn string-of [prefix minlen maxlen] (->StringGen prefix minlen maxlen))
+(defn tuple-of  [& gens] (->TupleGen (into [] gens)))
+(defn any-of    [] (->AnyGen))
+
+; ═════════════════════════════════════════════════════════════════════════
+; SPEC — a predicate over the bound value, as a self-contained lambda
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- lit
+  "A value as bl source that re-reads to itself: negatives parenthesised,
+   strings quoted, keywords colon-preserved (str drops the colon), collections
+   quoted so they read as data rather than being evaluated as calls."
+  [v]
+  (cond (and (core/int? v) (< v 0)) (str "(- " (- 0 v) ")")
+        (string? v) (str "\"" v "\"")
+        (nil? v) "nil"
+        (keyword? v) (core/pr-str v)
+        (or (vector? v) (map? v) (set? v) (list? v)) (str "(quote " (core/pr-str v) ")")
+        :else (str v)))
+
+(defn holds?
+  "Does spec `pred-src` (a predicate over the one variable `var`) hold for `v`?
+   Evaluated as ((fn [var] pred) v) — self-contained, no scope leak. A predicate
+   that RAISES counts as NOT holding (a property that errors failed)."
+  [var pred-src v]
+  (try
+    (= true (env/eval (str "((fn [" var "] " pred-src ") " (lit v) ")")))
+    (catch _ false)))
+
+; ── z3 fragment: delegate to system.smt, the verifier's OWN translator ──────
+;
+; smt-of reuses system.smt/of-source — the SAME source→SMT translator
+; verify-process uses — so veritas and the verifier can NEVER disagree about what
+; a predicate means, and veritas inherits every theory system.smt has (Int, Real,
+; Bool, String, enum datatypes, unary desugaring). `vars` is the set of bound
+; variable names (one for a scalar query, the positional names for a tuple).
+; :untranslatable ⟹ nil ⟹ the escalator falls back to enumerate/sample (honest).
+
+(defn smt-of [vars pred-src]
+  (let [r (smt/of-source (core/set vars) pred-src)]
+    (if (or (nil? r) (= r :untranslatable)) nil r)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; SHRINK — the minimal witness (classic ladder toward 0)
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- smaller-int [v]
+  (if (not (core/int? v)) (list)
+    (into [] (distinct (filter (fn [c] (< (core/abs c) (core/abs v)))
+                               (list 0 (core/quot v 2) (if (> v 0) (- v 1) (+ v 1))))))))
+
+(defn- shrink-fail
+  "Walk `v` down the shrink ladder to the simplest value that still FAILS
+   `fail?`. Returns the minimal failing value."
+  [fail? v]
+  (loop [best v fuel 200]
+    (if (<= fuel 0) best
+      (let [simpler (filter fail? (smaller-int best))]
+        (if (empty? simpler) best (recur (core/first simpler) (- fuel 1)))))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; CHECK — one verb, modal verdict, engine escalator
+; ═════════════════════════════════════════════════════════════════════════
+;
+; A query is {:q :exists|:for-all :var str :gen g :pred src}. check runs the
+; strongest engine the (gen, pred) pair supports.
+
+(defn- try-symbolic
+  "The z3 rung. A verdict map, or nil when this query is not symbolically
+   decidable (gen does not constrain, or pred is outside the SMT fragment)."
+  [port q]
+  (let [g (:gen q) var (:var q) pred (:pred q)
+        con (gen-constrain g var)
+        smt-pred (if (nil? con) nil (smt-of (list var) pred))]
+    (if (or (nil? con) (nil? smt-pred))
+      nil
+      (let [decls (:decls con) bounds (:assert con)]
+        (if (= (:q q) :exists)
+          (let [r (z3/check-model port (str "(set-option :timeout 3000)\n" decls bounds
+                                            "(assert " smt-pred ")\n"))]
+            (cond
+              (= "sat" (:status r))
+                {:modality :proven :engine :z3 :witness (get (mock/parse-model (:model r)) var)}
+              (= "unsat" (:status r))
+                {:modality :proven :engine :z3 :witness nil :none true}
+              :else {:modality :unknown :engine :z3}))
+          (let [r (z3/check-model port (str "(set-option :timeout 3000)\n" decls bounds
+                                            "(assert (not " smt-pred "))\n"))]
+            (cond
+              (= "unsat" (:status r)) {:modality :proven :engine :z3}
+              (= "sat" (:status r))
+                {:modality :refuted :engine :z3 :witness (get (mock/parse-model (:model r)) var)}
+              :else {:modality :unknown :engine :z3})))))))
+
+(defn- run-sample
+  "The fuzz/exhaustive rung. Enumerate finitely ⟹ exhaustion is a PROOF; else
+   sample. For ∀, a counterexample is shrunk; for ∃, find one witness."
+  [q seed n]
+  (let [g (:gen q) var (:var q) pred (:pred q)
+        enum (gen-enumerate g)
+        exhaustive (not (= enum :infinite))
+        values (if exhaustive enum (gen-sample g seed n))
+        fails? (fn [v] (not (holds? var pred v)))
+        proof-mod (if exhaustive :proven :witnessed)
+        eng (if exhaustive :enumerate :sample)]
+    (if (= (:q q) :for-all)
+      (let [cex (core/some (fn [v] (if (fails? v) v nil)) values)]
+        (if (nil? cex)
+          {:modality proof-mod :engine eng :tried (count values)}
+          {:modality :refuted :engine eng :witness cex :shrunk (shrink-fail fails? cex)}))
+      (let [wit (core/some (fn [v] (if (holds? var pred v) v nil)) values)]
+        (if (core/some? wit)
+          {:modality proof-mod :engine eng :witness wit}
+          {:modality proof-mod :engine eng :witness nil :none true})))))
+
+(defn check
+  "Run a query with the strongest engine it supports. `q` is
+   {:q :exists|:for-all :var str :gen g :pred src}. Returns a modal verdict.
+   Escalator: symbolic (z3) if the gen constrains and the pred is SMT; else
+   exhaustive if the gen enumerates finitely; else sample+shrink."
+  [port q]
+  (or (try-symbolic port q)
+      (run-sample q 0 32)))
+
+; ── sugar: the two quantifiers ──────────────────────────────────────────────
+
+(defn exists
+  "∃ v ∈ gen. pred(v).  pred is bl source over `var`. Modal verdict."
+  [port var gen pred] (check port {:q :exists :var var :gen gen :pred pred}))
+
+(defn for-all
+  "∀ v ∈ gen. pred(v).  Refutes + shrinks; :proven when symbolic or finite."
+  [port var gen pred] (check port {:q :for-all :var var :gen gen :pred pred}))
+
+; ═════════════════════════════════════════════════════════════════════════
+; COVERS — the third quantifier: does every input land in a clause?
+; ═════════════════════════════════════════════════════════════════════════
+;
+; ∀ input ∈ gen, ∃ clause of `fn-src` whose guard accepts input. This is the
+; COVERAGE property from priv/fuzz.bl, now a veritas query: the "spec" is read
+; from the function's OWN guard clauses (system.model), so no property is
+; written. Modality follows the generator: :proven when it enumerates finitely,
+; :witnessed when sampled. A gap is a :refuted with the uncovered witness.
+
+(defn- guards-of
+  "The guard SOURCE strings of a defn `fn-src`, in clause order (a clause with no
+   :when yields \"true\"), plus the first parameter name."
+  [fn-src]
+  (let [node (first (BeamLisp.Reader/read_string fn-src))
+        clauses (model/transitions node)
+        its (typed/node-items (typed/node-form node))
+        parsed (nth (typed/defn-clauses its) 2)
+        params (:params (core/first parsed))
+        arg (if (and (seq params) (= :symbol (typed/node-tag (typed/node-form (core/first params)))))
+              (typed/node-name (typed/node-form (core/first params))) "n")]
+    {:guards (into [] (map (fn [c] (or (:guard c) "true")) clauses)) :arg arg}))
+
+(defn- any-guard-covers?
+  "Does SOME guard of `gd` accept value `v`? A guard is evaluated as a lambda
+   application (holds?), so a raising guard declines — exactly as BEAM dispatch."
+  [gd v]
+  (core/some? (core/some (fn [g] (if (holds? (:arg gd) g v) true nil)) (:guards gd))))
+
+(defn covers
+  "The coverage property over a function `fn-src` and a generator `gen`: does
+   EVERY value the generator yields land in some clause? Returns a modal verdict:
+     :proven    every value covered AND the gen enumerates finitely (exhaustive)
+     :witnessed every SAMPLED value covered — not a proof
+     :refuted   a value fell through every clause (the gap), with :witness
+   The property is the function's own guard heads — nothing is written."
+  [port fn-src gen]
+  (let [gd (guards-of fn-src)
+        enum (gen-enumerate gen)
+        exhaustive (not (= enum :infinite))
+        values (if exhaustive enum (gen-sample gen 0 32))
+        gap (core/some (fn [v] (if (any-guard-covers? gd v) nil v)) values)]
+    (if (core/some? gap)
+      {:modality :refuted :engine (if exhaustive :enumerate :sample)
+       :witness gap :guards (:guards gd)}
+      {:modality (if exhaustive :proven :witnessed) :engine (if exhaustive :enumerate :sample)
+       :guards (:guards gd) :tried (count values)})))
+
+; ═════════════════════════════════════════════════════════════════════════
+; FAULTS — the fault space as exists-not queries, with a MODALITY
+; ═════════════════════════════════════════════════════════════════════════
+;
+; For each law i of a contract {:gen :laws}, ask (∃ v. ¬law_i ∧ (rest laws)):
+;   :proven  witness   ⟹ an ISOLATED fault (wrong for exactly law i) — z3-built
+;   :proven  :none     ⟹ law i is IMPLIED by the others (redundant) — z3-PROVEN
+;   :witnessed         ⟹ sampled an isolated fault (no proof of isolation)
+;   :unknown           ⟹ undecidable
+; This recovers mock/fault.bl's independence analysis with a modality attached:
+; a redundant law is now z3-PROVEN redundant, not merely un-witnessed.
+
+(defn isolate-fault
+  "The ∃-not query for law `i`: a value wrong for exactly law i. A modal verdict
+   — :proven witness (isolated fault), :proven :none (law i is implied/redundant),
+   :witnessed, or :unknown."
+  [port gen laws i]
+  (let [others (into [] (keep-indexed (fn [j l] (if (= j i) nil l)) laws))
+        neg (str "(not " (nth laws i) ")")
+        pred (str "(and " neg " " (core/join " " others) ")")]
+    (exists port "v" gen pred)))
+
+(defn faults
+  "The fault space of a contract {:gen g :laws [pred-src…]}: one isolate-fault
+   per law, tagged with the law it targets. :implied laws (proven :none) are
+   redundant — a finding about the SPEC, z3-proven."
+  [port contract]
+  (let [laws (:laws contract) gen (:gen contract)]
+    (into []
+      (map-indexed
+        (fn [i _]
+          (let [r (isolate-fault port gen laws i)]
+            {:law i :modality (:modality r)
+             :isolated-fault (if (:none r) nil (:witness r))
+             :implied (core/some? (:none r))}))
+        laws))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; ERGONOMICS — a managed solver, so the caller need not thread a z3 port
+; ═════════════════════════════════════════════════════════════════════════
+;
+; exists/for-all/covers take a port because z3 is a live process. `with-solver`
+; opens one, runs a thunk that receives it, and the thunk's queries share it —
+; the common case where a caller runs several checks together.
+
+(defn with-solver
+  "Open a z3 port, pass it to `f`, return f's result. The port lives for the
+   duration of `f` — batch your checks inside one with-solver."
+  [f]
+  (f (z3/open)))
