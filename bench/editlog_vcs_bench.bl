@@ -1,0 +1,281 @@
+; bench/editlog_vcs_bench.bl — the edit-log VCS, measured on the durable path.
+; Run: mix beam_lisp.run --path priv bench/editlog_vcs_bench.bl
+;
+; ── WHAT THIS PROVES ──────────────────────────────────────────────────
+;
+; The claim: "an edit-log version-control abstraction is not a system to
+; build — it is what the datom store already IS." A file is an entity keyed
+; by path (identity); an edit is a `transact!` that upserts content, so the
+; store AUTO-RETRACTS the old value and asserts the new, both stamped with
+; the transaction id. That `tx` is the revision id. Nothing is overwritten,
+; so `history` / `as-of` / `since` are the VCS's log / checkout / diff — for
+; free (priv/datom/time.bl).
+;
+; This measures the FOUR operations that decide whether it is usable as the
+; recorder behind a shared folder ("every write becomes a tracked edit"),
+; on the DURABLE backend (redb, fsync per commit) — the honest cost, not
+; the in-memory fantasy:
+;
+;   1  COMMIT      record one edit as a tx (durable). → edits/sec, p50/p99
+;   2  LOG         every revision of one file (datom/changes).      → ms
+;   3  CHECKOUT    reconstruct a file at a past tx (datom/value-at).→ ms
+;   4  DIFF        what changed since tx T across all files (since). → ms
+;
+; And one honesty section: content-snapshot vs patch storage — what the
+; naive "store the whole file each edit" costs, and what a diff model saves.
+
+(ns bench.editlog-vcs
+  (:require [datom] [datom.store-redb :as redb]))
+
+;; ── timing (median + p99 of trials after warmup) ─────────────────────
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+(defn- sort-nums [xs] (into [] (sort (into [] xs))))
+(defn- percentile [xs p]
+  (let [s (sort-nums xs) n (count s)]
+    (if (= n 0) 0 (get s (min (- n 1) (erlang/trunc (* p n)))))))
+(defn- median [xs] (percentile xs 0.5))
+(defn- mean [xs] (if (empty? xs) 0 (erlang/div (reduce + 0 xs) (count xs))))
+(defn- header [t] (println (str "\n" t)))
+(defn- row [& parts] (println (str "  " (join "  |  " (to-list (mapv (fn [p] (str p)) parts))))))
+
+;; ── a synthetic source-file corpus with realistic edits ──────────────
+;;
+;; Deterministic pseudo-random so runs are comparable. A "file" is ~LINES
+;; lines of ~WIDTH chars; an "edit" rewrites a handful of lines (the shape
+;; of a real code edit) and produces the NEW full content — which is what a
+;; content-snapshot VCS stores per revision.
+
+(def LINES 120)     ; ~120-line source files
+(def WIDTH 48)      ; ~48 chars/line  → ~5.7 KB/file
+(defn- lcg [seed] (rem (+ (* seed 1103515245) 12345) 2147483648))
+
+(defn- line-of [seed]
+  (let [s (lcg seed)]
+    (join "" (to-list (mapv (fn [i]
+                              (let [c (+ 97 (rem (lcg (+ s (* i 31))) 26))]
+                                (List/to_string (list c))))
+                            (range WIDTH))))))
+
+(defn- file-content [seed lines]
+  (join "\n" (to-list (mapv (fn [i] (line-of (+ seed (* i 7919)))) (range lines)))))
+
+(defn- apply-edit
+  "Rewrite `n` pseudo-random lines of `content` (seed drives which + what).
+   Returns the new full content — a content snapshot, as a real edit yields."
+  [content seed n]
+  (let [ls (into [] (String/split content "\n"))
+        cnt (count ls)
+        edited (reduce (fn [acc k]
+                         (let [idx (rem (lcg (+ seed (* k 104729))) cnt)]
+                           (assoc acc idx (line-of (+ seed (* k 61) 1)))))
+                       ls (range n))]
+    (join "\n" (to-list edited))))
+
+;; ── the schema: a file is an entity keyed by path; content is a value ──
+;;
+;; `:file/path` is the identity, so `(transact! [{:file/path p :file/content c}])`
+;; is an UPSERT: same path → same entity → the store retracts the prior
+;; content datom and asserts the new one, both under this tx. That single
+;; property is the entire edit-log.
+
+(def SCHEMA
+  [{:db/ident :file/path    :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :file/content :db/valueType :db.type/string}
+   {:db/ident :file/editor  :db/valueType :db.type/string}   ; who made the edit (the auth identity)
+   {:db/ident :file/size    :db/valueType :db.type/long}])
+
+(defn- db-path []
+  (str "/tmp/relay-editlog-bench-" (erlang/system_time :millisecond) ".redb"))
+
+(println "════════ EDIT-LOG VCS — BENCHMARK ON THE DURABLE PATH (redb) ════════")
+(println (str "redb NIF available? " (redb/available?)))
+(println "every edit = one durable transaction; history/as-of/since = the VCS")
+
+(when (not (redb/available?))
+  (println "\n✗ redb NIF not loaded — cannot measure the durable path. Aborting.")
+  (System/halt 1))
+
+;; ── open a fresh durable store ───────────────────────────────────────
+(def PATH (db-path))
+(def conn (datom/connect-with (redb/open PATH) SCHEMA))
+(println (str "store: " PATH))
+
+;; ── build a working set of files, one initial commit each ────────────
+(def NFILES 200)
+(def editors ["alice" "bob" "carol" "dave"])
+
+(defn- seed-files! []
+  (datom/transact! conn
+    (into [] (mapv (fn [i]
+                     (let [c (file-content (* (+ i 1) 2654435761) LINES)]
+                       {:db/id (- (+ i 1))
+                        :file/path (str "src/mod" (rem i 20) "/file" i ".ex")
+                        :file/content c
+                        :file/editor (get editors (rem i 4))
+                        :file/size (String/length c)}))
+                   (range NFILES)))))
+
+(header "0 — SEED: initial commit of the working set")
+(let [t0 (now-us)
+      report (seed-files!)
+      t1 (now-us)]
+  (row "files" NFILES)
+  (row "initial tx id" (datom/basis-t (datom/db conn)))
+  (row "seed commit ms" (erlang/div (- t1 t0) 1000))
+  (row "≈ bytes/file" (erlang/div (* LINES (+ WIDTH 1)) 1)))
+
+;; the current paths, so edits target real files
+(def all-paths
+  (into [] (mapv (fn [r] (get r 0))
+                 (into [] (datom/q '[:find ?p :where [?e :file/path ?p]] (datom/db conn))))))
+
+;; ── 1. COMMIT: record one edit as a durable transaction ──────────────
+;;
+;; The load-bearing number. Each edit upserts one file's content — the store
+;; fsyncs (Durability::Immediate) and appends the retraction+assertion pair.
+;; This is the per-write tax the shared folder pays to make every write a
+;; tracked revision.
+
+(defn- one-edit! [seed]
+  (let [p (get all-paths (rem seed NFILES))
+        ; read current content (a checkout of HEAD), apply a small edit
+        cur (datom/q '[:find ?c :in $ ?p :where [?e :file/path ?p] [?e :file/content ?c]]
+                     (datom/db conn) p)
+        content (get (first (into [] cur)) 0)
+        next-c (apply-edit content (+ seed 7) 3)]
+    (datom/transact! conn
+      [{:db/id -1 :file/path p :file/content next-c
+        :file/editor (get editors (rem seed 4))
+        :file/size (String/length next-c)}])))
+
+(header "1 — COMMIT: one edit = one durable tx (fsync per commit)")
+(let [warm (mapv (fn [k] (one-edit! (+ 100000 k))) (range 20))
+      n 1000
+      samples (mapv (fn [k]
+                      (let [t0 (now-us) _ (one-edit! k) t1 (now-us)]
+                        (- t1 t0)))
+                    (range n))]
+  (row "edits recorded" n)
+  (row "p50 µs/edit" (median samples))
+  (row "p99 µs/edit" (percentile samples 0.99))
+  (row "mean µs/edit" (mean samples))
+  (row "edits/sec (p50)" (if (> (median samples) 0) (erlang/div 1000000 (median samples)) "∞"))
+  (row "basis tx after" (datom/basis-t (datom/db conn))))
+
+;; ── 2. LOG: every revision of one file ───────────────────────────────
+;;
+;; `datom/changes db e a` — one row per assertion of :file/content, oldest
+;; first, each with its tx. That IS `git log` for the file: the list of
+;; revisions and when each became true.
+
+(defn- entity-of [p]
+  (get (first (into [] (datom/q '[:find ?e :in $ ?p :where [?e :file/path ?p]]
+                                (datom/db conn) p)))
+       0))
+
+(header "2 — LOG: every revision of one file (datom/changes)")
+(let [; the file we edited most — file at index 0 got edits whenever k≡0 mod NFILES
+      p (get all-paths 0)
+      e (entity-of p)
+      db (datom/history (datom/db conn))
+      samples (mapv (fn [k]
+                      (let [t0 (now-us)
+                            revs (datom/changes (datom/db conn) e :file/content)
+                            t1 (now-us)]
+                        (- t1 t0)))
+                    (range 50))
+      revs (datom/changes (datom/db conn) e :file/content)]
+  (row "file" p)
+  (row "revisions" (count revs))
+  (row "p50 µs" (median samples))
+  (row "p99 µs" (percentile samples 0.99)))
+
+;; ── 3. CHECKOUT: reconstruct a file at a past revision ───────────────
+;;
+;; `datom/as-of db t` then read the content — the world as it was at tx `t`.
+;; O(1) to construct the view; the read is a basis-filtered index lookup.
+
+(header "3 — CHECKOUT: file content at a past tx (datom/as-of + value-at)")
+(let [p (get all-paths 0)
+      e (entity-of p)
+      head (datom/basis-t (datom/db conn))
+      mid (erlang/div head 2)
+      samples (mapv (fn [k]
+                      (let [t0 (now-us)
+                            v (datom/value-at (datom/db conn) mid e :file/content)
+                            t1 (now-us)]
+                        (- t1 t0)))
+                    (range 50))
+      v-mid (datom/value-at (datom/db conn) mid e :file/content)
+      v-head (datom/value-at (datom/db conn) head e :file/content)]
+  (row "checkout @ tx" mid)
+  (row "HEAD tx" head)
+  (row "content differs past vs HEAD?" (if (= v-mid v-head) "no" "yes ✓"))
+  (row "p50 µs" (median samples))
+  (row "p99 µs" (percentile samples 0.99)))
+
+;; ── 4. DIFF: what changed since a tx, across all files ────────────────
+;;
+;; `datom/since db t` hides everything up to and including t, so a scan of
+;; :file/content assertions yields exactly the files touched after t — the
+;; "what changed while I was away" query, without diffing two snapshots.
+
+(header "4 — DIFF: files changed since a past tx (datom/since)")
+(let [head (datom/basis-t (datom/db conn))
+      cut (- head 100)
+      samples (mapv (fn [k]
+                      (let [t0 (now-us)
+                            changed (datom/q '[:find ?p
+                                               :where [?e :file/content ?c] [?e :file/path ?p]]
+                                             (datom/since (datom/db conn) cut))
+                            t1 (now-us)]
+                        (- t1 t0)))
+                    (range 30))
+      changed (into [] (datom/q '[:find ?p
+                                  :where [?e :file/content ?c] [?e :file/path ?p]]
+                                (datom/since (datom/db conn) cut)))]
+  (row "since tx" cut)
+  (row "files changed after cut" (count changed))
+  (row "p50 µs" (median samples))
+  (row "p99 µs" (percentile samples 0.99)))
+
+;; ── 5. HONEST LEDGER: content-snapshot vs patch storage ──────────────
+;;
+;; The above stores the WHOLE file per edit. That is what datom gives for
+;; free and what these numbers measure. But it is O(edits × filesize) on
+;; disk. A real VCS stores DIFFS. This section quantifies the gap so the
+;; choice is informed, not assumed: total bytes of content datoms vs the
+;; bytes a per-edit line-diff would have stored.
+
+(header "5 — STORAGE: snapshot cost vs a diff model (honest ledger)")
+(let [hist (datom/history (datom/db conn))
+      ; every :file/content assertion ever made = every stored revision
+      content-datoms (into [] (datom/q '[:find ?c
+                                         :where [?e :file/content ?c]]
+                                       hist))
+      total-snapshot-bytes (reduce (fn [acc r] (+ acc (String/length (get r 0)))) 0 content-datoms)
+      revisions (count content-datoms)
+      avg-file (if (> revisions 0) (erlang/div total-snapshot-bytes revisions) 0)
+      ; a line-diff of a 3-line edit is ~3 lines added + 3 removed ≈ 6×WIDTH
+      est-patch-per-edit (* 6 (+ WIDTH 1))
+      est-patch-total (* revisions est-patch-per-edit)]
+  (row "stored revisions (content assertions)" revisions)
+  (row "snapshot bytes total" total-snapshot-bytes)
+  (row "avg bytes/revision" avg-file)
+  (row "est. diff-model bytes total" est-patch-total)
+  (row "snapshot / diff ratio"
+       (if (> est-patch-total 0)
+         (str (erlang/div total-snapshot-bytes est-patch-total) "×")
+         "-"))
+  (println "  → snapshots are simplest and what datom gives natively; a diff")
+  (println "    model trades CPU (apply patches to checkout) for disk. At this")
+  (println "    file size the ratio is the multiplier a diff model would save.")
+  (println "    For an internal edit-log where files are small and edits many,")
+  (println "    snapshots are often the right call — measure before optimizing."))
+
+;; ── cleanup ──────────────────────────────────────────────────────────
+(datom/release! conn)
+(File/rm PATH)
+(println (str "\n(cleaned up " PATH ")"))
+(println "\n════════ END — edit-log VCS benchmark ════════")
