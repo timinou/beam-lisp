@@ -425,6 +425,14 @@ defmodule BeamLisp.Reader do
               [?{ | _] = coll_rest ->
                 wrap_data_reader(fn_sym, coll_rest, pos0)
 
+              # A STRING after the tag: `#o"2026-06-15"`, mirroring
+              # Clojure's built-in `#inst "…"`. `form` reads the string
+              # literal and it is wrapped as `(<fn> "…")` — the one shape
+              # that lets a sigil-style temporal literal like `#o` carry a
+              # string payload and validate it at read time.
+              [?" | _] = str_rest ->
+                wrap_data_reader(fn_sym, str_rest, pos0)
+
               _ ->
                 record_or_bare(name, after_sym, rest, pos0)
             end
@@ -464,7 +472,7 @@ defmodule BeamLisp.Reader do
         {:ok, with_pos({:list, [fn_sym, coll]}, pos0), rest, pos}
 
       :none ->
-        {:error, "a data-reader tag must be followed by a collection"}
+        {:error, "a data-reader tag must be followed by a collection or string"}
 
       err ->
         err

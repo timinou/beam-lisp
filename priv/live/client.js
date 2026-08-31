@@ -43,11 +43,33 @@
 
   function at(container, path) {
     let el = rootEl(container);
-    for (const i of path) el = elementChildren(el)[i];
+    // Walk ALL child nodes (text + element), NOT element-only: the server
+    // differ (diff.bl `children-of`) indexes a node's children as the flat
+    // text+element list, and `hiccup->html` joins siblings with "" so the
+    // rendered DOM's childNodes mirror that list exactly. Walking
+    // elementChildren here skips text siblings, so a path segment under a node
+    // that interleaves text and elements (e.g. `[:button (icon) "Label"]`)
+    // resolves to the WRONG node — or past the end — and the op is silently
+    // dropped. That is the live-nav "URL changes but the page doesn't" bug.
+    for (const i of path) el = domChildren(el)[i];
     return el;
   }
 
-  // element children only (skip text nodes, so indices match the tree)
+  // the child nodes a diff PATH indexes: text + element, in document order,
+  // mirroring the server differ's `children-of` (which keeps strings and
+  // elements, drops nils, splices seqs). Comment/other node types are
+  // excluded (hiccup never emits them). This is the indexing the whole op
+  // set is computed against; `elementChildren` below is only for the two
+  // element-only concerns (root normalization + keyed lookup).
+  function domChildren(el) {
+    return Array.prototype.filter.call(el.childNodes, function (n) {
+      return n.nodeType === 1 || n.nodeType === 3;
+    });
+  }
+
+  // element children only (skip text nodes) — used for the #live-root → view
+  // root normalization and for keyed lookups (a `:key` is always on an
+  // element, and a keyed child list is all-element by construction).
   function elementChildren(el) {
     return Array.prototype.filter.call(el.childNodes, function (n) {
       return n.nodeType === 1;
@@ -172,24 +194,28 @@
     } else if (kind === "replace") {
       const parent = at(root, path.slice(0, -1));
       const idx = path[path.length - 1];
-      const el = elementChildren(parent)[idx];
+      // children-of index (text+element), matching the server differ
+      const el = domChildren(parent)[idx];
       parent.replaceChild(render(op[2]), el);
     } else if (kind === "remove") {
       const parent = at(root, path);
       const el = childByKey(parent, op[2]);
       if (el) parent.removeChild(el);
     } else if (kind === "remove-at") {
-      // positional remove (unkeyed list): drop the element child at index.
-      // The differ emits these high-index-first, so sequential application
-      // keeps the remaining indices valid.
+      // positional remove (unkeyed list): drop the child at a children-of
+      // index (text+element), matching the server differ. The differ emits
+      // these high-index-first, so sequential application keeps the remaining
+      // indices valid.
       const parent = at(root, path);
-      const el = elementChildren(parent)[op[2]];
+      const el = domChildren(parent)[op[2]];
       if (el) parent.removeChild(el);
     } else if (kind === "insert") {
       const parent = at(root, path);
       const idx = op[3];
       const node = render(op[4]);
-      const ref = elementChildren(parent)[idx] || null;
+      // insert before the child now at the children-of index (text+element),
+      // matching the server differ; null → append
+      const ref = domChildren(parent)[idx] || null;
       parent.insertBefore(node, ref);
     } else if (kind === "move") {
       const parent = at(root, path);
@@ -201,7 +227,7 @@
         // REMAINING children (null → append). This is the anchor-fill
         // reconciliation the differ assumes.
         parent.removeChild(el);
-        const remaining = elementChildren(parent);
+        const remaining = domChildren(parent);
         const ref = remaining[idx] || null;
         parent.insertBefore(el, ref);
       }
@@ -275,6 +301,24 @@
     // attribute; on fire we relay that term plus the value of the nearest
     // input (so a Send button and an Enter key both carry the field text).
     root.addEventListener("click", function (e) {
+      // A plain in-app <a href="/…"> becomes LIVE navigation automatically:
+      // intercept the click, push the URL, and fire a navigate event so the
+      // dispatcher re-projects with a keyed patch (no reload). Falls back to a
+      // real page load when JS is off, when it's a modified click (new tab),
+      // or when the link is external/hash — so links stay honest and
+      // bookmarkable. This is what makes EVERY screen-to-screen move live
+      // without wiring a single link by hand.
+      var a = e.target.closest && e.target.closest("a[href]");
+      if (a && !e.defaultPrevented && !e.metaKey && !e.ctrlKey &&
+          !e.shiftKey && !e.altKey && (a.getAttribute("target") || "") === "") {
+        var href = a.getAttribute("href") || "";
+        if (href.indexOf("/") === 0 && href.indexOf("//") !== 0 &&
+            href.indexOf("#") !== 0) {
+          e.preventDefault();
+          if (ws.__navigate) ws.__navigate(href);
+          return;
+        }
+      }
       fireFrom(e.target, "click", ws, formData(e.target));
     });
     root.addEventListener("input", function (e) {
@@ -295,6 +339,23 @@
         if (el.tagName === "INPUT") el.value = "";
       }
     });
+
+    // Back/Forward: the browser restored a previous URL, so tell the server to
+    // re-route to it (a plain navigate event → the dispatcher re-projects).
+    // No pushState here — the history entry already moved; we only sync state.
+    window.addEventListener("popstate", function () {
+      var path = location.pathname + location.search;
+      (ws.__send || ws.send.bind(ws))(
+        JSON.stringify(["event", ["navigate", path], {}]));
+    });
+
+    // programmatic navigation: push the URL and tell the server. Lets app code
+    // (or a film driver) move routes without a synthetic click.
+    ws.__navigate = function (path) {
+      try { history.pushState({ live: path }, "", path); } catch (_e) {}
+      (ws.__send || ws.send.bind(ws))(
+        JSON.stringify(["event", ["navigate", path], {}]));
+    };
 
     return ws;
   }
@@ -327,11 +388,33 @@
     return null;
   }
 
+  // A `:navigate` event term carries the app-route to move to. live.app turns
+  // it into a keyed PATCH (no reload), but the URL bar must follow so links
+  // stay real and shareable, and Back/Forward work. `navTarget` finds the
+  // navigate path in a term — a single ["navigate", "/x"] or the second slot
+  // of a [["assign",…],["navigate","/x"]] batch — or null when there is none.
+  function navTarget(term) {
+    if (!Array.isArray(term) || term.length === 0) return null;
+    if (term[0] === "navigate") return term[1];
+    // a vector of terms: scan for a navigate among them
+    if (Array.isArray(term[0])) {
+      for (var i = 0; i < term.length; i++) {
+        if (Array.isArray(term[i]) && term[i][0] === "navigate") return term[i][1];
+      }
+    }
+    return null;
+  }
+
   // relay the JSON term stored in attribute `attr` of `el` to the server
   function relay(el, attr, ws, data) {
     var raw = el.getAttribute(attr);
     var term = null;
     try { term = raw ? JSON.parse(raw) : null; } catch (e) { term = null; }
+    // a navigate term also moves the URL bar (pushState), so the address
+    // reflects the live route — a bookmarkable SPA over one socket. The
+    // server still gets the SAME event and re-routes; this only syncs the URL.
+    var nav = navTarget(term);
+    if (nav) { try { history.pushState({ live: nav }, "", nav); } catch (_e) {} }
     // __send guards readyState (buffer while CONNECTING, drop when CLOSED) so a
     // fire before the handshake or after a drop never throws.
     (ws.__send || ws.send.bind(ws))(JSON.stringify(["event", term, data || {}]));

@@ -1,0 +1,299 @@
+#+TITLE: Upstream requirements for the "capability-key" relay — env-scoped defs, db-backed authorize, egress caps, cluster fan-out
+#+STATE: ITEM
+#+CUSTOM_ID: PLAN-060-relay-upstream-requirements-capability-keys-sandboxed-tools
+
+* What this is (read me first)
+
+This plan lists four things beam-lisp would need to ADD so that "relay" — an
+OpenAI-compatible LLM gateway built in beam-lisp, living at
+=/home/user/code/ora/relay= — can become dramatically better than it is today.
+
+You do not need to know relay's internals to work these items. Each requirement
+below is a general beam-lisp capability, described on its own terms, with the
+relay use-case given only as motivation. Each is independently useful to other
+beam-lisp apps too.
+
+The four requirements are ordered by leverage. Requirement A is the keystone —
+it unblocks the most, including a separate relay test-isolation plan. B and C
+together unlock the headline feature (capability keys + sandboxed tool calls).
+D is the "even better" multi-node story and is not blocking.
+
+* The vision these requirements serve (motivation, not scope)
+
+Today a relay API key is a random string. The gateway hashes it, looks it up in
+a table, and then runs a handful of hand-written checks (is it enabled? under
+budget? under its rate limit?) in one function.
+
+Meanwhile beam-lisp ALREADY ships — built, tested, conformance-green — a
+capability system that relay does not use:
+- =auth= : a pure-beam-lisp Biscuit implementation (signed, attenuable,
+  offline-verifiable capability tokens carrying datalog facts).
+- =env=  : first-class environments whose host-interop rights are narrowed at
+  compile time (=env/fork=, caps).
+- =auth/sandbox= : the seam that turns a token's granted rights into an env's
+  caps.
+- =auth/audit= : every authorization verdict recorded as a datom, temporally
+  queryable.
+
+If relay adopted these, an API key would stop being a database row and become a
+*capability*: a signed token the holder can *attenuate itself*, offline, into a
+strictly weaker slice — "read-only, this model only, this budget, expires in an
+hour, this subprocess only" — with the narrowing guaranteed by cryptography, not
+by the server trusting the client. An agent spawning sub-agents could hand each
+one a weaker slice of its own authority, and the whole tree of who-may-do-what
+becomes a value you can print, diff, store, and audit.
+
+The four requirements below are the gaps between "the pieces exist" and "relay
+can actually do this."
+
+* Requirement A — Env-scoped =def= instances (THE KEYSTONE)  ✅ DONE
+
+** Status: IMPLEMENTED (2026-08-30)
+
+Shipped in beam-lisp. A stateful def marked =^:per-env= now materializes its
+OWN instance per consuming env (fork), while un-marked defs keep one global
+instance. Opt-in via metadata on the def name: =(def ^:per-env conn (datom/connect …))=.
+
+Design (as built), from the oracle review:
+- =^:per-env= interns a =%BeamLisp.Env.PerEnvDef{generation, init}= DESCRIPTOR
+  (a re-runnable zero-arity thunk), not a value, into the ordinary var slot —
+  at =:global= for a required library, so the PLAN-047 "library interns once,
+  VM-wide" invariant for fn defs is untouched.
+- =Env.fetch/2= branches on a descriptor hit: it checks a HIDDEN, exact-env
+  instance row ={consumer_env, :per_env_instance, ns, name}= (NOT chain-walked,
+  so a child env never inherits a parent's instance), and on a miss runs the
+  thunk once — pinned in =BeamLisp.Loader.Server= (serializes cold starts so a
+  double first-read collapses to one instance, and process-owned state like a
+  datom conn's ETS / an atom's Agent outlives the transient first reader),
+  bound to the target env + defining ns — then caches the value.
+- A non-materializing =Env.peek/2= / =Env.bound?/2= is used at every COMPILE-time
+  probe (macro resolution, syntax-quote qualification, type-tag resolution) so
+  compiling code that merely references a per-env var never creates an instance.
+- Redefinition bumps the descriptor =generation=; a live env re-materializes on
+  next read. =Env.destroy/1= sweeps instance rows (env-prefixed key). A per-env
+  init that reads itself raises a deterministic cyclic-init error, never hangs.
+- =^:per-env= on a =defn=/=defmacro= is a compile error (it only means something
+  for a stateful value).
+- Works on BOTH load paths: source (thunk anchored to the throwaway eval
+  module) and AOT (thunk emitted into the stable =BeamLisp.Ns.Init.<Ns>=
+  companion, so its closure survives namespace-reload churn).
+
+Files: =lib/beam_lisp/env.ex= (descriptor + define_per_env + fetch branch +
+materialization + peek/bound? + destroy/undefine/explain), =lib/beam_lisp/compiler.ex=
+(route + reject + non-materializing probes), =lib/beam_lisp/aot.ex= (preserve
+flag through value-def capture, emit define_per_env thunk).
+
+Tests: =test/beam_lisp/per_env_def_test.exs= (11 tests, all green) +
+=test/fixtures/aot/per_env_fixture.bl=. Covers: sibling-fork isolation (source
+AND AOT), global-def unaffected, within-fork identity stability, bound-worker
+sees parent's instance, child-does-not-inherit, destroy sweeps, redefinition
+generation, defn/defmacro rejection, cycle detection. No regression across the
+reload/ward (44), auth (65), datom (454), and core Elixir suites.
+
+** The gap, stated plainly
+
+A top-level =(def x (something-stateful))= compiles into ONE module keyed by the
+namespace name string. Every env fork that requires that namespace sees the
+SAME instance — the fork isolates the variable REGISTRY (which names resolve),
+but not the stateful value a name points at.
+
+** Evidence (measured, not assumed)
+
+Forking a namespace twice via =env/isolated= and comparing the identity of two
+def-held singletons (a datom store connection and a counter atom) returned
+=true= for both — i.e. identical, not isolated. ward's own source doc already
+notes this: =module_for= derives from the namespace string, not the env, so two
+forks that both define namespace =foo= share module =BeamLisp.Ns.Foo=.
+=run-sandboxed= works around it for TEST files by rewriting each file's own ns to
+a unique prefix — but it does not (and cannot) prefix the app dependencies those
+files require, so a required =relay.store= stays shared.
+
+** What to add
+
+A way for a fork to get its OWN instance of a namespace's def-held state, keyed
+by env rather than only by namespace string. In other words: when env E requires
+namespace N, the stateful =def= forms in N should be able to materialize once
+PER env, so E and a sibling env E' hold independent instances.
+
+Design questions to resolve during build (flag, do not pre-decide):
+- Should this be automatic for all defs, or opt-in per def (e.g. a metadata
+  marker like =^:per-env= on the def)? Automatic is simplest to reason about but
+  changes memory behaviour for every existing app; opt-in is safer to land
+  incrementally. Lean opt-in first.
+- How does a per-env instance interact with =capture=/=bind= across a process
+  boundary — does a bound worker see the parent env's instance (yes, it should,
+  to preserve "the worker runs under the parent's ceiling")?
+- Destruction: an env instance must be dropped when the env is destroyed, same
+  lifecycle as the env's var registry.
+
+** Why it is the keystone
+
+Two payoffs from one feature:
+1. *Complete test isolation.* ward could then give each test file a truly
+   private copy of every stateful dependency (stores, counters), making the
+   whole suite concurrency-safe by construction. This directly unblocks relay's
+   test plan (relay =PLAN-043=, Phase 3).
+2. *Multi-tenant production isolation.* Each tenant / each capability key could
+   run against its own private store instance in one VM, no cross-tenant
+   bleed, without spinning an OS process per tenant.
+
+** Acceptance
+
+- Forking a namespace with a =^:per-env= (or equivalent) stateful def twice and
+  comparing instance identity returns FALSE (distinct instances).
+- A =capture=/=bind= worker sees its parent env's instance, not =:global='s.
+- Destroying an env drops its instances.
+- A regression test in =test/bl/= proves all three.
+
+* Requirement B — =auth/authorize= over a live datom database
+
+** The gap, stated plainly
+
+The authorizer today evaluates datalog over a set of LITERAL fact tuples handed
+to it in its context (=auth/context {:facts [...] :rules [...] :checks [...]}=).
+It cannot, mid-decision, ask a live database a question. So a check like "is the
+cumulative spend on this key under its limit?" cannot be expressed as a token
+check, because the spend total lives in a datom store, not in the token.
+
+** What to add
+
+A fact-resolver seam so an authorizer context can include facts that are
+COMPUTED by running a query against a supplied datom db value at decision time,
+not only static tuples. Shape sketch (final form to be designed):
+
+#+begin_src clojure
+(auth/context
+  {:db      (datom/db conn)          ; a db VALUE, immutable, as-of its basis
+   :facts   [ ... static ... ]
+   :resolve [ ;; datalog rules whose body may reach into :db
+             '[(spend-of ?key ?cents) [?key :key/spend ?cents]] ]
+   :checks  ['(check if (spend-of $key $c) ($c < $limit))]})
+#+end_src
+
+The key property to preserve: it must be the SAME datalog engine the token
+checks and the RLS clause injection already use — do NOT introduce a second
+evaluator that could disagree with the first. The =auth-downstream= design doc
+already sketches this as =guarded-q=; this requirement is to make the authorizer
+itself db-aware, so "may you?" and "for which rows?" can both consult live data.
+
+Because a db value is immutable and carries a basis, a decision stays
+reproducible and temporally auditable ("was this allowed as-of last Tuesday?"
+= authorize against =(as-of db t)=) — the property must not be lost.
+
+** Motivation
+
+Lets relay fold budget, per-model allowance, and rate into the ONE
+=auth/authorize= call as datalog checks/policies, replacing the bespoke
+hand-written gate. The authorization decision becomes a single value-in /
+value-out function of (token, request, db).
+
+** Acceptance
+
+- An authorizer context can carry a datom db value and resolve facts by querying
+  it during the decision.
+- A check comparing a queried numeric fact against a token/authorizer bound
+  (e.g. spend < limit) passes/fails correctly against live data.
+- Reproducible against =(as-of db t)= — same inputs, same verdict.
+- Covered by a test in =test/bl/auth/=.
+
+* Requirement C — Network-egress capability (per host/port)
+
+** The gap, stated plainly
+
+Env caps gate host-interop at the MODULE (and op) level only. There is no
+capability that says "this fork may open a network connection to
+=api.anthropic.com:443= and nowhere else." Granting any network access today
+means granting the whole socket/HTTP module, which can then reach ANY host.
+The deployment doc (=docs/deployment-os-floor.md=) even concedes this and pushes
+egress control down to systemd's =RestrictAddressFamilies= — an OS-level, whole-
+node blunt instrument, not a per-sandbox one.
+
+** What to add
+
+A first-class egress capability inside the interop gate: a cap entry that names
+allowed destinations (host + port, or host pattern), so a forked env can be
+granted "may reach these endpoints" and a connection attempt to anything else
+fails closed — the same fail-closed discipline module caps already have.
+
+Design questions to resolve during build:
+- Granularity: exact host+port, host with wildcard (=*.openai.com=), CIDR? Start
+  with exact host+port and a wildcard host; defer CIDR unless needed.
+- Enforcement point: the gate must intercept the actual connect call
+  (=:gen_tcp=/=:ssl=/the HTTP client) — decide whether this is a wrapper around
+  the socket modules or a check the modules consult. Prefer the narrowest
+  interception that cannot be bypassed by calling a lower-level module.
+- Interaction with module caps: egress is an ADDITIONAL narrowing, never a
+  widening — a fork without the socket module still cannot connect even if it
+  holds an egress allowlist.
+
+** Motivation
+
+This is what makes it safe for relay to run untrusted TOOL code (relay is
+already a tool-aware gateway). A completion that invokes a tool could run the
+tool inside an env forked to exactly the token's rights, including "may call
+this one provider endpoint and exfiltrate nowhere." Without egress caps, any
+network grant is a full-internet grant, so structural tool sandboxing is
+incomplete.
+
+** Acceptance
+
+- A forked env granted egress to host H:P can connect to H:P and is DENIED (fail
+  closed) to any other host/port.
+- A fork without the socket module cannot connect at all, allowlist or not.
+- A deny is observable (an error, not a silent success) and testable.
+- Covered by a test alongside the existing caps tests
+  (=test/beam_lisp/caps_test.exs= / =test/bl/auth_caps_test.bl=).
+
+* Requirement D — Cluster fan-out for live shared state (the "even better")
+
+** The gap, stated plainly
+
+=datom/watch= (filtered, per-principal, live queries) is BUILT and works on a
+single node — a subscriber is notified only when a commit affects its guarded
+slice. But the multi-node primitives that would let a FLEET of nodes share live
+state are marked not-in-tree in =docs/datom-as-a-broadcast-substrate.md=:
+process groups (=:pg=), cluster naming (=:global=), node membership
+(=net_kernel/monitor_nodes=), cross-node calls (=:erpc=).
+
+** What to add
+
+Bring the cluster broadcast layer into the tree so a datom fact stream (and the
+=watch= subscriptions over it) can fan out across nodes, not just within one VM.
+The broadcast-substrate doc already lays out the ladder (=:pg= → Registry →
+Phoenix.PubSub → Presence) and argues a dropped broadcast is never a lost event
+(the log is the source of truth, a broadcast is just a faster read). Build the
+lowest rung that gives cluster fan-out, keeping the "log is truth" guarantee.
+
+** Motivation
+
+Enables a horizontally-scaled relay where every node sees key mints, spend
+updates, and revocations in near-real-time: revoke a key on one node and every
+node drops it, because they all subscribe to the same guarded fact stream. This
+is the realtime control-plane story. It is NOT needed for a single-node relay,
+which is why it is ranked last.
+
+** Acceptance
+
+- A fact committed on node 1 is delivered to a matching =watch= subscription on
+  node 2.
+- A dropped/again-connected node re-reads and converges (no lost facts).
+- Covered by a multi-node test.
+
+* Ordering and dependencies
+
+- A is independent and is the keystone — do it first. It also unblocks relay
+  =PLAN-043= Phase 3 (test isolation).
+- B is independent of A and C; do it whenever.
+- C is independent of A and B.
+- B + C together are what unlock the headline "capability key + sandboxed tool"
+  relay feature; either alone is a partial step.
+- D is independent and last (only matters at multi-node scale).
+
+* Non-goals
+
+- This plan does not change relay. It records what beam-lisp must provide.
+- It does not require adopting any of it in relay before it exists; relay tracks
+  its own adoption separately (relay =PLAN-043= and any successor).
+- No new datalog engine anywhere — every requirement that touches datalog reuses
+  the one engine =datom= and =auth= already share (the stated anti-pattern is two
+  engines that must agree).

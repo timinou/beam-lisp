@@ -1,0 +1,376 @@
+; live/app.bl — a live application is a VALUE.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; `live.socket`/`deflive` give one live PAGE: a socket per viewer, mount →
+; commit → diff → patch, events as data (:assign local · :intent write ·
+; :navigate). Beautiful, but it stops one level too low for a real app:
+;
+;   • it has no ROUTE TABLE — a view switches on a local; ten screens can't
+;     live in one socket, and "/e/:lib/:id" is not parsed to params;
+;   • its reads are UNGUARDED — the view reads a raw conn, so multi-tenant
+;     safety is left to author discipline;
+;   • the web FRAME (ws boundary + SSR + stylesheet warming) is copy-pasted
+;     into every app (see tooling/catalog.bl — ~120 lines of plumbing).
+;
+; `live.app` lifts those three into ONE value. An app is:
+;
+;   {:home    "/app"                       ; where "/" and a bare mount land
+;    :routes  [["/app"        home]        ; path pattern → screen fn
+;              ["/lib/:lib"    library]     ; a ':seg' binds a param
+;              ["/e/:lib/:id"  entity]]
+;    :principal (fn [conn]  -> me)          ; who is this request (cookie/hdr)
+;    :worlds  (fn [me params] -> {:control db :library db-or-nil …})
+;                                           ; the NAMED, ALREADY-GUARDED worlds
+;                                           ; this principal may read for this
+;                                           ; route — nil ⇒ not permitted/absent
+;    :observe (fn [me] -> [conn …])         ; conns to LISTEN to for liveness
+;    :intents {:ingest/confirm confirm-fn}  ; the only writes; op → performer
+;    :theme   (fn [] …)                     ; install a palette per socket (opt)
+;    :assets  (fn [conn path] -> conn|nil)  ; static asset handler (fonts…) (opt)
+;    :shell   (fn [title body style] -> html) ; the page document (opt)
+;    :warm    ["/app" "/lib/moroccan-law"]} ; concrete paths to warm the sheet
+;
+; A SCREEN is then the whole point: a pure function of a context map
+;
+;   (defscreen entity [{:keys [me params db]}]
+;     (let [lib (db :library)]              ; ← already guarded for `me`
+;       (page (usage-history (pull lib (:id params))))))
+;
+; The four hard things — routing, guarded multi-tenancy, liveness, the web
+; frame — are the FRAME's job, provided once, so a screen cannot get them
+; wrong. A cross-tenant read is not "prevented"; it is UNREPRESENTABLE,
+; because :worlds never hands a screen a world its principal may not see.
+;
+;   (live.app/serve knowledger {:port 4040})   ; ← the whole app, one call.
+;
+; This composes live.socket + auth/guard + web verbatim; it invents no new
+; rendering, diffing, or transport. It only supplies the frame.
+
+(ns live.app
+  (:require [live.socket :as sock]
+            [live.hiccup :as h]
+            [loom.token :as t]
+            [datom]
+            [web]
+            [interop]))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. ROUTE MATCHING — a path pattern with ':seg' params
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- segs
+  "Path → non-empty segments. \"/e/moroccan-law/DOC:1240\" → [\"e\" \"moroccan-law\" \"DOC:1240\"]."
+  [path]
+  (into [] (filter (fn [s] (not= "" s)) (String/split path "/"))))
+
+(defn- parse-qs
+  "\"basis=813&view=source\" → {:basis \"813\" :view \"source\"}. Empty → {}."
+  [qs]
+  (if (or (nil? qs) (= "" qs)) {}
+    (reduce (fn [acc pair]
+              (let [kv (String/split pair "=")]
+                (if (>= (count kv) 2)
+                  (assoc acc (keyword (first kv)) (web/url-decode (second kv)))
+                  acc)))
+            {} (String/split qs "&"))))
+
+(defn split-target
+  "Split a nav target into [path query-params]. \"/lib/x?basis=8\" →
+   [\"/lib/x\" {:basis \"8\"}]."
+  [target]
+  (let [ix (index-of target "?")]
+    (if (and ix (>= ix 0))
+      [(subs target 0 ix) (parse-qs (subs target (+ ix 1) (count target)))]
+      [target {}])))
+
+(defn match-route
+  "Match `path` against `routes` (a vector of [pattern screen] pairs) in
+   order. Returns [screen params-map] for the first match, or nil. A pattern
+   segment beginning ':' binds that segment as a param keyword; every other
+   segment must match literally, and the segment counts must be equal."
+  [routes path]
+  (let [ps (segs path)]
+    (loop [rs (seq routes)]
+      (if (empty? rs)
+        nil
+        (let [pair (first rs)
+              pat (first pair)
+              screen (second pair)
+              pss (segs pat)]
+          (if (not= (count pss) (count ps))
+            (recur (rest rs))
+            (let [params (loop [a pss b ps acc {}]
+                           (cond
+                             (empty? a) acc
+                             (String/starts_with? (first a) ":")
+                               (recur (rest a) (rest b)
+                                      (assoc acc (keyword (subs (first a) 1 (count (first a))))
+                                             (first b)))
+                             (= (first a) (first b))
+                               (recur (rest a) (rest b) acc)
+                             :else :no-match))]
+              (if (= params :no-match)
+                (recur (rest rs))
+                [screen params]))))))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. THE DISPATCH VIEW — one view, every screen (routing + guarded worlds)
+;; ════════════════════════════════════════════════════════════════════
+;;
+;; The socket's :view is this dispatcher. It reads the current route + the
+;; resolved principal from locals, matches a screen, resolves that route's
+;; NAMED WORLDS through the app's :worlds resolver (already guarded per
+;; principal — an absent/forbidden world is nil), and calls the screen with a
+;; context map. The screen reads `(db :library)` and cannot reach any world
+;; the resolver did not hand it — structural multi-tenancy.
+
+(defn- not-found [route]
+  [:div {:class (t/sx {:padding "48px" :font-family (t/tok :font :sans)
+                       :color (t/color :muted)})}
+   [:h1 {:class (t/sx {:color (t/color :text)})} "Not here"]
+   [:p (str "No screen for " route ".")]])
+
+(defn dispatch
+  "The universal view: (shared session locals) → hiccup, for ANY app. The app
+   value, the resolved principal, and the current route travel in `locals`
+   (set at mount and updated by :navigate). Everything else — matching,
+   world resolution, the screen call — happens here, once."
+  [_shared session locals]
+  (let [app (get locals :app)
+        me (get locals :me)
+        ;; install the theme for THIS render. dispatch is the view fn for both
+        ;; the SSR first paint AND every live re-projection in the socket
+        ;; process; install-theme! is process-local, so without this the socket
+        ;; re-renders with loom's DARK defaults — the class names then diverge
+        ;; from the warmed LIGHT sheet and nothing paints (mark goes purple,
+        ;; buttons go browser-default). Installing per render keeps every paint
+        ;; on-brand and the class names stable against the warmed sheet.
+        _theme (when-let [th (get app :theme)] (th))
+        ;; the route may arrive as a keyword (normalize-event keywordizes a
+        ;; :navigate target) or a string; `name` coerces both to a path string.
+        raw-route (or (get locals :route) (get app :home "/"))
+        target (if (keyword? raw-route) (name raw-route) (str raw-route))
+        [path qparams] (split-target target)
+        path (if (or (= path "/") (= path "")) (get app :home "/") path)
+        m (match-route (get app :routes) path)]
+    (if (nil? m)
+      (not-found path)
+      (let [screen (first m)
+            params (merge (second m) qparams)
+            worlds ((get app :worlds) me params)
+            ctx {:me me
+                 :params params
+                 :route path
+                 :query qparams
+                 :locals locals
+                 :session session
+                 ;; the guarded world accessor: `(db :library)` → a db VALUE
+                 ;; (or nil when the principal may not see it). The resolver
+                 ;; already applied RLS/as-of; the screen just reads.
+                 :db (fn [k] (get worlds k))
+                 :worlds worlds}]
+        (screen ctx)))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. THE SOCKET — a generic defserver (view + intents + worlds from ctx)
+;; ════════════════════════════════════════════════════════════════════
+;;
+;; `deflive` bakes :view and :intents into the macro literal, so it can serve
+;; exactly ONE page shape. An app needs the socket to carry a DIFFERENT view
+;; (the dispatcher) and a DIFFERENT intent registry per app — both must come
+;; from ctx. So this is a hand-written defserver over the SAME live.socket
+;; functions deflive wraps (mount / on-commit / handle-event): no new loop,
+;; just ctx-driven instead of macro-driven.
+;;
+;; Liveness: at init we listen to every conn the app says this principal
+;; should observe (:observe me). A commit on ANY of them re-projects this
+;; viewer — the ambient liveness that makes "the shelf grows as the agent
+;; ingests, no reload" the DEFAULT, wired by no screen.
+
+(defserver app-socket
+  (init [ctx]
+    (let [observe (get ctx :observe [])
+          _ (doseq [c observe] (datom/listen! c {}))
+          st (sock/mount {:view (get ctx :view)
+                          :shared (get ctx :shared)
+                          :session (get ctx :session)
+                          :sink (get ctx :sink)
+                          :locals (get ctx :locals {})
+                          :auth (get ctx :auth)
+                          :intents (get ctx :intents {})})]
+      (ok st)))
+
+  ;; a commit landed on any observed world — re-project this viewer
+  (handle-info [:datom/tx _basis _datoms] [st] (noreply (sock/on-commit st)))
+  (handle-info [:datom/changed _basis _attrs] [st] (noreply (sock/on-commit st)))
+
+  ;; a browser event (click/input/navigate), delivered as a call so the
+  ;; client can await :ok
+  (handle-call [:event ev] [_from st] (reply :ok (sock/handle-event st ev)))
+  (handle-call [:event ev data] [_from st] (reply :ok (sock/handle-event st ev data)))
+
+  ;; introspection for tests
+  (handle-call [:state] [_from st] (reply st st)))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. THE WEB FRAME — SSR first paint · ws boundary · stylesheet warming
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- default-shell
+  "The page document: the warmed stylesheet in <head>, the SSR body in a
+   #live-root, and the client that connects the socket. An app may override
+   this via :shell to add fonts/meta/title chrome."
+  [title body-html style-html]
+  (str "<!doctype html><html lang=\"en\"><head>"
+       "<meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<title>" title "</title>"
+       style-html
+       "</head><body>"
+       "<div id=\"live-root\">" body-html "</div>"
+       "<script src=\"/client.js\"></script>"
+       "<script>Live.connect({url:(location.protocol==='https:'?'wss://':'ws://')"
+       "+location.host+'/ws'+location.pathname+location.search,"
+       "root:document.getElementById('live-root')})</script>"
+       "</body></html>"))
+
+(defn- render-body
+  "SSR one route to a body HTML string for `me`, resetting the per-render
+   sheet first so classes are collected (the warmed head sheet already holds
+   every reachable class, so a first paint references present rules)."
+  [app me target]
+  (when-let [th (get app :theme)] (th))
+  (h/hiccup->html (dispatch nil nil {:app app :me me :route target})))
+
+(defn- warm-style
+  "Render every warm path once so the head <style> holds every class any
+   screen can reach — a live patch ships only class NAMES, so their rules
+   must already be present. Returns the complete <style> tag HTML."
+  [app]
+  (t/reset-sheet!)
+  (when-let [th (get app :theme)] (th))
+  (let [me (get app :warm-me)]
+    (doseq [p (get app :warm [])]
+      (h/hiccup->html (dispatch nil nil {:app app :me me :route p}))))
+  (h/hiccup->html (t/style-tag)))
+
+;; ── the ws boundary: one app-socket per connection ──────────────────
+
+(defn- keywordize [m]
+  (if (map? m)
+    (reduce (fn [acc kv] (assoc acc (keyword (str (first kv))) (second kv))) {} (seq m))
+    m))
+
+(defn- ws-init [init-state]
+  ;; init-state carries {:app :me :route :observe :shared}. Start an app-socket
+  ;; whose sink is THIS ws process; its locals seed the dispatcher.
+  (let [app (get init-state :app)
+        me (get init-state :me)
+        ;; the performer needs to know WHO fired the intent. live.socket reads
+        ;; the principal from :auth's :principal, so thread `me` there. When the
+        ;; app supplies its own :auth (a real biscuit policy), honour it but
+        ;; still carry `me` as the principal; otherwise a permissive gate that
+        ;; names the principal so intents can resolve the firm.
+        auth (let [a (get init-state :auth)]
+               (if (map? a)
+                 (merge a {:principal me})
+                 {:fn (fn [_op _p _pr] {:verdict :allow}) :principal me}))
+        srv (server-start-link app-socket
+              {:view dispatch
+               :shared (get init-state :shared)
+               :session nil
+               :sink (erlang/self)
+               :observe (get init-state :observe [])
+               :intents (get app :intents {})
+               :auth auth
+               :locals {:app app :me me :route (get init-state :route)}})]
+    [:ok {:srv srv}]))
+
+(defn- ws-handle-in [frame state]
+  (let [decoded (interop/json-> (nth frame 1))]
+    (if (and (sequential? decoded) (= "event" (first decoded)))
+      (let [term (nth decoded 1)
+            data (if (> (count decoded) 2) (nth decoded 2) {})]
+        (server-call (:srv state) [:event (sock/normalize-event term) (keywordize data)])
+        [:ok state])
+      [:ok state])))
+
+(defn- ws-handle-info [msg state]
+  [:push [[:text (interop/->json msg)]] state])
+
+(def ws-handlers
+  {:init ws-init
+   :handle-in ws-handle-in
+   :handle-info ws-handle-info})
+
+;; the client JS, read from beam-lisp's priv at boot
+(def client-js (File/read! (str (web/priv-dir) "/live/client.js")))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. defscreen — name a screen (a pure fn of the context map)
+;; ════════════════════════════════════════════════════════════════════
+;;
+;; A screen is just `(ctx) → hiccup`, so `defscreen` expands to `defn`. It
+;; exists to NAME the role and mark the intent, mirroring `live.socket/defview`.
+;; The ctx map carries {:me :params :query :route :db :worlds :locals :session};
+;; destructure what the screen needs: `(defscreen entity [{:keys [me params db]}] …)`.
+
+(defmacro defscreen [name params & body]
+  `(defn ~name ~params ~@body))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. serve — the whole app, one call
+;; ════════════════════════════════════════════════════════════════════
+
+(defn router
+  "The HTTP router for an app: assets, client.js, the ws upgrade, and SSR
+   first paint for any matched route. `style-html` is the warmed sheet."
+  [app style-html conn]
+  (let [path (web/path conn)
+        assets (get app :assets)
+        me ((get app :principal) conn)]
+    (cond
+      ;; static assets (fonts, images) — app-supplied, first crack
+      (and (some? assets) (some? (assets conn path))) (assets conn path)
+
+      (= path "/client.js") (web/js conn client-js)
+
+      ;; the ws endpoint is "/ws" + the connecting page's pathname, so the
+      ;; socket knows which route to first-project (e.g. "/ws/lib/x"). The
+      ;; initial route is that suffix ("/lib/x"), defaulting to home.
+      (String/starts_with? path "/ws")
+        (let [suffix (subs path 3 (count path))         ; "/ws/lib/x" → "/lib/x"
+              route0 (if (or (= suffix "") (= suffix "/")) (get app :home "/") suffix)
+              q (web/query conn)
+              target (if (or (nil? q) (= "" q)) route0 (str route0 "?" q))]
+          (web/upgrade conn ws-handlers
+                       {:app app :me me
+                        :route target
+                        :observe (if-let [obs (get app :observe)] (obs me) [])
+                        :auth (if-let [ar (get app :auth-info)] (ar me) nil)
+                        :shared (get app :shared-conn)}))
+
+      ;; SSR first paint — match a route, render its screen for this principal
+      (some? (match-route (get app :routes)
+                          (if (or (= path "/") (= path "")) (get app :home "/") path)))
+        (let [target (let [q (web/query conn)]
+                       (if (or (nil? q) (= "" q)) path (str path "?" q)))
+              shell (get app :shell default-shell)
+              body (render-body app me target)]
+          (web/html conn (shell (get app :title "App") body style-html)))
+
+      :else (web/text conn 404 "not found"))))
+
+(defn serve
+  "Serve `app` on `opts[:port]`. Warms the stylesheet over `(:warm app)`,
+   then starts one Bandit listener whose plug routes assets/client/ws/SSR.
+   Every viewer gets one live app-socket; navigation is a keyed patch, not a
+   reload; liveness is ambient over `(:observe app)`."
+  [app opts]
+  (let [style-html (warm-style app)
+        shared (or (get app :shared-conn) (datom/connect []))
+        app2 (assoc app :shared-conn shared)]
+    (web/serve {:port (get opts :port 4040)
+                :plug (fn [conn] (router app2 style-html conn))})
+    app2))

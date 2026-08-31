@@ -546,6 +546,11 @@ defmodule BeamLisp.Compiler do
           "defmacro #{name}: expected a parameter vector, got a string literal (a docstring must be followed by clauses)"
         )
 
+      per_env_attr?(name_meta(name_form)) ->
+        # A macro expands at COMPILE time; a per-env (runtime, per-consumer)
+        # instance is meaningless for one. Reject explicitly.
+        compile_error(env, "defmacro " <> name <> ": ^:per-env is only valid on a `def` value, not a macro")
+
       true ->
         compile_def(
           name,
@@ -1443,6 +1448,14 @@ defmodule BeamLisp.Compiler do
   # BeamLisp.Link). The `private` flag and any `^{...}`/attr-map metadata
   # land in the var's metadata.
   defp compile_defn(name, clauses, env, doc, private, attr) do
+    if per_env_attr?(attr) do
+      # `^:per-env` only means something for a stateful VALUE def — a function is
+      # already re-entrant and interns one global fn value (the PLAN-047
+      # invariant). Reject rather than silently ignore, so the marker never
+      # reads as "isolated" where it does nothing.
+      compile_error(env, "defn " <> name <> ": ^:per-env is only valid on a `def` value, not a function")
+    end
+
     mod = BeamLisp.Link.module_for(env.ns)
 
     # The defn form's own line stamps each generated `:def` node, so the
@@ -1767,7 +1780,10 @@ defmodule BeamLisp.Compiler do
   # Macros resolve at compile time against the live registry, so a
   # defmacro must precede its callers in the same session.
   defp macro_for(ns, name) do
-    case Env.fetch(ns, core_qualified(name)) do
+    # `peek`, not `fetch`: probing whether a name is a macro at COMPILE time must
+    # not materialize a `^:per-env` value. A per-env descriptor is never a macro,
+    # so it correctly falls through to `:error`.
+    case Env.peek(ns, core_qualified(name)) do
       {:ok, {:"$macro", m}} -> {:ok, m}
       _ -> :error
     end
@@ -1943,7 +1959,7 @@ defmodule BeamLisp.Compiler do
       # that is where the var lives and where the expansion site will
       # look. Qualifying it to the writer invented a name resolving
       # nowhere.
-      match?({:ok, _}, Env.fetch(ns, name)) -> owner_ns(ns, name) <> "/" <> name
+      Env.bound?(ns, name) -> owner_ns(ns, name) <> "/" <> name
       # Anything else is a name the template introduces (a `let` binding, a fn
       # parameter, a var defined later). Leave it bare so it resolves at the
       # expansion site, which is what those templates mean.
@@ -2045,20 +2061,54 @@ defmodule BeamLisp.Compiler do
   defp name_meta(_), do: nil
 
   defp compile_def(name, init_ast, env, doc, attr) do
-    intern_ast =
+    if per_env_attr?(attr) do
+      compile_per_env_def(name, init_ast, env, doc, attr)
+    else
+      intern_ast =
+        quote do
+          BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(init_ast))
+        end
+
+      if meta = var_meta_ast(doc, false, attr, env) do
+        # def returns the interned value; the meta write is a side effect.
+        quote do
+          value = unquote(intern_ast)
+          BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), unquote(meta))
+          value
+        end
+      else
+        intern_ast
+      end
+    end
+  end
+
+  # `^:per-env` metadata on a def name (reader lowers `^:per-env` to the atom key
+  # `:"per-env"` => true in the name-meta map).
+  defp per_env_attr?(attr) when is_map(attr), do: attr[:"per-env"] == true
+  defp per_env_attr?(_), do: false
+
+  # A `^:per-env` value def: register a re-runnable init THUNK (not a value) so
+  # each consuming env materializes its own instance on first read. The thunk is
+  # `fn -> init_ast end`; wrapping the already-compiled initializer in a
+  # zero-arity Elixir fn anchors any closure it builds to THIS form's throwaway
+  # eval module (source path) or the stable Init companion (AOT path) — neither
+  # is reloaded, so the thunk stays callable across namespace churn.
+  defp compile_per_env_def(name, init_ast, env, doc, attr) do
+    define_ast =
       quote do
-        BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(init_ast))
+        BeamLisp.Env.define_per_env(unquote(env.ns), unquote(name), fn -> unquote(init_ast) end)
       end
 
     if meta = var_meta_ast(doc, false, attr, env) do
-      # def returns the interned value; the meta write is a side effect.
       quote do
-        value = unquote(intern_ast)
+        _ = unquote(define_ast)
         BeamLisp.Env.put_meta(unquote(env.ns), unquote(name), unquote(meta))
-        value
+        # A marked def is opt-in and returns :ok, NOT the value — returning the
+        # value would force eager materialization at definition time.
+        :ok
       end
     else
-      intern_ast
+      define_ast
     end
   end
 
@@ -2906,7 +2956,9 @@ defmodule BeamLisp.Compiler do
         String.to_atom(name)
 
       {:symbol, name} ->
-        case Env.fetch(env.ns, name) do
+        # `peek`: resolving a type-tag symbol at compile time must not materialize
+        # a per-env value. A descriptor is not an atom module, so it falls through.
+        case Env.peek(env.ns, name) do
           {:ok, mod} when is_atom(mod) ->
             if BeamLisp.Record.record_module?(mod) or BeamLisp.Record.deftype_module?(mod),
               do: mod,

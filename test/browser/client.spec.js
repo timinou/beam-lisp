@@ -65,6 +65,39 @@ test("the JS client applies the differ's real ops in a real browser", async ({
   }
 });
 
+test("patches land correctly under parents that mix text + element children", async ({
+  page,
+}) => {
+  // REGRESSION: the live-nav "URL changes but the page does not fully update"
+  // bug. The server differ indexes a node's children as the flat text+element
+  // list (diff.bl children-of), and hiccup->html joins siblings with "" so the
+  // DOM childNodes mirror it. A client that walked ELEMENT-only children
+  // skipped the text siblings, so a path under a node like `[:button (icon)
+  // "Label"]` resolved to the wrong node (or off the end) and the op was
+  // silently dropped. This replays a session of such parents and asserts the
+  // DOM equals the server's HTML at every step — it fails if the client ever
+  // regresses to element-only indexing.
+  const mixed = fixture.mixed;
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, mixed.mount);
+
+  for (let i = 0; i < mixed.patches.length; i++) {
+    const step = mixed.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `mixed step ${i + 1}`).toBe(canonical(step.html));
+  }
+});
+
 test("keyed reorder preserves the SAME DOM nodes (not a rewrite)", async ({
   page,
 }) => {

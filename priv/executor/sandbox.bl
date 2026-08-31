@@ -1,0 +1,240 @@
+; executor/sandbox.bl — a capped beam-lisp session: caps + memory + disk.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; The substrate under "ssh into a capped beam process" (relay/docs/tailnet-
+; executors.md). A SESSION is an authenticated principal running code under three
+; independent ceilings:
+;
+;   1. CAPABILITY — which host modules the code may name. Enforced at COMPILE
+;      time by env caps, derived from the principal's Biscuit token
+;      (auth/caps-for). Ungranted module = compile error. Built upstream.
+;
+;   2. MEMORY — a hard per-process heap quota (max_heap_size, kill:true) so a
+;      runaway allocation kills THAT eval, never the VM; plus a per-USER ceiling
+;      (sum of a user's live session budgets) enforced at admission.
+;
+;   3. DISK — bytes written, tallied per-process and per-user, refused past the
+;      quota. The BEAM has no native disk quota, so this is an accounting gate
+;      on top of the capability that lets a session touch the filesystem at all.
+;
+; ══ WHY LIMITS ARE POLICY, NOT TOKEN-CARRIED ════════════════════════════════
+;
+; The token grants RIGHTS (what you may do); the executor operator sets LIMITS
+; (how much you may consume). A token holder must not be able to raise its own
+; memory ceiling by minting a fact — that would make attenuation (which only
+; narrows rights) a privilege-escalation path for resources. So `admit` takes a
+; policy map from the operator, keyed by user, and the token only ever decides
+; caps. Rights attenuate monotonically; limits are the host's floor.
+;
+; ══ THE SHAPE ═══════════════════════════════════════════════════════════════
+;
+;   (admit registry root-pub token policy conn) → {:ok session} | {:error why}
+;   (run session src)                            → {:ok value} | {:error e}
+;   (account-write! session nbytes)              → {:ok n} | {:error :disk-quota}
+;   (close registry session)                     → :ok   (frees the user tally)
+;
+; A `registry` is an atom holding {user -> {:mem-used :disk-used :sessions}}: the
+; per-user accounting that a single session cannot see on its own. `admit`/`close`
+; are the only writers; `run` reads its own session's env.
+
+(ns executor.sandbox
+  (:require [auth] [env]))
+
+;; ── the per-user accounting registry ─────────────────────────────────
+
+(defn registry
+  "A fresh accounting registry: an atom of {user -> tally}. One per executor
+   host. `admit` and `close` mutate it; sessions never touch it directly."
+  []
+  (atom {}))
+
+(defn- tally-for [reg user]
+  (or (get (deref reg) user)
+      {:mem-used 0 :disk-used 0 :sessions 0}))
+
+;; ── policy: the operator's per-user ceilings ─────────────────────────
+;;
+;; `policy` is {:mem-per-session words :mem-per-user words
+;;              :disk-per-session bytes :disk-per-user bytes
+;;              :users {user override-map}}. A per-user override wins over the
+;; default. Absent → a conservative default (small heap, no disk).
+
+(def ^:private DEFAULT-POLICY
+  {:mem-per-session 5000000      ; ~5M words ≈ 40MB/session on 64-bit
+   :mem-per-user    20000000     ; a user's live sessions sum to ≤ ~160MB
+   :disk-per-session 0           ; no disk by default — fail closed
+   :disk-per-user    0})
+
+(defn- resolve-policy [policy user]
+  (let [base (merge DEFAULT-POLICY (dissoc policy :users))
+        override (get (get policy :users {}) user)]
+    (merge base (or override {}))))
+
+;; ── principal identity from the token ────────────────────────────────
+;;
+;; The `user` fact the token carries: `["user" "<id>"]` in the authority block.
+;; We read it AFTER verification (via caps-for's success) so an unverified token
+;; can never assert an identity — the same discipline as auth/verified-facts.
+
+(defn- user-of [root-pub token]
+  (let [facts (auth/verified-facts root-pub token)]
+    (if (nil? facts)
+      nil
+      (let [u (some (fn [t] (if (= (first t) "user") (nth t 1) nil)) facts)]
+        u))))
+
+;; ── ambient time (so token TTL checks Just Work) ─────────────────────
+;;
+;; A TTL-bounded token carries a `check if time($t), $t < cutoff`. That check
+;; can only evaluate if the authorizer context supplies a `time` fact. Rather
+;; than make every caller remember to thread the clock (a footgun: forget it and
+;; EVERY TTL token silently fails its check), `admit` injects the current time
+;; into the ctx unless the caller already supplied one. A caller that wants a
+;; fixed clock (tests, replay) passes its own `time` fact and this leaves it be.
+
+(defn- has-time-fact? [ctx]
+  (some (fn [t] (= (first t) "time")) (or (:facts ctx) [])))
+
+(defn- with-ambient-time [ctx]
+  (if (has-time-fact? ctx)
+    ctx
+    (let [now (erlang/apply (erlang/binary_to_atom "Elixir.System") :system_time (list :second))]
+      (assoc ctx :facts (into (or (:facts ctx) []) [["time" {:date now}]])))))
+
+;; ── admission ────────────────────────────────────────────────────────
+
+(defn admit
+  "Authorize `token` under `root-pub`, check the principal's per-user ceilings
+   against `policy`, and on success reserve a session: fork a capped, heap-
+   bounded env and register the reservation. Returns {:ok session} where a
+   session is {:user :env :policy :registry :disk 0}, or {:error why}.
+
+   `ctx` is the authorizer context (policies/facts/revocation). `conn` may be
+   nil (no audit) or a datom conn (every admit decision recorded).
+
+   Fails closed: bad signature, revoked, over-quota, or no `user` fact all
+   return {:error …} and fork NOTHING."
+  [registry root-pub token ctx0 policy conn]
+  (let [ctx (with-ambient-time ctx0)
+        caps-r (auth/caps-for root-pub token ctx)]
+    (if (contains? caps-r :error)
+      (do (when conn (auth/record! conn token (:error caps-r) ctx))
+          {:error {:reason (:reason (:error caps-r)) :stage :authorize}})
+      (let [user (user-of root-pub token)]
+        (if (nil? user)
+          {:error {:reason :no-user-fact :stage :identity}}
+          (let [pol (resolve-policy policy user)
+                tally (tally-for registry user)
+                mem-after (+ (:mem-used tally) (:mem-per-session pol))]
+            (if (> mem-after (:mem-per-user pol))
+              {:error {:reason :mem-quota-user :stage :admit
+                       :used (:mem-used tally) :request (:mem-per-session pol)
+                       :ceiling (:mem-per-user pol)}}
+              (let [caps (:ok caps-r)
+                    e (env/fork :global {:caps caps :max-heap-words (:mem-per-session pol)})]
+                (swap! registry
+                  (fn [m]
+                    (let [t (or (get m user) {:mem-used 0 :disk-used 0 :sessions 0})]
+                      (assoc m user (-> t
+                                        (assoc :mem-used mem-after)
+                                        (update :sessions inc))))))
+                (when conn
+                  (auth/record! conn token
+                    (auth/authorize root-pub token ctx) ctx))
+                {:ok {:user user :env e :policy pol :registry registry
+                      :disk (atom 0)}}))))))))
+
+;; ── running code under the session's ceilings ────────────────────────
+
+(defn run
+  "Compile+run `src` in `session`'s capped env, inside a spawned process whose
+   heap is hard-bounded (kill:true). Returns {:ok value} | {:error e}. A cap
+   violation surfaces as a COMPILE error inside the fork; a memory blowout kills
+   the eval process and surfaces as {:error :memory-quota}; the VM is untouched."
+  [session src]
+  ; The eval runs in a spawn_monitor'd child whose heap is hard-bounded; the
+  ; child sends its result THROUGH ITS OWN pid as the message tag, and we
+  ; selective-receive on that exact pid. This matters: `run` may be called from
+  ; a process that is ALSO doing group-leader IO (the SSH shell), whose mailbox
+  ; carries `{io_reply, …}` tuples. A bare 2-tuple receive would match and
+  ; discard those, hanging the shell's IO — so we match only `[child-pid r]`
+  ; and the child's `{:DOWN …}`, leaving every foreign message untouched.
+  (let [parent (erlang/self)
+        e (:env session)
+        words (:mem-per-session (:policy session))
+        spawned
+        (erlang/spawn_monitor
+          (fn []
+            (erlang/process_flag :max_heap_size
+              {:size words :kill true :error_logger false})
+            (env/with-env e
+              (fn []
+                (let [r (try {:ok (env/eval src)}
+                             (catch e {:error {:reason :eval :message (ex-message e)}}))]
+                  (erlang/send parent [(erlang/self) r]))))))
+        child (elem spawned 0)
+        mref (elem spawned 1)]
+    (let [result
+          (receive
+            [child-pid r] (if (= child-pid child) r :__foreign__)
+            [:DOWN dref dtype dpid dreason]
+              (if (= dref mref)
+                {:error {:reason :memory-quota :detail dreason}}
+                :__foreign__)
+            (after 30000 {:error {:reason :timeout}}))]
+      (erlang/demonitor mref (list :flush))
+      result)))
+
+;; ── disk accounting ──────────────────────────────────────────────────
+
+(defn account-write!
+  "Reserve `nbytes` of disk quota for `session`, charging both the session and
+   its user. {:ok new-session-total} when under both ceilings, else
+   {:error {:reason :disk-quota-session|:disk-quota-user …}}. The gate a capped
+   file-write helper calls BEFORE writing — the capability lets a session touch
+   the fs; this bounds how much."
+  [session nbytes]
+  (let [pol (:policy session)
+        reg (:registry session)
+        user (:user session)
+        sess-used (deref (:disk session))
+        sess-after (+ sess-used nbytes)]
+    (if (> sess-after (:disk-per-session pol))
+      {:error {:reason :disk-quota-session :used sess-used
+               :request nbytes :ceiling (:disk-per-session pol)}}
+      (let [utally (tally-for reg user)
+            user-after (+ (:disk-used utally) nbytes)]
+        (if (> user-after (:disk-per-user pol))
+          {:error {:reason :disk-quota-user :used (:disk-used utally)
+                   :request nbytes :ceiling (:disk-per-user pol)}}
+          (do (reset! (:disk session) sess-after)
+              (swap! reg (fn [m]
+                           (let [t (or (get m user) {:mem-used 0 :disk-used 0 :sessions 0})]
+                             (assoc m user (assoc t :disk-used user-after)))))
+              {:ok sess-after}))))))
+
+;; ── teardown ─────────────────────────────────────────────────────────
+
+(defn close
+  "End `session`: destroy its env and release its memory reservation from the
+   user tally (disk stays charged — bytes on disk persist past a session).
+   Idempotent-ish: closing twice double-frees memory, so call once per admit."
+  [registry session]
+  (let [user (:user session)
+        pol (:policy session)]
+    (env/destroy (:env session))
+    (swap! registry
+      (fn [m]
+        (let [t (or (get m user) {:mem-used 0 :disk-used 0 :sessions 0})]
+          (assoc m user (-> t
+                            (update :mem-used (fn [u] (max 0 (- u (:mem-per-session pol)))))
+                            (update :sessions (fn [s] (max 0 (dec s)))))))))
+    :ok))
+
+;; ── introspection (for tests + ops) ──────────────────────────────────
+
+(defn usage
+  "The current {:mem-used :disk-used :sessions} tally for `user` in `registry`."
+  [registry user]
+  (tally-for registry user))

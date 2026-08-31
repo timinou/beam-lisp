@@ -1,0 +1,259 @@
+; executor/ssh.bl — the capped-shell SSH executor, in beam-lisp.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; "ssh into a capped beam-lisp process" — the WHOLE daemon, in bl. An ordinary
+; ssh client connects; OTP terminates the transport; and the `shell` fn here
+; (a bl fn OTP accepts directly, being is_function/1) spawns a process that
+; admits a capped executor.sandbox session and runs a `bl>` read-eval-print loop
+; inside it. Caps are enforced at COMPILE time in the session's env; memory and
+; disk ceilings ride the session; every module the token did not grant is
+; unspeakable.
+;
+; ══ WHY THIS IS 100% BL, ZERO ELIXIR ════════════════════════════════════════
+;
+; The maximalist ethos of web.bl, taken all the way: NO Elixir shim at all. A bl
+; namespace COMPILES TO A REAL BEAM MODULE whose `defn`s are genuine exports
+; (verified: `(defn is_auth_key …)` exports `is_auth_key/3`). So this ns IS the
+; `:ssh_server_key_api` callback module OTP requires — we point `:ssh.daemon`'s
+; `key_cb` at this ns's own module atom, and OTP calls `host_key/2` and
+; `is_auth_key/3` defined below directly. The `shell` option likewise takes a
+; bl fn (a bl fn is is_function/1). ∴ opts, shell, REPL, store, session, AND the
+; public-key callback are all this one file. Nothing in Elixir.
+;
+; The auth callbacks avoid any var that needs an ambient env (they run in OTP's
+; connection-handler process): cross-ns compiled refs (`store/user-for`) and
+; keyword-atoms (`:ssh_file`) resolve without a bound env; a bare `IO`/`inspect`
+; would not, so those appear only in the shell process where we route through
+; def'd module atoms.
+;
+; ══ THE FLOW ════════════════════════════════════════════════════════════════
+;
+;   identity  — SSH public key, authorized by executor.store (KeyCB → is-auth-key)
+;   authority — the store maps the user to a base64 Biscuit exec-token
+;   caps      — auth/sandbox-fork projects the token's rights into the env
+;   limits    — the operator's policy map (memory/disk), NOT token-carried
+;
+;   (serve {:port :system-dir :store :root-pub :policy :registry :conn})
+;     → {:ok daemon-ref}
+
+(ns executor.ssh
+  (:require [executor.sandbox :as sb] [executor.store :as store] [auth]))
+
+(def ^:private IOM (erlang/binary_to_atom "Elixir.IO"))
+(def ^:private KernelM (erlang/binary_to_atom "Elixir.Kernel"))
+
+;; This ns's own BEAM module atom (BeamLisp.Ns.Executor.Ssh) — the module OTP
+;; will call host_key/2 + is_auth_key/3 on. Derived from the ns name the same
+;; way the compiler names it, so no Elixir accessor is needed.
+(defn- cap-seg [s]
+  (str (String/upcase (String/slice s 0 1)) (String/slice s 1 (count s))))
+(def ^:private SELF-MODULE
+  (erlang/binary_to_atom
+    (str "Elixir.BeamLisp.Ns."
+         (join "." (map cap-seg (String/split "executor.ssh" "."))))))
+
+;; IO helpers that resolve IOM as a captured VALUE, not a per-process var — the
+;; shell runs in an OTP-spawned process with no ambient bl env, so a bare `IO`
+;; var would not resolve there. A def'd module atom is captured by the closure.
+;; Same reason `show` uses Elixir's Kernel.inspect rather than bl `inspect`
+;; (a core var that would not resolve in the env-less shell process).
+(defn- puts! [s] (erlang/apply IOM :puts (list s)))
+(defn- gets! [prompt] (erlang/apply IOM :gets (list prompt)))
+(defn- show [v] (erlang/apply KernelM :inspect (list v)))
+
+;; ── option plumbing (erlang proplists are tuples in a list) ──────────
+
+(defn- opt [k v] (erlang/list_to_tuple (list k v)))
+(defn- charlist [s] (erlang/binary_to_list s))
+
+;; ── the REPL: reads a line, hands it to a HANDLER, prints ────────────
+;;
+;; The loop, IO framing, and :quit handling are shared; only "what a line MEANS"
+;; varies. A `handler` is a fn (session, line-string) → output-string. The
+;; default handler is the bl> reader-eval (`bl-handler`); relay injects a bash>
+;; handler that cap-checks then shells out through relay.sandbox. This keeps the
+;; daemon/auth/admit/read-loop in ONE place and makes a new shell kind a fn, not
+;; a fork of the server.
+
+(defn- render [result]
+  (cond
+    (contains? result :ok)    (str "=> " (let [v (:ok result)]
+                                            (if (string? v) v (show v))))
+    (contains? result :error) (str "!! " (show (:error result)))
+    :else (show result)))
+
+(defn bl-handler
+  "The default `bl>` line handler: eval the line in the capped session env and
+   render the {:ok v}|{:error e} result. A cap violation is a compile error
+   inside the fork; memory/disk ceilings ride the session."
+  [session line]
+  (render (sb/run session line)))
+
+; IO.gets over an SSH channel returns a CHARLIST (erlang string), or :eof, or
+; an {:error _} tuple. Normalize a charlist to a binary; anything else ends the
+; loop. (A bl `string?` is false for a charlist, so we must convert, not test.)
+(defn- read-line! [prompt]
+  (let [line (gets! prompt)]
+    (cond
+      (= line :eof) :eof
+      (erlang/is_list line) (erlang/list_to_binary line)
+      (string? line) line
+      :else :eof)))
+
+(defn- repl [session prompt handler]
+  (let [line (read-line! prompt)]
+    (cond
+      (= line :eof) :ok
+      :else
+      (let [src (String/trim line)]
+        (cond
+          (= src "") (repl session prompt handler)
+          (or (= src ":quit") (= src ":q") (= src "(quit)"))
+          (do (puts! "bye") :ok)
+          :else
+          (do (puts! (handler session src))
+              (repl session prompt handler)))))))
+
+;; ── a session: admit under the user's token, run the loop, close ─────
+
+(defn- start-session [user state]
+  (let [token-b64 (store/token-for (:store state) user)
+        prompt (get state :prompt "bl> ")
+        handler (get state :handler bl-handler)
+        ; per-session lifecycle: on-open runs after admit and returns a map
+        ; MERGED onto the session (e.g. a per-session scratch dir); on-close runs
+        ; in the finally with the augmented session (e.g. remove that dir). Both
+        ; default to no-ops, so bl> is unchanged.
+        on-open (or (get state :on-open) (fn [s] {}))
+        on-close (or (get state :on-close) (fn [s] nil))
+        banner (get state :banner
+                    (str "capped session for " user
+                         " — caps enforced at compile time. :quit to exit."))]
+    (if (nil? token-b64)
+      (puts! (str prompt "DENIED: no token for " user))
+      (let [token (auth/decode-base64 token-b64)
+            ctx (auth/context {:policies [(auth/allow [])]})
+            admitted (sb/admit (:registry state) (:root-pub state)
+                               token ctx (:policy state) (:conn state))]
+        (if (contains? admitted :error)
+          (puts! (str prompt "DENIED: " (show (:error admitted))))
+          ; carry the audit conn + verified token INTO the session, so a handler
+          ; (e.g. relay's bash>) can record a datom PER COMMAND, not just per
+          ; admit. nil conn ⇒ no per-command audit, same as admit.
+          (let [base (merge (:ok admitted) {:conn (:conn state) :token token})
+                session (merge base (on-open base))]
+            (puts! (str prompt banner))
+            (try (repl session prompt handler)
+                 (finally (do (on-close session)
+                              (sb/close (:registry state) base))))))))))
+
+;; ── the shell fn OTP calls (bl fn, is_function/1) ────────────────────
+
+(defn- shell-fn [state]
+  (fn [user]
+    (erlang/spawn (fn [] (start-session (erlang/list_to_binary user) state)))))
+
+;; ── :ssh_server_key_api callbacks (this ns IS the key_cb module) ───────
+;;
+;; OTP calls host_key/2 + is_auth_key/3 on the module named in `key_cb`. These
+;; ARE those exports (a bl `defn` compiles to a real BEAM export of the same
+;; name). They run in OTP's connection-handler process with no ambient bl env,
+;; so they use only cross-ns compiled refs + keyword-atoms — never a bare var
+;; that would need env resolution.
+
+;; Reduce an authorized_keys line to `<type> <base64>`, dropping any comment,
+;; so enrollment and the presented-key encoding compare equal.
+(defn- normalize-line [line]
+  (let [parts (String/split (String/trim line) " ")]
+    (if (>= (count parts) 2)
+      (str (nth parts 0) " " (nth parts 1))
+      (String/trim line))))
+
+;; Encode a decoded public key to its canonical authorized_keys line.
+;; :ssh_file.encode wants an erlang list of {Key, Attrs} tuples and returns a
+;; binary; a bl vector is NOT an erlang list, so build the list + tuple by hand.
+(defn- encode-key-line [key]
+  (let [entry (erlang/list_to_tuple (list key (list)))]
+    (normalize-line (erlang/apply :ssh_file :encode (list (list entry) :auth_keys)))))
+
+(defn- opts-get [opts k]
+  (erlang/apply :proplists :get_value (list k opts)))
+
+(defn host_key
+  "Host-key callback — delegates to the stock file backend (host key read from
+   system_dir). We override only authorization, never host-key handling."
+  [algorithm daemon-opts]
+  (erlang/apply :ssh_file :host_key (list algorithm daemon-opts)))
+
+(defn is_auth_key
+  "Authorize a presented public key for `user`. OTP passes our key_cb opts under
+   :key_cb_private. The key must be enrolled + enabled in the store AND owned by
+   the login user (no confused-deputy: alice's key can't authenticate as bob)."
+  [key user daemon-opts]
+  (let [priv (opts-get daemon-opts :key_cb_private)
+        store (opts-get priv :store)
+        line (encode-key-line key)
+        owner (store/user-for store line)]
+    (and (not (nil? owner))
+         (= owner (erlang/list_to_binary user)))))
+
+;; ── the daemon ───────────────────────────────────────────────────────
+
+(defn serve
+  "Start the capped-shell SSH executor. `opts`:
+     :port        int (0 = ephemeral)
+     :ip          erlang ip tuple (default {127,0,0,1})
+     :system-dir  host-key dir (must hold an ssh_host_*_key)
+     :store       an executor.store conn (public-key auth + token lookup)
+     :root-pub    the Biscuit root public key the executor trusts
+     :policy      the resource policy map (memory/disk ceilings)
+     :registry    an executor.sandbox registry (created if absent)
+     :conn        a datom conn for audit, or nil
+     :handler     per-line fn (session, line) → output string (default bl-handler)
+     :prompt      the shell prompt string (default \"bl> \")
+     :banner      the post-admit greeting (default names the compile-time gate)
+   Returns {:ok daemon-ref}."
+  [opts]
+  (let [port (get opts :port 0)
+        ip (get opts :ip (erlang/list_to_tuple (list 127 0 0 1)))
+        system-dir (charlist (:system-dir opts))
+        store (:store opts)
+        registry (or (:registry opts) (sb/registry))
+        state {:store store
+               :root-pub (:root-pub opts)
+               :policy (:policy opts)
+               :registry registry
+               :conn (get opts :conn nil)
+               ; per-line semantics — default bl>; a caller injects a different
+               ; handler + prompt (e.g. relay's bash>) without forking the server.
+               :prompt (get opts :prompt "bl> ")
+               :handler (get opts :handler bl-handler)
+               :banner (get opts :banner nil)
+               ; per-session lifecycle hooks (default no-ops); relay's bash>
+               ; uses these for a per-session scratch dir.
+               :on-open (get opts :on-open nil)
+               :on-close (get opts :on-close nil)}
+        ; key_cb points at THIS ns's own module (host_key/2 + is_auth_key/3 are
+        ; its exports). The store rides in the cb opts; OTP threads it to the
+        ; callbacks under :key_cb_private.
+        key-cb-opts (list (opt :store store)
+                          (opt :system_dir system-dir))
+        daemon-opts
+        (list (opt :system_dir system-dir)
+              (opt :ip ip)
+              (opt :shell (shell-fn state))
+              (opt :auth_methods (charlist "publickey"))
+              (opt :key_cb (erlang/list_to_tuple (list SELF-MODULE key-cb-opts))))]
+    (erlang/apply :ssh :daemon (list port daemon-opts))))
+
+(defn stop
+  "Stop a running daemon."
+  [ref]
+  (erlang/apply :ssh :stop_daemon (list ref)))
+
+(defn port
+  "The bound port of a running daemon."
+  [ref]
+  (let [info (elem (erlang/apply :ssh :daemon_info (list ref)) 1)]
+    (erlang/apply :proplists :get_value (list :port info))))
