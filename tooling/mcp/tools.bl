@@ -1,0 +1,438 @@
+; tooling/mcp/tools.bl — the codebase tools, wired to codebase.bl for real.
+;
+; This is the PROTOTYPE that repoints the MCP surface from a domain library
+; (spell/apps/mcp pointed at Moroccan law) onto beam-lisp's OWN code-as-facts
+; engine (priv/codebase.bl). The claim under test: the three-tool shape
+;
+;     library/list  ·  library/query  ·  proc/run
+;
+; is not law-specific. Repointed at code it becomes
+;
+;     code/list     ·  code/query     ·  code/ask
+;
+; and every mapping survives — including MRTR (input_required): the flow that
+; elicited a legal document's missing params now elicits "which function?" for
+; a code question. Same machinery, different fact space.
+;
+; Design principle (from Anthropic's code-execution-with-MCP, CodeRLM, and
+; LogicLoc, arXiv 2604.16021): the codebase is a FACT DATABASE and the model
+; asks precise questions over it. Only ANSWERS (rows) cross the wire, never
+; whole files. code/query is the datalog escape hatch (max power); code/ask is
+; the ergonomic layer of NAMED questions a coding agent actually asks.
+;
+; NB on correctness: priv/codebase.bl ships `impact`/`reachable` whose datalog
+; leaves the target var unbound — `(reaches ?who ?name)` with ?name free means
+; "?who reaches SOME callee", i.e. every caller, not the callees of a NAMED fn.
+; The ask layer below binds the target via :in (the FEAT-025-safe "filter at
+; the call site" discipline), so `impact of X` is genuinely X's callers.
+
+(ns mcp.tools
+  (:require [codebase]
+            [typed]
+            [datom]
+            [datom.watch]
+            [system.core :as sys]
+            [z3]))
+
+;; ── the mounted codebase (a real fixture: beam-lisp indexing itself) ──
+;;
+;; We dogfood: index priv/codebase.bl and priv/typed.bl — the very engine
+;; answering these questions — into one fact database. "The checker as a
+;; database" (examples/typing/02_codebase_demo.bl, act 2).
+
+(def sigs (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
+
+(def MOUNTED
+  ;; [ns-string source-path] — the files that become facts.
+  [["codebase" "priv/codebase.bl"]
+   ["typed"    "priv/typed.bl"]])
+
+(defn- offset-facts
+  "Shift every :db/id by delta so multiple files never collide. codebase.bl
+   uses fixed id bases per index-source, so two mounts into one conn would
+   otherwise overwrite each other. Entities join by :fn/name / call strings,
+   never by :db/id, so shifting ids is semantically free."
+  [facts delta]
+  (to-list (map (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) facts)))
+
+(defn- mount!
+  "Index every MOUNTED source into one fresh datom conn, id-offset per file."
+  []
+  (let [conn (codebase/connect-codebase)]
+    (reduce (fn [i pair]
+              (let [[ns-str path] pair
+                    src (second (File/read path))
+                    facts (codebase/index-source sigs ns-str src)
+                    delta (* i 1000000)
+                    all (concat (offset-facts (:fn facts) delta)
+                                (offset-facts (:calls facts) delta))]
+                (datom/transact! conn all)
+                (+ i 1)))
+            0 MOUNTED)
+    conn))
+
+(def code-conn (mount!))
+
+;; core callee set for the mounted namespaces — the "always defined" names
+;; (core + each mounted ns's publics) so unknown-callees does not flag them.
+(def core-names
+  (reduce (fn [s pair]
+            (into s (codebase/core-callee-names (first pair))))
+          #{} MOUNTED))
+
+(defn conn [] code-conn)
+
+;; ── helpers ─────────────────────────────────────────────────────────
+
+(defn- keywordize [m]
+  (reduce (fn [out kv] (assoc out (keyword (key kv)) (val kv)))
+          {} (to-list m)))
+
+(defn- manifest [db]
+  {:namespaces (to-list (map first
+                             (sort (into [] (datom/q '[:find ?ns
+                                                       :where [?d :fn/ns ?ns]] db)))))
+   :functions (or (get (get (into [] (datom/q '[:find (count ?d)
+                                                :where [?d :fn/name _]] db)) 0) 0) 0)
+   :calls (or (get (get (into [] (datom/q '[:find (count ?c)
+                                            :where [?c :call/caller _]] db)) 0) 0) 0)})
+
+;; ── tool 1: code/list ───────────────────────────────────────────────
+
+(def code-list-descriptor
+  {:type "object" :properties {} :required []})
+
+(defn code-list-handler [_args]
+  (let [db (datom/db code-conn)
+        m (manifest db)]
+    {:codebases
+     [{:name "beam-lisp"
+       :title "beam-lisp self-index (codebase.bl + typed.bl)"
+       :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
+       :sources (to-list (map second MOUNTED))
+       :entities m
+       :uri "code://beam-lisp/schema"}]}))
+
+;; ── tool 2: code/query (the datalog escape hatch) ───────────────────
+;;
+;; Same in-count discipline as the legal prototype: the query declares its
+;; own :in inputs; we pass exactly what it declares. Rules (%) available for
+;; recursive walks (reaches); a trailing scalar (?target) is threaded from
+;; the `bindings` arg in declaration order.
+
+(def code-query-descriptor
+  {:type "object"
+   :properties
+   {:codebase {:type "string" :description "Codebase name (e.g. beam-lisp)"}
+    :query {:type "array" :description "Datalog query (EDN vector) over fn/call facts"
+            :items {}}
+    :bindings {:type "array"
+               :description "Scalar :in inputs after $ and % (in declaration order)"
+               :items {}}}
+   :required ["query"]})
+
+(defn- in-tokens
+  "The flat symbols the query declares between :in and the next clause
+   keyword — e.g. [$ % ?today]. Empty when :in is absent (implicit [$])."
+  [query-vec]
+  (let [xs (to-list query-vec)]
+    (if (some? (some (fn [x] (= x :in)) xs))
+      (take-while (fn [x] (not (keyword? x)))
+                  (rest (drop-while (fn [x] (not (= x :in))) xs)))
+      [])))
+
+(defn code-query-handler [args]
+  (let [query-raw (get args "query")
+        query-vec (cond
+                    (vector? query-raw) query-raw
+                    (sequential? query-raw) (into [] query-raw)
+                    :else (throw (ex-info "query must be sequential" {})))
+        db (datom/db code-conn)
+        ;; Inputs are positional: $ → the db, % → the REACH rules, every
+        ;; other declared symbol (?target …) is filled from `bindings` in
+        ;; order. This reads the :in clause instead of guessing by arity,
+        ;; so `:in $ ?wanted` binds ?wanted to a scalar and `:in $ % ?t`
+        ;; correctly slots the rules into the % position.
+        toks (in-tokens query-vec)
+        raw-binds (or (get args "bindings") [])
+        user-binds (to-list (if (sequential? raw-binds) raw-binds []))
+        [inputs _]
+        (reduce (fn [[acc rest-binds] tok]
+                  (cond
+                    (= tok '$) [(conj acc db) rest-binds]
+                    (= tok '%) [(conj acc codebase/REACH) rest-binds]
+                    :else [(conj acc (first rest-binds)) (rest rest-binds)]))
+                [[] user-binds]
+                (if (empty? toks) ['$] toks))
+        result (apply datom/q query-vec inputs)]
+    {:codebase (or (get args "codebase") "beam-lisp")
+     :rows (to-list (map to-list result))}))
+
+;; ── tool 3: code/ask (named questions; MRTR for missing target) ─────
+;;
+;; The ergonomic layer. A coding agent does not think in datalog — it asks
+;; "who breaks if I change X", "who calls X", "what does X reach", "which fns
+;; return string", "any arity mismatches", "any unknown callees". Each maps
+;; to one canned, target-bound query. Questions that NEED a target but got
+;; none return input_required (MRTR) — the identical elicitation the legal
+;; prototype used for document params, here asking "which function?".
+
+(def ^:private target-questions #{"impact" "callers" "reachable" "returns-type"})
+(def ^:private nullary-questions #{"arity-mismatches" "unknown-callees"})
+
+(def code-ask-descriptor
+  {:type "object"
+   :properties
+   {:question {:type "string"
+               :description "One of: impact, callers, reachable, returns-type, arity-mismatches, unknown-callees"}
+    :target {:type "string"
+             :description "The function name (or type tag for returns-type) the question is about"}}
+   :required ["question"]})
+
+(defn- rows [q & inputs]
+  (to-list (map to-list (sort (into [] (apply datom/q q (datom/db code-conn) inputs))))))
+
+(defn- answer [question target]
+  (let [db (datom/db code-conn)]
+   (cond
+    ;; who transitively CALLS target — what breaks if target changes.
+    ;; Delegates to the (now target-bound) shipped helper: DRY, and the
+    ;; correctness fix lives in ONE place (priv/codebase.bl), not copied here.
+    (= question "impact")
+    (to-list (map to-list (codebase/impact db target)))
+
+    ;; direct callers of target, with call sites.
+    (= question "callers")
+    (rows '[:find ?caller ?line :in $ ?t
+            :where [?c :call/callee ?t] [?c :call/caller ?caller] [?c :call/line ?line]]
+          target)
+
+    ;; what target transitively reaches (forward call graph).
+    (= question "reachable")
+    (to-list (map to-list (codebase/reachable db target)))
+
+    ;; fns whose return MAY include the given type tag (e.g. "string").
+    (= question "returns-type")
+    (rows '[:find ?name ?src :in $ ?wanted
+            :where [?d :fn/name ?name] [?d :fn/ret-tag ?wanted] [?d :fn/ret-source ?src]]
+          target)
+
+    ;; calls whose callee is defined but never at the called arity.
+    (= question "arity-mismatches")
+    (to-list (map to-list (codebase/arity-mismatches (datom/db code-conn))))
+
+    ;; calls to names never defined / not core / not interop.
+    (= question "unknown-callees")
+    (to-list (map to-list (codebase/unknown-callees (datom/db code-conn) core-names)))
+
+    :else :unknown-question)))
+
+(defn code-ask-handler [args]
+  (let [question (get args "question")
+        target (get args "target")]
+    (cond
+      (and (contains? target-questions question) (nil? target))
+      {:resultType "input_required"
+       :inputRequests
+       [{"method" "elicitation/create"
+         "params" {"message" (str "The '" question "' question needs a target function name.")
+                   "requestedSchema"
+                   {"type" "object"
+                    "properties" {"target" {"type" "string"
+                                            "description" "Function name (or type tag for returns-type)"}}
+                    "required" ["target"]}}}]}
+
+      (not (or (contains? target-questions question)
+               (contains? nullary-questions question)))
+      {:resultType "complete"
+       :isError true
+       :content [{"type" "text"
+                  "text" (str "Unknown question: " (pr-str question)
+                              ". Try one of: impact callers reachable returns-type "
+                              "arity-mismatches unknown-callees")}]}
+
+      :else
+      (let [result (answer question target)]
+        {:resultType "complete"
+         :question question
+         :target target
+         :rows result}))))
+
+;; ── tool 4: code/verify (the PROVER as a tool) ──────────────────────
+;;
+;; "Is this change safe?" answered by a proof, not a vibe. The client sends
+;; the SOURCE of a defserver carrying ^{:invariant …}; system.core proves the
+;; invariant holds for every state and input (z3), and when it does NOT,
+;; synthesizes the weakest guard that repairs it (the checker run backwards).
+;; This is the single-most differentiated coding-agent tool: no other MCP can
+;; return a machine-checked safety verdict + an auto-repair for a state machine.
+;;
+;; The z3 port is opened lazily and memoized in an atom — z3 is a real OS
+;; process, so we pay for it only when the first verify arrives.
+
+(def ^:private z3-port (atom nil))
+
+(defn- port! []
+  (let [p @z3-port]
+    (if (nil? p)
+      (let [np (z3/open)] (reset! z3-port np) np)
+      p)))
+
+(defn- read1 [s] (first (BeamLisp.Reader/read_string s)))
+
+(def code-verify-descriptor
+  {:type "object"
+   :properties
+   {:source {:type "string"
+             :description "Source of a defserver carrying ^{:invariant …} to prove safe"}
+    :repair {:type "boolean"
+             :description "When the invariant fails, synthesize the weakest repairing guard"}}
+   :required ["source"]})
+
+(defn code-verify-handler [args]
+  (let [source (get args "source")
+        want-repair (get args "repair")
+        port (port!)
+        node (read1 source)
+        r (sys/verify-process port node)]
+    (cond
+      ;; nothing to prove (no ^{:invariant} or not translatable) — say so honestly.
+      (not (get r :checked))
+      {:resultType "complete"
+       :verdict "unchecked"
+       :reason (or (get r :reason) "no ^{:invariant} annotation to prove")}
+
+      ;; proven safe.
+      (get r :holds)
+      {:resultType "complete"
+       :verdict "holds"
+       :machine (str (get r :name))}
+
+      ;; invariant violated — return the warnings, and a repair if asked.
+      :else
+      (let [base {:resultType "complete"
+                  :verdict "violated"
+                  :machine (str (get r :name))
+                  :warnings (to-list (map (fn [w]
+                                            {:message (get w :msg)
+                                             :line (get w :line)
+                                             :col (get w :col)})
+                                          (get r :warnings)))}]
+        (if (not (= want-repair true))
+          base
+          (let [rp (sys/repair-process port node)]
+            (assoc base :repairs
+                   (to-list (map (fn [x] {:transition (name (get x :label))
+                                          :guard (get x :guard)})
+                                 (get rp :repairs))))))))))
+
+;; ── tool 5: code/subscribe + code/poll (LIVE fact changes via datom/watch) ─
+;;
+;; MCP 2026-07-28 has subscriptions/listen for live resources. datom's L3
+;; `datom/watch` IS that mechanism, one layer down: give it a pattern of
+;; interest over the fact space and it fires only when a commit matches. The
+;; canonical coding-agent use: "tell me if the function I am editing gains or
+;; loses a caller" — [?c :call/callee <fn>]. This prototype exposes it as a
+;; poll pair (subscribe returns a handle; poll drains what fired) because the
+;; in-process demo has no long-lived listen stream; a real transport wires the
+;; callback straight to subscriptions/listen frames.
+
+(def ^:private subscriptions (atom {}))   ; id → {:watch pid :buf atom}
+(def ^:private sub-counter (atom 0))
+
+(def code-subscribe-descriptor
+  {:type "object"
+   :properties
+   {:callee {:type "string"
+             :description "Fire when a call TO this function is asserted/retracted"}}
+   :required ["callee"]})
+
+(defn code-subscribe-handler [args]
+  (let [callee (get args "callee")
+        buf (atom [])
+        w (datom.watch/watch code-conn [(quote ?c) :call/callee callee]
+            (fn [changes] (swap! buf concat changes)))
+        id (str "sub-" (swap! sub-counter (fn [n] (+ n 1))))]
+    (swap! subscriptions assoc id {:watch w :buf buf :callee callee})
+    {:resultType "complete"
+     :subscription id
+     :interest (str "[?c :call/callee \"" callee "\"]")
+     :note "Fires on a new/removed caller of this fn. Drain with code/poll."}))
+
+(def code-poll-descriptor
+  {:type "object"
+   :properties
+   {:subscription {:type "string" :description "The subscription id from code/subscribe"}}
+   :required ["subscription"]})
+
+(defn code-poll-handler [args]
+  (let [id (get args "subscription")
+        sub (get @subscriptions id)]
+    (if (nil? sub)
+      {:resultType "complete" :isError true
+       :content [{"type" "text" "text" (str "Unknown subscription: " (pr-str id))}]}
+      (let [buf (get sub :buf)
+            drained @buf
+            db (datom/db code-conn)
+            ;; The matched datom is [?e :call/callee <callee>]; its :v is the
+            ;; CALLEE, not the caller. The caller is a sibling datom on the same
+            ;; call entity :e — resolve it so the event names who added the call.
+            caller-of (fn [e]
+                        (let [r (into [] (datom/q '[:find ?caller :in $ ?e
+                                                    :where [?e :call/caller ?caller]]
+                                                  db e))]
+                          (if (empty? r) nil (first (first r)))))]
+        (reset! buf [])
+        {:resultType "complete"
+         :subscription id
+         :events (to-list (map (fn [c] {:caller (caller-of (get c :e))
+                                        :callee (str (get c :v))
+                                        :added (get c :added)})
+                               drained))}))))
+
+;; A test seam: assert a call fact into the live conn so the demo can show a
+;; subscription firing. Real callers commit through their own edits; this is
+;; the in-process equivalent of "someone added a call to your fn".
+(defn assert-call! [caller callee arity line]
+  (datom/transact! code-conn
+    [{:db/id (+ 9000000 (swap! sub-counter (fn [n] (+ n 1))))
+      :call/caller caller :call/callee callee
+      :call/arity arity :call/line line}]))
+
+;; ── registry (identical shape to the legal prototype) ───────────────
+
+(def tools
+  [["code/list"
+    "List mounted codebases and their manifests (namespaces, fn/call counts)"
+    code-list-descriptor
+    code-list-handler]
+   ["code/query"
+    "Datalog over a codebase's fn/call facts (rules available for reachability)"
+    code-query-descriptor
+    code-query-handler]
+   ["code/ask"
+    "Ask a named question about the code; elicits the target fn if missing (MRTR)"
+    code-ask-descriptor
+    code-ask-handler]
+   ["code/verify"
+    "Prove a defserver's ^{:invariant} holds (z3); synthesize a repair if it fails"
+    code-verify-descriptor
+    code-verify-handler]
+   ["code/subscribe"
+    "Watch the fact space: fire when a fn gains/loses a caller (datom L3 watch)"
+    code-subscribe-descriptor
+    code-subscribe-handler]
+   ["code/poll"
+    "Drain the events a subscription has accumulated since the last poll"
+    code-poll-descriptor
+    code-poll-handler]])
+
+(defn tool-by-name [name]
+  (first (filter (fn [t] (= name (first t))) tools)))
+
+(defn tools-list []
+  (to-list
+    (map (fn [t]
+           (let [[name desc schema _] t]
+             {:name name :description desc :inputSchema schema}))
+         tools)))
