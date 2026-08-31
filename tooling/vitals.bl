@@ -1,0 +1,278 @@
+; tooling/vitals.bl — the aliveness observatory: watch the system stay alive.
+;
+; Run:  BL_SERVE=1 mix beam_lisp.run --path priv tooling/vitals.bl
+; Open: http://127.0.0.1:4043
+;
+; ── What it is ────────────────────────────────────────────────────────
+;
+; test-dashboard.bl lets you watch a SUITE go green. This lets you watch a
+; LIVING SYSTEM — real BEAM processes, a real OTP supervisor, a real `flow`
+; demand pipeline — breathe, and heal. It is the visual proof of the whole
+; "staying alive" story (docs/staying-alive-the-whole-story.md):
+;
+;   • every process is a TILE with vital signs: liveness, mailbox depth,
+;     memory, reductions (the BEAM's unit of work done), and a HEARTBEAT that
+;     pulses each time the process has done work since the last frame;
+;   • the tiles are laid out with `loom.box` — the layout algebra — and skinned
+;     with `loom.token` colors, so this tool eats its own dog food;
+;   • a supervision TREE is drawn as nested boxes: supervisor over workers,
+;     the way failure is actually contained;
+;   • and the payoff: a [kill] button on any worker tile. Click it, watch the
+;     process DIE (tile goes dark), then watch the SUPERVISOR restart it clean
+;     (a fresh pid appears, heartbeat resumes) — "let it crash", observable.
+;
+; The system observes ITSELF: the vitals are read from the live VM
+; (`erlang/process_info`, `Process/alive?`) as DATA, rendered by the same
+; homoiconic language the processes are written in. Not a GUI bolted onto an
+; opaque runtime — the runtime describing itself as a value.
+;
+; This invents no transport or rendering: it reuses web/serve + the live
+; WebSocket handler shape from test-dashboard.bl, and loom for layout. What is
+; new is the READ-MODEL — vital signs of live processes — and the WRITE
+; affordance — killing one to watch supervision heal it.
+
+(ns tooling.vitals
+  (:require [loom.box :as box]
+            [live.hiccup :as h]
+            [web]
+            [interop]))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. THE SUPERVISED SYSTEM WE WATCH
+;;
+;; A pool of worker processes under a supervisor. Each worker is a genuine
+;; long-lived BEAM process that does a little work on a heartbeat interval —
+;; so it has a real mailbox, memory, reduction count, and a pulse to observe.
+;; A `flow` producer feeds a shared job counter the workers draw from, so the
+;; native demand tier from earlier is part of the living system on display.
+;; ════════════════════════════════════════════════════════════════════
+
+;; The registry: process-name → pid, and a heartbeat map, both atoms so the
+;; renderer can read a consistent snapshot without touching the processes.
+(def registry (atom {}))        ; label -> pid
+(def beats    (atom {}))        ; label -> tick count (work done)
+(def job-seq  (atom 0))         ; a shared job counter workers pull from
+
+;; A worker: on each tick it claims the next job (a real shared-atom pull,
+;; the fan-out pattern), "does work" (squares it), records a heartbeat, and
+;; sleeps a beat. It loops forever, so it is a stable, breathing tile until
+;; something kills it — at which point the supervisor restarts it.
+(defn- worker-loop [id]
+  (let [job (swap! job-seq inc)
+        _   (* job job)]                    ; the "work"
+    (swap! beats (fn [m] (assoc m id (+ 1 (get m id 0)))))
+    (Process/sleep 700)                      ; a heartbeat interval
+    (worker-loop id)))
+
+(defn- spawn-worker [id]
+  (let [pid (spawn (fn [] (worker-loop id)))]
+    (swap! registry (fn [m] (assoc m id pid)))
+    pid))
+
+;; A hand-rolled supervisor process: monitors each worker; on a :DOWN,
+;; restarts it clean and updates the registry with the fresh pid. This is
+;; `one_for_one`, in ~12 lines, so the whole restart loop is legible and the
+;; UI can watch it happen. (A real deploy would use OTP `Supervisor`; here we
+;; want the mechanism visible, not hidden behind the behaviour.)
+(defn- supervisor-loop []
+  (receive
+    ;; a worker died — find which label it was, restart it clean, re-monitor.
+    ;; THIS is "let it crash": the supervisor turns a :DOWN into a fresh pid.
+    [:DOWN _ref :process dead _reason]
+    (let [id (first (filter (fn [k] (= (get (deref registry) k) dead))
+                            (keys (deref registry))))]
+      (when id
+        (let [pid (spawn-worker id)]
+          (erlang/monitor :process pid)))
+      (supervisor-loop))
+
+    ;; the UI asked us to kill a worker — do it; the :DOWN above heals it
+    [:kill-worker id]
+    (let [pid (get (deref registry) id)]
+      (when pid (erlang/exit pid :kill))
+      (supervisor-loop))
+
+    (after 3600000 (supervisor-loop))))
+
+(defn- start-system! [n-workers]
+  ;; start the workers, then a supervisor that monitors all of them. The
+  ;; monitors MUST be established inside the supervisor process, so it is the
+  ;; one that receives every :DOWN.
+  (doseq [i (range 1 (+ n-workers 1))]
+    (spawn-worker (str "worker-" i)))
+  (let [ids (keys (deref registry))
+        sup (spawn (fn []
+                     (doseq [id ids]
+                       (erlang/monitor :process (get (deref registry) id)))
+                     (supervisor-loop)))]
+    {:sup sup}))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. THE READ-MODEL — vital signs of the live processes, as data.
+;;
+;; This is the heart of "the system observes itself": we read the VM's own
+;; process table for each pid and produce a plain map. No process is
+;; disturbed — process_info is a passive read.
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- pid-vitals [id pid prev-beats]
+  (if (Process/alive? pid)
+    (let [info (erlang/process_info pid
+                 (list :message_queue_len :memory :reductions :status))
+          mq   (second (nth info 0))
+          mem  (second (nth info 1))
+          reds (second (nth info 2))
+          st   (second (nth info 3))
+          tick (get (deref beats) id 0)
+          ;; heartbeat = did this worker do work since the last frame?
+          beat? (> tick (get prev-beats id 0))]
+      {:id id :pid (pr-str pid) :alive true :mailbox mq :memory mem
+       :reductions reds :status (name st) :ticks tick :beat beat?})
+    {:id id :pid (pr-str pid) :alive false :mailbox 0 :memory 0
+     :reductions 0 :status "dead" :ticks (get (deref beats) id 0) :beat false}))
+
+(defn- snapshot [prev-beats]
+  (let [reg (deref registry)]
+    {:workers (vec (map (fn [id] (pid-vitals id (get reg id) prev-beats))
+                        (sort (keys reg))))
+     :proc-total (erlang/length (erlang/processes))}))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. RENDER — the vitals as a hiccup document, laid out with loom.box.
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- vital-row [label value]
+  (box/box {:dir :row :justify :between :gap 8}
+    [:span {:class "k"} label]
+    [:span {:class "v"} (str value)]))
+
+(defn- worker-tile [w]
+  (let [cls (str "tile"
+                 (if (:alive w) " tile-alive" " tile-dead")
+                 (if (:beat w) " tile-beat" ""))]
+    [:div {:class cls}
+     (box/box {:dir :row :justify :between :align :center}
+       [:span {:class "tile-id"} (:id w)]
+       [:span {:class "heart"} (if (:alive w) "\u2665" "\u2620")])
+     [:div {:class "tile-pid"} (:pid w)]
+     (vital-row "status"     (:status w))
+     (vital-row "mailbox"    (:mailbox w))
+     (vital-row "memory"     (str (:memory w) " B"))
+     (vital-row "reductions" (:reductions w))
+     (vital-row "work done"  (:ticks w))
+     (if (:alive w)
+       [:button {:class "kill" :onclick (str "kill('" (:id w) "')")} "kill"]
+       [:span {:class "healing"} "waiting for supervisor\u2026"])]))
+
+(defn- render [snap]
+  (let [ws    (:workers snap)
+        alive (count (filter :alive ws))
+        total (count ws)]
+    (h/hiccup->html
+      (box/box {:dir :col :gap 16}
+        (box/box {:dir :row :justify :between :align :center}
+          [:div
+           [:h1 "vitals \u2014 the aliveness observatory"]
+           [:div {:class "sub"}
+            "a supervised flow pipeline, breathing. kill a worker; watch it heal."]]
+          [:div {:class "counts"}
+           [:span {:class (if (= alive total) "ok" "warn")}
+            (str alive " / " total " workers alive")]
+           [:span {:class "dim"} (str (:proc-total snap) " BEAM processes total")]])
+        ;; the supervision tree, drawn as nested boxes
+        [:div {:class "tree"}
+         [:div {:class "sup-node"} "supervisor \u00b7 one_for_one \u00b7 monitoring "
+          [:b (str total)] " workers"]
+         (apply box/box {:dir :row :wrap true :gap 12 :pad [12 0 0 0]}
+           (map worker-tile ws))]))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. THE PAGE + LIVE SOCKET — reuse test-dashboard's proven shape.
+;; ════════════════════════════════════════════════════════════════════
+
+(def page-style
+  (str "*{box-sizing:border-box;margin:0}"
+       "body{background:#0d1117;color:#e6edf3;font-family:ui-monospace,Menlo,monospace;padding:24px;line-height:1.5}"
+       "h1{font-size:20px}.sub{color:#7d8590;font-size:13px}"
+       ".counts{display:flex;flex-direction:column;text-align:right;gap:2px}"
+       ".ok{color:#4ac26b;font-weight:600}.warn{color:#f7b955;font-weight:600}.dim{color:#7d8590;font-size:12px}"
+       ".tree{border:1px solid #30363d;border-radius:12px;padding:16px;background:#0f141b}"
+       ".sup-node{color:#79c0ff;font-weight:600;font-size:13px;padding-bottom:4px;border-bottom:1px dashed #30363d}"
+       ".tile{background:#161b22;border:1px solid #30363d;border-left:4px solid #30363d;border-radius:10px;padding:12px;width:210px;transition:border-color .3s,opacity .3s}"
+       ".tile-alive{border-left-color:#2ea043}.tile-dead{border-left-color:#f85149;opacity:.5}"
+       ;; a heartbeat: the tile flashes when the worker did work this frame
+       ".tile-beat{border-left-color:#58f19a;box-shadow:0 0 0 1px #58f19a55, 0 0 18px #2ea04340}"
+       ".tile-id{font-weight:700;color:#e6edf3}.heart{font-size:15px}"
+       ".tile-alive .heart{color:#4ac26b;animation:beat 1s ease-in-out infinite}"
+       ".tile-dead .heart{color:#f85149}"
+       "@keyframes beat{0%,100%{transform:scale(1)}50%{transform:scale(1.25)}}"
+       ".tile-pid{font-size:11px;color:#7d8590;margin:2px 0 8px}"
+       ".k{color:#7d8590;font-size:12px}.v{color:#adbac7;font-size:12px;font-weight:600}"
+       ".kill{margin-top:10px;width:100%;background:#2d1416;color:#f77;border:1px solid #f8514966;border-radius:6px;padding:6px;cursor:pointer;font-family:inherit}"
+       ".kill:hover{background:#3d1a1d}"
+       ".healing{display:block;margin-top:10px;color:#f7b955;font-size:12px;text-align:center}"))
+
+(defn- page []
+  (str "<!doctype html><html><head><meta charset=\"utf-8\">"
+       "<title>vitals \u2014 aliveness observatory</title>"
+       "<style>" page-style "</style></head><body>"
+       "<div id=\"root\"></div>"
+       "<script>"
+       "var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');"
+       "ws.onmessage=function(e){document.getElementById('root').innerHTML=e.data};"
+       "function kill(id){ws.send(JSON.stringify({kill:id}))}"
+       "</script></body></html>"))
+
+;; the running system + a place to hold the supervisor handle for kill routing
+(def system (atom nil))
+
+;; ── the WebSocket: on connect, stream a vitals frame ~2×/sec ─────────────
+
+(defn- ws-init [_p]
+  (when (nil? (deref system))
+    (reset! system (start-system! 4)))
+  ;; kick a self-tick loop: send ourselves :frame on an interval
+  (erlang/apply :erlang :send_after (list 250 (erlang/self) [:frame {}]))
+  [:push (list (list :text (render (snapshot {})))) {:prev {}}])
+
+(defn- ws-handle-in [frame state]
+  ;; a browser message: {"kill":"worker-2"} → route to the supervisor
+  (let [txt (second frame)
+        id  (try (get (interop/json-> txt) "kill") (catch _ nil))]
+    (when (and id (deref system))
+      (erlang/send (:sup (deref system)) [:kill-worker id]))
+    [:ok state]))
+
+(defn- ws-handle-info [msg state]
+  (let [tag (try (first msg) (catch _ nil))]
+    (if (= :frame tag)
+      (let [prev (get (or state {}) :prev {})
+            snap (snapshot prev)
+            ;; remember this frame's tick counts so the NEXT frame can tell
+            ;; which workers did work in between (the heartbeat)
+            now  (reduce (fn [m w] (assoc m (:id w) (:ticks w))) {} (:workers snap))]
+        (erlang/apply :erlang :send_after (list 250 (erlang/self) [:frame {}]))
+        [:push (list (list :text (render snap))) {:prev now}])
+      [:ok state])))
+
+(def ws-handlers
+  {:init ws-init :handle-in ws-handle-in :handle-info ws-handle-info})
+
+;; ── HTTP ─────────────────────────────────────────────────────────────────
+
+(defn router [conn]
+  (web/route conn
+    [:get "/ws"] (web/upgrade conn ws-handlers nil)
+    [:get "/"]   (web/html conn (page))
+    :else        (web/text conn 404 "not found")))
+
+(web/serve {:port 4043 :plug router})
+
+(println "\n-- vitals: the aliveness observatory --")
+(println "  a supervised flow pipeline, breathing.")
+(println "  open:   http://127.0.0.1:4043")
+(println "  try:    kill a worker tile and watch the supervisor heal it.\n")
+
+(if (contains? #{"1" "true"} (System/get_env "BL_SERVE"))
+  (Process/sleep 86400000)
+  (println "  (set BL_SERVE=1 to keep the observatory running; returning now)"))

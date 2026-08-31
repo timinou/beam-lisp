@@ -1,0 +1,190 @@
+; clojure/core/async/impl.bl — the push-CSP channel engine.
+;
+; ══ WHAT THIS IS, AND IS NOT ════════════════════════════════════════════════
+;
+; This is core.async's PRIVATE implementation, not native beam-lisp furniture.
+; It sits under the core.async compat tree exactly as `specter.engine` sits
+; under the specter tree: a compat library's engine, filed with the library it
+; serves. `clojure.core.async` (../async.bl) is a thin renaming skin over the
+; functions here; nothing else should require this module.
+;
+; It implements PUSH-CSP channels (Hoare/Go/Clojure style): a producer `put!`s
+; a value and blocks when a bounded buffer is full. That model exists here for
+; ONE reason — to run unmodified Clojure `core.async` source. A native
+; beam-lisp author does NOT reach for it, because the BEAM already covers every
+; job it does, better:
+;
+;   • bounded producer/consumer  → `flow` (priv/flow.bl): demand-driven PULL,
+;                                  strictly better backpressure (the producer
+;                                  structurally cannot outrun the consumer;
+;                                  no buffer to size). THIS is the native tier.
+;   • select + timeout           → selective `receive` + `(after ms …)`, which
+;                                  is native AND stronger (this file's `select`
+;                                  is not even linearizable across two ready
+;                                  data channels — see its docstring).
+;   • request/reply              → `defserver`/`gen_server`.
+;   • handoff / rendezvous       → bare `send`/`receive`.
+;
+; So push-CSP has essentially no native audience on this VM. It is kept purely
+; as the substrate the Clojure compat shim skins over. For the native story see
+; priv/flow.bl (demand streaming) and the async-channels README's "Three tiers".
+;
+; A channel is a process holding a bounded buffer + parked-waiter lists, served
+; by a receive loop. Client ops (`put!`/`take!`/`close!`/`select`) send it a
+; message and await one reply, correlated by an `erlang/make_ref` tag (needed
+; because beam-lisp `receive` rebinds pattern vars rather than pinning them).
+;
+; A channel is a process. Its state is a map:
+;   {:cap n :buf (v …) :puts ([v from ref] …) :takes ([from ref] …) :closed bool}
+
+(ns clojure.core.async.impl)
+
+;; ─────────────────────────────────────────────────────────────────────
+;; The channel actor — one process running this receive loop IS a channel.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn handle-put [s v from ref]
+  (cond
+    (:closed s)
+    (do (erlang/send from [:put-done ref false]) s)
+
+    ;; a taker is already waiting → hand the value straight across
+    (seq (:takes s))
+    (let [[tfrom tref] (first (:takes s))]
+      (erlang/send tfrom [:take-done tref v])
+      (erlang/send from [:put-done ref true])
+      (assoc s :takes (rest (:takes s))))
+
+    ;; room in the buffer → store and let the putter continue
+    (< (count (:buf s)) (:cap s))
+    (do (erlang/send from [:put-done ref true])
+        (assoc s :buf (concat (:buf s) (list v))))
+
+    ;; buffer full (or unbuffered) → block this putter
+    :else
+    (assoc s :puts (concat (:puts s) (list [v from ref])))))
+
+(defn handle-take [s from ref]
+  (cond
+    ;; buffered value → deliver, then slide a blocked putter into the slot
+    (seq (:buf s))
+    (let [v  (first (:buf s))
+          s1 (assoc s :buf (rest (:buf s)))]
+      (erlang/send from [:take-done ref v])
+      (if (seq (:puts s1))
+        (let [[pv pfrom pref] (first (:puts s1))]
+          (erlang/send pfrom [:put-done pref true])
+          (assoc s1 :puts (rest (:puts s1)) :buf (concat (:buf s1) (list pv))))
+        s1))
+
+    ;; unbuffered rendezvous: hand a blocked putter's value directly across
+    (seq (:puts s))
+    (let [[pv pfrom pref] (first (:puts s))]
+      (erlang/send pfrom [:put-done pref true])
+      (erlang/send from [:take-done ref pv])
+      (assoc s :puts (rest (:puts s))))
+
+    ;; closed and empty → take returns nil forever
+    (:closed s)
+    (do (erlang/send from [:take-done ref nil]) s)
+
+    ;; nothing available → block this taker
+    :else
+    (assoc s :takes (concat (:takes s) (list [from ref])))))
+
+(defn handle-close [s]
+  (doseq [t (:takes s)]
+    (let [[tfrom tref] t] (erlang/send tfrom [:take-done tref nil])))
+  (doseq [p (:puts s)]
+    (let [[pv pfrom pref] p] (erlang/send pfrom [:put-done pref false])))
+  (assoc s :closed true :takes (list) :puts (list)))
+
+(defn handle-cancel [s ref]
+  (assoc s
+    :takes (remove (fn [t] (let [[_ r] t] (= r ref))) (:takes s))
+    :puts  (remove (fn [p] (let [[_ _ r] p] (= r ref))) (:puts s))))
+
+(defn chan-loop [s]
+  (receive
+    [:put v from ref]  (chan-loop (handle-put s v from ref))
+    [:take from ref]   (chan-loop (handle-take s from ref))
+    [:cancel ref]      (chan-loop (handle-cancel s ref))
+    [:close from ref]  (let [s2 (handle-close s)]
+                         (erlang/send from [:close-done ref])
+                         (chan-loop s2))
+    [:inspect from ref] (do (erlang/send from [:inspect-done ref s]) (chan-loop s))))
+
+;; ─────────────────────────────────────────────────────────────────────
+;; Native API — 9 functions. This is the whole model.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn chan
+  "A channel. (chan) is unbuffered (every put rendezvous with a take);
+   (chan n) buffers up to n values before puts block."
+  ([]  (chan 0))
+  ([n] (spawn (fn [] (chan-loop {:cap n :buf (list) :puts (list) :takes (list) :closed false})))))
+
+(defn put!
+  "Put v on ch, blocking the calling process until accepted. Returns true,
+   or false if the channel was closed. (On the BEAM 'blocking' means the
+   scheduler parks this process — cheap, not a held OS thread.)"
+  [ch v]
+  (let [ref (erlang/make_ref) me (erlang/self)]
+    (erlang/send ch [:put v me ref])
+    (receive [:put-done r ok] ok)))
+
+(defn take!
+  "Take a value from ch, blocking until one is available. Returns nil when
+   the channel is closed and drained."
+  [ch]
+  (let [ref (erlang/make_ref) me (erlang/self)]
+    (erlang/send ch [:take me ref])
+    (receive [:take-done r v] v)))
+
+(defn close!
+  "Close ch. Pending takers get nil; pending putters get false; further
+   puts fail and further takes drain the buffer then return nil."
+  [ch]
+  (let [ref (erlang/make_ref) me (erlang/self)]
+    (erlang/send ch [:close me ref])
+    (receive [:close-done r] true)))
+
+(defn timeout
+  "A channel that closes after ms milliseconds — taking from it blocks ~ms
+   then yields nil. The idiomatic timer for `select`."
+  [ms]
+  (let [c (chan 0)]
+    (spawn (fn [] (Process/sleep ms) (close! c)))
+    c))
+
+(defn select
+  "Wait on several operations; the first ready wins. `ops` entries are
+   either `ch` (a take) or `[ch v]` (a put). Returns [value winning-ch].
+   This is a selective receive over all pending requests — the BEAM does
+   the arbitration the JVM's core.async needs a shared commit flag for.
+
+   CAVEAT: not linearizable across two ready *data* channels (a losing
+   branch can consume-and-drop in the race window before its cancel lands).
+   The race-free shape is data-channel vs `timeout` (a timeout only closes,
+   consuming nothing)."
+  [ops]
+  (let [me (erlang/self)
+        ;; EAGER: `map` is lazy; the (erlang/send …) side effects MUST fire
+        ;; before the receive parks us, so force with `vec`.
+        entries (vec (map (fn [op]
+                            (let [ref (erlang/make_ref)]
+                              (if (vector? op)
+                                (let [[ch v] op]
+                                  (erlang/send ch [:put v me ref])
+                                  {:ref ref :ch ch})
+                                (do (erlang/send op [:take me ref])
+                                    {:ref ref :ch op}))))
+                          ops))
+        result (receive
+                 [:take-done r v]  {:r r :val v}
+                 [:put-done  r ok] {:r r :val ok})
+        winner (first (filter (fn [e] (= (:ref e) (:r result))) entries))]
+    (doseq [e entries]
+      (if (not (= (:ref e) (:r result)))
+        (erlang/send (:ch e) [:cancel (:ref e)])))
+    [(:val result) (:ch winner)]))

@@ -1,0 +1,298 @@
+; flow.bl — demand-driven streaming, the uncompromisingly BEAM-native way.
+;
+; ══ THE INVERSION ═══════════════════════════════════════════════════════════
+;
+; core.async (and priv/channels.bl, its CSP cousin) is PUSH: a producer puts
+; values into a buffer and blocks when the buffer fills. Backpressure is a
+; SIDE EFFECT of a bounded buffer — you feel it only once the buffer is full,
+; and the buffer is a guess (how big? too small stalls, too big hides latency
+; and eats memory under load).
+;
+; The BEAM's own answer — GenStage — is the opposite, and it is the model this
+; file implements: PULL. A consumer asks for N events ("demand"); a producer is
+; FORBIDDEN to send more than has been demanded. Backpressure is not a buffer
+; filling up; it is the STRUCTURE of the protocol. A slow consumer simply
+; demands slower, and the producer — by contract — cannot outrun it. No buffer
+; to size, no memory blowup under load, no dropped events. This is why every
+; serious BEAM data pipeline (Broadway, Flow, the whole Dashbit stack) is
+; GenStage-shaped and not channel-shaped.
+;
+;   PUSH (core.async / its CSP engine)  PULL (flow — this file)
+;   ─────────────────────────────       ──────────────────────────────
+;   producer decides the rate           CONSUMER decides the rate
+;   buffer absorbs the mismatch         no mismatch is possible
+;   backpressure = buffer-full stall    backpressure = unfilled demand
+;   size the buffer (a guess)           nothing to size
+;
+; ══ THE SHAPE ═══════════════════════════════════════════════════════════════
+;
+; Three roles, each a process:
+;   • a PRODUCER      emits events only in response to demand
+;   • a CONSUMER      subscribes upstream, issues demand, handles events
+;   • a PRODUCER-CONSUMER  does both: demands from upstream, is demanded from
+;                          downstream, transforms in between
+;
+; The wire protocol between a consumer C and its producer P:
+;   C -> P   [:subscribe C]                register downstream
+;   C -> P   [:demand n]                   "I can handle n more events"
+;   P -> C   [:events (e …)]               here are up-to-n events
+;   P -> C   [:done]                       stream is exhausted, no more coming
+;
+; A producer keeps a running `demand` counter per subscriber and a generator of
+; events. It emits min(demand, available) events, decrements demand, and goes
+; quiet until more demand arrives. THAT quiet is the backpressure — it costs
+; nothing and cannot overflow.
+;
+; ══ WHY THIS IS THE NATIVE TIER ═════════════════════════════════════════════
+;
+; This owes nothing to Clojure. There is no `<!`/`<!!`, no `go`, no CSP
+; rendezvous — those are core.async's vocabulary, and core.async is the COMPAT
+; shim (priv/clojure/core/async.bl), a skin for running Clojure source. This
+; file is the beam-lisp concurrency model a native author reaches for: demand,
+; subscription, transform stages — the GenStage algebra, in lisp.
+
+(ns flow)
+
+;; ─────────────────────────────────────────────────────────────────────
+;; PRODUCER — emits events only up to the demand it has been given.
+;;
+;; `gen` is a stateful generator: (gen state) -> [events' state'] | :halt,
+;; where events' is a list of AT MOST the requested count. A producer never
+;; buffers ahead; it computes events lazily, on demand, and only as many as
+;; asked. This is the crux — the producer is structurally incapable of
+;; outrunning its consumer.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- producer-loop [gen gstate demand sub]
+  (receive
+    ;; a downstream stage subscribed to us
+    [:subscribe c]
+    (producer-loop gen gstate demand c)
+
+    ;; downstream can handle `n` more events → try to satisfy from the gen
+    [:demand n]
+    (let [total (+ demand n)
+          step  (gen gstate total)]
+      (if (= step :halt)
+        (do (when sub (erlang/send sub [:done])) :stopped)
+        (let [[events gstate2] step
+              k (count events)]
+          (when (and sub (seq events))
+            (erlang/send sub [:events events]))
+          ;; carry any demand the gen could not yet fill
+          (producer-loop gen gstate2 (- total k) sub))))
+
+    [:cancel] :stopped
+
+    (after 3600000 (producer-loop gen gstate demand sub))))
+
+(defn producer
+  "Spawn a demand-driven producer. `gen` is (fn [state max] -> [events state']
+   | :halt): return at most `max` events and the next state, or :halt when the
+   stream is exhausted. The producer emits ONLY what downstream demands."
+  [gen init]
+  (spawn (fn [] (producer-loop gen init 0 nil))))
+
+;; A convenience producer over a finite collection — the `range`/seq source.
+(defn from-seq
+  "A producer that emits the elements of `coll`, at most `max` per demand,
+   then signals :done. The canonical finite source."
+  [coll]
+  (producer
+    (fn [remaining max]
+      (if (empty? remaining)
+        :halt
+        [(take max remaining) (drop max remaining)]))
+    (seq coll)))
+
+;; ─────────────────────────────────────────────────────────────────────
+;; PRODUCER-CONSUMER — the transform stage. Demands from upstream, is
+;; demanded from downstream, maps `f` over events in between. Demand flows
+;; UP (downstream's demand becomes our demand on upstream); events flow
+;; DOWN (upstream's events, transformed, become ours). This is the whole
+;; point of a demand pipeline: backpressure propagates end to end for free.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- pc-loop [xform up sub]
+  (receive
+    [:subscribe c]
+    (do (erlang/send up [:subscribe (erlang/self)])
+        (pc-loop xform up c))
+
+    ;; downstream demand → demand the same upstream (1:1 for map; a filter
+    ;; would demand more, a flatMap fewer — xform decides via its own stage)
+    [:demand n]
+    (do (erlang/send up [:demand n])
+        (pc-loop xform up sub))
+
+    ;; upstream events → transform, forward down
+    [:events events]
+    (let [out (xform events)]
+      (when (and sub (seq out))
+        (erlang/send sub [:events out]))
+      (pc-loop xform up sub))
+
+    [:done]
+    (do (when sub (erlang/send sub [:done])) :stopped)
+
+    [:cancel] (do (erlang/send up [:cancel]) :stopped)
+
+    (after 3600000 (pc-loop xform up sub))))
+
+(defn transform
+  "A producer-consumer stage: subscribes to `up`, applies `xform` (a fn from a
+   LIST of events to a list of events — so it can map, filter, or expand) and
+   forwards downstream. Demand propagates upstream automatically."
+  [up xform]
+  (let [pc (spawn (fn [] (pc-loop xform up nil)))]
+    pc))
+
+;; sugar: element-wise map and filter stages built on `transform`
+(defn map-stage    [up f]    (transform up (fn [events] (vec (map f events)))))
+(defn filter-stage [up pred] (transform up (fn [events] (vec (filter pred events)))))
+
+;; ─────────────────────────────────────────────────────────────────────
+;; MULTI-RATE stage — where demand stops being 1:1 and becomes ARITHMETIC.
+;;
+;; `transform` above forwards demand 1:1: downstream asks for n, it asks
+;; upstream for n. That is correct ONLY when the stage emits exactly one
+;; event per input (a `map`). The moment the rate changes, 1:1 breaks the
+;; demand contract in one of two ways:
+;;
+;;   • EXPANDING (flatMap): one input → many outputs. If downstream demands
+;;     3 and we demand 3 upstream, a ×3 expansion emits 9 — THREE TIMES the
+;;     demand. We just overran the consumer we promised never to overrun.
+;;
+;;   • CONTRACTING (filter/batch): one input → sometimes zero outputs. If
+;;     downstream demands 3 and we demand 3 upstream but 2 are dropped,
+;;     downstream gets 1 and then STARVES — we under-delivered and stalled.
+;;
+;; The fix is the crux of the GenStage algebra: a multi-rate stage cannot
+;; pass demand through untouched. It must (1) meter its OUTPUT against the
+;; outstanding downstream demand, delivering at most that many, (2) BUFFER
+;; any surplus it produced, and (3) pull upstream, in its own chunks, only
+;; when its buffer runs dry and downstream still wants more. Demand and
+;; supply are reconciled by a little state machine — this is what a channel
+;; fundamentally cannot express, because a channel has no notion of demand
+;; to do arithmetic on.
+;;
+;; State: {:buf undelivered-outputs  :want outstanding-downstream-demand
+;;         :up-out outstanding-upstream-demand  :done? upstream-finished}
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- mr-flush
+  "Deliver min(buffered, wanted) events downstream; if upstream is done and
+   the buffer has drained, propagate :done. Returns [buf' want']."
+  [buf want sub done?]
+  (let [k (min (count buf) want)]
+    (when (> k 0)
+      (erlang/send sub [:events (take k buf)]))
+    (let [buf2 (drop k buf) want2 (- want k)]
+      (when (and done? (empty? buf2))
+        (erlang/send sub [:done]))
+      [buf2 want2])))
+
+(defn- mr-pull
+  "If the buffer cannot satisfy outstanding demand and upstream is neither
+   done nor already working, ask upstream for one chunk. Returns up-out'."
+  [buf want up up-out done? chunk]
+  (if (and (> want (count buf)) (= up-out 0) (not done?))
+    (do (erlang/send up [:demand chunk]) chunk)
+    up-out))
+
+(defn- mr-loop [xform up sub st chunk]
+  (receive
+    [:subscribe c]
+    (do (erlang/send up [:subscribe (erlang/self)])
+        (mr-loop xform up c st chunk))
+
+    ;; downstream demand grows → try to satisfy from buffer, then maybe pull
+    [:demand n]
+    (let [want (+ (:want st) n)
+          [buf2 want2] (mr-flush (:buf st) want sub (:done? st))
+          up-out2 (mr-pull buf2 want2 up (:up-out st) (:done? st) chunk)]
+      (mr-loop xform up sub
+               (assoc st :buf buf2 :want want2 :up-out up-out2) chunk))
+
+    ;; upstream delivered → expand/contract via xform, buffer, meter out
+    [:events events]
+    (let [produced (reduce (fn [acc e] (concat acc (xform e))) (list) events)
+          buf1 (concat (:buf st) produced)
+          up-out1 (- (:up-out st) (count events))
+          [buf2 want2] (mr-flush buf1 (:want st) sub (:done? st))
+          up-out2 (mr-pull buf2 want2 up up-out1 (:done? st) chunk)]
+      (mr-loop xform up sub
+               (assoc st :buf buf2 :want want2 :up-out up-out2) chunk))
+
+    ;; upstream exhausted → flush what remains against current demand; the
+    ;; buffer may outlive this message and drain on later demand
+    [:done]
+    (let [[buf2 want2] (mr-flush (:buf st) (:want st) sub true)]
+      (mr-loop xform up sub
+               (assoc st :buf buf2 :want want2 :done? true) chunk))
+
+    [:cancel] (do (erlang/send up [:cancel]) :stopped)
+
+    (after 3600000 (mr-loop xform up sub st chunk))))
+
+(defn flat-transform
+  "A MULTI-RATE producer-consumer. `xform` maps ONE upstream event to a LIST
+   of downstream events (length 0 = drop, 1 = map, >1 = expand). The stage
+   meters output against downstream demand, buffers surplus, and pulls
+   upstream in `chunk`-sized bites only when it must. Demand arithmetic,
+   done correctly: it never emits more than demanded and never starves a
+   consumer that still wants more."
+  [up xform chunk]
+  (spawn (fn []
+           (mr-loop xform up nil
+                    {:buf (list) :want 0 :up-out 0 :done? false} chunk))))
+
+;; sugar over flat-transform: the two canonical multi-rate shapes
+(defn expand-stage
+  "×k expansion: each event becomes (f event) → a list. One in, many out."
+  [up f chunk] (flat-transform up f chunk))
+
+(defn mapcat-stage
+  "clojure-flavoured expand: f returns a seq, flattened downstream."
+  [up f chunk] (flat-transform up (fn [e] (vec (f e))) chunk))
+
+;; ─────────────────────────────────────────────────────────────────────
+;; CONSUMER — the demand SOURCE. It drives the whole pipeline: nothing
+;; upstream produces anything until a consumer issues demand. `run` is the
+;; blocking consumer that folds every event into an accumulator and returns
+;; it when the stream signals :done — the native `reduce` over a stream.
+;;
+;; `batch` is the demand size: how many events to ask for at a time. This is
+;; the ONE tuning knob, and unlike a channel's buffer size it cannot cause
+;; memory blowup — it only sets how chatty the demand signalling is. Bigger
+;; batch = fewer round-trips; smaller = tighter latency. Correctness is
+;; identical for any batch ≥ 1.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn run
+  "Drive `up` as a demand-driven consumer, folding events with (f acc event)
+   from `init`, pulling `batch` events at a time. Blocks until the stream is
+   exhausted, then returns the accumulator. This is `reduce` over a live,
+   backpressured stream."
+  [up init f batch]
+  (erlang/send up [:subscribe (erlang/self)])
+  (erlang/send up [:demand batch])
+  (loop [acc init]
+    (receive
+      [:events events]
+      ;; fold this batch, then signal we can take another batch — the demand
+      ;; RENEWAL is the backpressure: upstream got exactly `batch` ahead of us
+      ;; and now waits until we ask again.
+      (let [acc2 (reduce f acc events)]
+        (erlang/send up [:demand batch])
+        (recur acc2))
+
+      [:done] acc
+
+      (after 3600000 (recur acc)))))
+
+(defn run-each
+  "Drive `up`, calling (f event) for its side effects on each event, until the
+   stream is exhausted. The side-effecting consumer."
+  [up f batch]
+  (run up nil (fn [_ e] (f e) nil) batch))
