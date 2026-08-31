@@ -541,7 +541,10 @@
    value is that tagged pair, hands back just the function. Anything else —
    an ordinary value, an unbound name — yields nil."
   [ns name]
-  (let [r (BeamLisp.Env/fetch ns (core-qualified name))]
+  ; `peek`, not `fetch`: probing whether a name is a macro at COMPILE time must
+  ; not materialize a `^:per-env` value. A per-env descriptor is never a macro,
+  ; so it correctly falls through. Mirrors genesis `macro_for`.
+  (let [r (BeamLisp.Env/peek ns (core-qualified name))]
     (if (and (erlang/is_tuple r)
              (= :ok (erlang/element 1 r)))
       (let [v (erlang/element 2 r)]
@@ -2001,7 +2004,9 @@
     (macro? env name) name
     :else
       (let [ns (:ns env)
-            r (BeamLisp.Env/fetch ns name)]
+            ; `peek`: resolving a syntax-quote name at COMPILE time must not
+            ; materialize a `^:per-env` value — only test whether it binds.
+            r (BeamLisp.Env/peek ns name)]
         (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
           (str (owner-ns ns name) "/" name)
           name))))
@@ -2152,7 +2157,9 @@
       (= :keyword (rn/node-tag f)) (erlang/binary_to_atom (rn/node-name f))
       (= :symbol (rn/node-tag f))
         (let [name (rn/node-name f)
-              r (BeamLisp.Env/fetch (:ns env) name)]
+              ; `peek`: resolving a type-tag symbol at COMPILE time must not
+              ; materialize a per-env value. A descriptor is not an atom module.
+              r (BeamLisp.Env/peek (:ns env) name)]
           (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r))
                    (erlang/is_atom (erlang/element 2 r))
                    (or (BeamLisp.Record/record_module? (erlang/element 2 r))
@@ -2834,15 +2841,48 @@
         doc (if has-doc (rn/node-form (first rest-args)) nil)
         init (if has-doc (second rest-args) (first rest-args))
         init-ast (compile init (notail env))
-        intern-ast (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name init-ast))
-        meta (var-meta-map doc false (name-author-meta (first args)))]
+        author (name-author-meta (first args))
+        meta (var-meta-map doc false author)]
+    (if (per-env-attr? author)
+      (compile-per-env-def name init-ast env meta)
+      (let [intern-ast (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name init-ast))]
+        (if (nil? meta)
+          intern-ast
+          (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
+            (ast-node :__block__
+                      (list (ast-node := (list value-var intern-ast))
+                            (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
+                            value-var))))))))
+
+(defn- per-env-attr?
+  "Say whether a def's AUTHOR metadata carries `^:per-env` (the reader lowers it
+   to the key `:per-env` => true). A per-env def registers a re-runnable init
+   THUNK instead of a value, so each consuming namespace materializes its own
+   instance on first read. Mirrors genesis `per_env_attr?`."
+  [author]
+  (and (erlang/is_map author)
+       (= true (maps/get :per-env author false))))
+
+(defn- compile-per-env-def
+  "Compile a `^:per-env` value def: register a re-runnable init THUNK (not a
+   value) with `BeamLisp.Env.define_per_env`, so each consuming env materializes
+   its own instance on first read. The thunk is `fn -> init end`; wrapping the
+   already-compiled initializer in a zero-arity fn anchors any closure it builds
+   to a stable module, so the thunk stays callable across namespace churn.
+
+   A marked def is opt-in and returns `:ok`, NOT the value — returning the value
+   would force eager materialization at definition time. Mirrors genesis
+   `compile_per_env_def`."
+  [name init-ast env meta]
+  (let [thunk-ast (ast-node :fn (list (ast-node :-> (list (list) init-ast))))
+        define-ast (ast-mod-call (list :BeamLisp :Env) :define_per_env
+                                 (list (:ns env) name thunk-ast))]
     (if (nil? meta)
-      intern-ast
-      (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
-        (ast-node :__block__
-                  (list (ast-node := (list value-var intern-ast))
-                        (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
-                        value-var))))))
+      define-ast
+      (ast-node :__block__
+                (list (ast-node := (list (erlang/list_to_tuple (list :_ (list) var-context)) define-ast))
+                      (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
+                      :ok)))))
 
 (defn- guarded-def-head
   "Wrap a def clause head with its guard, if any.
@@ -2975,6 +3015,11 @@
                      (not (empty? (rest rest-args))))
         doc (if has-doc (rn/node-form (first rest-args)) nil)
         after-doc (if has-doc (rest rest-args) rest-args)
+        ; A macro expands at COMPILE time; a per-env (runtime, per-consumer)
+        ; instance is meaningless for one. Reject explicitly. Mirrors genesis.
+        _ (if (per-env-attr? (name-author-meta (first args)))
+            (compile-error env (str "defmacro " name ": ^:per-env is only valid on a `def` value, not a macro"))
+            nil)
         clauses (parse-fn-clauses after-doc env)
         fn-args (macro-fn-form clauses)
         ; macro fns use nil-rest: a trailing `& body` is nil when empty
@@ -3134,6 +3179,13 @@
         attr-map (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})
         after-attr (if has-attr (rest after-doc) after-doc)
         author (maps/merge (name-author-meta (first args)) attr-map)
+        ; `^:per-env` is a stateful-VALUE-def marker; a function is already
+        ; re-entrant and interns one global fn value (the PLAN-047 invariant),
+        ; so the marker would do nothing on a defn. Reject rather than silently
+        ; ignore it. Mirrors genesis `compile_defn`.
+        _ (if (per-env-attr? author)
+            (compile-error env (str kind " " name ": ^:per-env is only valid on a `def` value, not a function"))
+            nil)
         ; Parity guards (genesis compile_def_special): a defn with no clauses,
         ; or a docstring followed by another string instead of a parameter
         ; vector, is a source error — caught here with the exact message.
