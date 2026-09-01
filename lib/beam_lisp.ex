@@ -126,6 +126,24 @@ defmodule BeamLisp do
         _ -> :genesis
       end
 
+      # Reader cutover: route `Reader.read_string/2` through the self-hosted
+      # beam-lisp reader (priv/reader.bl) for every later read — the language
+      # reads itself. Same shape and safety as the compiler cutover above:
+      # idempotent, forced to the genesis reader while reader.bl's OWN source is
+      # being read (the language never reads its tail with its half-built
+      # reader), and a load failure degrades to genesis instead of breaking
+      # boot. The differential corpus gates the flip: every .bl file in the
+      # repo, read by both readers position-bearing and byte-compared, is
+      # 419/419 identical — plus the parity, position, atom-guard and cutover
+      # suites. `:reader_backend :genesis` in app env opts back out (rebuild
+      # escape hatch); reader.ex stays as the bootstrap seed and the oracle
+      # yardstick either way, exactly like compiler.ex.
+      try do
+        BeamLisp.Reader.enable_bl_reader()
+      rescue
+        _ -> :genesis
+      end
+
       Env.in_ns("user")
     end
 
