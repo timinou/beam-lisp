@@ -133,6 +133,41 @@ defmodule BeamLisp.ReloadWatcherTest do
     assert safe_eval("(w.one/v)") == :second
   end
 
+  # The literate twin: a `.bl.md` save is the SAME kind of event. The watcher
+  # recomposes the doc to its program (every code cell, in order) and stages
+  # THAT — so the prose never enters the bundle, and the ns the doc declares
+  # joins (or holds) the image exactly like a plain source would.
+  test "a saved .bl.md file updates the running image through the same seam", %{dir: dir} do
+    doc = fn v ->
+      """      
+      # Watcher doc
+
+      Prose around the cells; prose is never staged.
+
+      ```beam-lisp
+      (ns w.doc)
+      (defn v [] #{v})
+      ```
+
+      More prose.
+      """
+    end
+
+    {:ok, _} = ReloadWatcher.start_link(dirs: [dir], name: :wtest_md)
+    on_exit(fn -> stop(:wtest_md) end)
+    await_watching()
+
+    p = Path.join(dir, "w1.bl.md")
+    File.write!(p, doc.(":first"))
+
+    save_until(p, doc.(":first"), fn -> safe_eval("(w.doc/v)") == :first end)
+    assert safe_eval("(w.doc/v)") == :first
+
+    # edit the CODE CELL (prose unchanged) → the running fn changes, no restart
+    save_until(p, doc.(":second"), fn -> safe_eval("(w.doc/v)") == :second end)
+    assert safe_eval("(w.doc/v)") == :second
+  end
+
   # NB the RELOAD CONTRACT the watcher wraps — a change applies, an incoherent
   # change is held with the old code serving, successive changes land in order,
   # staging without commit defers — is proven deterministically and free of the

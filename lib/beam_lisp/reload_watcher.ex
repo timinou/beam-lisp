@@ -108,7 +108,7 @@ defmodule BeamLisp.ReloadWatcher do
   def handle_info({:file_event, fs, {path, _events}}, %{fs: fs} = state) do
     state = %{state | event_count: state.event_count + 1}
 
-    if String.ends_with?(path, ".bl") and File.regular?(path) do
+    if watches?(path) and File.regular?(path) do
       {:noreply, handle_bl_change(path, state)}
     else
       {:noreply, state}
@@ -141,9 +141,31 @@ defmodule BeamLisp.ReloadWatcher do
   # the static coherence pass and either applies the edit or holds it with the
   # old code serving — exactly the reconcile-loop contract, driven by a save.
   defp handle_bl_change(path, state) do
-    result = apply_change(File.read!(path), path, state.auto_commit)
+    result = apply_change(file_source(path), path, state.auto_commit)
     if state.on_result, do: state.on_result.(result)
     %{state | last: result}
+  end
+
+  # Which file events the watcher reacts to: plain `.bl` sources and the two
+  # literate dialects (`.bl.md`, `.bl.org`). The literate twins are the SAME
+  # kind of save — a livebook doc is a namespace wearing prose (PLAN-069), so
+  # saving one stages its program, not its prose.
+  defp watches?(path), do: String.ends_with?(path, [".bl", ".bl.md", ".bl.org"])
+
+  # The source a file event stages: a plain `.bl` is itself; a literate file is
+  # first recomposed to its program text — every code cell concatenated in
+  # document order, the same minimal extraction the require path uses
+  # (`BeamLisp.Loader.doc_source/2`, pinned equal to `bl.doc/doc-source`). The
+  # reload bundle therefore stages the NAMESPACE the doc declares; prose never
+  # enters the bundle.
+  defp file_source(path) do
+    raw = File.read!(path)
+
+    cond do
+      String.ends_with?(path, ".bl.md") -> BeamLisp.Loader.doc_source(raw, :md)
+      String.ends_with?(path, ".bl.org") -> BeamLisp.Loader.doc_source(raw, :org)
+      true -> raw
+    end
   end
 
   @doc """
