@@ -84,7 +84,21 @@
 
   // ── render a hiccup-as-array subtree to a DOM node ────────────────────
   // ["tag", {attrs}, ...children]  |  "text"  |  number
-  function render(node) {
+  //
+  // SVG AWARENESS: an element inside an <svg> must be created with
+  // createElementNS — a plain createElement builds an HTML-namespace element
+  // the browser renders as an unknown inline tag ("blank" posters, text
+  // spilled as loose strings). The context enters at <svg> and inherits to
+  // every descendant; `svg` is false at the roots applyOp renders.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const HTML_NS = "http://www.w3.org/1999/xhtml";
+  const SVG_TAGS = {
+    svg: 1, defs: 1, g: 1, rect: 1, circle: 1, ellipse: 1, line: 1,
+    path: 1, polygon: 1, polyline: 1, text: 1, tspan: 1, stop: 1,
+    linearGradient: 1, radialGradient: 1, pattern: 1, clipPath: 1, mask: 1,
+    use: 1, symbol: 1, marker: 1, filter: 1, image: 1
+  };
+  function render(node, svg) {
     if (node === null || node === undefined) return document.createTextNode("");
     if (typeof node === "string" || typeof node === "number") {
       return document.createTextNode(String(node));
@@ -97,7 +111,9 @@
       attrs = rest[0];
       rest = rest.slice(1);
     }
-    const el = document.createElement(String(tag).replace(/[#.].*$/, "") || "div");
+    const bare = String(tag).replace(/[#.].*$/, "") || "div";
+    const inSvg = svg || SVG_TAGS[bare] === 1;
+    const el = document.createElementNS(inSvg ? SVG_NS : HTML_NS, bare);
     // shorthand id/classes on the tag (e.g. "li.task")
     applyShorthand(el, String(tag));
     for (const k in attrs) {
@@ -106,9 +122,9 @@
     for (const child of rest) {
       // a nested array of children (a spliced seq) flattens
       if (Array.isArray(child) && typeof child[0] !== "string") {
-        for (const c of child) el.appendChild(render(c));
+        for (const c of child) el.appendChild(render(c, inSvg));
       } else {
-        el.appendChild(render(child));
+        el.appendChild(render(child, inSvg));
       }
     }
     return el;
@@ -163,6 +179,31 @@
   }
 
   // ── apply one op ──────────────────────────────────────────────────────
+  // ── apply one patch (a list of ops) ───────────────────────────────────
+  // The server's reference (diff.bl apply-ops) applies ALL structural ops
+  // first — grouped by parent path, deepest parents first — and only then
+  // the deep ops, whose paths index the REBUILT tree. Applying in raw wire
+  // order patches pre-move nodes: a keyed list whose reconcile moves a child
+  // would set attributes/text on whatever sat at that index BEFORE the move.
+  // Grouping here is the exact mirror: within a parent, wire order already
+  // is removes → placements (anchor-fill); across parents, deepest first.
+  const STRUCTURAL = { remove: 1, "remove-at": 1, insert: 1, move: 1 };
+  function applyPatch(root, ops) {
+    const structural = [];
+    const deep = [];
+    for (const op of ops) (STRUCTURAL[op[0]] ? structural : deep).push(op);
+    const byPath = new Map();
+    for (const op of structural) {
+      const k = JSON.stringify(op[1]);
+      if (!byPath.has(k)) byPath.set(k, []);
+      byPath.get(k).push(op);
+    }
+    const paths = Array.from(byPath.keys()).sort(
+      (a, b) => JSON.parse(b).length - JSON.parse(a).length);
+    for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
+    for (const op of deep) applyOp(root, op);
+  }
+
   function applyOp(root, op) {
     const kind = op[0];
     const path = op[1];
@@ -291,7 +332,7 @@
       if (kind === "mount") {
         root.innerHTML = a;
       } else if (kind === "patch") {
-        for (const op of a) applyOp(root, op);
+        applyPatch(root, a);
       } else if (kind === "denied") {
         if (opts.onDenied) opts.onDenied(a);
       }
