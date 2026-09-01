@@ -116,9 +116,20 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
         sources = discover(source_dirs)
         manifest = read_manifest(manifest_path)
-        {ordered, deps} = order_and_deps(sources)
+        {ordered, deps, ns_index} = order_and_deps(sources)
 
+        # `hashes`: each source's OWN content hash — the leaf input to both the
+        # AOT cache's `closure_key/3` and the tier-2 closure hash below.
         hashes = Map.new(ordered, fn path -> {path, content_hash(path)} end)
+
+        # `manifest_hashes`: the tier-2 CLOSURE hash per source (FEAT-030) — this
+        # ns plus its transitive `:require` closure — which is what the manifest
+        # stores and `up_to_date?/5` compares. Keying the manifest on the closure
+        # (not the bare file hash) is what makes a source rebuild when a
+        # namespace it REQUIRES changes, keeping the manifest in lockstep with
+        # the beam's stamp and the runtime gate (all three use the closure).
+        manifest_hashes =
+          Map.new(ordered, fn path -> {path, closure_hash_for(path, ns_index, hashes)} end)
 
         cache_key =
           if BeamLisp.AOTCache.enabled?() and opts[:force] != true do
@@ -149,7 +160,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         to_build =
           Enum.count(ordered, fn path ->
             opts[:force] ||
-              not up_to_date?(manifest, path, Map.fetch!(hashes, path), cur_key, compile_path)
+              not up_to_date?(manifest, path, Map.fetch!(manifest_hashes, path), cur_key, compile_path)
           end)
 
         if to_build > 0 do
@@ -158,7 +169,12 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
         {manifest, recompiled, errors, _built} =
           Enum.reduce(ordered, {manifest, false, [], 0}, fn path, {m, rc, errs, built} ->
-            hash = Map.fetch!(hashes, path)
+            # The manifest stores the tier-2 closure hash (FEAT-030), not the
+            # file's own content hash — so a source is rebuilt when a namespace it
+            # requires changes, and its stored `:hash` matches what the beam is
+            # stamped with. The bare content hash is still used below for the AOT
+            # cache's `closure_key/3` (tier-3 addressing).
+            hash = Map.fetch!(manifest_hashes, path)
 
             if opts[:force] || not up_to_date?(m, path, hash, cur_key, compile_path) do
               built = built + 1
@@ -376,13 +392,18 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
   defp content_hash(source), do: source |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16()
 
-  # A source is up to date when its content hash AND the toolchain key both
-  # match the manifest, and every beam it recorded still exists. The key match
-  # is what mirrors the runtime's `AOT.stale?/2`: a codegen edit moves the key
-  # without touching the source, so hash alone would say "fresh" while the
-  # runtime rejects the beam and recompiles from source on every boot. An entry
-  # written by an older task carries no `:key` — it fails the match once and
-  # rebuilds (re-stamping the current key), a safe one-time migration.
+  # A source is up to date when its tier-2 CLOSURE hash AND the toolchain key
+  # both match the manifest, and every beam it recorded still exists. The key
+  # match mirrors the runtime's `AOT.stale?/2`: a codegen or tier-1 edit moves
+  # the key without touching this source, so the hash alone would say "fresh"
+  # while the runtime rejects the beam and recompiles from source on every boot.
+  # The closure hash (FEAT-030) closes the symmetric gap in the OTHER direction:
+  # a change to a REQUIRED namespace moves this source's closure hash without
+  # touching its own bytes, so a bare-content manifest would have said "fresh"
+  # while the runtime (which stamps + checks the closure) rejected the dependent
+  # beam. An entry written by an older task carries no `:key`, or a pre-FEAT-030
+  # bare-content `:hash` — either fails the match once and rebuilds (re-stamping
+  # the current key + closure hash), a safe one-time migration.
   defp up_to_date?(manifest, path, hash, key, compile_path) do
     case manifest[path] do
       %{hash: ^hash, key: ^key, modules: mods} ->
@@ -441,6 +462,14 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         {path, reqs |> Enum.map(&Map.get(ns_to_path, &1)) |> Enum.reject(&is_nil/1) |> Enum.uniq()}
       end)
 
+    # ns index for the tier-2 closure hash (FEAT-030): the primary ns of each
+    # path and the RAW require names per ns (unfiltered — an unresolvable require
+    # must hash identically on the build and runtime sides, so both walk the same
+    # raw edge set and let `closure_hash/3` render a missing member as `<ns>:?`).
+    ns_of_path = Map.new(info, fn {ns, _reqs, path} -> {path, ns} end)
+    reqs_by_ns = Map.new(info, fn {ns, reqs, _path} -> {ns, reqs} end)
+    ns_index = %{ns_to_path: ns_to_path, ns_of_path: ns_of_path, reqs_by_ns: reqs_by_ns}
+
     visited = MapSet.new()
     stack = MapSet.new()
 
@@ -450,7 +479,32 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         {acc ++ sub, vs}
       end)
 
-    {ordered, deps}
+    {ordered, deps, ns_index}
+  end
+
+  # The tier-2 freshness hash for a source `path` (FEAT-030), computed with the
+  # SAME `BeamLisp.SourceGraph.closure_hash/3` the runtime drift gate uses, so a
+  # beam this build stamps compares equal to what `AOT.stale?/2` recomputes. A
+  # path with no `(ns …)` form has no closure to key on — it compiles into the
+  # ambient `user` namespace, which the runtime cannot resolve to a source and
+  # therefore always trusts — so fall back to the file's own content hash for the
+  # manifest's build-time freshness (rebuild on its own change).
+  defp closure_hash_for(path, ns_index, hashes) do
+    case Map.get(ns_index.ns_of_path, path) do
+      ns when is_binary(ns) ->
+        srchash = fn n ->
+          case Map.get(ns_index.ns_to_path, n) do
+            p when is_binary(p) -> Map.get(hashes, p)
+            _ -> nil
+          end
+        end
+
+        reqs = fn n -> Map.get(ns_index.reqs_by_ns, n, []) end
+        BeamLisp.SourceGraph.closure_hash(ns, srchash, reqs)
+
+      _ ->
+        Map.fetch!(hashes, path)
+    end
   end
 
   defp visit(path, deps, vs) do

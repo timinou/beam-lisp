@@ -530,18 +530,24 @@ defmodule BeamLisp.AOT do
     shim_asts = Emit.shim_defs(ns_defs)
     {init_ast, companion_quoted} = build_init_ast(ns, mod, ns_defs, value_defs, ns_meta)
 
-    # PROVENANCE (Wave 1 / L1): stamp the source content-hash and the toolchain
-    # key INTO the shim module as attributes, plus a `__bl_provenance__/0`
+    # PROVENANCE (Wave 1 / L1; closure hash — FEAT-030): stamp a freshness hash
+    # and the toolchain key INTO the shim module, plus a `__bl_provenance__/0`
     # reader. This makes a compiled `.beam` self-certify against its `.bl`
     # source — read back with `module_info(:attributes)` or the reader with NO
     # load, NO `__bl_init__`, NO eval. A drift-aware loader compares these to
-    # the live source; a stale beam (compiled before a def existed) is then
-    # detectable instead of silently serving the old code. `source_hash` uses
-    # the SAME sha256/Base.encode16 the Mix manifest uses, so a beam's stamp
-    # equals the manifest hash for the same bytes. `nil` when the source is not
-    # a readable file (in-memory compile) — the loader treats an unstampable
-    # beam as "trust" (prod-release path), never as stale.
-    source_hash = provenance_source_hash(file)
+    # the live source; a stale beam (compiled before a def existed, OR before a
+    # namespace it REQUIRES changed) is then detectable instead of silently
+    # serving the old code.
+    #
+    # `source_hash` here is the tier-2 CLOSURE hash (this ns + its transitive
+    # `:require` closure), not the bare file hash: a cross-namespace `defmacro`
+    # means a dependent's emitted bytes can go stale when a REQUIRED source
+    # changes even though the dependent's own file did not. `ns_closure_hash/1`
+    # resolves through the same load path the compile runs under, so this stamp
+    # equals what the runtime gate (`stale?/2`) recomputes. `nil` for an
+    # in-memory compile (`file == nil`) — the loader treats an unstampable beam
+    # as "trust" (prod-release path), never as stale.
+    source_hash = if file, do: ns_closure_hash(ns, file), else: nil
     compiler_key = BeamLisp.AOTCache.compiler_key()
 
     ns_module_quoted =
@@ -583,17 +589,105 @@ defmodule BeamLisp.AOT do
     File.write!(path, beam)
     {mod, path}
   end
-  # The provenance hash for a source file: sha256 of its bytes, hex-encoded,
-  # byte-identical to the Mix manifest's `content_hash/1` (so a stamp compares
-  # equal to the manifest entry for the same source). `nil` for an in-memory
-  # compile (no file) or an unreadable path — an unstampable beam is trusted by
-  # the loader (prod-release path), never judged stale.
-  defp provenance_source_hash(nil), do: nil
 
-  defp provenance_source_hash(file) do
+  @doc """
+  The per-namespace freshness hash (FEAT-030, tier-2): a digest over `ns` and
+  the content of its transitive `:require` closure, resolved against the LIVE
+  source path. This is the value stamped into a beam at emit and recomputed by
+  the runtime drift gate — they match iff neither `ns` nor anything it requires
+  has changed since the beam was built.
+
+  Returns `nil` when `ns` has no resolvable source (a packaged release ships no
+  `.bl`) — the loader trusts an unstampable/unresolvable beam rather than
+  judging it stale. Requires OUTSIDE the source set (the ambient `core`/`sugar`
+  prelude, the reader providers) are deliberately NOT walked here: they are
+  covered by `BeamLisp.AOTCache.compiler_key/0` (tier-1), so a change there
+  moves the toolchain key and invalidates every beam regardless of this hash.
+  """
+  @spec ns_closure_hash(binary) :: binary | nil
+  def ns_closure_hash(ns) when is_binary(ns), do: ns_closure_hash(ns, nil)
+
+  @doc """
+  `ns_closure_hash/1` with an explicit source `file` for `ns` (the emit path).
+
+  At emit the compiling file's path is known, but `ns` may NOT resolve by name
+  through the ambient search dirs yet — an isolated `--out` build compiles
+  `<dir>/drift/fixture.bl` with only `<dir>/drift` on the load path, so the ns
+  `drift.fixture` (which resolves against `<dir>`) is unreachable and the hash
+  would come back `nil` (an unstampable beam). Seeding `ns`'s own
+  `{hash, requires}` directly from `file` removes that dependency on name
+  resolution for the primary ns; its transitive requires still resolve by name
+  the ordinary way (they are siblings on the load path). The runtime gate calls
+  the `/1` form (no file) and resolves the same ns to the same bytes, so the two
+  hashes agree.
+  """
+  @spec ns_closure_hash(binary, binary | nil) :: binary | nil
+  def ns_closure_hash(ns, file) when is_binary(ns) do
+    # Fresh per-call resolution cache: a namespace's source is read at most once
+    # WITHIN this computation, but never carried ACROSS calls (that would serve a
+    # stale hash after an edit — the exact false-fresh the drift gate exists to
+    # prevent). Cleared on entry, dropped on exit.
+    Process.put(:bl_source_info_cache, seed_cache(ns, file))
+
+    try do
+      case source_info_cached(ns) do
+        nil ->
+          nil
+
+        _ ->
+          reqs = fn n ->
+            case source_info_cached(n) do
+              {_hash, requires} -> requires
+              nil -> []
+            end
+          end
+
+          srchash = fn n ->
+            case source_info_cached(n) do
+              {hash, _requires} -> hash
+              nil -> nil
+            end
+          end
+
+          BeamLisp.SourceGraph.closure_hash(ns, srchash, reqs)
+      end
+    after
+      Process.delete(:bl_source_info_cache)
+    end
+  end
+
+  # Prime the resolution cache with `ns`'s own `{hash, requires}` read straight
+  # from `file`, so the primary ns never depends on ambient name resolution.
+  # `nil`/unreadable file → empty cache (fall back to name resolution).
+  defp seed_cache(ns, file) when is_binary(file) do
     case File.read(file) do
-      {:ok, bytes} -> :crypto.hash(:sha256, bytes) |> Base.encode16()
-      {:error, _} -> nil
+      {:ok, content} ->
+        hash = :crypto.hash(:sha256, content) |> Base.encode16()
+        {_ns, requires} = BeamLisp.SourceGraph.header(content)
+        %{ns => {hash, requires}}
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp seed_cache(_ns, _file), do: %{}
+  # Resolve a namespace's `{source_hash, requires}` at most once per
+  # `ns_closure_hash/1` call. The closure walk and the subsequent per-member
+  # `srchash`/`reqs` queries both hit this, so without the cache a namespace's
+  # source would be read several times; the cache is process-local and cleared
+  # at each top-level entry, so it can never serve a hash from a prior call.
+  defp source_info_cached(ns) do
+    cache = Process.get(:bl_source_info_cache, %{})
+
+    case Map.fetch(cache, ns) do
+      {:ok, v} ->
+        v
+
+      :error ->
+        v = BeamLisp.Loader.source_info(ns)
+        Process.put(:bl_source_info_cache, Map.put(cache, ns, v))
+        v
     end
   end
   # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
@@ -943,7 +1037,11 @@ defmodule BeamLisp.AOT do
         false
 
       {beam_hash, beam_key} ->
-        src_hash = BeamLisp.Loader.source_hash(ns)
+        # The live tier-2 closure hash: this ns plus its transitive `:require`
+        # closure. `nil` when no source resolves (packaged release) — trust the
+        # beam. Must be computed the SAME way emit stamped it (`ns_closure_hash/1`
+        # in both), so a fresh beam compares equal and is not needlessly rejected.
+        src_hash = ns_closure_hash(ns)
 
         cond do
           is_nil(src_hash) -> false

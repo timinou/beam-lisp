@@ -1,14 +1,14 @@
 # beam-lisp bootstrap seed manifest — generated, do not edit by hand.
 # Regenerate: mix run priv/bootstrap/gen_manifest.exs (after a keyed rebuild).
 %{
-  "compiler_key" => "937fcc8b14a1ae42b5b3d13e682ca2a0f278a205a3b46b862a785fdbef35a1a3",
+  "compiler_key" => "0691e5dbb23ec8701e3bcec02d3679071c1fdefbcd210477243803d28775d35e",
   "elixir" => "1.20.2",
   "modules" => %{
-    "Elixir.BeamLisp.Ns.Body.Compiler.beam" => "49eff4441490b640b1b3176f16d2b1080c16b5fca8a4da4cecad5752c9817e26",
-    "Elixir.BeamLisp.Ns.Body.Reader-node.beam" => "efe56a2f11c8240113101a9d030e5e8b767789f8cb5816bc7d4437bdcb5e693f",
-    "Elixir.BeamLisp.Ns.Compiler.beam" => "b90eb52a8d60d02b1e0cb947fc01a9fbd07ea488be018b2314768af9a002b35a",
-    "Elixir.BeamLisp.Ns.Init.Compiler.beam" => "6b6f081b93f5868569a99903994ff210fb391df83f1fd86752dccc3620e01db7",
-    "Elixir.BeamLisp.Ns.Reader-node.beam" => "5561e69d85d30d92f49ff35ee004f9e4d9fd67856f06908ad282b7614114f9c6"
+    "Elixir.BeamLisp.Ns.Body.Compiler.beam" => "7c7da22a2ae748a866f9d82f041becfdb502930a17ae8b23b321448ef126b7a0",
+    "Elixir.BeamLisp.Ns.Body.Reader-node.beam" => "424e5d21fe2068fcbe6e95665815484560d66c0c88cb5e887d4d1de96928c982",
+    "Elixir.BeamLisp.Ns.Compiler.beam" => "27d94705b8ea85d6df48a0b105071b18e9ffef53df85364c1d2edc1514e22e46",
+    "Elixir.BeamLisp.Ns.Init.Compiler.beam" => "d7b68b0d343f364adb1d57bfa3d521e86cc63a4413dc4f99a75816fe1ae39827",
+    "Elixir.BeamLisp.Ns.Reader-node.beam" => "8f7b056ba7d90947696da4af4b5953d76e5c8496fc2db56e5c22577cd9e9cc57"
   },
   "otp" => "29",
   "schema" => "beam-lisp-bootstrap-seed-v1"

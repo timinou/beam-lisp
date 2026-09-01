@@ -60,6 +60,30 @@ defmodule BeamLisp.Loader do
   end
 
   @doc """
+  Resolve `ns` to `{source_hash, requires}` — the content hash (same encoding as
+  `source_hash/1`) plus the namespace names of its `:require` clauses, from ONE
+  file resolution. `nil` when the source is not on the search path.
+
+  This is the runtime half of the FEAT-030 closure hash: `BeamLisp.AOT`
+  recursively walks `requires` and hashes each member's `source_hash`, so a
+  namespace's freshness reflects itself AND its transitive requires. Sharing the
+  ONE `find_file/1` resolution keeps the hash and the require edges consistent
+  (a beam stamped from these inputs matches a runtime gate computed from them).
+  """
+  @spec source_info(binary) :: {binary, [binary]} | nil
+  def source_info(ns) when is_binary(ns) do
+    case find_file(ns) do
+      {:ok, _path, content} ->
+        hash = :crypto.hash(:sha256, content) |> Base.encode16()
+        {_ns, requires} = BeamLisp.SourceGraph.header(content)
+        {hash, requires}
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   Run `fun` with `dir` pinned as the sole ambient search directory, so
   `find_file/1` / `source_hash/1` / `AOT.ensure_loaded/1` resolve `.bl` sources
   from there. Restores the prior binding after. Used by the drift gate's tests

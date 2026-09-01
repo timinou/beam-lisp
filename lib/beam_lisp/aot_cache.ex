@@ -13,13 +13,16 @@ defmodule BeamLisp.AOTCache do
 
   Keys:
 
-    * `compiler_key/0` — the toolchain: beam_lisp's version, Elixir and
-      OTP versions, the contents of the codegen modules' beams
+    * `compiler_key/0` — the TOOLCHAIN tier (FEAT-030): beam_lisp's version,
+      Elixir and OTP versions, the contents of the codegen modules' beams
       (AOT/Emit/Link/Ns/Reader/AtomGuard/Native — NOT the Compiler
       orchestration module, whose bytes no longer affect emitted code) and
-      of beam_lisp's own `priv/**/*.bl`, which now includes the self-hosted
-      compiler source `compiler.bl` itself (the core prelude is evaluated
-      against every compile).
+      the `@toolchain_seeds` source CLOSURE (the self-hosted compiler, the
+      reader providers, and the ambient `core`/`sugar` prelude — not the whole
+      `priv/**/*.bl`). A change to a tier-1 source invalidates every beam; a
+      change to any OTHER source moves only its own per-namespace key
+      (`BeamLisp.AOT.ns_closure_hash/1`) and its dependents'. Memoized in
+      `:persistent_term` (a VM constant in normal use).
     * `closure_key/2` — the source: sha256 over the absolute path and
       content hash of the file plus its transitive `:require` closure.
       The absolute path is part of the key because emitted beams embed it
@@ -53,6 +56,25 @@ defmodule BeamLisp.AOTCache do
   # emitted code — the reader, the emitter, linking, ns topology, atom interning,
   # native decls — stays hashed here; a real change to the compiler's behaviour
   # lives in `compiler.bl` and is caught by the `.bl` source hash.
+  # Memoization slot for the toolchain key (a VM constant in normal use).
+  @toolchain_key_pt {__MODULE__, :toolchain_key}
+
+  # TIER-1 seeds: namespaces whose transitive `:require` closure forms the
+  # "toolchain" — a change to any of them can alter EVERY emitted byte, so they
+  # hash into `compiler_key/0` (invalidate all) rather than a per-namespace
+  # closure. The set and WHY each is here:
+  #   compiler      — the self-hosted compiler; runs at compile time for every ns
+  #   reader-node   — the compiler's reader dependency (compiler requires it)
+  #   core, sugar   — ambient: referred into every ns for unqualified name
+  #                    resolution (BeamLisp.Env fetch fallback), so any ns can
+  #                    depend on them WITHOUT an explicit `:require` edge
+  #   data-readers  — seeds the tagged-literal (`#tag …`) registry consulted by
+  #                    the reader at READ time, again with no `:require` edge
+  # These implicit (edge-less) dependencies are exactly why per-namespace
+  # closure hashing cannot see them — hashing them globally here is what keeps
+  # the fine-grained tier sound.
+  @toolchain_seeds ["compiler", "reader-node", "core", "sugar", "data-readers"]
+
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
@@ -85,6 +107,25 @@ defmodule BeamLisp.AOTCache do
   so stale artifacts compiled by a different toolchain are never linked.
   """
   def compiler_key do
+    case :persistent_term.get(@toolchain_key_pt, :undefined) do
+      :undefined ->
+        key = compute_compiler_key()
+        :persistent_term.put(@toolchain_key_pt, key)
+        key
+
+      key ->
+        key
+    end
+  end
+
+  @doc false
+  # Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
+  # The key is a VM-constant in normal use (codegen beams + tier-1 sources do
+  # not change under a running node), so this exists only for tests that mutate
+  # a hashed input in-process and must observe the new key.
+  def reset_compiler_key, do: :persistent_term.erase(@toolchain_key_pt)
+
+  defp compute_compiler_key do
     vsn =
       case :application.get_key(:beam_lisp, :vsn) do
         {:ok, v} -> List.to_string(v)
@@ -115,16 +156,68 @@ defmodule BeamLisp.AOTCache do
         end
       end)
 
-    prelude =
-      case :code.priv_dir(:beam_lisp) do
-        dir when is_list(dir) ->
-          dir |> Path.join("**/*.bl") |> Path.wildcard() |> Enum.sort() |> Enum.map(&File.read!/1)
+    # TIER-1 sources: the self-hosted compiler, the reader providers, and the
+    # ambient prelude — the closure of @toolchain_seeds. A change to ANY of
+    # these can alter every emitted byte (they run at compile time for every
+    # namespace, or provide the reader/tagged-literal machinery, or are referred
+    # into every ns via `core`/`sugar` name resolution), so they invalidate ALL
+    # beams and belong in the toolchain key rather than a per-namespace closure.
+    # Everything ELSE in the prelude is keyed per namespace by
+    # `BeamLisp.AOT.ns_closure_hash/1`, so editing a leaf source no longer
+    # rotates this key. Resolved by DIRECT file reads (no reader, no Env): this
+    # runs from `Bootstrap.install!/1` BEFORE `BeamLisp.init/0`.
+    toolchain_sources = toolchain_source_contents()
 
-        _ ->
-          []
-      end
+    hash_parts(parts ++ beams ++ toolchain_sources)
+  end
 
-    hash_parts(parts ++ beams ++ prelude)
+  # Content of every tier-1 source, sorted by namespace name for determinism.
+  # A seed that cannot be resolved contributes nothing (degrade, never crash) —
+  # a missing compiler source surfaces as a compile error downstream, not here.
+  defp toolchain_source_contents do
+    case priv_bl_files() do
+      %{} = by_ns when map_size(by_ns) > 0 ->
+        reqs = fn ns ->
+          case by_ns[ns] do
+            {_path, content} -> elem(BeamLisp.SourceGraph.header(content), 1)
+            _ -> []
+          end
+        end
+
+        @toolchain_seeds
+        |> Enum.filter(&Map.has_key?(by_ns, &1))
+        |> Enum.reduce(MapSet.new(), fn seed, acc ->
+          BeamLisp.SourceGraph.closure(seed, reqs) |> MapSet.union(acc)
+        end)
+        |> Enum.sort()
+        |> Enum.map(fn ns -> elem(Map.fetch!(by_ns, ns), 1) end)
+
+      _ ->
+        []
+    end
+  end
+
+  # Map of declared-ns => {path, content} for every `priv/**/*.bl`, built with a
+  # pure header scan (no reader/Env; safe pre-init). Files with no `(ns …)` form
+  # are omitted — they compile into `user` and are never tier-1 seeds.
+  defp priv_bl_files do
+    case :code.priv_dir(:beam_lisp) do
+      dir when is_list(dir) ->
+        dir
+        |> Path.join("**/*.bl")
+        |> Path.wildcard()
+        |> Enum.reduce(%{}, fn path, acc ->
+          content = File.read!(path)
+
+          case BeamLisp.SourceGraph.header(content) do
+            {ns, _reqs} when is_binary(ns) -> Map.put_new(acc, ns, {path, content})
+            _ -> acc
+          end
+        end)
+
+      _ ->
+        %{}
+    end
   end
 
   @doc """

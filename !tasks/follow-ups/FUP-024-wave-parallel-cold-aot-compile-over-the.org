@@ -1,0 +1,104 @@
+#+TITLE: Wave-parallel cold AOT compile over the require DAG (~2.5-3x, OS-process workers)
+#+STATE: ITEM
+#+SESSION_ID: 156e98a98c8113c8
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-01T13-34-07-410Z_156e98a98c8113c8.jsonl]]
+#+CUSTOM_ID: FUP-024-wave-parallel-cold-aot-compile-over-the
+
+* Initial Message
+
+beam-lisp AOT: building 110 source(s)
+  [1/110] priv/auth/biscuit/crypto.bl
+  [2/110] priv/auth/biscuit/codec.bl
+  [3/110] priv/auth/engine/expr.bl
+  [4/110] priv/auth/biscuit/datalog.bl
+  [5/110] priv/datom/codec.bl
+  [6/110] priv/datom/schema.bl
+  [7/110] priv/datom/store.bl
+  [8/110] priv/datom/index.bl
+  [9/110] priv/datom/db.bl
+  [10/110] priv/datom/query/relation.bl
+  [11/110] priv/datom/query/parse.bl
+  [12/110] priv/datom/query/agg.bl
+  [13/110] priv/datom/query/plan.bl
+  [14/110] priv/datom/vector.bl
+  [15/110] priv/datom/query/analytic.bl
+  [16/110] priv/datom/datalog.bl
+
+
+this looks like it's compiling alphabetically. would it be faster if it found dependencies and compiled them first? what's a way to make cold compile faster?
+
+* Context / why FUP not now
+Split from FEAT-030 (two-tier invalidation key). FEAT-030 fixes the DOMINANT pain —
+the daily edit→compile loop rebuilding all 116 sources — and is low-risk/high-ratio.
+This item is the orthogonal COLD-build lever: parallelize the currently-serial compile.
+
+* Problem (measured 2026-09-01, 16-core, cache off, --force)
+Cold serial build = 511s (~8.5 min), 116 sources → 307 beams. The build loop is a
+serial fold — `Enum.reduce(ordered, …, fn path -> compile_file(path) …)` at
+lib/mix/tasks/compile.beam_lisp.ex:119 — so 15 of 16 cores sit idle for 8.5 minutes.
+
+* Available parallelism (MEASURED, not estimated)
+The task ALREADY computes the require DAG (`order_and_deps/1`, :428; `visit/3` :456).
+Wave structure of the real prelude (115 ns-bearing files, 228 edges), ambient core+sugar
+injected:
+  depth = 11 waves; widths = [36,19,12,9,9,8,7,7,4,2,2]  (wave0 = 36 independent files)
+  critical path (11 files): datom/query/{relation,parse,fixpoint,rules,engine} →
+    auth/engine/origin → auth/authorizer → auth/sandbox → auth → executor/{sandbox,ssh}
+
+Size-weighted ceiling (compile cost ∝ source bytes as proxy):
+  parallel floor = Σ per-wave heaviest file = 546,906 B = 31.8% of 1.72MB total
+  ⇒ theoretical ceiling ~3.1x, NOT 10x — because compiler.bl (181KB, wave2) and
+    core.bl (68KB, wave0) are serial bottlenecks nothing in their wave overlaps.
+  Realistic with 16 cores + scheduling overhead: ~2.5-3x → cold 511s → ~180-200s.
+  (Verify with a time-weighted profile, not size — see step 0.)
+
+* Why it's real work, not a flag
+`AOT.compile_source` MUTATES shared VM state: `Env.in_ns`, `Env.current_ns`, global
+atom interning, and `:global.trans({{:bl_load,mod},…})` locks (aot.ex:105,196). An
+in-VM `Task.async_stream` over a wave would corrupt the shared Env → wrong/racy beams.
+Two viable designs:
+
+  A. OS-process workers (RECOMMENDED, safe): spawn N `mix compile.beam_lisp
+     --source-dir <subset>` (or a new `--only <files>` flag) per wave, each its own VM
+     ⇒ no shared-Env hazard. Barrier between waves. Coordinate via the existing manifest
+     (already checkpointed per-source, :run reduce). Cost: N VM boots/wave — amortized
+     across a 36-wide wave, negligible vs 8.5 min; boot cost hurts the 2-wide tail waves,
+     so cap workers = min(cores, wave_width) and consider merging the tail (waves 8-10,
+     8 files total) into one serial worker.
+  B. Worker-isolated Env in-VM: give each compile task its own Env/intern namespace or
+     make interning reentrant + drop the :global.trans for a compile-local lock. Faster
+     (no VM boots) but deep surgery on shared runtime state — higher risk. Defer unless A's
+     VM-boot overhead measures badly.
+
+* Ordering interplay with FEAT-030
+Do FEAT-030 FIRST. Two-tier keys make waves independently cacheable/skippable, so the
+parallel build only ever compiles the actually-dirty closure — parallelism then applies
+to the (smaller) dirty wave set, compounding the win. Parallelizing before FEAT-030 would
+still rebuild all 116 in parallel — 3x on the wrong baseline.
+
+* Plan
+  0. Profile: instrument the reduce with per-file monotonic timing (cache off, --force),
+     capture ONE cold run → replace the size proxy with real time-weighting; confirm the
+     ~3x ceiling and whether codegen-bound or load-bound.
+  1. Add `--only <comma-paths>` (or `--wave <manifest>`) to compile.beam_lisp so a worker
+     compiles an explicit file subset into the shared compile_path + updates manifest.
+  2. Parent process: compute waves from order_and_deps DAG (already have it), then for each
+     wave `Task.async_stream` over OS-process workers (System.cmd/Port), workers=min(cores,
+     wave_width), barrier per wave. Merge tail waves.
+  3. Manifest coordination: workers must not clobber each other's manifest writes — either
+     per-worker partial manifests merged by parent, or parent owns the single manifest and
+     workers report {path→{hash,key,modules}}.
+  4. Interaction with AOTCache store/fetch: ensure concurrent store/4 (temp-dir+rename,
+     already atomic aot_cache.ex:179) is safe under parallel workers — looks fine, verify.
+
+* Acceptance
+  - cold `mix compile.beam_lisp --force` (cache off) wall-time ≥2x faster on 16 cores,
+    measured with the step-0 protocol (≥3 samples, report spread).
+  - byte-identical beams vs serial build (diff the two compile_paths' beam sets).
+  - full `mix test` green; drift gate + AOTCache suites unbroken.
+  - no Env corruption: run twice, beams stable; no atom-table / :global lock warnings.
+
+* Refs
+  compile.beam_lisp.ex:119 (serial reduce), :428 order_and_deps, :456 visit
+  aot.ex:105,196 (shared-Env mutation + :global.trans)
+  Blocks-on: FEAT-030-two-tier-aot-invalidation-key-closure-gr

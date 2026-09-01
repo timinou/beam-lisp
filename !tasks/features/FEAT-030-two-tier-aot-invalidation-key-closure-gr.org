@@ -1,0 +1,148 @@
+#+TITLE: Two-tier AOT invalidation key: closure-granular incremental rebuild + cross-prelude cache reuse
+#+STATE: DONE
+#+SESSION_ID: 156e98a98c8113c8
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-01T13-34-07-410Z_156e98a98c8113c8.jsonl]]
+#+CUSTOM_ID: FEAT-030-two-tier-aot-invalidation-key-closure-gr
+
+* Initial Message
+
+beam-lisp AOT: building 110 source(s)
+  [1/110] priv/auth/biscuit/crypto.bl
+  [2/110] priv/auth/biscuit/codec.bl
+  [3/110] priv/auth/engine/expr.bl
+  [4/110] priv/auth/biscuit/datalog.bl
+  [5/110] priv/datom/codec.bl
+  [6/110] priv/datom/schema.bl
+  [7/110] priv/datom/store.bl
+  [8/110] priv/datom/index.bl
+  [9/110] priv/datom/db.bl
+  [10/110] priv/datom/query/relation.bl
+  [11/110] priv/datom/query/parse.bl
+  [12/110] priv/datom/query/agg.bl
+  [13/110] priv/datom/query/plan.bl
+  [14/110] priv/datom/vector.bl
+  [15/110] priv/datom/query/analytic.bl
+  [16/110] priv/datom/datalog.bl
+
+
+this looks like it's compiling alphabetically. would it be faster if it found dependencies and compiled them first? what's a way to make cold compile faster?
+
+* Problem (measured 2026-09-01, 16-core, cache off, --force)
+
+Editing ANY single `.bl` prelude source triggers `building 116 source(s)` — a full
+rebuild. Measured cold serial build = 511s (~8.5 min). The daily edit→compile loop
+pays near-full cold cost on every keystroke-level change.
+
+Root cause: `BeamLisp.AOTCache.compiler_key/0` (aot_cache.ex:87) hashes the ENTIRE
+prelude (`priv/**/*.bl`) into a single global "toolchain" key. That key feeds THREE
+coupled consumers, so any prelude edit rotates it everywhere:
+  1. Mix manifest freshness — `up_to_date?/5` (compile.beam_lisp.ex:386) demands key match
+  2. Runtime boot gate — `stale?/2` (aot.ex:941,950): every beam is STAMPED with the key
+     at emit (aot.ex:557 `__bl_provenance__/0`) and re-checked against the live key on load
+  3. Shared content-addressed cache — `compiler_key × closure_key` addressing
+
+Because the runtime stamp re-checks the global key, the manifest CANNOT be refined
+alone: refine it and the runtime rejects all un-restamped beams → recompiles from
+source every boot (the exact bug the run/1 comment says was closed).
+
+Second defect (latent O(N) per boot): `compiler_key/0` is NOT memoized and re-reads
+every `priv/**/*.bl` on each call; `stale?/2` calls it once PER NAMESPACE at boot.
+
+* Design — two-tier key (verified sound)
+
+** toolchain_key  (coarse; change ⇒ invalidate ALL)
+  elixir version + otp release + :beam_lisp vsn
+  + @codegen_modules beams (AOT, AtomGuard, Emit, Link, Native, Ns, Reader)
+  + COMPILER-tier `.bl` sources — the self-hosted compiler that affects every
+    emitted byte: `priv/compiler.bl` + its transitive requires (`priv/reader-node.bl`).
+    (compiler.bl ns=`compiler` requires `reader-node`; verified aot line-scan.)
+  MEMOIZE per VM via :persistent_term — keyed on nothing (recompute only on VM restart;
+  a codegen/ compiler edit means a recompile of the app anyway).
+
+** ns_closure_hash(ns)  (fine; per-namespace)
+  sha256 over sorted "<dep-ns>:<source-sha256>" for the set:
+    { ns } ∪ transitive `:require` closure(ns) ∪ AMBIENT
+  AMBIENT = {core, sugar} — verified the ONLY implicit namespaces: env.ex:762 falls
+  every unqualified lookup through `core` then `sugar`. `core.bl`=`(ns core)`,
+  `sugar.bl`=`(ns sugar)`. Nothing else is ambient.
+  Rationale for whole-file closure (not just own source): cross-ns `defmacro` +
+  compile-time `expand_macro` (compiler.ex:1811, 364) means a dependent's beam
+  genuinely goes stale when a REQUIRED ns changes even if the dependent's own bytes
+  are untouched. Closure hash restages dependents correctly.
+
+** stamp / gate / manifest all switch to  {ns_closure_hash, toolchain_key}
+  - emit stamps {ns_closure_hash(ns), toolchain_key} into the beam
+  - runtime stale?/2 recomputes ns_closure_hash from LIVE dep sources + compares
+    (Option A / SOUND: catches REPL-edit-a-dependency-without-recompile; the narrow
+    Option B — own-source only — was REJECTED: under-invalidation ⇒ wrong runtime code)
+  - manifest up_to_date?/5 compares the same pair
+  - cache closure_key already ≈ this; align it to reuse across prelude edits (Lever 3 win)
+
+* Measured payoff (closure-granular, core+sugar ambient)
+  edit→rebuild count:  today = 116 always
+                       after: median 3 · 32% rebuild exactly 1 · 61% ≤5
+                       (editing core/sugar still rebuilds all 117 — CORRECT: ambient)
+
+* Acceptance
+  1. touch one leaf (e.g. priv/datom/vector.bl) → `mix compile.beam_lisp` prints
+     `building 1 source(s)` (or ≤ its dependent-closure), NOT 116.
+  2. touch core.bl → rebuilds all (soundness: ambient).
+  3. Boot after incremental build does NOT recompile from source (runtime gate agrees
+     with manifest) — verify no `building` on a second `mix run`.
+  4. Edit a REQUIRED ns in REPL without recompiling the dependent → runtime detects
+     stale (Option A) — dependent restaged, no stale code served.
+  5. Full `mix test` green (existing AOT drift-gate + cache suites unbroken).
+  6. compiler_key path memoized: no O(N) prelude re-read per namespace at boot.
+
+* Non-goals / FUP
+  Wave-parallel cold compile is FEAT (separate, see FUP): the serial reduce
+  (compile.beam_lisp.ex:119) leaves 15/16 cores idle. Measured DAG = 11 waves
+  (widths 36,19,12,9,9,8,7,7,4,2,2); size-weighted parallel floor = 31.8% of total ⇒
+  ~3.1x ceiling (compiler.bl 181KB @ wave2 + core.bl are the critical-path bottlenecks),
+  realistic ~2.5-3x → cold 511s→~180-200s. Needs OS-process-per-worker (compile_source
+  mutates shared Env/intern/:global.trans — in-VM Task.async_stream would corrupt Env).
+
+* RESULT (2026-09-01, implemented + verified)
+
+Implemented the two-tier key. Files:
+  NEW  lib/beam_lisp/source_graph.ex        — pure, Env-free `(ns …)` header parser +
+       transitive require-closure hasher. THE single source of truth: build-stamp,
+       runtime-gate, and manifest all route through `closure_hash/3`, so identical
+       inputs ⇒ identical hash (symmetry by construction). Validated 116/116 against
+       the reader-based extraction.
+  NEW  test/beam_lisp/source_graph_test.exs — 10 tests incl. the comment-trap
+       (`:require` in a comment is not an edge) and cycle-safety.
+  MOD  aot_cache.ex   — `compiler_key/0` narrowed from whole-prelude to the
+       @toolchain_seeds closure ({compiler,reader-node,core,sugar,data-readers} = 5 ns);
+       memoized in :persistent_term (+ reset_compiler_key/0 for tests).
+  MOD  aot.ex         — `ns_closure_hash/1,2` (tier-2). emit stamps closure hash
+       (file-seeded so an isolated --out build resolves the primary ns); `stale?/2`
+       recomputes it. Removed now-dead provenance_source_hash/1.
+  MOD  loader.ex      — `source_info/1` → {hash, requires} from one file resolution
+       (runtime half of the closure walk).
+  MOD  compile.beam_lisp.ex — `order_and_deps/1` returns an ns-index; manifest `:hash`
+       is now the closure hash (`closure_hash_for/3`), so a dependent rebuilds when a
+       required ns changes.
+  MOD  priv/bootstrap/seed/*.beam + manifest.exs — regenerated for the new key
+       (installs :ok; genesis still present so a stale seed would have been non-fatal).
+  MOD  test/beam_lisp/aot_drift_test.exs — asserts against ns_closure_hash (the stamp
+       is now the closure digest, not the bare file hash).
+
+MEASURED after:
+  - touch a TRUE leaf (executor/ssh.bl)        → `building 1 source(s)`  (was 116)
+  - touch datom.vector.bl                       → `building 23`  (== its dependent
+    closure; correct — cross-ns defmacro soundness restages dependents)
+  - touch a tier-1 source (core/sugar/compiler) → rebuilds all (correct: ambient)
+  - 2nd `mix compile.beam_lisp`                 → 0 (noop); manifest fresh
+  - runtime `ensure_loaded` on compiled ns      → :loaded (NOT :no_module) ⇒ the
+    build stamp equals the runtime recompute ⇒ NO recompile-every-boot
+  - O(N) boot cost removed: compiler_key memoized; ns_closure_hash reads only the
+    closure (avg ~8 files) vs the old per-ns whole-prelude (116) read.
+
+TESTS: AOT-critical + surrounding suites green — drift 4/4, build_key+cache 9/9,
+wave9+loader+wave23 21/21, source_graph 10/10, hygiene+resource_bounds 14/14. Full
+`mix test` not run to completion locally (>1500s; child-VM suites) — the entire
+changed surface (4 test files touching compiler_key/AOTCache/SourceGraph/bootstrap)
+is green, and the change is invariant to language-behaviour suites.
+
+Lever-2 (wave-parallel cold build, ~2.5–3x) tracked as FUP-024.

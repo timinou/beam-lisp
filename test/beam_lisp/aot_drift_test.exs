@@ -107,9 +107,12 @@ defmodule BeamLisp.AotDriftTest do
     compile!(@v2)
     reload_beam!()
 
-    # The stamp equals the live source hash, so the gate trusts it.
+    # The stamp equals the live tier-2 closure hash (FEAT-030), so the gate
+    # trusts it. The fixture ns has no `:require`, so its closure is itself
+    # alone — but the stamp is still the closure DIGEST, not the bare file hash,
+    # so assert against the same `ns_closure_hash/1` the gate recomputes.
     {stamp, key} = apply(@mod, :__bl_provenance__, [])
-    live = :crypto.hash(:sha256, File.read!(@src)) |> Base.encode16()
+    live = BeamLisp.Loader.with_search_dir(@src_dir, fn -> BeamLisp.AOT.ns_closure_hash(@ns) end)
     assert stamp == live
     assert key == BeamLisp.AOTCache.compiler_key()
   end
@@ -117,9 +120,10 @@ defmodule BeamLisp.AotDriftTest do
   test "dev: the drift gate routes a stale beam to the source path (:no_module)" do
     forge_stale!()
 
-    # The on-disk beam is v1 (no `added`); the source is v2 — hashes differ.
+    # The on-disk beam is v1 (no `added`); the source is v2 — closure hashes
+    # differ (the fixture's closure is itself alone, so its own change suffices).
     {stamp, _} = apply(@mod, :__bl_provenance__, [])
-    live = :crypto.hash(:sha256, File.read!(@src)) |> Base.encode16()
+    live = BeamLisp.Loader.with_search_dir(@src_dir, fn -> BeamLisp.AOT.ns_closure_hash(@ns) end)
     refute stamp == live, "precondition: beam must be stale vs source"
 
     # Drift detected → :no_module, so `Loader` falls to the SOURCE path. The
