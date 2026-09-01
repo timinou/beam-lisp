@@ -33,12 +33,79 @@
   [c]
   (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 44)))
 
-(defn- delimiter?
-  "Return true when codepoint `c` ends an unquoted symbol, keyword, number, or character token."
-  [c]
-  (or (ignored-char? c)
-      (= c 40) (= c 41) (= c 91) (= c 93) (= c 123) (= c 125)
-      (= c 34) (= c 59)))
+; --- source positions --------------------------------------------------------
+;
+; A `pos` is the Erlang tuple {line, col, file} (line and col 1-indexed, file a
+; path binary or nil), the SAME shape reader.ex threads and reader-node's
+; `node-pos` returns. The reader threads it so each form knows where its first
+; character sits, and wraps LIST forms (only lists — a list is where evaluation
+; happens, so a list is what an error names) in a {:meta, node, pos} wrapper via
+; `meta-node`. Non-list forms stay bare, matching the Elixir answer key.
+;
+; The cost is inherent: position must thread through every read step, because
+; deriving an offset from the remaining charlist would be quadratic. Each
+; `read-*` fn takes the position of its first char and returns the position of
+; the head of the source it did NOT consume, so the next sibling starts there.
+
+(defn- pos-line [pos] (erlang/element 1 pos))
+(defn- pos-col  [pos] (erlang/element 2 pos))
+(defn- pos-file [pos] (erlang/element 3 pos))
+
+(defn- make-pos
+  "Build a {line col file} position tuple."
+  [line col file]
+  (erlang/list_to_tuple (list line col file)))
+
+(defn- advance-pos
+  "Advance a position over ONE consumed codepoint `c`: a newline restarts the
+   column at 1 on the next line; anything else advances the column by one. The
+   file component is invariant."
+  [pos c]
+  (if (= c 10)
+    (make-pos (+ (pos-line pos) 1) 1 (pos-file pos))
+    (make-pos (pos-line pos) (+ (pos-col pos) 1) (pos-file pos))))
+
+(defn- advance-to
+  "Advance `pos` over the consumed prefix of charlist `from` up to the shared
+   suffix `to`. Because every reader step returns a suffix of its input (via
+   `rest`/`skip-ignored`), `to` is always tail-shared with `from`, so this walks
+   exactly the characters consumed and stops at `identical?` — O(consumed),
+   never re-scanning. `[]` is a singleton, so end-of-input terminates too.
+   Line and column accumulate as plain integers; the {line col file} tuple is
+   materialized once at the end — one allocation per walk, none per character."
+  [pos from to]
+  (loop [rem from line (pos-line pos) col (pos-col pos)]
+    (if (or (identical? rem to) (empty? rem))
+      (make-pos line col (pos-file pos))
+      (if (= 10 (first rem))
+        (recur (rest rem) (+ line 1) 1)
+        (recur (rest rem) line (+ col 1))))))
+
+(defn- pos-meta
+  "The {:line :col :file} map the compiler reads off a {:meta …} wrapper."
+  [pos]
+  (maps/from_list (list (tuple2 :line (pos-line pos))
+                        (tuple2 :col (pos-col pos))
+                        (tuple2 :file (pos-file pos)))))
+
+(defn- wrap-list-pos
+  "Wrap a list node in its source position, exactly as reader.ex does for lists
+   (and only lists). `open-pos` is the position of the list's opening delimiter
+   or prefix character."
+  [list-node open-pos]
+  (rn/meta-node list-node (pos-meta open-pos)))
+
+(defn- take-token
+  "Split a source charlist into its next delimiter-bounded token chars and the unconsumed input.
+
+   One VM-level sweep instead of a per-character bl loop: `string/cspan` counts
+   the prefix of chars NOT in the delimiter set — exactly the test the old loop
+   made per char (whitespace/commas plus the structural ( ) [ ] { } \" ;) — and
+   `lists/split` cuts the token off the front. Two BIF calls per token instead
+   of a call chain per character; same token, same stop point."
+  [chars]
+  (let [n (string/cspan chars " \t\n\r,()[]{}\";")]
+    (lists/split n chars)))
 
 (defn- skip-comment
   "Consume a line comment charlist and return the newline and following input, or an empty list at end of input."
@@ -57,18 +124,25 @@
     (= 59 (first chars)) (recur (skip-comment (rest chars)))
     :else chars))
 
-(defn- take-token
-  "Split a source charlist into its next delimiter-bounded token chars and the unconsumed input."
-  [chars]
-  (loop [remaining chars acc (list)]
-    (if (or (empty? remaining) (delimiter? (first remaining)))
-      [(reverse acc) remaining]
-      (recur (rest remaining) (cons (first remaining) acc)))))
+(defn- skip-pos
+  "Skip whitespace/commas/comments AND advance a position over what was skipped,
+   returning `[remaining-chars new-pos]`. The position-aware twin of
+   `skip-ignored`: it reuses that fn to find the next form's first char, then
+   walks the consumed gap with `advance-to` so the form is attributed to the
+   line and column it actually sits on."
+  [chars pos]
+  (let [after (skip-ignored chars)]
+    [after (advance-to pos chars after)]))
 
+
+;; `chars` is already a plain Erlang list — every reader step conses onto the
+;; input charlist — so it goes straight to characters_to_binary. Routing it
+;; through core's universal `to-list` normalizer cost ~7 predicate dispatches
+;; per token to return the list unchanged.
 (defn- chars->string
   "Convert a charlist of Unicode codepoints into the binary string used by beam-lisp values."
   [chars]
-  (unicode/characters_to_binary (to-list chars)))
+  (unicode/characters_to_binary chars))
 
 (defn- hex-value
   "Return the numeric value of one ASCII hexadecimal digit, or nil when `c` is not hexadecimal."
@@ -144,12 +218,15 @@
     :else c))
 
 (defn- read-string-body
-  "Read characters through the closing quote and return `[binary-value remaining-source]`, interpreting string escapes."
-  [chars]
+  "Read characters through the closing quote and return `[binary-value remaining-source pos']`,
+   interpreting string escapes. A string is a scalar — never wrapped — so `pos`
+   is threaded only to report where reading resumes. `pos` is the position of
+   the first char AFTER the opening quote."
+  [chars pos]
   (loop [remaining chars acc (list)]
     (cond
       (empty? remaining) (syntax-error "unterminated string")
-      (= 34 (first remaining)) [(chars->string (reverse acc)) (rest remaining)]
+      (= 34 (first remaining)) [(chars->string (reverse acc)) (rest remaining) (advance-to pos chars (rest remaining))]
       (= 92 (first remaining))
         (let [tail (rest remaining)]
           (cond
@@ -163,12 +240,12 @@
 (defn- whole-number
   "Parse token charlist `chars` as a whole integer or float and return nil when any characters remain or parsing fails."
   [chars]
-  (let [integer-result (string/to_integer (to-list chars))
+  (let [integer-result (string/to_integer chars)
         integer-value (erlang/element 1 integer-result)
         integer-rest (erlang/element 2 integer-result)]
     (if (and (not= integer-value :error) (empty? integer-rest))
       integer-value
-      (let [float-result (string/to_float (to-list chars))
+      (let [float-result (string/to_float chars)
             float-value (erlang/element 1 float-result)
             float-rest (erlang/element 2 float-result)]
         (if (and (not= float-value :error) (empty? float-rest))
@@ -202,10 +279,23 @@
       (= token "nil") nil
       (= token "true") true
       (= token "false") false
-      (= 58 (first chars)) (node :keyword (chars->string (rest chars)))
+      ; A keyword interns an atom downstream, so account it against the VM atom
+      ; table before returning — the same guard reader.ex applies in
+      ; check_atom_safety!. account! samples every :atom_check_interval names
+      ; and raises AtomGuard.LimitError past the high-water fraction, turning an
+      ; uncatchable full-table VM abort into an ordinary catchable error.
+      (= 58 (first chars))
+        (let [name (chars->string (rest chars))]
+          (BeamLisp.AtomGuard/account! name)
+          (node :keyword name))
       (= 92 (first chars)) (character-literal token chars)
       :else (let [number (whole-number chars)]
-              (if (nil? number) (symbol-node token) number)))))
+              (if (nil? number)
+                ; A symbol likewise interns an atom downstream: account it too.
+                ; A number interns nothing, so it stays outside the guard.
+                (do (BeamLisp.AtomGuard/account! token)
+                    (symbol-node token))
+                number)))))
 
 (defn- pair-items
   "Turn an even sequence of map forms into Erlang key/value tuples, raising when one key lacks a value."
@@ -218,46 +308,116 @@
                    (cons (tuple2 (first remaining) (second remaining)) acc)))))
 
 (defn- wrap-prefix
-  "Read one form after a reader prefix and return its `(name form)` list node plus remaining source."
-  [chars name in-fn?]
-  (let [remaining (skip-ignored chars)]
+  "Read one form after a reader prefix and return `[list-node remaining pos']`.
+   `pos0` is the position of the prefix character itself; the resulting
+   `(name form)` list is wrapped there, exactly as reader.ex positions a
+   quote/deref/unquote list at its prefix char."
+  [chars name in-fn? pos0]
+  ; reader.ex QUIRK, matched for parity: after a reader prefix it skips
+  ; whitespace starting the position count at pos0 — the PREFIX char's position,
+  ; NOT the char after it. So the following form inherits the prefix column
+  ; (e.g. `(a ~b)` positions the inner list at the backtick's column, and `~b`
+  ; one past it). Passing pos0 (un-advanced) reproduces that exactly.
+  (let [[remaining rpos] (skip-pos chars pos0)]
     (if (empty? remaining)
       (syntax-error (str name " with no following form"))
-      (let [[form after] (read-form remaining in-fn?)]
-        [(node :list (list (symbol-node name) form)) after]))))
+      (let [[form after fpos] (read-form remaining in-fn? rpos)]
+        [(wrap-list-pos (node :list (list (symbol-node name) form)) pos0) after fpos]))))
+
+(defn- metadata-key
+  "The atom key for one `^{…}` map key, which MUST be a keyword node — matching
+   reader.ex's metadata_key. Samples the atom table on the interned name."
+  [k]
+  (if (and (erlang/is_tuple k) (= :keyword (rn/node-tag k)))
+    (let [name (rn/node-name k)]
+      (BeamLisp.AtomGuard/account! name)
+      (erlang/binary_to_atom name))
+    (syntax-error "metadata map keys must be keywords")))
+
+(defn- metadata-spec
+  "Lower the spec form after `^` to a metadata map with atom keys, the shape the
+   compiler's var-metadata writer and the type checker consume — mirroring
+   reader.ex's metadata_spec:
+     ^:kw   → {kw true}         (a keyword node)
+     ^Sym   → {:tag {:symbol Sym}}
+     ^\"str\" → {:tag \"str\"}      (a bare string scalar)
+     ^{…}   → the map itself, keys interned as keyword atoms, values left as
+              raw reader forms (the compiler lowers them when they land)."
+  [spec]
+  (cond
+    (and (erlang/is_tuple spec) (= :keyword (rn/node-tag spec)))
+      (let [name (rn/node-name spec)]
+        (BeamLisp.AtomGuard/account! name)
+        (maps/from_list (list (tuple2 (erlang/binary_to_atom name) true))))
+    (and (erlang/is_tuple spec) (= :symbol (rn/node-tag spec)))
+      (maps/from_list (list (tuple2 :tag spec)))
+    (erlang/is_binary spec)
+      (maps/from_list (list (tuple2 :tag spec)))
+    (and (erlang/is_tuple spec) (= :map (rn/node-tag spec)))
+      (reduce (fn [acc pair]
+                (maps/put (metadata-key (erlang/element 1 pair))
+                          (erlang/element 2 pair)
+                          acc))
+              (maps/new)
+              (rn/node-items spec))
+    :else (syntax-error "metadata must be a Symbol, Keyword, String or Map")))
+
+(defn- attach-meta
+  "Merge metadata map `m` onto `target`, mirroring reader.ex's attach_meta. A
+   target already wrapped `{:meta, form, existing}` (a positioned list, or a
+   previous `^` in a stack like `^:a ^:b x`) merges the maps; anything else gets
+   a fresh `{:meta, target, m}` wrapper. So `^` metadata rides in the SAME
+   {:meta …} channel as source position, and the compiler's `name-author-meta`
+   splits author keys from :line/:col/:file downstream."
+  [target m]
+  (if (and (erlang/is_tuple target) (= :meta (rn/node-tag target)))
+    (rn/meta-node (rn/node-form target) (maps/merge (rn/node-pos target) m))
+    (rn/meta-node target m)))
 
 (defn- read-meta
-  "Read a `^metadata target` form and return just the target, plus remaining source.
+  "Read a `^metadata target` form and return `[wrapped-target remaining pos']`.
 
    The `^` reader macro attaches metadata to the form after it — `^{:ret int}
-   double` tags the symbol `double`, `^:private x` tags `x`. That metadata is
-   used elsewhere (the type checker reads `^{:ret …}`), but the plain form
-   tree this reader produces does not carry it: the answer key
-   (`BeamLisp.Reader/read_all`) drops all metadata before returning, so to
-   match it we read the metadata spec, throw it away, and return the target
-   form alone. First skip whitespace, read the spec form, skip whitespace
-   again, then read and return the target."
-  [chars in-fn?]
-  (let [after-caret (skip-ignored chars)]
+   double` tags the symbol `double`, `^:private x` tags `x`. Unlike read-all
+   (which deep-unwraps everything), read-string KEEPS this metadata: it is
+   author data the compiler reads off a def/defn name (`name-author-meta`) to
+   build the var's metadata map and to feed the type checker. So read the spec,
+   read the target, and return the target wrapped `{:meta, target, spec-map}` —
+   exactly as reader.ex's meta_form does. First skip whitespace, read the spec
+   form, skip whitespace again, then read the target."
+  [chars in-fn? pos0]
+  (let [[after-caret cpos] (skip-pos chars pos0)]
     (if (empty? after-caret)
       (syntax-error "^ with no following metadata")
-      (let [[_spec after-spec] (read-form after-caret in-fn?)
-            remaining (skip-ignored after-spec)]
+      (let [[spec after-spec spos] (read-form after-caret in-fn? cpos)
+            [remaining rpos] (skip-pos after-spec spos)]
         (if (empty? remaining)
           (syntax-error "^ metadata with no target form")
-          (read-form remaining in-fn?))))))
+          (let [[target after tpos] (read-form remaining in-fn? rpos)]
+            [(attach-meta target (metadata-spec spec)) after tpos]))))))
 
 (defn- read-until
-  "Read forms until codepoint `closer` and return `[items remaining-source]`, raising when the collection is unterminated."
-  [chars closer in-fn?]
-  (loop [remaining (skip-ignored chars) acc (list)]
-    (cond
-      (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer))))
-      (= closer (first remaining)) [(reverse acc) (rest remaining)]
-      :else (let [[form after] (read-form remaining in-fn?)]
-              (if (= form :reader-discard)
-                (recur (skip-ignored after) acc)
-                (recur (skip-ignored after) (cons form acc)))))))
+  "Read forms until codepoint `closer` and return `[items remaining-source pos']`,
+   raising when the collection is unterminated. `pos` is the position of the
+   first char after the opener; the returned pos' is the position just past the
+   consumed `closer`. Child positions thread through directly (no re-walk), so
+   the whole descent stays linear in the source length."
+  [chars closer in-fn? pos]
+  (let [[start spos] (skip-pos chars pos)]
+    (loop [remaining start rpos spos acc (list)]
+      (cond
+        (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer))))
+        (= closer (first remaining)) [(reverse acc) (rest remaining) (advance-pos rpos closer)]
+        :else (let [[form after fpos] (read-form remaining in-fn? rpos)
+                    [next npos] (skip-pos after fpos)]
+                (cond
+                  ; #_ discard: contributes nothing.
+                  (= form :reader-discard) (recur next npos acc)
+                  ; #?@ splice: spread the selected collection's items into acc.
+                  ; acc is a prepending stack, so reverse the items before joining.
+                  (splice-marker? form)
+                    (recur next npos (concat (reverse (splice-items* form)) acc))
+                  :else (recur next npos (cons form acc))))))))
 
 (defn- fn-arg-index
   "Return the positive position named by `%` or `%N`, `:rest` for `%&`, and nil for an ordinary symbol name."
@@ -314,98 +474,291 @@
   [items]
   (let [[body maximum rest?] (rewrite-fn-seq items 0 false)
         positional (positional-params maximum)
+        ; `concat` returns a LAZY seq; realize it with `apply list` so the param
+        ; vector node holds a proper list, byte-identical to the Elixir reader.
+        ; An unrealized LazySeq here made the whole `#(… %&)` tree compare
+        ; unequal to the answer key even though its forced contents matched.
         params (if rest?
-                 (concat positional (list (symbol-node "&") (symbol-node "rest__")))
+                 (apply list (concat positional (list (symbol-node "&") (symbol-node "rest__"))))
                  positional)]
     (node :list
       (list (symbol-node "fn")
             (node :vector params)
             (node :list body)))))
 
-(defn- deferred-reader-conditional
-  "Reject a reader conditional explicitly until platform branch selection is ported."
-  []
-  ; TODO(P2-tail): port #? and #?@ branch selection and collection splicing.
-  (syntax-error "reader.bl: reader conditionals not yet ported"))
+; The platform feature this reader answers to. Matches the Elixir reader's
+; @conditional_feature: beam-lisp reads `.cljc` sources, so it presents as
+; `:clj` (plus `:default` as the last-resort branch).
+(def ^:private CONDITIONAL-FEATURE "clj")
 
-(defn- deferred-record-or-tag
-  "Reject a record or tagged-data dispatch explicitly until those extension forms are ported."
-  []
-  ; TODO(P2-tail): port #Name{...} records and #tag[...] data readers.
-  (syntax-error "reader.bl: records and tagged data not yet ported"))
+(defn- feature-selected?
+  "True when a reader-conditional feature keyword name is one this platform takes."
+  [feat]
+  (or (= feat CONDITIONAL-FEATURE) (= feat "default")))
+
+(defn- keyword-node?
+  "True when reader node `n` is a {:keyword name} tuple."
+  [n]
+  (and (erlang/is_tuple n) (= :keyword (first (erlang/tuple_to_list n)))))
+
+(defn- select-conditional
+  "Walk `feat expr feat expr …` reader nodes; return the expr of the first
+   feature this platform takes. `:default` is last-resort. No match raises,
+   as in Clojure — a silent empty read would hide a branch-selection bug."
+  [items]
+  (cond
+    (empty? items) (syntax-error "no matching reader-conditional branch")
+    (empty? (rest items)) (syntax-error "reader conditional has an odd number of forms")
+    :else
+      (let [feat (first items) expr (second items)]
+        (if (not (keyword-node? feat))
+          (syntax-error "reader conditional feature must be a keyword")
+          (if (feature-selected? (second (erlang/tuple_to_list feat)))
+            expr
+            (recur (rest (rest items))))))))
+
+(defn- splice-marker
+  "Turn the selected `#?@` branch (which must be a collection node) into a
+   `[:reader-splice items]` marker that `read-until` and `read-all` spread
+   into their surrounding sequence."
+  [form]
+  (if (and (erlang/is_tuple form)
+           (let [t (first (erlang/tuple_to_list form))]
+             (or (= t :vector) (= t :list) (= t :set))))
+    ; An Erlang tuple sentinel {:reader-splice items} — NOT a bl vector
+    ; [:reader-splice …], which would be a %BeamLisp.Vector and collide with a
+    ; real vector node. `read-until`/`read-all` detect it by is_tuple + head.
+    (rn/->tuple [:reader-splice (second (erlang/tuple_to_list form))])
+    (syntax-error "reader conditional splicing requires a collection")))
+
+(defn- splice-marker?
+  "True when `form` is the {:reader-splice items} sentinel from a #?@ branch."
+  [form]
+  (and (erlang/is_tuple form)
+       (= :reader-splice (first (erlang/tuple_to_list form)))))
+
+(defn- splice-items*
+  "The spread items carried by a {:reader-splice items} sentinel."
+  [form]
+  (second (erlang/tuple_to_list form)))
+
+(defn- read-reader-conditional
+  "Read a `#?(…)` or `#?@(…)` form from `chars` (positioned just after the
+   `?`), returning `[form-or-marker remaining-source pos']`. `pos` is the
+   position of the char after the `?` (i.e. the `@` or `(`)."
+  [chars in-fn? pos]
+  (cond
+    (and (not (empty? chars)) (= 64 (first chars)) (= 40 (second chars)))
+      (let [[items after fpos] (read-until (rest (rest chars)) 41 in-fn? (advance-pos (advance-pos pos 64) 40))]
+        [(splice-marker (select-conditional items)) after fpos])
+    (and (not (empty? chars)) (= 40 (first chars)))
+      (let [[items after fpos] (read-until (rest chars) 41 in-fn? (advance-pos pos 40))]
+        [(select-conditional items) after fpos])
+    :else (syntax-error "reader conditional must be #?( ... ) or #?@( ... )")))
+
+(defn- data-reader-fn
+  "The reader-fn symbol node registered for tag string `tag`, or nil.
+
+   Reads the SAME registry the Elixir reader consults — `priv/data-readers.bl`
+   seeds `#d`/`#time` into it at boot, and a program may add more with
+   `(data-reader! …)`. A hit is `{:ok {:symbol name}}`; a miss is `:error`."
+  [tag]
+  (let [r (BeamLisp.RT/data_reader tag)]
+    (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
+      (erlang/element 2 r)
+      nil)))
+
+(defn- read-tag
+  "Read a hash-dispatch that is a data-reader tag, a record literal, or a bare
+   hash-symbol, and return the pair of form and remaining source.
+
+   A REGISTERED tag wins first: it wraps the following collection or string as
+   a call to its reader-fn, mirroring Clojure data-readers and the Elixir
+   reader. With no registered tag, a following brace makes it a record literal;
+   anything else is a bare hash-symbol (the trailing-hash gensym-marker path)."
+  [chars in-fn? pos0 pos-after-hash]
+  (let [[token after] (take-token chars)
+        tag (chars->string token)
+        fn-sym (data-reader-fn tag)
+        ; position of the char after the tag token (the `[`/`{`/`"` payload)
+        tok-pos (advance-to pos-after-hash chars after)]
+    (cond
+      (not (nil? fn-sym))
+        (cond
+          (empty? after) (syntax-error (str "#" tag " with no following form"))
+          (or (= 91 (first after)) (= 123 (first after)) (= 34 (first after)))
+            ; reader.ex QUIRK, matched for parity: wrap_data_reader reads the
+            ; payload with the `#` position (pos0), not the position after the
+            ; tag — so the payload's inner columns AND the returned pos undercount
+            ; by the tag length + 1. A single `#time"…"` still matches (its own
+            ; wrapper is at pos0), but the sibling after it inherits the short
+            ; column. Passing pos0 (not tok-pos) reproduces it bug-for-bug.
+            (let [[form rest2 fpos] (read-form after in-fn? pos0)]
+              ; A data-reader call is a list; reader.ex positions it at the `#`.
+              [(wrap-list-pos (node :list (list fn-sym form)) pos0) rest2 fpos])
+          :else (syntax-error (str "#" tag " expects a collection or a string")))
+      (and (not (empty? after)) (= 123 (first after)))
+        ; reader.ex QUIRK, matched for parity: record_or_bare reads the `{…}` via
+        ; map_form(map_rest, pos0) — map_rest is already PAST the `{`, and the
+        ; position stays at the `#` (pos0). So the `{` is consumed WITHOUT
+        ; advancing the column, and the map contents thread from pos0. Reading it
+        ; through read-form instead would advance over the `{` (pos0+1) and leave
+        ; the returned pos — hence the next sibling's column — one too high. Read
+        ; the contents directly from (rest after) starting at pos0 to match.
+        (let [[items rest2 fpos] (read-until (rest after) 125 in-fn? pos0)
+              kvs (pair-items items)]
+          ; A record literal is NOT wrapped by reader.ex — stays bare.
+          [(rn/->tuple [:record tag kvs]) rest2 fpos])
+      :else [(classify (cons 35 token)) after (advance-to pos-after-hash chars after)])))
 
 (defn- read-dispatch
-  "Read a hash-prefixed reader form and return `[form remaining-source]`, including sets, discards, and anonymous functions."
-  [chars in-fn?]
-  (cond
-    (empty? chars) [(symbol-node "#") chars]
-    (= 40 (first chars))
-      (if in-fn?
-        (syntax-error "nested #() fn literals are not allowed")
-        (let [[items after] (read-until (rest chars) 41 true)]
-          [(desugar-fn items) after]))
-    (= 123 (first chars))
-      (let [[items after] (read-until (rest chars) 125 in-fn?)]
-        [(node :set items) after])
-    (= 95 (first chars))
-      (let [remaining (skip-ignored (rest chars))]
-        (if (empty? remaining)
-          (syntax-error "#_ must be followed by a form")
-          (let [[_ after-discard] (read-form remaining in-fn?)]
-            [:reader-discard after-discard])))
-    (= 63 (first chars)) (deferred-reader-conditional)
-    :else
-      (let [[token after] (take-token chars)]
-        (if (and (not (empty? after))
-                 (or (= 91 (first after)) (= 123 (first after))))
-          (deferred-record-or-tag)
-          [(classify (cons 35 token)) after]))))
+  "Read a hash-prefixed reader form and return `[form remaining-source pos']`,
+   including sets, discards, and anonymous functions. `pos0` is the position of
+   the `#`; `chars` starts just after it."
+  [chars in-fn? pos0]
+  (let [after-hash (advance-pos pos0 35)]
+    (cond
+      (empty? chars) [(symbol-node "#") chars after-hash]
+      (= 40 (first chars))
+        (if in-fn?
+          (syntax-error "nested #() fn literals are not allowed")
+          ; reader.ex QUIRK, matched for parity: its `#(...)` handler feeds the
+          ; body collection a position still at the `#` (pos0) while the char
+          ; stream is already past `#(`. That 2-column undercount threads through
+          ; the body AND into the returned pos, so the NEXT sibling after a
+          ; fn-literal is 2 short. Passing pos0 (not the advanced position)
+          ; reproduces it exactly; the fn's own wrapper is positioned at pos0 too.
+          (let [[items after fpos] (read-until (rest chars) 41 true pos0)]
+            ; #() desugars to an (fn …) list; reader.ex positions it at the `#`.
+            [(wrap-list-pos (desugar-fn items) pos0) after fpos]))
+      (= 123 (first chars))
+        (let [[items after fpos] (read-until (rest chars) 125 in-fn? (advance-pos after-hash 123))]
+          ; A set is NOT wrapped by reader.ex — stays bare.
+          [(node :set items) after fpos])
+      (= 95 (first chars))
+        ; `#_` discards the next FORM. A stacked `#_ #_ a b` discards two forms:
+        ; the inner `#_ a` yields :reader-discard (nothing), so this `#_` still
+        ; owes a real form — keep reading until one non-discard form is consumed.
+        ; Reading only once left `b` alive (`[1 #_ #_ 2 3 4]` → [1 3 4] not [1 4]).
+        (let [[start spos] (skip-pos (rest chars) (advance-pos after-hash 95))]
+          (loop [remaining start rpos spos]
+            (if (empty? remaining)
+              (syntax-error "#_ must be followed by a form")
+              (let [[form after-discard fpos] (read-form remaining in-fn? rpos)]
+                (if (= form :reader-discard)
+                  (let [[nxt npos] (skip-pos after-discard fpos)] (recur nxt npos))
+                  [:reader-discard after-discard fpos])))))
+      (= 63 (first chars)) (read-reader-conditional (rest chars) in-fn? (advance-pos after-hash 63))
+      :else (read-tag chars in-fn? pos0 after-hash))))
 
 (defn- read-atom
-  "Read one delimiter-bounded atom from `chars` and return its classified value with remaining source."
-  [chars]
+  "Read one delimiter-bounded atom from `chars` and return `[value remaining pos']`.
+   A scalar/symbol/keyword is never wrapped, so only the position is advanced
+   over the token consumed."
+  [chars pos]
   (let [[token after] (take-token chars)]
     (if (empty? token)
       (syntax-error (str "unexpected character " (first chars)))
-      [(classify token) after])))
+      [(classify token) after (advance-to pos chars after)])))
 
 (defn- read-form
-  "Read one form from a non-empty source charlist and return `[bare-reader-node remaining-source]`."
-  [chars in-fn?]
-  (let [head (first chars) tail (rest chars)]
+  "Read one form from a non-empty source charlist and return
+   `[reader-node remaining-source pos']`. `pos` is the position of `chars`'s
+   first character; the returned pos' is the position of the head of the source
+   left unconsumed. Only LIST forms are wrapped with their position (via the
+   collection/prefix/dispatch helpers); every other shape stays bare, matching
+   the Elixir answer key."
+  [chars in-fn? pos]
+  (let [head (first chars) tail (rest chars)
+        tpos (advance-pos pos head)]
     (cond
-      (= head 40) (let [[items after] (read-until tail 41 in-fn?)] [(node :list items) after])
-      (= head 91) (let [[items after] (read-until tail 93 in-fn?)] [(node :vector items) after])
-      (= head 123) (let [[items after] (read-until tail 125 in-fn?)] [(node :map (pair-items items)) after])
+      (= head 40) (let [[items after fpos] (read-until tail 41 in-fn? tpos)] [(wrap-list-pos (node :list items) pos) after fpos])
+      (= head 91) (let [[items after fpos] (read-until tail 93 in-fn? tpos)] [(node :vector items) after fpos])
+      (= head 123) (let [[items after fpos] (read-until tail 125 in-fn? tpos)] [(node :map (pair-items items)) after fpos])
       (= head 41) (syntax-error "unexpected )")
       (= head 93) (syntax-error "unexpected ]")
       (= head 125) (syntax-error "unexpected }")
-      (= head 39) (wrap-prefix tail "quote" in-fn?)
-      (= head 96) (wrap-prefix tail "syntax-quote" in-fn?)
+      (= head 39) (wrap-prefix tail "quote" in-fn? pos)
+      (= head 96) (wrap-prefix tail "syntax-quote" in-fn? pos)
       (= head 126)
         (if (and (not (empty? tail)) (= 64 (first tail)))
-          (wrap-prefix (rest tail) "unquote-splicing" in-fn?)
-          (wrap-prefix tail "unquote" in-fn?))
-      (= head 64) (wrap-prefix tail "deref" in-fn?)
-      (= head 35) (read-dispatch tail in-fn?)
-      (= head 94) (read-meta tail in-fn?)
-      (= head 34) (read-string-body tail)
+          (wrap-prefix (rest tail) "unquote-splicing" in-fn? pos)
+          (wrap-prefix tail "unquote" in-fn? pos))
+      (= head 64) (wrap-prefix tail "deref" in-fn? pos)
+      (= head 35) (read-dispatch tail in-fn? pos)
+      (= head 94) (read-meta tail in-fn? pos)
+      (= head 34) (read-string-body tail tpos)
       (and (= head 58) (not (empty? tail)) (= 34 (first tail)))
-        (let [[name after] (read-string-body (rest tail))] [(node :keyword name) after])
-      :else (read-atom chars))))
+        (let [[name after spos] (read-string-body (rest tail) (advance-pos tpos 34))] [(node :keyword name) after spos])
+      :else (read-atom chars pos))))
 
-(defn read-all
-  "Read binary source text `src` into a list of bare reader-node forms so compilers and tools can consume its structure."
-  [src]
+(defn- unwrap-deep
+  "Strip every {:meta node pos} source-position wrapper, top-level and nested,
+   so a position-free caller sees the bare reader shapes it always matched on.
+   This is reader.ex's `unwrap_deep`, ported: `read-all` returns these bare
+   trees, while `read-string` keeps the wrappers for the compiler."
+  [form]
+  (cond
+    (not (erlang/is_tuple form)) form
+    :else
+      (let [tag (first (erlang/tuple_to_list form))]
+        (cond
+          (= tag :meta) (unwrap-deep (rn/node-form form))
+          (or (= tag :list) (= tag :vector) (= tag :set))
+            (node tag (apply list (map unwrap-deep (second (erlang/tuple_to_list form)))))
+          (= tag :map)
+            (node :map (apply list (map (fn [pair]
+                                          (tuple2 (unwrap-deep (erlang/element 1 pair))
+                                                  (unwrap-deep (erlang/element 2 pair))))
+                                        (second (erlang/tuple_to_list form)))))
+          (= tag :record)
+            (let [parts (erlang/tuple_to_list form)]
+              (rn/->tuple [:record (second parts)
+                           (apply list (map (fn [pair]
+                                              (tuple2 (unwrap-deep (erlang/element 1 pair))
+                                                      (unwrap-deep (erlang/element 2 pair))))
+                                            (nth parts 2)))]))
+          :else form))))
+
+(defn- read-forms*
+  "The shared position-threading read loop: read every top-level form from
+   binary `src`, attributing each to line/col in `file`, and return the list of
+   forms WITH their {:meta …} position wrappers intact. `read-string` returns
+   these directly; `read-all` deep-unwraps them."
+  [src file]
   ; `unicode/characters_to_list`, not `binary_to_list`: source text is UTF-8,
   ; so a multi-byte character (an em-dash, an accented letter) must become ONE
   ; codepoint, not several raw bytes. `binary_to_list` would split it into
   ; bytes and a later re-encode would mangle it — the answer key reads with
   ; the codepoint-aware conversion, so this must too.
-  (loop [chars (skip-ignored (unicode/characters_to_list src)) forms (list)]
-    (if (empty? chars)
-      (reverse forms)
-      (let [[form after] (read-form chars false)]
-        (if (= form :reader-discard)
-          (recur (skip-ignored after) forms)
-          (recur (skip-ignored after) (cons form forms)))))))
+  ; Reset the per-process atom-intern counter at the start of every read, so
+  ; the guard's sampling cadence never leaks between reads and concurrent
+  ; readers don't interfere (mirrors reader.ex's Process.put at read entry).
+  (BeamLisp.AtomGuard/reset)
+  (let [[start spos] (skip-pos (unicode/characters_to_list src) (make-pos 1 1 file))]
+    (loop [chars start rpos spos forms (list)]
+      (if (empty? chars)
+        (reverse forms)
+        (let [[form after fpos] (read-form chars false rpos)
+              [nxt npos] (skip-pos after fpos)]
+          (cond
+            (= form :reader-discard) (recur nxt npos forms)
+            (splice-marker? form)
+              (recur nxt npos (concat (reverse (splice-items* form)) forms))
+            :else (recur nxt npos (cons form forms))))))))
+
+(defn read-string
+  "Read binary source text `src` into reader-node forms WITH source-position
+   {:meta …} wrappers, attributed to `file`. This is the position-bearing entry
+   the compiler needs (a diagnostic points at file:line off these wrappers);
+   `read-all` is the position-free entry for tools that only want bare shapes."
+  [src file]
+  (read-forms* src file))
+
+(defn read-all
+  "Read binary source text `src` into a list of BARE reader-node forms (source
+   positions deep-unwrapped) so compilers and tools can consume its structure.
+   Mirrors reader.ex's read_all/1, which also strips positions, so the parity
+   suite compares like with like."
+  [src]
+  (map unwrap-deep (read-forms* src nil)))

@@ -37,13 +37,13 @@ fields:
 
 ```clojure
 (def weather
-  (mock/contract-from
+  (veritas.mock/contract-from
     [["temp" "Int"] ["humidity" "Int"] ["code" "Int"]]
     ["(>= temp -90)" "(<= temp 60)"
      "(>= humidity 0)" "(<= humidity 100)"
      "(>= code 200)" "(<= code 599)"]))
 
-(mock/synth port weather "")
+(veritas.mock/synth port weather "")
 ;; → {:temp 0 :humidity 0 :code 200}   — a valid response, from the laws alone
 ```
 
@@ -64,7 +64,7 @@ to response, with no hidden state:
 
 ```clojure
 (defn serve [city]
-  (mock/synth-seeded port weather "temp" (erlang/rem (erlang/phash2 city) 60)))
+  (veritas.mock/synth-seeded port weather "temp" (erlang/rem (erlang/phash2 city) 60)))
 
 (serve "paris")  ;; → always the same response for "paris"
 ```
@@ -78,8 +78,8 @@ The boundary values a hand-written mock always forgets. z3's optimizer finds the
 coldest and hottest response the contract still admits:
 
 ```clojure
-(mock/synth-boundary port weather "temp" :min)  ;; → {:temp -90 …}  the exact edge
-(mock/synth-boundary port weather "temp" :max)  ;; → {:temp  60 …}
+(veritas.mock/synth-boundary port weather "temp" :min)  ;; → {:temp -90 …}  the exact edge
+(veritas.mock/synth-boundary port weather "temp" :max)  ;; → {:temp  60 …}
 ```
 
 Add a law, and its two edges come with it, for free.
@@ -90,7 +90,7 @@ Assert the **negation** of the contract and every value the solver returns is,
 by definition, a violation:
 
 ```clojure
-(mock/synth-invalid port weather)
+(veritas.mock/synth-invalid port weather)
 ;; → {:temp 61 :humidity 101 :code 0}   — every field out of contract
 ```
 
@@ -106,8 +106,8 @@ Ask whether the contract is satisfiable at all. A law set no value can satisfy
 is a broken **spec** — found with no implementation, no mock, nothing:
 
 ```clojure
-(mock/contract-from [["temp" "Int"]] ["(> temp 60)" "(< temp -90)"])
-(mock/satisfiable-status port that)   ;; → "unsat"  — the spec is impossible
+(veritas.mock/contract-from [["temp" "Int"]] ["(> temp 60)" "(< temp -90)"])
+(veritas.mock/satisfiable-status port that)   ;; → "unsat"  — the spec is impossible
 ```
 
 The moment you can *state* a contract, you can ask if it is *realizable*. A spec
@@ -189,7 +189,7 @@ If the solver finds a value, it breaks that one law and nothing else — an
 **isolated mutant**:
 
 ```clojure
-(fault/error-for port weather 1)   ;; clause 1 is (<= temp 60)
+(veritas.fault/error-for port weather 1)   ;; clause 1 is (<= temp 60)
 ;; => {:temp 61 :humidity 0 :code 200}   — wrong for temp<=60, valid everywhere else
 ```
 
@@ -197,7 +197,7 @@ So "give me an error" stops being vague. `errors` returns the whole catalogue,
 one entry per law, keyed by the law it breaks:
 
 ```clojure
-(fault/errors port weather)
+(veritas.fault/errors port weather)
 ;; => {0 {:temp -41 ...}    ; breaks (>= temp -40)
 ;;     1 {:temp 61 ...}     ; breaks (<= temp 60)
 ;;     3 {:humidity -1 ...} ; breaks (>= humidity 0)
@@ -213,10 +213,12 @@ for it; and the verdict travels *with* the response, so the test knows which cas
 it got — no branch in the caller:
 
 ```clojure
-(def server (fault/make-server port weather "temp" {:bad-temp 1 :bad-code 6}))
-(fault/serve server :normal)    ;; => {:ok? true  :reason nil :value {...valid...}}
-(fault/serve server :bad-temp)  ;; => {:ok? false :reason 1   :value {:temp 61 ...}}
-(fault/serve server :bad-code)  ;; => {:ok? false :reason 6   :value {:code 600 ...}}
+;; the server wraps a veritas.mock server (the valid path) with named injections:
+(def base   (veritas.mock/make-mock port weather "temp"))
+(def server (veritas.fault/make-server base {:bad-temp 1 :bad-code 6}))
+(veritas.fault/serve server :normal)    ;; => {:ok? true  :reason nil :value {...valid...}}
+(veritas.fault/serve server :bad-temp)  ;; => {:ok? false :reason 1   :value {:temp 61 ...}}
+(veritas.fault/serve server :bad-code)  ;; => {:ok? false :reason 6   :value {:code 600 ...}}
 ```
 
 The injection is data. A test drives the server through its happy path and any
@@ -244,7 +246,7 @@ what it was built to break) — and the hard questions become ordinary queries:
 One call runs all of it:
 
 ```clojure
-(fault/report port weather)
+(veritas.fault/report port weather)
 ;; => {:clauses 7 :faults 6
 ;;     :covered   (0 1 3 4 5 6)
 ;;     :uncovered (2)                          ; a blind spot...
@@ -266,8 +268,8 @@ the same solver, the same predicate, run the other way. Pin the value into the
 ensures and ask whether they can be violated; UNSAT means it holds:
 
 ```clojure
-(mock/check port weather (mock/synth port weather ""))  ;; → true
-(mock/check port weather (mock/synth-invalid port weather))  ;; → false
+(veritas.mock/check port weather (veritas.mock/synth port weather ""))  ;; → true
+(veritas.mock/check port weather (veritas.mock/synth-invalid port weather))  ;; → false
 ```
 
 The two directions verify each other. This is the same discipline the state-
@@ -283,7 +285,7 @@ nonlinear spec unsatisfiable can spin forever. So the engine bounds every query
 with a solver timeout and treats the result honestly:
 
 ```clojure
-(mock/satisfiable-status port nonlinear-impossible-contract)  ;; → "unknown"
+(veritas.mock/satisfiable-status port nonlinear-impossible-contract)  ;; → "unknown"
 ```
 
 `"unknown"` is never mistaken for `"sat"` or `"unsat"`. The engine will not
@@ -310,20 +312,27 @@ constraints are decided both ways; nonlinear ones synthesize but may not prove.
 
 ## Where it lives
 
-- `priv/mock.bl` — the synthesis engine: `synth`, `synth-seeded`,
-  `synth-boundary`, `synth-invalid`, `satisfiable-status`, `check`,
-  `contract-from`.
-- `priv/mock/fault.bl` — the fault space: `error-for`, `errors`, `make-server`,
-  `serve`, `isolate`/`isolate-all`, and the datalog analysis (`report`,
-  `uncovered-clauses`, `faults-per-clause`, `redundant-mutants`,
-  `independent-laws`).
-- `examples/mock/00-a-contract-is-a-mock.bl` — the core loop on integer fields.
-- `examples/mock/01-how-far-it-reaches.bl` — strings, reals, relations, and the
-  honest `unknown`.
-- `examples/mock/02-the-sandbox-picks-the-mock.bl` — the world chooses real vs
-  mock, with no branch in the caller.
-- `examples/mock/03-the-fault-space-is-data.bl` — errors on demand, a mock server
-  that injects them, and the datalog robustness report.
+This guide is the `veritas.mock` + `veritas.fault` layers of the veritas family
+(see `docs/one-verb-over-generators.md` for the unifying core). The synthesis
+direction here is the general `veritas/exists` grown into a server; the fault
+space is `veritas/faults` plus its datalog analysis half.
+
+- `priv/veritas/mock.bl` (`ns veritas.mock`) — the synthesis engine: `synth`,
+  `synth-seeded`, `synth-boundary`, `synth-invalid`, `satisfiable-status`,
+  `check`, `contract-from`, and the server `make-mock`/`answer`.
+- `priv/veritas/fault.bl` (`ns veritas.fault`) — the fault space: `error-for`,
+  `errors`, `make-server`, `serve`, `isolate`/`isolate-all`, and the datalog
+  analysis (`report`, `uncovered-clauses`, `faults-per-clause`,
+  `redundant-mutants`, `independent-laws`).
+- `priv/veritas.bl` — the shared core: the `Gen` protocol, `check` escalator,
+  `parse-model` (a z3 model IS a value), and the `exists`/`for-all`/`covers`/
+  `faults` these layers build on.
+- `examples/veritas/03-the-mock-server.bl` — a contract as a deterministic server,
+  with boundaries and the adversarial case.
+- `examples/veritas/04-the-fault-space.bl` — z3 generates isolated faults, datalog
+  analyses coverage/redundancy, and a server injects errors by name.
+- `test/bl/veritas/mock_test.bl`, `test/bl/veritas/fault_test.bl` — the assurance
+  suites for both layers.
 
 ## What is proven, and what is next
 

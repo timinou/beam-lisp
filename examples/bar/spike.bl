@@ -1,0 +1,194 @@
+; examples/bar/spike.bl — the loom.bar spike: a REAL Wayland layer surface,
+; drawn by pure beam-lisp, on your running compositor.
+;
+;   Run:  mix beam_lisp.run examples/bar/spike.bl
+;
+; The acceptance, stated up front:
+;   1. `niri msg layers` lists namespace "loom-bar-spike" (a Top layer surface).
+;   2. A 44px translucent bar appears at the top of every output: title left,
+;      clock right, both from a PSF-extracted pixel atlas (loom.bar.text).
+;   3. Hover the bar: the title highlights (pointer events → conn facts →
+;      re-project — no callback mutates a pixel).
+;   4. `kill -9` the BEAM: the bar dies; rerun, it is back. (The supervisor
+;      tree is phase 1; the spike proves the pixel pipeline.)
+;
+; Everything below the conn is data: the protocol tables (wayland.protocols),
+; the font atlas (loom.bar.text), the ops (loom.bar.canvas). The one native
+; seam is the memfd (wayland.shm); the fd rides SCM_RIGHTS to the compositor.
+
+(ns bar.spike
+  (:require [wayland.wire :as wire]
+            [wayland.conn :as conn]
+            [wayland.shm :as shm]
+            [wayland.protocols :as proto]
+            [loom.bar.canvas :as canvas]
+            [loom.bar.text :as text]))
+
+;; ── the canvas: geometry + palette (premultiplied ARGB) ──────────────
+
+(def W 2560)
+(def H 44)
+(def STRIDE (* W 4))
+
+(defn pm [a r g b]
+  "Premultiplied ARGB: channels scaled by alpha (wl_shm wants premult)."
+  (let [f (fn [c] (quot (* c a) 255))]
+    (wire/argb a (f r) (f g) (f b))))
+
+(def BG     (pm 234 15 17 24))               ; translucent slate — blur shows through
+(def FG     (wire/argb 255 226 229 236))
+(def FG-DIM (wire/argb 255 128 136 150))
+(def ACCENT (wire/argb 255 128 168 255))
+
+(defn- b4 [c] (wire/bytes-of (wire/u32-le c)))
+(def FG4 (b4 FG))
+(def FG-DIM4 (b4 FG-DIM))
+(def ACCENT4 (b4 ACCENT))
+(def BG4 (b4 BG))
+
+;; ── the view: db → ops + hit regions (THE pure projection) ───────────
+
+(defn- pad2 [n] (if (< n 10) (str "0" n) (str n)))
+
+(defn now-str []
+  (let [t (erlang/apply :calendar :local_time (list))
+        tm (erlang/element 2 t)]
+    (str (pad2 (erlang/element 1 tm)) ":"
+         (pad2 (erlang/element 2 tm)) ":"
+         (pad2 (erlang/element 3 tm)))))
+
+(def TITLE "BEAM-LISP | wl-spike")
+(def PAD 16)
+
+(defn view
+  "db → {:ops … :regions …}. Hover is CHOSEN here, from facts — the same
+   shape live views use; the renderer is a dumb assembler downstream."
+  [db]
+  (let [hover (:hover db)
+        title-run (if (= hover :title)
+                    (text/render TITLE ACCENT4 BG4 2)
+                    (text/render TITLE FG-DIM4 BG4 2))
+        clk-run (text/render (:now db) FG4 BG4 2)
+        clk-x (- W PAD (:w clk-run))]
+    {:ops [[:glyphs {:x PAD :y 6 :run title-run}]
+           [:glyphs {:x clk-x :y 6 :run clk-run}]]
+     :regions {:title [PAD (+ PAD (:w title-run))]
+               :clock [clk-x (+ clk-x (:w clk-run))]}}))
+
+(defn hover-at
+  "Which region holds pixel x — the tree walked in reverse (bar.hit's job,
+   inlined for the spike)."
+  [regions x]
+  (if (nil? x)
+    nil
+    (loop [ks (keys regions)]
+      (if (empty? ks)
+        nil
+        (let [k (first ks)
+              r (nth (get regions k) 0)
+              x1 (nth (get regions k) 1)]
+          (if (and (>= x r) (<= x x1)) k (recur (rest ks))))))))
+
+;; ── paint: ops → frame → memfd → attach/damage/frame/commit ──────────
+
+(defn paint! [c db]
+  (let [ops (:ops (view db))
+        frame (canvas/frame ops BG W H)
+        idx (:buf-idx c)
+        buf (nth (:buffers c) idx)
+        off (* idx (* STRIDE H))
+        _ (shm/pool-write (:pool-fd c) off frame)
+        [c1 _cb] (conn/request c (:surface c) 3 [:alloc])
+        c2 (conn/mount! c1 _cb "wl_callback"
+                        (fn [c _op _args] (assoc c :repaint true)))
+        [c3 _] (conn/request c2 (:surface c2) 1 [buf 0 0])
+        [c4 _] (conn/request c3 (:surface c3) 2 [0 0 W H])
+        [c5 _] (conn/request c4 (:surface c4) 6 [])
+        c6 (assoc c5 :buf-idx (rem (inc idx) 2) :repaint false)]
+    [c6 db]))
+
+(defn ensure-pool!
+  "One memfd, two buffers. The fd crosses to the compositor inside the
+   create_pool request — conn/request routes it to SCM_RIGHTS."
+  [c]
+  (let [size (* 2 STRIDE H)
+        fd (shm/pool-new size)
+        [c1 pool] (conn/request c (:shm c) 0 [:alloc fd size])
+        [c2 b0] (conn/request c1 pool 0 [:alloc 0 W STRIDE proto/format-argb8888])
+        [c3 b1] (conn/request c2 pool 0 [:alloc (* STRIDE H) W STRIDE proto/format-argb8888])]
+    (assoc c3 :pool-fd fd :pool pool :buffers [b0 b1] :buf-idx 0)))
+
+;; ── the loop: pump events, project, repaint on change ────────────────
+
+(defn wait-configure [c tries]
+  (cond
+    (:configure c) (:configure c)
+    (:closed c) (erlang/error "layer surface closed before configure")
+    (zero? tries) (erlang/error "no configure within ~6s")
+    :else (let [[kind c2] (conn/pump c 200)]
+            (if (= kind :event)
+              (recur c2 (dec tries))
+              (recur c (dec tries))))))
+
+(defn loop! [c db]
+  (let [now (now-str)
+        db1 (if (not= now (:now db)) (assoc db :now now) db)
+        regions (:regions (view db1))
+        db2 (assoc db1 :hover (hover-at regions (:pointer-x db1)))
+        dirty? (or (:repaint c) (not= db2 db))
+        c1 (dissoc c :repaint)
+        [c2 db3] (if dirty? (paint! c1 db2) [c1 db2])]
+    (let [[kind c4] (conn/pump c2 200)]
+      (cond
+        (= kind :closed) (println "✗ display socket closed")
+        (= kind :event) (recur c4 db3)
+        :else (recur c4 db3)))))
+
+;; ── boot ─────────────────────────────────────────────────────────────
+
+(let [r (conn/connect!)]
+  (if (contains? r :error)
+    (println "✗" (:error r))
+    (let [c0 (:ok r)
+          [c1 _reg] (conn/prime! c0)
+          c2 (conn/roundtrip c1)
+          _ (println (str "✓ connected — " (count (:globals c2)) " globals"))
+          [c3 comp] (conn/bind! c2 "wl_compositor")
+          [c4 shmv] (conn/bind! c3 "wl_shm")
+          [c5 seat] (conn/bind! c4 "wl_seat")
+          [c6 lshell] (conn/bind! c5 "zwlr_layer_shell_v1")
+          c6b (assoc c6 :compositor comp :shm shmv :seat seat :layer-shell lshell)
+          _ (println (str "✓ bound compositor/shm/seat/layer-shell"))
+          [c7 surf] (conn/request c6b comp 0 [:alloc])
+          [c8 lsurf] (conn/request c7 lshell 0 [:alloc surf 0 proto/layer-top "loom-bar-spike"])
+          c9 (conn/mount! c8 lsurf "zwlr_layer_surface_v1"
+                          (fn [c op args]
+                            (cond
+                              (= op 0) (let [vs (to-list args)]
+                                         (assoc c :configure {:serial (nth vs 0)}))
+                              (= op 1) (assoc c :closed true)
+                              :else c)))
+          c10 (conn/mount! c9 seat "wl_seat"
+                           (fn [c _op _args] c))
+          [c11 ptr] (conn/request c10 seat 0 [:alloc])
+          c12 (conn/mount! c11 ptr "wl_pointer"
+                           (fn [c op args]
+                             (let [vs (to-list args)]
+                               (cond
+                                 (= op 0) (assoc-in c [:db :pointer-x] (nth vs 2))
+                                 (= op 2) (assoc-in c [:db :pointer-x] (nth vs 1))
+                                 (= op 1) (assoc-in c [:db :pointer-x] nil)
+                                 (= op 3) (do (println (str "  button " (nth vs 2) " state " (nth vs 3))) c)
+                                 :else c))))
+          _ (println (str "✓ layer surface ns=loom-bar-spike (obj " lsurf ") — awaiting configure"))
+          cfg (wait-configure c12 30)
+          [c13 _] (conn/request c12 lsurf 0 [0 H])
+          [c14 _] (conn/request c13 lsurf 1 [(+ proto/anchor-top proto/anchor-left proto/anchor-right)])
+          [c15 _] (conn/request c14 lsurf 2 [H])
+          [c16 _] (conn/request c15 lsurf 6 [(:serial cfg)])
+          c17 (ensure-pool! c16)
+          c18 (assoc c17 :surface surf :layer-surface lsurf)
+          db {:now (now-str) :pointer-x nil :hover nil}
+          [c19 db1] (paint! c18 db)]
+      (println "✓ first frame committed — the bar is live (Ctrl-C to stop)")
+      (loop! c19 db1))))

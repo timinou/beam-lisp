@@ -270,6 +270,8 @@ defmodule BeamLisp.Loader do
       end
   end
 
+  @doc_extensions [".bl", ".bl.md", ".bl.org"]
+
   # Search the load paths for a regular `<ns>.bl` whose declared ns
   # matches. Returns {:ok, path, content} for the first matching file;
   # else the first same-named file whose declared ns differs (so the
@@ -280,7 +282,7 @@ defmodule BeamLisp.Loader do
   # the require. The matching file's content is returned to avoid
   # reading it twice: once for the ns check, once for the load.
   defp find_file(ns) do
-    rel = String.replace(ns, ".", "/") <> ".bl"
+    base = String.replace(ns, ".", "/")
 
     Enum.reduce(search_dirs(), nil, fn dir, acc ->
       case acc do
@@ -288,18 +290,27 @@ defmodule BeamLisp.Loader do
           acc
 
         _ ->
-          path = Path.join(dir, rel)
+          Enum.reduce(@doc_extensions, acc, fn ext, acc ->
+            case acc do
+              {:ok, _, _} ->
+                acc
 
-          if File.regular?(path) do
-            content = File.read!(path)
+              _ ->
+                path = Path.join(dir, base <> ext)
 
-            case declared_ns(content) do
-              ^ns -> {:ok, path, content}
-              other -> acc || {:wrong_ns, path, other}
+                if File.regular?(path) do
+                  raw = File.read!(path)
+                  content = doc_content(path, raw)
+
+                  case declared_ns(content) do
+                    ^ns -> {:ok, path, content}
+                    other -> acc || {:wrong_ns, path, other}
+                  end
+                else
+                  acc
+                end
             end
-          else
-            acc
-          end
+          end)
       end
     end)
   end
@@ -309,6 +320,71 @@ defmodule BeamLisp.Loader do
   # whose first form is not `(ns …)` declares no namespace and returns
   # nil. Only the head is consumed — the scan stops at the end of the
   # ns name, and the file's body is left for the eventual load to parse.
+  # A document's loadable source: itself when plain .bl, else its code cells.
+  defp doc_content(path, raw) do
+    if String.ends_with?(path, ".bl") do
+      raw
+    else
+      doc_source(raw, if(String.ends_with?(path, ".org"), do: :org, else: :md))
+    end
+  end
+  @doc """
+  The program of a livebook document: every code cell concatenated, in
+  document order. `format` is `:md` for `.bl.md` (fenced beam-lisp cells)
+  or `:org` for `.bl.org` (#+begin_src beam-lisp blocks).
+
+  This is the loader's MINIMAL read-side extractor — it must stay
+  dependency-free because it runs below the var registry, mid-load. The
+  full-fidelity twin (ids, result spans, round-tripping) is `bl.doc` in
+  priv/bl/doc.bl, and the test suite pins the two equal on every fixture.
+  """
+  def doc_source(raw, format) when format in [:md, :org] do
+    raw
+    |> String.split("\n")
+    |> collect_doc_cells(format, [])
+    |> Enum.reverse()
+    |> List.flatten()
+    |> Enum.join("\n")
+  end
+
+  defp collect_doc_cells([], _format, acc), do: acc
+
+  defp collect_doc_cells([line | rest], format, acc) do
+    trimmed = String.trim(line)
+
+    open? =
+      if format == :md do
+        String.starts_with?(trimmed, "```beam-lisp")
+      else
+        String.starts_with?(trimmed, "#+begin_src beam-lisp")
+      end
+
+    if open? do
+      closer =
+        if format == :md do
+          fn l -> String.trim(l) == "```" end
+        else
+          fn l -> String.trim(l) == "#+end_src" end
+        end
+
+      {body, rest} = take_until(rest, closer)
+      collect_doc_cells(rest, format, [body | acc])
+    else
+      collect_doc_cells(rest, format, acc)
+    end
+  end
+
+  defp take_until(lines, pred), do: take_until(lines, pred, [])
+
+  defp take_until([], _pred, acc), do: {Enum.reverse(acc), []}
+
+  defp take_until([line | rest], pred, acc) do
+    if pred.(line) do
+      {Enum.reverse(acc), rest}
+    else
+      take_until(rest, pred, [line | acc])
+    end
+  end
   defp declared_ns(source) do
     case skip_leading(source) do
       "(" <> rest ->

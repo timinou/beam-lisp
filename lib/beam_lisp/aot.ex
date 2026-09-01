@@ -886,7 +886,26 @@ defmodule BeamLisp.AOT do
     Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
 
     try do
-      case Code.compile_quoted(block, filename) do
+      # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
+      #
+      # `Code.compile_quoted/2` unconditionally wraps compilation in
+      # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
+      # checker — and there is NO compiler option to turn it off (the
+      # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
+      # which this AOT path does not use). That checker verifies every emitted
+      # module against the WHOLE set of modules loaded in the compile VM, so its
+      # cost grows with the image: once a dense library (minikanren) is loaded,
+      # verifying a later tuple-dense generated namespace (datom.query.magic)
+      # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
+      # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
+      #
+      # The check earns NOTHING here: the source was already validated by the
+      # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
+      # correct by construction (shims forward to body modules). The primitive
+      # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
+      # calls under its verify wrapper — produces byte-identical beams without
+      # the checker pass.
+      case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
         [] -> raise "AOT: compiling a namespace produced no module"
         mods -> mods
       end

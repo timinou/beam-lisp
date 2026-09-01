@@ -1,0 +1,510 @@
+; bl/doc.bl — the livebook: a .bl.md or .bl.org file, as data.
+;
+; A document is a namespace wearing prose. This file is the one place that
+; knows the two dialects (.bl.md fences, .bl.org src blocks) and compiles
+; both into ONE span model:
+;
+;   {:format :md|:org :path "…" :ns "payroll"
+;    :spans [ {:kind :prose  :lines […]}                  byte-sacrosanct
+;             {:kind :cell   :id "gross" :frozen? false   code, evaluable
+;              :silent? false :info "…raw info line…"
+;              :lines […]}
+;             {:kind :result :id "sanity" :lines […]}     the ONLY thing
+;                                                         the tool writes
+;             {:kind :prose-code :lang "elixir" :lines […]} }  plain fences
+;
+; ── The covenant ───────────────────────────────────────────────────────
+;
+; The tool owns exactly one span kind: results. Prose and cells are preserved
+; byte-for-byte, always — editors, git, and Obsidian all see a normal file.
+; `render-doc` echoes a slice back unchanged (the spans partition the file
+; exactly), and only `write-results` produces different text, touching result
+; spans and nothing else. A cell with no result span yet gets one inserted
+; right after it; an existing span is rewritten IN PLACE, wherever the author
+; put it.
+;
+; ── The dialects ───────────────────────────────────────────────────────
+;
+; .bl.md    ```beam-lisp id=gross frozen       → cell
+;           ```bl-result gross                 → owned span
+; .bl.org   #+begin_src beam-lisp :id gross :frozen
+;           #+RESULTS: gross                   → owned span (org-babel shape)
+;
+; `frozen` cells are not evaluated (their stored result IS the truth);
+; `silent` cells run but never show a result. Unknown info tokens are
+; preserved verbatim — the format grows without a migration.
+;
+; Cell ids: explicit `id=` / `:id`, else derived from the cell's first
+; definition (`(defn gross …)` → "gross"), else "cell-N". Derivation is
+; deterministic in document content and order, so ids are stable across
+; runs without being rewritten into the file.
+
+(ns bl.doc)
+
+;; ── small string plumbing ─────────────────────────────────────────────
+
+(defn trim-tokens
+  "The non-blank tokens of a line, as a list."
+  [s]
+  (filter (fn [t] (not (blank? t))) (split (trim s) " ")))
+
+(defn- md-attrs
+  "A markdown fence's attribute tokens: `id=gross`, `frozen`, `silent`.
+   Anything unrecognised is ignored here and preserved in the file, because
+   the raw info line is never rewritten."
+  [tokens]
+  (loop [ts tokens, m {:id nil :frozen? false :silent? false}]
+    (if (empty? ts)
+      m
+      (let [t (first ts)]
+        (cond
+          (starts-with? t "id=") (recur (rest ts) (assoc-in m [:id] (subs t 3 (count t))))
+          (= t "frozen")         (recur (rest ts) (assoc-in m [:frozen?] true))
+          (= t "silent")         (recur (rest ts) (assoc-in m [:silent?] true))
+          :else                  (recur (rest ts) m))))))
+
+(defn- org-attrs
+  "An org src header's `:id name :frozen :silent` tokens."
+  [tokens]
+  (loop [ts tokens, m {:id nil :frozen? false :silent? false}]
+    (cond
+      (empty? ts)              m
+      (= (first ts) ":id")     (if (empty? (rest ts))
+                                 m
+                                 (recur (rest (rest ts))
+                                        (assoc-in m [:id] (first (rest ts)))))
+      (= (first ts) ":frozen") (recur (rest ts) (assoc-in m [:frozen?] true))
+      (= (first ts) ":silent") (recur (rest ts) (assoc-in m [:silent?] true))
+      :else                    (recur (rest ts) m))))
+
+(defn- find-line
+  "First index ≥ from whose line satisfies pred, else nil."
+  [lines from pred]
+  (loop [k from]
+    (cond
+      (>= k (count lines)) nil
+      (pred (nth lines k)) k
+      :else                (recur (inc k)))))
+
+(defn- slice-lines
+  "The lines at indexes a..(b-1), as a list in order."
+  [lines a b]
+  (loop [k (dec b), acc (list)]
+    (if (< k a) acc (recur (dec k) (cons (nth lines k) acc)))))
+
+(defn- append-prose
+  "Flush pending prose lines (accumulated back-to-front) onto the span list —
+   both are in reverse order here; the scanners reverse once at the end."
+  [prose spans]
+  (if (empty? prose) spans (cons {:kind :prose :lines (reverse prose)} spans)))
+
+;; ── the markdown scanner ──────────────────────────────────────────────
+
+(defn- md-open?
+  "A ```-opening line's {:kind :attrs :lang :id} — ANY fenced block opens,
+   because a plain ``` block is legal markdown prose and must be consumed
+   until its close so its body is never mistaken for new fences."
+  [line]
+  (let [t (trim line)]
+    (when (starts-with? t "```")
+      (let [toks (trim-tokens t)
+            lang (subs (first toks) 3 (count (first toks)))]
+        (cond
+          (= lang "beam-lisp") {:kind :cell :lang lang
+                                :attrs (md-attrs (rest toks)) :id nil}
+          (= lang "bl-result") {:kind :result :lang lang :attrs nil
+                                :id (if (empty? (rest toks)) "" (first (rest toks)))}
+          :else                {:kind :prose-code :lang lang :attrs nil :id nil})))))
+
+(defn- md-close?
+  "A ```-only line closes a fence."
+  [line]
+  (= (trim line) "```"))
+
+(defn- md-span
+  "The span one markdown fence becomes, given its open record, raw header
+   line, and body lines."
+  [open header body]
+  (cond
+    (= (:kind open) :cell)
+    {:kind :cell :lang "beam-lisp"
+     :frozen? (:frozen? (:attrs open))
+     :silent? (:silent? (:attrs open))
+     :explicit-id (:id (:attrs open))
+     :info header
+     :lines body}
+
+    (= (:kind open) :result)
+    {:kind :result :id (:id open) :lines body}
+
+    :else
+    {:kind :prose-code :lang (:lang open) :lines body}))
+
+(defn- slice-md-lines
+  "The markdown scanner: one flat pass. {:ok spans} | {:error {:line :why}}."
+  [lines]
+  (loop [i 0, prose [], spans []]
+    (cond
+      (>= i (count lines))
+      {:ok (append-prose prose spans)}
+
+      :else
+      (let [open (md-open? (nth lines i))]
+        (if (nil? open)
+          (recur (inc i) (cons (nth lines i) prose) spans)
+          (let [end (find-line lines (inc i) md-close?)]
+            (if (nil? end)
+              {:error {:line (inc i) :why "unterminated fence (no closing ```)"}}
+              (let [span (md-span open (nth lines i) (slice-lines lines i (inc end)))]
+                (recur (inc end) [] (cons span (append-prose prose spans)))))))))))
+
+;; ── the org scanner ───────────────────────────────────────────────────
+
+(defn- org-results-id
+  "A #+RESULTS line's block id, or nil: `#+RESULTS: sanity`, `#+RESULTS[name]`.
+   A bare `#+RESULTS:` matches nothing and passes through as prose, verbatim."
+  [line]
+  (let [t (trim line)]
+    (cond
+      (starts-with? t "#+RESULTS:")
+      (let [r (trim (subs t 10 (count t)))]
+        (when (not (blank? r)) r))
+
+      (starts-with? t "#+RESULTS[")
+      (let [end (index-of t "]")]
+        (when (not (nil? end)) (subs t 10 end)))
+
+      :else nil)))
+
+(defn- org-stop?
+  "The lines that end a results body. Our writer always ends its blocks with
+   a blank line, so the blank-line rule alone round-trips; the others keep a
+   hand-written file from swallowing a following section."
+  [line]
+  (let [t (trim line)]
+    (or (blank? t)
+        (starts-with? t "*")
+        (starts-with? t "#+begin_")
+        (starts-with? t "#+end_")
+        (starts-with? t "#+RESULTS"))))
+
+(defn- org-src-span
+  "The span one #+begin_src block becomes."
+  [header body]
+  (let [toks  (trim-tokens header)
+        lang  (if (empty? (rest toks)) "" (first (rest toks)))
+        attrs (org-attrs (rest (rest toks)))]
+    (if (= lang "beam-lisp")
+      {:kind :cell :lang "beam-lisp"
+       :frozen? (:frozen? attrs) :silent? (:silent? attrs)
+       :explicit-id (:id attrs)
+       :info header
+       :lines body}
+      {:kind :prose-code :lang lang :lines body})))
+
+(defn- slice-org-lines
+  "The org scanner: one flat pass. {:ok spans} | {:error {:line :why}}."
+  [lines]
+  (loop [i 0, prose [], spans []]
+    (cond
+      (>= i (count lines))
+      {:ok (append-prose prose spans)}
+
+      :else
+      (let [line (nth lines i)
+            t    (trim line)]
+        (cond
+          (starts-with? t "#+begin_src")
+          (let [end (find-line lines (inc i)
+                               (fn [l] (starts-with? (trim l) "#+end_src")))]
+            (if (nil? end)
+              {:error {:line (inc i) :why "unterminated #+begin_src (no #+end_src)"}}
+              (let [span (org-src-span line (slice-lines lines i (inc end)))]
+                (recur (inc end) [] (cons span (append-prose prose spans))))))
+
+          (starts-with? t "#+begin_")
+          (let [end (find-line lines (inc i)
+                               (fn [l] (starts-with? (trim l) "#+end_")))]
+            (if (nil? end)
+              {:error {:line (inc i) :why (str "unterminated block (no #+end_ for " t ")")}}
+              (let [body (slice-lines lines i (inc end))]
+                (recur (inc end) []
+                       (cons {:kind :prose :lines body} (append-prose prose spans))))))
+
+          (not (nil? (org-results-id line)))
+          (let [rid  (org-results-id line)
+                end  (or (find-line lines (inc i) org-stop?) (count lines))
+                body (slice-lines lines i end)]
+            (recur end [] (cons {:kind :result :id rid :lines body}
+                                (append-prose prose spans))))
+
+          :else
+          (recur (inc i) (cons line prose) spans))))))
+
+;; ── ids and the namespace ─────────────────────────────────────────────
+
+(def ^:private def-heads
+  #{"(defn" "(def" "(defmacro" "(defn-" "(defmulti" "(defprotocol"})
+
+(defn- first-def-name
+  "The name of the first definition in code, or nil."
+  [lines]
+  (loop [ls lines]
+    (if (empty? ls)
+      nil
+      (let [toks (trim-tokens (first ls))]
+        (if (and (contains? def-heads (first toks)) (>= (count toks) 2))
+          (first (rest toks))
+          (recur (rest ls)))))))
+
+(defn- in?
+  "Membership over a short list (used for minted-id collision sets)."
+  [xs x]
+  (not (empty? (filter (fn [y] (= y x)) xs))))
+
+(defn finalize-spans
+  "Give every cell an id, exactly once: explicit id wins; else the first def
+   name; else cell-N. Collisions get -2, -3, … in document order."
+  [spans]
+  (loop [spans spans, out [], used (list), n 0]
+    (if (empty? spans)
+      (reverse out)
+      (let [sp    (first spans)
+            cell? (= :cell (:kind sp))
+            base  (or (:explicit-id sp)
+                      (when cell? (first-def-name (:lines sp)))
+                      (str "cell" n))
+            id    (if (in? used base)
+                    (loop [k 2]
+                      (let [c (str base "-" k)]
+                        (if (in? used c) (recur (inc k)) c)))
+                    base)]
+        (recur (rest spans)
+               (cons (if cell? (assoc-in sp [:id] id) sp) out)
+               (if cell? (cons id used) used)
+               (if cell? (inc n) n))))))
+
+(defn declared-ns
+  "The namespace the document declares — its first cell that opens with
+   (ns …), or nil (a doc may be pure narrative and scratch)."
+  [doc]
+  (loop [spans (:spans doc)]
+    (if (empty? spans)
+      nil
+      (let [sp   (first spans)
+            toks (if (= :cell (:kind sp)) (trim-tokens (first (:lines sp))) (list))]
+        (if (and (not (empty? toks)) (= (first toks) "(ns)") (>= (count toks) 2))
+          (first (rest toks))
+          (recur (rest spans)))))))
+
+(defn cells
+  "The document's cells, in document order."
+  [doc]
+  (filter (fn [sp] (= :cell (:kind sp))) (:spans doc)))
+
+(defn cell-source
+  "One cell's code as a single string — its span lines minus the opening
+   info line and the closing fence."
+  [cell]
+  (join "\n" (rest (butlast (:lines cell)))))
+
+(defn cells-source
+  "The document's namespace source: every cell concatenated in document
+   order. This string IS the program — the loader loads it, the runner
+   evaluates it, and requiring the doc's ns loads exactly it."
+  [doc]
+  (join "\n" (mapcat (fn [sp] (:lines sp)) (cells doc))))
+
+;; ── the public slice / render ─────────────────────────────────────────
+
+(defn format-of
+  ":md | :org, from the path's extension."
+  [path]
+  (if (ends-with? path ".org") :org :md))
+
+(defn slice-text
+  "Slice document TEXT of the given format: {:ok doc} | {:error {:line :why}}."
+  [text fmt]
+  (let [lines (split text "\n")
+        r (if (= :org fmt) (slice-org-lines lines) (slice-md-lines lines))]
+    (if (contains? r :error)
+      r
+      (let [spans (finalize-spans (reverse (:ok r)))
+            doc   {:format fmt :spans spans}]
+        {:ok (assoc-in doc [:ns] (declared-ns doc))}))))
+
+(defn slice-doc
+  "Slice a .bl.md or .bl.org file from disk."
+  [path]
+  (let [r (slice-text (File/read! path) (format-of path))]
+    (if (contains? r :ok)
+      {:ok (assoc-in (:ok r) [:path] path)}
+      r)))
+
+(defn render-doc
+  "Echo a document back to text, byte-for-byte. The partition test:
+   render(slice(x)) == x, always."
+  [doc]
+  (join "\n" (mapcat (fn [sp] (:lines sp)) (:spans doc))))
+
+;; ── the one writer: result spans ──────────────────────────────────────
+
+(defn- result-span-lines
+  "The owned-span lines a result is written as, per dialect. An md block is
+   [open, value…, close]; an org block is [header, : line…, blank]."
+  [fmt id value]
+  (let [vls (split (str value) "\n")]
+    (if (= :org fmt)
+      (mapcat identity
+              (list (list (str "#+RESULTS: " id))
+                    (map (fn [l] (str ": " l)) vls)
+                    (list "")))
+      (mapcat identity
+              (list (list (str "```bl-result " id))
+                    vls
+                    (list "```"))))))
+
+(defn write-results
+  "Apply {id → value-string} to a document's result spans. An existing span
+   for an id is rewritten IN PLACE; a missing one is inserted directly after
+   its cell. Returns the new TEXT. This is the only function that rewrites a
+   livebook, and it can only ever touch spans of kind :result."
+  [doc results]
+  (let [result-ids (map (fn [sp] (:id sp))
+                        (filter (fn [sp] (= :result (:kind sp))) (:spans doc)))
+        insert-new? (fn [sp id]
+                      (and (= :cell (:kind sp))
+                           (contains? results id)
+                           (not (in? result-ids id))))]
+    (loop [spans (:spans doc), out [], pend results]
+      (if (empty? spans)
+        (join "\n" (mapcat (fn [sp] (:lines sp)) (reverse out)))
+        (let [sp (first spans)
+              id (:id sp)]
+          (cond
+            (and (= :result (:kind sp)) (contains? pend id))
+            (let [replacement {:kind :result :id id
+                               :lines (result-span-lines (:format doc) id (get pend id))}]
+              (recur (rest spans) (cons replacement out) (dissoc pend id)))
+
+            (insert-new? sp id)
+            (let [inserted {:kind :result :id id
+                            :lines (if (= :org (:format doc))
+                                     (result-span-lines :org id (get pend id))
+                                     (cons "" (result-span-lines :md id (get pend id))))}]
+              (recur (rest spans) (cons inserted (cons sp out)) (dissoc pend id)))
+
+            :else
+            (recur (rest spans) (cons sp out) pend)))))))
+
+;; ── evaluation: the runner ────────────────────────────────────────────
+;;
+;; Cells evaluate in document order into ONE env — the document's namespace.
+;; A cell's result is its last value, printed; stdout is captured around the
+;; eval when ExUnit.CaptureIO is on the runtime (mix dev/test and the dev
+;; escript ship it). A failure becomes that cell's result and does NOT stop
+;; the document — the honest page shows the error where the value would be.
+
+(def capture?
+  "True when stdout capture is available in this runtime."
+  (try (do (ExUnit.CaptureIO/capture_io (fn [] nil)) true)
+       (catch e false)))
+
+(defn- eval-captured
+  "Eval src in env with stdout capture: {:value :stdout :error}."
+  [src env path]
+  (try
+    (let [box (atom nil)
+          out (ExUnit.CaptureIO/capture_io
+                (fn [] (reset! box (BeamLisp.Compiler/eval_string src env path))))
+          v   @box]
+      {:value (BeamLisp.RT/print_str v) :stdout out :error nil})
+    (catch e
+      {:value "" :stdout "" :error (ex-message e)})))
+
+(defn- eval-plain
+  "Same contract, no capture (the release floor)."
+  [src env path]
+  (try
+    (let [v (BeamLisp.Compiler/eval_string src env path)]
+      {:value (BeamLisp.RT/print_str v) :stdout "" :error nil})
+    (catch e
+      {:value "" :stdout "" :error (ex-message e)})))
+
+(defn- result-string
+  "What a cell's run shows: stdout then value, or the error."
+  [d]
+  (cond
+    (not (nil? (get-in d [:raw :error]))) (str ";; error: " (get-in d [:raw :error]))
+    (blank? (get-in d [:stdout]))         (get-in d [:value])
+    (blank? (get-in d [:value]))          (get-in d [:stdout])
+    :else                                 (str (get-in d [:stdout]) (get-in d [:value]))))
+
+(defn run-doc
+  "Evaluate a document's live cells:
+   {:results {id → result-string} :errors [id …] :details […]}.
+   Frozen cells are skipped (their stored result is the truth); silent cells
+   run but contribute no result string."
+  [doc]
+  (let [path (or (:path doc) "doc.bl.md")
+        dir  (Path/dirname path)
+        ns   (or (:ns doc) "user")]
+    (BeamLisp.Loader/with_load_path dir
+      (fn []
+        (let [prev-ns (BeamLisp.Env/current_ns)]
+          (try
+            (do (BeamLisp.Env/in_ns ns)
+                (let [env (BeamLisp.Compiler/new_env ns)
+                      details
+                      (map (fn [c]
+                             (let [t0  (System/monotonic_time :millisecond)
+                                   raw ((if capture? eval-captured eval-plain)
+                                        (cell-source c) env path)
+                                   ms  (- (System/monotonic_time :millisecond) t0)]
+                               {:id      (:id c)
+                                :silent? (= true (:silent? c))
+                                :value   (get-in raw [:value])
+                                :stdout  (get-in raw [:stdout])
+                                :error   (get-in raw [:error])
+                                :ms      ms}))
+                           (filter (fn [c] (not (= true (:frozen? c)))) (cells doc)))
+                      shown (filter (fn [d] (not (:silent? d))) details)]
+                  {:results (reduce (fn [m d] (assoc-in m [(:id d)] (result-string d)))
+                                    {} shown)
+                   :errors  (map (fn [d] (:id d))
+                                 (filter (fn [d] (not (nil? (get-in d [:error])))) details))
+                   :details details}))
+            (finally (BeamLisp.Env/in_ns prev-ns))))))))
+
+(defn run-and-write!
+  "Slice a file, run its cells, write the result spans back. The CI verb:
+   deterministic output means a green re-run leaves `git diff` empty."
+  [path]
+  (let [sr (slice-doc path)]
+    (if (contains? sr :error)
+      {:path path :error (:error sr)}
+      (let [doc (:ok sr)
+            r   (run-doc doc)]
+        (File/write path (write-results doc (:results r)))
+        {:path    path
+         :ns      (:ns doc)
+         :cells   (count (cells doc))
+         :errors  (:errors r)
+         :results (count (:results r))}))))
+
+;; ── the loader contract ───────────────────────────────────────────────
+;;
+;; `find_file` resolves a namespace to .bl, .bl.md, or .bl.org. For docs it
+;; needs exactly one thing: the concatenated cell source. The Elixir side
+;; carries a minimal extractor (BeamLisp.Loader.doc_source/2) because the
+;; loader runs below the var registry; this function is the full-fidelity
+;; twin, and the test suite pins the two equal on every fixture.
+
+(defn doc-source
+  "The program text of document TEXT: every cell concatenated. Same output
+   as BeamLisp.Loader.doc_source/2 — pinned equal by tests."
+  [text fmt]
+  (let [r (slice-text text fmt)]
+    (if (contains? r :ok)
+      (cells-source (:ok r))
+      "")))

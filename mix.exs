@@ -47,7 +47,30 @@ defmodule BeamLisp.MixProject do
       # before anything tries to load it.
 
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      # `bl` — the language's own executable. An escript is the BEAM's
+      # native single-file packaging (an archive of .beam files behind an
+      # #! header, loaded by any OTP installation). The main_module is the
+      # AOT-compiled CLI namespace ITSELF — no Elixir floor: the escript
+      # apply enters BeamLisp.Ns.Bl.Cli.main/1, which boots the substrate
+      # (AOT.boot) and dispatches, all in beam-lisp (priv/bl/cli.bl).
+      # Native accelerators (the defnative Rust crates, Explorer/Polars,
+      # z3) are NIFs and cannot ride in an escript archive — pure-language
+      # code is unaffected; those paths degrade or need a checkout/release.
+      escript: [name: "bl", main_module: BeamLisp.Ns.Bl.Cli],
+      # `mix release` — the ERTS-carrying packaging tier (the `bl` escript
+      # needs an OTP install; a release does not). Default settings, no
+      # Burrito step: wrap only if the self-extracting UX is wanted.
+      releases: [bl: [
+        include_executables_for: [:unix],
+        # Do NOT strip beams: stripping re-stamps every module, so the AOT
+        # drift gate (aot.ex stale?/2) rightly reads them as built by a
+        # different toolchain and refuses them — every AOT namespace would
+        # fall back to recompiling source on each boot. Ship the beams the
+        # compiler emitted; the gate then passes and boot stays on the fast
+        # __bl_init__ path.
+        strip_beams: false
+      ]]
     ]
   end
 

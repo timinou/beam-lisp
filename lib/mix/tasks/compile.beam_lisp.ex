@@ -125,6 +125,20 @@ defmodule Mix.Tasks.Compile.BeamLisp do
             BeamLisp.AOTCache.compiler_key()
           end
 
+        # The TOOLCHAIN key, stamped into every manifest entry and compared by
+        # `up_to_date?/5`. Distinct from `cache_key` above (which is nil under
+        # `--force` and when the shared AOTCache is off): this one is ALWAYS
+        # computed, because it is what makes the build's freshness test agree
+        # with the runtime's. `BeamLisp.AOT.stale?/2` rejects a beam whose
+        # `compiler_key` no longer matches the live codegen — but `up_to_date?`
+        # historically checked only the source hash, so a codegen edit (which
+        # moves the key, not the source) left the beam on disk: runtime refused
+        # it and recompiled from source EVERY boot, while the build kept saying
+        # "up to date" and never refreshed it. Recording the key here closes
+        # that gap — a key drift now invalidates the manifest entry, so the
+        # ordinary `mix compile` rebuild re-stamps the beam the runtime wants.
+        cur_key = BeamLisp.AOTCache.compiler_key()
+
         # How many sources actually need building this run. On a warm tree
         # this is 0 (everything up to date); on a COLD build it is every
         # source, and a cold build of the full prelude is hundreds of
@@ -134,7 +148,8 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         # "working through 400 files". Counted up front so the total is known.
         to_build =
           Enum.count(ordered, fn path ->
-            opts[:force] || not up_to_date?(manifest, path, Map.fetch!(hashes, path), compile_path)
+            opts[:force] ||
+              not up_to_date?(manifest, path, Map.fetch!(hashes, path), cur_key, compile_path)
           end)
 
         if to_build > 0 do
@@ -145,7 +160,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
           Enum.reduce(ordered, {manifest, false, [], 0}, fn path, {m, rc, errs, built} ->
             hash = Map.fetch!(hashes, path)
 
-            if opts[:force] || not up_to_date?(m, path, hash, compile_path) do
+            if opts[:force] || not up_to_date?(m, path, hash, cur_key, compile_path) do
               built = built + 1
               Mix.shell().info("  [#{built}/#{to_build}] #{Path.relative_to_cwd(path)}")
               closure_key =
@@ -182,7 +197,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
                   old_modules = (m[path] || %{}) |> Map.get(:modules, [])
                   Enum.each(old_modules -- modules, &delete_beam(&1, compile_path))
 
-                  m2 = Map.put(m, path, %{hash: hash, modules: modules})
+                  m2 = Map.put(m, path, %{hash: hash, key: cur_key, modules: modules})
                   # Checkpoint the manifest after each successful source. The
                   # build writes beams to ebin incrementally, but this manifest
                   # was historically persisted only after the whole reduce
@@ -361,9 +376,16 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
   defp content_hash(source), do: source |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16()
 
-  defp up_to_date?(manifest, path, hash, compile_path) do
+  # A source is up to date when its content hash AND the toolchain key both
+  # match the manifest, and every beam it recorded still exists. The key match
+  # is what mirrors the runtime's `AOT.stale?/2`: a codegen edit moves the key
+  # without touching the source, so hash alone would say "fresh" while the
+  # runtime rejects the beam and recompiles from source on every boot. An entry
+  # written by an older task carries no `:key` — it fails the match once and
+  # rebuilds (re-stamping the current key), a safe one-time migration.
+  defp up_to_date?(manifest, path, hash, key, compile_path) do
     case manifest[path] do
-      %{hash: ^hash, modules: mods} ->
+      %{hash: ^hash, key: ^key, modules: mods} ->
         Enum.all?(mods, &File.exists?(Path.join(compile_path, Atom.to_string(&1) <> ".beam")))
 
       _ ->

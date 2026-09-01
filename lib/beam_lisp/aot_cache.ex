@@ -100,8 +100,18 @@ defmodule BeamLisp.AOTCache do
     beams =
       Enum.flat_map(@codegen_modules, fn mod ->
         case :code.which(mod) do
-          path when is_list(path) -> [File.read!(path)]
-          _ -> []
+          path when is_list(path) ->
+            # An escript's :code.which/1 reports a VIRTUAL archive path
+            # (`<script>/<app>/ebin/M.beam`) that no filesystem backs —
+            # same shape as the missing-priv_dir fallback below. Degrade
+            # the key instead of crashing the compile.
+            case File.read(path) do
+              {:ok, bin} -> [bin]
+              _ -> []
+            end
+
+          _ ->
+            []
         end
       end)
 

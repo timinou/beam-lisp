@@ -29,12 +29,15 @@ defmodule BeamLisp do
   @prelude_path Path.join(__DIR__, "../priv/core.bl")
   @multi_path Path.join(__DIR__, "../priv/multi.bl")
   @sugar_path Path.join(__DIR__, "../priv/sugar.bl")
+  @data_readers_path Path.join(__DIR__, "../priv/data-readers.bl")
   @external_resource @prelude_path
   @external_resource @multi_path
   @external_resource @sugar_path
+  @external_resource @data_readers_path
   @prelude File.read!(@prelude_path)
   @multi File.read!(@multi_path)
   @sugar File.read!(@sugar_path)
+  @data_readers File.read!(@data_readers_path)
 
   @doc """
   Evaluate beam-lisp source, bootstrapping `core` on first use.
@@ -51,7 +54,21 @@ defmodule BeamLisp do
     init()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      path |> File.read!() |> Compiler.eval_string(Compiler.new_env(), path)
+      raw = File.read!(path)
+
+      # A document (.bl.md / .bl.org) works as an entry file too: its
+      # program is its code cells, exactly as when it is `:require`d.
+      source =
+        if Path.extname(path) in [".md", ".org"] do
+          BeamLisp.Loader.doc_source(
+            raw,
+            if(String.ends_with?(path, ".org"), do: :org, else: :md)
+          )
+        else
+          raw
+        end
+
+      Compiler.eval_string(source, Compiler.new_env(), path)
     end)
   end
 
@@ -84,6 +101,16 @@ defmodule BeamLisp do
           :no_module -> Compiler.eval_string(source, Compiler.new_env("core"))
         end
       end
+
+      # Seed the built-in tagged-literal registry (`#d`, `#time`) from source,
+      # AFTER core (it calls `data-reader!`) and BEFORE any user file is read.
+      # This is what lets the tag→reader-fn mappings live in beam-lisp
+      # (`priv/data-readers.bl`) instead of a hardcoded Elixir default — the
+      # reader reads a whole file before evaluating it, so a same-file
+      # registration would lose the race, but a boot-time one never does.
+      # Evaluated directly (not AOT-cached): it is three side-effecting forms,
+      # not a var-bearing namespace, so there is nothing to intern or reuse.
+      Compiler.eval_string(@data_readers, Compiler.new_env("core"))
 
       Env.mark_seeded()
 

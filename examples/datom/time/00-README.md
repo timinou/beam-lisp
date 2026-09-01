@@ -28,7 +28,7 @@ sturdy as any date the store already holds. `02` is the demo that proves it.
 
 These are runnable demos, not paper specs. The valid-time half of
 `datom.time` — the `:db.type/time` value type, the interval constructors and
-predicates, Allen's algebra, set operations, the `#o` reader, and the
+predicates, Allen's algebra, set operations, the `#time` reader, and the
 miniKanren / z3 bridges — is built in `priv/datom/time.bl`, validated by
 `test/bl/datom/time_valid_test.bl` (7 tests, 39 assertions, 0 failures), and
 every file here executes end to end:
@@ -61,7 +61,7 @@ Read them in order; each builds on the representation the last one established.
 |---|------|--------------|-------|
 | 01 | `01-interval.bl` | a date **is** a half-open interval `[from, to)`; one type, resolution varies; adjacency kills "end of day" | §0 |
 | 02 | `02-value-not-entity.bl` | it is a packed **value** (`:db.type/interval`), sturdy and fast like `:instant` — round-trips, range-scans, ESC-lane fallback | §0 |
-| 03 | `03-reader.bl` | `#o"…"` reads ISO 8601-2 text into an interval, **validated at read time** | §1 |
+| 03 | `03-reader.bl` | `#time"…"` reads ISO 8601-2 text into an interval, **validated at read time** | §1 |
 | 04 | `04-allen.bl` | Allen's 13 relations two ways: the `overlaps?` predicate **and** the `[?a :~overlaps ?b]` join — one relation, two spellings | §2 |
 | 05 | `05-set-algebra.bl` | "the day minus the meetings" is `datom/q` with `not-join`; metadata rides through the join | §3 |
 | 06 | `06-bitemporal.bl` | valid time × transaction time on one entity — the query neither library can express alone | §0, §6 |

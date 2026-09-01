@@ -174,22 +174,55 @@ with a caveat. Unifying them removes each one:
   result with the strongest modality it earned. Every z3 call carries a timeout,
   so an undecidable query yields `:unknown`, never a hang.
 
-## Where it lives
+## Where it lives — the `veritas.*` family
 
-- `priv/veritas.bl` — the engine: the `Gen` protocol + generators, `smt-of` (the
-  `system.smt` seam), `check` with its escalator, and the sugar `exists`,
-  `for-all`, `covers`, `faults`, `isolate-fault`, `with-solver`.
+The core is one verb; the three things a mock/fault/property tool needs *beyond*
+the verb live in three sibling modules, each built ON the core, each in its own
+file. There is exactly one quantifier core, and each layer adds only what the
+core cannot express.
+
+- `priv/veritas.bl` — **the core**: the `Gen` protocol + generators, `samples`,
+  `smt-of` (the `system.smt` seam), `parse-model` (a z3 model IS a value), `check`
+  with its escalator, and the sugar `exists`, `for-all`, `covers`, `faults`,
+  `isolate-fault`, `with-solver`.
+- `priv/veritas/mock.bl` (`ns veritas.mock`) — **the mock server**. What the core
+  cannot express: a multi-field *contract* `{:fields :ensures}`, DETERMINISM
+  (`make-mock`/`answer` — same key ⇒ same response, so a mock is a pure fn), and
+  BOUNDARIES (`synth-boundary` via z3's optimizer). Reuses the core's
+  `parse-model`.
+- `priv/veritas/fault.bl` (`ns veritas.fault`) — **the fault space as data**. The
+  core's `faults` is the z3 half (an isolated, modality-tagged mutant per law);
+  this adds the datalog ANALYSIS half — `build-db` + `uncovered-clauses`
+  (not-join) + `faults-per-clause` + `redundant-mutants` (signature grouping) +
+  `independent-laws`, with violations MEASURED, plus `serve`/`error-for` error
+  injection on the mock server.
+- `priv/veritas/property.bl` (`ns veritas.property`) — **hypothesis testing**. The
+  behavioural analogue of `covers`: RUN the target function and assert a predicate
+  over its RETURN, then SHRINK a counterexample to the minimal input. Draws its
+  fuzz domain from a veritas generator via `samples` — the same algebra the core
+  uses, not a parallel one.
+
+Examples and tests:
+
 - `examples/veritas/00-one-verb.bl` — mock, property, and lint as one verb.
 - `examples/veritas/01-the-generator-algebra.bl` — one generator, three engines.
 - `examples/veritas/02-faults-are-queries.bl` — the fault space as `exists`-not.
-- `test/bl/veritas/veritas_test.bl` — 11 tests over the three engines, the
-  modality discipline, coverage, and proven redundancy.
+- `examples/veritas/03-the-mock-server.bl` — a contract as a deterministic server.
+- `examples/veritas/04-the-fault-space.bl` — z3 generates, datalog analyses.
+- `examples/veritas/05-the-property-is-behaviour.bl` — output properties + shrink.
+- `test/bl/veritas/veritas_test.bl` — the core: three engines, modality, coverage,
+  proven redundancy.
+- `test/bl/veritas/mock_test.bl` — server determinism, boundary optimize, invalid.
+- `test/bl/veritas/fault_test.bl` — measured coverage, redundancy grouping,
+  proven-implied laws, named injection.
+- `test/bl/veritas/property_test.bl` — hold, refute+shrink, crash, generator domains.
 
-## Relationship to the tools it unifies
+## How the family relates
 
-`veritas` is the general form of `priv/mock.bl` (∃ over a contract),
-`priv/mock/fault.bl` (∃¬ over a contract), and `priv/fuzz.bl` (∀ over a
-function's guards). Those modules still run and are still tested; veritas is the
-one surface new code should reach for, and the older three are candidates to
-become thin wrappers over it — a cutover to track separately, so their green
-tests are re-pointed rather than broken.
+This family REPLACES the earlier `priv/mock.bl`, `priv/mock/fault.bl`, and
+`priv/fuzz.bl` (now removed). Those three each re-wrote the quantifier core
+alongside their one distinctive capability; the family keeps the core in ONE place
+(`priv/veritas.bl`) and preserves every distinctive capability as a named layer on
+top of it. So `veritas.mock` is the general `exists`-as-a-server, `veritas.fault`
+is `faults` plus its set-analysis half, and `veritas.property` is the behavioural
+sibling of `covers` — one core, three layers, zero capability lost.

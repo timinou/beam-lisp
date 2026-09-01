@@ -1,0 +1,409 @@
+; bl/cli.bl — the beam-lisp CLI, written in beam-lisp. ALL of it.
+;
+; `bl` is an escript whose main_module IS this namespace's AOT module
+; (BeamLisp.Ns.Bl.Cli — real named BEAM functions, per the AOT contract).
+; There is no Elixir floor module: the escript apply enters `main/1`, which
+; boots the substrate itself (BeamLisp.AOT/boot — the same calls a mix
+; task used to make), repopulates this namespace's var registry via
+; ensure_loaded, and dispatches. Usage text, flag parsing, help, the
+; Elixir-keyword adapters and exit codes all live here — compiled by the
+; self-hosted compiler on every `mix compile` (priv/ is an AOT source
+; dir) and shipped inside the binary.
+;
+; Exit codes: 0 ok · 1 runtime failure · 2 usage error.
+
+(ns bl.cli)
+
+;; ── argv parsing ──────────────────────────────────────────────────────
+;; One uniform shape: global flags may appear anywhere before `--`,
+;; the first positional is the command, the rest are its arguments.
+;; Built only from verified primitives (assoc-in/get-in/loop/recur) —
+;; no #() literals, no tuples-as-lists, no Elixir keyword literals.
+
+(defn add-arg [st a] (assoc-in st [:args] (cons a (:args st))))
+
+(defn parse-argv [argv]
+  (loop [as argv
+         st {:cmd nil :args [] :paths [] :out nil :async false
+             :help false :version false :dd nil}]
+    (if (empty? as)
+      (assoc-in (assoc-in st [:args] (reverse (:args st)))
+                [:dd] (reverse (or (:dd st) [])))
+      (let [a (first as)
+            more (rest as)]
+        (cond
+          ;; after `--` everything is a program argument
+          (:dd st)         (recur more (add-arg st a))
+          (= a "--")       (recur more (assoc-in st [:dd] []))
+          (= a "-h")       (recur more (assoc-in st [:help] true))
+          (= a "--help")   (recur more (assoc-in st [:help] true))
+          (= a "--version") (recur more (assoc-in st [:version] true))
+
+          ;; flags that take a value
+          (= a "-p")
+          (if (empty? more)
+            (assoc-in st [:error] "missing value for -p")
+            (recur (rest more)
+                   (assoc-in st [:paths] (cons (first more) (:paths st)))))
+          (= a "--path")
+          (if (empty? more)
+            (assoc-in st [:error] "missing value for --path")
+            (recur (rest more)
+                   (assoc-in st [:paths] (cons (first more) (:paths st)))))
+          (= a "--out")
+          (if (empty? more)
+            (assoc-in st [:error] "missing value for --out")
+            (recur (rest more) (assoc-in st [:out] (first more))))
+          (= a "--async")  (recur more (assoc-in st [:async] true))
+
+          ;; unknown dash-thing: bare "-" is a positional (stdin convention)
+          (if (starts-with? a "-") true false)
+          (assoc-in st [:unknown] a)
+
+          ;; first positional is the command, the rest are arguments
+          (nil? (:cmd st)) (recur more (assoc-in st [:cmd] a))
+          :else            (recur more (add-arg st a)))))))
+
+;; ── help ──────────────────────────────────────────────────────────────
+
+(def command-help
+  {"run"     "bl run FILE.bl [-p DIR] [-- args...]  run a program (prints the last value)"
+   "eval"    "bl eval EXPR                       evaluate one expression, print its value"
+   "repl"    "bl repl                            interactive session (default with no command)"
+   "test"    "bl test [FILE|DIR] [-p DIR] [--async]  run .bl tests (default test/)"
+   "build"   "bl build PATH... [--out DIR]       AOT-compile namespaces to .beam files (def-files, not scripts — side effects run at compile)"
+   "ward"    "bl ward FILE.bl...                 run files in isolated, coherence-gated forks"
+   "watch"   "bl watch FILE|DIR                  live-reload on save"
+   "doc"     "bl doc run FILE... | build TARGET... [--out DIR]  livebooks (.bl.md/.bl.org)"
+   "version" "bl version                         print the version"
+   "help"    "bl help [COMMAND]                  show help"})
+
+(defn usage []
+  (println "bl — beam-lisp on the BEAM")
+  (println "")
+  (println "usage: bl [flags] COMMAND [args]")
+  (println "")
+  (println "commands:")
+  (each (fn [c] (println (str "  " (get-in command-help [c]))))
+        ["run" "eval" "repl" "test" "doc" "build" "ward" "watch" "version" "help"])
+  (println "")
+  (println "flags:")
+  (println "  -p, --path DIR  add a library root (repeatable; BEAM_LISP_PATH also works)")
+  (println "      --out DIR   build output directory (default ./build)")
+  (println "      --async     run tests concurrently, one env per file")
+  (println "  -h, --help      show help")
+  (println "      --version   print the version")
+  (println "  --              everything after this goes to the program")
+  (println "")
+  (println "exit codes: 0 ok · 1 runtime failure · 2 usage error"))
+
+;; ── shared plumbing ───────────────────────────────────────────────────
+
+(defn each
+  "Eager for-each. `map` is lazy — a side effect sitting in an unrealized
+  lazy seq simply never runs (the help text shipped that bug). reduce is
+  an eager fold, so this is the honest loop. Returns nil."
+  [f coll]
+  (reduce (fn [_ x] (f x) nil) nil coll))
+
+(defn register-paths [st]
+  (each (fn [d] (BeamLisp.Env/add_search_path d)) (:paths st)))
+
+(defn to-list
+  "Elixir list from any seq. Beam-lisp vectors are their own type; the
+  Elixir APIs reached here (Keyword.fetch!, ward's source list) want the
+  plain cons-cell list the mix tasks passed."
+  [coll]
+  (reverse (reduce (fn [acc x] (cons x acc)) nil coll)))
+
+(defn kw-pair
+  "One {:k, v} Elixir keyword pair. Beam-lisp has no tuple literal
+  (core.bl builds its tagged tuples exactly this way)."
+  [k v]
+  (erlang/list_to_tuple (list k v)))
+
+(defn kw
+  "An Elixir keyword list from beam-lisp pairs: (kw [:a 1] [:b 2]).
+  Elixir APIs read opts with Keyword.get/fetch!, which no beam-lisp
+  literal satisfies — this is the bridge, not a policy decision.
+  Realized eagerly: Keyword.get pattern-matches cons cells, so a lazy
+  seq here would crash it."
+  [& pairs]
+  (to-list (map (fn [p] (kw-pair (first p) (second p))) pairs)))
+
+(defn io-err [s] (IO/puts :stderr s))
+
+(defn dirname [p] (Path/dirname p))
+
+(defn expand-targets
+  "FILE → [FILE]; DIR → every .bl under it (hidden entries skipped)."
+  [p]
+  (cond
+    (File/regular? p) (if (ends-with? p ".bl") [p] [])
+    (File/dir? p)
+    (->> (File/ls! p)
+         (filter (fn [n] (not (starts-with? n "."))))
+         (sort-by identity)
+         (map (fn [n] (str p "/" n)))
+         (mapcat expand-targets))
+    :else []))
+
+(defn join-args
+  "bl eval '(+ 1' '2)' — join leftover positionals into one expression."
+  [args]
+  (reduce (fn [acc s] (if acc (str acc " " s) s)) nil args))
+
+;; ── commands (each returns an exit code) ──────────────────────────────
+
+(defn cmd-run [args st]
+  (if (empty? args)
+    (do (io-err "usage: bl run FILE.bl [-- args...]") 2)
+    (do (register-paths st)
+        ;; parity with `mix beam_lisp.run`: the last value prints.
+        (println (BeamLisp.RT/print_str (BeamLisp/run_file (first args))))
+        0)))
+
+(defn cmd-eval [args st]
+  (if (empty? args)
+    (do (io-err "usage: bl eval EXPR") 2)
+    (do (register-paths st)
+        (println (BeamLisp.RT/print_str (BeamLisp/eval (join-args args))))
+        0)))
+
+(defn cmd-repl [_args _st]
+  (BeamLisp/repl)
+  0)
+
+(defn cmd-test [args st]
+  (register-paths st)
+  (let [targets (if (empty? args) ["test"] args)
+        paths (mapcat expand-targets targets)]
+    (if (empty? paths)
+      (do (io-err "bl test: no .bl test files found") 2)
+      (do ;; TestRT.cli halts(1) itself when anything fails.
+          (BeamLisp.TestRT/cli (to-list paths) (kw [:async (:async st)]))
+          0))))
+
+(defn cmd-build [args st]
+  (let [paths (mapcat expand-targets args)]
+    (if (empty? args)
+      (do (io-err "usage: bl build PATH... [--out DIR]") 2)
+      (do (register-paths st)
+          (each (fn [p]
+                  (each (fn [m]
+                          (let [[mod path] m]
+                            (println (str "compiled " (name mod) " → " path))))
+                        (BeamLisp.AOT/compile_file
+                          p (kw [:output_dir (or (:out st) "build")]))))
+                paths)
+          0))))
+
+(defn cmd-ward [args st]
+  (if (empty? args)
+    (do (io-err "usage: bl ward FILE.bl [FILE.bl ...]") 2)
+    (do (register-paths st)
+        ;; Same pipeline as `mix beam_lisp.ward`: sources into a var,
+        ;; warm the reload libraries, run + report inside one eval.
+        (BeamLisp.Env/intern "user" "__ward_sources__"
+                             (vec (map (fn [f] (File/read! f)) args)))
+        (BeamLisp.Loader/ensure_loaded "reload")
+        (BeamLisp.Loader/ensure_loaded "reload.ward")
+        (if (BeamLisp/eval
+             (str "(let [r (reload.ward/run (BeamLisp.Env/fetch! \"user\" "
+                  "\"__ward_sources__\"))] "
+                  "(println (reload.ward/report r)) (:ok? r))"))
+          0
+          1))))
+
+(defn watch-error [r]
+  (io-err (str "bl watch: cannot start the watcher: " (ex-message r)))
+  (io-err "  the live-reload engine needs the :file_system dep, which ships")
+  (io-err "  only in dev/test — build `MIX_ENV=dev mix escript.build` for watch.")
+  (System/halt 1))
+
+(defn cmd-watch [args _st]
+  (if (empty? args)
+    (do (io-err "usage: bl watch FILE|DIR") 2)
+    (let [target (first args)
+          dirs (to-list [(if (File/dir? target) target (dirname target))])]
+      ;; FileSystem's :undef inside the watcher's init surfaces as an EXIT
+      ;; SIGNAL to this linked process — uncatchable by try. Trap exits so
+      ;; the failure returns as a {:error, {:EXIT, _}} tuple instead.
+      (Process/flag :trap_exit true)
+      (try
+        (let [[tag _detail]
+              (BeamLisp.ReloadWatcher/start_link
+                (kw [:dirs dirs]
+                    [:auto_commit true]
+                    [:on_result (fn [r] (println (pr-str r)))]))]
+          (if (= :ok tag)
+            (do (println (str "bl watch: watching " (first dirs)
+                              " — Ctrl+C to stop"))
+                ;; `bl watch` IS this process.
+                (Process/sleep :infinity))
+            (watch-error _detail)))
+        (catch e (watch-error e))))))
+
+(defn doc-usage []
+  (println "bl doc — livebooks: documents that ARE programs (.bl.md / .bl.org)")
+  (println "")
+  (println "usage:")
+  (println "  bl doc run FILE...                 run cells, write result spans into the file")
+  (println "  bl doc build TARGET... [--out DIR] render documents to static HTML (default: site)")
+  (println "")
+  (println "a document's cells evaluate in document order; exit 1 on any error"))
+
+(defn doc-run-files
+  "Run every file's cells and write its result spans. Returns the number of
+   failed files."
+  [paths]
+  (loop [ps paths, fail 0]
+    (if (empty? ps)
+      fail
+      (let [path (first ps)
+            r (BeamLisp/eval (str "(bl.doc/run-and-write! \"" path "\")"))]
+        (if (get-in r [:error])
+          (do (io-err (str "bl doc run: " path ": " (get-in r [:error])))
+              (recur (rest ps) (inc fail)))
+          (do (println (str "bl doc run: " path " — " (get-in r [:cells]) " cells, "
+                            (count (get-in r [:errors])) " cell errors"))
+              (recur (rest ps)
+                     (if (empty? (get-in r [:errors])) fail (inc fail)))))))))
+
+(defn doc-collect
+  "One build target (file or dir) → its documents, via bl.doc.html."
+  [target]
+  (BeamLisp/eval (str "(bl.doc.html/collect-docs \"" target "\")")))
+
+(defn doc-build-files
+  "Render every document. Returns the number of failed documents."
+  [docs st]
+  (let [out (or (:out st) "site")]
+    (loop [ds docs, built 0, fail 0]
+      (if (empty? ds)
+        (do (println (str "bl doc build: " built " page(s) → " out))
+            fail)
+        (let [path (first ds)
+              r (BeamLisp/eval
+                  (str "(bl.doc.html/build-file \"" path "\" \"" out "\")"))]
+          (if (get-in r [:error])
+            (do (io-err (str "bl doc build: " path ": " (get-in r [:error])))
+                (recur (rest ds) built (inc fail)))
+            (do (println (str "bl doc build: " (get-in r [:source]) " → " (get-in r [:path])
+                             " (" (get-in r [:cells]) " cells)"))
+                (if (empty? (get-in r [:errors]))
+                  (recur (rest ds) (inc built) fail)
+                  (do (io-err (str "bl doc build: " path " cell errors: "
+                                   (join ", " (get-in r [:errors]))))
+                      (recur (rest ds) (inc built) (inc fail)))))))))))
+
+(defn cmd-doc [args st]
+  (if (empty? args)
+    (do (doc-usage) 2)
+    (do (BeamLisp.Loader/ensure_loaded "bl.doc")
+        (BeamLisp.Loader/ensure_loaded "bl.doc.html")
+        (let [sub (first args)
+              rest (rest args)]
+          (cond
+            (= sub "run")
+            (if (empty? rest)
+              (do (io-err "usage: bl doc run FILE...") 2)
+              (let [fail (doc-run-files rest)] (if (= fail 0) 0 1)))
+
+            (= sub "build")
+            (if (empty? rest)
+              (do (io-err "usage: bl doc build TARGET... [--out DIR]") 2)
+              (let [docs (loop [ts rest, acc []]
+                           (if (empty? ts)
+                             acc
+                             (recur (rest ts)
+                                    (into acc (doc-collect (first ts))))))]
+                (if (empty? docs)
+                  (do (io-err "bl doc build: no .bl.md / .bl.org documents found") 2)
+                  (let [fail (doc-build-files docs st)] (if (= fail 0) 0 1)))))
+
+            (= sub "help")
+            (do (doc-usage) 0)
+
+            :else
+            (do (io-err (str "bl doc: unknown subcommand \"" sub "\""))
+                (doc-usage)
+                2))))))
+
+(defn version-str []
+  ;; :application, not the Elixir Application delegate — the erlang
+  ;; module is what the escript's trimmed stdlib guarantees.
+  (let [r (application/get_key :beam_lisp :vsn)]
+    (if (= :undefined r)
+      "0.0.0-dev"
+      (let [[tag vsn] r]
+        (if (= :ok tag) (erlang/list_to_binary vsn) "0.0.0-dev")))))
+
+(defn cmd-version [_args _st]
+  (println (str "beam-lisp " (version-str)))
+  0)
+
+(defn cmd-help [args _st]
+  (if (empty? args)
+    (usage)
+    (if-let [line (get-in command-help [(first args)])]
+      (println line)
+      (do (io-err (str "bl help: unknown command \"" (first args) "\""))
+          2)))
+  0)
+
+(def commands
+  {"run" cmd-run
+   "eval" cmd-eval
+   "repl" cmd-repl
+   "test" cmd-test
+   "build" cmd-build
+   "ward" cmd-ward
+   "watch" cmd-watch
+   "version" cmd-version
+   "doc"     cmd-doc
+   "help" cmd-help})
+
+;; ── entry ─────────────────────────────────────────────────────────────
+
+(defn dispatch [st]
+  (let [cmd (:cmd st)]
+    (if-let [f (get-in commands [cmd])]
+      (f (:args st) st)
+      (do (io-err (str "bl: unknown command \"" cmd "\""))
+          (usage)
+          2))))
+
+(defn main [argv]
+  ;; The escript enters here as a plain BEAM apply: same-module calls in
+  ;; the body are direct remote calls and need no registry, so the boot
+  ;; runs before any var-level use. AOT.boot/0 starts Env + Loader.Server
+  ;; on demand and seeds core — the substrate work a mix task used to do;
+  ;; ensure_loaded then runs THIS module's __bl_init__ (value defs like
+  ;; `commands`, fn values, links) — the documented ordering: init first,
+  ;; __bl_init__ second.
+  (BeamLisp.AOT/boot)
+  ;; AOT fast path first (escripts: always hits). A STRIPPED release reports
+  ;; :no_module — the drift gate rightly refuses re-stamped beams — and the
+  ;; designed pairing is the loader's source path (priv/bl/cli.bl ships in
+  ;; the release), which reinterns the vars and marks the namespace loaded.
+  (if (= :no_module (BeamLisp.AOT/ensure_loaded "bl.cli"))
+    (BeamLisp.Loader/ensure_loaded "bl.cli"))
+  (let [code
+        (try
+          (let [st (parse-argv argv)]
+            (cond
+              (:error st)   (do (io-err (str "bl: " (:error st))) 2)
+              (:unknown st) (do (io-err (str "bl: unknown flag " (:unknown st))) 2)
+              (:help st)    (do (usage) 0)
+              (:version st) (do (cmd-version nil st))
+              ;; `bl` alone is a repl, like `python` alone
+              (nil? (:cmd st)) (cmd-repl nil st)
+              :else (dispatch st)))
+          ;; ex-message is total: Exception.message for real exceptions,
+          ;; inspect for a beam-lisp `throw` of a plain value.
+          (catch e
+            (io-err (str "error: " (ex-message e)))
+            1))]
+    ;; An escript ignores main/1's return value — the exit code is a halt.
+    (System/halt code)))

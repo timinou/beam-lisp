@@ -36,7 +36,7 @@
 ; else → sample+shrink.
 
 (ns veritas
-  (:require [z3] [mock] [core] [env] [system.smt :as smt]
+  (:require [z3] [core] [env] [system.smt :as smt] [reader-node :as rn]
             [system.model :as model] [typed]))
 
 ; ═════════════════════════════════════════════════════════════════════════
@@ -182,6 +182,15 @@
 (defn tuple-of  [& gens] (->TupleGen (into [] gens)))
 (defn any-of    [] (->AnyGen))
 
+(defn samples
+  "The concrete values a generator offers as a test domain: its finite enumeration
+   when it has one, else a deterministic sample of `n`. Public so consumers
+   (veritas.property) draw their fuzz domain from the SAME generator algebra the
+   check escalator uses — one domain notion, not a parallel one."
+  [gen n]
+  (let [enum (gen-enumerate gen)]
+    (if (= enum :infinite) (gen-sample gen 0 n) enum)))
+
 ; ═════════════════════════════════════════════════════════════════════════
 ; SPEC — a predicate over the bound value, as a self-contained lambda
 ; ═════════════════════════════════════════════════════════════════════════
@@ -198,14 +207,73 @@
         (or (vector? v) (map? v) (set? v) (list? v)) (str "(quote " (core/pr-str v) ")")
         :else (str v)))
 
+(defn- positional-lets
+  "When `v` is a vector, `let` bindings that name each coordinate <var>_i — the
+   SAME positional names TupleGen/gen-constrain declares to z3. So a predicate
+   written for the symbolic rung (p_0, p_1, …) also evaluates on the bl fallback,
+   symmetric across both evaluators. A scalar value yields no bindings."
+  [var v]
+  (if (vector? v)
+    (core/join " "
+      (core/map-indexed (fn [i x] (str var "_" i " " (lit x))) v))
+    ""))
+
 (defn holds?
-  "Does spec `pred-src` (a predicate over the one variable `var`) hold for `v`?
-   Evaluated as ((fn [var] pred) v) — self-contained, no scope leak. A predicate
-   that RAISES counts as NOT holding (a property that errors failed)."
-  [var pred-src v]
+  "Does spec `pred` (a quoted bl form over the one variable `var`) hold for `v`?
+   Evaluated as (let [var v  var_0 v0 …] pred) — self-contained, no scope leak.
+   For a vector `v` the coordinates also bind as <var>_i so a positional
+   predicate (p_0, p_1) evaluates on the fallback exactly as it does in z3. A
+   predicate that RAISES counts as NOT holding (a property that errors failed)."
+  [var pred v]
   (try
-    (= true (env/eval (str "((fn [" var "] " pred-src ") " (lit v) ")")))
+    (= true (env/eval (str "(let [" var " " (lit v) " " (positional-lets var v) "] " (pr-str (pred-form pred)) ")")))
     (catch _ false)))
+
+; ── z3 model parsing: a SAT model IS the value (was mock/parse-model) ────────
+;
+; z3 answers a SAT query with `((define-fun name () Sort VALUE) …)`. VALUE is a
+; scalar (16, true, "usr_"), a negative `(- 39)`, or a rational `(/ 1.0 2.0)`.
+; Read the model with the bl reader (it is valid s-expression text) and project
+; each define-fun to [name value]. veritas owns this now — the last thing it
+; needed from mock.bl, so the dependency is severed and mock/fuzz/fault stand
+; alone (zero consumers, superseded by this file).
+
+(defn- model-value
+  "The bl value of a define-fun's VALUE node: a bare scalar, (- n) → -n, or
+   (/ a b) → a÷b (z3 renders a Real as an exact rational)."
+  [vnode]
+  (let [f (typed/node-form vnode)
+        tg (typed/node-tag f)]
+    (cond
+      (= tg :scalar) f
+      (= tg :list)
+        (let [its (typed/node-items f)
+              op (if (empty? its) nil (typed/node-name (typed/node-form (first its))))]
+          (cond
+            (and (= op "-") (= 2 (count its)))
+              (- 0 (model-value (second its)))
+            (and (= op "/") (= 3 (count its)))
+              (/ (model-value (second its)) (model-value (nth its 2)))
+            :else f))
+      :else f)))
+
+(defn parse-model
+  "A z3 model TEXT → {field-name-string → bl value}. The model is `(…defs…)`;
+   each def is (define-fun NAME () SORT VALUE). nil/empty text → {}."
+  [model-text]
+  (if (or (nil? model-text) (= "" model-text))
+    {}
+    (let [top (first (BeamLisp.Reader/read_string model-text))
+          defs (typed/node-items top)]
+      (into {}
+        (keep (fn [d]
+                (let [its (typed/node-items d)]
+                  (if (and (>= (count its) 5)
+                           (= "define-fun" (typed/node-name (typed/node-form (first its)))))
+                    [(typed/node-name (typed/node-form (second its)))
+                     (model-value (nth its 4))]
+                    nil)))
+              defs)))))
 
 ; ── z3 fragment: delegate to system.smt, the verifier's OWN translator ──────
 ;
@@ -216,8 +284,18 @@
 ; variable names (one for a scalar query, the positional names for a tuple).
 ; :untranslatable ⟹ nil ⟹ the escalator falls back to enumerate/sample (honest).
 
-(defn smt-of [vars pred-src]
-  (let [r (smt/of-source (core/set vars) pred-src)]
+(defn pred-form
+  "The authoring contract, enforced: a predicate is a QUOTED bl form, never a
+   source string (the blueprint.constraint rule). The form is walkable and
+   composable as data; pr-str is only the wire into system.smt. A string here
+   is a migration bug — throw, don't guess."
+  [form]
+  (if (string? form)
+    (throw (str "veritas: predicates are quoted bl forms, not source strings — got " (pr-str form)))
+    form))
+
+(defn smt-of [vars form]
+  (let [r (smt/of-source (core/set vars) (pr-str (pred-form form)))]
     (if (or (nil? r) (= r :untranslatable)) nil r)))
 
 ; ═════════════════════════════════════════════════════════════════════════
@@ -242,8 +320,9 @@
 ; CHECK — one verb, modal verdict, engine escalator
 ; ═════════════════════════════════════════════════════════════════════════
 ;
-; A query is {:q :exists|:for-all :var str :gen g :pred src}. check runs the
-; strongest engine the (gen, pred) pair supports.
+; A query is {:q :exists|:for-all :var str :gen g :pred form} — the pred is a
+; QUOTED bl form over var (blueprint.constraint's rule: no strings-as-constraints).
+; check runs the strongest engine the (gen, pred) pair supports.
 
 (defn- try-symbolic
   "The z3 rung. A verdict map, or nil when this query is not symbolically
@@ -260,7 +339,7 @@
                                             "(assert " smt-pred ")\n"))]
             (cond
               (= "sat" (:status r))
-                {:modality :proven :engine :z3 :witness (get (mock/parse-model (:model r)) var)}
+                {:modality :proven :engine :z3 :witness (get (parse-model (:model r)) var)}
               (= "unsat" (:status r))
                 {:modality :proven :engine :z3 :witness nil :none true}
               :else {:modality :unknown :engine :z3}))
@@ -269,7 +348,7 @@
             (cond
               (= "unsat" (:status r)) {:modality :proven :engine :z3}
               (= "sat" (:status r))
-                {:modality :refuted :engine :z3 :witness (get (mock/parse-model (:model r)) var)}
+                {:modality :refuted :engine :z3 :witness (get (parse-model (:model r)) var)}
               :else {:modality :unknown :engine :z3})))))))
 
 (defn- run-sample
@@ -295,7 +374,8 @@
 
 (defn check
   "Run a query with the strongest engine it supports. `q` is
-   {:q :exists|:for-all :var str :gen g :pred src}. Returns a modal verdict.
+   {:q :exists|:for-all :var str :gen g :pred form} — the pred a QUOTED bl form
+   over var. Returns a modal verdict.
    Escalator: symbolic (z3) if the gen constrains and the pred is SMT; else
    exhaustive if the gen enumerates finitely; else sample+shrink."
   [port q]
@@ -305,7 +385,7 @@
 ; ── sugar: the two quantifiers ──────────────────────────────────────────────
 
 (defn exists
-  "∃ v ∈ gen. pred(v).  pred is bl source over `var`. Modal verdict."
+  "∃ v ∈ gen. pred(v).  pred is a quoted bl form over `var`. Modal verdict."
   [port var gen pred] (check port {:q :exists :var var :gen gen :pred pred}))
 
 (defn for-all
@@ -323,8 +403,9 @@
 ; :witnessed when sampled. A gap is a :refuted with the uncovered witness.
 
 (defn- guards-of
-  "The guard SOURCE strings of a defn `fn-src`, in clause order (a clause with no
-   :when yields \"true\"), plus the first parameter name."
+  "The guard FORMS of a defn `fn-src`, in clause order (a clause with no
+   :when yields `true`), plus the first parameter name. Taken from the clause's
+   guard NODE — the parsed form, not a re-printed string."
   [fn-src]
   (let [node (first (BeamLisp.Reader/read_string fn-src))
         clauses (model/transitions node)
@@ -333,7 +414,10 @@
         params (:params (core/first parsed))
         arg (if (and (seq params) (= :symbol (typed/node-tag (typed/node-form (core/first params)))))
               (typed/node-name (typed/node-form (core/first params))) "n")]
-    {:guards (into [] (map (fn [c] (or (:guard c) "true")) clauses)) :arg arg}))
+    {:guards (into [] (map (fn [c] (if (nil? (:guard-node c))
+                                   true
+                                   (rn/form (:guard-node c))))
+                         clauses)) :arg arg}))
 
 (defn- any-guard-covers?
   "Does SOME guard of `gd` accept value `v`? A guard is evaluated as a lambda
@@ -351,14 +435,27 @@
   [port fn-src gen]
   (let [gd (guards-of fn-src)
         enum (gen-enumerate gen)
-        exhaustive (not (= enum :infinite))
-        values (if exhaustive enum (gen-sample gen 0 32))
-        gap (core/some (fn [v] (if (any-guard-covers? gd v) nil v)) values)]
-    (if (core/some? gap)
-      {:modality :refuted :engine (if exhaustive :enumerate :sample)
-       :witness gap :guards (:guards gd)}
-      {:modality (if exhaustive :proven :witnessed) :engine (if exhaustive :enumerate :sample)
-       :guards (:guards gd) :tried (count values)})))
+        exhaustive (not (= enum :infinite))]
+    (if exhaustive
+      ; FINITE domain: exhaustion IS a proof — enumerate every value.
+      (let [values enum
+            gap (core/some (fn [v] (if (any-guard-covers? gd v) nil v)) values)]
+        (if (core/some? gap)
+          {:modality :refuted :engine :enumerate :witness gap :guards (:guards gd)}
+          {:modality :proven :engine :enumerate :guards (:guards gd) :tried (count values)}))
+      ; INFINITE domain: coverage ≡ ∀ v. (or guard₁ … guardₙ). When the guards
+      ; translate and the gen constrains, that is a z3 query — a real :proven
+      ; over an unbounded domain (enumerate could only :witness). z3's SAT model
+      ; for the negation IS the uncovered witness. Untranslatable ⇒ sample.
+      (let [or-pred (str "(or " (core/join " " (:guards gd)) ")")
+            sym (try-symbolic port {:q :for-all :var (:arg gd) :gen gen :pred or-pred})]
+        (if (core/some? sym)
+          (merge sym {:guards (:guards gd)})
+          (let [values (gen-sample gen 0 32)
+                gap (core/some (fn [v] (if (any-guard-covers? gd v) nil v)) values)]
+            (if (core/some? gap)
+              {:modality :refuted :engine :sample :witness gap :guards (:guards gd)}
+              {:modality :witnessed :engine :sample :guards (:guards gd) :tried (count values)})))))))
 
 ; ═════════════════════════════════════════════════════════════════════════
 ; FAULTS — the fault space as exists-not queries, with a MODALITY
@@ -378,12 +475,12 @@
    :witnessed, or :unknown."
   [port gen laws i]
   (let [others (into [] (keep-indexed (fn [j l] (if (= j i) nil l)) laws))
-        neg (str "(not " (nth laws i) ")")
-        pred (str "(and " neg " " (core/join " " others) ")")]
+        ; laws are quoted forms — compose as data, never as strings
+        pred (cons 'and (cons (list 'not (nth laws i)) others))]
     (exists port "v" gen pred)))
 
 (defn faults
-  "The fault space of a contract {:gen g :laws [pred-src…]}: one isolate-fault
+  "The fault space of a contract {:gen g :laws [quoted-form…]}: one isolate-fault
    per law, tagged with the law it targets. :implied laws (proven :none) are
    redundant — a finding about the SPEC, z3-proven."
   [port contract]

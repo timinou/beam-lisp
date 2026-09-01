@@ -101,6 +101,35 @@ defmodule BeamLisp.Reader do
   @spec read_string(String.t()) :: [term]
   @spec read_string(String.t(), binary | nil) :: [term]
   def read_string(source, file \\ nil) when is_binary(source) do
+    # THE READER SEAM, shaped exactly like BeamLisp.Compiler.compile/2's
+    # backend switch. `read_string` is the ONE position-bearing entry every
+    # caller funnels through (read_all/read_one/read_data/read_all_data and the
+    # five live call sites all reach source text through here), so flipping it
+    # flips the whole reader with a single decision. When the self-hosted
+    # beam-lisp reader (priv/reader.bl) is interned this delegates to it;
+    # otherwise the genesis Elixir reader below runs — which is also what reads
+    # reader.bl's OWN source on a tree where it is not yet built, and what the
+    # differential oracle measures the .bl reader against. reader.ex is never
+    # deleted: it is the bootstrap seed and the yardstick, exactly as
+    # compiler.ex's genesis lowering stays as `compile_elixir`.
+    if use_bl_reader?() do
+      read_string_bl(source, file)
+    else
+      read_string_elixir(source, file)
+    end
+  end
+
+  @doc """
+  The genesis (Elixir) reader: turn source text into position-bearing forms.
+
+  This is the original hand-written reader. `read_string/2` delegates to the
+  self-hosted beam-lisp reader once it is built; this stays as the bootstrap
+  seed and as the differential oracle's yardstick. Callers that MUST have the
+  Elixir reading specifically (the oracle, and read_string itself before the
+  .bl reader is interned) call this directly.
+  """
+  @spec read_string_elixir(String.t(), binary | nil) :: [term]
+  def read_string_elixir(source, file \\ nil) when is_binary(source) do
     Process.put(@guard_cfg_key, atom_guard_config())
     Process.put(@guard_count_key, 0)
     Process.put(@fn_literal_depth_key, 0)
@@ -118,9 +147,96 @@ defmodule BeamLisp.Reader do
     end
   end
 
+  # Invoke the self-hosted reader and translate its exceptions back to this
+  # module's PUBLIC types, so a delegated read is byte-identical to a genesis
+  # read at every observable point — the returned forms AND the exception a
+  # caller can rescue. reader.bl raises `BeamLisp.ExInfo` for a syntax error
+  # and `BeamLisp.AtomGuard.LimitError` for atom exhaustion; the documented
+  # contract (this module's @spec, docs/trust-boundary.md) is
+  # `Reader.SyntaxError` / `Reader.AtomLimitError`. Re-raising here keeps that
+  # contract stable across the flip. The forms themselves are already
+  # byte-parity with genesis (test/bl/reader_parity_test.bl and the corpus
+  # differential over every .bl file confirm it), so only error TYPE needs a
+  # translation, never the value.
+  defp read_string_bl(source, file) do
+    apply(BeamLisp.Ns.Reader, :"read-string", [source, file])
+  rescue
+    e in BeamLisp.AtomGuard.LimitError ->
+      reraise AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
+
+    e in BeamLisp.ExInfo ->
+      reraise SyntaxError, [message: Exception.message(e)], __STACKTRACE__
+  end
+
+  # Whether to route `read_string/2` through the self-hosted beam-lisp reader.
+  # Mirrors `BeamLisp.Compiler.use_bl_compiler?/0` exactly:
+  #   :auto (default) — delegate whenever the `reader` namespace is interned
+  #   :genesis        — always the Elixir reader (rebuild / oracle safety)
+  #   :bl             — always the .bl reader (fail loudly if absent)
+  # Keyed on the LIVE interning state (not a persistent flag), so it can never
+  # claim a reader that this node has not actually loaded — the same leak-proof
+  # discipline the compiler seam uses.
+  defp use_bl_reader? do
+    case Application.get_env(:beam_lisp, :reader_backend, :auto) do
+      :genesis -> false
+      :bl -> true
+      :auto -> BeamLisp.Env.loaded_ns?("reader")
+    end
+  end
+
+  @doc """
+  Ensure the self-hosted beam-lisp reader is ready to serve `read_string/2`.
+
+  Interns the `reader` namespace (and its `reader-node` dependency), after which
+  `read_string/2` with the default `:auto` backend delegates every read to it —
+  the language reads itself. Mirrors `BeamLisp.Compiler.enable_bl_backend/0`:
+  idempotent, and safe before the beam exists (a fresh tree loads reader.bl from
+  source). Returns `:bl` when the self-hosted reader is now active, `:genesis`
+  otherwise.
+
+  Ordering matters, exactly as it does for the compiler: interning the reader
+  ns READS reader.bl's own source, so for the duration of that load the reader
+  backend is forced to `:genesis`. Otherwise the per-call `use_bl_reader?` check
+  would flip mid-load and the tail of reader.bl would be read by the very
+  half-interned reader it is defining — an `undefined var` at best. Once fully
+  interned the force is lifted and subsequent reads use the .bl reader.
+  """
+  def enable_bl_reader do
+    unless BeamLisp.Env.loaded_ns?("reader") do
+      prev = Application.get_env(:beam_lisp, :reader_backend, :auto)
+      Application.put_env(:beam_lisp, :reader_backend, :genesis)
+
+      try do
+        BeamLisp.Loader.ensure_loaded("reader")
+      after
+        Application.put_env(:beam_lisp, :reader_backend, prev)
+      end
+    end
+
+    if BeamLisp.Env.loaded_ns?("reader"), do: :bl, else: :genesis
+  end
+
   @spec read_all(String.t()) :: [term]
   def read_all(source) when is_binary(source) do
     source |> read_string() |> Enum.map(&unwrap_deep/1)
+  end
+
+  @doc """
+  The genesis (Elixir) reader's bare-shape entry: `read_all` pinned to the
+  Elixir reading, never the self-hosted one.
+
+  This is the differential oracle's answer key. `read_all/1` follows the
+  `read_string/2` seam and so becomes the .bl reader once it is interned —
+  which is exactly what the parity and position suites (and priv/self/oracle.bl)
+  must NOT do: an answer key that flips to the reader under test degrades to a
+  self-comparison that proves nothing. Those callers read the answer key
+  through THIS function, which always runs `read_string_elixir` regardless of
+  the `:reader_backend`, so the comparison stays genesis-vs-.bl — the same way
+  `BeamLisp.Compiler.compile_elixir` pins the compiler oracle.
+  """
+  @spec read_all_elixir(String.t()) :: [term]
+  def read_all_elixir(source) when is_binary(source) do
+    source |> read_string_elixir() |> Enum.map(&unwrap_deep/1)
   end
 
   @spec read_one(String.t()) :: term
@@ -410,12 +526,16 @@ defmodule BeamLisp.Reader do
   defp record_or_tag(rest, pos0) do
     case atom_form(rest, pos0) do
       {:ok, {:symbol, name}, after_sym, _pos} ->
-        # A registered DATA-READER (`#d[…]`, `#d{…}`) takes precedence: read
-        # the following collection and wrap it as `(<fn> <collection>)`, the
-        # way Clojure's `*data-readers*` expands a tagged literal. The fn is
-        # a beam-lisp symbol registered via `data-reader!` from source, so
-        # `#d[…]` can validate-at-read-time and carry source position — and
-        # the whole feature is one branch here plus one ETS lookup.
+        # A registered DATA-READER (`#d[…]`, `#time"…"`) takes precedence: read
+        # the following form and wrap it as `(<fn> <form>)`, the way Clojure's
+        # `*data-readers*` expands a tagged literal. The tag→fn mapping is not
+        # baked in here — `BeamLisp.RT.data_reader/1` is a pure lookup into a
+        # registry that beam-lisp SOURCE owns: `priv/data-readers.bl` seeds the
+        # built-ins (`#d`, `#time`) at boot, and a program may add its own with
+        # `(data-reader! …)`. This file only knows the SHAPE grammar (what may
+        # follow a tag), never what any tag MEANS. The stored value is a
+        # `{:symbol, name}` node, so `#d[…]` validates-at-read-time and carries
+        # source position.
         case BeamLisp.RT.data_reader(name) do
           {:ok, {:symbol, _} = fn_sym} ->
             case after_sym do
@@ -425,11 +545,16 @@ defmodule BeamLisp.Reader do
               [?{ | _] = coll_rest ->
                 wrap_data_reader(fn_sym, coll_rest, pos0)
 
-              # A STRING after the tag: `#o"2026-06-15"`, mirroring
-              # Clojure's built-in `#inst "…"`. `form` reads the string
-              # literal and it is wrapped as `(<fn> "…")` — the one shape
-              # that lets a sigil-style temporal literal like `#o` carry a
-              # string payload and validate it at read time.
+              # A STRING after the tag: `#time"2026-06-15"`, mirroring
+              # Clojure's built-in `#inst "…"`. It is wrapped as `(<fn> "…")`
+              # — the shape that lets a temporal literal carry ISO 8601 text and
+              # validate it at read time. This is pure LEXER grammar (what token
+              # may follow a tag), which is why it lives in the reader and not
+              # in `.bl`: it defines nothing about what `#time` means, only that
+              # a tag may be followed by a string. The self-hosted `reader.bl`
+              # will gain the same grammar when it becomes the live reader (its
+              # `deferred-record-or-tag` TODO); until then the live reader is
+              # this one, so the grammar is here.
               [?" | _] = str_rest ->
                 wrap_data_reader(fn_sym, str_rest, pos0)
 

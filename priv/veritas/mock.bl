@@ -1,0 +1,190 @@
+; veritas/mock.bl — a contract, run backwards, IS a mock server.
+;
+; ── Where this sits ─────────────────────────────────────────────────────────
+;
+; veritas core answers a QUERY: (quantifier [var gen] pred) → modal verdict. That
+; is ∃/∀ over a typed generator. A mock needs something the core does not model:
+;   • a CONTRACT — a multi-field response shape {:fields :ensures}, not one var;
+;   • DETERMINISM — the same request key must always yield the same response, so a
+;     mock is a pure fn input→response (a server, not a fresh witness each call);
+;   • BOUNDARIES — the min/max valid response, which needs z3's OPTIMIZER, a path
+;     the core's sat/unsat escalator never takes.
+;
+; So this module keeps the contract shape and drives z3 directly for those three
+; things — but it REUSES the core's z3-model parser (veritas/parse-model), so the
+; "a SAT model IS the value" machinery is written once, in the core, not again
+; here. Everything the core already does (∃ a value, ∃ an invalid value) is left
+; to the core; this module adds only what the core cannot express.
+;
+; ── The one idea (unchanged from the original mock.bl) ──────────────────────
+;
+;   verify :  ∀ resp. ensures(resp)              → UNSAT ⟹ property holds
+;   mock   :  ∃ resp. ensures(resp) ∧ seed(resp) → SAT   ⟹ the model is the resp
+;
+; A mock is not written; it is DERIVED from the same contract the real impl is
+; checked against. Because the derivation is a pure fn of (contract, input), the
+; mock is a pure value — safe where the real impl's network egress is unspeakable.
+
+(ns veritas.mock
+  (:require [z3] [veritas :as v] [system.smt :as smt] [core]))
+
+(def TIMEOUT-MS 3000)
+(defn- timed [smt] (str "(set-option :timeout " TIMEOUT-MS ")\n" smt))
+
+; ── contract → SMT ──────────────────────────────────────────────────────────
+;
+; A contract is {:fields [[name sort]…] :ensures [smt-string…]}. The AUTHORING
+; surface is quoted bl forms (contract-from); they lower through system.smt —
+; the SAME translator the verifier and the veritas core use, so a mock and its
+; checker can never disagree. The :ensures strings are the z3 WIRE, produced
+; once at the contract boundary and never hand-written.
+
+(defn contract-decls
+  "declare-const lines for the response fields. Public: veritas.fault reuses this
+   so the contract→SMT lowering lives in ONE place (this module owns contracts)."
+  [fields]
+  (core/join "" (map (fn [f] (str "(declare-const " (first f) " " (second f) ")\n")) fields)))
+
+(defn- assert-all
+  "Assert every ensures clause."
+  [ensures]
+  (core/join "" (map (fn [e] (str "(assert " e ")\n")) ensures)))
+
+(defn- keywordize
+  "{name-string → v} → {name-keyword → v}, so a synthesized response reads like an
+   ordinary bl map ({:temp 16} not {\"temp\" 16})."
+  [m]
+  (into {} (map (fn [p] [(keyword (first p)) (second p)]) (into [] m))))
+
+(defn- model->value
+  "A z3 result → the response map (via the core's parser) or nil when not SAT."
+  [r]
+  (if (= "sat" (:status r)) (keywordize (v/parse-model (:model r))) nil))
+
+; ── synthesis modes ─────────────────────────────────────────────────────────
+;
+; Every mode returns {:status \"sat\"|\"unsat\"|\"unknown\" :value {field→v}|nil}.
+; A SAT carries the model as the value; unsat/unknown carry nil. Callers branch on
+; :status so \"unknown\" is never mistaken for a definite answer.
+
+(defn synth
+  "ONE valid response for `contract`, or nil. `extra` is extra SMT asserted on top
+   (a seed, a request-derived constraint) — \"\" for the bare contract."
+  [port contract extra]
+  (let [smt (timed (str (contract-decls (:fields contract))
+                        (assert-all (:ensures contract))
+                        extra))
+        r (z3/check-model port smt)]
+    {:status (:status r) :value (model->value r)}))
+
+(defn satisfiable?
+  "Is the contract realizable at all? true only on a definite SAT. A contradictory
+   spec (unsat) or an undecidable one (unknown) → false."
+  [port contract]
+  (= "sat" (:status (synth port contract ""))))
+
+(defn satisfiable-status
+  "The raw verdict: \"sat\" | \"unsat\" (contradictory spec) | \"unknown\"."
+  [port contract]
+  (:status (synth port contract "")))
+
+(defn synth-invalid
+  "A response the contract FORBIDS: assert the NEGATION of the ensures. Every value
+   this returns is, by construction, a contract violation — an adversarial fault
+   the mock can inject while STILL being provably inside the sandbox."
+  [port contract]
+  (let [neg (str "(not (and " (core/join " " (:ensures contract)) "))")
+        smt (timed (str (contract-decls (:fields contract)) "(assert " neg ")\n"))
+        r (z3/check-model port smt)]
+    {:status (:status r) :value (model->value r)}))
+
+; ── the mock SERVER: determinism the core cannot express ────────────────────
+;
+; synth-seeded pins an integer `field` to `seed` (a request key), so the SAME key
+; yields the SAME response. That is what turns a one-off witness into a mock
+; SERVER: a pure fn input→response, keyed by (hash input). The seed EQUATES the
+; field to the seed (a linear constraint), keeping the query fast and decidable.
+
+(defn synth-seeded
+  "A DETERMINISTIC response, pinned by `seed` (an integer) on integer `field`. Same
+   seed ⟹ same response. This is the mock server primitive."
+  [port contract field seed]
+  (synth port contract (str "(assert (= " field " " seed "))\n")))
+
+(defrecord MockServer [port contract seed-field])
+
+(defn make-mock
+  "A mock server value: a pure fn from a request key to a deterministic valid
+   response. `seed-field` is the integer field pinned to the key."
+  [port contract seed-field]
+  (->MockServer port contract seed-field))
+
+(defn answer
+  "Serve request `key` from a mock `server`: a deterministic valid response
+   {:ok? true :value {…}}. The same key always yields the same value."
+  [server key]
+  {:ok? true
+   :value (:value (synth-seeded (:port server) (:contract server) (:seed-field server) key))})
+
+; ── boundaries: the OPTIMIZER path the core never takes ─────────────────────
+;
+; synth-boundary asks z3's optimizer for the smallest/largest valid response over
+; an integer `field`. These are the edge cases a hand-written mock always forgets,
+; generated for free — and they need (minimize)/(maximize), which the core's
+; sat/unsat check-model escalator has no way to request.
+
+(defn synth-boundary
+  "The EXTREME valid response: `dir` :min or :max over integer `field`. z3's
+   optimizer finds the smallest/largest response the contract still admits."
+  [port contract field dir]
+  (let [obj (if (= dir :min) "minimize" "maximize")
+        smt (timed (str (contract-decls (:fields contract))
+                        (assert-all (:ensures contract))
+                        "(" obj " " field ")\n"))
+        r (z3/check-model port smt)]
+    {:status (:status r) :value (model->value r)}))
+
+; ── the forward round-trip: synthesize backward, VERIFY forward ─────────────
+;
+; A synthesized response is trusted only when it survives the forward check: pin
+; every field to its value and ask whether the ensures can be violated. unsat ⟹ it
+; holds. Only a definite unsat returns true, so an undecidable check is a safe
+; false.
+
+(defn- render-lit
+  "A bl value as an SMT literal: negatives as (- n), strings quoted, bools bare."
+  [val]
+  (cond
+    (and (core/int? val) (< val 0)) (str "(- " (- 0 val) ")")
+    (string? val)                   (str "\"" val "\"")
+    :else                           (str val)))
+
+(defn check
+  "Does concrete `value` ({field→v}) satisfy `contract`? Pins every field and asks
+   whether the ensures can be violated; unsat ⟹ it holds."
+  [port contract value]
+  (let [pins (core/join ""
+               (map (fn [f]
+                      (let [nm (first f) val (get value (keyword nm))]
+                        (str "(assert (= " nm " " (render-lit val) "))\n")))
+                    (:fields contract)))
+        neg (str "(not (and " (core/join " " (:ensures contract)) "))")
+        smt (timed (str (contract-decls (:fields contract)) pins "(assert " neg ")\n"))]
+    (= "unsat" (z3/check port smt))))
+
+; ── deriving a contract from QUOTED bl predicates ─────────────────────
+
+(defn contract-from
+  "Build a contract from `fields` ([[name sort]…]) and `preds` (QUOTED bl forms
+   over the field names — blueprint.constraint's rule: a predicate is a
+   walkable/composable form, never a source string). Each predicate is
+   translated through system.smt (the verifier's own translator); an
+   untranslatable predicate is dropped — the mock then satisfies a WEAKER
+   contract, never a wrong one."
+  [fields preds]
+  (let [vars (core/set (map first fields))
+        ens (keep (fn [p]
+                    (let [s (smt/of-source vars (pr-str (v/pred-form p)))]
+                      (if (or (nil? s) (= s :untranslatable)) nil s)))
+                  preds)]
+    {:fields fields :ensures (into [] ens)}))

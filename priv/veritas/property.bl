@@ -1,0 +1,234 @@
+; veritas/property.bl — hypothesis testing: a property over a function's OUTPUT.
+;
+; ── Where this sits ─────────────────────────────────────────────────────────
+;
+; veritas core's `covers` reads a function's own guard clauses and asks a
+; STRUCTURAL question: does every input land in some clause? That never RUNS the
+; function. A hypothesis is the behavioural analogue: RUN the function on an
+; input and assert a predicate over its RETURN value. The core cannot express
+; this — it checks predicates over generated inputs, it never calls a target fn
+; and inspects the result.
+;
+; The move (classic QuickCheck/Hypothesis, one turn of the screw): a REFUTED
+; property is SHRUNK to its minimal witness — the smallest input that still breaks
+; it — so the report names the simplest failing case, not the first random one.
+;
+; The fuzz DOMAIN is drawn from veritas generators (veritas/samples): an int-of is
+; a bounded int domain, any-of is the cross-type domain (the old fuzz/mixed),
+; tuple-of is a multi-arg domain (the old fuzz/pairs). One generator algebra feeds
+; the property tester and the core alike — not a second, parallel domain notion.
+
+(ns veritas.property
+  (:require [veritas :as v] [system.model :as model] [system.smt :as smt]
+            [typed] [env] [core] [z3]))
+
+; ── read a function's shape as data ─────────────────────────────────────────
+
+(defn- params-of
+  "The parameter NAME vector of a defn's first clause (all args, in order).
+   Multi-arg aware; defaults to [\"n\"] when the shape is opaque."
+  [node]
+  (let [its (typed/node-items (typed/node-form node))
+        parsed (nth (typed/defn-clauses its) 2)
+        params (:params (first parsed))
+        names (into [] (keep (fn [p]
+                               (if (= :symbol (typed/node-tag (typed/node-form p)))
+                                 (typed/node-name (typed/node-form p)) nil))
+                             params))]
+    (if (empty? names) ["n"] names)))
+
+(defn- fn-name-of
+  "The defn's own name, for building a call to it."
+  [node]
+  (let [its (typed/node-items (typed/node-form node))]
+    (typed/node-name (typed/node-form (second its)))))
+
+(defn shape-of
+  "The data shape of a defn source: its name and parameter names."
+  [src]
+  (let [node (first (BeamLisp.Reader/read_string src))]
+    {:name (fn-name-of node) :params (params-of node)}))
+
+; ── render an INPUT (a tuple of args) as bl source ──────────────────────────
+
+(defn- lit
+  "One value as bl SOURCE that re-reads to itself. Negatives parenthesised, strings
+   quoted, keywords colon-preserved (str drops it), collections quoted so they read
+   as data literals rather than being evaluated as calls."
+  [val]
+  (cond (and (core/int? val) (< val 0)) (str "(- " (- 0 val) ")")
+        (string? val) (str "\"" val "\"")
+        (nil? val) "nil"
+        (keyword? val) (core/pr-str val)
+        (or (vector? val) (map? val) (set? val) (list? val)) (str "(quote " (core/pr-str val) ")")
+        :else (str val)))
+
+(defn- tuple-of
+  "A candidate as an arg TUPLE, given `arity`. A vector candidate is the arg LIST
+   only when arity>1 ([6 0] → two args); for a single-arg function a vector is ONE
+   value. A bare value is always [value]. Resolves the one-vector-arg vs many-args
+   ambiguity a vector candidate would otherwise carry."
+  [arity cand]
+  (cond
+    (and (vector? cand) (> arity 1)) cand
+    (vector? cand) [cand]
+    :else [cand]))
+
+(defn- args-src [arity cand] (core/join " " (map lit (tuple-of arity cand))))
+(defn- params-src [params] (core/join " " params))
+
+; ── call the function on a candidate ────────────────────────────────────────
+
+(defn- call
+  "Call function `src` on candidate `cand`. {:ok v} on a normal return, {:raised
+   true} on any raise (a crash is a first-class property outcome)."
+  [src params cand]
+  (let [node (first (BeamLisp.Reader/read_string src))]
+    (try
+      {:ok (env/eval (str src "\n(" (fn-name-of node) " " (args-src (count params) cand) ")"))}
+      (catch _ {:raised true}))))
+
+; ── does the hypothesis hold at a candidate? ────────────────────────────────
+;
+; Call the fn, then evaluate the predicate with `result` bound to the return. A
+; raise during the CALL is {:crash true}; a raise in the predicate counts as the
+; property NOT holding (a property that errors is a failed property). The predicate
+; is evaluated as a self-contained lambda over the params + `result`, so nothing
+; from the caller's scope leaks in.
+
+(defn- holds-at?
+  [src params pred cand]
+  (let [r (call src params cand)]
+    (if (:raised r)
+      {:holds false :crash true :input cand}
+      (let [ok (try
+                 (= true (env/eval
+                           (str "((fn [" (params-src params) " result] " (pr-str (v/pred-form pred)) ") "
+                                (args-src (count params) cand) " " (lit (:ok r)) ")")))
+                 (catch _ false))]
+        {:holds ok :crash false :input cand :result (:ok r)}))))
+
+; ── shrink: the minimal witness (classic ladder toward 0) ───────────────────
+
+(defn- smaller-int
+  "Simpler integers than `v`: 0, v/2, v±1 toward 0 — deduped, strictly closer to 0."
+  [val]
+  (if (not (core/int? val)) (list)
+    (let [cands (list 0 (core/quot val 2) (if (> val 0) (- val 1) (+ val 1)))]
+      (into [] (distinct (filter (fn [c] (< (core/abs c) (core/abs val))) cands))))))
+
+(defn- smaller
+  "Shrink candidates for `cand`: an int walks the ladder toward 0; a pair shrinks
+   each coordinate independently. Strictly-simpler candidates only."
+  [cand]
+  (if (vector? cand)
+    (into [] (mapcat
+               (fn [i] (map (fn [s] (assoc cand i s)) (smaller-int (nth cand i))))
+               (range 0 (count cand))))
+    (smaller-int cand)))
+
+(defn- shrink
+  "Walk a failing `cand` down to a LOCAL MINIMUM: repeatedly replace the witness
+   with any strictly-simpler candidate that still fails, until none does."
+  [src params pred cand]
+  (loop [best cand fuel 200]
+    (if (<= fuel 0) best
+      (let [simpler (filter (fn [c] (not (:holds (holds-at? src params pred c))))
+                            (smaller best))]
+        (if (empty? simpler) best (recur (first simpler) (- fuel 1)))))))
+
+; ── the public verb ─────────────────────────────────────────────────────────
+
+(defn hypothesis
+  "Test a behavioural hypothesis `pred` (a QUOTED bl form over the input params and
+   `result`) against a function `src` over the domain of generator `gen`. Tries to
+   REFUTE it; on the first failing input, SHRINKS to the minimal witness. Returns
+     {:holds true}                                     — no counterexample found
+     {:holds false :witness cand :shrunk cand          — refuted, minimal case
+      :result v :crash bool}                            — whether it was a crash
+   The property applies to every input by construction; the witness is the simplest
+   input the code fails on. `n` is the sample size for an infinite generator."
+  [src pred gen n]
+  (let [sh (shape-of src)
+        params (:params sh)
+        domain (v/samples gen n)
+        failing (core/some (fn [c]
+                             (let [h (holds-at? src params pred c)]
+                               (if (:holds h) nil h)))
+                           domain)]
+    (if (nil? failing)
+      {:holds true :tried (count domain)}
+      (let [minimal (shrink src params pred (:input failing))
+            mres (holds-at? src params pred minimal)]
+        {:holds false
+         :witness (:input failing)
+         :shrunk minimal
+         :result (:result mres)
+         :crash (:crash mres)}))))
+
+; ═══════════════════════════════════════════════════════════════════════════
+; PROVE — the behavioural hypothesis, SYMBOLICALLY
+; ═══════════════════════════════════════════════════════════════════════════
+;
+; hypothesis SAMPLES a function's output; prove DISCHARGES the same law with z3.
+; The function lowers to a define-fun (system.smt/defn->define-fun), `result` in
+; the predicate is bound to the call (fname params…), and ∀ inputs. pred becomes
+; one z3 query. A TRUE law over an infinite domain is now :proven (not merely
+; :witnessed); a violation is z3's counterexample. Untranslatable body or
+; predicate ⇒ fall back to the sampled `hypothesis` (honest, never a false z3).
+
+(defn- param-decls
+  "z3 const declarations for `params` under `gen`. A TupleGen zips its children to
+   the params positionally; a scalar gen constrains the single param. Returns
+   {:decls str :assert str} or nil when the gen does not constrain (⇒ sample)."
+  [params gen]
+  (if (= :tuple (v/gen-tag gen))
+    (let [child-cons (core/map-indexed
+                       (fn [i p] (v/gen-constrain (core/nth (:gens gen) i) p)) params)]
+      (if (core/some? (core/some (fn [c] (if (core/nil? c) true nil)) child-cons))
+        nil
+        {:decls (core/join "" (core/map :decls child-cons))
+         :assert (core/join "" (core/map :assert child-cons))}))
+    (v/gen-constrain gen (core/first params))))
+
+(defn prove
+  "Prove a behavioural law `pred` (a QUOTED bl form over the input params and `result`) about a
+   function `src` symbolically. `gen` is the input domain (a scalar gen for a
+   1-arg fn, a tuple-of for multi-arg). `ret-sort` (default \"Int\") is the
+   function's return sort — use \"Bool\" for a predicate-returning fn. Returns a
+   modal verdict:
+     :proven :z3     — ∀ inputs the law holds (z3 unsat on its negation)
+     :refuted :z3    — a counterexample input (+ :witness)
+     falls back to (hypothesis …) sampled verdict when not translatable."
+  ([port src pred gen] (prove port src pred gen "Int"))
+  ([port src pred gen ret-sort]
+   (let [sh (shape-of src)
+         params (:params sh)
+         fname (:name sh)
+         def-fn (smt/defn->define-fun src ret-sort)
+         con (param-decls params gen)
+         call (str "(" fname " " (core/join " " params) ")")
+         ; the predicate over params + result; result := the function call.
+         pred-smt (let [r (smt/of-source (core/set (core/conj params "result")) (pr-str (v/pred-form pred)))]
+                    (if (or (core/nil? r) (= r :untranslatable)) nil r))]
+     (if (or (= def-fn :untranslatable) (core/nil? con) (core/nil? pred-smt))
+       ; not fully symbolic → the sampled hypothesis (honest fallback)
+       (let [h (hypothesis src pred gen 64)]
+         (if (:holds h)
+           {:modality :witnessed :engine :sample :tried (:tried h)}
+           {:modality :refuted :engine :sample :witness (:shrunk h) :crash (:crash h)}))
+       ; fully symbolic: define f, bind result=call, prove ∀ inputs. pred
+       (let [prelude (str "(set-option :timeout 3000)\n" def-fn "\n"
+                          (:decls con) (:assert con)
+                          "(declare-const result " ret-sort ")\n"
+                          "(assert (= result " call "))\n")
+             r (z3/check-model port (str prelude "(assert (not " pred-smt "))\n"))]
+         (core/cond
+           (= "unsat" (:status r)) {:modality :proven :engine :z3}
+           (= "sat" (:status r))
+             (let [m (v/parse-model (:model r))
+                   wit (if (= :tuple (v/gen-tag gen))
+                         (into [] (core/map (fn [p] (core/get m p)) params))
+                         (core/get m (core/first params)))]
+               {:modality :refuted :engine :z3 :witness wit})
+           :else {:modality :unknown :engine :z3}))))))

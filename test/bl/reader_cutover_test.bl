@@ -1,0 +1,141 @@
+; reader_cutover_test.bl — the LIVE reader seam: prove that flipping
+; `read_string/2` onto the self-hosted reader (priv/reader.bl) is transparent.
+;
+; WHY THIS EXISTS
+;
+; The cutover puts a backend switch inside BeamLisp.Reader.read_string/2 — the
+; ONE position-bearing entry every caller funnels through (read_all, read_one,
+; read_data, read_all_data, and the five live call sites in compiler.ex / aot.ex
+; / compile.beam_lisp.ex all reach source text through it). The switch mirrors
+; BeamLisp.Compiler.compile/2's `:compiler_backend`:
+;
+;   :genesis — always the Elixir reader (the bootstrap seed + oracle yardstick)
+;   :bl      — always the self-hosted reader (priv/reader.bl)
+;   :auto    — delegate to .bl once the `reader` ns is interned, else genesis
+;
+; reader.ex is NEVER deleted: it is the genesis seed (it reads reader.bl's own
+; source on a cold tree) and the differential oracle's answer key, exactly as
+; compiler.ex's `compile_elixir` stays after the compiler cutover.
+;
+; The parity/position/atom-guard suites prove reader.bl MATCHES reader.ex on
+; every shape. THIS suite proves the SEAM itself: with the backend forced to
+; :bl, a read through the PUBLIC entry (`read_string`, the one production code
+; calls) returns byte-identically to the genesis reader, AND the public
+; exception contract (Reader.SyntaxError / Reader.AtomLimitError) survives the
+; flip — reader.bl raises its own ExInfo / AtomGuard.LimitError internally, and
+; the seam translates them back so a caller that rescues the documented types
+; still catches them.
+;
+; The switch is restored in every `finally`: a leaked :bl backend would make
+; every later read in this VM go through the slower self-hosted path, and a
+; leaked :genesis would blind the other reader suites' :auto delegation.
+;
+; Run:  mix beam_lisp.test test/bl/reader_cutover_test.bl
+
+; :require [reader] interns the `reader` ns so its internal sibling vars
+; (read-form, classify, …) resolve through the Env var table when the seam
+; delegates to it. In production `enable_bl_reader` does this interning; a test
+; that forces the :bl backend must intern it too or the delegated read hits
+; `undefined var: reader/read-form`.
+(ns reader-cutover.test
+  (:require [reader]))
+
+; --- backend scaffolding ------------------------------------------------------
+
+(defn- set-backend! [b] (Application/put_env :beam_lisp :reader_backend b))
+(defn- clear-backend! [] (Application/delete_env :beam_lisp :reader_backend))
+
+(defn- with-backend
+  "Run thunk `f` with the reader backend pinned to `b`, always restoring the
+   previous setting — a leaked backend would corrupt every later read."
+  [b f]
+  (let [prev (Application/get_env :beam_lisp :reader_backend :auto)]
+    (set-backend! b)
+    (try (f)
+         (finally (Application/put_env :beam_lisp :reader_backend prev)))))
+
+; --- the seam is transparent: :bl read == :genesis read -----------------------
+;
+; read_string is the public entry production calls. Forced to :bl it must return
+; exactly what the genesis Elixir reader returns — positions, author metadata,
+; and all. read_string_elixir is the genesis answer key (never flips).
+
+(defn- flipped [src file] (with-backend :bl (fn [] (BeamLisp.Reader/read_string src file))))
+(defn- genesis [src file] (BeamLisp.Reader/read_string_elixir src file))
+
+(deftest flipped-read-matches-genesis-on-scalars-and-lists
+  (testing "the seam forced to :bl returns the genesis tree, positions and all"
+    (is (= (genesis "(+ 1 2)" "a.bl") (flipped "(+ 1 2)" "a.bl")))
+    (is (= (genesis "[1 2 3]" "a.bl") (flipped "[1 2 3]" "a.bl")))
+    (is (= (genesis "{:a 1 :b 2}" "a.bl") (flipped "{:a 1 :b 2}" "a.bl")))
+    (is (= (genesis "42 :kw \"str\" nil" "a.bl") (flipped "42 :kw \"str\" nil" "a.bl")))))
+
+(deftest flipped-read-matches-genesis-on-positions
+  (testing "multi-line source: every list's {:line :col :file} matches genesis"
+    (is (= (genesis "(a)\n\n  (b c)" "src.bl") (flipped "(a)\n\n  (b c)" "src.bl")))))
+
+(deftest flipped-read-matches-genesis-on-author-metadata
+  (testing "^ metadata rides through the seam identically (compiler reads it)"
+    (is (= (genesis "(def ^:private secret 42)" "m.bl")
+           (flipped "(def ^:private secret 42)" "m.bl")))
+    (is (= (genesis "(defn ^{:doc \"d\"} f [x] x)" "m.bl")
+           (flipped "(defn ^{:doc \"d\"} f [x] x)" "m.bl")))))
+
+(deftest flipped-read-matches-genesis-on-dispatch-forms
+  (testing "fn-literals, data-reader tags, and their siblings match through the seam"
+    (is (= (genesis "(->> xs (map #(* % %)) (reduce +))" "d.bl")
+           (flipped "(->> xs (map #(* % %)) (reduce +))" "d.bl")))
+    (is (= (genesis "(f #time\"1990/2000\" #time\"1995\")" "d.bl")
+           (flipped "(f #time\"1990/2000\" #time\"1995\")" "d.bl")))))
+
+; --- read_all / read_one inherit the flip (they funnel through read_string) ---
+
+(deftest read-all-and-read-one-inherit-the-seam
+  (testing "read_all through the flipped seam still deep-unwraps to bare shapes"
+    (is (= (BeamLisp.Reader/read_all_elixir "(a [b {:c 1}])")
+           (with-backend :bl (fn [] (BeamLisp.Reader/read_all "(a [b {:c 1}])"))))))
+  (testing "read_one through the flipped seam returns the single bare form"
+    (is (= (BeamLisp.Reader/read_one "(a b c)")
+           (with-backend :bl (fn [] (BeamLisp.Reader/read_one "(a b c)")))))))
+
+; --- the public exception contract survives the flip --------------------------
+;
+; reader.bl raises BeamLisp.ExInfo (syntax) and BeamLisp.AtomGuard.LimitError
+; (atom exhaustion); the DOCUMENTED contract (Reader @spec, docs/trust-boundary)
+; is Reader.SyntaxError / Reader.AtomLimitError. The seam re-raises so a caller
+; rescuing the public type still catches a delegated read's failure.
+
+; The seam re-raises reader.bl's internal ExInfo as the PUBLIC
+; Reader.SyntaxError. thrown?/thrown-with-msg? catch ANY raise (untyped), so the
+; type IS the contract here — use the typed-catch idiom: match the public struct
+; explicitly, fall through to false on any other error.
+
+(deftest flipped-syntax-error-is-public-syntax-error
+  (testing "a syntax error through the :bl seam raises Reader.SyntaxError"
+    (is (try
+          (do (with-backend :bl (fn [] (BeamLisp.Reader/read_string "(a b" "e.bl"))) false)
+          (catch BeamLisp.Reader.SyntaxError e (includes? (str (ex-message e)) "unterminated"))
+          (catch e false)))))
+
+(deftest flipped-atom-limit-is-public-atom-limit
+  (testing "atom exhaustion through the :bl seam raises Reader.AtomLimitError"
+    (let [prev-f (Application/get_env :beam_lisp :atom_high_water_fraction 0.9)
+          prev-i (Application/get_env :beam_lisp :atom_check_interval 256)]
+      (Application/put_env :beam_lisp :atom_high_water_fraction 0.0)
+      (Application/put_env :beam_lisp :atom_check_interval 1)
+      (BeamLisp.AtomGuard/reset)
+      (try
+        (is (try
+              (do (with-backend :bl (fn [] (BeamLisp.Reader/read_string "danger-cutover-uniq-sym" "e.bl"))) false)
+              (catch BeamLisp.Reader.AtomLimitError e true)
+              (catch e false)))
+        (finally
+          (Application/put_env :beam_lisp :atom_high_water_fraction prev-f)
+          (Application/put_env :beam_lisp :atom_check_interval prev-i))))))
+
+; --- :genesis is always the Elixir reader (rebuild / oracle safety) -----------
+
+(deftest genesis-backend-forces-elixir-reader
+  (testing "forced :genesis returns the Elixir reading even if reader ns is interned"
+    (is (= (BeamLisp.Reader/read_string_elixir "(x #(f %) y)" "g.bl")
+           (with-backend :genesis (fn [] (BeamLisp.Reader/read_string "(x #(f %) y)" "g.bl")))))))

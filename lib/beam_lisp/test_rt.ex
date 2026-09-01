@@ -253,7 +253,7 @@ defmodule BeamLisp.TestRT do
 
   defp run_suite_serial(paths) do
     BeamLisp.init()
-    Compiler.eval_string(File.read!(test_lib_path()), Compiler.new_env("core"))
+    Compiler.eval_string(test_lib(), Compiler.new_env("core"))
 
     Enum.each(paths, fn path ->
       Env.in_ns("user")
@@ -271,7 +271,7 @@ defmodule BeamLisp.TestRT do
     base = Env.fork(:global)
 
     Env.with_env(base, fn ->
-      Compiler.eval_string(File.read!(test_lib_path()), Compiler.new_env("core"))
+      Compiler.eval_string(test_lib(), Compiler.new_env("core"))
     end)
 
     # Streams in the ORIGINAL path order so output reads like the serial
@@ -331,7 +331,20 @@ defmodule BeamLisp.TestRT do
     unless passed?(totals), do: System.halt(1)
   end
 
-  defp test_lib_path, do: Application.app_dir(:beam_lisp, "priv/test.bl")
+  # The test library ships INSIDE the compiled module, not as a runtime
+  # priv file — the same rule as the prelude in beam_lisp.ex: escripts
+  # (and flat .beam deployments) have no :code.priv_dir/1, so a runtime
+  # File.read! would crash `bl test`. @external_resource keeps Mix
+  # recompiling when the source changes.
+  @test_lib_path Path.join(__DIR__, "../../priv/test.bl")
+  @external_resource @test_lib_path
+  @test_lib File.read!(@test_lib_path)
+
+  defp test_lib, do: @test_lib
+
+  @doc "The embedded test-library source — for in-language loaders (reload/ward.bl) " <>
+       "that must work where :code.priv_dir/1 does not (escripts)."
+  def test_lib_source, do: @test_lib
 
   # --- failure printing ---
 

@@ -136,30 +136,34 @@ module whole.
 
 Tempo's `~o"2026-06-15"` is a compile-time sigil that parses ISO 8601-2
 into a value. beam-lisp has the same shape with more reach:
-**data-readers**, the mechanism datom already uses for `#d[...]` queries
-(`priv/datom.bl`: `(data-reader! "d" (quote datom/read-query))`; core has
-`(reader-macro! "@" (quote deref))`).
+**data-readers**, the mechanism datom already uses for `#d[...]` queries. The
+tag→reader-fn mapping is beam-lisp source, not a hardcoded reader default: the
+built-ins live in one central registry (`priv/data-readers.bl`) that
+`BeamLisp.init/0` seeds at boot, alongside `#d` — the self-hosted analogue of
+Clojure's `data_readers.clj` (core has `(reader-macro! "@" (quote deref))` for
+the non-tag case).
 
 ```clojure
-;; read time: #o"…" runs the ISO 8601-2 / EDTF / IXDTF grammar → a
-;; valid-time entity literal. one repr: it reads straight into a datom.
-(data-reader! "o" (quote datom.time/read-iso8601))
+;; read time: #time"…" runs the ISO 8601-2 / EDTF / IXDTF grammar → a
+;; valid-time value literal. one repr: it reads straight into a datom.
+;; registered centrally in priv/data-readers.bl, seeded at boot:
+(data-reader! "time" (quote datom.time/read-iso8601))
 
-#o"2026-06-15"                          ; a day  — [2026-06-15, 2026-06-16)
-#o"156X"                                ; a masked year — the 1560s (§4)
-#o"2026-06-15T09/2026-06-15T17"         ; a closed interval
-#o"1984?/2004~"                         ; per-endpoint EDTF qualifications (§4)
-#o"2026-06-15T14:30[Australia/Sydney]"  ; IXDTF zone suffix
+#time"2026-06-15"                          ; a day  — [2026-06-15, 2026-06-16)
+#time"156X"                                ; a masked year — the 1560s (§4)
+#time"2026-06-15T09/2026-06-15T17"         ; a closed interval
+#time"1984?/2004~"                         ; per-endpoint EDTF qualifications (§4)
+#time"2026-06-15T14:30[Australia/Sydney]"  ; IXDTF zone suffix
 ```
 
 Strictly better than the sigil on two axes. A malformed literal is a
 **read error at the source position** — the story
 `examples/typing/01_check_demo.bl` tells ("each at the position the user
-wrote") — not a runtime parse failure. And because `#o` yields a datom
+wrote") — not a runtime parse failure. And because `#time` yields a datom
 entity (§0), a literal drops directly into a transaction:
 
 ```clojure
-(datom/transact! conn [{:reign/name "Aethelred" :reign/span #o"978/1016"}])
+(datom/transact! conn [{:reign/name "Aethelred" :reign/span #time"978/1016"}])
 ```
 
 The one thing the Elixir sigil does that a reader does not is
@@ -340,14 +344,14 @@ verdict (§4) carries the **actual z3 counterexample** *and* the
 evidence, the way the type checker does.
 
 ```clojure
-(explain #o"156X")
+(explain #time"156X")
 ;=> {:headline "a masked year spanning the 1560s"
-;    :span     [#o"1560" #o"1570")      ; half-open, real bounds
+;    :span     [#time"1560" #time"1570")      ; half-open, real bounds
 ;    :iterates :month
 ;    :parts    [[:qualification :masked-digit 3]]}
 
-(to-ansi (explain #o"156X"))   ; coloured terminal
-(to-html (explain #o"156X"))   ; the live UI surface (§8)
+(to-ansi (explain #time"156X"))   ; coloured terminal
+(to-html (explain #time"156X"))   ; the live UI surface (§8)
 ```
 
 ---
@@ -430,14 +434,14 @@ seqs (`examples/lazy.bl`) with constant-space `loop`/`recur`, so an RRULE
 is a lazy generator — infinite by default, `take`/`take-while`-bounded,
 never materialised until a set operation forces it. The "shared AST for
 ISO 8601 and RRULE" tempo documents is, here, one reader grammar feeding
-two interpreters: `#o` for a literal, a lazy unfold for a rule. And the
+two interpreters: `#time` for a literal, a lazy unfold for a rule. And the
 bound is not a hope — `priv/termination.bl` **proves** the
 `take-while (before? …)` finite, because a shrinking measure toward a
 `:time/to` is exactly its accepted shrink shape.
 
 ```clojure
 (->> (recur-rule {:freq :monthly :by-day :friday :by-monthday 13})
-     (take-while #(before? % #o"2100"))
+     (take-while #(before? % #time"2100"))
      (into []))
 ```
 
@@ -485,7 +489,7 @@ engine), or *new* (genuinely to-build).
 |---|---|---|
 | interval-as-type | a store entity, one repr (§0) | **identity** — datom gives it free |
 | valid × transaction time | `:time/from…to` × existing `as-of` (§0) | **identity** — one bitemporal entity |
-| `~o` sigil / parse | `data-reader!` `#o` (§1) | **native** — reader + ISO grammar |
+| `~o` sigil / parse | `data-reader!` `#time` (§1) | **native** — reader + ISO grammar |
 | pattern matching | map destructuring + guards (§1) | **identity** — an interval is a map |
 | Allen's 13 relations | `defmulti` + `defrelation` (§2) | **native** — dispatch + computed rel |
 | set algebra (multirange) | store negation/join + optics (§3) | **native** — join = intersect, laws inherited |
@@ -521,8 +525,11 @@ fixpoint over the same db, grounded-vs-floating is an effect type, and
 "does this schedule ever miss a deadline?" is an inductive invariant. The
 second axis of `datom.time` was always missing; tempo is its name.
 
-The next move, if this became code, is the one the scorecard names: build
-the `#o` reader (the ISO 8601-2 / EDTF / IXDTF grammar), the single *new*
-thing — and let every other row fall out of the entity it already is,
-measured cell by cell, a low score naming exactly what to build, the way
-every compat document in this repo works.
+The move the scorecard named — build the `#time` reader (the ISO 8601-2 /
+EDTF / IXDTF grammar), the single *new* thing — is now done: `read-iso8601`
+in `priv/datom/time.bl`, registered as `#time` in the central
+`priv/data-readers.bl` registry, exercised by the eight demos in
+`examples/datom/time/` and `test/bl/datom/time_valid_test.bl`. Every other
+row falls out of the value it already is, measured cell by cell, a low score
+naming exactly what to build next, the way every compat document in this repo
+works.

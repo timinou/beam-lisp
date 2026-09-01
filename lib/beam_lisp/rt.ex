@@ -2096,25 +2096,15 @@ defmodule BeamLisp.RT do
   as Clojure's `*data-readers*` expands `#inst "…"`.
   """
   def data_reader(tag) when is_binary(tag) do
-    case BeamLisp.Env.lookup({:data_reader, tag}) do
-      {:ok, name} -> {:ok, name}
-      :error -> data_reader_default(tag)
-    end
+    # Pure registry lookup — no builtin defaults live here. The tag→reader-fn
+    # mapping is OWNED by beam-lisp source: `priv/data-readers.bl` registers
+    # `#d` and `#time` at boot (loaded by `BeamLisp.init/0` BEFORE any user
+    # file is read), the way Clojure's `data_readers.clj` seeds `#inst`/`#uuid`.
+    # A stored value is `{:symbol, name}`, exactly the shape the reader's
+    # `record_or_tag` clause expects; a miss returns `:error` and the reader
+    # falls through to its record/bare-atom path.
+    BeamLisp.Env.lookup({:data_reader, tag})
   end
-
-  # Builtin data-reader defaults, mirroring the `@`→`deref` fallback in the
-  # reader: a whole file is READ before any form (including the `data-reader!`
-  # registration in `priv/datom.bl`) EVALUATES, so a `#d[…]` literal in a file
-  # that merely `:require`s datom would not see a purely runtime registration.
-  # Naming the builtin here keeps `#d[…]` readable from first boot; a runtime
-  # `data-reader!` still overrides it (checked first, above).
-  defp data_reader_default("d"), do: {:ok, {:symbol, "datom/read-query"}}
-  # `#o"…"` — the temporal literal, read by `datom.time/read-iso8601`. Same
-  # bootstrap as `#d`: a file that merely `:require`s `datom.time` reads its
-  # `#o` literals before the runtime `data-reader!` registration evaluates,
-  # so the builtin default makes `#o` readable from first boot.
-  defp data_reader_default("o"), do: {:ok, {:symbol, "datom.time/read-iso8601"}}
-  defp data_reader_default(_), do: :error
 
   @doc """
   `(data-reader! "d" 'datom/read-query)` registers a data-reader so
@@ -2122,9 +2112,14 @@ defmodule BeamLisp.RT do
   `reader-macro!`, and registered from beam-lisp source rather than wired
   into the reader.
   """
-  def data_reader!(tag, {:symbol, name}) when is_binary(tag) do
-    BeamLisp.Env.put_key({:data_reader, tag}, name)
-    name
+  def data_reader!(tag, {:symbol, _name} = sym) when is_binary(tag) do
+    # Store the WHOLE `{:symbol, name}` node, not the bare string: the reader
+    # (`record_or_tag`) matches `{:ok, {:symbol, _}}` and wraps the following
+    # form as `(<sym> <form>)`. Storing a bare string produced `{:ok, "name"}`,
+    # which matched no clause and crashed the reader — so this registry was
+    # dead until now and `#d`/`#o` only worked through an Elixir hardcode.
+    BeamLisp.Env.put_key({:data_reader, tag}, sym)
+    sym
   end
 
   @doc """
