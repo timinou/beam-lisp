@@ -1,0 +1,450 @@
+; loom/desktop.bl — a native desktop app is a loom view over live state.
+;
+; ── The idea ──────────────────────────────────────────────────────────
+;
+; live/ made a web page a PURE PROJECTION of state: one commit, N browser
+; viewers converge, the diff is the only thing on the wire. `desktop` makes a
+; NATIVE WINDOW the viewer. The loop is identical — state changes, the view
+; re-renders, the window converges — but the transport is not a WebSocket, it
+; is the wry `eval` channel, and the "server" and "client" live in the SAME
+; BEAM node.
+;
+;   (desktop/app
+;     {:title "Counter" :width 360 :height 220
+;      :state 0                                   ; any value
+;      :view  (fn [n] (ui/button {:on-click [:inc]} (str "count: " n)))
+;      :on-event (fn [n ev] (if (= (first ev) :inc) (+ n 1) n))})
+;
+; `view` is a PURE function `state → loom hiccup`. `on-event` is a PURE
+; reducer `(state, event) → state`. That is the whole contract, and it is the
+; same shape as a reduce, an Elm app, or a `live` socket — because it is the
+; same idea in three dresses.
+;
+; ── Events: loom's vocabulary, unchanged ──────────────────────────────
+;
+; A loom component already expresses an event as `:on-click [:intent …]` and
+; live/hiccup already renders that to a `data-ev-click='<json term>'` marker.
+; The web client hook binds those markers to a WebSocket. Here, a tiny client
+; hook (CLIENT-HOOK below) binds the SAME markers to `bl.send` via event
+; delegation — so EVERY loom component (button, field, the whole form) drives a
+; native window with zero change. The event term you wrote in the view is the
+; event value your reducer receives.
+;
+; A page can also call `bl.send([:whatever x])` directly (a raw JS escape
+; hatch); it arrives at `on-event` as the parsed term just the same.
+;
+; ── The driver ────────────────────────────────────────────────────────
+;
+; `mount` spawns ONE process that IS the app: it holds the state, renders the
+; first frame into the window, then loops. Each event (from the page) or tick
+; (from a timer) is folded through `on-event`; if the state changed, the view
+; re-renders and the new HTML is swapped into the live page with one `eval`.
+; The process owns the state, so there is no shared mutable cell and no race —
+; the actor model doing what it is good at.
+
+(ns loom.desktop
+  (:require [wry]
+            [loom.token :as t]
+            [live.hiccup :as h]
+            [interop]))
+
+;; ── the client hook ──────────────────────────────────────────────────
+;;
+;; Injected once, at mount, ahead of any frame. It does two jobs:
+;;
+;;   1. delegation: one document-level click listener walks up from the target
+;;      to the nearest `[data-ev-click]` and posts its term back — so buttons
+;;      rendered in ANY later frame are live without re-binding. `input`/`change`
+;;      are delegated the same way, carrying the field's value.
+;;   2. swap: `__loom_swap(html)` replaces the app root's innerHTML, and
+;;      `__loom_style(css)` keeps the stylesheet current (a new frame may use
+;;      classes the first did not). Both are what the driver calls via `eval`.
+;;
+;; The term in `data-ev-*` is JSON (live/hiccup emits it that way); we post it
+;; verbatim so the driver can parse it back to a beam-lisp value.
+
+(def ^:private client-hook
+  (str
+    "window.__loom = window.__loom || {};"
+    ;; ── auto-height ─────────────────────────────────────────────────
+    ;; After any render the page measures its OWN intrinsic content height
+    ;; (loom-root.scrollHeight, independent of the surface's current size) and,
+    ;; if it changed, reports it back as a reserved event ["__loom-height", h].
+    ;; The driver turns that into a surface resize — so a dropdown that opens
+    ;; below the bar makes the surface exactly tall enough to show it, and
+    ;; closing shrinks it back. No view ever computes a pixel height.
+    "window.__loom_h = 0;"
+    ;; the height the surface needs = the lowest pixel ANY content reaches.
+    ;; Measured as the max getBoundingClientRect().bottom over loom-root and
+    ;; all its descendants (the viewport top is the surface top, since the bar
+    ;; is anchored to the top edge). This is robust to out-of-flow dropdowns:
+    ;; an absolutely-positioned panel below a pill counts, even though it does
+    ;; not expand any ancestor's normal-flow height.
+    "window.__loom_measure = function(){"
+    "  var r=document.getElementById('loom-root'); if(!r) return;"
+    "  var max=0; var els=r.querySelectorAll('*');"
+    "  var b=r.getBoundingClientRect().bottom; if(b>max) max=b;"
+    "  for(var i=0;i<els.length;i++){var rb=els[i].getBoundingClientRect().bottom; if(rb>max) max=rb;}"
+    "  var h=Math.ceil(max);"
+    "  if(h>0 && h!==window.__loom_h){window.__loom_h=h; bl.send(JSON.stringify(['__loom-height', h]));}"
+    "};"
+    ;; measure on the next frame (after layout settles) following any swap
+    "window.__loom_remeasure = function(){requestAnimationFrame(function(){requestAnimationFrame(window.__loom_measure);});};"
+    ;; swap the app body and (if present) the live stylesheet, then remeasure
+    "window.__loom_swap = function(html){var r=document.getElementById('loom-root'); if(r) r.innerHTML=html; window.__loom_remeasure();};"
+    "window.__loom_style = function(css){var s=document.getElementById('loom-style'); if(s) s.textContent=css; window.__loom_remeasure();};"
+    ;; augment an event term with a value pulled from the source element
+    "function __loom_val(el){return el&&(el.type==='checkbox')?el.checked:(el?el.value:null);}"
+    ;; post the term on the nearest ancestor carrying data-ev-<kind>
+    "function __loom_fire(kind, target){"
+    "  var el=target; while(el&&el!==document){"
+    "    var raw=el.getAttribute&&el.getAttribute('data-ev-'+kind);"
+    "    if(raw){var term=JSON.parse(raw);"
+    "      if(kind==='input'||kind==='change'){term=[term,__loom_val(el)];}"
+    "      bl.send(JSON.stringify(term)); return;}"
+    "    el=el.parentNode;}"
+    "}"
+    "document.addEventListener('click', function(e){__loom_fire('click', e.target);});"
+    "document.addEventListener('input', function(e){__loom_fire('input', e.target);}, true);"
+    "document.addEventListener('change', function(e){__loom_fire('change', e.target);}, true);"
+    ;; measure the first paint too
+    "window.__loom_remeasure();"))
+
+;; ── rendering: state → a full HTML document, and → a body swap ────────
+;;
+;; `t/with-sheet` runs the view with a fresh atomic-CSS sheet and returns the
+;; realized tree plus the <style> element. The first frame builds a whole
+;; document (so the hook and root exist); later frames send just the body HTML
+;; and the current sheet CSS, which the hook swaps in.
+
+(defn- render-frame
+  "Run `view` on `state` → {:body <html string> :css <sheet css string>}."
+  [view state]
+  (let [result (t/with-sheet (fn [] (view state)))
+        body (h/hiccup->html (:tree result))
+        ;; the style element's second item is the full CSS text (base + sheet)
+        css (second (:style result))]
+    {:body body :css css}))
+
+; when the window is transparent, loom's base-css still paints an opaque
+; `body{background:<bg>}`. This override (emitted AFTER the sheet, so it wins)
+; makes the document itself see-through, leaving only the view's own
+; translucent blocks visible — the compositor shows through the rest.
+(def ^:private transparent-css
+  "html,body{background:transparent !important}")
+
+(defn- document
+  "The first-paint HTML: the hook, a live <style>, and the app root holding
+   the first body. Everything a frame needs to exist is created here once.
+   When `transparent?`, the document background is forced see-through."
+  [title frame transparent?]
+  (str "<!doctype html><html lang=\"en\"><head>"
+       "<meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<title>" (h/escape title) "</title>"
+       "<style id=\"loom-style\">" (:css frame) "</style>"
+       (if transparent? (str "<style>" transparent-css "</style>") "")
+       "</head><body>"
+       "<div id=\"loom-root\">" (:body frame) "</div>"
+       "<script>" client-hook "</script>"
+       "</body></html>"))
+
+;; ── the event parse ───────────────────────────────────────────────────
+;;
+;; The page posts a JSON string. Decode it to beam-lisp data; a leading
+;; string head (JSON has no keywords) is turned back into a keyword so a
+;; reducer can `(case (first ev) :inc … )` naturally. `[["inc"]]`-shaped
+;; nesting from the input/change wrapper is handled too.
+
+(defn- keywordize-head
+  "A decoded JSON event `[\"inc\" …]` → `[:inc …]`; a nested `[[\"assign\" k] v]`
+   keywordizes the inner head as well. Non-list events pass through."
+  [ev]
+  (cond
+    (and (or (list? ev) (vector? ev)) (seq ev))
+      ;; build a VECTOR, not `(cons kw (map …))`: consing a keyword onto a lazy
+      ;; seq makes an improper list that `nth`/`second`/`vec` cannot index.
+      (let [head (first ev)
+            head' (if (string? head) (keyword head) (keywordize-head head))
+            tail (mapv keywordize-head (rest ev))]
+        (into [head'] tail))
+    :else ev))
+
+(defn- parse-event [body]
+  (try
+    (keywordize-head (interop/json-> body))
+    (catch _ [:raw body])))
+
+;; ── the driver process ────────────────────────────────────────────────
+
+(defn- swap! [window frame]
+  ;; push the new stylesheet first (so classes exist), then the body
+  (wry/eval window (str "window.__loom_style(" (interop/->json (:css frame)) ")"))
+  (wry/eval window (str "window.__loom_swap(" (interop/->json (:body frame)) ")")))
+
+(defn- height-event?
+  "Whether `ev` is the reserved auto-height report `[:__loom-height h]`."
+  [ev]
+  (and (or (list? ev) (vector? ev))
+       (seq ev)
+       (= (first ev) :__loom-height)))
+
+;; The driver carries `width` and `base-h` (the bar's own height) so a height
+;; report can resize the surface, never shrinking below the bar itself.
+(defn- driver-loop [window view on-event width base-h state]
+  (receive
+    ;; an event from the page (IPC body already parsed by the receiver).
+    ;; A reserved [:__loom-height h] report is INTERNAL (surface sizing, not
+    ;; app state): resize to fit — never below the bar's base height — and loop
+    ;; without touching state. Everything else folds through on-event.
+    [:event ev]
+    (if (height-event? ev)
+      ;; ev is the vector `[:__loom-height h]` (parse-event builds vectors).
+      (let [h (nth ev 1 base-h)
+            target (if (and (number? h) (> h base-h)) h base-h)]
+        (wry/resize window width target)
+        (driver-loop window view on-event width base-h state))
+      (let [new-state (on-event state ev)]
+        (when (not= new-state state)
+          (swap! window (render-frame view new-state)))
+        (driver-loop window view on-event width base-h new-state)))
+
+    ;; a periodic tick: fold a synthetic event, re-render if it moved state
+    [:tick ev]
+    (let [new-state (on-event state ev)]
+      (when (not= new-state state)
+        (swap! window (render-frame view new-state)))
+      (driver-loop window view on-event width base-h new-state))
+
+    ;; the window asked to close (or `stop` was called): end the loop
+    :stop :ok
+
+    _ (driver-loop window view on-event width base-h state)))
+
+;; ── availability ──────────────────────────────────────────────────────
+
+(defn available?
+  "Whether the native WebView backend loaded (delegates to `wry/available?`).
+   A desktop app that cannot open a window should degrade, not crash."
+  []
+  (wry/available?))
+
+;; ── the app value ──────────────────────────────────────────────────────
+
+(defrecord App [window driver])
+
+(defn mount
+  "Mount a live loom view in a native window and return an `App`.
+
+   `spec` keys:
+     :state     the initial state value (default nil)
+     :view      (fn [state] → loom hiccup)                    REQUIRED
+     :on-event  (fn [state event] → new-state)  (default: ignore events)
+     :title :width :height :decorations :always-on-top :resizable :x :y
+                all forwarded to `wry/open`
+     :tick      {:every-ms N :event <term>} — fold `event` every N ms, so a
+                clock or a vitals frame advances without any user input
+
+   The returned App holds the window and the driver process. `stop` tears
+   both down."
+  [spec]
+  (let [view (get spec :view)
+        on-event (get spec :on-event (fn [s _] s))
+        state0 (get spec :state)
+        title (get spec :title "beam-lisp")
+        _ (when (nil? view) (throw (ex-info "desktop/mount needs a :view fn" {})))
+        ;; render the first frame BEFORE opening, so the window shows content
+        ;; immediately (no empty flash before the first eval).
+        frame0 (render-frame view state0)
+        doc (document title frame0 (get spec :transparent false))
+        ;; the driver process holds state and owns the window handle. We create
+        ;; it first as a forward-reference cell so the on-message closure can
+        ;; send to it; a promise-style handshake keeps it simple.
+        self (erlang/self)
+        ;; open the window; every page event lands as a parsed term sent to the
+        ;; driver we are about to spawn. We route via a thin relay: the window's
+        ;; :on-message forwards to `self` until the driver pid is known, then to
+        ;; the driver. Simpler: spawn the driver first, then open with a closure
+        ;; that targets it.
+        driver-box (atom nil)
+        window (wry/open
+                 (merge
+                   (select-keys spec [:width :height :decorations
+                                      :always-on-top :resizable :x :y
+                                      :layer :anchor :exclusive :transparent])
+                   {:title title
+                    :html doc
+                    :on-message
+                    (fn [body]
+                      (when-let [d (deref driver-box)]
+                        (erlang/send d [:event (parse-event body)])))}))
+        ;; the bar's own height is the floor a height-report shrinks back to;
+        ;; the width passed to resize is the configured width (a left+right
+        ;; anchored layer surface keeps its real width from the anchors, so
+        ;; only the height actually changes for a dropdown).
+        base-h (get spec :height 480)
+        rz-width (get spec :width 720)
+        driver (spawn (fn []
+                        (driver-loop window view on-event
+                                     rz-width base-h state0)))]
+    (reset! driver-box driver)
+    ;; optional periodic tick: a process that pokes the driver every N ms.
+    (when-let [tick (get spec :tick)]
+      (let [ms (get tick :every-ms 1000)
+            ev (get tick :event [:tick])]
+        (spawn (fn []
+                 (letfn [(loop-tick []
+                           (Process/sleep ms)
+                           (when (Process/alive? driver)
+                             (erlang/send driver [:tick ev])
+                             (loop-tick)))]
+                   (loop-tick))))))
+    (->App window driver)))
+
+(defn emit
+  "Fold an event into a mounted app from beam-lisp itself (not from the page).
+   The reducer runs and the view re-renders exactly as for a page event — so
+   external state (a datom change, a received message) can drive the UI."
+  [app ev]
+  (erlang/send (:driver app) [:event ev]))
+
+(defn stop
+  "Close the app's window and stop its driver."
+  [app]
+  (erlang/send (:driver app) :stop)
+  (wry/close (:window app)))
+
+;; ── presets ──────────────────────────────────────────────────────────
+
+(defn app
+  "Mount a normal application window. Thin sugar over `mount` with sensible
+   window defaults (decorated, resizable)."
+  [spec]
+  (mount (merge {:width 720 :height 480 :decorations true :resizable true}
+                spec)))
+
+(defn bar
+  "Mount a top-bar STATUSBAR: a frameless strip docked to the top of the
+   screen via wlr-layer-shell, above tiled windows, reserving its own strip.
+
+   The docking is done with the layer-shell protocol (`:layer :top`,
+   `:anchor [:top :left :right]`) — NOT X11 always-on-top, which a
+   wlroots/tiling compositor (niri, sway, hyprland) ignores. Anchoring both
+   left and right stretches the bar to the full screen width, so you do not
+   even need to know the monitor's pixel width.
+
+   The reserved strip (`:exclusive`) is PINNED to the bar height, NOT `:auto`.
+   That is what makes dropdowns work: the surface itself grows downward to
+   host an open panel (auto-height, see `mount`), but the reserved zone stays
+   the bar's height — so the panel OVERLAYS the windows below (it is on the
+   `:top` layer) instead of shoving them down. Close the panel, the surface
+   shrinks back. The bar's own footprint never changes.
+
+   Keys beyond `mount`:
+     :height       the bar's height in px (default 34)
+     :edge         :top (default) or :bottom — which edge to dock to
+     :transparent  translucent for a glassmorphic look (default true)
+     :anchor       override the anchored edges (default [edge :left :right])
+     :exclusive    override the reserved strip (default = the bar height)
+
+   A bar is just `mount` at a point in the window-option space: no chrome, a
+   layer surface, anchored to span an edge. The view is an ordinary loom row."
+  [spec]
+  (let [height (get spec :height 34)
+        edge (get spec :edge :top)
+        anchor (get spec :anchor [edge :left :right])]
+    (mount (merge {:decorations false
+                   :resizable false
+                   :layer :top
+                   :anchor anchor
+                   ;; fixed reserved strip = bar height, so growing the surface
+                   ;; for a dropdown overlays windows below instead of moving
+                   ;; them. Overridable, but :auto would defeat the dropdown.
+                   :exclusive height
+                   :transparent true
+                   ;; width is set by the left+right anchor; height is the strip.
+                   ;; a sane fallback width for non-layer-shell (X11) fallback.
+                   :width 1920
+                   :height height}
+                  (dissoc spec :edge :screen-width)))))
+
+;; ── the dropdown grammar ───────────────────────────────────────────────
+;;
+;; A dropdown is a trigger with a panel that hangs BELOW it, out of the normal
+;; flow. The whole point on a bar: the panel is `position:absolute`, so it does
+;; NOT push the bar's own row around — the bar's spacing is preserved whether the
+;; menu is open or shut. When open, the panel extends past the bar's height; the
+;; auto-height machinery (see the client hook + driver) then grows the surface
+;; just enough to show it, and shrinks back on close. The reserved zone stays
+;; the bar height, so the panel overlays the windows below.
+;;
+;; It is pure view: `dropdown` reads `open?` from your state and emits an
+;; `:on-click` toggle event; your reducer flips the flag. No hidden state, same
+;; one-way-data-flow as everything else.
+
+(defn dropdown
+  "A dropdown menu: a trigger that toggles a panel hanging below it.
+
+   `opts`:
+     :open?     whether the panel is shown (from your state)      REQUIRED-ish
+     :on-click  the event term fired when the trigger is clicked   REQUIRED
+     :trigger   hiccup for the trigger's inner content (label, icon, …)
+     :align     :left (default) or :right — which edge of the trigger the
+                panel aligns to (a right-aligned trigger wants :right so the
+                panel does not overflow the screen)
+     :width     panel width in px (default 220)
+     :gap       px gap between trigger and panel (default 8)
+     :style     extra style merged into the panel surface
+   `& body` are the panel's children (menu rows, anything).
+
+   The panel inherits the glassmorphic surface by default; override via :style."
+  [opts & body]
+  (let [open? (get opts :open? false)
+        on-click (get opts :on-click)
+        trigger (get opts :trigger "▾")
+        align (get opts :align :left)
+        width (get opts :width 220)
+        gap (get opts :gap 8)
+        panel-style (get opts :style {})]
+    ;; a relatively-positioned wrapper so the absolute panel anchors to it.
+    [:div {:class (t/sx {:position "relative" :display "inline-flex"})}
+     ;; the trigger — clicking fires the toggle event
+     [:div {:on-click on-click
+            :class (t/sx {:cursor "pointer" :display "inline-flex"
+                          :align-items "center"})}
+      trigger]
+     ;; the panel, out of flow. Rendered only when open, so a closed menu
+     ;; contributes nothing to the measured height (surface stays bar-tall).
+     (when open?
+       (into
+              [:div
+              {:class (t/sx (merge
+                              {:position "absolute" :top "100%"
+                               ;; align the panel to the trigger's left or right
+                               ;; edge (computed key → assoc, not a literal).
+                               (if (= align :right) :right :left) "0"
+                               :margin-top (str gap "px")
+                               :min-width (str width "px")
+                               :display "flex" :flex-direction "column"
+                               :gap "2px" :padding "6px"
+                               :background "rgba(24, 26, 28, 0.72)"
+                               :backdrop-filter "blur(18px) saturate(1.4)"
+                               :-webkit-backdrop-filter "blur(18px) saturate(1.4)"
+                               :border "1px solid rgba(255,255,255,0.12)"
+                               :border-radius "12px"
+                               :box-shadow "0 8px 28px rgba(0,0,0,0.40)"
+                               :z-index "1000"}
+                              panel-style))}]
+              body))]))
+
+(defn menu-item
+  "One row inside a dropdown panel: a clickable line that fires `on-click`.
+   Sugar for the common menu row; a panel can hold arbitrary hiccup instead."
+  [on-click label]
+  [:div {:on-click on-click
+         :class (t/sx {:padding "7px 10px" :border-radius "7px"
+                       :cursor "pointer" :white-space "nowrap"
+                       :font-size (t/text :sm) :color (t/color :text)
+                       :transition "background 120ms"})
+         :style {:--hover "rgba(255,255,255,0.08)"}}
+   label])

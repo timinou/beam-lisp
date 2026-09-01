@@ -1,0 +1,180 @@
+; wry.bl — a native window with a WebView, as three verbs.
+;
+; ── The idea ──────────────────────────────────────────────────────────
+;
+; A web UI should cost a beam-lisp program one form to show and one form to
+; drive. `wry` is the whole surface:
+;
+;   (def w (wry/open {:title "Hi" :html "<h1>hi</h1>"}))
+;   (wry/eval w "document.body.style.background='rebeccapurple'")
+;   (wry/close w)
+;
+; The window is a real OS window hosting a real browser engine (WebKitGTK on
+; Linux, WebView2 on Windows, WebKit on macOS — whatever `wry` binds). The
+; Rust crate `wry_webview` is the substrate; this file is the language.
+;
+; ── IPC, both ways ────────────────────────────────────────────────────
+;
+; beam-lisp → page: `eval` runs any JavaScript in the window.
+;
+; page → beam-lisp: the page calls `bl.send(x)` (an init script aliases it to
+; `window.ipc.postMessage`). The NIF delivers each message as `{:wry-ipc body}`
+; to a RECEIVER PROCESS this namespace spawns per window. That process loops
+; and calls the user's `:on-message` function with the body — so a caller
+; never touches a mailbox or a pid; it just passes a function.
+;
+; ── Scope (prototype #1) ──────────────────────────────────────────────
+;
+; One window per `open`, driven robustly. Many concurrent windows is a real
+; next step (the toolkit's global init is per-thread) and is not claimed here.
+
+(ns wry)
+
+;; ── the native surface ───────────────────────────────────────────────
+;;
+;; Three NIFs, hosted by this namespace. `webview-open` takes the receiver
+;; pid first, then the window parameters; exactly one of html/url carries
+;; content (the other is ""). All are DirtyCpu/normal per the crate.
+
+(defnative "wry_webview"
+  ; (pid title html url width height decorations always-on-top resizable
+  ;  x y layer anchor-mask exclusive transparent)
+  (webview-open 15)  ; -> handle
+  (webview-eval 2)   ; (handle js)                       -> true
+(webview-resize 3) ; (handle width height)             -> true
+(webview-close 1)) ; (handle)                          -> true
+
+;; x/y "unset" sentinel: the NIF reads i64::MIN as "let the WM place it".
+;; -9223372036854775808 is that value; a docked bar passes real coordinates.
+;; The same value means "auto" for the layer-shell exclusive zone.
+(def ^:private pos-unset -9223372036854775808)
+
+;; layer keyword -> the NIF's small int (0 none, 1 top, 2 overlay).
+(def ^:private layer-code {nil 0 :none 0 :top 1 :overlay 2})
+
+;; edge keyword -> its bit in the anchor mask (top|bottom|left|right).
+(def ^:private edge-bit {:top 1 :bottom 2 :left 4 :right 8})
+
+(defn- anchor->mask
+  "A vector of edge keywords -> the NIF's anchor bitmask. `[:top :left :right]`
+   (a top bar) -> 1|4|8 = 13."
+  [edges]
+  (reduce (fn [m e] (erlang/bor m (get edge-bit e 0))) 0 (or edges [])))
+
+;; ── availability ──────────────────────────────────────────────────────
+
+(defn available?
+  "Whether the native WebView backend loaded. A GUI capability that cannot be
+   built (no Rust toolchain, no WebKitGTK) must read as ABSENT, so a program
+   can degrade rather than crash at require time."
+  []
+  (BeamLisp.Native/available? "wry"))
+
+;; ── the IPC receiver ──────────────────────────────────────────────────
+
+(defn- ipc-loop
+  "Deliver every `{:wry-ipc body}` message to `on-message`. One of these runs
+   per window, as its own process, for the window's whole life. `:wry-stop`
+   ends it (sent by `close`); anything else is ignored so a stray message
+   never wedges the loop."
+  [on-message]
+  (receive
+    [:wry-ipc body] (do (on-message body) (ipc-loop on-message))
+    :wry-stop :ok
+    _ (ipc-loop on-message)))
+
+;; ── the value ─────────────────────────────────────────────────────────
+;;
+;; A window is its native handle plus the receiver pid to shut down on close.
+;; The handle is opaque (a Rust resource); the record just pairs them so
+;; `close` can stop the receiver too.
+
+(defrecord Window [handle receiver])
+
+;; ── open / eval / close ───────────────────────────────────────────────
+
+(defn open
+  "Open a window with a WebView and return a `Window` handle.
+
+   `opts` is a map, every key optional:
+     :title       window title            (default \"beam-lisp\")
+     :html        inline HTML to render   — mutually exclusive with :url
+     :url         a URL to load           — used only if :html is absent
+     :width       logical width  in px    (default 800)
+     :height      logical height in px    (default 600)
+     :on-message  (fn [body] …) called with each `bl.send(x)` from the page
+     :decorations whether the OS frame/title bar is drawn (default true;
+                  false → a frameless window, what a statusbar wants)
+     :always-on-top  float above other windows (default false)
+     :resizable   whether the user may resize it (default true)
+     :x :y        initial top-left position in px; omit → the WM places it
+                  (a docked bar passes real coordinates)
+     :layer       wlr-layer-shell layer for docked/always-on-top surfaces on
+                  Wayland: :top (a bar) | :overlay (a HUD) | :none/omit (an
+                  ordinary window). This is what a wlroots compositor (niri,
+                  sway, hyprland) obeys — `:always-on-top` is an X11-ism it
+                  ignores. No-op on X11 / unsupported compositors.
+     :anchor      [edge …] screen edges the layer surface sticks to, from
+                  #{:top :bottom :left :right}. A top bar is [:top :left :right].
+     :exclusive   px strip the compositor reserves for the surface so other
+                  windows don't overlap it. :auto (default when :layer set) =
+                  reserve the surface's own size; an int = that many px; 0 = none.
+     :transparent make the window + webview transparent, so the page's
+                  translucent CSS reveals the compositor behind it (glassmorphism).
+
+   With neither :html nor :url, a tiny placeholder page is shown, so `open`
+   with no content still produces a visible, obviously-working window."
+  [opts]
+  (let [title (get opts :title "beam-lisp")
+        html (get opts :html)
+        url (get opts :url)
+        width (erlang/float (get opts :width 800))
+        height (erlang/float (get opts :height 600))
+        decorations (get opts :decorations true)
+        always-on-top (get opts :always-on-top false)
+        resizable (get opts :resizable true)
+        x (get opts :x pos-unset)
+        y (get opts :y pos-unset)
+        layer (get layer-code (get opts :layer) 0)
+        anchor-mask (anchor->mask (get opts :anchor))
+        exclusive (let [e (get opts :exclusive :auto)]
+                    (if (= e :auto) pos-unset e))
+        transparent (get opts :transparent false)
+        on-message (get opts :on-message (fn [_] :ok))
+        ; content: :html wins; else :url; else a placeholder page. Exactly one
+        ; of the two strings handed to the NIF is non-empty.
+        [html-arg url-arg]
+        (cond
+          (not (nil? html)) [html ""]
+          (not (nil? url)) ["" url]
+          :else ["<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;display:grid;place-items:center;height:90vh\"><h1>beam-lisp · wry</h1>" ""])
+        ; a receiver process per window: it owns the mailbox the NIF sends IPC
+        ; to, and turns each message into an on-message call.
+        receiver (spawn (fn [] (ipc-loop on-message)))
+        handle (webview-open receiver title html-arg url-arg width height
+                             decorations always-on-top resizable x y
+                             layer anchor-mask exclusive transparent)]
+    (->Window handle receiver)))
+
+(defn eval
+  "Run JavaScript `js` in `window`'s page. Fire-and-forget: returns as soon as
+   the request is queued. Raises if the window is already closed."
+  [window js]
+  (webview-eval (:handle window) js))
+
+(defn resize
+  "Resize `window`'s surface to `width` × `height` logical px. Fire-and-forget.
+   For a layer-shell bar this is how a dropdown grows the surface to hold an
+   open panel and shrinks it back on close — the exclusive zone stays fixed, so
+   the extra height overlays windows below rather than reflowing them."
+  [window width height]
+  (webview-resize (:handle window)
+                  (erlang/float width)
+                  (erlang/float height)))
+
+(defn close
+  "Close `window` and stop its IPC receiver. Waits for the window's own thread
+   to unwind, so a program that closes then exits sees a clean teardown."
+  [window]
+  (erlang/send (:receiver window) :wry-stop)
+  (webview-close (:handle window)))
