@@ -1,0 +1,178 @@
+; auth/login.bl — the three login shapes + the session seam, as functions.
+;
+; ── What this is ────────────────────────────────────────────────────
+;
+; auth.strategy says "a login is a function params → facts". Three login
+; SHAPES a real product needs are more than a bare function, because each
+; carries a small protocol the app should not re-invent (and re-invent
+; subtly wrong):
+;
+;   • DEVICE KEY  — passwordless challenge-response. The server issues a
+;                   random nonce; the client signs it with a device key
+;                   (WebCrypto, non-exportable private half); the server
+;                   verifies the signature against the stored public key.
+;                   Proves possession without any secret crossing the wire.
+;   • PASSWORD    — email + password, verified against a stored PBKDF2
+;                   verifier (auth.password). This file only names the
+;                   strategy; the hashing lives next door.
+;   • MAGIC LINK  — a single-use, time-limited token emailed as a URL. The
+;                   server stores only the token's HASH; on click it hashes
+;                   the presented token and matches. The raw token is never
+;                   at rest.
+;
+; And the piece every authenticated request needs, exactly once, correctly:
+;
+;   • SESSION-OF  — read a capability token from its wire (cookie/header)
+;                   string, VERIFY it under the root public key, and return
+;                   the principal it speaks for — or nil. A forged or
+;                   tampered token yields nil; no request is ever scoped by
+;                   an unverified claim.
+;
+; ── Why these live in `auth` ────────────────────────────────────────
+;
+; Each is small, but each has one detail that is a security bug if the app
+; gets it wrong: a nonce that is not random, a magic token stored in the
+; clear, a session that reads facts BEFORE verifying the signature. Writing
+; them once here, over the proven Biscuit + crypto layers, is the same move
+; as auth.password: give the app a correct value to compose, not a protocol
+; to re-derive. Storage stays the app's (datom); the crypto stays here.
+
+(ns auth.login
+  (:require [auth.biscuit.codec :as codec]
+            [auth.audit :as audit]
+            [auth.password :as password]))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. DEVICE KEY — challenge / response (passwordless)
+;; ════════════════════════════════════════════════════════════════════
+
+(def ^:private NONCE-BYTES 32)
+
+(defn challenge
+  "A fresh random login challenge — `NONCE-BYTES` of CSPRNG output.
+
+   The server issues this, remembers it against the pending login (in
+   datom, a cache, whatever it likes), and sends it to the client to sign.
+   Randomness is the whole security property: a predictable nonce would let
+   an attacker precompute a signature, so this is `strong_rand_bytes`, never
+   a timestamp or counter."
+  []
+  (erlang/apply :crypto :strong_rand_bytes (list NONCE-BYTES)))
+
+(defn verify-challenge
+  "Whether `signature` is a valid Ed25519 signature of `nonce` by the
+   private half of `public-key`.
+
+   `public-key` is the stored `:principal/public-key` (raw 32 bytes); the
+   client produced `signature` by signing the exact `nonce` bytes with the
+   device's non-exportable private key. True proves the client holds that
+   device key — the passwordless authentication — without the key ever
+   leaving the device. Any of the three inputs nil ⇒ false, never a crash."
+  [public-key nonce signature]
+  (if (or (nil? public-key) (nil? nonce) (nil? signature))
+    false
+    (erlang/apply :crypto :verify
+                  (list :eddsa :none nonce signature (list public-key :ed25519)))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. PASSWORD — re-exported strategy resolver (hashing lives in password.bl)
+;; ════════════════════════════════════════════════════════════════════
+
+(defn password-verifier
+  "A `(identity, password) → bool` fn for `auth/password-strategy`, backed
+   by `lookup-fn` (`identity → stored-verifier | nil`). Thin alias of
+   `auth.password/verifier` so the whole login vocabulary reads from one
+   namespace at the call site."
+  [lookup-fn]
+  (password/verifier lookup-fn))
+
+(defn hash-password [plain] (password/hash-password plain))
+(defn verify-password [plain stored] (password/verify-password plain stored))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. MAGIC LINK — a single-use, hash-at-rest token
+;; ════════════════════════════════════════════════════════════════════
+
+(def ^:private MAGIC-BYTES 32)
+
+(defn magic-token
+  "A fresh URL-safe magic-link token string — `MAGIC-BYTES` of CSPRNG
+   output, base64url so it drops straight into a link. This is the RAW
+   token that goes in the emailed URL and is shown to no one else; store
+   only its `token-hash`."
+  []
+  (Base/url_encode64 (erlang/apply :crypto :strong_rand_bytes (list MAGIC-BYTES))))
+
+(defn token-hash
+  "The SHA-256 hex of a magic (or invite) token — what the server STORES.
+
+   Storing the hash, not the token, means a leak of the datastore does not
+   leak live links: an attacker would have to reverse SHA-256. On redemption
+   the server hashes the presented token and matches this. Same shape the
+   `:invite/nonce-hash` column already expects."
+  [raw]
+  (String/downcase (Base/encode16 (erlang/apply :crypto :hash (list :sha256 raw)))))
+
+(defn magic-match?
+  "Whether a `presented` raw token hashes to a `stored` hash, in constant
+   time. The app still owns the datom lookup, the expiry check, and the
+   single-use flip; this is only the secret comparison, done without a
+   timing leak."
+  [presented stored]
+  (if (or (nil? presented) (nil? stored))
+    false
+    (let [a (token-hash presented)]
+      ;; both are fixed-length SHA-256 hex strings (binaries); hash_equals
+      ;; needs equal-length binaries, which same-length hex always are.
+      (if (not= (count a) (count stored))
+        false
+        (erlang/apply :crypto :hash_equals (list a stored))))))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. SESSION-OF — a verified principal from a wire token string
+;; ════════════════════════════════════════════════════════════════════
+;;
+;; The seam every authenticated request crosses. Given the base64 token a
+;; cookie or `Authorization: Bearer` header carried, and the root public
+;; key that verifies it, return WHO the request speaks for — after checking
+;; the signature. The order is the security property: decode, VERIFY, then
+;; read facts. verified-facts refuses to read an unverified token, so a
+;; forged cookie can name any principal it likes and still resolve to nil.
+
+(defn- fact-value
+  "The single argument of the first `name` fact in `facts` (a seq of
+   tuples like [\"user\" \"alice\"]), or nil."
+  [facts name]
+  (let [hit (first (filter (fn [t] (= (first t) name)) facts))]
+    (if (nil? hit) nil (second hit))))
+
+(defn session-of
+  "Resolve a verified session from a wire token string.
+
+   `opts` = {:token-str <base64> :root-pub <key>}. Returns
+   {:principal p :firm f :role r :token <token-value>} when the token
+   decodes AND verifies under `root-pub`; nil for a missing, malformed,
+   forged, or tampered token. The returned `:token` is the parsed value,
+   ready to authorize with — the caller need not decode again.
+
+   This is deliberately transport-agnostic: the caller pulls the string
+   from a cookie or header (so `auth` needs no dependency on `web`) and
+   supplies the verifying key. Single root-pub matches the shared-instance
+   model where the server mints every firm's capabilities; isolation rides
+   the verified (firm F) fact, not a per-firm key."
+  [opts]
+  (let [token-str (:token-str opts)
+        root-pub (:root-pub opts)]
+    (if (or (nil? token-str) (= "" token-str) (nil? root-pub))
+      nil
+      (let [tok (try (codec/decode (Base/url_decode64! token-str))
+                     (catch _e nil))]
+        (if (nil? tok)
+          nil
+          (let [facts (audit/verified-facts root-pub tok)]  ; nil unless sig verifies
+            (if (nil? facts)
+              nil
+              {:principal (fact-value facts "user")
+               :firm (fact-value facts "firm")
+               :role (fact-value facts "role")
+               :token tok})))))))

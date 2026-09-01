@@ -101,18 +101,30 @@ engine they jointly support is what answers.
 (def port (z3/open))
 
 ;; exists = the MOCK — z3 solves it, the model IS the value
-(v/exists port "temp" (v/int-of -90 60) "(> temp 50)")
+(v/exists port "temp" (v/int-of -90 60) '(> temp 50))
 ;; → {:modality :proven :engine :z3 :witness 51}
 
 ;; a structured token, from the String theory
-(v/exists port "tok" (v/string-of "sk_" 8 16) "(str-prefix? \"sk_\" tok)")
+(v/exists port "tok" (v/string-of "sk_" 8 16) '(str-prefix? "sk_" tok))
 ;; → {:modality :proven :engine :z3 :witness "sk_ABCED"}
 
+;; an ENUM datatype: the tags ARE the domain — and a payload arm synthesizes
+(v/for-all port "phase" (v/enum-of :pending :running :done)
+           '(not (= phase :running)))
+;; → {:modality :refuted :engine :z3 :witness :running}   ; a REAL bl keyword back
+
+(v/exists port "mode" (v/enum-of [:on :int] :off) '(some? (:on mode)))
+;; → {:modality :proven :engine :z3 :witness {:on 2}}     ; z3 built the record
+
+;; a COLLECTION: the bl rung binds vectors, the z3 rung its LENGTH (c_len)
+(v/for-all port "c" (v/coll-of 0 5) '(<= (count c) 5))
+;; → {:modality :proven :engine :z3}                      ; over EVERY vector
+
 ;; for-all = the PROPERTY TEST — a real ∀ proof when linear
-(v/for-all port "n" (v/int-of 0 100) "(>= n 0)")
+(v/for-all port "n" (v/int-of 0 100) '(>= n 0))
 ;; → {:modality :proven :engine :z3}
 
-(v/for-all port "n" (v/int-of 0 100) "(< n 50)")
+(v/for-all port "n" (v/int-of 0 100) '(< n 50))
 ;; → {:modality :refuted :engine :z3 :witness 50}
 
 ;; covers = the COVERAGE LINT — the "spec" is the function's own guards
@@ -123,7 +135,7 @@ engine they jointly support is what answers.
 ;; → {:modality :proven :engine :enumerate}               ; exhaustive over a finite domain
 
 ;; gen/any witnesses type-partiality with no mixed domain to remember
-(v/for-all port "x" (v/any-of) "(int? x)")
+(v/for-all port "x" (v/any-of) '(int? x))
 ;; → {:modality :refuted :engine :sample :witness 1.5}
 ```
 
@@ -135,7 +147,7 @@ modality is itself the finding:
 
 ```clojure
 (v/faults port {:gen (v/int-of -100 100)
-                :laws ["(>= v -40)" "(<= v 60)" "(>= v -50)"]})
+                :laws ['(>= v -40) '(<= v 60) '(>= v -50)]})
 ;; → [{:law 0 :modality :proven :isolated-fault -50 :implied false}
 ;;    {:law 1 :modality :proven :isolated-fault 61  :implied false}
 ;;    {:law 2 :modality :proven :isolated-fault nil :implied true}]
@@ -167,9 +179,20 @@ with a caveat. Unifying them removes each one:
   **globally** — across require boundaries. (Multimethods are namespace-local and
   will not dispatch from a requiring module; that is why generators are records,
   not `:gen/kind` maps.)
-- A **spec** is translated by `system.smt/of-source` — the verifier's own
-  translator — so veritas inherits Int, Real, Bool, String, and enum theories for
-  free, and cannot disagree with the checker about what a predicate means.
+- A **spec** is translated by `system.smt` — the verifier's own translator — so
+  veritas cannot disagree with the checker about what a predicate means, and
+  inherits every theory it speaks: Int, Real, Bool, String, the ENUM DATATYPES
+  (`enum-of` threads its datatype decl + ctor map through `smt-of-opts`), and
+  the COLLECTION LENGTH abstraction (`coll-of` declares `<var>_len`; count/
+  conj/rest/pop/empty? become arithmetic). A theory is a GENERATOR: bind the
+  domain in bl, declare it to z3, project the witness back — and every
+  quantifier speaks the new sort. Content predicates (`some` over elements)
+  and mixed variant+length tuples stay outside the fragment and fall to the
+  enumerate/sample rungs, modality saying so.
+- A **witness is a real bl value**: z3's enum constructors (`E_phase-running`,
+  `(E_mode-on 2)`) and modelled lengths (`c_len`) project back to a keyword, a
+  `{tag payload}` map, a vector — symmetrical with what a sample would have
+  been, so the caller never sees an SMT term.
 - **`check`** tries z3, then finite enumeration, then sampling, and labels the
   result with the strongest modality it earned. Every z3 call carries a timeout,
   so an undecidable query yields `:unknown`, never a hang.
@@ -181,7 +204,9 @@ the verb live in three sibling modules, each built ON the core, each in its own
 file. There is exactly one quantifier core, and each layer adds only what the
 core cannot express.
 
-- `priv/veritas.bl` — **the core**: the `Gen` protocol + generators, `samples`,
+- `priv/veritas.bl` — **the core**: the `Gen` protocol + generators (`int-of`,
+  `real-of`, `bool-of`, `string-of`, `one-of`, `enum-of` — the enum datatype —
+  `coll-of` — the length abstraction — `tuple-of`, `any-of`), `samples`,
   `smt-of` (the `system.smt` seam), `parse-model` (a z3 model IS a value), `check`
   with its escalator, and the sugar `exists`, `for-all`, `covers`, `faults`,
   `isolate-fault`, `with-solver`.
@@ -210,12 +235,17 @@ Examples and tests:
 - `examples/veritas/03-the-mock-server.bl` — a contract as a deterministic server.
 - `examples/veritas/04-the-fault-space.bl` — z3 generates, datalog analyses.
 - `examples/veritas/05-the-property-is-behaviour.bl` — output properties + shrink.
+- `examples/veritas/06-all-theories.bl` — every sort one verb: enum datatypes
+  (nullary + payload), collection lengths, tuples across sorts.
 - `test/bl/veritas/veritas_test.bl` — the core: three engines, modality, coverage,
   proven redundancy.
 - `test/bl/veritas/mock_test.bl` — server determinism, boundary optimize, invalid.
 - `test/bl/veritas/fault_test.bl` — measured coverage, redundancy grouping,
   proven-implied laws, named injection.
 - `test/bl/veritas/property_test.bl` — hold, refute+shrink, crash, generator domains.
+- `test/bl/veritas/theories_test.bl` — every sort the translator speaks: z3-proven
+  enums (with projected witnesses), proven/refuted length laws, the honest
+  content-predicate and mixed-mode falls.
 
 ## How the family relates
 

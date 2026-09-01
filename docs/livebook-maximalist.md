@@ -353,3 +353,180 @@ The README says beam-lisp is a language for the generative era, and that
 `.bl.md` makes code self-documenting. Maximalist livebook is simply taking
 that sentence literally: the document is the program, the program is a log,
 and the log is rendered — live, static, and in CI — from one source of truth.
+
+---
+
+## 9. Phase 2 — the live editor (design now, build later)
+
+Phase 1 (§§1–8, shipped) makes the document a first-class program: `.bl.md`
+and `.bl.org` slice into cells, run into one namespace, and write back only
+their result spans. Nothing above needs a browser. Phase 2 puts a **live
+editor** in front of that same document — and the design rule is that the
+editor changes *nothing* about the covenant. The file on disk stays the truth;
+the editor is one more renderer that can also emit facts.
+
+### 9.1 Why Lexical, and what "the shim" means
+
+We do not write a text editor. Rich-text editing (selection, IME, undo,
+collaborative carets, accessibility) is a decade of browser edge cases;
+[Lexical](https://lexical.dev) (Meta's editor framework) already solves them
+and exposes a clean, serializable node model. We adopt Lexical for **keystroke
+handling and caret-level state only**, and wrap it in a thin
+**beam-lisp-maximalist shim** whose entire job is to keep Lexical's editor
+state and the server's document facts in agreement.
+
+The shim is deliberately small. It is *not* a port of Lexical's model into
+beam-lisp, and it is *not* a place where document semantics live. It is a
+translation membrane with two directions:
+
+```
+  Lexical editor state  ──(local edit → intent fact)──▶  server (datom truth)
+  server document facts  ──(fact → editorState patch)──▶  Lexical
+```
+
+Everything that *means* something — a cell's identity, its source, its last
+result, whether it is frozen — is a **server fact**. Lexical holds only the
+ephemeral typing buffer and the projection of those facts into editable nodes.
+
+### 9.2 The division of authority (the load-bearing decision)
+
+> **Lexical owns keystrokes. The server owns truth.**
+
+This single split resolves every hard question below. Concretely:
+
+| concern | owner | why |
+|---|---|---|
+| caret, selection, IME composition | Lexical | sub-frame latency; must be local |
+| in-progress text of the focused cell | Lexical | a keystroke cannot round-trip to the server |
+| cell identity / order / source of record | server | the document is a namespace; order is run order |
+| result spans, freshness, freeze state | server | results are facts, produced by `run` |
+| "what does cell X define / depend on" | server | the doc graph already answers this (§6, W6) |
+| conflict resolution across viewers | server | one log, `as-of`; the editor never merges |
+
+The editor may *propose*; only the server *commits*. A local edit becomes an
+**intent fact** the moment it settles (debounced on pause / blur / explicit
+run), the server folds it into the document log, and the resulting document
+facts flow back as an editorState patch. Lexical never mutates cell identity
+or result spans directly — it cannot, because it never holds them as authority.
+
+### 9.3 Events as facts (reuse `live.bl`, don't reinvent)
+
+Phase 2 introduces **no new sync machinery**. `bl live` (§6, W5) already serves
+a document as a Pulse-style app where *view = f(doc facts)*, *events = facts*,
+*results = facts*. The Lexical shim is simply a richer client for that same
+loop:
+
+- **an edit is an event** → `{:cell/edit id :text "…" :basis <tx>}` — a fact,
+  logged like any other; `:basis` is the tx the edit was made against, so a
+  stale edit is detected at fold time, never silently merged.
+- **a run is an event** → `{:cell/run id}` → the server evaluates under ward
+  (spawned process, kill timer — §7.3) and transacts `:cell/result` facts.
+- **a result is a fact** → it flows back to every viewer as a patch; the shim
+  renders it into a *non-editable* Lexical decorator node (see §9.5).
+
+Because edits and results are the same kind of thing the rest of the system
+already speaks (datom facts on a log), time travel (`as-of`), multi-viewer
+convergence, and CI doc-tests all keep working with zero editor-specific code.
+
+### 9.4 State tiers — SHARED / SESSION / LOCAL
+
+Live editing needs three tiers of state, and each maps cleanly onto a
+`live.bl` scope. Getting a piece of state into the right tier is the whole
+game; the tiers are:
+
+| tier | lifetime & reach | examples | backing |
+|---|---|---|---|
+| **SHARED** | the document, all viewers, durable | cell source, result spans, freeze flags, cell order | the doc log on disk (the file is the fold) |
+| **SESSION** | one viewer's connection | draft text not yet committed, cursor, scroll, selection, per-viewer viewer-registry choices | per-conn state in `live.bl` (dropped on disconnect) |
+| **LOCAL** | one Lexical instance, sub-commit | IME composition buffer, in-flight keystrokes, transient decorator UI | Lexical editorState only; never leaves the browser until it settles into SESSION |
+
+The rule that falls out: **a keystroke lives in LOCAL, settles into SESSION on
+pause, and is promoted to SHARED only by an explicit or debounced commit.**
+SHARED is the only tier that touches the file. SESSION is the draft buffer that
+makes editing feel instant without lying to other viewers. LOCAL is Lexical's
+private business and the server never sees it.
+
+Promotion is monotone and one-directional per edit: LOCAL → SESSION → SHARED.
+Demotion never happens; a rejected commit (stale `:basis`) surfaces as a fresh
+SHARED fact that the shim reconciles into SESSION, and the viewer sees the
+authoritative text with their draft rebased or flagged — never a silent
+clobber.
+
+### 9.5 Mapping the document onto Lexical nodes
+
+The shim projects document facts into a small, fixed set of Lexical node
+kinds. Prose is ordinary rich text; the two things that are *not* free text are
+represented as **decorator nodes** (Lexical's escape hatch for
+non-text-editable regions the framework still tracks for selection/undo):
+
+- **prose block** → native Lexical rich-text nodes (headings, lists, quotes,
+  tables) — editable, and serialized back to md/org on commit by the same
+  renderer Phase 1 already owns, run in reverse.
+- **cell (code)** → a `CodeCellNode` decorator: a CodeMirror/textarea island
+  for the source, editable as text, but a single unit to Lexical's model. Its
+  identity is a SHARED fact; its buffer is SESSION; its keystrokes are LOCAL.
+- **result span** → a `ResultNode` decorator: **read-only**, rendered from the
+  `:cell/result` fact (hiccup passthrough + the viewer registry from W5). The
+  user cannot type into a result, which is exactly the covenant — the tool
+  writes result spans, humans do not.
+- **frozen cell** → the same `CodeCellNode`, styled frozen and marked
+  non-runnable; the freeze flag is SHARED.
+
+Crucially, the md/org ⇄ nodes mapping *is* Phase 1's slicer/renderer used in
+both directions. There is no second parser. On load: file → spans → nodes. On
+commit: changed nodes → spans → file, touching only what changed, result spans
+still owned solely by `run`. `render(slice(x)) == x` (the Phase 1 covenant)
+guarantees the editor cannot corrupt a byte it did not intend to change.
+
+### 9.6 The commit path, end to end
+
+```
+keystroke
+  → Lexical editorState (LOCAL)
+  → debounce / blur / ⌘↵                     ; settle
+  → shim diffs changed nodes → span deltas   ; SESSION draft
+  → intent fact {:cell/edit id :text :basis} ; promote to SHARED (proposed)
+  → server folds into doc log                ; commit or reject (stale basis)
+  → doc facts patch broadcast to all viewers
+  → shim applies patch → Lexical editorState ; SHARED → visible
+  ⟂ on {:cell/run}: eval under ward → :cell/result fact → ResultNode
+```
+
+Every arrow that crosses the browser/server boundary is a fact on the existing
+log. The editor is stateless with respect to truth: reload the tab and the
+document reconstitutes from SHARED facts; the only thing lost is LOCAL (an
+in-flight keystroke) and SESSION drafts the viewer hadn't committed — which is
+the correct and expected loss.
+
+### 9.7 Trust model — assume a trusted user, say so in public
+
+Phase 2's target is a **single trusted author** (or a small trusted team) on
+their own machine or a trusted host. A served document is arbitrary code;
+`bl live` inherits ward's capability caps (§7.6) and **never widens them for
+the editor**. The editor adds no new authority: it can only emit the same
+`:cell/edit` / `:cell/run` facts a scripted client could already emit against
+`bl live`. We do not build a multi-tenant sandbox in Phase 2; if untrusted
+multi-user editing is ever wanted, that is a separate capability-tiering
+project, and the trust-boundary doc will say so before a single untrusted
+keystroke is accepted.
+
+### 9.8 What Phase 2 must *not* do (guardrails)
+
+- **No document semantics in JS.** The shim translates; it never decides cell
+  identity, order, or result freshness. Those are server facts.
+- **No second parser.** md/org ⇄ nodes is Phase 1's renderer, both directions.
+- **No editable results.** Result spans are tool-owned; the editor renders them
+  read-only. This is the covenant, enforced at the node level.
+- **No silent merge.** Concurrent edits reconcile through the log with an
+  explicit `:basis`; a stale edit is surfaced, never blindly applied.
+- **No cap widening.** The editor emits the same facts a script could; it gains
+  no authority the served app didn't already grant.
+
+### 9.9 Prerequisites and sequencing
+
+Phase 2 sits on top of W5 (`bl live`) and therefore on W1–W4 (shipped in
+Phase 1) plus W5's per-viewer session conn and viewer registry. The one hard
+prerequisite named in §7.5 stands: **the reader's atom-exhaustion fix
+(PLAN-009) must land before a live editor invites free-form evals** — a
+notebook mints symbols like nothing else, and the editor is the ultimate
+free-form eval surface. Ship PLAN-009, then W5, then the Lexical shim.
