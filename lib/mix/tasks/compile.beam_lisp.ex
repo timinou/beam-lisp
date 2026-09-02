@@ -49,7 +49,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   def run(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        strict: [source_dir: :string, force: :boolean, out: :string]
+        strict: [source_dir: :string, force: :boolean, out: :string, jobs: :integer]
       )
 
     source_dirs = if d = opts[:source_dir], do: [d], else: source_dirs_from_config()
@@ -116,20 +116,23 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
         sources = discover(source_dirs)
         manifest = read_manifest(manifest_path)
-        {ordered, deps, ns_index} = order_and_deps(sources)
 
-        # `hashes`: each source's OWN content hash — the leaf input to both the
-        # AOT cache's `closure_key/3` and the tier-2 closure hash below.
-        hashes = Map.new(ordered, fn path -> {path, content_hash(path)} end)
+        # ONE traversal of the namespace graph (priv/boot/build-plan.bl) yields
+        # the compile order, the DAG's waves, each source's resolved deps and
+        # its tier-2 CLOSURE key — this ns plus its transitive `:require`
+        # closure — in O(V + E). The closure key is what the manifest stores
+        # and `up_to_date?/5` compares: keying on the closure (not the bare
+        # file hash) is what makes a source rebuild when a namespace it
+        # REQUIRES changes, and it is the same digest the beam is stamped with
+        # and the runtime drift gate recomputes, so the three cannot disagree.
+        plan = BeamLisp.BuildPlan.plan_paths(sources)
+        ordered = Enum.map(plan.order, & &1.path)
+        deps = plan.deps
+        manifest_hashes = plan.key
 
-        # `manifest_hashes`: the tier-2 CLOSURE hash per source (FEAT-030) — this
-        # ns plus its transitive `:require` closure — which is what the manifest
-        # stores and `up_to_date?/5` compares. Keying the manifest on the closure
-        # (not the bare file hash) is what makes a source rebuild when a
-        # namespace it REQUIRES changes, keeping the manifest in lockstep with
-        # the beam's stamp and the runtime gate (all three use the closure).
-        manifest_hashes =
-          Map.new(ordered, fn path -> {path, closure_hash_for(path, ns_index, hashes)} end)
+        # `hashes`: each source's OWN content hash — the leaf input to the AOT
+        # cache's `closure_key/3`.
+        hashes = Map.new(plan.order, fn node -> {node.path, node.hash} end)
 
         cache_key =
           if BeamLisp.AOTCache.enabled?() and opts[:force] != true do
@@ -167,84 +170,86 @@ defmodule Mix.Tasks.Compile.BeamLisp do
           Mix.shell().info("beam-lisp AOT: building #{to_build} source(s)")
         end
 
-        {manifest, recompiled, errors, _built} =
-          Enum.reduce(ordered, {manifest, false, [], 0}, fn path, {m, rc, errs, built} ->
-            # The manifest stores the tier-2 closure hash (FEAT-030), not the
-            # file's own content hash — so a source is rebuilt when a namespace it
-            # requires changes, and its stored `:hash` matches what the beam is
-            # stamped with. The bare content hash is still used below for the AOT
-            # cache's `closure_key/3` (tier-3 addressing).
-            hash = Map.fetch!(manifest_hashes, path)
+        # Wave by wave. Every source in a wave depends only on earlier waves,
+        # so a wave compiles in parallel, each source in its own process. All
+        # of them intern into the `:global` Env — a later wave must see an
+        # earlier wave's vars, and forks never publish upward — which is safe
+        # because what an emitter mutates is keyed by ITS namespace
+        # (`{:ns_defs, ns}`, the var rows) while `*ns*` is per-process; two
+        # sources in one wave are two namespaces by construction. The one
+        # shared cell, the `:global` load-path stack, is pushed/popped in
+        # balanced pairs and only READ by `Loader.find_file`, which also has
+        # the compiling file's own dir first. Results fold back into the
+        # manifest in plan order, so the manifest and the cache stores are as
+        # deterministic as the serial build was. `--jobs N` caps the width.
+        jobs = opts[:jobs] || System.schedulers_online()
+        counter = :counters.new(1, [])
 
-            if opts[:force] || not up_to_date?(m, path, hash, cur_key, compile_path) do
-              built = built + 1
-              Mix.shell().info("  [#{built}/#{to_build}] #{Path.relative_to_cwd(path)}")
-              closure_key =
-                if cache_key, do: BeamLisp.AOTCache.closure_key(path, deps, hashes)
+        build_one = fn path ->
+          hash = Map.fetch!(manifest_hashes, path)
+          n = :counters.add(counter, 1, 1) && :counters.get(counter, 1)
+          Mix.shell().info("  [#{n}/#{to_build}] #{Path.relative_to_cwd(path)}")
 
-              cached =
-                if closure_key do
-                  BeamLisp.AOTCache.fetch(cache_key, closure_key, compile_path)
-                end
+          closure_key =
+            if cache_key, do: BeamLisp.AOTCache.closure_key(path, deps, hashes)
 
-              result =
-                case cached do
-                  {:ok, modules} ->
-                    # A fetch evaluates nothing; run each namespace's init
-                    # hook so value defs are interned as a fresh compile
-                    # would have interned them.
-                    BeamLisp.AOTCache.run_init_modules(modules, compile_path)
-                    {:ok, modules}
-
-                  _ ->
-                    compile_file(path, compile_path)
-                end
-
-              case result do
-                {:ok, modules} ->
-                  # Delete beams this source used to emit but no longer does.
-                  # A namespace emits one namespace module plus one body module
-                  # per var and a value/macro companion — all deterministically
-                  # named. When a var is removed or renamed its body beam would
-                  # otherwise linger on the code path, outside the new manifest
-                  # and so invisible to `clean`. Remove `old -- new` on every
-                  # recompile so the on-disk module set exactly matches what the
-                  # source now defines.
-                  old_modules = (m[path] || %{}) |> Map.get(:modules, [])
-                  Enum.each(old_modules -- modules, &delete_beam(&1, compile_path))
-
-                  m2 = Map.put(m, path, %{hash: hash, key: cur_key, modules: modules})
-                  # Checkpoint the manifest after each successful source. The
-                  # build writes beams to ebin incrementally, but this manifest
-                  # was historically persisted only after the whole reduce
-                  # finished -- so an interrupted cold build (timeout/kill) left
-                  # a populated ebin with NO manifest. The next run then saw a
-                  # partial beam set (shims whose body modules were not emitted
-                  # yet -> UndefinedFunctionError at test time) and, finding no
-                  # manifest, recompiled every source from scratch with no
-                  # resume. Persisting per source makes the cold build resumable
-                  # and keeps manifest and ebin in step at every observable point.
-                  write_manifest(manifest_path, m2)
-
-                  # Publish freshly compiled beams; cache hits and failed
-                  # stores alike fall through to the normal flow.
-                  if closure_key != nil and not match?({:ok, _}, cached) do
-                    BeamLisp.AOTCache.store(cache_key, closure_key, compile_path, modules)
-                  end
-
-                  {m2, true, errs, built}
-
-                {:error, err} ->
-                  {m, rc, [err | errs], built}
-              end
-            else
-              {m, rc, errs, built}
+          cached =
+            if closure_key do
+              BeamLisp.AOTCache.fetch(cache_key, closure_key, compile_path)
             end
+
+          result =
+            case cached do
+              {:ok, modules} ->
+                BeamLisp.AOTCache.run_init_modules(modules, compile_path)
+                {:ok, modules}
+
+              _ ->
+                compile_file(path, compile_path)
+            end
+
+          {path, hash, closure_key, cached, result}
+        end
+
+        {manifest, recompiled, errors} =
+          Enum.reduce(plan.waves, {manifest, false, []}, fn wave, {m, rc, errs} ->
+            todo =
+              wave
+              |> Enum.map(& &1.path)
+              |> Enum.filter(fn path ->
+                opts[:force] ||
+                  not up_to_date?(m, path, Map.fetch!(manifest_hashes, path), cur_key, compile_path)
+              end)
+
+            results =
+              todo
+              |> Task.async_stream(
+                build_one,
+                max_concurrency: jobs,
+                ordered: true,
+                timeout: :infinity
+              )
+              |> Enum.map(fn {:ok, r} -> r end)
+
+            Enum.reduce(results, {m, rc, errs}, fn
+              {path, hash, closure_key, cached, {:ok, modules}}, {m, _rc, errs} ->
+                old_modules = (m[path] || %{}) |> Map.get(:modules, [])
+                Enum.each(old_modules -- modules, &delete_beam(&1, compile_path))
+
+                m2 = Map.put(m, path, %{hash: hash, key: cur_key, modules: modules})
+                write_manifest(manifest_path, m2)
+
+                if closure_key != nil and not match?({:ok, _}, cached) do
+                  BeamLisp.AOTCache.store(cache_key, closure_key, compile_path, modules)
+                end
+
+                {m2, true, errs}
+
+              {_path, _hash, _ck, _cached, {:error, err}}, {m, rc, errs} ->
+                {m, rc, [err | errs]}
+            end)
           end)
 
-        # Drop manifest entries for sources that disappeared and remove
-        # their generated beams. split_with returns lists of {path, meta}
-        # pairs, so fold the survivors back into a map for storage.
         {kept, stale} = Enum.split_with(manifest, fn {path, _} -> path in sources end)
 
         Enum.each(stale, fn {_path, %{modules: mods}} ->
@@ -438,105 +443,5 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   defp delete_beam(mod, compile_path) do
     path = Path.join(compile_path, Atom.to_string(mod) <> ".beam")
     if File.exists?(path), do: File.rm(path)
-  end
-
-  # --- require ordering ---
-
-  # Compile sources in dependency order: a source's `ns :require`
-  # targets that are themselves sources must compile first. Returns the
-  # list in compile order plus the resolved path → required-paths map
-  # (the AOT cache keys on the transitive closure), or raises on a cycle.
-  defp order_and_deps(sources) do
-    # primary ns and require targets per source
-    # ONE parser: the graph's own `header/1` (priv/boot/source-graph.bl), the
-    # same read the runtime drift gate and the AOT stamp use. A second reading
-    # of what a `:require` is would be a second place for the build and the
-    # runtime to disagree about freshness.
-    info =
-      Enum.map(sources, fn path ->
-        {ns, reqs} = BeamLisp.SourceGraph.header(File.read!(path))
-        {ns, reqs, path}
-      end)
-
-    # ns -> source path, for require targets that are among the sources
-    ns_to_path = Map.new(info, fn {ns, _reqs, path} -> {ns, path} end)
-
-    deps =
-      Map.new(info, fn {_ns, reqs, path} ->
-        {path, reqs |> Enum.map(&Map.get(ns_to_path, &1)) |> Enum.reject(&is_nil/1) |> Enum.uniq()}
-      end)
-
-    # ns index for the tier-2 closure hash (FEAT-030): the primary ns of each
-    # path and the RAW require names per ns (unfiltered — an unresolvable require
-    # must hash identically on the build and runtime sides, so both walk the same
-    # raw edge set and let `closure_hash/3` render a missing member as `<ns>:?`).
-    ns_of_path = Map.new(info, fn {ns, _reqs, path} -> {path, ns} end)
-    reqs_by_ns = Map.new(info, fn {ns, reqs, _path} -> {ns, reqs} end)
-    ns_index = %{ns_to_path: ns_to_path, ns_of_path: ns_of_path, reqs_by_ns: reqs_by_ns}
-
-    visited = MapSet.new()
-    stack = MapSet.new()
-
-    {ordered, _} =
-      Enum.reduce(sources, {[], {visited, stack}}, fn path, {acc, vs} ->
-        {sub, vs} = visit(path, deps, vs)
-        {acc ++ sub, vs}
-      end)
-
-    {ordered, deps, ns_index}
-  end
-
-  # The tier-2 freshness hash for a source `path` (FEAT-030), computed with the
-  # SAME `BeamLisp.SourceGraph.closure_hash/3` the runtime drift gate uses, so a
-  # beam this build stamps compares equal to what `AOT.stale?/2` recomputes. A
-  # path with no `(ns …)` form has no closure to key on — it compiles into the
-  # ambient `user` namespace, which the runtime cannot resolve to a source and
-  # therefore always trusts — so fall back to the file's own content hash for the
-  # manifest's build-time freshness (rebuild on its own change).
-  defp closure_hash_for(path, ns_index, hashes) do
-    case Map.get(ns_index.ns_of_path, path) do
-      ns when is_binary(ns) ->
-        srchash = fn n ->
-          case Map.get(ns_index.ns_to_path, n) do
-            p when is_binary(p) -> Map.get(hashes, p)
-            _ -> nil
-          end
-        end
-
-        reqs = fn n -> Map.get(ns_index.reqs_by_ns, n, []) end
-        BeamLisp.SourceGraph.closure_hash(ns, srchash, reqs)
-
-      _ ->
-        Map.fetch!(hashes, path)
-    end
-  end
-
-  defp visit(path, deps, vs) do
-    {visited, stack} = vs
-
-    cond do
-      MapSet.member?(stack, path) ->
-        raise "beam-lisp AOT: require cycle involving #{path}"
-
-      MapSet.member?(visited, path) ->
-        {[], vs}
-
-      true ->
-        # `path` is in progress while we walk its deps, so a cycle
-        # back to it is detected by the stack membership test above.
-        {sub, {visited, stack}} =
-          Enum.reduce(
-            Map.get(deps, path, []),
-            {[], {visited, MapSet.put(stack, path)}},
-            fn dep, {acc, vs} ->
-              {s, vs} = visit(dep, deps, vs)
-              {acc ++ s, vs}
-            end
-          )
-
-        visited = MapSet.put(visited, path)
-        stack = MapSet.delete(stack, path)
-        {sub ++ [path], {visited, stack}}
-    end
   end
 end

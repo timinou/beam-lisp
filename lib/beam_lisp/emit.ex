@@ -200,18 +200,8 @@ defmodule BeamLisp.Emit do
     # (PLAN-046); lock ids are {resource, requester} 2-tuples. The loser
     # simply redefines identically under ignore_module_conflict.
     :global.trans({{:bl_module, mod}, self()}, fn ->
-      prev_opts = Code.compiler_options()
-      # infer_signatures: false drops Elixir's type checker to :traverse mode
-      # for the generated module — signature construction (Module.Types.Descr
-      # tuple intersections) dominates compile time on tuple-literal-dense
-      # generated code: one heavy defn measured 93s with, 63ms without.
-      Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
-
-      try do
-        Module.create(mod, block, location || Macro.Env.location(__ENV__))
-      after
-        Code.compiler_options(prev_opts)
-      end
+      BeamLisp.CompilerOptions.ensure!()
+      Module.create(mod, block, location || Macro.Env.location(__ENV__))
     end)
   end
 end

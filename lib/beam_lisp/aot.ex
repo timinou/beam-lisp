@@ -104,6 +104,11 @@ defmodule BeamLisp.AOT do
     # capturing any defs.
     Env.in_ns("user")
 
+    # A compilation unit starts its fresh-name counter at zero, so the beams
+    # it emits are a function of its source alone (reproducible across runs
+    # and across serial/parallel builds). Both compilers share the counter.
+    Compiler.reset_fresh!()
+
     # The source path rides along so an AOT-compiled module's line table
     # names the .bl file. These .beam files persist and are what a
     # production stack trace hits, so this is the attribution that
@@ -973,38 +978,33 @@ defmodule BeamLisp.AOT do
   # spun the compiler up per module and made a full build take minutes; one
   # call for the whole block restores near-single-module cost.
   defp compile_block!(block, filename) do
-    prev = Code.compiler_options()
-    # infer_signatures: false — see BeamLisp.Emit.build_module/3; the
-    # signature-construction pass costs orders of magnitude more than the
-    # rest of compilation on tuple-dense generated code.
-    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
+    # Compiler options (ignore_module_conflict, infer_signatures: false) are
+    # set ONCE, VM-wide, by `BeamLisp.CompilerOptions.ensure!/0` — never
+    # saved and restored around a call. See that module for why.
+    BeamLisp.CompilerOptions.ensure!()
 
-    try do
-      # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
-      #
-      # `Code.compile_quoted/2` unconditionally wraps compilation in
-      # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
-      # checker — and there is NO compiler option to turn it off (the
-      # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
-      # which this AOT path does not use). That checker verifies every emitted
-      # module against the WHOLE set of modules loaded in the compile VM, so its
-      # cost grows with the image: once a dense library (minikanren) is loaded,
-      # verifying a later tuple-dense generated namespace (datom.query.magic)
-      # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
-      # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
-      #
-      # The check earns NOTHING here: the source was already validated by the
-      # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
-      # correct by construction (shims forward to body modules). The primitive
-      # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
-      # calls under its verify wrapper — produces byte-identical beams without
-      # the checker pass.
-      case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
-        [] -> raise "AOT: compiling a namespace produced no module"
-        mods -> mods
-      end
-    after
-      Code.compiler_options(prev)
+    # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
+    #
+    # `Code.compile_quoted/2` unconditionally wraps compilation in
+    # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
+    # checker — and there is NO compiler option to turn it off (the
+    # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
+    # which this AOT path does not use). That checker verifies every emitted
+    # module against the WHOLE set of modules loaded in the compile VM, so its
+    # cost grows with the image: once a dense library (minikanren) is loaded,
+    # verifying a later tuple-dense generated namespace (datom.query.magic)
+    # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
+    # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
+    #
+    # The check earns NOTHING here: the source was already validated by the
+    # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
+    # correct by construction (shims forward to body modules). The primitive
+    # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
+    # calls under its verify wrapper — produces byte-identical beams without
+    # the checker pass.
+    case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
+      [] -> raise "AOT: compiling a namespace produced no module"
+      mods -> mods
     end
   end
 

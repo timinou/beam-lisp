@@ -94,26 +94,17 @@ defmodule BeamLisp.Compiler do
     # measured 93s with inference, 63ms without. There is no per-module
     # opt-out on <= 1.20; the `@compile no_type_check: true` previously
     # emitted here matches no known attribute and was silently ignored.
-    prev_opts = Code.compiler_options()
-    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
+    BeamLisp.CompilerOptions.ensure!()
 
-    try do
-      Module.create(
-        mod,
-        quote do
-          def run, do: unquote(ast)
-        end,
-        # Claim the form's own `.bl` file (and line) so the module's line
-        # table points at the user's source, not beam-lisp's compiler. A
-        # macro-built form with no position falls back to the old
-        # behaviour.
-        module_location(form, env) || Macro.Env.location(__ENV__)
-      )
+    Module.create(
+      mod,
+      quote do
+        def run, do: unquote(ast)
+      end,
+      module_location(form, env) || Macro.Env.location(__ENV__)
+    )
 
-      mod.run()
-    after
-      Code.compiler_options(prev_opts)
-    end
+    mod.run()
   end
 
   @doc "Compile one reader form to an Elixir quoted expression."
@@ -609,18 +600,12 @@ defmodule BeamLisp.Compiler do
        [quote(do: @behaviour :gen_server)] ++ server_ordered_defs(group_server_defs(defs)) ++ server_client_defs()}
 
     quote do
-      previous = Code.compiler_options()
-      Code.compiler_options(ignore_module_conflict: true)
-
-      try do
-        # The body is escaped so its `@behaviour`/`def` nodes are reconstructed
-        # at runtime as data and compiled by Module.create — never expanded in
-        # this eval module's own body (Elixir would reject `@` outside module
-        # scope if the nodes were inlined here).
-        Module.create(unquote(mod), unquote(Macro.escape(module_body)), unquote(location))
-      after
-        Code.compiler_options(previous)
-      end
+      BeamLisp.CompilerOptions.ensure!()
+      # The body is escaped so its `@behaviour`/`def` nodes are reconstructed
+      # at runtime as data and compiled by Module.create — never expanded in
+      # this eval module's own body (Elixir would reject `@` outside module
+      # scope if the nodes were inlined here).
+      Module.create(unquote(mod), unquote(Macro.escape(module_body)), unquote(location))
 
       BeamLisp.Env.intern(unquote(env.ns), unquote(name), unquote(mod))
       unquote(mod)
@@ -2001,7 +1986,7 @@ defmodule BeamLisp.Compiler do
 
   defp gensym_name(name) do
     base = binary_part(name, 0, byte_size(name) - 1)
-    base <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"
+    base <> "__" <> Integer.to_string(next_fresh!()) <> "__auto"
   end
 
   # --- special form helpers ---
@@ -3511,7 +3496,25 @@ defmodule BeamLisp.Compiler do
 
   defp fresh_var(name) do
     clean = String.replace(name, ~r/[^a-zA-Z0-9_]/, "_")
-    Macro.var(String.to_atom("#{clean}_#{System.unique_integer([:positive])}"), __MODULE__)
+    Macro.var(String.to_atom("#{clean}_#{next_fresh!()}"), __MODULE__)
+  end
+
+  @fresh_key :bl_fresh_seq
+
+  @doc """
+  Start this process's fresh-name counter over. Called once per compilation
+  unit (`BeamLisp.AOT.compile_source/2`) so every local-variable and gensym
+  name in the emitted module — hence the beam's bytes — is a function of the
+  unit's source alone, never of what else compiled earlier in this VM. The
+  self-hosted compiler (`priv/boot/compiler.bl` `reset-fresh!`) draws from the
+  SAME pdict counter, so genesis and `.bl` stay byte-parity under the oracle.
+  """
+  def reset_fresh!, do: Process.put(@fresh_key, 0)
+
+  defp next_fresh! do
+    n = (Process.get(@fresh_key) || 0) + 1
+    Process.put(@fresh_key, n)
+    n
   end
 
   defp uppercase?(<<c, _::binary>>), do: c in ?A..?Z
