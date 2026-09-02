@@ -231,7 +231,13 @@ defmodule BeamLisp.Native do
   defp create_host(mod, ns, crate, signatures) do
     # Rustler installs as `priv/native/<crate>.so` (no `lib` prefix), and
     # `:erlang.load_nif/2` wants the path WITHOUT the extension.
-    lib_path = Path.join(:code.priv_dir(:beam_lisp), "native/#{crate}")
+    #
+    # A crate may live in a CONSUMER app (acid-shell's native/wayland_shm,
+    # native/loom_paint), whose `:beam_lisp_native` compiler installs it into
+    # THAT app's priv — not beam_lisp's. So resolve across every loaded app's
+    # priv/native, consumer apps first, beam_lisp last; a NIF that exists
+    # nowhere reports beam_lisp's path in the error (the historical default).
+    lib_path = resolve_lib_path(crate)
 
     stubs =
       for {name, arity} <- signatures do
@@ -301,6 +307,30 @@ defmodule BeamLisp.Native do
 
     Module.create(mod, body, Macro.Env.location(__ENV__))
     mod
+  end
+
+  # Search order: every loaded OTP app's priv/native (beam_lisp last), so a
+  # consumer's crate wins over an identically named one in beam_lisp's priv.
+  # Returns the extension-less path load_nif wants; falls back to beam_lisp's
+  # priv when nothing exists, so the load error names a sensible location.
+  defp resolve_lib_path(crate) do
+    apps =
+      Application.loaded_applications()
+      |> Enum.map(fn {app, _, _} -> app end)
+      |> Enum.reject(&(&1 == :beam_lisp))
+      |> Kernel.++([:beam_lisp])
+
+    found =
+      Enum.find_value(apps, fn app ->
+        case :code.priv_dir(app) do
+          {:error, _} -> nil
+          dir ->
+            p = Path.join(to_string(dir), "native/#{crate}")
+            if File.exists?(p <> ".so"), do: p, else: nil
+        end
+      end)
+
+    found || Path.join(:code.priv_dir(:beam_lisp), "native/#{crate}")
   end
 
   defp link_var(ns, mod, name, arity) do
