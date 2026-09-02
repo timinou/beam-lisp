@@ -2,482 +2,318 @@
 
 > `the-process-pattern-language.md` gave 23 patterns and showed the forms are
 > bundles of them. Users don't write patterns; they write bundles. This document
-> specifies the five an end user reaches for — **server, bus, registry,
-> supervisor, fence** — with (a) the primary syntax, (b) an alternative
-> syntax, (c) what each composes with, and (d) exactly how it is implemented on
-> top of `defprocess` and the shipped runtime.
+> specifies the five an end user reaches for — **server, fence, registry, bus,
+> supervisor** — the verbs that act on them, and how each is implemented on the
+> shipped runtime.
 
-Design constraints that hold across all five:
+Three facts fix the design:
 
-1. **Data first, macro second.** Every bundle has a *map form* (a plain value
-   you can build, diff, store in datom, verify) and a *macro form* (sugar that
-   produces the map). The macro is never the only way in. This is the
-   composability lever: a supervisor's children are just values, so a tree can
-   be computed, filtered, merged.
-2. **One primitive underneath.** Each bundle lowers to `defprocess`
-   (`{:state :on :invariant :after :emit}`) — except fence, which lowers to a
-   *function* over three patterns and owns no process definition.
-3. **Verify is a value op.** `(verify x)` works on any bundle value *before*
-   it is started. Same fn, every bundle; the pattern name is the diagnosis.
-4. **Existing surface stays.** `defserver` (OTP-callback style) and
-   `supervise`/`worker` remain, re-expressed as thin skins. No parallel impls.
+1. **Inspectability is free.** The reader turns every form into a tree;
+   `system/model` extracts the transition graph from any `receive` shape —
+   *"five surface forms lower to the identical transition graph."*
+   `codebase.bl` proves the same for call graphs. So no `def*` form has to
+   return a "spec map" to be verifiable; `(system/verify 'ns/name)` reads the
+   source. Syntax decides **ergonomics of use only**.
+2. **One dialect per form.** `defserver`'s clause style — `(init …)`,
+   `(handle-call PAT :when G [from state] …)` — is the house style; every
+   other `def*` uses the same `(clause-head args…)` shape. No alternative
+   map dialect.
+3. **Verbs are generic and layered the BEAM's way.** No per-instance methods
+   (`account/call` does not exist; slash means namespace). See §0.
 
 ---
 
-## 0. `defprocess` — the substrate the bundles lower to
+## 0. The verb tiers
 
-```clojure
-(defprocess counter
-  {:state     0
-   :on        {:inc        (fn [n]      (inc n))            ; Tell edge
-               [:add k]    (fn [n]      (+ n k))            ; Tell w/ payload
-               [:get ?rep] (fn [n]      (reply ?rep n n))}  ; Ask edge
-   :invariant (fn [n] (>= n 0))
-   :after     [5000 (fn [n] (log "idle" n) n)]})            ; Timeout Edge
-```
+On the BEAM every verb is generic over a *behaviour*: `erlang:send` for any
+process, `gen_server:call` for any gen_server, `supervisor:which_children`
+for any supervisor. A user module adds only a **domain client API**
+(`Account.withdraw/2`) that wraps the generic call. beam-lisp keeps exactly
+that layering.
 
-- `:on` keys are **receive patterns**; `?rep` is a reply handle (Correlated
-  Reply — the macro allocates `from`+`ref`, the user never sees them).
-- `(reply ?rep value state')` sends `[ref value]` back and returns `state'`.
-  A handler that returns a bare value is a Tell edge (no reply).
-- `:invariant` → `preserves?`/`establishes?` at verify time; runtime assert
-  in dev.
+Supervisor, registry, and bus are all gen_servers (supervisor literally;
+registry and bus are built with `defserver`), so `call`/`cast` are truly
+universal.
 
-**Implementation.** `defprocess` is a macro in `priv/process.bl`. Expansion:
+| tier | where | verbs | holds for |
+|---|---|---|---|
+| **1 prelude** | top-level | `start` `start-link` `stop` · `call` `cast` · `monitor` `link` `kill` · `fence` `fence-fn` · `supervise` `worker` | every process |
+| **2 behaviour** | `kind/` ns | `super/children` `super/child-of` `super/terminate` `super/restart` · `reg/register` `reg/unregister` `reg/whereis` `reg/where` · `bus/publish` · `flow/subscribe` (a bus *is* a producer) | every process of that kind |
+| **3 domain** | your ns, plain `defn` | `(defn withdraw [a n] (call a [:withdraw n]))` | this protocol |
+| **4 definition** | only inside a `def*` | `init handle-call handle-cast handle-info name invariant` · `ok reply noreply stop` · `keys` · `demand` · `strategy intensity child pool` | return vocabulary |
+| **graph** | `system/` | `system/verify` `system/model` | beam-lisp's addition; the BEAM has no equivalent |
 
-```clojure
-(def counter
-  {:process/name  'counter
-   :process/state 0
-   :process/on    [[:inc        (fn …)] [[:add k] (fn …)] …]   ; ordered
-   :process/inv   (fn …)
-   :process/after [5000 (fn …)]})
-```
+Cutovers implied: `server-start-link`/`server-call`/`server-cast`/`server-stop`
+→ `start-link`/`call`/`cast`/`stop` (drop the prefix; they are generic).
+`kill` is the generic `erlang/exit pid :kill`; the supervisor's child
+termination is `super/terminate`, never `kill`.
 
-— a **value**. `(start counter)` spawns
-`(loop [s state] (receive …clauses… (after ms …)))` from it. Because that
-loop is literally what `system.model/extract-loop-receive` reads, `(verify
-counter)` = `system.core/verify-process` over the model of that loop: **zero
-new verifier code**. When any `:on` handler uses `?rep`, `start` instead
-emits a `gen_server` module (reusing `compiler.bl`'s `defserver` emitter, one
-callback per edge) so `:sys`, `observer`, and OTP tooling see it.
+**Names are values.** `[:registry key]` is accepted wherever a pid is.
+Resolution happens once, inside `call`/`cast`/`stop`/`monitor`, not in each
+form — the via-tuple idea, as a Lisp.
 
 ---
 
 ## 1. Server
 
-**What it is.** A process that holds state and answers requests. Bundle:
-Loop-Carried State + Ask + Tell + Correlated Reply + Timeout Edge.
-
-### Primary syntax — `defserver` (existing, unchanged for users)
+Bundle: Loop-Carried State + Ask + Tell + Correlated Reply + Timeout Edge.
 
 ```clojure
+(ns bank)
+
 (defserver account
-  (init [balance] (ok balance))
-  (handle-call [:withdraw n] :when (pos? n) [_from balance]
-    (if (>= balance n)
-      (reply [:ok (- balance n)] (- balance n))
-      (reply [:insufficient balance] balance)))
+  (init [b] (ok b))
+  (invariant [b] (>= b 0))                                   ; ○ new clause
+  (handle-call [:withdraw n] :when (pos? n) [_from b]
+    (if (>= b n)
+      (reply [:ok (- b n)] (- b n))
+      (reply [:insufficient b] b)))
+  (handle-call [:withdraw n] [_from b] (reply [:invalid n] b))
   (handle-call :balance [_from b] (reply b b))
-  (handle-cast :reset [_] (noreply 0)))
+  (handle-cast :reset   [_b]      (noreply 0)))
 
-(def acct (account/start 100))
-(account/call acct [:withdraw 30])   ; → [:ok 70]
-(account/cast acct :reset)
+;; domain client API — yours, plain defn
+(defn withdraw [a n] (call a [:withdraw n]))
+(defn balance  [a]   (call a :balance))
+
+(def a (start-link account 100))
+(withdraw a 30)                 ; → [:ok 70]
+(cast a :reset)
+(stop a)
+(system/verify 'bank/account)   ; → :ok | {:unsafe …} — from source, no process
 ```
 
-This is the OTP-callback dialect and it stays: it is the right thing for
-people arriving from Erlang/Elixir, and its `:when` guard clauses are already
-a maximalist feature (validity lives in the edge, not the handler).
-
-### Alternative syntax — `defprocess` map form (the native dialect)
-
-```clojure
-(defprocess account
-  {:state     100
-   :invariant (fn [b] (>= b 0))
-   :on {[:withdraw n ?r] :when (pos? n)
-          (fn [b] (if (>= b n)
-                    (reply ?r [:ok (- b n)] (- b n))
-                    (reply ?r [:insufficient b] b)))
-        [:balance ?r]     (fn [b] (reply ?r b b))
-        :reset            (fn [_] 0)}})
-
-(def acct (start account {:state 100}))     ; override initial state
-(ask  acct [:withdraw 30])                  ; → [:ok 70]   (Ask; 5s default timeout)
-(ask  acct [:withdraw 30] {:timeout 100})
-(tell acct :reset)                          ; Tell
-```
-
-Why both: `ask`/`tell` are the two verbs a user needs — Ask and Tell by
-name. `?r` makes Correlated Reply invisible. The map form is a value:
-`(assoc-in account [:on :reset] …)` adds an edge at runtime; `(verify
-account)` reads it.
-
-### Composability
-
-- `(merge-on account audit-edges)` — mix in a map of edges (e.g. a standard
-  `:ping ?r` health edge every server gets).
-- `(with-invariant account (fn …))` — strengthen an invariant; verify still
-  works because it is still a map.
-- A server value is a valid **child spec** for a supervisor (§4) as-is.
-
-### Implementation
-
-- `defserver` becomes a *skin*: its clauses are rewritten into the
-  `:process/on` vector (`handle-call PAT …` → edge with `?r`;
-  `handle-cast` → edge without; `handle-info` → edge; `init` → `:state` fn).
-  Then the existing gen_server emitter in `compiler.bl` runs unchanged.
-  Cutover, not a parallel path: one emitter, two front-ends.
-- `ask` = `make_ref` + `send [pat… self ref]` + `receive [ref v] (after ms
-  (throw :timeout))`. For gen_server-backed processes it is
-  `GenServer/call`. One name, dispatched on the process's `:process/kind`.
-- `reply` for the bare-loop backend = `(erlang/send from [ref v])`; for
-  gen_server = `GenServer/reply`. The `?r` handle carries which.
+**Implementation.**
+- `defserver` exists; the gen_server emitter in `compiler.bl` is unchanged.
+- `(invariant [s] pred)` clause: stored as a `defn` `account-invariant` the
+  emitter also asserts in dev builds; `system/verify` reads it for
+  `establishes?`/`preserves?`. ~20 lines in `compiler.bl`.
+- `call`/`cast`/`start`/`start-link`/`stop`: rename of `server-*` in the
+  prelude, plus name resolution (`[:reg key]` → `reg/whereis`) at the top of
+  each. `call` takes `{:timeout ms}` as optional third arg.
 
 ---
 
-## 2. Bus
+## 2. Fence
 
-**What it is.** Broadcast events to N handlers **with backpressure** —
-gen_event without the flooding. Bundle: Fan-Out(broadcast) + Demand +
-End-of-Stream.
-
-### Primary syntax
+Bundle: Monitor + Ask + Timeout Edge. A **function**, not a form — nothing to
+define, nothing to supervise.
 
 ```clojure
-(defbus payments
-  {:demand 16})                          ; per-handler demand batch (default 8)
+(fence 200 (risky-eval form))        ; → {:ok v} | {:crash reason} | {:timeout}
 
-(def b (start payments))
+(match (fence 200 (risky-eval form))
+  {:ok v}     v
+  {:crash r}  (log :died r)
+  {:timeout}  (log :hung))
 
-;; handlers are flow consumers — anything with a demand contract
-(subscribe b :ledger  (fn [ev] (ledger/record! ev)))
-(subscribe b :metrics (fn [ev] (metrics/tick! (:amount ev))))
-(subscribe b :mailer  (flow/filter-stage (fn [ev] (> (:amount ev) 1000))
-                                          email/send!))   ; a stage, not a fn
+(fence {:ms 200 :kill? true :as :throw} (risky-eval form))
+;; :kill? true → exit the child on timeout (default true)
+;; :as :throw  → raise instead of returning the map
 
-(publish b {:type :paid :amount 42})   ; Tell into the bus
-(close b)                              ; End-of-Stream to every handler
+(map #(fence-fn 50 %) thunks)        ; higher-order; composes with flow/map-stage
 ```
 
-### Alternative syntax — the bus as a flow producer you fan
+**Implementation.** `priv/fence.bl`, ~30 lines:
 
 ```clojure
-(def b (flow/broadcast (flow/from-mailbox :payments)))   ; any producer → bus
-(flow/run-each b ledger/record! 16)                      ; each run is a subscriber
-(flow/run-each (flow/filter-stage b big?) email/send! 4)
-(erlang/send :payments {:type :paid :amount 42})
+(defmacro fence [opts & body] `(fence-fn ~opts (fn [] ~@body)))
+
+(defn fence-fn [opts f]
+  (let [{:keys [ms kill?]} (norm-opts opts)
+        me  (self)
+        {:keys [pid ref]} (spawn-monitor (fn [] (erlang/send me [:fence-ok (self) (f)])))]
+    (receive
+      [:fence-ok p v]             :when (= p pid) (do (demonitor ref :flush) {:ok v})
+      [:DOWN r :process _ reason] :when (= r ref) {:crash reason}
+      (after ms (do (when kill? (erlang/exit pid :kill))
+                    (demonitor ref :flush)
+                    {:timeout})))))
 ```
 
-This dialect says out loud what a bus *is*: a producer with a broadcast
-fan-out. `defbus` is just a name and a registry of subscribers around it.
-
-### Semantics that make it a maximalist bus
-
-- Each subscriber has its own demand counter; the bus emits to subscriber
-  `i` only `min(demand_i, queued)`. A slow subscriber slows **only the
-  bus's queue for itself** up to `:max-lag` (default 1024), after which the
-  bus applies the configured policy: `:block` (the *publisher* is slowed —
-  true end-to-end backpressure), `:drop-oldest`, or `:detach` (the
-  subscriber is unsubscribed and a `:lagged` event published). Policy is
-  per-subscriber: `(subscribe b :metrics f {:on-lag :drop-oldest})`.
-- `subscribe` with a `flow` stage means transformation *and* filtering
-  happen on the subscriber's side of the demand boundary, so an expensive
-  handler cannot slow the bus for others.
-
-### Composability
-
-- A bus is a producer → it plugs into any `flow` stage: `(flow/map-stage b
-  f)` is a derived bus.
-- Two buses merge: `(flow/merge a b)` (Fan-In).
-- A server can subscribe: `(subscribe b :acct (partial tell acct))` — bus
-  events become Tell edges on the server. Verifier sees the edge.
-
-### Implementation
-
-- `defbus` → `defprocess` with
-  `:state {:subs {id {:pid :demand :queue :policy}} :closed? false}` and
-  edges `[:subscribe id pid opts]`, `[:demand id n]`, `[:publish ev]`,
-  `[:close]`, `[:DOWN …]` (auto-unsubscribe — Monitor). `[:publish ev]`
-  appends to every sub's queue then runs `drain`, which for each sub emits
-  `min(demand queue)` as `[:events …]` and decrements. Lag policy applied
-  in `drain`. ~80 lines in `priv/bus.bl`, all on top of `flow`'s existing
-  `[:subscribe]`/`[:demand]`/`[:events]`/`[:done]` protocol so every flow
-  consumer already speaks bus.
-- `flow/broadcast` (alt syntax) = the same process, started from a producer
-  instead of a mailbox; `defbus` calls it. One engine.
+The `:when` guards are Correlated Reply under beam-lisp's rebinding `receive`.
+`demonitor :flush` on every exit is the leak hand-rolled fences miss.
+Cut over: `spell` `fence.bl` (2 copies) and `ward`'s per-test wrapper.
 
 ---
 
 ## 3. Registry
 
-**What it is.** Name → process, self-healing on death, queryable. Bundle:
-Loop-Carried State(relation) + Ask + Monitor(auto-retract).
-
-### Primary syntax
+Bundle: Loop-Carried State (a relation) + Ask + Monitor (auto-retract).
 
 ```clojure
 (defregistry sessions
-  {:keys [:user-id :node]})              ; attributes stored alongside pid
+  (keys :user-id :node))             ; attributes stored with each pid
 
 (def r (start sessions))
+(reg/register   r pid {:user-id 42 :node (node)})
+(reg/whereis    r {:user-id 42})     ; → pid | nil
+(reg/where      r '[:find ?p :where [?e :node "b@h"] [?e :pid ?p]])   ; datalog
+(reg/unregister r pid)
+;; an entry retracts itself when its pid dies
 
-(register r pid {:user-id 42 :node (node)})
-(whereis  r {:user-id 42})               ; → pid | nil   (Ask)
-(where    r '[:find ?pid :where [?e :node "b@host"] [?e :pid ?pid]])  ; datalog
-(unregister r pid)
+;; a name is a value — every prelude verb accepts one
+(call [:sessions {:user-id 42}] :balance)
+
+;; a server names itself; registered on start, retracted on ⊥
+(defserver session
+  (name [:sessions {:user-id 42}])
+  (init [_] (ok {}))
+  …)
 ```
 
-Processes registered die → entries retract automatically (Monitor edge).
-A restarted worker re-registers in its `:state` init.
-
-### Alternative syntax — via-tuple style, no explicit registry object
-
-```clojure
-(defprocess session
-  {:name  [:sessions {:user-id 42}]     ; ← registered on start, retracted on ⊥
-   :state {} :on {…}})
-
-(start session)
-(ask [:sessions {:user-id 42}] :ping)  ; addressing by name, ask resolves it
-```
-
-The `:name` key on any `defprocess` is the ergonomic path: users mostly
-don't want a registry, they want *to name things*. `[:sessions attrs]`
-selects a registry and the attributes; the default registry `:global` exists
-without declaration.
-
-### Composability
-
-- Registry state is a datom db: `where` is `datom/q` over it. Reachability
-  facts (`:~reachable`) and registry facts live in the same relational
-  space, so *"pids on a node that just went down, whose process can reach
-  state X"* is one query.
-- A supervisor can address children by name: `(child sup [:sessions
-  {:user-id 42}])`.
-- Cross-node: a registry started with `{:scope :cluster}` replicates entries
-  via `pg`-style gossip — **unbuilt; single-node only in the first slice.**
-
-### Implementation
-
-- `defregistry` → `defprocess` with `:state` = a datom conn; edges
-  `[:register pid attrs ?r]` (assert `{:pid pid …attrs}`, `erlang/monitor
-  pid`, reply), `[:whereis attrs ?r]` (query, reply), `[:where q ?r]`,
-  `[:unregister pid ?r]`, `[:DOWN _ :process pid _]` (retract all datoms with
-  that `:pid`). Invariant: every `:pid` in the db is `alive?` — the verifier
-  checks the `:DOWN` handler exists in the only state (Monitor pattern rule).
-- `:name` on `defprocess`: `start` does `(register (registry-of name) self
-  attrs)` first thing in the spawned process; the registry's monitor handles
-  retract. `ask`/`tell` accept `[reg attrs]` and resolve via `whereis` (one
-  hop, cached per call).
-- `priv/registry.bl`, ~100 lines; `vitals.bl`'s hand-rolled atom registry is
-  cut over to it (one need, one impl).
+**Implementation.** `defregistry` expands to a `defserver` whose state is a
+datom conn: `handle-call [:register pid attrs]` asserts `{:pid pid …attrs}`
+and `erlang/monitor`s; `[:whereis attrs]` / `[:where q]` query;
+`handle-info [:DOWN _ :process pid _]` retracts every datom with that `:pid`.
+Invariant: every `:pid` in the db is alive — the Monitor rule (`:DOWN`
+handled in the only state) is what `system/verify` checks. `(name …)` on
+`defserver` → `init` prepends `reg/register`. `priv/registry.bl`, ~100 lines;
+`vitals.bl`'s atom registry cuts over. Single-node only in this slice.
 
 ---
 
-## 4. Supervisor
+## 4. Bus
 
-**What it is.** A policy over children's failure edges, verified before boot.
+Bundle: Fan-Out (broadcast) + Demand + End-of-Stream — gen_event with
+backpressure.
+
+```clojure
+(defbus payments
+  (demand 16))                       ; per-subscriber pull size (default 8)
+
+(def b (start payments))
+(flow/subscribe b :ledger ledger/record!)                       ; a fn
+(flow/subscribe b :big    (flow/filter-stage #(> (:amount %) 1000) email/send!)
+                          {:on-lag :drop-oldest})               ; a stage + policy
+(bus/publish b {:type :paid :amount 42})
+(stop b)                             ; End-of-Stream to every subscriber
+```
+
+Each subscriber pulls at its own demand. A slow one backs up only its own
+queue to `:max-lag` (default 1024), then its policy fires: `:block` (the
+*publisher* is slowed — end-to-end backpressure), `:drop-oldest`, or `:detach`
+(unsubscribed, a `:lagged` event published).
+
+**Implementation.** `defbus` expands to a `defserver` with state
+`{:subs {id {:pid :demand :queue :policy}} :closed? false}` speaking `flow`'s
+existing `[:subscribe]/[:demand]/[:events]/[:done]` protocol — so every flow
+consumer already speaks bus and `flow/subscribe` needs no bus-specific code.
+`[:publish ev]` appends to each queue then drains `min(demand queue)` per
+subscriber; lag policy applied in drain; `:DOWN` auto-unsubscribes.
+`priv/bus.bl`, ~80 lines. `flow/broadcast` (any producer → bus) is the same
+server started from a producer instead of `bus/publish`.
+
+---
+
+## 5. Supervisor
+
 Bundle: Monitor|Link + Healing Edge + Governor + Invariant Gate.
-
-### Primary syntax — tree as data
 
 ```clojure
 (defsupervisor billing
-  {:strategy  :one-for-one
-   :intensity [3 5000]                        ; Governor: 3 restarts / 5s
-   :children  [(child :acct    account {:state 100})
-               (child :bus     payments)
-               (child :workers (pool worker {:size 4}))   ; a sub-supervisor
-               (child :ledger  ledger {:restart :transient})]})
+  (strategy  :one-for-one)
+  (intensity 3 5000)                          ; Governor: 3 restarts / 5 s
+  (child :acct    account 100)                ; anything startable + start args
+  (child :bus     payments)
+  (child :reg     sessions)
+  (child :workers (pool worker 4))            ; sub-supervisor, one-for-one
+  (child :ledger  ledger {:restart :transient :shutdown 5000}))
 
-(verify billing)   ; → :ok | {:unsafe :workers {:pattern :governor :lasso [...]}}
-(def s (start billing))
-(children s)       ; → [{:id :acct :pid … :state :alive :restarts 0} …]
-(kill s :acct)     ; → healed; (children s) shows a new pid, restarts 1
+(system/verify 'bank/billing)   ; whole-graph gate, before boot
+(def s (start-link billing))
+(super/children s)              ; → [{:id :acct :pid … :restarts 0} …]
+(call (super/child-of s :acct) :balance)
+(super/terminate s :acct)       ; → healed: new pid, restarts 1
+
+;; existing wrapping form — same result
+(supervise :one-for-one {:intensity [3 5000]}
+  [(worker :acct (fn [] (start-link account 100)))])
 ```
 
-- `child` builds a child spec from **any bundle value** (server, bus,
-  registry, another supervisor, a bare `defprocess`). Per-child `:restart
-  :permanent|:transient|:temporary`, `:shutdown ms`.
-- `pool` = N identical children under a `one-for-one` sub-supervisor with a
-  Fan-Out(distribute) front: `(tell (pool-of s :workers) job)` goes to one
-  worker with demand.
+`child` takes **any** startable name — a server, bus, registry, another
+supervisor — so no form needs a `child_spec` callback. `pool` is N identical
+children under a `one-for-one` sub-supervisor with a Fan-Out(distribute)
+front: `(cast (super/child-of s :workers) job)` reaches one worker with demand.
 
-### Alternative syntax — supervision as a wrapping form
+**What `system/verify` checks on a tree:**
 
-```clojure
-(supervise :one-for-all {:intensity [3 5000]}
-  (worker :acct   (start account {:state 100}))
-  (worker :bus    (start payments))
-  (supervise :one-for-one (pool worker 4)))
-```
-
-This is today's `supervise`/`worker`, extended to nest and accept bundle
-values. Same semantics; it reads as a tree drawn in code. Both forms yield
-the same `:sup/…` map; `verify` and `start` don't care which you wrote.
-
-### What verify checks (the Invariant Gate composed)
-
-| check | pattern | shipped verb |
+| check | pattern | verb |
 |---|---|---|
-| each child's `s0 ⊨ invariant` | Healing Edge | `establishes?` |
+| each child `s0 ⊨ invariant` | Healing Edge | `establishes?` |
 | every child edge keeps its invariant | — | `preserves?` |
 | no child has a lasso through `⊥` | Governor | `find-lasso` |
 | every Ask between siblings is answered | Ask | `all-senders-guarantee?` |
 | no two siblings Ask each other | — | `deadlocked` |
 | `one-for-all`: no sibling `s0` violates another's invariant | Healing Edge (cross-form) | `establishes?` over the union |
-| link topology agrees with strategy | Link | link-closure vs strategy (new, small) |
+| link topology agrees with strategy | Link | link-closure vs strategy (new) |
 
-The last two are the **whole-graph** checks that don't exist per-process:
-they need the union graph, which the tree value provides.
+The last two exist only at tree level — they need the union graph.
 
-### Composability
-
-- Trees are values: `(update billing :children conj (child :cache cache))`,
-  `(merge-trees a b)`, `(filter-children billing #(= :permanent (:restart
-  %)))`. A deploy can `diff` two trees.
-- `(start billing {:children {:acct {:state 0}}})` overrides child args.
-- `vitals` renders any started tree: `(vitals/watch s)`.
-- Hot upgrade: `(reload/stage billing')` + `(super/apply s billing')` starts
-  new children, stops removed, restarts changed — **designed, unbuilt.**
-
-### Implementation
-
-- `defsupervisor`/`child`/`pool` → a map `{:sup/strategy :sup/intensity
-  :sup/children [{:id :spec :restart :shutdown}]}`.
-- `start` lowers to OTP: `Supervisor/start_link` with child specs whose
-  `start` is `(fn [] (start spec))` — the **existing** `BeamLisp.Supervisor`
-  path in `rt.ex`. No new restart machinery; OTP does Healing Edge and
-  Governor. `supervise`/`worker` are rewritten to build the same map (skin).
-- `verify` = `system.core` verbs over `(system.model/system-model (map
-  :spec children))`; the two new checks (`one-for-all` cross-invariant,
-  link-closure) are ~40 lines in `priv/super.bl`.
-- `children`/`kill` = `Supervisor/which_children` + `terminate_child`, shaped
-  as maps. `vitals.bl` cuts over from its hand-rolled sup to this.
+**Implementation.** `defsupervisor` expands to a `defn billing-spec` returning
+OTP child specs whose `start` is `(fn [] (start-link child args))`, and
+`start-link billing` → `Supervisor/start_link` — the **existing**
+`BeamLisp.Supervisor` path in `rt.ex`. OTP does Healing Edge and Governor; no
+new restart machinery. `supervise`/`worker` are rewritten to produce the same
+specs. `system/verify` on a supervisor name = `system.core` verbs over
+`(system.model/system-model children-sources)` plus the two new checks
+(~40 lines, `priv/super.bl`). `super/children`/`child-of`/`terminate`/`restart`
+wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
+`vitals.bl`'s hand-rolled supervisor cuts over.
 
 ---
 
-## 5. Fence
-
-**What it is.** Run something isolated and bounded; get `{:ok v}`,
-`{:crash reason}`, or `{:timeout}`. Bundle: Monitor + Ask + Timeout Edge. Not
-a process form — a **function**.
-
-### Primary syntax
+## 6. All five in one program
 
 ```clojure
-(fence 200 (risky-eval form))           ; → {:ok v} | {:crash r} | {:timeout}
+(ns jobs)
 
-(match (fence 200 (risky-eval form))
-  {:ok v}      (use v)
-  {:crash r}   (log "died" r)
-  {:timeout}   (log "hung"))
-```
+(defserver worker
+  (name [:workers {:id (gensym)}])
+  (init [_] (ok {:done 0}))
+  (handle-cast [:job j] [s]
+    (match (fence 50 (process j))
+      {:ok v}     (do (bus/publish [:results] v)               (noreply (update s :done inc)))
+      {:crash r}  (do (bus/publish [:errors] {:job j :r r})    (noreply s))
+      {:timeout}  (do (bus/publish [:errors] {:job j :r :hung}) (noreply s))))
+  (handle-call :stats [_ s] (reply s s)))
 
-`fence` is a macro: body runs in a fresh spawned process; caller monitors,
-waits ≤ ms, demonitors + flushes on every exit (the leak hand-rolled fences
-get wrong).
-
-### Alternative syntax — fence as a value / option map
-
-```clojure
-(fence {:ms 200 :kill? true :as :either} (risky-eval form))
-;; :kill? true  → on timeout, exit the child (default true)
-;; :as :either  → return [:ok v] | [:err {:crash r}] (Either shape for →>)
-;; :as :throw   → throw on crash/timeout (for code that wants exceptions)
-
-(fence-fn 200 f)                        ; fn form, for higher-order use:
-(pmap (partial fence-fn 200) fns)      ; fence a batch
-```
-
-### Composability
-
-- With flow: `(flow/map-stage up (partial fence-fn 50))` — a stage whose
-  every element is isolated; a poison element yields `{:crash …}` downstream
-  instead of killing the stage.
-- With server: an `:on` handler body wrapped in `fence` turns "handler
-  crashes → server restarts" into "handler failure → reply `{:crash r}`" —
-  choose per edge whether to let it crash or fence it.
-- With supervisor: `ward` = fence per test + a collector; `spell/fence.bl` =
-  fence + a reply — both become one call.
-
-### Implementation
-
-- `priv/fence.bl`, ~30 lines:
-  ```clojure
-  (defmacro fence [opts & body]
-    `(fence-fn ~opts (fn [] ~@body)))
-  (defn fence-fn [opts f]
-    (let [{:keys [ms kill?]} (norm opts)
-          {:keys [pid ref]} (spawn-monitor (fn [] (erlang/send (self) [ref (f)])))]  ; ← see NB
-      (receive
-        [r v]     :when (= r ref)   (do (demonitor ref :flush) {:ok v})
-        [:DOWN r :process _ reason] :when (= r ref) {:crash reason}
-        (after ms (do (when kill? (erlang/exit pid :kill))
-                      (demonitor ref :flush) {:timeout})))))
-  ```
-  NB: reply is sent to the *caller* (captured before spawn) with the
-  monitor ref as the correlation tag — the `:when` guards are the Correlated
-  Reply pattern under beam-lisp's rebinding `receive`. Cut over
-  `spell/fence.bl` (2 copies) and `ward`'s per-test wrapper to call it.
-
----
-
-## 6. How they compose — one program using all five
-
-```clojure
-(defprocess worker
-  {:name  [:workers {:id (gensym)}]                      ; registry
-   :state {:done 0}
-   :on    {[:job j] (fn [s] (match (fence 50 (process j))  ; fence per job
-                              {:ok v}   (do (publish :results v) (update s :done inc))
-                              {:crash r} (do (publish :errors {:job j :r r}) s)
-                              {:timeout} (do (publish :errors {:job j :r :hung}) s)))
-           [:stats ?r] (fn [s] (reply ?r s s))}})           ; server edge
-
-(defbus results {:demand 32})
-(defbus errors  {:demand 8 :on-lag :drop-oldest})
+(defbus results (demand 32))
+(defbus errors  (demand 8))
+(defregistry workers (keys :id))
 
 (defsupervisor app
-  {:strategy :one-for-one :intensity [5 10000]
-   :children [(child :registry (registry :workers))
-              (child :results  results)
-              (child :errors   errors)
-              (child :workers  (pool worker {:size 8}))]})
+  (strategy :one-for-one)
+  (intensity 5 10000)
+  (child :workers-reg workers)
+  (child :results     results)
+  (child :errors      errors)
+  (child :pool        (pool worker 8)))
 
-(verify app)                     ; whole-graph gate: :ok
-(def s (start app))
-(subscribe (child s :errors) :log println)
-(doseq [j jobs] (tell (pool-of s :workers) [:job j]))   ; distribute
-(ask [:workers {:id …}] :stats)
+(system/verify 'jobs/app)                              ; :ok
+(def s (start-link app))
+(flow/subscribe (super/child-of s :errors) :log println)
+(doseq [j job-list] (cast (super/child-of s :pool) [:job j]))
+(call [:workers {:id some-id}] :stats)
 ```
-
-Every line is one named pattern; every value is inspectable, verifiable,
-diffable; nothing is a black box.
 
 ---
 
-## 7. Build plan (order chosen so each step is a green cutover)
+## 7. Build plan — each step a green cutover
 
-1. **`priv/process.bl`** — `defprocess`, `start`, `ask`, `tell`, `reply`,
-   `verify` (delegating to `system.core`). Test: `counter` above, verified +
-   run. Bare-loop backend only.
-2. **`priv/fence.bl`** — `fence`/`fence-fn`. Test: three outcomes. Cut over
-   `ward`'s per-test wrapper. (Independent of 1; do in parallel.)
-3. **`defserver` → skin** over `defprocess` + the existing gen_server emitter.
-   Test: `examples/server.bl`, `guards.bl` unchanged and green.
-4. **`priv/registry.bl`** — `defregistry`, `:name` on `defprocess`,
-   name-addressed `ask`/`tell`. Cut over `vitals.bl`'s atom registry.
-5. **`priv/bus.bl`** — `defbus` on `flow`'s protocol; `flow/broadcast`.
-   Test: two subscribers, one slow, lag policy observed.
-6. **`priv/super.bl`** — `defsupervisor`/`child`/`pool`, `verify` over the
-   tree (incl. the two new cross-form checks), `supervise`/`worker` as skin.
-   Cut over `vitals.bl`'s hand-rolled supervisor. Test: `examples/supervision.bl`
-   green + one `verify` that *rejects* a child with a lasso.
-7. **§6 example** as `examples/bundles/00-all-five.bl`, and the
-   `the-process-pattern-language.md` ledger updated from ◐/○ to ✅.
+| # | step | files | test / cutover |
+|---|---|---|---|
+| 1 | **Docs trued** (this commit) | `the-process-pattern-language.md`, `the-five-bundles.md` | — |
+| 2 | **Generic verbs**: `call` `cast` `start` `start-link` `stop` in prelude; name resolution hook (no-op until 5) | `priv/prelude.bl` (or wherever `server-call` lives), `compiler.bl` client API | `examples/server.bl`, `guards.bl` green using new names; `server-*` removed (cutover) |
+| 3 | **`fence`** | `priv/fence.bl` | new `examples/fence.bl`: three outcomes green; `ward` per-test wrapper cut over; note for spell to cut its two copies |
+| 4 | **`defserver (invariant …)`** clause + `system/verify` on a server name | `compiler.bl`, `priv/system/core.bl` | `guards.bl` `account` gains invariant; `(system/verify 'account)` → `:ok`; a deliberately bad server → `{:unsafe …}` |
+| 5 | **`defregistry`**, `(name …)` clause, name resolution in verbs | `priv/registry.bl`, `compiler.bl`, prelude | `examples/registry.bl`: register / whereis / where / auto-retract on kill; `vitals.bl` atom registry cut over |
+| 6 | **`defbus`** on flow's protocol, `flow/broadcast` | `priv/bus.bl`, `priv/flow.bl` | `examples/bus.bl`: two subscribers, one slow, `:drop-oldest` observed; `stop` reaches both |
+| 7 | **`defsupervisor`**, `child`, `pool`, `super/*`, `system/verify` over a tree; `supervise`/`worker` as skin | `priv/super.bl`, `rt.ex` (specs only), `priv/system/core.bl` | `examples/supervision.bl` green; `system/verify` **rejects** a child with a lasso; `vitals.bl` hand-rolled sup cut over |
+| 8 | **§6 example** + pattern ledger ◐/○ → ✅ | `examples/bundles/00-all-five.bl`, `the-process-pattern-language.md` | example green end to end |
 
-Unbuilt after this plan, stated plainly: cluster-scoped registry, hot
-tree upgrade (`super/apply`), `^pin` in `receive`.
+Steps 2 and 3 are independent (parallel). 4 needs 2. 5–7 each need 2; 7 needs
+4 (verify) and benefits from 5 (`child-of` by name). 8 needs all.
+
+Stated unbuilt after step 8: cluster-scoped registry, hot tree upgrade
+(`super/apply` via `reload`), `^pin` in `receive`.

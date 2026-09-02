@@ -8,17 +8,16 @@
 > the part of the relation it touches, so that the seven forms (`server`,
 > `machine`, `bus`, `registry`, `flow`, `supervisor`, `system`) are shown to be
 > **compositions of patterns**, not primitives of their own. Patterns are the
-> API design surface: every `defprocess` option, every stdlib fn in `flow`,
-> `super`, `reg`, and every guarantee `system.core` can prove, should map to
-> exactly one named pattern here.
+> API design surface: every clause a `def*` form accepts, every stdlib fn in
+> `flow`, `super`, `reg`, `bus`, and every guarantee `system.core` can prove,
+> should map to exactly one named pattern here.
 
 Format per pattern (Alexander-style, adapted):
 
 - **Intent** — what problem it solves, one sentence.
 - **Forces** — the tensions it resolves.
-- **Shape** — its expression in the relation: which of `:state`, `:on`,
-  `:invariant`, `:emit`, and which *kind* of edge (state edge · composition
-  edge · failure edge · observation).
+- **Shape** — its expression in the relation: state, edges (which *kind*:
+  state edge · composition edge · failure edge · observation), invariant.
 - **Protocol** — the messages, as data.
 - **Guarantee** — what the graph can *prove* about it (via `system.core`).
 - **API** — the surface name(s). ✅ = shipped · ◐ = shipped under another name
@@ -28,36 +27,49 @@ Format per pattern (Alexander-style, adapted):
 
 ---
 
-## 0. The substrate: `defprocess`
+## 0. The substrate: the receive loop, as the reader sees it
 
-Every pattern is a constraint on this one form. Spec of the form itself, so
-patterns have something concrete to attach to.
+There is no new definition form underneath the patterns. The substrate is the
+shape every process already has:
 
 ```clojure
-(defprocess NAME
-  {:state     INITIAL                       ; carried value — REQUIRED
-   :on        {PATTERN (fn [state msg] …)   ; state edges — REQUIRED (≥1)
-               …}
-   :invariant (fn [state] bool)             ; must hold after EVERY edge
-   :emit      (fn [state] [msgs state'])    ; outputs owed downstream
-   :after     [ms (fn [state] …)]           ; the timeout edge (§1.5)
-   :meta      {…}})                         ; open: patterns add keys here
+(loop [state INITIAL]
+  (receive
+    PATTERN (… state')          ; a state edge; the body yields the next state
+    …
+    (after MS (… state'))))     ; the timeout edge (§1.5)
 ```
 
-Semantics, fixed:
+`system.model` reads this shape directly from source (`extract-loop-receive`,
+`extract-receive`, `extract-defn`) and its header says why nothing more is
+needed: *five surface forms lower to the identical transition graph.*
+`defserver`'s callback clauses, a bare loop, a multi-clause `defn` — all the
+same graph. **Inspectability comes from the reader, not from the syntax.**
+This is what `codebase.bl` and `system/` already prove; no form has to return
+a "spec map" to be verifiable.
 
-1. `:on` handlers return the **next state**. A handler may return
-   `[:stop reason state']` to take the terminal edge deliberately.
-2. `:invariant` is checked by the verifier statically (`preserves?`) and may be
-   asserted at runtime in dev; violation is a **crash** (takes the failure
-   edge, §3), never a silent continue.
-3. A `defprocess` **is** a `(loop [s] (receive …))` — `system.model`'s
-   `extract-loop-receive` reads it identically. It compiles to a real
-   `gen_server` when the Ask pattern (§1.2) is present, else to a bare process.
-4. Every process has two implicit edges the author never writes:
+Semantics every pattern assumes:
+
+1. Each receive clause yields the **next state**; a clause may take the
+   terminal edge deliberately (`stop` in `defserver`, plain return in a loop).
+2. An **invariant** is a predicate over state the verifier checks statically
+   (`establishes?` on the initial state, `preserves?` on every edge). Violation
+   at runtime is a **crash** — it takes the failure edge (§3), never a silent
+   continue. `defserver` gains an `(invariant pred)` clause for it (○).
+3. Every process has two implicit edges the author never writes:
    - **failure**: `∀s. s --[crash]--> ⊥`
    - **exit**: `s --[:stop]--> ∎` (the deliberate terminal)
    Patterns in §3 operate on the first; End-of-Stream (§2.6) on the second.
+
+The verbs that act on a process are **generic** and live in four tiers (the
+BEAM's own layering — see `the-five-bundles.md` §0):
+
+| tier | examples | holds for |
+|---|---|---|
+| prelude | `start start-link stop call cast monitor link kill fence` | every process |
+| `kind/` | `super/children reg/whereis bus/publish flow/subscribe` | every process of that behaviour |
+| your ns | `(defn withdraw [a n] (call a [:withdraw n]))` | this protocol |
+| inside `def*` | `init handle-call reply noreply ok stop …` | return vocabulary |
 
 The pattern **categories** are the four things you can do with a relation:
 
@@ -84,7 +96,7 @@ The pattern **categories** are the four things you can do with a relation:
 - **Guarantee.** `reachable-states` is the set of loop arguments the graph can
   produce; `discover-invariant` mines it. Because state is a value, the
   verifier sees it *without running the process*.
-- **API.** ✅ `(loop [s] (receive …))` · ✅ `defserver` · ○ `defprocess :state`.
+- **API.** ✅ `(loop [s] (receive …))` · ✅ `defserver` `init`.
 - **Grounding.** `flow/producer-loop [gen gstate demand sub]`,
   `impl/chan-loop {:cap :buf :puts :takes :closed}`, `vitals/worker-loop [id]`.
 - **Related.** every other pattern assumes it; Snapshot (§4.2) reads it.
@@ -103,7 +115,8 @@ The pattern **categories** are the four things you can do with a relation:
   reply on every path (no request the graph can leave unanswered).
   `deadlocked` catches two processes Asking each other.
 - **API.** ✅ `gen_server/call` via `defserver` · ◐ hand-rolled in
-  `impl/put!` `take!` `close!` · ○ `(ask p msg)` as the one native verb.
+  `impl/put!` `take!` `close!` · ○ `(call pid-or-name msg)` — generic, prelude
+  (today's `server-call`, renamed and widened to any process / any name).
 - **Grounding.** every `impl.bl` client op:
   `(erlang/send ch [:take me ref]) (receive [:take-done r v] …)`.
 - **Related.** Tell (§1.3-dual), Correlated Reply, Timeout Edge.
@@ -119,7 +132,8 @@ The pattern **categories** are the four things you can do with a relation:
   graph can prove: the edge exists and the handler `preserves?` the
   invariant. Tell without Demand is the **unbounded mailbox** hazard; the
   verifier can flag a Tell edge whose sender has no Demand relation to `p`.
-- **API.** ✅ `erlang/send` · ✅ `gen_server/cast` · ○ `(tell p msg)`.
+- **API.** ✅ `erlang/send` · ✅ `gen_server/cast` · ○ `(cast pid-or-name msg)`
+  — generic, prelude (today's `server-cast`).
 - **Grounding.** `vitals` `[:kill-worker id]`; `flow` `[:demand n]` (Demand is
   a Tell — a demand signal must *itself* never block).
 - **Related.** Ask (dual), Demand (the Tell that makes Tell safe).
@@ -150,7 +164,7 @@ The pattern **categories** are the four things you can do with a relation:
 - **Forces.** Liveness vs. a receiver that may be dead; timeouts as *edges* so
   the graph sees them; a long idle wait that is not a bug.
 - **Shape.** A state edge with **no message** — labelled `[after ms]`. In
-  `defprocess`: `:after [ms f]`. In `receive`: the `(after ms …)` clause.
+  `receive`: the `(after ms …)` clause; in `defserver`: a `handle-info :timeout`.
 - **Protocol.** None. Fires when the mailbox has no matching message for `ms`.
 - **Guarantee.** `verify-liveness`: every receive has either an `after` edge or
   a proof that a sender must eventually send. A receive with neither is the
@@ -196,7 +210,7 @@ The pattern **categories** are the four things you can do with a relation:
   unreachable drain = a parked requester that never returns = a leak the
   graph sees.
 - **API.** ◐ `impl` `:puts`/`:takes` + `handle-cancel` · ○ `(park state
-  from ref)` / `(drain state pred)` helpers in `defprocess`.
+  from ref)` / `(drain state pred)` helpers in the prelude.
 - **Grounding.** `impl/handle-put` "buffer full → block this putter";
   `handle-take` "hand a blocked putter's value directly across".
 - **Related.** Ask, Selective Receive, Demand (the pull-based alternative
@@ -398,7 +412,7 @@ that add edges *out of* `⊥`.
   processes one crash takes down. A supervisor's children must not be
   link-closed to each other unless the strategy is `one-for-all` (else the
   restart policy and the link topology disagree — a flaggable inconsistency).
-- **API.** ✅ `erlang/link` · ✅ `spawn_link` · `defprocess :meta {:trap-exit
+- **API.** ✅ `erlang/link` · ✅ `spawn_link` · `defserver (trap-exit
   true}` ○.
 - **Grounding.** OTP internals of `supervise`; `staying-alive` doc §links.
 - **Related.** Monitor, Healing Edge, Governor.
@@ -491,7 +505,7 @@ that add edges *out of* `⊥`.
   monotone between two snapshots is **wedged** — a runtime fact no static
   check gives, and the *complement* of `find-lasso` (static livelock vs.
   observed stall).
-- **API.** ◐ `vitals` `worker-loop` sleep+tick · ○ `defprocess :after` +
+- **API.** ◐ `vitals` `worker-loop` sleep+tick · ○ `defserver (tick ms …)` +
   `vitals/beating?`.
 - **Grounding.** `vitals` "heartbeat = did this worker do work since the last
   frame?"
@@ -595,7 +609,7 @@ Two consequences for the API:
 |---|---|
 | Loop-Carried State, Ask, Tell, Selective Receive, Timeout Edge | ✅ native |
 | Correlated Reply | ✅ via `make_ref` + guard; ○ `^pin` |
-| Parked Waiter | ◐ in `impl.bl`; ○ `defprocess` helpers |
+| Parked Waiter | ◐ in `impl.bl`; ○ prelude `park`/`drain` helpers |
 | Pipeline, Demand, Metered Stage, End-of-Stream | ✅ `flow.bl` |
 | Fan-Out, Fan-In | ◐ shim + hand-rolled; ○ `flow/broadcast` `distribute` `merge` |
 | Registry | ◐ `vitals` atom; ○ `defregistry` on datom |
@@ -607,8 +621,10 @@ Two consequences for the API:
 | Invariant Gate | ✅ per-process; ○ per-tree |
 | Simulation | ✅ verb; ○ wired to `flow` |
 
-**Honest next slice (unchanged from the-fundamental-form.md, now precise):**
-`defprocess` with `:state :on :invariant :after`; lower `defserver` to it;
-`(fence f ms)` in stdlib (kills two hand-rolled copies in spell); and
-`super/verify` composing the §4.3 verbs over one two-worker tree — the
-smallest set that makes §5's "every fn names one pattern" true in code.
+**Honest next slice (supersedes the-fundamental-form.md's `defprocess`
+proposal, which was redundant — the reader already makes every form a graph):**
+generic prelude verbs `call`/`cast`/`start`/`start-link`/`stop` (cutover from
+`server-*`, widened to any pid or name); `(fence ms body)` in stdlib (kills two
+hand-rolled copies in spell); and `system/verify` over one two-worker
+`defsupervisor` — the smallest set that makes §5's "every fn names one
+pattern" true in code. Full step list: `the-five-bundles.md` §7.
