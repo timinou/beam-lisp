@@ -18,7 +18,7 @@ DECISIONS become datalog QUERIES over the program-as-facts, not ad-hoc analyses.
    (superseded by compile-defn*)
 ```
 
-The dead-code query **found genuine unused helpers** in priv/compiler.bl — the
+The dead-code query **found genuine unused helpers** in priv/boot/compiler.bl — the
 language analyzing itself improved itself. (A known limitation surfaced too:
 `parse-require-spec` is called via `(map parse-require-spec ...)`, a
 higher-order reference the direct-call-site query misses — so the query is a

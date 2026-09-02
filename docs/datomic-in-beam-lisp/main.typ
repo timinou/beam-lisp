@@ -40,8 +40,8 @@ the measurements that should decide what storage substrate comes next.
 == Where it lives
 
 ```
-priv/datom.bl              the public API — one namespace, the whole database
-priv/datom/
+priv/lib/datom.bl              the public API — one namespace, the whole database
+priv/lib/datom/
   store.bl                 L1: the storage port (six methods)
   store-ets.bl             L0: an ETS implementation of it
   codec.bl                 order-preserving binary keys
@@ -541,7 +541,7 @@ carry this database unchanged.
 
 == The port is proven, not assumed
 
-A port with one implementation is a hypothesis. `priv/datom/store-map.bl`
+A port with one implementation is a hypothesis. `priv/lib/datom/store-map.bl`
 is a second one — a sorted map in an atom, sharing no machinery with ETS: no
 tables, no process ownership, a different concurrency story. The entire
 database runs on it unchanged.
@@ -984,7 +984,7 @@ inclusive, it has no CAS, and its BTree path writes bytes without fsync. Its
 independently on nearly the same design as this codec, which is a good sign for
 both.
 
-`priv/datom/store-redb.bl` implements the port over
+`priv/lib/datom/store-redb.bl` implements the port over
 `native/datom_redb` — one `WriteTransaction` per commit, `Durability::Immediate`
 with no way to weaken it, CAS inside a single transaction, and dirty-IO
 scheduling so a filesystem call cannot stall a BEAM scheduler.

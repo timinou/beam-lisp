@@ -1,6 +1,6 @@
 # CHECKPOINT 1 — the .bl compiler compiles the whole prelude
 
-**Question.** Can the beam-lisp-written compiler (priv/compiler.bl) compile the
+**Question.** Can the beam-lisp-written compiler (priv/boot/compiler.bl) compile the
 entire prelude to the same Elixir AST the existing Elixir compiler produces —
 not just isolated forms, but every top-level form of every real file?
 
@@ -11,7 +11,7 @@ produces a slightly different (but equivalent) chain of intermediate bindings.
 ## The gate
 
 `prelude_corpus_gate.bl` reads every `.bl` file under `priv/` and
-`priv/system/`, threads the current namespace (each `(ns X)` switches the
+`priv/lib/system/`, threads the current namespace (each `(ns X)` switches the
 compile ns), and compiles every top-level form through BOTH the `.bl` compiler
 and the oracle, comparing with `ast-equal?`.
 

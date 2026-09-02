@@ -6,7 +6,7 @@ DOM diff rides on **fact-deltas**. Everything LiveView does, plus the three
 things it structurally cannot — provable-sound incremental diffs, auth as the
 same datalog as the query, and free time-travel.
 
-Design: `!tasks/plans/PLAN-052-*.org`. The layer lives in `priv/live/`
+Design: `!tasks/plans/PLAN-052-*.org`. The layer lives in `priv/lib/live/`
 (`hiccup.bl` · `diff.bl` · `socket.bl`) and rests on the W0 language fix that
 made `^{:key …}` reach runtime collections.
 

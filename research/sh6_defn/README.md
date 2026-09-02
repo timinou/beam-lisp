@@ -8,7 +8,7 @@ Elixir syntax tree the existing compiler produces?
 covering self-recursion, multi-arity, variadic, guards, and parameter
 destructuring.
 
-## What was added to `priv/compiler.bl`
+## What was added to `priv/boot/compiler.bl`
 
 - **`def`** → `BeamLisp.Env.intern(ns, name, value)`.
 - **`defn` / `defn-`** → `BeamLisp.Link.defvar(ns, name, entries, location)`,

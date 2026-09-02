@@ -317,14 +317,14 @@ This guide is the `veritas.mock` + `veritas.fault` layers of the veritas family
 direction here is the general `veritas/exists` grown into a server; the fault
 space is `veritas/faults` plus its datalog analysis half.
 
-- `priv/veritas/mock.bl` (`ns veritas.mock`) — the synthesis engine: `synth`,
+- `priv/lib/veritas/mock.bl` (`ns veritas.mock`) — the synthesis engine: `synth`,
   `synth-seeded`, `synth-boundary`, `synth-invalid`, `satisfiable-status`,
   `check`, `contract-from`, and the server `make-mock`/`answer`.
-- `priv/veritas/fault.bl` (`ns veritas.fault`) — the fault space: `error-for`,
+- `priv/lib/veritas/fault.bl` (`ns veritas.fault`) — the fault space: `error-for`,
   `errors`, `make-server`, `serve`, `isolate`/`isolate-all`, and the datalog
   analysis (`report`, `uncovered-clauses`, `faults-per-clause`,
   `redundant-mutants`, `independent-laws`).
-- `priv/veritas.bl` — the shared core: the `Gen` protocol, `check` escalator,
+- `priv/lib/veritas.bl` — the shared core: the `Gen` protocol, `check` escalator,
   `parse-model` (a z3 model IS a value), and the `exists`/`for-all`/`covers`/
   `faults` these layers build on.
 - `examples/veritas/03-the-mock-server.bl` — a contract as a deterministic server,

@@ -39,7 +39,7 @@ below adds ergonomics or reach, never a new semantic.
 | `receive … after` | selective mailbox match + timeout | `(receive pat body … (after ms …))` | ✓ `pingpong.bl` |
 | `spawn` / `spawn_link` / `spawn_monitor` | isolated process; optional crash/death signal | `(erlang/spawn (fn [] …))` | ✓ `processes.bl` |
 | `monitor` → `{:DOWN,…}` | one-way death notice | `(erlang/monitor :process pid)` | ✓ (idea) `examples/datom/07` §6 |
-| `register` / `whereis` | **local** name → pid | `(erlang/register :n pid)` | ✓ `priv/datom/conn.bl` |
+| `register` / `whereis` | **local** name → pid | `(erlang/register :n pid)` | ✓ `priv/lib/datom/conn.bl` |
 | `:global` | **cluster** unique name via consensus (CP) | `(global/register_name :n pid)` | — |
 | **`:pg`** | **process groups — the native 1→N broadcast** | `(pg/join grp (erlang/self))` then send each of `(pg/get_members grp)` | — |
 | `:erpc` / `:rpc` | call a fun on another node | `(erpc/call node m f args)` | — |
@@ -93,7 +93,7 @@ picks a rung by *blast radius* at the seam (§5).
 ## 2. The seam already in the tree: `auth` ⋈ `datom`
 
 The reason filtered subscriptions are cheap is that **the filter already
-exists**. Study `priv/auth/rls.bl` and `examples/auth/05-rls-filter-your-rows.bl`:
+exists**. Study `priv/lib/auth/rls.bl` and `examples/auth/05-rls-filter-your-rows.bl`:
 
 ```clojure
 ;; auth guards a query by INJECTING datalog :where clauses — before it runs.
@@ -135,7 +135,7 @@ with no second policy language.
 
 The subscription filter must run **against each committed datom**, not by
 re-running a whole query per event. The tree already has the primitive:
-`priv/datom/query/engine.bl` → `unify-pattern`.
+`priv/lib/datom/query/engine.bl` → `unify-pattern`.
 
 ```clojure
 ;; engine.bl, today: unify a clause against ONE datom [e a v tx op].
@@ -153,13 +153,13 @@ interested?(report, clauses) ≝ ∃ d ∈ report.tx-datoms . clauses unify with
 
 This is O(|tx-datoms| × |clauses|) per commit — cheap, and it reuses the engine
 that already exists rather than a parallel matcher that could drift from query
-semantics (the same anti-pattern `priv/datom/datalog.bl` documents for the
+semantics (the same anti-pattern `priv/lib/datom/datalog.bl` documents for the
 native fixpoint spike: *"a second engine that must agree"*).
 
 ### 3.1 Three filter tiers, cheapest first
 
 The design exposes filters by selectivity, so a subscriber pays only for what it
-needs — and the store's own index structure (`priv/datom/index.bl`: EAVT / AEVT
+needs — and the store's own index structure (`priv/lib/datom/index.bl`: EAVT / AEVT
 / AVET / VAET) tells us which tier is cheap.
 
 | tier | interest | test against a commit | cost |
@@ -176,7 +176,7 @@ maintained. A subscriber declares its tier; the writer routes accordingly.
 ### 3.2 The incremental-view escape hatch
 
 For T2 done *right* (recompute only the delta, never the whole answer), the tree
-already spiked the substrate: `priv/datom/datalog.bl` exposes
+already spiked the substrate: `priv/lib/datom/datalog.bl` exposes
 `dl-eval-incremental` (semi-naive maintenance under new base facts, in Rust).
 A materialized `datom/watch` view over a recursive rule is
 `dl-eval-incremental(rules, edb_before, new_edb=tx-datoms)`. Out of scope for
@@ -206,7 +206,7 @@ A subscription is the bound case. Given a query vector `?q`, the interest
   (fn [changes] …))
 ```
 
-Because embeddings are datoms (`priv/datom/vector.bl`: *"a vector is just a
+Because embeddings are datoms (`priv/lib/datom/vector.bl`: *"a vector is just a
 fact"*), and the vector search NIF scores a **bound** entity set, the changefeed
 scores *only the entities in this commit* — not the whole corpus. And because
 `similar-to` reads through the db value's basis
@@ -249,7 +249,7 @@ sends *after* commit, off the hot path — it never blocks the writer (§7.4).
   (`conn.bl`). One store = one ordered writer = one serialization domain. Many
   stores = many independent writers across nodes. Route an entity to its shard by
   a stable key.
-- **The substrate distributes.** `priv/datom/store.bl` is deliberately **6
+- **The substrate distributes.** `priv/lib/datom/store.bl` is deliberately **6
   methods** and targets **Hobbes** (FoundationDB-architecture, strictly
   serializable, distributed ordered keyspace). Horizontal *write* scaling within
   one logical database is the substrate's job; nothing above L0 learns which
@@ -496,7 +496,7 @@ Thin additions, mirroring Datomic's `tx-report-queue` but **push, not pull**,
 delta-by-default, and transport-pluggable:
 
 ```clojure
-;; priv/datom/conn.bl — one new seam, inside the writer, after a real commit.
+;; priv/lib/datom/conn.bl — one new seam, inside the writer, after a real commit.
 ;; DEFAULT payload is the DELTA (§6). Same-node always gets it; cross-node gets
 ;; it too unless a subscriber asked for :basis.
 (defn- publish-report! [conn report]
@@ -512,7 +512,7 @@ delta-by-default, and transport-pluggable:
       (Phoenix.PubSub/broadcast ps (basis-topic topic)
         [:datom/changed (datom/basis-t (:db-after report)) (changed-attrs report)]))))
 
-;; priv/datom.bl — the facade surface
+;; priv/lib/datom.bl — the facade surface
 (datom/listen!   conn)                       ; delta stream: [:datom/tx basis tx-datoms]
 (datom/listen!   conn {:attrs #{…}})         ; T0: only commits touching these attrs
 (datom/listen!   conn {:payload :basis})     ; the KNOB: basis-only, reader re-derives
@@ -596,10 +596,10 @@ made observable, with the filter and the security it already had.
 
 ## See also
 
-- `priv/datom/conn.bl` — the single writer, the basis high-water mark, the tx report
-- `priv/auth/rls.bl`, `examples/auth/05`,`08` — clause injection, "may you?" ⋈ "which rows?"
-- `priv/datom/query/engine.bl` — `unify-pattern`, the matcher this reuses
-- `priv/datom/vector.bl`, `examples/semantic/03`,`10` — similarity as a filtering clause
+- `priv/lib/datom/conn.bl` — the single writer, the basis high-water mark, the tx report
+- `priv/lib/auth/rls.bl`, `examples/auth/05`,`08` — clause injection, "may you?" ⋈ "which rows?"
+- `priv/lib/datom/query/engine.bl` — `unify-pattern`, the matcher this reuses
+- `priv/lib/datom/vector.bl`, `examples/semantic/03`,`10` — similarity as a filtering clause
 - `docs/the-application-is-a-value.md` — FEAT-016, *broadcast the moment, never the projection*
 - `lib/beam_lisp/spell/server.ex` — `Phoenix.PubSub` subscribe/broadcast, already in the tree
 - PLAN-033 (Hobbes substrate), PLAN-044 (L2 broadcast) / PLAN-045 (L3 filtered watch)

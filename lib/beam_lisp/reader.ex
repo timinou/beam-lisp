@@ -106,7 +106,7 @@ defmodule BeamLisp.Reader do
     # caller funnels through (read_all/read_one/read_data/read_all_data and the
     # five live call sites all reach source text through here), so flipping it
     # flips the whole reader with a single decision. When the self-hosted
-    # beam-lisp reader (priv/reader.bl) is interned this delegates to it;
+    # beam-lisp reader (priv/boot/reader.bl) is interned this delegates to it;
     # otherwise the genesis Elixir reader below runs — which is also what reads
     # reader.bl's OWN source on a tree where it is not yet built, and what the
     # differential oracle measures the .bl reader against. reader.ex is never
@@ -376,7 +376,7 @@ defmodule BeamLisp.Reader do
 
   # `@x` reads as `(deref x)` — but the `@ → deref` mapping is not
   # wired into the reader: it lives in the reader-macro table (see
-  # BeamLisp.RT.reader_macro/1), registered from priv/core.bl like a
+  # BeamLisp.RT.reader_macro/1), registered from priv/boot/core.bl like a
   # Lisp reader macro, and rebindable. The builtin default keeps `@`
   # working before the prelude loads. `@` followed only by whitespace
   # (or nothing) is a reader error.
@@ -530,7 +530,7 @@ defmodule BeamLisp.Reader do
         # the following form and wrap it as `(<fn> <form>)`, the way Clojure's
         # `*data-readers*` expands a tagged literal. The tag→fn mapping is not
         # baked in here — `BeamLisp.RT.data_reader/1` is a pure lookup into a
-        # registry that beam-lisp SOURCE owns: `priv/data-readers.bl` seeds the
+        # registry that beam-lisp SOURCE owns: `priv/boot/data-readers.bl` seeds the
         # built-ins (`#d`, `#time`) at boot, and a program may add its own with
         # `(data-reader! …)`. This file only knows the SHAPE grammar (what may
         # follow a tag), never what any tag MEANS. The stored value is a

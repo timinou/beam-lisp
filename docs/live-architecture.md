@@ -17,7 +17,7 @@ The one idea, before the diagrams:
 ## 1. The layers (what lives where)
 
 ```
-                          priv/live/
+                          priv/lib/live/
   ┌──────────────────────────────────────────────────────────────────┐
   │  style.bl   design tokens + atomic CSS   ── a brand, as a value    │
   │  ui.bl      accessible components         ── functions → hiccup     │
@@ -28,8 +28,8 @@ The one idea, before the diagrams:
   └──────────────────────────────────────────────────────────────────┘
                                 │  rests on
                                 ▼
-                          priv/datom/  (the log-structured database)
-                          priv/auth.bl (the guard + the authorizer)
+                          priv/lib/datom/  (the log-structured database)
+                          priv/lib/auth.bl (the guard + the authorizer)
 ```
 
 Nothing in the view layer knows about sockets; nothing in the socket layer
@@ -204,18 +204,18 @@ names the *intent*, never the actor. A check-in cannot lie about who checked in.
 ```
   concept in the loop          file                       key symbol
   ─────────────────────        ──────────────────────     ─────────────────────
-  brand as a value             priv/loom/token.bl         install-theme!, tok, sx
-  layout algebra               priv/loom/box.bl           box, col, row, grid
-  accessible components        priv/loom/ui.bl            button, field, card…
-  view → HTML                  priv/live/hiccup.bl        hiccup->html
-  minimal patches              priv/live/diff.bl          diff, apply-ops
-  bind view ↔ conn (the loop)  priv/live/socket.bl        defview, deflive,
+  brand as a value             priv/lib/loom/token.bl         install-theme!, tok, sx
+  layout algebra               priv/lib/loom/box.bl           box, col, row, grid
+  accessible components        priv/lib/loom/ui.bl            button, field, card…
+  view → HTML                  priv/lib/live/hiccup.bl        hiccup->html
+  minimal patches              priv/lib/live/diff.bl          diff, apply-ops
+  bind view ↔ conn (the loop)  priv/lib/live/socket.bl        defview, deflive,
                                                           mount, on-commit,
                                                           handle-event
-  browser applies patches      priv/live/client.js        Live.applyOp
-  the shared world + history   priv/datom/                connect, transact!,
+  browser applies patches      priv/lib/live/client.js        Live.applyOp
+  the shared world + history   priv/lib/datom/                connect, transact!,
                                                           q, as-of, listen!
-  guard + authorizer           priv/auth.bl               guard, authorize
+  guard + authorizer           priv/lib/auth.bl               guard, authorize
   the running app              examples/live/11-pulse-app.bl
 ```
 

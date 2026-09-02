@@ -935,7 +935,7 @@ defmodule BeamLisp.RT do
 
   # --- sorted collections ------------------------------------------
   # The ordered siblings of `set`/map. Their vocabulary (sorted-map,
-  # sorted-set, subseq, rsubseq) is defined in priv/core.bl over these
+  # sorted-set, subseq, rsubseq) is defined in priv/boot/core.bl over these
   # primitives — Elixir keeps only what needs :gb_trees.
 
   @doc "`(sorted-map & kvs)` — an ordered map from flat key/value args."
@@ -977,7 +977,7 @@ defmodule BeamLisp.RT do
   @doc """
   `(sorted-dissoc m k)` — an ordered map without `k` (idempotent).
 
-  Exists because `dissoc` in `priv/core.bl` reaches for `Map/delete`, which
+  Exists because `dissoc` in `priv/boot/core.bl` reaches for `Map/delete`, which
   on a SortedMap would delete a struct FIELD (or silently no-op) rather
   than a tree entry — leaving the key still present. core dispatches here
   for ordered maps.
@@ -2097,7 +2097,7 @@ defmodule BeamLisp.RT do
   """
   def data_reader(tag) when is_binary(tag) do
     # Pure registry lookup — no builtin defaults live here. The tag→reader-fn
-    # mapping is OWNED by beam-lisp source: `priv/data-readers.bl` registers
+    # mapping is OWNED by beam-lisp source: `priv/boot/data-readers.bl` registers
     # `#d` and `#time` at boot (loaded by `BeamLisp.init/0` BEFORE any user
     # file is read), the way Clojure's `data_readers.clj` seeds `#inst`/`#uuid`.
     # A stored value is `{:symbol, name}`, exactly the shape the reader's
@@ -2291,7 +2291,7 @@ defmodule BeamLisp.RT do
       # sets (wave 18)
       "set" => &set/1,
       # Ordered collections. The variadic surface (sorted-map, sorted-set)
-      # is defined in priv/core.bl over these; what lands here is only
+      # is defined in priv/boot/core.bl over these; what lands here is only
       # what needs :gb_trees underneath.
       "sorted-map-of" => &sorted_map_of/1,
       "sorted-set-of" => &sorted_set_of/1,

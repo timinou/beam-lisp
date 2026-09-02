@@ -33,9 +33,9 @@ and only one of them is uncompromisingly native:
 
 | tier | file / ns | model | native? |
 |---|---|---|---|
-| **demand-flow** | `priv/flow.bl` / `flow` | **PULL** — consumer signals demand, producer cannot outrun it (GenStage) | ✅ **the native tier** |
-| CSP channel engine | `priv/clojure/core/async/impl.bl` / `clojure.core.async.impl` | **PUSH** — bounded buffer + rendezvous (Hoare CSP on actors) | ◐ core.async's *private engine*, filed under the compat tree (like `specter.engine`) — not native, not standalone |
-| core.async | `priv/clojure/core/async.bl` / `clojure.core.async` | Clojure's CSP API | ❌ compat shim over `…async.impl` |
+| **demand-flow** | `priv/std/flow.bl` / `flow` | **PULL** — consumer signals demand, producer cannot outrun it (GenStage) | ✅ **the native tier** |
+| CSP channel engine | `priv/std/clojure/core/async/impl.bl` / `clojure.core.async.impl` | **PUSH** — bounded buffer + rendezvous (Hoare CSP on actors) | ◐ core.async's *private engine*, filed under the compat tree (like `specter.engine`) — not native, not standalone |
+| core.async | `priv/std/clojure/core/async.bl` / `clojure.core.async` | Clojure's CSP API | ❌ compat shim over `…async.impl` |
 
 **Why `flow` is the native tier and `channels` is not.** The BEAM's own answer
 to backpressure is GenStage, and it is **demand-driven**: a consumer asks for
@@ -62,13 +62,13 @@ furniture is `flow` (demand streaming), `defserver`/`gen_server`
 ## Inside core.async: the shim + its private engine
 
 core.async itself is split into two files, mirroring how beam-lisp separates
-`priv/specter/*` (the Clojure optics library) from its own engine module — a
+`priv/std/specter/*` (the Clojure optics library) from its own engine module — a
 compat library and its private machinery, filed together:
 
 | file | ns | what it is | size |
 |---|---|---|---|
-| `priv/clojure/core/async.bl` | `clojure.core.async` | the **compat shim** — renames only, zero engine | ~15 aliases |
-| `priv/clojure/core/async/impl.bl` | `clojure.core.async.impl` | the **push-CSP engine** — the channel actor | ~9 verbs |
+| `priv/std/clojure/core/async.bl` | `clojure.core.async` | the **compat shim** — renames only, zero engine | ~15 aliases |
+| `priv/std/clojure/core/async/impl.bl` | `clojure.core.async.impl` | the **push-CSP engine** — the channel actor | ~9 verbs |
 
 (Paths follow the loader's ns→path rule: dots become directory separators, so
 `clojure.core.async.impl` lives at `clojure/core/async/impl.bl`. Both sit under
@@ -92,8 +92,8 @@ core.async (shim)     →  clojure.core.async.impl (engine)
   not something native code should reach for (the BEAM already covers its jobs
   via `flow`, selective `receive`, and `gen_server`).
 
-The engine (`priv/clojure/core/async/impl.bl`) is ~200 lines, most of it the
-channel actor's buffering rules. The shim (`priv/clojure/core/async.bl`) is ~15
+The engine (`priv/std/clojure/core/async/impl.bl`) is ~200 lines, most of it the
+channel actor's buffering rules. The shim (`priv/std/clojure/core/async.bl`) is ~15
 lines of aliasing over it.
 
 ## Why this file order

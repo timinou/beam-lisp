@@ -9,14 +9,14 @@ guessing.
 
 ## What was built
 
-`priv/reader.bl` — text → forms, written in beam-lisp. It reproduces the core
+`priv/boot/reader.bl` — text → forms, written in beam-lisp. It reproduces the core
 grammar: lists, vectors, maps, sets, strings (all escapes, including `\uXXXX`
 and UTF-8), keywords (including `:"quoted"`), symbols, numbers, `nil`/`true`/
 `false`, character literals, the quote family (`'` `` ` `` `~` `~@`), `@`
 deref, `#()` fn literals with `%`/`%N`/`%&`, `#_` discard, `^metadata`, and
 comment/comma trivia.
 
-It leans on `priv/reader-node.bl` (the shared node vocabulary, P1) to build the
+It leans on `priv/boot/reader-node.bl` (the shared node vocabulary, P1) to build the
 tuples, and is graded by `priv/self/oracle.bl` (the differential oracle) which
 compares its output against `BeamLisp.Reader/read_all`, the answer key.
 

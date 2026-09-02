@@ -14,7 +14,7 @@ Elixir syntax tree, which Elixir then turns into BEAM bytecode). So the language
 was described in a different language.
 
 Self-hosting means: **that machinery is now written in beam-lisp itself.** The
-reader is `priv/reader.bl`. The compiler is `priv/compiler.bl`. They are
+reader is `priv/boot/reader.bl`. The compiler is `priv/boot/compiler.bl`. They are
 beam-lisp programs that read and compile beam-lisp.
 
 ## What stays Elixir, and why that is correct

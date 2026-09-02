@@ -68,10 +68,10 @@ and the final Typst writeup.
 ## In-repo native assets the design leans on (not citations, but the
 other half of the story)
 
-- `priv/datom/query/` — datalog engine: fixpoint, rules, magic sets
-- `priv/rewrite.bl` — tree unification + fixed-point rewriting; rules
+- `priv/lib/datom/query/` — datalog engine: fixpoint, rules, magic sets
+- `priv/std/rewrite.bl` — tree unification + fixed-point rewriting; rules
   as data
-- `priv/deodorant.bl` — tiered rule-set composition (SAFE/IDIOMATIC)
-- `priv/specter/`, `priv/optics.bl` — composable navigation/traversal
+- `priv/std/deodorant.bl` — tiered rule-set composition (SAFE/IDIOMATIC)
+- `priv/std/specter/`, `priv/std/optics.bl` — composable navigation/traversal
 - `examples/type_safety.bl` — the runtime value-tag taxonomy the
   lattice is designed from

@@ -90,7 +90,7 @@ defmodule BeamLisp.Wave28PrimsTest do
       # Asserted by construction rather than by exhausting the table:
       # the prim must route through BeamLisp.AtomGuard, so a source scan
       # is the honest check that no bare intern crept back in.
-      src = File.read!("priv/core.bl")
+      src = File.read!("priv/boot/core.bl")
       [_, keyword_def | _] = String.split(src, "(defn keyword")
       body = String.slice(keyword_def, 0, 400)
 

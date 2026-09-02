@@ -29,7 +29,7 @@ maximalist version collapses to one sentence:
 |---|---|---|---|
 | **serve** | `bl live doc.bl.md` | a notebook app: every cell run, output, and edit is a fact; N viewers converge through the log | `examples/live/05-two-tabs.bl`, the Pulse loop in `docs/live-architecture.md` |
 | **build** | `bl doc build docs/` | a static docs site: the same hiccup, frozen to HTML | `docs/tutorial-full-stack-ssg.md`, `live.hiccup/hiccup->html` |
-| **run** | `bl doc run doc.bl.md` | CI: every cell evaluates in order under isolation, results are re-written into the file, deftest cells run | `priv/bl/cli.bl`, `reload.ward`, `priv/test.bl` |
+| **run** | `bl doc run doc.bl.md` | CI: every cell evaluates in order under isolation, results are re-written into the file, deftest cells run | `priv/std/bl/cli.bl`, `reload.ward`, `priv/std/test.bl` |
 
 No fourth artifact. When the narrative, the code, and the outputs live in one
 file that is itself a namespace, "docs drift" stops being a category of bug.
@@ -234,19 +234,19 @@ git-native, so this is a requirement, not a nicety.
 | affordance | file | role in the livebook |
 |---|---|---|
 | string eval, last value out | `BeamLisp.eval/1` (`lib/beam_lisp.ex`) | cell evaluation |
-| hiccup → HTML | `priv/live/hiccup.bl` | the projection layer, everywhere |
-| keyed tree diff + ops | `priv/live/diff.bl`, `client.js` | live re-render of notebook views |
-| socket loop (`defview`/`deflive`) | `priv/live/socket.bl` | the notebook app's loop |
-| datom log: `q`/`as-of`/`watch`/history | `priv/datom/` | results, sessions, time travel |
-| stage → static coherence → atomic commit | `priv/reload.bl` | cell edits as transactions (L1, L3) |
+| hiccup → HTML | `priv/lib/live/hiccup.bl` | the projection layer, everywhere |
+| keyed tree diff + ops | `priv/lib/live/diff.bl`, `client.js` | live re-render of notebook views |
+| socket loop (`defview`/`deflive`) | `priv/lib/live/socket.bl` | the notebook app's loop |
+| datom log: `q`/`as-of`/`watch`/history | `priv/lib/datom/` | results, sessions, time travel |
+| stage → static coherence → atomic commit | `priv/std/reload.bl` | cell edits as transactions (L1, L3) |
 | file watcher w/ `auto_commit` | `lib/beam_lisp/reload_watcher.ex`, `bl watch` | save = stage (needs the W3 extension) |
 | AOT per-file → `.beam` + `__bl_init__` | `BeamLisp.AOT` | docs compile to real libraries |
-| source → call-graph facts, `impact` | `priv/codebase.bl` | reactive re-run scope (Pluto's half) |
-| clojure.test port, ETS registry | `priv/test.bl` | deftest cells run in CI |
+| source → call-graph facts, `impact` | `priv/std/codebase.bl` | reactive re-run scope (Pluto's half) |
+| clojure.test port, ETS registry | `priv/std/test.bl` | deftest cells run in CI |
 | isolated coherent forks | `reload.ward` | `bl doc run` isolation |
-| env-conveying spawn | `priv/system/core.bl` | cell processes inherit session world |
-| capability capture / sandbox tiers | `priv/env.bl`, `docs/trust-boundary.md` | untrusted docs, capped cells |
-| design tokens + components | `priv/loom/` | the notebook chrome, themed |
+| env-conveying spawn | `priv/lib/system/core.bl` | cell processes inherit session world |
+| capability capture / sandbox tiers | `priv/std/env.bl`, `docs/trust-boundary.md` | untrusted docs, capped cells |
+| design tokens + components | `priv/lib/loom/` | the notebook chrome, themed |
 | live catalog over code facts | `tooling/catalog.bl`, `docs/explorer.md` | the precedent: docs as queries |
 
 ## 5. What is missing (the honest gap list)
@@ -259,7 +259,7 @@ git-native, so this is a requirement, not a nicety.
 | G4 | no print capture (no `with-out-str`) | `env/capture` is env-conveyance, not IO | W2 |
 | G5 | cell edits must recompose ns source before staging | reload stages whole-ns strings (by design) | W3 |
 | G6 | no result-viewer registry (hiccup passthrough first, registry later) | — | W5 |
-| G7 | no `bl live` / `bl doc` commands | `priv/bl/cli.bl` command map | W2, W5 |
+| G7 | no `bl live` / `bl doc` commands | `priv/std/bl/cli.bl` command map | W2, W5 |
 | G8 | no md→hiccup / org-subset→hiccup prose renderer | — | W4 (build) |
 | G9 | output truncation policy for huge results | `print_str` is unbounded | W2 |
 | G10 | re-run-on-edit wiring (the `impact` query exists; the behavior doesn't) | `codebase.bl` | W6 |
@@ -268,7 +268,7 @@ git-native, so this is a requirement, not a nicety.
 
 ## 6. The waves (each shippable alone, in order)
 
-**W1 — the format and the covenant.** `priv/bl/doc.bl`: `slice-doc`,
+**W1 — the format and the covenant.** `priv/std/bl/doc.bl`: `slice-doc`,
 `render-doc`, both dialects; ID minting; the fixed-point property as tests
 (`parse∘render = id`; `run` touches only owned spans). Zero runtime
 integration — this wave cannot break anything, which is why it goes first.

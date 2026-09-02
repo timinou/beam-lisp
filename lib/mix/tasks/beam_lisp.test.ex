@@ -2,7 +2,7 @@ defmodule Mix.Tasks.BeamLisp.Test do
   @moduledoc """
   Run beam-lisp's self-hosted test suite: `mix beam_lisp.test [PATH]`.
 
-  Loads the prelude and the `priv/test.bl` library, then every
+  Loads the prelude and the `priv/std/test.bl` library, then every
   `test/**/*.bl` (or the given path), runs the registered tests via
   `BeamLisp.TestRT.run_suite/1`, prints the clojure.test-shaped
   summary, and exits non-zero when anything failed.

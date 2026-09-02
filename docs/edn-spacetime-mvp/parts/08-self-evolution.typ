@@ -20,7 +20,7 @@ different levels.
 
 == Where optics and Specter fit
 
-#module("optics (`priv/optics.bl`)", "VALUE TRANSFORMS",
+#module("optics (`priv/std/optics.bl`)", "VALUE TRANSFORMS",
   owns: [composable paths (`in`, `idx`, `traversed`, `filtered`, `optional`)
          and focused rewrites (`view`, `over`, `setv`)],
   disowns: [selection predicates, short-circuiting])[
@@ -42,7 +42,7 @@ different levels.
              session)
 ```)
 
-#module("specter (`priv/specter/`)", "TERM SURGERY",
+#module("specter (`priv/std/specter/`)", "TERM SURGERY",
   owns: [`ALL`, `keypath*`, `must*`, `pred*`, `srange*`; select /
          select-first / transform / setval over nested EDN terms],
   disowns: [code installation])[

@@ -22,10 +22,10 @@ the retrofit broke nothing. Where the first document argued, this one accounts.
     model, generalized.
   - `priv/model.bl` — the transition extractor: five surface forms lower to one
     graph, plus the naming trichotomy (binding · annotation · content-hash).
-  - `priv/system.bl` — the guarantee engine: inductive safety, abduction,
+  - `priv/lib/system.bl` — the guarantee engine: inductive safety, abduction,
     deadlock, liveness, refinement, sandbox — each a function of a transition
     model plus the bundled z3.
-  - `priv/effects.bl` — retrofitted onto `footprint`, so the codebase now has
+  - `priv/std/effects.bl` — retrofitted onto `footprint`, so the codebase now has
     #emph[one] effect model, not two.
 ]
 
@@ -46,7 +46,7 @@ whole thesis made concrete — you point these at ordinary code.
 (fp/commute? a b) (fp/frame-independent? a b)
 (fp/rung fp)                       ; → :pure | :atom | :process | :io  (the old ladder)
 
-;; guarantees (priv/system.bl)
+;; guarantees (priv/lib/system.bl)
 (sys/prove-box port inv svar decls init transitions)   ; □Inv, unbounded (z3)
 (sys/abduce port inv svar decls guard next domain)      ; auto-strengthen
 (sys/all-senders-guarantee? db q-fn label pred)         ; the sender discharge
@@ -96,7 +96,7 @@ What those forty assertions pin down, by guarantee:
 = The regression: the retrofit broke nothing
 
 The riskiest move was folding `effects.bl` onto `footprint` — `effects` has a
-live consumer (`priv/live.bl`, MVP-F). It is byte-identical after the retrofit,
+live consumer (`priv/lib/live.bl`, MVP-F). It is byte-identical after the retrofit,
 and the whole non-auth suite stays green.
 
 #ran("BeamLisp.TestRT.cli(non-auth test/bl/**/*.bl)")[
@@ -124,7 +124,7 @@ and the whole non-auth suite stays green.
 
 = The measured numbers
 
-Warm, on the bundled z3 (`priv/z3/bin/z3`, 4.16.0), via the direct harness.
+Warm, on the bundled z3 (`priv/lib/z3/bin/z3`, 4.16.0), via the direct harness.
 
 #table(
   columns: (1fr, auto),
@@ -200,7 +200,7 @@ Two rough edges the prototype README flagged, now fixed in the shipped modules:
 
 The graduation above left the tier as libraries you hand-fed: every test wrote
 the transition maps and the SMT strings by hand. P17 closes that seam. The
-modules are now one package (`priv/system/`, namespace `system.*`), and one
+modules are now one package (`priv/lib/system/`, namespace `system.*`), and one
 function does the whole job.
 
 #idea(title: "Annotate a server, it gets verified")[
@@ -262,7 +262,7 @@ query — the model as a queryable view, not a bespoke search.
 
 = Where it stands
 
-The system-model tier is graduated and integrated: one package (`priv/system/`,
+The system-model tier is graduated and integrated: one package (`priv/lib/system/`,
 five modules under `system.*`), 65 test assertions green across model, guarantee
 engine, and seam, ten runnable demos, one unified effect model, a
 point-and-verify checker that reads `^{:invariant}` off an ordinary server, and

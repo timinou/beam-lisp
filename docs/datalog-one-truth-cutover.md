@@ -12,7 +12,7 @@ A *source of truth* is a place that **decides** something — such that two plac
 deciding the same thing can drift. A Datalog fixpoint decides five things:
 **unify · novelty · termination · the semi-naïve delta · what a value is.**
 
-Before this work those five lived in *two* places: `priv/datom/query/rules.bl`
+Before this work those five lived in *two* places: `priv/lib/datom/query/rules.bl`
 (the bl `derive-*` loops) **and** `native/datom_datalog/src/eval.rs`. Two
 drivers, checkable only by a benchmark on the inputs you happen to try — a
 latent divergence, not an asset. "The native one isn't wired into `q`" did not
@@ -38,7 +38,7 @@ responsibilities do not overlap — that is what makes it one truth.
   evaluator: `ir.rs` gained `BodyItem::Computed` + `Op` (saturating
   `+ - * min max` and the six comparisons), so arithmetic-in-recursion
   (shortest path) runs natively. `eval.rs` walks `BodyItem`s.
-- `priv/datom/query/fixpoint.bl` — **`materialise`**, a drop-in for
+- `priv/lib/datom/query/fixpoint.bl` — **`materialise`**, a drop-in for
   `rules/materialise` (same signature, same `{name tuple-set}` output). It:
   1. evaluates each pattern/plain clause with bl's engine → **base relations**;
   2. translates rules → native IR (atoms + computed items);
@@ -109,13 +109,13 @@ not eat the win — the speedup *grows* with depth. Native speed with one truth.
 ## The cutover (executed)
 
 The entire production wiring of recursive rules was a **single expression**:
-`priv/datom/query/engine.bl`, where `q` builds `rules-rel` by calling
+`priv/lib/datom/query/engine.bl`, where `q` builds `rules-rel` by calling
 `datom.query.rules/materialise`. The cutover made **that one function** the
 dispatch point — so `q` changed **not at all** and now runs native for free.
 
 ### Step 1 — `materialise` became the dispatcher ✅ DONE
 
-`priv/datom/query/rules.bl`, the one seam:
+`priv/lib/datom/query/rules.bl`, the one seam:
 
 ```clojure
 (defn materialise [db rules eval-plain]

@@ -1037,17 +1037,29 @@ defmodule BeamLisp.AOT do
         false
 
       {beam_hash, beam_key} ->
-        # The live tier-2 closure hash: this ns plus its transitive `:require`
-        # closure. `nil` when no source resolves (packaged release) — trust the
-        # beam. Must be computed the SAME way emit stamped it (`ns_closure_hash/1`
-        # in both), so a fresh beam compares equal and is not needlessly rejected.
-        src_hash = ns_closure_hash(ns)
-
         cond do
-          is_nil(src_hash) -> false
-          beam_hash == src_hash and beam_key == BeamLisp.AOTCache.compiler_key() -> false
-          strict_aot?() -> raise stale_beam_error(ns, mod, beam_hash, src_hash)
-          true -> true
+          # A BOOT-tier namespace's freshness IS the toolchain key: every file
+          # under `priv/boot/` hashes into `compiler_key/0`, so a key match
+          # means the source it was built from is byte-for-byte the source on
+          # disk. No closure hash to compute — and none MAY be computed here:
+          # the closure hash is answered by `source-graph`, itself a boot
+          # namespace, so asking would recurse into the load this gate vets.
+          ns in BeamLisp.Tiers.boot_namespaces() ->
+            beam_key != BeamLisp.AOTCache.compiler_key()
+
+          true ->
+            # The live tier-2 closure hash: this ns plus its transitive
+            # `:require` closure. `nil` when no source resolves (packaged
+            # release) — trust the beam. Computed the SAME way emit stamped it
+            # (`ns_closure_hash/1` in both), so a fresh beam compares equal.
+            src_hash = ns_closure_hash(ns)
+
+            cond do
+              is_nil(src_hash) -> false
+              beam_hash == src_hash and beam_key == BeamLisp.AOTCache.compiler_key() -> false
+              strict_aot?() -> raise stale_beam_error(ns, mod, beam_hash, src_hash)
+              true -> true
+            end
         end
     end
   end

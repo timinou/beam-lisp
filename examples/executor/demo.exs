@@ -5,7 +5,7 @@
 #
 # It sets up a throwaway SSH keypair, enrolls two demo users in the datom
 # `executor.store`, mints them Biscuit exec-tokens with DIFFERENT capabilities,
-# and starts the pure-beam-lisp SSH executor (priv/executor/ssh.bl). You then
+# and starts the pure-beam-lisp SSH executor (priv/std/executor/ssh.bl). You then
 # ssh in and get a capped `bl>` REPL — caps enforced at compile time, memory and
 # disk bounded per the policy.
 #

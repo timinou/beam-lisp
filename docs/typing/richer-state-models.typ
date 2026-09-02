@@ -28,7 +28,7 @@ claims with runnable spikes, and lists what to build.
 
 = What "state" is today, exactly
 
-Read `priv/system/core.bl`. `verify-process` collects the state variables an
+Read `priv/lib/system/core.bl`. `verify-process` collects the state variables an
 invariant mentions, and then:
 
 ```clojure
@@ -36,7 +36,7 @@ svars (state-vars inv-node clauses)
 svar  (if (empty? svars) nil (first (into [] svars)))   ; ← takes the FIRST
 ```
 
-And `priv/system/smt.bl` states its own ceiling honestly:
+And `priv/lib/system/smt.bl` states its own ceiling honestly:
 
 #verified[
   "State vars are modelled as SMT integers — the common case for process state

@@ -360,7 +360,7 @@ defmodule BeamLisp.Loader do
   This is the loader's MINIMAL read-side extractor — it must stay
   dependency-free because it runs below the var registry, mid-load. The
   full-fidelity twin (ids, result spans, round-tripping) is `bl.doc` in
-  priv/bl/doc.bl, and the test suite pins the two equal on every fixture.
+  priv/std/bl/doc.bl, and the test suite pins the two equal on every fixture.
   """
   def doc_source(raw, format) when format in [:md, :org] do
     raw
@@ -477,7 +477,7 @@ defmodule BeamLisp.Loader do
   # library, and ABOVE priv so an app can override a shipped library it
   # deliberately replaces.
   defp search_dirs do
-    Env.load_paths() ++ ambient_dirs() ++ [Application.app_dir(:beam_lisp, "priv")]
+    Env.load_paths() ++ ambient_dirs() ++ BeamLisp.Tiers.dirs()
   end
 
   # The ambient segment of `search_dirs/0`: the CALLER's captured roots

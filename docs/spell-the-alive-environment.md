@@ -17,13 +17,13 @@ hand-written `mix beam_lisp.run` invocation:
 
 | organ | lives at | proves |
 |---|---|---|
-| code as facts | `priv/codebase.bl` | source → datom → impact/reachability queries |
+| code as facts | `priv/std/codebase.bl` | source → datom → impact/reachability queries |
 | self-building catalog | `tooling/catalog.bl` | `^:catalog` metadata; doc = demo = same form |
 | explorer | `docs/explorer.md` | library × examples join; coverage as gap query |
-| live views | `priv/live/`, `examples/live/` | view = pure fn db→hiccup; convergence through the log |
-| edit-as-transaction | `priv/reload.bl`, `priv/reload/`, `examples/reload/` | bundles held/coherent; quiesce; reroute |
-| ward | `priv/reload/ward.bl` | isolated per-file env forks; coherence gate; always-latest |
-| guarantee engine | `priv/system/`, `examples/system/` | inductive safety, repair, deadlock, liveness, refinement |
+| live views | `priv/lib/live/`, `examples/live/` | view = pure fn db→hiccup; convergence through the log |
+| edit-as-transaction | `priv/std/reload.bl`, `priv/std/reload/`, `examples/reload/` | bundles held/coherent; quiesce; reroute |
+| ward | `priv/std/reload/ward.bl` | isolated per-file env forks; coherence gate; always-latest |
+| guarantee engine | `priv/lib/system/`, `examples/system/` | inductive safety, repair, deadlock, liveness, refinement |
 | the fundamental form | `docs/the-fundamental-form.md` | process = transition relation; seven forms = one shape |
 | aliveness observatory | `tooling/vitals.bl` | processes as tiles; supervision tree; kill → heal |
 
@@ -39,7 +39,7 @@ EVALUATES each file (defns become live) and READS each (line + source become
 facts). Spell's boot is that, generalized:
 
 ```clojure
-(spell/boot {:roots ["priv/core.bl" "priv" "."]})
+(spell/boot {:roots ["priv/boot/core.bl" "priv" "."]})
 ;; → namespaces loaded through reload's coherent path (not raw eval)
 ;; → codebase facts indexed
 ;; → catalog, vitals, notebook, chat served over web/serve + live.socket
@@ -207,7 +207,7 @@ src/…/main.bl`, ward suites via `.local/bltest`. The existing
 its interface↔spell compile-time bridge and generated LiveView are the
 encumbrance to leave behind. Live UI comes from `priv/live` + `web/serve`
 (same seam catalog and vitals already use). Durability comes from
-`datom.store-fjall` (already required by `priv/codebase.bl:27`) — no redb, no
+`datom.store-fjall` (already required by `priv/std/codebase.bl:27`) — no redb, no
 Phoenix.
 
 ### R10 — The MVP cut
@@ -274,7 +274,7 @@ that lands after the notebook view exists (it is W5's prerequisite).
    umbrella archived as the experiment it was. The name `spell` is worth
    keeping; the directory history is not.
 2. **stdlib scope at boot.** Recommendation: explicit manifest in the app
-   (`spell/boot` takes roots), defaulting to `priv/core.bl` + the stdlib set
+   (`spell/boot` takes roots), defaulting to `priv/boot/core.bl` + the stdlib set
    the catalog indexes + `.`. "Load all of priv" is convenient but drags z3
    and friends into every boot; make the default tasteful, not maximal.
 3. **MCP face timing.** The agent-native story wants MCP early, but the MVP

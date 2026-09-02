@@ -8,7 +8,7 @@ rules `recur` depends on?
 **Verdict: yes.** 17/17 forms compile AST-equal to the oracle; all three
 `recur` misuse cases error exactly where the existing compiler does.
 
-## What was added to `priv/compiler.bl`
+## What was added to `priv/boot/compiler.bl`
 
 - **`if`** → Elixir's `if` tree; the test is not in tail position, the branches
   keep it (so a `recur` in a branch is still legal); a missing else is `nil`.

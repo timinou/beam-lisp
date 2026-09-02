@@ -100,7 +100,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         env_was_running? = Process.whereis(BeamLisp.Env) != nil
 
         # INSTALL THE BOOTSTRAP SEED before init. beam-lisp's compiler is
-        # self-hosted (priv/compiler.bl) with no Elixir genesis fallback, so
+        # self-hosted (priv/boot/compiler.bl) with no Elixir genesis fallback, so
         # `BeamLisp.init/0` → `enable_bl_backend/0` must find the compiler beam
         # already on the code path. On a fresh clone the build's ebin has no
         # such beam yet; the committed seed under priv/bootstrap/seed/ is copied
@@ -448,10 +448,14 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   # (the AOT cache keys on the transitive closure), or raises on a cycle.
   defp order_and_deps(sources) do
     # primary ns and require targets per source
+    # ONE parser: the graph's own `header/1` (priv/boot/source-graph.bl), the
+    # same read the runtime drift gate and the AOT stamp use. A second reading
+    # of what a `:require` is would be a second place for the build and the
+    # runtime to disagree about freshness.
     info =
       Enum.map(sources, fn path ->
-        forms = BeamLisp.Reader.read_all(File.read!(path))
-        {primary_ns(forms), requires(forms), path}
+        {ns, reqs} = BeamLisp.SourceGraph.header(File.read!(path))
+        {ns, reqs, path}
       end)
 
     # ns -> source path, for require targets that are among the sources
@@ -535,31 +539,4 @@ defmodule Mix.Tasks.Compile.BeamLisp do
         {sub ++ [path], {visited, stack}}
     end
   end
-
-  # The first `(ns name ...)` form names the source's namespace (nil if
-  # none — such a file lands in `user`).
-  defp primary_ns(forms) do
-    Enum.find_value(forms, nil, fn
-      {:list, [{:symbol, "ns"}, {:symbol, name} | _]} -> name
-      _ -> nil
-    end)
-  end
-
-  # Namespaces required via `(:require [other.ns ...])` / `other.ns`.
-  defp requires(forms) do
-    Enum.flat_map(forms, fn
-      {:list, [{:symbol, "ns"}, _name | clauses]} ->
-        Enum.flat_map(clauses, fn
-          {:list, [{:keyword, "require"} | specs]} -> Enum.map(specs, &require_target/1)
-          _ -> []
-        end)
-
-      _ ->
-        []
-    end)
-  end
-
-  defp require_target({:symbol, target}), do: target
-  defp require_target({:vector, [{:symbol, target} | _]}), do: target
-  defp require_target(_), do: nil
 end

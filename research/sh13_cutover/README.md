@@ -6,9 +6,9 @@ The mathematical heart of self-hosting: the `.bl` compiler compiles ITS OWN
 SOURCE to the same Elixir AST the existing compiler produces.
 
 ```
-priv/compiler.bl   self-compile OK: 133  FAIL: 0
-priv/reader.bl     self-compile OK: 37   FAIL: 0
-priv/reader-node.bl self-compile OK: 10  FAIL: 0
+priv/boot/compiler.bl   self-compile OK: 133  FAIL: 0
+priv/boot/reader.bl     self-compile OK: 37   FAIL: 0
+priv/boot/reader-node.bl self-compile OK: 10  FAIL: 0
 priv/self/oracle.bl self-compile OK: 16  FAIL: 0
 ```
 

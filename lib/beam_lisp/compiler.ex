@@ -128,7 +128,7 @@ defmodule BeamLisp.Compiler do
   # identically to today, just without line attribution.
   def compile(form, env) do
     # THE CUTOVER SEAM. beam-lisp's compiler is written in beam-lisp
-    # (priv/compiler.bl). Once that source is AOT-compiled into the
+    # (priv/boot/compiler.bl). Once that source is AOT-compiled into the
     # `BeamLisp.Ns.Compiler` module, THIS function delegates every form to it —
     # the language compiles itself. The Elixir `compile_elixir/2` below is the
     # GENESIS seed: the original hand-written lowering, kept for exactly two

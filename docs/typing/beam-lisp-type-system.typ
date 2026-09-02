@@ -320,7 +320,7 @@ P10 is the row that turns "works on demos" into "works on the repo":
 The first run reported 11 warnings; every one was a checker bug (a
 dispatch branch that let `ns` forms fall through to the walker, an
 under-wide `get` seed, higher-order seeds that refused keyword-callable
-arguments). All three were fixed at the root in `priv/typed.bl`, and
+arguments). All three were fixed at the root in `priv/std/typed.bl`, and
 the lesson is now a rule: *over-narrow seeds are false-positive
 factories* — when in doubt, unseeded.
 
@@ -344,7 +344,7 @@ z3 runs as an external process behind a port driver, wrapped as a
 native call — the same pattern as a NIF or `defnative`. The protocol
 lessons (one `(reset)` per query, line-scanned answers, paren-balanced
 model reads) are encoded once in `lib/beam_lisp/z3_port.ex` and
-`priv/z3.bl`.
+`priv/lib/z3.bl`.
 
 #number(
   "z3 4.16.0 via port driver, per query",
@@ -369,7 +369,7 @@ assumption derived, one broken rule caught).
 == miniKanren: relations and holes
 
 miniKanren (a relational/logic-programming kernel, self-hosted in
-`priv/minikanren.bl`) runs relations *backwards*: given a type and a
+`priv/lib/minikanren.bl`) runs relations *backwards*: given a type and a
 hole, synthesize what fits. Demo 04 types a term relation, leaves a
 hole in `((+ 1) _)`, and gets inhabitants: a numeral, a variable from
 the local context, a branch template. A string-shaped misfit gets none.
@@ -384,7 +384,7 @@ now a documented decision pattern.)
 
 == datom: the codebase as a database
 
-`priv/codebase.bl` indexes source into datom facts —
+`priv/std/codebase.bl` indexes source into datom facts —
 `:fn/name/ns/arity/line/ret-tag`, `:call/caller/callee/line` — and the
 query engine answers what grep cannot:
 
@@ -395,7 +395,7 @@ query engine answers what grep cannot:
 - *find-by-type* (invariant L10): "every function returning
   `#{:string}`" — completion by type, the editor feature.
 
-Indexing `priv/typed.bl` itself is the demo's second act: the type
+Indexing `priv/std/typed.bl` itself is the demo's second act: the type
 checker's own code, as data, answering questions about itself (MVP-B,
 demo 02).
 
@@ -460,7 +460,7 @@ Six capabilities borrowed from theorem provers, each demoed (P15):
 = Proven live queries
 
 datom's `watch` re-runs a query on every relevant commit and ships the
-`{:added :removed}` diff. MVP-F (`priv/live.bl`, demo 06) gates that
+`{:added :removed}` diff. MVP-F (`priv/lib/live.bl`, demo 06) gates that
 on *monotonicity*:
 
 #decision(because: [with `[:not …]`, a new datom can make an old answer
@@ -487,22 +487,22 @@ running demo:
 #table(
   columns: (auto, 1fr, auto),
   table.header([*MVP*], [*capability*], [*demo*]),
-  [A], [the checker: lattice, positions, evidence, hover (`priv/typed.bl`)], [`01_check_demo`],
-  [B], [the codebase as a database (`priv/codebase.bl`)], [`02_codebase_demo`],
-  [C], [solver-backed rule proofs (`priv/z3.bl` + `z3_port.ex`)], [`03_solver_demo`],
-  [D], [holes and synthesis (`priv/minikanren.bl`)], [`04_holes_demo`],
-  [E], [deodorant × types: promotion (`priv/promote.bl`)], [`05_promote_demo`],
-  [F], [proven live queries (`priv/live.bl` + `effects.bl`)], [`06_live_demo`],
+  [A], [the checker: lattice, positions, evidence, hover (`priv/std/typed.bl`)], [`01_check_demo`],
+  [B], [the codebase as a database (`priv/std/codebase.bl`)], [`02_codebase_demo`],
+  [C], [solver-backed rule proofs (`priv/lib/z3.bl` + `z3_port.ex`)], [`03_solver_demo`],
+  [D], [holes and synthesis (`priv/lib/minikanren.bl`)], [`04_holes_demo`],
+  [E], [deodorant × types: promotion (`priv/std/promote.bl`)], [`05_promote_demo`],
+  [F], [proven live queries (`priv/lib/live.bl` + `effects.bl`)], [`06_live_demo`],
 )
 
-plus `priv/errors.bl` (§10), `priv/deferred.bl`, `priv/termination.bl`.
+plus `priv/std/errors.bl` (§10), `priv/std/deferred.bl`, `priv/std/termination.bl`.
 The full regression is 663 language tests, 0 failures, with every demo
 in this document passing in the same process.
 
 = Errors: the five archetypes, one rendering
 
 Every warning — from any layer — renders identically (P11,
-`priv/errors.bl`): file:line:col, the user's own line, a caret under
+`priv/std/errors.bl`): file:line:col, the user's own line, a caret under
 the offending form, delaborated types. Widths use the token boundary
 because ends are not tracked; that approximation is documented in the
 code, not hidden.
@@ -645,10 +645,10 @@ z3-as-native ever fails operationally, the port boundary is where a
 replacement slots in — the call sites know SMT-LIB, not z3.
 
 *Optics.* Specter (Marz) for the navigator algebra; the van Laarhoven
-formulation (Pickering, Gibbons, Wu) for `priv/optics.bl`. P12's split
+formulation (Pickering, Gibbons, Wu) for `priv/std/optics.bl`. P12's split
 verdict — optics own shape, walkers own flow — is this phase's own
 measurement.
 
-*Datalog.* datom's query engine (this repo, `priv/datom/query/`) —
+*Datalog.* datom's query engine (this repo, `priv/lib/datom/query/`) —
 the codebase-as-database MVP stands on it, and monotonicity (§9) is
 datalog's foundational theorem applied to live queries.

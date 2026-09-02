@@ -17,8 +17,8 @@ defmodule BeamLisp.AOTCache do
       Elixir and OTP versions, the contents of the codegen modules' beams
       (AOT/Emit/Link/Ns/Reader/AtomGuard/Native — NOT the Compiler
       orchestration module, whose bytes no longer affect emitted code) and
-      the `@toolchain_seeds` source CLOSURE (the self-hosted compiler, the
-      reader providers, and the ambient `core`/`sugar` prelude — not the whole
+      every source in `priv/boot/` (the self-hosted compiler, the reader
+      providers, and the ambient `core`/`sugar` prelude — not the whole
       `priv/**/*.bl`). A change to a tier-1 source invalidates every beam; a
       change to any OTHER source moves only its own per-namespace key
       (`BeamLisp.AOT.ns_closure_hash/1`) and its dependents'. Memoized in
@@ -47,7 +47,7 @@ defmodule BeamLisp.AOTCache do
 
   # The host modules whose bytes can change EMITTED code. `BeamLisp.Compiler` is
   # deliberately ABSENT: the lowering now lives entirely in the self-hosted
-  # `priv/compiler.bl` (hashed below via the `priv/**/*.bl` prelude), so the
+  # `priv/boot/compiler.bl` (hashed below via the `priv/**/*.bl` prelude), so the
   # Elixir `BeamLisp.Compiler` is pure orchestration — the thin `compile/2`
   # delegator, `eval_form`, `new_env`, reader interop — that does not affect a
   # single emitted byte. Hashing it would make the seed's provenance depend on
@@ -59,22 +59,21 @@ defmodule BeamLisp.AOTCache do
   # Memoization slot for the toolchain key (a VM constant in normal use).
   @toolchain_key_pt {__MODULE__, :toolchain_key}
 
-  # TIER-1 seeds: namespaces whose transitive `:require` closure forms the
-  # "toolchain" — a change to any of them can alter EVERY emitted byte, so they
-  # hash into `compiler_key/0` (invalidate all) rather than a per-namespace
-  # closure. The set and WHY each is here:
+  # TIER-1 = `priv/boot/` (see BeamLisp.Tiers). Everything there can alter
+  # EVERY emitted byte, so it hashes into `compiler_key/0` (invalidate all)
+  # rather than a per-namespace closure. WHY each file is in the tier:
   #   compiler      — the self-hosted compiler; runs at compile time for every ns
   #   reader-node   — the compiler's reader dependency (compiler requires it)
+  #   reader        — the self-hosted reader every later read goes through
   #   core, sugar   — ambient: referred into every ns for unqualified name
   #                    resolution (BeamLisp.Env fetch fallback), so any ns can
   #                    depend on them WITHOUT an explicit `:require` edge
   #   data-readers  — seeds the tagged-literal (`#tag …`) registry consulted by
   #                    the reader at READ time, again with no `:require` edge
   # These implicit (edge-less) dependencies are exactly why per-namespace
-  # closure hashing cannot see them — hashing them globally here is what keeps
-  # the fine-grained tier sound.
-  @toolchain_seeds ["compiler", "reader-node", "core", "sugar", "data-readers"]
-
+  # closure hashing cannot see them — hashing the tier globally is what keeps
+  # the fine-grained tier sound. Moving a file INTO boot/ is how a namespace
+  # becomes ambient; nothing else needs to change.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
@@ -157,7 +156,7 @@ defmodule BeamLisp.AOTCache do
       end)
 
     # TIER-1 sources: the self-hosted compiler, the reader providers, and the
-    # ambient prelude — the closure of @toolchain_seeds. A change to ANY of
+    # ambient prelude — the whole `priv/boot/` tier. A change to ANY of
     # these can alter every emitted byte (they run at compile time for every
     # namespace, or provide the reader/tagged-literal machinery, or are referred
     # into every ns via `core`/`sugar` name resolution), so they invalidate ALL
@@ -171,53 +170,19 @@ defmodule BeamLisp.AOTCache do
     hash_parts(parts ++ beams ++ toolchain_sources)
   end
 
-  # Content of every tier-1 source, sorted by namespace name for determinism.
-  # A seed that cannot be resolved contributes nothing (degrade, never crash) —
-  # a missing compiler source surfaces as a compile error downstream, not here.
+  # Content of every tier-1 source: everything under `priv/boot/`, sorted by
+  # path for determinism. The boot tier is closed under `:require` (the
+  # compiler needs only `reader-node`; core/sugar/data-readers need nothing),
+  # so hashing the DIRECTORY is the closure — no header parse, no graph walk,
+  # nothing that could want the reader or Env this runs before. A missing boot
+  # dir contributes nothing (degrade, never crash) — the missing compiler then
+  # surfaces as a compile error downstream, not here.
   defp toolchain_source_contents do
-    case priv_bl_files() do
-      %{} = by_ns when map_size(by_ns) > 0 ->
-        reqs = fn ns ->
-          case by_ns[ns] do
-            {_path, content} -> elem(BeamLisp.SourceGraph.header(content), 1)
-            _ -> []
-          end
-        end
-
-        @toolchain_seeds
-        |> Enum.filter(&Map.has_key?(by_ns, &1))
-        |> Enum.reduce(MapSet.new(), fn seed, acc ->
-          BeamLisp.SourceGraph.closure(seed, reqs) |> MapSet.union(acc)
-        end)
-        |> Enum.sort()
-        |> Enum.map(fn ns -> elem(Map.fetch!(by_ns, ns), 1) end)
-
-      _ ->
-        []
-    end
-  end
-
-  # Map of declared-ns => {path, content} for every `priv/**/*.bl`, built with a
-  # pure header scan (no reader/Env; safe pre-init). Files with no `(ns …)` form
-  # are omitted — they compile into `user` and are never tier-1 seeds.
-  defp priv_bl_files do
-    case :code.priv_dir(:beam_lisp) do
-      dir when is_list(dir) ->
-        dir
-        |> Path.join("**/*.bl")
-        |> Path.wildcard()
-        |> Enum.reduce(%{}, fn path, acc ->
-          content = File.read!(path)
-
-          case BeamLisp.SourceGraph.header(content) do
-            {ns, _reqs} when is_binary(ns) -> Map.put_new(acc, ns, {path, content})
-            _ -> acc
-          end
-        end)
-
-      _ ->
-        %{}
-    end
+    BeamLisp.Tiers.boot_dir()
+    |> Path.join("**/*.bl")
+    |> Path.wildcard()
+    |> Enum.sort()
+    |> Enum.map(&File.read!/1)
   end
 
   @doc """

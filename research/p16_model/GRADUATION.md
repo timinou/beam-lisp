@@ -6,11 +6,11 @@
   bridges to effects.
 - `priv/model.bl` — transition extraction (5 forms → 1 graph) + naming
   trichotomy (binding / annotation / content-hash) + `system-model`.
-- `priv/system.bl` — the guarantee engine: prove-box · abduce ·
+- `priv/lib/system.bl` — the guarantee engine: prove-box · abduce ·
   all-senders-guarantee? · deadlocked · find-lasso + guarantee-catalog ·
   simulates? · migration-preserves? · footprint-in-caps? · spawn-footprint
   (refinement 2).
-- `priv/effects.bl` — retrofitted onto footprint (one effect model, not two);
+- `priv/std/effects.bl` — retrofitted onto footprint (one effect model, not two);
   output byte-identical to baseline; demo 06 still PASS.
 
 ## Tests (the assurances)
@@ -47,15 +47,15 @@ over search.
 
 # P17 — the checker seam (2026-08-29)
 
-The tier is now ONE package (`priv/system/`, ns `system.*`) and a point-and-verify
+The tier is now ONE package (`priv/lib/system/`, ns `system.*`) and a point-and-verify
 checker, not a set of libraries you hand-feed.
 
 ## Package
-- `priv/system/footprint.bl` → `system.footprint`
-- `priv/system/model.bl`     → `system.model`
-- `priv/system/smt.bl`       → `system.smt`   (source→SMT-LIB translator)
-- `priv/system/step.bl`      → `system.step`  (:~step as a defrelation)
-- `priv/system/core.bl`      → `system.core`  (guarantee engine + the seam)
+- `priv/lib/system/footprint.bl` → `system.footprint`
+- `priv/lib/system/model.bl`     → `system.model`
+- `priv/lib/system/smt.bl`       → `system.smt`   (source→SMT-LIB translator)
+- `priv/lib/system/step.bl`      → `system.step`  (:~step as a defrelation)
+- `priv/lib/system/core.bl`      → `system.core`  (guarantee engine + the seam)
 
 ## The seam
 - `(system/verify-process port node)` — annotate a defserver name with

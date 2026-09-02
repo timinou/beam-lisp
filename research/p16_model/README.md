@@ -169,7 +169,7 @@ Un-nameable resources (runtime pids, message contents) collapse to :opaque-world
 
 Graduation note: pure arithmetic (`+`, `count`) currently names an
 :opaque-world :R resource (harmless — still :R, purity holds); refine to name
-no resource at graduation. Retrofit into priv/effects.bl: keep rung = rank(fp)
+no resource at graduation. Retrofit into priv/std/effects.bl: keep rung = rank(fp)
 so nothing downstream regresses.
 
 Files: `footprint.bl` (fp-walk/rung/pure?/monotone?/commute?/frame-independent?),

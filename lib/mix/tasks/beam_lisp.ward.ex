@@ -41,7 +41,7 @@ defmodule Mix.Tasks.BeamLisp.Ward do
     # The test library into core, exactly as the stock bl runner does, so
     # `deftest`/`is`/`run-tests` resolve inside every fork via the core fallback.
     BeamLisp.Compiler.eval_string(
-      File.read!(Application.app_dir(:beam_lisp, "priv/test.bl")),
+      File.read!(Application.app_dir(:beam_lisp, "priv/std/test.bl")),
       BeamLisp.Compiler.new_env("core")
     )
 

@@ -16,7 +16,7 @@ The interesting question is the maximalist one:
 
 The answer names itself once you ask where it lives. beam-lisp already has
 a temporal module: `datom.time` — `as-of` / `since` / `history`, the
-bitemporal filters over the store (`priv/datom/time.bl`, "the database
+bitemporal filters over the store (`priv/lib/datom/time.bl`, "the database
 remembers"). That module owns **one** temporal axis: *transaction time* —
 when the database learned a fact. Tempo owns the **other**: *valid time* —
 when a fact is true in the world. They are not two libraries that happen to
@@ -53,7 +53,7 @@ at the finest resolution. Note too that `:db.type/time` here means *any*
 temporal value, not SQL's time-of-day — the per-resolution fragmentation
 (`DATE`/`TIME`/`TIMESTAMP`) is exactly what the one type abolishes.
 
-This is the choice `priv/datom/vector.bl` already made, and it made it
+This is the choice `priv/lib/datom/vector.bl` already made, and it made it
 against the exact temptation to avoid. An embedding *could* be a
 `:db.type/term` holding `[0.1 0.2 …]`; vector.bl refused, and gave it a
 value **type** and a packed shape, "for three reasons: storage, meaning,
@@ -138,7 +138,7 @@ Tempo's `~o"2026-06-15"` is a compile-time sigil that parses ISO 8601-2
 into a value. beam-lisp has the same shape with more reach:
 **data-readers**, the mechanism datom already uses for `#d[...]` queries. The
 tag→reader-fn mapping is beam-lisp source, not a hardcoded reader default: the
-built-ins live in one central registry (`priv/data-readers.bl`) that
+built-ins live in one central registry (`priv/boot/data-readers.bl`) that
 `BeamLisp.init/0` seeds at boot, alongside `#d` — the self-hosted analogue of
 Clojure's `data_readers.clj` (core has `(reader-macro! "@" (quote deref))` for
 the non-tag case).
@@ -146,7 +146,7 @@ the non-tag case).
 ```clojure
 ;; read time: #time"…" runs the ISO 8601-2 / EDTF / IXDTF grammar → a
 ;; valid-time value literal. one repr: it reads straight into a datom.
-;; registered centrally in priv/data-readers.bl, seeded at boot:
+;; registered centrally in priv/boot/data-readers.bl, seeded at boot:
 (data-reader! "time" (quote datom.time/read-iso8601))
 
 #time"2026-06-15"                          ; a day  — [2026-06-15, 2026-06-16)
@@ -264,7 +264,7 @@ carried through the join because that is what joins do.
 ```
 
 **Reads are optics.** For the pointwise rewrites — clip every interval to
-work hours, bump every busy span — `priv/optics.bl` does the thing
+work hours, bump every busy span — `priv/std/optics.bl` does the thing
 `update-in` cannot spell (`examples/optics.bl`): rewrite *every* slot at
 once.
 
@@ -292,7 +292,7 @@ cannot honestly be a boolean. beam-lisp ships two engines for exactly
 **Masks and one-of sets → miniKanren.** A masked year `156X` is not a
 value, it is a *relation*: `exists d in 0..9. year = 1560 + d`. Enumerating
 it (`Enum.take(~o"156X", 5)`) is running that relation forward.
-`priv/minikanren.bl` is precisely a relational enumerator over constrained
+`priv/lib/minikanren.bl` is precisely a relational enumerator over constrained
 logic variables. "The 15th of every month in 1985" (`1985-XX-15`, tempo's
 12-member set) is a fresh variable over months with the day pinned.
 
@@ -313,7 +313,7 @@ dated `1984?/2004~`, overlap the reign dated `199X`?" is a
 | `impossible` (no) | `unsat` of overlap — no model joins them |
 | `possible` (maybe) | both `sat` — a model each way |
 
-That is `z3/prove-equiv`'s exact shape (`priv/z3.bl`: "unsat = PROVEN for
+That is `z3/prove-equiv`'s exact shape (`priv/lib/z3.bl`: "unsat = PROVEN for
 all inputs; sat = counterexample"), lifted from rewrite-soundness to
 temporal overlap. The z3 header even states the division of labour:
 "the tag lattice owns structure, miniKanren owns relations, z3 owns
@@ -332,7 +332,7 @@ they'd miss" is strictly richer than "possible."
 Tempo's `explain/1` returns a structured explanation with semantic part
 tags (`:headline`, `:span`, `:qualification`, `:metadata`) rendering to
 text / ANSI / HTML. Not a nicety bolted on — the same instinct that runs
-through beam-lisp's error and typing story (`priv/errors.bl` "the SOURCE
+through beam-lisp's error and typing story (`priv/std/errors.bl` "the SOURCE
 the user wrote", the hover evidence table, the ChronoLog "plain-English
 trace for every bound").
 
@@ -435,7 +435,7 @@ is a lazy generator — infinite by default, `take`/`take-while`-bounded,
 never materialised until a set operation forces it. The "shared AST for
 ISO 8601 and RRULE" tempo documents is, here, one reader grammar feeding
 two interpreters: `#time` for a literal, a lazy unfold for a rule. And the
-bound is not a hope — `priv/termination.bl` **proves** the
+bound is not a hope — `priv/std/termination.bl` **proves** the
 `take-while (before? …)` finite, because a shrinking measure toward a
 `:time/to` is exactly its accepted shrink shape.
 
@@ -445,11 +445,11 @@ bound is not a hope — `priv/termination.bl` **proves** the
      (into []))
 ```
 
-**A schedule is a live value.** `priv/live.bl` and the datom watch layer
+**A schedule is a live value.** `priv/lib/live.bl` and the datom watch layer
 (`examples/datom/live/`) mean a free-busy calendar is not a snapshot you
 recompute — it is a **live** datom view. Add a meeting (a transaction) and
 every downstream query — free slots, critical path, the rendered
-availability grid (`priv/live/hiccup.bl`) — updates by the broadcast
+availability grid (`priv/lib/live/hiccup.bl`) — updates by the broadcast
 substrate, not a poll. Tempo *computes* availability; beam-lisp *serves*
 it, live, because "the runtime is the application." That is the half of the
 thesis an Elixir library sits outside of.
@@ -459,7 +459,7 @@ thesis an Elixir library sits outside of.
 ## 9. The synergies one repr unlocks — the verification tier
 
 Because an interval is a store entity and a process lowers to transition
-clauses over the store (`priv/system/model.bl`), `datom.time` does not just
+clauses over the store (`priv/lib/system/model.bl`), `datom.time` does not just
 *answer questions about dates* — it makes time a term the **verification
 engine** can quantify over. This is the tier tempo structurally cannot
 reach, and it falls out of the single representation:
@@ -501,14 +501,14 @@ engine), or *new* (genuinely to-build).
 | ChronoLog network | fixpoint ∪ z3 ∪ miniKanren, same db (§7) | **native** — three strategies, no new structure |
 | critical-path schedule | recursive rules + `fixpoint_bench` (§7) | **native** — longest-path over closure |
 | RRULE recurrence | lazy unfold + `termination` proof (§8) | **native** — infinite, provably bounded |
-| live free-busy | `priv/live.bl` + datom watch (§8) | **new-and-beyond** — tempo has no runtime |
+| live free-busy | `priv/lib/live.bl` + datom watch (§8) | **new-and-beyond** — tempo has no runtime |
 | real-time model checking | `system.*` + `:time/span` (§9) | **new-and-beyond** — a theorem, not a check |
 | grounded/floating safety | `effects` lattice (§9) | **native** — a build error, not a doc note |
 | the ISO grammar itself | to-build: the 8601-2 / EDTF / IXDTF reader | **new** — the one real port cost |
 
 Read the right column top to bottom and the shape is stark: **one row is
 genuinely new** — the ISO 8601-2 grammar, and even that is "a hand-rolled
-reader over delimited fields," the exact phrase `priv/auth/biscuit/codec.bl`
+reader over delimited fields," the exact phrase `priv/lib/auth/biscuit/codec.bl`
 uses for work beam-lisp does routinely. Four rows are *identity* — tempo's
 hard-won invariant is already `datom.time`'s. Two are *beyond* tempo
 entirely. Everything else is *native*: not a reimplementation, a
@@ -527,8 +527,8 @@ second axis of `datom.time` was always missing; tempo is its name.
 
 The move the scorecard named — build the `#time` reader (the ISO 8601-2 /
 EDTF / IXDTF grammar), the single *new* thing — is now done: `read-iso8601`
-in `priv/datom/time.bl`, registered as `#time` in the central
-`priv/data-readers.bl` registry, exercised by the eight demos in
+in `priv/lib/datom/time.bl`, registered as `#time` in the central
+`priv/boot/data-readers.bl` registry, exercised by the eight demos in
 `examples/datom/time/` and `test/bl/datom/time_valid_test.bl`. Every other
 row falls out of the value it already is, measured cell by cell, a low score
 naming exactly what to build next, the way every compat document in this repo

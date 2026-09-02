@@ -1,6 +1,6 @@
 defmodule BeamLisp.ExecutorSSHBlTest do
   @moduledoc """
-  End-to-end for the MAXIMALIST bl SSH executor (priv/executor/ssh.bl): the whole
+  End-to-end for the MAXIMALIST bl SSH executor (priv/std/executor/ssh.bl): the whole
   daemon is beam-lisp; the only Elixir is the generic BeamLisp.SSHKeyCB shim.
 
   A real `ssh` client (openssh) authenticates by a store-enrolled public key and

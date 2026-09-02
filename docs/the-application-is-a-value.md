@@ -398,7 +398,7 @@ history includes the application itself.
 - `docs/spacetime-interface-as-value.typ` — the four serialisability levels
 - `docs/spacetime-lisp-machine.typ` — owners as processes, the evolution loop
 - `docs/building-an-app.md` — the practical guide to building on this
-- `priv/datom/schema.bl` — `:db.type/term`, and why it is declared
-- `priv/datom/conn.bl` — the single writer, and why the basis is a high-water
+- `priv/lib/datom/schema.bl` — `:db.type/term`, and why it is declared
+- `priv/lib/datom/conn.bl` — the single writer, and why the basis is a high-water
   mark
 - `spell/src/spell/server.bl` — the closed vocabulary, and `topic`'s rationale

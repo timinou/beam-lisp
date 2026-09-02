@@ -46,7 +46,7 @@ Every remaining `any` on seam.bl decomposes into:
 
 ## Artifacts
 
-- **Seed-table format** (in priv/typed.bl): the P1 map, extended —
+- **Seed-table format** (in priv/std/typed.bl): the P1 map, extended —
   `core-seeds-v2` (41 fns) + `host-seeds` (22 fns), every entry
   verified against the runtime before seeding (sound-conservative:
   doubtful ⇒ unseeded ⇒ any ⇒ silent).

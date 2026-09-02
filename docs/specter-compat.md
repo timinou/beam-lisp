@@ -1,7 +1,7 @@
 # Specter compatibility measurement
 
 **Thesis under test:** Specter is the settled north star for beam-lisp's
-optics story. beam-lisp ships its own `priv/optics.bl` — a
+optics story. beam-lisp ships its own `priv/std/optics.bl` — a
 van-Laarhoven-flavored lens/traversal library — but that is a beam-lisp
 design, not the thing users of Clojure reach for. Clojure's optics
 de-facto standard is *Specter*, and the question this document measures
@@ -294,7 +294,7 @@ by breaking something:
   jank macro nesting `when` or `let` — 8 fidelity slices at once. The
   vendored suite caught it immediately.
 - **The gap was never Specter-specific.** Any beam-lisp library shipping
-  a macro hit it; it is why `priv/optics.bl` and `priv/rewrite.bl` keep
+  a macro hit it; it is why `priv/std/optics.bl` and `priv/std/rewrite.bl` keep
   their helpers and macros in a single file. Measuring someone else's
   code found a bug in our own libraries' constraints.
 
@@ -490,7 +490,7 @@ Genuinely missing, and small: **`keyword`, `namespace`, `satisfies?`**, and
 A beam-lisp-native engine behind `select`/`transform`/`setval` would give a
 working Specter-shaped API and *barely move the measurement*, because **15 of
 the 31 fixtures call `i/` internals directly**. It would also buy something
-this project already ships: `priv/optics.bl` provides lenses and traversals
+this project already ships: `priv/std/optics.bl` provides lenses and traversals
 natively. Paying an engine's cost for an API we have, while the number stays
 put, is the worst of the three.
 
@@ -593,7 +593,7 @@ rather than choosing a spelling. Now variadic, as Clojure's is.
 Names referred into `specter.navs` are not referred on to its consumers. A
 protocol cannot be re-exported by `def` (it names a registry entry, not a
 var), and neither can a macro (binding the name captures what it evaluated
-to, not the expander). Both are now written down in `priv/specter/navs.bl`
+to, not the expander). Both are now written down in `priv/std/specter/navs.bl`
 where the next person will look.
 
 ### The four predictions FUP-001 made
@@ -623,7 +623,7 @@ Specter's cache is a var-interned mutable cell, and "global" on this host is
 either ETS or per-process, where choosing wrongly is a correctness bug rather
 than a slowdown. Nothing has yet forced the choice.
 
-`priv/optics.bl` remains the recommended native optics library. The engine is
+`priv/std/optics.bl` remains the recommended native optics library. The engine is
 a measurement instrument and a demonstration that the host can carry a hard
 macro-and-protocol-heavy design; it is not a replacement for optics that
 needed no compiler changes to exist.

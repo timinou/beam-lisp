@@ -242,7 +242,7 @@ technique that didn't pay off is reported as such rather than hidden.
 #v(0.2em)
 #text(size: 8.5pt, fill: g3)[
   All five prototypes live in the repository under `native/datom_datalog/`
-  (the Rust spike) and `priv/datom/query/` (`rules.bl`, `magic.bl`,
+  (the Rust spike) and `priv/lib/datom/query/` (`rules.bl`, `magic.bl`,
   `prem.bl`). Every number above comes from ONE reproducible harness —
   `bench/datalog_axes_bench.bl` — run as a single batch with a warmup, the
   median of five trials, and a correctness assertion on every row (a

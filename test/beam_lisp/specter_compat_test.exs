@@ -1,6 +1,6 @@
 defmodule BeamLisp.SpecterCompatTest do
   # The thesis: Specter is beam-lisp's north star for optics. beam-lisp
-  # ships its own optics in priv/optics.bl, but the settled question is
+  # ships its own optics in priv/std/optics.bl, but the settled question is
   # the honest one — how far is beam-lisp from running Clojure's Specter
   # as-is? Every fixture under test/fixtures/specter/ is a verbatim
   # block of the real Specter, copied with its sha256 in a header; the
@@ -349,7 +349,7 @@ defmodule BeamLisp.SpecterCompatTest do
     end
   end
   describe "verbatim slices running on beam-lisp's ported engine" do
-    # Wave 28 ported Specter's compiled-path engine (priv/specter/*.bl).
+    # Wave 28 ported Specter's compiled-path engine (priv/std/specter/*.bl).
     # These slices are the payoff and the proof: upstream's OWN code,
     # byte-for-byte, executing against our NONE, our doseqres and our
     # compiled-select-any*. A slice here is not "loads" — it computes a

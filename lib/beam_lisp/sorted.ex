@@ -25,7 +25,7 @@ defmodule BeamLisp.Sorted do
   `.bl` would be slower, buggier, and would duplicate OTP for no gain.
 
   The vocabulary ON TOP (`sorted-set`, `subseq`, comparator handling) lives
-  in `priv/core.bl`, where it belongs.
+  in `priv/boot/core.bl`, where it belongs.
 
   ## Ordering is Clojure's, not Erlang's
 

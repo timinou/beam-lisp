@@ -147,7 +147,7 @@ never inflates a number to look greener than the code is.
   every query, renders the live view.
 - `tooling/run-catalog.bl` — the entrypoint that indexes the default package and
   serves it.
-- `priv/live/lint.bl` — the static check for rendered lists missing a `:key`,
+- `priv/lib/live/lint.bl` — the static check for rendered lists missing a `:key`,
   which also runs once at start and prints any findings before serving.
 - `examples/loom/` — the galleries that demonstrate `loom`, and the model for how
   to write examples the explorer can read.

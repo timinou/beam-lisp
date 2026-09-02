@@ -11,7 +11,7 @@ the argument; read these for the shape.
 ## The one-sentence thesis
 
 beam-lisp already has a temporal module — `datom.time`, the `as-of` / `since`
-/ `history` filters over the store (`priv/datom/time.bl`, "the database
+/ `history` filters over the store (`priv/lib/datom/time.bl`, "the database
 remembers"). That module owns *transaction time*: **when the database learned
 a fact**. Tempo owns the other axis, *valid time*: **when a fact is true in
 the world**. They are not two libraries that share a word — they are the two
@@ -29,7 +29,7 @@ sturdy as any date the store already holds. `02` is the demo that proves it.
 These are runnable demos, not paper specs. The valid-time half of
 `datom.time` — the `:db.type/time` value type, the interval constructors and
 predicates, Allen's algebra, set operations, the `#time` reader, and the
-miniKanren / z3 bridges — is built in `priv/datom/time.bl`, validated by
+miniKanren / z3 bridges — is built in `priv/lib/datom/time.bl`, validated by
 `test/bl/datom/time_valid_test.bl` (7 tests, 39 assertions, 0 failures), and
 every file here executes end to end:
 

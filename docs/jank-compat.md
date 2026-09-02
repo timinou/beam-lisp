@@ -148,7 +148,7 @@ upstream span in `core.jank@3028594`.
 | 92 | keep-indexed | 3002–3037 | `keep-indexed` | ✓ | coll + *transducer 1-arity both behave* (wave 25) |
 | 93 | drop-last | 3112–3116 | `drop-last` | ✓ | *was ✗* — `(map f coll (drop n coll))` is a two-coll `map`; behaves when core.jank's own multi-coll `map` (slice 89) is co-loaded. beam-lisp's *native* `map` is still single-coll (a user-facing gap, tracked below) |
 | 94 | split-with | 3162–3166 | `split-with` | ✓ | needs the `juxt` slice co-loaded (core dep) |
-| 95 | interpose | 3183–3203 | `interpose` | ✓ | *was ✗* — the `interleave` lazy-infinite crash is fixed (core `interleave` is now the pure lazy `priv/core.bl` version, not `Enum.intersperse`); the 1-arity transducer (volatile!-based) also behaves. Needs the `interleave` slice co-loaded (core dep) |
+| 95 | interpose | 3183–3203 | `interpose` | ✓ | *was ✗* — the `interleave` lazy-infinite crash is fixed (core `interleave` is now the pure lazy `priv/boot/core.bl` version, not `Enum.intersperse`); the 1-arity transducer (volatile!-based) also behaves. Needs the `interleave` slice co-loaded (core dep) |
 | 96 | dorun | 3204–3216 | `dorun` | ✓ | `when-let` + top-level `recur` |
 | 97 | doall | 3217–3230 | `doall` | ✓ | needs the `dorun` slice co-loaded |
 | 98 | reductions | 3346–3361 | `reductions` | ✓ | *was ✗* — `reduced?` is now core |
@@ -281,7 +281,7 @@ are the honest test of the wave-24 gap list.
   which accepts the completing 1-arity.
 - **`interpose` was the prediction's cleanest win.** The `interleave` lazy-
   infinite crash is gone because core `interleave` is now the pure lazy
-  `priv/core.bl` self-hosted version, not `Enum.intersperse`. `interpose`
+  `priv/boot/core.bl` self-hosted version, not `Enum.intersperse`. `interpose`
   behaves on both its coll arity and its volatile!-based transducer arity.
 - **The prediction's miss: the "small core gaps" were not built.** The
   wave-24 list claimed `rem`, `float?`, `transientable?`, `reduce-kv`,

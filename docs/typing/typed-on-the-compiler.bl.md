@@ -1,6 +1,6 @@
 # Typing the compiler with the language's own checker
 
-The compiler is written in beam-lisp — `priv/compiler.bl` is a normal program of
+The compiler is written in beam-lisp — `priv/boot/compiler.bl` is a normal program of
 `defn`s. beam-lisp ships a type checker, `typed`, that reads beam-lisp source and
 points at shapes that cannot be right. So one program can read another: `typed`
 can read `compiler.bl`. That sentence sounds circular, but it is not — it is the

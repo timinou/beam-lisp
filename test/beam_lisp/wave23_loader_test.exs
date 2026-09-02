@@ -70,7 +70,7 @@ defmodule BeamLisp.Wave23LoaderTest do
 
     # Both files declare the requested ns; the higher-priority project
     # file owns it and wins, exactly as a user's optics.bl would shadow
-    # priv/optics.bl.
+    # priv/std/optics.bl.
     File.write!(Path.join(project, "w23ovr.bl"), """
     (ns w23ovr)
     (def origin :project)
@@ -90,7 +90,7 @@ defmodule BeamLisp.Wave23LoaderTest do
   end
 
   test "a priv/ library loads when nothing on the load path shadows it" do
-    # An empty high-priority dir leaves the real priv/rewrite.bl as the
+    # An empty high-priority dir leaves the real priv/std/rewrite.bl as the
     # only provider.
     dir = tmpdir("priv")
     with_load_dirs([dir], fn ->
@@ -112,7 +112,7 @@ defmodule BeamLisp.Wave23LoaderTest do
 
     with_load_dirs([dir], fn ->
       eval("(ns w23.privskipapp (:require [optics]))")
-      # The real priv/optics.bl won the require past the decoy.
+      # The real priv/std/optics.bl won the require past the decoy.
       assert eval("(optics/view (optics/in :a) {:a 42})") == 42
       refute Env.loaded_ns?("optics.different")
     end)

@@ -937,6 +937,6 @@ application is testable before any of it is wired.
 - `spell/src/spell/server.bl` — the closed vocabulary, in one file
 - `lib/beam_lisp/spell/server.ex` — where authority lives (performers,
   readers, the atom-table boundary)
-- `priv/datom.bl` — `q`, `pull`, `as-of`, `since`, `history`, `changes`
+- `priv/lib/datom.bl` — `q`, `pull`, `as-of`, `since`, `history`, `changes`
 - `!tasks/features/FEAT-016-*` — why a write should broadcast the *moment*
   rather than the board, and what that unlocks

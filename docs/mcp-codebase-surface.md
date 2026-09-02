@@ -6,7 +6,7 @@ Run: `mix beam_lisp.run --path tooling tooling/run-mcp-demo.bl`
 
 > One claim, tested: the three-tool MCP shape proven against a *law* library in
 > `spell/apps/mcp` is not domain-specific. Repointed at beam-lisp's own
-> code-as-facts engine (`priv/codebase.bl`), the *same* protocol core, the
+> code-as-facts engine (`priv/std/codebase.bl`), the *same* protocol core, the
 > *same* MRTR elicitation, and the *same* registry answer coding questions —
 > only the fact space changed. Then two tools no external indexer can offer —
 > `code/verify` (the z3 prover) and `code/subscribe` (datom L3 watch) — are
@@ -48,7 +48,7 @@ Three independent lines of work in the field converged on one conclusion:
   them on a deterministic engine; more accurate localization at lower token cost,
   because structural traversal is offloaded off the model.
 
-beam-lisp already *is* the substrate all three reach for: `priv/codebase.bl`
+beam-lisp already *is* the substrate all three reach for: `priv/std/codebase.bl`
 turns source into facts —
 
 ```
@@ -106,7 +106,7 @@ answer. Identical protocol path, different question. (`demo.bl` exchanges 5→6.
 ## 3. What the prototype proves (verified, not asserted)
 
 `demo.bl` runs **eleven** exchanges against beam-lisp indexing **itself**
-(`priv/codebase.bl` + `priv/typed.bl` → 80 fns, 745 call facts, one basis):
+(`priv/std/codebase.bl` + `priv/std/typed.bl` → 80 fns, 745 call facts, one basis):
 
 1. `server/discover` → `2026-07-28` handshake ✓
 2. `tools/list` → exactly **six** tools, `ttlMs`/`cacheScope` present ✓
@@ -158,7 +158,7 @@ BOUND   impact t-meet →  9 fns   (genuine transitive callers of t-meet)
 DIRECT callers of t-meet → guard-narrow, walk-call, walk-if  (all 9 contain these 3)
 ```
 
-This is now **fixed upstream** in `priv/codebase.bl`: `impact` and `reachable`
+This is now **fixed upstream** in `priv/std/codebase.bl`: `impact` and `reachable`
 bind the target via `:in` (the FEAT-025-safe discipline: filter at the call
 site, not in the rule body). `code/ask` delegates straight to the fixed
 helpers — the correctness lives in **one** place, not copied into the MCP layer.
@@ -221,6 +221,6 @@ tooling/mcp/server.bl           dispatch + code:// resources (repointed)
 tooling/mcp/tools.bl            code/list · code/query · code/ask · code/verify ·
                                 code/subscribe · code/poll (rewritten)
 tooling/mcp/demo.bl             eleven exchanges over the real self-index
-priv/codebase.bl                impact/reachable target-binding fix (upstream)
+priv/std/codebase.bl                impact/reachable target-binding fix (upstream)
 tooling/run-mcp-demo.bl         runnable entrypoint
 ```

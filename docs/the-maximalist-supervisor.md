@@ -42,7 +42,7 @@ Before designing, the honest inventory — what I confirmed by reading the sourc
 | `Agent` / `Task` | ✅ interop | `examples/processes.bl` |
 | a process → transition graph | ✅ | `system.model/graph`, `transitions`, `extract-defserver` |
 | verify / repair a process | ✅ | `system.core/verify-process`, `repair-process`, `discover-invariant`, `find-lasso` |
-| `flow` (demand/GenStage) | ✅ built earlier this thread | `priv/flow.bl` |
+| `flow` (demand/GenStage) | ✅ built earlier this thread | `priv/std/flow.bl` |
 | **`defsupervisor` (declarative tree)** | ❌ not yet | only raw `supervise` + interop |
 | **gen_statem / gen_event / Registry / Application** | ❌ not yet | interop-only or absent |
 

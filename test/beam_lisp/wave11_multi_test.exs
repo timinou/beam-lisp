@@ -9,7 +9,7 @@ defmodule BeamLisp.Wave11MultiTest do
     # multi.bl holds the hierarchy helpers; load it so tests can use
     # multi/derive, multi/isa? (multimethod/protocol special forms are
     # in the compiler, so they need no load).
-    BeamLisp.run_file("priv/multi.bl")
+    BeamLisp.run_file("priv/std/multi.bl")
     Env.in_ns("user")
     :ok
   end

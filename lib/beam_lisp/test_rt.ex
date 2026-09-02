@@ -2,7 +2,7 @@ defmodule BeamLisp.TestRT do
   @moduledoc """
   The test registry for beam-lisp's self-hosted suite.
 
-  `priv/test.bl` defines the `deftest`/`is`/`testing`/`are`/`run-tests`
+  `priv/std/test.bl` defines the `deftest`/`is`/`testing`/`are`/`run-tests`
   surface; the storage behind it lives here, in the shared
   `:beam_lisp_vars` ETS table (owned by `BeamLisp.Env`), so registered
   tests survive across files and runs without a supervised process.
@@ -230,7 +230,7 @@ defmodule BeamLisp.TestRT do
   end
 
   @doc """
-  Load and run a beam-lisp test suite: prelude, the `priv/test.bl`
+  Load and run a beam-lisp test suite: prelude, the `priv/std/test.bl`
   library, then each `path`, then every registered namespace via the
   beam-lisp `run-tests` fn. Returns the grand totals map.
 
@@ -336,7 +336,7 @@ defmodule BeamLisp.TestRT do
   # (and flat .beam deployments) have no :code.priv_dir/1, so a runtime
   # File.read! would crash `bl test`. @external_resource keeps Mix
   # recompiling when the source changes.
-  @test_lib_path Path.join(__DIR__, "../../priv/test.bl")
+  @test_lib_path Path.join(__DIR__, "../../priv/std/test.bl")
   @external_resource @test_lib_path
   @test_lib File.read!(@test_lib_path)
 

@@ -2,7 +2,7 @@ defmodule BeamLisp.ExamplesTest do
   use ExUnit.Case, async: false
 
   # The examples under examples/ are executable documentation; keep them honest.
-  # They run through WARD's example runner (priv/reload/ward.bl → run-examples),
+  # They run through WARD's example runner (priv/std/reload/ward.bl → run-examples),
   # the same isolated-fork machinery the .bl test suites use, extended for the
   # three things a bare script needs and a deftest suite does not:
   #

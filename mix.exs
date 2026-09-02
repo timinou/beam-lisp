@@ -37,7 +37,9 @@ defmodule BeamLisp.MixProject do
       # `priv/` (core, datom, optics) — the language libraries. The
       # contract/view stack lives in the :interface app of the spell repo
       # since the extraction; beam-lisp is the language again.
-      beam_lisp: [source_dirs: ["priv"]],
+      # The tiered source tree (see BeamLisp.Tiers): priv/boot is the toolchain,
+      # priv/std the stdlib, priv/lib the batteries, priv/build the build itself.
+      beam_lisp: [source_dirs: ["priv/boot", "priv/std", "priv/lib", "priv/build"]],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present
       # before anything tries to load it.
@@ -53,7 +55,7 @@ defmodule BeamLisp.MixProject do
       # #! header, loaded by any OTP installation). The main_module is the
       # AOT-compiled CLI namespace ITSELF — no Elixir floor: the escript
       # apply enters BeamLisp.Ns.Bl.Cli.main/1, which boots the substrate
-      # (AOT.boot) and dispatches, all in beam-lisp (priv/bl/cli.bl).
+      # (AOT.boot) and dispatches, all in beam-lisp (priv/std/bl/cli.bl).
       # Native accelerators (the defnative Rust crates, Explorer/Polars,
       # z3) are NIFs and cannot ride in an escript archive — pure-language
       # code is unaffected; those paths degrade or need a checkout/release.

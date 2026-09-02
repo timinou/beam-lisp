@@ -28,7 +28,7 @@ defmodule BeamLisp.NativeTest do
       # `datom.store-fjall` is the namespace the crate was BUILT for:
       # `rustler::init!` names its host module at compile time, so a
       # crate loads into exactly one namespace. See the moduledoc.
-      BeamLisp.run_file("priv/datom/store-fjall.bl")
+      BeamLisp.run_file("priv/lib/datom/store-fjall.bl")
 
       assert BeamLisp.Native.available?("datom.store-fjall")
 
@@ -49,7 +49,7 @@ defmodule BeamLisp.NativeTest do
       # and `intern` so the name can be passed around. A native function
       # that could only be called and never passed would be
       # second-class in a language where functions are values.
-      BeamLisp.run_file("priv/datom/store-fjall.bl")
+      BeamLisp.run_file("priv/lib/datom/store-fjall.bl")
 
       assert eval("""
              (ns native.test.value (:require [datom.store-fjall]))
@@ -159,12 +159,12 @@ defmodule BeamLisp.NativeTest do
       # Silent loss of durability is the worst shape this could take —
       # no crash, no warning, and the only symptom is data missing
       # after a restart (BUG-021).
-      BeamLisp.run_file("priv/datom/store-fjall.bl")
+      BeamLisp.run_file("priv/lib/datom/store-fjall.bl")
 
       out = Path.join(System.tmp_dir!(), "aot_native_#{System.unique_integer([:positive])}")
       File.mkdir_p!(out)
 
-      mods = BeamLisp.AOT.compile_file("priv/datom/store-fjall.bl", output_dir: out)
+      mods = BeamLisp.AOT.compile_file("priv/lib/datom/store-fjall.bl", output_dir: out)
       assert length(mods) >= 1
 
       # The declaration is recorded, which is what `__bl_init__` replays.
@@ -181,7 +181,7 @@ defmodule BeamLisp.NativeTest do
     end
 
     test "the native functions work through the AOT-loaded module" do
-      BeamLisp.run_file("priv/datom/store-fjall.bl")
+      BeamLisp.run_file("priv/lib/datom/store-fjall.bl")
 
       db_path = Path.join(System.tmp_dir!(), "aot_rt_#{System.unique_integer([:positive])}.fjall")
       db = BeamLisp.Native.Datom.StoreFjall.fjall_open(db_path)

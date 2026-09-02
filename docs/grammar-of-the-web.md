@@ -191,7 +191,7 @@ passes.
   the code.
 - `docs/the-application-is-a-value.md` — why a closed set of event verbs makes the
   app a value you can ship, diff, and verify.
-- `priv/loom/` — the parts themselves: the scale and style engine, the box layout
+- `priv/lib/loom/` — the parts themselves: the scale and style engine, the box layout
   algebra, and the component vocabulary built on them.
 - `examples/loom/` — runnable galleries you can open in a browser, and a catalog
   that builds itself from them.

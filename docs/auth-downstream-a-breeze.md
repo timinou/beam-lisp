@@ -22,7 +22,7 @@ overlap:
 
 | system | where | surface | purpose |
 |---|---|---|---|
-| datom schema | `priv/datom/schema.bl` | `{:db/ident :user/email :db/valueType :db.type/string :db/unique :db.unique/identity}` | how a fact is **stored, indexed, unique** |
+| datom schema | `priv/lib/datom/schema.bl` | `{:db/ident :user/email :db/valueType :db.type/string :db/unique :db.unique/identity}` | how a fact is **stored, indexed, unique** |
 | defcontract | `spell/src/spell/contract.bl` (PLAN-021) | `(assign @count :integer 0)` · `(push @flash {:message :string :kind :atom})` | the **seam** shape crossing server/client |
 | defrecord | `examples/records.bl` | `(defrecord Point [x y])` | a **struct**-shaped value |
 

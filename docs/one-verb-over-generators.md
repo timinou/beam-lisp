@@ -204,24 +204,24 @@ the verb live in three sibling modules, each built ON the core, each in its own
 file. There is exactly one quantifier core, and each layer adds only what the
 core cannot express.
 
-- `priv/veritas.bl` — **the core**: the `Gen` protocol + generators (`int-of`,
+- `priv/lib/veritas.bl` — **the core**: the `Gen` protocol + generators (`int-of`,
   `real-of`, `bool-of`, `string-of`, `one-of`, `enum-of` — the enum datatype —
   `coll-of` — the length abstraction — `tuple-of`, `any-of`), `samples`,
   `smt-of` (the `system.smt` seam), `parse-model` (a z3 model IS a value), `check`
   with its escalator, and the sugar `exists`, `for-all`, `covers`, `faults`,
   `isolate-fault`, `with-solver`.
-- `priv/veritas/mock.bl` (`ns veritas.mock`) — **the mock server**. What the core
+- `priv/lib/veritas/mock.bl` (`ns veritas.mock`) — **the mock server**. What the core
   cannot express: a multi-field *contract* `{:fields :ensures}`, DETERMINISM
   (`make-mock`/`answer` — same key ⇒ same response, so a mock is a pure fn), and
   BOUNDARIES (`synth-boundary` via z3's optimizer). Reuses the core's
   `parse-model`.
-- `priv/veritas/fault.bl` (`ns veritas.fault`) — **the fault space as data**. The
+- `priv/lib/veritas/fault.bl` (`ns veritas.fault`) — **the fault space as data**. The
   core's `faults` is the z3 half (an isolated, modality-tagged mutant per law);
   this adds the datalog ANALYSIS half — `build-db` + `uncovered-clauses`
   (not-join) + `faults-per-clause` + `redundant-mutants` (signature grouping) +
   `independent-laws`, with violations MEASURED, plus `serve`/`error-for` error
   injection on the mock server.
-- `priv/veritas/property.bl` (`ns veritas.property`) — **hypothesis testing**. The
+- `priv/lib/veritas/property.bl` (`ns veritas.property`) — **hypothesis testing**. The
   behavioural analogue of `covers`: RUN the target function and assert a predicate
   over its RETURN, then SHRINK a counterexample to the minimal input. Draws its
   fuzz domain from a veritas generator via `samples` — the same algebra the core
@@ -252,7 +252,7 @@ Examples and tests:
 This family REPLACES the earlier `priv/mock.bl`, `priv/mock/fault.bl`, and
 `priv/fuzz.bl` (now removed). Those three each re-wrote the quantifier core
 alongside their one distinctive capability; the family keeps the core in ONE place
-(`priv/veritas.bl`) and preserves every distinctive capability as a named layer on
+(`priv/lib/veritas.bl`) and preserves every distinctive capability as a named layer on
 top of it. So `veritas.mock` is the general `exists`-as-a-server, `veritas.fault`
 is `faults` plus its set-analysis half, and `veritas.property` is the behavioural
 sibling of `covers` — one core, three layers, zero capability lost.

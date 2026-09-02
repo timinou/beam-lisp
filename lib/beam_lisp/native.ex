@@ -60,7 +60,7 @@ defmodule BeamLisp.Native do
   beam-lisp names are kebab-case; NIF names must match what
   `rustler::init!` exported, which is snake_case. `compare-and-swap`
   therefore hosts as `compare_and_swap`, and the var keeps its kebab
-  spelling. The same convention `priv/core.bl` already uses for its
+  spelling. The same convention `priv/boot/core.bl` already uses for its
   primitives.
 
   ## When the NIF is absent
@@ -310,7 +310,7 @@ defmodule BeamLisp.Native do
     #
     # `put_link` carries the `{module, %{arity => fname}, variadic}`
     # shape the COMPILER reads to emit a direct call — the same
-    # mechanism `priv/core.bl` primitives use, and what makes
+    # mechanism `priv/boot/core.bl` primitives use, and what makes
     # `(compare-and-swap h k old new)` compile to a plain remote call
     # with no dispatch overhead.
     #

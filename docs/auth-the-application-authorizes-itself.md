@@ -291,11 +291,11 @@ it.
 
 `datom` set the precedent exactly: a facade namespace (`datom.bl`) re-exporting
 implementation namespaces (`datom.conn`, `datom.query.engine`, …), one file
-each under `priv/datom/`. `auth` mirrors it bone for bone.
+each under `priv/lib/datom/`. `auth` mirrors it bone for bone.
 
 ```
-priv/auth.bl                    ; facade: the whole package, one require
-priv/auth/
+priv/lib/auth.bl                    ; facade: the whole package, one require
+priv/lib/auth/
   biscuit/
     codec.bl        ; protobuf wire format <-> block values  (schema.proto)
     crypto.bl       ; Ed25519 signature chain: build, append, verify, seal

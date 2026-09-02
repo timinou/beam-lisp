@@ -26,10 +26,10 @@ defmodule BeamLisp do
   # dirs; escripts) have no :code.priv_dir/1 for :beam_lisp, so a
   # runtime File.read! would crash boot. @external_resource keeps
   # Mix recompiling when the .bl sources change.
-  @prelude_path Path.join(__DIR__, "../priv/core.bl")
-  @multi_path Path.join(__DIR__, "../priv/multi.bl")
-  @sugar_path Path.join(__DIR__, "../priv/sugar.bl")
-  @data_readers_path Path.join(__DIR__, "../priv/data-readers.bl")
+  @prelude_path Path.join(__DIR__, "../priv/boot/core.bl")
+  @multi_path Path.join(__DIR__, "../priv/std/multi.bl")
+  @sugar_path Path.join(__DIR__, "../priv/boot/sugar.bl")
+  @data_readers_path Path.join(__DIR__, "../priv/boot/data-readers.bl")
   @external_resource @prelude_path
   @external_resource @multi_path
   @external_resource @sugar_path
@@ -105,7 +105,7 @@ defmodule BeamLisp do
       # Seed the built-in tagged-literal registry (`#d`, `#time`) from source,
       # AFTER core (it calls `data-reader!`) and BEFORE any user file is read.
       # This is what lets the tag→reader-fn mappings live in beam-lisp
-      # (`priv/data-readers.bl`) instead of a hardcoded Elixir default — the
+      # (`priv/boot/data-readers.bl`) instead of a hardcoded Elixir default — the
       # reader reads a whole file before evaluating it, so a same-file
       # registration would lose the race, but a boot-time one never does.
       # Evaluated directly (not AOT-cached): it is three side-effecting forms,
@@ -115,7 +115,7 @@ defmodule BeamLisp do
       Env.mark_seeded()
 
       # Cutover: route the compiler through the self-hosted beam-lisp compiler
-      # (priv/compiler.bl) now that the prelude it needs is seeded. On a tree
+      # (priv/boot/compiler.bl) now that the prelude it needs is seeded. On a tree
       # where the compiler beam is built this flips `Compiler.compile/2` onto
       # the .bl compiler VM-wide; on a fresh tree the seed is absent and this
       # is a no-op, so boot still works via the genesis Elixir compiler (which
@@ -127,7 +127,7 @@ defmodule BeamLisp do
       end
 
       # Reader cutover: route `Reader.read_string/2` through the self-hosted
-      # beam-lisp reader (priv/reader.bl) for every later read — the language
+      # beam-lisp reader (priv/boot/reader.bl) for every later read — the language
       # reads itself. Same shape and safety as the compiler cutover above:
       # idempotent, forced to the genesis reader while reader.bl's OWN source is
       # being read (the language never reads its tail with its half-built

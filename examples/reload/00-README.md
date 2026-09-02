@@ -13,8 +13,8 @@ started this whole line of work (`undefined var` from a compiled module that
 lagged its source) becomes *unrepresentable as an observable state* — the same
 discipline, lifted from build artifacts to live edits.
 
-Design: `!tasks/plans/PLAN-056-*.org`. The layer lives in `priv/reload.bl`
-(the reconcile loop) and `priv/reload/migrate.bl` (verified in-flight message
+Design: `!tasks/plans/PLAN-056-*.org`. The layer lives in `priv/std/reload.bl`
+(the reconcile loop) and `priv/std/reload/migrate.bl` (verified in-flight message
 migration), with a dev filesystem watcher in `lib/beam_lisp/reload_watcher.ex`.
 
 Run any file with:

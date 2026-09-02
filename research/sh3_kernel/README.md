@@ -9,7 +9,7 @@ ordinary call paths?
 
 ## What was built
 
-`priv/compiler.bl` — forms → Elixir syntax tree, written in beam-lisp. This is
+`priv/boot/compiler.bl` — forms → Elixir syntax tree, written in beam-lisp. This is
 the KERNEL: the part with no special forms yet. It covers:
 
 - **literals** — number, float, string, boolean, nil, keyword (each is its own

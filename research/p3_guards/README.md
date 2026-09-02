@@ -66,4 +66,4 @@ destructuring params with `:keys`/`:or`/`:as`, nested patterns).
 ## Consequence
 
 P1+P2+P3 complete ⇒ **MVP-A (the checker) graduates**: lattice +
-poswalk promote to `priv/typed.bl`, demo in `examples/typing/`.
+poswalk promote to `priv/std/typed.bl`, demo in `examples/typing/`.

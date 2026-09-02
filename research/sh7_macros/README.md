@@ -9,7 +9,7 @@ documented variable-capture case?
 `(let [and-tmp 5] (and 1 and-tmp))` compiles byte-identically, so the capture
 bug cannot occur.
 
-## What was added to `priv/compiler.bl`
+## What was added to `priv/boot/compiler.bl`
 
 - **Macro expansion.** When a call head is a macro (a var tagged
   `{:"$macro", fn}`), the call is expanded at compile time via the runtime's

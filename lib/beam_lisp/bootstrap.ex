@@ -2,7 +2,7 @@ defmodule BeamLisp.Bootstrap do
   @moduledoc """
   Installs the committed self-hosted-compiler seed into a build's code path.
 
-  beam-lisp's compiler is written in beam-lisp (`priv/compiler.bl`) and there is
+  beam-lisp's compiler is written in beam-lisp (`priv/boot/compiler.bl`) and there is
   no longer an Elixir genesis compiler to fall back on. So a fresh clone must
   boot the compiler from a PRE-BUILT artifact: the AOT-compiled closure of the
   `compiler` and `reader-node` namespaces, committed under
