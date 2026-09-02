@@ -212,6 +212,13 @@ were never seven things at all.
 
 ## 6. Honesty ledger
 
+> **Superseded, 2026-09-02:** the `defprocess` surface proposed in §2 and §5
+> is withdrawn. The reader already makes every `receive` shape a graph
+> (`system/model` reads raw loops and `defserver` alike), so a second "spec
+> map" dialect adds nothing. The one-primitive *claim* stands; the *syntax*
+> is `defserver`'s clause style plus generic verbs. See
+> `the-five-bundles.md` §0.
+
 - **Real (verified):** `system.model` extracts graphs from raw
   `receive`/`loop`/`defn` (`extract-receive`, `extract-loop-receive`);
   `:~step`/`:~reachable` run on the shipped `datom.query.fixpoint` engine;
