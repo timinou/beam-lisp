@@ -26,7 +26,7 @@ idempotent to upload (retries are free), and "edited" by asserting a new fact.
 | database store | bytes go to | opt-in |
 |---|---|---|
 | `store-ets` / `store-map` (memory) | `blob-ets` (memory) | `{:blobs :tmp}` — a temp directory |
-| `store-fjall` (disk) | `blob-fs` at `<db>.blobs`, a sibling dir | `{:blobs (datom.blob-s3/open …)}` (FUP-025) |
+| `store-fjall` (disk) | `blob-fs` at `<db>.blobs`, a sibling dir | `{:blobs (datom.blob-s3/open …)}` — Garage, MinIO, AWS, R2 |
 | `store-hobbes` (cluster, later) | `blob-s3`, required | — |
 
 The store declares its default via `datom.blob/DefaultBlobs`; the choice is a
@@ -38,7 +38,7 @@ conflicting one is refused.
 | # | file | shows |
 |---|---|---|
 | 01 | `01-attach.bl` | one-shot `datom/file` vs two-phase `put-file!`; the datom and the broadcast carry no body; dangling descriptor refused; `file-bytes` / `file-stream` / `file-url`; dedup; metadata as attributes |
-| 02 | `02-tiers.bl` | memory → memory, `:tmp` opt-in, disk → sibling dir; configured once (inherit / refuse); `close!` deletes a `:tmp` dir and syncs a durable store; the S3 seam |
+| 02 | `02-tiers.bl` | memory → memory, `:tmp` opt-in, disk → sibling dir; configured once (inherit / refuse); `close!` deletes a `:tmp` dir and syncs a durable store; the S3 tier against Garage (`BL_S3_*` env) |
 | 03 | `03-history-and-gc.bl` | replace and retract keep old bytes for `as-of`; `with` stages into a blob overlay; `gc-files!` sweeps orphans only, inside the writer; why retracted bytes stay |
 
 ## Write path, in one line

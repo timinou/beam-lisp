@@ -114,7 +114,13 @@ defmodule BeamLisp.MixProject do
       # runtime: `datom/q` and the whole datalog core never touch it, and
       # `q-df` degrades to a clear "add :explorer" error when it is absent, so a
       # deployment that only wants set-valued datalog carries no Polars weight.
-      {:explorer, "~> 0.12"}
+      {:explorer, "~> 0.12"},
+      # datom/blob-s3.bl signs AWS Signature V4 with aws_signature and speaks
+      # HTTP with Req. Both were previously transitive (via explorer); they are
+      # the S3 blob tier's direct deps now — a transitive dep vanishing must
+      # not be a silent S3 outage.
+      {:req, "~> 0.7"},
+      {:aws_signature, "~> 0.4"}
     ]
   end
 end

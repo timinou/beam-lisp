@@ -193,7 +193,7 @@ re-hashes, because O(bytes) work does not belong in the serializer.
 
 - `priv/lib/datom/file.bl` — the DFile value and its constructor
 - `priv/lib/datom/blob.bl` — the port and its capabilities
-- `priv/lib/datom/blob-{ets,fs,overlay}.bl` — the substrates
+- `priv/lib/datom/blob-{ets,fs,overlay,s3}.bl` — the substrates
 - `priv/lib/datom/conn.bl` — `put-file!`, `stage-files!`, `gc-files!`, `close!`
 - `test/bl/datom/blob_test.bl` — the port's executable contract
 - `test/bl/datom/file_test.bl` — the datom-level invariants
