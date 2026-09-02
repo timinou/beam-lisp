@@ -1,0 +1,140 @@
+; bench/vector_integration_spike.bl — MEASURE FIRST.
+; Run: mix beam_lisp.run --path priv bench/vector_integration_spike.bl
+;
+; ── Why this exists ───────────────────────────────────────────────────
+;
+; The plan to integrate datom_vector more tightly (spikes C→A→B2→B1) rests on
+; a claim: that a `similar-to` query over the durable store pays two structural
+; taxes the current decoupled design cannot avoid —
+;
+;   MARSHAL   corpus materialization re-reads the whole embedding column:
+;             attr-datoms → binary_to_term per row (the DVec body rides an ETF
+;             envelope at rest) → bl assembles [e dvec] pairs → concat bodies.
+;   RESCAN    that whole corpus is rebuilt on EVERY query (no resident index on
+;             the plain path), and vec-search RE-QUANTIZES it each call.
+;
+; FUP-022's guess-gate is explicit: do NOT build the native scan speculatively;
+; profile a real bottleneck first. So this spike decomposes the cost and puts a
+; number on each tax, at growing N, BEFORE any optimisation lands. The later
+; spikes are judged against these baselines.
+;
+; Decomposition, per query:
+;   total   = the whole datom/q similar-to clause, end to end
+;   corpus  = materialize [e dvec] pairs from the store (the MARSHAL tax)
+;   pack    = concat the DVec bodies into one corpus binary
+;   search  = the native vec-search alone, given a pre-packed corpus
+;             (exact rerank=0 vs quantized rerank>0 — the RESCAN/quant cost)
+;
+; If corpus ≫ search, the marshal tax dominates and A/C are worth it. If
+; search dominates at large N, B (resident ANN) is where the win is. The
+; numbers decide the order, not the intuition.
+
+(ns bench.vector-integration-spike
+  (:require [datom.conn] [datom.db] [datom.index] [datom.vector :as v]
+            [datom.store-fjall] [datom.query.engine :as eng]))
+
+;; ── timing: median of trials after warmup ───────────────────────────
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+(defn- median [xs]
+  (let [s (into [] (sort (into [] xs))) n (count s)]
+    (if (= 0 (rem n 2))
+      (erlang/div (+ (get s (- (erlang/div n 2) 1)) (get s (erlang/div n 2))) 2)
+      (get s (erlang/div n 2)))))
+(defn- time-us [trials f]
+  (let [_warm (f)
+        samples (mapv (fn [_] (let [t0 (now-us) _ (f) t1 (now-us)] (- t1 t0)))
+                      (range trials))]
+    (median samples)))
+(defn- us [n] (str n "us"))
+(defn- header [t] (println (str "\n" t)))
+(defn- row [& parts]
+  (println (str "  " (join " | " (to-list (mapv (fn [p] (str p)) parts))))))
+
+;; ── synthetic embeddings with real cluster structure ────────────────
+;; Deterministic pseudo-random unit vectors around G centres, so nearest-
+;; neighbour finds genuine structure (not noise) and the search does real work.
+
+(def DIM 128)
+(def CENTRES 16)
+
+(defn- prng [seed] (rem (+ (* seed 1103515245) 12345) 2147483648))
+(defn- centre-vec [g]
+  ; a fixed direction per centre: component j = sin(g*7 + j)
+  (mapv (fn [j] (math/sin (+ (* g 7.0) (* j 1.0)))) (range DIM)))
+(defn- jittered [g seed]
+  (let [base (centre-vec g)
+        s (prng (+ (* g 131) seed))]
+    (mapv (fn [j] (+ (get base j)
+                     (* 0.15 (- (/ (rem (prng (+ s (* j 17))) 1000) 1000.0) 0.5))))
+          (range DIM))))
+
+(defn- fjall-conn [n]
+  (let [c (datom.conn/connect-with
+            (datom.store-fjall/open-fresh)
+            [{:db/ident :doc/label :db/valueType :db.type/string}
+             {:db/ident :doc/embedding :db/valueType :db.type/vector}])]
+    ; transact in batches so no single tx is enormous
+    (doseq [chunk (partition 200 (range n))]
+      (datom.conn/transact! c
+        (mapv (fn [i] {:db/id (- (+ i 1))
+                       :doc/label (str "doc-" i)
+                       :doc/embedding (v/embedding (jittered (rem i CENTRES) i))})
+              (into [] chunk))))
+    c))
+
+;; ── the corpus path, replicated from relations.bl (private there) ───
+;; This is EXACTLY what `similar-to` runs to materialize its corpus, isolated so
+;; we can time the marshal tax on its own.
+
+(defn- materialize-corpus [db attr]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [e (datom.index/-e d) vv (datom.index/-v d)]
+                     (if (v/vec? vv) [e vv] nil)))
+                 (datom.db/attr-datoms db attr))))
+
+(defn- pack-corpus [pairs]
+  (erlang/iolist_to_binary (to-list (mapv (fn [p] (:body (get p 1))) pairs))))
+
+;; ── the measurement ─────────────────────────────────────────────────
+
+(def SIZES [500 2000 8000])
+(def K 10)
+
+(defn spike []
+  (println "=== datom_vector integration spike — where does similar-to spend? ===")
+  (println (str "DIM=" DIM "  CENTRES=" CENTRES "  K=" K
+                "  (times are median us over trials)"))
+  (header "N | total-q | corpus | pack | search(exact) | search(quant) | corpus/total")
+  (doseq [n SIZES]
+    (let [c (fjall-conn n)
+          db (datom.conn/db c)
+          q (v/embedding (jittered 3 999999))
+          ; end-to-end similar-to query
+          total-us (time-us 5 (fn []
+                                (count (eng/q '[:find ?l ?s
+                                                :in $ ?q
+                                                :where [?e :doc/label ?l]
+                                                       [(similar-to :doc/embedding ?q 10) [?e ?s]]]
+                                              db q))))
+          ; MARSHAL tax alone
+          corpus-us (time-us 5 (fn [] (count (materialize-corpus db :doc/embedding))))
+          ; a materialized corpus to feed the isolated pieces
+          pairs (materialize-corpus db :doc/embedding)
+          ids (mapv (fn [p] (get p 0)) pairs)
+          pack-us (time-us 5 (fn [] (pack-corpus pairs)))
+          body (pack-corpus pairs)
+          ; native search alone, exact vs quantized (the RESCAN/quant cost)
+          qf (v/to-floats q)
+          search-exact-us (time-us 5 (fn []
+                                       (v/vec-search (to-list qf) (to-list ids) body DIM K 0)))
+          search-quant-us (time-us 5 (fn []
+                                       (v/vec-search (to-list qf) (to-list ids) body DIM K
+                                                     (v/default-rerank K))))
+          pct (erlang/div (* corpus-us 100) (max 1 total-us))]
+      (row n (us total-us) (us corpus-us) (us pack-us)
+           (us search-exact-us) (us search-quant-us) (str pct "%")))))
+
+(spike)
+(println "\n=== done ===")
