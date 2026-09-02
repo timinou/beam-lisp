@@ -51,12 +51,12 @@ defmodule BeamLisp.SourceGraph do
   def hash_lines(lines), do: call(:"hash-lines", [Enum.map(lines, &IO.iodata_to_binary/1)])
 
   defp call(fun, args) do
-    # The graph is a library of the language, so it needs the language: the
-    # prelude seeded (`concat`, `sort`, `sha256-hex` are core vars) and the
-    # `source-graph` namespace interned. `init/0` is idempotent and cheap once
-    # done; callers that already booted (the compile task, a running app) pay
-    # one `seeded?` check.
-    BeamLisp.init()
+    # The runtime is the CALLER's contract: every caller (the compile task, the
+    # drift gate, a booted app) runs after `BeamLisp.init/0`. This fn must not
+    # call `init/0` itself — `init` loads `core` through the drift gate, and a
+    # gate that asked the graph would re-enter a half-run `init` (seeded? is
+    # still false) and seed forever. Boot-tier beams bypass the graph in
+    # `AOT.stale?/2` for exactly this reason.
     BeamLisp.Loader.ensure_loaded(@ns)
 
     # Through the VAR TABLE, not a module call: when the namespace is AOT-built

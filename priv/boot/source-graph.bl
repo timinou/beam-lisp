@@ -27,40 +27,75 @@
 ;
 ; An unresolvable member hashes as "ns:?" rather than vanishing — a require
 ; that STOPS resolving is itself a change worth rebuilding for.
+;
+; ── Why this file uses only host calls ──────────────────────────────────────
+;
+; The drift gate asks this graph while `core` is still being loaded (the gate
+; vets core's own beam), and a test may ask it from a fresh forked Env with no
+; prelude interned. So nothing here may reach a `core` var: every operation is
+; a direct `erlang/`, `lists/`, `crypto/` or `reader-node` call, all of which
+; are linked at compile time and need no var lookup at run time. The payoff is
+; a graph that is callable from ANY Env at ANY point of boot, and whose entire
+; semantic dependency is the reader. That is also what makes it fast: no
+; dispatch, no lazy seqs, plain Erlang lists end to end.
 
 (ns source-graph
   (:require [reader-node :as rn]))
 
 ; ── header ───────────────────────────────────────────────────────────────────
 
+(defn- tag-is? [node tag] (erlang/=:= tag (rn/node-tag node)))
+
 (defn- ns-form?
   "Is this bare reader node an `(ns …)` list?"
   [form]
-  (and (= :list (rn/node-tag form))
-       (let [items (rn/node-items form)]
-         (and (seq items)
-              (= "ns" (rn/node-name (first items)))))))
+  (if (tag-is? form :list)
+    (let [items (rn/node-items form)]
+      (if (erlang/=:= items (list))
+        false
+        (erlang/=:= "ns" (rn/node-name (erlang/hd items)))))
+    false))
 
 (defn- require-target
-  "The namespace a `:require` spec names: `foo` or `[foo :as f]` → \"foo\"."
+  "The namespace a `:require` spec names, as `{true ns}` for lists/filtermap,
+   or false when the spec names nothing: `foo` → foo, `[foo :as f]` → foo."
   [spec]
-  (case (rn/node-tag spec)
-    :symbol (rn/node-name spec)
-    :vector (let [items (rn/node-items spec)]
-              (when (and (seq items) (= :symbol (rn/node-tag (first items))))
-                (rn/node-name (first items))))
-    nil))
+  (if (tag-is? spec :symbol)
+    (erlang/list_to_tuple (list true (rn/node-name spec)))
+    (if (tag-is? spec :vector)
+      (let [items (rn/node-items spec)]
+        (if (if (erlang/=:= items (list)) false (tag-is? (erlang/hd items) :symbol))
+          (erlang/list_to_tuple (list true (rn/node-name (erlang/hd items))))
+          false))
+      false)))
+
+(defn- require-clause?
+  "Is this ns clause a `(:require …)` list?"
+  [clause]
+  (if (tag-is? clause :list)
+    (let [items (rn/node-items clause)]
+      (if (erlang/=:= items (list))
+        false
+        (let [head (erlang/hd items)]
+          (if (tag-is? head :keyword)
+            (erlang/=:= "require" (rn/node-name head))
+            false))))
+    false))
 
 (defn- clause-requires
-  "Requires named by one ns clause, or [] when it is not a `(:require …)`."
+  "Requires named by one ns clause; the empty list when it is not a require."
   [clause]
-  (if (and (= :list (rn/node-tag clause))
-           (let [items (rn/node-items clause)]
-             (and (seq items)
-                  (= :keyword (rn/node-tag (first items)))
-                  (= "require" (rn/node-name (first items))))))
-    (keep require-target (rest (rn/node-items clause)))
-    []))
+  (if (require-clause? clause)
+    (lists/filtermap (fn [s] (require-target s)) (erlang/tl (rn/node-items clause)))
+    (list)))
+
+(defn- dedupe
+  "First occurrence of each element, order preserved. O(n·k) over the k
+   distinct names — an ns form names a handful, so this beats building a set."
+  [xs]
+  (lists/reverse
+    (lists/foldl (fn [x acc] (if (lists/member x acc) acc (lists/append (list x) acc)))
+                 (list) xs)))
 
 (defn header
   "The node a source file declares: `[ns requires]`.
@@ -70,26 +105,38 @@
    `:require` clauses name, in order, without duplicates. Only the FIRST
    symbol of each spec vector counts — `[a :refer [x y]]` contributes `a`."
   [content]
-  (let [form (first (filter ns-form? (BeamLisp.Reader/read_all content)))]
-    (if (nil? form)
-      [nil []]
-      (let [items (rn/node-items form)
-            name (rn/node-name (second items))]
-        [name (vec (distinct (mapcat clause-requires (drop 2 items))))]))))
+  (let [forms (BeamLisp.Reader/read_all content)
+        found (lists/search (fn [f] (ns-form? f)) forms)]
+    (if (erlang/=:= found false)
+      [nil (list)]
+      (let [form (erlang/element 2 found)
+            items (rn/node-items form)
+            name (rn/node-name (erlang/hd (erlang/tl items)))
+            reqs (lists/append (lists/map (fn [c] (clause-requires c))
+                                          (erlang/tl (erlang/tl items))))]
+        [name (dedupe reqs)]))))
 
 ; ── closure ──────────────────────────────────────────────────────────────────
 
+(defn- as-list
+  "A caller's `reqs` may answer with a vector, a list, or nil; the walk wants
+   an Erlang list. `Enum.to_list` covers every beam-lisp collection."
+  [xs]
+  (if (erlang/=:= xs nil) (list) (if (erlang/is_list xs) xs (Enum/to_list xs))))
+
 (defn closure
-  "Every namespace `ns` transitively requires, including `ns`. A set. Each
-   node is visited once, so the walk is linear in the edges it crosses."
+  "Every namespace `ns` transitively requires, including `ns`. A sorted list
+   without duplicates. Each node is expanded once — `seen` is a map, so the
+   walk is O(V + E) with O(1) membership — and the frontier is a plain list,
+   so it is a depth-first walk that terminates on cycles."
   [ns reqs]
-  (loop [todo (list ns) seen #{}]
-    (if (empty? todo)
-      seen
-      (let [n (first todo)]
-        (if (contains? seen n)
-          (recur (rest todo) seen)
-          (recur (concat (reqs n) (rest todo)) (conj seen n)))))))
+  (loop [todo (list ns) seen (maps/new)]
+    (if (erlang/=:= todo (list))
+      (lists/sort (maps/keys seen))
+      (let [n (erlang/hd todo) more (erlang/tl todo)]
+        (if (maps/is_key n seen)
+          (recur more seen)
+          (recur (lists/append (as-list (reqs n)) more) (maps/put n true seen)))))))
 
 ; ── hashing ──────────────────────────────────────────────────────────────────
 
@@ -97,13 +144,15 @@
   "sha256 hex over `lines` joined by a NUL byte — the one digest shape every
    freshness key uses, so the build and the runtime hash alike."
   [lines]
-  (sha256-hex (join (erlang/list_to_binary (list 0)) lines)))
+  (binary/encode_hex (crypto/hash :sha256 (lists/join (erlang/list_to_binary (list 0)) lines))
+                     :lowercase))
 
 (defn closure-hash
   "The freshness key of `ns`: sha256 over the sorted `ns:hash` line of every
    member of its require-closure. Deterministic in the two callbacks alone."
   [ns srchash reqs]
-  (->> (closure ns reqs)
-       sort
-       (map (fn [n] (str n ":" (or (srchash n) "?"))))
-       hash-lines))
+  (hash-lines
+    (lists/map (fn [n]
+                 (let [h (srchash n)]
+                   (erlang/iolist_to_binary (list n ":" (if (erlang/=:= h nil) "?" h)))))
+               (closure ns reqs))))
