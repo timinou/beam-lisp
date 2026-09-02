@@ -85,7 +85,7 @@ has finished thinking about it.**
 
 ## 3. The emit rewrite
 
-The change is confined to the **lowering** step of `compiler.bl` and the
+The change is confined to the **lowering** step of `priv/boot/compiler.bl` and the
 **module topology** of `emit.ex`. Reader, macroexpansion, analysis, the
 shim/body split, AOT caching, the loader — untouched in concept.
 
@@ -96,6 +96,21 @@ shim/body split, AOT caching, the loader — untouched in concept.
 symbol, choose a clause shape) and lowering (build the tuple) happen in the
 same function. That is fine when the target is a syntax tree that closely
 mirrors the source — Elixir quoted is one.
+
+### 3.1b The short path — verified (`research/ce1_core_erlang/`)
+
+The compiler's emitted quoted tree is *already* the IR described below: every
+symbol resolved, every macro expanded, a closed vocabulary of ~16 node kinds
+with one-line Core counterparts. A ~600-line `.bl` reader of that tree
+(`ce1/lower` + module topology) drives `cerl` directly. Verified: 7582
+prelude/example forms lower with none rejected; six test suites (142 tests,
+583 assertions) run through the Core backend with zero divergence from the
+Elixir backend; `defn`, `defserver` and `Link.defvar` (body + shim modules,
+closure survival across redefinition) all work in Core; module builds are
+1.7–2.0× faster than `Module.create`. The three-pass design below remains the
+*destination* (a bl-owned ANF the toolbench reads); the short path is how to
+get a working Core backend first, with the same def-tuple seam and no
+compiler rewrite. The cutover recipe is in the spike's README.
 
 ### 3.2 With Core: three passes, one IR
 
@@ -198,7 +213,10 @@ the *language* stops doing so.
 
 ## 5. The `.bl` modules this grows
 
-All in-house, all in `.bl`, all reading and writing plain data:
+All in-house, all in `.bl`, all reading and writing plain data. They live in
+`priv/self/` (the compiler's own tier, beside `oracle.bl`) until the cutover,
+when `anf`/`match`/`guard`/`cerl`/`beam` move into `priv/boot/` — they become
+the toolchain closure — and `oracle`/`opt` stay in `self/`:
 
 | module | job | reads | writes |
 |---|---|---|---|

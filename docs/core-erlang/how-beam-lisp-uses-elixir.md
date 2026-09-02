@@ -50,7 +50,7 @@ Erlang's compiler and stays no matter what frontend feeds it.
 mean it. That is a dependency on Elixir's *semantics*: the meaning of every
 node the compiler emits is defined by the Elixir language, not by beam-lisp.
 
-Counted over `priv/compiler.bl`, the emitted node vocabulary is small:
+Counted over `priv/boot/compiler.bl`, the emitted node vocabulary is small:
 
 | Elixir node | count | what beam-lisp uses it for |
 |---|---|---|
@@ -111,6 +111,12 @@ The library surface, by module (`lib/beam_lisp/`):
 | `server.ex` | `defserver` start/stop wrappers routing around `GenServer` |
 | `env.ex` / `link.ex` / `refs.ex` / `atom_guard.ex` | namespaces, var linking, heap/caps bounds, atom-table guard |
 | `reader.ex` / `compiler.ex` / `emit.ex` / `aot.ex` / `loader.ex` | the *Elixir* reader/compiler (oracle + seed) and module topology |
+
+The `.bl` side is tiered under `priv/`: `boot/` (reader-node, reader, compiler,
+core, sugar, data-readers — the toolchain closure), `std/` (typed, codebase,
+termination, reload, …), `lib/` (datom, system, veritas, auth, …), `self/`
+(the compiler's own oracle). Role A lives entirely in `priv/boot/compiler.bl`
+plus `lib/beam_lisp/emit.ex`.
 
 Two facts about role B matter for any backend discussion:
 
