@@ -139,19 +139,17 @@ defmodule BeamLisp.AOTCache do
 
     beams =
       Enum.flat_map(@codegen_modules, fn mod ->
-        case :code.which(mod) do
-          path when is_list(path) ->
-            # An escript's :code.which/1 reports a VIRTUAL archive path
-            # (`<script>/<app>/ebin/M.beam`) that no filesystem backs —
-            # same shape as the missing-priv_dir fallback below. Degrade
-            # the key instead of crashing the compile.
-            case File.read(path) do
-              {:ok, bin} -> [bin]
-              _ -> []
-            end
-
-          _ ->
-            []
+        # `:code.get_object_code/1` answers the module's bytes wherever the
+        # code server found them — a real ebin OR an escript archive. Reading
+        # `:code.which/1`'s path with `File.read` fails inside an escript (the
+        # path is virtual), which silently dropped every codegen beam from the
+        # key, so a packaged `bl` computed a DIFFERENT key from the build that
+        # stamped its beams and treated its whole stdlib as stale — 80s boots
+        # from source, or a refusal under BEAM_LISP_AOT_STRICT. Degrade (never
+        # crash) when a module is genuinely absent.
+        case :code.get_object_code(mod) do
+          {^mod, bin, _path} -> [bin]
+          _ -> []
         end
       end)
 

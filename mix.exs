@@ -59,7 +59,12 @@ defmodule BeamLisp.MixProject do
       # Native accelerators (the defnative Rust crates, Explorer/Polars,
       # z3) are NIFs and cannot ride in an escript archive — pure-language
       # code is unaffected; those paths degrade or need a checkout/release.
-      escript: [name: "bl", main_module: BeamLisp.Ns.Bl.Cli],
+      # `strip_beams: false` for the SAME reason the release below says it:
+      # stripping re-stamps the codegen modules, whose bytes hash into the
+      # toolchain key, so a stripped `bl` computes a key its own beams were
+      # not stamped with and reads its entire stdlib as stale — an 80s boot
+      # from source (or a refusal under BEAM_LISP_AOT_STRICT=1).
+      escript: [name: "bl", main_module: BeamLisp.Ns.Bl.Cli, strip_beams: false],
       # `mix release` — the ERTS-carrying packaging tier (the `bl` escript
       # needs an OTP install; a release does not). Default settings, no
       # Burrito step: wrap only if the self-extracting UX is wanted.
