@@ -1,0 +1,157 @@
+; boot/build-plan.bl — from a set of sources to an executable plan, in one pass.
+;
+; The build asks three questions of the namespace graph, and used to answer
+; each by walking the graph again:
+;
+;   in what ORDER must files compile?        (topological sort)
+;   what is each file's FRESHNESS KEY?        (its require-closure hash)
+;   which files can compile IN PARALLEL?      (the waves of the DAG)
+;
+; They are one question. A post-order traversal that reaches every node once
+; computes all three as it returns: a node's closure hash is a fold over its
+; children's closures, its wave is 1 + max of its children's waves, and the
+; order it is emitted in IS the topological order. So this module is O(V + E)
+; by construction — no node is expanded twice — and that is a property of the
+; algorithm, not an optimisation a later edit can quietly lose. The test
+; `build_plan_test.bl` pins it: every `srchash` is asked exactly once.
+;
+; Input: a list of nodes, one per source file:
+;
+;   {:path "priv/std/optics.bl" :ns "optics" :reqs ("core" "multi") :hash "…"}
+;
+; `:hash` is the file's OWN content hash. `:ns` is nil for a file without an
+; `(ns …)` form (it compiles into `user` and has no closure to key on: its
+; freshness is its own hash). `:reqs` are the RAW names the file requires —
+; a name that resolves to no source still contributes an `ns:?` line to the
+; closure hash, so a require that stops resolving is itself a change.
+;
+; Output — the plan:
+;
+;   {:order   (node …)                topological, dependencies first
+;    :waves   ((node …) (node …) …)   wave k depends only on waves < k
+;    :closure {ns → sorted (ns …)}    transitive requires, self included
+;    :key     {path → closure-hash}   the manifest / provenance key
+;    :deps    {path → (path …)}       resolved direct deps, as paths}
+;
+; `:key` is exactly `source-graph/closure-hash` (same digest, same lines), so
+; a beam the build stamps compares equal to what the runtime gate recomputes.
+; That equality is the whole freshness contract and it is pinned by test.
+;
+; Cycles: a require cycle is a build error in the sense that no order
+; satisfies it, but the walk must still terminate and the hash must still be
+; stable. A back-edge is treated as already-visited (its contribution to the
+; closure is whatever the partial closure holds), matching `source-graph/closure`
+; on the same graph, and the nodes land in one wave. The prelude has none
+; (`cyc.bl` in the plan's provenance checked all 113); this rule only keeps
+; the build total on a user's graph.
+
+(ns build-plan
+  (:require [source-graph :as sg]))
+
+; ── input indexing ───────────────────────────────────────────────────────────
+
+(defn- index-by
+  "A map from (f x) to x over `xs`; a later x wins."
+  [f xs]
+  (lists/foldl (fn [x acc] (maps/put (f x) x acc)) (maps/new) xs))
+
+(defn- as-list [xs]
+  (if (erlang/=:= xs nil) (list) (if (erlang/is_list xs) xs (Enum/to_list xs))))
+
+; ── the one traversal ────────────────────────────────────────────────────────
+;
+; State threaded through the walk, a map with:
+;   :done   {ns → {:closure sorted-list :wave int}}   finished nodes
+;   :order  (node …)  reversed emission order
+; A node is finished only after all its resolvable requires are, so the
+; reversed emission order is topological.
+
+(defn- visit
+  "Finish `ns` and everything below it. Returns the new state. `on-path` is
+   the set of nodes on the current DFS path (cycle guard); a node found there
+   is skipped as if done, with an empty contribution."
+  [ns by-ns st on-path]
+  (if (maps/is_key ns (maps/get :done st))
+    st
+    (if (maps/is_key ns on-path)
+      st
+      (let [node (maps/get ns by-ns nil)]
+        (if (erlang/=:= node nil)
+          ; an unresolvable require: nothing to compile, nothing below it. It
+          ; still appears in closures (the caller adds the name itself).
+          st
+          (let [on-path (maps/put ns true on-path)
+                reqs (as-list (maps/get :reqs node))
+                st (lists/foldl (fn [r acc] (visit r by-ns acc on-path)) st reqs)
+                done (maps/get :done st)
+                ; the closure is this ns + the union of each require's closure
+                ; (an unresolvable require contributes just its own name);
+                ; the wave is 1 + the deepest resolvable require's wave
+                ; the closure is this ns ∪ each require's closure; an
+                ; unresolvable require contributes just its own name. Closures
+                ; are kept as MAPS (name → true) so the union is a merge, never
+                ; a sort: O(|closure|) per node, Σ|closure| overall — the same
+                ; work the hash below must do anyway, so nothing here is above
+                ; the floor. The wave is 1 + the deepest resolvable require's.
+                step (fn [r acc]
+                       (let [d (maps/get r done nil)]
+                         (if (erlang/=:= d nil)
+                           (erlang/list_to_tuple (list (maps/put r true (erlang/element 1 acc)) (erlang/element 2 acc)))
+                           (erlang/list_to_tuple (list (maps/merge (erlang/element 1 acc) (maps/get :closure d))
+                                                       (erlang/max (erlang/element 2 acc) (maps/get :wave d)))))))
+                acc (lists/foldl step (erlang/list_to_tuple (list (maps/put ns true (maps/new)) 0)) reqs)
+                closure (erlang/element 1 acc)
+                wave (erlang/element 2 acc)
+                entry (maps/put :closure closure (maps/put :wave (erlang/+ wave 1) (maps/new)))]
+            (maps/put :order (lists/append (list node) (maps/get :order st))
+                      (maps/put :done (maps/put ns entry done) st))))))))
+
+; ── the plan ─────────────────────────────────────────────────────────────────
+
+(defn plan
+  "Build the plan for `nodes` (see the header). Deterministic: nodes are
+   visited in sorted path order, so the same inputs always give the same
+   `:order` and `:waves`."
+  [nodes]
+  (let [nodes (as-list nodes)
+        named (lists/filter (fn [n] (erlang/=/= nil (maps/get :ns n))) nodes)
+        anon (lists/filter (fn [n] (erlang/=:= nil (maps/get :ns n))) nodes)
+        by-ns (index-by (fn [n] (maps/get :ns n)) named)
+        by-path (index-by (fn [n] (maps/get :path n)) nodes)
+        st0 (maps/put :done (maps/new) (maps/put :order (list) (maps/new)))
+        st (lists/foldl (fn [n acc] (visit (maps/get :ns n) by-ns acc (maps/new)))
+                        st0
+                        (lists/sort (fn [a b] (erlang/=< (maps/get :path a) (maps/get :path b))) named))
+        done (maps/get :done st)
+        ; anonymous files (no ns) compile last, in path order, in their own wave
+        order (lists/append (lists/reverse (maps/get :order st))
+                            (lists/sort (fn [a b] (erlang/=< (maps/get :path a) (maps/get :path b))) anon))
+        srchash-of (fn [n] (let [nd (maps/get n by-ns nil)] (if (erlang/=:= nd nil) nil (maps/get :hash nd))))
+        key-of (fn [node]
+                 (let [ns (maps/get :ns node)]
+                   (if (erlang/=:= ns nil)
+                     (maps/get :hash node)
+                     (sg/hash-lines
+                       (lists/map (fn [m] (let [h (srchash-of m)]
+                                            (erlang/iolist_to_binary (list m ":" (if (erlang/=:= h nil) "?" h)))))
+                                  (lists/sort (maps/keys (maps/get :closure (maps/get ns done)))))))))
+        keys (lists/foldl (fn [node acc] (maps/put (maps/get :path node) (key-of node) acc)) (maps/new) order)
+        deps (lists/foldl (fn [node acc]
+                            (maps/put (maps/get :path node)
+                                      (lists/filtermap (fn [r] (let [d (maps/get r by-ns nil)]
+                                                                 (if (erlang/=:= d nil) false
+                                                                   (erlang/list_to_tuple (list true (maps/get :path d))))))
+                                                       (as-list (maps/get :reqs node)))
+                                      acc))
+                          (maps/new) order)
+        max-wave (lists/foldl (fn [n m] (erlang/max m (maps/get :wave (maps/get (maps/get :ns n) done)))) 0 named)
+        wave-of (fn [node] (let [ns (maps/get :ns node)]
+                             (if (erlang/=:= ns nil) (erlang/+ max-wave 1) (maps/get :wave (maps/get ns done)))))
+        waves (lists/map (fn [k] (lists/filter (fn [node] (erlang/=:= k (wave-of node))) order))
+                         (lists/seq 1 (if (erlang/=:= anon (list)) max-wave (erlang/+ max-wave 1))))
+        closure (maps/map (fn [_ v] (lists/sort (maps/keys (maps/get :closure v)))) done)]
+    (maps/put :order order
+      (maps/put :waves (lists/filter (fn [w] (erlang/=/= w (list))) waves)
+        (maps/put :closure closure
+          (maps/put :key keys
+            (maps/put :deps deps (maps/new))))))))
