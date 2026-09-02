@@ -395,7 +395,6 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     File.write!(path, :erlang.term_to_binary(manifest))
   end
 
-  defp content_hash(source), do: source |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16()
 
   # A source is up to date when its tier-2 CLOSURE hash AND the toolchain key
   # both match the manifest, and every beam it recorded still exists. The key
