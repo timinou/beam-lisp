@@ -134,14 +134,28 @@ defmodule BeamLisp.Native do
 
   @table :beam_lisp_native_declarations
 
+  # The declarations table is VM-wide state and must OUTLIVE whichever
+  # process first declared a native. Created lazily by the first caller, it
+  # died with that caller when the caller was a parallel-build worker (one
+  # `Task` per source): every `defnative` namespace compiled after that
+  # worker exited saw `declaration/1` → nil, its `__bl_init__` was emitted
+  # WITHOUT the `Native.declare` replay, and the beam differed from a serial
+  # build's — silently, a deployment with no native backend (BUG-021's exact
+  # symptom, by a new route). Same fix as BeamLisp.LazySeq's table: the
+  # pinned `Loader.Server` owns it, so its lifetime is the VM's.
   defp table do
     case :ets.whereis(@table) do
       :undefined ->
-        try do
-          :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-        rescue
-          ArgumentError -> @table
-        end
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+          rescue
+            # Another process won the race; its table is the one we want.
+            ArgumentError -> :ok
+          end
+        end)
+
+        @table
 
       _ ->
         @table

@@ -11,10 +11,24 @@ defmodule BeamLisp.PerfProbe do
 
   @tab :beam_lisp_perf_probe
 
+  # Owned by the pinned Loader.Server so a probe table created inside a
+  # short-lived process (a parallel-build worker, an async test fork) does
+  # not vanish with it. See BeamLisp.Native.table/0.
   defp tab do
     case :ets.whereis(@tab) do
-      :undefined -> :ets.new(@tab, [:public, :named_table, :set])
-      _ -> @tab
+      :undefined ->
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@tab, [:public, :named_table, :set])
+          rescue
+            ArgumentError -> :ok
+          end
+        end)
+
+        @tab
+
+      _ ->
+        @tab
     end
   end
 

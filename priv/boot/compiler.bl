@@ -2024,6 +2024,8 @@
     (has-slash? name) name
     (and (> (count name) 6)
          (= "__auto" (subs name (- (count name) 6) (count name)))) name
+    (and (> (count name) 3)
+         (= "__c" (subs name (- (count name) 3) (count name)))) name
     (contains? special-forms name) name
     (local? env name) name
     (macro? env name) name
@@ -3179,6 +3181,73 @@
   (let [data (if (reader-form? v) (datum v) v)]
     (Macro/escape (strip-one-quote data))))
 
+(defn- prelink-info
+  "The `{module, arity→fname, variadic-or-nil}` link triple `Link.defvar` will
+   install for `name`'s `clauses` — computed from the clause shapes alone, so
+   the link can be put BEFORE the clauses compile (see compile-defn*). One
+   `{min fname__bl_v}` at most: a defn has at most one variadic clause shape."
+  [mod name clauses]
+  (let [shapes (distinct (map (fn [c] (clause-shape (:params c))) clauses))
+        fixed (reduce (fn [m sh]
+                        (if (= :fixed (first sh))
+                          (assoc m (second sh) (erlang/binary_to_atom name))
+                          m))
+                      {} shapes)
+        variadic (some (fn [sh]
+                         (if (= :variadic (first sh))
+                           (erlang/list_to_tuple (list (second sh) (erlang/binary_to_atom (str name "__bl_v"))))
+                           nil))
+                       shapes)]
+    (erlang/list_to_tuple (list mod fixed variadic))))
+
+(defn- defn-clauses-of
+  "The parsed clauses of a `(defn name doc? attr? clauses…)` argument list —
+   the same peeling `compile-defn*` does, factored so the two agree."
+  [args env]
+  (let [rest-args (rest args)
+        has-doc (and (not (empty? rest-args))
+                     (erlang/is_binary (rn/node-form (first rest-args)))
+                     (not (empty? (rest rest-args))))
+        after-doc (if has-doc (rest rest-args) rest-args)
+        has-attr (and (not (empty? after-doc))
+                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
+        after-attr (if has-attr (rest after-doc) after-doc)]
+    (if (or (empty? after-attr) (erlang/is_binary (rn/node-form (first after-attr))))
+      nil
+      (parse-fn-clauses after-attr env))))
+
+(defn prelink-defn
+  "If `form` is a top-level `(defn …)`/`(defn- …)`, install its link in `ns`
+   NOW, before anything in the unit compiles, and return true; else false.
+
+   Why: a call to a defn compiles to a direct `Module.fname(args)` iff the
+   var is linked at that moment, else to `RT.invoke(fetch …)`. Within one
+   file, `mplus` may call `bind` defined 6 lines LATER: in a fresh VM that
+   call compiled slow (no link yet); in a VM that had compiled the file
+   before, fast (the link survived). Same source, two beams — and the first
+   build in every VM the slower. `AOT.compile_source` prelinks every defn in
+   the unit before compiling any form, so forward references inside a file
+   are direct calls, deterministically. Only the link is installed (the
+   shape triple `Link.defvar` will put back); no var value — a call before
+   the definition runs still fails loudly, as it should."
+  [form ns]
+  (let [f (rn/node-form form)]
+    (if (and (= :list (rn/node-tag f))
+             (let [items (rn/node-items f)]
+               (and (not (empty? items))
+                    (= :symbol (rn/node-tag (first items)))
+                    (contains? #{"defn" "defn-"} (rn/node-name (first items)))
+                    (not (empty? (rest items)))
+                    (= :symbol (rn/node-tag (rn/node-form (second items)))))))
+      (let [args (rest (rn/node-items f))
+            name (rn/node-name (rn/node-form (first args)))
+            clauses (defn-clauses-of args (new-env ns))]
+        (if (nil? clauses)
+          false
+          (do (BeamLisp.Env/put_link ns name (prelink-info (BeamLisp.Link/module_for ns) name clauses))
+              true)))
+      false)))
+
 (defn- compile-defn*
   "The general defn compiler, with an explicit `private?` flag (for defn-).
 
@@ -3222,6 +3291,19 @@
             :else nil)
         mod (BeamLisp.Link/module_for (:ns env))
         clauses (parse-fn-clauses after-attr env)
+        ; PRE-LINK before compiling the clauses. A non-tail self-reference in
+        ; a body — `(bind …)` inside `bind`, or `mplus` calling `bind` calling
+        ; `mplus` — compiles to a direct `Module.fname(args)` iff the var is
+        ; linked at that moment, else to a slow `RT.invoke(fetch …)`. The
+        ; link is normally installed by `Link.defvar` AFTER the whole form
+        ; runs, so a fresh VM emitted the slow form and a warm VM (the var
+        ; linked by an earlier compile of the same file) the fast one: the
+        ; SAME source gave two different beams, and the first build in every
+        ; VM was the slower one. Installing the link from the clause shapes
+        ; up front makes the emitted code a function of the source alone,
+        ; and always the direct call. The link is exactly what defvar will
+        ; put back (`Emit.fixed_variadic` over the same shapes).
+        _ (BeamLisp.Env/put_link (:ns env) name (prelink-info mod name clauses))
         entries (apply list
                   (map (fn [c]
                          (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
@@ -3327,16 +3409,23 @@
     (erlang/is_list d)
       (rn/list-node (apply list (map data->form d)))
 
-    ; a plain map (not one of the struct-backed values vector?/set? caught)
+    ; a plain map (not one of the struct-backed values vector?/set? caught).
+    ; SORTED by the reader-form key: an Erlang map enumerates atom keys in
+    ; atom-INDEX order — the order the atoms were created in this VM — which
+    ; differs between a serial and a parallel build, and would make the
+    ; emitted `%{}` literal (hence the beam) depend on build history rather
+    ; than on the source. Map semantics are unaffected by entry order.
     (map? d)
       (rn/->tuple
         (list :map
-              (apply list
-                (map (fn [kv]
-                       (erlang/list_to_tuple
-                         (list (data->form (erlang/element 1 kv))
-                               (data->form (erlang/element 2 kv)))))
-                     (maps/to_list d)))))
+              (lists/sort
+                (fn [a b] (erlang/=< (erlang/element 1 a) (erlang/element 1 b)))
+                (apply list
+                  (map (fn [kv]
+                         (erlang/list_to_tuple
+                           (list (data->form (erlang/element 1 kv))
+                                 (data->form (erlang/element 2 kv)))))
+                       (maps/to_list d))))))
 
     ; a keyword is an atom other than nil/true/false; its node carries the name
     (and (erlang/is_atom d) (not (nil? d)) (not= d true) (not= d false))
@@ -3359,6 +3448,106 @@
              (erlang/list_to_tuple (list (rn/sym-node name) name)))
            (maps/keys (:locals env))))))
 
+; ── gensym canonicalisation ──────────────────────────────────────────────────
+;
+; A macro's syntax-quote template mints `x#` names ONCE, when the macro's own
+; `defmacro` is compiled: the `__N__auto` number is baked into the macro's
+; body, so every expansion of `or` carries `or-tmp__847__auto` — the N the
+; compiling process's counter was at back when `core.bl` compiled. That N is
+; a function of core.bl's compile, not of the file now being compiled, so it
+; leaks build history into every dependent's bytes: the same source emitted
+; different beams depending on what compiled before it (35/303 beams differed
+; run-to-run after locals were made deterministic; all 35 were this).
+;
+; Hygiene needs only that a template's gensym be DISTINCT from the user's
+; names and from other templates' gensyms in the same expansion; it does not
+; need the number to be the one minted at definition. So each expansion
+; renames: walk the expanded form, and give every distinct baked `__N__auto`
+; name a CANONICAL `base__M__c` name, M from THIS unit's counter. The `__c`
+; marker (not `__auto`) is what makes the scheme total: a canonical name is
+; never renamed again, so it is safe to re-expand a form that carries one,
+; and the baked number the template happened to have is never consulted
+; twice — it can change under our feet (a sibling in the same build wave
+; recompiling `core.bl` re-interns every macro with new baked numbers) and
+; the emitted names are still a function of this unit's source alone.
+; Distinctness is preserved (the per-expansion map is 1:1).
+;
+; Order matters here, because this file is compiled by the compiler it
+; defines: once `expand-macro` below is (re)defined, every later form's
+; macro expansions run through it, and it calls `canonical-gensyms` →
+; `renumber`. Both are therefore defined ABOVE it, as real fns.
+
+(def ^:private gensym-re (Regex/compile! "^(.+)__[0-9]+__auto$"))
+
+(defn- gensym-base
+  "`base` of a BAKED template gensym `base__N__auto`, or nil when `name` is
+   not one. A canonical `base__N__c` is deliberately NOT matched."
+  [name]
+  (let [m (Regex/run gensym-re name)]
+    (if (erlang/=:= m nil) nil (second m))))
+
+; Order matters here, because this file is compiled by the compiler it
+; defines: the moment `expand-macro` below is (re)defined, every later
+; form's macro expansions run through it — and it calls
+; `canonical-gensyms` → `renumber` → `renumber*`. So all three must be REAL
+; definitions before `expand-macro` is, which is why this block sits above
+; it. `renumber` and `renumber*` are mutually recursive: declare one, define
+; the other, then define the first.
+(defn- renumber
+  "Walk `node` threading the rename map `m` (baked name → canonical name).
+   Returns [node' m']. One self-recursive fn: this file is compiled by the
+   compiler it defines, so by the time the NEXT form after `expand-macro`
+   expands a macro, everything `expand-macro` reaches must already be a real
+   definition — a `declare`d placeholder would be called for real."
+  [node m]
+  (if (and (erlang/is_tuple node) (= :meta (erlang/element 1 node)))
+    ; a positioned node: renumber what is inside, keep the position
+    (let [inner (renumber (erlang/element 2 node) m)]
+      (list (rn/meta-node (first inner) (erlang/element 3 node)) (second inner)))
+    (let [tag (rn/node-tag node)]
+      (cond
+        (= tag :symbol)
+          (let [name (rn/node-name node)
+                base (gensym-base name)]
+            (if (nil? base)
+              (list node m)
+              (if (contains? m name)
+                (list (rn/->tuple (list :symbol (get m name))) m)
+                (let [new (str base "__" (next-fresh!) "__c")]
+                  (list (rn/->tuple (list :symbol new)) (assoc m name new))))))
+        (or (= tag :list) (= tag :vector) (= tag :set))
+          (let [r (reduce (fn [acc item]
+                            (let [x (renumber item (second acc))]
+                              (list (cons (first x) (first acc)) (second x))))
+                          (list (list) m)
+                          (rn/node-items node))]
+            (list (rn/->tuple (list tag (apply list (reverse (first r))))) (second r)))
+        (= tag :map)
+          (let [r (reduce (fn [acc pair]
+                            (let [k (renumber (kv-key pair) (second acc))
+                                  v (renumber (kv-val pair) (second k))]
+                              (list (cons (erlang/list_to_tuple (list (first k) (first v))) (first acc)) (second v))))
+                          (list (list) m)
+                          (rn/node-items node))]
+            (list (rn/->tuple (list :map (apply list (reverse (first r))))) (second r)))
+        :else (list node m)))))
+
+(defn- canonical-gensyms
+  "Rename every template gensym in one expansion's result to a canonical name
+   drawn from this unit's counter (see above). `form` is a reader form (the
+   shape `data->form` returns).
+
+   The rename map is PER EXPANSION and keyed on the BAKED name: within one
+   expansion the same `x#` is the same baked name, so it maps to one
+   canonical name (hygiene inside the template holds); across expansions the
+   map is fresh, so it does not matter that the baked number can CHANGE mid
+   unit — it does, whenever `core.bl` is recompiled by a sibling in the same
+   build wave and its macros re-intern with new baked numbers. A canonical
+   name (`__c`) is never in the map's domain, so a nested re-expansion of an
+   already-canonical form passes it through unchanged."
+  [form]
+  (first (renumber form {})))
+
 (defn- expand-macro
   "Run a macro once and turn its result back into a form.
 
@@ -3371,11 +3560,14 @@
    `macro-fn` is the function from `macro-lookup`; `form` is the whole call
    node; `args` are the argument nodes; `env` is a fresh compile environment."
   [macro-fn form args env]
-  (data->form
-    (BeamLisp.RT/invoke macro-fn
-      (apply list
-        (concat (list (datum form) (macro-env env))
-                (map datum args))))))
+  (canonical-gensyms
+    (data->form
+      (BeamLisp.RT/invoke macro-fn
+        (apply list
+          (concat (list (datum form) (macro-env env))
+                  (map datum args)))))))
+
+
 
 (declare macroexpand-1-env)
 

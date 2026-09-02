@@ -37,6 +37,9 @@ defmodule BeamLisp.Compiler do
   alias BeamLisp.Env
   alias BeamLisp.Reader
 
+  # Per-compilation-unit fresh-name state (pdict). See `reset_fresh!/0`.
+  @fresh_key :bl_fresh_seq
+
   @special_forms ~w(ns def fn defn defn- defmacro defmulti defmethod defnative defprotocol satisfies? extend-type extend-protocol defrecord deftype reify let loop recur if do quote syntax-quote receive throw try loop* let* fn* defserver)
 
   @doc "A fresh top-level compile-time environment."
@@ -1432,6 +1435,81 @@ defmodule BeamLisp.Compiler do
   # capture, and later call sites compile to direct remote calls (see
   # BeamLisp.Link). The `private` flag and any `^{...}`/attr-map metadata
   # land in the var's metadata.
+  @doc """
+  If `form` is a top-level `(defn …)`/`(defn- …)`, install its link in `ns`
+  now — before anything in the unit compiles — and return `true`; else
+  `false`. See `prelink-defn` in priv/boot/compiler.bl for why: forward
+  references inside a file must compile to direct calls in a fresh VM exactly
+  as they do in a warm one, or the same source emits two different beams.
+  """
+  def prelink_defn(form, ns) do
+    case strip_meta(form) do
+      {:list, [{:symbol, kind}, name_form | rest]} when kind in ["defn", "defn-"] ->
+        case strip_meta(name_form) do
+          {:symbol, name} ->
+            case defn_clauses_of(rest, new_env(ns)) do
+              nil -> false
+              clauses ->
+                BeamLisp.Env.put_link(ns, name, prelink_info(BeamLisp.Link.module_for(ns), name, clauses))
+                true
+            end
+
+          _ ->
+            false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp strip_meta({:meta, inner, _}), do: strip_meta(inner)
+  defp strip_meta(x), do: x
+
+  # The clause list of a defn's argument list after peeling docstring and
+  # attr-map, or nil when there is nothing parseable (compile_defn reports).
+  defp defn_clauses_of(rest, env) do
+    rest = Enum.map(rest, &strip_meta/1)
+
+    rest =
+      case rest do
+        [doc, _ | _] when is_binary(doc) -> tl(rest)
+        _ -> rest
+      end
+
+    rest =
+      case rest do
+        [{:map, _} | more] -> more
+        _ -> rest
+      end
+
+    case rest do
+      [] -> nil
+      [s | _] when is_binary(s) -> nil
+      _ -> try do fn_clauses(rest, env) rescue _ -> nil end
+    end
+  end
+
+  defp prelink_info(mod, name, clauses) do
+    shapes =
+      clauses
+      |> Enum.map(fn {params, _guard, _body} ->
+        {fixed, rest} = split_variadic(params)
+        {if(rest, do: :variadic, else: :fixed), length(fixed)}
+      end)
+      |> Enum.uniq()
+
+    fixed = for {:fixed, n} <- shapes, into: %{}, do: {n, String.to_atom(name)}
+
+    variadic =
+      Enum.find_value(shapes, fn
+        {:variadic, n} -> {n, String.to_atom(name <> "__bl_v")}
+        _ -> nil
+      end)
+
+    {mod, fixed, variadic}
+  end
+
   defp compile_defn(name, clauses, env, doc, private, attr) do
     if per_env_attr?(attr) do
       # `^:per-env` only means something for a stateful VALUE def — a function is
@@ -1469,6 +1547,14 @@ defmodule BeamLisp.Compiler do
     # so compilation follows the source. Only the emitted list is
     # rearranged, and within each shape the clauses keep their written
     # order — which is the order their guards are tried in.
+    # PRE-LINK before compiling the clauses, so a non-tail self-reference (or
+    # a mutual one already linked) compiles to the direct `mod.fname(args)`
+    # regardless of whether an earlier compile of this file in this VM left
+    # the link behind — same emitted code in a fresh VM and a warm one. Mirrors
+    # `prelink-info` in priv/boot/compiler.bl; `Link.defvar` re-installs the
+    # identical triple afterwards.
+    BeamLisp.Env.put_link(env.ns, name, prelink_info(mod, name, clauses))
+
     entries =
       clauses
       |> Enum.map(fn {params, guard, body} ->
@@ -1797,7 +1883,62 @@ defmodule BeamLisp.Compiler do
     [datum(form), macro_env(env) | Enum.map(args, &datum/1)]
     |> then(&BeamLisp.RT.invoke(macro_fn, &1))
     |> data_to_form()
+    |> canonical_gensyms()
   end
+
+  # Renumber every `base__N__auto` gensym in an expansion from THIS unit's
+  # fresh counter. The N a macro's template baked in at `defmacro` time is a
+  # function of the macro's file's compile, not of the file being compiled
+  # now, so leaving it leaks build history into dependents' beams. Hygiene
+  # needs only distinctness, which a 1:1 rename preserves. Mirrors
+  # `canonical-gensyms` in priv/boot/compiler.bl (byte-parity oracle).
+  # PER-EXPANSION rename map keyed on the BAKED name (`base__N__auto`),
+  # producing CANONICAL names (`base__M__c`, M from this unit's counter).
+  # Within one expansion the same `x#` is one baked name → one canonical
+  # name (template hygiene holds); across expansions the map is fresh, so a
+  # baked number that CHANGES mid-unit (core.bl recompiled by a sibling in
+  # the same build wave re-interns every macro) cannot leak into the
+  # output. `__c` names are never in the map's domain, so re-expanding an
+  # already-canonical form is the identity. Mirrors compiler.bl.
+  defp canonical_gensyms(form), do: form |> renumber(%{}) |> elem(0)
+
+  defp renumber({:meta, inner, pos}, m) do
+    {inner2, m2} = renumber(inner, m)
+    {{:meta, inner2, pos}, m2}
+  end
+
+  defp renumber({:symbol, name} = node, m) do
+    case Regex.run(~r/^(.+)__[0-9]+__auto$/, name) do
+      [_, base] ->
+        case m do
+          %{^name => new} -> {{:symbol, new}, m}
+          _ ->
+            new = base <> "__" <> Integer.to_string(next_fresh!()) <> "__c"
+            {{:symbol, new}, Map.put(m, name, new)}
+        end
+
+      nil ->
+        {node, m}
+    end
+  end
+
+  defp renumber({tag, items}, m) when tag in [:list, :vector, :set] do
+    {items2, m2} = Enum.map_reduce(items, m, &renumber/2)
+    {{tag, items2}, m2}
+  end
+
+  defp renumber({:map, pairs}, m) do
+    {pairs2, m2} =
+      Enum.map_reduce(pairs, m, fn {k, v}, m ->
+        {k2, m} = renumber(k, m)
+        {v2, m} = renumber(v, m)
+        {{k2, v2}, m}
+      end)
+
+    {{:map, pairs2}, m2}
+  end
+
+  defp renumber(node, m), do: {node, m}
 
   # `&env`: the call site's locals as a map of symbol => name. beam-lisp
   # locals are compiler AST vars (not inspectable data), so the NAMES are
@@ -1828,8 +1969,17 @@ defmodule BeamLisp.Compiler do
   # (a record, a lazy seq, an atom-ref) is a value in its own right and falls
   # through to the literal clause below -- mangling one into `{:map, ...}` here
   # would hand a macro a map where the author passed a record.
-  defp data_to_form(m) when is_bl_map(m),
-    do: {:map, Enum.map(m, fn {k, v} -> {data_to_form(k), data_to_form(v)} end)}
+  # SORTED entries. A map that passed through a macro is an Erlang map, and
+  # small Erlang maps enumerate in KEY-TERM order — for atom keys that is
+  # atom-INDEX order, i.e. the order the atoms were first created in this VM,
+  # which differs between a serial and a parallel build (`:variant` before or
+  # after `:"on-click"`). The emitted `%{}` literal then differs, so the beam
+  # does. Sorting by the READER-FORM key (a stable, structural term) makes
+  # the expansion a function of the source. Map semantics are unaffected.
+  defp data_to_form(m) when is_bl_map(m) do
+    entries = Enum.map(m, fn {k, v} -> {data_to_form(k), data_to_form(v)} end)
+    {:map, Enum.sort_by(entries, &elem(&1, 0))}
+  end
 
   defp data_to_form(a) when is_atom(a) and a not in [nil, true, false],
     do: {:keyword, Atom.to_string(a)}
@@ -1911,6 +2061,7 @@ defmodule BeamLisp.Compiler do
     cond do
       String.contains?(name, "/") -> name
       String.ends_with?(name, "__auto") -> name
+      String.ends_with?(name, "__c") -> name
       special_or_local?(name, env) -> name
       true -> qualified_or_bare(name, env)
     end
@@ -3499,7 +3650,6 @@ defmodule BeamLisp.Compiler do
     Macro.var(String.to_atom("#{clean}_#{next_fresh!()}"), __MODULE__)
   end
 
-  @fresh_key :bl_fresh_seq
 
   @doc """
   Start this process's fresh-name counter over. Called once per compilation

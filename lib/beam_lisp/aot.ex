@@ -115,9 +115,26 @@ defmodule BeamLisp.AOT do
     # matters most — an eval module is transient, this is not.
     file = Keyword.get(opts, :file)
 
+    forms = Reader.read_string(source, file)
+
+    # PRE-LINK every top-level defn in the unit before compiling any form.
+    # A call to a defn defined LATER in the same file would otherwise compile
+    # to a slow `RT.invoke(fetch …)` in a fresh VM but a direct call in a VM
+    # that had compiled the file before (the link survives): same source, two
+    # beams, and the first build the slower. The ns of a form is the ns the
+    # preceding `(ns …)` declared, tracked here exactly as the compile pass
+    # will track it. Both compilers implement `prelink_defn`; genesis is
+    # called because the seam (`Compiler.compile/2`) is per-form and this is
+    # per-unit — the two are byte-parity anyway (the oracle pins it).
+    Enum.reduce(forms, "user", fn form, ns ->
+      case ns_decl(form) do
+        nil -> Compiler.prelink_defn(form, ns); ns
+        declared -> declared
+      end
+    end)
+
     {value_defs, touched, ns_meta} =
-      source
-      |> Reader.read_string(file)
+      forms
       |> Enum.reduce({%{}, MapSet.new(), %{}}, fn form, {vdefs, nss, nsmeta} ->
         ns = Env.current_ns()
         vdefs = capture_value_def(vdefs, form, ns)
@@ -360,6 +377,17 @@ defmodule BeamLisp.AOT do
   # declaration so `__bl_init__/0` can re-run them in a fresh VM (a
   # referred var like `greet` resolves through these at runtime). Latest
   # declaration of an alias/refer wins.
+  # The namespace a top-level `(ns NAME …)` form declares, else nil.
+  defp ns_decl({:meta, inner, _}), do: ns_decl(inner)
+  defp ns_decl({:list, [{:symbol, "ns"}, name_form | _]}) do
+    case name_form do
+      {:meta, {:symbol, n}, _} -> n
+      {:symbol, n} -> n
+      _ -> nil
+    end
+  end
+  defp ns_decl(_), do: nil
+
   defp capture_ns_decl(ns_meta, {:meta, form, _m}), do: capture_ns_decl(ns_meta, form)
 
   defp capture_ns_decl(ns_meta, {:list, [{:symbol, "ns"}, {:symbol, ns} | clauses]}) do
