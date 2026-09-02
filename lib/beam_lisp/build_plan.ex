@@ -23,17 +23,34 @@ defmodule BeamLisp.BuildPlan do
 
   @doc """
   Read every source once and plan the build. `paths` are source files; each
-  becomes a node via `BeamLisp.SourceGraph.header/1` and a sha256 of its bytes.
+  becomes a node via `node-from` (header, content hash, interface hash, the
+  names the interface covers, and the file's references into each required
+  ns) — the same node the runtime gate builds, so build and gate agree.
   """
   @spec plan_paths([binary]) :: plan
   def plan_paths(paths) do
+    BeamLisp.Loader.ensure_loaded(@ns)
+    node_from = BeamLisp.Env.fetch!(@ns, "node-from")
+
     paths
-    |> Enum.map(fn path ->
-      content = File.read!(path)
-      {ns, reqs} = BeamLisp.SourceGraph.header(content)
-      %{path: path, ns: ns, reqs: reqs, hash: content_hash(content)}
-    end)
+    |> Enum.map(fn path -> BeamLisp.RT.invoke(node_from, [path, File.read!(path)]) end)
     |> plan()
+  end
+
+  @doc """
+  The freshness key of one namespace, resolved by name — what the runtime
+  drift gate compares to a beam's stamp and what emit stamps. `resolve.(ns)`
+  returns a namespace's source content or `nil`; `seed` is an optional
+  `{ns, content}` for the primary ns when its file is known but may not
+  resolve by name (the emit path). `nil` when `ns` itself does not resolve.
+
+  ONE definition of the key (`build-plan/key-for` → `plan`), two callers.
+  """
+  @spec key_for(binary, (binary -> binary | nil), {binary, binary} | nil) :: binary | nil
+  def key_for(ns, resolve, seed \\ nil) when is_binary(ns) and is_function(resolve, 1) do
+    BeamLisp.Loader.ensure_loaded(@ns)
+    seed_arg = if seed, do: [elem(seed, 0), elem(seed, 1)], else: nil
+    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, "key-for"), [ns, resolve, seed_arg])
   end
 
   @doc "Plan from already-built nodes (see `t:node_/0`)."
@@ -51,6 +68,4 @@ defmodule BeamLisp.BuildPlan do
     }
   end
 
-  @doc "sha256 (upper hex) of a source's bytes — the leaf hash every key folds."
-  def content_hash(content), do: :crypto.hash(:sha256, content) |> Base.encode16()
 end

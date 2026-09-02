@@ -656,61 +656,23 @@ defmodule BeamLisp.AOT do
   """
   @spec ns_closure_hash(binary, binary | nil) :: binary | nil
   def ns_closure_hash(ns, file) when is_binary(ns) do
-    # Fresh per-call resolution cache: a namespace's source is read at most once
-    # WITHIN this computation, but never carried ACROSS calls (that would serve a
-    # stale hash after an edit — the exact false-fresh the drift gate exists to
-    # prevent). Cleared on entry, dropped on exit.
-    Process.put(:bl_source_info_cache, seed_cache(ns, file))
+    # Fresh per-call resolution cache: a namespace's source is read at most
+    # once WITHIN this computation, never carried ACROSS calls (that would
+    # serve a stale key after an edit — the exact false-fresh the drift gate
+    # exists to prevent). Cleared on entry, dropped on exit.
+    Process.put(:bl_source_info_cache, %{})
 
     try do
-      case source_info_cached(ns) do
-        nil ->
-          nil
-
-        _ ->
-          reqs = fn n ->
-            case source_info_cached(n) do
-              {_hash, requires} -> requires
-              nil -> []
-            end
-          end
-
-          srchash = fn n ->
-            case source_info_cached(n) do
-              {hash, _requires} -> hash
-              nil -> nil
-            end
-          end
-
-          BeamLisp.SourceGraph.closure_hash(ns, srchash, reqs)
-      end
+      resolve = fn n -> source_content_cached(n) end
+      seed = if file && File.exists?(file), do: {ns, File.read!(file)}
+      BeamLisp.BuildPlan.key_for(ns, resolve, seed)
     after
       Process.delete(:bl_source_info_cache)
     end
   end
 
-  # Prime the resolution cache with `ns`'s own `{hash, requires}` read straight
-  # from `file`, so the primary ns never depends on ambient name resolution.
-  # `nil`/unreadable file → empty cache (fall back to name resolution).
-  defp seed_cache(ns, file) when is_binary(file) do
-    case File.read(file) do
-      {:ok, content} ->
-        hash = :crypto.hash(:sha256, content) |> Base.encode16()
-        {_ns, requires} = BeamLisp.SourceGraph.header(content)
-        %{ns => {hash, requires}}
-
-      _ ->
-        %{}
-    end
-  end
-
-  defp seed_cache(_ns, _file), do: %{}
-  # Resolve a namespace's `{source_hash, requires}` at most once per
-  # `ns_closure_hash/1` call. The closure walk and the subsequent per-member
-  # `srchash`/`reqs` queries both hit this, so without the cache a namespace's
-  # source would be read several times; the cache is process-local and cleared
-  # at each top-level entry, so it can never serve a hash from a prior call.
-  defp source_info_cached(ns) do
+  # Resolve a namespace's source CONTENT at most once per key computation.
+  defp source_content_cached(ns) do
     cache = Process.get(:bl_source_info_cache, %{})
 
     case Map.fetch(cache, ns) do
@@ -718,11 +680,12 @@ defmodule BeamLisp.AOT do
         v
 
       :error ->
-        v = BeamLisp.Loader.source_info(ns)
+        v = BeamLisp.Loader.source_content(ns)
         Process.put(:bl_source_info_cache, Map.put(cache, ns, v))
         v
     end
   end
+
   # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
   # `%{aliases:, refers:, requires:}`.
   defp build_init_ast(ns, mod, ns_defs, value_defs, ns_meta) do

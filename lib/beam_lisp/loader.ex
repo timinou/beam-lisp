@@ -60,26 +60,17 @@ defmodule BeamLisp.Loader do
   end
 
   @doc """
-  Resolve `ns` to `{source_hash, requires}` — the content hash (same encoding as
-  `source_hash/1`) plus the namespace names of its `:require` clauses, from ONE
-  file resolution. `nil` when the source is not on the search path.
-
-  This is the runtime half of the FEAT-030 closure hash: `BeamLisp.AOT`
-  recursively walks `requires` and hashes each member's `source_hash`, so a
-  namespace's freshness reflects itself AND its transitive requires. Sharing the
-  ONE `find_file/1` resolution keeps the hash and the require edges consistent
-  (a beam stamped from these inputs matches a runtime gate computed from them).
+  The source CONTENT of `ns` on the current search path, or `nil` when no
+  source is findable (a prod release ships beams, not sources). The freshness
+  key (`BeamLisp.BuildPlan.key_for/3`) derives everything it needs — content
+  hash, requires, interface — from this one read, so the build and the
+  runtime gate see the same bytes.
   """
-  @spec source_info(binary) :: {binary, [binary]} | nil
-  def source_info(ns) when is_binary(ns) do
+  @spec source_content(binary) :: binary | nil
+  def source_content(ns) when is_binary(ns) do
     case find_file(ns) do
-      {:ok, _path, content} ->
-        hash = :crypto.hash(:sha256, content) |> Base.encode16()
-        {_ns, requires} = BeamLisp.SourceGraph.header(content)
-        {hash, requires}
-
-      _ ->
-        nil
+      {:ok, _path, content} -> content
+      _ -> nil
     end
   end
 

@@ -17,13 +17,24 @@
 ;
 ; Input: a list of nodes, one per source file:
 ;
-;   {:path "priv/std/optics.bl" :ns "optics" :reqs ("core" "multi") :hash "…"}
+;   {:path "priv/std/optics.bl" :ns "optics" :reqs ("core" "multi") :hash "…"
+;    :iface "…" :inames ("f" "g" …) :refs {"core" ("map" …) …}}        (optional)
 ;
 ; `:hash` is the file's OWN content hash. `:ns` is nil for a file without an
 ; `(ns …)` form (it compiles into `user` and has no closure to key on: its
 ; freshness is its own hash). `:reqs` are the RAW names the file requires —
 ; a name that resolves to no source still contributes an `ns:?` line to the
-; closure hash, so a require that stops resolving is itself a change.
+; key, so a require that stops resolving is itself a change.
+;
+; The three optional fields turn on INTERFACE keying (ns-interface.bl):
+; `:iface` is the ns's interface hash, `:inames` the names that hash
+; accounts for, `:refs` the `{ns → names}` this file references in each
+; required ns (sg/references). With them, a member X of a node's
+; closure contributes `X:iface` instead of `X:content` — so editing a fn
+; BODY in X rebuilds nothing that requires X — but only when every name the
+; node references in X is in X's `:inames` (the edge is COVERED). An
+; uncovered edge keeps `X:content`: the scan can only ever remove rebuilds
+; it has proven unnecessary, never add a stale beam.
 ;
 ; Output — the plan:
 ;
@@ -33,9 +44,15 @@
 ;    :key     {path → closure-hash}   the manifest / provenance key
 ;    :deps    {path → (path …)}       resolved direct deps, as paths}
 ;
-; `:key` is exactly `source-graph/closure-hash` (same digest, same lines), so
-; a beam the build stamps compares equal to what the runtime gate recomputes.
-; That equality is the whole freshness contract and it is pinned by test.
+; `:key` uses the same digest as `source-graph/closure-hash` and, without the
+; interface fields, the same lines — so the runtime gate (which recomputes
+; the key from live sources with the same node shape) compares equal to what
+; the build stamped. That equality is the whole freshness contract and it is
+; pinned by test.
+;
+; The key of D is over D's WHOLE closure, not its direct requires: T→D→X
+; where D's macro expands into `(X/f …)` puts X's link shape (or X's macro
+; expansion) into T's bytes, so T observes X's interface transitively.
 ;
 ; Cycles: a require cycle is a build error in the sense that no order
 ; satisfies it, but the walk must still terminate and the hash must still be
@@ -46,7 +63,7 @@
 ; the build total on a user's graph.
 
 (ns build-plan
-  (:require [source-graph :as sg]))
+  (:require [source-graph :as sg] [ns-interface]))
 
 ; ── input indexing ───────────────────────────────────────────────────────────
 
@@ -126,15 +143,61 @@
         ; anonymous files (no ns) compile last, in path order, in their own wave
         order (lists/append (lists/reverse (maps/get :order st))
                             (lists/sort (fn [a b] (erlang/=< (maps/get :path a) (maps/get :path b))) anon))
-        srchash-of (fn [n] (let [nd (maps/get n by-ns nil)] (if (erlang/=:= nd nil) nil (maps/get :hash nd))))
+        node-of (fn [n] (maps/get n by-ns nil))
+        ; Is D's edge to X covered — every name D references in X accounted
+        ; for by X's interface? Only meaningful when both sides carry the
+        ; interface fields; a `:refer :all` (names not attributable) or a
+        ; missing field means "not covered".
+        covered? (fn [d x]
+                   (let [xn (node-of x)]
+                     (if (erlang/=:= xn nil) false
+                       (if (erlang/not (maps/is_key :iface xn)) false
+                         (let [refs (as-list (maps/get x (maps/get :refs d (maps/new)) (list)))
+                               inames (maps/get :inames xn (list))]
+                           ; `:refer :all` → names unattributable → not covered
+                           (if (lists/member :all refs) false
+                             (lists/all (fn [r] (lists/member r inames)) refs)))))))
+        ; Who requires X, across the whole graph — computed ONCE (a reverse
+        ; edge map), so asking it per closure member stays O(deg), keeping the
+        ; plan O(V + E + Σ|closure|).
+        requirers (lists/foldl (fn [n acc]
+                                 (lists/foldl (fn [r a] (maps/put r (lists/append (maps/get r a (list)) (list (maps/get :ns n))) a))
+                                              acc (as-list (maps/get :reqs n))))
+                               (maps/new) named)
+        ; A covered-edge map: {X → set of nodes whose edge to X is covered},
+        ; so `line-of` answers "is every observer of X inside D's closure
+        ; covered?" with O(deg) membership tests. Observers OUTSIDE D's
+        ; closure cannot reach D's bytes and rightly do not veto: `u` with
+        ; `:refer :all` on x costs u a rebuild, never d.
+        covered-map (lists/foldl (fn [x acc]
+                                   (maps/put x (lists/foldl (fn [m a] (if (covered? (node-of m) x) (maps/put m true a) a))
+                                                            (maps/new) (maps/get x requirers (list)))
+                                             acc))
+                                 (maps/new) (maps/keys by-ns))
+        ; The line a closure member X contributes to D's key: D itself its
+        ; content (its own edit must rebuild it); another X its INTERFACE iff
+        ; every requirer of X that lies in D's closure has a covered edge to
+        ; X — then no beam D's bytes depend on bakes more of X than its
+        ; interface — else X's content; an unresolvable X `x:?`.
+        line-of (fn [d x d-closure]
+                  (let [xn (node-of x)]
+                    (cond
+                      (erlang/=:= xn nil) (erlang/iolist_to_binary (list x ":?"))
+                      (erlang/=:= x (maps/get :ns d)) (erlang/iolist_to_binary (list x ":" (maps/get :hash xn)))
+                      :else
+                        (let [cov (maps/get x covered-map (maps/new))
+                              observers (lists/filter (fn [m] (maps/is_key m d-closure)) (maps/get x requirers (list)))]
+                          (if (lists/all (fn [m] (maps/is_key m cov)) observers)
+                            (erlang/iolist_to_binary (list x ":" (maps/get :iface xn)))
+                            (erlang/iolist_to_binary (list x ":" (maps/get :hash xn))))))))
         key-of (fn [node]
                  (let [ns (maps/get :ns node)]
                    (if (erlang/=:= ns nil)
                      (maps/get :hash node)
-                     (sg/hash-lines
-                       (lists/map (fn [m] (let [h (srchash-of m)]
-                                            (erlang/iolist_to_binary (list m ":" (if (erlang/=:= h nil) "?" h)))))
-                                  (lists/sort (maps/keys (maps/get :closure (maps/get ns done)))))))))
+                     (let [d-closure (maps/get :closure (maps/get ns done))]
+                       (sg/hash-lines
+                         (lists/map (fn [m] (line-of node m d-closure))
+                                    (lists/sort (maps/keys d-closure))))))))
         keys (lists/foldl (fn [node acc] (maps/put (maps/get :path node) (key-of node) acc)) (maps/new) order)
         deps (lists/foldl (fn [node acc]
                             (maps/put (maps/get :path node)
@@ -155,3 +218,55 @@
         (maps/put :closure closure
           (maps/put :key keys
             (maps/put :deps deps (maps/new))))))))
+
+; ── one namespace's key, from a resolver ─────────────────────────────────────
+;
+; The build has every source in hand and plans them all at once. The RUNTIME
+; drift gate has one namespace and a way to find sources by name — and it
+; must arrive at the SAME key the build stamped, or every beam looks stale.
+; So the gate does not reimplement the key: it walks the closure by name,
+; builds the same nodes the build builds, and calls the same `plan`. One
+; definition of "the key"; two callers.
+
+(defn node-from
+  "The plan node for a source: `{:path :ns :reqs :hash :iface :inames :refs}`,
+   with the interface fields. `path` is whatever the caller wants in the
+   node (the build uses the file path; the gate the ns name)."
+  [path content]
+  (let [fs (sg/forms content)
+        h (sg/header-forms fs)]
+    (maps/put :path path
+      (maps/put :ns (erlang/hd (Enum/to_list h))
+        (maps/put :reqs (erlang/hd (erlang/tl (Enum/to_list h)))
+          (maps/put :hash (binary/encode_hex (crypto/hash :sha256 content))
+            (maps/put :iface (ns-interface/hash-forms fs)
+              (maps/put :inames (ns-interface/names-forms fs)
+                (maps/put :refs (sg/references-forms fs) (maps/new))))))))))
+
+(defn key-for
+  "The freshness key of namespace `ns`, given `resolve`: ns → source content
+   or nil. Walks the require-closure by name (each member resolved once),
+   plans that sub-graph, and returns `ns`'s key — or nil when `ns` itself
+   does not resolve (a packaged release ships no source; the gate trusts
+   the beam). `seed` is an optional `[ns content]` for `ns` itself, for the
+   emit path where the file is known but may not resolve by name yet."
+  [ns resolve seed]
+  (let [seed-ns (if (erlang/=:= seed nil) nil (erlang/hd (Enum/to_list seed)))
+        get (fn [n] (if (erlang/=:= n seed-ns) (erlang/hd (erlang/tl (Enum/to_list seed))) (resolve n)))
+        root (get ns)]
+    (if (erlang/=:= root nil)
+      nil
+      (let [nodes (loop [todo (list ns) seen (maps/new) acc (list)]
+                    (if (erlang/=:= todo (list))
+                      acc
+                      (let [n (erlang/hd todo) more (erlang/tl todo)]
+                        (if (maps/is_key n seen)
+                          (recur more seen acc)
+                          (let [c (get n)]
+                            (if (erlang/=:= c nil)
+                              (recur more (maps/put n true seen) acc)
+                              (let [node (node-from n c)]
+                                (recur (lists/append (as-list (maps/get :reqs node)) more)
+                                       (maps/put n true seen)
+                                       (lists/append (list node) acc)))))))))]
+        (maps/get ns (maps/get :key (plan nodes)))))))
