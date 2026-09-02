@@ -1,0 +1,310 @@
+#+TITLE: datom :db.type/file — content-addressed file values over a tiered BlobStore port (memory → tmp/fs → S3)
+#+STATE: ITEM
+#+SESSION_ID: 15702e33226adb2a
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp--self-hosted/2026-09-02T19-05-56-617Z_15702e33226adb2a.jsonl]]
+#+CUSTOM_ID: PLAN-073-datom-db-type-file-content-addressed-fil
+
+* Initial Message
+
+How would you design a file dbtype? I want:
+- db in-memory -> file in memory or in tmpdir
+- db on file -> file on file storage or on s3
+- db distributed (i.e. postgres, tikZ sharded and stuff) -> s3
+
+Any config needs to be done when setting up the db.
+
+Efficient
+
+If you think of other things to do, let me know
+
+* Initial Message
+
+How would you design a file dbtype? I want:
+- db in-memory -> file in memory or in tmpdir
+- db on file -> file on file storage or on s3
+- db distributed (i.e. postgres, tikZ sharded and stuff) -> s3
+Any config needs to be done when setting up the db. Efficient.
+
+Decisions taken with the user (2026-09-02):
+- writer validates every file datom with =-blob-has?= (correctness first; stamp-skip optimisation only if measured)
+- in-memory db defaults bodies to ETS; =:tmp= is opt-in
+- v1 = port + ets + fs + overlay + tx integration + GC sweep. S3 = wave 2 (separate item, seam named here).
+
+* Goal
+
+A =:db.type/file= value type for datom. A file is a FACT (a datom) but its BYTES are not:
+the datom carries a small content-addressed descriptor, the bytes live in a second port
+(=BlobStore=) whose substrate is chosen ONCE at connect time and follows the database's
+own storage tier by default.
+
+| db substrate         | default blob tier            | opt-in                       |
+|----------------------+------------------------------+------------------------------|
+| store-ets / store-map | blob-ets (memory)           | =:tmp= (System.tmp_dir)      |
+| store-fjall           | blob-fs sibling dir =<path>.blobs= | blob-s3 (wave 2)        |
+| store-hobbes (future) | blob-s3 REQUIRED            | — (local blobs + distributed db is refused) |
+
+* Why the bytes leave the datom (the one non-obvious constraint)
+
+A datom's value is written into 2–4 indexes (=datom.index/put-ops=), and for AVET the
+value is part of the KEY (=datom.codec=). A 40 MB value ⇒ 80–160 MB of index writes and a
+key encoder fed a 40 MB term. ∴ the datom holds a ~50 B descriptor; bytes are stored
+exactly once, keyed by sha256.
+
+Content addressing gives the rest for free: immutability (=as-of= resolves the same bytes
+forever), dedup, idempotent put (safe retries), and "edit a file" = assert a new DFile.
+
+* Precedent to mirror (read these first)
+
+- =priv/lib/datom/store.bl= — the 6-method Store port + OPTIONAL capability protocols
+  (=Scan=, =FileBacked=) beside it. BlobStore copies this shape exactly.
+- =priv/lib/datom/vector.bl= + =schema.bl= =type-ok?= / =validate-attr-def= — how a
+  "special" value type is added: own record (=DVec=), structural check in schema (schema is
+  a LEAF; it must not require the vector/file ns), AVET index/unique REFUSED at declaration
+  time, value rides the value-codec ESC lane.
+- =priv/lib/datom/store-overlay.bl= — speculative buffer over a base; =blob-overlay= is
+  the same idea for bytes.
+- =priv/lib/datom/conn.bl= — registry keyed BY STORE (=store-cell=); =connect-with=;
+  =run-tx-pipeline= (the single pipeline both =transact!= and =with= use);
+  =release!=.
+- =test/bl/datom/store_test.bl= — conformance suite pattern; substrate named in ONE fn.
+
+* Values
+
+#+begin_src clojure
+(ns datom.file)
+(defrecord DFile [sha size media-type])         ; at rest (~50 B). sha = 32-byte binary (sha256)
+;; staged form: same record with an extra :body key (a binary) — exists ONLY between
+;; the caller and the commit. It NEVER reaches an index; the pipeline strips it.
+
+(datom.file/file bytes)                         ; → staged DFile (sha computed, :body kept)
+(datom.file/file bytes {:media-type "image/png"})
+(datom.file/file? v)  (datom.file/staged? v)  (datom.file/sha-hex df)
+#+end_src
+
+Metadata policy: descriptor = ={sha size media-type}= only. Filename, uploader, created-at
+are ORDINARY attributes on the entity — queryable, not buried in a map.
+
+Schema (=datom.schema=): add =:db.type/file= to =VALUE-TYPES=. =type-ok?= checks
+structurally: map, =:sha= binary of 32 bytes, =:size= non-negative int, =:media-type=
+string or nil; if =:body= present it must be a binary with =(byte_size body) = size=.
+=validate-attr-def=: =:db/index= / =:db/unique= on a =:db.type/file= attribute ⇒
+={:error :file-attribute-cannot-be-avet-indexed}= (same rationale as vector: a map
+descriptor has no meaningful AVET order; dedup-by-content lookups go through a sibling
+=:file/sha :db.type/string :db/unique= attribute, populated by a tx-fn if wanted).
+
+Codec: DFile rides =LANE-ESC= (as DVec does). A dedicated =LANE-FILE= (raw 32 B sha + u64
+size + media-type) is a later contained optimisation — note it in the value-codec header
+comment, do not build it.
+
+* The port: =priv/lib/datom/blob.bl=
+
+#+begin_src clojure
+(ns datom.blob)
+
+(defprotocol BlobStore
+  "Content-addressed bytes. Keys are sha256 binaries; values are binaries."
+  (-blob-put    [bs sha bytes])   ; idempotent; returns bs
+  (-blob-get    [bs sha])         ; binary | nil
+  (-blob-has?   [bs sha])         ; boolean
+  (-blob-delete [bs sha])         ; GC only; NEVER called from the tx path; returns bs
+  (-blob-shas   [bs]))            ; lazy seq / vector of every sha held — for GC sweep
+
+;; optional capabilities, dispatched by satisfies? exactly like datom.store/Scan
+(defprotocol BlobStream (-blob-stream [bs sha]))         ; seq of binary chunks
+(defprotocol BlobUrl    (-blob-url [bs sha opts]))       ; string | nil
+(defprotocol DefaultBlobs (-default-blobs [store]))      ; a STORE's default blob tier
+
+(defn stream [bs sha] …)   ; -blob-stream when satisfied, else (list (-blob-get …))
+(defn url    [bs sha opts] …) ; -blob-url when satisfied, else nil
+(defn default-for [store] …) ; -default-blobs when satisfied, else (datom.blob-ets/open)
+#+end_src
+
+=-blob-shas= is on the core port (not optional) because GC is not optional: a crash between
+blob-put and index commit leaves an orphan, and every substrate must be sweepable.
+
+* Substrates (v1)
+
+- =priv/lib/datom/blob-ets.bl= — =(open)=. ETS =set= table, sha → binary. Binaries ≥64 B are
+  refc on the BEAM, so ETS holds a reference, not a copy. =store-ets= and =store-map=
+  extend =DefaultBlobs= → =(blob-ets/open)=.
+- =priv/lib/datom/blob-fs.bl= — =(open dir)=. Layout =<dir>/<hex[0..2]>/<hex[2..4]>/<hex>=
+  (sharded to avoid the many-entries-per-dir cliff). Write = tmp file in =<dir>/.tmp= +
+  =File.rename= ⇒ atomic, a torn write is never visible under the final name. Implements
+  =BlobStream= (=File.stream!= chunks) and =BlobUrl= (="file://…"=). =(open :tmp)= ⇒
+  =System.tmp_dir/beam_lisp_blobs_<unique>= (reuse =datom.store/fresh-path='s uniqueness
+  argument — factor a shared =unique-suffix= if that avoids a copy). =store-fjall= extends
+  =DefaultBlobs= → =(blob-fs/open (str path ".blobs"))= — a sibling dir so db + bodies move
+  together.
+- =priv/lib/datom/blob-overlay.bl= — =(open base)=. Atom-held map buffer; puts land in the
+  buffer; get/has? consult buffer then base; =-blob-delete= on an overlay throws (GC never
+  runs speculatively); =-blob-shas= = union.
+
+* Where the blob store lives (config only at setup, enforced)
+
+=connect-with= gains an options arity:
+#+begin_src clojure
+(datom/connect-with store)                       ; blobs = (datom.blob/default-for store)
+(datom/connect-with store schema-defs)
+(datom/connect-with store schema-defs {:blobs (datom.blob-fs/open :tmp)})
+(datom/connect-with store schema-defs {:blobs :tmp})   ; sugar for the line above
+(datom/connect        schema-defs {:blobs …})          ; ets store + explicit blobs
+#+end_src
+
+The blob store goes into the registry CELL (=store-cell=: ={:writer :basis :subs :blobs}=).
+It is a property of the STORE: a second =connect-with= over the same store with no =:blobs=
+inherits it; with a DIFFERENT =:blobs= ⇒ =(throw (ex-info "blob store already configured
+for this store" {:configured … :requested …}))=. That is "config only at setup" as an
+enforced invariant, not a convention.
+
+=Conn= record gains =blobs=; =Db= record (=datom.db=) gains =blobs= so reads never touch
+the registry (=db-value store schema basis-t blobs=). Every =->Db= / =db-value= caller
+updated (grep =db-value= — conn.bl, db.bl as-of/since/history, watch/migrate if any).
+
+=release!= also drops the blob store from the cell (no close on the port; fs handles are
+just paths; ets table is owned by… see Edge below).
+
+* Write path
+
+Two-phase is THE efficient path; the one-shot form is sugar for small files.
+
+#+begin_src clojure
+;; 1. bytes leave the caller's process, IN PARALLEL with other callers, never in the writer
+(def f (datom/put-file! conn bytes {:media-type "image/png"}))   ; → DFile at rest
+;; 2. the writer sees a 50 B descriptor
+(datom/transact! conn [{:doc/title "cat" :doc/attachment f}])
+
+;; one-shot: a staged DFile in tx-data → the writer uploads before commit
+(datom/transact! conn [{:doc/attachment (datom.file/file bytes)}])
+#+end_src
+
+=put-file!= = sha256 (=:crypto.hash=) → =-blob-put= on =(:blobs conn)= → DFile at rest.
+Runs in the caller's process.
+
+In =run-tx-pipeline= (conn.bl), AFTER =validate= and BEFORE =datom.index/write-datoms=,
+a new step =stage-files!= over the realized datoms:
+- for each datom whose attribute is =:db.type/file= (schema lookup):
+  - staged (has =:body=) → =-blob-put= then strip =:body= from the value
+  - at rest → =(-blob-has? blobs sha)= must be true, else the tx is REJECTED with
+    ={:error :file-missing :attr a :sha hex}= collected like other problems
+- ORDER MATTERS: blobs first, index commit second. A crash between the two leaves an
+  orphan blob (recoverable by GC), never a datom pointing at nothing.
+- =run-tx-pipeline= receives the blob store as a parameter (=[store blobs schema db-before
+  tx-data]=): for =transact!= it is =(:blobs conn)=; for =with= it is
+  =(datom.blob-overlay/open (:blobs conn))= — bodies stay speculative exactly as index
+  writes do, and =db-after= carries the overlay so =file-bytes= on a speculative db works.
+
+The broadcast report's =:tx-datoms= carry descriptors only (bodies were stripped) — a
+subscriber never receives 40 MB over PubSub.
+
+* Read path (facade, =priv/lib/datom.bl=)
+
+#+begin_src clojure
+(datom/file-bytes  db dfile)                ; -blob-get on (:blobs db); nil if absent
+(datom/file-stream db dfile)                ; datom.blob/stream
+(datom/file-url    db dfile {:expires 900}) ; datom.blob/url; nil when the tier has none
+#+end_src
+Reads go through the =Db= value (not the conn), so =as-of= / =history= dbs resolve bytes
+identically — a retracted file's bytes remain readable through a historical db.
+
+* GC: =datom/gc-files!=
+
+Retraction MUST NOT delete bytes — history and =as-of= still reference them. The only
+garbage is orphans (blob present, referenced by zero datoms in ALL history). ∴
+#+begin_src clojure
+(datom/gc-files! conn)   ; → {:swept n :kept m}
+#+end_src
+Algorithm: referenced = set of shas over =(datom/history conn)= scanned per
+=:db.type/file= attribute via AEVT (both assertions and retractions); held = =-blob-shas=;
+delete held ∖ referenced. Runs INSIDE the writer (=with-writer=) so no concurrent
+=put-file!= → =transact!= window can have its just-uploaded blob swept before the
+transaction lands — the writer is the only place where "no tx is in flight" is true.
+Documented caveat: a =put-file!= that never transacts is by definition an orphan and will
+be swept; callers that stage-then-transact across a gc must do so within one transact
+(one-shot form) or accept re-upload (idempotent, so harmless).
+
+Real reclamation of retracted files needs excision — out of scope, named in the file
+header so it has somewhere to stand.
+
+* Tests
+
+- =test/bl/datom/blob_test.bl= (new) — BlobStore CONFORMANCE suite, substrate named in one
+  =open-blobs= fn; run against blob-ets, blob-fs (=:tmp=), blob-overlay-over-ets:
+  put/get round trip · has? · idempotent put · delete idempotent · shas lists exactly what
+  is held · get of unknown sha is nil · a 5 MB binary round-trips byte-identical ·
+  blob-fs: torn-write invisibility (kill between tmp write and rename ⇒ has? false) ·
+  overlay: put invisible to base, get falls through, delete throws.
+- =test/bl/datom/file_test.bl= (new):
+  1. schema: =:db.type/file= accepted; index/unique refused; malformed descriptors refused
+     (wrong sha length, size mismatch with body)
+  2. one-shot transact of a staged DFile → =file-bytes= round-trips; stored datom value has
+     NO =:body= (assert via =datom/datoms= on EAVT)
+  3. two-phase =put-file!= then transact → same
+  4. transact of an at-rest DFile whose sha is NOT in the blob store ⇒ rejected with
+     =:file-missing=
+  5. =with= (speculative): staged file visible through =db-after='s =file-bytes=; base blob
+     store =has?= false afterwards
+  6. dedup: two entities, same bytes ⇒ one blob (=-blob-shas= count 1)
+  7. as-of: retract the file datom; =(file-bytes (as-of db before) f)= still returns bytes;
+     =gc-files!= sweeps nothing (still referenced in history)
+  8. gc: =put-file!= with no transact ⇒ =gc-files!= sweeps exactly 1
+  9. tiering: =connect= (ets) ⇒ blobs is a BlobEts; =connect-with (store-fjall/open p)= ⇒
+     blobs is a BlobFs at =p.blobs= (guard with =store-fjall/available?=, as index.bl does)
+  10. setup-only: second =connect-with= over the same store with a different =:blobs= ⇒
+      throws; with none ⇒ inherits (identical? to the first)
+  11. broadcast: =listen!= then one-shot transact ⇒ the report's tx-datom value has no =:body=
+- =examples/datom/files/01-attach.bl=, =02-tiers.bl=, =03-speculative-and-gc.bl= — must run
+  clean under =mix beam_lisp.run --path priv examples/datom/files/0*.bl=; =00-README.md=
+  indexes them.
+
+* Edge cases (decide these, do not discover them)
+
+- Empty file (0 bytes): valid; sha of empty input; blob-fs writes an empty file.
+- =:body= larger than declared =:size= or sha mismatch on a STAGED file: recompute at
+  =datom.file/file= (the only constructor); the pipeline TRUSTS the constructor but the
+  schema =type-ok?= still checks =size = byte_size body= cheaply. Do not re-hash in the
+  writer (that would put O(bytes) work inside the serializer).
+- ETS blob table ownership: an ETS table dies with its owner. blob-ets must be created
+  with =:public= + a heir or owned by a long-lived process — follow whatever =store-ets=
+  does today (read it; copy the mechanism, do not invent a second one).
+- blob-fs dir missing at open ⇒ =mkdir_p=; unwritable ⇒ throw at OPEN (setup time), never
+  at first put.
+- =-blob-has?= on fs = =File.exists?=; on ets = =:ets.member=. Both O(1).
+- Nil media-type is allowed (unknown); the descriptor still carries the key.
+- =file-bytes= on a descriptor the blob store lacks (e.g. someone deleted the dir) ⇒ nil,
+  not a throw; the datom is still a valid fact. Document.
+
+* Non-goals (v1)
+
+- S3 substrate (wave 2, separate item; the =BlobUrl= presigned seam is the whole reason
+  the read path returns urls now). Wave 2 must promote =req= + =aws_signature= from
+  transitive (=mix.lock= via explorer/req_llm) to DIRECT deps in =mix.exs=.
+- Read-through cache wrapper for remote tiers ={:cache :tmp}= — wave 2/3.
+- Inline-small-files mode — REJECTED: a second storage path through every index.
+- Excision / physical reclaim of retracted files.
+- Encryption at rest, multipart >5 GB, resumable uploads — S3 cfg knobs, later.
+- =LANE-FILE= in value-codec.
+
+* Definition of done
+
+- =blob_test.bl= green against all three v1 substrates; =file_test.bl= 1–11 green.
+- Full datom suite (=mix beam_lisp.test test/bl/datom=) no regressions.
+- grep: no =:body= handling anywhere except =datom.file=, =conn.bl='s =stage-files!=, and
+  =schema.bl='s structural check. No =if fjall= / =if ets= branch anywhere — tiering is
+  =DefaultBlobs= dispatch only.
+- =docs/=: one new page =docs/datom-files-a-file-is-a-fact.md= written per
+  =docs/AGENTS.md= (how it IS, zero context, instructive) — descriptor vs bytes, tiers,
+  two-phase write, why retraction keeps bytes.
+- Examples 01–03 run clean.
+
+* Build sequence (waves)
+
+1. =datom.file= record + constructor; =schema.bl= type + refusals; =value-codec= header note.
+   TEST: file_test 1.
+2. =datom.blob= port + =blob-ets= + =blob-fs= + =blob-overlay=; =DefaultBlobs= on
+   store-ets/store-map/store-fjall. TEST: blob_test.
+3. conn.bl: cell gains =:blobs=; =connect-with= options arity + setup-only enforcement;
+   =Conn=/=Db= gain =blobs=; =run-tx-pipeline= gains =stage-files!=; =with= uses
+   blob-overlay; =release!=. Facade: =put-file!= =file-bytes= =file-stream= =file-url=.
+   TEST: file_test 2–7, 9–11.
+4. =gc-files!=. TEST: file_test 8 (+7 re-asserted).
+5. Examples + doc page. Full suite.

@@ -24,7 +24,9 @@
 
 (ns datom.conn
   (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
-            [datom.store-overlay] [datom.tx] [datom.broadcast] [env]))
+            [datom.store-overlay] [datom.tx] [datom.broadcast] [env]
+            [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
+            [datom.file]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -126,7 +128,10 @@
 ; name promises mutation silently pure (BUG-014). A caller who followed
 ; the naming convention lost their schema and learned about it later,
 ; from an unrelated `transact!` complaining about the data.
-(defrecord Conn [store schema basis writer subs])
+; `blobs` is the bytes port for `:db.type/file` values. Like the writer and
+; the basis it belongs to the STORE (it lives in the registry cell), so two
+; connections over one store resolve files through one blob store.
+(defrecord Conn [store schema basis writer subs blobs])
 
 ;; ── the cross-node PubSub resolver ──────────────────────────────────
 ;;
@@ -198,23 +203,44 @@
   [a b]
   (erlang/list_to_tuple (to-list [a b])))
 
+(defn- resolve-blobs
+  "The blob store a `connect-with` call asks for: an explicit BlobStore, the
+   `:tmp` shorthand (a fresh directory under the system temp dir), or the
+   store's own default when nothing was requested."
+  [store requested]
+  (cond
+    (nil? requested) (or (datom.blob/default-for store) (datom.blob-ets/open))
+    (= requested :tmp) (datom.blob-fs/open :tmp)
+    :else requested))
+
 (defn- store-cell
-  "The `{:writer pid :basis atom}` shared by every connection over
-   `store`, created once.
+  "The `{:writer pid :basis atom :subs :blobs}` shared by every connection
+   over `store`, created once.
 
    `Agent/get_and_update` does the check-and-create in ONE serialized
    step, so two connections opening the same store concurrently cannot
-   both decide it is absent."
-  [store initial-basis]
+   both decide it is absent.
+
+   `requested-blobs` is what THIS caller asked for (nil = no opinion). The
+   blob store is configured exactly once, when the cell is created: a later
+   connection with no opinion inherits it, and a later connection asking
+   for a DIFFERENT one is refused. Bytes must have one home per database;
+   a second tier would silently split the files between two places."
+  [store initial-basis requested-blobs]
   (agent-get-and-update
     (registry)
     (fn [reg]
       (let [k (store-key store)
             hit (get reg k)]
         (if (some? hit)
-          (->tuple-2 hit reg)
+          (if (and (some? requested-blobs)
+                   (not (= requested-blobs :tmp))
+                   (not (= requested-blobs (:blobs hit))))
+            (->tuple-2 {:error {:configured (:blobs hit) :requested requested-blobs}} reg)
+            (->tuple-2 hit reg))
           (let [cell {:writer (start-writer) :basis (atom initial-basis)
-                      :subs (datom.broadcast/new-subs)}]
+                      :subs (datom.broadcast/new-subs)
+                      :blobs (resolve-blobs store requested-blobs)}]
             (->tuple-2 cell (assoc reg k cell))))))
     30000))
 
@@ -267,7 +293,8 @@
             (if (and (some? cell) (Process/alive? (:writer cell)))
               (->tuple-2 (:writer cell) reg)
               (let [fresh (start-writer)
-                    updated (assoc (or cell {:basis (:basis conn) :subs (:subs conn)})
+                    updated (assoc (or cell {:basis (:basis conn) :subs (:subs conn)
+                                             :blobs (:blobs conn)})
                                    :writer fresh)]
                 (->tuple-2 fresh (assoc reg k updated))))))
         30000))))
@@ -341,8 +368,9 @@
 
    `connect` is this with a fresh ETS store, which is the development
    substrate rather than the only one."
-  ([store] (connect-with store []))
-  ([store schema-defs]
+  ([store] (connect-with store [] {}))
+  ([store schema-defs] (connect-with store schema-defs {}))
+  ([store schema-defs opts]
    (let [; RECOVER whatever the store already holds. For an in-memory
          ; store this finds nothing and the defaults stand; for a durable
          ; one it is the difference between reopening a database and
@@ -379,12 +407,17 @@
          ; The writer and the basis belong to the STORE, not to this
          ; connection: a second connection over the same store is another
          ; view of one database and must share both.
-         cell (store-cell store basis)
+         cell (store-cell store basis (get opts :blobs))
+         _ (if (some? (:error cell))
+             (throw (ex-info "blob store already configured for this store; it is chosen once, at setup"
+                             (:error cell)))
+             nil)
          conn (->Conn store
                       (atom (datom.schema/install-all base schema-defs))
                       (:basis cell)
                       (:writer cell)
-                      (:subs cell))]
+                      (:subs cell)
+                      (:blobs cell))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -457,12 +490,99 @@
    `schema-defs` are attribute definitions installed before any data, so
    the very first transaction already knows its cardinalities."
   ([] (connect []))
-  ([schema-defs] (connect-with (datom.store-ets/open) schema-defs)))
+  ([schema-defs] (connect-with (datom.store-ets/open) schema-defs {}))
+  ([schema-defs opts] (connect-with (datom.store-ets/open) schema-defs opts)))
 
 (defn db
   "The current database VALUE. O(1) — it captures a basis, not data."
   [conn]
-  (datom.db/db-value (:store conn) (deref (:schema conn)) (deref (:basis conn))))
+  (datom.db/db-value (:store conn) (deref (:schema conn)) (deref (:basis conn))
+                     (:blobs conn)))
+
+;; ── files ───────────────────────────────────────────────────────────────────
+;;
+;; The efficient write path is TWO-PHASE: bytes leave through `put-file!` in
+;; the CALLER's process — so a hundred uploads run in parallel and the single
+;; writer never blocks on I/O — and the transaction then carries a 50-byte
+;; descriptor. A staged DFile (one still carrying `:body`) in transaction
+;; data is the one-shot convenience for small files: the pipeline uploads it
+;; before the commit.
+
+(defn put-file!
+  "Store `bytes` in the connection's blob store and return the DFile at
+   rest, ready to be transacted. Runs here, in the caller's process."
+  ([conn bytes] (put-file! conn bytes {}))
+  ([conn bytes opts]
+   (let [staged (datom.file/file bytes opts)]
+     (datom.blob/-blob-put (:blobs conn) (:sha staged) (:body staged))
+     (datom.file/at-rest staged))))
+
+(defn- stage-files!
+  "For every `:db.type/file` op: upload a staged body and strip it, or
+   confirm an at-rest descriptor's bytes are already held. Returns the ops
+   with no body anywhere in them, or throws listing every missing file.
+
+   Runs on OPS, after validation (which still sees the body to check its
+   size) and before `realize` — so cardinality-one supersession compares
+   descriptors, never a staged value against its own at-rest twin. A
+   retraction of a file never uploads or checks: the fact is going away.
+
+   Runs BEFORE the index commit, so a crash between the two leaves an orphan
+   blob (recoverable by the GC sweep) and never a datom pointing at nothing."
+  [blobs schema ops]
+  (let [file-attr? (fn [a] (= :db.type/file (datom.schema/value-type schema a)))
+        outcome
+        (reduce
+          (fn [acc op]
+            (let [a (get op 2)
+                  v (get op 3)]
+              (if (and (file-attr? a) (datom.file/file? v))
+                (cond
+                  (datom.file/staged? v)
+                    (do (if (= (get op 0) :db/add)
+                          (datom.blob/-blob-put blobs (:sha v) (:body v))
+                          nil)
+                        (assoc acc :ops (conj (:ops acc) (assoc op 3 (datom.file/at-rest v)))))
+                  (or (not (= (get op 0) :db/add))
+                      (datom.blob/-blob-has? blobs (:sha v)))
+                    (assoc acc :ops (conj (:ops acc) op))
+                  :else
+                    (assoc acc :missing (conj (:missing acc)
+                                              {:error :file-missing
+                                               :attr a
+                                               :sha (datom.file/sha-hex v)})))
+                (assoc acc :ops (conj (:ops acc) op)))))
+          {:ops [] :missing []}
+          ops)]
+    (if (seq (:missing outcome))
+      (throw (ex-info "transaction rejected: file bytes not in the blob store"
+                      {:problems (:missing outcome)}))
+      (:ops outcome))))
+
+(defn gc-files!
+  "Sweep orphan blobs: held by the blob store, referenced by no file datom
+   anywhere in history. Runs INSIDE the writer — the one place where `no
+   transaction is in flight` is true — so a `put-file!` whose transaction is
+   queued cannot have its bytes swept from under it."
+  [conn]
+  (with-writer
+    conn
+    (fn []
+      (let [schema (deref (:schema conn))
+            file-attrs (filterv (fn [a] (= :db.type/file (datom.schema/value-type schema a)))
+                                (keys schema))
+            ; Every datom, assertion or retraction, at any basis: history
+            ; is what keeps a retracted file's bytes alive.
+            referenced (reduce (fn [acc a]
+                                 (reduce (fn [s d] (conj s (:sha (datom.index/-v d))))
+                                         acc
+                                         (datom.index/scan (:store conn) :aevt a)))
+                               #{}
+                               file-attrs)
+            held (datom.blob/-blob-shas (:blobs conn))
+            orphans (filterv (fn [sha] (not (contains? referenced sha))) held)]
+        (doseq [sha orphans] (datom.blob/-blob-delete (:blobs conn) sha))
+        {:swept (count orphans) :kept (- (count held) (count orphans))}))))
 
 (defn schema
   "The connection's current schema map."
@@ -667,10 +787,13 @@
   [conn tx-data]
   (let [db-before (db conn)
         overlay (datom.store-overlay/open (:store conn))
-        result (run-tx-pipeline overlay (deref (:schema conn)) db-before tx-data)
+        ; Bytes are speculative too: a staged file lands in a blob overlay
+        ; the real blob store never sees, and db-after resolves through it.
+        blob-overlay (datom.blob-overlay/open (:blobs conn))
+        result (run-tx-pipeline overlay blob-overlay (deref (:schema conn)) db-before tx-data)
         tx (get result :tx)]
     {:db-before db-before
-     :db-after (datom.db/db-value overlay (deref (:schema conn)) tx)
+     :db-after (datom.db/db-value overlay (deref (:schema conn)) tx blob-overlay)
      :tx tx
      :tempids (get result :tempids)
      :tx-datoms (get result :tx-datoms)}))
@@ -690,7 +813,7 @@
 
    `store` is committed to. For `transact!` that is the connection's real
    store; for `with` it is an overlay whose base is never touched."
-  [store schema db-before tx-data]
+  [store blobs schema db-before tx-data]
   (let [; Transaction functions run FIRST, against the before-value, and
         ; splice their output into the transaction data. Everything after
         ; this line sees a flat tx-data with no :db/fn forms left — so a
@@ -728,7 +851,10 @@
                               (if (= (get op 1) datom.tx/TX-SELF)
                                 (assoc op 1 tx)
                                 op))
-                            expanded)
+                            ; File bodies leave for the blob store HERE,
+                            ; before any datom exists: what gets realized
+                            ; and indexed is the descriptor alone.
+                            (stage-files! blobs schema expanded))
             datoms (datom.tx/realize store schema tx (conj with-self instant))]
         ; One atomic commit for every index of every datom: a transaction
         ; visible in EAVT but not AEVT would be a corrupt database.
@@ -743,7 +869,7 @@
    a unit. It is correct because exactly one process runs it at a time."
   [conn tx-data]
   (let [db-before (db conn)
-        result (run-tx-pipeline (:store conn) (deref (:schema conn)) db-before tx-data)
+        result (run-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before tx-data)
         tx (get result :tx)]
     ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
     ; let a slower transaction with a LOWER id land last and rewind

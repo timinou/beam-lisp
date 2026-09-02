@@ -1,0 +1,176 @@
+; test/bl/datom/file_test.bl — `:db.type/file`: a file is a fact, its bytes are not.
+; Run: mix beam_lisp.test test/bl/datom/file_test.bl
+;
+; The invariants under test:
+;   1. a body never reaches an index (the datom holds a descriptor only)
+;   2. bytes resolve through the DB VALUE, so as-of keeps a retracted file
+;   3. a descriptor whose bytes were never uploaded is refused
+;   4. `with` stages bytes the real blob store never sees
+;   5. the blob tier follows the store and is configured once, at setup
+;   6. GC sweeps orphans only
+
+(ns datom.file.test
+  (:require [datom] [datom.conn] [datom.file] [datom.blob] [datom.blob-ets]
+            [datom.blob-fs] [datom.blob-overlay] [datom.schema] [datom.store-ets]
+            [datom.store-fjall]))
+
+(def SCHEMA
+  [{:db/ident :doc/title :db/valueType :db.type/string}
+   {:db/ident :doc/attachment :db/valueType :db.type/file}])
+
+(defn- bytes-of [n] (erlang/list_to_binary (to-list (mapv (fn [i] (rem (* i 13) 256)) (range 0 n)))))
+
+(defn- attachment [db e] (:doc/attachment (datom/entity db e)))
+
+;; ── schema ───────────────────────────────────────────────────────────
+
+(deftest file-type-is-known-and-refuses-avet
+  (is (nil? (datom.schema/validate-attr-def {:db/ident :a :db/valueType :db.type/file})))
+  (is (= :file-attribute-cannot-be-avet-indexed
+         (:error (datom.schema/validate-attr-def
+                   {:db/ident :a :db/valueType :db.type/file :db/index true}))))
+  (is (= :file-attribute-cannot-be-avet-indexed
+         (:error (datom.schema/validate-attr-def
+                   {:db/ident :a :db/valueType :db.type/file :db/unique :db.unique/identity})))))
+
+(deftest malformed-descriptors-are-refused
+  (let [schema (datom.schema/install-all (datom.schema/empty-schema) SCHEMA)
+        ok? (fn [v] (nil? (datom.schema/validate-value schema :doc/attachment v)))
+        f (datom.file/file "hello")]
+    (is (ok? f))
+    (is (ok? (datom.file/at-rest f)))
+    (is (not (ok? (assoc f :sha "short"))))
+    (is (not (ok? (assoc f :size 99))))
+    (is (not (ok? {:sha (:sha f)})))))
+
+;; ── the datom holds a descriptor; bytes come back through the db value ─
+
+(deftest one-shot-staged-file-round-trips-without-a-body-in-the-index
+  (let [conn (datom/connect SCHEMA)
+        data (bytes-of 5000)
+        r (datom/transact! conn [{:db/id -1 :doc/title "a"
+                                  :doc/attachment (datom/file data {:media-type "x/y"})}])
+        e (get (:tempids r) -1)
+        stored (attachment (:db-after r) e)]
+    (is (datom.file/file? stored))
+    (is (nil? (get stored :body)))
+    (is (= 5000 (:size stored)))
+    (is (= "x/y" (:media-type stored)))
+    (is (= data (datom/file-bytes (:db-after r) stored)))
+    ; the raw datom, straight from the index, carries no body either
+    (is (nil? (get (datom/datom-v (first (datom/datoms (:db-after r) :eavt e :doc/attachment))) :body)))
+    ; nor does the broadcast report
+    (is (every? (fn [d] (nil? (get (datom/datom-v d) :body))) (:tx-datoms r)))))
+
+(deftest two-phase-put-file-then-transact
+  (let [conn (datom/connect SCHEMA)
+        data (bytes-of 70000)
+        desc (datom/put-file! conn data)
+        r (datom/transact! conn [{:db/id -1 :doc/title "b" :doc/attachment desc}])]
+    (is (nil? (get desc :body)))
+    (is (= data (datom/file-bytes (:db-after r) desc)))))
+
+(deftest dangling-descriptor-is-rejected
+  (let [conn (datom/connect SCHEMA)
+        bogus (datom.file/at-rest (datom.file/file "never uploaded"))]
+    (is (thrown? (datom/transact! conn [{:db/id -1 :doc/title "c" :doc/attachment bogus}])))
+    (is (= 0 (count (datom/q '[:find ?e :where [?e :doc/title "c"]] (datom/db conn)))))))
+
+(deftest same-bytes-store-once
+  (let [conn (datom/connect SCHEMA)
+        data (bytes-of 300)]
+    (datom/transact! conn [{:db/id -1 :doc/title "1" :doc/attachment (datom/file data)}
+                           {:db/id -2 :doc/title "2" :doc/attachment (datom/file data)}])
+    (is (= 1 (count (datom.blob/-blob-shas (:blobs conn)))))))
+
+(deftest retraction-keeps-bytes-for-as-of
+  (let [conn (datom/connect SCHEMA)
+        data (bytes-of 100)
+        r (datom/transact! conn [{:db/id -1 :doc/title "d" :doc/attachment (datom/file data)}])
+        e (get (:tempids r) -1)
+        before (datom/db conn)
+        f (attachment before e)]
+    (datom/transact! conn [[:db/retract e :doc/attachment f]])
+    (is (nil? (attachment (datom/db conn) e)))
+    (is (= data (datom/file-bytes before f)))
+    (is (= data (datom/file-bytes (datom/as-of (datom/db conn) (:tx r)) f)))
+    (is (= {:swept 0 :kept 1} (datom/gc-files! conn)))))
+
+;; ── speculation ──────────────────────────────────────────────────────
+
+(deftest with-stages-bytes-the-real-store-never-sees
+  (let [conn (datom/connect SCHEMA)
+        spec (datom/with conn [{:db/id -1 :doc/title "s" :doc/attachment (datom/file "draft")}])
+        f (attachment (:db-after spec) (get (:tempids spec) -1))]
+    (is (= "draft" (datom/file-bytes (:db-after spec) f)))
+    (is (nil? (datom/file-bytes (datom/db conn) f)))
+    (is (= 0 (count (datom.blob/-blob-shas (:blobs conn)))))))
+
+;; ── gc ───────────────────────────────────────────────────────────────
+
+(deftest gc-sweeps-orphans-only
+  (let [conn (datom/connect SCHEMA)]
+    (datom/transact! conn [{:db/id -1 :doc/title "kept" :doc/attachment (datom/file "kept")}])
+    (datom/put-file! conn "orphan")
+    (is (= {:swept 1 :kept 1} (datom/gc-files! conn)))
+    (is (= {:swept 0 :kept 1} (datom/gc-files! conn)))))
+
+;; ── tiers: the store decides; configured once ────────────────────────
+
+(deftest memory-store-defaults-to-memory-blobs
+  (let [conn (datom/connect SCHEMA)]
+    (is (instance? datom.blob-ets/BlobEts (:blobs conn)))
+    (is (nil? (datom/file-url (datom/db conn) (datom/put-file! conn "x"))))))
+
+(deftest tmp-opt-in-puts-bytes-in-a-directory
+  (let [conn (datom/connect SCHEMA {:blobs :tmp})
+        f (datom/put-file! conn "on disk")]
+    (is (instance? datom.blob-fs/BlobFs (:blobs conn)))
+    (is (= true (File/exists? (erlang/binary_part (datom/file-url (datom/db conn) f) 7
+                                                  (- (erlang/byte_size (datom/file-url (datom/db conn) f)) 7)))))
+    (is (= "on disk" (datom/file-bytes (datom/db conn) f)))))
+
+(deftest fjall-store-defaults-to-a-sibling-blob-dir
+  (if (datom.store-fjall/available?)
+    (let [store (datom.store-fjall/open-fresh)
+          conn (datom/connect-with store SCHEMA)]
+      (is (instance? datom.blob-fs/BlobFs (:blobs conn)))
+      (is (= (str (:path store) ".blobs") (:dir (:blobs conn))))
+      (datom/release! conn))
+    (is true)))
+
+(deftest blob-store-is-configured-once-per-store
+  (let [store (datom.store-ets/open)
+        first-conn (datom/connect-with store SCHEMA {:blobs :tmp})
+        again (datom/connect-with store SCHEMA)]
+    (is (= (:blobs first-conn) (:blobs again)))
+    (is (thrown? (datom/connect-with store SCHEMA {:blobs (datom.blob-ets/open)})))))
+
+;; ── the blob port itself, per substrate ──────────────────────────────
+
+(defn- conformance [bs]
+  (let [f (datom.file/file (bytes-of 2048))
+        sha (:sha f)]
+    (is (not (datom.blob/-blob-has? bs sha)))
+    (is (nil? (datom.blob/-blob-get bs sha)))
+    (datom.blob/-blob-put bs sha (:body f))
+    (datom.blob/-blob-put bs sha (:body f))          ; idempotent
+    (is (datom.blob/-blob-has? bs sha))
+    (is (= (:body f) (datom.blob/-blob-get bs sha)))
+    (is (= [sha] (datom.blob/-blob-shas bs)))
+    (datom.blob/-blob-delete bs sha)
+    (datom.blob/-blob-delete bs sha)                 ; idempotent
+    (is (not (datom.blob/-blob-has? bs sha)))
+    (is (= [] (datom.blob/-blob-shas bs)))))
+
+(deftest blob-ets-conforms (conformance (datom.blob-ets/open)))
+(deftest blob-fs-conforms (conformance (datom.blob-fs/open :tmp)))
+
+(deftest blob-overlay-isolates-the-base
+  (let [base (datom.blob-ets/open)
+        ov (datom.blob-overlay/open base)
+        f (datom.file/file "spec")]
+    (datom.blob/-blob-put ov (:sha f) (:body f))
+    (is (datom.blob/-blob-has? ov (:sha f)))
+    (is (not (datom.blob/-blob-has? base (:sha f))))
+    (is (thrown? (datom.blob/-blob-delete ov (:sha f))))))

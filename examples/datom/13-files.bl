@@ -1,0 +1,131 @@
+; examples/datom/13-files.bl — a file is a fact; its bytes are not.
+; Run: mix beam_lisp.run --path priv examples/datom/13-files.bl
+;
+; ── The vision in one sentence ────────────────────────────────────────
+;
+; A `:db.type/file` datom holds a ~50-byte content-addressed descriptor;
+; the bytes live in a BLOB STORE chosen ONCE at connect time, which by
+; default follows the database's own tier:
+;
+;   in-memory db  → bytes in memory        (opt-in: a temp directory)
+;   on-disk db    → bytes in <db>.blobs    (opt-in: S3)
+;   cluster db    → bytes on S3, required  (later)
+;
+; Everything else — history, as-of, speculation, dedup, broadcast — is what
+; the database already does, applied to a file because a file is a fact.
+
+(ns example.datom.files
+  (:require [datom] [datom.file] [datom.blob] [datom.blob-fs] [datom.store-fjall]))
+
+(defn- show [label value] (println (str "  " label "  " (pr-str value))))
+(defn- heading [text] (println (str "\n" text)))
+(defn- tier-of [conn]
+  (let [b (:blobs conn)]
+    (cond (instance? datom.blob-fs/BlobFs b) (str "blob-fs @ " (:dir b))
+          :else "blob-ets (memory)")))
+
+(def SCHEMA
+  [{:db/ident :doc/title :db/valueType :db.type/string}
+   {:db/ident :doc/attachment :db/valueType :db.type/file}])
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 1. an in-memory database keeps its bytes in memory ──")
+
+(def conn (datom/connect SCHEMA))
+(show "blob tier chosen by the store:" (tier-of conn))
+
+; The one-shot form: a staged file in transaction data. The pipeline uploads
+; the bytes and records the descriptor — the datom never carries a body.
+(def png (erlang/list_to_binary (to-list (mapv (fn [i] (rem i 256)) (range 0 4096)))))
+(def r1 (datom/transact! conn [{:db/id -1 :doc/title "cat.png"
+                                :doc/attachment (datom/file png {:media-type "image/png"})}]))
+(def cat (get (:tempids r1) -1))
+
+(def stored (:doc/attachment (datom/entity (datom/db conn) cat)))
+(show "what the datom holds:" (datom.file/at-rest stored))
+(show "body in the datom?" (some? (get stored :body)))
+(show "bytes resolved through the db value, identical?" (= png (datom/file-bytes (datom/db conn) stored)))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 2. the efficient path: upload in YOUR process, transact a descriptor ──")
+
+; `put-file!` runs in the caller — a hundred callers upload in parallel and
+; the single writer serializes only 50-byte descriptors.
+(def big (erlang/list_to_binary (to-list (mapv (fn [i] (rem (* i 7) 256)) (range 0 262144)))))
+(def desc (datom/put-file! conn big {:media-type "application/octet-stream"}))
+(show "descriptor returned (no body):" desc)
+(def r2 (datom/transact! conn [{:db/id -1 :doc/title "big.bin" :doc/attachment desc}]))
+(show "256 KiB round-trips:" (= big (datom/file-bytes (:db-after r2) desc)))
+
+; A descriptor whose bytes were never uploaded is refused, not recorded.
+(def bogus (datom.file/at-rest (datom.file/file "never uploaded")))
+(show "dangling descriptor rejected:"
+      (try (do (datom/transact! conn [{:db/id -1 :doc/title "x" :doc/attachment bogus}]) false)
+           (catch e (:error (first (:problems (ex-data e)))))))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 3. content-addressed: same bytes, one blob ──")
+
+(datom/transact! conn [{:db/id -1 :doc/title "cat-copy.png" :doc/attachment (datom/file png)}])
+(show "documents holding those bytes:"
+      (count (datom/q '[:find ?e :where [?e :doc/attachment _]] (datom/db conn))))
+(show "blobs actually stored:" (count (datom.blob/-blob-shas (:blobs conn))))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 4. history keeps the bytes: retract, then look back ──")
+
+(def before (datom/db conn))
+(datom/transact! conn [[:db/retract cat :doc/attachment (datom.file/at-rest stored)]])
+(show "attachment now:" (:doc/attachment (datom/entity (datom/db conn) cat)))
+(show "attachment as-of before, bytes intact:"
+      (= png (datom/file-bytes before (:doc/attachment (datom/entity before cat)))))
+(show "gc sweeps nothing (still referenced in history):" (datom/gc-files! conn))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 5. speculation: `with` stages bytes the real store never sees ──")
+
+(def spec (datom/with conn [{:db/id -1 :doc/title "draft.txt" :doc/attachment (datom/file "draft")}]))
+(def draft (:doc/attachment (datom/entity (:db-after spec) (get (:tempids spec) -1))))
+(show "speculative db-after resolves the bytes:" (datom/file-bytes (:db-after spec) draft))
+(show "real db does not:" (datom/file-bytes (datom/db conn) draft))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 6. an orphan: uploaded, never transacted, swept ──")
+
+(datom/put-file! conn "forgotten")
+(show "gc:" (datom/gc-files! conn))
+
+;; ═════════════════════════════════════════════════════════════════════
+(heading "── 7. tiers: the store decides; you override once, at setup ──")
+
+; In-memory db, bytes in a temp directory — the opt-in for big files.
+(def tmp-conn (datom/connect SCHEMA {:blobs :tmp}))
+(show "memory db + :tmp →" (tier-of tmp-conn))
+(def r3 (datom/transact! tmp-conn [{:db/id -1 :doc/title "t" :doc/attachment (datom/file png)}]))
+(def t-file (:doc/attachment (datom/entity (:db-after r3) (get (:tempids r3) -1))))
+(show "a file tier hands out a URL:" (datom/file-url (:db-after r3) t-file))
+(show "memory tier hands out none:" (datom/file-url (datom/db conn) desc))
+
+; A second connection over the same store INHERITS the tier…
+(def again (datom/connect-with (:store tmp-conn) SCHEMA))
+(show "second conn, same blob store:" (= (:blobs again) (:blobs tmp-conn)))
+; …and asking for a different one is refused: bytes have one home per db.
+(show "different tier on the same store refused:"
+      (try (do (datom/connect-with (:store tmp-conn) SCHEMA {:blobs (datom.blob-fs/open :tmp)}) false)
+           (catch e (some? (:configured (ex-data e))))))
+
+; A durable db keeps its bytes BESIDE it: <path>.blobs, moved and backed up
+; as one. (Needs the native fjall backend; skipped cleanly when absent.)
+(if (datom.store-fjall/available?)
+  (let [path (str "/tmp/example-datom-files-" (erlang/unique_integer (to-list [:positive])) ".fjall")
+        store (datom.store-fjall/open path)
+        dconn (datom/connect-with store SCHEMA)
+        r (datom/transact! dconn [{:db/id -1 :doc/title "d" :doc/attachment (datom/file png)}])
+        f (:doc/attachment (datom/entity (:db-after r) (get (:tempids r) -1)))]
+    (show "disk db →" (tier-of dconn))
+    (show "bytes live at:" (datom/file-url (:db-after r) f))
+    (show "sibling of the database:" (= (str path ".blobs") (:dir (:blobs dconn))))
+    (datom/release! dconn))
+  (println "  (fjall backend not loaded — disk tier demo skipped)"))
+
+(println "\n  A file is a fact. Its bytes are wherever the database lives.")
