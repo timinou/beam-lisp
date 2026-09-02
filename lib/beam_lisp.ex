@@ -54,19 +54,9 @@ defmodule BeamLisp do
     init()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      raw = File.read!(path)
-
       # A document (.bl.md / .bl.org) works as an entry file too: its
       # program is its code cells, exactly as when it is `:require`d.
-      source =
-        if Path.extname(path) in [".md", ".org"] do
-          BeamLisp.Loader.doc_source(
-            raw,
-            if(String.ends_with?(path, ".org"), do: :org, else: :md)
-          )
-        else
-          raw
-        end
+      source = BeamLisp.Loader.read_source(path)
 
       Compiler.eval_string(source, Compiler.new_env(), path)
     end)

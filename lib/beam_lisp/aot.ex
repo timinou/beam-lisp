@@ -84,7 +84,7 @@ defmodule BeamLisp.AOT do
     boot()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      path |> File.read!() |> compile_source(Keyword.put_new(opts, :file, path))
+      path |> BeamLisp.Loader.read_source() |> compile_source(Keyword.put_new(opts, :file, path))
     end)
   end
 
@@ -158,6 +158,14 @@ defmodule BeamLisp.AOT do
       emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file)
     end)
   end
+
+  # The namespaces the drift gate itself runs on (`ns_closure_hash/1` →
+  # `BuildPlan.key_for/3` → `build-plan` and its requires). Vetting one of
+  # THESE by closure hash would ask the gate to load what it is vetting, and
+  # the loader's cycle guard turns that into `undefined var: build-plan/…`.
+  # They are boot-tier by construction; naming them here keeps that true
+  # even where `Tiers.boot_namespaces/0` cannot see the source tree.
+  @gate_namespaces ~w(build-plan source-graph ns-interface reader-node)
 
   @doc """
   Ensure namespace `ns` is usable in this VM: load its AOT module if a
@@ -664,7 +672,7 @@ defmodule BeamLisp.AOT do
 
     try do
       resolve = fn n -> source_content_cached(n) end
-      seed = if file && File.exists?(file), do: {ns, File.read!(file)}
+      seed = if file && File.exists?(file), do: {ns, BeamLisp.Loader.read_source(file)}
       BeamLisp.BuildPlan.key_for(ns, resolve, seed)
     after
       Process.delete(:bl_source_info_cache)
@@ -1035,8 +1043,12 @@ defmodule BeamLisp.AOT do
           # disk. No closure hash to compute — and none MAY be computed here:
           # the closure hash is answered by `source-graph`, itself a boot
           # namespace, so asking would recurse into the load this gate vets.
-          ns in BeamLisp.Tiers.boot_namespaces() ->
-            beam_key != BeamLisp.AOTCache.compiler_key()
+          ns in BeamLisp.Tiers.boot_namespaces() or ns in @gate_namespaces ->
+            # No toolchain sources on disk (an escript or release away from
+            # its checkout) ⇒ nothing to compare against: trust the beam, as
+            # the closure branch does when no source resolves.
+            BeamLisp.Tiers.boot_namespaces() != [] and
+              beam_key != BeamLisp.AOTCache.compiler_key()
 
           true ->
             # The live tier-2 closure hash: this ns plus its transitive

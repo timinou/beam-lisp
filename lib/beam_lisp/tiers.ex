@@ -76,9 +76,16 @@ defmodule BeamLisp.Tiers do
   deployments, the compile task's VM before the app is loaded).
   """
   def priv_root do
-    case :code.priv_dir(:beam_lisp) do
-      dir when is_list(dir) -> List.to_string(dir)
-      _ -> Path.expand("../../priv", __DIR__)
-    end
+    from_code_path =
+      case :code.priv_dir(:beam_lisp) do
+        dir when is_list(dir) -> List.to_string(dir)
+        _ -> nil
+      end
+
+    # An escript answers with a path INSIDE its archive (`bl/beam_lisp/priv`),
+    # which is not a directory on disk; the source tree is the truth then.
+    if from_code_path && File.dir?(from_code_path),
+      do: from_code_path,
+      else: Path.expand("../../priv", __DIR__)
   end
 end

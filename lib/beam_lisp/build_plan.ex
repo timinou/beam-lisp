@@ -33,7 +33,7 @@ defmodule BeamLisp.BuildPlan do
     node_from = BeamLisp.Env.fetch!(@ns, "node-from")
 
     paths
-    |> Enum.map(fn path -> BeamLisp.RT.invoke(node_from, [path, File.read!(path)]) end)
+    |> Enum.map(fn path -> BeamLisp.RT.invoke(node_from, [path, BeamLisp.Loader.read_source(path)]) end)
     |> plan()
   end
 

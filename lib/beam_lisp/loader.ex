@@ -335,6 +335,18 @@ defmodule BeamLisp.Loader do
   # whose first form is not `(ns …)` declares no namespace and returns
   # nil. Only the head is consumed — the scan stops at the end of the
   # ns name, and the file's body is left for the eventual load to parse.
+  @doc """
+  The loadable source at `path`: the bytes themselves for a plain `.bl`,
+  the concatenated code cells for a literate `.bl.md` / `.bl.org`. This is
+  THE read the build and the loader share, so a document compiles to the
+  same program it loads as.
+  """
+  @spec read_source(Path.t()) :: binary
+  def read_source(path), do: doc_content(path, File.read!(path))
+
+  @doc "The source extensions the loader (and the build) recognise."
+  def doc_extensions, do: @doc_extensions
+
   # A document's loadable source: itself when plain .bl, else its code cells.
   defp doc_content(path, raw) do
     if String.ends_with?(path, ".bl") do

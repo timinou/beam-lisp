@@ -9,6 +9,10 @@ does, and runs them on the tree they live in.
   (:require [source-graph :as sg] [ns-interface :as ni] [build-plan :as bp]))
 ```
 
+```bl-result cell0
+:docs.build.the-build-is-a-program
+```
+
 ## The tiers
 
 beam-lisp's own sources live in three tiers under `priv/`, and the tier says
@@ -29,6 +33,10 @@ how a change propagates:
 (println "boot requires outside boot:" (remove (fn [r] (contains? boot-nss r)) boot-reqs))
 ```
 
+```bl-result boot-files
+:ok
+```
+
 - `std/` — the standard library, keyed per namespace.
 - `lib/` — batteries (`datom`, `auth`, `live`, `loom`, `veritas`, `z3`, …), keyed
   per namespace, optional in a release.
@@ -43,6 +51,10 @@ runtime to disagree about what a `:require` is.
 
 ```beam-lisp
 (println (sg/header "(ns a (:require [b :as bb] c))\n; (:require [not-an-edge])\n(def s \"(:require [nor-this])\")"))
+```
+
+```bl-result cell2
+:ok
 ```
 
 ## The plan: one traversal, three answers
@@ -65,6 +77,10 @@ graph at 400 and 4000 nodes.
 (def t2 (erlang/monotonic_time :millisecond))
 (println "sources:" (count files) "  read+node:" (- t1 t0) "ms   plan:" (- t2 t1) "ms")
 (println "waves:" (count (:waves plan)) " sizes:" (map count (:waves plan)))
+```
+
+```bl-result files
+:ok
 ```
 
 The first wave is the leaves — everything that requires nothing but the ambient
@@ -92,6 +108,10 @@ nodes the key is byte-identical to the old closure hash:
 (println "plain plan key == closure-hash:" (= plain-key closure-key))
 ```
 
+```bl-result plain
+:ok
+```
+
 Three consumers hold that key and must agree:
 
 1. the build's **manifest** (`_build/…/compile.beam_lisp`) stores it per source;
@@ -109,6 +129,10 @@ closure by name, builds the same nodes with `node-from`, and calls the same
 (println "key-for == plan key, every namespace:"
          (every? (fn [n] (= (bp/key-for (:ns n) resolve nil) (get (:key plan) (:path n))))
                  (take 40 (filter :ns nodes))))
+```
+
+```bl-result resolve
+:ok
 ```
 
 ## Reproducible by construction
@@ -134,12 +158,47 @@ history into emitted bytes were found and closed, each in both compilers:
 The property is pinned by `test/beam_lisp/aot_reproducible_test.exs`: serial,
 parallel, and post-perturbation builds emit byte-identical beams.
 
+## The driver: `build/run`
+
+The build itself is `priv/boot/build.bl`. One function, one map in, one map out:
+
+```
+(build/run {:sources [paths] :out "dir" :manifest "path"
+            :force? bool :jobs n :log fn})
+→ {:built n :errors [msg …] :manifest {path {:hash key :key toolchain :modules [mod …]}}}
+```
+
+It plans the sources (`build-plan/plan` over `node-from`), walks the waves,
+and inside each wave runs `build-one` for every source that is not fresh —
+in parallel, `:jobs` at a time, results collected in order. A source is
+**fresh** when its manifest entry has this key, this toolchain key, and every
+module it names is on disk. `build-one` asks the shared cache first
+(`AOTCache.fetch`); on a miss it compiles and publishes. The manifest is
+rewritten after every source, so an interrupted build resumes where it
+stopped. Sources that vanished lose their beams. A source the reader
+rejects is one entry in `:errors` — the rest still builds.
+
+The same function has two shells, and neither decides anything:
+
+- `mix compile.beam_lisp` — flag parsing, the project's compile and manifest
+  paths, `Bootstrap.install!` + `AOT.boot` so the language is up, one call,
+  the tuple Mix wants back.
+- `bl build PATH… [--out DIR] [--force] [--jobs N]` — the same call from the
+  escript; the manifest lives in the output dir.
+
+A literate document (`.bl.md`, `.bl.org`) is a source like any other: the
+build reads it through `Loader.read_source/1`, the same extractor the loader
+uses when it is required, so a document compiles to exactly the program it
+loads as.
+
+Pinned by `test/bl/build_test.bl`: fresh tree, no-op, body edit → 1, interface
+edit → closure, broken source → error, deleted source → swept, poisoned
+manifest → ignored, `clean`.
+
 ## Where the Elixir still is
 
-The build driver in `lib/mix/tasks/compile.beam_lisp.ex` is now a thin shell:
-discover sources → `BuildPlan.plan_paths` → for each wave, `Task.async_stream`
-over `AOT.compile_file` → write the manifest. What it cannot be is `.bl`:
-`Mix.Task.Compiler` is an Elixir behaviour, and the toolchain key that validates
-the bootstrap seed runs *before* the language exists. Everything the driver
-*decides* — order, waves, keys, coverage — is already in the three modules
-above, in the language.
+`Mix.Task.Compiler` is an Elixir behaviour, and the toolchain key that
+validates the bootstrap seed runs *before* the language exists — so the two
+shells above are Elixir, and so is the substrate they boot. Everything the
+build *decides* — order, waves, keys, coverage, freshness, what to run and
+when — is in the language.
