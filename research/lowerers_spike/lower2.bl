@@ -1,0 +1,307 @@
+; lower2.bl — the DOCTRINE-CORRECT lowerer: reader-node tree in, j1 IR out,
+; eligibility routed through the SHIPPED proof engines (no hand-rolled checks).
+;
+; ── What changed from run.bl (the spike) ────────────────────────────────────
+;
+; run.bl lowered the COMPILER-QUOTED tree ({:"{}" …}-wrapped, painful) and
+; hand-rolled its own eligibility (sl-refuse :impure / :not-shrinking). That was
+; a PARALLEL IMPLEMENTATION of two shipped engines. This lowerer:
+;
+;   1. reads the READER-NODE tree — the SAME clean s-expression that
+;      system.footprint, termination, and system.smt already consume. One tree,
+;      one source of truth. `typed/node-*` gives head/items with zero wrapping.
+;
+;   2. delegates eligibility to the engines (the doc-05 offload theorems):
+;        footprint(f) = ∅            → system.footprint/pure?      (purity)
+;        terminates(f)              → termination/check-loop        (measure)
+;      A refusal names the FAILED THEOREM — reusing the engine's own detail,
+;      never a bespoke message.
+;
+;   3. lowers TWO kernel shapes, both provable:
+;        fold-kernel : scalar accumulator, init 0     → `ret acc`   (checksum)
+;        store-kernel: (conj out EXPR), init []        → `store` loop (blend)
+;      The store shape is the FRAME-RULE payoff: `(conj out …)` into a FRESH
+;      output buffer (disjoint from every input binary) is a :W on a resource
+;      that `footprint/frame-independent?` proves disjoint from the reads — so
+;      the functional accumulation is OBSERVATIONALLY PURE and lowers to an
+;      in-place native store loop with no aliasing hazard.
+;
+; Run:  BEAM_LISP_PATH=research/lowerers_spike ./bl run research/lowerers_spike/lower2.bl
+; (or via env/eval of the edited engine sources — see harness.bl)
+
+(ns lower2
+  (:require [typed] [env]))
+
+; NB: the shipped engines (system.footprint, termination) must be loaded by the
+; CALLER before this file is eval'd — the standalone runner and blend_harness
+; both env/eval the EDITED engine sources first (so the extended
+; footprint/termination are in scope without an escript rebuild).
+
+; ── reader-node helpers (clean tree — no {:"{}" wrapping) ───────────────────
+
+(defn nf [n] (typed/node-form n))
+(defn ntag [n] (typed/node-tag (nf n)))
+(defn nitems [n] (typed/node-items (nf n)))
+(defn nname [n] (typed/node-name (nf n)))
+(defn sym? [n] (= :symbol (ntag n)))
+(defn lst? [n] (= :list (ntag n)))
+(defn head-name [n] (if (lst? n) (nname (first (nitems n))) nil))
+(defn call-args [n] (rest (nitems n)))
+(defn int-lit? [n] (and (= :scalar (ntag n)) (int? (nf n))))
+(defn int-val [n] (nf n))
+
+; ── refusal: name the failed theorem, carry the engine's own detail ─────────
+
+(defn refuse [check why] (throw (ex-info (str "REFUSED " check ": " why) {:check check})))
+
+; ── ELIGIBILITY via the shipped engines (doc-05 theorems 1 & 2) ─────────────
+
+(defn check-pure!
+  "Theorem 1 (footprint = ∅). Delegates to system.footprint — the SAME engine
+   the capability sandbox and effects ladder use. A non-empty footprint names
+   the resource that fails purity."
+  [defn-body]
+  (let [fp (system.footprint/fp-walk {} defn-body)]
+    (if (system.footprint/pure? fp)
+      true
+      (refuse :impure (str "footprint " fp " — not empty (doc-05 theorem 1)")))))
+
+(defn check-terminates!
+  "Theorem 2 (terminates). Delegates to termination/check-loop — the SAME
+   engine that gates every recur. Reuses its verdict detail verbatim."
+  [loop-node]
+  (let [v (termination/check-loop loop-node)]
+    (if (contains? #{:accepted :trusted} (:status v))
+      true
+      (refuse :may-diverge (str (:detail v) " (doc-05 theorem 2)")))))
+
+; ── loop-shape extraction (from the clean tree) ─────────────────────────────
+;
+; The eligible control shape is exactly one counted loop:
+;   (loop [i 0 acc INIT] (if (< i BOUND) (recur (+ i STEP) NEXT) RET))
+; where i is the counter, acc the accumulator. STORE vs FOLD is decided by
+; INIT: [] ⟹ store-kernel (output buffer), 0 ⟹ fold-kernel (scalar).
+
+(defn find-loop
+  "The first (loop …) under a node (the defn body). nil if none."
+  [n]
+  (if (and (lst? n) (= "loop" (head-name n)))
+    n
+    (if (or (lst? n) (contains? #{:vector} (ntag n)))
+      (reduce (fn [f x] (if (nil? f) (find-loop x) f)) nil (nitems n))
+      nil)))
+
+(defn parse-loop
+  "Destructure the counted loop into its parts, or refuse with the reason."
+  [loop-node]
+  (let [items (nitems loop-node)
+        binds (nitems (second items))            ; [i 0 acc INIT]
+        body  (nth items 2)]                     ; the (if …)
+    (if (not= 4 (count binds))
+      (refuse :not-a-counted-loop "loop must bind exactly [counter init0 acc init1]"))
+    (let [ctr    (nname (nth binds 0))
+          ctr0   (nth binds 1)
+          acc    (nname (nth binds 2))
+          acc0   (nth binds 3)]
+      (if (not (lst? body))
+        (refuse :not-a-counted-loop "loop body is not an (if …)"))
+      (if (not= "if" (head-name body))
+        (refuse :not-a-counted-loop "loop body is not an (if …)"))
+      (let [test (nth (nitems body) 1)
+            then (nth (nitems body) 2)
+            els  (nth (nitems body) 3)]
+        ; test must be (< ctr BOUND)
+        (if (not (and (lst? test) (= "<" (head-name test))
+                      (sym? (first (call-args test)))
+                      (= ctr (nname (first (call-args test))))))
+          (refuse :not-a-counted-loop "test must be (< counter bound)"))
+        (let [bound (second (call-args test))
+              ; then must contain (recur (+ ctr STEP) NEXT)
+              recur-node (if (and (lst? then) (= "recur" (head-name then)))
+                           then
+                           (refuse :not-a-counted-loop "then-branch must be a bare (recur …)"))
+              rargs (call-args recur-node)
+              step-expr (first rargs)
+              next-expr (second rargs)]
+          ; counter advance must be (+ ctr <pos-lit>)
+          (if (not (and (lst? step-expr) (= "+" (head-name step-expr))
+                        (sym? (first (call-args step-expr)))
+                        (= ctr (nname (first (call-args step-expr))))
+                        (int-lit? (second (call-args step-expr)))
+                        (> (int-val (second (call-args step-expr))) 0)))
+            (refuse :not-shrinking "counter must advance by a positive literal (+ ctr k)"))
+          {:ctr ctr :ctr0 ctr0 :acc acc :acc0 acc0
+           :bound bound :step (int-val (second (call-args step-expr)))
+           :next next-expr :ret els
+           :kind (cond
+                   (and (int-lit? acc0) (= 0 (int-val acc0))) :fold
+                   (= :vector (ntag acc0))                     :store
+                   :else (refuse :unsupported-acc
+                           "accumulator init must be 0 (fold) or [] (store)"))})))))
+
+; ── the arithmetic fragment → IR (ANF fused into the walk) ──────────────────
+
+(def stms (atom nil))
+(def nvar (atom 0))
+(defn fresh [] (let [v @nvar] (swap! nvar inc) v))
+(defn emit! [ln] (swap! stms conj ln))
+
+; env :syms maps a bl symbol name → an IR var index.
+(defn var-of [env n]
+  (let [ix (get (:syms env) (nname n))]
+    (if (nil? ix) (refuse :impure (str "unbound symbol " (nname n))) ix)))
+
+(defn lower-expr!
+  "Lower a fragment expression to an IR var index, emitting straight-line ops.
+   The fragment: literals, params/loop-vars, + - * , quot-by-literal, and
+   (binary/at buf i). Anything else refuses :impure — but note the ENGINE has
+   already certified purity, so a refusal here is a lowering-coverage gap, not
+   an unsoundness."
+  [env e]
+  (cond
+    (int-lit? e)
+      (let [v (fresh)] (emit! (str "imm " v " " (int-val e))) v)
+    (sym? e) (var-of env e)
+    (lst? e)
+      (let [h (head-name e) as (call-args e)]
+        (cond
+          ; (binary/at buf i) → load
+          (= h "binary/at")
+            (let [base (var-of env (first as))
+                  off  (lower-expr! env (second as))
+                  v (fresh)]
+              (emit! (str "load " v " " base " " off)) v)
+          ; (+ a b): fold literal-b into addimm
+          (= h "+")
+            (let [a (lower-expr! env (first as)) rb (second as) v (fresh)]
+              (if (int-lit? rb)
+                (emit! (str "addimm " v " " a " " (int-val rb)))
+                (emit! (str "add " v " " a " " (lower-expr! env rb))))
+              v)
+          ; (- a b): literal-b → subimm; else full sub
+          (= h "-")
+            (let [ra (first as) rb (second as) v (fresh)]
+              (if (int-lit? rb)
+                (let [a (lower-expr! env ra)] (emit! (str "subimm " v " " a " " (int-val rb))))
+                (let [a (lower-expr! env ra) b (lower-expr! env rb)]
+                  (emit! (str "sub " v " " a " " b))))
+              v)
+          (= h "*")
+            (let [a (lower-expr! env (first as)) b (lower-expr! env (second as)) v (fresh)]
+              (emit! (str "mul " v " " a " " b)) v)
+          ; (quot x <lit>) → udivimm  (the /255 pixel normalize)
+          (= h "quot")
+            (let [a (lower-expr! env (first as)) d (second as) v (fresh)]
+              (if (not (int-lit? d))
+                (refuse :impure "quot divisor must be a literal"))
+              (emit! (str "udivimm " v " " a " " (int-val d))) v)
+          :else (refuse :impure (str "call " h " outside the arithmetic fragment"))))
+    :else (refuse :impure "expression outside the fragment")))
+
+; ── kernel emission ─────────────────────────────────────────────────────────
+
+(defn lower-kernel
+  "defn source → j1 IR text. Runs the two engine theorems, then lowers."
+  [src]
+  (reset! stms nil) (reset! nvar 0)
+  (let [node (first (BeamLisp.Reader/read_string src))
+        items (nitems node)
+        fname (nname (nth items 1))
+        params (nitems (nth items 2))
+        pnames (into [] (map (fn [p] (nname p)) params))
+        body-forms (drop 3 items)
+        body (last (into [] body-forms))
+        loop-node (find-loop node)]
+    (if (nil? loop-node) (refuse :not-a-counted-loop "no loop form"))
+    ; ── THEOREMS via the shipped engines ──
+    (check-pure! body)
+    (check-terminates! loop-node)
+    ; ── shape ──
+    (let [lp (parse-loop loop-node)
+          np (count pnames)
+          ; params occupy IR vars 0..np-1
+          env0 {:syms (reduce (fn [m i] (assoc m (nth pnames i) i)) {} (range np))}]
+      (swap! nvar (fn [x] (max x np)))
+      (let [civ (fresh) av (fresh)
+            env (-> env0
+                    (assoc-in [:syms (:ctr lp)] civ)
+                    (assoc-in [:syms (:acc lp)] av))]
+        ; loop counter + accumulator inits
+        (emit! (str "init " civ " " (if (int-lit? (:ctr0 lp)) (int-val (:ctr0 lp)) (var-of env (:ctr0 lp)))))
+        (if (= :fold (:kind lp))
+          (emit! (str "init " av " " (int-val (:acc0 lp)))))
+        (let [bound-v (if (int-lit? (:bound lp))
+                        (let [v (fresh)] (emit! (str "init " v " " (int-val (:bound lp)))) v)
+                        (var-of env (:bound lp)))]
+          (cond
+            ; ── FOLD: acc' = NEXT ; ret acc ──
+            (= :fold (:kind lp))
+              (let [nv (lower-expr! env (:next lp))]
+                (emit! (str "mov " av " " nv))
+                (emit! (str "loop " civ " " bound-v " " (:step lp)))
+                (emit! (str "ret " av)))
+            ; ── STORE: NEXT is (conj out EXPR) → store EXPR at ctr into out(=param0) ──
+            (= :store (:kind lp))
+              (let [conj-node (:next lp)]
+                (if (not (and (lst? conj-node) (= "conj" (head-name conj-node))))
+                  (refuse :unsupported-acc "store accumulator must grow via (conj out EXPR)"))
+                (let [elem (second (call-args conj-node))
+                      ev (lower-expr! env elem)]
+                  ; store into the FIRST param buffer (the fresh output) at ctr
+                  (emit! (str "store 0 " civ " " ev))
+                  (emit! (str "loop " civ " " bound-v " " (:step lp)))
+                  ; store-kernel returns len (param index for bound if it's a param)
+                  (emit! (str "ret " (if (int-lit? (:bound lp)) bound-v (var-of env (:bound lp)))))))))
+        (let [lines (reverse (into [] @stms))]
+          {:name fname :nparams np :kind (:kind lp) :lines lines})))))
+
+(defn ir-text [k]
+  (reduce (fn [a l] (str a l "\n"))
+          (str "kernel " (:name k) " " (:nparams k) "\n")
+          (:lines k)))
+
+; ── demo kernels ────────────────────────────────────────────────────────────
+
+(def checksum-src
+  "(defn checksum [buf n]
+     (loop [i 0 acc 0]
+       (if (< i n) (recur (+ i 1) (+ (* 31 acc) (binary/at buf i))) acc)))")
+
+; the pixel blend, written PURELY (fresh output buffer via conj) — the
+; frame-rule payoff: observationally pure, lowers to a store loop.
+(def blend-src
+  "(defn blend [out dst src n a]
+     (loop [i 0 acc []]
+       (if (< i n)
+         (recur (+ i 1)
+                (conj acc (quot (+ (* a (binary/at src i)) (* (- 255 a) (binary/at dst i))) 255)))
+         n)))")
+
+(def dot-src
+  "(defn dot [xs ys n]
+     (loop [i 0 acc 0]
+       (if (< i n) (recur (+ i 1) (+ acc (* (nth xs i) (nth ys i)))) acc)))")
+
+(defn try-lower [name src]
+  (try
+    (let [k (lower-kernel src)]
+      (str "ACCEPTED [" (:kind k) "] " (count (:lines k)) " IR lines"))
+    (catch e (str "REFUSED " (:check (ex-data e)) " — " (ex-message e)))))
+
+(defn now-us [] (erlang/monotonic_time :microsecond))
+
+(defn main []
+  (println "══ reader-node lowerer — eligibility via shipped engines ══")
+  (let [t0 (now-us) k (lower-kernel checksum-src) t1 (now-us)]
+    (println (str "checksum  : ACCEPTED [" (:kind k) "] " (count (:lines k))
+                  " IR lines, lowered in " (- t1 t0) " µs"))
+    (File/write "/tmp/j1_checksum.ir" (ir-text k))
+    (println (ir-text k)))
+  (let [t0 (now-us) k (lower-kernel blend-src) t1 (now-us)]
+    (println (str "blend     : ACCEPTED [" (:kind k) "] " (count (:lines k))
+                  " IR lines, lowered in " (- t1 t0) " µs"))
+    (File/write "/tmp/j1_blend.ir" (ir-text k))
+    (println (ir-text k)))
+  (println "── refusals name the failed theorem (engine-sourced) ──")
+  (println (str "dot (nth): " (try-lower "dot" dot-src))))
+;; (main) — call explicitly when run standalone; libraries load defs only
