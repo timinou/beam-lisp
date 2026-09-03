@@ -89,6 +89,12 @@ defmodule BeamLisp.ReloadWatcher do
       fs: fs,
       auto_commit: Keyword.get(opts, :auto_commit, true),
       on_result: Keyword.get(opts, :on_result),
+      # How a change is applied: `(source, path, commit?) -> result`. Defaults to
+      # the in-process `apply_change/3`. The daemon injects a variant that
+      # submits the reload to its Executor FIFO, so a stage->commit is ordered
+      # against runs/tests in the same warm VM (no two things mutating the image
+      # at once).
+      apply: Keyword.get(opts, :apply, &apply_change/3),
       event_count: 0,
       last: :idle
     }
@@ -141,7 +147,7 @@ defmodule BeamLisp.ReloadWatcher do
   # the static coherence pass and either applies the edit or holds it with the
   # old code serving — exactly the reconcile-loop contract, driven by a save.
   defp handle_bl_change(path, state) do
-    result = apply_change(file_source(path), path, state.auto_commit)
+    result = state.apply.(file_source(path), path, state.auto_commit)
     if state.on_result, do: state.on_result.(result)
     %{state | last: result}
   end

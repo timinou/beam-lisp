@@ -53,6 +53,16 @@ defmodule BeamLisp.Daemon.Executor do
     :exit, _ -> 0
   end
 
+  @doc """
+  Run `fun` on the single command worker — the SAME FIFO that serves runs and
+  tests. The watcher submits a reload commit here so a stage->commit never races
+  a program the daemon is running: whichever reached the mailbox first wins, and
+  the other waits. Returns `fun`'s value.
+  """
+  def run_reload(server \\ __MODULE__, fun) when is_function(fun, 0) do
+    GenServer.call(server, {:run_reload, fun}, :infinity)
+  end
+
   # --- GenServer: a single worker, calls serialized by the mailbox ---
 
   @impl true
@@ -71,6 +81,22 @@ defmodule BeamLisp.Daemon.Executor do
     # only one program runs at a time. Concurrent clients queue in the mailbox.
     code = execute(sock, id, req, conn, state.handler)
     {:reply, code, state}
+  end
+
+  @impl true
+  def handle_call({:run_reload, fun}, _from, state) do
+    # A reload commit shares the one worker with runs/tests — ordered, never
+    # concurrent with a program mutating the same image.
+    result =
+      try do
+        fun.()
+      rescue
+        e -> {:error, Exception.message(e)}
+      catch
+        kind, v -> {:error, {kind, v}}
+      end
+
+    {:reply, result, state}
   end
 
   # --- execution ---

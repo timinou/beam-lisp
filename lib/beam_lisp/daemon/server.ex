@@ -79,6 +79,15 @@ defmodule BeamLisp.Daemon.Server do
           pid -> {:ok, pid}
         end
 
+      # The watcher registry: `bl watch` clients register here; reload commits
+      # ride the Executor FIFO. Optional — a build without :file_system still
+      # serves every non-watch command.
+      {:ok, _wreg} =
+        case Process.whereis(BeamLisp.Daemon.WatchRegistry) do
+          nil -> BeamLisp.Daemon.WatchRegistry.start_link([])
+          pid -> {:ok, pid}
+        end
+
       state = %{
         root: root,
         endpoints: ep,
