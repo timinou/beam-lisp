@@ -47,6 +47,36 @@ defmodule BeamLisp.Link do
   for why — the shim/body split now lives in the shared emitter.
   """
   def defvar(ns, name, new_defs, location \\ nil) when is_binary(ns) and is_binary(name) do
+    # Backend switch (PLAN-079 S-D). When the process/global backend is :core
+    # AND the self-hosted Core backend module is loaded, a def is built through
+    # bl-ANF -> Core Erlang (self.core/core-defvar-anf) instead of the Elixir
+    # emitter below. Default :elixir (key unset), so this is INERT until
+    # something opts in -- the switch a full-suite regression flips to prove
+    # Core can build the whole system before it becomes the default.
+    if core_backend?() do
+      apply(BeamLisp.Ns.Self.Core, :"core-defvar-anf", [ns, name, new_defs])
+    else
+      defvar_elixir(ns, name, new_defs, location)
+    end
+  end
+
+  # True when the active backend is :core and self.core is available to serve
+  # it. Process key first (per-eval override, e.g. a test), then the global
+  # key; absent -> :elixir. The load/export guard covers the boot window before
+  # self.core is compiled -- during genesis the Elixir path must run.
+  defp core_backend? do
+    backend =
+      Process.get(:bl_backend) ||
+        (case BeamLisp.Env.lookup({:bl_backend}) do
+           {:ok, b} -> b
+           :error -> :elixir
+         end)
+
+    backend == :core and Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
+      function_exported?(BeamLisp.Ns.Self.Core, :"core-defvar-anf", 3)
+  end
+
+  defp defvar_elixir(ns, name, new_defs, location) do
     mod = Emit.module_for(ns)
 
     # This definition's real code — and every closure it creates — lives
