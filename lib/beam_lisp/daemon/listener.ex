@@ -196,6 +196,9 @@ defmodule BeamLisp.Daemon.Listener do
       ctx[:shutting_down] == true ->
         {:error, {:reject, :shutting_down, "daemon draining"}}
 
+      is_function(ctx[:drift_fun], 0) and ctx.drift_fun.() ->
+        {:error, {:reject, :restart_required, "checkout changed under the daemon"}}
+
       version_skew?(hello, ctx) ->
         {:error, {:reject, :restart_required, "compiler key / build id changed"}}
 

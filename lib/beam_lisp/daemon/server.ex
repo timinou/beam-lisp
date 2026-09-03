@@ -89,7 +89,9 @@ defmodule BeamLisp.Daemon.Server do
         idle_seconds: idle_seconds(opts),
         last_activity: System.monotonic_time(:millisecond),
         shutting_down: false,
-        compiler_key: compiler_key(),
+        # The key we BOOTED with (frozen). Drift = this != the live on-disk key.
+        # An explicit `:compiler_key` opt lets a test simulate a stale daemon.
+        compiler_key: Keyword.get(opts, :compiler_key) || compiler_key(),
         daemon_build_id: build_id(),
         execute_fun: Keyword.get(opts, :execute_fun, &default_execute/4),
         stop_flag: :counters.new(1, [:atomics])
@@ -156,7 +158,19 @@ defmodule BeamLisp.Daemon.Server do
       shutting_down: false,
       execute_fun: state.execute_fun,
       control_fun: fn :stop -> GenServer.cast(__MODULE__, :stop) end,
-      queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end
+      queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end,
+      # Self-drift: has the checkout changed under the running daemon? Compare
+      # the key we booted with to the live on-disk key. If it moved, this VM is
+      # stale and MUST be restarted, never trusted — hot-swapping would mix old
+      # loaded code with new sources.
+      drift_fun: fn ->
+        try do
+          is_binary(state.compiler_key) and
+            state.compiler_key != BeamLisp.AOTCache.current_compiler_key()
+        rescue
+          _ -> false
+        end
+      end
     }
 
     flag = state.stop_flag
