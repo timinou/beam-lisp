@@ -89,6 +89,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&d)
 }
 
+/// Raw sha256 digest bytes (the daemon tree fingerprint).
+#[allow(dead_code)]
+pub fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).to_vec()
+}
+
 /// Hex-encode raw bytes (no hashing) — for displaying a stored digest.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
