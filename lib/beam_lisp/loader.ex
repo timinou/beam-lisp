@@ -98,6 +98,27 @@ defmodule BeamLisp.Loader do
   def source_hash_in(dir, ns) do
     with_search_dir(dir, fn -> source_hash(ns) end)
   end
+
+  @doc """
+  Run `fun` with `dirs` bound as the ambient search roots for every namespace
+  load it triggers, in load order. Unlike `with_search_dir/2` (a single dir for
+  drift-gate resolution), this overrides the `[File.cwd!() | extra_dirs()]`
+  capture that `ensure_loaded/1` would otherwise compute — the daemon binds a
+  CLIENT's roots (its cwd + `-p` paths) here because the daemon VM's own cwd is
+  the checkout, not the client's tree. Restores the prior binding after.
+  """
+  def with_ambient_dirs(dirs, fun) when is_list(dirs) do
+    prev = Process.get(:bl_ambient_dirs)
+    Process.put(:bl_ambient_dirs, dirs)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev),
+        do: Process.delete(:bl_ambient_dirs),
+        else: Process.put(:bl_ambient_dirs, prev)
+    end
+  end
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
     # AOT FIRST, and this is the one place it can go.
@@ -156,7 +177,10 @@ defmodule BeamLisp.Loader do
         # this case). The per-load load-path stack is NOT captured: it
         # belongs to whatever load is in progress and reads correctly
         # inside the server.
-        dirs = [File.cwd!()] ++ extra_dirs()
+        # A daemon request binds the CLIENT's roots (cwd + `-p` paths) via
+        # `with_ambient_dirs/2`; the daemon VM's own cwd is the checkout,
+        # not the client's tree. Unbound, this is the standalone capture.
+        dirs = Process.get(:bl_ambient_dirs) || [File.cwd!() | extra_dirs()]
 
         BeamLisp.Loader.Server.run(fn ->
           prev = Process.get(:bl_search_dirs)
