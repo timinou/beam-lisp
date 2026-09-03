@@ -39,7 +39,10 @@ defmodule BeamLisp.Z3Port do
 
   defp bundled_exe do
     exe = if match?({:win32, _}, :os.type()), do: "z3.exe", else: "z3"
-    Path.join([:code.priv_dir(:beam_lisp) |> to_string(), "z3", "bin", exe])
+    # Tiers.priv_root/0, not :code.priv_dir: inside an escript the code path
+    # answers with a path INSIDE the archive, which is not a directory on
+    # disk — the checkout's priv/ is the truth there, as everywhere else.
+    Path.join([BeamLisp.Tiers.priv_root(), "z3", "bin", exe])
   end
 
   @doc """

@@ -17,7 +17,40 @@
 
 (ns system.core
   (:require [z3] [system.footprint :as fp] [typed] [minikanren :as mk] [system.gfp :as gfp]
-            [system.model :as model] [system.smt :as smt] [errors]))
+            [system.model :as model] [system.smt :as smt] [smt :as smtlib] [errors]))
+
+; ── script building: forms, with a verbatim lane for legacy strings ────────
+;
+; Every z3 script this module builds is DATA (see smt.bl): commands composed
+; with syntax-quote, rendered by smt/script at the port edge. Three helpers
+; absorb LEGACY caller strings — `decls` blocks, `inv`/`rel` predicates,
+; `:guard`/`:next` terms from examples and older tools — by routing them
+; through `smt/raw` so they splice verbatim; forms compose as data. New
+; callers pass forms.
+(defn- decl-cmds [d]
+  "Declarations as script items: a legacy text block splices verbatim, a
+   seq of forms passes through."
+  (if (string? d) [(smtlib/raw d)] d))
+
+(defn- asserted [t]
+  "An (assert t) command for a term that may be a form or legacy text."
+  (if (string? t) (smtlib/raw (str "(assert " t ")")) (smtlib/assert t)))
+
+(defn- neg-asserted [t]
+  "An (assert (not t)) command, term-tolerant like `asserted`."
+  (if (string? t) (smtlib/raw (str "(assert (not " t "))")) (smtlib/assert `(not ~t))))
+
+(defn- eq-asserted [a b]
+  "An (assert (= a b)) command, term-tolerant."
+  (if (or (string? a) (string? b))
+    (smtlib/raw (str "(assert (= " a " " b "))"))
+    (smtlib/assert `(= ~a ~b))))
+
+(defn- and-asserted [g1 g2]
+  "An (assert (and g1 g2)) command, term-tolerant."
+  (if (or (string? g1) (string? g2))
+    (smtlib/raw (str "(assert (and " g1 " " g2 "))"))
+    (smtlib/assert `(and ~g1 ~g2))))
 
 ; ════════════════════════════════════════════════════════════════════════
 ; INDUCTIVE SAFETY — □Inv, unbounded (P16c)
@@ -33,20 +66,20 @@
   "Does the transition preserve Inv? Assert Inv(s) ∧ guard ∧ s2=next ∧ ¬Inv(s2);
    unsat ⟹ preserved. Returns {:preserved bool :model countermodel-or-nil}."
   [port inv svar decls guard next]
-  (let [smt (str decls
-                 "(declare-const " svar "2 Int)\n"
-                 "(assert " (inv svar) ")\n"
-                 (if guard (str "(assert " guard ")\n") "")
-                 "(assert (= " svar "2 " next "))\n"
-                 "(assert (not " (inv (str svar "2")) "))\n")
-        r (z3/check-model port smt)]
+  (let [s2 (symbol (str svar "2"))
+        cmds (concat (decl-cmds decls)
+                     [(smtlib/declare-const s2 'Int)
+                      (asserted (inv svar))]
+                     (if guard [(asserted guard)] [])
+                     [(eq-asserted s2 next)
+                      (neg-asserted (inv s2))])
+        r (z3/check-model port cmds)]
     {:preserved (= "unsat" (:status r)) :model (:model r)}))
 
 (defn establishes?
   "Does the initial state expression establish Inv?"
   [port inv decls init]
-  (let [smt (str decls "(assert (not " (inv init) "))\n")
-        r (z3/check-model port smt)]
+  (let [r (z3/check-model port (concat (decl-cmds decls) [(neg-asserted (inv init))]))]
     {:established (= "unsat" (:status r)) :model (:model r)}))
 
 (defn prove-box
@@ -70,48 +103,60 @@
 ; DECIDES sufficiency, datalog DISCHARGES against senders.
 ; ════════════════════════════════════════════════════════════════════════
 
-(defn- render-term [t]
-  (cond
-    (list? t)   (str "(" (join " " (map render-term t)) ")")
-    (symbol? t) (str t)
-    :else       (pr-str t)))
+; miniKanren enumerates plain data — lists of symbols and numbers — which IS
+; the SMT term as data. No rendering: the printer at the port edge renders.
+(defn- render-term [t] t)
 
 (defn- oneof [x xs] (mk/disj* (map (fn [v] (mk/=== x v)) xs)))
 
+(defn- term-atom
+  "A domain member as the FORM atom a candidate names: a numeric string → its
+   integer, any other string → a symbol, an already-formed symbol/number as-is.
+   The ONE place a repair vocabulary crosses from names to terms."
+  [x]
+  (cond (number? x) x
+        (symbol? x) x
+        (string? x) (try (erlang/binary_to_integer x)
+                         (catch _ (symbol x)))
+        :else x))
+
 (defn candidates
   "Every (op a b), op ∈ {<= >=}, a,b ∈ domain — enumerated relationally by
-   miniKanren, as deduped SMT strings."
+   miniKanren as deduped quoted FORMS. Domain members are normalised to term
+   atoms (numeric strings → ints, name strings → symbols) so a candidate is a
+   real SMT term, never a string literal."
   [domain]
-  (let [terms (mk/run 400 q
+  (let [dom (map term-atom domain)
+        terms (mk/run 400 q
                 (mk/fresh [op a b]
                   (mk/=== q (list op a b))
                   (oneof op (list '<= '>=))
-                  (oneof a domain)
-                  (oneof b domain)))]
+                  (oneof a dom)
+                  (oneof b dom)))]
     (distinct (map render-term terms))))
 
 (defn sufficient?
   "Does `cand` close the triple Inv ∧ cand ∧ guard ∧ s2=next ⊢ Inv(s2)?"
   [port inv svar decls guard next cand]
-  (let [smt (str decls
-                 "(declare-const " svar "2 Int)\n"
-                 "(assert " (inv svar) ")\n"
-                 "(assert " cand ")\n"
-                 (if guard (str "(assert " guard ")\n") "")
-                 "(assert (= " svar "2 " next "))\n"
-                 "(assert (not " (inv (str svar "2")) "))\n")]
-    (= "unsat" (z3/check port smt))))
+  (let [s2 (symbol (str svar "2"))]
+    (= "unsat" (z3/check port
+      (concat (decl-cmds decls)
+              [(smtlib/declare-const s2 'Int)
+               (asserted (inv svar))
+               (asserted cand)]
+              (if guard [(asserted guard)] [])
+              [(eq-asserted s2 next)
+               (neg-asserted (inv s2))])))))
 
 (defn fireable?
   "Is `cand` satisfiable with Inv and the guard? (rejects contradictory
    candidates that 'close' the triple by forbidding the transition). NB: no
    inline (check-sat) — z3/check appends it; a second one desyncs the reader."
   [port inv svar decls guard cand]
-  (let [smt (str decls
-                 "(assert " (inv svar) ")\n"
-                 "(assert " cand ")\n"
-                 (if guard (str "(assert " guard ")\n") ""))]
-    (= "sat" (z3/check port smt))))
+  (= "sat" (z3/check port
+     (concat (decl-cmds decls)
+             [(asserted (inv svar)) (asserted cand)]
+             (if guard [(asserted guard)] [])))))
 
 (defn abduce
   "Sufficient + fireable candidates over `domain`, shortest first (a shorter
@@ -134,10 +179,9 @@
   "Under the invariant, does g2 imply g1? (g2 ⇒ g1 means g1 is WEAKER/more
    permissive). Assert inv ∧ g2 ∧ ¬g1; unsat ⇒ the implication holds."
   [port inv svar decls g1 g2]
-  (= "unsat" (z3/check port (str decls
-                                "(assert " (inv svar) ")\n"
-                                "(assert " g2 ")\n"
-                                "(assert (not " g1 "))\n"))))
+  (= "unsat" (z3/check port
+     (concat (decl-cmds decls)
+             [(asserted (inv svar)) (asserted g2) (neg-asserted g1)]))))
 
 (defn repair-transition
   "The WEAKEST sound guard that repairs a broken transition, or nil if none in
@@ -247,15 +291,18 @@
    a-var, c-var, input; a-next/c-next are the two next-state SMT exprs; extra
    is extra premise SMT (guards, initial-phase constraints), or nil."
   [port rel decls a-var c-var a-next c-next extra]
-  (let [smt (str decls
-                 "(declare-const " a-var "2 Int)\n"
-                 "(declare-const " c-var "2 Int)\n"
-                 "(assert " (rel a-var c-var) ")\n"
-                 (if extra (str extra "\n") "")
-                 "(assert (= " a-var "2 " a-next "))\n"
-                 "(assert (= " c-var "2 " c-next "))\n"
-                 "(assert (not " (rel (str a-var "2") (str c-var "2")) "))\n")]
-    (= "unsat" (z3/check port smt))))
+  (let [a2 (symbol (str a-var "2")) c2 (symbol (str c-var "2"))
+        rcmd (fn [v w] (let [t (rel v w)]
+                         (if (string? t) (smtlib/raw (str "(assert " t "))")) (smtlib/assert t))))
+        cmds (concat (decl-cmds decls)
+                     [(smtlib/declare-const a2 'Int)
+                      (smtlib/declare-const c2 'Int)
+                      (rcmd a-var c-var)]
+                     (cond (nil? extra) [] (string? extra) [(smtlib/raw extra)] :else extra)
+                     [(eq-asserted a2 a-next)
+                      (eq-asserted c2 c-next)
+                      (neg-asserted (rel a2 c2))])]
+    (= "unsat" (z3/check port cmds))))
 
 (defn migration-preserves?
   "A hot upgrade's code_change: does migrating v1 → v2 preserve v2's invariant
@@ -263,11 +310,11 @@
    v2's var in terms of v1's. Assert inv(v1) ∧ v2=migrate ∧ ¬inv(v2); unsat ⟹
    the migration is safe."
   [port inv decls v1 v2 migrate]
-  (let [smt (str decls
-                 "(assert " (inv v1) ")\n"
-                 "(assert (= " v2 " " migrate "))\n"
-                 "(assert (not " (inv v2) "))\n")]
-    (= "unsat" (z3/check port smt))))
+  (= "unsat" (z3/check port
+     (concat (decl-cmds decls)
+             [(asserted (inv v1))
+              (eq-asserted v2 migrate)
+              (neg-asserted (inv v2))]))))
 
 ; ════════════════════════════════════════════════════════════════════════
 ; SANDBOX — footprint ⊆ caps, incl. refinement 2 (P16e)
@@ -626,37 +673,41 @@
    the enum sorts need, emitted BEFORE the define-fun that references them.
    Applying Inv to primed args needs no substitution."
   [prelude svars sorts inv-smt]
-  (str prelude
-       "(define-fun Inv ("
-       (join " " (map (fn [v] (str "(" v " " (get sorts v "Int") ")")) svars))
-       ") Bool " inv-smt ")\n"))
+  (concat (cond (nil? prelude) [] (string? prelude) [(smtlib/raw prelude)]
+                (empty? prelude) [] :else prelude)
+          [(apply list 'define-fun 'Inv
+                  ; eager lists: a form is data, never a half-realized thunk
+                  (apply list (map (fn [v] (list (symbol v) (symbol (get sorts v "Int")))) svars))
+                  'Bool
+                  (list inv-smt))]))
 
-(defn- decl-of [nm sort] (str "(declare-const " nm " " sort ")\n"))
+(defn- decl-of [nm sort] (smtlib/declare-const (symbol nm) (symbol sort)))
 
 (defn- preserves-joint?
   "Does the transition preserve the sorted-state invariant? Assert Inv(s) ∧
    guard ∧ (⋀ vᵢ2=nextᵢ) ∧ ¬Inv(s2); unsat ⟹ preserved."
   [port prelude svars sorts inv-smt decls guard nexts]
-  (let [prime-decls (join "" (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars))
-        prime-eqs   (join "" (map (fn [v] (str "(assert (= " v "2 " (get nexts v v) "))\n")) svars))
-        cur-args (join " " svars)
-        pri-args (join " " (map (fn [v] (str v "2")) svars))
-        smt (str (inv-define-fun prelude svars sorts inv-smt)
-                 decls prime-decls
-                 "(assert (Inv " cur-args "))\n"
-                 (if guard (str "(assert " guard ")\n") "")
-                 prime-eqs
-                 "(assert (not (Inv " pri-args ")))\n")]
-    {:preserved (= "unsat" (z3/check port smt))}))
+  (let [prime-decls (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars)
+        prime-eqs   (map (fn [v] (eq-asserted (symbol (str v "2")) (get nexts v v))) svars)
+        cur-args    (map symbol svars)
+        pri-args    (map (fn [v] (symbol (str v "2"))) svars)
+        cmds (concat (inv-define-fun prelude svars sorts inv-smt)
+                     (decl-cmds decls)
+                     prime-decls
+                     [(smtlib/assert `(Inv ~@cur-args))]
+                     (if guard [(asserted guard)] [])
+                     prime-eqs
+                     [(smtlib/assert `(not (Inv ~@pri-args)))])]
+    {:preserved (= "unsat" (z3/check port cmds))}))
 
 (defn- establishes-joint?
   "Does the init state establish the invariant? Assert ¬Inv(init-exprs); unsat
    ⟹ established."
   [port prelude svars sorts inv-smt decls init-exprs]
-  (let [smt (str (inv-define-fun prelude svars sorts inv-smt)
-                 decls
-                 "(assert (not (Inv " (join " " init-exprs) ")))\n")]
-    (= "unsat" (z3/check port smt))))
+  (= "unsat" (z3/check port
+     (concat (inv-define-fun prelude svars sorts inv-smt)
+             (decl-cmds decls)
+             [(smtlib/assert `(not (Inv ~@init-exprs)))]))))
 
 (defn verify-process
   "Verify a process SOURCE FORM end to end. Returns:
@@ -682,7 +733,9 @@
             ; the tag→entry map the translator reads.
             enum-fields (filter (fn [v] (= (get sorts v) (enum-sort-name v))) svars)
             arm-maps (into {} (map (fn [v] [v (variant-arms v inv-node init-c0 msg-cs0)]) enum-fields))
-            prelude (join "" (map (fn [v] (smt/datatype-decl (enum-sort-name v) (get arm-maps v))) enum-fields))
+            ; datatype-decl returns one FORM per sort — the prelude IS the
+            ; command list now
+            prelude (vec (map (fn [v] (smt/datatype-decl (enum-sort-name v) (get arm-maps v))) enum-fields))
             variants (reduce (fn [m v] (merge m (smt/variants-map (enum-sort-name v) (get arm-maps v))))
                              {} enum-fields)
             inv-smt (if (empty? svars) :untranslatable (smt/translate (set svars) variants inv-node))]
@@ -732,13 +785,17 @@
                                                svars))
                                        ts)
                                  "Int"))
-                decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
-                           (join "" (map (fn [nm] (decl-of nm (input-sort nm))) inputs)))
+                decls (vec (concat (map (fn [v] (decl-of v (get sorts v "Int"))) svars)
+                                   (map (fn [nm] (decl-of nm (input-sort nm))) inputs)))
                 ; establishment: a pure pass-through init (the opening state) is
                 ; the caller's contract, trusted. A computed init is checked.
                 init-nexts (if init-c (next-fields svars sorts variants (:next-node init-c)) nil)
+                ; a pass-through init's next value is the var itself — as a
+                ; FORM that is the symbol `v`, as legacy text the string "v"
                 passthrough? (and (some? init-nexts)
-                                  (every? (fn [v] (= (get init-nexts v) v)) svars))
+                                  (every? (fn [v] (let [iv (get init-nexts v)]
+                                                    (or (= iv v) (= iv (symbol v)))))
+                                          svars))
                 init-est (cond
                            (nil? init-c) true
                            (nil? init-nexts) true
@@ -783,8 +840,8 @@
                                               acc (cons (:guard t) (into [] (vals (:nexts t))))))
                                     #{} ts)
                 inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
-                decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
-                           (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
+                decls (vec (concat (map (fn [v] (decl-of v (get sorts v "Int"))) svars)
+                                   (map (fn [nm] (decl-of nm "Int")) inputs)))
                 ; candidate domain: state vars + inputs + {0}, the abduce vocabulary
                 domain (concat svars inputs (list "0"))
                 cands (candidates domain)
@@ -793,7 +850,7 @@
                 repair-for (fn [t]
                              (let [g0 (:guard t)
                                    works (filter (fn [c]
-                                                   (let [combined (if g0 (str "(and " g0 " " c ")") c)]
+                                                   (let [combined (if g0 (apply list 'and g0 [c]) c)]
                                                      (and (:preserved (preserves-joint? port "" svars sorts inv-smt decls combined (:nexts t)))
                                                           (joint-fireable? port svars sorts inv-smt decls g0 c))))
                                                  cands)]
@@ -813,27 +870,41 @@
   "Is the strengthened guard (and guard cand) satisfiable with the invariant?
    Rejects a candidate that 'repairs' by making the transition impossible."
   [port svars sorts inv-smt decls guard cand]
-  (let [smt (str (inv-define-fun "" svars sorts inv-smt) decls
-                 "(assert (Inv " (join " " svars) "))\n"
-                 (if guard (str "(assert " guard ")\n") "")
-                 "(assert " cand ")\n")]
-    (= "sat" (z3/check port smt))))
+  (= "sat" (z3/check port
+     (concat (inv-define-fun [] svars sorts inv-smt)
+             (decl-cmds decls)
+             [(smtlib/assert `(Inv ~@(map symbol svars)))]
+             (if guard [(asserted guard)] [])
+             [(asserted cand)]))))
 
 (defn- guard-implies-multi?
   "Under the invariant (joint), does g2 imply g1? g2 ⇒ g1 ≡ g1 is weaker."
   [port svars sorts inv-smt decls g1 g2]
-  (= "unsat" (z3/check port (str (inv-define-fun "" svars sorts inv-smt) decls
-                                 "(assert (Inv " (join " " svars) "))\n"
-                                 "(assert " g2 ")\n"
-                                 "(assert (not " g1 "))\n"))))
+  (= "unsat" (z3/check port
+     (concat (inv-define-fun [] svars sorts inv-smt)
+             (decl-cmds decls)
+             [(smtlib/assert `(Inv ~@(map symbol svars)))
+              (asserted g2)
+              (neg-asserted g1)]))))
+
+(defn- syms-in [t]
+  "The symbol NAMES inside a form, flattened."
+  (cond (symbol? t) [(name t)]
+        (list? t)   (mapcat syms-in t)
+        (vector? t) (mapcat syms-in t)
+        :else []))
 
 (defn- free-syms
   "The identifier tokens in an SMT-ish or source string — words that are not ops,
    numbers, or keywords. A cheap lexer: strips ( ) [ ] { } then splits on space.
    Keyword tokens (leading :) are message tags, not variables, so dropped."
   [src]
-  (let [stripped (reduce (fn [s d] (join " " (split s d))) src ["(" ")" "[" "]" "{" "}"])
-        toks (split stripped " ")
+  (let [toks (if (string? src)
+               (let [stripped (reduce (fn [s d] (join " " (split s d))) src ["(" ")" "[" "]" "{" "}"])]
+                 (split stripped " "))
+               ; a translated FORM (the shape smt/of-node now returns): walk
+               ; its symbols — a keyword tag is a message tag, not a var
+               (mapcat syms-in [src]))
         ops #{"+" "-" "*" "and" "or" "not" "=" "<" ">" "<=" ">=" "mod"
               "inc" "dec" "pos?" "neg?" "zero?"
               ; boolean literals are VALUES, not variables — declaring them as
@@ -890,9 +961,9 @@
         per-var (mapcat
                   (fn [v]
                     (map (fn [op-k]
-                           (str "(" (first op-k) " " v " " (second op-k) ")"))
+                           (list (symbol (first op-k)) (symbol v) (second op-k)))
                          (mapcat (fn [op] (map (fn [k] [op k]) consts))
-                                 (list "<=" ">="))))
+                                 (list '<= '>=))))
                   svars)]
     (distinct per-var)))
 
@@ -902,34 +973,45 @@
    free opening value, so a candidate over it must hold for ALL openings — we
    model that by leaving it free (no equation), which is the sound reading."
   [port svars sorts decls init-vals cand]
-  (let [eqs (join "" (keep (fn [v]
-                             (let [iv (get init-vals v)]
-                               (if (or (nil? iv) (= iv v)) nil
-                                 (str "(assert (= " v " " iv "))\n"))))
-                           svars))
-        smt (str decls eqs "(assert (not " cand "))\n")]
-    (= "unsat" (z3/check port smt))))
+  (let [eqs (keep (fn [v]
+                    (let [iv (get init-vals v)]
+                      ; a pass-through field (init = the var, by symbol or by
+                      ; legacy name string) stays free — see the docstring
+                      (if (or (nil? iv) (= iv v) (= iv (symbol v))) nil
+                        (eq-asserted (symbol v) iv))))
+                  svars)]
+    (= "unsat" (z3/check port
+       (concat (decl-cmds decls) eqs [(neg-asserted cand)])))))
+
+(defn- prime-sym [t v]
+  "Prime every occurrence of state var `v` in a term: v → v2. Forms walk as
+   data; a legacy string splices by split — both only sound for the
+   single-var vocabulary the candidate enumerator produces."
+  (cond (symbol? t) (if (= t (symbol v)) (symbol (str v "2")) t)
+        (string? t) (join (str v "2") (split t v))
+        (list? t)   (apply list (map (fn [x] (prime-sym x v)) t))
+        :else t))
 
 (defn- inductive-under?
   "Under the conjunction `conj-set` as antecedent, does `cand` survive every
    transition? For each t: assert (⋀ conj-set)(s) ∧ guard ∧ (⋀ v2=next) ∧
    ¬cand(s2); unsat for ALL t ⟹ cand is preserved."
   [port svars sorts decls conj-set ts cand]
-  (let [prime-decls (join "" (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars))
-        anteced (join "" (map (fn [c] (str "(assert " c ")\n")) conj-set))
-        cand2 (join (str (first svars) "2")           ; crude prime of cand: only
-                    (split cand (first svars)))]       ; sound for single-var vocab
+  (let [prime-decls (map (fn [v] (decl-of (str v "2") (get sorts v "Int"))) svars)
+        anteced (map asserted conj-set)]
     (every?
       (fn [t]
-        (let [prime-eqs (join "" (map (fn [v] (str "(assert (= " v "2 "
-                                                    (get (:nexts t) v v) "))\n")) svars))
-              ; prime the candidate over WHICHEVER state var it mentions
-              cprimed (reduce (fn [s v] (join (str v "2") (split s v))) cand svars)
-              smt (str decls prime-decls anteced
-                       (if (:guard t) (str "(assert " (:guard t) ")\n") "")
-                       prime-eqs
-                       "(assert (not " cprimed "))\n")]
-          (= "unsat" (z3/check port smt))))
+        (let [prime-eqs (map (fn [v] (eq-asserted (symbol (str v "2")) (get (:nexts t) v v))) svars)
+              ; prime the candidate over WHICHEVER state var it mentions —
+              ; only sound for the single-var vocabulary, as before
+              cprimed (prime-sym cand (first svars))
+              cmds (concat (decl-cmds decls)
+                           prime-decls
+                           anteced
+                           (if (:guard t) [(asserted (:guard t))] [])
+                           prime-eqs
+                           [(neg-asserted cprimed)])]
+          (= "unsat" (z3/check port cmds))))
       ts)))
 
 (defn discover-invariant
@@ -971,8 +1053,8 @@
                                     acc (cons (:guard t) (into [] (vals (:nexts t))))))
                           #{} ts)
             inputs (filter (fn [nm] (not (contains? svarset nm))) (into [] input-names))
-            decls (str (join "" (map (fn [v] (decl-of v (get sorts v "Int"))) svars))
-                       (join "" (map (fn [nm] (decl-of nm "Int")) inputs)))
+            decls (vec (concat (map (fn [v] (decl-of v (get sorts v "Int"))) svars)
+                               (map (fn [nm] (decl-of nm "Int")) inputs)))
             init-vals (if init-c (next-fields svars sorts {} (:next-node init-c)) {})
             cands (candidate-invariants svars)
             ; 1. establishment filter → a CONSISTENT seed
@@ -987,8 +1069,8 @@
                            (recur next-set))))]
         {:name (:name sm)
          :discovered (if (empty? fixpoint) nil
-                       (str "(and " (join " " (sort fixpoint)) ")"))
-         :conjuncts (sort fixpoint)
+                       (apply list 'and (sort-by pr-str fixpoint)))
+         :conjuncts (sort-by pr-str fixpoint)
          :checked true}))))
 
 ; ═════════════════════════════════════════════════════════════════
@@ -1064,28 +1146,29 @@
                 ; the length domain: each c_len is a non-negative Int; plus any
                 ; input (e.g. x on enqueue) is irrelevant to length, so ignored.
                 len-var (first len-vars)   ; single-collection common case
-                nonneg (join "" (map (fn [lv] (str "(assert (>= " lv " 0))\n")) len-vars))
-                decls (str (join "" (map (fn [lv] (str "(declare-const " lv " Int)\n")) len-vars)))
+                nonneg (map (fn [lv] (smtlib/assert `(>= ~(symbol lv) 0))) len-vars)
+                decls (map (fn [lv] (smtlib/declare-const (symbol lv) 'Int)) len-vars)
                 ; Inv as a define-fun over the length vars
-                idef (str "(define-fun Inv (" (join " " (map (fn [lv] (str "(" lv " Int)")) len-vars))
-                          ") Bool " inv-smt ")\n")
+                idef (apply list 'define-fun 'Inv
+                            (apply list (map (fn [lv] (list (symbol lv) 'Int)) len-vars))
+                            'Bool (list inv-smt))
                 ; establishment: init [] → length 0
                 init-len (if init-c (smt/of-node-len (set svars) colls (:next-node init-c)) nil)
                 init-est (if (or (nil? init-len) (= init-len :untranslatable)) true
-                           (let [smt (str idef decls nonneg
-                                          "(assert (not (Inv " init-len ")))\n")]
-                             (= "unsat" (z3/check port smt))))
+                           (= "unsat" (z3/check port
+                              (concat [idef] decls nonneg
+                                      [(smtlib/assert `(not (Inv ~init-len)))]))))
                 ; preservation: for each transition, prove Inv preserved over lengths
                 step-fails
                   (keep (fn [t]
-                          (let [prime (str "(declare-const " len-var "2 Int)\n")
-                                smt (str idef decls prime
-                                         "(assert (>= " len-var " 0))\n"
-                                         "(assert (Inv " len-var "))\n"
-                                         (if (:guard t) (str "(assert " (:guard t) ")\n") "")
-                                         "(assert (= " len-var "2 " (:next t) "))\n"
-                                         "(assert (not (Inv " len-var "2)))\n")]
-                            (if (= "unsat" (z3/check port smt)) nil {:label (:label t)})))
+                          (let [cmds (concat [idef] decls
+                                             [(smtlib/declare-const (symbol (str len-var "2")) 'Int)
+                                              (smtlib/assert `(>= ~(symbol len-var) 0))
+                                              (smtlib/assert `(Inv ~(symbol len-var)))]
+                                             (if (:guard t) [(asserted (:guard t))] [])
+                                             [(eq-asserted (symbol (str len-var "2")) (:next t))
+                                              (smtlib/assert `(not (Inv ~(symbol (str len-var "2")))))])]
+                            (if (= "unsat" (z3/check port cmds)) nil {:label (:label t)})))
                         ts)]
             (register-guarantee! (keyword (str (:name sm) "-capacity"))
                                  {:extension :exact :kind :capacity})
@@ -1108,19 +1191,20 @@
 (defn- len-bound-inductive?
   "Is (<= len-var k) established at init AND preserved by all transitions `ts`?
    Reuses the length-abstraction SMT the capacity checker builds."
-  [port len-var idef-k decls nonneg init-len ts]
+  [port len-var idef-k decl-cmds nonneg-cmds init-len ts]
   (let [est (if (or (nil? init-len) (= init-len :untranslatable)) true
-              (= "unsat" (z3/check port (str idef-k decls nonneg
-                                             "(assert (not (Inv " init-len ")))\n"))))
+              (= "unsat" (z3/check port
+                 (concat [idef-k] decl-cmds nonneg-cmds
+                         [(smtlib/assert `(not (Inv ~init-len)))]))))
         preserved (every? (fn [t]
-                            (let [prime (str "(declare-const " len-var "2 Int)\n")
-                                  smt (str idef-k decls prime
-                                           "(assert (>= " len-var " 0))\n"
-                                           "(assert (Inv " len-var "))\n"
-                                           (if (:guard t) (str "(assert " (:guard t) ")\n") "")
-                                           "(assert (= " len-var "2 " (:next t) "))\n"
-                                           "(assert (not (Inv " len-var "2)))\n")]
-                              (= "unsat" (z3/check port smt))))
+                            (let [cmds (concat [idef-k] decl-cmds
+                                               [(smtlib/declare-const (symbol (str len-var "2")) 'Int)
+                                                (smtlib/assert `(>= ~(symbol len-var) 0))
+                                                (smtlib/assert `(Inv ~(symbol len-var)))]
+                                               (if (:guard t) [(asserted (:guard t))] [])
+                                               [(eq-asserted (symbol (str len-var "2")) (:next t))
+                                                (smtlib/assert `(not (Inv ~(symbol (str len-var "2")))))])]
+                              (= "unsat" (z3/check port cmds))))
                           ts)]
     (and est preserved)))
 
@@ -1153,13 +1237,15 @@
                           (if (or (= gsmt :untranslatable) (= nsmt :untranslatable) (nil? nsmt))
                             nil {:label (:label c) :guard gsmt :next nsmt})))
                       msg-cs)
-             decls (str "(declare-const " len-var " Int)\n")
-             nonneg (str "(assert (>= " len-var " 0))\n")
+             decl-cmds [(smtlib/declare-const (symbol len-var) 'Int)]
+             nonneg-cmds [(smtlib/assert `(>= ~(symbol len-var) 0))]
              init-vnode (if init-c (field-value-node coll (:next-node init-c)) nil)
              init-len (if init-vnode (smt/of-node-len (set svars) colls init-vnode) nil)
-             idef-of (fn [k] (str "(define-fun Inv ((" len-var " Int)) Bool (<= " len-var " " k "))\n"))
+             idef-of (fn [k] (apply list 'define-fun 'Inv
+                                    (apply list [(list (symbol len-var) 'Int)])
+                                    'Bool (list `(<= ~(symbol len-var) ~k))))
              found (some (fn [k]
-                           (if (len-bound-inductive? port len-var (idef-of k) decls nonneg init-len ts)
+                           (if (len-bound-inductive? port len-var (idef-of k) decl-cmds nonneg-cmds init-len ts)
                              k nil))
                          (range 0 (+ ceiling 1)))]
          (if (nil? found)
@@ -1203,10 +1289,14 @@
 ; Quantified array reasoning can return :unknown — then the guarantee is
 ; :approximate, never a false proof (reachable ≠ decidable).
 
-(def ^:private distinct-def
-  (str "(define-fun Distinct ((a (Array Int Int)) (len Int)) Bool "
-       "(forall ((i Int) (j Int)) "
-       "(=> (and (<= 0 i) (< i j) (< j len)) (not (= (select a i) (select a j))))))\n"))
+; the Distinct definition as DATA — one form, part of the scripts below
+(def ^:private distinct-def-form
+  (apply list 'define-fun 'Distinct
+         (apply list [(list 'a '(Array Int Int)) (list 'len 'Int)])
+         'Bool
+         (list '(forall ((i Int) (j Int))
+                 (=> (and (<= 0 i) (< i j) (< j len))
+                     (not (= (select a i) (select a j))))))))
 
 (defn- enqueue-fresh-guarded?
   "Does clause `c` append a value to `coll` UNDER a freshness guard — i.e. its
@@ -1250,17 +1340,21 @@
             appends (filter (fn [c] (appends-to? coll c)) msg-cs)
             ; establishment: the empty queue (len 0) is trivially distinct.
             est (= "unsat" (z3/check port
-                  (str distinct-def "(declare-const a (Array Int Int))\n"
-                       "(assert (not (Distinct a 0)))\n")))
+                  [distinct-def-form
+                   (smtlib/declare-const 'a '(Array Int Int))
+                   (smtlib/assert `(not (Distinct a 0)))]))
             ; each append preserves distinctness iff it is freshness-guarded.
             unguarded (filter (fn [c] (not (enqueue-fresh-guarded? coll c))) appends)
             ; z3 confirms: a fresh-guarded append DOES preserve distinctness.
             fresh-preserves (= "unsat" (z3/check port
-                              (str distinct-def
-                                   "(declare-const a (Array Int Int))\n(declare-const len Int)\n(declare-const x Int)\n"
-                                   "(assert (>= len 0))\n(assert (Distinct a len))\n"
-                                   "(assert (forall ((i Int)) (=> (and (<= 0 i) (< i len)) (not (= (select a i) x)))))\n"
-                                   "(assert (not (Distinct (store a len x) (+ len 1))))\n")))
+                              [distinct-def-form
+                               (smtlib/declare-const 'a '(Array Int Int))
+                               (smtlib/declare-const 'len 'Int)
+                               (smtlib/declare-const 'x 'Int)
+                               (smtlib/assert `(>= len 0))
+                               (smtlib/assert `(Distinct a len))
+                               (smtlib/assert `(forall ((i Int)) (=> (and (<= 0 i) (< i len)) (not (= (select a i) x)))))
+                               (smtlib/assert `(not (Distinct (store a len x) (+ len 1))))]))
             pos (typed/node-pos node)
             fails (map (fn [c] {:label (:label c)}) unguarded)]
         (register-guarantee! (keyword (str (:name sm) "-distinct"))
@@ -1375,8 +1469,7 @@
   "Can both guards hold at once? Assert (and g1 g2); sat ⇒ they overlap ⇒
    nondeterministic. decls declares the free vars."
   [port decls g1 g2]
-  (let [smt (str decls "(assert (and " g1 " " g2 "))\n")]
-    (= "sat" (z3/check port smt))))
+  (= "sat" (z3/check port (concat (decl-cmds decls) [(and-asserted g1 g2)]))))
 
 (defn nondeterministic-pairs
   "Pairs of same-label transitions whose guards overlap. `transitions` is

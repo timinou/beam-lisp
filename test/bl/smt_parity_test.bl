@@ -1,0 +1,129 @@
+; smt_parity_test.bl — the data cutover, certified by the solver.
+;
+; When system.smt's translators were cut from emitting SMT-LIB strings to
+; returning QUOTED FORMS, the old string outputs were snapshotted into
+; test/fixtures/smt_parity/expected.bl. This suite rebuilds every snapshot
+; entry through the form translators and has z3 prove the two DENOTE THE
+; SAME TERM: `(assert (not (= old new)))` must come back unsat. Formatting
+; differences (`(- 1)` vs `-1`, whitespace) are irrelevant; meaning is not.
+(ns smt-parity.test
+  (:require [smt :as s] [system.smt :as smt] [typed] [z3]))
+
+(def fixture-path "test/fixtures/smt_parity/expected.bl")
+
+(def corpus
+  "name → {:vars {:name sort} :src source :kind :term | :defn}. The sorts
+   default to Int; string-theory entries name their sorts."
+  {"cmp"           {:vars {"a" "Int"} :src "(> a 0)"}
+   "impl"          {:vars {"a" "Int"} :src "(=> (> a 0) (> a -1))"}
+   "ite"           {:vars {"a" "Int"} :src "(if (> a 0) (+ a 1) (- a 1))"}
+   "max-idiom"     {:vars {"a" "Int"} :src "(= (max 0 a) (ite (>= 0 a) 0 a))"}
+   "min-max"       {:vars {"a" "Int" "b" "Int"} :src "(>= (min a b) (max 0 (- (+ a b) 10)))"}
+   "pred-desugar"  {:vars {"a" "Int"} :src "(and (pos? a) (not (zero? a)))"}
+   "dec-inc"       {:vars {"n" "Int"} :src "(= (dec (inc n)) n)"}
+   "arith-mix"     {:vars {"a" "Int" "b" "Int"} :src "(>= (* a b) (+ (mod a 7) (* 2 b)))"}
+   "real-literals" {:vars {"r" "Real"} :src "(and (> r 1.5) (< r 2.0))"}
+   "real-neg"      {:vars {"r" "Real"} :src "(>= r -1.5)"}
+   "strings"       {:vars {"s" "String" "t" "String"} :src "(str-contains? (str s t) \"hi\")"}
+   "str-len"       {:vars {"s" "String"} :src "(>= (str-len s) 3)"}
+   "guarded-clauses" {:vars {"a" "Int"} :kind :defn :ret "Int"
+                      :src "(defn sign ([a] :when (pos? a) 1) ([a] :when (neg? a) (- 0 1)) ([a] 0))"}
+   "define-fun"    {:vars {"n" "Int"} :kind :defn :ret "Int"
+                    :src "(defn floor-half ([n] :when (>= n 0) (div n 2)) ([n] (- 0 (div (- 0 n) 2))))"}})
+
+(defn- expected-map
+  "The snapshot, loaded once: the fixture lives outside the search path, so
+   it is read by path and evaluated (its defs intern :global)."
+  []
+  (let [fetch (fn [] (try (BeamLisp.Env/fetch! "smt-parity.expected" "expected") (catch _ nil)))]
+    (when (nil? (fetch))
+      (BeamLisp/eval (File/read! fixture-path)))
+    (fetch)))
+
+(defn- old-str
+  "The snapshotted SMT-LIB string for a corpus entry."
+  [name]
+  (let [exp (get (expected-map) name)]
+    (when (nil? exp) (throw (ex-info (str "no snapshot for " name) {})))
+    exp))
+
+(defn- node->data
+  "A reader node's structural form → the plain datum it denotes. The form
+   is a kind-tagged tuple — `{:symbol, \"a\"}` → `a`, `{:list, […]}` → a
+   list — and a NESTED form is wrapped in `{:meta, form, position}`, so
+   meta unwraps first. Scalars through."
+  [f]
+  (if (erlang/is_tuple f)
+    (let [k (erlang/element 1 f) v (erlang/element 2 f)]
+      (cond (= k :meta)   (node->data v)   ; nested forms carry position meta
+            (= k :symbol)  (symbol v)
+            (= k :keyword) (keyword v)
+            (= k :list)    (apply list (map node->data v))
+            (= k :vector)  (vec (map node->data v))
+            (= k :map)     (into {} (map (fn [kv] [(node->data (erlang/element 1 kv))
+                                                   (node->data (erlang/element 2 kv))])
+                                         v))
+            :else f))
+    f))
+
+(defn- old-form
+  "The snapshot read back as a FORM — the old output is prefix notation,
+   so the reader parses it directly."
+  [name]
+  (node->data (typed/node-form (first (BeamLisp.Reader/read_string (old-str name))))))
+
+(defn- decls
+  "[(declare-const v Sort) …] for a corpus entry."
+  [entry]
+  (map (fn [kv] (s/declare-const (first kv) (second kv)))
+       (into [] (:vars entry))))
+
+; The suite renders its own scripts with smt/script and talks to the port
+; directly, so the gate is independent of z3.bl's input contract (which the
+; cutover itself changes).
+(defn- verdict [port cmds] (:status (BeamLisp.Z3Port/check port (s/script cmds) false)))
+
+(defn- prove-equal!
+  "z3: does `(= old new)` hold for every input? unsat ⟹ same term."
+  [port cmds old new]
+  (= "unsat" (verdict port (concat cmds [(s/assert `(not (= ~old ~new)))]))))
+
+(defn- prove-fns-equal!
+  "z3: are two 1-ary define-funs equal for ALL Int args? The quantified
+   form proves it outright; `unknown` falls back to sample points."
+  [port old-name old-form new-name new-form param]
+  (let [q `(not (forall ((~param Int)) (= (~old-name ~param)
+                                        (~new-name ~param))))
+        verdict (verdict port [old-form new-form (s/assert q)])]
+    (if (= "unknown" verdict)
+      ; sample the sign corners where truncation and clause folds bite
+      (every? (fn [pt]
+                (let [d `(not (= (~old-name ~pt) (~new-name ~pt)))]
+                  (= "unsat" (verdict port [old-form new-form (s/assert d)]))))
+              [0 1 (- 0 1) 7 (- 0 8) 100])
+      (= "unsat" verdict))))
+
+(deftest term-parity
+  (let [port (BeamLisp.Z3Port/open)]
+    (doseq [kv (into [] corpus)]
+      (let [name (first kv) entry (second kv)]
+        (when (not= :defn (:kind entry))
+          (let [new (smt/of-source (set (keys (:vars entry))) (:src entry))]
+            (is (prove-equal! port (decls entry) (old-form name) new)
+                (str name ": form translation changed the term"))))))))
+
+(deftest defn-parity
+  (let [port (BeamLisp.Z3Port/open)]
+    (doseq [kv (into [] corpus)]
+      (let [name (first kv) entry (second kv)]
+        (when (= :defn (:kind entry))
+          ; old keeps the original name; the new defn is renamed so both
+          ; can coexist in one script and be compared over all inputs
+          (let [old-f (old-form name)
+                old-name (nth old-f 1)
+                new-name (symbol (str old-name "_new"))
+                new-f (smt/defn->define-fun (:src entry) (:ret entry))
+                renamed (apply list (nth new-f 0) new-name (drop 2 new-f))
+                p (first (nth (nth renamed 2) 0))]
+            (is (prove-fns-equal! port old-name old-f new-name renamed p)
+                (str name ": define-fun translation changed the function"))))))))
