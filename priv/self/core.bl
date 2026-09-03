@@ -31,7 +31,7 @@
 ; reached through plain erlang/-style interop. No Elixir compiler is on this
 ; path.
 
-(ns self.core (:require [compiler :as c]))
+(ns self.core (:require [compiler :as c] [self.anf :as anf]))
 
 ;; ── tiny cerl surface ───────────────────────────────────────────────────────
 
@@ -308,6 +308,123 @@
 
     :else (throw (ex-info "ce1: unhandled quoted node" {:node t}))))
 
+;; ── bl-ANF → cerl (PLAN-079 S-C) ─────────────────────────────────────────────
+;;
+;; The lowering re-pointed at the backend-neutral IR. self.anf/normalise already
+;; desugared truthiness/cond/let into :if/:do/:let and resolved every name, so
+;; this table is a direct op→constructor map — SIMPLER than `lower` (which still
+;; reads Elixir-quoted). This is the shape a future MLIR emitter mirrors: one
+;; :op → one target constructor, :ann → attributes, body nodes → regions.
+
+(declare lower-anf)
+
+(defn lower-anf-pattern [p]
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar) (if (= "_" (:name p)) (fresh "_") (cvar (erlang/binary_to_atom (:name p))))
+      (= op :plit) (lit (:val p))
+      (= op :pnil) (cerl/c_nil)
+      (= op :ptuple) (ctuple (map lower-anf-pattern (:elems p)))
+      (= op :pcons) (cerl/c_cons (lower-anf-pattern (:head p)) (lower-anf-pattern (:tail p)))
+      (= op :palias) (cerl/c_alias (lower-anf-pattern (:a p)) (lower-anf-pattern (:b p)))
+      (= op :pmap)
+        (cerl/c_map_pattern
+          (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf (first kv)) (lower-anf-pattern (second kv))))
+                        (:pairs p))))
+      (= op :pstruct)
+        (cerl/c_map_pattern
+          (cons (cerl/c_map_pair_exact (catom :__struct__) (catom (:mod p)))
+                (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf (first kv)) (lower-anf-pattern (second kv))))
+                              (:fields p)))))
+      :else (throw (ex-info "lower-anf-pattern: unknown pop" {:pop op :pat p})))))
+
+(defn lower-anf-clauses
+  "bl-ANF clauses ({:pats :guard :body}) → cerl clauses over the SAME arity."
+  [clauses]
+  (map (fn [cl]
+         (let [pats (to-list (map lower-anf-pattern (:pats cl)))]
+           (if (nil? (:guard cl))
+             (cclause pats (lower-anf (:body cl)))
+             (cclause pats (lower-anf (:guard cl)) (lower-anf (:body cl))))))
+       clauses))
+
+(defn lower-anf-fn
+  "A bl-ANF :fn → Core fun. One clause of plain-var params lowers to a direct
+   fun; otherwise a fun over fresh params whose body cases on their tuple."
+  [n]
+  (let [clauses (:clauses n)
+        cl0 (first clauses)
+        arity (count (:pats cl0))
+        simple? (and (= 1 (count clauses)) (nil? (:guard cl0))
+                     (every? (fn [p] (= :pvar (:pop p))) (:pats cl0)))]
+    (if simple?
+      (cfun (to-list (map (fn [p] (cvar (erlang/binary_to_atom (:name p)))) (:pats cl0)))
+            (lower-anf (:body cl0)))
+      (let [params (to-list (map (fn [_] (fresh "A")) (range arity)))
+            lowered (lower-anf-clauses clauses)
+            tupled (map (fn [cl] (cerl/c_clause (list (ctuple (cerl/clause_pats cl)))
+                                                (cerl/clause_guard cl)
+                                                (cerl/clause_body cl)))
+                        lowered)]
+        (cfun params (ccase (ctuple params) tupled))))))
+
+(defn lower-anf-try
+  [n]
+  (let [body (lower-anf (:body n))
+        v (fresh "V") cls (fresh "Class") rsn (fresh "Reason") stk (fresh "Stack")
+        catch-clauses (:catch n)
+        handler (ccase (cerl/c_values (list cls rsn))
+                       (to-list (concat (lower-anf-clauses catch-clauses)
+                               (list (cclause (list (fresh "_") (fresh "_"))
+                                              (ccall :erlang :raise (list cls rsn stk)))))))
+        handler* (clet (cvar :__STACKTRACE__) stk handler)
+        after (:after n)
+        caught (if (empty? catch-clauses) body
+                 (cerl/c_try body (list v) v (list cls rsn stk) handler*))
+        c2 (fresh "Class") r2 (fresh "Reason") s2 (fresh "Stack") v2 (fresh "V")]
+    (if (nil? after)
+      caught
+      (cerl/c_try caught (list v2) (cseq (lower-anf after) v2)
+                  (list c2 r2 s2)
+                  (cseq (lower-anf after) (ccall :erlang :raise (list c2 r2 s2)))))))
+
+(defn lower-anf
+  "bl-ANF node (self.anf vocabulary) → cerl."
+  [n]
+  (let [op (:op n)]
+    (cond
+      (= op :lit) (lit (:val n))
+      (= op :var) (cvar (erlang/binary_to_atom (:name n)))
+      (= op :global) (ccall :Elixir.BeamLisp.Env :fetch! (list (lit (:ns n)) (lit (:name n))))
+      (= op :remote) (ccall (:mod n) (:fun n) (to-list (map lower-anf (:args n))))
+      (= op :apply) (capply (lower-anf (:fn n)) (to-list (map lower-anf (:args n))))
+      (= op :let) (clet (cvar (erlang/binary_to_atom (:name n))) (lower-anf (:init n)) (lower-anf (:body n)))
+      (= op :if) (ccase (lower-anf (:test n))
+                        (list (cclause (list (catom false)) (lower-anf (:else n)))
+                              (cclause (list (catom nil)) (lower-anf (:else n)))
+                              (cclause (list (fresh "_")) (lower-anf (:then n)))))
+      (= op :do) (reduce (fn [acc s] (cseq acc (lower-anf s)))
+                         (lower-anf (first (:stmts n)))
+                         (rest (:stmts n)))
+      (= op :case) (ccase (lower-anf (:subj n)) (lower-anf-clauses (:clauses n)))
+      (= op :fn) (lower-anf-fn n)
+      (= op :try) (lower-anf-try n)
+      (= op :recv)
+        (let [cls (lower-anf-clauses (:clauses n))]
+          (if (nil? (:timeout n))
+            (cerl/c_receive (to-list cls))
+            (cerl/c_receive (to-list cls) (lower-anf (:timeout n)) (lower-anf (:after n)))))
+      (= op :tuple) (ctuple (map lower-anf (:elems n)))
+      (= op :map) (cmap (map (fn [kv] (cpair (lower-anf (first kv)) (lower-anf (second kv)))) (:pairs n)))
+      (= op :enil) (cerl/c_nil)
+      (= op :cons) (cerl/c_cons (lower-anf (:head n)) (lower-anf (:tail n)))
+      (= op :struct)
+        ;; %Mod{…} → a Core map carrying :__struct__ plus the fields (the same
+        ;; runtime shape the Elixir backend builds).
+        (cmap (cons (cpair (catom :__struct__) (catom (:mod n)))
+                    (to-list (map (fn [kv] (cpair (lower-anf (first kv)) (lower-anf (second kv)))) (:fields n)))))
+      :else (throw (ex-info "lower-anf: unknown op" {:op op :node n})))))
+
 ;; ── module wrapper + the two evaluators ─────────────────────────────────────
 
 (defn module-info-defs [mname]
@@ -489,3 +606,14 @@
   (let [[ns name tuples] (args q)]
     (core-defvar ns name (to-list (map unescape tuples)))))
 
+
+;; ── S-C: the bl-ANF eval seam ────────────────────────────────────────────────
+;;
+;; The expression evaluator re-pointed at the neutral IR: quoted → normalise →
+;; bl-ANF → lower-anf → cerl. This is the path S-D makes the ONLY path (compiler
+;; emits bl-ANF directly, `normalise` retires). eval-core-anf mirrors eval-core.
+
+(defn eval-core-anf
+  "Evaluate one compiler-emitted quoted form through bl-ANF → Core Erlang."
+  [mname q]
+  (eval-core mname (lower-anf (anf/normalise q))))
