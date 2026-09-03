@@ -26,7 +26,6 @@ defmodule BeamLisp.Daemon.Executor do
   """
 
   use GenServer
-  require Logger
 
   alias BeamLisp.Daemon.{IO, Protocol}
 

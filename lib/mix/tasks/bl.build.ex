@@ -96,7 +96,7 @@ defmodule Mix.Tasks.Bl.Build do
   end
 
   # Run a command, streaming output; return {output, exit_status}.
-  defp cmd(bin, args, opts \\ []) do
+  defp cmd(bin, args, opts) do
     env = Keyword.get(opts, :env, [])
     cd = Keyword.get(opts, :cd, File.cwd!())
 

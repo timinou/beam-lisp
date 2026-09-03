@@ -108,7 +108,8 @@ defmodule BeamLisp.Daemon.IO do
 
   defp send_chunks(state, _stream, <<>>), do: state
   defp send_chunks(state, stream, bin) do
-    <<chunk::binary-size(min(@chunk, byte_size(bin))), rest::binary>> = bin
+    take = min(@chunk, byte_size(bin))
+    <<chunk::binary-size(^take), rest::binary>> = bin
     frame =
       case stream do
         :stdout -> Protocol.stdout(state.id, state.seq, chunk)
