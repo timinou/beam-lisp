@@ -336,15 +336,31 @@ defmodule BeamLisp.Native do
 
     found =
       Enum.find_value(apps, fn app ->
-        case :code.priv_dir(app) do
-          {:error, _} -> nil
+        case priv_dir(app) do
+          nil -> nil
           dir ->
-            p = Path.join(to_string(dir), "native/#{crate}")
+            p = Path.join(dir, "native/#{crate}")
             if File.exists?(p <> ".so"), do: p, else: nil
         end
       end)
 
-    found || Path.join(:code.priv_dir(:beam_lisp), "native/#{crate}")
+    found || Path.join(BeamLisp.Tiers.priv_root(), "native/#{crate}")
+  end
+
+  # An app's priv dir as a REAL directory, or nil. beam_lisp's own goes
+  # through `Tiers.priv_root/0`, which knows that an escript reports a virtual
+  # archive path and falls back to the source tree — the `.so` files the
+  # escript cannot carry still live there, so `bl` can load the native tier
+  # from a checkout instead of failing every store open with :nif_not_loaded.
+  defp priv_dir(:beam_lisp), do: BeamLisp.Tiers.priv_root()
+
+  defp priv_dir(app) do
+    case :code.priv_dir(app) do
+      {:error, _} -> nil
+      dir ->
+        dir = to_string(dir)
+        if File.dir?(dir), do: dir, else: nil
+    end
   end
 
   defp link_var(ns, mod, name, arity) do

@@ -76,16 +76,20 @@ defmodule BeamLisp.Tiers do
   deployments, the compile task's VM before the app is loaded).
   """
   def priv_root do
-    from_code_path =
-      case :code.priv_dir(:beam_lisp) do
-        dir when is_list(dir) -> List.to_string(dir)
-        _ -> nil
-      end
+    # An escript answers `priv_dir` with a path INSIDE its archive — a path no
+    # `File`/`Path.wildcard` call can see. Treat a priv dir that is not a real
+    # directory as absent and fall back to the source tree: otherwise
+    # `boot_namespaces/0` reads as `[]`, the drift gate asks `build-plan` for a
+    # key while `build-plan` is the namespace being loaded, the loader's cycle
+    # guard answers "already loading", and the escript dies at boot with
+    # `undefined var: build-plan/key-for`.
+    case :code.priv_dir(:beam_lisp) do
+      dir when is_list(dir) ->
+        dir = List.to_string(dir)
+        if File.dir?(dir), do: dir, else: Path.expand("../../priv", __DIR__)
 
-    # An escript answers with a path INSIDE its archive (`bl/beam_lisp/priv`),
-    # which is not a directory on disk; the source tree is the truth then.
-    if from_code_path && File.dir?(from_code_path),
-      do: from_code_path,
-      else: Path.expand("../../priv", __DIR__)
+      _ ->
+        Path.expand("../../priv", __DIR__)
+    end
   end
 end
