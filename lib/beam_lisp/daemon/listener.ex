@@ -117,7 +117,7 @@ defmodule BeamLisp.Daemon.Listener do
             close(sock)
 
           {:ok, {:request, id, req}} ->
-            ctx.execute_fun.(sock, id, req)
+            serve_request(sock, id, req, ctx)
             close(sock)
 
           {:ok, _other} ->
@@ -129,6 +129,57 @@ defmodule BeamLisp.Daemon.Listener do
 
       {:error, _} ->
         close(sock)
+    end
+  end
+
+  # Run the command on the executor while concurrently pumping the client's
+  # stdin frames to the IO proxy. The executor call blocks in a spawned task;
+  # this process owns the socket and routes `:stdin_reply` frames it reads to
+  # the proxy pid the executor registers via `{:route_stdin, id, proxy}`.
+  defp serve_request(sock, id, req, ctx) do
+    me = self()
+    task = spawn_monitor(fn -> ctx.execute_fun.(sock, id, req, me) end)
+    pump_stdin(sock, id, task, nil)
+  end
+
+  defp pump_stdin(sock, id, {task_pid, task_ref} = task, proxy) do
+    receive do
+      {:route_stdin, ^id, p} ->
+        pump_stdin(sock, id, task, p)
+
+      {:DOWN, ^task_ref, :process, ^task_pid, _reason} ->
+        :ok
+    after
+      0 ->
+        # non-blocking socket poll for a stdin frame; short timeout so we keep
+        # checking the task's completion.
+        case :gen_tcp.recv(sock, 0, 50) do
+          {:ok, frame} ->
+            case Protocol.decode(frame) do
+              {:ok, {:stdin_reply, ^id, seq, data}} when is_pid(proxy) ->
+                send(proxy, {:stdin_reply, seq, data})
+
+              _ ->
+                :ok
+            end
+
+            pump_stdin(sock, id, task, proxy)
+
+          {:error, :timeout} ->
+            pump_stdin(sock, id, task, proxy)
+
+          {:error, _} ->
+            # client vanished; wait for the task to notice via a failed send
+            wait_task(task)
+        end
+    end
+  end
+
+  defp wait_task({task_pid, task_ref}) do
+    receive do
+      {:DOWN, ^task_ref, :process, ^task_pid, _} -> :ok
+    after
+      30_000 -> :ok
     end
   end
 

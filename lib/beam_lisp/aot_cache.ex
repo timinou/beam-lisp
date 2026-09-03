@@ -117,6 +117,16 @@ defmodule BeamLisp.AOTCache do
     end
   end
 
+  @doc """
+  Compute the compiler key WITHOUT the persistent_term memo — the live value
+  for the CURRENT toolchain sources on disk. `compiler_key/0` caches its first
+  computation for the VM's life (correct: codegen + tier-1 sources are constant
+  under a running node); the daemon uses THIS to detect that the checkout it
+  serves has drifted from the sources it booted with, which must force a
+  restart, not a stale reuse.
+  """
+  def current_compiler_key, do: compute_compiler_key()
+
   @doc false
   # Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
   # The key is a VM-constant in normal use (codegen beams + tier-1 sources do

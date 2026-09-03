@@ -21,6 +21,11 @@
 ;; no #() literals, no tuples-as-lists, no Elixir keyword literals.
 
 (defn add-arg [st a] (assoc-in st [:args] (cons a (:args st))))
+(defn dd-arg
+  "Cons a post-`--` token onto `:dd` (the program's own argv), NOT `:args`.
+  Before this, everything after `--` leaked into the command's positionals and
+  the program saw nothing via `BeamLisp/argv` — the documented post-`--` gap."
+  [st a] (assoc-in st [:dd] (cons a (:dd st))))
 
 (defn parse-argv [argv]
   (loop [as argv
@@ -32,8 +37,9 @@
       (let [a (first as)
             more (rest as)]
         (cond
-          ;; after `--` everything is a program argument
-          (:dd st)         (recur more (add-arg st a))
+          ;; after `--` everything is a PROGRAM argument (goes to :dd, exposed
+          ;; as BeamLisp/argv), never the command's own positionals
+          (:dd st)         (recur more (dd-arg st a))
           (= a "--")       (recur more (assoc-in st [:dd] []))
           (= a "-h")       (recur more (assoc-in st [:help] true))
           (= a "--help")   (recur more (assoc-in st [:help] true))
@@ -142,6 +148,14 @@
 
 (defn dirname [p] (Path/dirname p))
 
+(defn resolve
+  "Expand a file argument against the command's cwd. Standalone this is the OS
+  cwd (identity for an absolute path); under the daemon it is the CLIENT's cwd,
+  so `bl run foo.bl` from any terminal finds the client's file, not one under
+  the daemon's checkout. `BeamLisp/cwd` carries the binding."
+  [p]
+  (Path/expand p (BeamLisp/cwd)))
+
 (defn- source-file?
   "A file the loader would load: `.bl`, or a literate `.bl.md` / `.bl.org`."
   [p]
@@ -171,8 +185,11 @@
   (if (empty? args)
     (do (io-err "usage: bl run FILE.bl [-- args...]") 2)
     (do (register-paths st)
-        ;; parity with `mix beam_lisp.run`: the last value prints.
-        (println (BeamLisp.RT/print_str (BeamLisp/run_file (first args))))
+        ;; parity with `mix beam_lisp.run`: the last value prints. The program
+        ;; sees its post-`--` args via `BeamLisp/argv`; `:dd` carries them.
+        (BeamLisp/with_argv (to-list (or (:dd st) []))
+          (fn []
+            (println (BeamLisp.RT/print_str (BeamLisp/run_file (resolve (first args)))))))
         0)))
 
 (defn cmd-eval [args st]
@@ -189,12 +206,14 @@
 (defn cmd-test [args st]
   (register-paths st)
   (let [targets (if (empty? args) ["test"] args)
-        paths (mapcat expand-targets targets)]
+        paths (mapcat expand-targets (map resolve targets))]
     (if (empty? paths)
       (do (io-err "bl test: no .bl test files found") 2)
-      (do ;; TestRT.cli halts(1) itself when anything fails.
-          (BeamLisp.TestRT/cli (to-list paths) (kw [:async (:async st)]))
-          0))))
+      ;; NON-halting: run the suite, map pass/fail to an exit code. `TestRT.cli`
+      ;; halts the VM on failure, which would kill a warm daemon; `run_suite` +
+      ;; `passed?` return a verdict the caller turns into 0/1 instead.
+      (let [totals (BeamLisp.TestRT/run_suite (to-list paths) (kw [:async (:async st)]))]
+        (if (BeamLisp.TestRT/passed? totals) 0 1)))))
 
 (defn cmd-build
   "`bl build PATH... [--out DIR] [--force] [--jobs N]` — the same driver
@@ -202,12 +221,12 @@
    interface-keyed freshness, a manifest in the output dir. Second run is a
    no-op; a body edit rebuilds one file."
   [args st]
-  (let [paths (vec (mapcat expand-targets args))]
+  (let [paths (vec (mapcat expand-targets (map resolve args)))]
     (if (empty? args)
       (do (io-err "usage: bl build PATH... [--out DIR] [--force] [--jobs N]") 2)
       (do (register-paths st)
           (BeamLisp.Loader/ensure_loaded "build")
-          (let [out (or (:out st) "build")
+          (let [out (resolve (or (:out st) "build"))
                 run (BeamLisp.Env/fetch! "build" "run")
                 r (run {:sources paths :out out :force? (:force st) :jobs (:jobs st)
                         :log println})]
@@ -222,7 +241,7 @@
         ;; Same pipeline as `mix beam_lisp.ward`: sources into a var,
         ;; warm the reload libraries, run + report inside one eval.
         (BeamLisp.Env/intern "user" "__ward_sources__"
-                             (vec (map (fn [f] (File/read! f)) args)))
+                             (vec (map (fn [f] (File/read! (resolve f))) args)))
         (BeamLisp.Loader/ensure_loaded "reload")
         (BeamLisp.Loader/ensure_loaded "reload.ward")
         (if (BeamLisp/eval
@@ -391,6 +410,27 @@
           (usage)
           2))))
 
+(defn run-argv
+  "Parse argv and run the command, returning an EXIT CODE — never halting. The
+  re-entrant seam: `main` boots then calls this then halts; the daemon calls it
+  per request inside a bound env (cwd/argv/ambient-dirs already set by the
+  executor). All filesystem arguments resolve against `BeamLisp/cwd`, so a
+  daemon request finds the client's files, a standalone run finds its own."
+  [argv]
+  (try
+    (let [st (parse-argv argv)]
+      (cond
+        (:error st)   (do (io-err (str "bl: " (:error st))) 2)
+        (:unknown st) (do (io-err (str "bl: unknown flag " (:unknown st))) 2)
+        (:help st)    (do (usage) 0)
+        (:version st) (cmd-version nil st)
+        ;; `bl` alone is a repl, like `python` alone
+        (nil? (:cmd st)) (cmd-repl nil st)
+        :else (dispatch st)))
+    (catch e
+      (io-err (str "error: " (ex-message e)))
+      1)))
+
 (defn main [argv]
   ;; The escript enters here as a plain BEAM apply: same-module calls in
   ;; the body are direct remote calls and need no registry, so the boot
@@ -406,21 +446,6 @@
   ;; the release), which reinterns the vars and marks the namespace loaded.
   (if (= :no_module (BeamLisp.AOT/ensure_loaded "bl.cli"))
     (BeamLisp.Loader/ensure_loaded "bl.cli"))
-  (let [code
-        (try
-          (let [st (parse-argv argv)]
-            (cond
-              (:error st)   (do (io-err (str "bl: " (:error st))) 2)
-              (:unknown st) (do (io-err (str "bl: unknown flag " (:unknown st))) 2)
-              (:help st)    (do (usage) 0)
-              (:version st) (do (cmd-version nil st))
-              ;; `bl` alone is a repl, like `python` alone
-              (nil? (:cmd st)) (cmd-repl nil st)
-              :else (dispatch st)))
-          ;; ex-message is total: Exception.message for real exceptions,
-          ;; inspect for a beam-lisp `throw` of a plain value.
-          (catch e
-            (io-err (str "error: " (ex-message e)))
-            1))]
+  (let [code (run-argv argv)]
     ;; An escript ignores main/1's return value — the exit code is a halt.
     (System/halt code)))

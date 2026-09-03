@@ -62,6 +62,57 @@ defmodule BeamLisp do
     end)
   end
 
+  @doc """
+  The program arguments a `bl run FILE -- a b c` invocation exposes to the
+  running program (the `a b c`). Process-local: a daemon request binds the
+  CLIENT's post-`--` args via `with_argv/2`; outside a command context it
+  falls back to the OS `System.argv/0`, so a plain `elixir`/escript run still
+  sees its own arguments.
+  """
+  def argv do
+    case Process.get(:bl_argv) do
+      nil -> System.argv()
+      list when is_list(list) -> list
+    end
+  end
+
+  @doc "Run `fun` with `list` bound as the program argv (see `argv/0`)."
+  def with_argv(list, fun) when is_list(list) do
+    prev = Process.get(:bl_argv)
+    Process.put(:bl_argv, list)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev), do: Process.delete(:bl_argv), else: Process.put(:bl_argv, prev)
+    end
+  end
+
+  @doc """
+  The working directory a `bl` command resolves file arguments against.
+  Process-local: a daemon request binds the CLIENT's cwd here (the daemon VM's
+  own `File.cwd!/0` is the checkout, not the client's tree); outside a command
+  context it falls back to the OS cwd, so a standalone run is unchanged.
+  """
+  def cwd do
+    case Process.get(:bl_cwd) do
+      nil -> File.cwd!()
+      dir when is_binary(dir) -> dir
+    end
+  end
+
+  @doc "Run `fun` with `dir` bound as the command cwd (see `cwd/0`)."
+  def with_cwd(dir, fun) when is_binary(dir) do
+    prev = Process.get(:bl_cwd)
+    Process.put(:bl_cwd, dir)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev), do: Process.delete(:bl_cwd), else: Process.put(:bl_cwd, prev)
+    end
+  end
+
   @doc "Seed the `core` namespace and load the prelude, once."
   def init do
     ensure_env()

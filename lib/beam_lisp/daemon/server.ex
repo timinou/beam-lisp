@@ -71,6 +71,14 @@ defmodule BeamLisp.Daemon.Server do
       _ = write_pid(ep.pid, root)
       _ = write_meta(ep.meta, root, token)
 
+      # The single-worker command serializer. Linked so a daemon stop takes it
+      # down; a fresh one starts with each daemon.
+      {:ok, _exec} =
+        case Process.whereis(BeamLisp.Daemon.Executor) do
+          nil -> BeamLisp.Daemon.Executor.start_link([])
+          pid -> {:ok, pid}
+        end
+
       state = %{
         root: root,
         endpoints: ep,
@@ -83,7 +91,7 @@ defmodule BeamLisp.Daemon.Server do
         shutting_down: false,
         compiler_key: compiler_key(),
         daemon_build_id: build_id(),
-        execute_fun: Keyword.get(opts, :execute_fun, &default_execute/3),
+        execute_fun: Keyword.get(opts, :execute_fun, &default_execute/4),
         stop_flag: :counters.new(1, [:atomics])
       }
 
@@ -148,7 +156,7 @@ defmodule BeamLisp.Daemon.Server do
       shutting_down: false,
       execute_fun: state.execute_fun,
       control_fun: fn :stop -> GenServer.cast(__MODULE__, :stop) end,
-      queue_depth_fun: fn -> 0 end
+      queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end
     }
 
     flag = state.stop_flag
@@ -160,10 +168,15 @@ defmodule BeamLisp.Daemon.Server do
     spawn(fn -> Listener.accept_loop(lsock, ctx, fn -> :counters.get(flag, 1) == 1 end) end)
   end
 
-  defp default_execute(sock, id, _req) do
-    # S1 placeholder: command execution lands in S2. Report cleanly.
-    :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: command execution not yet enabled (S2)\n"))
-    :gen_tcp.send(sock, Protocol.exit(id, 70))
+  # The default command path: hand the request to the Executor (one worker at a
+  # time). `conn` is the connection handler pid, which routes stdin frames.
+  defp default_execute(sock, id, req, conn) do
+    BeamLisp.Daemon.Executor.run(sock, id, req, conn)
+  rescue
+    e ->
+      _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{Exception.message(e)}\n"))
+      _ = :gen_tcp.send(sock, Protocol.exit(id, 70))
+      70
   end
 
   defp safe_boot do
