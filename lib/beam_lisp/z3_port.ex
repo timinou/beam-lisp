@@ -25,21 +25,40 @@ defmodule BeamLisp.Z3Port do
   a shell happens to resolve. Raises with the remedy when absent.
   """
   def open do
-    exe = bundled_exe()
+    exe = resolve_exe()
 
-    unless File.exists?(exe) do
+    unless exe && File.exists?(exe) do
       raise """
-      bundled z3 missing at #{exe}
-      run: mix beam_lisp.z3.fetch\
+      bundled z3 not found. Looked (in order) at:
+      #{candidate_paths() |> Enum.map(&("  - " <> &1)) |> Enum.join("\n")}
+      run: mix beam_lisp.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
       """
     end
 
     Port.open({:spawn_executable, exe}, [:binary, :stream, :use_stdio, args: ["-in"]])
   end
 
-  defp bundled_exe do
+  # Resolve the PINNED z3 artifact across packaging tiers — never the system
+  # PATH. Three candidates, first that exists wins:
+  #   1. BEAM_LISP_Z3 env — an explicit pin (release/CI points it at its artifact)
+  #   2. :code.priv_dir/z3/bin/z3 — the mix / OTP-release layout, where priv_dir
+  #      is a real directory the fetch task populated
+  #   3. <cwd>/priv/z3/bin/z3 — the ESCRIPT tier: `bl` is a single archive file,
+  #      so priv_dir resolves to a pseudo-path INSIDE it that can hold no 34MB
+  #      NIF; the pinned binary still lives in the checkout's priv/, and `bl` is
+  #      run from the repo root. This is a repo artifact, not a PATH lookup.
+  # All three name the SAME pinned binary the repo controls — the "what proves
+  # your rules is the artifact the repo pinned" invariant holds across tiers.
+  defp resolve_exe do
+    Enum.find(candidate_paths(), &File.exists?/1)
+  end
+
+  defp candidate_paths do
     exe = if match?({:win32, _}, :os.type()), do: "z3.exe", else: "z3"
-    Path.join([:code.priv_dir(:beam_lisp) |> to_string(), "z3", "bin", exe])
+    env = System.get_env("BEAM_LISP_Z3")
+    priv = Path.join([:code.priv_dir(:beam_lisp) |> to_string(), "z3", "bin", exe])
+    cwd = Path.join([File.cwd!(), "priv", "z3", "bin", exe])
+    (if(env, do: [env], else: []) ++ [priv, cwd]) |> Enum.uniq()
   end
 
   @doc """
