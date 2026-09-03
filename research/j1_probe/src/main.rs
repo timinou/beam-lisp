@@ -43,6 +43,7 @@ struct Var(usize);
 enum Stm {
     Imm { dst: Var, k: i64 },
     Add { dst: Var, a: Var, b: Var },
+    Sub { dst: Var, a: Var, b: Var },
     Mul { dst: Var, a: Var, b: Var },
     AddImm { dst: Var, a: Var, k: i64 },
     /// dst = zext(load.i8 base + off)
@@ -102,7 +103,7 @@ fn compile(k: &Kernel) -> (JITModule, usize) {
         let mut touch = |vs: &mut Vec<usize>| match stm {
             Stm::Imm { dst, .. } | Stm::Zext8 { dst, .. } => vs.push(dst.0),
             Stm::Mov { dst, a } => vs.extend([dst.0, a.0]),
-            Stm::Add { dst, a, b } | Stm::Mul { dst, a, b } => vs.extend([dst.0, a.0, b.0]),
+            Stm::Add { dst, a, b } | Stm::Sub { dst, a, b } | Stm::Mul { dst, a, b } => vs.extend([dst.0, a.0, b.0]),
             Stm::AddImm { dst, a, .. } | Stm::UdivImm { dst, a, .. } => vs.extend([dst.0, a.0]),
             Stm::LoadU8 { dst, base, off } => vs.extend([dst.0, base.0, off.0]),
             Stm::StoreU8 { base, off, v } => vs.extend([base.0, off.0, v.0]),
@@ -154,6 +155,12 @@ fn compile(k: &Kernel) -> (JITModule, usize) {
                 let x = bcx.use_var(var(a.0));
                 let y = bcx.use_var(var(b.0));
                 let v = bcx.ins().iadd(x, y);
+                bcx.def_var(var(dst.0), v);
+            }
+            Stm::Sub { dst, a, b } => {
+                let x = bcx.use_var(var(a.0));
+                let y = bcx.use_var(var(b.0));
+                let v = bcx.ins().isub(x, y);
                 bcx.def_var(var(dst.0), v);
             }
             Stm::Mul { dst, a, b } => {
@@ -249,10 +256,14 @@ fn parse_ir(text: &str) -> Option<Kernel> {
             "init" => inits.push((Var(v(t[1])), k(t[2]))),
             "imm" => body.push(Stm::Imm { dst: Var(v(t[1])), k: k(t[2]) }),
             "add" => body.push(Stm::Add { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
-            "sub" => body.push(Stm::Add { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
+            "sub" => body.push(Stm::Sub { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
             "mul" => body.push(Stm::Mul { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
             "addimm" => body.push(Stm::AddImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: k(t[3]) }),
             "load" => body.push(Stm::LoadU8 { dst: Var(v(t[1])), base: Var(v(t[2])), off: Var(v(t[3])) }),
+            "store" => body.push(Stm::StoreU8 { base: Var(v(t[1])), off: Var(v(t[2])), v: Var(v(t[3])) }),
+            "udivimm" => body.push(Stm::UdivImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: k(t[3]) }),
+            "subimm" => body.push(Stm::AddImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: -k(t[3]) }),
+            "zext" => body.push(Stm::Zext8 { dst: Var(v(t[1])), a: Var(v(t[2])) }),
             "mov" => body.push(Stm::Mov { dst: Var(v(t[1])), a: Var(v(t[2])) }),
             "loop" => { i = Var(v(t[1])); limit = Var(v(t[2])); step = k(t[3]); }
             "ret" => ret = Var(v(t[1])),
@@ -389,6 +400,60 @@ fn fill(buf: &mut [u8]) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // ── generalized pixel-class runner: a store-kernel over N pointer args ──
+    // args: --run-store IR_FILE DST_FILE SRC_FILE ALPHA OUT_FILE
+    // The kernel has 3 params (dst*, src*, len) + alpha via inits; it MUTATES
+    // dst in place. We run it, write the mutated dst to OUT_FILE for the bl
+    // reference to diff, and also self-check against a Rust twin here.
+    if args.len() >= 2 && args[1] == "--run-store" {
+        // args: --run-store IR_FILE DST_FILE SRC_FILE ALPHA OUT_FILE
+        // Kernel params: (out*, dst*, src*, len, alpha). out is a FRESH buffer
+        // (the frame-rule output) — distinct from every input.
+        let ir = std::fs::read_to_string(&args[2]).unwrap();
+        let dst = std::fs::read(&args[3]).unwrap();
+        let src = std::fs::read(&args[4]).unwrap();
+        let alpha: u8 = args[5].parse().unwrap();
+        let out_file = &args[6];
+        let k = parse_ir(&ir).expect("parse");
+        let n = dst.len().min(src.len());
+        let mut out = vec![0u8; n];
+        // rust twin (independent reference)
+        let mut twin = vec![0u8; n];
+        {
+            let a = alpha as u32; let na = (255 - alpha) as u32;
+            for i in 0..n {
+                twin[i] = ((src[i] as u32 * a + dst[i] as u32 * na) / 255) as u8;
+            }
+        }
+        let (m, p) = compile(&k);
+        std::mem::forget(m);
+        let t = Instant::now();
+        match k.n_params {
+            3 => {
+                // fn(out*, src*, len)  — single-input store (invert, scale, brighten)
+                let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(p) };
+                f(out.as_mut_ptr() as i64, src.as_ptr() as i64, n as i64);
+            }
+            4 => {
+                // fn(out*, src*, len, k)  — single-input + scalar param (via ALPHA slot)
+                let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(p) };
+                f(out.as_mut_ptr() as i64, src.as_ptr() as i64, n as i64, alpha as i64);
+            }
+            5 => {
+                // fn(out*, dst*, src*, len, alpha)
+                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(p) };
+                f(out.as_mut_ptr() as i64, dst.as_ptr() as i64, src.as_ptr() as i64, n as i64, alpha as i64);
+            }
+            _ => { eprintln!("run-store expects 3/4/5 params, got {}", k.n_params); std::process::exit(2); }
+        }
+        let dt = t.elapsed();
+        let twin_match = if k.n_params == 5 { out[..n] == twin[..n] } else { true /* twin only defined for blend */ };
+        std::fs::write(out_file, &out).unwrap();
+        println!("store-kernel '{}' over {} bytes: {:?}   rust-twin-match={}  (out→{})",
+                 k.name, n, dt, twin_match, out_file);
+        std::process::exit(0);
+    }
     if args.len() >= 2 && args[1] == "--run-ir" {
         // args: --run-ir IR_FILE BUF_FILE BL_VALUE_FILE
         let ir = std::fs::read_to_string(&args[2]).unwrap();
