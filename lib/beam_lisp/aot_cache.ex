@@ -103,11 +103,11 @@ defmodule BeamLisp.AOTCache do
   @doc """
   The backend that lowers a namespace's body modules to `.beam`: `:core`
   (bl-ANF -> Core Erlang, via `self.core`) or `:elixir` (the genesis Elixir
-  compiler). Default `:elixir`; opt in per-run with
-  `config :beam_lisp, :aot_backend, :core`. The Core path is proven for AOT
-  integration (PLAN-081 step 1) but is NOT yet the default: a full-tree Core
-  build still hits lowering gaps in some files (see PLAN-081 step 3), so the
-  flip waits on those. Setting `:core` here builds body modules through Core.
+  compiler). Default `:core` (PLAN-081 step 3 flip): a full-tree Core build is
+  proven clean, byte-reproducible, and behaviourally identical to Elixir (the
+  regression stays at baseline under either backend). Opt back to the Elixir
+  compiler per-run with `config :beam_lisp, :aot_backend, :elixir` — it stays
+  fully supported as the genesis path and the differential-oracle yardstick.
 
   It lives here, not in `BeamLisp.AOT`, because `compiler_key/0` must fold it in
   (a Core-built beam and an Elixir-built beam of the same source are different
@@ -116,9 +116,9 @@ defmodule BeamLisp.AOTCache do
   a concern. `BeamLisp.AOT` reads the same value so build and key agree.
   """
   def aot_backend do
-    case Application.get_env(:beam_lisp, :aot_backend, :elixir) do
-      :core -> :core
-      _ -> :elixir
+    case Application.get_env(:beam_lisp, :aot_backend, :core) do
+      :elixir -> :elixir
+      _ -> :core
     end
   end
 

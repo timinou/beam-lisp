@@ -73,7 +73,15 @@ defmodule BeamLisp.Link do
          end)
 
     backend == :core and Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
-      function_exported?(BeamLisp.Ns.Self.Core, :"core-defvar-anf", 3)
+      function_exported?(BeamLisp.Ns.Self.Core, :"core-defvar-anf", 3) and
+      # self.core's VARS must be interned, not just its module code loaded:
+      # core-defvar-anf reaches its own siblings (expand-defaults, lower-anf, …)
+      # through the Env var table, so an un-interned self.core would route here
+      # and then raise `undefined var: self.core/…` on the first sibling call.
+      # When the ns is not interned (e.g. a --path-scoped tool env that never
+      # booted the Core backend) fall back to the Elixir path, which is always
+      # available. `maybe_load_core_backend/0` interns it at boot under :core.
+      BeamLisp.Env.loaded_ns?("self.core")
   end
 
   defp defvar_elixir(ns, name, new_defs, location) do

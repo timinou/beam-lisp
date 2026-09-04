@@ -674,7 +674,7 @@ defmodule BeamLisp.AOT do
   # `pmap-ordered`), so a process-dictionary flag would not reach them — only
   # an application env is visible VM-wide. Guarded on `self.core` actually
   # being loaded and exporting the seam, so a misconfiguration degrades to the
-  # Elixir path rather than crashing the build. Default `:elixir` — opt-in :core.
+  # Elixir path rather than crashing the build. Default `:core` (PLAN-081 flip).
   defp core_aot_backend? do
     BeamLisp.AOTCache.aot_backend() == :core and
       Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
