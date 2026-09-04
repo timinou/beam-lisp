@@ -100,10 +100,10 @@ defmodule BeamLisp.Wave22ServerTest do
              (init [arg] (ok arg))
              (handle-call :inc [_from state] (reply (inc state) (inc state)))
              (handle-cast :reset [_state] (noreply 0)))
-           (def p (server-start-link c 10))
-           (server-call p :inc)
-           (server-cast p :reset)
-           (server-call p :inc)
+           (def p (start-link c 10))
+           (call p :inc)
+           (cast p :reset)
+           (call p :inc)
            """) == 1
   end
 

@@ -2376,27 +2376,33 @@ defmodule BeamLisp.RT do
         }),
       "trace" => multi_fn(%{2 => &trace_2/2, 3 => &trace_3/3}),
       "untrace" => &untrace_1/1,
-      # The client side of `defserver`. Without these a server is only
-      # reachable through raw `:gen_server` interop, which defeats the
-      # point of the form. Names are prefixed `server-` because `call`
-      # and `cast` are far too generic to claim in the core namespace.
-      "server-start-link" =>
-        multi_fn(%{
-          1 => &BeamLisp.Server.start_link/1,
-          2 => &BeamLisp.Server.start_link/2,
-          3 => &BeamLisp.Server.start_link/3
-        }),
-      "server-start" =>
+      # The generic process verbs — tier 1 of docs/the-five-bundles.md §0.
+      # On the BEAM these verbs are generic over every process of a
+      # behaviour (`gen_server:call` works on any gen_server), so
+      # beam-lisp claims the bare names at top level. They were prefixed
+      # `server-` until the four-tier verb design. Inside a defserver
+      # body `stop` stays the return constructor — bound as a local that
+      # shadows this verb.
+      "start" =>
         multi_fn(%{
           1 => &BeamLisp.Server.start/1,
           2 => &BeamLisp.Server.start/2,
           3 => &BeamLisp.Server.start/3
         }),
-      "server-call" =>
+      "start-link" =>
+        multi_fn(%{
+          1 => &BeamLisp.Server.start_link/1,
+          2 => &BeamLisp.Server.start_link/2,
+          3 => &BeamLisp.Server.start_link/3
+        }),
+      "call" =>
         multi_fn(%{2 => &BeamLisp.Server.call/2, 3 => &BeamLisp.Server.call/3}),
-      "server-cast" => &BeamLisp.Server.cast/2,
-      "server-stop" =>
-        multi_fn(%{1 => &BeamLisp.Server.stop/1, 2 => &BeamLisp.Server.stop/2})
+      "cast" => &BeamLisp.Server.cast/2,
+      "stop" =>
+        multi_fn(%{1 => &BeamLisp.Server.stop/1, 2 => &BeamLisp.Server.stop/2}),
+      "monitor" => &:erlang.monitor(:process, &1),
+      "link" => &:erlang.link/1,
+      "kill" => &:erlang.exit(&1, :kill)
     }
 
     prims = Map.merge(prims, otp_prims)

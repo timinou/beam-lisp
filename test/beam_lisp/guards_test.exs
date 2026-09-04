@@ -187,12 +187,12 @@ defmodule BeamLisp.GuardsTest do
                (if (>= state n) (reply :ok (- state n)) (reply :insufficient state)))
              (handle-call [:withdraw n] [_from state] (reply :invalid state))
              (handle-call :balance [_from state] (reply state state)))
-           (let [p (server-start-link bank 100)
-                 a (server-call p [:withdraw 30])
-                 b (server-call p [:withdraw 1000])
-                 c (server-call p [:withdraw -5])
-                 d (server-call p :balance)]
-             (server-stop p)
+           (let [p (start-link bank 100)
+                 a (call p [:withdraw 30])
+                 b (call p [:withdraw 1000])
+                 c (call p [:withdraw -5])
+                 d (call p :balance)]
+             (stop p)
              (list a b c d))
            """) == [:ok, :insufficient, :invalid, 70]
   end
