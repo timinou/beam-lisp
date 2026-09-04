@@ -12,14 +12,25 @@ defmodule BeamLisp.Compiler do
   `compiler.bl` is bootstrapped by the PREVIOUS generation of the seed compiler
   (see `BeamLisp.Bootstrap.install!/1`'s staging path) — never by Elixir.
 
+  ## Why a facade, and how it delegates
+
   Why keep this module at all, rather than call `BeamLisp.Ns.Compiler`
   directly? A stable, well-known name. Every caller across `lib/`, the tests,
   and the tooling types `BeamLisp.Compiler.eval_string/…`; the facade lets the
-  IMPLEMENTATION live in `.bl` while the NAME stays put. The facade holds only
-  target-agnostic host glue (the backend switch and the intern-from-beam step),
-  no compiler semantics.
+  IMPLEMENTATION live in `.bl` while the NAME stays put. It holds only
+  target-agnostic host glue (the intern-from-beam boot step), no compiler
+  semantics.
 
-  Compile-time environment (built by `new_env/1`, threaded by the .bl compiler):
+  Each entry point is a one-line `apply(@compiler_ns, :fun, args)`. That late
+  bind — rather than `Kernel.defdelegate/2` or a direct call — is deliberate:
+  the target module `BeamLisp.Ns.Compiler` is generated at runtime from `.bl`
+  and does not exist at THIS module's compile time, so any compile-time export
+  reference would warn "undefined function". `apply/3` resolves the callee when
+  the call actually runs, by which point the ns is interned.
+
+  ## Compile-time environment
+
+  Built by `new_env/1`, threaded by the `.bl` compiler:
 
     * `:ns` — current namespace for var resolution
     * `:locals` — `%{name => Elixir AST var}`
@@ -43,9 +54,8 @@ defmodule BeamLisp.Compiler do
   so generated modules and compile errors can name it. Delegates to the
   self-hosted `eval_string` in `priv/boot/compiler.bl`.
   """
-  def eval_string(source, env \\ new_env(), file \\ nil) do
-    apply(@compiler_ns, :eval_string, [source, env, file])
-  end
+  def eval_string(source, env \\ new_env(), file \\ nil),
+    do: apply(@compiler_ns, :eval_string, [source, env, file])
 
   @doc """
   Compile one reader form to a value and evaluate it.
@@ -56,19 +66,34 @@ defmodule BeamLisp.Compiler do
   """
   def eval_form(form, env), do: apply(@compiler_ns, :eval_form, [form, env])
 
-  @doc """
-  Compile one reader form to its Elixir/Core syntax tree.
+  @doc "Expand `form` once as a macro call in namespace `ns` (self-hosted)."
+  def macroexpand_1(form, ns), do: apply(@compiler_ns, :macroexpand_1, [form, ns])
 
-  THE CUTOVER SEAM, now fully self-hosted: it delegates to `BeamLisp.Ns.Compiler`
-  whenever the `compiler` namespace is interned (the normal state, from the seed
-  or a fresh build). Before the compiler is interned on a from-source tree there
-  is nothing to delegate to — but there is also no Elixir genesis fallback any
-  more, so `enable_bl_backend/0` (run at boot, after the seed installs) MUST have
-  interned it first. `:compiler_backend :bl` forces delegation; anything else
-  still requires the ns to be interned.
+  @doc "Prelink a `defn`'s call surface for namespace `ns` (self-hosted)."
+  def prelink_defn(form, ns), do: apply(@compiler_ns, :prelink_defn, [form, ns])
+
+  @doc "Restart this process's fresh-name counter (self-hosted)."
+  def reset_fresh!, do: apply(@compiler_ns, :reset_fresh!, [])
+
+  @doc "Read ONE top-level form of `source` as runtime data (self-hosted)."
+  def read_data(source) when is_binary(source),
+    do: apply(@compiler_ns, :read_data, [source])
+
+  @doc "Read EVERY top-level form of `source` as runtime data (self-hosted)."
+  def read_all_data(source) when is_binary(source),
+    do: apply(@compiler_ns, :read_all_data, [source])
+
+  @doc """
+  Compile one reader form to its Core Erlang / Elixir syntax tree.
+
+  Delegates to `BeamLisp.Ns.Compiler` once the `compiler` namespace is interned
+  — the normal state on any tree, reached from the committed seed or a fresh
+  build. There is no Elixir genesis fallback: if the ns is not interned the
+  compiler simply is not loaded, which can only mean boot ran out of order or
+  the seed is missing/corrupt.
   """
   def compile(form, env) do
-    if use_bl_compiler?() do
+    if Env.loaded_ns?("compiler") do
       apply(@compiler_ns, :compile, [form, env])
     else
       raise """
@@ -82,40 +107,6 @@ defmodule BeamLisp.Compiler do
     end
   end
 
-  @doc "Expand `form` once as a macro call in namespace `ns` (self-hosted)."
-  def macroexpand_1(form, ns), do: apply(@compiler_ns, :macroexpand_1, [form, ns])
-
-  @doc "Prelink a `defn`'s call surface for namespace `ns` (self-hosted)."
-  def prelink_defn(form, ns), do: apply(@compiler_ns, :prelink_defn, [form, ns])
-
-  @doc "Read ONE top-level form of `source` as runtime data (self-hosted)."
-  def read_data(source) when is_binary(source),
-    do: apply(@compiler_ns, :read_data, [source])
-
-  @doc "Read EVERY top-level form of `source` as runtime data (self-hosted)."
-  def read_all_data(source) when is_binary(source),
-    do: apply(@compiler_ns, :read_all_data, [source])
-
-  @doc "Restart this process's fresh-name counter (self-hosted)."
-  def reset_fresh!, do: apply(@compiler_ns, :reset_fresh!, [])
-
-  # --- boot glue: the backend switch + intern-from-beam (no compiler semantics) ---
-
-  @doc """
-  Whether to route `compile/2` through the self-hosted beam-lisp compiler.
-
-  `:bl` forces it; `:genesis` is no longer meaningful (there is no genesis) and
-  behaves like `:auto`; `:auto` delegates whenever the `compiler` namespace is
-  interned in this node's Env — which it is once the seed installs and
-  `enable_bl_backend/0` runs.
-  """
-  def use_bl_compiler? do
-    case Application.get_env(:beam_lisp, :compiler_backend, :auto) do
-      :bl -> true
-      _ -> Env.loaded_ns?("compiler")
-    end
-  end
-
   @doc """
   Ensure the self-hosted beam-lisp compiler is ready to serve `compile/2`.
 
@@ -123,13 +114,13 @@ defmodule BeamLisp.Compiler do
   tree, or the freshly built beam otherwise) — running its `__bl_init__`, which
   replays the compiler's own `def` VALUES into the Env var table. No
   compilation, no genesis. Idempotent. Returns `:bl` when the self-hosted
-  compiler is now active, `:genesis` (legacy label = "not active") otherwise.
+  compiler is now active, `:not_loaded` if interning failed.
   """
   def enable_bl_backend do
     unless Env.loaded_ns?("compiler") do
       BeamLisp.Loader.ensure_loaded("compiler")
     end
 
-    if Env.loaded_ns?("compiler"), do: :bl, else: :genesis
+    if Env.loaded_ns?("compiler"), do: :bl, else: :not_loaded
   end
 end

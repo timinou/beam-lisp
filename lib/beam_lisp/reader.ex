@@ -22,9 +22,10 @@ defmodule BeamLisp.Reader do
   reader semantics:
 
     * the `BeamLisp.Reader.SyntaxError` / `BeamLisp.Reader.AtomLimitError`
-      exception structs the host raises, and the mapping from the .bl reader's
+      exception structs the host raises, and the mapping from the `.bl` reader's
       internal errors (`BeamLisp.ExInfo`, `BeamLisp.AtomGuard.LimitError`) onto
-      them, so Elixir callers keep `assert_raise`-ing the same types;
+      them — done once in `mapping_host_errors/1` — so Elixir callers keep
+      `assert_raise`-ing the same types;
     * `enable_bl_reader/0`, the boot step that interns the reader ns from its
       beam.
   """
@@ -40,31 +41,26 @@ defmodule BeamLisp.Reader do
   @spec read_string(String.t()) :: [term]
   @spec read_string(String.t(), binary | nil) :: [term]
   def read_string(source, file \\ nil) when is_binary(source) do
-    apply(@reader_ns, :read_string, [source, file])
-  rescue
-    e in BeamLisp.AtomGuard.LimitError ->
-      reraise BeamLisp.Reader.AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
-
-    e in BeamLisp.ExInfo ->
-      reraise BeamLisp.Reader.SyntaxError, [message: Exception.message(e)], __STACKTRACE__
+    mapping_host_errors(fn -> apply(@reader_ns, :read_string, [source, file]) end)
   end
 
   @doc "Read `source` into a list of BARE reader forms (positions stripped)."
   @spec read_all(String.t()) :: [term]
   def read_all(source) when is_binary(source) do
-    apply(@reader_ns, :read_all, [source])
-  rescue
-    e in BeamLisp.AtomGuard.LimitError ->
-      reraise BeamLisp.Reader.AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
-
-    e in BeamLisp.ExInfo ->
-      reraise BeamLisp.Reader.SyntaxError, [message: Exception.message(e)], __STACKTRACE__
+    mapping_host_errors(fn -> apply(@reader_ns, :read_all, [source]) end)
   end
 
   @doc "Read exactly one bare form from `source`; raise if zero or many."
   @spec read_one(String.t()) :: term
   def read_one(source) when is_binary(source) do
-    apply(@reader_ns, :read_one, [source])
+    mapping_host_errors(fn -> apply(@reader_ns, :read_one, [source]) end)
+  end
+
+  # Run `fun`, translating the `.bl` reader's internal error structs into the
+  # host-facing `BeamLisp.Reader.*` exceptions callers assert on. The one place
+  # the host↔language error boundary is crossed.
+  defp mapping_host_errors(fun) do
+    fun.()
   rescue
     e in BeamLisp.AtomGuard.LimitError ->
       reraise BeamLisp.Reader.AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
@@ -78,14 +74,13 @@ defmodule BeamLisp.Reader do
 
   Interns the `reader` namespace from its beam (the committed seed on a fresh
   tree, or the freshly built beam otherwise). No genesis reader remains behind
-  it. Idempotent. Returns `:bl` when active, `:genesis` (legacy = "not active")
-  otherwise.
+  it. Idempotent. Returns `:bl` when active, `:not_loaded` if interning failed.
   """
   def enable_bl_reader do
     unless BeamLisp.Env.loaded_ns?("reader") do
       BeamLisp.Loader.ensure_loaded("reader")
     end
 
-    if BeamLisp.Env.loaded_ns?("reader"), do: :bl, else: :genesis
+    if BeamLisp.Env.loaded_ns?("reader"), do: :bl, else: :not_loaded
   end
 end
