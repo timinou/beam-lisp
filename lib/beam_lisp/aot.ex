@@ -323,6 +323,7 @@ defmodule BeamLisp.AOT do
     # eager intern — carry the flag past the name-meta peel (which otherwise
     # discards `m`). Every other marker (e.g. `^:private`) is metadata only and
     # does not change how the value is registered.
+    # is_map-ok: reader metadata is a plain map by construction, never a struct
     if is_map(m) and m[:"per-env"] == true do
       case rest do
         [init] -> put_value_def(vdefs, ns, bare_name(name_form), nil, init, per_env: true)

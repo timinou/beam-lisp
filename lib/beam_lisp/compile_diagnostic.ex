@@ -125,6 +125,7 @@ defmodule BeamLisp.CompileDiagnostic do
   # Pull {line, col, file} off the form's reader metadata. Only lists (and
   # collection literals) are wrapped, so a bare literal or a macro-built form
   # returns an empty position — the caller falls back to the file-level label.
+  # is_map-ok: reader metadata is a plain map by construction, never a struct
   defp position({:meta, _inner, m}) when is_map(m) do
     [line: m[:line], col: m[:col], file: m[:file]]
   end
