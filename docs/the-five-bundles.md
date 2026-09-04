@@ -87,7 +87,7 @@ Bundle: Loop-Carried State + Ask + Tell + Correlated Reply + Timeout Edge.
 - `defserver` exists; the gen_server emitter in `compiler.bl` is unchanged.
 - `(invariant [s] pred)` clause: stored as a `defn` `account-invariant` the
   emitter also asserts in dev builds; `system/verify` reads it for
-  `establishes?`/`preserves?`. ~20 lines in `compiler.bl`.
+  `establishes?`/`preserves?`. ~20 lines in `priv/boot/compiler.bl`.
 - `call`/`cast`/`start`/`start-link`/`stop`: rename of `server-*` in the
   prelude, plus name resolution (`[:reg key]` → `reg/whereis`) at the top of
   each. `call` takes `{:timeout ms}` as optional third arg.
@@ -114,7 +114,7 @@ define, nothing to supervise.
 (map #(fence-fn 50 %) thunks)        ; higher-order; composes with flow/map-stage
 ```
 
-**Implementation.** `priv/fence.bl`, ~30 lines:
+**Implementation.** `priv/std/fence.bl`, ~30 lines:
 
 ```clojure
 (defmacro fence [opts & body] `(fence-fn ~opts (fn [] ~@body)))
@@ -168,8 +168,8 @@ and `erlang/monitor`s; `[:whereis attrs]` / `[:where q]` query;
 `handle-info [:DOWN _ :process pid _]` retracts every datom with that `:pid`.
 Invariant: every `:pid` in the db is alive — the Monitor rule (`:DOWN`
 handled in the only state) is what `system/verify` checks. `(name …)` on
-`defserver` → `init` prepends `reg/register`. `priv/registry.bl`, ~100 lines;
-`vitals.bl`'s atom registry cuts over. Single-node only in this slice.
+`defserver` → `init` prepends `reg/register`. `priv/std/registry.bl`, ~100 lines;
+`tooling/vitals.bl`'s atom registry cuts over. Single-node only in this slice.
 
 ---
 
@@ -201,7 +201,7 @@ existing `[:subscribe]/[:demand]/[:events]/[:done]` protocol — so every flow
 consumer already speaks bus and `flow/subscribe` needs no bus-specific code.
 `[:publish ev]` appends to each queue then drains `min(demand queue)` per
 subscriber; lag policy applied in drain; `:DOWN` auto-unsubscribes.
-`priv/bus.bl`, ~80 lines. `flow/broadcast` (any producer → bus) is the same
+`priv/std/bus.bl`, ~80 lines. `flow/broadcast` (any producer → bus) is the same
 server started from a producer instead of `bus/publish`.
 
 ---
@@ -257,9 +257,9 @@ OTP child specs whose `start` is `(fn [] (start-link child args))`, and
 new restart machinery. `supervise`/`worker` are rewritten to produce the same
 specs. `system/verify` on a supervisor name = `system.core` verbs over
 `(system.model/system-model children-sources)` plus the two new checks
-(~40 lines, `priv/super.bl`). `super/children`/`child-of`/`terminate`/`restart`
+(~40 lines, `priv/std/super.bl`). `super/children`/`child-of`/`terminate`/`restart`
 wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
-`vitals.bl`'s hand-rolled supervisor cuts over.
+`tooling/vitals.bl`'s hand-rolled supervisor cuts over.
 
 ---
 
@@ -304,12 +304,12 @@ wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
 | # | step | files | test / cutover |
 |---|---|---|---|
 | 1 | **Docs trued** (this commit) | `the-process-pattern-language.md`, `the-five-bundles.md` | — |
-| 2 | **Generic verbs**: `call` `cast` `start` `start-link` `stop` in prelude; name resolution hook (no-op until 5) | `priv/prelude.bl` (or wherever `server-call` lives), `compiler.bl` client API | `examples/server.bl`, `guards.bl` green using new names; `server-*` removed (cutover) |
-| 3 | **`fence`** | `priv/fence.bl` | new `examples/fence.bl`: three outcomes green; `ward` per-test wrapper cut over; note for spell to cut its two copies |
-| 4 | **`defserver (invariant …)`** clause + `system/verify` on a server name | `compiler.bl`, `priv/system/core.bl` | `guards.bl` `account` gains invariant; `(system/verify 'account)` → `:ok`; a deliberately bad server → `{:unsafe …}` |
-| 5 | **`defregistry`**, `(name …)` clause, name resolution in verbs | `priv/registry.bl`, `compiler.bl`, prelude | `examples/registry.bl`: register / whereis / where / auto-retract on kill; `vitals.bl` atom registry cut over |
-| 6 | **`defbus`** on flow's protocol, `flow/broadcast` | `priv/bus.bl`, `priv/flow.bl` | `examples/bus.bl`: two subscribers, one slow, `:drop-oldest` observed; `stop` reaches both |
-| 7 | **`defsupervisor`**, `child`, `pool`, `super/*`, `system/verify` over a tree; `supervise`/`worker` as skin | `priv/super.bl`, `rt.ex` (specs only), `priv/system/core.bl` | `examples/supervision.bl` green; `system/verify` **rejects** a child with a lasso; `vitals.bl` hand-rolled sup cut over |
+| 2 | **Generic verbs**: `call` `cast` `start` `start-link` `stop` in prelude; name resolution hook (no-op until 5) | `priv/boot/core.bl` (where `server-call` lives), `priv/boot/compiler.bl` client API | `examples/server.bl`, `guards.bl` green using new names; `server-*` removed (cutover) |
+| 3 | **`fence`** | `priv/std/fence.bl` | new `examples/fence.bl`: three outcomes green; `ward` per-test wrapper cut over; note for spell to cut its two copies |
+| 4 | **`defserver (invariant …)`** clause + `system/verify` on a server name | `priv/boot/compiler.bl`, `priv/lib/system/core.bl` | `guards.bl` `account` gains invariant; `(system/verify 'account)` → `:ok`; a deliberately bad server → `{:unsafe …}` |
+| 5 | **`defregistry`**, `(name …)` clause, name resolution in verbs | `priv/std/registry.bl`, `priv/boot/compiler.bl`, `priv/boot/core.bl` | `examples/registry.bl`: register / whereis / where / auto-retract on kill; `tooling/vitals.bl` atom registry cut over |
+| 6 | **`defbus`** on flow's protocol, `flow/broadcast` | `priv/std/bus.bl`, `priv/std/flow.bl` | `examples/bus.bl`: two subscribers, one slow, `:drop-oldest` observed; `stop` reaches both |
+| 7 | **`defsupervisor`**, `child`, `pool`, `super/*`, `system/verify` over a tree; `supervise`/`worker` as skin | `priv/std/super.bl`, `lib/beam_lisp/rt.ex` (specs only), `priv/lib/system/core.bl` | `examples/supervision.bl` green; `system/verify` **rejects** a child with a lasso; `tooling/vitals.bl` hand-rolled sup cut over |
 | 8 | **§6 example** + pattern ledger ◐/○ → ✅ | `examples/bundles/00-all-five.bl`, `the-process-pattern-language.md` | example green end to end |
 
 Steps 2 and 3 are independent (parallel). 4 needs 2. 5–7 each need 2; 7 needs
