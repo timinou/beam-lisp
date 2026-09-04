@@ -51,19 +51,36 @@
 (defn cmap [pairs] (cerl/c_map (to-list pairs)))
 (defn cpair [k v] (cerl/c_map_pair k v))
 
-(def counter (atom 0))
-(defn fresh [prefix]
-  (swap! counter inc)
-  (cvar (erlang/binary_to_atom (str prefix "_ce" (deref counter)))))
+(def ^:private core-fresh-key (erlang/binary_to_atom "bl_core_fresh_seq"))
 
 (defn reset-fresh!
-  "Reset the fresh-name counter to 0. Called once per COMPILATION UNIT (each
-   module build) so the fresh var names — hence the emitted beam's bytes — are a
-   function of that unit's source alone, never of what else built earlier in the
-   VM. Mirrors BeamLisp.Compiler.reset_fresh!/0; the same discipline is what
-   makes a Core-produced seed/AOT beam byte-reproducible across builds."
+  "Reset THIS PROCESS's fresh-name counter to 0. Called once per COMPILATION
+   UNIT (each module build) so the fresh var names — hence the emitted beam's
+   bytes — are a function of that unit's source alone, never of what else built
+   earlier OR CONCURRENTLY in the VM.
+
+   The counter is per-process (process dictionary), exactly like
+   BeamLisp.Compiler.reset_fresh!/0 and priv/boot/compiler.bl's `reset-fresh!`.
+   A shared ref would be a reproducibility HAZARD: the AOT build compiles
+   namespaces in PARALLEL worker processes (build.bl `pmap-ordered` →
+   `spawn_link`), and two workers racing one global counter would interleave
+   fresh numbers and emit non-reproducible beams — the exact leak class
+   aot_reproducible_test pins (serial ≡ parallel ≡ post-perturbation). Per
+   process, each worker's sequence is a function of its own source alone."
   []
-  (reset! counter 0))
+  (erlang/put core-fresh-key 0)
+  nil)
+
+(defn- next-fresh!
+  "The next number from THIS PROCESS's fresh-name counter (1, 2, 3 …)."
+  []
+  (let [cur (erlang/get core-fresh-key)
+        n (erlang/+ (if (erlang/=:= cur :undefined) 0 cur) 1)]
+    (erlang/put core-fresh-key n)
+    n))
+
+(defn fresh [prefix]
+  (cvar (erlang/binary_to_atom (str prefix "_ce" (next-fresh!)))))
 
 ;; ── quoted-node accessors ───────────────────────────────────────────────────
 
@@ -79,9 +96,9 @@
   "{:__aliases__ _ [:BeamLisp :RT]} → 'Elixir.BeamLisp.RT'. A bare atom passes."
   [m]
   (cond
-    (= :__MODULE__ m) (deref current-module)
+    (= :__MODULE__ m) (current-module)
     (erlang/is_atom m) m
-    (and (var-node? m) (= :__MODULE__ (head m))) (deref current-module)
+    (and (var-node? m) (= :__MODULE__ (head m))) (current-module)
     (form? m :__aliases__)
       (erlang/binary_to_atom
         (str "Elixir." (Enum/join (to-list (map (fn [a] (erlang/atom_to_binary a)) (args m))) ".")))
@@ -215,7 +232,12 @@
                   (list c2 r2 s2)
                   (cseq (lower after-q) (ccall :erlang :raise (list c2 r2 s2)))))))
 
-(def current-module (atom nil))
+(def ^:private current-module-key (erlang/binary_to_atom "bl_core_current_module"))
+
+(defn- set-current-module! [m] (erlang/put current-module-key m) m)
+
+(defn- current-module []
+  (let [v (erlang/get current-module-key)] (if (= :undefined v) nil v)))
 
 (defn lower
   "Elixir quoted (as emitted by compiler.bl) → cerl."
@@ -223,7 +245,7 @@
   (cond
     ;; ── leaves
     (nil? t) (catom nil)
-    (var-node? t) (if (= :__MODULE__ (head t)) (catom (deref current-module)) (cvar (head t)))
+    (var-node? t) (if (= :__MODULE__ (head t)) (catom (current-module)) (cvar (head t)))
     (erlang/is_atom t) (catom t)
     (erlang/is_number t) (lit t)
     (erlang/is_binary t) (lit t)
@@ -327,6 +349,22 @@
 
 (declare lower-anf)
 
+(defn lower-anf-pattern-key
+  "Lower the KEY of a map/struct pattern pair to a ground cerl term. A pattern
+   key is always a literal value, never a sub-pattern or an expression to
+   evaluate, but the two producers spell it differently: norm-pattern's :pstruct
+   keeps the field name as a RAW atom (:items), while its :pmap wraps the key
+   through normalise into a :lit node. Accept both: a bl-ANF node map lowers
+   through lower-anf (a :lit yields its literal), and a bare value is abstracted
+   directly. Calling lower-anf on the raw atom was the bug: an atom is not a
+   node, so it fell to the else branch and threw an unknown-op error, which
+   blocked every namespace with a vector pattern in a receive/case clause
+   (e.g. (receive [:done r] r), which reads as a %Vector struct pattern)."
+  [k]
+  (if (and (map? k) (contains? k :op))
+    (lower-anf k)
+    (lit k)))
+
 (defn lower-anf-pattern [p]
   (let [op (:pop p)]
     (cond
@@ -338,12 +376,12 @@
       (= op :palias) (cerl/c_alias (lower-anf-pattern (:a p)) (lower-anf-pattern (:b p)))
       (= op :pmap)
         (cerl/c_map_pattern
-          (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf (first kv)) (lower-anf-pattern (second kv))))
+          (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf-pattern-key (first kv)) (lower-anf-pattern (second kv))))
                         (:pairs p))))
       (= op :pstruct)
         (cerl/c_map_pattern
           (cons (cerl/c_map_pair_exact (catom :__struct__) (catom (:mod p)))
-                (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf (first kv)) (lower-anf-pattern (second kv))))
+                (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf-pattern-key (first kv)) (lower-anf-pattern (second kv))))
                               (:fields p)))))
       :else (throw (ex-info "lower-anf-pattern: unknown pop" {:pop op :pat p})))))
 
@@ -397,6 +435,28 @@
                   (list c2 r2 s2)
                   (cseq (lower-anf after) (ccall :erlang :raise (list c2 r2 s2)))))))
 
+(defn anf-if->case
+  "Lower a truthy `if` to a Core `case`, given the ALREADY-lowered cerl test,
+   then, and else. Elixir truthiness: only `false` and `nil` are falsey.
+
+   `then` and `else` each appear ONCE. The naive encoding — a `false` clause and
+   a `nil` clause both yielding `else`, plus a catch-all `then` — lowered `else`
+   TWICE, and because a `cond` nests one `if` inside another's else, the else
+   subtree at depth k was re-lowered 2^k times: O(2^N) in the branch count. A
+   15-branch `cond` (datom.codec/encode-value) took 45s+ and blocked the whole
+   Core AOT build. A single guarded clause — `X when X =:= false or X =:= nil`
+   → else — collapses the two falsey patterns into one, so each branch is
+   lowered once and the cost is linear. `erlang:or/2` (the strict boolean BIF,
+   not `orelse`) is guard-legal in Core Erlang; `=:=` is exact equality."
+  [ctest cthen celse]
+  (let [x (fresh "If")
+        guard (ccall :erlang :or
+                     (list (ccall :erlang (erlang/binary_to_atom "=:=") (list x (catom false)))
+                           (ccall :erlang (erlang/binary_to_atom "=:=") (list x (catom nil)))))]
+    (ccase ctest
+           (list (cclause (list x) guard celse)
+                 (cclause (list (fresh "_")) cthen)))))
+
 (defn lower-anf
   "bl-ANF node (self.anf vocabulary) → cerl."
   [n]
@@ -408,10 +468,7 @@
       (= op :remote) (ccall (:mod n) (:fun n) (to-list (map lower-anf (:args n))))
       (= op :apply) (capply (lower-anf (:fn n)) (to-list (map lower-anf (:args n))))
       (= op :let) (clet (cvar (erlang/binary_to_atom (:name n))) (lower-anf (:init n)) (lower-anf (:body n)))
-      (= op :if) (ccase (lower-anf (:test n))
-                        (list (cclause (list (catom false)) (lower-anf (:else n)))
-                              (cclause (list (catom nil)) (lower-anf (:else n)))
-                              (cclause (list (fresh "_")) (lower-anf (:then n)))))
+      (= op :if) (anf-if->case (lower-anf (:test n)) (lower-anf (:then n)) (lower-anf (:else n)))
       (= op :do) (reduce (fn [acc s] (cseq acc (lower-anf s)))
                          (lower-anf (first (:stmts n)))
                          (rest (:stmts n)))
@@ -518,10 +575,14 @@
    `attrs` is [[name value] …] (e.g. [[:behaviour [:gen_server]]])."
   ([mname def-asts] (defs->module mname def-asts (list)))
   ([mname def-asts attrs]
-  (reset! current-module mname)
+  (set-current-module! mname)
   (let [def-asts (to-list (mapcat expand-defaults def-asts))
         heads (to-list (map def-head def-asts))
-        groups (group-by (fn [[f ps _ _]] [f (count ps)]) heads)
+        ;; Stable group order — see defs->module-anf: a map keyed by an atom
+        ;; fname iterates in atom-table (creation) order, so sort by the fname
+        ;; STRING + arity to make the emitted beam a function of the source alone.
+        groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
+                        (to-list (group-by (fn [[f ps _ _]] [f (count ps)]) heads)))
         funs (to-list
                (map (fn [[[f n] cls]]
                       (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
@@ -558,11 +619,21 @@
    fed by bl-ANF. `attrs` is [[name value] …]."
   ([mname def-asts] (defs->module-anf mname def-asts (list)))
   ([mname def-asts attrs]
-   (reset! current-module mname)
+   (set-current-module! mname)
    (reset-fresh!)   ; per-unit: emitted bytes are a function of THIS source alone
    (let [def-asts (to-list (mapcat expand-defaults def-asts))
          heads (to-list (map def-head-anf def-asts))
-         groups (group-by (fn [[f ps _ _]] [f (count ps)]) heads)
+         ;; Group clauses by [fname arity], then iterate in a STABLE order.
+         ;; `group-by` returns a map keyed by [fname arity], and a map with ATOM
+         ;; keys iterates in atom-TABLE order (creation order), not term order —
+         ;; so which function's clauses come first depended on which atoms the VM
+         ;; had interned by the time this ran, i.e. on everything compiled
+         ;; earlier in the build. That made both the function order AND the
+         ;; per-function `fresh "P"` params vary run-to-run: the emitted beam was
+         ;; NOT reproducible. Sorting the groups by the fname STRING + arity ties
+         ;; the order to the source alone, which is what reproducibility means.
+         groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
+                         (to-list (group-by (fn [[f ps _ _]] [f (count ps)]) heads)))
          funs (to-list
                 (map (fn [[[f n] cls]]
                        (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
@@ -731,3 +802,22 @@
    {module beam}. `mname` is the body-module atom (deterministic per ns)."
   [mname def-asts]
   (module->beam (defs->module-anf mname def-asts)))
+
+(defn aot-body-beams
+  "The AOT integration seam (PLAN-081 step 1): compile EVERY body module of a
+   namespace to a .beam via Core, returning a list of {module beam} pairs.
+
+   `ns-defs` is the stabilised var→def-tuples map the Elixir AOT path holds
+   (Env.ns_defs after emit.ex's stabilise_body_modules). We reuse
+   BeamLisp.Emit/body_modules to group it into [{body-mod [def-ast …]} …] — the
+   SAME grouping emit.ex uses for its Elixir body modules — so the Core path and
+   the Elixir path split a namespace into byte-identical module topology,
+   differing only in the backend that lowers each body. The shim, init, and
+   provenance modules stay Elixir (role-B/C plumbing: Env.intern, __bl_init__,
+   __bl_provenance__); only the real code — the sole semantic Elixir dependency
+   — flows through Core here."
+  [ns-defs]
+  (to-list
+    (map (fn [[body-mod def-asts]]
+           (ns-body-beam body-mod (to-list def-asts)))
+         (to-list (BeamLisp.Emit/body_modules ns-defs)))))
