@@ -11,46 +11,51 @@ at all.
 ```
 role                what it is                       replaceable?
 ──────────────────  ───────────────────────────────  ─────────────────────────
-A. backend          bl AST → Elixir quoted → .beam   yes — this is the topic
+A. backend          bl AST → Core Erlang → .beam     replaced — Core is default
 B. runtime library  BeamLisp.RT / Vector / Env …     independent of A
 C. OTP host         application, supervisor, mix     no, and correctly so
 ```
 
 ## The pipeline as it runs today
 
+The default backend is Core Erlang — no Elixir compiler on the path:
+
 ```
 "(defn f [x] (inc x))"
    │  reader.bl                          text → reader nodes (data, with positions)
    ▼
- bl AST
-   │  compiler.bl                        special forms → Elixir QUOTED AST
-   ▼                                     {:def, meta, [{:f, [], [x]}, [do: …]]}
- Elixir quoted
-   │  Module.create / :elixir_compiler.quoted      ← role A starts here
-   │    elixir_expand      resolves aliases/imports/requires, expands Elixir macros
-   │    Module.Types       Elixir's type inference over the emitted code
-   │    elixir_erl         quoted → Erlang abstract format
+ reader forms
+   │  compiler.bl                        special forms → bl-ANF (a small neutral IR)
    ▼
- Erlang abstract format
-   │  :compile.forms                     erl_lint → v3_core
+ bl-ANF
+   │  self/core.bl                       bl-ANF → Core Erlang
    ▼
- Core Erlang                             ← the layer targeting-core-erlang.md aims at
+ Core Erlang                             the BEAM's simplest real input
+   │  :compile.forms                     ← Erlang stdlib; the only backend call
    │  sys_core_fold → v3_kernel → beam_ssa (type opt, alloc opt) → beam_validator → beam_asm
    ▼
  .beam  (JIT'd by the VM on load)
 ```
 
-Everything from "Elixir quoted" to "Erlang abstract format" is Elixir's
-compiler doing work on machine-generated code. Everything below Core Erlang is
-Erlang's compiler and stays no matter what frontend feeds it.
+Everything above Core Erlang is beam-lisp source. Everything from
+`:compile.forms` down is Erlang's own compiler and stays no matter what
+frontend feeds it. (An opt-in legacy path, `:aot_backend :elixir`, lowers
+bl-ANF through Elixir's quoted AST instead — kept for comparison, not the
+default.)
 
-## Role A — Elixir as compiler backend (the semantic dependency)
+## Role A — the compiler backend
 
-`compiler.bl` does not emit BEAM; it emits Elixir **syntax** and asks Elixir to
-mean it. That is a dependency on Elixir's *semantics*: the meaning of every
-node the compiler emits is defined by the Elixir language, not by beam-lisp.
+The backend is the layer that turns the compiler's output into a `.beam`. By
+default it is beam-lisp: `compiler.bl` emits **bl-ANF**, and `self/core.bl`
+lowers that to **Core Erlang**, which the Erlang stdlib compiles. No Elixir
+compiler is involved.
 
-Counted over `priv/boot/compiler.bl`, the emitted node vocabulary is small:
+The **opt-in legacy path** (`:aot_backend :elixir`) instead has the front end
+emit Elixir **syntax** and asks Elixir to mean it — a dependency on Elixir's
+*semantics*. It is kept for comparison and is what the rest of this section
+describes, because understanding what that path emitted is what made the Core
+Erlang target a bounded rewrite. The emitted-node vocabulary was small, which is
+exactly why replacing it was tractable:
 
 | Elixir node | count | what beam-lisp uses it for |
 |---|---|---|
@@ -110,13 +115,15 @@ The library surface, by module (`lib/beam_lisp/`):
 | `multi.ex` | multimethods + bl protocols (bl's own dispatch, not Elixir protocols) |
 | `server.ex` | `defserver` start/stop wrappers routing around `GenServer` |
 | `env.ex` / `link.ex` / `refs.ex` / `atom_guard.ex` | namespaces, var linking, heap/caps bounds, atom-table guard |
-| `reader.ex` / `compiler.ex` / `emit.ex` / `aot.ex` / `loader.ex` | the *Elixir* reader/compiler (oracle + seed) and module topology |
+| `emit.ex` / `aot.ex` / `link.ex` / `loader.ex` | module topology, AOT cache/drift gate, var linking, the loader |
+| `reader.ex` / `compiler.ex` | ~230-line FACADES: they hold no compiler logic, just the well-known host names delegating to `BeamLisp.Ns.Reader` / `BeamLisp.Ns.Compiler`, error-type mapping, and the boot step |
 
 The `.bl` side is tiered under `priv/`: `boot/` (reader-node, reader, compiler,
 core, sugar, data-readers — the toolchain closure), `std/` (typed, codebase,
 termination, reload, …), `lib/` (datom, system, veritas, auth, …), `self/`
-(the compiler's own oracle). Role A lives entirely in `priv/boot/compiler.bl`
-plus `lib/beam_lisp/emit.ex`.
+(`core.bl` — bl-ANF → Core Erlang; `anf.bl` — the neutral IR). Role A lives
+entirely in `priv/boot/compiler.bl` (front end) plus `priv/self/core.bl` (the
+Core Erlang backend).
 
 Two facts about role B matter for any backend discussion:
 
@@ -136,15 +143,17 @@ remote call. `core.bl` uses ~30 such calls (`String/*`, `Map/delete`,
 
 ## Role C — Elixir as OTP host
 
-`application.ex`, `supervisor.ex`, the `mix beam_lisp.*` tasks, `escript.build`,
-`mix release`, the `drop` bundler's payload. This is the process that *runs*
+`application.ex`, `supervisor.ex`, the `mix beam_lisp.*` tasks,
+`mix release` (the sole packaging tier), the `drop` bundler's payload. This is the process that *runs*
 the language — exactly as Clojure keeps a JVM launcher. It has no opinion on
 how `.beam` files are produced and is not part of the language.
 
 ## The one-line summary
 
-beam-lisp depends on Elixir **semantically** in exactly one place: the moment
-`compiler.bl`'s output is handed to `Module.create`. Every other use of Elixir
-is a remote function call (role B) or the process that boots the VM (role C).
-Replacing role A leaves B and C untouched — that is what makes a Core Erlang
-backend a bounded, not a total, rewrite.
+beam-lisp no longer depends on the Elixir **compiler** at all by default:
+`compiler.bl` lowers to bl-ANF, `self/core.bl` lowers that to Core Erlang, and
+the Erlang stdlib turns Core Erlang into a `.beam`. The only remaining semantic
+Elixir is role B (runtime remote calls) and role C (the OTP host). Role A —
+once "bl AST → Elixir quoted → Module.create" — has been replaced; the Elixir
+AST path survives solely as an opt-in (`config :beam_lisp, :aot_backend,
+:elixir`).
