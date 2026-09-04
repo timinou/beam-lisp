@@ -134,14 +134,28 @@ defmodule BeamLisp.Native do
 
   @table :beam_lisp_native_declarations
 
+  # The declarations table is VM-wide state and must OUTLIVE whichever
+  # process first declared a native. Created lazily by the first caller, it
+  # died with that caller when the caller was a parallel-build worker (one
+  # `Task` per source): every `defnative` namespace compiled after that
+  # worker exited saw `declaration/1` → nil, its `__bl_init__` was emitted
+  # WITHOUT the `Native.declare` replay, and the beam differed from a serial
+  # build's — silently, a deployment with no native backend (BUG-021's exact
+  # symptom, by a new route). Same fix as BeamLisp.LazySeq's table: the
+  # pinned `Loader.Server` owns it, so its lifetime is the VM's.
   defp table do
     case :ets.whereis(@table) do
       :undefined ->
-        try do
-          :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-        rescue
-          ArgumentError -> @table
-        end
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+          rescue
+            # Another process won the race; its table is the one we want.
+            ArgumentError -> :ok
+          end
+        end)
+
+        @table
 
       _ ->
         @table
@@ -231,7 +245,13 @@ defmodule BeamLisp.Native do
   defp create_host(mod, ns, crate, signatures) do
     # Rustler installs as `priv/native/<crate>.so` (no `lib` prefix), and
     # `:erlang.load_nif/2` wants the path WITHOUT the extension.
-    lib_path = Path.join(:code.priv_dir(:beam_lisp), "native/#{crate}")
+    #
+    # A crate may live in a CONSUMER app (acid-shell's native/wayland_shm,
+    # native/loom_paint), whose `:beam_lisp_native` compiler installs it into
+    # THAT app's priv — not beam_lisp's. So resolve across every loaded app's
+    # priv/native, consumer apps first, beam_lisp last; a NIF that exists
+    # nowhere reports beam_lisp's path in the error (the historical default).
+    lib_path = resolve_lib_path(crate)
 
     stubs =
       for {name, arity} <- signatures do
@@ -301,6 +321,46 @@ defmodule BeamLisp.Native do
 
     Module.create(mod, body, Macro.Env.location(__ENV__))
     mod
+  end
+
+  # Search order: every loaded OTP app's priv/native (beam_lisp last), so a
+  # consumer's crate wins over an identically named one in beam_lisp's priv.
+  # Returns the extension-less path load_nif wants; falls back to beam_lisp's
+  # priv when nothing exists, so the load error names a sensible location.
+  defp resolve_lib_path(crate) do
+    apps =
+      Application.loaded_applications()
+      |> Enum.map(fn {app, _, _} -> app end)
+      |> Enum.reject(&(&1 == :beam_lisp))
+      |> Kernel.++([:beam_lisp])
+
+    found =
+      Enum.find_value(apps, fn app ->
+        case priv_dir(app) do
+          nil -> nil
+          dir ->
+            p = Path.join(dir, "native/#{crate}")
+            if File.exists?(p <> ".so"), do: p, else: nil
+        end
+      end)
+
+    found || Path.join(BeamLisp.Tiers.priv_root(), "native/#{crate}")
+  end
+
+  # An app's priv dir as a REAL directory, or nil. beam_lisp's own goes
+  # through `Tiers.priv_root/0`, which knows that an escript reports a virtual
+  # archive path and falls back to the source tree — the `.so` files the
+  # escript cannot carry still live there, so `bl` can load the native tier
+  # from a checkout instead of failing every store open with :nif_not_loaded.
+  defp priv_dir(:beam_lisp), do: BeamLisp.Tiers.priv_root()
+
+  defp priv_dir(app) do
+    case :code.priv_dir(app) do
+      {:error, _} -> nil
+      dir ->
+        dir = to_string(dir)
+        if File.dir?(dir), do: dir, else: nil
+    end
   end
 
   defp link_var(ns, mod, name, arity) do

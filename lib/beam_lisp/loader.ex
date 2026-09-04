@@ -60,26 +60,17 @@ defmodule BeamLisp.Loader do
   end
 
   @doc """
-  Resolve `ns` to `{source_hash, requires}` — the content hash (same encoding as
-  `source_hash/1`) plus the namespace names of its `:require` clauses, from ONE
-  file resolution. `nil` when the source is not on the search path.
-
-  This is the runtime half of the FEAT-030 closure hash: `BeamLisp.AOT`
-  recursively walks `requires` and hashes each member's `source_hash`, so a
-  namespace's freshness reflects itself AND its transitive requires. Sharing the
-  ONE `find_file/1` resolution keeps the hash and the require edges consistent
-  (a beam stamped from these inputs matches a runtime gate computed from them).
+  The source CONTENT of `ns` on the current search path, or `nil` when no
+  source is findable (a prod release ships beams, not sources). The freshness
+  key (`BeamLisp.BuildPlan.key_for/3`) derives everything it needs — content
+  hash, requires, interface — from this one read, so the build and the
+  runtime gate see the same bytes.
   """
-  @spec source_info(binary) :: {binary, [binary]} | nil
-  def source_info(ns) when is_binary(ns) do
+  @spec source_content(binary) :: binary | nil
+  def source_content(ns) when is_binary(ns) do
     case find_file(ns) do
-      {:ok, _path, content} ->
-        hash = :crypto.hash(:sha256, content) |> Base.encode16()
-        {_ns, requires} = BeamLisp.SourceGraph.header(content)
-        {hash, requires}
-
-      _ ->
-        nil
+      {:ok, _path, content} -> content
+      _ -> nil
     end
   end
 
@@ -106,6 +97,27 @@ defmodule BeamLisp.Loader do
   @doc "`source_hash/1` for `ns` resolved against `dir` alone."
   def source_hash_in(dir, ns) do
     with_search_dir(dir, fn -> source_hash(ns) end)
+  end
+
+  @doc """
+  Run `fun` with `dirs` bound as the ambient search roots for every namespace
+  load it triggers, in load order. Unlike `with_search_dir/2` (a single dir for
+  drift-gate resolution), this overrides the `[File.cwd!() | extra_dirs()]`
+  capture that `ensure_loaded/1` would otherwise compute — the daemon binds a
+  CLIENT's roots (its cwd + `-p` paths) here because the daemon VM's own cwd is
+  the checkout, not the client's tree. Restores the prior binding after.
+  """
+  def with_ambient_dirs(dirs, fun) when is_list(dirs) do
+    prev = Process.get(:bl_ambient_dirs)
+    Process.put(:bl_ambient_dirs, dirs)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev),
+        do: Process.delete(:bl_ambient_dirs),
+        else: Process.put(:bl_ambient_dirs, prev)
+    end
   end
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
@@ -165,7 +177,10 @@ defmodule BeamLisp.Loader do
         # this case). The per-load load-path stack is NOT captured: it
         # belongs to whatever load is in progress and reads correctly
         # inside the server.
-        dirs = [File.cwd!()] ++ extra_dirs()
+        # A daemon request binds the CLIENT's roots (cwd + `-p` paths) via
+        # `with_ambient_dirs/2`; the daemon VM's own cwd is the checkout,
+        # not the client's tree. Unbound, this is the standalone capture.
+        dirs = Process.get(:bl_ambient_dirs) || [File.cwd!() | extra_dirs()]
 
         BeamLisp.Loader.Server.run(fn ->
           prev = Process.get(:bl_search_dirs)
@@ -344,6 +359,18 @@ defmodule BeamLisp.Loader do
   # whose first form is not `(ns …)` declares no namespace and returns
   # nil. Only the head is consumed — the scan stops at the end of the
   # ns name, and the file's body is left for the eventual load to parse.
+  @doc """
+  The loadable source at `path`: the bytes themselves for a plain `.bl`,
+  the concatenated code cells for a literate `.bl.md` / `.bl.org`. This is
+  THE read the build and the loader share, so a document compiles to the
+  same program it loads as.
+  """
+  @spec read_source(Path.t()) :: binary
+  def read_source(path), do: doc_content(path, File.read!(path))
+
+  @doc "The source extensions the loader (and the build) recognise."
+  def doc_extensions, do: @doc_extensions
+
   # A document's loadable source: itself when plain .bl, else its code cells.
   defp doc_content(path, raw) do
     if String.ends_with?(path, ".bl") do

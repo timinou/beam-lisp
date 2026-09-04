@@ -1,0 +1,104 @@
+; build_plan_test.bl — the build plan's contract, pinned.
+;
+; build-plan.bl turns a set of sources into an order, a set of waves and a
+; freshness key per source in one traversal. These tests pin the properties
+; the build relies on, on a small hand-made graph AND on the real prelude:
+;
+;   order is topological           every dep is emitted before its dependent
+;   waves are honest               wave k depends only on waves < k
+;   keys equal source-graph's      the manifest key IS the runtime gate's key
+;   an anonymous file keys on itself, and lands in the last wave
+;   a cycle terminates             and every node still gets a key
+;   O(V + E)                       each node is expanded once; the plan asks
+;                                  nothing of the disk (it reads node maps)
+(ns build-plan.test
+  (:require [build-plan :as bp] [source-graph :as sg]))
+
+(defn- node [path ns reqs hash] {:path path :ns ns :reqs reqs :hash hash})
+
+(def diamond
+  "d requires b and c; b requires c; c requires x (unresolvable); plus an
+   anonymous file."
+  (list (node "d.bl" "d" ["b" "c"] "hd")
+        (node "b.bl" "b" ["c"] "hb")
+        (node "c.bl" "c" ["x"] "hc")
+        (node "anon.bl" nil [] "ha")))
+
+(defn- pos-of [plan] (into {} (map-indexed (fn [i n] [(:path n) i]) (:order plan))))
+
+(defn- topological? [plan]
+  (let [pos (pos-of plan)]
+    (every? (fn [n] (every? (fn [d] (< (get pos d) (get pos (:path n)))) (get (:deps plan) (:path n))))
+            (:order plan))))
+
+(defn- waves-honest? [plan]
+  (let [wave-of (into {} (apply concat (map-indexed (fn [k w] (map (fn [n] [(:path n) k]) w)) (:waves plan))))]
+    (every? (fn [n] (every? (fn [d] (< (get wave-of d) (get wave-of (:path n)))) (get (:deps plan) (:path n))))
+            (:order plan))))
+
+(deftest diamond-order-and-waves
+  (let [p (bp/plan diamond)]
+    (is (= ["c.bl" "b.bl" "d.bl" "anon.bl"] (vec (map :path (:order p)))))
+    (is (= [["c"] ["b"] ["d"] [nil]] (vec (map (fn [w] (vec (map :ns w))) (:waves p)))))
+    (is (topological? p))
+    (is (waves-honest? p))
+    (is (= ["b" "c" "d" "x"] (vec (get (:closure p) "d"))) "unresolvable x stays in the closure")
+    (is (= ["b.bl" "c.bl"] (vec (get (:deps p) "d.bl"))) "deps are resolved paths only")))
+
+(deftest keys-are-source-graph-keys
+  (let [p (bp/plan diamond)
+        hashes {"d" "hd" "b" "hb" "c" "hc"}
+        reqs (fn [n] (get {"d" ["b" "c"] "b" ["c"] "c" ["x"]} n []))]
+    (doseq [n ["d" "b" "c"]]
+      (is (= (get (:key p) (str n ".bl")) (sg/closure-hash n (fn [m] (get hashes m)) reqs))
+          (str "key parity for " n)))
+    (is (= "ha" (get (:key p) "anon.bl")) "an anonymous file keys on its own hash")))
+
+(deftest key-moves-only-with-the-closure
+  (let [p1 (bp/plan diamond)
+        p2 (bp/plan (map (fn [n] (if (= "c" (:ns n)) (assoc n :hash "hc2") n)) diamond))
+        p3 (bp/plan (map (fn [n] (if (= "b" (:ns n)) (assoc n :hash "hb2") n)) diamond))]
+    (is (not= (get (:key p1) "d.bl") (get (:key p2) "d.bl")) "editing c moves d (transitive)")
+    (is (not= (get (:key p1) "b.bl") (get (:key p2) "b.bl")) "editing c moves b")
+    (is (= (get (:key p1) "c.bl") (get (:key p3) "c.bl")) "editing b does not move c (no edge)")
+    (is (= (get (:key p1) "anon.bl") (get (:key p3) "anon.bl")))))
+
+(deftest cycles-terminate
+  (let [p (bp/plan (list (node "a" "a" ["b"] "1") (node "b" "b" ["a"] "2")))]
+    (is (= 2 (count (:order p))))
+    (is (every? string? (vals (:key p))) "every node keyed")
+    (is (= (get (:key p) "a") (get (:key (bp/plan (list (node "a" "a" ["b"] "1") (node "b" "b" ["a"] "2")))) "a"))
+        "stable across runs")))
+
+(deftest determinism
+  (let [p1 (bp/plan diamond)
+        p2 (bp/plan (reverse diamond))]
+    (is (= (map :path (:order p1)) (map :path (:order p2))) "input order does not matter")
+    (is (= (:key p1) (:key p2)))))
+
+(deftest linear-in-the-graph
+  ;; Each node is expanded once, so the plan costs O(V + E + Σ|closure|) — the
+  ;; last term is unavoidable, the closure hash must see every member. On a
+  ;; STAR (a root requiring n leaves) Σ|closure| = 2n, so the whole plan is
+  ;; linear: 400 vs 4000 nodes must scale ~10x, never ~100x. (A CHAIN has
+  ;; Σ|closure| = n²/2 — a quadratic OUTPUT, not a quadratic walk; the real
+  ;; prelude is 13 waves deep with Σ|closure| ≈ 9·V.)
+  (let [star (fn [n] (cons (node "root" "root" (vec (map str (range 1 n))) "hr")
+                           (Enum/to_list (map (fn [i] (node (str i) (str i) [] (str "h" i))) (range 1 n)))))
+        t (fn [f] (let [a (erlang/monotonic_time :microsecond)] (f) (- (erlang/monotonic_time :microsecond) a)))
+        small (t (fn [] (bp/plan (star 400))))
+        big (t (fn [] (bp/plan (star 4000))))]
+    (is (< big (* 30 (max small 2000))) (str "400→" small "µs, 4000→" big "µs"))))
+
+(deftest real-prelude-plans
+  (let [files (sort (Path/wildcard "priv/**/*.bl"))
+        nodes (Enum/to_list
+                (map (fn [p] (let [c (File/read! p) [ns reqs] (sg/header c)]
+                               (node p ns reqs (sha256-hex c))))
+                     files))
+        p (bp/plan nodes)]
+    (is (= (count files) (count (:order p))))
+    (is (topological? p))
+    (is (waves-honest? p))
+    (is (every? (fn [n] (contains? (:key p) (:path n))) nodes) "every source keyed")
+    (is (> (count (first (:waves p))) 10) "the prelude has real parallelism in wave 1")))

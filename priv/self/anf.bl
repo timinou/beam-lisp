@@ -1,0 +1,399 @@
+; self/anf.bl — bl-ANF: the backend-neutral IR (PLAN-079 S-B).
+;
+; ── What this is ─────────────────────────────────────────────────────────────
+;
+; priv/boot/compiler.bl resolves every symbol and expands every macro, then
+; emits a small closed vocabulary — but shaped as ELIXIR quoted AST
+; (`{{:., [], [M, F]}, [], args}`): opaque tuples, coupled to Elixir's AST
+; shape, hostile to any other backend. bl-ANF is the SAME resolved program as
+; self-describing, backend-neutral DATA. It is the single IR the whole
+; toolbench reads and BOTH backends consume:
+;
+;     compiler.bl → bl-ANF → cerl.bl   → Core Erlang → .beam   (self.core, S-C)
+;                         → native.bl → MLIR/LLVM              (PLAN-080)
+;
+; ── Shape: one node = an MLIR op ─────────────────────────────────────────────
+;
+; A node is a map {:op <keyword> …operands… :ann <map>}. That is exactly an
+; MLIR operation: an op-name, typed operands, and an attribute dictionary
+; (`:ann`). Nested nodes are regions. So a future MLIR emitter is a structural
+; walk — op→op, :ann→attributes, body-nodes→regions — no reshaping. `:ann`
+; carries types (from typed), effects (from footprint) and source positions;
+; S-B leaves it empty but every constructor threads it, so nothing downstream
+; has to reshape a node to annotate it.
+;
+; ── The vocabulary ───────────────────────────────────────────────────────────
+;
+;   :lit    {:val v}                          number/string/atom/nil/true/false
+;   :var    {:name "x"}                        a lexical local
+;   :global {:ns "user" :name "inc"}           an Env.fetch! var reference
+;   :remote {:mod :erlang :fun :+ :args [n…]}  a host call M:f(args)
+;   :apply  {:fn n :args [n…]}                 call a fn VALUE
+;   :let    {:name "x" :init n :body n}        one binding (ANF core)
+;   :if     {:test n :then n :else n}          bl truthiness (nil/false → else)
+;   :do     {:stmts [n…]}                      sequence, value = last
+;   :case   {:subj n :clauses [clause…]}       pattern match
+;   :fn     {:clauses [clause…]}               a closure (params are patterns)
+;   :try    {:body n :catch [clause…] :after n|nil}
+;   :recv   {:clauses [clause…] :timeout n|nil :after n|nil}
+;   :tuple  {:elems [n…]}                      an Erlang tuple
+;   :map    {:pairs [[n n]…]}
+;   :cons   {:head n :tail n}     :enil {}     list cells
+;   :struct {:mod M :fields [[n n]…]}          %Mod{…}
+;
+; A `clause` is {:pats [pat…] :guard n|nil :body n}. A `pat`:
+;   :pvar {:name} :plit {:val} :ptuple {:elems} :pmap {:pairs [[key pat]…]}
+;   :pcons {:head :tail} :pnil {} :palias {:a :b} :pstruct {:mod :fields}
+;
+; ── Two functions ────────────────────────────────────────────────────────────
+;
+;   normalise : quoted → bl-ANF   — the bridge from compiler.bl's output today.
+;               After S-D compiler.bl emits bl-ANF directly and this retires.
+;   interp    : bl-ANF × env → value — a reference evaluator. It gives bl-ANF a
+;               MEANING independent of any backend, so bl-ANF can be gated
+;               without trusting cerl (S-B), and it becomes the self-referential
+;               oracle after Elixir genesis is gone (S-E): Core output vs interp,
+;               no Elixir in sight.
+
+(ns self.anf)
+
+;; ── quoted-node accessors (same shape self.core reads) ───────────────────────
+
+(defn- qnode? [t n] (and (tuple? t) (= n (tuple-size t))))
+(defn- qhead [t] (elem t 0))
+(defn- qargs [t] (elem t 2))
+(defn- qvar? [t] (and (qnode? t 3) (erlang/is_atom (qhead t)) (erlang/is_atom (elem t 2))))
+(defn- qcall? [t] (and (qnode? t 3) (tuple? (qhead t)) (= :. (qhead (qhead t)))))
+(defn- qform? [t k] (and (qnode? t 3) (= k (qhead t))))
+(defn- qkw [kvs k] (Keyword/get kvs k))
+(def qbar (erlang/binary_to_atom "|"))
+(def qpct (erlang/binary_to_atom "%"))
+(def qmap-open (erlang/binary_to_atom "%{}"))
+(def qtuple (erlang/binary_to_atom "{}"))
+
+;; ── constructors (every node threads an :ann, default {}) ────────────────────
+
+(defn lit [v] {:op :lit :val v :ann {}})
+(defn var [name] {:op :var :name name :ann {}})
+(defn global [ns name] {:op :global :ns ns :name name :ann {}})
+(defn remote [mod fun args] {:op :remote :mod mod :fun fun :args args :ann {}})
+(defn app [f args] {:op :apply :fn f :args args :ann {}})
+(defn lett [name init body] {:op :let :name name :init init :body body :ann {}})
+(defn iff [test then else] {:op :if :test test :then then :else else :ann {}})
+(defn doo [stmts] {:op :do :stmts stmts :ann {}})
+(defn casee [subj clauses] {:op :case :subj subj :clauses clauses :ann {}})
+(defn fnn [clauses] {:op :fn :clauses clauses :ann {}})
+(defn tryy [body catch after] {:op :try :body body :catch catch :after after :ann {}})
+(defn recv [clauses timeout after] {:op :recv :clauses clauses :timeout timeout :after after :ann {}})
+(defn tup [elems] {:op :tuple :elems elems :ann {}})
+(defn mapp [pairs] {:op :map :pairs pairs :ann {}})
+(defn cons-cell [h t] {:op :cons :head h :tail t :ann {}})
+(def enil {:op :enil :ann {}})
+(defn structt [mod fields] {:op :struct :mod mod :fields fields :ann {}})
+(defn clause [pats guard body] {:pats pats :guard guard :body body})
+
+;; pattern constructors
+(defn pvar [name] {:pop :pvar :name name})
+(defn plit [v] {:pop :plit :val v})
+(defn ptuple [elems] {:pop :ptuple :elems elems})
+(defn pmap [pairs] {:pop :pmap :pairs pairs})
+(defn pcons [h t] {:pop :pcons :head h :tail t})
+(def pnil {:pop :pnil})
+(defn palias [a b] {:pop :palias :a a :b b})
+(defn pstruct [mod fields] {:pop :pstruct :mod mod :fields fields})
+
+;; ── alias resolution (same as self.core) ─────────────────────────────────────
+
+(defn- alias->atom [m]
+  (cond
+    (erlang/is_atom m) m
+    (qform? m :__aliases__)
+      (erlang/binary_to_atom
+        (str "Elixir." (Enum/join (to-list (map (fn [a] (erlang/atom_to_binary a)) (qargs m))) ".")))
+    :else (throw (ex-info "anf: not a module" {:node m}))))
+
+(declare normalise)
+(declare norm-pattern)
+(declare norm-clauses)
+
+(defn- cons-node? [x] (qform? x qbar))
+
+(defn- norm-list
+  "Elixir list literal (elements are quoted AST) → :cons chain / [h|t]."
+  [xs]
+  (if (and (= 1 (count xs)) (cons-node? (first xs)))
+    (cons-cell (normalise (first (qargs (first xs)))) (normalise (second (qargs (first xs)))))
+    (reduce (fn [acc x] (cons-cell (normalise x) acc)) enil (reverse xs))))
+
+(defn- simple-lambda?
+  "One-clause, unguarded fn whose params are all plain vars — the compiler's
+   shape for `let`; its application normalises to a chain of :let."
+  [f]
+  (and (qform? f :fn)
+       (= 1 (count (qargs f)))
+       (let [ps (first (qargs (first (qargs f))))]
+         (every? qvar? ps))))
+
+(defn norm-pattern [p]
+  (cond
+    (qvar? p) (pvar (erlang/atom_to_binary (qhead p)))
+    (qform? p qpct)
+      (let [[m fields] (qargs p)]
+        (pstruct (alias->atom m)
+                 (to-list (map (fn [kv] [(elem kv 0) (norm-pattern (elem kv 1))]) (qargs fields)))))
+    (qform? p qmap-open)
+      (pmap (to-list (map (fn [kv] [(normalise (elem kv 0)) (norm-pattern (elem kv 1))]) (qargs p))))
+    (qform? p qtuple) (ptuple (to-list (map norm-pattern (qargs p))))
+    (qform? p :=) (palias (norm-pattern (first (qargs p))) (norm-pattern (second (qargs p))))
+    (qnode? p 2) (ptuple (list (norm-pattern (elem p 0)) (norm-pattern (elem p 1))))
+    (erlang/is_list p) (reduce (fn [acc x] (pcons (norm-pattern x) acc)) pnil (reverse p))
+    :else (plit p)))
+
+(defn norm-clauses
+  "[{:-> _ [[pats…] body]} …] (possibly {:when …}-guarded) → bl-ANF clauses."
+  [clauses]
+  (to-list
+    (map (fn [cl]
+           (let [pats (first (qargs cl)) body (second (qargs cl)) p0 (first pats)]
+             (if (and (= 1 (count pats)) (qform? p0 :when))
+               (let [ws (qargs p0) n (dec (count ws))]
+                 (clause (to-list (map norm-pattern (take n ws))) (normalise (nth ws n)) (normalise body)))
+               (clause (to-list (map norm-pattern pats)) nil (normalise body)))))
+         clauses)))
+
+(defn- norm-block
+  "A :__block__: `x = e` → :let (var) or a one-clause :case (pattern); any
+   other statement sequences via :do."
+  [stmts]
+  (cond
+    (empty? stmts) (lit nil)
+    (= 1 (count stmts)) (normalise (first stmts))
+    :else
+      (let [s (first stmts) rest-body (norm-block (rest stmts))]
+        (if (qform? s :=)
+          (let [lhs (first (qargs s)) rhs (second (qargs s))]
+            (if (qvar? lhs)
+              (lett (erlang/atom_to_binary (qhead lhs)) (normalise rhs) rest-body)
+              (casee (normalise rhs) (list (clause (list (norm-pattern lhs)) nil rest-body)))))
+          (doo (list (normalise s) rest-body))))))
+
+(defn normalise
+  "compiler.bl's emitted (Elixir-quoted) output → bl-ANF."
+  [t]
+  (cond
+    (nil? t) (lit nil)
+    (qvar? t) (var (erlang/atom_to_binary (qhead t)))
+    (erlang/is_atom t) (lit t)
+    (erlang/is_number t) (lit t)
+    (erlang/is_binary t) (lit t)
+    (erlang/is_list t) (norm-list t)
+
+    ;; calls: M.f(args) / (fn…).(v) as let / f.(args)
+    (qcall? t)
+      (let [tgt (qargs (qhead t)) as (to-list (map normalise (qargs t)))]
+        (cond
+          ;; Env.fetch!("ns","name") → :global (a var reference, not a host call)
+          (and (= 2 (count tgt)) (= :fetch! (second tgt))
+               (let [m (first tgt)] (and (qform? m :__aliases__) (= [:BeamLisp :Env] (to-list (qargs m))))))
+            (let [av (qargs t)] (global (first av) (second av)))
+          (= 2 (count tgt)) (remote (alias->atom (first tgt)) (second tgt) as)
+          (simple-lambda? (first tgt))
+            (let [cl (first (qargs (first tgt))) ps (first (qargs cl))]
+              (reduce (fn [body [p a]] (lett (erlang/atom_to_binary (qhead p)) a body))
+                      (normalise (second (qargs cl)))
+                      (reverse (to-list (map (fn [p a] [p a]) ps as)))))
+          :else (app (normalise (first tgt)) as)))
+
+    (qform? t :apply)
+      (let [[m f as] (qargs t)]
+        (if (and (erlang/is_atom m) (erlang/is_atom f) (erlang/is_list as))
+          (remote m f (to-list (map normalise as)))
+          (remote :erlang :apply (list (normalise m) (normalise f) (normalise as)))))
+
+    (qform? t :__aliases__) (lit (alias->atom t))
+    (qform? t qbar) (cons-cell (normalise (first (qargs t))) (normalise (second (qargs t))))
+    (qform? t :==) (remote :erlang :== (to-list (map normalise (qargs t))))
+    (qform? t :===) (remote :erlang :=:= (to-list (map normalise (qargs t))))
+    (qform? t :and) (let [[a b] (qargs t)] (iff (normalise a) (normalise b) (lit false)))
+    (qform? t :make_ref) (remote :erlang :make_ref (list))
+    (qform? t :__block__) (norm-block (qargs t))
+    (qform? t :=) (norm-block (list t (first (qargs t))))
+    (qform? t :fn) (fnn (norm-clauses (qargs t)))
+
+    (qform? t :if)
+      (let [[test kvs] (qargs t)] (iff (normalise test) (normalise (qkw kvs :do)) (normalise (qkw kvs :else))))
+
+    (qform? t :cond)
+      (let [clauses (to-list (qkw (first (qargs t)) :do))
+            lastc (last clauses)
+            [init body-cls] (if (= true (first (first (qargs lastc))))
+                              [(normalise (second (qargs lastc))) (butlast clauses)]
+                              [(remote :erlang :error (list (lit :cond_clause))) clauses])]
+        (reduce (fn [else cl]
+                  (let [test (first (first (qargs cl))) body (second (qargs cl))]
+                    (iff (normalise test) (normalise body) else)))
+                init
+                (reverse (to-list body-cls))))
+
+    (qform? t :case)
+      (let [[subj kvs] (qargs t)] (casee (normalise subj) (norm-clauses (qkw kvs :do))))
+
+    (qform? t :try)
+      (let [kvs (first (qargs t))
+            body (normalise (qkw kvs :do))
+            cc (to-list (or (qkw kvs :catch) (list)))
+            af (qkw kvs :after)]
+        (tryy body (norm-clauses cc) (if (nil? af) nil (normalise af))))
+
+    (qform? t :receive)
+      (let [kvs (first (qargs t))
+            cls (norm-clauses (or (qkw kvs :do) (list)))
+            af (qkw kvs :after)]
+        (if (nil? af)
+          (recv cls nil nil)
+          (let [ac (first af)]
+            (recv cls (normalise (first (first (qargs ac)))) (normalise (second (qargs ac)))))))
+
+    (qform? t qtuple) (tup (to-list (map normalise (qargs t))))
+    (qnode? t 2) (tup (list (normalise (elem t 0)) (normalise (elem t 1))))
+    (qform? t qmap-open)
+      (mapp (to-list (map (fn [kv] [(normalise (elem kv 0)) (normalise (elem kv 1))]) (qargs t))))
+    (qform? t qpct)
+      (let [[m fields] (qargs t)]
+        (structt (alias->atom m)
+                 (to-list (map (fn [kv] [(normalise (elem kv 0)) (normalise (elem kv 1))]) (qargs fields)))))
+
+    :else (throw (ex-info "anf/normalise: unhandled quoted node" {:node t}))))
+
+;; ── the reference interpreter ────────────────────────────────────────────────
+;;
+;; interp gives bl-ANF a meaning that does not depend on cerl or on Elixir. It
+;; is a tree-walker over an environment (a map name→value). Host calls go
+;; through the real modules via erlang/apply, and fn VALUES are ordinary bl
+;; closures — so a program's value is computed with the SAME runtime library
+;; (Role B) both backends use, differing only in how control/binding is walked.
+;; This is the gate for S-B (bl-ANF has the right meaning) and, after Elixir
+;; genesis is deleted (S-E), the self-referential oracle: Core output vs interp.
+
+(declare interp)
+
+(defn- truthy? [v] (and (not (nil? v)) (not (= false v))))
+
+(defn- pmatch
+  "Match value `v` against pattern `p`, extending bindings `b` (a map) or
+   returning :nomatch. Mirrors Core/Erlang clause semantics."
+  [p v b]
+  (cond
+    (= :nomatch b) :nomatch
+    :else
+      (let [op (:pop p)]
+        (cond
+          (= op :pvar) (assoc b (:name p) v)
+          (= op :plit) (if (= (:val p) v) b :nomatch)
+          (= op :pnil) (if (or (nil? v) (= (list) v) (and (erlang/is_list v) (empty? v))) b :nomatch)
+          (= op :palias) (pmatch (:b p) v (pmatch (:a p) v b))
+          (= op :ptuple)
+            (if (and (tuple? v) (= (count (:elems p)) (tuple-size v)))
+              (reduce (fn [acc [i pe]] (pmatch pe (elem v i) acc))
+                      b (map-indexed (fn [i pe] [i pe]) (:elems p)))
+              :nomatch)
+          (= op :pcons)
+            (if (and (erlang/is_list v) (not (empty? v)))
+              (pmatch (:tail p) (rest v) (pmatch (:head p) (first v) b))
+              :nomatch)
+          (= op :pmap)
+            (if (map? v)
+              (reduce (fn [acc [k pe]]
+                        (if (= :nomatch acc) :nomatch
+                          (if (contains? v k) (pmatch pe (get v k) acc) :nomatch)))
+                      b (:pairs p))
+              :nomatch)
+          (= op :pstruct)
+            (if (and (map? v) (= (:mod p) (get v :__struct__)))
+              (reduce (fn [acc [k pe]] (pmatch pe (get v k) acc)) b (:fields p))
+              :nomatch)
+          :else :nomatch))))
+
+(defn- match-clauses
+  "Try each clause against args (a list of values); run the first whose
+   patterns match AND whose guard is truthy. `on-fail` is called with no args."
+  [clauses args env on-fail]
+  (let [hit (some (fn [cl]
+                    (let [b (reduce (fn [acc [pat v]] (pmatch pat v acc))
+                                    env (map (fn [pat v] [pat v]) (:pats cl) args))]
+                      (if (= :nomatch b) nil
+                        (if (or (nil? (:guard cl)) (truthy? (interp (:guard cl) b)))
+                          [cl b] nil))))
+                  clauses)]
+    (if (nil? hit) (on-fail) (interp (:body (first hit)) (second hit)))))
+
+(defn interp
+  "Evaluate a bl-ANF node under env (name→value). Returns the value."
+  [n env]
+  (let [op (:op n)]
+    (cond
+      (= op :lit) (:val n)
+      (= op :var) (get env (:name n))
+      (= op :global) (BeamLisp.Env/fetch! (:ns n) (:name n))
+      (= op :remote) (erlang/apply (:mod n) (:fun n) (to-list (map (fn [a] (interp a env)) (:args n))))
+      (= op :apply) (BeamLisp.RT/invoke (interp (:fn n) env) (to-list (map (fn [a] (interp a env)) (:args n))))
+      (= op :let) (interp (:body n) (assoc env (:name n) (interp (:init n) env)))
+      (= op :if) (if (truthy? (interp (:test n) env)) (interp (:then n) env) (interp (:else n) env))
+      (= op :do) (last (map (fn [s] (interp s env)) (:stmts n)))
+      (= op :tuple) (erlang/list_to_tuple (to-list (map (fn [e] (interp e env)) (:elems n))))
+      (= op :map) (reduce (fn [m [k v]] (assoc m (interp k env) (interp v env))) {} (:pairs n))
+      (= op :enil) (list)
+      (= op :cons) (cons (interp (:head n) env) (interp (:tail n) env))
+      (= op :struct)
+        ;; Build the raw struct map with Map/put, NOT bl assoc: assoc on a
+        ;; %BeamLisp.Vector treats the key as an index ("assoc index out of
+        ;; bounds"). The compiler emits %Mod{…} as a plain map carrying
+        ;; :__struct__ plus the fields, so we construct exactly that.
+        (reduce (fn [m [k v]] (Map/put m (interp k env) (interp v env)))
+                (Map/put (Map/new) :__struct__ (:mod n)) (:fields n))
+      (= op :case)
+        (match-clauses (:clauses n) (list (interp (:subj n) env)) env
+                       (fn [] (erlang/error (tuple :case_clause (interp (:subj n) env)))))
+      (= op :fn)
+        ;; compiler.bl emits a :fn whose clauses all share one arity (variadic
+        ;; and multi-arity are already desugared UPSTREAM into the {:$blfn fixed
+        ;; variadic} TUPLE the compiler builds around inner :fn nodes). So a :fn
+        ;; node is exactly a raw BEAM closure of fixed arity = its pattern count.
+        ;; We produce a real Erlang function of that arity via arity-keyed
+        ;; clauses (1..8 covers every fn the compiler emits; a self/apply fn is
+        ;; arity 1, the widest observed is small). The body runs the clause
+        ;; matcher, so guards and destructuring still hold.
+        (let [clauses (:clauses n)
+              nargs (count (:pats (first clauses)))
+              run (fn [args] (match-clauses clauses args env
+                                            (fn [] (erlang/error :function_clause))))]
+          (cond
+            (= nargs 0) (fn [] (run (list)))
+            (= nargs 1) (fn [a] (run (list a)))
+            (= nargs 2) (fn [a b] (run (list a b)))
+            (= nargs 3) (fn [a b c] (run (list a b c)))
+            (= nargs 4) (fn [a b c d] (run (list a b c d)))
+            (= nargs 5) (fn [a b c d e] (run (list a b c d e)))
+            (= nargs 6) (fn [a b c d e f] (run (list a b c d e f)))
+            (= nargs 7) (fn [a b c d e f g] (run (list a b c d e f g)))
+            (= nargs 8) (fn [a b c d e f g h] (run (list a b c d e f g h)))
+            :else (throw (ex-info "anf/interp: :fn arity > 8" {:nargs nargs}))))
+      (= op :try)
+        ;; The compiler emits Erlang-shaped catch clauses: two patterns
+        ;; (class, reason). `throw` compiles to ExInfo.raise_payload → an
+        ;; Elixir `raise`, so on the BEAM the class is :error and the reason is
+        ;; the exception struct. bl's own (catch e …) normalises to that reason,
+        ;; so we recover the pair by binding [:error caught] — the clause body
+        ;; then reconstructs the bl value exactly as the Elixir backend does.
+        (let [run (fn []
+                    (try (interp (:body n) env)
+                         (catch e
+                           (if (empty? (:catch n)) (throw e)
+                             (match-clauses (:catch n)
+                                            (list :error e)
+                                            env (fn [] (throw e)))))))]
+          (if (nil? (:after n)) (run)
+            (try (run) (finally (interp (:after n) env)))))
+      (= op :recv)
+        (throw (ex-info "anf/interp: :recv not supported in the reference interpreter" {:node n}))
+      :else (throw (ex-info "anf/interp: unknown op" {:op op :node n})))))

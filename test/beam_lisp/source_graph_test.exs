@@ -1,7 +1,14 @@
 defmodule BeamLisp.SourceGraphTest do
-  use ExUnit.Case, async: true
+  # The graph is beam-lisp code (priv/boot/source-graph.bl): the runtime must
+  # be up. `async: false` because `init/0` seeds the VM-wide Env.
+  use ExUnit.Case, async: false
 
   alias BeamLisp.SourceGraph
+
+  setup_all do
+    BeamLisp.init()
+    :ok
+  end
 
   describe "header/1" do
     test "ns with no requires" do

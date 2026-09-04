@@ -1,0 +1,255 @@
+; test/bl/datom/blob_test.bl — the BlobStore CONFORMANCE suite.
+; Run: mix beam_lisp.test test/bl/datom/blob_test.bl
+;
+; ── This file is the actual protocol contract ─────────────────────────
+;
+; `priv/lib/datom/blob.bl` states the port in docstrings; this suite states
+; it executably, and every substrate must pass it unchanged — the same
+; discipline as store_test.bl for the Store port. blob-s3 sits in
+; `SUBSTRATES` when an S3 endpoint is configured (see below); it runs
+; against Garage in this repo's development, any S3-compatible server works.
+;
+; Substrate-specific knowledge (the on-disk layout of blob-fs, the
+; torn-write guarantee) lives in its own section at the bottom, NOT in the
+; conformance body.
+
+(ns datom.blob.test
+  (:require [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
+            [datom.blob-s3] [datom.file] [datom.store]))
+
+(defn- bytes-of [n] (erlang/list_to_binary (to-list (mapv (fn [i] (rem (* i 31) 256)) (range 0 n)))))
+
+;; The S3 substrate joins the suite when a real S3 endpoint is provided —
+;; CI and this repo's development run against Garage (garagehq.deuxfleurs.fr);
+;; any S3-compatible server works. Set ALL of:
+;;   BL_S3_ENDPOINT   e.g. http://127.0.0.1:3900
+;;   BL_S3_BUCKET     e.g. bl-blobs
+;;   BL_S3_REGION     e.g. garage (server's s3_region)
+;;   BL_S3_ACCESS_KEY_ID / BL_S3_SECRET_ACCESS_KEY
+;; Absent ⇒ the S3 substrate is skipped, exactly as the fjall store tests
+;; skip when the native backend is not built.
+
+(defn- s3-cfg []
+  (let [e (System/get_env "BL_S3_ENDPOINT")]
+    (if (nil? e)
+      nil
+      ; A FRESH prefix per run, the same uniqueness discipline as
+      ; datom.store/fresh-path: a bucket persists across runs, and the
+      ; conformance body assumes a substrate that starts empty.
+      {:bucket (System/get_env "BL_S3_BUCKET")
+       :prefix (str "bl_blob_test_" (erlang/list_to_binary (os/getpid))
+                    "_" (erlang/monotonic_time :nanosecond)
+                    "_" (erlang/unique_integer (to-list [:positive])))
+       :region (or (System/get_env "BL_S3_REGION") "garage")
+       :endpoint e
+       :access-key (System/get_env "BL_S3_ACCESS_KEY_ID")
+       :secret-key (System/get_env "BL_S3_SECRET_ACCESS_KEY")})))
+
+(def SUBSTRATES
+  "Name → constructor. The ONLY place a substrate is named."
+  (let [base {:ets     (fn [] (datom.blob-ets/open))
+              :fs      (fn [] (datom.blob-fs/open :tmp))
+              :overlay (fn [] (datom.blob-overlay/open (datom.blob-ets/open)))}]
+    (if (some? (s3-cfg))
+      (assoc base :s3 (fn [] (datom.blob-s3/open (s3-cfg))))
+      base)))
+
+(defn- each-substrate
+  "Run `f` with a fresh blob store of every substrate, closing it after."
+  [f]
+  (doseq [entry (seq SUBSTRATES)]
+    (let [bs ((get entry 1))]
+      (f (get entry 0) bs)
+      (datom.store/close bs))))
+
+;; ── point access ────────────────────────────────────────────────────────────
+
+(deftest absent-sha-is-nil-and-not-held
+  (each-substrate
+    (fn [nm bs]
+      (let [sha (datom.file/sha256 "never")]
+        (is (nil? (datom.blob/-blob-get bs sha)))
+        (is (not (datom.blob/-blob-has? bs sha)))))))
+
+(deftest put-then-get-is-byte-identical
+  (each-substrate
+    (fn [nm bs]
+      (let [data (bytes-of 3000)
+            sha (datom.file/sha256 data)]
+        (datom.blob/-blob-put bs sha data)
+        (is (datom.blob/-blob-has? bs sha))
+        (is (= data (datom.blob/-blob-get bs sha)))))))
+
+(deftest a-large-blob-round-trips
+  ; 5 MiB: past any single-chunk shortcut, past the refc-binary threshold,
+  ; more than one fs stream chunk.
+  (each-substrate
+    (fn [nm bs]
+      (let [data (bytes-of (* 5 1024 1024))
+            sha (datom.file/sha256 data)]
+        (datom.blob/-blob-put bs sha data)
+        (is (= data (datom.blob/-blob-get bs sha)))
+        (is (= data (erlang/iolist_to_binary (to-list (datom.blob/stream bs sha)))))))))
+
+(deftest empty-blob-is-a-blob
+  (each-substrate
+    (fn [nm bs]
+      (let [sha (datom.file/sha256 "")]
+        (datom.blob/-blob-put bs sha "")
+        (is (datom.blob/-blob-has? bs sha))
+        (is (= "" (datom.blob/-blob-get bs sha)))))))
+
+;; ── idempotence: content addressing makes retries free ─────────────────────
+
+(deftest put-is-idempotent
+  (each-substrate
+    (fn [nm bs]
+      (let [data "same"
+            sha (datom.file/sha256 data)]
+        (datom.blob/-blob-put bs sha data)
+        (datom.blob/-blob-put bs sha data)
+        (datom.blob/-blob-put bs sha data)
+        (is (= data (datom.blob/-blob-get bs sha)))
+        (is (= 1 (count (datom.blob/-blob-shas bs))))))))
+
+(deftest put-returns-the-store
+  ; so a caller can thread it, exactly like Store/-put
+  (each-substrate
+    (fn [nm bs]
+      (let [sha (datom.file/sha256 "t")]
+        (is (= bs (datom.blob/-blob-put bs sha "t")))))))
+
+;; ── shas: the GC sweep's input ───────────────────────────────────────────────
+
+(deftest shas-lists-exactly-what-is-held
+  (each-substrate
+    (fn [nm bs]
+      (is (= [] (datom.blob/-blob-shas bs)))
+      (let [a (datom.file/sha256 "a")
+            b (datom.file/sha256 "b")
+            c (datom.file/sha256 "c")]
+        (datom.blob/-blob-put bs a "a")
+        (datom.blob/-blob-put bs b "b")
+        (datom.blob/-blob-put bs c "c")
+        (is (= #{a b c} (into #{} (datom.blob/-blob-shas bs))))))))
+
+;; ── streaming ────────────────────────────────────────────────────────────────
+
+(deftest stream-concatenates-to-the-blob
+  (each-substrate
+    (fn [nm bs]
+      (let [data (bytes-of 200000)
+            sha (datom.file/sha256 data)]
+        (datom.blob/-blob-put bs sha data)
+        (is (= data (erlang/iolist_to_binary (to-list (datom.blob/stream bs sha)))))
+        (is (nil? (datom.blob/stream bs (datom.file/sha256 "absent"))))))))
+
+;; ── delete: GC only, idempotent ─────────────────────────────────────────────
+
+(deftest delete-removes-and-is-idempotent
+  ; the overlay is the one substrate that REFUSES delete (a speculation
+  ; never GCs), so it is tested apart below
+  (doseq [nm (filterv (fn [k] (not= k :overlay)) (keys SUBSTRATES))]
+    (let [bs ((get SUBSTRATES nm))
+          sha (datom.file/sha256 "d")]
+      (datom.blob/-blob-put bs sha "d")
+      (datom.blob/-blob-delete bs sha)
+      (is (not (datom.blob/-blob-has? bs sha)))
+      (is (nil? (datom.blob/-blob-get bs sha)))
+      (datom.blob/-blob-delete bs sha)
+      (is (= [] (datom.blob/-blob-shas bs)))
+      (datom.store/close bs))))
+
+;; ── close: idempotent teardown ──────────────────────────────────────────────
+
+(deftest close-is-idempotent
+  (each-substrate
+    (fn [nm bs]
+      (datom.store/close bs)
+      (datom.store/close bs)
+      (is true))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; substrate-specific knowledge
+;; ═══════════════════════════════════════════════════════════════════════════
+
+;; ── blob-fs ──────────────────────────────────────────────────────────────────
+
+(deftest fs-shards-by-the-first-four-hex-digits
+  (let [bs (datom.blob-fs/open :tmp)
+        data "sharded"
+        sha (datom.file/sha256 data)
+        hex (datom.file/sha-hex sha)]
+    (datom.blob/-blob-put bs sha data)
+    (is (= true (File/exists? (str (:dir bs) "/" (erlang/binary_part hex 0 2)
+                                   "/" (erlang/binary_part hex 2 2) "/" hex))))
+    (is (= (str "file://" (:dir bs) "/" (erlang/binary_part hex 0 2)
+                "/" (erlang/binary_part hex 2 2) "/" hex)
+           (datom.blob/url bs sha {})))
+    (datom.store/close bs)))
+
+(deftest fs-a-torn-write-is-invisible
+  ; The write lands in .tmp and is renamed into place. Simulate the crash
+  ; between the two: a file sitting in .tmp is NOT held and NOT listed.
+  (let [bs (datom.blob-fs/open :tmp)
+        sha (datom.file/sha256 "torn")]
+    (File/write! (str (:dir bs) "/.tmp/" (datom.file/sha-hex sha) "_crashed") "tor")
+    (is (not (datom.blob/-blob-has? bs sha)))
+    (is (nil? (datom.blob/-blob-get bs sha)))
+    (is (= [] (datom.blob/-blob-shas bs)))
+    ; and a real put afterwards succeeds regardless of the debris
+    (datom.blob/-blob-put bs sha "torn")
+    (is (= "torn" (datom.blob/-blob-get bs sha)))
+    (datom.store/close bs)))
+
+(deftest fs-tmp-is-deleted-on-close-a-named-dir-is-kept
+  (let [tmp (datom.blob-fs/open :tmp)
+        named-dir (str (System/tmp_dir!) "/bl_blob_named_" (erlang/unique_integer (to-list [:positive])))
+        named (datom.blob-fs/open named-dir)]
+    (datom.store/close tmp)
+    (datom.store/close named)
+    (is (= false (File/dir? (:dir tmp))))
+    (is (= true (File/dir? named-dir)))
+    (File/rm_rf! named-dir)))
+
+(deftest fs-unwritable-location-fails-at-open
+  (is (thrown? (datom.blob-fs/open "/proc/no-such-place/blobs"))))
+
+;; ── blob-s3 (when an endpoint is configured) ─────────────────────────────────
+
+(deftest s3-presigned-url-fetches-without-signing
+  (if (some? (s3-cfg))
+    (let [bs (datom.blob-s3/open (s3-cfg))
+          data "fetched by an unsigned client"
+          sha (datom.file/sha256 data)]
+      (datom.blob/-blob-put bs sha data)
+      (let [url (datom.blob/url bs sha {:expires 300})
+            resp (Req/request (to-list [(erlang/list_to_tuple (to-list [:method "GET"]))
+                                        (erlang/list_to_tuple (to-list [:url url]))
+                                        (erlang/list_to_tuple (to-list [:retry false]))]))
+            r (erlang/element 2 resp)]
+        (is (= 200 (get r :status)))
+        (is (= data (get r :body))))
+      (datom.blob/-blob-delete bs sha))
+    (is true)))
+
+;; ── blob-overlay ─────────────────────────────────────────────────────────────
+
+(deftest overlay-reads-through-and-never-writes-the-base
+  (let [base (datom.blob-ets/open)
+        ov (datom.blob-overlay/open base)
+        in-base (datom.file/sha256 "base")
+        in-ov (datom.file/sha256 "spec")]
+    (datom.blob/-blob-put base in-base "base")
+    (datom.blob/-blob-put ov in-ov "spec")
+    (is (= "base" (datom.blob/-blob-get ov in-base)))
+    (is (= "spec" (datom.blob/-blob-get ov in-ov)))
+    (is (nil? (datom.blob/-blob-get base in-ov)))
+    (is (= #{in-base in-ov} (into #{} (datom.blob/-blob-shas ov))))
+    (is (= [in-base] (datom.blob/-blob-shas base)))))
+
+(deftest overlay-refuses-delete
+  (let [ov (datom.blob-overlay/open (datom.blob-ets/open))
+        sha (datom.file/sha256 "x")]
+    (datom.blob/-blob-put ov sha "x")
+    (is (thrown? (datom.blob/-blob-delete ov sha)))))

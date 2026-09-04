@@ -1,0 +1,840 @@
+; self/core.bl — the Core Erlang backend, in beam-lisp.
+;
+; ── What this is ─────────────────────────────────────────────────────────────
+;
+; A second reader of priv/boot/compiler.bl's output. compiler.bl resolves every
+; symbol, expands every macro, and emits a SMALL closed vocabulary of quoted
+; nodes (literal · var · remote call · fn/apply · if/cond/case · block/= · try ·
+; receive · apply · tuple/map/struct). That tree is not Elixir — it is a
+; lisp-shaped ANF-ish term that Elixir happens to accept. Core Erlang accepts it
+; just as directly, and cheaper: compile:forms [from_core] skips the Elixir
+; expander, Module.Types and ParallelChecker — the passes that cost 93s / 13min
+; on generated code — so a def through Core builds ~1.7-2.0x faster with no
+; option juggling. This module is that lowering (`lower`), the module topology
+; (body module + namespace shims, mirroring emit.ex), and the two seams the
+; runtime switches onto: `eval-core` (evaluate one form) and `core-defvar`
+; (Link.defvar in Core).
+;
+; ── The rule ─────────────────────────────────────────────────────────────────
+;
+; This is the FIRST graduation of research/ce1_core_erlang (proven: 7897 forms
+; lowered, 142 tests / 583 assertions zero divergence from the Elixir backend,
+; closure survival across redefinition). It reads the compiler's QUOTED output
+; today; PLAN-079 S-C/S-D re-point it at a backend-neutral bl-ANF IR and make
+; compiler.bl emit that IR directly, deleting the quoted layer. The lowering
+; table (quoted node -> cerl constructor) does not change shape when that lands;
+; only its INPUT does. Everything here is a pure function of data to data except
+; `load-module!`/`eval-core`/`core-defvar`, the one effectful edge (load a
+; binary) — the same shape emit.ex has.
+;
+; cerl, compile:forms, code:load_binary, core_pp are all public OTP APIs,
+; reached through plain erlang/-style interop. No Elixir compiler is on this
+; path.
+
+(ns self.core (:require [compiler :as c] [self.anf :as anf]))
+
+;; ── tiny cerl surface ───────────────────────────────────────────────────────
+
+(defn lit [v] (cerl/abstract v))
+(defn catom [a] (cerl/c_atom a))
+(defn cvar [name] (cerl/c_var name))
+(defn ccall [m f args] (cerl/c_call (catom m) (catom f) (to-list args)))
+(defn capply [f args] (cerl/c_apply f (to-list args)))
+(defn cfun [vars body] (cerl/c_fun (to-list vars) body))
+(defn clet [v arg body] (cerl/c_let (list v) arg body))
+(defn cseq [a b] (cerl/c_seq a b))
+(defn ccase [arg clauses] (cerl/c_case arg (to-list clauses)))
+(defn cclause
+  ([pats body] (cerl/c_clause (to-list pats) body))
+  ([pats guard body] (cerl/c_clause (to-list pats) guard body)))
+(defn ctuple [es] (cerl/c_tuple (to-list es)))
+(defn cmap [pairs] (cerl/c_map (to-list pairs)))
+(defn cpair [k v] (cerl/c_map_pair k v))
+
+; The per-process counter/module keys are INLINE literal atoms, not value defs.
+; A `(def k …)` would intern a var that `set-current-module!`/`next-fresh!`
+; reach through `Env.fetch!` at runtime — and when core-defvar-anf runs from a
+; throwaway eval env (the backend switch's path, core_switch_test) that var is
+; not interned there, so the fetch raised `undefined var: self.core/…-key`.
+; A literal atom is baked into the body module and needs no var lookup.
+
+(defn reset-fresh!
+  "Reset THIS PROCESS's fresh-name counter to 0. Called once per COMPILATION
+   UNIT (each module build) so the fresh var names — hence the emitted beam's
+   bytes — are a function of that unit's source alone, never of what else built
+   earlier OR CONCURRENTLY in the VM.
+
+   The counter is per-process (process dictionary), exactly like
+   BeamLisp.Compiler.reset_fresh!/0 and priv/boot/compiler.bl's `reset-fresh!`.
+   A shared ref would be a reproducibility HAZARD: the AOT build compiles
+   namespaces in PARALLEL worker processes (build.bl `pmap-ordered` →
+   `spawn_link`), and two workers racing one global counter would interleave
+   fresh numbers and emit non-reproducible beams — the exact leak class
+   aot_reproducible_test pins (serial ≡ parallel ≡ post-perturbation). Per
+   process, each worker's sequence is a function of its own source alone."
+  []
+  (erlang/put :bl_core_fresh_seq 0)
+  nil)
+
+(defn- next-fresh!
+  "The next number from THIS PROCESS's fresh-name counter (1, 2, 3 …)."
+  []
+  (let [cur (erlang/get :bl_core_fresh_seq)
+        n (erlang/+ (if (erlang/=:= cur :undefined) 0 cur) 1)]
+    (erlang/put :bl_core_fresh_seq n)
+    n))
+
+(defn fresh [prefix]
+  (cvar (erlang/binary_to_atom (str prefix "_ce" (next-fresh!)))))
+
+;; ── quoted-node accessors ───────────────────────────────────────────────────
+
+(defn node? [t n] (and (tuple? t) (= n (tuple-size t))))
+(defn head [t] (elem t 0))
+(defn args [t] (elem t 2))
+(defn var-node? [t] (and (node? t 3) (erlang/is_atom (head t)) (erlang/is_atom (elem t 2))))
+(defn call-node? [t] (and (node? t 3) (tuple? (head t)) (= :. (head (head t)))))
+(defn form? [t k] (and (node? t 3) (= k (head t))))
+(defn kw [kvs k] (Keyword/get kvs k))
+
+(defn alias->atom
+  "{:__aliases__ _ [:BeamLisp :RT]} → 'Elixir.BeamLisp.RT'. A bare atom passes."
+  [m]
+  (cond
+    (= :__MODULE__ m) (current-module)
+    (erlang/is_atom m) m
+    (and (var-node? m) (= :__MODULE__ (head m))) (current-module)
+    (form? m :__aliases__)
+      (erlang/binary_to_atom
+        (str "Elixir." (Enum/join (to-list (map (fn [a] (erlang/atom_to_binary a)) (args m))) ".")))
+    :else (throw (ex-info "not a module" {:node m}))))
+
+;; ── the lowering ────────────────────────────────────────────────────────────
+
+(declare lower)
+(declare lower-fn)
+(declare lower-pattern)
+
+(defn cons-node? [x] (form? x (erlang/binary_to_atom "|")))
+
+(defn lower-list
+  "An Elixir list literal whose elements are AST → cons cells. `[h | t]` is
+   written as a one-element list holding a `{:|, _, [h t]}` node — the
+   brackets belong to the cons, so the element IS the list."
+  [xs]
+  (if (and (= 1 (count xs)) (cons-node? (first xs)))
+    (cerl/c_cons (lower (first (args (first xs)))) (lower (second (args (first xs)))))
+    (reduce (fn [acc x] (cerl/c_cons (lower x) acc)) (cerl/c_nil) (reverse xs))))
+
+(defn truthy-case
+  "Elixir truthiness: nil and false are false. Everything else is true."
+  [test then else]
+  (ccase (lower test)
+         (list (cclause (list (catom false)) (lower else))
+               (cclause (list (catom nil)) (lower else))
+               (cclause (list (fresh "_")) (lower then)))))
+
+(defn lower-block
+  "A :__block__: `x = e` binds via let (var) or a one-clause case (pattern);
+   any other statement sequences with `do`."
+  [stmts]
+  (cond
+    (empty? stmts) (catom nil)
+    (= 1 (count stmts)) (lower (first stmts))
+    :else
+      (let [s (first stmts) rest-body (lower-block (rest stmts))]
+        (if (form? s :=)
+          (let [lhs (first (args s)) rhs (second (args s))]
+            (if (var-node? lhs)
+              (clet (cvar (head lhs)) (lower rhs) rest-body)
+              (ccase (lower rhs) (list (cclause (list (lower-pattern lhs)) rest-body)))))
+          (cseq (lower s) rest-body)))))
+
+(defn lower-clauses
+  "[{:-> _ [[pats...] body]} …] (possibly guarded) → cerl clauses over the
+   SAME arity. A guarded head is {:when _ [p1 … pn guard]}."
+  [clauses]
+  (map (fn [cl]
+         (let [pats (first (args cl)) body (second (args cl))
+               p0 (first pats)]
+           (if (and (= 1 (count pats)) (form? p0 :when))
+             (let [ws (args p0) n (dec (count ws))]
+               (cclause (to-list (map lower-pattern (take n ws))) (lower (nth ws n)) (lower body)))
+             (cclause (map lower-pattern pats) (lower body)))))
+       clauses))
+
+(defn simple-lambda?
+  "A one-clause, unguarded fn whose params are all plain vars — the shape the
+   compiler emits for `let`, so its application lowers to a real Core let."
+  [f]
+  (and (form? f :fn)
+       (= 1 (count (args f)))
+       (let [ps (first (args (first (args f))))]
+         (every? var-node? ps))))
+
+(defn lower-fn
+  "A :fn → Core fun. Multi-clause or guarded: one fun over fresh params whose
+   body is a case on the tuple of them."
+  [f]
+  (let [clauses (args f)
+        cl0 (first clauses)
+        arity (count (first (args cl0)))]
+    (if (simple-lambda? f)
+      (cfun (map (fn [p] (cvar (head p))) (first (args cl0))) (lower (second (args cl0))))
+      (let [params (to-list (map (fn [_] (fresh "A")) (range arity)))
+            lowered (lower-clauses clauses)
+            ; each clause's pats become one tuple pattern
+            tupled (map (fn [cl]
+                          (cerl/c_clause (list (ctuple (cerl/clause_pats cl)))
+                                         (cerl/clause_guard cl)
+                                         (cerl/clause_body cl)))
+                        lowered)]
+        (cfun params (ccase (ctuple params) tupled))))))
+
+(defn lower-pattern [p]
+  (cond
+    (var-node? p) (if (= :_ (head p)) (fresh "_") (cvar (head p)))
+    ;; %Mod{k: pat} ⇒ ~{'__struct__' := 'Mod', k := pat}~
+    (form? p (erlang/binary_to_atom "%"))
+      (let [[m fields] (args p)]
+        (cerl/c_map_pattern
+          (cons (cerl/c_map_pair_exact (catom :__struct__) (catom (alias->atom m)))
+                (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower (elem kv 0)) (lower-pattern (elem kv 1))))
+                              (args fields))))))
+    (form? p (erlang/binary_to_atom "%{}"))
+      (cerl/c_map_pattern
+        (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower (elem kv 0)) (lower-pattern (elem kv 1)))) (args p))))
+    (form? p (erlang/binary_to_atom "{}"))  (ctuple (map lower-pattern (args p)))
+    (form? p :=)   (cerl/c_alias (lower-pattern (first (args p))) (lower-pattern (second (args p))))
+    (node? p 2)    (ctuple (list (lower-pattern (elem p 0)) (lower-pattern (elem p 1))))
+    (erlang/is_list p) (reduce (fn [acc x] (cerl/c_cons (lower-pattern x) acc)) (cerl/c_nil) (reverse p))
+    :else (lit p)))
+
+(defn lower-try
+  "{:try _ [[do: e, catch: [{:-> _ [[kind value] body]}…]]]} → Core try.
+   __STACKTRACE__ inside the handler is the trace var."
+  [kvs]
+  (let [body (lower (kw kvs :do))
+        v (fresh "V")
+        cls (fresh "Class") rsn (fresh "Reason") stk (fresh "Stack")
+        catch-clauses (to-list (or (kw kvs :catch) (list)))
+        ; rebind __STACKTRACE__ → Stack by wrapping the handler in a let
+        handler (ccase (cerl/c_values (list cls rsn))
+                       (to-list (concat (lower-clauses catch-clauses)
+                               (list (cclause (list (fresh "_") (fresh "_"))
+                                              (ccall :erlang :raise (list cls rsn stk)))))))
+        handler* (clet (cvar :__STACKTRACE__) stk handler)
+        after-q (kw kvs :after)
+        ; catch handlers wrap the body; `after` (finally) wraps THAT, so the
+        ; handler runs first and the after-body last, on both exits.
+        caught (if (empty? catch-clauses)
+                 body
+                 (cerl/c_try body (list v) v (list cls rsn stk) handler*))
+        c2 (fresh "Class") r2 (fresh "Reason") s2 (fresh "Stack") v2 (fresh "V")]
+    (if (nil? after-q)
+      caught
+      (cerl/c_try caught (list v2) (cseq (lower after-q) v2)
+                  (list c2 r2 s2)
+                  (cseq (lower after-q) (ccall :erlang :raise (list c2 r2 s2)))))))
+
+(defn- set-current-module! [m] (erlang/put :bl_core_current_module m) m)
+
+(defn- current-module []
+  (let [v (erlang/get :bl_core_current_module)] (if (= :undefined v) nil v)))
+
+(defn lower
+  "Elixir quoted (as emitted by compiler.bl) → cerl."
+  [t]
+  (cond
+    ;; ── leaves
+    (nil? t) (catom nil)
+    (var-node? t) (if (= :__MODULE__ (head t)) (catom (current-module)) (cvar (head t)))
+    (erlang/is_atom t) (catom t)
+    (erlang/is_number t) (lit t)
+    (erlang/is_binary t) (lit t)
+    (var-node? t) (cvar (head t))
+    (erlang/is_list t) (lower-list t)
+
+    ;; ── calls
+    (call-node? t)
+      (let [tgt (args (head t)) as (map lower (args t))]
+        (cond
+          ;; M.f(args)
+          (= 2 (count tgt)) (ccall (alias->atom (first tgt)) (second tgt) as)
+          ;; (fn [x] body).(v)  ⇒  let x = v in body   ← the compiler's `let`
+          (simple-lambda? (first tgt))
+            (let [cl (first (args (first tgt)))
+                  ps (first (args cl))]
+              (reduce (fn [body [p a]] (clet (cvar (head p)) a body))
+                      (lower (second (args cl)))
+                      (reverse (to-list (map (fn [p a] (list p a)) ps as)))))
+          ;; f.(args)
+          :else (capply (lower (first tgt)) as)))
+
+    ;; ── Kernel.apply(m, f, args) as emitted for Module/fun calls
+    (form? t :apply)
+      (let [[m f as] (args t)]
+        (if (and (erlang/is_atom m) (erlang/is_atom f) (erlang/is_list as))
+          (ccall m f (map lower as))
+          (ccall :erlang :apply (list (lower m) (lower f) (lower as)))))
+
+    (form? t :__aliases__) (catom (alias->atom t))
+    ;; [h | t] cons (syntax-quote splices emit these)
+    (form? t (erlang/binary_to_atom "|"))
+      (cerl/c_cons (lower (first (args t))) (lower (second (args t))))
+    ;; Kernel operators the compiler emits as bare nodes
+    (form? t :==) (ccall :erlang :== (to-list (map lower (args t))))
+    (form? t :===) (ccall :erlang :=:= (to-list (map lower (args t))))
+    (form? t :and) (truthy-case (first (args t)) (second (args t)) {:__lowered (catom false)})
+    (form? t :make_ref) (ccall :erlang :make_ref (list))
+    (form? t :__block__) (lower-block (args t))
+    (form? t :=) (lower-block (list t (first (args t))))
+    (form? t :fn) (lower-fn t)
+
+    (form? t :if)
+      (let [[test kvs] (args t)] (truthy-case test (kw kvs :do) (kw kvs :else)))
+
+    (form? t :cond)
+      (let [clauses (to-list (kw (first (args t)) :do))
+            lastc (last clauses)
+            ; a trailing literal `true` clause is the default; every other
+            ; clause (even a literal true) is a test, in source order
+            [init body-cls] (if (= true (first (first (args lastc))))
+                              [(lower (second (args lastc))) (butlast clauses)]
+                              [(ccall :erlang :error (list (catom :cond_clause))) clauses])]
+        (reduce (fn [else cl]
+                  (let [test (first (first (args cl))) body (second (args cl))]
+                    (truthy-case test body {:__lowered else})))
+                init
+                (reverse (to-list body-cls))))
+
+    (form? t :case)
+      (let [[subj kvs] (args t)]
+        (ccase (lower subj) (lower-clauses (kw kvs :do))))
+
+    (form? t :try) (lower-try (first (args t)))
+
+    ;; {:receive _ [[do: clauses, after: [{:-> _ [[timeout] body]}]]]}
+    (form? t :receive)
+      (let [kvs (first (args t))
+            cls (lower-clauses (or (kw kvs :do) (list)))
+            af (kw kvs :after)]
+        (if (nil? af)
+          (cerl/c_receive (to-list cls))
+          (let [ac (first af)]
+            (cerl/c_receive (to-list cls)
+                            (lower (first (first (args ac))))
+                            (lower (second (args ac)))))))
+
+    ;; ── data
+    (form? t (erlang/binary_to_atom "{}")) (ctuple (map lower (args t)))
+    (node? t 2) (ctuple (list (lower (elem t 0)) (lower (elem t 1))))
+    (form? t (erlang/binary_to_atom "%{}"))
+      (cmap (map (fn [kv] (cpair (lower (elem kv 0)) (lower (elem kv 1)))) (args t)))
+    ;; %Mod{k: v}  ⇒  Mod:'__struct__'([{k, v}])
+    (form? t (erlang/binary_to_atom "%"))
+      (let [[m fields] (args t)]
+        (ccall (alias->atom m) :__struct__
+               (list (lower-list (map (fn [kv] (tuple (elem kv 0) (elem kv 1))) (args fields))))))
+
+    ;; an already-lowered cerl smuggled through cond's fold
+    (and (map? t) (contains? t :__lowered)) (:__lowered t)
+
+    :else (throw (ex-info "ce1: unhandled quoted node" {:node t}))))
+
+;; ── bl-ANF → cerl (PLAN-079 S-C) ─────────────────────────────────────────────
+;;
+;; The lowering re-pointed at the backend-neutral IR. self.anf/normalise already
+;; desugared truthiness/cond/let into :if/:do/:let and resolved every name, so
+;; this table is a direct op→constructor map — SIMPLER than `lower` (which still
+;; reads Elixir-quoted). This is the shape a future MLIR emitter mirrors: one
+;; :op → one target constructor, :ann → attributes, body nodes → regions.
+
+(declare lower-anf)
+
+(defn lower-anf-pattern-key
+  "Lower the KEY of a map/struct pattern pair to a ground cerl term. A pattern
+   key is always a literal value, never a sub-pattern or an expression to
+   evaluate, but the two producers spell it differently: norm-pattern's :pstruct
+   keeps the field name as a RAW atom (:items), while its :pmap wraps the key
+   through normalise into a :lit node. Accept both: a bl-ANF node map lowers
+   through lower-anf (a :lit yields its literal), and a bare value is abstracted
+   directly. Calling lower-anf on the raw atom was the bug: an atom is not a
+   node, so it fell to the else branch and threw an unknown-op error, which
+   blocked every namespace with a vector pattern in a receive/case clause
+   (e.g. (receive [:done r] r), which reads as a %Vector struct pattern)."
+  [k]
+  (if (and (map? k) (contains? k :op))
+    (lower-anf k)
+    (lit k)))
+
+(defn lower-anf-pattern [p]
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar) (if (= "_" (:name p)) (fresh "_") (cvar (erlang/binary_to_atom (:name p))))
+      (= op :plit) (lit (:val p))
+      (= op :pnil) (cerl/c_nil)
+      (= op :ptuple) (ctuple (map lower-anf-pattern (:elems p)))
+      (= op :pcons) (cerl/c_cons (lower-anf-pattern (:head p)) (lower-anf-pattern (:tail p)))
+      (= op :palias) (cerl/c_alias (lower-anf-pattern (:a p)) (lower-anf-pattern (:b p)))
+      (= op :pmap)
+        (cerl/c_map_pattern
+          (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf-pattern-key (first kv)) (lower-anf-pattern (second kv))))
+                        (:pairs p))))
+      (= op :pstruct)
+        (cerl/c_map_pattern
+          (cons (cerl/c_map_pair_exact (catom :__struct__) (catom (:mod p)))
+                (to-list (map (fn [kv] (cerl/c_map_pair_exact (lower-anf-pattern-key (first kv)) (lower-anf-pattern (second kv))))
+                              (:fields p)))))
+      :else (throw (ex-info "lower-anf-pattern: unknown pop" {:pop op :pat p})))))
+
+(defn lower-anf-clauses
+  "bl-ANF clauses ({:pats :guard :body}) → cerl clauses over the SAME arity."
+  [clauses]
+  (map (fn [cl]
+         (let [pats (to-list (map lower-anf-pattern (:pats cl)))]
+           (if (nil? (:guard cl))
+             (cclause pats (lower-anf (:body cl)))
+             (cclause pats (lower-anf (:guard cl)) (lower-anf (:body cl))))))
+       clauses))
+
+(defn lower-anf-fn
+  "A bl-ANF :fn → Core fun. One clause of plain-var params lowers to a direct
+   fun; otherwise a fun over fresh params whose body cases on their tuple."
+  [n]
+  (let [clauses (:clauses n)
+        cl0 (first clauses)
+        arity (count (:pats cl0))
+        simple? (and (= 1 (count clauses)) (nil? (:guard cl0))
+                     (every? (fn [p] (= :pvar (:pop p))) (:pats cl0)))]
+    (if simple?
+      (cfun (to-list (map (fn [p] (cvar (erlang/binary_to_atom (:name p)))) (:pats cl0)))
+            (lower-anf (:body cl0)))
+      (let [params (to-list (map (fn [_] (fresh "A")) (range arity)))
+            lowered (lower-anf-clauses clauses)
+            tupled (map (fn [cl] (cerl/c_clause (list (ctuple (cerl/clause_pats cl)))
+                                                (cerl/clause_guard cl)
+                                                (cerl/clause_body cl)))
+                        lowered)]
+        (cfun params (ccase (ctuple params) tupled))))))
+
+(defn lower-anf-try
+  [n]
+  (let [body (lower-anf (:body n))
+        v (fresh "V") cls (fresh "Class") rsn (fresh "Reason") stk (fresh "Stack")
+        catch-clauses (:catch n)
+        handler (ccase (cerl/c_values (list cls rsn))
+                       (to-list (concat (lower-anf-clauses catch-clauses)
+                               (list (cclause (list (fresh "_") (fresh "_"))
+                                              (ccall :erlang :raise (list cls rsn stk)))))))
+        handler* (clet (cvar :__STACKTRACE__) stk handler)
+        after (:after n)
+        caught (if (empty? catch-clauses) body
+                 (cerl/c_try body (list v) v (list cls rsn stk) handler*))
+        c2 (fresh "Class") r2 (fresh "Reason") s2 (fresh "Stack") v2 (fresh "V")]
+    (if (nil? after)
+      caught
+      (cerl/c_try caught (list v2) (cseq (lower-anf after) v2)
+                  (list c2 r2 s2)
+                  (cseq (lower-anf after) (ccall :erlang :raise (list c2 r2 s2)))))))
+
+(defn anf-if->case
+  "Lower a truthy `if` to a Core `case`, given the ALREADY-lowered cerl test,
+   then, and else. Elixir truthiness: only `false` and `nil` are falsey.
+
+   `then` and `else` each appear ONCE. The naive encoding — a `false` clause and
+   a `nil` clause both yielding `else`, plus a catch-all `then` — lowered `else`
+   TWICE, and because a `cond` nests one `if` inside another's else, the else
+   subtree at depth k was re-lowered 2^k times: O(2^N) in the branch count. A
+   15-branch `cond` (datom.codec/encode-value) took 45s+ and blocked the whole
+   Core AOT build. A single guarded clause — `X when X =:= false or X =:= nil`
+   → else — collapses the two falsey patterns into one, so each branch is
+   lowered once and the cost is linear. `erlang:or/2` (the strict boolean BIF,
+   not `orelse`) is guard-legal in Core Erlang; `=:=` is exact equality."
+  [ctest cthen celse]
+  (let [x (fresh "If")
+        guard (ccall :erlang :or
+                     (list (ccall :erlang (erlang/binary_to_atom "=:=") (list x (catom false)))
+                           (ccall :erlang (erlang/binary_to_atom "=:=") (list x (catom nil)))))]
+    (ccase ctest
+           (list (cclause (list x) guard celse)
+                 (cclause (list (fresh "_")) cthen)))))
+
+(defn lower-anf
+  "bl-ANF node (self.anf vocabulary) → cerl."
+  [n]
+  (let [op (:op n)]
+    (cond
+      (= op :lit) (lit (:val n))
+      (= op :var) (cvar (erlang/binary_to_atom (:name n)))
+      (= op :global) (ccall :Elixir.BeamLisp.Env :fetch! (list (lit (:ns n)) (lit (:name n))))
+      (= op :remote) (ccall (:mod n) (:fun n) (to-list (map lower-anf (:args n))))
+      (= op :apply) (capply (lower-anf (:fn n)) (to-list (map lower-anf (:args n))))
+      (= op :let) (clet (cvar (erlang/binary_to_atom (:name n))) (lower-anf (:init n)) (lower-anf (:body n)))
+      (= op :if) (anf-if->case (lower-anf (:test n)) (lower-anf (:then n)) (lower-anf (:else n)))
+      (= op :do) (reduce (fn [acc s] (cseq acc (lower-anf s)))
+                         (lower-anf (first (:stmts n)))
+                         (rest (:stmts n)))
+      (= op :case) (ccase (lower-anf (:subj n)) (lower-anf-clauses (:clauses n)))
+      (= op :fn) (lower-anf-fn n)
+      (= op :try) (lower-anf-try n)
+      (= op :recv)
+        (let [cls (lower-anf-clauses (:clauses n))]
+          (if (nil? (:timeout n))
+            (cerl/c_receive (to-list cls))
+            (cerl/c_receive (to-list cls) (lower-anf (:timeout n)) (lower-anf (:after n)))))
+      (= op :tuple) (ctuple (map lower-anf (:elems n)))
+      (= op :map) (cmap (map (fn [kv] (cpair (lower-anf (first kv)) (lower-anf (second kv)))) (:pairs n)))
+      (= op :enil) (cerl/c_nil)
+      (= op :cons) (cerl/c_cons (lower-anf (:head n)) (lower-anf (:tail n)))
+      (= op :struct)
+        ;; %Mod{…} → the SAME struct value the Elixir backend builds, INCLUDING
+        ;; every default field. Elixir's `%Mod{f: v}` fills the fields the literal
+        ;; omits from `defstruct` (e.g. %BeamLisp.Vector{items: …} gets
+        ;; `meta: nil`); a plain map of only the written fields does NOT, so a
+        ;; Core-built struct was missing keys and `map_get(:meta, v)` — the shape
+        ;; the compiler's own `data->form` relies on — raised `key :meta not
+        ;; found`, breaking every file compiled while a Core-built compiler.bl
+        ;; was loaded. Build it the way the quoted `lower` above does: call the
+        ;; struct module's generated `__struct__/1` with the written fields as a
+        ;; `[{key, value}]` list — it applies them over the defaults, yielding a
+        ;; complete struct. Field keys are literal atoms; values are lowered.
+        (ccall (:mod n) :__struct__
+               (list (reduce (fn [acc kv]
+                               (cerl/c_cons (ctuple (list (lower-anf-pattern-key (first kv))
+                                                          (lower-anf (second kv))))
+                                            acc))
+                             (cerl/c_nil)
+                             (reverse (to-list (:fields n))))))
+      :else (throw (ex-info "lower-anf: unknown op" {:op op :node n})))))
+
+;; ── module wrapper + the two evaluators ─────────────────────────────────────
+
+(defn module-info-defs [mname]
+  (let [k (cvar :K)]
+    (list (tuple (cerl/c_fname :module_info 0)
+                 (cfun (list) (ccall :erlang :get_module_info (list (catom mname)))))
+          (tuple (cerl/c_fname :module_info 1)
+                 (cfun (list k) (ccall :erlang :get_module_info (list (catom mname) k)))))))
+
+(defn expr->module
+  "A Core module `mname` exporting run/0 whose body is `core-expr`."
+  [mname core-expr]
+  (let [run (cerl/c_fname :run 0)
+          defs (cons (tuple run (cfun (list) core-expr)) (module-info-defs mname))]
+    (cerl/c_module (catom mname) (to-list (map first defs)) (list) (to-list defs))))
+
+(defn eval-core
+  "Compile a Core module, load it, run run/0, purge."
+  [mname core-expr]
+  (let [m (expr->module mname core-expr)
+        res (compile/forms m (list :from_core :binary :return))]
+    (when (not= :ok (elem res 0)) (throw (ex-info "ce1: compile failed" {:res res})))
+    (code/load_binary mname (erlang/binary_to_list (str mname ".core")) (elem res 2))
+    ; the module is KEPT: a closure the form returns (a macro fn, a defn's
+    ; value) lives in it — the same reason Elixir's Eval.M* modules stay.
+    (erlang/apply mname :run (list))))
+
+
+; ── def-tuple readback + the body/namespace module topology ──────────────────
+(defn unescape [t]
+  (cond
+    (form? t (erlang/binary_to_atom "{}")) (erlang/list_to_tuple (to-list (map unescape (args t))))
+    (and (node? t 2) (not (erlang/is_atom (elem t 0)))) (tuple (unescape (elem t 0)) (unescape (elem t 1)))
+    (node? t 2) (tuple (elem t 0) (unescape (elem t 1)))
+    (erlang/is_list t) (to-list (map unescape t))
+    :else t))
+;; ── the body module ───────────────────────────────────
+;;
+;; `Link.defvar` receives [{kind arity fname def_ast} …]. Here the SAME tuples
+;; become one Core module: each {fname, arity} group is one fun whose body is a
+;; case over the tuple of params, one clause per def (with its guard). The
+;; shim/body topology of emit.ex is untouched — this builds the BODY module.
+
+(defn def-head
+  "{:def _ [head [do: body]]} → [fname params guard-or-nil body]."
+  [d]
+  (let [[h kv] (args d) body (kw kv :do)]
+    (if (form? h :when)
+      (let [ws (args h) n (dec (count ws)) fh (first ws)]
+        [(head fh) (args fh) (nth ws n) body])
+      [(head h) (args h) nil body])))
+
+(def default-op (erlang/binary_to_atom "\\\\"))
+
+(defn expand-defaults
+  "Elixir `def f(a, b \\ 1, c \\ 2)` = three defs: f/1 → f(a,1,2), f/2 → f(a,b,2),
+   f/3 body. One def in, one or more defs out; heads lose the `\\` markers."
+  [d]
+  (let [[fname ps g body] (def-head d)
+        ps (to-list ps)
+        defaulted? (fn [p] (form? p default-op))]
+    (if (not (some defaulted? ps))
+      (list d)
+      (let [plain (to-list (map (fn [p] (if (defaulted? p) (first (args p)) p)) ps))
+            full (tuple :def (list) (list (if (nil? g) (tuple fname (list) plain)
+                                            (tuple :when (list) (to-list (concat plain (list g)))))
+                                          (list (tuple :do body))))
+            n-req (count (take-while (fn [p] (not (defaulted? p))) ps))
+            n (count ps)
+            ; one forwarding def per arity in [n-req, n)
+            fwd (map (fn [k]
+                       (let [given (take k plain)
+                             call-args (to-list (concat given (map (fn [p] (second (args p))) (drop k ps))))]
+                         (tuple :def (list)
+                                (list (tuple fname (list) (to-list given))
+                                      (list (tuple :do (tuple (tuple :. (list) (list :__MODULE__ fname)) (list) call-args)))))))
+                     (range n-req n))]
+        (to-list (concat fwd (list full)))))))
+
+(defn defs->module
+  "[{:def …} …] (the def_asts of one namespace/body module) → cerl module.
+   `attrs` is [[name value] …] (e.g. [[:behaviour [:gen_server]]])."
+  ([mname def-asts] (defs->module mname def-asts (list)))
+  ([mname def-asts attrs]
+  (set-current-module! mname)
+  (let [def-asts (to-list (mapcat expand-defaults def-asts))
+        heads (to-list (map def-head def-asts))
+        ;; Stable group order — see defs->module-anf: a map keyed by an atom
+        ;; fname iterates in atom-table (creation) order, so sort by the fname
+        ;; STRING + arity to make the emitted beam a function of the source alone.
+        groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
+                        (to-list (group-by (fn [[f ps _ _]] [f (count ps)]) heads)))
+        funs (to-list
+               (map (fn [[[f n] cls]]
+                      (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
+                            clauses (to-list
+                                      (map (fn [[_ ps g body]]
+                                             (let [pats (to-list (map lower-pattern ps))]
+                                               (if (nil? g)
+                                                 (cclause (list (ctuple pats)) (lower body))
+                                                 (cclause (list (ctuple pats)) (lower g) (lower body)))))
+                                           cls))
+                            fail (cclause (list (fresh "_"))
+                                          (ccall :erlang :error (list (catom :function_clause))))]
+                        (tuple (cerl/c_fname f n)
+                               (cfun params (ccase (ctuple params) (concat clauses (list fail)))))))
+                    (to-list groups)))
+        defs (to-list (concat funs (module-info-defs mname)))
+        cattrs (to-list (map (fn [[k v]] (tuple (catom k) (lit v))) attrs))]
+    (cerl/c_module (catom mname) (to-list (map first defs)) cattrs defs))))
+
+(defn- def-head-anf
+  "A quoted {:def …} → [fname bl-ANF-params guard-or-nil bl-ANF-body], the
+   def-head pieces normalised into bl-ANF (params→patterns, guard/body→nodes)."
+  [d]
+  (let [[fname ps g body] (def-head d)]
+    [fname
+     (to-list (map anf/norm-pattern (to-list ps)))
+     (if (nil? g) nil (anf/normalise g))
+     (anf/normalise body)]))
+
+(defn defs->module-anf
+  "Like defs->module, but each def body/guard/params flow through bl-ANF
+   (normalise → lower-anf) instead of the quoted `lower`. This is the def path
+   re-pointed at the neutral IR (PLAN-079 S-D): the SAME body/shim topology,
+   fed by bl-ANF. `attrs` is [[name value] …]."
+  ([mname def-asts] (defs->module-anf mname def-asts (list)))
+  ([mname def-asts attrs]
+   (set-current-module! mname)
+   (reset-fresh!)   ; per-unit: emitted bytes are a function of THIS source alone
+   (let [def-asts (to-list (mapcat expand-defaults def-asts))
+         heads (to-list (map def-head-anf def-asts))
+         ;; Group clauses by [fname arity], then iterate in a STABLE order.
+         ;; `group-by` returns a map keyed by [fname arity], and a map with ATOM
+         ;; keys iterates in atom-TABLE order (creation order), not term order —
+         ;; so which function's clauses come first depended on which atoms the VM
+         ;; had interned by the time this ran, i.e. on everything compiled
+         ;; earlier in the build. That made both the function order AND the
+         ;; per-function `fresh "P"` params vary run-to-run: the emitted beam was
+         ;; NOT reproducible. Sorting the groups by the fname STRING + arity ties
+         ;; the order to the source alone, which is what reproducibility means.
+         groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
+                         (to-list (group-by (fn [[f ps _ _]] [f (count ps)]) heads)))
+         funs (to-list
+                (map (fn [[[f n] cls]]
+                       (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
+                             clauses (to-list
+                                       (map (fn [[_ ps g body]]
+                                              (let [pats (to-list (map lower-anf-pattern ps))]
+                                                (if (nil? g)
+                                                  (cclause (list (ctuple pats)) (lower-anf body))
+                                                  (cclause (list (ctuple pats)) (lower-anf g) (lower-anf body)))))
+                                            cls))
+                             fail (cclause (list (fresh "_"))
+                                           (ccall :erlang :error (list (catom :function_clause))))]
+                         (tuple (cerl/c_fname f n)
+                                (cfun params (ccase (ctuple params) (concat clauses (list fail)))))))
+                     (to-list groups)))
+         defs (to-list (concat funs (module-info-defs mname)))
+         cattrs (to-list (map (fn [[k v]] (tuple (catom k) (lit v))) attrs))]
+     (cerl/c_module (catom mname) (to-list (map first defs)) cattrs defs))))
+
+;; ── defserver: the emitted Module.create call → a Core module ───────────────
+;;
+;; compile-defserver emits `Module.create(Mod, <escaped block>, loc)` wrapped
+;; in compiler-option juggling. The block holds `@behaviour :gen_server` plus
+;; one `def` per callback. Read it back; build the same module in Core.
+
+(defn find-node [pred t]
+  (cond (pred t) t
+        (tuple? t) (some (fn [x] (find-node pred x)) (erlang/tuple_to_list t))
+        (erlang/is_list t) (some (fn [x] (find-node pred x)) t)
+        :else nil))
+
+(defn server->module
+  "The quoted defserver form → [module-name cerl-module]."
+  [q]
+  (let [mc (find-node (fn [t] (and (call-node? t)
+                                   (= 2 (count (args (head t))))
+                                   (= :create (second (args (head t))))))
+                      q)
+        [mname block-esc _loc] (args mc)
+        block (unescape block-esc)
+        stmts (args block)
+        attrs (to-list (keep (fn [st] (when (form? st (erlang/binary_to_atom "@"))
+                                        (let [a (first (args st))] [(head a) (first (args a))])))
+                             stmts))
+        def-asts (to-list (filter (fn [st] (form? st :def)) stmts))]
+    [mname (defs->module mname def-asts attrs)]))
+
+
+; ── the effectful edge: compile a cerl module and load it ────────────────────
+(defn load-module! [m]
+  (let [res (compile/forms m (list :from_core :binary :return))]
+    (when (not= :ok (elem res 0)) (throw (ex-info "ce1: compile failed" {:res res})))
+    (code/load_binary (elem res 1) (erlang/binary_to_list (str (elem res 1) ".core")) (elem res 2))
+    (elem res 1)))
+
+;; else (Env bookkeeping, fn_value, link-info) is reused as is.
+
+(defn shim-def
+  "A body-module def → the namespace shim: same head (+ guard), body forwards."
+  [body-mod d]
+  (let [[fname ps g body] (def-head d)
+        ps (to-list ps)
+        fwd (tuple (tuple :. (list) (list body-mod fname)) (list) ps)
+        h (if (nil? g) (tuple fname (list) ps) (tuple :when (list) (to-list (concat ps (list g)))))]
+    (tuple :def (list) (list h (list (tuple :do fwd))))))
+
+(defn core-defvar
+  "Define `name` in `ns` from compiler def-tuples [{kind arity fname def_ast}…],
+   building both modules in Core. Returns the fn value, like Link.defvar."
+  [ns name new-defs]
+  (let [mod (BeamLisp.Emit/module_for ns)
+        body-mod (BeamLisp.Emit/fresh_body_module)
+        body-defs (BeamLisp.Emit/attach_body_module new-defs body-mod)
+        all-defs (Map/put (BeamLisp.Env/ns_defs ns) name body-defs)
+        ; body module: this var's real code
+        _ (load-module! (defs->module body-mod (to-list (map (fn [t] (elem t 3)) body-defs))))
+        ; namespace module: shims for EVERY var in the ns (rebuilt each def)
+        shims (to-list (mapcat (fn [[_ defs]] (map (fn [t] (shim-def (elem t 4) (elem t 3))) defs))
+                               (to-list all-defs)))
+        _ (load-module! (defs->module mod shims))
+        _ (BeamLisp.Env/put_ns_defs ns all-defs)
+        fv (BeamLisp.Emit/fixed_variadic new-defs)
+        fixed (elem fv 0) variadic (elem fv 1)
+        value (BeamLisp.Emit/fn_value mod fixed variadic)]
+    (BeamLisp.Env/put_key (tuple :link ns name) (tuple mod (Map/new fixed) variadic))
+    (BeamLisp.Env/intern ns name value)))
+
+(defn eval-def
+  "Evaluate a quoted `defn` through the Core defvar instead of Link.defvar."
+  [q]
+  (let [[ns name tuples] (args q)]
+    (core-defvar ns name (to-list (map unescape tuples)))))
+
+
+;; ── S-C: the bl-ANF eval seam ────────────────────────────────────────────────
+;;
+;; The expression evaluator re-pointed at the neutral IR: quoted → normalise →
+;; bl-ANF → lower-anf → cerl. This is the path S-D makes the ONLY path (compiler
+;; emits bl-ANF directly, `normalise` retires). eval-core-anf mirrors eval-core.
+
+(defn eval-core-anf
+  "Evaluate one compiler-emitted quoted form through bl-ANF → Core Erlang."
+  [mname q]
+  (reset-fresh!)
+  (eval-core mname (lower-anf (anf/normalise q))))
+
+;; ── S-D: the def seam re-pointed at bl-ANF ───────────────────────────────────
+;;
+;; core-defvar-anf mirrors core-defvar but lowers BOTH the body module and the
+;; namespace shims through bl-ANF (defs->module-anf). The shim forms shim-def
+;; produces are ordinary quoted {:def …} forwards, so normalise handles them the
+;; same as any def. This is the def-building path S-D makes the default; the
+;; quoted-reading defs->module is retained only until compiler.bl emits bl-ANF
+;; directly and the quoted `lower` retires.
+
+(defn core-defvar-anf
+  "Like core-defvar, but body + shims flow through bl-ANF → Core."
+  [ns name new-defs]
+  (let [mod (BeamLisp.Emit/module_for ns)
+        body-mod (BeamLisp.Emit/fresh_body_module)
+        body-defs (BeamLisp.Emit/attach_body_module new-defs body-mod)
+        all-defs (Map/put (BeamLisp.Env/ns_defs ns) name body-defs)
+        _ (load-module! (defs->module-anf body-mod (to-list (map (fn [t] (elem t 3)) body-defs))))
+        shims (to-list (mapcat (fn [[_ defs]] (map (fn [t] (shim-def (elem t 4) (elem t 3))) defs))
+                               (to-list all-defs)))
+        _ (load-module! (defs->module-anf mod shims))
+        _ (BeamLisp.Env/put_ns_defs ns all-defs)
+        fv (BeamLisp.Emit/fixed_variadic new-defs)
+        fixed (elem fv 0) variadic (elem fv 1)
+        value (BeamLisp.Emit/fn_value mod fixed variadic)]
+    (BeamLisp.Env/put_key (tuple :link ns name) (tuple mod (Map/new fixed) variadic))
+    (BeamLisp.Env/intern ns name value)))
+
+(defn eval-def-anf
+  "Evaluate a quoted defn through the bl-ANF def path."
+  [q]
+  (let [[ns name tuples] (args q)]
+    (core-defvar-anf ns name (to-list (map unescape tuples)))))
+
+;; ── S-D.aot: Core → .beam on disk ────────────────────────────────────────────
+;;
+;; The AOT edge: compile a module built by the Core backend to a .beam BINARY
+;; and persist it, so a namespace's code can be loaded in a fresh VM with no
+;; Elixir compiler present. This is the Core counterpart of emit.ex's AOT path
+;; (Code.compile_quoted → write_beam). reset-fresh! per module keeps the bytes
+;; reproducible (a rebuild of the same source yields the same beam).
+
+(defn module->beam
+  "Compile a cerl module to a {module-name, beam-binary} pair."
+  [m]
+  (let [res (compile/forms m (list :from_core :binary :return))]
+    (when (not= :ok (elem res 0))
+      (throw (ex-info "self.core: from_core compile failed" {:res res})))
+    (tuple (elem res 1) (elem res 2))))
+
+(defn write-beam!
+  "Write a compiled beam binary to <dir>/<module>.beam. Returns the path."
+  [dir module beam]
+  (let [path (str dir "/" (erlang/atom_to_binary module) ".beam")]
+    (File/mkdir_p! dir)
+    (File/write! path beam)
+    path))
+
+(defn ns-body-beam
+  "Compile a namespace's def-asts to its BODY module beam via Core, returning
+   {module beam}. `mname` is the body-module atom (deterministic per ns)."
+  [mname def-asts]
+  (module->beam (defs->module-anf mname def-asts)))
+
+(defn aot-body-beams
+  "The AOT integration seam (PLAN-081 step 1): compile EVERY body module of a
+   namespace to a .beam via Core, returning a list of {module beam} pairs.
+
+   `ns-defs` is the stabilised var→def-tuples map the Elixir AOT path holds
+   (Env.ns_defs after emit.ex's stabilise_body_modules). We reuse
+   BeamLisp.Emit/body_modules to group it into [{body-mod [def-ast …]} …] — the
+   SAME grouping emit.ex uses for its Elixir body modules — so the Core path and
+   the Elixir path split a namespace into byte-identical module topology,
+   differing only in the backend that lowers each body. The shim, init, and
+   provenance modules stay Elixir (role-B/C plumbing: Env.intern, __bl_init__,
+   __bl_provenance__); only the real code — the sole semantic Elixir dependency
+   — flows through Core here."
+  [ns-defs]
+  (to-list
+    (map (fn [[body-mod def-asts]]
+           (ns-body-beam body-mod (to-list def-asts)))
+         (to-list (BeamLisp.Emit/body_modules ns-defs)))))

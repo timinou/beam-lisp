@@ -112,7 +112,9 @@ defmodule BeamLisp.LoaderPathTest do
     # whenever an earlier test had already loaded the real one. A test that
     # breaks its neighbours is not evidence, it is a second bug.
     ns = uniq_ns("lptest_privoverride")
-    priv_dir = Application.app_dir(:beam_lisp, "priv")
+    # A shipped library lives in a TIER (`priv/lib`), which is what the
+    # loader searches; a flat `priv/` file is not on any path.
+    priv_dir = Application.app_dir(:beam_lisp, "priv/lib")
     priv_file = Path.join(priv_dir, "#{ns}.bl")
     far_dir = Path.join(System.tmp_dir!(), "blpath_override_#{System.unique_integer([:positive])}")
 
@@ -135,7 +137,7 @@ defmodule BeamLisp.LoaderPathTest do
     # override test is consistent with a loader that simply stopped consulting
     # priv at all.
     ns = uniq_ns("lptest_privonly")
-    priv_dir = Application.app_dir(:beam_lisp, "priv")
+    priv_dir = Application.app_dir(:beam_lisp, "priv/lib")
     priv_file = Path.join(priv_dir, "#{ns}.bl")
     far_dir = Path.join(System.tmp_dir!(), "blpath_privonly_#{System.unique_integer([:positive])}")
     File.mkdir_p!(far_dir)

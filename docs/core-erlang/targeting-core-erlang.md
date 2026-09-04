@@ -1,8 +1,15 @@
 # Targeting Core Erlang
 
-*How beam-lisp would emit Core Erlang instead of Elixir quoted AST, what that
-buys, and the `.bl` modules it would grow. Companion to
+*How beam-lisp emits Core Erlang instead of Elixir quoted AST, what that buys,
+and the `.bl` modules that carry it. Companion to
 `how-beam-lisp-uses-elixir.md`.*
+
+> **Status: this is how it works now.** Core Erlang is the default backend
+> (`:aot_backend :core`). `compiler.bl` emits bl-ANF and `priv/self/core.bl`
+> lowers it to Core Erlang; the Elixir-quoted path survives only as the opt-in
+> `:aot_backend :elixir`. The design below reads in the future tense in places
+> because it was written before the cutover — the mechanics it describes are the
+> ones in the tree today.
 
 ## 1. What ANF is
 

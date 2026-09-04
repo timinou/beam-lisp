@@ -84,7 +84,7 @@ defmodule BeamLisp.AOT do
     boot()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      path |> File.read!() |> compile_source(Keyword.put_new(opts, :file, path))
+      path |> BeamLisp.Loader.read_source() |> compile_source(Keyword.put_new(opts, :file, path))
     end)
   end
 
@@ -104,15 +104,37 @@ defmodule BeamLisp.AOT do
     # capturing any defs.
     Env.in_ns("user")
 
+    # A compilation unit starts its fresh-name counter at zero, so the beams
+    # it emits are a function of its source alone (reproducible across runs
+    # and across serial/parallel builds). Both compilers share the counter.
+    Compiler.reset_fresh!()
+
     # The source path rides along so an AOT-compiled module's line table
     # names the .bl file. These .beam files persist and are what a
     # production stack trace hits, so this is the attribution that
     # matters most — an eval module is transient, this is not.
     file = Keyword.get(opts, :file)
 
+    forms = Reader.read_string(source, file)
+
+    # PRE-LINK every top-level defn in the unit before compiling any form.
+    # A call to a defn defined LATER in the same file would otherwise compile
+    # to a slow `RT.invoke(fetch …)` in a fresh VM but a direct call in a VM
+    # that had compiled the file before (the link survives): same source, two
+    # beams, and the first build the slower. The ns of a form is the ns the
+    # preceding `(ns …)` declared, tracked here exactly as the compile pass
+    # will track it. Both compilers implement `prelink_defn`; genesis is
+    # called because the seam (`Compiler.compile/2`) is per-form and this is
+    # per-unit — the two are byte-parity anyway (the oracle pins it).
+    Enum.reduce(forms, "user", fn form, ns ->
+      case ns_decl(form) do
+        nil -> Compiler.prelink_defn(form, ns); ns
+        declared -> declared
+      end
+    end)
+
     {value_defs, touched, ns_meta} =
-      source
-      |> Reader.read_string(file)
+      forms
       |> Enum.reduce({%{}, MapSet.new(), %{}}, fn form, {vdefs, nss, nsmeta} ->
         ns = Env.current_ns()
         vdefs = capture_value_def(vdefs, form, ns)
@@ -137,6 +159,14 @@ defmodule BeamLisp.AOT do
     end)
   end
 
+  # The namespaces the drift gate itself runs on (`ns_closure_hash/1` →
+  # `BuildPlan.key_for/3` → `build-plan` and its requires). Vetting one of
+  # THESE by closure hash would ask the gate to load what it is vetting, and
+  # the loader's cycle guard turns that into `undefined var: build-plan/…`.
+  # They are boot-tier by construction; naming them here keeps that true
+  # even where `Tiers.boot_namespaces/0` cannot see the source tree.
+  @gate_namespaces ~w(build-plan source-graph ns-interface reader-node)
+
   @doc """
   Ensure namespace `ns` is usable in this VM: load its AOT module if a
   `.beam` exists on the code path, and run its `__bl_init__/0` (no-op
@@ -154,7 +184,14 @@ defmodule BeamLisp.AOT do
   def ensure_loaded(ns) when is_binary(ns) do
     mod = Link.module_for(ns)
 
-    if code_path_module?(mod) and Code.ensure_loaded?(mod) and
+    # `Code.ensure_loaded?/1` is authoritative: it loads the module from the
+    # code path (or confirms it in memory) and answers true/false. The older
+    # `code_path_module?/1` (`:code.which/1`) pre-check is dropped: after a fresh
+    # `Bootstrap.install!/1` copies a seed beam into ebin, `:code.which/1` can
+    # still answer `:non_existing` from a cache populated before the copy, which
+    # false-negatived the whole AOT branch and dropped a valid seed beam to the
+    # (now genesis-less) SOURCE path. `Code.ensure_loaded?/1` reflects reality.
+    if Code.ensure_loaded?(mod) and
          function_exported?(mod, :__bl_init__, 0) do
       # Fast path BEFORE the lock: require cycles (A's __bl_init__ requires
       # A) are cut by the mark-first protocol below, and that cut must not
@@ -242,6 +279,24 @@ defmodule BeamLisp.AOT do
     end
 
     BeamLisp.init()
+    maybe_load_core_backend()
+    :ok
+  end
+
+  # Under `:aot_backend == :core`, make `self.core` (and its `self.anf` require)
+  # usable in this VM so `emit_module` can route body modules through it. The
+  # `self/` tier is deliberately OFF the library load path (`BeamLisp.Tiers`
+  # excludes it from `library_names/dirs`, so ordinary code cannot `:require`
+  # the compiler's own backend), so its home — `priv/` as the root, where
+  # `self.core` resolves to `self/core.bl` — is added as an explicit search path
+  # only when the Core backend is selected. A no-op under the default `:elixir`
+  # backend: the `self/` quarantine stays intact and nothing loads.
+  defp maybe_load_core_backend do
+    if BeamLisp.AOTCache.aot_backend() == :core do
+      BeamLisp.Env.add_search_path(BeamLisp.Tiers.priv_root())
+      BeamLisp.Loader.ensure_loaded("self.core")
+    end
+
     :ok
   end
 
@@ -355,6 +410,17 @@ defmodule BeamLisp.AOT do
   # declaration so `__bl_init__/0` can re-run them in a fresh VM (a
   # referred var like `greet` resolves through these at runtime). Latest
   # declaration of an alias/refer wins.
+  # The namespace a top-level `(ns NAME …)` form declares, else nil.
+  defp ns_decl({:meta, inner, _}), do: ns_decl(inner)
+  defp ns_decl({:list, [{:symbol, "ns"}, name_form | _]}) do
+    case name_form do
+      {:meta, {:symbol, n}, _} -> n
+      {:symbol, n} -> n
+      _ -> nil
+    end
+  end
+  defp ns_decl(_), do: nil
+
   defp capture_ns_decl(ns_meta, {:meta, form, _m}), do: capture_ns_decl(ns_meta, form)
 
   defp capture_ns_decl(ns_meta, {:list, [{:symbol, "ns"}, {:symbol, ns} | clauses]}) do
@@ -573,13 +639,53 @@ defmodule BeamLisp.AOT do
     # — one block of `defmodule`s, one invocation — restores near-single-module
     # cost. The block is order-insensitive: body modules are referenced by the
     # shims only at call time, not at compile time.
-    all_quoted =
-      [ns_module_quoted | body_module_quoteds] ++ List.wrap(companion_quoted)
+    #
+    # BACKEND SPLIT (PLAN-081 step 1). The BODY modules hold the real code —
+    # the sole SEMANTIC dependency on the Elixir backend — so under
+    # `:aot_backend == :core` they are lowered through `self.core` (bl-ANF →
+    # Core Erlang → .beam) instead of the Elixir compiler, while the shim,
+    # init, and provenance modules stay Elixir (role-B/C runtime plumbing:
+    # `Env.intern`, `__bl_init__`, `__bl_provenance__` — target-agnostic
+    # module-level glue, not "the compiler"). The two paths split a namespace
+    # into the identical module topology (`Emit.body_modules` groups the same
+    # way on both sides), so a Core body module and an Elixir shim interoperate
+    # exactly as an all-Elixir build does. Default `:elixir` = the original
+    # single-invocation path, unchanged.
+    case core_aot_backend?() do
+      true ->
+        # Body modules via Core; the rest (shim + init + companion) via Elixir.
+        core_body_beams =
+          BeamLisp.Ns.Self.Core
+          |> apply(:"aot-body-beams", [ns_defs])
+          |> Enum.map(fn tuple -> {elem(tuple, 0), elem(tuple, 1)} end)
 
-    block = {:__block__, [], all_quoted}
+        rest_block = {:__block__, [], [ns_module_quoted | List.wrap(companion_quoted)]}
 
-    compile_block!(block, filename)
-    |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
+        (compile_block!(rest_block, filename) ++ core_body_beams)
+        |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
+
+      false ->
+        all_quoted =
+          [ns_module_quoted | body_module_quoteds] ++ List.wrap(companion_quoted)
+
+        block = {:__block__, [], all_quoted}
+
+        compile_block!(block, filename)
+        |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
+    end
+  end
+
+  # Whether the AOT body-module backend is Core Erlang (`self.core`) rather
+  # than the Elixir compiler. Node-global (`Application.get_env`) DELIBERATELY:
+  # the build compiles namespaces in spawned worker processes (build.bl
+  # `pmap-ordered`), so a process-dictionary flag would not reach them — only
+  # an application env is visible VM-wide. Guarded on `self.core` actually
+  # being loaded and exporting the seam, so a misconfiguration degrades to the
+  # Elixir path rather than crashing the build. Default `:core` (PLAN-081 flip).
+  defp core_aot_backend? do
+    BeamLisp.AOTCache.aot_backend() == :core and
+      Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
+      function_exported?(BeamLisp.Ns.Self.Core, :"aot-body-beams", 1)
   end
 
   # Compile-to-disk for one module; returns `{mod, path}`.
@@ -623,61 +729,23 @@ defmodule BeamLisp.AOT do
   """
   @spec ns_closure_hash(binary, binary | nil) :: binary | nil
   def ns_closure_hash(ns, file) when is_binary(ns) do
-    # Fresh per-call resolution cache: a namespace's source is read at most once
-    # WITHIN this computation, but never carried ACROSS calls (that would serve a
-    # stale hash after an edit — the exact false-fresh the drift gate exists to
-    # prevent). Cleared on entry, dropped on exit.
-    Process.put(:bl_source_info_cache, seed_cache(ns, file))
+    # Fresh per-call resolution cache: a namespace's source is read at most
+    # once WITHIN this computation, never carried ACROSS calls (that would
+    # serve a stale key after an edit — the exact false-fresh the drift gate
+    # exists to prevent). Cleared on entry, dropped on exit.
+    Process.put(:bl_source_info_cache, %{})
 
     try do
-      case source_info_cached(ns) do
-        nil ->
-          nil
-
-        _ ->
-          reqs = fn n ->
-            case source_info_cached(n) do
-              {_hash, requires} -> requires
-              nil -> []
-            end
-          end
-
-          srchash = fn n ->
-            case source_info_cached(n) do
-              {hash, _requires} -> hash
-              nil -> nil
-            end
-          end
-
-          BeamLisp.SourceGraph.closure_hash(ns, srchash, reqs)
-      end
+      resolve = fn n -> source_content_cached(n) end
+      seed = if file && File.exists?(file), do: {ns, BeamLisp.Loader.read_source(file)}
+      BeamLisp.BuildPlan.key_for(ns, resolve, seed)
     after
       Process.delete(:bl_source_info_cache)
     end
   end
 
-  # Prime the resolution cache with `ns`'s own `{hash, requires}` read straight
-  # from `file`, so the primary ns never depends on ambient name resolution.
-  # `nil`/unreadable file → empty cache (fall back to name resolution).
-  defp seed_cache(ns, file) when is_binary(file) do
-    case File.read(file) do
-      {:ok, content} ->
-        hash = :crypto.hash(:sha256, content) |> Base.encode16()
-        {_ns, requires} = BeamLisp.SourceGraph.header(content)
-        %{ns => {hash, requires}}
-
-      _ ->
-        %{}
-    end
-  end
-
-  defp seed_cache(_ns, _file), do: %{}
-  # Resolve a namespace's `{source_hash, requires}` at most once per
-  # `ns_closure_hash/1` call. The closure walk and the subsequent per-member
-  # `srchash`/`reqs` queries both hit this, so without the cache a namespace's
-  # source would be read several times; the cache is process-local and cleared
-  # at each top-level entry, so it can never serve a hash from a prior call.
-  defp source_info_cached(ns) do
+  # Resolve a namespace's source CONTENT at most once per key computation.
+  defp source_content_cached(ns) do
     cache = Process.get(:bl_source_info_cache, %{})
 
     case Map.fetch(cache, ns) do
@@ -685,11 +753,12 @@ defmodule BeamLisp.AOT do
         v
 
       :error ->
-        v = BeamLisp.Loader.source_info(ns)
+        v = BeamLisp.Loader.source_content(ns)
         Process.put(:bl_source_info_cache, Map.put(cache, ns, v))
         v
     end
   end
+
   # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
   # `%{aliases:, refers:, requires:}`.
   defp build_init_ast(ns, mod, ns_defs, value_defs, ns_meta) do
@@ -973,42 +1042,35 @@ defmodule BeamLisp.AOT do
   # spun the compiler up per module and made a full build take minutes; one
   # call for the whole block restores near-single-module cost.
   defp compile_block!(block, filename) do
-    prev = Code.compiler_options()
-    # infer_signatures: false — see BeamLisp.Emit.build_module/3; the
-    # signature-construction pass costs orders of magnitude more than the
-    # rest of compilation on tuple-dense generated code.
-    Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
+    # Compiler options (ignore_module_conflict, infer_signatures: false) are
+    # set ONCE, VM-wide, by `BeamLisp.CompilerOptions.ensure!/0` — never
+    # saved and restored around a call. See that module for why.
+    BeamLisp.CompilerOptions.ensure!()
 
-    try do
-      # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
-      #
-      # `Code.compile_quoted/2` unconditionally wraps compilation in
-      # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
-      # checker — and there is NO compiler option to turn it off (the
-      # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
-      # which this AOT path does not use). That checker verifies every emitted
-      # module against the WHOLE set of modules loaded in the compile VM, so its
-      # cost grows with the image: once a dense library (minikanren) is loaded,
-      # verifying a later tuple-dense generated namespace (datom.query.magic)
-      # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
-      # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
-      #
-      # The check earns NOTHING here: the source was already validated by the
-      # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
-      # correct by construction (shims forward to body modules). The primitive
-      # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
-      # calls under its verify wrapper — produces byte-identical beams without
-      # the checker pass.
-      case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
-        [] -> raise "AOT: compiling a namespace produced no module"
-        mods -> mods
-      end
-    after
-      Code.compiler_options(prev)
+    # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
+    #
+    # `Code.compile_quoted/2` unconditionally wraps compilation in
+    # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
+    # checker — and there is NO compiler option to turn it off (the
+    # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
+    # which this AOT path does not use). That checker verifies every emitted
+    # module against the WHOLE set of modules loaded in the compile VM, so its
+    # cost grows with the image: once a dense library (minikanren) is loaded,
+    # verifying a later tuple-dense generated namespace (datom.query.magic)
+    # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
+    # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
+    #
+    # The check earns NOTHING here: the source was already validated by the
+    # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
+    # correct by construction (shims forward to body modules). The primitive
+    # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
+    # calls under its verify wrapper — produces byte-identical beams without
+    # the checker pass.
+    case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
+      [] -> raise "AOT: compiling a namespace produced no module"
+      mods -> mods
     end
   end
-
-  defp code_path_module?(mod), do: :code.which(mod) != :non_existing
 
   # DRIFT GATE (Wave 1 / L2). A compiled beam is trusted only when it still
   # matches the source it was built from. Reads the beam's `__bl_provenance__/0`
@@ -1032,6 +1094,34 @@ defmodule BeamLisp.AOT do
   # tar, and hardlinks; the content hash survives all of them and equals the Mix
   # manifest's own hash for the same bytes.
   defp stale?(ns, mod) do
+    cond do
+      # BOOTSTRAP STAGING: a mismatched committed seed was installed as a
+      # previous-generation bootstrap stage (BeamLisp.Bootstrap.install!/1 sets
+      # `:bootstrap_staging` to the namespaces it provides). Those staged beams
+      # are a VALID compiler even though their key differs from the current
+      # toolchain — interning replays def VALUES, it does not recompile — so
+      # trust them for interning. Without this the gate would route `compiler`/
+      # `reader-node` to the SOURCE path, which, with genesis deleted, has no
+      # compiler to build them. Once the build re-emits these under the current
+      # key the staged copies are superseded and a matching install clears the
+      # flag; so the trust is scoped to exactly the staged namespaces and only
+      # while staging is in effect.
+      ns in staging_namespaces() ->
+        false
+
+      true ->
+        stale_by_provenance?(ns, mod)
+    end
+  end
+
+  defp staging_namespaces do
+    case Application.get_env(:beam_lisp, :bootstrap_staging, nil) do
+      list when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  defp stale_by_provenance?(ns, mod) do
     case beam_provenance(mod) do
       nil ->
         false
@@ -1044,8 +1134,12 @@ defmodule BeamLisp.AOT do
           # disk. No closure hash to compute — and none MAY be computed here:
           # the closure hash is answered by `source-graph`, itself a boot
           # namespace, so asking would recurse into the load this gate vets.
-          ns in BeamLisp.Tiers.boot_namespaces() ->
-            beam_key != BeamLisp.AOTCache.compiler_key()
+          ns in BeamLisp.Tiers.boot_namespaces() or ns in @gate_namespaces ->
+            # No toolchain sources on disk (an escript or release away from
+            # its checkout) ⇒ nothing to compare against: trust the beam, as
+            # the closure branch does when no source resolves.
+            BeamLisp.Tiers.boot_namespaces() != [] and
+              beam_key != BeamLisp.AOTCache.compiler_key()
 
           true ->
             # The live tier-2 closure hash: this ns plus its transitive

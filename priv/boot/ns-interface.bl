@@ -1,0 +1,286 @@
+; boot/ns-interface.bl — what a dependent can SEE of a namespace, as one hash.
+;
+; ── The problem ─────────────────────────────────────────────────────────────
+;
+; The per-namespace freshness key (source-graph/closure-hash) folds the FULL
+; CONTENT of every namespace in the require-closure. Edit one `defn` body in
+; `datom.store` and 35 beams rebuild — every dependent, transitively — though
+; not one of their bytes changes. Their bytes cannot change: a dependent's
+; compiled code reaches a required namespace's functions through a direct
+; call `Module.fname(args)` (resolved by name and arity) or a var fetch by
+; name. What is INSIDE a function body is invisible to the caller's beam.
+;
+; So the right key for "must a dependent rebuild?" is not "did the required
+; source change?" but "did the part of it the dependent can OBSERVE change?".
+; That observable part is the namespace's INTERFACE.
+;
+; ── What a dependent's bytes observe (the interface, exactly) ───────────────
+;
+; Read straight off compiler.bl's cross-namespace reads (every `BeamLisp.Env/…`
+; call it makes about a name in ANOTHER namespace):
+;
+;   1. the SET OF NAMES        `Env/peek`, `refer_source`: does `foo/bar`
+;                              resolve? Is it referred? (a missing name is a
+;                              compile error → the dependent's output changes)
+;   2. per name, its KIND      fn | macro | value | module (record/deftype):
+;                              `macro-lookup` decides EXPANSION vs CALL;
+;                              `Record/record_module?` decides a type-tag
+;   3. a fn's LINK SHAPE       `Env/link` → {module, {arity → fname}, {min
+;                              fname}}: the caller bakes a direct call iff its
+;                              arity is in the map; else `RT.invoke(fetch …)`.
+;                              Changing an arity changes the caller's bytes.
+;   4. a macro's DEFINITION    the expansion is inlined into the caller, and
+;                              an expansion is a pure function of the macro's
+;                              source text and the call's arguments. So the
+;                              macro's whole `(defmacro …)` form text IS its
+;                              interface — body included.
+;   5. per name, PRIVATE?      `reject-private!`: calling a private var is a
+;                              compile error
+;   6. a defnative's SIGNATURES `Native.declare` names+arities (a host module
+;                              the caller links to directly)
+;   7. the ns's own REQUIRES/ALIASES/REFERS  `alias_target`: `mk/bind` in a
+;                              dependent resolves through the dependent's own
+;                              ns form, not the required one's — so NOT part
+;                              of the required ns's interface. (A required
+;                              ns's `:refer` of a third ns's macro, however,
+;                              is: `refer_source` lets a dependent see it.)
+;
+; NOT in the interface, deliberately: fn bodies (the whole point), docstrings
+; (metadata is written by the defining ns's own init, never baked into a
+; caller), `def` VALUES (a caller fetches at runtime), comments, formatting.
+;
+; ── Why source-derived, and how it stays sound ──────────────────────────────
+;
+; The interface is computed from the SOURCE TEXT alone — the same discipline
+; as the closure hash — so the build can ask it before anything compiles and
+; the runtime gate can recompute it without a running compiler. It reads the
+; top-level forms with the real reader and classifies each defining form by
+; its head: defn/defn- (name + clause arities + private), defmacro (name +
+; full form text), def (name), defrecord/deftype/defprotocol/defmulti/
+; defserver (name + kind), defnative (crate + signatures). Anything else at
+; top level (an expression, a `(comment …)`, a `declare`) contributes nothing.
+;
+; A defining form that is ITSELF produced by a macro at top level
+; (`(defsmell …)`, `(deftest …)`) is invisible to this scan: the reader sees
+; `(defsmell name …)`, not the `def` it expands to. Such a name is therefore
+; NOT in the interface hash, and a dependent that calls it would not rebuild
+; when it changes. Soundness is preserved by construction, not by hoping: the
+; build keys a dependent on the interface hash ONLY when every name it
+; references in the required ns is accounted for by the scan (the
+; `covered?` check in build-plan); otherwise it falls back to the closure
+; hash for that edge. Today that fallback is what every edge already uses,
+; so the interface can only ever REMOVE rebuilds it has proven unnecessary.
+;
+; ── Host-only, like source-graph ────────────────────────────────────────────
+;
+; No `core` vars: the drift gate may ask this while `core` is loading.
+
+(ns ns-interface
+  (:require [reader-node :as rn] [source-graph :as sg]))
+
+(defn- tag-is? [node tag] (erlang/=:= tag (rn/node-tag node)))
+
+; Erlang's boolean operators are not BIFs a `.bl` can call; nested `if`s
+; below give the same short-circuiting.
+(defn- non-empty? [xs] (erlang/=/= xs (list)))
+
+(defn- head-name
+  "The symbol name heading a list form, or nil."
+  [form]
+  (if (tag-is? form :list)
+    (let [items (rn/node-items form)]
+      (if (erlang/=:= items (list))
+        nil
+        (let [h (erlang/hd items)]
+          (if (tag-is? h :symbol) (rn/node-name h) nil))))
+    nil))
+
+(defn- second-name
+  "The symbol name in a list form's second position, or nil."
+  [form]
+  (let [items (rn/node-items form)]
+    (if (erlang/< (erlang/length items) 2)
+      nil
+      (let [n (erlang/hd (erlang/tl items))]
+        (if (tag-is? n :symbol) (rn/node-name n) nil)))))
+
+(def ^:private defining-heads
+  ; head → kind. defn/defn-/defmacro/defnative are handled specially below.
+  (maps/from_list
+    (list (erlang/list_to_tuple (list "def" "value"))
+          (erlang/list_to_tuple (list "defrecord" "record"))
+          (erlang/list_to_tuple (list "deftype" "type"))
+          (erlang/list_to_tuple (list "defprotocol" "protocol"))
+          (erlang/list_to_tuple (list "defmulti" "multi"))
+          (erlang/list_to_tuple (list "defserver" "server")))))
+
+; ── clause arities ───────────────────────────────────────────────────────────
+;
+; `(defn f [a b] …)`, `(defn f ([a] …) ([a b] …))`, `(defn f [a & r] …)` →
+; the arity SET the link map will hold, plus the variadic minimum if any.
+; Mirrors compiler.bl's `clause-shape`/`prelink-info` on reader nodes.
+
+(defn- amp? [n] (if (tag-is? n :symbol) (erlang/=:= "&" (rn/node-name n)) false))
+
+(defn- param-shape
+  "[fixed-count variadic?] of one parameter vector node."
+  [pv]
+  (let [items (rn/node-items pv)
+        fixed (lists/takewhile (fn [p] (erlang/not (amp? p))) items)]
+    (erlang/list_to_tuple (list (erlang/length fixed) (erlang/=/= (erlang/length fixed) (erlang/length items))))))
+
+(defn- clause-shapes
+  "The shapes of every clause after the docstring/attr-map of a defn's args."
+  [args]
+  (let [after-doc (if (if (erlang/>= (erlang/length args) 2) (erlang/is_binary (rn/node-form (erlang/hd args))) false)
+                    (erlang/tl args) args)
+        after-attr (if (if (non-empty? after-doc) (tag-is? (erlang/hd after-doc) :map) false)
+                     (erlang/tl after-doc) after-doc)]
+    (if (erlang/=:= after-attr (list))
+      (list)
+      (if (tag-is? (erlang/hd after-attr) :vector)
+        ; single inline clause
+        (list (param-shape (erlang/hd after-attr)))
+        ; several parenthesised clauses
+        (lists/filtermap (fn [c]
+                           (if (tag-is? c :list)
+                             (let [ci (rn/node-items c)]
+                               (if (if (non-empty? ci) (tag-is? (erlang/hd ci) :vector) false)
+                                 (erlang/list_to_tuple (list true (param-shape (erlang/hd ci))))
+                                 false))
+                             false))
+                         after-attr)))))
+
+(defn- shapes->text
+  "Canonical text of a shape list: sorted `n` for fixed, `n+` for variadic."
+  [shapes]
+  (lists/join ","
+    (lists/usort
+      (lists/map (fn [s] (erlang/iolist_to_binary
+                           (list (erlang/integer_to_binary (erlang/element 1 s))
+                                 (if (erlang/element 2 s) "+" ""))))
+                 shapes))))
+
+; ── one form → interface lines ───────────────────────────────────────────────
+;
+; Each defining form yields ONE line, `kind name detail`, so the interface is
+; a sorted set of lines and two namespaces with the same observable surface
+; hash alike regardless of definition order.
+
+(defn- form-text
+  "A canonical rendering of a form's bare shape (positions stripped): the
+   external term format of the reader node, hex-encoded. Stable across
+   whitespace, comments and line numbers; distinct for any real change."
+  [form]
+  (binary/encode_hex (erlang/term_to_binary (rn/node-form form)) :lowercase))
+
+(defn- form-line
+  "The interface line for one top-level form, or nil when it defines nothing
+   a dependent can observe."
+  [form]
+  (let [head (head-name form)]
+    (if (erlang/=:= head nil)
+      nil
+      (let [name (second-name form)
+            items (rn/node-items form)]
+        (if (erlang/=:= head "defnative")
+          ; `(defnative "crate" (sig arity) …)`: no symbol name; the whole
+          ; form (crate + every signature) is the interface
+          (erlang/iolist_to_binary (list "native " (form-text form)))
+        (if (erlang/=:= name nil)
+          nil
+          (cond
+            (if (erlang/=:= head "defn") true (erlang/=:= head "defn-"))
+              (erlang/iolist_to_binary
+                (list "fn " name " " (shapes->text (clause-shapes (erlang/tl (erlang/tl items))))
+                      (if (erlang/=:= head "defn-") " private" "")))
+            (erlang/=:= head "defmacro")
+              ; the whole form: a macro's body IS its interface
+              (erlang/iolist_to_binary (list "macro " name " " (form-text form)))
+            (erlang/=:= head "defprotocol")
+              ; a protocol's method names + arities are what an implementer
+              ; and a caller both bake (dispatch by name/arity)
+              (erlang/iolist_to_binary
+                (list "protocol " name " "
+                      (lists/join "," (lists/map (fn [c] (let [ci (rn/node-items c)]
+                                                          (erlang/iolist_to_binary
+                                                            (list (rn/node-name (erlang/hd ci)) "/"
+                                                                  (erlang/integer_to_binary
+                                                                    (if (erlang/>= (erlang/length ci) 2)
+                                                                      (erlang/length (rn/node-items (erlang/hd (erlang/tl ci))))
+                                                                      0))))))
+                                                (lists/filter (fn [c] (if (tag-is? c :list)
+                                                                        (let [ci (rn/node-items c)] (if (non-empty? ci) (tag-is? (erlang/hd ci) :symbol) false))
+                                                                        false))
+                                                              (erlang/tl (erlang/tl items)))))))
+            (maps/is_key head defining-heads)
+              (erlang/iolist_to_binary (list (maps/get head defining-heads) " " name))
+            :else nil)))))))
+
+; ── the interface ────────────────────────────────────────────────────────────
+
+(defn lines-forms
+  "`lines` over already-read forms."
+  [forms]
+  (lists/usort
+    (lists/filtermap (fn [f] (let [l (form-line f)] (if (erlang/=:= l nil) false (erlang/list_to_tuple (list true l)))))
+                     forms)))
+
+(defn lines
+  "The interface of a source: its sorted defining lines (see the header)."
+  [content]
+  (lines-forms (sg/forms content)))
+
+(defn- inner-names
+  "Names a defining form introduces BESIDES its own: a protocol's methods
+   (each `(-get [store k] …)` clause), a defnative's signatures (each
+   `(vec-pack 1)`). Both are names a dependent calls by `ns/name`."
+  [form]
+  (let [head (head-name form)]
+    (if (if (erlang/=:= head "defprotocol") true (erlang/=:= head "defnative"))
+      (lists/filtermap (fn [c]
+                         (if (tag-is? c :list)
+                           (let [ci (rn/node-items c)]
+                             (if (if (non-empty? ci) (tag-is? (erlang/hd ci) :symbol) false)
+                               (erlang/list_to_tuple (list true (rn/node-name (erlang/hd ci))))
+                               false))
+                           false))
+                       (erlang/tl (erlang/tl (rn/node-items form))))
+      (list))))
+
+(defn names
+  "The names the interface accounts for — every defined name the scan saw,
+   including a protocol's methods and a defnative's signatures. The build
+   uses this to decide whether a dependent's references into this namespace
+   are all COVERED (else it keeps the closure key for that edge)."
+  [content]
+  (names-forms (sg/forms content)))
+
+(defn names-forms
+  "`names` over already-read forms."
+  [forms]
+  (lists/usort
+    (lists/append
+      (lists/map (fn [f]
+                   (let [h (head-name f) n (second-name f)]
+                     (if (erlang/=:= h "defnative")
+                       (inner-names f)
+                       (if (if (erlang/=:= h nil) false
+                             (if (erlang/=:= n nil) false
+                               (if (maps/is_key h defining-heads) true
+                                 (lists/member h (list "defn" "defn-" "defmacro")))))
+                         (lists/append (list n) (inner-names f))
+                         (list)))))
+                 forms))))
+
+(defn hash
+  "sha256 hex of the interface. Two sources with the same observable surface
+   — same names, kinds, arities, privacy, macro definitions — hash alike, so a
+   dependent keyed on this does not rebuild when only a fn body changed."
+  [content]
+  (hash-forms (sg/forms content)))
+
+(defn hash-forms
+  "`hash` over already-read forms."
+  [forms]
+  (sg/hash-lines (lines-forms forms)))

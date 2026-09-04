@@ -26,17 +26,15 @@ defmodule BeamLisp do
   # dirs; escripts) have no :code.priv_dir/1 for :beam_lisp, so a
   # runtime File.read! would crash boot. @external_resource keeps
   # Mix recompiling when the .bl sources change.
-  @prelude_path Path.join(__DIR__, "../priv/boot/core.bl")
-  @multi_path Path.join(__DIR__, "../priv/std/multi.bl")
-  @sugar_path Path.join(__DIR__, "../priv/boot/sugar.bl")
+  # The prelude namespaces (core/multi/sugar) are loaded from their AOT/seed
+  # beams at boot — never eval'd from source here — since the genesis compiler
+  # that once compiled that embedded source was deleted (the seed is the floor).
+  # Only `@data_readers` is still eval'd at boot (three side-effecting forms that
+  # register the built-in tagged literals; it is not a var-bearing namespace, so
+  # there is no beam to load). `@external_resource` keeps Mix recompiling this
+  # module when the tagged-literal registry changes.
   @data_readers_path Path.join(__DIR__, "../priv/boot/data-readers.bl")
-  @external_resource @prelude_path
-  @external_resource @multi_path
-  @external_resource @sugar_path
   @external_resource @data_readers_path
-  @prelude File.read!(@prelude_path)
-  @multi File.read!(@multi_path)
-  @sugar File.read!(@sugar_path)
   @data_readers File.read!(@data_readers_path)
 
   @doc """
@@ -54,22 +52,63 @@ defmodule BeamLisp do
     init()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-      raw = File.read!(path)
-
       # A document (.bl.md / .bl.org) works as an entry file too: its
       # program is its code cells, exactly as when it is `:require`d.
-      source =
-        if Path.extname(path) in [".md", ".org"] do
-          BeamLisp.Loader.doc_source(
-            raw,
-            if(String.ends_with?(path, ".org"), do: :org, else: :md)
-          )
-        else
-          raw
-        end
+      source = BeamLisp.Loader.read_source(path)
 
       Compiler.eval_string(source, Compiler.new_env(), path)
     end)
+  end
+
+  @doc """
+  The program arguments a `bl run FILE -- a b c` invocation exposes to the
+  running program (the `a b c`). Process-local: a daemon request binds the
+  CLIENT's post-`--` args via `with_argv/2`; outside a command context it
+  falls back to the OS `System.argv/0`, so a plain `elixir`/escript run still
+  sees its own arguments.
+  """
+  def argv do
+    case Process.get(:bl_argv) do
+      nil -> System.argv()
+      list when is_list(list) -> list
+    end
+  end
+
+  @doc "Run `fun` with `list` bound as the program argv (see `argv/0`)."
+  def with_argv(list, fun) when is_list(list) do
+    prev = Process.get(:bl_argv)
+    Process.put(:bl_argv, list)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev), do: Process.delete(:bl_argv), else: Process.put(:bl_argv, prev)
+    end
+  end
+
+  @doc """
+  The working directory a `bl` command resolves file arguments against.
+  Process-local: a daemon request binds the CLIENT's cwd here (the daemon VM's
+  own `File.cwd!/0` is the checkout, not the client's tree); outside a command
+  context it falls back to the OS cwd, so a standalone run is unchanged.
+  """
+  def cwd do
+    case Process.get(:bl_cwd) do
+      nil -> File.cwd!()
+      dir when is_binary(dir) -> dir
+    end
+  end
+
+  @doc "Run `fun` with `dir` bound as the command cwd (see `cwd/0`)."
+  def with_cwd(dir, fun) when is_binary(dir) do
+    prev = Process.get(:bl_cwd)
+    Process.put(:bl_cwd, dir)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev), do: Process.delete(:bl_cwd), else: Process.put(:bl_cwd, prev)
+    end
   end
 
   @doc "Seed the `core` namespace and load the prelude, once."
@@ -95,11 +134,32 @@ defmodule BeamLisp do
       # loaded by default and referred everywhere (see BeamLisp.Env's `sugar`
       # fallback). Loads after core (it is pure macros over core) and after
       # multi, mirroring the AOT-first / source-fallback handling of both.
-      for {ns, source} <- [{"core", @prelude}, {"multi", @multi}, {"sugar", @sugar}] do
-        case BeamLisp.AOT.ensure_loaded(ns) do
-          :loaded -> :ok
-          :no_module -> Compiler.eval_string(source, Compiler.new_env("core"))
-        end
+      # SELF-HOST BOOT ORDER (genesis deleted — the seed is the only floor).
+      #
+      # 1. `core` FIRST. It is a boot-tier namespace, so its drift check is a
+      #    pure toolchain-key comparison (no closure hash, no reader) — it can
+      #    intern from its seed beam before anything else exists. It carries the
+      #    runtime vars (`list`, `reduce`, …) the compiler and reader resolve
+      #    against.
+      BeamLisp.AOT.ensure_loaded("core")
+
+      # 2. Intern the .bl reader and compiler from their seed beams NOW, before
+      #    the rest of the prelude. `multi`/`sugar` are NOT boot-tier, so their
+      #    drift check computes a closure hash — which reads their source via
+      #    `source-graph` → `BeamLisp.Reader.read_all`, i.e. it needs the reader
+      #    LIVE. And there is no Elixir genesis reader/compiler behind the facade
+      #    any more, so the reader ns MUST be interned first or that read has
+      #    nothing to run. `core` (step 1) gives them their runtime deps.
+      BeamLisp.Reader.enable_bl_reader()
+      BeamLisp.Compiler.enable_bl_backend()
+
+      # 3. The rest of the prelude. `multi` (dispatch) and `sugar` (threading /
+      #    cond macros) layer on `core`; their closure-hash drift check now finds
+      #    the interned reader. Once interned, `compile/2` and `read_string/2`
+      #    run every later form (including the `@data_readers` eval below, which
+      #    opens `(ns data-readers)`) through the self-hosted toolchain.
+      for ns <- ["multi", "sugar"] do
+        BeamLisp.AOT.ensure_loaded(ns)
       end
 
       # Seed the built-in tagged-literal registry (`#d`, `#time`) from source,
@@ -113,36 +173,6 @@ defmodule BeamLisp do
       Compiler.eval_string(@data_readers, Compiler.new_env("core"))
 
       Env.mark_seeded()
-
-      # Cutover: route the compiler through the self-hosted beam-lisp compiler
-      # (priv/boot/compiler.bl) now that the prelude it needs is seeded. On a tree
-      # where the compiler beam is built this flips `Compiler.compile/2` onto
-      # the .bl compiler VM-wide; on a fresh tree the seed is absent and this
-      # is a no-op, so boot still works via the genesis Elixir compiler (which
-      # is what builds the seed). Never lets a compiler-load failure break boot.
-      try do
-        BeamLisp.Compiler.enable_bl_backend()
-      rescue
-        _ -> :genesis
-      end
-
-      # Reader cutover: route `Reader.read_string/2` through the self-hosted
-      # beam-lisp reader (priv/boot/reader.bl) for every later read — the language
-      # reads itself. Same shape and safety as the compiler cutover above:
-      # idempotent, forced to the genesis reader while reader.bl's OWN source is
-      # being read (the language never reads its tail with its half-built
-      # reader), and a load failure degrades to genesis instead of breaking
-      # boot. The differential corpus gates the flip: every .bl file in the
-      # repo, read by both readers position-bearing and byte-compared, is
-      # 419/419 identical — plus the parity, position, atom-guard and cutover
-      # suites. `:reader_backend :genesis` in app env opts back out (rebuild
-      # escape hatch); reader.ex stays as the bootstrap seed and the oracle
-      # yardstick either way, exactly like compiler.ex.
-      try do
-        BeamLisp.Reader.enable_bl_reader()
-      rescue
-        _ -> :genesis
-      end
 
       Env.in_ns("user")
     end

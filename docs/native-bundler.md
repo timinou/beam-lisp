@@ -247,3 +247,73 @@ Two release-integration findings baked into the design:
 2. Trailing args after `bin/bl eval EXPR` land in `System.argv()` verbatim —
    a `--` separator LEAKS into argv (verified empirically), so the launcher
    does not add one.
+
+## 12. The warm daemon — a ~instant dev loop
+
+A drop's launcher does more than extract-and-exec: before it cold-boots the
+release VM (~1s), it looks for a **warm `bl daemon`** for the caller's tree and
+forwards the command to it over a Unix socket. A served command returns in
+~20ms instead of ~1s. The escript path costs ~30s per invocation (it cold-loads
+its whole archive every time) and cannot load NIFs at all — the daemon+drop
+pair is strictly better, so the escript is deprecated.
+
+### One daemon per tree
+
+A daemon is keyed by the real path of its tree root (a checkout, or an extracted
+drop payload). The key is the first 16 hex of `sha256(realpath(root))`. Its
+endpoints live under `$XDG_RUNTIME_DIR/beam_lisp/` (a `0700` dir): `<id>.sock`
+(the `AF_UNIX` stream socket, `0600`), `<id>.token` (a 256-bit secret), plus a
+pidfile and meta. The socket's existence is discovery; an **authenticated
+hello** (constant-time token compare + matching tree fingerprint) is authority.
+
+### The wire
+
+Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The daemon
+decodes with `binary_to_term(bin, [:safe])` and then a total, allowlisted schema
+check — a malformed or oversized frame is refused, never executed. A client
+`hello` gets `ready` or a `reject` (`unauthorized` · `wrong_tree` ·
+`restart_required` · `shutting_down`). Then one `request` (`argv`, `cwd`,
+`env_paths`) streams back `stdout`/`stderr`/`stdin`/`exit` frames.
+
+### One worker, one image
+
+Every command runs on a **single Executor FIFO** — because a beam-lisp program
+shares VM-global state (loaded modules, the pinned loader, ETS, NIFs) with the
+daemon, two programs cannot run at once. Per request the daemon forks a fresh
+env (`Env.isolated`), binds the client's roots (`Loader.with_ambient_dirs`) and
+cwd/argv, and routes stdout through a per-request group-leader proxy. Two
+concurrent `bl run` from two terminals attach to the same daemon and queue —
+there is no cross-VM build lock to contend on. Live-reload (`bl watch`) runs
+inside the daemon too; a save's stage→commit rides the same FIFO, so it is
+ordered against the runs and tests, never concurrent with them.
+
+### Staleness is a restart, never a hot-swap
+
+The daemon freezes the compiler key it booted with. When the checkout changes
+under it (the live key moves) or a client presents a different key, it refuses
+work with `restart_required`: a stale VM never serves: it is stopped and a fresh
+one loads a single coherent image. Mixing old loaded code with new sources is
+the one thing a warm VM must not do.
+
+### Using it
+
+```
+bl daemon start     # become the daemon (blocks; the launcher runs it detached)
+bl daemon status    # a live daemon's pid, tree, key, uptime, queue depth
+bl daemon stop      # drain and exit; the socket is removed
+
+BL_DAEMON=off       # every command cold-boots, no daemon
+BL_DAEMON=auto      # a missing daemon is auto-started, then attached
+```
+
+The fallback is total: no daemon (or `BL_DAEMON=off`) means each `bl` is an
+ordinary cold boot — correct, just slower. A command is never silently retried
+after its request frame is sent, because side effects may already have happened;
+a lost connection there is an unknown outcome (exit 1), not a re-run.
+
+## 13. Building the blessed `bl`
+
+`mix bl.build` is the one command: compile → `mix release bl` (prod) → build the
+Rust launcher + pack tool → `drop pack` → install `./bl`. Options: `--out PATH`,
+`--release DIR` (reuse a tree), `--skip-cargo`, `--target os/arch`. The escript
+(`mix escript.build`) still builds as a legacy path; prefer the drop.

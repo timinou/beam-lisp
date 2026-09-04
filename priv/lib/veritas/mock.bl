@@ -26,10 +26,9 @@
 ; mock is a pure value — safe where the real impl's network egress is unspeakable.
 
 (ns veritas.mock
-  (:require [z3] [veritas :as v] [system.smt :as smt] [core]))
+  (:require [z3] [veritas :as v] [system.smt :as smt] [smt :as smtlib] [core]))
 
 (def TIMEOUT-MS 3000)
-(defn- timed [smt] (str "(set-option :timeout " TIMEOUT-MS ")\n" smt))
 
 ; ── contract → SMT ──────────────────────────────────────────────────────────
 ;
@@ -40,15 +39,17 @@
 ; once at the contract boundary and never hand-written.
 
 (defn contract-decls
-  "declare-const lines for the response fields. Public: veritas.fault reuses this
-   so the contract→SMT lowering lives in ONE place (this module owns contracts)."
+  "declare-const COMMANDS for the response fields — forms, rendered at the port
+   edge like every script. Public: veritas.fault reuses this so the contract→SMT
+   lowering lives in ONE place (this module owns contracts)."
   [fields]
-  (core/join "" (map (fn [f] (str "(declare-const " (first f) " " (second f) ")\n")) fields)))
+  (vec (map (fn [f] (smtlib/declare-const (symbol (first f)) (symbol (second f)))) fields)))
 
 (defn- assert-all
-  "Assert every ensures clause."
+  "Assert every ensures clause — each a FORM (or a legacy raw string)."
   [ensures]
-  (core/join "" (map (fn [e] (str "(assert " e ")\n")) ensures)))
+  (vec (map (fn [e] (if (string? e) (smtlib/raw (str "(assert " e ")")) (smtlib/assert e)))
+            ensures)))
 
 (defn- keywordize
   "{name-string → v} → {name-keyword → v}, so a synthesized response reads like an
@@ -68,34 +69,50 @@
 ; :status so \"unknown\" is never mistaken for a definite answer.
 
 (defn synth
-  "ONE valid response for `contract`, or nil. `extra` is extra SMT asserted on top
-   (a seed, a request-derived constraint) — \"\" for the bare contract."
+  "ONE valid response for `contract`, or nil. `extra` is extra SMT asserted on
+   top — a form command, a seq of them, or a legacy raw string — nil/empty for
+   the bare contract."
   [port contract extra]
-  (let [smt (timed (str (contract-decls (:fields contract))
-                        (assert-all (:ensures contract))
-                        extra))
-        r (z3/check-model port smt)]
+  ; a command starts with a symbol head — that is what separates ONE command
+  ; from a seq of them (a seq's first element would be a command, also
+  ; symbol-headed, but its SECOND would not be its last… keep it simple: the
+  ; callers here pass one command, nil, a string, or a seq; sniff the head)
+  (let [extra-cmds (cond (nil? extra) []
+                         (string? extra) [(smtlib/raw extra)]
+                         (and (list? extra) (symbol? (first extra))) [extra]
+                         (vector? extra) (vec extra)
+                         (list? extra) (vec extra)
+                         :else [extra])
+        cmds (concat [(smtlib/raw (str "(set-option :timeout " TIMEOUT-MS ")"))]
+                     (contract-decls (:fields contract))
+                     (assert-all (:ensures contract))
+                     extra-cmds)
+        r (z3/check-model port cmds)]
     {:status (:status r) :value (model->value r)}))
 
 (defn satisfiable?
   "Is the contract realizable at all? true only on a definite SAT. A contradictory
    spec (unsat) or an undecidable one (unknown) → false."
   [port contract]
-  (= "sat" (:status (synth port contract ""))))
+  (= "sat" (:status (synth port contract nil))))
 
 (defn satisfiable-status
   "The raw verdict: \"sat\" | \"unsat\" (contradictory spec) | \"unknown\"."
   [port contract]
-  (:status (synth port contract "")))
+  (:status (synth port contract nil)))
 
 (defn synth-invalid
   "A response the contract FORBIDS: assert the NEGATION of the ensures. Every value
    this returns is, by construction, a contract violation — an adversarial fault
    the mock can inject while STILL being provably inside the sandbox."
   [port contract]
-  (let [neg (str "(not (and " (core/join " " (:ensures contract)) "))")
-        smt (timed (str (contract-decls (:fields contract)) "(assert " neg ")\n"))
-        r (z3/check-model port smt)]
+  (let [ens (:ensures contract)
+        neg-cmd (smtlib/assert
+                  `(not (and ~@(map (fn [e] (if (string? e) (symbol e) e)) ens))))
+        cmds (concat [(smtlib/raw (str "(set-option :timeout " TIMEOUT-MS ")"))]
+                     (contract-decls (:fields contract))
+                     [neg-cmd])
+        r (z3/check-model port cmds)]
     {:status (:status r) :value (model->value r)}))
 
 ; ── the mock SERVER: determinism the core cannot express ────────────────────
@@ -109,7 +126,7 @@
   "A DETERMINISTIC response, pinned by `seed` (an integer) on integer `field`. Same
    seed ⟹ same response. This is the mock server primitive."
   [port contract field seed]
-  (synth port contract (str "(assert (= " field " " seed "))\n")))
+  (synth port contract (smtlib/assert `(= ~(symbol field) ~seed))))
 
 (defrecord MockServer [port contract seed-field])
 
@@ -137,11 +154,12 @@
   "The EXTREME valid response: `dir` :min or :max over integer `field`. z3's
    optimizer finds the smallest/largest response the contract still admits."
   [port contract field dir]
-  (let [obj (if (= dir :min) "minimize" "maximize")
-        smt (timed (str (contract-decls (:fields contract))
-                        (assert-all (:ensures contract))
-                        "(" obj " " field ")\n"))
-        r (z3/check-model port smt)]
+  (let [obj (if (= dir :min) 'minimize 'maximize)
+        cmds (concat [(smtlib/raw (str "(set-option :timeout " TIMEOUT-MS ")"))]
+                     (contract-decls (:fields contract))
+                     (assert-all (:ensures contract))
+                     [(list obj (symbol field))])
+        r (z3/check-model port cmds)]
     {:status (:status r) :value (model->value r)}))
 
 ; ── the forward round-trip: synthesize backward, VERIFY forward ─────────────
@@ -151,26 +169,29 @@
 ; holds. Only a definite unsat returns true, so an undecidable check is a safe
 ; false.
 
-(defn- render-lit
-  "A bl value as an SMT literal: negatives as (- n), strings quoted, bools bare."
+(defn- smt-literal
+  "A bl value as an SMT literal TERM (data): a negative number is `(- n)`,
+   a string is itself (emit quotes it), everything else passes through."
   [val]
   (cond
-    (and (core/int? val) (< val 0)) (str "(- " (- 0 val) ")")
-    (string? val)                   (str "\"" val "\"")
-    :else                           (str val)))
+    (and (core/int? val) (< val 0)) (list '- (- 0 val))
+    :else val))
 
 (defn check
   "Does concrete `value` ({field→v}) satisfy `contract`? Pins every field and asks
    whether the ensures can be violated; unsat ⟹ it holds."
   [port contract value]
-  (let [pins (core/join ""
-               (map (fn [f]
-                      (let [nm (first f) val (get value (keyword nm))]
-                        (str "(assert (= " nm " " (render-lit val) "))\n")))
-                    (:fields contract)))
-        neg (str "(not (and " (core/join " " (:ensures contract)) "))")
-        smt (timed (str (contract-decls (:fields contract)) pins "(assert " neg ")\n"))]
-    (= "unsat" (z3/check port smt))))
+  (let [pins (vec (map (fn [f]
+                         (let [nm (first f) val (get value (keyword nm))]
+                           (smtlib/assert `(= ~(symbol nm) ~(smt-literal val)))))
+                       (:fields contract)))
+        neg-cmd (smtlib/assert
+                  `(not (and ~@(map (fn [e] (if (string? e) (symbol e) e)) (:ensures contract)))))
+        cmds (concat [(smtlib/raw (str "(set-option :timeout " TIMEOUT-MS ")"))]
+                     (contract-decls (:fields contract))
+                     pins
+                     [neg-cmd])]
+    (= "unsat" (z3/check port cmds))))
 
 ; ── deriving a contract from QUOTED bl predicates ─────────────────────
 

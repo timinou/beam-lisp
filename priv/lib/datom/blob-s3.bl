@@ -1,0 +1,217 @@
+; datom/blob-s3.bl — the bytes port, on S3-compatible object storage.
+;
+; ── The tier a distributed database requires ──────────────────────────
+;
+; An in-memory database keeps bytes in memory and a disk database keeps
+; them beside itself; a database sharded across nodes cannot do either —
+; bytes that live on one node vanish with the node. Object storage is the
+; shared, durable, node-independent tier, and content addressing is a
+; perfect fit for it: keys are immutable, a PUT is idempotent, and a
+; client can fetch bytes straight from S3 with a presigned URL without
+; ever crossing the BEAM.
+;
+; Everything here is plain AWS Signature V4 + HTTP, so it works against
+; AWS S3, Garage, MinIO, R2 (with :endpoint), and friends:
+;
+;   (datom.blob-s3/open
+;     {:bucket "bl-blobs" :prefix "app" :region "garage"
+;      :endpoint "http://127.0.0.1:3900"
+;      :access-key "GK…" :secret-key "…"})
+;
+; `:endpoint` omitted means AWS proper. Keys are `<prefix>/<sha-hex>` —
+; no sharding, that is the point of the flat namespace.
+;
+; ── What is deliberately simple ───────────────────────────────────────
+;
+; One signed request per method; no connection pool of our own (Req
+; pools), no multipart (objects here are file bodies already held whole
+; by the caller — S3's 5 GB single-PUT cap is the documented ceiling),
+; no retries (the port is idempotent; a caller retrying a whole put is
+; free). `-blob-stream` reads the whole object and yields 64 KiB chunks:
+; the CHUNKING contract is satisfied, byte-range streaming is the later
+; optimisation a proxying web server would want.
+
+(ns datom.blob-s3
+  (:require [datom.blob] [datom.store] [datom.file]))
+
+(defrecord BlobS3 [bucket prefix region endpoint access-key secret])
+
+(defn open
+  "An S3-backed blob store. Requires :bucket, :access-key, :secret-key;
+   :region defaults to \"garage\" (Garage's default), :endpoint to AWS,
+   :prefix to \"blobs\"."
+  [cfg]
+  (Application/ensure_all_started :req)
+  (->BlobS3 (get cfg :bucket)
+            (get cfg :prefix "blobs")
+            (get cfg :region "garage")
+            (get cfg :endpoint "https://s3.amazonaws.com")
+            (get cfg :access-key)
+            (get cfg :secret-key)))
+
+(def ^:private CHUNK-BYTES 65536)
+
+(defn- key-for
+  "The object key of a sha: `<prefix>/<64 hex>`, no sharding."
+  [bs sha]
+  (str (:prefix bs) "/" (datom.file/sha-hex sha)))
+
+(defn- host-of
+  "The Host header value S3 must see: endpoint authority (with port)."
+  [bs]
+  (let [rest (if-let [i (index-of (:endpoint bs) "://")]
+               (erlang/binary_part (:endpoint bs) (+ i 3)
+                                   (- (erlang/byte_size (:endpoint bs)) (+ i 3)))
+               (:endpoint bs))]
+    (if-let [i (index-of rest "/")] (erlang/binary_part rest 0 i) rest)))
+
+(defn- now-amz
+  "UTC now as calendar:datetime() — what aws_signature formats to the
+   x-amz-date stamp. MUST be UTC: the signature and the date scope agree."
+  []
+  (erlang/universaltime))
+
+(defn- sign
+  "Signed headers for a request: sigv4 over method/url/body with the host
+   header the caller supplies (aws_signature does not add it for header
+   auth). Returns the full header list to send."
+  [bs method url body]
+  (aws_signature/sign_v4 (:access-key bs) (:secret bs) (:region bs) "s3"
+                         (now-amz) method url
+                         (to-list [(erlang/list_to_tuple
+                                     (to-list ["host" (host-of bs)]))])
+                         body
+                         (to-list [(erlang/list_to_tuple
+                                     (to-list [:uri_encode_path false]))])))
+
+(defn- request
+  "One signed request; the parsed response map `{:status :headers :body}`.
+   `query` is appended raw (already URL-encoded)."
+  ([bs method path body] (request bs method path "" body))
+  ([bs method path query body]
+   (let [; The wire method and the signed method must be the SAME STRING:
+         ; Req sends what it is given, so give both sides "PUT", not "put".
+         method (String/upcase method)
+         url (str (:endpoint bs) "/" (:bucket bs) "/" path query)
+         resp (Req/request
+                (to-list [(erlang/list_to_tuple (to-list [:method method]))
+                          (erlang/list_to_tuple (to-list [:url url]))
+                          (erlang/list_to_tuple (to-list [:headers (sign bs method url body)]))
+                          (erlang/list_to_tuple (to-list [:body body]))
+                          (erlang/list_to_tuple (to-list [:retry false]))]))]
+     (if (= :error (erlang/element 1 resp))
+       (throw (ex-info "s3 request failed" {:path path :reason (erlang/element 2 resp)}))
+       (let [r (erlang/element 2 resp)]
+         {:status (get r :status) :headers (get r :headers) :body (get r :body)})))))
+
+(defn- check
+  "A response that must be 2xx, else an error carrying the object, the
+   status and the S3 error XML — the server tells you WHY, keep it."
+  [r path op]
+  (if (< (get r :status) 300)
+    r
+    (throw (ex-info (str "s3 " op " failed")
+                    {:path path :status (get r :status) :body (get r :body)}))))
+
+(defn- xml-texts
+  "The text inside every <tag>…</tag> of an XML body. The LIST response is
+   the one XML an S3 client cannot avoid; this is the minimal scrape."
+  [xml tag]
+  (let [open (str "<" tag ">")
+        close (str "</" tag ">")]
+    (loop [rest xml acc []]
+      (let [i (index-of rest open)]
+        (if (nil? i)
+          acc
+          (let [after (erlang/binary_part rest (+ i (count open))
+                                          (- (erlang/byte_size rest) (+ i (count open))))
+                j (index-of after close)]
+            (if (nil? j)
+              acc
+              (recur (erlang/binary_part after (+ j (count close))
+                                         (- (erlang/byte_size after) (+ j (count close))))
+                     (conj acc (erlang/binary_part after 0 j))))))))))
+
+(defn- list-page
+  "One ListObjectsV2 page: {:shas [...] :truncated bool :token str|nil}."
+  [bs after-token]
+  (let [; Query VALUES are pre-encoded RFC3986 (quote leaves exactly the
+        ; unreserved set AWS canonicalization allows): aws_signature's
+        ; canonical query passes raw bytes through, so the server must see
+        ; the same bytes there or the signature will not match.
+        q (str "?list-type=2&prefix=" (uri_string/quote (str (:prefix bs) "/"))
+               (if (some? after-token)
+                 (str "&continuation-token=" (uri_string/quote after-token))
+                 ""))
+        r (check (request bs "get" "" q "") "list" "list")
+        keys (xml-texts (get r :body) "Key")
+        strip (count (str (:prefix bs) "/"))]
+    {:shas (mapv (fn [k] (binary/decode_hex
+                           (erlang/binary_part k strip (- (count k) strip))))
+                 keys)
+     :truncated (some? (index-of (get r :body) "<IsTruncated>true</IsTruncated>"))
+     :token (first (xml-texts (get r :body) "NextContinuationToken"))}))
+
+(extend-type BlobS3
+  datom.blob/BlobStore
+
+  (-blob-put [bs sha bytes]
+    (let [path (key-for bs sha)]
+      (check (request bs "put" path "" bytes) path "put")
+      bs))
+
+  (-blob-get [bs sha]
+    (let [path (key-for bs sha)
+          r (request bs "get" path "" "")]
+      (if (< (get r :status) 300) (get r :body) nil)))
+
+  (-blob-has? [bs sha]
+    (< (get (request bs "head" (key-for bs sha) "" "") :status) 300))
+
+  (-blob-delete [bs sha]
+    ; 204 on a live object, 404 on a gone one — both are success: the
+    ; method is idempotent by definition.
+    (let [path (key-for bs sha)
+          st (get (request bs "delete" path "" "") :status)]
+      (if (or (< st 300) (= 404 st)) nil (check {:status st :body nil} path "delete"))
+      bs))
+
+  (-blob-shas [bs]
+    (loop [token nil acc []]
+      (let [page (list-page bs token)
+            acc (into acc (get page :shas))]
+        (if (:truncated page)
+          (recur (:token page) acc)
+          acc)))))
+
+; A presigned GET: signature in the QUERY STRING, no headers — this is what
+; `datom/file-url` hands to a client, which then talks to S3 directly.
+(extend-protocol datom.blob/BlobUrl
+  BlobS3
+  (-blob-url [bs sha opts]
+    (aws_signature/sign_v4_query_params
+      (:access-key bs) (:secret bs) (:region bs) "s3"
+      (now-amz) "GET"
+      (str (:endpoint bs) "/" (:bucket bs) "/" (key-for bs sha))
+      ; A query-auth canonical request carries UNSIGNED-PAYLOAD, not the
+      ; empty-body hash — the lib defaults to hashing {body, <<>>}, which
+      ; every S3 server rejects with Invalid signature.
+      (to-list [(erlang/list_to_tuple (to-list [:ttl (get opts :expires 900)]))
+                (erlang/list_to_tuple
+                  (to-list [:body_digest "UNSIGNED-PAYLOAD"]))]))))
+
+; Streaming: the object arrives whole (Req body), then leaves in chunks —
+; the port's contract is "chunks, never ask the caller to hold what it does
+; not need twice", and this satisfies it; byte-range GETs are the upgrade.
+(extend-protocol datom.blob/BlobStream
+  BlobS3
+  (-blob-stream [bs sha]
+    (let [b (datom.blob/-blob-get bs sha)]
+      (if (nil? b)
+        nil
+        (loop [rest b acc []]
+          (if (<= (erlang/byte_size rest) CHUNK-BYTES)
+            (conj acc rest)
+            (recur (erlang/binary_part rest CHUNK-BYTES
+                                       (- (erlang/byte_size rest) CHUNK-BYTES))
+                   (conj acc (erlang/binary_part rest 0 CHUNK-BYTES)))))))))

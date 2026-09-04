@@ -231,14 +231,8 @@ defmodule BeamLisp.Record do
   # Rebuilding a struct module on every defrecord evaluation is the
   # normal case (hot reload), so the module-conflict warning is noise.
   defp create_module(mod, block) do
-    prev = Code.compiler_options()
-    Code.compiler_options(ignore_module_conflict: true)
-
-    try do
-      Module.create(mod, block, Macro.Env.location(__ENV__))
-    after
-      Code.compiler_options(prev)
-    end
+    BeamLisp.CompilerOptions.ensure!()
+    Module.create(mod, block, Macro.Env.location(__ENV__))
   end
 
   defp register(mod, kind, ns, name, fields) do

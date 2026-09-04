@@ -1,0 +1,231 @@
+; boot/build.bl — the AOT build, as a program.
+;
+; What `mix compile.beam_lisp` and `bl build` do, in the language, so the
+; build is one thing: plan the sources (build-plan), skip what is fresh
+; (the manifest), compile the rest wave by wave in parallel, fetch from or
+; store to the shared cache, write the manifest. The Elixir Mix task is a
+; shell around `run` — it parses flags, finds the compile path, and returns
+; the shape Mix wants. It decides nothing.
+;
+; ── Contract ────────────────────────────────────────────────────────────────
+;
+;   (run {:sources [paths]              every source: .bl, .bl.md, .bl.org
+;         :out "dir"                     where beams go
+;         :manifest "path"               the manifest file (default <out>/compile.beam_lisp)
+;         :force? bool                   rebuild everything
+;         :jobs n                        parallel width per wave
+;         :log (fn [msg])                progress lines (nil = silent)})
+;   → {:built n :errors [msg …] :manifest {path → entry}}
+;
+; The manifest maps each source path to
+; `{:hash key :key toolchain-key :modules [mod …]}` — `key` is the plan's
+; per-source freshness key (interface-keyed, see build-plan), `toolchain-key`
+; `BeamLisp.AOTCache/compiler_key`. A source is FRESH iff its manifest entry
+; matches both and every module's beam is on disk.
+;
+; Why keys and not mtimes: mtime is scrambled by checkout, worktrees and
+; tar; the key is a function of the bytes. Why the manifest stores the
+; plan's key (not the file's content hash): it is the same key the beam is
+; stamped with and the runtime drift gate recomputes, so a dependent whose
+; required interface changed is rebuilt here, not rejected at boot.
+;
+; ── Concurrency ─────────────────────────────────────────────────────────────
+;
+; A wave's sources depend only on earlier waves, so a wave compiles in
+; parallel: one process per source, all interning into the `:global` Env.
+; What an emitter mutates is keyed by its own namespace, so two sources in
+; one wave never touch the same rows; `*ns*` is per-process. Results fold
+; back in plan order, so the manifest and cache stores are as deterministic
+; as a serial build (and the beams are byte-identical — pinned by
+; test/beam_lisp/aot_reproducible_test.exs).
+;
+; ── Failure ─────────────────────────────────────────────────────────────────
+;
+; One source failing does not stop the wave or the build: its error is
+; collected, its manifest entry left as it was, and later waves proceed
+; (a dependent of a failed source will fail loudly on its own). The caller
+; decides what an error list means (Mix: `{:error, …}`; `bl build`: exit 1).
+
+(ns build
+  (:require [build-plan :as plan]))
+
+; ── manifest ─────────────────────────────────────────────────────────────────
+
+(defn manifest-path [out] (Path/join out "compile.beam_lisp"))
+
+(defn- entry?
+  "A well-formed manifest entry: two hash strings and a realised list of
+   module atoms. Anything else — an older schema, a serialised thunk — is
+   treated as absent, so the source simply rebuilds."
+  [e]
+  (and (map? e)
+       (string? (:hash e)) (string? (:key e))
+       (let [mods (:modules e)]
+         (and (or (vector? mods) (erlang/is_list mods))
+              (every? (fn [m] (erlang/is_atom m)) mods)))))
+
+(defn read-manifest
+  "The manifest at `path`, or {} when absent/unreadable. Malformed entries
+   are dropped, never trusted: the manifest is on-disk input."
+  [path]
+  (let [r (File/read path)]
+    (if (= :ok (erlang/element 1 r))
+      (let [bin (erlang/element 2 r)
+            t (if (= bin "") {} (try (erlang/binary_to_term bin) (catch _ {})))]
+        (if (map? t)
+          (reduce (fn [m k] (let [e (get t k)] (if (and (string? k) (entry? e)) (assoc m k e) m)))
+                  {} (keys t))
+          {}))
+      {})))
+
+(defn write-manifest
+  "Persist `m`. Module lists are realised to vectors first: a lazy seq
+   would serialise as a closure over a process that no longer exists."
+  [path m]
+  (File/mkdir_p! (Path/dirname path))
+  (File/write! path (erlang/term_to_binary
+                       (reduce (fn [acc k] (assoc acc k (update (get m k) :modules vec))) {} (keys m)))))
+
+(defn- beam-path [out mod] (Path/join out (str (erlang/atom_to_binary mod) ".beam")))
+
+(defn fresh?
+  "Is `path` up to date: manifest entry with this key and toolchain key, and
+   every module's beam present?"
+  [manifest path key tkey out]
+  (let [e (get manifest path)]
+    (and (some? e)
+         (= key (:hash e))
+         (= tkey (:key e))
+         (every? (fn [m] (File/exists? (beam-path out m))) (:modules e)))))
+
+(defn- delete-beam [out mod]
+  (let [p (beam-path out mod)] (when (File/exists? p) (File/rm p))))
+
+; ── one source ───────────────────────────────────────────────────────────────
+
+(defn- build-one
+  "Compile `path` (or link it from the shared cache) into `out`.
+   → {:path :key :closure-key :cached? :result} where result is
+   [:ok modules] or [:error msg].
+
+   Runs in a WORKER process (pmap-ordered). Everything it returns is fully
+   realised before it is sent back: a lazy seq's thunk is a closure over
+   the worker's stack and would be forced in the parent after the worker
+   exited — a `map` here must be `mapv`, and `mods` a vector."
+  [path key cache-key closure-key out log]
+  (when log (log (str "  " path)))
+  (let [cached (if closure-key (BeamLisp.AOTCache/fetch cache-key closure-key out) :miss)
+        ; fetch → {:ok modules} | :miss
+        hit? (and (erlang/is_tuple cached) (= :ok (erlang/element 1 cached)))
+        result (if hit?
+                 (let [mods (vec (erlang/element 2 cached))]
+                   (BeamLisp.AOTCache/run_init_modules mods out)
+                   [:ok mods])
+                 (try
+                   (let [mods (BeamLisp.AOT/compile_file path (list (erlang/list_to_tuple (list :output_dir out))))]
+                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (erlang/element 1 m))))])
+                   (catch e
+                     [:error (str "beam-lisp AOT: " path ": " (ex-message e))])))]
+    {:path path :key key :closure-key closure-key :cached? hit? :result result}))
+
+; ── parallel wave ────────────────────────────────────────────────────────────
+
+(defn- chunks-of
+  "`xs` in consecutive groups of at most `n` (the last may be short)."
+  [n xs]
+  (loop [xs (seq xs) acc []]
+    (if (nil? xs)
+      acc
+      (recur (seq (drop n xs)) (conj acc (vec (take n xs)))))))
+
+(defn- pmap-ordered
+  "Map `f` over `xs` in parallel (at most `n` at once), results in order.
+   Plain spawn/receive: one process per element in a chunk, each sending
+   `[ref result]` back; collected in chunk order. A crash in `f` is
+   linked, so it surfaces as the build's own failure — `build-one` already
+   catches compile errors into a result, so a crash here is a real bug."
+  [n f xs]
+  (let [me (erlang/self)]
+    (apply concat
+      (map (fn [chunk]
+             (let [refs (mapv (fn [x]
+                                (let [ref (erlang/make_ref)]
+                                  (erlang/spawn_link (fn [] (erlang/send me (erlang/list_to_tuple (list ref (f x))))))
+                                  ref))
+                              chunk)]
+               ; selective receive: the mailbox is scanned for THIS ref's
+               ; reply, so results come back in chunk order whatever order
+               ; the workers finished in
+               (mapv (fn [ref] (receive [r v] :when (= r ref) v)) refs)))
+           (chunks-of n xs)))))
+
+; ── the build ────────────────────────────────────────────────────────────────
+
+(defn run
+  "Build `sources` into `out`. See the header for the contract."
+  [opts]
+  (let [sources (vec (:sources opts))
+        out (:out opts)
+        force? (= true (:force? opts))
+        jobs (or (:jobs opts) (erlang/system_info :schedulers_online))
+        log (:log opts)
+        mpath (or (:manifest opts) (manifest-path out))
+        tkey (BeamLisp.AOTCache/compiler_key)
+        cache-key (if (and (BeamLisp.AOTCache/enabled?) (not force?)) tkey nil)
+        manifest0 (read-manifest mpath)
+        ; A source the reader rejects cannot be planned: it is reported as a
+        ; build error and left out of the graph (its dependents will fail on
+        ; their own require, loudly). Everything else still builds.
+        read-results (map (fn [path]
+                            (try [:ok (plan/node-from path (BeamLisp.Loader/read_source path))]
+                                 (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))])))
+                          sources)
+        read-errors (vec (map second (filter (fn [r] (= :error (first r))) read-results)))
+        p (plan/plan (map second (filter (fn [r] (= :ok (first r))) read-results)))
+        hashes (into {} (map (fn [n] [(:path n) (:hash n)]) (:order p)))
+        todo? (fn [m path] (or force? (not (fresh? m path (get (:key p) path) tkey out))))
+        total (count (filter (fn [n] (todo? manifest0 (:path n))) (:order p)))]
+    (when (and log (> total 0)) (log (str "beam-lisp AOT: building " total " source(s)")))
+    (let [final
+          (reduce
+            (fn [st wave]
+              (let [m (:manifest st)
+                    paths (map :path (filter (fn [n] (todo? m (:path n))) wave))
+                    results (pmap-ordered jobs
+                              (fn [path]
+                                (build-one path (get (:key p) path) cache-key
+                                           (if cache-key (BeamLisp.AOTCache/closure_key path (:deps p) hashes) nil)
+                                           out log))
+                              paths)]
+                (reduce
+                  (fn [st r]
+                    (let [[tag payload] (:result r)]
+                      (if (= tag :ok)
+                        (let [old (get-in (:manifest st) [(:path r) :modules] [])
+                              m2 (assoc (:manifest st) (:path r) {:hash (:key r) :key tkey :modules payload})]
+                          (doseq [mod (remove (fn [m] (contains? (set payload) m)) old)] (delete-beam out mod))
+                          (write-manifest mpath m2)
+                          (when (and (:closure-key r) (not (:cached? r)))
+                            (BeamLisp.AOTCache/store cache-key (:closure-key r) out payload))
+                          (assoc st :manifest m2 :built (inc (:built st))))
+                        (assoc st :errors (conj (vec (:errors st)) payload)))))
+                  st results)))
+            {:manifest manifest0 :built 0 :errors read-errors}
+            (:waves p))
+          ;; forget sources that no longer exist; delete their beams
+          keep (set sources)
+          m-final (:manifest final)
+          stale-paths (remove (fn [path] (contains? keep path)) (keys m-final))
+          kept (reduce (fn [m path] (dissoc m path)) m-final stale-paths)]
+      (doseq [path stale-paths] (doseq [mod (:modules (get m-final path))] (delete-beam out mod)))
+      (write-manifest mpath kept)
+      {:built (:built final) :errors (:errors final) :manifest kept})))
+
+(defn clean
+  "Delete every beam the manifest at `mpath` names (from `out`), and the
+   manifest itself."
+  [out mpath]
+  (let [m (read-manifest mpath)]
+    (doseq [path (keys m)] (doseq [mod (:modules (get m path))] (delete-beam out mod)))
+    (when (File/exists? mpath) (File/rm mpath))
+    :ok))

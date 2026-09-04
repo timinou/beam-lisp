@@ -1,7 +1,7 @@
 ; smt.bl — source → SMT-LIB translation (P17: the checker seam).
 ;
 ; The seam between model.bl (extracts a transition's guard/next as source) and
-; system.bl (proves over SMT strings). beam-lisp's prefix arithmetic is ALREADY
+; system.bl (proves over SMT forms). beam-lisp's prefix arithmetic is ALREADY
 ; valid SMT-LIB — (+ balance amt), (>= n 0), (and a b) translate as identity.
 ; This module adds:
 ;   - predicate desugaring: (pos? x) → (> x 0), (zero? x) → (= x 0), etc.
@@ -13,9 +13,13 @@
 ; State vars are modelled as SMT integers — the common case for process state
 ; (balances, counters, phases-as-ints). Non-integer state (maps, strings) is
 ; out of this translator's scope and surfaces as :untranslatable.
+;
+; ── RETURN VALUES: forms, not strings ──────────────────────────────────────
+; translate and friends return DATA FORMS or :untranslatable, never strings.
+; Callers wrap with smt/script or smt/emit only at the z3 port edge.
 
 (ns system.smt
-  (:require [typed]))
+  (:require [typed] [smt :as smtlib]))
 
 ; ── the SORT FUNCTOR: a value's tag-lattice tag → its z3 SORT ─────────────
 ;
@@ -71,16 +75,17 @@
 
 ; binary/n-ary ops that pass through unchanged (prefix bl = prefix SMT-LIB)
 (def passthrough-ops
-  #{"+" "-" "*" "and" "or" "not" "=" "<" ">" "<=" ">=" "mod" "=>" "ite"})
+  ; div: SMT-LIB's Euclidean div — same op name, same meaning
+  #{"+" "-" "*" "div" "and" "or" "not" "=" "<" ">" "<=" ">=" "mod" "=>" "ite"})
 
-; predicates that desugar to a comparison against a state var
+; predicates that desugar to a comparison against a state var — form builders
 (def unary-desugar
-  {"pos?"  (fn [x] (str "(> " x " 0)"))
-   "neg?"  (fn [x] (str "(< " x " 0)"))
-   "zero?" (fn [x] (str "(= " x " 0)"))
-   "inc"   (fn [x] (str "(+ " x " 1)"))
-   "dec"   (fn [x] (str "(- " x " 1)"))
-   "not"   (fn [x] (str "(not " x ")"))})
+  {"pos?"  (fn [x] (list '> x 0))
+   "neg?"  (fn [x] (list '< x 0))
+   "zero?" (fn [x] (list '= x 0))
+   "inc"   (fn [x] (list '+ x 1))
+   "dec"   (fn [x] (list '- x 1))
+   "not"   (fn [x] (list 'not x))})
 
 ; STRING-theory operations: bl string fns → SMT-LIB str.* (SMT-LIB 2.6 Unicode
 ; strings). Each maps a bl call to the z3 operator of the same meaning, so a
@@ -89,24 +94,20 @@
 ; string length) and the collection path (translate-len) owns it. A string
 ; length invariant uses (str-len s) explicitly.
 (def string-ops
-  {"str"           "str.++"       ; (str a b) → concatenation
-   "str-len"       "str.len"      ; (str-len s) → length
-   "str-contains?" "str.contains"
-   "str-prefix?"   "str.prefixof"
-   "str-suffix?"   "str.suffixof"})
+  {"str"           'str.++       ; (str a b) → concatenation
+   "str-len"       'str.len      ; (str-len s) → length
+   "str-contains?" 'str.contains
+   "str-prefix?"   'str.prefixof
+   "str-suffix?"   'str.suffixof})
 
-; Render a bl float as an SMT Real literal. z3 wants a decimal point; a whole
-; float like 2.0 already carries one via str, but guard the integer-valued case.
-(defn- smt-real [x]
-  (let [s (str x)]
-    (if (some (fn [ch] (= ch ".")) (into [] s)) s (str s ".0"))))
+; A Real literal is the float itself: smt/emit renders the decimal point.
 
 ; ── the translator ──────────────────────────────────────────────────────
 ;
-; Returns an SMT-LIB string, or the keyword :untranslatable if any subform is
-; outside the vocabulary. `vars` is the set of known state-variable names
-; (symbols); a symbol not in `vars` is still emitted (it may be an input var
-; the caller declared), but see translate-strict for the checked variant.
+; Returns a DATA FORM (symbol/number/bool/string/list), or :untranslatable if
+; any subform is outside the vocabulary. `vars` is the set of known state-
+; variable names (symbols); a symbol not in `vars` is still emitted (it may be
+; an input var the caller declared).
 
 (declare translate)
 
@@ -115,7 +116,7 @@
 ; ── payload-variant discriminant recognition (R1b) ──────────────────────
 ; (some? (:on mode)) is the discriminant "the :on arm is present". Recognize the
 ; inner (:on mode) as a payload-accessor over a known variant tag, and emit the
-; z3 tester ((_ is E_mode-on) mode).
+; z3 tester ((_ is E_mode-on) mode) as a FORM.
 (defn- variant-access?
   "Is `node` a payload accessor (:tag field) over a known payload variant?"
   [variants node]
@@ -128,13 +129,14 @@
                   (and (map? v) (:field v))))))))
 
 (defn- variant-is-test
-  "The z3 discriminant ((_ is Ctor) arg) for a recognized (:tag arg) accessor."
+  "The z3 discriminant ((_ is Ctor) arg) as a FORM for a recognized (:tag arg)
+   accessor. e.g. (some? (:on mode)) → (list '_ 'is \"E_mode-on\") mode)"
   [variants node]
   (let [its (typed/node-items (typed/node-form node))
         k (typed/node-name (typed/node-form (first its)))
         v (get variants k)
-        arg (typed/node-name (typed/node-form (second its)))]
-    (str "((_ is " (:ctor v) ") " arg ")")))
+        arg (symbol (typed/node-name (typed/node-form (second its))))]
+    (list (list '_ 'is (symbol (:ctor v))) arg)))
 
 ; ── quot / rem: TRUNCATED division from z3's EUCLIDEAN div/mod ──────────────
 ;
@@ -148,14 +150,16 @@
 ;   rem  a b = a − b·(quot a b)       [the division identity a = b·q + r]
 ; Sound when b≠0 (b=0 raises in bl and is uninterpreted in z3 — a crash the
 ; property tester surfaces, not a false proof). `a`,`b` are already-translated
-; SMT strings; the correction re-references them but is side-effect-free.
+; SMT DATA FORMS; the correction re-references them but is side-effect-free.
+; W6 rule: these build quoted forms, never SMT-LIB strings — smt/emit is the
+; ONE form→text crossing at the z3 port edge.
 (defn- smt-quot [a b]
-  (str "(+ (div " a " " b ") "
-       "(ite (and (< " a " 0) (> (mod " a " " b ") 0)) "
-            "(ite (> " b " 0) 1 (- 1)) 0))"))
+  (list '+ (list 'div a b)
+        (list 'ite (list 'and (list '< a 0) (list '> (list 'mod a b) 0))
+              (list 'ite (list '> b 0) 1 (list '- 1)) 0)))
 
 (defn- smt-rem [a b]
-  (str "(- " a " (* " b " " (smt-quot a b) "))"))
+  (list '- a (list '* b (smt-quot a b))))
 
 (defn- translate-args
   "Translate every child; if any is untranslatable, the whole form is."
@@ -164,10 +168,13 @@
     (if (some untranslatable? ts) :untranslatable ts)))
 
 (defn translate
-  "A reader node → an SMT-LIB string, or :untranslatable.
+  "A reader node → a DATA FORM (symbol/number/bool/string/list), or :untranslatable.
    `variants` maps an enum keyword tag (a string, e.g. \"open\") to its z3
    CONSTRUCTOR name (e.g. \"Phase-open\"); an empty map ⇒ no enums (Int/Real/
-   Bool/String only, unchanged). The 2-arg form is the no-enum default."
+   Bool/String only, unchanged). The 2-arg form is the no-enum default.
+   
+   Callers wrap the returned form with (smt/script) or (smt/emit) only at the
+   z3 port edge."
   ([vars node] (translate vars {} node))
   ([vars variants node]
    (let [f (typed/node-form node)
@@ -175,26 +182,26 @@
      (cond
        ; literals (a :scalar node's form IS the raw value)
        (= tg :scalar)
-         (cond (int? f)      (str f)
-               (float? f)    (smt-real f)               ; Real theory: 1.5 → "1.5"
-               (= f true)    "true"
-               (= f false)   "false"
-               (string? f)   (str "\"" f "\"")           ; String theory constant
+         (cond (int? f)      f        ; the value IS the term
+               (float? f)    f        ; Real theory: emit renders the decimal
+               (= f true)    true
+               (= f false)   false
+               (string? f)   f        ; String theory constant
                :else         :untranslatable)
 
-       ; a keyword literal → its z3 constructor. A finite tagged variant is a z3
-       ; algebraic datatype; a NULLARY arm :open becomes the sort-prefixed
+       ; a keyword literal → its z3 constructor SYMBOL. A finite tagged variant
+       ; is a z3 algebraic datatype; a NULLARY arm :open becomes the sort-prefixed
        ; constructor the caller registered (E_phase-open) — bare `open` collides
        ; across datatypes. A keyword absent from `variants` → untranslatable.
        (= tg :keyword)
          (let [k (typed/node-name f)
                v (get variants k)]
            (cond (nil? v) :untranslatable
-                 (map? v) (:ctor v)      ; a payload arm named bare = its 0-ary use is rare; emit ctor
-                 :else v))               ; nullary arm: the constructor string
+                 (map? v) (symbol (:ctor v))    ; payload arm: constructor symbol
+                 :else (symbol v)))             ; nullary arm: constructor symbol
 
        ; a single-key MAP literal {:on lvl} → a PAYLOAD-arm constructor call
-       ; (E_mode-on <lvl>). The key is the tag; its value is the payload arg.
+       ; as a FORM (E_mode-on <lvl>).
        (= tg :map)
          (let [items (typed/node-items f)]
            (if (not (= 1 (count items)))
@@ -206,12 +213,12 @@
                (if (and (map? v) (:field v))
                  (let [a (translate vars variants vnode)]
                    (if (untranslatable? a) :untranslatable
-                     (str "(" (:ctor v) " " a ")")))
+                     (list (symbol (:ctor v)) a)))
                  :untranslatable))))
 
-       ; a symbol: emit its name (state var or declared input)
+       ; a symbol: emit as a SYMBOL (state var or declared input)
        (= tg :symbol)
-         (typed/node-name f)
+         (symbol (typed/node-name f))
 
        ; a list: an operator application
        (= tg :list)
@@ -221,13 +228,13 @@
              (let [head (typed/node-form (first its))]
                (cond
                  ; a KEYWORD head applied to a variant field: (:on mode) — the
-                 ; PAYLOAD ACCESSOR. Emits the z3 field selector (E_mode-on.val mode).
+                 ; PAYLOAD ACCESSOR. Returns z3 field selector form (E_mode-on.val mode).
                  (and (= :keyword (typed/node-tag head)) (= 1 (count (rest its))))
                    (let [k (typed/node-name head)
                          v (get variants k)
                          argsmt (translate vars variants (second its))]
                      (if (and (map? v) (:field v) (not (untranslatable? argsmt)))
-                       (str "(" (:field v) " " argsmt ")")
+                       (list (symbol (:field v)) argsmt)
                        :untranslatable))
                  (not (= :symbol (typed/node-tag head)))
                  :untranslatable
@@ -236,28 +243,28 @@
                        args (rest its)]
                    (cond
                      ; (some? (:on mode)) / (is? (:on mode)) — the DISCRIMINANT:
-                     ; "the :on arm is present" → ((_ is E_mode-on) mode).
+                     ; "the :on arm is present" → ((_ is E_mode-on) mode) as form.
                      (and (contains? #{"some?" "is?"} op) (= 1 (count args))
                           (variant-access? variants (first args)))
                        (variant-is-test variants (first args))
-                     ; unary desugar: (pos? x) etc — exactly one arg
+                     ; unary desugar: (pos? x) etc — exactly one arg → form
                      (and (contains? unary-desugar op) (= 1 (count args)))
                        (let [a (translate vars variants (first args))]
                          (if (untranslatable? a) :untranslatable
                            ((get unary-desugar op) a)))
-                     ; (if c t e) → z3 (ite c t e): bl's `if` IS z3's ite.
+                     ; (if c t e) → z3 (ite c t e) form: bl's `if` IS z3's ite.
                      (and (= op "if") (= 3 (count args)))
                        (let [ts (translate-args vars variants args)]
                          (if (untranslatable? ts) :untranslatable
-                           (str "(ite " (join " " ts) ")")))
+                           (apply list 'ite ts)))
                      ; (max a b) → (ite (>= a b) a b); (min a b) → (ite (<= a b) a b).
                      ; The floor/ceiling idiom (max 0 c) relay billing leans on.
                      (and (contains? #{"max" "min"} op) (= 2 (count args)))
                        (let [ts (translate-args vars variants args)]
                          (if (untranslatable? ts) :untranslatable
                            (let [a (first ts) b (second ts)
-                                 cmp (if (= op "max") ">=" "<=")]
-                             (str "(ite (" cmp " " a " " b ") " a " " b ")"))))
+                                 cmp (if (= op "max") '>= '<=)]
+                             (list 'ite (list cmp a b) a b))))
                      ; (quot a b) / (rem a b) → TRUNCATED division reconstructed
                      ; from z3's Euclidean div/mod (see smt-quot/smt-rem). Both
                      ; args translated; either untranslatable ⇒ the whole form is.
@@ -266,25 +273,25 @@
                          (if (untranslatable? ts) :untranslatable
                            (let [a (first ts) b (second ts)]
                              (if (= op "quot") (smt-quot a b) (smt-rem a b)))))
-                     ; (nth p <int>) → p_<int>: index a POSITIONAL tuple var. The
-                     ; tuple gen declares z3 consts p_0 p_1…; this lets a predicate
+                     ; (nth p <int>) → p_<int> SYMBOL: index a POSITIONAL tuple var.
+                     ; The tuple gen declares z3 consts p_0 p_1…; this lets a predicate
                      ; spell them as (nth p 0) so the SAME source also evals in bl.
                      (and (= op "nth") (= 2 (count args))
                           (= :symbol (typed/node-tag (typed/node-form (first args))))
                           (= :scalar (typed/node-tag (typed/node-form (second args))))
                           (int? (typed/node-form (second args))))
-                       (str (typed/node-name (typed/node-form (first args)))
-                            "_" (typed/node-form (second args)))
-                     ; passthrough n-ary ops
+                       (symbol (str (typed/node-name (typed/node-form (first args)))
+                                    "_" (typed/node-form (second args))))
+                     ; passthrough n-ary ops → form
                      (contains? passthrough-ops op)
                        (let [ts (translate-args vars variants args)]
                          (if (untranslatable? ts) :untranslatable
-                           (str "(" op " " (join " " ts) ")")))
-                     ; STRING-theory ops → the SMT str.* operator, args translated
+                           (apply list (symbol op) ts)))
+                     ; STRING-theory ops → form with SMT str.* SYMBOL
                      (contains? string-ops op)
                        (let [ts (translate-args vars variants args)]
                          (if (untranslatable? ts) :untranslatable
-                           (str "(" (get string-ops op) " " (join " " ts) ")")))
+                           (apply list (get string-ops op) ts)))
                      :else :untranslatable))))))
 
        :else :untranslatable))))
@@ -302,7 +309,7 @@
 
 (declare translate-len)
 
-(defn- len-name [c] (str c "_len"))
+(defn- len-name [c] (symbol (str c "_len")))
 
 (defn- translate-len-args [vars colls nodes]
   (let [ts (map (fn [n] (translate-len vars colls n)) nodes)]
@@ -311,19 +318,20 @@
 (defn translate-len
   "Like translate, but each name in `colls` (a set of collection var names) is
    abstracted to its length. count/conj/rest/pop/empty? over a collection var
-   become integer arithmetic on <var>_len; the empty-vector literal is 0."
+   become integer arithmetic on <var>_len; the empty-vector literal is 0.
+   Returns forms or :untranslatable."
   [vars colls node]
   (let [f (typed/node-form node)
         tg (typed/node-tag f)]
     (cond
       (= tg :scalar)
-        (cond (int? f) (str f) (= f true) "true" (= f false) "false" :else :untranslatable)
+        (cond (int? f) f (= f true) true (= f false) false :else :untranslatable)
       ; the empty-vector literal → length 0
       (= tg :vector)
-        (if (empty? (typed/node-items f)) "0" :untranslatable)
+        (if (empty? (typed/node-items f)) 0 :untranslatable)
       (= tg :symbol)
         (let [nm (typed/node-name f)]
-          (if (contains? colls nm) (len-name nm) nm))
+          (if (contains? colls nm) (len-name nm) (symbol nm)))
       (= tg :list)
         (let [its (typed/node-items f)]
           (if (empty? its) :untranslatable
@@ -336,31 +344,32 @@
                                     (and (= :symbol (typed/node-tag ff))
                                          (contains? colls (typed/node-name ff)))))]
                   (cond
-                    ; (count c) → c_len
+                    ; (count c) → c_len symbol
                     (and (= op "count") (= 1 (count args)) (coll-arg? (first args)))
                       (len-name (typed/node-name (typed/node-form (first args))))
-                    ; (conj c x) → (+ c_len 1)  — one element added
+                    ; (conj c x) → (+ c_len 1) form
                     (and (= op "conj") (= 2 (count args)) (coll-arg? (first args)))
-                      (str "(+ " (len-name (typed/node-name (typed/node-form (first args)))) " 1)")
-                    ; (rest c) / (pop c) → (- c_len 1)
+                      (list '+ (len-name (typed/node-name (typed/node-form (first args)))) 1)
+                    ; (rest c) / (pop c) → (- c_len 1) form
                     (and (contains? #{"rest" "pop" "next"} op) (= 1 (count args)) (coll-arg? (first args)))
-                      (str "(- " (len-name (typed/node-name (typed/node-form (first args)))) " 1)")
-                    ; (empty? c) → (= c_len 0)
+                      (list '- (len-name (typed/node-name (typed/node-form (first args)))) 1)
+                    ; (empty? c) → (= c_len 0) form
                     (and (= op "empty?") (= 1 (count args)) (coll-arg? (first args)))
-                      (str "(= " (len-name (typed/node-name (typed/node-form (first args)))) " 0)")
+                      (list '= (len-name (typed/node-name (typed/node-form (first args)))) 0)
                     (and (contains? unary-desugar op) (= 1 (count args)))
                       (let [a (translate-len vars colls (first args))]
                         (if (untranslatable? a) :untranslatable ((get unary-desugar op) a)))
                     (contains? passthrough-ops op)
                       (let [ts (translate-len-args vars colls args)]
                         (if (untranslatable? ts) :untranslatable
-                          (str "(" op " " (join " " ts) ")")))
+                          (apply list (symbol op) ts)))
                     :else :untranslatable))))))
       :else :untranslatable)))
 
 (defn of-source-len
   "translate-len over a source STRING. `colls` is the set of collection var
-   names abstracted to length; `vars` the full state-var set."
+   names abstracted to length; `vars` the full state-var set. Returns form or
+   :untranslatable."
   [vars colls src]
   (if (nil? src) nil
     (translate-len vars colls (first (BeamLisp.Reader/read_string src)))))
@@ -373,7 +382,7 @@
   (not (untranslatable? (translate vars (first (BeamLisp.Reader/read_string src))))))
 
 (defn of-source
-  "Translate a source STRING (as model.bl stores guards/next) to SMT, or
+  "Translate a source STRING (as model.bl stores guards/next) to a FORM or
    :untranslatable. `vars` is a set of state-variable name strings.
    Prefer `of-node` when a clause node is in hand — it skips the re-read."
   [vars src]
@@ -382,7 +391,7 @@
     (translate vars (first (BeamLisp.Reader/read_string src)))))
 
 (defn of-node
-  "Translate a reader NODE (as model.bl now carries on a clause) to SMT, or
+  "Translate a reader NODE (as model.bl now carries on a clause) to a FORM or
    :untranslatable. The direct path: the node is already parsed, so unlike
    of-source there is no delaborate→re-read round-trip to lose fidelity through.
    The 3-arg form threads an enum `variants` map (keyword tag → constructor)."
@@ -427,31 +436,34 @@
                 (into [] arms))))
 
 (defn datatype-decl
-  "The (declare-datatypes …) prelude line for a variant `sort` over `arms`
+  "The (declare-datatypes …) FORM for a variant `sort` over `arms`
    {tag→payload-sort|nil}. A nullary arm is a bare constructor; a payload arm is
-   (Ctor (Ctor.val Sort)). All constructors sort-prefixed (no cross-sort clash)."
+   (Ctor (Ctor.val Sort)). All constructors sort-prefixed (no cross-sort clash).
+   Returns a form to be emitted."
   [sort arms]
-  (str "(declare-datatypes () ((" sort " "
-       (join " " (map (fn [pair]
-                        (let [k (first pair) psort (second pair)]
-                          (if (nil? psort)
-                            (variant-ctor sort k)
-                            (str "(" (variant-ctor sort k)
-                                 " (" (variant-field sort k) " " psort "))"))))
-                      (into [] arms)))
-       ")))\n"))
+  (list 'declare-datatypes
+        '()
+        (list (apply list (symbol sort)
+                      (map (fn [pair]
+                             (let [k (first pair) psort (second pair)]
+                               (if (nil? psort)
+                                 (symbol (variant-ctor sort k))
+                                 (list (symbol (variant-ctor sort k))
+                                       (list (symbol (variant-field sort k)) (symbol psort))))))
+                           (into [] arms))))))
 
 (defn of-source-variants
   "of-source with an enum `variants` map (tag string → constructor entry): the
    string-source sibling of the 3-arity of-node. Consumers holding a source
    string — veritas predicates — thread their datatypes through here.
-   :untranslatable when any form is outside the vocabulary."
+   Returns form or :untranslatable."
   [vars variants src]
   (if (nil? src) nil
     (translate vars variants (first (BeamLisp.Reader/read_string src)))))
 
 (defn of-node-len
-  "translate-len over a reader NODE — the node-direct sibling of of-source-len."
+  "translate-len over a reader NODE — the node-direct sibling of of-source-len.
+   Returns form or :untranslatable."
   [vars colls node]
   (if (nil? node) nil (translate-len vars colls node)))
 
@@ -466,6 +478,7 @@
 ;   (defn sign ([n] :when (pos? n) 1) ([n] :when (neg? n) -1) ([n] 0))
 ;   → (define-fun sign ((n Int)) Int (ite (> n 0) 1 (ite (< n 0) -1 0)))
 ; Any untranslatable guard or body ⇒ :untranslatable (never a false definition).
+; Returns a FORM or :untranslatable.
 
 (defn- clause-params
   "The param NAME strings of a parsed clause (its :params node list)."
@@ -478,27 +491,27 @@
   (last (:body pc)))
 
 (defn- fold-clauses
-  "Fold guarded clauses into a nested ite SMT string over `vars`. The LAST clause
+  "Fold guarded clauses into a nested ite SMT FORM over `vars`. The LAST clause
    is the else (its guard, if any, ignored — it is the fallthrough); each earlier
-   clause contributes (ite <guard> <body> <rest>). :untranslatable if any guard
-   or body is."
+   clause contributes (ite <guard> <body> <rest>) form. :untranslatable if any
+   guard or body is."
   [vars clauses]
   (if (empty? (rest clauses))
     ; last clause: just its body (the else arm)
     (of-node vars (last-body-node (first clauses)))
     (let [pc (first clauses)
-          g (if (nil? (:guard pc)) "true" (of-node vars (:guard pc)))
+          g (if (nil? (:guard pc)) true (of-node vars (:guard pc)))
           b (of-node vars (last-body-node pc))
           rest-smt (fold-clauses vars (rest clauses))]
       (if (or (untranslatable? g) (untranslatable? b) (untranslatable? rest-smt))
         :untranslatable
-        (str "(ite " g " " b " " rest-smt ")")))))
+        (list 'ite g b rest-smt)))))
 
 (defn defn->define-fun
   "Lower a defn SOURCE string to an SMT-LIB (define-fun name ((p Sort)…) Ret body)
-   over sort `ret-sort` (all params share it — the arithmetic common case). Folds
-   guarded clauses to nested ite. :untranslatable when the body leaves the
-   fragment. The returned string is a z3 prelude: assert a law over (name …)."
+   FORM over sort `ret-sort` (all params share it — the arithmetic common case).
+   Folds guarded clauses to nested ite. :untranslatable when the body leaves the
+   fragment. The returned form is a z3 prelude: assert a law over (name …)."
   [defn-src ret-sort]
   (let [node (first (BeamLisp.Reader/read_string defn-src))
         its (typed/node-items (typed/node-form node))
@@ -510,6 +523,10 @@
         body-smt (fold-clauses vars clauses)]
     (if (untranslatable? body-smt)
       :untranslatable
-      (str "(define-fun " name " ("
-           (join " " (map (fn [p] (str "(" p " " ret-sort ")")) params))
-           ") " ret-sort " " body-smt ")"))))
+      ; one shape for forms: eager lists — a lazy `(map …)` inside a form
+      ; is a half-realizable landmine for every consumer that walks it
+      (apply list 'define-fun (symbol name)
+             (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) params))
+             (symbol ret-sort)
+             (list body-smt)))))
+

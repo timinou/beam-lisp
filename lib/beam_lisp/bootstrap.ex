@@ -12,9 +12,12 @@ defmodule BeamLisp.Bootstrap do
   runs, so `enable_bl_backend/0` finds `BeamLisp.Ns.Compiler` on the code path
   and interns it from the beam (no compile, no genesis). The install is:
 
-    * VERIFIED   — every beam's sha256 must match the manifest, and the
-      manifest's `compiler_key` must match this toolchain's key. A mismatch
-      is a hard, actionable error, never a silent boot into a broken state.
+    * VERIFIED   — every beam's sha256 must match the manifest (a corrupt seed
+      is fatal). The manifest's `compiler_key` is advisory: a MATCH means the
+      seed beams are the finished, byte-identical compiler; a MISMATCH means the
+      seed is a valid PREVIOUS-generation compiler, staged to bootstrap the
+      rebuild (self-hosting: gen-N compiles gen-N+1). Either way the seed is
+      installed — there is no Elixir genesis behind it.
     * REPAIRING  — it runs on every build and overwrites a missing or drifted
       copy, so a half-populated `ebin` self-heals.
     * ATOMIC-ish — each beam is written to a temp name and renamed into place.
@@ -70,17 +73,98 @@ defmodule BeamLisp.Bootstrap do
     # genesis is finally deleted the seed becomes load-bearing and a mismatch
     # surfaces at compile time as a clear "compiler seed not loaded" error whose
     # fix is to regenerate the seed on this toolchain. Returns `:ok` when the
-    # seed was installed, `{:skipped, reason}` when it was not.
-    if key_matches?(manifest) do
-      Enum.each(manifest["modules"], fn {name, want_sha} ->
-        src = Path.join(seed_dir, name)
-        verify_seed_file!(src, name, want_sha)
-        install_one(src, Path.join(ebin, name), want_sha)
-      end)
+    # seed matched (finished compiler), `{:staged, reason}` when it was installed
+    # as a previous-generation bootstrap stage for the rebuild.
+    matches? = key_matches?(manifest)
 
+    # ALWAYS install the committed seed beams — on a match AND on a mismatch.
+    #
+    # A MATCH means the seed beams are byte-identical to what this toolchain
+    # produces, so they are the finished compiler: install and you are done.
+    #
+    # A MISMATCH (active development: compiler.bl or another hashed input changed
+    # since the seed was frozen) does NOT mean the seed is unusable — it is still
+    # a WORKING compiler of the PREVIOUS generation, and a self-hosted compiler
+    # is bootstrapped by the previous generation of itself. So we STAGE it: the
+    # gen-N seed is installed, boot interns it, and `compile.beam_lisp` uses it to
+    # rebuild the whole tree — including a fresh, correctly-keyed gen-N+1 compiler
+    # — from source. `stale?/2` (aot.ex) then sees the freshly built beams carry
+    # the current key and serves them; the staged seed beams for `compiler`/
+    # `reader` are overwritten by the rebuild. No Elixir genesis is needed on
+    # EITHER path — the seed is the floor the tower stands on.
+    #
+    # Integrity (sha256) is verified regardless: a corrupt seed is fatal, a
+    # merely-differently-keyed one is a valid bootstrap stage.
+    Enum.each(manifest["modules"], fn {name, want_sha} ->
+      src = Path.join(seed_dir, name)
+      verify_seed_file!(src, name, want_sha)
+      install_one(src, Path.join(ebin, name), want_sha)
+    end)
+
+    # Make the code server SEE the just-installed beams immediately. The build
+    # boots in THIS VM; a module the code server already resolved to
+    # `:non_existing` (before the seed was copied) stays cached as missing until
+    # explicitly (re)loaded, so `AOT.ensure_loaded/1` would rule the fresh seed
+    # beam absent and fall to the SOURCE path — which, with genesis gone, cannot
+    # compile it. Purge + load each installed module so the freshly written
+    # bytes are the live code before the first `ensure_loaded`.
+    Enum.each(manifest["modules"], fn {name, _sha} ->
+      mod = name |> Path.basename(".beam") |> String.to_atom()
+      beam_path = Path.join(ebin, name)
+      :code.purge(mod)
+      :code.load_binary(mod, String.to_charlist(beam_path), File.read!(beam_path))
+    end)
+
+    if matches? do
+      # A matching seed is the finished compiler; no staging trust needed.
+      Application.delete_env(:beam_lisp, :bootstrap_staging)
       :ok
     else
-      {:skipped, :compiler_key_mismatch}
+      # A mismatched seed was installed as a PREVIOUS-generation bootstrap
+      # stage. Record the namespaces it provides so the AOT drift gate trusts
+      # THOSE staged beams for interning (they are a valid compiler; their
+      # bytes need not match the current source — interning replays def VALUES,
+      # it does not recompile). The rebuild then produces fresh, correctly-keyed
+      # beams that supersede them, and the flag is cleared on the next matching
+      # install. Without this, the gate would rule the staged seed stale, route
+      # `compiler`/`reader-node` to the SOURCE path, and — with genesis gone —
+      # have nothing to compile them with.
+      staged_ns =
+        manifest["modules"]
+        |> Map.keys()
+        |> Enum.map(&seed_module_to_ns/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+
+      Application.put_env(:beam_lisp, :bootstrap_staging, staged_ns)
+      {:staged, :compiler_key_mismatch}
+    end
+  end
+
+  # Map a committed seed beam filename to the beam-lisp namespace it provides,
+  # or nil for a companion module (Body.*/Init.*) that is not a namespace of
+  # its own. `Elixir.BeamLisp.Ns.Compiler.beam` -> "compiler";
+  # `Elixir.BeamLisp.Ns.Reader-node.beam` -> "reader-node". Only the top-level
+  # `BeamLisp.Ns.<Name>` shims name a namespace; the drift gate keys on those.
+  defp seed_module_to_ns(filename) do
+    base = Path.basename(filename, ".beam")
+
+    case base do
+      "Elixir.BeamLisp.Ns." <> rest ->
+        if String.contains?(rest, ".") do
+          # Body.Compiler / Init.Compiler — companion module, not a namespace.
+          nil
+        else
+          # `Compiler` -> "compiler"; `Reader-node` -> "reader-node". Underscore
+          # each hyphen-separated CamelCase segment, then rejoin with hyphens,
+          # so a compound namespace segment keeps its `-`.
+          rest
+          |> String.split("-")
+          |> Enum.map_join("-", &Macro.underscore/1)
+        end
+
+      _ ->
+        nil
     end
   end
 

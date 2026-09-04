@@ -60,6 +60,28 @@ answer is closed. Three kinds, each with one home:
 There is no fourth "component state" tier to invent. Durable/shared → it's a
 fact. Ephemeral/private → it's a session datom or a local. That's it.
 
+### Truth ordering — LOG ⊐ FILE ⊐ IMAGE
+
+The same closure holds one level up, where *code* lives. Three things could
+claim to be the source of truth, and each is right at its own level:
+
+```
+  LOG    the facts — a session's messages, a claim/edit verdict, reload's
+         journal. Append-only, basis-addressed. Undo = a basis pointer.
+  FILE   a namespace source (.bl) or a livebook (.bl.md / .bl.org) — a FOLD
+         of the log. Tools own result + verdict spans; authors own the rest.
+  IMAGE  what is live — the fold of every file's sources through reload's
+         coherence gate (`priv/std/reload.bl`). Never written to directly.
+```
+
+This settles a tension two earlier texts left open (`livebook-maximalist.md`
+§9.2 "the file is the truth" vs. reload's "the image is the truth"): the file
+is the truth *of what to load*, the image is the truth *of what is running*,
+and the log is the truth *of what happened*. A structural edit therefore does
+three things in one transaction — appends to the log, splices the file at
+exactly one form's span, and stages the whole namespace through the gate —
+and a held bundle writes nothing anywhere.
+
 ---
 
 ## 3. The loop — one commit, N viewers converge

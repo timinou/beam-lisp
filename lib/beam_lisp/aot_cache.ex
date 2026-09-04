@@ -74,14 +74,22 @@ defmodule BeamLisp.AOTCache do
   # closure hashing cannot see them — hashing the tier globally is what keeps
   # the fine-grained tier sound. Moving a file INTO boot/ is how a namespace
   # becomes ambient; nothing else needs to change.
+  # The Elixir modules whose BYTES affect emitted code, so a change to any of
+  # them must rotate `compiler_key/0` (invalidate every AOT beam). These are the
+  # genuine codegen host: AOT driver, atom guard, the emitter, linker, native
+  # bridge, and the ns-module shell. `BeamLisp.Compiler` and `BeamLisp.Reader`
+  # are NOT here: since the genesis cutover they are thin FACADES that delegate
+  # to the self-hosted `BeamLisp.Ns.Compiler` / `BeamLisp.Ns.Reader` (whose
+  # source, `priv/boot/{compiler,reader}.bl`, is already hashed as a tier-1
+  # toolchain source below). Hashing the facades would rotate the key on a mere
+  # doc/plumbing edit that cannot change a single emitted byte.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
     BeamLisp.Emit,
     BeamLisp.Link,
     BeamLisp.Native,
-    BeamLisp.Ns,
-    BeamLisp.Reader
+    BeamLisp.Ns
   ]
 
   @doc "Whether the cache participates in compilation. Default on."
@@ -97,6 +105,28 @@ defmodule BeamLisp.AOTCache do
     case System.get_env(@env_dir) do
       nil -> :filename.basedir(:user_cache, ~c"beam_lisp") |> Path.join("aot")
       dir -> dir
+    end
+  end
+
+  @doc """
+  The backend that lowers a namespace's body modules to `.beam`: `:core`
+  (bl-ANF -> Core Erlang, via `self.core`) or `:elixir` (the genesis Elixir
+  compiler). Default `:core` (PLAN-081 step 3 flip): a full-tree Core build is
+  proven clean, byte-reproducible, and behaviourally identical to Elixir (the
+  regression stays at baseline under either backend). Opt back to the Elixir
+  compiler per-run with `config :beam_lisp, :aot_backend, :elixir` — it stays
+  fully supported as the genesis path and the differential-oracle yardstick.
+
+  It lives here, not in `BeamLisp.AOT`, because `compiler_key/0` must fold it in
+  (a Core-built beam and an Elixir-built beam of the same source are different
+  bytes, so they MUST get different toolchain keys or the cache would serve one
+  for the other) and this module computes the key before `BeamLisp.AOT` is even
+  a concern. `BeamLisp.AOT` reads the same value so build and key agree.
+  """
+  def aot_backend do
+    case Application.get_env(:beam_lisp, :aot_backend, :core) do
+      :elixir -> :elixir
+      _ -> :core
     end
   end
 
@@ -117,6 +147,16 @@ defmodule BeamLisp.AOTCache do
     end
   end
 
+  @doc """
+  Compute the compiler key WITHOUT the persistent_term memo — the live value
+  for the CURRENT toolchain sources on disk. `compiler_key/0` caches its first
+  computation for the VM's life (correct: codegen + tier-1 sources are constant
+  under a running node); the daemon uses THIS to detect that the checkout it
+  serves has drifted from the sources it booted with, which must force a
+  restart, not a stale reuse.
+  """
+  def current_compiler_key, do: compute_compiler_key()
+
   @doc false
   # Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
   # The key is a VM-constant in normal use (codegen beams + tier-1 sources do
@@ -134,24 +174,28 @@ defmodule BeamLisp.AOTCache do
     parts = [
       "beam_lisp:#{vsn}",
       "elixir:#{System.version()}",
-      "otp:#{:erlang.system_info(:otp_release)}"
+      "otp:#{:erlang.system_info(:otp_release)}",
+      # The BACKEND is part of the toolchain: a Core-built beam and an
+      # Elixir-built beam of the same source are different bytes, so they must
+      # land under different keys or the shared cache would serve one where the
+      # other belongs. Flipping `:aot_backend` rotates every beam's key exactly
+      # like a codegen change, which is what it is.
+      "aot_backend:#{aot_backend()}"
     ]
 
     beams =
       Enum.flat_map(@codegen_modules, fn mod ->
-        case :code.which(mod) do
-          path when is_list(path) ->
-            # An escript's :code.which/1 reports a VIRTUAL archive path
-            # (`<script>/<app>/ebin/M.beam`) that no filesystem backs —
-            # same shape as the missing-priv_dir fallback below. Degrade
-            # the key instead of crashing the compile.
-            case File.read(path) do
-              {:ok, bin} -> [bin]
-              _ -> []
-            end
-
-          _ ->
-            []
+        # `:code.get_object_code/1` answers the module's bytes wherever the
+        # code server found them — a real ebin OR an escript archive. Reading
+        # `:code.which/1`'s path with `File.read` fails inside an escript (the
+        # path is virtual), which silently dropped every codegen beam from the
+        # key, so a packaged `bl` computed a DIFFERENT key from the build that
+        # stamped its beams and treated its whole stdlib as stale — 80s boots
+        # from source, or a refusal under BEAM_LISP_AOT_STRICT. Degrade (never
+        # crash) when a module is genuinely absent.
+        case :code.get_object_code(mod) do
+          {^mod, bin, _path} -> [bin]
+          _ -> []
         end
       end)
 
@@ -178,9 +222,27 @@ defmodule BeamLisp.AOTCache do
   # dir contributes nothing (degrade, never crash) — the missing compiler then
   # surfaces as a compile error downstream, not here.
   defp toolchain_source_contents do
-    BeamLisp.Tiers.boot_dir()
-    |> Path.join("**/*.bl")
-    |> Path.wildcard()
+    boot =
+      BeamLisp.Tiers.boot_dir()
+      |> Path.join("**/*.bl")
+      |> Path.wildcard()
+
+    # Under the Core backend, `priv/self/` (self.core + self.anf) is ALSO tier-1:
+    # it lowers every body module, so a change there alters every emitted byte,
+    # exactly like a change to `priv/boot/compiler.bl`. Hash it into the key so
+    # editing the Core backend invalidates all Core beams. Under `:elixir` the
+    # self/ tier does not run, so it is left out (its edits are then correctly
+    # irrelevant to the Elixir toolchain key).
+    self =
+      if aot_backend() == :core do
+        BeamLisp.Tiers.priv_root()
+        |> Path.join("self/**/*.bl")
+        |> Path.wildcard()
+      else
+        []
+      end
+
+    (boot ++ self)
     |> Enum.sort()
     |> Enum.map(&File.read!/1)
   end

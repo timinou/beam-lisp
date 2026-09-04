@@ -1,114 +1,146 @@
 # Self-hosting beam-lisp
 
-*How the language came to be written in itself — from zero context.*
+*How the language is written in itself — from zero context.*
 
 ## What "self-hosting" means here
 
-beam-lisp is a Lisp that runs on the BEAM (the Erlang virtual machine). You
-write Clojure-shaped code — `(map inc [1 2 3])` — and it runs with Erlang's
-processes, supervision, and hot code loading underneath.
+beam-lisp is a Lisp on the BEAM (the Erlang virtual machine). You write
+Clojure-shaped code — `(map inc [1 2 3])` — and it runs with Erlang's processes,
+supervision, and hot code loading underneath.
 
-Originally, the machinery that turned your beam-lisp text into a running program
-was written in **Elixir**: a *reader* (text → data) and a *compiler* (data →
-Elixir syntax tree, which Elixir then turns into BEAM bytecode). So the language
-was described in a different language.
+The machinery that turns your beam-lisp text into a running program is itself
+written in beam-lisp:
 
-Self-hosting means: **that machinery is now written in beam-lisp itself.** The
-reader is `priv/boot/reader.bl`. The compiler is `priv/boot/compiler.bl`. They are
-beam-lisp programs that read and compile beam-lisp.
+- the **reader** (text → data) is `priv/boot/reader.bl`
+- the **compiler** (data → Core Erlang → BEAM bytecode) is `priv/boot/compiler.bl`
+
+They are beam-lisp programs that read and compile beam-lisp. There is no Elixir
+compiler or reader for the language — the code you edit to change how the
+language works is `.bl`.
+
+## The path from source to bytecode
+
+```
+source text
+   │  reader.bl            (text → reader forms)
+   ▼
+reader forms
+   │  compiler.bl          (forms → bl-ANF, a small neutral IR)
+   ▼
+bl-ANF
+   │  self/core.bl         (bl-ANF → Core Erlang)
+   ▼
+Core Erlang
+   │  :compile.forms       (Core Erlang → .beam)  ← an Erlang/OTP stdlib call
+   ▼
+BEAM bytecode
+```
+
+Every arrow except the last is beam-lisp source. The last arrow is the BEAM's
+own code generator, reached through one Erlang stdlib call — that IS the native
+backend, and reusing it is the whole point (beam-lisp writes the missing middle,
+not a new machine-code emitter).
+
+Core Erlang is the target because it is the BEAM's simplest real input: a tiny,
+well-specified functional core the Erlang compiler accepts directly. The same
+bl-ANF middle is designed to feed other backends later (an MLIR/LLVM path)
+without touching the compiler front end.
 
 ## What stays Elixir, and why that is correct
 
-Not everything leaves Elixir, and that is the design, not a compromise:
+Not everything is beam-lisp, and that is the design, not a compromise:
 
-- **The final lowering** — turning the Elixir syntax tree the compiler produces
-  into actual bytecode — is `Code.eval_quoted`, an Elixir standard-library call.
-  We keep it deliberately. It IS the BEAM's compiler; rewriting it would delete
-  the project's whole thesis (that Elixir's compiler is already a native-code
-  backend with a homoiconic AST, so beam-lisp only needs the missing middle).
+- **The final code generator** — `:compile.forms` / the Erlang compiler — turns
+  Core Erlang into bytecode. It is the BEAM's compiler; rewriting it would delete
+  the thesis.
 - **The OTP host** — the application, supervisor, and `mix` tasks that start the
-  VM — stays Elixir. That is the process that *runs* the language, not the
-  language, exactly as Clojure keeps a JVM launcher.
-- **A frozen `.beam` seed** — the AOT-compiled reader+compiler — breaks the
-  one irreducible circularity: you cannot read the reader without a reader, or
-  compile the compiler without a compiler. Every self-hosted language ships a
-  seed. Ours is `Elixir.BeamLisp.Ns.Compiler.beam`, built on every `mix`
-  compile.
+  VM — is the process that *runs* the language, not the language, exactly as
+  Clojure keeps a JVM launcher.
+- **The runtime substrate** — the `rt` primitives and the persistent `Vector`,
+  `Set`, `Env` — is benchmark-exempt substrate the compiler leans on for speed
+  (`first` runs on the hottest path). It migrates only if a `.bl` version is as
+  fast, so it stays until a benchmark earns the move.
+- **A thin facade** — `lib/beam_lisp/compiler.ex` and `reader.ex` are ~230 lines
+  total, holding no compiler logic. They keep the well-known module names
+  (`BeamLisp.Compiler.eval_string/3`, `BeamLisp.Reader.read_one/1`) that host
+  code calls, map the reader's errors onto host exception types, and run the
+  boot step. Every entry point delegates straight to `BeamLisp.Ns.Compiler` /
+  `BeamLisp.Ns.Reader`, the modules compiled from the `.bl` source.
 
-So the floor is: one stdlib call + Erlang/OTP + a build artifact. Nothing about
-the *language* is maintained in Elixir.
+So the floor is: one Erlang stdlib call + Erlang/OTP + the runtime substrate + a
+name-keeping shell. Nothing about the *language* lives in Elixir.
 
-## How it was built: prototype by prototype, graded by an oracle
+## The seed: how a language compiles itself
 
-The old Elixir compiler still works, so it is the **answer key**. Every piece of
-the new compiler was checked by feeding the same input to both and asserting
-they produce the **same Elixir syntax tree**. This "differential oracle"
-(`priv/self/oracle.bl`) gated every step, so a mistake failed a check instead of
-shipping.
+There is one irreducible circularity: you cannot compile `compiler.bl` without a
+compiler, or read `reader.bl` without a reader. Every self-hosting language
+breaks it the same way — with a **checked-in compiled artifact**, the seed.
 
-The build climbed one feature at a time (each with a runnable gate under
-`research/shN_*/`):
+The seed is `priv/bootstrap/seed/`: the whole `priv/boot` toolchain
+(compiler, reader, reader-node, core, sugar, the build system) as Core-Erlang
+`.beam` files, plus a manifest of their hashes and the toolchain key they were
+built under. It is committed to git, and it is byte-reproducible — a fresh build
+of the current source produces exactly these bytes.
 
-| step | what it added |
-|---|---|
-| P0 | the seed round-trips: a tiny `.bl` compiler runs in a bare `erl` VM |
-| P1 | the shared "what is a form" vocabulary (`reader-node.bl`) |
-| P2 | the reader (`reader.bl`) — 308/309 files read identically |
-| P3–P9 | **every ~35 special forms** — literals, calls, `let`/`loop`/`recur`, `fn`/`defn` + full destructuring + guards, `def` + var-linking, macros + syntax-quote + hygiene, `defmulti`/`defprotocol`/`defrecord`/`reify`, `defserver` (a real gen_server), `try`/`receive`, `ns` |
-| CK1 | **the whole standard library compiles**: 932/932 top-level forms, byte-identical |
-| P12 | the compiler analyzes itself — a datalog query answers "what breaks if I change this?" |
+At boot, `BeamLisp.Bootstrap` copies the seed into the build's code path and the
+language interns it from those bytes — no compile, no bootstrap language. From
+there the toolchain is live and rebuilds everything else.
 
-## The proofs that it is real
+### Editing the compiler: the staging ladder
 
-- **932/932** — every top-level form of the entire prelude compiles to the same
-  syntax tree as the old compiler (`research/sh_checkpoint1/`).
-- **The fixpoint holds** — the `.bl` compiler compiles ITS OWN SOURCE
-  identically: `compile(compiler-source) ≡ oracle(compiler-source)`. The
-  compiler reproduces itself (`research/sh13_cutover/fixpoint.bl`).
-- **It runs** — not just matching trees: the compiler's output is evaluated and
-  produces correct values (`(loop [i 0 acc 0] …) → 45`)
-  (`research/sh12_selfanalysis/end_to_end.bl`).
-- **34 native tests** — the compiler's test suite is itself beam-lisp
-  (`test/bl/self_hosting_test.bl`, `mix beam_lisp.test`).
+When you edit `compiler.bl` (or any boot source), its toolchain key changes, so
+the committed seed no longer matches. That is fine: the seed is still a *working
+compiler of the previous generation*, and a self-hosting compiler is
+bootstrapped by the previous generation of itself. `Bootstrap.install!` STAGES
+the seed — installs it as gen-N — and the build uses it to compile your edited
+gen-N+1 source into fresh, correctly-keyed beams that supersede it.
+
+To bless a new generation as the committed floor, rebuild and regenerate:
+
+```
+mix compile.beam_lisp
+mix run priv/bootstrap/gen_manifest.exs   # copies the fresh boot beams → seed/
+```
+
+Git history is the ultimate recovery floor: any past seed is a `git checkout`
+away.
+
+## Backends: Core Erlang by default
+
+`:aot_backend` selects how a namespace's functions are lowered:
+
+- `:core` (default) — bl-ANF → Core Erlang → `.beam`. No Elixir compiler on the
+  path. Proven reproducible and behaviourally identical to the Elixir path.
+- `:elixir` — the legacy path via Elixir's AST. Kept available with
+  `config :beam_lisp, :aot_backend, :elixir`.
+
+A Core-built beam and an Elixir-built beam of the same source get different
+toolchain keys, so the AOT cache never serves one for the other.
+
+## Packaging
+
+`mix release` is the one supported packaging tier, wrapped by `mix bl.build`
+(which also packs the native tier into a self-extracting `bl` drop). An escript
+is deliberately not built: it is a single BEAM archive with no way to carry
+native artifacts (the `defnative` Rust NIFs, z3, Explorer), so it can never
+package a full beam-lisp.
 
 ## The mind-blowing part: the compiler is a program the language reasons about
 
-Because the compiler is now beam-lisp source, the language's own tools consume
-it:
+Because the compiler is beam-lisp source, the language's own tools consume it:
 
-- `codebase` indexes `compiler.bl` into a datom database — 121 functions, zero
-  arity mismatches. *"What breaks if I change `compile-body`?"* is a datalog
-  query returning its 8 callers (`examples/self/compiler-as-codebase.bl`).
-- The **optimizer becomes a set of datalog queries** over the program-as-facts:
-  "functions called exactly once" (inline candidates), "functions never called"
-  (dead code — which found real unused helpers in the compiler itself).
-- AST passes (line-stamping) become **optics traversals** — `path + transform`,
+- `codebase` indexes `compiler.bl` into a datom database; *"what breaks if I
+  change `compile-body`?"* is a datalog query over its callers
+  (`examples/self/compiler-as-codebase.bl`).
+- Optimizer questions become datalog queries over the program-as-facts:
+  functions called once (inline candidates), functions never called (dead code).
+- AST passes (line-stamping) are optics traversals — `path + transform`,
   composable, not hand-rolled recursion.
-
-Self-hosting closes a loop: the analysis tools and the compiler now meet — the
-compiler is the first large program the language reasons about about itself.
-
-## The remaining work (honest status)
-
-- **The runtime cutover** — making the live `Compiler.compile/2` delegate to
-  `compiler.bl` and deleting the ~2400 lines of Elixir lowering — is scoped and
-  de-risked (the fixpoint is the green light) but deserves a dedicated session
-  with the full `mix test` as the per-step gate, because it modifies the
-  load-bearing compiler. The recipe is in `research/sh13_cutover/README.md`. The
-  one dependency to resolve: `compiler.bl` calls back into `macroexpand_1`, so a
-  thin `Compiler` module (`compile` delegating + `macroexpand_1` + `new_env` +
-  `read_all_data`) stays; the rest moves to `bootstrap/genesis/`.
-- **The runtime substrate** (the 335 `rt` primitives, the persistent Vector) is
-  *deliberately* retained as benchmark-exempt substrate: `first` is called 140×
-  by the compiler itself, on the hottest path. Porting it to `.bl` and AOT-
-  linking produces the same BEAM code but adds a bootstrap-ordering hazard, so
-  by the project's own floor principle ("substrate migrates only if `.bl`-
-  expressible without a benchmarked perf loss") it stays until a benchmark
-  earns the move. The cutover does not touch it.
 
 ## In one sentence
 
-beam-lisp's reader and compiler are now written in beam-lisp, compile the
-language's entire standard library byte-identically, reproduce themselves, and
-are analyzed by the language's own tools — with Elixir kept, on purpose, as the
-final AST→BEAM step and the OTP host.
+beam-lisp's reader and compiler are beam-lisp programs that lower the language
+to Core Erlang, boot from a byte-reproducible committed seed, bootstrap each new
+edit from the previous seed generation, and are analyzed by the language's own
+tools — with Erlang/OTP kept, on purpose, as the final Core-Erlang→BEAM step and
+the host.

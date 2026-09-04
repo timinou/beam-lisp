@@ -362,8 +362,10 @@ Phase 1 (§§1–8, shipped) makes the document a first-class program: `.bl.md`
 and `.bl.org` slice into cells, run into one namespace, and write back only
 their result spans. Nothing above needs a browser. Phase 2 puts a **live
 editor** in front of that same document — and the design rule is that the
-editor changes *nothing* about the covenant. The file on disk stays the truth;
-the editor is one more renderer that can also emit facts.
+editor changes *nothing* about the covenant. The file on disk stays the truth
+*of what to load* (the full ordering is LOG ⊐ FILE ⊐ IMAGE —
+`live-architecture.md` §2); the editor is one more renderer that can also
+emit facts.
 
 ### 9.1 Why Lexical, and what "the shim" means
 
