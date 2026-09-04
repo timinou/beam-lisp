@@ -50,24 +50,17 @@ defmodule BeamLisp.MixProject do
 
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      # `bl` — the language's own executable. An escript is the BEAM's
-      # native single-file packaging (an archive of .beam files behind an
-      # #! header, loaded by any OTP installation). The main_module is the
-      # AOT-compiled CLI namespace ITSELF — no Elixir floor: the escript
-      # apply enters BeamLisp.Ns.Bl.Cli.main/1, which boots the substrate
-      # (AOT.boot) and dispatches, all in beam-lisp (priv/std/bl/cli.bl).
-      # Native accelerators (the defnative Rust crates, Explorer/Polars,
-      # z3) are NIFs and cannot ride in an escript archive — pure-language
-      # code is unaffected; those paths degrade or need a checkout/release.
-      # `strip_beams: false` for the SAME reason the release below says it:
-      # stripping re-stamps the codegen modules, whose bytes hash into the
-      # toolchain key, so a stripped `bl` computes a key its own beams were
-      # not stamped with and reads its entire stdlib as stale — an 80s boot
-      # from source (or a refusal under BEAM_LISP_AOT_STRICT=1).
-      escript: [name: "bl", main_module: BeamLisp.Ns.Bl.Cli, strip_beams: false],
-      # `mix release` — the ERTS-carrying packaging tier (the `bl` escript
-      # needs an OTP install; a release does not). Default settings, no
-      # Burrito step: wrap only if the self-extracting UX is wanted.
+      # PACKAGING — `mix release` is the ONE supported tier. escript is
+      # DEPRECATED and intentionally not configured: an escript is a single
+      # BEAM archive behind a #! header with NO way to carry native artifacts,
+      # and a full beam-lisp ships native extensions (defnative → Rust crate
+      # NIFs, Explorer/Polars, z3, drop-packed binaries). Only a release
+      # packages the whole language — ERTS + priv/ + the native artifacts —
+      # so it is the only build that yields a complete, runnable `bl`.
+      #
+      # `mix release bl` — the ERTS-carrying packaging tier (self-contained;
+      # no host OTP install needed). Default settings, no Burrito step: wrap
+      # only if the self-extracting UX is wanted.
       releases: [bl: [
         include_executables_for: [:unix],
         # Do NOT strip beams: stripping re-stamps every module, so the AOT

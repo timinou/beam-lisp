@@ -133,6 +133,30 @@ defmodule BeamLisp do
       # built on it, so core must come first (list order).
       # sugar.bl is a THIRD layer: the threading/cond macros (cond->, some->,
       # condp, doto, fnil, …), kept out of core.bl to hold its size down but
+      # SELF-HOST CUTOVER — intern the .bl compiler + reader FROM THEIR BEAMS
+      # FIRST, before any boot-time compile. Once `compiler`/`reader` are
+      # interned, `compile/2` and `read_string/2` delegate every form to the
+      # self-hosted `.bl` toolchain (BeamLisp.Ns.Compiler / BeamLisp.Ns.Reader),
+      # so the prelude eval below and the `@data_readers` eval run through the
+      # LANGUAGE, never the Elixir genesis path. Interning replays already-built
+      # def VALUES from the beam — no compilation, so it needs only RT.seed_core/0
+      # (done above), not the .bl prelude. On a tree with no compiler beam
+      # (a from-source bootstrap) these are no-ops: the ns stays un-interned and
+      # the staged seed installer (BeamLisp.Bootstrap) is what supplies the beam.
+      # A load failure degrades to whatever backend is configured; boot never
+      # breaks. (`:compiler_backend`/`:reader_backend :genesis` opt out.)
+      try do
+        BeamLisp.Compiler.enable_bl_backend()
+      rescue
+        _ -> :genesis
+      end
+
+      try do
+        BeamLisp.Reader.enable_bl_reader()
+      rescue
+        _ -> :genesis
+      end
+
       # loaded by default and referred everywhere (see BeamLisp.Env's `sugar`
       # fallback). Loads after core (it is pure macros over core) and after
       # multi, mirroring the AOT-first / source-fallback handling of both.
@@ -154,36 +178,6 @@ defmodule BeamLisp do
       Compiler.eval_string(@data_readers, Compiler.new_env("core"))
 
       Env.mark_seeded()
-
-      # Cutover: route the compiler through the self-hosted beam-lisp compiler
-      # (priv/boot/compiler.bl) now that the prelude it needs is seeded. On a tree
-      # where the compiler beam is built this flips `Compiler.compile/2` onto
-      # the .bl compiler VM-wide; on a fresh tree the seed is absent and this
-      # is a no-op, so boot still works via the genesis Elixir compiler (which
-      # is what builds the seed). Never lets a compiler-load failure break boot.
-      try do
-        BeamLisp.Compiler.enable_bl_backend()
-      rescue
-        _ -> :genesis
-      end
-
-      # Reader cutover: route `Reader.read_string/2` through the self-hosted
-      # beam-lisp reader (priv/boot/reader.bl) for every later read — the language
-      # reads itself. Same shape and safety as the compiler cutover above:
-      # idempotent, forced to the genesis reader while reader.bl's OWN source is
-      # being read (the language never reads its tail with its half-built
-      # reader), and a load failure degrades to genesis instead of breaking
-      # boot. The differential corpus gates the flip: every .bl file in the
-      # repo, read by both readers position-bearing and byte-compared, is
-      # 419/419 identical — plus the parity, position, atom-guard and cutover
-      # suites. `:reader_backend :genesis` in app env opts back out (rebuild
-      # escape hatch); reader.ex stays as the bootstrap seed and the oracle
-      # yardstick either way, exactly like compiler.ex.
-      try do
-        BeamLisp.Reader.enable_bl_reader()
-      rescue
-        _ -> :genesis
-      end
 
       Env.in_ns("user")
     end

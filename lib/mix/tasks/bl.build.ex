@@ -23,9 +23,12 @@ defmodule Mix.Tasks.Bl.Build do
     * `--skip-cargo`   reuse a previously built launcher/pack tool
     * `--target T`     cross-target (`linux/x86_64` etc.; needs per-target NIFs)
 
-  The escript (`mix escript.build`) remains for now as a legacy path; it is
-  **deprecated** — it cannot carry NIFs (z3/datom), and cold-loads its archive
-  in tens of seconds. Prefer `mix bl.build`.
+  The escript path is **removed** (no `escript:` in mix.exs): an escript is a
+  single BEAM archive with no way to carry native artifacts (z3/datom NIFs,
+  Explorer/Polars, drop-packed binaries), so it can never package a full
+  beam-lisp. `mix release` — which this task wraps — is the only supported
+  packaging tier: it carries ERTS + priv/ + the native tier. `mix bl.build`
+  is the one command that produces a shippable `bl`.
   """
 
   use Mix.Task
