@@ -18,16 +18,23 @@ defmodule BeamLisp.Reader do
   DELETED. A genesis-less tree boots the reader from the committed Core-Erlang
   seed (`priv/bootstrap/seed/`, installed by `BeamLisp.Bootstrap`).
 
-  The facade keeps two things beyond pure delegation, both host glue, not
-  reader semantics:
+  ## Errors: the language owns its own type
 
-    * the `BeamLisp.Reader.SyntaxError` / `BeamLisp.Reader.AtomLimitError`
-      exception structs the host raises, and the mapping from the `.bl` reader's
-      internal errors (`BeamLisp.ExInfo`, `BeamLisp.AtomGuard.LimitError`) onto
-      them — done once in `mapping_host_errors/1` — so Elixir callers keep
-      `assert_raise`-ing the same types;
-    * `enable_bl_reader/0`, the boot step that interns the reader ns from its
-      beam.
+  A malformed source raises `BeamLisp.Reader.SyntaxError`, and the `.bl` reader
+  raises THAT struct itself (`reader.bl`'s `syntax-error` does
+  `(erlang/error (BeamLisp.Reader.SyntaxError/exception msg))`). So the facade
+  does NOT translate reader errors — the type is the language's own contract,
+  the same struct Elixir callers `assert_raise` on, raised at the source.
+
+  One error the facade DOES still map is `BeamLisp.AtomGuard.LimitError`. That is
+  not a reader concern: it is the host VM's atom-table high-water valve
+  (`BeamLisp.AtomGuard`), raised from Elixir infrastructure that the reader runs
+  *inside*, before a keyword/symbol can be interned. It is surfaced to callers as
+  `BeamLisp.Reader.AtomLimitError` — a distinct type from a syntax error, so a
+  test can assert exactly which failure it provoked. `mapping_atom_limit/1` is
+  the one remaining host-glue seam.
+
+  `enable_bl_reader/0` is the boot step that interns the reader ns from its beam.
   """
 
   @reader_ns BeamLisp.Ns.Reader
@@ -36,37 +43,34 @@ defmodule BeamLisp.Reader do
   Read binary `source` into position-bearing reader forms, attributed to `file`.
 
   THE reader entry every caller funnels through. Delegates to the self-hosted
-  reader; maps its internal errors onto the host exception types.
+  reader, which raises `BeamLisp.Reader.SyntaxError` itself on malformed input.
   """
   @spec read_string(String.t()) :: [term]
   @spec read_string(String.t(), binary | nil) :: [term]
   def read_string(source, file \\ nil) when is_binary(source) do
-    mapping_host_errors(fn -> apply(@reader_ns, :read_string, [source, file]) end)
+    mapping_atom_limit(fn -> apply(@reader_ns, :read_string, [source, file]) end)
   end
 
   @doc "Read `source` into a list of BARE reader forms (positions stripped)."
   @spec read_all(String.t()) :: [term]
   def read_all(source) when is_binary(source) do
-    mapping_host_errors(fn -> apply(@reader_ns, :read_all, [source]) end)
+    mapping_atom_limit(fn -> apply(@reader_ns, :read_all, [source]) end)
   end
 
   @doc "Read exactly one bare form from `source`; raise if zero or many."
   @spec read_one(String.t()) :: term
   def read_one(source) when is_binary(source) do
-    mapping_host_errors(fn -> apply(@reader_ns, :read_one, [source]) end)
+    mapping_atom_limit(fn -> apply(@reader_ns, :read_one, [source]) end)
   end
 
-  # Run `fun`, translating the `.bl` reader's internal error structs into the
-  # host-facing `BeamLisp.Reader.*` exceptions callers assert on. The one place
-  # the host↔language error boundary is crossed.
-  defp mapping_host_errors(fun) do
+  # Run `fun`, surfacing the host VM's atom-table guard as the reader-facing
+  # `AtomLimitError`. A `SyntaxError` from the `.bl` reader passes through
+  # untouched — the language already raises the right type.
+  defp mapping_atom_limit(fun) do
     fun.()
   rescue
     e in BeamLisp.AtomGuard.LimitError ->
       reraise BeamLisp.Reader.AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
-
-    e in BeamLisp.ExInfo ->
-      reraise BeamLisp.Reader.SyntaxError, [message: Exception.message(e)], __STACKTRACE__
   end
 
   @doc """
