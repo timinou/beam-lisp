@@ -133,17 +133,28 @@ defmodule BeamLisp do
       # built on it, so core must come first (list order).
       # sugar.bl is a THIRD layer: the threading/cond macros (cond->, some->,
       # condp, doto, fnil, …), kept out of core.bl to hold its size down but
-      # SELF-HOST CUTOVER — intern the .bl compiler + reader FROM THEIR BEAMS
-      # FIRST, before any boot-time compile. Once `compiler`/`reader` are
-      # interned, `compile/2` and `read_string/2` delegate every form to the
-      # self-hosted `.bl` toolchain (BeamLisp.Ns.Compiler / BeamLisp.Ns.Reader),
-      # so the prelude eval below and the `@data_readers` eval run through the
-      # LANGUAGE, never the Elixir genesis path. Interning replays already-built
-      # def VALUES from the beam — no compilation, so it needs only RT.seed_core/0
-      # (done above), not the .bl prelude. On a tree with no compiler beam
-      # (a from-source bootstrap) these are no-ops: the ns stays un-interned and
-      # the staged seed installer (BeamLisp.Bootstrap) is what supplies the beam.
-      # A load failure degrades to whatever backend is configured; boot never
+      # loaded by default and referred everywhere (see BeamLisp.Env's `sugar`
+      # fallback). Loads after core (it is pure macros over core) and after
+      # multi, mirroring the AOT-first / source-fallback handling of both.
+      for {ns, source} <- [{"core", @prelude}, {"multi", @multi}, {"sugar", @sugar}] do
+        case BeamLisp.AOT.ensure_loaded(ns) do
+          :loaded -> :ok
+          :no_module -> Compiler.eval_string(source, Compiler.new_env("core"))
+        end
+      end
+
+      # SELF-HOST CUTOVER — the prelude (core/multi/sugar) is now seeded, so the
+      # .bl compiler's own runtime deps (`list`, `reduce`, the sugar macros)
+      # resolve. Intern the .bl compiler + reader FROM THEIR BEAMS now, BEFORE
+      # the `@data_readers` eval below: once interned, `compile/2` and
+      # `read_string/2` delegate every later form to the self-hosted toolchain
+      # (BeamLisp.Ns.Compiler / BeamLisp.Ns.Reader), so `@data_readers` — which
+      # opens with `(ns data-readers)` and needs the compiler's special-forms —
+      # runs through the LANGUAGE, not the Elixir genesis path. Interning replays
+      # already-built def VALUES from the beam (no compilation). On a from-source
+      # tree with no compiler beam these are no-ops: the ns stays un-interned and
+      # `@data_readers` compiles via genesis, which is exactly what a bootstrap
+      # build does. A load failure degrades to the configured backend; boot never
       # breaks. (`:compiler_backend`/`:reader_backend :genesis` opt out.)
       try do
         BeamLisp.Compiler.enable_bl_backend()
@@ -155,16 +166,6 @@ defmodule BeamLisp do
         BeamLisp.Reader.enable_bl_reader()
       rescue
         _ -> :genesis
-      end
-
-      # loaded by default and referred everywhere (see BeamLisp.Env's `sugar`
-      # fallback). Loads after core (it is pure macros over core) and after
-      # multi, mirroring the AOT-first / source-fallback handling of both.
-      for {ns, source} <- [{"core", @prelude}, {"multi", @multi}, {"sugar", @sugar}] do
-        case BeamLisp.AOT.ensure_loaded(ns) do
-          :loaded -> :ok
-          :no_module -> Compiler.eval_string(source, Compiler.new_env("core"))
-        end
       end
 
       # Seed the built-in tagged-literal registry (`#d`, `#time`) from source,
