@@ -122,7 +122,7 @@ defmodule BeamLisp.WebSocket do
   Build the adapter's initial state from a beam-lisp handler map and a
   user init argument. Used by the `websocket` bl namespace at upgrade time.
   """
-  def wrap(handlers, user_state) when is_map(handlers) do
+  def wrap(handlers, user_state) when is_map(handlers) and not is_struct(handlers) do
     # bl keyword map keys are inconsistent across the atom-table boundary: a
     # single-word `:init` interns as the atom `:init`, but a hyphenated
     # `:handle-in` arrives as the string "handle-in". Normalize every key to a
