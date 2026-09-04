@@ -184,7 +184,14 @@ defmodule BeamLisp.AOT do
   def ensure_loaded(ns) when is_binary(ns) do
     mod = Link.module_for(ns)
 
-    if code_path_module?(mod) and Code.ensure_loaded?(mod) and
+    # `Code.ensure_loaded?/1` is authoritative: it loads the module from the
+    # code path (or confirms it in memory) and answers true/false. The older
+    # `code_path_module?/1` (`:code.which/1`) pre-check is dropped: after a fresh
+    # `Bootstrap.install!/1` copies a seed beam into ebin, `:code.which/1` can
+    # still answer `:non_existing` from a cache populated before the copy, which
+    # false-negatived the whole AOT branch and dropped a valid seed beam to the
+    # (now genesis-less) SOURCE path. `Code.ensure_loaded?/1` reflects reality.
+    if Code.ensure_loaded?(mod) and
          function_exported?(mod, :__bl_init__, 0) do
       # Fast path BEFORE the lock: require cycles (A's __bl_init__ requires
       # A) are cut by the mark-first protocol below, and that cut must not
@@ -1065,8 +1072,6 @@ defmodule BeamLisp.AOT do
     end
   end
 
-  defp code_path_module?(mod), do: :code.which(mod) != :non_existing
-
   # DRIFT GATE (Wave 1 / L2). A compiled beam is trusted only when it still
   # matches the source it was built from. Reads the beam's `__bl_provenance__/0`
   # stamp (source hash + toolchain key) and compares to the LIVE source.
@@ -1089,6 +1094,34 @@ defmodule BeamLisp.AOT do
   # tar, and hardlinks; the content hash survives all of them and equals the Mix
   # manifest's own hash for the same bytes.
   defp stale?(ns, mod) do
+    cond do
+      # BOOTSTRAP STAGING: a mismatched committed seed was installed as a
+      # previous-generation bootstrap stage (BeamLisp.Bootstrap.install!/1 sets
+      # `:bootstrap_staging` to the namespaces it provides). Those staged beams
+      # are a VALID compiler even though their key differs from the current
+      # toolchain — interning replays def VALUES, it does not recompile — so
+      # trust them for interning. Without this the gate would route `compiler`/
+      # `reader-node` to the SOURCE path, which, with genesis deleted, has no
+      # compiler to build them. Once the build re-emits these under the current
+      # key the staged copies are superseded and a matching install clears the
+      # flag; so the trust is scoped to exactly the staged namespaces and only
+      # while staging is in effect.
+      ns in staging_namespaces() ->
+        false
+
+      true ->
+        stale_by_provenance?(ns, mod)
+    end
+  end
+
+  defp staging_namespaces do
+    case Application.get_env(:beam_lisp, :bootstrap_staging, nil) do
+      list when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  defp stale_by_provenance?(ns, mod) do
     case beam_provenance(mod) do
       nil ->
         false
