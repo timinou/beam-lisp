@@ -26,17 +26,15 @@ defmodule BeamLisp do
   # dirs; escripts) have no :code.priv_dir/1 for :beam_lisp, so a
   # runtime File.read! would crash boot. @external_resource keeps
   # Mix recompiling when the .bl sources change.
-  @prelude_path Path.join(__DIR__, "../priv/boot/core.bl")
-  @multi_path Path.join(__DIR__, "../priv/std/multi.bl")
-  @sugar_path Path.join(__DIR__, "../priv/boot/sugar.bl")
+  # The prelude namespaces (core/multi/sugar) are loaded from their AOT/seed
+  # beams at boot — never eval'd from source here — since the genesis compiler
+  # that once compiled that embedded source was deleted (the seed is the floor).
+  # Only `@data_readers` is still eval'd at boot (three side-effecting forms that
+  # register the built-in tagged literals; it is not a var-bearing namespace, so
+  # there is no beam to load). `@external_resource` keeps Mix recompiling this
+  # module when the tagged-literal registry changes.
   @data_readers_path Path.join(__DIR__, "../priv/boot/data-readers.bl")
-  @external_resource @prelude_path
-  @external_resource @multi_path
-  @external_resource @sugar_path
   @external_resource @data_readers_path
-  @prelude File.read!(@prelude_path)
-  @multi File.read!(@multi_path)
-  @sugar File.read!(@sugar_path)
   @data_readers File.read!(@data_readers_path)
 
   @doc """
@@ -136,36 +134,32 @@ defmodule BeamLisp do
       # loaded by default and referred everywhere (see BeamLisp.Env's `sugar`
       # fallback). Loads after core (it is pure macros over core) and after
       # multi, mirroring the AOT-first / source-fallback handling of both.
-      for {ns, source} <- [{"core", @prelude}, {"multi", @multi}, {"sugar", @sugar}] do
-        case BeamLisp.AOT.ensure_loaded(ns) do
-          :loaded -> :ok
-          :no_module -> Compiler.eval_string(source, Compiler.new_env("core"))
-        end
-      end
+      # SELF-HOST BOOT ORDER (genesis deleted — the seed is the only floor).
+      #
+      # 1. `core` FIRST. It is a boot-tier namespace, so its drift check is a
+      #    pure toolchain-key comparison (no closure hash, no reader) — it can
+      #    intern from its seed beam before anything else exists. It carries the
+      #    runtime vars (`list`, `reduce`, …) the compiler and reader resolve
+      #    against.
+      BeamLisp.AOT.ensure_loaded("core")
 
-      # SELF-HOST CUTOVER — the prelude (core/multi/sugar) is now seeded, so the
-      # .bl compiler's own runtime deps (`list`, `reduce`, the sugar macros)
-      # resolve. Intern the .bl compiler + reader FROM THEIR BEAMS now, BEFORE
-      # the `@data_readers` eval below: once interned, `compile/2` and
-      # `read_string/2` delegate every later form to the self-hosted toolchain
-      # (BeamLisp.Ns.Compiler / BeamLisp.Ns.Reader), so `@data_readers` — which
-      # opens with `(ns data-readers)` and needs the compiler's special-forms —
-      # runs through the LANGUAGE, not the Elixir genesis path. Interning replays
-      # already-built def VALUES from the beam (no compilation). On a from-source
-      # tree with no compiler beam these are no-ops: the ns stays un-interned and
-      # `@data_readers` compiles via genesis, which is exactly what a bootstrap
-      # build does. A load failure degrades to the configured backend; boot never
-      # breaks. (`:compiler_backend`/`:reader_backend :genesis` opt out.)
-      try do
-        BeamLisp.Compiler.enable_bl_backend()
-      rescue
-        _ -> :genesis
-      end
+      # 2. Intern the .bl reader and compiler from their seed beams NOW, before
+      #    the rest of the prelude. `multi`/`sugar` are NOT boot-tier, so their
+      #    drift check computes a closure hash — which reads their source via
+      #    `source-graph` → `BeamLisp.Reader.read_all`, i.e. it needs the reader
+      #    LIVE. And there is no Elixir genesis reader/compiler behind the facade
+      #    any more, so the reader ns MUST be interned first or that read has
+      #    nothing to run. `core` (step 1) gives them their runtime deps.
+      BeamLisp.Reader.enable_bl_reader()
+      BeamLisp.Compiler.enable_bl_backend()
 
-      try do
-        BeamLisp.Reader.enable_bl_reader()
-      rescue
-        _ -> :genesis
+      # 3. The rest of the prelude. `multi` (dispatch) and `sugar` (threading /
+      #    cond macros) layer on `core`; their closure-hash drift check now finds
+      #    the interned reader. Once interned, `compile/2` and `read_string/2`
+      #    run every later form (including the `@data_readers` eval below, which
+      #    opens `(ns data-readers)`) through the self-hosted toolchain.
+      for ns <- ["multi", "sugar"] do
+        BeamLisp.AOT.ensure_loaded(ns)
       end
 
       # Seed the built-in tagged-literal registry (`#d`, `#time`) from source,

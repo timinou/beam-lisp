@@ -74,14 +74,22 @@ defmodule BeamLisp.AOTCache do
   # closure hashing cannot see them — hashing the tier globally is what keeps
   # the fine-grained tier sound. Moving a file INTO boot/ is how a namespace
   # becomes ambient; nothing else needs to change.
+  # The Elixir modules whose BYTES affect emitted code, so a change to any of
+  # them must rotate `compiler_key/0` (invalidate every AOT beam). These are the
+  # genuine codegen host: AOT driver, atom guard, the emitter, linker, native
+  # bridge, and the ns-module shell. `BeamLisp.Compiler` and `BeamLisp.Reader`
+  # are NOT here: since the genesis cutover they are thin FACADES that delegate
+  # to the self-hosted `BeamLisp.Ns.Compiler` / `BeamLisp.Ns.Reader` (whose
+  # source, `priv/boot/{compiler,reader}.bl`, is already hashed as a tier-1
+  # toolchain source below). Hashing the facades would rotate the key on a mere
+  # doc/plumbing edit that cannot change a single emitted byte.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
     BeamLisp.Emit,
     BeamLisp.Link,
     BeamLisp.Native,
-    BeamLisp.Ns,
-    BeamLisp.Reader
+    BeamLisp.Ns
   ]
 
   @doc "Whether the cache participates in compilation. Default on."
