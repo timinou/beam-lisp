@@ -282,10 +282,10 @@ defmodule BeamLisp.AOT do
   # excludes it from `library_names/dirs`, so ordinary code cannot `:require`
   # the compiler's own backend), so its home — `priv/` as the root, where
   # `self.core` resolves to `self/core.bl` — is added as an explicit search path
-  # only when the Core backend is actually selected. A no-op under the default
-  # `:elixir` backend: the `self/` quarantine stays intact and nothing loads.
+  # only when the Core backend is selected. A no-op under the default `:elixir`
+  # backend: the `self/` quarantine stays intact and nothing loads.
   defp maybe_load_core_backend do
-    if Application.get_env(:beam_lisp, :aot_backend, :elixir) == :core do
+    if BeamLisp.AOTCache.aot_backend() == :core do
       BeamLisp.Env.add_search_path(BeamLisp.Tiers.priv_root())
       BeamLisp.Loader.ensure_loaded("self.core")
     end
@@ -674,9 +674,9 @@ defmodule BeamLisp.AOT do
   # `pmap-ordered`), so a process-dictionary flag would not reach them — only
   # an application env is visible VM-wide. Guarded on `self.core` actually
   # being loaded and exporting the seam, so a misconfiguration degrades to the
-  # Elixir path rather than crashing the build. Default `:elixir` — inert.
+  # Elixir path rather than crashing the build. Default `:elixir` — opt-in :core.
   defp core_aot_backend? do
-    Application.get_env(:beam_lisp, :aot_backend, :elixir) == :core and
+    BeamLisp.AOTCache.aot_backend() == :core and
       Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
       function_exported?(BeamLisp.Ns.Self.Core, :"aot-body-beams", 1)
   end

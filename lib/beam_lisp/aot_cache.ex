@@ -101,6 +101,28 @@ defmodule BeamLisp.AOTCache do
   end
 
   @doc """
+  The backend that lowers a namespace's body modules to `.beam`: `:core`
+  (bl-ANF -> Core Erlang, via `self.core`) or `:elixir` (the genesis Elixir
+  compiler). Default `:elixir`; opt in per-run with
+  `config :beam_lisp, :aot_backend, :core`. The Core path is proven for AOT
+  integration (PLAN-081 step 1) but is NOT yet the default: a full-tree Core
+  build still hits lowering gaps in some files (see PLAN-081 step 3), so the
+  flip waits on those. Setting `:core` here builds body modules through Core.
+
+  It lives here, not in `BeamLisp.AOT`, because `compiler_key/0` must fold it in
+  (a Core-built beam and an Elixir-built beam of the same source are different
+  bytes, so they MUST get different toolchain keys or the cache would serve one
+  for the other) and this module computes the key before `BeamLisp.AOT` is even
+  a concern. `BeamLisp.AOT` reads the same value so build and key agree.
+  """
+  def aot_backend do
+    case Application.get_env(:beam_lisp, :aot_backend, :elixir) do
+      :core -> :core
+      _ -> :elixir
+    end
+  end
+
+  @doc """
   Hash of the toolchain that produced a beam. Any change to codegen, the
   runtime it links against, or the language/VM version yields a new key,
   so stale artifacts compiled by a different toolchain are never linked.
@@ -144,7 +166,13 @@ defmodule BeamLisp.AOTCache do
     parts = [
       "beam_lisp:#{vsn}",
       "elixir:#{System.version()}",
-      "otp:#{:erlang.system_info(:otp_release)}"
+      "otp:#{:erlang.system_info(:otp_release)}",
+      # The BACKEND is part of the toolchain: a Core-built beam and an
+      # Elixir-built beam of the same source are different bytes, so they must
+      # land under different keys or the shared cache would serve one where the
+      # other belongs. Flipping `:aot_backend` rotates every beam's key exactly
+      # like a codegen change, which is what it is.
+      "aot_backend:#{aot_backend()}"
     ]
 
     beams =
@@ -186,9 +214,27 @@ defmodule BeamLisp.AOTCache do
   # dir contributes nothing (degrade, never crash) — the missing compiler then
   # surfaces as a compile error downstream, not here.
   defp toolchain_source_contents do
-    BeamLisp.Tiers.boot_dir()
-    |> Path.join("**/*.bl")
-    |> Path.wildcard()
+    boot =
+      BeamLisp.Tiers.boot_dir()
+      |> Path.join("**/*.bl")
+      |> Path.wildcard()
+
+    # Under the Core backend, `priv/self/` (self.core + self.anf) is ALSO tier-1:
+    # it lowers every body module, so a change there alters every emitted byte,
+    # exactly like a change to `priv/boot/compiler.bl`. Hash it into the key so
+    # editing the Core backend invalidates all Core beams. Under `:elixir` the
+    # self/ tier does not run, so it is left out (its edits are then correctly
+    # irrelevant to the Elixir toolchain key).
+    self =
+      if aot_backend() == :core do
+        BeamLisp.Tiers.priv_root()
+        |> Path.join("self/**/*.bl")
+        |> Path.wildcard()
+      else
+        []
+      end
+
+    (boot ++ self)
     |> Enum.sort()
     |> Enum.map(&File.read!/1)
   end
