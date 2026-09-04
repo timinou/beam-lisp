@@ -82,6 +82,19 @@
           ;; carry any demand the gen could not yet fill
           (producer-loop gen gstate2 (- total k) sub))))
 
+    ;; Tagged demand identifies the consumer for fan-out producers. A
+    ;; single-subscriber producer intentionally uses the same logic.
+    [:demand n _from]
+    (let [total (+ demand n)
+          step  (gen gstate total)]
+      (if (= step :halt)
+        (do (when sub (erlang/send sub [:done])) :stopped)
+        (let [[events gstate2] step
+              k (count events)]
+          (when (and sub (seq events))
+            (erlang/send sub [:events events]))
+          (producer-loop gen gstate2 (- total k) sub))))
+
     [:cancel] :stopped
 
     (after 3600000 (producer-loop gen gstate demand sub))))
@@ -122,7 +135,11 @@
     ;; downstream demand → demand the same upstream (1:1 for map; a filter
     ;; would demand more, a flatMap fewer — xform decides via its own stage)
     [:demand n]
-    (do (erlang/send up [:demand n])
+    (do (erlang/send up [:demand n (erlang/self)])
+        (pc-loop xform up sub))
+
+    [:demand n _from]
+    (do (erlang/send up [:demand n (erlang/self)])
         (pc-loop xform up sub))
 
     ;; upstream events → transform, forward down
@@ -197,7 +214,7 @@
    done nor already working, ask upstream for one chunk. Returns up-out'."
   [buf want up up-out done? chunk]
   (if (and (> want (count buf)) (= up-out 0) (not done?))
-    (do (erlang/send up [:demand chunk]) chunk)
+    (do (erlang/send up [:demand chunk (erlang/self)]) chunk)
     up-out))
 
 (defn- mr-loop [xform up sub st chunk]
@@ -208,6 +225,13 @@
 
     ;; downstream demand grows → try to satisfy from buffer, then maybe pull
     [:demand n]
+    (let [want (+ (:want st) n)
+          [buf2 want2] (mr-flush (:buf st) want sub (:done? st))
+          up-out2 (mr-pull buf2 want2 up (:up-out st) (:done? st) chunk)]
+      (mr-loop xform up sub
+               (assoc st :buf buf2 :want want2 :up-out up-out2) chunk))
+
+    [:demand n _from]
     (let [want (+ (:want st) n)
           [buf2 want2] (mr-flush (:buf st) want sub (:done? st))
           up-out2 (mr-pull buf2 want2 up (:up-out st) (:done? st) chunk)]
@@ -276,7 +300,7 @@
    backpressured stream."
   [up init f batch]
   (erlang/send up [:subscribe (erlang/self)])
-  (erlang/send up [:demand batch])
+  (erlang/send up [:demand batch (erlang/self)])
   (loop [acc init]
     (receive
       [:events events]
@@ -284,7 +308,7 @@
       ;; RENEWAL is the backpressure: upstream got exactly `batch` ahead of us
       ;; and now waits until we ask again.
       (let [acc2 (reduce f acc events)]
-        (erlang/send up [:demand batch])
+        (erlang/send up [:demand batch (erlang/self)])
         (recur acc2))
 
       [:done] acc
@@ -296,3 +320,49 @@
    stream is exhausted. The side-effecting consumer."
   [up f batch]
   (run up nil (fn [_ e] (f e) nil) batch))
+
+
+;; ─────────────────────────────────────────────────────────────────────
+;; SUBSCRIPTION + FAN-OUT — a generic consumer process and the bridge
+;; from any producer into a bus.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- subscription-loop [up target batch]
+  (receive
+    [:events events]
+    (do (if (erlang/is_pid target)
+          (erlang/send target [:events events])
+          (vec (map target events)))
+        (erlang/send up [:demand batch (erlang/self)])
+        (subscription-loop up target batch))
+
+    [:done]
+    (do (when (erlang/is_pid target) (erlang/send target [:done]))
+        :done)
+
+    [:cancel]
+    (do (erlang/send up [:cancel]) :cancelled)
+
+    (after 3600000 (subscription-loop up target batch))))
+
+(defn subscribe
+  "Subscribe a function or process to `up`. The consumer pulls `:demand`
+   events at a time and tags demand with its pid so fan-out producers can
+   account for each subscriber independently. `:on-lag` and `:max-lag` are
+   advisory metadata understood by buses and ignored by ordinary producers."
+  ([up id target] (subscribe up id target {}))
+  ([up id target opts]
+   (let [batch (get opts :demand 8)
+         policy (get opts :on-lag :block)
+         max-lag (get opts :max-lag 1024)
+         consumer (spawn (fn [] (subscription-loop up target batch)))]
+     (erlang/send up [:subscribe consumer])
+     (erlang/send up [:flow-options consumer id policy max-lag])
+     (erlang/send up [:demand batch consumer])
+     consumer)))
+
+(defn broadcast
+  "Start a bus fed by `up`. The bridge subscribes with ordinary flow demand;
+   bus subscribers therefore see the same events as `bus/publish` produces."
+  ([up] (bus/start-broadcast up {}))
+  ([up opts] (bus/start-broadcast up opts)))

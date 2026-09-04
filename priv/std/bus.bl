@@ -1,0 +1,163 @@
+; bus.bl — backpressured fan-out on flow's pull protocol.
+
+(ns bus)
+
+(defn- drain-sub [sub]
+  (let [queue (:queue sub)
+        demand (:demand sub)
+        n (min demand (count queue))]
+    (when (> n 0)
+      (erlang/send (:pid sub) [:events (vec (take n queue))]))
+    (assoc sub :queue (vec (drop n queue)) :demand (- demand n))))
+
+(defn blocked? [st]
+  (some (fn [[_ sub]]
+          (and (= (:policy sub) :block)
+               (>= (count (:queue sub)) (:max-lag sub))))
+        (:subs st)))
+
+(defn- append-one [sub ev]
+  (let [queued (conj (:queue sub) ev)
+        limit (:max-lag sub)
+        policy (:policy sub)]
+    (cond
+      (and (> (count queued) limit) (= policy :drop-oldest))
+        (drain-sub (assoc sub :queue (vec (drop (- (count queued) limit) queued))))
+
+      (and (> (count queued) limit) (= policy :detach))
+        :detach
+
+      :else (drain-sub (assoc sub :queue queued)))))
+
+(defn append-event [st ev]
+  (let [result
+        (reduce-kv
+          (fn [acc key sub]
+            (let [next-sub (append-one sub ev)]
+              (if (= next-sub :detach)
+                (do (erlang/demonitor (:ref sub) (list :flush))
+                    (assoc acc :subs (dissoc (:subs acc) key)
+                               :lagged (conj (:lagged acc) (:id sub))))
+                (assoc acc :subs (assoc (:subs acc) key next-sub)))))
+          (assoc st :lagged [])
+          (:subs st))]
+    (reduce
+      (fn [acc id]
+        (let [notice {:type :lagged :subscriber id}]
+          (reduce-kv
+            (fn [a key sub]
+              (let [next-sub (append-one sub notice)]
+                (if (= next-sub :detach)
+                  (do (erlang/demonitor (:ref sub) (list :flush))
+                      (assoc a :subs (dissoc (:subs a) key)))
+                  (assoc a :subs (assoc (:subs a) key next-sub)))))
+            acc (:subs acc))))
+      (dissoc result :lagged)
+      (:lagged result))))
+
+(defn- reply-waiters [st]
+  (if (or (blocked? st) (empty? (:waiting st)))
+    st
+    (let [[[from ev] & more] (:waiting st)
+          next (append-event (assoc st :waiting (vec more)) ev)]
+      (GenServer/reply from :ok)
+      (reply-waiters next))))
+
+(defn add-sub [st pid]
+  (if (contains? (:subs st) pid)
+    st
+    (let [ref (erlang/monitor :process pid)
+          sub {:id pid :pid pid :ref ref :demand 0 :queue []
+               :policy :block :max-lag (:max-lag st)}]
+      (assoc st :subs (assoc (:subs st) pid sub)))))
+
+(defn configure-sub [st pid id policy max-lag]
+  (if-let [sub (get (:subs st) pid)]
+    (assoc st :subs
+           (assoc (:subs st) pid
+                  (assoc sub :id id :policy policy :max-lag max-lag)))
+    st))
+
+(defn demand-from [st pid n]
+  (if-let [sub (get (:subs st) pid)]
+    (reply-waiters
+      (assoc st :subs
+             (assoc (:subs st) pid
+                    (drain-sub (assoc sub :demand (+ (:demand sub) n))))))
+    st))
+
+(defn remove-sub [st ref pid]
+  (reply-waiters
+    (assoc st :subs
+           (reduce-kv
+             (fn [subs key sub]
+               (if (and (= (:pid sub) pid) (= (:ref sub) ref))
+                 (dissoc subs key)
+                 subs))
+             (:subs st) (:subs st)))))
+
+(defn send-done [st]
+  (vec (map (fn [[_ sub]] (erlang/send (:pid sub) [:done])) (:subs st)))
+  (vec (map (fn [[from _ev]] (GenServer/reply from :done)) (:waiting st)))
+  :ok)
+
+(defmacro defbus [name & config]
+  (let [demand-form (first config)
+        default-demand (if demand-form (second demand-form) 8)]
+    `(defserver ~name
+       (init [opts#]
+         (ok {:subs {} :closed? false :waiting []
+              :demand (get opts# :demand ~default-demand)
+              :max-lag (get opts# :max-lag 1024)}))
+
+       (handle-call [:publish ev#] [from# st#]
+         (if (bus/blocked? st#)
+           (noreply (assoc st# :waiting (conj (:waiting st#) [from# ev#])))
+           (reply :ok (bus/append-event st# ev#))))
+
+       (handle-cast [:publish ev#] [st#]
+         (noreply (bus/append-event st# ev#)))
+
+       (handle-info [:subscribe pid#] [st#]
+         (noreply (bus/add-sub st# pid#)))
+
+       (handle-info [:flow-options pid# id# policy# max-lag#] [st#]
+         (noreply (bus/configure-sub st# pid# id# policy# max-lag#)))
+
+       (handle-info [:demand n# pid#] [st#]
+         (noreply (bus/demand-from st# pid# n#)))
+
+       (handle-info [:demand n#] [st#]
+         (noreply st#))
+
+       (handle-info [:DOWN ref# :process pid# _reason#] [st#]
+         (noreply (bus/remove-sub st# ref# pid#)))
+
+       (terminate [_reason# st#]
+         (bus/send-done st#)))))
+
+(defn publish
+  "Publish one event. The call waits when a :block subscriber reaches its
+   lag bound, making backpressure reach the publishing process."
+  [b ev]
+  (call b [:publish ev] :infinity))
+
+(defbus broadcast-bus (demand 8))
+
+(defn- bridge-loop [up b batch]
+  (receive
+    [:events events]
+    (do (vec (map (fn [ev] (publish b ev)) events))
+        (erlang/send up [:demand batch (erlang/self)])
+        (bridge-loop up b batch))
+    [:done]
+    (do (stop b) :done)
+    (after 3600000 (bridge-loop up b batch))))
+
+(defn start-broadcast [up opts]
+  (let [b (start broadcast-bus opts)
+        batch (get opts :demand 8)
+        bridge (spawn (fn [] (bridge-loop up b batch)))]
+    (erlang/send up [:subscribe bridge])
+    (erlang/send up [:demand batch bridge])
+    b))
