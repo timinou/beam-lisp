@@ -2,6 +2,10 @@
 
 *How the language is written in itself — from zero context.*
 
+For the full guided tour — language, IR, backend, seed, proofs, and the
+native road — read the series [[file:from-source-to-silicon/README.bl.org][From
+Source to Silicon]] (=docs/from-source-to-silicon/=).
+
 ## What "self-hosting" means here
 
 beam-lisp is a Lisp on the BEAM (the Erlang virtual machine). You write
