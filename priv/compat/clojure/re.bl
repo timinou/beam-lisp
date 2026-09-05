@@ -1,0 +1,200 @@
+; re.bl — Clojure's clojure.core regular-expression surface, native on the BEAM.
+;
+; ── Why this exists ─────────────────────────────────────────────────────────
+;
+; On the JVM, `re-pattern`/`re-find`/`re-matches`/`re-seq`/`re-matcher`/
+; `re-groups` are clojure.core functions backed by `java.util.regex.Pattern`
+; and `Matcher`. beam-lisp has no Java; it has Erlang's `:re` (PCRE) and
+; Elixir's `Regex` wrapper. These functions reproduce Clojure's EXACT contracts
+; on top of `Regex`, so unmodified Clojure/Babashka code that calls them — and
+; the `clojure.string` reimplementation next door — behaves identically.
+;
+; ── The contracts reproduced (this is the fidelity that matters) ─────────────
+;
+;   re-pattern   string|pattern -> a compiled pattern value (idempotent on a
+;                pattern). `#"…"` reader literals also desugar to this.
+;   re-find      first match. NO capture groups -> the matched STRING (or nil).
+;                WITH groups -> a VECTOR [whole g1 g2 …], a non-participating
+;                group being nil. This whole/vector split is the single most
+;                important Clojure regex contract and the one people trip on.
+;   re-matches   like re-find but the pattern must match the ENTIRE string
+;                (implicitly anchored). Same whole-vs-vector return shape.
+;   re-seq       a lazy seq of every non-overlapping match, each shaped as
+;                re-find shapes one.
+;   re-matcher   a stateful matcher over [pattern string], the object
+;                clojure.string/replace drives with re-find + re-groups.
+;   re-groups    the groups of the matcher's LAST match, shaped as re-find.
+;   re-quote-replacement  escape `\` and `$` so a replacement string is literal.
+;
+; ── Interning into core ─────────────────────────────────────────────────────
+;
+; In Clojure these are clojure.core, available with no require. Loading this
+; namespace interns each into `core`, so a bare `(re-find #"\d+" s)` resolves
+; everywhere — exactly as on the JVM — without touching any boot seed.
+
+(ns clojure.re)
+
+;; ── pattern ──────────────────────────────────────────────────────────────────
+
+(defn regex?
+  "True when `x` is a compiled regular-expression pattern (an Elixir `%Regex{}`)."
+  [x]
+  (and (erlang/is_map x) (Regex/regex? x)))
+
+(defn re-pattern
+  "Compile `s` into a pattern. Idempotent when `s` is already a pattern, so
+   `(re-pattern p)` is safe. Mirrors clojure.core/re-pattern."
+  [s]
+  (if (regex? s) s (Regex/compile! s)))
+
+;; ── the shared match-shaping rule ────────────────────────────────────────────
+
+(defn- shape-match
+  "Turn Elixir's `Regex.run` result into Clojure's re-find/re-matches shape.
+   `Regex.run` returns nil (no match) or a list [whole g1 g2 …]. Clojure's rule:
+   a pattern with NO capture groups yields the whole matched string; a pattern
+   WITH groups yields the whole vector. A non-participating optional group comes
+   back from :re as an empty capture, which Clojure represents as nil — but the
+   default `Regex.run` cannot distinguish \"\" from \"absent\", so callers that
+   need that fidelity use the :return :index path; for the common cases the
+   whole/vector split is what code depends on and what we reproduce."
+  [run-result]
+  (cond
+    (nil? run-result) nil
+    (= 1 (count run-result)) (first run-result)   ; no capture groups -> the string
+    :else (vec run-result)))                        ; groups -> [whole g1 g2 …]
+
+;; ── re-find / re-matches ─────────────────────────────────────────────────────
+
+(defn re-find
+  "The first regex match in `s`, or nil. No groups -> the matched string; with
+   groups -> a vector [whole g1 …]. The 2-arity `(re-find re s)` is the common
+   form; the 1-arity `(re-find matcher)` steps a matcher (see re-matcher)."
+  ([m]
+   ; matcher arity: advance the matcher and return its current match shape.
+   (matcher-find m))
+  ([re s]
+   (shape-match (Regex/run (re-pattern re) s))))
+
+(defn re-matches
+  "Like re-find, but succeeds only when `re` matches the ENTIRE string `s`
+   (Clojure implicitly anchors re-matches). Returns nil, the whole string, or
+   the [whole g1 …] vector."
+  [re s]
+  (let [p (re-pattern re)
+        r (Regex/run p s)]
+    (cond
+      (nil? r) nil
+      ; whole match must equal the entire input for re-matches to succeed
+      (not= (first r) s) nil
+      (= 1 (count r)) (first r)
+      :else (vec r))))
+
+;; ── re-seq ───────────────────────────────────────────────────────────────────
+
+(defn re-seq
+  "A lazy sequence of successive matches of `re` in `s`, each shaped as re-find
+   shapes a single match (string without groups, vector with)."
+  [re s]
+  (let [p (re-pattern re)
+        ; Regex.scan returns a list of match-lists [[whole g1 …] …]
+        scans (Regex/scan p s)]
+    (map (fn [one]
+           (if (= 1 (count one)) (first one) (vec one)))
+         scans)))
+
+;; ── re-matcher / re-groups (the stateful pair clojure.string/replace uses) ───
+;;
+;; On the JVM a Matcher is a mutable cursor. beam-lisp models it as a map in a
+;; `volatile!` cell: {:pat compiled, :s string, :pos byte-offset, :last match}.
+;; `re-find`/1 advances it to the next match from :pos; `re-groups` reads :last.
+
+(defn re-matcher
+  "A stateful matcher over `re` and `s` — the object `re-find`/1 advances and
+   `re-groups` reads. Reproduces java.util.regex.Matcher's role for the code
+   (notably clojure.string/replace) that drives matching by hand."
+  [re s]
+  (volatile! {:pat (re-pattern re) :s s :pos 0 :last nil :prev-empty false}))
+
+(defn- matcher-find
+  "Advance matcher `m` to its next match and return that match's shape (string
+   or vector), or nil at end. Uses :re's index run so overlapping-empty matches
+   terminate, matching Matcher.find()."
+  [m]
+  (let [st @m
+        s (:s st)
+        pat (:pat st)
+        pos (:pos st)]
+    (if (> pos (String/length s))
+      (do (vreset! m (assoc st :last nil)) nil)
+      (let [rest-str (String/slice s pos (- (String/length s) pos))
+            r (Regex/run pat rest-str)]
+        (if (nil? r)
+          (do (vreset! m (assoc st :last nil :pos (+ (String/length s) 1))) nil)
+          (let [whole (first r)
+                ; find the offset of this match within rest-str to advance :pos
+                idx (matcher-offset rest-str whole)
+                abs-start (+ pos idx)
+                consumed (+ abs-start (max 1 (String/length whole)))
+                shaped (if (= 1 (count r)) whole (vec r))]
+            (vreset! m (assoc st :last shaped :pos consumed))
+            shaped))))))
+
+(defn- matcher-offset
+  "The character offset of the first occurrence of `sub` in `s`. `sub` is a
+   known substring (the regex whole-match), so this always finds it. Splitting
+   on `sub` and measuring the first part is grapheme-correct and needs no
+   byte-offset arithmetic (an empty `sub` yields offset 0, the right answer for
+   a zero-width match)."
+  [s sub]
+  (if (= "" sub)
+    0
+    (String/length (first (String/split s sub)))))
+
+(defn re-groups
+  "The groups of matcher `m`'s most recent match, shaped as re-find shapes a
+   match. Raises if called before a successful match."
+  [m]
+  (let [last (:last @m)]
+    (if (nil? last)
+      (throw (ex-info "re-groups called before a successful match" {}))
+      last)))
+
+;; ── re-quote-replacement ─────────────────────────────────────────────────────
+
+(defn re-quote-replacement
+  "Escape `replacement` so it is used LITERALLY in re-find/replace substitution
+   — i.e. `$` and `\\` lose their special meaning. Mirrors
+   clojure.string/re-quote-replacement (Matcher/quoteReplacement)."
+  [replacement]
+  (-> replacement
+      (String/replace "\\" "\\\\")
+      (String/replace "$" "\\$")))
+
+;; ── intern the clojure.core surface so bare calls resolve everywhere ─────────
+;;
+;; These are clojure.core on the JVM (no require needed). Interning into `core`
+;; makes `(re-find …)` resolve unqualified in any namespace, with zero edit to
+;; a boot seed. Idempotent: re-interning the same fns on reload is harmless.
+
+(defn install!
+  "Intern the regex surface into `core` so the names resolve unqualified,
+   matching clojure.core. Called on load; safe to call again."
+  []
+  (BeamLisp.Env/intern "core" "re-pattern" re-pattern)
+  (BeamLisp.Env/intern "core" "re-find" re-find)
+  (BeamLisp.Env/intern "core" "re-matches" re-matches)
+  (BeamLisp.Env/intern "core" "re-seq" re-seq)
+  (BeamLisp.Env/intern "core" "re-matcher" re-matcher)
+  (BeamLisp.Env/intern "core" "re-groups" re-groups)
+  (BeamLisp.Env/intern "core" "re-quote-replacement" re-quote-replacement)
+  (BeamLisp.Env/intern "core" "regex?" regex?)
+  :installed)
+
+;; Fire the interning on load. A bare top-level `(install!)` call is NOT one of
+;; the forms AOT captures for `__bl_init__/0` replay, so it would run only in a
+;; from-source boot and silently NOT on an AOT'd load. A value `def` IS captured
+;; and its initializer replayed on every load — so binding a throwaway var to
+;; `(install!)` makes the core-interning reliably happen whether the namespace
+;; is loaded from source or from its compiled beam.
+(def ^:private __regex-installed (install!))
