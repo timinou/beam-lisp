@@ -45,6 +45,43 @@ if wanted == [] do
   Mix.raise("no boot-closure beams in #{ebin} — run mix compile.beam_lisp first")
 end
 
+# A seed whose manifest key and beam stamps disagree is a LIE that crashes
+# genesis-less boots circularly: the drift gate reads each beam's provenance
+# key, finds it != compiler_key, routes `reader` to the source path — which
+# needs the reader. Copied beams must therefore be PROVEN built under the
+# current key, not assumed: `_build` can hold older-keyed beams (e.g. after a
+# failed compile left a stale ebin). Refuse loudly instead.
+current_key = BeamLisp.AOTCache.compiler_key()
+
+# Only the top-level Ns.<Name> shims carry `__bl_provenance__/0`; Body/Init
+# companions are unchecked (they share the shim's build by construction).
+shim_beams = Enum.filter(wanted, fn name ->
+  base = Path.basename(name, ".beam")
+  not (String.contains?(base, ".Body.") or String.contains?(base, ".Init."))
+end)
+
+Enum.each(shim_beams, fn name ->
+  path = Path.join(ebin, name)
+  mod = name |> Path.basename(".beam") |> String.to_atom()
+  :code.purge(mod)
+  :code.delete(mod)
+  {:module, _} = :code.load_binary(mod, ~c"gen_manifest", File.read!(path))
+
+  case mod.__bl_provenance__() do
+    {_src, ^current_key} ->
+      :ok
+
+    {_src, beam_key} ->
+      Mix.raise("""
+      refusing to seed a stale beam: #{name}
+        beam provenance key: #{String.slice(beam_key, 0, 16)}…
+        current compiler key: #{String.slice(current_key, 0, 16)}…
+      The ebin beams were built under a different toolchain. Rebuild first:
+        mix clean && mix compile   then re-run gen_manifest.
+      """)
+  end
+end)
+
 # Clear stale seed beams, then copy the current closure in.
 seed_dir |> Path.join("*.beam") |> Path.wildcard() |> Enum.each(&File.rm!/1)
 

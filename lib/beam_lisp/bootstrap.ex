@@ -95,10 +95,12 @@ defmodule BeamLisp.Bootstrap do
     #
     # Integrity (sha256) is verified regardless: a corrupt seed is fatal, a
     # merely-differently-keyed one is a valid bootstrap stage.
+    current_key = BeamLisp.AOTCache.compiler_key()
+
     Enum.each(manifest["modules"], fn {name, want_sha} ->
       src = Path.join(seed_dir, name)
       verify_seed_file!(src, name, want_sha)
-      install_one(src, Path.join(ebin, name), want_sha)
+      maybe_install_one(src, Path.join(ebin, name), want_sha, current_key)
     end)
 
     # Make the code server SEE the just-installed beams immediately. The build
@@ -197,6 +199,41 @@ defmodule BeamLisp.Bootstrap do
         manifest: #{want_sha}
         on disk:  #{got}
       """
+    end
+  end
+
+  # The seed is a FLOOR, never a ceiling: a destination beam stamped with the
+  # CURRENT toolchain key is a fresh gen-N+1 rebuild (the staging ladder's own
+  # output) and strictly supersedes the gen-N seed. Overwriting it would
+  # un-supersede the rebuild on every boot — ebin would oscillate between
+  # seed and rebuild, and seed regeneration could never observe fresh beams
+  # (a boot between build and gen_manifest would re-poison ebin). Skip the
+  # copy; the purge+load below then loads the fresh beam, which is exactly
+  # the code this VM should run.
+  defp maybe_install_one(src, dst, want_sha, current_key) do
+    if fresh_generation?(dst, current_key) do
+      :ok
+    else
+      install_one(src, dst, want_sha)
+    end
+  end
+
+  # Whether `dst` holds a beam stamped with the current toolchain key. The
+  # stamp is the `__bl_provenance__/0` function, so reading it costs a load;
+  # install! loads every module below anyway, so this only changes WHICH
+  # bytes get loaded. Absent/unstamped beams answer false (drifted or
+  # pre-provenance: overwrite with the seed, as before).
+  defp fresh_generation?(dst, current_key) do
+    with {:ok, bytes} <- File.read(dst),
+         mod <- dst |> Path.basename(".beam") |> String.to_atom(),
+         :code.purge(mod),
+         :code.delete(mod),
+         {:module, _} <- :code.load_binary(mod, String.to_charlist(dst), bytes),
+         true <- function_exported?(mod, :__bl_provenance__, 0),
+         {_src_hash, key} <- mod.__bl_provenance__() do
+      key == current_key
+    else
+      _ -> false
     end
   end
 
