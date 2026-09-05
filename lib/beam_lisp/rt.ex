@@ -1237,6 +1237,11 @@ defmodule BeamLisp.RT do
   # made `(sort-by val > freqs)` return garbage.
   defp comparator_le(result) when is_boolean(result), do: result
   defp comparator_le(result) when is_number(result), do: result <= 0
+  # Any other result (e.g. a value whose comparator did not reduce to a number
+  # or boolean) falls back to Erlang term ordering against 0 — the exact
+  # behavior of the previous `invoke(comp, …) <= 0` implementation, so no
+  # existing sort regresses.
+  defp comparator_le(result), do: result <= 0
 
   # --- cpp/* interop ------------------------------------------------
   # jank writes `(cpp/jank.runtime.name x)` for its C++ primitives.
