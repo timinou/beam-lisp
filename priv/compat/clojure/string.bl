@@ -1,0 +1,339 @@
+; string.bl — Clojure's clojure.string, native on the BEAM.
+;
+; ── Why this is a reimplementation, not a copy-paste ─────────────────────────
+;
+; Clojure's own clojure/string.clj is Java to the core: every function calls
+; StringBuilder, java.util.regex.Matcher, Character.isWhitespace, and
+; CharSequence host methods. None of that exists on the BEAM. So this file is a
+; faithful REIMPLEMENTATION: the same public names, the same documented
+; contracts, the same argument orders and edge cases — but each body delegates
+; to Elixir's `String` (which is grapheme-correct Unicode) and to the native
+; `clojure.re` regex surface next door. The oracle that keeps it honest is
+; Clojure's own test suite (test/clojure/test_clojure/string.clj), vendored and
+; adapted in test/bl/compat/string_test.bl — every adaptation recorded there.
+;
+; ── The contracts that need care (where JVM and BEAM differ) ─────────────────
+;
+;   * chars are INTEGERS here (`\o` is 111), not Character objects. `replace`
+;     and `index-of` accept a char by converting it to a one-grapheme string.
+;   * regex replacement templates: Clojure/Java write `$1` for group 1; Erlang's
+;     :re writes `\1`. `replace` translates `$N` -> `\N` (and a literal `\` in a
+;     STRING match is kept literal) so upstream templates work unchanged.
+;   * nil handling: Clojure's string fns throw NullPointerException on nil.
+;     beam-lisp has no NPE; passing nil raises a BEAM error, which the tests
+;     assert via `thrown?` rather than a specific class.
+;   * split/split-lines return VECTORS (Clojure guarantees vector?), and trailing
+;     empty strings are dropped exactly as Clojure drops them.
+
+(ns clojure.string
+  (:require [clojure.re]
+            [clojure.core-ext]))
+
+;; ── small helpers ────────────────────────────────────────────────────────────
+
+(defn- ch->str
+  "A match/replacement argument may be a char (an integer codepoint on the
+   BEAM). Normalize a char to a one-grapheme string; leave a string as-is."
+  [x]
+  (if (erlang/is_integer x)
+    (List/to_string (list x))
+    x))
+
+(defn- global-false
+  "The Elixir option list requesting a FIRST-only (non-global) replace."
+  []
+  (list (erlang/list_to_tuple (list :global false))))
+
+(defn- java-template->erlang
+  "Translate a Java/Clojure regex-replacement TEMPLATE STRING into the spelling
+   Erlang's :re expects. Java's rules: `$N` is a group reference, backslash+char
+   is a literal char, doubled-backslash is a literal backslash. Erlang's :re
+   rules: backslash+N is a group reference, doubled-backslash is a literal
+   backslash, a bare `$` is literal. So scan the Java template char by char:
+     backslash + next -> that next char taken literally (a literal backslash is
+                         re-doubled so :re keeps it) — this is how
+                         `re-quote-replacement` output (which backslash-escapes
+                         `$` and backslash) becomes literal text.
+     `$` + digits     -> backslash + those digits (a group reference).
+     any other char   -> itself.
+   Codepoints: 92 = backslash, 36 = dollar. Runs only on the pattern/string
+   path, never on a function replacement (a function's return value is inserted
+   literally by :re already)."
+  [tmpl]
+  (let [cs (String/to_charlist tmpl)]
+    (loop [in cs out []]
+      (cond
+        (empty? in) (erlang/list_to_binary (lists/reverse out))
+        (= 92 (first in))
+          (if (empty? (rest in))
+            (recur (rest in) (cons 92 (cons 92 out)))
+            (let [nxt (second in)]
+              (if (= 92 nxt)
+                (recur (rest (rest in)) (cons 92 (cons 92 out)))
+                (recur (rest (rest in)) (cons nxt out)))))
+        (= 36 (first in))
+          (recur (rest in) (cons 92 out))
+        :else
+          (recur (rest in) (cons (first in) out))))))
+;; ── reverse ──────────────────────────────────────────────────────────────────
+
+(defn reverse
+  "Returns `s` with its characters (graphemes) reversed."
+  [s]
+  (String/reverse s))
+
+;; ── join ─────────────────────────────────────────────────────────────────────
+
+(defn join
+  "Returns a string of the elements of `coll`, as by `str`, optionally separated
+   by `separator`. `(join coll)` concatenates; `(join sep coll)` interposes.
+   Arg order is Clojure's (separator first). A char separator (an integer
+   codepoint here) is rendered as its character, not its number."
+  ([coll] (apply str (map str (to-list coll))))
+  ([separator coll] (Enum/join (map str (to-list coll)) (ch->str separator))))
+
+;; ── case ─────────────────────────────────────────────────────────────────────
+
+(defn upper-case
+  "Converts `s` to upper-case (Unicode, grapheme-correct)."
+  [s]
+  (String/upcase s))
+
+(defn lower-case
+  "Converts `s` to lower-case (Unicode, grapheme-correct)."
+  [s]
+  (String/downcase s))
+
+(defn capitalize
+  "Converts the first character of `s` to upper-case and the rest to lower-case."
+  [s]
+  (if (< (String/length s) 2)
+    (String/upcase s)
+    (str (String/upcase (subs s 0 1))
+         (String/downcase (subs s 1)))))
+
+;; ── trim family ──────────────────────────────────────────────────────────────
+
+(defn trim
+  "Removes whitespace from both ends of `s`."
+  [s]
+  (String/trim s))
+
+(defn triml
+  "Removes whitespace from the left (leading) side of `s`."
+  [s]
+  (String/trim_leading s))
+
+(defn trimr
+  "Removes whitespace from the right (trailing) side of `s`."
+  [s]
+  (String/trim_trailing s))
+
+(defn trim-newline
+  "Removes all trailing newline `\\n` or return `\\r` characters from `s`.
+   Similar to Perl's chomp."
+  [s]
+  (String/replace s (Regex/compile! "[\\r\\n]+$") ""))
+
+;; ── blank? ───────────────────────────────────────────────────────────────────
+
+(defn blank?
+  "True if `s` is nil, empty, or contains only whitespace."
+  [s]
+  (cond
+    (nil? s) true
+    (= "" s) true
+    :else (= "" (String/trim s))))
+
+;; ── split / split-lines ──────────────────────────────────────────────────────
+
+(defn- drop-trailing-empties
+  "Drop trailing empty strings from a split result, as Clojure's split does
+   when no limit (or a non-positive limit) is given."
+  [parts]
+  (loop [v (vec parts)]
+    (if (and (> (count v) 0) (= "" (peek v)))
+      (recur (pop v))
+      v)))
+
+(defn split
+  "Splits `s` on the regular expression `re`. Returns a vector of the parts.
+   Trailing empty strings are not returned unless `limit` is given; a limit of
+   -1 returns all, a positive limit caps the number of parts. `re` may be a
+   compiled pattern or a pattern string; a plain string is treated as a regex,
+   matching Clojure (which only accepts a Pattern)."
+  ([s re]
+   (drop-trailing-empties (String/split s (clojure.re/re-pattern re))))
+  ([s re limit]
+   (cond
+     (= limit -1) (vec (String/split s (clojure.re/re-pattern re)))
+     (<= limit 0) (drop-trailing-empties (String/split s (clojure.re/re-pattern re)))
+     :else (vec (String/split s (clojure.re/re-pattern re)
+                              (list (erlang/list_to_tuple (list :parts limit))))))))
+
+(defn split-lines
+  "Splits `s` on `\\n` or `\\r\\n`, returning a vector of lines. Trailing empty
+   lines are not returned."
+  [s]
+  (drop-trailing-empties (String/split s (Regex/compile! "\\r?\\n"))))
+
+;; ── replace / replace-first ──────────────────────────────────────────────────
+
+(defn- do-replace
+  "The shared engine for replace / replace-first. `opts` is the Elixir option
+   list (global true by default; `(global-false)` for replace-first). Handles
+   the three Clojure match/replacement shapes:
+     char/char, string/string  -> literal substring replacement
+     pattern/string            -> regex, with `$N` group refs (translated to \\N)
+     pattern/function          -> regex, replacement fn receives whole + groups."
+  [s match replacement opts first?]
+  (let [m (ch->str match)]
+    (cond
+      ; pattern + function replacement — driven by hand so the fn sees exactly
+      ; Clojure's argument shape (see regex-replace-fn), NOT Elixir's positional
+      ; whole+groups (its arity introspection rejects a variadic BEAM closure).
+      (and (clojure.re/regex? m) (fn? replacement))
+        (regex-replace-fn m s replacement first?)
+      ; pattern + string replacement — translate Java `$N` group refs to :re's \N
+      (clojure.re/regex? m)
+        (if first?
+          (Regex/replace m s (java-template->erlang replacement) (global-false))
+          (Regex/replace m s (java-template->erlang replacement)))
+      ; literal string/char replacement
+      :else
+        (let [r (ch->str replacement)]
+          (if first?
+            (String/replace s m r (global-false))
+            (String/replace s m r))))))
+
+(defn- fn-arg-for-match
+  "The single argument Clojure passes a replacement function for one match.
+   `run` is Elixir's `Regex.run` result — [whole g1 g2 …]. Clojure's rule: with
+   NO capture groups the fn receives the whole match STRING; WITH groups it
+   receives the vector [whole g1 …]."
+  [run]
+  (if (= 1 (count run)) (first run) (vec run)))
+
+(defn- regex-replace-fn
+  "Replace matches of pattern `m` in `s` by calling `f` on each match and
+   splicing its return value in literally. `first?` true replaces only the first
+   match. Implemented over `Regex/scan` (all matches, each as [whole g1 …]) and
+   the match offsets, so the fn receives exactly Clojure's argument shape and
+   the surrounding text is preserved verbatim."
+  [m s f first?]
+  (let [matches (Regex/scan m s)]
+    (if (empty? matches)
+      s
+      (loop [ms (if first? (list (first matches)) matches)
+             rest-str s
+             acc []]
+        (if (empty? ms)
+          (apply str (conj acc rest-str))
+          (let [run (first ms)
+                whole (first run)
+                ; locate this match in the remaining text (scan yields matches
+                ; left-to-right, so the first occurrence is the right one)
+                parts (String/split rest-str whole)
+                before (first parts)
+                after (subs rest-str (+ (String/length before) (String/length whole)))
+                replaced (str (f (fn-arg-for-match run)))]
+            (recur (rest ms) after (conj (conj acc before) replaced))))))))
+
+(defn replace
+  "Replaces ALL instances of `match` with `replacement` in `s`.
+   match / replacement may be:
+     string / string     — literal
+     char   / char        — literal (chars are integer codepoints here)
+     pattern / string     — regex; `$1`,`$2` in the replacement are group refs
+     pattern / function   — regex; the fn receives the match (string, or
+                            [whole g1 …] vector when the pattern has groups)."
+  [s match replacement]
+  (do-replace s match replacement nil false))
+
+(defn replace-first
+  "Replaces the FIRST instance of `match` with `replacement` in `s`. Same
+   match/replacement shapes as `replace`."
+  [s match replacement]
+  (do-replace s match replacement (global-false) true))
+
+(defn re-quote-replacement
+  "Escapes special characters in a replacement string so it is used literally
+   in `replace`/`replace-first`. Delegates to the clojure.re implementation."
+  [replacement]
+  (clojure.re/re-quote-replacement replacement))
+
+;; ── membership / prefix / suffix ─────────────────────────────────────────────
+
+(defn starts-with?
+  "True if `s` begins with the substring `substr`."
+  [s substr]
+  (String/starts_with? s (ch->str substr)))
+
+(defn ends-with?
+  "True if `s` ends with the substring `substr`."
+  [s substr]
+  (String/ends_with? s (ch->str substr)))
+
+(defn includes?
+  "True if `s` contains the substring `substr`."
+  [s substr]
+  (String/contains? s (ch->str substr)))
+
+;; ── index-of / last-index-of ─────────────────────────────────────────────────
+
+(defn- char-index
+  "The grapheme index of the first occurrence of `value` in `s` at or after
+   `from`, or nil. Implemented by splitting on the (known) substring and
+   measuring the prefix, which is grapheme-correct."
+  [s value from]
+  (let [needle (ch->str value)
+        start (max 0 from)
+        prefix (subs s 0 (min start (String/length s)))
+        tail (subs s (min start (String/length s)))]
+    (if (String/contains? tail needle)
+      (+ (String/length prefix)
+         (String/length (first (String/split tail needle))))
+      nil)))
+
+(defn index-of
+  "The index of the first occurrence of `value` (a string or char) in `s`,
+   optionally starting the search at `from`. Returns nil when not found."
+  ([s value] (char-index s value 0))
+  ([s value from] (char-index s value from)))
+
+(defn- last-char-index
+  "The grapheme index of the LAST occurrence of `value` in `s` at or before
+   `from` (inclusive of matches starting at from), or nil."
+  [s value from]
+  (let [needle (ch->str value)
+        limit (if (nil? from) (String/length s) from)]
+    (loop [best nil i 0]
+      (let [nxt (char-index s needle i)]
+        (cond
+          (nil? nxt) best
+          (> nxt limit) best
+          :else (recur nxt (+ nxt 1)))))))
+
+(defn last-index-of
+  "The index of the last occurrence of `value` in `s`, optionally at or before
+   `from`. Returns nil when not found."
+  ([s value] (last-char-index s value nil))
+  ([s value from] (last-char-index s value from)))
+
+;; ── escape ───────────────────────────────────────────────────────────────────
+
+(defn escape
+  "Returns a new string, using `cmap` to escape each character `ch` of `s`:
+   if `(cmap ch)` is nil, append `ch` unchanged; otherwise append `(cmap ch)`.
+   The map is keyed by CHARACTERS (integer codepoints here); a replacement may
+   be a char or a string."
+  [s cmap]
+  (apply str
+    (map (fn [g]
+           (let [c (first (String/to_charlist g))
+                 rep (get cmap c)]
+             (cond
+               (nil? rep) g
+               (erlang/is_integer rep) (List/to_string (list rep))
+               :else rep)))
+         (String/graphemes s))))
