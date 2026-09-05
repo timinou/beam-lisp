@@ -1,0 +1,134 @@
+; super.bl — supervision trees as data (bundle 5).
+;
+; The supervisor is the only bundle that is a PROCESS, not a library: it owns
+; children, it must never block, it must never crash. Its state is the child
+; set and the restart ledger — both of which OTP keeps for us. What this file
+; adds is the DEFINITION: a tree written as data, and the verbs to look into
+; a running one.
+;
+;   (super/defsupervisor billing
+;     (strategy :one-for-one)
+;     (intensity 3 5000)               ; 3 restarts per 5s, then give up
+;     (child :acct account 100)        ; (start-link account 100)
+;     (child :workers (pool worker 4)))
+;
+;   (def s (start-link billing))
+;   (super/children s)                 ; → [{:id :acct :pid … :type :worker} …]
+;   (super/child-of s :acct)           ; → pid
+;   (super/restart s :acct)            ; OTP child ops, by id
+;
+; And the tree is verifiable: (system/verify 'my-ns/billing) proves each
+; child's invariant from source (guidebook 07).
+;
+; A POOL is n identical workers under a one-for-one sub-supervisor, plus a
+; dispatcher child. The pool protocol: (super/child-of s :workers) returns
+; the dispatcher's pid; any cast to it is forwarded round-robin to a living
+; worker. A dead worker's messages wait out its restart — at-least-once, no
+; dead-letter.
+
+(ns super)
+
+;; ── looking into a running tree ────────────────────────────────────────
+
+(defn children
+  "The child set: [{:id :pid :type}] — the supervisor's state, as data.
+   (OTP does not expose per-child restart counts; the tree shape is what
+   it exposes, so that is what we hand back.)"
+  [s]
+  (vec (map (fn [t]
+              (let [parts (erlang/tuple_to_list t)]
+                {:id (nth parts 0) :pid (nth parts 1) :type (nth parts 2)}))
+            (Supervisor/which_children s))))
+
+(defn child-of
+  "The pid of the child named id. When the child is a POOL (a sub-supervisor
+   with a :dispatcher child), returns the dispatcher's pid — so a plain cast
+   reaches a worker, per the pool protocol."
+  [s id]
+  (let [c (first (filter (fn [c] (= id (:id c))) (children s)))]
+    (if (nil? c)
+      nil
+      (if (= :supervisor (:type c))
+        (let [d (first (filter (fn [c2] (= :dispatcher (:id c2)))
+                               (children (:pid c))))]
+          (if (nil? d) (:pid c) (:pid d)))
+        (:pid c)))))
+
+(defn terminate [s id] (Supervisor/terminate_child s id))
+(defn restart   [s id] (Supervisor/restart_child s id))
+
+;; ── the pool ───────────────────────────────────────────────────────────
+
+; The dispatcher is one worker among siblings; it finds them through the
+; pool's REGISTERED name (its init arg) — a name, not a pid, so it survives
+; the sub-supervisor's own restarts.
+(defserver pool-dispatcher
+  (init [sup-name] (ok {:sup sup-name :next 0}))
+  (handle-cast msg [st]
+    (let [sup (Process/whereis (:sup st))]
+      (if (nil? sup)
+        (noreply st)
+        (let [workers (vec (filter (fn [c] (not (= (erlang/self) (:pid c))))
+                                   (children sup)))
+              n (count workers)]
+          (if (= n 0)
+            (noreply st)
+            (let [w (:pid (nth workers (rem (:next st) n)))]
+              (cast w msg)
+              (noreply {:sup (:sup st) :next (inc (:next st))}))))))))
+
+(defn pool-spec
+  "A pool child spec: n identical `target` workers under a named one-for-one
+   sub-supervisor, fronted by the dispatcher. Each worker's init arg is its
+   index (0..n-1) — the one thing that distinguishes identical workers. The
+   sub-supervisor registers as <id>-sup; pool ids must be unique per VM
+   (a second pool with the same id refuses to start, loudly)."
+  [id target n]
+  (BeamLisp.Supervisor/pool id
+                            (keyword (str (name id) "-sup"))
+                            pool-dispatcher
+                            target
+                            n))
+
+;; ── the form ───────────────────────────────────────────────────────────
+
+(defmacro defsupervisor
+  "Define a supervision tree as data. The name binds a spec map; start it with
+   the prelude verbs: (start-link billing).
+
+   (super/defsupervisor billing
+     (strategy :one-for-one)            ; default; :one-for-all :rest-for-one
+     (intensity 3 5000)                 ; max restarts / window ms
+     (child :acct account 100)          ; id, defserver name, init args…
+     (child :ledger ledger {:restart :transient :shutdown 5000})
+     (child :workers (pool worker 4)))"
+  [name & clauses]
+  (let [of (fn [hd] (first (filter (fn [c] (= hd (first c))) clauses)))
+        strategy-clause (of (quote strategy))
+        strategy (if (nil? strategy-clause) :one-for-one (second strategy-clause))
+        intensity-clause (of (quote intensity))
+        intensity (if (nil? intensity-clause) nil (vec (rest intensity-clause)))
+        child-form (fn [c]
+                     (let [id (second c)
+                           target (nth c 2)
+                           more (drop 3 c)]
+                       (if (and (erlang/is_list target)
+                                (= (quote pool) (first target)))
+                         `(super/pool-spec ~id ~(second target) ~(nth target 2))
+                         (let [n-more (count more)
+                               lastf (if (> n-more 0) (nth more (dec n-more)) nil)
+                               has-opts (and (not (nil? lastf)) (map? lastf))
+                               init-args (if has-opts (take (dec n-more) more) more)
+                               arg (if (empty? init-args) nil (first init-args))]
+                           ;; The child IS the gen_server (an MFA child spec),
+                           ;; never a wrapper task that would exit :normal and
+                           ;; restart forever. One init arg; for several, pass
+                           ;; a vector.
+                           (if has-opts
+                             `(BeamLisp.Supervisor/server ~id ~target ~arg ~lastf)
+                             `(BeamLisp.Supervisor/server ~id ~target ~arg))))))]
+    `(def ~name
+       {:__supervisor__ true
+        :strategy ~strategy
+        :intensity ~intensity
+        :children (list ~@(map child-form (filter (fn [c] (= (quote child) (first c))) clauses)))})))

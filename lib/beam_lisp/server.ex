@@ -103,6 +103,13 @@ defmodule BeamLisp.Server do
   def start_link(mod), do: start_link(mod, nil, %{})
   def start_link(mod, arg), do: start_link(mod, arg, %{})
 
+  # A defsupervisor spec is data with a `__supervisor__` marker: starting it
+  # delegates to the Supervisor path. Extra args (init arg, opts) do not
+  # apply to a tree, so they are refused loudly rather than dropped.
+  def start_link(%{__supervisor__: true} = spec, nil, opts) when opts == %{} do
+    BeamLisp.Supervisor.start_link(spec)
+  end
+
   # OTP has no "no name" value: an anonymous server uses the /3 arity,
   # a registered one the /4. Passing [] as a name is an ArgumentError.
   def start_link(mod, arg, opts) do
@@ -118,6 +125,10 @@ defmodule BeamLisp.Server do
   @doc "Start an unsupervised server."
   def start(mod), do: start(mod, nil, %{})
   def start(mod, arg), do: start(mod, arg, %{})
+
+  def start(%{__supervisor__: true} = spec, nil, opts) when opts == %{} do
+    BeamLisp.Supervisor.start_link(spec)
+  end
 
   def start(mod, arg, opts) do
     conveyed = convey_arg(arg)
@@ -158,12 +169,12 @@ defmodule BeamLisp.Server do
   def bind_init(arg), do: arg
 
   @doc "Synchronous call. Default timeout matches OTP's 5s."
-  def call(server, msg), do: :gen_server.call(server, msg)
-  def call(server, msg, timeout), do: :gen_server.call(server, msg, timeout)
+  def call(server, msg), do: :gen_server.call(resolve(server), msg)
+  def call(server, msg, timeout), do: :gen_server.call(resolve(server), msg, timeout)
 
   @doc "Fire-and-forget cast. Always returns nil, as the reply is the absence of one."
   def cast(server, msg) do
-    :gen_server.cast(server, msg)
+    :gen_server.cast(resolve(server), msg)
     nil
   end
 
@@ -171,9 +182,29 @@ defmodule BeamLisp.Server do
   def stop(server), do: stop(server, :normal)
 
   def stop(server, reason) do
-    :gen_server.stop(server, reason, :infinity)
+    :gen_server.stop(resolve(server), reason, :infinity)
     nil
   end
+
+  # A NAME IS A VALUE: `[:registry key]` anywhere a pid is expected resolves
+  # through that registry — an OTP-registered atom naming a defregistry
+  # server — to the pid registered under `key`. Resolution happens HERE,
+  # once, in the verbs, not in each form (docs/the-five-bundles.md §0).
+  defp resolve(%BeamLisp.Vector{items: {reg, key}}) when is_atom(reg) do
+    if Process.whereis(reg) == nil do
+      raise ArgumentError, "no registry named #{inspect(reg)} is running"
+    end
+
+    case :gen_server.call(reg, %BeamLisp.Vector{items: {:whereis, key}}) do
+      nil ->
+        raise ArgumentError, "no process registered as #{inspect([reg, key])}"
+
+      pid when is_pid(pid) ->
+        pid
+    end
+  end
+
+  defp resolve(other), do: other
 
   # `{:ok, pid}` is OTP's shape, but a beam-lisp caller wants the pid —
   # a failed start should raise rather than hand back a tuple that

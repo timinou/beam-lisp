@@ -87,6 +87,69 @@ defmodule BeamLisp.Supervisor do
     pid
   end
 
+  @doc """
+  Child spec for a defserver child: the child IS the gen_server, not a wrapper.
+
+  A bare-fn child (`worker/2`) runs the fn as a `Task` — right for a loop,
+  wrong for a gen_server: the fn would return the pid, the task would exit
+  `:normal`, and a `:permanent` supervisor would restart it forever. So a
+  defserver child is an MFA tuple pointing here, and `start_server/2` returns
+  the `{:ok, pid}` shape OTP requires.
+  """
+  def server(id, mod), do: server(id, mod, nil, %{})
+  def server(id, mod, arg), do: server(id, mod, arg, %{})
+
+  def server(id, mod, arg, opts) when is_map(opts) do
+    %{id: id, start: {__MODULE__, :start_server, [mod, arg]}}
+    |> maybe_put(opts, :restart)
+    |> maybe_put(opts, :shutdown)
+    |> maybe_put(opts, :type)
+  end
+
+  @doc "The child-start entry of a defserver child spec (see `server/4`)."
+  def start_server(mod, arg) do
+    {:ok, BeamLisp.Server.start_link(mod, arg)}
+  end
+
+  @doc """
+  Child spec for a POOL: a named one-for-one sub-supervisor owning one
+  dispatcher (whose init arg is the pool's registered name) and `n` identical
+  workers (each receives its index as init arg). The whole sub-tree is one
+  child: it restarts and dies as a unit.
+  """
+  def pool(id, sup_name, dispatcher_mod, target, n) do
+    children =
+      [%{id: :dispatcher, start: {__MODULE__, :start_server, [dispatcher_mod, sup_name]}}] ++
+        for i <- 0..(n - 1), do: server(String.to_atom("w#{i}"), target, i)
+
+    %{id: id, type: :supervisor, start: {__MODULE__, :start_named_sup, [children, sup_name]}}
+  end
+
+  @doc "The child-start entry of a pool spec: start the named sub-supervisor."
+  def start_named_sup(children, name) do
+    Supervisor.start_link(children, strategy: :one_for_one, name: name)
+  end
+
+  @doc """
+  Start a tree from a `defsupervisor` spec map — what the prelude `start-link`
+  dispatches to when its argument carries the `__supervisor__` marker.
+
+      {:__supervisor__ true
+       :strategy :one-for-one
+       :intensity [3 5000]              ; bl vector → max_restarts/max_seconds
+       :children (list worker-spec …)}
+  """
+  def start_link(%{strategy: strategy, children: children} = spec) do
+    sup_opts = [strategy: normalize_strategy(strategy)] ++ intensity_from(spec)
+    {:ok, pid} = Supervisor.start_link(child_list(children), sup_opts)
+    pid
+  end
+
+  defp intensity_from(%{intensity: %BeamLisp.Vector{items: {max_r, max_s}}}),
+    do: [max_restarts: max_r, max_seconds: max_s]
+
+  defp intensity_from(_), do: []
+
   # beam-lisp writes restart strategies the way the reader spells them —
   # `:one-for-one` — while Elixir's Supervisor wants `:one_for_one`. A
   # dashed atom is just the same strategy with its hyphens turned to
