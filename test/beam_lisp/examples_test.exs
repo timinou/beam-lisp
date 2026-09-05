@@ -51,7 +51,12 @@ defmodule BeamLisp.ExamplesTest do
       end
     end
 
-    entries = Enum.map(@examples, fn p -> %{"path" => p, "src" => File.read!(p)} end)
+    # Read each example through `Loader.read_source/1`, not a raw `File.read!`:
+    # that is the loader's own read, so a `#!/usr/bin/env bl` shebang line is
+    # stripped and a literate `.bl.md`/`.bl.org` example is reduced to its code
+    # cells — exactly as when the file is `bl run`. A raw read would feed ward
+    # the shebang and fail an otherwise-runnable executable script.
+    entries = Enum.map(@examples, fn p -> %{"path" => p, "src" => BeamLisp.Loader.read_source(p)} end)
     BeamLisp.Env.intern("user", "__ward_examples__", entries)
 
     result =

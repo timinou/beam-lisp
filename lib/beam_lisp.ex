@@ -56,6 +56,16 @@ defmodule BeamLisp do
       # program is its code cells, exactly as when it is `:require`d.
       source = BeamLisp.Loader.read_source(path)
 
+      # Bind the Clojure/Babashka `*command-line-args*` var to THIS run's argv
+      # before evaluating. A script entry point reads a bare `*command-line-args*`
+      # (the bb idiom); the compat `clojure.io` namespace deliberately does NOT
+      # intern it (it would load in the Loader.Server process and snapshot an
+      # empty argv), so THIS process — which holds the `argv/0` binding — interns
+      # the live value. Set AFTER any require the script triggers still resolves
+      # it, because a `def`-style var read hits the registry at call time.
+      # Interning unconditionally is harmless when no script reads it.
+      BeamLisp.Env.intern("core", "*command-line-args*", argv())
+
       Compiler.eval_string(source, Compiler.new_env(), path)
     end)
   end

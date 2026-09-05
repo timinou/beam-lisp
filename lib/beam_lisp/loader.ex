@@ -374,11 +374,26 @@ defmodule BeamLisp.Loader do
   # A document's loadable source: itself when plain .bl, else its code cells.
   defp doc_content(path, raw) do
     if String.ends_with?(path, ".bl") do
-      raw
+      strip_shebang(raw)
     else
       doc_source(raw, if(String.ends_with?(path, ".org"), do: :org, else: :md))
     end
   end
+
+  # A leading `#!/usr/bin/env bl` shebang line lets a `.bl` script be executable
+  # directly, exactly as a Babashka script begins with `#!/usr/bin/env bb`. The
+  # reader has no notion of a shebang, so strip a first-line `#!` here —
+  # replacing it with an EMPTY line, not deleting it, so every subsequent form's
+  # line number (and thus every diagnostic) still points where the author wrote
+  # it. Only the very first line, and only when it starts with `#!`.
+  defp strip_shebang(<<"#!", _::binary>> = raw) do
+    case String.split(raw, "\n", parts: 2) do
+      [_shebang, rest] -> "\n" <> rest
+      [_shebang] -> ""
+    end
+  end
+
+  defp strip_shebang(raw), do: raw
   @doc """
   The program of a livebook document: every code cell concatenated, in
   document order. `format` is `:md` for `.bl.md` (fenced beam-lisp cells)

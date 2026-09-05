@@ -1223,8 +1223,20 @@ defmodule BeamLisp.RT do
   def sort(coll), do: sort(&compare/2, coll)
 
   def sort(comp, coll) do
-    coll |> seqable() |> Enum.sort(fn a, b -> invoke(comp, [a, b]) <= 0 end) |> empty_contract()
+    coll |> seqable() |> Enum.sort(fn a, b -> comparator_le(invoke(comp, [a, b])) end) |> empty_contract()
   end
+
+  # Clojure's `sort`/`sort-by` accept EITHER a 3-way comparator (returns a
+  # negative/zero/positive number, like `compare`) OR a boolean predicate (like
+  # `<` or `>`). Erlang's `Enum.sort` wants a `a <= b` boolean. Bridge both:
+  #   * a boolean result  -> use it directly (true means "a before b", exactly
+  #                          `Enum.sort`'s `<=` contract for a `<`-style pred).
+  #   * a numeric result  -> `<= 0` means "a before-or-equal b".
+  # Without the boolean case, `(sort > coll)` silently mis-sorts: `true <= 0`
+  # is false for every pair, so nothing orders. This is the fidelity gap that
+  # made `(sort-by val > freqs)` return garbage.
+  defp comparator_le(result) when is_boolean(result), do: result
+  defp comparator_le(result) when is_number(result), do: result <= 0
 
   # --- cpp/* interop ------------------------------------------------
   # jank writes `(cpp/jank.runtime.name x)` for its C++ primitives.
