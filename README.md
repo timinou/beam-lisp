@@ -52,3 +52,28 @@ It also makes it a lot more fun to prototype. (TODO When you do `bl watch <file-
 
 ## Mindblowers
 
+### Real Babashka/Clojure stdlib runs on the BEAM
+
+Unmodified Clojure source — `clojure.string`, `clojure.set`, `clojure.walk`,
+`clojure.edn`, `clojure.java.io`, `babashka.fs` — loads and runs on beam-lisp,
+graded by **Clojure's own test suites** (81 tests, 339 assertions, zero
+failures). `clojure.set` is vendored *byte-for-byte* upstream; the Java-interop
+namespaces are reimplemented against BEAM primitives with the same contracts.
+`slurp`/`spit`/`*command-line-args*`/shebangs make a `.bl` file a runnable
+Babashka-style script.
+
+- The measurement (method, scorecard, gaps closed, honest boundaries):
+  [`docs/babashka-compat.md`](docs/babashka-compat.md)
+- A runnable literate guidebook (every code cell executes):
+  [`docs/babashka-on-the-beam.bl.md`](docs/babashka-on-the-beam.bl.md) —
+  `mix beam_lisp.run docs/babashka-on-the-beam.bl.md`
+- Showcase scripts: [`examples/babashka/`](examples/babashka/) —
+  `wordfreq.bl`, `edn_report.bl`, `loc.bl`
+
+```clojure
+(ns app (:require [clojure.string :as str] [clojure.edn :as edn]))
+(->> (edn/read-string (slurp "data.edn"))   ; safe, never evaluates
+     (group-by :region)
+     (sort-by (comp count val) >))            ; Clojure idiom, on OTP
+```
+

@@ -80,4 +80,23 @@ defmodule BeamLisp.BabashkaShowcaseTest do
       assert out =~ ~r/bl\s+\d+\s+\d+/
     end
   end
+
+  describe "the runnable guidebook" do
+    test "docs/babashka-on-the-beam.bl.md executes every code cell" do
+      # A literate `.bl.md` doc: run_file reads its beam-lisp code cells and
+      # evaluates them. This pins that the whole guidebook runs end to end and
+      # that its key computations are right — so the doc cannot rot.
+      out =
+        ExUnit.CaptureIO.capture_io(fn ->
+          BeamLisp.run_file("docs/babashka-on-the-beam.bl.md")
+        end)
+
+      # a spread of sections, and the final marker proving it reached the end
+      assert out =~ "hell0 w0rld"
+      assert out =~ "safety — (inc 1) stays DATA: (inc 1)"
+      assert out =~ "south: 550"
+      assert out =~ "north: 250"
+      assert out =~ "everything above executed"
+    end
+  end
 end
