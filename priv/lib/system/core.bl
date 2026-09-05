@@ -709,6 +709,41 @@
              (decl-cmds decls)
              [(smtlib/assert `(not (Inv ~@init-exprs)))]))))
 
+(defn- invariant-clause
+  "The (invariant [s] pred) clause of a defserver NODE, as
+   {:node pred-node :binder \"s\"} — or nil. The clause alternative to
+   ^{:invariant} meta (invariant-node): same check, friendlier spelling.
+   The binder is the clause's OWN name for the state; verify-process
+   substitutes the init's state name for it (subst-sym) before translating."
+  [node]
+  (if (= "defserver" (model/head-name node))
+    (let [its (typed/node-items (typed/node-form node))]
+      (first
+        (keep (fn [c]
+                (if (= "invariant" (model/head-name c))
+                  (let [cits (typed/node-items (typed/node-form c))
+                        params (nth cits 1)
+                        binder (typed/node-name (typed/node-form (first (typed/node-items params))))]
+                    {:node (last cits) :binder binder})
+                  nil))
+              (drop 2 its))))
+    nil))
+
+(defn- subst-sym
+  "NODE with every symbol `from` replaced by symbol `to`, via a form
+   round-trip (delaborate → walk → re-read). Sound for the small arithmetic
+   predicates invariants are; positions degrade to the re-read, which only
+   warning carets notice."
+  [node from to]
+  (let [form (errors/delaborate node)
+        walk (fn walk [x]
+               (cond
+                 (and (symbol? x) (= (str x) from)) (symbol to)
+                 (vector? x) (vec (map walk x))
+                 (seq? x) (apply list (map walk x))
+                 :else x))]
+    (first (BeamLisp.Reader/read_string (pr-str (walk form))))))
+
 (defn verify-process
   "Verify a process SOURCE FORM end to end. Returns:
      {:name :holds :warnings [{:msg :line :col}] :checked bool}
@@ -720,10 +755,21 @@
   [port node]
   (let [sm (model/system-model node)
         clauses (:transitions sm)
-        inv-node (invariant-node node)]
-    (if (nil? inv-node)
+        ; the invariant comes from ^{:invariant …} name meta OR an
+        ; (invariant [s] pred) clause — same check, two spellings
+        inv-spec (let [m (invariant-node node)]
+                   (if (some? m) {:node m :binder nil} (invariant-clause node)))]
+    (if (nil? inv-spec)
       {:name (:name sm) :holds nil :checked false :warnings []}
-      (let [shape (state-shape inv-node clauses)
+      (let [preshape (state-shape (:node inv-spec) clauses)
+            binder (:binder inv-spec)]
+        (if (and (some? binder) (not= 1 (count (:svars preshape))))
+          {:name (:name sm) :holds nil :checked false :warnings []
+           :reason "invariant clause needs single-field state; for map/vector state use ^{:invariant} meta naming the fields"}
+          (let [inv-node (if (some? binder)
+                           (subst-sym (:node inv-spec) binder (first (:svars preshape)))
+                           (:node inv-spec))
+            shape preshape
             svars (:svars shape)
             sorts (:sorts shape)
             init-c0 (first (filter (fn [c] (= :init (:label c))) clauses))
@@ -810,7 +856,7 @@
             {:name (:name sm)
              :holds (and init-est (empty? failures))
              :checked true
-             :warnings (box-warnings {:failures failures} pos)}))))))
+             :warnings (box-warnings {:failures failures} pos)}))))))))
 
 (defn repair-process
   "For each transition that BREAKS the invariant, synthesize the weakest extra
@@ -1421,6 +1467,93 @@
                   (map (fn [w] (errors/render file src w)) (:warnings r))
                   [])))
             forms)))
+
+(defn- supervisor-targets
+  "The child target NAMES of a defsupervisor form, pools unwrapped:
+   (child :acct account 100) → [\"account\"]; (child :w (pool worker 4)) → [\"worker\"]."
+  [node]
+  (let [its (typed/node-items (typed/node-form node))]
+    (vec (mapcat (fn [c]
+                   (if (= "child" (model/head-name c))
+                     (let [cf (typed/node-form c)
+                           cits (typed/node-items cf)]
+                       (if (< (count cits) 3)
+                         []
+                         (let [tf (typed/node-form (nth cits 2))]
+                           (cond
+                             (and (= :list (typed/node-tag tf))
+                                  (= "pool" (model/head-name (nth cits 2))))
+                             (let [inner (typed/node-form (second (typed/node-items tf)))]
+                               (if (= :symbol (typed/node-tag inner))
+                                 [(typed/node-name inner)]
+                                 []))
+                             (= :symbol (typed/node-tag tf)) [(typed/node-name tf)]
+                             :else []))))
+                     []))
+                 (drop 2 its)))))
+
+(defn verify
+  "(verify 'ns/name) — verify `name` from SOURCE: resolve the ns over the load
+   path, read the file, find the form, prove under a fresh z3 port.
+
+   A DEFSERVER proves its invariant (establish + preserve).
+   A DEFSUPERVISOR proves the invariant of every child it names (the tree is
+   only as true as its leaves; the supervisor itself has no state to assert
+   over). → :ok | {:unsafe [rendered-warnings]} | :unchecked.
+
+   One quoted name, no port management, no reader plumbing. Opens a z3 process
+   per call — right for pre-boot gates, not hot loops."
+  [qname]
+  (let [ns-str (namespace qname)
+        nm (name qname)
+        rel (str (String/replace ns-str "." "/") ".bl")
+        dir (first (filter (fn [d] (File/exists? (str d "/" rel)))
+                           (cons (second (File/cwd)) (BeamLisp.Env/load_paths))))]
+    (if (nil? dir)
+      :unchecked
+      (let [path (str dir "/" rel)
+            src (second (File/read path))
+            forms (BeamLisp.Reader/read_string src)
+            named? (fn [n]
+                     (= nm (typed/node-name
+                             (typed/node-form
+                               (second (typed/node-items (typed/node-form n)))))))
+            defserver-node (first (filter (fn [n] (and (= "defserver" (model/head-name n))
+                                                       (named? n)))
+                                          forms))
+            defsupervisor-node (first (filter (fn [n] (and (= "defsupervisor" (model/head-name n))
+                                                           (named? n)))
+                                              forms))]
+        (cond
+          (not (nil? defserver-node))
+          (let [port (z3/open)
+                r (verify-process-report port path src defserver-node)]
+            (cond
+              (not (:checked r)) :unchecked
+              (:holds r) :ok
+              :else {:unsafe (vec (:rendered r))}))
+
+          (not (nil? defsupervisor-node))
+          (let [port (z3/open)
+                targets (supervisor-targets defsupervisor-node)
+                results (map (fn [t]
+                               (let [tn (first (filter (fn [n]
+                                                         (and (= "defserver" (model/head-name n))
+                                                              (= t (typed/node-name
+                                                                     (typed/node-form
+                                                                       (second (typed/node-items (typed/node-form n))))))))
+                                                       forms))]
+                                 (if (nil? tn)
+                                   {:name t :checked false :holds false :rendered []}
+                                   (verify-process-report port path src tn))))
+                             targets)]
+            (cond
+              (some (fn [r] (and (:checked r) (not (:holds r)))) results)
+              {:unsafe (vec (mapcat (fn [r] (:rendered r)) results))}
+              (every? (fn [r] (and (:checked r) (:holds r))) results) :ok
+              :else :unchecked))
+
+          :else :unchecked)))))
 
 ; ════════════════════════════════════════════════════════════════════
 ; MESSAGE COVERAGE — the check only we can do (P17)
