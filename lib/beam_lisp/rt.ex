@@ -70,6 +70,30 @@ defmodule BeamLisp.RT do
   # which is how jank's doseq indexes its binding vector.
   def invoke(%BeamLisp.Vector{} = v, [i]) when is_integer(i), do: BeamLisp.Vector.nth(v, i)
 
+  # Sets are functions of their members: `(#{1 2} 1)` ≡ `1`, `(#{1 2} 9)` ≡ nil,
+  # exactly as in Clojure. clojure.set/join relies on this (it uses an index map
+  # AND membership tests as functions).
+  def invoke(%BeamLisp.Set{} = s, [k]), do: if(Set.member?(s, k), do: k, else: nil)
+  def invoke(%BeamLisp.Set{} = s, [k, default]),
+    do: if(Set.member?(s, k), do: k, else: default)
+
+  # Sorted collections are functions too: a sorted set of its members, a sorted
+  # map of its keys — mirroring the plain-map/plain-set clauses below.
+  def invoke(%BeamLisp.Sorted.SortedSet{} = s, [k]),
+    do: if(BeamLisp.Sorted.set_member?(s, k), do: k, else: nil)
+  def invoke(%BeamLisp.Sorted.SortedSet{} = s, [k, default]),
+    do: if(BeamLisp.Sorted.set_member?(s, k), do: k, else: default)
+  def invoke(%BeamLisp.Sorted.SortedMap{} = m, [k]), do: get(m, k)
+  def invoke(%BeamLisp.Sorted.SortedMap{} = m, [k, default]), do: get(m, k, default)
+
+  # Plain maps are functions of their keys: `({:a 1} :a)` ≡ `(get m :a)`,
+  # `({:a 1} :z default)` ≡ `(get m :z default)`. This is core Clojure/jank
+  # semantics; clojure.set/join and much idiomatic lookup code depend on it.
+  # Placed AFTER every struct clause (structs are also `is_map`) so only a
+  # genuine plain map reaches here.
+  def invoke(m, [k]) when is_map(m) and not is_struct(m), do: get(m, k)
+  def invoke(m, [k, default]) when is_map(m) and not is_struct(m), do: get(m, k, default)
+
   @doc """
   `~@` splicing. Clojure splices any seqable onto the rest of the form,
   so a spliced vector or lazy seq must flatten like a list — jank's
