@@ -13,13 +13,17 @@ defmodule BeamLisp.Tiers do
       rebuilds only its require-closure.
     * `lib/` — batteries: `datom`, `auth`, `live`, `loom`, `veritas`, `z3`,
       `system`… Same per-namespace keying; optional in a release.
+    * `compat/` — Clojure/Babashka stdlib compatibility: `clojure.string`,
+      `clojure.set`, `clojure.walk`, `clojure.edn`, regex helpers, IO. Native
+      reimplementations exposing the upstream public API so unmodified Clojure
+      source loads and runs. Per-namespace keyed; optional in a release.
 
   `self/` holds the self-hosting gates (oracle, fixpoint) and `build/` the
   build system written in beam-lisp; neither is a library a program requires.
   """
 
-  @tiers ~w(boot std lib build self)
-  @library_tiers ~w(boot std lib build)
+  @tiers ~w(boot std lib compat build self)
+  @library_tiers ~w(boot std lib compat build)
 
   @doc "Tier directory names, in load-path order."
   def names, do: @tiers
