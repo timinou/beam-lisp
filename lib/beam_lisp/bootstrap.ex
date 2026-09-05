@@ -219,16 +219,30 @@ defmodule BeamLisp.Bootstrap do
   end
 
   # Whether `dst` holds a beam stamped with the current toolchain key. The
-  # stamp is the `__bl_provenance__/0` function, so reading it costs a load;
-  # install! loads every module below anyway, so this only changes WHICH
-  # bytes get loaded. Absent/unstamped beams answer false (drifted or
-  # pre-provenance: overwrite with the seed, as before).
+  # stamp is the `__bl_provenance__/0` function, which only the namespace SHIM
+  # (Ns.<Name>) carries — Ns.Body.<Name> and Ns.Init.<Name> have none. A seed
+  # namespace is one generation unit: shim, body and init are built together,
+  # so a Body/Init destination inherits the verdict of its sibling shim beam.
+  # (Reading the body alone answered false — no provenance fn — and every boot
+  # under a mismatched seed copied the gen-N seed body over a fresh gen-N+1
+  # rebuild, leaving a fresh shim forwarding to a stale body: `undefined
+  # function` for every var added since the seed was frozen.)
+  # Reading the stamp costs a load; install! loads every module below anyway,
+  # so this only changes WHICH bytes get loaded. Absent/unstamped beams answer
+  # false (drifted or pre-provenance: overwrite with the seed, as before).
   defp fresh_generation?(dst, current_key) do
-    with {:ok, bytes} <- File.read(dst),
-         mod <- dst |> Path.basename(".beam") |> String.to_atom(),
+    provenance_beam =
+      cond do
+        String.contains?(dst, ".Body.") -> String.replace(dst, ".Body.", ".")
+        String.contains?(dst, ".Init.") -> String.replace(dst, ".Init.", ".")
+        true -> dst
+      end
+
+    with {:ok, bytes} <- File.read(provenance_beam),
+         mod <- provenance_beam |> Path.basename(".beam") |> String.to_atom(),
          :code.purge(mod),
          :code.delete(mod),
-         {:module, _} <- :code.load_binary(mod, String.to_charlist(dst), bytes),
+         {:module, _} <- :code.load_binary(mod, String.to_charlist(provenance_beam), bytes),
          true <- function_exported?(mod, :__bl_provenance__, 0),
          {_src_hash, key} <- mod.__bl_provenance__() do
       key == current_key

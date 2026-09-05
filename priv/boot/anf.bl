@@ -265,3 +265,193 @@
                  (to-list (map (fn [kv] [(normalise (elem kv 0)) (normalise (elem kv 1))]) (qargs fields)))))
 
     :else (throw (ex-info "anf/normalise: unhandled quoted node" {:node t}))))
+
+;; ── quote-node: the reverse bridge (TRANSITION-ONLY, dies in PLAN-086 E5) ───
+;;
+;; bl-ANF → Elixir-quoted. While compiler.bl's producers convert to direct ANF
+;; emission family-by-family, the public `compile` boundary wraps its output in
+;; quote-node so the quoted consumers (eval_form's Module.create, the defvar
+;; entries) keep working unchanged. Correctness is proven structurally:
+;; normalise ∘ quote-node ≡ identity over the 442-form corpus fixture
+;; (test/fixtures/anf_corpus/), and the whole tree builds green through it.
+
+(def ^:private qvar-ctx (erlang/binary_to_atom "Elixir.BeamLisp.Compiler"))
+
+(defn- qvar-node [name] (erlang/list_to_tuple (list (erlang/binary_to_atom name) (list) qvar-ctx)))
+
+(defn- elixir-alias [m]
+  ; :"Elixir.BeamLisp.RT" → {:__aliases__, [alias: false], [:BeamLisp :RT]}
+  (let [s (erlang/atom_to_binary m)
+        bare (if (and (> (erlang/byte_size s) 7) (= "Elixir." (erlang/binary_part s 0 7)))
+               (erlang/binary_part s 7 (- (erlang/byte_size s) 7))
+               nil)]
+    (if (nil? bare)
+      m
+      (erlang/list_to_tuple
+        (list :__aliases__
+              (list (erlang/list_to_tuple (list :alias false)))
+              (to-list (map erlang/binary_to_atom
+                            (to-list (String/split bare ".")))))))))
+
+(declare quote-node)
+
+(defn- quote-lit
+  "Embed a VALUE as quoted data (Macro/escape's job): scalars self-quote;
+   composites embed structurally."
+  [v]
+  (cond
+    (erlang/is_tuple v)
+      (let [xs (erlang/tuple_to_list v)]
+        (if (= 2 (count xs))
+          (erlang/list_to_tuple (to-list (map quote-lit (to-list xs))))
+          (erlang/list_to_tuple (list (erlang/binary_to_atom "{}") (list)
+                                      (to-list (map quote-lit (to-list xs)))))))
+    (erlang/is_list v)
+      (to-list (map quote-lit (to-list v)))
+    (map? v)
+      (erlang/list_to_tuple (list (erlang/binary_to_atom "%{}") (list)
+                                  (to-list (map (fn [k] (erlang/list_to_tuple
+                                                          (list (quote-lit k) (quote-lit (get v k)))))
+                                                (maps/keys v)))))
+    :else v))
+
+(defn- quote-pat [p]
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar) (qvar-node (:name p))
+      (= op :plit) (quote-lit (:val p))
+      (= op :pnil) (list)
+      (= op :ptuple)
+        (let [xs (to-list (map quote-pat (:elems p)))]
+          (if (= 2 (count xs))
+            (erlang/list_to_tuple xs)
+            (erlang/list_to_tuple (list (erlang/binary_to_atom "{}") (list) xs))))
+      (= op :pcons)
+        (list (erlang/list_to_tuple (list qbar (list) (list (quote-pat (:head p)) (quote-pat (:tail p))))))
+      (= op :palias)
+        (erlang/list_to_tuple (list := (list) (list (quote-pat (:a p)) (quote-pat (:b p)))))
+      (= op :pmap)
+        (erlang/list_to_tuple (list qmap-open (list)
+                                    (to-list (map (fn [kv] (erlang/list_to_tuple
+                                                             (list (quote-node (first kv)) (quote-pat (second kv)))))
+                                                  (:pairs p)))))
+      (= op :pstruct)
+        (erlang/list_to_tuple (list qpct (list)
+                                    (list (elixir-alias (:mod p))
+                                          (erlang/list_to_tuple
+                                            (list qmap-open (list)
+                                                  (to-list (map (fn [kv] (erlang/list_to_tuple
+                                                                           (list (quote-lit (first kv)) (quote-pat (second kv)))))
+                                                                (:fields p))))))))
+      :else (throw (ex-info "anf/quote-pat: unknown pop" {:pop op})))))
+
+(defn- quote-clauses [clauses]
+  (to-list
+    (map (fn [cl]
+           (let [pats (to-list (map quote-pat (:pats cl)))
+                 body (quote-node (:body cl))]
+             (if (nil? (:guard cl))
+               (erlang/list_to_tuple (list :-> (list) (list pats body)))
+               (erlang/list_to_tuple (list :-> (list)
+                                           (list (list (erlang/list_to_tuple
+                                                         (list :when (list)
+                                                               (to-list (concat pats (list (quote-node (:guard cl))))))))
+                                                 body))))))
+         clauses)))
+
+(defn quote-node
+  "bl-ANF node → Elixir-quoted tree. The transition adapter; see above."
+  [n]
+  (let [op (:op n)
+        qn (fn [x] (quote-node x))]
+    (cond
+      (= op :lit) (quote-lit (:val n))
+      (= op :var) (qvar-node (:name n))
+      (= op :global)
+        (erlang/list_to_tuple
+          (list (erlang/list_to_tuple
+                  (list :. (list)
+                        (list (erlang/list_to_tuple
+                                (list :__aliases__
+                                      (list (erlang/list_to_tuple (list :alias false)))
+                                      (list :BeamLisp :Env)))
+                              :fetch!)))
+                (list) (list (:ns n) (:name n))))
+      (= op :remote)
+        (erlang/list_to_tuple
+          (list (erlang/list_to_tuple (list :. (list) (list (elixir-alias (:mod n)) (:fun n))))
+                (list) (to-list (map qn (:args n)))))
+      (= op :apply)
+        (erlang/list_to_tuple
+          (list (erlang/list_to_tuple (list :. (list) (list (qn (:fn n)))))
+                (list) (to-list (map qn (:args n)))))
+      (= op :let)
+        (let [fnn-q (erlang/list_to_tuple
+                      (list :fn (list)
+                            (list (erlang/list_to_tuple
+                                    (list :-> (list) (list (list (qvar-node (:name n))) (qn (:body n))))))))]
+          (erlang/list_to_tuple
+            (list (erlang/list_to_tuple (list :. (list) (list fnn-q)))
+                  (list) (list (qn (:init n))))))
+      (= op :if)
+        (erlang/list_to_tuple
+          (list :if (list)
+                (list (qn (:test n))
+                      (list (erlang/list_to_tuple (list :do (qn (:then n))))
+                            (erlang/list_to_tuple (list :else (qn (:else n))))))))
+      (= op :do)
+        (erlang/list_to_tuple (list :__block__ (list) (to-list (map qn (:stmts n)))))
+      (= op :case)
+        (erlang/list_to_tuple
+          (list :case (list)
+                (list (qn (:subj n))
+                      (list (erlang/list_to_tuple (list :do (quote-clauses (:clauses n))))))))
+      (= op :fn)
+        (erlang/list_to_tuple (list :fn (list) (quote-clauses (:clauses n))))
+      (= op :try)
+        (let [kvs (concat (list (erlang/list_to_tuple (list :do (qn (:body n)))))
+                          (if (empty? (:catch n)) (list)
+                            (list (erlang/list_to_tuple (list :catch (quote-clauses (:catch n))))))
+                          (if (nil? (:after n)) (list)
+                            (list (erlang/list_to_tuple (list :after (qn (:after n)))))))]
+          (erlang/list_to_tuple (list :try (list) (list (to-list kvs)))))
+      (= op :recv)
+        (let [kvs (concat (list (erlang/list_to_tuple (list :do (quote-clauses (:clauses n)))))
+                          (if (nil? (:timeout n)) (list)
+                            (list (erlang/list_to_tuple
+                                    (list :after (list (erlang/list_to_tuple
+                                                         (list :-> (list)
+                                                               (list (list (qn (:timeout n))) (qn (:after n)))))))))))]
+          (erlang/list_to_tuple (list :receive (list) (list (to-list kvs)))))
+      (= op :tuple)
+        (let [xs (to-list (map qn (:elems n)))]
+          (if (= 2 (count xs))
+            (erlang/list_to_tuple xs)
+            (erlang/list_to_tuple (list qtuple (list) xs))))
+      (= op :map)
+        (erlang/list_to_tuple (list qmap-open (list)
+                                    (to-list (map (fn [kv] (erlang/list_to_tuple (list (qn (first kv)) (qn (second kv)))))
+                                                  (:pairs n)))))
+      (= op :enil) (list)
+      (= op :cons)
+        (list (erlang/list_to_tuple (list qbar (list) (list (qn (:head n)) (qn (:tail n))))))
+      (= op :struct)
+        (erlang/list_to_tuple (list qpct (list)
+                                    (list (elixir-alias (:mod n))
+                                          (erlang/list_to_tuple
+                                            (list qmap-open (list)
+                                                  (to-list (map (fn [kv] (erlang/list_to_tuple (list (qn (first kv)) (qn (second kv)))))
+                                                                (:fields n))))))))
+      (= op :defn-clause)
+        (let [qpats (to-list (map quote-pat (:pats n)))
+              bare-head (erlang/list_to_tuple (list (:fname n) (list) qpats))
+              head (if (nil? (:guard n))
+                     bare-head
+                     (erlang/list_to_tuple
+                       (list :when (list)
+                             (to-list (concat qpats (list (quote-node (:guard n))))))))]
+          (erlang/list_to_tuple
+            (list :def (list)
+                  (list head
+                        (list (erlang/list_to_tuple (list :do (quote-node (:body n)))))))))
+      :else (throw (ex-info "anf/quote-node: unknown op" {:op op})))))
