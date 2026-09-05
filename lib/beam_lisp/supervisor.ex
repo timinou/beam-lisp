@@ -100,15 +100,21 @@ defmodule BeamLisp.Supervisor do
   def server(id, mod, arg), do: server(id, mod, arg, %{})
 
   def server(id, mod, arg, opts) when is_map(opts) do
-    %{id: id, start: {__MODULE__, :start_server, [mod, arg]}}
+    %{id: id, start: {__MODULE__, :start_server, [mod, arg, Map.get(opts, :name)]}}
     |> maybe_put(opts, :restart)
     |> maybe_put(opts, :shutdown)
     |> maybe_put(opts, :type)
   end
 
-  @doc "The child-start entry of a defserver child spec (see `server/4`)."
-  def start_server(mod, arg) do
-    {:ok, BeamLisp.Server.start_link(mod, arg)}
+  @doc """
+  The child-start entry of a defserver child spec (see `server/4`). `name`
+  is an optional OTP name — a singleton child (a registry, a named bus)
+  stays addressable by name across its own restarts, which is the point.
+  """
+  def start_server(mod, arg, nil), do: {:ok, BeamLisp.Server.start_link(mod, arg)}
+
+  def start_server(mod, arg, name) when is_atom(name) do
+    {:ok, BeamLisp.Server.start_link(mod, arg, %{name: name})}
   end
 
   @doc """
@@ -119,7 +125,7 @@ defmodule BeamLisp.Supervisor do
   """
   def pool(id, sup_name, dispatcher_mod, target, n) do
     children =
-      [%{id: :dispatcher, start: {__MODULE__, :start_server, [dispatcher_mod, sup_name]}}] ++
+      [%{id: :dispatcher, start: {__MODULE__, :start_server, [dispatcher_mod, sup_name, nil]}}] ++
         for i <- 0..(n - 1), do: server(String.to_atom("w#{i}"), target, i)
 
     %{id: id, type: :supervisor, start: {__MODULE__, :start_named_sup, [children, sup_name]}}

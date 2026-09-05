@@ -55,7 +55,7 @@ Semantics every pattern assumes:
 2. An **invariant** is a predicate over state the verifier checks statically
    (`establishes?` on the initial state, `preserves?` on every edge). Violation
    at runtime is a **crash** — it takes the failure edge (§3), never a silent
-   continue. `defserver` gains an `(invariant pred)` clause for it (○).
+   continue. `defserver` has an `(invariant [s] pred)` clause for it (✅).
 3. Every process has two implicit edges the author never writes:
    - **failure**: `∀s. s --[crash]--> ⊥`
    - **exit**: `s --[:stop]--> ∎` (the deliberate terminal)
@@ -608,23 +608,28 @@ Two consequences for the API:
 | pattern | status |
 |---|---|
 | Loop-Carried State, Ask, Tell, Selective Receive, Timeout Edge | ✅ native |
+| Ask/Tell generic verbs | ✅ prelude `call`/`cast`/`start`/`start-link`/`stop`/`monitor`/`link`/`kill`; `[:registry key]` names resolve inside the verbs |
 | Correlated Reply | ✅ via `make_ref` + guard; ○ `^pin` |
 | Parked Waiter | ◐ in `impl.bl`; ○ prelude `park`/`drain` helpers |
 | Pipeline, Demand, Metered Stage, End-of-Stream | ✅ `flow.bl` |
-| Fan-Out, Fan-In | ◐ shim + hand-rolled; ○ `flow/broadcast` `distribute` `merge` |
-| Registry | ◐ `vitals` atom; ○ `defregistry` on datom |
+| Fan-Out | ✅ `flow/broadcast` + `bus.bl` (lag policies, tagged demand) |
+| Fan-In | ◐ `core.async merge` (shim); ○ `flow/merge` `flow/distribute` |
+| Registry | ✅ `reg.bl` — `defregistry`, monitor-retract, name-as-value; ◐ `vitals` atom cutover deferred |
 | Monitor, Link | ✅ native |
-| Healing Edge | ✅ `supervise`; ○ `defsupervisor` |
-| Governor | ✅ OTP intensity; ○ `find-lasso` pre-check wired in |
-| Bounded Isolation | ◐ `ward`, `fence.bl`; ○ stdlib `fence` |
+| Healing Edge | ✅ `supervise` + `defsupervisor` (`super.bl`: strategies, intensity, pools, tree verbs) |
+| Governor | ✅ OTP intensity; `defsupervisor (intensity r s)`; ○ `find-lasso` pre-check wired in |
+| Bounded Isolation | ✅ `fence.bl` stdlib (ward cut over); ◐ hand-rolled copies in spell remain |
 | Heartbeat, Snapshot | ◐ `vitals.bl`; ○ stdlib fns |
-| Invariant Gate | ✅ per-process; ○ per-tree |
+| Invariant Gate | ✅ per-process AND per-tree — `(invariant [s] pred)` clause or `^{:invariant}` meta; `system/verify 'ns/name` |
 | Simulation | ✅ verb; ○ wired to `flow` |
 
-**Honest next slice (supersedes the-fundamental-form.md's `defprocess`
-proposal, which was redundant — the reader already makes every form a graph):**
-generic prelude verbs `call`/`cast`/`start`/`start-link`/`stop` (cutover from
-`server-*`, widened to any pid or name); `(fence ms body)` in stdlib (kills two
-hand-rolled copies in spell); and `system/verify` over one two-worker
-`defsupervisor` — the smallest set that makes §5's "every fn names one
-pattern" true in code. Full step list: `the-five-bundles.md` §7.
+**Proven end-to-end:** `examples/bundles/00-all-five.bl` runs all five
+bundles in one program — verify-gate `:ok` before boot, fence absorbing a
+crash and a hang onto the error bus, pool round-robin, name-as-value stats
+call, and a killed worker regrown with the registry re-pointing.
+
+**What remains (honest):** Tick and Heartbeat/Snapshot stdlib fns;
+`park`/`drain`; `^pin`; `flow/distribute`/`flow/merge`; the `vitals` cutovers
+to fence + registry; `defsystem` running tree-verify in `start`. The
+bootstrap ladder must be repaired before any further `priv/boot/` edit can
+run (PLAN-088).
