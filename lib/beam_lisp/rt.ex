@@ -526,6 +526,12 @@ defmodule BeamLisp.RT do
   # the vector shape made those crash with a FunctionClauseError.
   def conj(m, [k, v]) when is_bl_map(m), do: Map.put(m, hash_key(k), v)
 
+  # A raw 2-element TUPLE is also a map entry. Mapping/reducing over a beam-lisp
+  # map yields its entries as `{k, v}` tuples (e.g. `(map inner a-map)` inside
+  # clojure.walk), and feeding those back into `(into {} …)` must add the entry,
+  # not raise. Only the 2-tuple is an entry; a tuple of any other arity is not.
+  def conj(m, {k, v}) when is_bl_map(m), do: Map.put(m, hash_key(k), v)
+
   def conj(m, entry) when is_bl_map(m) and is_list(entry),
     do: bad_map_entry(entry, length(entry))
 
