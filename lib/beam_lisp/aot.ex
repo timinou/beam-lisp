@@ -283,18 +283,14 @@ defmodule BeamLisp.AOT do
     :ok
   end
 
-  # Under `:aot_backend == :core`, make `self.core` (and its `self.anf` require)
-  # usable in this VM so `emit_module` can route body modules through it. The
-  # `self/` tier is deliberately OFF the library load path (`BeamLisp.Tiers`
-  # excludes it from `library_names/dirs`, so ordinary code cannot `:require`
-  # the compiler's own backend), so its home — `priv/` as the root, where
-  # `self.core` resolves to `self/core.bl` — is added as an explicit search path
-  # only when the Core backend is selected. A no-op under the default `:elixir`
-  # backend: the `self/` quarantine stays intact and nothing loads.
+  # Under `:aot_backend == :core`, make the boot `lower` ns (and its `anf`
+  # require) usable in this VM so `emit_module` can route body modules through
+  # it. Both live in `priv/boot/` — already a searchable tier — so no
+  # search-path juggling is needed; this just interns the namespace.
+  # A no-op under the `:elixir` backend.
   defp maybe_load_core_backend do
     if BeamLisp.AOTCache.aot_backend() == :core do
-      BeamLisp.Env.add_search_path(BeamLisp.Tiers.priv_root())
-      BeamLisp.Loader.ensure_loaded("self.core")
+      BeamLisp.Loader.ensure_loaded("lower")
     end
 
     :ok
@@ -643,7 +639,8 @@ defmodule BeamLisp.AOT do
     #
     # BACKEND SPLIT (PLAN-081 step 1). The BODY modules hold the real code —
     # the sole SEMANTIC dependency on the Elixir backend — so under
-    # `:aot_backend == :core` they are lowered through `self.core` (bl-ANF →
+    # `:aot_backend == :core` they are lowered through the boot `lower` ns
+    # (bl-ANF →
     # Core Erlang → .beam) instead of the Elixir compiler, while the shim,
     # init, and provenance modules stay Elixir (role-B/C runtime plumbing:
     # `Env.intern`, `__bl_init__`, `__bl_provenance__` — target-agnostic
@@ -656,7 +653,7 @@ defmodule BeamLisp.AOT do
       true ->
         # Body modules via Core; the rest (shim + init + companion) via Elixir.
         core_body_beams =
-          BeamLisp.Ns.Self.Core
+          BeamLisp.Ns.Lower
           |> apply(:"aot-body-beams", [ns_defs])
           |> Enum.map(fn tuple -> {elem(tuple, 0), elem(tuple, 1)} end)
 
@@ -676,17 +673,17 @@ defmodule BeamLisp.AOT do
     end
   end
 
-  # Whether the AOT body-module backend is Core Erlang (`self.core`) rather
+  # Whether the AOT body-module backend is Core Erlang (boot `lower` ns) rather
   # than the Elixir compiler. Node-global (`Application.get_env`) DELIBERATELY:
   # the build compiles namespaces in spawned worker processes (build.bl
   # `pmap-ordered`), so a process-dictionary flag would not reach them — only
-  # an application env is visible VM-wide. Guarded on `self.core` actually
+  # an application env is visible VM-wide. Guarded on `lower` actually
   # being loaded and exporting the seam, so a misconfiguration degrades to the
   # Elixir path rather than crashing the build. Default `:core` (PLAN-081 flip).
   defp core_aot_backend? do
     BeamLisp.AOTCache.aot_backend() == :core and
-      Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
-      function_exported?(BeamLisp.Ns.Self.Core, :"aot-body-beams", 1)
+      Code.ensure_loaded?(BeamLisp.Ns.Lower) and
+      function_exported?(BeamLisp.Ns.Lower, :"aot-body-beams", 1)
   end
 
   # Compile-to-disk for one module; returns `{mod, path}`.

@@ -5,7 +5,7 @@ the program it reads as.*
 
 beam-lisp reads and compiles beam-lisp. The reader is `priv/boot/reader.bl`, the
 compiler is `priv/boot/compiler.bl`, and the backend that turns the compiler's
-output into BEAM bytecode is `priv/self/core.bl` — all of it the language, none
+output into BEAM bytecode is `priv/boot/lower.bl` — all of it the language, none
 of it an Elixir compiler. This tour shows the pieces working, from the outside
 in.
 
@@ -67,12 +67,13 @@ stack.
 
 ## From forms to Core Erlang
 
-The compiler lowers to a small neutral IR (**bl-ANF**), and `self/core.bl` turns
+The compiler lowers to a small neutral IR (**bl-ANF**, vocabulary in
+`priv/boot/anf.bl`), and `boot/lower.bl` turns
 that into **Core Erlang** — the BEAM's simplest real input. The whole path is
 beam-lisp until the Erlang stdlib turns Core Erlang into a `.beam`:
 
 ```
-text ──reader.bl──▶ forms ──compiler.bl──▶ bl-ANF ──self/core.bl──▶ Core Erlang ──▶ .beam
+text ──reader.bl──▶ forms ──compiler.bl──▶ bl-ANF ──boot/lower.bl──▶ Core Erlang ──▶ .beam
 ```
 
 A namespace's functions become a Core Erlang module, compiled and loaded in the

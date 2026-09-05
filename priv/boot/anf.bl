@@ -1,0 +1,267 @@
+; boot/anf.bl — bl-ANF: the backend-neutral IR (PLAN-079 S-B, PLAN-086 E1).
+;
+; Graduated from priv/self/anf.bl to the boot tier in PLAN-086 E1: compiler.bl
+; emits this vocabulary directly (S-D.emit), so it must live at the tier the
+; compiler can require. The reference interpreter (the self-referential
+; oracle) stays behind in priv/self/anf.bl.
+;
+; ── What this is ─────────────────────────────────────────────────────────────
+;
+; priv/boot/compiler.bl resolves every symbol and expands every macro, then
+; emits this small closed vocabulary — self-describing, backend-neutral DATA.
+; It is the single IR the whole toolbench reads and the backends consume:
+;
+;     compiler.bl → bl-ANF → lower.bl  → Core Erlang → .beam   (boot, E1)
+;                         → native.bl → MLIR/LLVM              (PLAN-080)
+;
+; ── Shape: one node = an MLIR op ─────────────────────────────────────────────
+;
+; A node is a map {:op <keyword> …operands… :ann <map>}. That is exactly an
+; MLIR operation: an op-name, typed operands, and an attribute dictionary
+; (`:ann`). Nested nodes are regions. So a future MLIR emitter is a structural
+; walk — op→op, :ann→attributes, body-nodes→regions — no reshaping. `:ann`
+; carries types (from typed), effects (from footprint) and source positions;
+; every constructor threads it, so nothing downstream has to reshape a node to
+; annotate it.
+;
+; ── The vocabulary ───────────────────────────────────────────────────────────
+;
+;   :lit    {:val v}                          number/string/atom/nil/true/false
+;   :var    {:name "x"}                        a lexical local
+;   :global {:ns "user" :name "inc"}           an Env.fetch! var reference
+;   :remote {:mod :erlang :fun :+ :args [n…]}  a host call M:f(args)
+;   :apply  {:fn n :args [n…]}                 call a fn VALUE
+;   :let    {:name "x" :init n :body n}        one binding (ANF core)
+;   :if     {:test n :then n :else n}          bl truthiness (nil/false → else)
+;   :do     {:stmts [n…]}                      sequence, value = last
+;   :case   {:subj n :clauses [clause…]}       pattern match
+;   :fn     {:clauses [clause…]}               a closure (params are patterns)
+;   :try    {:body n :catch [clause…] :after n|nil}
+;   :recv   {:clauses [clause…] :timeout n|nil :after n|nil}
+;   :tuple  {:elems [n…]}                      an Erlang tuple
+;   :map    {:pairs [[n n]…]}
+;   :cons   {:head n :tail n}     :enil {}     list cells
+;   :struct {:mod M :fields [[n n]…]}          %Mod{…}
+;
+; A `clause` is {:pats [pat…] :guard n|nil :body n}. A `pat`:
+;   :pvar {:name} :plit {:val} :ptuple {:elems} :pmap {:pairs [[key pat]…]}
+;   :pcons {:head :tail} :pnil {} :palias {:a :b} :pstruct {:mod :fields}
+;
+; ── normalise: the quoted→bl-ANF bridge ─────────────────────────────────────
+;
+;   normalise : quoted → bl-ANF — the bridge from compiler.bl's legacy
+;               Elixir-quoted output. TRANSITION-ONLY (PLAN-086): once
+;               compiler.bl emits bl-ANF directly (E2–E4), normalise and the
+;               quoted-node accessors below are DELETED (E5).
+;   interp    : bl-ANF × env → value — lives in priv/self/anf.bl (oracle tier).
+
+(ns anf)
+
+;; ── quoted-node accessors (TRANSITION-ONLY — die with normalise in E5) ──────
+
+(defn- qnode? [t n] (and (tuple? t) (= n (tuple-size t))))
+(defn- qhead [t] (elem t 0))
+(defn- qargs [t] (elem t 2))
+(defn- qvar? [t] (and (qnode? t 3) (erlang/is_atom (qhead t)) (erlang/is_atom (elem t 2))))
+(defn- qcall? [t] (and (qnode? t 3) (tuple? (qhead t)) (= :. (qhead (qhead t)))))
+(defn- qform? [t k] (and (qnode? t 3) (= k (qhead t))))
+(defn- qkw [kvs k] (Keyword/get kvs k))
+(def qbar (erlang/binary_to_atom "|"))
+(def qpct (erlang/binary_to_atom "%"))
+(def qmap-open (erlang/binary_to_atom "%{}"))
+(def qtuple (erlang/binary_to_atom "{}"))
+
+;; ── constructors (every node threads an :ann, default {}) ────────────────────
+
+(defn lit [v] {:op :lit :val v :ann {}})
+(defn var [name] {:op :var :name name :ann {}})
+(defn global [ns name] {:op :global :ns ns :name name :ann {}})
+(defn remote [mod fun args] {:op :remote :mod mod :fun fun :args args :ann {}})
+(defn app [f args] {:op :apply :fn f :args args :ann {}})
+(defn lett [name init body] {:op :let :name name :init init :body body :ann {}})
+(defn iff [test then else] {:op :if :test test :then then :else else :ann {}})
+(defn doo [stmts] {:op :do :stmts stmts :ann {}})
+(defn casee [subj clauses] {:op :case :subj subj :clauses clauses :ann {}})
+(defn fnn [clauses] {:op :fn :clauses clauses :ann {}})
+(defn tryy [body catch after] {:op :try :body body :catch catch :after after :ann {}})
+(defn recv [clauses timeout after] {:op :recv :clauses clauses :timeout timeout :after after :ann {}})
+(defn tup [elems] {:op :tuple :elems elems :ann {}})
+(defn mapp [pairs] {:op :map :pairs pairs :ann {}})
+(defn cons-cell [h t] {:op :cons :head h :tail t :ann {}})
+(def enil {:op :enil :ann {}})
+(defn structt [mod fields] {:op :struct :mod mod :fields fields :ann {}})
+(defn clause [pats guard body] {:pats pats :guard guard :body body})
+
+;; pattern constructors
+(defn pvar [name] {:pop :pvar :name name})
+(defn plit [v] {:pop :plit :val v})
+(defn ptuple [elems] {:pop :ptuple :elems elems})
+(defn pmap [pairs] {:pop :pmap :pairs pairs})
+(defn pcons [h t] {:pop :pcons :head h :tail t})
+(def pnil {:pop :pnil})
+(defn palias [a b] {:pop :palias :a a :b b})
+(defn pstruct [mod fields] {:pop :pstruct :mod mod :fields fields})
+
+;; ── alias resolution (same as self.core) ─────────────────────────────────────
+
+(defn- alias->atom [m]
+  (cond
+    (erlang/is_atom m) m
+    (qform? m :__aliases__)
+      (erlang/binary_to_atom
+        (str "Elixir." (Enum/join (to-list (map (fn [a] (erlang/atom_to_binary a)) (qargs m))) ".")))
+    :else (throw (ex-info "anf: not a module" {:node m}))))
+
+(declare normalise)
+(declare norm-pattern)
+(declare norm-clauses)
+
+(defn- cons-node? [x] (qform? x qbar))
+
+(defn- norm-list
+  "Elixir list literal (elements are quoted AST) → :cons chain / [h|t]."
+  [xs]
+  (if (and (= 1 (count xs)) (cons-node? (first xs)))
+    (cons-cell (normalise (first (qargs (first xs)))) (normalise (second (qargs (first xs)))))
+    (reduce (fn [acc x] (cons-cell (normalise x) acc)) enil (reverse xs))))
+
+(defn- simple-lambda?
+  "One-clause, unguarded fn whose params are all plain vars — the compiler's
+   shape for `let`; its application normalises to a chain of :let."
+  [f]
+  (and (qform? f :fn)
+       (= 1 (count (qargs f)))
+       (let [ps (first (qargs (first (qargs f))))]
+         (every? qvar? ps))))
+
+(defn norm-pattern [p]
+  (cond
+    (qvar? p) (pvar (erlang/atom_to_binary (qhead p)))
+    (qform? p qpct)
+      (let [[m fields] (qargs p)]
+        (pstruct (alias->atom m)
+                 (to-list (map (fn [kv] [(elem kv 0) (norm-pattern (elem kv 1))]) (qargs fields)))))
+    (qform? p qmap-open)
+      (pmap (to-list (map (fn [kv] [(normalise (elem kv 0)) (norm-pattern (elem kv 1))]) (qargs p))))
+    (qform? p qtuple) (ptuple (to-list (map norm-pattern (qargs p))))
+    (qform? p :=) (palias (norm-pattern (first (qargs p))) (norm-pattern (second (qargs p))))
+    (qnode? p 2) (ptuple (list (norm-pattern (elem p 0)) (norm-pattern (elem p 1))))
+    (erlang/is_list p) (reduce (fn [acc x] (pcons (norm-pattern x) acc)) pnil (reverse p))
+    :else (plit p)))
+
+(defn norm-clauses
+  "[{:-> _ [[pats…] body]} …] (possibly {:when …}-guarded) → bl-ANF clauses."
+  [clauses]
+  (to-list
+    (map (fn [cl]
+           (let [pats (first (qargs cl)) body (second (qargs cl)) p0 (first pats)]
+             (if (and (= 1 (count pats)) (qform? p0 :when))
+               (let [ws (qargs p0) n (dec (count ws))]
+                 (clause (to-list (map norm-pattern (take n ws))) (normalise (nth ws n)) (normalise body)))
+               (clause (to-list (map norm-pattern pats)) nil (normalise body)))))
+         clauses)))
+
+(defn- norm-block
+  "A :__block__: `x = e` → :let (var) or a one-clause :case (pattern); any
+   other statement sequences via :do."
+  [stmts]
+  (cond
+    (empty? stmts) (lit nil)
+    (= 1 (count stmts)) (normalise (first stmts))
+    :else
+      (let [s (first stmts) rest-body (norm-block (rest stmts))]
+        (if (qform? s :=)
+          (let [lhs (first (qargs s)) rhs (second (qargs s))]
+            (if (qvar? lhs)
+              (lett (erlang/atom_to_binary (qhead lhs)) (normalise rhs) rest-body)
+              (casee (normalise rhs) (list (clause (list (norm-pattern lhs)) nil rest-body)))))
+          (doo (list (normalise s) rest-body))))))
+
+(defn normalise
+  "compiler.bl's legacy (Elixir-quoted) output → bl-ANF. TRANSITION-ONLY:
+   retires in PLAN-086 E5 when compiler.bl emits bl-ANF directly."
+  [t]
+  (cond
+    (nil? t) (lit nil)
+    (qvar? t) (var (erlang/atom_to_binary (qhead t)))
+    (erlang/is_atom t) (lit t)
+    (erlang/is_number t) (lit t)
+    (erlang/is_binary t) (lit t)
+    (erlang/is_list t) (norm-list t)
+
+    ;; calls: M.f(args) / (fn…).(v) as let / f.(args)
+    (qcall? t)
+      (let [tgt (qargs (qhead t)) as (to-list (map normalise (qargs t)))]
+        (cond
+          ;; Env.fetch!("ns","name") → :global (a var reference, not a host call)
+          (and (= 2 (count tgt)) (= :fetch! (second tgt))
+               (let [m (first tgt)] (and (qform? m :__aliases__) (= [:BeamLisp :Env] (to-list (qargs m))))))
+            (let [av (qargs t)] (global (first av) (second av)))
+          (= 2 (count tgt)) (remote (alias->atom (first tgt)) (second tgt) as)
+          (simple-lambda? (first tgt))
+            (let [cl (first (qargs (first tgt))) ps (first (qargs cl))]
+              (reduce (fn [body [p a]] (lett (erlang/atom_to_binary (qhead p)) a body))
+                      (normalise (second (qargs cl)))
+                      (reverse (to-list (map (fn [p a] [p a]) ps as)))))
+          :else (app (normalise (first tgt)) as)))
+
+    (qform? t :apply)
+      (let [[m f as] (qargs t)]
+        (if (and (erlang/is_atom m) (erlang/is_atom f) (erlang/is_list as))
+          (remote m f (to-list (map normalise as)))
+          (remote :erlang :apply (list (normalise m) (normalise f) (normalise as)))))
+
+    (qform? t :__aliases__) (lit (alias->atom t))
+    (qform? t qbar) (cons-cell (normalise (first (qargs t))) (normalise (second (qargs t))))
+    (qform? t :==) (remote :erlang :== (to-list (map normalise (qargs t))))
+    (qform? t :===) (remote :erlang :=:= (to-list (map normalise (qargs t))))
+    (qform? t :and) (let [[a b] (qargs t)] (iff (normalise a) (normalise b) (lit false)))
+    (qform? t :make_ref) (remote :erlang :make_ref (list))
+    (qform? t :__block__) (norm-block (qargs t))
+    (qform? t :=) (norm-block (list t (first (qargs t))))
+    (qform? t :fn) (fnn (norm-clauses (qargs t)))
+
+    (qform? t :if)
+      (let [[test kvs] (qargs t)] (iff (normalise test) (normalise (qkw kvs :do)) (normalise (qkw kvs :else))))
+
+    (qform? t :cond)
+      (let [clauses (to-list (qkw (first (qargs t)) :do))
+            lastc (last clauses)
+            [init body-cls] (if (= true (first (first (qargs lastc))))
+                              [(normalise (second (qargs lastc))) (butlast clauses)]
+                              [(remote :erlang :error (list (lit :cond_clause))) clauses])]
+        (reduce (fn [else cl]
+                  (let [test (first (first (qargs cl))) body (second (qargs cl))]
+                    (iff (normalise test) (normalise body) else)))
+                init
+                (reverse (to-list body-cls))))
+
+    (qform? t :case)
+      (let [[subj kvs] (qargs t)] (casee (normalise subj) (norm-clauses (qkw kvs :do))))
+
+    (qform? t :try)
+      (let [kvs (first (qargs t))
+            body (normalise (qkw kvs :do))
+            cc (to-list (or (qkw kvs :catch) (list)))
+            af (qkw kvs :after)]
+        (tryy body (norm-clauses cc) (if (nil? af) nil (normalise af))))
+
+    (qform? t :receive)
+      (let [kvs (first (qargs t))
+            cls (norm-clauses (or (qkw kvs :do) (list)))
+            af (qkw kvs :after)]
+        (if (nil? af)
+          (recv cls nil nil)
+          (let [ac (first af)]
+            (recv cls (normalise (first (first (qargs ac)))) (normalise (second (qargs ac)))))))
+
+    (qform? t qtuple) (tup (to-list (map normalise (qargs t))))
+    (qnode? t 2) (tup (list (normalise (elem t 0)) (normalise (elem t 1))))
+    (qform? t qmap-open)
+      (mapp (to-list (map (fn [kv] [(normalise (elem kv 0)) (normalise (elem kv 1))]) (qargs t))))
+    (qform? t qpct)
+      (let [[m fields] (qargs t)]
+        (structt (alias->atom m)
+                 (to-list (map (fn [kv] [(normalise (elem kv 0)) (normalise (elem kv 1))]) (qargs fields)))))
+
+    :else (throw (ex-info "anf/normalise: unhandled quoted node" {:node t}))))

@@ -110,7 +110,7 @@ defmodule BeamLisp.AOTCache do
 
   @doc """
   The backend that lowers a namespace's body modules to `.beam`: `:core`
-  (bl-ANF -> Core Erlang, via `self.core`) or `:elixir` (the genesis Elixir
+  (bl-ANF -> Core Erlang, via the boot `lower` ns) or `:elixir` (the genesis Elixir
   compiler). Default `:core` (PLAN-081 step 3 flip): a full-tree Core build is
   proven clean, byte-reproducible, and behaviourally identical to Elixir (the
   regression stays at baseline under either backend). Opt back to the Elixir
@@ -227,12 +227,13 @@ defmodule BeamLisp.AOTCache do
       |> Path.join("**/*.bl")
       |> Path.wildcard()
 
-    # Under the Core backend, `priv/self/` (self.core + self.anf) is ALSO tier-1:
-    # it lowers every body module, so a change there alters every emitted byte,
-    # exactly like a change to `priv/boot/compiler.bl`. Hash it into the key so
-    # editing the Core backend invalidates all Core beams. Under `:elixir` the
-    # self/ tier does not run, so it is left out (its edits are then correctly
-    # irrelevant to the Elixir toolchain key).
+    # The bl-ANF vocabulary + lowering graduated to `priv/boot/` (anf.bl +
+    # lower.bl, PLAN-086 E1) and are hashed by the boot glob above. What
+    # remains in `priv/self/` is the interp oracle (self.anf) and the legacy
+    # quoted lowering (self.core, dies in E5); while the quoted path still
+    # serves, keep self/ tier-1 so an edit there invalidates all Core beams.
+    # Under `:elixir` the self/ tier does not run, so it is left out (its
+    # edits are then correctly irrelevant to the Elixir toolchain key).
     self =
       if aot_backend() == :core do
         BeamLisp.Tiers.priv_root()

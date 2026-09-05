@@ -48,22 +48,22 @@ defmodule BeamLisp.Link do
   """
   def defvar(ns, name, new_defs, location \\ nil) when is_binary(ns) and is_binary(name) do
     # Backend switch (PLAN-079 S-D). When the process/global backend is :core
-    # AND the self-hosted Core backend module is loaded, a def is built through
-    # bl-ANF -> Core Erlang (self.core/core-defvar-anf) instead of the Elixir
-    # emitter below. Default :elixir (key unset), so this is INERT until
+    # AND the Core backend module is loaded, a def is built through
+    # bl-ANF -> Core Erlang (boot `lower` ns, core-defvar-anf) instead of the
+    # Elixir emitter below. Default :elixir (key unset), so this is INERT until
     # something opts in -- the switch a full-suite regression flips to prove
     # Core can build the whole system before it becomes the default.
     if core_backend?() do
-      apply(BeamLisp.Ns.Self.Core, :"core-defvar-anf", [ns, name, new_defs])
+      apply(BeamLisp.Ns.Lower, :"core-defvar-anf", [ns, name, new_defs])
     else
       defvar_elixir(ns, name, new_defs, location)
     end
   end
 
-  # True when the active backend is :core and self.core is available to serve
-  # it. Process key first (per-eval override, e.g. a test), then the global
-  # key; absent -> :elixir. The load/export guard covers the boot window before
-  # self.core is compiled -- during genesis the Elixir path must run.
+  # True when the active backend is :core and the boot `lower` ns is available
+  # to serve it. Process key first (per-eval override, e.g. a test), then the
+  # global key; absent -> :elixir. The load/export guard covers the boot window
+  # before lower is compiled -- during genesis the Elixir path must run.
   defp core_backend? do
     backend =
       Process.get(:bl_backend) ||
@@ -72,16 +72,16 @@ defmodule BeamLisp.Link do
            :error -> :elixir
          end)
 
-    backend == :core and Code.ensure_loaded?(BeamLisp.Ns.Self.Core) and
-      function_exported?(BeamLisp.Ns.Self.Core, :"core-defvar-anf", 3) and
-      # self.core's VARS must be interned, not just its module code loaded:
+    backend == :core and Code.ensure_loaded?(BeamLisp.Ns.Lower) and
+      function_exported?(BeamLisp.Ns.Lower, :"core-defvar-anf", 3) and
+      # lower's VARS must be interned, not just its module code loaded:
       # core-defvar-anf reaches its own siblings (expand-defaults, lower-anf, …)
-      # through the Env var table, so an un-interned self.core would route here
-      # and then raise `undefined var: self.core/…` on the first sibling call.
+      # through the Env var table, so an un-interned lower would route here
+      # and then raise `undefined var: lower/…` on the first sibling call.
       # When the ns is not interned (e.g. a --path-scoped tool env that never
       # booted the Core backend) fall back to the Elixir path, which is always
       # available. `maybe_load_core_backend/0` interns it at boot under :core.
-      BeamLisp.Env.loaded_ns?("self.core")
+      BeamLisp.Env.loaded_ns?("lower")
   end
 
   defp defvar_elixir(ns, name, new_defs, location) do

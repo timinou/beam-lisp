@@ -5,8 +5,9 @@ and the `.bl` modules that carry it. Companion to
 `how-beam-lisp-uses-elixir.md`.*
 
 > **Status: this is how it works now.** Core Erlang is the default backend
-> (`:aot_backend :core`). `compiler.bl` emits bl-ANF and `priv/self/core.bl`
-> lowers it to Core Erlang; the Elixir-quoted path survives only as the opt-in
+> (`:aot_backend :core`). `compiler.bl` emits bl-ANF and `priv/boot/lower.bl`
+> lowers it to Core Erlang (IR vocabulary: `priv/boot/anf.bl`; both graduated
+> from `priv/self/` in PLAN-086 E1); the Elixir-quoted path survives only as the opt-in
 > `:aot_backend :elixir`. The design below reads in the future tense in places
 > because it was written before the cutover — the mechanics it describes are the
 > ones in the tree today.
@@ -154,7 +155,7 @@ selection happens where the caller enters). The module names keep their
 
 | gone | added |
 |---|---|
-| Elixir quoted node construction throughout `compiler.bl` | `priv/self/anf.bl` — normaliser |
+| Elixir quoted node construction throughout `compiler.bl` | `priv/boot/anf.bl` — normaliser |
 | `Macro.escape` (literals are Core literals) | `priv/self/cerl.bl` — bl-ANF → cerl |
 | `Module.create`, `:elixir_compiler.quoted`, `Code.compiler_options` juggling, `infer_signatures: false`, `ignore_module_conflict` | `compile:forms/2` + `code:load_binary/3` |
 | alias/require emission | — (atoms) |
@@ -227,7 +228,7 @@ the toolchain closure — and `oracle`/`opt` stay in `self/`:
 
 | module | job | reads | writes |
 |---|---|---|---|
-| `self.anf` | let-hoist, resolve symbols, name intermediates | resolved bl forms | bl-ANF |
+| `anf` (priv/boot) | let-hoist, resolve symbols, name intermediates | resolved bl forms | bl-ANF |
 | `self.match` | clause list → decision tree; exhaustiveness/redundancy facts | bl-ANF `case` | bl-ANF `case` (nested) + facts for `typed` |
 | `self.guard` | decide guard-safety of a predicate; lower to guard or to body test | bl-ANF, `system.smt` vocabulary | bl-ANF with `:guard` annotations |
 | `self.cerl` | bl-ANF → `cerl` terms; annotations | bl-ANF | Core Erlang |

@@ -28,7 +28,7 @@ reader forms
    │  compiler.bl          (forms → bl-ANF, a small neutral IR)
    ▼
 bl-ANF
-   │  self/core.bl         (bl-ANF → Core Erlang)
+   │  boot/lower.bl        (bl-ANF → Core Erlang)
    ▼
 Core Erlang
    │  :compile.forms       (Core Erlang → .beam)  ← an Erlang/OTP stdlib call
