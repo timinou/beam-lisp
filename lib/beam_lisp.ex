@@ -163,6 +163,13 @@ defmodule BeamLisp do
       BeamLisp.Reader.enable_bl_reader()
       BeamLisp.Compiler.enable_bl_backend()
 
+      # The bl-ANF pipeline (PLAN-086 E2). `compiler`'s `eval_form` delegates
+      # to `compiler2/eval_form`, so the namespace must be interned before any
+      # form is compiled. Loader.ensure_loaded (not AOT.ensure_loaded) so a
+      # toolchain-key mismatch falls back to compiling the source, exactly as
+      # enable_bl_backend does for `compiler`.
+      BeamLisp.Loader.ensure_loaded("compiler2")
+
       # 3. The rest of the prelude. `multi` (dispatch) and `sugar` (threading /
       #    cond macros) layer on `core`; their closure-hash drift check now finds
       #    the interned reader. Once interned, `compile/2` and `read_string/2`

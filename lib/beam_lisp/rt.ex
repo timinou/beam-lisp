@@ -64,6 +64,7 @@ defmodule BeamLisp.RT do
 
   @doc "Keywords are functions of maps, as in jank and Clojure: `(:a m)` ≡ `(get m :a)`."
   def invoke(kw, [m]) when is_atom(kw), do: get(m, kw)
+
   def invoke(kw, [m, default]) when is_atom(kw), do: get(m, kw, default)
 
   # Vectors are functions of their indices: `([a b] 1)` ≡ `(nth [a b] 1)`,
@@ -93,6 +94,31 @@ defmodule BeamLisp.RT do
   # genuine plain map reaches here.
   def invoke(m, [k]) when is_map(m) and not is_struct(m), do: get(m, k)
   def invoke(m, [k, default]) when is_map(m) and not is_struct(m), do: get(m, k, default)
+
+  @doc """
+  True when `invoke/2` can call `value` with `arity` arguments: a fn of that
+  arity, an atom as a one-argument lookup fn (`(:k m)`), a multi-fn with a
+  matching clause, or a dynamic remote handle. The compiler's call-head
+  dispatch uses this to let a local shadow a linked global only when the
+  local's value is actually callable — `(max h max)` with an integer local
+  `max` still reaches `core/max`, while `(comp a b)` with a fn local `comp`
+  invokes the local.
+  """
+  def invocable?(value, arity)
+
+  def invocable?(f, arity) when is_function(f), do: is_function(f, arity)
+
+  def invocable?(kw, arity) when is_atom(kw), do: arity == 1 or arity == 2
+
+  # is_map-ok: fixed is the internal arity→fn map of the multi-fn tag tuple,
+  # built by multi_fn/1,2 — never a user value, so struct-vs-map never applies.
+  def invocable?({@multi_fn_tag, fixed, variadic}, arity) when is_map(fixed) do
+    Map.has_key?(fixed, arity) or
+      (is_tuple(variadic) and tuple_size(variadic) == 2 and arity >= elem(variadic, 0))
+  end
+
+  def invocable?({:"$remote", _, _}, _arity), do: true
+  def invocable?(_, _), do: false
 
   @doc """
   `~@` splicing. Clojure splices any seqable onto the rest of the form,

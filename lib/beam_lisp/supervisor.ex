@@ -99,6 +99,9 @@ defmodule BeamLisp.Supervisor do
   def server(id, mod), do: server(id, mod, nil, %{})
   def server(id, mod, arg), do: server(id, mod, arg, %{})
 
+  # is_map-ok: opts is an Elixir-side supervisor options map built by this
+  # module's own callers (see server/1..3 above, which pass %{}); beam-lisp
+  # collections never flow here.
   def server(id, mod, arg, opts) when is_map(opts) do
     %{id: id, start: {__MODULE__, :start_server, [mod, arg, Map.get(opts, :name)]}}
     |> maybe_put(opts, :restart)

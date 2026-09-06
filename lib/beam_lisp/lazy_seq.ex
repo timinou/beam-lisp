@@ -89,7 +89,20 @@ defmodule BeamLisp.LazySeq do
     List.foldr(elems, new(tail_fun), fn e, acc -> [e | acc] end)
   end
 
-  @doc "Run a node's thunk exactly once, caching and returning the result."
+  @doc """
+  Run a node's thunk exactly once, caching and returning the result.
+
+  The memo is load-bearing SEMANTICS, not an optimization: a thunk may have
+  effects (`(map println xs)`, the build's `map eval-form forms`), and
+  Clojure's lazy-seq contract — which bl makes — is that it runs at most
+  once. A "cache the value only on second force" policy was tried and
+  reverted: it made shared effectful thunks re-run (double `defvar` /
+  double module definition in the parallel build) — see git history.
+  The budget eviction below is the accepted exception: a realized value
+  whose memo is evicted re-runs its thunk on next force (BUG-011's table
+  loss already made that possible), so thunks must tolerate re-execution
+  under memory pressure — but never under normal operation.
+  """
   def force(%__MODULE__{key: key, thunk: thunk}) do
     ensure_table()
 
@@ -105,17 +118,21 @@ defmodule BeamLisp.LazySeq do
     end
   end
 
-  # The cache is insert-only with make_ref keys, so it grows without bound:
-  # every forced seq's realized chunk is retained VM-wide forever. Compile-time
-  # pipelines (anf/normalise/lower) realize giant trees per form — map/to-list
-  # churn over whole quoted bodies — and a single big file accumulated ~160MB
-  # per top-level form here, OOM-killing full `mix compile` builds.
+  # Backstop budget. The cache is insert-only with make_ref keys (no
+  # reachability in ETS), so every forced node's realized value is retained
+  # VM-wide until eviction: compile-time pipelines (anf/normalise/lower)
+  # realize giant single-use trees per form and a big file accumulated ~7GB
+  # here, OOM-killing full builds. Exact-once memoization is language
+  # semantics (see force/1), so retention cannot be refused per-node; a
+  # capacity bound is the only semantics-preserving lever this side of a GC'd
+  # cache. The workload-side fix — not emitting lazy intermediates in the
+  # toolchain — belongs to the compiler pipeline (the quoted roundtrip is
+  # deleted by PLAN-086 E3/E4).
   #
-  # Memoization is an optimization, not semantics: losing an entry means a
-  # thunk re-runs (the table itself is already allowed to vanish and rebuild
-  # — see BUG-011 above). So when the table crosses the budget, evict ALL of
-  # it and continue. Whole-table eviction over per-entry LRU: one O(1) size
-  # check per cold force, no bookkeeping, no hot-path cost.
+  # When the table crosses the budget, evict ALL of it and continue: losing
+  # an entry means a thunk re-runs, which BUG-011 above already made possible
+  # (the table may vanish entirely). Whole-table eviction over per-entry LRU:
+  # one O(1) size check per cold force, no bookkeeping, no hot-path cost.
   defp maybe_evict do
     budget = Application.get_env(:beam_lisp, :lazy_cache_budget_bytes, @cache_budget_bytes)
 

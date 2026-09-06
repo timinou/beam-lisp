@@ -184,10 +184,12 @@ defmodule BeamLisp.Wave24RecordsTest do
       assert eval("(.-a (->W24Line 1 2))") == 1
       assert eval("(.b (->W24Line 1 2))") == 2
 
-      # No map semantics: not a map, no keyword access.
+      # No map semantics: not a map, and keyword/get NEVER read fields.
+      # Lookup on a non-associative value is the decided total-get nil
+      # (9f5d08b — Clojure-compatible); count stays a hard error.
       assert eval("(map? (->W24Line 1 2))") == false
-      assert_raise FunctionClauseError, fn -> eval("(:a (->W24Line 1 2))") end
-      assert_raise FunctionClauseError, fn -> eval("(get (->W24Line 1 2) :a)") end
+      assert eval("(:a (->W24Line 1 2))") == nil
+      assert eval("(get (->W24Line 1 2) :a)") == nil
       assert_raise FunctionClauseError, fn -> eval("(count (->W24Line 1 2))") end
     end
 

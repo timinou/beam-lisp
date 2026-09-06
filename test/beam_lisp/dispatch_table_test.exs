@@ -167,7 +167,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, 1},
       "rest" => {:eq, [2, 3]},
       "next" => {:eq, [2, 3]},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:eq, [4, 1, 2, 3]},
       "contains?" => {:eq, false},
@@ -216,7 +216,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, "a"},
       "rest" => {:eq, ["b"]},
       "next" => {:eq, ["b"]},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -256,7 +256,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, nil},
       "rest" => {:eq, []},
       "next" => {:eq, nil},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -276,7 +276,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, nil},
       "rest" => {:eq, []},
       "next" => {:eq, nil},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -377,7 +377,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, nil},
       "rest" => {:eq, []},
       "next" => {:eq, nil},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -397,7 +397,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, nil},
       "rest" => {:eq, []},
       "next" => {:eq, nil},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -417,7 +417,7 @@ defmodule BeamLisp.DispatchTableTest do
       "first" => {:eq, nil},
       "rest" => {:eq, []},
       "next" => {:eq, nil},
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},
@@ -439,7 +439,7 @@ defmodule BeamLisp.DispatchTableTest do
       "next" => {:eq, [2, 3]},
       # No keys, so every associative op refuses rather than inventing a
       # meaning for `(get {1,2,3} :a)`.
-      "get" => {:raises, FunctionClauseError},
+      "get" => {:eq, nil},  # total get: non-associative → nil (9f5d08b)
       "assoc" => {:raises, FunctionClauseError},
       "conj" => {:raises, FunctionClauseError},
       "contains?" => {:eq, false},

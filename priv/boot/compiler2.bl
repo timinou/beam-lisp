@@ -1,32 +1,22 @@
-; compiler.bl — the compiler, written in beam-lisp.
+; compiler2.bl — the bl-ANF compiler, written in beam-lisp (PLAN-086 E2).
 ;
-; A compiler turns a program you wrote into something the machine can run. In
-; beam-lisp's case the target is an ELIXIR SYNTAX TREE: the same shape Elixir's
-; own compiler accepts, which it then turns into real BEAM bytecode. So this
-; file's whole job is: given a reader form (the tree the reader produced),
-; return the matching Elixir syntax tree.
+; A compiler turns a program you wrote into something the machine can run.
+; This one's target is bl-ANF: the one IR of the self-hosted toolchain. The
+; pipeline is reader.bl (text -> forms) -> this file (forms -> bl-ANF nodes)
+; -> lower.bl (bl-ANF -> Core Erlang -> BEAM). `eval_form` lowers and runs
+; each form as run/0 of a throwaway module; AOT lowers whole namespaces into
+; real modules. There is no Elixir-quoted layer on this path.
 ;
-; An Elixir syntax tree is built from three-part tuples {head, metadata, args}.
-; For example the call (+ 1 2) becomes, in the end, a call to a runtime helper:
-;
-;   {{:., [], [{:__aliases__, [], [:BeamLisp, :RT]}, :invoke]}, [],
-;    [<the + function>, [1, 2]]}
-;
-; That looks heavy written out, so this file builds such trees with small
-; named helpers (ast-call, ast-remote, …) instead of by hand. The helpers are
-; the vocabulary; the compile functions below are the grammar.
-;
-; This is the KERNEL: it handles literals, the collection literals, symbols,
-; and ordinary calls. The special forms (let, if, fn, def, and the rest) are
-; layered on top in later work. Everything here is checked against the existing
-; Elixir compiler by the differential oracle (self/oracle.bl): for every form,
-; the tree this produces must equal the tree the old compiler produces.
-
-(ns compiler
-  ; the compiler2 require is LOAD-BEARING for the build, not the call: it makes
-  ; build-plan order compiler2 (and its anf/lower requires) before this file,
-  ; so the delegation below never flips the pipeline onto a stale toolchain
-  (:require [reader-node :as rn] [compiler2 :as c2]))
+; The namespace is `compiler2` rather than `compiler` for the bootstrap
+; cutover: this file is compiled by the PREVIOUS-generation compiler, which
+; evaluates and interns each form as it goes. Interning into the live
+; `compiler` ns would swap pipeline functions mid-compile — old callers would
+; embed the new ANF nodes as data. A separate namespace means no running
+; function is ever redefined while it is compiling this file. `compiler.bl`
+; keeps the old definitions and delegates `eval_form` here; the old functions
+; are deleted once the seed carries this pipeline (E5).
+(ns compiler2
+  (:require [reader-node :as rn] [anf :as a] [lower :as lower]))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Building Elixir syntax trees
@@ -148,6 +138,19 @@
   [ns]
   {:ns ns :locals {} :recur nil :tail true})
 
+(defn- with-ann
+  "Stamp an ANF node's :ann with the source position the reader recorded on
+   its form (:meta map with :line/:file). Lowering turns it into a cerl line
+   annotation, so a runtime error's stack frame names the .bl file and line.
+   Nodes built from thin air (macro output) carry no position — the honest
+   answer to 'where did this come from' is nowhere."
+  [node m]
+  (if (and (erlang/is_map m)
+           (erlang/is_integer (maps/get :line m 0))
+           (> (maps/get :line m 0) 0))
+    (assoc node :ann {:line (maps/get :line m) :file (maps/get :file m nil)})
+    node))
+
 (defn- pos-env
   "Thread a form's source position into the compile environment.
 
@@ -224,6 +227,41 @@
 
 (def ^:private var-context (erlang/binary_to_atom "Elixir.BeamLisp.Compiler"))
 
+; ── bl-ANF emission helpers (PLAN-086 E2) ────────────────────────────────────
+;
+; compile-node and the compile-* family emit bl-ANF nodes (priv/boot/anf.bl),
+; not Elixir-quoted trees. The host modules the runtime calls live at fixed
+; atoms; anf-list builds a LIST VALUE node (a cons chain) from a list of nodes.
+
+(def ^:private mod-erlang :erlang)
+(def ^:private mod-body-lower (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Body.Lower"))
+(def ^:private mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.RT"))
+(def ^:private mod-env (erlang/binary_to_atom "Elixir.BeamLisp.Env"))
+(def ^:private mod-vector (erlang/binary_to_atom "Elixir.BeamLisp.Vector"))
+(def ^:private mod-set (erlang/binary_to_atom "Elixir.BeamLisp.Set"))
+(def ^:private mod-record (erlang/binary_to_atom "Elixir.BeamLisp.Record"))
+(def ^:private mod-exinfo (erlang/binary_to_atom "Elixir.BeamLisp.ExInfo"))
+(def ^:private mod-exception (erlang/binary_to_atom "Elixir.Exception"))
+(def ^:private mod-formmeta (erlang/binary_to_atom "Elixir.BeamLisp.FormMeta"))
+(def ^:private mod-link (erlang/binary_to_atom "Elixir.BeamLisp.Link"))
+(def ^:private mod-loader (erlang/binary_to_atom "Elixir.BeamLisp.Loader"))
+(def ^:private mod-multi (erlang/binary_to_atom "Elixir.BeamLisp.Multi"))
+(def ^:private mod-native (erlang/binary_to_atom "Elixir.BeamLisp.Native"))
+(def ^:private mod-server (erlang/binary_to_atom "Elixir.BeamLisp.Server"))
+(def ^:private mod-module (erlang/binary_to_atom "Elixir.Module"))
+(def ^:private mod-code (erlang/binary_to_atom "Elixir.Code"))
+
+(defn- anf-list
+  "A bl-ANF node that evaluates to the LIST of the given nodes' values."
+  [nodes]
+  (reduce (fn [acc n] (a/cons-cell n acc)) a/enil (reverse nodes)))
+
+(defn- anf-invoke
+  "The general beam-lisp call: BeamLisp.RT.invoke(f, [args]) — handles plain
+   fns, keywords, remote references, and the $blfn dispatch tuple."
+  [f-node arg-nodes]
+  (a/remote mod-rt :invoke (list f-node (anf-list arg-nodes))))
+
 ; ── fresh names ──────────────────────────────────────────────────────────────
 ;
 ; Every `let` binding, loop parameter and auto-gensym (`x#`) needs a name no
@@ -262,33 +300,27 @@
     n))
 
 (defn- fresh-var
-  "Invent a brand-new Elixir variable node for a local binding named `base`.
+  "Invent a brand-new name for a local binding named `base`.
 
-   Every `let` binding and loop parameter needs its own unique Elixir
-   variable, so nested bindings of the same source name do not collide. The
-   node shape is {unique-name, [], context}: a unique atom (base plus the next
-   number from `fresh-seq`), empty metadata, and a context atom that marks it
-   as a compiler-made variable. The differential oracle compares local
+   Every `let` binding and loop parameter needs its own unique name, so nested
+   bindings of the same source name do not collide. The name is a STRING
+   (base plus the next number from `fresh-seq`) — bl-ANF :var/:let nodes carry
+   string names, atomised at lowering. The differential oracle compares local
    variables by role, not by name."
   [base]
-  (let [name (erlang/binary_to_atom (str base "_" (next-fresh!)))]
-    (erlang/list_to_tuple (list name (list) var-context))))
+  (str base "_" (next-fresh!)))
 
 (defn- compile-each
-  "Compile a sequence of forms and return the results as a PLAIN list.
-
-   Elixir syntax trees are built from plain lists, so the compiled children
-   must be an ordinary list — not a beam-lisp vector. `map` here is lazy and
-   `into []` would make a vector, so `apply list` forces the results into the
-   plain list the tree needs."
+  "Compile a sequence of forms and return the results as a PLAIN list of
+   bl-ANF nodes."
   [forms env]
-  (apply list (map (fn [f] (compile f env)) forms)))
+  (apply list (map (fn [f] (compile-node f env)) forms)))
 
 (defn- compile-each-notail
   "Compile a sequence of forms with tail position turned off, as a plain list.
    Used for call and recur arguments, which are never in tail position."
   [forms env]
-  (apply list (map (fn [f] (compile f (notail env))) forms)))
+  (apply list (map (fn [f] (compile-node f (notail env))) forms)))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Small helpers over reader forms and text
@@ -446,19 +478,21 @@
    `name` is the symbol's text; `env` says which namespace to resolve against."
   [name env]
   (cond
-    ; a local (let binding or parameter) resolves to its Elixir variable
+    ; a local (let binding or parameter): usually its fresh var name; a named
+    ; fn's own name stores the self-application NODE directly
     (local? env name)
-      (local-var env name)
+      (let [lv (local-var env name)]
+        (if (erlang/is_binary lv) (a/var lv) lv))
     (has-slash? name)
       (let [tgt (slash-target env name)]
         (if (= :remote (first tgt))
-          ; Module/fun as a VALUE: a remote function reference
-          (ast-remote-fun (second tgt) (nth tgt 2))
-          ; a var in another namespace: refuse a private one, else fetch value
+          ; Module/fun as a VALUE: a runtime remote-function reference
+          (a/remote mod-rt :remote_fun (list (a/lit (second tgt)) (a/lit (nth tgt 2))))
+          ; a var in another namespace: refuse a private one, else a reference
           (do (reject-private! env (second tgt) (nth tgt 2))
-              (ast-fetch (second tgt) (nth tgt 2)))))
+              (a/global (second tgt) (nth tgt 2)))))
     :else
-      (ast-fetch (:ns env) name)))
+      (a/global (:ns env) name)))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Compiling collection literals
@@ -472,17 +506,8 @@
    is the Elixir struct-construction syntax for `%BeamLisp.Vector{items: {..}}`
    with each element compiled in turn."
   [items env]
-  (let [elem-asts (compile-each items env)
-        ; the elements packed into an Elixir tuple literal {e1, e2, ...},
-        ; whose tree is a {:{}, [], [elems]} node
-        items-tuple (erlang/list_to_tuple (list tuple-head (list) elem-asts))]
-    ; %BeamLisp.Vector{items: {e1, e2, ...}} — a struct construction, whose
-    ; alias carries plain `[]` metadata (not [alias: false], which is for
-    ; dotted remote-call module refs)
-    (ast-node struct-head
-              (list (plain-alias (list :BeamLisp :Vector))
-                    (ast-node map-head
-                              (list (erlang/list_to_tuple (list :items items-tuple))))))))
+  (a/structt mod-vector
+             (list [(a/lit :items) (a/tup (compile-each items env))])))
 
 (defn- compile-map
   "Turn a map literal like {:a 1} into the tree that builds a beam-lisp map.
@@ -494,20 +519,18 @@
   [pairs env]
   (let [entries (apply list (map (fn [pair]
                                 (let [kv (erlang/tuple_to_list pair)
-                                      k (compile (first kv) env)
-                                      v (compile (second kv) env)]
-                                  (erlang/list_to_tuple
-                                    (list (ast-mod-call (list :BeamLisp :RT) :hash_key (list k))
-                                          v))))
+                                      k (compile-node (first kv) env)
+                                      v (compile-node (second kv) env)]
+                                  [(a/remote mod-rt :hash_key (list k))
+                                   v]))
                               pairs))]
-    (ast-node map-head entries)))
+    (a/mapp entries)))
 
 (defn- compile-set
   "Turn a set literal like #{1 2} into the tree that builds a beam-lisp set,
    `BeamLisp.Set.new([...])` with each member compiled."
   [items env]
-  (let [elem-asts (compile-each items env)]
-    (ast-mod-call (list :BeamLisp :Set) :new (list elem-asts))))
+  (a/remote mod-set :new (list (anf-list (compile-each items env)))))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Compiling a call
@@ -524,17 +547,17 @@
    `{module, arity=>function-name map, variadic-or-nil}` triple. Returns the
    direct-call tree, or nil when the arity does not match (so the caller falls
    back to the general path)."
-  [link-info arg-asts]
+  [link-info arg-nodes]
   (let [parts (erlang/tuple_to_list link-info)
         mod (first parts)
         fixed (second parts)
         variadic (nth parts 2)
-        arity (count arg-asts)]
+        arity (count arg-nodes)]
     (cond
       ; a fixed arity match: Module.fname(args)
       (contains? fixed arity)
         (let [fname (get fixed arity)]
-          (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname))) arg-asts))
+          (a/remote mod fname arg-nodes))
       ; a variadic match {min, fname}: pass the first `min` args plus the rest
       ; collected into a list — Module.fname(a1, ..., amin, [rest...])
       (and (erlang/is_tuple variadic)
@@ -542,10 +565,11 @@
         (let [vparts (erlang/tuple_to_list variadic)
               min (first vparts)
               fname (second vparts)
-              fixed-args (apply list (take min arg-asts))
-              rest-args (apply list (drop min arg-asts))]
-          (ast-node (erlang/list_to_tuple (list :. (list) (list mod fname)))
-                    (apply list (concat fixed-args (list rest-args)))))
+              fixed-args (apply list (take min arg-nodes))
+              rest-args (apply list (drop min arg-nodes))]
+          ; collect the trailing args into one list literal: f(a1..amin, [rest...])
+          (a/remote mod fname
+                    (apply list (concat fixed-args (list (anf-list rest-args))))))
       :else nil)))
 
 (defn- core-qualified
@@ -629,26 +653,19 @@
         args (rest items)
         ; call arguments are never in tail position — a recur inside an
         ; argument is an error, so compile them with tail turned off
-        arg-asts (compile-each-notail args env)
+        arg-nodes (compile-each-notail args env)
         tag (rn/node-tag head)]
     (cond
       ; (:keyword m ...) — the keyword looks itself up in its argument
       (= tag :keyword)
-        (ast-invoke (erlang/binary_to_atom (rn/node-name head)) arg-asts)
+        (anf-invoke (a/lit (BeamLisp.AtomGuard/to_atom (rn/node-name head))) arg-nodes)
 
       ; (Module/fun args), (alias/var args), or (ns/var args)
       (and (= tag :symbol) (has-slash? (rn/node-name head)))
         (let [tgt (slash-target env (rn/node-name head))]
           (if (= :remote (first tgt))
-            ; a host-module call: apply(Module, :fun, [args])
-            ; the Kernel apply/3 node carries the import metadata Elixir stamps
-            (erlang/list_to_tuple
-              (list :apply
-                    (list (erlang/list_to_tuple (list :context var-context))
-                          (erlang/list_to_tuple (list :imports
-                            (list (erlang/list_to_tuple (list 2 (erlang/binary_to_atom "Elixir.Kernel")))
-                                  (erlang/list_to_tuple (list 3 (erlang/binary_to_atom "Elixir.Kernel")))))))
-                    (list (second tgt) (nth tgt 2) arg-asts)))
+            ; a host-module call: Module.fun(args) directly
+            (a/remote (second tgt) (nth tgt 2) arg-nodes)
             ; a var in another namespace: refuse a private one FIRST (before the
             ; linked direct-call shortcut, which bypasses the fetch path), then
             ; use the linked direct call when it is a linked defn, else invoke
@@ -657,31 +674,49 @@
               (reject-private! env tns tvar)
               (let [link (BeamLisp.Env/link tns tvar)]
                 (or (and (not= link :error)
-                         (linked-call (second (erlang/tuple_to_list link)) arg-asts))
-                    (ast-invoke (ast-fetch tns tvar) arg-asts))))))
+                         (linked-call (second (erlang/tuple_to_list link)) arg-nodes))
+                    (anf-invoke (a/global tns tvar) arg-nodes))))))
 
       ; deftype field access: `(.-x obj)` and `(.x obj)` both read field `x`
       ; off a deftype instance. Records have no field surface (keyword lookup
       ; is their access path), so this reaches only deftype values, via
-      ; Record.deftype_field — matching genesis `compile_deftype_field`.
+      ; Record.deftype_field.
       (and (= tag :symbol) (= 1 (count args))
            (deftype-field-name (rn/node-name head)))
-        (ast-mod-call (list :BeamLisp :Record) :deftype_field
-                      (list (first arg-asts)
-                            (erlang/binary_to_atom (deftype-field-name (rn/node-name head)))))
+        (a/remote mod-record :deftype_field
+                  (list (first arg-nodes)
+                        (a/lit (erlang/binary_to_atom (deftype-field-name (rn/node-name head))))))
 
-      ; (name args) with a plain name — try the linked direct call first,
-      ; then fall back to the general lookup-and-invoke path
+      ; (name args) with a plain name. A LOCAL (a parameter, a let binding)
+      ; in call position faces a linked global of the same name: the decided
+      ; dispatch is CALLABILITY — the local's value is invoked when it can
+      ; take this many arguments (RT.invocable?), otherwise the linked global
+      ; runs. `(comp a b)` with a fn parameter `comp` invokes the parameter
+      ; (jank's sort-by slice depends on it); `(max h max)` with an integer
+      ; binding `max` still reaches core/max (the async backpressure contract
+      ; depends on THAT). Clojure would always pick the local and fail the
+      ; second; always-global would fail the first. When no linked global
+      ; exists the local is invoked unconditionally, exactly as before.
       (= tag :symbol)
-        (let [name (rn/node-name head)
-              link (BeamLisp.Env/link (:ns env) (core-qualified name))]
-          (or (and (not= link :error)
-                   (linked-call (second (erlang/tuple_to_list link)) arg-asts))
-              (ast-invoke (compile-symbol name env) arg-asts)))
+        (let [name (rn/node-name head)]
+          (if (local? env name)
+            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))
+                  local-node (compile-symbol name env)
+                  direct (and (not= link :error)
+                              (linked-call (second (erlang/tuple_to_list link)) arg-nodes))]
+              (if direct
+                (a/iff (a/remote mod-rt :invocable? (list local-node (a/lit (count arg-nodes))))
+                       (anf-invoke local-node arg-nodes)
+                       direct)
+                (anf-invoke local-node arg-nodes)))
+            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))]
+              (or (and (not= link :error)
+                       (linked-call (second (erlang/tuple_to_list link)) arg-nodes))
+                  (anf-invoke (compile-symbol name env) arg-nodes)))))
 
       ; (expr args) with a compound head — compile it, then call it
       :else
-        (ast-invoke (compile head env) arg-asts))))
+        (anf-invoke (compile-node head env) arg-nodes))))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; The one entry point
@@ -696,37 +731,38 @@
     "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
 
 (defn- compile-body
-  "Compile body forms into one Elixir tree (a single form, or a __block__)."
+  "Compile body forms into one bl-ANF node (a single form, or a :do)."
   [body env]
   (cond
-    (empty? body) nil
-    (empty? (rest body)) (compile (first body) env)
-    :else (ast-node :__block__ (apply list (map (fn [f] (compile f env)) body)))))
+    (empty? body) (a/lit nil)
+    (empty? (rest body)) (compile-node (first body) env)
+    :else (a/doo (apply list (map (fn [f] (compile-node f env)) body)))))
 
 (defn- compile-if
-  "Turn (if test then else) into the Elixir if tree."
+  "Turn (if test then else) into the bl-ANF :if node."
   [test then else env]
-  (let [test-ast (compile test env)
-        then-ast (compile then env)
-        else-ast (if (nil? else) nil (compile else env))]
-    (ast-node :if (list test-ast
-                        (list (erlang/list_to_tuple (list :do then-ast))
-                              (erlang/list_to_tuple (list :else else-ast)))))))
+  (let [test-node (compile-node test env)
+        then-node (compile-node then env)
+        else-node (if (nil? else) (a/lit nil) (compile-node else env))]
+    (a/iff test-node then-node else-node)))
 
 (defn- nest-lets
-  "Wrap body-ast in one immediately-called function per binding step."
-  [steps body-ast]
+  "Wrap body-node in one :let per binding step. Each step is [name init-node]."
+  [steps body-node]
   (reduce (fn [inner step]
-            (let [var (first step) arg-ast (second step)
-                  fn-ast (ast-node :fn (list (ast-node :-> (list (list var) inner))))]
-              (ast-node (erlang/list_to_tuple (list :. (list) (list fn-ast))) (list arg-ast))))
-          body-ast (reverse steps)))
+            (a/lett (first step) (second step) inner))
+          body-node (reverse steps)))
 
 (defn- self-apply
-  "Build the self-application scaffold a loop uses to call itself."
+  "Build the self-application scaffold a loop uses to call itself:
+   the outer fn takes `self` and returns the inner fn; applied to itself,
+   the inner closes over the recursive reference."
   [self inner-fn]
-  (let [outer-fn (ast-node :fn (list (ast-node :-> (list (list self) inner-fn))))]
-    (ast-node (erlang/list_to_tuple (list :. (list) (list outer-fn))) (list outer-fn))))
+  (let [outer-fn (a/fnn (list (a/clause (list (a/pvar self)) nil inner-fn)))]
+    ; emitted pre-folded: ((fn [self] inner-fn) outer-fn) ≡ (let self = outer-fn
+    ; in inner-fn) for a strict single plain-var arg — the fold normalise
+    ; applies (simple-lambda?), kept explicit so the direct-emit output matches
+    (a/lett self outer-fn inner-fn)))
 
 (defn- compile-recur
   "Turn (recur value ...) into a jump back to the enclosing loop or function.
@@ -744,16 +780,15 @@
         (compile-error env (str "recur arity mismatch: target takes " (:arity target)
                                 ", got " (count args)))
       :else
-        (let [arg-asts (compile-each-notail args env)]
+        (let [arg-nodes (compile-each-notail args env)]
           (if (contains? target :self-call)
             ; a linked defn: a direct named self-call Module.fname(args)
             (let [mf (:self-call target)]
-              (ast-node (erlang/list_to_tuple (list :. (list) (list (first mf) (second mf))))
-                        arg-asts))
+              (a/remote (first mf) (second mf) arg-nodes))
             ; a loop / anonymous fn: re-enter by self-application
             (let [self (:self target)
-                  self-app (ast-node (erlang/list_to_tuple (list :. (list) (list self))) (list self))]
-              (ast-node (erlang/list_to_tuple (list :. (list) (list self-app))) arg-asts)))))))
+                  self-app (a/app (a/var self) (list (a/var self)))]
+              (a/app self-app arg-nodes)))))))
 
 (defn- binding-pairs
   "Split a binding vector's items into [pattern value] pairs.
@@ -780,36 +815,37 @@
 
 (declare destructure-steps)
 
-(defn- rt-nth-ast
-  "The tree for `BeamLisp.RT.nth(whole, i)` — the i-th element of a sequence."
-  [whole-ast i]
-  (ast-mod-call (list :BeamLisp :RT) :nth (list whole-ast i)))
+(defn- rt-nth-node
+  "The node for `BeamLisp.RT.nth(whole, i)` — the i-th element of a sequence."
+  [whole-node i]
+  (a/remote mod-rt :nth (list whole-node (a/lit i))))
 
-(defn- rt-get-ast
-  "The tree for `BeamLisp.RT.get(whole, key, default)` — a map lookup with a
+(defn- rt-get-node
+  "The node for `BeamLisp.RT.get(whole, key, default)` — a map lookup with a
    fallback used when the key is absent."
-  [whole-ast key default-ast]
-  (ast-mod-call (list :BeamLisp :RT) :get (list whole-ast key default-ast)))
+  [whole-node key default-node]
+  (a/remote mod-rt :get (list whole-node (a/lit key) default-node)))
 
-(defn- rt-drop-ast
-  "The tree for the trailing part of a sequence after the first `n` elements —
+(defn- rt-get-raw
+  "Like rt-get-node, but the key is already a bl-ANF node."
+  [whole-node key-node default-node]
+  (a/remote mod-rt :get (list whole-node key-node default-node)))
+
+(defn- rt-drop-node
+  "The node for the trailing part of a sequence after the first `n` elements —
    what an `& rest` parameter binds.
 
    Clojure binds an EXHAUSTED rest to nil, not to an empty list, so this is a
-   `case` over `RT.drop(whole, n)`: an empty result becomes nil, anything else
+   :case over `RT.drop(whole, n)`: an empty result becomes nil, anything else
    is the remaining sequence. Matching Clojure here matters — `(when (next s))`
    loops depend on an exhausted rest being falsey."
-  [whole-ast n]
+  [whole-node n]
   ; a FIXED `dropped` var (not gensym'd), matching the existing compiler; it is
-  ; scoped to this one `case` so there is no collision
-  (let [dropped (erlang/list_to_tuple (list :dropped (list) var-context))
-        drop-call (ast-mod-call (list :BeamLisp :RT) :drop (list whole-ast n))
-        empty-clause (ast-node :-> (list (list (list)) nil))
-        keep-clause (ast-node :-> (list (list dropped) dropped))]
-    (ast-node :case
-              (list drop-call
-                    (list (erlang/list_to_tuple
-                            (list :do (list empty-clause keep-clause))))))))
+  ; scoped to this one :case so there is no collision
+  (let [drop-call (a/remote mod-rt :drop (list whole-node (a/lit n)))]
+    (a/casee drop-call
+             (list (a/clause (list a/pnil) nil (a/lit nil))
+                   (a/clause (list (a/pvar "dropped")) nil (a/var "dropped"))))))
 
 (defn- symbol-pattern?
   "Say whether a pattern node is a plain symbol (a simple name binding) rather
@@ -823,11 +859,11 @@
   (and (symbol-pattern? pat) (= "&" (rn/node-name (rn/node-form pat)))))
 
 (defn- destructure-symbol
-  "Bind a plain-name pattern to `value-ast`: one step, and the name recorded
+  "Bind a plain-name pattern to `value-node`: one step, and the name recorded
    as a local."
-  [name value-ast env]
+  [name value-node env]
   (let [var (fresh-var name)]
-    {:steps (list (list var value-ast)) :env (put-local env name var)}))
+    {:steps (list (list var value-node)) :env (put-local env name var)}))
 
 (defn- destructure-vector
   "Expand a vector pattern `[a b & rest :as all]` against `whole-ast`.
@@ -837,38 +873,52 @@
    and an `:as name` to the whole value. `whole-ast` is the expression for the
    value being taken apart — already a simple variable at the top level (the
    caller binds a temporary), or an `RT.nth(...)` expression when nested."
-  [elems whole-ast env]
+  [elems whole-node env]
   (loop [items elems i 0 acc {:steps (list) :env env}]
     (cond
       (empty? items) acc
-      ; :as name  — bind the whole value to name
+      ; :as name  — bind the whole value to name. Must be the LAST TWO
+      ; elements: a missing name or a trailing element is a silent mis-bind,
+      ; so refuse loudly (the genesis Elixir compiler raised these; the port
+      ; dropped them).
       (and (= :keyword (rn/node-tag (rn/node-form (first items))))
            (= "as" (rn/node-name (rn/node-form (first items)))))
-        (let [name (rn/node-name (rn/node-form (second items)))
-              r (destructure-symbol name whole-ast (:env acc))]
-          (recur (rest (rest items)) i
-                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))
+        (cond
+          (nil? (second items))
+            (erlang/error
+              (RuntimeError/exception "\" :as \" in a vector binding must be followed by a name"))
+          (not (empty? (rest (rest items))))
+            (erlang/error
+              (RuntimeError/exception "\" :as \" in a vector binding must be its last two elements ([... :as name])"))
+          (not (= :symbol (rn/node-tag (rn/node-form (second items)))))
+            (erlang/error
+              (RuntimeError/exception "\" :as \" in a vector binding must name a symbol"))
+          :else
+            (let [name (rn/node-name (rn/node-form (second items)))
+                  r (destructure-symbol name whole-node (:env acc))]
+              (recur (rest (rest items)) i
+                     {:steps (concat (:steps acc) (:steps r)) :env (:env r)})))
       ; & rest  — bind the trailing sequence
       (amp? (first items))
         (let [rest-pat (second items)
-              drop-ast (rt-drop-ast whole-ast i)]
+              drop-node (rt-drop-node whole-node i)]
           (if (symbol-pattern? rest-pat)
             ; a plain-name rest binds the trailing sequence directly
-            (let [r (destructure-steps rest-pat drop-ast (:env acc))]
+            (let [r (destructure-steps rest-pat drop-node (:env acc))]
               (recur (rest (rest items)) i
                      {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))
             ; a COMPOSITE rest pattern: bind the trailing sequence to a temp
             ; ONCE, then destructure the pattern against that temp (so the
             ; drop expression is not re-evaluated for each nested name)
             (let [rest-var (fresh-var "rest")
-                  r (destructure-steps rest-pat rest-var (:env acc))]
+                  r (destructure-steps rest-pat (a/var rest-var) (:env acc))]
               (recur (rest (rest items)) i
                      {:steps (concat (:steps acc)
-                                     (cons (list rest-var drop-ast) (:steps r)))
+                                     (cons (list rest-var drop-node) (:steps r)))
                       :env (:env r)}))))
       ; an ordinary element at position i
       :else
-        (let [r (destructure-steps (first items) (rt-nth-ast whole-ast i) (:env acc))]
+        (let [r (destructure-steps (first items) (rt-nth-node whole-node i) (:env acc))]
           (recur (rest items) (+ i 1)
                  {:steps (concat (:steps acc) (:steps r)) :env (:env r)})))))
 
@@ -890,8 +940,8 @@
    :x and :y), `{:as name}` (bind the whole value), `{:or {x 0}}` (defaults for
    absent keys), and `{local :key}` (bind local to the value at :key). `kvs` is
    the list of key/value pair tuples from the map pattern node."
-  [kvs whole-ast env]
-  (let [whole-var whole-ast
+  [kvs whole-node env]
+  (let [whole-var whole-node
         ; collect :or defaults first so any binding can use them
         ors (reduce (fn [m pair]
                       (let [k (rn/node-form (kv-key pair))]
@@ -913,9 +963,9 @@
               (reduce (fn [a2 sym]
                         (let [name (rn/node-name (rn/node-form sym))
                               default (get ors name)
-                              default-ast (if (nil? default) nil (compile default (:env a2)))
+                              default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
                               r (destructure-symbol name
-                                   (rt-get-ast whole-var (erlang/binary_to_atom name) default-ast)
+                                   (rt-get-node whole-var (erlang/binary_to_atom name) default-node)
                                    (:env a2))]
                           {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
                       acc (rn/node-items (rn/node-form v)))
@@ -925,9 +975,9 @@
               (reduce (fn [a2 sym]
                         (let [name (rn/node-name (rn/node-form sym))
                               default (get ors name)
-                              default-ast (if (nil? default) nil (compile default (:env a2)))
+                              default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
                               r (destructure-symbol name
-                                   (rt-get-ast whole-var name default-ast)
+                                   (rt-get-node whole-var name default-node)
                                    (:env a2))]
                           {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
                       acc (rn/node-items (rn/node-form v)))
@@ -952,9 +1002,9 @@
                  (= :symbol (rn/node-tag (rn/node-form v))))
               (let [name (rn/node-name (rn/node-form v))
                     default (get ors name)
-                    default-ast (if (nil? default) nil (compile default (:env acc)))
+                    default-node (if (nil? default) (a/lit nil) (compile-node default (:env acc)))
                     r (destructure-symbol name
-                         (rt-get-ast whole-var (erlang/binary_to_atom (rn/node-name k)) default-ast)
+                         (rt-get-node whole-var (erlang/binary_to_atom (rn/node-name k)) default-node)
                          (:env acc))]
                 {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
             ; `{local :key}` / `{[a b] :pair}` — a binding pattern in the key
@@ -963,9 +1013,9 @@
             ; destructure-steps rather than assuming a bare name.
             :else
               (let [key-node (rn/node-form v)
-                    key-ast (if (= :keyword (rn/node-tag key-node))
-                              (erlang/binary_to_atom (rn/node-name key-node))
-                              (compile v (:env acc)))
+                    key-node-val (if (= :keyword (rn/node-tag key-node))
+                                   (a/lit (erlang/binary_to_atom (rn/node-name key-node)))
+                                   (compile-node v (:env acc)))
                     pat-node (rn/node-form (kv-key pair))]
                 ; When the binding pattern is a plain symbol (`{x 'k :or {x 9}}`
                 ; or `{x :key}`), apply that symbol's :or default in the lookup
@@ -975,31 +1025,31 @@
                 (if (= :symbol (rn/node-tag pat-node))
                   (let [name (rn/node-name pat-node)
                         default (get ors name)
-                        default-ast (if (nil? default) nil (compile default (:env acc)))
+                        default-node (if (nil? default) (a/lit nil) (compile-node default (:env acc)))
                         r (destructure-symbol name
-                             (rt-get-ast whole-var key-ast default-ast)
+                             (rt-get-raw whole-var key-node-val default-node)
                              (:env acc))]
                     {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
                   (let [r (destructure-steps (kv-key pair)
-                                             (rt-get-ast whole-var key-ast nil)
+                                             (rt-get-raw whole-var key-node-val (a/lit nil))
                                              (:env acc))]
                     {:steps (concat (:steps acc) (:steps r)) :env (:env r)}))))))
       base kvs)))
 
 (defn- destructure-steps
-  "Turn one binding pattern against `value-ast` into a list of plain
-   [variable value-tree] steps plus the updated environment.
+  "Turn one binding pattern against `value-node` into a list of plain
+   [fresh-name value-node] steps plus the updated environment.
 
    A plain name is one step. A vector pattern `[a b]` or a map pattern
    `{:keys [..]}` expands into several — a temporary for the whole value, then
    one step per destructured name. Nested patterns recurse."
-  [pattern value-ast env]
+  [pattern value-node env]
   (let [pat (rn/node-form pattern)
         tag (rn/node-tag pat)]
     (cond
-      (= tag :symbol) (destructure-symbol (rn/node-name pat) value-ast env)
-      (= tag :vector) (destructure-vector (rn/node-items pat) value-ast env)
-      (= tag :map) (destructure-map (rn/node-items pat) value-ast env)
+      (= tag :symbol) (destructure-symbol (rn/node-name pat) value-node env)
+      (= tag :vector) (destructure-vector (rn/node-items pat) value-node env)
+      (= tag :map) (destructure-map (rn/node-items pat) value-node env)
       :else (compile-error env "unsupported binding pattern: expected a symbol, vector, or map" pattern))))
 
 (defn- compile-let
@@ -1016,25 +1066,25 @@
         result (reduce
                  (fn [acc pair]
                    (let [e (:env acc)
-                         init-ast (compile (second pair) e)]
+                         init-node (compile-node (second pair) (notail e))]
                      (if (symbol-pattern? (first pair))
                        ; a plain name: one step, no temporary
                        (let [r (destructure-symbol (rn/node-name (rn/node-form (first pair)))
-                                                   init-ast e)]
+                                                   init-node e)]
                          {:steps (concat (:steps acc) (:steps r)) :env (:env r)})
                        ; a destructuring pattern: bind the value to a temporary
                        ; ONCE (so it is not recomputed for each name), then
                        ; index into that temporary
                        (let [whole-var (fresh-var "whole")
-                             r (destructure-steps (first pair) whole-var e)]
+                             r (destructure-steps (first pair) (a/var whole-var) e)]
                          {:steps (concat (:steps acc)
-                                         (cons (list whole-var init-ast) (:steps r)))
+                                         (cons (list whole-var init-node) (:steps r)))
                           :env (:env r)}))))
                  {:steps (list) :env env} pairs)
         final-env (:env result)
         steps (:steps result)
-        body-ast (compile-body body final-env)]
-    (nest-lets steps body-ast)))
+        body-node (compile-body body final-env)]
+    (nest-lets steps body-node)))
 
 (defn- compile-loop
   "Turn (loop [pattern value ...] body...) into a self-re-entrant function.
@@ -1058,40 +1108,34 @@
                       (let [name (rn/node-name pat)
                             var (fresh-var name)]
                         {:params (cons var (:params acc))
-                         :args (cons (compile (second pair) env) (:args acc))
+                         :args (cons (compile-node (second pair) (notail env)) (:args acc))
                          :steps (:steps acc)
                          :env (put-local (:env acc) name var)})
                       ; a destructuring pattern: a `whole` param + prelude steps
                       (let [whole (fresh-var "whole")
-                            r (destructure-steps pat-node whole (:env acc))]
+                            r (destructure-steps pat-node (a/var whole) (:env acc))]
                         {:params (cons whole (:params acc))
-                         :args (cons (compile (second pair) env) (:args acc))
+                         :args (cons (compile-node (second pair) (notail env)) (:args acc))
                          :steps (concat (:steps acc) (:steps r))
                          :env (:env r)}))))
                 {:params (list) :args (list) :steps (list) :env env} pairs)
         params (reverse (:params built))
-        arg-asts (reverse (:args built))
+        arg-nodes (reverse (:args built))
         prelude-steps (:steps built)
         self (fresh-var "loop")
         loop-env (assoc (:env built) :recur {:self self :arity (count params)} :tail true)
         body-core (compile-body body loop-env)
-        body-ast (if (empty? prelude-steps)
-                   body-core
-                   (ast-node :__block__
-                             (apply list
-                                    (concat
-                                      (map (fn [step]
-                                             (ast-node := (list (first step) (second step))))
-                                           prelude-steps)
-                                      (list body-core)))))
-        inner-fn (ast-node :fn (list (ast-node :-> (list params body-ast))))
+        body-node (if (empty? prelude-steps)
+                    body-core
+                    (nest-lets prelude-steps body-core))
+        inner-fn (a/fnn (list (a/clause (apply list (map (fn [v] (a/pvar v)) params)) nil body-node)))
         self-applied (self-apply self inner-fn)]
-    (ast-node (erlang/list_to_tuple (list :. (list) (list self-applied))) arg-asts)))
+    (a/app self-applied arg-nodes)))
 
 (defn- compile-throw
   "Turn (throw x) into BeamLisp.ExInfo.raise_payload(x)."
   [x env]
-  (ast-mod-call (list :BeamLisp :ExInfo) :raise_payload (list (compile x env))))
+  (a/remote mod-exinfo :raise_payload (list (compile-node x (notail env)))))
 
 ; ---- pattern matching (receive) ----------------------------------------------
 ;
@@ -1163,27 +1207,26 @@
         tag (rn/node-tag f)]
     (cond
       (and (= tag :symbol) (= "_" (rn/node-name f)))
-        (list (list (erlang/list_to_tuple (list :_ (list) var-context))) env)
+        (list (list (a/pvar "_")) env)
       (= tag :symbol)
         (let [name (rn/node-name f) var (fresh-var name)]
-          (list (list var) (put-local env name var)))
+          (list (list (a/pvar var)) (put-local env name var)))
       (= tag :keyword)
-        (list (list (erlang/binary_to_atom (rn/node-name f))) env)
+        (list (list (a/plit (erlang/binary_to_atom (rn/node-name f)))) env)
       (= tag :vector)
         (let [pr (pattern-product (rn/node-items f) env)
               combos (first pr)
               alts (apply list
                      (mapcat (fn [pats]
-                               (let [tuple-pat (erlang/list_to_tuple (list tuple-head (list) (apply list pats)))
-                                     ; in a PATTERN the alias carries plain `[]`
-                                     ; metadata, not `[alias: false]`
-                                     vec-alias (erlang/list_to_tuple
-                                                 (list :__aliases__ (list) (list :BeamLisp :Vector)))
-                                     vector-pat (ast-node struct-head
-                                                          (list vec-alias
-                                                                (ast-node map-head
-                                                                          (list (erlang/list_to_tuple (list :items tuple-pat))))))]
-                                 (list tuple-pat vector-pat)))
+                               (let [ps (apply list pats)]
+                                 (list (a/ptuple ps)
+                                       (a/pstruct mod-vector
+                                                  ; pstruct field keys are RAW
+                                                  ; atoms (norm-pattern's
+                                                  ; encoding; quote-pat and
+                                                  ; lower-anf-pattern-key both
+                                                  ; expect it), not plit nodes
+                                                  (list [:items (a/ptuple ps)])))))
                              combos))]
           ; a vector matches a tuple OR a beam-lisp vector, so this doubles the
           ; child count. Refuse once the doubled alternatives cross the ceiling
@@ -1203,24 +1246,27 @@
         (let [kvs (rn/node-items f)
               keys (apply list (map (fn [pair]
                                       (let [k (rn/node-form (kv-key pair))]
-                                        (erlang/binary_to_atom (rn/node-name k))))
+                                        ; map-pattern keys are :lit EXPRESSION
+                                        ; nodes (norm-pattern's encoding:
+                                        ; normalise of the key form), not plit
+                                        (a/lit (erlang/binary_to_atom (rn/node-name k)))))
                                     kvs))
               pr (pattern-product (apply list (map kv-val kvs)) env)
               combos (first pr)]
           (list (apply list
                   (map (fn [vals]
-                         (ast-node map-head
-                                   (apply list
-                                     (loop [ks keys vs vals acc (list)]
-                                       (if (or (empty? ks) (empty? vs))
-                                         (reverse acc)
-                                         (recur (rest ks) (rest vs)
-                                                (cons (erlang/list_to_tuple (list (first ks) (first vs))) acc)))))))
+                         (a/pmap
+                           (apply list
+                             (loop [ks keys vs vals acc (list)]
+                               (if (or (empty? ks) (empty? vs))
+                                 (reverse acc)
+                                 (recur (rest ks) (rest vs)
+                                        (cons [(first ks) (first vs)] acc)))))))
                        combos))
                 (second pr)))
       :else
         ; a number, string, boolean, or nil matches itself
-        (list (list f) env))))
+        (list (list (a/plit f)) env))))
 
 ; ---- try / catch / finally ---------------------------------------------------
 ;
@@ -1251,7 +1297,13 @@
                 (= :symbol (rn/node-tag (rn/node-form (first items))))
                 (= "finally" (rn/node-name (rn/node-form (first items)))))))))
 
-(defn- catch-handler-ast
+(defn- anf-and2
+  "Strict boolean AND of two nodes, lowered as the if-chain the normaliser
+   uses for quoted `and`."
+  [x y]
+  (a/iff x y (a/lit false)))
+
+(defn- catch-handler-node
   "Build the body a catch clause runs once it matches: bind the handler's name
    to the normalized exception value, then run the handler forms. Shared by the
    typed and untyped branches, mirroring the genesis `run_handler`."
@@ -1259,9 +1311,7 @@
   (let [handler-var (fresh-var e-name)
         handler-env (put-local env e-name handler-var)
         handler-body (compile-body handler-forms handler-env)]
-    (ast-node :__block__
-              (list (ast-node := (list handler-var e-var))
-                    handler-body))))
+    (a/lett handler-var (a/var e-var) handler-body)))
 
 (defn- catch-cond-branch
   "Compile ONE (catch …) clause into a `cond` branch `[test] -> handler`.
@@ -1287,26 +1337,22 @@
           (let [rest-items (rest (rest items))
                 e-name (rn/node-name (rn/node-form (first rest-items)))
                 handler-forms (rest rest-items)
-                ; a dotted module symbol -> :__aliases__ node of its atom parts
-                segs (apply list (map erlang/binary_to_atom (split-dots name)))
-                mod-ast (ast-alias segs)
+                ; the module the type names, as its BEAM atom
+                mod-atom (module-atom name)
                 ; `is_struct(e, Mod)` is a Kernel guard, not an :erlang BIF, so
                 ; build its expansion directly: e is a map whose :__struct__ is
-                ; exactly Mod. This is the same shape the guard compiler emits
-                ; for `vector?`/`map?`, and is valid in an ordinary expression.
-                test (ast-node :and
-                               (list (ast-node :and
-                                               (list (erl-call :erlang :is_map (list e-var))
-                                                     (erl-call :erlang :is_map_key (list :__struct__ e-var))))
-                                     (ast-node :===
-                                               (list (erl-call :erlang :map_get (list :__struct__ e-var))
-                                                     mod-ast))))
-                handler (catch-handler-ast e-name handler-forms e-var env)]
-            (ast-node :-> (list (list test) handler)))
+                ; exactly Mod. `and` lowers as the if-chain the normaliser uses.
+                test (anf-and2 (anf-and2 (a/remote mod-erlang :is_map (list (a/var e-var)))
+                                         (a/remote mod-erlang :is_map_key (list (a/lit :__struct__) (a/var e-var))))
+                               (a/remote mod-erlang (erlang/binary_to_atom "=:=")
+                                         (list (a/remote mod-erlang :map_get (list (a/lit :__struct__) (a/var e-var)))
+                                               (a/lit mod-atom))))
+                handler (catch-handler-node e-name handler-forms e-var env)]
+            (a/clause (list test) nil handler))
           ; untyped: (catch e handler…)
           (let [handler-forms (rest (rest items))
-                handler (catch-handler-ast name handler-forms e-var env)]
-            (ast-node :-> (list (list true) handler))))))))
+                handler (catch-handler-node name handler-forms e-var env)]
+            (a/clause (list (a/lit true)) nil handler)))))))
 
 (defn- compile-catch-dispatch
   "Compile ALL of a try's catch clauses into a single `cond` dispatch.
@@ -1319,11 +1365,16 @@
    instead of being swallowed. Mirrors the genesis catch dispatch."
   [catches e-var kind-var value-var stack-var env]
   (let [branches (apply list (map (fn [c] (catch-cond-branch c e-var env)) catches))
-        reraise (erl-call :erlang :raise (list kind-var value-var stack-var))
-        fallthrough (ast-node :-> (list (list true) reraise))
+        reraise (a/remote mod-erlang :raise (list (a/var kind-var) (a/var value-var) (a/var stack-var)))
+        fallthrough (a/clause (list (a/lit true)) nil reraise)
         all-branches (apply list (concat branches (list fallthrough)))]
-    (ast-node :cond
-              (list (list (erlang/list_to_tuple (list :do all-branches)))))))
+    ; the first branch whose test holds wins — a nested if-chain, exactly the
+    ; normaliser's encoding of quoted `cond` (the last test is `true`)
+    (let [init (:body (first (reverse all-branches)))]
+      (reduce (fn [else cl]
+                (a/iff (first (:pats cl)) (:body cl) else))
+              init
+              (rest (reverse all-branches))))))
 
 (defn- after-clause-form?
   "Say whether a receive sub-form is an (after ms body) clause."
@@ -1368,30 +1419,25 @@
   (let [after-forms (filter after-clause-form? forms)
         normal (filter (fn [f] (not (after-clause-form? f))) forms)
         clauses (receive-clause-forms normal env)
-        ; each clause -> one -> node per pattern alternative
+        ; each clause -> one ANF clause per pattern alternative
         do-clauses (apply list
                      (mapcat (fn [cl]
                                (let [pr (compile-pattern (:pattern cl) env)
                                      pats (first pr)
                                      pat-env (second pr)
-                                     guard-ast (if (nil? (:guard cl)) nil
-                                                 (compile-guard (:guard cl) pat-env))
-                                     body-ast (compile (:body cl) pat-env)]
+                                     guard-node (if (nil? (:guard cl)) nil
+                                                  (compile-guard (:guard cl) pat-env))
+                                     body-node (compile-node (:body cl) pat-env)]
                                  (map (fn [pat]
-                                        (let [head (if (nil? guard-ast) pat
-                                                     (ast-node :when (list pat guard-ast)))]
-                                          (ast-node :-> (list (list head) body-ast))))
+                                        (a/clause (list pat) guard-node body-node))
                                       pats)))
-                             clauses))
-        base-opts (list (erlang/list_to_tuple (list :do do-clauses)))
-        opts (if (empty? after-forms)
-               base-opts
-               (let [af-items (rn/node-items (rn/node-form (first after-forms)))
-                     timeout (compile (second af-items) (notail env))
-                     after-body (compile (nth af-items 2) env)
-                     after-clause (ast-node :-> (list (list timeout) after-body))]
-                 (concat base-opts (list (erlang/list_to_tuple (list :after (list after-clause)))))))]
-    (ast-node :receive (list (apply list opts)))))
+                             clauses))]
+    (if (empty? after-forms)
+      (a/recv do-clauses nil nil)
+      (let [af-items (rn/node-items (rn/node-form (first after-forms)))
+            timeout (compile-node (second af-items) (notail env))
+            after-body (compile-node (nth af-items 2) env)]
+        (a/recv do-clauses timeout after-body)))))
 
 (defn- compile-try
   "Compile (try body... (catch e h...) (finally f...)) into Elixir try/catch.
@@ -1405,54 +1451,43 @@
         body (filter (fn [f] (not (or (catch-clause-form? f) (finally-clause-form? f)))) forms)]
     (if (and (empty? catches) (empty? finallies))
       (compile-body body env)
-      (let [body-ast (compile-body body env)
+      (let [body-node (compile-body body env)
             kind-var (fresh-var "kind")
             value-var (fresh-var "value")
             e-var (fresh-var "e")
             stack-var (fresh-var "stack")
             ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
-            normalize (ast-node :case
-                                (list kind-var
-                                      (list (erlang/list_to_tuple
-                                              (list :do
-                                                    (list (ast-node :-> (list (list :throw) value-var))
-                                                          (ast-node :-> (list (list :error)
-                                                                              (ast-mod-call (list :Exception) :normalize
-                                                                                            (list :error value-var stack-var))))
-                                                          (ast-node :-> (list (list :exit)
-                                                                              ; a 2-tuple literal {:exit, v} is a BARE
-                                                                              ; tuple in Elixir AST, not a {:{},[],..} node
-                                                                              (erlang/list_to_tuple (list :exit value-var))))))))))
-            ; assemble the try opts incrementally: [do: body] always, then
-            ; catch: ONLY when there are catch clauses, then after: only when
-            ; there is a finally. A try with a finally but NO catch (e.g.
-            ; `(try (thunk) (finally (cleanup)))`) is valid and must emit just
-            ; [do:, after:]. The catch machinery (dispatch/normalize/clause) is
-            ; built INSIDE this branch, never eagerly: computing
-            ; `(compile-catch-branch (first catches) ...)` when `catches` is
-            ; empty passed nil to compile-catch-branch, which crashed in
-            ; `node-items` with “not a tuple”. Matches genesis's incremental
-            ; opts assembly, where the catch clause exists only when needed.
-            do-opt (list (erlang/list_to_tuple (list :do body-ast)))
-            with-catch (if (empty? catches)
-                         do-opt
-                         (let [dispatch-body (compile-catch-dispatch catches e-var kind-var value-var stack-var env)
-                               ; stack = __STACKTRACE__; e = normalize; dispatch
-                               catch-body (ast-node :__block__
-                                                    ; __STACKTRACE__ is a bare special variable
-                                                    ; {:__STACKTRACE__, [], nil}, not a call
-                                                    (list (ast-node := (list stack-var
-                                                                             (erlang/list_to_tuple (list :__STACKTRACE__ (list) var-context))))
-                                                          (ast-node := (list e-var normalize))
-                                                          dispatch-body))
-                               catch-clause (ast-node :-> (list (list kind-var value-var) catch-body))]
-                           (concat do-opt (list (erlang/list_to_tuple (list :catch (list catch-clause)))))))
-            opts (if (empty? finallies)
-                   with-catch
-                   (let [fin-items (rest (rn/node-items (rn/node-form (first finallies))))
-                         fin-ast (compile-body fin-items (notail env))]
-                     (concat with-catch (list (erlang/list_to_tuple (list :after fin-ast))))))]
-        (ast-node :try (list (apply list opts)))))))
+            ; stack-var is v3_core's RAW stacktrace (a wrapper tuple): the
+            ; reraise below must pass it to raise/raw_raise AS IS — the primop
+            ; takes the raw form and a plain frame list SEGFAULTS the VM. But
+            ; Exception.normalize wants the frame LIST (element 2 of the raw
+            ; form — what Elixir's compiler emits for a __STACKTRACE__ read),
+            ; or an undef normalizes to a fieldless %UndefinedFunctionError{}
+            ; ("undefined function" with no module named).
+            raw-stack (a/var stack-var)
+            frame-list (a/remote mod-erlang :element (list (a/lit 2) raw-stack))
+            ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
+            normalize (a/casee (a/var kind-var)
+                               (list (a/clause (list (a/plit :throw)) nil (a/var value-var))
+                                     (a/clause (list (a/plit :error)) nil
+                                               (a/remote mod-exception :normalize
+                                                         (list (a/lit :error) (a/var value-var) frame-list)))
+                                     (a/clause (list (a/plit :exit)) nil
+                                               (a/tup (list (a/lit :exit) (a/var value-var))))))
+            ; the catch branch exists only when there ARE catch clauses (a try
+            ; with only a finally emits just [body, after]); the lowerer binds
+            ; the cerl var `__STACKTRACE__` around every catch clause's body
+            dispatch-body (if (empty? catches) nil
+                            (compile-catch-dispatch catches e-var kind-var value-var stack-var env))
+            catch-clauses (if (empty? catches) (list)
+                            (list (a/clause (list (a/pvar kind-var) (a/pvar value-var))
+                                            nil
+                                            (a/lett stack-var (a/var "__STACKTRACE__")
+                                                    (a/lett e-var normalize dispatch-body)))))
+            after-node (if (empty? finallies) nil
+                         (let [fin-items (rest (rn/node-items (rn/node-form (first finallies))))]
+                           (compile-body fin-items (notail env))))]
+        (a/tryy body-node catch-clauses after-node)))))
 
 (defn- datum
   "Turn a reader form into the plain DATA value it denotes.
@@ -1502,12 +1537,12 @@
 (defn- compile-quote
   "Turn (quote form) into the data the form denotes, as a literal value.
 
-   `quote` says ‘do not evaluate this — give it back as data’. We build the
-   datum (the form as a plain value) and then `Macro.escape` it, which turns a
-   value into the Elixir syntax tree that reconstructs it. That is exactly how
-   a quoted list, symbol, or literal becomes a constant in the compiled code."
+   `quote` says 'do not evaluate this — give it back as data'. The datum (the
+   form as a plain value) embeds directly as a bl-ANF literal: the lowerer
+   abstracts any ground term, so a quoted list, symbol, or literal is a
+   constant in the compiled code."
   [form]
-  (Macro/escape (datum form)))
+  (a/lit (datum form)))
 
 ; ── guards ────────────────────────────────────────────────────────────────────
 ;
@@ -1520,10 +1555,10 @@
 ; definitions. Anything else is refused, matching what the BEAM allows.
 
 (defn- erl-call
-  "The tree for a direct Erlang call `:mod.fun(args)` — the building block of
+  "The node for a direct Erlang call `:mod.fun(args)` — the building block of
    guard expressions."
   [mod fun args]
-  (ast-node (erlang/list_to_tuple (list :. (list) (list mod fun))) args))
+  (a/remote mod fun args))
 
 (def ^:private guard-bifs
   "The guard vocabulary: each allowed name mapped to how it compiles. A
@@ -1558,26 +1593,26 @@
    "neg?" (list :expand :guard_neg 1)})
 
 (defn- g-and
-  "An Elixir `a and b` operator node — what `guard-special` uses to combine
-   sub-tests (the compiler's own guard expansions emit the `and` operator, not
-   an `:erlang.andalso` call)."
+  "Strict boolean AND of two guard nodes (the if-chain the normaliser uses
+   for quoted `and`)."
   [a b]
-  (ast-node :and (list a b)))
+  (anf-and2 a b))
 
 (defn- g-or
-  "An Elixir `a or b` operator node."
+  "Boolean OR of two guard nodes, as an if-chain (case-in-guard is legal
+   Core Erlang)."
   [a b]
-  (ast-node :or (list a b)))
+  (a/iff a (a/lit true) b))
 
 (defn- g-eq3
-  "An Elixir `a === b` operator node (strict equality)."
+  "Strict equality `a =:= b` between guard nodes."
   [a b]
-  (ast-node :=== (list a b)))
+  (a/remote mod-erlang (erlang/binary_to_atom "=:=" ) (list a b)))
 
 (defn- g-ne3
-  "An Elixir `a !== b` operator node (strict inequality)."
+  "Strict inequality `a =/= b` between guard nodes."
   [a b]
-  (ast-node :!== (list a b)))
+  (a/remote mod-erlang (erlang/binary_to_atom "=/=") (list a b)))
 
 (defn- guard-special
   "Expand a guard predicate that no single Erlang BIF captures into a
@@ -1586,53 +1621,59 @@
   [tag args]
   (let [x (first args)]
     (cond
-      (= tag :guard_nil) (erl-call :erlang :"=:=" (list x nil))
-      (= tag :guard_some) (erl-call :erlang :"=/=" (list x nil))
-      (= tag :guard_true) (erl-call :erlang :"=:=" (list x true))
-      (= tag :guard_zero) (erl-call :erlang :== (list x 0))
-      (= tag :guard_pos) (erl-call :erlang :> (list x 0))
-      (= tag :guard_neg) (erl-call :erlang :< (list x 0))
+      (= tag :guard_nil) (erl-call :erlang (erlang/binary_to_atom "=:=") (list x (a/lit nil)))
+      (= tag :guard_some) (erl-call :erlang (erlang/binary_to_atom "=/=") (list x (a/lit nil)))
+      (= tag :guard_true) (erl-call :erlang (erlang/binary_to_atom "=:=") (list x (a/lit true)))
+      (= tag :guard_zero) (erl-call :erlang :== (list x (a/lit 0)))
+      (= tag :guard_pos) (erl-call :erlang :> (list x (a/lit 0)))
+      (= tag :guard_neg) (erl-call :erlang :< (list x (a/lit 0)))
       (= tag :guard_keyword)
-        ; an atom that is not true/false/nil, using the `and`/`!==` operators
+        ; an atom that is not true/false/nil
         (g-and (erl-call :erlang :is_atom (list x))
-               (g-and (g-ne3 x true)
-                      (g-and (g-ne3 x false) (g-ne3 x nil))))
+               (g-and (g-ne3 x (a/lit true))
+                      (g-and (g-ne3 x (a/lit false)) (g-ne3 x (a/lit nil)))))
       (= tag :guard_vector)
-        ; a map carrying a :__struct__ of BeamLisp.Vector (left-nested `and`,
-        ; the shape Elixir's compiler emits: ((is_map and has_key) and eq))
+        ; a map carrying a :__struct__ of BeamLisp.Vector (left-nested and)
         (g-and (g-and (erl-call :erlang :is_map (list x))
-                      (erl-call :erlang :is_map_key (list :__struct__ x)))
-               (g-eq3 (erl-call :erlang :map_get (list :__struct__ x))
-                      (ast-alias (list :BeamLisp :Vector))))
+                      (erl-call :erlang :is_map_key (list (a/lit :__struct__) x)))
+               (g-eq3 (erl-call :erlang :map_get (list (a/lit :__struct__) x))
+                      (a/lit mod-vector)))
       (= tag :guard_fn)
         (g-or (erl-call :erlang :is_function (list x))
               (g-and (erl-call :erlang :is_tuple (list x))
-                     (g-and (ast-node :==
-                                      (list (erl-call :erlang :tuple_size (list x)) 3))
-                            (ast-node :in
-                                      (list (erl-call :erlang :element (list 1 x))
-                                            (apply list (list (erlang/binary_to_atom "$blfn")
-                                                              (erlang/binary_to_atom "$remote"))))))))
+                     (g-and (erl-call :erlang :==
+                                      (list (erl-call :erlang :tuple_size (list x)) (a/lit 3)))
+                            (g-in-list (erl-call :erlang :element (list (a/lit 1) x))
+                                       (list (erlang/binary_to_atom "$blfn")
+                                             (erlang/binary_to_atom "$remote"))))))
       (= tag :guard_map)
         ; a plain map that is not one of the wrapper structs
-        (let [wrapper-aliases (apply list
-                                (map (fn [m] (ast-alias m))
-                                     (list (list :BeamLisp :Vector)
-                                           (list :BeamLisp :Set)
-                                           (list :BeamLisp :LazySeq)
-                                           (list :BeamLisp :Sorted :SortedSet)
-                                           (list :BeamLisp :Atom)
-                                           (list :BeamLisp :Volatile)
-                                           (list :BeamLisp :Promise)
-                                           (list :BeamLisp :Future)
-                                           (list :BeamLisp :Reduced))))
-              has-struct (erl-call :erlang :is_map_key (list :__struct__ x))
-              struct-val (erl-call :erlang :map_get (list :__struct__ x))
-              in-wrappers (ast-node :in (list struct-val wrapper-aliases))]
+        (let [wrapper-atoms (list mod-vector
+                                  mod-set
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.LazySeq")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Sorted.SortedSet")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Atom")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Volatile")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Promise")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Future")
+                                  (erlang/binary_to_atom "Elixir.BeamLisp.Reduced"))
+              has-struct (erl-call :erlang :is_map_key (list (a/lit :__struct__) x))
+              struct-val (erl-call :erlang :map_get (list (a/lit :__struct__) x))
+              in-wrappers (g-in-list struct-val wrapper-atoms)]
           (g-and (erl-call :erlang :is_map (list x))
-                 (g-or (ast-node :not (list has-struct))
-                       (ast-node :not (list in-wrappers)))))
+                 (g-or (a/remote mod-erlang :not (list has-struct))
+                       (a/remote mod-erlang :not (list in-wrappers)))))
       :else (throw (str "compiler: unknown guard expansion " tag)))))
+
+(defn- g-in-list
+  "Membership test `x in [a, b, …]` as a nested =:= if-chain — the guard-safe
+   expansion of Elixir's `in` operator."
+  [x atoms]
+  (if (empty? atoms)
+    (a/lit false)
+    (a/iff (g-eq3 x (a/lit (first atoms)))
+           (a/lit true)
+           (g-in-list x (rest atoms)))))
 
 (declare compile-guard)
 
@@ -1660,19 +1701,22 @@
         args (rest items)]
     (cond
       (= name "and")
-        (reduce (fn [acc a] (erl-call :erlang :andalso (list acc (compile-guard a env))))
+        ; an if-chain, not erlang:andalso/2 (which does not exist — a call to
+        ; it in a guard makes the guard silently fail). This is the same
+        ; shape the normaliser gives genesis's quoted `:and`.
+        (reduce (fn [acc a] (g-and acc (compile-guard a env)))
                 (compile-guard (first args) env) (rest args))
       (= name "or")
-        (reduce (fn [acc a] (erl-call :erlang :orelse (list acc (compile-guard a env))))
+        (reduce (fn [acc a] (g-or acc (compile-guard a env)))
                 (compile-guard (first args) env) (rest args))
       (= name "not")
         (erl-call :erlang :not (list (compile-guard (first args) env)))
       (contains? guard-bifs name)
         (let [entry (get guard-bifs name)
-              arg-asts (apply list (map (fn [a] (compile-guard a env)) args))]
+              arg-nodes (apply list (map (fn [a] (compile-guard a env)) args))]
           (if (= :bif (first entry))
-            (erl-call (second entry) (nth entry 2) arg-asts)
-            (guard-special (second entry) arg-asts)))
+            (erl-call (second entry) (nth entry 2) arg-nodes)
+            (guard-special (second entry) arg-nodes)))
       :else
         (compile-error env
           (str "`" name "` is not allowed in a guard. The BEAM evaluates guards without "
@@ -1692,11 +1736,11 @@
     (cond
       (= tag :symbol)
         (if (local? env (rn/node-name f))
-          (local-var env (rn/node-name f))
+          (a/var (local-var env (rn/node-name f)))
           (compile-error env (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
-      (= tag :keyword) (erlang/binary_to_atom (rn/node-name f))
+      (= tag :keyword) (a/lit (erlang/binary_to_atom (rn/node-name f)))
       (= tag :list) (compile-guard-list (rn/node-items f) env)
-      :else f)))
+      :else (a/lit f))))
 
 (defn- guardable-env
   "Narrow an env so a guard may read ONLY the variables the clause head binds.
@@ -1729,8 +1773,23 @@
   (loop [ps param-forms fixed (list)]
     (cond
       (empty? ps) [(reverse fixed) nil]
-      (amp-node? (first ps)) [(reverse fixed) (second ps)]
+      (amp-node? (first ps))
+        ; exactly one form may follow `&` — a name or one pattern
+        (if (and (some? (second ps)) (empty? (rest (rest ps))))
+          [(reverse fixed) (second ps)]
+          (erlang/error (RuntimeError/exception "& in params must be followed by exactly one parameter")))
       :else (recur (rest ps) (cons (first ps) fixed)))))
+
+(defn- check-rest-pattern!
+  "Refuse a MAP pattern in rest position.
+
+   The rest is always a positional seq; destructuring it as a map would
+   silently bind every key to nil (a seq is not a map) — a footgun, not a
+   feature, so refuse loudly like the genesis Elixir compiler did."
+  [rest-form]
+  (when (= :map (rn/node-tag (rn/node-form rest-form)))
+    (erlang/error
+      (RuntimeError/exception "& rest pattern cannot be a map: the rest is a positional seq; use a vector pattern (& [a b]) or destructure the map as a fixed param"))))
 
 (defn- bind-param
   "Bind one parameter form to a fresh Elixir variable.
@@ -1745,7 +1804,7 @@
           var (fresh-var name)]
       {:param var :steps (list) :env (put-local env name var)})
     (let [whole-var (fresh-var "whole")
-          r (destructure-steps pform whole-var env)]
+          r (destructure-steps pform (a/var whole-var) env)]
       {:param whole-var :steps (:steps r) :env (:env r)})))
 
 (defn- clause-shape
@@ -1789,10 +1848,9 @@
               (let [rname (rn/node-name (rn/node-form rest-form))
                     raw (fresh-var "rest")
                     rest-var (fresh-var rname)
-                    norm (ast-node :if
-                                   (list (ast-node :== (list raw (list)))
-                                         (list (erlang/list_to_tuple (list :do nil))
-                                               (erlang/list_to_tuple (list :else raw)))))]
+                    norm (a/iff (a/remote mod-erlang :== (list (a/var raw) a/enil))
+                                (a/lit nil)
+                                (a/var raw))]
                 {:params (cons raw (:params fixed-built))
                  :steps (concat (:steps fixed-built) (list (list rest-var norm)))
                  :env (put-local (:env fixed-built) rname rest-var)})
@@ -1807,11 +1865,11 @@
             (not (symbol-pattern? rest-form))
               (let [raw (fresh-var "rest")
                     rest-var (fresh-var "rest")
-                    norm (ast-node :if
-                                   (list (ast-node :== (list raw (list)))
-                                         (list (erlang/list_to_tuple (list :do nil))
-                                               (erlang/list_to_tuple (list :else raw)))))
-                    r (destructure-steps rest-form rest-var (:env fixed-built))]
+                    norm (a/iff (a/remote mod-erlang :== (list (a/var raw) a/enil))
+                                (a/lit nil)
+                                (a/var raw))
+                    _ (check-rest-pattern! rest-form)
+                    r (destructure-steps rest-form (a/var rest-var) (:env fixed-built))]
                 {:params (cons raw (:params fixed-built))
                  :steps (concat (:steps fixed-built)
                                 (cons (list rest-var norm) (:steps r)))
@@ -1827,32 +1885,21 @@
         ; a named fn binds its own name to self.(self) inside the body
         named-env (if (nil? fn-name)
                     (:env rest-built)
-                    (let [self-app (ast-node (erlang/list_to_tuple (list :. (list) (list self)))
-                                             (list self))]
+                    (let [self-app (a/app (a/var self) (list (a/var self)))]
                       (put-local (:env rest-built) fn-name self-app)))
         body-env (assoc named-env :recur {:self self :arity arity} :tail true)
-        body-ast (compile-body body body-env)
+        body-node (compile-body body body-env)
         full-body (if (empty? prelude-steps)
-                    body-ast
-                    (ast-node :__block__
-                              (apply list
-                                     (concat
-                                       (map (fn [step]
-                                              (ast-node := (list (first step) (second step))))
-                                            prelude-steps)
-                                       (list body-ast)))))
-        ; a :when guard wraps the clause head as {:when, [], params ++ [guard]},
-        ; compiled in the restricted guard dialect against the head's variables
-        ; a guard reads only the head's parameter variables (guardable-env),
-        ; so a destructured or unbound name in the guard is refused rather than
-        ; leaking an undefined variable from the generated clause head.
-        head (if (nil? guard)
-               params
-               (list (ast-node :when
-                               (apply list (concat params
-                                                   (list (compile-guard guard (guardable-env body-env params))))))))]
+                    body-node
+                    (nest-lets prelude-steps body-node))
+        ; a :when guard is compiled in the restricted guard dialect against the
+        ; head's variables; a guard reads only the head's parameter variables
+        ; (guardable-env), so a destructured or unbound name in the guard is
+        ; refused rather than leaking an undefined variable.
+        guard-node (if (nil? guard) nil
+                     (compile-guard guard (guardable-env body-env params)))]
     {:shape (clause-shape param-forms)
-     :clause (ast-node :-> (list head full-body))}))
+     :clause (a/clause (apply list (map (fn [p] (a/pvar p)) params)) guard-node full-body)}))
 
 (defn- split-when
   "Split a clause's forms into [guard body] at a leading `:when`.
@@ -1923,32 +1970,26 @@
              (= :fixed (first (first shapes))))
       ; one fixed arity: a bare self-applied fn
       (self-apply (get self-map (first shapes))
-                  (ast-node :fn (apply list (get by-shape (first shapes)))))
+                  (a/fnn (apply list (get by-shape (first shapes)))))
       ; multiple arities and/or a variadic: a $blfn dispatch tuple
       (let [fixed-entries
             (apply list
               (map (fn [shape]
-                     (erlang/list_to_tuple
-                       (list (second shape)
-                             (self-apply (get self-map shape)
-                                         (ast-node :fn (apply list (get by-shape shape)))))))
+                     [(a/lit (second shape))
+                      (self-apply (get self-map shape)
+                                  (a/fnn (apply list (get by-shape shape))))])
                    (filter (fn [s] (= :fixed (first s))) shapes)))
             variadic-shape (first (filter (fn [s] (= :variadic (first s))) shapes))
-            ; the variadic slot is the tuple literal {min, fn} — an AST tuple
-            ; node {:{}, [], [min, fn-ast]}, NOT a call
-            variadic-ast (if (nil? variadic-shape)
-                           nil
-                           (erlang/list_to_tuple
-                             (list tuple-head (list)
-                                   (list (second variadic-shape)
+            ; the variadic slot is the tuple {min, fn}
+            variadic-node (if (nil? variadic-shape)
+                            (a/lit nil)
+                            (a/tup (list (a/lit (second variadic-shape))
                                          (self-apply (get self-map variadic-shape)
-                                                     (ast-node :fn (apply list (get by-shape variadic-shape))))))))]
-        ; the whole value is the tuple literal {:"$blfn", %{...}, variadic}
-        (erlang/list_to_tuple
-          (list tuple-head (list)
-                (list (erlang/binary_to_atom "$blfn")
-                      (ast-node map-head fixed-entries)
-                      variadic-ast)))))))
+                                                     (a/fnn (apply list (get by-shape variadic-shape)))))))]
+        ; the whole value is the tuple {:"$blfn", %{...}, variadic}
+        (a/tup (list (a/lit (erlang/binary_to_atom "$blfn"))
+                     (a/mapp fixed-entries)
+                     variadic-node))))))
 
 (defn- compile-fn
   "Turn a (fn ...) form into a function value.
@@ -2000,12 +2041,9 @@
 (declare synq)
 
 (defn- cons-cell
-  "An Elixir list-cons AST for `[head | tail]`. In Elixir's syntax tree a cons
-   is a one-element LIST holding a `|` node: `[{:|, [], [head, tail]}]`. The
-   list wrapper matters — it is what makes the nested result read as
-   `[a | [b | [c | []]]]`, the shape the answer key produces."
+  "A cons node `[head | tail]` — the list-construction building block."
   [head tail]
-  (list (ast-node :| (list head tail))))
+  (a/cons-cell head tail))
 
 (defn- gensym-hash?
   "Say whether a template symbol name ends in # (and is longer than one char),
@@ -2082,19 +2120,19 @@
 (defn- synq-list
   "Build the constructor for a template list's items, right to left. Each
    ordinary item is consed onto the growing tail; a ~@xs item splices its whole
-   sequence with BeamLisp.RT.splice. Returns [ast new-gensym-map]."
+   sequence with BeamLisp.RT.splice. Returns [node new-gensym-map]."
   [items env g]
   (reduce (fn [acc item]
-            (let [built-ast (first acc)
+            (let [built-node (first acc)
                   gacc (second acc)]
               (if (splice-form? item)
                 (let [x (second (rn/node-items (rn/node-form item)))]
-                  (list (ast-mod-call (list :BeamLisp :RT) :splice
-                                      (list (compile x (notail env)) built-ast))
+                  (list (a/remote mod-rt :splice
+                                  (list (compile-node x (notail env)) built-node))
                         gacc))
                 (let [r (synq item env gacc)]
-                  (list (cons-cell (first r) built-ast) (second r))))))
-          (list (list) g)
+                  (list (cons-cell (first r) built-node) (second r))))))
+          (list a/enil g)
           (reverse items)))
 
 (defn- nested-synq-form?
@@ -2109,14 +2147,20 @@
                 (= "syntax-quote" (rn/node-name (rn/node-form (first items)))))))))
 
 (defn- synq
-  "Build the Elixir tree that constructs one templated form at run time.
-   Returns [ast new-gensym-map]."
+  "Build the bl-ANF node that constructs one templated form at run time.
+   Returns [node new-gensym-map]."
   [form env g]
   (let [f (rn/node-form form)
         tag (rn/node-tag f)]
     (cond
       (unquote-form? form)
-        (list (compile (second (rn/node-items f)) (notail env)) g)
+        (list (compile-node (second (rn/node-items f)) (notail env)) g)
+      ; a bare ~@x outside any list/vector template: refused (splicing makes
+      ; sense only as a list item — synq-list's splice-form? branch). The
+      ; genesis Elixir compiler raised this; the port dropped it.
+      (splice-form? form)
+        (erlang/error
+          (RuntimeError/exception "~@ is only valid inside a syntax-quoted list or vector"))
       ; a NESTED syntax-quote gets its OWN fresh gensym map: its `x#` symbols
       ; must be independent of the enclosing template's, so two sibling nested
       ; backticks each holding `x#` produce DIFFERENT generated names. The
@@ -2125,36 +2169,36 @@
       (nested-synq-form? form)
         (let [inner (second (rn/node-items f))
               inner-r (synq inner env {})
-              inner-ast (first inner-r)
-              sq-sym (Macro/escape (rn/->tuple (list :symbol "syntax-quote")))]
-          (list (cons-cell sq-sym (cons-cell inner-ast (list))) g))
+              inner-node (first inner-r)
+              sq-sym (a/lit (rn/->tuple (list :symbol "syntax-quote")))]
+          (list (cons-cell sq-sym (cons-cell inner-node a/enil)) g))
       (= tag :list)
         (synq-list (rn/node-items f) env g)
       (= tag :vector)
         (let [r (synq-list (rn/node-items f) env g)]
-          (list (ast-mod-call (list :BeamLisp :Vector) :new (list (first r))) (second r)))
+          (list (a/remote mod-vector :new (list (first r))) (second r)))
       (= tag :map)
         (let [built (reduce (fn [acc pair]
                               (let [k (kv-key pair) v (kv-val pair)
                                     rk (synq k env (second acc))
                                     rv (synq v env (second rk))]
-                                (list (cons (erlang/list_to_tuple (list (first rk) (first rv)))
+                                (list (cons [(first rk) (first rv)]
                                             (first acc))
                                       (second rv))))
                             (list (list) g)
                             (rn/node-items f))]
-          (list (ast-node map-head (apply list (reverse (first built)))) (second built)))
+          (list (a/mapp (apply list (reverse (first built)))) (second built)))
       (= tag :symbol)
         (let [rg (resolve-gensym (rn/node-name f) g)
               resolved (first rg)
               g2 (second rg)]
-          (list (Macro/escape (rn/->tuple (list :symbol (qualify-synq resolved env)))) g2))
+          (list (a/lit (rn/->tuple (list :symbol (qualify-synq resolved env)))) g2))
       (= tag :keyword)
-        (list (erlang/binary_to_atom (rn/node-name f)) g)
-      :else (list f g))))
+        (list (a/lit (erlang/binary_to_atom (rn/node-name f))) g)
+      :else (list (a/lit f) g))))
 
 (defn- compile-syntax-quote
-  "Compile a (syntax-quote form) into the tree that builds the templated form."
+  "Compile a (syntax-quote form) into the node that builds the templated form."
   [form env]
   (first (synq form env {})))
 
@@ -2226,6 +2270,18 @@
     (erlang/list_to_tuple
       (list m (compile-fn (apply list (parse-fn-clauses-as-args (rest items))) env)))))
 
+(defn- protocol-impl-pair
+  "protocol-impl's result as an a/mapp pair: [(a/lit name) fn-node]."
+  [form env]
+  (let [p (protocol-impl form env)]
+    [(a/lit (first (erlang/tuple_to_list p)))
+   (second (erlang/tuple_to_list p))]))
+
+(defn- impls-map
+  "The method-implementations map node for a group of (name [args] body) forms."
+  [method-forms env]
+  (a/mapp (apply list (map (fn [mf] (protocol-impl-pair mf env)) method-forms))))
+
 (defn- parse-fn-clauses-as-args
   "Wrap a method body (a single `[params] body...` clause) as the argument list
    the fn compiler expects."
@@ -2241,16 +2297,14 @@
    no metadata stays metadata-free, exactly as genesis does for a plain
    defprotocol/defmulti. This is what makes a protocol/multimethod docstring
    retrievable via the same `Env.meta`/doc resolution as a `defn` docstring."
-  [define-ast doc ns name]
+  [define-node doc ns name]
   (if (nil? doc)
-    define-ast
-    (let [value-var (erlang/list_to_tuple (list :value (list) var-context))
-          meta (ast-node map-head
-                         (list (erlang/list_to_tuple (list :doc doc))))]
-      (ast-node :__block__
-                (list (ast-node := (list value-var define-ast))
-                      (ast-mod-call (list :BeamLisp :Env) :put_meta (list ns name meta))
-                      value-var)))))
+    define-node
+    (a/lett "value" define-node
+            (a/doo (list (a/remote mod-env :put_meta
+                                   (list (a/lit ns) (a/lit name)
+                                         (a/mapp (list (list (a/lit :doc) (a/lit doc))))))
+                         (a/var "value"))))))
 
 (defn- compile-defmulti
   "Compile (defmulti name dispatch-fn) — or (defmulti name docstring dispatch-fn)
@@ -2267,9 +2321,10 @@
                      (erlang/is_binary (rn/node-form (first more))))
         doc (if has-doc (rn/node-form (first more)) nil)
         dispatch (if has-doc (second more) (first more))
-        define-ast (ast-mod-call (list :BeamLisp :Multi) :define_multi
-                                 (list (:ns env) name (compile dispatch (notail env))))]
-    (with-doc-meta define-ast doc (:ns env) name)))
+        define-node (a/remote mod-multi :define_multi
+                              (list (a/lit (:ns env)) (a/lit name)
+                                    (compile-node dispatch (notail env))))]
+    (with-doc-meta define-node doc (:ns env) name)))
 
 (defn- compile-defmethod
   "Compile (defmethod name dispatch-val [params] body...) into a
@@ -2277,10 +2332,10 @@
   [name-form dispatch-val rest-forms env]
   (let [name (rn/node-name (rn/node-form name-form))
         tgt (multi-var-target env name)]
-    (ast-mod-call (list :BeamLisp :Multi) :add_method
-                  (list (first tgt) (second tgt)
-                        (compile dispatch-val (notail env))
-                        (compile-fn (apply list rest-forms) env)))))
+    (a/remote mod-multi :add_method
+              (list (a/lit (first tgt)) (a/lit (second tgt))
+                    (compile-node dispatch-val (notail env))
+                    (compile-fn (apply list rest-forms) env)))))
 
 (defn- compile-defprotocol
   "Compile (defprotocol Name (method [args])...) into a Multi.define_protocol
@@ -2298,9 +2353,9 @@
                        (map (fn [mf]
                               (rn/node-name (rn/node-form (first (rn/node-items (rn/node-form mf))))))
                             methods))
-        define-ast (ast-mod-call (list :BeamLisp :Multi) :define_protocol
-                                 (list (:ns env) name method-names))]
-    (with-doc-meta define-ast doc (:ns env) name)))
+        define-node (a/remote mod-multi :define_protocol
+                              (list (a/lit (:ns env)) (a/lit name) (a/lit method-names)))]
+    (with-doc-meta define-node doc (:ns env) name)))
 
 (defn- compile-extend-type
   "Compile (extend-type Type Protocol (method [args] body)...) into a
@@ -2309,17 +2364,17 @@
   (let [protocol (rn/node-name (rn/node-form protocol-form))
         tgt (multi-var-target env protocol)
         tag (type-tag type-form env)
-        impls (ast-node map-head
-                        (apply list (map (fn [mf] (protocol-impl mf env)) method-forms)))]
-    (ast-mod-call (list :BeamLisp :Multi) :extend_type
-                  (list (first tgt) (second tgt) tag impls))))
+        impls (impls-map method-forms env)]
+    (a/remote mod-multi :extend_type
+              (list (a/lit (first tgt)) (a/lit (second tgt)) (a/lit tag) impls))))
 
 (defn- compile-satisfies?
   "Compile (satisfies? Protocol value) into a Multi.satisfies? call."
   [protocol-form value-form env]
   (let [tgt (multi-var-target env (rn/node-name (rn/node-form protocol-form)))]
-    (ast-mod-call (list :BeamLisp :Multi) :satisfies?
-                  (list (first tgt) (second tgt) (compile value-form (notail env))))))
+    (a/remote mod-multi :satisfies?
+              (list (a/lit (first tgt)) (a/lit (second tgt))
+                    (compile-node value-form (notail env))))))
 
 (defn- compile-extend-protocol
   "Compile (extend-protocol Protocol Type (method...)... Type2 (method...)...)
@@ -2357,15 +2412,15 @@
                        (let [type-form (first grp)
                              method-forms (second grp)
                              tag (type-tag type-form env)
-                             impls (ast-node map-head
-                                             (apply list (map (fn [mf] (protocol-impl mf env)) method-forms)))]
-                         (ast-mod-call (list :BeamLisp :Multi) :extend_type
-                                       (list (first tgt) (second tgt) tag impls))))
+                             impls (impls-map method-forms env)]
+                         (a/remote mod-multi :extend_type
+                                   (list (a/lit (first tgt)) (a/lit (second tgt))
+                                         (a/lit tag) impls))))
                      all-groups))]
-    ; a single call is itself; several become a block
+    ; a single call is itself; several become a do block
     (if (= 1 (count calls))
       (first calls)
-      (ast-node :__block__ calls))))
+      (a/doo calls))))
 
 (defn- group-proto-forms
   "Group protocol/method forms: each protocol symbol followed by its method
@@ -2408,13 +2463,27 @@
   (let [crate (rn/node-form crate-form)
         signatures (apply list
                      (map (fn [sf]
-                            (let [items (rn/node-items (rn/node-form sf))]
-                              (erlang/list_to_tuple
-                                (list (rn/node-name (rn/node-form (first items)))
-                                      (rn/node-form (second items))))))
+                            ; each signature must be (fn-name arity) — a
+                            ; two-element list with a symbol name and an
+                            ; integer arity. Anything else is a malformed
+                            ; declaration; refuse it loudly instead of
+                            ; crashing deep inside node accessors (genesis
+                            ; raised this; the port dropped it).
+                            (let [sf-form (rn/node-form sf)]
+                              (if (and (= :list (rn/node-tag sf-form))
+                                       (erlang/=:= 2 (count (rn/node-items sf-form)))
+                                       (= :symbol (rn/node-tag (rn/node-form (first (rn/node-items sf-form)))))
+                                       (erlang/is_integer (rn/node-form (second (rn/node-items sf-form)))))
+                                (erlang/list_to_tuple
+                                  (list (rn/node-name (rn/node-form (first (rn/node-items sf-form))))
+                                        (rn/node-form (second (rn/node-items sf-form)))))
+                                (erlang/error
+                                  (RuntimeError/exception
+                                    (str "defnative: expected (fn-name arity), got "
+                                         (pr-str (rn/form sf))))))))
                           sig-forms))]
-    (ast-mod-call (list :BeamLisp :Native) :declare
-                  (list (:ns env) crate (Macro/escape signatures)))))
+    (a/remote mod-native :declare
+              (list (a/lit (:ns env)) (a/lit crate) (a/lit signatures)))))
 
 (defn- compile-reify
   "Compile (reify Protocol (method [args] body)... ) into an anonymous object.
@@ -2425,26 +2494,21 @@
    named type."
   [forms env]
   (let [groups (group-proto-forms forms)
-        tag-var (erlang/list_to_tuple (list :tag (list) var-context))
+        tag-var "tag"
         extends (map (fn [grp]
                        (let [proto (rn/node-name (rn/node-form (first grp)))
                              tgt (multi-var-target env proto)
                              method-forms (second grp)
-                             impls (ast-node map-head
-                                             (apply list (map (fn [mf] (protocol-impl mf env)) method-forms)))]
-                         (ast-mod-call (list :BeamLisp :Multi) :extend_type
-                                       (list (first tgt) (second tgt) tag-var impls))))
+                             impls (impls-map method-forms env)]
+                         (a/remote mod-multi :extend_type
+                                   (list (a/lit (first tgt)) (a/lit (second tgt))
+                                         (a/var tag-var) impls))))
                      groups)
         ; the reified value: {:bl_reify, tag, {}}
-        reified (erlang/list_to_tuple
-                  (list tuple-head (list)
-                        (list :bl_reify tag-var
-                              (erlang/list_to_tuple (list tuple-head (list) (list))))))
-        ; tag = make_ref(); extends...; reified
-        stmts (concat (list (ast-node := (list tag-var (ast-node :make_ref (list)))))
-                      extends
-                      (list reified))]
-    (ast-node :__block__ (apply list stmts))))
+        reified (a/tup (list (a/lit :bl_reify) (a/var tag-var) (a/tup (list))))]
+    ; tag = make_ref(); extends...; reified
+    (a/lett tag-var (a/remote mod-erlang :make_ref (list))
+            (a/doo (apply list (concat extends (list reified)))))))
 
 (defn- record-field-names
   "The field names of a record/deftype field vector, as strings."
@@ -2490,10 +2554,10 @@
                  method-forms (second group)
                  protocol (rn/node-name (rn/node-form proto-form))
                  tgt (multi-var-target env protocol)
-                 impls (ast-node map-head
-                                 (apply list (map (fn [mf] (protocol-impl mf env)) method-forms)))]
-             (ast-mod-call (list :BeamLisp :Multi) :extend_type
-                           (list (first tgt) (second tgt) mod-var impls))))
+                 impls (impls-map method-forms env)]
+             (a/remote mod-multi :extend_type
+                       (list (a/lit (first tgt)) (a/lit (second tgt))
+                             (a/var mod-var) impls))))
          grouped)))
 
 (defn- compile-defrecord
@@ -2512,34 +2576,27 @@
         fields (record-field-names fields-form)
         ; a FIXED variable named `mod` (not gensym'd), matching the existing
         ; compiler — there is only one per record definition, so no collision
-        mod-var (erlang/list_to_tuple (list :mod (list) var-context))
+        mod-var "mod"
         define-fn (if (= kind :record) :define :define_type)
+        define-node (a/remote mod-record define-fn
+                              (list (a/lit (:ns env)) (a/lit name) (a/lit fields)))
         base (list
-               ; mod = Record.define(ns, Name, fields)
-               (ast-node := (list mod-var
-                                  (ast-mod-call (list :BeamLisp :Record) define-fn
-                                                (list (:ns env) name fields))))
                ; intern Name -> mod
-               (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name mod-var))
+               (a/remote mod-env :intern (list (a/lit (:ns env)) (a/lit name) (a/var mod-var)))
                ; intern ->Name -> positional constructor
-               (ast-mod-call (list :BeamLisp :Env) :intern
-                             (list (:ns env) (str "->" name)
-                                   (ast-mod-call (list :BeamLisp :Record) :positional_ctor (list mod-var)))))
-        ; the map-constructor slot: a record interns `map->Name`; a deftype has
-        ; none, so the slot is `nil` (the existing compiler emits it either way)
-        map-ctor-slot (if (= kind :record)
-                        (ast-mod-call (list :BeamLisp :Env) :intern
-                                      (list (:ns env) (str "map->" name)
-                                            (ast-mod-call (list :BeamLisp :Record) :map_ctor (list mod-var))))
-                        nil)
+               (a/remote mod-env :intern
+                         (list (a/lit (:ns env)) (a/lit (str "->" name))
+                               (a/remote mod-record :positional_ctor (list (a/var mod-var))))))
+        ; the map-constructor slot: a record interns `map->Name`; a deftype has none
+        map-ctor-stmts (if (= kind :record)
+                         (list (a/remote mod-env :intern
+                                 (list (a/lit (:ns env)) (a/lit (str "map->" name))
+                                       (a/remote mod-record :map_ctor (list (a/var mod-var))))))
+                         (list))
         ; the inline protocol extends, in source order, each a Multi.extend_type
-        extend-asts (record-protocol-extends (or proto-forms (list)) mod-var env)
-        ; wrap them in one block occupying the single statement slot the
-        ; original layout reserved (an empty block when there are no protocols),
-        ; then the outer block returns the module value
-        extend-block (ast-node :__block__ (apply list extend-asts))
-        stmts (concat base (list map-ctor-slot extend-block mod-var))]
-    (ast-node :__block__ (apply list stmts))))
+        extend-nodes (record-protocol-extends (or proto-forms (list)) mod-var env)
+        stmts (apply list (concat base map-ctor-stmts extend-nodes (list (a/var mod-var))))]
+    (a/lett mod-var define-node (a/doo stmts))))
 
 ; ---- defserver (real gen_server) ---------------------------------------------
 ;
@@ -2566,9 +2623,9 @@
         ; that fetches its constructor at run time
         ret-env (reduce (fn [e cname]
                           (put-local e cname
-                                     (ast-mod-call (list :Map) :fetch!
-                                                   (list (ast-mod-call (list :BeamLisp :Server) :return_constructors (list))
-                                                         cname))))
+                                     (a/remote (erlang/binary_to_atom "Elixir.Map") :fetch!
+                                               (list (a/remote mod-server :return_constructors (list))
+                                                     (a/lit cname)))))
                         env (maps/keys ctors))]
     (compile-body forms ret-env)))
 
@@ -2595,29 +2652,26 @@
                           {:params (list) :steps (list) :env env}
                           params)
             head-vars (reverse (:params built))
-            prelude (map (fn [s] (ast-node := (list (first s) (second s)))) (:steps built))
-            ; INIT ONLY: the OTP arg arrives wrapped by BeamLisp.Server.start*
-            ; with the caller's env token. Receive it into a fresh param, bind
-            ; the conveyed env and unwrap the real arg (bind_init), then let the
-            ; user's own param bindings run against that real arg. This is what
-            ; makes a `defserver` started inside an isolated fork resolve its
-            ; namespace's vars in init instead of crashing at :global. Other
-            ; vector callbacks (handle-continue/terminate) are unchanged.
+            ; the whole def-ast stays QUOTED until E4 (the server module is
+            ; Module.create'd from escaped quoted trees); the compiler's ANF
+            ; nodes cross back through anf/quote-node at the boundary
             init? (= fname :init)
             conveyed-var (fresh-var "bl_init_arg")
             ; bind the conveyed env; assign the real arg to the user's param
             ; when init declares one, or just discard it when init takes `[]`.
-            unwrap-step (cond
-                          (not init?) (list)
+            inner-body (nest-lets (:steps built) (server-body body (:env built)))
+            with-unwrap (cond
+                          (not init?) inner-body
                           (empty? head-vars)
-                            (list (ast-mod-call (list :BeamLisp :Server) :bind_init (list conveyed-var)))
+                            (a/doo (list (a/remote mod-server :bind_init (list (a/var conveyed-var)))
+                                         inner-body))
                           :else
-                            (list (ast-node := (list (first head-vars)
-                                                     (ast-mod-call (list :BeamLisp :Server) :bind_init
-                                                                   (list conveyed-var))))))
+                            (a/lett (first head-vars)
+                                    (a/remote mod-server :bind_init (list (a/var conveyed-var)))
+                                    inner-body))
             def-head-vars (if init? (list conveyed-var) head-vars)
-            body-ast (server-body (concat unwrap-step prelude body) (:env built))]
-        (list (ast-node :def (list (ast-node fname def-head-vars)
+            body-ast (anf-quote-node with-unwrap)]
+        (list (ast-node :def (list (ast-node fname (apply list (map qvar def-head-vars)))
                                    (list (erlang/list_to_tuple (list :do body-ast)))))))
       ; (handle-call PATTERN [params...] body...) with an optional :when guard
       (let [pat-form (first rest-forms)
@@ -2630,7 +2684,7 @@
             pr (compile-pattern pat-form env)
             pats (first pr)
             msg-env (second pr)
-            guard-ast (if (nil? guard) nil (compile-guard guard msg-env))
+            guard-ast (if (nil? guard) nil (anf-quote-node (compile-guard guard msg-env)))
             built (reduce (fn [acc pform]
                             (let [b (bind-param pform (:env acc))]
                               {:params (cons (:param b) (:params acc))
@@ -2639,25 +2693,28 @@
                           {:params (list) :steps (list) :env msg-env}
                           (rn/node-items (rn/node-form params-form)))
             head-vars (reverse (:params built))
-            prelude (map (fn [s] (ast-node := (list (first s) (second s)))) (:steps built))
-            body-ast (server-body (concat prelude body) (:env built))]
+            body-ast (anf-quote-node (nest-lets (:steps built) (server-body body (:env built))))]
         (map (fn [pat]
-               (let [head (ast-node fname (cons pat head-vars))
+               (let [head (ast-node fname (cons (anf-quote-pat pat) (apply list (map qvar head-vars))))
                      ghead (if (nil? guard-ast) head (ast-node :when (list head guard-ast)))]
                  (ast-node :def (list ghead (list (erlang/list_to_tuple (list :do body-ast)))))))
              pats)))))
 
 (defn- server-client-defs
   "The fixed client-API def-asts every server gets: start, start_link, call,
-   cast, stop — thin wrappers over GenServer with default arguments."
-  []
+   cast, stop — thin wrappers over GenServer with default arguments.
+
+   `mod` is the server module's atom, embedded as a LITERAL where the genesis
+   quoted tree used `__MODULE__` — an Elixir-compiler special form that does
+   not exist on the Core path (core_lint: unbound_var)."
+  [mod]
   (let [gsdot (fn [f args] (ast-node (erlang/list_to_tuple (list :. (list) (list (ast-alias (list :GenServer)) f))) args))
         blsrvdot (fn [f args] (ast-node (erlang/list_to_tuple (list :. (list) (list (ast-alias (list :BeamLisp :Server)) f))) args))
         deflt (fn [name d] (ast-node (erlang/binary_to_atom "\\\\") (list (svar name) d)))
         mkdef (fn [fname params body] (ast-node :def (list (ast-node fname params)
                                                            (list (erlang/list_to_tuple (list :do body))))))
-        ; __MODULE__ carries the compiler context, like the oracle emits
-        modv (erlang/list_to_tuple (list :__MODULE__ (list) var-context))]
+        ; the module atom as a self-quoting literal (see the docstring)
+        modv mod]
     (list
       ;; start/start_link route through BeamLisp.Server (NOT GenServer directly)
       ;; so the caller's env is CONVEYED into the server process: Server.start*
@@ -2748,40 +2805,23 @@
                               (server-default-defs cb)
                               user)))
                         (BeamLisp.Server/callback_order))
-        ; @behaviour :gen_server node with the metadata Elixir stamps
-        kernel-atom (erlang/binary_to_atom "Elixir.Kernel")
-        behaviour-node (erlang/list_to_tuple
-                         (list (erlang/binary_to_atom "@")
-                               (list (erlang/list_to_tuple (list :context var-context))
-                                     (erlang/list_to_tuple (list :imports (list (erlang/list_to_tuple (list 1 kernel-atom))))))
-                               (list (erlang/list_to_tuple
-                                       (list :behaviour
-                                             (list (erlang/list_to_tuple (list :context var-context)))
-                                             (list :gen_server))))))
-        module-body (ast-node :__block__
-                              (apply list (concat (list behaviour-node) ordered inv-defs (server-client-defs))))
-        location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
-                       (erlang/list_to_tuple (list :line (or (:line env) 1))))
-        ; the create call: Module.create(mod, <escaped body>, location)
-        create-call (ast-mod-call (list :Module) :create
-                                  (list mod (Macro/escape module-body) location))
-        ; a FIXED `previous` var (not gensym'd), matching the oracle; one per
-        ; defserver so no collision
-        prev-var (erlang/list_to_tuple (list :previous (list) var-context))
-        opts-call (fn [arg] (ast-mod-call (list :Code) :compiler_options (list arg)))
-        ; try do create after Code.compiler_options(previous) end
-        try-node (ast-node :try
-                           (list (list (erlang/list_to_tuple (list :do create-call))
-                                       (erlang/list_to_tuple (list :after (opts-call prev-var))))))]
-    ; previous = Code.compiler_options()
-    ; Code.compiler_options([ignore_module_conflict: true])
-    ; try ... ; Env.intern(ns, name, mod) ; mod
-    (ast-node :__block__
-              (list (ast-node := (list prev-var (ast-mod-call (list :Code) :compiler_options (list))))
-                    (opts-call (list (erlang/list_to_tuple (list :ignore_module_conflict true))))
-                    try-node
-                    (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name mod))
-                    mod))))
+        module-defs (apply list (concat ordered inv-defs (server-client-defs mod)))
+        ; the callback/client defs are quoted {:def …} DATA — embedded as a
+        ; literal and compiled at RUN TIME through the Core path
+        ; (defs->module-anf → load-module!), never Elixir's Module.create:
+        ; guards keep their Core spelling (case-in-guard is legal in Core,
+        ; rejected by the Elixir compiler — the genesis andalso bug's whole
+        ; class dies here), and the defserver quoted seam closes (PLAN-086 E4).
+        ; reload-defs! purges a previous version first, matching the genesis
+        ; ignore_module_conflict semantics (redefinition silently replaces).
+        ; The call targets the stable BODY lower (like eval_form): a defserver
+        ; form compiling while lower redefines itself must not swap machinery.
+        create-node (a/remote mod-body-lower :reload-defs!
+                              (list (a/lit mod) (a/lit module-defs)
+                                    (a/lit (list (list :behaviour (list :gen_server))))))]
+    (a/doo (list create-node
+                 (a/remote mod-env :intern (list (a/lit (:ns env)) (a/lit name) (a/lit mod)))
+                 (a/lit mod)))))
 
 ; ---- ns (namespace declaration) ----------------------------------------------
 ;
@@ -2839,10 +2879,9 @@
                             (rest items)
                             (compile-error env "ns supports only :require clauses"))))
                       clauses)
-        ns-var (erlang/list_to_tuple (list :ns (list) var-context))
         parsed (map (fn [s] (parse-require-spec s env)) specs)
         loads (apply list
-                (map (fn [p] (ast-mod-call (list :BeamLisp :Loader) :ensure_loaded (list (first p))))
+                (map (fn [p] (a/remote mod-loader :ensure_loaded (list (a/lit (first p)))))
                      parsed))
         ; aliases/refers accumulate in REVERSE spec order (the existing compiler
         ; prepends each spec's op-group), but ops WITHIN a spec stay forward.
@@ -2850,15 +2889,15 @@
         alias-groups (map (fn [p]
                             (if (nil? (second p))
                               (list)
-                              (list (ast-mod-call (list :BeamLisp :Env) :add_alias
-                                                  (list name (second p) (first p))))))
+                              (list (a/remote mod-env :add_alias
+                                              (list (a/lit name) (a/lit (second p)) (a/lit (first p)))))))
                           parsed)
         aliases (apply concat (reverse alias-groups))
         refer-groups (map (fn [p]
                             (let [r (nth p 2)]
                               (cond
                                 (= r :all)
-                                  (list (ast-mod-call (list :BeamLisp :Env) :add_refer_all (list name (first p))))
+                                  (list (a/remote mod-env :add_refer_all (list (a/lit name) (a/lit (first p)))))
                                 (empty? r) (list)
                                 :else
                                   (apply list
@@ -2869,20 +2908,23 @@
                                            ; reference — a private var is not part
                                            ; of another namespace's public surface.
                                            (do (reject-private! env (first p) sym)
-                                               (ast-mod-call (list :BeamLisp :Env) :add_refer
-                                                             (list name sym (first p)))))
+                                               (a/remote mod-env :add_refer
+                                                         (list (a/lit name) (a/lit sym) (a/lit (first p))))))
                                          r)))))
                           parsed)
         refers (apply concat (reverse refer-groups))
-        block-of (fn [stmts] (if (= 1 (count stmts)) (first stmts) (ast-node :__block__ (apply list stmts))))]
-    (ast-node :__block__
-              (list (ast-node := (list ns-var name))
-                    (ast-mod-call (list :BeamLisp :Env) :declare_ns (list ns-var))
-                    (ast-mod-call (list :BeamLisp :Env) :in_ns (list ns-var))
-                    loads
-                    (block-of aliases)
-                    (block-of refers)
-                    (ast-mod-call (list :String) :to_atom (list ns-var))))))
+        ; bind `ns` once, like genesis's `ns = ...` assignment: the var reads
+        ; keep the corpus (and any consumer walking the IR) on one shape
+        nsvar (a/var "ns")]
+    (a/lett "ns" (a/lit name)
+            (a/doo (apply list
+                     (concat (list (a/remote mod-env :declare_ns (list nsvar))
+                                   (a/remote mod-env :in_ns (list nsvar)))
+                             loads
+                             aliases
+                             refers
+                             (list (a/remote (erlang/binary_to_atom "Elixir.String") :to_atom
+                                             (list nsvar)))))))))
 
 (defn- compile-def
   "Compile (def name value) or (def name \"doc\" value) into the tree that
@@ -2901,19 +2943,19 @@
                      (erlang/is_binary (rn/node-form (first rest-args))))
         doc (if has-doc (rn/node-form (first rest-args)) nil)
         init (if has-doc (second rest-args) (first rest-args))
-        init-ast (compile init (notail env))
+        init-node (compile-node init (notail env))
         author (name-author-meta (first args))
         meta (var-meta-map doc false author)]
     (if (per-env-attr? author)
-      (compile-per-env-def name init-ast env meta)
-      (let [intern-ast (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name init-ast))]
+      (compile-per-env-def name init-node env meta)
+      (let [intern-node (a/remote mod-env :intern (list (a/lit (:ns env)) (a/lit name) init-node))]
         (if (nil? meta)
-          intern-ast
-          (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
-            (ast-node :__block__
-                      (list (ast-node := (list value-var intern-ast))
-                            (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
-                            value-var))))))))
+          intern-node
+          (a/lett "value" intern-node
+                  (a/doo (list (a/remote mod-env :put_meta
+                                         (list (a/lit (:ns env)) (a/lit name)
+                                               (a/normalise meta)))
+                               (a/var "value")))))))))
 
 (defn- per-env-attr?
   "Say whether a def's AUTHOR metadata carries `^:per-env` (the reader lowers it
@@ -2934,16 +2976,17 @@
    A marked def is opt-in and returns `:ok`, NOT the value — returning the value
    would force eager materialization at definition time. Mirrors genesis
    `compile_per_env_def`."
-  [name init-ast env meta]
-  (let [thunk-ast (ast-node :fn (list (ast-node :-> (list (list) init-ast))))
-        define-ast (ast-mod-call (list :BeamLisp :Env) :define_per_env
-                                 (list (:ns env) name thunk-ast))]
+  [name init-node env meta]
+  (let [thunk-node (a/fnn (list (a/clause (list) nil init-node)))
+        define-node (a/remote mod-env :define_per_env
+                              (list (a/lit (:ns env)) (a/lit name) thunk-node))]
     (if (nil? meta)
-      define-ast
-      (ast-node :__block__
-                (list (ast-node := (list (erlang/list_to_tuple (list :_ (list) var-context)) define-ast))
-                      (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
-                      :ok)))))
+      define-node
+      (a/doo (list define-node
+                   (a/remote mod-env :put_meta
+                             (list (a/lit (:ns env)) (a/lit name)
+                                   (a/normalise meta)))
+                   (a/lit :ok))))))
 
 (defn- guarded-def-head
   "Wrap a def clause head with its guard, if any.
@@ -2954,6 +2997,27 @@
   (if (nil? guard-ast)
     head
     (ast-node :when (list head guard-ast))))
+
+(defn- anf-quote-node
+  "BOOTSTRAP-ONLY indirection (PLAN-086 E2 cutover): call anf/quote-node by
+   runtime fetch, never by linked direct call. quote-node/quote-pat joined
+   anf.bl AFTER the committed seed was frozen, so the seed's (stale but already
+   loaded) Ns.Body.Anf module lacks them; a direct call emitted against the
+   fresh link dies with undefined-function inside the cutover build itself.
+   Revert to plain `a/quote-node`/`a/quote-pat` once the seed carries them."
+  [x]
+  ((BeamLisp.Env/fetch! "anf" "quote-node") x))
+
+(defn- anf-quote-pat
+  "See anf-quote-node."
+  [x]
+  ((BeamLisp.Env/fetch! "anf" "quote-pat") x))
+
+(defn- qvar
+  "A quoted Elixir variable tree for a fresh name — only for the QUOTED
+   def-clause entries (transition; E3 makes defn clauses bl-ANF nodes)."
+  [name]
+  (erlang/list_to_tuple (list (erlang/binary_to_atom name) (list) var-context)))
 
 (defn- compile-defn-clause
   "Compile one defn clause into a def-clause entry {kind fixed-count fname def-ast}.
@@ -2997,11 +3061,14 @@
                      :else
                        (let [raw (fresh-var "rest")
                              rest-var (fresh-var "rest")
-                             norm (ast-node :if
-                                            (list (ast-node :== (list raw (list)))
-                                                  (list (erlang/list_to_tuple (list :do nil))
-                                                        (erlang/list_to_tuple (list :else raw)))))
-                             r (destructure-steps rest-form rest-var (:env fixed-built))]
+                             ; bl-ANF, like the fn-clause composite-rest branch
+                             ; above: a quoted ast-node tree here dies in
+                             ; anf-quote-node with `op: nil`.
+                             norm (a/iff (a/remote mod-erlang :== (list (a/var raw) a/enil))
+                                         (a/lit nil)
+                                         (a/var raw))
+                             _ (check-rest-pattern! rest-form)
+                             r (destructure-steps rest-form (a/var rest-var) (:env fixed-built))]
                          {:params (cons raw (:params fixed-built))
                           :steps (concat (:steps fixed-built)
                                          (cons (list rest-var norm) (:steps r)))
@@ -3013,22 +3080,27 @@
         body-env (assoc (:env rest-built)
                         :recur {:self-call (list mod fname) :arity (count params)}
                         :tail true)
-        body-ast (compile-body body body-env)
+        ; the def-clause entry's body stays QUOTED until E3: the compiler
+        ; emits bl-ANF and quote-node bridges it back (normalise ∘ quote-node
+        ; ≡ identity, proven over the corpus fixture)
+        body-ast (anf-quote-node (compile-body body body-env))
         full-body (if (empty? prelude-steps)
                     body-ast
                     (ast-node :__block__
                               (apply list
                                      (concat
                                        (map (fn [step]
-                                              (ast-node := (list (first step) (second step))))
+                                              (ast-node := (list (qvar (first step))
+                                                                 (anf-quote-node (second step)))))
                                             prelude-steps)
                                        (list body-ast)))))
         ; a guard sees ONLY the head's parameter variables — not the
         ; destructured names bound by the body prelude, which have not run when
         ; the BEAM evaluates the guard.
-        guard-ast (if (nil? guard) nil (compile-guard guard (guardable-env body-env params)))
+        guard-ast (if (nil? guard) nil
+                    (anf-quote-node (compile-guard guard (guardable-env body-env params))))
         ; the clause head: fname(params), guarded if needed
-        head (ast-node fname params)
+        head (ast-node fname (apply list (map qvar params)))
         def-ast (ast-node :def (list (guarded-def-head head guard-ast)
                                      (list (erlang/list_to_tuple (list :do full-body)))))
         kind (if variadic? :variadic :fixed)]
@@ -3084,19 +3156,17 @@
         clauses (parse-fn-clauses after-doc env)
         fn-args (macro-fn-form clauses)
         ; macro fns use nil-rest: a trailing `& body` is nil when empty
-        fn-ast (compile-fn* (apply list fn-args) true env)
-        macro-val (erlang/list_to_tuple
-                    (list tuple-head (list)
-                          (list (erlang/binary_to_atom "$macro") fn-ast)))
-        intern-ast (ast-mod-call (list :BeamLisp :Env) :intern (list (:ns env) name macro-val))
+        fn-node (compile-fn* (apply list fn-args) true env)
+        macro-val (a/tup (list (a/lit (erlang/binary_to_atom "$macro")) fn-node))
+        intern-node (a/remote mod-env :intern (list (a/lit (:ns env)) (a/lit name) macro-val))
         meta (var-meta-map doc false (name-author-meta (first args)))]
     (if (nil? meta)
-      intern-ast
-      (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
-        (ast-node :__block__
-                  (list (ast-node := (list value-var intern-ast))
-                        (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
-                        value-var))))))
+      intern-node
+      (a/lett "value" intern-node
+              (a/doo (list (a/remote mod-env :put_meta
+                                     (list (a/lit (:ns env)) (a/lit name)
+                                           (a/normalise meta)))
+                           (a/var "value")))))))
 
 (defn- compile-defn
   "Compile (defn name [params] body...) — or its multi-clause form — into the
@@ -3344,17 +3414,20 @@
                        clauses))
         location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
                        (erlang/list_to_tuple (list :line (or (:line env) 1))))
-        defvar-ast (ast-mod-call (list :BeamLisp :Link) :defvar
-                                 (list (:ns env) name (Macro/escape entries) location))
+        ; the entries are DATA (def-clause tuples with quoted bodies) embedded
+        ; as one literal; Link.defvar interns them at run time
+        defvar-node (a/remote mod-link :defvar
+                              (list (a/lit (:ns env)) (a/lit name)
+                                    (a/lit entries) (a/lit location)))
         meta (var-meta-map doc private? author)]
     (if (nil? meta)
-      defvar-ast
+      defvar-node
       ; value = defvar(...); Env.put_meta(ns, name, meta); value
-      (let [value-var (erlang/list_to_tuple (list :value (list) var-context))]
-        (ast-node :__block__
-                  (list (ast-node := (list value-var defvar-ast))
-                        (ast-mod-call (list :BeamLisp :Env) :put_meta (list (:ns env) name meta))
-                        value-var))))))
+      (a/lett "value" defvar-node
+              (a/doo (list (a/remote mod-env :put_meta
+                                     (list (a/lit (:ns env)) (a/lit name)
+                                           (a/normalise meta)))
+                           (a/var "value")))))))
 
 (defn- compile-special
   "Compile a special form by name."
@@ -3653,32 +3726,11 @@
               form))))
       form)))
 
-(defn- stamp-line
-  "Stamp the current source line onto the outermost Elixir AST node's metadata.
-
-   An Elixir AST node is a `{node, meta, args}` 3-tuple whose `meta` is a
-   keyword list; the BEAM reads `:line` from that meta to fill its line table,
-   so a runtime error raised inside the node names the user's source line. This
-   prepends `{:line, line}` to the meta of a real 3-tuple node when the env
-   carries a sane line. A bare literal (a number/string/atom — no call site) or
-   a node whose meta is not a list is returned unchanged. Mirrors the genesis
-   `stamp_line`/`stamp_node`."
-  [ast env]
-  (let [line (:line env)]
-    (if (and (erlang/is_integer line) (> line 0)
-             (erlang/is_tuple ast)
-             (= 3 (erlang/tuple_size ast))
-             (erlang/is_list (erlang/element 2 ast)))
-      (erlang/setelement 2 ast
-                         (cons (erlang/list_to_tuple (list :line line))
-                               (erlang/element 2 ast)))
-      ast)))
-
-(defn compile
-  "Turn one reader form into its Elixir syntax tree.
+(defn compile-node
+  "Turn one reader form into its bl-ANF node.
 
    This is the compiler's front door. It looks at what KIND of form it was
-   handed and routes to the matching builder: a plain value passes through, a
+   handed and routes to the matching builder: a plain value is a literal, a
    collection literal builds its runtime value, a symbol resolves to a
    variable or remote reference, and a list is a call. Metadata wrappers are
    peeled first so the real form underneath is what gets compiled.
@@ -3702,29 +3754,24 @@
               author (if (erlang/is_map m)
                        (maps/without (list :line :col :file) m)
                        {})
-              ; stamp the form's line onto the compiled node's Elixir metadata
-              ; so a runtime error raised inside it names the user's source line
-              ; (not the line the enclosing def opens on). Only a real AST node
-              ; (a `{node meta args}` tuple with a keyword-list meta) is stamped;
-              ; a bare literal has no call site and is left alone.
-              inner-ast (stamp-line (compile inner penv) penv)]
+              inner-node (with-ann (compile-node inner penv) m)]
           (if (or (not (erlang/is_map author)) (= 0 (erlang/map_size author)))
-            inner-ast
-            (let [author-map (ast-node map-head
+            inner-node
+            (let [author-map (a/mapp
                                (apply list
                                  (map (fn [k]
-                                        (erlang/list_to_tuple
-                                          (list k (compile (maps/get k author) (notail penv)))))
+                                        [(a/lit k) (compile-node (maps/get k author) (notail penv))])
                                       (maps/keys author))))]
-              (ast-mod-call (list :BeamLisp :FormMeta) :with_meta
-                            (list inner-ast author-map)))))
+              (with-ann (a/remote mod-formmeta :with_meta
+                          (list inner-node author-map))
+                        m))))
 
       ; keyword literal: its value is the interned atom. Intern it through the
       ; AtomGuard — NOT a raw `binary_to_atom` — so a novel keyword reaching the
       ; compiler directly (a macro building keyword forms, or any caller
       ; compiling forms without going through the reader's counter) still passes
       ; the atom-table safety guard instead of silently exhausting the table.
-      (= tag :keyword) (BeamLisp.AtomGuard/to_atom (rn/node-name form))
+      (= tag :keyword) (a/lit (BeamLisp.AtomGuard/to_atom (rn/node-name form)))
 
       ; collection literals
       (= tag :vector) (compile-vector (rn/node-items form) env)
@@ -3739,8 +3786,8 @@
         (let [parts (erlang/tuple_to_list (rn/node-form form))
               rec-name (second parts)
               kvs (nth parts 2)]
-          (ast-mod-call (list :BeamLisp :Record) :literal
-                        (list (:ns env) rec-name (compile-map kvs env))))
+          (a/remote mod-record :literal
+                    (list (a/lit (:ns env)) (a/lit rec-name) (compile-map kvs env))))
 
       ; a symbol names a value
       (= tag :symbol)
@@ -3754,7 +3801,7 @@
       (= tag :list)
         (let [items (rn/node-items form)]
           (if (empty? items)
-            (list)
+            a/enil
             (let [head (rn/node-form (first items))
                   name (if (= :symbol (rn/node-tag head)) (rn/node-name head) nil)]
               (cond
@@ -3765,12 +3812,22 @@
                 ; The arguments are NOT pre-compiled — a macro receives them as
                 ; data. `local?` names shadow macros, so a bound local wins.
                 (and (some? name) (not (local? env name)) (macro? env name))
-                  (compile (macroexpand-1-env form env) env)
+                  (compile-node (macroexpand-1-env form env) env)
                 ; an ordinary call
                 :else (compile-call items env)))))
 
-      ; a plain number, string, boolean, or nil is already its own value
-      :else form)))
+      ; a plain number, string, boolean, or nil is a literal
+      :else (a/lit form))))
+
+(defn compile
+  "Turn one reader form into its ELIXIR-QUOTED syntax tree.
+
+   TRANSITION wrapper (PLAN-086 E2): the compiler emits bl-ANF internally
+   (compile-node); this bridges the result back through anf/quote-node for
+   the quoted consumers that remain until E3–E5. normalise ∘ quote-node ≡
+   identity, proven over the corpus fixture (test/fixtures/anf_corpus/)."
+  [form env]
+  (anf-quote-node (compile-node form env)))
 
 ; ============================================================================
 ; Elixir-facing driver entry points (underscore names)
@@ -3801,6 +3858,42 @@
   [form ns]
   (prelink-defn form ns))
 
+(defn eval_form
+  "Compile one reader `form` in `env` and RUN it, returning its value.
+
+   The form compiles to bl-ANF, lowers to Core Erlang, and runs as run/0 of a
+   throwaway module (`BeamLisp.Eval.M<n>`) — never interpreted — so
+   `loop`/`recur` keep real tail-call optimisation. The module is KEPT loaded:
+   a closure the form returns (a macro fn, a defn's value) lives in it.
+
+   The self-hosted twin of the genesis `BeamLisp.Compiler.eval_form/2` it
+   replaces; there is no Elixir compiler on this path — `compile-node` is the
+   .bl compiler and lower.bl the Core backend."
+  [form env]
+  ; The lowerer is called on the BODY MODULE, not through the `lower` ns vars:
+  ; this runs WHILE files (lower.bl itself included) are compiling, and a
+  ; `(declare lower-anf)` or a half-redefined `lower` ns must not swap the
+  ; machinery mid-eval — the AOT body module is the stable previous generation
+  ; for the VM's life, exactly the genesis role.
+  (let [node (compile-node form env)
+        n (System/unique_integer (list :positive))
+        modname (erlang/binary_to_atom (str "Elixir.BeamLisp.Eval.M" n))
+        ; run/0 executes the form's side effects — defvar above all — and those
+        ; must build through Core too, or a defn inside an evaluated form would
+        ; Elixir-compile the quoted transition entries (PLAN-086 E2). Process-
+        ; scoped: the flag's readers (Link.defvar) run on this process.
+        prev-backend (Process/put :bl_backend :core)]
+    (try
+      (BeamLisp.Ns.Body.Lower/reset-fresh!)
+      (BeamLisp.Ns.Body.Lower/eval-core modname (BeamLisp.Ns.Body.Lower/lower-anf node))
+      ; restore, don't shadow: when the flag was never set, DELETE the process
+      ; key rather than writing :elixir — an explicit :elixir would shadow a
+      ; future global :core for the rest of this process's life (E5 flips the
+      ; default; leave the channel clean for it).
+      (finally (if (nil? prev-backend)
+                 (Process/delete :bl_backend)
+                 (Process/put :bl_backend prev-backend))))))
+
 (defn eval_string
   "Read, compile and evaluate every form in `source`; return the last value.
 
@@ -3829,15 +3922,3 @@
   (BeamLisp.AtomGuard/check! source)
   ; eager list — read_all_data callers (the persist journal) index it concretely
   (to-list (map datum (to-list (BeamLisp.Ns.Reader/read_all source)))))
-
-(defn eval_form
-  "Compile one reader `form` in `env` and RUN it, returning its value.
-   PLAN-086 E2 bootstrap cutover: the bl-ANF pipeline lives in the `compiler2`
-   namespace (priv/boot/compiler2.bl) so that compiling it never redefines a
-   function of the pipeline that is running. This delegate is the whole flip:
-   every caller — AOT, the REPL, tests — reaches compiler2 through here. The
-   Elixir-quoted definitions below remain only so the PREVIOUS-generation seed
-   can compile this file and compiler2.bl; they are deleted once the seed
-   carries the bl-ANF pipeline (E5)."
-  [form env]
-  (c2/eval_form form env))

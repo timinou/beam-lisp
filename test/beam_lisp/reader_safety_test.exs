@@ -25,7 +25,7 @@ defmodule BeamLisp.ReaderSafetyTest do
     # very first symbol samples.
     with_guard_config!(0.0, 1)
 
-    assert_raise AtomLimitError, ~r/refusing to read "foo".*atom table/, fn ->
+    assert_raise AtomLimitError, ~r/refusing to intern "foo".*atom table/, fn ->
       Reader.read_one("foo")
     end
   end
