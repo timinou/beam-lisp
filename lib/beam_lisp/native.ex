@@ -1,4 +1,6 @@
 defmodule BeamLisp.Native do
+  alias BeamLisp.Emit
+
   @moduledoc """
   `defnative` — a beam-lisp namespace that hosts a Rust NIF.
 
@@ -79,9 +81,8 @@ defmodule BeamLisp.Native do
   """
   @spec declare(String.t(), String.t(), [{String.t(), non_neg_integer()}]) :: module()
   def declare(ns, crate, signatures) do
-    # VM-wide critical section: the host module is created at RUNTIME, so
-    # two envs loading the same native-backed namespace concurrently would
-    # race Module.create ("currently being defined") — same fix as
+    # VM-wide critical section: two envs loading the same native-backed
+    # namespace concurrently would race host publication — same fix as
     # BeamLisp.Record.define/3 (PLAN-046).
     :global.trans({host_module(ns), self()}, fn -> do_declare(ns, crate, signatures) end)
   end
@@ -90,20 +91,14 @@ defmodule BeamLisp.Native do
     guard_against_duplicates!(ns, signatures)
     guard_against_shadowing!(ns, signatures)
 
-    # Record it, so an AOT build can replay it from the namespace
-    # module's `__bl_init__/0`. The host module is built at RUNTIME by
-    # `Module.create`, so AOT never wrote it to disk — an AOT-compiled
-    # deployment started with no native backend at all, `available?`
-    # answered false, and the layer above quietly chose an in-memory
-    # store. Silent loss of durability, discovered only when data failed
-    # to survive a restart (BUG-021).
-    :ets.insert(table(), {{:native, ns}, {crate, signatures}})
-
     mod = host_module(ns)
 
     unless Code.ensure_loaded?(mod) do
       create_host(mod, ns, crate, signatures)
     end
+
+    # Publish replay metadata only after the complete host binary compiled and loaded.
+    :ets.insert(table(), {{:native, ns}, {crate, signatures}})
 
     for {name, arity} <- signatures do
       link_var(ns, mod, name, arity)
@@ -242,6 +237,21 @@ defmodule BeamLisp.Native do
     Module.concat([BeamLisp.Native | segments])
   end
 
+  @doc false
+  def nif_load_failed(ns, crate, lib_path, reason) do
+    IO.warn("""
+    the NIF for #{ns} did not load: #{inspect(reason)}
+
+    crate:   #{crate}
+    library: #{lib_path}.so
+
+    A "Function not found" reason means a declared name or arity disagrees
+    with the crate; run `mix compile` if the library is simply missing.
+    """)
+
+    :ok
+  end
+
   defp create_host(mod, ns, crate, signatures) do
     # Rustler installs as `priv/native/<crate>.so` (no `lib` prefix), and
     # `:erlang.load_nif/2` wants the path WITHOUT the extension.
@@ -253,73 +263,45 @@ defmodule BeamLisp.Native do
     # nowhere reports beam_lisp's path in the error (the historical default).
     lib_path = resolve_lib_path(crate)
 
+    load_result = Emit.var("load_result")
+    reason = Emit.var("reason")
+
+    load_body = %{
+      op: :case,
+      subj: Emit.remote(:erlang, :load_nif, [Emit.lit(String.to_charlist(lib_path)), Emit.lit(0)]),
+      clauses: [
+        %{pats: [%{pop: :plit, val: :ok}], guard: nil, body: Emit.lit(:ok)},
+        %{
+          pats: [%{pop: :ptuple, elems: [%{pop: :plit, val: :error}, %{pop: :pvar, name: "reason"}]}],
+          guard: nil,
+          body: Emit.remote(__MODULE__, :nif_load_failed, [Emit.lit(ns), Emit.lit(crate), Emit.lit(lib_path), reason])
+        },
+        %{pats: [%{pop: :pvar, name: "load_result"}], guard: nil, body: load_result}
+      ],
+      ann: %{}
+    }
+
+    stub_body = Emit.remote(:erlang, :nif_error, [Emit.lit(:nif_not_loaded)])
+
     stubs =
       for {name, arity} <- signatures do
         fname = String.to_atom(String.replace(name, "-", "_"))
-        args = Macro.generate_arguments(arity, mod)
-
-        quote do
-          def unquote(fname)(unquote_splicing(args)) do
-            :erlang.nif_error(:nif_not_loaded)
-          end
-        end
+        params = for index <- 1..arity//1, do: %{pop: :pvar, name: "arg#{index}"}
+        Emit.function_clause(fname, stub_body, params)
       end
 
-    body =
-      quote do
-        @compile no_type_check: true
-        @on_load :__load_nif__
+    clauses = [
+      Emit.function_clause(:__load_nif__, load_body),
+      Emit.function_clause(:__nif_loaded__, stub_body)
+      | stubs
+    ]
 
-        def __load_nif__ do
-          case :erlang.load_nif(unquote(String.to_charlist(lib_path)), 0) do
-            :ok -> :ok
-            # A missing or unbuildable NIF leaves the module unloaded
-            # rather than crashing the whole compile. `available?/1`
-            # then answers false and a caller can choose another store.
-            # A load failure is REPORTED, always. It used to be silent
-            # behind an env var, so an arity that disagreed with the
-            # Rust function — or a stub list that had drifted from the
-            # crate — left `available?` quietly answering false and the
-            # backend simply absent. The caller then chose an in-memory
-            # store and never learned why.
-            #
-            # `{:bad_lib, "Function not found"}` in particular names the
-            # exact function whose signature does not match, which is
-            # the whole diagnosis. Swallowing it wasted that.
-            {:error, reason} ->
-              IO.warn("""
-              the NIF for #{unquote(ns)} did not load: #{inspect(reason)}
+    beam =
+      mod
+      |> Emit.descriptor_for(clauses, on_load: [{:__load_nif__, 0}])
+      |> Emit.compile_descriptor()
 
-              crate:   #{unquote(crate)}
-              library: #{unquote(lib_path)}.so
-
-              A "Function not found" reason means a declared name or
-              arity disagrees with the crate; run `mix compile` if the
-              library is simply missing.
-              """)
-
-              :ok
-          end
-        end
-
-        # Every function the NIF exports needs a stub here, including
-        # this marker: `load_nif` REFUSES the whole library if the
-        # module is missing one, with `{:bad_lib, "Function not found"}`.
-        # That strictness is a feature — it means a stub list that has
-        # drifted from the crate fails at load rather than at the first
-        # call to whichever function was forgotten.
-        #
-        # Once loaded, the real `__nif_loaded__/0` comes from Rust and
-        # returns true; unloaded, this stub raises, which is how
-        # `available?/1` tells the two apart.
-        def __nif_loaded__ do
-          :erlang.nif_error(:nif_not_loaded)
-        end
-
-        unquote_splicing(stubs)
-      end
-
-    Module.create(mod, body, Macro.Env.location(__ENV__))
+    Emit.load_binary!(beam, "beam_lisp_native")
     mod
   end
 

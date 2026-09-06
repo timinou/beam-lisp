@@ -42,7 +42,7 @@ defmodule BeamLisp.Compiler do
 
   alias BeamLisp.Env
 
-  @compiler_ns BeamLisp.Ns.Compiler
+  @compiler_ns BeamLisp.Ns.Compiler2
 
   @doc "A fresh top-level compile-time environment for namespace `ns`."
   def new_env(ns \\ Env.current_ns()), do: apply(@compiler_ns, :new_env, [ns])
@@ -84,7 +84,7 @@ defmodule BeamLisp.Compiler do
     do: apply(@compiler_ns, :read_all_data, [source])
 
   @doc """
-  Compile one reader form to its Core Erlang / Elixir syntax tree.
+  Compile one reader form to its canonical bl-ANF node.
 
   Delegates to `BeamLisp.Ns.Compiler` once the `compiler` namespace is interned
   — the normal state on any tree, reached from the committed seed or a fresh
@@ -93,7 +93,7 @@ defmodule BeamLisp.Compiler do
   the seed is missing/corrupt.
   """
   def compile(form, env) do
-    if Env.loaded_ns?("compiler") do
+    if Env.loaded_ns?("compiler2") do
       apply(@compiler_ns, :compile, [form, env])
     else
       raise """
@@ -117,10 +117,10 @@ defmodule BeamLisp.Compiler do
   compiler is now active, `:not_loaded` if interning failed.
   """
   def enable_bl_backend do
-    unless Env.loaded_ns?("compiler") do
-      BeamLisp.Loader.ensure_loaded("compiler")
+    unless Env.loaded_ns?("compiler2") do
+      BeamLisp.Loader.ensure_loaded("compiler2")
     end
 
-    if Env.loaded_ns?("compiler"), do: :bl, else: :not_loaded
+    if Env.loaded_ns?("compiler2"), do: :bl, else: :not_loaded
   end
 end

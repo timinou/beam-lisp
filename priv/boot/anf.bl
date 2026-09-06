@@ -102,6 +102,162 @@
 (defn palias [a b] {:pop :palias :a a :b b})
 (defn pstruct [mod fields] {:pop :pstruct :mod mod :fields fields})
 
+;; ── complete module descriptor boundary ────────────────────────────────────
+
+(defn- boundary-error [m f path message value]
+  (throw (ex-info (str "anf module " (:name m)
+                       (if (nil? f) "" (str " " (first f) "/" (second f)))
+                       " at " path ": " message)
+                  {:module (:name m) :function f :path path :value value})))
+
+(defn- exact-keys? [m ks]
+  (and (map? m) (= (count (maps/keys m)) (count ks))
+       (every? (fn [k] (contains? m k)) ks)))
+
+(defn- eager-list [x field]
+  (if (or (erlang/is_list x) (BeamLisp.RT/vector? x))
+    (to-list x)
+    (throw (ex-info (str "anf/module: " field " must be a list or vector")
+                    {:path field :value x}))))
+
+(defn- literal-data? [v]
+  (cond
+    (erlang/is_function v) false
+    (erlang/is_tuple v) (every? literal-data? (erlang/tuple_to_list v))
+    (erlang/is_list v) (every? literal-data? v)
+    (BeamLisp.RT/vector? v) (every? literal-data? (to-list v))
+    ; is_map-ok: Core literals include plain data structs, but never resources or thunks.
+    (erlang/is_map v) (every? (fn [k] (and (literal-data? k) (literal-data? (maps/get k v)))) (maps/keys v))
+    :else (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_bitstring v))))
+
+(declare validate-node!)
+(declare validate-pattern!)
+
+(defn- validate-ann! [m f path ann]
+  (when (not (map? ann)) (boundary-error m f path "annotation must be a map" ann)))
+
+(defn- validate-seq! [m f path xs each]
+  (when (not (erlang/is_list xs)) (boundary-error m f path "must be a proper list" xs))
+  (doseq [[i x] (map-indexed (fn [i x] [i x]) xs)] (each x (str path "[" i "]"))))
+
+(defn- validate-pairs! [m f path pairs key-check val-check]
+  (validate-seq! m f path pairs
+    (fn [pair p]
+      (when (or (not (or (BeamLisp.RT/vector? pair) (erlang/is_list pair))) (not= 2 (count pair)))
+        (boundary-error m f p "pair must contain exactly two values" pair))
+      (key-check (first pair) (str p "[0]"))
+      (val-check (second pair) (str p "[1]")))))
+
+(defn- validate-pattern! [m f p path]
+  (when (not (map? p)) (boundary-error m f path "pattern must be a map" p))
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar) (when (or (not (exact-keys? p [:pop :name])) (not (erlang/is_binary (:name p))))
+                     (boundary-error m f path "pvar requires only binary :name" p))
+      (= op :plit) (when (or (not (exact-keys? p [:pop :val])) (not (literal-data? (:val p))))
+                     (boundary-error m f path "plit requires safe literal :val" p))
+      (= op :pnil) (when (not (exact-keys? p [:pop])) (boundary-error m f path "pnil has no operands" p))
+      (= op :ptuple) (do (when (not (exact-keys? p [:pop :elems])) (boundary-error m f path "invalid ptuple fields" p))
+                          (validate-seq! m f (str path ".elems") (:elems p) (fn [x q] (validate-pattern! m f x q))))
+      (= op :pcons) (do (when (not (exact-keys? p [:pop :head :tail])) (boundary-error m f path "invalid pcons fields" p))
+                         (validate-pattern! m f (:head p) (str path ".head")) (validate-pattern! m f (:tail p) (str path ".tail")))
+      (= op :palias) (do (when (not (exact-keys? p [:pop :a :b])) (boundary-error m f path "invalid palias fields" p))
+                          (validate-pattern! m f (:a p) (str path ".a")) (validate-pattern! m f (:b p) (str path ".b")))
+      (= op :pmap) (do (when (not (exact-keys? p [:pop :pairs])) (boundary-error m f path "invalid pmap fields" p))
+                        (validate-pairs! m f (str path ".pairs") (:pairs p)
+                          (fn [x q] (validate-node! m f x q)) (fn [x q] (validate-pattern! m f x q))))
+      (= op :pstruct) (do (when (or (not (exact-keys? p [:pop :mod :fields])) (not (erlang/is_atom (:mod p))))
+                            (boundary-error m f path "pstruct requires atom :mod and :fields" p))
+                          (validate-pairs! m f (str path ".fields") (:fields p)
+                            (fn [x q] (when (not (literal-data? x)) (boundary-error m f q "unsafe literal field key" x)))
+                            (fn [x q] (validate-pattern! m f x q))))
+      :else (boundary-error m f (str path ".pop") "unknown pattern op" op))))
+
+(defn- validate-inner-clause! [m f cl path]
+  (when (not (exact-keys? cl [:pats :guard :body])) (boundary-error m f path "clause fields must be :pats/:guard/:body" cl))
+  (validate-seq! m f (str path ".pats") (:pats cl) (fn [x q] (validate-pattern! m f x q)))
+  (when (not (nil? (:guard cl))) (validate-node! m f (:guard cl) (str path ".guard")))
+  (validate-node! m f (:body cl) (str path ".body")))
+
+(defn- validate-node! [m f n path]
+  (when (not (map? n)) (boundary-error m f path "executable node must be an ANF map, not quoted AST" n))
+  (validate-ann! m f (str path ".ann") (:ann n))
+  (let [op (:op n) node (fn [x p] (validate-node! m f x p))
+        nodes (fn [xs p] (validate-seq! m f p xs (fn [x q] (node x q))))]
+    (cond
+      (= op :lit) (when (or (not (exact-keys? n [:op :val :ann])) (not (literal-data? (:val n)))) (boundary-error m f path "invalid literal or fields" n))
+      (= op :var) (when (or (not (exact-keys? n [:op :name :ann])) (not (erlang/is_binary (:name n)))) (boundary-error m f path "var requires binary :name" n))
+      (= op :global) (when (or (not (exact-keys? n [:op :ns :name :ann])) (not (erlang/is_binary (:ns n))) (not (erlang/is_binary (:name n)))) (boundary-error m f path "global requires binary :ns/:name" n))
+      (= op :remote) (do (when (or (not (exact-keys? n [:op :mod :fun :args :ann])) (not (erlang/is_atom (:mod n))) (not (erlang/is_atom (:fun n)))) (boundary-error m f path "remote requires atom :mod/:fun and :args" n)) (nodes (:args n) (str path ".args")))
+      (= op :apply) (do (when (not (exact-keys? n [:op :fn :args :ann])) (boundary-error m f path "invalid apply fields" n)) (node (:fn n) (str path ".fn")) (nodes (:args n) (str path ".args")))
+      (= op :let) (do (when (or (not (exact-keys? n [:op :name :init :body :ann])) (not (erlang/is_binary (:name n)))) (boundary-error m f path "invalid let fields" n)) (node (:init n) (str path ".init")) (node (:body n) (str path ".body")))
+      (= op :if) (do (when (not (exact-keys? n [:op :test :then :else :ann])) (boundary-error m f path "invalid if fields" n)) (node (:test n) (str path ".test")) (node (:then n) (str path ".then")) (node (:else n) (str path ".else")))
+      (= op :do) (do (when (not (exact-keys? n [:op :stmts :ann])) (boundary-error m f path "invalid do fields" n)) (nodes (:stmts n) (str path ".stmts")) (when (empty? (:stmts n)) (boundary-error m f (str path ".stmts") "do requires at least one statement" (:stmts n))))
+      (or (= op :case) (= op :fn)) (do (when (not (exact-keys? n (if (= op :case) [:op :subj :clauses :ann] [:op :clauses :ann]))) (boundary-error m f path "invalid clause-bearing node fields" n)) (when (= op :case) (node (:subj n) (str path ".subj"))) (validate-seq! m f (str path ".clauses") (:clauses n) (fn [x q] (validate-inner-clause! m f x q))))
+      (= op :try) (do (when (not (exact-keys? n [:op :body :catch :after :ann])) (boundary-error m f path "invalid try fields" n)) (node (:body n) (str path ".body")) (validate-seq! m f (str path ".catch") (:catch n) (fn [x q] (validate-inner-clause! m f x q))) (when (not (nil? (:after n))) (node (:after n) (str path ".after"))))
+      (= op :recv) (do (when (not (exact-keys? n [:op :clauses :timeout :after :ann])) (boundary-error m f path "invalid recv fields" n)) (validate-seq! m f (str path ".clauses") (:clauses n) (fn [x q] (validate-inner-clause! m f x q))) (if (nil? (:timeout n)) (when (not (nil? (:after n))) (boundary-error m f (str path ".after") "receive after requires timeout" (:after n))) (do (node (:timeout n) (str path ".timeout")) (node (:after n) (str path ".after")))))
+      (or (= op :tuple) (= op :enil)) (do (when (not (exact-keys? n (if (= op :tuple) [:op :elems :ann] [:op :ann]))) (boundary-error m f path "invalid tuple/list fields" n)) (when (= op :tuple) (nodes (:elems n) (str path ".elems"))))
+      (= op :map) (do (when (not (exact-keys? n [:op :pairs :ann])) (boundary-error m f path "invalid map fields" n)) (validate-pairs! m f (str path ".pairs") (:pairs n) node node))
+      (= op :cons) (do (when (not (exact-keys? n [:op :head :tail :ann])) (boundary-error m f path "invalid cons fields" n)) (node (:head n) (str path ".head")) (node (:tail n) (str path ".tail")))
+      (= op :struct) (do (when (or (not (exact-keys? n [:op :mod :fields :ann])) (not (erlang/is_atom (:mod n)))) (boundary-error m f path "struct requires atom :mod and :fields" n)) (validate-pairs! m f (str path ".fields") (:fields n) node node))
+      :else (boundary-error m f (str path ".op") "unknown executable op" op))))
+
+(defn validate-module! [m]
+  (when (not (exact-keys? m [:op :version :name :clauses :exports :attrs :ann]))
+    (boundary-error m nil "$" "descriptor has missing or unknown fields" m))
+  (when (not= :module (:op m)) (boundary-error m nil "$.op" "must be :module" (:op m)))
+  (when (not= 1 (:version m)) (boundary-error m nil "$.version" "unsupported schema version" (:version m)))
+  (when (not (erlang/is_atom (:name m))) (boundary-error m nil "$.name" "module name must be an atom" (:name m)))
+  (validate-ann! m nil "$.ann" (:ann m))
+  (let [seen (atom {})]
+    (validate-seq! m nil "$.clauses" (:clauses m)
+      (fn [cl path]
+        (when (not (exact-keys? cl [:op :fname :params :guard :body :ann])) (boundary-error m nil path "definition fields must be :op/:fname/:params/:guard/:body/:ann" cl))
+        (when (not= :defn-clause (:op cl)) (boundary-error m nil (str path ".op") "must be :defn-clause" (:op cl)))
+        (when (not (erlang/is_atom (:fname cl))) (boundary-error m nil (str path ".fname") "function name must be an atom" (:fname cl)))
+        (validate-ann! m nil (str path ".ann") (:ann cl))
+        (let [arity (count (:params cl)) f [(:fname cl) arity]]
+          (when (= :module_info (:fname cl)) (boundary-error m f (str path ".fname") "reserved compiler function" (:fname cl)))
+          (validate-seq! m f (str path ".params") (:params cl) (fn [x q] (validate-pattern! m f x q)))
+          (when (not (nil? (:guard cl))) (validate-node! m f (:guard cl) (str path ".guard")))
+          (validate-node! m f (:body cl) (str path ".body"))
+          (swap! seen assoc f true))))
+    (let [exports-seen (atom {})]
+      (validate-seq! m nil "$.exports" (:exports m)
+        (fn [e path]
+          (when (or (not (BeamLisp.RT/vector? e)) (not= 2 (count e)) (not (erlang/is_atom (first e))) (not (erlang/is_integer (second e))) (< (second e) 0)) (boundary-error m nil path "export must be [atom nonnegative-integer]" e))
+          (let [f [(first e) (second e)]]
+            (when (= :module_info (first e)) (boundary-error m f path "reserved compiler export" e))
+            (when (get @exports-seen f) (boundary-error m f path "duplicate export" e))
+            (when (not (get @seen f)) (boundary-error m f path "export has no matching clause" e))
+            (swap! exports-seen assoc f true)))))
+    (let [attrs-seen (atom {}) reserved {:module true :export true :import true :file true}]
+      (validate-seq! m nil "$.attrs" (:attrs m)
+        (fn [a path]
+          (when (or (not (BeamLisp.RT/vector? a)) (not= 2 (count a)) (not (erlang/is_atom (first a))) (not (literal-data? (second a)))) (boundary-error m nil path "attribute must be [atom Core-literal-compatible-value]" a))
+          (when (get reserved (first a)) (boundary-error m nil path "reserved compiler attribute" (first a)))
+          (when (get @attrs-seen (first a)) (boundary-error m nil path "duplicate attribute" (first a)))
+          (swap! attrs-seen assoc (first a) true))))
+    m))
+
+(defn- normalize-grammar [x]
+  (cond
+    (and (map? x) (or (= :lit (:op x)) (= :plit (:pop x)))) x
+    (map? x) (reduce (fn [out k] (assoc out k (normalize-grammar (get x k)))) {} (maps/keys x))
+    (BeamLisp.RT/vector? x) (to-list (map normalize-grammar (to-list x)))
+    (erlang/is_list x) (to-list (map normalize-grammar x))
+    :else x))
+
+(defn module
+  "Construct and validate the canonical version-1 ANF module descriptor.
+   Collection inputs are eagerly realized once and normalized to proper lists."
+  ([name clauses exports attrs] (module name clauses exports attrs {}))
+  ([name clauses exports attrs ann]
+   (validate-module! {:op :module :version 1 :name name
+                      :clauses (to-list (map normalize-grammar (eager-list clauses "$.clauses")))
+                      :exports (eager-list exports "$.exports")
+                      :attrs (eager-list attrs "$.attrs") :ann ann})))
+
 ;; ── alias resolution (same as self.core) ─────────────────────────────────────
 
 (defn- alias->atom [m]

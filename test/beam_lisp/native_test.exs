@@ -58,6 +58,20 @@ defmodule BeamLisp.NativeTest do
     end
   end
 
+  describe "canonical host descriptor" do
+    @tag :capture_log
+    test "missing NIF keeps callable stubs without invoking the Elixir compiler" do
+      source = File.read!("lib/beam_lisp/native.ex")
+      refute source =~ "Module" <> ".create"
+      refute source =~ "quote " <> "do"
+
+      mod = BeamLisp.Native.declare("native.test.canonical_missing", "no_such_crate_exists", [{"missing-call", 1}])
+      assert function_exported?(mod, :missing_call, 1)
+      assert_raise ErlangError, fn -> mod.missing_call(:value) end
+      refute BeamLisp.Native.available?("native.test.canonical_missing")
+    end
+  end
+
   describe "declarations that should be refused" do
     test "a name that shadows core is refused, with the fix in the message" do
       # The collision does not fail where it is written — it fails
@@ -149,12 +163,10 @@ defmodule BeamLisp.NativeTest do
 
   describe "AOT" do
     test "an emitted namespace replays its native declaration" do
-      # The host module is built by `Module.create` at RUNTIME, so AOT
-      # never wrote it to disk and nothing recreated it. An
-      # AOT-compiled deployment therefore started with NO native
-      # backend: `available?` answered false, the layer above quietly
-      # chose an in-memory store, and a database meant to be durable
-      # was not.
+      # The host module is built from a canonical descriptor at runtime, and
+      # the AOT namespace init records enough metadata to recreate it.
+      # Without that replay an AOT deployment would start with no native
+      # backend and silently choose an in-memory store.
       #
       # Silent loss of durability is the worst shape this could take —
       # no crash, no warning, and the only symptom is data missing
@@ -172,9 +184,27 @@ defmodule BeamLisp.NativeTest do
 
       # And the emitted module's init carries it: loading the AOT output
       # in a deployment brings the host module and the NIF with it.
-      {mod, path} = hd(mods)
+      mod = BeamLisp.Emit.module_for("datom.store-fjall")
+      assert {^mod, path} = List.keyfind(mods, mod, 0)
       assert File.exists?(path)
+
+      # Body modules precede their shim; return order is publication order,
+      # not an invitation to treat the first artifact as the namespace.
+      for {emitted, beam_path} <- mods do
+        :code.purge(emitted)
+        assert {:module, ^emitted} =
+                 :code.load_binary(emitted, String.to_charlist(beam_path), File.read!(beam_path))
+      end
+
       assert function_exported?(mod, :__bl_init__, 0)
+      declaration = BeamLisp.Native.declaration("datom.store-fjall")
+      :ets.delete(:beam_lisp_native_declarations, {:native, "datom.store-fjall"})
+      try do
+        apply(mod, :__bl_init__, [])
+        assert BeamLisp.Native.declaration("datom.store-fjall") == declaration
+      after
+        :ets.insert(:beam_lisp_native_declarations, {{:native, "datom.store-fjall"}, declaration})
+      end
 
       assert Code.ensure_loaded?(BeamLisp.Native.Datom.StoreFjall)
       assert BeamLisp.Native.available?("datom.store-fjall")

@@ -302,6 +302,33 @@
           (tuple (cerl/c_fname :module_info 1)
                  (cfun (list k) (ccall :erlang :get_module_info (list (catom mname) k)))))))
 
+(defn module->core
+  "Validate and lower one canonical ANF module descriptor to Core Erlang."
+  [descriptor]
+  (let [m (anf/validate-module! descriptor) mname (:name m)]
+    (set-current-module! mname)
+    (reset-fresh!)
+    (let [groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
+                          (to-list (group-by (fn [cl] [(:fname cl) (count (:params cl))]) (:clauses m))))
+          funs (to-list
+                 (map (fn [[[f n] clauses]]
+                        (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
+                              lowered (to-list (map (fn [cl]
+                                (let [pats (to-list (map lower-anf-pattern (:params cl)))]
+                                  (if (nil? (:guard cl))
+                                    (cclause (list (ctuple pats)) (lower-anf (:body cl)))
+                                    (cclause (list (ctuple pats)) (lower-anf (:guard cl)) (lower-anf (:body cl)))))) clauses))
+                              fail (cclause (list (fresh "_")) (ccall :erlang :error (list (catom :function_clause))))]
+                          (tuple (cerl/c_fname f n)
+                                 (cfun-anno f n params (ccase (ctuple params) (concat lowered (list fail))))))) groups))
+          infos (module-info-defs mname) defs (to-list (concat funs infos))
+          exports (sort-by (fn [x] [(erlang/atom_to_binary (first x)) (second x)]) (:exports m))
+          cexports (to-list (concat (map (fn [[f n]] (cerl/c_fname f n)) exports)
+                                    (list (cerl/c_fname :module_info 0) (cerl/c_fname :module_info 1))))
+          attrs (sort-by (fn [[k _]] (erlang/atom_to_binary k)) (:attrs m))
+          cattrs (to-list (map (fn [[k v]] (tuple (catom k) (lit v))) attrs))]
+      (cerl/c_module (catom mname) cexports cattrs defs))))
+
 (defn expr->module
   "A Core module `mname` exporting run/0 whose body is `core-expr`."
   [mname core-expr]
@@ -384,45 +411,89 @@
      (if (nil? g) nil (anf/normalise g))
      (anf/normalise body)]))
 
-(defn defs->module-anf
-  "Each def body/guard/params flow through bl-ANF (normalise → lower-anf).
-   This is the def path on the neutral IR (PLAN-079 S-D): the SAME body/shim
-   topology, fed by bl-ANF. `attrs` is [[name value] …]."
-  ([mname def-asts] (defs->module-anf mname def-asts (list)))
-  ([mname def-asts attrs]
-   (set-current-module! mname)
-   (reset-fresh!)   ; per-unit: emitted bytes are a function of THIS source alone
-   (let [def-asts (to-list (mapcat expand-defaults def-asts))
-         heads (to-list (map def-head-anf def-asts))
-         ;; Group clauses by [fname arity], then iterate in a STABLE order.
-         ;; `group-by` returns a map keyed by [fname arity], and a map with ATOM
-         ;; keys iterates in atom-TABLE order (creation order), not term order —
-         ;; so which function's clauses come first depended on which atoms the VM
-         ;; had interned by the time this ran, i.e. on everything compiled
-         ;; earlier in the build. That made both the function order AND the
-         ;; per-function `fresh "P"` params vary run-to-run: the emitted beam was
-         ;; NOT reproducible. Sorting the groups by the fname STRING + arity ties
-         ;; the order to the source alone, which is what reproducibility means.
-         groups (sort-by (fn [[[f n] _]] [(erlang/atom_to_binary f) n])
-                         (to-list (group-by (fn [[f ps _ _]] [f (count ps)]) heads)))
-         funs (to-list
-                (map (fn [[[f n] cls]]
-                       (let [params (to-list (map (fn [_] (fresh "P")) (range n)))
-                             clauses (to-list
-                                       (map (fn [[_ ps g body]]
-                                              (let [pats (to-list (map lower-anf-pattern ps))]
-                                                (if (nil? g)
-                                                  (cclause (list (ctuple pats)) (lower-anf body))
-                                                  (cclause (list (ctuple pats)) (lower-anf g) (lower-anf body)))))
-                                            cls))
-                             fail (cclause (list (fresh "_"))
-                                           (ccall :erlang :error (list (catom :function_clause))))]
-                         (tuple (cerl/c_fname f n)
-                                (cfun-anno f n params (ccase (ctuple params) (concat clauses (list fail)))))))
-                     (to-list groups)))
-         defs (to-list (concat funs (module-info-defs mname)))
-         cattrs (to-list (map (fn [[k v]] (tuple (catom k) (lit v))) attrs))]
-     (cerl/c_module (catom mname) (to-list (map first defs)) cattrs defs))))
+(defn- clauses->descriptor [mname clauses attrs]
+  (anf/module mname clauses (to-list (distinct (map (fn [cl] [(:fname cl) (count (:params cl))]) clauses))) attrs))
+
+
+; ── E3: the def path on defn-clause NODES (no quoted readback) ───────────────
+;;
+;; compile-defn-clause emits {:op :defn-clause :fname :params :guard :body}
+;; nodes directly (PLAN-086 E3). While emitter (compiler2) and reader (this
+;; ns) can be swapped at different moments — hotpatch, the seed boot ladder —
+;; and a namespace accumulates defs across BOTH generations, the module
+;; builder dispatches PER DEF on the payload shape: a map is a defn-clause
+;; node, a tuple is a quoted {:def …} (which still flows through def-head-anf/
+;; expand-defaults for defserver's client defs until E4). All of the quoted
+;; readback dies at E5.
+
+(defn bootstrap-import-definitions
+  "BOOTSTRAP-ONLY import boundary for definition-store clause slots."
+  [defs]
+  (to-list
+    (mapcat (fn [d]
+              (cond
+                (and (map? d) (= :defn-clause (:op d))) (list d)
+                (form? d :def)
+                  (map (fn [expanded]
+                         (let [[f ps g body] (def-head-anf expanded)]
+                           {:op :defn-clause :fname f :params ps :guard g :body body :ann {}}))
+                       (expand-defaults d))
+                :else (throw (ex-info "lower/bootstrap-import-definitions: unrecognized definition clause"
+                                      {:path "$.definitions" :value d})))) defs)))
+
+(defn normalize-generation-defs!
+  "BOOTSTRAP-ONLY, once per old-seed generation under writer serialization.
+   Replace each Env definition tuple's clause slot with canonical data."
+  []
+  (let [namespaces (to-list (BeamLisp.Env/namespaces))]
+    (doseq [ns namespaces]
+      (let [defs (BeamLisp.Env/ns_defs ns)
+            canonical
+              (reduce (fn [out [name entries]]
+                        (assoc out name
+                          (to-list (map (fn [entry]
+                            (let [clause (first (bootstrap-import-definitions (list (elem entry 3))))]
+                              (erlang/setelement 4 entry clause))) entries))))
+                      {} (to-list defs))]
+        (BeamLisp.Env/put_ns_defs ns canonical)))
+    {:generation :bootstrap-imported :namespaces namespaces}))
+
+(defn- defn-clause-parts
+  "Destructure a {:op :defn-clause} node → [fname params guard body]."
+  [n]
+  [(:fname n) (to-list (:params n)) (:guard n) (:body n)])
+
+(defn- def-parts-any
+  "[fname params guard body] for either def payload: a defn-clause NODE
+   destructures directly (params already pattern nodes, guard/body already
+   bl-ANF); a quoted {:def …} goes through the transition readback."
+  [d]
+  (if (erlang/is_map d)
+    (defn-clause-parts d)
+    (def-head-anf d)))
+
+(defn defs->module-anf-any
+  "Temporary old-seed name delegating to one importer and one emitter."
+  ([mname defs] (defs->module-anf-any mname defs (list)))
+  ([mname defs attrs]
+   (let [clauses (bootstrap-import-definitions defs)]
+     (module->core (clauses->descriptor mname clauses attrs)))))
+
+(defn shim-def-any
+  "A body-module def payload → the namespace shim def: same head (+ guard),
+   body forwards. Dispatches on payload shape — node shims carry pvar params
+   and an ANF remote; quoted shims use the transition shim-def."
+  [body-mod d]
+  (if (erlang/is_map d)
+    {:op :defn-clause :fname (:fname d)
+     :params (:params d)
+     :guard (:guard d)
+     :body {:op :remote :mod body-mod :fun (:fname d)
+            :args (to-list (map (fn [p] {:op :var :name (:name p) :ann {}})
+                                (to-list (:params d))))
+            :ann {}}
+     :ann {}}
+    (shim-def body-mod d)))
 
 ; ── the effectful edge: compile a cerl module and load it ────────────────────
 (defn load-module!
@@ -479,10 +550,14 @@
         body-mod (BeamLisp.Emit/fresh_body_module)
         body-defs (BeamLisp.Emit/attach_body_module new-defs body-mod)
         all-defs (Map/put (BeamLisp.Env/ns_defs ns) name body-defs)
-        _ (load-module! (defs->module-anf body-mod (to-list (map (fn [t] (elem t 3)) body-defs))))
-        shims (to-list (mapcat (fn [[_ defs]] (map (fn [t] (shim-def (elem t 4) (elem t 3))) defs))
+        ; E3: body and shim modules build through the shape-dispatching
+        ; builders — defn-clause nodes directly, quoted def-asts (a ns's
+        ; older-generation defs, re-shimmed on every defvar) through the
+        ; transition readback. All-quoted dies at E5.
+        _ (load-module! (defs->module-anf-any body-mod (to-list (map (fn [t] (elem t 3)) body-defs))))
+        shims (to-list (mapcat (fn [[_ defs]] (map (fn [t] (shim-def-any (elem t 4) (elem t 3))) defs))
                                (to-list all-defs)))
-        _ (load-module! (defs->module-anf mod shims))
+        _ (load-module! (defs->module-anf-any mod shims))
         _ (BeamLisp.Env/put_ns_defs ns all-defs)
         fv (BeamLisp.Emit/fixed_variadic new-defs)
         fixed (elem fv 0) variadic (elem fv 1)
@@ -515,6 +590,31 @@
 ;; Elixir compiler present. reset-fresh! per module keeps the bytes
 ;; reproducible (a rebuild of the same source yields the same beam).
 
+(declare module->beam)
+
+(defn descriptor->beam
+  "Compile a canonical ANF module descriptor to {module-name, beam-binary}."
+  [descriptor]
+  (module->beam (module->core descriptor)))
+
+(defn reload-descriptor!
+  "Validate and compile a canonical descriptor before replacing its module.
+
+   The old module remains installed when validation or compilation fails. A
+   successful load must identify exactly the descriptor's module."
+  [descriptor]
+  (let [pair (descriptor->beam descriptor)
+        expected (elem pair 0)
+        beam (elem pair 1)
+        filename (erlang/binary_to_list (str expected ".beam"))]
+    (code/purge expected)
+    (code/delete expected)
+    (let [result (code/load_binary expected filename beam)]
+      (if (= result (tuple :module expected))
+        expected
+        (throw (ex-info "lower: descriptor load failed"
+                        {:module expected :result result}))))))
+
 (defn module->beam
   "Compile a cerl module to a {module-name, beam-binary} pair."
   [m]
@@ -535,7 +635,7 @@
   "Compile a namespace's def-asts to its BODY module beam via Core, returning
    {module beam}. `mname` is the body-module atom (deterministic per ns)."
   [mname def-asts]
-  (module->beam (defs->module-anf mname def-asts)))
+  (module->beam (defs->module-anf-any mname def-asts)))
 
 (defn aot-body-beams
   "The AOT integration seam: compile EVERY body module of a namespace to a
@@ -555,3 +655,12 @@
     (map (fn [[body-mod def-asts]]
            (ns-body-beam body-mod (to-list def-asts)))
          (to-list (BeamLisp.Emit/body_modules ns-defs)))))
+
+;; Install this public migration entry only after its dependencies exist.
+;; The previous seed's live definer calls it while rebuilding this namespace.
+(defn defs->module-anf
+  "BOOTSTRAP migration wrapper for quoted definition clauses."
+  ([mname defs] (defs->module-anf mname defs (list)))
+  ([mname defs attrs]
+   (let [clauses (bootstrap-import-definitions defs)]
+     (module->core (clauses->descriptor mname clauses attrs)))))

@@ -42,7 +42,7 @@ defmodule BeamLisp.Record do
   holder process to outlive.
   """
 
-  alias BeamLisp.Env
+  alias BeamLisp.{Emit, Env}
   import BeamLisp.Guards, only: [is_bl_map: 1]
 
   @registry_key {__MODULE__, :registry}
@@ -84,20 +84,18 @@ defmodule BeamLisp.Record do
   @doc """
   Define a record type `name` in namespace `ns` with `fields`, returning
   the struct module. The module is created (or, on redefinition, updated)
-  with a `defstruct` so it is a first-class Elixir struct; the registry
-  records the field list.
+  with the standard `__struct__/0,1` ABI so it is a first-class Elixir struct;
+  the registry records the field list.
   """
   def define(ns, name, fields) do
     # The whole define is a VM-wide critical section: two envs loading
-    # the same namespace concurrently would otherwise race Module.create
-    # ("currently being defined" CompileError) — the record registry is
-    # deliberately global (PLAN-046), so its creation must serialize.
+    # the same namespace concurrently would otherwise race host publication.
+    # The record registry is global (PLAN-046), so creation must serialize.
     mod = module_name(ns, name)
     # {resource, requester}: :global lock ids must be that 2-tuple shape.
     :global.trans({mod, self()}, fn ->
       field_atoms = Enum.map(fields, &String.to_atom/1)
-      struct_fields = Enum.map(field_atoms, &{&1, nil})
-      create_module(mod, quote do: defstruct(unquote(struct_fields)))
+      create_module(mod, :record, field_atoms)
       register(mod, :record, ns, name, field_atoms)
       mod
     end)
@@ -113,7 +111,7 @@ defmodule BeamLisp.Record do
     mod = module_name(ns, name)
 
     :global.trans({mod, self()}, fn ->
-      create_module(mod, quote do: :ok)
+      create_module(mod, :deftype, [])
       register(mod, :deftype, ns, name, Enum.map(fields, &String.to_atom/1))
       mod
     end)
@@ -228,11 +226,46 @@ defmodule BeamLisp.Record do
     Module.concat([BeamLisp.Record | segments] ++ [name])
   end
 
-  # Rebuilding a struct module on every defrecord evaluation is the
-  # normal case (hot reload), so the module-conflict warning is noise.
-  defp create_module(mod, block) do
-    BeamLisp.CompilerOptions.ensure!()
-    Module.create(mod, block, Macro.Env.location(__ENV__))
+  @doc false
+  def generated_struct(mod, fields) do
+    fields
+    |> Map.new(&{&1, nil})
+    |> Map.put(:__struct__, mod)
+  end
+
+  @doc false
+  def generated_struct(mod, fields, kv) do
+    Enum.reduce(kv, generated_struct(mod, fields), fn {key, value}, struct ->
+      if key in fields do
+        Map.put(struct, key, value)
+      else
+        raise KeyError, key: key, term: struct
+      end
+    end)
+  end
+
+  # Compile the complete replacement before touching the loaded module or registry.
+  defp create_module(mod, kind, fields) do
+    clauses =
+      case kind do
+        :record ->
+          [
+            Emit.function_clause(:__struct__, Emit.remote(__MODULE__, :generated_struct, [Emit.lit(mod), Emit.lit(fields)])),
+            Emit.function_clause(
+              :__struct__,
+              Emit.remote(__MODULE__, :generated_struct, [Emit.lit(mod), Emit.lit(fields), Emit.var("kv")]),
+              [%{pop: :pvar, name: "kv"}]
+            )
+          ]
+
+        :deftype ->
+          [Emit.function_clause(:__bl_deftype__, Emit.lit(true))]
+      end
+
+    beam = mod |> Emit.descriptor_for(clauses) |> Emit.compile_descriptor()
+    :code.purge(mod)
+    :code.delete(mod)
+    Emit.load_binary!(beam, "beam_lisp_record")
   end
 
   defp register(mod, kind, ns, name, fields) do

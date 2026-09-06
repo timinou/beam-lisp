@@ -3,7 +3,7 @@ defmodule BeamLisp.AOT do
   Ahead-of-time compilation of beam-lisp source into real BEAM modules.
 
   Interactive `defn` builds its per-namespace module at runtime via
-  `Module.create` (see `BeamLisp.Link`); that needs a live compiler in
+  the legacy host module builder (see `BeamLisp.Link`); that needs a live compiler in
   the running VM and produces nothing that survives into an escript or
   release. AOT flips that: a `.bl` file is treated as a build input,
   compiled once by `mix compile.beam_lisp`, and each namespace it
@@ -257,7 +257,7 @@ defmodule BeamLisp.AOT do
       # so its presence distinguishes a real compiled module from an IN-MEMORY
       # namespace shim. `BeamLisp.init/0` (seeding core from source) and
       # `Link.defvar` (every runtime `def`) build such a shim via
-      # `Module.create`, and `:code.which/1` reports it loaded — it returns
+      # the legacy host module builder, and `:code.which/1` reports it loaded — it returns
       # `[]`, not `:non_existing`, so `code_path_module?` alone says yes. When
       # a shim shadows the on-disk beam in some VM (the compile VM does exactly
       # this: it seeds core from source, THEN emits the beam), reporting
@@ -282,22 +282,12 @@ defmodule BeamLisp.AOT do
     maybe_load_core_backend()
     :ok
   end
-
-  # Under `:aot_backend == :core`, make the boot `lower` ns (and its `anf`
-  # require) usable in this VM so `emit_module` can route body modules through
-  # it. Both live in `priv/boot/` — already a searchable tier — so no
-  # search-path juggling is needed; this just interns the namespace.
-  # A no-op under the `:elixir` backend.
+  # Canonical AOT has one backend. Loading `lower` also loads its `anf`
+  # dependency; readiness failures remain explicit at the descriptor boundary.
   defp maybe_load_core_backend do
-    if BeamLisp.AOTCache.aot_backend() == :core do
-      BeamLisp.Loader.ensure_loaded("lower")
-    end
-
+    BeamLisp.Loader.ensure_loaded("lower")
     :ok
   end
-
-  # --- compilation plumbing ---
-
   # Capture a value `def`'s initializer (and optional docstring) so the
   # namespace module can re-run it in `__bl_init__/0`. Latest def wins,
   # but first-definition order is preserved (a later def may reference
@@ -335,7 +325,7 @@ defmodule BeamLisp.AOT do
   #
   # `defn`/`defmacro` become real functions in the emitted module, so the
   # `fn_ops` above reconstruct them. These do not: each one builds something
-  # at EVAL time — a gen_server module via `Module.create`, a record's
+  # at EVAL time — a gen_server module via the legacy host module builder, a record's
   # constructor and accessors, a protocol's dispatch table — and interns the
   # result. An AOT build wrote none of it to disk and nothing recreated it,
   # so the namespace loaded cleanly and then failed at first use:
@@ -564,134 +554,74 @@ defmodule BeamLisp.AOT do
   defp emit_module(ns, value_defs, ns_meta, output_dir, file) do
     mod = Emit.module_for(ns)
     filename = file || "beam_lisp_aot/#{ns}.bl"
-
-    # Runtime `Link.defvar` named each var's body module with a
-    # process-unique integer (`Ns.Fn.M<n>`) — perfect for the runtime, where
-    # every `def` wants a brand-new module, but NON-DETERMINISTIC across
-    # builds: two AOT compiles of the same source would emit different body
-    # module names, so `.beam` files accumulate and the Mix manifest never
-    # stabilises. Rename each body module to a name derived purely from the
-    # namespace and var, so a rebuild is byte-stable and the manifest can
-    # track exactly the modules on disk.
     ns_defs = stabilise_body_modules(ns, Env.ns_defs(ns))
-
-    # Body modules: one `defmodule` of real code per var's body module.
-    body_module_quoteds =
-      for {body_mod, def_asts} <- Emit.body_modules(ns_defs) do
-        quote do
-          defmodule unquote(body_mod) do
-            @moduledoc false
-            unquote_splicing(def_asts)
-          end
-        end
-      end
-
-    # Namespace module: forwarding shims + the init hook. `build_init_ast`
-    # also hands back a stable companion module (`BeamLisp.Ns.Init.<Ns>`) that
-    # holds the value/macro initializers, or nil when there are none — emitted
-    # as its own never-reloaded beam so macro-expander closures survive churn.
-    shim_asts = Emit.shim_defs(ns_defs)
-    {init_ast, companion_quoted} = build_init_ast(ns, mod, ns_defs, value_defs, ns_meta)
-
-    # PROVENANCE (Wave 1 / L1; closure hash — FEAT-030): stamp a freshness hash
-    # and the toolchain key INTO the shim module, plus a `__bl_provenance__/0`
-    # reader. This makes a compiled `.beam` self-certify against its `.bl`
-    # source — read back with `module_info(:attributes)` or the reader with NO
-    # load, NO `__bl_init__`, NO eval. A drift-aware loader compares these to
-    # the live source; a stale beam (compiled before a def existed, OR before a
-    # namespace it REQUIRES changed) is then detectable instead of silently
-    # serving the old code.
-    #
-    # `source_hash` here is the tier-2 CLOSURE hash (this ns + its transitive
-    # `:require` closure), not the bare file hash: a cross-namespace `defmacro`
-    # means a dependent's emitted bytes can go stale when a REQUIRED source
-    # changes even though the dependent's own file did not. `ns_closure_hash/1`
-    # resolves through the same load path the compile runs under, so this stamp
-    # equals what the runtime gate (`stale?/2`) recomputes. `nil` for an
-    # in-memory compile (`file == nil`) — the loader treats an unstampable beam
-    # as "trust" (prod-release path), never as stale.
     source_hash = if file, do: ns_closure_hash(ns, file), else: nil
     compiler_key = BeamLisp.AOTCache.compiler_key()
 
-    ns_module_quoted =
-      quote do
-        defmodule unquote(mod) do
-          @moduledoc false
-          # `__bl_provenance__/0` is the provenance read path: `:code.ensure_loaded/1`
-          # makes it callable WITHOUT running `__bl_init__/0` (loading module code
-          # ≠ running the init hook), so a drift check reads {source_hash,
-          # compiler_key} for the cost of a function call and no eval. Returns
-          # `{nil, key}` for an in-memory compile (unstampable — loader trusts it).
-          @doc false
-          def __bl_provenance__, do: {unquote(source_hash), unquote(compiler_key)}
-          unquote_splicing(shim_asts)
-          unquote(init_ast)
-        end
+    {init_clause, companion_descriptor} = build_init_ast(ns, mod, ns_defs, value_defs, ns_meta)
+
+    provenance_clause =
+      Emit.function_clause(
+        :__bl_provenance__,
+        %{op: :tuple, elems: [Emit.lit(source_hash), Emit.lit(compiler_key)], ann: %{}}
+      )
+
+    namespace_clauses =
+      (Emit.shim_clauses(ns_defs) ++ [provenance_clause, init_clause])
+      |> Enum.map(fn clause ->
+        ann = Map.merge(%{file: filename, line: 1}, Map.get(clause.body, :ann, %{}))
+        %{clause | body: Map.put(clause.body, :ann, ann)}
+      end)
+    namespace_descriptor =
+      Emit.descriptor_for(mod, namespace_clauses, [bl_source_hash: source_hash, bl_compiler_key: compiler_key])
+
+    body_descriptors =
+      for {body_mod, clauses} <- Emit.body_modules(ns_defs) do
+        Emit.descriptor_for(body_mod, clauses)
       end
 
-    # ONE compiler invocation for the whole namespace. A namespace with 130
-    # vars emits ~132 modules (body modules + shim ns module + companion);
-    # calling `Code.compile_quoted/2` once per module spun the Elixir compiler
-    # up ~132 times and made `core.bl` alone cost 8s. Compiling them together
-    # — one block of `defmodule`s, one invocation — restores near-single-module
-    # cost. The block is order-insensitive: body modules are referenced by the
-    # shims only at call time, not at compile time.
-    #
-    # BACKEND SPLIT (PLAN-081 step 1). The BODY modules hold the real code —
-    # the sole SEMANTIC dependency on the Elixir backend — so under
-    # `:aot_backend == :core` they are lowered through the boot `lower` ns
-    # (bl-ANF →
-    # Core Erlang → .beam) instead of the Elixir compiler, while the shim,
-    # init, and provenance modules stay Elixir (role-B/C runtime plumbing:
-    # `Env.intern`, `__bl_init__`, `__bl_provenance__` — target-agnostic
-    # module-level glue, not "the compiler"). The two paths split a namespace
-    # into the identical module topology (`Emit.body_modules` groups the same
-    # way on both sides), so a Core body module and an Elixir shim interoperate
-    # exactly as an all-Elixir build does. Default `:elixir` = the original
-    # single-invocation path, unchanged.
-    case core_aot_backend?() do
-      true ->
-        # Body modules via Core; the rest (shim + init + companion) via Elixir.
-        core_body_beams =
-          BeamLisp.Ns.Lower
-          |> apply(:"aot-body-beams", [ns_defs])
-          |> Enum.map(fn tuple -> {elem(tuple, 0), elem(tuple, 1)} end)
+    # Compile and validate every byte before the first code load or disk write.
+    # This is the pre-publication failure boundary: Env and the stable namespace
+    # module still describe the previous successful generation.
+    beams =
+      (body_descriptors ++ List.wrap(companion_descriptor) ++ [namespace_descriptor])
+      |> Enum.map(&Emit.compile_descriptor/1)
 
-        rest_block = {:__block__, [], [ns_module_quoted | List.wrap(companion_quoted)]}
+    body_mods = MapSet.new(body_descriptors, & &1.name)
+    {body_beams, public_beams} = Enum.split_with(beams, fn {m, _} -> MapSet.member?(body_mods, m) end)
 
-        (compile_block!(rest_block, filename) ++ core_body_beams)
-        |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
+    Enum.each(body_beams, &Emit.load_binary!(&1, filename))
 
-      false ->
-        all_quoted =
-          [ns_module_quoted | body_module_quoteds] ++ List.wrap(companion_quoted)
-
-        block = {:__block__, [], all_quoted}
-
-        compile_block!(block, filename)
-        |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
+    try do
+      Enum.each(public_beams, &Emit.load_binary!(&1, filename))
+    rescue
+      error ->
+        affected = Enum.map(public_beams, &elem(&1, 0))
+        raise "AOT publication failed for #{inspect(affected)}: #{Exception.message(error)}"
     end
+
+    # Public API returns the namespace first; write its bodies afterwards so
+    # bootstrap's companion freshness check cannot mistake them for seed code.
+    beams
+    |> Enum.sort_by(fn {emitted_mod, _} -> if emitted_mod == mod, do: 0, else: 1 end)
+    |> Enum.map(fn {emitted_mod, beam} -> write_beam(emitted_mod, beam, output_dir) end)
   end
 
-  # Whether the AOT body-module backend is Core Erlang (boot `lower` ns) rather
-  # than the Elixir compiler. Node-global (`Application.get_env`) DELIBERATELY:
-  # the build compiles namespaces in spawned worker processes (build.bl
-  # `pmap-ordered`), so a process-dictionary flag would not reach them — only
-  # an application env is visible VM-wide. Guarded on `lower` actually
-  # being loaded and exporting the seam, so a misconfiguration degrades to the
-  # Elixir path rather than crashing the build. Default `:core` (PLAN-081 flip).
-  defp core_aot_backend? do
-    BeamLisp.AOTCache.aot_backend() == :core and
-      Code.ensure_loaded?(BeamLisp.Ns.Lower) and
-      function_exported?(BeamLisp.Ns.Lower, :"aot-body-beams", 1)
-  end
+  # The canonical emitter is mandatory after bootstrap; no Elixir fallback exists.
 
-  # Compile-to-disk for one module; returns `{mod, path}`.
+  # Compile-to-disk for one module; replacement preserves cache-linked inodes.
   defp write_beam(mod, beam, output_dir) do
     path = Path.join(output_dir, Atom.to_string(mod) <> ".beam")
     File.mkdir_p!(output_dir)
-    File.write!(path, beam)
-    {mod, path}
+    tmp = path <> ".tmp-#{System.unique_integer([:positive])}"
+
+    try do
+      File.write!(tmp, beam)
+      File.rename!(tmp, path)
+      {mod, path}
+    after
+      File.rm(tmp)
+    end
   end
 
   @doc """
@@ -760,214 +690,99 @@ defmodule BeamLisp.AOT do
   # `ns_meta` is the per-namespace map captured from the `(ns …)` form:
   # `%{aliases:, refers:, requires:}`.
   defp build_init_ast(ns, mod, ns_defs, value_defs, ns_meta) do
-    env = Compiler.new_env(ns)
-
     aliases = Map.get(ns_meta, :aliases, [])
     refers = Map.get(ns_meta, :refers, [])
     refer_alls = Map.get(ns_meta, :refer_alls, [])
     requires = Map.get(ns_meta, :requires, [])
 
-    # THE REQUIRES FIRST, before this namespace's own init touches anything.
-    #
-    # A value def's initializer can CALL into a required namespace, and
-    # `__bl_init__/0` runs those initializers for real. `reel.corpus` does
-    # exactly this — a top-level def that calls `reel.film/tempid-for` — and
-    # it failed with "undefined var: reel.film/TEMPIDS": the module for
-    # `reel.film` was loaded, but its own value defs had not run yet, so the
-    # table its function reaches for did not exist.
-    #
-    # Compilation order was already right (the task compiles required files
-    # first); LOAD order was not, because nothing recorded what to load.
-    # Recursing through the loader is what fixes it, and the loader's
-    # `loaded_ns?` guard is what stops a require cycle from spinning.
-    require_ops =
-      for target <- requires do
-        quote do: BeamLisp.Loader.ensure_loaded(unquote(target))
-      end
-
-    # Then re-instantiate the ns declaration's alias/refer metadata, so
-    # any referred/aliased resolution in this namespace works at runtime.
     ns_ops =
-      require_ops ++
-      for {alias_, target} <- aliases do
-        quote do: BeamLisp.Env.add_alias(unquote(ns), unquote(alias_), unquote(target))
-      end ++
-      for {sym, target} <- refers do
-        quote do: BeamLisp.Env.add_refer(unquote(ns), unquote(sym), unquote(target))
-      end ++
-      # `:refer :all` — pull EVERY public name of the target. Emitted after the
-      # requires above so the target namespace is loaded and its exports are
-      # enumerable. Without this, a namespace that re-exports through
-      # `(def x x)` over a `:refer :all` (specter.navs does exactly this) could
-      # not resolve the referred name and `__bl_init__` raised
-      # `undefined var: <ns>/<name>`.
-      for target <- refer_alls do
-        quote do: BeamLisp.Env.add_refer_all(unquote(ns), unquote(target))
-      end
+      Enum.map(requires, &Emit.remote(BeamLisp.Loader, :ensure_loaded, [Emit.lit(&1)])) ++
+        Enum.map(aliases, fn {alias_, target} ->
+          Emit.remote(Env, :add_alias, Enum.map([ns, alias_, target], &Emit.lit/1))
+        end) ++
+        Enum.map(refers, fn {sym, target} ->
+          Emit.remote(Env, :add_refer, Enum.map([ns, sym, target], &Emit.lit/1))
+        end) ++
+        Enum.map(refer_alls, fn target ->
+          Emit.remote(Env, :add_refer_all, [Emit.lit(ns), Emit.lit(target)])
+        end)
 
-    # A `defnative` declaration is replayed BEFORE the fn links, so the
-    # host module exists and its names are bound by the time anything
-    # resolves against them. Without this an AOT build had no native
-    # backend at all: the host is created by `Module.create` at runtime,
-    # so it was never written to disk, and nothing recreated it
-    # (BUG-021).
     native_ops =
       case BeamLisp.Native.declaration(ns) do
-        nil ->
-          []
-
+        nil -> []
         {crate, signatures} ->
-          [
-            quote do
-              BeamLisp.Native.declare(
-                unquote(ns),
-                unquote(crate),
-                unquote(Macro.escape(signatures))
-              )
-            end
-          ]
+          [Emit.remote(BeamLisp.Native, :declare, Enum.map([ns, crate, signatures], &Emit.lit/1))]
       end
 
-    # fn values + link metadata, so `map f`, interop and later call
-    # compilation all resolve against this module.
     fn_ops =
       Enum.flat_map(ns_defs, fn {name, defs} ->
-        # MATCH ON THE TAG AND READ BY INDEX, not on the tuple's width. These
-        # arrive as `{:fixed, arity, fname, ast, meta}` — five elements — and
-        # a four-element pattern here matched NOTHING. A comprehension filters
-        # rather than raises, so `fixed` came out `[]` and the emitted var was
-        # `{:"$blfn", %{}, nil}`: a function value with an empty dispatch
-        # table, which fails at the call site with "wrong number of args (1)"
-        # for an argument count the module plainly exports.
-        #
-        # Single-arity fns were unaffected — they take the one-clause branch
-        # in `fn_value_expr/3` — so this was invisible until a namespace with
-        # a multi-arity `defn` was AOT-compiled.
-        fixed =
-          for d <- defs, elem(d, 0) == :fixed, do: {elem(d, 1), elem(d, 2)}
+        fixed = for d <- defs, elem(d, 0) == :fixed, do: {elem(d, 1), elem(d, 2)}
+        variadic = Enum.find_value(defs, fn d -> if elem(d, 0) == :variadic, do: {elem(d, 1), elem(d, 2)} end)
 
-        variadic =
-          Enum.find_value(defs, fn
-            d when elem(d, 0) == :variadic -> {elem(d, 1), elem(d, 2)}
-            _ -> nil
-          end)
+        ops = [
+          Emit.remote(Env, :intern, [Emit.lit(ns), Emit.lit(name),
+            Emit.remote(Emit, :fn_value, Enum.map([mod, fixed, variadic], &Emit.lit/1))]),
+          Emit.remote(Env, :put_link, Enum.map([ns, name, {mod, Map.new(fixed), variadic}], &Emit.lit/1))
+        ]
 
-        # Replay the var's metadata (`%{doc:, private:, …}`). `compile_defn`
-        # wrote it to the live Env during the emit VM's eval_form pass via
-        # `Env.put_meta`, but nothing persisted it into the AOT module — so an
-        # AOT-loaded `defn` had no docstring and `(doc foo)` printed "No doc
-        # found" for every core fn. Read it here and replay it. `nil`/empty
-        # meta emits nothing.
-        meta_ops =
-          case Env.meta(ns, name) do
-            # is_map-ok: `meta` is a var's metadata map written by
-            # `Env.put_meta` (%{doc:, private:, …}), a plain internal Elixir
-            # map, never a beam-lisp struct.
-            {:ok, meta} when is_map(meta) and map_size(meta) > 0 ->
-              [quote do: BeamLisp.Env.put_meta(unquote(ns), unquote(name), unquote(Macro.escape(meta)))]
-
-            _ ->
-              []
-          end
-
-        [
-          quote do
-            BeamLisp.Env.intern(unquote(ns), unquote(name), unquote(fn_value_expr(mod, fixed, variadic)))
-          end,
-          quote do
-            BeamLisp.Env.put_link(unquote(ns), unquote(name), unquote(Macro.escape({mod, Map.new(fixed), variadic})))
-          end
-        ] ++ meta_ops
+        case Env.meta(ns, name) do
+          # is_map-ok: Env metadata is structural host data, not a language collection.
+          {:ok, meta} when is_map(meta) and map_size(meta) > 0 ->
+            ops ++ [Emit.remote(Env, :put_meta, Enum.map([ns, name, meta], &Emit.lit/1))]
+          _ -> ops
+        end
       end)
 
-    # Value defs, in first-definition order (a later def may build on
-    # an earlier one, exactly as at runtime).
-    #
-    # A value initializer can CREATE A CLOSURE — a `defmacro`'s expander is
-    # exactly this: `{:"$macro", {:"$blfn", _, closure}}`. That closure's code
-    # belongs to whatever module the `fn` was compiled into. If we splice
-    # these ops straight into `Ns.<Ns>.__bl_init__/0`, the closure belongs to
-    # the NAMESPACE module — which every runtime `(def)` into this namespace
-    # reloads. On the third reload the BEAM purges the version the closure
-    # came from and using the macro raises BadFunctionError. Source-seeding is
-    # immune because each top-level form is evaluated in its own throwaway
-    # `BeamLisp.Eval.M<n>` module, which is never reloaded.
-    #
-    # So we mirror that: the value/macro ops live in a STABLE companion module
-    # `BeamLisp.Ns.Init.<Ns>` (emitted once, never reloaded), and `__bl_init__`
-    # merely CALLS it. Closures created inside it are anchored to that stable
-    # module and survive namespace churn. When there are no value defs the
-    # companion is omitted and no call is emitted.
-    value_ops =
-      for {name, doc, init_form, per_env?} <- value_defs do
-        init_ast = Compiler.compile(init_form, env)
+    compiler_env = Compiler.new_env(ns)
 
-        # A `^:per-env` value replays as a per-env descriptor (a re-runnable
-        # thunk each consuming env materializes once), NOT an eager global
-        # intern. Wrapping the compiled initializer in `fn -> … end` here anchors
-        # any closure it builds to this stable Init companion module (never
-        # reloaded), exactly as the eager path relies on for macro expanders.
+    value_ops =
+      Enum.flat_map(value_defs, fn {name, doc, init_form, per_env?} ->
+        init_node = compile_initializer(init_form, compiler_env)
+
         register =
           if per_env? do
-            quote do: BeamLisp.Env.define_per_env(unquote(ns), unquote(name), fn -> unquote(init_ast) end)
+            Emit.remote(Env, :define_per_env, [Emit.lit(ns), Emit.lit(name), Emit.closure(init_node)])
           else
-            quote do: BeamLisp.Env.intern(unquote(ns), unquote(name), unquote(init_ast))
+            Emit.remote(Env, :intern, [Emit.lit(ns), Emit.lit(name), init_node])
           end
 
         if doc do
-          quote do
-            _value = unquote(register)
-            BeamLisp.Env.put_meta(unquote(ns), unquote(name), %{doc: unquote(doc)})
-          end
+          [register, Emit.remote(Env, :put_meta, [Emit.lit(ns), Emit.lit(name), Emit.lit(%{doc: doc})])]
         else
-          register
+          [register]
         end
-      end
+      end)
 
     init_mod = init_module_for(ns)
 
-    {value_call_ops, companion_quoted} =
+    companion_descriptor =
       case value_ops do
-        [] ->
-          {[], nil}
-
-        ops ->
-          companion =
-            quote do
-              defmodule unquote(init_mod) do
-                @moduledoc false
-                # Runs this namespace's value/macro initializers. Lives in its
-                # own never-reloaded module so the closures it creates (macro
-                # expanders especially) are never stranded by namespace churn.
-                def __bl_init_values__ do
-                  unquote_splicing(ops)
-                  :ok
-                end
-              end
-            end
-
-          {[quote(do: unquote(init_mod).__bl_init_values__())], companion}
+        [] -> nil
+        ops -> Emit.descriptor_for(init_mod, [Emit.function_clause(:__bl_init_values__, Emit.sequence(ops ++ [Emit.lit(:ok)]))])
       end
 
-    ns_defs_escaped = Macro.escape(ns_defs)
+    value_call_ops =
+      if companion_descriptor,
+        do: [Emit.remote(init_mod, :__bl_init_values__, [])],
+        else: []
 
-    init_ast =
-      quote do
-        @doc "Re-populates this namespace's var registry; idempotent."
-        def __bl_init__ do
-          unquote_splicing(ns_ops)
-          unquote_splicing(native_ops)
-          unquote_splicing(fn_ops)
-          unquote_splicing(value_call_ops)
-          BeamLisp.Env.put_ns_defs(unquote(ns), unquote(ns_defs_escaped))
-          :ok
-        end
-      end
+    body =
+      Emit.sequence(
+        ns_ops ++ native_ops ++ fn_ops ++ value_call_ops ++
+          [Emit.remote(Env, :put_ns_defs, [Emit.lit(ns), Emit.lit(ns_defs)]), Emit.lit(:ok)]
+      )
 
-    {init_ast, companion_quoted}
+    {Emit.function_clause(:__bl_init__, body), companion_descriptor}
   end
 
-  # The stable companion module that holds a namespace's value/macro
+  defp compile_initializer(form, env) do
+    unless Code.ensure_loaded?(BeamLisp.Ns.Compiler2) and
+             function_exported?(BeamLisp.Ns.Compiler2, :"compile-node", 2) do
+      raise "initializer compiler unavailable: BeamLisp.Ns.Compiler2.compile-node/2 is not ready"
+    end
+
+    apply(BeamLisp.Ns.Compiler2, :"compile-node", [form, env])
+  end
   # initializers: `BeamLisp.Ns.Init.<Ns>`, parallel to `BeamLisp.Ns.<Ns>`.
   defp init_module_for(ns) do
     segments = ns |> String.split(".") |> Enum.map(&Macro.camelize/1)
@@ -1008,67 +823,6 @@ defmodule BeamLisp.AOT do
     Module.concat([BeamLisp.Ns, "Body" | segments])
   end
 
-  # The runtime value of a fn var, mirroring BeamLisp.Link.fn_value/3:
-  # a single fixed-arity fn is a plain capture; anything else is the
-  # tagged multi-arity/variadic wrapper with captures inside.
-  defp fn_value_expr(mod, [{arity, fname}], nil) do
-    quote do: &unquote(mod).unquote(fname)/unquote(arity)
-  end
-
-  defp fn_value_expr(mod, fixed, variadic) do
-    fixed_map = {:%{}, [], for {arity, fname} <- fixed do
-      {arity, quote(do: &unquote(mod).unquote(fname)/unquote(arity))}
-    end}
-
-    variadic_entry =
-      case variadic do
-        nil ->
-          nil
-
-        {min, fname} ->
-          {:{}, [], [min, quote(do: &unquote(mod).unquote(fname)/unquote(min + 1))]}
-      end
-
-    quote do
-      {:"$blfn", unquote(fixed_map), unquote(variadic_entry)}
-    end
-  end
-
-  # Compile a block of several `defmodule`s in ONE invocation and return every
-  # `{module, beam}` pair, in the order the compiler emitted them. Emitting a
-  # namespace's ~130 body modules with one `Code.compile_quoted/2` call each
-  # spun the compiler up per module and made a full build take minutes; one
-  # call for the whole block restores near-single-module cost.
-  defp compile_block!(block, filename) do
-    # Compiler options (ignore_module_conflict, infer_signatures: false) are
-    # set ONCE, VM-wide, by `BeamLisp.CompilerOptions.ensure!/0` — never
-    # saved and restored around a call. See that module for why.
-    BeamLisp.CompilerOptions.ensure!()
-
-    # Call the compiler PRIMITIVE directly instead of `Code.compile_quoted/2`.
-    #
-    # `Code.compile_quoted/2` unconditionally wraps compilation in
-    # `Module.ParallelChecker.verify/1` — the group-pass type/undefined-function
-    # checker — and there is NO compiler option to turn it off (the
-    # `:verification` flag lives only on `Kernel.ParallelCompiler.compile/2`,
-    # which this AOT path does not use). That checker verifies every emitted
-    # module against the WHOLE set of modules loaded in the compile VM, so its
-    # cost grows with the image: once a dense library (minikanren) is loaded,
-    # verifying a later tuple-dense generated namespace (datom.query.magic)
-    # spun for 13+ MINUTES at `ParallelChecker.collect_results` — a superlinear
-    # blowup, not a slow file (magic.bl compiles in ~8s in isolation).
-    #
-    # The check earns NOTHING here: the source was already validated by the
-    # self-hosted lisp compiler, and the emitted Elixir is machine-generated —
-    # correct by construction (shims forward to body modules). The primitive
-    # `:elixir_compiler.quoted/3` — the exact function `Code.compile_quoted/2`
-    # calls under its verify wrapper — produces byte-identical beams without
-    # the checker pass.
-    case :elixir_compiler.quoted(block, filename, fn _, _ -> :ok end) do
-      [] -> raise "AOT: compiling a namespace produced no module"
-      mods -> mods
-    end
-  end
 
   # DRIFT GATE (Wave 1 / L2). A compiled beam is trusted only when it still
   # matches the source it was built from. Reads the beam's `__bl_provenance__/0`

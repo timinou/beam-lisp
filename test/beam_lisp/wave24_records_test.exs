@@ -27,6 +27,28 @@ defmodule BeamLisp.Wave24RecordsTest do
 
   defp eval(source), do: Compiler.eval_string(source, Compiler.new_env("user"))
 
+  describe "canonical host module" do
+    test "preserves the Elixir struct ABI through repeated redefinition" do
+      eval("(defrecord W24Abi [x y])")
+      eval("(defrecord W24Abi [x y])")
+      eval("(defrecord W24Abi [x y])")
+
+      mod = BeamLisp.Record.User.W24Abi
+      assert mod.__struct__() == %{__struct__: mod, x: nil, y: nil}
+      assert struct(mod, x: 1, unknown: 2) == %{__struct__: mod, x: 1, y: nil}
+      assert_raise KeyError, fn -> struct!(mod, x: 1, unknown: 2) end
+    end
+
+    test "record and deftype generation contains no quoted compiler route" do
+      source = File.read!("lib/beam_lisp/record.ex")
+      refute source =~ "Module" <> ".create"
+      refute source =~ "quote " <> "do"
+
+      eval("(deftype W24CanonicalType [x])")
+      refute function_exported?(BeamLisp.Record.User.W24CanonicalType, :__struct__, 0)
+    end
+  end
+
   describe "constructors" do
     test "->Point builds a record with the declared fields" do
       eval("(defrecord W24Point [x y])")
