@@ -238,16 +238,30 @@ defmodule BeamLisp.Bootstrap do
         true -> dst
       end
 
-    with {:ok, bytes} <- File.read(provenance_beam),
-         mod <- provenance_beam |> Path.basename(".beam") |> String.to_atom(),
-         :code.purge(mod),
-         :code.delete(mod),
-         {:module, _} <- :code.load_binary(mod, String.to_charlist(provenance_beam), bytes),
-         true <- function_exported?(mod, :__bl_provenance__, 0),
-         {_src_hash, key} <- mod.__bl_provenance__() do
-      key == current_key
+    # The sibling-shim verdict only inherits when the destination beam itself
+    # is there AND was written in the same pass as the shim: shim, body and
+    # init are one generation unit, emitted together. A killed/interrupted
+    # build can leave a fresh shim beside a stale body or init; trusting the
+    # shim alone then skips the reinstall and the VM loads mismatched halves.
+    unit_consistent? =
+      provenance_beam == dst or
+        (File.exists?(dst) and File.exists?(provenance_beam) and
+           File.stat!(dst).mtime >= File.stat!(provenance_beam).mtime)
+
+    if unit_consistent? do
+      with {:ok, bytes} <- File.read(provenance_beam),
+           mod <- provenance_beam |> Path.basename(".beam") |> String.to_atom(),
+           :code.purge(mod),
+           :code.delete(mod),
+           {:module, _} <- :code.load_binary(mod, String.to_charlist(provenance_beam), bytes),
+           true <- function_exported?(mod, :__bl_provenance__, 0),
+           {_src_hash, key} <- mod.__bl_provenance__() do
+        key == current_key
+      else
+        _ -> false
+      end
     else
-      _ -> false
+      false
     end
   end
 

@@ -47,6 +47,10 @@ defmodule BeamLisp.LazySeq do
   # them in one table coupled them.
   @table :beam_lisp_lazy_cache
 
+  # Whole-table eviction budget for the realization cache (see maybe_evict/0).
+  # Overridable via config :beam_lisp, :lazy_cache_budget_bytes.
+  @cache_budget_bytes 512 * 1024 * 1024
+
   # Chunked seq fns realize this many elements per thunk, so the
   # per-element LazySeq allocation is amortized instead of one struct +
   # closure per element (the reason Clojure chunks at 32).
@@ -95,8 +99,32 @@ defmodule BeamLisp.LazySeq do
 
       [] ->
         value = thunk.()
+        maybe_evict()
         :ets.insert(@table, {{:lazy, key}, value})
         value
+    end
+  end
+
+  # The cache is insert-only with make_ref keys, so it grows without bound:
+  # every forced seq's realized chunk is retained VM-wide forever. Compile-time
+  # pipelines (anf/normalise/lower) realize giant trees per form — map/to-list
+  # churn over whole quoted bodies — and a single big file accumulated ~160MB
+  # per top-level form here, OOM-killing full `mix compile` builds.
+  #
+  # Memoization is an optimization, not semantics: losing an entry means a
+  # thunk re-runs (the table itself is already allowed to vanish and rebuild
+  # — see BUG-011 above). So when the table crosses the budget, evict ALL of
+  # it and continue. Whole-table eviction over per-entry LRU: one O(1) size
+  # check per cold force, no bookkeeping, no hot-path cost.
+  defp maybe_evict do
+    budget = Application.get_env(:beam_lisp, :lazy_cache_budget_bytes, @cache_budget_bytes)
+
+    case :ets.info(@table, :memory) do
+      words when is_integer(words) and words * 8 > budget ->
+        :ets.delete_all_objects(@table)
+
+      _ ->
+        :ok
     end
   end
 
