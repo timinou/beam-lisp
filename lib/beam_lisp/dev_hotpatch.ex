@@ -29,7 +29,11 @@ defmodule BeamLisp.DevHotpatch do
     do: names |> String.split(",", trim: true) |> hotpatch!()
 
   def hotpatch!(names) when is_list(names) do
-    for name <- names, do: hotpatch_ns!(name)
+    normalized = Enum.map(names, &to_string/1)
+    Enum.each(normalized, fn name ->
+      hotpatch_ns!(name)
+      BeamLisp.Generation.record_hotpatch([name])
+    end)
     :ok
   end
 

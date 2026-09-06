@@ -40,8 +40,8 @@ defmodule BeamLisp.Bootstrap do
   (one whose compiler beam already matches) is a cheap no-op; it never silently
   proceeds past a real mismatch, because there is no genesis fallback behind it.
   """
-  def install!(compile_path) do
-    seed_dir = seed_dir()
+  def install!(compile_path, opts \\ []) do
+    seed_dir = Keyword.get(opts, :seed_dir, seed_dir())
 
     manifest_path = Path.join(seed_dir, @manifest_name)
 
