@@ -1,0 +1,232 @@
+; fp_anf.bl — PROTOTYPE: system.footprint re-expressed over bl-ANF.
+;
+; Question: if engines read the IR the backend emits (instead of surface
+; reader-node trees), what changes — precision, size, soundness — and what
+; do consumers have to change?
+;
+; Run: mix beam_lisp.run --path priv research/anf_engines/fp_anf.bl
+;
+; Contract kept: (fp-anf node) → {resource → mode}, same modes/ranks as
+; system.footprint so `rung`, `pure?`, `monotone?`, `commute?`,
+; `frame-independent?` apply unchanged.
+
+(ns research.anf-engines.fp-anf
+  (:require [compiler :as c]
+            [system.footprint :as fp]))
+
+; ── op classification by (mod fun), not string ─────────────────────────
+;
+; Surface engine: op-mode keyed by "swap!" — name-based, shadowable.
+; ANF: the compiler already resolved the callee. Key by [mod fun].
+
+(def refs :Elixir.BeamLisp.Refs)
+(def rt   :Elixir.BeamLisp.RT)
+(def core :Elixir.BeamLisp.Ns.Core)
+
+(def op-mode
+  {[refs :swap!] :W  [refs :reset!] :W  [refs :deref] :R  [refs :atom] :R
+   [:datom :transact!] :A [:datom :listen!] :R [:datom :db] :R [:datom :q] :R
+   [:erlang :send] :S [:erlang :spawn] :X
+   [rt :println] :W [:Elixir.File :read] :R [:Elixir.File :write] :W})
+
+(def io-ops #{[rt :println] [:Elixir.File :read] [:Elixir.File :write]})
+
+; Globals invoked through RT.invoke keep their name; classify by that name
+; only for the io family (a var named println). Everything else invoked
+; dynamically is an unknown callee → :opaque-world (sound, as before).
+(def global-io #{"println"})
+
+; Every :remote whose (mod fun) is neither a resource op nor an io op is a
+; PURE host call: erlang arithmetic, RT collection ops, binary indexing, …
+; This replaces the surface engine's 60-entry `pure-ops` string set: the
+; compiler already decided these are direct host calls with no resource.
+; Conservative exception: unknown Elixir application modules could do IO —
+; keep a small opaque set for modules that are not value-semantics kernels.
+(def value-mods #{:erlang :binary :lists :maps rt core :Elixir.BeamLisp.Ns.Reader})
+
+; ── resource identity through ANF locals ────────────────────────────────
+;
+; ANF names every intermediate: `(-> a (swap! inc))` and `(doto a …)` bind
+; `a` to a fresh local before the resource op sees it. The surface engine
+; never had this problem (it never expanded the macro — it gave up instead).
+; So the ANF engine carries an ALIAS ENV: local → resource it stands for,
+; populated at every :let whose init is a global or an already-aliased var.
+; A local bound to anything else (a computed value) is an unnameable
+; resource → :opaque-world, exactly the surface rule for a non-symbol arg.
+
+(defn- author-name [v] (first (re/split v "_[0-9]+$" (list (tuple :return :binary)))))
+
+(defn- resource-of [aliases args]
+  (let [a0 (first args)]
+    (cond
+      (nil? a0) fp/opaque-world
+      (= :global (:op a0)) (:name a0)
+      (= :var (:op a0)) (get aliases (:name a0) fp/opaque-world)
+      :else fp/opaque-world)))
+
+(defn- alias-for
+  "What a let-bound local stands for, or nil when it is a computed value."
+  [aliases init]
+  (cond
+    (= :global (:op init)) (:name init)
+    (= :var (:op init))    (get aliases (:name init))
+    :else nil))
+
+(declare fp-anf)
+
+(defn- fp-all [aliases nodes]
+  (reduce (fn [m n] (fp/join-fp m (fp-anf aliases n))) {} nodes))
+
+(defn- bind-pats
+  "Pattern vars of a clause are computed values: shadow any alias."
+  [aliases pats]
+  (reduce (fn [al p] (if (= :pvar (:pop p)) (dissoc al (:name p)) al)) aliases pats))
+
+(defn fp-anf
+  "Footprint of a bl-ANF node under an alias env: {resource → mode}."
+  ([n] (fp-anf {} n))
+  ([aliases n]
+   (let [op (:op n)]
+     (cond
+       (nil? n) {}
+       (contains? #{:lit :var :global :enil} op) {}
+       (= op :remote)
+         (let [k [(:mod n) (:fun n)] args (:args n)]
+           (cond
+             (contains? io-ops k)  (fp/join-fp {:io (get op-mode k)} (fp-all aliases args))
+             (contains? op-mode k) (fp/join-fp {(resource-of aliases args) (get op-mode k)} (fp-all aliases args))
+             ; RT.invoke on a global: classify by var name (io only), else opaque
+             (and (= k [rt :invoke]) (= :global (:op (first args))))
+               (if (contains? global-io (:name (first args)))
+                 (fp/join-fp {:io :W} (fp-all aliases (rest args)))
+                 (fp/join-fp {fp/opaque-world :W} (fp-all aliases (rest args))))
+             (contains? value-mods (:mod n)) (fp-all aliases args)
+             :else (fp/join-fp {fp/opaque-world :W} (fp-all aliases args))))
+       (= op :apply)  (fp/join-fp {fp/opaque-world :W} (fp-all aliases (cons (:fn n) (:args n))))
+       (= op :let)
+         (let [al (alias-for aliases (:init n))
+               inner (if (nil? al) (dissoc aliases (:name n)) (assoc aliases (:name n) al))]
+           (fp/join-fp (fp-anf aliases (:init n)) (fp-anf inner (:body n))))
+       (= op :if)     (fp-all aliases (list (:test n) (:then n) (:else n)))
+       (= op :do)     (fp-all aliases (:stmts n))
+       (= op :case)   (fp/join-fp (fp-anf aliases (:subj n))
+                                  (reduce (fn [m cl]
+                                            (let [al (bind-pats aliases (list (:pat cl)))]
+                                              (fp/join-fp m (fp-all al (list (:guard cl) (:body cl))))))
+                                          {} (:clauses n)))
+       (= op :fn)     {}                                   ; deferred, as surface
+       (= op :try)    (fp-all aliases (list (:body n) (:catch n) (:after n)))
+       (= op :recv)   (fp/join-fp {fp/opaque-world :K}
+                                  (reduce (fn [m cl]
+                                            (let [al (bind-pats aliases (list (:pat cl)))]
+                                              (fp/join-fp m (fp-all al (list (:guard cl) (:body cl))))))
+                                          {} (:clauses n)))
+       (= op :tuple)  (fp-all aliases (:items n))
+       (= op :map)    (fp-all aliases (mapcat (fn [kv] (list (first kv) (second kv))) (:pairs n)))
+       (= op :cons)   (fp-all aliases (list (:head n) (:tail n)))
+       (= op :struct) (fp-all aliases (map second (:fields n)))
+       :else {}))))
+
+(defn fp-fn-body
+  "Footprint of a compiled (fn …) node's clause bodies — what a defn DOES
+   when called (the surface engine's per-body walk)."
+  [fn-node]
+  (reduce (fn [m cl] (fp/join-fp m (fp-anf {} (:body cl)))) {} (:clauses fn-node)))
+
+; ── write-back: proofs as :ann ──────────────────────────────────────────
+;
+; Annotate every node with its footprint. The IR is a plain map; :ann is the
+; slot every constructor threads. Nothing downstream is disturbed: lower.bl
+; reads only :ann :line/:file.
+
+(defn annotate
+  "Return node with {:footprint fp :rung rung} in :ann, recursively."
+  [n]
+  (if (not (map? n)) n
+    (let [kids (reduce (fn [m k]
+                         (let [v (get m k)]
+                           (assoc m k
+                             (cond (map? v) (if (contains? v :op) (annotate v) v)
+                                   (list? v)
+                                     (apply list (map (fn [x] (if (and (map? x) (contains? x :op)) (annotate x) x)) v))
+                                   (vector? v)
+                                     (into [] (map (fn [x] (if (and (map? x) (contains? x :op)) (annotate x) x)) v))
+                                   :else v))))
+                       n (keys n))
+          f (fp-anf n)]
+      (assoc kids :ann (assoc (or (:ann n) {}) :footprint f :rung (fp/rung f))))))
+
+; ── differential harness ────────────────────────────────────────────────
+
+(defn- read1 [s] (first (BeamLisp.Ns.Reader/read_string s nil)))
+(defn- surface [s] (fp/fp-walk {} (read1 s)))
+(defn- via-anf [s] (fp-anf (c/compile-node (read1 s) (c/new-env "probe"))))
+
+(def corpus
+  [; ── agree: plain idioms
+   "(deref a)" "(swap! a inc)" "(+ (deref a) (count xs))"
+   "(erlang/send p m)" "(println x)" "(datom/transact! conn tx)"
+   "(swap! orders conj o)" "(swap! balance + n)"
+   "(if (> n 0) (swap! a inc) (deref a))"
+   "(do (println x) (swap! a inc))"
+   "(binary/at b i)" "(fn [q] (swap! q inc))"
+   ; ── macros the surface walker does not know → :opaque-world
+   "(-> a deref inc)" "(when (> n 0) (swap! a inc))"
+   "(cond-> x (> n 0) inc)" "(if-let [v (deref a)] v 0)"
+   "(doto a (swap! inc))" "(as-> (deref a) v (inc v))"
+   "(let [{:keys [x]} m] (swap! st assoc :x x))"
+   "(for [x xs] (inc x))" "(some-> a deref)"
+   ; ── threading through a resource op
+   "(-> a (swap! inc))" "(->> tx (datom/transact! conn))"
+   ; ── unknown user fn: both should be opaque
+   "(my-fn a)"
+   ; ── alias soundness: a computed local is NOT a nameable resource
+   "(let [r (pick)] (swap! r inc))"
+   "(let [r a] (swap! r inc))"
+   ; ── shadowing: inner binding must not inherit outer alias
+   "(let [r a] (let [r (pick)] (swap! r inc)))"
+   ; ── case-bound var is computed
+   "(case (pick) x (swap! x inc))"])
+
+(defn- pad [s w]
+  (let [k (- w (erlang/byte_size s))]
+    (if (> k 0) (str s (binary/copy " " k)) s)))
+
+(defn- cell [s]
+  (let [sf (surface s) an (via-anf s)]
+    {:form s :surface sf :anf an
+     :same? (= sf an)
+     :surface-rung (fp/rung sf) :anf-rung (fp/rung an)}))
+
+(def results (map cell corpus))
+
+(println "form                                          surface                       anf")
+(doall (map (fn [r]
+              (println (str (if (:same? r) "  = " "  ≠ ")
+                            (pad (:form r) 42) " "
+                            (pad (pr-str (:surface r)) 28) " "
+                            (pr-str (:anf r)))))
+            results))
+
+(def n-same (count (filter :same? results)))
+(def n-diff (- (count results) n-same))
+(println "\nagree:" n-same " differ:" n-diff " of" (count results))
+
+; classify the differences
+(def opaque-lost
+  (filter (fn [r] (and (not (:same? r))
+                       (contains? (:surface r) :opaque-world)
+                       (not (contains? (:anf r) :opaque-world))))
+          results))
+(println "surface over-approximated to :opaque-world, ANF precise:" (count opaque-lost))
+(doall (map (fn [r] (println "   " (:form r) " → " (pr-str (:anf r)))) opaque-lost))
+
+(def other-diffs (filter (fn [r] (and (not (:same? r)) (not (some #{r} opaque-lost)))) results))
+(println "other differences (inspect):" (count other-diffs))
+(doall (map (fn [r] (println "   " (:form r) " surface " (pr-str (:surface r)) " anf " (pr-str (:anf r)))) other-diffs))
+
+; ── :ann write-back survives emission unchanged ─────────────────────────
+(println "\n── annotate + emit")
+(def node (annotate (c/compile-node (read1 "(let [x (deref a)] (swap! b + x))") (c/new-env "probe"))))
+(println "root :ann" (pr-str (:ann node)))
+(println "let-init :ann" (pr-str (:ann (:init node))))
