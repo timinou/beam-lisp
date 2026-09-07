@@ -10,7 +10,8 @@ The source-only editing companion has immutable plans, explicit hash authorizati
 
 ## Verified gates
 
-- Full runtime suite: **1,485 passed**, seed **151300**, after fixing the order-sensitive Clojure set dependency. Command: `MIX_ENV=test mix test --no-compile --seed 151300`, under a 10G MemoryMax / 1G MemorySwapMax scope. Evidence: `final-regression-result.log`. The preceding direct `mix compile.beam_lisp --force` in that combined command produced no observable build; it is not claimed as the uncached-build proof.
+- Final policy-complete runtime suite: **1,487 passed**, seed **151300**, via `MIX_ENV=test mix test --seed 151300`. This includes explicit document policy refusal and actual candidate behavior in a copied workspace. Evidence: `final-policy-regression-result.log`.
+- Earlier complete runtime suite: **1,485 passed**, seed **151300**, after fixing the order-sensitive Clojure set dependency. Command: `MIX_ENV=test mix test --no-compile --seed 151300`, under a 10G MemoryMax / 1G MemorySwapMax scope. Evidence: `final-regression-result.log`. The preceding direct `mix compile.beam_lisp --force` in that combined command produced no observable build; it is not claimed as the uncached-build proof.
 - Actual uncached build: **141 sources**, result `{:ok, []}`. Command: `MIX_ENV=test BEAM_LISP_AOT_CACHE=off mix run --no-compile --no-start -e 'result = Mix.Tasks.Compile.BeamLisp.run(["--force", "--source-dir", "priv", "--out", "/tmp/bl-plan091-uncached-explicit"]); IO.inspect(result, label: "UNCACHED_BUILD_RESULT"); unless match?({:ok, _}, result), do: System.halt(1)'`. Evidence: `final-uncached-build-result.log`.
 - Compiler cutover: 89 host tests and 29 language tests / 110 assertions pass. Explicit `Elixir.String/...` qualification and capability enforcement pass a later 72-test focused gate. The runtime suite includes the added regression.
 - Eager traversal: three same-VM batches of ten small and ten 64-binding units. Baseline registrations are 1,630 / 13,910 per batch; eager registrations are zero in every batch. Emitted hashes match across generations and repetitions. Loaded-module delta is zero. Evidence: `compiler-retention-comparison.log`; the comparison sub-gates pass even though that earlier combined run subsequently found a missing newly added corpus fixture. The completed corpus gate is recorded separately in `eager-gate-result.log`.
@@ -47,4 +48,6 @@ Deferred user-approved work remains outside this convergence plan: PLAN-087 SIMD
 - `d785007`: integrated native shared lazy ownership.
 - Spell `8baa5f0`: selectively committed Loop/MCP editing integration.
 
-Final compiler/seed/documentation commit follows this verification record. Unrelated project, journal, and concurrent plan files are preserved rather than swept into the milestone.
+- `bc0e656`: final compiler namespace/deletion/seed/documentation cutover.
+
+The document runner additionally exposes explicit policy refusal: only `:trusted` executes; every other policy refuses before any cell or result write. The focused policy/change suite and subsequent 1,487-test full suite pass. Trusted document replay remains byte-identical. Unrelated project, journal, and concurrent plan files are preserved rather than swept into the milestone.

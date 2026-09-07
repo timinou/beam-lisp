@@ -37,6 +37,29 @@ defmodule BeamLisp.DevChangeTest do
     assert File.read!(Path.join(root, "fixture.bl")) == passing.old_bytes
   end
 
+  test "verification evaluates the candidate while the source workspace stays unchanged" do
+    BeamLisp.init()
+    ns = "candidate_behavior_#{System.unique_integer([:positive])}"
+    original = "(ns #{ns})\n(defn target [] \"old\")\n"
+    root = fixture!(original)
+    assert {:ok, plan} = DevChange.plan(spec(root, %{selector: ns <> "/target"}))
+    runner = fn command ->
+      refute command.cwd == root
+      child = BeamLisp.Env.fork()
+      try do
+        value = BeamLisp.Env.with_env(child, fn ->
+          BeamLisp.eval(File.read!(Path.join(command.cwd, "fixture.bl")) <> "\n(#{ns}/target)")
+        end)
+        assert value == "changed"
+        :ok
+      after
+        BeamLisp.Env.destroy(child)
+      end
+    end
+    assert {:ok, %{status: :verified}} = DevChange.verify(plan, runner: runner)
+    assert File.read!(Path.join(root, "fixture.bl")) == original
+  end
+
   test "plan and preview do not modify source bytes" do
     source = """
     (ns demo)
