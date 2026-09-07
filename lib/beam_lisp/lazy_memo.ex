@@ -42,15 +42,23 @@ defmodule BeamLisp.LazyMemo do
 
   def exchange(resource, expected, state, notifications \\ []) do
     ensure_loaded!()
+    deps = dependencies(state)
+    bytes = estimate_bytes(state)
 
-    nif_compare_exchange(
-      resource,
-      expected,
-      state,
-      dependencies(state),
-      estimate_bytes(state),
-      notifications
-    )
+    # Two scheduler lanes, one cell. The fast lane is a regular-scheduler NIF
+    # and must finish well under 1 ms. The NIF itself guarantees that bound:
+    # it answers `:reroute` for a large current value, a large replacement, or
+    # any NEW dependency edge (an unbounded cycle walk), and we then take the
+    # dirty lane. The router only skips the fast attempt when the replacement
+    # is obviously too big, so the common tiny-memo case costs one crossing.
+    if bytes <= nif_fast_lane_bytes() do
+      case nif_compare_exchange_fast(resource, expected, state, deps, bytes, notifications) do
+        :reroute -> nif_compare_exchange(resource, expected, state, deps, bytes, notifications)
+        outcome -> outcome
+      end
+    else
+      nif_compare_exchange(resource, expected, state, deps, bytes, notifications)
+    end
   end
 
   def dependencies(term) do
@@ -160,7 +168,23 @@ defmodule BeamLisp.LazyMemo do
 
   def read(resource) do
     ensure_loaded!()
-    nif_read(resource)
+
+    case nif_lane(resource) do
+      :fast -> nif_read_fast(resource)
+      :dirty -> nif_read(resource)
+    end
+  end
+
+  @doc "Byte ceiling below which cell reads/writes take the regular-scheduler lane."
+  def fast_lane_bytes do
+    ensure_loaded!()
+    nif_fast_lane_bytes()
+  end
+
+  @doc "Tune the fast-lane ceiling. Raising it trades scheduler fairness for throughput."
+  def set_fast_lane_bytes(bytes) when is_integer(bytes) and bytes >= 0 do
+    ensure_loaded!()
+    nif_set_fast_lane_bytes(bytes)
   end
 
   def compare_exchange(resource, expected, replacement, dependencies, bytes) do
@@ -186,6 +210,24 @@ defmodule BeamLisp.LazyMemo do
   def nif_new(_state, _dependencies, _bytes), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_read(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_read_fast(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_lane(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_fast_lane_bytes, do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_set_fast_lane_bytes(_bytes), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_compare_exchange_fast(
+        _resource,
+        _expected,
+        _replacement,
+        _dependencies,
+        _bytes,
+        _notifications
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_compare_exchange(
         _resource,
