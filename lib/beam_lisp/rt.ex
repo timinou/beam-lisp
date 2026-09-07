@@ -2416,6 +2416,7 @@ defmodule BeamLisp.RT do
       "force" => &BeamLisp.Deferred.force/1,
       "realized?" => &BeamLisp.Deferred.realized?/1,
       "delay?" => &BeamLisp.Deferred.delay?/1,
+      "derived?" => &BeamLisp.Reactive.derived?/1,
       "future?" => &BeamLisp.Refs.future?/1,
       "future-cancel" => &BeamLisp.Refs.future_cancel/1,
       "volatile!" => &BeamLisp.Refs.volatile/1,
@@ -2707,6 +2708,7 @@ defmodule BeamLisp.RT do
       "force" => {BeamLisp.Deferred, %{1 => :force}, nil},
       "realized?" => {BeamLisp.Deferred, %{1 => :realized?}, nil},
       "delay?" => {BeamLisp.Deferred, %{1 => :delay?}, nil},
+      "derived?" => {BeamLisp.Reactive, %{1 => :derived?}, nil},
       "future?" => {BeamLisp.Refs, %{1 => :future?}, nil},
       "future-cancel" => {BeamLisp.Refs, %{1 => :future_cancel}, nil}
     }

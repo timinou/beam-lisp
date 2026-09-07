@@ -392,6 +392,9 @@ defmodule BeamLisp.Refs do
   # A delay derefs to its value, forcing it once. `@d` therefore works on a
   # delay exactly as on an atom or promise.
   def deref(%BeamLisp.Delay{} = d), do: BeamLisp.Deferred.force(d)
+  # A derived derefs to its current value, recomputing only if a dependency
+  # changed. `@d` on a derived reads it exactly like an atom.
+  def deref(%BeamLisp.Derived{} = d), do: BeamLisp.Reactive.deref(d)
 
   def deref(other), do: raise(ArgumentError, "deref: not a derefable reference: #{inspect(other)}")
 
