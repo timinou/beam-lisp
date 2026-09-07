@@ -27,6 +27,7 @@ can drop into the corner of any live app.
             [data.tap :as tap]
             [tooling.trace :as trace]
             [tooling.incremental :as inc]
+            [web]
             [interop]))
 
 ;; One process-wide tap: the live socket publishes a frame per mount/commit
@@ -62,7 +63,16 @@ can drop into the corner of any live app.
   "An incremental, traced view subtree. Recomputes only when a dep changes,
    and records each recompute into the dashboard's render trace under `label`."
   [label deps render]
-  (trace/traced (tr) label deps render))
+  (trace/traced (tr) label deps
+    (fn []
+      ;; stamp the subtree root with its label. A paint/inspect tool reads
+      ;; data-tr up the DOM to name the OWNER of any changed element.
+      (let [h (render)]
+        (if (and (vector? h) (keyword? (first h)))
+          (if (map? (second h))
+            (assoc h 1 (assoc (second h) :data-tr (name label)))
+            (into [(first h) {:data-tr (name label)}] (rest h)))
+          h)))))
 
 (defn component
   "A memoised view component (tooling.incremental/component): equal inputs
@@ -294,7 +304,11 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "#pc-cells{max-height:180px;overflow:auto}"
    ".pcc{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-top:1px solid #1f2733}"
    ".pcc .k{color:#ffd166}.pcc .v{color:#7d8590;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
-   "#pc-trace{font-size:11px;color:#39d0d8;margin-bottom:8px;min-height:14px}"))
+   "#pc-trace{font-size:11px;color:#39d0d8;margin-bottom:8px;min-height:14px}"
+   "#pc-tools{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}"
+   ".pct{background:#121821;color:#7d8590;border:1px solid #1f2733;border-radius:99px;"
+   "padding:3px 10px;font:inherit;font-size:10px;text-transform:uppercase;letter-spacing:.1em;cursor:pointer}"
+   ".pct.on{color:#0a0e14;background:#39d0d8;border-color:#39d0d8;font-weight:700}"))
 
 (defn- chip-js []
   (str
@@ -302,6 +316,12 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "var ep=root.getAttribute('data-ep');"
    "var badge=document.getElementById('pc-badge'),panel=document.getElementById('pc-panel');"
    "badge.onclick=function(){panel.hidden=!panel.hidden};"
+   ;; instrument toggles → Studio.toggle; reflect state (incl. restored) on the buttons
+   "function syncTools(){if(!window.Studio)return;root.querySelectorAll('.pct').forEach(function(b){"
+   "var i=Studio.instruments[b.getAttribute('data-tool')];b.classList.toggle('on',!!(i&&i.on))})}"
+   "root.querySelectorAll('.pct').forEach(function(b){b.onclick=function(){"
+   "if(window.Studio){Studio.toggle(b.getAttribute('data-tool'));syncTools()}}});"
+   "document.addEventListener('studio:toggle',syncTools);setTimeout(syncTools,50);"
    "function fb(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(1)+' MB'}"
    "function render(s){document.getElementById('pc-n').textContent=s.vitals['live-cells'];"
    "document.getElementById('pc-vitals').innerHTML="
@@ -310,7 +330,8 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "document.getElementById('pc-cells').innerHTML=(s.cells||[]).map(c=>"
    "`<div class=pcc><span class=k>${c.kind}:${c.name}</span><span class=v>${c.value}</span></div>`).join('');"
    "var t=s.trace||{},rc=(t.recomputed||[]);var tl=document.getElementById('pc-trace');"
-   "if(tl)tl.innerHTML=rc.length?`↻ ${rc.join(', ')} → ${t['patch-ops']} op`:'idle';}"
+   "var f=s.frame;var fl=f?`t${f.t} · ${f.kind} · ${f['op-count']} op · ${(+f.ms).toFixed(1)}ms`+(f.event&&f.event!=='nil'?` · ${f.event}`:''):'';"
+   "if(tl)tl.innerHTML=rc.length?`↻ ${rc.join(', ')} → ${t['patch-ops']} op<br>${fl}`:(fl||'idle');}"
    "function conn(){var ws=new WebSocket(ep);"
    "ws.onmessage=function(e){render(JSON.parse(e.data))};"
    "ws.onclose=function(){setTimeout(conn,1000)};}conn();})();"))
@@ -342,9 +363,12 @@ raw-text tags, emitted verbatim). `with-chip` is the decorator.
     [:span {:id "pc-label"} "cells"]]
    [:div {:id "pc-panel" :hidden true}
     [:div {:id "pc-head"} "pulse"]
+    [:div {:id "pc-tools"}
+     [:button {:class "pct" :data-tool "paint" :title "flash the exact elements each patch op touched"} "paint"]]
     [:div {:id "pc-vitals"}]
     [:div {:id "pc-trace"}]
     [:div {:id "pc-cells"}]]
+   [:script {:src "/__pulse/studio.js"}]
    [:script (chip-js)]])
 
 (defn with-chip
@@ -415,5 +439,18 @@ its router; `mount` returns everything a host needs.
    same /__pulse/ws feed."
   []
   {:page (page)
-   :ws-handlers ws-handlers})
+   :ws-handlers ws-handlers
+   :studio-js (web/asset "lib/tooling/studio.js")})
+
+(defn http
+  "The studio's HTTP surface as a live.app `:http` handler: the chip feed and
+   the studio script. Wire it with one key: `{:http (pulse/http)}`."
+  []
+  (let [m (mount)]
+    (fn [conn path]
+      (cond
+        (= path "/__pulse/ws")        (web/upgrade conn (:ws-handlers m) nil)
+        (= path "/__pulse/studio.js") (web/js conn (:studio-js m))
+        (= path "/__pulse")           (web/html conn (:page m))
+        :else nil))))
 ```
