@@ -21,11 +21,11 @@ modules are libraries you `require`.
 `data` is organized around three things a living value can do. Each is a
 namespace, named for the power it gives you.
 
-### `data.vault` — *remember*
+### `data.cache` — *remember*
 
 > compute once, keep forever, and ask what you kept
 
-A `vault` is a content-addressed cache: a value's identity is the hash of its
+A `cache` is a content-addressed cache: a value's identity is the hash of its
 inputs, so the same inputs return the same slot — this run, and (with a
 directory) the next. Two tiers, one door: a hot tier in memory in front of a
 durable tier on disk. What makes it `data` and not just a cache: **every entry
@@ -34,14 +34,14 @@ is cached, how large, how often hit, by which store" is a `q`, not a private
 scan.
 
 ```beam-lisp
-; (illustrative — see data.vault for the runnable tour)
-; (require '[data.vault :as vault])
-; (def v (vault/open "gemini" {:dir "cache/gemini"}))
-; (vault/get! v prompt (fn [] (call-the-model prompt)))   ; runs at most once
-; (vault/hottest v 10)                                     ; what's earning its slot
+; (illustrative — see data.cache for the runnable tour)
+; (require '[data.cache :as cache])
+; (def v (cache/open "gemini" {:dir "cache/gemini"}))
+; (cache/get! v prompt (fn [] (call-the-model prompt)))   ; runs at most once
+; (cache/hottest v 10)                                     ; what's earning its slot
 ```
 
-Read the full, runnable introduction in `priv/lib/data/vault.bl.md` — the module
+Read the full, runnable introduction in `priv/lib/data/cache.bl.md` — the module
 *is* its own literate tour.
 
 ### `data.lens` — *relate* (the reactive core, already in the language)
@@ -61,7 +61,7 @@ new module; it points at what the language already has.
 > watch your program's living state breathe
 
 `pulse` is a live dashboard of the cells themselves. Every atom, delay, derived,
-and vault is a cell; `pulse` shows the native vitals (how many cells are alive,
+and cache is a cell; `pulse` shows the native vitals (how many cells are alive,
 how many bytes they retain) as ground truth, and — for cells that opt in with
 `track` — a labelled, live table of their current values. Served into any app in
 dev mode with two route lines. It is deliberately a bold, dark instrument panel,
@@ -76,18 +76,18 @@ The names are chosen so the *power* is legible from the word:
 
 | namespace | verb | one word | what it means for you |
 |---|---|---|---|
-| `data.vault` | remember | keep | expensive results computed once, kept, and queryable |
+| `data.cache` | remember | keep | expensive results computed once, kept, and queryable |
 | `data.lens` | relate | follow | values that update themselves when their inputs move |
 | `data.pulse` | reveal | see | your program's living state, visible as it runs |
 
-A vault is where you *keep* things safe and retrievable. A lens is what you look
+A cache is where you *keep* things safe and retrievable. A lens is what you look
 *through* to see a value derived from others. A pulse is the *sign of life* you
 watch. Together they cover the three things that make data feel alive rather than
 inert: it persists, it connects, and it is observable.
 
 ## What is honest about `data`
 
-- **`vault`'s datalog index is heavier than a plain map.** You buy a queryable,
+- **`cache`'s datalog index is heavier than a plain map.** You buy a queryable,
   watchable catalog; for a cache of thousands that is a rounding error, for tens
   of millions you would sample or compact. Reach for it when the *question*
   "what is cached" matters as much as the values.
@@ -101,12 +101,12 @@ inert: it persists, it connects, and it is observable.
 
 ## Where to go next
 
-- `priv/lib/data/vault.bl.md` — the cache that remembers and can be queried.
+- `priv/lib/data/cache.bl.md` — the cache that remembers and can be queried.
 - `priv/lib/data/pulse.bl.md` — the dashboard that reveals living state.
 - `docs/memory-policy/08-one-cell-many-references.bl.md` — the one cell behind
   atom, delay, derived, and memoize, which everything in `data` stands on.
 - `docs/memory-policy/shared-lazy-values.bl.md` — why ownership follows
-  references, the property that makes a vault's hot tier reclaim itself.
+  references, the property that makes a cache.s hot tier reclaim itself.
 
 The thread through all of it: **one cell, many faces.** `data` is the family of
 faces that make a value remember, relate, and reveal.

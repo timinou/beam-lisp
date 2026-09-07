@@ -1,24 +1,30 @@
-# data.vault — compute once, keep forever, ask what you kept
+# data.cache — compute once, keep it, ask what you kept
 
-A cache usually hides its contents. You put things in, you get things out, and
-what is actually in there is a black box you clear when it misbehaves. `vault`
-refuses that. It is a content-addressed cache whose every entry is also a
-**fact in a small in-memory datalog database**, so the cache is *queryable*:
-what is cached, how large, how often it was hit, by which store, since when.
+At heart this is **memoisation**: give it a key and a thunk (a zero-argument
+function that computes a value), and it runs the thunk at most once per key,
+remembering the result. That is the whole job a cache does. The plain name is
+the honest one — it is a cache, so it is called `cache`.
 
-Three ideas, one module:
+What makes it worth a module rather than a one-off map is two additions on top
+of plain memoisation:
 
-- **Content addressing.** A value's identity is the hash of its inputs. Ask for
-  the same inputs, get the same slot — across processes, across restarts.
-- **Two tiers, one door.** A hot tier in memory (a native cell, reclaimed by
-  the garbage collector) sits in front of a durable tier on disk. You call one
-  function; the tiers negotiate.
-- **An index you can query.** Every put records a datom. The catalog of what is
-  cached is a datalog relation, not a private map — so observability is a
-  `q`, not a `println`.
+- **Content addressing + tiers, so "once" means once across restarts.** A key's
+  identity is the hash of its inputs, and a hot in-memory tier (a native cell,
+  reclaimed by the garbage collector) sits in front of an optional durable tier
+  on disk. Ordinary in-process `memoize` forgets everything when the VM stops;
+  a `cache` with a directory does not. Same inputs, same slot — this run and the
+  next.
+- **An index you can query.** Every entry is also a **fact in a small datalog
+  database**, so the catalog of what is cached is a `q`, not a black box you
+  clear when it misbehaves: what is stored, how large, how often hit, by which
+  store, since when.
+
+So: a cache, first and plainly. The content addressing makes it survive
+restarts; the datalog index makes it legible. Both serve the one idea —
+compute once, keep it.
 
 ```beam-lisp
-(ns data.vault
+(ns data.cache
   (:require [datom]))
 ```
 
