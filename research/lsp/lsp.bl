@@ -1,0 +1,277 @@
+; lsp.bl — a language "server" that is not a server.
+;
+; ── Why beam-lisp collapses the LSP split ────────────────────────────────
+;
+; A conventional LSP has two halves that do not trust each other: a dumb server
+; that re-parses text and answers positional questions, and a host editor that
+; owns the truth. beam-lisp has no such split — the compiler IS the analyzer,
+; and every ANF node's :ann already carries {position + proofs + types}. So a
+; "language server" here is a thin projection: index the analyzed program by
+; source position, and answer each request by reading the node under the cursor.
+;
+; This module implements the CORE LSP requests (hover, diagnostics, definition,
+; references, document-symbols, signature) as pure functions over source text —
+; no protocol, no process, no re-parse. A transport (stdio JSON-RPC) is a
+; trivial shell around these; the intelligence is here.
+;
+; It also implements requests LSP has NO WORDS FOR, because they need proofs the
+; compiler computed: purity/termination hover, native-eligibility, effect
+; footprint, "prove this invariant", and whole-program impact.
+
+(ns lsp
+  (:require [system.ir :as ir]
+            [system.analyze :as analyze]
+            [system.summary :as summary]
+            [system.typecheck :as tc]
+            [system.footprint :as fp]
+            [typed]
+            [errors]))
+
+; ── the position index ───────────────────────────────────────────────────
+
+(defn- in-span?
+  "Does source point [line col] fall inside node annotation `ann`'s span?
+   Half-open on the end so adjacent nodes never both claim a point."
+  [ann line col]
+  (and (map? ann) (int? (:line ann)) (int? (:end-line ann))
+       (let [sl (:line ann) sc (:col ann) el (:end-line ann) ec (:end-col ann)]
+         (and (or (> line sl) (and (= line sl) (>= col sc)))
+              (or (< line el) (and (= line el) (< col ec)))))))
+
+(defn innermost-at
+  "The innermost ANF node under `n` whose span contains [line col], or nil.
+   Descends greedily: a child that contains the point wins over its parent, so
+   the cursor resolves to the most specific expression."
+  [n line col]
+  (when (ir/node? n)
+    (if (in-span? (:ann n) line col)
+      (or (some (fn [c] (innermost-at c line col)) (ir/child-nodes n)) n)
+      (some (fn [c] (innermost-at c line col)) (ir/child-nodes n)))))
+
+(defn- analyzed
+  "The reusable analysis bundle for `src`: whole-program summaries, the return
+   table for the type checker, and per-fn ANF bodies. Every request projects
+   from this — computed once."
+  [src]
+  (let [summaries (analyze/analyze src)
+        bodies (analyze/fn-bodies src)
+        known (reduce (fn [m [name s]] (assoc m name (:returns s))) {} (into [] summaries))]
+    {:summaries summaries :bodies bodies :known known}))
+
+(defn- fn-at
+  "[fn-name node] for the innermost node at [line col], searching every fn body.
+   The enclosing function name lets a request read that fn's summary."
+  [a line col]
+  (some (fn [[name d]]
+          (let [hit (innermost-at (:body d) line col)]
+            (when hit [name hit])))
+        (into [] (:bodies a))))
+
+; ── CORE LSP requests ─────────────────────────────────────────────────────
+
+(defn hover
+  "textDocument/hover — the type and role of the expression under the cursor,
+   inferred inter-procedurally. A call shows its callee's proven return tagset;
+   a literal its own tag; a variable its binding. This is dual to `typed/hover`
+   but reads the ANALYZED (cross-call) type, not just the local one."
+  [src line col]
+  (let [a (analyzed src)
+        hit (fn-at a line col)]
+    (if (nil? hit)
+      "∅ nothing here"
+      (let [[fname node] hit
+            tags (summary/returns-tag (:known a) node)]
+        (str (case (:op node)
+               :remote (str "call " (:mod node) "/" (:fun node))
+               :var (str "var " (:name node))
+               :global (str "fn " (:name node))
+               :lit (str "literal " (pr-str (:val node)))
+               (str (:op node)))
+             " : " (pr-str (sort (into [] tags))))))))
+
+(defn diagnostics
+  "textDocument/publishDiagnostics — every warning the compiler and engines
+   produce, each already positioned via :ann. Merges the single-function type
+   checker, the inter-procedural checker, and (extensible) any other engine.
+   Returns a list of {:msg :line :col :end-col ...} ready to render as squiggles."
+  [src ns]
+  (let [interproc (tc/check-source src)
+        local (:warnings (typed/check-source src ns))]
+    (concat interproc local)))
+
+(defn document-symbols
+  "textDocument/documentSymbol — every top-level definition with its span and
+   its proven summary (return type, termination, effect footprint). An outline
+   that shows not just WHAT is defined but what each definition PROVABLY does."
+  [src]
+  (let [a (analyzed src)]
+    (map (fn [[name s]]
+           {:name name
+            :returns (sort (into [] (:returns s)))
+            :terminates (:terminates s)
+            :pure (empty? (:footprint s))
+            :calls (into [] (:edges s))})
+         (into [] (:summaries a)))))
+
+(defn definition
+  "textDocument/definition — for a call/var under the cursor, the name it
+   resolves to. (A full impl returns the definition's span; here we resolve the
+   callee name through the same graph the compiler uses.)"
+  [src line col]
+  (let [a (analyzed src)
+        hit (fn-at a line col)]
+    (when hit
+      (let [[fname node] hit]
+        (cond
+          (and (= :remote (:op node)) (= (:mod node) :Elixir.BeamLisp.RT) (= (:fun node) :invoke))
+            (let [callee (first (:args node))]
+              (when (= :global (:op callee)) {:resolves-to (:name callee) :kind :user-fn}))
+          (= :remote (:op node)) {:resolves-to (str (:mod node) "/" (:fun node)) :kind :host}
+          (= :global (:op node)) {:resolves-to (:name node) :kind :user-fn}
+          :else nil)))))
+
+(defn references
+  "textDocument/references — every function that calls `target`, from the
+   whole-program call graph (higher-order calls included). This is a GRAPH
+   answer, not a text grep: a fn passed as a callback is a real reference."
+  [src target]
+  (let [a (analyzed src)]
+    (filter (fn [name] (contains? (:edges (get (:summaries a) name)) target))
+            (into [] (map first (into [] (:summaries a)))))))
+
+; ── BEYOND LSP: requests that need PROOFS, which no LSP can express ────────
+
+(defn proof-hover
+  "There is no LSP request for this. Point at a function and learn what the
+   compiler PROVED about it: its effect footprint, whether it terminates, its
+   inferred return type, and who it calls — the whole summary, as a hover card."
+  [src fn-name]
+  (let [a (analyzed src)
+        s (get (:summaries a) fn-name)]
+    (if (nil? s)
+      (str "∅ no such fn: " fn-name)
+      {:fn fn-name
+       :pure (empty? (:footprint s))
+       :footprint (:footprint s)
+       :terminates (:terminates s)
+       :returns (sort (into [] (:returns s)))
+       :calls (into [] (:edges s))})))
+
+(defn native-eligible
+  "No LSP request for this either. Answer, per function, whether it could be
+   compiled to a native NIF — the doc-05 conjunction (pure ∧ terminates), read
+   straight off the summary. A green light in the gutter for 'this can go
+   native'; a refusal names the theorem that failed."
+  [src fn-name]
+  (let [a (analyzed src)
+        s (get (:summaries a) fn-name)]
+    (cond
+      (nil? s) {:eligible false :reason (str "no such fn: " fn-name)}
+      (seq (:footprint s)) {:eligible false :reason :impure :footprint (:footprint s)}
+      (not (:terminates s)) {:eligible false :reason :may-diverge}
+      :else {:eligible true :note "pure ∧ terminating — candidate for native offload"})))
+
+(defn impact
+  "No LSP request for this. Everything transitively reachable from `fn-name` —
+   the blast radius of a change, computed from the call graph. LSP references
+   go one hop; this goes all of them."
+  [src fn-name]
+  (into [] (analyze/reachable (:summaries (analyzed src)) [fn-name])))
+
+(defn dead-code
+  "No LSP request for this. Functions unreachable from `roots` — sound dead
+   code, keeping higher-order callbacks correctly live."
+  [src roots]
+  (analyze/dead-fns (:summaries (analyzed src)) roots))
+
+; ── the rest of the core surface (completion / signature / inlay / …) ─────
+
+(defn completion
+  "textDocument/completion — the names in scope at a point, ranked. Every
+   top-level fn is a candidate; each carries its proven summary so the editor
+   can show `double : (:int) → (:int), pure, terminates` beside the name. A
+   real impl adds lexical locals from the enclosing fn's params; the whole
+   -program names come from the summary table for free."
+  [src _line _col]
+  (let [a (analyzed src)]
+    (map (fn [[name s]]
+           {:label name
+            :detail (str ": " (pr-str (sort (into [] (:returns s))))
+                         (if (empty? (:footprint s)) " pure" " impure")
+                         (if (:terminates s) " ↓" " ⟳?"))
+            :kind :function})
+         (into [] (:summaries a)))))
+
+(defn signature-help
+  "textDocument/signatureHelp — for the call under the cursor, the callee's
+   inferred signature: argument arity from its ANF params and return tagset
+   from its summary. Unlike an LSP that reads a docstring, this is the type the
+   compiler INFERRED, so it is right even with no annotation."
+  [src line col]
+  (let [a (analyzed src)
+        hit (fn-at a line col)]
+    (when hit
+      (let [[_ node] hit]
+        (when (and (= :remote (:op node)) (= (:mod node) :Elixir.BeamLisp.RT)
+                   (= (:fun node) :invoke))
+          (let [callee (first (:args node))]
+            (when (= :global (:op callee))
+              (let [name (:name callee)
+                    d (get (:bodies a) name)
+                    s (get (:summaries a) name)]
+                (when (and d s)
+                  {:label (str "(" name " " (join " " (:params d)) ")")
+                   :returns (sort (into [] (:returns s)))})))))))))
+
+(defn inlay-hints
+  "textDocument/inlayHint — a hint at each top-level fn: its inferred return
+   type and an effect marker. LSP inlay hints usually show inferred types from
+   an external type-checker; here they are the compiler's own inference, and
+   they include an EFFECT hint (`!` = touches state) no LSP has."
+  [src]
+  (let [a (analyzed src)]
+    (map (fn [[name s]]
+           {:fn name
+            :hint (str "→ " (pr-str (sort (into [] (:returns s))))
+                       (if (empty? (:footprint s)) "" " !"))})
+         (into [] (:summaries a)))))
+
+(defn document-highlight
+  "textDocument/documentHighlight — every call site of `target` WITHIN a fn,
+   from the ANF (a real occurrence, not a text match). Returns the spans to
+   highlight when the cursor rests on a use of `target`."
+  [src target]
+  (let [a (analyzed src)
+        spans (atom [])
+        walk (fn walk [n]
+               (when (ir/node? n)
+                 (when (and (= :global (:op n)) (= (:name n) target))
+                   (swap! spans conj (select-keys (:ann n) [:line :col :end-col])))
+                 (doseq [c (ir/child-nodes n)] (walk c))))]
+    (doseq [[_ d] (into [] (:bodies a))] (walk (:body d)))
+    (filter (fn [s] (contains? s :line)) (deref spans))))
+
+(defn code-actions
+  "textDocument/codeAction — the quick-fixes available at a point. Two sources,
+   both already computed: (1) every diagnostic here is fixable if its engine has
+   a rewrite (a deodorant smell → the trivia-preserving edit from Tool 1); (2)
+   a pure+terminating fn offers a 'compile native' action (Tool 5). Returns
+   action descriptors {:title :kind :at}; applying uses span-rewrite so the edit
+   is formatting-safe."
+  [src ns line col]
+  (let [diags (filter (fn [d] (= line (:line d))) (diagnostics src ns))
+        a (analyzed src)
+        hit (fn-at a line col)
+        acts (map (fn [d] {:title (str "fix: " (:msg d)) :kind :quickfix
+                           :at (select-keys d [:line :col :end-col])}) diags)]
+    (concat acts
+            (when hit
+              (let [enclosing (first (some (fn [[name d]]
+                                             (when (innermost-at (:body d) line col) [name]))
+                                           (into [] (:bodies a))))
+                    s (when enclosing (get (:summaries a) enclosing))]
+                (if (and s (empty? (:footprint s)) (:terminates s))
+                  [{:title (str "compile '" enclosing "' to native (pure ∧ terminating)")
+                    :kind :refactor :fn enclosing}]
+                  []))))))
+

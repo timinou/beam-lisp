@@ -1,0 +1,217 @@
+; cfa.bl — PROTOTYPE: make higher-order calls transparent via 0-CFA over bl-ANF.
+;
+; ── The problem ─────────────────────────────────────────────────────────
+;
+; codebase_reach.bl proved surface-name and single-ANF-node call extraction
+; both give up on higher-order dispatch: `(apply-twice inc 5)` records a call to
+; `apply-twice`, but the call to `inc` — made INSIDE apply-twice through its
+; parameter `f` — is invisible. The callee is a runtime VALUE, not a name, so
+; no amount of syntactic walking finds it.
+;
+; ── The answer: flow, not names ─────────────────────────────────────────
+;
+; Don't ask "what name is in call position?" — ask "which functions can FLOW to
+; this call position?". That is control-flow analysis (0-CFA). bl-ANF is the
+; ideal substrate:
+;   * every local is alpha-renamed → a globally-unique flow variable, free;
+;   * every call argument is atomic (a :var/:global/:lit), so an argument that
+;     is a function is literally a (:global g) node we can see flow in;
+;   * `(f x)` is RT/invoke with args (callee, arglist) — the callee slot is
+;     exactly the position whose inhabitants we solve for.
+;
+; The abstract value of a flow variable is a SET OF TOP-LEVEL FUNCTION NAMES
+; that can reach it. Constraints (least-fixpoint):
+;   (:global g), g a known defn         ⟹ {g} ⊑ AV(node)
+;   let x = e                           ⟹ AV(e) ⊑ AV(x)
+;   invoke callee (a0 a1 …), g ∈ AV/lit ⟹ for each g resolvable:
+;                                            AV(aᵢ) ⊑ AV(paramᵢ of g)   (arg flow)
+;                                            edge caller → g              (CALL GRAPH)
+;                                            AV(ret of g) ⊑ AV(call)      (return flow)
+; Iterate to a fixpoint. The edges discovered include the ones through
+; higher-order parameters — the call graph is now COMPLETE for statically-known
+; function values (a closract passed as data is resolved; a function chosen by
+; runtime I/O remains, honestly, unknown).
+
+(ns research.anf-engines.cfa
+  (:require [compiler :as c] [system.ir :as ir] [typed]))
+
+(def rt :Elixir.BeamLisp.RT)
+
+(declare headname node-av step-node)
+
+; ── extract defns as {name → {:params [names] :body node}} ───────────────
+;
+; A defn compiles to an intern call, so we compile the equivalent
+; (fn [params] body) and peel the self-application scaffold to recover the
+; param names and the real body.
+
+(defn- peel-fn
+  "Param-name list and body node of a compiled (fn [params] body)."
+  [compiled]
+  (let [f (if (= :let (:op compiled)) (:body compiled) compiled)
+        clause (first (:clauses f))]
+    {:params (map :name (:pats clause)) :body (:body clause)}))
+
+(defn- defn-index [src]
+  (reduce
+    (fn [m form]
+      (if (contains? #{"defn" "defn-"} (headname form))
+        (let [items (typed/node-items (typed/node-form form))
+              name (typed/node-name (typed/node-form (second items)))
+              parsed (nth (typed/defn-clauses items) 2)
+              c0 (first parsed)
+              params (:params c0)
+              body (last (:body c0))
+              fn-form (typed/->tuple [:list (apply list
+                        (concat (list (typed/sym-node "fn")
+                                      (typed/->tuple [:vector (apply list params)]))
+                                (list body)))])
+              compiled (c/compile-node fn-form (c/new-env (str "cfa-" name)))]
+          (assoc m name (peel-fn compiled)))
+        m))
+    {} (BeamLisp.Reader/read_string src)))
+
+(defn- headname [form]
+  (let [f (typed/node-form form)]
+    (if (= :list (typed/node-tag f))
+      (let [its (typed/node-items f)]
+        (if (and (seq its) (= :symbol (typed/node-tag (typed/node-form (first its)))))
+          (typed/node-name (typed/node-form (first its))) nil))
+      nil)))
+
+; ── the abstract cache: {flowvar → #{fn-names}} + call edges ─────────────
+;
+; flowvar = a local var name (unique), [:param name] (same space — params ARE
+; locals in the compiled body), [:ret fn-name], or [:call fn-name] for the value
+; of a call. Because ANF alpha-renames, a bare name is a fine global key.
+
+(defn- av [cache k] (get cache k #{}))
+(defn- join [s1 s2] (into s1 s2))
+
+; walk a cons-list ANF node into a vector of element nodes
+(defn- cons->vec [node]
+  (loop [n node acc []]
+    (if (= :cons (:op n))
+      (recur (:tail n) (conj acc (:head n)))
+      acc)))
+
+; the abstract value of an ATOM in call/arg position: the fns it may denote
+(defn- atom-av [defns cache node]
+  (cond
+    (= :global (:op node)) (if (contains? defns (:name node)) #{(:name node)} #{})
+    (= :var (:op node))    (av cache (:name node))
+    :else #{}))
+
+; ── one pass: fold constraints from every node of every defn body ────────
+
+(defn- step-node [defns state fname node]
+  ; state = {:cache … :edges #{[caller callee]}}
+  (if (not (ir/node? node))
+    state
+    (let [op (:op node)]
+      (cond
+        (= op :let)
+          (let [s1 (step-node defns state fname (:init node))
+                cache (:cache s1)
+                ; AV(init) ⊑ AV(name)
+                initav (node-av defns cache (:init node))
+                cache2 (assoc cache (:name node) (join (av cache (:name node)) initav))]
+            (step-node defns (assoc s1 :cache cache2) fname (:body node)))
+
+        (and (= op :remote) (= (:mod node) rt) (= (:fun node) :invoke))
+          (let [args (:args node)
+                callee (first args)
+                actuals (if (>= (count args) 2) (cons->vec (second args)) [])
+                ; first recurse into callee + actuals to populate their AVs
+                s1 (reduce (fn [s a] (step-node defns s fname a))
+                           (step-node defns state fname callee) actuals)
+                cache (:cache s1)
+                targets (atom-av defns cache callee)
+                ; for each resolvable target: arg-flow, edge, return-flow
+                s2 (reduce
+                     (fn [s g]
+                       (let [gdef (get defns g)
+                             params (:params gdef)
+                             c (:cache s)
+                             ; AV(actualᵢ) ⊑ AV(paramᵢ)
+                             c2 (reduce (fn [cc [p a]]
+                                          (assoc cc p (join (av cc p) (node-av defns cc a))))
+                                        c (map (fn [p a] [p a]) params actuals))]
+                         (assoc s :cache c2
+                                  :edges (conj (:edges s) [fname g]))))
+                     s1 (into [] targets))]
+            s2)
+
+        (and (= op :remote))
+          ; a direct resolved call to [mod fun]: record the edge (module call),
+          ; then recurse args
+          (let [callee-name (str (:mod node) "/" (:fun node))
+                s0 (assoc state :edges (conj (:edges state) [fname callee-name]))]
+            (reduce (fn [s a] (step-node defns s fname a)) s0 (:args node)))
+
+        :else
+          (reduce (fn [s ch] (step-node defns s fname ch)) state (ir/child-nodes node))))))
+
+; AV of an arbitrary node (not just an atom): a global/var atom, else empty
+; (a call's value would need [:call …]; kept minimal for the prototype).
+(defn- node-av [defns cache node]
+  (atom-av defns cache node))
+
+; ── fixpoint ─────────────────────────────────────────────────────────────
+
+(defn analyze [src]
+  (let [defns (defn-index src)
+        init {:cache {} :edges #{}}]
+    (loop [state init n 0]
+      (let [next (reduce (fn [s [fname gdef]]
+                           (step-node defns s fname (:body gdef)))
+                         state (into [] defns))]
+        (if (or (= (:cache next) (:cache state)) (> n 8))
+          next
+          (recur next (+ n 1)))))))
+
+; ── measure ──────────────────────────────────────────────────────────────
+
+(defn- mark [x] (println (str "CFA " x)))
+
+; Corpus: apply-twice takes a function f and calls it. main passes inc.
+; The edge apply-twice → inc exists ONLY through the higher-order parameter.
+(def src
+  "(defn inc2 [n] (erlang/+ n 1))
+   (defn apply-twice [f x] (f (f x)))
+   (defn main [] (apply-twice inc2 5))
+   (defn compose [g h] (fn [x] (g (h x))))")
+
+(def result (analyze src))
+(mark (str "edges: " (pr-str (sort (into [] (:edges result))))))
+(mark (str "apply-twice→inc2 present: "
+           (contains? (:edges result) ["apply-twice" "inc2"])
+           "  ← the higher-order call, made transparent"))
+(mark (str "main→apply-twice present: "
+           (contains? (:edges result) ["main" "apply-twice"])))
+
+; ── hard case 1: POLYMORPHIC call site — two fns flow to the same param ──
+; A sound analysis must report BOTH edges (dispatch/dbl both reach `f`).
+(def poly-src
+  "(defn dispatch [n] (erlang/+ n 1))
+   (defn dbl [n] (erlang/* n 2))
+   (defn run [f x] (f x))
+   (defn use-a [] (run dispatch 5))
+   (defn use-b [] (run dbl 7))")
+(def pr1 (analyze poly-src))
+(mark (str "\nPOLYMORPHIC run→{dispatch,dbl}: "
+           (contains? (:edges pr1) ["run" "dispatch"]) " "
+           (contains? (:edges pr1) ["run" "dbl"])
+           "  ← both call targets found (sound over-approx)"))
+
+; ── hard case 2: HONEST OPACITY — fn chosen by runtime value ──
+; `(pick-op tag)` returns a function decided at runtime. The analysis must NOT
+; invent an edge it cannot justify — unknown stays unknown.
+(def opaque-src
+  "(defn add1 [n] (erlang/+ n 1))
+   (defn runtime-call [chooser x] ((chooser) x))
+   (defn go [] (runtime-call some-external-thing 5))")
+(def or1 (analyze opaque-src))
+(mark (str "OPAQUE edges from runtime-call: "
+           (pr-str (sort (into [] (filter (fn [e] (= (first e) "runtime-call")) (:edges or1)))))
+           "  ← no invented edge to add1 (honest unknown)"))

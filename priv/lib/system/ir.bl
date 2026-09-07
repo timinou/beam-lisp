@@ -1,0 +1,248 @@
+; ir.bl — the shared substrate for proof engines that read bl-ANF.
+;
+; ── Why this exists ──────────────────────────────────────────────────────
+;
+; The proof engines (footprint, termination, model, smt, typed) historically
+; read the SURFACE reader-node tree — the s-expression before macro expansion.
+; That made each engine re-implement a slice of the compiler: it had to know
+; what `->`, `when`, `doto`, `if-let` mean, and it gave up (→ :opaque-world)
+; on anything it had not taught itself. The compiler ALREADY expanded every
+; macro and resolved every symbol when it produced bl-ANF. Reading the IR
+; instead means one meaning for a program, computed once, by the compiler.
+;
+; This namespace is the vocabulary that reading holds in common:
+;
+;   * NODE ACCESS   — child-nodes, an op-agnostic structural view
+;   * ALIAS ENV     — because ANF names every intermediate, a resource op
+;                     sees a fresh local (`r`), not the global it stands for.
+;                     The alias env carries {local-name → resource-it-aliases};
+;                     a local bound to a COMPUTED value is not a nameable
+;                     resource (→ :opaque-world), exactly the surface rule for
+;                     a non-symbol argument.
+;   * ANNOTATE      — write a proof into every node's :ann, EAGERLY (the
+;                     descriptor boundary refuses a LazySeq).
+;
+; The field names below are the anf.bl vocabulary verbatim:
+;   :tuple :elems · :map :pairs [[k v]…] · :struct :fields [[k v]…]
+;   clause {:pats [pat…] :guard n|nil :body n} · pattern {:pop …}
+; Getting these wrong silently walks nothing, so they live in ONE place.
+
+(ns system.ir)
+
+; ── opaque top ────────────────────────────────────────────────────────────
+;
+; A resource we cannot name (a computed value, an unknown callee's world)
+; collapses to this single top. Engines that care (footprint) treat it as
+; conflicting with everything; engines that do not simply ignore it.
+(def opaque-world :opaque-world)
+
+; ── node access ─────────────────────────────────────────────────────────
+
+(defn node? [n] (and (map? n) (contains? n :op)))
+
+(defn op [n] (:op n))
+
+(defn child-nodes
+  "The immediate executable child NODES of `n`, in evaluation order, flat.
+   Clause bodies/guards are included; patterns are NOT nodes (they bind, they
+   do not evaluate). nil children (an absent :else already defaults to a nil
+   literal in real ANF, but :try/:recv :after may be nil) are dropped. This is
+   the op-agnostic spine every generic traversal folds over."
+  [n]
+  (let [o (:op n)]
+    (cond
+      (contains? #{:lit :var :global :enil} o) (list)
+      (= o :remote) (:args n)
+      (= o :apply)  (cons (:fn n) (:args n))
+      (= o :let)    (list (:init n) (:body n))
+      (= o :if)     (list (:test n) (:then n) (:else n))
+      (= o :do)     (:stmts n)
+      (= o :case)   (cons (:subj n) (clause-children (:clauses n)))
+      (= o :fn)     (clause-children (:clauses n))
+      (= o :try)    (finite-concat (list (:body n)) (clause-children (:catch n))
+                                   (if (nil? (:after n)) (list) (list (:after n))))
+      (= o :recv)   (finite-concat (clause-children (:clauses n))
+                                   (if (nil? (:timeout n)) (list) (list (:timeout n)))
+                                   (if (nil? (:after n)) (list) (list (:after n))))
+      (= o :tuple)  (:elems n)
+      (= o :map)    (pair-children (:pairs n))
+      (= o :cons)   (list (:head n) (:tail n))
+      (= o :struct) (pair-children (:fields n))
+      :else (list))))
+
+(defn- finite-concat [& xs] (apply concat xs))
+
+(defn- clause-children
+  "The guard (when present) and body node of every clause, flat."
+  [clauses]
+  (reduce (fn [acc cl]
+            (finite-concat acc
+                           (if (nil? (:guard cl)) (list) (list (:guard cl)))
+                           (list (:body cl))))
+          (list) clauses))
+
+(defn- pair-children
+  "Both node halves of every [k v] pair, flat."
+  [pairs]
+  (reduce (fn [acc pair] (finite-concat acc (list (first pair) (second pair)))) (list) pairs))
+
+; ── pattern variables (for scope shadowing) ───────────────────────────────
+
+(defn pattern-vars
+  "Every :pvar name bound by pattern `p`, recursively. A clause binding these
+   introduces COMPUTED locals: any alias of the same name must be shadowed."
+  [p]
+  (let [o (:pop p)]
+    (cond
+      (= o :pvar)    (list (:name p))
+      (= o :ptuple)  (mapcat pattern-vars (:elems p))
+      (= o :pcons)   (finite-concat (pattern-vars (:head p)) (pattern-vars (:tail p)))
+      (= o :palias)  (finite-concat (pattern-vars (:a p)) (pattern-vars (:b p)))
+      (= o :pmap)    (mapcat (fn [pair] (pattern-vars (second pair))) (:pairs p))
+      (= o :pstruct) (mapcat (fn [pair] (pattern-vars (second pair))) (:fields p))
+      :else (list))))
+
+(defn clause-pattern-vars
+  "Every var bound across all of a clause's :pats."
+  [cl]
+  (mapcat pattern-vars (:pats cl)))
+
+; ── alias environment ──────────────────────────────────────────────────────
+;
+; env : {local-name(binary) → resource-name(binary) | :opaque-world}
+; A resource is nameable when it is a GLOBAL (its author name) or a local that
+; ALIASES a global. Anything else — a computed value — is unnameable.
+
+(def empty-aliases {})
+
+(defn resource-of
+  "The resource named by argument node `a0` under alias env `aliases`:
+   a :global's author name, a :var's alias (or opaque if the local is a
+   computed value), else :opaque-world."
+  [aliases a0]
+  (cond
+    (nil? a0) opaque-world
+    (= :global (:op a0)) (:name a0)
+    (= :var (:op a0)) (get aliases (:name a0) opaque-world)
+    :else opaque-world))
+
+(defn alias-for
+  "What a let-bound local stands for when its init is a pure reference:
+   a global's name, or the alias the init var already carries. nil when the
+   init is a COMPUTED value (the local is then not a nameable resource)."
+  [aliases init]
+  (cond
+    (= :global (:op init)) (:name init)
+    (= :var (:op init))    (get aliases (:name init))
+    :else nil))
+
+(defn let-env
+  "The alias env for a :let body: bind the new local to what its init aliases,
+   or shadow any prior alias of that name when the init is computed."
+  [aliases let-node]
+  (let [al (alias-for aliases (:init let-node))]
+    (if (nil? al) (dissoc aliases (:name let-node)) (assoc aliases (:name let-node) al))))
+
+(defn clause-env
+  "The alias env inside a clause body: every pattern var is a computed local,
+   so shadow any alias it collides with."
+  [aliases cl]
+  (reduce (fn [al v] (dissoc al v)) aliases (clause-pattern-vars cl)))
+
+; ── loop desugaring recognition ────────────────────────────────────────────
+;
+; The compiler lowers `(loop [v INIT…] BODY)` / `(recur V…)` to a Y-combinator
+; self-application (compiler.bl self-apply/compile-recur):
+;
+;   loop  → (apply (let loop_N (fn [self] (fn [v…] BODY')) …) INIT…)
+;   recur → (apply (apply (var loop_N) [(var loop_N)]) V…)
+;
+; Both engines that read loops (footprint, termination) must see through this
+; plumbing, so the recognisers live here in the shared substrate.
+
+(defn- self-fn? [n]
+  (and (map? n) (= :fn (:op n)) (= 1 (count (:clauses n)))
+       (= 1 (count (:pats (first (:clauses n)))))))
+
+(defn anf-loop?
+  "Is `n` a compiled loop scaffold?
+   (apply (let loop_N (fn [self] (fn [v…] body)) …) inits)"
+  [n]
+  (and (map? n) (= :apply (:op n))
+       (let [f (:fn n)]
+         (and (map? f) (= :let (:op f)) (self-fn? (:init f))
+              (= :fn (:op (:body (first (:clauses (:init f))))))))))
+
+(defn loop-parts
+  "{:self :vars :body :inits} of a recognised loop scaffold `n`."
+  [n]
+  (let [f (:fn n)
+        inner (:body (first (:clauses (:init f))))
+        clause (first (:clauses inner))]
+    {:self  (:name f)
+     :vars  (map :name (:pats clause))
+     :body  (:body clause)
+     :inits (:args n)}))
+
+(defn recur?
+  "Is `n` a back-edge to loop `self`? (apply (apply (var self) [(var self)]) V…).
+   With `self` nil, matches the structural shape of ANY recur."
+  ([n] (recur? n nil))
+  ([n self]
+   (and (map? n) (= :apply (:op n))
+        (let [g (:fn n)]
+          (and (map? g) (= :apply (:op g)) (map? (:fn g)) (= :var (:op (:fn g)))
+               (or (nil? self) (= self (:name (:fn g)))))))))
+
+(defn recur-vals
+  "The next-value NODES of a recur (its outer apply args)."
+  [n]
+  (:args n))
+
+; ── annotate: write a proof onto the IR ────────────────────────────────────
+
+(defn- eager [xs] (apply list xs))
+
+(defn ann-put
+  "Return node `n` with key `k` = `v` added to its :ann. A no-op on non-nodes."
+  [n k v]
+  (if (node? n) (assoc n :ann (assoc (or (:ann n) {}) k v)) n))
+
+(defn ann-get [n k] (get (:ann n) k))
+
+(defn annotate
+  "Recursively rewrite every executable node under `n`, calling
+   `(f node)` → value and storing it at `(:ann node) k`. Bottom-up: children
+   are annotated first, so `f` may read child annotations. Collection fields
+   are rebuilt EAGERLY — the descriptor boundary (anf/module) refuses a
+   LazySeq, so `annotate` must never introduce one."
+  [f k n]
+  (if (not (node? n)) n
+    (let [rebuilt (reduce
+                    (fn [m field]
+                      (let [v (get m field)]
+                        (assoc m field
+                          (cond
+                            (node? v) (annotate f k v)
+                            (list? v)   (eager (map (fn [x] (annotate-child f k x)) v))
+                            (vector? v) (into [] (map (fn [x] (annotate-child f k x)) v))
+                            :else v))))
+                    n (keys n))]
+      (ann-put rebuilt k (f rebuilt)))))
+
+(defn- annotate-child
+  "Annotate a value that may be a node, a clause map, or a [k v] pair vector."
+  [f k x]
+  (cond
+    (node? x) (annotate f k x)
+    ; a clause: {:pats :guard :body} — recurse into guard/body only
+    (and (map? x) (contains? x :body) (contains? x :pats))
+      (let [g (:guard x) b (:body x)]
+        (assoc x :guard (if (node? g) (annotate f k g) g)
+                 :body (if (node? b) (annotate f k b) b)))
+    ; a [k v] pair (map/struct field): both halves may be nodes
+    (and (vector? x) (= 2 (count x)))
+      (into [] (map (fn [y] (if (node? y) (annotate f k y) y)) x))
+    (list? x)   (eager (map (fn [y] (annotate-child f k y)) x))
+    (vector? x) (into [] (map (fn [y] (annotate-child f k y)) x))
+    :else x))

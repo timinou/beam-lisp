@@ -1,0 +1,194 @@
+; analyze.bl — the whole-program inter-procedural pass. ONE call graph, ONE
+; fixpoint, feeding every engine.
+;
+; ── What it produces ────────────────────────────────────────────────────
+;
+; Given a source, analyze builds {fn-name → summary} where each summary
+; ({:footprint :terminates :returns :calls}) is computed with EVERY callee's
+; summary substituted — the inter-procedural closure of system.summary. A
+; caller's footprint now includes its callees' footprints; a caller's return
+; type flows from its callees' returns; a higher-order call is resolved through
+; the flow facts (0-CFA) so a function reached only through a parameter is still
+; in the graph.
+;
+; ── Why a fixpoint ──────────────────────────────────────────────────────
+;
+; Summaries are mutually dependent: f's footprint depends on g's, and with
+; recursion g's may depend on f's. So we iterate: start every function at the
+; empty/bottom summary, recompute all summaries from the current table, repeat
+; until nothing changes. Monotonicity (footprints only grow toward
+; :opaque-world, tagsets toward `any`) guarantees a fixpoint; a round cap is the
+; belt-and-suspenders bound.
+;
+; ── Soundness ───────────────────────────────────────────────────────────
+;
+; A function truly reachable only at runtime (chosen by I/O) stays unresolved —
+; the flow set for its call site is empty and the call contributes
+; :opaque-world / `any`. Sound over-approximation: the graph never MISSES a
+; statically-knowable edge and never INVENTS one it cannot justify.
+
+(ns system.analyze
+  (:require [system.ir :as ir]
+            [system.summary :as summary]
+            [compiler :as c]
+            [typed]))
+
+(def rt :Elixir.BeamLisp.RT)
+
+; ── extract every function body as ANF ───────────────────────────────────
+
+(defn- headname [form]
+  (let [f (typed/node-form form)]
+    (if (= :list (typed/node-tag f))
+      (let [its (typed/node-items f)]
+        (if (and (seq its) (= :symbol (typed/node-tag (typed/node-form (first its)))))
+          (typed/node-name (typed/node-form (first its))) nil))
+      nil)))
+
+(defn fn-bodies
+  "{name → {:params [names] :body anf}} for every single-clause defn/defn- in
+   src. Multi-clause and higher-arity are summarized on their last clause body
+   (the spike scope; a production pass unions all clauses)."
+  [src]
+  (reduce
+    (fn [m form]
+      (if (contains? #{"defn" "defn-"} (headname form))
+        (let [items (typed/node-items (typed/node-form form))
+              name (typed/node-name (typed/node-form (second items)))
+              parsed (nth (typed/defn-clauses items) 2)
+              c0 (first parsed)
+              params (:params c0)
+              body-forms (:body c0)
+              ; compile a (fn [params] body…) and peel to the clause body
+              fn-form (typed/->tuple
+                        [:list (apply list
+                          (concat (list (typed/sym-node "fn")
+                                        (typed/->tuple [:vector (apply list params)]))
+                                  body-forms))])
+              compiled (c/compile-node fn-form (c/new-env (str "an-" name)))
+              peeled (if (= :let (:op compiled)) (:body compiled) compiled)
+              clause (first (:clauses peeled))]
+          (assoc m name {:params (map :name (:pats clause)) :body (:body clause)}))
+        m))
+    {} (BeamLisp.Reader/read_string src)))
+
+; ── flow facts: which functions can reach each variable (0-CFA) ──────────
+;
+; A param bound to a global fn (passed as an argument) flows that fn's name to
+; the param. We compute a coarse per-program flow map {var-name → #{fn-names}}
+; by scanning every call's actuals against the callee's params.
+
+(defn- cons->vec [node]
+  (loop [n node acc []]
+    (if (= :cons (:op n)) (recur (:tail n) (conj acc (:head n))) acc)))
+
+(defn- atom-fns [defns flow node]
+  (cond
+    (= :global (:op node)) (if (contains? defns (:name node)) #{(:name node)} #{})
+    (= :var (:op node)) (get flow (:name node) #{})
+    :else #{}))
+
+(defn- flow-step [defns flow fname node]
+  (cond
+    (not (ir/node? node)) flow
+    (= :let (:op node))
+      (let [f1 (flow-step defns flow fname (:init node))
+            fv (atom-fns defns f1 (:init node))
+            f2 (if (empty? fv) f1 (assoc f1 (:name node) (into (get f1 (:name node) #{}) fv)))]
+        (flow-step defns f2 fname (:body node)))
+    (and (= :remote (:op node)) (= (:mod node) rt) (= (:fun node) :invoke))
+      (let [args (:args node)
+            callee (first args)
+            actuals (if (>= (count args) 2) (cons->vec (second args)) [])
+            f1 (reduce (fn [fl a] (flow-step defns fl fname a)) flow actuals)
+            targets (atom-fns defns f1 callee)]
+        (reduce (fn [fl g]
+                  (let [gdef (get defns g)
+                        params (:params gdef)]
+                    (reduce (fn [ff [p a]]
+                              (let [av (atom-fns defns ff a)]
+                                (if (empty? av) ff (assoc ff p (into (get ff p #{}) av)))))
+                            fl (map (fn [p a] [p a]) params actuals))))
+                f1 (into [] targets)))
+    :else (reduce (fn [fl ch] (flow-step defns fl fname ch)) flow (ir/child-nodes node))))
+
+(defn- flow-facts [defns]
+  (loop [flow {} n 0]
+    (let [next (reduce (fn [fl [fname d]] (flow-step defns fl fname (:body d))) flow (into [] defns))]
+      (if (or (= next flow) (> n 8)) next (recur next (inc n))))))
+
+; ── the summary fixpoint ─────────────────────────────────────────────────
+;
+; returns-table : {fn → :returns tagset}. Iterate summarize until stable.
+; footprint closure: a caller's footprint joins every resolved callee's.
+
+(defn- resolve-calls
+  "Concrete callee fn-names a call key denotes: a bare name is itself; a
+   [:flow v] resolves through flow facts; a [mod fun] host op is not a user fn."
+  [defns flow k]
+  (cond
+    (and (erlang/is_binary k) (contains? defns k)) #{k}
+    (and (BeamLisp.RT/vector? k) (= :flow (first k))) (get flow (second k) #{})
+    :else #{}))
+
+(defn analyze
+  "Whole-program summaries: {fn-name → {:footprint :terminates :returns :calls
+   :edges}} with inter-procedural closure. `src` is source text.
+
+   Each round recomputes every function's summary with two tables from the
+   PREVIOUS round substituted: `returns` (callee return tagsets) and `fps`
+   (callee footprints, via a resolver passed to system.footprint). A caller's
+   footprint therefore GROWS to include its callees' resources; recursion reads
+   the in-progress footprint and converges monotonically. Iterates to a fixpoint
+   (a round cap bounds pathological cases)."
+  [src]
+  (let [defns (fn-bodies src)
+        flow (flow-facts defns)
+        names (into [] (map first defns))]
+    (loop [returns {} fps {} n 0]
+      ; a footprint resolver over the PREVIOUS round's fps: a resolved user call
+      ; contributes its callee's known footprint; an unresolved one stays opaque.
+      (let [fp-resolve (fn [callee-name]
+                         (if (contains? fps callee-name) (get fps callee-name) :unknown))
+            locals (reduce (fn [m [name d]]
+                             (assoc m name (summary/summarize returns fp-resolve (:body d))))
+                           {} (into [] defns))
+            returns2 (reduce (fn [m name] (assoc m name (:returns (get locals name)))) {} names)
+            fps2 (reduce (fn [m name] (assoc m name (:footprint (get locals name)))) {} names)]
+        (if (or (and (= returns2 returns) (= fps2 fps)) (> n 12))
+          ; final table: local summary + resolved call edges
+          (reduce (fn [m name]
+                    (let [loc (get locals name)
+                          resolved (reduce (fn [s k] (into s (resolve-calls defns flow k)))
+                                           #{} (into [] (:calls loc)))]
+                      (assoc m name (assoc loc :edges resolved))))
+                  {} names)
+          (recur returns2 fps2 (inc n)))))))
+
+; ── the call/flow graph (for reachability / dead-code / impact) ──────────
+
+(defn call-graph
+  "{caller → #{callee fn-names}} — the resolved inter-procedural edges,
+   including higher-order calls. A function reachable only through a parameter
+   IS an edge here."
+  [summaries]
+  (reduce (fn [m [name s]] (assoc m name (:edges s))) {} (into [] summaries)))
+
+(defn reachable
+  "Every fn-name reachable from `roots` through the call graph (transitive)."
+  [summaries roots]
+  (let [g (call-graph summaries)]
+    (loop [seen (set roots) frontier (into [] roots)]
+      (if (empty? frontier)
+        seen
+        (let [n (first frontier)
+              nexts (filter (fn [x] (not (contains? seen x))) (into [] (get g n #{})))]
+          (recur (into seen nexts) (concat (rest frontier) nexts)))))))
+
+(defn dead-fns
+  "Functions never reached from `roots` — sound dead code, including through
+   higher-order calls (a fn used only as a callback is correctly LIVE)."
+  [summaries roots]
+  (let [live (reachable summaries roots)]
+    (filter (fn [name] (not (contains? live name)))
+            (into [] (map first (into [] summaries))))))

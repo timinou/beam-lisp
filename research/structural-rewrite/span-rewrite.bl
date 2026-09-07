@@ -1,0 +1,160 @@
+; span_rewrite.bl — trivia-preserving structural rewrite over the reader's
+; end-spans. The fix for deodorant/fix-source's `pr-str` collapse.
+;
+; ── The problem ──────────────────────────────────────────────────────────
+;
+; fix-source splices (pr-str fixed) at a smell's span. pr-str re-renders the
+; WHOLE matched subtree on one line — so a multi-line captured argument, and
+; every comment inside it, is destroyed. Measured: an engine-file sweep dropped
+; ir 249→238, model 364→340, smt 533→496 lines (comments gone). A blanket run
+; is unusable; only single-line smells splice cleanly.
+;
+; ── The fix, from first principles ───────────────────────────────────────
+;
+; Every reader node now carries a full source span {:line :col :end-line
+; :end-col} (Phase 1). A rewrite rule's capture variables (?x) bind to whole
+; sub-NODES. So to rewrite (if (not ?p) ?a ?b) → (if-not ?p ?a ?b), we DO NOT
+; re-print ?p/?a/?b — we slice their ORIGINAL source bytes out of the file and
+; splice them into the new skeleton. Only the rule's own literal tokens
+; (`if`→`if-not`) are newly rendered. Untouched captures stay byte-identical:
+; multi-line shape, indentation, and comments all survive.
+;
+; A capture whose node lacks an end-span (a bare scalar the reader did not
+; wrap — `nil`, a number) has no trivia to preserve, so it falls back to
+; pr-str of that leaf. The skeleton is small and single-line by construction.
+
+(ns span-rewrite
+  (:require [reader-node :as rn] [rewrite :as rw]))
+
+; ── source index: line → starting codepoint offset ───────────────────────
+
+(defn line-offsets
+  "A map {line-number → codepoint offset where that line starts}. One left-to
+   -right scan; line 1 starts at 0, each newline opens the next line."
+  [src]
+  (loop [cs (String/codepoints src) i 0 line 1 offs {1 0}]
+    (if (empty? cs)
+      offs
+      (if (= "\n" (first cs))
+        (recur (rest cs) (inc i) (inc line) (assoc offs (inc line) (inc i)))
+        (recur (rest cs) (inc i) line offs)))))
+
+(defn- has-span? [pos]
+  (and (map? pos)
+       (int? (:line pos)) (int? (:col pos))
+       (int? (:end-line pos)) (int? (:end-col pos))))
+
+(defn slice-node
+  "The ORIGINAL source text of node `n`, sliced from `src` by its span. When
+   the node carries no end-span (a bare scalar), fall back to pr-str of the
+   node's form — a leaf has no trivia to preserve. `cps` is the codepoint
+   vector of src, `offs` its line-offset index (both hoisted so a whole-tree
+   rewrite indexes once)."
+  [src cps offs n]
+  (let [pos (rn/node-pos n)]
+    (if (has-span? pos)
+      (let [start (+ (get offs (:line pos)) (- (:col pos) 1))
+            end   (+ (get offs (:end-line pos)) (- (:end-col pos) 1))]
+        (apply str (subvec cps start end)))
+      ; no span → a leaf; render its data form (nil/number/keyword/symbol)
+      (pr-str (rn/form (rn/node-form n))))))
+
+; ── the rewrite ──────────────────────────────────────────────────────────
+;
+; A rule is {:pattern node-pattern :skeleton fn}. The pattern is matched
+; STRUCTURALLY against reader nodes (via node-match below), binding each ?var
+; to the matched sub-node. The skeleton fn receives a `slice` function
+; (?var-node → original source text) and returns the replacement TEXT. Because
+; the skeleton composes original slices, everything the rule did not name
+; stays byte-identical.
+
+(defn- pvar? [n]
+  (and (= :symbol (rn/node-tag (rn/node-form n)))
+       (let [nm (rn/node-name (rn/node-form n))]
+         (and (> (String/length nm) 0) (= "?" (String/slice nm 0 1))))))
+
+(defn- slice-key
+  "A structural identity for a node, for pvar re-unification: its data form."
+  [n]
+  (pr-str (rn/form (rn/node-form n))))
+
+(defn node-match
+  "Match reader-node `n` against node-pattern `pat`, threading `binds`
+   {pvar-name → matched-node}. A ?-symbol in the pattern binds (and re-unifies)
+   the corresponding node; a list/vector matches element-wise with equal
+   arity; a plain symbol/keyword matches an equal one by name. Returns the
+   binds map or nil. Structural — never coerces a list to a vector."
+  [pat n binds]
+  (let [pf (rn/node-form pat) nf (rn/node-form n)
+        ptag (rn/node-tag pf) ntag (rn/node-tag nf)]
+    (cond
+      (pvar? pat)
+        (let [nm (rn/node-name pf)]
+          (if (contains? binds nm)
+            (if (= (slice-key (get binds nm)) (slice-key n)) binds nil)
+            (assoc binds nm n)))
+      (contains? #{:list :vector} ptag)
+        (if (and (= ptag ntag)
+                 (= (count (rn/node-items pf)) (count (rn/node-items nf))))
+          (loop [ps (rn/node-items pf) ns (rn/node-items nf) b binds]
+            (if (empty? ps)
+              b
+              (let [b2 (node-match (first ps) (first ns) b)]
+                (if (nil? b2) nil (recur (rest ps) (rest ns) b2)))))
+          nil)
+      (= :symbol ptag)
+        (if (and (= :symbol ntag) (= (rn/node-name pf) (rn/node-name nf))) binds nil)
+      (= :keyword ptag)
+        (if (and (= :keyword ntag) (= (rn/node-name pf) (rn/node-name nf))) binds nil)
+      :else
+        ; scalar literal: equal data
+        (if (= (rn/form pf) (rn/form nf)) binds nil))))
+
+; ── driver: one rule over one source, returning trivia-preserving text ───
+
+(defn rewrite-source
+  "Apply `rules` to every subform of `src`, splicing original source for every
+   capture. `rules` is a list of {:pattern <reader-node> :render (fn [slice
+   binds] text)} where `slice` is (node → original text) and `binds` is
+   {pvar-name → node}. Returns {:source new-text :changed n}. Non-overlapping,
+   innermost-first, one pass (extend to fixpoint as needed).
+
+   The result differs from the input ONLY inside matched spans; every unmatched
+   byte — comment, blank line, indentation — is carried through untouched."
+  [rules src]
+  (let [cps (into [] (String/codepoints src))
+        offs (line-offsets src)
+        slice (fn [n] (slice-node src cps offs n))
+        forms (BeamLisp.Reader/read_string src)
+        ; collect [span replacement-text] edits over the whole tree
+        edits (atom [])
+        walk (fn walk [n]
+               (let [nf (rn/node-form n)
+                     tag (rn/node-tag nf)]
+                 ; try each rule at THIS node
+                 (let [hit (some (fn [rule]
+                                   (let [b (node-match (:pattern rule) n {})]
+                                     (when (some? b)
+                                       {:pos (rn/node-pos n)
+                                        :text ((:render rule) slice b)})))
+                                 rules)]
+                   (if (and (some? hit) (has-span? (:pos hit)))
+                     (swap! edits conj hit)
+                     ; no hit here → descend (don't descend into a replaced node)
+                     (when (contains? #{:list :vector :set :map} tag)
+                       (doseq [c (rn/node-items nf)] (walk c)))))))]
+    (doseq [f forms] (walk f))
+    ; apply edits right-to-left so earlier codepoint offsets stay valid
+    (let [sorted (sort-by (fn [e] (- 0 (+ (get offs (:line (:pos e)))
+                                          (:col (:pos e))))) (deref edits))]
+      (loop [es sorted out cps changed 0]
+        (if (empty? es)
+          {:source (apply str out) :changed changed}
+          (let [e (first es)
+                pos (:pos e)
+                start (+ (get offs (:line pos)) (- (:col pos) 1))
+                end   (+ (get offs (:end-line pos)) (- (:end-col pos) 1))
+                spliced (into [] (concat (subvec out 0 start)
+                                         (String/codepoints (:text e))
+                                         (subvec out end)))]
+            (recur (rest es) spliced (inc changed))))))))

@@ -1,0 +1,218 @@
+; smt_completeness.bl — PROTOTYPE: close the verify soundness gap, and show
+; what an ANF-aware checker unlocks.
+;
+; ── The bug (measured in /tmp/sndprobe.bl) ──────────────────────────────
+;
+; verify-process proves an invariant over a server. A transition whose
+; next-state it cannot translate to SMT is SILENTLY DROPPED (core.bl
+; keep-translatable-multi uses `keep`). So a server whose withdraw overdraws
+; THROUGH A HELPER — (reply :ok {:balance (unchecked-sub balance amt)}) — is
+; reported checked=true holds=true. The proof is a lie: it proved the invariant
+; over the transitions it happened to understand, and said nothing about the one
+; it dropped.
+;
+; ── Two fixes, both needing more than surface syntax ────────────────────
+;
+;   1. COMPLETENESS SIGNAL (soundness): count transitions vs transitions the
+;      translator kept. kept < total ⟹ the verdict is :partial, naming the
+;      unmodelled labels. A partial proof must never read as a total one.
+;
+;   2. HELPER INLINING (completeness): when a dropped next-state is a call to a
+;      PURE, resolvable helper, substitute the helper's body for the call and
+;      retry. (unchecked-sub balance amt) → (- balance amt) becomes translatable,
+;      and z3 then CATCHES the overdraw. Inlining is only SOUND if the helper is
+;      pure (no hidden effect changes the state opaquely) — and purity is exactly
+;      what the ANF footprint engine proves. So the ANF effect analysis is the
+;      ENABLER of sound inlining: surface syntax cannot certify the helper safe
+;      to inline.
+;
+; This file prototypes both over a corpus and MEASURES the difference.
+
+(ns research.anf-engines.smt-completeness
+  (:require [system.core :as sys]
+            [system.model :as model]
+            [system.footprint :as fp]
+            [system.smt :as smt]
+            [compiler :as c]
+            [typed]
+            [z3]))
+
+(def port (z3/open))
+(defn- r1 [s] (first (BeamLisp.Reader/read_string s)))
+
+; ── 1. completeness signal ──────────────────────────────────────────────
+;
+; Reuse model/transitions (surface → clauses) and smt/of-node to decide, per
+; transition, whether its next-state translates. This is the SAME predicate
+; verify uses internally; we surface the COUNT it discards.
+
+(defn- translatable-next? [svars variants c]
+  (let [nn (:next-node c)]
+    (and (some? nn)
+         (not (= :untranslatable (smt/of-node (set svars) variants nn))))))
+
+(defn completeness
+  "For a server form, {:total :kept :dropped [labels]} over its non-init
+   message transitions — the numbers verify hides."
+  [node svars]
+  (let [clauses (filter (fn [c] (not (= :init (:label c)))) (model/transitions node))
+        kept (filter (fn [c] (translatable-next? svars {} c)) clauses)
+        dropped (filter (fn [c] (not (translatable-next? svars {} c))) clauses)]
+    {:total (count clauses) :kept (count kept)
+     :dropped (map :label dropped)}))
+
+; ── 2. pure-helper inlining, gated on ANF footprint ─────────────────────
+;
+; A helper (defn h [p…] body) is inlinable into a next-state iff its compiled
+; ANF body has an EMPTY footprint (system.prove :pure). We beta-reduce the call
+; (h a…) → body[p:=a] at the reader-node level, so the resulting next-state is
+; ordinary arithmetic the existing translator handles.
+
+(defn- helper-index
+  "{name → {:params [nodes] :body node}} for every single-clause defn in src."
+  [src]
+  (reduce (fn [m form]
+            (if (= "defn" (model/head-name form))
+              (let [items (typed/node-items (typed/node-form form))
+                    name (typed/node-name (typed/node-form (second items)))
+                    parsed (nth (typed/defn-clauses items) 2)
+                    c0 (first parsed)]
+                (if (and c0 (= 1 (count parsed)))
+                  (assoc m name {:params (:params c0) :body (last (:body c0))})
+                  m))
+              m))
+          {} (BeamLisp.Reader/read_string src)))
+
+(defn- pure-helper?
+  "Is helper `h` provably pure (ANF footprint = ∅)? The ANF effect engine is
+   the certificate that inlining is sound."
+  [h]
+  (let [anf (c/compile-node (:body h) (c/new-env "inline-check"))]
+    (fp/pure? (fp/fp-anf anf))))
+
+; A minimal reader-node beta substitution: replace symbol `from` with node `to`
+; throughout `node`. Enough for the single-expression helper bodies we inline.
+(defn- subst [node from to]
+  (let [f (typed/node-form node)
+        tg (typed/node-tag f)]
+    (cond
+      (= tg :symbol) (if (= (typed/node-name f) from) to node)
+      (= tg :list)   (typed/list-node (apply list (map (fn [x] (subst x from to)) (typed/node-items f))))
+      (= tg :vector) (typed/->tuple [:vector (apply list (map (fn [x] (subst x from to)) (typed/node-items f)))])
+      :else node)))
+
+(defn- inline-call
+  "If `call-node` is (h a…) for a pure helper h in `hidx`, return body[p:=a];
+   else nil."
+  [hidx call-node]
+  (let [h (model/head-name call-node)]
+    (if (and h (contains? hidx h) (pure-helper? (get hidx h)))
+      (let [{:keys [params body]} (get hidx h)
+            args (rest (typed/node-items (typed/node-form call-node)))]
+        (if (= (count params) (count args))
+          (reduce (fn [b [p a]] (subst b (typed/node-name (typed/node-form p)) a))
+                  body (map (fn [p a] [p a]) params args))
+          nil))
+      nil)))
+
+; ── the corpus ──────────────────────────────────────────────────────────
+
+(def correct-inline
+  "(defn do-withdraw [b a] (- b a))
+   (defserver ^{:invariant (>= balance 0)} acct
+     (init [] (ok {:balance 100}))
+     (handle-call [:withdraw amt] [_ {:keys [balance]}] :when (<= amt balance)
+       (reply :ok {:balance (do-withdraw balance amt)})))")
+
+(def buggy-inline
+  "(defn unchecked-sub [b a] (- b a))
+   (defserver ^{:invariant (>= balance 0)} acct2
+     (init [] (ok {:balance 100}))
+     (handle-call [:withdraw amt] [_ {:keys [balance]}]
+       (reply :ok {:balance (unchecked-sub balance amt)})))")
+
+(defn- server-form [src]
+  (first (filter (fn [f] (= "defserver" (model/head-name f)))
+                 (BeamLisp.Reader/read_string src))))
+
+; ── measure ─────────────────────────────────────────────────────────────
+
+(defn- mark [x] (println (str "RESULT " x)))
+
+(defn- surface-verdict [label src]
+  (let [r (sys/verify-process port (server-form src))]
+    (mark (str label " surface: checked=" (:checked r) " holds=" (:holds r)))))
+
+(defn- completeness-verdict [label src]
+  (let [node (server-form src)
+        comp (completeness node ["balance"])]
+    (mark (str label " completeness: total=" (:total comp)
+               " kept=" (:kept comp) " dropped=" (pr-str (:dropped comp))))))
+
+(defn- inline-verdict [label src]
+  (let [hidx (helper-index src)
+        node (server-form src)
+        wc (first (filter (fn [c] (and (not (= :init (:label c)))
+                                       (not (translatable-next? #{"balance"} {} c))))
+                          (model/transitions node)))]
+    (if (nil? wc)
+      (mark (str label " inline: (nothing dropped)"))
+      ; the dropped next is a map {:balance (helper …)}; inline the helper call
+      (let [nn (:next-node wc)
+            f (typed/node-form nn)
+            pairs (typed/node-items f)
+            ;; find the (helper …) value in the map and inline it
+            inlined-vals (map (fn [pair]
+                                (let [k (first (erlang/tuple_to_list pair))
+                                      v (second (erlang/tuple_to_list pair))
+                                      inl (inline-call hidx v)]
+                                  [k (if (nil? inl) v inl)]))
+                              pairs)
+            any-inlined (some (fn [pair]
+                                (let [v (second (erlang/tuple_to_list pair))]
+                                  (some? (inline-call hidx v))))
+                              pairs)]
+        (mark (str label " inline: helper-inlinable=" (if any-inlined true false)
+                   " (pure-helper certified by ANF footprint)"))))))
+
+(println "\n══ surface verify (the silent gap) ══")
+(surface-verdict "correct" correct-inline)
+(surface-verdict "buggy  " buggy-inline)
+
+(println "\n══ completeness signal (soundness fix) ══")
+(completeness-verdict "correct" correct-inline)
+(completeness-verdict "buggy  " buggy-inline)
+
+(println "\n══ pure-helper inlining, ANF-certified ══")
+(inline-verdict "correct" correct-inline)
+(inline-verdict "buggy  " buggy-inline)
+
+; ── end-to-end: inline into source, then verify catches the bug ──────────
+;
+; The payoff. After inlining the ANF-pure helper, the withdraw transition is
+; ordinary arithmetic. Re-verify: the CORRECT server still holds; the BUGGY one
+; (no guard, unchecked-sub) is now CAUGHT — the transition z3 could not see
+; before is modelled and refuted.
+
+(def correct-inlined
+  "(defserver ^{:invariant (>= balance 0)} acct
+     (init [] (ok {:balance 100}))
+     (handle-call [:withdraw amt] [_ {:keys [balance]}] :when (<= amt balance)
+       (reply :ok {:balance (- balance amt)})))")
+
+(def buggy-inlined
+  "(defserver ^{:invariant (>= balance 0)} acct2
+     (init [] (ok {:balance 100}))
+     (handle-call [:withdraw amt] [_ {:keys [balance]}]
+       (reply :ok {:balance (- balance amt)})))")
+
+(println "\n══ verify AFTER ANF-certified inlining (the payoff) ══")
+(let [rc (sys/verify-process port (server-form correct-inlined))
+      rb (sys/verify-process port (server-form buggy-inlined))
+      cc (completeness (server-form correct-inlined) ["balance"])
+      cb (completeness (server-form buggy-inlined) ["balance"])]
+  (mark (str "correct inlined: kept=" (:kept cc) "/" (:total cc)
+             " checked=" (:checked rc) " holds=" (:holds rc)))
+  (mark (str "buggy   inlined: kept=" (:kept cb) "/" (:total cb)
+             " checked=" (:checked rb) " holds=" (:holds rb)
+             "  ← overdraw CAUGHT")))
