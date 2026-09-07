@@ -51,6 +51,39 @@ defmodule BeamLisp.LazyMemo do
     end
   end
 
+  @doc """
+  Create an EAGER reference cell: GC-owned like any cell, but its value is not
+  scanned for dependency edges and not cycle-checked. This is what an atom
+  wants — it holds ordinary data (which may legally point back at another
+  atom), and a lazy memo's cycle rejection would wrongly refuse those. Ownership
+  is unaffected: the saved term still holds any embedded resource handles.
+  """
+  def create_ref(value) do
+    ensure_loaded!()
+    bytes = estimate_bytes(value)
+
+    if bytes <= nif_fast_lane_bytes() do
+      nif_new_fast(value, [], bytes)
+    else
+      nif_new(value, [], bytes)
+    end
+  end
+
+  @doc "Compare-exchange on an eager ref cell: no dependency scan, no cycle check."
+  def exchange_ref(resource, expected, value, notifications \\ []) do
+    ensure_loaded!()
+    bytes = estimate_bytes(value)
+
+    if bytes <= nif_fast_lane_bytes() do
+      case nif_compare_exchange_fast(resource, expected, value, [], bytes, notifications) do
+        :reroute -> nif_compare_exchange(resource, expected, value, [], bytes, notifications)
+        outcome -> outcome
+      end
+    else
+      nif_compare_exchange(resource, expected, value, [], bytes, notifications)
+    end
+  end
+
   def exchange(resource, expected, state, notifications \\ []) do
     ensure_loaded!()
     deps = dependencies(state)

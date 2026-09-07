@@ -99,6 +99,38 @@ defmodule BeamLisp.WatchesTest do
     end
   end
 
+  describe "atoms hold eager data, including cycles" do
+    test "an atom may point at another atom that points back" do
+      # Atoms are eager reference cells, not lazy memos: a value that refers to
+      # another atom (which refers back) is legal, as in Clojure. The lazy
+      # memo's cycle rejection must NOT apply here.
+      result =
+        eval("""
+        (def a (atom nil))
+        (def b (atom nil))
+        (reset! a b)
+        (reset! b a)
+        [(= b @a) (= a @b)]
+        """)
+
+      assert realize_pairs(result) == [true, true]
+    end
+
+    test "an atom survives the process that created it" do
+      # A cell-backed atom is a value behind a reference, not a running process,
+      # so it outlives its creator (Clojure semantics), unlike the old Agent.
+      result =
+        eval("""
+        (def holder (atom nil))
+        (def t (Task/async (fn [] (reset! holder (atom 41)))))
+        (Task/await t 5000)
+        (swap! @holder inc)
+        """)
+
+      assert result == 42
+    end
+  end
+
   describe "spell.st connector" do
     defp connector(body), do: eval(File.read!("test/fixtures/bl/st-connector.bl") <> "\n" <> body)
 

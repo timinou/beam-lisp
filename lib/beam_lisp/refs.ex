@@ -1,12 +1,22 @@
 defmodule BeamLisp.Atom do
   @moduledoc """
   A reference whose value can be read and atomically swapped:
-  beam-lisp's `(atom v)`, backed by an Elixir `Agent`. Mirrors
-  Clojure's atom: `deref` reads, `swap!` applies, `reset!` sets,
-  `compare-and-set!` CASes. The Agent serializes access, so there is
-  no need for Clojure's CAS-retry loop.
+  beam-lisp's `(atom v)`, backed by a native memo cell. Mirrors Clojure's
+  atom: `deref` reads, `swap!` applies, `reset!` sets, `compare-and-set!`
+  CASes.
+
+  The value lives in one GC-owned cell; `swap!` is a compare-exchange retry
+  loop, the loop Clojure's atom runs and the old Agent version avoided by
+  serializing in a process. The cell makes that loop cheaper than an Agent
+  round-trip, and it removes the process: an atom is now a value held behind
+  a reference, not a running process, so it survives as long as any holder
+  keeps it (as in Clojure) rather than dying with a linked Agent.
+
+  `watches` is a SECOND cell holding `%{key => fn}`. Watches therefore share
+  the same ownership discipline as the value and need no process-dictionary
+  side table.
   """
-  defstruct [:pid]
+  defstruct [:cell, :watches]
 end
 
 
@@ -82,36 +92,44 @@ defmodule BeamLisp.Refs do
   # --- atoms ---
 
   def atom(v) do
-    {:ok, pid} = Agent.start_link(fn -> v end)
-    %BeamLisp.Atom{pid: pid}
+    %BeamLisp.Atom{cell: BeamLisp.LazyMemo.create_ref(v), watches: BeamLisp.LazyMemo.create_ref(%{})}
   end
 
   def swap!(ref, f), do: swap!(ref, f, [])
 
-  # Agent.get_and_update runs the fn inside the Agent process, which
-  # serializes swaps — `{new, new}` stores the new value and returns
-  # it to the caller.
-  def swap!(%BeamLisp.Atom{} = atom, f, args_list) do
-    # Return BOTH values so watches can be told what changed; the swap itself is
-    # unchanged (still one serialized get_and_update inside the Agent).
-    {old, new} =
-      Agent.get_and_update(atom.pid, fn current ->
-        new = BeamLisp.RT.invoke(f, [current | args_list])
-        {{current, new}, new}
-      end)
+  # Compare-exchange retry loop: read the current value, apply f, publish with
+  # exchange. A concurrent writer makes exchange answer :retry, and we re-read
+  # and re-apply — Clojure's atom contract. Watches fire AFTER the value
+  # commits, in the caller's process, exactly as before.
+  def swap!(%BeamLisp.Atom{cell: cell} = atom, f, args_list) do
+    old = BeamLisp.LazyMemo.read(cell)
+    new = BeamLisp.RT.invoke(f, [old | args_list])
 
-    notify_watches(atom, old, new)
-    new
+    case BeamLisp.LazyMemo.exchange_ref(cell, old, new) do
+      :ok ->
+        notify_watches(atom, old, new)
+        new
+
+      :retry ->
+        swap!(atom, f, args_list)
+
+      :cycle ->
+        raise ArgumentError, "swap!: the new value would form a reference cycle"
+    end
   end
 
   def swap!(other, _f, _args_list) do
     raise ArgumentError, message: "swap!: not a reference: #{inspect(other)}"
   end
 
-  def reset!(%BeamLisp.Atom{} = atom, v) do
-    old = Agent.get_and_update(atom.pid, fn current -> {current, v} end)
-    notify_watches(atom, old, v)
-    v
+  def reset!(%BeamLisp.Atom{cell: cell} = atom, v) do
+    old = BeamLisp.LazyMemo.read(cell)
+
+    case BeamLisp.LazyMemo.exchange_ref(cell, old, v) do
+      :ok -> notify_watches(atom, old, v); v
+      :retry -> reset!(atom, v)
+      :cycle -> raise ArgumentError, "reset!: the value would form a reference cycle"
+    end
   end
 
   def reset!(other, _v), do: raise(ArgumentError, "reset!: not an atom: #{inspect(other)}")
@@ -131,16 +149,9 @@ defmodule BeamLisp.Refs do
   # Clojure. Running them inside the Agent would block it, and a watch that
   # touched its own atom would deadlock.
 
-  @watch_key {BeamLisp.Atom, :watches}
-
   @doc "Register `f` under `key`; it is called `(f key ref old new)` on change."
-  def add_watch!(%BeamLisp.Atom{} = atom, key, f) do
-    Agent.update(atom.pid, fn state ->
-      watches = Process.get(@watch_key, %{})
-      Process.put(@watch_key, Map.put(watches, key, f))
-      state
-    end)
-
+  def add_watch!(%BeamLisp.Atom{watches: w} = atom, key, f) do
+    update_watches(w, &Map.put(&1, key, f))
     atom
   end
 
@@ -149,13 +160,8 @@ defmodule BeamLisp.Refs do
   end
 
   @doc "Remove the watch registered under `key`."
-  def remove_watch!(%BeamLisp.Atom{} = atom, key) do
-    Agent.update(atom.pid, fn state ->
-      watches = Process.get(@watch_key, %{})
-      Process.put(@watch_key, Map.delete(watches, key))
-      state
-    end)
-
+  def remove_watch!(%BeamLisp.Atom{watches: w} = atom, key) do
+    update_watches(w, &Map.delete(&1, key))
     atom
   end
 
@@ -163,10 +169,21 @@ defmodule BeamLisp.Refs do
     raise ArgumentError, message: "remove-watch!: not an atom: #{inspect(other)}"
   end
 
-  defp notify_watches(%BeamLisp.Atom{} = atom, old, new) do
+  # CAS-loop on the watches cell, so concurrent add/remove do not lose each other.
+  defp update_watches(cell, f) do
+    old = BeamLisp.LazyMemo.read(cell)
+
+    case BeamLisp.LazyMemo.exchange_ref(cell, old, f.(old)) do
+      :ok -> :ok
+      :retry -> update_watches(cell, f)
+      :cycle -> raise ArgumentError, "watch table would form a reference cycle"
+    end
+  end
+
+  defp notify_watches(%BeamLisp.Atom{watches: w} = atom, old, new) do
     # A no-op change still notifies, matching Clojure: the watch decides what
     # counts as a change, not the atom.
-    case Agent.get(atom.pid, fn _ -> Process.get(@watch_key, %{}) end) do
+    case BeamLisp.LazyMemo.read(w) do
       watches when map_size(watches) == 0 ->
         :ok
 
@@ -178,10 +195,23 @@ defmodule BeamLisp.Refs do
   end
 
   # Clojure's `=` is beam-lisp's `==`; match that.
-  def compare_and_set!(%BeamLisp.Atom{} = atom, old, new) do
-    Agent.get_and_update(atom.pid, fn current ->
-      if current == old, do: {true, new}, else: {false, current}
-    end)
+  def compare_and_set!(%BeamLisp.Atom{cell: cell} = atom, old, new) do
+    # Clojure `compare-and-set!` compares with `=` (value equality), so `1` and
+    # `1.0` count as equal; the native exchange compares EXACTLY. Do the
+    # value-equality check here against the current term, then exchange against
+    # that exact term so the swap is still atomic: a racing writer changes the
+    # term, the exact exchange answers :retry, and we re-check.
+    current = BeamLisp.LazyMemo.read(cell)
+
+    if current == old do
+      case BeamLisp.LazyMemo.exchange_ref(cell, current, new) do
+        :ok -> notify_watches(atom, current, new); true
+        :retry -> compare_and_set!(atom, old, new)
+        :cycle -> raise ArgumentError, "compare-and-set!: the value would form a reference cycle"
+      end
+    else
+      false
+    end
   end
 
   def compare_and_set!(other, _old, _new) do
@@ -350,7 +380,7 @@ defmodule BeamLisp.Refs do
 
   # --- deref ---
 
-  def deref(%BeamLisp.Atom{} = atom), do: Agent.get(atom.pid, & &1)
+  def deref(%BeamLisp.Atom{cell: cell}), do: BeamLisp.LazyMemo.read(cell)
 
   # Clojure's deref on a future blocks indefinitely.
   def deref(%BeamLisp.Future{} = f), do: Task.await(f.task, :infinity)
@@ -365,7 +395,7 @@ defmodule BeamLisp.Refs do
 
   def deref(other), do: raise(ArgumentError, "deref: not a derefable reference: #{inspect(other)}")
 
-  def deref(%BeamLisp.Atom{} = atom, _timeout_ms, _timeout_val), do: Agent.get(atom.pid, & &1)
+  def deref(%BeamLisp.Atom{cell: cell}, _timeout_ms, _timeout_val), do: BeamLisp.LazyMemo.read(cell)
 
   def deref(%BeamLisp.Future{} = f, timeout_ms, timeout_val) do
     try do
