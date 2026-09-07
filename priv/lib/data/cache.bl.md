@@ -91,23 +91,32 @@ its slot — the input any eviction policy actually needs.
 
 ```beam-lisp
 (defn- note! [store hash tier bytes]
-  (datom/transact! (index-conn)
-    [{:db/id -1
-      :entry/hash hash
-      :entry/store (:vault/name store)
-      :entry/tier tier
-      :entry/bytes bytes
-      :entry/hits 0
-      :entry/created (System/system_time :millisecond)}]))
+  ; the index is bookkeeping, never correctness: if its table is unreachable
+  ; (e.g. created by a process that has since exited), swallow it — the cache
+  ; still memoises correctly, it just cannot answer "what is cached" here.
+  (try
+    (datom/transact! (index-conn)
+      [{:db/id -1
+        :entry/hash hash
+        :entry/store (:vault/name store)
+        :entry/tier tier
+        :entry/bytes bytes
+        :entry/hits 0
+        :entry/created (System/system_time :millisecond)}])
+    (catch _ nil)))
 
 (defn- bump-hits! [hash current]
-  (datom/transact! (index-conn)
-    [{:db/id -1 :entry/hash hash :entry/hits (+ 1 current)}]))
+  (try
+    (datom/transact! (index-conn)
+      [{:db/id -1 :entry/hash hash :entry/hits (+ 1 current)}])
+    (catch _ nil)))
 
 (defn- entry-hits [db hash]
-  (let [rows (datom/q '[:find ?h :in $ ?hash :where [?e :entry/hash ?hash] [?e :entry/hits ?h]]
-                      db hash)]
-    (if (empty? rows) 0 (first (first rows)))))
+  (try
+    (let [rows (datom/q '[:find ?h :in $ ?hash :where [?e :entry/hash ?hash] [?e :entry/hits ?h]]
+                        db hash)]
+      (if (empty? rows) 0 (first (first rows))))
+    (catch _ 0)))
 ```
 
 ## The one door: get!
@@ -129,8 +138,8 @@ recording the fact. The same inputs never compute twice.
     (cond
       ; hot hit: in this VM's memory already.
       (contains? @hot hash)
-      (let [db (datom/db (index-conn))]
-        (bump-hits! hash (entry-hits db hash))
+      (do
+        (try (bump-hits! hash (entry-hits (datom/db (index-conn)) hash)) (catch _ nil))
         (get @hot hash))
 
       ; durable hit: on disk from a previous run. Warm the hot tier.
@@ -164,7 +173,8 @@ These are ordinary `datom/q` calls over the live index.
 (defn entries
   "All catalog rows for `store` as maps. The cache, made legible."
   [store]
-  (let [db (datom/db (index-conn))
+  (try
+   (let [db (datom/db (index-conn))
         rows (datom/q '[:find ?hash ?tier ?bytes ?hits ?created
                         :in $ ?store
                         :where [?e :entry/store ?store]
@@ -177,7 +187,8 @@ These are ordinary `datom/q` calls over the live index.
     (map (fn [row]
            (let [[hash tier bytes hits created] (vec row)]
              {:hash hash :tier tier :bytes bytes :hits hits :created created}))
-         rows)))
+         rows))
+   (catch _ [])))
 
 (defn stats
   "A one-line summary of a store: entry count and total bytes."

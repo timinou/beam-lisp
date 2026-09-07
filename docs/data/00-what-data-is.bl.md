@@ -1,112 +1,114 @@
-# data — values that remember, relate, and reveal themselves
+# data — reusable patterns for values that remember, relate, and reveal
 
 Most programs treat data as something you push around: read it, transform it,
-write it out, forget it. The `data` family treats data as something *alive* — a
-value that can remember what it computed, relate to the values it depends on,
-and reveal its own state to you while the program runs.
+write it out, forget it. The `data` family is a small shelf of **reusable
+patterns** for the cases where a value should do more — remember what it
+computed, relate to the values it depends on, or be shared and observed while
+the program runs.
 
-This is possible because BeamLisp has one native **cell** underneath its whole
-state model — the same cell behind `atom`, `delay`, `derived`, `memoize`, and
-`lazy-seq`. A cell is a small box that holds a value, can be read and swapped
-atomically, and is owned by whoever holds it (reclaimed by the garbage collector
-when the last holder lets go). Once state, caching, and reactivity are all *one*
-substrate, a family of tools can sit on top that would otherwise each need their
-own machinery. That family is `data`.
+These patterns are possible because BeamLisp has one native **cell** underneath
+its whole state model — the same cell behind `atom`, `delay`, `derived`,
+`memoize`, and `lazy-seq`. A cell is a small box that holds a value, can be read
+and swapped atomically, and is owned by whoever holds it (reclaimed by the
+garbage collector when the last holder lets go). Once state, caching, and
+reactivity are all one substrate, a family of patterns can sit on top that would
+otherwise each need their own machinery.
 
-Everything here is ordinary BeamLisp. There is no new syntax to learn; `data`
-modules are libraries you `require`.
+`data` is the shelf of patterns. It is not where the tools live — an instrument
+you *run* (like the live cell dashboard) belongs in `tooling`, and *uses* these
+patterns rather than being one. That separation is the point: `data` holds the
+building blocks; `tooling` holds the instruments built from them.
 
-## The three verbs of living data
+Everything here is ordinary BeamLisp you `require`.
 
-`data` is organized around three things a living value can do. Each is a
-namespace, named for the power it gives you.
+## The three patterns
 
-### `data.cache` — *remember*
+### `data.cache` — remember
 
-> compute once, keep forever, and ask what you kept
+> compute once, keep it, ask what you kept
 
-A `cache` is a content-addressed cache: a value's identity is the hash of its
-inputs, so the same inputs return the same slot — this run, and (with a
-directory) the next. Two tiers, one door: a hot tier in memory in front of a
-durable tier on disk. What makes it `data` and not just a cache: **every entry
-is also a fact in a small datalog database**, so the cache is queryable. "What
-is cached, how large, how often hit, by which store" is a `q`, not a private
-scan.
+At heart, memoisation: a key and a thunk, run at most once per key, result
+remembered. On top of that, content-addressing and a hot/durable tier so "once"
+survives restarts, and a datalog index so the cache is *queryable* — what is
+stored, how large, how often hit. The plain name is the honest one: it is a
+cache. Full tour: `priv/lib/data/cache.bl.md`.
 
-```beam-lisp
-; (illustrative — see data.cache for the runnable tour)
-; (require '[data.cache :as cache])
-; (def v (cache/open "gemini" {:dir "cache/gemini"}))
-; (cache/get! v prompt (fn [] (call-the-model prompt)))   ; runs at most once
-; (cache/hottest v 10)                                     ; what's earning its slot
-```
+### `data.registry` — a roll-call
 
-Read the full, runnable introduction in `priv/lib/data/cache.bl.md` — the module
-*is* its own literate tour.
+> let live things sign in, then list them
 
-### `data.lens` — *relate* (the reactive core, already in the language)
+The shape behind any "list of active things": open connections, running jobs,
+tracked values. A thing `enroll`s with a kind, a name, and whatever `meta` you
+want; you `entries`, `of-kind`, `lookup`, or `retire`. One shared cell, so it is
+safe across processes and needs no process to supervise. Full tour:
+`priv/lib/data/registry.bl.md`.
+
+### `data.config` — shared settings, read live
+
+> one settings sheet everyone shares
+
+A read-mostly bag of settings held once, in one shared cell every process reads
+directly — no per-read rebuild, no per-process copy. It plugs into the
+language's own dispatch: a `Config` record implements a `Settings` protocol, so
+`fetch` is one verb dispatched on type, not a shadowed `get`. Overrides layer on
+top of a base for per-context twists. Full tour: `priv/lib/data/config.bl.md`.
+
+### `data.lens` — relate (the reactive core, already in the language)
 
 > a value that follows other values
 
-`derived` and `atom` already give you relating: `(derived [a b] …)` is a value
-that recomputes only when `a` or `b` actually changed, and `add-watch` lets a
-change drive an effect. These live in the core language (`lib/beam_lisp/`), and
-the tutorial `docs/memory-policy/08-one-cell-many-references.bl.md` is their
-tour. `data` names this capability *lens* to make its role legible — a lens is a
-view onto other values that stays in focus as they move — but it introduces no
-new module; it points at what the language already has.
+`derived` and `atom` already give you relating: a value that recomputes only
+when its inputs changed, and `add-watch` to drive effects. These live in the
+core language; `data` names the capability *lens* to place it on the shelf, but
+introduces no new module. Tour:
+`docs/memory-policy/08-one-cell-many-references.bl.md`.
 
-### `data.pulse` — *reveal*
+## The names, and the power each carries
 
-> watch your program's living state breathe
-
-`pulse` is a live dashboard of the cells themselves. Every atom, delay, derived,
-and cache is a cell; `pulse` shows the native vitals (how many cells are alive,
-how many bytes they retain) as ground truth, and — for cells that opt in with
-`track` — a labelled, live table of their current values. Served into any app in
-dev mode with two route lines. It is deliberately a bold, dark instrument panel,
-unlike the document-like look of the rest of the stack, because it is an
-instrument, not a page.
-
-Read the full introduction in `priv/lib/data/pulse.bl.md`.
-
-## Why these three, and why these names
-
-The names are chosen so the *power* is legible from the word:
-
-| namespace | verb | one word | what it means for you |
+| pattern | verb | one word | what it gives you |
 |---|---|---|---|
-| `data.cache` | remember | keep | expensive results computed once, kept, and queryable |
-| `data.lens` | relate | follow | values that update themselves when their inputs move |
-| `data.pulse` | reveal | see | your program's living state, visible as it runs |
+| `data.cache` | remember | keep | expensive results computed once, kept, queryable |
+| `data.registry` | enroll | list | a safe, shared roll-call of live things |
+| `data.config` | fetch | share | one live settings sheet, dispatched by type |
+| `data.lens` | derive | follow | values that update themselves when inputs move |
 
-A cache is where you *keep* things safe and retrievable. A lens is what you look
-*through* to see a value derived from others. A pulse is the *sign of life* you
-watch. Together they cover the three things that make data feel alive rather than
-inert: it persists, it connects, and it is observable.
+## Tooling built on these patterns
+
+The `tooling` namespace holds instruments that *use* `data`:
+
+- **`tooling.pulse`** — a live dashboard of every cell, as a full page and as an
+  expandable corner **chip** you inject into any live view with `with-chip`
+  (the chip is hiccup, so it rides the app's own render→diff→patch loop). Its
+  roll-call of tracked cells *is* a `data.registry`. Tour:
+  `priv/lib/tooling/pulse.bl.md`.
+- **`tooling.incremental`** — render only what changed: a component memoised on
+  its inputs returns identical hiccup, and the differ prunes unchanged subtrees.
+  Tour: `priv/lib/tooling/incremental.bl.md`.
+- **`tooling.trace`** — why did the UI update? A causal record — fact changed →
+  subtrees recomputed → patch ops shipped — that even catches the wasteful
+  recompute-with-no-op. Tour: `priv/lib/tooling/trace.bl.md`.
 
 ## What is honest about `data`
 
-- **`cache`'s datalog index is heavier than a plain map.** You buy a queryable,
-  watchable catalog; for a cache of thousands that is a rounding error, for tens
-  of millions you would sample or compact. Reach for it when the *question*
+- **`cache`'s datalog index is bookkeeping, not correctness.** It makes the
+  cache queryable; if its table is unreachable (e.g. created by a process that
+  exited), the cache still memoises correctly and the catalog simply reads
+  empty. And the index is heavier than a plain map — worth it when the question
   "what is cached" matters as much as the values.
-- **`pulse`'s per-cell table is opt-in.** The runtime reports an *aggregate* —
-  it does not enumerate individual cells — so the labelled rows are exactly the
-  cells that called `track`, never a fabricated list. The vitals are the floor
-  of truth; the registry is the lens you choose to add.
-- **`lens` is not new code.** It is a name for `derived`/`atom`/`add-watch`,
-  which already ship in the core. `data` gives the capability a home in the
-  mental map without duplicating the implementation.
+- **`config` dispatches, it does not shadow.** `fetch` is a protocol method on
+  the Config type — one verb, many types — not a new `get` per module.
+- **`lens` is not new code.** It names `derived`/`atom`/`add-watch`, which ship
+  in the core.
+- **The dashboard is an instrument, not a pattern.** It lives in `tooling` and
+  stands on `data.registry`, never the other way around.
 
 ## Where to go next
 
-- `priv/lib/data/cache.bl.md` — the cache that remembers and can be queried.
-- `priv/lib/data/pulse.bl.md` — the dashboard that reveals living state.
+- `priv/lib/data/cache.bl.md`, `registry.bl.md`, `config.bl.md` — the patterns.
+- `priv/lib/tooling/pulse.bl.md`, `incremental.bl.md`, `trace.bl.md` — the
+  instruments.
 - `docs/memory-policy/08-one-cell-many-references.bl.md` — the one cell behind
-  atom, delay, derived, and memoize, which everything in `data` stands on.
-- `docs/memory-policy/shared-lazy-values.bl.md` — why ownership follows
-  references, the property that makes a cache.s hot tier reclaim itself.
+  all of it.
 
-The thread through all of it: **one cell, many faces.** `data` is the family of
-faces that make a value remember, relate, and reveal.
+The thread through everything: **one cell, many faces.** `data` is the shelf of
+patterns those faces make reusable; `tooling` is the instruments built from them.
