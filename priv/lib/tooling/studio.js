@@ -354,7 +354,31 @@
     disable: function () { this.on = false; var b = document.getElementById("pc-graph"); if (b) b.hidden = true; }
   };
 
+  // ── Click-to-test: export the frames from the scrubber position to now
+  function wireExport() {
+    var b = document.getElementById("pc-export");
+    if (!b || b.__wired) return;
+    b.__wired = true;
+    b.onclick = function () {
+      var fs = timeline.frames;
+      if (!fs.length) return;
+      var from = timeline.cur != null ? timeline.cur + 1 : fs[0].t;
+      var to = fs[fs.length - 1].t;
+      if (window.__pulseSend) window.__pulseSend(["export", from, to]);
+    };
+  }
+  document.addEventListener("studio:toggle", wireExport);
+  setTimeout(wireExport, 100);
+
   Studio.onMessage = function (m) {
+    if (m.msg === "export") {
+      var out = document.getElementById("pc-export-out");
+      if (out) { out.hidden = false; out.value = m.source; out.select(); }
+      try { navigator.clipboard && navigator.clipboard.writeText(m.source); } catch (_e) {}
+      var b = document.getElementById("pc-export");
+      if (b) { b.textContent = "⤓ " + m.steps + " steps → clipboard"; setTimeout(function () { b.textContent = "⤓ test from here"; }, 2500); }
+      return;
+    }
     if (m.msg === "timeline") timeline.index(m.frames);
     else if (m.msg === "time") timeline.show(m);
     else if (m.msg === "inspect") inspect.show(m);

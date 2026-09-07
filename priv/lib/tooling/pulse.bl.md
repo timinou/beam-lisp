@@ -28,6 +28,7 @@ can drop into the corner of any live app.
             [tooling.trace :as trace]
             [tooling.incremental :as inc]
             [live.hiccup :as h]
+            [live.socket]
             [web]
             [interop]))
 
@@ -399,6 +400,8 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    ".pcost{display:flex;align-items:center;gap:8px;padding:2px 0}.pcost .l{color:#7d8590;width:30px}"
    ".pcost svg{flex:1;height:18px}.pcost b{width:56px;text-align:right;color:#e6edf3}.pcost i{color:#7d8590;font-style:normal;font-size:9px;margin-left:2px}"
    ".pcidle{margin-top:4px;color:#46d18f}.pcidle.bad{color:#ff5c8a;font-weight:700}"
+   "#pc-tl-actions{margin-top:6px}#pc-export{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 8px;font:inherit;font-size:10px;cursor:pointer}"
+   "#pc-export-out{width:100%;height:120px;margin-top:6px;background:#0a0e14;color:#c9d1d9;border:1px solid #1f2733;border-radius:6px;font:10px/1.35 ui-monospace,Menlo,monospace;padding:6px;box-sizing:border-box;resize:vertical}"
    "#pc-graph{margin-bottom:10px;background:#121821;border:1px solid #1f2733;border-radius:8px;padding:6px 10px}"
    "#pc-graph svg{display:block}#pc-graph text{font-family:inherit}.pcempty{color:#7d8590;font-size:10px}"))
 
@@ -476,7 +479,10 @@ raw-text tags, emitted verbatim). `with-chip` is the decorator.
     [:div {:id "pc-timeline" :hidden true}
      [:input {:id "pc-scrub" :type "range" :min "1" :max "1" :value "1"}]
      [:div {:id "pc-tl-info"}]
-     [:div {:id "pc-tl-ticks"}]]
+     [:div {:id "pc-tl-ticks"}]
+     [:div {:id "pc-tl-actions"}
+      [:button {:id "pc-export" :title "turn the frames from here to now into a deftest"} "⤓ test from here"]]
+     [:textarea {:id "pc-export-out" :hidden true :readonly true :spellcheck "false"}]]
     [:div {:id "pc-vitals"}]
     [:div {:id "pc-trace"}]
     [:div {:id "pc-cells"}]]
@@ -563,6 +569,52 @@ its router; `mount` returns everything a host needs.
      :owner (or (get attrs :data-tr) (get attrs :key))
      :touched (touched path)
      :t (:t f)}))
+
+;; ── Click-to-test: the tap ring as a regression test ─────────────────
+;;
+;; A frame is {event ops}. A run of frames is therefore a SCENARIO: do these
+;; events, expect these changes. `scenario` lifts a t-range off the ring into
+;; a value; `scenario-source` prints it as a deftest that replays the events
+;; through a headless live socket and asserts each step's op SIGNATURE (the
+;; kinds of ops, in order — stable across cosmetic path drift, strict about
+;; what changed). You used the app; you now have a test.
+(defn- signature [ops] (mapv (fn [op] (keyword (name (first op)))) ops))
+
+(defn scenario
+  "Frames `from`..`to` (commits with a causing event) as [{:event :expect}]."
+  [from to]
+  (into []
+    (keep (fn [f]
+            (when (and (= :commit (:kind f)) (some? (:event f)))
+              {:event (:event f) :expect (signature (:ops f))}))
+          (tap/between (tap) from to))))
+
+(defn replay
+  "Run `steps` ([{:event :expect}]) against a fresh headless socket built by
+   `mount-fn` (a zero-arg fn returning a live.socket state — the test's own
+   world). Returns [{:event :expect :got :ok?}] so a deftest can assert each."
+  [mount-fn steps]
+  (let [t (tap/open)
+        st0 (assoc (mount-fn) :tap t)]
+    (loop [st st0 ss steps out []]
+      (if (empty? ss)
+        out
+        (let [step (first ss)
+              st2 (live.socket/handle-event st (:event step))
+              got (signature (:ops (tap/latest t)))]
+          (recur st2 (rest ss)
+                 (conj out (assoc step :got got :ok? (= got (:expect step))))))))))
+
+(defn scenario-source
+  "The scenario as deftest source text. `mount-expr` is the bl expression
+   (a string) that builds the headless socket state for the test's world."
+  [test-name mount-expr steps]
+  (str "(deftest " test-name "\n"
+       "  ; recorded from the studio — replays the events, asserts what each changed\n"
+       "  (let [steps " (pr-str steps) "\n"
+       "        runs (tooling.pulse/replay (fn [] " mount-expr ") steps)]\n"
+       "    (doseq [r runs]\n"
+       "      (is (= (:expect r) (:got r)) (str \"after \" (pr-str (:event r)))))))\n"))
 
 (defn- ws-init [_state]
   ;; per-commit push: this ws process subscribes to the tap, so a frame is
@@ -708,6 +760,12 @@ its router; `mount` returns everything a host needs.
       (= verb "time")     (reply state (assoc (or (frame-at (nth req 1)) {:t (nth req 1) :missing true}) :msg "time"))
       (= verb "inspect")  (reply state (assoc (inspect (into [] (nth req 1))) :msg "inspect"))
       (= verb "set")      (reply state (assoc (set! (nth req 1) (nth req 2)) :msg "set"))
+      (= verb "export")   (let [steps (scenario (nth req 1) (nth req 2))]
+                            (reply state {:msg "export"
+                                          :steps (count steps)
+                                          :source (scenario-source
+                                                    (str "recorded-t" (nth req 1) "-t" (nth req 2))
+                                                    "(my-app/mount-for-test)" steps)}))
       :else [:ok state])))
 
 (def ws-handlers
