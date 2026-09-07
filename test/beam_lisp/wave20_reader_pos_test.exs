@@ -14,7 +14,11 @@ defmodule BeamLisp.ReaderWave20PosTest do
   test "a form on line 1 carries line 1, col 1, and the file" do
     [list] = Reader.read_string("(+ 1 2)", "a.bl")
 
-    assert pos(list) == %{line: 1, col: 1, file: "a.bl"}
+    # start position is the contract these tests guard; the reader now ALSO
+    # records the end span (:end-line/:end-col) for underline diagnostics.
+    assert %{line: 1, col: 1, file: "a.bl"} = pos(list)
+    assert pos(list)[:"end-line"] == 1
+    assert pos(list)[:"end-col"] == 8
     assert line(list) == 1
   end
 
@@ -93,7 +97,8 @@ defmodule BeamLisp.ReaderWave20PosTest do
 
   test "read_string/1 defaults the file to nil" do
     [list] = Reader.read_string("(+ 1 2)")
-    assert pos(list) == %{line: 1, col: 1, file: nil}
+    assert %{line: 1, col: 1, file: nil} = pos(list)
+    assert pos(list)[:"end-col"] == 8
   end
 
   test "read_all/read_one still return the bare shapes" do
