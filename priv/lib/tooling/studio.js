@@ -341,6 +341,19 @@
   function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/'/g, "&#39;"); }
   Studio.ednTerm = ednTerm;
 
+  // ── Cost: the server renders the sparklines (SVG hiccup); we only show/hide
+  Studio.instruments.cost = {
+    on: false,
+    enable: function () { this.on = true; var b = document.getElementById("pc-cost"); if (b) b.hidden = false; },
+    disable: function () { this.on = false; var b = document.getElementById("pc-cost"); if (b) b.hidden = true; }
+  };
+
+  Studio.instruments.graph = {
+    on: false,
+    enable: function () { this.on = true; var b = document.getElementById("pc-graph"); if (b) b.hidden = false; },
+    disable: function () { this.on = false; var b = document.getElementById("pc-graph"); if (b) b.hidden = true; }
+  };
+
   Studio.onMessage = function (m) {
     if (m.msg === "timeline") timeline.index(m.frames);
     else if (m.msg === "time") timeline.show(m);
