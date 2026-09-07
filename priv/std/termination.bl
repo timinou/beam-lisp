@@ -1,271 +1,243 @@
-; termination.bl — L13, graduated — P15d: termination for loop/recur.
+; termination.bl — L13, P15d: termination for loop/recur, computed over bl-ANF.
 ;
-; The rule under test: a (recur …) is ACCEPTED when its argument is
-; provably shrinking along a measure, REJECTED with the counterexample
-; path otherwise, and a ^{:decreasing …} annotation on the loop is the
-; trusted escape hatch (L13).
+; The rule: a loop TERMINATES when SOME ranking variable is well-founded on
+; EVERY back-edge — it moves monotonically toward a fixed endpoint (∃-ranking,
+; Floyd). Accumulators need not shrink; only the ranking var must. A ^{:decreasing}
+; measure on the loop is the trusted escape hatch (L13).
 ;
 ; Shrinking, spike scope (sound — acceptance means the rule PROVED it):
-;   (dec x) / (- x <positive-literal>)   — x an int-bound loop var
-;   (rest xs) / (next xs)                — a seq-bound loop var
-; Loop var boundness comes from the loop's binding vector; the var's
-; initial LITERAL decides int vs seq. Anything else (identity, inc, a
-; var-free expr, an unknown fn call) is not provably shrinking →
-; rejected, with the failing recur form printed.
+;   (dec x) / (- x <pos-lit>)   count-DOWN, x an int loop var
+;   (rest xs) / (next xs)       a seq loop var
+;   (inc x) / (+ x <pos-lit>)   count-UP, well-founded ONLY against an
+;                               upper-bound guard (< x E) / (> E x)
 ;
-; The measure annotation: ^{:decreasing expr} on the loop's binding
-; vector trusts the author's measure — the spike records it as accepted
-; and reports WHICH measure was trusted (auditable, not silent).
+; ── Why over bl-ANF ────────────────────────────────────────────────────
+;
+; The compiler desugars `loop`/`recur` to a Y-combinator self-application:
+;
+;   (loop [i INIT] BODY)  →  ( (let [loop_N (fn [self] (fn [i] BODY'))]
+;                                 (let loop_N ...) )    INIT )
+;   (recur V)             →  ((apply loop_N [loop_N]) [V])
+;
+; where BODY' is BODY with every op resolved. Reading the IR means the measure
+; check sees the SAME resolved arithmetic (`:remote :erlang :dec` etc.) the
+; backend emits, and recognises the shape regardless of the surface macro that
+; produced it. The loop-var names and the ranking logic are recovered from the
+; scaffold. `check-loop`/`check-source` keep their surface signatures: they
+; compile the loop form to ANF, then run the ANF recogniser.
 
 (ns termination
-  (:require [typed] [errors]))
+  (:require [system.ir :as ir] [compiler :as c] [errors] [typed]))
 
-(defn- unwrap [n] (typed/node-form n))
+(def compile-env (c/new-env "termination"))
 
-(defn head-sym [node]
-  (if (and (= :list (typed/node-tag node))
-           (not (empty? (typed/node-items node)))
-           (= :symbol (typed/node-tag (unwrap (first (typed/node-items node))))))
-    (typed/node-name (unwrap (first (typed/node-items node))))
-    nil))
+(defn- to-anf [surface-node] (c/compile-node surface-node compile-env))
 
-(defn- literal-kind
-  "The init form's kind: :int, :seq, or :unknown."
-  [node]
-  (let [n (unwrap node)]
-    (cond
-      (int? n) :int
-      (= :vector (typed/node-tag n)) :seq
-      (and (= :list (typed/node-tag n))
-           (= "quote" (head-sym n))) :seq
-      :else :unknown)))
+; ── scaffold recognition ─────────────────────────────────────────────
+;
+; A compiled loop is (apply SCAFFOLD INIT-args) where SCAFFOLD is a
+; (let [loop_N (fn [self] INNER)] INNER). INNER is (fn [v0 v1 …] LOOP-BODY).
+; We extract: the self name loop_N, the loop-var names, and LOOP-BODY.
 
-(defn- self-arg?
-  "Is `node` the loop var `v` itself (a bare symbol reference)?"
-  [node v]
-  (and (= :symbol (typed/node-tag (unwrap node)))
-       (= v (typed/node-name (unwrap node)))))
+(defn- self-fn?
+  "Is `n` a single-clause fn of one pvar (the `self` wrapper)?"
+  [n]
+  (and (= :fn (:op n)) (= 1 (count (:clauses n)))
+       (= 1 (count (:pats (first (:clauses n)))))))
+
+(defn anf-loop?
+  "Is `n` a compiled loop scaffold? (apply (let loop_N (fn [self] (fn [vars] body)) …) inits)"
+  [n]
+  (and (= :apply (:op n))
+       (let [f (:fn n)]
+         (and (= :let (:op f))
+              (self-fn? (:init f))
+              (let [inner (:body (first (:clauses (:init f))))]
+                (= :fn (:op inner)))))))
+
+(defn- loop-parts
+  "{:self :vars :body :inits} of a recognised loop scaffold."
+  [n]
+  (let [f (:fn n)
+        self (:name f)
+        inner (:body (first (:clauses (:init f))))
+        clause (first (:clauses inner))
+        vars (map :name (:pats clause))]
+    {:self self :vars vars :body (:body clause) :inits (:args n)}))
+
+; ── recur (back-edge) detection ───────────────────────────────────────
+;
+; A recur to loop_N is (apply (apply (var loop_N) [(var loop_N)]) NEW-VALS).
+; Its NEW-VALS are the positional next values of the loop vars.
+
+(defn- recur-to?
+  [n self]
+  (and (= :apply (:op n))
+       (let [g (:fn n)]
+         (and (= :apply (:op g))
+              (= :var (:op (:fn g)))
+              (= self (:name (:fn g)))))))
+
+(defn- find-recurs
+  "Every recur (back-edge) to `self` under `n`, not descending into a NESTED
+   loop scaffold (its recurs are its own obligation). Returns list of NEW-VALS."
+  [self n]
+  (cond
+    (not (ir/node? n)) (list)
+    (recur-to? n self) (list (:args n))
+    (anf-loop? n) (list)               ; nested loop: its own obligation
+    :else (mapcat (fn [c] (find-recurs self c)) (ir/child-nodes n))))
+
+; ── measure direction over ANF ──────────────────────────────────────
+
+(def core :Elixir.BeamLisp.Ns.Core)
+(def rt   :Elixir.BeamLisp.RT)
+
+(defn- self-var? [n v] (and (= :var (:op n)) (= v (:name n))))
+(defn- pos-lit? [n] (and (= :lit (:op n)) (int? (:val n)) (> (:val n) 0)))
 
 (defn measure-dir
-  "The direction `node` moves loop var `v` (kind k) along a well-founded
-   measure: :down (toward 0 / empty), :up (away from 0 by a positive literal —
-   well-founded ONLY against an upper-bound guard, which check-loop verifies),
-   or nil (not a measure move). Generalises the old boolean `shrinking-expr?`:
-   :down is exactly the cases it accepted, :up is the counted-UP idiom
-   (for i=0; i<n; i++) that a bounded loop uses — the checksum/blend/pixel shape.
-   Well-foundedness of :up is NOT local: it needs the guard to bound v from
-   above, so measure-dir only reports the shape and check-loop discharges the
-   bound obligation."
-  [node v k]
-  (let [n (unwrap node)
-        h (head-sym n)]
-    (if (nil? h)
-      nil
-      (let [args (rest (typed/node-items n))]
-        ; Shape, not kind: (dec v)/(rest v) shrink toward a floor; (inc v)/
-        ; (+ v +k) grow toward a ceiling. Kind-correctness is the type
-        ; checker's obligation (P1); we own the measure shape only.
-        (cond
-          (and (= h "dec") (= 1 (count args)) (self-arg? (first args) v)) :down
-          (and (= h "inc") (= 1 (count args)) (self-arg? (first args) v)) :up
-          (and (= h "-") (= 2 (count args)) (self-arg? (first args) v)
-               (int? (unwrap (nth args 1))) (> (unwrap (nth args 1)) 0)) :down
-          (and (= h "+") (= 2 (count args)) (self-arg? (first args) v)
-               (int? (unwrap (nth args 1))) (> (unwrap (nth args 1)) 0)) :up
-          ; (+ k v) — commuted literal-first form
-          (and (= h "+") (= 2 (count args)) (self-arg? (nth args 1) v)
-               (int? (unwrap (first args))) (> (unwrap (first args)) 0)) :up
-          (and (contains? #{"rest" "next"} h) (= 1 (count args))
-               (self-arg? (first args) v)) :down
-          :else nil)))))
+  "The direction ANF node `node` moves loop var `v`: :down (toward a floor),
+   :up (away by a positive literal — well-founded only against an upper bound),
+   or nil. Reads the resolved [mod fun] the compiler emitted."
+  [node v]
+  (if (not (= :remote (:op node)))
+    nil
+    (let [k [(:mod node) (:fun node)] args (:args node)]
+      (cond
+        (and (= k [core :dec]) (= 1 (count args)) (self-var? (first args) v)) :down
+        (and (= k [core :inc]) (= 1 (count args)) (self-var? (first args) v)) :up
+        (and (= k [:erlang :-]) (= 2 (count args)) (self-var? (first args) v) (pos-lit? (nth args 1))) :down
+        (and (= k [:erlang :+]) (= 2 (count args)) (self-var? (first args) v) (pos-lit? (nth args 1))) :up
+        (and (= k [:erlang :+]) (= 2 (count args)) (self-var? (nth args 1) v) (pos-lit? (first args))) :up
+        (and (contains? #{[rt :rest] [rt :next]} k) (= 1 (count args)) (self-var? (first args) v)) :down
+        :else nil))))
 
 (defn shrinking-expr?
-  "Back-compat boolean: a :down move (the original count-DOWN measures). The
-   count-UP direction is well-founded only against a bound, so it is NOT
-   reported here — callers wanting the general measure use `measure-dir`."
-  [node v k]
-  (= :down (measure-dir node v k)))
+  "Back-compat boolean: a :down move (count-DOWN measures)."
+  [node v]
+  (= :down (measure-dir node v)))
 
-(declare find-recurs)
-
-(defn find-recurs
-  "All (recur …) forms under node (not descending into nested loop/fn —
-   those are their own obligations)."
-  [node acc]
-  (let [n (unwrap node)
-        tag (typed/node-tag n)]
-    (cond
-      (= tag :list)
-        (let [h (head-sym n)]
-          (cond
-            (= h "recur") (conj acc n)
-            (contains? #{"loop" "fn"} h) acc
-            :else (reduce (fn [a x] (find-recurs x a)) acc (typed/node-items n))))
-      (contains? #{:vector :set} tag)
-        (reduce (fn [a x] (find-recurs x a)) acc (typed/node-items n))
-      (= tag :map)
-        (reduce (fn [a p] (find-recurs (second (erlang/tuple_to_list p)) a))
-                acc (typed/node-items n))
-      :else acc)))
+; ── upper-bound harvesting over ANF ──────────────────────────────────
+;
+; A count-UP var is well-founded iff a guard bounds it above. Over ANF a guard
+; is the :test of an :if; the comparison is a :remote to erlang </<=/>/>=.
 
 (defn- cmp-bounds-above
-  "Given a comparison (op a b), the var name it bounds ABOVE, or nil. A var v is
-   bounded above by: (< v E) (<= v E) (> E v) (>= E v). E is any expression —
-   soundness needs only that v cannot grow without bound before the guard fails.
-   (For the counted loop the guard is the loop test itself; E is the length.)"
+  "The var name a comparison node bounds ABOVE, or nil: (< v E)/(<= v E) bound v;
+   (> E v)/(>= E v) bound v."
   [node]
-  (let [n (unwrap node)
-        h (head-sym n)]
-    (if (nil? h) nil
-      (let [args (rest (typed/node-items n))]
-        (if (not= 2 (count args)) nil
-          (let [a (first args) b (second args)
-                a-sym (= :symbol (typed/node-tag (unwrap a)))
-                b-sym (= :symbol (typed/node-tag (unwrap b)))
-                a-nm (if a-sym (typed/node-name (unwrap a)) nil)
-                b-nm (if b-sym (typed/node-name (unwrap b)) nil)]
-            (cond
-              (contains? #{"<" "<="} h) (if a-sym a-nm nil)   ; v < E → v bounded above
-              (contains? #{">" ">="} h) (if b-sym b-nm nil)   ; E > v → v bounded above
-              :else nil)))))))
+  (if (not (= :remote (:op node)))
+    nil
+    (let [k (:fun node) mod (:mod node) args (:args node)]
+      (if (or (not= mod :erlang) (not= 2 (count args)))
+        nil
+        (let [a (first args) b (second args)
+              a-nm (if (= :var (:op a)) (:name a) nil)
+              b-nm (if (= :var (:op b)) (:name b) nil)]
+          (cond
+            (contains? #{:< :=<} k) a-nm     ; erlang :< / :=< : v < E → v bounded above
+            (contains? #{:> :>=} k) b-nm     ; E > v → v bounded above
+            :else nil))))))
 
-(declare upper-bounded-vars)
-
-(defn upper-bounded-vars
-  "The set of loop-var names bounded ABOVE by some `if`/`when`/`and` guard in a
-   loop body — a count-UP measure on such a var is well-founded (it cannot grow
-   past the bound before the guard fails and the loop returns). Collected
-   structurally over every guard test reachable in the body."
+(defn- upper-bounded-vars
+  "Loop-var names bounded ABOVE by some guard in `node`. An :if :test is a
+   guard; an :erlang :andalso/:and conjunction bounds via any conjunct."
   [node]
-  (let [n (unwrap node)
+  (cond
+    (not (ir/node? node)) #{}
+    (= :if (:op node))
+      (let [test (:test node)
+            here (if (and (= :remote (:op test)) (contains? #{:andalso :and} (:fun test)) (= :erlang (:mod test)))
+                   (reduce (fn [acc c] (let [v (cmp-bounds-above c)] (if (nil? v) acc (conj acc v))))
+                           #{} (:args test))
+                   (let [v (cmp-bounds-above test)] (if (nil? v) #{} #{v})))]
+        (reduce (fn [acc x] (into acc (upper-bounded-vars x))) here
+                (list (:then node) (:else node))))
+    (anf-loop? node) #{}                      ; nested loop guards its own vars
+    :else (reduce (fn [acc x] (into acc (upper-bounded-vars x))) #{} (ir/child-nodes node))))
+
+; ── the verdict ────────────────────────────────────────────────────
+
+(defn check-anf-loop
+  "Termination verdict for a recognised ANF loop scaffold node."
+  [n]
+  (let [{:keys [self vars body]} (loop-parts n)
+        bounded (upper-bounded-vars body)
+        recurs (find-recurs self body)
+        nvars (count vars)
+        var-at (fn [i] (nth (apply list vars) i))
+        wf-on-all? (fn [vi]
+                     (let [v (var-at vi)]
+                       (every? (fn [newvals]
+                                 (if (< vi (count newvals))
+                                   (let [dir (measure-dir (nth newvals vi) v)]
+                                     (or (= dir :down)
+                                         (and (= dir :up) (contains? bounded v))))
+                                   false))
+                               recurs)))
+        ranking (filter wf-on-all? (range nvars))]
+    (if (empty? recurs)
+      {:status :accepted :detail "no recur — trivially terminating"}
+      (if (not (empty? ranking))
+        {:status :accepted
+         :detail (str "ranking variable: " (var-at (first ranking))
+                      " (well-founded on every recur)")}
+        {:status :rejected
+         :detail (str "no ranking variable — every loop var either fails to move "
+                      "toward a fixed endpoint or (counting up) lacks a bounding guard")}))))
+
+(defn check-loop
+  "The termination verdict for one SURFACE loop form. A ^{:decreasing …} measure
+   on the bindings vector is the trusted escape hatch; otherwise the form is
+   compiled to bl-ANF and the scaffold recogniser runs. Returns
+   {:status :accepted|:rejected|:trusted :detail …}."
+  [surface-node]
+  (let [items (typed/node-items surface-node)
+        bindings-node (second items)
+        bmeta (if (= :meta (typed/node-tag bindings-node))
+                (nth (erlang/tuple_to_list bindings-node) 2) nil)
+        decreasing (if (and (map? bmeta) (contains? bmeta :decreasing)) (:decreasing bmeta) nil)]
+    (if (some? decreasing)
+      {:status :trusted :detail (str "trusted measure: " (errors/delaborate decreasing))}
+      (let [anf (to-anf surface-node)]
+        (if (anf-loop? anf)
+          (check-anf-loop anf)
+          {:status :accepted :detail "no recur — trivially terminating"})))))
+
+; ── source-level driver ────────────────────────────────────────────
+;
+; find-loops walks the SURFACE tree to locate loop forms (their source position
+; is what an error renders against), then check-loop compiles each. Keeping the
+; location walk on the surface tree preserves the reported line/col.
+
+(defn- s-unwrap [n] (typed/node-form n))
+(defn- s-head [node]
+  (if (and (= :list (typed/node-tag node))
+           (not (empty? (typed/node-items node)))
+           (= :symbol (typed/node-tag (s-unwrap (first (typed/node-items node))))))
+    (typed/node-name (s-unwrap (first (typed/node-items node))))
+    nil))
+
+(defn find-loops
+  "All surface loop forms under node, with their verdicts."
+  [node]
+  (let [n (s-unwrap node)
         tag (typed/node-tag n)]
     (cond
       (= tag :list)
-        (let [h (head-sym n)
-              items (typed/node-items n)]
-          (cond
-            ; (if TEST then else) / (when TEST …): TEST is a guard — harvest bounds,
-            ; then recurse into the branches (nested loops guard their own vars).
-            (contains? #{"if" "when" "when-not"} h)
-              (let [test (second items)
-                    here (let [th (head-sym (unwrap test))]
-                           (if (= th "and")
-                             ; conjunction of guards: each conjunct may bound a var
-                             (reduce (fn [acc c] (let [v (cmp-bounds-above c)]
-                                                   (if (nil? v) acc (conj acc v))))
-                                     #{} (rest (typed/node-items (unwrap test))))
-                             (let [v (cmp-bounds-above test)]
-                               (if (nil? v) #{} #{v}))))]
-                (reduce (fn [acc x] (into acc (upper-bounded-vars x)))
-                        here (rest (rest items))))
-            ; don't descend into a NESTED loop/fn — its guards bind its own vars
-            (contains? #{"loop" "fn"} h) #{}
-            :else
-              (reduce (fn [acc x] (into acc (upper-bounded-vars x))) #{}
-                      (typed/node-items n))))
+        (let [h (s-head n)
+              here (if (= h "loop") [(check-loop n)] [])
+              kids (reduce (fn [a x] (concat a (find-loops x))) [] (typed/node-items n))]
+          (concat here kids))
       (contains? #{:vector :set} tag)
-        (reduce (fn [acc x] (into acc (upper-bounded-vars x))) #{} (typed/node-items n))
+        (reduce (fn [a x] (concat a (find-loops x))) [] (typed/node-items n))
       (= tag :map)
-        (reduce (fn [acc p] (into acc (upper-bounded-vars (second (erlang/tuple_to_list p)))))
-                #{} (typed/node-items n))
-      :else #{})))
-
-(defn check-loop
-  "The termination verdict for one loop form. Returns
-   {:status :accepted|:rejected|:trusted :detail …}."
-  [node]
-  (let [items (typed/node-items node)
-        bindings-node (second items)
-        ; ^{:decreasing …} on the bindings vector is the escape hatch
-        bmeta (if (= :meta (typed/node-tag bindings-node))
-                (nth (erlang/tuple_to_list bindings-node) 2)
-                nil)
-        decreasing (if (and (map? bmeta) (contains? bmeta :decreasing))
-                     (:decreasing bmeta)
-                     nil)]
-    (if (some? decreasing)
-      {:status :trusted :detail (str "trusted measure: " (errors/delaborate decreasing))}
-      (let [bs (typed/node-items (unwrap bindings-node))
-            vars (loop [xs bs m {}]
-                   (if (empty? xs)
-                     m
-                     (let [b (first xs)
-                           init (second xs)]
-                       (recur (rest (rest xs))
-                              (if (= :symbol (typed/node-tag (unwrap b)))
-                                (assoc m (typed/node-name (unwrap b))
-                                         (literal-kind init))
-                                m)))))
-            ; loop-var NAME by position, so a recur arg maps back to its var
-            var-name (fn [i] (let [b (nth bs (* 2 i))]
-                               (if (= :symbol (typed/node-tag (unwrap b)))
-                                 (typed/node-name (unwrap b)) nil)))
-            nvars (erlang/div (count bs) 2)
-            body (rest (rest items))
-            ; the guards that gate each recur: an (if <test> …) whose branch
-            ; contains the recur. bounded-above collects vars v with a guard
-            ; (< v E) / (<= v E) / (> E v) / (>= E v) — v is bounded from above,
-            ; making a count-UP measure on v well-founded.
-            ; harvest guard bounds from the loop BODY (not the loop node itself —
-            ; that would hit the nested-loop guard and see nothing)
-            bounded-above (reduce (fn [acc b] (into acc (upper-bounded-vars b)))
-                                  #{} body)
-            recurs (reduce (fn [a b] (find-recurs b a)) [] body)
-            ; A loop TERMINATES when SOME ranking variable is well-founded on
-            ; EVERY recur: it moves monotonically toward a fixed endpoint. This
-            ; is the ∃-ranking rule (Floyd) — accumulators need not shrink, only
-            ; the ranking var must. A :down move is always well-founded; a :up
-            ; move is well-founded iff the guard bounds that var above.
-            wf-on-all? (fn [vi]
-                         (let [v (var-name vi)]
-                           (and (some? v)
-                                (every?
-                                  (fn [r]
-                                    (let [args (rest (typed/node-items r))]
-                                      (if (< vi (count args))
-                                        (let [dir (measure-dir (nth args vi) v
-                                                               (get vars v :unknown))]
-                                          (or (= dir :down)
-                                              (and (= dir :up)
-                                                   (contains? bounded-above v))))
-                                        false)))
-                                  recurs))))
-            ranking (filter wf-on-all? (range nvars))]
-        (if (empty? recurs)
-          {:status :accepted :detail "no recur — trivially terminating"}
-          (if (not (empty? ranking))
-            {:status :accepted
-             :detail (str "ranking variable: " (var-name (first ranking))
-                          " (well-founded on every recur)")}
-            {:status :rejected
-             :detail (str "no ranking variable — every loop var either fails to "
-                          "move toward a fixed endpoint or (counting up) lacks a "
-                          "bounding guard: " (errors/delaborate (first recurs)))}))))))
+        (reduce (fn [a p] (concat a (find-loops (second (erlang/tuple_to_list p))))) [] (typed/node-items n))
+      :else [])))
 
 (defn check-source
   "Verdicts for every top-level (and nested-in-defn) loop in src."
   [src]
   (let [forms (BeamLisp.Reader/read_string src)]
-    (reduce
-      (fn [acc form]
-        (concat acc (find-loops form)))
-      [] forms)))
-
-(defn find-loops
-  "All loop forms under node, with their verdicts."
-  [node]
-  (let [n (unwrap node)
-        tag (typed/node-tag n)]
-    (cond
-      (= tag :list)
-        (let [h (head-sym n)
-              here (if (= h "loop") [(check-loop n)] [])
-              kids (reduce (fn [a x] (concat a (find-loops x))) []
-                           (typed/node-items n))]
-          (concat here kids))
-      (contains? #{:vector :set} tag)
-        (reduce (fn [a x] (concat a (find-loops x))) [] (typed/node-items n))
-      (= tag :map)
-        (reduce (fn [a p] (concat a (find-loops (second (erlang/tuple_to_list p)))))
-                [] (typed/node-items n))
-      :else [])))
+    (reduce (fn [acc form] (concat acc (find-loops form))) [] forms)))
