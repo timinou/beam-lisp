@@ -140,6 +140,116 @@
     Studio.lastT = e.detail.t;
   });
 
+  // ── Timeline: scrub back through every frame ──────────────────────
+  //
+  // The server kept every frame's TREE as a value, so "the screen at t" is
+  // just hiccup->html of that value — no replay, no re-running events. The
+  // past is shown in a COVER laid exactly over the live root; the live root
+  // keeps receiving patches underneath, untouched. Release → cover gone,
+  // and you are back on the present with nothing to reconcile.
+  function cover() {
+    var c = document.getElementById("studio-cover");
+    if (c) return c;
+    c = document.createElement("div");
+    c.id = "studio-cover";
+    document.body.appendChild(c);
+    return c;
+  }
+  function placeCover() {
+    var c = cover(), root = window.Live.root, r = root.getBoundingClientRect();
+    c.style.cssText = "position:absolute;left:" + (r.left + scrollX) + "px;top:" + (r.top + scrollY) +
+      "px;width:" + r.width + "px;min-height:" + r.height + "px;z-index:2147481000;background:inherit;" +
+      "outline:2px dashed #39d0d8;outline-offset:-2px";
+    c.className = root.className;
+    return c;
+  }
+  var timeline = (Studio.instruments.timeline = {
+    on: false, frames: [], cur: null, frozen: false,
+    enable: function () {
+      timeline.on = true;
+      var box = document.getElementById("pc-timeline");
+      if (box) box.hidden = false;
+      timeline.request();
+    },
+    disable: function () {
+      timeline.on = false;
+      timeline.release();
+      var box = document.getElementById("pc-timeline");
+      if (box) box.hidden = true;
+    },
+    request: function () { if (window.__pulseSend) window.__pulseSend(["timeline"]); },
+    index: function (frames) {
+      timeline.frames = frames;
+      var sc = document.getElementById("pc-scrub");
+      if (!sc || !frames.length) return;
+      sc.min = frames[0].t; sc.max = frames[frames.length - 1].t;
+      if (!timeline.frozen) { sc.value = sc.max; timeline.describe(frames[frames.length - 1], true); }
+      var ticks = document.getElementById("pc-tl-ticks");
+      if (ticks) {
+        var maxOps = Math.max.apply(null, frames.map(function (f) { return f.ops; }).concat([1]));
+        ticks.innerHTML = "";
+        frames.forEach(function (f) {
+          var d = document.createElement("div");
+          d.className = "tlt" + (f.kind === "mount" ? " mount" : "") + (timeline.cur === f.t ? " cur" : "");
+          d.style.height = Math.max(3, Math.round(18 * f.ops / maxOps)) + "px";
+          d.title = "t" + f.t + " · " + f.kind + " · " + f.ops + " op · " + (+f.ms).toFixed(1) + "ms" + (f.event !== "nil" ? " · " + f.event : "");
+          d.onclick = function () { sc.value = f.t; timeline.seek(f.t); };
+          ticks.appendChild(d);
+        });
+      }
+      if (!sc.__wired) {
+        sc.__wired = true;
+        sc.addEventListener("input", function () { timeline.seek(+sc.value); });
+      }
+    },
+    describe: function (f, live) {
+      var info = document.getElementById("pc-tl-info");
+      if (!info || !f) return;
+      info.innerHTML = (live ? "<b>live</b> · " : "<b>t" + f.t + "</b> · ") + f.kind + " · " + f.ops +
+        " op · " + (+f.ms).toFixed(1) + "ms" + (f.event && f.event !== "nil" ? " · " + f.event : "") +
+        (live ? "" : "  <i style='color:#7d8590'>(drag to the end → live)</i>");
+    },
+    seek: function (t) {
+      var last = timeline.frames.length ? timeline.frames[timeline.frames.length - 1].t : null;
+      if (t === last) return timeline.release();
+      timeline.frozen = true; timeline.cur = t;
+      if (window.__pulseSend) window.__pulseSend(["time", t]);
+    },
+    // the frame at t arrived — show it in the cover, paint the ops that made it
+    show: function (f) {
+      if (!timeline.frozen || f.missing) return;
+      var c = placeCover();
+      c.innerHTML = f.html;
+      var row = timeline.frames.find(function (x) { return x.t === f.t; });
+      timeline.describe(row || { t: f.t, kind: f.kind, ops: (f.ops || []).length, ms: f.ms, event: f.event }, false);
+      Array.prototype.forEach.call(document.querySelectorAll(".tlt"), function (d, i) {
+        d.classList.toggle("cur", timeline.frames[i] && timeline.frames[i].t === f.t);
+      });
+      paint.clear();
+      // differ paths are relative to the VIEW root (the single element under
+      // #live-root — see client.js rootEl); mirror that for the cover.
+      var viewRoot = c.children.length === 1 ? c.firstElementChild : c;
+      (f.ops || []).forEach(function (op) { paint.flash(viewRoot, op, f.t, 60000); });
+    },
+    release: function () {
+      if (!timeline.frozen) return;
+      timeline.frozen = false; timeline.cur = null;
+      var c = document.getElementById("studio-cover"); if (c) c.remove();
+      paint.clear();
+      var f = timeline.frames[timeline.frames.length - 1];
+      var sc = document.getElementById("pc-scrub"); if (sc && f) sc.value = f.t;
+      timeline.describe(f, true);
+      Array.prototype.forEach.call(document.querySelectorAll(".tlt"), function (d) { d.classList.remove("cur"); });
+    }
+  });
+  Studio.onMessage = function (m) {
+    if (m.msg === "timeline") timeline.index(m.frames);
+    else if (m.msg === "time") timeline.show(m);
+  };
+  Studio.onSnapshot = function (m) {
+    if (timeline.on && m.frame && (!timeline.frames.length || timeline.frames[timeline.frames.length - 1].t !== m.frame.t)) timeline.request();
+  };
+
   // ── persistence + chip toggles ────────────────────────────────────
   Studio.toggle = function (name, on) {
     var inst = Studio.instruments[name];

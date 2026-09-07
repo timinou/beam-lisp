@@ -27,6 +27,7 @@ can drop into the corner of any live app.
             [data.tap :as tap]
             [tooling.trace :as trace]
             [tooling.incremental :as inc]
+            [live.hiccup :as h]
             [web]
             [interop]))
 
@@ -187,7 +188,7 @@ kind histogram, and the tracked cells.
   "The snapshot as a JSON string, bl collections deep-converted so Jason can
    encode them. This is what a websocket ships each tick."
   []
-  (Jason/encode! (interop/jsonable (snapshot))))
+  (Jason/encode! (interop/jsonable (assoc (snapshot) :msg "snapshot"))))
 ```
 
 ## Shape one: the full page
@@ -308,7 +309,13 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "#pc-tools{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}"
    ".pct{background:#121821;color:#7d8590;border:1px solid #1f2733;border-radius:99px;"
    "padding:3px 10px;font:inherit;font-size:10px;text-transform:uppercase;letter-spacing:.1em;cursor:pointer}"
-   ".pct.on{color:#0a0e14;background:#39d0d8;border-color:#39d0d8;font-weight:700}"))
+   ".pct.on{color:#0a0e14;background:#39d0d8;border-color:#39d0d8;font-weight:700}"
+   "#pc-timeline{margin-bottom:10px;background:#121821;border:1px solid #1f2733;border-radius:8px;padding:8px 10px}"
+   "#pc-scrub{width:100%;accent-color:#39d0d8}"
+   "#pc-tl-info{font-size:11px;color:#e6edf3;min-height:14px}#pc-tl-info b{color:#39d0d8}"
+   "#pc-tl-ticks{display:flex;gap:2px;margin-top:6px;height:18px;align-items:flex-end}"
+   ".tlt{flex:1;min-width:2px;background:#1f2733;border-radius:1px;cursor:pointer}.tlt.cur{background:#39d0d8}.tlt.mount{background:#7d8590}"
+   "#live-root.studio-frozen{outline:2px dashed #39d0d8;outline-offset:-2px}"))
 
 (defn- chip-js []
   (str
@@ -332,9 +339,13 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "var t=s.trace||{},rc=(t.recomputed||[]);var tl=document.getElementById('pc-trace');"
    "var f=s.frame;var fl=f?`t${f.t} · ${f.kind} · ${f['op-count']} op · ${(+f.ms).toFixed(1)}ms`+(f.event&&f.event!=='nil'?` · ${f.event}`:''):'';"
    "if(tl)tl.innerHTML=rc.length?`↻ ${rc.join(', ')} → ${t['patch-ops']} op<br>${fl}`:(fl||'idle');}"
-   "function conn(){var ws=new WebSocket(ep);"
-   "ws.onmessage=function(e){render(JSON.parse(e.data))};"
-   "ws.onclose=function(){setTimeout(conn,1000)};}conn();})();"))
+   "var ws=null;function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m))}"
+   "function conn(){ws=new WebSocket(ep);window.__pulseWs=ws;"
+   "ws.onmessage=function(e){var m=JSON.parse(e.data);"
+   "if(m.msg==='snapshot'){render(m);if(window.Studio&&Studio.onSnapshot)Studio.onSnapshot(m)}"
+   "else if(window.Studio&&Studio.onMessage)Studio.onMessage(m)};"
+   "ws.onclose=function(){setTimeout(conn,1000)};}conn();"
+   "window.__pulseSend=send;})();"))
 ```
 
 ## The bold part: inject the chip into any live view, natively
@@ -364,7 +375,12 @@ raw-text tags, emitted verbatim). `with-chip` is the decorator.
    [:div {:id "pc-panel" :hidden true}
     [:div {:id "pc-head"} "pulse"]
     [:div {:id "pc-tools"}
-     [:button {:class "pct" :data-tool "paint" :title "flash the exact elements each patch op touched"} "paint"]]
+     [:button {:class "pct" :data-tool "paint" :title "flash the exact elements each patch op touched"} "paint"]
+     [:button {:class "pct" :data-tool "timeline" :title "scrub back through every frame the app rendered"} "timeline"]]
+    [:div {:id "pc-timeline" :hidden true}
+     [:input {:id "pc-scrub" :type "range" :min "1" :max "1" :value "1"}]
+     [:div {:id "pc-tl-info"}]
+     [:div {:id "pc-tl-ticks"}]]
     [:div {:id "pc-vitals"}]
     [:div {:id "pc-trace"}]
     [:div {:id "pc-cells"}]]
@@ -419,9 +435,41 @@ its router; `mount` returns everything a host needs.
       [:push (list (list :text (frame-json))) state]
     :else [:ok state]))
 
+(defn- reply [state msg]
+  [:push (list (list :text (Jason/encode! (interop/jsonable msg)))) state])
+
+(defn- frame-at
+  "One frame rendered for the timeline: its html (the tree is a value we
+   kept, so 'the screen at t' is a pure function of it), the ops that made
+   it, and the event that caused it."
+  [t]
+  (when-let [f (tap/frame (tap) t)]
+    {:t (:t f) :kind (:kind f) :ms (:ms f) :basis (:basis f)
+     :event (pr-str (:event f))
+     :ops (:ops f)
+     :html (h/hiccup->html (:tree f))}))
+
+(defn- timeline-index
+  "Every retained frame as a small row (no tree, no ops) — the scrubber."
+  []
+  (mapv (fn [f] {:t (:t f) :kind (:kind f) :ms (:ms f)
+                 :ops (count (:ops f)) :event (pr-str (:event f)) :at (:at f)})
+        (tap/frames (tap))))
+
+(defn- ws-in
+  "Requests from the chip, each a JSON list of verb and args:
+   timeline -> the scrubber index; time t -> the screen at frame t."
+  [frame state]
+  (let [req (try (interop/json-> (nth frame 1)) (catch _ nil))
+        verb (if (sequential? req) (first req) nil)]
+    (cond
+      (= verb "timeline") (reply state {:msg "timeline" :frames (timeline-index)})
+      (= verb "time")     (reply state (assoc (or (frame-at (nth req 1)) {:t (nth req 1) :missing true}) :msg "time"))
+      :else [:ok state])))
+
 (def ws-handlers
   {:init ws-init
-   :handle-in (fn [_frame state] [:ok state])
+   :handle-in ws-in
    :handle-info ws-info})
 
 (defn mount
