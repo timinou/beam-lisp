@@ -108,11 +108,27 @@ of the pattern \u2014 the roster machinery is `data.registry`, not bespoke code.
 
 (defn track
   "Register a cell for the dashboard: `kind` keyword, `name` label, `reader` a
-   zero-arg fn returning a snapshot of the cell's value. Returns an id for
-   `untrack`. An untracked cell still counts in the native vitals; it simply
-   has no labelled row."
-  [kind name reader]
-  (registry/enroll (reg) kind name {:reader reader}))
+   zero-arg fn returning a snapshot of the cell's value. An optional `writer`
+   (fn [new-value]) lets the studio SET the cell from the chip — the cell is
+   then driveable, not just visible. Returns an id for `untrack`. An
+   untracked cell still counts in the native vitals; it simply has no row."
+  ([kind name reader] (track kind name reader nil))
+  ([kind name reader writer]
+   (registry/enroll (reg) kind name {:reader reader :writer writer})))
+
+(defn set!
+  "Write `value` (an EDN string, read here) into the tracked cell `name`
+   through its writer. Returns {:ok name} or {:error why}."
+  [cell-name edn]
+  (let [e (first (filter (fn [e] (= (str (:name e)) (str cell-name))) (registry/entries (reg))))
+        w (when e (:writer (:meta e)))]
+    (cond
+      (nil? e) {:error (str "no tracked cell " cell-name)}
+      (nil? w) {:error (str cell-name " is read-only (tracked without a writer)")}
+      ;; the chip is a DEV instrument with full authority (it can already fire
+      ;; any intent); the value is evaluated as bl, so `(range 3)` works too.
+      :else (try (w (BeamLisp/eval edn)) {:ok cell-name}
+                 (catch err {:error (str err)})))))
 
 (defn untrack
   "Drop a tracked cell from the dashboard."
@@ -148,6 +164,7 @@ kind histogram, and the tracked cells.
              :kind (:kind e)
              :name (:name e)
              :age-ms (- now (:since e))
+             :writable (some? (:writer (:meta e)))
              :value (try (pr-str ((:reader (:meta e)))) (catch _ ":unreadable"))})
           (registry/entries (reg)))))
 
@@ -315,7 +332,14 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "#pc-tl-info{font-size:11px;color:#e6edf3;min-height:14px}#pc-tl-info b{color:#39d0d8}"
    "#pc-tl-ticks{display:flex;gap:2px;margin-top:6px;height:18px;align-items:flex-end}"
    ".tlt{flex:1;min-width:2px;background:#1f2733;border-radius:1px;cursor:pointer}.tlt.cur{background:#39d0d8}.tlt.mount{background:#7d8590}"
-   "#live-root.studio-frozen{outline:2px dashed #39d0d8;outline-offset:-2px}"))
+   "#pc-inspect{margin-bottom:10px;background:#121821;border:1px solid #1f2733;border-radius:8px;padding:8px 10px;font-size:11px}"
+   "#pc-in-head{color:#ffd166;font-weight:700;margin-bottom:4px}"
+   "#pc-in-body .row{padding:3px 0;border-top:1px solid #1f2733;color:#e6edf3;word-break:break-all}"
+   "#pc-in-body .k{color:#7d8590;margin-right:6px}#pc-in-body .ev{color:#c084fc}"
+   "#pc-in-body button{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 8px;font:inherit;cursor:pointer;margin-left:6px}"
+   "#pc-in-body input{background:#0a0e14;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 6px;font:inherit;width:100%;margin-top:3px}"
+   ".pcc .set{background:none;border:none;color:#39d0d8;cursor:pointer;font:inherit;padding:0 0 0 6px}"
+   ".studio-pick{outline:2px solid #ffd166!important;outline-offset:2px}"))
 
 (defn- chip-js []
   (str
@@ -335,7 +359,8 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "`<div class=pcv><b>${s.vitals['tracked']}</b><i>tracked</i></div>`+"
    "`<div class=pcv><b>${fb(s.vitals['retained-bytes'])}</b><i>retained</i></div>`;"
    "document.getElementById('pc-cells').innerHTML=(s.cells||[]).map(c=>"
-   "`<div class=pcc><span class=k>${c.kind}:${c.name}</span><span class=v>${c.value}</span></div>`).join('');"
+   "`<div class=pcc><span class=k>${c.kind}:${c.name}</span><span class=v title=\"${String(c.value).replace(/\"/g,'&quot;')}\">${c.value}</span>${c.writable?`<button class=set data-cell=\"${c.name}\" data-val=\"${String(c.value).replace(/\"/g,'&quot;')}\">✎</button>`:''}</div>`).join('');"
+   "document.querySelectorAll('#pc-cells .set').forEach(function(b){b.onclick=function(){var v=prompt('set '+b.getAttribute('data-cell')+' to (edn):',b.getAttribute('data-val'));if(v!=null)send(['set',b.getAttribute('data-cell'),v])}});"
    "var t=s.trace||{},rc=(t.recomputed||[]);var tl=document.getElementById('pc-trace');"
    "var f=s.frame;var fl=f?`t${f.t} · ${f.kind} · ${f['op-count']} op · ${(+f.ms).toFixed(1)}ms`+(f.event&&f.event!=='nil'?` · ${f.event}`:''):'';"
    "if(tl)tl.innerHTML=rc.length?`↻ ${rc.join(', ')} → ${t['patch-ops']} op<br>${fl}`:(fl||'idle');}"
@@ -376,7 +401,11 @@ raw-text tags, emitted verbatim). `with-chip` is the decorator.
     [:div {:id "pc-head"} "pulse"]
     [:div {:id "pc-tools"}
      [:button {:class "pct" :data-tool "paint" :title "flash the exact elements each patch op touched"} "paint"]
-     [:button {:class "pct" :data-tool "timeline" :title "scrub back through every frame the app rendered"} "timeline"]]
+     [:button {:class "pct" :data-tool "timeline" :title "scrub back through every frame the app rendered"} "timeline"]
+     [:button {:class "pct" :data-tool "inspect" :title "alt-click any element: what it is, what feeds it, what touched it — and fire its events"} "inspect"]]
+    [:div {:id "pc-inspect" :hidden true}
+     [:div {:id "pc-in-head"} "alt-click an element"]
+     [:div {:id "pc-in-body"}]]
     [:div {:id "pc-timeline" :hidden true}
      [:input {:id "pc-scrub" :type "range" :min "1" :max "1" :value "1"}]
      [:div {:id "pc-tl-info"}]
@@ -418,6 +447,55 @@ its router; `mount` returns everything a host needs.
 ```beam-lisp
 (defn- send-tick! []
   (erlang/send_after 2000 (erlang/self) [:pulse/tick]))
+
+(defn- node-children
+  "The child slots a differ path indexes: strings and elements, nils dropped,
+   seqs spliced (mirrors live.diff `children-of`)."
+  [node]
+  (if (and (vector? node) (keyword? (first node)))
+    (let [body (if (map? (second node)) (drop 2 node) (rest node))]
+      (into [] (remove nil? (mapcat (fn [c] (if (and (sequential? c) (not (vector? c))) c [c])) body))))
+    []))
+
+(defn node-at
+  "The hiccup node at differ `path` (a vector of child indices) in `tree`."
+  [tree path]
+  (reduce (fn [n i] (when n (get (node-children n) i))) tree path))
+
+(defn- path-prefix? [p q]
+  (and (<= (count p) (count q)) (= p (subvec (into [] q) 0 (count p)))))
+
+(defn touched
+  "Every retained frame whose ops touched `path` or anything under it —
+   the history of one element, read straight off the tap ring."
+  [path]
+  (into []
+    (keep (fn [f]
+            (let [hits (filter (fn [op] (path-prefix? path (nth op 1))) (:ops f))]
+              (when (seq hits)
+                {:t (:t f) :event (pr-str (:event f)) :ops (into [] hits)})))
+          (tap/frames (tap)))))
+
+(defn inspect
+  "Everything the studio can say about the element at `path`: the hiccup
+   node (tag, attrs, its event terms — the :on-* values are DATA, so they
+   can be shown, edited, and fired), its owner, and the frames that touched
+   it."
+  [path]
+  (let [f (tap/latest (tap))
+        node (when f (node-at (:tree f) path))
+        tag (when (vector? node) (first node))
+        attrs (when (and (vector? node) (map? (second node))) (second node))
+        events (when attrs
+                 (into {} (filter (fn [[k _]] (String/starts_with? (name k) "on-")) attrs)))]
+    {:path path
+     :tag (when tag (name tag))
+     :attrs (when attrs (pr-str (apply dissoc attrs (keys events))))
+     :events (into {} (map (fn [[k v]] [(name k) (pr-str v)]) events))
+     :text (when (string? node) node)
+     :owner (or (get attrs :data-tr) (get attrs :key))
+     :touched (touched path)
+     :t (:t f)}))
 
 (defn- ws-init [_state]
   ;; per-commit push: this ws process subscribes to the tap, so a frame is
@@ -465,6 +543,8 @@ its router; `mount` returns everything a host needs.
     (cond
       (= verb "timeline") (reply state {:msg "timeline" :frames (timeline-index)})
       (= verb "time")     (reply state (assoc (or (frame-at (nth req 1)) {:t (nth req 1) :missing true}) :msg "time"))
+      (= verb "inspect")  (reply state (assoc (inspect (into [] (nth req 1))) :msg "inspect"))
+      (= verb "set")      (reply state (assoc (set! (nth req 1) (nth req 2)) :msg "set"))
       :else [:ok state])))
 
 (def ws-handlers

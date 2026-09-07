@@ -242,9 +242,110 @@
       Array.prototype.forEach.call(document.querySelectorAll(".tlt"), function (d) { d.classList.remove("cur"); });
     }
   });
+  // ── Inspect + Drive: point at anything, ask, and act ──────────────
+  //
+  // Alt-click an element → its differ path (Live.pathOf, the inverse of the
+  // walk the patcher does) → the server answers from the tap's latest TREE:
+  // the hiccup node, its :on-* event terms (data, so they can be shown and
+  // FIRED from here through the app's own socket), its owner, and every
+  // retained frame whose ops touched it. A tracked cell with a writer can
+  // be set from the cells list (✎) — and Paint shows what that changed.
+  var inspect = (Studio.instruments.inspect = {
+    on: false, picked: null,
+    enable: function () {
+      inspect.on = true;
+      var box = document.getElementById("pc-inspect"); if (box) box.hidden = false;
+      document.addEventListener("click", inspect.onClick, true);
+    },
+    disable: function () {
+      inspect.on = false;
+      document.removeEventListener("click", inspect.onClick, true);
+      inspect.unpick();
+      var box = document.getElementById("pc-inspect"); if (box) box.hidden = true;
+    },
+    unpick: function () {
+      if (inspect.picked) inspect.picked.classList.remove("studio-pick");
+      inspect.picked = null;
+    },
+    onClick: function (e) {
+      if (!e.altKey) return;
+      var root = window.Live.root;
+      if (!root.contains(e.target)) return;
+      e.preventDefault(); e.stopPropagation();
+      inspect.pick(e.target);
+    },
+    pick: function (el) {
+      var path = window.Live.pathOf(window.Live.root, el);
+      if (!path) return;
+      inspect.unpick();
+      inspect.picked = el; el.classList.add("studio-pick");
+      if (window.__pulseSend) window.__pulseSend(["inspect", path]);
+    },
+    show: function (m) {
+      var head = document.getElementById("pc-in-head"), body = document.getElementById("pc-in-body");
+      if (!head || !body) return;
+      var own = inspect.picked ? ownerOf(inspect.picked) : { kind: "?", name: "?" };
+      head.textContent = "<" + (m.tag || "#text") + "> [" + m.path.join(" ") + "] · " + own.kind + ":" + own.name;
+      var rows = [];
+      if (m.text) rows.push("<div class=row><span class=k>text</span>" + esc(m.text) + "</div>");
+      if (m.attrs && m.attrs !== "{}") rows.push("<div class=row><span class=k>attrs</span>" + esc(m.attrs) + "</div>");
+      Object.keys(m.events || {}).forEach(function (k) {
+        rows.push("<div class=row><span class=k>" + k + "</span><span class=ev>" + esc(m.events[k]) +
+          "</span><button data-fire='" + esc(m.events[k]) + "'>fire</button></div>");
+      });
+      if (m.touched && m.touched.length) {
+        rows.push("<div class=row><span class=k>touched by</span>" + m.touched.map(function (h) {
+          return "<button data-seek='" + h.t + "' title='" + esc(h.event) + " · " + h.ops.map(function (o) { return o[0]; }).join(",") + "'>t" + h.t + "</button>";
+        }).join("") + "</div>");
+      } else rows.push("<div class=row><span class=k>touched by</span>nothing yet</div>");
+      body.innerHTML = rows.join("");
+      body.querySelectorAll("[data-fire]").forEach(function (b) {
+        b.onclick = function () { inspect.fire(b.getAttribute("data-fire")); };
+      });
+      body.querySelectorAll("[data-seek]").forEach(function (b) {
+        b.onclick = function () {
+          if (!timeline.on) Studio.toggle("timeline", true);
+          var t = +b.getAttribute("data-seek"), sc = document.getElementById("pc-scrub");
+          if (sc) sc.value = t;
+          timeline.seek(t);
+        };
+      });
+    },
+    // fire an event term exactly as a click on the element would — through
+    // the APP's socket, so auth/intents/commit all run for real
+    fire: function (edn) {
+      var term = ednTerm(edn);
+      if (!term || !window.Live.ws) return;
+      (window.Live.ws.__send || window.Live.ws.send.bind(window.Live.ws))(JSON.stringify(["event", term, {}]));
+    }
+  });
+  // a tiny reader for the event-term subset the socket accepts:
+  // [:intent :op {:k "v" :n 1}] · [:assign :key value] · [:navigate "/x"]
+  function ednTerm(src) {
+    var i = 0;
+    function ws() { while (i < src.length && /[\s,]/.test(src[i])) i++; }
+    function read() {
+      ws();
+      var c = src[i];
+      if (c === "[") { i++; var v = []; for (;;) { ws(); if (src[i] === "]") { i++; return v; } v.push(read()); } }
+      if (c === "{") { i++; var m = {}; for (;;) { ws(); if (src[i] === "}") { i++; return m; } var k = read(); var val = read(); m[typeof k === "string" ? k.replace(/^:/, "") : String(k)] = val; } }
+      if (c === '"') { i++; var s = ""; while (src[i] !== '"') { if (src[i] === "\\") i++; s += src[i++]; } i++; return s; }
+      var j = i; while (i < src.length && !/[\s,\[\]{}]/.test(src[i])) i++;
+      var tok = src.slice(j, i);
+      if (tok === "nil") return null; if (tok === "true") return true; if (tok === "false") return false;
+      if (/^-?\d+(\.\d+)?$/.test(tok)) return +tok;
+      return tok.replace(/^:/, "");
+    }
+    try { return read(); } catch (_e) { return null; }
+  }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/'/g, "&#39;"); }
+  Studio.ednTerm = ednTerm;
+
   Studio.onMessage = function (m) {
     if (m.msg === "timeline") timeline.index(m.frames);
     else if (m.msg === "time") timeline.show(m);
+    else if (m.msg === "inspect") inspect.show(m);
+    else if (m.msg === "set" && m.error) alert("studio: " + m.error);
   };
   Studio.onSnapshot = function (m) {
     if (timeline.on && m.frame && (!timeline.frames.length || timeline.frames[timeline.frames.length - 1].t !== m.frame.t)) timeline.request();
