@@ -13,7 +13,19 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 
-rustler::atoms! { ok, retry, cycle }
+rustler::atoms! { ok, retry, cycle, fast, dirty, reroute }
+
+/// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must
+/// return in well under 1 ms or it stalls every process on its scheduler.
+/// Copying a term through an OwnedEnv is memcpy-order work; 64 KiB keeps the
+/// fast path comfortably sub-100 us on this class of hardware. Larger cells
+/// take the dirty lane exactly as before. Tunable via `nif_set_fast_lane_bytes`.
+const DEFAULT_FAST_LANE_BYTES: usize = 64 * 1024;
+static FAST_LANE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_FAST_LANE_BYTES);
+
+fn fast_lane_bytes() -> usize {
+    FAST_LANE_BYTES.load(Ordering::Acquire)
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_CELLS: AtomicUsize = AtomicUsize::new(0);
@@ -187,8 +199,29 @@ fn reclaim_state(state: State) {
     enqueue_reclaim(env);
 }
 
+/// Fast-lane reclaim. The reclaimer thread exists so that freeing a LARGE
+/// term never stalls a scheduler; for a term under the fast-lane ceiling the
+/// free is memcpy-order and the channel hop is pure overhead. Drop it here.
+fn reclaim_state_small(state: State) {
+    let State { term, env, .. } = state;
+    drop(term);
+    drop(env);
+}
+
+/// Dirty lane: a large initial value copies megabytes into the cell.
 #[rustler::nif(name = "nif_new", schedule = "DirtyCpu")]
 fn new(
+    state: Term<'_>,
+    dependencies: Vec<ResourceArc<MemoCell>>,
+    estimate: u64,
+) -> NifResult<ResourceArc<MemoCell>> {
+    allocate(state, dependencies, estimate, false)
+}
+
+/// Fast lane: regular scheduler. `LazyMemo.create` routes here only when the
+/// estimate is under the fast-lane ceiling, so the initial copy is bounded.
+#[rustler::nif(name = "nif_new_fast")]
+fn new_fast(
     state: Term<'_>,
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
@@ -225,6 +258,14 @@ fn allocate(
 struct Cursor {
     position: Mutex<SavedTerm>,
     source: ResourceArc<MemoCell>,
+    // Whether pulling a chunk must take the dirty lane. Decided ONCE, at cursor
+    // creation, from the source's average element size: a chunk copies at most
+    // 32 heads, so `32 * avg_bytes <= ceiling` keeps a chunk within the
+    // fast-lane budget. Immutable, and cloned onto every sub-cursor so the
+    // decision holds for the whole walk. Residual: a list whose bytes are
+    // concentrated in a few giant elements has a small average yet a large
+    // chunk; such lists are rare, and lowering the ceiling forces them dirty.
+    dirty_chunks: bool,
 }
 #[rustler::resource_impl]
 impl rustler::Resource for Cursor {}
@@ -235,8 +276,15 @@ fn cursor(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
 ) -> NifResult<ResourceArc<Cursor>> {
-    list.list_length()?;
+    let len = list.list_length()?;
     let source = allocate(list, dependencies, estimate, true)?;
+    let retained = lock(&source.state)
+        .as_ref()
+        .ok_or(rustler::Error::BadArg)?
+        .retained_bytes;
+    // 32 * (retained / len) > ceiling  ⇔  a chunk may exceed the budget.
+    let avg = if len > 0 { retained / len } else { retained };
+    let dirty_chunks = avg.saturating_mul(32) > fast_lane_bytes();
     let position = lock(&source.state)
         .as_ref()
         .ok_or(rustler::Error::BadArg)?
@@ -245,11 +293,18 @@ fn cursor(
     Ok(ResourceArc::new(Cursor {
         position: Mutex::new(position),
         source,
+        dirty_chunks,
     }))
 }
 
-#[rustler::nif(name = "nif_cursor_chunk", schedule = "DirtyCpu")]
-fn cursor_chunk<'a>(
+/// Whether this cursor's chunks must take the dirty lane. `SeqCursor` reads it
+/// ONCE at creation and threads the answer, so no per-chunk NIF is needed.
+#[rustler::nif(name = "nif_cursor_dirty_chunks")]
+fn cursor_dirty_chunks(cursor: ResourceArc<Cursor>) -> bool {
+    cursor.dirty_chunks
+}
+
+fn cursor_chunk_impl<'a>(
     env: Env<'a>,
     cursor: ResourceArc<Cursor>,
 ) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
@@ -273,10 +328,32 @@ fn cursor_chunk<'a>(
             Some(ResourceArc::new(Cursor {
                 position: Mutex::new(state.env.save(remaining)),
                 source: cursor.source.clone(),
+                dirty_chunks: cursor.dirty_chunks,
             }))
         };
         Ok((chunk, tail))
     })
+}
+
+/// Fast lane: regular scheduler. A chunk is at most 32 heads and the cursor's
+/// `dirty_chunks` flag (set at creation) guarantees that stays within the
+/// fast-lane byte budget; `SeqCursor` calls this entry for a normal cursor.
+#[rustler::nif(name = "nif_cursor_chunk_fast")]
+fn cursor_chunk_fast<'a>(
+    env: Env<'a>,
+    cursor: ResourceArc<Cursor>,
+) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    cursor_chunk_impl(env, cursor)
+}
+
+/// Dirty lane: for a cursor whose elements are large enough that a 32-head
+/// chunk may copy more than the ceiling.
+#[rustler::nif(name = "nif_cursor_chunk", schedule = "DirtyCpu")]
+fn cursor_chunk<'a>(
+    env: Env<'a>,
+    cursor: ResourceArc<Cursor>,
+) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    cursor_chunk_impl(env, cursor)
 }
 
 #[rustler::nif(name = "nif_dependency_resource")]
@@ -288,15 +365,55 @@ fn dependency_resource(term: Term<'_>) -> Option<ResourceArc<MemoCell>> {
     })
 }
 
-#[rustler::nif(name = "nif_read", schedule = "DirtyCpu")]
-fn read<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+/// Which scheduler lane a cell's current contents belong on. Non-dirty and
+/// O(1): it reads the byte accounting the cell already maintains. Callers
+/// route `read`/`compare_exchange` on this answer so a tiny memo never pays
+/// the dirty-scheduler migration that a multi-megabyte value legitimately needs.
+#[rustler::nif(name = "nif_lane")]
+fn lane(resource: ResourceArc<MemoCell>) -> NifResult<Atom> {
+    let guard = lock(&resource.state);
+    let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
+    Ok(if state.retained_bytes <= fast_lane_bytes() { fast() } else { dirty() })
+}
+
+#[rustler::nif(name = "nif_fast_lane_bytes")]
+fn get_fast_lane_bytes() -> u64 {
+    fast_lane_bytes() as u64
+}
+
+#[rustler::nif(name = "nif_set_fast_lane_bytes")]
+fn set_fast_lane_bytes(bytes: u64) -> NifResult<u64> {
+    let bytes = usize::try_from(bytes).map_err(|_| rustler::Error::BadArg)?;
+    FAST_LANE_BYTES.store(bytes, Ordering::Release);
+    Ok(bytes as u64)
+}
+
+fn read_impl<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
     let guard = lock(&resource.state);
     let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
     Ok(state.env.run(|owned| state.term.load(owned).in_env(env)))
 }
 
-#[rustler::nif(name = "nif_compare_exchange", schedule = "DirtyCpu")]
-fn compare_exchange<'a>(
+/// Fast lane: regular scheduler. Bounded only for cells at or under the fast
+/// lane byte ceiling; `LazyMemo.read/1` checks `nif_lane` first and routes
+/// larger cells to the dirty `nif_read`.
+#[rustler::nif(name = "nif_read_fast")]
+fn read_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    read_impl(env, resource)
+}
+
+/// Dirty lane: unchanged behaviour for large values.
+#[rustler::nif(name = "nif_read", schedule = "DirtyCpu")]
+fn read<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    read_impl(env, resource)
+}
+
+/// Shared CAS body. `fast_lane` makes the call refuse (with `reroute`) any
+/// work that could not be bounded: a large current or replacement term, or a
+/// dependency set that adds NEW edges (whose cycle walk is unbounded). The
+/// caller then retries on the dirty lane. Everything the fast lane does accept
+/// is O(1) plus a small-term copy, which is what a regular-scheduler NIF may do.
+fn compare_exchange_impl<'a>(
     env: Env<'a>,
     resource: ResourceArc<MemoCell>,
     expected: Term<'_>,
@@ -304,6 +421,7 @@ fn compare_exchange<'a>(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
     notifications: Vec<(LocalPid, Term<'a>)>,
+    fast_lane: bool,
 ) -> NifResult<Atom> {
     if resource.read_only {
         return Err(rustler::Error::BadArg);
@@ -312,6 +430,13 @@ fn compare_exchange<'a>(
     let dependencies = dependency_ids(dependencies);
     let mut cell = lock(&resource.state);
     let current = cell.as_ref().ok_or(rustler::Error::BadArg)?;
+    if fast_lane {
+        let ceiling = fast_lane_bytes();
+        if current.retained_bytes > ceiling || retained_bytes > ceiling {
+            drop(cell);
+            return Ok(reroute());
+        }
+    }
     let identical = current
         .env
         .run(|owned| current.term.load(owned) == expected);
@@ -320,7 +445,8 @@ fn compare_exchange<'a>(
         return Ok(retry());
     }
 
-    let replacement = save(replacement, retained_bytes);
+    // Decide the cycle question BEFORE copying the replacement term: a
+    // rejected attempt then costs no term copy and no deferred reclaim.
     let mut edges = lock(graph());
     // Existing edges cannot introduce a new cycle. Claims and waiter updates
     // normally retain exactly the same dependencies as the previous state.
@@ -330,13 +456,19 @@ fn compare_exchange<'a>(
         .copied()
         .filter(|id| !previous.is_some_and(|old| old.contains(id)))
         .collect();
+    if fast_lane && !added.is_empty() {
+        // New edges mean an unbounded cycle walk: not fast-lane work.
+        drop(edges);
+        drop(cell);
+        return Ok(reroute());
+    }
     if would_cycle(&edges, resource.id, &added) {
         drop(edges);
         drop(cell);
-        reclaim_state(replacement);
         return Ok(cycle());
     }
 
+    let replacement = save(replacement, retained_bytes);
     edges.insert(resource.id, dependencies);
     let old = cell.replace(replacement).ok_or(rustler::Error::BadArg)?;
     saturating_sub(&RETAINED_BYTES, old.retained_bytes);
@@ -349,8 +481,43 @@ fn compare_exchange<'a>(
     for (pid, message) in notifications {
         let _ = env.send(&pid, message);
     }
-    reclaim_state(old);
+    if fast_lane {
+        reclaim_state_small(old);
+    } else {
+        reclaim_state(old);
+    }
     Ok(ok())
+}
+
+/// Fast lane: regular scheduler. Self-guarding: it answers `reroute` (and
+/// changes nothing) for a large current value, a large replacement, or any
+/// NEW dependency edge, so it can never be tricked into unbounded work. The
+/// caller retries `nif_compare_exchange` on `reroute`.
+#[rustler::nif(name = "nif_compare_exchange_fast")]
+fn compare_exchange_fast<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+    expected: Term<'_>,
+    replacement: Term<'a>,
+    dependencies: Vec<ResourceArc<MemoCell>>,
+    estimate: u64,
+    notifications: Vec<(LocalPid, Term<'a>)>,
+) -> NifResult<Atom> {
+    compare_exchange_impl(env, resource, expected, replacement, dependencies, estimate, notifications, true)
+}
+
+/// Dirty lane: unchanged behaviour for large values or new dependency edges.
+#[rustler::nif(name = "nif_compare_exchange", schedule = "DirtyCpu")]
+fn compare_exchange<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+    expected: Term<'_>,
+    replacement: Term<'a>,
+    dependencies: Vec<ResourceArc<MemoCell>>,
+    estimate: u64,
+    notifications: Vec<(LocalPid, Term<'a>)>,
+) -> NifResult<Atom> {
+    compare_exchange_impl(env, resource, expected, replacement, dependencies, estimate, notifications, false)
 }
 
 #[rustler::nif(name = "nif_id")]

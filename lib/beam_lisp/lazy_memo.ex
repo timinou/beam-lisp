@@ -37,20 +37,72 @@ defmodule BeamLisp.LazyMemo do
 
   def create(state) do
     ensure_loaded!()
-    nif_new(state, dependencies(state), estimate_bytes(state))
+    deps = dependencies(state)
+    bytes = estimate_bytes(state)
+
+    # A small initial value is copied on a regular scheduler; a large one
+    # (which copies megabytes into the cell) takes the dirty lane. The
+    # estimate is known here, before the call, so the lane is chosen directly
+    # — no reroute round-trip needed for creation.
+    if bytes <= nif_fast_lane_bytes() do
+      nif_new_fast(state, deps, bytes)
+    else
+      nif_new(state, deps, bytes)
+    end
+  end
+
+  @doc """
+  Create an EAGER reference cell: GC-owned like any cell, but its value is not
+  scanned for dependency edges and not cycle-checked. This is what an atom
+  wants — it holds ordinary data (which may legally point back at another
+  atom), and a lazy memo's cycle rejection would wrongly refuse those. Ownership
+  is unaffected: the saved term still holds any embedded resource handles.
+  """
+  def create_ref(value) do
+    ensure_loaded!()
+    bytes = estimate_bytes(value)
+
+    if bytes <= nif_fast_lane_bytes() do
+      nif_new_fast(value, [], bytes)
+    else
+      nif_new(value, [], bytes)
+    end
+  end
+
+  @doc "Compare-exchange on an eager ref cell: no dependency scan, no cycle check."
+  def exchange_ref(resource, expected, value, notifications \\ []) do
+    ensure_loaded!()
+    bytes = estimate_bytes(value)
+
+    if bytes <= nif_fast_lane_bytes() do
+      case nif_compare_exchange_fast(resource, expected, value, [], bytes, notifications) do
+        :reroute -> nif_compare_exchange(resource, expected, value, [], bytes, notifications)
+        outcome -> outcome
+      end
+    else
+      nif_compare_exchange(resource, expected, value, [], bytes, notifications)
+    end
   end
 
   def exchange(resource, expected, state, notifications \\ []) do
     ensure_loaded!()
+    deps = dependencies(state)
+    bytes = estimate_bytes(state)
 
-    nif_compare_exchange(
-      resource,
-      expected,
-      state,
-      dependencies(state),
-      estimate_bytes(state),
-      notifications
-    )
+    # Two scheduler lanes, one cell. The fast lane is a regular-scheduler NIF
+    # and must finish well under 1 ms. The NIF itself guarantees that bound:
+    # it answers `:reroute` for a large current value, a large replacement, or
+    # any NEW dependency edge (an unbounded cycle walk), and we then take the
+    # dirty lane. The router only skips the fast attempt when the replacement
+    # is obviously too big, so the common tiny-memo case costs one crossing.
+    if bytes <= nif_fast_lane_bytes() do
+      case nif_compare_exchange_fast(resource, expected, state, deps, bytes, notifications) do
+        :reroute -> nif_compare_exchange(resource, expected, state, deps, bytes, notifications)
+        outcome -> outcome
+      end
+    else
+      nif_compare_exchange(resource, expected, state, deps, bytes, notifications)
+    end
   end
 
   def dependencies(term) do
@@ -124,7 +176,13 @@ defmodule BeamLisp.LazyMemo do
     nif_cursor(list, dependencies(list), estimate_bytes(list))
   end
 
-  def cursor_chunk(resource), do: nif_cursor_chunk(resource)
+  @doc "Whether this cursor's chunks must take the dirty lane (decided at creation)."
+  def cursor_dirty_chunks?(resource), do: nif_cursor_dirty_chunks(resource)
+
+  @doc "Pull the next chunk. `dirty?` (from `cursor_dirty_chunks?/1`) picks the lane."
+  def cursor_chunk(resource, dirty? \\ false)
+  def cursor_chunk(resource, false), do: nif_cursor_chunk_fast(resource)
+  def cursor_chunk(resource, true), do: nif_cursor_chunk(resource)
 
   def estimate_bytes(term), do: :erts_debug.flat_size(term) * :erlang.system_info(:wordsize)
 
@@ -160,7 +218,23 @@ defmodule BeamLisp.LazyMemo do
 
   def read(resource) do
     ensure_loaded!()
-    nif_read(resource)
+
+    case nif_lane(resource) do
+      :fast -> nif_read_fast(resource)
+      :dirty -> nif_read(resource)
+    end
+  end
+
+  @doc "Byte ceiling below which cell reads/writes take the regular-scheduler lane."
+  def fast_lane_bytes do
+    ensure_loaded!()
+    nif_fast_lane_bytes()
+  end
+
+  @doc "Tune the fast-lane ceiling. Raising it trades scheduler fairness for throughput."
+  def set_fast_lane_bytes(bytes) when is_integer(bytes) and bytes >= 0 do
+    ensure_loaded!()
+    nif_set_fast_lane_bytes(bytes)
   end
 
   def compare_exchange(resource, expected, replacement, dependencies, bytes) do
@@ -187,6 +261,24 @@ defmodule BeamLisp.LazyMemo do
   @doc false
   def nif_read(_resource), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
+  def nif_read_fast(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_lane(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_fast_lane_bytes, do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_set_fast_lane_bytes(_bytes), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_compare_exchange_fast(
+        _resource,
+        _expected,
+        _replacement,
+        _dependencies,
+        _bytes,
+        _notifications
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
   def nif_compare_exchange(
         _resource,
         _expected,
@@ -204,9 +296,15 @@ defmodule BeamLisp.LazyMemo do
   @doc false
   def nif_stats, do: :erlang.nif_error(:nif_not_loaded)
   @doc false
+  def nif_new_fast(_state, _dependencies, _bytes), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
   def nif_cursor(_list, _dependencies, _bytes), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_cursor_chunk(_cursor), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_cursor_chunk_fast(_cursor), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_cursor_dirty_chunks(_cursor), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_dependency_resource(_term), do: :erlang.nif_error(:nif_not_loaded)
 end

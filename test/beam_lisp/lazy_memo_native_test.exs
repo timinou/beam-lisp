@@ -114,6 +114,112 @@ defmodule BeamLisp.LazyMemoNativeTest do
     end
   end
 
+  # ---- W1: cursor + create lanes ----
+
+  test "a small-element cursor pulls chunks on the fast lane and preserves order" do
+    list = Enum.to_list(1..1000)
+    cur = LazyMemo.cursor(list)
+    refute LazyMemo.cursor_dirty_chunks?(cur)
+    # fast and dirty pulls yield identical chunks
+    {fast_chunk, _} = LazyMemo.nif_cursor_chunk_fast(cur)
+    assert fast_chunk == Enum.to_list(1..32)
+    # full walk through the public SeqCursor preserves every value
+    assert Enum.to_list(BeamLisp.SeqCursor.new(list)) == list
+  end
+
+  test "a large-element cursor routes chunks to the dirty lane" do
+    # 3000 elements each a ~3KB map: 32 of them exceeds a 64KiB chunk budget.
+    big_elem = Map.new(1..300, fn i -> {i, i} end)
+    list = List.duplicate(big_elem, 3000)
+    cur = LazyMemo.cursor(list)
+    assert LazyMemo.cursor_dirty_chunks?(cur)
+    # still correct through the dirty lane
+    assert Enum.take(BeamLisp.SeqCursor.new(list), 2) == [big_elem, big_elem]
+  end
+
+  test "create routes by size and both lanes hold the same value" do
+    small = LazyMemo.create(:x)
+    assert :fast = LazyMemo.nif_lane(small)
+    assert :x = LazyMemo.read(small)
+    big = LazyMemo.create(Map.new(1..50_000, fn i -> {i, i} end))
+    assert :dirty = LazyMemo.nif_lane(big)
+  end
+
+  # ---- scheduler lanes: one cell, two lanes, chosen by measured size ----
+
+  test "small cells route to the fast lane; large cells stay dirty" do
+    small = LazyMemo.create({:value, 1})
+    assert :fast = LazyMemo.nif_lane(small)
+
+    big = LazyMemo.create(Map.new(1..50_000, fn i -> {i, i} end))
+    assert :dirty = LazyMemo.nif_lane(big)
+    # both lanes read the same value
+    assert {:value, 1} = LazyMemo.read(small)
+    assert LazyMemo.read(big) == LazyMemo.nif_read(big)
+  end
+
+  test "fast CAS reroutes on a large replacement and on a NEW dependency edge" do
+    small = LazyMemo.create(:a)
+    big_term = Map.new(1..50_000, fn i -> {i, i} end)
+    big_bytes = LazyMemo.estimate_bytes(big_term)
+    assert :reroute = LazyMemo.nif_compare_exchange_fast(small, :a, big_term, [], big_bytes, [])
+    # untouched
+    assert :a = LazyMemo.read(small)
+
+    other = LazyMemo.create(:o)
+    # adding a brand-new edge is unbounded cycle-walk work: not fast-lane
+    assert :reroute = LazyMemo.nif_compare_exchange_fast(small, :a, {:dep, other}, [other], 16, [])
+    assert :a = LazyMemo.read(small)
+
+    # the public router transparently completes both through the dirty lane
+    assert :ok = LazyMemo.exchange(small, :a, {:dep, other})
+    assert {:dep, ^other} = LazyMemo.read(small)
+  end
+
+  test "fast lane preserves CAS exactness and single-shot notification" do
+    r = LazyMemo.create(0)
+    assert :fast = LazyMemo.nif_lane(r)
+    tag = make_ref()
+    assert :retry = LazyMemo.exchange(r, 0.0, 1, [{self(), tag}])
+    refute_received ^tag
+    assert :ok = LazyMemo.exchange(r, 0, 1, [{self(), tag}])
+    assert_receive ^tag
+    assert 1 = LazyMemo.read(r)
+  end
+
+  test "a cell that grows past the ceiling migrates lanes and stays correct" do
+    r = LazyMemo.create(0)
+    assert :fast = LazyMemo.nif_lane(r)
+    big = Enum.to_list(1..100_000)
+    assert :ok = LazyMemo.exchange(r, 0, big)
+    assert :dirty = LazyMemo.nif_lane(r)
+    assert ^big = LazyMemo.read(r)
+    assert :ok = LazyMemo.exchange(r, big, 1)
+    assert :fast = LazyMemo.nif_lane(r)
+    assert 1 = LazyMemo.read(r)
+  end
+
+  test "fast lane ceiling is tunable and accounting survives inline reclaim" do
+    old = LazyMemo.fast_lane_bytes()
+    try do
+      r = LazyMemo.create(0)
+      # lower the ceiling below any real term: everything becomes dirty
+      LazyMemo.set_fast_lane_bytes(0)
+      assert :dirty = LazyMemo.nif_lane(r)
+      assert :ok = LazyMemo.exchange(r, 0, 1)
+      assert 1 = LazyMemo.read(r)
+    after
+      LazyMemo.set_fast_lane_bytes(old)
+    end
+
+    # churn a small cell through the fast lane; retained bytes must not drift
+    r = LazyMemo.create(0)
+    before = LazyMemo.stats().retained_bytes
+    Enum.reduce(1..1000, 0, fn i, v -> :ok = LazyMemo.exchange(r, v, i); i end)
+    after_bytes = LazyMemo.stats().retained_bytes
+    assert abs(after_bytes - before) < 1024
+  end
+
   test "finite inputs use immutable shared storage and preserve all values" do
     values = Enum.to_list(1..1000)
     input = LazySeq.input(values)
