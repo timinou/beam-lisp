@@ -9,6 +9,7 @@ defmodule BeamLisp.DevChange do
   @lock ".beam-lisp/change.lock"
   @default_allowlist ["mix", "bl", "elixir", "true", "false"]
 
+  # is_map-ok: a host change descriptor is validated by fields, including struct records.
   def plan(spec) when is_map(spec) do
     with {:ok, root} <- root(spec),
          {:ok, path} <- target(root, get(spec, :target)),
@@ -31,6 +32,7 @@ defmodule BeamLisp.DevChange do
   end
   def plan(_), do: {:error, :invalid_spec}
 
+  # is_map-ok: host plan records are checked by valid_plan, not sequence classification.
   def preview(p) when is_map(p) do
     with :ok <- valid_plan(p) do
       {:ok, %{id: p.id, target: p.target, namespace: p.namespace, selector: p.selector,
@@ -41,6 +43,7 @@ defmodule BeamLisp.DevChange do
   def preview(_), do: {:error, :invalid_plan}
 
   def verify(plan, opts \\ [])
+  # is_map-ok: host plan records are checked by valid_plan, not sequence classification.
   def verify(p, opts) when is_map(p) do
     runner = Keyword.get(opts, :runner)
     allowlist = Keyword.get(opts, :allowlist, @default_allowlist)
@@ -74,6 +77,7 @@ defmodule BeamLisp.DevChange do
   end
   def verify(_, _), do: {:error, :invalid_plan}
 
+  # is_map-ok: both host records undergo explicit plan and authorization validation.
   def apply!(p, _caller_receipt, auth) when is_map(p) and is_map(auth) do
     with :ok <- valid_plan(p),
          :ok <- authorized(auth, p.id, p.new_hash),
@@ -87,7 +91,7 @@ defmodule BeamLisp.DevChange do
   def apply!(_, _, _), do: {:error, :invalid_application}
 
   def receipt(id, workspace) when is_binary(id) do
-    with {:ok, root} <- canonical(workspace),
+    with {:ok, root} <- canonical_workspace(workspace),
          {:ok, file} <- journal_file(root, id),
          {:ok, bytes} <- safe_read_journal(root, file),
          {:ok, value} <- Jason.decode(bytes) do
@@ -103,7 +107,7 @@ defmodule BeamLisp.DevChange do
     with {:ok, old} <- receipt(id, workspace),
          :ok <- applied_receipt(old),
          :ok <- authorized(auth, id, val(old, "after_hash")),
-         {:ok, root} <- canonical(workspace),
+         {:ok, root} <- canonical_workspace(workspace),
          {:ok, path} <- target(root, val(old, "target")),
          {:ok, bytes} <- File.read(path),
          :ok <- same(bytes, val(old, "after_hash")),
@@ -167,8 +171,9 @@ defmodule BeamLisp.DevChange do
   end
   defp valid_plan(_), do: {:error, :invalid_plan}
 
-  defp root(spec), do: canonical(get(spec, :workspace, get(spec, :workspace_root)))
-  defp canonical(root) when is_binary(root) do
+  defp root(spec), do: canonical_workspace(get(spec, :workspace, get(spec, :workspace_root)))
+  @doc "Validate an existing workspace directory, refusing symlink components."
+  def canonical_workspace(root) when is_binary(root) do
     expanded = Path.expand(root)
     cond do
       not File.dir?(expanded) -> {:error, :invalid_workspace}
@@ -176,7 +181,7 @@ defmodule BeamLisp.DevChange do
       true -> {:ok, expanded}
     end
   end
-  defp canonical(_), do: {:error, :missing_workspace}
+  def canonical_workspace(_), do: {:error, :missing_workspace}
 
   defp target(root, name) when is_binary(name) do
     parts = Path.split(name)
@@ -334,6 +339,7 @@ defmodule BeamLisp.DevChange do
     end
   end
 
+  # is_map-ok: host command records are inspected by fields, not language map operations.
   defp descriptor(d, allowlist) when is_map(d) and is_list(allowlist) do
     argv = get(d, :argv)
     cwd = get(d, :cwd, ".")

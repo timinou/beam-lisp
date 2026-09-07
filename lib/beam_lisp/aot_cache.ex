@@ -86,6 +86,8 @@ defmodule BeamLisp.AOTCache do
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
+    BeamLisp.CompilerData,
+    BeamLisp.Record,
     BeamLisp.Emit,
     BeamLisp.Link,
     BeamLisp.Native,

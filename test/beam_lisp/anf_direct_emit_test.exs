@@ -1,19 +1,9 @@
 defmodule BeamLisp.AnfDirectEmitTest do
   use ExUnit.Case, async: false
 
-  # PLAN-086 E2 oracle: compiler2 emits bl-ANF DIRECTLY; before the cutover the
-  # same forms compiled to Elixir-quoted trees that anf/normalise then read
-  # back. The two routes over the toolchain corpus must produce the SAME ANF
-  # nodes, modulo:
-  #
-  #   * fresh-name counters ("x_12" vs :x_2830 — generation order differs)
-  #   * the transition def-clause encoding: compiler2 embeds the quoted
-  #     entries list as one (a/lit entries) node, which normalise decomposed
-  #     into cons/tuple nodes on the old path — so a new-side :lit carrying a
-  #     quoted-tree value is compared against normalise(that value) instead.
-  #
-  # Retires in E5 together with the old `compiler` pipeline it compares against
-  # (the fixtures under test/fixtures/anf_corpus/ remain the frozen record).
+  # Canonical cutover oracle: both the stable `compiler` namespace and the host
+  # facade expose compiler2's ANF directly. The corpus comparison remains
+  # structural (including guards); no canonicalize/quote round-trip is allowed.
 
   @files [
     "priv/boot/core.bl",
@@ -24,43 +14,70 @@ defmodule BeamLisp.AnfDirectEmitTest do
     "priv/std/optics.bl"
   ]
 
+  test "public compiler matches frozen corpus snapshots including guards" do
+    in_compiler_scope(fn -> compare_files(@files) end)
+  end
+
+  test "compiler implementation matches its frozen snapshot without changing earlier corpus state" do
+    in_compiler_scope(fn ->
+      # Seed the historical prefix for this additional dataset.
+      # Its private collection names must not prelink later reader fixtures.
+      for path <- Enum.take(@files, 3) do
+        %{entries: entries} = snapshot_path(path) |> File.read!() |> :erlang.binary_to_term()
+        env = BeamLisp.Compiler.new_env("anfcensus")
+        Enum.each(entries, fn {form, _} ->
+          BeamLisp.Compiler.reset_fresh!()
+          BeamLisp.Compiler.compile(form, env)
+        end)
+      end
+      compare_files(["priv/boot/compiler2.bl"])
+    end)
+  end
+
+  defp in_compiler_scope(fun) do
+    child = BeamLisp.Env.fork()
+    try do
+      BeamLisp.Env.with_env(child, fn -> BeamLisp.init(); fun.() end)
+    after
+      BeamLisp.Env.destroy(child)
+    end
+  end
+
   defp bl(ns, name, args) do
     BeamLisp.RT.invoke(BeamLisp.Env.fetch!(ns, name), args)
   end
 
-  test "compiler2 direct emit ≡ normalise∘compile over the toolchain corpus" do
-    BeamLisp.init()
+  defp snapshot_path(path), do: "test/fixtures/anf_canonical_corpus/#{String.replace(path, "/", "_")}.etf"
+
+  defp compare_files(paths) do
 
     mismatches =
-      for path <- @files, reduce: [] do
+      for path <- paths, reduce: [] do
         acc ->
-          forms = BeamLisp.Reader.read_all(File.read!(path)) |> Enum.to_list()
-          env_old = Map.put(bl("compiler", "new-env", ["anfcensus"]), :ns, "anfcensus")
-          env_new = Map.put(bl("compiler2", "new-env", ["anfcensus"]), :ns, "anfcensus")
+          # Trusted repository fixtures use lossless Erlang terms, not pr-str:
+          # printed atom names can contain reader delimiters. Inputs travel
+          # with the seed outputs; source edits cannot silently shift a zip.
+          %{version: 2, source: ^path, entries: entries} =
+            snapshot_path(path) |> File.read!() |> :erlang.binary_to_term()
+          assert entries != []
+          assert Enum.all?(entries, fn {_, outcome} -> match?({:ok, _}, outcome) end)
+          env = Map.put(bl("compiler2", "new-env", ["anfcensus"]), :ns, "anfcensus")
 
-          forms
+          entries
           |> Enum.with_index()
-          |> Enum.reduce(acc, fn {form, i}, acc ->
-            old =
+          |> Enum.reduce(acc, fn {{form, {:ok, expected}}, i}, acc ->
+            result =
               try do
-                {:ok, bl("anf", "normalise", [bl("compiler", "compile", [form, env_old])])}
+                bl("compiler2", "reset-fresh!", [])
+                {:ok, BeamLisp.Compiler.compile(form, env), expected}
               catch
-                _, _ -> :skip
+                kind, reason -> {:compile_error, kind, reason}
               end
 
-            new =
-              try do
-                {:ok, bl("compiler2", "compile-node", [form, env_new])}
-              catch
-                _, _ -> :skip
-              end
-
-            case {old, new} do
-              {:skip, _} ->
-                acc
-
-              {{:ok, o}, {:ok, n}} ->
-                case equiv(o, n) do
+            case result do
+              {:compile_error, kind, reason} -> [{path, i, "compile #{kind}: #{inspect(reason, limit: 5)}"} | acc]
+              {:ok, canonical, expected} ->
+                case equiv(expected, canonical) do
                   :ok -> acc
                   {:diff, why} -> [{path, i, why} | acc]
                 end
@@ -69,7 +86,7 @@ defmodule BeamLisp.AnfDirectEmitTest do
       end
 
     assert mismatches == [],
-           "#{length(mismatches)} corpus form(s) differ:\n" <>
+           "#{length(mismatches)} corpus form(s) differ from frozen snapshots:\n" <>
              (mismatches
               |> Enum.take(5)
               |> Enum.map(fn {p, i, why} -> "  #{p} form #{i}: #{why}" end)
@@ -171,12 +188,34 @@ defmodule BeamLisp.AnfDirectEmitTest do
     ground_list(to_enum(es), fn ds -> {:ground, List.to_tuple(ds)} end)
   end
 
+  defp groundify(%{op: :struct, fields: _} = node), do: groundify(norm(node))
+
   defp groundify(%{op: :struct, mod: mod, pairs: ps}) do
     ground_list(to_enum(ps), fn ds ->
       fields = Map.new(ds, fn [k, v] -> {k, v} end)
       {:ground, struct!(mod, fields)}
     end)
   end
+
+  # The seed constructs literal maps; the direct emitter embeds those same
+  # values. Interpret only ground constructors, never arbitrary compiled calls.
+  defp groundify(%{op: :map, pairs: pairs}) do
+    Enum.reduce_while(to_enum(pairs), {:ground, %{}}, fn pair, {:ground, acc} ->
+      [key, value] = to_enum(pair)
+      case {groundify(key), groundify(value)} do
+        {{:ground, k}, {:ground, v}} -> {:cont, {:ground, Map.put(acc, k, v)}}
+        _ -> {:halt, :no}
+      end
+    end)
+  end
+  defp groundify(%{op: :remote, mod: BeamLisp.RT, fun: :hash_key, args: [arg]}) do
+    case groundify(arg) do
+      {:ground, value} -> {:ground, BeamLisp.RT.hash_key(value)}
+      _ -> :no
+    end
+  end
+  defp groundify(%BeamLisp.Vector{} = pair),
+    do: ground_list(to_enum(pair), &{:ground, &1})
 
   defp groundify(_), do: :no
 
@@ -197,7 +236,7 @@ defmodule BeamLisp.AnfDirectEmitTest do
   end
 
   # bl lists arrive as proper Elixir lists; :tuple/:struct fields as tuples or
-  # bl vectors — normalise all to plain lists for the walk.
+  # bl vectors — canonicalize all to plain lists for the walk.
   defp to_enum(%BeamLisp.Vector{items: t}), do: Tuple.to_list(t)
   defp to_enum(t) when is_tuple(t), do: Tuple.to_list(t)
   defp to_enum(l) when is_list(l), do: l
@@ -224,6 +263,17 @@ defmodule BeamLisp.AnfDirectEmitTest do
     end
   end
 
+  # E3 clause nodes can be embedded as data inside a direct-side :lit while
+  # adapter readback decomposes the same map into :struct/:tuple constructors.
+  # Rebuild map data recursively so those two representations meet as values;
+  # the outer ANF node maps never reach ground_data/1.
+  defp ground_data(v) when is_map(v) do
+    case ground_data_list(Map.to_list(v), []) do
+      {:ok, pairs} -> {:ok, Map.new(pairs)}
+      :no -> :no
+    end
+  end
+
   defp ground_data(_), do: :no
 
   defp proper_list?([]), do: true
@@ -243,11 +293,11 @@ defmodule BeamLisp.AnfDirectEmitTest do
   # and binary leaf (gensym counters differ between the two pipelines), and
   # {:__aliases__, _, segs} tuples resolved to their module atom: the genesis
   # emitter resolved aliases at emit time, compiler2 keeps the alias tuple in
-  # the transition entries, and normalise's alias->atom resolves both to the
+  # the transition entries, and canonicalize's alias->atom resolves both to the
   # same :remote — the data-level spellings differ, the compiled node does not.
   defp ground_eq(a, b), do: ground_norm(a) == ground_norm(b)
 
-  # (atoms normalise to their fresh()-ed string spelling below, so the alias
+  # (atoms canonicalize to their fresh()-ed string spelling below, so the alias
   # resolves to the same string).
   defp ground_norm({:__aliases__, _meta, segs}) when is_list(segs),
     do: segs |> Enum.map(&Atom.to_string/1) |> Module.concat() |> Atom.to_string()
@@ -268,52 +318,27 @@ defmodule BeamLisp.AnfDirectEmitTest do
   defp ground_norm_tail([h | t]), do: [ground_norm(h) | ground_norm_tail(t)]
   defp ground_norm_tail(improper), do: ground_norm(improper)
 
-  # :lit carrying a quoted tree (transition encoding) → normalise it away.
+  # :lit carrying a quoted tree (transition encoding) → canonicalize it away.
   # Data that merely LOOKS quoted (a 3-tuple with an atom head and list meta
-  # can occur in plain data) makes normalise throw — then it was data: keep
+  # can occur in plain data) makes canonicalize throw — then it was data: keep
   # the node.
-  defp norm(%{op: :lit, val: v} = node) do
-    if quoted_tree?(v) do
-      try do
-        bl("anf", "normalise", [v])
-      catch
-        _, _ -> node
-      end
-    else
-      node
-    end
-  end
-
-  defp norm(other), do: other
+  # Both spellings are accepted by the canonical module import boundary;
+  # they describe the same struct field pairs, not different operations.
+  defp norm(%{op: :struct, fields: fields} = node),
+    do: node |> Map.delete(:fields) |> Map.put(:pairs, fields)
+  defp norm(node), do: node
 
   # A quoted AST tree: a list/tuple whose leaves include {atom, list, ctx}
   # var tuples or {:atom, meta, args} call nodes — plain data (keywords,
   # numbers, binaries) is not.
-  defp quoted_tree?(v) when is_tuple(v) or is_list(v) do
-    v |> :erts_debug.flat_size() |> Kernel.>(2) and has_meta_tuple?(v)
-  end
-
-  defp quoted_tree?(_), do: false
-
-  defp has_meta_tuple?(t) when is_tuple(t) do
-    (tuple_size(t) == 3 and is_atom(elem(t, 0)) and is_list(elem(t, 1))) or
-      (t |> Tuple.to_list() |> Enum.any?(fn
-         e when is_tuple(e) or is_list(e) -> has_meta_tuple?(e)
-         _ -> false
-       end))
-  end
-
-  defp has_meta_tuple?([h | t]), do: has_meta_tuple?(h) or has_meta_tuple?(t)
-  defp has_meta_tuple?(_), do: false
 
   # bl vectors are %BeamLisp.Vector{} structs — compare by items tuple.
   defp walk(%BeamLisp.Vector{items: a}, %BeamLisp.Vector{items: b}),
     do: do_equiv(Tuple.to_list(a), Tuple.to_list(b))
 
-  # The defvar transition entries: raw quoted data whose INTERNAL spelling
-  # (alias tuples, cons markers) legitimately differs between genesis and
-  # compiler2. The contract is the READBACK — normalise of each clause's
-  # def-ast — so compare that, not the raw data.
+  # Mixed seed/full rebuilds can compare a quoted genesis def entry with an E3
+  # :defn-clause node. Canonicalise the entries as data, then compare each def's
+  # executable readback contract rather than its generation-specific encoding.
   defp walk(%{op: :remote, mod: BeamLisp.Link, fun: :defvar, args: a},
             %{op: :remote, mod: BeamLisp.Link, fun: :defvar, args: b}) do
     with :ok <- do_equiv(Enum.at(a, 0), Enum.at(b, 0)),
@@ -326,18 +351,12 @@ defmodule BeamLisp.AnfDirectEmitTest do
     end
   end
 
-  # entries on both sides, canonicalised to the raw data list of
-  # {kind, arity, name, def-ast} tuples (old side: decomposed cons/tuple
-  # nodes → groundify; new side: :lit of the raw list).
   defp entries_equiv(old_node, new_node) do
     with {:ground, es_old} <- groundify(old_node),
          {:ground, es_new} <- groundify(new_node),
          true <- length(es_old) == length(es_new) do
       Enum.zip(es_old, es_new)
-      |> Enum.reduce_while(:ok, fn {e_old, e_new}, :ok ->
-        {k1, n1, f1, ast1} = e_old
-        {k2, n2, f2, ast2} = e_new
-
+      |> Enum.reduce_while(:ok, fn {{k1, n1, f1, ast1}, {k2, n2, f2, ast2}}, :ok ->
         if {k1, n1, f1} == {k2, n2, f2} do
           case def_ast_equiv(ast1, ast2) do
             :ok -> {:cont, :ok}
@@ -353,34 +372,16 @@ defmodule BeamLisp.AnfDirectEmitTest do
     end
   end
 
-  # A def-ast `{:def, _, [head, [do: body]]}`: head params compare as data
-  # (fresh-normalised); the body compares through normalise — the readback
-  # defs->module-anf performs.
-  defp def_ast_equiv({:def, _, [head1, kw1]}, {:def, _, [head2, kw2]}) do
-    {n1, _, params1} = head1
-    {n2, _, params2} = head2
-
-    cond do
-      ground_norm(params1) != ground_norm(params2) ->
-        {:diff, "def params #{inspect(params1, limit: 10)} vs #{inspect(params2, limit: 10)}"}
-
-      Atom.to_string(n1) != Atom.to_string(n2) ->
-        {:diff, "def name #{n1} vs #{n2}"}
-
-      true ->
-        do_equiv(
-          bl("anf", "normalise", [Keyword.get(kw1, :do)]),
-          bl("anf", "normalise", [Keyword.get(kw2, :do)])
-        )
-    end
-  end
+  defp def_ast_equiv(%{op: :"defn-clause"} = expected, %{op: :"defn-clause"} = actual),
+    do: do_equiv(expected, actual)
 
   defp def_ast_equiv(a, b),
-    do: {:diff, "not def-asts: #{inspect(a, limit: 6)} vs #{inspect(b, limit: 6)}"}
+    do: {:diff, "not def-ast vs defn-clause: #{inspect(a, limit: 6)} vs #{inspect(b, limit: 6)}"}
+
 
   defp walk(a, b) when is_map(a) and is_map(b) do
     # :ann carries source positions (metadata, not semantics): the direct
-    # emitter stamps it from reader meta; normalise of genesis's quoted
+    # emitter stamps it from reader meta; canonicalize of genesis's quoted
     # output has none. Positions are pinned by wave20, not by this oracle.
     ka = a |> Map.delete(:ann) |> Map.keys() |> Enum.sort()
     kb = b |> Map.delete(:ann) |> Map.keys() |> Enum.sort()

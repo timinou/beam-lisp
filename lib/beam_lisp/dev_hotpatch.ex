@@ -24,14 +24,18 @@ defmodule BeamLisp.DevHotpatch do
   @doc """
   Hot-patch the given boot namespaces (list of names like `"compiler2"`, or
   a comma-separated string) from `priv/boot/<name>.bl` sources.
+  `:source_root` selects an explicit source snapshot for controlled comparisons.
   """
-  def hotpatch!(names) when is_binary(names),
-    do: names |> String.split(",", trim: true) |> hotpatch!()
+  def hotpatch!(names, opts \\ [])
 
-  def hotpatch!(names) when is_list(names) do
+  def hotpatch!(names, opts) when is_binary(names),
+    do: names |> String.split(",", trim: true) |> hotpatch!(opts)
+
+  def hotpatch!(names, opts) when is_list(names) do
+    source_root = Keyword.get(opts, :source_root, "priv/boot")
     normalized = Enum.map(names, &to_string/1)
     Enum.each(normalized, fn name ->
-      hotpatch_ns!(name)
+      hotpatch_ns!(name, source_root)
       BeamLisp.Generation.record_hotpatch([name])
     end)
     :ok
@@ -49,16 +53,17 @@ defmodule BeamLisp.DevHotpatch do
     end
   end
 
-  defp hotpatch_ns!(name) do
-    path = Path.join("priv/boot", "#{name}.bl")
+  defp hotpatch_ns!(name, source_root) do
+    path = Path.join(source_root, "#{name}.bl")
     unless File.exists?(path), do: raise("no boot source for namespace #{name}: #{path} not found")
 
-    dir = Path.join(System.tmp_dir!(), "bl_hotpatch_#{name}_#{System.unique_integer([:positive])}")
+    nonce = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    dir = Path.join(System.tmp_dir!(), "bl_hotpatch_#{Path.basename(name)}_#{nonce}")
     File.mkdir_p!(dir)
 
     started = System.monotonic_time(:millisecond)
     emitted = BeamLisp.AOT.compile_file(path, output_dir: dir)
-    beams = Path.wildcard(Path.join(dir, "*.beam"))
+    beams = Enum.map(emitted, &elem(&1, 1))
 
     Enum.each(beams, fn beam ->
       mod = beam |> Path.basename(".beam") |> String.to_atom()

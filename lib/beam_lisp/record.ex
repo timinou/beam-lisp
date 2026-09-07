@@ -95,6 +95,7 @@ defmodule BeamLisp.Record do
     # {resource, requester}: :global lock ids must be that 2-tuple shape.
     :global.trans({mod, self()}, fn ->
       field_atoms = Enum.map(fields, &String.to_atom/1)
+      validate_struct_fields!(field_atoms)
       create_module(mod, :record, field_atoms)
       register(mod, :record, ns, name, field_atoms)
       mod
@@ -256,7 +257,7 @@ defmodule BeamLisp.Record do
               Emit.remote(__MODULE__, :generated_struct, [Emit.lit(mod), Emit.lit(fields), Emit.var("kv")]),
               [%{pop: :pvar, name: "kv"}]
             )
-          ]
+          ] ++ struct_info_clauses(mod, fields)
 
         :deftype ->
           [Emit.function_clause(:__bl_deftype__, Emit.lit(true))]
@@ -266,6 +267,33 @@ defmodule BeamLisp.Record do
     :code.purge(mod)
     :code.delete(mod)
     Emit.load_binary!(beam, "beam_lisp_record")
+  end
+
+  defp validate_struct_fields!(fields) do
+    if :__struct__ in fields, do: raise(ArgumentError, "cannot set :__struct__ in struct definition")
+    Enum.reduce(fields, MapSet.new(), fn field, seen ->
+      if MapSet.member?(seen, field), do: IO.warn("duplicate key #{inspect(field)} found in struct")
+      MapSet.put(seen, field)
+    end)
+    :ok
+  end
+
+  defp struct_info_clauses(mod, fields) do
+    functions = [__struct__: 0, __struct__: 1]
+    struct = Enum.map(fields, &%{field: &1, default: nil, required: false})
+    # Elixir's literal/pattern expander reads __info__(:struct); __struct__/0,1
+    # alone supports runtime construction but not compilation against the type.
+    values = [module: mod, functions: functions, macros: [], deprecated: [],
+      struct: struct, exports_md5: :crypto.hash(:md5, :erlang.term_to_binary({functions, struct}))]
+    literals = Enum.map(values, fn {key, value} ->
+      Emit.function_clause(:__info__, Emit.lit(value), [%{pop: :plit, val: key}])
+    end)
+    metadata = Enum.map([:attributes, :compile, :md5], fn key ->
+      Emit.function_clause(:__info__,
+        Emit.remote(:erlang, :get_module_info, [Emit.lit(mod), Emit.lit(key)]),
+        [%{pop: :plit, val: key}])
+    end)
+    literals ++ metadata
   end
 
   defp register(mod, kind, ns, name, fields) do
