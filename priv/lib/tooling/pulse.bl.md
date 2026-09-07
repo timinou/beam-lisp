@@ -24,9 +24,28 @@ can drop into the corner of any live app.
 ```beam-lisp
 (ns tooling.pulse
   (:require [data.registry :as registry]
+            [data.tap :as tap]
             [tooling.trace :as trace]
             [tooling.incremental :as inc]
             [interop]))
+
+;; One process-wide tap: the live socket publishes a frame per mount/commit
+;; here (hand it to the app as `:tap`), and the dashboard subscribes so every
+;; frame reaches the browser the instant it lands — no polling, no missed
+;; updates between ticks.
+(def ^:private the-tap (atom nil))
+
+(defn tap
+  "The dashboard's data.tap. Give it to a live app: `{:tap (pulse/tap)}`."
+  []
+  (or @the-tap
+      (let [t (tap/open {:cap 300})]
+        (if (compare-and-set! the-tap nil t) t @the-tap))))
+
+(defn frames
+  "Every retained frame the live socket published (oldest first)."
+  []
+  (tap/frames (tap)))
 
 ;; One process-wide render trace, so the dashboard can narrate updates.
 (def ^:private the-trace (atom nil))
@@ -141,7 +160,18 @@ kind histogram, and the tracked cells.
      :trace {:recomputed recent
              :patch-ops (:patch-ops u)
              :event-count (:event-count u)}
+     :frame (frame-summary (tap/latest (tap)))
      :at (System/system_time :millisecond)}))
+
+(defn frame-summary
+  "A tap frame without its tree (the tree is large; a tool fetches it on
+   demand by :t). Ops are kept: they are what a paint overlay flashes."
+  [f]
+  (when f
+    {:t (:t f) :kind (:kind f) :ms (:ms f) :basis (:basis f)
+     :event (pr-str (:event f))
+     :op-count (count (:ops f))
+     :ops (:ops f)}))
 
 (defn frame-json
   "The snapshot as a JSON string, bl collections deep-converted so Jason can
@@ -347,16 +377,23 @@ its router; `mount` returns everything a host needs.
 
 ```beam-lisp
 (defn- send-tick! []
-  (erlang/send_after 500 (erlang/self) [:pulse/tick]))
+  (erlang/send_after 2000 (erlang/self) [:pulse/tick]))
 
 (defn- ws-init [_state]
+  ;; per-commit push: this ws process subscribes to the tap, so a frame is
+  ;; shipped the moment the live socket publishes it. The 2s tick is only a
+  ;; heartbeat for the vitals (cell counts move without a commit).
+  (tap/subscribe! (tap))
   (send-tick!)
   [:push (list (list :text (frame-json))) {}])
 
 (defn- ws-info [msg state]
-  (if (and (sequential? msg) (= :pulse/tick (first msg)))
-    (do (send-tick!) [:push (list (list :text (frame-json))) state])
-    [:ok state]))
+  (cond
+    (and (sequential? msg) (= :pulse/tick (first msg)))
+      (do (send-tick!) [:push (list (list :text (frame-json))) state])
+    (and (sequential? msg) (= :tap/frame (first msg)))
+      [:push (list (list :text (frame-json))) state]
+    :else [:ok state]))
 
 (def ws-handlers
   {:init ws-init

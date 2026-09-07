@@ -327,16 +327,34 @@
       setLive(false);
     };
 
+    // Tooling seam: every step the socket takes is re-announced on the
+    // document as a CustomEvent, so an instrument (a paint overlay, a
+    // timeline) can watch WITHOUT patching this file or the app:
+    //   live:mount {root}            first paint landed
+    //   live:patch {root, ops}       these ops were just applied
+    //   live:tap   {t}               the server's tap stamped the last step t
+    // A page with no listeners pays one dispatch per step.
+    function announce(name, detail) {
+      try { document.dispatchEvent(new CustomEvent(name, { detail: detail })); }
+      catch (_e) { /* non-DOM host */ }
+    }
+
     ws.onmessage = function (msg) {
       const [kind, a, b] = JSON.parse(msg.data);
       if (kind === "mount") {
         root.innerHTML = a;
+        announce("live:mount", { root: root });
       } else if (kind === "patch") {
         applyPatch(root, a);
+        announce("live:patch", { root: root, ops: a });
+      } else if (kind === "tap") {
+        announce("live:tap", { t: a });
       } else if (kind === "denied") {
         if (opts.onDenied) opts.onDenied(a);
       }
     };
+    Live.ws = ws;
+    Live.root = root;
 
     // event delegation. A [data-ev-EVENT] node carries its intent as a JSON
     // attribute; on fire we relay that term plus the value of the nearest
@@ -478,5 +496,22 @@
     return true;
   }
 
-  window.Live = { connect: connect, applyOp: applyOp, render: render };
+  // the path of `el` under `root`, in the differ's coordinates (indices into
+  // the text+element child list) — the inverse of `at`. Lets a tool point at
+  // an element and ask the server about it.
+  function pathOf(root, el) {
+    var path = [];
+    var top = rootEl(root);
+    while (el && el !== top) {
+      var parent = el.parentNode;
+      if (!parent) return null;
+      path.unshift(domChildren(parent).indexOf(el));
+      el = parent;
+    }
+    return el === top ? path : null;
+  }
+
+  window.Live = { connect: connect, applyOp: applyOp, render: render,
+                  at: at, pathOf: pathOf, ws: null, root: null };
+  var Live = window.Live;
 })();
