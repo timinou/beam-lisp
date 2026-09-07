@@ -359,6 +359,9 @@ defmodule BeamLisp.Refs do
 
   def deref(%BeamLisp.Volatile{} = vol), do: Process.get({BeamLisp.Volatile, vol.key})
   def deref(%BeamLisp.Reduced{} = r), do: r.value
+  # A delay derefs to its value, forcing it once. `@d` therefore works on a
+  # delay exactly as on an atom or promise.
+  def deref(%BeamLisp.Delay{} = d), do: BeamLisp.Deferred.force(d)
 
   def deref(other), do: raise(ArgumentError, "deref: not a derefable reference: #{inspect(other)}")
 

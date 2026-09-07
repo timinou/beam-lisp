@@ -2412,6 +2412,10 @@ defmodule BeamLisp.RT do
       "remove-watch" => &BeamLisp.Refs.remove_watch!/2,
       "promise" => &BeamLisp.Refs.promise/0,
       "deliver" => &BeamLisp.Refs.deliver/2,
+      # delay/force/realized? — the value-shaped face of the lazy memo cell.
+      "force" => &BeamLisp.Deferred.force/1,
+      "realized?" => &BeamLisp.Deferred.realized?/1,
+      "delay?" => &BeamLisp.Deferred.delay?/1,
       "future?" => &BeamLisp.Refs.future?/1,
       "future-cancel" => &BeamLisp.Refs.future_cancel/1,
       "volatile!" => &BeamLisp.Refs.volatile/1,
@@ -2700,6 +2704,9 @@ defmodule BeamLisp.RT do
       "remove-watch" => {BeamLisp.Refs, %{2 => :remove_watch!}, nil},
       "promise" => {BeamLisp.Refs, %{0 => :promise}, nil},
       "deliver" => {BeamLisp.Refs, %{2 => :deliver}, nil},
+      "force" => {BeamLisp.Deferred, %{1 => :force}, nil},
+      "realized?" => {BeamLisp.Deferred, %{1 => :realized?}, nil},
+      "delay?" => {BeamLisp.Deferred, %{1 => :delay?}, nil},
       "future?" => {BeamLisp.Refs, %{1 => :future?}, nil},
       "future-cancel" => {BeamLisp.Refs, %{1 => :future_cancel}, nil}
     }
