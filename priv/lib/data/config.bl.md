@@ -47,6 +47,14 @@ reads shared and live.
   [base]
   (->Config (atom {:base base :overrides {}})))
 
+(defn ref
+  "The config's underlying cell, for use as a `derived` dependency. A Config
+   record has a stable identity, so a derived over the Config itself would
+   never see a `put`; depend on `(ref config)` instead and the derived
+   recomputes whenever a setting changes."
+  [c]
+  (:cell c))
+
 (defn- effective [c]
   ; overrides win over base; this is the map every read sees.
   (let [s @(:cell c)]
