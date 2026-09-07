@@ -7,7 +7,7 @@ defmodule BeamLisp.Generation do
   """
 
   @hotpatch_key {__MODULE__, :hotpatched_namespaces}
-  @loaded_modules [BeamLisp.Ns.Compiler2, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf]
+  @loaded_modules [BeamLisp.Ns.Compiler, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf]
 
   @doc "Return a machine-readable generation receipt without loading compiler modules."
   def receipt(opts \\ []) do

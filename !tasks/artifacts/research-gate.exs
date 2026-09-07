@@ -1,0 +1,8 @@
+BeamLisp.run_file("research/ce1_core_erlang/bench.bl")
+BeamLisp.run_file("research/ce1_core_erlang/census.bl")
+BeamLisp.run_file("research/ce1_core_erlang/oracle.bl")
+totals = BeamLisp.Env.fetch!("oracle", "totals") |> BeamLisp.LazySeq.to_list()
+IO.inspect(totals, label: "RESEARCH_ORACLE_RESULTS", limit: :infinity)
+unless Enum.all?(totals, &BeamLisp.TestRT.passed?/1), do: raise("research value oracle failed")
+Enum.each(Process.get(:canonical_upgrade_cleanup, []), &File.rm_rf!/1)
+System.halt(0)

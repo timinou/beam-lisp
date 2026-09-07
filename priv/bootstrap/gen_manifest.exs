@@ -12,8 +12,8 @@
 # writes a manifest recording the compiler_key they were built under, the
 # Elixir/OTP versions, and a sha256 per beam, and reports what it wrote.
 
-seed_dir = "priv/bootstrap/seed"
-ebin = Mix.Project.compile_path()
+seed_dir = System.get_env("BL_SEED_DIR", "priv/bootstrap/seed")
+ebin = System.get_env("BL_SEED_EBIN") || Mix.Project.compile_path()
 File.mkdir_p!(seed_dir)
 
 # The bootstrap floor is the WHOLE boot tier: every namespace under
@@ -51,7 +51,7 @@ end
 # needs the reader. Copied beams must therefore be PROVEN built under the
 # current key, not assumed: `_build` can hold older-keyed beams (e.g. after a
 # failed compile left a stale ebin). Refuse loudly instead.
-current_key = BeamLisp.AOTCache.compiler_key()
+current_key = BeamLisp.AOTCache.current_compiler_key()
 
 # Only the top-level Ns.<Name> shims carry `__bl_provenance__/0`; Body/Init
 # companions are unchecked (they share the shim's build by construction).
@@ -96,7 +96,7 @@ entries =
 
 manifest = %{
   "schema" => "beam-lisp-bootstrap-seed-v1",
-  "compiler_key" => BeamLisp.AOTCache.compiler_key(),
+  "compiler_key" => current_key,
   "elixir" => System.version(),
   "otp" => List.to_string(:erlang.system_info(:otp_release)),
   "modules" => entries
@@ -107,6 +107,9 @@ content =
     "# Regenerate: mix run priv/bootstrap/gen_manifest.exs (after a keyed build).\n" <>
     inspect(manifest, pretty: true, limit: :infinity) <> "\n"
 
+unless BeamLisp.AOTCache.current_compiler_key() == current_key do
+  Mix.raise("toolchain sources changed during seed assembly; refusing to publish its manifest")
+end
 File.write!(Path.join(seed_dir, "manifest.exs"), content)
 
 IO.puts(

@@ -74,6 +74,46 @@ defmodule BeamLisp.AOTCacheTest do
     assert File.read!(Path.join(dst_dir, "Elixir.FakeMod.beam")) == fake_beam
   end
 
+  test "recompiling a fetched beam cannot overwrite its cache entry", %{out_a: out_a, out_b: out_b} do
+    source = "(ns cache_immutable_fixture) (defn answer [] 1)"
+    modules = BeamLisp.AOT.compile_source(source, output_dir: out_a) |> Enum.map(&elem(&1, 0))
+    key = AOTCache.compiler_key()
+    :ok = AOTCache.store(key, "immutable", out_a, modules)
+    assert {:ok, ^modules} = AOTCache.fetch(key, "immutable", out_b)
+    original = Map.new(modules, fn mod ->
+      name = Atom.to_string(mod) <> ".beam"
+      {name, File.read!(Path.join(out_b, name))}
+    end)
+
+    BeamLisp.AOT.compile_source(String.replace(source, "[] 1", "[] 2"), output_dir: out_b)
+    assert Enum.any?(original, fn {name, bytes} -> File.read!(Path.join(out_b, name)) != bytes end)
+    assert {:ok, ^modules} = AOTCache.fetch(key, "immutable", out_b)
+    for {name, bytes} <- original, do: assert(File.read!(Path.join(out_b, name)) == bytes)
+  end
+
+  test "a damaged or legacy entry is a miss and can be replaced", %{out_a: out_a, out_b: out_b} do
+    mod = BeamLisp.CacheIntegrityFixture
+    File.mkdir_p!(out_a)
+    File.write!(Path.join(out_a, "#{mod}.beam"), "original")
+    :ok = AOTCache.store("integrity", "entry", out_a, [mod])
+    entry = Path.join([AOTCache.dir(), "integrity", "entry"])
+    File.write!(Path.join(entry, "#{mod}.beam"), "corrupt")
+    assert :miss = AOTCache.fetch("integrity", "entry", out_b)
+    :ok = AOTCache.store("integrity", "entry", out_a, [mod])
+    assert {:ok, [^mod]} = AOTCache.fetch("integrity", "entry", out_b)
+    assert File.read!(Path.join(out_b, "#{mod}.beam")) == "original"
+    File.write!(Path.join(entry, "manifest.term"), :erlang.term_to_binary(%{modules: [mod]}))
+    assert :miss = AOTCache.fetch("integrity", "entry", out_b)
+    :ok = AOTCache.store("integrity", "entry", out_a, [mod])
+    assert {:ok, [^mod]} = AOTCache.fetch("integrity", "entry", out_b)
+  end
+
+  test "cache entry keys cannot escape the cache root", %{out_a: out_a} do
+    assert_raise ArgumentError, ~r/safe path components/, fn ->
+      AOTCache.store("..", "entry", out_a, [])
+    end
+  end
+
   test "missing beams degrade to a miss" do
     key = AOTCache.compiler_key()
     assert :miss = AOTCache.fetch(key, "never-stored", System.tmp_dir!())

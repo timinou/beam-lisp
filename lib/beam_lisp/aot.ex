@@ -573,12 +573,15 @@ defmodule BeamLisp.AOT do
         %{clause | body: Map.put(clause.body, :ann, ann)}
       end)
     namespace_descriptor =
-      Emit.descriptor_for(mod, namespace_clauses, [bl_source_hash: source_hash, bl_compiler_key: compiler_key])
+      Emit.descriptor_for(mod, namespace_clauses, [bl_source_hash: source_hash, bl_compiler_key: compiler_key], %{file: filename})
 
     body_descriptors =
       for {body_mod, clauses} <- Emit.body_modules(ns_defs) do
-        Emit.descriptor_for(body_mod, clauses)
+        Emit.descriptor_for(body_mod, clauses, [], %{file: filename})
       end
+
+    companion_descriptor = if companion_descriptor,
+      do: Map.put(companion_descriptor, :ann, %{file: filename}), else: nil
 
     # Compile and validate every byte before the first code load or disk write.
     # This is the pre-publication failure boundary: Env and the stable namespace
@@ -776,12 +779,12 @@ defmodule BeamLisp.AOT do
   end
 
   defp compile_initializer(form, env) do
-    unless Code.ensure_loaded?(BeamLisp.Ns.Compiler2) and
-             function_exported?(BeamLisp.Ns.Compiler2, :"compile-node", 2) do
-      raise "initializer compiler unavailable: BeamLisp.Ns.Compiler2.compile-node/2 is not ready"
+    unless Code.ensure_loaded?(BeamLisp.Ns.Compiler) and
+             function_exported?(BeamLisp.Ns.Compiler, :"compile-node", 2) do
+      raise "initializer compiler unavailable: BeamLisp.Ns.Compiler.compile-node/2 is not ready"
     end
 
-    apply(BeamLisp.Ns.Compiler2, :"compile-node", [form, env])
+    apply(BeamLisp.Ns.Compiler, :"compile-node", [form, env])
   end
   # initializers: `BeamLisp.Ns.Init.<Ns>`, parallel to `BeamLisp.Ns.<Ns>`.
   defp init_module_for(ns) do

@@ -4,8 +4,8 @@ defmodule BeamLisp do
 
   jank is a Clojure dialect native to C++; beam-lisp is the same idea
   aimed at the other native target that matters: the BEAM. The reader
-  speaks jank-flavored Clojure, the compiler lowers forms to Elixir
-  quoted expressions, and Elixir's compiler turns those into ordinary
+  speaks jank-flavored Clojure. The compiler builds canonical ANF module
+  descriptors, and the Core Erlang backend turns them into ordinary
   BEAM bytecode. Interop is not a bridge — `Module/function` calls
   compile straight to remote calls.
 
@@ -13,7 +13,7 @@ defmodule BeamLisp do
 
       iex> BeamLisp.eval("(defn square [x] (* x x)) (square 12)")
       144
-      iex> BeamLisp.eval("(map inc [1 2 3])")
+      iex> BeamLisp.eval("(to-list (map inc [1 2 3]))")
       [2, 3, 4]
       iex> BeamLisp.eval("(String/upcase \\"beam-native\\")")
       "BEAM-NATIVE"
@@ -162,13 +162,6 @@ defmodule BeamLisp do
       #    nothing to run. `core` (step 1) gives them their runtime deps.
       BeamLisp.Reader.enable_bl_reader()
       BeamLisp.Compiler.enable_bl_backend()
-
-      # The bl-ANF pipeline (PLAN-086 E2). `compiler`'s `eval_form` delegates
-      # to `compiler2/eval_form`, so the namespace must be interned before any
-      # form is compiled. Loader.ensure_loaded (not AOT.ensure_loaded) so a
-      # toolchain-key mismatch falls back to compiling the source, exactly as
-      # enable_bl_backend does for `compiler`.
-      BeamLisp.Loader.ensure_loaded("compiler2")
 
       # 3. The rest of the prelude. `multi` (dispatch) and `sugar` (threading /
       #    cond macros) layer on `core`; their closure-hash drift check now finds

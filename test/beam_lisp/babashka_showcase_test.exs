@@ -81,6 +81,18 @@ defmodule BeamLisp.BabashkaShowcaseTest do
     end
   end
 
+  test "set union retains variadic conj when the core root is reseeded" do
+    BeamLisp.Loader.ensure_loaded("clojure.set")
+    original = BeamLisp.Env.fetch!("core", "conj")
+    try do
+      BeamLisp.Env.intern("core", "conj", BeamLisp.RT.multi_fn(%{1 => &BeamLisp.RT.conj/1, 2 => &BeamLisp.RT.conj/2}))
+      value = BeamLisp.eval(~S|(clojure.set/union #{1} #{2} #{3})|)
+      assert BeamLisp.Set.to_list(value) |> Enum.sort() == [1, 2, 3]
+    after
+      BeamLisp.Env.intern("core", "conj", original)
+    end
+  end
+
   describe "the runnable guidebook" do
     test "docs/babashka-on-the-beam.bl.md executes every code cell" do
       # A literate `.bl.md` doc: run_file reads its beam-lisp code cells and

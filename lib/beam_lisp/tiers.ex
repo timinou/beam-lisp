@@ -66,6 +66,24 @@ defmodule BeamLisp.Tiers do
     end
   end
 
+  @doc "Whether a source belongs to the boot tier, including Mix's priv symlink."
+  def boot_source?(path) do
+    with {:ok, boot} <- File.stat(boot_dir()) do
+      beneath_directory?(Path.dirname(Path.expand(path)), {boot.major_device, boot.inode})
+    else
+      _ -> false
+    end
+  end
+
+  defp beneath_directory?(path, identity) do
+    case File.stat(path) do
+      {:ok, stat} when {stat.major_device, stat.inode} == identity -> true
+      _ ->
+        parent = Path.dirname(path)
+        parent != path and beneath_directory?(parent, identity)
+    end
+  end
+
   @doc "Every `.bl` source under the library tiers, sorted."
   def sources(root \\ priv_root()) do
     root

@@ -113,7 +113,7 @@ defmodule BeamLisp.Wave26AtomGuardTest do
       assert BeamLisp.Compiler.compile(
                {:keyword, "wave26_known_keyword"},
                BeamLisp.Compiler.new_env("wave26")
-             ) == :wave26_known_keyword
+             ) == %{op: :lit, val: :wave26_known_keyword, ann: %{}}
     end
 
     test "ordinary evaluation is unaffected by the guard being present" do

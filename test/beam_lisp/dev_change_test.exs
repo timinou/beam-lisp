@@ -304,7 +304,7 @@ test "intent recovery reports old, new, and neither explicitly" do
   name = :crypto.hash(:sha256, plan.id) |> Base.encode16(case: :lower)
   journal = Path.join(dir, name <> ".json")
   body = %{phase: :intent, id: plan.id, target: plan.target, selector: plan.selector,
-    old_hash: plan.old_hash, after_hash: plan.new_hash} |> Jason.encode!()
+    old_hash: plan.old_hash, after_hash: plan.new_hash} |> JSON.encode!()
   File.write!(journal, body)
 
   assert {:ok, %{"recovery" => "old"}} = DevChange.receipt(plan.id, root)

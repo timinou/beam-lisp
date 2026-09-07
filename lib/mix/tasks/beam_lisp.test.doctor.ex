@@ -26,7 +26,6 @@ defmodule Mix.Tasks.BeamLisp.Test.Doctor do
   @global_smells [
     {"BeamLisp.Record", "record registry is VM-global"},
     {"BeamLisp.Native", "native host modules are VM-global"},
-    {"BeamLisp.LazySeq", "lazy-seq realization cache is VM-global"},
     {"Interface.Server", "app singleton (agent registry on persistent_term)"},
     {"Env.intern", "writes to the ambient env — fine inside a fork, global outside"},
     {"clear_registry", "bl test registry sweep — exact-env, but check intent"},

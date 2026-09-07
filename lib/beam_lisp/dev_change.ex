@@ -94,7 +94,7 @@ defmodule BeamLisp.DevChange do
     with {:ok, root} <- canonical_workspace(workspace),
          {:ok, file} <- journal_file(root, id),
          {:ok, bytes} <- safe_read_journal(root, file),
-         {:ok, value} <- Jason.decode(bytes) do
+         {:ok, value} <- JSON.decode(bytes) do
       recover(value, root)
     else
       {:error, :enoent} -> {:error, :not_found}
@@ -415,11 +415,11 @@ defmodule BeamLisp.DevChange do
 
   defp persist_evidence(root, evidence) do
     with :ok <- ensure_journal(root), {:ok, file} <- evidence_file(root, evidence.edit_id),
-         :ok <- atomic(file, Jason.encode!(evidence)), do: :ok
+         :ok <- atomic(file, JSON.encode!(evidence)), do: :ok
   end
   defp read_evidence(root, id) do
     with {:ok, file} <- evidence_file(root, id), {:ok, bytes} <- safe_read_journal(root, file),
-         {:ok, evidence} <- Jason.decode(bytes), do: {:ok, evidence}
+         {:ok, evidence} <- JSON.decode(bytes), do: {:ok, evidence}
   end
   defp verified(r, p) do
     with {:ok, expected_command} <- descriptor(p.verification, @default_allowlist) do
@@ -441,7 +441,7 @@ defmodule BeamLisp.DevChange do
   defp same(bytes, h), do: if(hash(bytes) == h, do: :ok, else: {:error, :conflict})
   defp hash(bytes), do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   defp toolchain, do: %{elixir: System.version(), otp: List.to_string(:erlang.system_info(:otp_release))}
-  defp normalize_json(value), do: value |> Jason.encode!() |> Jason.decode!()
+  defp normalize_json(value), do: value |> JSON.encode!() |> JSON.decode!()
   defp get(m, k, default \\ nil), do: Map.get(m, k, Map.get(m, Atom.to_string(k), default))
   defp val(m, k), do: Map.get(m, k, Map.get(m, String.to_atom(k)))
 
@@ -482,7 +482,7 @@ defmodule BeamLisp.DevChange do
         target: p.target, selector: p.selector, old_hash: p.old_hash, after_hash: p.new_hash,
         old_form: binary_part(p.old_bytes, p.span.start, p.span.stop - p.span.start),
         verification_evidence: evidence, command_descriptor: val(evidence, "command_descriptor"), status: phase}
-      case atomic(file, Jason.encode!(data)) do
+      case atomic(file, JSON.encode!(data)) do
         :ok -> {:ok, data}
         error -> error
       end

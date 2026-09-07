@@ -39,6 +39,9 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   @recursive true
   @manifest "compile.beam_lisp"
 
+  @doc false
+  def refresh_staged_build?(staged) when is_list(staged), do: "build" in staged
+
   @impl Mix.Task.Compiler
   def run(args) do
     {opts, _, _} =
@@ -52,7 +55,12 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     # `--out DIR` scopes the whole build to DIR — beams and manifest — so a
     # test that compiles a fixture set never touches the production code path.
     out = opts[:out] || Mix.Project.compile_path()
-    manifest = if opts[:out], do: Path.join(out, @manifest), else: Path.join(Mix.Project.manifest_path(), @manifest)
+
+    manifest =
+      if opts[:out],
+        do: Path.join(out, @manifest),
+        else: Path.join(Mix.Project.manifest_path(), @manifest)
+
     if opts[:out], do: File.mkdir_p!(out)
 
     if sources == [] do
@@ -90,7 +98,8 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   end
 
   @impl Mix.Task.Compiler
-  def clean, do: clean(Mix.Project.compile_path(), Path.join(Mix.Project.manifest_path(), @manifest))
+  def clean,
+    do: clean(Mix.Project.compile_path(), Path.join(Mix.Project.manifest_path(), @manifest))
 
   @doc "Remove the manifest at `out/compile.beam_lisp` and every module it names (isolated builds)."
   def clean(out) when is_binary(out), do: clean(out, Path.join(out, @manifest))
@@ -117,7 +126,19 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     env_was_running? = Process.whereis(BeamLisp.Env) != nil
     server_was_running? = Process.whereis(BeamLisp.Loader.Server) != nil
 
-    BeamLisp.Bootstrap.install!(Mix.Project.compile_path())
+    # A consuming app must not receive its own copy of the bootstrap floor:
+    # that copy can shadow a newer compiler already built in the dependency.
+    compiler_path =
+      if Mix.Project.config()[:app] == :beam_lisp do
+        Mix.Project.compile_path()
+      else
+        case :code.lib_dir(:beam_lisp) do
+          {:error, reason} -> raise "beam_lisp dependency is unavailable: #{inspect(reason)}"
+          path -> Path.join(to_string(path), "ebin")
+        end
+      end
+
+    BeamLisp.Bootstrap.install!(compiler_path)
     BeamLisp.AOT.boot()
 
     try do
@@ -132,6 +153,15 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   # (not a module call) so it works whether `build` is AOT-built or read from
   # source — the compile task's own first run is the latter.
   defp build_call(name, args) do
+    staged = Application.get_env(:beam_lisp, :bootstrap_staging, [])
+
+    # The seed's build namespace is only a previous-generation bootstrap tool.
+    # Keep the staged compiler available, but force build itself through the
+    # loader's normal source fallback so scheduling changes take effect now.
+    if name == "run" and refresh_staged_build?(staged) do
+      Application.put_env(:beam_lisp, :bootstrap_staging, List.delete(staged, "build"))
+    end
+
     BeamLisp.Loader.ensure_loaded("build")
     BeamLisp.RT.invoke(BeamLisp.Env.fetch!("build", name), args)
   end
@@ -144,7 +174,9 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     source_dirs
     |> List.wrap()
     |> Enum.filter(&File.dir?/1)
-    |> Enum.flat_map(fn dir -> Enum.flat_map(exts, &Path.wildcard(Path.join(dir, "**/*" <> &1))) end)
+    |> Enum.flat_map(fn dir ->
+      Enum.flat_map(exts, &Path.wildcard(Path.join(dir, "**/*" <> &1)))
+    end)
     |> Enum.uniq()
     |> Enum.sort()
   end

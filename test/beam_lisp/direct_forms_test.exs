@@ -6,6 +6,19 @@ defmodule BeamLisp.DirectFormsTest do
     BeamLisp.Compiler.eval_string("(ns #{ns})\n" <> source, BeamLisp.Compiler.new_env(ns))
   end
 
+  test "explicit Elixir prefixes resolve to the same host module" do
+    assert eval("qualifiedhost", "(Elixir.String/upcase \"hello\")") == "HELLO"
+    assert eval("qualifiedhost", "(let [f Elixir.String/upcase] (f \"hello\"))") == "HELLO"
+    child = BeamLisp.Env.fork(:global, caps: [])
+    try do
+      assert_raise BeamLisp.CompileError, fn ->
+        BeamLisp.Env.with_env(child, fn -> eval("qualifiedhost", "(Elixir.String/upcase \"denied\")") end)
+      end
+    after
+      BeamLisp.Env.destroy(child)
+    end
+  end
+
   test "defserver preserves guarded callback dispatch" do
     mod =
       eval("directserverinvariant", """
@@ -78,7 +91,7 @@ defmodule BeamLisp.DirectFormsTest do
     assert generated_meta.custom == %{origin: :macro}
     assert [%BeamLisp.Vector{items: {{:symbol, "x"}}}] = generated_meta.arglists
 
-    source = File.read!("priv/boot/compiler2.bl")
+    source = File.read!("priv/boot/compiler.bl")
     refute source =~ "(a/normalise meta)"
     refute source =~ "Macro/escape"
   end

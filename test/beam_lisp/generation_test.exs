@@ -10,14 +10,14 @@ defmodule BeamLisp.GenerationTest do
   end
 
   test "receipt separates current source, committed seed, and actually loaded code" do
-    Enum.each([BeamLisp.Ns.Compiler2, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf], &Code.ensure_loaded!/1)
+    Enum.each([BeamLisp.Ns.Compiler, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf], &Code.ensure_loaded!/1)
     receipt = Generation.receipt()
 
     assert receipt.source.codegen_key == BeamLisp.AOTCache.current_compiler_key()
     assert is_binary(receipt.seed.manifest_sha256)
     assert byte_size(receipt.seed.manifest_sha256) == 64
 
-    for mod <- [BeamLisp.Ns.Compiler2, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf] do
+    for mod <- [BeamLisp.Ns.Compiler, BeamLisp.Ns.Lower, BeamLisp.Ns.Anf] do
       identity = receipt.loaded.modules[Atom.to_string(mod)]
       assert %{loaded_md5: loaded_md5, object_code: %{sha256: hash, path: path}} = identity
       assert loaded_md5 == Base.encode16(apply(mod, :module_info, [:md5]), case: :lower)
@@ -62,8 +62,8 @@ defmodule BeamLisp.GenerationTest do
 
   test "hotpatch receipt names only successfully recorded namespaces" do
     assert Generation.receipt().hotpatched_namespaces == []
-    assert :ok = Generation.record_hotpatch(["lower", "compiler2", "lower"])
-    assert Generation.receipt().hotpatched_namespaces == ["compiler2", "lower"]
+    assert :ok = Generation.record_hotpatch(["lower", "compiler", "lower"])
+    assert Generation.receipt().hotpatched_namespaces == ["compiler", "lower"]
   end
 
   test "receipt exposes build and cache modes without conflating them with identity" do

@@ -4,7 +4,7 @@ defmodule BeamLisp.DevHotpatch do
   the iteration path for toolchain work that would otherwise need a seed
   regeneration (minutes) per edit.
 
-      BL_HOTPATCH=compiler2,lower mix test test/beam_lisp/guards_test.exs
+      BL_HOTPATCH=compiler,lower mix test test/beam_lisp/guards_test.exs
       BL_HOTPATCH=anf mix run --no-start my_probe.exs
 
   For each named namespace `foo`, this compiles `priv/boot/foo.bl` with the
@@ -22,7 +22,7 @@ defmodule BeamLisp.DevHotpatch do
   require Logger
 
   @doc """
-  Hot-patch the given boot namespaces (list of names like `"compiler2"`, or
+  Hot-patch the given boot namespaces (list of names like `"compiler"`, or
   a comma-separated string) from `priv/boot/<name>.bl` sources.
   `:source_root` selects an explicit source snapshot for controlled comparisons.
   """

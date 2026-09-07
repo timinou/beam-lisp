@@ -1,8 +1,8 @@
 defmodule BeamLisp.AnfDirectEmitTest do
   use ExUnit.Case, async: false
 
-  # Canonical cutover oracle: both the stable `compiler` namespace and the host
-  # facade expose compiler2's ANF directly. The corpus comparison remains
+  # Canonical cutover oracle: the `compiler` namespace is the self-hosted backend.
+  # The corpus comparison remains
   # structural (including guards); no canonicalize/quote round-trip is allowed.
 
   @files [
@@ -61,14 +61,14 @@ defmodule BeamLisp.AnfDirectEmitTest do
             snapshot_path(path) |> File.read!() |> :erlang.binary_to_term()
           assert entries != []
           assert Enum.all?(entries, fn {_, outcome} -> match?({:ok, _}, outcome) end)
-          env = Map.put(bl("compiler2", "new-env", ["anfcensus"]), :ns, "anfcensus")
+          env = Map.put(bl("compiler", "new-env", ["anfcensus"]), :ns, "anfcensus")
 
           entries
           |> Enum.with_index()
           |> Enum.reduce(acc, fn {{form, {:ok, expected}}, i}, acc ->
             result =
               try do
-                bl("compiler2", "reset-fresh!", [])
+                bl("compiler", "reset-fresh!", [])
                 {:ok, BeamLisp.Compiler.compile(form, env), expected}
               catch
                 kind, reason -> {:compile_error, kind, reason}
@@ -139,7 +139,7 @@ defmodule BeamLisp.AnfDirectEmitTest do
   # The genesis ns/def assembly emitted empty __block__s for absent alias/refer
   # groups, which norm-block turned into pure-constant no-op statements
   # (:enil / lit nil) mid-sequence, and wrapped the ns :require loads in ONE
-  # discarded cons-list expression. compiler2 omits the no-ops and emits each
+  # discarded cons-list expression. the compiler omits the no-ops and emits each
   # load as its own statement. Both canonicalize away: drop pure-constant
   # NON-FINAL statements (the final one carries the value), and splice the
   # elements of a non-final cons-list stmt into individual statements
@@ -292,7 +292,7 @@ defmodule BeamLisp.AnfDirectEmitTest do
   # Ground values compare with fresh-name normalisation applied to every atom
   # and binary leaf (gensym counters differ between the two pipelines), and
   # {:__aliases__, _, segs} tuples resolved to their module atom: the genesis
-  # emitter resolved aliases at emit time, compiler2 keeps the alias tuple in
+  # emitter resolved aliases at emit time, the compiler keeps the alias tuple in
   # the transition entries, and canonicalize's alias->atom resolves both to the
   # same :remote — the data-level spellings differ, the compiled node does not.
   defp ground_eq(a, b), do: ground_norm(a) == ground_norm(b)

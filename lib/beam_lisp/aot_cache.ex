@@ -44,6 +44,8 @@ defmodule BeamLisp.AOTCache do
 
   @env_off "BEAM_LISP_AOT_CACHE"
   @env_dir "BEAM_LISP_AOT_CACHE_DIR"
+  @gc_last_sweep_pt {__MODULE__, :gc_last_sweep}
+  @gc_defaults [keep_generations: 8, max_age_days: 30, max_delete: 4, interval_ms: 3_600_000]
 
   # The host modules whose bytes can change EMITTED code. `BeamLisp.Compiler` is
   # deliberately ABSENT: the lowering now lives entirely in the self-hosted
@@ -111,13 +113,10 @@ defmodule BeamLisp.AOTCache do
   end
 
   @doc """
-  The backend that lowers a namespace's body modules to `.beam`: `:core`
-  (bl-ANF -> Core Erlang, via the boot `lower` ns) or `:elixir` (the genesis Elixir
-  compiler). Default `:core` (PLAN-081 step 3 flip): a full-tree Core build is
-  proven clean, byte-reproducible, and behaviourally identical to Elixir (the
-  regression stays at baseline under either backend). Opt back to the Elixir
-  compiler per-run with `config :beam_lisp, :aot_backend, :elixir` — it stays
-  fully supported as the genesis path and the differential-oracle yardstick.
+  The body-module backend is `:core`: bl-ANF → Core Erlang → BEAM through
+  the boot `lower` namespace. Other settings raise before boot or cache access.
+  The self-hosted compiler emits ANF, not Elixir definition syntax, so the
+  removed genesis backend cannot serve as a fallback.
 
   It lives here, not in `BeamLisp.AOT`, because `compiler_key/0` must fold it in
   (a Core-built beam and an Elixir-built beam of the same source are different
@@ -127,8 +126,10 @@ defmodule BeamLisp.AOTCache do
   """
   def aot_backend do
     case Application.get_env(:beam_lisp, :aot_backend, :core) do
-      :elixir -> :elixir
-      _ -> :core
+      :core -> :core
+      backend ->
+        raise ArgumentError,
+              "unsupported AOT backend #{inspect(backend)}: the self-hosted compiler emits ANF; use :core"
     end
   end
 
@@ -167,6 +168,9 @@ defmodule BeamLisp.AOTCache do
   def reset_compiler_key, do: :persistent_term.erase(@toolchain_key_pt)
 
   defp compute_compiler_key do
+    # Loading metadata does not start the app. Builds and ordinary startup
+    # must not hash different versions merely because one ran before start.
+    :application.load(:beam_lisp)
     vsn =
       case :application.get_key(:beam_lisp, :vsn) do
         {:ok, v} -> List.to_string(v)
@@ -250,6 +254,10 @@ defmodule BeamLisp.AOTCache do
     |> Enum.map(&File.read!/1)
   end
 
+  # Prelude bodies remain toolchain inputs: macros and compiler helpers can
+  # execute ordinary core functions while producing code. An interface-only
+  # key is unsafe without tracking those transitive compile-time dependencies.
+
   @doc """
   Hash of one source's closure: its absolute path + content hash and those
   of every transitive `:require` target within the build's source set.
@@ -285,9 +293,7 @@ defmodule BeamLisp.AOTCache do
   def fetch(compiler_key, closure_key, compile_path) do
     entry = entry_dir(compiler_key, closure_key)
 
-    with true <- File.dir?(entry),
-         {:ok, bin} <- File.read(Path.join(entry, "manifest.term")),
-         %{modules: modules} <- safe_term(bin),
+    with {:ok, modules} <- valid_entry(entry),
          :ok <- link_beams(entry, compile_path, modules) do
       {:ok, modules}
     else
@@ -310,19 +316,164 @@ defmodule BeamLisp.AOTCache do
         File.cp!(Path.join(compile_path, beam_file(mod)), Path.join(tmp, beam_file(mod)))
       end)
 
-      File.write!(Path.join(tmp, "manifest.term"), :erlang.term_to_binary(%{modules: modules}))
+      digests = Map.new(modules, fn mod ->
+        {mod, Path.join(tmp, beam_file(mod)) |> File.read!() |> then(&:crypto.hash(:sha256, &1))}
+      end)
+      File.write!(Path.join(tmp, "manifest.term"),
+        :erlang.term_to_binary(%{version: 2, modules: modules, digests: digests}))
 
-      if File.dir?(final) do
-        File.rm_rf!(tmp)
-      else
-        File.rename(tmp, final)
-      end
+      :global.trans({{@toolchain_key_pt, :publish, final}, self()}, fn ->
+        case valid_entry(final) do
+          {:ok, _} -> File.rm_rf!(tmp)
+          :miss ->
+            # Old or damaged cache entries are disposable, unlike source.
+            File.rm_rf!(final)
+            File.rename!(tmp, final)
+        end
+      end, [node()])
 
+      maybe_cleanup_obsolete_generations(compiler_key)
       :ok
     rescue
       _ ->
         File.rm_rf(tmp)
         :ok
+    end
+  end
+
+  defp valid_entry(entry) do
+    with {:ok, binary} <- File.read(Path.join(entry, "manifest.term")),
+         %{version: 2, modules: modules, digests: digests} <- safe_term(binary),
+         true <- is_list(modules),
+         true <- Enum.all?(modules, fn mod ->
+           case File.read(Path.join(entry, beam_file(mod))) do
+             {:ok, bytes} -> :crypto.hash(:sha256, bytes) == Map.get(digests, mod)
+             _ -> false
+           end
+         end) do
+      {:ok, modules}
+    else
+      _ -> :miss
+    end
+  rescue
+    _ -> :miss
+  end
+
+  @doc """
+  Remove obsolete compiler-key generations from the configured cache root.
+
+  The active generation is always retained. Only real directories whose names
+  are lowercase SHA-256 keys are candidates; symlinks and all other entries are
+  ignored. Cleanup is bounded by `:max_delete` per call and is best-effort.
+
+  Retention defaults can be overridden with
+  `config :beam_lisp, :aot_cache_gc, keep_generations: 8, max_age_days: 30,
+  max_delete: 4, interval_ms: 3_600_000`. Explicit options override config.
+  """
+  def cleanup_obsolete_generations(active_key, opts \\ []) when is_binary(active_key) do
+    options = gc_options(opts)
+    root = dir()
+
+    with {:ok, entries} <- File.ls(root) do
+      generations =
+        entries
+        |> Enum.filter(&valid_compiler_key?/1)
+        |> Enum.reject(&(&1 == active_key))
+        |> Enum.flat_map(&generation_info(root, &1))
+        |> Enum.sort_by(& &1.mtime, :desc)
+
+      now = System.os_time(:second)
+      keep = max(options[:keep_generations] - 1, 0)
+      age_limit = options[:max_age_days] * 86_400
+
+      candidates =
+        generations
+        |> Enum.with_index()
+        |> Enum.filter(fn {generation, index} ->
+          index >= keep or now - generation.mtime > age_limit
+        end)
+        |> Enum.map(&elem(&1, 0))
+        |> Enum.sort_by(& &1.mtime)
+        |> Enum.take(options[:max_delete])
+
+      deleted =
+        Enum.flat_map(candidates, fn generation ->
+          case File.rm_rf(generation.path) do
+            {:ok, _} -> [generation.name]
+            {:error, _, _} -> []
+          end
+        end)
+
+      {:ok, deleted}
+    else
+      {:error, :enoent} -> {:ok, []}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _ -> {:ok, []}
+  end
+
+  @doc false
+  def reset_cleanup_throttle, do: :persistent_term.erase(@gc_last_sweep_pt)
+
+  defp maybe_cleanup_obsolete_generations(active_key) do
+    # Parallel build workers share one sweep budget. Recheck inside the lock
+    # so a cold wave cannot multiply max_delete by its worker count.
+    :global.trans({@gc_last_sweep_pt, self()}, fn ->
+      options = gc_options([])
+      now = System.monotonic_time(:millisecond)
+      root = dir()
+      last = :persistent_term.get(@gc_last_sweep_pt, nil)
+
+      due? =
+        case last do
+          {^root, at} -> now - at >= options[:interval_ms]
+          _ -> true
+        end
+
+      if due? do
+        :persistent_term.put(@gc_last_sweep_pt, {root, now})
+        cleanup_obsolete_generations(active_key, options)
+      end
+    end)
+
+    :ok
+  end
+
+  defp gc_options(overrides) do
+    configured = Application.get_env(:beam_lisp, :aot_cache_gc, [])
+
+    @gc_defaults
+    |> Keyword.merge(if(Keyword.keyword?(configured), do: configured, else: []))
+    |> Keyword.merge(overrides)
+    |> then(fn options ->
+      [
+        keep_generations:
+          positive_integer(options[:keep_generations], @gc_defaults[:keep_generations]),
+        max_age_days: positive_integer(options[:max_age_days], @gc_defaults[:max_age_days]),
+        max_delete: positive_integer(options[:max_delete], @gc_defaults[:max_delete]),
+        interval_ms: non_negative_integer(options[:interval_ms], @gc_defaults[:interval_ms])
+      ]
+    end)
+  end
+
+  defp positive_integer(value, _default) when is_integer(value) and value > 0, do: value
+  defp positive_integer(_value, default), do: default
+
+  defp non_negative_integer(value, _default) when is_integer(value) and value >= 0, do: value
+  defp non_negative_integer(_value, default), do: default
+
+  defp valid_compiler_key?(name), do: Regex.match?(~r/\A[0-9a-f]{64}\z/, name)
+
+  defp generation_info(root, name) do
+    path = Path.join(root, name)
+
+    case File.lstat(path, time: :posix) do
+      {:ok, %File.Stat{type: :directory, mtime: mtime}} ->
+        [%{name: name, path: path, mtime: mtime}]
+
+      _ ->
+        []
     end
   end
 
@@ -368,7 +519,16 @@ defmodule BeamLisp.AOTCache do
     end
   end
 
-  defp entry_dir(compiler_key, closure_key), do: Path.join([dir(), compiler_key, closure_key])
+  defp entry_dir(compiler_key, closure_key) do
+    unless Enum.all?([compiler_key, closure_key], &is_binary/1) and
+             Enum.all?([compiler_key, closure_key], &Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, &1)),
+      do: raise(ArgumentError, "cache keys must be safe path components")
+    generation = Path.join(dir(), compiler_key)
+    case File.lstat(generation) do
+      {:ok, %{type: :symlink}} -> raise ArgumentError, "cache generation cannot be a symlink"
+      _ -> Path.join(generation, closure_key)
+    end
+  end
 
   defp beam_file(mod), do: Atom.to_string(mod) <> ".beam"
 
@@ -415,6 +575,7 @@ defmodule BeamLisp.AOTCache do
   end
 
   defp hash_parts(parts) do
-    :crypto.hash(:sha256, IO.iodata_to_binary(Enum.intersperse(parts, 0))) |> Base.encode16(case: :lower)
+    :crypto.hash(:sha256, IO.iodata_to_binary(Enum.intersperse(parts, 0)))
+    |> Base.encode16(case: :lower)
   end
 end

@@ -75,9 +75,7 @@ defmodule BeamLisp.Emit do
     exports = Enum.map(exports, &canonical_pair/1)
     attrs = Enum.map(attrs, &canonical_pair/1)
 
-    if function_exported?(BeamLisp.Ns.Anf, :module, 5),
-      do: apply(BeamLisp.Ns.Anf, :module, [name, clauses, exports, attrs, ann]),
-      else: BeamLisp.BootstrapAdapter.descriptor(name, clauses, exports, attrs, ann)
+    apply(BeamLisp.Ns.Anf, :module, [name, clauses, exports, attrs, ann])
   end
 
   defp canonical_pair(%BeamLisp.Vector{} = pair), do: pair
@@ -90,10 +88,7 @@ defmodule BeamLisp.Emit do
   end
 
   def compile_descriptor(descriptor) do
-    compiled =
-      if function_exported?(BeamLisp.Ns.Lower, :"descriptor->beam", 1),
-        do: apply(BeamLisp.Ns.Lower, :"descriptor->beam", [descriptor]),
-        else: BeamLisp.BootstrapAdapter.compile_descriptor(descriptor)
+    compiled = apply(BeamLisp.Ns.Lower, :"descriptor->beam", [descriptor])
 
     case compiled do
       {mod, bytes} when is_atom(mod) and is_binary(bytes) -> {mod, bytes}
