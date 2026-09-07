@@ -21,13 +21,12 @@ defmodule BeamLisp.Meta do
 
   ## Supported
 
-  * **lazy seqs** — a `%BeamLisp.LazySeq{}` carries a unique `:key`
-    reference (the same one that gates its memoized realization), which
-    is a genuine per-instance identity. Metadata is keyed by it, so it
-    is invisible to `=` (seq equality compares realized contents, never
-    the struct) and to printing (the `Inspect` impl renders the body).
-    `with_meta/2` returns a *fresh* node (new key, thunk re-forced) so
-    the original keeps its own metadata and its realization cache.
+  * **lazy seqs** — a `%BeamLisp.LazySeq{}` carries metadata in an
+    immutable struct field. Equality compares realized contents and printing
+    renders the body, so neither observes metadata. `with_meta/2` returns an
+    independently annotated value that retains the exact same native memo
+    resource: successful realization is shared with the source, and changing
+    metadata never repeats effects.
   * **vars** — var metadata is real and lives in `BeamLisp.Env` under
     `{:meta, ns, name}`, the same key that already carried docstrings.
     `Env.put_meta/3` now takes a general map with merge semantics
@@ -54,15 +53,13 @@ defmodule BeamLisp.Meta do
     round-trips through `with-meta` cleanly without changing the shape
     of the threaded form.
 
-  ## Boundedness
+  ## Lifetime
 
-  A value-metadata entry lives in the shared vars ETS table for the
-  process lifetime. Entries are keyed by fresh references, so the table
-  only grows by the number of *distinct* `with_meta` calls on lazy seqs,
-  never by re-traversals — the same trade-off the lazy-seq realization
-  cache already documents.
+  Lazy-seq metadata lives only in the immutable value. It creates no Env
+  registry entry or other permanent side-table root; its lifetime is the
+  lifetime of the annotated value. The shared native memo resource remains
+  reclaimable after every value that refers to it becomes unreachable.
   """
-
 
   @doc """
   The metadata map attached to `x`, or `nil` when it has none.
@@ -70,13 +67,7 @@ defmodule BeamLisp.Meta do
   Returns `nil` for every value type that cannot carry metadata
   (see the module doc), so the Clojure idiom `(meta x)` is always safe.
   """
-  def meta(%BeamLisp.LazySeq{} = lazy) do
-    case BeamLisp.Env.lookup(meta_key(lazy)) do
-      {:ok, m} -> m
-      :error -> nil
-    end
-  end
-
+  def meta(%BeamLisp.LazySeq{metadata: metadata}), do: metadata
   def meta(_other), do: nil
 
   @doc """
@@ -85,24 +76,18 @@ defmodule BeamLisp.Meta do
   cannot carry it). A non-map, non-nil `m` is an error, matching
   Clojure's "Metadata must be … a Map".
 
-  On a lazy seq the returned value is a **fresh node**: a new identity
-  key and a re-forced thunk, so the original keeps its own metadata and
-  its realization cache untouched. On every other type `x` is returned
-  unchanged.
+  On a lazy seq the returned value is an immutable struct update: the
+  original keeps its metadata, while both values retain the exact same native
+  memo resource and therefore share realization. On every other type `x` is
+  returned unchanged.
   """
-  def with_meta(%BeamLisp.LazySeq{} = lazy, nil) do
-    # nil metadata clears: return a fresh node (new identity, no entry)
-    # so the original's metadata and realization cache are untouched.
-    %BeamLisp.LazySeq{lazy | key: make_ref()}
-  end
+  def with_meta(%BeamLisp.LazySeq{} = lazy, nil),
+    do: %BeamLisp.LazySeq{lazy | metadata: nil}
 
   # is_map-ok: m is the internal metadata map (user-provided meta value),
   # never a collection path — any struct/map is a legal meta payload.
-  def with_meta(%BeamLisp.LazySeq{} = lazy, m) when is_map(m) do
-    fresh = %BeamLisp.LazySeq{lazy | key: make_ref()}
-    BeamLisp.Env.put_key(meta_key(fresh), m)
-    fresh
-  end
+  def with_meta(%BeamLisp.LazySeq{} = lazy, m) when is_map(m),
+    do: %BeamLisp.LazySeq{lazy | metadata: m}
 
   def with_meta(x, nil), do: x
   # is_map-ok: same as above — m is a metadata map, not a collection value.
@@ -123,9 +108,4 @@ defmodule BeamLisp.Meta do
   def vary_meta(x, f) do
     with_meta(x, BeamLisp.RT.invoke(f, [meta(x)]))
   end
-
-  # The ETS key for a value's metadata. Lazy seqs key on their identity
-  # reference; the tag keeps this disjoint from the env's `{:meta, ns, name}`
-  # var-metadata key and from the `{:lazy, ref}` realization cache.
-  defp meta_key(%BeamLisp.LazySeq{key: key}), do: {:meta_of, key}
 end

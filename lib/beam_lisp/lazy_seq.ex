@@ -1,166 +1,187 @@
 defmodule BeamLisp.LazySeq do
   @moduledoc """
-  A lazily-realized sequence — the Clojure seq model, native on the BEAM.
-
-  A `LazySeq` holds a zero-arity thunk. Forcing it produces either `nil`
-  (empty) or a `[head | tail]` cell whose `tail` is itself a `LazySeq` or a
-  realized list, so a lazy seq is a chain of deferred cells that each realize
-  exactly when they are reached.
-
-  **Thunk contract — what a lazy-seq body may return:** `nil`, a `[h | t]`
-  cons cell, any seqable collection (vector, set), or a bare `LazySeq`.
-  Returning a bare `LazySeq` is idiomatic — Clojure `lazy-seq` bodies
-  routinely hand back another seq (`(lazy-seq (concat …))`) — and
-  `realize/1` peels such nested nodes until it finds `nil` or a cons cell.
-  **What the type guarantees to callers:** `cell/1` and `realize/1` always
-  yield `nil` or a `[h | t]` cell — never a bare `LazySeq` — so every walk
-  (concat, first, next, take, count, Enum) can pattern-match on exactly those
-  two shapes. Only the head is normalized; the tail stays lazy, so an infinite
-  seq realizes one cell at a time.
-
-  Realization is memoized **once per node** so re-forcing a shared cell never
-  re-runs its thunk (the guarantee Clojure's `lazy-seq` makes): each node
-  carries a unique `:ref` key and writes its realized value into the shared
-  vars ETS table the first time the thunk runs. The trade-off against a
-  process/`Agent`-per-cell is that it is lock-free and cheap for hot `take`/
-  `doall` loops; the trade-off against pure functional rebind is that a
-  realized cell's cache entry lives for the process lifetime (bounded by the
-  number of distinct lazy cells realized, not by re-traversals). An `:atomics`
-  slot was the first candidate but holds integers only, so it cannot store a
-  realized cell.
-
-  Implements `Enumerable` and `Inspect`: the former lets lazy seqs flow into
-  Elixir's `Enum`/`Stream` unchanged, the latter prints a bounded prefix
-  (`(1 2 3 …)`) so an infinite seq can never hang the printer.
+  A lazy sequence with resource-owned memo state. Successful answers are shared;
+  known failed attempts may be retried. Recursive force, cyclic retained values,
+  and evaluator loss are terminal. Metadata is immutable and value-owned.
   """
-
-  # The realization cache lives in its OWN table, not in the shared var
-  # table. An ETS table dies with the process that created it, and the
-  # var table is created by (and so owned by) the `Env` Agent — so an
-  # Env restart silently discarded every memoized chunk. A seq that had
-  # realized 32 elements went back to realizing one at a time: not an
-  # error, just the memo quietly gone, which is why it surfaced as an
-  # intermittent laziness test failure correlated with machine load
-  # rather than as anything diagnosable (BUG-011).
-  #
-  # Memoization state and var state have different lifetimes. Keeping
-  # them in one table coupled them.
-  @table :beam_lisp_lazy_cache
-
-  # Whole-table eviction budget for the realization cache (see maybe_evict/0).
-  # Overridable via config :beam_lisp, :lazy_cache_budget_bytes.
-  @cache_budget_bytes 512 * 1024 * 1024
-
-  # Chunked seq fns realize this many elements per thunk, so the
-  # per-element LazySeq allocation is amortized instead of one struct +
-  # closure per element (the reason Clojure chunks at 32).
+  alias BeamLisp.LazyMemo
   @chunk_size 32
+  defstruct resource: nil, metadata: nil
 
-  defstruct key: nil, thunk: nil
-
-  @type t :: %__MODULE__{key: reference(), thunk: (-> term)}
-
-  @doc "Wrap `thunk` in a lazy seq node, realized at most once."
-  def new(thunk) when is_function(thunk, 0) do
-    %__MODULE__{key: make_ref(), thunk: thunk}
+  defmodule ForceError do
+    defexception [:reason, :message]
+    @impl true
+    def exception(reason),
+      do: %__MODULE__{reason: reason, message: "LazySeq force failed: #{inspect(reason)}"}
   end
 
-  @doc "Interop alias for the `lazy-seq` macro's `BeamLisp.LazySeq/from_fun` call."
-  def from_fun(thunk) when is_function(thunk, 0), do: new(thunk)
+  @type t :: %__MODULE__{resource: reference(), metadata: map() | nil}
+  @doc "Wrap a recipe in a shared lazy node. A successful result is memoized."
+  def new(thunk) when is_function(thunk, 0),
+    do: %__MODULE__{resource: LazyMemo.create({:pending, thunk})}
 
-  @doc "Is `x` a lazy seq?"
+  def from_fun(thunk) when is_function(thunk, 0), do: new(thunk)
   def lazy?(%__MODULE__{}), do: true
   def lazy?(_), do: false
-
-  @doc "The chunk size for chunked realization (32, as in Clojure)."
   def chunk_size, do: @chunk_size
 
-  @doc """
-  Build a realized cons chain `e1 | e2 | … | ek | <lazy tail>` from the
-  non-empty proper list `elems` (k ≤ `@chunk_size`) and a 0-arity `tail_fun`
-  producing the next segment (or nil). Chunked seq fns return one of these
-  from a single thunk: a consumer that stops inside the chunk (like `take 5`)
-  never forces the tail, while each element past the first costs only a cons
-  cell instead of a fresh LazySeq node.
-  """
+  @doc false
+  def input(%BeamLisp.Vector{} = vector), do: input(BeamLisp.Vector.to_list(vector))
+
+  def input(list) when is_list(list) do
+    size =
+      try do
+        length(list)
+      rescue
+        ArgumentError -> 0
+      end
+
+    if size > @chunk_size, do: BeamLisp.SeqCursor.new(list), else: list
+  end
+
+  def input(other), do: other
   def chain([], _tail_fun), do: nil
 
-  def chain(elems, tail_fun) when is_function(tail_fun, 0) do
-    List.foldr(elems, new(tail_fun), fn e, acc -> [e | acc] end)
-  end
+  def chain(elems, tail_fun) when is_function(tail_fun, 0),
+    do: List.foldr(elems, new(tail_fun), fn e, acc -> [e | acc] end)
 
-  @doc """
-  Run a node's thunk exactly once, caching and returning the result.
+  def force(%__MODULE__{resource: resource}), do: force_state(resource)
+  @doc false
+  def memo_state(%__MODULE__{resource: resource}), do: LazyMemo.read(resource)
 
-  The memo is load-bearing SEMANTICS, not an optimization: a thunk may have
-  effects (`(map println xs)`, the build's `map eval-form forms`), and
-  Clojure's lazy-seq contract — which bl makes — is that it runs at most
-  once. A "cache the value only on second force" policy was tried and
-  reverted: it made shared effectful thunks re-run (double `defvar` /
-  double module definition in the parallel build) — see git history.
-  The budget eviction below is the accepted exception: a realized value
-  whose memo is evicted re-runs its thunk on next force (BUG-011's table
-  loss already made that possible), so thunks must tolerate re-execution
-  under memory pressure — but never under normal operation.
-  """
-  def force(%__MODULE__{key: key, thunk: thunk}) do
-    ensure_table()
-
-    case :ets.lookup(@table, {:lazy, key}) do
-      [{_, value}] ->
+  defp force_state(resource) do
+    case LazyMemo.read(resource) do
+      {:completed, value} ->
         value
 
-      [] ->
-        value = thunk.()
-        maybe_evict()
-        :ets.insert(@table, {{:lazy, key}, value})
-        value
+      {:terminal, reason} ->
+        raise ForceError, reason
+
+      {:running, _thunk, owner, attempt, _waiters} when owner == self() ->
+        resource |> publish_attempt(attempt, {:terminal, :recursive_force}) |> return_outcome()
+
+      {:running, _thunk, owner, attempt, _waiters} ->
+        wait_for_attempt(resource, owner, attempt)
+
+      {:pending, thunk} = old ->
+        claim_attempt(resource, old, thunk)
+
+      {:failed, thunk, _kind, _reason, _stacktrace} = old ->
+        claim_attempt(resource, old, thunk)
     end
   end
 
-  # Backstop budget. The cache is insert-only with make_ref keys (no
-  # reachability in ETS), so every forced node's realized value is retained
-  # VM-wide until eviction: compile-time pipelines (anf/normalise/lower)
-  # realize giant single-use trees per form and a big file accumulated ~7GB
-  # here, OOM-killing full builds. Exact-once memoization is language
-  # semantics (see force/1), so retention cannot be refused per-node; a
-  # capacity bound is the only semantics-preserving lever this side of a GC'd
-  # cache. The workload-side fix — not emitting lazy intermediates in the
-  # toolchain — belongs to the compiler pipeline (the quoted roundtrip is
-  # deleted by PLAN-086 E3/E4).
-  #
-  # When the table crosses the budget, evict ALL of it and continue: losing
-  # an entry means a thunk re-runs, which BUG-011 above already made possible
-  # (the table may vanish entirely). Whole-table eviction over per-entry LRU:
-  # one O(1) size check per cold force, no bookkeeping, no hot-path cost.
-  defp maybe_evict do
-    budget = Application.get_env(:beam_lisp, :lazy_cache_budget_bytes, @cache_budget_bytes)
+  defp claim_attempt(resource, old, thunk) do
+    LazyMemo.admit!()
+    attempt = make_ref()
 
-    case :ets.info(@table, :memory) do
-      words when is_integer(words) and words * 8 > budget ->
-        :ets.delete_all_objects(@table)
+    case LazyMemo.exchange(resource, old, {:running, thunk, self(), attempt, []}) do
+      :ok -> evaluate_attempt(resource, attempt, thunk)
+      :retry -> force_state(resource)
+      :cycle -> raise ForceError, :cyclic_memo
+    end
+  end
+
+  defp evaluate_attempt(resource, attempt, thunk) do
+    state =
+      try do
+        {:completed, thunk.()}
+      catch
+        kind, reason -> {:failed, thunk, kind, reason, __STACKTRACE__}
+      end
+
+    # Publication errors are not recipe failures and must not be republished.
+    resource |> publish_attempt(attempt, state) |> return_outcome()
+  end
+
+  defp publish_attempt(resource, attempt, state) do
+    case LazyMemo.read(resource) do
+      {:running, _thunk, owner, ^attempt, waiters} = old when owner == self() ->
+        outcome = attempt_outcome(state)
+        notifications = notifications(resource, attempt, waiters, outcome)
+
+        case LazyMemo.exchange(resource, old, state, notifications) do
+          :ok -> outcome
+          :retry -> publish_attempt(resource, attempt, state)
+          :cycle -> publish_attempt(resource, attempt, {:terminal, :cyclic_memo})
+        end
+
+      {:terminal, reason} ->
+        {:terminal, reason}
 
       _ ->
-        :ok
+        raise ForceError, {:stale_force_owner, attempt}
     end
   end
 
-  # Created on first use. The creator MUST be a VM-lifetime process: under
-  # async test suites the first toucher was a short-lived per-file Task, the
-  # table died with it, and every later lazy-seq access VM-wide raised
-  # "the table identifier does not refer to an existing ETS table" — flaky,
-  # order-dependent (PLAN-047 W1). The pinned Loader.Server owns it.
-  defp ensure_table do
-    case :ets.whereis(@table) do
-      :undefined ->
-        BeamLisp.Loader.Server.run(fn ->
-          try do
-            :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-          rescue
-            # Another process won the race; its table is the one we want.
-            ArgumentError -> :ok
-          end
-        end)
+  defp notifications(resource, attempt, waiters, outcome) do
+    identity = LazyMemo.id(resource)
+    Enum.map(waiters, &{&1, {:lazy_attempt, identity, attempt, outcome}})
+  end
+
+  defp attempt_outcome({:failed, _thunk, kind, reason, trace}), do: {:failed, kind, reason, trace}
+  defp attempt_outcome(outcome), do: outcome
+  defp return_outcome({:completed, value}), do: value
+  defp return_outcome({:failed, kind, reason, trace}), do: :erlang.raise(kind, reason, trace)
+  defp return_outcome({:terminal, reason}), do: raise(ForceError, reason)
+
+  defp wait_for_attempt(resource, owner, attempt) do
+    identity = LazyMemo.id(resource)
+    monitor = Process.monitor(owner)
+
+    case LazyMemo.read(resource) do
+      {:running, thunk, ^owner, ^attempt, waiters} = old ->
+        case LazyMemo.exchange(
+               resource,
+               old,
+               {:running, thunk, owner, attempt, [self() | waiters]}
+             ) do
+          :ok ->
+            receive_attempt(resource, identity, owner, attempt, monitor)
+
+          :retry ->
+            Process.demonitor(monitor, [:flush])
+            force_state(resource)
+
+          :cycle ->
+            Process.demonitor(monitor, [:flush])
+            raise ForceError, :cyclic_memo
+        end
+
+      _ ->
+        Process.demonitor(monitor, [:flush])
+        force_state(resource)
+    end
+  end
+
+  defp receive_attempt(resource, identity, owner, attempt, monitor) do
+    receive do
+      {:lazy_attempt, ^identity, ^attempt, outcome} ->
+        Process.demonitor(monitor, [:flush])
+        return_outcome(outcome)
+
+      {:DOWN, ^monitor, :process, ^owner, _reason} ->
+        owner_lost(resource, owner, attempt)
+        # Commit and notifications are one native operation. If commit won
+        # before owner death, its exact reply is delivered, even after a retry
+        # starts. Otherwise owner_lost publishes a terminal reply to us.
+        receive do
+          {:lazy_attempt, ^identity, ^attempt, outcome} -> return_outcome(outcome)
+        end
+    end
+  end
+
+  defp owner_lost(resource, owner, attempt) do
+    case LazyMemo.read(resource) do
+      {:running, _thunk, ^owner, ^attempt, waiters} = old ->
+        terminal = {:terminal, {:force_owner_lost, owner, attempt}}
+        messages = notifications(resource, attempt, waiters, terminal)
+
+        case LazyMemo.exchange(resource, old, terminal, messages) do
+          :ok -> :ok
+          :retry -> owner_lost(resource, owner, attempt)
+          :cycle -> raise ForceError, :cyclic_memo
+        end
 
       _ ->
         :ok
@@ -195,6 +216,7 @@ defmodule BeamLisp.LazySeq do
       %BeamLisp.Vector{} = v -> normalize_cell(BeamLisp.Vector.to_list(v))
       %BeamLisp.Set{} = s -> normalize_cell(BeamLisp.Set.to_list(s))
       %__MODULE__{} = nested -> realize_loop(nested, depth + 1)
+      %BeamLisp.SeqCursor{} = cursor -> BeamLisp.SeqCursor.cell(cursor)
       value -> value
     end
   end
@@ -208,6 +230,7 @@ defmodule BeamLisp.LazySeq do
   def cell(nil), do: nil
   def cell([]), do: nil
   def cell(%__MODULE__{} = l), do: realize(l)
+  def cell(%BeamLisp.SeqCursor{} = cursor), do: BeamLisp.SeqCursor.cell(cursor)
   def cell(xs) when is_list(xs), do: xs
   def cell(%BeamLisp.Vector{} = v), do: normalize_cell(BeamLisp.Vector.to_list(v))
   # A lazy-seq body may return any seqable — jank wraps a bare
@@ -314,7 +337,7 @@ defmodule BeamLisp.LazySeq do
       limit = if is_integer(opts.limit) and opts.limit > 0, do: opts.limit, else: 20
       {elems, truncated} = BeamLisp.LazySeq.sample(lazy, limit)
 
-      body = Enum.map(elems, &Inspect.inspect(&1, opts))
+      body = Enum.map(elems, &Inspect.Algebra.to_doc(&1, opts))
       body = Enum.intersperse(body, " ")
       # concat/1 wants a FLAT list of docs; a nested list is not a doc
       # and crashes the algebra formatter, which made a lazy seq

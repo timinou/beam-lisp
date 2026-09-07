@@ -18,7 +18,9 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
 
   ## Absent toolchain
 
-  A checkout without `cargo` is not an error. The database runs on its
+  The core LazySeq runtime requires a current `lazy_memo` artifact. If it
+  needs building and `cargo` is absent, compilation fails with an actionable
+  error. Native database backends remain optional: the database runs on its
   in-memory stores, `available?` answers false, and the conformance
   suite drops the native backend from its list rather than failing. A
   native capability that cannot be built must read as ABSENT, never as
@@ -34,6 +36,15 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
     if File.dir?(@native_dir) do
       case System.find_executable("cargo") do
         nil ->
+          memo_dir = Path.join(@native_dir, "lazy_memo")
+
+          if File.exists?(Path.join(memo_dir, "Cargo.toml")) and
+               not fresh?("lazy_memo", memo_dir) do
+            Mix.raise(
+              "LazySeq requires the lazy_memo native runtime. Install cargo and run mix compile; no current native artifact is available."
+            )
+          end
+
           Mix.shell().info([
             :yellow,
             "no cargo on PATH — native backends will report unavailable"
@@ -92,7 +103,10 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
   end
 
   defp newest_source(crate_dir) do
-    [Path.join(crate_dir, "src/**/*.rs"), Path.join(crate_dir, "Cargo.toml")]
+    Enum.map(
+      ["src/**/*.rs", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"],
+      &Path.join(crate_dir, &1)
+    )
     |> Enum.flat_map(&Path.wildcard/1)
     |> Enum.map(fn f ->
       case File.stat(f) do
@@ -177,7 +191,16 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
 
     # `BeamLisp.Native` loads `priv/native/<crate>` (no `lib` prefix,
     # no extension — `:erlang.load_nif/2` appends it).
-    File.cp!(built, installed_path(crate))
+    destination = installed_path(crate)
+    temporary = destination <> ".tmp-#{System.unique_integer([:positive])}"
+
+    # A running VM may still map the old library. Never truncate its inode.
+    try do
+      File.cp!(built, temporary)
+      File.rename!(temporary, destination)
+    after
+      File.rm(temporary)
+    end
   end
 
   # Where the loadable artefact lives once installed. Named because

@@ -1663,9 +1663,10 @@ defmodule BeamLisp.RT do
   end
   defp seqable(coll), do: coll
 
-  def map(f, coll), do: lazy_map(f, seqable(coll))
+  def map(f, coll), do: lazy_map(f, LazySeq.input(seqable(coll)))
 
   defp lazy_map(f, coll) do
+    coll = LazySeq.input(coll)
     LazySeq.new(fn ->
       case LazySeq.cell(coll) do
         nil -> nil
@@ -1695,11 +1696,15 @@ defmodule BeamLisp.RT do
   # Multi-collection `(map f c1 c2 …)` — stops at the *shortest* input,
   # exactly like Clojure. Each coll is re-seq'd per step so a lazy input is
   # only ever realized as far as the fold needs it.
-  def map_multi(f, c1, rest_colls), do: lazy_multi_map(f, [c1 | rest_colls])
+  def map_multi(f, c1, rest_colls),
+    do: lazy_multi_map(f, Enum.map([c1 | rest_colls], &LazySeq.input/1))
 
   defp lazy_multi_map(f, colls) do
     LazySeq.new(fn ->
-      seqs = Enum.map(colls, &seq/1)
+      seqs = Enum.map(colls, fn
+        %BeamLisp.SeqCursor{} = cursor -> LazySeq.cell(cursor)
+        other -> seq(other)
+      end)
 
       if Enum.any?(seqs, &is_nil/1) do
         nil
@@ -1709,12 +1714,13 @@ defmodule BeamLisp.RT do
     end)
   end
 
-  def filter(pred, coll), do: lazy_filter(pred, seqable(coll))
+  def filter(pred, coll), do: lazy_filter(pred, LazySeq.input(seqable(coll)))
 
   # Chunked like map: each thunk collects up to `@chunk_size` elements that
   # pass `pred` (skipping non-matches without yielding them), so a consumer
   # that stops early never realizes more than one source chunk past it.
   defp lazy_filter(pred, coll) do
+    coll = LazySeq.input(coll)
     LazySeq.new(fn ->
       case skip_filter(pred, coll) do
         nil -> nil
@@ -1793,21 +1799,23 @@ defmodule BeamLisp.RT do
 
   @doc "`(cycle coll)` repeats `coll` forever, lazily."
   def cycle(coll) do
-    case LazySeq.cell(coll) do
+    input = LazySeq.input(coll)
+    case LazySeq.cell(input) do
       nil -> nil
-      cells -> LazySeq.new(fn -> cycle_from(cells, cells) end)
+      _ -> LazySeq.new(fn -> cycle_from(input, input) end)
     end
   end
 
-  defp cycle_from(nil, _orig), do: nil
-
-  defp cycle_from([h | t], orig) do
-    rest = if t == [], do: orig, else: t
-    [h | LazySeq.new(fn -> cycle_from(rest, orig) end)]
+  defp cycle_from(current, original) do
+    case LazySeq.cell(current) do
+      nil -> cycle_from(original, original)
+      [head | tail] -> [head | LazySeq.new(fn -> cycle_from(tail, original) end)]
+    end
   end
 
   @doc "`(concat & seqs)` — a lazy seq of every input, in order."
   def concat(seqs) when is_list(seqs) do
+    seqs = Enum.map(seqs, &LazySeq.input/1)
     LazySeq.new(fn -> concat_chunk(seqs) end)
   end
 
@@ -1817,6 +1825,7 @@ defmodule BeamLisp.RT do
   # Clojure's concat advances seqs lazily too. Returns `:empty`, a proper
   # list (all consumed), or `{elems, rest_seqs}` for a lazy tail.
   defp concat_chunk(seqs) do
+    seqs = Enum.map(seqs, &LazySeq.input/1)
     case concat_pull(seqs, LazySeq.chunk_size(), []) do
       :empty -> nil
       {[], rest} -> concat_chunk(rest)
@@ -1914,7 +1923,10 @@ defmodule BeamLisp.RT do
     end
   end
 
-  def take_while(pred, coll), do: LazySeq.new(fn -> take_while_seg(pred, seqable(coll)) end)
+  def take_while(pred, coll) do
+    input = LazySeq.input(seqable(coll))
+    LazySeq.new(fn -> take_while_seg(pred, input) end)
+  end
 
   # Chunked: collect up to @chunk_size consecutive matches, stopping at the
   # first non-match (which ends the whole seq, so no tail is produced then).

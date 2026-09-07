@@ -11,10 +11,11 @@ defmodule BeamLisp.Wave14MetaTest do
 
   defp eval(source), do: BeamLisp.eval(source)
 
-  # A lazy seq is the one value type with genuine per-instance identity
-  # on the BEAM (its realization `:key` reference), so it is the value
-  # type that actually carries metadata.
+  # Lazy seqs carry metadata directly while their native resource provides
+  # shared memoization across independently annotated values.
   defp seq1, do: LazySeq.new(fn -> [1, 2, 3] end)
+
+  defp meta_of_entries, do: Env.match({{:meta_of, :_}, :_})
 
   describe "BeamLisp.Meta on lazy seqs" do
     test "absent metadata reads as nil, not an empty map" do
@@ -32,6 +33,64 @@ defmodule BeamLisp.Wave14MetaTest do
       assert tagged != original
       assert Meta.meta(original) == nil
       assert Meta.meta(tagged) == %{a: 1}
+    end
+
+    test "pending source and annotated value share one effect and the same resource" do
+      {:ok, effects} = Agent.start_link(fn -> 0 end)
+
+      original =
+        LazySeq.new(fn ->
+          Agent.update(effects, &(&1 + 1))
+          [:value]
+        end)
+
+      tagged = Meta.with_meta(original, %{a: 1})
+
+      assert tagged.resource === original.resource
+      assert LazySeq.force(tagged) == [:value]
+      assert LazySeq.force(original) == [:value]
+      assert Agent.get(effects, & &1) == 1
+      assert Meta.meta(original) == nil
+      assert Meta.meta(tagged) == %{a: 1}
+    end
+
+    test "successful source and later annotation share the completed memo" do
+      {:ok, effects} = Agent.start_link(fn -> 0 end)
+
+      original =
+        LazySeq.new(fn ->
+          Agent.update(effects, &(&1 + 1))
+          :value
+        end)
+
+      assert LazySeq.force(original) == :value
+      tagged = Meta.with_meta(original, %{done: true})
+      assert tagged.resource === original.resource
+      assert LazySeq.force(tagged) == :value
+      assert Agent.get(effects, & &1) == 1
+    end
+
+    test "metadata creates no Env meta_of registry entries" do
+      before = meta_of_entries()
+      tagged = Meta.with_meta(seq1(), %{a: 1})
+
+      assert Meta.meta(tagged) == %{a: 1}
+      assert meta_of_entries() == before
+    end
+
+    test "copies and closure captures retain metadata and shared realization" do
+      {:ok, effects} = Agent.start_link(fn -> 0 end)
+      original = LazySeq.new(fn -> Agent.get_and_update(effects, fn n -> {:value, n + 1} end) end)
+      tagged = Meta.with_meta(original, %{captured: true})
+      copy = tagged
+      captured = fn -> tagged end
+
+      assert Meta.meta(copy) == %{captured: true}
+      assert Meta.meta(captured.()) == %{captured: true}
+      assert LazySeq.force(copy) == :value
+      assert LazySeq.force(captured.()) == :value
+      assert LazySeq.force(original) == :value
+      assert Agent.get(effects, & &1) == 1
     end
 
     test "the tagged value is still equal to the original (metadata not in =)" do
@@ -59,9 +118,13 @@ defmodule BeamLisp.Wave14MetaTest do
       assert Meta.meta(tagged) == %{a: 1}
     end
 
-    test "nil metadata clears (reads back as nil)" do
+    test "nil metadata clears without changing the resource or original metadata" do
       tagged = Meta.with_meta(seq1(), %{a: 1})
-      assert Meta.meta(Meta.with_meta(tagged, nil)) == nil
+      cleared = Meta.with_meta(tagged, nil)
+
+      assert cleared.resource === tagged.resource
+      assert Meta.meta(cleared) == nil
+      assert Meta.meta(tagged) == %{a: 1}
     end
 
     test "vary_meta folds the current metadata through an Elixir function" do
@@ -96,6 +159,7 @@ defmodule BeamLisp.Wave14MetaTest do
 
       for v <- values do
         assert Meta.meta(v) == nil, "meta of #{inspect(v)} should be nil"
+
         assert Meta.with_meta(v, %{doc: "d"}) === v,
                "with_meta on #{inspect(v)} should be a no-op"
       end
@@ -163,6 +227,7 @@ defmodule BeamLisp.Wave14MetaTest do
     test "doc_string resolves a referred var" do
       Env.add_refer("user", "w14-referred", "w14-other")
       Env.put_meta("w14-other", "w14-referred", %{doc: "referred docs"})
+
       assert Env.doc_string("user", "w14-referred") ==
                %{ns: "w14-other", name: "w14-referred", doc: "referred docs"}
     end
