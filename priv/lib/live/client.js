@@ -348,7 +348,7 @@
         applyPatch(root, a);
         announce("live:patch", { root: root, ops: a });
       } else if (kind === "tap") {
-        announce("live:tap", { t: a });
+        announce("live:tap", { t: a, basis: b });
       } else if (kind === "denied") {
         if (opts.onDenied) opts.onDenied(a);
       }

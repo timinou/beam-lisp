@@ -791,9 +791,42 @@ its router; `mount` returns everything a host needs.
    :ws-handlers ws-handlers
    :studio-js (web/asset "lib/tooling/studio.js")})
 
+(defn converge-page
+  "Two viewers of the same app, side by side, each a REAL separate socket.
+   Click in one; the commit lands on the log; both re-project and — with
+   Paint on in each — both flash the same change. The concurrency model
+   (a local mutation renders here, a fact renders everywhere through the
+   log) becomes something you can watch instead of read about."
+  [app-path]
+  (str "<!doctype html><html><head><meta charset=utf-8><title>converge</title><style>"
+       "body{margin:0;background:#05070a;color:#e6edf3;font:12px ui-monospace,Menlo,monospace}"
+       "#bar{display:flex;gap:16px;align-items:center;padding:8px 14px;border-bottom:1px solid #1f2733}"
+       "#bar b{color:#39d0d8;letter-spacing:.3em;text-transform:uppercase}#bar i{color:#7d8590;font-style:normal}"
+       "#bar button{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:3px 10px;font:inherit;cursor:pointer}"
+       "#grid{display:grid;grid-template-columns:1fr 1fr;gap:2px;height:calc(100vh - 38px)}"
+       "iframe{border:0;width:100%;height:100%;background:#0a0e14}"
+       ".lbl{position:absolute;top:44px;padding:2px 8px;background:#0a0e14;border:1px solid #1f2733;border-radius:99px;color:#ffd166;font-size:10px}"
+       "</style></head><body>"
+       "<div id=bar><b>converge</b><i>two sockets, one log. click in either — both repaint.</i>"
+       "<button onclick=\"paintBoth()\">paint both</button><span id=st></span></div>"
+       "<div id=grid><iframe id=a src=\"" app-path "\"></iframe><iframe id=b src=\"" app-path "\"></iframe></div>"
+       "<span class=lbl style=\"left:12px\">viewer A</span><span class=lbl style=\"left:calc(50% + 12px)\">viewer B</span>"
+       "<script>"
+       "function fw(id){return document.getElementById(id).contentWindow}"
+       "function paintBoth(){['a','b'].forEach(function(id){var w=fw(id);if(w.Studio){w.Studio.toggle('paint',true)}})}"
+       ;; each viewer is its OWN socket, so one commit is two tap frames (two
+       ;; t's). What they share is the BASIS of the world they rendered — so
+       ;; convergence is 'same basis', not 'same t'.
+       "var seen={a:null,b:null};"
+       "function watch(id){var w=fw(id);w.document.addEventListener('live:tap',function(e){seen[id]=e.detail.basis;"
+       "document.getElementById('st').textContent=' · A@basis '+seen.a+' · B@basis '+seen.b+(seen.a===seen.b?' — converged ✓':' — catching up…')})}"
+       "['a','b'].forEach(function(id){document.getElementById(id).addEventListener('load',function(){watch(id)})});"
+       "</script></body></html>"))
+
 (defn http
-  "The studio's HTTP surface as a live.app `:http` handler: the chip feed and
-   the studio script. Wire it with one key: `{:http (pulse/http)}`."
+  "The studio's HTTP surface as a live.app `:http` handler: the chip feed,
+   the studio script, the full page, and the converge view. Wire it with one
+   key: `{:http (pulse/http)}`."
   []
   (let [m (mount)]
     (fn [conn path]
@@ -801,5 +834,6 @@ its router; `mount` returns everything a host needs.
         (= path "/__pulse/ws")        (web/upgrade conn (:ws-handlers m) nil)
         (= path "/__pulse/studio.js") (web/js conn (:studio-js m))
         (= path "/__pulse")           (web/html conn (:page m))
+        (= path "/__pulse/converge")  (web/html conn (converge-page "/"))
         :else nil))))
 ```
