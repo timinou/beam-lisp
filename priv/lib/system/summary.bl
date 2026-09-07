@@ -1,0 +1,136 @@
+; summary.bl — a function's SUMMARY: everything the engines need to know about
+; it in order to reason about its CALLERS.
+;
+; ── Why summaries ───────────────────────────────────────────────────────
+;
+; Every "meaning" engine hits the same wall at a call to another function.
+; footprint says :opaque-world, termination cannot see through it, a type
+; checker calls the result `any`. They fail identically for one reason: none
+; has a description of what the callee DOES. A summary is that description,
+; computed once per function from its bl-ANF body:
+;
+;   {:footprint  {resource → mode}   ; what state it touches (system.footprint)
+;    :terminates bool                 ; does every loop in it halt
+;    :returns    #{tags}              ; the tagset its value can take
+;    :calls      #{callee-keys}}      ; who it calls (resolved, incl. higher-order)
+;
+; system.analyze propagates these across the call graph to a fixpoint, so a
+; caller reads a callee's summary instead of giving up. This module computes ONE
+; function's summary given the summaries known so far — the per-node step the
+; fixpoint iterates.
+
+(ns system.summary
+  (:require [system.ir :as ir]
+            [system.footprint :as fp]
+            [termination :as term]))
+
+(def rt   :Elixir.BeamLisp.RT)
+(def core :Elixir.BeamLisp.Ns.Core)
+
+(declare terminates?)
+
+; ── resolved callees (the CFA-ready call set) ────────────────────────────
+;
+; A user call compiles to RT/invoke of a (:global g). A direct host op is a
+; :remote [mod fun]. We record BOTH, keyed uniformly: a user call as the global
+; name string, a host op as [mod fun]. Higher-order calls through a :var are
+; recorded as [:flow varname] — system.analyze resolves those against the flow
+; facts; on their own they stay unresolved (honest).
+
+(defn- callee-key [callee]
+  (cond
+    (= :global (:op callee)) (:name callee)
+    (= :var (:op callee))    [:flow (:name callee)]
+    :else nil))
+
+(declare calls-in)
+
+(defn- calls-all [nodes]
+  (reduce (fn [s n] (into s (calls-in n))) #{} nodes))
+
+(defn calls-in
+  "The set of callee keys invoked anywhere under `n`. A user call
+   (RT/invoke (:global g) …) yields \"g\"; a host op (:remote mod fun) yields
+   [mod fun]; a higher-order call (RT/invoke (:var v) …) yields [:flow v]."
+  [n]
+  (cond
+    (not (ir/node? n)) #{}
+    (and (= :remote (:op n)) (= (:mod n) rt) (= (:fun n) :invoke))
+      (let [args (:args n)
+            k (callee-key (first args))]
+        (into (if (nil? k) #{} #{k}) (calls-all (rest args))))
+    (= :remote (:op n))
+      (into #{[(:mod n) (:fun n)]} (calls-all (:args n)))
+    :else (calls-all (ir/child-nodes n))))
+
+; ── return tagset over ANF ────────────────────────────────────────────────
+;
+; A conservative, sound tag inference: a literal's tag is exact; an `if`/`case`
+; is the union of its branches; a call's return is looked up in `known` (the
+; summaries so far) — unknown ⇒ `any`. This is the inter-procedural return flow:
+; once a callee's :returns is known, its call sites inherit it.
+
+(def all-tags #{:int :float :kw :string :bool :map :vec :set :fn :nil :sym :seq :list})
+
+(defn- lit-tag [v]
+  (cond
+    (erlang/is_integer v) :int
+    (erlang/is_float v) :float
+    (erlang/is_binary v) :string
+    (or (= v true) (= v false)) :bool
+    (nil? v) :nil
+    (keyword? v) :kw
+    (erlang/is_atom v) :sym
+    (map? v) :map
+    (BeamLisp.RT/vector? v) :vec
+    :else nil))
+
+; host ops with a known scalar result tag — enough to catch the classic
+; arithmetic-on-nonnumber inter-procedural bug. Extended as needed; unknown host
+; ops fall to `any` (sound).
+(def host-return
+  {[:erlang :+] #{:int :float} [:erlang :-] #{:int :float}
+   [:erlang :*] #{:int :float} [:erlang :div] #{:int}
+   [:erlang :>] #{:bool} [:erlang :<] #{:bool} [:erlang :>=] #{:bool}
+   [:erlang :=<] #{:bool} [:erlang :==] #{:bool} [:erlang :=:=] #{:bool}})
+
+(declare returns)
+
+(defn- returns [known n]
+  (cond
+    (not (ir/node? n)) all-tags
+    (= :lit (:op n))  (let [t (lit-tag (:val n))] (if (nil? t) all-tags #{t}))
+    (= :enil (:op n)) #{:nil}
+    (= :if (:op n))   (set (concat (returns known (:then n)) (returns known (:else n))))
+    (= :do (:op n))   (if (empty? (:stmts n)) #{:nil} (returns known (last (:stmts n))))
+    (= :let (:op n))  (returns known (:body n))
+    (= :case (:op n)) (reduce (fn [acc cl] (set (concat acc (returns known (:body cl)))))
+                              #{} (:clauses n))
+    (and (= :remote (:op n)) (= (:mod n) rt) (= (:fun n) :invoke))
+      (let [callee (first (:args n))]
+        (if (= :global (:op callee))
+          (get known (:name callee) all-tags)   ; inter-procedural: callee's return
+          all-tags))
+    (= :remote (:op n)) (get host-return [(:mod n) (:fun n)] all-tags)
+    (ir/anf-loop? n) (returns known (:body (first (:clauses (:init (:fn n))))))
+    :else all-tags))
+
+; ── the summary of one function ───────────────────────────────────────────
+
+(defn summarize
+  "Summarize function body `anf-body` given `known` {fn-name → :returns} for
+   inter-procedural return flow. Footprint and calls are local; :terminates and
+   :returns use the shared engines. The fixpoint (system.analyze) recomputes
+   :footprint and :returns with callee summaries substituted."
+  [known anf-body]
+  {:footprint  (fp/fp-anf anf-body)
+   :terminates (terminates? anf-body)
+   :returns    (returns known anf-body)
+   :calls      (calls-in anf-body)})
+
+(defn- terminates? [n]
+  (cond
+    (not (ir/node? n)) true
+    (ir/anf-loop? n) (and (= :accepted (:status (term/check-anf-loop n)))
+                          (every? terminates? (ir/child-nodes n)))
+    :else (every? terminates? (ir/child-nodes n))))
