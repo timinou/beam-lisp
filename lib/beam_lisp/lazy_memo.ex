@@ -37,7 +37,18 @@ defmodule BeamLisp.LazyMemo do
 
   def create(state) do
     ensure_loaded!()
-    nif_new(state, dependencies(state), estimate_bytes(state))
+    deps = dependencies(state)
+    bytes = estimate_bytes(state)
+
+    # A small initial value is copied on a regular scheduler; a large one
+    # (which copies megabytes into the cell) takes the dirty lane. The
+    # estimate is known here, before the call, so the lane is chosen directly
+    # — no reroute round-trip needed for creation.
+    if bytes <= nif_fast_lane_bytes() do
+      nif_new_fast(state, deps, bytes)
+    else
+      nif_new(state, deps, bytes)
+    end
   end
 
   def exchange(resource, expected, state, notifications \\ []) do
@@ -132,7 +143,13 @@ defmodule BeamLisp.LazyMemo do
     nif_cursor(list, dependencies(list), estimate_bytes(list))
   end
 
-  def cursor_chunk(resource), do: nif_cursor_chunk(resource)
+  @doc "Whether this cursor's chunks must take the dirty lane (decided at creation)."
+  def cursor_dirty_chunks?(resource), do: nif_cursor_dirty_chunks(resource)
+
+  @doc "Pull the next chunk. `dirty?` (from `cursor_dirty_chunks?/1`) picks the lane."
+  def cursor_chunk(resource, dirty? \\ false)
+  def cursor_chunk(resource, false), do: nif_cursor_chunk_fast(resource)
+  def cursor_chunk(resource, true), do: nif_cursor_chunk(resource)
 
   def estimate_bytes(term), do: :erts_debug.flat_size(term) * :erlang.system_info(:wordsize)
 
@@ -246,9 +263,15 @@ defmodule BeamLisp.LazyMemo do
   @doc false
   def nif_stats, do: :erlang.nif_error(:nif_not_loaded)
   @doc false
+  def nif_new_fast(_state, _dependencies, _bytes), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
   def nif_cursor(_list, _dependencies, _bytes), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_cursor_chunk(_cursor), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_cursor_chunk_fast(_cursor), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def nif_cursor_dirty_chunks(_cursor), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_dependency_resource(_term), do: :erlang.nif_error(:nif_not_loaded)
 end

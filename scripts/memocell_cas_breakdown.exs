@@ -30,6 +30,28 @@ tc.("elixir_walk+estimate", fn -> LazyMemo.dependencies(1); LazyMemo.estimate_by
 tc.("nif_stats_nondirty", fn -> LazyMemo.nif_stats() end)
 # 6. nif_id (non-dirty, trivial) — floor for a regular-scheduler NIF call
 tc.("nif_id_nondirty", fn -> LazyMemo.nif_id(r) end)
+# W1: cursor chunk fast vs dirty, and create fast vs dirty
+big_list = Enum.to_list(1..1_000_000)
+cur = LazyMemo.cursor(big_list)
+IO.puts("CAS|cursor_dirty_chunks|#{LazyMemo.cursor_dirty_chunks?(cur)}")
+# isolated chunk pull: walk one pre-built cursor to exhaustion, time per chunk.
+drain = fn label, pull ->
+  c0 = LazyMemo.cursor(big_list)
+  {t, chunks} =
+    :timer.tc(fn ->
+      Enum.reduce_while(Stream.cycle([:x]), {c0, 0}, fn _, {c, k} ->
+        case pull.(c) do
+          {_chunk, nil} -> {:halt, k + 1}
+          {_chunk, tail} -> {:cont, {tail, k + 1}}
+        end
+      end)
+    end)
+  IO.puts("CAS|#{label}|ns_per_chunk=#{round(t * 1000 / chunks)}|chunks=#{chunks}")
+end
+drain.("cursor_chunk_FAST", &LazyMemo.nif_cursor_chunk_fast/1)
+drain.("cursor_chunk_DIRTY", &LazyMemo.nif_cursor_chunk/1)
+tc.("create_small_FAST", fn -> LazyMemo.nif_new_fast(0, [], 8) end)
+tc.("create_small_DIRTY", fn -> LazyMemo.nif_new(0, [], 8) end)
 # 7. Agent baseline
 {:ok, ag} = Agent.start_link(fn -> 0 end)
 tc.("agent_update", fn -> Agent.update(ag, &(&1 + 1)) end)

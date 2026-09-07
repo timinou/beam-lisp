@@ -208,8 +208,20 @@ fn reclaim_state_small(state: State) {
     drop(env);
 }
 
+/// Dirty lane: a large initial value copies megabytes into the cell.
 #[rustler::nif(name = "nif_new", schedule = "DirtyCpu")]
 fn new(
+    state: Term<'_>,
+    dependencies: Vec<ResourceArc<MemoCell>>,
+    estimate: u64,
+) -> NifResult<ResourceArc<MemoCell>> {
+    allocate(state, dependencies, estimate, false)
+}
+
+/// Fast lane: regular scheduler. `LazyMemo.create` routes here only when the
+/// estimate is under the fast-lane ceiling, so the initial copy is bounded.
+#[rustler::nif(name = "nif_new_fast")]
+fn new_fast(
     state: Term<'_>,
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
@@ -246,6 +258,14 @@ fn allocate(
 struct Cursor {
     position: Mutex<SavedTerm>,
     source: ResourceArc<MemoCell>,
+    // Whether pulling a chunk must take the dirty lane. Decided ONCE, at cursor
+    // creation, from the source's average element size: a chunk copies at most
+    // 32 heads, so `32 * avg_bytes <= ceiling` keeps a chunk within the
+    // fast-lane budget. Immutable, and cloned onto every sub-cursor so the
+    // decision holds for the whole walk. Residual: a list whose bytes are
+    // concentrated in a few giant elements has a small average yet a large
+    // chunk; such lists are rare, and lowering the ceiling forces them dirty.
+    dirty_chunks: bool,
 }
 #[rustler::resource_impl]
 impl rustler::Resource for Cursor {}
@@ -256,8 +276,15 @@ fn cursor(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
 ) -> NifResult<ResourceArc<Cursor>> {
-    list.list_length()?;
+    let len = list.list_length()?;
     let source = allocate(list, dependencies, estimate, true)?;
+    let retained = lock(&source.state)
+        .as_ref()
+        .ok_or(rustler::Error::BadArg)?
+        .retained_bytes;
+    // 32 * (retained / len) > ceiling  ⇔  a chunk may exceed the budget.
+    let avg = if len > 0 { retained / len } else { retained };
+    let dirty_chunks = avg.saturating_mul(32) > fast_lane_bytes();
     let position = lock(&source.state)
         .as_ref()
         .ok_or(rustler::Error::BadArg)?
@@ -266,11 +293,18 @@ fn cursor(
     Ok(ResourceArc::new(Cursor {
         position: Mutex::new(position),
         source,
+        dirty_chunks,
     }))
 }
 
-#[rustler::nif(name = "nif_cursor_chunk", schedule = "DirtyCpu")]
-fn cursor_chunk<'a>(
+/// Whether this cursor's chunks must take the dirty lane. `SeqCursor` reads it
+/// ONCE at creation and threads the answer, so no per-chunk NIF is needed.
+#[rustler::nif(name = "nif_cursor_dirty_chunks")]
+fn cursor_dirty_chunks(cursor: ResourceArc<Cursor>) -> bool {
+    cursor.dirty_chunks
+}
+
+fn cursor_chunk_impl<'a>(
     env: Env<'a>,
     cursor: ResourceArc<Cursor>,
 ) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
@@ -294,10 +328,32 @@ fn cursor_chunk<'a>(
             Some(ResourceArc::new(Cursor {
                 position: Mutex::new(state.env.save(remaining)),
                 source: cursor.source.clone(),
+                dirty_chunks: cursor.dirty_chunks,
             }))
         };
         Ok((chunk, tail))
     })
+}
+
+/// Fast lane: regular scheduler. A chunk is at most 32 heads and the cursor's
+/// `dirty_chunks` flag (set at creation) guarantees that stays within the
+/// fast-lane byte budget; `SeqCursor` calls this entry for a normal cursor.
+#[rustler::nif(name = "nif_cursor_chunk_fast")]
+fn cursor_chunk_fast<'a>(
+    env: Env<'a>,
+    cursor: ResourceArc<Cursor>,
+) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    cursor_chunk_impl(env, cursor)
+}
+
+/// Dirty lane: for a cursor whose elements are large enough that a 32-head
+/// chunk may copy more than the ceiling.
+#[rustler::nif(name = "nif_cursor_chunk", schedule = "DirtyCpu")]
+fn cursor_chunk<'a>(
+    env: Env<'a>,
+    cursor: ResourceArc<Cursor>,
+) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    cursor_chunk_impl(env, cursor)
 }
 
 #[rustler::nif(name = "nif_dependency_resource")]

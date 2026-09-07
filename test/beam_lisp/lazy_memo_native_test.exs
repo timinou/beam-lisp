@@ -114,6 +114,37 @@ defmodule BeamLisp.LazyMemoNativeTest do
     end
   end
 
+  # ---- W1: cursor + create lanes ----
+
+  test "a small-element cursor pulls chunks on the fast lane and preserves order" do
+    list = Enum.to_list(1..1000)
+    cur = LazyMemo.cursor(list)
+    refute LazyMemo.cursor_dirty_chunks?(cur)
+    # fast and dirty pulls yield identical chunks
+    {fast_chunk, _} = LazyMemo.nif_cursor_chunk_fast(cur)
+    assert fast_chunk == Enum.to_list(1..32)
+    # full walk through the public SeqCursor preserves every value
+    assert Enum.to_list(BeamLisp.SeqCursor.new(list)) == list
+  end
+
+  test "a large-element cursor routes chunks to the dirty lane" do
+    # 3000 elements each a ~3KB map: 32 of them exceeds a 64KiB chunk budget.
+    big_elem = Map.new(1..300, fn i -> {i, i} end)
+    list = List.duplicate(big_elem, 3000)
+    cur = LazyMemo.cursor(list)
+    assert LazyMemo.cursor_dirty_chunks?(cur)
+    # still correct through the dirty lane
+    assert Enum.take(BeamLisp.SeqCursor.new(list), 2) == [big_elem, big_elem]
+  end
+
+  test "create routes by size and both lanes hold the same value" do
+    small = LazyMemo.create(:x)
+    assert :fast = LazyMemo.nif_lane(small)
+    assert :x = LazyMemo.read(small)
+    big = LazyMemo.create(Map.new(1..50_000, fn i -> {i, i} end))
+    assert :dirty = LazyMemo.nif_lane(big)
+  end
+
   # ---- scheduler lanes: one cell, two lanes, chosen by measured size ----
 
   test "small cells route to the fast lane; large cells stay dirty" do
