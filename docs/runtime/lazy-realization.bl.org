@@ -1,0 +1,281 @@
+#+TITLE: Lazy Seq Realization — the force contract
+#+STARTUP: showall
+
+* What is lazy realization
+
+A `LazySeq` wraps a zero-arity thunk — user code deferred until explicitly forced. Forcing produces either `nil` (empty), a `[head | tail]` cons cell, or raises an exception. Memoization means a successful force is permanent for the table's lifetime; a failed force may be retried.
+
+Each LazySeq node is its own atomic event. Concurrent callers may discover they're forcing the same node: one becomes the evaluator, the rest wait for its result. If the evaluator dies, crashes, or is killed, waiters learn it and may retry. If the memo table's owner dies, all state becomes terminal and further attempts are refused.
+
+The design separates three concerns:
+
+1. **Thunk execution** — user code, runs in a transient Task (never in Loader)
+2. **Memoization** — ETS table owned by Loader.Server (long-lived)
+3. **Coordination** — monitors, state atoms, message passing (both async)
+
+* Node identity: tid, generation, key
+
+A LazySeq struct holds four fields:
+
+```elixir
+%LazySeq{
+  key: reference(),          ;; Unique per node (make_ref/0)
+  generation: reference(),   ;; Unique per table creation (make_ref/0)
+  tid: :ets.tid(),           ;; Table identifier at node construction
+  thunk: (-> term)
+}
+```
+
+**tid captures the table at node creation.** When a node is constructed, `ensure_table/0` is called to return both the ETS table identifier and a generation marker. These are stored in the struct immediately, binding the node to that exact table for its lifetime.
+
+**Why tid, not the table name?** ETS tables are process-owned; ownership dies with the process. If we register the table by name and the owner process restarts, the new process creates a new table under the same name. Existing nodes would then perform operations on the wrong table — or hang trying to lookup an owner that no longer exists. Capturing `tid` at construction time means the node always refers to the exact table it was created with, even if the table dies or the name is reused.
+
+**Why generation?** The table is created inside Loader.Server and lives as long as the server. If Loader.Server dies and is restarted, a new table is created with a new generation marker. A node from the old server holds the old generation; when forced, it detects this mismatch and raises `{:memo_owner_lost, tid, old_gen, new_tid, new_gen}` rather than performing operations on the wrong table.
+
+**Entry structure:** Memo table entries use the key `{:lazy, tid, key}` where `key` is the node's reference. This ensures entries from different tables (or generations) never collide, even if they use the same reference as the node key.
+
+* The force state machine
+
+Each entry in the memo table lives in one of five states:
+
+| State | Meaning | Transition |
+|-------|---------|------------|
+| *not present* | Never forced | → `:running` (new attempt) or `:completed` (fast-path) |
+| `:running` | Evaluating; waiters blocked | → `:completed` (success) or `:failed` (exception) or `:terminal` (owner lost) |
+| `:completed` | Success permanent | Read-only; no transition |
+| `:failed` | Thunk raised exception; retryable | → `:running` (new attempt) or `:completed` (retry succeeds) |
+| `:terminal` | Owner lost; unrecoverable | Read-only; no transition |
+
+Each running state holds:
+
+```elixir
+{:running, owner, attempt, waiters}
+```
+
+- `owner`: PID of the force caller who claimed this attempt
+- `attempt`: Unique reference (per force invocation, not per node)
+- `waiters`: List of PIDs subscribed to this attempt's outcome
+
+**Key invariant:** Only one evaluator per entry is active at any time. The `claim_attempt/5` function uses `ets:insert_new/2` (atomic CAS) to register exactly one `:running` state per new entry, or `ets:select_replace/3` to upgrade from `:failed` to `:running`.
+
+* Single-flight: one evaluator, many waiters
+
+When two processes call `force/1` on the same node concurrently:
+
+1. **First caller (the evaluator)** claims `:running` and executes the thunk.
+2. **Subsequent callers (waiters)** find `:running` already in place, register themselves in the waiters list, and sleep.
+3. **Evaluator publishes** the result (success, exception, or loss) as a message to all waiters.
+4. **Waiters wake**, receive the message, and return (or re-raise) the exact result the evaluator produced.
+
+No evaluator runs thunk code twice per node. No waiter spins or polls. All bookkeeping is atomic (ETS CAS) and all message passing is asynchronous.
+
+* Monitoring: evaluator and memo owner
+
+When a waiter enters the receive loop, it monitors two processes:
+
+1. **Evaluator (owner):** If the force caller crashes before publishing, the waiter learns immediately via `{:DOWN, ref, :process, owner, reason}`.
+2. **Memo owner (Loader.Server):** If the memo table owner dies, the table evaporates and state becomes unrecoverable.
+
+Either DOWN is terminal. On evaluator DOWN, `owner_lost/4` atomically marks the entry `:terminal` and broadcasts the terminal state to all waiters. On memo-owner DOWN, `memo_owner_lost/4` does the same. Waiters then retry, find the `:terminal` state, and raise `ForceError` with the loss reason.
+
+**Why monitor both?** Monitoring only the evaluator is insufficient — if the evaluator crashes but the memo table owner is still alive, waiters might corrupt the memo state or loop forever. Monitoring only the table is insufficient — the evaluator might hold resources (a database connection, a file descriptor) that need to be reclaimed synchronously. Monitoring both ensures the entire force contract is preserved.
+
+**Terminal loss is asymmetric:** If the evaluator dies, the attempt is terminal, but other force attempts on the same node (a retry from a different caller) may re-evaluate. If the memo owner dies, the entire node is terminal — no retries are possible because the memoization state is gone.
+
+* Successful permanence; failure retry semantics
+
+**Success is permanent.** Once a force transitions to `:completed`, all future forces on that node return the exact same value, forever. The entry is immutable; no monitor is needed; no message is sent. The value is retained as long as the ETS table exists.
+
+**Failure is retryable.** If the thunk raises an exception, the entry moves to `:failed` with the kind, reason, and stacktrace. Future forces on the same node may:
+
+- **Retry:** If a new caller invokes `force/1` and finds `:failed`, it claims a new attempt and re-evaluates the thunk. The exception from the first attempt is not stored; only the fact that it failed is.
+- **Accept the failure:** If the new caller is willing to accept the exception, `force_state/4` looks up the entry again and re-raises the stored exception and stacktrace.
+
+**Explicit retry means explicit re-execution.** If a thunk performs side effects (writing to a file, updating state), a retry will repeat those effects. The Beam Lisp runtime does not track "what side effects already happened" — the thunk author must design for idempotence if retries matter.
+
+**No implicit retries.** The force function itself never silently retries; the caller must decide.
+
+* Loader existing-table fast path
+
+When `force/1` is called, the first thing it does is call `ensure_table/0`:
+
+```elixir
+defp ensure_table do
+  case :ets.whereis(@table) do
+    :undefined ->
+      # Table missing; create it inside Loader to pin to server lifetime.
+      BeamLisp.Loader.Server.run(&ensure_owned_table/0)
+    tid ->
+      # Table exists; return it without Loader.Server.run.
+      generation = :persistent_term.get({__MODULE__, :generation}, :missing)
+      if generation == :missing do
+        BeamLisp.Loader.Server.run(&ensure_owned_table/0)
+      else
+        {tid, generation}
+      end
+  end
+end
+```
+
+**The fast path is critical.** Calling `Loader.Server.run/1` is synchronous: the caller blocks in `GenServer.call/3` until the server processes the request. If the server is busy evaluating a slow library load, unrelated force calls block waiting for that load to finish.
+
+The fast path checks if the table already exists using `ets:whereis/1` (a table-lookup, not a process-call). If it does, and the generation marker is cached, `ensure_table/0` returns immediately without touching Loader.Server. **Only table creation routes through Loader**, because only creation needs to pin the table to the server's lifetime.
+
+**Consequence:** Forcing a lazy seq never blocks behind unrelated Loader.Server work once the table exists.
+
+* Async monitor bookkeeping
+
+When an evaluator claims an attempt, it asks Loader.Server to monitor the owner:
+
+```elixir
+BeamLisp.Loader.Server.async_monitor_lazy_owner(self(), entry, attempt)
+```
+
+This is an **asynchronous cast**, not a call. The evaluator's `GenServer.cast/2` returns immediately; Loader.Server processes the monitor request in the background.
+
+When the attempt completes (success or failure), the evaluator sends:
+
+```elixir
+BeamLisp.Loader.Server.async_demonitor_lazy_owner(entry, attempt)
+```
+
+Again, an async cast. Loader.Server removes the monitor and demonitors the evaluator's PID in the background.
+
+**Why async?** If monitoring were synchronous (`GenServer.call/3`), an evaluator inside Loader would create a dependency cycle: Loader is monitoring the evaluator (waiting for its completion), and the evaluator is waiting for Loader to acknowledge the monitor request. That is a deadlock.
+
+**Why in Loader at all?** The monitor is stored in Loader's state because Loader.Server monitors the processes. When an evaluator crashes, the DOWN message arrives at Loader.Server, which then calls `owner_lost/4` to mark the memo entry terminal. Storing the monitor map in the evaluator's local state would lose the monitor if the evaluator crashes — Loader.Server would never see the DOWN.
+
+* Loader-context transient evaluator
+
+The thunk (user code) is never executed inside Loader.Server. When an evaluator (force caller) claims an attempt, it calls `evaluate_attempt/4`:
+
+```elixir
+defp evaluate_attempt(entry, tid, attempt, thunk) do
+  try do
+    value = thunk.()
+    publish_attempt(entry, tid, attempt, {:completed, value})
+    value
+  catch
+    kind, reason ->
+      stacktrace = __STACKTRACE__
+      publish_attempt(entry, tid, attempt, {:failed, kind, reason, stacktrace})
+      :erlang.raise(kind, reason, stacktrace)
+  after
+    BeamLisp.Loader.Server.async_demonitor_lazy_owner(entry, attempt)
+  end
+end
+```
+
+The `thunk.()` runs **in the caller's process**, not in Loader. If the thunk crashes, spawns processes, opens files, or modifies state, it does so in the context where `force/1` was called.
+
+**Exception to this rule:** If the force call originates inside Loader.Server (checked via `in_server?/0` pdict flag), the force wraps the entire evaluation in a transient Task:
+
+```elixir
+def force(%__MODULE__{} = lazy) do
+  if BeamLisp.Loader.Server.in_server?() do
+    task = Task.async(fn -> force_bound(lazy) end)
+    Task.await(task, :infinity)
+  else
+    force_bound(lazy)
+  end
+end
+```
+
+**Why a Task?** Library loads run inside Loader.Server. A load may call `force/1` on a lazy seq. If the thunk hangs, blocks on I/O, or spawns processes, those operations happen inside Loader, and Loader blocks. This breaks async semantics for other library loads and for Loader-published monitor callbacks.
+
+The Task runs on a separate supervisor (Task.Supervisor) with independent lifetime, concurrency, and resource bounds. If the thunk hangs, the Task blocks, not Loader.
+
+* Memory budget
+
+Before evaluating a new attempt, `admit_attempt!/0` checks:
+
+```elixir
+defp admit_attempt! do
+  budget = Application.get_env(:beam_lisp, :lazy_cache_budget_bytes, @cache_budget_bytes)
+  word_size = :erlang.system_info(:wordsize)
+
+  case :ets.info(@table, :memory) do
+    words when is_integer(words) and words * word_size > budget ->
+      raise ForceError, {:lazy_cache_budget_exceeded, budget}
+    _ -> :ok
+  end
+end
+```
+
+**The budget is soft.** It checks the current table size before starting the thunk. If the table exceeds the budget, the attempt is rejected. But the budget does not prevent individual values from being large, nor does it prevent a slow thunk from consuming unbounded memory during execution.
+
+**Why soft?** The result size is unknown until after the thunk completes. Allowing large results preserves correctness — the thunk author decides what sizes are acceptable. The budget is a gating mechanism only: it prevents new attempts from starting if the memo table is already large, trading off "fresh evaluation attempt" against "memory pressure."
+
+**The default budget is 512 MB.** This is per table (the lazy cache table), not per LazySeq or per evaluation. Applications can override via config `:beam_lisp, :lazy_cache_budget_bytes`.
+
+* Recursion and terminal depth
+
+A thunk may return another LazySeq — `(lazy-seq (concat …))` is idiomatic. The `realize/1` and `realize_loop/2` functions peel nested LazySeq nodes:
+
+```elixir
+defp realize_loop(%__MODULE__{} = l, depth) do
+  if depth > 100_000 do
+    raise "LazySeq.realize: thunk chain #{depth} deep without a head — " <>
+            "a self-referential lazy seq never produces a cell; it would hang forever"
+  end
+
+  case force(l) do
+    [] -> nil
+    %BeamLisp.Vector{} = v -> normalize_cell(BeamLisp.Vector.to_list(v))
+    %BeamLisp.Set{} = s -> normalize_cell(BeamLisp.Set.to_list(s))
+    %__MODULE__{} = nested -> realize_loop(nested, depth + 1)
+    value -> value
+  end
+end
+```
+
+**The depth limit is 100,000.** A LazySeq that returns another LazySeq that returns another, with no cons cells in between, will error after 100k nesting levels. This prevents infinite loops: a thunk that returns itself, or a cycle of thunks returning each other, is caught and reported.
+
+* User-facing ForceError
+
+All force failures raise `ForceError` with a reason atom and a message. The exception holds:
+
+```elixir
+defexception [:reason, :message]
+```
+
+Common reasons:
+
+| Reason | Cause |
+|--------|-------|
+| `:recursive_force` | `force/1` called again while evaluating the same node |
+| `{:force_owner_lost, pid, attempt}` | Evaluator crashed mid-force; memo entry marked terminal |
+| `{:memo_owner_lost, tid, gen, new_tid, new_gen}` | Memo table owner (Loader) restarted; current node references obsolete table |
+| `{:memo_owner_lost, tid}` | ETS table lookup failed (table destroyed) |
+| `{:lazy_cache_budget_exceeded, bytes}` | Memo table exceeded soft budget; new attempt rejected |
+| `{:terminal, reason}` | Waiters encountered a terminal memo state |
+
+**Exceptions propagate as-is.** If the thunk raises, the exception and stacktrace are stored in the `:failed` state and re-raised to all waiters with the original stacktrace intact. The exception does not escape the memo system; it is part of the force result.
+
+**Explicit failures are not permanent.** A `:failed` entry may be re-evaluated on a future force. A `:terminal` entry is permanent and cannot be retried.
+
+* Whole picture: a force walk
+
+1. **Setup:** Caller invokes `force(lazy)`. If the call originates inside Loader, wrap it in a transient Task.
+2. **Check table:** `ensure_table/0` checks if the memo table exists. If not, `Loader.Server.run/1` creates it (once). Fast path: existing table returns immediately.
+3. **Check state:** `force_state/4` looks up the node's entry in the memo table.
+   - If `:completed`: return the value.
+   - If `:failed`: may retry or re-raise stored exception.
+   - If `:running`: jump to wait loop.
+   - If absent: claim a new attempt.
+4. **Claim attempt:** `claim_attempt/5` reserves the `:running` state and registers with Loader to monitor the owner.
+5. **Evaluate:** `evaluate_attempt/4` runs the thunk in the caller's process. On success or exception, jump to publish.
+6. **Publish:** `publish_attempt/4` atomically replaces `:running` with the final state and broadcasts messages to all waiters.
+7. **Wait (for concurrent callers):** `wait_for_attempt/4` enters a receive loop, monitoring evaluator and memo owner. On message, handle the result. On DOWN, call loss handler and retry.
+
+* Design trade-offs
+
+**ETS vs. process dict:** The memo table is stored in ETS (owned by Loader) rather than the evaluator's process dict. This ensures memoization persists across multiple force calls and is visible to concurrent callers. Process-local state would require per-process synchronization and would leak or reset on process death.
+
+**Soft budget vs. hard limit:** The memory budget is checked before evaluation, not enforced during. This preserves correctness (large values are allowed) and simplicity (no interruption of running thunks). Hard limits would require killing thunks mid-execution, which is complex and error-prone.
+
+**Async monitors vs. sync:** Monitors are asynchronous to break dependency cycles and preserve Loader's ability to handle other work. The trade-off is that monitor updates are not guaranteed to be in-order with other messages, but the state machine tolerates this via reference identity (attempt unique per force).
+
+**Retryable failures vs. permanent:** Failures are retryable to allow explicit recovery. The cost is that side effects in thunks may repeat. Thunk authors must design for this or accept the limitation.
+
+**Terminal loss vs. recovery:** When an owner dies, the memo entry is marked terminal rather than automatically retried. This prevents silent data corruption from occurring when an evaluator was in an inconsistent state mid-force.
