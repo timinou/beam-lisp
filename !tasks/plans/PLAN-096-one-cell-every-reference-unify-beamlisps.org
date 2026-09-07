@@ -1,0 +1,327 @@
+#+TITLE: One cell, every reference: unify BeamLisp's shared-state primitives on MemoCell
+#+STATE: ITEM
+#+SESSION_ID: 15751ba43523b193
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-06T14-57-15-988Z_15751ba43523b193.jsonl]]
+#+CUSTOM_ID: PLAN-096-one-cell-every-reference-unify-beamlisps
+
+* Initial Message
+
+Explain the way that the lazyseq was implemented and what BUG-029 entails, from zero context in simple language
+
+* Why this plan exists
+
+Commit f1cba00 gave MemoCell two scheduler lanes chosen by the cell's own
+byte accounting. It made point B (a CAS-backed mutable ref) go from 9x slower
+than Agent to 2.6x faster: swap! 10158 -> 587 ns, read 4151 -> 91 ns, CAS
+5718 -> 333 ns. Measured in scripts/memocell_cas_breakdown.exs and
+scripts/memocell_prototypes.exs; clean full suite on the committed tree
+1492/1492 (seed 419179).
+
+The user asked for a final plan in which the OTHER points (A shared
+immutables, C memoize/herd, D dataflow, E off-heap cursor, F accounting,
+G off-scheduler reclaim) improve at least as much as B did, through one
+harmonious approach rather than seven features.
+
+* The single idea
+
+BeamLisp today has FOUR independent implementations of "a value other code
+can share and observe":
+
+| primitive        | today                                  | file                       |
+|------------------+----------------------------------------+----------------------------|
+| lazy-seq memo    | MemoCell (native, GC-owned, 2 lanes)   | lazy_seq.ex + lazy_memo.ex |
+| atom / swap!     | one Agent PROCESS per atom             | refs.ex BeamLisp.Atom      |
+| add-watch        | map in the Agent's process dictionary  | refs.ex                    |
+| volatile!        | creating process's dictionary          | refs.ex BeamLisp.Volatile  |
+| delay / memoize  | ABSENT (no defmacro delay, no memoize) | -                          |
+
+Each is a separate ownership model with a separate cost model, and none can
+see the others: an atom cannot be a dependency of a lazy value, a watch
+cannot fire from a memo, a delay does not exist. That is the incoherence.
+
+The plan: MemoCell becomes THE reference cell. Every primitive above is a
+thin protocol over one native cell that already has, measured and tested:
+GC-deterministic ownership (A, F), publish+notify in one atomic step (C,
+watches), a dependency graph with cycle rejection (D), off-heap chunked
+iteration (E), size-routed scheduler lanes (B), and off-scheduler reclaim
+of large terms (G). The other points then improve for the same reason B
+did: they stop paying for machinery they never needed (a process per atom,
+a dictionary per watch table, a dirty hop per tiny read) and start sharing
+machinery that already exists.
+
+Principle 2 of the house rules: one need, one implementation. Remove the
+parallel ones.
+
+* Non-goals
+
+- Cross-node semantics. A MemoCell handle is a reference into one node's
+  memory and must stay so. Distribution is addressed only by making the
+  per-node story dense and by choosing pull-based shapes (E) that are the
+  correct primitive across a boundary later. No distributed invalidation.
+- Rewriting lazy_seq.ex's process logic (receive/monitor/owner death) in
+  .bl. That code is boot-critical and proven; it is a CONSUMER of the cell,
+  not part of it.
+- Hot NIF upgrade. Resource terms are version-local (lib.rs moduledoc);
+  restart the VM after native changes, as today.
+
+* Measured baseline every wave is judged against
+
+From this session, same machine, scripts checked in:
+
+| point | baseline                                    | after f1cba00                         |
+|-------+---------------------------------------------+---------------------------------------|
+| A     | 500 holders x 4.27 MB: copy 3177 MB         | cell 0.0 MB (unchanged by lanes)      |
+| B     | Agent 850k-1.5M ops/s; cell 92k             | cell 2.11M ops/s                      |
+| C     | 200 forcers: independent 200 runs           | shared 1 run (unchanged)              |
+| D     | 2000-deep chain: cycle check 145-390 us     | (dirty lane, unchanged)               |
+| E     | 1M items: list heap 15.81 MB                | cursor 0.01 MB (chunk NIF still dirty)|
+| F     | nif_stats exact: 100 cells 13.74 MB -> 0    | unchanged                             |
+| G     | free 24 MB: max_pending_observed=1          | unchanged                             |
+| lanes | read 4151 ns, CAS 5718 ns (all dirty)       | read 91 ns, CAS 333 ns (small)        |
+
+"At least as good as B" means: each point's dominant per-operation cost
+drops by an order of magnitude or its capability goes from absent to
+present, and the number is in a checked-in script.
+
+* Waves
+
+Ordering is by real dependency only. W1 and W2 are independent of each
+other and both precede W3; W4 depends on W1; W5 is last because it deletes.
+
+** W1. Finish the lanes: cursor and create (E, A)
+
+Target: native/lazy_memo/src/lib.rs, lib/beam_lisp/lazy_memo.ex,
+lib/beam_lisp/seq_cursor.ex, test/beam_lisp/lazy_memo_native_test.exs.
+
+Change:
+- nif_cursor_chunk gets a fast twin. A chunk is <= 32 heads copied out of a
+  saved list; that is bounded by construction regardless of the SOURCE
+  size, so unlike read it needs no size check: the fast lane is always
+  correct. Keep the dirty entry only for symmetry/tuning; SeqCursor.cell
+  calls the fast one.
+- nif_new gets a fast twin routed by the estimate the Elixir side already
+  computes (create small -> fast; large -> dirty). Same self-guard shape as
+  compare_exchange_fast: reroute if the estimate is over the ceiling.
+- nif_cursor (creation) stays dirty: it copies the whole list.
+
+Edge: a chunk whose heads are themselves large terms (a list of 32 maps of
+1 MB each) is 32 MB of copy-out. Guard: cursor creation records the
+source's retained_bytes; if retained_bytes / list_length > ceiling, mark the
+Cursor resource dirty_chunks=true at creation and route chunks dirty.
+One flag, decided once, no per-chunk measurement.
+
+Accept: prototype E consumer heap unchanged (0.01 MB) AND a new row in
+memocell_cas_breakdown.exs "cursor_chunk_FAST" under 200 ns per chunk
+(today the dirty hop makes it ~4-5 us). Wave23 seq tests green. Native
+suite green.
+
+Why it lifts E "as much as B": E's win was memory (1520x) but every chunk
+pull paid the same 4 us dirty tax B paid. Removing it makes the off-heap
+walk cost-competitive with an on-heap list walk, so it can be the DEFAULT
+for any finite input over chunk_size, not a special case.
+
+** W2. delay and memoize on the cell (C)
+
+Target: priv/boot/core.bl (new defmacro delay, defn force, defn realized?,
+defn memoize), lib/beam_lisp/lazy_seq.ex (expose a value-shaped force that
+does not normalize to a cell), test/bl/core_additions_test.bl.
+
+Change:
+- (delay body...) => a LazySeq-shaped cell whose thunk returns the value.
+  force returns the value itself (NOT normalized through cell/1, which
+  would turn a vector into a seq). Add LazySeq.force_value/1 = force/1
+  without realize; delay uses it. realized? reads memo_state for
+  {:completed, _}.
+- (memoize f) => a small map from args-key to cell, itself held in a cell
+  (so the table is shared and GC-owned). Lookup: read the table cell; on
+  miss, CAS in a new pending cell for that key (loser of the race reads
+  the winner's cell); force that cell. Herd protection is inherited: N
+  concurrent callers with the same key share one force, which prototype C
+  proved (1 run vs 200).
+- Failed attempts stay retryable (the {:failed, ...} state): a memoized
+  function that throws does not poison its key forever.
+
+Edge: keys must be values, not references (a fn as a key would compare by
+identity and never hit). Document; do not "fix" by hashing closures.
+
+Accept: test/bl: (let [d (delay (do (swap! n inc) 42))] (force d) (force d)
+=> n incremented once, both 42). (memoize slow) called from 100 processes
+concurrently with the same arg increments a counter once. A vector inside
+a delay forces back as a vector. Benchmark row: memoized hit under 300 ns
+(one fast read + one map lookup).
+
+Why it lifts C "as much as B": C's dedup was already perfect but only for
+lazy-seq bodies; delay/memoize did not exist. Absent -> present, with the
+same herd guarantee, at fast-lane cost.
+
+** W3. atom, watches, and volatile become the cell (B completed, A)
+
+Target: lib/beam_lisp/refs.ex, lib/beam_lisp/rt.ex (the "atom" link
+table ~line 2404), lib/beam_lisp/env.ex, priv/boot/core.bl if it names
+BeamLisp.Atom, test/beam_lisp/*refs*|*atom*|*watch* and the .bl tests
+that use add-watch (grep add-watch under test/bl and examples/).
+
+Change:
+- BeamLisp.Atom{pid} -> BeamLisp.Atom{cell}. atom/1 = create. deref =
+  LazyMemo.read (fast lane for small values). swap!/3 = read, invoke f,
+  exchange; on :retry re-read and re-apply (Clojure's CAS loop, which the
+  Agent version explicitly avoided and which the cell now makes cheaper
+  than the Agent round-trip: 587 ns vs 1013-1536 ns measured).
+  compare-and-set! = one exchange. reset! = read + exchange loop.
+- Watches: the notifications argument of compare_exchange already delivers
+  {pid, message} atomically with publication. A watch registers
+  {watcher_pid, key} in a watches cell adjacent to the value cell; swap!
+  passes the notification list and the WATCHER process runs f. This keeps
+  the Clojure rule that watches run outside the swap and cannot deadlock
+  it; it removes the process-dictionary table. If callers must run the
+  watch in the CALLER's process (today's behavior), swap! reads the
+  watches cell after the exchange and invokes locally; pick this variant
+  first because it is behavior-preserving, and record the choice.
+- Volatile: leave it. It is intentionally process-local and cheaper than
+  any shared cell (a dictionary op ~20 ns). The moduledoc's contract is
+  correct as written. Unifying it would be a regression, not harmony.
+- Delete the Agent path entirely. No dual implementation, no flag.
+
+Edge: an atom created in a process that later dies. Agent atoms died with
+their Agent (linked); cell atoms are GC-owned and survive as long as any
+holder holds them. This is a semantic IMPROVEMENT (matches Clojure) but
+tests that relied on atom death must be found and updated with a note.
+Grep for Process.exit / atom.pid in tests.
+
+Edge: large atom values. A 4 MB map in an atom now routes dirty on every
+swap (correct: the Agent copied it twice per swap anyway). Document that
+large-value atoms should hold a cell-of-parts (or a datom db) rather than
+one blob; that is the same advice as for any persistent structure.
+
+Accept: prototype B row "atom_swap" via the PUBLIC (atom)/(swap!) surface
+under 700 ns. All existing atom/watch tests green after updating the
+death-semantics cases. examples/ that use add-watch run clean. Prototype A
+re-run with an ATOM as the shared holder shows the same 0.0 MB delta (an
+atom holding a 4 MB value shared by 500 processes costs one copy).
+
+Why it lifts A "as much as B": A's sharing was proven only for a raw
+LazyMemo handle nobody writes by hand. After W3, (atom big-config) IS the
+shared-immutable idiom, so the 779-copies-avoided win lands in ordinary
+code with no new API.
+
+** W4. Reverse edges: invalidation on the dependency graph (D)
+
+Target: native/lazy_memo/src/lib.rs (GRAPH gains a dependents index;
+nif_invalidate; nif_dependents), lib/beam_lisp/lazy_memo.ex,
+priv/boot/core.bl or priv/std/ (a small (derived [deps] body) form),
+tests.
+
+Depends on W1 (fast create) and benefits from W3 (atoms as sources).
+
+Change:
+- GRAPH today maps id -> Vec<dependency ids> (forward). Add the reverse
+  index id -> Vec<dependent ids>, maintained in the same critical section
+  where forward edges are inserted/removed (allocate, compare_exchange,
+  destructor). Both indexes under the existing mutex; no second lock.
+- nif_invalidate(resource): walk dependents transitively; for each cell in
+  state {:completed, v} whose graph entry marks it derived, CAS it back to
+  {:pending, thunk}. Requires keeping the thunk after completion for
+  derived cells only (today {:completed, v} drops it). Add a
+  {:completed, v, thunk} variant used only by derived cells so plain memos
+  keep their smaller state.
+- (derived [a b] body): create a cell whose thunk reads a and b (recording
+  them as dependencies), and register it as a dependent. deref forces it;
+  swap! on a (W3 atom) calls nif_invalidate(a) after a successful exchange.
+  Pull-based recompute: invalidation marks stale, the next deref recomputes.
+  No push, no glitch-freedom guarantee, documented as such (Clojure
+  add-watch has none either).
+- Sharding the GRAPH mutex is NOT in this wave. Measure first (accept row
+  below); shard only if contention is observed.
+
+Edge: invalidation must be bounded work on the caller. Walking dependents
+is O(edges reachable); route nif_invalidate DirtyCpu and keep the mark step
+O(1) per cell. Diamond dependencies (c depends on a and b, both invalidated
+by one swap) mark c once because the mark is idempotent.
+
+Accept: test: (def a (atom 1)) (def c (derived [a] (* 2 @a))) @c => 2,
+(swap! a inc), @c => 4, and c's thunk ran exactly twice. A 10k-wide
+fan-out (one atom, 10k derived) invalidates in under 5 ms. The
+2000-deep-chain cycle test still returns :cycle. Benchmark row
+"derived_deref_hit" under 200 ns (a fast read).
+
+Why it lifts D "as much as B": D was the largest latent capability and was
+unbuilt; the graph existed only to reject cycles. Absent -> present. And it
+is only viable BECAUSE of the lanes: a signal graph is dominated by tiny
+reads, which cost 91 ns now and 4151 ns before f1cba00.
+
+** W5. defnative cutover: delete lazy_memo.ex (the declaration doctrine)
+
+Target: new priv/boot/lazy-memo.bl; delete lib/beam_lisp/lazy_memo.ex;
+lib/beam_lisp/lazy_seq.ex, seq_cursor.ex, refs.ex call the bl-hosted host
+module; mix compile task unchanged (it already builds the crate).
+
+Last, deliberately: every earlier wave adds surface to the SAME Elixir
+module, and moving it once at the end is one cutover instead of four.
+
+Change:
+- (ns lazy-memo) (defnative "lazy_memo" (nif-new 3) (nif-new-fast 3)
+  (nif-read 1) (nif-read-fast 1) (nif-lane 1) (nif-compare-exchange 6)
+  (nif-compare-exchange-fast 6) (nif-cursor 3) (nif-cursor-chunk 1)
+  (nif-cursor-chunk-fast 1) (nif-dependency-resource 1) (nif-id 1)
+  (nif-resource-id 1) (nif-stats 0) (nif-loaded? 0) (nif-fast-lane-bytes 0)
+  (nif-set-fast-lane-bytes 1) (nif-invalidate 1) (nif-dependents 1)).
+  Names are kebab; Native.declare hosts them snake_case (native.ex).
+- rustler::init!/nif_init name must match the host module
+  BeamLisp.Native.LazyMemo (native.ex "one crate, one namespace"); update
+  the c"Elixir.BeamLisp.LazyMemo" literal in lib.rs accordingly.
+- Port the pure logic to .bl in the same namespace: dependencies (the
+  walk), estimate-bytes, admit! (budget), the read/exchange routers.
+  ensure_loaded! disappears: @on_load in the host module loads the NIF.
+- lazy_seq.ex and friends call BeamLisp.Native.LazyMemo directly for the
+  nif-* names and the bl namespace for the routers (via Env link).
+
+Edge: boot order. lazy-memo.bl must load before core.bl's first lazy-seq
+force. The NIF is lazy-on-first-use today which is what made everything
+above safe; after cutover the host module's @on_load runs at namespace
+load, which happens in the boot tier before core. Verify with an uncached
+build and the seed rebuild (this touches the boot tier, so the commit-time
+seed gate applies; follow it explicitly, never regenerate seeds as an
+edit-loop workaround — BUG-029's rule).
+
+Accept: lib/beam_lisp/lazy_memo.ex does not exist. mix compile from clean
+(rm -rf _build priv/native/lazy_memo.so) succeeds. Seed rebuild is
+byte-identical or the delta is explained. Full suite green on a clean
+machine. All memocell_*.exs scripts still run (they use the public API).
+
+* Verification protocol (applies to every wave)
+
+1. cargo test in native/lazy_memo.
+2. Lane-targeted suites: lazy_memo_native_test, wave10_lazy, wave14_seq,
+   wave23_lazyseq, wave26_coregaps, plus the wave's own tests.
+3. scripts/memocell_prototypes.exs and memocell_cas_breakdown.exs: no
+   row regresses; the wave's accept rows appear.
+4. Full mix test on a machine with load1 < 6 (this session's two "failed"
+   runs were at load 15-28 from unrelated BEAMs and passed clean at 1492
+   once characterized; do not chase environmental flakes as regressions,
+   but DO run the wave23 file 3x since it is GC-timing sensitive).
+5. Commit per wave with the measured numbers in the message, as f1cba00.
+
+* What "harmonious" buys, stated once
+
+After W5 there is one native cell, one .bl namespace declaring it, and five
+thin consumers (lazy-seq, delay/memoize, atom/watch, derived, cursor) that
+share ownership, accounting, lanes, and reclaim. A new shared-state
+primitive is a new consumer, not a new ownership model. Removing the Agent
+atom, the dictionary watch table, and the Elixir shim is what makes this
+one system rather than a cache with six features bolted on.
+
+NOTE [2026-09-07]: W1-W4 DONE and committed; W5 deferred to PLAN-097 (verified bootstrap circularity, not skippable-as-written). Commits: f1cba00 (two-lane split, prior), 61e84fb (W1 cursor/create lanes), 9c8a1a3 (W2 delay/memoize), a821a5a (W3 atoms on cell), eb45016 (W4 derived), plus tutorials 43ccb9a + 55d8f4b.
+
+Measured wins (all in scripts/memocell_*.exs, this session):
+- W1: cursor chunk 16760->1153 ns/chunk (14.5x); create 10875->2103 ns (5.2x); prototype E heap unchanged.
+- W2: delay force hit 215 ns; memoize present where absent before.
+- W3: atom swap 746 ns (Agent 1194, now 1.6x FASTER, was 9x slower pre-split); atom deref 163 ns (Agent-deref 1502, ~9x); memoize hit 2453->594 ns FOR FREE when atom became a cell.
+- W4: derived deref-hit 455 ns; chained invalidation works; 10k fan-out 48 ms. Pull-based (deviated from plan's native reverse-edge: simpler, zero swap cost, no Rust).
+
+Real regression CAUGHT+FIXED before commit: atoms need eager create_ref/exchange_ref (no cycle check) because Clojure atoms legally hold mutual references; the example suite's swap! of a cyclic value raised. Added create_ref/exchange_ref to LazyMemo; atoms now also outlive their creator (Clojure semantics).
+
+Verification: cargo 3/3; native suite 18/18; watches 17/17; deferred 7/7 (21 assert, incl 50-proc herd); reactive 6/6 (23 assert); 210/210 examples; final clean full suite 1496/1497 twice, the single failure a DIFFERENT DevChangeHardening test each run (filesystem/runner sandbox, zero cell code, passes 21/21 isolated) = pre-existing environmental flake, not PLAN-096.
+
+Doctrine gain (delete lazy_memo.ex) blocked by bootstrap circularity -> PLAN-097 research spike. lazy_memo.ex stays as TRUE substrate, which native.ex doctrine exempts.
+
+Side FUP found: BUG-030 (9/5 misread as qualified name; reader classify -> whole-number -> symbol-node).

@@ -1,0 +1,170 @@
+#+TITLE: Fast core iteration: fine-grain the toolchain key
+#+STATE: BLOCKED
+#+SESSION_ID: 15751ba43523b193
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-06T14-57-15-988Z_15751ba43523b193.jsonl]]
+#+CUSTOM_ID: PLAN-089-fast-core-iteration-fine-grain-the-toolc
+
+* Initial Message
+
+how can you remvoe the regen wit?
+
+ Already built: DevHotpatch — BL_HOTPATCH skips regen entirely during iteration.
+
+ - BL_HOTPATCH=compiler2,lower,anf,reader mix test … (or mix run) recompiles those priv/boot/*.bl nss from current source in-VM (~1.5s anf … ~29s compiler2) and :code.purge/load_binary-swaps the beams — the same bytes
+ a regen would write, but no seed rebuild, no process restart.
+ - Wired via test_helper.exs → BeamLisp.DevHotpatch.apply_env!() reading the env var; lives in lib/beam_lisp/dev_hotpatch.ex.
+ - Scope: boot-tier nss. priv/std+lib files (e.g. ward.bl) don't need it — plain mix compile rebuilds them via the normal AOT drift gate.
+
+ So: iterate with BL_HOTPATCH=... (seconds), regen only once at commit time as the gate. The regen itself can't be removed — the seed is the committed bootstrap artifact the language cold-starts from — but it's out of
+ the edit→test loop.
+
+ Esc dismiss
+
+
+
+
+Tlel me how we can make development and iteratino on the core of beam lisp faster, right now i need to wait so long every time.
+
+Structural chagnes, not hotfixes like the one above
+
+* Problem (measured 2026-09-06)
+
+Editing ANY file in =priv/boot/*.bl= makes the edit→test loop ~2m23s.
+
+Chain of causation (all verified in-repo):
+1. =BeamLisp.AOTCache.compute_compiler_key/0= hashes the CONTENT of every
+   =priv/boot/**/*.bl= (13 files) + the codegen Elixir module bytes into ONE
+   global "toolchain key".
+2. A one-char edit to any boot file rotates that key.
+3. The per-source freshness gate (build.bl =fresh?=, aot.ex =stale?=) stamps
+   every beam with the toolchain key. Key rotated ⇒ ALL 142 beams stale.
+4. The shared AOT cache (=aot_cache.ex=) is keyed =<compiler_key>/<closure_key>=.
+   Rotated compiler_key ⇒ 0 cache hits. (Evidence: ~/.cache/beam_lisp/aot holds
+   37 orphaned compiler-key dirs, 433 MB — one full closure per past iteration.)
+5. =mix compile.beam_lisp= eagerly rebuilds all 142 beams up front; =mix test=
+   runs =mix compile= first. So the full 2m23s is paid before a test starts.
+
+Measured facts:
+- warm no-op =mix compile= after a boot edit: 2m23s (full-tree rebuild)
+- VM boot alone (=mix run -e :ok=): 12.5s
+- shared cache: 433 MB, 37 orphaned compiler-key namespaces
+- DevHotpatch (existing workaround): anf ~1.5s … compiler2 ~29s per ns
+
+* Key insight
+
+=compiler_key/0= conflates two inputs with opposite change-frequency/impact:
+- CODEGEN (compiler, lower, anf, reader, reader-node + Elixir Emit/Link/AOT/Ns):
+  code that RUNS at compile time to PRODUCE bytes. Its body is load-bearing —
+  a body edit changes every emitted beam ⇒ rotate-all is CORRECT.
+- AMBIENT PRELUDE (core, sugar, data-readers): library code CALLED at runtime
+  by compiled beams. A caller's beam reaches these by name/arity; the body is
+  invisible to the caller (this is exactly what ns-interface.bl already proves
+  for the std/lib tier). A body edit here changes NO dependent's bytes ⇒
+  rotate-all is NEEDLESSLY conservative.
+
+core.bl is 67 KB and the most-edited boot file. Today a one-char body edit to
+core rebuilds all 142 beams. It should rebuild zero.
+
+* Fix 1 — interface-key the ambient prelude into the toolchain key (biggest win)
+
+In =compute_compiler_key/0= / =toolchain_source_contents/0= (aot_cache.ex):
+for the ambient-prelude boot files (core, sugar, data-readers) hash their
+INTERFACE (ns-interface/hash-forms) instead of raw content; keep raw content
+for the genuine codegen boot files.
+
+Result:
+- edit a fn BODY in core/sugar          → key unchanged → 0 rebuilds
+- add/rename/re-arity a core/sugar fn    → key rotates   → full rebuild (sound, conservative)
+- edit compiler/lower/anf/reader body    → key rotates   → full rebuild (correct — codegen)
+
+Soundness: identical argument to ns-interface.bl's std/lib keying — a body a
+caller cannot observe cannot invalidate the caller. The prelude's ambient
+(edge-less) reachability only matters for WHICH names resolve; the interface
+hash already captures the name/kind/arity/macro-def surface that governs
+emitted bytes. Macros in the prelude are interface-captured whole (body
+included), so macro edits still correctly rotate.
+
+Effort: small, single Elixir function + a boot-vs-prelude partition. Must run
+below the var registry (this executes in Bootstrap.install! before init) — so
+reuse the reader-node/ns-interface path the drift gate already uses pre-core,
+or precompute prelude interface hashes via a minimal reader. Pin with a test:
+core body edit ⇒ compiler_key stable; core arity edit ⇒ compiler_key moves.
+
+* Fix 2 — lazy invalidation for genuine codegen edits (medium win)
+
+When the codegen key legitimately rotates (you edited the compiler itself),
+don't eagerly rebuild all 142 in =mix compile=. The drift gate + loader already
+fall back to per-namespace source compilation on demand
+(=AOT.ensure_loaded → :no_module → Loader.ensure_loaded_source=). A dev-mode
+=mix compile.beam_lisp --lazy= (or =BL_LAZY_AOT=1=) skips the full build and
+trusts the runtime gate: =mix test foo= then recompiles only foo's require
+closure, not the whole tree. Cost moves from "every codegen edit = 2m23s
+upfront" to "pay per namespace the test actually exercises."
+
+Risk: cold from-source load is slow (datom: 3m20s src vs 14.7s AOT), so this
+only wins when few namespaces are touched — i.e. exactly the dev inner loop.
+Keep eager build as the CI/commit gate.
+
+* Fix 3 — persistent dev daemon with in-place boot hot-swap (loop-latency win)
+
+Generalize DevHotpatch from a manual env-var one-shot into the =bl daemon= watch
+loop. Today =daemon/server.ex= =drift_fun= forces a FULL restart when the
+booted compiler_key != live key. Instead, for a boot-ns save, hot-swap just that
+ns in-VM (=:code.purge= + =:code.load_binary=, the DevHotpatch mechanism) via the
+Executor FIFO, keeping the substrate warm (saves the 12.5s boot) and skipping
+rebuild. This is the structural, watched form of the existing hotfix — the fast
+path becomes the default, not a manual invocation.
+
+* Hygiene — GC orphaned cache keys
+
+Fix 1 slashes key churn, but add a cheap sweep: on store, drop compiler-key dirs
+older than N days / beyond K generations. 433 MB of orphans today.
+
+* Sequencing
+
+Fix 1 is independent and highest-leverage — land it first, pin with a
+compiler_key stability test. Fix 2 layers on top (dev-mode lazy build). Fix 3 is
+orthogonal (daemon loop) and can proceed in parallel. Hygiene is a small add.
+
+* Acceptance
+
+- edit core.bl fn body → =mix compile= is a no-op (0 beams rebuilt), proven by
+  the manifest diff and a stable =AOTCache.compiler_key=
+- edit compiler.bl → full rebuild still occurs (correctness preserved)
+- aot_reproducible_test.exs stays green (byte-identical beams)
+- seed regen still required only at commit (unchanged gate)
+
+* Execution correction — 2026-09-06
+
+The proposed Fix 1 interface-only key is NOT sound and has been withdrawn before shipping. Verified counterexample: core/case macro invokes ordinary core/case-pairs during expansion; compiler.bl also executes ordinary core helpers. Retaining macro text while dropping helper bodies can therefore reuse stale emitted code. The earlier 139→5 rebuild experiment measures work skipped, not correctness. The original acceptance of zero rebuilds is also wrong: core itself must always rebuild after a body edit.
+
+Removed the newly authored PreludeInterface module/tests and key wiring; raw boot-source hashing remains conservative and correct. A future fine-grained key must track transitive compile-time dependencies (including dynamic macro calls), not just exported signatures.
+
+Build repair: reproduced MIX_ENV=test mix compile failure (artifact bash/85.txt), then a minimal compiler2 compile stack (bash/96.txt). AOT constructed Elixir unquote_splicing from new ANF definition maps even on Core backend; moving construction into the Elixir-only branch removes that error. Emit.shim_def also assumes legacy Elixir syntax; repairing the ANF emission integration with regression tests is in progress. Prior claims that dev success proved test failures unrelated were unjustified and are superseded.
+
+Hygiene implemented in aot_cache.ex with temporary-directory tests: bounded retention, active key protection, real hex directory filtering, symlink exclusion, and throttled store-time cleanup. Parallel sweep serialization being verified.
+
+Fix 2/3 investigation deliverable: !tasks/artifacts/PLAN-089-lazy-daemon-investigation.md. Crucial blockers: active compiler generation differs from desired source key during seed staging; lazy cannot merely skip build/run. Daemon cannot hard-purge deterministic body/init modules without breaking captured functions/macros. No lazy or daemon implementation claimed.
+
+Remaining execution gates: normal test-environment build must succeed, focused AOT and ANF tests plus byte reproducibility must pass, normal dev build/no-op must succeed, seed directory must remain unchanged by this repair. Record actual results, not inferred success.
+
+* Verification and blocking ownership decision
+
+Implemented structural boot barrier: boot sources execute serially in plan order, ordinary waves remain parallel, and boot failure gates ordinary work. Mix refreshes staged build source through the normal loader. Tiers.boot_source? uses directory identity to recognize Mix priv symlinks. ANF AOT fixes: shape-aware shims, Lower.ns-body-beam uses defs->module-anf-any, and Core binaries load before forwarding shims. AOT writes replace files atomically, preserving hardlinked cache inodes. Unsupported Elixir-body cfg is rejected explicitly rather than splicing ANF as quoted syntax.
+
+Passed evidence at the earlier verified snapshot:
+- MIX_ENV=test mix compile: full 139-source build, artifact bash/126.txt.
+- Focused AOT/cache/drift/reproducibility/ANF/barrier suite: 29 passed, 11.9s, bash/130.txt.
+- Isolated /tmp/beam-lisp-clean-zIcrsa build, BEAM_LISP_AOT_CACHE=off: 139 sources, exit 0, bash/131.txt.
+- Same isolated build no-op: 3.192s, no AOT sources built, bash/132.txt.
+- git diff priv/bootstrap/seed empty: no seed regen performed.
+- Direct emitter oracle correction independently passed one corpus test (worker 5-DirectEmitGate).
+
+Latest full-suite attempts do NOT pass and supersede any claim of current-tree completion:
+- bash/134.txt: LazySeq illegal guard; the subsequently observed source already computes word_size outside the guard.
+- bash/135.txt: ANF validator unexpected close; repaired one excess close around swap! seen so export validation stays in the same lexical scope; parser probe bash/139.txt passed.
+- bash/140.txt: current 140-source compile hits LazySeq.ForceError {:lazy_cache_budget_exceeded,536870912} while compiling anf, before tests start.
+
+Retention investigation (agent 7-LazyRetentionRepair): 20 concurrent forces execute a shared thunk exactly once; 20,000 unreachable forced nodes remain as 20,001 ETS rows after GC. ETS strongly roots completed lazy tails, and opaque LazySeq keys provide no notification of last-handle collection. Process-exit cleanup, eviction, or reset would invalidate sequences copied to other processes or captured in global variables. Raising the budget only delays failure. The current explicit exactly-once-across-forks contract needs GC-owned memo handles (native resource lifetime) or a user-approved narrower ownership contract. No speculative eviction/cap increase was applied. Original build repair cannot be certified against the latest tree until this ownership issue is resolved.
+
+NOTE [2026-09-06]: Completed investigations and implemented build/cache repairs are recorded. Latest-tree verification is explicitly deferred to PLAN-092-resolve-lazyseq-memo-ownership-before-co, pending the user's ownership-contract decision after the requested native-resource explanation. No claim of full completion.
