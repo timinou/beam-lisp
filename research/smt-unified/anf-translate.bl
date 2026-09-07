@@ -1,0 +1,415 @@
+; research/smt-unified/anf-translate.bl — the ONE SMT translator, over bl-ANF.
+;
+; Goal: everything system.smt does by walking SURFACE reader nodes (scalar
+; arithmetic, enums, collection-length, defn→define-fun) done instead over
+; bl-ANF, so the surface walker can be deleted. Reading ANF is strictly better:
+; the compiler already resolved every operator spelling (`>=`, `erlang/>=`, a
+; macro expanding to it) to ONE [mod fun], and a user call is a clear
+; (RT/invoke (:global f) …) we can INLINE when f is proven pure.
+;
+; This file is the PROTOTYPE. It carries the same public surface as system.smt
+; (of-node, translate, translate-len, defn->define-fun, of-source*) so a parity
+; harness can prove old==new via z3 before the bodies are promoted into
+; system.smt and the surface walker is cut.
+;
+; Run:  BEAM_LISP_PATH=research/smt-unified …  (hyphenated ns ⇒ hyphenated file)
+
+(ns anf-translate
+  (:require [system.ir :as ir]
+            [system.analyze :as analyze]
+            [compiler :as c]))
+
+(def rt :Elixir.BeamLisp.RT)
+(def core-mod :Elixir.BeamLisp.Ns.Core)
+
+(defn- untranslatable? [x] (= x :untranslatable))
+
+; ── [mod fun] → SMT operator symbol ──────────────────────────────────────
+;
+; The compiler resolved every surface spelling to one of these. `and`/`or`/`=>`
+; are NOT here — they lower to short-circuit :let/:if scaffolds, reconstructed
+; below. `div`/`=<`(the `<=` spelling)/`not` arrive as RT/invoke and are handled
+; in the call dispatch. This table is the pure-arithmetic/relational fragment.
+(def op-table
+  {[:erlang :+] '+ [:erlang :-] '- [:erlang :*] '*
+   [:erlang :>] '> [:erlang :<] '< [:erlang :>=] '>= [:erlang :=<] '<=
+   [:erlang :==] '= [:erlang :=:=] '= [:erlang :rem] :rem
+   [rt :eqv] '= [core-mod :mod] 'mod})
+
+; ── truncated division from z3's Euclidean div/mod (identical to surface) ──
+(defn- smt-quot [a b]
+  (list '+ (list 'div a b)
+        (list 'ite (list 'and (list '< a 0) (list '> (list 'mod a b) 0))
+              (list 'ite (list '> b 0) 1 (list '- 1)) 0)))
+(defn- smt-rem [a b]
+  (list '- a (list '* b (smt-quot a b))))
+
+(declare t)
+
+; ── the short-circuit reconstruction: :let scaffold → and/or/=> ───────────
+;
+; (and X Y) compiles to  (let [g X] (if g Y g))   — else branch re-reads g
+; (or  X Y) compiles to  (let [g X] (if g g Y))   — then branch re-reads g
+; (=> X Y) is (or (not X) Y): same or-scaffold, init = (not X).
+; The recognizer is NAME-independent — it matches the structural shape (the
+; let-var appearing as test AND as one branch), so it survives gensym renames.
+(defn- scaffold [ctx node]
+  (if (not (= :let (:op node)))
+    :no
+    (let [nm (:name node) body (:body node)]
+      (if (not (= :if (:op body)))
+        :no
+        (let [test (:test body) then (:then body) els (:else body)
+              is-var? (fn [n] (and (= :var (:op n)) (= nm (:name n))))]
+          (cond
+            ; (let [g X] (if g Y g)) → (and X Y)
+            (and (is-var? test) (is-var? els))
+              (let [x (t ctx (:init node)) y (t ctx then)]
+                (if (or (untranslatable? x) (untranslatable? y)) :untranslatable
+                  (list 'and x y)))
+            ; (let [g X] (if g g Y)) → (or X Y)
+            (and (is-var? test) (is-var? then))
+              (let [x (t ctx (:init node)) y (t ctx els)]
+                (if (or (untranslatable? x) (untranslatable? y)) :untranslatable
+                  (list 'or x y)))
+            :else :no))))))
+
+; ── call dispatch: (RT/invoke (:global f) argcons) and Core/RT primitives ──
+
+(defn- cons->args [node]
+  (loop [n node acc []]
+    (if (= :cons (:op n)) (recur (:tail n) (conj acc (:head n))) acc)))
+
+; primitive user-calls that arrive as RT/invoke (:global name) — the ops the
+; compiler leaves as a var apply rather than a resolved remote.
+(def invoke-desugar
+  {"div"           (fn [as] (list 'div (first as) (second as)))
+   "not"           (fn [as] (list 'not (first as)))
+   "=<"            (fn [as] (list '<= (first as) (second as)))
+   "str"           (fn [as] (apply list 'str.++ as))
+   "str-len"       (fn [as] (list 'str.len (first as)))
+   "str-contains?" (fn [as] (apply list 'str.contains as))
+   "str-prefix?"   (fn [as] (apply list 'str.prefixof as))
+   "str-suffix?"   (fn [as] (apply list 'str.suffixof as))})
+
+(defn- global-name [node]
+  (and (= :global (:op node)) (:name node)))
+
+(defn- t-args [ctx nodes]
+  (let [ts (map (fn [n] (t ctx n)) nodes)]
+    (if (some untranslatable? ts) :untranslatable ts)))
+
+; length abstraction: a collection var c ∈ (:colls ctx) → c_len; count/conj/
+; rest/pop/next/empty? over it → integer arithmetic on c_len.
+(defn- len-name [c] (symbol (str c "_len")))
+
+(defn- coll-var? [ctx node]
+  (and (= :global (:op node)) (contains? (:colls ctx) (:name node))))
+
+(defn- t-invoke
+  "An (RT/invoke (:global f) argcons) call. Order: length ops (when f names a
+   collection op over a coll var) → primitive desugar → pure-helper inline →
+   untranslatable."
+  [ctx node]
+  (let [args (:args node)
+        callee (first args)
+        f (global-name callee)
+        actuals (if (>= (count args) 2) (cons->args (second args)) [])]
+    (cond
+      (nil? f) :untranslatable
+      ; ── collection length (only when colls non-empty and arg is a coll var) ──
+      (and (= f "count") (= 1 (count actuals)) (coll-var? ctx (first actuals)))
+        (len-name (:name (first actuals)))
+      (and (= f "conj") (= 2 (count actuals)) (coll-var? ctx (first actuals)))
+        (list '+ (len-name (:name (first actuals))) 1)
+      (and (contains? #{"rest" "pop" "next"} f) (= 1 (count actuals)) (coll-var? ctx (first actuals)))
+        (list '- (len-name (:name (first actuals))) 1)
+      (and (= f "empty?") (= 1 (count actuals)) (coll-var? ctx (first actuals)))
+        (list '= (len-name (:name (first actuals))) 0)
+      ; ── payload accessor (:tag arg): f is the keyword? No — (:on mode) is
+      ;    invoke with FIRST arg a :lit keyword. Handle that shape here. ──
+      (and (= :lit (:op callee)) (keyword? (:val callee)))
+        (let [k (name (:val callee))
+              v (get (:variants ctx) k)]
+          (if (and (map? v) (:field v))
+            (let [a (t ctx (first actuals))]
+              (if (untranslatable? a) :untranslatable (list (symbol (:field v)) a)))
+            :untranslatable))
+      ; ── nth over a positional tuple var: (nth p 0) → p_0 ──
+      (and (= f "nth") (= 2 (count actuals))
+           (= :global (:op (first actuals)))
+           (= :lit (:op (second actuals))) (int? (:val (second actuals))))
+        (symbol (str (:name (first actuals)) "_" (:val (second actuals))))
+      ; ── primitive desugar ──
+      (contains? invoke-desugar f)
+        (let [ts (t-args ctx actuals)]
+          (if (untranslatable? ts) :untranslatable ((get invoke-desugar f) ts)))
+      ; ── pure-helper inline ──
+      (and (contains? (:bodies ctx) f) ((:pure? ctx) f))
+        (let [d (get (:bodies ctx) f)
+              params (:params d)
+              benv (reduce (fn [m [p a]] (assoc m p (t ctx a)))
+                           (:env ctx) (map (fn [p a] [p a]) params actuals))]
+          (t (assoc ctx :env benv) (:body d)))
+      :else :untranslatable)))
+
+; some?/is? discriminant over a payload accessor: (some? (:on mode)) →
+; ((_ is E_mode-on) mode).
+(defn- discriminant [ctx node]
+  (let [args (:args node)
+        inner (first args)]
+    (if (and (= 1 (count args)) (ir/node? inner)
+             (= :remote (:op inner)) (= rt (:mod inner)) (= :invoke (:fun inner)))
+      (let [iargs (:args inner)
+            kw (first iargs)]
+        (if (and (= :lit (:op kw)) (keyword? (:val kw)))
+          (let [k (name (:val kw))
+                v (get (:variants ctx) k)
+                actuals (if (>= (count iargs) 2) (cons->args (second iargs)) [])
+                arg (first actuals)]
+            (if (and (map? v) (:ctor v) (= :global (:op arg)))
+              (list (list '_ 'is (symbol (:ctor v))) (symbol (:name arg)))
+              :untranslatable))
+          :untranslatable))
+      :untranslatable)))
+
+; collection-length ops keyed by :fun (mod-agnostic — RT or Core). First arg is
+; the collection; abstracted to <c>_len when c ∈ (:colls ctx).
+(defn- t-length-op [ctx node]
+  (let [fun (:fun node) args (:args node) a0 (first args)]
+    (cond
+      (and (= fun :count) (= 1 (count args)) (coll-var? ctx a0))
+        (len-name (:name a0))
+      (and (= fun :conj) (= 2 (count args)) (coll-var? ctx a0))
+        (list '+ (len-name (:name a0)) 1)
+      (and (contains? #{:rest :pop :next} fun) (= 1 (count args)) (coll-var? ctx a0))
+        (list '- (len-name (:name a0)) 1)
+      (and (= fun :empty?) (= 1 (count args)) (coll-var? ctx a0))
+        (list '= (len-name (:name a0)) 0)
+      :else :no)))
+
+(defn- t-remote [ctx node]
+  (let [key [(:mod node) (:fun node)]
+        fun (:fun node) args (:args node)]
+    (cond
+      ; user call / var-apply
+      (and (= (:mod node) rt) (= fun :invoke)) (t-invoke ctx node)
+      ; collection length (mod-agnostic, only when a coll var is present)
+      (and (not (empty? (:colls ctx)))
+           (contains? #{:count :conj :rest :pop :next :empty?} fun)
+           (not (= :no (t-length-op ctx node))))
+        (t-length-op ctx node)
+      ; some?/is? discriminant
+      (and (contains? #{:some? :is?} fun) (= 1 (count args)))
+        (let [d (discriminant ctx node)]
+          (if (untranslatable? d) :untranslatable d))
+      ; max/min → ite
+      (and (contains? #{:max :min} fun) (= 2 (count args)))
+        (let [ts (t-args ctx args)]
+          (if (untranslatable? ts) :untranslatable
+            (let [a (first ts) b (second ts) cmp (if (= fun :max) '>= '<=)]
+              (list 'ite (list cmp a b) a b))))
+      ; quot (Core) / rem (erlang)
+      (and (= fun :quot) (= 2 (count args)))
+        (let [ts (t-args ctx args)]
+          (if (untranslatable? ts) :untranslatable (smt-quot (first ts) (second ts))))
+      (and (= key [:erlang :rem]) (= 2 (count args)))
+        (let [ts (t-args ctx args)]
+          (if (untranslatable? ts) :untranslatable (smt-rem (first ts) (second ts))))
+      ; pos?/neg?/zero?/inc/dec (mod-agnostic — RT for pos?/neg?/zero?, Core for inc/dec)
+      (and (contains? #{:pos? :neg? :zero? :inc :dec} fun) (= 1 (count args)))
+        (let [a (t ctx (first args))]
+          (if (untranslatable? a) :untranslatable
+            (cond (= fun :pos?) (list '> a 0) (= fun :neg?) (list '< a 0)
+                  (= fun :zero?) (list '= a 0) (= fun :inc) (list '+ a 1)
+                  (= fun :dec) (list '- a 1))))
+      ; nth over a positional tuple var: (nth p 0) → p_0
+      (and (= fun :nth) (= 2 (count args))
+           (= :global (:op (first args)))
+           (= :lit (:op (second args))) (int? (:val (second args))))
+        (symbol (str (:name (first args)) "_" (:val (second args))))
+      ; op-table (arithmetic/relational)
+      (contains? op-table key)
+        (let [op (get op-table key)
+              ts (t-args ctx args)]
+          (if (untranslatable? ts) :untranslatable
+            (if (= op :rem) (smt-rem (first ts) (second ts))
+              (apply list op ts))))
+      :else :untranslatable)))
+
+(defn t
+  "bl-ANF node → an SMT formula (a quoted s-expr) or :untranslatable, under
+   `ctx` {:env :variants :colls :bodies :pure?}. env maps a var/param name to an
+   already-translated formula (inlining); variants maps an enum tag string to
+   its z3 constructor entry; colls is the set of length-abstracted var names;
+   bodies/pure? gate pure-helper inlining."
+  [ctx node]
+  (cond
+    (not (ir/node? node)) :untranslatable
+    (= :lit (:op node))
+      (let [v (:val node)]
+        (cond
+          (keyword? v)
+            (let [entry (get (:variants ctx) (name v))]
+              (cond (nil? entry) :untranslatable
+                    (map? entry) (symbol (:ctor entry))
+                    :else (symbol entry)))
+          (int? v) v (float? v) v (= v true) true (= v false) false
+          (string? v) v
+          :else :untranslatable))
+    (= :var (:op node)) (get (:env ctx) (:name node) (symbol (:name node)))
+    (= :global (:op node))
+      (let [nm (:name node)]
+        (if (contains? (:colls ctx) nm) (len-name nm)
+          (get (:env ctx) nm (symbol nm))))
+    ; empty vector literal → length 0 (only meaningful in length mode)
+    (and (= :struct (:op node)) (= :Elixir.BeamLisp.Vector (:mod node)))
+      (if (empty? (:colls ctx)) :untranslatable 0)
+    (= :if (:op node))
+      (let [test (t ctx (:test node)) then (t ctx (:then node)) els (t ctx (:else node))]
+        (if (some untranslatable? [test then els]) :untranslatable
+          (list 'ite test then els)))
+    (= :let (:op node))
+      (let [s (scaffold ctx node)]
+        (if (= s :no) :untranslatable s))
+    ; single-key map literal {:on lvl} → payload ctor call
+    (= :map (:op node))
+      (let [pairs (:pairs node)]
+        (if (not (= 1 (count pairs))) :untranslatable
+          (let [pair (first pairs)
+                khead (first pair)
+                kw (and (= :remote (:op khead)) (first (:args khead)))
+                vnode (second pair)]
+            (if (and kw (= :lit (:op kw)) (keyword? (:val kw)))
+              (let [k (name (:val kw)) v (get (:variants ctx) k)]
+                (if (and (map? v) (:field v))
+                  (let [a (t ctx vnode)]
+                    (if (untranslatable? a) :untranslatable (list (symbol (:ctor v)) a)))
+                  :untranslatable))
+              :untranslatable))))
+    (= :remote (:op node)) (t-remote ctx node)
+    :else :untranslatable))
+
+; ── whole-program context (for pure-helper inlining) ─────────────────────
+
+(defn context
+  "Build a translation ctx. `state-vars` seed env as themselves; `variants` and
+   `colls` set the enum/length modes; `prog-src` (optional) supplies pure-helper
+   bodies for inlining."
+  ([state-vars] (context state-vars {} #{} nil))
+  ([state-vars variants colls prog-src]
+   (let [summaries (if prog-src (analyze/analyze prog-src) {})
+         bodies (if prog-src (into {} (analyze/fn-bodies prog-src)) {})
+         pure? (fn [nm] (empty? (:footprint (get summaries nm {:footprint {:x 1}}))))]
+     {:env (reduce (fn [m v] (assoc m v (symbol v))) {} (into [] state-vars))
+      :variants variants :colls colls :bodies bodies :pure? pure?})))
+
+; ── the surface-compatible API: compile a reader NODE / SOURCE to ANF ─────
+
+(defn- ->anf [node-or-src]
+  (let [node (if (string? node-or-src)
+               (first (BeamLisp.Reader/read_string node-or-src))
+               node-or-src)]
+    (c/compile-node node (c/new-env "anf-smt"))))
+
+(defn of-node
+  "Translate a reader NODE (model.bl's clause carriers) to a FORM or
+   :untranslatable, via ANF. 2-arg: no enums. 3-arg: enum variants."
+  ([vars node] (of-node vars {} node))
+  ([vars variants node]
+   (if (nil? node) nil
+     (t (context vars variants #{} nil) (->anf node)))))
+
+(defn of-source
+  "Translate a source STRING to a FORM or :untranslatable, via ANF."
+  [vars src]
+  (if (nil? src) nil (t (context vars) (->anf src))))
+
+(defn of-source-variants
+  [vars variants src]
+  (if (nil? src) nil (t (context vars variants #{} nil) (->anf src))))
+
+(defn of-node-len
+  "translate-len over a reader NODE: colls length-abstracted."
+  [vars colls node]
+  (if (nil? node) nil (t (context vars {} colls nil) (->anf node))))
+
+(defn of-source-len
+  [vars colls src]
+  (if (nil? src) nil (t (context vars {} colls nil) (->anf src))))
+
+(defn translate
+  "Direct reader-node translate (2/3-arg), matching system.smt/translate."
+  ([vars node] (translate vars {} node))
+  ([vars variants node] (t (context vars variants #{} nil) (->anf node))))
+
+(defn translate-len
+  [vars colls node] (t (context vars {} colls nil) (->anf node)))
+
+; ── of-source with pure-helper inlining (the beyond-surface capability) ───
+
+(defn of-source-inlining
+  "Translate predicate `pred-src` against whole program `prog-src`, INLINING any
+   pure helper it calls. The capability the surface walker never had."
+  [prog-src state-vars pred-src]
+  (t (context state-vars {} #{} prog-src) (->anf pred-src)))
+
+; ── defn → define-fun, from the ANF descriptor ───────────────────────────
+;
+; A defn compiles to (Link/defvar ns name (:lit DESCRIPTOR) meta); the
+; descriptor is a LIST of {:fixed arity fname clausemap} tuples, each clausemap
+; a :defn-clause with :guard (ANF|nil), :params [{:name}], :body (ANF). We fold
+; the clauses to nested ite exactly as the surface path did — but the guards and
+; bodies are ALREADY resolved ANF, so a guard using a macro/pure-helper works.
+
+(defn- descriptor-clauses
+  "The clause tuples of a compiled defn node, or nil if not a defn."
+  [anf]
+  (if (and (= :remote (:op anf)) (= :Elixir.BeamLisp.Link (:mod anf)) (= :defvar (:fun anf)))
+    (let [lit (nth (:args anf) 2)]
+      (if (= :lit (:op lit)) (:val lit) nil))
+    nil))
+
+(defn- clause-parts [tup]
+  ; tup = {:fixed arity fname clausemap} as a 4-tuple
+  (let [l (erlang/tuple_to_list tup)
+        cm (nth l 3)]
+    {:params (into [] (map (fn [p] (:name p)) (:params cm)))
+     :guard (:guard cm)
+     :body (:body cm)}))
+
+(defn- fold-clauses
+  "Fold guarded clauses to nested ite over canonical param symbols `cps`. Each
+   clause's own (renamed) params bind to the canonical params in env. Last
+   clause is the else arm."
+  [cps clauses]
+  (let [c (first clauses)
+        p (clause-parts c)
+        env (reduce (fn [m [rp cp]] (assoc m rp (symbol cp)))
+                    {} (map (fn [rp cp] [rp cp]) (:params p) cps))
+        ctx (assoc (context #{}) :env env)]
+    (if (empty? (rest clauses))
+      (t ctx (:body p))
+      (let [g (if (nil? (:guard p)) true (t ctx (:guard p)))
+            b (t ctx (:body p))
+            rest-smt (fold-clauses cps (rest clauses))]
+        (if (or (untranslatable? g) (untranslatable? b) (untranslatable? rest-smt))
+          :untranslatable
+          (list 'ite g b rest-smt))))))
+
+(defn defn->define-fun
+  "Lower a defn SOURCE to (define-fun name ((p Sort)…) Ret body) over `ret-sort`,
+   via the ANF descriptor. Nested-ite clause fold; :untranslatable on any
+   out-of-fragment guard/body."
+  [defn-src ret-sort]
+  (let [anf (->anf defn-src)
+        clauses (descriptor-clauses anf)]
+    (if (nil? clauses) :untranslatable
+      (let [cls (into [] clauses)
+            cps (:params (clause-parts (first cls)))
+            body-smt (fold-clauses cps cls)]
+        (if (untranslatable? body-smt) :untranslatable
+          (apply list 'define-fun (symbol (:val (nth (:args anf) 1)))
+                 (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) cps))
+                 (symbol ret-sort)
+                 (list body-smt)))))))
