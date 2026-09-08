@@ -1,0 +1,445 @@
+; linear.bl — emission linearity: the compiler never duplicates a subtree.
+;
+; ── The bug this names ───────────────────────────────────────────────────
+;
+; `self-apply` (the loop/fn scaffold) once emitted `let self = (fn [self]
+; inner) in inner` — the compiled inner fn spliced TWICE. Every fn and every
+; loop doubled its body in the IR; `for` (three scaffolds + a dead chunked
+; branch) emitted its body ×24; nested `for`s compounded, ×24 per level.
+; Three deep was 13 824 copies of the body and 20 s of `anf/validate-node!`;
+; four deep never finished. A printflow screen with three nested `for`s took
+; the app namespace from 45 s to 350 s to load. Nothing was WRONG — the code
+; ran — it was merely exponential, and nobody could see it.
+;
+; ── The property ─────────────────────────────────────────────────────────
+;
+; LINEARITY: |emit(form)| ≤ k · |form|. It holds iff no compiler constructor
+; places the SAME compiled child node in two positions of the tree it builds.
+; A duplicated child is the ONLY way output can outgrow input super-linearly,
+; because every compile-* function is structurally recursive on the source.
+;
+; Three tiers, each a different formal engine, each checked by a suite:
+;
+;   1. STRUCTURAL (datalog over the compiler-as-codebase, tier: codebase +
+;      system.ir). Over the compiler's OWN ANF: for every fn, every local
+;      bound to a compiled node (`(compile-node …)`, `(compile-body …)`, a
+;      `*-node` name) is USED AT MOST ONCE inside any constructor call. This
+;      is an affine-use check — the same discipline linear types enforce —
+;      run as a query over facts, so a future `(a/lett self outer inner)`
+;      with `inner` twice is a failing fact, not a surprise.
+;
+;   2. SEMANTIC (z3 via system.smt). The size lemma: given affine use, the
+;      per-constructor size recurrence is affine — `size(out) ≤ c + Σ size(in)`
+;      — so by induction on the source `|emit| ≤ k·|src|`. z3 discharges the
+;      arithmetic for every constructor arity the compiler uses.
+;
+;   3. DYNAMIC (system.incr hashes, run on the emitted IR). The sentinel: a
+;      post-compile pass hashes every subtree (alpha-normalized, :ann-free)
+;      and reports any NON-TRIVIAL subtree whose hash occurs more than once
+;      under a clause. It cannot be fooled by a new constructor or a macro
+;      (the ×2 in `for` was MACRO-level, invisible to tier 1) and it is
+;      cheap: one walk, one hash per node. This is what `lsp/diagnostics`
+;      surfaces and what the boot build asserts over the whole toolchain.
+;
+; Tier 1 proves the compiler's source has the property; tier 2 proves the
+; property implies the bound; tier 3 measures the artefact. A regression in
+; any of the three fails a test with the offending function named.
+
+(ns system.linear
+  (:require [system.ir :as ir]
+            [system.incr :as incr]
+            [system.analyze :as analyze]
+            [compiler :as c]
+            [z3]
+            [typed]))
+
+; ════════════════════════════════════════════════════════════════════════
+; TIER 3 — the dynamic sentinel: duplicate subtrees in emitted IR
+; ════════════════════════════════════════════════════════════════════════
+
+(defn- size
+  "Node count of an ANF subtree (executable nodes only)."
+  [n]
+  (if (ir/node? n)
+    (reduce (fn [acc c] (+ acc (size c))) 1 (ir/child-nodes n))
+    0))
+
+(defn- subtree-key
+  "The content address of a subtree: alpha-normalized, :ann-free."
+  [n]
+  (incr/body-hash n))
+
+;; WHAT COUNTS AS A DUPLICATE. Two structurally equal subtrees are legitimate
+;; when they come from two SOURCE sites: `(f (first kv)) (f (second kv))`
+;; written twice, two `recur`s that both emit `((self self) (rest s))`. A
+;; spliced compiled child is one source site placed twice — and every node
+;; carries its source span in :ann. So the key is (structure, span): equal
+;; structure AT THE SAME SPAN more than once is exactly "the compiler (or a
+;; macro) placed this compiled child again". No size threshold is needed;
+;; `min-size` (default 3) only drops leaves, whose spans legitimately repeat
+;; (a variable read twice).
+;;
+;; Not every node is positioned: a fn scaffold, a macro's own output, carry
+;; `{}`. Their PROVENANCE is still readable — the set of spans of the
+;; positioned nodes INSIDE them. Two hand-written twins (`(fn [x] (= (f x)
+;; fv))` on two lines of partition-by) have disjoint inner spans; a spliced
+;; copy carries the SAME inner spans as its sibling, because both were
+;; compiled from the one argument form. So the key is (structure, inner-
+;; spans), and a subtree with NO positioned node at all (pure macro output)
+;; keys on structure alone above `unpositioned-resolution` — the trivial
+;; idioms a macro legitimately emits at several sites (`(recur (rest s))`,
+;; ≤ 8 nodes) stay below it.
+(defn- own-span [n]
+  (let [a (:ann n)]
+    (when (and (map? a) (int? (:line a)))
+      [(:line a) (:col a) (:end-line a) (:end-col a)])))
+
+(def unpositioned-resolution 9)
+
+(defn duplicates
+  "The subtrees that occur MORE THAN ONCE under `root` with the SAME source
+   span, as [{:hash :span :count :size :sample}]. Sorted by size desc so the
+   worst offender is first. See the note above for why span is the key."
+  ([root] (duplicates root 3))
+  ([root min-size]
+   (let [seen (atom {})
+         ; one bottom-up pass: each node's {:size :spans} is folded from its
+         ; children's, so provenance costs O(n) for the whole tree
+         walk (fn walk [n]
+                (if (not (ir/node? n))
+                  {:size 0 :spans #{}}
+                  (let [kids (into [] (map walk (ir/child-nodes n)))
+                        sz (reduce (fn [a k] (+ a (:size k))) 1 kids)
+                        spans (reduce (fn [a k] (into a (:spans k)))
+                                      (if-let [s (own-span n)] #{s} #{}) kids)
+                        sp (if (empty? spans) :unpositioned (sort spans))]
+                    (when (>= sz (if (= sp :unpositioned) (max min-size unpositioned-resolution) min-size))
+                      (let [k [(subtree-key n) sp]]
+                        (swap! seen (fn [m] (let [e (get m k)]
+                                              (assoc m k (if e (update e :count inc)
+                                                           {:hash (first k) :span sp :count 1 :size sz
+                                                            :sample (incr/strip-ann n)})))))))
+                    {:size sz :spans spans})))]
+     (walk root)
+     (into [] (sort-by (fn [d] (- (:size d)))
+                       (filter (fn [d] (> (:count d) 1)) (vals (deref seen))))))))
+
+(defn linear?
+  "Does the emitted tree under `root` contain no duplicated non-trivial
+   subtree? The property tier 1 proves the compiler has and tier 3 measures."
+  [root]
+  (empty? (duplicates root)))
+
+(defn blowup
+  "The emission ratio of a source form: nodes emitted per source node. A
+   linear compiler keeps this bounded by a small constant (≈ 40 for the
+   heaviest scaffolds: a `for` is ~12 nodes of source and ~450 of IR);
+   before the fix a 3-deep `for` measured in the thousands."
+  [src ns]
+  (let [node (c/compile-node (first (BeamLisp.Reader/read_string src)) (c/new-env ns))
+        data (c/read-data src)
+        src-size (fn src-size [f] (cond (or (list? f) (vector? f)) (reduce + 1 (map src-size f))
+                                        (map? f) (reduce + 1 (map src-size (vals f)))
+                                        :else 1))]
+    {:src (src-size data) :emitted (size node)
+     :ratio (quot (size node) (max 1 (src-size data)))
+     :duplicates (duplicates node)}))
+
+(defn- src-size [f]
+  (cond (or (list? f) (vector? f)) (reduce + 1 (map src-size f))
+        (map? f) (reduce + 1 (map src-size (vals f)))
+        :else 1))
+
+(defn ratios
+  "Tier 3's MEASUREMENT, per fn: [{:fn :src :emitted :ratio}] for every defn
+   in `src` — emitted IR nodes per source node. This is the bound itself
+   (|emit| ≤ k·|src|) read off the artefact. Across the boot toolchain every
+   fn measures ≤ 1; a scaffold that started splicing would show as a fn
+   whose ratio jumped, and nested use would show it compounding."
+  [src]
+  (let [forms (c/read-all-data src)
+        sizes (into {} (keep (fn [d] (when (and (list? d) (contains? #{'defn 'defn-} (first d)))
+                                       [(name (second d)) (src-size d)]))
+                             forms))]
+    (into []
+      (map (fn [[nm b]]
+             (let [e (size (:body b)) s (get sizes nm 1)]
+               {:fn nm :src s :emitted e :ratio (quot e (max 1 s))}))
+           (analyze/fn-bodies src)))))
+
+(defn over-ratio
+  "The fns of `src` whose emitted/source ratio exceeds `k`. Empty ⇒ the bound
+   holds with constant k over this source."
+  [src k]
+  (into [] (filter (fn [r] (> (:ratio r) k)) (ratios src))))
+
+(defn check-source
+  "Tier 3 over every defn in `src`: [{:fn name :duplicates […]}] for the
+   functions whose emitted body is NOT linear. Empty ⇒ linear."
+  [src]
+  (into []
+    (keep (fn [[name d]]
+            (let [ds (duplicates (:body d))]
+              (when (seq ds) {:fn name :duplicates ds})))
+          (analyze/fn-bodies src))))
+
+(defn diagnostics
+  "Tier 3 as LSP diagnostics: one per non-linear fn, positioned on the fn's
+   body (the :ann the compiler stamped), naming the largest duplicated
+   subtree and how many copies. A macro that splices its body twice shows
+   up here on the CALLER's function — where the cost is paid."
+  [src]
+  (into []
+    (keep (fn [[name d]]
+            (let [ds (duplicates (:body d))]
+              (when (seq ds)
+                (let [worst (first ds) ann (or (:ann (:body d)) {})]
+                  {:kind :non-linear-emission :fn name
+                   :line (get ann :line 0) :col (get ann :col 0)
+                   :msg (str name ": emitted IR duplicates a " (:size worst) "-node subtree ×" (:count worst)
+                             " (" (count ds) " duplicated shape" (if (> (count ds) 1) "s" "") ")"
+                             " — a macro or constructor splices a compiled child more than once")}))))
+          (analyze/fn-bodies src))))
+
+; ════════════════════════════════════════════════════════════════════════
+; TIER 1 — the structural proof over the compiler's own source
+; ════════════════════════════════════════════════════════════════════════
+;
+; The facts: in the compiler, a constructor is any `a/…` call (anf.bl's
+; lit/var/remote/app/lett/iff/doo/casee/fnn/tryy/recv/tup/mapp/cons-cell/
+; structt/clause) or a local helper that forwards to one (self-apply,
+; nest-lets). A COMPILED CHILD is a local whose init is a call to compile-*
+; or a helper returning a node. AFFINE USE: within one constructor
+; expression (transitively through its argument lists), each compiled-child
+; local is referenced at most once.
+;
+; Here the compiler's source is read as ANF via analyze/fn-bodies, so the
+; check sees the real binding structure (a `let` chain) rather than text.
+
+;; anf.bl's constructor vocabulary, by NAME: a constructor call is recognised
+;; whether the compiler reaches it as `a/lett` (aliased), `anf/lett`, or a
+;; direct remote into the Anf module — the check reads meaning, not spelling.
+(def constructor-names
+  #{"lit" "var" "global" "remote" "app" "lett" "iff" "doo" "casee" "fnn" "tryy"
+    "recv" "tup" "mapp" "cons-cell" "structt" "clause"})
+
+(defn- callee-name
+  "The unqualified callee name of a call node, or nil."
+  [n]
+  (cond
+    (= :remote (:op n)) (str (:fun n))
+    (and (= :apply (:op n)) (ir/node? (:fn n)) (= :global (:op (:fn n))))
+      (let [nm (:name (:fn n)) i (index-of nm "/")]
+        (if (and i (>= i 0)) (subs nm (inc i)) nm))
+    :else nil))
+
+(defn- constructor-call?
+  "A call into anf.bl's constructors."
+  [n]
+  (and (ir/node? n)
+       (let [nm (callee-name n)]
+         (and nm (contains? constructor-names nm)
+              (or (= :remote (:op n)) (= :Elixir.BeamLisp.Ns.Anf (:mod n))
+                  (let [full (:name (:fn n))]
+                    (or (= 0 (index-of full "a/")) (= 0 (index-of full "anf/")))))))))
+
+;; A `(a/var "x")` / `(a/lit v)` / `(a/global ns name)` is a LEAF: a
+;; reference, not a compiled subtree. Placing the same leaf twice is how a
+;; variable is READ twice (`declare_ns ns` then `in_ns ns`) — a use, never a
+;; duplication of work. The affine rule is about children with CONTENT.
+(defn- leaf-constructor?
+  [n]
+  (contains? #{"var" "lit" "global"} (callee-name n)))
+
+(defn- compiled-init?
+  "Is this let-init the compilation of a child? A call whose callee name
+   starts with `compile` (compile-node, compile-body, compile-each-notail …)
+   or ends in `-node`/`-steps`, or a NON-LEAF constructor call itself."
+  [init]
+  (or (and (constructor-call? init) (not (leaf-constructor? init)))
+      (and (ir/node? init) (= :apply (:op init)) (ir/node? (:fn init))
+           (= :global (:op (:fn init)))
+           (let [nm (:name (:fn init))]
+             (or (= 0 (index-of nm "compile")) (= 0 (index-of nm "self-apply"))
+                 (= 0 (index-of nm "nest-lets")))))
+      (and (ir/node? init) (= :remote (:op init))
+           (= 0 (index-of (str (:fun init)) "compile")))))
+
+;; ── PLACEMENT COUNTING ──────────────────────────────────────────────────
+;;
+;; A compiled child is PLACED when it appears as an argument (at any depth of
+;; the argument lists — a `(list …)` of clauses is still the constructor's
+;; argument) of a constructor call. The count for a child is the number of
+;; placements over the WHOLE constructed tree of one fn, where a let-bound
+;; local whose init is itself a constructor call transmits the placements of
+;; ITS arguments each time IT is placed. That is the fixpoint the old bug
+;; needed to be caught: `inner-fn` was placed once inside `outer-fn`'s
+;; `a/fnn`, and `outer-fn` AND `inner-fn` were both placed in the final
+;; `a/lett` — two placements of `inner-fn` reaching the emitted tree.
+;;
+;; Names are the compiler's gensyms (`inner-fn_3`); the `params` a fn-body
+;; carries are those same gensyms, so a parameter is matched by identity
+;; and its ORIGIN name (before the `_N`) decides whether it denotes a node.
+
+(defn- origin
+  "`inner-fn_3` → `inner-fn`: the source name behind a compiler gensym."
+  [nm]
+  (let [i (last-index-of nm "_")]
+    (if (and i (> i 0)) (subs nm 0 i) nm)))
+
+(defn- node-name?
+  "Does a (source) name denote a compiled node, by the compiler's own
+   convention? `*-node`, `*-fn`, `*-nodes`, and the bare nouns the compile-*
+   helpers thread: inner, body, init, subj."
+  [nm]
+  (let [o (origin nm)]
+    (or (some (fn [suffix] (and (>= (count o) (count suffix))
+                                (= suffix (subs o (- (count o) (count suffix))))))
+              ["-node" "-fn" "-nodes"])
+        (contains? #{"inner" "body" "init" "subj"} o))))
+
+(defn- var-refs
+  "How many times :var `name` occurs under `n` (any depth, any position)."
+  [n name]
+  (if (not (ir/node? n)) 0
+    (+ (if (and (= :var (:op n)) (= name (:name n))) 1 0)
+       (reduce + 0 (map (fn [c] (var-refs c name)) (ir/child-nodes n))))))
+
+(defn- direct-placements
+  "{name → count} of every :var placed as an argument of constructor call
+   `site` (through nested list/cons argument structure, not through nested
+   constructor calls — those are their own sites)."
+  [site]
+  (let [acc (atom {})
+        walk (fn walk [n]
+               (when (ir/node? n)
+                 (cond
+                   (= :var (:op n)) (swap! acc update (:name n) (fn [c] (inc (or c 0))))
+                   (constructor-call? n) nil        ; a nested site counts for itself
+                   :else (doseq [ch (ir/child-nodes n)] (walk ch)))))]
+    (doseq [a (ir/child-nodes site)] (walk a))
+    (deref acc)))
+
+(defn placements
+  "Tier 1's fixpoint over one fn: {child-name → placements reaching the
+   emitted tree}. `children` are the names that denote compiled nodes (params
+   by convention + let-bound compiled inits). A let-bound CONSTRUCTOR local
+   `l` with direct placements D(l) and itself placed P(l) times contributes
+   P(l)·D(l)(c) to each child c."
+  [params body]
+  (let [lets (atom {})            ; local → init node (constructor-built locals)
+        children (atom (set (filter node-name? params)))
+        sites (atom [])           ; top-level constructor sites (not let-inits)
+        walk (fn walk [n in-init?]
+               (when (ir/node? n)
+                 (cond
+                   (= :let (:op n))
+                     (do (when (compiled-init? (:init n)) (swap! children conj (:name n)))
+                         (when (constructor-call? (:init n)) (swap! lets assoc (:name n) (:init n)))
+                         (walk (:init n) true)
+                         (walk (:body n) false))
+                   (constructor-call? n)
+                     (do (when (not in-init?) (swap! sites conj n))
+                         (doseq [ch (ir/child-nodes n)] (walk ch false)))
+                   :else (doseq [ch (ir/child-nodes n)] (walk ch in-init?)))))]
+    (walk body false)
+    ;; P(l) = top(l) + Σ_other D(other)(l)·P(other). The let chain is acyclic
+    ;; (a local's init can only mention EARLIER locals), so P is a fixpoint
+    ;; reached by iterating over the locals; each round is one pass, and
+    ;; rounds ≤ chain depth. Direct placements are computed once per local.
+    (let [ls (deref lets)
+          dl (into {} (map (fn [[l init]] [l (direct-placements init)]) ls))
+          top (reduce (fn [m s] (merge-with + m (direct-placements s))) {} (deref sites))
+          step (fn [p]
+                 (into {} (map (fn [[l _]]
+                                 [l (+ (get top l 0)
+                                       (reduce + 0 (map (fn [[other d]] (* (get d l 0) (get p other 0))) dl)))])
+                               ls)))
+          p (loop [p (into {} (map (fn [[l _]] [l (get top l 0)]) ls)) n 0]
+              (let [p2 (step p)]
+                (if (or (= p2 p) (> n 64)) p2 (recur p2 (inc n)))))
+          total (reduce (fn [m [l d]]
+                          (let [pl (get p l 0)]
+                            (reduce (fn [m2 [c k]] (assoc m2 c (+ (get m2 c 0) (* pl k)))) m d)))
+                        top dl)]
+      (into {} (filter (fn [[c _]] (contains? (deref children) c)) total)))))
+
+(defn affine-violations
+  "Tier 1 over one fn: every compiled child placed MORE THAN ONCE in the
+   tree the fn emits. [{:local :placements}]. The old `self-apply` is caught
+   here: `inner-fn` placed twice (once via `outer-fn`, once directly)."
+  [params body]
+  (into [] (keep (fn [[c n]] (when (> n 1) {:local c :placements n})) (placements params body))))
+
+(defn param-violations
+  "`affine-violations` over every defn in `src`, flattened with :fn."
+  [src]
+  (into []
+    (mapcat (fn [[name d]]
+              (map (fn [v] (assoc v :fn name)) (affine-violations (:params d) (:body d))))
+            (analyze/fn-bodies src))))
+
+(defn check-compiler
+  "Tier 1 over the compiler source: [{:fn :violations}] for every function
+   that places a compiled child — a let-bound one or a parameter — more than
+   once in the tree it emits. Empty ⇒ the compiler is emission-linear BY
+   CONSTRUCTION. This is the theorem; tier 3 is its measurement."
+  [compiler-src]
+  (into []
+    (keep (fn [[name d]]
+            (let [v (affine-violations (:params d) (:body d))]
+              (when (seq v) {:fn name :violations v})))
+          (analyze/fn-bodies compiler-src))))
+
+; ════════════════════════════════════════════════════════════════════════
+; TIER 2 — the size lemma, discharged by z3
+; ════════════════════════════════════════════════════════════════════════
+;
+; With affine use, a constructor of arity n produces 1 + Σ|child_i| nodes.
+; Induction on the source: if each child satisfies |emit(c)| ≤ k·|c| and
+; the constructor adds a constant overhead ≤ h (the scaffold: self-apply
+; adds 4 nodes, a let adds 1), then |emit(f)| ≤ k·|f| for k ≥ h+1. The
+; lemma z3 proves, ∀ sizes ≥ 0, arity ≤ 8, overhead ≤ 8: with k = 12,
+;   (c1 ≤ k·s1) ∧ … ∧ (cn ≤ k·sn) ∧ (out = h + c1 + … + cn) ∧ (h ≤ 8)
+;   ⟹ out ≤ k·(1 + s1 + … + sn).
+; The negation is unsat. If a constructor ever placed a child TWICE
+; (out = h + 2·c1 + …), the same query is sat — the counter-model is the
+; blowup. So this is also the arithmetic reason tier 1's condition is the
+; right one.
+
+(defn size-lemma
+  "The SMT-LIB commands (as forms) whose `check-sat` must be unsat for the
+   linearity bound with constant `k`, constructor arity `n`, scaffold
+   overhead ≤ `h`. `dup` (default 1) is how many times child 1 is placed —
+   pass 2 to watch the bound fail as it did before the fix."
+  ([k n h] (size-lemma k n h 1))
+  ([k n h dup]
+   (let [ss (map (fn [i] (symbol (str "s" i))) (range n))
+         cs (map (fn [i] (symbol (str "c" i))) (range n))
+         decl (fn [v] (list 'declare-const v 'Int))
+         nonneg (fn [v] (list 'assert (list '>= v 0)))
+         bounded (map (fn [s c] (list 'assert (list '<= c (list '* k s)))) ss cs)
+         out (apply list '+ 'h (cons (list '* dup (first cs)) (rest cs)))
+         src (apply list '+ 1 ss)]
+     (concat (map decl ss) (map decl cs) [(decl 'h)]
+             (map nonneg ss) (map nonneg cs)
+             [(list 'assert (list '>= 'h 0)) (list 'assert (list '<= 'h h))]
+             bounded
+             ; negate the conclusion (z3/check appends the check-sat)
+             [(list 'assert (list 'not (list '<= out (list '* k src))))]))))
+
+(defn prove-bound
+  "Tier 2: for every arity 1..max-arity, z3 shows the bound holds (unsat)
+   with a single placement and FAILS (sat) with a double placement. Returns
+   {:holds bool :arities [{:n :linear :duplicated}]}."
+  [port k h max-arity]
+  (let [rows (into []
+               (map (fn [n]
+                      ; z3/check resets the solver per query — two queries on one
+                      ; port must not see each other's assertions
+                      {:n n
+                       :linear (z3/check port (size-lemma k n h 1))
+                       :duplicated (z3/check port (size-lemma k n h 2))})
+                    (range 1 (inc max-arity))))]
+    {:holds (every? (fn [r] (and (= "unsat" (:linear r)) (= "sat" (:duplicated r)))) rows)
+     :arities rows}))

@@ -992,12 +992,30 @@ defmodule BeamLisp.Env do
 
   defp ast_calls_remote?(_entries, _target), do: false
 
-  # A depth-first walk of a compiled def AST for a reference to the target var,
-  # matching BOTH shapes the compiler emits for a qualified cross-ns call:
-  #   * static  — `{:., _, [TargetModule, :fname]}` (remote call to the ns module)
-  #   * dynamic — `BeamLisp.Env.fetch!("target.ns", "name")` / `fetch(…)`
-  #     (a runtime var lookup, emitted when the callee's ns is known-but-forked)
-  # Either proves a live static dependency on the target var.
+  # A depth-first walk of a compiled def for a reference to the target var.
+  # Since the canonical-compiler cutover a def entry's body is bl-ANF (maps
+  # with an :op), not Elixir AST — the walker matches the ANF shapes FIRST,
+  # and keeps the Elixir-AST clauses for any entry still carrying one:
+  #   * ANF static  — `%{op: :remote, mod: TargetModule, fun: :fname}`
+  #   * ANF global  — `%{op: :global, ns: "target.ns", name: "name"}`
+  #   * AST static  — `{:., _, [TargetModule, :fname]}`
+  #   * AST dynamic — `BeamLisp.Env.fetch!("target.ns", "name")` / `fetch(…)`
+  # Any of these proves a live static dependency on the target var. (Before
+  # this, `callers_of` returned [] for every ANF def, so a reload that dropped
+  # a var another namespace called was APPLIED instead of held.)
+  defp node_calls_remote?(%{op: :remote, mod: mod, fun: f} = n, {_tns, _name, target_mod, fname} = t) do
+    (mod == target_mod and f == fname) or node_calls_remote?(Map.delete(n, :op) |> Map.values(), t)
+  end
+
+  defp node_calls_remote?(%{op: :global, ns: tns, name: nm}, {target_ns, name, _tm, _fn})
+       when tns == target_ns and nm == name do
+    true
+  end
+
+  defp node_calls_remote?(%{} = m, target) do
+    m |> Map.delete(:ann) |> Map.values() |> node_calls_remote?(target)
+  end
+
   defp node_calls_remote?({{:., _, [mod, f]}, _, _args}, {_tns, _name, target_mod, fname})
        when mod == target_mod and f == fname do
     true
@@ -1021,6 +1039,12 @@ defmodule BeamLisp.Env do
 
   defp node_calls_remote?({a, b}, target) do
     node_calls_remote?(a, target) or node_calls_remote?(b, target)
+  end
+
+  # a def entry is a tuple `{:fixed, arity, name, clause-map, module}` (or the
+  # variadic form) — walk every element
+  defp node_calls_remote?(tuple, target) when is_tuple(tuple) do
+    tuple |> Tuple.to_list() |> node_calls_remote?(target)
   end
 
   defp node_calls_remote?(_other, _target), do: false

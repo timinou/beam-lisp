@@ -72,6 +72,11 @@ defmodule BeamLisp.Z3Port do
   `(get-model)` text when `model?: true` and status is "sat".
   """
   def check(port, smt, model? \\ false) do
+    # A caller-supplied (check-sat) would make z3 answer TWICE and desync the
+    # reader by one answer for every later query on this port — a silent,
+    # alternating sat/unsat that looks like a solver bug. Strip it: this
+    # function owns the check.
+    smt = Regex.replace(~r/^\s*\(check-sat\)\s*$/m, smt, "")
     Port.command(port, "(reset)\n" <> smt <> "(check-sat)\n")
 
     case read_answer(port, "") do
