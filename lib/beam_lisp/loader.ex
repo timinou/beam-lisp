@@ -119,6 +119,35 @@ defmodule BeamLisp.Loader do
         else: Process.put(:bl_ambient_dirs, prev)
     end
   end
+  @doc """
+  Is `ns` a beam-lisp namespace this loader COULD load — already in the env,
+  compiled AOT, or present as a source file on the search path?
+
+  The compiler asks this when a qualified name `a.b/c` names a prefix that is
+  neither an alias nor a loaded namespace. Without it the prefix falls through
+  to "lowercase ⇒ Erlang module", which compiles fine and fails at the call
+  site as `:"a.b".c/2 is undefined` — an error that depends on which OTHER
+  file happened to load `a.b` first. Never loads anything; a positive answer
+  is followed by `ensure_loaded/1` at the compiler's discretion.
+  """
+  def resolvable?(ns) when is_binary(ns) do
+    ns == "core" or Env.loaded_ns?(ns) or
+      Code.ensure_loaded?(BeamLisp.Link.module_for(ns)) or
+      source_on_path?(ns)
+  end
+
+  # The same rule `find_file/1` applies: a file serves `ns` only if it DECLARES
+  # `ns`. `crypto/hash` inside `auth/biscuit/` must stay the Erlang module even
+  # though a sibling `crypto.bl` exists — that file declares
+  # `auth.biscuit.crypto`, so it is not evidence that a namespace `crypto`
+  # exists.
+  defp source_on_path?(ns) do
+    case find_file(ns) do
+      {:ok, _, _} -> true
+      _ -> false
+    end
+  end
+
   @doc "Load `ns` from `<ns>.bl` on the load paths, unless already loaded."
   def ensure_loaded(ns) when is_binary(ns) do
     # AOT FIRST, and this is the one place it can go.
