@@ -27,6 +27,57 @@
 (function () {
   "use strict";
 
+  // ── durable offline outbox (opt-in via connect({outbox:true})) ────────
+  //
+  // The floor tablet drops wifi mid-gesture. A durable gesture (an element
+  // marked data-live-durable) is minted a client idempotency id, injected into
+  // the event data as "ev/id", PERSISTED to localStorage, then sent. It clears
+  // only when the server sends ["ack", id]; on reconnect every un-acked frame
+  // is replayed. The server dedups by the unique :ev/id, so replay is
+  // exactly-once. Off by default — an app that never sets {outbox:true} keeps
+  // the old volatile behaviour byte-for-byte.
+  function makeOutbox(key) {
+    function load() {
+      try { return JSON.parse(window.localStorage.getItem(key) || "[]"); }
+      catch (_e) { return []; }
+    }
+    function save(q) {
+      try { window.localStorage.setItem(key, JSON.stringify(q)); } catch (_e) {}
+    }
+    return {
+      add: function (id, frame) {
+        var q = load(), i;
+        for (i = 0; i < q.length; i++) if (q[i].id === id) return;
+        q.push({ id: id, frame: frame });
+        save(q);
+      },
+      ack: function (id) {
+        var q = load(), out = [], i;
+        for (i = 0; i < q.length; i++) if (q[i].id !== id) out.push(q[i]);
+        save(out);
+      },
+      replay: function (sendFrame) {
+        var q = load(), i;
+        for (i = 0; i < q.length; i++) sendFrame(q[i].frame);
+      },
+      count: function () { return load().length; },
+    };
+  }
+
+  // a monotonic-ish client id for a device: a stable per-tab prefix + counter,
+  // so two tablets on the same PIN never collide and a crash-restart continues.
+  var __seq = 0;
+  function mintId(op) {
+    var pfx;
+    try {
+      pfx = window.localStorage.getItem("live:client-id");
+      if (!pfx) { pfx = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+                  window.localStorage.setItem("live:client-id", pfx); }
+    } catch (_e) { pfx = "c" + Date.now().toString(36); }
+    __seq++;
+    return "ev-" + op + "-" + pfx + "-" + Date.now().toString(36) + "-" + __seq;
+  }
+
   // ── resolve a path (array of child indices) to a DOM element ──────────
   //
   // The diff paths are relative to the VIEW's root element (the single
@@ -278,83 +329,107 @@
   // ── the socket ────────────────────────────────────────────────────────
   function connect(opts) {
     const root = opts.root || document.getElementById("live-root");
-    const ws = new WebSocket(opts.url);
 
-    // An event can fire BEFORE the handshake finishes (a fast click on first
-    // paint) or AFTER the socket drops. Calling ws.send() in either state
-    // throws ("…object that is not, or is no longer, usable"). Buffer sends
-    // made while CONNECTING and flush them on open; drop sends once CLOSED.
-    // `ws.__send` is what relay() uses, never ws.send directly.
+    // The outbox is opt-in: {outbox:true} turns on a durable localStorage queue
+    // + auto-reconnect + replay. Without it, the socket keeps its old volatile
+    // behaviour (buffer while CONNECTING, drop when CLOSED, no reconnect).
+    var outbox = opts.outbox ? makeOutbox("live:outbox") : null;
+
+    // `ws` is now MUTABLE — a reconnect swaps in a fresh socket while the event
+    // delegation (bound to `root` once, below) keeps firing. `pending` buffers
+    // sends made while the CURRENT socket is still CONNECTING.
+    var ws = null;
     var pending = [];
-    ws.__send = function (payload) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(payload);
-      } else if (ws.readyState === WebSocket.CONNECTING) {
-        pending.push(payload);
-      }
-      // CLOSING/CLOSED: drop — the view will re-sync on reconnect
-    };
+    var reconnectMs = 500;
 
-    // Observable connection state. The client mirrors the live socket's health
-    // onto `document.documentElement[data-live]` ("1" connected, "0" dropped)
-    // and dispatches a `live:state` CustomEvent. Two audiences need this: a
-    // reconnect indicator in the UI, and an out-of-band watcher (e.g. a
-    // scenario-film liveness watchdog) that must certify the socket stayed up
-    // across a whole take — a point-in-time check cannot. Backward-compatible:
-    // a page that ignores the attribute is unaffected.
-    function setLive(up) {
-      try {
-        document.documentElement.setAttribute("data-live", up ? "1" : "0");
-        document.dispatchEvent(
-          new CustomEvent("live:state", { detail: { up: up } }),
-        );
-      } catch (_e) {
-        /* non-DOM host (tests) — ignore */
-      }
-      if (opts.onLive) opts.onLive(up);
+    // send a raw JSON frame string: straight through when OPEN, buffered while
+    // CONNECTING, dropped when there is no socket (the outbox holds the durable
+    // ones and replays them on reconnect). relay() calls ws.__send; that is a
+    // thin shim over this so existing call sites are unchanged.
+    function sendFrame(payload) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(payload);
+      else if (ws && ws.readyState === WebSocket.CONNECTING) pending.push(payload);
+      // no socket / CLOSED: drop — a durable frame is in the outbox already
     }
 
-    ws.onopen = function () {
-      for (var i = 0; i < pending.length; i++) ws.send(pending[i]);
-      pending = [];
-      setLive(true);
-    };
+    function dispatchLive(up) {
+      try {
+        document.documentElement.setAttribute("data-live", up ? "1" : "0");
+        document.dispatchEvent(new CustomEvent("live:state", { detail: { up: up } }));
+      } catch (_e) { /* non-DOM host (tests) — ignore */ }
+      if (opts.onLive) opts.onLive(up);
+    }
+    function setLive(up) {
+      dispatchLive(up);
+      // publish the pending-count so a view/pill can show « N en attente ».
+      if (outbox) {
+        try {
+          document.documentElement.setAttribute("data-live-pending", String(outbox.count()));
+          document.dispatchEvent(new CustomEvent("live:pending",
+            { detail: { count: outbox.count() } }));
+        } catch (_e) {}
+      }
+    }
 
-    ws.onclose = function () {
-      setLive(false);
-    };
-    ws.onerror = function () {
-      setLive(false);
-    };
-
-    // Tooling seam: every step the socket takes is re-announced on the
-    // document as a CustomEvent, so an instrument (a paint overlay, a
-    // timeline) can watch WITHOUT patching this file or the app:
-    //   live:mount {root}            first paint landed
-    //   live:patch {root, ops}       these ops were just applied
-    //   live:tap   {t}               the server's tap stamped the last step t
-    // A page with no listeners pays one dispatch per step.
     function announce(name, detail) {
       try { document.dispatchEvent(new CustomEvent(name, { detail: detail })); }
       catch (_e) { /* non-DOM host */ }
     }
 
-    ws.onmessage = function (msg) {
-      const [kind, a, b] = JSON.parse(msg.data);
-      if (kind === "mount") {
-        root.innerHTML = a;
-        announce("live:mount", { root: root });
-      } else if (kind === "patch") {
-        applyPatch(root, a);
-        announce("live:patch", { root: root, ops: a });
-      } else if (kind === "tap") {
-        announce("live:tap", { t: a, basis: b });
-      } else if (kind === "denied") {
-        if (opts.onDenied) opts.onDenied(a);
-      }
-    };
-    Live.ws = ws;
+    // open (or re-open) the socket and wire its handlers.
+    function openSocket() {
+      ws = new WebSocket(opts.url);
+      ws.__send = sendFrame;   // relay() and __navigate use this
+
+      ws.onopen = function () {
+        reconnectMs = 500;                         // reset backoff
+        for (var i = 0; i < pending.length; i++) ws.send(pending[i]);
+        pending = [];
+        if (outbox) outbox.replay(sendFrame);      // resend every un-acked frame
+        setLive(true);
+      };
+      ws.onclose = function () {
+        setLive(false);
+        if (outbox) {                              // auto-reconnect with backoff
+          setTimeout(openSocket, reconnectMs);
+          reconnectMs = Math.min(reconnectMs * 2, 10000);
+        }
+      };
+      ws.onerror = function () { setLive(false); };
+      ws.onmessage = function (msg) {
+        const [kind, a, b] = JSON.parse(msg.data);
+        if (kind === "mount") {
+          root.innerHTML = a;
+          announce("live:mount", { root: root });
+        } else if (kind === "patch") {
+          applyPatch(root, a);
+          announce("live:patch", { root: root, ops: a });
+        } else if (kind === "tap") {
+          announce("live:tap", { t: a, basis: b });
+        } else if (kind === "denied") {
+          if (opts.onDenied) opts.onDenied(a);
+        } else if (kind === "ack") {
+          if (outbox) { outbox.ack(a); setLive(true); }   // the gesture landed — drop it
+        }
+      };
+      Live.ws = ws;
+    }
+    openSocket();
     Live.root = root;
+
+    // relay() delegates to this to mark+persist a durable gesture before send.
+    // A node marked data-live-durable mints an idempotency id, injects it into
+    // the event data as "ev/id", and stores the full frame so a reconnect can
+    // replay it. Returns the (possibly augmented) data object.
+    Live.__durable = function (el, term, data) {
+      if (!outbox || !el || !el.closest || !el.closest("[data-live-durable]")) return data;
+      var op = (Array.isArray(term) && term[0] === "intent") ? String(term[1]) : "ev";
+      var d = Object.assign({}, data || {});
+      d["ev/id"] = mintId(op);
+      outbox.add(d["ev/id"], JSON.stringify(["event", term, d]));
+      setLive(!!(ws && ws.readyState === WebSocket.OPEN));
+      return d;
+    };
 
     // event delegation. A [data-ev-EVENT] node carries its intent as a JSON
     // attribute; on fire we relay that term plus the value of the nearest
@@ -483,9 +558,15 @@
     // server still gets the SAME event and re-routes; this only syncs the URL.
     var nav = navTarget(term);
     if (nav) { try { history.pushState({ live: nav }, "", nav); } catch (_e) {} }
+    // A durable gesture (inside a [data-live-durable] node) is minted an
+    // idempotency id, persisted to the outbox, and augmented into `data` as
+    // "ev/id" BEFORE the send — so a drop-then-reconnect replays it exactly
+    // once. A non-durable gesture (or an app without {outbox:true}) is a no-op
+    // pass-through, unchanged.
+    var d = (Live.__durable ? Live.__durable(el, term, data || {}) : (data || {}));
     // __send guards readyState (buffer while CONNECTING, drop when CLOSED) so a
     // fire before the handshake or after a drop never throws.
-    (ws.__send || ws.send.bind(ws))(JSON.stringify(["event", term, data || {}]));
+    (ws.__send || ws.send.bind(ws))(JSON.stringify(["event", term, d]));
     return true;
   }
 
