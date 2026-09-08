@@ -987,22 +987,21 @@
        (recur (inc i) (conj acc (nth v i)))
        acc))))
 
-; --- for: list comprehension (adapted from jank core.jank) ---
-; Clojure's `for` — the single most-reached-for macro in the language,
-; and the glaring gap in the prelude before this. This is upstream
-; jank's definition, adapted verbatim from the vendored fidelity
-; fixture test/fixtures/jank/slice_44_for.bl (itself byte-for-byte
-; core.jank@3028594, EPL-1.0); the only difference is this beam-lisp
-; header comment. The fixture already proves the expansion compiles and
-; runs under this compiler — shipping the same text into `core` is the
-; language feeding itself, the project principle. It depends on
-; assert-macro-args, gensym, partition, peek/pop, concat (all in the
-; prelude/RT), and the chunk quartet stubs defined in the doseq-chunk
-; section above; beam-lisp seqs are unchunked (chunked-seq? is false)
-; so `for` stays uniformly lazy and the chunked branch never runs.
-; Macro-expansion time uses partition/peek/pop; the emitted code calls
-; the chunk stubs, when-first, when-let, lazy-seq, seq, nth, int, and
-; unchecked-inc — all resolved from `core`.
+; --- for: list comprehension ------------------------------------------------
+; Clojure's `for`, re-derived for the BEAM rather than ported from jank. The
+; ported version carried Clojure's chunked-seq fast path — dead here (every
+; beam-lisp seq is unchunked, `chunked-seq?` is constant false) — and so
+; spliced the body expression into TWO branches. With the compiler's own
+; scaffolding that made a `for` emit its body ×24 (see compiler `self-apply`),
+; and nested `for`s multiplied: three deep was ×13 824, four never compiled.
+;
+; The invariant this definition keeps, and system.linear checks over every
+; macro in core: THE BODY EXPRESSION APPEARS EXACTLY ONCE IN THE EXPANSION.
+; Each binding group is one lazy iterator over its seq; modifiers nest
+; inward (:let binds, :when skips by re-entering the loop, :while ends the
+; group); an inner group's iterator is concatenated lazily onto the outer's
+; continuation. Rightmost-fastest order, laziness, and destructuring binding
+; forms are exactly Clojure's.
 (defmacro for
   "List comprehension. Takes a vector of one or more
    binding-form/collection-expr pairs, each followed by zero or more
@@ -1017,77 +1016,43 @@
   (assert-macro-args
     (vector? seq-exprs) "a vector for its binding"
     (even? (count seq-exprs)) "an even number of forms in binding vector")
-  (let [to-groups (fn [seq-exprs]
+  (let [; [[bind expr [mod-k mod-v] …] …] — one group per binding pair
+        to-groups (fn [seq-exprs]
                     (reduce (fn [groups [k v]]
                               (if (keyword? k)
                                 (conj (pop groups) (conj (peek groups) [k v]))
                                 (conj groups [k v])))
                             [] (partition 2 seq-exprs)))
         err (fn [& msg] (throw (apply str msg)))
-        emit-bind (fn emit-bind [[[bind expr & mod-pairs]
-                                  & [[_ next-expr] :as next-groups]]]
-                    (let [giter (gensym "iter__")
-                          gxs (gensym "s__")
-                          do-mod (fn do-mod [[[k v :as pair] & etc]]
-                                   (cond
-                                     (= k :let) `(let ~v ~(do-mod etc))
-                                     (= k :while) `(when ~v ~(do-mod etc))
-                                     (= k :when) `(if ~v
-                                                    ~(do-mod etc)
-                                                    (recur (rest ~gxs)))
-                                     (keyword? k) (err "Invalid 'for' keyword " k)
-                                     next-groups
-                                     `(let [iterys# ~(emit-bind next-groups)
-                                            fs# (seq (iterys# ~next-expr))]
-                                        (if fs#
-                                          (concat fs# (~giter (rest ~gxs)))
-                                          (recur (rest ~gxs))))
-                                     :else (do
-                                             `(cons ~body-expr
-                                                    (~giter (rest ~gxs))))))]
-                      (if next-groups
-                        ; not the inner-most loop
-                        `(fn ~giter [~gxs]
-                           (lazy-seq
-                             (loop [~gxs ~gxs]
-                               (when-first [~bind ~gxs]
-                                 ~(do-mod mod-pairs)))))
-                        ; inner-most loop
-                        (let [gi (gensym "i__")
-                              gb (gensym "b__")
-                              do-cmod (fn do-cmod [[[k v :as pair] & etc]]
-                                        (cond
-                                          (= k :let) `(let ~v ~(do-cmod etc))
-                                          (= k :while) `(when ~v ~(do-cmod etc))
-                                          (= k :when) `(if ~v
-                                                         ~(do-cmod etc)
-                                                         (recur
-                                                           (unchecked-inc ~gi)))
-                                          (keyword? k)
-                                          (err "Invalid 'for' keyword " k)
-                                          :else
-                                          `(do (chunk-append ~gb ~body-expr)
-                                               (recur (unchecked-inc ~gi)))))]
-                          `(fn ~giter [~gxs]
-                             (lazy-seq
-                               (loop [~gxs ~gxs]
-                                 (when-let [~gxs (seq ~gxs)]
-                                   (if (chunked-seq? ~gxs)
-                                     (let [c# (chunk-first ~gxs)
-                                           size# (int (count c#))
-                                           ~gb (chunk-buffer size#)]
-                                       (if (loop [~gi (int 0)]
-                                             (if (< ~gi size#)
-                                               (let [~bind (nth c# ~gi)]
-                                                 ~(do-cmod mod-pairs))
-                                               true))
-                                         (chunk-cons
-                                           (chunk ~gb)
-                                           (~giter (chunk-rest ~gxs)))
-                                         (chunk-cons (chunk ~gb) nil)))
-                                     (let [~bind (first ~gxs)]
-                                       ~(do-mod mod-pairs)))))))))))]
-    `(let [iter# ~(emit-bind (to-groups seq-exprs))]
+        ; one group → the iterator fn over its seq. `emit-inner` is the code
+        ; that yields for ONE element (given the continuation over the rest);
+        ; the outermost group's inner is `(cons body (rest…))`, an inner
+        ; group's is `(concat (inner-iter its-seq) (rest…))`.
+        emit-group (fn emit-group [[[bind expr & mod-pairs] & next-groups]]
+                     (let [giter (gensym "iter__")
+                           gxs (gensym "s__")
+                           more `(~giter (rest ~gxs))
+                           ; the yield for one element, once
+                           yield (if next-groups
+                                   (let [[_ next-expr] (first next-groups)]
+                                     `(let [inner# ~(emit-group next-groups)
+                                            ys# (seq (inner# ~next-expr))]
+                                        (if ys# (concat ys# ~more) (recur (rest ~gxs)))))
+                                   `(cons ~body-expr ~more))
+                           ; modifiers wrap the yield, innermost last
+                           do-mod (fn do-mod [[[k v] & etc]]
+                                    (cond
+                                      (nil? k) yield
+                                      (= k :let) `(let ~v ~(do-mod etc))
+                                      (= k :while) `(when ~v ~(do-mod etc))
+                                      (= k :when) `(if ~v ~(do-mod etc) (recur (rest ~gxs)))
+                                      :else (err "Invalid 'for' keyword " k)))]
+                       `(fn ~giter [~gxs]
+                          (lazy-seq
+                            (loop [~gxs ~gxs]
+                              (when-first [~bind ~gxs]
+                                ~(do-mod mod-pairs)))))))]
+    `(let [iter# ~(emit-group (to-groups seq-exprs))]
        (iter# ~(second seq-exprs)))))
 
 ; --- wave 27: the prims Specter and faithful programs reach for ---
