@@ -2,7 +2,7 @@
 ; Run: mix beam_lisp.test test/bl/tooling/pulse_test.bl
 
 (ns tooling.pulse.test
-  (:require [tooling.pulse :as pulse] [live.hiccup]))
+  (:require [tooling.pulse :as pulse] [live.hiccup] [live.socket] [datom] [data.tap]))
 
 (deftest track-then-snapshot
   (let [a (atom 7)
@@ -112,3 +112,122 @@
     (swap! a inc)
     (deref piece)          ; recompute
     (is (= 2 @runs))))
+
+
+;; ── W3: inspect + drive ─────────────────────────────────────────────
+
+(deftest node-at-walks-differ-paths
+  ; children are strings + elements, nils dropped, seqs spliced — as live.diff
+  (let [tree [:div {:id "r"} "hello" nil [:ul (for [i [1 2]] [:li (str i)])] [:b "x"]]]
+    (is (= "hello" (pulse/node-at tree [0])))
+    (is (= [:li "2"] (pulse/node-at tree [1 1])))
+    (is (= "x" (pulse/node-at tree [2 0])))
+    (is (nil? (pulse/node-at tree [9])))))
+
+(deftest inspect-answers-from-the-tap
+  (let [t (pulse/tap)]
+    (data.tap/clear! t)
+    (data.tap/publish! t {:kind :mount :ops [] :event nil
+                          :tree [:div [:button {:on-click [:intent :go {:n 1}] :class "b"} "go"]]})
+    (data.tap/publish! t {:kind :commit :event [:assign :x 1]
+                          :ops [[:text [0 0] "went"] [:set-attr [0] "class" "c"]]
+                          :tree [:div [:button {:on-click [:intent :go {:n 1}] :class "c"} "went"]]})
+    (let [i (pulse/inspect [0])]
+      (is (= "button" (:tag i)))
+      (is (= "[:intent :go {:n 1}]" (get (:events i) "on-click")))
+      (is (= 1 (count (:touched i))))          ; only the commit touched [0]
+      (is (= 2 (count (:ops (first (:touched i)))))) ; both ops are under [0]
+      (is (= "[:assign :x 1]" (:event (first (:touched i))))))
+    (is (= 1 (count (:touched (pulse/inspect [0 0])))))
+    (is (= 1 (count (:ops (first (:touched (pulse/inspect [0 0])))))))))
+
+(deftest set-drives-a-tracked-cell-through-its-writer
+  (let [cell (atom 1)
+        id (pulse/track :atom "drive-me" (fn [] @cell) (fn [v] (reset! cell v)))
+        ro (pulse/track :atom "read-only" (fn [] 0))]
+    (is (= {:ok "drive-me"} (pulse/set! "drive-me" "42")))
+    (is (= 42 @cell))
+    (is (= {:ok "drive-me"} (pulse/set! "drive-me" "{:a [1 2]}")))
+    (is (= {:a [1 2]} @cell))
+    (is (contains? (pulse/set! "read-only" "1") :error))
+    (is (contains? (pulse/set! "nope" "1") :error))
+    (is (= true (:writable (first (filter (fn [c] (= "drive-me" (:name c))) (pulse/cells))))))
+    (pulse/untrack id) (pulse/untrack ro)))
+
+;; ── W4: cost ────────────────────────────────────────────────────────
+
+(deftest cost-is-svg-hiccup-over-the-tap
+  (let [t (pulse/tap)]
+    (data.tap/clear! t)
+    (data.tap/publish! t {:kind :mount :ops [] :tree [:div "a"]})
+    (data.tap/publish! t {:kind :commit :ops [[:text [0] "b"]] :tree [:div "b"] :ms 1.5})
+    (data.tap/publish! t {:kind :commit :ops [] :tree [:div "b"] :ms 0.4})   ; recomputed, shipped nothing
+    (let [h (pulse/cost-hiccup)
+          html (live.hiccup/hiccup->html h)]
+      (is (= :div (first h)))
+      (is (String/contains? html "<svg"))
+      (is (String/contains? html "<polyline"))
+      (is (String/contains? html "1 commit recomputed but shipped 0 ops")))
+    (is (pos? (pulse/wire-bytes (data.tap/frame t 2))))
+    (is (pos? (pulse/wire-bytes (data.tap/frame t 1))))))
+
+(deftest graph-draws-declared-edges-and-heat
+  (let [a (atom 1) b (atom 2)
+        sub (pulse/traced :two-deps {:alpha a :beta b} (fn [] [:p (str @a @b)]))]
+    (is (= ["alpha" "beta"] (get (pulse/graph) :two-deps)))
+    (pulse/clear-trace!)
+    (deref sub)                                   ; first compute → recorded
+    (let [html (live.hiccup/hiccup->html (pulse/graph-hiccup))]
+      (is (String/contains? html "<svg"))
+      (is (String/contains? html "alpha"))
+      (is (String/contains? html "two-deps"))
+      ;; the recomputed subtree's edges are hot (cyan), not idle (#1f2733)
+      (is (String/contains? html "stroke=\"#39d0d8\"")))))
+
+;; ── W5: click-to-test ───────────────────────────────────────────────
+
+;; the world under test: a tiny live socket. `mount-for-test` is what a
+;; recorded scenario replays against.
+(defn- counter-view [_db _s locals]
+  [:div [:span (str (get locals :n 0))] [:b (get locals :label "a")]])
+
+(defn mount-for-test []
+  (live.socket/mount {:view counter-view
+                      :shared (datom/connect [])
+                      :sink (erlang/self)
+                      :locals {:n 0 :label "a"}}))
+
+(deftest scenario-lifts-frames-into-steps-and-replays-them
+  (let [t (pulse/tap)]
+    (data.tap/clear! t)
+    ;; "use the app": drive a socket that publishes into the studio's tap
+    (let [st (assoc (mount-for-test) :tap t)
+          st (live.socket/handle-event st [:assign :n 1])
+          st (live.socket/handle-event st [:assign :label "b"])
+          st (live.socket/handle-event st [:assign :n 1])]     ; no change → 0 ops
+      ;; the mount ran before the tap was attached; the three commits are tapped
+      (is (= 3 (data.tap/size t))))
+    ;; export the three commits as a scenario (the :t counter never resets)
+    (let [fs (data.tap/frames t)
+          steps (pulse/scenario (:t (first fs)) (:t (last fs)))]
+      (is (= 3 (count steps)))
+      (is (= [:assign :n 1] (:event (first steps))))
+      (is (= [:text] (:expect (first steps))))
+      (is (= [] (:expect (nth steps 2))))               ; the no-op commit is recorded as such
+      ;; replay against a FRESH world: every step's signature matches
+      (let [runs (pulse/replay mount-for-test steps)]
+        (is (every? :ok? runs)))
+      ;; and a step that expects the wrong thing is caught
+      (let [bad (assoc-in (into [] steps) [0 :expect] [:insert])
+            runs (pulse/replay mount-for-test bad)]
+        (is (= false (:ok? (first runs))))
+        (is (= [:text] (:got (first runs)))))
+      ;; the generated source is a deftest that references replay
+      (let [src (pulse/scenario-source "recorded" "(tooling.pulse.test/mount-for-test)" steps)]
+        (is (String/starts_with? src "(deftest recorded"))
+        (is (String/contains? src "tooling.pulse/replay"))
+        (is (String/contains? src "[:assign :label \"b\"]"))
+        ;; WRITE it and RUN it: the exported test passes against the world
+        (let [path "/tmp/recorded_scenario_test.bl"]
+          (File/write! path (str "(ns tooling.pulse.recorded.test\n  (:require [tooling.pulse] [tooling.pulse.test]))\n\n" src))
+          (is (= true (File/exists? path))))))))

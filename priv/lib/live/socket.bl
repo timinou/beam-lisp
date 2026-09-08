@@ -8,7 +8,10 @@
 ;   :view     a pure fn  (db locals) → hiccup        — the projection
 ;   :shared   a datom conn — the durable, shared world
 ;   :session  a datom conn — this socket's OWN in-memory state (ETS)
-;   :locals   a map — ephemeral per-socket values (draft text, ui toggles)
+;   :locals   a map — ephemeral per-socket values (draft text, ui toggles);
+;             after an intent it also carries :live/outcome
+;             {:op :status :committed|:noop|:denied :seq (:why)} — the
+;             socket's verdict, so a view renders feedback from the truth
 ;   :tree     the last hiccup value it rendered (to diff against)
 ;   :sink     where patch messages go (a pid; in prod the LiveView channel)
 ;   :auth     {:root pub :token biscuit :principal p} or nil
@@ -32,6 +35,8 @@
             [live.diff :as diff]
             [datom]
             [datom.store-ets]
+            [data.tap :as tap]
+            [datom.db]
             [auth]))
 
 ;; ── the event vocabulary (closed, refused by name) ──────────────────
@@ -159,6 +164,28 @@
   (erlang/send (:sink state) msg)
   state)
 
+;; ── the tap: publish what this socket just did ──────────────────────
+;;
+;; When the socket was opened with `:tap` (a data.tap), every mount and every
+;; commit publishes one frame: what kind of step, the ops shipped, the tree
+;; after, how long the render+diff took, the shared basis, and the event that
+;; caused it (nil for an observed commit). The socket never knows who reads
+;; the tap — a dashboard, a timeline, a test recorder. Without :tap this is a
+;; no-op, so a production socket pays nothing.
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+
+(defn- basis-of [state]
+  (try (datom.db/basis-t (datom/db (:shared state))) (catch _ nil)))
+
+(defn- tap! [state frame]
+  (when-let [t (:tap state)]
+    (let [f (tap/publish! t (assoc frame :basis (basis-of state)
+                                         :event (:last-event state)))]
+      ;; tell the browser which :t this patch/mount is, so a client-side tool
+      ;; (paint, timeline) can correlate what it saw with the tap's history
+      (push! state [:tap (:t f) (:basis f)])))
+  (dissoc state :last-event))
+
 ;; ── mount ───────────────────────────────────────────────────────────
 
 (defn mount
@@ -167,9 +194,12 @@
    socket state map."
   [opts]
   (let [state (merge {:locals {}} opts)
-        tree (render state)]
-    (push! (assoc state :tree tree)
-           [:mount (hiccup/hiccup->html tree)])))
+        t0 (now-us)
+        tree (render state)
+        state2 (push! (assoc state :tree tree)
+                      [:mount (hiccup/hiccup->html tree)])]
+    (tap! state2 {:kind :mount :ops [] :tree tree
+                  :ms (/ (- (now-us) t0) 1000.0)})))
 
 ;; ── a commit landed: re-project this viewer, ship minimal patches ───
 
@@ -177,11 +207,14 @@
   "The shared or session world moved. Re-render, diff against the last
    tree, push the patch ops (only if non-empty), remember the new tree."
   [state]
-  (let [next (render state)
-        ops (diff/diff (:tree state) next)]
-    (if (seq ops)
-      (push! (assoc state :tree next) [:patch ops])
-      (assoc state :tree next))))
+  (let [t0 (now-us)
+        next (render state)
+        ops (diff/diff (:tree state) next)
+        ms (/ (- (now-us) t0) 1000.0)
+        state2 (if (seq ops)
+                 (push! (assoc state :tree next) [:patch ops])
+                 (assoc state :tree next))]
+    (tap! state2 {:kind :commit :ops (into [] ops) :tree next :ms ms})))
 
 ;; ── an event fired ──────────────────────────────────────────────────
 
@@ -189,8 +222,9 @@
 ;;   :auth nil                       -> allow (no gate; dev / trusted)
 ;;   :auth {:fn (fn [op payload principal] -> {:verdict ...})}
 ;;                                   -> call it (tests, custom policy engines)
-;;   :auth {:root pub :token biscuit ...}
-;;                                   -> the real offline biscuit decision
+;;   :auth {:root pub :token biscuit :policies […] :checks […] :facts […]}
+;;                                   -> the real offline biscuit decision; the
+;;                                      context carries operation + time + :facts
 ;; Every path returns a decision map {:verdict :allow|:deny :why?}, so
 ;; perform-intent treats them uniformly. A denied decision NEVER writes.
 (defn- authorize-intent
@@ -200,9 +234,14 @@
     (some? (:fn auth-info))
       ((:fn auth-info) op payload (:principal auth-info))
     :else
+      ;; the request context: the operation, the CLOCK (so a TTL check on the
+      ;; token bites at decision time, not at connect time), and whatever
+      ;; facts the app adds (:facts — a firm, a device, a resource)
       (auth/authorize (:root auth-info) (:token auth-info)
                       (auth/context
-                        {:facts [["operation" (name op)]]
+                        {:facts (into [["operation" (name op)]
+                                       ["time" {:date (erlang/system_time :second)}]]
+                                      (or (:facts auth-info) []))
                          :checks (or (:checks auth-info) [])
                          :policies (or (:policies auth-info) [(auth/allow [])])}))))
 
@@ -235,7 +274,31 @@
             ;; chose not to write); a tx is committed to the SHARED world,
             ;; whose commit lands on on-commit and re-renders everyone.
             (when (some? tx) (datom/transact! (:shared state) tx))
-            {:ok state}))))))
+            {:ok state :committed (some? tx)}))))))
+
+;; ── the outcome of the last intent, as a local the view can read ────
+;;
+;; A view must never tell the person "saved" before the socket knows. The
+;; socket is the only party that knows whether an intent was refused, wrote,
+;; or validated-and-declined (nil tx) — so it records that verdict in locals
+;; under :live/outcome and the view renders feedback FROM it (a toast keyed
+;; on :seq). The outcome lives until the next event from this viewer; a
+;; screen that ignores it loses nothing.
+(defn- with-outcome [state op status why]
+  ;; :seq is monotone per socket (kept outside locals so clearing the outcome
+  ;; never resets it) — a view keys its toast on it, so two identical
+  ;; outcomes in a row still read as two events.
+  (let [seq-n (inc (get state :outcome-seq 0))]
+    (-> state
+        (assoc :outcome-seq seq-n)
+        (assoc-in [:locals :live/outcome]
+                  (merge {:op op :status status :seq seq-n}
+                         (if why {:why why} {}))))))
+
+(defn- clear-outcome [state]
+  (if (get-in state [:locals :live/outcome])
+    (update state :locals (fn [l] (dissoc l :live/outcome)))
+    state))
 
 (defn handle-event
   "Apply one fired event. Returns the new socket state.
@@ -249,19 +312,28 @@
    values for [:from …] sources)."
   ([state ev] (handle-event state ev {}))
   ([state ev event-data]
+   ;; a NEW gesture from this viewer: the previous intent's outcome is stale
+   (handle-event* (clear-outcome (if (:tap state) (assoc state :last-event ev) state))
+                  ev event-data)))
+
+(defn- handle-event* [state ev event-data]
    (cond
-     ;; a vector of events: fold them in order. A DENIED intent stops the
-     ;; fold — whatever follows it (a "saved" flash, a navigate away) was
-     ;; conditional on the write, and running it would tell the person
-     ;; something happened that did not. Put the intent FIRST in the vector
-     ;; when the rest should only run on success.
+     ;; a vector of events: fold them in order. An intent that did NOT write
+     ;; — denied, or a no-op (the performer validated and declined) — stops
+     ;; the fold: whatever follows it (a "saved" flash, closing the form, a
+     ;; navigate away) was conditional on the write, and running it would
+     ;; tell the person something happened that did not. Put the intent
+     ;; FIRST in the vector when the rest should only run on a commit.
      (and (vector? ev) (> (count ev) 0) (every? event-term? ev))
        (loop [s state es (seq ev)]
          (if (empty? es)
            s
            (let [e (first es)
-                 s2 (handle-event s e event-data)]
-             (if (and (= :intent (first e)) (:denied-last s2))
+                 ;; inner steps keep the fold's outcome (only a NEW gesture clears it)
+                 s2 (handle-event* (if (:tap s) (assoc s :last-event e) s) e event-data)]
+             (if (and (= :intent (first e))
+                      (or (:denied-last s2)
+                          (= :noop (get-in s2 [:locals :live/outcome :status]))))
                (dissoc s2 :denied-last)
                (recur s2 (rest es))))))
 
@@ -287,12 +359,19 @@
              payload (merge (if (map? event-data) event-data {}) declared)
              result (perform-intent state op payload)]
          (if (contains? result :denied)
-           ;; NO render, NO write; mark the state so a surrounding vector
-           ;; of events stops here (see the fold above)
-           (assoc (push! state [:denied (:denied result)]) :denied-last true)
-           (:ok result)))                              ; commit path renders
+           ;; NO write; record the refusal so the view can say so, re-render
+           ;; THIS viewer only, and mark the state so a surrounding vector of
+           ;; events stops here (see the fold above)
+           (-> (with-outcome state op :denied (:denied result))
+               (push! [:denied (:denied result)])
+               on-commit
+               (assoc :denied-last true))
+           ;; committed → the commit path renders everyone (with the outcome
+           ;; already in locals); a no-op wrote nothing, so render here
+           (let [st (with-outcome (:ok result) op (if (:committed result) :committed :noop) nil)]
+             (if (:committed result) st (on-commit st)))))
 
-     :else (throw (str "live: unknown event " (pr-str ev))))))
+     :else (throw (str "live: unknown event " (pr-str ev)))))
 
 ;; ── session conn: the per-socket in-memory world ────────────────────
 
