@@ -205,9 +205,25 @@ fn compile(k: &Kernel) -> (JITModule, usize) {
                 let x = bcx.use_var(var(a.0));
                 // strength reduction the way LLVM/rustc do it: for u16-range x,
                 // x/255 == (x * 0x8081) >> 23. cranelift will NOT do this itself.
-                let v = if c == 255 {
-                    let m = bcx.ins().imul_imm(x, 0x8081);
-                    bcx.ins().ushr_imm(m, 23)
+                // Unsigned divide by a CONSTANT, without a hardware divide.
+                // Values here are pixel-range (< 2^32), so a 64-bit multiply by
+                // a precomputed magic number + shift is exact and ~10x faster
+                // than `udiv`. This is what LLVM/GCC do; cranelift does not.
+                let v = if c > 0 && (c & (c - 1)) == 0 {
+                    // power of two → shift right by log2(c)
+                    bcx.ins().ushr_imm(x, c.trailing_zeros() as i64)
+                } else if c > 0 {
+                    // magic: for 0 <= x < 2^32 and divisor d, floor(x/d) =
+                    // (x * m) >> (32 + s) with m,s from the round-up method.
+                    // We compute in u64 (x < 2^32 so x*m < 2^64).
+                    let d = c as u64;
+                    let mut s = 0u32;
+                    while (1u64 << s) < d { s += 1; }            // s = ceil(log2(d))
+                    // m = ceil(2^(32+s) / d), fits in u64 for d in pixel range
+                    let m = (((1u128 << (32 + s)) + (d as u128) - 1) / (d as u128)) as u64;
+                    let mv = bcx.ins().iconst(I64, m as i64);
+                    let prod = bcx.ins().imul(x, mv);
+                    bcx.ins().ushr_imm(prod, (32 + s) as i64)
                 } else {
                     bcx.ins().udiv_imm(x, c)
                 };
