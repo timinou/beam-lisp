@@ -383,6 +383,15 @@
     root.addEventListener("input", function (e) {
       fireFrom(e.target, "input", ws, { value: e.target.value });
     });
+    // a <select> / checkbox / radio commits on `change`, not `input`: a
+    // form-for select carries `on-change` and must reach the server too
+    root.addEventListener("change", function (e) {
+      var t = e.target;
+      var data = (t.type === "checkbox" || t.type === "radio")
+        ? { value: t.value, checked: t.checked }
+        : { value: t.value };
+      fireFrom(t, "change", ws, data);
+    });
     // Enter in an input fires its `on-keydown.enter` intent (if any), and
     // clears the field — the chat-composer gesture. The `.enter` modifier is
     // part of the attribute name (data-ev-keydown.enter), so match by prefix.
