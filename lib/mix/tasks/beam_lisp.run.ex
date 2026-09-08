@@ -6,6 +6,15 @@ defmodule Mix.Tasks.BeamLisp.Run do
   `BEAM_LISP_PATH` (colon-separated) does the same from the environment. The
   entry file's own directory is always searched, so a self-contained program
   needs neither.
+
+  `--code-path DIR` puts a directory of AOT beams (`mix beam_lisp.aot --out DIR`)
+  on the VM's code path (repeatable); `BEAM_LISP_CODE_PATH` (colon-separated)
+  does the same from the environment. This is NOT `ERL_AFLAGS="-pa DIR"`: Mix
+  prunes the code path down to the project's deps once it has loaded the
+  project (`prune_code_paths`, default on since 1.15), so a `-pa` given to the
+  VM is gone by the time the program runs — silently, and the loader falls
+  back to compiling every namespace from source. The flag adds the directory
+  AFTER the prune, where it sticks.
   """
   @shortdoc "Run a beam-lisp file"
 
@@ -29,13 +38,28 @@ defmodule Mix.Tasks.BeamLisp.Run do
   def run(argv) do
     Mix.Task.run("app.start")
 
-    {opts, args} = OptionParser.parse!(argv, strict: [path: :keep], aliases: [p: :path])
+    {opts, args} =
+      OptionParser.parse!(argv, strict: [path: :keep, code_path: :keep], aliases: [p: :path])
+
     for {:path, dir} <- opts, do: BeamLisp.Env.add_search_path(dir)
+    for dir <- code_paths(opts), do: Code.prepend_path(Path.expand(dir))
 
     case args do
       [path] -> run_file(path)
       _ -> Mix.raise("usage: mix beam_lisp.run [--path DIR] FILE.bl")
     end
+  end
+
+  @doc false
+  def code_paths(opts) do
+    env =
+      case System.get_env("BEAM_LISP_CODE_PATH") do
+        nil -> []
+        "" -> []
+        s -> String.split(s, ":", trim: true)
+      end
+
+    for({:code_path, dir} <- opts, do: dir) ++ env
   end
 
   defp run_file(path) do

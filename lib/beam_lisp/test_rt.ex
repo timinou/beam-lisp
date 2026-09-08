@@ -186,6 +186,7 @@ defmodule BeamLisp.TestRT do
     Env.with_ns(to_string(ns), fn ->
       Enum.each(registered_tests(ns), fn {name, f} ->
         begin_test(ns, name)
+        t0 = System.monotonic_time(:millisecond)
 
         try do
           RT.invoke(f, [])
@@ -195,6 +196,11 @@ defmodule BeamLisp.TestRT do
           kind, value -> record(ns, :error, name, nil, name, {kind, value})
         after
           end_test(ns)
+          # `BL_TEST_TIMES=1` prints one line per test with its wall time — the
+          # question "which test is the minute?" answered without editing the
+          # suite. Off by default: the summary line is the contract.
+          if System.get_env("BL_TEST_TIMES") in ["1", "true"],
+            do: IO.puts("  #{name}  #{System.monotonic_time(:millisecond) - t0}ms")
         end
       end)
     end)

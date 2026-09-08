@@ -1225,6 +1225,21 @@ defmodule BeamLisp.Env do
     end
   end
 
+  @doc "Remove one configured search path from the current env (no-op if absent)."
+  def remove_search_path(dir) do
+    dir = Path.expand(dir)
+
+    case env_id() do
+      :global ->
+        Agent.update(__MODULE__, fn s ->
+          Map.put(s, :search_paths, List.delete(Map.get(s, :search_paths, []), dir))
+        end)
+
+      env ->
+        update_env_state(env, &%{&1 | search_paths: List.delete(&1.search_paths, dir)})
+    end
+  end
+
   @doc "Drop the current env's configured search paths (test isolation)."
   def clear_search_paths do
     case env_id() do

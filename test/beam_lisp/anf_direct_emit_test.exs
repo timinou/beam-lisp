@@ -18,21 +18,9 @@ defmodule BeamLisp.AnfDirectEmitTest do
     in_compiler_scope(fn -> compare_files(@files) end)
   end
 
-  test "compiler implementation matches its frozen snapshot without changing earlier corpus state" do
-    in_compiler_scope(fn ->
-      # Seed the historical prefix for this additional dataset.
-      # Its private collection names must not prelink later reader fixtures.
-      for path <- Enum.take(@files, 3) do
-        %{entries: entries} = snapshot_path(path) |> File.read!() |> :erlang.binary_to_term()
-        env = BeamLisp.Compiler.new_env("anfcensus")
-        Enum.each(entries, fn {form, _} ->
-          BeamLisp.Compiler.reset_fresh!()
-          BeamLisp.Compiler.compile(form, env)
-        end)
-      end
-      compare_files(["priv/boot/compiler2.bl"])
-    end)
-  end
+  # The implementation's own oracle used to be a second corpus over
+  # `priv/boot/compiler2.bl`; the cutover (bc0e656) renamed that file to
+  # `priv/boot/compiler.bl`, which is in @files above — one corpus, one test.
 
   defp in_compiler_scope(fun) do
     child = BeamLisp.Env.fork()

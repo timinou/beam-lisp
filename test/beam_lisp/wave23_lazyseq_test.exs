@@ -24,18 +24,30 @@ defmodule BeamLisp.Wave23LazySeqTest do
     end
   end
 
-  defp assert_stats_converge(predicate, remaining \\ 100_000)
-  defp assert_stats_converge(_predicate, 0), do: flunk("native memo stats did not converge")
+  # Off-heap cell destruction is deferred work the VM runs in batches (20k
+  # discarded cells drain as ~14k → 8k → 2k → 0 over ~150ms on an idle VM).
+  # Bound the wait by WALL CLOCK, not by a spin count: 100k `yield`s was
+  # ~400ms idle and less under a full suite's scheduler load — a timing flake
+  # dressed as a leak.
+  @converge_ms 5_000
 
-  defp assert_stats_converge(predicate, remaining) do
+  defp assert_stats_converge(predicate),
+    do: assert_stats_converge(predicate, System.monotonic_time(:millisecond) + @converge_ms)
+
+  defp assert_stats_converge(predicate, deadline) do
     :erlang.garbage_collect()
     stats = LazyMemo.stats()
 
-    if predicate.(stats) do
-      :ok
-    else
-      :erlang.yield()
-      assert_stats_converge(predicate, remaining - 1)
+    cond do
+      predicate.(stats) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("native memo stats did not converge within #{@converge_ms}ms: #{inspect(stats)}")
+
+      true ->
+        Process.sleep(1)
+        assert_stats_converge(predicate, deadline)
     end
   end
 

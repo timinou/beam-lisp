@@ -67,7 +67,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
       {:noop, []}
     else
       result =
-        in_runtime(fn ->
+        in_runtime(source_dirs, fn ->
           build_call("run", [
             %{
               sources: sources,
@@ -105,7 +105,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   def clean(out) when is_binary(out), do: clean(out, Path.join(out, @manifest))
 
   defp clean(out, manifest) do
-    if File.exists?(manifest), do: in_runtime(fn -> build_call("clean", [out, manifest]) end)
+    if File.exists?(manifest), do: in_runtime([], fn -> build_call("clean", [out, manifest]) end)
     :ok
   end
 
@@ -122,7 +122,19 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   # Whatever this task started, it stops: a Mix compile VM goes on to start
   # the application, which wants to own its own `Env`; a test's `on_exit`
   # must not leave a linked `Env` behind either.
-  defp in_runtime(fun) do
+  #
+  # `source_dirs` — the roots being built — are registered as search paths for
+  # the build's duration. Every emitted beam is stamped with its namespace's
+  # closure key, and that key is folded over the require-closure RESOLVED BY
+  # NAME: `blueprint.plan` requiring `blueprint.schema` must find the sibling
+  # file. The emitter's own load path only holds the compiling file's
+  # directory, so a `--source-dir` outside cwd (an application built from the
+  # language's checkout) resolved its own siblings as "unresolvable" (`x:?`)
+  # and stamped a key the runtime gate — which does see them — never matched.
+  # Every beam then looked stale, and every load silently fell back to source:
+  # the AOT path was a no-op for any app not living under cwd. Root cause of
+  # `BEAM_LISP_PATH=<dir>` being needed for the build to be worth anything.
+  defp in_runtime(source_dirs, fun) do
     env_was_running? = Process.whereis(BeamLisp.Env) != nil
     server_was_running? = Process.whereis(BeamLisp.Loader.Server) != nil
 
@@ -141,9 +153,16 @@ defmodule Mix.Tasks.Compile.BeamLisp do
     BeamLisp.Bootstrap.install!(compiler_path)
     BeamLisp.AOT.boot()
 
+    before = BeamLisp.Env.search_paths()
+    added = source_dirs |> Enum.map(&Path.expand/1) |> Enum.reject(&(&1 in before))
+    Enum.each(added, &BeamLisp.Env.add_search_path/1)
+
     try do
       fun.()
     after
+      # Leave the env as found: a Mix compile VM goes on to start the app,
+      # whose own configuration must not inherit a build-time root.
+      Enum.each(added, &BeamLisp.Env.remove_search_path/1)
       if not env_was_running?, do: try_stop(BeamLisp.Env)
       if not server_was_running?, do: try_stop(BeamLisp.Loader.Server)
     end

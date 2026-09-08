@@ -50,7 +50,88 @@ defmodule BeamLisp.BuildPlan do
   def key_for(ns, resolve, seed \\ nil) when is_binary(ns) and is_function(resolve, 1) do
     BeamLisp.Loader.ensure_loaded(@ns)
     seed_arg = if seed, do: [elem(seed, 0), elem(seed, 1)], else: nil
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, "key-for"), [ns, resolve, seed_arg])
+    key_for = BeamLisp.Env.fetch!(@ns, "key-for")
+
+    # The committed bootstrap seed may carry the previous generation of
+    # `build-plan`, whose `key-for` is 3-ary (no `node-of`). The build that
+    # re-emits the boot tier runs THROUGH that seed, so this call must work
+    # against both generations: memoized when the language offers it, plain
+    # otherwise. Once the seed is re-blessed the fallback is never taken.
+    if BeamLisp.RT.invocable?(key_for, 4),
+      do: BeamLisp.RT.invoke(key_for, [ns, resolve, seed_arg, &memo_node/2]),
+      else: BeamLisp.RT.invoke(key_for, [ns, resolve, seed_arg])
+  end
+
+  # ── the node memo ──────────────────────────────────────────────────────────
+  #
+  # A plan node is a PURE function of a source's bytes: forms, header, interface
+  # hash, interface names, references. The runtime drift gate asks `key_for`
+  # once per namespace it vets, and each call walks that namespace's whole
+  # require-closure — so the same ninety files were read and parsed ninety
+  # times over. Measured on a ninety-namespace application: 71.7s of a 72.5s
+  # load was this gate; the beams' own `__bl_init__` replay was under a
+  # second. Keying the memo on the CONTENT HASH (never the path, never mtime)
+  # keeps the gate's guarantee intact: an edited file has new bytes, a new
+  # key, and is parsed afresh; the closure key is still folded from live bytes
+  # on every call. Only the parse is shared.
+  #
+  # VM-wide, owned by the pinned `Loader.Server` (the same rule as the
+  # native-declarations and lazy-seq tables): created lazily by the first
+  # caller, it must outlive that caller — a parallel-build worker exits after
+  # its one file.
+  @memo :beam_lisp_build_plan_nodes
+
+  @doc """
+  `node-from` memoized by content hash. `ns` is what the node records as
+  its `:path` (the gate uses the namespace name); a memo hit for the same
+  bytes under another name is re-labelled, not re-parsed.
+  """
+  def memo_node(ns, content) when is_binary(ns) and is_binary(content) do
+    hash = :crypto.hash(:sha256, content)
+
+    node =
+      case :ets.lookup(memo_table(), hash) do
+        [{^hash, node}] ->
+          node
+
+        [] ->
+          node =
+            BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, "node-from"), [ns, content])
+
+          :ets.insert(memo_table(), {hash, node})
+          node
+      end
+
+    Map.put(node, :path, ns)
+  end
+
+  @doc "Forget every memoized node (tests; a toolchain change rotates the parse)."
+  def clear_memo do
+    case :ets.whereis(@memo) do
+      :undefined -> :ok
+      _ -> :ets.delete_all_objects(@memo)
+    end
+
+    :ok
+  end
+
+  defp memo_table do
+    case :ets.whereis(@memo) do
+      :undefined ->
+        BeamLisp.Loader.Server.run(fn ->
+          try do
+            :ets.new(@memo, [:named_table, :public, :set, read_concurrency: true])
+          rescue
+            # Another process won the race; its table is the one we want.
+            ArgumentError -> :ok
+          end
+        end)
+
+        @memo
+
+      _ ->
+        @memo
+    end
   end
 
   @doc "Plan from already-built nodes (see `t:node_/0`)."

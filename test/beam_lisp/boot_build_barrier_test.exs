@@ -57,8 +57,12 @@ defmodule BeamLisp.BootBuildBarrierTest do
   end
 
   test "boot errors close the ordinary-source execution gate" do
-    assert call("continue-after-boot?", [%{errors: []}])
-    refute call("continue-after-boot?", [%{errors: ["failed"]}])
+    # The barrier is BOOT-source errors only (1baaab4): an ordinary source
+    # failing to compile is a report, not a reason to skip every later wave.
+    boot = Path.join(BeamLisp.Tiers.boot_dir(), "compiler.bl")
+    assert call("continue-after-boot?", [%{errors: [], "boot-paths": [boot]}])
+    assert call("continue-after-boot?", [%{errors: ["priv/std/helper.bl: failed"], "boot-paths": [boot]}])
+    refute call("continue-after-boot?", [%{errors: ["#{boot}: failed"], "boot-paths": [boot]}])
   end
 
   test "relative source paths and Mix priv symlinks identify the same boot tier" do
