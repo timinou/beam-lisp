@@ -1,0 +1,315 @@
+; span_rewrite.bl — trivia-preserving structural rewrite over the reader's
+; end-spans. The fix for deodorant/fix-source's `pr-str` collapse.
+;
+; ── The problem ──────────────────────────────────────────────────────────
+;
+; fix-source splices (pr-str fixed) at a smell's span. pr-str re-renders the
+; WHOLE matched subtree on one line — so a multi-line captured argument, and
+; every comment inside it, is destroyed. Measured: an engine-file sweep dropped
+; ir 249→238, model 364→340, smt 533→496 lines (comments gone). A blanket run
+; is unusable; only single-line smells splice cleanly.
+;
+; ── The fix, from first principles ───────────────────────────────────────
+;
+; Every reader node now carries a full source span {:line :col :end-line
+; :end-col} (Phase 1). A rewrite rule's capture variables (?x) bind to whole
+; sub-NODES. So to rewrite (if (not ?p) ?a ?b) → (if-not ?p ?a ?b), we DO NOT
+; re-print ?p/?a/?b — we slice their ORIGINAL source bytes out of the file and
+; splice them into the new skeleton. Only the rule's own literal tokens
+; (`if`→`if-not`) are newly rendered. Untouched captures stay byte-identical:
+; multi-line shape, indentation, and comments all survive.
+;
+; A capture whose node lacks an end-span (a bare scalar the reader did not
+; wrap — `nil`, a number) has no trivia to preserve, so it falls back to
+; pr-str of that leaf. The skeleton is small and single-line by construction.
+
+(ns span-rewrite
+  (:require [reader-node :as rn] [rewrite :as rw]))
+
+; ── source index: line → starting codepoint offset ───────────────────────
+
+(defn line-offsets
+  "A map {line-number → codepoint offset where that line starts}. One left-to
+   -right scan; line 1 starts at 0, each newline opens the next line."
+  [src]
+  (loop [cs (String/codepoints src) i 0 line 1 offs {1 0}]
+    (if (empty? cs)
+      offs
+      (if (= "\n" (first cs))
+        (recur (rest cs) (inc i) (inc line) (assoc offs (inc line) (inc i)))
+        (recur (rest cs) (inc i) line offs)))))
+
+(defn- has-span? [pos]
+  (and (map? pos)
+       (int? (:line pos)) (int? (:col pos))
+       (int? (:end-line pos)) (int? (:end-col pos))))
+
+(defn- safe-form
+  "rn/form of a node, or nil when the node is a shape rn/form refuses (:map,
+   :record, :set). Used where a best-effort data view is enough. NB: a nil
+   RESULT is ambiguous (the value nil vs a refusal) — use `form-cell` when the
+   distinction matters."
+  [n]
+  (try (rn/form (rn/node-form n)) (catch e nil)))
+
+(defn- capture-ok?
+  "True when node `n` can be reproduced in a rewrite: either it has a real span
+   (slice the source) or it is a LEAF (symbol/scalar/keyword) whose value
+   pr-strs losslessly. A compound node (map/list/vector/set) with no span
+   cannot be reproduced — return false so the fix is skipped rather than dumping
+   node internals."
+  [n]
+  (or (nil? n)  ; a bare-nil node is a leaf, renders as "nil"
+      (has-span? (rn/node-pos n))
+      ; a spanless leaf is reproducible via pr-str EXCEPT a string: bl pr-str of
+      ; a raw binary drops the quotes ("defmethod" -> bare defmethod, an unbound
+      ; symbol), so a spanless string capture must veto the fix.
+      (and (contains? #{:symbol :scalar :keyword} (rn/node-tag (rn/node-form n)))
+           (not (erlang/is_binary (safe-form n))))))
+
+(defn- form-cell
+  "[:ok value] when the node converts to a data form (value may itself be nil),
+   or [:no] when rn/form refuses the shape. Unlike safe-form this never loses
+   the nil-value vs refusal distinction — which is what lets a `nil` literal be
+   compared correctly against a \"nil\" string (atom vs binary, not equal)."
+  [n]
+  (try [:ok (rn/form (rn/node-form n))] (catch e [:no])))
+
+(defn slice-node
+  "The ORIGINAL source text of node `n`, sliced from `src` by its span. When
+   the node carries no end-span (a bare scalar), fall back to pr-str of the
+   node's form — a leaf has no trivia to preserve. `cps` is the codepoint
+   vector of src, `offs` its line-offset index (both hoisted so a whole-tree
+   rewrite indexes once)."
+  [src cps offs n]
+  (if (nil? n)
+    "nil"  ; the reader represents a nil literal as bare nil
+  (let [pos (rn/node-pos n)]
+    (if (has-span? pos)
+      (let [start (+ (get offs (:line pos)) (dec (:col pos)))
+            end   (+ (get offs (:end-line pos)) (dec (:end-col pos)))]
+        (apply str (subvec cps start end)))
+      ; no span → a leaf; render its data form (nil/number/keyword/symbol),
+      ; or the raw node tuple for a shape rn/form refuses.
+      (let [f (safe-form n)] (pr-str (if (nil? f) (rn/node-form n) f)))))))
+
+; ── the rewrite ──────────────────────────────────────────────────────────
+;
+; A rule is {:pattern node-pattern :skeleton fn}. The pattern is matched
+; STRUCTURALLY against reader nodes (via node-match below), binding each ?var
+; to the matched sub-node. The skeleton fn receives a `slice` function
+; (?var-node → original source text) and returns the replacement TEXT. Because
+; the skeleton composes original slices, everything the rule did not name
+; stays byte-identical.
+
+(defn- pvar? [n]
+  (and (= :symbol (rn/node-tag (rn/node-form n)))
+       (let [nm (rn/node-name (rn/node-form n))]
+         (and (pos? (String/length nm)) (= "?" (String/slice nm 0 1))))))
+
+(defn- slice-key
+  "A structural identity for a node, for pvar re-unification. Uses the node's
+   data form when convertible, else its raw node tuple — either way, equal
+   captures compare equal."
+  [n]
+  (if (nil? n)
+    "nil"
+    (let [f (safe-form n)]
+      (pr-str (if (nil? f) (rn/node-form n) f)))))
+
+(defn node-match
+  "Match reader-node `n` against node-pattern `pat`, threading `binds`
+   {pvar-name → matched-node}. A ?-symbol in the pattern binds (and re-unifies)
+   the corresponding node; a list/vector matches element-wise with equal
+   arity; a plain symbol/keyword matches an equal one by name. Returns the
+   binds map or nil. Structural — never coerces a list to a vector."
+  [pat n binds]
+  (let [pf (rn/node-form pat) nf (rn/node-form n)
+        ptag (rn/node-tag pf) ntag (rn/node-tag nf)]
+    (cond
+      (pvar? pat)
+        (let [nm (rn/node-name pf)]
+          (if (contains? binds nm)
+            (when (= (slice-key (get binds nm)) (slice-key n)) binds)
+            (assoc binds nm n)))
+      (contains? #{:list :vector} ptag)
+        (when (and (= ptag ntag)
+                 (= (count (rn/node-items pf)) (count (rn/node-items nf)))) (loop [ps (rn/node-items pf) ns (rn/node-items nf) b binds]
+            (if (empty? ps)
+              b
+              (let [b2 (node-match (first ps) (first ns) b)]
+                (if (nil? b2) nil (recur (rest ps) (rest ns) b2))))))
+      (= :symbol ptag)
+        (when (and (= :symbol ntag) (= (rn/node-name pf) (rn/node-name nf))) binds)
+      (= :keyword ptag)
+        (when (and (= :keyword ntag) (= (rn/node-name pf) (rn/node-name nf))) binds)
+      (= :map ptag)
+        (when (and (= :map ntag)
+                 (= (count (rn/node-items pf)) (count (rn/node-items nf)))) (loop [ps (rn/node-items pf) ns (rn/node-items nf) b binds]
+            (if (empty? ps)
+              b
+              (let [b2 (node-match (first ps) (first ns) b)]
+                (if (nil? b2) nil (recur (rest ps) (rest ns) b2))))))
+      :else
+        ; scalar literal: compare the TYPED values, not their printed form.
+        ; pr-str conflates nil (atom) with "nil" (binary) — both print `nil` —
+        ; so matching on pr-str would unify them and mis-rewrite (= x "nil").
+        ; safe-form yields the real value: (= nil "nil") is false (atom≠binary).
+        (let [pc (form-cell pat) nc (form-cell n)]
+          (if (and (= :ok (first pc)) (= :ok (first nc)))
+            ; both convertible — compare TYPED values: (= nil "nil") is false
+            (when (= (second pc) (second nc)) binds)
+            ; a shape rn/form refuses — fall back to node identity
+            (when (= (slice-key pat) (slice-key n)) binds))))))
+
+; ── guard support + deodorant bridge ───────────────────────────────
+;
+; A rule may carry an optional :when guard — a fn of the bindings map. deodorant
+; guards read bindings as DATA forms keyed by the pattern symbol (`(get b '?k)`),
+; so before calling a guard we convert each bound node to its data form and key
+; it by the pattern symbol, exactly as deodorant/smell-match does.
+
+(defn- binds->data
+  "{pvar-name-string → node} → {pattern-symbol → data-form}, the shape a
+   deodorant :when guard expects."
+  [binds]
+  (reduce (fn [m pair]
+            (assoc m (symbol (first pair))
+                   (if (nil? (second pair)) nil (safe-form (second pair)))))
+          {} (into [] binds)))
+
+(defn- rule-guard-ok?
+  "True when `rule` has no :when guard, or its guard accepts the bindings."
+  [rule binds]
+  (let [g (get rule :when nil)]
+    (if (nil? g) true (g (binds->data binds)))))
+
+(defn- pvar-name? [nm]
+  (and (pos? (String/length nm)) (= "?" (String/slice nm 0 1))))
+
+(defn- template->render
+  "Derive a :render fn from a deodorant :replacement TEMPLATE (a native form
+   with ?vars). Walking the template: a ?var renders as the ORIGINAL source
+   bytes of its captured node (via `slice`) — preserving that argument's
+   multi-line shape and comments; every literal token renders via pr-str. So
+   only the template's own fixed tokens are new text; captures are byte-exact."
+  [replacement]
+  (fn [slice binds]
+    (letfn [(render [x]
+              (cond
+                (and (symbol? x) (pvar-name? (str x)))
+                  ; a capture may be bound to a nil-literal node, which the
+                  ; reader represents as bare nil — so test membership, not
+                  ; nil-ness of the value, or a `nil` branch renders as "?a".
+                  (if (contains? binds (str x))
+                    (slice (get binds (str x)))
+                    (str x))
+                (list? x)
+                  (str "(" (join " " (map render x)) ")")
+                (vector? x)
+                  (str "[" (join " " (map render x)) "]")
+                :else (pr-str x)))]
+      (render replacement))))
+
+(defn smell->rule
+  "Convert a deodorant smell `{:pattern :replacement :when?}` (native-form
+   templates) into a span-rewrite rule `{:pattern <node> :render :when?}`. The
+   pattern is re-read as a reader node so node-match can walk it; the render is
+   derived from the replacement template so captures splice ORIGINAL bytes.
+   This is the whole bridge: every existing smell becomes trivia-preserving
+   with no per-smell work."
+  [smell]
+  {:pattern (first (BeamLisp.Reader/read_string (pr-str (:pattern smell))))
+   :render (template->render (:replacement smell))
+   :when (get smell :when nil)})
+
+; ── driver: one rule over one source, returning trivia-preserving text ───
+
+(defn rewrite-source
+  "Apply `rules` to every subform of `src`, splicing original source for every
+   capture. `rules` is a list of {:pattern <reader-node> :render (fn [slice
+   binds] text)} where `slice` is (node → original text) and `binds` is
+   {pvar-name → node}. Returns {:source new-text :changed n}. Non-overlapping,
+   innermost-first, one pass (extend to fixpoint as needed).
+
+   The result differs from the input ONLY inside matched spans; every unmatched
+   byte — comment, blank line, indentation — is carried through untouched."
+  [rules src]
+  (let [cps (into [] (String/codepoints src))
+        offs (line-offsets src)
+        slice (fn [n] (slice-node src cps offs n))
+        forms (BeamLisp.Reader/read_string src)
+        ; collect [span replacement-text] edits over the whole tree
+        edits (atom [])
+        quoting? (fn [nf]
+                   ; a quote / syntax-quote form is a DATA TEMPLATE, not code to
+                   ; simplify: `(if ~test ...) builds an if, it is not one. Its
+                   ; child spans also do not align with the source once the
+                   ; sigil is desugared to (syntax-quote …). Skip the whole form.
+                   (and (= :list (rn/node-tag nf))
+                        (seq (rn/node-items nf))
+                        (let [h (rn/node-form (first (rn/node-items nf)))]
+                          (and (= :symbol (rn/node-tag h))
+                               (contains? #{"quote" "syntax-quote"} (rn/node-name h))))))
+        ; the name a (defn NAME …)/(defmacro NAME …) form defines, else nil
+        def-name (fn [nf]
+                   (when (and (= :list (rn/node-tag nf)) (seq (rn/node-items nf)))
+                     (let [its (rn/node-items nf)
+                           h (rn/node-form (first its))]
+                       (when (and (= :symbol (rn/node-tag h))
+                                  (contains? #{"defn" "defn-" "defmacro"} (rn/node-name h))
+                                  (> (count its) 1))
+                         (let [nm (rn/node-form (second its))]
+                           (when (= :symbol (rn/node-tag nm)) (rn/node-name nm)))))))
+        ; the head symbol of a replacement text like "(inc x)" → "inc"
+        text-head (fn [t]
+                    (let [s (String/trim t)]
+                      (when (and (> (String/length s) 1) (= "(" (String/slice s 0 1)))
+                        (first (String/split (String/slice s 1 (String/length s)) " ")))))
+        walk (fn walk [n self]
+               (let [nf (rn/node-form n)
+                     tag (rn/node-tag nf)
+                     self2 (or (def-name nf) self)]
+                 (if (quoting? nf)
+                   nil  ; do not descend into a quoted template
+                 ; try each rule at THIS node
+                 (let [hit (some (fn [rule]
+                                   (let [b (node-match (:pattern rule) n {})]
+                                     (when (and (some? b) (rule-guard-ok? rule b)
+                                                ; a COMPOUND capture (map/list/
+                                                ; vector/set) with no span cannot
+                                                ; be reproduced — rendering it would
+                                                ; dump node internals, so skip the
+                                                ; fix. A leaf (symbol/scalar/kw)
+                                                ; with no span renders losslessly
+                                                ; via pr-str, so it is fine.
+                                                (every? (fn [pair] (capture-ok? (second pair)))
+                                                        (into [] b)))
+                                       {:pos (rn/node-pos n)
+                                        :text ((:render rule) slice b)})))
+                                 rules)]
+                   (if (and (some? hit) (has-span? (:pos hit))
+                            ; SELF-REFERENCE GUARD: never rewrite a call inside
+                            ; f's own definition into a call to f (a primitive
+                            ; like `inc` defined as (+ x 1) must not become
+                            ; (inc x) — infinite recursion).
+                            (not (and (some? self2) (= self2 (text-head (:text hit))))))
+                     (swap! edits conj hit)
+                     ; no hit here → descend (don't descend into a replaced node)
+                     (when (contains? #{:list :vector :set :map} tag)
+                       (doseq [c (rn/node-items nf)] (walk c self2))))))))]
+    (doseq [f forms] (walk f nil))
+    ; apply edits right-to-left so earlier codepoint offsets stay valid
+    (let [sorted (sort-by (fn [e] (- 0 (+ (get offs (get-in e [:pos :line]))
+                                          (get-in e [:pos :col])))) (deref edits))]
+      (loop [es sorted out cps changed 0]
+        (if (empty? es)
+          {:source (apply str out) :changed changed}
+          (let [e (first es)
+                pos (:pos e)
+                start (+ (get offs (:line pos)) (dec (:col pos)))
+                end   (+ (get offs (:end-line pos)) (dec (:end-col pos)))
+                spliced (into [] (concat (subvec out 0 start)
+                                         (String/codepoints (:text e))
+                                         (subvec out end)))]
+            (recur (rest es) spliced (inc changed))))))))

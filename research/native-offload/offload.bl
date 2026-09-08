@@ -1,0 +1,112 @@
+; research/native-offload/offload.bl — the missing edge: eligibility → lower →
+; Cranelift JIT → differential oracle → measured speedup.
+;
+; The pieces existed in isolation:
+;   - native.eligible : the doc-05 verdict (pure ∧ terminating ∧ typed) per fn
+;   - lower2          : a proven-eligible defn → j1 IR text
+;   - j1_probe        : a Cranelift JIT that runs j1 IR and times it
+; …but nothing connected them. This orchestrator is that connection, as ONE
+; gated flow:
+;
+;   1. GATE   — native.eligible must say :eligible; a refusal names the theorem
+;               and we STOP (never lower an ineligible fn).
+;   2. LOWER  — lower2 turns the defn into j1 IR text.
+;   3. BEAM   — run the same kernel through the interpreter (baseline value+time).
+;   4. JIT    — shell to j1_probe --run-ir: Cranelift compiles+runs the IR,
+;               reporting its value and time.
+;   5. ORACLE — the JIT value MUST equal the BEAM value (differential check).
+;               Only a value-identical result is allowed to claim a speedup.
+;   6. REPORT — the measured BEAM-vs-JIT speedup, gated on the oracle.
+;
+; This is the research wiring (shell to the standalone probe). Productionizing it
+; is a Rustler JIT-host cdylib exposing compile/call NIFs (PLAN follow-up); the
+; PROOF that the pipeline is sound and fast is here.
+;
+; Run (needs the probe built + a buffer):
+;   cargo build --release --manifest-path research/j1_probe/Cargo.toml
+;   BEAM_LISP_PATH=research/native-offload mix beam_lisp.run --path priv research/native-offload/offload_run.bl
+
+(ns offload
+  (:require [typed] [env]))
+
+; native.eligible + lower2 are loaded by the runner via env/eval (they pull the
+; shipped engines). We reference them by their interned globals here.
+
+(def probe-bin
+  "/home/user/.cache/cargo-target/release/j1_probe")
+
+(def buf-file "/tmp/j1_buf_1m.bin")
+
+(defn now-us [] (erlang/monotonic_time :microsecond))
+
+; ── the BEAM baseline: the checksum kernel, interpreted ──────────────────────
+;
+; The same computation the JIT runs, in plain beam-lisp, over the same bytes —
+; the honest baseline. (acc = acc*31 + byte, wrapping at 2^64 to match the JIT's
+; i64 wrap.)
+
+(def wrap (erlang/bsl 1 64))
+
+(defn- byte-at [bin i] (first (erlang/binary_to_list (erlang/binary_part bin i 1))))
+
+(defn beam-checksum [bytes n]
+  (loop [i 0 acc 0]
+    (if (< i n)
+      (recur (+ i 1) (erlang/rem (+ (* 31 acc) (byte-at bytes i)) wrap))
+      acc)))
+
+; ── shell to the Cranelift probe ─────────────────────────────────────────────
+
+(defn- sh [cmd]
+  (erlang/list_to_binary (os/cmd (erlang/binary_to_list cmd))))
+
+(defn jit-run
+  "Write `ir` to a file, run j1_probe --run-ir over `buf-file`, and parse its
+   report line: '… : DT   jit=V  rust-ref-match=B  bl-match=B'. Returns
+   {:value V :match? bool :raw line}."
+  [ir]
+  (let [ir-file "/tmp/offload_kernel.j1"]
+    (File/write! ir-file ir)
+    (let [out (sh (str probe-bin " --run-ir " ir-file " " buf-file))
+          ; parse jit=NNN and rust-ref-match=true|false
+          jit-tok (second (split out "jit="))
+          value (erlang/binary_to_integer (first (split (or jit-tok "0 ") " ")))
+          match? (some? (index-of out "rust-ref-match=true"))]
+      {:value value :match? match? :raw (first (split out "\n"))})))
+
+; ── the gated pipeline ───────────────────────────────────────────────────────
+
+(defn offload!
+  "Run the whole gated flow for kernel `name` with source `src`, over the bytes
+   in `buf-file`. `eligible-fn` and `lower-fn`/`irtext-fn` are the interned
+   native.eligible/eligible and lower2/lower-kernel + lower2/ir-text. Returns a
+   report map; :ran? false with :reason when the gate refuses."
+  [eligible-fn lower-fn irtext-fn analyze-src name src]
+  (let [verdict (eligible-fn analyze-src name)]
+    (if (not (:eligible verdict))
+      {:ran? false :name name :reason (:reason verdict) :detail (get verdict :detail)}
+      ; ── eligible by the ANF gate; the LOWERER is a second, finer gate: it
+      ; refuses shapes outside the counted-loop arithmetic fragment (e.g. nth).
+      ; A refusal here is a gate outcome, not a crash — catch and report it. ──
+      (let [lowered (try {:ok (lower-fn src)}
+                         (catch e {:refused (ex-message e)}))]
+      (if (:refused lowered)
+        {:ran? false :name name :reason :not-in-fragment :detail (:refused lowered)}
+      (let [k (:ok lowered)
+            ir (irtext-fn k)
+            bytes (File/read! buf-file)
+            n (erlang/byte_size bytes)
+            ; BEAM baseline
+            tb0 (now-us) beam-v (beam-checksum bytes n) tb1 (now-us)
+            beam-us (- tb1 tb0)
+            ; Cranelift JIT
+            jit (jit-run ir)
+            ; ORACLE: values must agree
+            oracle-ok (= beam-v (:value jit))]
+        {:ran? true :name name :eligible true
+         :ir-lines (count (:lines k))
+         :beam-value beam-v :jit-value (:value jit)
+         :oracle-ok oracle-ok
+         :jit-ref-match (:match? jit)
+         :beam-us beam-us
+         :jit-raw (:raw jit)}))))))

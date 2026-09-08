@@ -1,0 +1,124 @@
+; research/smt-unified/parity.bl — prove the ANF translator DENOTES THE SAME
+; TERM as the surface translator, across the full corpus, via z3.
+;
+; For each entry: translate with system.smt (old) and anf-translate (new); if
+; both are forms, ask z3 whether they can DIFFER — (assert (not (= old new)))
+; under the entry's declarations must be UNSAT. A formatting difference
+; (`(- 1)` vs `-1`, gensym names) is irrelevant; meaning is the oracle.
+;
+; Run: BEAM_LISP_PATH=research/smt-unified mix beam_lisp.run --path priv research/smt-unified/parity.bl
+
+(ns parity
+  (:require [system.smt :as old] [anf-translate :as new] [smt :as smtlib] [z3] [core]))
+
+; corpus: {name → {:vars {name sort} :src "…" :kind :term|:defn|:len :ret sort :colls #{…}}}
+(def corpus
+  {"cmp"          {:vars {"a" "Int"} :src "(> a 0)"}
+   "impl"         {:vars {"a" "Int"} :src "(=> (> a 0) (> a -1))"}
+   "ite"          {:vars {"a" "Int"} :src "(if (> a 0) (+ a 1) (- a 1))"}
+   "and"          {:vars {"a" "Int"} :src "(and (> a 0) (< a 9))"}
+   "or"           {:vars {"a" "Int"} :src "(or (> a 0) (< a 9))"}
+   "max-idiom"    {:vars {"a" "Int"} :src "(= (max 0 a) (ite (>= 0 a) 0 a))"}
+   "min-max"      {:vars {"a" "Int" "b" "Int"} :src "(>= (min a b) (max 0 (- (+ a b) 10)))"}
+   "pred-desugar" {:vars {"a" "Int"} :src "(and (pos? a) (not (zero? a)))"}
+   "dec-inc"      {:vars {"n" "Int"} :src "(= (dec (inc n)) n)"}
+   "arith-mix"    {:vars {"a" "Int" "b" "Int"} :src "(>= (* a b) (+ (mod a 7) (* 2 b)))"}
+   "quot-rem"     {:vars {"a" "Int" "b" "Int"} :src "(= a (+ (* b (quot a b)) (rem a b)))"}
+   "real-lits"    {:vars {"r" "Real"} :src "(and (> r 1.5) (< r 2.0))"}
+   "real-neg"     {:vars {"r" "Real"} :src "(>= r -1.5)"}
+   "strings"      {:vars {"s" "String" "t" "String"} :src "(str-contains? (str s t) \"hi\")"}
+   "str-len"      {:vars {"s" "String"} :src "(>= (str-len s) 3)"}
+   ; length mode
+   "count-len"    {:kind :len :vars {"c" "Int"} :colls #{"c"} :src "(>= (count c) 0)"}
+   "conj-len"     {:kind :len :vars {"c" "Int"} :colls #{"c"} :src "(> (count (conj c 1)) (count c))"}
+   ; enum / variant
+   "enum-kw"      {:kind :var :vars {"p" "E_phase"} :sort "E_phase"
+                   :arms {"open" nil "closed" nil} :src "(= p :open)"}
+   "payload-disc" {:kind :var :vars {"mode" "E_mode"} :sort "E_mode"
+                   :arms {"on" "Int" "off" nil} :src "(some? (:on mode))"}
+   "payload-acc"  {:kind :var :vars {"mode" "E_mode"} :sort "E_mode"
+                   :arms {"on" "Int" "off" nil} :src "(= (:on mode) 3)"}
+   ; define-fun
+   "sign-defn"    {:kind :defn :ret "Int"
+                   :src "(defn sign ([a] :when (pos? a) 1) ([a] :when (neg? a) (- 0 1)) ([a] 0))"}
+   "floor-half"   {:kind :defn :ret "Int"
+                   :src "(defn floor-half ([n] :when (>= n 0) (div n 2)) ([n] (- 0 (div (- 0 n) 2))))"}})
+
+(defn- decls-for [vars]
+  (map (fn [pair] (smtlib/declare-const (symbol (first pair)) (symbol (second pair))))
+       (into [] vars)))
+
+(defn- both [name spec]
+  "Return [old-form new-form] for a corpus entry, by kind."
+  (let [vars (set (keys (:vars spec)))
+        kind (get spec :kind :term)]
+    (cond
+      (= kind :term) [(old/of-source vars (:src spec)) (new/of-source vars (:src spec))]
+      (= kind :var)
+        (let [vm (old/variants-map (:sort spec) (:arms spec))]
+          [(old/of-source-variants vars vm (:src spec))
+           (new/of-source-variants vars vm (:src spec))])
+      (= kind :len)  [(old/of-source-len vars (:colls spec) (:src spec))
+                      (new/of-source-len vars (:colls spec) (:src spec))]
+      (= kind :defn) [(old/defn->define-fun (:src spec) (:ret spec))
+                      (new/defn->define-fun (:src spec) (:ret spec))])))
+
+(defn- len-decls [spec]
+  ; length mode declares c_len Int for each collection var
+  (map (fn [c] (smtlib/declare-const (symbol (str c "_len")) 'Int)) (into [] (get spec :colls #{}))))
+
+(defn- equal-forms?
+  "z3: is (not (= old new)) UNSAT under the entry's decls? For a define-fun, the
+   two are define-fun COMMANDS — compare by asserting their bodies equal over
+   fresh args; here we string-compare the folded ite body via a wrapper."
+  [port name spec old-f new-f]
+  (let [kind (get spec :kind :term)]
+    (cond
+      (or (= old-f :untranslatable) (= new-f :untranslatable))
+        (= old-f new-f)                         ; both must agree on untranslatable
+      (= kind :defn)
+        ; both are (define-fun nm ((p S)…) Ret BODY). New alpha-renames params
+        ; (n vs n_47), so declare the union of BOTH param sets, then prove the
+        ; two bodies equal AS FUNCTIONS by binding new's params = old's params.
+        (let [obody (last old-f) nbody (last new-f)
+              oparams (into [] (nth old-f 2))
+              nparams (into [] (nth new-f 2))
+              alldecls (map (fn [p] (smtlib/declare-const (first p) (second p)))
+                            (concat oparams nparams))
+              ; bind each new param to the positional old param: (assert (= n_47 n))
+              binds (map (fn [op np] (smtlib/assert (list '= (first np) (first op))))
+                         oparams nparams)
+              script (concat alldecls binds [(smtlib/assert (list 'not (list '= obody nbody)))])]
+          (= "unsat" (z3/check port script)))
+      (= kind :var)
+        (let [dt (old/datatype-decl (:sort spec) (:arms spec))
+              decls (map (fn [pair] (smtlib/declare-const (symbol (first pair)) (symbol (second pair))))
+                         (into [] (:vars spec)))
+              script (concat [dt] decls [(smtlib/assert (list 'not (list '= old-f new-f)))])]
+          (= "unsat" (z3/check port script)))
+      :else
+        (let [decls (concat (decls-for (:vars spec)) (len-decls spec))
+              script (concat decls [(smtlib/assert (list 'not (list '= old-f new-f)))])]
+          (= "unsat" (z3/check port script))))))
+
+(defn run []
+  (let [port (z3/open)
+        results
+        (map (fn [pair]
+               (let [name (first pair) spec (second pair)
+                     [o n] (both name spec)
+                     ok (equal-forms? port name spec o n)]
+                 {:name name :ok ok :old (pr-str o) :new (pr-str n)}))
+             (into [] corpus))
+        pass (filter :ok results)
+        fail (filter (fn [r] (not (:ok r))) results)]
+    (println "═══ SMT translator parity: surface vs ANF ═══")
+    (reduce (fn [_ r] (println (if (:ok r) "  ✓ " "  ✗ ") (:name r)
+                           (if (:ok r) "" (str "\n      old=" (:old r) "\n      new=" (:new r)))) nil)
+          nil results)
+    (println (str "\n" (count pass) "/" (count results) " denote the same term"))
+    (when (not (empty? fail))
+      (println "FAILURES:" (pr-str (map :name fail))))
+    {:pass (count pass) :total (count results)}))
+
+(run)
