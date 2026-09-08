@@ -51,6 +51,14 @@ enum Stm {
     Mov { dst: Var, a: Var },
     Zext8 { dst: Var, a: Var },
     UdivImm { dst: Var, a: Var, k: i64 },
+    /// dst = (a <  b) ? 1 : 0   (signed)
+    Lt { dst: Var, a: Var, b: Var },
+    /// dst = (a <= b) ? 1 : 0   (signed)
+    Le { dst: Var, a: Var, b: Var },
+    /// dst = (a == b) ? 1 : 0
+    Eq { dst: Var, a: Var, b: Var },
+    /// dst = (c != 0) ? a : b   (BRANCHLESS select — both a,b already computed)
+    Sel { dst: Var, c: Var, a: Var, b: Var },
     /// store.i8 base + off <- v
     StoreU8 { base: Var, off: Var, v: Var },
 }
@@ -103,7 +111,9 @@ fn compile(k: &Kernel) -> (JITModule, usize) {
         let mut touch = |vs: &mut Vec<usize>| match stm {
             Stm::Imm { dst, .. } | Stm::Zext8 { dst, .. } => vs.push(dst.0),
             Stm::Mov { dst, a } => vs.extend([dst.0, a.0]),
-            Stm::Add { dst, a, b } | Stm::Sub { dst, a, b } | Stm::Mul { dst, a, b } => vs.extend([dst.0, a.0, b.0]),
+            Stm::Add { dst, a, b } | Stm::Sub { dst, a, b } | Stm::Mul { dst, a, b }
+            | Stm::Lt { dst, a, b } | Stm::Le { dst, a, b } | Stm::Eq { dst, a, b } => vs.extend([dst.0, a.0, b.0]),
+            Stm::Sel { dst, c, a, b } => vs.extend([dst.0, c.0, a.0, b.0]),
             Stm::AddImm { dst, a, .. } | Stm::UdivImm { dst, a, .. } => vs.extend([dst.0, a.0]),
             Stm::LoadU8 { dst, base, off } => vs.extend([dst.0, base.0, off.0]),
             Stm::StoreU8 { base, off, v } => vs.extend([base.0, off.0, v.0]),
@@ -203,6 +213,37 @@ fn compile(k: &Kernel) -> (JITModule, usize) {
                 };
                 bcx.def_var(var(dst.0), v);
             }
+            Stm::Lt { dst, a, b } => {
+                let x = bcx.use_var(var(a.0));
+                let y = bcx.use_var(var(b.0));
+                let c = bcx.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, x, y);
+                let v = bcx.ins().uextend(I64, c);
+                bcx.def_var(var(dst.0), v);
+            }
+            Stm::Le { dst, a, b } => {
+                let x = bcx.use_var(var(a.0));
+                let y = bcx.use_var(var(b.0));
+                let c = bcx.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedLessThanOrEqual, x, y);
+                let v = bcx.ins().uextend(I64, c);
+                bcx.def_var(var(dst.0), v);
+            }
+            Stm::Eq { dst, a, b } => {
+                let x = bcx.use_var(var(a.0));
+                let y = bcx.use_var(var(b.0));
+                let c = bcx.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, x, y);
+                let v = bcx.ins().uextend(I64, c);
+                bcx.def_var(var(dst.0), v);
+            }
+            Stm::Sel { dst, c, a, b } => {
+                // BRANCHLESS: both arms are already-computed values; pick by c!=0.
+                let cv = bcx.use_var(var(c.0));
+                let zero = bcx.ins().iconst(I64, 0);
+                let cond = bcx.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, cv, zero);
+                let x = bcx.use_var(var(a.0));
+                let y = bcx.use_var(var(b.0));
+                let v = bcx.ins().select(cond, x, y);
+                bcx.def_var(var(dst.0), v);
+            }
             Stm::StoreU8 { base, off, v } => {
                 let pb = bcx.use_var(var(base.0));
                 let po = bcx.use_var(var(off.0));
@@ -260,6 +301,10 @@ fn parse_ir(text: &str) -> Option<Kernel> {
             "mul" => body.push(Stm::Mul { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
             "addimm" => body.push(Stm::AddImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: k(t[3]) }),
             "load" => body.push(Stm::LoadU8 { dst: Var(v(t[1])), base: Var(v(t[2])), off: Var(v(t[3])) }),
+            "lt" => body.push(Stm::Lt { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
+            "le" => body.push(Stm::Le { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
+            "eq" => body.push(Stm::Eq { dst: Var(v(t[1])), a: Var(v(t[2])), b: Var(v(t[3])) }),
+            "sel" => body.push(Stm::Sel { dst: Var(v(t[1])), c: Var(v(t[2])), a: Var(v(t[3])), b: Var(v(t[4])) }),
             "store" => body.push(Stm::StoreU8 { base: Var(v(t[1])), off: Var(v(t[2])), v: Var(v(t[3])) }),
             "udivimm" => body.push(Stm::UdivImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: k(t[3]) }),
             "subimm" => body.push(Stm::AddImm { dst: Var(v(t[1])), a: Var(v(t[2])), k: -k(t[3]) }),
@@ -406,6 +451,90 @@ fn main() {
     // The kernel has 3 params (dst*, src*, len) + alpha via inits; it MUTATES
     // dst in place. We run it, write the mutated dst to OUT_FILE for the bl
     // reference to diff, and also self-check against a Rust twin here.
+    // ── frame server: compile ONCE, then stream frames over stdin/stdout ──
+    // args: --serve-store IR_FILE
+    // Request  (binary, repeatable):
+    //   u8 op            'R' render | 'Q' quit
+    //   if 'R': u32le np    (params EXCLUDING the output buffer = n_params-1)
+    //     np times, IN SHADER PARAM ORDER:
+    //       u8 tag         'B' buffer | 'I' int
+    //       'B': u32le len, then len bytes   → passed as a pointer
+    //       'I': i64le value                 → passed as a scalar
+    //     the LAST param is n (an int, the loop bound / output size)
+    // Response: u32le outlen, then outlen bytes (the fresh output buffer)
+    // Output buffer is param 0, allocated here as n bytes.
+    if args.len() >= 3 && args[1] == "--serve-store" {
+        use std::io::{Read, Write};
+        let ir = std::fs::read_to_string(&args[2]).unwrap();
+        let k = parse_ir(&ir).expect("parse");
+        let (m, p) = compile(&k);
+        std::mem::forget(m);
+        let mut stdin = std::io::stdin().lock();
+        let mut stdout = std::io::stdout().lock();
+        fn rd(r: &mut impl std::io::Read, buf: &mut [u8]) -> bool {
+            let mut off = 0;
+            while off < buf.len() {
+                match r.read(&mut buf[off..]) { Ok(0) => return false, Ok(n) => off += n, Err(_) => return false }
+            }
+            true
+        }
+        let call = |full: &[i64]| -> i64 {
+            unsafe {
+                match full.len() {
+                    2 => (std::mem::transmute::<_, extern "C" fn(i64,i64)->i64>(p))(full[0],full[1]),
+                    3 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64)->i64>(p))(full[0],full[1],full[2]),
+                    4 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64,i64)->i64>(p))(full[0],full[1],full[2],full[3]),
+                    5 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64,i64,i64)->i64>(p))(full[0],full[1],full[2],full[3],full[4]),
+                    6 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64,i64,i64,i64)->i64>(p))(full[0],full[1],full[2],full[3],full[4],full[5]),
+                    7 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64,i64,i64,i64,i64)->i64>(p))(full[0],full[1],full[2],full[3],full[4],full[5],full[6]),
+                    8 => (std::mem::transmute::<_, extern "C" fn(i64,i64,i64,i64,i64,i64,i64,i64)->i64>(p))(full[0],full[1],full[2],full[3],full[4],full[5],full[6],full[7]),
+                    _ => { eprintln!("serve-store: unsupported arity {}", full.len()); std::process::exit(2); }
+                }
+            }
+        };
+        loop {
+            let mut op = [0u8;1];
+            if !rd(&mut stdin, &mut op) { break; }
+            if op[0] == b'Q' { break; }
+            if op[0] != b'R' { continue; }
+            let mut u32b = [0u8;4];
+            if !rd(&mut stdin, &mut u32b) { break; }
+            let np = u32::from_le_bytes(u32b) as usize;
+            let mut bufs: Vec<Vec<u8>> = Vec::new();
+            let mut argvals: Vec<i64> = Vec::with_capacity(np);
+            for _ in 0..np {
+                let mut tag = [0u8;1];
+                if !rd(&mut stdin, &mut tag) { std::process::exit(0); }
+                if tag[0] == b'B' {
+                    if !rd(&mut stdin, &mut u32b) { std::process::exit(0); }
+                    let len = u32::from_le_bytes(u32b) as usize;
+                    let mut b = vec![0u8; len];
+                    if !rd(&mut stdin, &mut b) { std::process::exit(0); }
+                    argvals.push(b.as_ptr() as i64);
+                    bufs.push(b);
+                } else {
+                    let mut ib = [0u8;8];
+                    if !rd(&mut stdin, &mut ib) { std::process::exit(0); }
+                    argvals.push(i64::from_le_bytes(ib));
+                }
+            }
+            if np + 1 != k.n_params {
+                eprintln!("serve-store: kernel wants {} params, got {}+out", k.n_params, np);
+                std::process::exit(2);
+            }
+            let n = *argvals.last().unwrap_or(&0) as usize;
+            let mut out = vec![0u8; n];
+            let mut full: Vec<i64> = Vec::with_capacity(np + 1);
+            full.push(out.as_mut_ptr() as i64);
+            full.extend_from_slice(&argvals);
+            let _ = call(&full);
+            let _ = bufs; // keep input buffers alive across the call
+            stdout.write_all(&(n as u32).to_le_bytes()).unwrap();
+            stdout.write_all(&out).unwrap();
+            stdout.flush().unwrap();
+        }
+        std::process::exit(0);
+    }
     if args.len() >= 2 && args[1] == "--run-store" {
         // args: --run-store IR_FILE DST_FILE SRC_FILE ALPHA OUT_FILE
         // Kernel params: (out*, dst*, src*, len, alpha). out is a FRESH buffer
