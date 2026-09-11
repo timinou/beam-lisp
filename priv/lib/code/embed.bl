@@ -1,0 +1,180 @@
+; code/embed.bl — a static code-embedding model, as an OPTIONAL capability.
+;
+; ── The idea ──────────────────────────────────────────────────────────
+;
+; Text → vector, by MEANING. A search for "where do we check a transaction's
+; schema" should find `tx/validate!` whether or not the words match.
+;
+; That normally means a transformer, which means hundreds of megabytes
+; resident and a forward pass per document. This uses a STATIC model instead
+; (`minishlab/potion-code-16M-v2`): 16M parameters, 256 dimensions, ~33 MB on
+; disk, distilled from a 137M-parameter code-retrieval transformer. An embed
+; is a token look-up plus a mean — no attention, no KV cache, no batching
+; machinery. On the CoIR code-retrieval benchmark it scores 39.08 NDCG@10
+; against BM25's 42.31, and the HYBRID of the two scores 43.36: a static
+; model is not a cheaper approximation of a transformer so much as a
+; different, cheap, complementary signal.
+;
+; ── Why OPTIONAL is the design, not a fallback ────────────────────────
+;
+; The model is not in this repository and never will be: 33 MB of weights are
+; a downloaded artifact, not source. So the capability must be able to be
+; ABSENT, and absence must read as "this is not available here" — never as a
+; mysterious crash, and never as a degraded-but-silent answer. Every entry
+; point below is therefore availability-gated, and `why-unavailable` names
+; what is missing and the one command that fixes it.
+;
+; A caller that requires the model calls `require-model!` and gets a handle or
+; a loud, actionable error. A caller that merely wants it asks `available?`.
+; Nothing loads until one of them runs: the model handle is a `delay`, so
+; requiring this namespace costs a lookup of two paths.
+;
+; ── What crosses to Rust, and what does not ───────────────────────────
+;
+; The weights live in the `code_embed` NIF resource — 16M floats on Rust's
+; heap, NOT as a BEAM term (as a bl vector they would be 16M boxed floats plus
+; list overhead, and every embed would cross twice). One batch crosses once,
+; and it crosses as packed little-endian f32 bytes, which is already the shape
+; `datom.vector`'s `DVec` stores. No float is ever boxed on the way through.
+
+(ns code.embed
+  (:require [datom.vector]))
+
+;; ── the native surface ──────────────────────────────────────────────
+
+(defnative "code_embed"
+  (embedder-open 1)    ; (path)               -> model handle
+  (embedder-dim 1)     ; (handle)             -> 256
+  (embedder-encode 3)) ; (handle texts maxlen) -> count*dim packed f32 bytes
+
+;; The pinned model. `mix beam_lisp.embed.fetch` fetches exactly this one and
+;; verifies its sha256; the name is also the cache subdirectory, so two models
+;; can never be confused for one another on disk.
+(def MODEL "potion-code-16M-v2")
+
+;; Its width. Asserted against the NIF rather than trusted — see `model-dim`.
+(def DIM 256)
+
+;; Token budget per text. NOT a model limit (a static model has no context
+;; window — the model card's "1,000,000 tokens" is honest): it bounds the
+;; pathological case, one 4,000-line top-level form, so a batch cannot turn a
+;; query into a stall. Ordinary functions are two orders of magnitude under it.
+(def MAX-TOKENS 1024)
+
+(def FILES ["config.json" "tokenizer.json" "model.safetensors"])
+
+;; ── availability ────────────────────────────────────────────────────
+
+(defn nif?
+  "Whether the Rust kernel loaded. False on a machine with no Rust toolchain —
+   the crate is optional and its absence is reported, not raised."
+  []
+  (BeamLisp.Native/available? "code.embed"))
+
+(defn dir
+  "Where this model's files live on this machine (see `BeamLisp.Model`)."
+  []
+  (BeamLisp.Model/dir MODEL))
+
+(defn present?
+  "Whether the model's files are on disk (fetched, whatever the NIF says)."
+  []
+  (every? (fn [f] (= true (File/exists? (str (dir) "/" f)))) FILES))
+
+(defn available?
+  "Whether semantic embedding can actually run here."
+  []
+  (and (nif?) (present?)))
+
+(defn why-unavailable
+  "A sentence naming what is missing and how to fix it — or nil when the model
+   is ready. Both callers that can fail surface THIS string, so the diagnosis
+   is written once."
+  []
+  (cond
+    (not (nif?))
+      "the code_embed NIF is not built (needs a Rust toolchain: `mix compile`)"
+    (not (present?))
+      (str "the model weights are not on disk — run `mix beam_lisp.embed.fetch`"
+           " (expected in " (dir) ")")
+    :else nil))
+
+;; ── the handle ──────────────────────────────────────────────────────
+;;
+;; A `delay`, so requiring this namespace does NOT read 33 MB of weights.
+;; First use pays ~200 ms (safetensors parse + tokenizer build); every later
+;; call reuses the handle. Concurrent first-users agree on one load.
+
+(def ^:private handle
+  (delay (embedder-open (dir))))
+
+;; The token the example runner keys a SKIP on: an absent model is an
+;; environment fact, not a broken example (see `reload.ward`). Keep it verbatim.
+(def unavailable-prefix "code embeddings unavailable")
+
+(defn require-model!
+  "The model handle, or a loud error naming the fix.
+
+   The message is prefixed `code embeddings unavailable` on purpose: callers
+   that cannot proceed without the model (an example, a script) get a failure
+   the runner classifies as an absent optional dependency rather than a bug."
+  []
+  (let [why (why-unavailable)]
+    (if (some? why)
+      (throw (ex-info (str unavailable-prefix ": " why)
+                      {:model MODEL :dir (dir) :nif (nif?) :present (present?)}))
+      (force handle))))
+
+(defn model-dim
+  "The width the LOADED model reports. Equals `DIM`; a mismatch would mean the
+   cache holds weights of a different model than the name it sits under, which
+   is worth failing on rather than silently mixing vector spaces."
+  []
+  (embedder-dim (require-model!)))
+
+;; ── embedding ───────────────────────────────────────────────────────
+
+(defn embed-batch
+  "Embed a seq of texts → a vector of `DVec`, positionally aligned with input.
+
+   One NIF crossing for the whole batch, returning one packed binary; each row
+   is sliced out here and becomes a `DVec` body with no re-encoding. The model
+   already L2-normalises, so the bytes ARE the unit vector and `similar-to`
+   reduces to a dot product."
+  [texts]
+  (let [ts (into [] (to-list texts))]
+    (if (empty? ts)
+      []
+      (let [h (require-model!)
+            d (err-dims! (embedder-dim h))
+            bin (embedder-encode h (to-list ts) MAX-TOKENS)]
+        (mapv (fn [i]
+                (datom.vector/->DVec d (erlang/binary_part bin (* i d 4) (* d 4))))
+              (range (count ts)))))))
+
+(defn- err-dims!
+  "Reject a model whose width is not the one this namespace was written
+   against. A different width is not a tuning difference — it is a different
+   vector space, and mixing it with stored embeddings scores noise."
+  [d]
+  (if (= d DIM)
+    d
+    (throw (ex-info (str "the cached model is " d "-dimensional; " MODEL
+                         " should be " DIM " — the cache holds different weights")
+                    {:expected DIM :found d :dir (dir)}))))
+
+(defn embed
+  "One text → a `DVec` (or throws when the model is absent; see
+   `require-model!`)."
+  [text]
+  (first (embed-batch [text])))
+
+(defn info
+  "What is live, for a caller that wants to PRINT it — a demo, a health line,
+   a manifest. Never throws."
+  []
+  {:model MODEL
+   :dim DIM
+   :dir (dir)
+   :available (available?)
+   :why (why-unavailable)})

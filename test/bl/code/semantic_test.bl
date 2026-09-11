@@ -1,0 +1,220 @@
+; test/bl/code/semantic_test.bl — the code-as-facts embedding column.
+; Run: mix beam_lisp.test test/bl/code/semantic_test.bl
+;
+; ── What must hold ────────────────────────────────────────────────────
+;
+; 1. A function's DOCUMENT is its own source: the slice ends at the next
+;    top-level form and drops that form's section heading, so one function
+;    never carries a neighbour's prose into its vector.
+; 2. Two files indexed into ONE conn do not collide. `codebase/index-source`
+;    numbers entities from a fixed base, so without the per-file band the
+;    second file silently overwrites the first — same ids, half the corpus.
+; 3. Search ranks by MEANING. The fixtures are deliberately from two domains
+;    (index persistence, sourdough) so a keyword overlap cannot fake it.
+; 4. `search-in` finds the k nearest WITHIN a candidate set, and
+;    `search-returning` joins the tag fact by NAME — the ret-tag entity is
+;    not the entity that carries the embedding.
+; 5. Re-indexing an unchanged file changes nothing: embeddings are a pure
+;    function of source bytes, so the datoms are identical and no re-assert
+;    happens.
+;
+; Every test that needs the model is guarded: a checkout without
+; `mix beam_lisp.embed.fetch` reads them as PASSING vacuously, the same way
+; the durable-store tests treat an absent fjall backend.
+
+(ns code.semantic.test
+  (:require [code.embed] [code.semantic] [datom] [datom.vector]))
+
+;; ── the fixture: two namespaces, two subjects ─────────────────────────
+
+(def SRC-A
+  (str "(ns fix.embeddings)\n"
+       "\n"
+       ";; ── persistence ───────────────────────────────────────────\n"
+       "\n"
+       "(defn save-index\n"
+       "  \"Persist an embedding index to disk so the next run reloads it\n"
+       "   instead of re-embedding every function from scratch.\"\n"
+       "  [index path]\n"
+       "  (File/write! path index))\n"
+       "\n"
+       "(defn ^{:ret string} describe-index\n"
+       "  \"A one-line description of what an index holds.\"\n"
+       "  [index]\n"
+       "  \"index\")\n"))
+
+(def SRC-B
+  (str "(ns fix.kitchen)\n"
+       "\n"
+       "(defn bake-sourdough\n"
+       "  \"Fold the dough, let it rest, and bake it in a very hot oven\n"
+       "   until the crust is dark and the crumb is open.\"\n"
+       "  [dough]\n"
+       "  dough)\n"
+       "\n"
+       "(defn ^{:ret string} name-the-loaf\n"
+       "  \"A name for the loaf, carved on the crust before baking.\"\n"
+       "  [flour]\n"
+       "  \"loaf\")\n"))
+
+(defn- scratch []
+  (str (System/tmp_dir!) "/code_semantic_test_"
+       (erlang/unique_integer (to-list [:positive]))))
+
+(defn- fixture!
+  "Write the two sources into a scratch dir; returns `{:dir :a :b}`."
+  []
+  (let [dir (scratch)
+        a (str dir "/a.bl")
+        b (str dir "/b.bl")]
+    (File/mkdir_p! dir)
+    (File/write! a SRC-A)
+    (File/write! b SRC-B)
+    {:dir dir :a a :b b}))
+
+(defn- fixture-conn!
+  "A conn with both fixtures indexed. Returns `[conn f]`."
+  []
+  (let [f (fixture!)
+        conn (code.semantic/connect)]
+    (code.semantic/index! conn [["fix.embeddings" (:a f)]
+                                ["fix.kitchen" (:b f)]])
+    [conn f]))
+
+;; ── the document ──────────────────────────────────────────────────────
+
+(deftest document-is-the-qualified-name-then-the-source
+  (is (= "a.b/thing\nSOURCE"
+         (code.semantic/document "a.b" "thing" "SOURCE"))))
+
+(deftest slice-stops-at-the-next-form
+  ; The slice for `save-index` ends at `describe-index` — so it contains its
+  ; own docstring and NOT the section heading that introduces the next form,
+  ; which is what keeps one function's vector from describing its neighbour.
+  (let [lines (code.semantic/source-lines SRC-A)
+        starts (code.semantic/form-starts SRC-A)
+        slice (code.semantic/slice-text lines starts (get starts 1))]
+    ; the file reads: (ns …) / blank / section comment / blank / (defn save-index
+    (is (= 5 (get starts 1)))
+    (is (= 3 (count starts)))
+    (is (includes? slice "(defn save-index"))
+    (is (includes? slice "re-embedding every function"))
+    (is (not (includes? slice "describe-index")))
+    (is (not (includes? slice "persistence")))       ; the NEXT form's heading
+    (is (not (includes? slice "bake-sourdough")))))
+
+(deftest form-starts-lists-every-top-level-form
+  (let [starts (code.semantic/form-starts SRC-A)]
+    (is (= 1 (get starts 0)))                        ; the ns form
+    (is (= 3 (count starts)))))                      ; ns, save-index, describe-index
+
+(deftest documents-one-per-function
+  (let [docs (code.semantic/documents "fix.embeddings" SRC-A)]
+    (is (= 2 (count docs)))
+    (is (= ["save-index" "describe-index"]
+           (mapv (fn [d] (:name d)) docs)))
+    (is (= "fix.embeddings" (:ns (get docs 0))))))
+
+(deftest ns-of-file-reads-the-declaration
+  (let [f (fixture!)]
+    (is (= "fix.embeddings" (code.semantic/ns-of-file (:a f))))
+    (is (= "fix.kitchen" (code.semantic/ns-of-file (:b f))))
+    ; a path that is not there still yields a usable NAME rather than nil:
+    ; `:fn/ns` is a string column, and nil is rejected by the schema.
+    (is (= "nothing.bl" (code.semantic/ns-of-file (str (:dir f) "/nothing.bl"))))))
+
+(deftest id-bands-are-disjoint
+  (is (not= (code.semantic/offset-for 0) (code.semantic/offset-for 1)))
+  (is (< (code.semantic/offset-for 0) (code.semantic/offset-for 1))))
+
+;; ── indexing and search (need the model) ──────────────────────────────
+
+(deftest both-files-survive-one-conn
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          stats (code.semantic/stats (datom/db conn))]
+      ; FOUR functions, not two: the second file did not overwrite the first.
+      (is (= 4 (get stats :functions)))
+      (is (= 4 (get stats :embedded)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-ranks-by-meaning
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          hits (code.semantic/search-text db "persist an index to disk" 3)]
+      (is (= "save-index" (:name (get hits 0))))
+      (is (> (:score (get hits 0)) (:score (get hits 1))))
+      ; and the other subject does not win its own question, either
+      (let [cake (code.semantic/search-text db "bake bread in a hot oven" 3)]
+        (is (= "bake-sourdough" (:name (get cake 0)))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest results-descend-by-score
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          hits (code.semantic/search-text (datom/db conn) "index" 4)]
+      (is (= 4 (count hits)))
+      (is (>= (:score (get hits 0)) (:score (get hits 1))))
+      (is (>= (:score (get hits 1)) (:score (get hits 2))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-in-restricts-to-a-namespace
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          q (code.embed/embed "persist an index to disk")
+          everywhere (code.semantic/search db q 4)
+          kitchen (code.semantic/search-in-ns db q "fix.kitchen" 4)]
+      ; globally `save-index` wins…
+      (is (= "save-index" (:name (get everywhere 0))))
+      ; …and within the kitchen namespace it is not a candidate at all.
+      (is (= 2 (count kitchen)))
+      (is (every? (fn [r] (= "fix.kitchen" (:ns r))) kitchen))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-returning-joins-the-tag-by-name
+  ; The tag fact lives on a DIFFERENT entity than the embedding: joining on
+  ; id would find nothing, and an empty candidate set looks exactly like an
+  ; empty answer.
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          hits (code.semantic/search-returning db (code.embed/embed "index") "string" 4)]
+      ; BOTH string-returning functions, and only those: `describe-index`
+      ; (source A) and `name-the-loaf` (source B) — the join is by name.
+      (is (= #{"describe-index" "name-the-loaf"} (set (mapv :name hits))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest re-indexing-an-unchanged-file-changes-nothing
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          before (code.semantic/embeddings (datom/db conn))]
+      (code.semantic/index! conn [["fix.embeddings" (:a f)]])
+      (is (= before (code.semantic/embeddings (datom/db conn))))
+      ; and a band that SHIFTED would duplicate rather than overwrite
+      (is (= 4 (count before)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest similar-excludes-the-function-itself
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          hits (code.semantic/similar (datom/db conn) "save-index" 3)]
+      (is (not (some (fn [r] (= "save-index" (:name r))) hits)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+;; ── the optionality contract ──────────────────────────────────────────
+
+(deftest absence-is-reportable-never-a-crash
+  ; Whatever the state of this machine, asking is safe and named.
+  (let [info (code.embed/info)]
+    (is (= "potion-code-16M-v2" (:model info)))
+    (is (= 256 (:dim info)))
+    (is (or (= true (:available info)) (some? (:why info))))))

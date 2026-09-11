@@ -1,0 +1,470 @@
+; code/semantic.bl — ask the codebase a question in natural language.
+;
+; ── The idea ──────────────────────────────────────────────────────────
+;
+; `codebase.bl` turns source into FACTS (`:fn/name`, `:call/callee`, …) and
+; answers structural questions over them: who calls X, what breaks if X
+; changes, which fns return a string. Structural questions are exact, and they
+; are the wrong shape for the question a person actually starts with:
+;
+;   "where do we check that a transaction's schema is valid?"
+;
+; No fn is named `check-transaction-schema-valid`. The answer is a QUERY whose
+; words do not appear in the code. That is what an embedding is for.
+;
+; So this namespace adds exactly one thing to the codebase: an embedding per
+; function — one more fact, `[?e :fn/embedding ?v]`, in the same conn, the
+; same transaction, the same time axis. It is not a second index beside the
+; database; it is a column. Which is why the query below is a datalog query
+; and not a call to a search API:
+;
+;   [(similar-to :fn/embedding ?q 10) [?e ?score]]
+;
+; ── The two properties worth the whole exercise ───────────────────────
+;
+; 1. SEMANTIC AND STRUCTURAL COMPOSE. `similar-to` is a clause like any
+;    other, so "the 10 functions nearest to this query" and "the functions
+;    that reach `tx/validate!`" are not two systems to join in application
+;    code — they are two lines of one query. See `search-in-ns`.
+;
+; 2. ORDER MATTERS, AND IT MEANS SOMETHING. When a clause upstream has
+;    already bound the entity, `similar-to` searches only those candidates —
+;    so "nearest AMONG the candidates" is genuinely nearest-of-that-set, not
+;    "globally nearest, then filtered to nothing". Putting `[?e :fn/ns "x"]`
+;    BEFORE the analytic clause is therefore a correctness decision, not a
+;    style one, and the queries here are written in that order deliberately.
+;
+; ── What it is NOT ───────────────────────────────────────────────────
+;
+; It is not a replacement for grep. On the CoIR code-retrieval benchmark the
+; model behind `code.embed` scores 39.1 NDCG@10 where BM25 scores 42.3, and
+; the two TOGETHER score 43.4. Lexical and semantic fail on different
+; questions; a code search that has only one of them is worse than one that
+; has both, which is a reason to keep `similar-to` optional and let a caller
+; combine it, not a reason to reach for it always.
+
+(ns code.semantic
+  (:require [code.embed] [codebase] [typed] [datom] [datom.vector]))
+
+;; ── the schema: one more column ─────────────────────────────────────
+;;
+;; `:fn/embedding` beside codebase's own attributes. Added by CONCATENATION,
+;; never by editing `codebase.bl`: a codebase that wants no embeddings keeps
+;; its exact schema, and the facts stay identical either way.
+
+(def EMBEDDING
+  {:db/ident :fn/embedding :db/valueType :db.type/vector})
+
+(defn schema
+  "The codebase schema plus the embedding column."
+  []
+  (conj codebase/SCHEMA EMBEDDING))
+
+(def sigs
+  "The type seeds `codebase/index-source` reads its annotations through — the
+   same set the MCP code surface mounts, so a fact indexed here matches one
+   indexed there."
+  (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
+
+(defn connect
+  "A fresh conn carrying the codebase facts AND an embedding column."
+  []
+  (datom/connect (schema)))
+
+;; ── turning source into a document ──────────────────────────────────
+;;
+;; What gets embedded is a FUNCTION, not a file and not a form: its qualified
+;; name, then its source. The name carries the identifier tokens a query may
+;; name outright (`meet`, `tx`, `lattice`); the source carries the vocabulary
+;; a query describes but never spells. Both are signal to a code-retrieval
+;; model — it was trained on exactly this pairing of docstring-questions to
+;; function bodies.
+
+(defn source-lines
+  "The source split into lines, 1-indexed by position."
+  [src]
+  (into [] (re/split src "\n")))
+
+(defn form-starts
+  "The 1-based line each TOP-LEVEL form begins on, ascending.
+
+   Read from the real reader rather than by scanning for `^\(`, so a form
+   preceded by a reader macro, a metadata map or a comment is located where
+   the reader says it is."
+  [src]
+  (into [] (sort (keep (fn [f] (:line (typed/node-pos f)))
+                       (to-list (BeamLisp.Reader/read_string src))))))
+
+(defn- trim-section-tail
+  "Drop the trailing blank lines and comment-only lines from a slice.
+
+   A slice runs to the NEXT top-level form, so it swallows the blank line and
+   the `;; ── section ──` heading that introduce it. Those comments describe
+   the FOLLOWING function; left here they embed one function's description
+   into another's vector. The symptom is a ranking that is subtly wrong — a
+   function rising because of a neighbour's prose — which is far harder to
+   notice than an exception, so it is worth the six lines to not have."
+  [slice]
+  (loop [ls (vec slice)]
+    (if (empty? ls)
+      ls
+      (let [last-line (trim (peek ls))]
+        (if (or (= "" last-line) (= ";" (subs last-line 0 1)))
+          (recur (pop ls))
+          ls)))))
+
+(defn slice-text
+  "The source text of the top-level form beginning on `line`.
+
+   The end is the next top-level form's start — the reader knows where forms
+   begin, and a form ends where the next one starts. The last form runs to EOF.
+   This is exact for whole forms and needs no paren balancing, which would
+   have to re-implement string and comment handling to be correct."
+  [lines starts line]
+  (let [n (count lines)
+        after (sort (filter (fn [l] (> l line)) (to-list starts)))
+        end (if (empty? after) n (dec (first after)))
+        from (dec line)]
+    (if (or (>= from end) (>= from n))
+      ""
+      (join "\n" (trim-section-tail (subvec lines from (min end n)))))))
+
+(defn document
+  "The text a function is embedded as: its qualified name, then its source."
+  [ns-str name text]
+  (str ns-str "/" name "\n" text))
+
+(defn- fn-entities
+  "One entry per FUNCTION, in SOURCE ORDER, from the fn facts.
+
+   A function emits several facts — one per arity, one per return tag — and
+   every one of them is a separate entity. The function is what has a meaning,
+   so they are grouped by `ns/name` and the embedding is asserted on each of
+   the group's entity ids: one vector, written where every arity can find it,
+   and one row out of a query.
+
+   Sorted by line, and that is not cosmetic: the grouping is a map, and a
+   map's `vals` come back in an order nobody promised. Documents would then
+   be embedded in an arbitrary order and — worse — the ORDER WOULD LOOK
+   PLAUSIBLE, so the only symptom is a listing that does not match the file."
+  [fn-facts]
+  (into []
+        (sort-by (fn [e] (:line e))
+                 (vals
+                   (reduce
+                     (fn [acc f]
+                       (let [k (str (:fn/ns f) "/" (:fn/name f))]
+                         (if (contains? acc k)
+                           (assoc acc k (update (get acc k) :ids conj (:db/id f)))
+                           (assoc acc k {:name (:fn/name f) :ns (:fn/ns f)
+                                         :line (:fn/line f) :ids [(:db/id f)]}))))
+                     {}
+                     (filterv (fn [f] (and (some? (:fn/name f)) (some? (:fn/line f))))
+                              (to-list fn-facts)))))))
+
+(defn documents
+  "Every function in `src` as `{:name :ns :line :text}` — what would be
+   embedded. Exposed because “what does the model actually see?” is the first
+   question worth asking of any retrieval result."
+  [ns-str src]
+  (let [lines (source-lines src)
+        starts (form-starts src)]
+    (mapv (fn [e]
+            {:name (:name e) :ns (:ns e) :line (:line e)
+             :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
+          (fn-entities (:fn (codebase/index-source sigs ns-str src))))))
+
+;; ── indexing ────────────────────────────────────────────────────────
+
+(defn- shift-ids
+  "Every fact's `:db/id` moved by `delta`.
+
+   `codebase/index-source` numbers entities from a FIXED base (fns from 1000,
+   call facts from 100000), so two files indexed into one conn collide
+   outright: the second file's `1000` is the first file's `1000`, and the first
+   file's facts and embeddings are silently overwritten. Entities join by
+   `:fn/name` and `:call/*` STRINGS everywhere, never by id, so shifting an
+   index's ids is semantically free — it is what makes several files share one
+   fact space at all."
+  [facts delta]
+  (mapv (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) (to-list facts)))
+
+(defn index-source!
+  "Index ONE file into `conn`: its codebase facts AND an embedding per
+   function, in ONE transaction.
+
+   One transaction matters. The vector and the facts it describes commit
+   together, so there is no window in which a query can find an embedding
+   whose function does not exist yet — the same atomicity every other fact
+   gets, for free, because a vector IS a fact.
+
+   `offset` shifts this file's entity ids clear of every other file's (see
+   `shift-ids`); `index!` derives it from the file's position in the set."
+  ([conn ns-str path] (index-source! conn ns-str path 0))
+  ([conn ns-str path offset]
+  (let [src (File/read! path)
+        raw (codebase/index-source sigs ns-str src)
+        facts {:fn (shift-ids (:fn raw) offset) :calls (shift-ids (:calls raw) offset)}
+        lines (source-lines src)
+        starts (form-starts src)
+        ; already in source order, and a VECTOR: the loop below indexes it,
+        ; and `get` by position on a seq is nil — which would transact no
+        ; embedding at all while reporting the functions as indexed.
+        ents (fn-entities (:fn facts))
+        docs (mapv (fn [e]
+                     {:name (:name e) :ns (:ns e) :line (:line e)
+                      :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
+                   ents)
+        vecs (code.embed/embed-batch (mapv :text docs))
+        embeds (reduce
+                 (fn [acc i]
+                   (let [e (get ents i) v (get vecs i)]
+                     (concat acc (mapv (fn [id] {:db/id id :fn/embedding v}) (:ids e)))))
+                 []
+                 (range (count ents)))]
+    (datom/transact! conn (concat (:fn facts) (:calls facts) embeds))
+    {:file path :ns ns-str
+     :functions (count ents)
+     :facts (+ (count (:fn facts)) (count (:calls facts)))
+     ; the texts the model actually saw — carried out, not discarded, because
+     ; "what was embedded?" is the first question worth asking of any
+     ; retrieval result.
+     :documents docs})))
+
+(defn offset-for
+  "The entity-id band source `i` (0-based) is indexed into.
+
+   Exposed, not inlined, so a caller that re-indexes ONE source later — the
+   live case — lands on the same band as `index!` gave it. A second band would
+   not overwrite; it would DUPLICATE, leaving two live embeddings per function
+   and a query that returns both."
+  [i]
+  (* (+ i 1) 1000000))
+
+(defn index!
+  "Index a whole codebase. `sources` is a seq of `[ns-string path]` pairs —
+   the shape the MCP code surface already mounts.
+
+   Each file is given its own id band, a million apart, so a set of sources
+   lands in one conn without collision."
+  [conn sources]
+  (into []
+        (map-indexed
+          (fn [i pair]
+            (index-source! conn (get pair 0) (get pair 1) (offset-for i)))
+          (to-list sources))))
+
+(defn ns-of-file
+  "The `(ns …)` name declared in `path` — the namespace a file's facts are
+   attributed to. Falls back to the file's base name so a file the reader
+   cannot parse still gets indexed under a stable name instead of `nil`.
+
+   `Regex/run` (not the compat `re-find`) because it has no dependency on a
+   compat namespace being loaded first, and it returns Clojure's shape —
+   `(whole g1 …)`, a LIST whose second element is group 1 (`get` on a list by
+   index is nil in this language, which reads as a failed match). The pattern
+   is built with `Regex/compile!` rather than with a hash-quote regex literal,
+   which this reader does not provide: the literal reads as the symbol `#`
+   followed by a string, and the failure surfaces as `undefined var: <ns>/#` —
+   an error that names neither the regex nor the file it is in."
+  [path]
+  ; `File/read` (not `File/read!`): this is called on every path a glob
+  ; returns, and a file that vanished between the glob and the read is an
+  ; environment fact, not a reason to abort an index of a thousand files.
+  (let [src (second (File/read path))]
+    ; `second` of `{:error, :enoent}` is the ATOM `:enoent`, not nil — so the
+    ; question is whether what came back is a binary, not whether it is absent.
+    (if (erlang/is_binary src)
+      (let [m (Regex/run (Regex/compile! "\\(ns\\s+([^\\s\\)\\]]+)") src)]
+        (if (some? m) (second m) (last (re/split path "/"))))
+      (last (re/split path "/")))))
+
+(defn index-dir!
+  "Index every `*.bl` under `root`, taking each file's namespace from its
+   `(ns …)` form. Convenience for a demo, or for indexing a whole checkout
+   when a few seconds of indexing is the right trade."
+  [conn root]
+  (let [paths (sort (Path/wildcard (str root "/**/*.bl")))]
+    (index! conn (mapv (fn [p] [(ns-of-file p) p]) (to-list paths)))))
+
+;; ── search ──────────────────────────────────────────────────────────
+
+(def SEARCH-Q
+  '[:find ?name ?ns ?line ?score
+    :in $ ?q ?k
+    :where [(similar-to :fn/embedding ?q ?k) [?e ?score]]
+           [?e :fn/name ?name]
+           [?e :fn/ns ?ns]
+           [?e :fn/line ?line]])
+
+(defn- row
+  [r]
+  {:name (get r 0) :ns (get r 1) :line (get r 2) :score (get r 3)})
+
+(defn- ranked
+  "Rows (`{:name :ns :line :score}`), most similar first.
+
+   The sort is NOT redundant. A datalog query returns a SET, and `similar-to`
+   generates its rows in score order — but the join against the fn facts runs
+   afterwards and is free to emit them in any order, so the ranking the search
+   produced is not the ranking that comes out. Measured on a two-file corpus:
+   the raw rows came back 0.245, 0.129, 0.198, 0.173, 0.130 — the RIGHT five
+   functions in arbitrary order, which reads as a bad ranking rather than as a
+   missing sort. K nearest is a ranking, so the last step is to rank."
+  [rows]
+  (into [] (sort-by (fn [r] (:score r)) (fn [a b] (compare b a)) rows)))
+
+(defn search
+  "The `k` functions nearest to the embedding `dvec`, most similar first —
+   each `{:name :ns :line :score}`.
+
+   `k` is a BOUND VARIABLE, not a literal, because `similar-to` resolves its
+   arguments through the same binding environment every other clause uses —
+   so the count is a query parameter like any other."
+  [db dvec k]
+  (ranked (mapv row (datom/q SEARCH-Q db dvec k))))
+
+(defn search-text
+  "Ask the codebase a question in English. This is the whole user-facing
+   surface of the feature."
+  [db text k]
+  (search db (code.embed/embed text) k))
+
+;; ── nearest WITHIN a set ───────────────────────────────
+;;
+;; `similar-to` is a datalog clause, and a clause sees the world one BINDING at
+;; a time. That is right for its two natural jobs — GENERATE (the entity is
+;; free: the k nearest of everything) and SCORE (the entity is bound: how
+;; relevant is THIS function to the query). It is the wrong shape for a third
+;; question — the k nearest WITHIN a set — because a set has to be visible all
+;; at once for a k over it to mean anything.
+;;
+;; Written down because the wrong answers are silent and look plausible:
+;;
+;;   · bind `?e` from a pattern over a LITERAL (`[?e :fn/ns "datom.tx"]`) and
+;;     the query yields EVERY function in that namespace, each with its score
+;;     — unranked, unbounded by k, and easy to mistake for a ranking;
+;;   · bind the same pattern from an `:in` variable instead and the engine
+;;     carries the variable as ONE set-valued binding, which the provider reads
+;;     as "the single bound entity", matches nothing, and answers ZERO rows.
+;;
+;; Neither is "the k nearest in the set", and neither says so. So the
+;; restricted search is not a clause: it is the same kernel `similar-to` calls
+;; (`datom.vector/search`), handed the candidate corpus in one piece.
+
+(defn embeddings
+  "Every `[entity dvec]` in the embedding column, at the current basis."
+  [db]
+  (mapv (fn [r] [(get r 0) (get r 1)])
+        (into [] (datom/q '[:find ?e ?v :where [?e :fn/embedding ?v]] db))))
+
+(defn- fn-index
+  "entity → `{:name :ns :line}` for every indexed function.
+
+   Fetched once per search rather than once per hit: a lookup per hit is how a
+   k-nearest query quietly becomes k queries."
+  [db]
+  (reduce
+    (fn [m r] (assoc m (get r 0) {:name (get r 1) :ns (get r 2) :line (get r 3)}))
+    {}
+    (into [] (datom/q '[:find ?e ?name ?ns ?line
+                        :where [?e :fn/name ?name]
+                               [?e :fn/ns ?ns]
+                               [?e :fn/line ?line]] db))))
+
+(defn- hits->rows
+  "`[[entity score] …]` → `[{:name :ns :line :score} …]`.
+
+   A hit whose entity has no fn facts is dropped rather than emitted as a row
+   of nils: that is an embedding with no function behind it, which `stats` is
+   the right place to report."
+  [index hits]
+  (into [] (keep (fn [h]
+                   (let [facts (get index (get h 0))]
+                     (if (nil? facts) nil (assoc facts :score (get h 1)))))
+                 (to-list hits))))
+
+(defn search-in
+  "The `k` functions nearest to `dvec` AMONG those `cand-q` selects.
+
+   `cand-q` is a datalog query whose `:find` is `?e`, taking one `:in` input:
+   the filter that defines the candidate set — `[?e :fn/ns ?nsf]`,
+   `[?e :fn/ret-tag ?tag]`, or anything else the engine can express."
+  [db dvec cand-q input k]
+  (let [allowed (set (mapv (fn [r] (get r 0)) (into [] (datom/q cand-q db input))))
+        candidates (filterv (fn [p] (contains? allowed (get p 0))) (embeddings db))]
+    (if (empty? candidates)
+      []
+      (ranked (hits->rows (fn-index db)
+                          (datom.vector/search dvec candidates k
+                                               (datom.vector/default-rerank k)))))))
+
+(defn search-in-ns
+  "The `k` functions nearest to `dvec`, restricted to ONE namespace."
+  [db dvec ns-str k]
+  (search-in db dvec '[:find ?e :in $ ?nsf :where [?e :fn/ns ?nsf]] ns-str k))
+
+(defn search-returning
+  "The `k` functions nearest to `dvec` among those whose return type may
+   include `tag` — a corpus narrowed by a FACT, ranked by MEANING.
+
+   The candidate set joins on NAME, not on id, and that is not a shortcut.
+   `codebase.bl` gives a function ONE entity per arity (carrying `:fn/line`)
+   and a SEPARATE entity per return tag (carrying `:fn/ret-tag`, no line), and
+   the embedding is written on the arity entities. So `[?e :fn/ret-tag ?t]`
+   alone binds the tag entity, which has no vector, and a search restricted to
+   it finds nothing — silently, because an empty candidate set and an empty
+   answer look identical. The shared `:fn/name` is the identity; the ids are
+   an allocation detail."
+  [db dvec tag k]
+  (search-in db dvec
+    '[:find ?e :in $ ?tag
+      :where [?d :fn/ret-tag ?tag]
+             [?d :fn/name ?n]
+             [?e :fn/name ?n]
+             [?e :fn/embedding ?v]]
+    tag k))
+
+(defn similar
+  "More like this: the `k` functions nearest to `name`'s own embedding.
+
+   The query IS the item, which is the trick that makes this work without a
+   second system: a stored embedding can be used as a query vector, because
+   it is just a value. The function itself is excluded — it is its own
+   nearest neighbour at 1.0, which is true and useless."
+  [db name k]
+  (let [found (into [] (datom/q '[:find ?v :in $ ?n
+                                  :where [?e :fn/name ?n] [?e :fn/embedding ?v]]
+                                db name))]
+    (if (empty? found)
+      []
+      (let [q (get (get found 0) 0)]
+        (into [] (filter (fn [r] (not= (:name r) name))
+                         (search db q (+ k 1))))))))
+
+;; ── what is in the index ────────────────────────────────────────────
+
+(defn stats
+  "Counts for a manifest or a health line: how many functions the codebase
+   declares, how many of them carry an embedding, and how many call facts.
+
+   Counting `[?e :fn/name _]` is NOT counting functions. `codebase.bl` gives a
+   function one entity per arity AND a separate entity per return tag, and
+   those tag entities carry the name too — so the naive count reports a
+   codebase with annotations as larger than it is, by exactly the number of
+   annotations. The entity that carries a source LINE is the function; the
+   name is the identity shared across its entities."
+  [db]
+  (let [declared (into [] (datom/q '[:find ?ns ?name
+                                     :where [?e :fn/name ?name]
+                                            [?e :fn/ns ?ns]
+                                            [?e :fn/line ?l]] db))
+        embedded (into [] (datom/q '[:find ?ns ?name
+                                     :where [?e :fn/embedding ?v]
+                                            [?e :fn/name ?name]
+                                            [?e :fn/ns ?ns]] db))
+        key-of (fn [r] (str (get r 0) "/" (get r 1)))]
+    {:functions (count (distinct (mapv key-of declared)))
+     :embedded (count (distinct (mapv key-of embedded)))
+     :calls (or (get (get (into [] (datom/q '[:find (count ?c) :where [?c :call/caller _]]
+                                           db)) 0) 0) 0)}))

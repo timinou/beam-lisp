@@ -1,0 +1,269 @@
+; examples/code-semantic/02-live.bl — the index follows the code.
+;
+; Run:
+;   mix beam_lisp.run --path priv --path examples examples/code-semantic/02-live.bl
+;
+; Type at the prompt (when run from a terminal):
+;
+;   <anything>     ask the codebase, in English
+;   :add           append a function to the sample source
+;   :reindex       re-index the sample and report what the watch saw
+;   :events        how many embedding datoms the watch has seen so far
+;   :quit
+;
+; With no terminal attached (a pipe, CI, `mix beam_lisp.examples`) the same
+; commands are played from a scripted session — the SAME loop, so what runs in
+; CI is what you type, not a re-implementation of it.
+;
+; ── What this is about ────────────────────────────────────────────────
+;
+; 01-search-by-meaning.bl indexes a codebase once and answers questions
+; about it. That is a batch job. The interesting case is the one every
+; editor plugin lives in: the code CHANGES, and the answers have to change
+; with it.
+;
+; On beam-lisp that is not a feature to build. An embedding is a fact, and
+; the database already knows how to tell you that a fact changed — the L3
+; `datom/watch` fires on the commit itself. So "keep the index live" is:
+;
+;   · re-index the file that changed (one function, same id band), and
+;   · a watch on `[?e :fn/embedding ?v]` tells you exactly which embeddings
+;     moved, without polling and without a diffing layer.
+;
+; ── Why the sample is a COPY ──────────────────────────────────────────
+;
+; The demo edits source and re-indexes it. An example must not edit the
+; repository it is explaining, so two real beam-lisp files are copied into a
+; scratch directory under the system temp dir, and THAT is what gets edited.
+
+(ns example.code-semantic.live
+  (:require [code.embed] [code.semantic] [datom] [datom.watch]))
+
+;; ── the gate ──────────────────────────────────────────────────────────
+;;
+;; Optional, as everywhere: with no model this throws a message the example
+;; runner classifies as an absent optional dependency and SKIPS.
+
+(code.embed/require-model!)
+
+(defn- heading [text] (println (str "\n── " text " ──")))
+
+(defn- show-hits
+  [rows]
+  (if (empty? rows)
+    (println "      — nothing —")
+    (doseq [r rows]
+      (println (str "      " (:ns r) "/" (:name r)
+                    "   line " (:line r)
+                    "   " (:score r))))))
+
+;; ── a scratch copy, so the demo can edit it ───────────────────────────
+
+(def SAMPLE
+  [["datom.vector" "priv/lib/datom/vector.bl"]
+   ["datom.tx"     "priv/lib/datom/tx.bl"]])
+
+(def scratch
+  (str (System/tmp_dir!) "/beam-lisp-live-"
+       (erlang/list_to_binary (os/getpid))
+       "_" (erlang/unique_integer (to-list [:positive]))))
+
+(File/mkdir_p! scratch)
+
+(def sources
+  (into []
+        (map-indexed
+          (fn [i pair]
+            (let [path (str scratch "/" (get pair 0) ".bl")]
+              (File/write! path (File/read! (get pair 1)))
+              {:index i :ns (get pair 0) :path path}))
+          SAMPLE)))
+
+(defn- index-all!
+  []
+  (into [] (mapv (fn [s]
+                   (code.semantic/index-source! conn (:ns s) (:path s)
+                                                (code.semantic/offset-for (:index s))))
+                 sources)))
+
+;; ── the connection, and the watch ─────────────────────────────────────
+
+(def conn (code.semantic/connect))
+
+(defn- db
+  "The CURRENT basis.
+
+   A function, not a value: `(datom/db conn)` snapshots the store, so a `db`
+   captured once would answer every later question against the state of the
+   world at boot — an index that reads as empty right after indexing, and a new
+   function that cannot be found right after adding it. The live demo is
+   exactly the program where that mistake shows."
+  []
+  (datom/db conn))
+
+;; The watch is a pattern, not a poll: it fires ON the commit that asserts or
+;; retracts an embedding datom, so it is exact about what changed.
+;;
+;; The callback reports to the process that STARTED the watch, captured as a
+;; LOCAL — not as a namespace var. The watch runs in a process of its own, and
+;; a var reference inside the callback is resolved, at call time, through the
+;; environment that compiled it; under the example runner's isolated fork that
+;; environment is not visible from the watch's process, and the callback dies
+;; with `undefined var: <example-ns>/me` before it can report anything. A local
+;; is captured in the closure and crosses the boundary.
+
+(defn- watch-embeddings!
+  []
+  (let [me (erlang/self)]
+    (datom.watch/watch conn '[?e :fn/embedding ?v]
+      (fn [changes] (erlang/send me [:embedding (count (to-list changes))])))))
+
+(def watch-ref (watch-embeddings!))
+
+(defn- drain-events
+  "Collect the embedding-change counts the watch has queued.
+
+   A short timeout is not a race: the watch fires synchronously with the
+   commit (`listen!` before the transact, `send` before it returns), so by the
+   time the next line runs the messages are already in this mailbox. The
+   timeout only bounds a mistake."
+  [n]
+  (receive
+    [:embedding k] (drain-events (+ n k))
+    (after 150 n)))
+
+;; ── the edit ──────────────────────────────────────────────────────────
+
+(def ADDITION
+  "
+(defn save-index
+  \"Persist an embedding index to disk so the next run reloads it instead of
+   re-embedding every function from scratch.\"
+  [index path]
+  (File/write! path index))
+
+(defn load-index
+  \"Read back the index save-index wrote, or nil when nothing is saved yet.\"
+  [path]
+  (if (= true (File/exists? path)) (File/read! path) nil))
+")
+
+(defn- add-functions!
+  "Append the two functions to the FIRST source.
+
+   Appending at the end is deliberate: `codebase/index-source` hands out entity
+   ids from the top of the file down, so a new function at the end cannot move
+   an existing function's ids — the edit is purely additive, which is what
+   makes “what changed?” a clean question. Re-indexing is the caller's next
+   step, so the edit and the re-index are separately visible."
+  []
+  (let [s (get sources 0)]
+    ; Read, extend, write back WHOLE. `File/write!` with an `:append` option
+    ; plus a read-and-concatenate does both halves of the job twice, and the
+    ; doubled file is not obviously wrong downstream: `codebase/index-source`
+    ; keys functions by name, so the duplicate copy collapses and the function
+    ; COUNT still looks right. The only symptom is that every embedding
+    ; re-asserts on a fresh set of ids — more watch events than the edit
+    ; warranted, which is how a two-function addition reported twelve changes.
+    (File/write! (:path s) (str (File/read! (:path s)) ADDITION))))
+
+(defn- reindex!
+  "Re-index the sample, and report what it cost and what it MOVED.
+
+   The event count is the watch's, not a guess: `drain-events` before and
+   after brackets exactly the commits this call made."
+  [label]
+  (drain-events 0)
+  (let [t0 (System/monotonic_time :millisecond)
+        r (index-all!)
+        ms (- (System/monotonic_time :millisecond) t0)
+        fns (reduce (fn [n x] (+ n (:functions x))) 0 r)]
+    (println (str "      " label ": " (count sources) " files → " fns
+                  " functions in " ms " ms"))
+    (println (str "      the watch saw " (drain-events 0)
+                  " embedding datoms change"))))
+
+;; ── one loop, two command sources ─────────────────────────────────────
+
+(defn- terminal?
+  "Whether a terminal is attached. `io:columns/0` answers `:enotsup` for
+   anything that is not a tty — a pipe, a file, or the isolated fork the
+   example runner uses. Testing it is what keeps `IO.gets` from BLOCKING
+   forever on a stdin nobody will ever write to."
+  []
+  (= :ok (erlang/element 1 (io/columns))))
+
+(defn- scripted-commands
+  "The session played when there is no terminal. Same commands, same loop —
+   what runs in CI is what a person types, not a re-implementation of it."
+  []
+  ["save an index to disk so the next run does not re-embed every function"
+   ":add"
+   ":reindex"
+   "save an index to disk so the next run does not re-embed every function"
+   ":quit"])
+
+(defn- next-command
+  "The next command line, or nil when the session is over."
+  [interactive? script pos]
+  (if interactive?
+    (let [line (IO/gets "> ")]
+      (if (= :eof line) nil (trim line)))
+    (if (>= pos (count script)) nil (get script pos))))
+
+(defn- run-command
+  "Execute one command. Returns `false` to end the session."
+  [cmd]
+  (cond
+    (= ":quit" cmd) false
+    (= ":add" cmd)
+      (do (println "      appending save-index / load-index to the sample source")
+          (add-functions!)
+          true)
+    (= ":reindex" cmd) (reindex! "re-indexed")
+    true
+      (do (println (str "    Q: " cmd))
+          (show-hits (code.semantic/search-text (db) cmd 3))
+          true)))
+
+(defn- session
+  [interactive?]
+  (loop [pos 0]
+    (let [cmd (next-command interactive? (scripted-commands) pos)]
+      (if (nil? cmd)
+        :done
+        (if (run-command cmd)
+          (recur (+ pos 1))
+          :done)))))
+
+;; ── the session ───────────────────────────────────────────────────────
+
+(heading "indexing the sample")
+(reindex! "indexed")
+(println (str "      " (get (code.semantic/stats (db)) :embedded)
+              " embeddings are now facts in one conn"))
+(println (str "      scratch copy: " scratch))
+
+(heading "a question whose answer does not exist yet")
+
+(if (terminal?)
+  (println "      type a question, or :add / :reindex / :events / :quit")
+  (println "      (no terminal attached — playing the scripted session)"))
+
+(session (terminal?))
+
+(heading "what just happened")
+
+(println "      · `:add` edited a source file; `:reindex` re-embedded it")
+(println "      · the WATCH reported the changed embeddings — a fact changed, and")
+(println "        the database said so, with no polling and no diffing layer")
+(println "      · the same question now answers with the new functions, because")
+(println "        the new functions are new FACTS in the same conn, not new rows")
+(println "        in a side index that would have needed its own invalidation")
+(println "")
+(println "      that is the whole live story: grep is always current because it")
+(println "      reads the file; this is current because the file is the index.")
+
+(datom.watch/unwatch watch-ref)
+(File/rm_rf scratch)
+(println (str "\n      scratch removed: " scratch))

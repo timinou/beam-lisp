@@ -62,9 +62,16 @@ defmodule Mix.Tasks.BeamLisp.Examples do
     end
 
     # Hand ward the {path, source} entries as data; it runs + reports in bl.
+    #
+    # `Loader.read_source/1`, not `File.read!`: the loader's own read strips a
+    # `#!/usr/bin/env bl` shebang and reduces a literate `.bl.md`/`.bl.org`
+    # document to its code cells — exactly as `bl run` does. A raw read hands
+    # ward the shebang and fails an otherwise-runnable executable script, which
+    # is why this task and `test/beam_lisp/examples_test.exs` (which reads
+    # through the loader) disagreed about the same three files.
     entries =
       Enum.map(paths, fn p ->
-        %{"path" => p, "src" => File.read!(p)}
+        %{"path" => p, "src" => BeamLisp.Loader.read_source(p)}
       end)
 
     BeamLisp.Env.intern("user", "__ward_examples__", entries)
