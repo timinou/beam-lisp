@@ -32,18 +32,33 @@ defmodule BeamLisp.NativeCompilerTest do
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
 
-      assert Mix.Tasks.Compile.BeamLispNative.built_path(dir, "lazy_memo") == nil
+      assert BeamLisp.Cargo.built_cdylib(dir, "lazy_memo") == nil
 
       File.write!(Path.join(dir, "liblazy_memo.dylib"), "fixture; never loaded")
 
-      assert Mix.Tasks.Compile.BeamLispNative.built_path(dir, "lazy_memo") ==
+      assert BeamLisp.Cargo.built_cdylib(dir, "lazy_memo") ==
                Path.join(dir, "liblazy_memo.dylib")
 
       # linux's name wins when both are present (they never are in practice)
       File.write!(Path.join(dir, "liblazy_memo.so"), "fixture")
 
-      assert Mix.Tasks.Compile.BeamLispNative.built_path(dir, "lazy_memo") ==
+      assert BeamLisp.Cargo.built_cdylib(dir, "lazy_memo") ==
                Path.join(dir, "liblazy_memo.so")
+    end
+
+    test "finds a tool cargo built without an extension, and a .exe on windows" do
+      dir = Path.join(System.tmp_dir!(), "bin_probe_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      assert BeamLisp.Cargo.built_bin(dir, "drop") == nil
+
+      File.write!(Path.join(dir, "drop"), "fixture")
+      assert BeamLisp.Cargo.built_bin(dir, "drop") == Path.join(dir, "drop")
+
+      File.rm!(Path.join(dir, "drop"))
+      File.write!(Path.join(dir, "drop.exe"), "fixture")
+      assert BeamLisp.Cargo.built_bin(dir, "drop") == Path.join(dir, "drop.exe")
     end
 
     test "installs under the extension the BEAM appends, not cargo's name" do

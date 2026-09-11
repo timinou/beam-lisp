@@ -25,7 +25,15 @@ set -e
 cd "$(dirname "$0")"
 
 RELEASE_DIR="${1:-}"
-DROP_BIN="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}/release/drop"
+
+# Ask cargo where it builds. `CARGO_TARGET_DIR`, or a `build.target-dir` in any
+# `.cargo/config.toml` (the user-level one included), redirects the target
+# directory; hardcoding one workstation's shared ~/.cache/cargo-target is how
+# this script — and `mix bl.build` — failed everywhere else.
+CARGO_TARGET="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  | sed -n 's/.*"target_directory" *: *"\([^"]*\)".*/\1/p' | head -1)"
+CARGO_TARGET="${CARGO_TARGET:-${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}}"
+DROP_BIN="$CARGO_TARGET/release/drop"
 
 if [ -z "$RELEASE_DIR" ]; then
   echo "make-drops: building host release (MIX_ENV=prod mix release bl)…"

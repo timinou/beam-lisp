@@ -142,41 +142,16 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
     end
   end
 
-  defp target_dir(crate_dir) do
-    case System.cmd("cargo", ["metadata", "--format-version", "1", "--no-deps"],
-           cd: crate_dir,
-           stderr_to_stdout: true
-         ) do
-      {json, 0} ->
-        # A hand-rolled extraction, because pulling in a JSON dependency
-        # for one field would be a poor trade. The key appears once.
-        case Regex.run(~r/"target_directory"\s*:\s*"([^"]+)"/, json) do
-          [_, dir] -> dir
-          _ -> Path.join(crate_dir, "target")
-        end
-
-      _ ->
-        Path.join(crate_dir, "target")
-    end
-  end
-
   defp install(crate, crate_dir) do
-    # ASK cargo where it put the artifact rather than assuming
-    # `<crate>/target`. A `CARGO_TARGET_DIR` in the environment (or a
-    # workspace, or `.cargo/config.toml`) redirects it elsewhere — on
-    # this machine to a shared `~/.cache/cargo-target` — and the
-    # assumption failed in the most confusing way available: cargo
-    # reported success, and the copy then failed on a path that had
-    # never existed.
-    #
-    # cargo names a cdylib per platform — `lib<name>.so`, `lib<name>.dylib`,
-    # `<name>.dll`. Probe, don't assume: assuming `.so` made a *successful*
-    # macOS build look like a missing crate.
-    built = built_path(built_dir(crate_dir), crate)
+    # Both halves of "where is the artefact" live in BeamLisp.Cargo: the target
+    # directory (asked of cargo, never assumed) and the per-platform cdylib
+    # name. Assuming either reports a successful build as a missing crate —
+    # which is exactly how a macOS NIF build, and a CI drop build, each died.
+    built = BeamLisp.Cargo.built_cdylib(BeamLisp.Cargo.release_dir(crate_dir), crate)
 
     if is_nil(built) do
       Mix.raise("""
-      cargo reported success but produced no #{crate} cdylib in #{built_dir(crate_dir)}.
+      cargo reported success but produced no #{crate} cdylib in #{BeamLisp.Cargo.release_dir(crate_dir)}.
 
       Most likely the crate is not configured as a cdylib. Its
       Cargo.toml needs:
@@ -227,20 +202,4 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
     end
   end
 
-  # cargo's per-platform cdylib name. A closed set, so probing beats parsing
-  # cargo's JSON artifact messages — and probing is what makes the macOS arm
-  # (`lib<crate>.dylib`) reachable from a test on any host.
-  @doc false
-  def built_path(dir, crate) do
-    Enum.find(
-      [
-        Path.join(dir, "lib#{crate}.so"),
-        Path.join(dir, "lib#{crate}.dylib"),
-        Path.join(dir, "#{crate}.dll")
-      ],
-      &File.exists?/1
-    )
-  end
-
-  defp built_dir(crate_dir), do: Path.join(target_dir(crate_dir), "release")
 end

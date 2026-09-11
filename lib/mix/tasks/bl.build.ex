@@ -44,8 +44,6 @@ defmodule Mix.Tasks.Bl.Build do
 
     out = Path.expand(opts[:out] || "./bl")
     drop_dir = Path.join(File.cwd!(), "tooling/drop")
-    cargo_target = System.get_env("CARGO_TARGET_DIR") || Path.expand("~/.cache/cargo-target")
-    drop_bin = Path.join([cargo_target, "release", "drop"])
 
     # 1. compile
     Mix.shell().info("bl.build: compiling…")
@@ -71,8 +69,14 @@ defmodule Mix.Tasks.Bl.Build do
       {_, 0} = cmd("cargo", ["build", "--release"], cd: drop_dir)
     end
 
-    unless File.exists?(drop_bin) do
-      Mix.raise("bl.build: drop tool not found at #{drop_bin} (cargo build failed?)")
+    # Ask cargo where it put them. Assuming a target dir (this task once
+    # hardcoded this workstation's shared `~/.cache/cargo-target`) reports a
+    # perfectly successful cargo build as a missing tool on every runner.
+    cargo_release = BeamLisp.Cargo.release_dir(drop_dir)
+    drop_bin = BeamLisp.Cargo.built_bin(cargo_release, "drop")
+
+    if is_nil(drop_bin) do
+      Mix.raise("bl.build: drop tool not found in #{cargo_release} (cargo build failed?)")
     end
 
     # 4. pack
