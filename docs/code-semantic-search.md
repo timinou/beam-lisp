@@ -29,10 +29,9 @@ That compression is extreme, and it is worth knowing by number.
 
 Three facts sit in that table.
 
-**It is small enough to be a default.** 84 MB resident against a transformer's
-644 MB of weights is the difference between "the language ships a semantic tier"
-and "the language needs a GPU box". The Rust side holds the f32 matrix; the file
-on disk is half that.
+**It is small enough to be a default.** 83 MB of resident weights against a
+transformer's 644 MB is the difference between "the language ships a semantic
+tier" and "the language needs a GPU box".
 
 **It is fast enough to re-do.** The 177 functions of beam-lisp's own datom layer
 embed in 27–36 ms, or about 0.17 ms per function, once the model is loaded
@@ -76,8 +75,9 @@ plus list overhead, and every embed crosses the boundary twice. Behind the
 resource the arithmetic happens where the numbers already are.
 
 That the weights really are off the heap is measurable, not a claim: loading the
-model moves RSS by ~84 MB and the BEAM's own `erlang:memory(total)` by **4 KB**.
-The vector column costs the heap 1.6 MB for 177 embeddings — where it belongs.
+model moves RSS by 83 MB (85 028–85 120 kB across three runs) and the BEAM's own
+`erlang:memory(total)` by **43–51 KB**. The whole vector column costs the heap
+1.5 MB for 177 embeddings — where it belongs.
 
 A batch crosses **once**, as packed little-endian f32 bytes: one binary holding
 `count × dim` floats. That is already the shape `datom.vector`'s `DVec` stores,

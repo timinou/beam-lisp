@@ -48,16 +48,16 @@ separate the BEAM's heap from everything else:
 
 | | cost |
 |---|---|
-| boot with `datom`, model not required | 156–176 MB RSS |
+| boot with `datom`, model not required | VmRSS 156–176 MB (what is required varies) |
 | `code.embed` + `code.semantic` required, model NOT loaded | no measurable change |
-| model loaded | **+82 to +85 MB RSS**, and **+4 KB** of BEAM heap |
-| first embed after load (model read + tokenizer build) | 266–278 ms, once |
+| model loaded | **+83 MB VmRSS** (85 028–85 120 kB), **+43–51 KB** of BEAM heap |
+| first embed after load (safetensors parse + tokenizer build) | 266–278 ms, once |
 | 177 functions / 160 288 characters | **27–36 ms**, ≈ 0.17 ms per function |
-| 177 embeddings live in the conn | 1.6 MB of BEAM heap |
+| 177 embeddings live in the conn | 1.5 MB of BEAM heap |
 
-The last two rows of that table are the point. The model's 84 MB is *Rust's*,
-not the BEAM's — the heap moves 4 KB — and a whole codebase's worth of vectors
-costs about the size of a photograph.
+Those last two rows are the point: the model's 83 MB is *Rust's*, not the
+BEAM's — the heap moves 43 KB — and a whole codebase's worth of vectors costs
+the heap about the size of a photograph.
 
 Indexing *cost* in the demos is dominated by `codebase/index-source` (parsing
 and walking), not by the model: the eight-file corpus takes single-digit
