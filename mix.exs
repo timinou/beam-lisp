@@ -4,7 +4,11 @@ defmodule BeamLisp.MixProject do
   def project do
     [
       app: :beam_lisp,
-      version: "0.1.0",
+      # Release version. CI stamps this from the tag, normalized to a valid
+      # `Version` (`v2026.0` → `2026.0.0`), so the tag is the single source of
+      # truth for an artifact; a local build keeps the source default.
+      # `bl version` reads it back from `:beam_lisp`'s vsn at runtime.
+      version: System.get_env("BL_VERSION") || "0.1.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       # AFTER :elixir, not before. A Mix compiler task must itself be

@@ -1,5 +1,10 @@
 #!/usr/bin/env sh
-# make-drops.sh — build `drop` bundles for every target with a staged release.
+# make-drops.sh — build `drop` bundles locally, for the host + cross-target packs.
+#
+# For release artifacts (linux/macos, both architectures, one native runner per
+# target) use the GitHub Actions matrix instead: .github/workflows/release.yml,
+# described in docs/native-bundler.md §14. This script stays the local path —
+# it cross-packs from ONE host and is therefore bound by the libc rule (§11).
 #
 # The only packaging decision is bundled-OTP-or-not:
 #   * no OTP bundled   → `MIX_ENV=prod mix escript.build`   (4 MB, needs OTP on host)
@@ -20,7 +25,15 @@ set -e
 cd "$(dirname "$0")"
 
 RELEASE_DIR="${1:-}"
-DROP_BIN="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}/release/drop"
+
+# Ask cargo where it builds. `CARGO_TARGET_DIR`, or a `build.target-dir` in any
+# `.cargo/config.toml` (the user-level one included), redirects the target
+# directory; hardcoding one workstation's shared ~/.cache/cargo-target is how
+# this script — and `mix bl.build` — failed everywhere else.
+CARGO_TARGET="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  | sed -n 's/.*"target_directory" *: *"\([^"]*\)".*/\1/p' | head -1)"
+CARGO_TARGET="${CARGO_TARGET:-${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}}"
+DROP_BIN="$CARGO_TARGET/release/drop"
 
 if [ -z "$RELEASE_DIR" ]; then
   echo "make-drops: building host release (MIX_ENV=prod mix release bl)…"

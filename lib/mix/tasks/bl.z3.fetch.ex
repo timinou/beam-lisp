@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.BeamLisp.Z3.Fetch do
+defmodule Mix.Tasks.Bl.Z3.Fetch do
   @moduledoc """
   Fetch the pinned, bundled z3 solver into `priv/z3/`.
 

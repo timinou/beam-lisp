@@ -508,7 +508,7 @@ fn cmd_pack(args: &[String]) {
     let _ = std::fs::remove_dir_all(&tmp_root);
     copy_tree(&release, &tmp_root);
 
-    let (os, _arch) = match &target {
+    let (os, arch) = match &target {
         Some(t) => parse_target(t)
             .unwrap_or_else(|| die("bad --target (os/arch: linux/x86_64, macos/aarch64, windows/x64…)")),
         None => (host_os(), host_arch()),
@@ -552,7 +552,10 @@ fn cmd_pack(args: &[String]) {
     let len = payload.len() as u64;
     let mut out_bytes = launcher_bytes;
     out_bytes.extend_from_slice(&payload);
-    out_bytes.extend_from_slice(&encode_trailer(offset, len, &sha_arr, os, host_arch()));
+    // The trailer carries the TARGET's arch, not the host's: `--target
+    // linux/aarch64` packed from an x86_64 host must not claim x86_64. A
+    // native (host) pack is unaffected — target == host there.
+    out_bytes.extend_from_slice(&encode_trailer(offset, len, &sha_arr, os, arch));
 
     File::create(&out)
         .and_then(|mut f| f.write_all(&out_bytes))

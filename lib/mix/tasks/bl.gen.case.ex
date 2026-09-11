@@ -1,9 +1,9 @@
-defmodule Mix.Tasks.BeamLisp.Gen.Case do
+defmodule Mix.Tasks.Bl.Gen.Case do
   @moduledoc """
   Generate the ExUnit case template that makes a beam-lisp app's tests
   async (PLAN-046):
 
-      mix beam_lisp.gen.case MyApp.BlCase --warm my.app my.app.more
+      mix bl.gen.case MyApp.BlCase --warm my.app my.app.more
 
   Writes `test/support/bl_case.ex` (override with `--path`) defining
   `MyApp.BlCase`; test modules then adopt it with one line:
@@ -36,7 +36,7 @@ defmodule Mix.Tasks.BeamLisp.Gen.Case do
     module =
       case args do
         [name] -> Module.concat([name])
-        _ -> Mix.raise("usage: mix beam_lisp.gen.case MODULE.NAME [--warm NS …] [--path FILE]")
+        _ -> Mix.raise("usage: mix bl.gen.case MODULE.NAME [--warm NS …] [--path FILE]")
       end
 
     warm = for {:warm, ns} <- opts, do: ns

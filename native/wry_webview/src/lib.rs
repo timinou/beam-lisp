@@ -1,3 +1,9 @@
+// Linux-only capability: gtk3/WebKitGTK + wlr-layer-shell. On any other
+// target this crate compiles to an EMPTY cdylib, so the namespace's
+// `defnative` load fails and `wry/*` correctly reads as ABSENT — the doctrine
+// for a native capability that cannot be built on this host.
+#![cfg(target_os = "linux")]
+
 //! `wry` — a native window with a WebView, as a beam-lisp capability.
 //!
 //! # What this is
