@@ -219,13 +219,34 @@ of the pattern \u2014 the roster machinery is `data.registry`, not bespoke code.
                        (= (str (:name e)) (str cell-name))))
           (registry/entries (reg))))
 
+  (def ^:private fe-max
+    "How many frontend cells the wire may announce. Pulse accepts announces
+     from any page script; the cap is what keeps that from being an unbounded
+     registry."
+    64)
+
+  (defn fe-admit?
+    "May a frontend cell be enrolled right now? The rule as a QUESTION: `kind`
+     and `name` must be non-empty strings, and the frontend side must stay under
+     `cap` rows — so a looping or hostile announcer cannot grow the roll-call
+     without bound. Testable without enrolling anything."
+    ([kind name] (fe-admit? kind name fe-max))
+    ([kind name cap]
+     (and (string? kind) (< 0 (String/length kind))
+          (string? name) (< 0 (String/length name))
+          (< (count (filter (fn [c] (= :fe (:where c))) (cells))) cap))))
+
   (defn fe-track!
-    "The page announced a browser-held cell. Idempotent: a reconnecting chip
-     re-announcing its cells never doubles a row."
+    "The page announced a browser-held cell. Idempotent — a reconnecting chip
+     re-announcing its cells never doubles a row — and REFUSING anything that is
+     not a (kind name) pair of non-empty strings, under the cap. Re-announcing a
+     cell that is already known always succeeds, so a chip at the cap still
+     reconnects."
     [kind name]
-    (if (fe-known? name)
-      {:ok (str name)}
-      (do (track-fe (keyword kind) name) {:ok (str name)})))
+    (cond
+      (fe-known? name)            {:ok (str name)}
+      (not (fe-admit? kind name)) {:error "fe-track wants (kind name) of non-empty strings, under the frontend cap"}
+      :else (do (track-fe (keyword kind) name) {:ok (str name)})))
 
   (defn fe-push!
     "The page pushed the current value of a frontend cell: mirror it so every
@@ -498,12 +519,13 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
       "window.__pulseFe={declare:feDeclare,set:feSet,get:function(n){return fe[n]?fe[n].value:undefined},"
       "cells:function(){return Object.keys(fe).map(function(k){return fe[k]})},"
       "subscribe:function(f){feSubs.push(f);return function(){feSubs=feSubs.filter(function(g){return g!==f})}}};"
-      "function feBadge(w){return '<i class=w '+w+'>'+w+'</i>'}"
+      "function esc(s){return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split('\"').join('&quot;')}"
+      "function feBadge(w){return '<i class=\"w '+w+'\">'+w+'</i>'}"
       "function renderCells(s){s=s||lastSnap||{};lastSnap=s;var rows={};"
       "(s.cells||[]).forEach(function(c){rows[c.name]={kind:c.kind,name:c.name,value:c.value,where:c.where||'be',writable:c.writable}});"
       "Object.keys(fe).forEach(function(k){var l=fe[k];rows[k]={kind:l.kind,name:l.name,value:String(l.value),where:'fe',writable:true}});"
-      "function row(c){return '<div class=pcc>'+feBadge(c.where)+'<span class=k>'+c.kind+':'+c.name+'</span>'+'<span class=v>'+String(c.value)+'</span>'+("
-      "c.writable?'<button class=set data-cell='+c.name+' data-where='+c.where+' data-val='+String(c.value)+'>\u270e</button>':'')+'</div>'}"
+      "function row(c){return '<div class=pcc>'+feBadge(c.where==='fe'?'fe':'be')+'<span class=k>'+esc(c.kind)+':'+esc(c.name)+'</span>'+'<span class=v>'+esc(c.value)+'</span>'+("
+      "c.writable?'<button class=\"set\" data-cell=\"'+esc(c.name)+'\" data-where=\"'+((c.where==='fe')?'fe':'be')+'\" data-val=\"'+esc(c.value)+'\">\u270e</button>':'')+'</div>'}"
       "var fs=Object.keys(rows).filter(function(k){return rows[k].where==='fe'}),bs=Object.keys(rows).filter(function(k){return rows[k].where!=='fe'});"
       "var el=document.getElementById('pc-cells');"
       "el.innerHTML=(fs.length?'<div class=pcg>frontend \u00b7 held in this page ('+fs.length+')</div>'+fs.map(function(k){return row(rows[k])}).join(''):'')"
