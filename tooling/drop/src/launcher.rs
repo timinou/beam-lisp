@@ -61,12 +61,64 @@ fn verify_and_extract(t: &Trailer, dest: &std::path::Path, install: &std::path::
         .unwrap_or_else(|e| fail(&format!("first-run extraction failed: {e}")));
 }
 
-/// Remove every version dir except `keep` (docs §6.3).
+/// Days an unused `<install>/<sha8>/` tree is kept before it is swept.
+/// Override with `BL_DROP_KEEP_DAYS`.
+///
+/// The rule this replaces — remove every version dir except the one in use,
+/// immediately — is not safe, and it fails as a CRASH, not a warning. A VM
+/// execs helper binaries (`inet_gethost`, `erl_child_setup`) out of its OWN
+/// erts dir, lazily, and a `bl daemon` runs from its tree for its whole life.
+/// So a second `bl` with a different payload — a dev build beside a release,
+/// or two releases — deleted the first one's tree from under it and the
+/// running VM died with
+///
+///     Can not execute .../drop/<sha8>/erts-<v>/bin/inet_gethost : enoent
+///
+/// plus an erl_crash.dump. Re-running appeared to fix it, because the tree is
+/// re-extracted: a transient-looking symptom with a permanent cause.
+///
+/// Age is a heuristic, not a guarantee: a tree older than the window that is
+/// still in use can still be swept. 30 days makes that a deliberate,
+/// documented trade instead of something any second binary can trigger.
+const DEFAULT_KEEP_DAYS: u64 = 30;
+
+fn keep_days() -> u64 {
+    std::env::var("BL_DROP_KEEP_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_KEEP_DAYS)
+}
+
+/// May this version dir be swept? Never the one in use, and never one we
+/// cannot date — an undatable dir is kept, not deleted.
+fn sweepable(
+    name: &str,
+    keep: &str,
+    modified: Option<std::time::SystemTime>,
+    cutoff: std::time::SystemTime,
+) -> bool {
+    name != keep && matches!(modified, Some(t) if t < cutoff)
+}
+
+/// Sweep version dirs past the retention window (docs §6, step 3).
 fn gc_old_versions(install: &std::path::Path, keep: &str) {
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(keep_days().saturating_mul(86_400)))
+    else {
+        return;
+    };
+
     if let Ok(rd) = std::fs::read_dir(install) {
         for d in rd.flatten() {
             let name = d.file_name().to_string_lossy().into_owned();
-            if name != keep && d.path().is_dir() {
+
+            if !d.path().is_dir() {
+                continue;
+            }
+
+            let modified = d.metadata().and_then(|m| m.modified()).ok();
+
+            if sweepable(&name, keep, modified, cutoff) {
                 let _ = std::fs::remove_dir_all(d.path());
             }
         }
@@ -240,5 +292,53 @@ fn main() {
             .status()
             .unwrap_or_else(|e| fail(&format!("spawn {}: {e}", bin.display())));
         std::process::exit(status.code().unwrap_or(EXIT_LAUNCHER_FAILURE));
+    }
+}
+
+// Named `gc_tests`, not `tests`: daemon.rs is `include!`d into this module and
+// already owns that name.
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("drop-gc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The regression: a second `bl` with a DIFFERENT payload used to delete
+    /// this tree, killing any VM still running from it.
+    #[test]
+    fn a_second_version_does_not_delete_the_first() {
+        let install = scratch("coexist");
+        std::fs::create_dir_all(install.join("aaaaaaaa")).unwrap();
+        std::fs::create_dir_all(install.join("bbbbbbbb")).unwrap();
+
+        gc_old_versions(&install, "bbbbbbbb");
+
+        assert!(
+            install.join("aaaaaaaa").is_dir(),
+            "a recent other version must survive another version's extract"
+        );
+        assert!(install.join("bbbbbbbb").is_dir());
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    /// ...and once past the window it IS swept, so the install dir cannot grow
+    /// without bound.
+    #[test]
+    fn sweeps_only_past_the_window() {
+        let now = std::time::SystemTime::now();
+        let cutoff = now - std::time::Duration::from_secs(30 * 86_400);
+        let ago = |days: u64| Some(now - std::time::Duration::from_secs(days * 86_400));
+
+        assert!(sweepable("stale", "current", ago(40), cutoff));
+        assert!(!sweepable("recent", "current", ago(1), cutoff));
+        // the version in use is never swept, however old
+        assert!(!sweepable("current", "current", ago(400), cutoff));
+        // undatable → kept, never deleted
+        assert!(!sweepable("undated", "current", None, cutoff));
     }
 }

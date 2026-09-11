@@ -126,8 +126,17 @@ magic check) and fails loudly on a host-only payload — the classic
    * macOS: `~/Library/Application Support/bl`
    * Windows: `%LOCALAPPDATA%\bl`
 3. **Versioned payload dir**: `<install>/<sha8>/` — extraction is atomic
-   (`.tmp` + rename). After a successful extract, payload dirs other than the
-   current one are removed (Burrito-parity GC; the running version never GCs itself).
+   (`.tmp` + rename). GC is by **age**, not exclusivity: after a successful
+   extract, version dirs older than `BL_DROP_KEEP_DAYS` (default 30) are
+   removed, and the dir in use is never removed.
+
+   It used to be Burrito-parity "keep only this one". That is unsafe: a VM
+   execs helper binaries (`inet_gethost`, `erl_child_setup`) out of its own
+   erts dir, lazily, and a `bl daemon` runs from its tree for its whole life —
+   so a second `bl` with a different payload (a dev build beside a release)
+   deleted the first one's tree from under it, and the running VM died with
+   `Can not execute …/erts-*/bin/inet_gethost : enoent` plus an erl_crash.dump.
+   Re-running re-extracts, so it read as transient.
 4. **Exec**:
    * unix: `execve("<install>/<sha8>/bin/bl", ["bl", "eval", ENTRY, "--", …argv])`
      where `ENTRY = BeamLisp.Ns.Bl.Cli.main(System.argv())`
@@ -180,7 +189,9 @@ drops (cross-target runs green once NIFs are built for the target libc — §5).
 4. Corrupt one payload byte → clean error, exit 126.
 5. `./bl run examples/hello.bl` → expected output, exit 0.
 6. Second run hits the extracted cache (no re-extraction; mtimes prove it).
-7. GC: drop in a fake older version dir → gone after next successful run.
+7. GC: two payloads side by side — running the second leaves the first's tree
+   intact (`launcher.rs::gc_tests`); a version dir past `BL_DROP_KEEP_DAYS` is
+   swept on the next successful run.
 8. (cross-target, CI-gated) same for darwin-universal + windows packs; z3 smoke
    `bl eval '(z3/…)'`; explorer smoke `datom.frame/q-df`.
 
@@ -232,7 +243,7 @@ Acceptance results (full tier: lang + datom crates + z3 + explorer):
 | `bl-bundle run examples/hello.bl` | full output + `:ok`, exit 0 (×3 stable) |
 | corrupted payload byte | clean sha error, exit 126 |
 | cache-hit second run | 566 ms (vs multi-second first run) |
-| GC of stale version dir | removed on next successful run |
+| GC of stale version dir | by age, default 30 d (`BL_DROP_KEEP_DAYS`); a concurrent version's tree is left alone |
 | reproducibility | two packs byte-identical |
 | bundle size | launcher 0.7 MB + payload 97.1 MB (unstripped beams, §3) ≈ 98 MB |
 
@@ -299,7 +310,7 @@ the one thing a warm VM must not do.
 
 ```
 bl daemon start     # become the daemon (blocks; the launcher runs it detached)
-bl daemon status    # a live daemon's pid, tree, key, uptime, queue depth
+bl daemon status    # a live daemon's pid, tree, compiler key, build id, uptime, queue depth
 bl daemon stop      # drain and exit; the socket is removed
 
 BL_DAEMON=off       # every command cold-boots, no daemon
@@ -339,7 +350,7 @@ a shortcut:
   the Rust NIFs would need musl artifacts (`cargo zigbuild`) **and** the pinned
   z3 linux assets are glibc-only, so a pure-musl payload could not carry the
   solver at all.
-* `mix beam_lisp.z3.fetch` picks its asset from the host OS/arch, and
+* `mix bl.z3.fetch` picks its asset from the host OS/arch, and
   `explorer`'s `rustler_precompiled` NIF matches the runner triple.
 
 The legs all run the same sequence — `mix bl.build` (§13) with its
@@ -348,7 +359,7 @@ prerequisites in front:
 ```sh
 mix deps.get
 mix compile                 # also creates _build/$MIX_ENV/lib/beam_lisp/priv
-mix beam_lisp.z3.fetch      # writes through that priv symlink into priv/z3
+mix bl.z3.fetch      # writes through that priv symlink into priv/z3
 mix bl.build --out bl-<target>
 ```
 
