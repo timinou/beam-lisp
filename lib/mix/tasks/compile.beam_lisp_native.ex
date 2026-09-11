@@ -169,14 +169,14 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
     # reported success, and the copy then failed on a path that had
     # never existed.
     #
-    # cargo names a cdylib `lib<name>.so`; the BEAM wants
-    # `priv/native/<name>` (no prefix, and `load_nif` appends the
-    # extension).
-    built = Path.join([target_dir(crate_dir), "release", "lib#{crate}.so"])
+    # cargo names a cdylib per platform — `lib<name>.so`, `lib<name>.dylib`,
+    # `<name>.dll`. Probe, don't assume: assuming `.so` made a *successful*
+    # macOS build look like a missing crate.
+    built = built_path(built_dir(crate_dir), crate)
 
-    unless File.exists?(built) do
+    if is_nil(built) do
       Mix.raise("""
-      cargo reported success but produced no #{built}.
+      cargo reported success but produced no #{crate} cdylib in #{built_dir(crate_dir)}.
 
       Most likely the crate is not configured as a cdylib. Its
       Cargo.toml needs:
@@ -207,5 +207,40 @@ defmodule Mix.Tasks.Compile.BeamLispNative do
   # `fresh?/2` asks the same question the install answers, and two spellings
   # of one path is how a freshness check quietly starts checking the wrong
   # file.
-  defp installed_path(crate), do: Path.join(["priv", "native", "#{crate}.so"])
+  #
+  # The BEAM appends the platform's shared-library extension to this
+  # extension-less name, and every unix platform — macOS included — uses
+  # `.so` (`erl_ddll`'s convention, and what Rustler's own installer emits
+  # for a `.dylib` cargo built).
+  @doc false
+  def installed_path(crate), do: Path.join(["priv", "native", "#{crate}#{nif_ext()}"])
+
+  # Which extension `:erlang.load_nif/2` appends. `:os.type/0` answers
+  # `{:unix, :darwin}` on macOS, so both unix platforms take the `.so` arm —
+  # and `.so` is also what Rustler's own installer writes for the `.dylib`
+  # cargo produced.
+  @doc false
+  def nif_ext do
+    case :os.type() do
+      {:win32, _} -> ".dll"
+      _ -> ".so"
+    end
+  end
+
+  # cargo's per-platform cdylib name. A closed set, so probing beats parsing
+  # cargo's JSON artifact messages — and probing is what makes the macOS arm
+  # (`lib<crate>.dylib`) reachable from a test on any host.
+  @doc false
+  def built_path(dir, crate) do
+    Enum.find(
+      [
+        Path.join(dir, "lib#{crate}.so"),
+        Path.join(dir, "lib#{crate}.dylib"),
+        Path.join(dir, "#{crate}.dll")
+      ],
+      &File.exists?/1
+    )
+  end
+
+  defp built_dir(crate_dir), do: Path.join(target_dir(crate_dir), "release")
 end

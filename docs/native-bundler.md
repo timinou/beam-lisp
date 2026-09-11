@@ -317,3 +317,61 @@ a lost connection there is an unknown outcome (exit 1), not a re-run.
 Rust launcher + pack tool → `drop pack` → install `./bl`. Options: `--out PATH`,
 `--release DIR` (reuse a tree), `--skip-cargo`, `--target os/arch`. The escript
 (`mix escript.build`) still builds as a legacy path; prefer the drop.
+
+## 14. CI — GitHub Actions (`.github/workflows/release.yml`)
+
+One drop per target, attached to a GitHub release on a `v*` tag (or built
+without publishing via `workflow_dispatch`).
+
+| artifact | runner | note |
+|---|---|---|
+| `bl-linux-x86_64` | `ubuntu-24.04` | glibc ≥ 2.39 — that is the pinned z3 asset's floor (`z3-4.16.0-x64-glibc-2.39`), which the fetch task smoke-runs |
+| `bl-linux-aarch64` | `ubuntu-24.04-arm` | z3's aarch64 asset is glibc 2.38 |
+| `bl-macos-arm64` | `macos-15` | |
+| `bl-macos-x86_64` | `macos-15-intel` | `macos-13` was retired 2025-12; `macos-15-intel` is its replacement |
+
+**Each target is built natively, on its own runner.** That is the design, not
+a shortcut:
+
+* every NIF is compiled against the runner's own libc/ABI, so it always
+  matches the ERTS `mix release` copies in. Cross-packing onto the
+  beam-machine `linux/any` (musl) bundles instead triggers the libc rule (§11):
+  the Rust NIFs would need musl artifacts (`cargo zigbuild`) **and** the pinned
+  z3 linux assets are glibc-only, so a pure-musl payload could not carry the
+  solver at all.
+* `mix beam_lisp.z3.fetch` picks its asset from the host OS/arch, and
+  `explorer`'s `rustler_precompiled` NIF matches the runner triple.
+
+The legs all run the same sequence — `mix bl.build` (§13) with its
+prerequisites in front:
+
+```sh
+mix deps.get
+mix compile                 # also creates _build/$MIX_ENV/lib/beam_lisp/priv
+mix beam_lisp.z3.fetch      # writes through that priv symlink into priv/z3
+mix bl.build --out bl-<target>
+```
+
+`BL_VERSION` (the tag minus its leading `v`, normalized to a valid
+`Version`: `v2026.0` → `2026.0.0`) stamps the release, so `bl version` on the
+artifact reports it; the GitHub release keeps the tag's name. On macOS the
+fetched z3 binary is ad-hoc signed before packing — Apple Silicon will not
+execute unsigned pages.
+
+**Per-platform prerequisites.** `wry_webview` is a Linux capability (gtk3 +
+webkit2gtk + wlr-layer-shell): its Cargo dependencies are `cfg(target_os =
+"linux")`-gated and its `lib.rs` is crate-level `cfg(target_os = "linux")`, so
+the macOS legs compile it to an empty cdylib and `wry/*` reads as ABSENT
+(§5, and the `defnative` doctrine). The Linux legs install
+`libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev` first.
+
+The smoke step runs the artifact the way a user does — cold, no daemon, no
+checkout — and asserts a live native surface of each tier: the language, a
+Rust NIF (`datom.store-fjall/available?`), Explorer (`datom.frame/available?`),
+the `lazy_memo` runtime, and the z3 port (`z3/check` → `sat`). A payload that
+silently lost its native tier fails in CI, not on a user's machine.
+
+**Deliberately not in CI:** code signing / notarization (§8 — org policy, not
+bundler policy), and single-host cross-target packs (`--target`) until
+per-target NIF staging lands (§5).
+

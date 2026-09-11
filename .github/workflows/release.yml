@@ -1,0 +1,244 @@
+name: release
+
+# Self-contained `bl` drops (docs/native-bundler.md) for Linux and macOS on
+# both processor families.
+#
+# Each target is built NATIVELY on its own runner. That is deliberate, not a
+# convenience:
+#
+#   * every NIF (native/datom_*, lazy_memo, wry_webview) is compiled against
+#     the runner's own libc/ABI, so it always matches the ERTS that
+#     `mix release` copies into the payload. Cross-packing a release onto the
+#     beam-machine "any" linux bundles would instead impose the musl libc rule
+#     (docs/native-bundler.md §11): the Rust NIFs and the pinned z3 binary
+#     would have to be rebuilt for musl, and z3 publishes glibc-only linux
+#     assets. Deferred (FUP).
+#   * `mix beam_lisp.z3.fetch` resolves its pinned asset per OS/arch itself.
+#   * explorer's precompiled NIF (rustler_precompiled) matches the runner
+#     triple by construction.
+#
+# Cost note: `ubuntu-24.04-arm` and the macOS runners are billed minutes on
+# private repositories. Drop a matrix leg if that matters more than coverage.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp when not building a tag (e.g. 2026.0 → 2026.0.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # Runner images ship their own Elixir/OTP; the project needs OTP 29 + Elixir
+  # 1.20 (mix.exs `elixir: "~> 1.18"`, erts.lock `otp = "29.0"`), pinned
+  # through setup-beam below rather than inherited from the image.
+  MIX_ENV: prod
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: linux-x86_64
+            runner: ubuntu-24.04
+            # z3's pinned linux x64 asset is built against glibc 2.39, so the
+            # runner must be ≥ 24.04 (its `mix beam_lisp.z3.fetch` smoke-runs
+            # the binary). This sets the drop's glibc floor in turn.
+          - artifact: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - artifact: macos-arm64
+            runner: macos-15
+          - artifact: macos-x86_64
+            # macos-13 (the last Intel image) was retired 2025-12;
+            # macos-15-intel is its supported replacement (until 2027-08).
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OTP 29 + Elixir 1.20
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -eu
+          v="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+          v="${v#v}"
+          [ -n "$v" ] || v="0.1.0-dev"
+          # Elixir's Version is major.minor.patch, so a CalVer tag like `v2026.0`
+          # is stamped as `2026.0.0`. The GitHub release keeps the tag's name;
+          # only the app version (what `bl version` reports) is normalized.
+          case "$v" in
+            *.*.*) ;;
+            *.*) v="$v.0" ;;
+            *)   v="$v.0.0" ;;
+          esac
+          echo "BL_VERSION=$v" >> "$GITHUB_ENV"
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "building beam-lisp $v for ${{ matrix.artifact }} (ref ${{ github.ref_name }})"
+
+      - name: Cache deps, builds, and cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/*/target
+            tooling/drop/target
+          key: ${{ matrix.artifact }}-${{ hashFiles('mix.lock', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.artifact }}-
+
+      # wry_webview is a Linux-only capability (gtk + webkit2gtk +
+      # wlr-layer-shell). Its Cargo.toml target-gates those deps and lib.rs is
+      # crate-level `cfg(target_os = "linux")`, so the macOS legs compile it to
+      # an empty cdylib and `wry/*` reads as ABSENT — the doctrine for a native
+      # capability that cannot be built here. On Linux the headers must exist.
+      - name: Install WebKitGTK toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
+
+      - run: mix deps.get
+
+      # Creates _build/$MIX_ENV/lib/beam_lisp/priv (a symlink to the source
+      # priv/), which is what the next step writes into — and what the release
+      # later copies. Builds the Rust NIFs for this runner.
+      - name: Compile (AOT + NIFs)
+        run: mix compile
+
+      - name: Fetch the pinned z3 solver
+        run: mix beam_lisp.z3.fetch
+
+      # Apple Silicon refuses to exec unsigned Mach-O pages. Cargo/ld ad-hoc
+      # sign what they produce, but the z3 release archive is not necessarily
+      # signed — sign it (and its dylib) before the release copies priv/ into
+      # the payload. The signature rides in the file, so extraction preserves it.
+      - name: Ad-hoc sign native binaries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --force --sign - {} \;
+          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --verify --verbose=1 {} \;
+
+      # compile → mix release bl → cargo → drop pack → install.
+      - name: Build the drop
+        run: mix bl.build --out "bl-${{ matrix.artifact }}"
+
+      # The drop must run with NO daemon and NO checkout: this is the artifact
+      # a user downloads, exercised exactly as they would. It is copied out of
+      # the workspace first, so a namespace that the payload is missing cannot
+      # be papered over by the checkout's own sources. Every assertion is a
+      # live native surface — the language, a Rust NIF (fjall), the core
+      # lazy_memo runtime, Explorer/Polars, and the z3 port — so a payload that
+      # silently lost its native tier fails here rather than on a user's machine.
+      - name: Smoke test (cold, no daemon, no checkout)
+        env:
+          BL_DAEMON: "off"
+        run: |
+          set -eu
+          cp "bl-${{ matrix.artifact }}" "$RUNNER_TEMP/bl"
+          chmod +x "$RUNNER_TEMP/bl"
+          cd "$RUNNER_TEMP"
+          BL="./bl"
+          expect() {
+            got="$("$BL" eval "$3" 2>&1 | tail -n1)"
+            if [ "$got" != "$2" ]; then
+              echo "FAIL $1: expected '$2', got '$got'" >&2
+              exit 1
+            fi
+            echo "ok  $1 → $got"
+          }
+          got="$("$BL" version | tail -n1)"
+          if [ "$got" != "beam-lisp $BL_VERSION" ]; then
+            echo "FAIL version: expected 'beam-lisp $BL_VERSION', got '$got'" >&2
+            exit 1
+          fi
+          echo "ok  version → $got"
+          expect language   3      '(+ 1 2)'
+          expect datom_fjall true  '(datom.store-fjall/available?)'
+          expect explorer   true   '(datom.frame/available?)'
+          expect lazy_memo  65536  '(BeamLisp.LazyMemo/fast_lane_bytes)'
+          expect z3         sat    '(let [p (z3/open)] (z3/check p "(assert true)"))'
+
+      - name: Checksum
+        run: |
+          set -eu
+          f="bl-${{ matrix.artifact }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$f" > "$f.sha256"
+          else
+            shasum -a 256 "$f" > "$f.sha256"
+          fi
+          cat "$f.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bl-${{ matrix.artifact }}
+          path: |
+            bl-${{ matrix.artifact }}
+            bl-${{ matrix.artifact }}.sha256
+          # The payload is already gzip; re-zipping ~100 MB per leg buys nothing.
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: publish release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the Linux drop runs on this host
+        run: |
+          set -eu
+          ls -la dist
+          chmod +x dist/bl-linux-x86_64
+          BL_DAEMON=off ./dist/bl-linux-x86_64 version
+          BL_DAEMON=off ./dist/bl-linux-x86_64 eval '(+ 1 2)'
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Self-contained `bl` — ERTS + language + native tier (datom Rust
+            crates, z3, Explorer). No Erlang/OTP needed on the host.
+
+            | file | runs on |
+            |---|---|
+            | `bl-linux-x86_64` | Linux x86_64 (glibc ≥ 2.39) |
+            | `bl-linux-aarch64` | Linux arm64 (glibc ≥ 2.39) |
+            | `bl-macos-arm64` | macOS on Apple Silicon |
+            | `bl-macos-x86_64` | macOS on Intel |
+
+            ```sh
+            chmod +x bl-linux-x86_64
+            ./bl-linux-x86_64 version
+            ./bl-linux-x86_64 eval '(+ 1 2)'
+            ```
+
+            The binaries are not code-signed. On macOS, Gatekeeper may require
+            `xattr -d com.apple.quarantine ./bl-macos-arm64` after a browser
+            download; `gh`/`curl` downloads are not quarantined.
+
+            Checksums ship alongside each file as `<name>.sha256`.

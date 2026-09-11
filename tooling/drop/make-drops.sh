@@ -1,5 +1,10 @@
 #!/usr/bin/env sh
-# make-drops.sh — build `drop` bundles for every target with a staged release.
+# make-drops.sh — build `drop` bundles locally, for the host + cross-target packs.
+#
+# For release artifacts (linux/macos, both architectures, one native runner per
+# target) use the GitHub Actions matrix instead: .github/workflows/release.yml,
+# described in docs/native-bundler.md §14. This script stays the local path —
+# it cross-packs from ONE host and is therefore bound by the libc rule (§11).
 #
 # The only packaging decision is bundled-OTP-or-not:
 #   * no OTP bundled   → `MIX_ENV=prod mix escript.build`   (4 MB, needs OTP on host)
