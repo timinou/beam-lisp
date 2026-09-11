@@ -75,6 +75,17 @@ defmodule BeamLisp.RT do
   # which is how jank's doseq indexes its binding vector.
   def invoke(%BeamLisp.Vector{} = v, [i]) when is_integer(i), do: BeamLisp.Vector.nth(v, i)
 
+  # A vector indexes by INTEGER, and an arity message here would be true and
+  # useless: the call has the right NUMBER of arguments. The matrix in
+  # test/bl/callable_test.bl is what surfaced this — `([10 20] :a1)` reported
+  # "a vector called with 1 argument", blaming the count for the kind.
+  def invoke(%BeamLisp.Vector{} = v, [i]) do
+    raise ArgumentError,
+      message:
+        "a vector indexes by integer, not by #{inspect(i, limit: 3, printable_limit: 40)} — " <>
+          "a vector is a function of its index: ([10 20] 1)"
+  end
+
   # Sets are functions of their members: `(#{1 2} 1)` ≡ `1`, `(#{1 2} 9)` ≡ nil,
   # exactly as in Clojure. clojure.set/join relies on this (it uses an index map
   # AND membership tests as functions).
