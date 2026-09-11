@@ -68,6 +68,10 @@ answers.
 | a name whose type inference knows | the type checker, as a warning | `m is called with 0 arguments — a map takes 1 or 2` |
 | anything else — a value from a map, a field, a call | the runtime | the same sentence, at the point of the call |
 
+The compiler's refusal is two lines: the position and the sentence, then the
+form it is about (`  offending form: 7`). The runtime's is one line — by the
+time a value is being called there is no source position left to give.
+
 The second layer WARNS rather than refuses, and stays quiet about a value it
 cannot type. Inference is sound but partial: a checker that can be wrong about a
 correct program is worse than a quiet one. It also declines to check the arity
