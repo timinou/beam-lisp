@@ -154,6 +154,62 @@ trimmed of the blank lines and `;; ── section ──` heading that introduce
 the symptom is a ranking that is subtly wrong for a reason no error message will
 ever name.
 
+## `bl search` — the same question, from the shell
+
+```sh
+bl search "where do we check that a transaction's schema is valid?" -p priv
+bl search "read a file into lines" -p src -k 5
+bl search --like datom.tx/validate -p priv          # more like this
+bl search "ship an order" --ns my.orders -p src      # one namespace
+```
+
+Four flags, no new vocabulary: `-p` is the library-root flag `bl run` already
+takes (and the roots are the corpus), `-k` is how many hits come back (10 by
+default), `--ns` narrows to one namespace, and `--like NAME` asks the other
+question — functions that look like `NAME` — instead of a question in English.
+
+Exit codes are the CLI's usual three: `0` a search ran, `1` something broke,
+`2` the command line was wrong (no query, a `-k` that is not a number). A
+missing model is `2` as well, and says so:
+
+```
+bl search: the model weights are not on disk — run `mix beam_lisp.embed.fetch` (expected in ~/.cache/beam_lisp/models/potion-code-16M-v2)
+  fetch the model once, then search offline forever:
+    mix beam_lisp.embed.fetch
+```
+
+### What it costs
+
+Measured on a laptop over beam-lisp's own `priv/` — 156 files, 2565 functions:
+
+| phase | cost |
+|---|---|
+| read 156 files | 17 ms |
+| analyze them (`codebase/index-source`) | **~520 s** |
+| embed 2565 functions | ~0.5 s (0.2 ms each) |
+| answer one question | ~250 ms |
+
+ANALYZING is the whole cost, and it is seconds PER FILE — macroexpansion of
+every form, 0.7 s for a small file and 30 s for `priv/boot/compiler.bl`. So the
+index is not free and not instant: point this at a directory, not a monorepo.
+
+This is not fundamental. A source's analysis is a pure function of its bytes,
+which is what `codebase/analyze-cached` already exploits: the facts are stored
+under sha256(source) in `.blanalysis`, and an unchanged file REPOPENS that store
+in tens of milliseconds instead of being re-indexed in seconds. The semantic
+index does not consult that store yet. When it does, the numbers above collapse
+to the read and the embed.
+
+A file the analyzer cannot read is skipped and NAMED, never silently dropped:
+
+```
+bl search: skipped priv/boot/core.bl — if-let requires a vector for its binding
+```
+
+(That one is a real limit of the analyzer, not of the CLI: expanding a macro
+template definition that contains a syntax-quoted call is not something the
+call-walker can do yet.)
+
 ## The live part costs nothing
 
 An embedding is a fact, so "keep the index current" is not a subsystem:
