@@ -27,7 +27,7 @@ real model; the query syntax and engine are exactly what a real deployment
 uses — only the vector *source* is a toy).
 
 ```
-mix beam_lisp.run --path priv --path examples examples/relations/01-defrelation.bl
+bl run -p examples examples/relations/01-defrelation.bl
 ```
 
 | # | file | what it shows |

@@ -25,9 +25,9 @@ Both raise a clear "add `:explorer`" error when Explorer is absent — it is an
 ## Run them
 
 ```sh
-mix beam_lisp.run --path priv examples/datom/df/01-query-to-frame.bl
-mix beam_lisp.run --path priv examples/datom/df/02-analytics.bl
-mix beam_lisp.run --path priv examples/datom/df/03-pull-to-frame.bl
+bl run examples/datom/df/01-query-to-frame.bl
+bl run examples/datom/df/02-analytics.bl
+bl run examples/datom/df/03-pull-to-frame.bl
 ```
 
 - **01-query-to-frame** — `q` vs `q-df` on the same query: column names (the `?`

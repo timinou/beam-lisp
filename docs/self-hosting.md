@@ -84,7 +84,9 @@ The seed is `priv/bootstrap/seed/`: the whole `priv/boot` toolchain
 (compiler, reader, reader-node, core, sugar, the build system) as Core-Erlang
 `.beam` files, plus a manifest of their hashes and the toolchain key they were
 built under. It is committed to git, and it is byte-reproducible — a fresh build
-of the current source produces exactly these bytes.
+of the current source produces exactly these bytes. (Why the committed floor is
+bytecode and not Core Erlang text, with measurements, is in
+[[file:from-source-to-silicon/05-the-seed.bl.org][the tour's seed chapter]].)
 
 At boot, `BeamLisp.Bootstrap` copies the seed into the build's code path and the
 language interns it from those bytes — no compile, no bootstrap language. From

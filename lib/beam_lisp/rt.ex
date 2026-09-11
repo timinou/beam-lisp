@@ -2118,7 +2118,10 @@ defmodule BeamLisp.RT do
 
       "#" <> ns <> "/" <> name <> "{" <> body <> "}"
     else
-      print_str_map(r)
+      # A foreign struct (an exception, a Date, …) is not a BL map and may
+      # not be Enumerable at all — printing it as one crashes the printer.
+      # inspect falls back to the struct's own Inspect (or the raw form).
+      if Enumerable.impl_for(r), do: print_str_map(r), else: inspect(r)
     end
   end
 

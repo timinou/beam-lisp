@@ -1,0 +1,151 @@
+; test/bl/system/lsp_rpc_test.bl — the LSP protocol layer, as pure functions.
+;
+; lsp.rpc turns JSON-RPC 2.0 frames into calls on lsp.bl and back. Framing,
+; position conversion (1-based bl codepoints ↔ 0-based LSP UTF-16) and the
+; lifecycle state machine are asserted here with maps in and maps out: no port,
+; no editor. Run: mix bl test test/bl/system/lsp_rpc_test.bl
+(ns system.lsp-rpc-test
+  (:require [lsp.rpc :as rpc]))
+
+(def src
+  (str "(defn mk [] :kw)\n"
+       "(defn double [x] (erlang/* x 2))\n"
+       "(defn caller [n] (double n))\n"))
+
+(def uri "file:///t.bl")
+
+(defn- init []
+  (rpc/handle (rpc/initial-state)
+              {"jsonrpc" "2.0" "id" 1 "method" "initialize" "params" {}}))
+
+(defn- open []
+  (let [res (init)
+        s0 (get res 0)]
+    (rpc/handle s0
+      {"jsonrpc" "2.0" "method" "textDocument/didOpen"
+       "params" {"textDocument" {"uri" uri "version" 1 "text" src}}})))
+
+(defn- req [state id method params]
+  (rpc/handle state {"jsonrpc" "2.0" "id" id "method" method "params" params}))
+
+;; ── framing ────────────────────────────────────────────────────────────────
+
+(deftest a-frame-round-trips
+  (let [msg {"jsonrpc" "2.0" "id" 7 "method" "x" "params" {"a" 1}}
+        r (rpc/decode-frame (rpc/encode-frame msg))]
+    (is (= msg (:msg r)) "decode ∘ encode is identity")
+    (is (= "" (:rest r)) "nothing trails a lone frame")))
+
+(deftest a-split-frame-waits-for-the-rest
+  (let [full (rpc/encode-frame {"jsonrpc" "2.0" "id" 1 "method" "x"})
+        half (subs full 0 (quot (erlang/byte_size full) 2))]
+    (is (some? (:need (rpc/decode-frame half))) "half a frame needs more bytes")
+    (is (= 1 (get (:msg (rpc/decode-frame full)) "id")) "the whole frame decodes")))
+
+(deftest two-frames-in-one-buffer
+  (let [buf (str (rpc/encode-frame {"jsonrpc" "2.0" "id" 1})
+                 (rpc/encode-frame {"jsonrpc" "2.0" "id" 2}))
+        r1 (rpc/decode-frame buf)
+        r2 (rpc/decode-frame (:rest r1))]
+    (is (= 1 (get (:msg r1) "id")) "the first message")
+    (is (= 2 (get (:msg r2) "id")) "the second, from the rest")
+    (is (= "" (:rest r2)))))
+
+(deftest a-malformed-header-is-reported
+  (let [r (rpc/decode-frame "X-Nope: 1\r\n\r\ngarbage")]
+    (is (= :bad-header (:error r)) "a header with no Content-Length")
+    (is (= "garbage" (:rest r)) "the rest resynchronizes past the separator")))
+
+;; ── positions ──────────────────────────────────────────────────────────────
+
+(deftest positions-are-utf16-aware
+  (let [t "héllo 🎉 x"]
+    (is (= {:line 0 :character 9} (rpc/bl->lsp t 1 9))
+        "the emoji costs two UTF-16 units, so x is at character 9")
+    (is (= {:line 1 :col 9} (rpc/lsp->bl t 0 9)) "and back to bl col 9")
+    (is (= {:line 1 :col 7} (rpc/lsp->bl t 0 7))
+        "a character inside the surrogate pair floors to the emoji")))
+
+(deftest crlf-lines-convert
+  (let [t "a\r\nb"]
+    (is (= {:line 1 :character 0} (rpc/bl->lsp t 2 1)) "line 2 is LSP line 1")))
+
+;; ── lifecycle ──────────────────────────────────────────────────────────────
+
+(deftest initialize-advertises-capabilities
+  (let [res (init)
+        s (get res 0)
+        out (get res 1)
+        r (get (first out) "result")]
+    (is (:initialized? s) "the server is initialized")
+    (is (= true (get-in r ["capabilities" "hoverProvider"])))
+    (is (= true (get-in r ["capabilities" "documentSymbolProvider"])))
+    (is (= "beam-lisp" (get-in r ["serverInfo" "name"])))))
+
+(deftest requests-before-initialize-are-refused
+  (let [res (req (rpc/initial-state) 2 "textDocument/hover" {})
+        err (get (first (get res 1)) "error")]
+    (is (= -32002 (get err "code")) "ServerNotInitialized")))
+
+(deftest unknown-method-is-method-not-found
+  (let [res (init)
+        out (req (get res 0) 3 "foo/bar" {})
+        err (get (first (get out 1)) "error")]
+    (is (= -32601 (get err "code")))))
+
+(deftest shutdown-replies-null
+  (let [res (init)
+        out (req (get res 0) 4 "shutdown" {})]
+    (is (:shutdown? (get out 0)) "the flag is set")
+    (is (contains? (first (get out 1)) "result") "and null is a result")))
+
+(deftest unknown-notification-is-ignored
+  (let [res (init)
+        out (rpc/handle (get res 0)
+                        {"jsonrpc" "2.0" "method" "wat/ever" "params" {}})]
+    (is (= [] (get out 1)) "no reply to an unknown notification")))
+
+;; ── documents and features ─────────────────────────────────────────────────
+
+(deftest did-open-publishes-diagnostics
+  (let [res (open)
+        n (first (get res 1))]
+    (is (= "textDocument/publishDiagnostics" (get n "method")))
+    (is (= uri (get-in n ["params" "uri"])))
+    (is (contains? (get-in n ["params"]) "diagnostics"))))
+
+(deftest did-close-clears-diagnostics
+  (let [res (open)
+        out (rpc/handle (get res 0)
+                        {"jsonrpc" "2.0" "method" "textDocument/didClose"
+                         "params" {"textDocument" {"uri" uri}}})]
+    (is (nil? (get-in (get out 0) [:docs uri])) "the document is forgotten")
+    (is (empty? (get-in (first (get out 1)) ["params" "diagnostics"]))
+        "an empty publish clears the squiggles")))
+
+(deftest hover-returns-contents
+  (let [res (open)
+        out (req (get res 0) 5 "textDocument/hover"
+                 {"textDocument" {"uri" uri}
+                  "position" {"line" 2 "character" 19}})
+        v (get-in (first (get out 1)) ["result" "contents" "value"])]
+    (is (string? v) "hover answers a markdown string")
+    (is (pos? (count v)) "with content")
+    (is (nil? (index-of v "\u2205")) "not the nothing-here marker")))
+
+(deftest document-symbols-carry-kinds-and-ranges
+  (let [res (open)
+        out (req (get res 0) 6 "textDocument/documentSymbol"
+                 {"textDocument" {"uri" uri}})
+        syms (get-in (first (get out 1)) ["result"])]
+    (is (= 3 (count syms)) "the three defns")
+    (is (every? (fn [s] (= 12 (get s "kind"))) syms) "each is a Function")
+    (is (every? (fn [s] (contains? (get s "range") "start")) syms) "each has a range")
+    (is (some (fn [s] (= "double" (get s "name"))) syms))))
+
+(deftest proof-request-reaches-the-proof
+  (let [res (open)
+        out (req (get res 0) 7 "$/beamlisp/proof" {"uri" uri "fn" "double"})
+        r (get (first (get out 1)) "result")]
+    (is (= "double" (get r "fn")))
+    (is (= true (get r "pure")) "double is proven pure")))

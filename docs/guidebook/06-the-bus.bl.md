@@ -88,7 +88,7 @@ The policies do not make one subscriber globally “slow.” They state what lag
 Run the repository example:
 
 ```sh
-mix beam_lisp.run --path priv examples/bus.bl
+bl run examples/bus.bl
 ```
 
 It publishes twenty values to a fast blocking subscriber and a deliberately slow drop-oldest subscriber. The assertions prove that the fast subscriber sees all twenty, the slow subscriber drops older values, and both finish through End-of-Stream.

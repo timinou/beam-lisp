@@ -1,33 +1,39 @@
-; tooling/mcp/tools.bl — the codebase tools, wired to codebase.bl for real.
+; priv/lib/mcp/tools.bl — the codebase tools: code-as-facts behind an MCP surface.
 ;
-; This is the PROTOTYPE that repoints the MCP surface from a domain library
-; (spell/apps/mcp pointed at Moroccan law) onto beam-lisp's OWN code-as-facts
-; engine (priv/std/codebase.bl). The claim under test: the three-tool shape
+; The codebase is a FACT DATABASE: a model asks precise questions over it and
+; only ANSWERS (rows) cross the wire, never whole files. The tools are
 ;
-;     library/list  ·  library/query  ·  proc/run
+;     code/list  ·  code/query  ·  code/ask  ·  code/verify
+;     code/subscribe  ·  code/poll
 ;
-; is not law-specific. Repointed at code it becomes
+; code/query is the datalog escape hatch (max power); code/ask is the ergonomic
+; layer of NAMED questions a coding agent actually asks ("who breaks if X
+; changes", "who calls X", "what does X reach"). A question that needs a target
+; and gets none returns input_required (MRTR) — the same elicitation a client
+; already understands.
 ;
-;     code/list     ·  code/query     ·  code/ask
+; code/verify proves a defserver's ^{:invariant} with z3 and, on failure,
+; synthesizes the weakest repairing guard. code/subscribe + code/poll expose
+; live fact changes through datom's watch: "tell me when my function gains or
+; loses a caller".
 ;
-; and every mapping survives — including MRTR (input_required): the flow that
-; elicited a legal document's missing params now elicits "which function?" for
-; a code question. Same machinery, different fact space.
+; The tools run against beam-lisp indexing ITSELF (priv/std/codebase.bl +
+; priv/std/typed.bl). The datom conn is built on first use, so requiring this
+; namespace reads no files and transacts nothing.
 ;
-; Design principle (from Anthropic's code-execution-with-MCP, CodeRLM, and
-; LogicLoc, arXiv 2604.16021): the codebase is a FACT DATABASE and the model
-; asks precise questions over it. Only ANSWERS (rows) cross the wire, never
-; whole files. code/query is the datalog escape hatch (max power); code/ask is
-; the ergonomic layer of NAMED questions a coding agent actually asks.
+; Design principle (Anthropic's code-execution-with-MCP; CodeRLM; LogicLoc,
+; arXiv 2604.16021): only answers cross the wire.
 ;
 ; NB on correctness: priv/std/codebase.bl ships `impact`/`reachable` whose datalog
 ; leaves the target var unbound — `(reaches ?who ?name)` with ?name free means
 ; "?who reaches SOME callee", i.e. every caller, not the callees of a NAMED fn.
-; The ask layer below binds the target via :in (the FEAT-025-safe "filter at
-; the call site" discipline), so `impact of X` is genuinely X's callers.
+; bl.ask binds the target via :in (the "filter at the call site" discipline), so
+; `impact of X` is genuinely X's callers. This server delegates every named
+; question to bl.ask, so the fix lives in one place and `bl ask` shares it.
 
 (ns mcp.tools
-  (:require [codebase]
+  (:require [bl.ask :as ask]
+            [codebase]
             [typed]
             [datom]
             [datom.watch]
@@ -71,7 +77,16 @@
             0 MOUNTED)
     conn))
 
-(def code-conn (mount!))
+; Built once, on first use — requiring this namespace reads no files and
+; transacts nothing; the mount happens the first time a tool asks for `conn`.
+(def ^:private the-conn (atom nil))
+
+(defn conn
+  "The self-indexed codebase: one datom conn over every MOUNTED source."
+  []
+  (or @the-conn
+      (let [c (mount!)]
+        (if (compare-and-set! the-conn nil c) c @the-conn))))
 
 ;; core callee set for the mounted namespaces — the "always defined" names
 ;; (core + each mounted ns's publics) so unknown-callees does not flag them.
@@ -79,8 +94,6 @@
   (reduce (fn [s pair]
             (into s (codebase/core-callee-names (first pair))))
           #{} MOUNTED))
-
-(defn conn [] code-conn)
 
 ;; ── helpers ─────────────────────────────────────────────────────────
 
@@ -103,7 +116,7 @@
   {:type "object" :properties {} :required []})
 
 (defn code-list-handler [_args]
-  (let [db (datom/db code-conn)
+  (let [db (datom/db (conn))
         m (manifest db)]
     {:codebases
      [{:name "beam-lisp"
@@ -147,7 +160,7 @@
                     (vector? query-raw) query-raw
                     (sequential? query-raw) (into [] query-raw)
                     :else (throw (ex-info "query must be sequential" {})))
-        db (datom/db code-conn)
+        db (datom/db (conn))
         ;; Inputs are positional: $ → the db, % → the REACH rules, every
         ;; other declared symbol (?target …) is filled from `bindings` in
         ;; order. This reads the :in clause instead of guessing by arity,
@@ -177,61 +190,27 @@
 ;; none return input_required (MRTR) — the identical elicitation the legal
 ;; prototype used for document params, here asking "which function?".
 
-(def ^:private target-questions #{"impact" "callers" "reachable" "returns-type"})
-(def ^:private nullary-questions #{"arity-mismatches" "unknown-callees"})
-
 (def code-ask-descriptor
   {:type "object"
    :properties
    {:question {:type "string"
-               :description "One of: impact, callers, reachable, returns-type, arity-mismatches, unknown-callees"}
+               :description (str "One of: " (join ", " (ask/db-questions)))}
     :target {:type "string"
              :description "The function name (or type tag for returns-type) the question is about"}}
    :required ["question"]})
 
-(defn- rows [q & inputs]
-  (to-list (map to-list (sort (into [] (apply datom/q q (datom/db code-conn) inputs))))))
-
-(defn- answer [question target]
-  (let [db (datom/db code-conn)]
-   (cond
-    ;; who transitively CALLS target — what breaks if target changes.
-    ;; Delegates to the (now target-bound) shipped helper: DRY, and the
-    ;; correctness fix lives in ONE place (priv/std/codebase.bl), not copied here.
-    (= question "impact")
-    (to-list (map to-list (codebase/impact db target)))
-
-    ;; direct callers of target, with call sites.
-    (= question "callers")
-    (rows '[:find ?caller ?line :in $ ?t
-            :where [?c :call/callee ?t] [?c :call/caller ?caller] [?c :call/line ?line]]
-          target)
-
-    ;; what target transitively reaches (forward call graph).
-    (= question "reachable")
-    (to-list (map to-list (codebase/reachable db target)))
-
-    ;; fns whose return MAY include the given type tag (e.g. "string").
-    (= question "returns-type")
-    (rows '[:find ?name ?src :in $ ?wanted
-            :where [?d :fn/name ?name] [?d :fn/ret-tag ?wanted] [?d :fn/ret-source ?src]]
-          target)
-
-    ;; calls whose callee is defined but never at the called arity.
-    (= question "arity-mismatches")
-    (to-list (map to-list (codebase/arity-mismatches (datom/db code-conn))))
-
-    ;; calls to names never defined / not core / not interop.
-    (= question "unknown-callees")
-    (to-list (map to-list (codebase/unknown-callees (datom/db code-conn) core-names)))
-
-    :else :unknown-question)))
+;; The answers live in bl.ask — the CLI and this server read the same question
+;; table and call the same `answer`, so a question has ONE implementation. The
+;; MRTR envelope below stays here: it is this surface's protocol shape, not
+;; the question's.
 
 (defn code-ask-handler [args]
   (let [question (get args "question")
         target (get args "target")]
     (cond
-      (and (contains? target-questions question) (nil? target))
+      ;; a target question with no target: elicit it (MRTR). Which questions
+      ;; take a target is bl.ask's table — one definition, both interfaces.
+      (and (ask/needs-target? question) (nil? target))
       {:resultType "input_required"
        :inputRequests
        [{"method" "elicitation/create"
@@ -242,21 +221,19 @@
                                             "description" "Function name (or type tag for returns-type)"}}
                     "required" ["target"]}}}]}
 
-      (not (or (contains? target-questions question)
-               (contains? nullary-questions question)))
+      ;; not a question this surface answers: name the ones that are.
+      (not (ask/db-question? question))
       {:resultType "complete"
        :isError true
        :content [{"type" "text"
                   "text" (str "Unknown question: " (pr-str question)
-                              ". Try one of: impact callers reachable returns-type "
-                              "arity-mismatches unknown-callees")}]}
+                              ". Try one of: " (join " " (ask/db-questions)))}]}
 
       :else
-      (let [result (answer question target)]
-        {:resultType "complete"
-         :question question
-         :target target
-         :rows result}))))
+      {:resultType "complete"
+       :question question
+       :target target
+       :rows (ask/answer (datom/db (conn)) question target core-names)})))
 
 ;; ── tool 4: code/verify (the PROVER as a tool) ──────────────────────
 ;;
@@ -350,7 +327,7 @@
 (defn code-subscribe-handler [args]
   (let [callee (get args "callee")
         buf (atom [])
-        w (datom.watch/watch code-conn [(quote ?c) :call/callee callee]
+        w (datom.watch/watch (conn) [(quote ?c) :call/callee callee]
             (fn [changes] (swap! buf concat changes)))
         id (str "sub-" (swap! sub-counter (fn [n] (+ n 1))))]
     (swap! subscriptions assoc id {:watch w :buf buf :callee callee})
@@ -373,7 +350,7 @@
        :content [{"type" "text" "text" (str "Unknown subscription: " (pr-str id))}]}
       (let [buf (get sub :buf)
             drained @buf
-            db (datom/db code-conn)
+            db (datom/db (conn))
             ;; The matched datom is [?e :call/callee <callee>]; its :v is the
             ;; CALLEE, not the caller. The caller is a sibling datom on the same
             ;; call entity :e — resolve it so the event names who added the call.
@@ -394,7 +371,7 @@
 ;; subscription firing. Real callers commit through their own edits; this is
 ;; the in-process equivalent of "someone added a call to your fn".
 (defn assert-call! [caller callee arity line]
-  (datom/transact! code-conn
+  (datom/transact! (conn)
     [{:db/id (+ 9000000 (swap! sub-counter (fn [n] (+ n 1))))
       :call/caller caller :call/callee callee
       :call/arity arity :call/line line}]))

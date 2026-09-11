@@ -262,13 +262,21 @@ fn main() {
 
     // ── daemon fast-path (unix) ──────────────────────────────────────────────
     // A warm `bl daemon` for the caller's tree serves the command over a socket
-    // in ~30ms instead of a ~1.2s cold VM boot. Skipped when BL_DAEMON=off, and
-    // for the daemon lifecycle verbs themselves (which must reach the release).
+    // in ~30ms instead of a ~1.2s cold VM boot. Skipped when BL_DAEMON=off, for
+    // the daemon lifecycle verbs themselves (which must reach the release), and
+    // for the verbs that own their process for as long as it lives: a repl, a
+    // watcher, a server, an editor/agent transport. The daemon runs one command
+    // at a time in one worker, so a command that never returns would hold every
+    // later client's turn; these run cold in their own VM instead.
     #[cfg(unix)]
     {
         let off = std::env::var("BL_DAEMON").map(|v| v == "off").unwrap_or(false);
-        let is_lifecycle = argv.first().map(String::as_str) == Some("daemon");
-        if !off && !is_lifecycle {
+        let first = argv.first().map(String::as_str);
+        let is_lifecycle = first == Some("daemon");
+        let owns_process = argv.is_empty()
+            || matches!(first, Some("repl" | "watch" | "monitor" | "serve" | "mcp"))
+            || (first == Some("lsp") && argv.get(1).map(String::as_str) == Some("serve"));
+        if !off && !is_lifecycle && !owns_process {
             if let Some(code) = maybe_attach_daemon(&argv, &bin) {
                 std::process::exit(code);
             }

@@ -1,18 +1,18 @@
 defmodule BeamLisp.RunCodePathTest do
   use ExUnit.Case, async: false
 
-  # `mix beam_lisp.run --code-path DIR` / `BEAM_LISP_CODE_PATH` must put a
-  # directory of AOT beams where the loader's AOT-first branch can see it.
-  # `ERL_AFLAGS="-pa DIR"` does not: Mix prunes the code path after loading
-  # the project, so the beams vanished and every namespace compiled from
-  # source — an application's 30s load with a "working" AOT build. This locks
-  # in the flag and the env var, and that the pruned `-pa` is indeed gone
-  # (so nobody reinstates it as the documented way).
+  # `bl --code-path DIR` / `BEAM_LISP_CODE_PATH` must put a directory of AOT
+  # beams where the loader's AOT-first branch can see it. `ERL_AFLAGS="-pa DIR"`
+  # does not: Mix prunes the code path after loading the project, so the beams
+  # vanished and every namespace compiled from source — an application's 30s
+  # load with a "working" AOT build. This locks in the flag and the env var
+  # (parsed by `bl.cli/parse-argv`, applied by `bl.util/register-paths`), and
+  # that the pruned `-pa` is indeed gone (so nobody reinstates it as the
+  # documented way).
 
   @tmp Path.join(System.tmp_dir!(), "beam_lisp_run_code_path")
   @src Path.join(@tmp, "src")
   @out Path.join(@tmp, "out")
-  @ns "rcp.fixture"
   @mod BeamLisp.Ns.Rcp.Fixture
 
   setup do
@@ -47,30 +47,35 @@ defmodule BeamLisp.RunCodePathTest do
     path
   end
 
-  # Straight through the loader, not the Mix task: the task's failure path is
-  # `exit({:shutdown, 1})` after printing to stderr, which a test cannot read.
-  # The code-path plumbing under test is `Mix.Tasks.BeamLisp.Run.code_paths/1`
-  # applied exactly as `run/1` does.
-  defp run(argv) do
-    {opts, [path]} = OptionParser.parse!(argv, strict: [path: :keep, code_path: :keep])
-    for dir <- Mix.Tasks.BeamLisp.Run.code_paths(opts), do: Code.prepend_path(Path.expand(dir))
-    ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file(path) end)
+  # Drive the CLI's own parse and path registration — the pair `bl run
+  # --code-path DIR` uses — then run the entry through the loader. The CLI's
+  # `main` halts the VM, which a test cannot survive, so the pieces under test
+  # are called directly at the same seam the command calls them.
+  defp run(argv, path) do
+    ExUnit.CaptureIO.capture_io(fn ->
+      BeamLisp.init()
+      BeamLisp.Loader.ensure_loaded("bl.cli")
+      BeamLisp.Loader.ensure_loaded("bl.util")
+      st = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.cli", "parse-argv"), [argv])
+      BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.util", "register-paths"), [st])
+      BeamLisp.run_file(path)
+    end)
   end
 
   test "--code-path makes the AOT beam visible to the VM" do
-    out = run(["--code-path", @out, entry()])
+    out = run(["run", "--code-path", @out], entry())
     assert out =~ ":on-path true", out
   end
 
   test "BEAM_LISP_CODE_PATH does the same from the environment" do
     System.put_env("BEAM_LISP_CODE_PATH", @out)
-    out = run([entry()])
+    out = run(["run"], entry())
     assert out =~ ":on-path true", out
   end
 
   test "without either, the beam is not on the path (the pruned -pa is not a fallback)" do
     Code.delete_path(@out)
-    out = run([entry()])
+    out = run(["run"], entry())
     assert out =~ ":on-path nil", out
   end
 end

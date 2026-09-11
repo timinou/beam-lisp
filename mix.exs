@@ -95,15 +95,15 @@ defmodule BeamLisp.MixProject do
   defp deps do
     [
       {:tidewave, "~> 0.5", only: :dev},
-      # Bandit backs the dev-only Tidewave playground (lib/dev/dev_server.ex).
-      # `only: :dev` again: the spell endpoint it used to serve moved to the
-      # spell repo with the extraction.
-      {:bandit, "~> 1.5", only: :dev},
-      # file_system drives the live-reload watcher (lib/beam_lisp/reload_watcher.ex):
-      # it emits filesystem events for `.bl` saves, which the watcher stages into
-      # the reload bundle. Dev + test only — production trusts compiled beams and
-      # runs no watcher (the guarantee lives in the running image, not the build).
-      {:file_system, "~> 1.0", only: [:dev, :test]},
+      # Bandit is the HTTP server behind `web/serve` and therefore `bl serve`
+      # (and the dev-only Tidewave playground, lib/dev/dev_server.ex). It ships
+      # in the release: a drop that advertises `bl serve` must be able to run it.
+      {:bandit, "~> 1.5"},
+      # file_system drives the live-reload watcher (lib/beam_lisp/reload_watcher.ex)
+      # behind `bl watch` and `bl monitor`: it emits filesystem events for `.bl`
+      # saves, which the watcher stages into the reload bundle. Ships in the
+      # release for the same reason as bandit.
+      {:file_system, "~> 1.0"},
       # examples/datom/live/06-projector.bl starts a PubSub as its broadcast
       # transport; the examples run only under `mix test`.
       {:phoenix_pubsub, "~> 2.1", only: :test},

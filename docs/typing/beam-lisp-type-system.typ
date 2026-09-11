@@ -507,7 +507,7 @@ the offending form, delaborated types. Widths use the token boundary
 because ends are not tracked; that approximation is documented in the
 code, not hidden.
 
-#ran("mix beam_lisp.run examples/typing/07_errors_demo.bl",
+#ran("bl run examples/typing/07_errors_demo.bl",
 [```
 m.bl:2:19: double-it: argument 1 is (:string), declared (:int)
   2 │    (defn buggy [] (double-it "s"))

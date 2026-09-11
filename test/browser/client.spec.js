@@ -9,7 +9,7 @@
 //
 // Run:  cd test/browser && npx playwright test
 // (fixture.json must be regenerated first:
-//    mix beam_lisp.run --path priv test/browser/gen_fixture.bl > fixture.json)
+//    bl run test/browser/gen_fixture.bl > fixture.json)
 
 const { test, expect } = require("@playwright/test");
 const fs = require("fs");

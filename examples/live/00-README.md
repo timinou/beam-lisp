@@ -13,7 +13,7 @@ made `^{:key …}` reach runtime collections.
 Run any file with:
 
 ```
-mix beam_lisp.run --path priv examples/live/NN-name.bl
+bl run examples/live/NN-name.bl
 ```
 
 ## The ladder — zero to the whole thing

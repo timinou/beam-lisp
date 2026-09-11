@@ -61,7 +61,7 @@ A number is shorthand for `{:ms number}`. `:kill?` defaults to `true`, which exi
 Run the repository example:
 
 ```sh
-mix beam_lisp.run --path priv examples/fence.bl
+bl run examples/fence.bl
 ```
 
 The fence monitors rather than links the child. A linked child's failure would propagate to the caller; a monitor instead delivers a `:DOWN` signal. The implementation correlates replies with the child pid and monitor reference, then removes the monitor with `:flush` on success, crash, and timeout. Unrelated mailbox messages remain untouched, and no late `:DOWN` message leaks into later receives.

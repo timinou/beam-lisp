@@ -98,7 +98,7 @@ a process is wedged; `stop` is the polite default.
 (stop c)                          ; clean shutdown
 ```
 
-Run it: `mix beam_lisp.run examples/server.bl` — this *is* that file.
+Run it: `bl run examples/server.bl` — this *is* that file.
 
 ## What changed under you (if you knew the old names)
 

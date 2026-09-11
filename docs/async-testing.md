@@ -20,7 +20,7 @@ cold runtime state as a one-flag choice. Practical guide to PLAN-046.
 ```
 
 ```console
-$ mix beam_lisp.test --async test/my
+$ bl test --async test/my
 ```
 
 Every FILE gets its own environment — a private fork of the runtime — and
@@ -167,7 +167,7 @@ Sometimes the test subject is Elixir orchestrating bl — then ExUnitCase
 gives you the same semantics in `*_test.exs`:
 
 ```console
-$ mix beam_lisp.gen.case MyApp.BlCase --warm my.app my.app.more
+$ mix bl.gen.case MyApp.BlCase --warm my.app my.app.more
 ```
 
 ```elixir
@@ -176,7 +176,7 @@ defmodule MyApp.ServerTest do
 end
 ```
 
-`mix beam_lisp.test.doctor` audits an existing `*_test.exs` tree and marks
+`bl test.doctor` audits an existing `*_test.exs` tree and marks
 each file ADOPTS / READY / FLIPPABLE / STAYS SYNC, with reasons. Reach for
 this when testing the host; reach for `*-test.bl` when testing the app.
 

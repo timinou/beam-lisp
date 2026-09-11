@@ -155,7 +155,7 @@ The demos in `examples/system/` are the pressure test made re-runnable. The
 load-bearing one — an OTP `defserver`, written with no verification in mind,
 produces the same machine as a raw `receive` loop:
 
-#ran("mix beam_lisp.run --path priv examples/system/01_extraction.bl")[
+#ran("bl run examples/system/01_extraction.bl")[
   ```
   raw receive-loop:   ([:dec "(- n 1)"] [:inc "(+ n 1)"] [:reset "0"])
   defserver (OTP):    ([:dec "(- n 1)"] [:inc "(+ n 1)"] [:reset "0"])
@@ -166,7 +166,7 @@ produces the same machine as a raw `receive` loop:
 
 And the crown, end to end, on the graduated engine:
 
-#ran("mix beam_lisp.run --path priv examples/system/08_hot_upgrade.bl")[
+#ran("bl run examples/system/08_hot_upgrade.bl")[
   ```
   VERIFIED HOT UPGRADE — code_change from v1 {:balance} to v2 {:balance :currency}
     1. migration b2 := b1 preserves balance ≥ 0:                true
@@ -226,7 +226,7 @@ function does the whole job.
 Remove the withdraw guard and the checker renders the failure exactly like every
 other beam-lisp warning — `file:line:col`, the source line, a caret:
 
-#ran("mix beam_lisp.run --path priv examples/system/09_point_and_verify.bl")[
+#ran("bl run examples/system/09_point_and_verify.bl")[
   ```
   account.bl:1:1: invariant not preserved by withdraw
     1 │ (defserver ^{:invariant (>= balance 0)} account

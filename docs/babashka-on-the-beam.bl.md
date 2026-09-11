@@ -1,7 +1,7 @@
 # Babashka on the BEAM — a runnable guidebook
 
 > This is a **literate program**. Every `beam-lisp` code block below runs.
-> Load it like any script: `mix beam_lisp.run docs/babashka-on-the-beam.bl.md`.
+> Load it like any script: `bl run docs/babashka-on-the-beam.bl.md`.
 > The prose is the narrative; the code is the proof.
 
 Babashka made Clojure a joy for scripting: `slurp` a file, crunch it with

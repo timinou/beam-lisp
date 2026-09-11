@@ -76,7 +76,7 @@ defmodule BeamLisp.Application do
 
   # The Tidewave endpoint is for interactive sessions (iex -S mix,
   # mix run --no-halt), never for one-shot CLI tasks — a
-  # `mix beam_lisp.run file.bl` or `mix run -e …` must not fight a
+  # `mix bl run file.bl` or `mix run -e …` must not fight a
   # running playground for port 9837.
   # The DevServer module only exists when compiled in beam-lisp's own :dev
   # (lib/dev is excluded from other elixirc_paths, so dependents never see it);

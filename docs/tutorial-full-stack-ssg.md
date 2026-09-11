@@ -42,7 +42,7 @@ Make a file called `hello.bl` and put this in it:
 Run it:
 
 ```
-mix beam_lisp.run --path priv hello.bl
+bl run hello.bl
 ```
 
 Output:
@@ -315,7 +315,7 @@ Finally, run the build:
 That's the whole program. Run it:
 
 ```
-mix beam_lisp.run --path priv examples/ssg/blog.bl
+bl run examples/ssg/blog.bl
 ```
 
 Output:

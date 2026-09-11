@@ -1,10 +1,10 @@
 # MCP over the codebase — a thoughtfully small surface
 
 Status: PROTOTYPE — 2026-08-30
-Lives in: `tooling/mcp/` (six modules) + `tooling/run-mcp-demo.bl` (entry)
-Run: `mix beam_lisp.run --path tooling tooling/run-mcp-demo.bl`
+Lives in: `priv/lib/mcp/` (four modules); `bl mcp` serves the stdio transport
+Run: `bl mcp` (stdio server) · `bl run examples/mcp-demo.bl` (demo)
 
-> One claim, tested: the three-tool MCP shape proven against a *law* library in
+> One claim, tested: the MCP shape proven against a *law* library in
 > `spell/apps/mcp` is not domain-specific. Repointed at beam-lisp's own
 > code-as-facts engine (`priv/std/codebase.bl`), the *same* protocol core, the
 > *same* MRTR elicitation, and the *same* registry answer coding questions —
@@ -15,23 +15,22 @@ Run: `mix beam_lisp.run --path tooling tooling/run-mcp-demo.bl`
 
 ---
 
-## 0. Where this came from
+## 0. The modules
 
-The six protocol modules were built in `spell/apps/mcp/src/mcp` pointed at a
-Moroccan-law fixture. They were copied here and split into two halves:
+The protocol modules live in `priv/lib/mcp/`; `bl mcp` spawns the stdio server.
 
-| module | origin | change |
-|---|---|---|
-| `jsonrpc.bl` | spell | **verbatim** — pure JSON-RPC 2.0 + version envelopes |
-| `transport-stdio.bl` | spell | **verbatim** — newline framing, all diagnostics to stderr |
-| `stdio_main.bl` | spell | **verbatim** — the spawned-process entry |
-| `server.bl` | spell | **repointed** — `code://` resources; dispatch unchanged |
-| `tools.bl` | spell | **rewritten** — six tools over `codebase.bl` |
-| `demo.bl` | spell | **rewritten** — eleven exchanges over real source |
+| module | what it is |
+|---|---|
+| `jsonrpc.bl` | pure JSON-RPC 2.0 + version envelopes |
+| `transport-stdio.bl` | newline framing, all diagnostics to stderr; `main` starts the server |
+| `server.bl` | dispatch + `code://` resources |
+| `tools.bl` | six tools over `codebase.bl` |
 
-That the transport-neutral half copies verbatim is the first evidence for the
-thesis: **the MCP core never calls out** (protocol is pure data in, data out),
-so it does not know or care whether the fact space behind it is law or code.
+The demo — eleven exchanges over the real self-index — is
+`examples/mcp-demo.bl`, run with `bl run examples/mcp-demo.bl`.
+
+The protocol core never calls out — protocol is pure data in, data out — so it
+does not know or care whether the fact space behind it is law or code.
 
 ---
 
@@ -63,7 +62,7 @@ and datom, not in a wide tool menu.
 
 ---
 
-## 2. The surface — the three-tool core, plus two beam-lisp-only tools
+## 2. The surface — the code tools, plus two beam-lisp-only tools
 
 | legal prototype | codebase MCP | role | wire cost |
 |---|---|---|---|
@@ -214,13 +213,11 @@ The existing `examples/typing/02_codebase_demo.bl` still PASSes with the fix.
 ## 6. Files
 
 ```
-tooling/mcp/jsonrpc.bl          protocol core (verbatim from spell)
-tooling/mcp/transport-stdio.bl  stdio framing  (verbatim)
-tooling/mcp/stdio_main.bl       spawned entry  (verbatim)
-tooling/mcp/server.bl           dispatch + code:// resources (repointed)
-tooling/mcp/tools.bl            code/list · code/query · code/ask · code/verify ·
-                                code/subscribe · code/poll (rewritten)
-tooling/mcp/demo.bl             eleven exchanges over the real self-index
-priv/std/codebase.bl                impact/reachable target-binding fix (upstream)
-tooling/run-mcp-demo.bl         runnable entrypoint
+priv/lib/mcp/jsonrpc.bl          protocol core
+priv/lib/mcp/transport-stdio.bl  stdio framing (main starts the server)
+priv/lib/mcp/server.bl           dispatch + code:// resources
+priv/lib/mcp/tools.bl            code/list · code/query · code/ask · code/verify ·
+                                 code/subscribe · code/poll
+examples/mcp-demo.bl            eleven exchanges over the real self-index
+priv/std/codebase.bl             impact/reachable target-binding fix (upstream)
 ```

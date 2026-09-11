@@ -46,7 +46,7 @@ must not be reachable through a `:global`-loaded wrapper either.*
 ## Running
 
 ```sh
-mix beam_lisp.run --path priv examples/sandbox/01-the-env-is-a-world.bl
+bl run examples/sandbox/01-the-env-is-a-world.bl
 ```
 
 Each file is self-contained and prints its own narration. Read them in order;
