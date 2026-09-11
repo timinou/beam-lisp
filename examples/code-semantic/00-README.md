@@ -42,24 +42,26 @@ and everything here is gated on it:
 
 ## What it costs
 
-Measured on this machine (AMD Ryzen AI 7 350), `VmRSS` read from
-`/proc/self/status`:
+Measured on this machine (AMD Ryzen AI 7 350), `VmRSS` from
+`/proc/self/status` over three runs, with `erlang:memory(total)` beside it to
+separate the BEAM's heap from everything else:
 
-| | RSS |
+| | cost |
 |---|---|
-| VM + datom, no `code.embed` | 156 MB |
-| `code.embed` required, model NOT loaded | 162 MB |
-| model loaded | 246 MB (**+84 MB**) |
-| 200 more embeddings | +1.8 MB |
+| boot with `datom`, model not required | 156–176 MB RSS |
+| `code.embed` + `code.semantic` required, model NOT loaded | no measurable change |
+| model loaded | **+82 to +85 MB RSS**, and **+4 KB** of BEAM heap |
+| first embed after load (model read + tokenizer build) | 266–278 ms, once |
+| 177 functions / 160 288 characters | **27–36 ms**, ≈ 0.17 ms per function |
+| 177 embeddings live in the conn | 1.6 MB of BEAM heap |
 
-84 MB resident for 16M parameters, of which 64 MB is the f32 matrix the Rust
-side holds (the file on disk is fp16, 32 MB). Embedding speed, over the 177
-real functions of the corpus in `01`: **306 ms for 159 000 characters** — 1.7 ms
-per function, which is why the demos index a corpus per run instead of caching.
+The last two rows of that table are the point. The model's 84 MB is *Rust's*,
+not the BEAM's — the heap moves 4 KB — and a whole codebase's worth of vectors
+costs about the size of a photograph.
 
 Indexing *cost* in the demos is dominated by `codebase/index-source` (parsing
 and walking), not by the model: the eight-file corpus takes single-digit
-seconds of wall clock, of which ~0.3 s is embedding.
+seconds of wall clock, of which tens of milliseconds are embedding.
 
 ## The two sentences to take away
 

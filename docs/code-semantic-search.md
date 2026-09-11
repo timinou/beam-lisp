@@ -35,7 +35,8 @@ and "the language needs a GPU box". The Rust side holds the f32 matrix; the file
 on disk is half that.
 
 **It is fast enough to re-do.** The 177 functions of beam-lisp's own datom layer
-embed in 306 ms, or 1.7 ms per function. Indexing a whole checkout costs seconds,
+embed in 27–36 ms, or about 0.17 ms per function, once the model is loaded
+(266–278 ms, paid on the first call). Indexing a whole checkout costs seconds,
 which means the index does not need an invalidation story elaborate enough to be
 worth caching.
 
@@ -73,6 +74,10 @@ reads 32 MB of weights once and keeps them.
 the matrix. The alternative — a bl vector of 16M floats — is 16M boxed values
 plus list overhead, and every embed crosses the boundary twice. Behind the
 resource the arithmetic happens where the numbers already are.
+
+That the weights really are off the heap is measurable, not a claim: loading the
+model moves RSS by ~84 MB and the BEAM's own `erlang:memory(total)` by **4 KB**.
+The vector column costs the heap 1.6 MB for 177 embeddings — where it belongs.
 
 A batch crosses **once**, as packed little-endian f32 bytes: one binary holding
 `count × dim` floats. That is already the shape `datom.vector`'s `DVec` stores,
