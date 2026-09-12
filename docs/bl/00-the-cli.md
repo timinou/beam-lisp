@@ -492,24 +492,46 @@ native is a line in the table, never a crash.
 $ bl doctor
 beam-lisp doctor
 
-  ok   language       (+ 1 2) → 3
-  ok   otp            29
-  ok   elixir         1.20.2
-  ok   beam-lisp      2026.0.0
-  ok   search-paths   0 root(s)
-  ok   code-paths     44 dir(s)
-  ok   datom_fjall    loaded
-  ok   explorer       loaded
-  ok   lazy_memo      65536 bytes fast lane
-  ok   z3             sat
-  ok   wry            loaded
-  --   daemon         not running (:no_socket)
-  --   src/           absent
-  --   .bl-check.edn  absent (run `bl check --update`)
-  --   .blanalysis/   absent (created by the first codebase read)
+  ok   language          (+ 1 2) → 3
+  ok   otp               29
+  ok   elixir            1.20.2
+  ok   beam-lisp         0.1.0
+  ok   search-paths      0 roots
+  ok   code-paths        44 dirs
+  ok   datom_fjall       loaded
+  ok   explorer          loaded
+  ok   lazy_memo         65536 bytes fast lane
+  ok   z3                sat
+  ok   wry               loaded
+  --   daemon            not running (:no_socket)
+  --   src/              absent
+  ok   .bl-check.edn     present
+  ok   .local/bl/cache/  present
 
-  ✓ 2 required probes ok; 4 optional absent
+  ✓ 2 required probes ok; 2 optional absent
 ```
+
+#### `bl cache status | prune [--max-mb N] [--dry-run]`
+
+The analysis store is content-addressed: one artifact per source *revision*,
+which is what makes a stale one unreachable — and also what makes them pile up.
+`status` says what this tree's stores hold, per directory, and whether the total
+is over the cap; `prune` deletes the OLDEST first, never the newest (the one the
+run that just finished wrote), until it is under. `--dry-run` reports and deletes
+nothing, `--max-mb` overrides the cap for one run, and `BL_CACHE_MAX_MB`
+(default 512) for every run. `bl search` prunes after it indexes, so the ceiling
+holds without anyone remembering it.
+
+```sh
+$ bl cache status
+  2 store(s)  839 KB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 839 KB · cap 512 MB (under)
+```
+
+A store per source revision means nothing here is precious: every one can be
+rebuilt from the source it came from, and the only thing pruning costs is the
+next run's time. Where they live is a project question — see
+`docs/code-semantic-search.md`.
 
 Exit `0` when the required probes pass, `1` otherwise.
 

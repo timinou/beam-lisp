@@ -1,0 +1,181 @@
+; cache.bl — `bl cache`: what the analysis store holds, and pruning it.
+;
+; The store is CONTENT-ADDRESSED: one artifact per (source, source-revision).
+; That is what makes a stale store unreachable — and it is also what makes
+; stores ACCUMULATE. Every edit mints a new store, and the old one is garbage
+; the moment the source moves on. Nothing deletes it on its own, so a cap, plus
+; a verb to see and enforce it, is not a nicety: without them the store grows
+; forever. (A reboot used to be the eviction policy. That is not a policy.)
+;
+; The cap is a total in bytes over the stores of one tree. `BL_CACHE_MAX_MB`
+; overrides the default, and pruning takes the OLDEST first — never the newest,
+; which is the store the run that just finished wrote (see `evict`).
+
+(ns bl.cache
+  (:require [bl.util :as u] [bl.cli :as cli] [codebase]))
+
+(def DEFAULT-MAX-MB 512)
+
+;; ── measuring the store ─────────────────────────────────────────────
+
+(defn- size-of
+  "Bytes under `path` — a file, or a directory walked recursively."
+  [path]
+  (if (File/dir? path)
+    (reduce (fn [n child] (+ n (size-of (str path "/" child)))) 0 (u/to-list (File/ls! path)))
+    (:size (File/stat! path))))
+
+(defn entries
+  "Every store in `dir`, as `{:name :bytes :mtime}` — ONE entry per store.
+
+   A store on disk is `<ns>.<sha>.fjall` plus everything named beside it: the
+   `.fjall.blobs` sibling holds the values too large to inline and belongs to the
+   same artifact. Counting it separately would double the reported size and let a
+   prune delete half a store — a store that opens, answers, and is missing
+   entries, which is worse than one that is gone."
+  [dir]
+  (if-not (File/dir? dir)
+    []
+    (into []
+      (keep (fn [name]
+              (when (ends-with? name ".fjall")
+                (let [p (str dir "/" name)
+                      blobs (str p ".blobs")]
+                  {:name (subs name 0 (- (count name) 6))
+                   :bytes (+ (size-of p) (if (File/exists? blobs) (size-of blobs) 0))
+                   :mtime (:mtime (File/stat! p))})))
+            (u/to-list (File/ls! dir))))))
+
+(defn human
+  "Bytes as something a person reads: `12 B`, `340 KB`, `1 MB`."
+  [n]
+  (cond
+    (< n 1024) (str n " B")
+    (< n (* 1024 1024)) (str (quot n 1024) " KB")
+    :else (str (quot n (* 1024 1024)) " MB")))
+
+(defn cap-bytes
+  "The ceiling in bytes: `BL_CACHE_MAX_MB` megabytes, else `DEFAULT-MAX-MB`.
+
+   Read per call, like every other knob here: a test (or a CI run with a small
+   disk) sets the variable and gets it."
+  []
+  (let [env (System/get_env "BL_CACHE_MAX_MB")
+        mb (if (nil? env) nil (cli/parse-int env))]
+    (* 1024 1024 (if (nil? mb) DEFAULT-MAX-MB mb))))
+
+;; ── deciding what goes ──────────────────────────────────────────────
+
+(defn evict
+  "The store NAMES to delete to bring `entries` under `cap` bytes: oldest first,
+   and never the newest entry.
+
+   The newest is the store the run that just finished wrote — the one the next
+   run is most likely to ask for — so it survives even a cap of zero. That is
+   why a store bigger than the whole cap is kept: the cap is a ceiling on the
+   OLD, not a reason to throw away what was just paid for.
+
+   Oldest-first is the right order for a content-addressed cache: a store exists
+   for one revision of one source, so the oldest is the least likely to be asked
+   for again. (Biggest-first would trade one large file's analysis for a dozen
+   tiny ones.) Pure, and it reads mtimes from its argument, so the order is a
+   property a test can state rather than whatever the filesystem stamped."
+  [entries cap]
+  (let [total (reduce (fn [n e] (+ n (:bytes e))) 0 entries)
+        oldest-first (sort-by (fn [e] (:mtime e)) entries)
+        candidates (if (empty? oldest-first)
+                     []
+                     (take (dec (count oldest-first)) oldest-first))]
+    (loop [cs candidates remaining total out []]
+      (if (or (empty? cs) (<= remaining cap))
+        out
+        (recur (rest cs)
+               (- remaining (:bytes (first cs)))
+               (conj out (:name (first cs))))))))
+
+(defn prune!
+  "Delete stores until every directory in `dirs` is under `cap` bytes.
+
+   Returns `{:removed :freed :kept :remaining}` over all of them. Idempotent: a
+   second run finds nothing to do, which is also the assertion that `kept` is
+   right."
+  [dirs cap]
+  (reduce
+    (fn [acc dir]
+      (let [es (entries dir)
+            doomed (into #{} (evict es cap))
+            freed (reduce (fn [n e] (if (contains? doomed (:name e)) (+ n (:bytes e)) n)) 0 es)]
+        (doseq [name (to-list doomed)]
+          (File/rm_rf! (str dir "/" name ".fjall"))
+          (File/rm_rf! (str dir "/" name ".fjall.blobs")))
+        (let [left (entries dir)]
+          {:removed (+ (:removed acc) (count doomed))
+           :freed (+ (:freed acc) freed)
+           :kept (+ (:kept acc) (count left))
+           :remaining (+ (:remaining acc) (reduce (fn [n e] (+ n (:bytes e))) 0 left))})))
+    {:removed 0 :freed 0 :kept 0 :remaining 0}
+    (to-list dirs)))
+
+(defn store-dirs
+  "The directories holding this tree's stores.
+
+   The live tier `codebase/blanalysis-dir` resolves to, PLUS the host tier when
+   it has stores — a project that could not be written to once (a read-only
+   mount, an installed drop) leaves its artifacts there, and reporting only the
+   live tier would hide exactly the ones a prune exists for."
+  []
+  (let [live (codebase/blanalysis-dir)
+        host (BeamLisp.Cache/host_dir (BeamLisp/cwd))]
+    (distinct (concat [live] (if (and (File/dir? host) (not= host live)) [host] [])))))
+
+;; ── the command ─────────────────────────────────────────────────────
+
+
+(defn- report
+  "One line per directory plus the total, and whether the cap is breached."
+  [dirs cap]
+  (let [rows (mapv (fn [d] {:dir d :entries (entries d)}) dirs)
+        bytes-of (fn [es] (reduce (fn [n e] (+ n (:bytes e))) 0 es))
+        total (reduce (fn [n r] (+ n (bytes-of (:entries r)))) 0 rows)]
+    (doseq [r rows]
+      (println (str "  " (count (:entries r)) " store(s)  " (human (bytes-of (:entries r)))
+                    "  " (:dir r))))
+    (println (str "total " (human total) " · cap " (human cap)
+                  (if (> total cap) " (over — run `bl cache prune`)" " (under)")))
+    0))
+
+(defn run
+  "`bl cache status | prune [--max-mb N] [--dry-run]`
+
+   status — what this tree's stores hold, per directory, and whether the total is
+   over the cap. prune — delete oldest-first until it is not, and say what was
+   freed. `--dry-run` on prune reports the same thing and deletes nothing, which
+   is the way to see what would go before it goes.
+
+   The flags come from the SHARED argv table (`bl.cli/parse-argv`), not from
+   parsing here: a verb that reads its own flags is a verb the dispatcher rejects
+   as an unknown flag before it ever runs, and the two would drift.
+
+   The default cap is 512 MB (`BL_CACHE_MAX_MB` overrides). Stores are per source
+   revision, so nothing here is precious: every one can be rebuilt from the source
+   it came from — the only thing pruning costs is the next run's time."
+  [args st]
+  (let [sub (first (to-list args))
+        ; `--max-mb` wins, then the environment, then the default — the order
+        ; every other knob here follows.
+        cap (if (:max_mb st) (* (:max_mb st) 1024 1024) (cap-bytes))]
+    (cond
+      (= sub "status") (report (store-dirs) cap)
+
+      (= sub "prune")
+        (let [dirs (store-dirs)
+              r (prune! dirs cap)]
+          (if (:dry_run st)
+            (report dirs cap)
+            (do (println (str "pruned " (:removed r) " store(s), freed " (human (:freed r))
+                              " · kept " (:kept r) " (" (human (:remaining r)) ")"))
+                0)))
+
+      :else (do (u/io-err "usage: bl cache status | prune [--max-mb N] [--dry-run]")
+                2))))
+

@@ -189,7 +189,7 @@ through one chain:
 ```
 index!            a set of [ns path] — the only entry point, one band per file
   └ index-source! one file: facts + one embedding per function, ONE transaction
-      └ cached-facts  the project's .blanalysis store, keyed by sha256(source)
+      └ cached-facts  the project's store, keyed by sha256(source)
 ```
 
 That is deliberate, and it is what keeps three callers from drifting apart. The
@@ -200,14 +200,27 @@ two indexers start disagreeing about what "indexed" means.
 
 Three properties belong to the door rather than to any caller:
 
-* **Cached analysis.** Facts come from `.blanalysis`, because an analysis is a
-  pure function of the source bytes. Nothing re-analyzes an unchanged file.
-  The store is the PROJECT's — `.blanalysis/` beside the tree, one fjall store
-  per source, content-addressed by `sha256(source)` — so a worktree carries its
-  own cache, `rm -rf` of the tree takes the cache with it, and no two checkouts
-  read each other's stores. `BLANALYSIS_DIR` overrides it (tests and builds
-  point it at a throwaway directory); add `.blanalysis/` to the project's
-  .gitignore, which `bl doctor` reports on.
+* **Cached analysis.** Facts come from the project's store, because an analysis
+  is a pure function of the source bytes: nothing re-analyzes an unchanged file.
+  `codebase/blanalysis-dir` resolves in three tiers — `$BLANALYSIS_DIR` (tests,
+  builds, CI), else `<project>/.local/bl/cache`, else
+  `$XDG_CACHE_HOME/beam_lisp/cache/<tree id>` for a project that cannot be
+  written to: an installed drop, a mounted checkout, a CI read-only bind. The
+  third tier is keyed by the same 16-hex tree id a `bl` daemon uses, so
+  re-extracting a payload finds its analysis again instead of paying for it
+  twice. The project is the nearest ancestor of the corpus that looks like one
+  (a `.git`/`.hg` root, `mix.exs`, `priv/boot/core.bl`, an extracted drop's
+  `bin/bl` + `releases/`); with none, the corpus you pointed at is the project —
+  never the filesystem root. `.local/bl/` is gitignored, and `bl doctor` reports
+  the directory.
+* **The stores accumulate, so a cap and a verb exist.** One store per (source,
+  source revision) means every edit mints a new one and the old one is garbage
+  the moment the source moves on. `bl cache status` shows what a tree holds, per
+  directory, and whether the total is over the cap (`BL_CACHE_MAX_MB`, default
+  512 MB); `bl cache prune [--max-mb N] [--dry-run]` deletes the OLDEST stores
+  first and never the newest, which is the one the run that just finished wrote.
+  `bl search` prunes after it indexes, so the ceiling holds without anyone
+  remembering it.
 * **The vectors are IN that store.** `:fn/embedding` is a COLUMN of it, not a
   second cache: the same file, the same sha, the same reopen. One marker datom
   on entity 0 records which model filled the column (`fn/embedding=potion-
@@ -264,7 +277,7 @@ bl search: the model weights are not on disk — run `mix bl.embed.fetch` (expec
 ### What it costs
 
 Measured on a laptop over beam-lisp's own `priv/` — 156 files, 2565 functions.
-The index runs THROUGH the `.blanalysis` cache, and the vectors are a COLUMN of
+The index runs THROUGH the project's store, and the vectors are a COLUMN of
 that same store, so the first run pays for the analysis and everything after it
 pays for a reopen:
 
@@ -279,7 +292,7 @@ Both runs of one question, over `priv/lib` — 101 files, 1,623 functions — wi
 the analysis store deleted first:
 
 ```
-$ rm -rf .blanalysis
+$ rm -rf .local/bl
 $ bl search "read a file into lines" -p priv/lib -k 3
 3 of 1623 functions in 101 files  (index 178184 ms · query 187 ms)
 
@@ -289,6 +302,27 @@ $ bl search "read a file into lines" -p priv/lib -k 3
   mcp.tools/read1                      line 274  0.5515622496604919
   code.semantic/form-starts            line 88   0.5239207148551941
 ```
+
+The same two runs on the corpus you actually work in — `priv/lib/code`, 2 files,
+48 functions — where the store is created beside the sources:
+
+```
+$ bl search "read a file into lines" -p priv/lib/code -k 3     # nothing cached yet
+3 of 48 functions in 2 files  (index 7151 ms · query 29 ms)
+
+$ bl search "read a file into lines" -p priv/lib/code -k 3     # everything cached
+3 of 48 functions in 2 files  (index 2534 ms · query 1214 ms · cached 2/2 · vectors 2/2)
+
+$ bl cache status
+  2 store(s)  839 KB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 839 KB · cap 512 MB (under)
+```
+
+`examples/code-semantic/01-search-by-meaning.bl` indexes eight real source files,
+so its FIRST run pays the full cold analysis — 79 s measured — and reopens the
+store in seconds after that. The example suite skips that file for this reason
+(the mechanism it demonstrates is covered by `test/bl/code/semantic_test.bl`);
+run the demo with `mix bl run`.
 
 The footer says what the store earned. `cached 101/101` is every analysis
 reopened; `vectors 101/101` is the stronger claim: no source was sliced and the

@@ -82,7 +82,7 @@ gives, because both of them are silent and both look plausible.
 ```
 native/code_embed/          the Rust NIF: a static code embedding model, resident off the BEAM heap
 priv/lib/code/embed.bl      availability, the delayed model handle, text → DVec
-priv/lib/code/semantic.bl   indexing (one embedding per function, through the .blanalysis cache), search, restricted search
+priv/lib/code/semantic.bl   indexing (one embedding per function, through the project's store), search, restricted search
 priv/std/bl/search.bl       the `bl search` command: corpus → index → question → hits
 lib/beam_lisp/model.ex      where a downloaded model lives on this machine
 lib/mix/tasks/bl.embed.fetch.ex          the pinned fetch (sha256-verified)

@@ -128,7 +128,7 @@ than one per file: a transaction has a fixed cost on top of its facts, so
 batches of `tx-batch` facts halve the write time of a per-file loop while
 staying well inside the connection's write deadline. And the facts of a file are a
 pure function of its text, so they are cached by content hash under the
-`.blanalysis` directory (`codebase/blanalysis-dir`): a file that has not
+analysis store directory (`codebase/blanalysis-dir`): a file that has not
 changed since the last question is read back as data instead of re-walked.
 The cache is never load-bearing — a missing or unreadable entry is a fresh
 index, and a changed byte changes the hash, so a stale entry is unreachable.

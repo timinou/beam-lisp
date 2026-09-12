@@ -28,7 +28,9 @@ defmodule BeamLisp.Model do
 
   @doc """
   Root of the model cache: `$BEAM_LISP_MODEL_DIR`, else
-  `$XDG_CACHE_HOME/beam_lisp/models`.
+  `$XDG_CACHE_HOME/beam_lisp/models` — the `models` subdirectory of the host
+  cache root (`BeamLisp.Cache`), which owns the one answer to "where does this
+  machine keep beam-lisp's derived state".
 
   Resolved PER CALL, never memoised: a test (or a fetch with `--dir`) sets the
   variable and expects the next call to see it. `BeamLisp.AOTCache` learned this
@@ -38,7 +40,7 @@ defmodule BeamLisp.Model do
   @spec root() :: String.t()
   def root do
     case System.get_env(@env_dir) do
-      nil -> :filename.basedir(:user_cache, ~c"beam_lisp") |> Path.join("models")
+      nil -> Path.join(BeamLisp.Cache.root(), "models")
       dir -> Path.expand(dir)
     end
   end
