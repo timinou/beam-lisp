@@ -5,11 +5,38 @@
 > where do we check that a transaction's schema is valid
 
 No function is called `check-transaction-schema-valid`. The words are in prose,
-not in identifiers. The answer is `datom.conn/run-tx-pipeline` and the three
-functions around it, and the only way to reach them is to search for what the
-code *means*.
+not in identifiers, and the only way to reach the code that means them is to
+search for what the code *means*. Asked over `priv/`, that question answers:
+
+```
+datom.db/schema-of            0.48
+datom.schema/validate-value   0.45
+datom.conn/schema             0.45
+```
 
 This is how that works in beam-lisp, and what it costs.
+
+## What it answers
+
+Four questions, all of them asked of beam-lisp's own source in the runs below:
+
+* **Behaviour you cannot name.** "parse a number out of a string" →
+  `datom.time/parse-int`, `datom.time/parse-point`. No keyword in the question
+  appears in either function.
+* **The sibling you forgot.** `bl search --like datom.tx/validate` →
+  `datom.tx/expand-store-ops`, `datom.tx/uniqueness-violation`,
+  `datom.tx/map-form->ops`. Near-duplicate code scores high, which makes this an
+  overlap radar before a refactor.
+* **One namespace.** `--ns datom.file "read a file from disk"` — the same
+  question asked of a subsystem.
+* **Meaning AND structure in one query.** `code.semantic/search-returning`
+  answers "nearest among the functions that return a string" — the candidate
+  set comes from a datom, the ranking from the model. Two kinds of knowledge,
+  one query, because an embedding is a fact like any other.
+
+The last one is the shape that generalises: any fact in the index can narrow a
+search, and any function's own embedding can be a query vector (`similar`),
+because a vector is a value — there is nothing special to build.
 
 ## A static embedding model is a lookup table
 
@@ -53,7 +80,7 @@ The weights are downloaded, sha256-pinned, and kept under
 fetched per checkout, while a model is the same bytes for every checkout,
 project and worktree on the machine, and copying it per tree buys nothing.
 
-Nothing at query time touches the network. `mix beam_lisp.embed.fetch` is the
+Nothing at query time touches the network. `mix bl.embed.fetch` is the
 only step that does, and after it, search runs with the cable unplugged.
 
 Absence is the ordinary state of a fresh checkout, so absence reads as absent:
@@ -154,6 +181,39 @@ trimmed of the blank lines and `;; ── section ──` heading that introduce
 the symptom is a ranking that is subtly wrong for a reason no error message will
 ever name.
 
+## One door into the index
+
+Everything that indexes goes through `code.semantic/index!`, and under it
+through one chain:
+
+```
+index!            a set of [ns path] — the only entry point, one band per file
+  └ index-source! one file: facts + one embedding per function, ONE transaction
+      └ cached-facts  the .blanalysis store, keyed by sha256(source)
+```
+
+That is deliberate, and it is what keeps three callers from drifting apart. The
+`bl search` command, the examples, and the tests all ask for an index in the
+same words and get the same answers: the same cache, the same entity bands, the
+same behaviour on a file that cannot be read. A second loop in a caller is how
+two indexers start disagreeing about what "indexed" means.
+
+Three properties belong to the door rather than to any caller:
+
+* **Cached analysis.** Facts come from `.blanalysis`, because an analysis is a
+  pure function of the source bytes. Nothing re-analyzes an unchanged file.
+* **Banded ids.** Each source gets its own million-wide id band (`offset-for`),
+  because `codebase/index-source` numbers entities from a fixed base and two
+  files sharing a conn would otherwise silently overwrite each other.
+* **Resilience with a name.** A source the analyzer cannot read yields
+  `{:file path :skipped reason}` instead of aborting the set — and the caller is
+  expected to SAY so. An index one file smaller that reports itself as complete
+  is worse than a crash.
+
+One transaction per file is the last part of the shape: the facts and the
+vectors that describe them commit together, so no query can find an embedding
+whose function does not exist yet.
+
 ## `bl search` — the same question, from the shell
 
 ```sh
@@ -173,32 +233,37 @@ Exit codes are the CLI's usual three: `0` a search ran, `1` something broke,
 missing model is `2` as well, and says so:
 
 ```
-bl search: the model weights are not on disk — run `mix beam_lisp.embed.fetch` (expected in ~/.cache/beam_lisp/models/potion-code-16M-v2)
+bl search: the model weights are not on disk — run `mix bl.embed.fetch` (expected in ~/.cache/beam_lisp/models/potion-code-16M-v2)
   fetch the model once, then search offline forever:
-    mix beam_lisp.embed.fetch
+    mix bl.embed.fetch
 ```
 
 ### What it costs
 
-Measured on a laptop over beam-lisp's own `priv/` — 156 files, 2565 functions:
+Measured on a laptop over beam-lisp's own `priv/` — 156 files, 2565 functions.
+The index runs THROUGH the `.blanalysis` cache, so the first run pays the
+analysis and every run after it pays a reopen:
 
-| phase | cost |
-|---|---|
-| read 156 files | 17 ms |
-| analyze them (`codebase/index-source`) | **~520 s** |
-| embed 2565 functions | ~0.5 s (0.2 ms each) |
-| answer one question | ~250 ms |
+| phase | first run | every run after |
+|---|---|---|
+| read the sources | 17 ms | 17 ms |
+| analyze them (`codebase/analyze-cached`: miss → hit) | **~520 s** | 5–10 ms per file |
+| embed the functions | ~0.5 s (0.2 ms each) | same |
+| answer one question | ~300 ms | ~300 ms |
 
-ANALYZING is the whole cost, and it is seconds PER FILE — macroexpansion of
-every form, 0.7 s for a small file and 30 s for `priv/boot/compiler.bl`. So the
-index is not free and not instant: point this at a directory, not a monorepo.
+ANALYZING is the first run's whole cost, and it is seconds PER FILE —
+macroexpansion of every form: 0.7 s for a small file, 30 s for
+`priv/boot/compiler.bl`. The cache is content-addressed (sha256 of the source),
+so an unchanged file is a REOPEN: measured per file, 180–2300 ms cold against
+5–10 ms warm.
 
-This is not fundamental. A source's analysis is a pure function of its bytes,
-which is what `codebase/analyze-cached` already exploits: the facts are stored
-under sha256(source) in `.blanalysis`, and an unchanged file REPOPENS that store
-in tens of milliseconds instead of being re-indexed in seconds. The semantic
-index does not consult that store yet. When it does, the numbers above collapse
-to the read and the embed.
+What a warm run still pays is the part that is not cached yet: the facts are
+read back out of each store (a scan, 50–350 ms per file) and the embeddings are
+recomputed. Measured end to end over the 100 files of `priv/lib` (1591
+functions): **first run 448 s, warm run 83 s**. Closing that gap is a known next
+step rather than a mystery — the embedding column can live in the SAME
+content-addressed store the analysis does, one more column of the same facts,
+and then a warm run is a reopen and nothing else.
 
 A file the analyzer cannot read is skipped and NAMED, never silently dropped:
 

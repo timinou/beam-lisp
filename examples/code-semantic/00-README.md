@@ -11,9 +11,9 @@ and get `datom.conn/schema`, `datom.conn/run-tx-pipeline`, `datom.conn/transact!
 ## Run it
 
 ```sh
-mix beam_lisp.embed.fetch                        # once: 33 MB, offline after
-mix beam_lisp.run --path priv --path examples examples/code-semantic/01-search-by-meaning.bl
-mix beam_lisp.run --path priv --path examples examples/code-semantic/02-live.bl
+mix bl.embed.fetch                        # once: 33 MB, offline after
+mix bl run --path priv --path examples examples/code-semantic/01-search-by-meaning.bl
+mix bl run --path priv --path examples examples/code-semantic/02-live.bl
 ```
 
 | # | file | what it is |
@@ -29,14 +29,14 @@ and everything here is gated on it:
 
 * `code.embed/available?` answers whether semantic search can run at all;
 * `code.embed/require-model!` throws a message the example runner classifies as
-  an **absent optional dependency** — `mix beam_lisp.examples` reports these two
+  an **absent optional dependency** — the examples suite reports these two
   examples as SKIPPED, not as failures;
 * requiring `code.embed` loads nothing. The model handle is a `delay`, so the
   33 MB is read on the first call that needs it, never on `require`.
 
 | state | behaviour |
 |---|---|
-| no model fetched | `code.embed/info` names the fix: `mix beam_lisp.embed.fetch` |
+| no model fetched | `code.embed/info` names the fix: `mix bl.embed.fetch` |
 | no Rust toolchain (NIF unbuilt) | same — reported as absent, never as present-but-broken |
 | model cached | fully offline: nothing at query time touches the network |
 
@@ -82,9 +82,10 @@ gives, because both of them are silent and both look plausible.
 ```
 native/code_embed/          the Rust NIF: a static code embedding model, resident off the BEAM heap
 priv/lib/code/embed.bl      availability, the delayed model handle, text → DVec
-priv/lib/code/semantic.bl   indexing (one embedding per function), search, restricted search
+priv/lib/code/semantic.bl   indexing (one embedding per function, through the .blanalysis cache), search, restricted search
+priv/std/bl/search.bl       the `bl search` command: corpus → index → question → hits
 lib/beam_lisp/model.ex      where a downloaded model lives on this machine
-lib/mix/tasks/beam_lisp.embed.fetch.ex   the pinned fetch (sha256-verified)
+lib/mix/tasks/bl.embed.fetch.ex          the pinned fetch (sha256-verified)
 docs/code-semantic-search.md            why this model, why a NIF, and what was rejected
 ```
 

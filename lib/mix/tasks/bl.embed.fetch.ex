@@ -1,8 +1,8 @@
-defmodule Mix.Tasks.BeamLisp.Embed.Fetch do
+defmodule Mix.Tasks.Bl.Embed.Fetch do
   @moduledoc """
   Fetch the pinned static code-embedding model into the user cache.
 
-      mix beam_lisp.embed.fetch [--dir PATH] [--force]
+      mix bl.embed.fetch [--dir PATH] [--force]
 
   ## What is fetched, and why this model
 

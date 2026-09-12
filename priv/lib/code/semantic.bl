@@ -172,7 +172,7 @@
     (mapv (fn [e]
             {:name (:name e) :ns (:ns e) :line (:line e)
              :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
-          (fn-entities (:fn (codebase/index-source sigs ns-str src))))))
+          (fn-entities (:facts (cached-facts ns-str src))))))
 
 ;; ── indexing ────────────────────────────────────────────────────────
 
@@ -189,6 +189,83 @@
   [facts delta]
   (mapv (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) (to-list facts)))
 
+;; ── the analysis cache: the one way in ──────────────────────────────
+;;
+;; Every fact this namespace indexes comes through `codebase/analyze-cached`,
+;; the `.blanalysis` store. That is not an optimisation bolted on: the analysis
+;; is a PURE FUNCTION OF THE SOURCE BYTES and the store is keyed by
+;; sha256(source), so an unchanged file is a REOPEN, not a re-index. Measured
+;; per file over beam-lisp's own `priv/`: 180–2300 ms cold against 5–10 ms warm.
+;;
+;; It is also the difference between a command that can be used and one that
+;; cannot. The first `bl search -p priv` paid ~520 s of macroexpansion for 156
+;; files; through this door the same tree costs seconds.
+
+(defn- fact-attrs
+  "The attributes a codebase index is made of, read off the schema itself.
+
+   Derived rather than listed: a hand-written set of `:fn/*` and `:call/*`
+   keywords is a second definition of the schema, and the failure it produces
+   is silent — one attribute forgotten and that fact is simply absent from
+   every index, with nothing to notice it by."
+  []
+  (set (mapv (fn [m] (:db/ident m)) codebase/SCHEMA)))
+
+(defn- fact-rows
+  "The rows whose attribute is a codebase FACT attribute.
+
+   An explicit loop rather than `keep` + `into`, because the lazy version was
+   QUADRATIC here and the shape of that curve is what made it visible:
+   measured, 248 rows took 46 ms and 1932 rows took 3721 ms — 8x the rows for
+   80x the time. On a warm cache this filter was the single largest term in
+   the run, larger than the store open it followed."
+  [rows attrs]
+  (loop [rs (to-list rows) acc []]
+    (if (empty? rs)
+      acc
+      (let [r (first rs)]
+        (recur (rest rs)
+               (if (contains? attrs (get r 1)) (conj acc r) acc))))))
+
+(defn- entity-facts
+  "Rows → one map per ENTITY, the shape `codebase/index-source` emits.
+
+   The analyzer hands back a list of maps, each carrying every attribute of one
+   entity; a query hands back ROWS, one attribute each. `fn-entities` reads
+   `:fn/ns` and `:fn/name` off the SAME map — so rows that are not put back
+   together group into nothing, and the symptom is an index of zero functions
+   over a corpus that has plenty, with no error anywhere.
+
+   The order these maps come back in is irrelevant because `fn-entities` sorts
+   by line; what matters is that every entity is in the collection before it
+   looks."
+  [rows]
+  (loop [rs (to-list rows) grouped {}]
+    (if (empty? rs)
+      (into [] (vals grouped))
+      (let [r (first rs)
+            e (get r 0)
+            ; `:db/id` is set, not copied: a row carries the VALUE, not the id,
+            ; and a map without it raises "bad argument in arithmetic" later —
+            ; in the id band, where the cause is invisible.
+            attrs (assoc (or (get grouped e) {}) :db/id e)]
+        (recur (rest rs) (assoc grouped e (assoc attrs (get r 1) (get r 2))))))))
+
+(defn- cached-facts
+  "The codebase facts for `src`, through `.blanalysis` when it is warm.
+
+   Returns `{:hit bool :facts [{:db/id e :fn/name …} …]}` — entity maps carrying
+   the ids the cached store allocated. Ids are the CALLER's business: the cache
+   gives a source the ids a fresh index would (`shift-ids` then moves them into
+   the caller's band), which is what keeps a cached run and a fresh run
+   byte-identical."
+  [ns-str src]
+  (let [{:keys [db hit]} (codebase/analyze-cached sigs ns-str src)
+        attrs (fact-attrs)
+        rows (into [] (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] db))]
+    {:hit hit
+     :facts (entity-facts (fact-rows rows attrs))}))
+
 (defn index-source!
   "Index ONE file into `conn`: its codebase facts AND an embedding per
    function, in ONE transaction.
@@ -199,18 +276,21 @@
    gets, for free, because a vector IS a fact.
 
    `offset` shifts this file's entity ids clear of every other file's (see
-   `shift-ids`); `index!` derives it from the file's position in the set."
+   `shift-ids`); `index!` derives it from the file's position in the set.
+
+   The facts come from `cached-facts`, so re-indexing an unchanged file costs a
+   store reopen and an embed rather than an analysis."
   ([conn ns-str path] (index-source! conn ns-str path 0))
   ([conn ns-str path offset]
   (let [src (File/read! path)
-        raw (codebase/index-source sigs ns-str src)
-        facts {:fn (shift-ids (:fn raw) offset) :calls (shift-ids (:calls raw) offset)}
+        raw (cached-facts ns-str src)
+        facts (shift-ids (:facts raw) offset)
         lines (source-lines src)
         starts (form-starts src)
         ; already in source order, and a VECTOR: the loop below indexes it,
         ; and `get` by position on a seq is nil — which would transact no
         ; embedding at all while reporting the functions as indexed.
-        ents (fn-entities (:fn facts))
+        ents (fn-entities facts)
         docs (mapv (fn [e]
                      {:name (:name e) :ns (:ns e) :line (:line e)
                       :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
@@ -222,10 +302,13 @@
                      (concat acc (mapv (fn [id] {:db/id id :fn/embedding v}) (:ids e)))))
                  []
                  (range (count ents)))]
-    (datom/transact! conn (concat (:fn facts) (:calls facts) embeds))
+    (datom/transact! conn (concat facts embeds))
     {:file path :ns ns-str
      :functions (count ents)
-     :facts (+ (count (:fn facts)) (count (:calls facts)))
+     :facts (count facts)
+     ; whether the ANALYSIS was a reopen or a fresh index — the number that
+     ; says whether the cache earned anything on this run.
+     :analysis (if (:hit raw) :cached :indexed)
      ; the texts the model actually saw — carried out, not discarded, because
      ; "what was embedded?" is the first question worth asking of any
      ; retrieval result.
@@ -252,13 +335,27 @@
   "Index a whole codebase. `sources` is a seq of `[ns-string path]` pairs —
    the shape the MCP code surface already mounts.
 
+   THE entry point. Every caller — the `bl search` command, the examples, the
+   tests — comes through here, so the analysis cache, the id bands, and
+   survival of a file that cannot be analyzed are properties of ONE path
+   rather than of each caller's own loop.
+
    Each file is given its own id band, a million apart, so a set of sources
-   lands in one conn without collision."
+   lands in one conn without collision.
+
+   Returns one result per source, in the order given. A source the analyzer
+   cannot read yields `{:file path :skipped reason}` instead of aborting the
+   run: one unreadable file in a tree of a thousand must not cost the caller
+   every result, and it must not disappear either — a skipped source that is
+   not REPORTED is a smaller index that looks complete."
   [conn sources]
   (into []
         (map-indexed
           (fn [i pair]
-            (index-source! conn (get pair 0) (get pair 1) (offset-for i)))
+            (let [path (get pair 1)]
+              (try
+                (index-source! conn (get pair 0) path (offset-for i))
+                (catch e {:file path :skipped (ex-message e)}))))
           (to-list sources))))
 
 (defn ns-of-file
