@@ -17,26 +17,44 @@ defmodule BeamLisp.Z3Port do
   @timeout 10_000
 
   @doc """
-  Start z3 reading SMT-LIB from stdin.
+  The VM's z3 process, started on demand.
 
-  The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the
-  pinned binary fetched by `mix bl.z3.fetch` — never the PATH:
-  what proves your rules is the artifact the repo pinned, not whatever
-  a shell happens to resolve. Raises with the remedy when absent.
+  This returns the port owned by `BeamLisp.Z3.Solver` — the one process that
+  drives it. It is a HANDLE: every command must go through `check/3`, because a
+  port's replies are delivered to its owner's mailbox, not to whoever writes to
+  it. Opening your own port here (as this function used to) is what let two
+  callers share one stream and desync; it also meant every caller that did not
+  memoize leaked another z3 process.
   """
   def open do
-    exe = resolve_exe()
-
-    unless exe && File.exists?(exe) do
-      raise """
-      bundled z3 not found. Looked (in order) at:
-      #{candidate_paths() |> Enum.map(&("  - " <> &1)) |> Enum.join("\n")}
-      run: mix bl.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
-      """
-    end
-
-    Port.open({:spawn_executable, exe}, [:binary, :stream, :use_stdio, args: ["-in"]])
+    {:ok, pid} = BeamLisp.Z3.Solver.ensure_started()
+    GenServer.call(pid, :port)
   end
+
+  @doc """
+  Start a z3 process. Called ONLY by the owner (`BeamLisp.Z3.Solver`), which
+  keeps the port for its whole life and serializes every conversation on it.
+
+  The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the pinned
+  binary fetched by `mix bl.z3.fetch` — never the PATH: what proves your rules
+  is the artifact the repo pinned, not whatever a shell happens to resolve. The
+  error names the remedy when it is absent.
+  """
+  def open_port do
+    case resolve_exe() do
+      nil -> {:error, missing_solver_message()}
+      exe -> {:ok, Port.open({:spawn_executable, exe}, [:binary, :stream, :use_stdio, args: ["-in"]])}
+    end
+  end
+
+  defp missing_solver_message do
+    """
+    bundled z3 not found. Looked (in order) at:
+    #{candidate_paths() |> Enum.map(&("  - " <> &1)) |> Enum.join("\n")}
+    run: mix bl.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
+    """
+  end
+
   @doc """
   True while the solver process behind `port` is reachable.
 
@@ -79,8 +97,18 @@ defmodule BeamLisp.Z3Port do
   Reset, assert `smt`, check-sat. Returns `%{status:, model:}` where
   status is "sat" | "unsat" | "unknown" | "error"; model is the
   `(get-model)` text when `model?: true` and status is "sat".
+
+  SERIALIZED through the owner process (`BeamLisp.Z3.Solver`): one conversation
+  at a time. `port` is provenance, not control — the solver owns the port, so a
+  caller's stale handle cannot break the call.
   """
-  def check(port, smt, model? \\ false) do
+  def check(port, smt, model? \\ false), do: BeamLisp.Z3.Solver.check(port, smt, model?)
+
+  @doc """
+  The protocol itself. Runs in the OWNER process only (`BeamLisp.Z3.Solver`),
+  because the replies below arrive in the caller's mailbox.
+  """
+  def raw_check(port, smt, model? \\ false) do
     # A caller-supplied (check-sat) would make z3 answer TWICE and desync the
     # reader by one answer for every later query on this port — a silent,
     # alternating sat/unsat that looks like a solver bug. Strip it: this
