@@ -185,10 +185,32 @@ the command's cwd, so the file survives a move to another checkout.
   (when (File/exists? path)
     (try (first (BeamLisp.Compiler/read_all_data (File/read! path))) (catch _ nil))))
 
+(defn baseline-text
+  "The committed baseline as TEXT: one source per line.
+
+   The file is reviewed, so it is written for a diff rather than for a parser.
+   `pr-str` of the whole value would be a single line of tens of kilobytes —
+   every `bl check --update` would show as one rewritten line and no reviewer
+   could see WHICH file's facts moved. Each entry is printed as a complete form
+   on its own line, so whitespace between them is the only difference the reader
+   sees: it parses back to exactly the same value."
+  [report]
+  (let [b (baseline-of report)
+        files (:files b)
+        keys (sort (into [] (map first (into [] files))))
+        ; A KEY is a bare string on its line, and this runtime's `pr-str`
+        ; prints a top-level string WITHOUT its quotes — the reader would take
+        ; the path as a symbol and every lookup would miss. Every quoted string
+        ; here comes from the encoder that never forgets the quotes.
+        line (fn [k] (str "         " (Jason/encode! k) " " (pr-str (get files k))))]
+    (str "{:version " (:version b) "\n"
+         " :metrics " (pr-str (:metrics b)) "\n"
+         " :files {" (join "\n" (map line keys)) "}}\n")))
+
 (defn write-baseline!
   "Write `report` as the committed baseline at `path`."
   [path report]
-  (File/write! path (str (pr-str (baseline-of report)) "\n")))
+  (File/write! path (baseline-text report)))
 ```
 
 ## The regression rule

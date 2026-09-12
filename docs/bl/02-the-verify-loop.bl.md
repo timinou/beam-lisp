@@ -75,7 +75,7 @@ $ bl lsp check src/ledger.bl
         calls: fee
 ```
 
-Four badges, four theorems:
+Five badges, five theorems:
 
 - **`→ type`** — the return type or type set the analyzer inferred. `cents` and
   `total` return numbers; `charged?` returns `bool`.
@@ -84,11 +84,82 @@ Four badges, four theorems:
 - **`terminates` / `may-diverge`** — whether every call is proved to finish.
 - **`◆ native`** — pure **and** terminating, the two facts that make an offload
   to native code sound. `announce` is not eligible, because it is not pure.
+- **`O(…)`** — the growth class of the function's OWN recursion, read off the
+  same analysis the termination proof uses. It is printed only for a function
+  that calls itself.
+
+## Growth: what a function costs as its input grows
+
+A termination proof answers "does it stop"; the growth badge answers "at what
+cost", which is the difference between a loop that finishes and a call that
+finishes after lunch. Three shapes are named, and nothing else is claimed:
+
+```sh
+$ bl lsp check src/bigo.bl
+── bigo.demo ──
+  diagnostics: none
+  symbols (3):
+    fib
+        → …  effects  terminates  ·  O(2^n)
+        calls: fib
+    nested
+        → …  effects  terminates  ·  >= O(n^2)
+        calls: nested
+    walk
+        → …  effects  terminates  ·  O(n)
+        calls: walk
+```
+
+- **`O(n)`** — one self-call, or a loop whose ranking variable moves toward its
+  floor. `walk` is here even though it makes TWO recursive calls, because it
+  recurs over the two halves of its argument: those subproblems are disjoint,
+  so the total work is linear in the tree.
+- **`>= O(n^2)`** — nested recursion: a self-call inside the argument of another
+  self-call. The inner call redoes work the outer one already paid for.
+- **`O(2^n)`** — ≥2 self-calls whose arguments are arithmetic images of the SAME
+  parameter (`(- n 1)` and `(- n 2)`, the naive `fib`). The subproblems overlap,
+  so without memoisation the work doubles per level.
+
+Two limits are worth stating out loud. The class bounds the function's own
+recursion shape — not the cost of the library functions it calls, so a `O(n)`
+that calls a quadratic helper still reads `O(n)`. And a non-recursive function
+carries no badge at all: there is nothing to bound.
 
 The `calls:` line is the resolved call graph — `bill` calls `total`, which calls
 `fee`.
 
 Exit `0` when the file has no diagnostics, `1` when it has some.
+
+## Plan a datalog query before it runs
+
+`bl lint` reads datalog literals in source and flags the one shape whose cost is
+invisible until the data grows: a nested `:not` / `:not-join` / `:or` / `:or-join`
+sub-query re-runs for every row the outer query produces. If a clause inside it
+reads an attribute column without an index, the whole column is read again per
+row.
+
+`datom/explain` answers the same question at runtime, against the live schema,
+with the exact index the planner picked:
+
+```sh
+$ bl eval "(datom/explain-str '[:find ?n :where [?d :fn/name ?n] [:not-join [?n] [?d2 :fn/name ?n]]] nil)"
+plan:
+  [?d :fn/name ?n]   index=[:aevt [:fn/name]]  cost=4  bound=#{}
+  [:not-join [?n] [?d2 :fn/name ?n]]   index=[:eavt [:not-join [?n]]]  cost=0  bound=#{?d ?n}
+smells:
+  [?d2 :fn/name ?n]  →  [:aevt [:fn/name]]
+      The planner reads the whole :fn/name column and re-runs this clause for
+      every outer row. Two remedies: (1) make the attribute AVET-indexed —
+      `:db/index true` (or `:db/unique`) — so the pattern prefix-scans;
+      (2) build the sub-query's answer ONCE outside the outer loop (a set, a
+      `memo`, or an `index!` step) and join against it. When no schema is at
+      hand, `datom/explain` against the live connection shows the exact plan.
+verdict: 1 per-row rescan
+```
+
+Pass the live db (`(datom/db conn)`) instead of `nil` and the plan is exact: an
+attribute that IS indexed resolves to `[:avet …]` and the smell disappears.
+`docs/datom-query-plans.md` has the whole story.
 
 ## Ask the call graph
 

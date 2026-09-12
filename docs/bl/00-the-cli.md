@@ -23,8 +23,15 @@ Every command answers with an exit code:
 | `0` | ok |
 | `1` | a runtime failure — a diagnostic, a regression, a failing test, a stale doc |
 | `2` | a usage error — an unknown flag, a missing argument |
+| `141` | the reader on the other end of stdout went away (`bl examples | head`) |
 
 Run `bl help` for the verb list, or `bl help COMMAND` for one line about a verb.
+
+Diagnostics are written to **stderr**; stdout carries only a command's data. That
+is what makes `--json` pipeable — one JSON object, nothing else. It is also why
+`bl help | head` ends as a plain `141` instead of an `error:` report about the
+pipe the caller closed: a command that loses its reader stops, and stops
+without pretending something went wrong.
 
 ## The warm daemon
 
@@ -118,6 +125,11 @@ Exit `0` when nothing failed, `1` when a test failed or errored.
 
 `--json` keys: `tests`, `pass`, `fail`, `error`, `files`.
 
+A test file that requires a namespace outside the library tiers needs that root
+on the search path — `bl test test/bl/datom/shape_test.bl -p examples`, because
+`semantic.shape` is an example. The file's own `Run:` line names the flags it
+needs.
+
 #### `bl examples [GLOB...] [--json]`
 
 Run the example programs, each in its own ward fork: isolated from its
@@ -203,10 +215,28 @@ src/demo.bl:4  if→if-not [safe]
 4 smells in 2 files
 ```
 
+A smell carries either a fix or a **note**. Advisory rules describe a shape
+whose correction is a restructure rather than a local rewrite, so they print
+what to change and offer no `after` text:
+
+```sh
+$ bl lint src/ledger.bl
+src/ledger.bl:12  datalog/nested-scan [idiomatic]
+  note: A nested :not/:not-join/:or/:or-join sub-query re-runs per outer row, so
+        a clause that binds a VALUE over an unindexed attribute re-reads that
+        whole column once per row. Fix: index the attribute (:db/index true, or
+        :db/unique) so AVET exists, or build the sub-query's answer ONCE
+        outside the loop (a set / memo / index! step). A :db.type/ref
+        attribute, and any indexed or unique one, already prefix-scans — when
+        the schema is not in this file, confirm with `datom/explain` against
+        the live conn.
+1 smell in 1 file
+```
+
 Exit `0` when clean, `1` when any smell is reported, `2` on a usage error.
 
 `--json` keys: `files` (per file: `path`, `smells` — each `name`, `tier`,
-`line`, `before`, `after`), `total`.
+`line`, `before`, `after`, `note`), `total`.
 
 #### `bl fix [PATH...] [--tier safe|idiomatic|every]`
 
