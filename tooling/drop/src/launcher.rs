@@ -262,7 +262,22 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
 /// (or lost after send — unknown outcome, exit 1), or `None` to fall back to a
 /// cold `bin/bl` boot. With `BL_DAEMON=auto`, a missing daemon is auto-started
 /// from `bin/bl daemon start` (detached) and retried once.
-#[cfg(unix)]
+
+/// `bl` is THIS executable — the launcher. The release's own `bin/bl` is a
+/// different program with a different command surface (`start`, `daemon`,
+/// `eval`, `rpc`), and its path changes with every rebuild. So anything that
+/// has to re-invoke `bl` from inside a running one — a gateway detaching
+/// itself, a systemd unit's ExecStart — is handed this path as `BL_BIN`,
+/// instead of looking up `bl` on a PATH where, inside a drop, the first match
+/// can be the release script itself.
+///
+/// The failure it prevents, seen for real: `bl gateway start` in an installed
+/// drop detached `setsid <payload>/bin/bl gateway run`, and the release script
+/// answered `Usage: bl COMMAND … ERROR: Unknown command gateway`.
+fn self_bl() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bl"))
+}
+
 fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
     let root = resolve_root(&cwd)?;
@@ -275,10 +290,17 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
         }
         Attach::RestartRequired => {
             // the daemon is stale (checkout changed). Stop it, restart, retry once.
+            // Say so: a daemon that vanishes without a word looks like a command
+            // that failed for no reason, and the next command pays a cold boot.
+            eprintln!(
+                "bl: the daemon for this tree was started from a different build; \
+                 stopping it and running this command cold"
+            );
             let _ = std::process::Command::new(bin)
                 .arg("eval")
                 .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"stop\"])")
                 .env("BL_DAEMON_ROOT", &root)
+                .env("BL_BIN", self_bl())
                 .status();
             if autostart_enabled() {
                 start_daemon_detached(bin, &root);
@@ -321,6 +343,7 @@ fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
         .arg("eval")
         .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"start\"])")
         .env("BL_DAEMON_ROOT", root)
+        .env("BL_BIN", self_bl())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -392,7 +415,13 @@ fn main() {
         let verb = verb_of(&argv);
         let is_lifecycle = verb.as_deref() == Some("daemon");
         let owns_process = verb.is_none()
-            || matches!(verb.as_deref(), Some("repl" | "monitor" | "serve" | "mcp"))
+            || matches!(
+                verb.as_deref(),
+                // `gateway` is the per-user listener every tree's names route
+                // through: it blocks for the machine's lifetime, so it must
+                // never be parked on a tree daemon's single worker.
+                Some("repl" | "monitor" | "serve" | "mcp" | "gateway")
+            )
             || (verb.as_deref() == Some("lsp") && argv.iter().any(|a| a == "serve"));
 
         // `bl daemon start` is a REQUEST for a daemon, not a command to run
@@ -430,6 +459,7 @@ fn main() {
     }
 
     let mut cmd = Command::new(&bin);
+    cmd.env("BL_BIN", self_bl());
     // Trailing args after `eval EXPR` land in System.argv() verbatim
     // (verified: bin/bl eval passes "$@" through as erl -extra). A `--`
     // would leak into argv, so it is NOT added here.

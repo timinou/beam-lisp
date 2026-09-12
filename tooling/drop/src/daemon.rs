@@ -425,6 +425,13 @@ pub fn try_attach(_root: &Path, _argv: &[String]) -> Attach {
 
 #[cfg(unix)]
 fn stream_until_exit(stream: &mut UnixStream) -> Attach {
+    // A served command that fails must SAY so. The daemon's own failure frames
+    // are not the only way to reach a non-zero exit — a worker can die, a boot
+    // can fail before the output proxy exists — and an exit with nothing on
+    // either stream is indistinguishable from a hang that returned. This guard
+    // is the difference between a diagnosis and a mystery: it fires only when
+    // the daemon exited non-zero having written nothing at all.
+    let mut wrote_anything = false;
     loop {
         let frame = match recv_frame(stream) {
             Some(f) => f,
@@ -443,12 +450,14 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                     if let Some(b) = t.get(5).and_then(|x| x.as_bytes()) {
                         let _ = std::io::stdout().write_all(b);
                         let _ = std::io::stdout().flush();
+                        wrote_anything = wrote_anything || !b.is_empty();
                     }
                 }
                 "stderr" => {
                     if let Some(b) = t.get(5).and_then(|x| x.as_bytes()) {
                         let _ = std::io::stderr().write_all(b);
                         let _ = std::io::stderr().flush();
+                        wrote_anything = wrote_anything || !b.is_empty();
                     }
                 }
                 // {:bl, 1, :stdin, id, seq, prompt} — seq is index 4
@@ -467,11 +476,25 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                 // {:bl, 1, :exit, id, code} — code is index 4
                 "exit" => {
                     let code = t.get(4).and_then(|x| x.as_int()).unwrap_or(0);
+                    if code != 0 && !wrote_anything {
+                        eprintln!(
+                            "bl: the daemon ended this command with exit {code} and no output; \
+                             run it cold (BL_DAEMON=off bl …) to see why"
+                        );
+                    }
                     return Attach::Exit(code as i32);
                 }
-                // {:bl, 1, :failed, id, code, msg} — code is index 4
+                // {:bl, 1, :failed, id, code, msg} — code is index 4, msg is 5
                 "failed" => {
                     let code = t.get(4).and_then(|x| x.as_int()).unwrap_or(1);
+                    if let Some(b) = t.get(5).and_then(|x| x.as_bytes()) {
+                        let _ = std::io::stderr().write_all(b);
+                        let _ = std::io::stderr().flush();
+                        wrote_anything = wrote_anything || !b.is_empty();
+                    }
+                    if !wrote_anything {
+                        eprintln!("bl: the daemon refused this command (exit {code})");
+                    }
                     return Attach::Exit(code as i32);
                 }
                 "heartbeat" | "accepted" | "watch" => {}
