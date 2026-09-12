@@ -1266,8 +1266,11 @@ defmodule BeamLisp.RT do
   # Any other result (e.g. a value whose comparator did not reduce to a number
   # or boolean) falls back to Erlang term ordering against 0 — the exact
   # behavior of the previous `invoke(comp, …) <= 0` implementation, so no
-  # existing sort regresses.
-  defp comparator_le(result), do: result <= 0
+  # existing sort regresses. Written as a literal `false` rather than
+  # `result <= 0`: every non-number term (atom, tuple, pid, list, map, binary)
+  # is GREATER than every number in Erlang's term order, so that comparison is
+  # false for any such result — and the compiler says so on every build.
+  defp comparator_le(_result), do: false
 
   # --- cpp/* interop ------------------------------------------------
   # jank writes `(cpp/jank.runtime.name x)` for its C++ primitives.

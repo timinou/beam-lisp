@@ -11,13 +11,14 @@ include!("daemon.rs");
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
-/// The command word in `argv`, skipping global flags and their values.
+/// The index of the first non-flag token in `argv` — the VERB — skipping the
+/// values that belong to a flag (`VALUED`). `None` when argv names no verb.
 ///
 /// Global flags may precede the command (`bl -p lib run x.bl`), so the verb is
 /// not simply `argv[0]` — deciding the daemon fast-path on the first token would
 /// send `bl -p lib repl` to the daemon, where it would hold the single worker
 /// forever. `--` is skipped too: everything after it is the program's argv.
-fn verb_of(argv: &[String]) -> Option<String> {
+fn verb_index(argv: &[String]) -> Option<usize> {
     const VALUED: [&str; 8] = [
         "-p",
         "--path",
@@ -48,15 +49,28 @@ fn verb_of(argv: &[String]) -> Option<String> {
             i += 1;
             continue;
         }
-        return Some(a.to_string());
+        return Some(i);
     }
     None
+}
+
+fn verb_of(argv: &[String]) -> Option<String> {
+    verb_index(argv).map(|i| argv[i].clone())
+}
+
+/// Is this invocation the REQUEST to start the daemon — `bl daemon start`?
+/// Only the explicit subcommand counts: a bare `bl daemon` is `status`.
+fn daemon_start_requested(argv: &[String]) -> bool {
+    match verb_index(argv) {
+        Some(i) => argv[i] == "daemon" && argv.get(i + 1).map(String::as_str) == Some("start"),
+        None => false,
+    }
 }
 
 // ── tests: the daemon fast-path's verb detection ────────────────────────────
 #[cfg(test)]
 mod verb_tests {
-    use super::verb_of;
+    use super::{daemon_start_requested, verb_of};
 
     fn v(args: &[&str]) -> Option<String> {
         verb_of(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -78,6 +92,28 @@ mod verb_tests {
         assert_eq!(v(&["--json"]), None);
         assert_eq!(v(&["-p"]), None);
         assert_eq!(v(&["--"]), None);
+    }
+
+    /// `bl daemon start` is the one invocation the launcher answers ITSELF:
+    /// it detaches the VM and returns. Every other daemon word (`status`,
+    /// `stop`, and the bare verb, which means `status`) must still reach the
+    /// release — and a `daemon` that merely appears as an ARGUMENT of another
+    /// verb is not a daemon invocation at all.
+    #[test]
+    fn only_an_explicit_daemon_start_is_the_launchers_own_work() {
+        let ds = |args: &[&str]| {
+            daemon_start_requested(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+
+        assert!(ds(&["daemon", "start"]));
+        assert!(ds(&["-p", "lib", "daemon", "start"]));
+        assert!(ds(&["--json", "daemon", "start"]));
+
+        assert!(!ds(&["daemon"]), "a bare `bl daemon` is `status`");
+        assert!(!ds(&["daemon", "status"]));
+        assert!(!ds(&["daemon", "stop"]));
+        assert!(!ds(&["run", "daemon", "start"]), "an argument, not the verb");
+        assert!(!ds(&[]));
     }
 }
 
@@ -291,18 +327,27 @@ fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
         .spawn();
 }
 
+/// Is a daemon reachable for this tree RIGHT NOW? A live socket plus a hello
+/// that completes — `version` through the protocol, the cheapest round trip.
+/// The socket file alone is not enough: after a crash it outlives its server.
+#[cfg(unix)]
+fn daemon_ready(root: &std::path::Path) -> bool {
+    match endpoints(root) {
+        Some(ep) => {
+            ep.sock.exists()
+                && matches!(try_attach(root, &["version".to_string()]), Attach::Exit(_))
+        }
+        None => false,
+    }
+}
+
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
 #[cfg(unix)]
 fn wait_ready(root: &std::path::Path) -> bool {
     for _ in 0..600 {
         // 600 * 200ms = 120s
-        if let Some(ep) = endpoints(root) {
-            if ep.sock.exists() {
-                // a quick attach probe: connect + hello only
-                if matches!(try_attach(root, &["version".to_string()]), Attach::Exit(_)) {
-                    return true;
-                }
-            }
+        if daemon_ready(root) {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -349,6 +394,34 @@ fn main() {
         let owns_process = verb.is_none()
             || matches!(verb.as_deref(), Some("repl" | "monitor" | "serve" | "mcp"))
             || (verb.as_deref() == Some("lsp") && argv.iter().any(|a| a == "serve"));
+
+        // `bl daemon start` is a REQUEST for a daemon, not a command to run
+        // inside one. Exec'd, the release parks in the foreground and dies with
+        // the shell that asked for it — while the verb's own docstring (and
+        // docs/bl/03) says the launcher runs it detached, which is what makes
+        // `bl daemon start && bl run …` mean anything. So detach here and
+        // return: the daemon outlives this process, and the caller learns
+        // whether it actually came up. `BL_DAEMON=off` keeps the old
+        // foreground behavior: ask for no daemon and you get none.
+        if !off && daemon_start_requested(&argv) {
+            let cwd = std::env::current_dir().ok();
+            if let Some(root) = cwd.as_deref().and_then(resolve_root) {
+                if daemon_ready(&root) {
+                    println!("bl: daemon already running for this tree");
+                    std::process::exit(0);
+                }
+
+                start_daemon_detached(&bin, &root);
+
+                if wait_ready(&root) {
+                    println!("bl: daemon started — commands for this tree are now warm");
+                    std::process::exit(0);
+                }
+                eprintln!("bl: daemon did not become ready (see `bl daemon status`)");
+                std::process::exit(1);
+            }
+        }
+
         if !off && !is_lifecycle && !owns_process {
             if let Some(code) = maybe_attach_daemon(&argv, &bin) {
                 std::process::exit(code);
