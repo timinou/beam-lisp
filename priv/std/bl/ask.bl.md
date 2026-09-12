@@ -77,7 +77,7 @@ it validates with `db-question?` and keeps its own MRTR envelope around them.
    {:name "symbols"
     :needs-target? false
     :scope :source
-    :doc "every definition with its proven summary: returns, purity, termination"}])
+    :doc "every definition with its proven summary: returns, purity, termination, growth"}])
 
 (defn questions
   "Every question this namespace answers, as descriptors."
@@ -309,7 +309,10 @@ entry point, so every definition counts as a root and nothing is reported dead â
 a false negative is the honest side to err on for a claim of "dead".
 
 `symbols` reads `lsp/document-symbols`: every definition with the summary the
-analyzer proved about it.
+analyzer proved about it. Each row is `file name returns purity termination
+growth`: the first five cells are the proven summary, and `growth` is the
+recursion's growth label (`O(n)` / `>= O(n^2)` / `O(2^n)`), empty when the
+definition is not self-recursive.
 
 ```beam-lisp
 (defn- node-refs
@@ -368,7 +371,8 @@ analyzer proved about it.
 
       (= question "symbols")
         (u/to-list (map (fn [s] (u/to-list [path (:name s) (returns-str s)
-                                            (:pure s) (:terminates s)]))
+                                            (:pure s) (:terminates s)
+                                            (:growth-label s)]))
                         (u/to-list (lsp/document-symbols src))))
 
       :else :unknown-question)))
