@@ -140,36 +140,37 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
   (u/to-list (map (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) facts)))
 
 (defn- facts-cache-path
-  "Where the indexed facts of a source with content hash `sha` live."
-  [sha]
-  (str (codebase/blanalysis-dir) "/facts." sha ".term"))
+  "Where the indexed facts of a source with content hash `sha` live — under the
+   project of the SOURCES being asked about, not the shell's."
+  [sha root]
+  (str (codebase/blanalysis-dir root) "/facts." sha ".term"))
 
 (defn- cached-facts
   "The cached facts for `sha`, or nil."
-  [sha]
-  (let [p (facts-cache-path sha)]
+  [sha root]
+  (let [p (facts-cache-path sha root)]
     (when (File/exists? p)
       (try (erlang/binary_to_term (File/read! p)) (catch _ nil)))))
 
 (defn- remember-facts!
   "Store `facts` for `sha`; a failure to write is silently a cache miss next time."
-  [sha facts]
+  [sha facts root]
   (try
-    (File/mkdir_p (codebase/blanalysis-dir))
-    (File/write! (facts-cache-path sha) (erlang/term_to_binary facts))
+    (File/mkdir_p (codebase/blanalysis-dir root))
+    (File/write! (facts-cache-path sha root) (erlang/term_to_binary facts))
     (catch _ nil)))
 
 (defn source-facts
   "`{:ns :fn :calls}` for one source text: the file's namespace and its
    definition and call facts, from the cache when this exact text has been
    indexed before."
-  [sigs src]
+  [sigs src root]
   (let [sha (sha256-hex src)]
-    (or (cached-facts sha)
+    (or (cached-facts sha root)
         (let [ns-str (u/ns-of src)
               facts (codebase/index-source sigs ns-str src)
               entry {:ns ns-str :fn (u/to-list (:fn facts)) :calls (u/to-list (:calls facts))}]
-          (remember-facts! sha entry)
+          (remember-facts! sha entry root)
           entry))))
 
 (def tx-batch
@@ -182,18 +183,19 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
    indexer reads return annotations against). Facts from all paths share the
    one connection, written `tx-batch` at a time; each file's ids are offset so
    files never collide. Returns the namespaces indexed, in path order."
-  [conn sigs paths]
+  ([conn sigs paths] (index! conn sigs paths (first (u/to-list paths))))
+  ([conn sigs paths root]
   (let [entries (loop [ps (u/to-list paths) i 0 nss [] facts []]
                   (if (empty? ps)
                     {:nss nss :facts facts}
-                    (let [e (source-facts sigs (File/read! (first ps)))
+                    (let [e (source-facts sigs (File/read! (first ps)) root)
                           delta (* i 1000000)]
                       (recur (rest ps) (+ i 1) (conj nss (:ns e))
                              (into facts (concat (offset-facts (:fn e) delta)
                                                  (offset-facts (:calls e) delta)))))))]
     (u/each (fn [batch] (datom/transact! conn (u/to-list batch)))
             (Enum/chunk_every (u/to-list (:facts entries)) tx-batch))
-    (:nss entries)))
+    (:nss entries))))
 ```
 
 Writing facts into a store is the slow half of a question — tens of seconds
@@ -211,8 +213,8 @@ set lives in memory for this run only — the same answers, just not remembered.
   (sha256-hex
     (join "\n" (map (fn [p] (sha256-hex (File/read! p))) (u/to-list paths)))))
 
-(defn- set-store-path [hash]
-  (str (codebase/blanalysis-dir) "/askset." hash ".fjall"))
+(defn- set-store-path [hash root]
+  (str (codebase/blanalysis-dir root) "/askset." hash ".fjall"))
 
 (defn connect-set!
   "A connection holding the facts of every source in `paths`: reopened from the
@@ -220,16 +222,21 @@ set lives in memory for this run only — the same answers, just not remembered.
    indexed and stored. Returns `{:conn :nss}`."
   [sigs paths]
   (let [paths (u/to-list paths)
+        ; The SOURCES decide where the store lives: a question about a checkout
+        ; elsewhere keeps its store there, the way `bl search` does. Resolving it
+        ; from the shell is how the cwd's project accumulated another tree's
+        ; asksets.
+        root (first paths)
         nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))]
     (if (not (datom.store-fjall/available?))
       (let [conn (codebase/connect-codebase)]
         {:conn conn :nss (index! conn sigs paths)})
-      (let [path (set-store-path (set-hash paths))]
+      (let [path (set-store-path (set-hash paths) root)]
         (if (File/exists? path)
           {:conn (datom.conn/connect-with (datom.store-fjall/open path))
            :nss (nss-of)}
           (do
-            (File/mkdir_p (codebase/blanalysis-dir))
+            (File/mkdir_p (codebase/blanalysis-dir root))
             (let [store (datom.store-fjall/open path)
                   conn (datom.conn/connect-with store codebase/SCHEMA)
                   nss (index! conn sigs paths)]

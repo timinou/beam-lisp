@@ -202,11 +202,14 @@ Three properties belong to the door rather than to any caller:
 
 * **Cached analysis.** Facts come from the project's store, because an analysis
   is a pure function of the source bytes: nothing re-analyzes an unchanged file.
-  `codebase/blanalysis-dir` resolves in three tiers — `$BLANALYSIS_DIR` (tests,
-  builds, CI), else `<project>/.local/bl/cache`, else
+  `codebase/blanalysis-dir` resolves in four tiers — `$BL_CACHE_DIR` (set it and
+  nothing else is consulted: the store goes where you point, which is the CI
+  lever, and it moves ONLY the store — the model lives under the cache root, so
+  `XDG_CACHE_HOME` is not a substitute for it), else `$BLANALYSIS_DIR` (the
+  per-call spelling tests use), else `<project>/.local/bl/cache`, else
   `$XDG_CACHE_HOME/beam_lisp/cache/<tree id>` for a project that cannot be
   written to: an installed drop, a mounted checkout, a CI read-only bind. The
-  third tier is keyed by the same 16-hex tree id a `bl` daemon uses, so
+  fourth tier is keyed by the same 16-hex tree id a `bl` daemon uses, so
   re-extracting a payload finds its analysis again instead of paying for it
   twice. The project is the nearest ancestor of the corpus that looks like one
   (a `.git`/`.hg` root, `mix.exs`, `priv/boot/core.bl`, an extracted drop's

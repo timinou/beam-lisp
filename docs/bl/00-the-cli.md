@@ -519,8 +519,11 @@ which is what makes a stale one unreachable — and also what makes them pile up
 is over the cap; `prune` deletes the OLDEST first, never the newest (the one the
 run that just finished wrote), until it is under. `--dry-run` reports and deletes
 nothing, `--max-mb` overrides the cap for one run, and `BL_CACHE_MAX_MB`
-(default 512) for every run. `bl search` prunes after it indexes, so the ceiling
-holds without anyone remembering it.
+(default 512) for every run. `BL_CACHE_DIR` moves the store itself — every tier
+below it is skipped — which is what a CI job or a container wants: the analysis
+goes on a volume, or into a directory the job deletes, and the model stays where
+it is. Relative values resolve against the command's cwd. `bl search` prunes
+after it indexes, so the ceiling holds without anyone remembering it.
 
 ```sh
 $ bl cache status
