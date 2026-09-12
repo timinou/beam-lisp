@@ -16,6 +16,11 @@ defmodule BeamLisp.Z3Port do
 
   @timeout 10_000
 
+  # z3 answers `(echo "…")` with the string alone (verified against the pinned
+  # binary), which makes it a reliable sync marker: a command is acknowledged on
+  # its own terms, instead of hoping the next check-sat surfaces its error.
+  @marker "~~bl-ok~~"
+
   @doc """
   The VM's z3 process, started on demand.
 
@@ -120,13 +125,96 @@ defmodule BeamLisp.Z3Port do
       {"sat", rest} ->
         if model? do
           Port.command(port, "(get-model)\n")
-          %{status: "sat", model: read_model(port, rest)}
+          %{status: "sat", model: read_sexp(port, rest)}
         else
           %{status: "sat", model: nil}
         end
 
       {line, _} ->
         %{status: line, model: nil}
+    end
+  end
+
+  # ── a conversation (push/pop, assumptions, unsat cores) ──────────────────
+
+  @doc """
+  Send SMT-LIB and wait for z3 to ACKNOWLEDGE it. Anything z3 prints before the
+  marker is returned as `:output`; an `(error …)` line comes back as
+  `%{ok: false}` rather than desynchronizing the reader.
+  """
+  def raw_command(port, smt) do
+    Port.command(port, smt <> "\n(echo \"" <> @marker <> "\")\n")
+
+    case read_until_marker(port, "", "") do
+      {:marker, out} -> %{ok: true, output: out}
+      {:error, line, out} -> %{ok: false, error: line, output: out}
+    end
+  end
+
+  @doc """
+  check-sat in the CURRENT solver state — no reset, so assertions accumulate and
+  `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
+  `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
+  named and the script must set `:produce-unsat-cores`), `:model?` (return the
+  model on sat).
+  """
+  def raw_check_here(port, opts) do
+    assume = Map.get(opts, :assume) || []
+
+    check =
+      if assume == [] do
+        "(check-sat)\n"
+      else
+        "(check-sat-assuming (" <> Enum.join(assume, " ") <> "))\n"
+      end
+
+    Port.command(port, check)
+
+    case read_answer(port, "") do
+      {"unsat", rest} ->
+        if Map.get(opts, :core?) do
+          Port.command(port, "(get-unsat-core)\n")
+          %{status: "unsat", core: read_sexp(port, rest)}
+        else
+          %{status: "unsat", core: nil}
+        end
+
+      {"sat", rest} ->
+        if Map.get(opts, :model?) do
+          Port.command(port, "(get-model)\n")
+          %{status: "sat", core: nil, model: read_sexp(port, rest)}
+        else
+          %{status: "sat", core: nil}
+        end
+
+      {line, _} ->
+        %{status: line, core: nil}
+    end
+  end
+
+  defp read_until_marker(port, acc, out) do
+    lines = String.split(acc, "\n")
+
+    cond do
+      Enum.member?(lines, @marker) ->
+        {:marker, out}
+
+      Enum.any?(lines, &String.starts_with?(&1, "(error")) ->
+        {:error, Enum.find(lines, &String.starts_with?(&1, "(error")), out}
+
+      true ->
+        receive do
+          {^port, {:data, data}} ->
+            keep =
+              (acc <> data)
+              |> String.split("\n")
+              |> Enum.reject(&(&1 == "" or &1 == @marker))
+              |> Enum.join("\n")
+
+            read_until_marker(port, acc <> data, keep)
+        after
+          @timeout -> {:error, "timeout waiting for z3 to acknowledge", out}
+        end
     end
   end
 
@@ -149,12 +237,12 @@ defmodule BeamLisp.Z3Port do
     end
   end
 
-  defp read_model(port, acc) do
+  defp read_sexp(port, acc) do
     if String.length(acc) > 3 and balanced?(acc) do
       acc
     else
       receive do
-        {^port, {:data, data}} -> read_model(port, acc <> data)
+        {^port, {:data, data}} -> read_sexp(port, acc <> data)
       after
         @timeout -> acc
       end
