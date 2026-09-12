@@ -42,6 +42,14 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
   @model "minishlab/potion-code-16M-v2"
   @base "https://huggingface.co/#{@model}/resolve/main"
 
+  # The DIRECTORY is the bare model name, because that is what the code that
+  # reads the weights computes for itself (`code.embed/MODEL` →
+  # `BeamLisp.Model.dir`). The org prefix belongs to the URL and stops there:
+  # resolving it into the path put the files under
+  # `models/minishlab/potion-code-16M-v2`, which nothing ever looks in — the
+  # fetch reported success while semantic search still saw no model on disk.
+  @dir_name "potion-code-16M-v2"
+
   # name => sha256 (pinned; computed from the upstream artifacts at the
   # revision whose weights these are). Sizes are shown in the log so a partial
   # download is visible as one.
@@ -55,7 +63,7 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
   @impl true
   def run(argv) do
     {opts, _args} = OptionParser.parse!(argv, strict: [dir: :string, force: :boolean])
-    dest = opts[:dir] || BeamLisp.Model.dir(@model)
+    dest = opts[:dir] || BeamLisp.Model.dir(@dir_name)
     File.mkdir_p!(dest)
 
     Mix.shell().info("fetching #{@model} into #{dest}")
@@ -94,6 +102,13 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
         Mix.shell().info([:green, "  ok    ", :reset, name, " (#{byte_size(body)} bytes)"])
       end
     end
+
+    # The weights' digest, on disk, for the code that has to decide whether a
+    # cached vector is still current: `code.embed/model-id` reads this, and a
+    # `.blanalysis` store remembers the marker it produces. Verifying 32 MB of
+    # weights on every query would be absurd; verifying them ONCE, here, is what
+    # pinning them buys.
+    File.write!(Path.join(dest, "DIGEST"), @files["model.safetensors"])
 
     Mix.shell().info("static code model ready: #{dest}")
     Mix.shell().info("try it:  bl run examples/code-semantic/01-search-by-meaning.bl")

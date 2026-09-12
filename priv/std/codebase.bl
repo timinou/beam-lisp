@@ -364,6 +364,81 @@
   [dir]
   (= :ok (File/mkdir_p dir)))
 
+; --- derived columns ---------------------------------------------------------
+;
+; A source's ANALYSIS is cached above. Callers derive MORE from the same source
+; — `code.semantic` adds a vector per function — and that derivation is the
+; expensive half of a warm run: the reader pass and the model call are re-paid
+; every time, while the facts come back from the store in milliseconds.
+;
+; A COLUMN is such a derivation, declared by the caller and remembered by the
+; store:
+;
+;   {:ident   :fn/embedding          the attribute the column fills
+;    :schema  [{:db/ident …}]        the attribute definitions it needs
+;    :version "potion-…@1a2b3c4d"    what the store holds when it is fresh
+;    :fill    (fn [db src] [datom …])}
+;
+; VERSION is the invalidation key and it belongs to the caller: for the
+; embedding column it is the model's identity, so a new model refills the column
+; without touching a single fact. A store written before the column existed and
+; a column whose version moved are the SAME case — fill it, on the same store,
+; keeping the facts — which is why an old artifact evolves instead of missing.
+;
+; The marker is ONE datom on entity 0, an id nothing else uses: codebase numbers
+; facts from 1000 and 100000, and datom's own attribute entities start at 1.
+
+(def FILLED-WITH
+  "The attribute the marker datom carries: which column the store holds and at
+   which version — `\"fn/embedding=potion-code-16M-v2@1a2b3c4d\"`.
+
+   A string, because a datom's value must be one of the schema's value types.
+   With a second column this becomes one marker attribute per column, which is
+   a change here and nowhere else."
+  {:db/ident :code/filled-with :db/valueType :db.type/string})
+
+(def MARKER-ID
+  "The entity the marker datom lives on — below every id in use."
+  0)
+
+(defn- filled-with
+  "The marker string this store carries, or nil when it carries none."
+  [db]
+  (let [rows (into [] (datom/q '[:find ?v :where [?e :code/filled-with ?v]] db))]
+    (if (empty? rows) nil (get (first rows) 0))))
+
+(defn- column-marker
+  "What the store says once `col` is fresh."
+  [col]
+  (str (name (:ident col)) "=" (:version col)))
+
+(defn- fill-columns!
+  "Bring every column in `columns` up to its `:version`, on `conn`. Returns
+   `{ident :cached|:filled}`.
+
+   A column whose marker already matches costs one query and NOTHING else: the
+   source is not read again and the model is not called again. That is the whole
+   point of a column, and it is why the caller gets this map back — a run that
+   re-derived everything and a run that re-derived nothing must not look alike.
+
+   The fill is handed the db and the source, and answers with datoms. It runs
+   ONLY when the marker moved, so a fill that is expensive (a model, say) is
+   paid once per source per version rather than once per run."
+  [conn src columns]
+  (loop [cs (to-list columns) filled {}]
+    (if (empty? cs)
+      filled
+      (let [col (first cs)
+            marker (column-marker col)]
+        (if (= marker (filled-with (datom/db conn)))
+          (recur (rest cs) (assoc filled (:ident col) :cached))
+          (do
+            (datom/transact! conn
+                             (concat ((:fill col) (datom/db conn) src)
+                                     [{:db/id MARKER-ID
+                                       (:db/ident FILLED-WITH) marker}]))
+            (recur (rest cs) (assoc filled (:ident col) :filled))))))))
+
 (defn analyze-cached
   "A codebase connection for `ns-str`'s `src`, using the content-addressed
    .blanalysis cache. Returns `{:conn :db :hit :sha}`.
@@ -378,30 +453,55 @@
    way the returned db answers every codebase query identically.
 
    `sigs` are the type seeds `index-source` needs; `ns-str` names the source;
-   `src` is its text."
-  [sigs ns-str src]
-  (let [sha (sha256-hex src)]
+   `src` is its text.
+
+   `opts` has one key, `:columns`: derivations from the same source that are
+   filled into the SAME store and remembered there by version (see the column
+   section above). The result reports each column as `:cached` — the store
+   already held it, and the fill did not run — or `:filled`."
+  ([sigs ns-str src] (analyze-cached sigs ns-str src {}))
+  ([sigs ns-str src opts]
+  (let [sha (sha256-hex src)
+        columns (:columns opts [])]
     (if-not (and (cache-available?) (cache-writable? (blanalysis-dir)))
       ; no persistent backend, or a directory we cannot write: index fresh into
       ; an in-memory conn (uncached)
       (let [conn (connect-codebase)]
         (transact-source! conn sigs ns-str src)
-        {:conn conn :db (datom/db conn) :hit false :sha sha})
-      (let [path (cache-path ns-str sha)]
+        ; No store to remember anything in: fill the columns into this conn, so
+        ; the answers match a cached run's exactly.
+        {:conn conn :db (datom/db conn) :hit false :sha sha
+         :columns (fill-columns! conn src columns)})
+      (let [path (cache-path ns-str sha)
+            ; Every definition the columns need, plus the marker attribute. Safe
+            ; to pass on a HIT: `connect-with` writes only what the store does
+            ; not already carry, so this costs nothing when the column is there
+            ; — and it is what EVOLVES a store written before the column was.
+            column-schema (concat (mapcat :schema columns) [FILLED-WITH])]
         (if (= true (File/exists? path))
-          ; HIT: reopen the persistent store; no schema arg — it is recovered
-          ; from the stored schema datoms, and re-passing it would re-transact.
+          ; HIT: reopen the persistent store. The schema is recovered from the
+          ; store's own datoms; the columns' definitions ride along because
+          ; `connect-with` writes only the ones the store does not carry —
+          ; re-passing a recovered definition would create a SECOND attribute
+          ; entity for a unique ident and be rejected.
           (let [store (datom.store-fjall/open path)
-                conn (datom.conn/connect-with store)]
-            {:conn conn :db (datom/db conn) :hit true :sha sha})
+                conn (datom.conn/connect-with store column-schema)]
+            {:conn conn :db (datom/db conn) :hit true :sha sha
+             :columns (fill-columns! conn src columns)})
           ; MISS: open a fresh persistent store, index + persist. The directory
           ; is already there — `cache-writable?` asked for it above.
           (do
             (let [store (datom.store-fjall/open path)
-                  conn (datom.conn/connect-with store SCHEMA)]
+                  conn (datom.conn/connect-with store (concat SCHEMA column-schema))]
               (transact-source! conn sigs ns-str src)
+              ; The facts go durable BEFORE the column is attempted: when the
+              ; fill raises (no model yet), the analysis it depends on is
+              ; already cached for the run that has one.
               (datom.store-fjall/sync! store)
-              {:conn conn :db (datom/db conn) :hit false :sha sha})))))))
+              (let [columns (fill-columns! conn src columns)]
+                (datom.store-fjall/sync! store)
+                {:conn conn :db (datom/db conn) :hit false :sha sha
+                 :columns columns})))))))))
 
 ; --- the queries ----------------------------------------------------------------
 

@@ -208,6 +208,12 @@ Three properties belong to the door rather than to any caller:
   read each other's stores. `BLANALYSIS_DIR` overrides it (tests and builds
   point it at a throwaway directory); add `.blanalysis/` to the project's
   .gitignore, which `bl doctor` reports on.
+* **The vectors are IN that store.** `:fn/embedding` is a COLUMN of it, not a
+  second cache: the same file, the same sha, the same reopen. One marker datom
+  on entity 0 records which model filled the column (`fn/embedding=potion-
+  code-16M-v2@75cf7a6c`), so a warm file is not sliced and the model is not
+  called at all — and a NEW model refills the column without touching a fact.
+  That column is why a warm run costs seconds rather than minutes.
 * **Banded ids.** Each source gets its own million-wide id band (`offset-for`),
   because `codebase/index-source` numbers entities from a fixed base and two
   files sharing a conn would otherwise silently overwrite each other.
@@ -258,15 +264,41 @@ bl search: the model weights are not on disk — run `mix bl.embed.fetch` (expec
 ### What it costs
 
 Measured on a laptop over beam-lisp's own `priv/` — 156 files, 2565 functions.
-The index runs THROUGH the `.blanalysis` cache, so the first run pays the
-analysis and every run after it pays a reopen:
+The index runs THROUGH the `.blanalysis` cache, and the vectors are a COLUMN of
+that same store, so the first run pays for the analysis and everything after it
+pays for a reopen:
 
-| phase | first run | every run after |
+| phase | first run (no store) | every run after |
 |---|---|---|
-| read the sources | 17 ms | 17 ms |
+| read the sources (they must be hashed) | 17 ms | 17 ms |
 | analyze them (`codebase/analyze-cached`: miss → hit) | **~520 s** | 5–10 ms per file |
-| embed the functions | ~0.5 s (0.2 ms each) | same |
+| derive the vectors (`:fn/embedding`, a column) | ~0.5 s (0.2 ms each) | **nothing — read from the store** |
 | answer one question | ~300 ms | ~300 ms |
+
+Both runs of one question, over `priv/lib` — 101 files, 1,623 functions — with
+the analysis store deleted first:
+
+```
+$ rm -rf .blanalysis
+$ bl search "read a file into lines" -p priv/lib -k 3
+3 of 1623 functions in 101 files  (index 178184 ms · query 187 ms)
+
+$ bl search "read a file into lines" -p priv/lib -k 3
+3 of 1623 functions in 101 files  (index 26933 ms · query 417 ms · cached 101/101 · vectors 101/101)
+  mcp.transport-stdio/read-line-safe   line 27   0.7456977367401123
+  mcp.tools/read1                      line 274  0.5515622496604919
+  code.semantic/form-starts            line 88   0.5239207148551941
+```
+
+The footer says what the store earned. `cached 101/101` is every analysis
+reopened; `vectors 101/101` is the stronger claim: no source was sliced and the
+model was not called once. The two runs answer with the same three functions and
+the same scores, because they are the same vectors.
+
+27 s for 101 files is ~270 ms a file — a store reopen plus a pull of the facts
+AND their vectors (an embedding is a blob, so both indexes are read). Nothing
+in that is the model or the reader; a per-stage timer is the next thing to
+build, rather than a guess about which half dominates.
 
 ANALYZING is the first run's whole cost, and it is seconds PER FILE —
 macroexpansion of every form: 0.7 s for a small file, 30 s for

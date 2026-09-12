@@ -165,14 +165,19 @@
 (defn documents
   "Every function in `src` as `{:name :ns :line :text}` — what would be
    embedded. Exposed because “what does the model actually see?” is the first
-   question worth asking of any retrieval result."
+   question worth asking of any retrieval result.
+
+   Deliberately NOT the same call indexing makes: this slices the source for
+   inspection and asks for no column — so it never touches the model, and never
+   fills anything."
   [ns-str src]
   (let [lines (source-lines src)
-        starts (form-starts src)]
+        starts (form-starts src)
+        ents (db-fn-entities (:db (codebase/analyze-cached sigs ns-str src)))]
     (mapv (fn [e]
             {:name (:name e) :ns (:ns e) :line (:line e)
              :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
-          (fn-entities (:facts (cached-facts ns-str src))))))
+          ents)))
 
 ;; ── indexing ────────────────────────────────────────────────────────
 
@@ -251,68 +256,120 @@
             attrs (assoc (or (get grouped e) {}) :db/id e)]
         (recur (rest rs) (assoc grouped e (assoc attrs (get r 1) (get r 2))))))))
 
-(defn- cached-facts
-  "The codebase facts for `src`, through `.blanalysis` when it is warm.
+(defn- db-fn-entities
+  "The function entities in `db`, in source order.
 
-   Returns `{:hit bool :facts [{:db/id e :fn/name …} …]}` — entity maps carrying
-   the ids the cached store allocated. Ids are the CALLER's business: the cache
-   gives a source the ids a fresh index would (`shift-ids` then moves them into
-   the caller's band), which is what keeps a cached run and a fresh run
-   byte-identical."
+   Rows are one attribute per entity and `fn-entities` groups them per
+   FUNCTION, so the regrouping is not optional: without it a fill marks
+   entities that no function claims, and the symptom is an index of zero
+   functions over a corpus that plainly has some."
+  [db]
+  (fn-entities
+    (entity-facts
+      (fact-rows (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] db) (fact-attrs)))))
+
+(defn- index-attrs
+  "What an index pull needs: every codebase fact attribute, PLUS the columns'.
+
+   The column has to be pulled with the facts. A corpus conn holding the
+   functions and none of their vectors is an index that reports functions and
+   cannot rank them — a search that finds nothing, out of a run that looked
+   like it worked."
+  []
+  (reduce (fn [s c] (conj s (:ident c))) (fact-attrs) (columns)))
+
+(defn- embedding-fill
+  "The datoms that put a vector on every entity of every function in `db`.
+
+   This is the whole cost of a cold index, and the reason the column exists: a
+   reader pass to slice each function out of `src`, one score per function, the
+   datoms that carry the result. It runs only when the store's marker says it
+   must — a warm file never gets here, and that is the difference between
+   slicing 1,591 functions again and slicing none."
+  [db src]
+  (let [ents (db-fn-entities db)
+        lines (source-lines src)
+        starts (form-starts src)
+        texts (mapv (fn [e]
+                      (document (:ns e) (:name e)
+                                (slice-text lines starts (:line e))))
+                    ents)
+        vecs (code.embed/embed-batch texts)]
+    (reduce
+      (fn [acc i]
+        (let [e (get ents i) v (get vecs i)]
+          (concat acc (mapv (fn [id] {:db/id id :fn/embedding v}) (:ids e)))))
+      []
+      (range (count ents)))))
+
+(defn- embedding-column
+  "`:fn/embedding` as a column of the analysis store.
+
+   The VERSION is the model's identity, which is what makes a new model cheap:
+   same source, same facts, one refilled column. It is also a correctness
+   guard — the marker says which model filled the store, so a run under another
+   model re-embeds rather than scoring one vector space against another, the
+   failure that has no symptom until the results are nonsense."
+  []
+  {:ident :fn/embedding
+   :schema [EMBEDDING]
+   :version (code.embed/model-id)
+   :fill embedding-fill})
+
+(defn- columns
+  "Every derived column an index carries. One today."
+  []
+  [(embedding-column)])
+
+(defn- cached-facts
+  "The codebase facts for `src` — WITH the embedding column — out of the store
+   when it is warm, derived when it is not.
+
+   Returns `{:hit bool :facts [{:db/id e :fn/name …} …] :columns {ident
+   :cached|:filled}}` — entity maps carrying the ids the cached store
+   allocated. Ids are the CALLER's business: the cache gives a source the ids a
+   fresh index would (`shift-ids` then moves them into the caller's band),
+   which is what keeps a cached run and a fresh run byte-identical.
+
+   The vectors arrive in the SAME pull as the facts, because in the store they
+   are the same kind of thing."
   [ns-str src]
-  (let [{:keys [db hit]} (codebase/analyze-cached sigs ns-str src)
-        attrs (fact-attrs)
-        rows (into [] (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] db))]
-    {:hit hit
-     :facts (entity-facts (fact-rows rows attrs))}))
+  (let [res (codebase/analyze-cached sigs ns-str src {:columns (columns)})
+        rows (into [] (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] (:db res)))]
+    {:hit (:hit res)
+     :columns (:columns res)
+     :facts (entity-facts (fact-rows rows (index-attrs)))}))
 
 (defn index-source!
-  "Index ONE file into `conn`: its codebase facts AND an embedding per
-   function, in ONE transaction.
+  "Index ONE file into `conn`: its codebase facts AND an embedding per function.
 
    One transaction matters. The vector and the facts it describes commit
-   together, so there is no window in which a query can find an embedding
-   whose function does not exist yet — the same atomicity every other fact
-   gets, for free, because a vector IS a fact.
+   together, so there is no window in which a query can find an embedding whose
+   function does not exist yet — the same atomicity every other fact gets, for
+   free, because a vector IS a fact. And because the vectors now come back out
+   of the SAME store as the facts, they arrive in the same pull and commit in
+   the same transaction with no extra bookkeeping at all.
 
    `offset` shifts this file's entity ids clear of every other file's (see
    `shift-ids`); `index!` derives it from the file's position in the set.
 
-   The facts come from `cached-facts`, so re-indexing an unchanged file costs a
-   store reopen and an embed rather than an analysis."
+   A warm file costs a store reopen and a pull. The reader pass and the model
+   live behind the column, which runs only when its marker moved — `:vectors`
+   reports which happened."
   ([conn ns-str path] (index-source! conn ns-str path 0))
   ([conn ns-str path offset]
   (let [src (File/read! path)
         raw (cached-facts ns-str src)
-        facts (shift-ids (:facts raw) offset)
-        lines (source-lines src)
-        starts (form-starts src)
-        ; already in source order, and a VECTOR: the loop below indexes it,
-        ; and `get` by position on a seq is nil — which would transact no
-        ; embedding at all while reporting the functions as indexed.
-        ents (fn-entities facts)
-        docs (mapv (fn [e]
-                     {:name (:name e) :ns (:ns e) :line (:line e)
-                      :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
-                   ents)
-        vecs (code.embed/embed-batch (mapv :text docs))
-        embeds (reduce
-                 (fn [acc i]
-                   (let [e (get ents i) v (get vecs i)]
-                     (concat acc (mapv (fn [id] {:db/id id :fn/embedding v}) (:ids e)))))
-                 []
-                 (range (count ents)))]
-    (datom/transact! conn (concat facts embeds))
+        facts (shift-ids (:facts raw) offset)]
+    (datom/transact! conn facts)
     {:file path :ns ns-str
-     :functions (count ents)
+     :functions (count (fn-entities (:facts raw)))
      :facts (count facts)
-     ; whether the ANALYSIS was a reopen or a fresh index — the number that
-     ; says whether the cache earned anything on this run.
+     ; whether the ANALYSIS was a reopen or a fresh index, and whether the
+     ; VECTOR column had to be derived again: the two numbers that say whether
+     ; the cache earned anything on this run.
      :analysis (if (:hit raw) :cached :indexed)
-     ; the texts the model actually saw — carried out, not discarded, because
-     ; "what was embedded?" is the first question worth asking of any
-     ; retrieval result.
-     :documents docs})))
+     :vectors (:fn/embedding (:columns raw))})))
 
 (defn offset-for
   "The entity-id band source `i` (0-based) is indexed into.
