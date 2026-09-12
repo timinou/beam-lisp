@@ -144,7 +144,11 @@ invocation, so it reports `not running` and changes nothing.
 
    (probe ".bl-check.edn" false
      (fn [] (let [ok? (File/regular? (u/resolve ".bl-check.edn"))]
-              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))])
+              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))
+
+   (probe ".blanalysis/" false
+     (fn [] (let [ok? (File/dir? (u/resolve ".blanalysis"))]
+              {:ok ok? :detail (if ok? "present" "absent (created by the first codebase read)")})))])
 ```
 
 ## The report

@@ -189,7 +189,7 @@ through one chain:
 ```
 index!            a set of [ns path] — the only entry point, one band per file
   └ index-source! one file: facts + one embedding per function, ONE transaction
-      └ cached-facts  the .blanalysis store, keyed by sha256(source)
+      └ cached-facts  the project's .blanalysis store, keyed by sha256(source)
 ```
 
 That is deliberate, and it is what keeps three callers from drifting apart. The
@@ -202,6 +202,12 @@ Three properties belong to the door rather than to any caller:
 
 * **Cached analysis.** Facts come from `.blanalysis`, because an analysis is a
   pure function of the source bytes. Nothing re-analyzes an unchanged file.
+  The store is the PROJECT's — `.blanalysis/` beside the tree, one fjall store
+  per source, content-addressed by `sha256(source)` — so a worktree carries its
+  own cache, `rm -rf` of the tree takes the cache with it, and no two checkouts
+  read each other's stores. `BLANALYSIS_DIR` overrides it (tests and builds
+  point it at a throwaway directory); add `.blanalysis/` to the project's
+  .gitignore, which `bl doctor` reports on.
 * **Banded ids.** Each source gets its own million-wide id band (`offset-for`),
   because `codebase/index-source` numbers entities from a fixed base and two
   files sharing a conn would otherwise silently overwrite each other.

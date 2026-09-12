@@ -506,8 +506,9 @@ beam-lisp doctor
   --   daemon         not running (:no_socket)
   --   src/           absent
   --   .bl-check.edn  absent (run `bl check --update`)
+  --   .blanalysis/   absent (created by the first codebase read)
 
-  ✓ 2 required probes ok; 3 optional absent
+  ✓ 2 required probes ok; 4 optional absent
 ```
 
 Exit `0` when the required probes pass, `1` otherwise.
