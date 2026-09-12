@@ -253,7 +253,7 @@
   width: 100%, stroke: (paint: ink-faint, thickness: 1pt, dash: "dashed"),
   inset: (x: 0.9em, y: 0.75em), radius: 2pt, above: 1.2em, below: 1.25em,
 )[
-  if id != none or title != none {
+  #if id != none or title != none {
     grid(
       columns: (auto, 1fr), column-gutter: 0.6em,
       align: (left + horizon, left + horizon),

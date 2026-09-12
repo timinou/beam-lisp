@@ -16,7 +16,7 @@ The post-`--` arguments reach the program through `BeamLisp/argv`, exactly as
 
 ```beam-lisp
 (ns bl.serve
-  (:require [bl.util :as u]))
+  (:require [bl.env :as env] [bl.util :as u]))
 ```
 
 ## The port
@@ -27,17 +27,51 @@ where it would write the literal, and the flag makes that call answer `N`.
 A program that keeps a bare literal simply ignores the flag — its port stays
 what it says.
 
+Every port a program serves on can also have a NAME. The name comes from the
+project: `:ports {:web 4000}` in `env.bl` says this tree serves a web port, and
+`(bl.serve/port :web 4043)` asks for it — claiming it in the session's registry
+and registering the hosts that name answers to. The number never leaves this
+file; what a developer opens is `http://web.<project>.test`.
+
 ```beam-lisp
 (def port-override
   "The port `--port` selected, or nil. The state behind `port`."
   (atom nil))
 
 (defn port
-  "The port `bl serve --port N` selected, else `default`. A program replaces a
-   literal port with this call so the flag can move its server:
-   `(web/serve {:port (bl.serve/port 4043) :plug router})`."
-  [default]
-  (or @port-override default))
+  "The port this program serves on, and the name it answers to.
+
+   `(port 4043)` answers the literal, or `--port N` when the operator passed
+   one: a program replaces its literal so the flag can move the server.
+
+   `(port :web 4043)` answers the port the project declares for the name `web`
+   — claimed in the session's registry, and registered with the hosts that name
+   answers to, so the app is reachable at `http://web.<project>.test` and no
+   human has to read a number. A port another live process holds is an ERROR
+   naming the owner: two servers must never trade places in silence."
+  ([default] (or @port-override default))
+  ([name default]
+   (let [n (name-str name)
+         root (BeamLisp/cwd)
+         want (or @port-override (declared n) default)
+         r (BeamLisp.Daemon.Ports/claim
+             n want
+             (u/kw [:root root]
+                   [:hosts (u/to-list (BeamLisp.Daemon.Names/hosts root n))]))]
+     (if (= :ok (erlang/element 1 r))
+       (erlang/element 2 r)
+       (throw (ex-info (str "bl.serve: cannot serve \"" n "\": "
+                            (pr-str (erlang/element 2 r)))
+                       {}))))))
+
+(defn- name-str [n] (if (keyword? n) (name n) (str n)))
+
+(defn declared
+  "The port the project declares for `name` — `:ports {:web 4000}` in env.bl —
+   or nil when the tree declares none. The number is a PREFERENCE: the registry
+   is what decides whether it is this process's to take."
+  [name]
+  (get-in (env/project (BeamLisp/cwd)) [:ports (name-str name) :port]))
 ```
 
 ## The command

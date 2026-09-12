@@ -17,9 +17,11 @@
 ; live fact changes through datom's watch: "tell me when my function gains or
 ; loses a caller".
 ;
-; The tools run against beam-lisp indexing ITSELF (priv/std/codebase.bl +
-; priv/std/typed.bl). The datom conn is built on first use, so requiring this
-; namespace reads no files and transacts nothing.
+; The tools serve TWO mounts, in order: beam-lisp's own engine (priv/std/
+; codebase.bl + priv/std/typed.bl — the very code answering these questions),
+; and, when the command runs inside a project, that tree's own namespaces read
+; from env.bl's `:paths`. The datom conn is built on first use, so requiring
+; this namespace reads no files and transacts nothing.
 ;
 ; Design principle (Anthropic's code-execution-with-MCP; CodeRLM; LogicLoc,
 ; arXiv 2604.16021): only answers cross the wire.
@@ -33,6 +35,8 @@
 
 (ns mcp.tools
   (:require [bl.ask :as ask]
+            [bl.env :as env]
+            [bl.util :as u]
             [codebase]
             [typed]
             [datom]
@@ -41,22 +45,77 @@
             [system.core :as sys]
             [z3]))
 
-;; ── the mounted codebase (a real fixture: beam-lisp indexing itself) ──
+;; ── what gets mounted: the engine, then the tree you are standing in ──
 ;;
-;; We dogfood: index priv/std/codebase.bl and priv/std/typed.bl — the very engine
-;; answering these questions — into one fact database. "The checker as a
-;; database" (examples/typing/02_codebase_demo.bl, act 2).
+;; The engine indexes ITSELF — priv/std/codebase.bl and priv/std/typed.bl, the
+;; very code answering these questions ("the checker as a database",
+;; examples/typing/02_codebase_demo.bl act 2) — and that is always mounted:
+;; every answer about the language needs it, and it is two namespaces.
+;;
+;; On top of it, when the command runs inside a PROJECT (an env.bl, found by
+;; walking up from the client's cwd), the tree's OWN namespaces are mounted,
+;; read from env.bl's `:paths`. Those are the same roots `bl` hands the loader,
+;; so "what this server serves" and "what a require resolves" cannot drift
+;; apart — and `bl mcp` in a checkout answers questions about the code the
+;; caller is editing, not only about the language it is written in. With no
+;; project file (or nothing loadable under its roots) the engine alone is the
+;; honest answer, which is what a bare `bl mcp` from /tmp gets.
+;;
+;; A namespace's SOURCE is read the way the loader reads it
+;; (`BeamLisp.Loader/read_source`: the bytes for a plain `.bl`, the concatenated
+;; code cells for a literate `.bl.md`), and its NAME is the one the file
+;; DECLARES (`bl.util/ns-of`), never the one its path would suggest: the loader
+;; itself skips a candidate whose declared ns differs, so a project file may be
+;; named after the tool it is (`tooling/catalog.bl` declaring
+;; `tooling.catalog-app`) without hijacking a shipped namespace.
 
 (def sigs (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
 
-(def MOUNTED
-  ;; The namespaces that become facts, by NAME. A source is resolved the way
-  ;; the loader resolves any require — through the priv tiers, wherever the
-  ;; application is installed — so the mount is independent of the process's
-  ;; cwd. A repo-relative path here worked only when you happened to run from
-  ;; the checkout (`bl mcp` in a release, from anywhere else: `:enoent` read as
-  ;; a source string, then a reader crash that named nothing).
-  ["codebase" "typed"])
+(def engine-mount
+  ;; The language's own two namespaces, spelled as a mount group like any other.
+  ;; They have no file of their own to read, so a source of nil means "resolve
+  ;; this one BY NAME through the load path" (see mount-source): a name is what
+  ;; resolves in a release installed anywhere, while a path only ever resolved
+  ;; from the checkout that wrote it.
+  {:name "beam-lisp"
+   :title "beam-lisp self-index (codebase.bl + typed.bl)"
+   :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
+   :sources (to-list (map (fn [ns-str] [ns-str nil]) ["codebase" "typed"]))})
+
+(defn- project-mount
+  "The tree's own namespaces as a mount group — from env.bl's `:paths`, which
+   are absolute, already discovered by walking up from the client's cwd — or nil
+   when there is no project file, no roots, or nothing loadable under them.
+   `exclude` names namespaces another group already mounts, so one source is
+   never indexed twice."
+  [exclude]
+  (let [p (env/project (BeamLisp/cwd))
+        roots (to-list (:paths p))]
+    (when (seq roots)
+      (let [sources (reduce
+                      (fn [acc f]
+                        (let [src (BeamLisp.Loader/read_source f)
+                              ns-str (u/ns-of src)]
+                          (if (or (= "user" ns-str)
+                                  (contains? exclude ns-str)
+                                  (some (fn [pr] (= ns-str (first pr))) acc))
+                            acc
+                            (conj acc [ns-str src]))))
+                      []
+                      (mapcat u/expand-targets roots))
+            name (or (:name p) "project")]
+        (when (seq sources)
+          {:name name
+           :title (str name " — " (count sources) " namespaces under " (join " " roots))
+           :description "The project's own namespaces, read from env.bl's :paths: fn/call facts, return types, call graph."
+           :roots (to-list roots)
+           :sources sources})))))
+
+(defn- mount-groups
+  "The mounts, in order: the engine, then this tree."
+  []
+  (let [tree (project-mount (set (map first (:sources engine-mount))))]
+    (if (some? tree) [engine-mount tree] [engine-mount])))
 
 (defn- offset-facts
   "Shift every :db/id by delta so multiple files never collide. codebase.bl
@@ -81,25 +140,60 @@
                     {:ns ns-str :searched (BeamLisp.Tiers/dirs)}))))
 
 (defn- mount!
-  "Index every MOUNTED namespace into one fresh datom conn, id-offset each."
+  "Index every mount group into one fresh datom conn, id-offsetting each source
+   so two files never collide, and tally what each group contributed. Returns
+   {:conn … :groups […] :core-names #{…}} — the groups are what code/list
+   reports and core-names is what `unknown-callees` measures against, so both
+   are read OFF THE MOUNT instead of asked of the runtime later."
   []
-  (let [conn (codebase/connect-codebase)]
-    (reduce (fn [i ns-str]
-              (let [facts (codebase/index-source sigs ns-str (mount-source ns-str))
-                    delta (* i 1000000)
-                    all (concat (offset-facts (:fn facts) delta)
-                                (offset-facts (:calls facts) delta)
-                                (offset-facts (:instr facts) delta))]
-                (datom/transact! conn all)
-                (+ i 1)))
-            0 MOUNTED)
+  (let [conn (codebase/connect-codebase)
+        groups (mount-groups)
+        rows (reduce
+               (fn [acc [g [ns-str src]]]
+                 (let [facts (codebase/index-source sigs ns-str (or src (mount-source ns-str)))
+                       delta (* (:i acc) 1000000)
+                       all (concat (offset-facts (:fn facts) delta)
+                                   (offset-facts (:calls facts) delta)
+                                   (offset-facts (:instr facts) delta))]
+                   (datom/transact! conn all)
+                   {:i (+ (:i acc) 1)
+                    :rows (conj (:rows acc)
+                                {:group (:name g) :ns ns-str
+                                 :functions (count (:fn facts))
+                                 :calls (count (:calls facts))
+                                 :names (map (fn [f] (get f :fn/name)) (:fn facts))})}))
+               {:i 0 :rows []}
+               (mapcat (fn [g] (map (fn [s] [g s]) (:sources g))) groups))
+        of-group (fn [gname] (filter (fn [r] (= gname (:group r))) (:rows rows)))]
     ;; The instruction corpus mounts beside the code facts: one conn, so
     ;; code/query reaches the :instr/* facts with the same datalog.
     (instr/mount! conn)
-    conn))
+    {:conn conn
+     :groups (to-list
+               (map (fn [g]
+                      (let [rs (of-group (:name g))
+                            m {:name (:name g)
+                               :title (:title g)
+                               :description (:description g)
+                               :sources (to-list (map first (:sources g)))
+                               :entities {:namespaces (to-list (sort (map :ns rs)))
+                                          :functions (reduce (fn [n r] (+ n (:functions r))) 0 rs)
+                                          :calls (reduce (fn [n r] (+ n (:calls r))) 0 rs)}
+                               :uri (str "code://" (:name g) "/schema")}]
+                        (if (some? (:roots g)) (assoc m :roots (to-list (:roots g))) m)))
+                    groups))
+     ;; core + every name the mount indexed. Asked of the FACTS, not of
+     ;; `Env/public_names`: that call LOADS the namespace, and loading a
+     ;; forty-file plant to answer a question about its call graph is the cost
+     ;; this server exists to avoid. The set is a superset of the public names
+     ;; (a private def is defined too), which is the safe direction for
+     ;; `unknown-callees`: it flags a callee with no definition anywhere, and
+     ;; every name here is one we just indexed.
+     :core-names (into (set (BeamLisp.Env/public_names "core"))
+                       (mapcat :names (:rows rows)))}))
 
 ; Built once, on first use — requiring this namespace reads no files and
-; transacts nothing; the mount happens the first time a tool asks for `conn`.
+; transacts nothing; the mount happens the first time a tool asks for it.
 ;
 ; "Once" means once while the memo is USABLE. A conn's store and blob store are
 ; ETS tables owned by the process that mounted them, so this atom — VM-global,
@@ -110,39 +204,37 @@
 ; then dies inside `:ets.lookup` with "the table identifier does not refer to an
 ; existing ETS table", which reads like a corrupt store rather than what it is:
 ; a memo outliving its owner. So ask before trusting one.
-(def ^:private the-conn (atom nil))
+;
+; The mount is held as ONE value — conn, groups and core-names together — so a
+; re-mount cannot hand out a conn from one build and counts from another.
+(def ^:private the-mount (atom nil))
+
+(defn- mounted []
+  (let [m @the-mount]
+    (if (and (some? m) (datom/alive? (:conn m)))
+      m
+      (let [_ (when (some? m) (datom/release! (:conn m)))
+            fresh (mount!)]
+        (if (compare-and-set! the-mount m fresh) fresh @the-mount)))))
 
 (defn conn
-  "The self-indexed codebase: one datom conn over every MOUNTED source."
+  "The self-indexed codebase: one datom conn over every mounted source."
   []
-  (let [c @the-conn]
-    (if (and (some? c) (datom/alive? c))
-      c
-      (let [_ (when (some? c) (datom/release! c))
-            fresh (mount!)]
-        (if (compare-and-set! the-conn c fresh) fresh @the-conn)))))
+  (:conn (mounted)))
 
-;; core callee set for the mounted namespaces — the "always defined" names
-;; (core + each mounted ns's publics) so unknown-callees does not flag them.
-(def core-names
-  (reduce (fn [s ns-str]
-            (into s (codebase/core-callee-names ns-str)))
-          #{} MOUNTED))
+(defn mounts
+  "What this server serves, in order: the engine, then — when the command runs
+   inside a project — this tree's own namespaces, read from env.bl's `:paths`.
+   Each entry is a `code/list` row: name, title, description, its namespaces,
+   the fn/call counts it contributed, and (for a tree) the roots it came from."
+  []
+  (:groups (mounted)))
 
-;; ── helpers ─────────────────────────────────────────────────────────
-
-(defn- keywordize [m]
-  (reduce (fn [out kv] (assoc out (keyword (key kv)) (val kv)))
-          {} (to-list m)))
-
-(defn- manifest [db]
-  {:namespaces (to-list (map first
-                             (sort (into [] (datom/q '[:find ?ns
-                                                       :where [?d :fn/ns ?ns]] db)))))
-   :functions (or (get (get (into [] (datom/q '[:find (count ?d)
-                                                :where [?d :fn/name _]] db)) 0) 0) 0)
-   :calls (or (get (get (into [] (datom/q '[:find (count ?c)
-                                            :where [?c :call/caller _]] db)) 0) 0) 0)})
+(defn core-names
+  "The always-defined set `unknown-callees` measures against: the public core
+   names plus every function this mount indexed (see mount!'s note)."
+  []
+  (:core-names (mounted)))
 
 ;; ── tool 1: code/list ───────────────────────────────────────────────
 
@@ -150,15 +242,10 @@
   {:type "object" :properties {} :required []})
 
 (defn code-list-handler [_args]
-  (let [db (datom/db (conn))
-        m (manifest db)]
-    {:codebases
-     [{:name "beam-lisp"
-       :title "beam-lisp self-index (codebase.bl + typed.bl)"
-       :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
-       :sources (to-list MOUNTED)
-       :entities m
-       :uri "code://beam-lisp/schema"}]}))
+  ;; Straight off the mount: what was indexed, from where, and how much of it.
+  ;; A client that asks "what are you serving?" gets the same list the server
+  ;; built its facts from, not a re-derivation from the store.
+  {:codebases (to-list (mounts))})
 
 ;; ── tool 2: code/query (the datalog escape hatch) ───────────────────
 ;;
@@ -233,7 +320,8 @@
                 [[] user-binds]
                 (if (empty? toks) ['$] toks))
         result (apply datom/q query-vec inputs)]
-    {:codebase (or (get args "codebase") "beam-lisp")
+    {:codebase (or (get args "codebase")
+                   (:name (first (mounts))))
      :rows (to-list (map to-list result))}))
 
 ;; ── tool 3: code/ask (named questions; MRTR for missing target) ─────
@@ -288,7 +376,7 @@
       {:resultType "complete"
        :question question
        :target target
-       :rows (ask/answer (datom/db (conn)) question target core-names)})))
+       :rows (ask/answer (datom/db (conn)) question target (core-names))})))
 
 ;; ── tool 4: code/verify (the PROVER as a tool) ──────────────────────
 ;;

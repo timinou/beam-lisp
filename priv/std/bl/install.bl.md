@@ -290,10 +290,100 @@ the corpus assembles.
                     "beamlisp module enabled"
                     "not wired — run: bl install doom")}]))))
 
+;; ── the gateway target ────────────────────────────────────────────────
+;;
+;; The gateway is HOST infrastructure, not a project's: one per user, holding
+;; the one port a URL is allowed to leave out, answering every name every tree
+;; registered. Installing it is the two things a project cannot do for itself —
+;; a systemd USER unit (it starts at login; it outlives a shell) and, once, the
+;; sysctl that lets a user bind port 80 at all.
+
+(defn- unit-file []
+  (let [cfg (or (System/get_env "XDG_CONFIG_HOME") (str (home) "/.config"))]
+    (str cfg "/systemd/user/bl-gateway.service")))
+
+(defn- unit-text [bin]
+  (join "\n"
+        ["[Unit]"
+         "Description=beam-lisp gateway — answers the names beam-lisp projects declare"
+         "After=network.target"
+         ""
+         "[Service]"
+         "Type=simple"
+         (str "ExecStart=" bin " gateway run")
+         "Restart=on-failure"
+         "RestartSec=2"
+         ""
+         "[Install]"
+         "WantedBy=default.target"
+         ""]))
+
+(defn- port-80-verdict
+  "Can an unprivileged process bind port 80 right now? Asked by binding it,
+   which is the only answer that counts."
+  []
+  (let [r (gen_tcp/listen 80
+                          (list :binary
+                                (tuple :ip (erlang/list_to_tuple (list 127 0 0 1)))
+                                (tuple :reuseaddr false)))]
+    (if (tuple? r)
+      (let [tag (erlang/element 1 r)]
+        (if (= :ok tag)
+          (do (gen_tcp/close (erlang/element 2 r)) :ok)
+          (erlang/element 2 r)))
+      :error)))
+
+(defn- sysctl-advice []
+  (str "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80"
+       "  (in /etc/sysctl.d/ to survive a reboot)"))
+
+(defn- run-gateway [_arg]
+  (let [bin (BeamLisp.Daemon.Gateway/command)
+        unit (unit-file)]
+    (if (nil? bin)
+      {:error "no `bl` on PATH — set BL_BIN to this build, then re-run"}
+      (do
+        (File/mkdir_p (Path/dirname unit))
+        (File/write! unit (unit-text bin))
+        (System/cmd "systemctl" (u/to-list ["--user" "daemon-reload"]) (u/kw [:stderr_to_stdout true]))
+        (let [start (System/cmd "systemctl"
+                                (u/to-list ["--user" "enable" "--now" "bl-gateway"])
+                                (u/kw [:stderr_to_stdout true]))
+              code (erlang/element 2 start)
+              verdict (port-80-verdict)]
+          [(step "unit" {:ok unit})
+           (step "service" (if (= 0 code)
+                              {:ok "enabled + started (systemctl --user)"}
+                              {:error (str "systemctl --user enable --now failed: "
+                                           (String/trim (erlang/element 1 start)))}))
+           (step "port 80" (cond
+                              (= :ok verdict) {:ok "unprivileged here — names need no port anywhere"}
+                              (= :eacces verdict) {:error (sysctl-advice)}
+                              :else {:error (str "not free (" (pr-str verdict)
+                                                 ") — the gateway will use 7777")}))
+           {:name "next" :ok true
+            :detail "open what it routes: bl ports, then a name"}])))))
+
+(defn- check-gateway [_arg]
+  (let [unit (unit-file)
+        verdict (port-80-verdict)
+        up (BeamLisp.Daemon.Gateway/port)]
+    [{:name "unit" :ok (File/regular? unit)
+      :detail (if (File/regular? unit) unit "absent — run: bl install gateway")}
+     {:name "gateway" :ok (not (nil? up))
+      :detail (if (nil? up) "not running — bl gateway start" (str "on port " up))}
+     {:name "port 80" :ok (= :ok verdict)
+      :detail (cond
+                (= :ok verdict) "unprivileged here"
+                (= :eacces verdict) (sysctl-advice)
+                :else (str "not free (" (pr-str verdict) ")"))}]))
 (def targets
   {"doom" {:summary "Doom Emacs: the beamlisp module, tree-sitter grammar, init.el wiring"
            :run run-doom
            :check check-doom}
+   "gateway" {:summary "The name gateway: one per user, holding the port a URL may leave out"
+              :run run-gateway
+              :check check-gateway}
    "mcp"  {:summary "MCP clients: agent instructions + server registration"
            :run run-mcp
            :check (fn [_] [{:name "mcp" :ok true
@@ -331,7 +421,7 @@ the corpus assembles.
     (let [name (first args)
           t (get targets name)]
       (if (nil? t)
-        (u/usage-error (str "bl install: unknown target \"" name "\" (doom|mcp)"))
+        (u/usage-error (str "bl install: unknown target \"" name "\" (doom|mcp|gateway)"))
         (let [arg (second args)
               steps (if (:check st)
                       ((:check t) arg)

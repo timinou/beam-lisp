@@ -5,12 +5,12 @@ tree. It is not a background service you have to think about: you start it, it
 prints where it is, and everything else in `bl` gets faster without changing
 what it means.
 
-```beam-lisp {:silent? true}
+```beam-lisp id=require
 (ns dev.session-doc
   (:require [bl.ports :as ports] [bl.env :as env] [bl.util :as u]))
 ```
 
-```bl-result cell0
+```bl-result require
 :dev.session-doc
 ```
 
@@ -35,12 +35,22 @@ never fight over a number nobody chose. `:ports {:ui 7700}` in `env.bl` says you
 want that one specifically, and if it is taken the session says so — naming
 whoever holds it — instead of quietly serving somewhere else:
 
-```beam-lisp {:id "ports-list"}
-(ports/list-ports)
+```beam-lisp id=ports-list
+;; A name nobody else uses, so the answer does not depend on which sessions are
+;; running. What this proves is the registry's contract: a claim shows up, and
+;; release takes it away.
+(let [name (str "doc-list-" (erlang/unique_integer (list :positive)))
+      listed? (fn [] (not (nil? (some (fn [c] (= name (:name c))) (ports/list-ports)))))]
+  (try
+    (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root "/tmp/doc-tree"]))
+    (let [claimed (listed?)]
+      (BeamLisp.Daemon.Ports/release name)
+      (list claimed (listed?)))
+    (finally (BeamLisp.Daemon.Ports/release name))))
 ```
 
-```bl-result cell1
-()
+```bl-result ports-list
+(true false)
 ```
 
 ## What a port costs when it is taken
@@ -48,7 +58,7 @@ whoever holds it — instead of quietly serving somewhere else:
 A port claim is a file, and the file names its owner. That is what makes the
 refusal useful:
 
-```beam-lisp {:id "claim-and-refuse"}
+```beam-lisp id=claim-and-refuse
 (let [name (str "doc-" (erlang/unique_integer (list :positive)))]
   (try
     (let [[t1 p1] (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root "/tmp/doc-tree"]))
@@ -58,7 +68,7 @@ refusal useful:
     (finally (BeamLisp.Daemon.Ports/release name))))
 ```
 
-```bl-result cell2
+```bl-result claim-and-refuse
 (:ok :error "/tmp/doc-tree")
 ```
 
@@ -80,13 +90,14 @@ POST /intent    run a project task on the session's single worker
 
 An editor, an agent and a browser need one address, not a registry of them.
 
-```beam-lisp {:id "url"}
+```beam-lisp id=url silent
+;; No stored result on purpose: this answers nil or a URL depending on whether a
+;; session is up right now, and the port is ephemeral. Storing either would go
+;; stale for a legitimate reason. The cell still RUNS, so a broken `ports/url`
+;; fails the check.
 (ports/url)
 ```
 
-```bl-result cell3
-nil
-```
 
 `bl ui` prints that URL; `bl ui --open` hands it to the desktop's opener. When
 no session is running for the tree, both say so rather than inventing one.
@@ -96,11 +107,11 @@ no session is running for the tree, both say so rather than inventing one.
 The dashboard's Tasks pane is the project's `env.bl` `:tasks` map — the same
 value `bl tasks` lists and `bl <name>` runs. This repository declares two:
 
-```beam-lisp {:id "tasks"}
+```beam-lisp id=tasks
 (keys (:tasks (env/project (BeamLisp/cwd))))
 ```
 
-```bl-result cell4
+```bl-result tasks
 ("demo" "runner")
 ```
 
@@ -113,11 +124,11 @@ worker; parking it would block every later client, so it refuses them by name
 and says why. `bl watch` is the exception — the daemon HOSTS that watcher, so
 its reload commits ride the same worker as everything else and nothing races.
 
-```beam-lisp {:id "owns-process"}
+```beam-lisp id=owns-process
 (list ((BeamLisp.Env/fetch! "bl.cli" "owns-process?") (list "repl") (BeamLisp/cwd))
       ((BeamLisp.Env/fetch! "bl.cli" "owns-process?") (list "test") (BeamLisp/cwd)))
 ```
 
-```bl-result cell5
+```bl-result owns-process
 (true false)
 ```

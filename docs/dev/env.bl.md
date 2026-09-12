@@ -5,12 +5,12 @@ it says what the project IS: where its namespaces live, what its tasks are
 called, which ports it serves on. Everything else — `bl run`, `bl test`,
 `bl dev`, the session's dashboard — reads it and relies on it.
 
-```beam-lisp {:id "require"}
+```beam-lisp id=require
 (ns dev.env-doc
   (:require [bl.env :as env] [bl.util :as u]))
 ```
 
-```beam-lisp {:silent? true}
+```beam-lisp silent
 (defn scratch
   "A temporary project directory that is removed when `f` returns."
   [f]
@@ -19,11 +19,8 @@ called, which ports it serves on. Everything else — `bl run`, `bl test`,
     (try (f d) (finally (File/rm_rf! d)))))
 ```
 
-```bl-result scratch
-&:"Elixir.BeamLisp.Ns.Dev.Env-doc".scratch/1
-```
 
-```bl-result cell0
+```bl-result require
 :dev.env-doc
 ```
 
@@ -40,29 +37,33 @@ This repository's own file, at the root:
                   :doc "the isolated test runner, running four adversarial files"}}}
 ```
 
-Five keys, and no others:
+Six keys, and no others:
 
 - `:name` — what the project is called.
+- `:instance` — which checkout of this project is running, when more than one
+  might be. It qualifies the names the project's ports answer to; declared, or
+  the git branch when that is not a default branch. See [names](names.bl.md).
 - `:paths` — the roots the loader searches for namespaces. This is what `-p`
   does on the command line, written down once instead of typed every time.
 - `:tasks` — the verbs a developer types: `bl demo`, `bl runner`. A task is a
   file to run, or a map with `:run`, `:doc`, `:watch` and `:paths`.
-- `:ports` — the ports the project serves on. `{:web 4000}`, or `{:web {:port 0}}`
-  to let the OS choose.
+- `:ports` — the ports the project serves on, by NAME: `{:web 4000}`, or
+  `{:web {:port 0}}` to let the OS choose. A name is what the port answers to —
+  `http://web.<project>.test` — so nobody has to read the number.
 - `:env` — environment variables the project expects.
 
 Anything else is reported as an unknown key. A typo that silently does nothing
 is the worst kind of configuration bug, so it is not allowed to be silent:
 
-```beam-lisp {:id "unknown-key"}
+```beam-lisp id=unknown-key
 (scratch
   (fn [d]
     (File/write! (str d "/env.bl") "{:name \"typo\" :wat 2}")
     (:errors (env/project d))))
 ```
 
-```bl-result cell1
-[]
+```bl-result unknown-key
+("unknown key wat")
 ```
 
 ## Reading it: two ways, one answer
@@ -70,29 +71,29 @@ is the worst kind of configuration bug, so it is not allowed to be silent:
 The value is a MAP, and a file whose last form is a map is read as DATA — no
 evaluation, nothing runs:
 
-```beam-lisp {:id "literal"}
+```beam-lisp id=literal
 (scratch
   (fn [d]
     (File/write! (str d "/env.bl") "{:name \"tiny\" :paths [\"src\"]}")
     (env/literal (str d "/env.bl"))))
 ```
 
-```bl-result cell2
-("unknown key wat")
+```bl-result literal
+{:ok {:name "tiny", :paths ["src"]}}
 ```
 
 A file whose value is COMPUTED — a project that builds its task list, say — is
 evaluated in its own fork instead. Both roads end at the same project value:
 
-```beam-lisp {:id "computed"}
+```beam-lisp id=computed
 (scratch
   (fn [d]
     (File/write! (str d "/env.bl") "(assoc {:name \"built\"} :paths [\"src\"])")
     (env/literal (str d "/env.bl"))))
 ```
 
-```bl-result cell3
-{:ok {:name "tiny", :paths ["src"]}}
+```bl-result computed
+:dynamic
 ```
 
 ## Where it is found
@@ -101,7 +102,7 @@ Discovery walks UP from the command's directory. `bl` typed in any subdirectory
 of a tree finds the same file, so no command ever needs a path to its own
 configuration:
 
-```beam-lisp {:id "walk-up"}
+```beam-lisp id=walk-up
 (scratch
   (fn [d]
     (File/mkdir_p! (str d "/deep/deeper"))
@@ -109,8 +110,8 @@ configuration:
     (= (str d "/env.bl") (env/find (str d "/deep/deeper")))))
 ```
 
-```bl-result cell4
-:dynamic
+```bl-result walk-up
+true
 ```
 
 ## A broken file degrades, it never stops you
@@ -119,20 +120,17 @@ Every shape problem is collected as data. A project with six mistakes reports
 six and still runs with the parts it understood — its remaining paths, its
 surviving tasks:
 
-```beam-lisp {:id "errors-are-data"}
+```beam-lisp id=errors-are-data
 (scratch
   (fn [d]
     (File/write! (str d "/env.bl") "{:name 42 :paths \"src\" :wat 2}")
     (list (:name (env/project d)) (:paths (env/project d)) (:errors (env/project d)))))
 ```
 
-```bl-result cell6
+```bl-result errors-are-data
 (nil [] (":paths must be a list of strings" ":name must be a string" "unknown key wat"))
 ```
 
-```bl-result cell5
-true
-```
 
 That is the whole idea: a project file you can read in one screen, in two ways
 that cannot disagree, that a typo cannot silently corrupt, and that never stops

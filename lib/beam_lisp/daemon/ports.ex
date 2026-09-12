@@ -22,6 +22,14 @@ defmodule BeamLisp.Daemon.Ports do
   A claim whose process is gone is stale and is swept on sight; a claim whose
   port is held by some process nobody claimed is reported as such, never
   silently taken over.
+
+  ## A claim carries its NAMES
+
+  A claim also holds the hosts the port answers to
+  (`BeamLisp.Daemon.Names`). They ride in the claim — one file, owned by the
+  process that actually holds the port — so a router can route by name without
+  reading any project file: the registry is the routing table, which is what
+  lets `BeamLisp.Daemon.Gateway` stay ignorant of `env.bl`.
   """
 
   alias BeamLisp.Daemon.Paths
@@ -32,11 +40,14 @@ defmodule BeamLisp.Daemon.Ports do
   `{:taken, claim}` (another session holds the name) or `{:port_busy, port,
   claim}` (the wanted number is in use).
 
-  Re-claiming a name this same process already holds is idempotent.
+  `:hosts` are the names this port answers to. They are recorded when the claim
+  is made; re-claiming a name this same process already holds keeps the port it
+  has, and is idempotent.
   """
   def claim(name, want, opts \\ []) do
     root = Keyword.get(opts, :root, File.cwd!())
     pid = normalize_pid(Keyword.get(opts, :pid))
+    hosts = normalize_hosts(Keyword.get(opts, :hosts))
 
     with {:ok, dir} <- ports_dir() do
       case held_here(dir, name, pid) do
@@ -45,12 +56,26 @@ defmodule BeamLisp.Daemon.Ports do
         {:ok, existing} when want == 0 -> {:ok, existing}
         {:ok, ^want} -> {:ok, want}
         # this session holds the name, but wants a different number: move it
-        {:ok, _other} -> take(dir, name, want, root, pid)
+        {:ok, _other} -> take(dir, name, want, root, pid, hosts)
         {:held, claim} -> {:error, {:taken, claim}}
-        :free -> take(dir, name, want, root, pid)
+        :free -> take(dir, name, want, root, pid, hosts)
       end
     end
   end
+
+  # Hosts are strings, lowercased and deduped: a `Host:` header is compared to
+  # them verbatim, and no caller should have to guess the case a name was
+  # claimed in. Anything else in the list is not a host and is dropped.
+  defp normalize_hosts(nil), do: []
+
+  defp normalize_hosts(hosts) when is_list(hosts) do
+    hosts
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_hosts(_other), do: []
 
   # `:os.getpid/0` answers a CHARLIST, and a pid kept in that shape compares
   # unequal to the integer a caller passes — which is how every claim came to
@@ -68,12 +93,13 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  defp take(dir, name, want, root, pid) do
+  defp take(dir, name, want, root, pid, hosts) do
     case bindable(want) do
       {:ok, port} ->
         claim = %{
           name: to_string(name),
           port: port,
+          hosts: hosts,
           tree_id: Paths.tree_id(root),
           root: root,
           pid: pid,
@@ -100,9 +126,9 @@ defmodule BeamLisp.Daemon.Ports do
   end
 
   @doc """
-  Every live claim, oldest name first, as maps `%{name, port, tree_id, root,
-  pid, claimed_at}`. Stale claims (owner gone) are swept as they are met, so a
-  crashed daemon leaves nothing behind for the next one to trip over.
+  Every live claim, oldest name first, as maps `%{name, port, hosts, tree_id,
+  root, pid, claimed_at}`. Stale claims (owner gone) are swept as they are met,
+  so a crashed daemon leaves nothing behind for the next one to trip over.
   """
   def list do
     case ports_dir() do
@@ -136,11 +162,23 @@ defmodule BeamLisp.Daemon.Ports do
     Enum.find(list(), fn c -> c.port == port end)
   end
 
+  @doc """
+  The live claim answering to `host`, or nil. The match is on the claim's own
+  host list, lowercased — `Host:` headers arrive in whatever case the client
+  wrote, and DNS is case-insensitive.
+  """
+  def holder_of_host(host) when is_binary(host) do
+    wanted = host |> String.downcase() |> String.trim()
+
+    Enum.find(list(), fn c -> wanted in Map.get(c, :hosts, []) end)
+  end
+
   # --- internals ---
 
   defp ports_dir do
     with {:ok, base} <- Paths.runtime_dir() do
       dir = Path.join(base, "ports")
+
 
       case File.mkdir_p(dir) do
         :ok ->
@@ -232,11 +270,12 @@ defmodule BeamLisp.Daemon.Ports do
 
   # The shape a claim must have, matched rather than asserted: a file that
   # carries anything else (an older format, a truncated write, a struct) is
-  # `:error`, which the caller treats as "not a claim" and sweeps.
+  # `:error`, which the caller treats as "not a claim" and sweeps. A claim
+  # written before hosts existed simply has none.
   defp read_claim(path) do
     with {:ok, bin} <- File.read(path),
          {:ok, %{name: _, port: _, pid: _} = claim} <- safe_binary_to_term(bin) do
-      {:ok, claim}
+      {:ok, Map.put(claim, :hosts, Map.get(claim, :hosts) || [])}
     else
       _ -> :error
     end
@@ -248,15 +287,26 @@ defmodule BeamLisp.Daemon.Ports do
     _ -> :error
   end
 
-  # Liveness of the claiming process. Our own OS pid is checked in-VM; a foreign
-  # one is checked through /proc (the runtime dir, the socket, the whole daemon
-  # story is Unix-shaped already). Where /proc is absent, a claim is respected
-  # rather than swept: refusing a port is recoverable, stealing one is not.
-  defp alive?(%{pid: pid}) when is_integer(pid) do
+  # A claim's owner: the same question `alive_pid?/1` answers for the gateway's
+  # own endpoint file, asked once. A claim always carries a pid, so there is one
+  # clause and no fallback to keep in step with it.
+  defp alive?(claim), do: alive_pid?(Map.get(claim, :pid))
+
+  @doc """
+  Whether the OS process `pid` is alive. Every endpoint that outlives the VM
+  that wrote it needs this answer — a port claim, the gateway's own endpoint —
+  because "the file is there" stops being true the moment its owner dies, and a
+  stale endpoint is never authority.
+
+  Our own pid is checked in-VM. A foreign one goes through `/proc` (the runtime
+  dir, the socket, the daemon: this story is Unix-shaped already). Where `/proc`
+  is absent a claim is RESPECTED rather than swept — refusing a port is
+  recoverable, stealing one is not.
+  """
+  def alive_pid?(pid) when is_integer(pid) do
     if pid == List.to_integer(:os.getpid()) do
       true
     else
-      # a FOREIGN owner: /proc is how a Unix tells whether a pid still exists
       case File.dir?("/proc") do
         true -> File.dir?("/proc/#{pid}")
         false -> true
@@ -264,5 +314,5 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  defp alive?(_), do: false
+  def alive_pid?(_other), do: false
 end

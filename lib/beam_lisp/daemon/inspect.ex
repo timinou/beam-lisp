@@ -76,17 +76,31 @@ defmodule BeamLisp.Daemon.Inspect do
 
   defp ports do
     Enum.map(Ports.list(), fn p ->
+      # The claim carries the names it answers to, so the model reads them
+      # rather than deriving anything: one place decides what a port is
+      # CALLED, and it is the process that holds the port.
+      hosts = Map.get(p, :hosts, [])
+
       %{
         name: p.name,
         port: p.port,
+        hosts: hosts,
         root: p.root,
         tree_id: p.tree_id,
         pid: p.pid,
-        url: "http://127.0.0.1:#{p.port}/",
+        url: named_url(hosts, p.port),
+        loopback: "http://127.0.0.1:#{p.port}/",
         claimed_at: p.claimed_at
       }
     end)
   end
+
+  # The address a human keeps, and — when a port has no name — the address
+  # that is always true. The port rule itself lives in `Gateway.url/1`: an
+  # address that omits the port nothing is listening on looks clickable and
+  # answers `connection refused`.
+  defp named_url([host | _], _port), do: BeamLisp.Daemon.Gateway.url(host)
+  defp named_url([], port), do: "http://127.0.0.1:#{port}/"
 
   defp tasks(root) do
     project = project(root)
@@ -196,7 +210,7 @@ defmodule BeamLisp.Daemon.Inspect do
 
   defp render_ports(ports) do
     Enum.map_join(ports, "\n", fn p ->
-      "  port          #{p.name} = #{p.port}  (#{Path.basename(p.root)}, pid #{p.pid})"
+      "  port          #{p.name} = #{p.url}  → #{p.port}  (#{Path.basename(p.root)}, pid #{p.pid})"
     end) <> ports_urls(ports)
   end
 
