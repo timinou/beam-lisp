@@ -44,6 +44,86 @@
   [port]
   (BeamLisp.Z3Port/alive? port))
 
+; ── conversations: push/pop, assumptions, unsat cores ────────────────────
+;
+; `z3/check` is ONE conversation in one call (reset, assert, check). A solver
+; also has state ACROSS calls, and that state must belong to one caller: these
+; verbs therefore require the lease taken by `with-solver`, and the solver
+; process refuses them for anyone else rather than letting two conversations
+; interleave in one z3 context.
+;
+; Nothing here is new machinery: `(push 1)` / `(pop 1)` / `(check-sat-assuming
+; …)` / `(get-unsat-core)` are z3's own verbs, reached through the acknowledge
+; protocol in BeamLisp.Z3Port (`(echo …)` as the sync marker).
+
+(defn with-solver
+  "Run `f` holding the solver for a WHOLE conversation — assert once, scope with
+   push/pop, check several times, read an unsat core. The lease is released in a
+   finally, and by monitor if this process is killed, so a crashed borrower never
+   strands the solver.
+
+   A running pool is preferred (`z3/pool!`): `f` then runs on a leased pool member
+   and the verbs below use it without being told — the process-local current
+   solver is set for the duration, so a conversation reads the same whether it is
+   on the singleton or on one of N."
+  [f]
+  (if (BeamLisp.Z3.Pool/up?)
+    (BeamLisp.Z3.Pool/with_solver
+      (fn [name]
+        (erlang/put :z3-current name)
+        (try (f) (finally (erlang/put :z3-current nil)))))
+    (do (erlang/put :z3-current nil)
+        (try (BeamLisp.Z3.Solver/with_lease f)
+             (finally (erlang/put :z3-current nil))))))
+
+(defn- current
+  "The solver this conversation is using: a pool instance's name, or nil for the
+   singleton. Set by with-solver and read by the verbs, so no verb needs a handle
+   — a conversation reads the same on the singleton or on one of N."
+  []
+  (erlang/get :z3-current))
+
+(defn command
+  "Send SMT-LIB into the open conversation and wait for z3 to acknowledge it.
+   → {:ok true} | {:ok false :error line}. Forms are rendered; a raw string passes
+   through verbatim."
+  [cmds]
+  (BeamLisp.Z3.Solver/command (current) (render cmds)))
+
+(defn assert!
+  "Assert FORMS into the open conversation (no reset — that is the point)."
+  [cmds]
+  (command (map (fn [c] (list 'assert c)) cmds)))
+
+(defn push [] (command "(push 1)"))
+(defn pop [] (command "(pop 1)"))
+
+(defn check-here
+  "check-sat over whatever the conversation has asserted so far."
+  []
+  (:status (BeamLisp.Z3.Solver/check_here (current) {})))
+
+(defn check-model-here
+  "check-sat over the conversation's state, with the model on sat."
+  []
+  (let [r (BeamLisp.Z3.Solver/check_here_model (current))]
+    {:status (:status r) :model (:model r)}))
+
+(defn check-assuming
+  "check-sat-assuming LITERALS (strings like \"g0\" or \"(not g0)\") over the
+   conversation's state."
+  [literals]
+  (let [r (BeamLisp.Z3.Solver/check_assume (current) (to-list literals))]
+    {:status (:status r) :core (:core r)}))
+
+(defn check-core
+  "check-sat over the conversation's state, returning the UNSAT CORE — which
+   named assertions are jointly responsible. The script must name its assertions
+   (`(assert (! p :named g))`) and set :produce-unsat-cores."
+  []
+  (let [r (BeamLisp.Z3.Solver/check_core (current))]
+    {:status (:status r) :core (:core r)}))
+
 ; `cmds` is a SEQ OF FORMS — the only shape a caller should build. A bare
 ; string still passes through verbatim (the escape hatch for raw SMT-LIB,
 ; used by tests and by callers mid-migration), so the port edge is total.
@@ -51,14 +131,35 @@
   (if (string? cmds) cmds (smt/script cmds)))
 
 (defn check
-  "Reset + assert + check-sat over form COMMANDS. → \"sat\" | \"unsat\" | \"unknown\"."
+  "Reset, assert COMMANDS, check-sat. → \"sat\" | \"unsat\" | \"unknown\" | \"error\".
+
+   When a pool is running the conversation is leased from it (`z3/pool!`), so the
+   same call site is served by N solvers instead of one; when no pool is up this
+   is the singleton, exactly as before. The pool is started deliberately, so this
+   is opt-in and nothing changes until someone starts one."
   [port cmds]
-  (:status (BeamLisp.Z3Port/check port (render cmds) false)))
+  (:status
+    (if (BeamLisp.Z3.Pool/up?)
+      (BeamLisp.Z3.Pool/check_one (render cmds) false)
+      (BeamLisp.Z3Port/check port (render cmds) false))))
+
+(defn pool!
+  "Start N solvers and serve `check` from them (idempotent). Returns the pool size."
+  [n]
+  (BeamLisp.Z3.Pool/start n)
+  (BeamLisp.Z3.Pool/size))
+
+(defn pool-size [] (if (BeamLisp.Z3.Pool/up?) (BeamLisp.Z3.Pool/size) 0))
+(defn pool-stop! [] (BeamLisp.Z3.Pool/stop))
+(defn pool-stats [] (BeamLisp.Z3.Pool/stats))
 
 (defn check-model
   "check + (get-model) on sat, over form COMMANDS. → {:status s :model text-or-nil}."
   [port cmds]
-  (BeamLisp.Z3Port/check port (render cmds) true))
+  (if (BeamLisp.Z3.Pool/up?)
+    (let [r (BeamLisp.Z3.Pool/check_one (render cmds) true)]
+      {:status (:status r) :model (:model r)})
+    (BeamLisp.Z3Port/check port (render cmds) true)))
 
 (defn- render-term [t]
   "A term is a FORM (rendered) or a legacy raw SMT-LIB string (verbatim).

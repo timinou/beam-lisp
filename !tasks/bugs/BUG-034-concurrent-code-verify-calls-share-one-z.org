@@ -1,0 +1,112 @@
+#+TITLE: concurrent code/verify calls share one z3 port and corrupt each other
+#+STATE: DOING
+#+SESSION_ID: 157bcd97046112e7
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-11T19-45-37-298Z_157bcd97046112e7.jsonl]]
+#+CUSTOM_ID: BUG-034-concurrent-code-verify-calls-share-one-z
+
+* Initial Message
+
+please check BUG-031 again and explain its latest status to me
+
+* Measured, before any fix
+
+```
+sequential  1000 code/verify over HTTP (POST /mcp)   0 failures   (29.4 s)
+concurrent  1000 code/verify over HTTP, 4 threads     15 failures  (30.2 s)
+in-process  8 concurrent code/verify                  1 of 8 answered
+```
+
+The daemon's stderr for the failures named the truth, which the client never saw
+because `call-tool` masks it (FUP-047):
+
+```
+tool handler error: %RuntimeError{message: "z3 timeout (acc: \"\")"}
+tool handler error: %ArgumentError{message: "argument error"}
+```
+
+* Mechanism (visible in the code, not inferred)
+
+`Z3Port.read_answer/2` receives `{port, {:data, …}}` — IN THE CALLER'S MAILBOX.
+A port is therefore a single-writer resource, and `Z3Port.open/0` gave every
+caller its own writer, while `mcp.tools/port!` memoized ONE port per VM and shared
+it with everyone. Two callers' commands interleave in one z3 stream and each read
+eats the other's lines; `acc: ""` in the timeout is the reader that never got its
+own answer. Sequential use was always fine — which is why this hid for so long.
+
+* Fix — 9d6cd69
+
+`BeamLisp.Z3.Solver`: the VM's one z3 process, and the one process that talks to
+it. Owns the port, serializes every conversation ((reset) → assertions →
+(check-sat) → (get-model)), started on demand and NOT linked (outlives the request
+that first needed it, dies with the VM), reopens a dead port inside the callback,
+and re-raises a solver failure in the caller with its original class/reason/stack.
+`Z3Port.check/3` serializes; the protocol moved to `raw_check/3`, run only by the
+owner; `Z3Port.open/0` returns the owner's port (also stopping the one-z3-per-
+caller leak for callers that did not memoize).
+
+* Verified
+
+- 8 concurrent identical checks → 8 × "sat" (isolated, on the built beams).
+- the interleaved detector — each caller asks a DIFFERENT question, which is the
+  case that desynced — →
+  `[{1,"sat"},{2,"unsat"},{3,"sat"},{4,"unsat"},{5,"sat"},{6,"unsat"},{7,"sat"},{8,"unsat"}]`,
+  match: true.
+
+* NOT verified yet (blocked)
+
+`test/bl/system/z3_concurrent_test.bl` (8 concurrent `code/verify` through the tool
+path) and the HTTP soak were not re-run after the fix: `mix compile` cannot finish
+while another session's `priv/lib/mcp/*.bl` and `priv/std/bl/mcp.bl.md` are
+mid-write (`unterminated collection`). The test file is committed with its PRE-fix
+observation (4 passed / 2 failed, 1 of 8 answered).
+
+First thing when the tree is quiet:
+
+```
+mix bl test test/bl/system/z3_concurrent_test.bl     # expect 6 passed
+mix bl.build && bl daemon start
+python3 <the 4-thread soak>                          # expect 0 failures in 1000
+```
+
+* Next, if more is wanted (not needed for correctness)
+
+The solver process is the unit a pool is built from: N solver processes under a
+supervisor, checked out per conversation. That buys throughput AND z3's
+incremental features (push/pop, assumptions, unsat cores) that a reset-per-query
+API cannot express. Serialization costs nothing today: a `code/verify` is ~29 ms.
+
+NOTE [2026-09-12]: CORRECTION — the "1 of 8 answered" figure was MY INSTRUMENT, not the code.
+
+The first in-process repro collected results into one atom with
+`(reset! out (conj @out …))` — a read-modify-write — so concurrent writers LOST
+updates. Monitors showed the workers exiting `:normal`, i.e. they had finished;
+only the bookkeeping dropped them. A sound instrument (each worker `erlang/send`s
+to the parent, which drains) reveals the real symptom, which is worse than
+silence: WRONG VERDICTS.
+
+Measured on the SHIPPED runtime (drop payload 03cd2b3d), with the committed test
+file test/bl/system/z3_concurrent_test.bl — 4 workers × 25 rounds × 2 questions,
+one provable machine and one broken one, so a desync shows as a wrong verdict:
+
+```
+pristine runtime (no fix):  98 wrong verdicts in 200
+                            bl test → 2 passed, 1 failed, actual: 98
++ Elixir.BeamLisp.Z3Port + Elixir.BeamLisp.Z3.Solver swapped in:
+                             0 wrong verdicts in 200
+                            bl test → 3 passed, all green
+```
+
+Both runs on the SAME runtime tree, one variable. The dev tree could not compile
+(another session's in-flight `priv/lib/mcp/*.bl` and `daemon/gateway.ex`), so the
+pair was measured against the drop's own runtime through
+`bin/bl eval 'BeamLisp.Ns.Bl.Cli.main(["test", …])'` — the real `bl test` verb on
+the real payload, with only two .beam files swapped.
+
+The HTTP soak evidence is unaffected and stands: it collected real responses
+(no shared state) — 1000 sequential → 0 failures, 1000 with 4 threads → 15
+failures, with `z3 timeout (acc: "")` and `argument error` in the daemon's
+stderr.
+
+Still outstanding: `./bl` at the repo root is the 03cd2b3d build, which does NOT
+contain the fix (measured: 98/200 above). It needs a rebuild once the tree
+compiles.

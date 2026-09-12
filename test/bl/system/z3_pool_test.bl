@@ -1,0 +1,104 @@
+; test/bl/system/z3_pool_test.bl — N solvers, one conversation each.
+;
+; One z3 process is one conversation, so a server answering several clients at
+; once wants more than one. The pool is a Supervisor over named solver instances
+; plus a lease server that tracks WHO holds WHAT (never pids: instances are named,
+; so a restart is invisible to it).
+;
+; What this file pins, in order of how much it would hurt to lose:
+;   1. correctness under concurrency WITH the pool in use — the same mixed-question
+;      soak as z3_concurrent_test.bl, but through the pool, because that is the
+;      configuration a served `code/verify` actually runs in;
+;   2. the lease bound: never more than N conversations at once (high_water);
+;   3. healing: kill a solver, the supervisor replaces it, the pool never hands
+;      out a corpse, and the next verify answers.
+
+(ns mcp.z3.pool.test
+  (:require [z3]
+            [mcp.tools :as tools]))
+
+(def good
+  "(defserver ^{:invariant (>= balance 0)} account
+     (init [balance] (ok balance))
+     (handle-call [:withdraw amt] [_ balance] :when (and (>= amt 0) (>= balance amt))
+       (reply :ok (- balance amt))))")
+
+(def buggy
+  "(defserver ^{:invariant (>= balance 0)} account
+     (init [balance] (ok balance))
+     (handle-call [:withdraw amt] [_ balance] (reply :ok (- balance amt))))")
+
+(defn- until [pred]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n 5000) false
+      :else (do (Process/sleep 10) (recur (inc n))))))
+
+(deftest a-pool-serves-concurrent-verifies-without-corruption
+  (is (= 3 (z3/pool! 3)) "three solvers")
+  (is (= 3 (z3/pool-size)))
+  (let [g good
+        b buggy
+        parent (erlang/self)
+        verdict (fn [src] (get (tools/code-verify-handler {"source" src}) :verdict))
+        worker (fn [i]
+                 (loop [n 0 bad 0]
+                   (if (= n 12)
+                     (erlang/send parent [:done i bad])
+                     (let [h (try (verdict g) (catch e (str "ERR " (pr-str e))))
+                           v (try (verdict b) (catch e (str "ERR " (pr-str e))))]
+                       (recur (inc n)
+                              (+ bad (if (= h "holds") 0 1) (if (= v "violated") 0 1)))))))
+        collect (fn [want]
+                  (loop [acc [] k 0]
+                    (if (> k want)
+                      acc
+                      (let [m (receive [:done i bad] [i bad] (after 180000 :timeout))]
+                        (if (= m :timeout) acc (recur (conj acc m) (inc k)))))))
+        pids (vec (map (fn [i] (erlang/spawn (fn [] (worker i)))) (to-list [0 1 2 3 4 5])))
+        got (vec (collect 6))
+        stats (z3/pool-stats)]
+    (is (= 6 (count pids)) "six verifies at once")
+    (is (= 6 (count got))
+        (str "every worker reported (0 reports means the INSTRUMENT lost them): " (pr-str got)))
+    (is (= 0 (reduce (fn [a p] (+ a (get p 1))) 0 got))
+        (str "no verdict was anyone else's — mismatches per worker: " (pr-str got)))
+    (is (= 3 (:n stats)) "the pool reports its size")
+    (is (<= (:high_water stats) 3)
+        (str "never more than N conversations at once: " (pr-str stats))))
+  (is (= :ok (z3/pool-stop!)) "and the pool stops"))
+
+(deftest a-killed-solver-is-replaced-not-handed-out
+  (is (= 2 (z3/pool! 2)))
+  (let [names (BeamLisp.Z3.Pool/instances)
+        victim (first names)
+        pid (Process/whereis victim)]
+    (is (= 2 (count names)))
+    (erlang/exit pid :kill)
+    (is (until (fn [] (let [now (Process/whereis victim)]
+                        (and (not (nil? now)) (not= now pid)))))
+        "the supervisor restarted the killed solver under the same name")
+    ;; The pool skips a name whose solver is coming back, so the very next
+    ;; conversation lands on a live one and answers.
+    (is (= "sat" (z3/check nil "(assert true)"))
+        "and a verify through the pool still answers"))
+  (is (= :ok (z3/pool-stop!)))
+  (is (= 0 (z3/pool-size)) "with the pool stopped, the singleton path is what remains"))
+
+(deftest a-conversation-uses-the-leased-instance
+  ; The point of the pool: a conversation is exclusive on ONE solver, and the
+  ; verbs find it without being handed a handle.
+  (is (= 2 (z3/pool! 2)))
+  (let [answers (z3/with-solver
+                  (fn []
+                    (z3/command "(declare-const z Int)")
+                    (z3/command "(assert (> z 5))")
+                    (z3/push)
+                    (z3/command "(assert (< z 2))")
+                    (let [scoped (z3/check-here)]
+                      (z3/pop)
+                      [scoped (z3/check-here)])))]
+    (is (= ["unsat" "sat"] answers)
+        "a scoped contradiction inside the conversation, gone after pop"))
+  (is (= :ok (z3/pool-stop!))))
