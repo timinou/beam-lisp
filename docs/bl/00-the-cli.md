@@ -468,8 +468,15 @@ See [04-editors-and-agents.md](04-editors-and-agents.md).
 
 Serve the codebase as a fact database over the Model Context Protocol on
 stdin/stdout, one JSON object per line. The tools are `code/list`, `code/query`,
-`code/ask`, `code/verify`, `code/subscribe` and `code/poll`. See
+`code/ask`, `code/verify`, `code/subscribe` and `code/poll`; the resources are
+`code://beam-lisp/schema` and `code://beam-lisp/namespaces`. See
 [04-editors-and-agents.md](04-editors-and-agents.md).
+
+Starting the server mounts the codebase it serves — `codebase.bl` and
+`typed.bl`, resolved through the load path (the priv tiers ship them) rather
+than the working directory — so `bl mcp` answers the same facts from anywhere,
+with no checkout, arguments or `--path` needed. The mount is paid once, at
+startup (a few seconds); every request after that reads the conn it built.
 
 ### doctor · version · help
 

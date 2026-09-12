@@ -127,7 +127,17 @@ Answers are rows:
 ```
 
 The mounted codebase is beam-lisp indexing itself — the code-as-facts engine
-(`codebase.bl` + `typed.bl`) served back as facts.
+(`codebase.bl` + `typed.bl`) served back as facts. Those two sources are
+resolved through the load path, not the working directory, so a client that
+starts `bl mcp` anywhere gets the same facts; the mount is paid once at startup
+and reused by every request.
+
+Two resources accompany the tools:
+
+| resource | answers |
+|---|---|
+| `code://beam-lisp/schema` | the fact schema: the `fn` and `call` attributes |
+| `code://beam-lisp/namespaces` | the namespaces currently mounted |
 
 ## `--json`, the third surface
 
