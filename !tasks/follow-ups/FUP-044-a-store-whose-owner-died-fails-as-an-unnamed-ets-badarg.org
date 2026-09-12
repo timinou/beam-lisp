@@ -1,0 +1,125 @@
+#+TITLE: A store whose owner died fails as an unnamed :ets badarg, deep in the engine
+#+STATE: ITEM
+#+CUSTOM_ID: FUP-044-a-store-whose-owner-died-fails-as-an-unnamed-ets-badarg
+
+* Symptom
+
+Use a store handle after the process that opened it has exited and the read
+dies like this — no store, no table, no owner, no cause:
+
+#+begin_example
+** (ArgumentError) errors were found at the given arguments:
+  * 1st argument: the table identifier does not refer to an existing ETS table
+    (stdlib 8.0) :ets.lookup(#Reference<0.1322680335.436600834.5619>, <<2, 80, 97, 99, ...>>)
+    (beam_lisp 0.1.0) priv/lib/datom/store-ets.bl:147: start-key/2
+    (beam_lisp 0.1.0) priv/lib/datom/store.bl:142: scan-via-range/3
+    (beam_lisp 0.1.0) priv/lib/datom/db.bl:162: datoms__bl_v/3
+    (beam_lisp 0.1.0) priv/lib/datom/query/engine.bl:490: pattern-scan-once/4
+#+end_example
+
+It reads like a corrupt database. It is a memo that outlived its owner.
+
+Minimal reproduction, no app, no server (drop payload = 39f4ac06). A connection
+opened inside a process that then EXITS, read afterwards by its parent:
+
+#+begin_src beam-lisp
+(ns probe (:require [datom]))
+
+(def memo (atom nil))
+(def child (spawn (fn [] (reset! memo (datom/connect [])))))
+(loop [] (when (Process/alive? child) (recur)))
+
+(println "alive?" (datom/alive? @memo))                       ; → false   ✓ it KNOWS
+(println "rows:" (count (datom/q '[:find ?e :where [?e :db/ident _]] (datom/db @memo))))
+#+end_src
+
+#+begin_example
+control  alive? true
+control  rows: 0
+child exited; memoized conn alive? false
+memoized READ RAISED: argument error          ← the whole message
+#+end_example
+
+The control (a connection opened in the long-lived process) reads fine, so the
+only variable is ownership — which is documented and intended:
+`datom.store-ets/open` says "ownership stays with the creating process, so the
+table dies when that process does".
+
+* Why this is a defect and not user error
+
+The check exists, is named after this exact case, and is not consulted:
+
+#+begin_src beam-lisp
+(defprotocol Alive?
+  "A substrate resource whose handle can outlive what it names."
+  (-alive? [resource]
+    "Is `resource` still backed by what it names? Must answer for a dead
+     handle rather than raising — that case is the reason it exists."))
+#+end_src
+
+`datom/alive?`'s own doc names the audience: "A caller that MEMOIZES a
+connection across processes must ask this before reusing it (`mcp.tools` mounts
+the codebase once, and the daemon outlives the worker that paid for the mount)."
+Three tiers read the store, and only one of them asks:
+
+| site | asks? | result |
+|---|---|---|
+| `mcp.tools/conn` (tools.bl:115) | yes — alive? → `release!` → re-mount → compare-and-set | correct |
+| `daemon/http.ex mcp_state` (http.ex:335) | no — `:persistent_term` memo, never re-validated | `FUP-045`: discover/resources/prompts break permanently |
+| `live.app` screens | no — and the framework renders every request in a FRESH process, so anything a screen opens is owned by a process that dies at the end of that render | the reproduction below |
+
+* Reproduction in a shipped tier: `bl serve` + a screen that opens a store
+
+`live.app` renders each HTTP request in its own process; the store a render
+opens belongs to that process. Measured on a probe screen in a real console
+(render-pid vs the ETS owner of the store the render created, one line per
+request):
+
+#+begin_example
+request 1 → 200   render-pid=<0.975.0> bank-owner=<0.975.0> bank-alive=true
+request 2 → 500
+request 3 → 500
+#+end_example
+
+The owner IS the render process, every request gets a new one, and the memo
+behind it hands the same dead handle back forever — the page never recovers.
+A store opened at boot, by contrast, is owned by the boot process (alive) and
+keeps serving, which is what makes the failure look page-specific rather than
+systemic.
+
+Two tiers invite this by construction:
+
+1. **`live.app`** hands screens an app value carrying live conns
+   (`:shared-conn`, `:worlds`, `:observe`) — the shape says "these are the app's
+   long-lived resources" — while the *render* process is ephemeral. Nothing
+   warns that a store opened during a render is already doomed, and nothing
+   reports it when it dies.
+2. **The store port** answers a dead handle with `badarg` even though
+   `Alive?` exists precisely to answer for one, and `datom.store/scan-datoms`
+   (store.bl:147) is the single entry every query path funnels through — the
+   one place the check would cost one `:ets.info`.
+
+* Fix sketch
+
+1. **Name the failure at the seam.** `scan-datoms` / `-range` / `-get` should
+   refuse a handle whose resource is not alive, with a named error that says
+   what happened: "this store's table is gone — it was opened by <pid>, which
+   exited (`Alive?`)". One guard where every read passes; the cost is one
+   `:ets.info` per scan, or zero if hoisted to `datom/db`.
+2. **Make the tiers that memoise ask.** `daemon/http.ex` (`FUP-045`) and
+   `live.app` should use the `mcp.tools/conn` idiom they already have a model
+   for: alive? → rebuild → compare-and-set.
+3. **Give `live.app` a resource story.** Either take the app value's resources
+   under a supervised process (so a render cannot own them), or let an app
+   DECLARE how to rebuild them (`:resources {:bank (fn [] …)}`) and revalidate
+   per render, or — the minimum — have the framework check `alive?` on the
+   resources it already knows about (`:shared-conn`, `:worlds`) and fail loudly
+   with the named error above instead of a bare 500.
+
+* Acceptance
+
+- A read through a dead handle raises an error naming the resource and the fact
+  that its owner exited; no `:ets` internals in the message.
+- A `live.app` screen that opens a store during a render either keeps working,
+  or fails loudly once with that error — never a session of silent 500s.
+- `bl daemon`'s MCP state survives its worker restarting (`FUP-045`).
