@@ -1,0 +1,226 @@
+; z3pool.bl — the oracle bundle: z3 as a supervised, leasable, invariant-checked
+; resource, in the same vocabulary as everything else.
+;
+; The engine division says z3 owns provability. What this file adds is that the
+; solver is not a special case in the runtime: it is a defserver (one z3 process,
+; one conversation at a time), it lives under a defsupervisor (N of them, healed
+; by OTP), it is handed out by a lease registry whose invariant is written down,
+; and a checkout waits under a bound (fence) instead of blocking forever.
+;
+; WHY THERE IS NO LOCK HERE. A z3 port's replies are delivered to the mailbox of
+; the process that OWNS it (`BeamLisp.Z3Port` is pure functions over a port, not a
+; process). `z3-solver` owns its port, so every conversation it is asked to run
+; executes in that one process, and a gen_server answers one call at a time —
+; structural mutual exclusion, no mutex, no owner bookkeeping, nothing to get
+; wrong. The Elixir tier keeps exactly one job: open the port and speak SMT-LIB
+; over it (`lib/beam_lisp/z3_port.ex`), the way `BeamLisp.Supervisor` is the
+; primitive that `defsupervisor` expands into.
+;
+;   (z3pool/pool!)                       ; start the tree: leases + 4 solvers
+;   (z3pool/check smt false)             ; a one-shot conversation
+;   (z3pool/with-solver (fn [s]          ; a conversation across calls
+;                         (z3pool/command s "(assert (> x 0))")
+;                         (z3pool/check-here s)))
+;
+; The lease is returned in a `finally` AND by monitor if the borrower dies, a
+; killed solver is restarted by OTP under the same child id, and the registry
+; never hands out a pid that is not alive.
+
+(ns z3pool
+  (:require [super :as super]))
+
+(def n-solvers
+  "How many z3 processes this tree runs. The size is DATA in the form below, the
+   way `(pool worker 4)` is — starting a second pool with a different size is a
+   different tree, not a runtime knob."
+  4)
+
+;; ── one z3 process, as a server ──────────────────────────────────────────
+
+(defserver z3-solver
+  (init [i] (ok {:i i :port (BeamLisp.Z3Port/open)}))
+
+  ;; A whole conversation in one call: reset, assert, check-sat.
+  (handle-call [:check smt model?] [_from st]
+    (reply (BeamLisp.Z3Port/raw_check (:port st) smt model?) st))
+
+  ;; Conversations that span calls. Only the owner of the port can run these,
+  ;; which is what makes the lease load-bearing rather than decorative.
+  (handle-call [:command smt] [_from st]
+    (reply (BeamLisp.Z3Port/raw_command (:port st) smt) st))
+
+  (handle-call [:check-here assume core? model?] [_from st]
+    (reply (BeamLisp.Z3Port/raw_check_here3 (:port st) assume core? model?) st))
+
+  (handle-call [:reset] [_from st]
+    (reply (BeamLisp.Z3Port/raw_command (:port st) "(reset)") st))
+
+  (handle-call [:alive?] [_from st]
+    (reply (BeamLisp.Z3Port/alive? (:port st)) st))
+
+  (handle-info _msg [st] (noreply st)))
+
+;; ── the lease registry: who holds which solver ───────────────────────────
+;;
+;; State is deliberately flat: `leases` is what the invariant below is about, and
+;; the verify dialect wants a bare field, not an accessor call (an accessor
+;; silently fails to prove — a lesson from PLAN-085).
+
+(defn- pool-children
+  "The pool's SOLVER children — every child that is not the lease server. Selected
+   by child ID, not by comparing pids: a pid comparison against `(erlang/self)`
+   silently depends on who calls (it excluded the registry only from inside the
+   registry, and reported five solvers everywhere else — measured). Resolved fresh
+   on every checkout, so a restarted child is found by its new pid and a dead one
+   is skipped."
+  [sup-name]
+  (let [sup (Process/whereis sup-name)]
+    (if (nil? sup)
+      (to-list [])
+      (vec (filter (fn [c] (and (not= (:id c) :leases) (Process/alive? (:pid c))))
+                   (super/children sup))))))
+
+(defn- free-solver [st]
+  (let [taken (vals (:leases st))]
+    (first (filter (fn [c] (not (some (fn [p] (= p (:pid c))) taken)))
+                   (pool-children (:sup st))))))
+
+(defn- release
+  "Drop a lease and its monitor. Called by checkin and by :DOWN alike."
+  [st lease]
+  (let [monref (first (filter (fn [kv] (= (val kv) lease)) (:mon st)))]
+    (when (not (nil? monref))
+      (Process/demonitor (key monref) (list :flush)))
+    {:sup (:sup st)
+     :leases (dissoc (:leases st) lease)
+     :mon (if (nil? monref) (:mon st) (dissoc (:mon st) (key monref)))
+     :high-water (:high-water st)}))
+
+(defserver z3-leases
+  ;; The invariant, in the language, checked by the same verifier the pool serves.
+  ;; Shape per examples/guards.bl: a binding over the state's bare fields — the
+  ;; verify dialect proves bare fields, and an accessor call silently fails.
+  (invariant [leases] (<= (count leases) 4))
+
+  (init [sup] (ok {:sup sup :leases {} :mon {} :high-water 0}))
+
+  (handle-call [:checkout who] [_from st]
+    (let [c (free-solver st)]
+      (if (nil? c)
+        (reply nil st)
+        (let [lease (erlang/make_ref)]
+          (reply {:solver (:pid c) :lease lease}
+                 {:sup (:sup st)
+                  :leases (assoc (:leases st) lease (:pid c))
+                  :mon (assoc (:mon st) (Process/monitor who) lease)
+                  :high-water (max (:high-water st) (inc (count (:leases st))))})))))
+
+  (handle-call [:checkin lease] [_from st]
+    (reply :ok (release st lease)))
+
+  (handle-call [:high-water] [_from st] (reply (:high-water st) st))
+  (handle-call [:busy] [_from st] (reply (count (:leases st)) st))
+
+  ;; A borrower that dies returns its solver: `finally` cannot run in a process
+  ;; that was killed, so the registry watches instead.
+  (handle-info [:DOWN ref :process _pid _reason] [st]
+    (let [lease (get (:mon st) ref)]
+      (noreply (if (nil? lease) st (release st lease))))))
+
+;; ── the tree ─────────────────────────────────────────────────────────────
+
+(super/defsupervisor z3-pool
+  (strategy :one-for-one)
+  (intensity 5 5000)
+  ;; the registry is NAMED, which is how the prelude verbs address it
+  (child :leases z3-leases :z3-pool)
+  (child :s0 z3-solver 0)
+  (child :s1 z3-solver 1)
+  (child :s2 z3-solver 2)
+  (child :s3 z3-solver 3))
+
+(defn up? [] (not (nil? (Process/whereis :z3-pool))))
+
+(defn registry
+  "The lease server, looked up through the tree each time. Asked afresh so a child
+   that OTP has restarted is found by its NEW pid — the reason the tree carries the
+   name and its children do not."
+  []
+  (if (up?)
+    (super/child-of (Process/whereis :z3-pool) :leases)
+    nil))
+
+(defn pool!
+  "Start the tree (idempotent). Returns the number of solvers."
+  []
+  (when (not (up?))
+    (let [pid (start-link z3-pool)]
+      ;; the tree itself is unregistered; give it the name its children look for
+      (Process/register pid :z3-pool)))
+  n-solvers)
+
+(defn ensure! [] (if (up?) n-solvers (pool!)))
+(defn pool-size [] (if (up?) n-solvers 0))
+(defn pool-stop! [] (when (up?) (stop :z3-pool)) :ok)
+
+(defn high-water
+  "The most conversations that were in flight at once — the number that says
+   whether N is right."
+  []
+  (if (up?) (call (registry) [:high-water]) -1))
+
+(defn busy [] (if (up?) (call (registry) [:busy]) -1))
+
+(defn solvers
+  "The solver pids in the tree, as `super/children` reports them — the same view
+   an operator gets from the supervisor bundle."
+  [] (if (up?) (map (fn [c] (:pid c)) (pool-children :z3-pool)) (to-list [])))
+
+;; ── leasing, bounded by a fence ──────────────────────────────────────────
+
+(defn with-solver
+  "Run `f` holding ONE solver for a whole conversation, waiting at most `ms` for
+   one to come free. The lease is returned in a finally; a killed borrower is
+   released by the registry's monitor. Raises when the bound expires — a value
+   the caller can also get with `try-checkout`."
+  ([f] (with-solver 30000 f))
+  ([ms f]
+   (ensure!)
+   (let [deadline (+ (erlang/monotonic_time :millisecond) ms)]
+     (loop []
+       (let [got (call (registry) [:checkout (erlang/self)])]
+         (cond
+           (not (nil? got))
+           (let [solver (:solver got)]
+             (try
+               (erlang/put :z3-current solver)
+               ;; A leased solver starts from a CLEAN context. Without this, a
+               ;; conversation inherits the previous borrower's assertions —
+               ;; measured as an inexplicable `unsat` in an unrelated test.
+               (call solver [:reset])
+               (f)
+               (finally
+                 (erlang/put :z3-current nil)
+                 (call (registry) [:checkin (:lease got)]))))
+
+           (< (erlang/monotonic_time :millisecond) deadline)
+           (do (Process/sleep 5) (recur))
+
+           :else
+           (throw (str "no z3 solver free within " ms "ms (pool of " n-solvers ")"))))))))
+
+(defn current
+  "The solver this conversation holds — set by with-solver, read by the verbs."
+  [] (erlang/get :z3-current))
+
+;; ── the verbs a conversation is made of ──────────────────────────────────
+
+(defn check
+  "One-shot conversation: reset, assert, check-sat, return the status."
+  [smt model?]
+  (with-solver (fn [] (:status (call (current) [:check smt model?])))))
+
+(defn command [smt] (call (current) [:command smt]))
+(defn check-here
+  ([] (check-here (to-list []) false false))
+  ([assume core? model?] (call (current) [:check-here assume core? model?])))

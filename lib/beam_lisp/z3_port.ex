@@ -22,18 +22,24 @@ defmodule BeamLisp.Z3Port do
   @marker "~~bl-ok~~"
 
   @doc """
-  The VM's z3 process, started on demand.
+  Start z3 and return its port.
 
-  This returns the port owned by `BeamLisp.Z3.Solver` — the one process that
-  drives it. It is a HANDLE: every command must go through `check/3`, because a
-  port's replies are delivered to its owner's mailbox, not to whoever writes to
-  it. Opening your own port here (as this function used to) is what let two
-  callers share one stream and desync; it also meant every caller that did not
-  memoize leaked another z3 process.
+  The driver is FUNCTIONS, not a process, and that is deliberate: ports deliver
+  their replies to the mailbox of the process that OWNS them, so whoever owns the
+  port must be whoever calls the functions below. Called from a beam-lisp
+  `defserver` (see priv/std/z3pool.bl), that gives structural serialization — a
+  gen_server answers one call at a time — with no lock anywhere.
   """
   def open do
-    {:ok, pid} = BeamLisp.Z3.Solver.ensure_started()
-    GenServer.call(pid, :port)
+    case open_port() do
+      {:ok, port} -> port
+      {:error, reason} -> raise reason
+    end
+  end
+
+  def close(port) do
+    if alive?(port), do: Port.close(port)
+    :ok
   end
 
   @doc """
@@ -103,16 +109,12 @@ defmodule BeamLisp.Z3Port do
   status is "sat" | "unsat" | "unknown" | "error"; model is the
   `(get-model)` text when `model?: true` and status is "sat".
 
-  SERIALIZED through the owner process (`BeamLisp.Z3.Solver`): one conversation
-  at a time. `port` is provenance, not control — the solver owns the port, so a
-  caller's stale handle cannot break the call.
+  RUNS IN THE PORT'S OWNER: the reads below arrive in the caller's mailbox, so
+  the owner is the only process that may call this.
   """
-  def check(port, smt, model? \\ false), do: BeamLisp.Z3.Solver.check(port, smt, model?)
+  def check(port, smt, model? \\ false), do: raw_check(port, smt, model?)
 
-  @doc """
-  The protocol itself. Runs in the OWNER process only (`BeamLisp.Z3.Solver`),
-  because the replies below arrive in the caller's mailbox.
-  """
+  @doc "The protocol itself. Runs in the OWNER process only."
   def raw_check(port, smt, model? \\ false) do
     # A caller-supplied (check-sat) would make z3 answer TWICE and desync the
     # reader by one answer for every later query on this port — a silent,
@@ -158,6 +160,14 @@ defmodule BeamLisp.Z3Port do
   named and the script must set `:produce-unsat-cores`), `:model?` (return the
   model on sat).
   """
+  @doc """
+  The same check, positional — beam-lisp callers pass `(assume core? model?)` and
+  never have to marshal a map across the boundary.
+  """
+  def raw_check_here3(port, assume, core?, model?) do
+    raw_check_here(port, %{assume: assume, core?: core?, model?: model?})
+  end
+
   def raw_check_here(port, opts) do
     assume = Map.get(opts, :assume) || []
 
