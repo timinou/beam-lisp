@@ -70,7 +70,7 @@ slots between two existing ones without renumbering.
     :instr/for "mcp" :instr/kind :onboarding :instr/order 20
     :instr/title "The wire"
     :instr/text
-    "One JSON-RPC 2.0 object per line on stdio. The protocol version travels in _meta[\"io.modelcontextprotocol/protocolVersion\"]; this build speaks 2026-07-28. First move: server/discover → capabilities, serverInfo, and these instructions. An unknown method answers -32601; a version the server does not speak answers -32022."}
+    "One JSON-RPC 2.0 object per line on stdio. TWO lifecycles are served, and the one you open with decides the shape of every answer after it. Modern (2026-07-28): the version travels in _meta[\"io.modelcontextprotocol/protocolVersion\"], the first move is server/discover → capabilities, serverInfo and these instructions, and a tool answers with bare rows. Classic (2025-06-18 and older): open with initialize, carrying the version in params; a revision we do not know is negotiated down rather than refused, and tool results come back in the content[] envelope that revision requires, with the rows repeated in structuredContent. A notification (no id) is NEVER answered — not with a result, not with an error. An unknown method answers -32601; a stated version the server does not speak answers -32022."}
 
    {:instr/id "mcp/onboarding/model"
     :instr/for "mcp" :instr/kind :onboarding :instr/order 30
@@ -82,7 +82,7 @@ slots between two existing ones without renumbering.
     :instr/for "mcp" :instr/kind :onboarding :instr/order 40
     :instr/title "Elicitation (MRTR)"
     :instr/text
-    "A question that needs a target and got none does not fail — it answers resultType: input_required with an elicitation schema. Retry the same call with inputResponses: {\"target\": \"<fn>\"} folded into the arguments. Never guess a target; let the server ask."}
+    "A question that needs a target and got none does not fail — it answers resultType: input_required with an elicitation schema. Retry the same tools/call with inputResponses: {\"target\": \"<fn>\"} as a SIBLING of name and arguments inside params — not inside arguments, where it is ignored and the server simply elicits again. Never guess a target; let the server ask."}
 
    {:instr/id "mcp/onboarding/verify"
     :instr/for "mcp" :instr/kind :onboarding :instr/order 50
