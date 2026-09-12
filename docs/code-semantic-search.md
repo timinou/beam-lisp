@@ -228,6 +228,17 @@ takes (and the roots are the corpus), `-k` is how many hits come back (10 by
 default), `--ns` narrows to one namespace, and `--like NAME` asks the other
 question — functions that look like `NAME` — instead of a question in English.
 
+`bl ask` is the neighbouring verb, and it answers a different kind of question:
+it walks the codebase's FACTS (who calls this, what breaks if I change it),
+while `search` ranks functions by what they MEAN. Two questions, two verbs —
+asking one with the other's tool is how you get a plausible answer to a
+question you did not ask.
+
+`search` is one `lazy` entry in `bl.cli` (`"search" (lazy "bl.search")`), which
+is what keeps the optional dependency optional: the CLI does not load the
+feature's source until someone asks for it, so a checkout with no model weights
+answers every other verb at the same cost and never fails on their behalf.
+
 Exit codes are the CLI's usual three: `0` a search ran, `1` something broke,
 `2` the command line was wrong (no query, a `-k` that is not a number). A
 missing model is `2` as well, and says so:
