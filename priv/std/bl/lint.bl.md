@@ -130,13 +130,25 @@ sweep; a linter reports what it can read and keeps going.
 ```beam-lisp
 (defn- smell
   "One reported smell: the rule, its tier, the starting line of the matched
-   form, and the before/after text of that rule alone."
+   form, and the before/after text of that rule alone.
+
+   An ADVISORY rule has no local rewrite — the fix restructures the form,
+   not the text — so it carries `:after nil` and a `:note` instead.
+   `str` rather than `name` keeps a namespaced rule's namespace, so
+   `datalog/nested-scan` reads as itself."
   [rule form pos]
-  {:name (name (:name rule))  ; a string, so `--json` can encode it
-   :tier (:tier rule)
-   :line (line-of pos)
-   :before (pr-str form)
-   :after (pr-str (deodorant/deodorize-with (list rule) form))})
+  (if (:advisory rule)
+    {:name (str (:name rule))  ; a string, so `--json` can encode it
+     :tier (:tier rule)
+     :line (line-of pos)
+     :before (pr-str form)
+     :after nil
+     :note (:note rule)}
+    {:name (str (:name rule))  ; a string, so `--json` can encode it
+     :tier (:tier rule)
+     :line (line-of pos)
+     :before (pr-str form)
+     :after (pr-str (deodorant/deodorize-with (list rule) form))}))
 
 (defn lint-source
   "Every smell in one source text under `rules`: `{:path :smells [...]}`. Walks
@@ -178,7 +190,8 @@ lines that show the change. The last line is the tally a gate reads.
 ```beam-lisp
 (defn render
   "The human report: one block per smell — `path:line  name [tier]`, the before
-   line, the after line — then `N smells in M files`."
+   line, then the after line (or, for an advisory rule, its note) — then
+   `N smells in M files`."
   [report]
   (let [blocks
         (mapcat
@@ -186,7 +199,9 @@ lines that show the change. The last line is the tally a gate reads.
            (map (fn [s]
                   (str (:path f) ":" (:line s) "  " (:name s) " [" (name (:tier s)) "]\n"
                        "    " (:before s) "\n"
-                       "  → " (:after s)))
+                       (if (nil? (:after s))
+                         (str "  note: " (:note s))
+                         (str "  → " (:after s)))))
                 (:smells f)))
          (:files report))]
     (join "\n"

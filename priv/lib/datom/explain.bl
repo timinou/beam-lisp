@@ -1,0 +1,308 @@
+; datom/explain.bl — why a query costs what it costs, before it runs.
+;
+; ── The failure this exists for ───────────────────────────────────────
+;
+; A datalog query answers correctly whether or not it is fast. The planner
+; picks an index per clause. When a clause binds an attribute VALUE and
+; the attribute has no `:db/index`, AVET holds no entry for it, so the
+; clause falls back to reading the whole column. A `:not`/`:not-join`/
+; `:or`/`:or-join` sub-query runs once per OUTER ROW, so that column read
+; happens per row: correct, and quadratic — 62 seconds for twenty-eight
+; files, unbounded on a larger tree.
+;
+; Nothing in the query's TEXT shows this. The attribute reads like any
+; other; the `:db/index` flag lives in the schema, and the plan exists
+; only at run time. So the cost is DERIVED here: `plan-trace` (in
+; `datom.query.plan`) reports the order and the index every clause uses,
+; and this namespace reads that trace to name the clauses that scan a
+; column per outer row.
+;
+; ── A smell is a risk, not an error ───────────────────────────────────
+;
+; `explain` returns the plan, every nested sub-query, the smells, and a
+; one-line verdict. A smell names the clause, the index it resolves to,
+; why the cost is per-row, and the two remedies: index the attribute, or
+; build the sub-query's answer once outside the loop. Whether an
+; attribute is indexed is a fact about the SCHEMA, not the query. Given a
+; db or a schema vector the reading is exact; given nothing, the worst
+; case (unindexed) is assumed and every smell is marked `:certain false`.
+; `datom/explain` against the live connection is how the exact plan is
+; seen.
+
+(ns datom.explain
+  (:require [datom.db] [datom.schema]
+            [datom.query.parse] [datom.query.plan]))
+
+;; ── the schema, as facts about indexes ──────────────────────────────
+
+(defn schema-map
+  "The schema MAP behind a db value, a schema map, or the schema VECTOR
+   `datom/connect` takes. nil stays nil.
+
+   `plan-trace` — and `datom.schema/indexed?` below it — read a schema
+   MAP, so this is the one adapter between what a caller has (a db, a
+   vector of definitions) and what the planner wants."
+  [schema]
+  (cond
+    (nil? schema) nil
+    (vector? schema) (reduce (fn [m d] (assoc m (get d :db/ident) d)) {} schema)
+    (map? schema) (or (datom.db/schema-of schema) schema)
+    :else nil))
+
+(defn schema-facts
+  "What a schema says about indexes: `{:indexed #{attr…} :ref #{attr…}}`.
+
+   Accepts a db value, a schema map, or the vector of attribute
+   definitions a connection is built from. Reads through
+   `datom.schema/indexed?` and `ref?` — the same predicates the planner
+   uses — so the explainer cannot disagree with the planner about what
+   counts as indexed."
+  [schema]
+  (let [m (schema-map schema)
+        attrs (into [] (keys (or m {})))]
+    {:indexed (into #{} (filter (fn [a] (datom.schema/indexed? m a))) attrs)
+     :ref (into #{} (filter (fn [a] (datom.schema/ref? m a))) attrs)}))
+
+;; ── a query, recognised ─────────────────────────────────────────────
+
+(defn query?
+  "Whether `form` is a datalog query vector — a `[:find … :where …]`."
+  [form]
+  (and (vector? form)
+       (some (fn [x] (= :find x)) form)
+       (some (fn [x] (= :where x)) form)))
+
+(defn- as-parsed
+  "A query's parsed form, from either the query vector or an already
+   parsed map."
+  [query]
+  (if (map? query) query (datom.query.parse/parse query)))
+
+;; ── nested sub-queries ──────────────────────────────────────────────
+
+(def COMBINATORS
+  "The clause operators that hold sub-clauses."
+  #{:and :or :not :or-join :not-join})
+
+(def PER-ROW
+  "The operators whose sub-queries run once per outer row. `:and` is
+   INLINE — its sub-clauses run in the enclosing row, so they are
+   analysed in that context, not as a sub-query of their own."
+  #{:not :not-join :or :or-join})
+
+(defn- vars-of
+  "Every variable mentioned in `clauses`, in first-seen order."
+  [clauses]
+  (into [] (distinct (mapcat datom.query.parse/all-variables clauses))))
+
+(defn- var-set
+  "The set of every variable mentioned in `clauses`."
+  [clauses]
+  (into #{} (mapcat datom.query.parse/all-variables clauses)))
+
+(defn- join-form?
+  "`[:not-join [?v …] …]` and `[:or-join [?v …] …]` name their shared
+   variables in the clause right after the operator."
+  [op]
+  (or (= op :not-join) (= op :or-join)))
+
+(defn- clause-body
+  "The sub-clauses of a combinator — everything after the operator, and
+   after the shared-variable vector for the `-join` forms."
+  [clause]
+  (let [rests (into [] (rest clause))]
+    (if (join-form? (get clause 0)) (into [] (rest rests)) rests)))
+
+(defn- shared-vars
+  "The variables a nested clause shares with its outer scope — what the
+   engine has bound when the sub-query runs.
+
+   `:not-join` and `:or-join` name them explicitly; a plain `:not` shares
+   the vars it also mentions outside itself (the planner's
+   `negation-inputs` rule); an `:or` branch set shares all of its
+   variables."
+  [clause context-vars]
+  (let [op (get clause 0)
+        rests (into [] (rest clause))]
+    (cond
+      (join-form? op) (into [] (first rests))
+      (= op :not) (datom.query.plan/negation-inputs clause context-vars)
+      :else (vars-of (clause-body clause)))))
+
+(defn- nested-in
+  "The nested sub-queries among `clauses`, given `outer-vars` bound outside
+   them, depth-first. `level` is every variable this level mentions apart
+   from a `:not`'s own locals — the context a `:not` shares with."
+  [clauses outer-vars]
+  (let [level (var-set
+                (filterv (fn [c]
+                           (not (and (datom.query.parse/rule-clause? c)
+                                     (= :not (get c 0)))))
+                         clauses))
+        context (into (set outer-vars) level)]
+    (reduce
+      (fn [acc clause]
+        (if (and (datom.query.parse/rule-clause? clause)
+                 (contains? COMBINATORS (get clause 0)))
+          (let [op (get clause 0)
+                body (clause-body clause)
+                scoped (shared-vars clause context)
+                here {:op op :scoped scoped :clauses body :outer-vars outer-vars}
+                inner (if (= op :and) outer-vars (into outer-vars scoped))]
+            (into (conj acc here) (nested-in body inner)))
+          acc))
+      []
+      clauses)))
+
+(defn nested
+  "Every sub-query in `query`, as
+   `{:op op :scoped [shared-vars] :clauses [clause…] :outer-vars [vars]}`.
+
+   `:scoped` is what is bound before the sub-query runs. `:and` is listed
+   because it is traversed, but it is INLINE — only `:not`/`:not-join`/
+   `:or`/`:or-join` re-run their sub-query once per outer row, which is
+   the cost a smell names."
+  [query]
+  (let [p (as-parsed query)]
+    (nested-in (:where p) (datom.query.parse/input-variables p))))
+
+;; ── the smell: a column read per outer row ──────────────────────────
+
+(defn- inline
+  "`clauses` with every `[:and …]` replaced by its sub-clauses, so an
+   inline conjunction is analysed in its enclosing row's context."
+  [clauses]
+  (reduce (fn [acc c]
+            (if (and (vector? c) (= :and (get c 0)))
+              (into acc (inline (into [] (rest c))))
+              (conj acc c)))
+          []
+          clauses))
+
+(defn- scan?
+  "Whether an index is a SCAN rather than a prefix read: the whole `:aevt`
+   column, or a full `:eavt`."
+  [index]
+  (or (= :aevt (get index 0))
+      (and (= :eavt (get index 0)) (empty? (get index 1)))))
+
+(defn- judgeable?
+  "Whether a clause's attribute is a CONSTANT. Only then can its index
+   status be read from a schema; `[?e ?a ?v]` names no attribute, so it is
+   skipped rather than guessed at."
+  [clause]
+  (datom.query.parse/constant? (get (datom.query.plan/pattern-terms clause) 1)))
+
+(defn- remedy
+  "The note a smell carries: what the scan costs and the two ways out."
+  [attr]
+  (let [a (pr-str attr)]
+    (str "The planner reads the whole " a " column and re-runs this clause for every outer row. "
+         "Two remedies: (1) make the attribute AVET-indexed — `:db/index true` (or `:db/unique`) — so the pattern prefix-scans; "
+         "(2) build the sub-query's answer ONCE outside the outer loop (a set, a `memo`, or an `index!` step) and join against it. "
+         "When no schema is at hand, `datom/explain` against the live connection shows the exact plan.")))
+
+(defn- smells-of
+  "The per-row rescans among one nested sub-query's effective clauses,
+   ordered as the engine would run them."
+  [sub schema indexed]
+  (let [clauses (inline (:clauses sub))
+        trace (datom.query.plan/plan-trace
+                {:find [] :in (into [] (:scoped sub)) :where clauses}
+                (schema-map schema))]
+    (keep
+      (fn [step]
+        (let [c (get step :clause)
+              idx (get step :index)]
+          (when (and (datom.query.parse/pattern-clause? c)
+                     (judgeable? c)
+                     (scan? idx))
+            (let [a (get (datom.query.plan/pattern-terms c) 1)
+                  known? (some? schema)]
+              {:kind :datalog/nested-scan
+               :clause c
+               :index idx
+               :attr a
+               :rows (str "all " (pr-str a) " datoms")
+               :estimate (str "O(|outer| × |" (pr-str a) "| per row)")
+               :certain (and known? (not (contains? indexed a)))
+               :note (remedy a)}))))
+      (:steps trace))))
+
+(defn smells
+  "Every per-row rescan in `query`, as `:datalog/nested-scan` maps.
+
+   `schema-or-nil` is a db value, a schema map, or a schema vector. With
+   nil, the worst case (unindexed) is assumed and every smell is marked
+   `:certain false`; with a schema, a smell is `:certain` only when the
+   attribute is provably unindexed. Each map carries the clause, the index
+   it resolved to, the attribute, an `:estimate`, and a `:note` naming
+   both remedies."
+  [query schema-or-nil]
+  (if (and (vector? query) (not (query? query)))
+    []
+    (let [known? (some? schema-or-nil)
+          indexed (if known? (get (schema-facts schema-or-nil) :indexed) #{})]
+      (into []
+            (mapcat (fn [sub]
+                      (if (contains? PER-ROW (get sub :op))
+                        (smells-of sub schema-or-nil indexed)
+                        []))
+                    (nested query))))))
+
+;; ── the report ──────────────────────────────────────────────────────
+
+(defn explain
+  "The whole picture for `query` against `db-or-schema`:
+
+     {:find    the :find section
+      :in      the :in section
+      :order   the top-level clauses in evaluation order
+      :steps   per clause: :index, :components, :cost, :bound
+      :nested  every sub-query, with its scope
+      :smells  the per-row rescans
+      :verdict one line — none, or a count}
+
+   Correctness is never in question; the report is about COST."
+  [query db-or-schema]
+  (let [p (as-parsed query)
+        trace (datom.query.plan/plan-trace p (schema-map db-or-schema))
+        subs (nested p)
+        found (smells p db-or-schema)
+        n (count found)]
+    {:find (:find p)
+     :in (:in p)
+     :order (:order trace)
+     :steps (:steps trace)
+     :nested subs
+     :smells found
+     :verdict (if (zero? n)
+                "no per-row rescan found"
+                (str n " per-row rescan" (if (= 1 n) "" "s")))}))
+
+(defn render
+  "`report` as text: the ordered plan (index, components, cost per
+   clause), each smell with its clause and remedy, then the verdict."
+  [report]
+  (let [plan-line (fn [s]
+                    (str "  " (pr-str (get s :clause))
+                         "   index=" (pr-str (get s :index))
+                         "  cost=" (get s :cost)
+                         "  bound=" (pr-str (get s :bound))))
+        smell-line (fn [s]
+                     (str "  " (pr-str (get s :clause))
+                          "  →  " (pr-str (get s :index)) "\n"
+                          "      " (get s :note)))]
+    (join "\n"
+          (concat
+            ["plan:"]
+            (map plan-line (:steps report))
+            (if (seq (:smells report))
+              (into ["smells:"] (map smell-line (:smells report)))
+              [])
+            [(str "verdict: " (:verdict report))]))))
+
+(defn explain-str
+  "`explain` rendered to text — the one call a REPL or `bl run` wants."
+  [query db-or-schema]
+  (render (explain query db-or-schema)))
