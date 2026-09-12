@@ -234,6 +234,11 @@ set lives in memory for this run only — the same answers, just not remembered.
         ; asksets.
         root (first paths)
         nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))]
+    ; The store's host module exists only once the namespace declaring it has
+    ; been initialized, and nothing on this path loads it: without this the ask
+    ; set is rebuilt every run. Inline for the same reason `bl.search` is (see
+    ; the note there — a helper in `codebase` or `bl.cache` cycles the AOT build).
+    (try (BeamLisp.AOT/ensure_loaded "datom.store-fjall") (catch e nil))
     (if (not (datom.store-fjall/available?))
       (let [conn (codebase/connect-codebase)]
         {:conn conn :nss (index! conn sigs paths)})
