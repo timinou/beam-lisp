@@ -99,3 +99,207 @@
       (doseq [ns-str (to-list tools/MOUNTED)]
         (is (string? (BeamLisp.Loader/source_content ns-str))
             (str ns-str " resolves through the priv tier alone"))))))
+
+;; ── the prompts surface: instructions are facts, a prompt is a query ──────
+;;
+;; The instruction corpus mounts as :instr/* facts in the SAME conn that
+;; holds the code facts (one database: code and its instructions side by
+;; side), so prompts/list and prompts/get are assembled by datalog, never
+;; read from a file. discover carries the onboarding prompt as its
+;; `instructions` key, so a client that never calls prompts/get is still told.
+
+(deftest discover-carries-the-onboarding-instructions
+  (let [r (server/request-response (server/state) (call 20 "server/discover" nil))
+        instructions (get-in r ["result" "instructions"])]
+    (is (some? (get-in r ["result" "capabilities" "prompts"]))
+        "the prompts capability is advertised")
+    (is (string? instructions) "discover carries instructions")
+    (is (some? (index-of instructions "What you are holding"))
+        "the instructions ARE the onboarding prompt, assembled from facts")))
+
+(deftest prompts-list-advertises-the-three-kinds
+  (let [r (server/request-response (server/state) (call 21 "prompts/list" nil))
+        ps (get-in r ["result" "prompts"])
+        names (into #{} (map (fn [p] (get p "name")) ps))]
+    (is (contains? names "beam-lisp/onboarding"))
+    (is (contains? names "beam-lisp/usage"))
+    (is (contains? names "beam-lisp/protocol"))))
+
+(deftest prompts-get-assembles-from-instruction-facts
+  (let [st (server/state)
+        r (server/request-response st
+                                   (call 22 "prompts/get" {"name" "beam-lisp/usage"}))
+        msg (first (get-in r ["result" "messages"]))
+        text (get-in msg ["content" "text"])]
+    (is (= "user" (get msg "role")) "a prompt is messages")
+    (is (some? (index-of text "Recipes")) "the corpus fragments are in order")
+    (is (some? (index-of text "code/verify")) "the recipes name the tools")
+    ;; the live section is computed from the registry, not authored
+    (is (some? (index-of text "code/subscribe")) "the live registry lists the tools")
+    (is (some? (index-of text "fn facts")) "the live registry counts the facts")))
+
+(deftest the-corpus-is-queryable-as-code-facts
+  ;; the whole point: instructions sit in the same database, so code/query
+  ;; itself can read them — an agent can verify where its instructions live.
+  (let [st (server/state)
+        r (server/request-response
+           st (call 23 "tools/call"
+                    {"name" "code/query"
+                     "arguments" {"query" (quote [:find ?title
+                                            :where
+                                            [_ :instr/kind :onboarding]
+                                            [_ :instr/title ?title]])}}))]
+    (is (= "complete" (get-in r ["result" "resultType"])))
+    (is (<= 6 (count (get-in r ["result" "rows"])))
+        "the onboarding fragments are facts in the served database")))
+
+(deftest prompts-get-rejects-an-unknown-prompt
+  (let [r (server/request-response (server/state)
+                                   (call 24 "prompts/get" {"name" "beam-lisp/nope"}))]
+    (is (some? (get r "error")) "an unknown prompt is an error, not a crash")))
+
+(deftest prompt-responses-are-json-encodable
+  ;; the transport encodes with Jason; a response it refuses is DROPPED
+  (let [st (server/state)
+        answers (map (fn [r] (server/request-response st r))
+                     [(call 30 "prompts/list" nil)
+                      (call 31 "prompts/get" {"name" "beam-lisp/onboarding"})
+                      (call 32 "prompts/get" {"name" "beam-lisp/usage"})
+                      (call 33 "prompts/get" {"name" "beam-lisp/protocol"})])]
+    (doseq [a answers]
+      (is (string? (Jason/encode! a))
+          "a prompt response survives the transport's encoder"))))
+
+;; ── the two lifecycles: `initialize` and `server/discover` ────────────────
+;;
+;; This build defines the stateless revision (2026-07-28), whose handshake is
+;; `server/discover` and whose version travels in `_meta`. Every MCP client in
+;; the wild still opens with `initialize` and carries its version in `params`.
+;; Serving only the former made the server unreachable in practice (FUP-043):
+;; the refusal landed on the very first frame, so no client ever got far enough
+;; to read the instructions telling it which revision to speak. Both handshakes
+;; are answered now, and the lifecycle a client opened with decides the shape
+;; of its tool results.
+
+(defn- classic
+  "A request as a CLASSIC client sends it: version in `params`, no `_meta`."
+  [id method params]
+  (let [base {"jsonrpc" "2.0" "id" id "method" method}]
+    (if (nil? params) base (assoc base "params" params))))
+
+(deftest the-classic-handshake-completes
+  (let [r (server/request-response (server/state)
+                                   (classic 30 "initialize"
+                                            {"protocolVersion" "2025-06-18"
+                                             "capabilities" {}
+                                             "clientInfo" {"name" "probe" "version" "1"}}))]
+    (is (= "2025-06-18" (get-in r ["result" "protocolVersion"]))
+        "the client's own revision is echoed back")
+    (is (some? (get-in r ["result" "capabilities" "tools"])) "capabilities travel")
+    (is (= "beam-lisp-mcp-server" (get-in r ["result" "serverInfo" "name"])))
+    (is (string? (get-in r ["result" "instructions"]))
+        "the onboarding prompt reaches a classic client too")
+    (is (nil? (get-in r ["error"])) "no refusal on the first frame")))
+
+(deftest an-unknown-revision-is-negotiated-not-refused
+  ;; Answering -32601 or -32022 ends the conversation: JSON-RPC gives the
+  ;; client no way to ask again. Name a revision we DO speak instead.
+  (let [r (server/request-response (server/state)
+                                   (classic 31 "initialize"
+                                            {"protocolVersion" "1999-01-01"}))]
+    (is (= "2025-06-18" (get-in r ["result" "protocolVersion"]))
+        "an unknown revision is answered with one we speak")))
+
+(deftest a-notification-is-never-answered
+  ;; JSON-RPC 2.0: no `id` ⇒ no response, not even an error. The old reply
+  ;; carried `id: null`, which a strict client reads as an unsolicited error.
+  (is (nil? (server/request-response (server/state)
+                                     {"jsonrpc" "2.0" "method" "notifications/initialized"}))
+      "a notification produces no response at all")
+  (is (nil? (server/request-response (server/state)
+                                     {"jsonrpc" "2.0" "method" "notifications/cancelled"
+                                      "params" {"requestId" 1}}))
+      "any notification, not just the handshake's"))
+
+(deftest a-classic-client-gets-a-content-envelope
+  ;; 2025-06-18 CallToolResult REQUIRES `content`; a classic client renders
+  ;; nothing without it. Connecting without this buys a handshake and no tool.
+  (let [st (assoc (server/state) :lifecycle :legacy)
+        r (server/request-response st (classic 32 "tools/call"
+                                               {"name" "code/list" "arguments" {}}))
+        result (get r "result")
+        content (first (get result "content"))]
+    (is (= "text" (get content "type")) "the rows arrive as text content")
+    (is (string? (get content "text")))
+    (is (= false (get result "isError")))
+    (is (some? (get-in result ["structuredContent" "codebases"]))
+        "the same rows stay machine-readable alongside the text")))
+
+(deftest a-modern-client-still-gets-bare-rows
+  ;; The stateless lifecycle is untouched: no `content` wrapper, rows at the
+  ;; top of the result, exactly as before the classic handshake was added.
+  (let [r (server/request-response (server/state)
+                                   (call 33 "tools/call" {"name" "code/list" "arguments" {}}))
+        result (get r "result")]
+    (is (nil? (get result "content")) "no classic envelope for a modern client")
+    (is (some? (get result "codebases")) "rows sit at the top of the result")
+    (is (= "complete" (get result "resultType")))))
+
+(deftest a-classic-frame-carries-only-the-jsonrpc-members
+  ;; The handshake was answered correctly and the client still hung: the frame
+  ;; carried `_meta` as a FOURTH top-level member, and a client that validates
+  ;; the envelope strictly drops the whole message rather than reporting it.
+  ;; A dropped frame is indistinguishable from a server that never answered.
+  (let [r (server/request-response (server/state)
+                                   (classic 34 "initialize"
+                                            {"protocolVersion" "2025-06-18"}))]
+    (is (nil? (get r "_meta")) "nothing sits beside jsonrpc/id/result")
+    (is (some? (get-in r ["result" "_meta" "io.modelcontextprotocol/serverInfo"]))
+        "it moved INSIDE the result, where every revision allows it"))
+  (let [st (assoc (server/state) :lifecycle :legacy)
+        r (server/request-response st (classic 35 "tools/call"
+                                               {"name" "code/list" "arguments" {}}))]
+    (is (nil? (get r "_meta")) "every later call on a classic connection too")
+    (is (some? (get-in r ["result" "_meta"])))))
+
+(deftest a-modern-frame-still-carries-meta-beside-result
+  (let [r (server/request-response (server/state) (call 36 "server/discover" nil))]
+    (is (some? (get r "_meta"))
+        "the stateless revision puts _meta beside result, and is unchanged")))
+
+;; ── code/query across the wire ──────────────────────────────────────
+;;
+;; The corpus test above hands the server a query built IN PROCESS, so its
+;; terms are real keywords and symbols and datalog is happy. Nothing that
+;; arrives over stdio looks like that: Jason/decode! yields strings, and a
+;; string ":find" is not a section keyword. These two pin the JSON shape —
+;; the only shape a real client can send.
+
+(deftest a-query-that-crossed-the-wire-is-still-datalog
+  (let [r (server/request-response
+           (server/state)
+           (call 40 "tools/call"
+                 {"name" "code/query"
+                  "arguments" {"query" [":find" "?title"
+                                        ":where"
+                                        ["_" ":instr/kind" ":onboarding"]
+                                        ["_" ":instr/title" "?title"]]}}))]
+    (is (= "complete" (get-in r ["result" "resultType"]))
+        "a query of plain JSON strings is not an invalid-params error")
+    (is (<= 6 (count (get-in r ["result" "rows"])))
+        "and it finds the same onboarding fragments the in-process query does")))
+
+(deftest a-string-value-in-a-wire-query-stays-a-string
+  ;; Only :keyword and ?symbol tokens are restored. A name being matched
+  ;; against is data and must survive as data, or every value clause breaks.
+  (let [r (server/request-response
+           (server/state)
+           (call 41 "tools/call"
+                 {"name" "code/query"
+                  "arguments" {"query" [":find" "?caller"
+                                        ":where"
+                                        ["?c" ":call/callee" "walk-calls"]
+                                        ["?c" ":call/caller" "?caller"]]}}))]
+    (is (= "complete" (get-in r ["result" "resultType"])))
+    (is (<= 1 (count (get-in r ["result" "rows"])))
+        "the callee name matched as the string it is")))

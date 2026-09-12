@@ -148,28 +148,65 @@ pub fn safe_path(base: &std::path::Path, rel: &std::path::Path) -> std::io::Resu
     Ok(out)
 }
 
-/// Atomic tar.gz extraction into `dest` (`.tmp` sibling, then rename).
-/// Shared by the launcher (first-run install) and `drop unpack` (CI).
+/// Atomic tar.gz extraction into `dest` (a per-process `.tmp-<pid>` sibling,
+/// then rename). Shared by the launcher (first-run install) and `drop unpack`
+/// (CI), so both tolerate a concurrent extractor of the same payload.
 pub fn extract_tar_gz(payload: &[u8], dest: &std::path::Path) -> std::io::Result<()> {
-    let tmp = dest.with_extension("tmp");
+    // Stage under a name only THIS process owns. Two `bl` invocations extract
+    // the same version more easily than it looks — an editor opening two
+    // workspaces, `bl daemon start` beside a `bl run`, two jobs on one
+    // machine — and a SHARED staging path makes them delete each other's work
+    // mid-unpack (observed: "failed to unpack … into <dir>.tmp/…", and
+    // "Directory not empty" when the loser's rename met the winner's tree).
+    let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
+    match unpack_into(payload, &tmp).and_then(|()| publish(&tmp, dest)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Unpack the payload into an existing, empty staging dir.
+fn unpack_into(payload: &[u8], tmp: &std::path::Path) -> std::io::Result<()> {
     let gz = flate2::read::GzDecoder::new(payload);
     let mut ar = tar::Archive::new(gz);
     ar.set_preserve_permissions(true);
     for e in ar.entries()? {
         let mut e = e?;
         let rel = e.path()?.into_owned();
-        let out = safe_path(&tmp, &rel)?;
+        let out = safe_path(tmp, &rel)?;
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }
         e.unpack(&out)?;
     }
-    make_entry_executable(&tmp, "bin/bl");
-    std::fs::rename(&tmp, dest)?;
+    make_entry_executable(tmp, "bin/bl");
     Ok(())
+}
+
+/// Publish a finished staging tree as `dest`.
+///
+/// Losing the race is not an error: another process extracted the SAME payload
+/// — same sha256, verified before unpacking — so the tree already in place is
+/// the tree we were about to publish. What must not happen is publishing over
+/// it, or reporting failure for a `bl` that is ready to run.
+fn publish(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if dest.join("bin").exists() {
+                let _ = std::fs::remove_dir_all(tmp);
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(unix)]

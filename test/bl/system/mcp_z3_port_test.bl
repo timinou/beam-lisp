@@ -1,0 +1,128 @@
+; test/bl/system/mcp_z3_port_test.bl — a memoized port must not outlive its owner.
+;
+; The bug this pins (BUG-031), found by running the flagship demo THROUGH THE
+; DAEMON rather than by reading code:
+;
+;   $ bl run examples/mcp-demo.bl      # first run after a daemon start
+;   ✓ All 11 exchanges passed
+;   $ bl run examples/mcp-demo.bl      # every later run in that same VM
+;     → {"error" {"code" -32602, "message" "Invalid params"}, "id" 7, …}
+;
+; Exchange 7 is code/verify. The cause is ownership, one layer down: a BEAM port
+; dies with the process that OPENED it, `mcp.tools` opens the z3 port inside
+; whichever process first asks (for the demo, the MCP server process), and the
+; memo (`z3-port`, a VM-global atom) was checked only for nil. So the first
+; server's death left every later verify holding a closed port; `Port.command/2`
+; on a closed port raises badarg, which reached the client as "-32602 Invalid
+; params" — a lie about the request, told by a catch-all in `mcp.server/call-tool`.
+;
+; The heal is the same rule as the codebase conn's (see mcp_conn_memo_test.bl):
+; ASK, do not assume. `z3/alive?` is the question; `port!` asks it.
+;
+; These tests use the real z3 binary (`mix bl.z3.fetch` populates priv/z3/bin).
+
+(ns mcp.z3.port.test
+  (:require [z3]
+            [mcp.server :as server]
+            [mcp.tools :as tools]))
+
+(defn- until
+  "Poll `pred` for up to 30 s. A process exit and a port close are both
+   asynchronous, and neither has a fixed duration worth sleeping for."
+  [pred]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n 3000) false
+      :else (do (Process/sleep 10) (recur (inc n))))))
+
+;; a defserver whose invariant holds — the demo's own exchange-7 source
+(def account
+  "(defserver ^{:invariant (>= balance 0)} account
+     (init [balance] (ok balance))
+     (handle-call [:withdraw amt] [_ balance] :when (and (>= amt 0) (>= balance amt))
+       (reply :ok (- balance amt))))")
+
+(defn- verify-request [id]
+  {"jsonrpc" "2.0" "id" id "method" "tools/call"
+   "_meta" {"io.modelcontextprotocol/protocolVersion" "2026-07-28"}
+   "params" {"name" "code/verify" "arguments" {"source" account}}})
+
+(defn- verdict-through-a-server []
+  (let [srv (server/start)]
+    (try
+      (get-in (server/request srv (verify-request 7)) ["result" "verdict"])
+      (finally
+        (server/stop srv)))))
+
+(deftest a-port-whose-owner-died-is-not-alive
+  (is (z3/alive? (z3/open)) "a port opened here is alive")
+  (let [orphan (atom nil)
+        owner (erlang/spawn (fn [] (reset! orphan (z3/open))))]
+    (is (until (fn [] (not (Process/alive? owner)))) "the owner exited")
+    (is (until (fn [] (not (z3/alive? @orphan))))
+        "and took the port with it — this is why a cache must ask")))
+
+(deftest a-verify-after-its-server-stopped-still-proves
+  ; The bug's exact shape, minus the daemon: the FIRST verify of a server's
+  ; life opens the port inside the server process, so stopping the server
+  ; closes it while the VM-global memo still names it.
+  (is (= "holds" (verdict-through-a-server))
+      "the first verify, through a server, proves")
+  (is (= "holds" (verdict-through-a-server))
+      "and so does the next one, in a NEW server over the same dead port memo"))
+
+(deftest the-memo-is-reused-only-while-it-is-alive
+  ; The memo itself, with no server in the picture: whoever verified FIRST owned
+  ; the port, and that process is gone. The next verify — from a different
+  ; process — must not inherit the corpse.
+  ;
+  ; The owner REPORTS its verdict into an atom rather than just raising: a
+  ; spawned process is its own env, and a silent nil here would make the test
+  ; pass without ever opening a port.
+  (let [src account
+        verdict (atom nil)
+        owner (erlang/spawn (fn []
+                              (reset! verdict
+                                      (get (tools/code-verify-handler {"source" src})
+                                           :verdict))))]
+    (is (until (fn [] (not (nil? @verdict))))
+        "the owner verified — which is what opens the port")
+    (is (= "holds" @verdict))
+    (is (until (fn [] (not (Process/alive? owner))))
+        "and then exited, taking its port with it")
+    (is (= "holds" (get (tools/code-verify-handler {"source" account}) :verdict))
+        "the next verify, here, still proves")))
+
+;; ── the repair that could not be spoken ─────────────────────────────
+;;
+;; code/verify's second half — synthesize the weakest guard that repairs a
+;; violated invariant — worked perfectly and reached no one. A guard is an
+;; AST, and Jason has no encoder for {:symbol "<="}, so the frame died on the
+;; way out: the transport logged to stderr and wrote NO LINE. A client cannot
+;; tell a dropped answer from a server still thinking, so the flagship tool
+;; looked like a hang until the caller timed out. The verdict travelled
+;; because it was a string; the repair did not because it was code.
+
+(def leaky-account
+  "(defserver ^{:invariant (>= balance 0)} account
+     (init [balance] (ok balance))
+     (handle-call [:withdraw amt] [_ balance]
+       (reply :ok (- balance amt))))")
+
+(defn- repair-request [id]
+  {"jsonrpc" "2.0" "id" id "method" "tools/call"
+   "_meta" {"io.modelcontextprotocol/protocolVersion" "2026-07-28"}
+   "params" {"name" "code/verify"
+             "arguments" {"source" leaky-account "repair" true}}})
+
+(deftest a-synthesized-repair-can-cross-the-wire
+  (let [r (server/request-response (server/state) (repair-request 8))
+        repairs (get-in r ["result" "repairs"])]
+    (is (= "violated" (get-in r ["result" "verdict"]))
+        "an unguarded withdraw does not preserve (>= balance 0)")
+    (is (= 1 (count repairs)) "and gets exactly one repair")
+    (is (string? (get (first repairs) "guard"))
+        "whose guard crosses as SOURCE — the text you paste into :when")
+    (is (some? (try (Jason/encode! r) (catch error nil)))
+        "and the whole frame encodes; an unencodable one is never written")))

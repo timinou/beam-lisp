@@ -62,6 +62,19 @@ defmodule BeamLisp.Daemon.Executor do
     GenServer.call(server, {:run_reload, fun}, :infinity)
   end
 
+  @doc """
+  Run `fun` on the single command worker with output CAPTURED, returning
+  `{result, output}`.
+
+  The FIFO is the point: an intent from the dashboard takes the same turn a
+  client's command would, so it never races a reload commit or a run. Capturing
+  needs the group-leader swap to happen in the process that PRINTS — this one —
+  so the caller cannot do it; hence a variant here rather than a wrapper there.
+  """
+  def run_capture(server \\ __MODULE__, fun) when is_function(fun, 0) do
+    GenServer.call(server, {:run_capture, fun}, :infinity)
+  end
+
   # --- GenServer: a single worker, calls serialized by the mailbox ---
 
   @impl true
@@ -80,6 +93,26 @@ defmodule BeamLisp.Daemon.Executor do
     # only one program runs at a time. Concurrent clients queue in the mailbox.
     code = execute(sock, id, req, conn, state.handler)
     {:reply, code, state}
+  end
+
+  @impl true
+  def handle_call({:run_capture, fun}, _from, state) do
+    {:ok, io} = StringIO.open("")
+    prev = Process.group_leader()
+    Process.group_leader(self(), io)
+
+    result =
+      try do
+        fun.()
+      rescue
+        e -> {:error, Exception.message(e)}
+      catch
+        kind, v -> {:error, {kind, v}}
+      end
+
+    Process.group_leader(self(), prev)
+    {_, output} = StringIO.contents(io)
+    {:reply, {result, output}, state}
   end
 
   @impl true

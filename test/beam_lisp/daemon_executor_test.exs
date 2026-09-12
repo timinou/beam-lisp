@@ -26,7 +26,7 @@ defmodule BeamLisp.DaemonExecutorTest do
   describe "command execution over the daemon" do
     test "eval round-trips: stdout value + exit 0", ctx do
       {out, code} = request(ctx, ["eval", "(+ 1 2)"])
-      assert code == 0
+      assert code == 0, "the suite must be green; it said:\n#{out}"
       assert out =~ "3"
     end
 
@@ -86,8 +86,8 @@ defmodule BeamLisp.DaemonExecutorTest do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "ok_test.bl"), "(ns ok-test)\n(deftest passes (is (= 1 1)))\n")
 
-      {_out, code} = request(ctx, ["test", "ok_test.bl"], dir)
-      assert code == 0
+      {out, code} = request(ctx, ["test", "ok_test.bl"], dir)
+      assert code == 0, "the suite must be green; it said:\n#{out}"
 
       # a failing suite maps to 1 WITHOUT halting the daemon
       File.write!(Path.join(dir, "bad_test.bl"), "(ns bad-test)\n(deftest fails (is (= 1 2)))\n")

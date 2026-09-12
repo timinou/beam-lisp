@@ -37,7 +37,16 @@ defmodule BeamLisp.Z3Port do
 
     Port.open({:spawn_executable, exe}, [:binary, :stream, :use_stdio, args: ["-in"]])
   end
+  @doc """
+  True while the solver process behind `port` is reachable.
 
+  A port dies with the process that OPENED it, so a memoized port can
+  outlive its owner — the server that answered the first query. A caller
+  that caches a port must ask this before reusing it: `Port.command/2` on a
+  closed port raises badarg, which reaches the client as a bare
+  `ArgumentError: argument error`.
+  """
+  def alive?(port), do: is_port(port) and Port.info(port) != nil
   # Resolve the PINNED z3 artifact across packaging tiers — never the system
   # PATH. Three candidates, first that exists wins:
   #   1. BEAM_LISP_Z3 env — an explicit pin (release/CI points it at its artifact)

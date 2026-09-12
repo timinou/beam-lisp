@@ -37,6 +37,7 @@
             [typed]
             [datom]
             [datom.watch]
+            [mcp.instructions :as instr]
             [system.core :as sys]
             [z3]))
 
@@ -87,22 +88,39 @@
               (let [facts (codebase/index-source sigs ns-str (mount-source ns-str))
                     delta (* i 1000000)
                     all (concat (offset-facts (:fn facts) delta)
-                                (offset-facts (:calls facts) delta))]
+                                (offset-facts (:calls facts) delta)
+                                (offset-facts (:instr facts) delta))]
                 (datom/transact! conn all)
                 (+ i 1)))
             0 MOUNTED)
+    ;; The instruction corpus mounts beside the code facts: one conn, so
+    ;; code/query reaches the :instr/* facts with the same datalog.
+    (instr/mount! conn)
     conn))
 
 ; Built once, on first use — requiring this namespace reads no files and
 ; transacts nothing; the mount happens the first time a tool asks for `conn`.
+;
+; "Once" means once while the memo is USABLE. A conn's store and blob store are
+; ETS tables owned by the process that mounted them, so this atom — VM-global,
+; written by whichever process asked first — can outlive what it names. In the
+; daemon that is the normal case, not an edge: commands run in one worker, and
+; a worker that dies (a linked crash, a staleness restart) takes the tables
+; with it while the memo keeps handing the dead conn out. Every later request
+; then dies inside `:ets.lookup` with "the table identifier does not refer to an
+; existing ETS table", which reads like a corrupt store rather than what it is:
+; a memo outliving its owner. So ask before trusting one.
 (def ^:private the-conn (atom nil))
 
 (defn conn
   "The self-indexed codebase: one datom conn over every MOUNTED source."
   []
-  (or @the-conn
-      (let [c (mount!)]
-        (if (compare-and-set! the-conn nil c) c @the-conn))))
+  (let [c @the-conn]
+    (if (and (some? c) (datom/alive? c))
+      c
+      (let [_ (when (some? c) (datom/release! c))
+            fresh (mount!)]
+        (if (compare-and-set! the-conn c fresh) fresh @the-conn)))))
 
 ;; core callee set for the mounted namespaces — the "always defined" names
 ;; (core + each mounted ns's publics) so unknown-callees does not flag them.
@@ -160,6 +178,27 @@
                :items {}}}
    :required ["query"]})
 
+(defn- edn-term
+  "JSON carries no keywords and no symbols, so a query that crossed the wire
+   arrives as plain strings and datalog rejects it at the first section. Put
+   the two tokens datalog dispatches on back: \":find\" → :find and \"?name\"
+   → ?name (with $, % and _ for the rules and the blank). Every other string
+   is a data value and stays one — [?c :call/callee \"walk-calls\"] still
+   matches a name. A query built in-process already holds real terms, and
+   those are not strings, so it passes through untouched."
+  [x]
+  (cond
+    (string? x)
+    (cond
+      (starts-with? x ":") (keyword (subs x 1))
+      (starts-with? x "?") (symbol x)
+      (or (= x "$") (= x "%") (= x "_")) (symbol x)
+      :else x)
+
+    (sequential? x) (into [] (map edn-term (to-list x)))
+
+    :else x))
+
 (defn- in-tokens
   "The flat symbols the query declares between :in and the next clause
    keyword — e.g. [$ % ?today]. Empty when :in is absent (implicit [$])."
@@ -173,8 +212,8 @@
 (defn code-query-handler [args]
   (let [query-raw (get args "query")
         query-vec (cond
-                    (vector? query-raw) query-raw
-                    (sequential? query-raw) (into [] query-raw)
+                    (vector? query-raw) (edn-term query-raw)
+                    (sequential? query-raw) (edn-term (into [] query-raw))
                     :else (throw (ex-info "query must be sequential" {})))
         db (datom/db (conn))
         ;; Inputs are positional: $ → the db, % → the REACH rules, every
@@ -261,15 +300,20 @@
 ;; return a machine-checked safety verdict + an auto-repair for a state machine.
 ;;
 ;; The z3 port is opened lazily and memoized in an atom — z3 is a real OS
-;; process, so we pay for it only when the first verify arrives.
+;; process, so we pay for it only when the first verify arrives. The memo must
+;; ASK before reusing it: a port dies with the process that opened it, and the
+;; first verify of a server's life is owned by that server — so the memo
+;; outlives its owner the moment the server stops. Reusing a dead port raises
+;; badarg, which a client reads as "Invalid params". Same rule as the codebase
+;; conn above: ask, do not assume.
 
 (def ^:private z3-port (atom nil))
 
 (defn- port! []
   (let [p @z3-port]
-    (if (nil? p)
-      (let [np (z3/open)] (reset! z3-port np) np)
-      p)))
+    (if (and (not (nil? p)) (z3/alive? p))
+      p
+      (let [np (z3/open)] (reset! z3-port np) np))))
 
 (defn- read1 [s] (first (BeamLisp.Reader/read_string s)))
 
@@ -315,8 +359,14 @@
           base
           (let [rp (sys/repair-process port node)]
             (assoc base :repairs
+                   ;; The synthesized guard is an AST — a list of symbols. It
+                   ;; goes out as SOURCE, both because a raw {:symbol "<="} is
+                   ;; not JSON-encodable (the frame dies on the way out and the
+                   ;; client waits forever for a line that never comes) and
+                   ;; because "(<= amt balance)" is the form the agent pastes
+                   ;; straight into that transition's :when.
                    (to-list (map (fn [x] {:transition (name (get x :label))
-                                          :guard (get x :guard)})
+                                          :guard (pr-str (get x :guard))})
                                  (get rp :repairs))))))))))
 
 ;; ── tool 5: code/subscribe + code/poll (LIVE fact changes via datom/watch) ─

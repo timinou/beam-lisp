@@ -1,0 +1,110 @@
+#+TITLE: daemon MCP: three methods break permanently when the mount's owner dies, and /mcp does not default the version
+#+STATE: ITEM
+#+CUSTOM_ID: FUP-045-daemon-mcp-breaks-permanently-and-ignores-a-missing-version
+
+* Symptom
+
+`bl daemon status` advertises an MCP endpoint — "mcp: http://127.0.0.1:<port>/mcp
+(the same MCP `bl mcp` serves over stdio)" — and it serves a *different* protocol
+experience than the stdio transport it claims to be.
+
+Observed on a live daemon (pid 2519540, root = a beam-lisp checkout, UI port
+60693). Four requests, one session, same process:
+
+#+begin_example
+$ D=http://127.0.0.1:60693/mcp
+
+$ curl -s -X POST $D -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}'
+{"error":{"code":-32603,"message":"Internal error: errors were found at the given arguments:\n\n  * 1st argument: the table identifier does not refer to an existing ETS table\n"},"id":1,"jsonrpc":"2.0"}
+
+$ curl -s -X POST $D -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"server/discover"}'
+{"error":{"code":-32022,"data":{"requestedVersion":null,"supportedVersions":["2026-07-28"]},"message":"Unsupported protocol version"},"id":2,"jsonrpc":"2.0"}
+
+$ curl -s -X POST $D -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/list","_meta":{"…":"2026-07-28"}}'
+{"_meta":{…},"id":3,"result":{"cacheScope":"public","resultType":"complete","tools":[…]}}      ← fine
+
+$ curl -s -X POST $D -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"code/list","arguments":{}},"_meta":{"…":"2026-07-28"}}'
+{"id":4,"result":{"codebases":[{"description":"The code-as-facts engine indexed over it…"}]}}   ← fine
+#+end_example
+
+So, on one daemon: `tools/list` and `tools/call` answer correctly while
+`server/discover`, `resources/read` and `prompts/get` are dead — with the
+*unnamed ETS badarg* of FUP-044 — and stay dead until the daemon restarts.
+
+* Cause — two independent defects in the HTTP transport
+
+**1. The memoised MCP state is never revalidated.** `lib/beam_lisp/daemon/http.ex:335`:
+
+#+begin_src elixir
+defp mcp_state(opts) do
+  key = {__MODULE__, :mcp_state, Keyword.get(opts, :tree_id, "default")}
+  case :persistent_term.get(key, nil) do
+    nil ->
+      BeamLisp.Loader.ensure_loaded("mcp.server")
+      state = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("mcp.server", "state"), [])
+      :persistent_term.put(key, state)
+      state
+    state -> state
+  end
+end
+#+end_src
+
+That state holds a datom `:conn` (the mounted codebase index), built by a worker
+process. The connection's ETS tables are owned by whoever ran the mount, so when
+that worker goes away the conn is two dead handles — and the memo hands it out
+forever. The branches that read `(get state :conn)` directly are exactly the
+three that fail (`priv/lib/mcp/server.bl:92` discover, `:101-118`
+resources/prompts); the tool handlers survive because they call
+`mcp.tools/conn`, which DOES ask (`priv/lib/mcp/tools.bl:115`):
+
+#+begin_src beam-lisp
+(defn conn []
+  (let [c @the-conn]
+    (if (and (some? c) (datom/alive? c))
+      c
+      (let [_ (when (some? c) (datom/release! c))
+            fresh (mount!)]
+        (if (compare-and-set! the-conn c fresh) fresh @the-conn)))))
+#+end_src
+
+The language already has the answer, one file away from the site that needs it.
+
+**2. `POST /mcp` does not default the protocol version; the stdio transport
+does.** `priv/lib/mcp/transport-stdio.bl:60-68`:
+
+#+begin_src beam-lisp
+(defn- ensure-version
+  "MCP 2026-07-28 carries the protocol version in a request's `_meta`. A
+   hand-typed request (a shell pipe) may omit it; default to the version this
+   server speaks so the stdio transport is usable without a full client."
+  [request] …)
+#+end_src
+
+`lib/beam_lisp/daemon/http.ex:323` passes the parsed request straight to
+`mcp.server/request-response`, so the same hand-typed request that works against
+`bl mcp` is refused by the daemon's own MCP endpoint — and refused with
+`requestedVersion: null`, which reads as a client bug rather than the missing
+default it is.
+
+* Fix sketch
+
+1. **Revalidate the memo.** Either rebuild the state when its conn is dead
+   (the `mcp.tools/conn` idiom, hoisted to the state: alive? → re-mount →
+   compare-and-set), or store only the *mount* and let each request resolve the
+   conn through `mcp.tools/conn`. Whatever holds a conn across processes must
+   ask `datom/alive?` before using it — FUP-044 item 2.
+2. **One entry that guarantees the version.** Run `ensure-version` on the HTTP
+   path too (or move it into `mcp.server/request-response`, where both
+   transports pass): the two transports should not disagree about what a valid
+   request is.
+3. **A test.** `bl mcp`'s stdio path and the daemon's `/mcp` should be driven by
+   the SAME conformance test over both transports; today the drop's own suite
+   would pass with the HTTP path entirely broken.
+
+* Acceptance
+
+- After the daemon's MCP worker has been restarted (or its mount has died),
+  `server/discover`, `resources/read` and `prompts/get` still answer over
+  `POST /mcp` — no `-32603`, no ETS text.
+- A version-less request gets the same answer over HTTP as over stdio.
+- Restarting the daemon is not the documented cure for a stale mount.

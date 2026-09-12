@@ -477,7 +477,11 @@ See [04-editors-and-agents.md](04-editors-and-agents.md).
 Serve the codebase as a fact database over the Model Context Protocol on
 stdin/stdout, one JSON object per line. The tools are `code/list`, `code/query`,
 `code/ask`, `code/verify`, `code/subscribe` and `code/poll`; the resources are
-`code://beam-lisp/schema` and `code://beam-lisp/namespaces`. See
+`code://beam-lisp/schema` and `code://beam-lisp/namespaces`. The server also
+speaks `prompts/list` + `prompts/get` — `beam-lisp/onboarding`,
+`beam-lisp/usage`, `beam-lisp/protocol`, each assembled by datalog from the
+`:instr/*` facts mounted in the same database — and `server/discover` carries
+the onboarding prompt as its `instructions` key. See
 [04-editors-and-agents.md](04-editors-and-agents.md).
 
 Starting the server mounts the codebase it serves — `codebase.bl` and
@@ -485,6 +489,41 @@ Starting the server mounts the codebase it serves — `codebase.bl` and
 than the working directory — so `bl mcp` answers the same facts from anywhere,
 with no checkout, arguments or `--path` needed. The mount is paid once, at
 startup (a few seconds); every request after that reads the conn it built.
+
+### install
+
+#### `bl install [TARGET [DIR]] [--check] [--json]`
+
+Install beam-lisp into your tools. With no TARGET, lists the targets. A target
+writes what the tool needs and reports each step; `--check` verifies an
+installation without writing anything.
+
+```sh
+$ bl install doom
+bl install doom
+
+  ok   module    ~/.config/doom/modules/lang/beamlisp (7 files)
+  ok   grammar   ~/.config/emacs/.local/etc/tree-sitter/libtree-sitter-beamlisp.so
+  ok   init.el   already wired
+  ok   next      doom sync, then restart Emacs
+```
+
+`doom` vendors the Doom module (major mode, LSP, warm REPL, codebase
+questions, literate `.bl.md`/`.bl.org` support) into the Doom user directory,
+compiles the tree-sitter grammar with `cc`, and adds
+`(beamlisp +lsp +literate)` under `:lang` in `init.el` — idempotently, in
+place. The Doom directory resolves from the argument, `$DOOMDIR`,
+`~/.config/doom`, `~/.doom.d`.
+
+`mcp` assembles the agent instructions from the instruction corpus — the
+same facts the MCP server serves over `prompts/get` — and writes
+`beam-lisp-mcp.onboarding.md` and `beam-lisp-mcp.usage.md` into DIR (default
+`.`), with the client registration snippet in each. An agent reads the files;
+a client can also just run the server.
+
+Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
+
+`--json` keys: `target`, `ok`, `steps` (each `name`, `ok`, `detail`).
 
 ### doctor · version · help
 
@@ -590,7 +629,7 @@ Flags may appear anywhere before `--`.
 | `--changed` | check: only sources changed since the last run |
 | `--update` | check: record the new baseline |
 | `--fix` | check: apply the safe rewrite |
-| `--check` | doc: report drift without writing |
+| `--check` | doc: report drift without writing; install: verify, don't write |
 | `--native` | build: also emit native modules |
 | `--install-hook` | check: install the pre-commit hook |
 | `--json` | machine-readable output where a command offers it |

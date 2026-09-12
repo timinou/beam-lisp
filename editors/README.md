@@ -14,6 +14,29 @@ beam-lisp meets an editor on three surfaces:
 `bl` must be on the editor's `PATH`. Inside the beam-lisp checkout, replace
 `"bl"` with `"mix", "bl"` in any command below.
 
+## The easy way: `bl install`
+
+```sh
+bl install doom   # Doom Emacs: module + tree-sitter grammar + init.el
+bl install mcp    # MCP clients: agent instructions + registration snippet
+```
+
+`bl install doom` vendors the Doom module (`editors/emacs/doom/`) into your
+Doom user directory, compiles the tree-sitter grammar with `cc`, and enables
+`(beamlisp +lsp +literate)` in `init.el`. The module gives you the major
+mode, the language server (lsp-mode or eglot), a warm `bl repl` with
+eval-at-point, the codebase questions (`bl ask`) on keys, and first-party
+literate documents: polymode cells in `.bl.md`, org-babel in `.bl.org`,
+cell-at-point evaluation, and `bl doc run` with in-place refresh. See the
+module's `README.org` for the key map. Re-run to upgrade; `--check`
+verifies.
+
+`bl install mcp [DIR]` writes `beam-lisp-mcp.onboarding.md` and
+`beam-lisp-mcp.usage.md` — the agent instructions, assembled from the same
+fact corpus the server serves over `prompts/get`.
+
+Everything below is the hand-run reference, and what the installer writes.
+
 ## Emacs
 
 `emacs/beamlisp-ts-mode.el` is the major mode; it registers `eglot` against

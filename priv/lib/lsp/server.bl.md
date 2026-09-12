@@ -125,14 +125,18 @@ allowed to end the process.
         :else
         (let [msg (:msg fr)
               res (try (rpc/handle state msg)
-                       (catch _e
-                         ;; JSON-RPC: a notification must not get a reply, so a
-                         ;; raising handler is reported on stderr for a
-                         ;; notification and as -32603 only for a request.
-                         (if (contains? msg "id")
-                           [state [(rpc/internal-error (get msg "id"))]]
-                           (do (u/io-err "bl lsp serve: handler raised")
-                               [state []]))))
+                       (catch e
+                         ;; A raise is a bug in a handler, and the ONLY trace
+                         ;; of it is what we say here — so say everything:
+                         ;; the method, the exception, on stderr always, and
+                         ;; in the -32603 message when the message is a
+                         ;; request (a notification must not get a reply).
+                         (let [detail (str (get msg "method") ": "
+                                           (or (ex-message e) (pr-str e)))]
+                           (u/io-err (str "bl lsp serve: handler raised: " detail))
+                           (if (contains? msg "id")
+                             [state [(rpc/internal-error (get msg "id") detail)]]
+                             [state []]))))
               state' (get res 0)
               out (get res 1)]
           (write-all out)

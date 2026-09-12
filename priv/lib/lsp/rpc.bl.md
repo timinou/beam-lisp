@@ -269,9 +269,14 @@ never has to know what a beam-lisp vector is.
   (error-resp nil -32700 (str "Parse error: " (name reason))))
 
 (defn internal-error
-  "The response to a handler that raised: JSON-RPC -32603."
-  [id]
-  (error-resp id -32603 "Internal error"))
+  "The response to a handler that raised: JSON-RPC -32603. `detail` names the
+   method and the raise — a bare \"Internal error\" teaches the client nothing
+   and the user less."
+  [id detail]
+  (error-resp id -32603
+              (if (nil? detail)
+                "Internal error"
+                (str "Internal error: " detail))))
 ```
 
 ## Capabilities
@@ -313,6 +318,37 @@ it is how a closed or clean document clears its squiggles.
      "severity" 1
      "source" "beam-lisp"
      "message" (str (get d :msg ""))}))
+
+(defn- parseable?
+  "Whether the reader accepts `text`. Mid-edit text often does not; the
+   answer is recorded on the doc so every position feature can degrade to its
+   empty result instead of raising -32603 on each keystroke."
+  [text]
+  (try (BeamLisp.Reader/read_string text) true (catch _e false)))
+
+(def ^:private feature-empty
+  "Every position feature's empty answer — what it returns when the document
+   does not parse. The parse-error diagnostic already carries the why."
+  {"textDocument/hover" nil
+   "textDocument/definition" nil
+   "textDocument/references" []
+   "textDocument/documentHighlight" []
+   "textDocument/documentSymbol" []
+   "textDocument/completion" []
+   "textDocument/signatureHelp" nil
+   "textDocument/inlayHint" []
+   "textDocument/codeAction" []
+   "$/beamlisp/proof" nil
+   "$/beamlisp/nativeEligible" nil
+   "$/beamlisp/impact" []
+   "$/beamlisp/deadCode" []})
+
+(defn- doc-unparseable?
+  "Whether the doc for this request's uri is present and known unparseable."
+  [state params]
+  (let [uri (or (get-in params ["textDocument" "uri"]) (get params "uri"))
+        d (doc-of state uri)]
+    (and (some? d) (= false (:parseable d)))))
 
 (defn- publish-diagnostics [state uri]
   (let [d (doc-of state uri)
@@ -501,7 +537,10 @@ symbol kind is Function.
 
 (defn- code-action-out [state params id]
   (let [uri (get-in params ["textDocument" "uri"])
-        pos (or (get params "position") {})
+        ;; codeAction sends a RANGE, not a position — the point is its start
+        pos (or (get params "position")
+                (get-in params ["range" "start"])
+                {})
         d (doc-of state uri)]
     (if (nil? d)
       [state [(response id [])]]
@@ -580,7 +619,8 @@ request before `initialize` is refused with -32002, an unknown request with
             uri (get td "uri")
             text (get td "text")
             state' (assoc-in state [:docs uri]
-                             {:text text :version (get td "version") :ns (ns-of text)})]
+                             {:text text :version (get td "version") :ns (ns-of text)
+                              :parseable (parseable? text)})]
         [state' [(publish-diagnostics state' uri)]])
 
       (= method "textDocument/didChange")
@@ -590,7 +630,8 @@ request before `initialize` is refused with -32002, an unknown request with
             state' (assoc-in state [:docs uri]
                              {:text text
                               :version (get-in params ["textDocument" "version"])
-                              :ns (ns-of text)})]
+                              :ns (ns-of text)
+                              :parseable (parseable? text)})]
         [state' [(publish-diagnostics state' uri)]])
 
       (= method "textDocument/didSave")
@@ -604,6 +645,13 @@ request before `initialize` is refused with -32002, an unknown request with
 
       (and has-id (not initialized))
       [state [(error-resp id -32002 "Server not initialized")]]
+
+      ;; Mid-edit text often does not parse; every position feature then
+      ;; answers its empty result — the parse-error diagnostic carries the why.
+      (and has-id
+           (contains? feature-empty method)
+           (doc-unparseable? state params))
+      [state [(response id (get feature-empty method))]]
 
       (and has-id (= method "textDocument/hover")) (hover-out state params id)
       (and has-id (= method "textDocument/definition")) (definition-out state params id)

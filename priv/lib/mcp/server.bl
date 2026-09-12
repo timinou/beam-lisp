@@ -11,7 +11,9 @@
 
 (ns mcp.server
   (:require [mcp.jsonrpc :as jsonrpc]
+            [mcp.instructions :as instr]
             [mcp.tools :as tools]
+            [bl.ask :as ask]
             [datom]))
 
 (defn- stringify
@@ -30,6 +32,12 @@
     (set? value) (to-list (map stringify (to-list value)))
     (BeamLisp.LazySeq/lazy? value) (to-list (map stringify (doall value)))
     (keyword? value) (name value)
+    ;; A symbol is code, and Jason has no encoder for one. Rendering it is not
+    ;; cosmetic: one unencodable member kills the WHOLE frame, and a frame that
+    ;; never gets written is a client that never gets an answer. Any handler
+    ;; returning a fragment of AST — a synthesized guard, a form — crosses the
+    ;; wire as the source it reads as.
+    (symbol? value) (str value)
     :else value))
 
 (defn- resource-descriptors []
@@ -51,12 +59,87 @@
   (first (filter (fn [entry] (= name (first entry)))
                 (get state :tools))))
 
-(defn- discover []
-  {"protocolVersion" (jsonrpc/protocol-version)
-   "supportedProtocolVersions" (to-list (jsonrpc/supported-versions))
-   "capabilities" {"tools" {}
-                    "resources" {"subscribe" false "listChanged" false}}
-   "serverInfo" (jsonrpc/server-info)})
+(defn live-usage-section
+  "The live registry, as markdown: what is mounted, then every tool, named
+   question, resource and prompt AS REGISTERED RIGHT NOW. The freshest
+   statement of the surface is the surface itself — this section is computed,
+   never authored."
+  [state]
+  (let [db (datom/db (get state :conn))
+        tool-lines (map (fn [t] (str "- `" (get t :name) "` — " (get t :description)))
+                        (tools/tools-list))]
+    (join "\n"
+          (concat
+           ["## Right now — the live registry" ""
+            (instr/manifest-line db) ""
+            "### Tools"]
+           tool-lines
+           [""
+            (str "### Named questions for code/ask\n\n" (join " · " (ask/db-questions)))
+            ""
+            "### Resources\n\ncode://beam-lisp/schema · code://beam-lisp/namespaces"
+            ""
+            "### Prompts\n\nbeam-lisp/onboarding · beam-lisp/usage · beam-lisp/protocol"]))))
+
+(defn- discover
+  "The handshake analog. Beyond capabilities and serverInfo, the result
+   carries `instructions` — the ONBOARDING prompt, assembled from the
+   instruction facts in the mounted database, so even a client that never
+   calls prompts/get is told how to hold this server."
+  [state]
+  (let [base {"protocolVersion" (jsonrpc/protocol-version)
+              "supportedProtocolVersions" (to-list (jsonrpc/supported-versions))
+              "capabilities" {"tools" {}
+                               "prompts" {"listChanged" false}
+                               "resources" {"subscribe" false "listChanged" false}}
+              "serverInfo" (jsonrpc/server-info)}]
+    (if (get state :conn)
+      (assoc base "instructions"
+             (get (instr/prompt "beam-lisp/onboarding" (datom/db (get state :conn)) nil) :text))
+      base)))
+
+(defn- initialize-result
+  "The classic handshake's answer. Same capabilities, serverInfo and
+   instructions `discover` returns — the two methods differ only in their name
+   and in where the version travels (params here, `_meta` there)."
+  [state requested]
+  (assoc (dissoc (discover state) "supportedProtocolVersions")
+         "protocolVersion" (jsonrpc/negotiate-version requested)))
+
+(defn- legacy? [state]
+  (= :legacy (get state :lifecycle)))
+
+(defn- legacy-tool-result
+  "MCP 2025-06-18 CallToolResult: the rows as JSON text in `content`, with the
+   same map repeated in `structuredContent` for clients that read it. A modern
+   result is bare rows; a classic client renders NOTHING without `content`, so
+   connecting without this envelope buys a handshake and no usable tool."
+  [value]
+  (let [text (try (Jason/encode! value)
+                  (catch error (pr-str value)))]
+    {"content" [{"type" "text" "text" text}]
+     "structuredContent" value
+     "isError" false}))
+
+(defn- tool-envelope
+  "Shape a tool result for the lifecycle the client opened with."
+  [state value]
+  (if (legacy? state) (legacy-tool-result value) value))
+
+(defn- classic-frame
+  "JSON-RPC 2.0 gives a response object exactly `jsonrpc`, `id` and one of
+   `result`/`error`. The modern revision hangs `_meta` beside them; a classic
+   client validates the envelope strictly and DROPS the whole message, which
+   reaches the user as a hang rather than an error. Fold it inside `result`,
+   where `Result._meta` is legal in every revision."
+  [response]
+  (if (and (map? response) (some? (get response "_meta")))
+    (let [m (get response "_meta")
+          bare (dissoc response "_meta")]
+      (if (some? (get bare "result"))
+        (assoc bare "result" (assoc (get bare "result") "_meta" m))
+        bare))
+    response))
 
 (defn- tools-list [state]
   ;; Raw data: `request-response` normalizes what it returns.
@@ -104,10 +187,15 @@
               (jsonrpc/input-required-result (get raw "inputRequests") id)
 
               (= result-kind "complete")
-              (jsonrpc/complete-result (dissoc raw "resultType") id)
+              (jsonrpc/complete-result
+               (tool-envelope state (dissoc raw "resultType")) id)
 
+              ;; A handler that stamps no resultType still produces a TOOL
+              ;; result, so it crosses the same envelope boundary — `code/list`
+              ;; is one, and skipping it here handed a classic client bare rows
+              ;; it cannot render.
               :else
-              (jsonrpc/complete-result raw id)))
+              (jsonrpc/complete-result (tool-envelope state raw) id)))
           (catch error
             (IO/puts :stderr (str "tool handler error: " (pr-str error)))
             (jsonrpc/invalid-params-error id "Tool arguments or query are invalid")))))))
@@ -116,10 +204,25 @@
   (init [initial] (ok (or initial (server-state))))
 
   ;; Payload-carrying vector dispatch preserves the request in OTP's message.
+  ;; The classic lifecycle IS stateful — that is what `initialize` means. A
+  ;; client that opens with it gets classic envelopes for the rest of the
+  ;; connection; a modern client never sets the flag and is untouched.
   (handle-call [:request value] [_from state]
-    (reply (request-response state value) state))
+    (reply (request-response state value)
+           (if (= "initialize" (get value "method"))
+             (assoc state :lifecycle :legacy)
+             state)))
 
   (handle-info _msg [state] (noreply state)))
+
+(defn- classic-for
+  "Shape the outgoing frame for the lifecycle this request belongs to. The
+   handshake itself counts: `initialize` is answered before the connection is
+   marked classic, and that very first frame is the one a strict client drops."
+  [state method response]
+  (if (or (= method "initialize") (legacy? state))
+    (classic-frame response)
+    response))
 
 (defn request-response [state request]
   (let [id (get request "id")
@@ -132,16 +235,39 @@
     ;; method safe: the two branches that forgot (resources/list,
     ;; resources/read) produced a `JSON encode error` in the transport that
     ;; named neither the method nor the value.
-    (stringify
-     (cond
+    (classic-for
+     state method
+     (stringify
+      (cond
+      ;; A notification (no `id`) gets NO line back — not a result, not an
+      ;; error. Answering one makes a strict client read the reply as an
+      ;; unsolicited error, and `id: null` is not a valid correlation either.
+      (jsonrpc/notification? request)
+      nil
+
       (not (jsonrpc/request-valid? request))
       (jsonrpc/invalid-request-error id)
 
-      (not (jsonrpc/version-supported? version))
+      ;; The classic handshake carries its version in `params`, never in
+      ;; `_meta` — so it must be answered ABOVE the `_meta` version gate, or
+      ;; every client in the wild is refused before it can say hello.
+      (= method "initialize")
+      (jsonrpc/complete-result
+       (initialize-result state (get (or (get request "params") {}) "protocolVersion"))
+       id)
+
+      ;; A classic client never sends `_meta` — its revision was settled at
+      ;; `initialize`. Gating it on a header its lifecycle does not have would
+      ;; refuse every call AFTER a successful handshake. End to end the stdio
+      ;; transport injects a version, which is exactly what hid this: the
+      ;; server must be correct on its own, not only behind that transport.
+      (if (legacy? state)
+        (and (some? version) (not (jsonrpc/known-version? version)))
+        (not (jsonrpc/version-supported? version)))
       (jsonrpc/unsupported-version-error id version)
 
       (= method "server/discover")
-      (jsonrpc/complete-result (discover) id)
+      (jsonrpc/complete-result (discover state) id)
 
       (= method "tools/list")
       (jsonrpc/complete-result (tools-list state) id)
@@ -159,8 +285,29 @@
           (jsonrpc/invalid-params-error id "Unknown resource URI")
           (jsonrpc/complete-result result id)))
 
+      ;; The prompts surface: the instruction corpus (mcp.instructions) as
+      ;; MCP prompts. Onboarding, usage and protocol are QUERY RESULTS over
+      ;; the same conn that holds the code facts — a prompt is assembled,
+      ;; never stored as a file.
+      (= method "prompts/list")
+      (jsonrpc/complete-result {"prompts" instr/prompt-descriptors} id)
+
+      (= method "prompts/get")
+      (let [name (get (get request "params") "name")]
+        (if (nil? (get state :conn))
+          (jsonrpc/invalid-params-error id "No codebase mounted")
+          (let [db (datom/db (get state :conn))
+                p (instr/prompt name db (live-usage-section state))]
+            (if (nil? p)
+              (jsonrpc/invalid-params-error id "Unknown prompt")
+              (jsonrpc/complete-result
+               {"description" (get p :description)
+                "messages" [{"role" "user"
+                              "content" {"type" "text" "text" (get p :text)}}]}
+               id)))))
+
       :else
-      (jsonrpc/method-not-found-error id method)))))
+      (jsonrpc/method-not-found-error id method))))))
 
 (defn start []
   (start-link mcp-server (server-state)))
