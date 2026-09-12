@@ -1,0 +1,188 @@
+#+TITLE: Solver pool with conversations + native decision tiers, in the five-bundles idiom
+#+STATE: ITEM
+#+SESSION_ID: 157bcd97046112e7
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-11T19-45-37-298Z_157bcd97046112e7.jsonl]]
+#+CUSTOM_ID: PLAN-106-solver-pool-with-conversations-native-de
+
+* Initial Message
+
+please check BUG-031 again and explain its latest status to me
+
+* Goal
+
+Two changes that reinforce each other, expressed in the vocabulary the repo already
+uses (docs/the-five-bundles.md tiers, docs/patterns/*, docs/guidebook/*):
+
+1. **A solver pool with conversations** — N z3 processes, leased per
+   CONVERSATION (not per call), so the API can finally use z3's real power:
+   `push`/`pop`, assumptions, unsat cores, incremental re-verification.
+2. **Native decision tiers in front of z3** — decide in BEAM what BEAM can
+   decide, keep z3 as the oracle of last resort, and RECORD which tier answered.
+
+The instrument decides how much of (2) is worth building: obligations and their
+tiers become FACTS, so "what fraction is native-decidable" is a datalog query
+over the codebase's own fact space, not a script someone has to trust.
+
+* Non-goals
+
+- **No NIF / no libz3 in-VM.** A NIF blocks a scheduler thread and turns a solver
+  segfault into a VM-wide outage; a z3 crash today is one process that the
+  supervisor heals. Measured cost of the port protocol is not the problem: a
+  `code/verify` is ~29 ms end to end over HTTP (1000 sequential calls, 29.4 s),
+  and the port protocol itself is p50 ~2 ms by the p13a research note. Revisit
+  only if profiling shows the text protocol dominating, or 10k+ queries/s are
+  needed.
+- **No new restart machinery.** OTP does Healing Edge and Governor (bundles §5).
+- **No new pattern vocabulary.** Use `fence`, `pool`, `reg/*`, `super/*`,
+  `system/verify` — all designed and built (PLAN-085, DONE).
+
+* Why (1) and (2) are complementary, not competing
+
+- (2) shrinks the DEMAND on the solver; (1) makes the remaining foreign calls
+  safe, concurrent and incremental.
+- (1) makes (2)'s value measurable: pool contention (queued leases, fenced
+  timeouts) is evidence that a native tier should absorb that obligation.
+- Both are gated by ONE instrument: the obligation, its tier, and the discharged
+  proof travel as data (pattern 13, and exactly what `system/prove.bl` already
+  does for native compilation: "the proof TRAVELS with the node", consumed by
+  `native-eligible?`).
+
+* The seam, per the verb tiers
+
+| layer | where | what | why there |
+|---|---|---|---|
+| primitive | `lib/beam_lisp/z3_solver.ex` (landed, 9d6cd69) | port owner + one conversation, serialized | it owns a BEAM port — same shape as `BeamLisp.Supervisor` |
+| behaviour | `priv/std/z3.bl` | `z3/with-solver`, `z3/converse`, `z3/assume`, `z3/check` | tier 2 verbs over the primitive |
+| behaviour | `priv/std/pool.bl` (or extend `super.bl`) | lease registry as a `defserver (invariant ...)` | tier 2/4: the pool is a server with an invariant |
+| graph | `priv/lib/system/decide.bl` | the tier ladder + obligation gate | tier "graph": `system/verify`'s own tier |
+| definition | `priv/lib/mcp/tools.bl` | `code/verify` reports `:tier`/provenance | the surface that shows the capability |
+
+* Step 0 — the instrument (no behaviour change, green)
+
+Obligations become values, and their discharge becomes facts.
+
+```clojure
+;; priv/lib/system/decide.bl
+(defn obligation [kind payload] {:obligation kind :payload payload})   ; a VALUE
+(defn discharge [o tier proof] {:obligation o :tier tier :proof proof :holds? true})
+```
+
+- tag every `z3/check`/`z3/check-model` site (28 today: `system/core.bl` 21,
+  `system/linear.bl` 4, `veritas.bl` 2, `system/smt.bl` 1) with the obligation it
+  discharges and the fragment it lives in (`:tag-lattice`, `:linear-int`,
+  `:presburger`, `:general-smt`, `:unknown`);
+- assert one fact per decision into the mounted codebase store, so the histogram
+  is a query:
+  `[:find ?tier (count ?d) :where [?d :verify/tier ?tier]]`;
+- green example: `examples/system/obligation-ledger.bl` prints the histogram over
+  a fixed corpus and asserts the total equals the number of checks.
+
+Acceptance: `mix bl run examples/system/obligation-ledger.bl` prints a histogram
+whose total matches the instrumented call sites; `mix bl check priv` unchanged
+(no semantics moved yet).
+
+**Gate:** if `:native-*` is ~0%, SKIP steps 3-4 and stop at the pool. The number
+decides, not the ambition.
+
+* Step 1 — conversation API (the pool with N=1), green
+
+- `z3/with-solver`: lease a solver for the duration of a conversation, return it
+  in a `finally`; `N=1` today, so behaviour is unchanged and the API is honest
+  about what it may charge for later;
+- every solver call inside a conversation is bounded by `fence` (bundles §2):
+  `{:ok v} | {:crash reason} | {:timeout}` — a hung z3 becomes a VALUE, not an
+  exception whose only trace is `tool handler error:` in a daemon log;
+- cutover: `mcp.tools/port!` → `z3/with-solver`; `Z3Port.check/3` becomes the
+  in-conversation send;
+- `push`/`pop`/`assume` verbs land here (used by step 4 and by
+  `discover-invariant`, which today runs several checks per call as separate
+  conversations).
+
+Acceptance: `mix bl test test/bl/system/z3_concurrent_test.bl` → 6 passed (it is
+committed with its PRE-fix observation: 1 of 8 answering); the 4-thread HTTP soak
+→ 0 failures in 1000; `mix bl run examples/mcp-demo.bl` → 11/11.
+
+* Step 2 — the pool as a bundle, green
+
+```clojure
+(defsupervisor z3-pool
+  (strategy  :one-for-one)
+  (intensity 3 5000)
+  (child :solvers (pool solver-srv 4)))       ; N solvers, one-for-one, healed
+
+(defserver z3-leases
+  (invariant (<= (count (keys leases)) 4))    ; verified by system/verify itself
+  (invariant (every lease-returns? leases)))
+```
+
+- checkout = `call [:reg z3-leases] [:checkout]` (fence-bounded wait, so a
+  saturated pool answers `{:timeout}` instead of hanging a caller);
+- return is GUARANTEED by `monitor` on the borrower (a crashed caller's lease
+  comes back — the Fence bundle's `demonitor :flush` discipline, applied to a
+  lease);
+- a fenced-out solver is terminated and healed by the supervisor, so a poisoned
+  z3 process is never reused;
+- `super/children z3-pool` is the observability surface; `system/verify
+  'z3-pool` is the boot gate — and it is the SAME verifier the pool serves:
+  recursive dogfooding, and the cheapest test of both.
+
+Acceptance: `mix bl test test/bl/system/z3_pool_test.bl` (concurrent leases never
+exceed N; a killed borrower returns its lease; a hung solver is replaced and the
+next verify answers); `system/verify 'z3-pool` green; 8-thread soak → 0 failures,
+and `(count (super/children z3-pool))` still 4 after a forced kill.
+
+* Step 3 — native tiers behind one gate (only if step 0's number says so)
+
+- `system/decide.bl` gets a ladder, each rung carrying the equivalence obligation
+  pattern 03 requires, so a rung may answer ONLY if it can state and discharge it
+  (silent tightening stays impossible by construction);
+- rung order: `:tag-lattice` (value-model facts, exact, no solver) →
+  `:linear-int` (bounded guards over integers — BEAM bignums are exact) →
+  decidable fragments → `:general-smt` (z3, oracle of last resort);
+- cutover ONE call site at a time, each with a green example, exactly like
+  PLAN-085's steps; the obligation fact keeps the histogram honest as tiers move;
+- `system/prove.bl::native-eligible?` is the model to copy: a proof annotation
+  consumed by a gate, not a re-walk.
+
+Acceptance per site: the pre-cutover obligations still answer the same way on the
+instrumented corpus (a differential check over the ledger, not vibes), `:tier` in
+the ledger moves from `:general-smt` to the native tier, and every existing test
+of that verb stays green.
+
+* Step 4 — the capstone: the verdict says who proved it
+
+- `code/verify` (and `system/verify`) return `{:verdict "holds" :tier :linear-int
+  :obligation ...}` — the MCP surface reports a machine-checked verdict AND its
+  provenance: native lattice / native arithmetic / z3;
+- unsat cores (from step 1's conversation verbs) turn "violated" into "violated
+  by guard G on transition T" — repair messages get a reason instead of a guess;
+- guidebook chapter + pattern-ledger update, per the bundles convention.
+
+Acceptance: `mix bl run examples/mcp-demo.bl` shows the tier in exchanges 7/8; the
+HTTP battery and the soak stay green; `docs/patterns/00-README.md` gains the row
+(or pattern 30 gains the section) describing obligation-gated DECISION the way it
+already describes obligation-gated LOWERING.
+
+* DAG and ordering
+
+```
+0 (instrument) --> 1 (conversation) --> 2 (pool) --> [gate: native fraction > 0?] --> 3 (tiers) --> 4 (provenance)
+```
+
+Steps 1 and 2 are independent of the gate; 3 and 4 are deliberately behind it.
+
+* Risks / gotchas known today
+
+- `./bl` and `mix bl *` builds are blocked WHILE another session edits
+  `priv/lib/mcp/*.bl` and `lib/beam_lisp/daemon/{ports,gateway}.ex`; the tree must be
+  quiet for any acceptance here to run (observed: "unterminated collection"; a
+  CompileError in gateway.ex).
+- `map` is lazy in beam-lisp (side effects inside a mapped fn do not fire until
+  the seq is realised) — a lease loop must force it, or leases leak silently.
+- Spawned processes cannot see THIS-ns `def` vars: pass data through closure
+  locals.
+- `pool`'s designed front is Fan-Out over `cast` (fire-and-forget). A LEASE is
+  not that: checkout must be `call` + monitor + fence. Do not overload `cast`.
+- The 10 s port timeout currently raises `RuntimeError "z3 timeout (acc: \"\")"`;
+  after step 1 it must be a value (`{:timeout}`), and `call-tool`'s catch-all
+  (FUP-047) must stop translating it into "-32602 Invalid params".
