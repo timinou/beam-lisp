@@ -57,12 +57,26 @@ commits, and prints a line per commit. It runs until you stop it.
 
 ```sh
 $ bl watch src
-bl watch: watching src — Ctrl+C to stop
+bl watch: watching /home/you/proj/src — Ctrl+C to stop
+✓ applied  /home/you/proj/src/ledger.bl  [ledger]
 ```
 
 A save that does not cohere is held back with its reason; the old code keeps
 serving. That is the same stage → check → commit pipeline the daemon and the
 monitor use.
+
+When a daemon is running for your tree, the **daemon hosts the watcher**: the
+watch request does not occupy the daemon's worker, and every reload's apply
+rides its queue, so a reload is ordered against the runs and tests the daemon is
+serving rather than racing them. A second client can `bl ask` or `bl test` while
+your watch streams. Results arrive as ordinary output frames, plus a heartbeat
+while the tree is quiet, so the stream stays live without a terminal frame.
+Without a daemon (`BL_DAEMON=off`, or no daemon for this tree) the same verb
+runs the same watcher in its own VM.
+
+The verbs that hold a process of their own — `bl repl`, `bl monitor`,
+`bl serve`, `bl mcp`, `bl lsp serve` — are never routed to the daemon's worker;
+they take a cold VM so the daemon keeps answering everyone else.
 
 Live reload needs the `:file_system` application, which the release ships.
 

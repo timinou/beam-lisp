@@ -15,7 +15,7 @@ defmodule BeamLisp.Daemon.Server do
   use GenServer
   require Logger
 
-  alias BeamLisp.Daemon.{Paths, Listener, Protocol}
+  alias BeamLisp.Daemon.{Paths, Listener, Protocol, WatchRegistry}
 
   @default_idle_seconds 8 * 60 * 60
 
@@ -191,15 +191,223 @@ defmodule BeamLisp.Daemon.Server do
     spawn(fn -> Listener.accept_loop(lsock, ctx, fn -> :counters.get(flag, 1) == 1 end) end)
   end
 
+  @watch_heartbeat_ms 20_000
+
   # The default command path: hand the request to the Executor (one worker at a
   # time). `conn` is the connection handler pid, which routes stdin frames.
+  #
+  # A `bl watch` request is the ONE exception: the daemon HOSTS the watcher, so
+  # the request must not hold the single Executor worker for the session's whole
+  # life (it would block every later client forever). Only the reload APPLIES
+  # ride the FIFO — the registry's apply_fun submits each through
+  # `Executor.run_reload/2` — which is what orders a reload against the runs and
+  # tests the daemon is serving. Every other argv path is unchanged.
   defp default_execute(sock, id, req, conn) do
-    BeamLisp.Daemon.Executor.run(sock, id, req, conn)
+    case watch_request(req.argv) do
+      {:ok, st} ->
+        watch_session(sock, id, req, conn, st)
+
+      :refuse ->
+        refuse_owning_verb(sock, id)
+
+      :no ->
+        BeamLisp.Daemon.Executor.run(sock, id, req, conn)
+    end
   rescue
-    e ->
-      _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{Exception.message(e)}\n"))
-      _ = :gen_tcp.send(sock, Protocol.exit(id, 70))
-      70
+    e -> fail_execute(sock, id, e)
+  end
+
+  # The verbs that own their process for as long as it lives: a repl waiting on
+  # stdin, a server, a watcher that repaints, an editor/agent transport. The
+  # launcher already sends them to a cold VM (see `owns_process` in
+  # tooling/drop/src/launcher.rs), so this is the SAFETY NET for a spelling the
+  # launcher's own token test misses (`bl -p lib repl`). Without it the Executor
+  # would park on its single worker and every later client would wait forever —
+  # the daemon would still look alive, which is the worst way to fail.
+  @owning_verbs ~w(repl monitor serve mcp)
+  defp refuse_owning_verb(sock, id) do
+    msg =
+      "bl daemon: this command keeps its own process — run it without the daemon " <>
+        "(BL_DAEMON=off bl ...)\n"
+
+    _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, msg))
+    _ = :gen_tcp.send(sock, Protocol.exit(id, 1))
+    1
+  end
+
+  defp fail_execute(sock, id, e) do
+    _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{Exception.message(e)}\n"))
+    _ = :gen_tcp.send(sock, Protocol.exit(id, 70))
+    70
+  end
+
+  # Is this a `bl watch` request? Decided by the CLI's OWN grammar
+  # (`bl.cli/parse-argv`), not by the first argv token: global flags may precede
+  # the command, so `bl -p lib watch DIR` must route here exactly as
+  # `bl watch DIR` does — a watch that fell through to the Executor would park
+  # on the single worker and block every later client. The cheap member? test
+  # only gates the parse.
+  defp watch_request(argv) do
+    if Enum.member?(argv, "watch") or Enum.member?(argv, "repl") or owns_process_verb?(argv) do
+      case parse_argv(argv) do
+        %{cmd: "watch"} = st ->
+          {:ok, st}
+
+        %{cmd: cmd} when cmd in @owning_verbs ->
+          :refuse
+
+        %{cmd: "lsp", args: ["serve" | _]} ->
+          :refuse
+
+        _ ->
+          :no
+      end
+    else
+      :no
+    end
+  end
+
+  # A cheap gate before parsing: does any token name a verb that owns its own
+  # process? (`bl repl` with no flags is the common case, so the bare name is
+  # tested too.)
+  defp owns_process_verb?(argv) do
+    Enum.any?(argv, fn tok -> tok in @owning_verbs or tok == "lsp" end)
+  end
+
+  # A watch session. Frames it emits, all on the request id:
+  #
+  #   {:bl, 1, :stdout,    id, 0,   "bl watch: watching DIR — Ctrl+C to stop\n"}
+  #   {:bl, 1, :stdout,    id, seq, rendered}        per reload commit
+  #   {:bl, 1, :heartbeat, id, ms}                   every @watch_heartbeat_ms
+  #
+  # and NO terminal `:exit` frame — a watch stream is live until the client
+  # disconnects, which is exactly what the launcher's `stream_until_exit` loops
+  # on: it keeps reading (and printing `:stdout` bytes) until the socket is
+  # lost, so Ctrl-C on the client is the end of the stream. The heartbeat keeps
+  # that read from timing out while the watched directory is quiet. A usage or
+  # registration error DOES send `:exit` (2 / 1) — the session never started.
+  defp watch_session(sock, id, req, conn, st) do
+    case watch_dir(st, req.cwd) do
+      {:ok, dir} ->
+        render = watch_renderer()
+        seq = :atomics.new(1, [])
+
+        notify = fn result ->
+          # A render fault must not take the registry (every watcher) down.
+          bytes =
+            try do
+              to_string(render.(result))
+            rescue
+              e -> "bl watch: render failed: #{Exception.message(e)}\n"
+            end
+
+          n = :atomics.add_get(seq, 1, 1)
+          _ = :gen_tcp.send(sock, Protocol.stdout(id, n, bytes))
+        end
+
+        case WatchRegistry.watch(dir, {conn, id}, notify) do
+          :ok ->
+            line = "bl watch: watching #{dir} — Ctrl+C to stop\n"
+            _ = :gen_tcp.send(sock, Protocol.stdout(id, 0, line))
+            park_watch(sock, id, conn)
+            0
+
+          {:error, reason} ->
+            _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, watch_start_error(reason)))
+            _ = :gen_tcp.send(sock, Protocol.exit(id, 1))
+            1
+        end
+
+      {:error, :usage} ->
+        _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "usage: bl watch FILE|DIR\n"))
+        _ = :gen_tcp.send(sock, Protocol.exit(id, 2))
+        2
+
+      {:error, {:not_dir, arg}} ->
+        _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl watch: not a directory: #{arg}\n"))
+        _ = :gen_tcp.send(sock, Protocol.exit(id, 2))
+        2
+    end
+  end
+
+  # Park the session until the client is gone. The listener's connection
+  # handler (`conn`) exits when its socket dies, so monitoring `conn` is the
+  # teardown signal; the registry then drops this session's subscription on the
+  # monitor it holds (see WatchRegistry). A heartbeat keeps the launcher's 30s
+  # read timeout from expiring between commits.
+  defp park_watch(sock, id, conn) do
+    ref = Process.monitor(conn)
+
+    try do
+      loop_watch(sock, id, ref)
+    after
+      Process.demonitor(ref, [:flush])
+    end
+  end
+
+  defp loop_watch(sock, id, ref) do
+    receive do
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        :ok
+    after
+      @watch_heartbeat_ms ->
+        if :gen_tcp.send(sock, Protocol.heartbeat(id)) == :ok do
+          loop_watch(sock, id, ref)
+        else
+          :ok
+        end
+    end
+  end
+
+  # The target is the CLI's own positional (the parse already happened in
+  # `watch_request/1`), resolved against the CLIENT's cwd — never the daemon's
+  # own checkout. A file names its own directory, so `bl watch foo.bl` and
+  # `bl watch .` are the same request; a bad flag is the same usage error a
+  # standalone `bl` would give.
+  defp watch_dir(st, cwd) do
+    cond do
+      Map.get(st, :error) != nil ->
+        {:error, :usage}
+
+      Map.get(st, :unknown) != nil ->
+        {:error, :usage}
+
+      true ->
+        case st |> Map.get(:args, []) |> Enum.to_list() do
+          [target | _] -> resolve_watch_dir(target, cwd)
+          _ -> {:error, :usage}
+        end
+    end
+  end
+
+  defp parse_argv(argv) do
+    BeamLisp.Loader.ensure_loaded("bl.cli")
+    parse = BeamLisp.Env.fetch!("bl.cli", "parse-argv")
+    BeamLisp.RT.invoke(parse, [argv])
+  end
+
+  defp resolve_watch_dir(target, cwd) do
+    path = Path.expand(target, cwd)
+
+    cond do
+      File.dir?(path) -> {:ok, path}
+      File.regular?(path) -> {:ok, Path.dirname(path)}
+      true -> {:error, {:not_dir, target}}
+    end
+  end
+
+  # ONE renderer for both hosts: resolve `bl.watch/render` through the RT and
+  # call it here, so the daemon's commit lines and a standalone `bl watch`'s are
+  # produced by the same beam-lisp function and cannot drift.
+  defp watch_renderer do
+    BeamLisp.Loader.ensure_loaded("bl.watch")
+    render = BeamLisp.Env.fetch!("bl.watch", "render")
+    fn result -> BeamLisp.RT.invoke(render, [result]) end
+  end
+
+  defp watch_start_error(reason) do
+    "bl watch: cannot start the watcher: #{inspect(reason)}\n" <>
+      "  the live-reload engine needs the :file_system application; run `bl doctor`.\n"
   end
 
   defp safe_boot do

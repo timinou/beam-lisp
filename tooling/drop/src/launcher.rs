@@ -11,6 +11,76 @@ include!("daemon.rs");
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
+/// The command word in `argv`, skipping global flags and their values.
+///
+/// Global flags may precede the command (`bl -p lib run x.bl`), so the verb is
+/// not simply `argv[0]` — deciding the daemon fast-path on the first token would
+/// send `bl -p lib repl` to the daemon, where it would hold the single worker
+/// forever. `--` is skipped too: everything after it is the program's argv.
+fn verb_of(argv: &[String]) -> Option<String> {
+    const VALUED: [&str; 8] = [
+        "-p",
+        "--path",
+        "--code-path",
+        "-o",
+        "--out",
+        "--tier",
+        "--jobs",
+        "--port",
+    ];
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "--" {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && a != "-" {
+            if VALUED.contains(&a) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // An empty token names nothing: it is a quoting accident, not a verb.
+        if a.is_empty() {
+            i += 1;
+            continue;
+        }
+        return Some(a.to_string());
+    }
+    None
+}
+
+// ── tests: the daemon fast-path's verb detection ────────────────────────────
+#[cfg(test)]
+mod verb_tests {
+    use super::verb_of;
+
+    fn v(args: &[&str]) -> Option<String> {
+        verb_of(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn verb_is_the_first_non_flag_token() {
+        assert_eq!(v(&["run", "x.bl"]).as_deref(), Some("run"));
+        assert_eq!(v(&["--json", "check"]).as_deref(), Some("check"));
+        assert_eq!(v(&["-p", "lib", "repl"]).as_deref(), Some("repl"));
+        assert_eq!(v(&["--code-path", "beams", "--json", "ask", "impact"]).as_deref(), Some("ask"));
+        assert_eq!(v(&["-o", "out"]).as_deref(), None);
+        assert_eq!(v(&["", "lint"]).as_deref(), Some("lint"));
+    }
+
+    #[test]
+    fn empty_and_flags_only_have_no_verb() {
+        assert_eq!(v(&[]), None);
+        assert_eq!(v(&["--json"]), None);
+        assert_eq!(v(&["-p"]), None);
+        assert_eq!(v(&["--"]), None);
+    }
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("drop: {msg}");
     std::process::exit(EXIT_LAUNCHER_FAILURE)
@@ -265,17 +335,20 @@ fn main() {
     // in ~30ms instead of a ~1.2s cold VM boot. Skipped when BL_DAEMON=off, for
     // the daemon lifecycle verbs themselves (which must reach the release), and
     // for the verbs that own their process for as long as it lives: a repl, a
-    // watcher, a server, an editor/agent transport. The daemon runs one command
-    // at a time in one worker, so a command that never returns would hold every
-    // later client's turn; these run cold in their own VM instead.
+    // repainting monitor, a server, an editor/agent transport. The daemon runs
+    // one command at a time in one worker, so a command that never returns
+    // would hold every later client's turn; these run cold in their own VM
+    // instead. `watch` is NOT one of them: the daemon HOSTS the watcher (its
+    // WatchRegistry) and streams commits back, so `bl watch` rides the warm
+    // daemon and its reloads stay ordered with the runs and tests it serves.
     #[cfg(unix)]
     {
         let off = std::env::var("BL_DAEMON").map(|v| v == "off").unwrap_or(false);
-        let first = argv.first().map(String::as_str);
-        let is_lifecycle = first == Some("daemon");
-        let owns_process = argv.is_empty()
-            || matches!(first, Some("repl" | "watch" | "monitor" | "serve" | "mcp"))
-            || (first == Some("lsp") && argv.get(1).map(String::as_str) == Some("serve"));
+        let verb = verb_of(&argv);
+        let is_lifecycle = verb.as_deref() == Some("daemon");
+        let owns_process = verb.is_none()
+            || matches!(verb.as_deref(), Some("repl" | "monitor" | "serve" | "mcp"))
+            || (verb.as_deref() == Some("lsp") && argv.iter().any(|a| a == "serve"));
         if !off && !is_lifecycle && !owns_process {
             if let Some(code) = maybe_attach_daemon(&argv, &bin) {
                 std::process::exit(code);
