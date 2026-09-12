@@ -99,6 +99,13 @@ defmodule BeamLisp.MixProject do
       # (and the dev-only Tidewave playground, lib/dev/dev_server.ex). It ships
       # in the release: a drop that advertises `bl serve` must be able to run it.
       {:bandit, "~> 1.5"},
+      # websock_adapter answers the upgrade bandit hands it: bandit depends on
+      # `websock` (the behaviour) but NOT on the adapter (the `upgrade/4` call),
+      # so `web.upgrade` — and with it every live.app socket — dies in a release
+      # without this line. It ships for the same reason bandit does: a drop that
+      # advertises `bl serve` serves live pages, and a page whose every intent
+      # rides the socket is dead without it.
+      {:websock_adapter, "~> 0.5"},
       # file_system drives the live-reload watcher (lib/beam_lisp/reload_watcher.ex)
       # behind `bl watch` and `bl monitor`: it emits filesystem events for `.bl`
       # saves, which the watcher stages into the reload bundle. Ships in the

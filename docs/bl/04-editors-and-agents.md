@@ -70,11 +70,14 @@ data:
 
 ### Wiring an editor
 
-`editors/README.md` has ready configuration for Emacs (eglot, via the bundled
-major mode), Neovim (both `nvim-lspconfig` and 0.11's `vim.lsp.config`), VS
-Code, and any other generic LSP client — plus a hand-run protocol example. Point
-the client at `bl lsp serve`; inside the checkout use `mix bl lsp serve`, or put
-`bl` on `PATH`.
+`bl install` does the wiring (see
+[00-the-cli.md](00-the-cli.md#install)): `bl install doom` installs the Doom
+Emacs module — the major mode, the tree-sitter grammar, LSP registration, a
+warm REPL, and first-party literate `.bl.md` / `.bl.org` support — and
+`bl install mcp` writes the agent instructions and client registration for
+MCP clients. The sections below remain the hand-run reference for clients
+the installer does not know yet (Neovim, VS Code) and for understanding what
+the installer writes.
 
 `bl lsp check FILE` is the same analysis without an editor — see
 [00-the-cli.md](00-the-cli.md#bl-lsp-check-file---json).
@@ -95,8 +98,39 @@ A client starts with `server/discover`:
 {"id": 1, "result": {
    "protocolVersion": "2026-07-28",
    "serverInfo": {"name": "beam-lisp-mcp-server", "version": "0.1.0"},
-   "capabilities": {"tools": {}, "resources": {"listChanged": false, "subscribe": false}}}}
+   "capabilities": {"tools": {}, "prompts": {"listChanged": false},
+                    "resources": {"listChanged": false, "subscribe": false}},
+   "instructions": "# beam-lisp MCP — onboarding\n\n## What you are holding\n\n…"}}
 ```
+
+### Instructions are facts; a prompt is a query result
+
+The server's instructions are not a file — they are datoms in the same
+database that holds the code facts, mounted beside them at startup. Each
+fragment is an entity with `:instr/id` (a unique identity — re-asserting
+amends), `:instr/for` (the surface: `"mcp"`), `:instr/kind`
+(`:onboarding` | `:usage` | `:protocol`), `:instr/order`, `:instr/title`,
+`:instr/text`. Two authoring styles, one fact space:
+
+- **the corpus document** — `priv/lib/mcp/instructions.bl.md` holds the
+  fragments about the surface as a whole;
+- **colocated annotations** — `^{:instr {…}}` on an `(ns …)` or `defn` NAME
+  puts an instruction in the namespace it describes, and the indexer
+  (`codebase.bl`) emits it as the same kind of fact.
+
+The prompt surface is three queries over those facts:
+
+| prompt | kind | when a client reads it |
+|---|---|---|
+| `beam-lisp/onboarding` | `:onboarding` | first contact, once (also on `server/discover` as `instructions`) |
+| `beam-lisp/usage` | `:usage` | on task start; closes with the live registry — tools, questions and counts as they are right now |
+| `beam-lisp/protocol` | `:protocol` | before extending or amending the instructions |
+
+`prompts/list` advertises them; `prompts/get` assembles one. Because the
+facts sit in the served database, `code/query` can read the instructions
+too — an agent can check where its instructions come from. `bl install mcp`
+projects the same corpus into markdown files; the files and the prompts
+cannot drift, because both are projections of one corpus.
 
 `tools/list` returns the tool surface:
 

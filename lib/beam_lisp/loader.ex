@@ -209,7 +209,15 @@ defmodule BeamLisp.Loader do
         # A daemon request binds the CLIENT's roots (cwd + `-p` paths) via
         # `with_ambient_dirs/2`; the daemon VM's own cwd is the checkout,
         # not the client's tree. Unbound, this is the standalone capture.
-        dirs = Process.get(:bl_ambient_dirs) || [File.cwd!() | extra_dirs()]
+        #
+        # EITHER WAY the caller's configured search paths join them. A bound
+        # capture used to REPLACE the standalone one, dropping `extra_dirs`
+        # (search paths + BEAM_LISP_PATH) — so a root registered by
+        # `Env.add_search_path` inside a daemon request was invisible to the
+        # load, because a fork's search paths live in the fork's env and the
+        # Loader.Server reads its own. A project's declared library roots
+        # (`env.bl` :paths) are exactly such a root.
+        dirs = (Process.get(:bl_ambient_dirs) || [File.cwd!()]) ++ extra_dirs()
 
         BeamLisp.Loader.Server.run(fn ->
           prev = Process.get(:bl_search_dirs)
@@ -480,6 +488,12 @@ defmodule BeamLisp.Loader do
       take_until(rest, pred, [line | acc])
     end
   end
+  # The declared name is the first SYMBOL after `ns`. Metadata is not a symbol,
+  # so `(ns ^{:instr {…}} codebase …)` — how priv/std/codebase.bl declares
+  # itself — must skip it rather than read it as the name. Reading it as the
+  # name made `find_file/1` reject the file as `{:wrong_ns, …}`, so
+  # `source_content/1` answered nil for a namespace that ships in priv, and the
+  # MCP codebase mount (which indexes exactly this file) failed at first use.
   defp declared_ns(source) do
     case skip_leading(source) do
       "(" <> rest ->
@@ -487,7 +501,7 @@ defmodule BeamLisp.Loader do
 
         case take_token(rest) do
           {"ns", rest} ->
-            rest = skip_leading(rest)
+            rest = rest |> skip_leading() |> skip_metadata() |> skip_leading()
 
             case take_token(rest) do
               {name, _} -> name
@@ -502,6 +516,52 @@ defmodule BeamLisp.Loader do
         nil
     end
   end
+
+  # `^meta` before a form: a map/vector/list (skipped by matching delimiters,
+  # strings respected, nesting counted) or a bare keyword/symbol token. Repeated
+  # because metadata stacks (`^:private ^:const name`).
+  defp skip_metadata("^" <> rest) do
+    rest |> skip_leading() |> skip_one_form() |> skip_metadata()
+  end
+
+  defp skip_metadata(other), do: other
+
+  @delimiters %{?{ => ?}, ?[ => ?], ?( => ?)}
+
+  defp skip_one_form(<<c, _::binary>> = s) do
+    case Map.fetch(@delimiters, c) do
+      {:ok, close} -> skip_nested(binary_part(s, 1, byte_size(s) - 1), c, close, 1, false)
+      :error ->
+        case take_token(s) do
+          {_token, rest} -> rest
+          nil -> s
+        end
+    end
+  end
+
+  defp skip_nested(<<>>, _op, _cl, _depth, _in_str), do: ""
+
+  defp skip_nested(<<c, rest::binary>>, op, cl, depth, true) do
+    cond do
+      c == ?\\ -> skip_nested(drop_char(rest), op, cl, depth, true)
+      c == ?" -> skip_nested(rest, op, cl, depth, false)
+      true -> skip_nested(rest, op, cl, depth, true)
+    end
+  end
+
+  defp skip_nested(<<c, rest::binary>>, op, cl, depth, false) do
+    cond do
+      c == ?" -> skip_nested(rest, op, cl, depth, true)
+      c == ?\\ -> skip_nested(drop_char(rest), op, cl, depth, false)
+      c == op -> skip_nested(rest, op, cl, depth + 1, false)
+      c == cl and depth == 1 -> rest
+      c == cl -> skip_nested(rest, op, cl, depth - 1, false)
+      true -> skip_nested(rest, op, cl, depth, false)
+    end
+  end
+
+  defp drop_char(<<_c, rest::binary>>), do: rest
+  defp drop_char(<<>>), do: ""
 
   defp skip_leading(<<c, rest::binary>>) when c in @ws, do: skip_leading(rest)
 

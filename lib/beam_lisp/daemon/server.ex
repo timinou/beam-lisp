@@ -15,7 +15,7 @@ defmodule BeamLisp.Daemon.Server do
   use GenServer
   require Logger
 
-  alias BeamLisp.Daemon.{Paths, Listener, Protocol, WatchRegistry}
+  alias BeamLisp.Daemon.{HTTP, Listener, Paths, Ports, Protocol, WatchRegistry}
 
   @default_idle_seconds 8 * 60 * 60
 
@@ -71,25 +71,23 @@ defmodule BeamLisp.Daemon.Server do
       _ = write_pid(ep.pid, root)
       _ = write_meta(ep.meta, root, token)
 
-      # The single-worker command serializer. Linked so a daemon stop takes it
-      # down; a fresh one starts with each daemon.
-      {:ok, _exec} =
-        case Process.whereis(BeamLisp.Daemon.Executor) do
-          nil -> BeamLisp.Daemon.Executor.start_link([])
-          pid -> {:ok, pid}
-        end
+      # The two stateful workers — the single-worker command serializer and the
+      # watcher registry — under one supervisor, because a bare `start_link` is
+      # linked but never RESTARTED: user code runs inside the worker, so a
+      # crash it links (`examples/mcp-demo.bl` starting an in-process MCP
+      # server) used to leave the daemon healthy-looking and permanently
+      # unable to run anything (`:noproc`). See `BeamLisp.Daemon.Workers`.
+      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started()
 
-      # The watcher registry: `bl watch` clients register here; reload commits
-      # ride the Executor FIFO. Optional — a build without :file_system still
-      # serves every non-watch command.
-      {:ok, _wreg} =
-        case Process.whereis(BeamLisp.Daemon.WatchRegistry) do
-          nil -> BeamLisp.Daemon.WatchRegistry.start_link([])
-          pid -> {:ok, pid}
-        end
+      # The session's address. `:ui` is claimed first (the registry is what
+      # decides whether a project's pinned port is free), then served — the page
+      # and the MCP endpoint live on ONE port, because "where is this session"
+      # should have one answer.
+      ui = start_ui(root)
 
       state = %{
         root: root,
+        ui: ui,
         endpoints: ep,
         token: token,
         tree: Paths.tree_fingerprint(root),
@@ -109,6 +107,7 @@ defmodule BeamLisp.Daemon.Server do
       start_acceptor(state)
       schedule_idle_check(state)
       Logger.info("bl daemon up: tree #{ep.tree_id} at #{ep.sock}")
+      IO.puts(startup_message(root, ui))
       {:ok, state}
     else
       {:error, reason} -> {:stop, {:daemon_init_failed, reason}}
@@ -150,12 +149,120 @@ defmodule BeamLisp.Daemon.Server do
   def terminate(_reason, state) do
     :counters.put(state.stop_flag, 1, 1)
     _ = :gen_tcp.close(state.lsock)
+    Ports.release(:ui)
     ep = state.endpoints
     for f <- [ep.sock, ep.token, ep.pid, ep.meta, ep.lock], do: File.rm(f)
     :ok
   end
 
   # --- internals ---
+
+  # ── the session's address ────────────────────────────────────────────────
+
+  # Claim and serve `:ui`. A project pins it with `:ports {:ui 7700}` in env.bl;
+  # without a pin the OS chooses, which is the right default — two trees on one
+  # machine must never fight over a number nobody chose.
+  #
+  # A failure here does NOT stop the daemon: its job is serving commands, and the
+  # page is a view. The startup message says what happened either way.
+  defp start_ui(root) do
+    want = project_port(root, "ui") || 0
+
+    case Ports.claim(:ui, want, root: root) do
+      {:ok, port} ->
+        case serve_ui(port, root) do
+          {:ok, pid} -> %{port: port, pid: pid, pinned: want != 0, error: nil}
+          {:error, reason} -> %{port: port, pid: nil, pinned: want != 0, error: reason}
+        end
+
+      {:error, reason} ->
+        %{port: nil, pid: nil, pinned: want != 0, error: reason}
+    end
+  end
+
+  defp serve_ui(port, root) do
+    opts = [
+      plug:
+        {HTTP,
+         [
+           status_fun: fn -> GenServer.call(__MODULE__, :status) end,
+           tree_id: Paths.tree_id(root),
+           # the intent guard: the page carries the daemon's own token, which a
+           # cross-origin caller cannot read and cannot send without a preflight
+           # this server never approves
+           token: System.get_env("BL_DAEMON_TOKEN") || File.read!(elem(Paths.endpoints(root), 1).token)
+         ]},
+      port: port,
+      ip: {127, 0, 0, 1},
+      startup_log: false
+    ]
+
+    case Bandit.start_link(opts) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, reason} ->
+        # The port could have been taken between the claim's probe and this bind
+        # (milliseconds). Take the failure as the answer rather than looping: the
+        # message names it, and the next start tries again.
+        {:error, reason}
+    end
+  end
+
+  # The port a project declares for `name`: `:ports {:ui 7700}` or
+  # `:ports {:ui {:port 7700}}`. nil when the tree declares none (the caller
+  # then asks the OS).
+  defp project_port(root, name) do
+    BeamLisp.Loader.ensure_loaded("bl.env")
+    p = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.env", "project"), [root])
+    spec = Map.get(Map.get(p, :ports) || %{}, name)
+
+    cond do
+      is_integer(spec) -> spec
+      # `{:port N}` from a project map. Matched, not `is_map`-tested: a bl
+      # Vector or Set is a struct and would pass `is_map/1`.
+      match?(%{port: _}, spec) -> Map.get(spec, :port)
+      true -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  @doc """
+  What the daemon says when it comes up. It names the tree, the session's URL,
+  and — because the port is ephemeral unless the project pins it — HOW to pin
+  it. The MCP line matters for the same reason: the session's port is the one
+  address an editor, an agent or a browser needs, and there is no second server
+  behind it.
+  """
+  def startup_message(root, ui) do
+    lines = ["bl daemon up for #{root}"]
+
+    lines =
+      case ui do
+        %{port: port, error: nil} when is_integer(port) ->
+          pin =
+            if ui.pinned do
+              "pinned by env.bl"
+            else
+              "ephemeral — pin it in env.bl with :ports {:ui 7700}"
+            end
+
+          lines ++
+            [
+              "  ui:   http://127.0.0.1:#{port}   (#{pin})",
+              "  mcp:  http://127.0.0.1:#{port}/mcp   (the same MCP `bl mcp` serves over stdio)"
+            ]
+
+        %{error: error} ->
+          lines ++ ["  ui:   not served — #{inspect(error)}"]
+
+        _ ->
+          lines
+      end
+
+    Enum.join(lines, "\n")
+  end
 
   defp start_acceptor(state) do
     ctx = %{
@@ -166,6 +273,7 @@ defmodule BeamLisp.Daemon.Server do
       started_at: state.started_at,
       shutting_down: false,
       execute_fun: state.execute_fun,
+      ui_port: (state.ui && state.ui.port) || nil,
       control_fun: fn :stop -> GenServer.cast(__MODULE__, :stop) end,
       queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end,
       # Self-drift: has the checkout changed under the running daemon? Compare
@@ -203,7 +311,7 @@ defmodule BeamLisp.Daemon.Server do
   # `Executor.run_reload/2` — which is what orders a reload against the runs and
   # tests the daemon is serving. Every other argv path is unchanged.
   defp default_execute(sock, id, req, conn) do
-    case watch_request(req.argv) do
+    case watch_request(req.argv, req.cwd) do
       {:ok, st} ->
         watch_session(sock, id, req, conn, st)
 
@@ -214,17 +322,28 @@ defmodule BeamLisp.Daemon.Server do
         BeamLisp.Daemon.Executor.run(sock, id, req, conn)
     end
   rescue
-    e -> fail_execute(sock, id, e)
+    e -> fail_execute(sock, id, Exception.message(e))
+  catch
+    # The WORKER's death, not the command's own failure. User code that links
+    # (a `start-link` server, the demo's in-process MCP server) or a VM-level
+    # fault takes the Executor down mid-request, and the `GenServer.call` above
+    # exits — which `rescue` does not see. Uncaught, the CONNECTION dies with
+    # it and the client is told "outcome unknown" about a reason this process
+    # is holding in its hand. Report it: the worker is restarted by its
+    # supervisor, and this frame is the difference between a diagnosis and a
+    # mystery.
+    :exit, reason -> fail_execute(sock, id, "the command worker died: #{inspect(reason)}")
   end
 
-  # The verbs that own their process for as long as it lives: a repl waiting on
-  # stdin, a server, a watcher that repaints, an editor/agent transport. The
-  # launcher already sends them to a cold VM (see `owns_process` in
-  # tooling/drop/src/launcher.rs), so this is the SAFETY NET for a spelling the
-  # launcher's own token test misses (`bl -p lib repl`). Without it the Executor
-  # would park on its single worker and every later client would wait forever —
-  # the daemon would still look alive, which is the worst way to fail.
-  @owning_verbs ~w(repl monitor serve mcp)
+  # The commands that own their process for as long as it lives: a repl waiting
+  # on stdin, a server, a watcher that repaints, an editor/agent transport, or a
+  # project task declared `:watch`. The launcher already sends the first four to
+  # a cold VM (see `owns_process` in tooling/drop/src/launcher.rs), so this is
+  # the SAFETY NET for a spelling its own token test misses (`bl -p lib repl`)
+  # and for the project-declared kind it cannot know about at all. Without it
+  # the Executor would park on its single worker and every later client would
+  # wait forever — the daemon would still look alive, which is the worst way to
+  # fail.
   defp refuse_owning_verb(sock, id) do
     msg =
       "bl daemon: this command keeps its own process — run it without the daemon " <>
@@ -235,43 +354,41 @@ defmodule BeamLisp.Daemon.Server do
     1
   end
 
-  defp fail_execute(sock, id, e) do
-    _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{Exception.message(e)}\n"))
+  # The message is a STRING, not an exception: two callers reach here — a
+  # command that raised (message from the exception) and a command worker that
+  # died (message from the exit reason).
+  defp fail_execute(sock, id, message) when is_binary(message) do
+    _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{message}\n"))
     _ = :gen_tcp.send(sock, Protocol.exit(id, 70))
     70
   end
 
-  # Is this a `bl watch` request? Decided by the CLI's OWN grammar
-  # (`bl.cli/parse-argv`), not by the first argv token: global flags may precede
-  # the command, so `bl -p lib watch DIR` must route here exactly as
-  # `bl watch DIR` does — a watch that fell through to the Executor would park
-  # on the single worker and block every later client. The cheap member? test
-  # only gates the parse.
-  defp watch_request(argv) do
-    if Enum.member?(argv, "watch") or Enum.member?(argv, "repl") or owns_process_verb?(argv) do
-      case parse_argv(argv) do
-        %{cmd: "watch"} = st ->
-          {:ok, st}
+  # Which of the three ways a request can go: a `bl watch` session the daemon
+  # HOSTS, a command that keeps its own process (refused), or ordinary work for
+  # the Executor.
+  #
+  # The decision is the CLI's OWN: `parse-argv` plus `bl.cli/owns-process?`, on
+  # the CLIENT's cwd — the same grammar and the same project file a standalone
+  # `bl` reads, so the two hosts cannot disagree about which spelling must go
+  # cold. There is no cheap token pre-filter any more: a task name is only
+  # knowable through the project, and a watch that fell through to the Executor
+  # would park the single worker forever.
+  defp watch_request(argv, cwd) do
+    st = parse_argv(argv)
 
-        %{cmd: cmd} when cmd in @owning_verbs ->
-          :refuse
-
-        %{cmd: "lsp", args: ["serve" | _]} ->
-          :refuse
-
-        _ ->
-          :no
-      end
-    else
-      :no
+    cond do
+      st.cmd == "watch" -> {:ok, st}
+      owns_process?(argv, cwd) -> :refuse
+      true -> :no
     end
   end
 
-  # A cheap gate before parsing: does any token name a verb that owns its own
-  # process? (`bl repl` with no flags is the common case, so the bare name is
-  # tested too.)
-  defp owns_process_verb?(argv) do
-    Enum.any?(argv, fn tok -> tok in @owning_verbs or tok == "lsp" end)
+  # The CLI's answer to "does this command keep its process?"
+  defp owns_process?(argv, cwd) do
+    fun = BeamLisp.Env.fetch!("bl.cli", "owns-process?")
+    BeamLisp.RT.invoke(fun, [argv, cwd]) == true
+  rescue
+    _ -> false
   end
 
   # A watch session. Frames it emits, all on the request id:

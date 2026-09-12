@@ -1,0 +1,209 @@
+; edn_tagged_readers.bl — a PATCH PROGRAM for `bl override apply`.
+;
+; The feature: clojure.edn honors :readers and :default, so EDN text may
+; carry custom tagged literals — `#spell/meta {:version 1}` — realized
+; through caller-supplied fns. The shipped source accepts the opts map for
+; signature compatibility and ignores it ("no tagged literals in the
+; realizer yet"). This is the BOUNDARY-cluster need: packages that speak
+; EDN with their own tags.
+;
+; The patch is a program (not a diff, not a ruleset): it receives
+;
+;   {:db-for        (fn [ns-list] → conn) — the codebase database over the
+;                                            shipped sources the patch names
+;    :read-shipped  (fn [ns] → {:path :source} | nil)
+;    :overrides-dir …
+;    :cwd           …}
+;
+; and returns {:files {"clojure.edn" <new source>} :tests […]}. Targets are
+; FOUND, never hardcoded: the database says which defns the shipped
+; clojure.edn has and where; the reader's spans say exactly which bytes they
+; occupy; the two must agree or the patch raises — a beam-lisp that drifted
+; under this patch fails here, before a byte is written.
+
+(ns edn-tagged-readers
+  (:require [datom] [reader-node :as rn] [span-rewrite :as sr]))
+
+; ── structural targets, found two ways that must agree ──────────────────
+
+(def targets
+  "The shipped defns this patch rewrites. read-string-all is deliberately
+   absent: realize keeps a 1-arity defaulting opts to {}, so it works
+   untouched."
+  ["realize" "realize-map" "read-string"])
+
+(defn- defn-node
+  "The top-level node of (defn|defn-) NAME in src, or nil."
+  [src name]
+  (some (fn [node]
+          (let [f (rn/node-form node)]
+            (if (= :list (rn/node-tag f))
+              (let [items (rn/node-items f)
+                    head (rn/node-name (rn/node-form (first items)))
+                    name-form (rn/node-form (second items))
+                    nm (if (= :meta (rn/node-tag name-form))
+                         (rn/node-name (rn/node-form (nth (erlang/tuple_to_list name-form) 1)))
+                         (rn/node-name name-form))]
+                (if (and (or (= head "defn") (= head "defn-")) (= nm name))
+                  node
+                  nil))
+              nil)))
+        (BeamLisp.Reader/read_string src)))
+
+(defn- check-targets!
+  "Every target defn exists in the shipped source, at the line the codebase
+   DATABASE also reports. A missing or moved target is a raise, not a
+   silently skipped edit. `db-for` scopes the facts to the target namespace."
+  [db-for src]
+  (let [db (datom/db (db-for ["clojure.edn"]))]
+    (doseq [name targets]
+      (let [rows (datom/q '[:find ?line
+                            :in $ ?name
+                            :where
+                            [?d :fn/ns "clojure.edn"]
+                            [?d :fn/name ?name]
+                            [?d :fn/line ?line]]
+                          db name)
+            node (defn-node src name)]
+        (when (empty? rows)
+          (throw (str "patch: codebase db has no defn " name " in clojure.edn — shipped source drifted?")))
+        (when (nil? node)
+          (throw (str "patch: defn " name " not found by the reader — shipped source drifted?")))
+        (let [db-line (first (vec (first rows)))
+              reader-line (:line (rn/node-pos node))]
+          (when (not= db-line reader-line)
+            (throw (str "patch: " name " at line " reader-line " per the reader, "
+                        db-line " per the database — index disagrees with source"))))))))
+
+; ── span surgery: splice by original bytes, rightmost-first ─────────────
+
+(defn- replace-node
+  "src with node cn's source span replaced by new-text. All replacements are
+   computed against the ORIGINAL source's spans, so they must be applied
+   rightmost-first (earlier splices would move later spans)."
+  [src node new-text]
+  (let [cps (into [] (String/codepoints src))
+        offs (sr/line-offsets src)
+        pos (rn/node-pos node)
+        start (+ (get offs (:line pos)) (dec (:col pos)))
+        end (+ (get offs (:end-line pos)) (dec (:end-col pos)))]
+    (str (apply str (subvec cps 0 start))
+         new-text
+         (apply str (subvec cps end)))))
+
+; ── the new sources ──────────────────────────────────────────────────────
+;
+; The change in one sentence: `realize` and `realize-map` take opts as
+; their first argument, and a :record node (the reader's shape for an
+; UNREGISTERED tag followed by a map — `#my/tag {:a 1}`) dispatches through
+; opts :readers / :default instead of falling out as a raw node.
+
+(def new-realize
+  "(defn- realize
+  \"Turn one reader NODE into a plain data VALUE. Recurs into collections. A
+   symbol becomes a symbol value, a keyword a keyword — never resolved, never
+   called, because EDN is data. `opts` is read-string's options map, threaded
+   down the walk so a tagged literal meets its reader fn wherever it nests;
+   the 1-arity defaults it (read-string-all keeps its shape).\"
+  ([node] (realize {} node))
+  ([opts node]
+   (let [n (rn/node-form node)
+         tag (rn/node-tag n)]
+     (cond
+       ; a bare scalar (number, string, boolean, nil, char-as-codepoint)
+       (= tag :scalar) n
+       ; keyword node -> a keyword value
+       (= tag :keyword) (keyword (rn/node-name n))
+       ; symbol node -> a symbol value (nil/true/false read as scalars already)
+       (= tag :symbol) (edn-symbol (rn/node-name n))
+       ; vector -> a vector of realized items
+       (= tag :vector) (vec (map (fn [x] (realize opts x)) (rn/node-items n)))
+       ; list -> a list of realized items
+       (= tag :list) (apply list (map (fn [x] (realize opts x)) (rn/node-items n)))
+       ; set -> a set of realized items
+       (= tag :set) (set (map (fn [x] (realize opts x)) (rn/node-items n)))
+       ; map -> realize each key and value of each {k-node, v-node} pair
+       (= tag :map) (realize-map opts (rn/node-items n))
+       ; a tagged literal -> its :readers / :default fn (clojure.edn contract)
+       (= tag :record) (realize-tagged opts n)
+       ; anything else is returned as its node form
+       :else n))))")
+
+(def new-realize-map-and-tagged
+  "(defn- realize-map
+  \"Build a map from a list of {key-node, value-node} pairs, realizing both
+   sides of each pair with the same opts. The reader represents each entry
+   as a 2-tuple of nodes.\"
+  [opts pairs]
+  (reduce (fn [m pair]
+            (let [k (realize opts (erlang/element 1 pair))
+                  v (realize opts (erlang/element 2 pair))]
+              (assoc m k v)))
+          {}
+          pairs))
+
+(defn- realize-tagged
+  \"A tagged literal `[:record tag kvs]` realized through opts: the :readers
+   fn for the tag, else :default called with (tag-string value), else a
+   raise — clojure.edn's exact contract for an unread tag. The reader only
+   produces a :record for an UNREGISTERED tag followed IMMEDIATELY by a map;
+   a registered tag is its data-reader call before EDN sees it.
+
+   A :readers key matches by PRINTED NAME: the reader keeps 'my/tag a
+   whole-name symbol while (symbol \\\"my/tag\\\") ns-splits, so `str` is the
+   only honest comparison; string keys work the same way. (Deviation from
+   upstream, which keys by symbol and passes :default a symbol: here the tag
+   is a string throughout.)\"
+  [opts n]
+  (let [tag (nth (erlang/tuple_to_list n) 1)
+        kvs (nth (erlang/tuple_to_list n) 2)
+        rs (get opts :readers)
+        v (realize-map opts kvs)
+        hit (if (some? rs)
+              (some (fn [k] (if (= (str k) tag) (get rs k) nil)) (keys rs))
+              nil)]
+    (cond
+      (some? hit)                            (hit v)
+      (some? (get opts :default))            ((get opts :default) tag v)
+      :else (throw (str \"clojure.edn: no reader for tag #\" tag
+                        \" (pass :readers or :default)\")))))")
+
+(def new-read-string
+  "(defn read-string
+  \"Reads one object from the string `s` and returns it as EDN DATA. Returns nil
+   when `s` is nil or contains only whitespace/comments. Never evaluates `s`
+   (EDN is data), so it is safe on untrusted input — the whole reason
+   clojure.edn exists apart from the load-time reader.
+
+   The opts map is honored: :eof is the answer for empty input, and tagged
+   literals dispatch through :readers (a {tag → fn} map, keyed by symbol or
+   string) or :default (a fn of tag and value). A tag with no reader raises.\"
+  ([s] (read-string {} s))
+  ([opts s]
+   (if (nil? s)
+     (get opts :eof nil)
+     (let [forms (BeamLisp.Reader/read_all s)]
+       (if (empty? forms)
+         (get opts :eof nil)
+         (realize opts (first forms)))))))")
+
+; ── the transformation ───────────────────────────────────────────────────
+
+(defn transform
+  "Rewrite the shipped clojure.edn to honor :readers/:default. Returns the
+   full new source plus this patch's explicit tests."
+  [ctx]
+  (let [shipped ((:read-shipped ctx) "clojure.edn")]
+    (when (nil? shipped)
+      (throw "patch: no shipped clojure.edn — nothing to transform"))
+    (let [src (:source shipped)]
+      (check-targets! (:db-for ctx) src)
+      ; splice rightmost-first against the ORIGINAL spans: read-string,
+      ; then realize-map (whose replacement also carries the two new fns),
+      ; then realize.
+      (let [s1 (replace-node src (defn-node src "read-string") new-read-string)
+            s2 (replace-node s1 (defn-node src "realize-map") new-realize-map-and-tagged)
+            s3 (replace-node s2 (defn-node src "realize") new-realize)]
+        {:files {"clojure.edn" s3}
+         :tests ["tagged_readers_test.bl"]
+         :doc "clojure.edn honors :readers/:default — tagged literals in EDN"}))))

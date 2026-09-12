@@ -1,0 +1,167 @@
+; test/bl/system/env_test.bl — the project file: discovery, both reads, the
+; shape it normalizes to, and what a command actually binds from it.
+;
+; Run: bl test test/bl/system/env_test.bl
+(ns system.env-test
+  (:require [bl.env :as env] [bl.cli :as cli]))
+
+(defn- tmp-root []
+  (str (System/tmp_dir!) "/bl_env_" (erlang/unique_integer (list :positive))))
+
+(defn- scratch
+  "A directory that is removed when `f` returns, however it returns."
+  [f]
+  (let [root (tmp-root)]
+    (try
+      (File/mkdir_p! root)
+      (f root)
+      (finally (File/rm_rf! root)))))
+
+(defn- write! [root rel text]
+  (let [p (str root "/" rel)]
+    (File/mkdir_p! (Path/dirname p))
+    (File/write! p text)
+    p))
+
+; ── discovery ─────────────────────────────────────────────────────────
+
+(deftest discovery-walks-up-from-any-depth
+  (scratch
+    (fn [root]
+      (let [p (write! root "env.bl" "{:name \"probe\"}")
+            deep (str root "/a/b/c")]
+        (File/mkdir_p! deep)
+        (is (= p (env/find deep)) "the same file is found three levels down")
+        (is (= p (env/find root)))))))
+
+(deftest a-tree-without-a-project-file-has-none
+  (scratch
+    (fn [root]
+      (let [deep (str root "/a/b")]
+        (File/mkdir_p! deep)
+        (is (nil? (env/find deep)))))))
+
+; ── the two reads ─────────────────────────────────────────────────────
+
+(deftest a-literal-project-reads-as-data
+  (scratch
+    (fn [root]
+      (let [p (write! root "env.bl" "{:name \"probe\" :paths [\"src\"]}")]
+        (is (= {:ok {:name "probe" :paths ["src"]}} (env/literal p))
+            "the last form is a map: no evaluation needed")))))
+
+(deftest a-computed-project-says-so
+  (scratch
+    (fn [root]
+      (let [p (write! root "env.bl" "(assoc {:name \"x\"} :paths [\"src\"])")]
+        (is (= :dynamic (env/literal p))
+            "a computed value is not readable as data — the caller must evaluate")
+        (is (= {:ok {:name "x" :paths ["src"]}} (env/evaluate p)))))))
+
+(deftest evaluation-is-forked
+  (scratch
+    (fn [root]
+      (let [p (write! root "env.bl"
+                "(do (def env-probe-secret 42) {:name \"leaky\"})")]
+        (is (= {:ok {:name "leaky"}} (env/evaluate p)))
+        (is (= :error (BeamLisp.Env/peek "user" "env-probe-secret"))
+            "what a project file defines does not leak into the image")))))
+
+; ── the shape ─────────────────────────────────────────────────────────
+
+(deftest a-project-normalizes-to-what-the-runtime-reads
+  (scratch
+    (fn [root]
+      (write! root "env.bl"
+        (str "{:name \"pulse\""
+             " :paths [\"src\" \"priv\"]"
+             " :tasks {:test \"test/run.bl\""
+             "         :dev {:run \"src/main.bl\" :watch true :doc \"the dev loop\"}}"
+             " :ports {:web 4000 :metrics {:port 0}}"
+             " :env {\"PULSE_ENV\" \"dev\"}}"))
+      (let [p (env/project root)]
+        (is (= "pulse" (:name p)))
+        (is (= [] (:errors p)))
+        (is (= (list (str root "/src") (str root "/priv")) (:paths p))
+            "library roots are absolute, against the file's own directory")
+        (is (= (str root "/test/run.bl") (get-in p [:tasks "test" :run]))
+            "a bare string task is the file to run")
+        (is (= true (get-in p [:tasks "dev" :watch])))
+        (is (= "the dev loop" (get-in p [:tasks "dev" :doc])))
+        (is (= {:port 4000} (get-in p [:ports "web"])))
+        (is (= {:port 0} (get-in p [:ports "metrics"])))
+        (is (= "dev" (get-in p [:env "PULSE_ENV"])))))))
+
+(deftest a-wrong-key-is-a-value-not-a-crash
+  (scratch
+    (fn [root]
+      (write! root "env.bl"
+        "{:name 42 :paths \"src\" :tasks {:a 1} :ports {:w \"x\"} :env {\"K\" 1} :wat 2}")
+      (let [p (env/project root)]
+        (is (= 6 (count (:errors p))) "every problem is reported, in one pass")
+        (is (= [] (:paths p)) "a bad :paths degrades to none")
+        (is (= {} (:tasks p)) "a bad task is dropped, not half-read")
+        (is (= {} (:ports p)))
+        (is (= {} (:env p)))
+        (is (some (fn [e] (includes? e "unknown key wat")) (:errors p)))))))
+
+(deftest a-broken-file-is-reported-and-survivable
+  (scratch
+    (fn [root]
+      (write! root "env.bl" "({:name\n")
+      (let [p (env/project root)]
+        (is (= 1 (count (:errors p))))
+        (is (includes? (first (:errors p)) "env.bl"))))))
+
+(deftest a-tree-without-a-project-is-an-empty-project
+  (scratch
+    (fn [root]
+      (let [p (env/project root)]
+        (is (nil? (:path p)))
+        (is (= [] (:paths p)))
+        (is (= {} (:tasks p)))
+        (is (= [] (:errors p)))))))
+
+; ── what a command binds ──────────────────────────────────────────────
+
+(defn- capture
+  "Run `f` with this process's group leader on a StringIO: the command's stdout
+   becomes a value here. Returns a two-element list of return value and output."
+  [f]
+  (let [prev (Process/group_leader)
+        dev (erlang/element 2 (StringIO/open ""))]
+    (Process/group_leader (erlang/self) dev)
+    (let [r (try (f) (finally (Process/group_leader (erlang/self) prev)))]
+      (list r (erlang/element 2 (StringIO/contents dev))))))
+
+(defn- run-in
+  "Run a `bl` command in `dir` — the cold path, with the command's cwd bound the
+   way a daemon request binds its client's. Returns [exit-code output]."
+  [dir argv]
+  (BeamLisp/with_cwd dir
+    (fn [] (capture (fn [] (cli/run-argv (to-list argv)))))))
+
+(deftest a-command-binds-the-declared-roots-and-environment
+  (scratch
+    (fn [root]
+      (write! root "env.bl"
+        "{:paths [\"src\"] :env {\"BL_ENV_TEST_MODE\" \"engaged\"}}")
+      (write! root "src/lib/thing.bl"
+        "(ns lib.thing)\n(defn hi [] (str \"hi \" (System/get_env \"BL_ENV_TEST_MODE\")))\n")
+      (write! root "src/app.bl"
+        "(ns app (:require [lib.thing :as t]))\n(println (t/hi))\n")
+      (let [deep (str root "/sub/dir")
+            [code out] (do (File/mkdir_p! deep)
+                           (run-in deep ["run" "../../src/app.bl"]))]
+        (is (= 0 code))
+        (is (includes? out "hi engaged")
+            "the library resolved through the declared :paths, and :env was bound")))))
+
+(deftest a-broken-project-file-does-not-stop-the-command
+  (scratch
+    (fn [root]
+      (write! root "env.bl" "({:name\n")
+      (write! root "hello.bl" "(println \"still runs\")\n")
+      (let [[code out] (run-in root ["run" "hello.bl"])]
+        (is (= 0 code) "a broken env.bl degrades; it never fails a command")
+        (is (includes? out "still runs"))))))

@@ -227,18 +227,11 @@ defmodule BeamLisp.Daemon.Listener do
     }
   end
 
-  defp status_text(ctx) do
-    meta = ready_meta(ctx)
-
-    """
-    bl daemon
-      pid           #{meta.pid}
-      tree          #{Base.encode16(ctx.tree, case: :lower) |> binary_part(0, 16)}
-      compiler_key  #{meta.compiler_key || "(none)"}
-      build_id      #{meta.daemon_build_id || "(none)"}
-      uptime_ms     #{meta.uptime_ms}
-      queue_depth   #{meta.queue_depth}
-    """
+  # The status a client sees is the SESSION'S READ-MODEL, rendered — the same
+  # model the browser page renders. One builder, two faces: a field added to the
+  # model shows up in both, and neither can drift from the other.
+  defp status_text(_ctx) do
+    BeamLisp.Daemon.Inspect.render_text(BeamLisp.Daemon.Inspect.model())
   end
 
   defp uptime_ms(ctx) do
