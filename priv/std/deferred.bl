@@ -47,46 +47,138 @@
         (concat acc (unknowns-in form defined core)))
       [] forms)))
 
-(defn unknowns-in [node defined core]
+(defn- pattern-symbols
+  "The symbol leaves of a binding pattern — the names a binder introduces.
+   Descends vectors/sets/maps (destructuring); keywords and literals bind
+   nothing. A name collected here is simply never flagged as an unknown
+   call — which is exactly var-shadowing semantics: a local by that name
+   IS what a call resolves to."
+  [node]
   (let [f (typed/node-form node)
         tag (typed/node-tag f)]
     (cond
-      (= tag :list)
-        (let [items (typed/node-items f)
-              head  (typed/node-form (first items))]
-          (if (and (= :symbol (typed/node-tag head))
-                   (not (contains? #{"ns" "def" "defn" "defn-" "fn" "if" "do"
-                                     "quote" "let" "loop" "recur" "when" "cond"
-                                     "and" "or" "doseq" "throw" "try"
-                                     ; try/receive sub-clauses: their heads are
-                                     ; syntax, not calls to resolve.
-                                     "catch" "finally" "after" "receive"}
-                                   (typed/node-name head))))
-            (let [h (typed/node-name head)
-                  p (typed/node-pos f)
-                  mine (if (or (contains? defined h)
-                               (contains? core h)
-                               (some? (index-of h "/")))
-                         []
-                         [{:callee h
-                           :line (if (nil? p) 0 (:line p))
-                           ; arg types at deferral time — literals are
-                           ; provable, locals are any (sound)
-                           :arg-types (into [] (map (fn [a]
-                                                      (typed/walk
-                                                        (merge typed/core-sigs
-                                                               typed/core-seeds-v2)
-                                                        {} a))
-                                                    (rest items)))}])]
-              (concat mine
-                      (reduce (fn [a x] (concat a (unknowns-in x defined core)))
-                              [] (rest items))))
-            (reduce (fn [a x] (concat a (unknowns-in x defined core)))
-                    [] items)))
-      (contains? #{:vector :set} tag)
-        (reduce (fn [a x] (concat a (unknowns-in x defined core)))
-                [] (typed/node-items f))
+      (= tag :symbol) [(typed/node-name f)]
+      (contains? #{:vector :set :map} tag)
+        (mapcat pattern-symbols (typed/node-items f))
       :else [])))
+
+(defn- binding-vector-names
+  "The local names a binding vector (`let`/`loop`/`doseq`/`for`/`when-let`…)
+   introduces: the pattern symbols at EVEN positions — odd positions are the
+   value expressions. doseq/for modifiers (`:let`, `:when`) sit on even slots
+   as keywords and contribute nothing; a malformed (non-vector) node binds
+   nothing rather than crashing the pass."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (not (= :vector (typed/node-tag f)))
+      []
+      (let [items (typed/node-items f)]
+        (loop [i 0 acc []]
+          (if (>= i (count items))
+            acc
+            (recur (+ i 2) (concat acc (pattern-symbols (nth items i))))))))))
+
+(defn- binder-local-names
+  "The names a binder form binds for its body, by head:
+   let-family — the binding vector; catch — its one binding; fn/defn-family/
+   defserver — every params vector in the tail (a bare [params …] for
+   single-arity, the first element of each ([params …] body) clause for
+   multi-arity and defserver clauses). Body lists that merely START with a
+   vector literal contribute their symbols too — harmless: those positions
+   hold tag keywords in practice, and over-collecting only ever SUPPRESSES a
+   flag on a name a local would shadow anyway."
+  [head tail]
+  (cond
+    (contains? #{"let" "loop" "doseq" "for" "when-let" "if-let"} head)
+      (binding-vector-names (first tail))
+    (= head "catch")
+      (pattern-symbols (first tail))
+    :else  ; fn / defn / defn- / defmacro / defmethod / defserver
+      (mapcat (fn [it]
+                (let [tf (typed/node-form it)
+                      tg (typed/node-tag tf)]
+                  (cond
+                    (= tg :vector) (pattern-symbols it)
+                    (= tg :list)
+                      (let [sub (typed/node-items tf)]
+                        (if (and (> (count sub) 0)
+                                 (= :vector (typed/node-tag (typed/node-form (first sub)))))
+                          (pattern-symbols (first sub))
+                          []))
+                    :else [])))
+              tail)))
+
+;; heads that bind locals for their body — see binder-local-names
+(def ^:private binder-heads
+  #{"let" "loop" "doseq" "for" "when-let" "if-let" "catch"
+    "fn" "defn" "defn-" "defmacro" "defmethod" "defserver"})
+
+(defn unknowns-in
+  "Calls in `node` whose head is unknown: not a special form, not core, not
+   in `defined`, not a LOCAL binding, not interop. The locals set is threaded
+   through binder forms — without it a call to a let-bound fn (an utterly
+   ordinary shape) was collected as an unknown var, and reload's coherence
+   pass HELD every edit containing one as a false 'dangling reference'.
+   Quoted forms are data, not calls: never descended into."
+  ([node defined core] (unknowns-in node defined core #{}))
+  ([node defined core locals]
+   (let [f (typed/node-form node)
+         tag (typed/node-tag f)]
+     (cond
+       (= tag :list)
+         (let [items (typed/node-items f)]
+           (if (empty? items)
+             []
+             (let [head (typed/node-form (first items))
+                   h    (if (= :symbol (typed/node-tag head))
+                          (typed/node-name head)
+                          nil)]
+               (cond
+                 ;; (quote …) — the content is DATA; there are no calls inside
+                 (= h "quote") []
+                 ;; binder forms: their names are locals for everything inside
+                 (contains? binder-heads h)
+                   (let [locals2 (into locals (binder-local-names h (rest items)))]
+                     (reduce (fn [a x] (concat a (unknowns-in x defined core locals2)))
+                             [] items))
+                 ;; special forms: not calls, but their contents may contain some
+                 (contains? #{"ns" "def" "if" "do" "when" "cond"
+                              "and" "or" "throw" "try" "recur"
+                              ; try/receive sub-clauses: their heads are
+                              ; syntax, not calls to resolve.
+                              "finally" "after" "receive"}
+                            h)
+                   (reduce (fn [a x] (concat a (unknowns-in x defined core locals)))
+                           [] items)
+                 ;; a non-symbol head ((f x), (:k m), ([..] …)) — no name to flag
+                 (nil? h)
+                   (reduce (fn [a x] (concat a (unknowns-in x defined core locals)))
+                           [] items)
+                 ;; a plain call
+                 :else
+                   (let [p (typed/node-pos f)
+                         mine (if (or (contains? locals h)
+                                      (contains? defined h)
+                                      (contains? core h)
+                                      (some? (index-of h "/")))
+                                []
+                                [{:callee h
+                                  :line (if (nil? p) 0 (:line p))
+                                  ; arg types at deferral time — literals are
+                                  ; provable, locals are any (sound)
+                                  :arg-types (into [] (map (fn [a]
+                                                             (typed/walk
+                                                               (merge typed/core-sigs
+                                                                      typed/core-seeds-v2)
+                                                               {} a))
+                                                           (rest items)))}])]
+                     (concat mine
+                             (reduce (fn [a x] (concat a (unknowns-in x defined core locals)))
+                                     [] (rest items))))))))
+       (contains? #{:vector :set} tag)
+         (reduce (fn [a x] (concat a (unknowns-in x defined core locals)))
+                 [] (typed/node-items f))
+       :else []))))
 
 (defn retry-deferred!
   "A namespace just loaded: every deferred constraint whose callee it

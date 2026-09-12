@@ -143,7 +143,7 @@ remote call. `core.bl` uses ~30 such calls (`String/*`, `Map/delete`,
 
 ## Role C — Elixir as OTP host
 
-`application.ex`, `supervisor.ex`, the `mix beam_lisp.*` tasks,
+`application.ex`, `supervisor.ex`, the `mix bl` task,
 `mix release` (the sole packaging tier), the `drop` bundler's payload. This is the process that *runs*
 the language — exactly as Clojure keeps a JVM launcher. It has no opinion on
 how `.beam` files are produced and is not part of the language.

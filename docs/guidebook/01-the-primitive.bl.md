@@ -94,7 +94,7 @@ inspect it *before* boot.
 | pattern | plain meaning |
 |---|---|
 | **Heartbeat** | Prove you're alive every N ms. |
-| **Snapshot** | Tell me your current state — dashboards (`tooling/vitals.bl` does this live). |
+| **Snapshot** | Tell me your current state — dashboards (`examples/tooling/vitals.bl` does this live). |
 | **Invariant Gate** | Prove *from source* that state never violates a rule (balance ≥ 0) — checked before the program runs, enforced as a crash if violated at runtime. |
 | **Simulation** | Prove process A's behavior is a safe replacement for B's — the basis of hot code upgrade. |
 

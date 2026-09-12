@@ -124,7 +124,7 @@ beam-lisp author actually reaches for:
 ## Run them
 
 ```sh
-mix beam_lisp.run examples/clojure-compat/async-channels/01-hello-channel.bl
+bl run examples/clojure-compat/async-channels/01-hello-channel.bl
 # … 02 … 03 … 04 … 05   (core.async shim)
 # … 07 … 08              (native flow tier)
 ```

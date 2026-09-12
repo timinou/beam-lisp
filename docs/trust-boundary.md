@@ -5,7 +5,7 @@ choice decides everything in this document.
 
 ## What is trusted, and why
 
-A `.bl` file given to `mix beam_lisp.run` — or typed into the REPL — sits at
+A `.bl` file given to `bl run` — or typed into the REPL — sits at
 the same trust level as an Elixir file passed to `Code.eval_string`, or a C
 file handed to `cc`. It is **trusted code**: it already has the authority to
 call `System.halt/1`, spawn processes, reach `:erlang` directly, and read and

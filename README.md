@@ -35,6 +35,19 @@ With Beam Lisp, you get:
 
 Use it to build applications that are safe, scalable, and whose complexity stays in check as you grow.
 
+## Getting started
+
+- **Install.** Download the `bl` drop for your platform from the latest release,
+  or build one from a checkout with `mix bl.build`.
+- **Check the machine.** `bl doctor` reports the language, the native tiers, and
+  the solver.
+- **Run something.** `bl run examples/hello.bl` — the last value prints.
+- **Open a session.** `bl repl` (or just `bl`).
+
+The full command reference is [`docs/bl/00-the-cli.md`](docs/bl/00-the-cli.md);
+the first-hour walkthrough is
+[`docs/bl/01-first-hour.bl.md`](docs/bl/01-first-hour.bl.md).
+
 ## Composable experiences
 
 ### Literate programming
@@ -66,7 +79,7 @@ Babashka-style script.
   [`docs/babashka-compat.md`](docs/babashka-compat.md)
 - A runnable literate guidebook (every code cell executes):
   [`docs/babashka-on-the-beam.bl.md`](docs/babashka-on-the-beam.bl.md) —
-  `mix beam_lisp.run docs/babashka-on-the-beam.bl.md`
+  `bl run docs/babashka-on-the-beam.bl.md`
 - Showcase scripts: [`examples/babashka/`](examples/babashka/) —
   `wordfreq.bl`, `edn_report.bl`, `loc.bl`
 

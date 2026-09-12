@@ -34,7 +34,7 @@ miniKanren / z3 bridges — is built in `priv/lib/datom/time.bl`, validated by
 every file here executes end to end:
 
 ```
-mix beam_lisp.run --path priv examples/datom/time/01-interval.bl   # … through 08
+bl run examples/datom/time/01-interval.bl   # … through 08
 ```
 
 Where a demo leans on an engine that already ships — miniKanren's `run`, z3's
@@ -71,7 +71,6 @@ Read them in order; each builds on the representation the last one established.
 ## Run
 
 ```
-mix beam_lisp.run --path priv examples/datom/time/01-interval.bl
+bl run examples/datom/time/01-interval.bl
 ```
 
-(`--path priv` puts the `datom` / `datom.time` libraries on the load path.)

@@ -57,7 +57,7 @@ replays — so a bare `(re-find …)` resolves everywhere, exactly as on the JVM
 ## The scorecard — real upstream tests, green
 
 Every count below is Clojure's own test file (adapted only for host
-differences, recorded per file), run by `mix beam_lisp.test`:
+differences, recorded per file), run by `bl test`:
 
 | suite | source of assertions | tests | assertions | status |
 |---|---|---:|---:|:---:|

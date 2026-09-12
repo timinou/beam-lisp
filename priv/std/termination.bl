@@ -52,6 +52,11 @@
 (def core :Elixir.BeamLisp.Ns.Core)
 (def rt   :Elixir.BeamLisp.RT)
 
+(defn- fn-name-str
+  "A fn name as its string form, whether the ANF carries it as a keyword or a
+   binary."
+  [k] (if (keyword? k) (name k) (str k)))
+
 (defn- self-var? [n v] (and (= :var (:op n)) (= v (:name n))))
 (defn- pos-lit? [n] (and (= :lit (:op n)) (int? (:val n)) (pos? (:val n))))
 
@@ -171,20 +176,30 @@
 ; :lit; `loop-nodes` descends into that embedded ANF too, so a loop written
 ; inside a defn is found with the same code as a top-level one.
 
-(defn- descriptor-bodies
-  "The clause ANF bodies a defn descriptor embeds in a :lit, as a list. A defn
-   compiles to an intern call whose descriptor :lit value is a LIST of
+(defn- descriptor-fns
+  "Every [fn-name params body] a defn descriptor embeds in a :lit value. A defn
+   compiles to an intern call whose descriptor :lit is a LIST of
    {:fixed arity name descmap} tuples; each descmap carries the clause's ANF
-   under :body. Reach them so a loop written inside a defn is reachable from
-   source with the same walk as a top-level one. Empty for any other :lit."
+   under :body. Empty for any other :lit."
   [n]
   (if (and (= :lit (:op n)) (erlang/is_list (:val n)))
     (keep (fn [item]
             (when (erlang/is_tuple item)
-              (let [desc (last (erlang/tuple_to_list item))]
-                (when (and (map? desc) (contains? desc :body)) (:body desc)))))
+              (let [parts (erlang/tuple_to_list item)
+                    desc (last parts)]
+                (when (and (map? desc) (contains? desc :body))
+                  [(if (>= (count parts) 3) (fn-name-str (nth parts 2)) "?")
+                   (map (fn [p] (get p :name)) (get desc :params))
+                   (:body desc)]))))
           (:val n))
     (list)))
+
+(defn- descriptor-bodies
+  "The clause ANF bodies a defn descriptor embeds in a :lit, as a list. Reach
+   them so a loop written inside a defn is reachable from source with the same
+   walk as a top-level one. Empty for any other :lit."
+  [n]
+  (map (fn [d] (nth d 2)) (descriptor-fns n)))
 
 (defn- loop-nodes
   "Every ANF loop scaffold reachable under `n`, descending through ordinary
@@ -204,3 +219,223 @@
   (let [forms (BeamLisp.Reader/read_string src)
         anfs (map (fn [f] (c/compile-node f compile-env)) forms)]
     (reduce (fn [acc anf] (concat acc (map check-loop (loop-nodes anf)))) (list) anfs)))
+
+; ── growth: the cost class of a fn's own recursion ──────────────────────
+;
+; The recursion SHAPE bounds the fn's own work: how many times it runs per
+; level, and whether its subproblems overlap. `growth` reads that shape off the
+; bl-ANF the compiler produced and reports one of :linear / :quadratic /
+; :exponential per self-recursive fn — a fn that calls itself by name, or that
+; runs a loop (the compiler desugars loop/recur to the same self-application).
+;
+; The bound's LIMITS: it bounds the fn's OWN recursion shape only. It says
+; nothing about the cost of the library functions the fn calls (a linear
+; recursion calling a linear callee still reads :linear), and nothing about a
+; non-recursive fn's cost. A fn the analysis cannot read is omitted, never
+; guessed; `growth` never raises.
+
+(defn- user-module?
+  "Is `m` a beam-lisp namespace module — the only kind a self-call's [mod fun]
+   form can name? Host modules (`erlang`, RT, core, `maps`, …) never are."
+  [m]
+  (and (not (contains? #{:erlang rt core} m))
+       (not (nil? (index-of (str m) "BeamLisp.Ns")))))
+
+(defn- self-call?
+  "Is ANF node `n` a call to the fn named `self`? A call to a linked user fn
+   compiles to `Module/fn` (a :remote whose module is a beam-lisp namespace);
+   an unresolved user call compiles to RT/invoke of a (:global name)."
+  [n self]
+  (and (ir/node? n) (= :remote (:op n))
+       (let [callee (first (:args n))]
+         (or (and (= :global (:op callee)) (= self (:name callee)))
+             (and (user-module? (:mod n)) (= self (fn-name-str (:fun n))))))))
+
+(defn self-call-nodes
+  "Every ANF node under `ir-node` that is a call to the fn named `self`, in
+   pre-order. Descends into a self-call's own arguments, so a self-call nested
+   inside another self-call is found too."
+  [ir-node self]
+  (cond
+    (not (ir/node? ir-node)) (list)
+    (self-call? ir-node self)
+      (cons ir-node (mapcat (fn [c] (self-call-nodes c self)) (ir/child-nodes ir-node)))
+    :else (mapcat (fn [c] (self-call-nodes c self)) (ir/child-nodes ir-node))))
+
+(defn- invoke?
+  "Is `n` a user-fn invocation (RT/invoke of a callee value)?"
+  [n] (and (= :remote (:op n)) (= rt (:mod n)) (= :invoke (:fun n))))
+
+(defn- cons-chain-nodes
+  "The element nodes of a :cons list value, in order."
+  [n]
+  (loop [n n acc []]
+    (cond
+      (not (ir/node? n)) acc
+      (= :cons (:op n)) (recur (:tail n) (conj acc (:head n)))
+      (= :enil (:op n)) acc
+      :else (conj acc n))))
+
+(defn- call-args
+  "The ACTUAL argument nodes of call node `n`: a linked remote carries them in
+   :args; RT/invoke wraps them in a cons-chain list value."
+  [n]
+  (if (invoke? n) (cons-chain-nodes (second (:args n))) (:args n)))
+
+(defn- arithmetic-image
+  "The parameter name an ARITHMETIC descent node steps by a positive literal —
+   `(- p k)` / `(+ p k)` / `(dec p)` / `(inc p)` — or nil. A STRUCTURAL descent
+   (`rest` / `next`) is not an arithmetic image: its subproblems are disjoint."
+  [node]
+  (if (not (= :remote (:op node)))
+    nil
+    (let [k [(:mod node) (:fun node)] args (:args node)
+          vn (fn [a] (when (= :var (:op a)) (:name a)))]
+      (cond
+        (and (= k [core :dec]) (= 1 (count args))) (vn (first args))
+        (and (= k [core :inc]) (= 1 (count args))) (vn (first args))
+        (and (= k [:erlang :-]) (= 2 (count args)) (pos-lit? (nth args 1))) (vn (first args))
+        (and (= k [:erlang :+]) (= 2 (count args)) (pos-lit? (nth args 1))) (vn (first args))
+        (and (= k [:erlang :+]) (= 2 (count args)) (pos-lit? (first args))) (vn (nth args 1))
+        :else nil))))
+
+(defn- descendant?
+  "Is node `target` `n` itself, or a node under it?"
+  [n target]
+  (cond
+    (not (ir/node? n)) false
+    (= n target) true
+    :else (some (fn [c] (descendant? c target)) (ir/child-nodes n))))
+
+(defn- nested-pair
+  "The [inner outer] self-call pair where `inner` sits inside `outer`'s
+   arguments, or nil."
+  [calls]
+  (some (fn [outer]
+          (some (fn [inner]
+                  (when (some (fn [arg] (descendant? arg inner)) (:args outer))
+                    [inner outer]))
+                calls))
+        calls))
+
+(defn- arithmetic-sites
+  "The first-argument arithmetic descents of `calls`, as {param → count}."
+  [calls]
+  (reduce (fn [m c]
+            (let [v (arithmetic-image (first (call-args c)))]
+              (if (nil? v) m (assoc m v (inc (get m v 0))))))
+          {} calls))
+
+(defn- branching-param
+  "The parameter name that ≥2 self-call sites descend by arithmetic, or nil."
+  [calls params]
+  (let [sites (arithmetic-sites calls)
+        ps (set params)]
+    (some (fn [v] (when (and (>= (get sites v 0) 2) (contains? ps v)) v))
+          (keys sites))))
+
+(defn- loop-nodes-under
+  "Every loop scaffold reachable under `n` (its own and any nested one)."
+  [n]
+  (cond
+    (not (ir/node? n)) (list)
+    (ir/anf-loop? n) (cons n (mapcat loop-nodes-under (ir/child-nodes n)))
+    :else (mapcat loop-nodes-under (ir/child-nodes n))))
+
+(defn- recognised-loops
+  "The loop scaffolds under `body` the termination rule accepts (or that carry
+   a trusted measure)."
+  [body]
+  (filter (fn [n] (contains? #{:accepted :trusted} (:status (check-loop n))))
+          (loop-nodes-under body)))
+
+(defn- anf-shape
+  "A short s-expression rendering of ANF node `n`, for a growth witness."
+  [n]
+  (cond
+    (not (ir/node? n)) "?"
+    (= :var (:op n)) (:name n)
+    (= :lit (:op n)) (pr-str (:val n))
+    (= :enil (:op n)) "()"
+    (= :global (:op n)) (:name n)
+    (= :remote (:op n))
+      (let [head (if (invoke? n)
+                   (let [c (first (:args n))] (if (= :global (:op c)) (:name c) "fn"))
+                   (fn-name-str (:fun n)))
+            as (call-args n)]
+        (str "(" head (if (empty? as) "" (str " " (join " " (map anf-shape as)))) ")"))
+    :else (str "(" (:op n) " …)")))
+
+(defn- class-rank [c] (case c :quadratic 2 :exponential 1 :linear 0 0))
+
+(defn- growth-of-body
+  "The growth entry for one fn `body`, or nil when it has no boundable
+   recursion. `params` are the fn's ANF parameter names."
+  [self params body]
+  (let [calls (self-call-nodes body self)
+        loops (recognised-loops body)
+        pair (nested-pair calls)
+        branch (branching-param calls params)]
+    (if (some? pair)
+      {:class :quadratic :label ">= O(n^2)"
+       :witness (anf-shape (first pair))
+       :detail "a self-call sits inside the arguments of another self-call — the inner call redoes work the outer already paid for"}
+      (if (some? branch)
+        {:class :exponential :label "O(2^n)"
+         :witness (str (get (arithmetic-sites calls) branch) " self-calls descend " branch " by arithmetic")
+         :detail "self-calls whose first argument steps the same parameter overlap — without memoisation the work doubles per level"}
+        (if (or (seq calls) (seq loops))
+          {:class :linear :label "O(n)"
+           :witness (if (seq loops)
+                      (str "loop over " (join ", " (into [] (:vars (ir/loop-parts (first loops))))))
+                      (str (count calls) " self-call site" (if (= 1 (count calls)) "" "s")))
+           :detail "work grows with the recursion depth — a single self-call, or a recognised loop whose ranking variable moves toward its floor"}
+          nil)))))
+
+(defn- fn-descriptors
+  "Every [fn-name params body] a compiled form embeds, walking to any depth."
+  [n]
+  (cond
+    (not (ir/node? n)) (list)
+    (= :lit (:op n)) (descriptor-fns n)
+    :else (mapcat fn-descriptors (ir/child-nodes n))))
+
+(defn growth
+  "The growth class of every self-recursive fn in `src`, as
+   {fn-name {:class :linear|:quadratic|:exponential :label … :witness …
+             :detail …}}. A fn absent from the map is not self-recursive —
+   nothing to say about it.
+
+   :quadratic   a self-call sits inside another self-call's arguments (nested
+                recursion: the inner call redoes work the outer already paid
+                for).
+   :exponential ≥2 self-call sites step the SAME parameter by positive
+                arithmetic (`(- p k)` / `(+ p k)` / `dec` / `inc`) — overlapping
+                subproblems, so without memoisation the work doubles per level
+                (naive fib). Two calls over STRUCTURAL descents (`rest`/`next`,
+                or differing fields of the same value) are NOT flagged: those
+                subproblems are disjoint and the total work stays linear in the
+                input.
+   :linear      otherwise — a single self-call, or a recognised loop whose
+                ranking variable moves toward its floor.
+   Precedence: nested beats exponential beats linear.
+
+   LIMITS: the bound is the fn's OWN recursion shape. It says nothing about the
+   cost of the functions it calls — a linear recursion calling a linear callee
+   still reads :linear — and nothing about a non-recursive fn. A fn the
+   analysis cannot read is omitted, never guessed; `growth` never raises."
+  [src]
+  (try
+    (let [forms (BeamLisp.Reader/read_string src)
+          descriptors (mapcat (fn [f] (fn-descriptors (c/compile-node f compile-env))) forms)]
+      (reduce (fn [acc d]
+                (let [nm (nth d 0) params (nth d 1) body (nth d 2)
+                      g (growth-of-body nm params body)
+                      old (get acc nm)]
+                  (if (nil? g) acc
+                    (assoc acc nm (if (and (some? old)
+                                           (> (class-rank (:class g)) (class-rank (:class old))))
+                                    old g)))))
+              {} descriptors))
+    (catch _ {})))
+

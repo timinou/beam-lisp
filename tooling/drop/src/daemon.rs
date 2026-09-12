@@ -320,7 +320,16 @@ pub fn endpoints(root: &Path) -> Option<Endpoints> {
 }
 
 /// Walk up from `cwd` to the nearest beam-lisp tree root (checkout or extracted
-/// release). `BL_DAEMON_ROOT` overrides.
+/// release), falling back to `cwd` itself when no checkout encloses it.
+/// `BL_DAEMON_ROOT` overrides.
+///
+/// THE FALLBACK MATCHES THE DAEMON'S OWN RULE. `BeamLisp.Daemon.start/1` keys
+/// its server on `BL_DAEMON_ROOT || File.cwd!()` — it does not search upward —
+/// so a daemon started from a scratch directory is keyed on that directory,
+/// while a launcher that resolved nothing there would never look for it: no
+/// fast-path, no `daemon start` handoff, a cold VM per command forever. A
+/// directory is a tree; a checkout found above it is a better answer to "which
+/// tree", which is why the search still comes first.
 pub fn resolve_root(cwd: &Path) -> Option<PathBuf> {
     if let Ok(r) = std::env::var("BL_DAEMON_ROOT") {
         if !r.is_empty() {
@@ -333,9 +342,13 @@ pub fn resolve_root(cwd: &Path) -> Option<PathBuf> {
             return std::fs::canonicalize(&dir).ok().or(Some(dir));
         }
         if !dir.pop() {
-            return None;
+            return canonical_or(cwd.to_path_buf());
         }
     }
+}
+
+fn canonical_or(path: PathBuf) -> Option<PathBuf> {
+    std::fs::canonicalize(&path).ok().or(Some(path))
 }
 
 fn is_tree_root(dir: &Path) -> bool {
@@ -712,5 +725,35 @@ mod tests {
             let bytes = e.finish();
             assert_eq!(decode(&bytes).unwrap().as_int(), Some(n), "int {n}");
         }
+    }
+
+    /// A directory that no checkout encloses is still a tree: the daemon keys
+    /// itself on the cwd there (`Daemon.start/1`), so a launcher that resolved
+    /// nothing could neither find nor hand off to the very daemon the release
+    /// had started in that directory.
+    #[test]
+    fn no_checkout_above_still_resolves_to_a_tree() {
+        let scratch = std::env::temp_dir().join(format!("drop-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let nested = scratch.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Nothing above it is a checkout → the directory IS the tree.
+        assert_eq!(
+            resolve_root(&nested).unwrap(),
+            std::fs::canonicalize(&nested).unwrap()
+        );
+
+        // A checkout above it still wins, from any depth below.
+        std::fs::create_dir_all(nested.join("priv").join("boot")).unwrap();
+        std::fs::write(nested.join("priv/boot/core.bl"), "").unwrap();
+        let deep = nested.join("x").join("y");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_root(&deep).unwrap(),
+            std::fs::canonicalize(&nested).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

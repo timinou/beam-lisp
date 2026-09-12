@@ -31,7 +31,7 @@ Because it is all data, the same code that measures `loom` measures any library.
 ## Run it
 
 ```
-mix beam_lisp.run --path priv tooling/run-catalog.bl
+bl serve examples/catalog.bl
 ```
 
 Open <http://127.0.0.1:4050>. Give it about a minute the first time — it reads
@@ -50,17 +50,16 @@ Two environment variables choose what to explore:
 ```
 BL_CATALOG_LIB=path/to/lib \
 BL_CATALOG_DIR=path/to/examples \
-mix beam_lisp.run --path priv tooling/run-catalog.bl
+bl serve examples/catalog.bl
 ```
 
 - `BL_CATALOG_LIB` — the folder of source files whose public functions you want
-  to measure. Defaults to `priv/loom`.
+  to measure. Defaults to `priv/lib/loom`.
 - `BL_CATALOG_DIR` — the folder of example files that demonstrate them. Defaults
   to `examples/loom`.
 
-Your example files must be on the load path so their `:require`s resolve. The
-simplest way is to keep the library under `priv/` and run with `--path priv`, the
-way `loom` does.
+Your example files must be on the load path so their `:require`s resolve: the
+library tiers under `priv/` are always searched, and `-p DIR` adds any other root.
 
 ---
 
@@ -143,9 +142,9 @@ never inflates a number to look greener than the code is.
 
 ## Where it lives
 
-- `tooling/catalog.bl` — the engine: reads source, builds the database, answers
+- `tooling.catalog` (in the shipped library tiers) — the engine: reads source, builds the database, answers
   every query, renders the live view.
-- `tooling/run-catalog.bl` — the entrypoint that indexes the default package and
+- `examples/catalog.bl` — the entrypoint that indexes the default package and
   serves it.
 - `priv/lib/live/lint.bl` — the static check for rendered lists missing a `:key`,
   which also runs once at start and prints any findings before serving.

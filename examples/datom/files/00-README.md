@@ -10,7 +10,7 @@ Design doc: `docs/datom-files-a-file-is-a-fact.md`.
 Run any file with:
 
 ```
-mix beam_lisp.run --path priv examples/datom/files/NN-name.bl
+bl run examples/datom/files/NN-name.bl
 ```
 
 ## The one idea

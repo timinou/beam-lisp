@@ -20,7 +20,7 @@ defmodule BeamLisp.Z3Port do
   Start z3 reading SMT-LIB from stdin.
 
   The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the
-  pinned binary fetched by `mix beam_lisp.z3.fetch` — never the PATH:
+  pinned binary fetched by `mix bl.z3.fetch` — never the PATH:
   what proves your rules is the artifact the repo pinned, not whatever
   a shell happens to resolve. Raises with the remedy when absent.
   """
@@ -31,7 +31,7 @@ defmodule BeamLisp.Z3Port do
       raise """
       bundled z3 not found. Looked (in order) at:
       #{candidate_paths() |> Enum.map(&("  - " <> &1)) |> Enum.join("\n")}
-      run: mix beam_lisp.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
+      run: mix bl.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
       """
     end
 

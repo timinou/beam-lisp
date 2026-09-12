@@ -20,7 +20,7 @@ migration), with a dev filesystem watcher in `lib/beam_lisp/reload_watcher.ex`.
 Run any file with:
 
 ```
-mix beam_lisp.run --path priv examples/reload/NN-name.bl
+bl run examples/reload/NN-name.bl
 ```
 
 ## The ladder — zero to the whole thing
@@ -72,10 +72,10 @@ mix beam_lisp.run --path priv examples/reload/NN-name.bl
 
 The same `reload/inspect` read-model drives two monitors and a runner:
 
-- **CLI monitor** — `mix beam_lisp.reload.monitor DIR` watches a directory and
+- **CLI monitor** — `bl monitor DIR` watches a directory and
   repaints the live image (namespaces, vars, journal) after every commit.
 - **Web monitor** — demo 09; the browser view of the same snapshot, pushed live.
-- **ward** — `mix beam_lisp.ward FILE...` runs `.bl` test files warm, isolated,
+- **ward** — `bl ward FILE...` runs `.bl` test files warm, isolated,
   coherence-advised, and always-latest; exits non-zero unless every file is green.
 
 ## Namespace-level, and prod-safe

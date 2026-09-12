@@ -6,7 +6,7 @@ What it should feel like, as four walkthroughs. Each names the machinery that
 makes it true, so experience claims stay falsifiable.
 
 #xp(1, "Start a session with a long-form mission")[
-  The user opens the session URL (or runs `mix beam_lisp.run spell/src/main.bl
+  The user opens the session URL (or runs `bl run spell/src/main.bl
   -- --session my-mission`, which boots `spacetime live my-mission` and opens
   the browser). The first thing on screen is not a prompt box — it is the
   #emph[mission composer]: a full-width, long-form Markdown-ish writing

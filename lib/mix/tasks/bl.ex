@@ -9,7 +9,7 @@ defmodule Mix.Tasks.Bl do
       mix bl test test/bl
       mix bl help
 
-  One runtime task replaces the old per-verb `mix beam_lisp.*` tasks. It
+  One runtime task carries every verb. It
   starts the application, loads `bl.cli`, and calls its `run-argv` — the same
   entry point the daemon and the drop launcher use, so behavior cannot drift
   between them.

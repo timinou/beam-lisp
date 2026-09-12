@@ -247,7 +247,7 @@ git-native, so this is a requirement, not a nicety.
 | env-conveying spawn | `priv/lib/system/core.bl` | cell processes inherit session world |
 | capability capture / sandbox tiers | `priv/std/env.bl`, `docs/trust-boundary.md` | untrusted docs, capped cells |
 | design tokens + components | `priv/lib/loom/` | the notebook chrome, themed |
-| live catalog over code facts | `tooling/catalog.bl`, `docs/explorer.md` | the precedent: docs as queries |
+| live catalog over code facts | `tooling.catalog`, `docs/explorer.md` | the precedent: docs as queries |
 
 ## 5. What is missing (the honest gap list)
 
@@ -259,51 +259,45 @@ git-native, so this is a requirement, not a nicety.
 | G4 | no print capture (no `with-out-str`) | `env/capture` is env-conveyance, not IO | W2 |
 | G5 | cell edits must recompose ns source before staging | reload stages whole-ns strings (by design) | W3 |
 | G6 | no result-viewer registry (hiccup passthrough first, registry later) | — | W5 |
-| G7 | no `bl live` / `bl doc` commands | `priv/std/bl/cli.bl` command map | W2, W5 |
+| G7 | `bl doc run` / `bl doc build` ship; the `bl live` notebook app is not a verb | `priv/std/bl/cli.bl`, `priv/std/bl/doc.bl` | see [`bl/03-the-live-loop.md`](bl/03-the-live-loop.md) |
 | G8 | no md→hiccup / org-subset→hiccup prose renderer | — | W4 (build) |
 | G9 | output truncation policy for huge results | `print_str` is unbounded | W2 |
 | G10 | re-run-on-edit wiring (the `impact` query exists; the behavior doesn't) | `codebase.bl` | W6 |
 
 ---
 
-## 6. The waves (each shippable alone, in order)
+## 6. What ships, and what remains
 
-**W1 — the format and the covenant.** `priv/std/bl/doc.bl`: `slice-doc`,
-`render-doc`, both dialects; ID minting; the fixed-point property as tests
-(`parse∘render = id`; `run` touches only owned spans). Zero runtime
-integration — this wave cannot break anything, which is why it goes first.
-*Acceptance: round-trip fixture corpus (real docs from `docs/`, org, md,
-CRLF, Obsidian-mangled) is byte-stable.*
+**The format and the covenant.** `priv/std/bl/doc.bl` slices both dialects —
+`.bl.md` fences and `.bl.org` src blocks — into one span model, mints stable
+ids, and owns exactly one span kind: results. `render-doc` echoes a slice back
+unchanged and only `write-results` produces different text, so the fixed point
+(`parse∘render = id`) holds and a run touches nothing but result spans. Tests
+pin both on md and org documents (`test/bl/doc_test.bl`,
+`test/fixtures/docs/`).
 
-**W2 — `bl doc run` (the README promise, kept).** Slice → recompose ns →
-eval under ward with a kill timer → capture value + stdout (spawned,
-env-conveying process, swapped group leader) → transact result facts → write
-owned spans → exit 1 on failure. deftest cells register and run. *Acceptance:
-`bl doc run docs/tutorial-full-stack-ssg.md` green in CI; a second run
-produces an empty `git diff`.*
+**`bl doc run`.** A document's cells evaluate in order into one namespace; a
+cell's value and stdout become its result span, and a failing cell shows its
+error where the value would be without stopping the document. A second run
+leaves `git diff` empty. `bl doc run FILE...`.
 
-**W3 — the document joins the ecosystem.** `find_file` tries `.bl`, `.bl.md`,
-`.bl.org` (`:require [my.book]` loads a doc); watcher accepts the extensions
-and stages via recomposition; coherence errors mapped through `pos-map`.
-*Acceptance: a `.bl.md` is required by a plain `.bl` program and by `mix compile` AOT.*
+**Documents join the ecosystem.** The loader resolves `.bl`, `.bl.md` and
+`.bl.org`, so a document is required like any namespace and AOT-compiles with
+the rest of `priv/`.
 
-**W4 — `bl doc build` (the static site).** md/org-subset → hiccup; cells →
-highlighted code + result spans; loom theme; search index over doc facts;
-`hiccup->html` out. The tutorial thesis lands: build docs and build the SSG
-blog with the same verb. *Acceptance: `docs/` renders to a navigable site;
-every code example in it is the code that ran.*
+**`bl doc build`.** the md/org prose subset renders to hiccup in
+`bl.doc.html`, and the page reaches HTML through the same `live.hiccup` the
+app layer uses, and each page carries the code that ran.
+`bl doc build TARGET... [--out DIR]`.
 
-**W5 — `bl live` (the notebook app).** Serve a doc as a Pulse-style app:
-view = f(doc facts), events = facts, results = facts; per-viewer session
-conn for drafts; hiccup passthrough for rich results plus a viewer registry
-(`result-viewer!`); frozen cells styled as frozen. *Acceptance: two tabs
-editing one doc converge through the log; `as-of` slider shows any prior run.*
+**`bl doc run --check`.** The CI gate: run the cells, write nothing, and fail
+when a stored result differs from a fresh run.
 
-**W6 — the reactive close.** Save a cell → `impact` over the doc graph →
-re-run exactly the stale downstream cells, coherence-gated; doc-test mode
-(`bl doc run --check`) fails CI when stored results don't match fresh ones;
-unify with the explorer (`^:catalog` examples and livebook cells are one
-kind of thing) and expose the doc graph over MCP for agents.
+**Remaining — `bl live` (the notebook app).** Serving a document as a
+Pulse-style app — view = f(doc facts), events = facts, results = facts, with a
+per-viewer session connection for drafts — is the one rendering not yet a verb.
+It builds on the shipped pieces above and the live socket layer in
+`priv/lib/live/`. See `docs/bl/03-the-live-loop.md` for the verbs that ship.
 
 ---
 

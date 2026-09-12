@@ -53,7 +53,7 @@ defmodule BeamLisp.Sandbox do
         base = Env.fork(:global)
 
         Env.with_env(base, fn ->
-          # The `src/` library-root convention, same as `mix beam_lisp.test`:
+          # The `src/` library-root convention, same as `mix bl test`:
           # a base image for THIS project's namespaces resolves them without
           # every test repeating a search path. Lands in the base env, so
           # forks see it through the chain.

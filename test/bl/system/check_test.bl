@@ -1,0 +1,203 @@
+; test/bl/system/check_test.bl — the `bl check` gate.
+;
+; bl.check measures each source with the compiler's own analyses, records the
+; accepted metrics in a baseline, and fails when something got worse. These
+; tests pin the per-file metrics, the baseline round-trip, the regression rule
+; (a function that loses a proof is named), and `--changed` selecting by
+; content.
+;
+; Run: mix bl test test/bl/system/check_test.bl
+(ns system.check-test
+  (:require [bl.check :as check] [bl.util :as u] [lsp]))
+
+(defn- capture
+  "Run `f` with this process's group leader on a StringIO, so a command's output
+   is a value here. Returns a two-element list of the return value and the
+   captured output; restores the leader in a finally."
+  [f]
+  (let [prev (Process/group_leader)
+        dev (erlang/element 2 (StringIO/open ""))]
+    (Process/group_leader (erlang/self) dev)
+    (let [r (try (f) (finally (Process/group_leader (erlang/self) prev)))]
+      (list r (erlang/element 2 (StringIO/contents dev))))))
+
+(defn- tmp-dir []
+  (let [d (str (System/tmp_dir!) "/bl_check_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p! d)
+    d))
+
+(def pure-src   "(defn p [x] (+ x 1))\n")
+(def clean-src  "(defn p [x] (inc x))\n")
+(def impure-src "(defn p [x] (do (IO/puts \"hi\") x))\n")
+(def two-fn-src "(defn p [x] (inc x))\n(defn q [x] (do (IO/puts \"hi\") x))\n")
+
+; ── per-file metrics ──────────────────────────────────────────────────
+
+(deftest analyze-source-counts-the-proven-facts
+  (let [a (check/analyze-source "t.bl" two-fn-src)]
+    (is (= 2 (:fns a)) "two definitions")
+    (is (= 1 (:pure a)) "p is pure, q touches IO")
+    (is (= 2 (:terminates a)) "both terminate")
+    (is (= 1 (:eligible a)) "only the pure one is native-eligible")
+    (is (= ["p"] (:pure-fns a)) "the pure function is named")
+    (is (= ["p"] (:eligible-fns a)) "the eligible function is named")
+    (is (= 0 (:diagnostics a)) "a clean program has no diagnostics")
+    (is (= 0 (:smells a)) "no smells here")
+    (is (not (:unreadable a)))))
+
+(deftest eligible-is-the-lsp-theorem
+  (testing "the derived badge equals `lsp/native-eligible` for every function"
+    (let [facts (into {} (map (fn [f] [(:name f) f])
+                              (:fn-info (check/analyze-source "t.bl" two-fn-src))))]
+      (is (= (:eligible (get facts "p")) (:eligible (lsp/native-eligible two-fn-src "p"))))
+      (is (= (:eligible (get facts "q")) (:eligible (lsp/native-eligible two-fn-src "q")))))))
+
+(deftest an-unreadable-source-is-a-metric-not-a-crash
+  (let [a (check/analyze-source "bad.bl" "(defn f [x]\n  (if x\n")]
+    (is (:unreadable a))
+    (is (= 0 (:fns a)))))
+
+; ── the baseline on disk ──────────────────────────────────────────────
+
+(deftest an-unreadable-file-is-a-metric-not-a-crash
+  (let [dir (tmp-dir)]
+    (try
+      (File/write! (str dir "/good.bl") clean-src)
+      (File/write! (str dir "/bad.bl") "(defn f [x]\n  (if x\n")
+      (let [report (check/analyze-paths [(str dir "/good.bl") (str dir "/bad.bl")])]
+        (is (= 2 (get-in report [:metrics :files])))
+        (is (= 1 (get-in report [:metrics :unreadable])) "the bad file is counted, not thrown")
+        (is (= 1 (get-in report [:metrics :fns])) "the good file is still measured"))
+      (finally (File/rm_rf! dir)))))
+
+(deftest baseline-round-trips
+  (let [dir (tmp-dir)]
+    (try
+      (let [p (str dir "/a.bl")]
+        (File/write! p pure-src)
+        (let [report (check/analyze-paths [p])
+              base-path (str dir "/.bl-check.edn")]
+          (check/write-baseline! base-path report)
+          (let [base (check/read-baseline base-path)]
+            (is (some? base) "the baseline reads back")
+            (is (= 1 (:version base)))
+            (is (= (:metrics report) (:metrics base)) "the metrics round-trip")
+            (is (= (get-in report [:files 0 :sha])
+                   (get-in base [:files (u/rel-path p) :sha]))
+                "each source's sha is recorded, keyed by its display path"))))
+      (finally (File/rm_rf! dir)))))
+
+(deftest baseline-is-written-one-source-per-line
+  (testing "the committed baseline is reviewed: each source on its own line"
+    (let [dir (tmp-dir)]
+      (try
+        (File/write! (str dir "/a.bl") pure-src)
+        (File/write! (str dir "/b.bl") pure-src)
+        (let [report (check/analyze-paths [(str dir "/a.bl") (str dir "/b.bl")])
+              text (check/baseline-text report)
+              lines (u/to-list (split text "\n"))]
+          (is (> (count lines) 4) "the file is not one long line")
+          (is (= 2 (count (filter (fn [l] (includes? l ":sha")) lines)))
+              "one line per source, each carrying its facts")
+          (is (includes? (first lines) "{:version 1")
+              "it is still ONE form, so the reader parses it")
+          (is (= (:metrics report) (:metrics (first (BeamLisp.Compiler/read_all_data text))))
+              "the multi-line form parses back to the same value"))
+        (finally (File/rm_rf! dir))))))
+
+(deftest no-baseline-reads-as-nil
+  (is (nil? (check/read-baseline "/tmp/does-not-exist.bl-check.edn"))))
+
+; ── the regression rule ───────────────────────────────────────────────
+
+(deftest a-fn-that-goes-impure-is-a-named-regression
+  (let [base {:files {"a.bl" {:sha "s" :diagnostics 0 :smells 0 :unreadable false
+                              :pure-fns ["p"] :terminates-fns ["p"] :eligible-fns ["p"]}}}
+        regs (check/regressions base {:files [(check/analyze-source "a.bl" impure-src)]})]
+    (is (= 2 (count regs)) "pure and eligible are lost; termination is not")
+    (is (some (fn [r] (includes? r "pure lost: p")) regs) "the lost pure fn is named")
+    (is (some (fn [r] (includes? r "eligible lost: p")) regs) "the lost eligible fn is named")))
+
+(deftest rising-diagnostics-and-smells-are-regressions
+  (let [base {:files {"a.bl" {:diagnostics 0 :smells 1 :unreadable false
+                              :pure-fns [] :terminates-fns [] :eligible-fns []}}}
+        now {:path "a.bl" :diagnostics 2 :smells 3 :unreadable false
+             :pure-fns [] :terminates-fns [] :eligible-fns []}
+        regs (check/regressions base {:files [now]})]
+    (is (= 2 (count regs)))
+    (is (some (fn [r] (includes? r "diagnostics 0 → 2")) regs))
+    (is (some (fn [r] (includes? r "smells 1 → 3")) regs))))
+
+(deftest improvements-and-new-files-are-not-regressions
+  (testing "a file that got better in every metric has no causes"
+    (let [base {:files {"a.bl" {:diagnostics 1 :smells 2 :unreadable false
+                                :pure-fns [] :terminates-fns [] :eligible-fns []}}}
+          now (assoc (check/analyze-source "a.bl" pure-src) :diagnostics 0 :smells 0)]
+      (is (= [] (check/regressions base {:files [now]})))))
+  (testing "a clean file the baseline does not know is new, not worse"
+    (is (= [] (check/regressions {:files {}} {:files [(check/analyze-source "new.bl" clean-src)]}))))
+  (testing "a brand-new file that arrives with a smell fails the gate"
+    (let [regs (check/regressions {:files {}} {:files [(check/analyze-source "new.bl" pure-src)]})]
+      (is (= 1 (count regs)))
+      (is (includes? (first regs) "smells 0 → 1")))))
+
+; ── --changed selects by content ──────────────────────────────────────
+
+(deftest changed-selects-only-the-edited-source
+  (let [dir (tmp-dir)]
+    (try
+      (let [a (str dir "/a.bl")
+            b (str dir "/b.bl")]
+        (File/write! a pure-src)
+        (File/write! b pure-src)
+        (let [base (check/baseline-of (check/analyze-paths [a b]))]
+          (is (= [] (check/changed-paths base [a b])) "nothing moved yet")
+          (File/write! b "(defn p [x] (+ x 2))\n")
+          (is (= [b] (check/changed-paths base [a b])) "only b moved")))
+      (finally (File/rm_rf! dir)))))
+
+; ── the command, end to end, in a bound cwd ───────────────────────────
+
+(deftest install-hook-writes-an-executable-hook
+  (let [dir (tmp-dir)]
+    (try
+      (File/mkdir_p! (str dir "/.git/hooks"))
+      (BeamLisp/with_cwd dir
+        (fn []
+          (is (= 0 (first (capture (fn [] (check/run [] {:install-hook true}))))) "install exits 0")
+          (let [hook (str dir "/.git/hooks/pre-commit")]
+            (is (File/exists? hook) "the hook is written")
+            (is (includes? (File/read! hook) "bl check --changed") "it runs the gate over changed files")
+            (is (= 493 (erlang/band (:mode (second (File/stat hook))) 511))
+                "it is executable (0755)"))
+          (is (= 0 (first (capture (fn [] (check/run [] {:install-hook true}))))) "installing again is fine")))
+      (finally (File/rm_rf! dir)))))
+
+(deftest install-hook-leaves-a-foreign-hook-alone
+  (let [dir (tmp-dir)]
+    (try
+      (File/mkdir_p! (str dir "/.git/hooks"))
+      (File/write! (str dir "/.git/hooks/pre-commit") "#!/bin/sh\necho mine\n")
+      (BeamLisp/with_cwd dir
+        (fn []
+          (is (= 1 (first (capture (fn [] (check/run [] {:install-hook true}))))) "a foreign hook is refused")
+          (is (includes? (File/read! (str dir "/.git/hooks/pre-commit")) "echo mine") "and left alone")))
+      (finally (File/rm_rf! dir)))))
+
+(deftest run-update-then-check-then-regress
+  (let [dir (tmp-dir)
+        file (str dir "/a.bl")]
+    (try
+      (File/write! file pure-src)
+      (BeamLisp/with_cwd dir
+        (fn []
+          (is (= 0 (first (capture (fn [] (check/run [] {:update true})))))
+              "--update records the baseline and exits 0")
+          (is (File/exists? (str dir "/.bl-check.edn")) "the baseline is written")
+          (is (= 0 (first (capture (fn [] (check/run [] {})))))
+              "an unchanged tree passes the gate")
+          (File/write! file impure-src)
+          (let [r (capture (fn [] (check/run [] {:changed true})))]
+            (is (= 1 (first r)) "a lost proof fails `--changed`")
+            (is (includes? (second r) "pure lost: p") "and the cause is named"))))
+      (finally (File/rm_rf! dir)))))

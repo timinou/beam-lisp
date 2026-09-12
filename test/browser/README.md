@@ -24,7 +24,7 @@ driving a real Chromium with Playwright against the JS client.
 
 ```sh
 # 1. regenerate the fixture from the real differ
-mix beam_lisp.run --path priv test/browser/gen_fixture.bl > test/browser/fixture.json
+bl run test/browser/gen_fixture.bl > test/browser/fixture.json
 
 # 2. install the Playwright test runner matching the cached browser
 cd test/browser

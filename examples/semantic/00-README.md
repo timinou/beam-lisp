@@ -14,7 +14,7 @@ similarity is a query clause beside `:where` patterns.
 ## How to run
 
 ```
-mix beam_lisp.run --path priv examples/semantic/01-embeddings.bl
+bl run examples/semantic/01-embeddings.bl
 ```
 
 Each file is self-contained and prints a narrated walk-through.

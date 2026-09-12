@@ -28,16 +28,20 @@
 
 ; --- schema -------------------------------------------------------------------
 
+; The name attributes are AVET-indexed: every question here binds a name and
+; asks "which entity has it?" — `[?d :fn/name ?callee]` inside a not-join runs
+; once per call row, and without the index each run is a full column scan
+; (quadratic in the codebase; ~60s for 28 files). With it, a prefix read.
 (def SCHEMA
-  [{:db/ident :fn/name        :db/valueType :db.type/string}
+  [{:db/ident :fn/name        :db/valueType :db.type/string :db/index true}
    {:db/ident :fn/ns          :db/valueType :db.type/string}
    {:db/ident :fn/arity       :db/valueType :db.type/long}
    {:db/ident :fn/line        :db/valueType :db.type/long}
    {:db/ident :fn/variadic    :db/valueType :db.type/boolean}
-   {:db/ident :fn/ret-tag     :db/valueType :db.type/string}
+   {:db/ident :fn/ret-tag     :db/valueType :db.type/string :db/index true}
    {:db/ident :fn/ret-source  :db/valueType :db.type/string}
-   {:db/ident :call/caller    :db/valueType :db.type/string}
-   {:db/ident :call/callee    :db/valueType :db.type/string}
+   {:db/ident :call/caller    :db/valueType :db.type/string :db/index true}
+   {:db/ident :call/callee    :db/valueType :db.type/string :db/index true}
    {:db/ident :call/arity     :db/valueType :db.type/long}
    {:db/ident :call/line      :db/valueType :db.type/long}])
 
@@ -271,8 +275,17 @@
                    fn-acc (concat call-acc cf))))))))
 
 (defn index-source
-  "Source text → {:fn […] :calls […]}."
+  "Source text → {:fn […] :calls […]}.
+
+   The text must BE text. A caller that read a file and passed the read's
+   failure back — `(second (File/read path))` is `:enoent` for a missing
+   file — got a `function_clause` from deep inside the reader, which named
+   neither the namespace nor the path. Fail here instead, where both are
+   still known."
   [sigs ns-str src]
+  (when-not (string? src)
+    (throw (ex-info "codebase/index-source: source is not a string"
+                    {:ns ns-str :source src})))
   (index-forms sigs ns-str (BeamLisp.Reader/read_string src)))
 
 (defn connect-codebase
@@ -372,36 +385,68 @@
     [(reaches ?a ?b) (calls ?a ?b)]
     [(reaches ?a ?b) (calls ?a ?x) (reaches ?x ?b)]])
 
+; The two "whole-codebase" questions are each ONE pass over calls joined against
+; ONE pass over definitions, with the join done as set lookups in beam-lisp. A
+; `[:not-join …]` per call row re-runs its sub-query once per row, so the
+; datalog-only spelling is quadratic in the number of calls (a minute for a few
+; dozen files); two linear scans and a set difference are the same relation.
+
+(defn- all-calls
+  "Every call row as [caller callee arity line]."
+  [db]
+  (datom/q '[:find ?caller ?callee ?n ?line
+             :where
+             [?c :call/caller ?caller]
+             [?c :call/callee ?callee]
+             [?c :call/arity ?n]
+             [?c :call/line ?line]]
+           db))
+
+(defn- defined-arities
+  "{name #{arity …}} over every definition, plus the set of variadic names."
+  [db]
+  (let [rows (datom/q '[:find ?name ?arity ?variadic
+                        :where
+                        [?d :fn/name ?name]
+                        [?d :fn/arity ?arity]
+                        [?d :fn/variadic ?variadic]]
+                      db)]
+    (reduce (fn [acc row]
+              (let [[name arity variadic] (vec row)]
+                (-> acc
+                    (update-in [:arities name] (fn [s] (conj (or s #{}) arity)))
+                    (update :variadic (fn [s] (if variadic (conj s name) s))))))
+            {:arities {} :variadic #{}}
+            rows)))
+
 (defn arity-mismatches
   "Calls whose callee is defined but never at the called arity
    (variadic fns excluded — their min-arity check is v2)."
   [db]
-  (sort (into []
-    (datom/q '[:find ?caller ?callee ?n ?line
-               :where
-               [?c :call/caller ?caller]
-               [?c :call/callee ?callee]
-               [?c :call/arity ?n]
-               [?c :call/line ?line]
-               [?d :fn/name ?callee]
-               [:not-join [?callee] [?v :fn/name ?callee] [?v :fn/variadic true]]
-               [:not-join [?callee ?n] [?d2 :fn/name ?callee] [?d2 :fn/arity ?n]]]
-             db))))
+  (let [defs (defined-arities db)
+        arities (:arities defs)
+        variadic (:variadic defs)]
+    (sort (into []
+      (filter (fn [row]
+                (let [[_ callee n _] (vec row)
+                      known (get arities callee)]
+                  (and known
+                       (not (contains? variadic callee))
+                       (not (contains? known n)))))
+              (all-calls db))))))
 
 (defn unknown-callees
   "Calls to names that are never defn'd, not core, not interop/aliased."
   [db core-names]
-  (sort (into []
-    (datom/q '[:find ?caller ?callee ?line
-               :in $ ?core
-               :where
-               [?c :call/caller ?caller]
-               [?c :call/callee ?callee]
-               [?c :call/line ?line]
-               [:not-join [?callee] [?d :fn/name ?callee]]
-               [(not (contains? ?core ?callee))]
-               [(not (codebase/interop-name? ?callee))]]
-             db core-names))))
+  (let [defined (:arities (defined-arities db))]
+    (sort (into []
+      (map (fn [row] (let [[caller callee _ line] (vec row)] [caller callee line]))
+        (filter (fn [row]
+                  (let [[_ callee _ _] (vec row)]
+                    (and (not (contains? defined callee))
+                         (not (contains? core-names callee))
+                         (not (interop-name? callee)))))
+                (all-calls db)))))))
 
 ; ── reaches as a first-class relation (the unification) ──────────────────────
 ;
@@ -487,19 +532,24 @@
              db tag))))
 
 (defn find-returning-only
-  "Fns whose return is entirely within `tags` (a set of strings)."
+  "Fns whose return is entirely within `tags` (a set of strings).
+
+   Two linear reads and a filter, not a `:not-join`: a nested sub-query
+   re-runs once per outer row, so the datalog-only spelling is quadratic
+   in the number of definitions. The same relation, with no rescan."
   [db tags]
-  (sort (into []
-    (datom/q '[:find ?name
-               :in $ ?tags
-               :where
-               [?d :fn/name ?name]
-               [?d :fn/ret-tag ?t]
-               [:not-join [?name ?tags]
-                [?d2 :fn/name ?name]
-                [?d2 :fn/ret-tag ?t2]
-                [(not (contains? ?tags ?t2))]]]
-             db tags))))
+  (let [rows (datom/q '[:find ?name ?t
+                        :where
+                        [?d :fn/name ?name]
+                        [?d :fn/ret-tag ?t]]
+                      db)
+        by-name (reduce (fn [m row]
+                          (let [[n t] (vec row)]
+                            (update m n (fn [s] (conj (or s #{}) t)))))
+                        {} rows)
+        ok (filter (fn [e] (every? (fn [t] (contains? tags t)) (val e)))
+                   (seq by-name))]
+    (sort (into [] (map (fn [e] [(key e)]) ok)))))
 
 (defn core-callee-names
   "The always-defined set: every public core name, plus this ns's."

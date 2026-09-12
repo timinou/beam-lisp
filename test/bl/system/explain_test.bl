@@ -1,0 +1,152 @@
+; test/bl/system/explain_test.bl — the datalog plan explainer.
+; Run: mix bl test test/bl/system/explain_test.bl
+;
+; `datom.explain` reads the planner's own trace and names the clauses that
+; re-read a whole attribute column once per OUTER ROW. These assertions
+; pin the two halves of that claim: the trace AGREES with the planner
+; (step 1), and a smell appears exactly when a nested clause resolves to a
+; scan — never for a top-level one, and never when the schema indexes the
+; attribute.
+
+(ns system.explain-test
+  (:require [codebase :as cb] [datom] [datom.conn]
+            [datom.explain :as ex] [datom.query.parse :as parse]
+            [datom.query.plan :as plan]))
+
+; ── fixtures ────────────────────────────────────────────────────────
+
+(def arity-query
+  "The OLD arity-mismatch shape: a `:not-join` binding `:fn/name` by
+   value. `:fn/name` is unindexed in the bare schema, so the planner
+   reads the whole column per call row — the failure the rule exists for."
+  '[:find ?caller
+    :where
+    [?c :call/caller ?caller]
+    [?c :call/callee ?callee]
+    [:not-join [?callee] [?d :fn/name ?callee]]])
+
+(def indexed-schema
+  [{:db/ident :fn/name :db/valueType :db.type/string :db/index true}])
+
+(def plain-query
+  '[:find ?name :where [?e :person/name ?name]])
+
+(def or-join-query
+  '[:find ?caller
+    :where
+    [?c :call/caller ?caller]
+    [:or-join [?caller] [?a :alias/name ?caller] [?b :alias/key ?caller]]])
+
+; ── (e) the trace agrees with the planner ───────────────────────────
+
+(deftest plan-trace-is-the-planner-order
+  (let [p (parse/parse arity-query)
+        trace (plan/plan-trace p nil)]
+    (is (= (:where (plan/plan p)) (:order trace))
+        ":order is exactly the plan's clause order")
+    (is (= (:where (plan/plan p)) (mapv (fn [s] (get s :clause)) (:steps trace)))
+        ":steps names the same clauses, in order")
+    (is (every? (fn [s]
+                  (= (get s :index)
+                     (plan/index-for nil (get s :bound) (get s :clause))))
+                (:steps trace))
+        "every step's :index is the index-for of its bound set")))
+
+(deftest plan-trace-uses-the-schema
+  (let [sub (fn [schema]
+              (plan/plan-trace
+                {:find [] :in '[?callee] :where '[[?d :fn/name ?callee]]}
+                schema))
+        bare (first (:steps (sub nil)))
+        indexed (first (:steps (sub (ex/schema-map indexed-schema))))]
+    (is (= [:aevt [:fn/name]] (:index bare)) "unindexed attr scans AEVT")
+    (is (= :avet (first (:index indexed))) "indexed attr prefix-scans AVET")))
+
+; ── (a) the old query is flagged, (b) indexing clears it ────────────
+
+(deftest a-nested-scan-is-flagged-and-indexing-clears-it
+  (let [bare (ex/smells arity-query nil)
+        indexed (ex/smells arity-query indexed-schema)]
+    (testing "with no schema, the :fn/name column read is named"
+      (is (= 1 (count bare)))
+      (is (= :datalog/nested-scan (:kind (first bare))))
+      (is (= :fn/name (:attr (first bare))))
+      (is (= :aevt (first (:index (first bare)))))
+      (is (not (:certain (first bare))) "unknown schema can only flag the risk")
+      (is (includes? (:note (first bare)) ":db/index true"))
+      (is (includes? (:note (first bare)) "ONCE"))
+      (is (includes? (:note (first bare)) "datom/explain")))
+    (testing "with :fn/name indexed, AVET answers it and the smell clears"
+      (is (empty? indexed)))))
+
+; ── (c) a top-level scan is fine; only a per-row one is a smell ─────
+
+(deftest a-plain-query-has-no-nested-scan
+  (is (empty? (ex/smells plain-query nil)))
+  (is (= (ex/nested plain-query) [])))
+
+; ── (d) :or-join sub-queries run per row too ───────────────────────
+
+(deftest or-join-rescans-are-flagged
+  (let [found (ex/smells or-join-query nil)]
+    (is (seq found) "an :or-join per-row sub-query is a rescan")
+    (is (every? (fn [s] (= :datalog/nested-scan (:kind s))) found))
+    (is (contains? (set (map (fn [s] (:op s)) (ex/nested or-join-query))) :or-join))))
+
+; ── (f) against a real connection, the schema decides ───────────────
+
+(defn- codebase-db []
+  (let [conn (datom/connect cb/SCHEMA)]
+    (datom/transact! conn [{:db/id -1 :call/caller "main" :call/callee "double"
+                            :call/arity 1}])
+    (datom/db conn)))
+
+(deftest explain-against-a-real-conn-is-certain-when-it-smells
+  (let [db (codebase-db)
+        indexed (datom/explain arity-query db)
+        unindexed-query '[:find ?caller
+                          :where
+                          [?c :call/caller ?caller]
+                          [?c :call/arity ?n]
+                          [:not-join [?n] [?d :fn/arity ?n]]]
+        unindexed (datom/explain unindexed-query db)]
+    (testing "an indexed attribute produces no smell"
+      (is (empty? (:smells indexed)))
+      (is (= "no per-row rescan found" (:verdict indexed))))
+    (testing "an unindexed attribute is a certain smell"
+      (is (= 1 (count (:smells unindexed))))
+      (is (= :fn/arity (:attr (first (:smells unindexed)))))
+      (is (:certain (first (:smells unindexed)))))))
+
+; ── (g) the render says what and why ────────────────────────────────
+
+(deftest render-names-the-clause-and-the-note
+  (let [out (ex/render (ex/explain arity-query nil))]
+    (is (includes? out "plan:"))
+    (is (includes? out "[?d :fn/name ?callee]"))
+    (is (includes? out ":fn/name"))
+    (is (includes? out ":db/index true"))
+    (is (includes? out "verdict: 1 per-row rescan"))))
+
+; ── the report's shape ──────────────────────────────────────────────
+
+(deftest the-report-carries-the-sections
+  (let [r (ex/explain arity-query nil)]
+    (is (= (set [:find :in :order :steps :nested :smells :verdict])
+           (set (keys r))))
+    (is (= (:find (parse/parse arity-query)) (:find r)))
+    (is (= 1 (count (:nested r))))
+    (is (= :not-join (:op (first (:nested r)))))
+    (is (= '[?callee] (:scoped (first (:nested r)))))))
+
+(deftest schema-facts-reads-vectors-maps-and-dbs
+  (is (contains? (:indexed (ex/schema-facts cb/SCHEMA)) :fn/name))
+  (is (not (contains? (:indexed (ex/schema-facts cb/SCHEMA)) :fn/arity)))
+  (let [db (codebase-db)]
+    (is (contains? (:indexed (ex/schema-facts db)) :fn/name))
+    (is (contains? (:indexed (ex/schema-facts (datom/schema (datom/connect cb/SCHEMA)))) :fn/name))))
+
+(deftest query?-recognises-a-query-vector
+  (is (ex/query? arity-query))
+  (is (not (ex/query? '[1 2 3])))
+  (is (not (ex/query? '(:find ?x)))))

@@ -1381,8 +1381,11 @@ defmodule BeamLisp.RT do
   # Any other result (e.g. a value whose comparator did not reduce to a number
   # or boolean) falls back to Erlang term ordering against 0 — the exact
   # behavior of the previous `invoke(comp, …) <= 0` implementation, so no
-  # existing sort regresses.
-  defp comparator_le(result), do: result <= 0
+  # existing sort regresses. Written as a literal `false` rather than
+  # `result <= 0`: every non-number term (atom, tuple, pid, list, map, binary)
+  # is GREATER than every number in Erlang's term order, so that comparison is
+  # false for any such result — and the compiler says so on every build.
+  defp comparator_le(_result), do: false
 
   # --- cpp/* interop ------------------------------------------------
   # jank writes `(cpp/jank.runtime.name x)` for its C++ primitives.
@@ -2234,15 +2237,16 @@ defmodule BeamLisp.RT do
       "#" <> ns <> "/" <> name <> "{" <> body <> "}"
     else
       # A host struct is OPAQUE: beam-lisp has no syntax for a value it did
-      # not define, and this branch used to hand it to `print_str_map`,
-      # which enumerates its argument — a struct is a map that is NOT
-      # Enumerable, so `Enum.map_join` raised `Protocol.UndefinedError` and
-      # the printer died on the very value it was asked to describe. That
-      # converts a reportable failure into an unreportable one at exactly
-      # the moment a reader is staring at output trying to find out what
-      # went wrong. `inspect` is honest about an opaque value, is BOUNDED
-      # (a huge payload cannot flood a log), and is the choice the
-      # reference clause above already makes, for the same reason.
+      # not define. Handing it to `print_str_map` asked the printer to
+      # ENUMERATE it, and a struct is a map that either is not Enumerable at
+      # all (an exception) or is one but yields ELEMENTS rather than pairs (a
+      # MapSet, a Date.Range) — while `print_str_map` destructures pairs. So
+      # the printer died on the very value it was asked to describe, which
+      # converts a reportable failure into an unreportable one at exactly the
+      # moment a reader is staring at output trying to find out what went
+      # wrong. `inspect` is honest about an opaque value, is BOUNDED (a huge
+      # payload cannot flood a log), and is the choice the reference clause
+      # above already makes, for the same reason.
       inspect(r)
     end
   end

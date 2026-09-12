@@ -13,19 +13,19 @@ The README's chain — *the language is the harness, the harness is the runtime,
 the runtime is the application* — has one missing link: nothing makes the
 harness *legible* while you are inside it. Nine organs already exist, each
 proven by examples and tests, each living in its own folder, each booted by a
-hand-written `mix beam_lisp.run` invocation:
+hand-written `bl run` invocation:
 
 | organ | lives at | proves |
 |---|---|---|
 | code as facts | `priv/std/codebase.bl` | source → datom → impact/reachability queries |
-| self-building catalog | `tooling/catalog.bl` | `^:catalog` metadata; doc = demo = same form |
+| self-building catalog | `tooling.catalog` | `^:catalog` metadata; doc = demo = same form |
 | explorer | `docs/explorer.md` | library × examples join; coverage as gap query |
 | live views | `priv/lib/live/`, `examples/live/` | view = pure fn db→hiccup; convergence through the log |
 | edit-as-transaction | `priv/std/reload.bl`, `priv/std/reload/`, `examples/reload/` | bundles held/coherent; quiesce; reroute |
 | ward | `priv/std/reload/ward.bl` | isolated per-file env forks; coherence gate; always-latest |
 | guarantee engine | `priv/lib/system/`, `examples/system/` | inductive safety, repair, deadlock, liveness, refinement |
 | the fundamental form | `docs/the-fundamental-form.md` | process = transition relation; seven forms = one shape |
-| aliveness observatory | `tooling/vitals.bl` | processes as tiles; supervision tree; kill → heal |
+| aliveness observatory | `examples/tooling/vitals.bl` | processes as tiles; supervision tree; kill → heal |
 
 Spell boots all of them over **one namespace set** (core + stdlib + the
 current folder) and lets a human — and an agent — live inside the result.
@@ -34,7 +34,7 @@ current folder) and lets a human — and an agent — live inside the result.
 
 ### R1 — Boot is a generalization of an existing program, not a new one
 
-`tooling/catalog.bl` already does the hard part of "load a folder": it
+`tooling.catalog` already does the hard part of "load a folder": it
 EVALUATES each file (defns become live) and READS each (line + source become
 facts). Spell's boot is that, generalized:
 
@@ -166,13 +166,13 @@ specification surface, adding one world:
 The patterns vocabulary maps 1:1 onto the example ladders the repo already
 teaches: `converges` ↔ two tabs (`live/05`), `isolated` ↔ ward /
 dangling-bundle (`reload/02`), `stays` ↔ invariants (`system/*`), `lively` ↔
-kill-and-heal (`tooling/vitals.bl`). A scenario run emits blueprint's
+kill-and-heal (`examples/tooling/vitals.bl`). A scenario run emits blueprint's
 deterministic HTML certificate — the demo of the spec.
 
 ### R6 — The catalog is the navigation; coverage is the debt metric
 
 Every view, tool, demo, and scenario Spell ships is a `^:catalog` entry, so
-the chrome of the app is queried, not listed. `tooling/catalog.bl` already
+the chrome of the app is queried, not listed. `tooling.catalog` already
 guarantees the doc and the demo cannot drift (they are the same form) and
 already reports coverage — the functions no example demonstrates. Spell eats
 its own dog food: the first catalog Spell serves is **itself**, and the
@@ -180,7 +180,7 @@ coverage number is the honesty metric in the corner of the screen.
 
 ### R7 — Vitals is the session view
 
-Do not build a bespoke "session monitor." `tooling/vitals.bl` already renders
+Do not build a bespoke "session monitor." `examples/tooling/vitals.bl` already renders
 processes as tiles with heartbeat, mailbox depth, supervision trees, and a
 kill button — reading live VM state as data. Spell sessions appear as the
 same tiles: a session is a process (R3), a handoff is a message edge between
@@ -233,7 +233,7 @@ that lands after the notebook view exists (it is W5's prerequisite).
 
 | source | taken | left behind |
 |---|---|---|
-| beam-lisp organs | everything in the table above | the hand-run `mix beam_lisp.run` invocations |
+| beam-lisp organs | everything in the table above | the hand-run `bl run` invocations |
 | `ora/djinn-bl` | Score-as-value discipline; affordance=authority; closed evaluator for untrusted input; Space-per-conn isolation; mix+blrun app shape | in-memory-only store; server-rendered cockpit; scripted mind stub |
 | `ora/relay` | env fork semantics (`^:per-env`, tombstones); one-seam backend swap; the transport cutover target | gateway product concerns |
 | `ora/blueprint` | scenario DSL, worlds, verdict algebra, patterns, certificates | legacy film DSL as primary path; manufacturing domain |

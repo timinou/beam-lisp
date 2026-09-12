@@ -10,7 +10,7 @@ Design doc (the spec these implement): `docs/datom-as-a-broadcast-substrate.md`.
 Run any file with:
 
 ```
-mix beam_lisp.run --path priv examples/datom/live/NN-name.bl
+bl run examples/datom/live/NN-name.bl
 ```
 
 ## The one idea

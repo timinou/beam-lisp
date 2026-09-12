@@ -80,7 +80,7 @@ loom component.
 ### `hello-app.bl` — the whole loop on one screen
 
 ```
-mix beam_lisp.run --path priv examples/desktop/hello-app.bl
+bl run examples/desktop/hello-app.bl
 ```
 
 A counter with a name field, built from real loom components (card, heading,
@@ -90,7 +90,7 @@ event and the window converges. `quit` halts the node.
 ### `statusbar.bl` — a top-bar that watches the VM it runs in
 
 ```
-mix beam_lisp.run --path priv examples/desktop/statusbar.bl
+bl run examples/desktop/statusbar.bl
 ```
 
 A frameless layer-shell strip docked to the top of the screen, glassmorphic

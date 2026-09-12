@@ -1,0 +1,125 @@
+#+TITLE: The warm daemon never survives its starter: bl daemon start reports up, exits, and leaves nothing to attach to
+#+STATE: DONE
+#+SESSION_ID: 157bcd97046112e7
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-11T19-45-37-298Z_157bcd97046112e7.jsonl]]
+#+CUSTOM_ID: FUP-035-the-warm-daemon-never-survives-its-start
+#+COMPLETION_HASH: f5a4509ba843104f
+
+* Initial Message
+
+Please look at the various modules available and tell me what `bl` should ship with to be a complete interface to programming in beam-lisp
+
+* Symptom
+
+The drop advertises a warm daemon: a command served over a socket in ~30 ms instead of a ~1.2 s cold VM boot. On this workstation no daemon ever survives long enough to serve anything, in either the explicit or the autostart flow.
+
+#+begin_example
+$ bl daemon start
+03:04:45 [info] bl daemon up: tree 397cee1bd9c4947a at /run/user/1000/beam_lisp/397cee1bd9c4947a.sock
+$ bl daemon status
+bl daemon: not running for /tmp/wd (:econnrefused)     # socket FILE exists, nobody listens
+
+$ BL_DAEMON=auto bl eval '(+ 1 2)'   # x3, measured
+0.66 s / 0.56 s / 0.81 s             # never ~30 ms
+$ pgrep -f 'bl-drop.*daemon' | wc -l
+0
+$ bl daemon status
+bl daemon: not running for /tmp/wd (:no_socket)
+#+end_example
+
+Same shape in dev: `mix bl daemon start` prints `bl daemon up`, returns, and `mix bl daemon status` immediately reports `:econnrefused`.
+
+* What is known
+
+- A daemon CAN serve: it did, for a whole watch session, in this session's verification of the daemon-hosted watcher (`FUP-077` / PLAN-101): while the daemon was up, a second client's `eval` returned `3` and a live `watch` streamed commit frames. So the protocol, the Executor, and the registry are fine.
+- The daemon is started three ways, and they disagree: (a) the Rust launcher's `start_daemon_detached` (only reached from `maybe_attach_daemon`, gated on `BL_DAEMON=auto`), (b) `bl daemon start` — a lifecycle verb the launcher deliberately does NOT fast-path, so it runs `bin/bl eval …main(["daemon","start"])` in the foreground, and (c) `mix bl daemon start` in dev.
+- Observation that narrows it: `daemon start` reports `up` and then EXITS. If the daemon is hosted by the VM that ran the command (which the `up` line and the socket file imply), the command must either park (foreground daemon) or hand the listener to a detached OS process. It appears to do neither.
+- The stray socket file left behind after the daemon dies also makes the NEXT `daemon start` slow: the launcher's `wait_ready` polls for up to 120 s (600 × 200 ms) and then falls back to a cold run — measured `real 2m0.14s` for one `bl daemon start`, with the daemon gone afterwards.
+
+* Reproduce
+
+#+begin_example
+cd /tmp && mkdir -p dtest && cd dtest
+bl daemon start                      # prints 'bl daemon up: tree …'
+bl daemon status                     # :econnrefused
+BL_DAEMON=auto bl eval '(+ 1 2)'     # cold timing, no daemon left behind
+pgrep -af 'bin/bl'                   # nothing
+#+end_example
+
+* Acceptance
+
+- `bl daemon start` leaves a daemon that is still reachable (`bl daemon status` shows running) after the starting process exits, and `bl daemon stop` removes it cleanly.
+- With the daemon up, `bl eval '(+ 1 2)'` is an order of magnitude faster than the cold path; the drop's documented ~30 ms is the target to measure against.
+- The stale-endpoint case is bounded: a start after an uncleanly killed daemon must not spend 120 s in `wait_ready` with no daemon to show for it — either the socket file is reclaimed or `wait_ready` reports the failure immediately.
+- A test pins the lifecycle (start → reachable → stop → unreachable), even if it must spawn a real VM.
+
+* Notes
+
+Not caused by PLAN-101's changes: the daemon's request path, the Executor, and the watcher registry were all exercised successfully during that work (see the watch e2e in `agent://12-WatchViaDaemon`). This is the lifecycle/detachment seam around them, which no session had exercised end to end before the drop was smoke-tested on 2026-09-12.
+
+NOTE [2026-09-12]: CORRECTION (2026-09-12 03:20) — the mechanism is located, and the daemon itself is fine.
+
+`BeamLisp.Daemon.start_foreground/1` is correct: it starts the Server and then BLOCKS on `receive {:DOWN, ref, …}` for the daemon's lifetime (lib/beam_lisp/daemon.ex:26-48). docs/bl/03 documents exactly this — "`bl daemon start` # become the daemon (blocks; the launcher runs it detached)".
+
+The bug is the parenthetical. In tooling/drop/src/launcher.rs, `start_daemon_detached` is called ONLY from `maybe_attach_daemon/2` (the autostart branch, `BL_DAEMON=auto`, `Attach::Fallback` / `RestartRequired`). The `daemon` verb is classified `is_lifecycle` and SKIPS the attach path entirely, so `bl daemon start` reaches `cmd.exec()` in the FOREGROUND: it parks in the user's terminal, and Ctrl-C (or any timeout) kills the daemon, leaving the socket file behind. That also explains the "2m0.14s bl daemon start" measurement in the symptom above — that was the foreground daemon parking until the harness's own `timeout 120` killed it, not a `wait_ready` spin.
+
+Everything downstream therefore works; only the lifecycle launcher is wrong. Measured with a live daemon in one process (protocol client, 2026-09-12 03:21):
+
+  eval '(+ 1 2)' served by the daemon      ->  24 ms   (cold: ~500-800 ms)
+  the same daemon refused ['repl'] with a terminal frame:
+    stderr "bl daemon: this command keeps its own process — run it without the daemon (BL_DAEMON=off bl ...)"
+    exit 1
+  a NEW client right after the refusal     ->  "3
+" + exit 0 in 24 ms
+    (so the single Executor worker was never parked)
+
+Suggested fix (launcher.rs, ~10 lines): treat `verb == "daemon"` with a `start` subcommand as the detach case — `start_daemon_detached(bin, &root)`, then `wait_ready(&root)`, then report up/status and exit — instead of `cmd.exec()`. Keep `daemon stop`/`status` as ordinary foreground commands, and reclaim a killed daemon's stale socket rather than costing the next start a spin. Acceptance is unchanged: `bl daemon start` returns; `bl daemon status` shows running; `bl eval` is an order of magnitude faster; `bl daemon stop` removes it.
+
+* RESOLVED 2026-09-11 — fixed in `03a74a7`, verified in a built drop
+
+The cause was exactly the launcher hypothesis, plus one thing underneath it.
+
+`tooling/drop/src/launcher.rs` reached `start_daemon_detached` ONLY from the
+autostart branch of `maybe_attach_daemon`, and the `daemon` verb is
+`is_lifecycle`, so the fast-path block skipped it and control fell to the
+`exec` at the bottom: `bin/bl eval BeamLisp.Ns.Bl.Cli.main(["daemon","start"])`
+in the foreground. The release parks in `Daemon.start_foreground/1` (which is
+correct — it IS the daemon), so the daemon lived exactly as long as the shell
+that asked for it. `bl daemon status` right after reported `:no_socket`.
+Observed, before the fix: `./bl daemon start` printed `bl daemon up: tree
+9b35bbfecf0429a8 …`, never returned, and the socket died with my timeout.
+
+The launcher now answers that one invocation itself — detach, wait for the
+socket to answer (a `version` round trip), report, exit — and a bare `bl
+daemon` or `daemon stop|status` still reaches the release. `BL_DAEMON=off`
+keeps the foreground behavior, so "no daemon" still means no daemon.
+
+Underneath it was a second, sharper bug: `resolve_root` returned `None` when no
+checkout encloses the cwd (`is_tree_root` wants `priv/boot/core.bl`, or `bin/bl`
++ `releases/`), while `BeamLisp.Daemon.start/1` keys its server on
+`BL_DAEMON_ROOT || File.cwd!()` with no search. So in a scratch directory the
+release started a daemon the launcher could never find — no fast-path, no
+handoff, a cold VM per command forever, and my first attempt at the detach fix
+fell straight through to `exec` because the root resolved to `None`.
+`resolve_root` now falls back to the cwd (the daemon's own rule), with the
+search upward still winning when a checkout does enclose it.
+
+Measured in the drop, cwd `/tmp/smoke` (no checkout above it):
+
+```
+$ ./bl daemon start
+bl: daemon started — commands for this tree are now warm
+real 0m2.295s          # detached; the daemon outlives the shell
+$ ./bl eval '(+ 1 2)'
+3
+real 0m0.068s          # warm — was a ~1.2s cold boot per command
+$ ./bl daemon status   # uptime_ms 5295, queue_depth 0
+$ ./bl daemon stop     # bl daemon: stopped (/tmp/smoke)
+$ ./bl eval '(+ 2 3)'  # 0.515s cold again
+```
+
+`cargo test` in `tooling/drop`: 13 tests, was 11 — one pins the invocation
+routing (`only_an_explicit_daemon_start_is_the_launchers_own_work`, including
+`run daemon start` as an ARGUMENT not a verb), one the root fallback
+(`no_checkout_above_still_resolves_to_a_tree`, including the upward search from
+two levels below a checkout).

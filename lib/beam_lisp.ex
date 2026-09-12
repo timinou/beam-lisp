@@ -208,34 +208,14 @@ defmodule BeamLisp do
     end
   end
 
-  @doc "A read-eval-print loop. Exit with Ctrl+C or by evaluating `(System/halt)`."
+  @doc """
+  A read-eval-print loop. The loop itself is `bl.repl` — a beam-lisp
+  namespace, so the interactive session is the same code `bl repl` runs.
+  Exit with Ctrl+D.
+  """
   def repl do
     init()
-    IO.puts("beam-lisp #{vsn()} — jank's language, the BEAM's runtime. (Ctrl+C to exit)")
-    repl_loop()
-  end
-
-  defp repl_loop do
-    case IO.gets("#{Env.current_ns()}=> ") do
-      :eof ->
-        :ok
-
-      {:error, _} ->
-        :ok
-
-      line ->
-        try do
-          line |> Compiler.eval_string() |> RT.print_str() |> IO.puts()
-        rescue
-          e -> IO.puts("error: #{Exception.message(e)}")
-        end
-
-        repl_loop()
-    end
-  end
-
-  defp vsn do
-    {:ok, vsn} = :application.get_key(:beam_lisp, :vsn)
-    List.to_string(vsn)
+    BeamLisp.Loader.ensure_loaded("bl.repl")
+    RT.invoke(Env.fetch!("bl.repl", "run"), [[], %{}])
   end
 end

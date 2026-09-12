@@ -5,7 +5,7 @@
 Run it:
 
 ```sh
-BL_SERVE=1 mix beam_lisp.run --path priv examples/data/studio.bl
+bl serve examples/data/studio.bl
 # http://127.0.0.1:4088            the app, with the chip in the corner
 # http://127.0.0.1:4088/__pulse/converge   two viewers side by side
 ```
