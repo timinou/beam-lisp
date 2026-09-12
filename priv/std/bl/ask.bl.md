@@ -139,25 +139,31 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
   [facts delta]
   (u/to-list (map (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) facts)))
 
-(defn- facts-cache-path
-  "Where the indexed facts of a source with content hash `sha` live — under the
-   project of the SOURCES being asked about, not the shell's."
-  [sha root]
-  (str (codebase/blanalysis-dir root) "/facts." sha ".term"))
+(defn- cache-path
+  "Where one cached ANALYSIS of a source with content hash `sha` lives. `kind`
+   says what was computed: `facts` is the indexer's facts (what a datalog
+   question is answered from), `symbols` the analyser's document symbols (what a
+   source question is answered from).
 
-(defn- cached-facts
-  "The cached facts for `sha`, or nil."
-  [sha root]
-  (let [p (facts-cache-path sha root)]
+   Under the project of the SOURCES being asked about, not the shell's: an
+   artifact derived from a tree belongs to that tree."
+  [kind sha root]
+  (str (codebase/blanalysis-dir root) "/" kind "." sha ".term"))
+
+(defn- cached-analysis
+  "The `kind` analysis remembered for `sha`, or nil."
+  [kind sha root]
+  (let [p (cache-path kind sha root)]
     (when (File/exists? p)
       (try (erlang/binary_to_term (File/read! p)) (catch _ nil)))))
 
-(defn- remember-facts!
-  "Store `facts` for `sha`; a failure to write is silently a cache miss next time."
-  [sha facts root]
+(defn- remember-analysis!
+  "Store `value` as the `kind` analysis of `sha`; a failure to write is silently
+   a cache miss next time."
+  [kind sha value root]
   (try
     (File/mkdir_p (codebase/blanalysis-dir root))
-    (File/write! (facts-cache-path sha root) (erlang/term_to_binary facts))
+    (File/write! (cache-path kind sha root) (erlang/term_to_binary value))
     (catch _ nil)))
 
 (defn source-facts
@@ -166,11 +172,11 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
    indexed before."
   [sigs src root]
   (let [sha (sha256-hex src)]
-    (or (cached-facts sha root)
+    (or (cached-analysis "facts" sha root)
         (let [ns-str (u/ns-of src)
               facts (codebase/index-source sigs ns-str src)
               entry {:ns ns-str :fn (u/to-list (:fn facts)) :calls (u/to-list (:calls facts))}]
-          (remember-facts! sha entry root)
+          (remember-analysis! "facts" sha entry root)
           entry))))
 
 (def tx-batch
@@ -348,15 +354,31 @@ definition is not self-recursive.
              (= :symbol (typed/node-tag (typed/node-form head)))
              (contains? #{"defn" "defn-"} (typed/node-name (typed/node-form head))))))))
 
+(defn symbols-of
+  "The document symbols of `src` — what a source question is answered from. The
+   analysis costs seconds a file, so a question asked twice over the same text
+   pays for it once: content-addressed, so an edit is a new entry and an
+   unchanged file is a hit. Every source question shares it, which is why
+   `dead-code` — two analyses' worth — costs one."
+  [src root]
+  (let [sha (sha256-hex src)]
+    (or (cached-analysis "symbols" sha root)
+        (let [syms (u/to-list (lsp/document-symbols src))]
+          (remember-analysis! "symbols" sha syms root)
+          syms))))
+
 (defn roots
   "The definitions a source's own top-level code refers to — its entry points.
-   A source with none is a library, so every definition is a root."
-  [src]
-  (let [names (set (map (fn [s] (:name s)) (u/to-list (lsp/document-symbols src))))
+   A source with none is a library, so every definition is a root. The symbols
+   are passed in when the caller already has them: analyzing one file twice to
+   answer one question is the cost this file exists to avoid."
+  ([src] (roots src (u/to-list (lsp/document-symbols src))))
+  ([src syms]
+  (let [names (set (map (fn [s] (:name s)) (u/to-list syms)))
         forms (BeamLisp.Reader/read_string src)
         refs (mapcat (fn [f] (if (defn-form? f) [] (node-refs f))) forms)
         rs (distinct (filter (fn [r] (contains? names r)) refs))]
-    (if (empty? rs) (into [] names) rs)))
+    (if (empty? rs) (into [] names) rs))))
 
 (defn- tag-str [t]
   (if (keyword? t) (name t) (pr-str t)))
@@ -368,19 +390,20 @@ definition is not self-recursive.
 (defn source-rows
   "Answer the file `question` for one source: rows are plain lists whose first
    cell names the file. `:unknown-question` when `question` is not a file
-   question."
-  [question path src]
+   question. `root` is the corpus the answer is remembered under."
+  [question path src root]
   (let [path (u/rel-path path)]
     (cond
       (= question "dead-code")
-        (u/to-list (map (fn [n] (u/to-list [path n]))
-                        (u/to-list (lsp/dead-code src (roots src)))))
+        (let [syms (symbols-of src root)]
+          (u/to-list (map (fn [n] (u/to-list [path n]))
+                          (u/to-list (lsp/dead-code src (roots src syms))))))
 
       (= question "symbols")
         (u/to-list (map (fn [s] (u/to-list [path (:name s) (returns-str s)
                                             (:pure s) (:terminates s)
                                             (:growth-label s)]))
-                        (u/to-list (lsp/document-symbols src))))
+                        (symbols-of src root)))
 
       :else :unknown-question)))
 ```
@@ -457,8 +480,11 @@ exits 0 even when it finds no rows; a bad invocation exits 2.
     0))
 
 (defn- run-source [qname sources st]
-  (let [rows (u/to-list
-               (mapcat (fn [p] (source-rows qname p (File/read! p))) sources))
+  (let [; The SOURCES decide where the analysis is remembered, as they do for the
+        ; store: a question about a checkout elsewhere caches there.
+        root (first sources)
+        rows (u/to-list
+               (mapcat (fn [p] (source-rows qname p (File/read! p) root)) sources))
         data {:question qname :target nil :rows rows :count (count rows)}]
     (u/emit st data render)
     0))

@@ -216,6 +216,14 @@ Three properties belong to the door rather than to any caller:
   `bin/bl` + `releases/`); with none, the corpus you pointed at is the project —
   never the filesystem root. `.local/bl/` is gitignored, and `bl doctor` reports
   the directory.
+* **The source questions cache their analysis too.** `bl ask symbols` and
+  `bl ask dead-code` are answered from `lsp/document-symbols`, which costs
+  seconds a file cold, and that analysis is remembered as `<kind>.<sha>.term`
+  beside the stores — same content address, same project rule, same eviction,
+  because an entry is one artifact whether it is a store or an analysis. The two
+  questions share the one analysis, so `dead-code` — which needs the symbols for
+  both its passes — pays for it once, and a question over an unchanged file
+  re-reads it instead of re-deriving it.
 * **The stores accumulate, so a cap and a verb exist.** One store per (source,
   source revision) means every edit mints a new one and the old one is garbage
   the moment the source moves on. `bl cache status` shows what a tree holds, per
@@ -307,7 +315,9 @@ $ bl search "read a file into lines" -p priv/lib -k 3
 ```
 
 The same two runs on the corpus you actually work in — `priv/lib/code`, 2 files,
-48 functions — where the store is created beside the sources:
+48 functions — where the store is created beside the sources. `status` counts
+every entry in that directory: stores and the per-file analyses `bl ask`
+remembers:
 
 ```
 $ bl search "read a file into lines" -p priv/lib/code -k 3     # nothing cached yet
@@ -317,8 +327,8 @@ $ bl search "read a file into lines" -p priv/lib/code -k 3     # everything cach
 3 of 48 functions in 2 files  (index 2534 ms · query 1214 ms · cached 2/2 · vectors 2/2)
 
 $ bl cache status
-  2 store(s)  839 KB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
-total 839 KB · cap 512 MB (under)
+  10 entries  65 MB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 65 MB · cap 512 MB (under)
 ```
 
 `examples/code-semantic/01-search-by-meaning.bl` indexes eight real source files,
