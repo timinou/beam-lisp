@@ -1,0 +1,213 @@
+; priv/lib/mcp/transport-http.bl — MCP over HTTP: the transport, and the OAuth
+; door in front of it.
+;
+; WHY THIS EXISTS. mcp.transport-stdio owns a process: it reads one request at a
+; time from stdin and writes one frame back, for as long as the client keeps the
+; pipe open. HTTP has no such lifetime — a request arrives, is answered, and the
+; next one may be a different connection, a different client, a different
+; principal. So this transport is a FUNCTION of (request, opts) → response, and
+; the app's own HTTP server calls it. It drives the same
+; `mcp.server/request-response` dispatch the stdio transport drives, so the two
+; cannot drift.
+;
+; AUTHORIZATION IS PART OF THE SHAPE, not an app's private business. The MCP
+; authorization spec says an unauthenticated request is answered 401 with a
+; `WWW-Authenticate` challenge naming a protected-resource metadata document
+; (RFC 9728); the client fetches that document, learns which authorization
+; servers can issue for this resource, and only then starts a flow. An app that
+; hand-rolls this gets it subtly wrong in a way no test catches until a real
+; client refuses to connect. So the challenge, the metadata document and the 401
+; body live here, and the app supplies only the two things that are policy: WHO
+; is calling (a verifier) and WHAT they may do (a registry per principal).
+;
+; WHAT A HANDLER SEES. `handle` calls the `:state` function WITH the verified
+; principal, so the app builds a registry for that caller — the mechanism is the
+; function argument, not a variable somewhere. A state built PER REQUEST is what
+; keeps one connection's rights out of another's. For the two hooks that receive
+; the state (`:resource-read`, `:prompt-get`) the principal is also merged in as
+; `:auth`; a TOOL handler is `(fn [args])` and sees only its arguments, so a tool
+; that must know who is calling gets it from the closure that built the registry.
+;
+; Serving, in an app:
+;
+;   (defn router [conn]
+;     (let [r (transport/handle
+;              {:method (web/method conn)
+;               :uri (web/path conn)
+;               :headers (headers-of conn)
+;               :body (web/read-body conn)}
+;              {:authenticate (fn [req] (verify (transport/bearer req)))
+;               :state (fn [principal] (my-registry-for principal))
+;               :resource-metadata-url "https://host/.well-known/oauth-protected-resource/mcp"})]
+;       (reply-from conn r)))
+
+(ns mcp.transport-http
+  (:require [mcp.server :as server]))
+
+;; ── the OAuth door ──────────────────────────────────────────────────
+
+(defn protected-resource-metadata
+  "The RFC 9728 document a client fetches after the 401 challenge. It is how a
+   client learns which authorization servers can issue tokens FOR THIS RESOURCE
+   — the resource indicator is the URL the client was already talking to, so a
+   client can never be steered into a token for somebody else's resource.
+
+   Only the keys it was given are emitted: an app with no documentation URL says
+   nothing about documentation rather than saying null."
+  [opts]
+  (let [base {"resource" (get opts :resource)
+              "bearer_methods_supported" ["header"]}
+        extras (filter (fn [pair] (some? (second pair)))
+                       [["authorization_servers" (get opts :authorization-servers)]
+                        ["scopes_supported" (get opts :scopes-supported)]
+                        ["resource_name" (get opts :resource-name)]
+                        ["resource_documentation" (get opts :documentation)]])
+        filled (reduce (fn [m pair] (assoc m (first pair) (second pair)))
+                       base extras)]
+    (reduce (fn [m k]
+              (if (or (vector? (get m k)) (list? (get m k)))
+                (assoc m k (to-list (get m k)))
+                m))
+            filled
+            ["authorization_servers" "scopes_supported"])))
+
+(defn www-authenticate
+  "The challenge header value for an unauthenticated request. Both parameters
+   are quoted because in the auth-param grammar a URL is not a token."
+  [metadata-url]
+  (str "Bearer realm=\"mcp\", resource_metadata=\"" metadata-url "\""))
+
+(defn- header
+  "Case-insensitive lookup over a headers map with string keys."
+  [headers name]
+  (let [want (String/downcase name)]
+    (first (keep (fn [k] (if (= want (String/downcase (str k))) (get headers k) nil))
+                 (keys (or headers {}))))))
+
+(defn bearer
+  "The bearer token from an `Authorization` header, or nil. The scheme is matched
+   case-insensitively and the LAST whitespace-separated field is the token,
+   because clients in the wild send `bearer` and some pad with an extra space —
+   refusing either is a bug report, not a security win."
+  [request]
+  (let [raw (header (get request :headers) "authorization")]
+    (if (nil? raw)
+      nil
+      (let [parts (split (String/trim raw) " ")]
+        (if (and (>= (count parts) 2)
+                 (= "bearer" (String/downcase (first parts))))
+          (last parts)
+          nil)))))
+
+;; ── the transport ───────────────────────────────────────────────────
+
+(defn- reply
+  "An HTTP response. Keys are keywords; header names are strings, so a caller
+   can hand them to its web layer without renaming anything."
+  ([status body] (reply status body {}))
+  ([status body headers]
+   {:status status
+    :headers (assoc headers "content-type" "application/json")
+    :body body}))
+
+(defn- bodyless [status]
+  {:status status :headers {} :body ""})
+
+(defn- rpc-error [id code message]
+  {"jsonrpc" "2.0" "id" id "error" {"code" code "message" message}})
+
+(defn- encode [v]
+  (try (Jason/encode! v)
+       (catch _e
+         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"encode failure\"}}")))
+
+(defn- decode [body]
+  (try (Jason/decode! body)
+       (catch _e ::unparseable)))
+
+(defn- dispatch-one
+  "One message through the server under the state built for this request. nil
+   for a notification: the spec answers those with NO body, and an answer to one
+   makes a strict client read a reply it never asked for."
+  [state message]
+  (if (and (map? message) (nil? (get message "id")))
+    nil
+    (server/request-response state message)))
+
+(defn handle
+  "Serve one HTTP request. Returns `{:status :headers :body}` with a JSON body,
+   so a caller can hand it straight to its web layer.
+
+   `request` — `{:method :uri :headers :body}`; `:headers` is a string-keyed map
+   in any case, `:body` the raw request body.
+
+   `opts`:
+     :state                  (fn [principal] → registry state). REQUIRED. Called
+                             per request on purpose: a connection's rights must
+                             not survive into the next request's process, and a
+                             tool handler that needs the caller closes over the
+                             principal here. `:auth` carries the principal for
+                             the hooks that receive the state (resource-read,
+                             prompt-get).
+     :authenticate           (fn [request] → principal | nil). Omit for a server
+                             that needs no authorization.
+     :resource-metadata-url  the RFC 9728 document's URL, used in the challenge.
+     :path                   endpoint path (default \"/mcp\").
+     :protocol-version       echoed as `MCP-Protocol-Version` on a success.
+
+   Handling is TOTAL: a malformed body, a wrong method, a wrong path and a
+   missing verifier are all answered, never raised. A transport that throws
+   inside a web handler looks to the client like a server that vanished — the
+   one failure a client cannot tell from the network."
+  [request opts]
+  (let [path (get opts :path "/mcp")
+        method (String/upcase (str (get request :method)))
+        uri (get request :uri)
+        verify (get opts :authenticate)
+        principal (if (nil? verify) ::anonymous (verify request))
+        message (decode (get request :body))]
+    (cond
+      (not (= path uri))
+      (reply 404 (encode (rpc-error nil -32600 "Not the MCP endpoint")))
+
+      (not (= "POST" method))
+      (reply 405 (encode (rpc-error nil -32600 "MCP over HTTP is POST"))
+             {"allow" "POST"})
+
+      ;; The door: 401 + the challenge that lets a client discover where to get
+      ;; a token. `WWW-Authenticate` IS the discovery mechanism — without it a
+      ;; client has no way to start, which is exactly why this belongs to the
+      ;; transport and not to each app.
+      (and (some? verify) (nil? principal))
+      (reply 401
+             (encode (rpc-error (get message "id") -32001 "Authorization required"))
+             (if-let [url (get opts :resource-metadata-url)]
+               {"www-authenticate" (www-authenticate url)}
+               {}))
+
+      (= ::unparseable message)
+      (reply 400 (encode (rpc-error nil -32700 "Parse error")))
+
+      (or (vector? message) (list? message))
+      ;; A BATCH: answers that are notifications disappear; a batch that was all
+      ;; notifications answers with a body-less 202. The answers are `to-list`ed
+      ;; before encoding because `keep` hands back a lazy seq, and Jason refuses
+      ;; a BeamLisp.LazySeq — a batch used to answer with a 500-shaped encode
+      ;; failure and no array at all.
+      (let [state (assoc ((get opts :state) principal) :auth principal)
+            answers (to-list (keep (fn [m] (dispatch-one state m)) message))]
+        (if (empty? answers)
+          (bodyless 202)
+          (reply 200 (encode answers)
+                 {"mcp-protocol-version" (str (get opts :protocol-version))})))
+
+      (map? message)
+      (let [state (assoc ((get opts :state) principal) :auth principal)
+            answer (dispatch-one state message)]
+        (if (nil? answer)
+          (bodyless 202)
+          (reply 200 (encode answer)
+                 {"mcp-protocol-version" (str (get opts :protocol-version))})))
+
+      :else
+      (reply 400 (encode (rpc-error nil -32600 "Invalid request"))))))
