@@ -1,0 +1,210 @@
+; build/drop.bl — THE COMPOUND CODEC: a drop is `launcher ⊕ payload ⊕ trailer`.
+;
+; `drop pack` (Rust, `tooling/drop/src/pack.rs`) produces it; this reads and
+; RE-EMITS the same bytes, so the language can check, seal and re-pack a drop
+; without the Rust tool in the loop. The format contract is
+; `tooling/drop/src/common.rs` — trailer layout, magic, version — and the one
+; thing that makes this implementable at all is that it is a TRAILER: the last
+; 56 bytes are self-describing, so reading a 100 MB compound costs 56 bytes and
+; a seek, not a scan.
+;
+;   offset u64 LE   where the payload starts (= the launcher's length)
+;   len    u64 LE   the payload's length
+;   sha256 32 bytes the payload's digest
+;   os     u8       OS_LINUX 0, OS_DARWIN 1, OS_WINDOWS 2
+;   arch   u8       ARCH_X86_64 0, ARCH_AARCH64 1, ARCH_UNIVERSAL 2
+;   version u16 LE  FORMAT_VERSION 1
+;   magic  4 bytes  "DRP1"
+;
+; `offset + len + 56` is the file size — asserted here rather than assumed,
+; because a compound whose arithmetic does not close is a truncated download or
+; a half-written install, and telling those apart from a good file is the whole
+; job of a launcher.
+;
+; Everything streams: hashing a payload reads it in 1 MB chunks through
+; `:crypto.hash_update/2`, so verifying a 100 MB drop does not need 100 MB of
+; heap (the launcher does exactly this on demand).
+(ns drop)
+
+(def magic "DRP1")
+(def trailer-len 56)
+
+; ── little-endian integers ──────────────────────────────────────────────────
+
+(defn- fixed-le
+  "`n` as exactly `width` little-endian bytes.
+
+   Two things are easy to get wrong here and BOTH were: `:binary.encode_unsigned/1`
+   answers with the MINIMAL width (`1` is one byte, not two), and for a
+   little-endian field the missing high-order bytes go at the END — padding in
+   front writes the number backwards. The golden vector is what caught it.
+
+   `erlang/byte_size`, never `count`: `count` on binary data counts something
+   else — a 56-byte trailer counts 55 (observed) — and an off-by-N here is a
+   wrong digest."
+  [n width]
+  (let [b (binary/encode_unsigned n :little)
+        pad (- width (erlang/byte_size b))]
+    (if (pos? pad)
+      (erlang/iolist_to_binary (list b (binary/copy (binary/encode_unsigned 0) pad)))
+      b)))
+
+(defn u64-le [n] (fixed-le n 8))
+(defn u16-le [n] (fixed-le n 2))
+
+(defn le-u64 [bin] (binary/decode_unsigned bin :little))
+
+; ── the trailer ─────────────────────────────────────────────────────────────
+
+(defn parse-trailer
+  "The trailer in `bin`'s last 56 bytes, or nil when this is not a v1 drop.
+   nil — not an exception — because the caller may be looking at a plain
+   launcher, a truncated file, or something else entirely, and all three mean
+   the same thing to it."
+  [bin]
+  (if (< (erlang/byte_size bin) trailer-len)
+    nil
+    (let [t (binary/part bin (- (erlang/byte_size bin) trailer-len) trailer-len)]
+      (if (not= magic (binary/part t 52 4))
+        nil
+        (let [version (binary/decode_unsigned (binary/part t 50 2) :little)]
+          (if (not= 1 version)
+            nil
+            {:offset (le-u64 (binary/part t 0 8))
+             :len (le-u64 (binary/part t 8 8))
+             :sha (binary/part t 16 32)
+             :os (binary/at t 48)
+             :arch (binary/at t 49)
+             :version version}))))))
+
+(defn encode-trailer
+  "The 56 bytes for a trailer map. Byte-identical to the Rust encoder for the
+   same fields (asserted against a real `drop pack` trailer in the suite)."
+  [m]
+  (erlang/iolist_to_binary
+    (list (u64-le (:offset m))
+          (u64-le (:len m))
+          (:sha m)
+          (binary/encode_unsigned (:os m))
+          (binary/encode_unsigned (:arch m))
+          (u16-le 1)
+          magic)))
+
+(defn payload-start [m] (:offset m))
+(defn payload-len [m] (:len m))
+
+(defn target
+  "`{:os :arch}` tags as the string the Rust tool prints: \"linux/x86_64\"."
+  [m]
+  (let [os (get {0 "linux" 1 "macos" 2 "windows"} (:os m) (str "os" (:os m)))
+        arch (get {0 "x86_64" 1 "aarch64" 2 "universal"} (:arch m) (str "arch" (:arch m)))]
+    (str os "/" arch)))
+
+; ── files ───────────────────────────────────────────────────────────────────
+
+(defn- open-read [path]
+  (let [r (file/open (String/to_charlist path) (list :read :binary))]
+    (if (= :ok (erlang/element 1 r)) (erlang/element 2 r) nil)))
+
+(defn file-size
+  "The size of `path`, or nil when it cannot be opened."
+  [path]
+  (let [fd (open-read path)]
+    (if (nil? fd)
+      nil
+      (let [r (file/position fd :eof)]
+        (file/close fd)
+        (if (= :ok (erlang/element 1 r)) (erlang/element 2 r) nil)))))
+
+(defn read-slice
+  "`len` bytes at `start`. Reads exactly that: the caller decides how much of a
+   file it wants, which is how `tail` is 56 bytes of a 100 MB drop."
+  [path start len]
+  (let [fd (open-read path)]
+    (if (nil? fd)
+      nil
+      (let [r (file/pread fd start len)]
+        (file/close fd)
+        (if (= :ok (erlang/element 1 r)) (erlang/element 2 r) nil)))))
+
+(defn tail
+  "The last `n` bytes of `path`."
+  [path n]
+  (let [size (file-size path)]
+    (if (and (some? size) (>= size n))
+      (read-slice path (- size n) n)
+      nil)))
+
+; ── hashing, streaming ──────────────────────────────────────────────────────
+
+(def chunk-size 1048576)
+
+(defn sha256-hex-of
+  "The lowercase hex sha256 of `len` bytes at `start` in `path`, read in 1 MB
+   chunks. Lowercase, because that is what the Rust tool prints and what the
+   tests compare against its output."
+  [path start len]
+  (let [fd (open-read path)]
+    (if (nil? fd)
+      nil
+      (let [ctx (crypto/hash_init :sha256)
+            ctx (loop [off start left len ctx ctx]
+                  (if (pos? left)
+                    (let [want (min chunk-size left)
+                          r (file/pread fd off want)]
+                      (if (= :ok (erlang/element 1 r))
+                        (let [data (erlang/element 2 r)
+                              n (erlang/byte_size data)]
+                          (recur (+ off n) (- left n)
+                                 (crypto/hash_update ctx data)))
+                        ctx))
+                    ctx))
+            digest (crypto/hash_final ctx)]
+        (file/close fd)
+        (String/downcase (Base/encode16 digest))))))
+
+(defn sha256-hex [data]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 data))))
+
+; ── the compound ────────────────────────────────────────────────────────────
+
+(defn compound
+  "`{:path :size :launcher :payload :trailer}` for a drop, or nil when `path`
+   is not one. `:launcher` is the offset/length pair a re-pack needs."
+  [path]
+  (let [size (file-size path)
+        trailer (if (and (some? size) (>= size trailer-len)) (parse-trailer (tail path trailer-len)) nil)]
+    (if (nil? trailer)
+      nil
+      {:path path
+       :size size
+       :launcher {:offset 0 :len (payload-start trailer)}
+       :payload {:offset (payload-start trailer) :len (payload-len trailer)}
+       :trailer trailer})))
+
+(defn verify
+  "Check `path` against its own trailer: does the payload's digest match, and
+   does `offset + len + 56` equal the file size? Both are asked here, because
+   a truncated file can still hash whatever payload it has left."
+  [path]
+  (let [c (compound path)]
+    (if (nil? c)
+      {:ok? false :reason "not a v1 drop (no DRP1 trailer)"}
+      (let [expected (deref-trailer c)
+            actual (sha256-hex-of path (payload-start (:trailer c)) (payload-len (:trailer c)))
+            arith (= (:size c) (+ (payload-start (:trailer c)) (payload-len (:trailer c)) trailer-len))]
+        {:ok? (and arith (= expected actual))
+         :size (:size c)
+         :expected expected
+         :actual actual
+         :arithmetic arith
+         :target (target (:trailer c))
+         :reason (cond
+                   (not arith) "offset + len + 56 does not equal the file size"
+                   (not= expected actual) "the payload's digest does not match the trailer"
+                   :else nil)}))))
+
+(defn deref-trailer
+  "The trailer's digest as lowercase hex."
+  [c]
+  (String/downcase (Base/encode16 (:sha (:trailer c)))))
