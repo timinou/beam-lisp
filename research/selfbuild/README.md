@@ -373,3 +373,51 @@ ExUnit suite passes against those beams* is a RELEASE-tree property — it needs
 W4's assembly to be meaningful (a tree whose code path is the substrate's, with
 no mix on it), and is scheduled there.
 
+
+## W4 — the release is a value (FIRST HALF LANDED; assembly next)
+
+**Landed.** `priv/build/release.bl` + `BeamLisp.Release` (Elixir call surface):
+
+- `app-closure/1` — the transitive `:applications` closure of the root app (37
+  apps for `beam_lisp`: OTP plus `_build` deps), each with its `.app` version
+  and its `:code.lib_dir/1` directory, so no dependency file is read to know
+  what a release must carry;
+- `value/1` — `{:name :vsn :erts {:vsn :dir} :apps [{:app :vsn :dir} …]}`;
+- `rel-text/1` / `write-rel!/2` — the `Name.rel` term, at
+  `releases/<vsn>/<name>.rel` (where `systools` looks when told `:path`).
+
+**Shaped against the mix-built drop** (`03cd2b3d/releases/0.1.0/bl.rel`), and two
+of those shapes are not free choices:
+
+| what | why it matters |
+|---|---|
+| Erlang SYNTAX: `{"bl","0.1.0"}` | strings, not binaries — my first version used `~w`, which prints a binary as `<<98,101,…>>`, i.e. a `.rel` nothing can read. Charlists + `~p` reproduce mix's output. |
+| 3-tuples with a TYPE | `{kernel,"11.0.1",permanent}`; `none` is "carried but not started" (mix writes `iex` that way). `systools` reads it to decide what boots. |
+| our closure ⊆ mix's set | mix also carries `:sasl` and `:iex`, which are nobody's `:applications` dependency. Neither is needed for a boot; a REPL-shipping release adds `iex` as `none`. |
+
+The test parses OUR `.rel` back with `:erl_scan` + `:erl_parse` and asserts the
+term equals the value, so the round trip through Erlang's own parser is the
+assertion — not the string we hoped we wrote.
+
+**Assembly recon (the recipe, gathered from the shipped drop, piece by piece).**
+The shipped `bin/bl` is mix-generated; for `eval` it runs
+`releases/<vsn>/elixir --cookie … --boot releases/<vsn>/<script> --boot-var
+RELEASE_LIB "$ROOT/lib" --vm-args …`, and for `start` adds `--erl-config
+<sys.config>` + `--erl "-mode embedded"`. What a tree needs, and from where:
+
+| piece | source |
+|---|---|
+| `lib/<app>-<vsn>/{ebin,priv}` | the value's `:dir`s (with a priv include/exclude — the drop currently ships `priv/.spell/graph` and a stray `priv/env.bl`) |
+| `erts-<vsn>/` | the value's `erts.dir` |
+| `releases/<vsn>/<name>.rel` | `write-rel!` ✓ landed |
+| `releases/<vsn>/{<name>,start_clean}.{script,boot}` | `:systools.make_script/2` → `script2boot/1`, with the `$ROOT`→`$RELEASE_LIB` rewrite for non-OTP apps before `script2boot` (W0/P3+P6: options `[{:path, [staging, libdir]}, {:outdir, staging}, :silent]`, `.rel` copied into the staging dir, `script2boot` takes the extension-less STEM) |
+| `releases/<vsn>/elixir`, `iex` | PATCHED COPIES of Elixir's `bin/{elixir,iex}` (mix's are patched to release-relative paths) — a sub-task in itself |
+| `releases/<vsn>/{sys.config,vm.args,remote.vm.args,env.sh}` | templates; `sys.config` is `[{logger,[{default_handler,[{config,#{type=>standard_error}}]}]}].` and the rest ship as comments plus env defaults |
+| `releases/{COOKIE,start_erl.data}` | a cookie, and `"<erts-vsn> <vsn>"` |
+| `bin/bl` | a launcher: mix's is ~190 lines of `sh`; a minimal one execs `releases/<vsn>/elixir` with the flags above |
+
+**NOT DONE, and the gate is not met.** The tree assembly itself is the rest of
+this wave, so G1 (`<rel>/bin/bl eval '(+ 1 2)'`) is unmet. The next step is
+`assemble/2` in `release.bl`, in this order: copy libs + ERTS → write the `.rel`
+→ `make_script`/rewrite/`script2boot` → templates + launcher → boot test.
+
