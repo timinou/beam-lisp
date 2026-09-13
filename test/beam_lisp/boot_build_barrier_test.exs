@@ -117,6 +117,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
              "build-plan",
              "drop",
              "ns-interface",
+             "pristine",
              "release",
              "source-graph",
              "substrate"
@@ -136,6 +137,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
     assert BeamLisp.Tiers.tier_of_ns("substrate") == :build
     assert BeamLisp.Tiers.tier_of_ns("release") == :build
     assert BeamLisp.Tiers.tier_of_ns("drop") == :build
+    assert BeamLisp.Tiers.tier_of_ns("pristine") == :build
     assert BeamLisp.Tiers.tier_of_ns("datom") == :library
   end
 
