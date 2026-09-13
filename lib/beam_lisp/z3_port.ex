@@ -154,6 +154,50 @@ defmodule BeamLisp.Z3Port do
   """
   def check(port, smt, model? \\ false), do: raw_check(port, smt, model?)
 
+  @doc """
+
+  `unknown` means the question was not decided, and the two ways that happens
+  want OPPOSITE responses: a CEILING (`timeout` / `canceled`) says raise it or
+  simplify the query; an INCOMPLETE THEORY says no ceiling will help, and the
+  obligation has to stay undecided rather than be retried harder. Measured against
+  the pinned binary: a factoring query under `(set-option :timeout 300)` answers
+  `timeout` standalone and `canceled` through the pool, and a DECIDED check answers
+  the empty string — which is why an absent reason comes back as nil and can never
+  be read as a name.
+
+  One extra round trip, on the undecided path only. The reply is the RAW z3
+  string here; naming it is the language's job (`oracle/verdict`).
+  """
+  def raw_reason(port, status, rest) when status == "unknown" do
+    Port.command(port, "(get-info :reason-unknown)\n")
+    read_sexp(port, rest) |> extract_reason()
+  end
+
+  def raw_reason(_port, _status, _rest), do: nil
+
+  # `(:reason-unknown "timeout")` → "timeout"; `(:reason-unknown "")` → nil; any
+  # other shape → nil, because a caller that cannot read the reason must not be
+  # handed a guess.
+  @reason_re ~r/^\(:reason-unknown\s+(.*)\)$/s
+
+  defp extract_reason(text) do
+    case Regex.run(@reason_re, String.trim(text || "")) do
+      [_, inner] ->
+        inner =
+          inner
+          |> String.trim()
+          |> String.trim_leading("\"")
+          |> String.trim_trailing("\"")
+
+        if inner == "", do: nil, else: inner
+
+      _ ->
+        nil
+    end
+  end
+
+
+
   @doc "The protocol itself. Runs in the OWNER process only."
   def raw_check(port, smt, model? \\ false) do
     # A caller-supplied (check-sat) would make z3 answer TWICE and desync the
@@ -172,8 +216,8 @@ defmodule BeamLisp.Z3Port do
           %{status: "sat", model: nil}
         end
 
-      {line, _} ->
-        %{status: line, model: nil}
+      {line, rest} ->
+        %{status: line, model: nil, why: raw_reason(port, line, rest)}
     end
   end
 
@@ -237,8 +281,8 @@ defmodule BeamLisp.Z3Port do
           %{status: "sat", core: nil}
         end
 
-      {line, _} ->
-        %{status: line, core: nil}
+      {line, rest} ->
+        %{status: line, core: nil, why: raw_reason(port, line, rest)}
     end
   end
 
@@ -265,9 +309,10 @@ defmodule BeamLisp.Z3Port do
         Port.command(port, "(pop 1)\n")
         %{status: "sat", core: nil, model: model}
 
-      {line, _} ->
+      {line, rest} ->
+        why = raw_reason(port, line, rest)
         Port.command(port, "(pop 1)\n")
-        %{status: line, core: nil, model: nil}
+        %{status: line, core: nil, model: nil, why: why}
     end
   end
 
