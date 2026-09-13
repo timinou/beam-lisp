@@ -124,10 +124,14 @@ calls this same namespace's `run` for the local path.
 
 (defn- watch-error
   "Report a watcher that could not start and return the failure exit code. Never
-   halts: under the daemon this runs inside the warm VM."
+   halts: under the daemon this runs inside the warm VM. The :file_system hint
+   only fires when the reason IS the missing application — printed beside an
+   unrelated failure (e.g. a name clash) it sends the reader to the wrong fix."
   [r]
   (u/io-err (str "bl watch: cannot start the watcher: " (why r)))
-  (u/io-err "  the live-reload engine needs the :file_system application; run `bl doctor`.")
+  (if (and (string? (why r)) (re-find #"file_system" (why r)))
+    (u/io-err "  the live-reload engine needs the :file_system application; run `bl doctor`.")
+    nil)
   1)
 
 (defn- apply-fn

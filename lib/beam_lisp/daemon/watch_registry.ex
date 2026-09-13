@@ -226,7 +226,12 @@ defmodule BeamLisp.Daemon.WatchRegistry do
     BeamLisp.ReloadWatcher.start_link(
       dirs: [dir],
       auto_commit: true,
-      apply: apply_fun
+      apply: apply_fun,
+      # The registry runs ONE WATCHER PER DIRECTORY, so the watcher must not
+      # take ReloadWatcher's default global name: with it, the SECOND
+      # directory's start_link fails {:already_started, pid} and the tree
+      # gets exactly one watched root, the rest refused.
+      name: nil
     )
   rescue
     e -> {:error, Exception.message(e)}
