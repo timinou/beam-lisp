@@ -154,13 +154,6 @@ defmodule BeamLisp.Z3Port do
   end
 
   @doc """
-  check-sat in the CURRENT solver state — no reset, so assertions accumulate and
-  `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
-  `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
-  named and the script must set `:produce-unsat-cores`), `:model?` (return the
-  model on sat).
-  """
-  @doc """
   The same check, positional — beam-lisp callers pass `(assume core? model?)` and
   never have to marshal a map across the boundary.
   """
@@ -168,6 +161,13 @@ defmodule BeamLisp.Z3Port do
     raw_check_here(port, %{assume: assume, core?: core?, model?: model?})
   end
 
+  @doc """
+  check-sat in the CURRENT solver state — no reset, so assertions accumulate and
+  `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
+  `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
+  named and the script must set `:produce-unsat-cores`), `:model?` (return the
+  model on sat).
+  """
   def raw_check_here(port, opts) do
     assume = Map.get(opts, :assume) || []
 
