@@ -1,7 +1,7 @@
 # The build is a program: source-graph, build-plan, and what "fresh" means
 
 An executable document (`bl doc run docs/build/the-build-is-a-program.bl.md`).
-It walks the three `.bl` modules in `priv/build/` that decide what `mix compile`
+It walks the `.bl` modules in `priv/build/` that decide what `mix compile`
 does, and runs them on the tree they live in.
 
 ```beam-lisp
@@ -127,7 +127,9 @@ nodes the key is byte-identical to the old closure hash:
 
 Three consumers hold that key and must agree:
 
-1. the build's **manifest** (`_build/…/compile.beam_lisp`) stores it per source;
+1. the build's **fact log** (`_build/…/build.log`; `priv/build/build-log.bl`)
+   records it per source — the manifest beside it is that log's PROJECTION,
+   written for Mix to read and for nothing else;
 2. the emitted beam's **stamp** (`__bl_provenance__/0`) carries it;
 3. the runtime **drift gate** (`BeamLisp.AOT.stale?/2`) recomputes it from live
    sources before trusting a beam.
@@ -176,20 +178,28 @@ parallel, and post-perturbation builds emit byte-identical beams.
 The build itself is `priv/build/build.bl`. One function, one map in, one map out:
 
 ```
-(build/run {:sources [paths] :out "dir" :manifest "path"
+(build/run {:sources [paths] :out "dir" :manifest "path" :log-path "path"
             :force? bool :jobs n :log fn})
-→ {:built n :errors [msg …] :manifest {path {:hash key :key toolchain :modules [mod …]}}}
+→ {:built n :errors [msg …] :manifest {path {:hash key :key tier :modules [mod …]}}}
 ```
 
 It plans the sources (`build-plan/plan` over `node-from`), walks the waves,
 and inside each wave runs `build-one` for every source that is not fresh —
 in parallel, `:jobs` at a time, results collected in order. A source is
-**fresh** when its manifest entry has this key, this tier key, and every
+**fresh** when the LOG records it under this key and this tier key, and every
 module it names is on disk. `build-one` asks the shared cache first
-(`AOTCache.fetch`); on a miss it compiles and publishes. The manifest is
-rewritten after every source, so an interrupted build resumes where it
-stopped. Sources that vanished lose their beams. A source the reader
-rejects is one entry in `:errors` — the rest still builds.
+(`AOTCache.fetch`); on a miss it compiles and publishes, and the wave APPENDS a
+fact per source (`build-log/append!`) — so an interrupted build resumes from the
+last complete fact, where the old single-document manifest could not be resumed
+at all. At the end one compaction writes the log's current state, and the
+manifest as its projection. Sources that vanished lose their beams. A source the
+reader rejects is one entry in `:errors` — the rest still builds.
+
+The log is also the build's QUERY SURFACE, which a manifest could never be:
+`build-log/stale` (what a build would recompile, in plan order),
+`build-log/impact` (everything an edit reaches — the reverse of the plan's
+`:deps`), and `build-log/coverage` (how much of the plan the log accounts for,
+and which facts are missing). `BeamLisp.BuildLog` is the Elixir call surface.
 
 The same function has two shells, and neither decides anything:
 
@@ -205,8 +215,9 @@ uses when it is required, so a document compiles to exactly the program it
 loads as.
 
 Pinned by `test/bl/build_test.bl`: fresh tree, no-op, body edit → 1, interface
-edit → closure, broken source → error, deleted source → swept, poisoned
-manifest → ignored, `clean`.
+edit → closure, broken source → error, deleted source → swept, a poisoned
+manifest costs nothing (the projection is repaired, never trusted), the log is
+the memory, `clean` removes both files.
 
 ## Where the Elixir still is
 

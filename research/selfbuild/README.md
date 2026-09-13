@@ -235,3 +235,83 @@ generation's. The AOT cache already keeps a sha256 per module, so the repair is
 cheap and belongs before W5: record per-module digests in the manifest, and make
 `fresh?` compare them.
 
+
+## W2 — the build's memory is a log of facts (landed)
+
+**The change.** New driver namespace `priv/build/build-log.bl` plus its Elixir
+call surface `BeamLisp.BuildLog`. The build's memory moved from ONE mutable
+document (the manifest: a `term_to_binary` map rewritten after every source) to
+an APPEND-ONLY LOG OF FACTS in the language's own data syntax, replayed into a
+state. The manifest is now that state's projection, written once at the end.
+
+```
+[:build/run id at-ms]                              a build started
+[:build/built path key tier [modules] cached?]     path is fresh under these keys
+[:build/failed path reason]                        path did not compile
+[:build/dropped path]                              path left the build
+[:build/end id built errors]                       how the run ended
+```
+
+Queries, none of which a manifest could answer: `stale/3` (the build's own
+worklist, in plan order), `impact/2` (everything an edit reaches — the reverse
+closure of the plan's `:deps`), `coverage/3` (how much of the plan the log
+accounts for).
+
+**Why facts and not the manifest.** The old shape had three costs, and each is
+now gone: it rewrote O(n) bytes to record one source (O(n) writes per build); an
+interruption left a document that was neither the old truth nor the new one;
+and it could only answer one question. A fact is written once and never edited,
+so a build killed mid-wave resumes from the last COMPLETE fact — and the log
+says what happened (compiled, cached, failed, dropped) instead of only what is.
+
+**Observed.**
+
+| what | observed |
+|---|---|
+| the log on disk | four lines of text for a two-source fixture: one `:build/run`, one `:build/built` per source, one `:build/end` |
+| the real tree | `_build/dev/lib/beam_lisp/.mix/build.log`, 51 KB — ~300 sources, compacted |
+| **resume** | delete the manifest: the next run is `{:noop, []}` and the projection is rewritten from the log |
+| **agreement** | `read_manifest() == BuildLog.manifest(state)`, asserted |
+| stale by query | after a body edit, `stale == [b.bl]` exactly (`a` is still fresh); `impact(a) == [b]`, `impact(b) == []` |
+| a driver edit | 15 s to rebuild the 5 driver sources — W1's amplifier fix, used in anger |
+| migration | a build directory with a manifest and no log: the source whose tier key is unknown rebuilds once, then warms |
+| compaction | one `:build/run` survives (the last one); replaying never grows a history |
+
+**Two things the probes caught** (both now comments in the module, because
+whoever writes the next reader/writer will meet them):
+
+1. `pr-str` is a VALUE printer — a string prints UNQUOTED, so a log written with
+   it would not read back. The log carries its own four-line serializer.
+2. A reader NODE is a tagged TUPLE (`{:vector [elem …]}`), so `vector?` is FALSE
+   for it while `count`/`first`/`second` answer anyway. The first `read-facts`
+   returned `[]` for a log that was plainly there, and the probe that printed
+   `(vector? node)` → `false` is what found it.
+
+**Contracts updated, because the truth moved** (the tests pin a property; the
+property now lives one layer down):
+
+- `test/beam_lisp/aot_build_key_test.exs` — the tier-key drift is forged IN THE
+  LOG (a text edit — the log is text, which is the point), and a forged MANIFEST
+  is asserted to change nothing, since it is a projection.
+- `test/bl/build_test.bl` — a poisoned manifest now COSTS NOTHING (the run
+  repairs the projection instead of rebuilding the world), plus new tests: `the
+  log is the memory`, and `clean` removing both files.
+- `test/beam_lisp/boot_build_barrier_test.exs` — the driver tier is five
+  namespaces now (`build-log` joins it, so it is tier-keyed like its siblings).
+
+**Validated.** 14/14 ExUnit across the three touched suites; 29/29 in the
+driver's own `.bl` suite; the 12-suite build/AOT gate set green; `mix compile`
+on the real tree still converges.
+
+**One observed flake, attributed by probe.** `test/bl/system/linear_test.bl`
+failed once (1 of 23, `the-old-self-apply-is-caught`) in the first run after
+this change, then passed three runs in a row. The assertion is a pure function
+of a literal source string, so `research/selfbuild/w2_probe5.bl` was run in BOTH
+trees: identical output (`[{:local "inner-fn_3", :fn "self-apply", :placements
+2}]`) and identical `check-source` results, from the same AOT beams. ∴ the
+language decides the same thing in both trees and the failure is in the `.bl`
+FORK runner (order/seed dependent — the same machinery whose seed-order flake
+`examples_test` documents), not in this wave. Recorded rather than smoothed
+over: 1 failure in 4 runs is the only evidence there is, and it is not enough
+to claim a rate.
+

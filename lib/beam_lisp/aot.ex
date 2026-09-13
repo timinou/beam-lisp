@@ -920,15 +920,15 @@ defmodule BeamLisp.AOT do
   # Has the namespace's TIER key moved since its beam was stamped? No tier
   # sources on disk (an escript, or a release away from its checkout) means
   # nothing to compare against: trust the beam, exactly as the closure branch
-  # does when no source resolves. An unknown tier is trusted for the same
-  # reason — the gate must never crash a load over a tier it does not know.
+  # does when no source resolves. Only the two TIER-KEYED tiers appear here:
+  # the `case` above routes `:library` to the closure branch, so a third tier
+  # could only arrive with a clause added for it — and without one the gate
+  # would fail loudly here rather than silently trust a beam.
   defp tier_key_moved?(:boot, beam_key),
     do: BeamLisp.Tiers.boot_namespaces() != [] and beam_key != BeamLisp.AOTCache.compiler_key()
 
   defp tier_key_moved?(:build, beam_key),
     do: BeamLisp.Tiers.build_namespaces() != [] and beam_key != BeamLisp.AOTCache.build_key()
-
-  defp tier_key_moved?(_tier, _beam_key), do: false
 
   # `{source_hash, compiler_key}` from a compiled shim, or `nil` when the module
   # carries no stamp (predates L1) or its code cannot be loaded. `ensure_loaded/1`

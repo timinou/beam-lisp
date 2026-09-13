@@ -111,16 +111,25 @@ defmodule BeamLisp.BootBuildBarrierTest do
     boot = BeamLisp.Tiers.boot_namespaces()
     build = BeamLisp.Tiers.build_namespaces()
 
-    assert Enum.sort(build) == ["build", "build-plan", "ns-interface", "source-graph"]
+    assert Enum.sort(build) == [
+             "build",
+             "build-log",
+             "build-plan",
+             "ns-interface",
+             "source-graph"
+           ]
+
     assert Enum.all?(build, &(&1 not in boot))
 
     # The drift gate runs on these; if one drifted into the wrong tier the gate
-    # would compare it against the wrong key. `reader-node` is codegen;
-    # `build-plan`/`source-graph`/`ns-interface` are the driver.
+    # would compare it against the wrong key. `reader-node` is codegen; the
+    # driver's own namespaces — the build, its planner, and the log they read
+    # their state from — are the build tier.
     assert BeamLisp.Tiers.tier_of_ns("reader-node") == :boot
     assert BeamLisp.Tiers.tier_of_ns("build-plan") == :build
     assert BeamLisp.Tiers.tier_of_ns("source-graph") == :build
     assert BeamLisp.Tiers.tier_of_ns("ns-interface") == :build
+    assert BeamLisp.Tiers.tier_of_ns("build-log") == :build
     assert BeamLisp.Tiers.tier_of_ns("datom") == :library
   end
 
