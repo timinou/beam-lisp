@@ -23,8 +23,8 @@ defmodule BeamLisp.RunCodePathTest do
     File.rm_rf!(@tmp)
     File.mkdir_p!(Path.join(@src, "rcp"))
     File.write!(Path.join(@src, "rcp/fixture.bl"), "(ns rcp.fixture)\n(defn answer [] 42)\n")
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
-    assert {:ok, _} = Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @src, "--out", @out])
+    BeamLisp.BuildTask.clean(@out)
+    assert {:ok, _} = BeamLisp.BuildTask.run(["--source-dir", @src, "--out", @out])
     assert File.exists?(Path.join(@out, Atom.to_string(@mod) <> ".beam"))
 
     on_exit(fn ->

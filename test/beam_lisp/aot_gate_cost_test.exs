@@ -67,8 +67,8 @@ defmodule BeamLisp.AotGateCostTest do
   end
 
   defp build! do
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
-    assert {:ok, _} = Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @src_dir, "--out", @out])
+    BeamLisp.BuildTask.clean(@out)
+    assert {:ok, _} = BeamLisp.BuildTask.run(["--source-dir", @src_dir, "--out", @out])
     ensure_named(BeamLisp.Env, fn -> BeamLisp.Env.start_link([]) end)
     ensure_named(BeamLisp.Loader.Server, fn -> BeamLisp.Loader.Server.start_link([]) end)
   end

@@ -957,7 +957,12 @@ defmodule BeamLisp.AOT do
   defp short(nil), do: "<none>"
   defp short(h), do: String.slice(h, 0, 12)
 
-  defp default_output_dir do
+  @doc """
+  The output directory a build defaults to: the Mix project's compile path when a
+  Mix project is loaded, else an error naming what to pass instead. Public because
+  the build driver needs the same answer, and two answers would be two defaults.
+  """
+  def default_output_dir do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix.Project, :compile_path, 0) do
       Mix.Project.compile_path()
     else

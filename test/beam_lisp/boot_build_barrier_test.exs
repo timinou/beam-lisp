@@ -148,8 +148,8 @@ defmodule BeamLisp.BootBuildBarrierTest do
   end
 
   test "staged build refresh decision is narrow" do
-    refute Mix.Tasks.Compile.BeamLisp.refresh_staged_build?([])
-    refute Mix.Tasks.Compile.BeamLisp.refresh_staged_build?(["compiler", "reader"])
-    assert Mix.Tasks.Compile.BeamLisp.refresh_staged_build?(["compiler", "build"])
+    refute BeamLisp.BuildTask.refresh_staged_build?([])
+    refute BeamLisp.BuildTask.refresh_staged_build?(["compiler", "reader"])
+    assert BeamLisp.BuildTask.refresh_staged_build?(["compiler", "build"])
   end
 end

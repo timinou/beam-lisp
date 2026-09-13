@@ -150,7 +150,7 @@ defmodule BeamLisp.BuildLogTest do
   defp build!(opts \\ []) do
     args = ["--source-dir", @src, "--out", @out, "--jobs", "1"]
     args = if opts[:force], do: args ++ ["--force"], else: args
-    Mix.Tasks.Compile.BeamLisp.run(args)
+    BeamLisp.BuildTask.run(args)
   end
 
   defp sources, do: Path.wildcard(Path.join(@src, "*.bl")) |> Enum.sort()

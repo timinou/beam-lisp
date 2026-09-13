@@ -11,7 +11,7 @@ defmodule BeamLisp.Wave9AotTest do
   @fixture_dir "test/fixtures/aot"
 
   # Build the fixtures into an ISOLATED directory, not the shared production
-  # code path. Compiling fixtures into `Mix.Project.compile_path()` (with the
+  # code path. Compiling fixtures into `BeamLisp.AOT.default_output_dir()` (with the
   # `clean` that precedes it) deleted the real AOT beams the rest of the suite
   # depends on and left a fixture-only manifest, so a later module purge hit a
   # missing body beam (nondeterministic `UndefinedFunctionError`) and the next
@@ -24,9 +24,9 @@ defmodule BeamLisp.Wave9AotTest do
 
     # Start from a clean slate, then compile the fixture set once for all
     # tests in this module, into the isolated output dir.
-    Mix.Tasks.Compile.BeamLisp.clean(@compile_path)
+    BeamLisp.BuildTask.clean(@compile_path)
     assert {:ok, []} =
-             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
+             BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @compile_path])
 
     Code.append_path(@compile_path)
     :ok
@@ -94,7 +94,7 @@ defmodule BeamLisp.Wave9AotTest do
     {out, 0} =
       System.cmd(
         "elixir",
-        ["-pa", Mix.Project.compile_path(), "-pa", @compile_path, "-e", script],
+        ["-pa", BeamLisp.AOT.default_output_dir(), "-pa", @compile_path, "-e", script],
         stderr_to_stdout: true
       )
 
@@ -112,7 +112,7 @@ defmodule BeamLisp.Wave9AotTest do
     before = for mod <- [BeamLisp.Ns.Math, BeamLisp.Ns.Hello], do: {mod, beam_mtime(mod)}
 
     assert {:noop, []} =
-             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
+             BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @compile_path])
 
     for {mod, mtime} <- before do
       assert beam_mtime(mod) == mtime
@@ -122,14 +122,14 @@ defmodule BeamLisp.Wave9AotTest do
   test "clean removes generated modules and the manifest" do
     assert File.exists?(beam_path(BeamLisp.Ns.Math))
 
-    Mix.Tasks.Compile.BeamLisp.clean(@compile_path)
+    BeamLisp.BuildTask.clean(@compile_path)
 
     refute File.exists?(beam_path(BeamLisp.Ns.Math))
     refute File.exists?(Path.join(@compile_path, "compile.beam_lisp"))
 
     # Recompile so the rest of the suite still sees them.
     assert {:ok, []} =
-             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
+             BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @compile_path])
   end
 
   defp beam_mtime(mod), do: File.stat!(beam_path(mod)).mtime

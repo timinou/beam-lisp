@@ -33,12 +33,12 @@ defmodule BeamLisp.AotBuildKeyTest do
 
   setup do
     BeamLisp.init()
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
-    on_exit(fn -> Mix.Tasks.Compile.BeamLisp.clean(@out) end)
+    BeamLisp.BuildTask.clean(@out)
+    on_exit(fn -> BeamLisp.BuildTask.clean(@out) end)
     :ok
   end
 
-  defp build!, do: Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @out])
+  defp build!, do: BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @out])
 
   defp read_manifest, do: @manifest |> File.read!() |> :erlang.binary_to_term()
   defp write_manifest(m), do: File.write!(@manifest, :erlang.term_to_binary(m))

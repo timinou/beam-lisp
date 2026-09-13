@@ -53,10 +53,10 @@ defmodule BeamLisp.AotDriftTest do
 
   defp compile!(source) do
     File.write!(@src, source)
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
+    BeamLisp.BuildTask.clean(@out)
 
     assert {:ok, _} =
-             Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @src_dir, "--out", @out])
+             BeamLisp.BuildTask.run(["--source-dir", @src_dir, "--out", @out])
   end
 
   # Reload the freshly-emitted beam into THIS VM, replacing any prior version,
@@ -158,7 +158,7 @@ defmodule BeamLisp.AotDriftTest do
     {out, 0} =
       System.cmd(
         "elixir",
-        ["-pa", Mix.Project.compile_path(), "-pa", @out, "-e", script],
+        ["-pa", BeamLisp.AOT.default_output_dir(), "-pa", @out, "-e", script],
         stderr_to_stdout: true,
         env: [{"BEAM_LISP_PATH", @src_dir}]
       )

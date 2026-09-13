@@ -29,7 +29,7 @@ defmodule BeamLisp.AOTCacheTest do
   end
 
   defp run_task(out) do
-    Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", out])
+    BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", out])
   end
 
   test "second build of the same sources into a fresh dir is served from cache", %{
