@@ -14,7 +14,39 @@ defmodule BeamLisp.Z3Port do
       body.
   """
 
-  @timeout 10_000
+  # The port's read deadline — the BACKSTOP, not the policy. The pool arms z3's
+  # OWN ceiling (priv/std/z3pool.bl, `z3-timeout-ms`) at every lease, so a hard
+  # query is answered `unknown` by the solver and never reaches this. This one
+  # fires when z3 ignores its own ceiling, when the port is driven directly (the
+  # tests do), or when a caller arms a ceiling ABOVE it — so a caller who wants
+  # to wait longer than this for one answer must move this too, with
+  # BL_Z3_READ_TIMEOUT. A raise here is a real bug, and the honest report.
+  #
+  # ORDERING, in one place: z3's :timeout  <  this  <  the caller's `call`
+  # timeout (z3pool/call-timeout-ms). Measured before the ordering existed: a
+  # query needing 6s killed its caller on the transport's compiled-in 5000ms
+  # default, and one needing 10s died HERE with an empty accumulator — no
+  # verdict, no diagnosis (FUP-057).
+  @default_read_timeout 20_000
+
+  @doc """
+  How long a single read from z3 may take, in ms.
+
+  `BL_Z3_READ_TIMEOUT` moves it; a missing, non-numeric or non-positive value
+  falls back to the default rather than disarming the read.
+  """
+  def read_timeout do
+    case System.get_env("BL_Z3_READ_TIMEOUT") do
+      nil ->
+        @default_read_timeout
+
+      raw ->
+        case Integer.parse(raw) do
+          {n, ""} when n > 0 -> n
+          _ -> @default_read_timeout
+        end
+    end
+  end
 
   # z3 answers `(echo "…")` with the string alone (verified against the pinned
   # binary), which makes it a reliable sync marker: a command is acknowledged on
@@ -223,7 +255,7 @@ defmodule BeamLisp.Z3Port do
 
             read_until_marker(port, acc <> data, keep)
         after
-          @timeout -> {:error, "timeout waiting for z3 to acknowledge", out}
+          read_timeout() -> {:error, "timeout waiting for z3 to acknowledge", out}
         end
     end
   end
@@ -243,7 +275,7 @@ defmodule BeamLisp.Z3Port do
             {Enum.at(lines, idx), rest}
         end
     after
-      @timeout -> raise "z3 timeout (acc: #{inspect(acc)})"
+      read_timeout() -> raise "z3 timeout (acc: #{inspect(acc)})"
     end
   end
 
@@ -254,7 +286,7 @@ defmodule BeamLisp.Z3Port do
       receive do
         {^port, {:data, data}} -> read_sexp(port, acc <> data)
       after
-        @timeout -> acc
+        read_timeout() -> acc
       end
     end
   end
