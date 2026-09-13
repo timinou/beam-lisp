@@ -26,26 +26,35 @@ defmodule BeamLisp.Z3.Ledger do
   @fragments [:"tag-lattice", :arith, :general]
   @tiers [:"native-witness", :z3]
 
-  @table __MODULE__
+  # EVERY slot, and the key → slot map. Module attributes resolve where they are
+  # used, so these sit above the functions that need them. `:total` is a slot like any
+  # other, so the histogram reports it without arithmetic — an earlier version derived
+  # the slot with `find_index(...) + 1` and handed :counters a 0.
+  @all @fragments ++ @tiers ++ [:total]
+  @index @all |> Enum.with_index(1) |> Map.new()
 
-  def up?, do: :ets.whereis(@table) != :undefined
+  @key {__MODULE__, :counters}
 
-  @doc """
-  The table the counts live in: one ETS counter per KEY.
+  def up?, do: :persistent_term.get(@key, nil) != nil
 
-  ETS `update_counter` is atomic, so concurrent recorders cannot lose each other's
-  counts, and the key is the term itself — `:arith`, `:z3`, `:total` — so there is
-  no index arithmetic to get wrong. (The first version used `:counters`, whose
-  indices are 1-based: it was called with index 0 and died "2nd argument: out of
-  range" on the very first record, which took down every check that recorded one.)
-  """
-  def start do
-    if up?() do
-      :ok
-    else
-      :ets.new(@table, [:named_table, :public, :set, {:write_concurrency, true}])
-      :ok
-    end
+  # Created at LOAD, in one process, before anything can race.
+  @on_load :open
+  def start, do: :ok
+
+  @doc false
+  # Public because @on_load needs an exported zero-arity function (with `defp` the
+  # module failed to load and took every z3 call with it: 24 errors of 24 in the soak).
+  #
+  # Counters, created ONCE at load. Two earlier shapes were measured and rejected:
+  # an ETS named table created on first use is a check-then-create across processes,
+  # so racers died with "table name already exists" — counted as a wrong verdict, ~1 in
+  # 200, which is how this was found; and an ETS table created at load then vanished
+  # ("the table identifier does not refer to an existing ETS table") because a table dies
+  # with the process that made it, and the loader is short-lived. A counters ref has no
+  # owner: it outlives the process that created it.
+  def open do
+    :persistent_term.put(@key, :counters.new(length(@all), [:write_concurrency]))
+    :ok
   end
 
   @doc "Record one decision: the question's `fragment` and the `tier` that answered."
@@ -75,8 +84,6 @@ defmodule BeamLisp.Z3.Ledger do
 
   @doc "The rollup, zeroes included so a missing tier is visibly zero."
   def histogram do
-    start()
-
     %{
       total: count(:total),
       fragments: Map.new(@fragments, fn f -> {f, count(f)} end),
@@ -86,15 +93,13 @@ defmodule BeamLisp.Z3.Ledger do
 
   @doc "Reset the rollup (tests, and a fresh measurement). Also clears this trail."
   def reset do
-    if up?(), do: :ets.delete_all_objects(@table)
+    for k <- @all, do: :counters.put(counters(), ix(k), 0)
     clear_here()
   end
 
   # Keys arrive from beam-lisp — where a keyword may reach us as an atom or as its
   # text — so canonicalise against the FIXED set (never inventing an atom from
   # data). An unknown key is a programming error and says so.
-  @all @fragments ++ @tiers ++ [:total]
-
   defp canon(key) do
     s = to_string(key)
 
@@ -104,17 +109,16 @@ defmodule BeamLisp.Z3.Ledger do
     end
   end
 
-  defp bump(key) do
-    k = canon(key)
-    :ets.update_counter(@table, k, {2, 1}, {k, 0})
-  end
+  defp bump(key), do: :counters.add(counters(), ix(key), 1)
 
-  defp count(key) do
-    k = canon(key)
+  defp counters, do: :persistent_term.get(@key)
 
-    case :ets.lookup(@table, k) do
-      [{^k, n}] -> n
-      [] -> 0
+  defp count(key), do: :counters.get(counters(), ix(key))
+
+  defp ix(key) do
+    case Map.fetch(@index, canon(key)) do
+      {:ok, i} -> i
+      :error -> raise "no ledger slot for #{inspect(key)}"
     end
   end
 end
