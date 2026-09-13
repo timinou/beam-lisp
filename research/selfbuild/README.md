@@ -416,8 +416,43 @@ RELEASE_LIB "$ROOT/lib" --vm-args …`, and for `start` adds `--erl-config
 | `releases/{COOKIE,start_erl.data}` | a cookie, and `"<erts-vsn> <vsn>"` |
 | `bin/bl` | a launcher: mix's is ~190 lines of `sh`; a minimal one execs `releases/<vsn>/elixir` with the flags above |
 
-**NOT DONE, and the gate is not met.** The tree assembly itself is the rest of
-this wave, so G1 (`<rel>/bin/bl eval '(+ 1 2)'`) is unmet. The next step is
-`assemble/2` in `release.bl`, in this order: copy libs + ERTS → write the `.rel`
-→ `make_script`/rewrite/`script2boot` → templates + launcher → boot test.
+**LANDED, and the gate is met — observed, not asserted.** `assemble/2` builds
+the tree in the order the recon gave, and the tree runs:
+
+```
+$ /tmp/beam_lisp_release_tree/bin/bl version
+beam_lisp 0.1.0
+$ /tmp/beam_lisp_release_tree/bin/bl eval 'IO.puts("elixir=" <> System.version())'
+elixir=1.20.2
+$ /tmp/beam_lisp_release_tree/bin/bl eval 'BeamLisp.Ns.Bl.Cli.main(["eval","(+ 40 2)"])'
+42
+```
+
+That `42` is the LANGUAGE running inside a tree where `assemble` generated every
+piece — the `.rel`, both boot scripts, the ERTS tree, 37 apps, the templates, the
+launcher. (`eval` is Elixir eval, which is what a mix launcher offers; the drop's
+own language verbs are W9's.)
+
+**Five traps, each earned by failing first:**
+
+| what went wrong | the fix |
+|---|---|
+| `:systools` lives in OTP's `sasl`, and a `start_clean` VM has no `lib/sasl-*/ebin` on its path | the stage appends it from the ERTS root it is already copying from — `sasl` is a BUILD tool here, never a release dependency |
+| `systools` answers `{:mandatory_app, :kernel, :none}` | `start_clean` is the same app set with only the MANDATORY apps permanent (kernel, stdlib, elixir); everything else is `none` — carried, not started |
+| `File.cp_r!` creates the destination, not its parents | mkdir `erts-<vsn>/` before copying `bin` into it |
+| `~w` prints a binary as `<<98,101,…>>` | `~p` with charlists, which is how `{"bl","0.1.0"}` gets written |
+| **an unescaped `"` inside a bl docstring silently truncates the string** | escape it — the compiler then fails far away (`node_items("$")`), and what found it was compiling each top-level FORM separately (`/tmp/w4_bisect.exs` against a paren-split copy) |
+
+**A claim I made and then FALSIFIED, recorded so it is not inherited.** I
+hypothesised that a `defn` body may not begin with a vector literal, and wrapped
+the launcher's line-vector in `(vec …)` on that theory. The error persisted, so
+the wrapper was reverted and the bare vector re-tested: 25/25 top-level forms
+compile. The theory is false, the wrapper is gone, and the only real cause was
+the docstring quote above.
+
+**One packaging fact handed to W10.** The tree carries
+`lib/*/ebin/Elixir.Mix.Tasks.*.beam` — rustler's, rustler_precompiled's, and
+beam_lisp's own compile task — because `copy-app!` copies the `ebin` as built.
+They are dead in a release (no Mix) and vanish when the cutover deletes
+`lib/mix`; the fix belongs to the wave that removes those sources.
 

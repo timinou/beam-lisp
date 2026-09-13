@@ -53,6 +53,27 @@ defmodule BeamLisp.Release do
   @spec rel_file(binary, binary, binary) :: binary
   def rel_file(out, name, vsn), do: call("rel-file", [out, name, vsn])
 
+  @doc """
+  `rel_text/1` under a chosen name and app TYPE: `start_clean` is the same app
+  set with every entry `:none` — on the code path, never started, which is what
+  lets `bin/bl eval` reach the release's code without booting it.
+  """
+  @spec rel_text_for(map, binary, atom) :: binary
+  def rel_text_for(value, name, type), do: call("rel-text-for", [value, name, type])
+
+  @doc """
+  Assemble the tree for `value` at `out`: every app's `ebin`/`priv` and ERTS,
+  the `.rel` and both boot scripts (`make_script` → `$ROOT/lib` →
+  `$RELEASE_LIB` → `script2boot`), the Elixir CLI wrappers, the templates, the
+  cookie, `start_erl.data`, and `bin/bl`.
+
+  Returns `%{ok?: bool, out: path, apps: n, warnings: n, errors: [msg]}`; a
+  `systools` rejection is reported in `errors` rather than raised, because the
+  caller is the one that knows whether a tree is required.
+  """
+  @spec assemble(map, binary) :: map
+  def assemble(value, out), do: call("assemble", [value, out])
+
   defp call(name, args) do
     BeamLisp.Loader.ensure_loaded(@ns)
     BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, name), args)
