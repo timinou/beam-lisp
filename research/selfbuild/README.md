@@ -563,3 +563,30 @@ must add. Also carried: a stored pack fixture goes stale whenever the launcher i
 rebuilt (the launcher is the offset), which is how one comparison here first
 looked like nondeterminism — `:offset` is a field, so that shows up as a
 difference rather than a mystery.
+
+## W6 (partial) — the build-twice property, checked (`aaf426a`)
+
+The property the comparison exists for was run rather than asserted: **two
+independent builds of the same nine driver sources**, each with its own output
+dir and its own manifest/log, produced **22 files / 858,453 bytes that agree on
+every digest** — the manifest included, carrying per-source hashes and keys.
+
+And one file that does not agree: `build.log`, which records the run id and the
+time. That is not a defect; it is the shape of the thing. So:
+
+- `index/2` / `trees/3` take a list of relative paths the caller **names** as
+  build state. The comparison does not guess which files those are — a gate that
+  quietly ignores files is one that passes while something is wrong.
+- a tar is the whole directory, so with any exclusion the tar layer reports
+  **NOT COMPARED** with the reason, and `same?` rests on the index layer alone.
+- remove the exclusion and the same comparison reports **exactly** that one
+  differing path — which is what makes the exclusion a disclosure rather than a
+  blindfold.
+
+**A release tree carries no build state at all**: no `build.log`, no manifest, no
+lock among its 2,099 files. So the gen-2/gen-3 fixpoint W6 must run can be
+compared strictly, with no exclusion at all — the exclusion exists for the
+build's *intermediate* trees, not for what it ships.
+
+Suite state: 8/8 in the pristine suite; 37 passed across the seven touched
+suites (pristine, tier barrier, drop, pack, release, log, substrate).
