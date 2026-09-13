@@ -34,26 +34,71 @@
 ; printer (`~p`), so what comes out is Erlang syntax, not this project's.
 (ns release)
 
-(defn- text
+(defn text
   "A charlist or binary as a binary. `:erlang` answers with charlists; bl
-   strings are binaries; `~w` wants one shape for both."
+   strings are binaries; `~w` wants one shape for both.
+
+   Public because the driver tier shares it: `selfbuild` reads a root out of
+   `:code` the same way, and a second copy of a four-line coercion is a second
+   place for it to drift."
   [x]
   (cond
     (string? x) x
     (erlang/is_list x) (erlang/list_to_binary x)
     :else (str x)))
 
+(defn spec-of
+  "`key` from an application's spec, LOADING it first when it is not loaded.
+
+   This is the difference between a dev VM and a drop, and it is not cosmetic:
+   inside a drop the app dirs are on the code path but NOTHING is loaded, and
+   `Application.spec/2` answers nil for an app that is not loaded. Asking without
+   this made a self-build see a closure of one app, copy two of the thirty-nine,
+   and then fail boot-scripting with `{:undefined_applications, …}` — measured,
+   twice, before it was written down. Loading is not starting: an app on the code
+   path that is never booted behaves exactly as before."
+  [app key]
+  (or (Application/spec app key)
+      (do (erlang/apply :application :load (list app))
+          (Application/spec app key))))
+
+(defn- vsn-of
+  "An application's version, from the three places that can answer, in the order
+   that prefers the app's own declaration: the loaded spec, the spec after
+   loading, and — for a tool app resolved from the ERTS root, where nothing is
+   loadable — the directory NAME."
+  [app dir]
+  (or (spec-of app :vsn)
+      (second (String/split (Path/basename dir) "-"))))
+
 (defn app-info
   "`{:app :vsn :dir}` for one application, or nil when the VM cannot see it.
    `nil` is the honest answer for an app that is not loaded and not on the code
-   path: the closure below drops it, and `systools` will say so if it mattered."
+   path: the closure below drops it, and `systools` will say so if it mattered.
+
+   A TOOL app (see `tool-apps`) is on no code path at all in a dev VM — measured:
+   `:code.lib_dir(:sasl)` answers `{:error, :bad_name}` — so it is resolved from
+   the ERTS root's own `lib/`, which is where `ensure-systools!` looks too."
   [app]
-  (let [dir (erlang/apply :code :lib_dir (list app))]
-    (if (erlang/is_list dir)
-      {:app app
-       :vsn (text (or (Application/spec app :vsn) "0"))
-       :dir (text dir)}
-      nil)))
+  (let [on-path (erlang/apply :code :lib_dir (list app))]
+    (cond
+      (erlang/is_list on-path)
+      (let [dir (text on-path)]
+        {:app app :vsn (text (vsn-of app dir)) :dir dir})
+
+      :else
+      (let [root (Path/join (erts-root) "lib")
+            hits (if (File/dir? root) (Path/wildcard (Path/join root (str (name app) "-*"))) [])]
+        (if (empty? hits)
+          nil
+          (let [dir (first (sort hits))]
+            {:app app :vsn (text (vsn-of app dir)) :dir dir}))))))
+
+(defn erts-root
+  "The ERTS install root — `<root>/erts-<vsn>` lives under it, and so does the
+   `lib/` a tool app is resolved from."
+  []
+  (text (erlang/apply :code :root_dir (list))))
 
 (defn app-closure
   "Every application the root app needs, transitively, in `:applications`
@@ -65,7 +110,7 @@
       out
       (let [next (vec (sort (distinct
                               (vec (remove (fn [a] (contains? seen a))
-                                           (vec (mapcat (fn [a] (or (Application/spec a :applications) []))
+                                           (vec (mapcat (fn [a] (or (spec-of a :applications) []))
                                                         frontier)))))))]
         (recur (into seen next) next (into out next))))))
 
@@ -73,7 +118,7 @@
   "The release value for `root`, deriving everything the assembly stage needs
    from the RUNNING VM."
   [root]
-  (let [apps (vec (keep app-info (app-closure root)))
+  (let [apps (vec (keep app-info (distinct (concat (app-closure root) (tool-apps)))))
         erts-vsn (text (erlang/system_info :version))]
     {:name (text root)
      :vsn (text (or (Application/spec root :vsn) "0.1.0"))
@@ -90,11 +135,25 @@
   []
   (set [:kernel :stdlib :elixir]))
 
+(defn tool-apps
+  "Apps the ASSEMBLY stage itself needs at BUILD time, carried in the release and
+   never started.
+
+   `:sasl` holds `:systools`, which generates the boot script, so a release that
+   must be able to re-assemble ITSELF has to carry it: without it a self-build
+   inside a drop dies with `no sasl under <root>` and no boot script is possible —
+   found by running one, not by reading. Listed `none` in the `.rel` (on the code
+   path, not started), which is the difference between carrying a tool and
+   booting it."
+  []
+  [:sasl])
+
 (defn app-permanent-set
   "Every app in the value, as the permanent set: a release's own boot starts
-   all of them."
+   all of them — except the assembly TOOLS, which are carried and not started."
   [v]
-  (set (map (fn [a] (:app a)) (:apps v))))
+  (set (map (fn [a] (:app a))
+            (remove (fn [a] (contains? (set (tool-apps)) (:app a))) (:apps v)))))
 
 (defn- rel-term
   "The `.rel` term as an Erlang tuple tree.
@@ -267,23 +326,26 @@
 (defn- elixir-cli-src
   "The directory holding the `elixir`/`iex` wrappers for the new release.
 
-   A drop assembling a release reuses ITS OWN wrappers — they ship with the
-   release, already patched, and the release's own `releases/<vsn>/` is derived
-   from `BL_BIN` exactly the way the launcher derives it (`bin/bl` → root →
-   `start_erl.data`). A source tree takes them from the host install."
+   Inside a drop the answer is the RUNNING release's own `releases/<vsn>/`: a
+   release root has `releases/start_erl.data`, and `erts-root` is exactly that
+   root when the VM is a release (`code:root_dir()` answers the payload) and the
+   ERTS install when it is a dev VM, where there is no `releases/` and the
+   wrappers come from the host install instead.
+
+   An earlier version derived this from `BL_BIN` by taking two dirnames — wrong,
+   and measured wrong: `BL_BIN` is the COMPOUND's path, so the derived root was
+   `/`, no wrappers were found, the copied tree had no `releases/<vsn>/elixir`,
+   and the new drop died on `bin/bl` line 15. Asking the runtime cannot be
+   wrong about where the runtime is."
   []
-  (let [bl-bin (System/get_env "BL_BIN")]
-    (if (nil? bl-bin)
-      (host-elixir-bin)
-      (let [root (Path/dirname (Path/dirname bl-bin))
-            releases (Path/join root "releases")
-            data (Path/join releases "start_erl.data")
-            parts (if (File/exists? data) (String/split (String/trim (File/read! data)) " ") [])
-            vsn (if (= 2 (count parts)) (second parts) nil)
-            own (if (some? vsn) (Path/join releases vsn) nil)]
-        (if (and (some? own) (File/exists? (Path/join own "elixir")))
-          own
-          (host-elixir-bin))))))
+  (let [root (erts-root)
+        data (Path/join (Path/join root "releases") "start_erl.data")
+        parts (if (File/exists? data) (String/split (String/trim (File/read! data)) " ") [])
+        vsn (if (= 2 (count parts)) (second parts) nil)
+        own (if (some? vsn) (Path/join (Path/join root "releases") vsn) nil)]
+    (if (and (some? own) (File/exists? (Path/join own "elixir")))
+      own
+      (host-elixir-bin))))
 
 (defn- patch-elixir-cli
   "The two substitutions mix makes when it copies Elixir's own wrappers into a
@@ -352,13 +414,23 @@
     path))
 
 (defn- cookie!
-  "A cookie for the release. Random when the crypto application will answer
-   (it does, preloaded), and a fixed string when it will not — a release that
-   cannot start because a cookie could not be invented would be a poor trade."
+  "A cookie for the release: the RUNNING release's cookie when there is one, else
+   a fresh random one, else a fixed string (crypto answers in practice — a release
+   that cannot start because a cookie could not be invented would be a poor
+   trade).
+
+   Inheriting is what makes a self-build reproducible, and it is also the honest
+   answer to what a rebuild IS: the same deployment, rebuilt. Measured before it
+   was written down — two generations differed in exactly ONE file,
+   `releases/COOKIE`, because each invented its own; with the difference down to
+   one file the fixpoint had nowhere left to hide."
   []
-  (try
-    (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 32)))
-    (catch _ "bl-local-cookie")))
+  (let [ours (Path/join (Path/join (erts-root) "releases") "COOKIE")]
+    (cond
+      (File/exists? ours) (String/trim (File/read! ours))
+      :else (try
+              (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 32)))
+              (catch _ "bl-local-cookie")))))
 
 (defn- ensure-systools!
   "`:systools` lives in OTP's `sasl`, and a `start_clean` VM does not put

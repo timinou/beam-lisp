@@ -221,8 +221,8 @@ defmodule BeamLisp.AOTCache do
   `build_key/0`. The build manifest and the emitter both route through here, so
   a beam's stamp and the gate that judges it cannot disagree.
   """
-  def key_for_source(path) do
-    if BeamLisp.Tiers.build_source?(path), do: build_key(), else: compiler_key()
+  def key_for_source(path, root \\ BeamLisp.Tiers.priv_root()) do
+    if BeamLisp.Tiers.build_source?(path, root), do: build_key(), else: compiler_key()
   end
 
   @doc "The key a NAMESPACE's beam is stamped with: `BeamLisp.Tiers.tier_of_ns/1`."

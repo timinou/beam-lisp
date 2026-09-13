@@ -109,18 +109,29 @@ defmodule BeamLisp.Tiers do
     end
   end
 
-  @doc "Whether a source belongs to the boot tier (codegen), including Mix's priv symlink."
-  def boot_source?(path), do: source_beneath?(boot_dir(), path)
+  @doc """
+  Whether a source belongs to the boot tier (codegen), including Mix's priv
+  symlink.
 
-  @doc "Whether a source belongs to the build-driver tier."
-  def build_source?(path), do: source_beneath?(build_dir(), path)
+  `root` is which priv the question is about, and it exists because a build can
+  run over a STAGED copy of a priv rather than the running one — a self-build
+  stages the payload's sources so that the paths compiled into beams are stable
+  from generation to generation. Without an explicit root every staged source
+  would read as ordinary, and the driver's own beams would lose the tier key the
+  drift gate depends on.
+  """
+  def boot_source?(path, root \\ priv_root()), do: source_beneath?(boot_dir(root), path)
+
+  @doc "Whether a source belongs to the build-driver tier, relative to `root`."
+  def build_source?(path, root \\ priv_root()), do: source_beneath?(build_dir(root), path)
 
   @doc """
   Whether a source is a TOOLCHAIN source: codegen (`boot/`) or driver
   (`build/`). These build serially before the ordinary waves — the compiler
   and the program scheduling it must both be sound before anything else runs.
   """
-  def toolchain_source?(path), do: boot_source?(path) or build_source?(path)
+  def toolchain_source?(path, root \\ priv_root()),
+    do: boot_source?(path, root) or build_source?(path, root)
 
   defp source_beneath?(dir, path) do
     with {:ok, stat} <- File.stat(dir) do
