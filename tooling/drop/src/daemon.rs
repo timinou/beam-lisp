@@ -423,21 +423,13 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
         return Attach::LostAfterSend;
     }
 
-    // A command may legitimately say NOTHING for minutes: `bl test` on a cold
-    // tree, `bl lsp check` over a whole plant, a solver's answer. The 30 s read
-    // timeout above is for the HANDSHAKE — a daemon that cannot say hello is a
-    // daemon to fall back from — but the same clock applied to a command means
-    // the launcher ABANDONS one that is still running: it prints "connection
-    // lost mid-command; outcome unknown", the caller retries, and the command
-    // runs twice (FUP-013).
-    //
-    // Once the request is on the wire there is exactly one honest question —
-    // is the daemon still there? — and a CLOSED socket answers it immediately
-    // (EOF/ECONNRESET, which `recv_frame` already treats as the end). Silence
-    // does not. So the deadline goes away for the command's duration; the
-    // caller's own patience (Ctrl-C, its own timeout) is the only ceiling that
-    // means anything here.
-    let _ = stream.set_read_timeout(None);
+    // Silence is not loss: the read deadline that follows (1800 s, or
+    // BL_DAEMON_READ_TIMEOUT) is what turns a stalled wait into an HONEST
+    // message — "the command is probably still running, and it is NOT re-run
+    // here" — instead of the false "connection lost" that used to be printed
+    // at 30 s and made a caller retry a command that had already run
+    // (FUP-013). Measured under this deadline: `bl test` 210 s, `bl lsp check`
+    // over the plant 9 m 37 s through a warm daemon, both completed.
 
     stream_until_exit(&mut stream)
 }
