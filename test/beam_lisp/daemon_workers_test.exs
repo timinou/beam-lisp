@@ -21,10 +21,11 @@ defmodule BeamLisp.Daemon.WorkersTest do
     :ok
   end
 
-  test "both workers run under the supervisor" do
+  test "all three workers run under the supervisor" do
     assert Process.whereis(BeamLisp.Daemon.Executor)
     assert Process.whereis(BeamLisp.Daemon.WatchRegistry)
-    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 2
+    assert Process.whereis(BeamLisp.Daemon.McpWorker)
+    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 3
   end
 
   test "a killed worker is restarted, not lost" do

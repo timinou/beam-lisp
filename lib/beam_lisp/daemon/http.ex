@@ -33,7 +33,7 @@ defmodule BeamLisp.Daemon.HTTP do
 
   import Plug.Conn
 
-  alias BeamLisp.Daemon.{Gateway, Inspect, Ports}
+  alias BeamLisp.Daemon.{Gateway, Inspect, McpWorker, Ports}
 
   @impl true
   def init(opts), do: opts
@@ -309,7 +309,10 @@ defmodule BeamLisp.Daemon.HTTP do
 
     case decode(body) do
       {:ok, request} ->
-        json(conn, 200, mcp_request(request, opts))
+        # On the McpWorker, not this per-request process: the index mount the
+        # request may trigger builds ETS tables owned by their creator, and a
+        # connection process dies with its response. See McpWorker's moduledoc.
+        json(conn, 200, McpWorker.run(fn -> mcp_request(request, opts) end))
 
       {:error, _} ->
         json(conn, 400, %{

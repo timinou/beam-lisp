@@ -1,7 +1,8 @@
 defmodule BeamLisp.Daemon.Workers do
   @moduledoc """
-  The daemon's two stateful workers — the command `Executor` and the
-  `WatchRegistry` — under ONE supervisor, so a death is a RESTART.
+  The daemon's three stateful workers — the command `Executor`, the
+  `WatchRegistry` and the HTTP MCP mount owner (`McpWorker`) — under ONE
+  supervisor, so a death is a RESTART.
 
   ## Why this module exists
 
@@ -29,7 +30,7 @@ defmodule BeamLisp.Daemon.Workers do
   the idle timer) still takes the tree down with it.
   """
 
-  @workers [BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry]
+  @workers [BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry, BeamLisp.Daemon.McpWorker]
 
   @doc """
   Start the worker supervisor, or hand back the one already running.

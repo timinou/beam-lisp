@@ -71,8 +71,8 @@ defmodule BeamLisp.Daemon.Server do
       _ = write_pid(ep.pid, root)
       _ = write_meta(ep.meta, root, token)
 
-      # The two stateful workers — the single-worker command serializer and the
-      # watcher registry — under one supervisor, because a bare `start_link` is
+      # The stateful workers — the single-worker command serializer, the
+      # watcher registry and the HTTP MCP mount owner — under one supervisor, because a bare `start_link` is
       # linked but never RESTARTED: user code runs inside the worker, so a
       # crash it links (`examples/mcp-demo.bl` starting an in-process MCP
       # server) used to leave the daemon healthy-looking and permanently
