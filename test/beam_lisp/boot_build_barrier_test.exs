@@ -116,12 +116,15 @@ defmodule BeamLisp.BootBuildBarrierTest do
              "build-log",
              "build-plan",
              "claim",
+             "deps",
              "drop",
+             "hex",
              "ns-interface",
              "pristine",
              "release",
              "selfbuild",
              "source-graph",
+             "store",
              "substrate"
            ]
 

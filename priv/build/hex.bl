@@ -1,0 +1,197 @@
+; build/hex.bl — THE HEX CLIENT, with the server as a CONTRACT.
+;
+; A package manager's client is mostly a promise about a server it does not
+; control. So the server is written down as a CONTRACT here, and the client is
+; built to be checked against it: the same predicates a mock must answer to are
+; the ones the client's decisions are tested against (see the suite, which
+; derives its mock from this contract with `veritas.mock` and asks the optimizer
+; for the boundary cases a hand-written fixture always forgets).
+;
+; ── The transport is a RESOURCE, not a stub ────────────────────────────────
+;
+; `fetch` takes a transport: a function of `[url {:binary? bool}]` answering
+; `{:ok body}` or `{:error reason}`. Production passes `httpc-transport`; a test
+; passes a mock, in-process or over a socket. This is the same shape `reload`
+; uses for its commit target — inject the RESOURCE the effect targets, never
+; replace the function that uses it — and it is why this client has no test-only
+; branch inside it: the mock is a value, not a mode.
+;
+; ── What the client checks, and why the order matters ──────────────────────
+;
+; A hex tarball is a tar of four entries: VERSION, CHECKSUM, metadata.config and
+; contents.tar.gz. Three digests matter: the one the LOCK records (of the whole
+; tarball), the one CHECKSUM holds (of contents.tar.gz), and the one the bytes
+; actually have. An install happens only when the first equals what arrived and
+; the second equals what the contents digest to — checked BEFORE the store's
+; rename, so an artifact that fails either test is never visible under its
+; content address. A fetcher that "mostly works" is a supply-chain bug.
+
+(ns hex
+  (:require [store :as st] [drop :as d] [release :as rel] [claim :as c]))
+
+(def api-base "https://hex.pm/api")
+(def repo-base "https://repo.hex.pm/tarballs")
+
+(defn package-url [name] (str api-base "/packages/" name))
+(defn tarball-url [name vsn] (str repo-base "/" name "-" vsn ".tar"))
+
+; ── the contract the server must answer to ─────────────────────────────────
+;
+; The contract lives in the SUITE, not here, and the tier barrier is why: a
+; driver source may not require a library one, and `veritas.mock` is a library.
+; That is the right outcome rather than a workaround — a contract is what a MOCK
+; is derived from, and mocks belong to tests. The suite states the shape of
+; `GET /api/packages/<name>` as Veritas predicates, derives its mock server from
+; them, and asks the optimizer for the boundary cases; this client is what the
+; assertions then talk to. Production has no mock and no branch for one.
+
+; ── transports ─────────────────────────────────────────────────────────────
+
+(defn httpc-transport
+  "The real transport: OTP's `:httpc`, with `:ssl` verified. Started lazily,
+   because a store-only build must not need TLS at all."
+  []
+  (fn [url opts]
+    (erlang/apply :application :ensure_all_started (list :inets))
+    (erlang/apply :application :ensure_all_started (list :ssl))
+    (let [r (erlang/apply :httpc :request
+                          (list :get
+                                (list (erlang/binary_to_list url), [])
+                                (list (list :timeout 30000)
+                                      (list :ssl (list (list :verify :verify_peer)
+                                                       (list :cacerts (erlang/apply :public_key :cacerts_get (list))))))))]
+      (cond
+        (not= :ok (erlang/element 1 r)) {:error (pr-str (erlang/element 2 r))}
+        :else (let [body (erlang/element 3 r)
+                    code (erlang/element 1 (erlang/element 2 r))]
+                (if (= 200 code)
+                  {:ok (if (:binary? opts) body (erlang/list_to_binary body))}
+                  {:error (str "HTTP " code)}))))))
+
+; ── the client ─────────────────────────────────────────────────────────────
+
+(defn fetch
+  "`fetch transport url {:binary? bool}` → `{:ok body}` | `{:error reason}`."
+  [transport url opts]
+  (transport url opts))
+
+(defn package
+  "The hex API's answer for one package, as `{:ok {:name :versions [{:vsn :checksum
+   :retired?} …]}}` or `{:error reason}`.
+
+   A document that cannot be used is an ERROR, not an empty package. That is not
+   pedantry: answering \"no versions\" for a name we mistyped, or for a body that
+   was not JSON at all, would let a lock check pass against nothing. The transport
+   decides where bytes come from; nothing here knows a mock from a server."
+  [transport name]
+  (let [r (fetch transport (package-url name) {:binary? false})]
+    (if (:error r)
+      r
+      (let [j (try (Jason/decode (:ok r)) (catch _ nil))]
+        (cond
+          (nil? j) {:error (str "hex: unusable package document for " name)}
+          (nil? (:name j)) {:error (str "hex: package document has no name: " name)}
+          (nil? (:releases j)) {:error (str "hex: package document has no releases: " name)}
+          :else
+          (let [vs (vec (map (fn [v] {:vsn (:version v)
+                                      :checksum (:checksum v)
+                                      :retired? (= true (:retired v))})
+                             (:releases j)))]
+            (if (empty? vs)
+              {:error (str "hex: " name " lists no versions")}
+              {:ok {:name (:name j) :versions vs}})))))))
+
+(defn tarball
+  "The bytes of `<name>-<vsn>.tar`, and their digest."
+  [transport name vsn]
+  (let [r (fetch transport (tarball-url name vsn) {:binary? true})]
+    (if (:error r)
+      r
+      {:ok {:bytes (:ok r) :sha (d/sha256-hex (:ok r))}})))
+
+(defn contents-sha
+  "The digest `CHECKSUM` holds: sha256 of `contents.tar.gz`."
+  [bytes]
+  (d/sha256-hex bytes))
+
+(defn tar-entries
+  "The entries of a tar in memory, as `{name-string → bytes}`. `compressed?`
+   for a gzipped archive. Reading in MEMORY rather than into a directory is not
+   fussiness: it means a check can be made before a single byte is written, and
+   no partial extraction can be left behind for a later run to mistake for a
+   library."
+  [bytes compressed?]
+  (let [opts (if compressed? (list :memory :compressed) (list :memory))
+        r (erlang/apply :erl_tar :extract
+                        (list (erlang/list_to_tuple (list :binary bytes)) opts))]
+    (if (= :ok (erlang/element 1 r))
+      (reduce (fn [acc e] (assoc acc (rel/text (erlang/element 1 e)) (erlang/element 2 e)))
+              {}
+              (erlang/element 2 r))
+      {:error (pr-str r)})))
+
+(defn- write-tree!
+  "Write `{rel-path → bytes}` under `dir`, creating parents. Paths are checked
+   for escapes: a tar entry named `../evil` is exactly the attack this is here to
+   refuse, and a store that writes outside its address is not a store."
+  [dir entries]
+  (doseq [pair entries]
+    (let [rel (first pair)
+          bytes (second pair)
+          target (Path/expand (Path/join dir rel))]
+      (when-not (String/starts_with? target (Path/expand (str dir "/")))
+        (throw (ex-info (str "tar entry escapes its directory: " rel) {})))
+      (File/mkdir_p! (Path/dirname target))
+      (File/write! target bytes)))
+  dir)
+
+(defn install!
+  "Fetch `(name, vsn)`, check it against the lock, and install it into the store.
+
+   Returns `{:ok? bool :dir path :sha locked-sha :why reason}`. The checks run in
+   the order that fails cheapest first, and NOTHING is written to the store until
+   every one has passed:
+
+     1. the tarball's digest equals the lock's — what we asked for is what came;
+     2. the archive holds `CHECKSUM` and `contents.tar.gz` at all;
+     3. the contents digest to what CHECKSUM says — so a tarball cannot describe
+        itself wrongly (hex states CHECKSUM in UPPERCASE: measured);
+     4. the contents parse as a tar, and every path stays inside the library.
+
+   Only then is a directory copied to a temp path and RENAMED into its content
+   address, so a library is visible exactly when it is complete."
+  [transport lock-entry scratch]
+  (let [name (:name lock-entry) vsn (:vsn lock-entry) want (:sha lock-entry)
+        got (tarball transport name vsn)]
+    (cond
+      (:error got)
+      {:ok? false :why (:error got)}
+
+      (not= want (:sha (:ok got)))
+      {:ok? false :why (str "digest differs from the lock: " (:sha (:ok got)) " ≠ " want)}
+
+      :else
+      (let [outer (tar-entries (:bytes (:ok got)) false)]
+        (if (:error outer)
+          {:ok? false :why (str "not a readable tarball: " (:error outer))}
+          (let [checksum (get outer "CHECKSUM")
+                cgz (get outer "contents.tar.gz")]
+            (cond
+              (or (nil? checksum) (nil? cgz))
+              {:ok? false :why "the tarball is missing CHECKSUM or contents.tar.gz"}
+
+              (not= (String/downcase (String/trim checksum)) (contents-sha cgz))
+              {:ok? false :why (str "contents digest differs: " (contents-sha cgz)
+                                    " ≠ " (String/downcase (String/trim checksum)))}
+
+              :else
+              (let [inner (tar-entries cgz true)]
+                (if (:error inner)
+                  {:ok? false :why (str "contents.tar.gz will not read: " (:error inner))}
+                  (let [staging (Path/join scratch (str name "-" vsn "-staging"))]
+                    (File/rm_rf! staging)
+                    (File/mkdir_p! staging)
+                    (try
+                      (write-tree! staging inner)
+                      {:ok? true :dir (st/install-dir! name vsn want staging) :sha want}
+                      (catch e {:ok? false :why (str "contents will not install: " (ex-message e))}))))))))))))
