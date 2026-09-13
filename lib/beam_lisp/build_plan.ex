@@ -1,6 +1,6 @@
 defmodule BeamLisp.BuildPlan do
   @moduledoc """
-  The build plan, delegated to the language: `priv/boot/build-plan.bl`.
+  The build plan, delegated to the language: `priv/build/build-plan.bl`.
 
   One post-order traversal of the namespace graph yields everything the build
   needs — topological order, per-source closure key, dependency paths, and

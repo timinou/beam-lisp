@@ -41,8 +41,10 @@ defmodule BeamLisp.MixProject do
       # `priv/` (core, datom, optics) — the language libraries. The
       # contract/view stack lives in the :interface app of the spell repo
       # since the extraction; beam-lisp is the language again.
-      # The tiered source tree (see BeamLisp.Tiers): priv/boot is the toolchain,
-      # priv/std the stdlib, priv/lib the batteries, priv/build the build itself.
+      # The tiered source tree (see BeamLisp.Tiers): priv/boot is the CODEGEN
+      # (its own key — a change here rebuilds every beam), priv/build is the
+      # build DRIVER (its own key — a change here rebuilds the driver only),
+      # priv/std the stdlib, priv/lib the batteries.
       beam_lisp: [source_dirs: ["priv/boot", "priv/std", "priv/lib", "priv/compat", "priv/build"]],
       # `beam_lisp_native` builds the Rust crates that `defnative`
       # namespaces load. It runs BEFORE :elixir so a NIF is present

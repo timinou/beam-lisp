@@ -6,7 +6,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
 
   This task is a SHELL. The build itself — planning the sources into
   dependency order and parallel waves, deciding what is fresh, compiling or
-  fetching from the shared cache, writing the manifest — is `priv/boot/build.bl`,
+  fetching from the shared cache, writing the manifest — is `priv/build/build.bl`,
   a beam-lisp program (`build/run`). What lives here is only what MUST be
   Elixir: the `Mix.Task.Compiler` behaviour, flag parsing, the project's
   compile and manifest paths, seeding the bootstrap compiler before the
@@ -29,7 +29,7 @@ defmodule Mix.Tasks.Compile.BeamLisp do
   ## Freshness
 
   The manifest maps each source to its per-source key (interface-keyed —
-  see `priv/boot/build-plan.bl` and docs/build/interface-keys.bl.md), the
+  see `priv/build/build-plan.bl` and docs/build/interface-keys.bl.md), the
   toolchain key, and the modules it produced. Byte-derived, never mtime.
   `mix clean` removes the manifest and every module it names.
   """

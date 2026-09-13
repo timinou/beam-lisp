@@ -1,4 +1,4 @@
-; boot/build.bl — the AOT build, as a program.
+; build/build.bl — the AOT build, as a program.
 ;
 ; What `mix compile.beam_lisp` and `bl build` do, in the language, so the
 ; build is one thing: plan the sources (build-plan), skip what is fresh
@@ -18,10 +18,11 @@
 ;   → {:built n :errors [msg …] :manifest {path → entry}}
 ;
 ; The manifest maps each source path to
-; `{:hash key :key toolchain-key :modules [mod …]}` — `key` is the plan's
-; per-source freshness key (interface-keyed, see build-plan), `toolchain-key`
-; `BeamLisp.AOTCache/compiler_key`. A source is FRESH iff its manifest entry
-; matches both and every module's beam is on disk.
+; `{:hash key :key tier-key :modules [mod …]}` — `key` is the plan's
+; per-source freshness key (interface-keyed, see build-plan), `tier-key` is
+; `BeamLisp.AOTCache.key_for_source/1` for that source: `compiler_key` for
+; codegen and ordinary sources, `build_key` for the build driver. A source is
+; FRESH iff its manifest entry matches both and every module's beam is on disk.
 ;
 ; Why keys and not mtimes: mtime is scrambled by checkout, worktrees and
 ; tar; the key is a function of the bytes. Why the manifest stores the
@@ -105,14 +106,14 @@
 
 (defn- build-one
   "Compile `path` (or link it from the shared cache) into `out`.
-   → {:path :key :closure-key :cached? :result} where result is
+   → {:path :key :tkey :closure-key :cached? :result} where result is
    [:ok modules] or [:error msg].
 
    Runs in a WORKER process (pmap-ordered). Everything it returns is fully
    realised before it is sent back: a lazy seq's thunk is a closure over
    the worker's stack and would be forced in the parent after the worker
    exited — a `map` here must be `mapv`, and `mods` a vector."
-  [path key cache-key closure-key out log]
+  [path key tkey cache-key closure-key out log]
   (when log (log (str "  " path)))
   (let [cached (if closure-key (BeamLisp.AOTCache/fetch cache-key closure-key out) :miss)
         ; fetch → {:ok modules} | :miss
@@ -126,7 +127,7 @@
                      [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (erlang/element 1 m))))])
                    (catch e
                      [:error (str "beam-lisp AOT: " path ": " (ex-message e))])))]
-    {:path path :key key :closure-key closure-key :cached? hit? :result result}))
+    {:path path :key key :tkey tkey :closure-key closure-key :cached? hit? :result result}))
 
 ; ── parallel wave ────────────────────────────────────────────────────────────
 
@@ -156,28 +157,33 @@
                (mapv (fn [ref] (receive [r v] :when (= r ref) v)) refs)))
            (chunks-of n xs)))))
 
-; ── structural boot barrier ─────────────────────────────────────────────────
+; ── structural toolchain barrier ───────────────────────────────────────────────
 
-(defn boot-source? [path] (BeamLisp.Tiers/boot_source? path))
+(defn toolchain-source? [path] (BeamLisp.Tiers/toolchain_source? path))
 
 (defn partition-plan
-  "Split a plan into serial boot order and parallel ordinary waves."
+  "Split a plan into the serial TOOLCHAIN prefix and the parallel ordinary waves.
+
+   Toolchain = codegen (`priv/boot/`) plus the build driver (`priv/build/`):
+   the compiler and the program scheduling it must both be sound before
+   anything else builds."
   [p]
-  (let [boot (vec (filter (fn [n] (boot-source? (:path n))) (:order p)))
-        boot-paths (set (map :path boot))
+  (let [tc (vec (filter (fn [n] (toolchain-source? (:path n))) (:order p)))
+        tc-paths (set (map :path tc))
         errors (vec (apply concat
                       (map (fn [n]
-                             (map (fn [dep] (str "beam-lisp AOT: boot source " (:path n) " requires ordinary source " dep))
-                                  (filter (fn [dep] (not (contains? boot-paths dep)))
-                                          (get (:deps p) (:path n) [])))) boot)))
+                             (map (fn [dep] (str "beam-lisp AOT: toolchain source " (:path n) " requires ordinary source " dep))
+                                  (filter (fn [dep] (not (contains? tc-paths dep)))
+                                          (get (:deps p) (:path n) [])))) tc)))
         ordinary-waves (vec (filter (fn [w] (not (empty? w)))
-                               (map (fn [w] (vec (filter (fn [n] (not (contains? boot-paths (:path n)))) w)))
+                               (map (fn [w] (vec (filter (fn [n] (not (contains? tc-paths (:path n)))) w)))
                                     (:waves p))))]
-    {:boot boot :ordinary-waves ordinary-waves :errors errors}))
+    {:toolchain tc :ordinary-waves ordinary-waves :errors errors}))
 
-;; The boot barrier: an error IN A BOOT SOURCE (or a boot source requiring an
-;; ordinary one) means the compiler about to build everything else is not
-;; sound — stop. An error in an ORDINARY source — a typo in b.bl — is a
+;; The toolchain barrier: an error IN A TOOLCHAIN SOURCE (codegen under
+;; `priv/boot/`, or the driver under `priv/build/`) — or a toolchain source
+;; requiring an ordinary one — means the compiler or the program scheduling it
+;; is not sound, so the build stops. An error in an ORDINARY source — a typo in b.bl — is a
 ;; report, not a barrier: a (needing nothing) still builds, c (needing b)
 ;; fails on its require and is reported too. Gating on ANY error (as the
 ;; barrier first shipped) turned one unreadable file into "nothing built".
@@ -186,70 +192,81 @@
 ;; called every message a boot error, and one ordinary source failing closed
 ;; the whole build (the barrier 1baaab4 meant to narrow never was). Ask for
 ;; a number before comparing.
-(defn- boot-error? [msg boot-paths]
-  (some (fn [path] (and (string? msg) (number? (index-of msg path)))) boot-paths))
+(defn- toolchain-error? [msg toolchain-paths]
+  (some (fn [path] (and (string? msg) (number? (index-of msg path)))) toolchain-paths))
 
-(defn continue-after-boot?
-  "Proceed to the ordinary waves? Yes unless a BOOT source failed."
+(defn continue-after-toolchain?
+  "Proceed to the ordinary waves? Yes unless a TOOLCHAIN source failed."
   [st]
-  (not (some (fn [e] (boot-error? e (:boot-paths st))) (:errors st))))
+  (not (some (fn [e] (toolchain-error? e (:toolchain-paths st))) (:errors st))))
 
-(defn- fold-results [st results tkey cache-key out mpath]
+(defn- fold-results [st results out mpath]
   (reduce (fn [st r]
     (let [[tag payload] (:result r) path (:path r)]
       (if (= tag :ok)
         (let [old (get-in (:manifest st) [path :modules] [])
-              m2 (assoc (:manifest st) path {:hash (:key r) :key tkey :modules payload})]
+              m2 (assoc (:manifest st) path {:hash (:key r) :key (:tkey r) :modules payload})]
           (doseq [mod (remove (fn [m] (contains? (set payload) m)) old)] (delete-beam out mod))
           (write-manifest mpath m2)
           (when (and (:closure-key r) (not (:cached? r)))
-            (BeamLisp.AOTCache/store cache-key (:closure-key r) out payload))
+            (BeamLisp.AOTCache/store (:tkey r) (:closure-key r) out payload))
           (assoc st :manifest m2 :built (inc (:built st))))
         (let [old (get (:manifest st) path) m2 (dissoc (:manifest st) path)]
           (when old (doseq [mod (:modules old)] (delete-beam out mod)))
           (write-manifest mpath m2)
           (assoc st :manifest m2 :errors (conj (vec (:errors st)) payload)))))) st results))
 
-(defn- build-wave [wave jobs st p todo? tkey cache-key hashes out mpath log]
+(defn- source-key
+  "The tier key a source's beam is stamped with: codegen for `priv/boot/` and
+   for every ordinary namespace, the driver key for `priv/build/`. The manifest
+   and the runtime gate both route through `AOTCache/key_for_source`, so a
+   beam's stamp and the judgement of it cannot disagree."
+  [path]
+  (BeamLisp.AOTCache/key_for_source path))
+
+(defn- build-wave [wave jobs st p todo? cache? hashes out mpath log]
   (let [m (:manifest st)
-        paths (map :path (filter (fn [n] (todo? m (:path n))) wave))
+        paths (vec (map :path (filter (fn [n] (todo? m (:path n))) wave)))
         results (pmap-ordered jobs (fn [path]
-                  (build-one path (get (:key p) path) cache-key
-                    (when cache-key (BeamLisp.AOTCache/closure_key path (:deps p) hashes)) out log)) paths)]
-    (fold-results st results tkey cache-key out mpath)))
+                  (let [tkey (source-key path)
+                        cache-key (when cache? tkey)]
+                    (build-one path (get (:key p) path) tkey cache-key
+                      (when cache-key (BeamLisp.AOTCache/closure_key path (:deps p) hashes)) out log))) paths)]
+    (fold-results st results out mpath)))
 
-(defn- build-ordinary [waves jobs st p todo? tkey cache-key hashes out mpath log]
-  (reduce (fn [s w] (build-wave w jobs s p todo? tkey cache-key hashes out mpath log)) st waves))
+(defn- build-ordinary [waves jobs st p todo? cache? hashes out mpath log]
+  (reduce (fn [s w] (build-wave w jobs s p todo? cache? hashes out mpath log)) st waves))
 
-(defn- build-boot [nodes st p todo? tkey cache-key hashes out mpath log]
+(defn- build-toolchain [nodes st p todo? cache? hashes out mpath log]
   (loop [xs (seq nodes) st st]
-    (if (or (nil? xs) (not (continue-after-boot? st))) st
-      (recur (seq (rest xs)) (build-wave [(first xs)] 1 st p todo? tkey cache-key hashes out mpath log)))))
+    (if (or (nil? xs) (not (continue-after-toolchain? st))) st
+      (recur (seq (rest xs)) (build-wave [(first xs)] 1 st p todo? cache? hashes out mpath log)))))
 
 (defn run [opts]
   (let [sources (vec (:sources opts)) out (:out opts) force? (= true (:force? opts))
         jobs (or (:jobs opts) (erlang/system_info :schedulers_online)) log (:log opts)
-        mpath (or (:manifest opts) (manifest-path out)) tkey (BeamLisp.AOTCache/compiler_key)
-        cache-key (when (and (BeamLisp.AOTCache/enabled?) (not force?)) tkey)
+        mpath (or (:manifest opts) (manifest-path out))
+        cache? (and (BeamLisp.AOTCache/enabled?) (not force?))
         manifest0 (read-manifest mpath)
         read-results (map (fn [path] (try [:ok (plan/node-from path (BeamLisp.Loader/read_source path))]
                                       (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))) sources)
         read-errors (vec (map second (filter (fn [r] (= :error (first r))) read-results)))
         p (plan/plan (map second (filter (fn [r] (= :ok (first r))) read-results)))
         part (partition-plan p) hashes (into {} (map (fn [n] [(:path n) (:hash n)]) (:order p)))
-        todo? (fn [m path] (or force? (not (fresh? m path (get (:key p) path) tkey out))))
+        todo? (fn [m path] (or force? (not (fresh? m path (get (:key p) path) (source-key path) out))))
         total (count (filter (fn [n] (todo? manifest0 (:path n))) (:order p)))]
     (when (and log (pos? total)) (log (str "beam-lisp AOT: building " total " source(s)")))
-    (let [boot-paths (set (map :path (:boot part)))
-          initial {:manifest manifest0 :built 0 :boot-paths boot-paths
+    (let [tc-paths (set (map :path (:toolchain part)))
+          initial {:manifest manifest0 :built 0 :toolchain-paths tc-paths
                    :errors (vec (concat read-errors (:errors part)))}
-          ; boot sources build only from a clean slate: a barrier error (a boot
-          ; source requiring an ordinary one) or an unreadable boot source
-          ; means the toolchain is unsound, so nothing further is attempted
-          booted (if (continue-after-boot? initial)
-                   (build-boot (:boot part) initial p todo? tkey cache-key hashes out mpath log) initial)
-          final (if (continue-after-boot? booted)
-                  (build-ordinary (:ordinary-waves part) jobs booted p todo? tkey cache-key hashes out mpath log) booted)
+          ; toolchain sources build only from a clean slate: a barrier error (a
+          ; toolchain source requiring an ordinary one) or an unreadable
+          ; toolchain source means the compiler or its driver is unsound, so
+          ; nothing further is attempted
+          built (if (continue-after-toolchain? initial)
+                  (build-toolchain (:toolchain part) initial p todo? cache? hashes out mpath log) initial)
+          final (if (continue-after-toolchain? built)
+                  (build-ordinary (:ordinary-waves part) jobs built p todo? cache? hashes out mpath log) built)
           keep (set sources) m-final (:manifest final)
           stale-paths (remove (fn [path] (contains? keep path)) (keys m-final))
           kept (reduce (fn [m path] (dissoc m path)) m-final stale-paths)]
