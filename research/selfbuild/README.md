@@ -519,3 +519,47 @@ the boot gate because the beams run fine until something needs to compile.
 `dereference_symlinks: true` now (as a keyword list — bl has no `key: value`
 argument syntax), and the release suite asserts `priv` is a real directory
 containing `boot/compiler.bl`.
+
+## W6 (partial) — the pristine comparison, landed
+
+Commits `cbb85f8` (a dead duplicate gzip codec removed from `drop.bl`) and
+`cd857c3` (`priv/build/pristine.bl`, `lib/beam_lisp/pristine.ex`, its suite, and
+`pristine` added to the driver tier).
+
+W6's real deliverable is a verb (`bl self-build`) and a fixpoint gate. What
+landed is the part the gate cannot be trusted without: the COMPARISON, in
+layers, with `same?` meaning every layer agreed.
+
+| layer | what it decides |
+|---|---|
+| `trees/2` | every file's path → (size, sha256) as SETS — an extra or missing path is a finding, not something a subset check smooths over — plus the tar byte-for-byte |
+| `drops/2` | producer-independent trailer fields, `offset + len + 56 == size`, each trailer's digest against its own payload, and the digest of the payload DECOMPRESSED |
+| `report/1` | EVERY difference, one line each |
+| `compounds-identical?/2` | the fixpoint ONE producer can demand of itself |
+
+**Teeth, not green.** The suite proves the gate can fail: three mutations at once
+(added path, removed path, changed byte) must yield three named findings and a
+report naming all three; a one-byte edit must move the tar's content even when
+block-granularity (512 B) keeps its size equal; a non-drop must be refused by
+name. Cross-producer: the Rust packer's compound and ours, for one tree, agree on
+trailer fields, payload digest and DECOMPRESSED payload while their compressed
+lengths differ (measured 1977 vs 1999 B). Single-producer: two packs of one tree
+made in the same run are the same file (`bf58b686…`), byte for byte.
+
+**Four facts the tests found rather than assumed**
+
+1. A trailer's `:len` describes the COMPRESSED payload — producer-dependent, not
+   a property of the tree. The first version compared it as if it were.
+2. bl keywords with a hyphen cross to Elixir as BINARY keys; without one, as
+   atoms. Hence letters-only keys on this boundary.
+3. `walk-files` yields `[rel abs]` PAIRS, not paths.
+4. `String/join` is not the runtime's; core's `(join sep coll)` is.
+
+**Not yet proved, and W6's gate still owes it:** nothing here has run a BUILD
+twice. "The same sources built twice give an identical tree" is a claim the
+comparison makes checkable, not a claim it has checked; and the composition
+(substrate → AOT → assemble → pack → compare) is exactly what `bl self-build`
+must add. Also carried: a stored pack fixture goes stale whenever the launcher is
+rebuilt (the launcher is the offset), which is how one comparison here first
+looked like nondeterminism — `:offset` is a field, so that shows up as a
+difference rather than a mystery.
