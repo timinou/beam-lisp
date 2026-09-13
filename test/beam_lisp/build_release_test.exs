@@ -165,6 +165,15 @@ defmodule BeamLisp.BuildReleaseTest do
 
     refute File.exists?(Path.join([@out, "lib", "beam_lisp-0.1.0", "priv", ".spell"])),
            "editor state must not be packaged"
+
+    # The priv MUST be real bytes, not the relative symlink Mix leaves in
+    # _build: a release that shipped the link would carry no `.bl` sources at
+    # all, and nothing in a boot test would notice — the beams run fine until
+    # the language needs to compile something.
+    priv = Path.join([@out, "lib", "beam_lisp-0.1.0", "priv"])
+    refute File.lstat!(priv).type == :symlink, "priv is a symlink, not a directory of sources"
+    assert File.exists?(Path.join(priv, "boot/compiler.bl")),
+           "the release must carry the language's own sources"
   end
 
   test "the gate: the tree boots, and the language runs in it", %{result: r} do

@@ -55,6 +55,37 @@ defmodule BeamLisp.Drop do
   @spec tail(binary, non_neg_integer) :: binary | nil
   def tail(path, n), do: call("tail", [path, n])
 
+  @doc "Every file under `root` as `[relative, absolute]`, in `drop pack`'s walk order."
+  @spec walk_files(binary) :: [list]
+  def walk_files(root), do: call("walk-files", [root])
+
+  @doc "The tar stream `drop pack` would write for a release directory."
+  @spec tar(binary) :: binary
+  def tar(root), do: call("tar", [root])
+
+  @doc "The gzip payload `drop pack` would write for a release directory."
+  @spec payload(binary) :: binary
+  def payload(root), do: call("payload", [root])
+
+  @doc "The gzip envelope (fixed header, raw deflate, crc32, isize) for `data`."
+  @spec gzip(binary) :: binary
+  def gzip(data), do: call("gzip", [data])
+
+  @doc "gunzip."
+  @spec gunzip(binary) :: binary
+  def gunzip(data), do: call("gunzip", [data])
+
+  @doc """
+  Seal `release` into a drop at `out`, using `launcher` as the prefix, for
+  target `os` (the trailer's tag: 0 linux, 1 macos, 2 windows).
+
+  Returns `%{ok?: true, out:, offset:, len:, sha:, errors: []}`, or
+  `%{ok?: false, errors: [reason]}` when the release carries no native object
+  for that target — the same refusal `drop pack` makes, for the same reason.
+  """
+  @spec pack(binary, binary, binary, integer) :: map
+  def pack(release, launcher, out, os \\ 0), do: call("pack", [release, launcher, out, os])
+
   defp call(name, args) do
     BeamLisp.Loader.ensure_loaded(@ns)
     BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, name), args)

@@ -204,7 +204,261 @@
                    (not= expected actual) "the payload's digest does not match the trailer"
                    :else nil)}))))
 
+; ── packing ────────────────────────────────────────────────────────────────
+;
+; `drop pack` (Rust) builds the payload as `gzip(tar(release-dir))` and a drop
+; is `launcher ⊕ payload ⊕ trailer`. Every shape here — the tar dialect, the
+; gzip envelope — was READ OUT of `tooling/drop/src/pack.rs` and the bytes it
+; produced, because the acceptance is byte-identity with that tool and it is
+; the only oracle.
+
+(def gzip-header "1f8b08000000000000ff")
+
+(defn gzip
+  "The gzip envelope flate2 writes for `drop pack`: a fixed 10-byte header
+   (mtime 0, XFL 0, OS 0xff — read off a real payload) + raw deflate + crc32 +
+   isize, both little-endian.
+
+   Erlang's `:zlib.compress/1` answers a ZLIB-wrapped stream, whose two-byte
+   header and four-byte adler32 wrap exactly the same deflate blocks, so the
+   raw stream is the middle — no separate raw-deflate API needed, and no
+   re-implementation of the compressor."
+  [data]
+  (let [z (zlib/compress data)
+        n (erlang/byte_size z)
+        raw (binary/part z 2 (- n 6))]
+    (erlang/iolist_to_binary
+      (list (Base/decode16 gzip-header (list (erlang/list_to_tuple (list :case :mixed))))
+            raw
+            (fixed-le (erlang/crc32 data) 4)
+            (fixed-le (erlang/byte_size data) 4)))))
+
+(defn gunzip [data] (zlib/gunzip data))
+
+; ── the tar ─────────────────────────────────────────────────────────────────
+
+(def block-size 512)
+
 (defn deref-trailer
   "The trailer's digest as lowercase hex."
   [c]
   (String/downcase (Base/encode16 (:sha (:trailer c)))))
+
+; ── packing ────────────────────────────────────────────────────────────────
+
+(defn gzip-header
+  "The 10 bytes flate2 writes: magic `1f 8b`, deflate, no flags, mtime 0, XFL 0,
+   OS 0xff (unknown) — read off a real payload rather than assumed."
+  []
+  (erlang/iolist_to_binary
+    (list (binary/encode_unsigned 31) (binary/encode_unsigned 139)
+          (binary/encode_unsigned 8) (binary/encode_unsigned 0)
+          (zeros 4) (binary/encode_unsigned 0) (binary/encode_unsigned 255))))
+
+(defn gzip
+  "The gzip envelope flate2 writes for `drop pack`: the fixed header above, raw
+   deflate, then crc32 and isize, both little-endian.
+
+   Erlang's `:zlib.compress/1` answers a ZLIB-wrapped stream, whose two-byte
+   header and four-byte adler32 wrap exactly the same deflate blocks, so the
+   raw stream is the middle — no raw-deflate API needed and no re-implementation
+   of a compressor."
+  [data]
+  (let [z (zlib/compress data)
+        n (erlang/byte_size z)
+        raw (binary/part z 2 (- n 6))]
+    (erlang/iolist_to_binary
+      (list (gzip-header) raw
+            (fixed-le (erlang/crc32 data) 4)
+            (fixed-le (erlang/byte_size data) 4)))))
+
+(defn gunzip [data] (zlib/gunzip data))
+
+; ── the tar ─────────────────────────────────────────────────────────────────
+
+(defn- zeros [n] (binary/copy (binary/encode_unsigned 0) n))
+
+(defn- pad-to
+  "`bin` followed by NUL bytes up to exactly `n`."
+  [bin n]
+  (let [k (- n (erlang/byte_size bin))]
+    (if (pos? k) (erlang/iolist_to_binary (list bin (zeros k))) bin)))
+
+(defn- octal-field
+  "`n` as `width` bytes: zero-padded octal and a NUL. The tar crate's
+   `octal_into` writes 7 digits + NUL into an 8-byte field (mode, uid, gid) and
+   11 + NUL into a 12-byte one (size, mtime)."
+  [n width]
+  (erlang/iolist_to_binary
+    (list (String/pad_leading (Integer/to_string n 8) (dec width) "0")
+          (binary/encode_unsigned 0))))
+
+(defn- checksum-field
+  "The checksum field. NOT the classic `6 digits + NUL + space`: the tar crate
+   writes it with `octal_into` like every other field (7 digits + NUL, observed
+   byte for byte), and a checksum is precisely the field a reader recomputes —
+   get its SHAPE wrong and every header is unreadable while every header we
+   write still agrees with itself."
+  [n]
+  (octal-field n 8))
+
+(defn tar-header
+  "The 512-byte GNU header `drop pack` writes for one entry: a FILE (mode 0755,
+   typeflag NUL) or the long-name entry (mode 0644, typeflag 'L').
+
+   Fixed by the oracle, not by taste: mode 0755 for every file (data files
+   included), mtime 0, uid/gid 0, empty uname/gname, the real size, a NUL
+   typeflag — NOT `'0'`, which is what GNU tar writes and what cost a byte of
+   checksum difference until the diff showed it — magic `ustar  \\0`, and
+   devmajor/devminor left as NUL bytes, whatever GNU tar itself would write.
+   The checksum is the sum of the header with its own field taken as spaces.
+
+   A name longer than the 100-byte field is TRUNCATED here (the full path
+   travels in a preceding `././@LongLink` entry, exactly as the crate does);
+   without that truncation the header stops being 512 bytes and every reader
+   rejects the archive — which is how the release tree, and only the release
+   tree, failed its first end-to-end pack."
+  [rel size mode typeflag]
+  (let [name-field (if (> (erlang/byte_size rel) 100) (binary/part rel 0 100) (pad-to rel 100))
+        draft (erlang/iolist_to_binary
+                (list name-field
+                      (octal-field mode 8)
+                      (octal-field 0 8)
+                      (octal-field 0 8)
+                      (octal-field size 12)
+                      (octal-field 0 12)
+                      (binary/copy " " 8)         ; the field, blanked
+                      (binary/encode_unsigned typeflag)  ; NUL for a file, 'L' for long
+                      (zeros 100)                    ; linkname
+                      "ustar  " (binary/encode_unsigned 0)
+                      (zeros 32) (zeros 32)          ; uname, gname
+                      (zeros 8) (zeros 8)            ; devmajor, devminor
+                      (zeros 155) (zeros 12)))       ; prefix, pad
+        sum (reduce + (erlang/binary_to_list draft))]
+    (erlang/iolist_to_binary
+      (list (binary/part draft 0 148) (checksum-field sum) (binary/part draft 156 356)))))
+
+(def file-mode 493)      ; 0o755, for every file
+(def long-name-mode 420) ; 0o644 — the crate's mode for the @LongLink entry only
+
+(defn- long-name-entry
+  "The GNU long-name entry: a `././@LongLink` header whose DATA is the path plus
+   a NUL, then padding. Only for paths over 100 bytes, and only because the
+   crate writes it — measured against a fixture with a 108-byte name."
+  [rel]
+  (let [name-bytes (erlang/iolist_to_binary (list rel (zeros 1)))
+        size (erlang/byte_size name-bytes)
+        pad (rem (- block-size (rem size block-size)) block-size)]
+    (erlang/iolist_to_binary
+      (list (tar-header "././@LongLink" size long-name-mode 76)  ; 76 = 'L'
+            name-bytes (zeros pad)))))
+
+(defn tar-entry
+  "One entry: the long-name entry when the path needs one, then the header, the
+   data, and NUL padding to the next 512-byte boundary."
+  [rel path]
+  (let [data (File/read! path)
+        size (erlang/byte_size data)
+        pad (rem (- block-size (rem size block-size)) block-size)
+        long (if (> (erlang/byte_size rel) 100) (long-name-entry rel) "")]
+    (erlang/iolist_to_binary
+      (list long (tar-header rel size file-mode 0) data (zeros pad)))))
+
+(defn- walk-into
+  "The walk itself: entries sorted at each level, a directory recursed the
+   moment it is met (which is what makes the order depth-first)."
+  [dir acc]
+  (reduce (fn [acc child]
+            (let [p (Path/join dir child)]
+              (if (File/dir? p) (walk-into p acc) (conj acc p))))
+          acc
+          (sort (File/ls! (Path/expand dir)))))
+
+(defn walk-files
+  "Every FILE under `root`, as `[relative-path absolute-path]`, in `drop pack`'s
+   order: depth-first and lexicographic — NOT \"all files sorted\", which would
+   order a directory's children against its siblings differently."
+  [root]
+  (map (fn [p] [(Path/relative_to p root) p]) (walk-into root [])))
+
+(defn tar
+  "The tar stream for a release directory: entries in walk order, then the two
+   512-byte zero blocks `Builder::finish` appends.
+
+   `into`/`Enum/to_list`, not `concat`: the result is handed to
+   `iolist_to_binary`, which needs a REAL list of iodata — a bl vector is a
+   struct, and a lazy sequence is neither."
+  [root]
+  (erlang/iolist_to_binary
+    (Enum/to_list
+      (into (vec (map (fn [e] (tar-entry (first e) (second e))) (walk-files root)))
+            [(zeros block-size) (zeros block-size)]))))
+
+(defn payload [root] (gzip (tar root)))
+
+; ── the packer ──────────────────────────────────────────────────────────────
+
+(defn os-magic
+  "The first bytes a native object must start with for a target OS: `drop pack`
+   refuses a release whose `.so`/`.dll` files do not match, because a drop
+   carrying the wrong platform's natives fails at RUN time on the far machine.
+   OS tags are the trailer's: 0 linux, 1 macos, 2 windows."
+  [os]
+  (cond
+    (= os 1) [(binary/encode_unsigned 207) (binary/encode_unsigned 250)
+              (binary/encode_unsigned 237) (binary/encode_unsigned 254)]
+    (= os 2) [(binary/encode_unsigned 77) (binary/encode_unsigned 90)]   ; "MZ"
+    :else [(binary/encode_unsigned 127)]                                  ; 0x7f, ELF
+    ))
+
+(defn native-object
+  "The first native object under `root` that matches `os`, or nil.
+
+   Only files whose extension is `so` or `dll` are considered, and only their
+   first bytes — the same narrow question the Rust packer asks (`\"MZ\"` for
+   Windows, the Mach-O magics for macOS, `0x7fELF` otherwise)."
+  [root os]
+  (let [want (os-magic os)]
+    (first (filter (fn [e]
+                     (let [name (str (first e))
+                           ext (String/downcase (Path/extname name))]
+                       (and (or (= ext ".so") (= ext ".dll"))
+                            (let [head (read-slice (second e) 0 4)]
+                              (and (some? head) (String/starts_with? head (apply str want)))))))
+                   (walk-files root)))))
+
+(defn pack
+  "Seal a release directory into a drop at `out`:
+   `launcher ⊕ gzip(tar(release)) ⊕ trailer`.
+
+   `launcher` is a STOCK launcher binary (or, in a running drop, its own first
+   `offset` bytes — `BL_BIN` gives the path). Written to `out.tmp` and renamed,
+   so a reader never sees half a drop, and chmod 0755 — the file exists to be
+   executed.
+
+   The native check is not decoration: `drop pack` refuses a release whose
+   native objects do not match the target (\"wrong release for this target?\"),
+   because a drop that carries the wrong platform's `.so` fails at RUN time on
+   the far machine. Same refusal here, same wording, before anything is
+   written."
+  [release launcher out os]
+  (let [want (os-magic os)]
+    (if (nil? (native-object release os))
+      {:ok? false :out out :offset 0 :len 0 :sha ""
+       :errors [(str "release payload has no native objects matching target os=" os
+                     " — wrong release for this target?")]}
+      (let [launcher-bytes (File/read! launcher)
+            body (payload release)
+            offset (erlang/byte_size launcher-bytes)
+            len (erlang/byte_size body)
+            sha (crypto/hash :sha256 body)
+            tmp (str out ".tmp")
+            bytes (erlang/iolist_to_binary
+                    (list launcher-bytes body
+                          (encode-trailer {:offset offset :len len :sha sha :os os :arch 0})))]
+        (File/write! tmp bytes)
+        (File/chmod! tmp 493)
+        (File/rename! tmp out)
+        {:ok? true :out out :offset offset :len len :errors []
+         :sha (String/downcase (Base/encode16 sha))}))))
+

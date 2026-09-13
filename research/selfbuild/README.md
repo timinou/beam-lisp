@@ -486,25 +486,36 @@ costs a seek and 56 bytes; verifying it streams the payload through
    front writes the number backwards — and the suite's self-consistency could
    never have caught it; only the packer's own bytes did.
 
-**NOT DONE: `bl pack`.** `launcher recovery from BL_BIN`, the tar, the gzip and
-`atomic install` are the rest of this wave, and the acceptance is byte-identity
-with `drop pack` on the same tree. The dialect, read out of
-`tooling/drop/src/pack.rs` (so the next step is transcription, not research):
+**LANDED — the packer, and the acceptance, observed.** `drop/pack/4` seals a
+release into a drop: launcher, `gzip(tar(release))` payload, trailer, written to
+`out.tmp` and renamed, chmod 0755, and the same native-object refusal `drop
+pack` makes (a release whose `.so` does not match the target is refused before
+anything is written).
 
-- the walk is depth-first with `read_dir` SORTED at every level, files only (no
-  directory entries); `rel` = the path relative to the release root;
-- every entry is a **GNU** header (`Header::new_gnu`, magic `ustar  \0` at 257):
-  `mode 0o755` for EVERY file (executables and data alike), `mtime 0`, `uid 0`,
-  `gid 0`, empty uname/gname, real size, `set_cksum` — which is 6 octal digits,
-  a NUL and a space, computed with the checksum field blanked;
-- data is padded to 512, and `finish()` writes the two 512-byte zero blocks;
-- gzip is `flate2`'s default compression (zlib level 6) — and the CONTAINER is
-  where byte-identity will actually be won or lost: XFL and the OS byte in the
-  gzip header come from the writer, not from deflate, so the honest route is to
-  build the gzip envelope by hand (`:zlib.deflate` with `windowBits: -15` for
-  raw deflate, then crc32 + isize) rather than to hope `:zlib.gzip/1` agrees
-  byte for byte;
-- `drop pack` takes `--launcher` (defaulting to `drop-launcher` next to the
-  running binary) and `--target`, so a from-the-language packer can reuse an
-existing launcher prefix and stay byte-identical for the other two thirds.
+| what | observed |
+|---|---|
+| **the end-to-end acceptance** | a drop packed BY THE LANGUAGE, sealed with the stock `drop-launcher`, RUNS: `<out> version` → `beam-lisp 0.1.0` |
+| **byte-identity of the tar** | the uncompressed tar equals `drop pack`'s byte for byte — 9728 B each — with a fixture file whose name is 108 bytes, over one 512-byte block, and with an empty file |
+| byte-identity of the payload | **DIFFERS** (1972 vs 1999 B): same tar, same 10-byte gzip header, different deflate stream. flate2 and Erlang's zlib are different compressors |
 
+So the acceptance holds for every part the language controls, and the part it
+does not is named: the last ~27 bytes live inside a deflate stream, and closing
+that gap means adopting flate2's compressor, not fixing a packer.
+
+**Four tar facts, all measured** (each wrong one failed differently):
+
+| fact | what it cost |
+|---|---|
+| typeflag is **NUL**, not `'0'` | 48 bytes of checksum difference; the field-by-field diff showed it |
+| the checksum field is **7 octal digits + NUL**, not the classic `6 + NUL + space` | a shape only the READER recomputes — a self-consistent writer looks fine while nothing else can read it |
+| a name over 100 bytes needs a `<././@LongLink` entry (mode **0644**, where files are 0755) and the real header carries the **truncated** name | the header stops being 512 bytes: the LAUNCHER rejected the release tree with `archive header checksum mismatch` while the 4-file fixture passed |
+| gzip's XFL/OS bytes come from the WRITER (`00`, `ff` for flate2) | the envelope is built by hand around the middle of `:zlib.compress`'s output |
+
+**A W4 DEFECT this wave found, fixed and pinned.** `copy-app!` copied Mix's
+`_build/<env>/lib/<app>/priv` — a RELATIVE symlink, `../../../../priv` — into the
+release, so the tree shipped a `priv` pointing at nothing: **the language's own
+`.bl` sources, absent from the drop that exists to carry them**, and invisible to
+the boot gate because the beams run fine until something needs to compile.
+`dereference_symlinks: true` now (as a keyword list — bl has no `key: value`
+argument syntax), and the release suite asserts `priv` is a real directory
+containing `boot/compiler.bl`.
