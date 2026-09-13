@@ -228,7 +228,7 @@ Three properties belong to the door rather than to any caller:
   source revision) means every edit mints a new one and the old one is garbage
   the moment the source moves on. `bl cache status` shows what a tree holds, per
   directory, and whether the total is over the cap (`BL_CACHE_MAX_MB`, default
-  512 MB); `bl cache prune [--max-mb N] [--dry-run]` deletes the OLDEST stores
+  2048 MB); `bl cache prune [--max-mb N] [--dry-run]` deletes the OLDEST stores
   first and never the newest, which is the one the run that just finished wrote.
   `bl search` prunes after it indexes, so the ceiling holds without anyone
   remembering it.
@@ -238,6 +238,19 @@ Three properties belong to the door rather than to any caller:
   code-16M-v2@75cf7a6c`), so a warm file is not sliced and the model is not
   called at all — and a NEW model refills the column without touching a fact.
   That column is why a warm run costs seconds rather than minutes.
+* **Several files at once.** One file's index is CPU-bound and touches nothing
+  shared, so `code.semantic/index!` analyzes up to four files in parallel and
+  MERGES them in input order. The seam is deliberate: an in-memory connection's
+  tables belong to the process that opened it and a store's writer is one
+  process, so workers analyze and the caller transacts. `$BL_INDEX_WORKERS`
+  moves the count (`1` is the serial path — the same code with a fan-out of
+  one). Measured on 10 cold files: 8869 ms serial against 6425 ms at four
+  workers — 1.4x, where four separate PROCESSES on the same files get 4x
+  (2443 + 1597 + 1894 + 2701 ms of index time, run concurrently). The serial
+  fraction is inside the VM rather than in the box, and that gap is filed
+  rather than papered over. A warm corpus does not care either way: the same
+  10 files index in 2377 ms.
+
 * **Banded ids.** Each source gets its own million-wide id band (`offset-for`),
   because `codebase/index-source` numbers entities from a fixed base and two
   files sharing a conn would otherwise silently overwrite each other.
@@ -327,8 +340,8 @@ $ bl search "read a file into lines" -p priv/lib/code -k 3     # everything cach
 3 of 48 functions in 2 files  (index 2534 ms · query 1214 ms · cached 2/2 · vectors 2/2)
 
 $ bl cache status
-  10 entries  65 MB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
-total 65 MB · cap 512 MB (under)
+  104 entries  36 MB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 36 MB · cap 2048 MB (under)
 ```
 
 `examples/code-semantic/01-search-by-meaning.bl` indexes eight real source files,

@@ -44,7 +44,7 @@
 ; combine it, not a reason to reach for it always.
 
 (ns code.semantic
-  (:require [code.embed] [codebase] [typed] [datom] [datom.vector]))
+  (:require [code.embed] [codebase] [typed] [datom] [datom.vector] [env]))
 
 ;; ── the schema: one more column ─────────────────────────────────────
 ;;
@@ -360,18 +360,7 @@
   ([conn ns-str path] (index-source! conn ns-str path 0 nil))
   ([conn ns-str path offset] (index-source! conn ns-str path offset nil))
   ([conn ns-str path offset root]
-  (let [src (File/read! path)
-        raw (cached-facts ns-str src root)
-        facts (shift-ids (:facts raw) offset)]
-    (datom/transact! conn facts)
-    {:file path :ns ns-str
-     :functions (count (fn-entities (:facts raw)))
-     :facts (count facts)
-     ; whether the ANALYSIS was a reopen or a fresh index, and whether the
-     ; VECTOR column had to be derived again: the two numbers that say whether
-     ; the cache earned anything on this run.
-     :analysis (if (:hit raw) :cached :indexed)
-     :vectors (:fn/embedding (:columns raw))})))
+   (merge-one conn offset (read-and-analyze ns-str path root))))
 
 (defn offset-for
   "The entity-id band source `i` (0-based) is indexed into.
@@ -390,6 +379,122 @@
   [i]
   (* (inc i) 1000000))
 
+;; ── several files at once ────────────────────────────────────────────
+;;
+;; One file's index is CPU-bound and touches nothing shared. The analyzer runs
+;; in this process; `code.embed`'s encode is a DirtyCpu NIF, so it yields its
+;; scheduler rather than blocking it; and a file's store is its OWN directory,
+;; so two files never contend for one lock. What does NOT parallelise is the
+;; CONNECTION — its tables belong to the process that opened it, and a store's
+;; writer is one process — so the seam is there: workers analyze, the caller
+;; merges. Keeping that seam also keeps the cache, the id bands, and the
+;; skip-handling to one implementation each.
+;;
+;; Not every core, either. Each worker holds one file's slice and its vectors,
+;; and this runs on a laptop that is usually busy with something else, where a
+;; wide fan-out buys latency for the run and takes it from everyone else.
+
+(def DEFAULT-WORKERS 4)
+(def MAX-WORKERS 16)
+
+; A worker that dies without reporting would otherwise hang the run for good.
+; Generous, because a big file legitimately takes minutes.
+(def WORKER-TIMEOUT-MS 900000)
+
+(defn workers-for
+  "How many files to analyze at once: `{:workers n}` when given, else
+   `DEFAULT-WORKERS` — never more than there are files, never more than
+   `MAX-WORKERS`, never fewer than one.
+
+   One IS the serial path: `fan-out` with a fan-out of one is `mapv`, so the
+   old behaviour is the same code rather than a second implementation kept
+   honest by hand."
+  ([n] (workers-for n {}))
+  ([n opts]
+   (let [asked (:workers opts)
+         asked (if (erlang/is_integer asked) asked DEFAULT-WORKERS)]
+     (max 1 (min asked n MAX-WORKERS)))))
+
+(defn- read-and-analyze
+  "One file's facts — analyzed or reopened — with the ids the STORE allocated.
+
+   Raises on a file it cannot read, which is what `index-source!` has always
+   done; `analyze-one` is the version that reports instead."
+  [ns-str path root]
+  (let [src (File/read! path)]
+    {:file path :ns ns-str :raw (cached-facts ns-str src root)}))
+
+(defn- analyze-one
+  "`read-and-analyze` as a worker reports it: never raises, because a raise in
+   another process has no caller left to catch it."
+  [ns-str path root]
+  (try
+    (read-and-analyze ns-str path root)
+    (catch e {:file path :skipped (ex-message e)})))
+
+(defn- merge-one
+  "The half that needs the connection: band the facts, commit them, report.
+
+   Separated from the analysis because it is the only part that cannot run in
+   a worker — see the note above `DEFAULT-WORKERS`."
+  [conn offset r]
+  (let [raw (:raw r)
+        facts (shift-ids (:facts raw) offset)]
+    (datom/transact! conn facts)
+    {:file (:file r) :ns (:ns r)
+     :functions (count (fn-entities (:facts raw)))
+     :facts (count facts)
+     ; whether the ANALYSIS was a reopen or a fresh index, and whether the
+     ; VECTOR column had to be derived again: the two numbers that say whether
+     ; the cache earned anything on this run.
+     :analysis (if (:hit raw) :cached :indexed)
+     :vectors (:fn/embedding (:columns raw))}))
+
+(defn- fan-out-collect
+  "See `fan-out`. Hands work out as workers REPORT, rather than in fixed bands:
+   file sizes differ by an order of magnitude and a band waits on its slowest
+   member."
+  [w n v me run next-i outstanding acc]
+  (let [started (min n (+ next-i (- w (count outstanding))))]
+    (doseq [i (range next-i started)] (spawn (fn [] (run i))))
+    (let [outstanding (into outstanding (range next-i started))]
+      (if (and (>= next-i started) (empty? outstanding))
+        acc
+        (receive
+          [i res] (fan-out-collect w n v me run
+                                   (max next-i started) (disj outstanding i)
+                                   (assoc acc i res))
+          ; Nobody reported. The run finishes with what it has and SAYS what it
+          ; lost: a lost worker is a skipped file, exactly like an unreadable
+          ; one, never a hang.
+          (after WORKER-TIMEOUT-MS
+                 (reduce (fn [a i]
+                           (assoc a i {:file (get (get v i) 1)
+                                       :skipped "the worker did not report"}))
+                         acc
+                         outstanding)))))))
+
+(defn- fan-out
+  "`f` over `xs` with at most `w` in flight, results in INPUT ORDER.
+
+   Order is not a nicety here: `index!` gives source `i` the band `(offset-for
+   i)`, so an index is only reproducible while position and band stay married.
+   With one worker this is `mapv`.
+
+   The worker body is CONVEYED, not merely spawned: env bindings do not cross
+   a process boundary on their own, and the store's directory is derived from
+   values the caller held — a worker that resolved those itself could write to
+   a different tier and nobody would notice until a run failed to warm."
+  [w f xs]
+  (let [v (vec (to-list xs))
+        n (count v)]
+    (if (<= w 1)
+      (mapv f v)
+      (let [me (erlang/self)
+            run (env/convey (fn [i] (erlang/send me [i (f (get v i))])))
+            acc (fan-out-collect w n v me run 0 #{} {})]
+        (mapv (fn [i] (get acc i)) (range n))))))
+
 (defn index!
   "Index a whole codebase. `sources` is a seq of `[ns-string path]` pairs —
    the shape the MCP code surface already mounts.
@@ -400,7 +505,9 @@
    rather than of each caller's own loop.
 
    Each file is given its own id band, a million apart, so a set of sources
-   lands in one conn without collision.
+   lands in one conn without collision. Files are analyzed by up to
+   `(workers-for n opts)` workers and merged in input ORDER, so two runs over
+   one corpus agree byte for byte.
 
    Returns one result per source, in the order given. A source the analyzer
    cannot read yields `{:file path :skipped reason}` instead of aborting the
@@ -409,15 +516,15 @@
    not REPORTED is a smaller index that looks complete."
   ([conn sources] (index! conn sources {}))
   ([conn sources opts]
-  (let [root (:root opts)]
-    (into []
-          (map-indexed
-            (fn [i pair]
-              (let [path (get pair 1)]
-                (try
-                  (index-source! conn (get pair 0) path (offset-for i) root)
-                  (catch e {:file path :skipped (ex-message e)}))))
-            (to-list sources))))))
+   (let [root (:root opts)
+         v (vec (to-list sources))
+         w (workers-for (count v) opts)
+         parts (fan-out w (fn [pair] (analyze-one (get pair 0) (get pair 1) root)) v)]
+     (into []
+           (map-indexed
+             (fn [i r]
+               (if (:skipped r) r (merge-one conn (offset-for i) r)))
+             parts)))))
 
 (defn ns-of-file
   "The `(ns …)` name declared in `path` — the namespace a file's facts are
