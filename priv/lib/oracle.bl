@@ -111,8 +111,32 @@
 
 (defn- ->tuple [k v] (erlang/list_to_tuple (to-list [k v])))
 
+(def ^:private memo-key :oracle-memo-on)
+
 (defn memo-clear! [] (when (not= :undefined (ets/info memo-tab)) (ets/delete_all_objects memo-tab)) :ok)
 (defn memo-size [] (if (= :undefined (ets/info memo-tab)) 0 (ets/info memo-tab :size)))
+
+(defn memo-on!
+  "Answer an identical script from memory instead of the solver. SOUND for `ask`,
+   which always sends a COMPLETE script (declarations + assertions + check): the
+   same bytes have the same answer. A conversation (`scoped`) is never memoised —
+   its meaning depends on the state the caller built."
+  [] (erlang/put memo-key true) :on)
+
+(defn memo-off! [] (erlang/put memo-key false) :off)
+
+;; UNset means ON: the memo is sound for `ask` (a complete script has one answer),
+;; so the default is to use it and `memo-off!` is the deliberate exception.
+(defn memo-on? [] (let [v (erlang/get memo-key)] (if (or (nil? v) (= :undefined v)) true (if (= v false) false true))))
+
+(defn with-memo
+  "Run `f` with the memo on or off, restoring the previous setting."
+  [on? f]
+  (let [prev (erlang/get memo-key)]
+    (erlang/put memo-key on?)
+    (try (f) (finally (erlang/put memo-key prev)))))
+
+(defn memo-stats [] {:entries (memo-size) :on (memo-on?)})
 
 ;; ── L6: the oracle as an EFFECT ──────────────────────────────────────────
 ;;
@@ -121,9 +145,12 @@
 ;; engine (core.bl) calls `ask` and never knows which.
 
 (def ^:private handler-key :oracle-handler)
+(def ^:private session-prelude-key :oracle-session-prelude)
 
-(defn- pool-handler
-  "The real oracle: one leased conversation per question (today's `z3/check`)."
+(defn pool-handler
+  "The DEFAULT handler: the real oracle, one leased conversation per question.
+   Public because a test that counts asks wraps it — the instrument is the same
+   thing the system uses."
   [text model?]
   (z3pool/check text model?))
 
@@ -147,6 +174,16 @@
 ;; `erlang/get` answers :undefined for an unset key — not nil — so `or` is wrong here.
 (defn- handler [] (let [h (erlang/get handler-key)] (if (or (nil? h) (= :undefined h)) pool-handler h)))
 
+(defn- custom-handler?
+  "True when someone is HANDLING the oracle — the session path must route through
+   the handler too, or `with-oracle` would be a lie for the engine (measured: a
+   table handler intercepted `ask` and the engine's sessions went to z3 anyway)."
+  []
+  (let [h (erlang/get handler-key)]
+    (not (or (nil? h) (= :undefined h)))))
+
+(defn- prelude-text [] (let [p (erlang/get session-prelude-key)] (if (= :undefined p) "" (or p ""))))
+
 (defn- now-us [] (erlang/monotonic_time :microsecond))
 
 (defn ask
@@ -156,18 +193,21 @@
   ([obl model?]
    (let [text (:text obl)
          k (:key obl)
-         hit (ets/lookup (memo!) k)]
+         hit (if (memo-on?) (ets/lookup (memo!) k) (to-list []))]
      (if (and (seq hit) (not model?))
        (let [v (erlang/element 2 (first hit))]
-         (BeamLisp.Z3.Ledger/record (:frag obl) :memo (name (:status v)))
+         (BeamLisp.Z3.Ledger/record (:frag obl) :memo (name (:status v)) 0)
          (assoc v :tier :memo :us 0))
        (let [t0 (now-us)
              raw ((handler) text model?)
              v (verdict raw :z3 (- (now-us) t0))]
-         (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)))
+         (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)) (:us v))
          ;; only a real answer is cached: `unknown` is not one (the ceiling), and
          ;; `error` is a transport failure that must not stick to the script.
-         (when (or (proven? v) (refuted? v)) (ets/insert memo-tab (->tuple k v)))
+         ;; `(memo!)`, not the bare name: the insert is what must create the table
+         ;; when a memo-OFF lookup skipped that step above (it did not, and the
+         ;; insert raised ArgumentError — measured).
+         (when (or (proven? v) (refuted? v)) (ets/insert (memo!) (->tuple k v)))
          v)))))
 
 ;; ── L4: a conversation by default ────────────────────────────────────────
@@ -180,21 +220,37 @@
 ;; pop: ~0.1 ms at the solver.
 
 (defn session
-  "Hold one solver, declare `prelude` once, run `f` — inside it use `scoped`."
+  "Hold one solver, declare `prelude` once, run `f` — inside it use `scoped`.
+
+   When a HANDLER is installed, `f` never touches a solver: each `scoped` sends the
+   prelude + its own commands to the handler as one script, so a table (or `deny`)
+   answers the engine's questions exactly as it answers a bare `ask`."
   [prelude f]
-  (z3pool/with-solver
-    (fn []
-      (z3pool/command (smtlib/script prelude))
-      (f))))
+  (let [text (smtlib/script prelude)
+        prev (erlang/get session-prelude-key)]
+    (erlang/put session-prelude-key text)
+    (try
+      (if (custom-handler?)
+        (f)
+        (z3pool/with-solver
+          (fn []
+            (z3pool/command text)
+            (f))))
+      (finally (if (= :undefined prev) (erlang/erase session-prelude-key) (erlang/put session-prelude-key prev))))))
 
 (defn scoped
   "One question inside a session: push, assert `cmds`, check, pop → verdict."
   ([obl] (scoped obl false))
   ([obl model?]
    (let [t0 (now-us)
-         raw (z3pool/scoped (:text obl) model?)
+         ;; with a HANDLER installed, the question is the whole script (the prelude
+         ;; the session put in the process dictionary + this scope's commands), so a
+         ;; table or `deny` answers the engine exactly as it answers a bare `ask`
+         raw (if (custom-handler?)
+               ((handler) (str (prelude-text) "\n" (:text obl)) model?)
+               (z3pool/scoped (:text obl) model?))
          v (verdict raw :z3 (- (now-us) t0))]
-     (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)))
+     (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)) (:us v))
      v)))
 
 (defn here-verdict
@@ -209,7 +265,7 @@
          v (verdict raw :z3 (- (now-us) t0))]
      ;; `:general` — a conversation check is not a classified fragment, and the
      ;; bucket that disables the witness rung is the honest one for it
-     (BeamLisp.Z3.Ledger/record :general :z3 (name (:status v)))
+     (BeamLisp.Z3.Ledger/record :general :z3 (name (:status v)) (:us v))
      v))
   ([] (here-verdict {})))
 
