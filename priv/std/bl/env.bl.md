@@ -106,7 +106,7 @@ one.
 
 ## The shape
 
-A project map declares five keys. Anything else is reported as an unknown key
+A project map declares nine keys. Anything else is reported as an unknown key
 rather than ignored, because a typo'd key that silently does nothing is the
 worst kind of configuration bug.
 
@@ -116,13 +116,63 @@ worst kind of configuration bug.
   :watch BOOL}`.
 - `:ports` — name → a port number, or `{:port N}` (`0` = the OS chooses).
 - `:env` — name → value, the environment the tree expects.
+- `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
+  application, so a build need not interrogate the running VM about itself.
+- `:build` — `{:paths :seed :out :native :jobs :ex}`: which roots hold build
+  sources, where the output goes, which crates are native, how wide to compile.
+  `:ex :exclude` holds paths RELATIVE TO `:ex :root`, since that is what they are
+  matched against.
+- `:release` — `{:name :vsn :output :permanent :include :cookie :env}`: what to
+  assemble, and what must be permanent in it.
+- `:deps` — `[{:name :vsn} …]`: what this tree requires. The digests a
+  resolution produced live in `bl.lock`, not here, so the declaration cannot
+  disagree with itself.
 
 Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp
-(def known-keys [:name :paths :tasks :ports :env :doc])
+(def known-keys [:name :paths :tasks :ports :env :doc
+                 :app :build :release :deps])
+
+(defn- unknown-keys
+  "The keys of `m` that nothing declares."
+  [m known]
+  (if (map? m)
+    (filter (fn [k] (not (some (fn [x] (= x k)) known))) (keys m))
+    []))
+
+(defn- unknown-errs
+  "One error string per undeclared key, naming where it was found."
+  [m known what]
+  (map (fn [k] (str what " has unknown key " k)) (unknown-keys m known)))
+
+(defn- norm-atoms
+  "A list of names read as atoms, or [] with an error. nil is absence."
+  [v what]
+  (cond
+    (nil? v) [[] []]
+    (and (vector? v) (every? (fn [x] (or (keyword? x) (string? x))) v))
+    [(map (fn [x] (if (keyword? x) x (keyword x))) v) []]
+    :else [[] [(str what " must be a list of names")]]))
+
+(defn- norm-names
+  "A list of strings that are NAMES matched against a path RELATIVE to a root
+   (`:build :ex :exclude`), so expanding them would make them match nothing."
+  [v what]
+  (cond
+    (nil? v) [[] []]
+    (and (vector? v) (every? (fn [x] (string? x)) v)) [v []]
+    :else [[] [(str what " must be a list of strings")]]))
+
+(defn- norm-opt-string
+  "A string made absolute against `root`, or nil. Absence is not an error."
+  [v what root]
+  (cond
+    (nil? v) [nil []]
+    (string? v) [(Path/expand v root) []]
+    :else [nil [(str what " must be a string")]]))
 
 (defn- key-name
   "A declaration's key as the STRING a command is typed with: `bl dev` looks up
@@ -195,11 +245,147 @@ problems reports all three in one pass.
       (keys v))
     :else [{} [":ports must be a map of name → port"]]))
 
-(defn- norm-env [v]
+(defn- norm-env
+  "A name → string map. The label names the key it came from, so an error says
+   WHERE the problem is."
+  [v what]
   (cond
     (nil? v) [{} []]
     (and (map? v) (every? (fn [k] (string? (get v k))) (keys v))) [v []]
-    :else [{} [":env must be a map of name → string"]]))
+    :else [{} [(str what " must be a map of name → string")]]))
+```
+
+```beam-lisp
+(defn- norm-app
+  "`:app` — what this tree IS as an OTP application, or nil for a tree that does
+   not claim to be one. A missing `:mod` is a library, not an error."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":app must be a map"]]
+    :else
+      (let [mod (:mod v)
+            modv (if (map? mod) {:name (:name mod) :start (:start mod)} nil)
+            errs (concat
+                   (if (or (nil? (:name v)) (string? (:name v))) []
+                       [":app :name must be a string"])
+                   (if (or (nil? (:vsn v)) (string? (:vsn v))) []
+                       [":app :vsn must be a string"])
+                   (if (or (nil? mod) (map? mod)) []
+                       [":app :mod must be a map"])
+                   (if (or (nil? mod) (not (map? mod)) (string? (:name mod))) []
+                       [":app :mod needs :name, a string"])
+                   (if (map? mod) (unknown-errs mod [:name :start] ":app :mod") [])
+                   (unknown-errs v [:name :vsn :applications :mod] ":app"))]
+        [(if (empty? errs)
+           {:name (:name v)
+            :vsn (:vsn v)
+            :applications (first (norm-atoms (:applications v) ":app :applications"))
+            :mod modv}
+           nil)
+         errs])))
+
+(defn- norm-build
+  "`:build` — where build sources live and where their output goes. Paths are
+   absolute against the project root, like every other path here."
+  [v root]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":build must be a map"]]
+    :else
+      (let [[paths perr]  (norm-strings (:paths v) ":build :paths" root)
+            [native nerr] (norm-strings (:native v) ":build :native" root)
+            [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
+            [out oerr]    (norm-opt-string (:out v) ":build :out" root)
+            jobs          (:jobs v)
+            jerr          (if (or (nil? jobs) (erlang/is_integer jobs)) []
+                              [":build :jobs must be a number"])
+            ex            (:ex v)
+            [exv exerr]
+            (cond
+              (nil? ex) [nil []]
+              (not (map? ex)) [nil [":build :ex must be a map"]]
+              :else
+                (let [[r rerr] (norm-opt-string (:root ex) ":build :ex :root" root)
+                      [x xerr] (norm-names (:exclude ex) ":build :ex :exclude")]
+                  [{:root r :exclude x}
+                   (concat rerr xerr
+                           (unknown-errs ex [:root :exclude] ":build :ex"))]))
+            errs (concat perr nerr serr oerr jerr exerr
+                         (unknown-errs v [:paths :seed :out :native :jobs :ex] ":build"))]
+        [(if (empty? errs)
+           {:paths paths
+            :seed seed
+            :out out
+            :native native
+            :jobs (or jobs 1)
+            :ex exv}
+           nil)
+         errs])))
+
+(defn- norm-release
+  "`:release` — what to assemble: the release's name and version, where it goes,
+   what must be permanent in it, and the environment its nodes expect.
+
+   `:cookie :inherit` is the measured default for a self-build: a drop that
+   invents a fresh cookie each generation differs from the one before by exactly
+   one file, which is enough to break a fixpoint."
+  [v root]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":release must be a map"]]
+    :else
+      (let [[out oerr]  (norm-opt-string (:output v) ":release :output" root)
+            [perm nerr] (norm-atoms (:permanent v) ":release :permanent")
+            [inc ierr]  (norm-atoms (:include v) ":release :include")
+            [env eerr]  (norm-env (:env v) ":release :env")
+            ck          (:cookie v)
+            cerr        (cond
+                          (nil? ck) []
+                          (= ck :inherit) []
+                          (string? ck) []
+                          :else [":release :cookie must be a string or :inherit"])
+            errs (concat
+                   (if (or (nil? (:name v)) (string? (:name v))) []
+                       [":release :name must be a string"])
+                   (if (or (nil? (:vsn v)) (string? (:vsn v))) []
+                       [":release :vsn must be a string"])
+                   oerr nerr ierr eerr cerr
+                   (unknown-errs v [:name :vsn :output :permanent :include :cookie :env]
+                                 ":release"))]
+        [(if (empty? errs)
+           {:name (:name v)
+            :vsn (:vsn v)
+            :output out
+            :permanent perm
+            :include inc
+            :cookie ck
+            :env env}
+           nil)
+         errs])))
+
+(defn- norm-deps
+  "`:deps` — the libraries this tree requires, as a list of `{:name :vsn}`. A
+   digest does not belong here: digests are what RESOLUTION produced, and they
+   live in `bl.lock`, so the declaration cannot disagree with itself."
+  [v]
+  (cond
+    (nil? v) [[] []]
+    (not (vector? v)) [[] [":deps must be a list of {:name :vsn}"]]
+    :else
+      (reduce
+        (fn [acc d]
+          (let [errs (if (map? d)
+                       (concat
+                         (if (string? (:name d)) [] ["a dep needs :name, a string"])
+                         (if (string? (:vsn d)) [] ["a dep needs :vsn, a string"])
+                         (unknown-errs d [:name :vsn] "a dep"))
+                       ["a dep must be a map"])]
+            (if (empty? errs)
+              [(conj (nth acc 0) {:name (:name d) :vsn (:vsn d)}) (nth acc 1)]
+              [(nth acc 0) (concat (nth acc 1) errs)])))
+        [[] []]
+        v)))
 ```
 
 `normalize` assembles the value the runtime holds. It is total too: `:errors` is
@@ -217,10 +403,11 @@ shape, whatever the file said.
         nerr           (if (or (nil? nm) (string? nm)) [] [":name must be a string"])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
-        [env eerr]     (norm-env (:env m))
-        unknown        (filter
-                         (fn [k] (not (some (fn [known] (= known k)) known-keys)))
-                         (keys m))]
+        [env eerr]     (norm-env (:env m) ":env")
+        [app aerr]     (norm-app (:app m))
+        [bld berr]     (norm-build (:build m) root)
+        [rel rerr]     (norm-release (:release m) root)
+        [deps derr]    (norm-deps (:deps m))]
     {:path path
      :root root
      :name (if (string? nm) nm nil)
@@ -228,14 +415,19 @@ shape, whatever the file said.
      :tasks tasks
      :ports ports
      :env env
-     :errors (concat perr nerr terr porerr eerr
-                     (map (fn [k] (str "unknown key " k)) unknown))}))
+     :app app
+     :build bld
+     :release rel
+     :deps deps
+     :errors (concat perr nerr terr porerr eerr aerr berr rerr derr
+                     (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :paths [] :tasks {} :ports {} :env {} :errors []})
+  {:path nil :root root :name nil :paths [] :tasks {} :ports {} :env {}
+   :app nil :build nil :release nil :deps [] :errors []})
 ```
 
 ## The project value for a directory
