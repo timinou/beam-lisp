@@ -315,3 +315,61 @@ FORK runner (order/seed dependent — the same machinery whose seed-order flake
 over: 1 failure in 4 runs is the only evidence there is, and it is not enough
 to claim a rate.
 
+
+## W3 — the Elixir substrate compiles in-process (landed)
+
+**The change.** `priv/build/substrate.bl` (driver tier, so tier-keyed like its
+siblings) plus `BeamLisp.Substrate` as its Elixir call surface. `mix compile`
+builds two things — the Elixir sources in `lib/` with mix's own `:elixir`
+compiler, and the `.bl` sources with this project's task. The drop must do both
+with no Mix project, no `_build` and no `MIX_ENV`; Elixir's compiler and
+`Kernel.ParallelCompiler` ship in the payload (W0/P2 measured 86 modules in
+9.9 s with Mix absent), so the substrate is just another STAGE.
+
+- Facts: `[:build/ex path content-hash [module …]]`, in the SAME log as the
+  AOT waves, so one replay answers for both.
+- Freshness: the content hash — plus the recorded MODULE LIST, which is what
+  makes a beam that vanished (or a half-extracted tree) pull its own source
+  back into the build. That is W1-R1's hole, closed here by construction.
+- Attribution: every compiled module reports the file it came from in
+  `module_info(:compile)`. That is what lets the whole set compile in ONE batch
+  (which is what the parallel compiler needs in order to resolve cross-file
+  dependencies itself) and still record a fact PER FILE, so one edited file
+  recompiles alone.
+- `build/run` gained `:ex {:root "lib" :exclude ["dev" "mix"]}`; the stage runs
+  BEFORE the `.bl` waves (a `.bl` source may call into it) and its errors are a
+  REPORT, not a barrier. `:ex-built` is in the run's result.
+
+**Observed** (`test/beam_lisp/build_substrate_test.exs`, and the driver's own
+suite):
+
+| what | observed |
+|---|---|
+| the project's own substrate | `lib/` minus `dev/`, `mix/` → every module, one fact per source, **no `Elixir.Mix.beam` in the output** |
+| a second pass | compiles NOTHING (fresh by hash) |
+| a body edit | exactly one file stale, one compiled |
+| a deleted beam | its source is stale again — the hash alone would have called it done forever |
+| a file that will not compile | reported with file:line, records NO fact, so it stays stale and the next run retries |
+| integration | `build/run` with `:ex`: `:ex-built 1` then `0`, `[:build/ex …]` in the same log, one entry in the state's `:ex` |
+
+**Three API facts the probes and the first failures earned** (all now comments):
+
+1. `Kernel.ParallelCompiler` walks its file argument as an **Erlang list**; a bl
+   vector is a struct, so handing it one dies inside the compiler's own
+   `[file | queue]` clauses. `Enum/to_list` at that boundary.
+2. The parallel compiler now **requires** `return_diagnostics: true` (the raw
+   `{file, {line, col}, msg}` tuples are deprecated), and then an error is a
+   `%Code.Diagnostic{}` — a MAP. `error-message` reads either shape.
+3. The stage's root is the SOURCE root (`lib`), with exclusions RELATIVE to it —
+   `**/*.ex` from the project root picks up `deps/` too (`deps/abnf_parsec`
+   failed the first real run, from inside its own module body).
+
+**Acceptance, honestly split.** G3 has two halves. *Produces the full ebin with
+no mix* is MET for the stage: the whole `lib/` minus the two Mix-carrying roots
+compiles in-process, and W0/P2 is the evidence that the compile needs no Mix
+module at all (this test VM has Mix loaded, so the test asserts the artifact and
+the absence of any Mix beam rather than the absence of the Mix module). *The
+ExUnit suite passes against those beams* is a RELEASE-tree property — it needs
+W4's assembly to be meaningful (a tree whose code path is the substrate's, with
+no mix on it), and is scheduled there.
+

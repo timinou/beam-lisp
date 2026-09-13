@@ -201,6 +201,17 @@ The log is also the build's QUERY SURFACE, which a manifest could never be:
 `:deps`), and `build-log/coverage` (how much of the plan the log accounts for,
 and which facts are missing). `BeamLisp.BuildLog` is the Elixir call surface.
 
+A run also carries an optional ELIXIR SUBSTRATE stage (`priv/build/substrate.bl`,
+`[:build/ex path hash [modules]]` facts in the same log): `lib/**/*.ex` minus
+the Mix-task shells and the dev server, compiled in ONE
+`Kernel.ParallelCompiler` batch — one batch, because the parallel compiler
+resolves cross-file dependencies itself, and still a FACT PER FILE, because
+every compiled module reports the file it came from in its compile info.
+Freshness is the content hash, and the module list is recorded so a beam that
+vanished pulls its own source back into the build. This is the stage that lets
+the shipped `bl` compile a project's Elixir sources with no Mix project, no
+`_build` and no `MIX_ENV` — Elixir's compiler ships in the payload.
+
 The same function has two shells, and neither decides anything:
 
 - `mix compile.beam_lisp` — flag parsing, the project's compile and manifest
