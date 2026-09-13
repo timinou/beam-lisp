@@ -54,7 +54,13 @@ defmodule BeamLisp.Z3.Ledger do
     bump(fragment)
     bump(tier)
     bump(:total)
-    Process.put({__MODULE__, :here}, [{fragment, tier} | Process.get({__MODULE__, :here}, [])])
+    # A MAP, not a tuple: the trail is read from beam-lisp, and there `(get tuple 1)`
+    # returns nil (an Elixir tuple is not indexable from the language), which made
+    # tier-for fall through to its default. Atom keys on a plain map read fine — the
+    # z3 results have been read that way all along.
+    Process.put({__MODULE__, :here}, [
+      %{fragment: fragment, tier: tier} | Process.get({__MODULE__, :here}, [])
+    ])
     :ok
   end
 
