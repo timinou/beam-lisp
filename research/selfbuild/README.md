@@ -456,3 +456,55 @@ beam_lisp's own compile task — because `copy-app!` copies the `ebin` as built.
 They are dead in a release (no Mix) and vanish when the cutover deletes
 `lib/mix`; the fix belongs to the wave that removes those sources.
 
+
+## W5 — the compound codec (landed); the packer's byte dialect (read, not built)
+
+**Landed.** `priv/build/drop.bl` + `BeamLisp.Drop`: `parse-trailer`,
+`encode-trailer`, `compound`, `verify`, `target`, plus the streaming hashing a
+launcher needs. A drop is `launcher ⊕ payload ⊕ trailer`, and the trailer is
+self-describing — 56 bytes at EOF: `offset u64 LE`, `len u64 LE`, `sha256 32B`,
+`os u8`, `arch u8`, `version u16 LE`, magic `DRP1`. Reading a 100 MB compound
+costs a seek and 56 bytes; verifying it streams the payload through
+`:crypto.hash_update/2` in 1 MB chunks.
+
+| what | observed |
+|---|---|
+| **the acceptance, in one line** | the golden trailer of a real `drop pack` compound decodes to its fields AND re-encoding them gives the SAME 56 bytes |
+| the real 103 MB compound | `BL_COMPOUND=…/bl mix test` → the streamed digest equals the digest the packer stored, and `offset+len+56` equals the file size |
+| truncation vs corruption | a synthetic compound, cut and then corrupted: the cut fails the ARITHMETIC, the corruption fails the DIGEST, and each reports which |
+| not a drop | random bytes → `nil`, never an exception (a launcher asks this of arbitrary files) |
+
+**Three interop facts earned by failing** (all now comments):
+
+1. `erlang/x/y` resolves as `:erlang."x/y"` — other Erlang modules take the
+   BARE form (`binary/part`, `crypto/hash`, `file/pread`), which is what the
+   rest of the tree already did.
+2. **`count` on binary data is not its size**: a 56-byte trailer counts 55. Byte
+   arithmetic uses `erlang/byte_size`; an off-by-N here is a wrong digest.
+3. For a LITTLE-ENDIAN field the padding belongs at the END
+   (`:binary.encode_unsigned/1` answers with the minimal width). Padding in
+   front writes the number backwards — and the suite's self-consistency could
+   never have caught it; only the packer's own bytes did.
+
+**NOT DONE: `bl pack`.** `launcher recovery from BL_BIN`, the tar, the gzip and
+`atomic install` are the rest of this wave, and the acceptance is byte-identity
+with `drop pack` on the same tree. The dialect, read out of
+`tooling/drop/src/pack.rs` (so the next step is transcription, not research):
+
+- the walk is depth-first with `read_dir` SORTED at every level, files only (no
+  directory entries); `rel` = the path relative to the release root;
+- every entry is a **GNU** header (`Header::new_gnu`, magic `ustar  \0` at 257):
+  `mode 0o755` for EVERY file (executables and data alike), `mtime 0`, `uid 0`,
+  `gid 0`, empty uname/gname, real size, `set_cksum` — which is 6 octal digits,
+  a NUL and a space, computed with the checksum field blanked;
+- data is padded to 512, and `finish()` writes the two 512-byte zero blocks;
+- gzip is `flate2`'s default compression (zlib level 6) — and the CONTAINER is
+  where byte-identity will actually be won or lost: XFL and the OS byte in the
+  gzip header come from the writer, not from deflate, so the honest route is to
+  build the gzip envelope by hand (`:zlib.deflate` with `windowBits: -15` for
+  raw deflate, then crc32 + isize) rather than to hope `:zlib.gzip/1` agrees
+  byte for byte;
+- `drop pack` takes `--launcher` (defaulting to `drop-launcher` next to the
+  running binary) and `--target`, so a from-the-language packer can reuse an
+existing launcher prefix and stay byte-identical for the other two thirds.
+
