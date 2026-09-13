@@ -57,8 +57,15 @@ defmodule BeamLisp.Z3.Ledger do
     :ok
   end
 
-  @doc "Record one decision: the question's `fragment` and the `tier` that answered."
-  def record(fragment, tier) do
+  @doc """
+  Record one decision: the question's `fragment`, the `tier` that answered, and the
+  `status` it answered WITH — `sat`, `unsat`, or `unknown`.
+
+  The status is half the record. The tier says WHO answered; the status says
+  whether there was an answer at all, and `unknown` collapsed into a boolean is how
+  a machine whose invariant holds came to be reported as violated (FUP-058).
+  """
+  def record(fragment, tier, status \\ nil) do
     start()
     bump(fragment)
     bump(tier)
@@ -68,7 +75,7 @@ defmodule BeamLisp.Z3.Ledger do
     # tier-for fall through to its default. Atom keys on a plain map read fine — the
     # z3 results have been read that way all along.
     Process.put({__MODULE__, :here}, [
-      %{fragment: fragment, tier: tier} | Process.get({__MODULE__, :here}, [])
+      %{fragment: fragment, tier: tier, status: status} | Process.get({__MODULE__, :here}, [])
     ])
     :ok
   end
@@ -80,6 +87,18 @@ defmodule BeamLisp.Z3.Ledger do
   def clear_here do
     Process.put({__MODULE__, :here}, [])
     :ok
+  end
+
+  @doc """
+  The decisions in this process's trail that the solver could NOT decide.
+
+  `unknown` is an answer about the SOLVER, not about the question: a fragment it
+  cannot decide, or a ceiling it hit. Read as a boolean it becomes "not proved",
+  and the verifier renders "not proved" as "violated" — so this is what the
+  boundary asks before it lets a verdict out.
+  """
+  def undecided do
+    here() |> Enum.filter(&(to_string(&1[:status]) == "unknown"))
   end
 
   @doc "The rollup, zeroes included so a missing tier is visibly zero."

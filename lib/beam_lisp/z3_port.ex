@@ -30,23 +30,31 @@ defmodule BeamLisp.Z3Port do
   @default_read_timeout 20_000
 
   @doc """
+  A positive integer from the environment, or `default`.
+
+  ONE rule for every bound in this path: a missing, non-numeric or non-positive
+  value falls back rather than disarming the deadline it exists to enforce.
+  """
+  def env_ms(name, default) do
+    case System.get_env(name) do
+      nil ->
+        default
+
+      raw ->
+        case Integer.parse(raw) do
+          {n, ""} when n > 0 -> n
+          _ -> default
+        end
+    end
+  end
+
+  @doc """
   How long a single read from z3 may take, in ms.
 
   `BL_Z3_READ_TIMEOUT` moves it; a missing, non-numeric or non-positive value
   falls back to the default rather than disarming the read.
   """
-  def read_timeout do
-    case System.get_env("BL_Z3_READ_TIMEOUT") do
-      nil ->
-        @default_read_timeout
-
-      raw ->
-        case Integer.parse(raw) do
-          {n, ""} when n > 0 -> n
-          _ -> @default_read_timeout
-        end
-    end
-  end
+  def read_timeout, do: env_ms("BL_Z3_READ_TIMEOUT", @default_read_timeout)
 
   # z3 answers `(echo "…")` with the string alone (verified against the pinned
   # binary), which makes it a reliable sync marker: a command is acknowledged on
