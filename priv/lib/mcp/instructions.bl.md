@@ -88,13 +88,13 @@ slots between two existing ones without renumbering.
     :instr/for "mcp" :instr/kind :onboarding :instr/order 50
     :instr/title "Two tools no indexer has"
     :instr/text
-    "code/verify takes the source of a defserver carrying ^{:invariant …} and PROVES the invariant with z3 — verdict: holds is a machine-checked fact, and with repair: true a violation returns the weakest guard that fixes it. code/subscribe + code/poll watch the fact space itself: subscribe to a callee, then poll to drain \"fn X gained or lost a caller\" events."}
+    "code/verify takes the source of a defserver carrying ^{:invariant …} and PROVES the invariant with z3 — verdict: holds is a machine-checked fact, and with repair: true a violation returns the weakest guard. Read the COVERAGE beside the verdict: :complete false means some transition's next-state could not be modelled and was therefore NOT checked, and :unmodelled names them — a partial proof, never a total one. code/subscribe + code/poll watch the fact space itself: subscribe to a callee, then poll to drain \"fn X gained or lost a caller\" events."}
 
    {:instr/id "mcp/onboarding/rules"
     :instr/for "mcp" :instr/kind :onboarding :instr/order 60
     :instr/title "Rules of engagement"
     :instr/text
-    "1. Ask named questions first (code/ask); drop to code/query only when the question has no name. 2. Project to rows — filter inside the query, never in your context. 3. Fetch the beam-lisp/usage prompt (prompts/get) before your first real task. 4. Trust verdicts, not vibes: if code/verify says holds, it holds for every state and input. 5. Fetch beam-lisp/protocol before you extend or amend these instructions."}])
+    "1. Ask named questions first (code/ask); drop to code/query only when the question has no name. 2. Project to rows — filter inside the query, never in your context. 3. Fetch the beam-lisp/usage prompt (prompts/get) before your first real task. 4. Trust verdicts, not vibes — but read a verdict WITH its coverage: `holds` is proved for every transition the checker could model, and `:complete false` (with `:unmodelled`) is a partial proof, so `holds` beside it is not a promise about every state and input. 5. Fetch beam-lisp/protocol before you extend or amend these instructions."}])
 ```
 
 ## The corpus: usage
