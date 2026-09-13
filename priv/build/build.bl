@@ -65,7 +65,10 @@
 (ns build
   (:require [build-plan :as plan]
             [build-log :as blog]
-            [substrate :as sub]))
+            [substrate :as sub]
+            [drop :as d]
+            [store :as st]
+            [claim :as c]))
 
 ; ── manifest ─────────────────────────────────────────────────────────────────
 
@@ -303,6 +306,115 @@
     (if (or (nil? xs) (not (continue-after-toolchain? st))) st
       (recur (seq (rest xs)) (build-wave [(first xs)] 1 st p todo? cache? hashes out log-path log root)))))
 
+; ── the native stage ────────────────────────────────────────────────────────
+;
+; Crates live under `native/<crate>/`; the artefact a build must place is
+; `priv/native/<crate>` (no `lib` prefix — `BeamLisp.Native` loads it by that
+; name). Two things make this a stage rather than a shell-out:
+;
+;   the KEY IS CONTENT   `(crate source digest, cargo version)`, so the same
+;                        inputs name the same artefact and a build either finds
+;                        it or makes it;
+;   the TARGET IS CLAIMED  cargo is run with a target dir under the store, and a
+;                        claim means two builds never run cargo over the same
+;                        target dir. That is the lock cargo would otherwise hold
+;                        on a shared target, replaced by a claim that says who
+;                        has it (see `claim`).
+;
+; The inputs are the ones the Mix task used before this existed
+; (`src/**/*.rs`, `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`) — read off
+; that task rather than invented, because a staleness key that disagrees with the
+; artefact is worse than no cache at all.
+
+(def native-inputs ["src/**/*.rs" "Cargo.toml" "Cargo.lock" ".cargo/config.toml"])
+
+(defn native-key
+  "The content key of a crate: its declared inputs' digests in sorted path order,
+   plus the cargo version. Version-qualified because a different compiler is a
+   different artefact."
+  [crate-dir]
+  (let [files (vec (sort (mapcat (fn [g] (Path/wildcard (Path/join crate-dir g)))
+                                 native-inputs)))
+        parts (map (fn [f] (str (Path/relative_to f crate-dir) ":"
+                                (d/sha256-hex-of f 0 (d/file-size f))))
+                   files)]
+    (subs (d/sha256-hex (str (join "\n" parts) "\ncargo")) 0 32)))
+
+(defn native-root
+  "Where built natives live: content-addressed, beside the library store — and
+   derived FROM the store rather than repeating its `XDG_CACHE_HOME`/`HOME`
+   fallback. The first version read `XDG_CACHE_HOME` directly, which is nil in a
+   bare test VM, and `Path/join` answered with a chardata error."
+  []
+  (Path/join (Path/dirname (st/root)) "native"))
+
+(defn- cdylib-in
+  "The cdylib cargo wrote for `crate` under `dir`, or nil."
+  [dir crate]
+  (first (filter (fn [p] (File/exists? p))
+                 [(Path/join dir (str "lib" crate ".so"))
+                  (Path/join dir (str "lib" crate ".dylib"))
+                  (Path/join dir (str crate ".dll"))])))
+
+(defn- native-one
+  "One crate: find the artefact its inputs name, or make it. Written as explicit
+   `assoc`s rather than a threading chain — a stage that reports counts should
+   not also be a puzzle about which arity of `update` it meant."
+  [acc crate-dir root log]
+  (let [crate (Path/basename crate-dir)
+        key (native-key crate-dir)
+        dir (Path/join (Path/join (native-root) key) crate)
+        dest (Path/join (Path/join root "priv/native") crate)
+        found (cdylib-in (Path/join dir "release") crate)]
+    (cond
+      (some? found)
+      (do (File/mkdir_p! (Path/dirname dest))
+          (File/cp! found dest)
+          (when (some? log) (log (str "beam-lisp native: " crate " from cache")))
+          (assoc acc
+                 :cached (+ 1 (:cached acc))
+                 :artifacts (conj (:artifacts acc) dest)))
+
+      (some? (c/held-by dir))
+      (assoc acc :errors (conj (:errors acc)
+                               (str "native: " crate " is being built by pid "
+                                    (:pid (c/held-by dir)))))
+
+      :else
+      (do
+        (c/acquire! dir crate)
+        (try
+          (File/mkdir_p! dir)
+          ; `:os.cmd` wants a LIST OF CHARACTERS, not a binary — passing a
+          ; binary answers with `not a list of characters` and no build.
+          (erlang/apply :os :cmd
+                        (list (erlang/binary_to_list
+                                (str "cd " crate-dir " && cargo build --release --target-dir " dir))))
+          (let [built (cdylib-in (Path/join dir "release") crate)]
+            (if (nil? built)
+              (assoc acc :errors (conj (:errors acc)
+                                       (str "native: cargo produced no cdylib for " crate)))
+              (do
+                (File/mkdir_p! (Path/dirname dest))
+                (File/cp! built dest)
+                (when (some? log) (log (str "beam-lisp native: " crate " built")))
+                (assoc acc
+                       :built (+ 1 (:built acc))
+                       :artifacts (conj (:artifacts acc) dest)))))
+          (finally (c/release! dir)))))))
+
+(defn build-native
+  "Build (or find) every crate's artefact and install it at `priv/native/<crate>`.
+   Returns `{:built n :cached n :artifacts [path …] :errors [msg …]}`."
+  [root log]
+  (let [crates (vec (filter (fn [dir] (File/exists? (Path/join dir "Cargo.toml")))
+                            (sort (Path/wildcard (Path/join root "native/*")))))]
+    (loop [cs crates
+           acc {:built 0 :cached 0 :artifacts [] :errors []}]
+      (if (empty? cs)
+        acc
+        (recur (rest cs) (native-one acc (first cs) root log))))))
+
 (defn run [opts]
   (let [sources (vec (:sources opts)) out (:out opts) force? (= true (:force? opts))
         root (:root opts)
@@ -360,8 +472,12 @@
       ; point where the log stops being history and becomes the current state.
       (blog/write! lpath (blog/facts-of st))
       (write-manifest mpath projection)
-      {:built (:built final) :errors (:errors final) :manifest projection
-       :ex-built (:ex-built with-ex)})))
+      (let [nat (if (:native opts) (build-native (or (:root opts) ".") log)
+                                  {:built 0 :cached 0 :artifacts [] :errors []})]
+        {:built (:built final) :errors (vec (concat (:errors final) (:errors nat)))
+         :manifest projection
+         :ex-built (:ex-built with-ex)
+         :native nat}))))
 
 (defn clean [out mpath]
   (let [lpath (blog/path-for mpath)
