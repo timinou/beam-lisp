@@ -1,0 +1,213 @@
+; oracle.bl — PROTOTYPE: z3 as if it had been written in beam-lisp.
+;
+; This file is the target shape of the cutover, written once so every layer of
+; it can be MEASURED against today's `z3/check` path before any consumer moves.
+; Nothing in `z3.bl`, `system/core.bl` or `veritas.bl` is changed by loading it.
+;
+; The thesis: the oracle's INPUTS are already language values (smt.bl: forms,
+; one printer). Its OUTPUTS are not — a verdict is a string compared at 44 sites,
+; a model is text parsed at 39. Its LIFETIME is a bundle (z3pool). Asking it is a
+; bare call. This file closes the three gaps:
+;
+;   L2  verdict as a VALUE       (verdict / proven? refuted? undecided? / model as bl values)
+;   L4  conversation by default  (session / scoped — declare once, push/pop per question)
+;   L5  obligation + memo        (obligation / memo tier: same script ⇒ no solver call)
+;   L6  the oracle as an EFFECT  (with-oracle — a handler the engine never sees)
+;   L7  fan-out through the pool (ask-all — N questions over N solvers)
+;
+; Every verb here is a function call away from `system/core.bl`'s twenty sites.
+
+(ns oracle
+  (:require [smt :as smtlib]
+            [z3pool]
+            [system.decide :as decide]
+            [typed]))
+
+;; ── L2: the verdict record ────────────────────────────────────────────────
+;;
+;; ONE shape for every answer the oracle gives. Status is a KEYWORD (the wire
+;; string is read once, here); a model is bl VALUES; a core is NAMES; the cost
+;; is on the record because the ledger needs it and so does the ceiling.
+
+(defn- status-kw [s]
+  (cond (= s "unsat") :unsat (= s "sat") :sat (= s "unknown") :unknown :else :error))
+
+(defn- model-value
+  "A define-fun VALUE node → bl value: scalar, (- n) → -n, (/ a b) → a÷b."
+  [vnode]
+  (let [f (typed/node-form vnode) tg (typed/node-tag f)]
+    (cond
+      (= tg :scalar) f
+      (= tg :list)
+        (let [its (typed/node-items f)
+              op (if (empty? its) nil (typed/node-name (typed/node-form (first its))))]
+          (cond (and (= op "-") (= 2 (count its))) (- 0 (model-value (second its)))
+                (and (= op "/") (= 3 (count its))) (/ (model-value (second its)) (model-value (nth its 2)))
+                :else f))
+      :else f)))
+
+(defn parse-model
+  "z3 model TEXT → {name-string → bl value}. The ONE model parser (today veritas
+   owns a private copy and core.bl matches `define-fun` textually at 14 sites)."
+  [text]
+  (if (or (nil? text) (= "" text))
+    {}
+    (let [top (first (BeamLisp.Reader/read_string text))]
+      (into {}
+        (keep (fn [d]
+                (let [its (typed/node-items d)]
+                  (when (and (>= (count its) 5)
+                             (= "define-fun" (typed/node-name (typed/node-form (first its)))))
+                    [(typed/node-name (typed/node-form (second its))) (model-value (nth its 4))])))
+              (typed/node-items top))))))
+
+(defn- parse-core
+  "`(g_pos g_neg)` → [\"g_pos\" \"g_neg\"]."
+  [text]
+  (if (or (nil? text) (= "" text))
+    []
+    (let [top (first (BeamLisp.Reader/read_string text))]
+      (vec (map (fn [n] (typed/node-name (typed/node-form n))) (typed/node-items top))))))
+
+(defn verdict
+  "A raw port reply {:status str :model text :core text} + cost → the record."
+  [raw tier us]
+  {:status (status-kw (:status raw))
+   :model  (parse-model (:model raw))
+   :core   (parse-core (:core raw))
+   :tier   tier
+   :us     us})
+
+(defn proven?    [v] (= :unsat (:status v)))
+(defn refuted?   [v] (= :sat (:status v)))
+(defn undecided? [v] (= :unknown (:status v)))
+
+;; ── L5: obligations, and a memo above the oracle ─────────────────────────
+;;
+;; An obligation is a VALUE: a label and the commands. Its identity is the
+;; content of the script it emits — so the memo is exactly "have I asked this
+;; before", and a re-verify of an unchanged tree asks the solver nothing.
+
+(defn obligation
+  "A question as a VALUE. Rendered and classified ONCE, here — measured: doing both
+   per ask cost 0.8 ms, eight times what the solver itself takes on a push/pop
+   question. The text is the identity (memo key); the fragment is what the ledger
+   and the native rung read."
+  [label cmds]
+  (let [text (smtlib/script cmds)]
+    {:label label :cmds cmds :text text :frag (decide/classify cmds) :key (erlang/phash2 text)}))
+
+(def ^:private memo-tab :oracle-memo)
+
+(defn- memo! []
+  (when (= :undefined (ets/info memo-tab))
+    (ets/new memo-tab (to-list [:set :public :named_table])))
+  memo-tab)
+
+(defn- ->tuple [k v] (erlang/list_to_tuple (to-list [k v])))
+
+(defn memo-clear! [] (when (not= :undefined (ets/info memo-tab)) (ets/delete_all_objects memo-tab)) :ok)
+(defn memo-size [] (if (= :undefined (ets/info memo-tab)) 0 (ets/info memo-tab :size)))
+
+;; ── L6: the oracle as an EFFECT ──────────────────────────────────────────
+;;
+;; `ask` PERFORMS the effect; whoever is in `with-oracle` HANDLES it. The default
+;; handler is the pool. A test hands in a table; a sandbox hands in `deny`. The
+;; engine (core.bl) calls `ask` and never knows which.
+
+(def ^:private handler-key :oracle-handler)
+
+(defn- pool-handler
+  "The real oracle: one leased conversation per question (today's `z3/check`)."
+  [text model?]
+  (z3pool/check text model?))
+
+(defn with-oracle
+  "Run `f` with every `ask` answered by `handler` — (fn [script-text model?] raw)."
+  [handler f]
+  (let [prev (erlang/get handler-key)]
+    (erlang/put handler-key handler)
+    (try (f) (finally (if (= :undefined prev) (erlang/erase handler-key) (erlang/put handler-key prev))))))
+
+(defn deny
+  "A handler that refuses: the sandbox's oracle."
+  [_text _model?]
+  (throw (ex-info "oracle: denied in this context" {})))
+
+(defn table
+  "A handler that answers from {script-text → status-string}; unlisted → unknown."
+  [answers]
+  (fn [text _model?] {:status (get answers text "unknown") :model nil :core nil}))
+
+;; `erlang/get` answers :undefined for an unset key — not nil — so `or` is wrong here.
+(defn- handler [] (let [h (erlang/get handler-key)] (if (or (nil? h) (= :undefined h)) pool-handler h)))
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+
+(defn ask
+  "The ONE way to ask. obligation → verdict. Memo first, then the handler in
+   force; every answer lands in the ledger with its status and its cost."
+  ([obl] (ask obl false))
+  ([obl model?]
+   (let [text (:text obl)
+         k (:key obl)
+         hit (ets/lookup (memo!) k)]
+     (if (and (seq hit) (not model?))
+       (let [v (erlang/element 2 (first hit))]
+         (BeamLisp.Z3.Ledger/record (:frag obl) :memo (name (:status v)))
+         (assoc v :tier :memo :us 0))
+       (let [t0 (now-us)
+             raw ((handler) text model?)
+             v (verdict raw :z3 (- (now-us) t0))]
+         (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)))
+         (when (not= :unknown (:status v)) (ets/insert memo-tab (->tuple k v)))
+         v)))))
+
+;; ── L4: a conversation by default ────────────────────────────────────────
+;;
+;; The engine's loops all have one shape: a PRELUDE (sorts, decls, the invariant
+;; as define-fun) and N questions over it. Today each question re-sends the
+;; prelude after a (reset) — and z3's first declaration after a reset costs
+;; ~1.6 ms (measured on the bare binary), the whole question ~3 ms. In a
+;; session the prelude is declared ONCE and each question is push/assert/check/
+;; pop: ~0.1 ms at the solver.
+
+(defn session
+  "Hold one solver, declare `prelude` once, run `f` — inside it use `scoped`."
+  [prelude f]
+  (z3pool/with-solver
+    (fn []
+      (z3pool/command (smtlib/script prelude))
+      (f))))
+
+(defn scoped
+  "One question inside a session: push, assert `cmds`, check, pop → verdict."
+  ([obl] (scoped obl false))
+  ([obl model?]
+   (let [t0 (now-us)]
+     (z3pool/command "(push 1)")
+     (z3pool/command (:text obl))
+     (let [raw (z3pool/check-here (to-list []) false model?)
+           v (verdict raw :z3 (- (now-us) t0))]
+       (z3pool/command "(pop 1)")
+       (BeamLisp.Z3.Ledger/record (:frag obl) :z3 (name (:status v)))
+       v))))
+
+;; ── L7: fan-out through the pool ─────────────────────────────────────────
+;;
+;; N independent obligations over the N solvers the pool already runs. Today
+;; every consumer asks serially, so the pool's high-water mark is 1.
+
+(defn ask-all
+  "obligations → verdicts, in order, one BEAM process per question; the lease
+   registry is the backpressure."
+  [obls]
+  (let [parent (erlang/self)
+        n (count obls)]
+    (vec (map (fn [o] (erlang/spawn (fn [] (erlang/send parent [:verdict (:label o) (ask o)]))))
+              obls))
+    (let [got (reduce (fn [acc _]
+                        (let [m (receive [:verdict l v] [l v] (after 60000 :timeout))]
+                          (if (= m :timeout) acc (assoc acc (first m) (second m)))))
+                      {} (range n))]
+      (vec (map (fn [o] (get got (:label o))) obls)))))

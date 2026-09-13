@@ -24,7 +24,7 @@ defmodule BeamLisp.Z3.Ledger do
   """
 
   @fragments [:"tag-lattice", :arith, :general]
-  @tiers [:"native-witness", :z3]
+  @tiers [:"native-witness", :z3, :memo]
 
   # EVERY slot, and the key → slot map. Module attributes resolve where they are
   # used, so these sit above the functions that need them. `:total` is a slot like any
