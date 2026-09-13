@@ -165,6 +165,57 @@ defmodule BeamLisp.BuildPristineTest do
   end
 
   @tag :slow
+  test "the same sources compiled twice give an identical beam set" do
+    # The property W6's fixpoint rests on, made checkable by existing machinery:
+    # two independent builds of ONE source set must agree file for file. This is
+    # the AOT half only — no release, no pack, no `bl self-build` — and each
+    # build gets its own output dir AND its own manifest/log, so neither can
+    # read the other's state.
+    srcs = Path.wildcard("priv/build/*.bl")
+    assert length(srcs) > 5
+
+    a = "/tmp/beam_lisp_pristine_build_a"
+    b = "/tmp/beam_lisp_pristine_build_b"
+
+    for dir <- [a, b] do
+      File.rm_rf!(dir)
+      File.mkdir_p!(dir)
+    end
+
+    BeamLisp.Loader.ensure_loaded("build")
+    run = BeamLisp.Env.fetch!("build", "run")
+
+    for out <- [a, b] do
+      r = BeamLisp.RT.invoke(run, [%{sources: srcs, out: out, force?: true, jobs: 4, log: nil}])
+      assert bl(r[:errors]) == []
+      assert r[:built] == length(srcs)
+    end
+
+    diff = BeamLisp.Pristine.trees(a, b, ["build.log"])
+    assert diff[:same?]
+    assert diff[:trees][:files][:a] == diff[:trees][:files][:b]
+    assert diff[:trees][:files][:a] >= length(srcs)
+
+    # The manifest IS inside the comparison — it carries per-source hashes and
+    # keys — and it came out identical. Only the log differs, because it records
+    # the run id and the time.
+    assert bl(diff[:trees][:changed]) == []
+
+    # And the exclusion is DISCLOSED, not silent: a tar is the whole directory,
+    # so the tar layer cannot be compared over a tree holding build state, and
+    # the report says NOT COMPARED instead of quietly passing.
+    assert diff[:tar][:same?] == nil
+    assert bl(diff[:tar][:skipped]) == ["build.log"]
+    assert BeamLisp.Pristine.report(diff) =~ "NOT COMPARED"
+
+    # without the exclusion the difference is exactly the log: the comparison
+    # notices it rather than filtering it away behind our backs.
+    raw = BeamLisp.Pristine.trees(a, b)
+    refute raw[:same?]
+    assert bl(raw[:trees][:changed]) == ["build.log"]
+  end
+
+  @tag :slow
   test "ONE producer's two packs of one tree are byte-identical end to end" do
     tree = @release_tree
     launcher = System.get_env("BL_LAUNCHER") || "/home/user/.cache/cargo-target/release/drop-launcher"

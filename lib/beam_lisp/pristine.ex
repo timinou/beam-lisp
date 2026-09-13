@@ -33,11 +33,17 @@ defmodule BeamLisp.Pristine do
   @doc """
   Layers 1 and 2 for two release roots: the set difference and the tar bytes.
 
-  Returns `%{"trees" => …, "tar" => …, "same?" => boolean}`. The `trees` map
-  carries `removed` / `added` / `changed` as sorted path lists.
+  `exclude` names relative paths that are build STATE rather than artifact (a
+  build log records the run id and time, so it can never be part of a fixpoint).
+  The caller must name them: the comparison does not guess. With any exclusion
+  the tar layer is reported as NOT COMPARED — a tar is the whole directory — so
+  `same?` rests on the index layer alone, and says so.
   """
-  @spec trees(binary, binary) :: map
-  def trees(a, b) when is_binary(a) and is_binary(b), do: call("trees", [a, b])
+  @spec trees(binary, binary, [binary]) :: map
+  def trees(a, b, exclude \\ [])
+
+  def trees(a, b, exclude) when is_binary(a) and is_binary(b) and is_list(exclude),
+    do: call("trees", [a, b, exclude])
 
   @doc """
   Layers 3 and 4 for two compounds: trailer fields, arithmetic, payload digest,
