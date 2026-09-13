@@ -37,6 +37,18 @@ defmodule BeamLisp.Release do
   @spec app_closure(atom) :: [atom]
   def app_closure(app) when is_atom(app), do: call("app-closure", [app])
 
+  @doc """
+  The apps a release's own boot starts — every app in the value except the
+  assembly TOOLS, which are carried on the code path and never started.
+
+  The `.rel` writes an app outside this set as `none`. Not a detail: it is how a
+  drop can run `bl self-build` at all (the tool must be present without being
+  booted), and it is why `:sasl` appears `none` in a shipped `.rel`.
+  """
+  @spec app_permanent_set(map) :: MapSet.t()
+  def app_permanent_set(value), do: call("app-permanent-set", [value])
+
+
   @doc "The `Name.rel` text for a release value (the term `systools` reads)."
   @spec rel_text(map) :: binary
   def rel_text(value), do: call("rel-text", [value])

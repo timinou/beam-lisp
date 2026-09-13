@@ -55,6 +55,9 @@ defmodule BeamLisp.Pristine do
 
   @doc "Every difference, one line each. `\"identical\"` when there are none."
   @spec report(map) :: binary
+  # is_map-ok: `diff` is the plain Elixir map `diff/2` returns — counts and lists
+  # of differing paths — never a beam-lisp value, so a struct must not pass here
+  # either and the stricter guard would reject the very map this is for.
   def report(diff) when is_map(diff), do: call("report", [diff])
 
   @doc """

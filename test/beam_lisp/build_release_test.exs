@@ -77,12 +77,22 @@ defmodule BeamLisp.BuildReleaseTest do
     assert to_string(vsn) == value.vsn
     assert to_string(erts) == value.erts.vsn
 
-    # Every app in the term is one the value named, with the same version and a
-    # boot TYPE — the round trip through Erlang's parser is the assertion, not
-    # the string.
+    # Every app in the term is one the value named, with the same version and the
+    # right boot TYPE — the round trip through Erlang's parser is the assertion,
+    # not the string.
+    #
+    # The type is NOT always `permanent`: the assembly TOOLS are carried, not
+    # started, so they are written `none` (mix's own release does exactly this;
+    # `sasl` is the one here, and it is listed `none` in the drop's own `.rel`).
+    # The permanent set is the API's answer, not a second opinion computed here.
+    permanent = BeamLisp.Release.app_permanent_set(value)
+
     assert List.keysort(List.wrap(app_terms), 0) ==
              value.apps
-             |> Enum.map(&{&1.app, to_charlist(&1.vsn), :permanent})
+             |> Enum.map(fn a ->
+               boot = if a.app in permanent, do: :permanent, else: :none
+               {a.app, to_charlist(a.vsn), boot}
+             end)
              |> Enum.sort()
 
     assert String.contains?(text, "beam_lisp"), "the .rel must name the apps"
