@@ -278,16 +278,39 @@ fn self_bl() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bl"))
 }
 
+/// After a request has been SENT, only three outcomes are safe: the command
+/// finished, the connection was lost, or nothing came back while it was still
+/// running. `None` means the daemon was never reached, which is the only case
+/// where the caller may fall back to a cold exec — and a stall must NOT take it,
+/// because the daemon's copy of the command may still be running. Running it
+/// twice is worse than reporting an unknown outcome.
+fn after_attach(a: Attach) -> Option<i32> {
+    match a {
+        Attach::Exit(code) => Some(code),
+        Attach::LostAfterSend => {
+            eprintln!("bl: daemon connection lost mid-command; outcome unknown");
+            Some(1)
+        }
+        Attach::Stalled(secs) => {
+            eprintln!(
+                "bl: the daemon has sent nothing for {secs}s, but the connection is still open \
+                 — the command is probably still running, and it is NOT re-run here \
+                 (outcome unknown). Raise BL_DAEMON_READ_TIMEOUT to wait longer, or run it \
+                 cold with BL_DAEMON=off to see it through."
+            );
+            Some(1)
+        }
+        _ => None,
+    }
+}
+
 fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
     let root = resolve_root(&cwd)?;
 
     match try_attach(&root, argv) {
         Attach::Exit(code) => Some(code),
-        Attach::LostAfterSend => {
-            eprintln!("bl: daemon connection lost mid-command; outcome unknown");
-            Some(1)
-        }
+        a @ (Attach::LostAfterSend | Attach::Stalled(_)) => after_attach(a),
         Attach::RestartRequired => {
             // the daemon is stale (checkout changed). Stop it, restart, retry once.
             // Say so: a daemon that vanishes without a word looks like a command
@@ -307,8 +330,7 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
                 if wait_ready(&root) {
                     return match try_attach(&root, argv) {
                         Attach::Exit(code) => Some(code),
-                        Attach::LostAfterSend => Some(1),
-                        _ => None,
+                        other => after_attach(other),
                     };
                 }
             }
@@ -320,8 +342,7 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
                 if wait_ready(&root) {
                     return match try_attach(&root, argv) {
                         Attach::Exit(code) => Some(code),
-                        Attach::LostAfterSend => Some(1),
-                        _ => None,
+                        other => after_attach(other),
                     };
                 }
             }
