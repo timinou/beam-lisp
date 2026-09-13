@@ -24,7 +24,7 @@ defmodule BeamLisp.Z3.Ledger do
   """
 
   @fragments [:"tag-lattice", :arith, :general]
-  @tiers [:"native-witness", :z3]
+  @tiers [:"native-witness", :z3, :memo]
 
   # EVERY slot, and the key → slot map. Module attributes resolve where they are
   # used, so these sit above the functions that need them. `:total` is a slot like any
@@ -65,7 +65,7 @@ defmodule BeamLisp.Z3.Ledger do
   whether there was an answer at all, and `unknown` collapsed into a boolean is how
   a machine whose invariant holds came to be reported as violated (FUP-058).
   """
-  def record(fragment, tier, status \\ nil) do
+  def record(fragment, tier, status \\ nil, us \\ nil) do
     start()
     bump(fragment)
     bump(tier)
@@ -75,7 +75,7 @@ defmodule BeamLisp.Z3.Ledger do
     # tier-for fall through to its default. Atom keys on a plain map read fine — the
     # z3 results have been read that way all along.
     Process.put({__MODULE__, :here}, [
-      %{fragment: fragment, tier: tier, status: status} | Process.get({__MODULE__, :here}, [])
+      %{fragment: fragment, tier: tier, status: status, us: us} | Process.get({__MODULE__, :here}, [])
     ])
     :ok
   end
@@ -99,6 +99,17 @@ defmodule BeamLisp.Z3.Ledger do
   """
   def undecided do
     here() |> Enum.filter(&(to_string(&1[:status]) == "unknown"))
+  end
+
+  @doc """
+  The COST of this process's decisions, in microseconds — the instrument behind
+  choosing a deadline from a measured distribution instead of an argument. Before
+  it existed, no obligation in the tree had ever been timed.
+  """
+  def cost do
+    us = here() |> Enum.map(&(&1[:us] || 0))
+    max = if us == [], do: 0, else: Enum.max(us)
+    %{count: length(us), total_us: Enum.sum(us), max_us: max}
   end
 
   @doc "The rollup, zeroes included so a missing tier is visibly zero."

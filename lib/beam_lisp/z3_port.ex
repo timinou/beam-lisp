@@ -242,6 +242,35 @@ defmodule BeamLisp.Z3Port do
     end
   end
 
+  @doc """
+  One SCOPED question: push, assert the script, check-sat, [get-model], pop — all
+  inside one call, against the solver state the caller's conversation already
+  built. The prelude is therefore sent once per conversation instead of once per
+  question (measured: a push/assert/check/pop question is 96 us at the solver and
+  3009 us when the prelude is re-sent after a reset).
+
+  `(get-model)` runs BEFORE the pop — the model of a popped scope is gone — and
+  `pop` prints nothing, so the reply stream stays exactly one status (+ model).
+  """
+  def raw_scoped(port, smt, model? \\ false) do
+    Port.command(port, "(push 1)\n" <> smt <> "\n(check-sat)\n")
+
+    case read_answer(port, "") do
+      {"unsat", _rest} ->
+        Port.command(port, "(pop 1)\n")
+        %{status: "unsat", core: nil, model: nil}
+
+      {"sat", rest} ->
+        model = if model?, do: (Port.command(port, "(get-model)\n") && read_sexp(port, rest))
+        Port.command(port, "(pop 1)\n")
+        %{status: "sat", core: nil, model: model}
+
+      {line, _} ->
+        Port.command(port, "(pop 1)\n")
+        %{status: line, core: nil, model: nil}
+    end
+  end
+
   defp read_until_marker(port, acc, out) do
     lines = String.split(acc, "\n")
 
