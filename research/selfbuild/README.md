@@ -184,7 +184,7 @@ self-cleaning:
 |---|---|
 | manifest key per tier | boot/compiler.bl, boot/sugar.bl, std/errors.bl, lib/datom.bl → codegen `b6a47eb8…`; build/{build,build-plan,source-graph,ns-interface}.bl → driver `fff8a5a3…` |
 | beam stamps | `Ns.Build` → `fff8a5a3…`, `Ns.Compiler` → `b6a47eb8…` |
-| **the amplifier is gone** | adding a build-driver source: codegen key UNCHANGED, driver key moved to `4c3d22e0…`, ONLY driver-keyed sources went stale, and the build touched **5 sources** (before the split: every beam, ~300) |
+| **the amplifier is gone** | adding a build-driver source: codegen key UNCHANGED, driver key moved to `4c3d22e0…`, ONLY driver-keyed sources went stale, and the build touched **5 sources** (before the split: every source in the tree — 190 of them here, ~300 beams) |
 | codegen edits stay conservative | adding a codegen source moved codegen to `32d07ec2…` AND the driver with it (the driver folds the codegen key in), so everything went stale — correct, and the opposite of the line above |
 | leaves no trace | the probe file is deleted by its trap; both keys return to the baseline values; two consecutive `mix compile`s then report nothing to build |
 | gates | 45/45 across aot_tier_key, boot_build_barrier, aot_build_key, aot_drift, aot_gate_cost, aot_cache, aot_reproducible, source_graph, bootstrap_adapter, bootstrap_generation |
@@ -269,7 +269,7 @@ says what happened (compiled, cached, failed, dropped) instead of only what is.
 | what | observed |
 |---|---|
 | the log on disk | four lines of text for a two-source fixture: one `:build/run`, one `:build/built` per source, one `:build/end` |
-| the real tree | `_build/dev/lib/beam_lisp/.mix/build.log`, 51 KB — ~300 sources, compacted |
+| the real tree | `_build/dev/lib/beam_lisp/.mix/build.log`, 52 907 B, 192 lines: one `:build/run`, **190 `:build/built`**, one `:build/end` — counted by reading the file with a tool that knows nothing about the format (python), which is also the check that it is text |
 | **resume** | delete the manifest: the next run is `{:noop, []}` and the projection is rewritten from the log |
 | **agreement** | `read_manifest() == BuildLog.manifest(state)`, asserted |
 | stale by query | after a body edit, `stale == [b.bl]` exactly (`a` is still fresh); `impact(a) == [b]`, `impact(b) == []` |
