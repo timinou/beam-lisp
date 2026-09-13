@@ -1,0 +1,170 @@
+; system/decide.bl — the decision ladder: decide in BEAM what BEAM can decide, and
+; say which rung answered.
+;
+; The repo's own pattern, one level over. `03-obligation-gated-lowering` says a
+; lowering may run only if it can state and discharge its equivalence obligation;
+; `30-make-it-a-value-lower-by-proof` makes the choice a value. Here the OBLIGATION
+; is an SMT question and the ladder is:
+;
+;   rung 1  :native-witness — bounded model search over integer guards. SOUND in
+;            exactly ONE direction: an assignment that satisfies every assertion
+;            proves "sat". It never claims unsat, and it runs only when EVERY
+;            assertion parsed into its fragment — an unparsed assertion means no
+;            claim, not a guess.
+;   rung 2  :z3             — the oracle of last resort, for everything else.
+;
+; It classifies the COMMANDS (the forms `z3/check` was handed), not the rendered
+; SMT text: the caller already has the forms, so there is nothing to parse and
+; nothing to get wrong. A raw SMT string (the escape hatch) is classified
+; `:general` and goes straight to z3 — conservatively, because it was not read.
+;
+; Every decision is recorded (fragment + tier) in `BeamLisp.Z3.Ledger`, so "is
+; another native rung worth building?" is a number rather than a taste.
+
+(ns system.decide)
+
+(def ^:private cmp-ops (to-list ["<" "<=" ">" ">=" "=" "distinct"]))
+(def ^:private arith-ops (to-list ["<" "<=" ">" ">=" "+" "-" "="]))
+(def ^:private non-linear-ops
+  (to-list ["*" "div" "mod" "rem" "abs" "forall" "exists" "ite" "to_int" "to_real" "sqrt"]))
+
+(defn- leaves
+  "Every leaf of a form tree, as strings — heads included. Walking `(vec f)` and not
+   a constructed head/args pair is deliberate: an earlier version that assembled
+   head+args missed a product nested inside an assertion, and every label it printed
+   was wrong."
+  [f]
+  (cond
+    (sequential? f) (reduce (fn [acc x] (concat acc (leaves x))) (to-list []) (vec f))
+    :else (let [s (str f)] (if (= s "") (to-list []) (to-list [s])))))
+
+(defn- any-leaf? [cmds pred]
+  (some (fn [l] (if (pred l) true false)) (leaves cmds)))
+
+(defn- in? [xs v] (some (fn [x] (= x v)) xs))
+
+(defn classify
+  "Which fragment is this question in?
+     :tag-lattice — only names from the value model (tag_x …), no arithmetic
+     :arith       — comparisons and linear integer arithmetic
+     :general     — anything else, including anything not read (a raw SMT string)"
+  [cmds]
+  (if (string? cmds)
+    :general
+    (cond
+      ;; Order matters and is not arbitrary: non-linearity wins outright (it is the
+      ;; one thing the witness rung must never touch), then the value model — a tag
+      ;; question is asked with `=`, so testing arithmetic first reported every
+      ;; tag-lattice question as :arith — and only then linear arithmetic.
+      (any-leaf? cmds (fn [l] (in? non-linear-ops l))) :general
+      (any-leaf? cmds (fn [l] (< 1 (count (split l "tag_"))))) :tag-lattice
+      (any-leaf? cmds (fn [l] (in? arith-ops l))) :arith
+      :else :arith)))
+
+(defn- seq? [f] (and (sequential? f) (not (empty? f))))
+(defn- head-str [f] (if (seq? f) (str (first f)) ""))
+(defn- args-of [f] (if (seq? f) (vec (rest f)) (to-list [])))
+
+(defn- declared [cmds]
+  (vec (filter (fn [x] (not (nil? x)))
+               (map (fn [c] (if (= "declare-const" (head-str c))
+                              (str (first (args-of c)))
+                              nil))
+                    cmds))))
+
+(defn- guard-of
+  "`(> x 2)` → {:op \">\" :var \"x\" :val 2}; nil when it is not such a comparison.
+   ONE nil makes the whole question unwitnessable here, which is the soundness
+   condition for a rung that must never guess."
+  [term]
+  (let [h (head-str term) a (args-of term)]
+    (if (and (some (fn [o] (= o h)) cmp-ops) (= 2 (count a)))
+      (let [v (str (first a)) n (second a)]
+        (if (and (number? n) (not= v "")) {:op h :var v :val n} nil))
+      nil)))
+
+(defn- guards [cmds]
+  (let [terms (map (fn [c] (if (= "assert" (head-str c)) (first (args-of c)) nil)) cmds)
+        real (vec (filter (fn [x] (not (nil? x))) terms))]
+    (if (empty? real) nil (vec (map guard-of real)))))
+
+(defn- holds? [assign g]
+  (let [x (get assign (:var g)) y (:val g) op (:op g)]
+    (cond
+      (= op ">=") (>= x y)
+      (= op ">") (> x y)
+      (= op "<=") (<= x y)
+      (= op "<") (< x y)
+      (= op "=") (= x y)
+      (= op "distinct") (not= x y)
+      :else false)))
+
+(def ^:private box
+  "Small integers around zero. Bounded on purpose: this rung proves existence, so a
+   small box is sound and merely incomplete — z3 answers what it leaves."
+  (to-list [-2 -1 0 1 2 3 4 5 6 7 8 9 10]))
+
+(defn witness
+  "Search for an assignment satisfying EVERY parsed assertion. → {:witness {var val}}
+   or nil. Never claims unsat."
+  [cmds]
+  (let [gs (guards cmds)]
+    (if (or (nil? gs) (some (fn [g] (nil? g)) gs))
+      nil
+      (let [vars (declared cmds)
+            combos (reduce (fn [acc v] (mapcat (fn [a] (map (fn [x] (assoc a v x)) box)) acc))
+                           (to-list [{}])
+                           vars)
+            hit (first (filter (fn [a] (every? (fn [g] (holds? a g)) gs)) combos))]
+        (if (nil? hit) nil {:witness hit :vars (count vars) :guards (count gs)})))))
+
+;; ── the ladder ───────────────────────────────────────────────────────────
+
+(defn- record! [fragment tier]
+  (BeamLisp.Z3.Ledger/record fragment tier)
+  tier)
+
+(defn- decide-with
+  "The ladder. `native?` decides whether the cheap rung may answer."
+  [cmds solver native?]
+  (let [frag (classify cmds)
+        w (if (or (not native?) (= frag :general)) nil (witness cmds))]
+    (if (nil? w)
+      {:status (solver) :tier (record! frag :z3)}
+      {:status "sat" :tier (record! frag :native-witness) :witness (:witness w)})))
+
+(defn decide
+  "Answer COMMANDS with the oracle, recording which fragment they were in.
+   → {:status \"sat\"|\"unsat\"|\"unknown\" :tier :z3}
+   The judgement is z3's, exactly as before — this adds the LEDGER, not a shortcut.
+   `solver` is the thunk the rung calls, so this file stays about DECISION and not
+   about transport.
+
+   NOT the native rung: a search rung that answers `sat` from a model is sound only
+   as far as `guards`/`holds?` read the assertion, and measured against the pool test
+   it returned a WRONG verdict (one bad answer in the concurrent soak). Until that
+   is fixed and shown, the cheap rung is opt-in via `decide-native` — see FUP-050."
+  [cmds solver]
+  (decide-with cmds solver false))
+
+(defn decide-native
+  "The same ladder WITH the cheap rung allowed to answer. Opt-in, and currently
+   known to be unsound on some inputs (FUP-050) — kept because the rung is the thing
+   under test, not because it is ready to prove anything."
+  [cmds solver]
+  (decide-with cmds solver true))
+
+(defn tier-for
+  "The weakest tier that took part: if z3 answered anything, the answer is z3's."
+  [tiers]
+  (if (some (fn [t] (= t :z3)) tiers) :z3 :native-witness))
+
+(defn here
+  "The tiers this process's decisions used since `clear-here!` — how a caller
+   reports what proved its answer."
+  []
+  (vec (BeamLisp.Z3.Ledger/here)))
+
+(defn clear-here! [] (BeamLisp.Z3.Ledger/clear_here))
+(defn histogram [] (BeamLisp.Z3.Ledger/histogram))
+(defn reset-ledger! [] (BeamLisp.Z3.Ledger/reset))
