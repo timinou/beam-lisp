@@ -48,7 +48,15 @@ On `initialize` it answers with the capability set it can actually honour —
 
 Diagnostics, definitions and references come from the compiler's analysis, not
 from re-parsing: a reference is a real call-graph edge, and a hover reports the
-callee's proven return type.
+callee's proven return type. The analysis is not confined to function bodies:
+the forms a script runs at top level are compiled into a synthetic `<top>`
+function — the same name the codebase db and `bl ask` print — so hover,
+definition, references, highlights and signature help answer there too, a
+script's use of a fn keeps it out of `deadCode`, and a type error in a
+top-level form squiggles like any other. Pointing at a definition's own head
+answers that fn's proof card. Mid-edit text that does not parse yet answers
+every feature with its empty result — the parse-error diagnostic already says
+why.
 
 ### Requests the protocol has no words for
 

@@ -54,7 +54,10 @@ defmodule BeamLisp.DaemonInspectTest do
 
     # the port table: every live claim appears in both, with the same number
     for p <- m.ports do
-      assert text =~ "#{p.name} = #{p.port}"
+      # the terminal prints the NAME as the address and the number beside it:
+      # the same value the JSON carries, said the way a human reads it
+      assert text =~ "#{p.name} = #{p.url}"
+      assert text =~ "→ #{p.port}"
       assert Enum.any?(js["ports"], fn j -> j["name"] == p.name and j["port"] == p.port end)
     end
 

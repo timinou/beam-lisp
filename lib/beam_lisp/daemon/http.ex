@@ -33,7 +33,7 @@ defmodule BeamLisp.Daemon.HTTP do
 
   import Plug.Conn
 
-  alias BeamLisp.Daemon.{Inspect, Ports}
+  alias BeamLisp.Daemon.{Gateway, Inspect, Ports}
 
   @impl true
   def init(opts), do: opts
@@ -353,9 +353,13 @@ defmodule BeamLisp.Daemon.HTTP do
 
   defp ports_json do
     Enum.map(Ports.list(), fn p ->
+      hosts = Map.get(p, :hosts, [])
+
       %{
         "name" => p.name,
         "port" => p.port,
+        "hosts" => hosts,
+        "url" => if(hosts == [], do: "http://127.0.0.1:#{p.port}/", else: Gateway.url(hd(hosts))),
         "tree" => p.tree_id,
         "root" => p.root,
         "pid" => p.pid,

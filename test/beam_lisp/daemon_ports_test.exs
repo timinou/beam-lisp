@@ -35,7 +35,7 @@ defmodule BeamLisp.DaemonPortsTest do
       end
     end)
 
-    %{root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_fingerprint(root)}
+    %{root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_id(root)}
   end
 
   # ── the registry ──────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ defmodule BeamLisp.DaemonPortsTest do
   # ── the session's address ─────────────────────────────────────────────
 
   test "the daemon claims :ui, serves the page, and lists ports as JSON", ctx do
-    port = Ports.port_of(:ui)
+    port = session_port(ctx.root)
     assert is_integer(port), "the daemon claims :ui at boot"
 
     page = Req.get!("http://127.0.0.1:#{port}/")
@@ -100,11 +100,19 @@ defmodule BeamLisp.DaemonPortsTest do
 
     ports = Req.get!("http://127.0.0.1:#{port}/ports")
     assert ports.status == 200
-    assert [%{"name" => "ui", "port" => ^port}] = ports.body
+
+    # The registry is machine-wide ON PURPOSE — a claim is a file so that
+    # another tree's session is visible rather than invisible — so assert THIS
+    # session's claim, not that it is the only one: other trees (and other test
+    # runs) legitimately hold claims at the same moment.
+    mine = Enum.find(ports.body, fn c -> c["name"] == "ui" and c["root"] == ctx.root end)
+    assert mine, "this session's :ui claim is in the table"
+    assert mine["port"] == port
+    assert mine["tree"] == ctx.tree
   end
 
   test "the MCP endpoint answers the same dispatch as `bl mcp`", ctx do
-    port = Ports.port_of(:ui)
+    port = session_port(ctx.root)
 
     resp =
       Req.post!("http://127.0.0.1:#{port}/mcp",
@@ -146,7 +154,7 @@ defmodule BeamLisp.DaemonPortsTest do
     wait_for(fn -> File.exists?(ep.token) end)
     on_exit(fn -> stop_quietly(pid) end)
 
-    port = Ports.port_of(:ui)
+    port = session_port(root)
     assert is_integer(port)
 
     page = Req.get!("http://127.0.0.1:#{port}/")
@@ -192,17 +200,24 @@ defmodule BeamLisp.DaemonPortsTest do
   end
 
   test "an unknown path is a JSON 404", ctx do
-    port = Ports.port_of(:ui)
+    port = session_port(ctx.root)
     resp = Req.get!("http://127.0.0.1:#{port}/nope")
     assert resp.status == 404
   end
 
   test "the startup message names the session and how to pin its port", ctx do
+    # the NAME is the session's address, and the loopback one is what still
+    # answers without the gateway — so the message prints both, for the same
+    # reason it prints how to pin a port nobody should have to remember
+    host = BeamLisp.Daemon.Names.host(ctx.root, "ui")
+
     msg = Server.startup_message(ctx.root, %{port: 43_123, pinned: false, error: nil})
     assert msg =~ "bl daemon up for #{ctx.root}"
-    assert msg =~ "http://127.0.0.1:43123"
+    assert msg =~ "http://#{host}"
+    assert msg =~ "127.0.0.1:43123"
     assert msg =~ "ephemeral — pin it in env.bl"
-    assert msg =~ "http://127.0.0.1:43123/mcp"
+    assert msg =~ "http://#{host}/mcp"
+    assert msg =~ "bl gateway start"
 
     pinned = Server.startup_message(ctx.root, %{port: 7700, pinned: true, error: nil})
     assert pinned =~ "pinned by env.bl"
@@ -221,11 +236,20 @@ defmodule BeamLisp.DaemonPortsTest do
     # pinning 0 is still ephemeral; the point is that the value comes from the
     # project rather than from the daemon's default.
     assert BeamLisp.Daemon.Server.startup_message(root, %{port: 5, pinned: true, error: nil}) =~ "pinned"
-    assert Ports.port_of(:ui) == Ports.port_of(:ui)
     _ = ctx
   end
 
   # ── helpers ──
+
+  # The port THIS session holds for `name`. `Ports.port_of/1` looks a name up
+  # machine-wide, and a claim's file is named by the NAME alone — so another
+  # tree's session (or a parallel test run) can hold `:ui` at the same moment
+  # and the lookup would answer with ITS port. Ask for our tree's claim.
+  defp session_port(root, name \\ :ui) do
+    Enum.find_value(Ports.list(), fn c ->
+      if to_string(c.name) == to_string(name) and c.root == root, do: c.port
+    end)
+  end
 
   defp ports_dir do
     with {:ok, base} <- Paths.runtime_dir(), do: {:ok, Path.join(base, "ports")}

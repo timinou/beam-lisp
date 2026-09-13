@@ -106,11 +106,15 @@ one.
 
 ## The shape
 
-A project map declares five keys. Anything else is reported as an unknown key
+A project map declares six keys. Anything else is reported as an unknown key
 rather than ignored, because a typo'd key that silently does nothing is the
 worst kind of configuration bug.
 
 - `:name` — the project's name, a string.
+- `:instance` — which checkout of this project is running, when more than one
+  might be: the qualifier its hosts carry. `:instance` when declared, else the
+  tree's git branch when that is not a default branch, else nothing. See
+  [names](names.bl.md).
 - `:paths` — library roots, relative to the file's directory.
 - `:tasks` — name → a file to run, or `{:run FILE :doc STRING :paths […]
   :watch BOOL}`.
@@ -122,7 +126,7 @@ per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp
-(def known-keys [:name :paths :tasks :ports :env :doc])
+(def known-keys [:name :instance :paths :tasks :ports :env :doc])
 
 (defn- key-name
   "A declaration's key as the STRING a command is typed with: `bl dev` looks up
@@ -215,6 +219,8 @@ shape, whatever the file said.
   (let [[paths perr]   (norm-strings (:paths m) ":paths" root)
         nm             (:name m)
         nerr           (if (or (nil? nm) (string? nm)) [] [":name must be a string"])
+        inst           (:instance m)
+        ierr           (if (or (nil? inst) (string? inst)) [] [":instance must be a string"])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
         [env eerr]     (norm-env (:env m))
@@ -224,18 +230,20 @@ shape, whatever the file said.
     {:path path
      :root root
      :name (if (string? nm) nm nil)
+     :instance (if (string? inst) inst nil)
      :paths paths
      :tasks tasks
      :ports ports
      :env env
-     :errors (concat perr nerr terr porerr eerr
+     :errors (concat perr nerr ierr terr porerr eerr
                      (map (fn [k] (str "unknown key " k)) unknown))}))
 
 (defn empty-project
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :paths [] :tasks {} :ports {} :env {} :errors []})
+  {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
+   :env {} :errors []})
 ```
 
 ## The project value for a directory

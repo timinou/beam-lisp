@@ -15,7 +15,7 @@ defmodule BeamLisp.Daemon.Server do
   use GenServer
   require Logger
 
-  alias BeamLisp.Daemon.{HTTP, Listener, Paths, Ports, Protocol, WatchRegistry}
+  alias BeamLisp.Daemon.{HTTP, Listener, Names, Paths, Ports, Protocol, WatchRegistry}
 
   @default_idle_seconds 8 * 60 * 60
 
@@ -168,7 +168,7 @@ defmodule BeamLisp.Daemon.Server do
   defp start_ui(root) do
     want = project_port(root, "ui") || 0
 
-    case Ports.claim(:ui, want, root: root) do
+    case Ports.claim(:ui, want, root: root, hosts: Names.hosts(root, "ui")) do
       {:ok, port} ->
         case serve_ui(port, root) do
           {:ok, pid} -> %{port: port, pid: pid, pinned: want != 0, error: nil}
@@ -229,11 +229,15 @@ defmodule BeamLisp.Daemon.Server do
   end
 
   @doc """
-  What the daemon says when it comes up. It names the tree, the session's URL,
-  and — because the port is ephemeral unless the project pins it — HOW to pin
-  it. The MCP line matters for the same reason: the session's port is the one
-  address an editor, an agent or a browser needs, and there is no second server
-  behind it.
+  What the daemon says when it comes up. It names the tree, the session's NAME
+  and the address behind it, and — because the port is ephemeral unless the
+  project pins it — HOW to pin it. The MCP line matters for the same reason:
+  the session's name is the one address an editor, an agent or a browser needs,
+  and there is no second server behind it.
+
+  Both spellings are printed on purpose. The name is what a human opens; the
+  loopback address is the truth underneath it, and it keeps answering when the
+  gateway is not running.
   """
   def startup_message(root, ui) do
     lines = ["bl daemon up for #{root}"]
@@ -248,10 +252,13 @@ defmodule BeamLisp.Daemon.Server do
               "ephemeral — pin it in env.bl with :ports {:ui 7700}"
             end
 
+          host = Names.host(root, "ui")
+
           lines ++
             [
-              "  ui:   http://127.0.0.1:#{port}   (#{pin})",
-              "  mcp:  http://127.0.0.1:#{port}/mcp   (the same MCP `bl mcp` serves over stdio)"
+              "  ui:   http://#{host}   → 127.0.0.1:#{port}   (#{pin})",
+              "  mcp:  http://#{host}/mcp   (the same MCP `bl mcp` serves over stdio)",
+              "        no gateway yet? http://127.0.0.1:#{port} — start one with `bl gateway start`"
             ]
 
         %{error: error} ->

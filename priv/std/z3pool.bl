@@ -66,6 +66,15 @@
 ;; the verify dialect wants a bare field, not an accessor call (an accessor
 ;; silently fails to prove — a lesson from PLAN-085).
 
+(defn- tree-pid
+  "The pool's supervisor pid, through the keeper — the one place children are
+   looked up. (An earlier version had the registry resolve them through a NAME,
+   which stopped being registered when the keeper took over: the registry then saw
+   no solvers, every checkout returned nil, and every check timed out. One source
+   of truth.)"
+  []
+  (call :z3-keeper [:pid]))
+
 (defn- pool-children
   "The pool's SOLVER children — every child that is not the lease server. Selected
    by child ID, not by comparing pids: a pid comparison against `(erlang/self)`
@@ -73,17 +82,16 @@
    registry, and reported five solvers everywhere else — measured). Resolved fresh
    on every checkout, so a restarted child is found by its new pid and a dead one
    is skipped."
-  [sup-name]
-  (let [sup (Process/whereis sup-name)]
-    (if (nil? sup)
+  [sup]
+  (if (nil? sup)
       (to-list [])
       (vec (filter (fn [c] (and (not= (:id c) :leases) (Process/alive? (:pid c))))
-                   (super/children sup))))))
+                   (super/children sup)))))
 
 (defn- free-solver [st]
   (let [taken (vals (:leases st))]
     (first (filter (fn [c] (not (some (fn [p] (= p (:pid c))) taken)))
-                   (pool-children (:sup st))))))
+                   (pool-children (tree-pid))))))
 
 (defn- release
   "Drop a lease and its monitor. Called by checkin and by :DOWN alike."
@@ -91,8 +99,7 @@
   (let [monref (first (filter (fn [kv] (= (val kv) lease)) (:mon st)))]
     (when (not (nil? monref))
       (Process/demonitor (key monref) (list :flush)))
-    {:sup (:sup st)
-     :leases (dissoc (:leases st) lease)
+    {:leases (dissoc (:leases st) lease)
      :mon (if (nil? monref) (:mon st) (dissoc (:mon st) (key monref)))
      :high-water (:high-water st)}))
 
@@ -102,7 +109,7 @@
   ;; verify dialect proves bare fields, and an accessor call silently fails.
   (invariant [leases] (<= (count leases) 4))
 
-  (init [sup] (ok {:sup sup :leases {} :mon {} :high-water 0}))
+  (init [_] (ok {:leases {} :mon {} :high-water 0}))
 
   (handle-call [:checkout who] [_from st]
     (let [c (free-solver st)]
@@ -110,8 +117,7 @@
         (reply nil st)
         (let [lease (erlang/make_ref)]
           (reply {:solver (:pid c) :lease lease}
-                 {:sup (:sup st)
-                  :leases (assoc (:leases st) lease (:pid c))
+                 {:leases (assoc (:leases st) lease (:pid c))
                   :mon (assoc (:mon st) (Process/monitor who) lease)
                   :high-water (max (:high-water st) (inc (count (:leases st))))})))))
 
@@ -133,35 +139,77 @@
   (strategy :one-for-one)
   (intensity 5 5000)
   ;; the registry is NAMED, which is how the prelude verbs address it
-  (child :leases z3-leases :z3-pool)
+  (child :leases z3-leases 0)
   (child :s0 z3-solver 0)
   (child :s1 z3-solver 1)
   (child :s2 z3-solver 2)
   (child :s3 z3-solver 3))
 
-(defn up? [] (not (nil? (Process/whereis :z3-pool))))
+;; Everything below addresses the pool through its KEEPER. `start-link` links a
+;; tree to whoever asked first — for a solver that is arbitrary: the caller is a
+;; worker, a request handler, a test process, and when it exits the pool goes with
+;; it. Measured: a soak's checks were all correct and the tree was gone by the
+;; next question, which is exactly how a mid-flight check turns into a wrong
+;; verdict. So one VM-lifetime process owns the tree, and the tree is linked to it.
+
+(defserver z3-keeper
+  ;; `start-link` answers with a tree RECORD (a map carrying the pid among other
+  ;; things); normalise once here so the rest of this file deals in pids.
+  (init [_]
+    (let [started (start-link z3-pool)]
+      (ok {:pid (if (map? started) (:pid started) started)})))
+  (handle-call [:pid] [_from st] (reply (:pid st) st))
+  (handle-info _msg [st] (noreply st)))
+
+(defn up?
+  "Is the pool running? The keeper's presence is the whole question: the tree is
+   linked to it, so a dead keeper means a dead tree, and `pool-stop!` stops the
+   keeper. Asking the keeper itself would be worse than useless here — a call to a
+   process that is not there is an EXIT, which a beam-lisp `catch` does not see, so
+   the first `ensure!` in a fresh VM would kill its own caller (measured: every
+   check in a 200-answer soak failed that way)."
+  []
+  (not (nil? (Process/whereis :z3-keeper))))
 
 (defn registry
   "The lease server, looked up through the tree each time. Asked afresh so a child
-   that OTP has restarted is found by its NEW pid — the reason the tree carries the
-   name and its children do not."
+   that OTP has restarted is found by its NEW pid — the reason the keeper carries
+   the name and the children do not."
   []
   (if (up?)
-    (super/child-of (Process/whereis :z3-pool) :leases)
+    (super/child-of (tree-pid) :leases)
     nil))
 
 (defn pool!
   "Start the tree (idempotent). Returns the number of solvers."
   []
+  ;; START AND NAME IT, race-safely. `start-link` does not register the tree, so
+  ;; the name is this function's job — and several callers can be inside this
+  ;; `when` at once (every `z3/check` ensures the pool). Measured before the fix:
+  ;; the loser of that race raised "name is already taken", and the pool it had
+  ;; just started was left running unregistered forever — which is how a check
+  ;; ended up calling a nil registry.
   (when (not (up?))
-    (let [pid (start-link z3-pool)]
-      ;; the tree itself is unregistered; give it the name its children look for
-      (Process/register pid :z3-pool)))
+    ;; `start`, not `start-link`: the keeper must outlive whoever asked for a
+    ;; solver. Several callers can be inside this branch at once, so the loser of
+    ;; the registration race stops the keeper it made — exactly one pool survives.
+    (let [pid (start z3-keeper)]
+      (when (nil? pid) (throw "z3-keeper failed to start"))
+      (try
+        (Process/register pid :z3-keeper)
+        (catch e (stop pid)))))
   n-solvers)
 
 (defn ensure! [] (if (up?) n-solvers (pool!)))
 (defn pool-size [] (if (up?) n-solvers 0))
-(defn pool-stop! [] (when (up?) (stop :z3-pool)) :ok)
+(defn pool-stop!
+  "Stop the pool: the KEEPER goes, and the tree it owns goes with it (that link is
+   the point of the keeper). Stopping only the tree left a keeper holding a dead
+   pid — measured as :noproc on the next checkout."
+  []
+  (let [k (Process/whereis :z3-keeper)]
+    (when (not (nil? k)) (stop k)))
+  :ok)
 
 (defn high-water
   "The most conversations that were in flight at once — the number that says
@@ -174,7 +222,10 @@
 (defn solvers
   "The solver pids in the tree, as `super/children` reports them — the same view
    an operator gets from the supervisor bundle."
-  [] (if (up?) (map (fn [c] (:pid c)) (pool-children :z3-pool)) (to-list [])))
+  []
+  (if (up?)
+    (map (fn [c] (:pid c)) (pool-children (tree-pid)))
+    (to-list [])))
 
 ;; ── leasing, bounded by a fence ──────────────────────────────────────────
 
@@ -220,7 +271,16 @@
   [smt model?]
   (with-solver (fn [] (:status (call (current) [:check smt model?])))))
 
-(defn command [smt] (call (current) [:command smt]))
+(defn- need-conversation!
+  "Refuse conversation verbs outside a lease. Without this the call goes to a nil
+   solver, which is an EXIT rather than an exception — invisible to every
+   `try/catch` in the language, and a silent death instead of an explanation."
+  []
+  (when (nil? (current))
+    (throw "no conversation is open — wrap this in z3/with-solver"))
+  (current))
+
+(defn command [smt] (call (need-conversation!) [:command smt]))
 (defn check-here
   ([] (check-here (to-list []) false false))
-  ([assume core? model?] (call (current) [:check-here assume core? model?])))
+  ([assume core? model?] (call (need-conversation!) [:check-here assume core? model?])))

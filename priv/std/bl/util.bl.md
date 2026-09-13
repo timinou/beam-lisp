@@ -66,10 +66,21 @@ a keyword list, realized eagerly because `Keyword.get` matches cons cells.
   (erlang/list_to_tuple (list k v)))
 
 (defn kw
-  "An Elixir keyword list from beam-lisp pairs: `(kw [:a 1] [:b 2])`.
-   Elixir option APIs read opts with Keyword.get/3, which a beam-lisp map does
-   not satisfy. Realized eagerly: Keyword.get pattern-matches cons cells."
+  "An Elixir keyword list from beam-lisp pairs: `(kw [:a 1] [:b 2])`. ONE
+   PAIR PER VECTOR — Elixir option APIs read opts with Keyword.get/3, which a
+   beam-lisp map does not satisfy. Realized eagerly: Keyword.get
+   pattern-matches cons cells.
+
+   A single vector of four elements is the same options written flat, and
+   `(kw [:a 1 :b 2])` would silently keep only `:a` — exactly the kind of
+   option that goes missing without a symptom until the feature that needed it
+   quietly does not work. So it is refused, by name."
   [& pairs]
+  (when (and (erlang/=:= (erlang/length pairs) 1)
+             (not (erlang/=:= 2 (count (first pairs)))))
+    (throw (ex-info (str "util/kw: one pair per vector — (kw [:a 1] [:b 2]), not "
+                         (pr-str (first pairs)))
+                    {:pairs (first pairs)})))
   (to-list (map (fn [p] (kw-pair (first p) (second p))) pairs)))
 ```
 

@@ -98,6 +98,25 @@ defmodule BeamLisp.TestVerbTest do
     assert out =~ "warm-test"
   end
 
+  test "a test library that vanished from core's MODULE is re-loaded", %{dir: dir} do
+    write(dir, "test/rel_test.bl", "(ns rel-test)\n(deftest a (is (= 1 1)))\n")
+
+    # The observed failure state: a later reload puts core back from its BEAM,
+    # which carries core.bl alone — so the assertion runtime the `is` macro
+    # expands into is gone from the module, while `deftest` still resolves in
+    # core's ENV. ward's guard checked the env alone, said "available", skipped
+    # the load, and every file in the run then died on `is-report/4 is undefined`.
+    :code.purge(BeamLisp.Ns.Core)
+    :code.delete(BeamLisp.Ns.Core)
+    {:module, _} = :code.load_file(BeamLisp.Ns.Core)
+
+    refute :erlang.function_exported(BeamLisp.Ns.Core, :"is-report", 4),
+           "precondition: the beam carries core.bl alone"
+
+    {code, out} = run(dir, ["test"])
+    assert code == 0, "a run in this state must still work; it said:\n#{out}"
+  end
+
   # ── helpers ──
 
   defp write(dir, rel, text) do
@@ -164,9 +183,11 @@ defmodule BeamLisp.TestVerbTest do
     result
   end
 
+  defp wait_for(fun, tries \\ 250)
+
   defp wait_for(_fun, 0), do: :timeout
 
-  defp wait_for(fun, tries \\ 250) do
+  defp wait_for(fun, tries) do
     if fun.(), do: :ok, else: (Process.sleep(20); wait_for(fun, tries - 1))
   end
 

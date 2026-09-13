@@ -1,0 +1,377 @@
+; research/autovcs/autovcs.bl — a daemon that versions its own work.
+;
+; ── The problem ──────────────────────────────────────────────────────────────
+;
+; A daemon edits a tree: an agent asks for a definition to change, a reload
+; bundle lands, a generated file is rewritten. Today that work is invisible.
+; The tree on disk is the only record, and a tree is a single state, not a
+; history: nothing says who asked for a byte, why, or how to take it back.
+;
+; ── The shape ────────────────────────────────────────────────────────────────
+;
+; Every mutating request the daemon serves becomes a CHANGE:
+;
+;   1. the files are written
+;   2. jj snapshots the working copy and the daemon DESCRIBES it
+;      ("<actor>: <intent>"), then opens the next change on top
+;   3. jj's operation log and commit log are mirrored into datom
+;
+; So the timeline becomes queryable facts, joined with the requests that caused
+; it: WHO asked, WHY, WHICH paths moved, WHICH jj operation recorded it, WHEN,
+; and HOW LONG it took. Every operation is undoable — `jj op restore` puts the
+; whole tree back the way it was.
+;
+; ── Boundaries ───────────────────────────────────────────────────────────────
+;
+; A PROBE. It lives in research/, is driven by demo.sh, changes no daemon and no
+; stdlib namespace. jj does the part that is hard (snapshotting, change ids that
+; survive rewrites, the operation log, restore); datom holds the part that must
+; be QUERYABLE. The mirror is DERIVED — every fact is keyed by the content-
+; addressed id jj already gave it (op id, commit id), so rebuilding it yields
+; the same facts, and re-transacting it is a no-op.
+;
+; Two facts the mirror holds that jj does not: the request that caused an
+; operation, and the paths that request touched as the DAEMON saw them. Those
+; are the daemon's own testimony, and they are what makes intent joinable.
+;
+; You must run it with the stdlib on the path (datom.time reaches z3pool):
+;   bl run -p priv/std research/autovcs/autovcs.bl -- serve  <workspace>
+;   bl run -p priv/std research/autovcs/autovcs.bl -- script <workspace> <file>
+;
+; One JSON request per line in; one JSON reply per line out.
+;   {"op":"write","id":"r1","path":"a.bl","content":"…","by":"agent:x","why":"…"}
+;   {"op":"delete","id":"r2","path":"b.bl","by":"…","why":"…"}
+;   {"op":"status"} | {"op":"history"} | {"op":"touched","path":"a.bl"}
+;   {"op":"undo","id":"<jj operation id>"} | {"op":"stop"}
+
+(ns autovcs
+  (:require [datom] [datom.conn] [datom.store-fjall]
+            [interop :as j] [bl.util :as u] [clojure.string :as cs]))
+
+(def JJ (or (System/get_env "AUTOVCS_JJ") "jj"))
+
+; The mirror directory is INSIDE the tree it versions, so the tree's own
+; .gitignore/.jjignore must exclude it — otherwise every checkpoint tracks the
+; journal that describes the checkpoint. demo.sh writes that ignore line, and
+; status reports whether it is there.
+(def MIRROR ".autovcs")
+
+; jj templates: one JSON object per line. `json(self)` is jj's own serializer,
+; so field names here are jj's, not a format we invented and must maintain.
+(def T "json(self) ++ \"\\n\"")
+
+(def SCHEMA
+  [{:db/ident :op/id        :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :op/parent    :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :op/desc      :db/valueType :db.type/string}
+   {:db/ident :op/args      :db/valueType :db.type/string}
+   {:db/ident :op/user      :db/valueType :db.type/string}
+   {:db/ident :op/host      :db/valueType :db.type/string}
+   {:db/ident :op/start     :db/valueType :db.type/string}
+   {:db/ident :op/snapshot  :db/valueType :db.type/boolean}
+   {:db/ident :op/workspace :db/valueType :db.type/string}
+   {:db/ident :cm/id        :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :cm/change    :db/valueType :db.type/string :db/index true}
+   {:db/ident :cm/parent    :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :cm/desc      :db/valueType :db.type/string}
+   {:db/ident :cm/author    :db/valueType :db.type/string}
+   {:db/ident :cm/time      :db/valueType :db.type/string}
+   {:db/ident :cm/path      :db/valueType :db.type/string :db/index true :db/cardinality :db.cardinality/many}
+   {:db/ident :req/id       :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :req/by       :db/valueType :db.type/string}
+   {:db/ident :req/why      :db/valueType :db.type/string}
+   {:db/ident :req/path     :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :req/op       :db/valueType :db.type/string :db/index true}
+   {:db/ident :req/commit   :db/valueType :db.type/string}
+   {:db/ident :req/at       :db/valueType :db.type/instant}
+   {:db/ident :req/ms       :db/valueType :db.type/long}
+   {:db/ident :meta/key     :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :meta/value   :db/valueType :db.type/string}])
+
+; ── json field access ─────────────────────────────────────────────────────────
+;
+; Jason decodes objects into maps whose keys may be atoms or strings; neither
+; the mirror nor a query should care which. One accessor, both spellings.
+
+(defn- fld [m k]
+  (let [v (get m k)]
+    (if (nil? v) (get m (name k)) v)))
+
+; ── the jj boundary ───────────────────────────────────────────────────────────
+;
+; jj is a process. stderr folds into stdout because a jj failure is a message
+; the daemon must show, never a silence.
+
+(defn- sh [ws argv]
+  (let [r (System/cmd JJ (u/to-list argv) (u/kw [:cd ws] [:stderr_to_stdout true]))]
+    {:out (erlang/element 1 r) :status (erlang/element 2 r)}))
+
+(defn- lines-of [res]
+  (filterv (fn [l] (> (count l) 0)) (cs/split-lines (:out res))))
+
+(defn- jj [ws argv]
+  (let [r (sh ws argv)]
+    {:status (:status r) :out (:out r) :lines (lines-of r)}))
+
+(defn- jj-json
+  "jj's templated JSON output as maps, one per object."
+  [ws argv]
+  (let [r (jj ws argv)]
+    (if (= 0 (:status r))
+      (mapv j/json-> (:lines r))
+      [])))
+
+(defn- head-op-id [ws]
+  (cs/trim (:out (jj ws ["op" "log" "-n" "1" "--no-graph" "-T" "self.id()"]))))
+
+(defn- at-commit [ws]
+  (first (jj-json ws ["log" "-r" "@" "--no-graph" "-T" T])))
+
+(defn- changed-paths [ws commit-id]
+  (let [r (jj ws ["diff" "--summary" "-r" commit-id])]
+    (if (= 0 (:status r))
+      (mapv (fn [l] (cs/trim (subs l 2))) (filterv (fn [l] (> (count l) 2)) (:lines r)))
+      [])))
+
+; ── the mirror (jj → datom) ───────────────────────────────────────────────────
+
+(defn- known-set [db query]
+  (into #{} (map first (datom/q query db))))
+
+(defn- op-facts [i o]
+  (assoc
+    {:op/id (fld o "id")
+     :op/parent (vec (or (fld o "parents") []))
+     :op/desc (or (fld o "description") "")
+     :op/args (or (get (fld o "attributes") "args") "")
+     :op/user (or (fld o "username") "")
+     :op/host (or (fld o "hostname") "")
+     :op/start (get (fld o "time") "start")
+     :op/snapshot (true? (fld o "is_snapshot"))
+     :op/workspace (or (fld o "workspace_name") "")}
+    :db/id (- 0 (inc i))))
+
+(defn- commit-facts [i c paths]
+  (assoc
+    {:cm/id (fld c "commit_id")
+     :cm/change (fld c "change_id")
+     :cm/parent (vec (or (fld c "parents") []))
+     :cm/desc (or (fld c "description") "")
+     :cm/author (or (get (fld c "author") "name") "")
+     :cm/time (get (fld c "author") "timestamp")
+     :cm/path paths}
+    :db/id (- 0 (+ 100000 (inc i)))))
+
+(defn- watermark
+  "The last operation this mirror ingested, as the mirror itself remembers it.
+   Durable, because the daemon restarts and the mirror must not start over."
+  [st]
+  (let [rows (datom/q '[:find ?v :where [?e :meta/key "op-head"] [?e :meta/value ?v]]
+                      (datom/db (:conn st)))]
+    (if (> (count rows) 0) (first (first rows)) "")))
+
+(defn mirror!
+  "Ingest whatever jj has recorded that datom has not.
+
+   Two guarantees, both cheap. The watermark makes the common case free: a query
+   that changed nothing asks jj for one id (one process, ~100 ms) and stops. The
+   content-addressed ids make the ingest idempotent: a fact already present is
+   skipped, so a rebuild of the mirror yields the same facts and no duplicates."
+  [st]
+  (let [ws (:ws st)
+        head (head-op-id ws)]
+    (if (= head (watermark st))
+      {:ops 0 :commits 0 :skipped true}
+      (let [db (datom/db (:conn st))
+            seen-ops (known-set db '[:find ?id :where [?e :op/id ?id]])
+            seen-cms (known-set db '[:find ?id :where [?e :cm/id ?id]])
+            new-ops (filterv (fn [o] (not (contains? seen-ops (fld o "id"))))
+                             (jj-json ws ["op" "log" "--no-graph" "-T" T]))
+            new-cms (filterv (fn [c] (not (contains? seen-cms (fld c "commit_id"))))
+                             (jj-json ws ["log" "-r" "all()" "--no-graph" "-T" T]))
+            tx (into (into [] (map-indexed op-facts new-ops))
+                     (into [] (map-indexed
+                                (fn [i c] (commit-facts i c (changed-paths ws (fld c "commit_id"))))
+                                new-cms)))]
+        (datom/transact! (:conn st)
+          (conj tx {:db/id -1 :meta/key "op-head" :meta/value head}))
+        {:ops (count new-ops) :commits (count new-cms) :skipped false}))))
+
+; ── the change itself ─────────────────────────────────────────────────────────
+;
+; Snapshot, describe, open the next change. `jj describe` snapshots the working
+; copy as a side effect of opening the workspace — there is no staging area and
+; no separate commit step — so the daemon never has an "uncommitted" state,
+; which is exactly the property an automatic VCS needs. The operation id is read
+; AFTER the describe and before `jj new`: it is the operation whose recorded
+; argv carries the intent, so jj's own op log reads like the session's audit
+; trail.
+
+(defn- checkpoint! [ws by why]
+  (jj ws ["describe" "-m" (str by ": " why)])
+  (let [c (at-commit ws)
+        op (head-op-id ws)]
+    (jj ws ["new"])
+    {:commit (or (fld c "commit_id") "") :op op}))
+
+(defn- now-ms [] (System/system_time :millisecond))
+(defn- sync! [st] (if (:store st) (datom.store-fjall/sync! (:store st))))
+
+; ── requests ──────────────────────────────────────────────────────────────────
+
+(defn- record-request! [st r result paths ms]
+  (datom/transact! (:conn st)
+    [{:db/id -1
+      :req/id (fld r "id")
+      :req/by (or (fld r "by") "daemon")
+      :req/why (or (fld r "why") "")
+      :req/op (:op result)
+      :req/commit (:commit result)
+      :req/at (now-ms)
+      :req/ms ms
+      :req/path paths}]))
+
+(defn- mutate [st r kind]
+  (let [t0 (now-ms)
+        ws (:ws st)
+        rel (fld r "path")
+        path (str ws "/" rel)
+        target (or (fld r "target") rel)
+        by (or (fld r "by") "daemon")
+        why (or (fld r "why") (str kind " " rel))]
+    (File/mkdir_p! (Path/dirname path))
+    (if (= kind "write")
+      (File/write! path (or (fld r "content") ""))
+      (if (File/exists? path) (File/rm! path)))
+    (let [res (checkpoint! ws by why)
+          m0 (now-ms)
+          _ (mirror! st)
+          mirror-ms (- (now-ms) m0)]
+      (record-request! st r res [target] (- (now-ms) t0))
+      (sync! st)
+      (merge {:ok true :request (fld r "id") :paths [target]} res
+             {:ms (- (now-ms) t0) :mirror_ms mirror-ms}))))
+
+(defn- history
+  "The timeline the daemon alone can tell: its own requests joined to the jj
+   operations they produced. An operation with no request is somebody else's
+   (a hand-run jj command); a request with no operation never reached the tree."
+  [st]
+  (let [rows (datom/q
+               '[:find ?rid ?by ?why ?ms ?at ?path ?oid ?desc ?args
+                 :where [?r :req/id ?rid] [?r :req/by ?by] [?r :req/why ?why]
+                        [?r :req/ms ?ms] [?r :req/at ?at] [?r :req/path ?path]
+                        [?r :req/op ?oid]
+                        [?o :op/id ?oid] [?o :op/desc ?desc] [?o :op/args ?args]]
+               (datom/db (:conn st)))]
+    (mapv (fn [row]
+            {:request (get row 0) :by (get row 1) :why (get row 2) :ms (get row 3)
+             :at (get row 4) :path (get row 5) :op (get row 6)
+             :jj_desc (get row 7) :jj_args (get row 8)})
+          rows)))
+
+(defn- touched [st path]
+  (let [rows (datom/q
+               '[:find ?rid ?by ?why ?at ?op
+                 :in $ ?path
+                 :where [?r :req/path ?path] [?r :req/id ?rid] [?r :req/by ?by]
+                        [?r :req/why ?why] [?r :req/at ?at] [?r :req/op ?op]]
+               (datom/db (:conn st)) path)]
+    (mapv (fn [row] {:request (get row 0) :by (get row 1) :why (get row 2)
+                     :at (get row 3) :op (get row 4)})
+          rows)))
+
+(defn- counts [st]
+  (let [db (datom/db (:conn st))
+        one (fn [q] (let [r (datom/q q db)] (if (> (count r) 0) (first (first r)) 0)))]
+    {:ops (one '[:find (count ?e) :where [?e :op/id _]])
+     :commits (one '[:find (count ?e) :where [?e :cm/id _]])
+     :requests (one '[:find (count ?e) :where [?e :req/id _]])}))
+
+(defn- status [st]
+  (let [ws (:ws st)
+        m (mirror! st)
+        head (at-commit ws)
+        ignores (if (File/exists? (str ws "/.gitignore"))
+                  (File/read! (str ws "/.gitignore"))
+                  "")]
+    {:ok true
+     :workspace ws
+     :jj {:version (cs/trim (:out (jj ws ["--version"])))
+          :head_commit (fld head "commit_id")
+          :head_change (fld head "change_id")
+          :head_desc (fld head "description")
+          :latest_op (head-op-id ws)}
+     :mirror (merge (counts st) {:new m})
+     :mirror_ignored (includes? ignores (str MIRROR "/"))}))
+
+(defn- undo [st r]
+  (let [op-id (fld r "id")
+        res (sh (:ws st) ["op" "restore" op-id])
+        m (mirror! st)]
+    (sync! st)
+    {:ok (= 0 (:status res))
+     :restored_to op-id
+     :jj_out (cs/trim (:out res))
+     :mirror m}))
+
+(defn- handle [st r]
+  (let [kind (fld r "op")]
+    (cond
+      (= kind "write")  (mutate st r "write")
+      (= kind "delete") (mutate st r "delete")
+      (= kind "status") (status st)
+      (= kind "history") {:ok true :history (history st)}
+      (= kind "touched") {:ok true :path (fld r "path") :requests (touched st (fld r "path"))}
+      (= kind "undo")   (undo st r)
+      :else             {:ok false :error (str "unknown request: " kind)})))
+
+; ── the loop ──────────────────────────────────────────────────────────────────
+
+(defn- reply [value] (println (j/->json value)))
+
+(defn- serve [st]
+  (let [line (io/get_line :standard_io)]
+    (if (or (nil? line) (= line :eof))
+      (do (reply {:ok true :stopped true}) :done)
+      (let [text (cs/trim line)]
+        (if (= 0 (count text))
+          (serve st)
+          (let [r (try (j/json-> text) (catch e {:op "bad" :error (str e)}))
+                out (try (handle st r) (catch e {:ok false :error (str e)}))
+                stop? (= (fld r "op") "stop")]
+            (reply out)
+            (if stop? :done (serve st))))))))
+
+(defn- script
+  "The same handler, driven from a file: a demo is a file, not a shell pipeline."
+  [st file]
+  (let [text (File/read! file)
+        reqs (filterv (fn [l] (> (count (cs/trim l)) 0)) (cs/split-lines text))]
+    (reduce
+      (fn [_ line]
+        (let [r (j/json-> line)
+              out (try (handle st r) (catch e {:ok false :error (str e)}))]
+          (reply out)))
+      nil reqs)))
+
+(defn- open-state [ws]
+  (let [dir (str ws "/" MIRROR)]
+    (File/mkdir_p! dir)
+    (if (datom.store-fjall/available?)
+      (let [store (datom.store-fjall/open (str dir "/mirror.fjall"))
+            conn (datom.conn/connect-with store SCHEMA)]
+        {:ws ws :store store :conn conn :durable true})
+      (let [conn (datom/connect SCHEMA)]
+        {:ws ws :store nil :conn conn :durable false}))))
+
+(defn- main []
+  (let [argv (vec (BeamLisp/argv))
+        cmd (first argv)
+        ws (second argv)]
+    (cond
+      (= cmd "serve")  (do (serve (open-state ws)) (println "autovcs: stopped"))
+      (= cmd "script") (script (open-state ws) (nth argv 2))
+      :else (println "usage: autovcs serve <workspace> | autovcs script <workspace> <requests.jsonl>"))))
+
+(main)

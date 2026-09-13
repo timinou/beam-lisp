@@ -294,6 +294,49 @@ an unchanged file pays for that analysis once; an edit is a new entry, because
 the name is the content hash. `symbols` and `dead-code` share the one analysis,
 which is why `dead-code` — two analyses' worth of work — costs one.
 
+### override
+
+The `.bl` the compiler ships is on every tree's search path — and the search
+order (tree > configured roots > shipped tiers) means a project file whose
+namespace matches already shadows a shipped one. `bl override` makes that a
+workflow. A tree's `overrides/` directory is a library root by convention: no
+flag, no config.
+
+#### `bl override vendor NS...`
+
+Copy a shipped namespace's source into `overrides/` to fix a bug in it. The
+copy shadows the shipped file for every command in the tree; the shipped file
+is untouched.
+
+#### `bl override apply PATCH.bl`
+
+Apply a patch: a beam-lisp PROGRAM exporting `(transform [ctx])`, handed the
+shipped sources plus the codebase database to locate its targets by structure
+(`:db-for`, `:read-shipped`), returning the new sources and its test files.
+Landing is all-or-nothing, verified before it takes effect:
+
+- logical, implicit: the compiler's diagnostics must be clean on each new
+  source, and each overridden namespace must load in an isolated env;
+- unit, implicit: the shipped tests of each touched namespace must pass
+  against the override (when a checkout's test tree is visible);
+- unit, explicit: the patch's own tests must pass.
+
+Any failure rolls every written file back and exits `1`.
+
+```sh
+$ bl override apply patches/edn_tagged_readers.bl
+wrote overrides/clojure/edn.bl
+✓ override applied — 1 file(s), 2 test file(s) passed
+```
+
+#### `bl override list · diff NS · revert NS...`
+
+See what this tree shadows and whether it drifted, diff an override against
+the shipped source, or drop an override and return to shipped behavior.
+
+See research/p17_overrides/ for a worked patch (teaching clojure.edn tagged
+literals via :readers/:default).
+
 ### build
 
 #### `bl build PATH... [--out DIR] [--force] [--jobs N] [--native]`
@@ -367,6 +410,16 @@ bl serve: server.bl running — Ctrl+C to stop
 `(bl.serve/port 4043)` where the literal port would go, and the flag makes that
 call answer `N`:
 
+write `(bl.serve/port :web 4043)` and the port comes from the project's
+`:ports {:web 4000}` (`--port N` still wins), claimed in the session's registry
+and registered with the name it answers to — so the app is reachable at
+`http://web.<project>.test` and no human reads the number. A port another live
+process holds is an error naming the owner, never a silent move.
+
+```clojure
+(web/serve {:port (bl.serve/port :web 4043) :plug router})
+```
+
 ```clojure
 (ns mini-server
   (:require [web]))
@@ -376,8 +429,6 @@ call answer `N`:
 
 (web/serve {:port (bl.serve/port 4043) :plug router})
 ```
-
-Exit `1` when the program raises, `2` when no FILE is given. The web layer needs
 `bandit`, which the release ships.
 
 #### `bl daemon start|stop|status`
@@ -398,6 +449,74 @@ bl daemon
 ```
 
 `status` exits `0` when a daemon answers, `1` when none is running.
+
+### ports · ui · open · gateway
+
+#### `bl ports`
+
+Every port a session has claimed, name first: the host it answers at, the number
+behind it, the owning tree and its pid. A claim with no name — a port nobody
+declared — still lists, with its loopback address.
+
+```sh
+$ bl ports
+  ui    http://beam-lisp.test        → 51337  beam-lisp (pid 1812553)
+  web   http://web.beam-lisp.test    → 4000   beam-lisp (pid 1812553)
+
+  2 name(s) registered, but no gateway answers them:
+      bl gateway start    (one per user; see bl install gateway)
+```
+
+The last two lines appear only when names are registered and nothing is
+listening for them. Exit `0`; an empty registry prints one line saying so.
+
+#### `bl open NAME [--open] [--port N]`
+
+The address behind a port name — the everyday verb, so nobody reads a number.
+It prints the name and the loopback address it routes to; `--open` hands the
+first one to the desktop's opener. `NAME` is a project port name (`web`) or a
+raw port number. Exit `1` when nothing live holds the name, `2` with no
+argument.
+
+```sh
+$ bl open web
+http://web.beam-lisp.test/
+  → http://127.0.0.1:4000/
+```
+
+#### `bl ui [--open]`
+
+The session's own address — the page and its `/mcp` endpoint, one URL. Exactly
+`bl open ui`: one implementation, so the terminal and the dashboard cannot
+disagree about where the session is. Exit `1` when no session is running for
+this tree.
+
+#### `bl gateway [start|stop|status|run]`
+
+The one listener that answers NAMES: one per user, holding the port a URL may
+leave out (80 when it can), reading `Host:` and splicing the connection to the
+port that registered that name. With no subcommand it reports what it is doing —
+the port, and every name it routes.
+
+```sh
+$ bl gateway
+bl gateway on 127.0.0.1:80 and [::1]:80   (pid 1900112)
+  beam-lisp.test       → 127.0.0.1:51337  beam-lisp
+  web.beam-lisp.test   → 127.0.0.1:4000   beam-lisp
+```
+
+`start` uses the systemd user unit when one is installed and detaches otherwise;
+`stop` stops the running one; `run` is the foreground process the unit execs —
+it blocks, and a pinned `--port N` that cannot be bound is an error rather than
+a silent move.
+
+Exit `0` when the gateway is up; `stop` and `status` exit `1` when none was
+running; `2` on an unknown subcommand.
+
+Names are derived from the tree, so the whole story is in
+[../dev/names.bl.md](../dev/names.bl.md): `<port>.<project>.test` and its
+`.localhost` twin, qualified by `:instance` when two checkouts of one project
+want different names.
 
 ### doc
 
