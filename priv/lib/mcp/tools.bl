@@ -82,12 +82,25 @@
    :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
    :sources (to-list (map (fn [ns-str] [ns-str nil]) ["codebase" "typed"]))})
 
+(defn- project-roots
+  "The tree's declared roots and the loader sources under them, WITHOUT reading
+   a byte of any of them. A plan is a count and a name; reading every source to
+   name them would cost what the mount costs (see mount-plan)."
+  []
+  (let [p (env/project (BeamLisp/cwd))
+        roots (to-list (:paths p))]
+    (when (seq roots)
+      {:name (or (:name p) "project")
+       :roots roots
+       :files (to-list (mapcat u/expand-targets roots))})))
+
 (defn- project-mount
   "The tree's own namespaces as a mount group — from env.bl's `:paths`, which
-   are absolute, already discovered by walking up from the client's cwd — or nil
-   when there is no project file, no roots, or nothing loadable under them.
+   are absolute, already discovered by walking up from the command's cwd — or
+   nil when there is no project file, no roots, or nothing loadable under them.
    `exclude` names namespaces another group already mounts, so one source is
-   never indexed twice."
+   never indexed twice. This is where the tree is READ: `u/ns-of` parses each
+   file's head, which is why the plan above does not do it."
   [exclude]
   (let [p (env/project (BeamLisp/cwd))
         roots (to-list (:paths p))]
@@ -117,6 +130,21 @@
   (let [tree (project-mount (set (map first (:sources engine-mount))))]
     (if (some? tree) [engine-mount tree] [engine-mount])))
 
+(defn mount-plan
+  "What a mount WOULD index, without reading a byte of it: one row per group,
+   with the roots and a source COUNT. A handshake has to answer fast, and naming
+   the sources costs a parse each — minutes on a real corpus — so the plan speaks
+   in counts, and `project-mount` does the reading when the mount is paid for."
+  []
+  (let [tree (project-roots)]
+    (to-list
+      (concat [{:name (:name engine-mount) :title (:title engine-mount)
+                :sources (count (:sources engine-mount))}]
+              (when (some? tree)
+                [{:name (:name tree)
+                  :sources (count (:files tree))
+                  :roots (to-list (:roots tree))}])))))
+
 (defn- offset-facts
   "Shift every :db/id by delta so multiple files never collide. codebase.bl
    uses fixed id bases per index-source, so two mounts into one conn would
@@ -139,15 +167,24 @@
     (throw (ex-info (str "mcp.tools: no source for " ns-str " on the load path")
                     {:ns ns-str :searched (BeamLisp.Tiers/dirs)}))))
 
-(defn- mount!
-  "Index every mount group into one fresh datom conn, id-offsetting each source
-   so two files never collide, and tally what each group contributed. Returns
-   {:conn … :groups […] :core-names #{…}} — the groups are what code/list
-   reports and core-names is what `unknown-callees` measures against, so both
-   are read OFF THE MOUNT instead of asked of the runtime later."
+(defn- tree-key
+  "Which tree a mount belongs to: the project file's root, or the command's cwd
+   when there is none. The memo is PER VM and the daemon serves many clients
+   from one, so a mount may only be reused for the tree it was built for —
+   otherwise a client standing in one project would be answered with another
+   one's facts, which is worse than being slow."
   []
+  (let [p (env/project (BeamLisp/cwd))]
+    (or (:root p) (BeamLisp/cwd))))
+
+(defn- index-groups!
+  "Index GROUPS into one fresh datom conn, id-offsetting each source so two
+   files never collide, and tally what each group contributed. Returns
+   {:key … :conn … :groups […] :core-names #{…}} — the groups are what code/list
+   reports, core-names is what `unknown-callees` measures against, and the key
+   is the tree the memos compare before reusing any of it."
+  [groups key]
   (let [conn (codebase/connect-codebase)
-        groups (mount-groups)
         rows (reduce
                (fn [acc [g [ns-str src]]]
                  (let [facts (codebase/index-source sigs ns-str (or src (mount-source ns-str)))
@@ -168,7 +205,8 @@
     ;; The instruction corpus mounts beside the code facts: one conn, so
     ;; code/query reaches the :instr/* facts with the same datalog.
     (instr/mount! conn)
-    {:conn conn
+    {:key key
+     :conn conn
      :groups (to-list
                (map (fn [g]
                       (let [rs (of-group (:name g))
@@ -192,12 +230,19 @@
      :core-names (into (set (BeamLisp.Env/public_names "core"))
                        (mapcat :names (:rows rows)))}))
 
-; Built once, on first use — requiring this namespace reads no files and
-; transacts nothing; the mount happens the first time a tool asks for it.
+; The mount is built on first use, and it is built in the order a client
+; experiences it: the ENGINE first — two namespaces, seconds — because a
+; handshake has to answer fast (an editor gives up on a slow one) and because
+; the instruction corpus is read off it. The TREE follows, from env.bl's
+; :paths, the moment a code question actually arrives: a real tree is minutes to
+; index (blueprint: 43 sources, ~90s; beam-lisp's OWN :paths, 327 sources,
+; minutes), and charging that to `initialize` would make the server look dead
+; before it had been asked anything. `mounted?` tells the two states apart and
+; `plan-line` says what is still coming.
 ;
 ; "Once" means once while the memo is USABLE. A conn's store and blob store are
-; ETS tables owned by the process that mounted them, so this atom — VM-global,
-; written by whichever process asked first — can outlive what it names. In the
+; ETS tables owned by the process that mounted them, so these atoms — VM-global,
+; written by whichever process asked first — can outlive what they name. In the
 ; daemon that is the normal case, not an edge: commands run in one worker, and
 ; a worker that dies (a linked crash, a staleness restart) takes the tables
 ; with it while the memo keeps handing the dead conn out. Every later request
@@ -205,22 +250,46 @@
 ; existing ETS table", which reads like a corrupt store rather than what it is:
 ; a memo outliving its owner. So ask before trusting one.
 ;
-; The mount is held as ONE value — conn, groups and core-names together — so a
+; Each mount is held as ONE value — conn, groups and core-names together — so a
 ; re-mount cannot hand out a conn from one build and counts from another.
+(def ^:private the-engine (atom nil))
 (def ^:private the-mount (atom nil))
 
-(defn- mounted []
-  (let [m @the-mount]
-    (if (and (some? m) (datom/alive? (:conn m)))
+(defn- live-mount
+  "The memo discipline in one place, for both mounts: hand back the current one
+   when its substrate is still there AND it belongs to this tree, otherwise
+   rebuild and CAS it in."
+  [cell key rebuild]
+  (let [m @cell]
+    (if (and (some? m) (= key (:key m)) (datom/alive? (:conn m)))
       m
       (let [_ (when (some? m) (datom/release! (:conn m)))
-            fresh (mount!)]
-        (if (compare-and-set! the-mount m fresh) fresh @the-mount)))))
+            fresh (rebuild)]
+        (if (compare-and-set! cell m fresh) fresh @cell)))))
+
+(defn- mount-engine! [] (index-groups! [engine-mount] nil))
+(defn- mount! [] (index-groups! (mount-groups) (tree-key)))
+
+(defn engine-conn
+  "The language's own index, on its own: what the handshake and the instruction
+   corpus read, so a client is told how to hold this server without waiting for
+   a tree to be indexed first. It does not depend on the tree, so it is not
+   keyed by one."
+  []
+  (:conn (live-mount the-engine nil mount-engine!)))
+
+(defn mounted?
+  "Whether THIS tree has been indexed yet — the question the instruction corpus
+   asks before it reports counts (a plan is honest; a count of zero is not)."
+  []
+  (let [m @the-mount]
+    (and (some? m) (= (tree-key) (:key m)) (datom/alive? (:conn m)))))
 
 (defn conn
-  "The self-indexed codebase: one datom conn over every mounted source."
+  "The self-indexed codebase: one datom conn over every mounted source. First
+   use indexes the tree as well, so this is the call a code question pays for."
   []
-  (:conn (mounted)))
+  (:conn (live-mount the-mount (tree-key) mount!)))
 
 (defn mounts
   "What this server serves, in order: the engine, then — when the command runs
@@ -228,13 +297,27 @@
    Each entry is a `code/list` row: name, title, description, its namespaces,
    the fn/call counts it contributed, and (for a tree) the roots it came from."
   []
-  (:groups (mounted)))
+  (:groups (live-mount the-mount (tree-key) mount!)))
 
 (defn core-names
   "The always-defined set `unknown-callees` measures against: the public core
-   names plus every function this mount indexed (see mount!'s note)."
+   names plus every function this mount indexed (see index-groups!'s note)."
   []
-  (:core-names (mounted)))
+  (:core-names (live-mount the-mount (tree-key) mount!)))
+
+(defn plan-line
+  "The mount plan as one sentence, in the voice of the live counts it stands in
+   for — what a client is owed when the tree is not indexed yet."
+  []
+  (join " + "
+        (map (fn [r]
+               (str (get r :name) " (" (get r :sources)
+                    (if (= 1 (get r :sources)) " source" " sources")
+                    (if (some? (get r :roots))
+                      (str " under " (join " " (get r :roots)))
+                      "")
+                    ")"))
+             (to-list (mount-plan)))))
 
 ;; ── tool 1: code/list ───────────────────────────────────────────────
 
