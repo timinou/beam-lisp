@@ -432,23 +432,143 @@
     (read-and-analyze ns-str path root)
     (catch e {:file path :skipped (ex-message e)})))
 
-(defn- merge-one
-  "The half that needs the connection: band the facts, commit them, report.
+(def MERGE-CHUNK
+  "Files merged per transaction.
 
-   Separated from the analysis because it is the only part that cannot run in
-   a worker — see the note above `DEFAULT-WORKERS`."
-  [conn offset r]
+   ONE, and measured rather than assumed. Batching a corpus merge looked like a
+   free win — fewer calls, the same guarantee (no query sees an embedding whose
+   function does not exist) — and it is a loss. Ten cold sources, serial, one
+   machine, one load, three runs each:
+
+       16 files/transaction    18584  18936  20097 ms
+        1 file/transaction     15525  14734  15249 ms
+
+   A wider transaction is slower than its width in narrower ones, which is the
+   same shape the analysis loop had before `keep`/`into` became a loop: cost
+   growing faster than the work. So the batch that saves calls pays elsewhere,
+   and the per-file transaction — the shape a live `index-source!` already
+   needed — is also the fast one.
+
+   Kept as a named knob because the number is worth re-measuring whenever the
+   transaction path changes."
+  1)
+
+(defn- chunked
+  "`coll` as vectors of at most `n`."
+  [n coll]
+  (loop [rs (to-list coll) acc [] cur []]
+    (if (empty? rs)
+      (if (empty? cur) acc (conj acc cur))
+      (if (= n (count cur))
+        (recur rs (conj acc cur) [])
+        (recur (rest rs) acc (conj cur (first rs)))))))
+
+(defn- result-of
+  "The report for one analyzed source — the shape every caller already reads.
+
+   `:analysis` says WHERE the facts came from, because that is the question a
+   cache has to answer about itself: a fresh analysis, a store, or the corpus
+   memo."
+  [r]
   (let [raw (:raw r)
-        facts (shift-ids (:facts raw) offset)]
-    (datom/transact! conn facts)
+        from (:from r)]
     {:file (:file r) :ns (:ns r)
      :functions (count (fn-entities (:facts raw)))
-     :facts (count facts)
-     ; whether the ANALYSIS was a reopen or a fresh index, and whether the
-     ; VECTOR column had to be derived again: the two numbers that say whether
-     ; the cache earned anything on this run.
-     :analysis (if (:hit raw) :cached :indexed)
+     :facts (count (:facts raw))
+     :analysis (if (= :manifest from) :manifest (if (:hit raw) :cached :indexed))
      :vectors (:fn/embedding (:columns raw))}))
+
+(defn- merge!
+  "Merge analyzed sources into `conn` — `MERGE-CHUNK` files per transaction.
+
+   `pending` is `[[offset r] …]`, in input order, where `r` is what a worker
+   returned. A skipped source passes through untransacted: it is a result like
+   any other, and the caller still has to see it."
+  [conn pending]
+  (into []
+        (mapcat
+          (fn [chunk]
+            (let [rows (mapcat (fn [pr]
+                                (if (:skipped (get pr 1))
+                                  []
+                                  (shift-ids (:facts (:raw (get pr 1))) (get pr 0))))
+                              chunk)
+                  _ (if (empty? rows) nil (datom/transact! conn rows))]
+              (mapv (fn [pr]
+                      (let [r (get pr 1)]
+                        (if (:skipped r) r (result-of r))))
+                    chunk)))
+          (chunked MERGE-CHUNK pending))))
+
+(defn- merge-one
+  "`merge!` for ONE source: band, commit, report.
+
+   `index-source!`'s path — the live case, one file, one transaction."
+  [conn offset r]
+  (first (merge! conn [[offset r]])))
+
+;; ── the corpus memo ──────────────────────────────────────────────────
+;;
+;; A warm run's cost is not work, it is OPENS: one store per file, each with its
+;; own fjall directory to open and pull — 94 s over 101 files — while all the
+;; facts together are 36 MB, which ONE read delivers. So a corpus's analysis is
+;; remembered whole, in the same directory and under the same cap as the stores
+;; it saves:
+;;
+;;   manifest.<key>.term    key = sha256(model, [[ns sha] …] IN ORDER)
+;;
+;; A run over byte-identical sources reads that one file and opens nothing.
+;; Anything else — an edit, an addition, a deletion, a model change — misses,
+;; and the per-file stores do what they always did: the incremental tier for
+;; exactly the files that moved.
+
+(def MANIFEST-VERSION 1)
+
+(defn- corpus-entries
+  "`[[ns sha] …]` for `pairs`, in order — reading each source once, which is
+   cheap (tens of ms for a hundred files) next to the analysis it identifies.
+
+   Raises on a source it cannot read, exactly like `read-and-analyze`: the
+   caller turns that into the per-file path, which reports the skip by name."
+  [pairs]
+  (mapv (fn [pair] [(get pair 0) (sha256-hex (File/read! (get pair 1)))]) pairs))
+
+(defn- memo-of
+  "What a memo holds: the analysis itself, banded for nobody.
+
+   Facts are stored UNBANDED because a band is a property of the corpus's
+   ORDER rather than of the file — and the key already carries the order."
+  [entries parts]
+  {:version MANIFEST-VERSION
+   :model (code.embed/model-id)
+   :sources (mapv (fn [e p] {:ns (get e 0) :sha (get e 1) :facts (:facts (:raw p))})
+                  entries parts)})
+
+(defn- memo-matches?
+  "Whether `memo` is usable for this corpus: same version, same model, one
+   source per pair, and the hash we just computed. A memo that does not fit is
+   treated as one that is not there — the stores then answer, and the run
+   rewrites it."
+  [memo entries]
+  (let [srcs (:sources memo)]
+    (and (= MANIFEST-VERSION (:version memo))
+         (= (code.embed/model-id) (:model memo))
+         (= (count entries) (count srcs))
+         (every? (fn [i] (= (get (get entries i) 1) (:sha (get srcs i))))
+                 (range (count entries))))))
+
+(defn- merge-memo!
+  "Merge a memo's facts into `conn`: the same bands, the same transactions, and
+   none of the opens. One result per source, each saying it came from the memo."
+  [conn pairs memo]
+  (merge! conn
+          (mapv (fn [i]
+                  (let [src (get (:sources memo) i)]
+                    [(offset-for i)
+                     {:file (get (get pairs i) 1) :ns (:ns src) :from :manifest
+                      :raw {:facts (:facts src) :hit true
+                            :columns {:fn/embedding :cached}}}]))
+                (range (count pairs)))))
 
 (defn- fan-out-collect
   "See `fan-out`. Hands work out as workers REPORT, rather than in fixed bands:
@@ -518,13 +638,29 @@
   ([conn sources opts]
    (let [root (:root opts)
          v (vec (to-list sources))
-         w (workers-for (count v) opts)
-         parts (fan-out w (fn [pair] (analyze-one (get pair 0) (get pair 1) root)) v)]
-     (into []
-           (map-indexed
-             (fn [i r]
-               (if (:skipped r) r (merge-one conn (offset-for i) r)))
-             parts)))))
+         ; The memo is looked up BEFORE any work, and its key is the corpus's
+         ; content: a hit is a proof that every fact below is the one a fresh
+         ; analysis would produce.
+         entries (if (not= false (:memo opts))
+                   (try (corpus-entries v) (catch e nil))
+                   nil)
+         key (if (some? entries)
+               (codebase/manifest-key (code.embed/model-id) entries)
+               nil)
+         memo (if (some? key) (codebase/read-manifest root key) {:absent true})]
+     (if (and (some? key) (:value memo) (memo-matches? (:value memo) entries))
+       (merge-memo! conn v (:value memo))
+       (let [w (workers-for (count v) opts)
+             parts (fan-out w (fn [pair] (analyze-one (get pair 0) (get pair 1) root)) v)
+             pending (mapv (fn [i r] [(offset-for i) r]) (range (count parts)) parts)
+             ; Only a COMPLETE corpus is worth memorizing: a run that skipped a
+             ; source has produced something it cannot name, and a memo of it
+             ; would quietly answer for a corpus nobody indexed.
+             _ (if (and (some? key) (seq parts)
+                        (every? (fn [r] (not (:skipped r))) parts))
+                 (codebase/write-manifest! root key (memo-of entries parts))
+                 nil)]
+         (merge! conn pending))))))
 
 (defn ns-of-file
   "The `(ns …)` name declared in `path` — the namespace a file's facts are
