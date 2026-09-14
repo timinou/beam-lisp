@@ -208,25 +208,25 @@ defmodule BeamLisp.Daemon.WatchRegistry do
   defp subscriber_pid(_), do: nil
 
   defp start_watcher(dir, executor, registry) do
-    # The apply callback runs on the Executor FIFO and posts the result back to
-    # the registry, which fans it out. `apply_change/3` is the watcher's own
-    # in-process default; here we wrap it in a serialized executor job. The
-    # saved path is folded into the result — the renderer's one place to see it.
+    # The apply callback runs on the Executor FIFO; the RESULT — applied,
+    # held, error, :removed alike — arrives via on_result already tagged and
+    # normalized by the watcher, and the registry fans it out. `apply_change/3`
+    # is the watcher's own in-process default; here it is wrapped in a
+    # serialized executor job so a stage->commit is ordered against runs/tests
+    # in the same warm VM.
     apply_fun = fn source, path, commit? ->
-      result =
-        BeamLisp.Daemon.Executor.run_reload(executor, fn ->
-          BeamLisp.ReloadWatcher.apply_change(source, path, commit?)
-        end)
-
-      tagged = tag_path(result, path)
-      send(registry, {:reload_result, dir, tagged})
-      tagged
+      BeamLisp.Daemon.Executor.run_reload(executor, fn ->
+        BeamLisp.ReloadWatcher.apply_change(source, path, commit?)
+      end)
     end
+
+    on_result = fn result -> send(registry, {:reload_result, dir, result}) end
 
     BeamLisp.ReloadWatcher.start_link(
       dirs: [dir],
       auto_commit: true,
       apply: apply_fun,
+      on_result: on_result,
       # The registry runs ONE WATCHER PER DIRECTORY, so the watcher must not
       # take ReloadWatcher's default global name: with it, the SECOND
       # directory's start_link fails {:already_started, pid} and the tree
@@ -237,13 +237,7 @@ defmodule BeamLisp.Daemon.WatchRegistry do
     e -> {:error, Exception.message(e)}
   end
 
-  # The result `bl.watch/render` sees: the commit status plus the saved path.
-  # A non-map result — the watcher's `{:error, msg}` when a stage/commit raised —
-  # is normalized to an `:error` result so the renderer has ONE shape.
-  defp tag_path(%{} = result, path), do: Map.put(result, :path, path)
 
-  defp tag_path(other, path),
-    do: %{path: path, status: :error, errors: [%{kind: :error, msg: inspect(other)}]}
 
   # Canonical directory path (realpath when it exists), so two spellings of the
   # same dir share one watcher.

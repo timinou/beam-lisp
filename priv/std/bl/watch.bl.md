@@ -44,7 +44,7 @@ uncatchable by `try` — so `run` traps exits and reports the failure as a value
 A watch result is the `reload/commit` status map plus `:path`:
 
     {:path    "…/foo.bl"       ; the file that was saved
-     :status  :applied         ; :applied | :held | :blocked | :empty | :error
+     :status  :applied         ; :applied | :held | :blocked | :empty | :error | :removed
      :bundle  ["app.foo"]      ; namespaces staged in this commit
      :applied ["app.foo"]      ; namespaces now live (on :applied)
      :errors  [...]}           ; reasons, each {:kind … :msg …} (on :held)
@@ -74,6 +74,7 @@ command. It is a rendering, not a printed map: nothing here dumps the result.
     (= status :held)    "✗"
     (= status :blocked) "⊘"
     (= status :error)   "!"
+    (= status :removed) "−"
     :else               "·"))
 
 (defn render
