@@ -1,6 +1,6 @@
 # The z3 lane — a map
 
-Five runnable programs that show how beam-lisp asks z3 a question and what it
+Thirteen runnable programs that show how beam-lisp asks z3 a question and what it
 does with the answer. Read them in order; each one is a single idea.
 
 ## What the lane is
@@ -42,8 +42,14 @@ cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 | `03-memo.bl` | does asking the same question twice cost anything | the second ask never reaches the solver — one ETS read — and `unknown` is not cached | `second → :unsat \| tier: :memo \| us: 0 \| solver calls: 0 \| memo entries: 1` |
 | `04-ceiling.bl` | where the 10 s z3 ceiling came from | every decision is timed; the ratio is a single-run snapshot, so watch it move | `median ordinary: 4701 us    the ceiling is 64 × that` (a second run: `5596 us` / `54 ×`) |
 | `05-sorts.bl` | a field's type decides which arithmetic z3 does | one word (`Real`→`Int`) flips `unsat`→`sat`; the `0.75` control now names the check that refused AND carries the state | `── the same invariant with 0.75 \| holds: false \| warned: 1 \| failures: 1` / `init → counterexample: x = 0.75` |
+| `08-k-induction.bl` | one step is not always enough to prove a machine safe | the same machine refused at `:k 1` with the state pair `5 → 6`, PROVEN at `:k 2` — and the `:base` check that a deeper question needs | `island :k 1 → holds: false \| leap → x = 5, x2 = 6` / `:k 2 → holds: true` |
+| `11-annotated.bl` | who says what SORT a field has | one declaration (`^{:sorts {:rate Real}}`) turns a vacuous `holds` into a real refusal, and `:defs` lowers an invariant's helper to a `define-fun`; `{:emit true}` prints the declarations the verdict was decided over | `half → holds: true (rate:Int)` / `+ :sorts → holds: false \| scale → rate = 0.5, rate2 = 1.0` |
 | `07-sessions.bl` | why a conversation beats a question | `discover-invariant` twice, sessions off/on: the same invariant, the same 10 questions, a fraction of the µs; `(z3pool/current)` is a pid inside a session, nil outside | `ledger ~65–77k µs → ~2.4–2.7k µs per discovery (≈6.5–7.7k → ≈0.24–0.27k µs/question across two runs); discovered identical: true` |
 | `09-blame.bl` | when repair cannot help, it says why | a refusal is `sat` → its hint is a MODEL; a blame is `unsat` → its hint is a CORE. Three unrepairable machines print their failure maps side by side | `drain → :next-step-breaks-it (core [g_next g_inv2]) · blocked → :guard-too-weak · impossible → :invariant-impossible (core [g_inv2])` |
+| `06-no-strings.bl` | how a predicate reaches the solver | a legacy TEXT predicate used to be pasted into the script and arrived at z3 as an INERT string literal; read once at the boundary, a form, a string and a bl source body emit BYTE-IDENTICAL scripts — and malformed text throws naming the text | `the three scripts are the same text: true` / `verdicts: [:unsat :unsat :unsat]` / `predicates: 10 \| read then emitted back identically: 10 \| mismatches: 0` |
+| `10-corpus.bl` | does the whole tree still check out | every `defserver` in `priv` + `examples`, verified machine by machine; the coverage line is an ASSERTION against an independent grep bound, so a cheerful zero fails | `machines 80 ≥ grep bound 62 → PASS` / `proved 27 \| refuted 19 \| undecided 0 \| declined 34` / the outcome column is byte-identical across runs |
+| `12-stats.bl` | what the oracle cost, in one view | the same state read two ways — through `bl z3 stats` and directly (a `:counters` histogram, `(decide/cost)`, `(ets/info :oracle-memo :size)`) — so the CLI is visibly a view over VM state, not a source of truth | `files 401 · machines 80` / `decisions 88 \| total 155559 us \| median 8242 us \| worst 60926 us` (`examples/bundles/00-all-five.bl · worker`) |
+| `13-faults.bl` | a fault has to cross a process boundary as text | the inert-literal trap caught in the act: emitted raw, `(>= v -40)` reaches z3 as the string `"(>= v -40)"`; read once it emits as `(>= v (- 40))`. Both lanes end on the same verdict | `STRING clauses == FORM clauses byte-identical: true` / `{:clause 0 :status :sat :modality :proven :implied false :value {:v -41}}` |
 
 ## Running them
 
@@ -56,15 +62,23 @@ BL_DAEMON=off timeout 240 mix bl run examples/z3/04-ceiling.bl
 BL_DAEMON=off timeout 240 mix bl run examples/z3/05-sorts.bl
 BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/07-sessions.bl
 BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/09-blame.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/08-k-induction.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/11-annotated.bl
+BL_DAEMON=off timeout 240 mix bl run examples/z3/06-no-strings.bl
+BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/z3/10-corpus.bl
+BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/z3/12-stats.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/13-faults.bl
 
-# all five, isolated and timed by ward
+# the same rollup through the CLI (needs a repacked drop: priv/std is AOT'd into it)
+./bl z3 stats            # five sections: corpus, cost, tiers, undecided, failures
+./bl z3 stats --dry-run  # ledger-only; skips the ~9 s walk and says which mode ran
+
+# every one of them, isolated and timed by ward
 BL_DAEMON=off timeout 600 mix bl examples examples/z3/*.bl
-#   ✓ 01 … 05
-#   5 passed, 0 skipped, 0 failed
 
 # the lane's tests
 BL_DAEMON=off timeout 1500 mix bl test test/bl/system/oracle_test.bl
-#   ✓ system.oracle-test  37 passed
+#   ✓ system.oracle-test  80 passed
 #   1 file(s) passed, 0 failed, 0 incoherent
 
 # per-layer measurement over 100 obligations
@@ -85,14 +99,17 @@ BL_DAEMON=off timeout 300 mix bl run --path priv --path examples bench/oracle_be
 
 ## Honest limits
 
-- **No corpus rollup yet.** `decide/cost` answers `{:count :total_us :max_us}`
-  for the obligations *this process* asked since `clear-here!`. Nothing rolls it
-  up over a whole `bl check` of the tree, so the 10 s default ceiling is still a
-  default, not a measured decision.
-- **`oracle/explain` has no engine caller yet.** `step-obligation` names its
-  three parts (`g_guard`, `g_next`, `g_inv2`) and every lease arms
-  `:produce-unsat-cores`, but the only references to `explain` in the engine are
-  comments — the blame lane is built and unused.
+- **The corpus rollup measures the tree, not the tool.** `bl z3 stats` walks
+  `priv` + `examples` (a serial walk, ~9 s) and reports what it found: 80
+  machines today. It reads the same ledger `decide/cost` reads, so its `:why`
+  column is z3's own reason and nothing else. What it does NOT do: attribute
+  cost to a specific `bl check` run (the ledger is per-VM and starts empty), or
+  verify a machine that the engine will not model (`declined`: a live/reactive
+  server — 34 of the 80).
+- **`oracle/explain` has one engine caller now, and only one.**
+  `repair-process`' blame branch (`09-blame.bl`). `step-obligation` names its
+  three parts (`g_guard`, `g_next`, `g_inv2`) for it and every lease arms
+  `:produce-unsat-cores`; the synthesis side still has no caller.
 - **The native witness rung is opt-in.** `system.decide/decide` runs z3 only;
   `decide/decide-native` (the bounded BEAM guard search) is called from tests,
   not by the verifier.
@@ -102,11 +119,22 @@ BL_DAEMON=off timeout 300 mix bl run --path priv --path examples bench/oracle_be
 - **Session questions are never memoised.** Inside a `session`, the same
   `scoped` commands mean whatever the conversation has already asserted, so the
   script text is not an identity there; `oracle/scoped` has no memo lookup.
-- **L6 and L7 exist but have no consumer** outside `bench/oracle_bench.bl` and
-  `test/bl/system/oracle_test.bl`.
-- **05's open half (FUP-059).** The sort comes from the init *literal*; a field
-  whose true sort appears only in an annotation, or that has no readable
-  literal, still falls back to `Int`.
+- **L6 and L7 are exercised by the bench and the oracle tests**, not by the
+  verifier: `with-oracle`/`table`/`deny` and `ask-all` have no engine caller.
+  The bench measures them (memo hit 17 µs/q, `ask-all` 4 solvers in flight),
+  which is what they are for.
+- **The measured numbers move.** Every microsecond figure in this file is one
+  run on a shared machine; the ratios move 2-3x with load. What does not move:
+  the ORDER (memo < session < one-shot), the outcome columns, and the verdicts.
+- **FUP-059 is closed; the lanes below are not.** `^{:sorts {:rate Real}}`
+  declares a field's sort where the init literal cannot (an unknown sort
+  NAME, or one that contradicts the literal, throws rather than degrading to
+  `Int`), and `:k` raises the induction depth past 1. Still undeclared: an
+  INPUT's sort (inferred by flow, defaulting to `Int`), a collection field's
+  ELEMENT sort (lengths only — see `verify-capacity`), a record/array
+  field's component sorts, and a helper called from a GUARD or a
+  next-state expression (`:defs` covers the invariant; an unmodelled
+  guard drops its transition and reports `:complete false`).
 
 ## Glossary
 
