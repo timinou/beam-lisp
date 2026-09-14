@@ -266,7 +266,7 @@ Three properties belong to the door rather than to any caller:
   Measured on 101 files: 113454 ms warm (96 of 101 stores reopened) against
   96802 ms with the memo — so the opens are about HALF a warm run, and the other
   half is the merge: `shift-ids` plus a transaction per file into the in-memory
-  connection the query runs against (FUP-060). The memo removes the half it can.
+  connection the query runs against (FUP-067). The memo removes the half it can.
 
 * **Banded ids.** Each source gets its own million-wide id band (`offset-for`),
   because `codebase/index-source` numbers entities from a fixed base and two
