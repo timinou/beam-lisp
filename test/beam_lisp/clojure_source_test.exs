@@ -152,6 +152,42 @@ defmodule BeamLisp.ClojureSourceTest do
     File.rm_rf!(dir)
   end
 
+  test "a branch-less reader conditional reads as nothing, as in Clojure" do
+    # `[1 #?(:cljs :x) 2]` is `[1 2]` on the JVM (verified against the Clojure
+    # reader). `.cljc` libraries depend on it: a cljs-only require and a
+    # cljs-only implementation are skipped, not refused.
+    assert [1, 2] == BeamLisp.Compiler.eval_string("[1 #?(:cljs :skipped) 2]") |> Enum.to_list()
+    assert [] == BeamLisp.Compiler.eval_string("[#?@(:cljs [1 2 3])]") |> Enum.to_list()
+    assert [1] == BeamLisp.Compiler.eval_string("[1 #?( :cljs :skipped)]") |> Enum.to_list()
+
+    # A malformed conditional is still a syntax error — the skip is for a
+    # platform decision, not for a broken form.
+    assert_raise BeamLisp.Reader.SyntaxError, ~r/odd number of forms/, fn ->
+      BeamLisp.Compiler.eval_string("[1 #?(:cljs) 2]")
+    end
+  end
+
+  test "a .cljc namespace with a cljs-only require and cljs-only impl loads" do
+    dir = tmp_dir!("cljc-skip")
+    ns = uniq_ns("cljlib_cljs_skip")
+
+    write_source!(dir, munge(ns) <> ".cljc", """
+    (ns #{ns}
+      "Clojure on one platform, something else on the other."
+      (:require #?(:clj [clojure.string :as str])
+                #?(:cljs [some.client-only.lib :as bd])))
+
+    #?(:cljs (defn amount [] :a-bigint))
+    #?(:clj  (defn amount [] :a-decimal))
+
+    (defn shout [] (str/upper-case "hi"))
+    """)
+
+    assert "HI" == load_and_eval(dir, ns, "(#{ns}/shout)")
+    assert :"a-decimal" == BeamLisp.Compiler.eval_string("(#{ns}/amount)")
+
+    File.rm_rf!(dir)
+  end
   test "a real Clojure library namespace loads from a nested tree" do
     # The shape a ported library arrives in: a docstring, a dashed namespace,
     # a nested directory, requiring a sibling — all at once.
