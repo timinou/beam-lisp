@@ -296,8 +296,24 @@ defmodule BeamLisp.Loader do
   # is EVALUATED (not required) into its fork, so its defs, its tests,
   # and its shadows (a fork-local `(ns relay.ratelimit) (defn …)` beats
   # the global var on that fork's chain) stay private.
+  # A `.clj`/`.cljc` source is written against clojure.core, not against the
+  # prelude: `defonce`, `format`, `hash`, `re-find`, `str/…` and the rest are
+  # unqualified there. The compat tier interns those into `core` when it loads,
+  # so a Clojure source is preceded by it — once per VM (each is an ordinary
+  # namespace load; a second require is a lookup). A `.bl` file pays nothing.
+  @clojure_prelude ~w(clojure.core-ext clojure.core-more clojure.re)
+
+  defp clojure_prelude!(path) do
+    if Path.extname(path) in [".clj", ".cljc"] do
+      for ns <- @clojure_prelude, do: ensure_loaded(ns)
+    end
+
+    :ok
+  end
+
   defp do_load(ns, path, content) do
     prev_ns = Env.current_ns()
+    clojure_prelude!(path)
 
     try do
       with_load_path(Path.dirname(path), fn ->
