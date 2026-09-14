@@ -222,7 +222,7 @@ defmodule BeamLisp.ReloadWatcher do
   # literate dialects (`.bl.md`, `.bl.org`). The literate twins are the SAME
   # kind of save — a livebook doc is a namespace wearing prose (PLAN-069), so
   # saving one stages its program, not its prose.
-  defp watches?(path), do: String.ends_with?(path, [".bl", ".bl.md", ".bl.org"])
+  defp watches?(path), do: String.ends_with?(path, [".bl", ".bl.md", ".bl.org", ".clj", ".cljc"])
 
   # The source a file event stages: a plain `.bl` is itself; a literate file is
   # first recomposed to its program text — every code cell concatenated in
