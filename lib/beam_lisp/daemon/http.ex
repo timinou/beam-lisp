@@ -33,7 +33,7 @@ defmodule BeamLisp.Daemon.HTTP do
 
   import Plug.Conn
 
-  alias BeamLisp.Daemon.{Inspect, Ports}
+  alias BeamLisp.Daemon.{Gateway, Inspect, IndexWorker, Ports}
 
   @impl true
   def init(opts), do: opts
@@ -44,9 +44,66 @@ defmodule BeamLisp.Daemon.HTTP do
       {"GET", "/"} -> dashboard(conn, opts)
       {"GET", "/model"} -> json(conn, 200, Inspect.json(conn_opts(opts)))
       {"GET", "/ports"} -> json(conn, 200, ports_json())
+      {"GET", "/index"} -> json(conn, 200, index_json())
       {"POST", "/mcp"} -> mcp(conn, opts)
       {"POST", "/intent"} -> intent(conn, opts)
+      {"POST", "/index"} -> index_now(conn, opts)
       _ -> not_found(conn)
+    end
+  end
+
+  # --- the index ---
+
+  # The tree's code index, as the index worker last reported it. `GET /index`
+  # reads the worker's ETS row (never a call: the pane must stay readable while
+  # the build it describes is running), and `POST /index` asks for a build — the
+  # button the page shows when the tree has none, and the same call `bl ui`
+  # makes on entry so opening a session starts the work.
+  defp index_json do
+    p = IndexWorker.progress()
+
+    %{
+      "phase" => to_string(p.phase),
+      "done" => Map.get(p, :done, 0),
+      "total" => Map.get(p, :total, 0),
+      "file" => Map.get(p, :file),
+      "from" => Map.get(p, :from),
+      "ms" => Map.get(p, :ms),
+      "hit" => Map.get(p, :hit),
+      "message" => Map.get(p, :message),
+      "at" => Map.get(p, :at),
+      "stats" => index_stats(Map.get(p, :stats))
+    }
+  end
+
+  # The beam-lisp stats map, as JSON: the numbers a reader wants (how many
+  # files, how many were analyzed vs came from cache) with the internal ones
+  # left out rather than rendered as `nil` fields.
+  defp index_stats(nil), do: nil
+
+  defp index_stats(s) when is_map(s) do
+    %{
+      "files" => to_int(Map.get(s, :files)),
+      "functions" => to_int(Map.get(s, :functions)),
+      "analyzed" => to_int(Map.get(s, :analyzed)),
+      "cached" => to_int(Map.get(s, :cached)),
+      "skipped" => length(List.wrap(Map.get(s, :skipped)))
+    }
+  end
+
+  defp index_stats(_), do: nil
+
+  defp to_int(n) when is_integer(n), do: n
+  defp to_int(_), do: 0
+
+  defp index_now(conn, opts) do
+    {:ok, _body, conn} = read_body(conn)
+
+    with :ok <- check_token(conn, opts) do
+      IndexWorker.ensure_building()
+      json(conn, 200, index_json())
+    else
+      {:error, :forbidden} -> json(conn, 403, %{"error" => "missing or wrong x-bl-token"})
     end
   end
 
@@ -88,6 +145,10 @@ defmodule BeamLisp.Daemon.HTTP do
       pre { background: #16141f; border: 1px solid #2c2838; border-radius: 8px;
             padding: .7rem .8rem; margin: .6rem 0 0; white-space: pre-wrap; }
       .ok { color: #46d18f; } .bad { color: #ff8f8f; }
+      .bar { background: #201d2c; border: 1px solid #2c2838; border-radius: 9999px;
+             height: .5rem; width: 100%; max-width: 28rem; overflow: hidden; margin: .5rem 0 .2rem; }
+      .bar > i { display: block; height: 100%; background: #7c5cff; transition: width .3s; }
+      .note { color: #9891ad; }
     </style></head><body><main>
       <div class="kicker">beam-lisp · warm session</div>
       <h1>#{esc(id.name)}</h1>
@@ -104,6 +165,11 @@ defmodule BeamLisp.Daemon.HTTP do
       <section>
         <h2>Ports</h2>
         #{ports_pane(m.ports)}
+      </section>
+
+      <section>
+        <h2>Index</h2>
+        #{index_pane()}
       </section>
 
       <section>
@@ -154,6 +220,50 @@ defmodule BeamLisp.Daemon.HTTP do
         }
       }
       function refresh() { location.reload(); }
+
+      // Ask for an index, then keep looking at it. The page is server-rendered,
+      // so the bar advances by polling the same JSON the pane was rendered
+      // from — no second source of truth about what the build is doing.
+      async function indexNow() {
+        const out = document.getElementById("index-out");
+        out.textContent = "indexing…";
+        try {
+          await fetch("/index", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bl-token": TOKEN },
+            body: "{}"
+          });
+          pollIndex();
+        } catch (e) { out.textContent = "index request failed: " + e; }
+      }
+
+      async function pollIndex() {
+        const out = document.getElementById("index-out");
+        try {
+          const p = await (await fetch("/index")).json();
+          if (p.phase === "building") {
+            out.textContent = "indexing " + p.done + "/" + p.total + " — " + (p.file || "");
+            setTimeout(pollIndex, 700);
+          } else if (p.phase === "ready") {
+            out.textContent = "index ready in " + p.ms + " ms — reload to see it";
+            setTimeout(() => location.reload(), 700);
+          } else if (p.phase === "error") {
+            out.textContent = "index failed: " + (p.message || "");
+          } else {
+            out.textContent = "";
+          }
+        } catch (e) { out.textContent = "poll failed: " + e; }
+      }
+
+      // A session that has no index starts one by being opened. `:cold` means
+      // this worker has never built; anything else is either done or in flight.
+      (async function () {
+        try {
+          const p = await (await fetch("/index")).json();
+          if (p.phase === "cold") indexNow();
+          else if (p.phase === "building") pollIndex();
+        } catch (e) { /* the pane stays empty; not worth a dialog */ }
+      })();
     </script>
     </body></html>
     """
@@ -186,6 +296,56 @@ defmodule BeamLisp.Daemon.HTTP do
   end
 
   defp intent_output, do: ~s(<pre id="intent-out" class="mono"></pre>)
+
+  # The tree's code index: what it cost, and — while it is being built — how far
+  # along it is. The page polls `GET /index` rather than waiting on the worker,
+  # because the worker is BUSY building; and when it finds no index at all it
+  # asks for one, so entering a session is enough to start the work rather than
+  # a fact you discover by asking a question and waiting a minute for silence.
+  defp index_pane do
+    p = IndexWorker.progress()
+    done = Map.get(p, :done, 0)
+    total = Map.get(p, :total, 0)
+
+    body =
+      case p.phase do
+        :ready ->
+          s = Map.get(p, :stats) || %{}
+          hit = if Map.get(p, :hit) == true, do: " (unchanged)", else: ""
+
+          "<p><span class=\"ok\">ready</span>#{hit} · " <>
+            "#{to_int(Map.get(s, :files))} files · " <>
+            "#{to_int(Map.get(s, :functions))} functions · " <>
+            "#{to_int(Map.get(s, :analyzed))} analyzed now, " <>
+            "#{to_int(Map.get(s, :cached))} from cache · " <>
+            "built in #{uptime(Map.get(p, :ms))}</p>"
+
+        :building ->
+          count = if total > 0, do: "#{done} / #{total} files", else: "starting…"
+
+          "<p>indexing — #{count}</p>" <> progress_bar(done, total) <>
+            "<p class=\"note mono\">#{esc(Map.get(p, :file) || "")}</p>"
+
+        :error ->
+          "<p><span class=\"bad\">index failed</span> " <>
+            "<span class=\"mono\">#{esc(Map.get(p, :message) || "")}</span></p>"
+
+        _ ->
+          "<p class=\"empty\">no index yet — " <>
+            "<button onclick=\"indexNow()\">index this tree</button></p>"
+      end
+
+    body <> ~s(<pre id="index-out" class="mono"></pre>)
+  end
+
+  # A bar needs a denominator; a build that has not counted its files yet gets a
+  # bar that says so rather than a division by zero rendered as 0%.
+  defp progress_bar(_done, 0), do: ~s(<div class="bar"><i style="width:2%"></i></div>)
+
+  defp progress_bar(done, total) do
+    pct = min(100, round(done / max(total, 1) * 100))
+    ~s(<div class="bar"><i style="width:#{pct}%"></i></div> <span class="note">#{pct}%</span>)
+  end
 
   defp ports_pane([]), do: ~s(<p class="empty">no ports claimed</p>)
 
@@ -309,7 +469,10 @@ defmodule BeamLisp.Daemon.HTTP do
 
     case decode(body) do
       {:ok, request} ->
-        json(conn, 200, mcp_request(request, opts))
+        # On the IndexWorker, not this per-request process: the index mount the
+        # request may trigger builds ETS tables owned by their creator, and a
+        # connection process dies with its response. See IndexWorker's moduledoc.
+        json(conn, 200, IndexWorker.run(fn -> mcp_request(request, opts) end))
 
       {:error, _} ->
         json(conn, 400, %{
@@ -352,10 +515,26 @@ defmodule BeamLisp.Daemon.HTTP do
   defp conn_opts(opts), do: Keyword.take(opts, [:status_fun, :tree_id])
 
   defp ports_json do
+    # One lookup and one probe for the whole table, for the reason the
+    # read-model resolves it once: the live facts cost a runtime-dir read and a
+    # port-80 probe, and a table of N names should not pay that N times.
+    live = Gateway.live()
+
     Enum.map(Ports.list(), fn p ->
+      hosts = Map.get(p, :hosts, [])
+
+      url =
+        if hosts == [] do
+          "http://127.0.0.1:#{p.port}/"
+        else
+          Gateway.url(hd(hosts), live.port, live.fronted)
+        end
+
       %{
         "name" => p.name,
         "port" => p.port,
+        "hosts" => hosts,
+        "url" => url,
         "tree" => p.tree_id,
         "root" => p.root,
         "pid" => p.pid,

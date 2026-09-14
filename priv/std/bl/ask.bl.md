@@ -26,6 +26,7 @@ has ONE definition, and every interface projects it.
 (ns bl.ask
   (:require [bl.util :as u]
             [codebase]
+            [code.index]
             [typed]
             [datom]
             [datom.conn]
@@ -128,7 +129,7 @@ than one per file: a transaction has a fixed cost on top of its facts, so
 batches of `tx-batch` facts halve the write time of a per-file loop while
 staying well inside the connection's write deadline. And the facts of a file are a
 pure function of its text, so they are cached by content hash under the
-`.blanalysis` directory (`codebase/blanalysis-dir`): a file that has not
+analysis store directory (`codebase/blanalysis-dir`): a file that has not
 changed since the last question is read back as data instead of re-walked.
 The cache is never load-bearing — a missing or unreadable entry is a fresh
 index, and a changed byte changes the hash, so a stale entry is unreachable.
@@ -139,37 +140,44 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
   [facts delta]
   (u/to-list (map (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) facts)))
 
-(defn- facts-cache-path
-  "Where the indexed facts of a source with content hash `sha` live."
-  [sha]
-  (str (codebase/blanalysis-dir) "/facts." sha ".term"))
+(defn- cache-path
+  "Where one cached ANALYSIS of a source with content hash `sha` lives. `kind`
+   says what was computed: `facts` is the indexer's facts (what a datalog
+   question is answered from), `symbols` the analyser's document symbols (what a
+   source question is answered from).
 
-(defn- cached-facts
-  "The cached facts for `sha`, or nil."
-  [sha]
-  (let [p (facts-cache-path sha)]
+   Under the project of the SOURCES being asked about, not the shell's: an
+   artifact derived from a tree belongs to that tree."
+  [kind sha root]
+  (str (codebase/blanalysis-dir root) "/" kind "." sha ".term"))
+
+(defn- cached-analysis
+  "The `kind` analysis remembered for `sha`, or nil."
+  [kind sha root]
+  (let [p (cache-path kind sha root)]
     (when (File/exists? p)
       (try (erlang/binary_to_term (File/read! p)) (catch _ nil)))))
 
-(defn- remember-facts!
-  "Store `facts` for `sha`; a failure to write is silently a cache miss next time."
-  [sha facts]
+(defn- remember-analysis!
+  "Store `value` as the `kind` analysis of `sha`; a failure to write is silently
+   a cache miss next time."
+  [kind sha value root]
   (try
-    (File/mkdir_p (codebase/blanalysis-dir))
-    (File/write! (facts-cache-path sha) (erlang/term_to_binary facts))
+    (File/mkdir_p (codebase/blanalysis-dir root))
+    (File/write! (cache-path kind sha root) (erlang/term_to_binary value))
     (catch _ nil)))
 
 (defn source-facts
   "`{:ns :fn :calls}` for one source text: the file's namespace and its
    definition and call facts, from the cache when this exact text has been
    indexed before."
-  [sigs src]
+  [sigs src root]
   (let [sha (sha256-hex src)]
-    (or (cached-facts sha)
+    (or (cached-analysis "facts" sha root)
         (let [ns-str (u/ns-of src)
               facts (codebase/index-source sigs ns-str src)
               entry {:ns ns-str :fn (u/to-list (:fn facts)) :calls (u/to-list (:calls facts))}]
-          (remember-facts! sha entry)
+          (remember-analysis! "facts" sha entry root)
           entry))))
 
 (def tx-batch
@@ -182,18 +190,19 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
    indexer reads return annotations against). Facts from all paths share the
    one connection, written `tx-batch` at a time; each file's ids are offset so
    files never collide. Returns the namespaces indexed, in path order."
-  [conn sigs paths]
+  ([conn sigs paths] (index! conn sigs paths (first (u/to-list paths))))
+  ([conn sigs paths root]
   (let [entries (loop [ps (u/to-list paths) i 0 nss [] facts []]
                   (if (empty? ps)
                     {:nss nss :facts facts}
-                    (let [e (source-facts sigs (File/read! (first ps)))
+                    (let [e (source-facts sigs (File/read! (first ps)) root)
                           delta (* i 1000000)]
                       (recur (rest ps) (+ i 1) (conj nss (:ns e))
                              (into facts (concat (offset-facts (:fn e) delta)
                                                  (offset-facts (:calls e) delta)))))))]
     (u/each (fn [batch] (datom/transact! conn (u/to-list batch)))
             (Enum/chunk_every (u/to-list (:facts entries)) tx-batch))
-    (:nss entries)))
+    (:nss entries))))
 ```
 
 Writing facts into a store is the slow half of a question — tens of seconds
@@ -211,30 +220,48 @@ set lives in memory for this run only — the same answers, just not remembered.
   (sha256-hex
     (join "\n" (map (fn [p] (sha256-hex (File/read! p))) (u/to-list paths)))))
 
-(defn- set-store-path [hash]
-  (str (codebase/blanalysis-dir) "/askset." hash ".fjall"))
+(defn- set-store-path [hash root]
+  (str (codebase/blanalysis-dir root) "/askset." hash ".fjall"))
 
 (defn connect-set!
   "A connection holding the facts of every source in `paths`: reopened from the
    persistent set store when this exact set has been indexed before, otherwise
-   indexed and stored. Returns `{:conn :nss}`."
+   indexed and stored. Returns `{:conn :nss}`.
+
+   The tree's own sources FIRST, through `code.index`: when the question is
+   about the tree the caller stands in — no `-p`, which is most of them — the
+   daemon has already indexed exactly these sources, and reusing its conn costs
+   a hash of each file (tens of ms) instead of reopening a store or re-indexing
+   anything. The askset below is the fallback for a question about a DIFFERENT
+   set of sources (an explicit `-p`, a single file), where the set really is a
+   different corpus."
   [sigs paths]
   (let [paths (u/to-list paths)
-        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))]
-    (if (not (datom.store-fjall/available?))
-      (let [conn (codebase/connect-codebase)]
-        {:conn conn :nss (index! conn sigs paths)})
-      (let [path (set-store-path (set-hash paths))]
-        (if (File/exists? path)
-          {:conn (datom.conn/connect-with (datom.store-fjall/open path))
-           :nss (nss-of)}
-          (do
-            (File/mkdir_p (codebase/blanalysis-dir))
-            (let [store (datom.store-fjall/open path)
-                  conn (datom.conn/connect-with store codebase/SCHEMA)
-                  nss (index! conn sigs paths)]
-              (datom.store-fjall/sync! store)
-              {:conn conn :nss nss})))))))
+        root (first paths)
+        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))
+        shared (try (code.index/reuse-for-paths (BeamLisp/cwd) paths) (catch e nil))]
+    (if (some? shared)
+      {:conn (:conn shared) :nss (nss-of)}
+      (do
+        ; The store's host module exists only once the namespace declaring it has
+        ; been initialized, and nothing on this path loads it: without this the ask
+        ; set is rebuilt every run. Inline for the same reason `bl.search` is (see
+        ; the note there — a helper in `codebase` or `bl.cache` cycles the AOT build).
+        (try (BeamLisp.AOT/ensure_loaded "datom.store-fjall") (catch e nil))
+        (if (not (datom.store-fjall/available?))
+          (let [conn (codebase/connect-codebase)]
+            {:conn conn :nss (index! conn sigs paths)})
+          (let [path (set-store-path (set-hash paths) root)]
+            (if (File/exists? path)
+              {:conn (datom.conn/connect-with (datom.store-fjall/open path))
+               :nss (nss-of)}
+              (do
+                (File/mkdir_p (codebase/blanalysis-dir root))
+                (let [store (datom.store-fjall/open path)
+                      conn (datom.conn/connect-with store codebase/SCHEMA)
+                      nss (index! conn sigs paths)]
+                  (datom.store-fjall/sync! store)
+                  {:conn conn :nss nss})))))))))
 ```
 
 ## Answering a database question
@@ -341,15 +368,31 @@ definition is not self-recursive.
              (= :symbol (typed/node-tag (typed/node-form head)))
              (contains? #{"defn" "defn-"} (typed/node-name (typed/node-form head))))))))
 
+(defn symbols-of
+  "The document symbols of `src` — what a source question is answered from. The
+   analysis costs seconds a file, so a question asked twice over the same text
+   pays for it once: content-addressed, so an edit is a new entry and an
+   unchanged file is a hit. Every source question shares it, which is why
+   `dead-code` — two analyses' worth — costs one."
+  [src root]
+  (let [sha (sha256-hex src)]
+    (or (cached-analysis "symbols" sha root)
+        (let [syms (u/to-list (lsp/document-symbols src))]
+          (remember-analysis! "symbols" sha syms root)
+          syms))))
+
 (defn roots
   "The definitions a source's own top-level code refers to — its entry points.
-   A source with none is a library, so every definition is a root."
-  [src]
-  (let [names (set (map (fn [s] (:name s)) (u/to-list (lsp/document-symbols src))))
+   A source with none is a library, so every definition is a root. The symbols
+   are passed in when the caller already has them: analyzing one file twice to
+   answer one question is the cost this file exists to avoid."
+  ([src] (roots src (u/to-list (lsp/document-symbols src))))
+  ([src syms]
+  (let [names (set (map (fn [s] (:name s)) (u/to-list syms)))
         forms (BeamLisp.Reader/read_string src)
         refs (mapcat (fn [f] (if (defn-form? f) [] (node-refs f))) forms)
         rs (distinct (filter (fn [r] (contains? names r)) refs))]
-    (if (empty? rs) (into [] names) rs)))
+    (if (empty? rs) (into [] names) rs))))
 
 (defn- tag-str [t]
   (if (keyword? t) (name t) (pr-str t)))
@@ -361,19 +404,20 @@ definition is not self-recursive.
 (defn source-rows
   "Answer the file `question` for one source: rows are plain lists whose first
    cell names the file. `:unknown-question` when `question` is not a file
-   question."
-  [question path src]
+   question. `root` is the corpus the answer is remembered under."
+  [question path src root]
   (let [path (u/rel-path path)]
     (cond
       (= question "dead-code")
-        (u/to-list (map (fn [n] (u/to-list [path n]))
-                        (u/to-list (lsp/dead-code src (roots src)))))
+        (let [syms (symbols-of src root)]
+          (u/to-list (map (fn [n] (u/to-list [path n]))
+                          (u/to-list (lsp/dead-code src (roots src syms))))))
 
       (= question "symbols")
         (u/to-list (map (fn [s] (u/to-list [path (:name s) (returns-str s)
                                             (:pure s) (:terminates s)
                                             (:growth-label s)]))
-                        (u/to-list (lsp/document-symbols src))))
+                        (symbols-of src root)))
 
       :else :unknown-question)))
 ```
@@ -450,8 +494,11 @@ exits 0 even when it finds no rows; a bad invocation exits 2.
     0))
 
 (defn- run-source [qname sources st]
-  (let [rows (u/to-list
-               (mapcat (fn [p] (source-rows qname p (File/read! p))) sources))
+  (let [; The SOURCES decide where the analysis is remembered, as they do for the
+        ; store: a question about a checkout elsewhere caches there.
+        root (first sources)
+        rows (u/to-list
+               (mapcat (fn [p] (source-rows qname p (File/read! p) root)) sources))
         data {:question qname :target nil :rows rows :count (count rows)}]
     (u/emit st data render)
     0))

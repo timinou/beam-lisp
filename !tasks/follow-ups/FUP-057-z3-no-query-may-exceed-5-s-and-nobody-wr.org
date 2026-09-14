@@ -1,0 +1,150 @@
+#+TITLE: z3: no query may exceed 5 s, and nobody wrote that down — three undeclared deadlines, two of which kill the caller
+#+STATE: DONE
+#+SESSION_ID: 157bcd97046112e7
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-11T19-45-37-298Z_157bcd97046112e7.jsonl]]
+#+CUSTOM_ID: FUP-057-z3-no-query-may-exceed-5-s-and-nobody-wr
+
+* Initial Message
+
+ok can you explain to me how z3 is now integrated with beam lisp and how it is bein used to more of its capacities, and how we could get even more out of it? this is for design/brainstorm
+
+* State "DOING" from "ITEM" when work starts.
+* Found 2026-09-13 while writing the z3 integration design note (design/brainstorm
+  turn). Corrects a claim I had just made in that note ("a hard obligation burns the
+  30 s lease and throws") — the fence is not what cuts, and the real bound is smaller
+  and harsher.
+
+**The finding: there are three deadlines in the z3 path, none declared, and they are
+ordered so the innermost one reports nothing.**
+
+| bound | value | where | on expiry |
+|---|---|---|---|
+| transport `call` | **5000 ms** (compiled-in default) | `priv/boot/compiler.bl:2597` — `(clause :call (…) (a/remote gs :call (list server request (a/lit 5000))))` | `{:exit, {:timeout, {:gen_server, :call, …}}}` — an EXIT the caller cannot `try/catch` |
+| port read | **10 000 ms** | `lib/beam_lisp/z3_port.ex:17` `@timeout 10_000`, raised at `read_answer/2:246` | `RuntimeError "z3 timeout (acc: …)"` — kills the solver's `handle_call`, so the child is restarted too |
+| checkout fence | **30 000 ms** | `priv/std/z3pool.bl:236` `([f] (with-solver 30000 f))` | throws "no z3 solver free within Nms (pool of 4)" |
+| z3's own ceiling | **unset** in the obligation engine | `system/core.bl` — no `set-option` anywhere in it | never: z3 is never asked to give up, so it never answers `unknown` |
+
+The fence is **checkout-contention only**: in `with-solver` the `(some? got)` branch of
+the `cond` precedes the deadline test, so once a solver is leased, `(f)` runs unbounded
+*from the fence's point of view* — the bound that actually applies is the 5 s transport
+`call`. Measured, in a cold `BL_DAEMON=off ./bl run`:
+
+* **probe A** — one query z3 needs ~10 s for, on the default path:
+  dies at **5624 ms** with
+  `error: {:exit, {:timeout, {:gen_server, :call, [#PID<0.115.0>, %BeamLisp.Vector{items: {:check …}}, false]}}}`.
+* **probe B** — the same query with an explicit `(call (z3pool/current) [:check …] 60000)`:
+  survives the transport, then dies at **10.67 s** in the port:
+  `RuntimeError{message: "z3 timeout (acc: \"\")"}` at `BeamLisp.Z3Port.read_answer/2`
+  (`z3_port.ex:246`), reached via `raw_check/3` → `Z3pool.Z3-solver.handle_call/3`.
+  The `acc` is EMPTY — the answer had not arrived, so nothing is even reported about it.
+* **probe C** — the same query, z3 given `(set-option :timeout 6000)` and the transport
+  raised: **`status: unknown`, elapsed 6019 ms**. So `unknown` arrives and travels fine
+  end-to-end once the deadlines are ordered; nothing about the path is broken, the
+  ordering is.
+
+**Consequences.**
+
+1. No obligation in this system may take longer than 5 s, and that is true by accident
+   of a compiler default rather than by design. Every obligation in the corpus today is
+   far under it (the whole 4-solver pool test is 210 s spread over many fast calls), so
+   it has never been hit.
+2. The four veritas dialects arm `(set-option :timeout 3000)` (`veritas/fault.bl:35`,
+   `veritas/mock.bl:31`, literals at `veritas.bl:513`, `veritas/property.bl:236`) — 3 s
+   sits deliberately under 5 s. That reads as a *workaround for the transport*, not a
+   statement about the solver. `system/core.bl`, which owns 21 of the 42 z3 call sites,
+   arms nothing.
+3. A slow obligation therefore produces no verdict at all: the caller process dies, the
+   solver child dies with it (restarted by the supervisor under the same child id, so
+   the pool heals), the lease is returned by `finally`/monitor, and the *report* is a
+   RuntimeError that names neither the machine nor the obligation.
+4. `read_until_marker/3` treats the same condition GRACEFULLY (`{:error, "timeout
+   waiting for z3 to acknowledge"}` at `z3_port.ex:226`) while `read_answer/2` RAISES.
+   One condition, two behaviours.
+5. The daemon path swallows it: probe A through the warm daemon printed
+   `bl: the daemon ended this command with exit 1 and no output` in 0.099 s — the crash
+   report (the only diagnosis) is dropped.
+
+**Related, NOT reproduced (read from the code, flagged as such):** a three-valued
+solver answer is collapsed to two. `preserves-joint?` returns
+`{:preserved (= "unsat" (z3/check …))}` (`core.bl:701`) and `verify-process` sets
+`:holds (and init-est (empty? failures))`, so an `unknown` lands on the not-proven side;
+`priv/lib/mcp/tools.bl:547` then renders it as `verdict "violated"`. The comment at
+`core.bl:1355` ("quantified array reasoning can return :unknown — then the guarantee is
+:approximate, never a false proof") is about the guarantee's EXTENSION, which is indeed
+always `:approximate` there, so it is not contradicted — but the *verdict* would still
+read as a violation. I did not produce an `unknown` from a real obligation:
+`examples/system/25_content_invariant.bl` answers `holds: true`, `:approximate` — a real
+unsat, in milliseconds.
+
+**Fix shape (ordered and named, innermost first).** z3's own `:timeout` must be the
+innermost bound so the solver answers `unknown` and nothing raises; the port read
+`@timeout` one step above it (its raise then means "z3 ignored its own ceiling", a real
+bug); the transport `call` above that; the fence stays about contention only and should
+say so in its docstring. Concretely: arm a default `(set-option :timeout N)` at the pool
+edge (or per obligation in `system/core`), and pass an explicit `call` timeout in
+`z3pool`'s verbs instead of taking the compiled-in 5000. Choice of N is a real decision:
+a longer ceiling means a hard obligation holds one of only four pool members longer.
+
+**Acceptance when fixed.** (a) a query that outruns z3's ceiling returns `"unknown"` as a
+verdict, with the machine named, and no process dies; (b) a query between the port bound
+and the call bound does not raise from `read_answer`; (c) `veritas`'s 3000 can be
+justified by the docstring rather than by luck; (d) tests pin all three orderings, with
+the 5 s one exercised through an injected slow query (the semiprime instance in this
+item's measurements) so the test does not depend on wall-clock flakiness.
+
+* FIXED — abdd46e (priv/std/z3pool.bl, lib/beam_lisp/z3_port.ex, test/bl/system/z3_deadline_test.bl)
+
+**The chain, innermost first. Only the innermost produces a verdict:**
+
+```
+z3's own ceiling   z3pool/z3-timeout-ms     10000, armed per lease     -> "unknown"
+the port's read    Z3Port/read_timeout      20000 (BL_Z3_READ_TIMEOUT) -> raises
+the caller's call  z3pool/call-timeout-ms   60000                      -> raises
+```
+
+The pool arms the ceiling ONCE per lease, on the context the `(reset)` just cleaned,
+because `(set-option :timeout …)` is global and last-wins — so a caller that sets its
+own later keeps it, which is how the four veritas dialects hold their 3000 ms. The
+port's deadline is now `read_timeout/0`, movable from the environment like the
+daemon's read timeout, and it means exactly one thing: z3 ignored its own ceiling.
+
+**Measured, same script, before and after** (`BL_DAEMON=off ./bl run`, the semiprime):
+
+| | before | after |
+|---|---|---|
+| died? | `{:exit, {:timeout, {:gen_server, :call, …}}}` at 5624 ms | — |
+| verdict | none | `status: unknown` at **10020 ms** |
+
+The "after" number is on the REBUILT drop (`mix bl.build`, payload ee950581), not just
+in-tree — note that `priv/std/**` is AOT-compiled into the payload, so a drop built
+before the fix keeps the old behaviour even though `priv/lib/**` resolves from the
+checkout. The first post-fix drop probe still died at 5688 ms for exactly that reason.
+
+**Tests: 12 assertions, `test/bl/system/z3_deadline_test.bl`.** The three bounds are
+ordered; the port deadline's default/override/refusal-to-disarm; a caller's 50 ms
+ceiling overrides the pool's 10 s (60x margin, so the speed is the evidence); with no
+caller ceiling the pool's fires and the answer is a verdict; and the backstop kills
+rather than verdicts — pinned by moving the port's deadline to 300 ms and asserting a
+spawned caller dies with NO verdict, instead of waiting 20 s.
+
+**Regression: 65 files, 1320 assertions, 0 red** (`test/bl/system/*` + `test/bl/veritas/*`).
+The veritas half is the real exercise of last-wins: those dialects arm 3000 ms through
+the same verbs and still pass. `mix bl check` on both changed files: diags=0 smells=0.
+
+**Acceptance, honestly scored.** (a) met — a query outrunning z3's ceiling returns
+`"unknown"` and nothing dies. (b) met — a query between the port's bound and the
+caller's no longer raises, because the port is now ABOVE the ceiling. (c) partially —
+veritas's 3000 ms is now justified by the chain comment in `z3pool.bl`, not by its own
+file. (d) met — the ordering and both ends are pinned by tests.
+
+**Still open, and NOT closed by this:**
+
+* The arm is pinned behaviourally, not by reading the option back: `raw_command`
+  discards z3's reply text, so `(get-option :timeout)` cannot be observed from the
+  language. The ordering test plus the two ceiling tests are what hold it.
+* `unknown` still collapses to `:holds false` and so to `verdict "violated"`
+  (`core.bl:701`, `tools.bl:547`) — read, not reproduced, and untouched here.
+* No corpus obligation has been TIMED. Whether any approaches even the old 5 s is
+  unknown, and answering it needs {status, ms} in the ledger.
+* The probes ran cold (`BL_DAEMON=off`). The daemon's own read timeout is 1800 s and
+  the chain applies inside the worker VM, but the slow probe was not re-run warm.

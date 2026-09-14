@@ -290,10 +290,288 @@ the corpus assembles.
                     "beamlisp module enabled"
                     "not wired — run: bl install doom")}]))))
 
+;; ── the gateway target ────────────────────────────────────────────────
+;;
+;; The gateway is HOST infrastructure, not a project's: one per user, holding
+;; the one port a URL is allowed to leave out, answering every name every tree
+;; registered. Installing it is the two things a project cannot do for itself —
+;; a systemd USER unit (it starts at login; it outlives a shell) and, once, the
+;; sysctl that lets a user bind port 80 at all.
+
+(defn- unit-file []
+  (let [cfg (or (System/get_env "XDG_CONFIG_HOME") (str (home) "/.config"))]
+    (str cfg "/systemd/user/bl-gateway.service")))
+
+(defn- unit-text [bin]
+  (join "\n"
+        ["[Unit]"
+         "Description=beam-lisp gateway — answers the names beam-lisp projects declare"
+         "After=network.target"
+         ""
+         "[Service]"
+         "Type=simple"
+         (str "ExecStart=" bin " gateway run")
+         "Restart=on-failure"
+         "RestartSec=2"
+         ""
+         "[Install]"
+         "WantedBy=default.target"
+         ""]))
+
+(defn- port-80-verdict
+  "Can an unprivileged process bind port 80 right now? Asked by binding it,
+   which is the only answer that counts."
+  []
+  (let [r (gen_tcp/listen 80
+                          (list :binary
+                                (tuple :ip (erlang/list_to_tuple (list 127 0 0 1)))
+                                (tuple :reuseaddr false)))]
+    (if (tuple? r)
+      (let [tag (erlang/element 1 r)]
+        (if (= :ok tag)
+          (do (gen_tcp/close (erlang/element 2 r)) :ok)
+          (erlang/element 2 r)))
+      :error)))
+
+(defn- port-80-pointer
+  "One line naming both ways a name gets answered on port 80, and the root
+   step each takes. The exact sysctl string lives in the gateway module, so
+   there is one spelling of it in the tree; this is a REPORT line, so it names
+   the verbs a developer types."
+  []
+  (str "run: bl install redirect (loopback only, removable), or: "
+       (BeamLisp.Daemon.Gateway/sysctl_command)))
+
+(defn- run-gateway [_arg]
+  (let [bin (BeamLisp.Daemon.Gateway/command)
+        unit (unit-file)]
+    (if (nil? bin)
+      {:error "no `bl` on PATH — set BL_BIN to this build, then re-run"}
+      (do
+        (File/mkdir_p (Path/dirname unit))
+        (File/write! unit (unit-text bin))
+        (System/cmd "systemctl" (u/to-list ["--user" "daemon-reload"]) (u/kw [:stderr_to_stdout true]))
+        (let [start (System/cmd "systemctl"
+                                (u/to-list ["--user" "enable" "--now" "bl-gateway"])
+                                (u/kw [:stderr_to_stdout true]))
+              code (erlang/element 2 start)
+              verdict (port-80-verdict)]
+          [(step "unit" {:ok unit})
+           (step "service" (if (= 0 code)
+                              {:ok "enabled + started (systemctl --user)"}
+                              {:error (str "systemctl --user enable --now failed: "
+                                           (String/trim (erlang/element 1 start)))}))
+           (step "port 80" (cond
+                              (= :ok verdict) {:ok "bindable by a user here — the gateway takes it"}
+                              (= :eacces verdict) {:error (port-80-pointer)}
+                              :else {:error (str "not free (" (pr-str verdict)
+                                                 ") — the gateway will use 7777 (" (port-80-pointer) ")")}))
+           {:name "next" :ok true
+            :detail "open what it routes: bl ports, then a name"}])))))
+
+(defn- check-gateway [_arg]
+  (let [unit (unit-file)
+        verdict (port-80-verdict)
+        answered (BeamLisp.Daemon.Gateway/ours_on? 80)
+        up (BeamLisp.Daemon.Gateway/port)]
+    [{:name "unit" :ok (File/regular? unit)
+      :detail (if (File/regular? unit) unit "absent — run: bl install gateway")}
+     {:name "gateway" :ok (not (nil? up))
+      :detail (if (nil? up) "not running — bl gateway start" (str "on port " up))}
+     ;; The question a developer actually has: can I leave the port out of the
+     ;; URL? Not "could I bind 80" — whether something answers there. So the
+     ;; check probes, and names the two ways to make it answer.
+     {:name "port 80" :ok answered
+      :detail (if answered
+                "a name needs no port here"
+                (str (pr-str verdict) " — " (port-80-pointer)))}]))
+;; ── the redirect target ───────────────────────────────────────────────
+;;
+;; A name is worth having because a URL may omit the port, and exactly ONE port
+;; may be omitted: 80. Binding it needs privilege or a machine-wide sysctl — a
+;; lot to ask for "I want to type my dev server's name". The third way is the
+;; smallest: leave the gateway where it stands and redirect port 80 to it, on
+;; loopback only, in nftables tables of our own.
+;;
+;; What that buys, exactly: packets to 127.0.0.0/8:80 and [::1]:80 are NATed to
+;; the gateway's port. Nothing on the LAN is touched (the rule sits in the
+;; OUTPUT chain and matches loopback destinations), no policy is loosened (a
+;; local process still cannot bind 1023), and the gateway's printed addresses
+;; lose their port by themselves — they are derived from a probe of port 80
+;; (BeamLisp.Daemon.Gateway/fronted_on?).
+;;
+;; Root is still needed for the rule. So the install is a SCRIPT: printed for
+;; the user when this process has no password, run with `sudo -n` when it does.
+;; A tool that stops to wait for a password in a pipe is worse than one that
+;; hands over the line.
+
+(def redirect-port
+  "Where the redirect sends port 80: the gateway's fallback port. An unpinned
+   gateway prefers 80 and settles on 7777, so this is the one that stays right
+   across a gateway restart."
+  7777)
+
+(def redirect-rules-path "/etc/bl-gateway-redirect.nft")
+(def redirect-unit-path "/etc/systemd/system/bl-gateway-redirect.service")
+
+(defn redirect-rules
+  "The ruleset, as text. Our OWN tables: an install never edits somebody else's
+   rules, and a removal never has to guess which rule was ours."
+  [port]
+  (str "table ip bl_gateway_redirect {\n"
+       "  chain output {\n"
+       "    type nat hook output priority dstnat; policy accept;\n"
+       "    ip daddr 127.0.0.0/8 tcp dport 80 redirect to :" port "\n"
+       "  }\n"
+       "}\n"
+       "table ip6 bl_gateway_redirect {\n"
+       "  chain output {\n"
+       "    type nat hook output priority dstnat; policy accept;\n"
+       "    ip6 daddr ::1 tcp dport 80 redirect to :" port "\n"
+       "  }\n"
+       "}\n"))
+
+(defn redirect-unit-text
+  "The boot half: nftables rules do not survive a reboot, and a SYSTEM unit is
+   the smallest thing that reapplies them — no dependency on how a particular
+   machine's /etc/nftables.conf happens to be written."
+  [rules-path]
+  (str "[Unit]\n"
+       "Description=beam-lisp gateway redirect — port 80 for names beam-lisp projects declare\n"
+       "After=network.target\n"
+       "\n[Service]\n"
+       "Type=oneshot\n"
+       "RemainAfterExit=yes\n"
+       "ExecStart=/usr/bin/nft -f " rules-path "\n"
+       "\n[Install]\n"
+       "WantedBy=multi-user.target\n"))
+
+(defn install-script
+  "Installing, as the script a human would paste. Dropping our own tables first
+   is what makes a second install a no-op instead of an error."
+  [stage]
+  (str "set -e\n"
+       "install -D -m644 " stage "/redirect.nft " redirect-rules-path "\n"
+       "install -D -m644 " stage "/redirect.service " redirect-unit-path "\n"
+       "nft delete table ip bl_gateway_redirect 2>/dev/null || true\n"
+       "nft delete table ip6 bl_gateway_redirect 2>/dev/null || true\n"
+       "nft -f " redirect-rules-path "\n"
+       "systemctl daemon-reload\n"
+       "systemctl enable --now bl-gateway-redirect.service\n"))
+
+(defn remove-script
+  "Removing: the same three things in reverse — and only ours."
+  []
+  (str "systemctl disable --now bl-gateway-redirect.service 2>/dev/null || true\n"
+       "nft delete table ip bl_gateway_redirect 2>/dev/null || true\n"
+       "nft delete table ip6 bl_gateway_redirect 2>/dev/null || true\n"
+       "rm -f " redirect-rules-path " " redirect-unit-path "\n"
+       "systemctl daemon-reload\n"))
+
+(defn- state-dir
+  "Where a staged install waits between being written (no root) and being
+   copied into /etc (root)."
+  []
+  (str (or (System/get_env "XDG_STATE_HOME") (str (home) "/.local/state"))
+       "/beam-lisp"))
+
+(defn- sudo-ready?
+  "Whether sudo runs a command without asking. Asked FIRST, because an install
+   that stops to wait for a password in a pipe reads as a hung tool."
+  []
+  (= 0 (erlang/element 2 (System/cmd "sudo" (u/to-list ["-n" "true"])
+                                     (u/kw [:stderr_to_stdout true])))))
+
+(defn- write-stage
+  "Write the two files the script installs. Writing them needs no root — only
+   putting them in /etc does, which is what the script is for."
+  [port]
+  (let [dir (str (state-dir) "/redirect")]
+    (File/mkdir_p dir)
+    (File/write! (str dir "/redirect.nft") (redirect-rules port))
+    (File/write! (str dir "/redirect.service") (redirect-unit-text redirect-rules-path))
+    dir))
+
+(defn- run-script
+  "Run an install script as root, or hand it over. Returns {:ok detail} or
+   {:error detail}; the script itself is PRINTED, because a sentence a
+   developer can act on beats a stack trace about a permission."
+  [script]
+  (if (sudo-ready?)
+    (let [r (System/cmd "sudo" (u/to-list ["sh" "-c" script]) (u/kw [:stderr_to_stdout true]))]
+      (if (= 0 (erlang/element 2 r))
+        {:ok "installed (nftables + the system unit)"}
+        {:error (str "the script failed: " (String/trim (erlang/element 1 r)))}))
+    (do (println "")
+        (println "this one needs root — run it:")
+        (println "")
+        (println script)
+        {:error "needs root — the script printed above"})))
+
+(defn- answered-on-80?
+  "The only honest question: does a beam-lisp gateway answer on port 80?"
+  []
+  (BeamLisp.Daemon.Gateway/ours_on? 80))
+
+(defn- run-redirect [_arg]
+  (let [port (BeamLisp.Daemon.Gateway/port)]
+    (cond
+      (answered-on-80?)
+      [{:name "port 80" :ok true :detail "already answered — nothing to install"}]
+
+      (nil? port)
+      [{:name "gateway" :ok false
+        :detail "not running — bl gateway start first (a redirect would have nothing to forward to)"}]
+
+      :else
+      (let [r (run-script (install-script (write-stage port)))
+            answered (answered-on-80?)]
+        [{:name "ruleset" :ok (not (contains? r :error)) :detail (or (get r :ok) (get r :error))}
+         {:name "port 80" :ok answered
+          :detail (if answered
+                    "names answer here without a port"
+                    (str "not answered yet — the gateway is on " port))}
+         {:name "gateway port" :ok (= port redirect-port)
+          :detail (if (= port redirect-port)
+                    (str "on the fallback port " redirect-port " — the boot rule stays right")
+                    (str "on " port ", not " redirect-port
+                         " — the rule follows it now, but restart the gateway on the fallback"
+                         " port so the boot rule keeps pointing at it"))}
+         {:name "next" :ok true :detail "bl ports — the addresses printed there need no port"}]))))
+
+(defn- remove-redirect [_arg]
+  (let [r (run-script (remove-script))
+        still (answered-on-80?)]
+    [{:name "ruleset" :ok (not (contains? r :error)) :detail (or (get r :ok) (get r :error))}
+     {:name "port 80" :ok true
+      :detail (if still
+                "still answered — by the gateway itself, which holds 80"
+                "no longer answered — every address shows its port again")}]))
+
+(defn- check-redirect [_arg]
+  (let [answered (answered-on-80?)
+        enabled (String/trim (erlang/element 1 (System/cmd "systemctl"
+                                                           (u/to-list ["is-enabled" "bl-gateway-redirect.service"])
+                                                           (u/kw [:stderr_to_stdout true]))))]
+    [{:name "port 80" :ok answered
+      :detail (if answered "a name needs no port here" "not answered — run: bl install redirect")}
+     {:name "ruleset file" :ok (File/regular? redirect-rules-path)
+      :detail (if (File/regular? redirect-rules-path) redirect-rules-path
+                "absent — run: bl install redirect")}
+     {:name "unit" :ok (= enabled "enabled")
+      :detail (if (= enabled "enabled") "enabled" (str enabled " — run: bl install redirect"))}]))
+
 (def targets
   {"doom" {:summary "Doom Emacs: the beamlisp module, tree-sitter grammar, init.el wiring"
            :run run-doom
            :check check-doom}
+   "gateway" {:summary "The name gateway: one per user, holding the port a URL may leave out"
+              :run run-gateway
+              :check check-gateway}
+   "redirect" {:summary "Port 80 without privilege: redirect it to the gateway (nftables + a system unit)"
+               :run run-redirect
+               :check check-redirect
+               :remove remove-redirect}
    "mcp"  {:summary "MCP clients: agent instructions + server registration"
            :run run-mcp
            :check (fn [_] [{:name "mcp" :ok true
@@ -316,30 +594,35 @@ the corpus assembles.
      (println (str "  " name "  " (:summary (get targets name)))))
    (sort (keys targets)))
   (println "")
-  (println "usage: bl install TARGET [DIR] [--check] [--json]"))
+  (println "usage: bl install TARGET [DIR] [--check] [--remove] [--json]"))
 
 (defn- all-ok? [steps]
   (empty? (filter (fn [s] (not (:ok s))) steps)))
 
 (defn run
-  "`bl install [TARGET [DIR]] [--check] [--json]`. No target lists them.
-   A target installs (or, with --check, verifies) and answers 0 when every
-   step is ok, 1 when one failed, 2 on a bad invocation."
+  "`bl install [TARGET [DIR]] [--check] [--remove] [--json]`. No target lists
+   them. A target installs (or, with --check, verifies, and with --remove,
+   undoes) and answers 0 when every step is ok, 1 when one failed, 2 on a bad
+   invocation."
   [args st]
   (if (empty? args)
     (do (list-targets) 0)
     (let [name (first args)
           t (get targets name)]
       (if (nil? t)
-        (u/usage-error (str "bl install: unknown target \"" name "\" (doom|mcp)"))
-        (let [arg (second args)
-              steps (if (:check st)
-                      ((:check t) arg)
-                      (let [r ((:run t) arg)]
-                        (if (and (map? r) (contains? r :error))
-                          [{:name name :ok false :detail (get r :error)}]
-                          r)))]
-          (u/emit st {:target name :ok (all-ok? steps) :steps steps}
-                  (fn [_] (render-report name steps)))
-          (if (all-ok? steps) 0 1))))))
+        (u/usage-error (str "bl install: unknown target \"" name
+                            "\" (" (join "|" (sort (keys targets))) ")"))
+        (if (and (:remove st) (nil? (:remove t)))
+          (u/usage-error (str "bl install: " name " has nothing to remove"))
+          (let [arg (second args)
+                steps (cond
+                        (:check st) ((:check t) arg)
+                        (:remove st) ((:remove t) arg)
+                        :else (let [r ((:run t) arg)]
+                                (if (and (map? r) (contains? r :error))
+                                  [{:name name :ok false :detail (get r :error)}]
+                                  r)))]
+            (u/emit st {:target name :ok (all-ok? steps) :steps steps}
+                    (fn [_] (render-report name steps)))
+            (if (all-ok? steps) 0 1)))))))
 ```

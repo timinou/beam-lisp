@@ -14,7 +14,47 @@ defmodule BeamLisp.Z3Port do
       body.
   """
 
-  @timeout 10_000
+  # The port's read deadline — the BACKSTOP, not the policy. The pool arms z3's
+  # OWN ceiling (priv/std/z3pool.bl, `z3-timeout-ms`) at every lease, so a hard
+  # query is answered `unknown` by the solver and never reaches this. This one
+  # fires when z3 ignores its own ceiling, when the port is driven directly (the
+  # tests do), or when a caller arms a ceiling ABOVE it — so a caller who wants
+  # to wait longer than this for one answer must move this too, with
+  # BL_Z3_READ_TIMEOUT. A raise here is a real bug, and the honest report.
+  #
+  # ORDERING, in one place: z3's :timeout  <  this  <  the caller's `call`
+  # timeout (z3pool/call-timeout-ms). Measured before the ordering existed: a
+  # query needing 6s killed its caller on the transport's compiled-in 5000ms
+  # default, and one needing 10s died HERE with an empty accumulator — no
+  # verdict, no diagnosis (FUP-057).
+  @default_read_timeout 20_000
+
+  @doc """
+  A positive integer from the environment, or `default`.
+
+  ONE rule for every bound in this path: a missing, non-numeric or non-positive
+  value falls back rather than disarming the deadline it exists to enforce.
+  """
+  def env_ms(name, default) do
+    case System.get_env(name) do
+      nil ->
+        default
+
+      raw ->
+        case Integer.parse(raw) do
+          {n, ""} when n > 0 -> n
+          _ -> default
+        end
+    end
+  end
+
+  @doc """
+  How long a single read from z3 may take, in ms.
+
+  `BL_Z3_READ_TIMEOUT` moves it; a missing, non-numeric or non-positive value
+  falls back to the default rather than disarming the read.
+  """
+  def read_timeout, do: env_ms("BL_Z3_READ_TIMEOUT", @default_read_timeout)
 
   # z3 answers `(echo "…")` with the string alone (verified against the pinned
   # binary), which makes it a reliable sync marker: a command is acknowledged on
@@ -114,6 +154,50 @@ defmodule BeamLisp.Z3Port do
   """
   def check(port, smt, model? \\ false), do: raw_check(port, smt, model?)
 
+  @doc """
+
+  `unknown` means the question was not decided, and the two ways that happens
+  want OPPOSITE responses: a CEILING (`timeout` / `canceled`) says raise it or
+  simplify the query; an INCOMPLETE THEORY says no ceiling will help, and the
+  obligation has to stay undecided rather than be retried harder. Measured against
+  the pinned binary: a factoring query under `(set-option :timeout 300)` answers
+  `timeout` standalone and `canceled` through the pool, and a DECIDED check answers
+  the empty string — which is why an absent reason comes back as nil and can never
+  be read as a name.
+
+  One extra round trip, on the undecided path only. The reply is the RAW z3
+  string here; naming it is the language's job (`oracle/verdict`).
+  """
+  def raw_reason(port, status, rest) when status == "unknown" do
+    Port.command(port, "(get-info :reason-unknown)\n")
+    read_sexp(port, rest) |> extract_reason()
+  end
+
+  def raw_reason(_port, _status, _rest), do: nil
+
+  # `(:reason-unknown "timeout")` → "timeout"; `(:reason-unknown "")` → nil; any
+  # other shape → nil, because a caller that cannot read the reason must not be
+  # handed a guess.
+  @reason_re ~r/^\(:reason-unknown\s+(.*)\)$/s
+
+  defp extract_reason(text) do
+    case Regex.run(@reason_re, String.trim(text || "")) do
+      [_, inner] ->
+        inner =
+          inner
+          |> String.trim()
+          |> String.trim_leading("\"")
+          |> String.trim_trailing("\"")
+
+        if inner == "", do: nil, else: inner
+
+      _ ->
+        nil
+    end
+  end
+
+
+
   @doc "The protocol itself. Runs in the OWNER process only."
   def raw_check(port, smt, model? \\ false) do
     # A caller-supplied (check-sat) would make z3 answer TWICE and desync the
@@ -132,8 +216,8 @@ defmodule BeamLisp.Z3Port do
           %{status: "sat", model: nil}
         end
 
-      {line, _} ->
-        %{status: line, model: nil}
+      {line, rest} ->
+        %{status: line, model: nil, why: raw_reason(port, line, rest)}
     end
   end
 
@@ -154,13 +238,6 @@ defmodule BeamLisp.Z3Port do
   end
 
   @doc """
-  check-sat in the CURRENT solver state — no reset, so assertions accumulate and
-  `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
-  `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
-  named and the script must set `:produce-unsat-cores`), `:model?` (return the
-  model on sat).
-  """
-  @doc """
   The same check, positional — beam-lisp callers pass `(assume core? model?)` and
   never have to marshal a map across the boundary.
   """
@@ -168,6 +245,13 @@ defmodule BeamLisp.Z3Port do
     raw_check_here(port, %{assume: assume, core?: core?, model?: model?})
   end
 
+  @doc """
+  check-sat in the CURRENT solver state — no reset, so assertions accumulate and
+  `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
+  `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
+  named and the script must set `:produce-unsat-cores`), `:model?` (return the
+  model on sat).
+  """
   def raw_check_here(port, opts) do
     assume = Map.get(opts, :assume) || []
 
@@ -197,8 +281,38 @@ defmodule BeamLisp.Z3Port do
           %{status: "sat", core: nil}
         end
 
-      {line, _} ->
-        %{status: line, core: nil}
+      {line, rest} ->
+        %{status: line, core: nil, why: raw_reason(port, line, rest)}
+    end
+  end
+
+  @doc """
+  One SCOPED question: push, assert the script, check-sat, [get-model], pop — all
+  inside one call, against the solver state the caller's conversation already
+  built. The prelude is therefore sent once per conversation instead of once per
+  question (measured: a push/assert/check/pop question is 96 us at the solver and
+  3009 us when the prelude is re-sent after a reset).
+
+  `(get-model)` runs BEFORE the pop — the model of a popped scope is gone — and
+  `pop` prints nothing, so the reply stream stays exactly one status (+ model).
+  """
+  def raw_scoped(port, smt, model? \\ false) do
+    Port.command(port, "(push 1)\n" <> smt <> "\n(check-sat)\n")
+
+    case read_answer(port, "") do
+      {"unsat", _rest} ->
+        Port.command(port, "(pop 1)\n")
+        %{status: "unsat", core: nil, model: nil}
+
+      {"sat", rest} ->
+        model = if model?, do: (Port.command(port, "(get-model)\n") && read_sexp(port, rest))
+        Port.command(port, "(pop 1)\n")
+        %{status: "sat", core: nil, model: model}
+
+      {line, rest} ->
+        why = raw_reason(port, line, rest)
+        Port.command(port, "(pop 1)\n")
+        %{status: line, core: nil, model: nil, why: why}
     end
   end
 
@@ -223,7 +337,7 @@ defmodule BeamLisp.Z3Port do
 
             read_until_marker(port, acc <> data, keep)
         after
-          @timeout -> {:error, "timeout waiting for z3 to acknowledge", out}
+          read_timeout() -> {:error, "timeout waiting for z3 to acknowledge", out}
         end
     end
   end
@@ -243,7 +357,7 @@ defmodule BeamLisp.Z3Port do
             {Enum.at(lines, idx), rest}
         end
     after
-      @timeout -> raise "z3 timeout (acc: #{inspect(acc)})"
+      read_timeout() -> raise "z3 timeout (acc: #{inspect(acc)})"
     end
   end
 
@@ -254,7 +368,7 @@ defmodule BeamLisp.Z3Port do
       receive do
         {^port, {:data, data}} -> read_sexp(port, acc <> data)
       after
-        @timeout -> acc
+        read_timeout() -> acc
       end
     end
   end

@@ -286,6 +286,57 @@ Rows are tab-separated. Exit `0` for any valid question, even one with no rows;
 
 `--json` keys: `question`, `target`, `rows`, `count`.
 
+A source question (`symbols`, `dead-code`) is answered from an ANALYSIS of each
+file — its document symbols — and that analysis is remembered per source
+revision, beside the stores, under the project the sources belong to (the same
+rule as everything else here: the PATH decides, not the shell). Asking twice over
+an unchanged file pays for that analysis once; an edit is a new entry, because
+the name is the content hash. `symbols` and `dead-code` share the one analysis,
+which is why `dead-code` — two analyses' worth of work — costs one.
+
+### override
+
+The `.bl` the compiler ships is on every tree's search path — and the search
+order (tree > configured roots > shipped tiers) means a project file whose
+namespace matches already shadows a shipped one. `bl override` makes that a
+workflow. A tree's `overrides/` directory is a library root by convention: no
+flag, no config.
+
+#### `bl override vendor NS...`
+
+Copy a shipped namespace's source into `overrides/` to fix a bug in it. The
+copy shadows the shipped file for every command in the tree; the shipped file
+is untouched.
+
+#### `bl override apply PATCH.bl`
+
+Apply a patch: a beam-lisp PROGRAM exporting `(transform [ctx])`, handed the
+shipped sources plus the codebase database to locate its targets by structure
+(`:db-for`, `:read-shipped`), returning the new sources and its test files.
+Landing is all-or-nothing, verified before it takes effect:
+
+- logical, implicit: the compiler's diagnostics must be clean on each new
+  source, and each overridden namespace must load in an isolated env;
+- unit, implicit: the shipped tests of each touched namespace must pass
+  against the override (when a checkout's test tree is visible);
+- unit, explicit: the patch's own tests must pass.
+
+Any failure rolls every written file back and exits `1`.
+
+```sh
+$ bl override apply patches/edn_tagged_readers.bl
+wrote overrides/clojure/edn.bl
+✓ override applied — 1 file(s), 2 test file(s) passed
+```
+
+#### `bl override list · diff NS · revert NS...`
+
+See what this tree shadows and whether it drifted, diff an override against
+the shipped source, or drop an override and return to shipped behavior.
+
+See research/p17_overrides/ for a worked patch (teaching clojure.edn tagged
+literals via :readers/:default).
+
 ### build
 
 #### `bl build PATH... [--out DIR] [--force] [--jobs N] [--native]`
@@ -359,6 +410,16 @@ bl serve: server.bl running — Ctrl+C to stop
 `(bl.serve/port 4043)` where the literal port would go, and the flag makes that
 call answer `N`:
 
+write `(bl.serve/port :web 4043)` and the port comes from the project's
+`:ports {:web 4000}` (`--port N` still wins), claimed in the session's registry
+and registered with the name it answers to — so the app is reachable at
+`http://web.<project>.test` and no human reads the number. A port another live
+process holds is an error naming the owner, never a silent move.
+
+```clojure
+(web/serve {:port (bl.serve/port :web 4043) :plug router})
+```
+
 ```clojure
 (ns mini-server
   (:require [web]))
@@ -368,8 +429,6 @@ call answer `N`:
 
 (web/serve {:port (bl.serve/port 4043) :plug router})
 ```
-
-Exit `1` when the program raises, `2` when no FILE is given. The web layer needs
 `bandit`, which the release ships.
 
 #### `bl daemon start|stop|status`
@@ -390,6 +449,103 @@ bl daemon
 ```
 
 `status` exits `0` when a daemon answers, `1` when none is running.
+
+### ports · ui · open · gateway
+
+#### `bl ports`
+
+Every port a session has claimed, name first: the host it answers at, the number
+behind it, the owning tree and its pid. A claim with no name — a port nobody
+declared — still lists, with its loopback address.
+
+```sh
+$ bl ports
+  ui    http://beam-lisp.test:7777/     → 51337  beam-lisp (pid 1812553)
+  web   http://web.beam-lisp.test:7777/ → 4000   beam-lisp (pid 1812553)
+
+  2 name(s) registered, but no gateway answers them:
+      bl gateway start    (one per user; see bl install gateway)
+```
+
+The address shows the port when it has to and no port when it does not: the one
+HTTP port a URL may leave out is 80, so a gateway standing on 80 (or one fronted
+by `bl install redirect`) prints `http://web.beam-lisp.test/`, and anything else
+prints the port — an address that omitted the port nothing is listening on would
+look clickable and refuse. With no gateway at all the names print bare, and the
+hint above says what is missing.
+
+The last two lines appear only when names are registered and nothing is
+listening for them. Exit `0`; an empty registry prints one line saying so.
+
+#### `bl open NAME [--open] [--port N]`
+
+The address behind a port name — the everyday verb, so nobody reads a number.
+It prints the name and the loopback address it routes to; `--open` hands the
+first one to the desktop's opener. `NAME` is a project port name (`web`) or a
+raw port number. Exit `1` when nothing live holds the name, `2` with no
+argument.
+
+```sh
+$ bl open web
+http://web.beam-lisp.test:7777/
+  → http://127.0.0.1:4000/
+```
+
+One URL, and the port in it is the one that works: with the gateway answering on
+port 80 — itself or through `bl install redirect` — it is
+`http://web.beam-lisp.test/` instead.
+
+#### `bl ui [--open]`
+
+The session's own address — the page and its `/mcp` endpoint, one URL. Exactly
+`bl open ui`: one implementation, so the terminal and the dashboard cannot
+disagree about where the session is. Exit `1` when no session is running for
+this tree.
+
+#### `bl gateway [start|stop|status|run]`
+
+The one listener that answers NAMES: one per user, holding the port a URL may
+leave out (80 when it can), reading `Host:` and splicing the connection to the
+port that registered that name. With no subcommand it reports what it is doing —
+the port, and every name it routes.
+
+```sh
+$ bl gateway
+bl gateway on 127.0.0.1:80 and [::1]:80   (pid 1900112)
+  port 80: answered — names need no port in the URL
+  beam-lisp.test       → 127.0.0.1:51337  beam-lisp
+  web.beam-lisp.test   → 127.0.0.1:4000   beam-lisp
+```
+
+The `port 80` line is the one thing a developer cannot read off the rest: it is
+probed, not configured, and when nothing answers there it says
+`not answered — bl install redirect` instead.
+
+`start` uses the systemd user unit when one is installed and detaches otherwise;
+`stop` stops the running one; `run` is the foreground process the unit execs —
+it blocks, and a pinned `--port N` that cannot be bound is an error rather than
+a silent move.
+
+Exit `0` when the gateway is up; `stop` and `status` exit `1` when none was
+running; `2` on an unknown subcommand.
+
+Port 80 is the only piece that needs root. Two ways to get it, and either one
+ends with every printed address losing its port:
+
+```sh
+bl install redirect          # loopback-only nftables redirect + a system unit — recommended
+# or hand the gateway the port itself:
+printf 'net.ipv4.ip_unprivileged_port_start=80\n' | sudo tee /etc/sysctl.d/60-beam-lisp-gateway.conf
+sudo sysctl --system
+```
+
+Which one is in force is not configured and not guessed: the gateway probes port
+80 and prints the address that answers. `bl gateway` reports the port it holds.
+
+Names are derived from the tree, so the whole story is in
+[../dev/names.bl.md](../dev/names.bl.md): `<port>.<project>.test` and its
+`.localhost` twin, qualified by `:instance` when two checkouts of one project
+want different names.
 
 ### doc
 
@@ -484,11 +640,11 @@ startup (a few seconds); every request after that reads the conn it built.
 
 ### install
 
-#### `bl install [TARGET [DIR]] [--check] [--json]`
+#### `bl install [TARGET [DIR]] [--check] [--remove] [--json]`
 
 Install beam-lisp into your tools. With no TARGET, lists the targets. A target
 writes what the tool needs and reports each step; `--check` verifies an
-installation without writing anything.
+installation without writing anything; `--remove` undoes what a target wrote.
 
 ```sh
 $ bl install doom
@@ -513,6 +669,32 @@ same facts the MCP server serves over `prompts/get` — and writes
 `.`), with the client registration snippet in each. An agent reads the files;
 a client can also just run the server.
 
+`gateway` writes a systemd **user** unit so the name gateway starts at login.
+
+`redirect` makes port 80 answer for the gateway without giving anything else on
+the machine the right to: one nftables table sends packets addressed to
+`127.0.0.0/8:80` and `[::1]:80` to the port the gateway already holds, plus a
+system unit that reapplies it at boot. It is the recommended way to get a
+portless address (loopback only, removable with `--remove`), and it is the one
+target that needs root, so it runs its script with `sudo` when it can and
+otherwise prints exactly what to paste:
+
+```sh
+$ bl install redirect
+bl install redirect
+
+this one needs root — run it:
+
+set -e
+install -D -m644 ~/.local/state/beam-lisp/redirect/redirect.nft /etc/bl-gateway-redirect.nft
+…
+systemctl enable --now bl-gateway-redirect.service
+
+  --   ruleset     needs root — the script printed above
+  --   port 80     not answered yet — the gateway is on 7777
+  ok   gateway port on the fallback port 7777 — the boot rule stays right
+```
+
 Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
 
 `--json` keys: `target`, `ok`, `steps` (each `name`, `ok`, `detail`).
@@ -522,8 +704,9 @@ Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
 #### `bl doctor [--json]`
 
 Report what this host can do: the language, OTP and Elixir, the native tiers
-(`datom_fjall`, `explorer`, `lazy_memo`, `wry`), the solver, the daemon, the
-search and code paths, and the checkout's own markers. Two probes are required —
+(`datom_fjall`, `explorer`, `code_embed`, `lazy_memo`, `wry`), the solver, the
+daemon, the search and code paths, the embedding weights (which of the three
+copies is answering), and the checkout's own markers. Two probes are required —
 the language evaluates, and the LazyMemo fast lane answers. An absent optional
 native is a line in the table, never a crash.
 
@@ -531,23 +714,57 @@ native is a line in the table, never a crash.
 $ bl doctor
 beam-lisp doctor
 
-  ok   language       (+ 1 2) → 3
-  ok   otp            29
-  ok   elixir         1.20.2
-  ok   beam-lisp      2026.0.0
-  ok   search-paths   0 root(s)
-  ok   code-paths     44 dir(s)
-  ok   datom_fjall    loaded
-  ok   explorer       loaded
-  ok   lazy_memo      65536 bytes fast lane
-  ok   z3             sat
-  ok   wry            loaded
-  --   daemon         not running (:no_socket)
-  --   src/           absent
-  --   .bl-check.edn  absent (run `bl check --update`)
+  ok   language          (+ 1 2) → 3
+  ok   otp               29
+  ok   elixir            1.20.2
+  ok   beam-lisp         0.1.0
+  ok   search-paths      0 roots
+  ok   code-paths        44 dirs
+  ok   datom_fjall       loaded
+  ok   explorer          loaded
+  ok   code_embed        loaded
+  ok   lazy_memo         65536 bytes fast lane
+  ok   z3                sat
+  ok   wry               loaded
+  --   daemon            not running (:no_socket)
+  --   src/              absent
+  ok   .bl-check.edn     present
+  ok   .local/bl/cache/  present
+  ok   embedding         present (ships with this bl: ~/.local/share/drop/<payload>/lib/beam_lisp-0.1.0/priv/embed/potion-code-16M-v2)
 
-  ✓ 2 required probes ok; 3 optional absent
+  ✓ 2 required probes ok; 2 optional absent
 ```
+
+#### `bl cache status | prune [--max-mb N] [--dry-run]`
+
+The analysis store is content-addressed: one artifact per source *revision*,
+which is what makes a stale one unreachable — and also what makes them pile up.
+`status` says what this tree's stores hold, per directory, and whether the total
+is over the cap; `prune` deletes the OLDEST first, never the newest (the one the
+run that just finished wrote), until it is under.
+
+An ENTRY is one artifact: a store — `<ns>.<sha>.fjall` with its `.blobs` sibling,
+which holds the values too large to inline — or a remembered per-file analysis,
+`<kind>.<sha>.term`, which the source questions leave behind. Counting one kind
+and not the other would let a capped cache grow through the files the cap does
+not see. `--dry-run` reports and deletes
+nothing, `--max-mb` overrides the cap for one run, and `BL_CACHE_MAX_MB`
+(default 512) for every run. `BL_CACHE_DIR` moves the store itself — every tier
+below it is skipped — which is what a CI job or a container wants: the analysis
+goes on a volume, or into a directory the job deletes, and the model stays where
+it is. Relative values resolve against the command's cwd. `bl search` prunes
+after it indexes, so the ceiling holds without anyone remembering it.
+
+```sh
+$ bl cache status
+  10 entries  65 MB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 65 MB · cap 512 MB (under)
+```
+
+A store per source revision means nothing here is precious: every one can be
+rebuilt from the source it came from, and the only thing pruning costs is the
+next run's time. Where they live is a project question — see
+`docs/code-semantic-search.md`.
 
 Exit `0` when the required probes pass, `1` otherwise.
 
@@ -590,6 +807,7 @@ Flags may appear anywhere before `--`.
 | `--update` | check: record the new baseline |
 | `--fix` | check: apply the safe rewrite |
 | `--check` | doc: report drift without writing; install: verify, don't write |
+| `--remove` | install: undo what a target wrote |
 | `--native` | build: also emit native modules |
 | `--install-hook` | check: install the pre-commit hook |
 | `--json` | machine-readable output where a command offers it |
@@ -606,6 +824,9 @@ Flags may appear anywhere before `--`.
 | `BL_DAEMON` | `off` skips the daemon fast path; `auto` starts a missing daemon and retries once |
 | `BL_DAEMON_ROOT` | the tree root the daemon serves (default: the current directory) |
 | `BL_DAEMON_IDLE_SECONDS` | stop an idle daemon after this many seconds; default `28800` (8 hours), `0` disables the timer |
+| `BL_CACHE_DIR` | where the analysis store lives — overrides every tier, relative to the cwd; the model is unaffected, so a CI job can point the store at a scratch volume without moving the weights |
+| `BL_CACHE_MAX_MB` | the store cap in MB, default `512` |
+| `BLANALYSIS_DIR` | one explicit store directory for a single run; `BL_CACHE_DIR` wins over it |
 | `BL_VERSION` | stamps a release build; `bl version` reports it |
 
 ## Where a namespace is found

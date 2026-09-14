@@ -74,8 +74,8 @@ small function of its own. `:required` marks the two that must pass.
 ## The probes
 
 The probes read in dependency order: the runtime, the loader's view of the
-disk, the native tiers, the solver, the GUI backend, the daemon, then the
-checkout's own markers.
+disk, the native tiers, the solver, the GUI backend, the daemon, the embedding
+weights, then the checkout's own markers.
 
 `--code-path` directories matter because Mix prunes the VM code path when the
 project loads; `code/get_path` is the honest count of what a program can
@@ -118,6 +118,10 @@ invocation, so it reports `not running` and changes nothing.
      (fn [] (let [ok? (datom.frame/available?)]
               {:ok ok? :detail (native-line ok?)})))
 
+   (probe "code_embed" false
+     (fn [] (let [ok? (native-tier "(code.embed/nif?)")]
+              {:ok ok? :detail (native-line ok?)})))
+
    (probe "lazy_memo" true
      (fn [] (let [n (BeamLisp.LazyMemo/fast_lane_bytes)]
               {:ok (int? n) :detail (str n " bytes fast lane")})))
@@ -144,7 +148,38 @@ invocation, so it reports `not running` and changes nothing.
 
    (probe ".bl-check.edn" false
      (fn [] (let [ok? (File/regular? (u/resolve ".bl-check.edn"))]
-              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))])
+              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))
+
+   (probe ".local/bl/cache/" false
+     (fn [] (let [forced (System/get_env "BL_CACHE_DIR")
+                  dir (if (nil? forced)
+                        (u/resolve ".local/bl/cache")
+                        (Path/expand forced (BeamLisp/cwd)))
+                  ok? (File/dir? dir)]
+              {:ok ok?
+               :detail (cond
+                         (and (some? forced) ok?) (str "present (" dir " — BL_CACHE_DIR)")
+                         (some? forced) (str dir " (BL_CACHE_DIR; created on first use)")
+                         ok? "present"
+                         :else "absent (created by the first codebase read)")})))
+
+   ; The embedding weights are the one asset a program needs BEFORE it can run
+   ; (`bl search` reads them on first use), and they can arrive three ways: this
+   ; `bl` may carry them, the machine's cache may hold them, or the caller pinned
+   ; a directory. Which one answered is the fact worth reporting — "present"
+   ; alone would hide a drop built `--no-embed` that is silently degraded.
+   (probe "embedding" false
+     (fn []
+       (let [m    (BeamLisp/eval "code.embed/MODEL")
+             tier (BeamLisp.Model/tier m)
+             dir  (BeamLisp.Model/dir m)]
+         (case tier
+           :bundled {:ok true :detail (str "present (bundled: " dir ")")}
+           :env     {:ok true :detail (str "present (BEAM_LISP_MODEL_DIR: " dir ")")}
+           :ambient {:ok true :detail (str "present (fetched into the cache: " dir ")")}
+           {:ok false
+            :detail (str "absent — `bl search` needs it; looked in "
+                         (join ", " (BeamLisp.Model/searched_dirs m)))}))))])
 ```
 
 ## The report

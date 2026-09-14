@@ -50,7 +50,7 @@ breaks what it touches does not get to stay.
 
 ```beam-lisp
 (ns bl.override
-  (:require [bl.util :as u] [bl.ask] [typed] [codebase] [env]))
+  (:require [bl.util :as u] [bl.ask] [typed] [codebase]))
 ```
 
 ## Where the shipped source lives
@@ -180,6 +180,9 @@ override, which `list` reports as `:identical`.
                  (let [p (override-path ns)]
                    (if (File/exists? p)
                      (do (File/rm p)
+                         ;; drop the now-empty ns directory, if that is what
+                         ;; it became (File/rmdir refuses a non-empty dir)
+                         (File/rmdir (u/dirname p))
                          (println (str "reverted " ns " — shipped source is in effect again"))
                          :ok)
                      (do (u/io-err (str "bl override: " ns " is not vendored here"))
@@ -272,13 +275,19 @@ exit code is `1`.
 (defn- checkout-test-root
   "The beam-lisp checkout's test/bl tree, or nil when this bl is a drop
    running away from its checkout — implicit unit tests are a checkout
-   feature."
+   feature. priv/ is resolved through the symlink Mix makes from _build,
+   then tested for the test tree's presence."
   []
-  (BeamLisp.Loader/ensure_loaded "bl.install")
-  (let [root ((BeamLisp.Env/fetch! "bl.install" "beam-root"))]
-    (if (and (some? root) (File/dir? (str root "/test/bl")))
-      (str root "/test/bl")
-      nil)))
+  (let [priv (BeamLisp.Tiers/priv_root)
+        real (let [r (File/read_link priv)]
+               (if (and (tuple? r) (= :ok (erlang/element 1 r)))
+                 (let [target (erlang/element 2 r)]
+                   (if (= "/" (subs target 0 1))
+                     target
+                     (str (Path/dirname priv) "/" target)))
+                 priv))
+        tdir (str (Path/dirname real) "/test/bl")]
+    (if (File/dir? tdir) tdir nil)))
 
 (defn- implicit-tests
   "Shipped test files that require one of the touched namespaces — the
@@ -312,11 +321,15 @@ The gates themselves:
              diags (u/to-list (diagnostics src ns))
              diag-fails (map (fn [d] (str ns ": " (pr-str d))) diags)
              load-fail (try
-                         (env/isolated
+                         ;; the ns must LOAD in a clean-room env, forked and
+                         ;; destroyed around the require: diagnostics analyze
+                         ;; text; this catches load-time failure (a bad value
+                         ;; def, a missing require) without touching this
+                         ;; process's registry — a warm daemon stays clean
+                         (BeamLisp.Env/isolated
+                          :global
                           (fn []
-                            (env/eval (str "(ns override-probe (:require [" ns "]))"))
-                            (println "PROBE sees:"
-                                     (pr-str (env/eval "(clojure.edn/read-string {:default (fn [t v] :patched-seen)} \"#t{:a 1}\")")))))
+                            (BeamLisp/eval (str "(ns override-probe (:require [" ns "]))"))))
                          nil
                          (catch e (str ns ": does not load: " e)))]
          (concat diag-fails (if (some? load-fail) [load-fail] []))))
@@ -346,7 +359,11 @@ The gates themselves:
   (u/each (fn [entry]
             (let [path (first entry) old (second entry)]
               (if (nil? old)
-                (File/rm path)
+                (do (File/rm path)
+                    ;; the vendored layout creates directories; leave none
+                    ;; behind empty (File/rmdir answers an error tuple for a
+                    ;; non-empty dir — exactly the case to keep)
+                    (File/rmdir (u/dirname path)))
                 (File/write! path old))))
           written))
 
@@ -366,7 +383,11 @@ The gates themselves:
           ;; The override goes on the search path FIRST, so verification —
           ;; and every command after — sees the new sources.
           (BeamLisp.Env/add_search_path (overrides-dir))
-          (let [written (map (fn [ns]
+          ;; The map is FORCED with to-list: beam-lisp seqs are uniformly
+          ;; lazy, and `written` is otherwise realized only by rollback! —
+          ;; the writes would happen at rollback time, after verification
+          ;; had already run against a file that did not exist yet.
+          (let [written (u/to-list (map (fn [ns]
                                (let [src (get files ns)
                                      path (override-path ns)
                                      old (if (File/exists? path) (File/read! path) nil)]
@@ -374,7 +395,7 @@ The gates themselves:
                                  (File/write! path src)
                                  (println (str "wrote overrides/" (ns->base ns) ".bl"))
                                  [path old]))
-                             nss)
+                             nss))
                 logical-fails (u/to-list (verify-logical files))]
             (if (not (empty? logical-fails))
               (do

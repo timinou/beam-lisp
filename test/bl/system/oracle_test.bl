@@ -1,0 +1,380 @@
+; test/bl/system/oracle_test.bl — the four things the cutover added, each pinned by
+; an observation rather than an argument.
+;
+;   1. the MEMO     an identical script is answered from memory, and only a real
+;                   answer is cached — `unknown` (the ceiling) and `error` (a
+;                   transport failure) must not stick to a script
+;   2. the COST     every decision lands in the ledger with its microseconds, so a
+;                   deadline can be chosen from a distribution (FUP-057 chose one
+;                   from an argument, because nothing was timed)
+;   3. the EFFECT   the oracle is a handler: a verifier runs against a TABLE with
+;                   no z3 at all, and `deny` refuses in a sandbox
+;   4. the FAN-OUT  N questions run on N solvers — the pool's width, used
+
+(ns system.oracle-test
+  (:require [oracle]
+            [z3]
+            [system.core :as sys]
+            [system.decide :as decide]
+            [z3pool]))
+
+(defn- read1 [s] (first (BeamLisp.Reader/read_string s)))
+
+(def machine
+  "(defserver ^{:invariant (>= balance 0)} account
+     (init [balance] (ok balance))
+     (handle-call [:withdraw amt] [_ balance] :when (and (>= amt 0) (>= balance amt))
+       (reply :ok (- balance amt))))")
+
+(def obl (oracle/obligation :probe ['(declare-const x Int) '(assert (> x 1))]))
+
+(deftest a-repeated-question-costs-no-solver
+  (z3/pool! 4)
+  (oracle/memo-clear!)
+  (let [a (oracle/ask obl)
+        calls-after-first (count (filter (fn [d] (= :oracle (:tier d))) (decide/here)))
+        _ (decide/clear-here!)
+        b (oracle/ask obl)
+        calls-after-second (count (filter (fn [d] (= :oracle (:tier d))) (decide/here)))]
+    (is (= (:status a) (:status b)) "the second answer is the first answer")
+    (is (= :memo (:tier b)) "and it came from memory")
+    (is (< 0 calls-after-first) "the first ask reached the solver")
+    (is (zero? calls-after-second) "the second did not")))
+
+(deftest the-memo-is-switchable
+  (oracle/memo-clear!)
+  (let [asks (atom 0)
+        counted (fn [text model?] (swap! asks inc) (oracle/pool-handler text model?))]
+    (oracle/with-memo false
+      (fn []
+        (oracle/with-oracle counted (fn [] (oracle/ask obl) (oracle/ask obl)))))
+    (is (= 2 @asks) "with the memo off, both asks reach the handler")))
+
+(deftest only-a-real-answer-is-cached
+  (oracle/memo-clear!)
+  ;; The ceiling is read from the environment PER LEASE (FUP-057), so 1 ms is the
+  ;; whole mechanism: the answer is `unknown`, which is NOT a fact about the
+  ;; script and must not be remembered as one.
+  (System/put_env "BL_Z3_TIMEOUT" "1")
+  (let [v (oracle/ask (oracle/obligation :hard
+                        ['(declare-const p Int) '(declare-const q Int)
+                         '(assert (> p 1)) '(assert (> q 1))
+                         '(assert (= (* p q) 43925755729223607997806993733463))]))]
+    (is (= :unknown (:status v)) "the ceiling fires before the factoring does")
+    (is (zero? (oracle/memo-size)) "and nothing was cached for it"))
+  (System/delete_env "BL_Z3_TIMEOUT"))
+
+(deftest every-decision-carries-its-cost
+  (oracle/memo-clear!)
+  (decide/clear-here!)
+  (oracle/ask obl)
+  (let [c (decide/cost)]
+    (is (< 0 (:count c)) "the decision is counted")
+    (is (< 0 (:total_us c)) "and it has a measured cost")
+    (is (<= (:max_us c) (:total_us c)) "the slowest is not slower than the total")))
+
+(deftest a-verifier-runs-with-no-z3-at-all
+  (let [answers (atom 0)
+        table (fn [_text _model?] (swap! answers inc)
+                                  {:status "unsat" :model nil :core nil})
+        r (oracle/with-oracle table (fn [] (sys/verify-process (z3/open) (read1 machine))))]
+    (is (:holds r) "the machine verifies against a TABLE, not the solver")
+    (is (< 0 @answers) "and the table was the handler")))
+
+(deftest the-sandbox-can-refuse-the-oracle
+  (oracle/memo-clear!)   ; nothing cached, or the handler is never reached at all
+  (is (thrown? (oracle/with-oracle oracle/deny (fn [] (oracle/ask obl))))
+      "deny raises instead of quietly reaching for a solver"))
+
+(deftest questions-fan-out-across-the-pool
+  (z3/pool! 4)
+  (oracle/memo-clear!)
+  (let [obls (vec (map (fn [i] (oracle/obligation (keyword (str "q" i))
+                                     ['(declare-const x Int)
+                                      (list 'assert (list '< 'x i))
+                                      (list 'assert (list '>= 'x i))]))
+                       (range 8)))
+        vs (oracle/ask-all obls)]
+    (is (= 8 (count vs)) "every question has an answer")
+    (is (every? (fn [v] (oracle/proven? v)) vs) "and every answer is a proof")
+    (is (<= 2 (z3pool/high-water)) "the pool ran more than one conversation at once")))
+
+(deftest an-undecided-answer-says-why
+  ;; `unknown` is not an answer, and there are two ways to get one that want
+  ;; OPPOSITE responses: a CEILING (raise it, or simplify the question) and an
+  ;; INCOMPLETE THEORY (no ceiling helps — the obligation stays undecided). The
+  ;; record now carries which, read from z3 itself with `(get-info :reason-unknown)`,
+  ;; and a DECIDED answer carries NO reason — the wire answers the empty string there,
+  ;; and that must never read as a name (which is why nil is the absence).
+  (z3/pool! 1)
+  (System/put_env "BL_Z3_TIMEOUT" "200")
+  (let [v (oracle/ask (oracle/obligation :factor
+                        ['(declare-const p Int) '(declare-const q Int)
+                         '(assert (> p 1)) '(assert (> q 1))
+                         '(assert (= (* p q) 43925755729223607997806993733463))]))]
+    (is (oracle/undecided? v) "the ceiling fires before the factoring does")
+    (is (some? (:why v)) "and the record names the reason, not just the silence")
+    (is (not (oracle/proven? v)))
+    (is (not (oracle/refuted? v)) "an undecided question is never a refutation"))
+  (System/delete_env "BL_Z3_TIMEOUT"))
+
+(deftest a-decided-answer-has-no-reason
+  ;; The negative control for the test above: if `:why` came from a default rather
+  ;; than from z3, every verdict would have one and this would fail.
+  (let [v (oracle/ask (oracle/obligation :contra
+                        ['(declare-const z Int) '(assert (> z 1)) '(assert (< z 0))]))]
+    (is (oracle/proven? v))
+    (is (nil? (:why v)) "a proof explains itself — there is nothing to excuse")))
+
+(deftest a-script-given-as-lines-is-the-script-given-as-forms
+  ;; `smt/script` renders a STRING as an SMT-LIB string LITERAL. So a script handed
+  ;; over as raw text used to compile to an inert literal: the pushed scope stayed
+  ;; empty and z3 answered `sat` for a contradiction. Both lanes must agree now.
+  (let [as-forms (oracle/ask (oracle/obligation :forms
+                              ['(declare-const z Int) '(assert (> z 1)) '(assert (< z 0))]))
+        as-text  (oracle/ask (oracle/obligation :text
+                              "(declare-const z Int)\n(assert (> z 1))\n(assert (< z 0))"))
+        as-lines (oracle/ask (oracle/obligation :lines
+                              ["(declare-const z Int)" "(assert (> z 1))" "(assert (< z 0))"]))]
+    (is (oracle/proven? as-forms))
+    (is (= (:status as-forms) (:status as-text)) "one string and one form-list agree")
+    (is (= (:status as-forms) (:status as-lines)) "and a list of lines is the same script")))
+
+(deftest a-refuted-step-shows-its-counterexample
+  ;; A refutation is a SAT answer: the model IS the state that breaks the
+  ;; invariant. One bit (`holds: false`) is not actionable; the values are.
+  (let [breaks "(defserver ^{:invariant (>= balance 0)} bank
+                  (init [balance] (ok balance))
+                  (handle-call [:withdraw amt] [_ balance] :when (>= amt 0)
+                    (reply :ok (- balance amt))))"
+        r (sys/verify-process (z3/open) (read1 breaks))]
+    (is (not (:holds r)) "the step is refused")
+    (is (= 1 (count (:failures r))))
+    (let [w (:counterexample (first (:failures r)))]
+      (is (some? (:model w)) "the refusal carries the state that breaks it")
+      (is (= 0 (get (:model w) "balance")))
+      (is (= 1 (get (:model w) "amt")))
+      (is (= -1 (get (:model w) "balance2")) "and the post-state it computes"))))
+
+(deftest the-unsat-core-lane-reads-as-a-diagnosis
+  ;; The DUAL lane: a core is the blame for a question whose expected answer is
+  ;; unsat (a synthesis, a repair search). The engine names its step parts, so the
+  ;; subset of names that comes back IS the diagnosis.
+  (is (= :guard-too-weak
+         (:blame (oracle/explain {:core ["g_guard" "g_next" "g_inv2"] :status :unsat}))))
+  (is (= :next-step-breaks-it
+         (:blame (oracle/explain {:core ["g_next" "g_inv2"] :status :unsat}))))
+  (is (= :invariant-impossible
+         (:blame (oracle/explain {:core ["g_inv2"] :status :unsat}))))
+  ;; and an empty core does NOT get guessed into one of the three: it reports the
+  ;; status it saw, because a caller that cannot fix what it is told cannot tell
+  ;; it was guessed.
+  (is (= :no-core (:blame (oracle/explain {:core [] :status :sat}))))
+  (is (= :sat (:status (oracle/explain {:core [] :status :sat}))))
+  (is (= :unrecognised-core (:blame (oracle/explain {:core ["other"] :status :unsat}))))
+)
+
+;; ── the candidate loops: the SAME answer through either lane ─────────────────
+;
+; `discover-invariant` and `synthesize-capacity` now hold ONE `oracle/session`
+; per machine and ask each candidate with `oracle/scoped` (a push/assert/check/
+; pop over the declared-once prelude). `BL_ORACLE_SESSIONS=off` keeps the one-shot
+; path for exactly this comparison. These pin the VALUES — recorded from the code
+; before the session, and re-observed after — so a drift in either lane fails
+; here. Two of the fixtures are the ones seam_test drives, so the engine's two
+; consumers agree about the same machines.
+
+(def discovery-fixture
+  "(defserver account
+     (init [] (ok 0))
+     (handle-call [:deposit amt] [_ balance] :when (>= amt 0)
+       (reply :ok (+ balance amt)))
+     (handle-call [:withdraw amt] [_ balance] :when (and (>= amt 0) (>= balance amt))
+       (reply :ok (- balance amt))))")
+
+(def leaky-fixture
+  "(defserver leaky
+     (init [] (ok 0))
+     (handle-call [:dec] [_ n] (reply :ok (- n 1))))")
+
+(def capacity-fixture
+  "(defserver q5
+     (init [] (ok {:items []}))
+     (handle-call [:enq x] [_ {:keys [items]}] :when (< (count items) 5)
+       (reply :ok {:items (conj items x)}))
+     (handle-call [:deq] [_ {:keys [items]}] :when (not (empty? items))
+       (reply :ok {:items (rest items)})))")
+
+(def no-capacity-fixture
+  "(defserver qinf
+     (init [] (ok {:items []}))
+     (handle-call [:enq x] [_ {:keys [items]}]
+       (reply :ok {:items (conj items x)})))")
+
+(defn- discover-of [src] (sys/discover-invariant (z3/open) (read1 src)))
+(defn- capacity-of [src] (sys/synthesize-capacity (z3/open) (read1 src)))
+
+;; run `f` in ONE lane: sessions off via the env switch, or on (unset). The memo
+;; is cleared either way, so a lane never answers from the other's cache.
+(defn- lane [sessions? src f]
+  (oracle/memo-clear!)
+  (if sessions?
+    (System/delete_env "BL_ORACLE_SESSIONS")
+    (System/put_env "BL_ORACLE_SESSIONS" "off"))
+  (let [r (f src)]
+    (System/delete_env "BL_ORACLE_SESSIONS")
+    r))
+
+(deftest discovery-pins-the-values-it-always-had
+  (z3/pool! 2)
+  (let [d (discover-of discovery-fixture)]
+    (is (:checked d) "an un-annotated machine is analysed")
+    (is (= "(and (>= balance 0))" (pr-str (:discovered d))))
+    (is (= "((>= balance 0))" (pr-str (:conjuncts d)))))
+  (let [d (discover-of leaky-fixture)]
+    (is (:checked d))
+    (is (= "(and (<= n 0) (<= n 1))" (pr-str (:discovered d)))
+        "the unbounded-below machine's upper bounds, exactly as before")))
+
+(deftest discovery-is-the-same-in-either-lane
+  (z3/pool! 2)
+  (let [off (lane false discovery-fixture discover-of)
+        on  (lane true  discovery-fixture discover-of)]
+    (is (:checked off))
+    (is (= (:discovered off) (:discovered on)) "the same invariant both ways")
+    (is (= (:conjuncts off) (:conjuncts on)))
+    (is (= (:checked off) (:checked on)))
+    (is (:discovered on)))
+  (let [off (lane false leaky-fixture discover-of)
+        on  (lane true  leaky-fixture discover-of)]
+    (is (= (pr-str (:discovered off)) (pr-str (:discovered on))))))
+
+(deftest capacity-pins-the-values-it-always-had
+  (z3/pool! 2)
+  (let [r (capacity-of capacity-fixture)]
+    (is (:bounded r))
+    (is (= 5 (:synthesized r)) "the tightest bound is 5"))
+  (let [r (capacity-of no-capacity-fixture)]
+    (is (not (:bounded r)))
+    (is (nil? (:synthesized r)) "no finite k -> nil, not a wrong number")))
+
+(deftest capacity-is-the-same-in-either-lane
+  (z3/pool! 2)
+  (let [off (lane false capacity-fixture capacity-of)
+        on  (lane true  capacity-fixture capacity-of)]
+    (is (= (:synthesized off) (:synthesized on)))
+    (is (= (:bounded off) (:bounded on)))
+    (is (= 5 (:synthesized on))))
+  (let [off (lane false no-capacity-fixture capacity-of)
+        on  (lane true  no-capacity-fixture capacity-of)]
+    (is (= (:synthesized off) (:synthesized on)))
+    (is (not (:bounded on)))))
+
+;; ── CHANGE B: a refusal by the repairer NAMES its culprit ───────────────────
+;
+; A broken transition no guard can save is no longer `nil :repair`. The DUAL of
+; the step question is asked — can this transition EVER satisfy the invariant? —
+; and its UNSAT CORE is the blame. (A refutation is `sat`, so its hint is a
+; MODEL; a blame is `unsat`, so its hint is a CORE — the polarity in one line.)
+
+(def drain-fixture
+  "(defserver ^{:invariant (>= balance 0)} drain
+     (init [] (ok 100))
+     (handle-call [:drain] [_ balance]
+       (reply :ok (- 0 1))))")
+
+(def blocked-fixture
+  "(defserver ^{:invariant (>= n 0)} blocked
+     (init [] (ok 0))
+     (handle-call [:dec] [_ n] :when (<= n 0)
+       (reply :ok (- n 1))))")
+
+(deftest an-impossible-next-state-blames-the-next-expression
+  (z3/pool! 2)
+  (let [r (sys/repair-process (z3/open) (read1 drain-fixture))
+        e (first (:repairs r))]
+    (is (:checked r) "the machine IS analysed — it carries an invariant")
+    (is (not (:holds r)))
+    (is (= :drain (:label e)))
+    (is (nil? (:guard e)) "no guard from the vocabulary saves it")
+    (is (= :next-step-breaks-it (:blame (:blame e))))
+    (is (= ["g_next" "g_inv2"] (:core (:blame e)))
+        "the core names the next-state and the invariant, not the (absent) guard")
+    (is (some? (:counterexample e)) "and the break still shows its state")))
+
+(deftest a-guard-that-blocks-every-good-state-blames-the-guard
+  (z3/pool! 2)
+  (let [r (sys/repair-process (z3/open) (read1 blocked-fixture))
+        e (first (:repairs r))]
+    (is (:checked r))
+    (is (nil? (:guard e)))
+    (is (= :guard-too-weak (:blame (:blame e))))
+    (is (= 3 (count (:core (:blame e)))) "all three named parts were needed")))
+
+(deftest an-impossible-invariant-blames-the-invariant
+  (z3/pool! 2)
+  (let [src "(defserver ^{:invariant (and (>= x 5) (<= x 1))} bad
+                (init [x] (ok 0))
+                (handle-call [:noop] [_ x] (reply :ok x)))"
+        r (sys/verify-process (z3/open) (read1 src))
+        f (first (:failures r))]
+    (is (not (:holds r)))
+    (is (= :init (:label f)) "the establishment check is the one that refused")
+    (is (= :invariant-impossible (:blame (:blame f))))
+    (is (= ["g_inv2"] (:core (:blame f)))
+        "the invariant alone is the core: it admits no state")))
+
+(deftest an-establishment-refusal-carries-its-witness
+  ;; the shape is uniform: a refuted init is a `:failures` entry like a refuted
+  ;; step, with the state that failed — not a bare `holds: false`
+  (z3/pool! 2)
+  (let [src "(defserver ^{:invariant (= (* x 2) 1)} wrong
+                (init [x] (ok 0.75))
+                (handle-call [:noop] [_ x] (reply :ok x)))"
+        r (sys/verify-process (z3/open) (read1 src))
+        f (first (:failures r))]
+    (is (not (:holds r)))
+    (is (= :init (:label f)) "the refusal is named")
+    (is (= 0.75 (get (:model (:counterexample f)) "x"))
+        "and the witness IS the init value that violates the invariant")
+    (is (seq (:warnings r)) "the warning says which check refused")))
+
+;; ── the SWITCH itself: pin the mechanism, not just the answer ───────────────
+;
+; The differential above pins VALUES, which both lanes give — so it cannot see a
+; dead switch. (It did not: the first cut of `oracle-sessions?` inverted its
+; `nil` test and BOTH lanes ran one-shot; the values still matched.) This test
+; pins the MECHANISM. Two transitions with the SAME guard and next-state produce
+; the SAME induction script, so the one-shot lane answers the second from the
+; memo while the session lane (`scoped`, never memoised) asks the solver again.
+
+(def twin-fixture
+  "(defserver twin
+     (init [] (ok 0))
+     (handle-call [:a amt] [_ balance] :when (>= amt 0)
+       (reply :ok (+ balance amt)))
+     (handle-call [:b amt] [_ balance] :when (>= amt 0)
+       (reply :ok (+ balance amt))))")
+
+(defn- lane-tiers [sessions?]
+  (oracle/memo-clear!)
+  (if sessions?
+    (System/delete_env "BL_ORACLE_SESSIONS")
+    (System/put_env "BL_ORACLE_SESSIONS" "off"))
+  (decide/clear-here!)
+  (discover-of twin-fixture)
+  (let [ts (decide/here)]
+    (System/delete_env "BL_ORACLE_SESSIONS")
+    (vec (map (fn [e] (:tier e)) ts))))
+
+(deftest the-lane-switch-is-observable
+  (z3/pool! 2)
+  (let [off (lane-tiers false)
+        on  (lane-tiers true)
+        memos (fn [ts] (count (filter (fn [t] (= :memo t)) ts)))]
+    (is (seq off))
+    (is (pos? (memos off))
+        "one-shot: the repeated script is answered from the memo")
+    (is (zero? (memos on))
+        "session: `scoped` is never memoised, so the switch is really OFF/ON")
+    (is (= (count off) (count on)) "and both lanes ask the same number of times")))

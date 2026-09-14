@@ -15,7 +15,7 @@ defmodule BeamLisp.Daemon.Server do
   use GenServer
   require Logger
 
-  alias BeamLisp.Daemon.{HTTP, Listener, Paths, Ports, Protocol, WatchRegistry}
+  alias BeamLisp.Daemon.{HTTP, Listener, Names, Paths, Ports, Protocol, WatchRegistry}
 
   @default_idle_seconds 8 * 60 * 60
 
@@ -71,13 +71,13 @@ defmodule BeamLisp.Daemon.Server do
       _ = write_pid(ep.pid, root)
       _ = write_meta(ep.meta, root, token)
 
-      # The two stateful workers — the single-worker command serializer and the
-      # watcher registry — under one supervisor, because a bare `start_link` is
+      # The stateful workers — the single-worker command serializer, the
+      # watcher registry and the HTTP MCP mount owner — under one supervisor, because a bare `start_link` is
       # linked but never RESTARTED: user code runs inside the worker, so a
       # crash it links (`examples/mcp-demo.bl` starting an in-process MCP
       # server) used to leave the daemon healthy-looking and permanently
       # unable to run anything (`:noproc`). See `BeamLisp.Daemon.Workers`.
-      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started()
+      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started(root: root)
 
       # The session's address. `:ui` is claimed first (the registry is what
       # decides whether a project's pinned port is free), then served — the page
@@ -149,7 +149,7 @@ defmodule BeamLisp.Daemon.Server do
   def terminate(_reason, state) do
     :counters.put(state.stop_flag, 1, 1)
     _ = :gen_tcp.close(state.lsock)
-    Ports.release(:ui)
+    Ports.release(:ui, root: state.root)
     ep = state.endpoints
     for f <- [ep.sock, ep.token, ep.pid, ep.meta, ep.lock], do: File.rm(f)
     :ok
@@ -168,7 +168,7 @@ defmodule BeamLisp.Daemon.Server do
   defp start_ui(root) do
     want = project_port(root, "ui") || 0
 
-    case Ports.claim(:ui, want, root: root) do
+    case Ports.claim(:ui, want, root: root, hosts: Names.hosts(root, "ui")) do
       {:ok, port} ->
         case serve_ui(port, root) do
           {:ok, pid} -> %{port: port, pid: pid, pinned: want != 0, error: nil}
@@ -229,11 +229,15 @@ defmodule BeamLisp.Daemon.Server do
   end
 
   @doc """
-  What the daemon says when it comes up. It names the tree, the session's URL,
-  and — because the port is ephemeral unless the project pins it — HOW to pin
-  it. The MCP line matters for the same reason: the session's port is the one
-  address an editor, an agent or a browser needs, and there is no second server
-  behind it.
+  What the daemon says when it comes up. It names the tree, the session's NAME
+  and the address behind it, and — because the port is ephemeral unless the
+  project pins it — HOW to pin it. The MCP line matters for the same reason:
+  the session's name is the one address an editor, an agent or a browser needs,
+  and there is no second server behind it.
+
+  Both spellings are printed on purpose. The name is what a human opens; the
+  loopback address is the truth underneath it, and it keeps answering when the
+  gateway is not running.
   """
   def startup_message(root, ui) do
     lines = ["bl daemon up for #{root}"]
@@ -248,10 +252,13 @@ defmodule BeamLisp.Daemon.Server do
               "ephemeral — pin it in env.bl with :ports {:ui 7700}"
             end
 
+          host = Names.host(root, "ui")
+
           lines ++
             [
-              "  ui:   http://127.0.0.1:#{port}   (#{pin})",
-              "  mcp:  http://127.0.0.1:#{port}/mcp   (the same MCP `bl mcp` serves over stdio)"
+              "  ui:   http://#{host}   → 127.0.0.1:#{port}   (#{pin})",
+              "  mcp:  http://#{host}/mcp   (the same MCP `bl mcp` serves over stdio)",
+              "        no gateway yet? http://127.0.0.1:#{port} — start one with `bl gateway start`"
             ]
 
         %{error: error} ->

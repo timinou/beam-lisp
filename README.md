@@ -39,8 +39,8 @@ Use it to build applications that are safe, scalable, and whose complexity stays
 
 - **Install.** Download the `bl` drop for your platform from the latest release,
   or build one from a checkout with `mix bl.build`.
-- **Check the machine.** `bl doctor` reports the language, the native tiers, and
-  the solver.
+- **Check the machine.** `bl doctor` reports the language, the native tiers,
+  the solver, and the embedding (which copy of the weights is answering).
 - **Run something.** `bl run examples/hello.bl` — the last value prints.
 - **Open a session.** `bl repl` (or just `bl`).
 

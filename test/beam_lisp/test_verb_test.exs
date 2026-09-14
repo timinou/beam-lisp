@@ -74,10 +74,22 @@ defmodule BeamLisp.TestVerbTest do
     assert out =~ "2 file(s) passed"
   end
 
-  test "the shared escape still runs the suite", %{dir: dir} do
+  test "the shared escape runs the FILES, not every suite this VM has run", %{dir: dir} do
     write(dir, "test/plain_test.bl", "(ns plain-test)\n(deftest fine (is (= 1 1)))\n")
-    {code, _out} = run(dir, ["test", "--shared"])
-    assert code == 0
+
+    # Two runs in ONE image. `--shared` forks the caller's image, so the second
+    # run's registry holds the files it named and nothing else; before that fork
+    # `run-tests :all` meant "everything this image ever ran", and a second run
+    # answered with the first run's tests — or, inside a warm daemon, with tests
+    # from the request before it.
+    {code, out} = run(dir, ["test", "--shared"])
+    assert code == 0, "the shared run must be green; it said:\n#{out}"
+    {code2, out2} = run(dir, ["test", "--shared"])
+    assert code2 == 0, "the second shared run must be green; it said:\n#{out2}"
+
+    ran = fn text -> Regex.run(~r/Ran (\d+) tests?/, text) |> List.last() end
+    assert ran.(out) == ran.(out2),
+           "the same files must run the same tests; first #{ran.(out)}, then #{ran.(out2)}"
   end
 
   test "the aggregate is available as JSON", %{dir: dir} do
@@ -96,6 +108,25 @@ defmodule BeamLisp.TestVerbTest do
     {code, out} = daemon_request(ctx, ["test"], dir)
     assert code == 0
     assert out =~ "warm-test"
+  end
+
+  test "a test library that vanished from core's MODULE is re-loaded", %{dir: dir} do
+    write(dir, "test/rel_test.bl", "(ns rel-test)\n(deftest a (is (= 1 1)))\n")
+
+    # The observed failure state: a later reload puts core back from its BEAM,
+    # which carries core.bl alone — so the assertion runtime the `is` macro
+    # expands into is gone from the module, while `deftest` still resolves in
+    # core's ENV. ward's guard checked the env alone, said "available", skipped
+    # the load, and every file in the run then died on `is-report/4 is undefined`.
+    :code.purge(BeamLisp.Ns.Core)
+    :code.delete(BeamLisp.Ns.Core)
+    {:module, _} = :code.load_file(BeamLisp.Ns.Core)
+
+    refute :erlang.function_exported(BeamLisp.Ns.Core, :"is-report", 4),
+           "precondition: the beam carries core.bl alone"
+
+    {code, out} = run(dir, ["test"])
+    assert code == 0, "a run in this state must still work; it said:\n#{out}"
   end
 
   # ── helpers ──
@@ -164,9 +195,11 @@ defmodule BeamLisp.TestVerbTest do
     result
   end
 
+  defp wait_for(fun, tries \\ 250)
+
   defp wait_for(_fun, 0), do: :timeout
 
-  defp wait_for(fun, tries \\ 250) do
+  defp wait_for(fun, tries) do
     if fun.(), do: :ok, else: (Process.sleep(20); wait_for(fun, tries - 1))
   end
 

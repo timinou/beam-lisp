@@ -118,11 +118,17 @@ The object model already matches a VCS in three places where it matters:
 
 And three constraints a VCS design must respect:
 
-- **One writer per process.** Transactions serialize through a single Agent per
-  store, and the registry cell holds the durable store's lock until `release!`.
-  A second OS process cannot open a live fjall database. jj-as-a-separate-
-  process therefore *cannot* be datom's writer, and a datom store cannot be
-  shared between the `bl` daemon and a spawned `jj`.
+- **One writer per process, and no one to enforce it.** Transactions serialize
+  through a single Agent per store, and `datom/db` captures the connection's own
+  basis. Measured (2026-09-12, `research/autovcs`): `datom.store-fjall/open`
+  takes NO lock — a second process opens the same path happily, its writes are
+  durable, and a fresh reader sees them; what a long-lived connection does not
+  see is another writer's facts, until its own next write advances its basis.
+  That is worse than an error, because nothing fails: two writers on one store
+  is two views that converge only when one of them writes. So a store has one
+  OWNER by construction, not by lock — which is why jj-as-a-separate-process
+  must not be datom's writer, and why the mirror's intent is spilled to a file
+  before it is transacted.
 - **Write amplification.** A datom lands in every covering index — EAVT, AEVT,
   and for indexed attributes AVET and VAET. That is 2–4 index entries per fact.
   Facts want to be small; a VCS object store wants one blob per object. This is

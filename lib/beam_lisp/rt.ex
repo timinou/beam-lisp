@@ -34,13 +34,13 @@ defmodule BeamLisp.RT do
       _ ->
         case variadic do
           nil ->
-            raise "wrong number of args (#{arity})"
+            raise ArgumentError, message: call_shape_error({@multi_fn_tag, fixed, variadic}, arity)
 
           {min, f} when arity >= min ->
             apply(f, Enum.take(args, min) ++ [Enum.drop(args, min)])
 
           {min, _f} ->
-            raise "wrong number of args (#{arity}, expected at least #{min})"
+            raise ArgumentError, message: call_shape_error({@multi_fn_tag, fixed, variadic}, arity)
         end
     end
   end
@@ -63,13 +63,28 @@ defmodule BeamLisp.RT do
   def invoke(f, args) when is_function(f), do: apply(f, args)
 
   @doc "Keywords are functions of maps, as in jank and Clojure: `(:a m)` ≡ `(get m :a)`."
-  def invoke(kw, [m]) when is_atom(kw), do: get(m, kw)
+  # `nil`, `true` and `false` are atoms, so without the extra guards they read
+  # as keywords here and `(nil m)` becomes a lookup of the key `nil` instead of
+  # the error every reader expects. A literal keyword is never one of the three.
+  def invoke(kw, [m]) when is_atom(kw) and not is_boolean(kw) and not is_nil(kw), do: get(m, kw)
 
-  def invoke(kw, [m, default]) when is_atom(kw), do: get(m, kw, default)
+  def invoke(kw, [m, default]) when is_atom(kw) and not is_boolean(kw) and not is_nil(kw),
+    do: get(m, kw, default)
 
   # Vectors are functions of their indices: `([a b] 1)` ≡ `(nth [a b] 1)`,
   # which is how jank's doseq indexes its binding vector.
   def invoke(%BeamLisp.Vector{} = v, [i]) when is_integer(i), do: BeamLisp.Vector.nth(v, i)
+
+  # A vector indexes by INTEGER, and an arity message here would be true and
+  # useless: the call has the right NUMBER of arguments. The matrix in
+  # test/bl/callable_test.bl is what surfaced this — `([10 20] :a1)` reported
+  # "a vector called with 1 argument", blaming the count for the kind.
+  def invoke(%BeamLisp.Vector{}, [i]) do
+    raise ArgumentError,
+      message:
+        "a vector indexes by integer, not by #{inspect(i, limit: 3, printable_limit: 40)} — " <>
+          "a vector is a function of its index: ([10 20] 1)"
+  end
 
   # Sets are functions of their members: `(#{1 2} 1)` ≡ `1`, `(#{1 2} 9)` ≡ nil,
   # exactly as in Clojure. clojure.set/join relies on this (it uses an index map
@@ -95,6 +110,16 @@ defmodule BeamLisp.RT do
   def invoke(m, [k]) when is_map(m) and not is_struct(m), do: get(m, k)
   def invoke(m, [k, default]) when is_map(m) and not is_struct(m), do: get(m, k, default)
 
+  # Nothing else is callable, and THIS clause is what makes that a sentence
+  # instead of a host stack frame. Without it the failure is
+  # `no function clause matching in BeamLisp.RT.invoke/2`: it names the
+  # runtime function rather than the value being called, says nothing about
+  # the arity, and leaves the reader nowhere to look. Every way a call can be
+  # wrong that the compiler cannot see — a local that shadowed a fn with a
+  # number, a `nil` that was never bound, the wrong arity for a map — arrives
+  # here, so this sentence IS the experience of the mistake.
+  def invoke(v, args), do: raise(ArgumentError, message: call_shape_error(v, length(args)))
+
   @doc """
   True when `invoke/2` can call `value` with `arity` arguments: a fn of that
   arity, an atom as a one-argument lookup fn (`(:k m)`), a multi-fn with a
@@ -119,6 +144,96 @@ defmodule BeamLisp.RT do
 
   def invocable?({:"$remote", _, _}, _arity), do: true
   def invocable?(_, _), do: false
+
+  @doc """
+  Why a value cannot be called with `arity` arguments, as one sentence.
+
+  The sentence lives here rather than at the raise site because more than one
+  layer reports the same mistake: `invoke/2` raises it at runtime, and the
+  compiler raises it for a call whose head it can read. One wording for one
+  mistake — a reader who meets the error in a REPL and again in a build log
+  should not have to recognise it twice.
+
+  The value prints BOUNDED: a mistake must not dump a megabyte of data into a
+  log, and which value was wrong is nearly always visible in its first few
+  elements.
+  """
+  def call_shape_error(v, arity) do
+    case call_shape(v) do
+      nil ->
+        "cannot call #{inspect(v, limit: 3, printable_limit: 40)} — " <>
+          "#{describe(v)} is not a function"
+
+      {kind, help} ->
+        "a #{kind} called with #{arity} argument#{plural(arity)} — #{help}"
+    end
+  end
+
+  defp plural(1), do: ""
+  defp plural(_), do: "s"
+
+  # A plain fn's wrong arity is raised by the BEAM itself, which already names
+  # both arities and the arguments passed; `invoke/2`'s fn clause therefore
+  # keeps its fast path rather than paying an arity check on EVERY call to
+  # improve a message that is already right. A multi-arity fn needs the help:
+  # the BEAM sees one arity-dispatched value, so only this table knows which
+  # arities it answers.
+  defp call_shape(f) when is_function(f), do: {"fn", "a fn takes exactly the arguments its parameter list declares"}
+
+  defp call_shape({:"$blfn", fixed, variadic}) do
+    fixed_arities =
+      case fixed |> Map.keys() |> Enum.sort() do
+        [] -> nil
+        arities -> Enum.join(arities, "/")
+      end
+
+    help =
+      case {fixed_arities, variadic} do
+        {nil, {min, _f}} -> "a variadic fn taking #{min} or more arguments"
+        {a, {min, _f}} -> "a fn of #{a} arguments, or #{min} or more"
+        {a, nil} -> "a fn of #{a} arguments"
+      end
+
+    {"fn", help}
+  end
+
+  defp call_shape({:"$remote", m, f}), do: {"fn", "a host fn #{m}.#{f}"}
+
+  defp call_shape(%BeamLisp.Vector{}),
+    do: {"vector", "a vector is a function of its index: ([10 20] 1)"}
+
+  defp call_shape(%BeamLisp.Set{}),
+    do: {"set", "a set is a function of its members: (#\{1 2\} 1)"}
+
+  defp call_shape(%SortedSet{}),
+    do: {"sorted set", "a sorted set is a function of its members"}
+
+  defp call_shape(%SortedMap{}),
+    do: {"sorted map", "a sorted map is a function of its keys: (sm :k)"}
+
+  defp call_shape(m) when is_map(m) and not is_struct(m),
+    do:
+      {"map",
+       "a map is a function of its keys: ({:a 1} :a), or with a default: ({:a 1} :zz :none)"}
+
+  defp call_shape(kw) when is_atom(kw) and not is_boolean(kw) and not is_nil(kw),
+    do: {"keyword", "a keyword looks itself up in a map: (:a {:a 1})"}
+
+  defp call_shape(_), do: nil
+
+  defp describe(v) when is_integer(v), do: "a number"
+  defp describe(v) when is_float(v), do: "a number"
+  defp describe(v) when is_binary(v), do: "a string"
+  defp describe(nil), do: "nil"
+  defp describe(v) when is_boolean(v), do: "a boolean"
+  defp describe(v) when is_list(v), do: "a list"
+  defp describe(%LazySeq{}), do: "a lazy seq"
+
+  defp describe(%{__struct__: mod} = r) when is_atom(mod) do
+    if is_ref_type(r), do: "a reference", else: "an opaque host value"
+  end
+
+  defp describe(_), do: "a value"
 
   @doc """
   `~@` splicing. Clojure splices any seqable onto the rest of the form,
@@ -1819,34 +1934,72 @@ defmodule BeamLisp.RT do
   @doc "`(concat & seqs)` — a lazy seq of every input, in order."
   def concat(seqs) when is_list(seqs) do
     seqs = Enum.map(seqs, &LazySeq.input/1)
-    LazySeq.new(fn -> concat_chunk(seqs) end)
+
+    # The not-yet-reached seqs live in a native cursor, not a heap list.
+    # `LazySeq.new` scans a thunk's closure env for dependency edges and
+    # flat-sizes it, so a chunk tail capturing the shrinking seq LIST made
+    # both O(remaining) per chunk — quadratic for the
+    # `(mapcat (fn [x] [x]) …)` shape `datom.tx/expand-tx-fns` uses. A cursor
+    # keeps at most one 32-seq chunk on the heap; the rest is native storage
+    # the scan crosses in one step.
+    cursor = BeamLisp.SeqCursor.new(seqs)
+    LazySeq.new(fn -> concat_chunk(nil, cursor) end)
   end
 
-  # A chunk is drawn from ONE source seq (up to @chunk_size elements). It
-  # does not cross into a later seq mid-chunk, so taking the head of a
-  # concat of a realized head + a huge lazy tail never realizes the tail —
-  # Clojure's concat advances seqs lazily too. Returns `:empty`, a proper
-  # list (all consumed), or `{elems, rest_seqs}` for a lazy tail.
-  defp concat_chunk(seqs) do
-    seqs = Enum.map(seqs, &LazySeq.input/1)
-    case concat_pull(seqs, LazySeq.chunk_size(), []) do
-      :empty -> nil
-      {[], rest} -> concat_chunk(rest)
-      {elems, []} -> elems
-      {elems, rest} -> LazySeq.chain(elems, fn -> concat_chunk(rest) end)
+  # `cur` is the seq being drained (`nil` when the next one comes from
+  # `cursor`). A chunk is up to @chunk_size elements from ONE source seq: it
+  # does not cross into a later seq mid-chunk, so taking the head of a concat
+  # of a realized head + a huge lazy tail never realizes the tail — Clojure's
+  # concat advances seqs lazily too, and wave 26 pins exactly that shape.
+  # An exhausted cursor ends the seq as a proper list (`elems`), so a small
+  # concat terminates without an empty LazySeq tail.
+  defp concat_chunk(cur, cursor) do
+    case concat_pull(cur, cursor, LazySeq.chunk_size(), []) do
+      :empty ->
+        nil
+
+      {elems, nil, cursor} ->
+        if BeamLisp.SeqCursor.cell(cursor) == nil,
+          do: elems,
+          else: LazySeq.chain(elems, fn -> concat_chunk(nil, cursor) end)
+
+      {elems, cur, cursor} ->
+        LazySeq.chain(elems, fn -> concat_chunk(cur, cursor) end)
     end
   end
 
-  defp concat_pull([], _n, []), do: :empty
-  defp concat_pull([], _n, acc), do: {Enum.reverse(acc), []}
-  defp concat_pull(seqs, 0, acc), do: {Enum.reverse(acc), seqs}
+  # Drain up to `n` elements. An exhausted `cur` ENDS the chunk rather than
+  # reaching into `cursor` for the next seq; `cur == nil` is the other side of
+  # that boundary — it takes one seq from the cursor and starts draining it.
+  # Empty inputs (`nil`, `[]`, an exhausted seq) are skipped in `next_seq`, so
+  # a chunk never ends merely because the next input is empty.
+  defp concat_pull(cur, cursor, 0, acc), do: {Enum.reverse(acc), cur, cursor}
 
-  defp concat_pull([s | rest], n, acc) do
-    case LazySeq.cell(s) do
-      # An exhausted leading seq is dropped here; the next chunk continues
-      # from the remaining seqs rather than pulling them in this one.
-      nil -> {Enum.reverse(acc), rest}
-      [h | t] -> concat_pull([t | rest], n - 1, [h | acc])
+  defp concat_pull(nil, cursor, n, acc) do
+    case next_seq(cursor) do
+      :none -> if acc == [], do: :empty, else: {Enum.reverse(acc), nil, cursor}
+      {[h | t], cursor} -> concat_pull(t, cursor, n - 1, [h | acc])
+    end
+  end
+
+  defp concat_pull(cur, cursor, n, acc) do
+    case LazySeq.cell(cur) do
+      # Exhausted: the chunk ends at the seq boundary.
+      nil -> {Enum.reverse(acc), nil, cursor}
+      [h | t] -> concat_pull(t, cursor, n - 1, [h | acc])
+    end
+  end
+
+  defp next_seq(cursor) do
+    case BeamLisp.SeqCursor.cell(cursor) do
+      nil ->
+        :none
+
+      [seq | cursor] ->
+        case LazySeq.cell(seq) do
+          nil -> next_seq(cursor)
+          cell -> {cell, cursor}
+        end
     end
   end
 
@@ -2121,10 +2274,18 @@ defmodule BeamLisp.RT do
 
       "#" <> ns <> "/" <> name <> "{" <> body <> "}"
     else
-      # A foreign struct (an exception, a Date, …) is not a BL map and may
-      # not be Enumerable at all — printing it as one crashes the printer.
-      # inspect falls back to the struct's own Inspect (or the raw form).
-      if Enumerable.impl_for(r), do: print_str_map(r), else: inspect(r)
+      # A host struct is OPAQUE: beam-lisp has no syntax for a value it did
+      # not define. Handing it to `print_str_map` asked the printer to
+      # ENUMERATE it, and a struct is a map that either is not Enumerable at
+      # all (an exception) or is one but yields ELEMENTS rather than pairs (a
+      # MapSet, a Date.Range) — while `print_str_map` destructures pairs. So
+      # the printer died on the very value it was asked to describe, which
+      # converts a reportable failure into an unreportable one at exactly the
+      # moment a reader is staring at output trying to find out what went
+      # wrong. `inspect` is honest about an opaque value, is BOUNDED (a huge
+      # payload cannot flood a log), and is the choice the reference clause
+      # above already makes, for the same reason.
+      inspect(r)
     end
   end
 

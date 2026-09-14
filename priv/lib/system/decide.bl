@@ -1,0 +1,256 @@
+; system/decide.bl — the decision ladder: decide in BEAM what BEAM can decide, and
+; say which rung answered.
+;
+; The repo's own pattern, one level over. `03-obligation-gated-lowering` says a
+; lowering may run only if it can state and discharge its equivalence obligation;
+; `30-make-it-a-value-lower-by-proof` makes the choice a value. Here the OBLIGATION
+; is an SMT question and the ladder is:
+;
+;   rung 1  :native-witness — bounded model search over integer guards. SOUND in
+;            exactly ONE direction: an assignment that satisfies every assertion
+;            proves "sat". It never claims unsat, and it runs only when EVERY
+;            assertion parsed into its fragment — an unparsed assertion means no
+;            claim, not a guess.
+;   rung 2  :oracle             — the oracle of last resort, for everything else.
+;
+; It classifies the COMMANDS (the forms `z3/check` was handed), not the rendered
+; SMT text: the caller already has the forms, so there is nothing to parse and
+; nothing to get wrong. A raw SMT string (the escape hatch) is classified
+; `:general` and goes straight to z3 — conservatively, because it was not read.
+;
+; Every decision is recorded (fragment + tier) in `BeamLisp.Z3.Ledger`, so "is
+; another native rung worth building?" is a number rather than a taste.
+
+(ns system.decide)
+
+(def ^:private cmp-ops (to-list ["<" "<=" ">" ">=" "=" "distinct"]))
+(def ^:private arith-ops (to-list ["<" "<=" ">" ">=" "+" "-" "="]))
+(def ^:private non-linear-ops
+  (to-list ["*" "div" "mod" "rem" "abs" "forall" "exists" "ite" "to_int" "to_real" "sqrt"]))
+
+(defn- leaves
+  "Every leaf of a form tree, as strings — heads included, walked ONCE into an
+   accumulator. Measured before this shape: `(concat acc (leaves x))` inside a
+   reduce is quadratic in the tree and was walked three times per question —
+   6.2 ms per classify, more than z3 took to answer (3 ms)."
+  [f]
+  (let [walk (fn walk [acc x]
+               (if (sequential? x)
+                 (reduce walk acc (vec x))
+                 (let [s (str x)] (if (= s "") acc (conj acc s)))))]
+    (walk [] f)))
+
+(defn- any-leaf? [cmds pred]
+  (some (fn [l] (boolean (pred l))) (leaves cmds)))
+
+(defn- in? [xs v] (some (fn [x] (= x v)) xs))
+
+(defn classify
+  "Which fragment is this question in?
+     :tag-lattice — only names from the value model (tag_x …), no arithmetic
+     :arith       — comparisons and linear integer arithmetic
+     :general     — anything else, including anything not read (a raw SMT string)"
+  [cmds]
+  (if (string? cmds)
+    :general
+    ;; the leaves are walked ONCE; three predicates read the same vector
+    (let [ls (leaves cmds)
+          any? (fn [pred] (some (fn [l] (boolean (pred l))) ls))]
+      (cond
+        ;; Order matters and is not arbitrary: non-linearity wins outright (it is the
+        ;; one thing the witness rung must never touch), then the value model — a tag
+        ;; question is asked with `=`, so testing arithmetic first reported every
+        ;; tag-lattice question as :arith — and only then linear arithmetic.
+        (any? (fn [l] (in? non-linear-ops l))) :general
+        (any? (fn [l] (< 1 (count (split l "tag_"))))) :tag-lattice
+        (any? (fn [l] (in? arith-ops l))) :arith
+        :else :arith))))
+
+(defn- seq? [f] (and (sequential? f) (not (empty? f))))
+(defn- head-str [f] (if (seq? f) (str (first f)) ""))
+(defn- args-of [f] (if (seq? f) (vec (rest f)) (to-list [])))
+
+(def ^:private int-sorts (to-list ["Int" "Real"]))
+
+(defn- declared
+  "Names `declare-const` binds with a sort this rung can reason about.
+
+   A declaration whose sort we cannot evaluate is NOT collected, and that is the
+   sound direction: an uncollected name makes every guard mentioning it
+   unwitnessable (see `witness`), so the question falls to z3 instead of being
+   answered about a variable we never modelled."
+  [cmds]
+  (vec (filter (fn [x] (some? x))
+               (map (fn [c] (when (= "declare-const" (head-str c))
+                              (let [a (args-of c)]
+                                (when (in? int-sorts (str (second a)))
+                                  (str (first a))))))
+                    cmds))))
+
+(defn- guard-of
+  "`(> x 2)` → {:op \">\" :var \"x\" :val 2}; nil when it is not such a comparison.
+   ONE nil makes the whole question unwitnessable here, which is the soundness
+   condition for a rung that must never guess.
+
+   The left side must be a BARE NAME — measured, not assumed. Accepting any term
+   built guards whose `:var` was the printed form of a compound: `(> (- x) 5)`
+   became a guard keyed by the printed form of (- x), and a key that cannot occur
+   in the assignment
+   evaluated as nil, where Erlang sorts atoms above all numbers, so `(> nil 5)`
+   is TRUE. The rung called `x > 5 and -x > 5` SATISFIABLE; z3 proved it unsat.
+   Twelve wrong verdicts in 256 enumerated guard pairs, every one this shape."
+  [term]
+  (let [h (head-str term) a (args-of term) lhs (first a) n (second a)]
+    (when (and (some (fn [o] (= o h)) cmp-ops)
+               (= 2 (count a))
+               (not (sequential? lhs))
+               (some? lhs)
+               (number? n))
+      (let [v (str lhs)]
+        (when (not= v "") {:op h :var v :val n})))))
+
+(defn- guards [cmds]
+  ;; An assert this file cannot read makes the whole question unwitnessable. The
+  ;; earlier shape filtered those out and answered about the rest, which is the
+  ;; same silent drop the guard parser had: a question is all of its assertions or
+  ;; none of them.
+  (let [asserts (filter (fn [c] (= "assert" (head-str c))) cmds)
+        terms (map (fn [c] (first (args-of c))) asserts)]
+    (if (or (empty? terms) (some (fn [t] (nil? t)) terms))
+      nil
+      (vec (map guard-of terms)))))
+
+(defn- holds? [assign g]
+  (let [x (get assign (:var g)) y (:val g) op (:op g)]
+    ;; `(some? x)` is the rest of the same measurement: a comparison we cannot
+    ;; evaluate is not a satisfied guard. Without it the comparison runs against
+    ;; nil, and `>`, `>=` and `distinct` answer TRUE for a variable that was never
+    ;; assigned — the dangerous direction, silently.
+    (and (some? x)
+    (cond
+      (= op ">=") (>= x y)
+      (= op ">") (> x y)
+      (= op "<=") (<= x y)
+      (= op "<") (< x y)
+      (= op "=") (= x y)
+      (= op "distinct") (not= x y)
+      :else false))))
+
+(def ^:private box
+  "Small integers around zero. Bounded on purpose: this rung proves existence, so a
+   small box is sound and merely incomplete — z3 answers what it leaves."
+  (to-list [-2 -1 0 1 2 3 4 5 6 7 8 9 10]))
+
+(defn witness
+  "Search for an assignment satisfying EVERY parsed assertion. → {:witness {var val}}
+   or nil. Never claims unsat, and never claims sat about a variable it did not
+   model: every guard's name must be one this file declared (see `declared`)."
+  [cmds]
+  (let [gs (guards cmds)]
+    (if (or (nil? gs) (some (fn [g] (nil? g)) gs))
+      nil
+      (let [vars (declared cmds)]
+        ;; a guard naming something we did not declare is not ours to answer: the
+        ;; assignment would be silent about it, and silence read as a satisfied
+        ;; guard is exactly how the rung got `x > 5 and -x > 5` wrong.
+        (if (some (fn [g] (not (in? vars (:var g)))) gs)
+          nil
+          (let [combos (reduce (fn [acc v] (mapcat (fn [a] (map (fn [x] (assoc a v x)) box)) acc))
+                               (to-list [{}])
+                               vars)
+                hit (first (filter (fn [a] (every? (fn [g] (holds? a g)) gs)) combos))]
+            (if (nil? hit) nil {:witness hit :vars (count vars) :guards (count gs)})))))))
+
+;; ── the ladder ───────────────────────────────────────────────────────────
+
+(defn- kw-status
+  "The oracle's wire status as the language's keyword. ONE vocabulary: `decide`
+   answers `:sat`/`:unsat`/`:unknown` because every consumer wants to ask the
+   QUESTION (`oracle/proven?`), not to compare an encoding — the string form at
+   forty-four sites is how `unknown` came to read as `violated` (FUP-058)."
+  [s]
+  (cond (= s "unsat") :unsat (= s "sat") :sat (= s "unknown") :unknown :else :error))
+
+(defn- record!
+  "Record the decision AND its outcome. The STATUS is half the record: the tier
+   says who answered, the status says whether there was an answer at all — and
+   `unknown` collapsed into a boolean is how a machine whose invariant holds came
+   to be reported as violated (FUP-058)."
+  [fragment tier status]
+  (BeamLisp.Z3.Ledger/record fragment tier status nil)
+  tier)
+
+(defn- decide-with
+  "The ladder. `native?` decides whether the cheap rung may answer."
+  [cmds solver native?]
+  (let [frag (classify cmds)
+        w (if (or (not native?) (= frag :general)) nil (witness cmds))]
+    (if (nil? w)
+      (let [st (solver)]
+        {:status (kw-status st) :tier (record! frag :oracle st)})
+      {:status :sat :tier (record! frag :native-witness "sat") :witness (:witness w)})))
+
+(defn decide
+  "Answer COMMANDS with the oracle, recording which fragment they were in.
+   → {:status :sat|:unsat|:unknown :tier :oracle}
+   The judgement is z3's, exactly as before — this adds the LEDGER, not a shortcut.
+   `solver` is the thunk the rung calls, so this file stays about DECISION and not
+   about transport.
+
+   NOT the native rung: the cheap rung is opt-in via `decide-native`. Its known
+   counterexample is fixed (FUP-053 — the rung called a conjunction with -x > 5
+   satisfiable because the guard parser accepted a compound left side, whose printed
+   form could never be a key in the assignment) and the fix is checked by a
+   differential sweep against z3. Turning it on by default is still a change of
+   VERDICTS, and that wants a measured benefit first, not an argument for soundness."
+  [cmds solver]
+  (decide-with cmds solver false))
+
+(defn decide-native
+    "The same ladder WITH the cheap rung allowed to answer. Opt-in. Soundness here is
+   an argument plus a measurement, not a proof: `witness` now requires every guard to
+   be a bare name over a declared Int/Real variable, so a returned assignment really
+   does satisfy every assertion as written, and that is checked by differential sweep
+   against z3 over 8256 enumerated constraint sets with zero disagreements. Kept
+   because the rung is the thing measured, not because it is ready to decide by
+   default."
+  [cmds solver]
+  (decide-with cmds solver true))
+
+(defn tier-for
+  "The weakest tier that took part, read out of the ledger's trail of {fragment, tier}
+   maps, one per decision. Two rules, both from measurement:
+
+   1. Each entry is read by KEY. Reading the trail as a flat list of keywords matched
+      nothing, so a trail that plainly said :oracle reported :native-witness — a claim of a
+      native proof for an answer the oracle gave.
+   2. An EMPTY trail is not evidence of a native answer. It reports :oracle. Only the
+      oracle can prove, so the unsafe mistake is claiming native — default away from it."
+  [trail]
+  (if (or (empty? trail) (some (fn [p] (= :oracle (:tier p))) trail)) :oracle :native-witness))
+
+(defn here
+  "The tiers this process's decisions used since `clear-here!` — how a caller
+   reports what proved its answer."
+  []
+  (vec (BeamLisp.Z3.Ledger/here)))
+
+(defn undecided
+  "The decisions this process's trail holds that the ORACLE could not decide — z3
+   answered `unknown`: a fragment it cannot decide, or the ceiling the pool arms.
+   NOT a verdict about the question, and a caller must not read it as one."
+  []
+  (vec (BeamLisp.Z3.Ledger/undecided)))
+
+(defn undecided? [] (not (empty? (BeamLisp.Z3.Ledger/undecided))))
+
+(defn clear-here! [] (BeamLisp.Z3.Ledger/clear_here))
+(defn histogram [] (BeamLisp.Z3.Ledger/histogram))
+
+(defn cost
+  "What this process's decisions COST: {:count :total_us :max_us}. The instrument
+   behind choosing a ceiling from the measured distribution — before this existed,
+   no obligation in the tree had ever been timed."
+  []
+  (BeamLisp.Z3.Ledger/cost))
+(defn reset-ledger! [] (BeamLisp.Z3.Ledger/reset))

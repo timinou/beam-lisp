@@ -23,7 +23,7 @@ full path return the same project value.
 as data. A broken `env.bl` degrades what the tree can do — its tasks, its ports
 — and never stops the command that read it, let alone the daemon hosting it.
 
-```beam-lisp
+```beam-lisp silent
 (ns bl.env
   (:require [bl.util :as u]))
 ```
@@ -34,7 +34,7 @@ The walk starts at the command's own directory and climbs until it finds an
 `env.bl` or runs out of directories. One project file per tree, found the same
 way from anywhere inside it.
 
-```beam-lisp
+```beam-lisp silent
 (def file-name "env.bl")
 
 (defn- parent [d] (Path/dirname d))
@@ -67,7 +67,7 @@ Both answer with a tagged result, `{:ok v}` or `{:error msg}`, so a caller
 never has to guess whether a map it received is the project or a report about
 one.
 
-```beam-lisp
+```beam-lisp silent
 (defn literal
   "`env.bl` as DATA: its last top-level form, parsed and not evaluated. Returns
    `{:ok map}` when that form is the project map (write the file this way),
@@ -106,11 +106,15 @@ one.
 
 ## The shape
 
-A project map declares nine keys. Anything else is reported as an unknown key
+A project map declares eleven keys. Anything else is reported as an unknown key
 rather than ignored, because a typo'd key that silently does nothing is the
 worst kind of configuration bug.
 
 - `:name` — the project's name, a string.
+- `:instance` — which checkout of this project is running, when more than one
+  might be: the qualifier its hosts carry. `:instance` when declared, else the
+  tree's git branch when that is not a default branch, else nothing. See
+  [names](names.bl.md).
 - `:paths` — library roots, relative to the file's directory.
 - `:tasks` — name → a file to run, or `{:run FILE :doc STRING :paths […]
   :watch BOOL}`.
@@ -132,8 +136,8 @@ Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
-```beam-lisp
-(def known-keys [:name :paths :tasks :ports :env :doc
+```beam-lisp silent
+(def known-keys [:name :instance :paths :tasks :ports :env :doc
                  :app :build :release :deps])
 
 (defn- unknown-keys
@@ -392,7 +396,7 @@ problems reports all three in one pass.
 a list, `:paths` is a list, `:tasks` and `:ports` are maps — always the right
 shape, whatever the file said.
 
-```beam-lisp
+```beam-lisp silent
 (defn normalize
   "The project value as the runtime reads it: `:paths` absolute against `root`,
    tasks and ports keyed by name, `:errors` — every shape problem found, as
@@ -401,6 +405,8 @@ shape, whatever the file said.
   (let [[paths perr]   (norm-strings (:paths m) ":paths" root)
         nm             (:name m)
         nerr           (if (or (nil? nm) (string? nm)) [] [":name must be a string"])
+        inst           (:instance m)
+        ierr           (if (or (nil? inst) (string? inst)) [] [":instance must be a string"])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
         [env eerr]     (norm-env (:env m) ":env")
@@ -411,6 +417,7 @@ shape, whatever the file said.
     {:path path
      :root root
      :name (if (string? nm) nm nil)
+     :instance (if (string? inst) inst nil)
      :paths paths
      :tasks tasks
      :ports ports
@@ -419,15 +426,15 @@ shape, whatever the file said.
      :build bld
      :release rel
      :deps deps
-     :errors (concat perr nerr terr porerr eerr aerr berr rerr derr
+     :errors (concat perr nerr ierr terr porerr eerr aerr berr rerr derr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :paths [] :tasks {} :ports {} :env {}
-   :app nil :build nil :release nil :deps [] :errors []})
+  {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
+   :env {} :app nil :build nil :release nil :deps [] :errors []})
 ```
 
 ## The project value for a directory
@@ -436,7 +443,7 @@ shape, whatever the file said.
 test. It finds the file, reads it, and returns a project value whether or not
 the tree has one at all.
 
-```beam-lisp
+```beam-lisp silent
 (defn project
   "The project value for the tree containing `cwd`. Always a map: `:path` is the
    env.bl (or nil), `:root` the directory relative paths resolve against, and

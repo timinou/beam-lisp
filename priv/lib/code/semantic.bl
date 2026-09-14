@@ -1,0 +1,878 @@
+; code/semantic.bl — ask the codebase a question in natural language.
+;
+; ── The idea ──────────────────────────────────────────────────────────
+;
+; `codebase.bl` turns source into FACTS (`:fn/name`, `:call/callee`, …) and
+; answers structural questions over them: who calls X, what breaks if X
+; changes, which fns return a string. Structural questions are exact, and they
+; are the wrong shape for the question a person actually starts with:
+;
+;   "where do we check that a transaction's schema is valid?"
+;
+; No fn is named `check-transaction-schema-valid`. The answer is a QUERY whose
+; words do not appear in the code. That is what an embedding is for.
+;
+; So this namespace adds exactly one thing to the codebase: an embedding per
+; function — one more fact, `[?e :fn/embedding ?v]`, in the same conn, the
+; same transaction, the same time axis. It is not a second index beside the
+; database; it is a column. Which is why the query below is a datalog query
+; and not a call to a search API:
+;
+;   [(similar-to :fn/embedding ?q 10) [?e ?score]]
+;
+; ── The two properties worth the whole exercise ───────────────────────
+;
+; 1. SEMANTIC AND STRUCTURAL COMPOSE. `similar-to` is a clause like any
+;    other, so "the 10 functions nearest to this query" and "the functions
+;    that reach `tx/validate!`" are not two systems to join in application
+;    code — they are two lines of one query. See `search-in-ns`.
+;
+; 2. ORDER MATTERS, AND IT MEANS SOMETHING. When a clause upstream has
+;    already bound the entity, `similar-to` searches only those candidates —
+;    so "nearest AMONG the candidates" is genuinely nearest-of-that-set, not
+;    "globally nearest, then filtered to nothing". Putting `[?e :fn/ns "x"]`
+;    BEFORE the analytic clause is therefore a correctness decision, not a
+;    style one, and the queries here are written in that order deliberately.
+;
+; ── What it is NOT ───────────────────────────────────────────────────
+;
+; It is not a replacement for grep. On the CoIR code-retrieval benchmark the
+; model behind `code.embed` scores 39.1 NDCG@10 where BM25 scores 42.3, and
+; the two TOGETHER score 43.4. Lexical and semantic fail on different
+; questions; a code search that has only one of them is worse than one that
+; has both, which is a reason to keep `similar-to` optional and let a caller
+; combine it, not a reason to reach for it always.
+
+(ns code.semantic
+  (:require [code.embed] [codebase] [typed] [datom] [datom.vector] [env]))
+
+;; ── the schema: one more column ─────────────────────────────────────
+;;
+;; `:fn/embedding` beside codebase's own attributes. Added by CONCATENATION,
+;; never by editing `codebase.bl`: a codebase that wants no embeddings keeps
+;; its exact schema, and the facts stay identical either way.
+
+(def EMBEDDING
+  {:db/ident :fn/embedding :db/valueType :db.type/vector})
+
+(defn schema
+  "The codebase schema plus the embedding column."
+  []
+  (conj codebase/SCHEMA EMBEDDING))
+
+(def sigs
+  "The type seeds `codebase/index-source` reads its annotations through — the
+   same set the MCP code surface mounts, so a fact indexed here matches one
+   indexed there."
+  (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
+
+(defn connect
+  "A fresh conn carrying the codebase facts AND an embedding column."
+  []
+  (datom/connect (schema)))
+
+;; ── turning source into a document ──────────────────────────────────
+;;
+;; What gets embedded is a FUNCTION, not a file and not a form: its qualified
+;; name, then its source. The name carries the identifier tokens a query may
+;; name outright (`meet`, `tx`, `lattice`); the source carries the vocabulary
+;; a query describes but never spells. Both are signal to a code-retrieval
+;; model — it was trained on exactly this pairing of docstring-questions to
+;; function bodies.
+
+(defn source-lines
+  "The source split into lines, 1-indexed by position."
+  [src]
+  (into [] (re/split src "\n")))
+
+(defn form-starts
+  "The 1-based line each TOP-LEVEL form begins on, ascending.
+
+   Read from the real reader rather than by scanning for `^\(`, so a form
+   preceded by a reader macro, a metadata map or a comment is located where
+   the reader says it is."
+  [src]
+  (into [] (sort (keep (fn [f] (:line (typed/node-pos f)))
+                       (to-list (BeamLisp.Reader/read_string src))))))
+
+(defn- trim-section-tail
+  "Drop the trailing blank lines and comment-only lines from a slice.
+
+   A slice runs to the NEXT top-level form, so it swallows the blank line and
+   the `;; ── section ──` heading that introduce it. Those comments describe
+   the FOLLOWING function; left here they embed one function's description
+   into another's vector. The symptom is a ranking that is subtly wrong — a
+   function rising because of a neighbour's prose — which is far harder to
+   notice than an exception, so it is worth the six lines to not have."
+  [slice]
+  (loop [ls (vec slice)]
+    (if (empty? ls)
+      ls
+      (let [last-line (trim (peek ls))]
+        (if (or (= "" last-line) (= ";" (subs last-line 0 1)))
+          (recur (pop ls))
+          ls)))))
+
+(defn slice-text
+  "The source text of the top-level form beginning on `line`.
+
+   The end is the next top-level form's start — the reader knows where forms
+   begin, and a form ends where the next one starts. The last form runs to EOF.
+   This is exact for whole forms and needs no paren balancing, which would
+   have to re-implement string and comment handling to be correct."
+  [lines starts line]
+  (let [n (count lines)
+        after (sort (filter (fn [l] (> l line)) (to-list starts)))
+        end (if (empty? after) n (dec (first after)))
+        from (dec line)]
+    (if (or (>= from end) (>= from n))
+      ""
+      (join "\n" (trim-section-tail (subvec lines from (min end n)))))))
+
+(defn document
+  "The text a function is embedded as: its qualified name, then its source."
+  [ns-str name text]
+  (str ns-str "/" name "\n" text))
+
+(defn- fn-entities
+  "One entry per FUNCTION, in SOURCE ORDER, from the fn facts.
+
+   A function emits several facts — one per arity, one per return tag — and
+   every one of them is a separate entity. The function is what has a meaning,
+   so they are grouped by `ns/name` and the embedding is asserted on each of
+   the group's entity ids: one vector, written where every arity can find it,
+   and one row out of a query.
+
+   Sorted by line, and that is not cosmetic: the grouping is a map, and a
+   map's `vals` come back in an order nobody promised. Documents would then
+   be embedded in an arbitrary order and — worse — the ORDER WOULD LOOK
+   PLAUSIBLE, so the only symptom is a listing that does not match the file."
+  [fn-facts]
+  (into []
+        (sort-by (fn [e] (:line e))
+                 (vals
+                   (reduce
+                     (fn [acc f]
+                       (let [k (str (:fn/ns f) "/" (:fn/name f))]
+                         (if (contains? acc k)
+                           (assoc acc k (update (get acc k) :ids conj (:db/id f)))
+                           (assoc acc k {:name (:fn/name f) :ns (:fn/ns f)
+                                         :line (:fn/line f) :ids [(:db/id f)]}))))
+                     {}
+                     (filterv (fn [f] (and (some? (:fn/name f)) (some? (:fn/line f))))
+                              (to-list fn-facts)))))))
+
+(defn documents
+  "Every function in `src` as `{:name :ns :line :text}` — what would be
+   embedded. Exposed because “what does the model actually see?” is the first
+   question worth asking of any retrieval result.
+
+   Deliberately NOT the same call indexing makes: this slices the source for
+   inspection and asks for no column — so it never touches the model, and never
+   fills anything."
+  ([ns-str src] (documents ns-str src nil))
+  ([ns-str src root]
+  (let [lines (source-lines src)
+        starts (form-starts src)
+        ents (db-fn-entities (:db (codebase/analyze-cached sigs ns-str src {:root root})))]
+    (mapv (fn [e]
+            {:name (:name e) :ns (:ns e) :line (:line e)
+             :text (document (:ns e) (:name e) (slice-text lines starts (:line e)))})
+          ents))))
+
+;; ── indexing ────────────────────────────────────────────────────────
+
+(defn- shift-ids
+  "Every fact's `:db/id` moved by `delta`.
+
+   `codebase/index-source` numbers entities from a FIXED base (fns from 1000,
+   call facts from 100000), so two files indexed into one conn collide
+   outright: the second file's `1000` is the first file's `1000`, and the first
+   file's facts and embeddings are silently overwritten. Entities join by
+   `:fn/name` and `:call/*` STRINGS everywhere, never by id, so shifting an
+   index's ids is semantically free — it is what makes several files share one
+   fact space at all."
+  [facts delta]
+  (mapv (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) (to-list facts)))
+
+;; ── the analysis cache: the one way in ──────────────────────────────
+;;
+;; Every fact this namespace indexes comes through `codebase/analyze-cached`,
+;; the project's store. That is not an optimisation bolted on: the analysis
+;; is a PURE FUNCTION OF THE SOURCE BYTES and the store is keyed by
+;; sha256(source), so an unchanged file is a REOPEN, not a re-index. Measured
+;; per file over beam-lisp's own `priv/`: 180–2300 ms cold against 5–10 ms warm.
+;;
+;; It is also the difference between a command that can be used and one that
+;; cannot. The first `bl search -p priv` paid ~520 s of macroexpansion for 156
+;; files; through this door the same tree costs seconds.
+
+(defn- fact-attrs
+  "The attributes a codebase index is made of, read off the schema itself.
+
+   Derived rather than listed: a hand-written set of `:fn/*` and `:call/*`
+   keywords is a second definition of the schema, and the failure it produces
+   is silent — one attribute forgotten and that fact is simply absent from
+   every index, with nothing to notice it by."
+  []
+  (set (mapv (fn [m] (:db/ident m)) codebase/SCHEMA)))
+
+(defn- fact-rows
+  "The rows whose attribute is a codebase FACT attribute.
+
+   An explicit loop rather than `keep` + `into`, because the lazy version was
+   QUADRATIC here and the shape of that curve is what made it visible:
+   measured, 248 rows took 46 ms and 1932 rows took 3721 ms — 8x the rows for
+   80x the time. On a warm cache this filter was the single largest term in
+   the run, larger than the store open it followed."
+  [rows attrs]
+  (loop [rs (to-list rows) acc []]
+    (if (empty? rs)
+      acc
+      (let [r (first rs)]
+        (recur (rest rs)
+               (if (contains? attrs (get r 1)) (conj acc r) acc))))))
+
+(defn- entity-facts
+  "Rows → one map per ENTITY, the shape `codebase/index-source` emits.
+
+   The analyzer hands back a list of maps, each carrying every attribute of one
+   entity; a query hands back ROWS, one attribute each. `fn-entities` reads
+   `:fn/ns` and `:fn/name` off the SAME map — so rows that are not put back
+   together group into nothing, and the symptom is an index of zero functions
+   over a corpus that has plenty, with no error anywhere.
+
+   The order these maps come back in is irrelevant because `fn-entities` sorts
+   by line; what matters is that every entity is in the collection before it
+   looks."
+  [rows]
+  (loop [rs (to-list rows) grouped {}]
+    (if (empty? rs)
+      (into [] (vals grouped))
+      (let [r (first rs)
+            e (get r 0)
+            ; `:db/id` is set, not copied: a row carries the VALUE, not the id,
+            ; and a map without it raises "bad argument in arithmetic" later —
+            ; in the id band, where the cause is invisible.
+            attrs (assoc (or (get grouped e) {}) :db/id e)]
+        (recur (rest rs) (assoc grouped e (assoc attrs (get r 1) (get r 2))))))))
+
+(defn- db-fn-entities
+  "The function entities in `db`, in source order.
+
+   Rows are one attribute per entity and `fn-entities` groups them per
+   FUNCTION, so the regrouping is not optional: without it a fill marks
+   entities that no function claims, and the symptom is an index of zero
+   functions over a corpus that plainly has some."
+  [db]
+  (fn-entities
+    (entity-facts
+      (fact-rows (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] db) (fact-attrs)))))
+
+(defn- index-attrs
+  "What an index pull needs: every codebase fact attribute, PLUS the columns'.
+
+   The column has to be pulled with the facts. A corpus conn holding the
+   functions and none of their vectors is an index that reports functions and
+   cannot rank them — a search that finds nothing, out of a run that looked
+   like it worked."
+  []
+  (reduce (fn [s c] (conj s (:ident c))) (fact-attrs) (columns)))
+
+(defn- embedding-fill
+  "The datoms that put a vector on every entity of every function in `db`.
+
+   This is the whole cost of a cold index, and the reason the column exists: a
+   reader pass to slice each function out of `src`, one score per function, the
+   datoms that carry the result. It runs only when the store's marker says it
+   must — a warm file never gets here, and that is the difference between
+   slicing 1,591 functions again and slicing none."
+  [db src]
+  (let [ents (db-fn-entities db)
+        lines (source-lines src)
+        starts (form-starts src)
+        texts (mapv (fn [e]
+                      (document (:ns e) (:name e)
+                                (slice-text lines starts (:line e))))
+                    ents)
+        vecs (code.embed/embed-batch texts)]
+    (reduce
+      (fn [acc i]
+        (let [e (get ents i) v (get vecs i)]
+          (concat acc (mapv (fn [id] {:db/id id :fn/embedding v}) (:ids e)))))
+      []
+      (range (count ents)))))
+
+(defn- embedding-column
+  "`:fn/embedding` as a column of the analysis store.
+
+   The VERSION is the model's identity, which is what makes a new model cheap:
+   same source, same facts, one refilled column. It is also a correctness
+   guard — the marker says which model filled the store, so a run under another
+   model re-embeds rather than scoring one vector space against another, the
+   failure that has no symptom until the results are nonsense."
+  []
+  {:ident :fn/embedding
+   :schema [EMBEDDING]
+   :version (code.embed/model-id)
+   :fill embedding-fill})
+
+(defn- columns
+  "Every derived column an index carries. One today."
+  []
+  [(embedding-column)])
+
+(defn- cached-facts
+  "The codebase facts for `src` — WITH the embedding column — out of the store
+   when it is warm, derived when it is not.
+
+   Returns `{:hit bool :facts [{:db/id e :fn/name …} …] :columns {ident
+   :cached|:filled}}` — entity maps carrying the ids the cached store
+   allocated. Ids are the CALLER's business: the cache gives a source the ids a
+   fresh index would (`shift-ids` then moves them into the caller's band),
+   which is what keeps a cached run and a fresh run byte-identical.
+
+   The vectors arrive in the SAME pull as the facts, because in the store they
+   are the same kind of thing."
+  [ns-str src root]
+  (let [res (codebase/analyze-cached sigs ns-str src {:columns (columns) :root root})
+        rows (into [] (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] (:db res)))]
+    {:hit (:hit res)
+     :columns (:columns res)
+     :facts (entity-facts (fact-rows rows (index-attrs)))}))
+
+(defn index-source!
+  "Index ONE file into `conn`: its codebase facts AND an embedding per function.
+
+   One transaction matters. The vector and the facts it describes commit
+   together, so there is no window in which a query can find an embedding whose
+   function does not exist yet — the same atomicity every other fact gets, for
+   free, because a vector IS a fact. And because the vectors now come back out
+   of the SAME store as the facts, they arrive in the same pull and commit in
+   the same transaction with no extra bookkeeping at all.
+
+   `offset` shifts this file's entity ids clear of every other file's (see
+   `shift-ids`); `index!` derives it from the file's position in the set.
+
+   A warm file costs a store reopen and a pull. The reader pass and the model
+   live behind the column, which runs only when its marker moved — `:vectors`
+   reports which happened."
+  ([conn ns-str path] (index-source! conn ns-str path 0 nil))
+  ([conn ns-str path offset] (index-source! conn ns-str path offset nil))
+  ([conn ns-str path offset root]
+   (merge-one conn offset (read-and-analyze ns-str path root))))
+
+(defn offset-for
+  "The entity-id band source `i` (0-based) is indexed into.
+
+   Exposed, not inlined, so a caller that re-indexes ONE source later — the
+   live case — lands on the same band as `index!` gave it. A second band does
+   not overwrite; it DUPLICATES: the same function ends up with two stored
+   vectors and its call facts counted twice, and nothing errors. Measured on a
+   two-function source: 2 embeddings and 1 call fact became 4 and 2.
+
+   What makes that easy to miss is that the REPORTING absorbs it — `stats`
+   counts distinct `ns/name`, and a query projects `?name ?ns ?line ?score`,
+   which two copies of a function share, so a set-valued result collapses them
+   into one row. The waste is real; the symptom is only in the counts of what
+   is STORED, never in the answers."
+  [i]
+  (* (inc i) 1000000))
+
+;; ── several files at once ────────────────────────────────────────────
+;;
+;; One file's index is CPU-bound and touches nothing shared. The analyzer runs
+;; in this process; `code.embed`'s encode is a DirtyCpu NIF, so it yields its
+;; scheduler rather than blocking it; and a file's store is its OWN directory,
+;; so two files never contend for one lock. What does NOT parallelise is the
+;; CONNECTION — its tables belong to the process that opened it, and a store's
+;; writer is one process — so the seam is there: workers analyze, the caller
+;; merges. Keeping that seam also keeps the cache, the id bands, and the
+;; skip-handling to one implementation each.
+;;
+;; Not every core, either. Each worker holds one file's slice and its vectors,
+;; and this runs on a laptop that is usually busy with something else, where a
+;; wide fan-out buys latency for the run and takes it from everyone else.
+
+(def DEFAULT-WORKERS 4)
+(def MAX-WORKERS 16)
+
+; A worker that dies without reporting would otherwise hang the run for good.
+; Generous, because a big file legitimately takes minutes.
+(def WORKER-TIMEOUT-MS 900000)
+
+(defn workers-for
+  "How many files to analyze at once: `{:workers n}` when given, else
+   `DEFAULT-WORKERS` — never more than there are files, never more than
+   `MAX-WORKERS`, never fewer than one.
+
+   One IS the serial path: `fan-out` with a fan-out of one is `mapv`, so the
+   old behaviour is the same code rather than a second implementation kept
+   honest by hand."
+  ([n] (workers-for n {}))
+  ([n opts]
+   (let [asked (:workers opts)
+         asked (if (erlang/is_integer asked) asked DEFAULT-WORKERS)]
+     (max 1 (min asked n MAX-WORKERS)))))
+
+(defn- read-and-analyze
+  "One file's facts — analyzed or reopened — with the ids the STORE allocated.
+
+   Raises on a file it cannot read, which is what `index-source!` has always
+   done; `analyze-one` is the version that reports instead."
+  [ns-str path root]
+  (let [src (File/read! path)]
+    {:file path :ns ns-str :raw (cached-facts ns-str src root)}))
+
+(defn- analyze-one
+  "`read-and-analyze` as a worker reports it: never raises, because a raise in
+   another process has no caller left to catch it."
+  [ns-str path root]
+  (try
+    (read-and-analyze ns-str path root)
+    (catch e {:file path :skipped (ex-message e)})))
+
+(def MERGE-CHUNK
+  "Files merged per transaction.
+
+   ONE, and measured rather than assumed. Batching a corpus merge looked like a
+   free win — fewer calls, the same guarantee (no query sees an embedding whose
+   function does not exist) — and it is a loss. Ten cold sources, serial, one
+   machine, one load, three runs each:
+
+       16 files/transaction    18584  18936  20097 ms
+        1 file/transaction     15525  14734  15249 ms
+
+   A wider transaction is slower than its width in narrower ones, which is the
+   same shape the analysis loop had before `keep`/`into` became a loop: cost
+   growing faster than the work. So the batch that saves calls pays elsewhere,
+   and the per-file transaction — the shape a live `index-source!` already
+   needed — is also the fast one.
+
+   Kept as a named knob because the number is worth re-measuring whenever the
+   transaction path changes."
+  1)
+
+(defn- chunked
+  "`coll` as vectors of at most `n`."
+  [n coll]
+  (loop [rs (to-list coll) acc [] cur []]
+    (if (empty? rs)
+      (if (empty? cur) acc (conj acc cur))
+      (if (= n (count cur))
+        (recur rs (conj acc cur) [])
+        (recur (rest rs) acc (conj cur (first rs)))))))
+
+(defn- result-of
+  "The report for one analyzed source — the shape every caller already reads.
+
+   `:analysis` says WHERE the facts came from, because that is the question a
+   cache has to answer about itself: a fresh analysis, a store, or the corpus
+   memo."
+  [r]
+  (let [raw (:raw r)
+        from (:from r)]
+    {:file (:file r) :ns (:ns r)
+     :functions (count (fn-entities (:facts raw)))
+     :facts (count (:facts raw))
+     :analysis (if (= :manifest from) :manifest (if (:hit raw) :cached :indexed))
+     :vectors (:fn/embedding (:columns raw))}))
+
+(defn- merge!
+  "Merge analyzed sources into `conn` — `MERGE-CHUNK` files per transaction.
+
+   `pending` is `[[offset r] …]`, in input order, where `r` is what a worker
+   returned. A skipped source passes through untransacted: it is a result like
+   any other, and the caller still has to see it."
+  [conn pending]
+  (into []
+        (mapcat
+          (fn [chunk]
+            (let [rows (mapcat (fn [pr]
+                                (if (:skipped (get pr 1))
+                                  []
+                                  (shift-ids (:facts (:raw (get pr 1))) (get pr 0))))
+                              chunk)
+                  _ (if (empty? rows) nil (datom/transact! conn rows))]
+              (mapv (fn [pr]
+                      (let [r (get pr 1)]
+                        (if (:skipped r) r (result-of r))))
+                    chunk)))
+          (chunked MERGE-CHUNK pending))))
+
+(defn- merge-one
+  "`merge!` for ONE source: band, commit, report.
+
+   `index-source!`'s path — the live case, one file, one transaction."
+  [conn offset r]
+  (first (merge! conn [[offset r]])))
+
+;; ── the corpus memo ──────────────────────────────────────────────────
+;;
+;; A warm run's cost is not work, it is OPENS: one store per file, each with its
+;; own fjall directory to open and pull — 94 s over 101 files — while all the
+;; facts together are 36 MB, which ONE read delivers. So a corpus's analysis is
+;; remembered whole, in the same directory and under the same cap as the stores
+;; it saves:
+;;
+;;   manifest.<key>.term    key = sha256(model, [[ns sha] …] IN ORDER)
+;;
+;; A run over byte-identical sources reads that one file and opens nothing.
+;; Anything else — an edit, an addition, a deletion, a model change — misses,
+;; and the per-file stores do what they always did: the incremental tier for
+;; exactly the files that moved.
+
+(def MANIFEST-VERSION 1)
+
+(defn- corpus-entries
+  "`[[ns sha] …]` for `pairs`, in order — reading each source once, which is
+   cheap (tens of ms for a hundred files) next to the analysis it identifies.
+
+   Raises on a source it cannot read, exactly like `read-and-analyze`: the
+   caller turns that into the per-file path, which reports the skip by name."
+  [pairs]
+  (mapv (fn [pair] [(get pair 0) (sha256-hex (File/read! (get pair 1)))]) pairs))
+
+(defn- memo-of
+  "What a memo holds: the analysis itself, banded for nobody.
+
+   Facts are stored UNBANDED because a band is a property of the corpus's
+   ORDER rather than of the file — and the key already carries the order."
+  [entries parts]
+  {:version MANIFEST-VERSION
+   :model (code.embed/model-id)
+   :sources (mapv (fn [e p] {:ns (get e 0) :sha (get e 1) :facts (:facts (:raw p))})
+                  entries parts)})
+
+(defn- memo-matches?
+  "Whether `memo` is usable for this corpus: same version, same model, one
+   source per pair, and the hash we just computed. A memo that does not fit is
+   treated as one that is not there — the stores then answer, and the run
+   rewrites it."
+  [memo entries]
+  (let [srcs (:sources memo)]
+    (and (= MANIFEST-VERSION (:version memo))
+         (= (code.embed/model-id) (:model memo))
+         (= (count entries) (count srcs))
+         (every? (fn [i] (= (get (get entries i) 1) (:sha (get srcs i))))
+                 (range (count entries))))))
+
+(defn- merge-memo!
+  "Merge a memo's facts into `conn`: the same bands, the same transactions, and
+   none of the opens. One result per source, each saying it came from the memo."
+  [conn pairs memo]
+  (merge! conn
+          (mapv (fn [i]
+                  (let [src (get (:sources memo) i)]
+                    [(offset-for i)
+                     {:file (get (get pairs i) 1) :ns (:ns src) :from :manifest
+                      :raw {:facts (:facts src) :hit true
+                            :columns {:fn/embedding :cached}}}]))
+                (range (count pairs)))))
+
+(defn- fan-out-collect
+  "See `fan-out`. Hands work out as workers REPORT, rather than in fixed bands:
+   file sizes differ by an order of magnitude and a band waits on its slowest
+   member."
+  [w n v me run next-i outstanding acc]
+  (let [started (min n (+ next-i (- w (count outstanding))))]
+    (doseq [i (range next-i started)] (spawn (fn [] (run i))))
+    (let [outstanding (into outstanding (range next-i started))]
+      (if (and (>= next-i started) (empty? outstanding))
+        acc
+        (receive
+          [i res] (fan-out-collect w n v me run
+                                   (max next-i started) (disj outstanding i)
+                                   (assoc acc i res))
+          ; Nobody reported. The run finishes with what it has and SAYS what it
+          ; lost: a lost worker is a skipped file, exactly like an unreadable
+          ; one, never a hang.
+          (after WORKER-TIMEOUT-MS
+                 (reduce (fn [a i]
+                           (assoc a i {:file (get (get v i) 1)
+                                       :skipped "the worker did not report"}))
+                         acc
+                         outstanding)))))))
+
+(defn- fan-out
+  "`f` over `xs` with at most `w` in flight, results in INPUT ORDER.
+
+   Order is not a nicety here: `index!` gives source `i` the band `(offset-for
+   i)`, so an index is only reproducible while position and band stay married.
+   With one worker this is `mapv`.
+
+   The worker body is CONVEYED, not merely spawned: env bindings do not cross
+   a process boundary on their own, and the store's directory is derived from
+   values the caller held — a worker that resolved those itself could write to
+   a different tier and nobody would notice until a run failed to warm."
+  [w f xs]
+  (let [v (vec (to-list xs))
+        n (count v)]
+    (if (<= w 1)
+      (mapv f v)
+      (let [me (erlang/self)
+            run (env/convey (fn [i] (erlang/send me [i (f (get v i))])))
+            acc (fan-out-collect w n v me run 0 #{} {})]
+        (mapv (fn [i] (get acc i)) (range n))))))
+
+(defn index!
+  "Index a whole codebase. `sources` is a seq of `[ns-string path]` pairs —
+   the shape the MCP code surface already mounts.
+
+   THE entry point. Every caller — the `bl search` command, the examples, the
+   tests — comes through here, so the analysis cache, the id bands, and
+   survival of a file that cannot be analyzed are properties of ONE path
+   rather than of each caller's own loop.
+
+   Each file is given its own id band, a million apart, so a set of sources
+   lands in one conn without collision. Files are analyzed by up to
+   `(workers-for n opts)` workers and merged in input ORDER, so two runs over
+   one corpus agree byte for byte.
+
+   Returns one result per source, in the order given. A source the analyzer
+   cannot read yields `{:file path :skipped reason}` instead of aborting the
+   run: one unreadable file in a tree of a thousand must not cost the caller
+   every result, and it must not disappear either — a skipped source that is
+   not REPORTED is a smaller index that looks complete."
+  ([conn sources] (index! conn sources {}))
+  ([conn sources opts]
+   (let [root (:root opts)
+         v (vec (to-list sources))
+         ; The memo is looked up BEFORE any work, and its key is the corpus's
+         ; content: a hit is a proof that every fact below is the one a fresh
+         ; analysis would produce.
+         entries (if (not= false (:memo opts))
+                   (try (corpus-entries v) (catch e nil))
+                   nil)
+         key (if (some? entries)
+               (codebase/manifest-key (code.embed/model-id) entries)
+               nil)
+         memo (if (some? key) (codebase/read-manifest root key) {:absent true})]
+     (if (and (some? key) (:value memo) (memo-matches? (:value memo) entries))
+       (merge-memo! conn v (:value memo))
+       (let [w (workers-for (count v) opts)
+             parts (fan-out w (fn [pair] (analyze-one (get pair 0) (get pair 1) root)) v)
+             pending (mapv (fn [i r] [(offset-for i) r]) (range (count parts)) parts)
+             ; Only a COMPLETE corpus is worth memorizing: a run that skipped a
+             ; source has produced something it cannot name, and a memo of it
+             ; would quietly answer for a corpus nobody indexed.
+             _ (if (and (some? key) (seq parts)
+                        (every? (fn [r] (not (:skipped r))) parts))
+                 (codebase/write-manifest! root key (memo-of entries parts))
+                 nil)]
+         (merge! conn pending))))))
+
+(defn ns-of-file
+  "The `(ns …)` name declared in `path` — the namespace a file's facts are
+   attributed to. Falls back to the file's base name so a file the reader
+   cannot parse still gets indexed under a stable name instead of `nil`.
+
+   `Regex/run` (not the compat `re-find`) because it has no dependency on a
+   compat namespace being loaded first, and it returns Clojure's shape —
+   `(whole g1 …)`, a LIST whose second element is group 1 (`get` on a list by
+   index is nil in this language, which reads as a failed match). The pattern
+   is built with `Regex/compile!` rather than with a hash-quote regex literal,
+   which this reader does not provide: the literal reads as the symbol `#`
+   followed by a string, and the failure surfaces as `undefined var: <ns>/#` —
+   an error that names neither the regex nor the file it is in."
+  [path]
+  ; `File/read` (not `File/read!`): this is called on every path a glob
+  ; returns, and a file that vanished between the glob and the read is an
+  ; environment fact, not a reason to abort an index of a thousand files.
+  (let [src (second (File/read path))]
+    ; `second` of `{:error, :enoent}` is the ATOM `:enoent`, not nil — so the
+    ; question is whether what came back is a binary, not whether it is absent.
+    (if (erlang/is_binary src)
+      (let [m (Regex/run (Regex/compile! "\\(ns\\s+([^\\s\\)\\]]+)") src)]
+        (if (some? m) (second m) (last (re/split path "/"))))
+      (last (re/split path "/")))))
+
+(defn index-dir!
+  "Index every `*.bl` under `root`, taking each file's namespace from its
+   `(ns …)` form. Convenience for a demo, or for indexing a whole checkout
+   when a few seconds of indexing is the right trade."
+  [conn root]
+  (let [paths (sort (Path/wildcard (str root "/**/*.bl")))]
+    (index! conn (mapv (fn [p] [(ns-of-file p) p]) (to-list paths)))))
+
+;; ── search ──────────────────────────────────────────────────────────
+
+(def SEARCH-Q
+  '[:find ?name ?ns ?line ?score
+    :in $ ?q ?k
+    :where [(similar-to :fn/embedding ?q ?k) [?e ?score]]
+           [?e :fn/name ?name]
+           [?e :fn/ns ?ns]
+           [?e :fn/line ?line]])
+
+(defn- row
+  [r]
+  {:name (get r 0) :ns (get r 1) :line (get r 2) :score (get r 3)})
+
+(defn- ranked
+  "Rows (`{:name :ns :line :score}`), most similar first.
+
+   The sort is NOT redundant. A datalog query returns a SET, and `similar-to`
+   generates its rows in score order — but the join against the fn facts runs
+   afterwards and is free to emit them in any order, so the ranking the search
+   produced is not the ranking that comes out. Measured on a two-file corpus:
+   the raw rows came back 0.245, 0.129, 0.198, 0.173, 0.130 — the RIGHT five
+   functions in arbitrary order, which reads as a bad ranking rather than as a
+   missing sort. K nearest is a ranking, so the last step is to rank."
+  [rows]
+  (into [] (sort-by (fn [r] (:score r)) (fn [a b] (compare b a)) rows)))
+
+(defn search
+  "The `k` functions nearest to the embedding `dvec`, most similar first —
+   each `{:name :ns :line :score}`.
+
+   `k` is a BOUND VARIABLE, not a literal, because `similar-to` resolves its
+   arguments through the same binding environment every other clause uses —
+   so the count is a query parameter like any other."
+  [db dvec k]
+  (ranked (mapv row (datom/q SEARCH-Q db dvec k))))
+
+(defn search-text
+  "Ask the codebase a question in English. This is the whole user-facing
+   surface of the feature."
+  [db text k]
+  (search db (code.embed/embed text) k))
+
+;; ── nearest WITHIN a set ───────────────────────────────
+;;
+;; `similar-to` is a datalog clause, and a clause sees the world one BINDING at
+;; a time. That is right for its two natural jobs — GENERATE (the entity is
+;; free: the k nearest of everything) and SCORE (the entity is bound: how
+;; relevant is THIS function to the query). It is the wrong shape for a third
+;; question — the k nearest WITHIN a set — because a set has to be visible all
+;; at once for a k over it to mean anything.
+;;
+;; Written down because the wrong answers are silent and look plausible:
+;;
+;;   · bind `?e` from a pattern over a LITERAL (`[?e :fn/ns "datom.tx"]`) and
+;;     the query yields EVERY function in that namespace, each with its score
+;;     — unranked, unbounded by k, and easy to mistake for a ranking;
+;;   · bind the same pattern from an `:in` variable instead and the engine
+;;     carries the variable as ONE set-valued binding, which the provider reads
+;;     as "the single bound entity", matches nothing, and answers ZERO rows.
+;;
+;; Neither is "the k nearest in the set", and neither says so. So the
+;; restricted search is not a clause: it is the same kernel `similar-to` calls
+;; (`datom.vector/search`), handed the candidate corpus in one piece.
+
+(defn embeddings
+  "Every `[entity dvec]` in the embedding column, at the current basis."
+  [db]
+  (mapv (fn [r] [(get r 0) (get r 1)])
+        (into [] (datom/q '[:find ?e ?v :where [?e :fn/embedding ?v]] db))))
+
+(defn- fn-index
+  "entity → `{:name :ns :line}` for every indexed function.
+
+   Fetched once per search rather than once per hit: a lookup per hit is how a
+   k-nearest query quietly becomes k queries."
+  [db]
+  (reduce
+    (fn [m r] (assoc m (get r 0) {:name (get r 1) :ns (get r 2) :line (get r 3)}))
+    {}
+    (into [] (datom/q '[:find ?e ?name ?ns ?line
+                        :where [?e :fn/name ?name]
+                               [?e :fn/ns ?ns]
+                               [?e :fn/line ?line]] db))))
+
+(defn- hits->rows
+  "`[[entity score] …]` → `[{:name :ns :line :score} …]`.
+
+   A hit whose entity has no fn facts is dropped rather than emitted as a row
+   of nils: that is an embedding with no function behind it, which `stats` is
+   the right place to report."
+  [index hits]
+  (into [] (keep (fn [h]
+                   (let [facts (get index (get h 0))]
+                     (if (nil? facts) nil (assoc facts :score (get h 1)))))
+                 (to-list hits))))
+
+(defn search-in
+  "The `k` functions nearest to `dvec` AMONG those `cand-q` selects.
+
+   `cand-q` is a datalog query whose `:find` is `?e`, taking one `:in` input:
+   the filter that defines the candidate set — `[?e :fn/ns ?nsf]`,
+   `[?e :fn/ret-tag ?tag]`, or anything else the engine can express."
+  [db dvec cand-q input k]
+  (let [allowed (set (mapv (fn [r] (get r 0)) (into [] (datom/q cand-q db input))))
+        candidates (filterv (fn [p] (contains? allowed (get p 0))) (embeddings db))]
+    (if (empty? candidates)
+      []
+      (ranked (hits->rows (fn-index db)
+                          (datom.vector/search dvec candidates k
+                                               (datom.vector/default-rerank k)))))))
+
+(defn search-in-ns
+  "The `k` functions nearest to `dvec`, restricted to ONE namespace."
+  [db dvec ns-str k]
+  (search-in db dvec '[:find ?e :in $ ?nsf :where [?e :fn/ns ?nsf]] ns-str k))
+
+(defn search-returning
+  "The `k` functions nearest to `dvec` among those whose return type may
+   include `tag` — a corpus narrowed by a FACT, ranked by MEANING.
+
+   The candidate set joins on NAME, not on id, and that is not a shortcut.
+   `codebase.bl` gives a function ONE entity per arity (carrying `:fn/line`)
+   and a SEPARATE entity per return tag (carrying `:fn/ret-tag`, no line), and
+   the embedding is written on the arity entities. So `[?e :fn/ret-tag ?t]`
+   alone binds the tag entity, which has no vector, and a search restricted to
+   it finds nothing — silently, because an empty candidate set and an empty
+   answer look identical. The shared `:fn/name` is the identity; the ids are
+   an allocation detail."
+  [db dvec tag k]
+  (search-in db dvec
+    '[:find ?e :in $ ?tag
+      :where [?d :fn/ret-tag ?tag]
+             [?d :fn/name ?n]
+             [?e :fn/name ?n]
+             [?e :fn/embedding ?v]]
+    tag k))
+
+(defn similar
+  "More like this: the `k` functions nearest to `name`'s own embedding.
+
+   The query IS the item, which is the trick that makes this work without a
+   second system: a stored embedding can be used as a query vector, because
+   it is just a value. The function itself is excluded — it is its own
+   nearest neighbour at 1.0, which is true and useless."
+  [db name k]
+  (let [found (into [] (datom/q '[:find ?v :in $ ?n
+                                  :where [?e :fn/name ?n] [?e :fn/embedding ?v]]
+                                db name))]
+    (if (empty? found)
+      []
+      (let [q (get (get found 0) 0)]
+        (into [] (filter (fn [r] (not= (:name r) name))
+                         (search db q (inc k))))))))
+
+;; ── what is in the index ────────────────────────────────────────────
+
+(defn stats
+  "Counts for a manifest or a health line: how many functions the codebase
+   declares, how many of them carry an embedding, and how many call facts.
+
+   Counting `[?e :fn/name _]` is NOT counting functions. `codebase.bl` gives a
+   function one entity per arity AND a separate entity per return tag, and
+   those tag entities carry the name too — so the naive count reports a
+   codebase with annotations as larger than it is, by exactly the number of
+   annotations. The entity that carries a source LINE is the function; the
+   name is the identity shared across its entities."
+  [db]
+  (let [declared (into [] (datom/q '[:find ?ns ?name
+                                     :where [?e :fn/name ?name]
+                                            [?e :fn/ns ?ns]
+                                            [?e :fn/line ?l]] db))
+        embedded (into [] (datom/q '[:find ?ns ?name
+                                     :where [?e :fn/embedding ?v]
+                                            [?e :fn/name ?name]
+                                            [?e :fn/ns ?ns]] db))
+        key-of (fn [r] (str (get r 0) "/" (get r 1)))]
+    {:functions (count (distinct (mapv key-of declared)))
+     :embedded (count (distinct (mapv key-of embedded)))
+     :calls (or (get (get (into [] (datom/q '[:find (count ?c) :where [?c :call/caller _]]
+                                           db)) 0) 0) 0)}))

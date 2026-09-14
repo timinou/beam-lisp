@@ -7,6 +7,17 @@ mix compile
 mix test test/beam_lisp/aot_reproducible_test.exs
 ```
 
+The language's own suites are `.bl` files; run them with the CLI **on this
+tree's sources**:
+
+```sh
+mix bl test test/bl
+```
+
+The `bl` at the repo root is a packed DROP — it runs the stdlib it was built
+with, so `./bl test` in a checkout exercises the last-built language, not this
+tree (a stale drop reports the tree's new namespaces as undefined vars).
+
 The committed bootstrap seed supplies the compiler needed to build current source. Ordinary development builds do not regenerate that seed. Regenerate it at the commit-time bootstrap gate:
 
 ```sh

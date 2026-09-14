@@ -1,0 +1,127 @@
+#+TITLE: datahike.api is a projection of datom, not a second engine: the intricacies, gap by gap, and what each costs datom itself
+#+STATE: ITEM
+#+SESSION_ID: 157f1633c5f68abb
+#+CUSTOM_ID: PLAN-115-datahike-api-is-a-projection-of-datom-not-a-second-engine
+
+* Why
+
+43 of kontor's 73 kernel/substrate namespaces stop at `(:require [datahike.api :as d])`
+(triage `/tmp/kontor_triage3.txt`, 2026-09-14). Kontor calls 16 datahike fns at 565 sites
+(`q` 204, `pull` 146, `db` 82, `transact` 62, `entity` 24, `as-of` 18, `valid-at` 9,
+`schema` 6, `connect` 4, `db-with` 3, `transact!` 2, `create-database` 2, `datoms` 2,
+`branch!` 1, `valid-between` 1, `history` 1) and reaches into two datahike *internals* by
+`requiring-resolve`: `datahike.tx-preds/register-tx-pred!` (`kontor/governance.cljc:585`)
+and `datahike.query/*disable-planner*` (`kontor/invariant.cljc:296`).
+
+Decision (user, 2026-09-14): stay beam-lisp native. The shim `datahike.api` is a THIN
+namespace of adapters over `priv/lib/datom.bl`'s public API. Where datahike has a feature
+datom lacks, the feature is added to **datom, as datom's own idiom, named datom's way**, and
+the shim maps the datahike spelling onto it. Never: a datahike emulation layer with its own
+index/query/tx code (the "second engine that must agree" anti-pattern,
+`priv/lib/datom/datalog.bl:8-17`, `docs/datalog-one-truth-cutover.md`). Never: Java/JVM
+warts carried through (no `java.util.Date` values, no `BigDecimal` class, no string
+tempids as a *type*, no `datahike.datom.Datom` class).
+
+Everything below is measured against `priv/lib/datom/**` as of `feat/bb-compat` @ 7466511
+(explorer report 2026-09-14, path:line per claim) and kontor's usage counts (comment/string
+stripped scan of the 73 files).
+
+* Part A — what already projects 1:1 (thin shim, no datom change)
+
+| datahike.api | datom | proof | shim body |
+|---|---|---|---|
+| `connect cfg` | `datom/connect schema opts` / `connect-with store …` | `conn.bl:503, 360` | cfg map → store ctor: `{:store {:backend :mem}}` → `store-ets`, `:file` → `store-fjall` dir; `:branch` key → see Part C branch! |
+| `create-database cfg` | opening a store IS creating it (`conn.bl:495` "durable data is never deleted") | `datom.bl:77-99` | idempotent no-op returning cfg; `database-exists?` → store dir/ETS presence check in the shim (not datom's concern) |
+| `release conn` | `release!` | `conn.bl:441` | direct |
+| `db conn` | `db` | `datom.bl:250` | direct |
+| `transact conn tx` / `transact!` | `transact!` → report `{:db-before :db-after :tx :tempids :tx-datoms}` | `conn.bl:766-943` | rename `:tx-datoms`→`:tx-data` in the returned map (kontor reads `(:tx-data report)`, `bitemporal.cljc:97`); datahike `transact` is sync in kontor's use |
+| `pull` / `pull-many` | same | `pull.bl:329-363` | direct; `:xform` unused by kontor (0 sites) |
+| `datoms db :eavt …` | same four indexes | `db.bl:155`, `index.bl:84-116` | direct; datom shape `[e a v tx op]` |
+| `as-of` `since` `history` | same | `time.bl:32-79` | direct; NB kontor's 1 `history` site must not `pull` on it (`db.bl:201` refuses) — check the site in W0 |
+| `schema conn` | `schema` returns `{attr → def-map}` | `conn.bl:603` | kontor's 4 sites: read what shape they expect (datahike returns the same map form) — verify W0 |
+| `db-with db tx` | `(:db-after (with conn tx))` | `conn.bl:786-839` (overlay store) | needs the conn, not the db: datom's `with` is conn-scoped. Shim keeps a `db → conn` back-pointer on the Db record (`db.bl:47` has `:store`; the registry is keyed by store, `conn.bl` — so `(conn-of db)` = registry lookup by `(:store db)`). No datom change. |
+| `entity db e` | eager map with `:db/id`, refs stay ids | `db.bl:187-213` | kontor's 24 sites: read as maps (`(:attr (d/entity …))`) — verify no `touch`/ref navigation in W0 (grep found 0 `d/touch`) |
+
+* Part B — datom gaps that kontor hits, and the datom-native design for each
+
+Each entry: kontor demand (count) · datom today (proof) · **datom-native addition** · shim mapping · cost.
+
+** B1 · `:db.type/bigdec` — 37 schema attrs
+Today: `VALUE-TYPES` (`schema.bl:66-93`) has no decimal; `value-codec.bl:155-185` lanes are LONG/BOOL/STR/KEYWORD/FLOAT/ESC. A record value would go ESC (`term_to_binary`) — stored, but **not order-preserving**, so AVET range scans on amounts and `<`/`>` predicates over the index would be wrong-ordered.
+Addition: `:db.type/decimal` value type whose codec is the `decimal/Decimal` record from PLAN-114 (`{unscaled scale}`), encoded in a new order-preserving DEC lane: sign byte + scale-normalised unscaled as a big-endian magnitude with length prefix (the same trick `codec.bl` uses for LONG). `type-ok?` (`schema.bl:248`) → `decimal?`. Equality for uniqueness: Java `equals` is scale-sensitive (`1.0M ≠ 1.00M`) but datahike uses `compare` for AVET; **decide: datom stores the value as given, indexes by numeric value** (so `1.0M` and `1.00M` collide in AVET as datahike does). Shim: `:db.type/bigdec` → `:db.type/decimal` in schema install.
+Cost: codec lane + schema row + tests. Depends on PLAN-114 W2. ~1 day.
+
+** B2 · valid time — `valid-at` 9 sites, `valid-between` 1, `:db.valid/from` 13, `:db.valid/to` 3, and every `with-vt` write (`bitemporal.cljc:47-67`)
+Kontor's model (from `bitemporal.cljc` docstring, lines 1-27): valid time is **per transaction**, carried as two attrs on the tx entity (`{:db/id "datomic.tx" :db.valid/from vf :db.valid/to vt}`), `valid-at db t` is a *read view* hiding datoms whose tx window excludes `t`, `valid-between` a range view, and `close-validity!` retroactively asserts `:db.valid/to` on an old tx eid with a transactor guard `vf < vt`.
+Datom today: single axis. `as-of/since/history` filter on the datom's `tx` (`time.bl:32-79`); the Db record is `{store schema basis-t filter-mode since-t blobs}` (`db.bl:47`); every read routes through `db/datoms` (`db.bl:155`), which is the single place a new filter can live. Datom ALSO already has a VALID-TIME **value type** — `:db.type/time` Interval + Allen relations + ISO reader (`time.bl:137-634`: "Everything below is VALID time: when a fact is true in the world"). ∴ the vocabulary exists; what is missing is the *view*.
+Addition (datom-native, reuses both existing halves):
+1. `:db/valid` — a built-in attr on the tx entity of type `:db.type/time` (an Interval; open-ended by default). Written by `transact!` when tx-data carries a `{:db/id :db/current-tx :db/valid #time"…/…"}` map (datom's `:db/current-tx` sentinel, `tx.bl:70-83`). One attr, not two — the Interval type already models `[from, to)`.
+2. `datom.time/valid-at db t` → `(assoc db :valid-at t)`; `valid-between db a b` → `(assoc db :valid-between [a b])`. In `db/datoms` (`db.bl:155`), after the basis/since filter, drop datoms whose tx's `:db/valid` interval does not contain `t` (or overlap `[a b]`). The tx→interval lookup is one EAVT read per distinct tx, memoised per query — measure; if hot, materialise a `tx → interval` side index in the writer (the writer already writes 4 indexes per commit, `index.bl:177-200`).
+3. Retroactive close: `[:db/add <tx-eid> :db/valid <narrower-interval>]` is an ordinary cardinality-one supersession (`tx.bl` realize) — the guard "new interval ⊂ old, from unchanged" is a `:db/valid`-specific validation row in `tx.bl` validate (like `:db/cas`). No new machinery.
+Shim: `:db.valid/from`/`:db.valid/to` in a `"datomic.tx"` map → `{:db/id :db/current-tx :db/valid (interval from to)}`; `valid-at`/`valid-between` → the datom fns; `(.-tx datom)` etc. via PLAN-114's `.-` rows over vector `nth`. The `get-else`-defaulted open end (`bitemporal.cljc:29-34` `forever`) becomes the Interval's open end.
+Cost: this is the largest datom change: read-path filter + writer validation + planner awareness (a `valid-at` view must not use a cached AVET count that ignores the filter — check `query/plan.bl`). ~3–5 days incl. a bitemporal conformance suite. **This is where the "second engine" risk lives: the filter must be inside `db/datoms`, never in the shim.**
+
+** B3 · writer-run transaction predicates — `datahike.tx-preds/register-tx-pred!` (governance, 1 site, but it is kontor's whole integrity story: "EVERY committed write … validated in the writer", `governance.cljc:6-8`)
+Datom today: `register-tx-fn!` (`tx.bl:138`) registers `[:db/fn f & args]` *data-producing* fns; nothing runs a predicate over the **fully-resolved report** before commit. The writer pipeline is `expand → tx-fns → resolve tempids → store-ops → validate → realize → net-effect → commit` (`conn.bl:766-943`).
+Addition: `datom/guard!` `[conn name pred]` / `unguard!` — a per-store registry of `(fn [report] → nil | problems)` run **inside the writer after realize/net-effect and before -commit**, with `:db-before`/`:db-after` (overlay) available. A non-nil result aborts the commit with `ex-info "transaction refused" {:guard name :problems …}`. Same shape as `with` (`conn.bl:786-839`) which already builds `:db-after` speculatively — reuse that.
+Shim: `datahike.tx-preds/register-tx-pred!` → `guard!`. `:db.attr/preds` (attribute-level predicates, mentioned in kontor's deps.edn comment; 0 uses in src) → not implemented.
+Cost: ~1 day. Zero risk to the engine; it is a hook at the one seam that already exists.
+
+** B4 · Datalog find-specs and builtins — `:find [?x .]` scalar **64**/29 files, `[?x ...]` collection **64**/29, `:keys` **259**, `:syms` 2, `(pull ?e pat)` in find 3, `get-else` **25**, `missing?` 6, `:with` 9, `:limit` 1, nested `(q …)` 2 (`invariant.cljc`)
+Datom today: `parse.bl:455-470` rejects any find element that is not a variable or a call (`:unsupported-find-element`); `:keys`/`:syms` absent; `:with` is recognised as a section keyword (`parse.bl:159-161`) but **silently dropped** (`parse.bl:163-192`) — a real correctness hole for aggregates independent of kontor; `get-else`/`missing?`/`ground`/`tuple` absent; predicates resolve by `BeamLisp.Env/fetch` in the *querying* namespace (`engine.bl:568-581`); `q` returns a SET of tuples (`engine.bl:650`).
+Addition (all in datom's query layer, as first-class syntax, since they are Datomic-standard not datahike-specific):
+- find-specs: `[?x .]` → scalar, `[[?x …]]`/`[?x ...]` → collection (vector), `[[?a ?b]]` → single tuple, relation (today's set). Parse in `parse.bl` into `:find-kind`; post-process in `engine/q` after aggregation. `:keys`/`:syms`/`:strs` → map each tuple. `:with` → carried into grouping so aggregates count duplicates (fixes the hole).
+- `(pull ?e pattern)` in find → post-projection through `pull.bl` per row (no engine change).
+- builtins as datom **query functions**, registered in a `datom.query.builtins` ns that `ns-resolve` consults before the caller's ns: `get-else $ ?e ?a default` (needs db access → the engine passes `$` as the bound source), `missing? $ ?e ?a`, `ground`, `tuple`, `untuple`, `identity`. `get-else` is the one that needs engine cooperation (it reads the db inside a function clause — engine `eval-expr` (`engine.bl:200-244`) must expose the source binding).
+- `:limit`/`:offset` → post-process (1 site).
+- nested `(q …)` in a predicate: already works if `q` is resolvable in the querying ns (it is `datom/q`); the shim's `datahike.api/q` is that fn. Verify the 2 sites in W0.
+- `$before`/`$after` multiple sources (2+2 sites in kontor): `parse.bl:222-262` accepts only `$` — add named sources (`:in $a $b`, pattern clauses `[$a ?e …]`). Small.
+Cost: ~3 days; largest test surface (kontor's 204 `q` sites become the conformance corpus via the JVM oracle: same query, same tx-data, datahike vs datom, compare result sets).
+
+** B5 · `:db.type/tuple` + `:db/tupleAttrs` — 21 attrs (composite uniqueness keys, e.g. `[:posting/tx :posting/seq]`)
+Datom today: absent (searched). Kontor uses them for `:db.unique/identity` on composite keys.
+Addition: `:db/tupleAttrs [a b c]` on an attr of `:db.type/vector` (exists: `schema.bl:66-93`) — the **writer** derives the tuple value from the entity's component attrs after realize (Datomic's semantics: `nil` slots for missing components), re-runs uniqueness on it. Implemented in `tx.bl` realize as a "derived attrs" pass; codec: vector lane already exists. Shim: `:db.type/tuple` → `:db.type/vector` + keep `:db/tupleAttrs`.
+Cost: ~1–2 days. Pure writer + schema validation; no query change.
+
+** B6 · lifecycle & misc — `delete-database` 0 in src (tests likely), `branch!` 1, `:db/purge*` 6, `:db.fn/call` 6, `:db.fn/retractEntity` 5, `:db.fn/cas` 1, `:db.fn/retractAttribute` 2, string tempids (`"datomic.tx"` 3, `"count"` 1), lookup refs in entity position (0 in src, but `[:db/add [:a v] …]` is idiomatic — verify tests)
+- `branch!`: kontor uses `(d/connect (assoc cfg :branch kw))` for **speculative what-if books**. Datom has `with` over a `store-overlay` (`conn.bl:786`) — a *branch* is a long-lived overlay store with a name: `datom/branch! conn name` → `connect-with (store-overlay base)` registered under `name`; reads see base+overlay, writes go to overlay; never merged back (kontor never merges). ~1 day.
+- `:db/purge` / `:db.fn/retractEntity`: datom has `:db/retractEntity` (`tx.bl:200-233`); purge = excision, absent ("does not exist yet", `datom.bl:332`). Kontor's 6 purge sites — read them in W0; if they are GDPR-erasure paths, they are a datom feature (excision) not a shim; if test-only, defer.
+- `:db.fn/call f args` → datom `[:db/fn f args]` (`tx.bl:150-199`) — shim rewrites the op keyword. `:db.fn/cas` → `:db/cas` (exists, `tx.bl:234`). `:db.fn/retractAttribute` → expand to retracts of current values (shim, via `entity`).
+- string tempids: datom accepts negative ints only (`tx.bl:281`). Shim assigns `-1, -2…` per distinct string in a tx and maps `:tempids` back to the strings in the report. `"datomic.tx"` → `:db/current-tx`. Pure shim.
+- lookup refs in entity position: rejected by datom (`tx.bl:719-740` `:lookup-ref-in-entity-position`) — deliberate. Shim resolves `[attr v]` to an eid via `datom/lookup-ref` **before** transact. Pure shim, but it races the writer (resolve-then-write); acceptable for kontor (single writer per book) — document.
+- `datahike.query/*disable-planner*`: kontor binds it to work around a datahike planner bug (`invariant.cljc:296-298`). Shim defines the var as a no-op dynamic; nothing to project.
+- Datom accessors `.-e .-a .-v .-tx`: PLAN-114 `.-` rows → `datom/datom-e …` (`datom.bl:744-749`).
+
+** B7 · `:db/txInstant` (9 sites) and instants
+Datom writes `:db/txInstant` as integer ms (`schema.bl:110-146`) ✓. Kontor compares them to `java.util.Date` values — which PLAN-114 makes integers too. `#inst` reads to integer ms. ∴ no adapter; **the choice to make Date = integer in PLAN-114 is what keeps this free**.
+
+* Part C — what this does to datom itself (the honest ledger)
+
+| change | kind | risk to the one-engine rule | reversible? |
+|---|---|---|---|
+| `:db.type/decimal` + DEC codec lane | new value type | none | yes (lane unused if no schema uses it) |
+| `:db/valid` tx attr + `valid-at`/`valid-between` filter in `db/datoms` | **read-path semantics** | the one real risk: every reader (q, pull, entity, datoms, watch T1/T2) must go through the filtered path — audit `watch.bl` T1 unify (matches raw tx datoms, not db reads) and the native rules kernel (`rules.bl` native dispatch reads base relations from bl — confirm they come from `db/datoms`) | yes, additive |
+| `guard!` writer predicates | new hook at existing seam | none | yes |
+| find-specs, `:keys`, `:with` fix, builtins, named sources | query syntax | none if parse/engine only; `get-else` needs `$` exposure in `eval-expr` | yes |
+| `:db/tupleAttrs` derived values | writer pass | none | yes |
+| `branch!` named overlays | registry | none | yes |
+| excision (`purge`) | **storage semantics** — history is the record | high; out of this plan unless W0 shows kontor's purge is load-bearing | — |
+
+* Part D — the shim namespace itself (`priv/compat/datahike/api.bl`, plus `datahike/tx_preds.bl`, `datahike/query.bl` for the two internals)
+~150 lines: cfg→store, string-tempid mapping, lookup-ref pre-resolution, op-keyword rewrites, report key rename, `:db.type/bigdec`/`tuple` schema rewrites, `valid/from+to` → Interval. **Nothing else.** Every fn is `(defn q [& args] (apply datom/q args))`-thin or a data rewrite; if a shim fn grows a loop over datoms, it is in the wrong layer.
+
+* Steps
+
+W0 · Read the ambiguous sites: 1 `history`, 4 `schema`, 6 purge, 2 nested-q, `$before/$after`, the 24 `entity` uses; rescan kontor's 397 test files for the api surface (tests are the conformance corpus). Write the datahike-vs-datom differential harness: the JVM oracle runs kontor's own test namespaces (`clojure -M:test`), beam-lisp runs the same; compare per-assertion.
+W1 · Part A shim + B6 pure-shim items. Acceptance: the 43 `datahike.api` namespaces LOAD (they will fail at *call* time on B1–B5 features; loading is the gate).
+W2 · B3 `guard!` + B5 tupleAttrs + B1 decimal type (needs PLAN-114 W2). Acceptance: `kontor.governance` governs a datom conn; a composite-key upsert dedups; a posting amount round-trips as Decimal through AVET ordered.
+W3 · B4 query layer. Acceptance: kontor's `q` corpus differential green; `:with` aggregate bug covered by a datom test independent of kontor.
+W4 · B2 valid time. Acceptance: kontor's bitemporal test namespace green under the differential; datom's own `bitemporal_test.bl` covers `valid-at` through q/pull/entity/datoms/watch; a `close-validity!` violating `vf < vt` is refused in the writer.
+W5 · B6 `branch!`; purge decision from W0. Acceptance: slice 4 — a journal transacted through the shim, trial balance via `q`, cent-exact vs JVM.
+
+* Not verified
+- That kontor's `entity` uses never navigate refs (0 `touch` found; the 24 sites are unread).
+- The 6 purge sites' role (W0 decides excision in/out).
+- Whether the native rules kernel's base relations pass through `db/datoms` (if not, `valid-at` would be invisible to recursive rules — audit in W4 before, not after).
+- kontor test files were NOT scanned for api/schema surface; src only.
+- Performance of the per-tx `:db/valid` lookup on large books (W4 measures on kontor's own fixtures).

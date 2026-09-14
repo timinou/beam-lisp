@@ -96,7 +96,12 @@ defmodule BeamLisp.ReloadWatcher do
       # at once).
       apply: Keyword.get(opts, :apply, &apply_change/3),
       event_count: 0,
-      last: :idle
+      last: :idle,
+      # Debounce state: paths with an unflushed event, and the armed flush
+      # timer (nil when quiet). See `defer/2`.
+      pending: %{},
+      flush_timer: nil,
+      quiet_ms: Keyword.get(opts, :quiet_ms, 50)
     }
 
     {:ok, state}
@@ -105,27 +110,56 @@ defmodule BeamLisp.ReloadWatcher do
   @impl true
   def handle_call(:event_count, _from, state), do: {:reply, state.event_count, state}
 
-  # `:drain` is a no-op barrier: because file events are handled synchronously in
-  # this GenServer's mailbox, by the time a `:drain` call is processed every event
-  # ahead of it has already run. Returning `state.last` reports the settled image.
-  def handle_call(:drain, _from, state), do: {:reply, state.last, state}
+  # `:drain` is a barrier: flush whatever the quiet window is still holding,
+  # then answer — because file events and the flush are handled synchronously
+  # in this GenServer's mailbox, by the time a `:drain` call is processed every
+  # event ahead of it has already run. Returning `state.last` reports the
+  # settled image.
+  def handle_call(:drain, _from, state) do
+    state = flush(state)
+    {:reply, state.last, state}
+  end
 
   @impl true
   def handle_info({:file_event, fs, {path, _events}}, %{fs: fs} = state) do
     state = %{state | event_count: state.event_count + 1}
 
-    if watches?(path) and File.regular?(path) do
-      {:noreply, handle_bl_change(path, state)}
+    if watches?(path) do
+      {:noreply, defer(path, state)}
     else
       {:noreply, state}
     end
   end
+
+  def handle_info(:flush_pending, state), do: {:noreply, flush(state)}
 
   def handle_info({:file_event, fs, :stop}, %{fs: fs} = state) do
     {:noreply, state}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # One save is many inotify events (create + write + attrib + close, more
+  # under an editor's write-tmp/rename dance), and applying each one used to
+  # run the full stage→commit per event: a single save committed the SAME
+  # bundle 13 times on the reference host (blueprint FUP-020), and an event
+  # landing between an editor's truncate and its write staged PARTIAL content
+  # ("source declares no (ns …)"). So events only arm a flush; the flush runs
+  # once the path has been quiet for `quiet_ms`, applying each path ONCE from
+  # its settled on-disk state.
+  defp defer(path, state) do
+    state = %{state | pending: Map.put(state.pending, path, true)}
+
+    case state.flush_timer do
+      nil ->
+        %{state | flush_timer: Process.send_after(self(), :flush_pending, state.quiet_ms)}
+
+      _timer ->
+        # A flush is already armed; it reads the whole pending set when it
+        # fires, so re-arming would only split one save across two flushes.
+        state
+    end
+  end
 
   @impl true
   def terminate(_reason, state) do
@@ -142,14 +176,46 @@ defmodule BeamLisp.ReloadWatcher do
     :ok
   end
 
+  # Apply every quieted path ONCE, from its settled on-disk state. A path
+  # that no longer exists was DELETED: staging would read nothing (or crash
+  # File.read!), so it is reported as `:removed` — the namespace stays loaded
+  # (no unload facility exists yet), but the watch log says what happened
+  # instead of printing a stage error for a file that is simply gone.
+  defp flush(state) do
+    paths = state.pending
+    state = %{state | pending: %{}, flush_timer: nil}
+
+    Enum.reduce(paths, state, fn {path, _}, acc ->
+      if File.regular?(path) do
+        handle_bl_change(path, acc)
+      else
+        notify(%{status: :removed, applied: [], errors: []}, path, acc)
+      end
+    end)
+  end
+
+  # Every result — applied, held, error, :removed — reaches the subscriber
+  # channel through here: tagged with the saved path, normalized to a map (a
+  # raised stage/commit comes back as the apply fun's {:error, msg}), so a
+  # renderer always has ONE shape.
+  defp notify(result, path, state) do
+    tagged =
+      case result do
+        %{} = m -> Map.put_new(m, :path, path)
+        other -> %{path: path, status: :error, errors: [%{kind: :error, msg: inspect(other)}]}
+      end
+
+    if state.on_result, do: state.on_result.(tagged)
+    %{state | last: tagged}
+  end
+
   # Stage the changed file into the reload bundle and (optionally) commit. The
   # bl-side `reload/stage` reads the ns from the source's `(ns …)`; a commit runs
   # the static coherence pass and either applies the edit or holds it with the
   # old code serving — exactly the reconcile-loop contract, driven by a save.
   defp handle_bl_change(path, state) do
     result = state.apply.(file_source(path), path, state.auto_commit)
-    if state.on_result, do: state.on_result.(result)
-    %{state | last: result}
+    notify(result, path, state)
   end
 
   # Which file events the watcher reacts to: plain `.bl` sources and the two

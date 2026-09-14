@@ -102,30 +102,30 @@ engine they jointly support is what answers.
 
 ;; exists = the MOCK — z3 solves it, the model IS the value
 (v/exists port "temp" (v/int-of -90 60) '(> temp 50))
-;; → {:modality :proven :engine :z3 :witness 51}
+;; → {:modality :proven :engine :oracle :witness 51}
 
 ;; a structured token, from the String theory
 (v/exists port "tok" (v/string-of "sk_" 8 16) '(str-prefix? "sk_" tok))
-;; → {:modality :proven :engine :z3 :witness "sk_ABCED"}
+;; → {:modality :proven :engine :oracle :witness "sk_ABCED"}
 
 ;; an ENUM datatype: the tags ARE the domain — and a payload arm synthesizes
 (v/for-all port "phase" (v/enum-of :pending :running :done)
            '(not (= phase :running)))
-;; → {:modality :refuted :engine :z3 :witness :running}   ; a REAL bl keyword back
+;; → {:modality :refuted :engine :oracle :witness :running}   ; a REAL bl keyword back
 
 (v/exists port "mode" (v/enum-of [:on :int] :off) '(some? (:on mode)))
-;; → {:modality :proven :engine :z3 :witness {:on 2}}     ; z3 built the record
+;; → {:modality :proven :engine :oracle :witness {:on 2}}     ; z3 built the record
 
 ;; a COLLECTION: the bl rung binds vectors, the z3 rung its LENGTH (c_len)
 (v/for-all port "c" (v/coll-of 0 5) '(<= (count c) 5))
-;; → {:modality :proven :engine :z3}                      ; over EVERY vector
+;; → {:modality :proven :engine :oracle}                      ; over EVERY vector
 
 ;; for-all = the PROPERTY TEST — a real ∀ proof when linear
 (v/for-all port "n" (v/int-of 0 100) '(>= n 0))
-;; → {:modality :proven :engine :z3}
+;; → {:modality :proven :engine :oracle}
 
 (v/for-all port "n" (v/int-of 0 100) '(< n 50))
-;; → {:modality :refuted :engine :z3 :witness 50}
+;; → {:modality :refuted :engine :oracle :witness 50}
 
 ;; covers = the COVERAGE LINT — the "spec" is the function's own guards
 (def classify "(defn classify ([n] :when (pos? n) :p) ([n] :when (neg? n) :neg))")

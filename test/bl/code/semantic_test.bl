@@ -1,0 +1,361 @@
+; test/bl/code/semantic_test.bl — the code-as-facts embedding column.
+; Run: mix bl test test/bl/code/semantic_test.bl
+;
+; ── What must hold ────────────────────────────────────────────────────
+;
+; 1. A function's DOCUMENT is its own source: the slice ends at the next
+;    top-level form and drops that form's section heading, so one function
+;    never carries a neighbour's prose into its vector.
+; 2. Two files indexed into ONE conn do not collide. `codebase/index-source`
+;    numbers entities from a fixed base, so without the per-file band the
+;    second file silently overwrites the first — same ids, half the corpus.
+; 3. Search ranks by MEANING. The fixtures are deliberately from two domains
+;    (index persistence, sourdough) so a keyword overlap cannot fake it.
+; 4. `search-in` finds the k nearest WITHIN a candidate set, and
+;    `search-returning` joins the tag fact by NAME — the ret-tag entity is
+;    not the entity that carries the embedding.
+; 5. Re-indexing an unchanged file changes nothing: embeddings are a pure
+;    function of source bytes, so the datoms are identical and no re-assert
+;    happens.
+;
+; Every test that needs the model is guarded: a checkout without
+; `mix bl.embed.fetch` reads them as PASSING vacuously, the same way
+; the durable-store tests treat an absent fjall backend.
+
+(ns code.semantic.test
+  (:require [code.embed] [code.semantic] [datom] [datom.vector]
+            [datom.store-fjall]))
+
+;; A cache test owns its cache. Without this the suite would write its stores
+;; into whatever store the CHECKOUT has — the tests would share state
+;; with each other and with the developer's own runs.
+(def store-root
+  (str (System/tmp_dir!) "/semantic_test_" (erlang/unique_integer (list :positive))))
+(System/put_env "BLANALYSIS_DIR" store-root)
+
+;; ── the fixture: two namespaces, two subjects ─────────────────────────
+
+(def SRC-A
+  (str "(ns fix.embeddings)\n"
+       "\n"
+       ";; ── persistence ───────────────────────────────────────────\n"
+       "\n"
+       "(defn save-index\n"
+       "  \"Persist an embedding index to disk so the next run reloads it\n"
+       "   instead of re-embedding every function from scratch.\"\n"
+       "  [index path]\n"
+       "  (File/write! path index))\n"
+       "\n"
+       "(defn ^{:ret string} describe-index\n"
+       "  \"A one-line description of what an index holds.\"\n"
+       "  [index]\n"
+       "  \"index\")\n"))
+
+(def SRC-B
+  (str "(ns fix.kitchen)\n"
+       "\n"
+       "(defn bake-sourdough\n"
+       "  \"Fold the dough, let it rest, and bake it in a very hot oven\n"
+       "   until the crust is dark and the crumb is open.\"\n"
+       "  [dough]\n"
+       "  dough)\n"
+       "\n"
+       "(defn ^{:ret string} name-the-loaf\n"
+       "  \"A name for the loaf, carved on the crust before baking.\"\n"
+       "  [flour]\n"
+       "  \"loaf\")\n"))
+
+(defn- scratch []
+  (str (System/tmp_dir!) "/code_semantic_test_"
+       (erlang/unique_integer (to-list [:positive]))))
+
+(defn- fixture!
+  "Write the two sources into a scratch dir; returns `{:dir :a :b}`."
+  []
+  (let [dir (scratch)
+        a (str dir "/a.bl")
+        b (str dir "/b.bl")]
+    (File/mkdir_p! dir)
+    (File/write! a SRC-A)
+    (File/write! b SRC-B)
+    {:dir dir :a a :b b}))
+
+(defn- fixture-conn!
+  "A conn with both fixtures indexed. Returns `[conn f]`."
+  []
+  (let [f (fixture!)
+        conn (code.semantic/connect)]
+    (code.semantic/index! conn [["fix.embeddings" (:a f)]
+                                ["fix.kitchen" (:b f)]])
+    [conn f]))
+
+;; ── the document ──────────────────────────────────────────────────────
+
+(deftest a-source-the-analyzer-cannot-read-is-reported-by-name
+  ; `index!` must survive one unreadable file AND say which one: a reason on
+  ; its own names the problem but not the file, so the caller cannot tell a
+  ; corpus-wide failure from one bad path. The CLI prints exactly this pair.
+  (let [f (fixture!)
+        bad (str (:dir f) "/broken.bl")]
+    (File/write! bad "(ns fix.broken)\n\n(defn oops [x] (+ x 1)\n")
+    (let [r (code.semantic/index! (code.semantic/connect) [["fix.broken" bad]])]
+      (is (= 1 (count r)) "one result per source, skipped or not")
+      (is (= bad (:file (first r))) "the path is in the result, not just the reason")
+      (is (string? (:skipped (first r))) "and the reason is a string to print")
+      (is (nil? (:functions (first r))) "a skipped source indexed nothing"))))
+
+(deftest document-is-the-qualified-name-then-the-source
+  (is (= "a.b/thing\nSOURCE"
+         (code.semantic/document "a.b" "thing" "SOURCE"))))
+
+(deftest slice-stops-at-the-next-form
+  ; The slice for `save-index` ends at `describe-index` — so it contains its
+  ; own docstring and NOT the section heading that introduces the next form,
+  ; which is what keeps one function's vector from describing its neighbour.
+  (let [lines (code.semantic/source-lines SRC-A)
+        starts (code.semantic/form-starts SRC-A)
+        slice (code.semantic/slice-text lines starts (get starts 1))]
+    ; the file reads: (ns …) / blank / section comment / blank / (defn save-index
+    (is (= 5 (get starts 1)))
+    (is (= 3 (count starts)))
+    (is (includes? slice "(defn save-index"))
+    (is (includes? slice "re-embedding every function"))
+    (is (not (includes? slice "describe-index")))
+    (is (not (includes? slice "persistence")))       ; the NEXT form's heading
+    (is (not (includes? slice "bake-sourdough")))))
+
+(deftest form-starts-lists-every-top-level-form
+  (let [starts (code.semantic/form-starts SRC-A)]
+    (is (= 1 (get starts 0)))                        ; the ns form
+    (is (= 3 (count starts)))))                      ; ns, save-index, describe-index
+
+(deftest documents-one-per-function
+  (let [docs (code.semantic/documents "fix.embeddings" SRC-A)]
+    (is (= 2 (count docs)))
+    (is (= ["save-index" "describe-index"]
+           (mapv (fn [d] (:name d)) docs)))
+    (is (= "fix.embeddings" (:ns (get docs 0))))))
+
+(deftest ns-of-file-reads-the-declaration
+  (let [f (fixture!)]
+    (is (= "fix.embeddings" (code.semantic/ns-of-file (:a f))))
+    (is (= "fix.kitchen" (code.semantic/ns-of-file (:b f))))
+    ; a path that is not there still yields a usable NAME rather than nil:
+    ; `:fn/ns` is a string column, and nil is rejected by the schema.
+    (is (= "nothing.bl" (code.semantic/ns-of-file (str (:dir f) "/nothing.bl"))))))
+
+(deftest id-bands-are-disjoint
+  (is (not= (code.semantic/offset-for 0) (code.semantic/offset-for 1)))
+  (is (< (code.semantic/offset-for 0) (code.semantic/offset-for 1))))
+
+;; ── indexing and search (need the model) ──────────────────────────────
+
+(deftest both-files-survive-one-conn
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          stats (code.semantic/stats (datom/db conn))]
+      ; FOUR functions, not two: the second file did not overwrite the first.
+      (is (= 4 (get stats :functions)))
+      (is (= 4 (get stats :embedded)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-ranks-by-meaning
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          hits (code.semantic/search-text db "persist an index to disk" 3)]
+      (is (= "save-index" (:name (get hits 0))))
+      (is (> (:score (get hits 0)) (:score (get hits 1))))
+      ; and the other subject does not win its own question, either
+      (let [cake (code.semantic/search-text db "bake bread in a hot oven" 3)]
+        (is (= "bake-sourdough" (:name (get cake 0)))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest results-descend-by-score
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          hits (code.semantic/search-text (datom/db conn) "index" 4)]
+      (is (= 4 (count hits)))
+      (is (>= (:score (get hits 0)) (:score (get hits 1))))
+      (is (>= (:score (get hits 1)) (:score (get hits 2))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-in-restricts-to-a-namespace
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          q (code.embed/embed "persist an index to disk")
+          everywhere (code.semantic/search db q 4)
+          kitchen (code.semantic/search-in-ns db q "fix.kitchen" 4)]
+      ; globally `save-index` wins…
+      (is (= "save-index" (:name (get everywhere 0))))
+      ; …and within the kitchen namespace it is not a candidate at all.
+      (is (= 2 (count kitchen)))
+      (is (every? (fn [r] (= "fix.kitchen" (:ns r))) kitchen))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest search-returning-joins-the-tag-by-name
+  ; The tag fact lives on a DIFFERENT entity than the embedding: joining on
+  ; id would find nothing, and an empty candidate set looks exactly like an
+  ; empty answer.
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db (datom/db conn)
+          hits (code.semantic/search-returning db (code.embed/embed "index") "string" 4)]
+      ; BOTH string-returning functions, and only those: `describe-index`
+      ; (source A) and `name-the-loaf` (source B) — the join is by name.
+      (is (= #{"describe-index" "name-the-loaf"} (set (mapv :name hits))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+;; ── the column: a warm file costs no reader and no model ──────────────
+
+(deftest a-second-index-comes-back-out-of-the-store
+  ;; Facts and vectors are ONE store, keyed by the source's bytes. A second
+  ;; index of an unchanged file must therefore report the COLUMN as cached: it
+  ;; did not re-run the reader, and did not call the model.
+  (if (and (code.embed/available?) (datom.store-fjall/available?))
+    (let [f (fixture!)
+          ; A source nothing else in this RUN has indexed. The store is keyed by
+          ; the bytes, so a fixture shared with another test is already warm —
+          ; and then "the first run analyzes" is false for a reason that has
+          ; nothing to do with this test.
+          path (str (:dir f) "/store.bl")]
+      (File/write! path (str "(ns fix.store)\n"
+                             "(defn store-probe-"
+                             (erlang/unique_integer (list :positive))
+                             " [x] x)\n"))
+      (let [conn1 (code.semantic/connect)
+            r1 (code.semantic/index! conn1 [["fix.store" path]])
+            v1 (code.semantic/embeddings (datom/db conn1))
+            conn2 (code.semantic/connect)
+            r2 (code.semantic/index! conn2 [["fix.store" path]] {:memo false})
+            v2 (code.semantic/embeddings (datom/db conn2))]
+        (is (= :indexed (:analysis (first r1))) "the first run analyzes")
+        (is (= :filled (:vectors (first r1))) "and fills the column")
+        (is (= :cached (:analysis (first r2))) "the second run reopens the store")
+        (is (= :cached (:vectors (first r2))) "vectors and all: nothing recomputed")
+        (is (= v1 v2) "and they are the same vectors, byte for byte"))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest a-warm-column-needs-no-model
+  ;; The sharpest statement of what caching the vector means: with the column
+  ;; already in the store, the model is not consulted AT ALL. Point the model
+  ;; directory somewhere empty and index again — the vectors still come back,
+  ;; because they were never the model's to give this time.
+  (if (and (code.embed/available?) (datom.store-fjall/available?))
+    (let [f (fixture!)
+          saved (System/get_env "BEAM_LISP_MODEL_DIR")
+          path (str (:dir f) "/warm.bl")
+          src (str "(ns fix.warm)\n"
+                   "(defn warm-probe-" (erlang/unique_integer (list :positive)) " [x] x)\n")]
+      (File/write! path src)
+      (let [c (code.semantic/connect)
+            cold-r (code.semantic/index! c [["fix.warm" path]])
+            cold (code.semantic/embeddings (datom/db c))]
+        ; Say WHAT the index said when this fails: an index that skipped the
+        ; file reports the reason, and a bare nil says nothing.
+        (is (= :filled (:vectors (first cold-r))) (str "cold: " (pr-str cold-r)))
+        ; Disable the model WITHOUT changing what the model IS. Moving the
+        ; directory alone would be a different question — the id comes from the
+        ; digest, so an empty directory is a DIFFERENT MODEL, and re-embedding
+        ; would be the right answer. Same digest, no weights: identity intact,
+        ; model unusable, and a fill would now fail loudly.
+        (let [id (code.embed/model-id)
+              fake (str (:dir f) "/no-weights")]
+          (File/mkdir_p! (str fake "/" code.embed/MODEL))
+          (File/write! (str fake "/" code.embed/MODEL "/DIGEST")
+                       (subs id (- (count id) 8)))
+          (System/put_env "BEAM_LISP_MODEL_DIR" fake)
+          (try
+            (let [conn (code.semantic/connect)
+                  r (code.semantic/index! conn [["fix.warm" path]])
+                  warm (code.semantic/embeddings (datom/db conn))]
+              (is (= :cached (:vectors (first r))) (str "warm: " (pr-str r)))
+              (is (= (count cold) (count warm)) "and the same vectors came back")
+              (is (pos? (count warm)) "not a vacuous comparison"))
+            (finally
+            (if (nil? saved)
+              (System/delete_env "BEAM_LISP_MODEL_DIR")
+              (System/put_env "BEAM_LISP_MODEL_DIR" saved))
+            (File/rm_rf (:dir f)))))))
+    (is true)))
+
+(deftest re-indexing-an-unchanged-file-changes-nothing
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          before (code.semantic/embeddings (datom/db conn))]
+      (code.semantic/index! conn [["fix.embeddings" (:a f)]])
+      (is (= before (code.semantic/embeddings (datom/db conn))))
+      ; and a band that SHIFTED would duplicate rather than overwrite
+      (is (= 4 (count before)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest similar-excludes-the-function-itself
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          hits (code.semantic/similar (datom/db conn) "save-index" 3)]
+      (is (not (some (fn [r] (= "save-index" (:name r))) hits)))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest a-second-band-duplicates-rather-than-overwrites
+  ; This is WHY `offset-for` exists and is public. Re-indexing a source in a
+  ; DIFFERENT band does not overwrite its embeddings — ids are identity — so
+  ; the stored vectors and call facts double, and nothing errors.
+  ;
+  ; The assertions record the part that surprised me: the DAMAGE is invisible
+  ; in the answers. `stats` counts distinct names and a query projects fields
+  ; the two copies share, so both absorb the duplicate. Only the counts of what
+  ; is STORED move — which is why the band has to be got right by construction
+  ; rather than noticed in a result.
+  (if (code.embed/available?)
+    (let [[conn f] (fixture-conn!)
+          db0 (datom/db conn)
+          before-calls (get (code.semantic/stats db0) :calls)]
+      (is (= 4 (count (code.semantic/embeddings db0))))
+      (code.semantic/index-source! conn "fix.embeddings" (:a f) 5000000)
+      (let [db (datom/db conn)
+            stats (code.semantic/stats db)]
+        ; stored: doubled
+        (is (= 6 (count (code.semantic/embeddings db))))
+        (is (> (get stats :calls) before-calls))
+        ; reported: unchanged, because both count distinct names
+        (is (= 4 (get stats :functions)))
+        (is (= 4 (get stats :embedded)))
+        ; answered: unchanged, because the projection collapses the copies
+        (is (= 1 (count (filterv (fn [r] (= "save-index" (:name r)))
+                                  (code.semantic/search-text db "persist an index to disk" 4))))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+(deftest index-dir-takes-each-namespace-from-its-file
+  (if (code.embed/available?)
+    (let [f (fixture!)
+          conn (code.semantic/connect)
+          indexed (code.semantic/index-dir! conn (:dir f))]
+      (is (= 2 (count indexed)))
+      ; a GLOB walks the tree, so this is where a mistyped or missing `(ns …)`
+      ; would surface as a nil ns and a schema rejection.
+      (is (= 4 (get (code.semantic/stats (datom/db conn)) :functions)))
+      (is (= #{"fix.embeddings" "fix.kitchen"}
+             (set (mapv (fn [r] (get r 0))
+                        (into [] (datom/q '[:find ?ns :where [?e :fn/ns ?ns]]
+                                          (datom/db conn)))))))
+      (File/rm_rf (:dir f)))
+    (is true)))
+
+;; ── the optionality contract ──────────────────────────────────────────
+
+(deftest absence-is-reportable-never-a-crash
+  ; Whatever the state of this machine, asking is safe and named.
+  (let [info (code.embed/info)]
+    (is (= "potion-code-16M-v2" (:model info)))
+    (is (= 256 (:dim info)))
+    (is (or (= true (:available info)) (some? (:why info))))))

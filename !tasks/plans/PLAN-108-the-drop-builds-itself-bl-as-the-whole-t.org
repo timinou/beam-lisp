@@ -1,0 +1,1768 @@
+#+TITLE: The drop builds itself: bl as the whole toolchain (design)
+#+STATE: DOING
+#+SESSION_ID: 157cf18f91d54263
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-12T17-01-15-721Z_157cf18f91d54263.jsonl]]
+#+CUSTOM_ID: PLAN-108-the-drop-builds-itself-bl-as-the-whole-t
+
+* Initial Message
+
+the dependence on mix is very annoying. I want to get rid of it, especially for build locks and it seems like the cold start is a problem too. how much dependence are we talking about? the goal is that the shipped .bl can do everything mix is needed for today (env.bl is how we configure our own thing, which I'm guessing is an extension of drop? accessible from the shipped binary though)
+
+* Initial message
+
+The user chose option C from PLAN-107 (the drop rebuilds itself) and framed the
+end state: the `bl` binary talks to hex directly, uses libraries internally only
+where that makes sense, and does not inherit Mix's assumptions about the build
+process. Design this fully before prototyping, on a separate worktree.
+
+* Thesis
+
+Mix is not replaced. It is outgrown — because its assumptions are not
+beam-lisp's, and beam-lisp already has a model that answers every one of them.
+
+Mix assumes: a project is a Mix project; a dependency is a hex package in
+`deps/` locked by `mix.lock`; an app is a `.app` resource whose `applications`
+closure is the release; "compile" is a list of `Mix.compilers()`; an environment
+(`MIX_ENV`) selects a build directory; the artifact is an escript, a release, or
+a running task. Every one of those is a decision Mix makes FOR you, and none is
+required by the language.
+
+beam-lisp already has: a project file that is a value (env.bl); a build that is
+a program over a graph (build.bl, build-plan.bl); a namespace as the compile
+unit; content-addressed freshness (keys, not mtimes); ERTS as the only
+irreducible binary and Core Erlang → BEAM as the only irreducible compile step;
+and a session that hosts execution (the daemon).
+
+So the design states beam-lisp's own model and lets each Mix concern fall to a
+named value in it:
+
+| Mix's assumption | beam-lisp's answer |
+|---|---|
+| `mix.exs` project / application / deps / releases | env.bl keys `:app` `:build` `:release` `:deps` |
+| `deps/` + `mix.lock` | a LIBRARY STORE (content-addressed) + a lock value |
+| `_build/<env>/` | a content-addressed output store + a manifest projection |
+| `Mix.compilers()` | a PIPELINE of stages, each a function over values |
+| `.app` generated from `application/0` | the `.app` assembled from the app value |
+| release = `applications` closure | an ASSEMBLY — a declared library set + the project + ERTS |
+| `MIX_ENV` | a coordinate: the tree + the target |
+| `mix release` | `bl release` (a value → a tree) |
+| `mix bl.build` + `drop pack` (Rust) | `bl pack` (the drop is a value) |
+| `mix test` | `bl test` (.bl) and `bl test --ex` (ExUnit, shipped) |
+| `Mix.Sync.Lock` on `_build` | one BUILD SESSION per tree (a process); no file lock |
+| `mix deps.get` | `bl deps` — the hex protocol, spoken by the language |
+
+* The model: six values and one process
+
+Everything below is one idea repeated: a build is a function of values, and
+every input and output is a value you can read, query, verify and store.
+
+** 1. The project (env.bl)
+
+env.bl is already the project as a value (`:name` `:paths` `:tasks` `:ports`
+`:env`), evaluated in its own fork, found by walking up, degrading on shape
+error. It grows four keys — the four things `mix.exs` does today:
+
+    {:name "beam-lisp"
+     :paths ["examples" "priv/lib"]
+     ;; what this project IS as an OTP application
+     :app    {:mod BeamLisp.Application
+              :applications [:kernel :stdlib :elixir :logger :ssh]
+              :vsn "0.1.0"}
+     ;; what gets built, and how freshness is keyed
+     :build  {:sources [{:tier :boot   :root "priv/boot"}
+                        {:tier :std    :root "priv/std"}
+                        {:tier :lib    :root "priv/lib"}
+                        {:tier :compat :root "priv/compat"}
+                        {:tier :build  :root "priv/build"}
+                        {:tier :ex     :root "lib" :exclude ["lib/dev" "lib/mix"]}]
+              :codegen ["compiler" "reader" "reader-node" "core" "sugar"
+                        "data-readers" "anf" "lower"]   ; declared, graph-verified
+              :ambient ["core" "sugar" "data-readers"]}
+     ;; how an artifact is assembled
+     :release {:name "bl" :erts :reuse
+               :include [:ex_unit]
+               :templates "priv/release"}
+     ;; what libraries this project needs, pinned
+     :deps   [{:name "bandit" :vsn "1.12.4" :sha "10bbab…" :source :hex}
+              {:name "explorer" :vsn "0.12.0" :sha "…" :source :hex}]}
+
+Two rules carry over from `bl.env`'s existing contract, unchanged:
+
+- a broken key degrades the build (a bad `:deps` entry is a reported error, and
+  the rest of the project still configures), never stops the command;
+- tooling that cannot afford an eval reads the first literal form as data.
+
+** 2. The library
+
+A library is not an app. It is a value:
+
+    {:name "bandit" :vsn "1.12.4" :sha "10bbab…"
+     :source :hex                      ; :hex | :payload | :path | :git
+     :requires [{:name "plug" :req "~> 1.18"} …]
+     :artifacts {:ebin "…/ebin" :priv "…/priv"}}
+
+Sources:
+
+- `:payload` — the running drop's own `lib/<name>-<vsn>/`. The drop is a
+  library store; a self-build on the same host needs no network at all.
+- `:hex` — fetched, verified, unpacked into the store (see "Hex" below).
+- `:path` — a checkout on disk (the transition path for `deps/`).
+- `:git` — deferred.
+
+The store is content-addressed and shared:
+`$XDG_CACHE_HOME/beam_lisp/lib/<name>-<vsn>-<sha8>/`, written by temp-dir +
+rename (the `AOTCache` pattern), verified by the sha in the lock. Nothing above
+the store inspects a library's source to decide anything — the same rule the
+datom blob store already follows.
+
+** 3. The source graph
+
+Exists (`build-plan/plan`: one post-order traversal answering order, waves and
+per-source key). The maximal additions:
+
+- the plan's result is retained as FACTS, not just a map: `:build/source`,
+  `:build/ns`, `:build/interface`, `:build/key`, `:build/requires`,
+  `:build/closure`, `:build/status`, `:build/beam`, `:build/provenance`;
+- those facts load into a datom conn, so the build's own questions are datalog:
+  "what is stale", "what does changing X rebuild" (the same query shape as
+  `codebase/impact`), "which beams disagree with their stamp";
+- the manifest file becomes a PROJECTION of the log (a cache for cold starts),
+  never a second truth. Today `build.bl` writes the manifest per source; the log
+  makes a resumed build a replay, not a re-derivation.
+
+This is the same move `codebase` already made for calls: the program is facts,
+and a question is a query. The build becomes the first program whose own
+scheduling is queried this way.
+
+** 4. The toolchain: two keys, not one directory glob
+
+The defect this design removes. `BeamLisp.AOTCache.compiler_key/0` hashes
+`priv/boot/**/*.bl` — a DIRECTORY glob. That tier holds the codegen (compiler,
+reader, reader-node, core, sugar, data-readers, anf, lower) AND the build driver
+(build, build-plan, source-graph, ns-interface). The latter four cannot change
+one emitted byte, yet editing one rotates the key, invalidates every beam, and
+forces a full prelude rebuild (~300 beams) while mix holds its build lock.
+Measured: 8 key generations in ~21h.
+
+The design derives the toolchain from the graph instead of the directory:
+
+- the CODEGEN SET is the transitive require-closure of `compiler` and `lower`,
+  plus the ambient set (`core`, `sugar`, `data-readers` — the edge-less names
+  every namespace may use);
+- it is DECLARED AS DATA (`:build :codegen` in env.bl), and the build VERIFIES
+  the declaration against the real graph — a mismatch is a build error naming
+  the difference. One declaration, checked by the graph, reader-free at key
+  time;
+- `toolchain_key` = digest(codegen source contents, codegen module bytes,
+  language/VM versions, backend). Stamps every emitted beam;
+- `build_key` = digest(the build-driver namespaces). Validates the driver's own
+  beams; never invalidates codegen;
+- the manifest records both keys per source.
+
+Effects: editing `build.bl` rebuilds the driver (a handful of beams) and nothing
+else; editing `compiler.bl` invalidates everything (correct); the boot barrier
+(`partition-plan`) becomes "the codegen closure builds serially first" rather
+than "the boot directory builds first" — the rule it always meant, stated as a
+property of the graph.
+
+`priv/build/` — the tier `Tiers`' moduledoc and `mix.exs` both already name but
+which does not exist on disk — becomes real: it is where the driver lives, and
+its existence is what makes the two keys expressible.
+
+** 5. The assembly (a release is a value)
+
+    {:name "bl" :vsn "0.1.0" :erts "17.0.1" :mode :embedded
+     :apps [{:name :kernel :vsn "11.0.1" :type :permanent} …]
+     :consolidated true
+     :config "priv/release/sys.config" :vm_args "priv/release/vm.args"}
+
+`release/assemble` is a function from that value + the filesystem to a tree.
+Every piece is computed; nothing is shelled out:
+
+| piece | how |
+|---|---|
+| `lib/<app>-<vsn>/{ebin,priv}` | project ebin = AOT output + compiled `.ex`; each library from the store |
+| `.app` files | synthesized from the app value (module list scanned from the ebin); libraries keep theirs |
+| `releases/<vsn>/<name>.rel` | written from the app list |
+| `start.script`, `start.boot`, `start_clean.*` | `:systools.make_script/2` + `:systools.script2boot/1` — in `sasl`, shipped |
+| `releases/<vsn>/consolidated/` | `Protocol.extract_protocols/1` + `Protocol.consolidate/2` — in the payload's Elixir |
+| `sys.config`, `vm.args`, `env.sh`, `remote.vm.args`, `elixir`, `iex` | templates under `priv/release/`, parameterized by the value |
+| `bin/<name>` | the release shell script, from the template (the payload's own `bin/bl` is the golden copy) |
+| `erts-<v>/` | reused from the running payload (host target); fetched via `erts.lock` for `--target` |
+| `releases/start_erl.data`, `releases/COOKIE` | written |
+
+Verified before use: the app set is closed (every declared app resolves to a
+library), `:systools` reports no script error, every beam's provenance is
+coherent with the assembly's toolchain key.
+
+** 6. The artifact (a drop is a value)
+
+    drop = launcher ⊕ gzip(tar(release)) ⊕ trailer(56 B)
+
+- LAUNCHER — recovered from `BL_BIN`, which the drop launcher already exports as
+  its own absolute path before exec'ing the release, and which the
+  daemon-start path also sets. The launcher bytes are `[0, payload_offset)` of
+  that file; `payload_offset` is read from the file's own trailer. No launcher
+  change is needed. `--launcher FILE` overrides; with no launcher and no drop
+  (an escript, a `mix bl` run) `bl pack` refuses and `bl release` still produces
+  a tree.
+- TAR — deterministic: entries sorted, mode 0755, mtime 0, uid/gid 0, empty
+  owner names, GNU headers. Reimplemented in `.bl` so `bl pack` and the Rust
+  `drop pack` agree byte-for-byte — a differential test, not a hope.
+- GZIP — `:zlib.gzip/1` (preloaded in ERTS; deterministic, no timestamp).
+  Interop detail to confirm in W0: the argument must be a byte list, not a
+  binary, through the current interop shim.
+- TRAILER — 56 bytes little-endian: offset u64, len u64, sha256 32 B, os u8,
+  arch u8, version u16, magic `DRP1`. A `.bl` codec, pinned against the Rust
+  encoder's golden vectors.
+
+The artifact is then a pure function of (tree, toolchain) → the fixpoint is
+checkable in bytes.
+
+** 7. The session (one process per tree)
+
+Today: mix serializes on a lock file, cargo takes an exclusive lock on its
+target dir, and `bl build` has no lock at all. The design makes the build a JOB
+ON THE TREE'S SESSION:
+
+- `bl build`/`bl release`/`bl self-build` are requests to the tree's daemon; the
+  Executor's single worker is the serialization, and the build fact-log is the
+  observable state (queue depth, current source, wave, errors);
+- a cold, daemonless build claims the tree by a CLAIM FILE (the `Ports` pattern
+  already shipped: a claim is a file, cross-daemon truth, stale claims swept, a
+  second claim refused naming the owner) — not a lock around `_build`;
+- the NIF build becomes a stage with the same treatment: a content-addressed
+  native store keyed by (crate source hash, toolchain), claimed so cargo runs at
+  most once per key per machine.
+
+Cold start is the other half. The daemon already answers in ~300 ms vs ~3.9 s
+cold; the design makes the session the default for build verbs and auto-start
+the default for `bl` (with `BL_DAEMON=off` the documented escape). Cold then
+costs once per tree per toolchain key.
+
+** 8. Compiling the Elixir substrate without mix
+
+The payload ships the Elixir compiler (`Elixir.Code`, `Elixir.Module`,
+`Elixir.Kernel.ParallelCompiler`, `Elixir.Protocol`, `Elixir.Macro`) and NOT
+Mix. So `bl` compiles `lib/**/*.ex` in-process:
+
+- `Kernel.ParallelCompiler.compile_to_path(files, ebin)`;
+- excluded: `lib/dev` (Tidewave, dev-only) and `lib/mix` (the transition shells,
+  deleted at cutover);
+- the Elixir source is Role B (the runtime substrate) — it stays Elixir until a
+  benchmark earns a `.bl` rewrite (FUP-016's rule), and compiling it needs no
+  Mix project, no `_build`, no `MIX_ENV`.
+
+ExUnit is ABSENT from the payload and must be added to the release's app set
+(`:release :include [:ex_unit]`), sourced from the Elixir installation or the
+payload's Elixir lib. `bl test --ex` then runs the ExUnit suite in-process,
+through the one runner, in a fork. Honest note: the ExUnit suite tests the
+Elixir substrate and retires as that substrate migrates.
+
+* The verbs
+
+| verb | what it is | notes |
+|---|---|---|
+| `bl build [PATHS…]` | AOT namespaces to beams | exists; gains build facts |
+| `bl build --native` | build the Rust NIFs | today parsed, documented and IGNORED (`build.bl` has no `:native` branch) — implement or delete |
+| `bl test [PATHS…]` / `--ex` | the one runner; `.bl` by default, ExUnit behind `--ex` | `--ex` is new |
+| `bl release [--out DIR]` | assemble an OTP release tree from the project value | new |
+| `bl pack --release DIR --out BIN` | the drop assembler in `.bl` | new; the `.bl` twin of `drop pack` |
+| `bl self-build [--out BIN]` | build → release → pack → verify, for the toolchain's own tree | new; the composite |
+| `bl deps [resolve\|fetch\|list\|verify]` | the library store + the hex protocol | new |
+| `bl seed` | regenerate `priv/bootstrap/seed` + manifest | replaces `mix run priv/bootstrap/gen_manifest.exs` |
+| `bl doctor --deep` | plus: store integrity, lock coverage, provenance of every beam | extends `bl doctor` |
+
+Exit codes stay 0/1/2, as everywhere.
+
+* Hex, as a library graph
+
+The hex protocol is small and documented; `bl deps` speaks it in `.bl`:
+
+1. `GET https://hex.pm/api/packages/<name>` → versions, `requirements`,
+   checksums, retirement (JSON).
+2. `GET https://repo.hex.pm/tarballs/<name>-<vsn>.tar` → a tar with `VERSION`,
+   `CHECKSUM`, `metadata.config`, and `contents.tar.gz`.
+3. verify the tarball's sha256 (outer) and the unpacked contents' checksum
+   (inner) against the lock; unpack `contents.tar.gz` into the store.
+4. resolution: a bounded backtracking resolver over `requirements`. v1 is
+   LOCK-FIRST: an existing lock's exact versions are fetched and verified;
+   `bl deps resolve` may choose new versions and rewrites the lock; `bl deps
+   verify` proves the store matches the lock without network.
+5. the lock is a value beside env.bl (`bl.lock`), and a `:payload` source
+   short-circuits the network entirely.
+
+Library use where it makes sense: `req` (shipped) or `:httpc` (inets, shipped)
+for HTTP; `jason` (shipped) for JSON; `:erl_tar` + `:zlib` for archives;
+`:ssl`/`:public_key` (shipped) for TLS. Nothing new is needed to fetch from hex
+from inside the drop.
+
+* The pipeline, end to end
+
+    env.bl ──▶ project value
+       │
+       ├─▶ library graph (payload store ⊕ hex/lock) ──▶ app set
+       │
+       └─▶ source graph (build-plan) ──▶ order · waves · keys
+                 │
+                 ├─ AOT: priv/**/*.bl,*.bl.md,*.bl.org ──▶ beams  (build.bl)
+                 └─ EX:  lib/**/*.ex (minus dev/mix)   ──▶ beams  (ParallelCompiler)
+                 │
+                 ▼
+          staging ebin ──▶ release/assemble ──▶ release tree
+                                                 │
+                         drop/assemble ◀─────────┘
+                               │
+                               ▼
+                         candidate `bl` ──▶ verify ──▶ install (atomic rename)
+
+* Verification
+
+| gate | what it proves |
+|---|---|
+| G1 boot | `bl-new version`, `bl-new eval '(+ 1 2)'`, `bl-new doctor --json` |
+| G2 native | fjall / explorer / lazy_memo / z3 all live in the candidate |
+| G3 build | `bl-new build` compiles a fixture tree with no mix |
+| G4 fixpoint | `bl-new self-build` → `bl-new2`; `bl-new ≡ bl-new2` byte-for-byte |
+| G5 oracle | while mix exists: `mix bl.build` and `bl self-build` produce the same release tree bytes and the same beam bytes |
+| G6 store | every library artifact's sha matches its lock; no network in `verify` |
+| G7 provenance | every beam in the candidate carries the candidate's toolchain key; the seed manifest agrees |
+| G8 keys | editing `build.bl` rebuilds only the driver; editing `compiler.bl` rebuilds everything |
+
+* The cutover ladder
+
+- Gen-0 — today's `bl`, mix-built. No self-build.
+- Gen-1 — `mix bl.build`, with the build/release/drop/deps namespaces shipped
+  in `priv/build/`. Gen-1 CAN self-build. G5 runs here (oracle).
+- Gen-2 — produced by Gen-1 `bl self-build`. G1–G4, G6–G8 run here.
+- Gen-3 — produced by Gen-2; G4 must hold between Gen-2's own output and Gen-3.
+- Cutover — delete `mix.exs`, `mix.lock`, `lib/mix/tasks/*`, `deps/`, the Rust
+  `drop` pack path and the escript remnants; CI moves to `bl self-build`.
+
+* Non-goals
+
+- Cross-target drops (musl/darwin/windows NIF staging, `erts.lock` fetching) —
+  unchanged from docs/native-bundler.md §5/§11; a FUP.
+- Auto-update channels.
+- Porting the Role B substrate to `.bl` — FUP-016's benchmark-earned rule.
+- Editing language semantics. This is build/release machinery only.
+- A GUI. The build's face is `bl build --json`, the daemon read-model, and a
+  dashboard pane (same pattern as PLAN-103 W5/W6).
+
+* Real vs designed (honesty ledger)
+
+Verified this session, by inspection and measurement:
+
+- the payload has NO `Elixir.Mix.beam`; every runtime mix reference is guarded;
+- the payload HAS `Elixir.Code`, `Elixir.Module`,
+  `Elixir.Kernel.ParallelCompiler`, `Elixir.Protocol`, `Elixir.Macro`;
+- the payload has `:systools` + `release_handler` (sasl), `:erl_tar` (stdlib),
+  `:zlib` (preloaded, callable);
+- ExUnit is ABSENT from the payload;
+- the drop compound is launcher ⊕ payload ⊕ 56-byte trailer, and the launcher
+  exports `BL_BIN` = its own path (so the launcher prefix is recoverable);
+- the launcher and daemon already run commands through one Executor FIFO;
+- `bl build` works standalone with no mix; `bl build --native` is a dead flag;
+- `compiler_key` hashes `priv/boot/**` by directory; 8 generations in ~21h;
+- 47 hex packages in `mix.lock`; hex.pm's API answers 200 and the tarball
+  endpoint answers 200 from this host.
+
+Designed here, not yet built: the library store and hex client; `:build`
+`:app` `:release` `:deps` in env.bl; the two-key toolchain and `priv/build/`;
+release assembly in `.bl`; the `.bl` drop packer; `bl self-build`; the build
+fact-log; the build session and its claim; the ExUnit-in-drop path.
+
+Named unknowns, each with a decisive probe in W0:
+
+- does `Kernel.ParallelCompiler.compile_to_path/2` compile `lib/**/*.ex` inside
+  the drop (minus dev/mix) with no Mix project?
+- does `:systools.make_script/2` accept our `.rel` and produce a bootable
+  `start.boot`?
+- does `Protocol.consolidate/2` work from the payload?
+- the zlib interop shape (byte list vs binary);
+- the exact bytes `mix release` produces that a hand-assembled tree must match
+  for G5.
+
+* Waves
+
+Each wave lands green and is independently valuable. Branch
+`feat/drop-builds-itself`, worktree `../beam-lisp--selfbuild`; the main tree is
+untouched until the cutover.
+
+** W0 — probes (de-risk, no product code)
+
+Six decisive probes, each a script under `research/selfbuild/` with a README
+recording the verdict: the ParallelCompiler compile of `lib/`; `:systools`
+script+boot from a hand-written `.rel`; `Protocol.consolidate`; zlib interop on
+a binary vs a byte list; a hand-copied release tree that boots from a copied
+`bin/bl` + reused ERTS; a byte-diff of `mix release` against a minimal
+hand-assembly.
+Accept: the hand-assembled tree runs `bl eval '(+ 1 2)'` from a copied launcher
+script.
+
+** W1 — the toolchain keys and `priv/build/`
+
+Move `build`, `build-plan`, `source-graph`, `ns-interface` to `priv/build/`; add
+`:build :codegen` to env.bl and the graph check that verifies it; split
+`compiler_key` into `toolchain_key` (codegen closure) and `build_key` (driver);
+stamp the manifest with both; make the boot barrier the codegen closure.
+Accept (G8): touching `priv/build/build.bl` rebuilds only the driver; touching
+`priv/boot/compiler.bl` rebuilds all; the AOT/reproducibility suites stay green.
+
+** W2 — the build fact-log
+
+`build/run` emits facts (`:build/*`) alongside the manifest; the manifest
+becomes a projection; a query surface answers stale/impact/coverage.
+Accept: a test drives a small tree, edits a body, and asserts the stale set by
+query; a resumed build replays from the log; the manifest and the log agree.
+
+** W3 — compile the Elixir substrate in-process
+
+`build/ex`: `Kernel.ParallelCompiler.compile_to_path` over the `:ex` roots minus
+exclusions, mixed into the same plan as the AOT stage, fresh by source hash.
+Accept: `bl build` produces `lib/beam_lisp`'s full ebin with no mix; the ExUnit
+suite passes against those beams.
+
+** W4 — release assembly
+
+`priv/build/release.bl`: the value → tree function, `:systools`, templates,
+consolidation, `.app` synthesis, ERTS reuse, `bin/bl`.
+Accept (G1): `bl release --out /tmp/rel` yields a tree that boots via
+`<rel>/bin/bl eval '(+ 1 2)'` — no mix anywhere.
+
+** W5 — the drop packer
+
+`priv/build/drop.bl`: launcher recovery from `BL_BIN`, deterministic tar in
+`.bl`, gzip, the trailer codec, atomic install.
+Accept: `bl pack --release /tmp/rel --out /tmp/bl-new`; `/tmp/bl-new version`
+works; byte-identical to `drop pack` of the same tree; trailer golden vectors
+agree with the Rust tool.
+
+** W6 — self-build
+
+`bl self-build`: compose W3–W5 for the toolchain's own tree, with the tree's
+`priv` threaded as an explicit root (`Tiers`/`AOTCache`/`build-plan`/`build` take
+a `:root`), and the seed carried into the candidate.
+Accept (G1–G4): Gen-2 builds Gen-3, byte-identical.
+
+** W7 — the library store and hex
+
+`priv/build/deps.bl` + `priv/build/hex.bl`: the store, the lock, the API client,
+tarball verification, the `:payload` short-circuit.
+Accept (G6): `bl deps verify` proves the store without network; `bl deps
+resolve` on a fixture project fetches and pins; a corrupted artifact fails.
+
+** W8 — the build session
+
+Build verbs as daemon jobs; the claim file for cold builds; the native store and
+its claim; the build read-model (queue, wave, per-source status) exposed to
+`--json` and the dashboard.
+Accept: two concurrent `bl self-build` in one tree run as one build + one queued
+request; no file lock exists outside the claim; a killed build resumes from the
+log.
+
+** W9 — env.bl, doctor, seed
+
+The `:app`/`:build`/`:release`/`:deps` keys wired end to end; `bl seed` replaces
+`gen_manifest.exs`; `bl doctor --deep`.
+Accept: this repository's env.bl drives its own release; `bl doctor --deep` is
+green.
+
+** W10 — cutover and docs
+
+Delete `mix.exs`, `mix.lock`, `lib/mix/tasks/*`, `deps/`, the Rust pack path and
+the escript remnants; CI runs `bl self-build`; docs updated (the build doc, the
+shipping doc, `bl help`) and a livebook whose cells run.
+
+* Risks
+
+1. THE .app/BOOT-SCRIPT GAP. G5's byte-diff is the early warning; W0's probe
+   settles whether `:systools` alone is enough or a small `.app` synthesizer is
+   needed. Reversible: `mix release` stays the oracle until G5.
+2. CONSOLIDATION DRIFT. `Protocol.consolidate` must be called with the same
+   app/scm arguments Mix uses, or the consolidated modules differ (slow paths,
+   not wrong answers). G5 catches it.
+3. THE TREE/PAYLOAD PRIV AMBIGUITY. A self-build compiles a tree while running a
+   payload. The explicit `:root` threading touches `Tiers`, `AOTCache`,
+   `build-plan`, `build` — the largest mechanical surface in the design.
+   Mitigation: thread it in W1, before any release work, with the existing
+   suites as the gate.
+4. HEX RESOLUTION. v1 is lock-first and may not need to CHOOSE versions at all;
+   if it does, bounded backtracking is a real subsystem. Deferred behind `bl
+   deps verify` (prove the store) and `:payload` (no network for self-build).
+5. SEED STAGING WITHOUT MIX. `gen_manifest` is an `.exs`; `bl seed` must be a
+   `.bl` verb over the same rules. Small, but on the bootstrap path — gate it on
+   the existing seed tests.
+6. THE DIRTY/PARALLEL-SESSION TRAP. Any `self-build` rotates the key and writes
+   beams; running it beside another session's `mix` reintroduces exactly the
+   lock contention this removes. W8's claim is the answer; until then,
+   self-build is one-session-at-a-time on the worktree.
+
+* Defaults taken (reversible)
+
+- `:deps` v1 is lock-first: no version CHOICE without `bl deps resolve`.
+- The ExUnit suite ships in the drop rather than being deleted, because it is
+  the oracle for the substrate that still exists.
+
+* VERIFICATION PASS (2026-09-12) — design claims vs observed artifact
+
+Every load-bearing claim was re-run against the running drop. Two held, two
+failed, and one method error was caught. What follows is what was OBSERVED; the
+commands and their real output are quoted.
+
+** Method error caught: I inspected the wrong payload
+
+`./bl maintenance meta` reports the repo `bl` carries payload sha256
+`03cd2b3d…`, and its PATH entry is `~/.local/share/drop/03cd2b3d/bin`. An earlier
+pass listed `ls -dt ~/.local/share/drop/*/ | head -1` and got `f3014971` — a
+newer directory produced by ANOTHER session's build. Every payload fact below is
+re-pinned to `03cd2b3d`. (The conclusions happened to be unchanged, which is
+luck, not method. The drop under test must be identified by its trailer, never
+by directory mtime.)
+
+Re-verified against `/home/user/.local/share/drop/03cd2b3d`:
+
+| claim | observed |
+|---|---|
+| no Mix in the payload | `Elixir.Mix.beam` count = **0** |
+| no ExUnit in the payload | `Elixir.ExUnit*` count = **0** |
+| Elixir compiler present | `Elixir.Kernel.ParallelCompiler.beam` count = **1** |
+| `systools` present | `…/lib/sasl-4.4/ebin/systools.beam` |
+| `erl_tar` present | `…/lib/stdlib-8.0/ebin/erl_tar.beam` |
+| the Elixir app is whole | payload ebin = **272** modules; host `elixir` ebin = **272** |
+
+The 272-vs-272 identity is the useful one: the drop's `elixir` app is NOT pruned.
+What is missing lives in separate apps (`mix`, `ex_unit`) or does not exist at
+all (see below). "The payload ships the Elixir compiler and not Mix" is exact.
+
+** CLAIM FAILED 1 — the launcher does not export `BL_BIN` in the shipped drop
+
+    BL_DAEMON=off ./bl eval '(System/get_env "BL_BIN")'        → nil
+    BL_DAEMON=off ./bl eval '(System/get_env "HOME")'          → "/home/user"
+    FOO=bar BL_DAEMON=off ./bl eval '(System/get_env "FOO")'   → "bar"
+
+Env passes through untouched; `BL_BIN` is simply never set. The binary agrees:
+
+    strings -a bl | grep -c BL_DAEMON  → 1      (control: the launcher reads it)
+    strings -a bl | grep -c BL_BIN     → 0
+
+and the source explains it:
+
+    grep -n BL_BIN tooling/drop/src/launcher.rs → 270, 297, 340, 456
+    stat: launcher.rs modified 2026-09-12 18:41 ; bl built 2026-09-12 15:55
+
+The `BL_BIN` export exists in the launcher SOURCE (four sites: the docstring,
+the stale-daemon restart, the detached daemon start, and the cold exec) but
+postdates the shipped binary by ~2h46m. Consequence for the design: recovering
+the launcher prefix from `BL_BIN` is valid against the CURRENT launcher source,
+not against the drop in hand. Therefore:
+
+- `bl pack --launcher FILE` is MANDATORY in v1, not an override;
+- W0's launcher probe becomes: build the launcher from HEAD, run it, and assert
+  `BL_DAEMON=off <bl> eval '(System/get_env "BL_BIN")'` returns the drop path —
+  the one-line change is in the tree, but it must be OBSERVED in an artifact;
+- there is no free fallback. `bl maintenance meta` yields the install DIR
+  (`~/.local/share/drop`) and the payload sha, never the drop FILE path, and
+  `/proc/self/exe` is `beam.smp` after the exec chain.
+
+** CLAIM FAILED 2 — `Protocol.consolidate/2` does not exist in Elixir 1.20
+
+    elixir -e 'IO.inspect({function_exported?(Protocol,:extract_protocols,1),
+                           function_exported?(Protocol,:consolidate,2),
+                           function_exported?(Protocol,:extract_impls,1),
+                           :code.which(Mix.Tasks.Compile.Protocols)})'
+    → {false, false, false, "/usr/lib/elixir/lib/mix/ebin/Elixir.Mix.Tasks.Compile.Protocols.beam"}
+
+Not one of the three `Protocol` functions exists. Protocol consolidation moved
+into **Mix** (`Mix.Tasks.Compile.Protocols`), which lives in the `mix` app — the
+app the drop deliberately does not have. The payload's Elixir ebin contains only
+`Elixir.Protocol` and `Elixir.Protocol.UndefinedError`; there is no
+`Protocol.Consolidation` module to ship. Design correction:
+
+- `bl release` produces an UNCONSOLIDATED release. That is correct, not broken:
+  protocol dispatch falls back to the per-impl modules; only speed and
+  `Protocol.consolidated?/1` change.
+- nothing breaks at boot: `grep -rn consolidated` over the release's `bin/bl` and
+  `releases/0.1.0/elixir` returns NO hits, so no script depends on the directory
+  existing.
+- G5's oracle must therefore compare against `mix release` with consolidation
+  disabled (`consolidate_protocols: false`), or expect exactly that difference.
+- consolidation becomes an OPTIONAL later wave (port the ~300-line logic as a
+  build stage) gated on a benchmark showing it matters — not a prerequisite.
+
+** CLAIM HELD — the build tier and the key glob
+
+    grep mix.exs            → line 45 "priv/build the build itself"
+                              line 46 `beam_lisp: [source_dirs: ["priv/boot",
+                              "priv/std", "priv/lib", "priv/compat", "priv/build"]]`
+    ls -d priv/build        → No such file or directory
+    aot_cache.ex:223        → "Content of every tier-1 source: everything under
+                              `priv/boot/`, sorted by path"
+    aot_cache.ex:209        → "ambient prelude — the whole `priv/boot/` tier. A
+                              change to ANY of [it]…"
+
+So `build.bl` (and `build-plan`, `source-graph`, `ns-interface`) hash into
+`compiler_key` by virtue of living in `priv/boot/`, while `mix.exs` already
+declares `priv/build` as a source dir and the directory does not exist. The
+W1 defect and its fix are both confirmed at the source.
+
+** CLAIM HELD — `bl build --native` is a dead flag
+
+    priv/std/bl/cli.bl: 44 (`:native false`), 108 (parses `--native`),
+                        140 and 231 (documented), 244 (`:native (:native st)`)
+    priv/boot/build.bl: 0 hits for "native"
+
+Parsed, documented, passed to the build, and ignored by the build. Confirmed.
+
+** CLAIM CORRECTED — ExUnit must be BROUGHT IN, not merely included
+
+    ls -d /usr/lib/elixir/lib/ex_unit      → present (host)
+    ls …/drop/03cd2b3d/lib | grep ex_unit  → nothing
+
+`ex_unit` is an app of its own, present on the host and absent from the payload.
+`:release :include [:ex_unit]` is therefore insufficient for a self-build: Gen-1's
+build must COPY the host `ex_unit` app into the payload, so Gen-2 and later
+carry it. Until that lands, `bl test --ex` can only run outside the drop.
+
+** Updated W0 probes
+
+1. rebuild the launcher from HEAD; assert `BL_BIN` is the drop path in the new
+   artifact (replaces "no launcher change needed");
+2. `Kernel.ParallelCompiler.compile_to_path/2` over `lib/**/*.ex` minus dev/mix
+   inside the drop;
+3. `:systools.make_script/2` + `script2boot/1` from a hand-written `.rel`;
+4. zlib interop shape (byte list works, binary raised badarg);
+5. a hand-assembled, UNCONSOLIDATED release tree that boots from a copied
+   `bin/bl` + reused ERTS;
+6. byte-diff `mix release --no-consolidate` (or config-equivalent) against the
+   hand-assembly.
+
+* TARGET RELEASE MANIFEST (observed, payload 03cd2b3d)
+
+W4's acceptance is "produce this, byte-comparable to `mix release`". The
+observed tree, exhaustive at the level that matters:
+
+    bin/bl
+    erts-17.0.1/                       (11 MB)
+    lib/                               (280 MB; 38 app dirs)
+    releases/
+      COOKIE                           ("QIDEDDX7…", 41 chars)
+      start_erl.data                   ("17.0.1 0.1.0")
+      0.1.0/
+        bl.rel  start.script  start.boot  start_clean.script  start_clean.boot
+        sys.config  vm.args  remote.vm.args  env.sh  elixir  iex
+        consolidated/                  (14 beams)
+
+`lib/beam_lisp-0.1.0/{ebin,priv}`; ebin holds 578 beams, 488 of them
+`Elixir.BeamLisp.Ns.*` — the compiled `.bl` namespaces land in ebin alongside
+the Elixir substrate, and `Elixir.BeamLisp.Ns.Compiler.beam` is there (the seed
+staging deviation PLAN-088 tracks).
+
+The `.rel` app order is load-bearing for G5: kernel, stdlib, elixir, sasl,
+beam_lisp, then the remaining 31 alphabetically (aws_signature, bandit,
+compiler, crypto, decimal, eex, explorer, finch, file_system, hpax, iex, inets,
+jason, logger, mime, mint, nimble_options, nimble_pool, plug, plug_crypto,
+public_key, req, rustler, rustler_precompiled, ssh, ssl, table, table_rex,
+telemetry, thousand_island, websock, websock_adapter). 36 `permanent` entries.
+
+The app set is: OTP (kernel, stdlib, compiler, crypto, asn1, public_key, ssl,
+ssh, inets, sasl, eex, iex, elixir, logger) + hex (bandit, explorer,
+file_system, finch, hpax, jason, mime, mint, nimble_options, nimble_pool, plug,
+plug_crypto, req, rustler, rustler_precompiled, table, table_rex, telemetry,
+thousand_island, websock, websock_adapter, aws_signature, decimal). NOT present:
+`mix`, `ex_unit`. `iex` IS present even though the drop's CLI is not IEx — worth
+keeping for parity (and because `bin/bl`'s `iex` sibling references it).
+
+FINDING — packaging hygiene. `lib/beam_lisp-0.1.0/priv/` currently ships
+`priv/.spell/graph` (agent session state) and a stray `priv/env.bl`, because the
+release copies the whole `priv/` tree. The assembler needs an explicit
+include/exclude discipline (`:release :priv {:include [...] :exclude [".spell"]}`)
+so build residue and session state never ship. Also present in priv and required:
+`boot std lib compat self live reload bootstrap/{seed,nano.bl,gen_manifest.exs}
+native z3 auth.bl`.
+
+* ROOT THREADING — the exact surface, and the three roots
+
+`Tiers` already parameterizes three functions and leaves three unparameterized:
+
+    dirs(root \\ priv_root())          boot_dir(root \\ priv_root())
+    sources(root \\ priv_root())       priv_root()
+                                       boot_namespaces()      ← no root
+                                       boot_source?(path)     ← no root
+
+The callers that must take a root for a self-build:
+
+| site | uses | why it must be rooted |
+|---|---|---|
+| `aot_cache.ex:232` | `Tiers.boot_dir()` | the key must hash the TREE's boot sources |
+| `aot_cache.ex:245` | `Tiers.priv_root()` | fallback when no tree is declared |
+| `aot.ex:892,896` | `boot_namespaces()` | the boot barrier must name the TREE's compiler |
+| `loader.ex:611` | `Tiers.dirs()` | search path = tree sources |
+| `build.bl:174` | `boot_source?` | `partition-plan`'s serial wave = tree's codegen |
+| `native.ex:329,337` | `priv_root()` | NATIVE ASSETS (runtime, not tree) |
+| `lazy_memo.ex:19` | `priv_root()` | native asset |
+| `z3_port.ex:102` | `priv_root()` | z3 binary (runtime asset) |
+| `web.bl:344`, `mcp/tools.bl:81`, `override.bl.md:72,281` | `priv_root`/`dirs` | mixed |
+
+The last four rows are the design's real refinement, because they are NOT the
+same root as the first five. A self-build reads sources from the TREE while
+reading native assets from the RUNNING PAYLOAD (or a target release). Today
+`priv_root/0` conflates the two, which is precisely what makes a self-build
+ambiguous. Split it into three named roots, threaded from the project value:
+
+    :source_root    where .bl/.ex sources are read          (the tree)
+    :runtime_root   where native/*.so, z3/, the seed are read (the payload or a release)
+    :out_root       where beams land                        (staging ebin → release lib)
+
+Rules:
+- `build-plan`, the AOT plan, the loader's search path and `boot_source?` take
+  `:source_root`;
+- `native.ex`, `lazy_memo.ex`, `z3_port.ex`, `web.bl`, `mcp/tools.bl` take
+  `:runtime_root`;
+- `Tiers.priv_root/0` survives ONLY as the default for both when no project
+  declares them (dev-in-a-checkout, escript), keeping today's behavior
+  byte-identical for every existing caller;
+- the design's W1 threading is therefore: parameterize three functions, add the
+  two root values to the project, and update 8 call sites — not a tree-wide
+  refactor. Risk 3's surface is bounded and enumerated here.
+
+* W0 VERDICTS (2026-09-12) — executed on `feat/drop-builds-itself`
+
+Worktree `../beam-lisp--selfbuild` at d1db387; probes committed as f90293b;
+full commands, output and non-coverage in `research/selfbuild/README.md`.
+Roster: W0 closed, W1 next.
+
+| # | question | verdict | observed |
+|---|---|---|---|
+| P1a | HEAD launcher exports `BL_BIN`? | PASS | `strings drop-launcher`: `BL_BIN`=1, control `BL_DAEMON`=2 |
+| P1b | `drop pack` round-trips a hand-assembled tree? | PASS | 103,588,258 B drop; `inspect` parses it |
+| P1c | packing deterministic? | PASS | two packs → same sha256 `3daeccf6…` |
+| P1d | does the new drop run, `BL_BIN` = its own path? | PASS | `(+ 1 2)`→3; `BL_BIN`→`…/p1/bl-p1a` |
+| P1f | self-graft arithmetic recoverable in-drop? | PASS | `offset+len+56 == size`; sha matches; launcher prefix 810,104 B |
+| P2 | drop compiles the Elixir substrate, no Mix? | PASS | 86 modules / 86 beams / 9,902 ms |
+| P3 | `:systools` produces boot scripts in-drop? | PASS | `make_script`→`{:ok,_,[]}`; `script2boot`→`:ok` |
+| P4 | gzip available + deterministic? | PASS | `:zlib.gzip` works, repeated → identical |
+| P5 | hand-assembled UNCONSOLIDATED tree boots? | PASS | Elixir 1.20.2 boots; language returns 42 |
+| P6 | byte-identical to `mix release`? | DEFERRED | needs `deps.get` + full compile here; informational half done |
+
+** CORRECTED — the launcher needs no change, only a rebuild
+
+`BL_BIN` is COMMITTED at d1db387 (four sites in a clean `launcher.rs`),
+introduced by `0f1dd78` ("drop: a served command that failed must say so",
+BUG-035). The shipped `bl` (built 15:55) simply PREDATES that commit. So the
+earlier reading — "the launcher change is written but absent" — becomes: the
+capability is in HEAD; only the field binary lacks it. There is no launcher work
+item, only a rebuild in Gen-1. P1d observed `BL_BIN` = the drop path in an
+artifact, so the mechanism is proven, not inferred. `--launcher FILE` stays as
+the escape hatch for any binary that predates 0f1dd78 (including today's).
+
+** P5's confound, checked and cleared
+
+The generated `start.script` uses `$ROOT` (78 occurrences) and embeds NO
+absolute path — neither the payload's nor the tree's — so the tree genuinely
+booted from its own `lib/`. (`make_script` is relocatable by default.)
+
+** P6 reconciled: the whole `mix release` difference, named
+
+Both scripts carry **40 `{path, …}` lines**, the same app set in the same order
+(kernel, stdlib, elixir, sasl, beam_lisp, then alphabetical), and neither embeds
+an absolute path. The entire difference is which variable a path uses:
+
+| script | non-OTP apps | OTP apps | bytes |
+|---|---|---|---|
+| `make_script` | `$ROOT/lib/<app>/ebin` | `$ROOT/lib/<app>/ebin` | 160,976 |
+| `mix release` | `$RELEASE_LIB/<app>/ebin` | `$ROOT/lib/<app>/ebin` | 163,091 |
+
+∴ W4's byte-identity step: rewrite the project + hex-dep path entries from
+`$ROOT/lib/<app>-<vsn>/ebin` to `$RELEASE_LIB/<app>-<vsn>/ebin` in the
+generated script BEFORE `script2boot` (the release's `bin/bl` supplies the
+variable via `--boot-var RELEASE_LIB "$RELEASE_ROOT/lib"`).
+
+** W4 implementation notes earned by W0 (do not rediscover)
+
+- `:systools.make_script/2` writes BOTH `.script` and `.boot`; `script2boot/1`
+  takes the extension-less STEM (a filename makes it look for `<n>.script.script`).
+- Option shape that works: `[{:path, [staging, libdir]}, {:outdir, staging}, :silent]`,
+  with the `.rel` copied into `staging` first. Zero warnings on the shipped rel.
+- `Kernel.ParallelCompiler.compile_to_path/2` needs `return_diagnostics: true`
+  to avoid a deprecation warning; `Code.compiler_options(ignore_module_conflict: true)`
+  before it, because the substrate's modules are already loaded in the drop's VM.
+- Excluded from `:ex` sources: `lib/dev` (Tidewave, dev-only) and `lib/mix`
+  (Mix-task shells — cannot compile without Mix, and die at cutover).
+- gzip takes Erlang iodata: build the tarball bytes via `iolist_to_binary`/
+  `list_to_binary`; a beam-lisp string literal raised badarg through `apply/3`
+  even though `is_binary` reports true.
+- Protocol consolidation is confirmed NON-essential for booting. Absence costs
+  dispatch speed only, and no script references the `consolidated` dir.
+
+** Not shown by W0 (do not read the passes as broader than they are)
+
+- `bl release` / `bl pack` / `bl self-build` do not exist; only `research/selfbuild/`.
+- `.app` synthesis for `beam_lisp` is untested — P5 reused the shipped `.app`.
+- The native tier (fjall / explorer / z3) was never exercised in a hand-assembled
+  tree; P5 reused the payload's `priv/`, so the NIFs rode along by copy.
+- Cross-target packing (ERTS fetch + graft) was not run; P1 packed for the host.
+- Consolidation's dispatch cost is unmeasured.
+
+* W1 LANDED — the toolchain has two keys (2026-09-13)
+
+*The change.* `priv/build/` exists; the build driver (`build`, `build-plan`,
+`source-graph`, `ns-interface`) moved out of `priv/boot/`, which is now the
+CODEGEN tier alone (8 namespaces: reader, compiler, reader-node, core, sugar,
+data-readers, anf, lower).
+
+- `BeamLisp.Tiers` — `build_dir/1`, `build_namespaces/0`, `tier_of_ns/1`,
+  `build_source?/1`, `toolchain_source?/1` (the union the barrier schedules).
+- `BeamLisp.AOTCache` — `build_key/0` (driver sources folded over
+  `compiler_key/0`, since the codegen compiles the driver), `key_for_ns/1`,
+  `key_for_source/1`, `key_for_tier/1`, `current_build_key/0`, `reset_keys/0`.
+- The emitter stamps every beam with its TIER key (`AOTCache.key_for_ns/1`) and
+  the runtime drift gate compares against the SAME function, so a beam's stamp
+  and the judgement of it cannot disagree.
+- `@gate_namespaces` is DELETED. The tier DIRECTORIES are the declaration: after
+  the move, `priv/boot/**` is exactly the codegen+ambient set file-for-file, so a
+  list written in code would only drift from the tree. The `reader-node`/
+  `build-plan`/`source-graph`/`ns-interface` recursion argument survives as a
+  comment at the deleted list's site.
+- The build manifest records the tier key per source; `fresh?` compares against
+  `key_for_source(path)`.
+- The serial barrier is the TOOLCHAIN prefix (codegen ∪ driver):
+  `partition-plan` → `:toolchain`, `continue-after-toolchain?`.
+- The committed seed floors the CODEGEN ONLY — 21 modules, down from 30.
+
+*Measured* (`research/selfbuild/w1_amplifier.sh`, re-runnable, self-cleaning):
+
+| what | observed |
+|---|---|
+| manifest key per tier | boot/compiler.bl, boot/sugar.bl, std/errors.bl, lib/datom.bl → codegen `b6a47eb8…`; build/{build,build-plan,source-graph,ns-interface}.bl → driver `fff8a5a3…` |
+| beam stamps | `BeamLisp.Ns.Build` → `fff8a5a3…`, `BeamLisp.Ns.Compiler` → `b6a47eb8…` |
+| **the amplifier is gone** | add a build-driver source: codegen key UNCHANGED, driver key moves to `4c3d22e0…`, ONLY driver-keyed sources go stale, the build touches **5 sources** (before the split: every beam, ~300) |
+| codegen edits stay conservative | add a codegen source: codegen moves to `32d07ec2…` AND the driver with it (the driver folds the codegen key in) → everything stale, correct |
+| leaves no trace | the probe deletes its file; both keys return to baseline; two consecutive `mix compile`s then report nothing to build |
+
+*Design deltas vs the text above.* (1) "Declared as data + graph-verified" is
+simplified to "the tier directory IS the declaration" — the closure property is
+asserted by a test instead of described by a data file. (2) The seed floors the
+codegen only: gen-N codegen compiling gen-N+1 codegen is the bootstrap contract,
+but a DRIVER floored from a previous generation is a mixed toolchain — a shim/body
+pair spanning the generation boundary dies at load.
+
+*Two defects found by implementing it, both fixed.* (1) A staged seed could
+install a previous-generation driver →
+`BeamLisp.Ns.Build."boot-source?"/1 is undefined or private`. The seed no longer
+carries the driver and `Bootstrap.install!` refuses to stage a build-tier
+namespace even if one is offered. (2) `fresh?` could not see that a beam had been
+REPLACED out of band: `install!` recreated a deleted driver beam from the seed, so
+the manifest looked fresh over another generation's bytes.
+
+*Open — W1-R1.* `fresh?` still checks only that each module's beam EXISTS. A beam
+replaced out of band (stale copy, partial extraction, a release tree written by
+someone else) is called fresh while the bytes are foreign. The AOT cache already
+keeps a per-module sha256; record digests in the manifest and compare. Schedule
+before W5, where foreign bytes become likely.
+
+*Validated.* `mix compile` clean; 45/45 across the 11 build/AOT suites. Full
+`mix test` on the W1 tree: 1509/1544, 3 invalid, 35 failed — attributed, not
+waived:
+
+- 33 = `priv/z3/bin/z3` absent. `priv/z3/` is gitignored, so a fresh worktree has
+  no solver and every z3-backed example fails to start its server. Symlinking
+  `priv/z3` closes it (the same way `deps` is symlinked).
+- 3 = `examples/system/02_inductive_safety.bl` ("no function clause matches"),
+  `examples/veritas/03-the-mock-server.bl` ("smt/emit: nil is not an SMT term"),
+  `examples/semantic/13-entity-graph.bl` (30 s timeout). All three reproduce
+  IDENTICALLY on a pristine worktree at `f90293b` (pre-W1: 214/217, same three,
+  same reasons). ∴ W1 introduces zero test regressions; these are environment
+  facts of this checkout (the z3-dependent examples had never actually RAN here —
+  without a solver they were failing at server start, which is why an earlier
+  count read "z3 not found" rather than these reasons).
+- 2 flakes in the full run only (`Bl.TestVerbTest`, `Bl.DaemonIntegrationTest`)
+  pass in isolation. Both are cross-session contention: another session's daemon
+  held the UI port (`{:taken, … root: "/tmp/bl_dash_762"}`) and the CrossNode
+  spike lost its `:net_kernel` name to another node.
+
+*Carried into W2+.* The measured baseline: a cache-warm `mix compile` on this
+worktree is 4m41s (pristine, f90293b) / 7m54s (W1, after the split). The tier
+split reduces WHAT a build-tool edit invalidates; it does not touch build cost
+itself — that is W2/W3's business.
+
+* W2 LANDED — the build's memory is a log of facts (2026-09-13)
+
+*The change.* New driver namespace `priv/build/build-log.bl` + its Elixir call
+surface `BeamLisp.BuildLog`. The build's memory moved from ONE mutable document
+(the manifest: a `term_to_binary` map rewritten after every source) to an
+APPEND-ONLY LOG OF FACTS in the language's data syntax, replayed into a state.
+The manifest is that state's PROJECTION, written once at the end of a run.
+
+```
+[:build/run id at-ms]                              a build started
+[:build/built path key tier [modules] cached?]     path is fresh under these keys
+[:build/failed path reason]                        path did not compile
+[:build/dropped path]                              path left the build
+[:build/end id built errors]                       how the run ended
+```
+
+The log is also the build's QUERY SURFACE, which a manifest could never be:
+`stale/3` (the worklist, in plan order), `impact/2` (everything an edit reaches
+— the reverse closure of the plan's `:deps`), `coverage/3` (how much of the plan
+the log accounts for). `build-log/state-of-manifest` migrates a build directory
+written before the log existed, in one read, so adopting the log costs no
+rebuild.
+
+*Observed.*
+
+| what | observed |
+|---|---|
+| the log on disk | four lines of text for a two-source fixture (one run, one built per source, one end) |
+| the real tree | `_build/dev/lib/beam_lisp/.mix/build.log`, 51 KB — ~300 sources, compacted |
+| resume | delete the manifest → the next run is `{:noop, []}`, and the projection is rewritten from the log |
+| agreement | `read_manifest() == BuildLog.manifest(state)`, asserted in two suites |
+| stale by query | after a body edit `stale == [b.bl]` exactly; `impact(a) == [b]`, `impact(b) == []` |
+| a driver edit | 15 s, five driver sources — W1's tier key doing its job on a real edit |
+| compaction | keeps the LAST run only; replaying never grows a history |
+
+*Accepted.* G2: `test/beam_lisp/build_log_test.exs` drives a two-source tree,
+edits a body, and asserts the stale set BY QUERY; a resumed build replays from
+the log (manifest deleted, still a no-op); and the manifest on disk equals the
+log's projection. The driver's own `.bl` suite (`test/bl/build_test.bl`) gained
+`the-log-is-the-memory` and `clean removes the log too`.
+
+*Probes earned two comments in the module.* (1) `pr-str` is a VALUE printer — it
+emits a string UNQUOTED, so a log written with it would not read back; the log
+carries its own four-line serializer. (2) A reader NODE is a tagged TUPLE
+(`{:vector [elem …]}`), so `vector?` is FALSE for it while `count`/`first`/
+`second` answer anyway — the first `read-facts` returned `[]` for a log that was
+plainly there. `research/selfbuild/w2_probe{,2,3,4,5}.bl` record both.
+
+*Contracts updated because the truth moved* (the property is pinned one layer
+down now, not deleted): `aot_build_key_test` forges the tier drift IN THE LOG
+and asserts a forged MANIFEST changes nothing; `build_test.bl`'s poisoned
+manifest now costs nothing (the projection is repaired, not trusted);
+`boot_build_barrier_test` knows the driver tier has five namespaces.
+
+*One flake, attributed by probe, not waived.* `system.linear-test` failed once
+(1/23) then passed 3× consecutively; the failing assertion is a pure function of
+a literal string, and `w2_probe5.bl` prints IDENTICAL results in this tree and a
+pristine `f90293b` worktree. ∴ the `.bl` fork runner's order/seed dependence,
+not this wave.
+
+*Validated.* 14/14 ExUnit (three touched suites), 29/29 driver `.bl` suite,
+56/56 across the 12-suite build/AOT gate set, `mix compile` converging on the
+real tree. Full-suite run in flight at the time of writing; results appended
+below if they differ from W1's attributed baseline.
+
+* W3 LANDED — the Elixir substrate compiles in-process (2026-09-13)
+
+*The change.* `priv/build/substrate.bl` (driver tier, tier-keyed like its
+siblings) + `BeamLisp.Substrate` (Elixir call surface). Facts
+`[:build/ex path content-hash [module …]]` in the SAME log as the AOT waves, so
+one replay answers for both. `build/run` gained
+`:ex {:root "lib" :exclude ["dev" "mix"]}`; the stage runs BEFORE the .bl waves
+(a .bl source may call into it), its errors are a REPORT rather than a barrier,
+and `:ex-built` is in the result.
+
+*Freshness* is the content hash PLUS the recorded module list: that is what
+makes a beam that vanished — or a half-extracted tree — pull its own source back
+into the build, which is exactly the hole W1-R1 records for the AOT side, closed
+here by construction.
+
+*Attribution* is the compiler's own (`module_info(:compile)[:source]`), which is
+what lets the whole set compile in ONE batch — the parallel compiler resolves
+cross-file dependencies itself — and still record a fact PER FILE, so one edited
+file recompiles alone.
+
+*Observed.* The project's own substrate (lib/ minus dev/, mix/) → every module,
+one fact per source, and NO `Elixir.Mix.beam` in the output; a second pass
+compiles nothing; a body edit compiles exactly one file; a deleted beam makes
+its source stale again; a file that will not compile is reported with file:line
+and records NO fact (so it stays stale rather than being believed done);
+`build/run` integration: `:ex-built 1` then `0`, `[:build/ex …]` in the same log.
+
+*Three API facts earned by failing first* (now comments in the module):
+(1) `Kernel.ParallelCompiler` walks its file argument as an Erlang list — a bl
+vector is a struct and dies inside the compiler's own `[file | queue]` clauses,
+so `Enum/to_list` at that boundary; (2) it now REQUIRES
+`return_diagnostics: true` (raw `{file, {line, col}, msg}` tuples deprecated),
+and the error is then a `%Code.Diagnostic{}` map, so the reader handles both
+shapes; (3) the stage's root is the SOURCE root with exclusions RELATIVE to it —
+`**/*.ex` from the project root pulls in `deps/` (`deps/abnf_parsec` failed the
+first real run).
+
+*Acceptance, split honestly.* G3's first half — "produces lib/beam_lisp's full
+ebin with no mix" — is MET for the stage; W0/P2 is the evidence that the compile
+needs no Mix module at all, and the test pins the artifact plus the absence of
+any Mix beam (this VM has Mix loaded, so the test cannot pin the absence of the
+module itself). The second half — "the ExUnit suite passes against those beams"
+— is a RELEASE-TREE property and is scheduled with W4, where the code path can
+actually be the substrate's.
+
+*Validated.* 34/34 in the driver's `.bl` suite (5 new), 33/33 across the touched
+ExUnit suites, and the 78-test build/AOT gate set green (one assertion updated
+for the new driver-tier namespace, which the barrier test enumerates).
+
+* W4 PARTIAL — the release VALUE is landed; the tree assembly is not (2026-09-13)
+
+*Landed.* `priv/build/release.bl` + `BeamLisp.Release`:
+
+- `app-closure/1` — the transitive `:applications` closure of the root app (37
+  apps for `beam_lisp`), each with its `.app` version and `:code.lib_dir/1`
+  directory, so nothing reads a dependency file to learn what a release carries;
+- `value/1` — `{:name :vsn :erts {:vsn :dir} :apps [{:app :vsn :dir} …]}`;
+- `rel-text/1`, `write-rel!/2` — the `Name.rel` at `releases/<vsn>/<name>.rel`.
+
+*Shaped against mix's own artifact* (`03cd2b3d/releases/0.1.0/bl.rel`): the
+`.rel` is ERLANG SYNTAX — `{"bl","0.1.0"}` (strings, not binaries; `~w` prints
+`<<98,101,…>>` and produces a file nothing can read), and each app is a 3-tuple
+carrying a TYPE (`permanent`, or `none` for carried-but-not-started, which is
+how mix writes `iex`). Our closure is a strict SUBSET of mix's app set: mix also
+carries `:sasl` and `:iex`, neither of which is anybody's `:applications`
+dependency. The test parses our `.rel` back with `:erl_scan`/`:erl_parse` and
+asserts the term equals the value — the round trip is the assertion.
+
+*Assembly recon, from the shipped drop* (recorded in full in
+`research/selfbuild/README.md`): the launcher's exact exec line (`releases/<vsn>/elixir
+--boot … --boot-var RELEASE_LIB "$ROOT/lib" --vm-args …`, plus `--erl-config` and
+`--erl "-mode embedded"` for `start`), and the piece-by-piece source of every file
+a tree needs — libs (with a priv include/exclude: the drop currently ships
+`priv/.spell/graph` and a stray `priv/env.bl`), ERTS, `.rel`, `<name>`/`start_clean`
+`.script`+`.boot` via `make_script` → `$ROOT`→`$RELEASE_LIB` rewrite → `script2boot`
+(stem), PATCHED COPIES of Elixir's `bin/{elixir,iex}`, the four templates, COOKIE +
+`start_erl.data`, and `bin/bl`.
+
+*NOT DONE.* The tree assembly itself, so G1 (`<rel>/bin/bl eval '(+ 1 2)'`) is
+UNMET. Next step: `assemble/2` in `release.bl`, in this order — copy libs + ERTS
+→ `.rel` → `make_script`/rewrite/`script2boot` → templates + launcher → boot test.
+
+* W4 COMPLETE — the tree boots and runs the language (2026-09-13; supersedes "W4 PARTIAL")
+
+`assemble/2` in `release.bl` turns the release VALUE into a tree, and the tree
+runs. Observed through a launcher that generated every piece of it:
+
+    bin/bl version                                             -> beam_lisp 0.1.0
+    bin/bl eval 'IO.puts("elixir=" <> System.version())'        -> elixir=1.20.2
+    bin/bl eval 'BeamLisp.Ns.Bl.Cli.main(["eval","(+ 40 2)"])'  -> 42
+
+Order, and why: apps + ERTS first (systools validates the .rel against the
+directory it is handed — a missing app is an ERROR there, not a warning); both
+`.rel`s; then `make_script` → `$ROOT/lib` → `$RELEASE_LIB` rewrite → `script2boot`
+in that order, because the boot file is COMPILED from the script text; then what
+a script cannot generate: the Elixir CLI wrappers (patched exactly as mix patches
+them — release-relative `ERTS_BIN`, no `-elixir_root/-pa` pair), the four
+templates, the cookie, `start_erl.data`, the launcher.
+
+`start_clean` is the SAME app set as the release with only the mandatory apps
+(kernel, stdlib, elixir) permanent. That is what puts the release's code on the
+path without starting it — and it is why `bl eval` can reach
+`BeamLisp.Ns.Bl.Cli` at all. mix's own `start_clean.script` names every app for
+the same reason (measured).
+
+Five traps, each earned by failing first: `:systools` lives in OTP's `sasl` and a
+`start_clean` VM has no `lib/sasl-*/ebin` on its path (the stage appends it from
+the ERTS root it is already copying — sasl is a BUILD tool here, never a release
+dependency); systools rejects `{:mandatory_app, :kernel, :none}`; `File.cp_r!`
+creates the destination, not its parents; `~w` prints a binary as `<<98,101,…>>`
+(so the `.rel` writer is `~p` with charlists); and an UNESCAPED QUOTE inside a bl
+docstring silently truncates the string, after which the compiler fails far away
+— found by compiling each top-level form separately.
+
+One hypothesis made and FALSIFIED, recorded so it is not inherited: "a `defn`
+body may not begin with a vector literal". The `(vec …)` wrapper added on that
+theory was reverted and the bare vector re-tested (25/25 forms compile) — the
+theory is false; the real cause was the docstring quote.
+
+Handed to W10: the tree carries `lib/*/ebin/Elixir.Mix.Tasks.*.beam` (rustler's,
+rustler_precompiled's and ours) because `copy-app!` copies the ebin as built.
+
+* W5 PARTIAL — the compound codec is landed; `bl pack` is not (2026-09-13)
+
+*Landed.* `priv/build/drop.bl` + `BeamLisp.Drop`: `parse-trailer`,
+`encode-trailer`, `compound`, `verify`, `target`, and streaming hashing. The
+ACCEPTANCE'S FIRST HALF IS MET and observed: the golden trailer of a real
+`drop pack` compound decodes to its fields and re-encodes to the SAME 56 bytes;
+pointed at the real 103 MB compound (`BL_COMPOUND=…/bl`) the streamed digest
+equals the digest the packer stored and `offset+len+56` equals the file size.
+Verification tells truncation (arithmetic) from corruption (digest) — the
+launcher's whole job.
+
+Three interop facts, all now comments: `erlang/x/y` is `:erlang."x/y"` (other
+Erlang modules take the bare form: `binary/part`, `crypto/hash`, `file/pread`);
+`count` on binary data is NOT its size (a 56-byte trailer counts 55 — byte
+arithmetic uses `erlang/byte_size`); and for a LITTLE-ENDIAN field the padding
+goes at the END (padding in front writes the number backwards — the golden
+vector caught it, self-consistency never would have).
+
+*NOT DONE: the packer.* `launcher recovery from BL_BIN`, the tar, the gzip and
+`atomic install`; acceptance is byte-identity with `drop pack` on the same tree.
+The dialect is READ OUT of `tooling/drop/src/pack.rs` and recorded in
+`research/selfbuild/README.md`: sorted depth-first file-only walk; GNU headers
+with mode 0o755 for every file, mtime 0, uid/gid 0, empty uname/gname, octal
+cksum (6 digits + NUL + space, checksum field blanked); 512-byte data padding
+plus the two zero blocks from `finish()`; flate2 default compression (zlib level
+6) — with the note that byte-identity lives in the GZIP CONTAINER (XFL and the OS
+byte come from the writer), so the honest route is to build that envelope by
+hand over raw deflate (`windowBits: -15`) rather than to hope `:zlib.gzip/1`
+agrees.
+
+* STATE AT HANDOFF (2026-09-13) — W1-W5 landed, W6-W10 deferred to FUP-109
+
+*Branch*: `feat/drop-builds-itself`, worktree `../beam-lisp--selfbuild`.
+Main tree untouched.
+
+*Landed, committed, verified by running:*
+
+| commit | wave | what |
+|---|---|---|
+| 391d52d | W1 | two toolchain keys — codegen (`priv/boot/`) and driver (`priv/build/`) |
+| 2089277 | W2 | the build's memory is an append-only fact log; the manifest is its projection |
+| de2ddc0 | W3 | the Elixir substrate compiles in-process, in the same plan and log |
+| 7249aef, e9175a7 | W4 | the release is a VALUE, then a TREE: it boots and runs the language |
+| 816958e, f1faebf | W5 | the compound codec, then the PACKER: a drop the language sealed runs |
+
+Evidence, observed rather than inferred:
+
+- `<tree>/bin/bl eval 'BeamLisp.Ns.Bl.Cli.main(["eval","(+ 40 2)"])'` → **42**
+- a drop packed BY THE LANGUAGE, sealed with the stock `drop-launcher` →
+  `<out> version` → **beam-lisp 0.1.0**
+- our TAR is **byte-identical** to `drop pack`'s (9728 B each, on a fixture with
+  a 108-byte name, a >512-byte file and an empty file)
+- the payload is NOT byte-identical (1972 vs 1999 B): flate2 and Erlang's zlib
+  are different compressors. Same tar, same 10-byte gzip header, different
+  deflate stream — measured by the test, not hidden.
+
+*Deferred, with reasons, to FUP-109*
+(`!tasks/plans/FUP-109-continue-the-self-build-programme-w6-w10.org`):
+W6 `bl self-build` + fixpoint, W7 library store + hex client, W8 build session
+claim, W9 `env.bl` + `bl seed` + `doctor --deep`, W10 the cutover. The follow-up
+carries each wave's next concrete step, the constraint list, and the state of
+the tree, so it can be picked up without re-deriving anything.
+
+*Two risks carried forward, in priority order:*
+
+1. **W1-R1** — `fresh?` trusts a beam that EXISTS rather than one that is
+   RIGHT. The AOT cache keeps a per-module sha256, so the repair is to record
+   digests in the manifest and compare them. Do it BEFORE release trees are
+   written by anything but this build (which is what W6 makes possible).
+2. The release ships `lib/*/ebin/Elixir.Mix.Tasks.*.beam` because `copy-app!`
+   copies the ebin as built — dead without Mix, gone when W10 deletes the
+   sources. (This wave already fixed the sibling defect: `priv` was being copied
+   as Mix's relative symlink, i.e. the language's own sources were missing from
+   the drop.)
+
+*Also worth knowing when resuming:* `.bl` suites (run with
+`mix bl test test/bl/…`) have an intermittent fork flake in
+`system.linear-test`; it was attributed to the runner by
+`research/selfbuild/w2_probe5.bl` (identical results in this tree and a pristine
+`f90293b` worktree), and it is not a signal about the build.
+
+* W6-W10 REVISED (2026-09-13, per user directive)
+
+The user reviewed the waves and directed four changes; they are recorded here
+with the machinery each one rests on, so the next session implements the
+revision, not the original prose. The end-game unification and distribution
+research is filed separately as **FUP-056** (`!tasks/follow-ups/`).
+
+** W6 — testing must be PRISTINE
+
+"Very good, just make sure your testing is pristine." Pristine is defined here
+as five properties, each checked independently, so a self-authored smoke test
+cannot stand in for any of them:
+
+1. **Set equality, not subset.** Compare the two release trees as SETS: every
+   file path → (size, sha256), sorted; equal file counts, equal total bytes, and
+   no path present in one tree and absent in the other. A build that leaves a
+   stale beam behind passes a subset check and fails this one.
+2. **Two independent artifact comparisons**, neither assuming the other:
+   (a) the TAR, byte-for-byte; (b) the payload, DECOMPRESSED, compared as a
+   sha256 — so W5's measured deflate difference cannot hide a real payload
+   difference. Then the trailer fields (offset, len, sha, os, arch, version)
+   must be equal, and `offset + len + 56 == size` must hold for both.
+3. **The candidate exercised as a SHIPPED artifact**: launched through the stock
+   launcher, with `MIX_*` cleared from the environment,
+   `:erlang.module_loaded(:Elixir.Mix)` asserted **false**, and a FRESH
+   `XDG_CACHE_HOME` so nothing is inherited from the host's caches. G1-G3 run
+   against that candidate, not against a tree we happen to have built.
+4. **Determinism of the producer**: the same tree packed twice is identical, and
+   the same sources built twice give an identical tree (the fixpoint at tree
+   grain). Both were verified by hand in W5's session; they belong in the test.
+5. **Honest failure**: a mismatch reports ALL differing paths, not the first.
+
+The fixpoint GRAIN is a decision that must be visible where it is enforced —
+name it in the test's own name/output ("tar+payload-sha, not the deflate
+stream") so nobody later reads a green gate as stronger than it is.
+
+** W7 — the server is a Veritas contract, and the mock is DERIVED
+
+"Use Veritas to represent the server, and to mock it properly." Veritas already
+has the shape for this (`examples/veritas/03-the-mock-server.bl`):
+
+- the hex endpoints are a **contract value** (`veritas.mock/contract-from` over
+  the response fields plus predicates) — the SAME contract the real client is
+  checked against, so impl and mock answer to one predicate and are
+  interchangeable;
+- `m/make-mock` + `m/answer` is a **deterministic server**: same request key ⇒
+  same response, a pure fn input→response. That is the mock, not a hand-written
+  table of fixtures;
+- `m/synth-boundary` gives the EDGES a hand-written mock always forgets —
+  retired and yanked versions, empty `requirements`, version-comparison
+  boundaries;
+- `m/synth-invalid` + `m/check` gives the adversarial case PROVABLY outside the
+  contract (the `∃` half negated).
+
+Injection, not stubbing: the client takes the RESOURCE (a transport/server
+value) the way `reload` injects its commit target (`with-target`) rather than
+stubbing functions. Prod speaks https to hex.pm; tests drive the mock
+in-process, and at least one test goes over a real local socket
+(`priv/std/socket.bl`) so framing is exercised too. Faults are queries as well
+(`veritas/fault`): transport error, truncation, timeout, an inner checksum that
+disagrees with the lock, a payload whose trailer sha disagrees (W5's `verify`) —
+the client must refuse loudly and NEVER install a partial artifact.
+
+** W8 — ONE PATH: the build is a BUNDLE, not a lock
+
+"Can this be made easier with `reload`'s machinery? And/or the
+bundles/checkpoints? One path, one approach, and it doesn't need locks at the
+system level anymore because it can handle it." — Yes, and it removes the
+claim-file protocol as a separate invention:
+
+- **The unit is the bundle.** `reload` already defines the transaction: `stage`
+  edits, then `commit` either applies the WHOLE bundle atomically or HOLDS it
+  with every reason and the old code still serving — "nothing half-applied is
+  ever observable". A build's wave set is exactly such a bundle.
+- **Coherence is STATIC** (reload's load-bearing property: judging a bundle must
+  not evaluate it). For a build the predicates already exist: dangling reference
+  (a source requiring a namespace neither in the bundle nor in the image — the
+  plan's closure check), promise (`declare`d, never built), **removal** (a beam
+  the new sources no longer define — reload's `removal-errors` IS the rename
+  ethics the build needs when a source moves or disappears), and contract/type →
+  the AOT key.
+- **The attached migration is the drift gate.** reload holds a
+  contract-changing bundle as incoherent UNTIL a migration is attached. Changing
+  the compiler, the seed, or the trailer format is precisely that: the old beams
+  no longer answer to the new contract, and the migration is the rebuild it
+  implies.
+- **The journal is the checkpoint.** reload's `journal` is bounded,
+  append-only, replayable and pushed to live subscribers; W2's build fact log is
+  the same shape. So: ONE log, one journal — a killed build resumes by replay,
+  and `inspect`-shaped read-models are what a monitor renders. (Measured this
+  session: there is **no** `checkpoint` subsystem in `priv/` or `lib/` — searched,
+  none. The nearest shipped machinery IS reload's journal plus the build log;
+  W8 must build on those rather than invent a third record.)
+- **One writer without a system lock.** The image has one owner by construction:
+  the tree's session, whose Executor has a single worker. A second
+  `bl self-build` stages into the same session and is QUEUED as the next bundle —
+  which is exactly the acceptance ("two concurrent runs = one build + one queued
+  request"), and needs no lock. A cold, daemonless run is a bundle that never got
+  committed, so the claim is a bundle file with an owner; liveness needs no
+  bookkeeping because reload already prunes by `is_process_alive` on the next
+  send.
+- **Ward is the warm runner.** It already keeps an image warm to run work; the
+  build is one more job on it, which is where the ~300 ms vs ~3.9 s difference
+  comes from. One warm runner per tree — not a new daemon kind.
+- **REGRESSION FOUND THIS SESSION, must be handled:** `reload`'s dev/prod signal
+  is `mix-present?` — `:erlang.module_loaded(:Elixir.Mix)`. W10 DELETES Mix, so
+  in dev that predicate becomes false and `reload-enabled?` refuses mutations:
+  the cutover would silently turn off live reload in every dev tree. The
+  replacement signal (the project value, or the session's presence) belongs in
+  W9/W10 and must not be left as Mix's absence.
+
+** W9 — approved, with one addition
+
+"Yessss." Unchanged from the plan: `:app` `:build` `:release` `:deps` wired end
+to end, `bl seed` replacing the `.exs`, `doctor --deep`. Addition: the four keys
+are also where "am I a dev image" now comes from, replacing `mix-present?` (see
+W8's regression).
+
+** W10 — observable ENOUGH
+
+"100%, just make sure it's observable enough." Concretely:
+
+- `bl build --json` / `bl self-build --json` expose the read-model (queue, wave,
+  per-source status, keys, provenance) in the same shape `reload`'s `inspect`
+  returns, so ONE monitor renders both the image and the build.
+- **Build events go into the reload journal** (`:build/run`, `:build/held`,
+  `:build/applied`), so the build appears in the same journal/subscriber stream
+  as every other change, and the dashboard pane needs no new plumbing.
+- A **provenance query** (G7) answering "which toolchain key built this beam,
+  from which sources, under which seed" — the diagnostic that makes a
+  post-cutover regression tractable. W1-R1's digests are its raw material.
+- `bl version --json` on a drop reports its own generation: build keys, seed
+  keys, app set, ERTS, target os/arch.
+- CI gates G1-G4 per build with the fixpoint grain NAMED in the output, and a
+  non-zero exit naming the first failing path.
+- Deleting Mix is itself observable: `doctor --deep` reports "Mix: absent" as a
+  PASS, and any residual `deps/`, `mix.lock`, or Mix-task beam as a failure.
+  (Measured this session: the release carries **8** `Elixir.Mix.*.beam` — 6 ours,
+  1 each from `rustler` and `rustler_precompiled` — so the check must not
+  blanket-fail on a dependency's legitimate artifact; better, the deps stop
+  shipping them.)
+
+** The end-game question — filed, not scheduled
+
+"Eventually, `bl build` and `bl self-build` should be the same thing" plus
+distributing beam and beam-lisp apps as drops ("like an app store") is filed as
+**FUP-056**, marked research: nothing in it is scheduled and nothing in it may
+be implemented inside this programme. It records what is already true (the
+trailer already names os/arch; the payload IS a library store; install-as-commit
+is reload's shape) and ten questions that must be answered in writing first.
+
+* W6-W10 REVISED — CORRECTIONS (2026-09-13, after checking the revision's own references)
+
+Three claims in the revision above were asserted from names rather than from
+reading. Two were WRONG; the third turned out to be a better answer than the
+plan had. Corrected here, and these corrections win.
+
+** 1. W7's socket reference was wrong (path and nature)
+
+There is no `priv/std/socket.bl`. `priv/lib/live/socket.bl` exists but is the
+**live-view socket** — a `defserver` mirroring a slice of a datom conn to one
+viewer (its header: `:view :shared :session :locals :tree :sink :auth`), not a
+transport. A real-socket test in W7 therefore either uses the shipped daemon's
+listener (`lib/beam_lisp/daemon.ex`, which `:gen_tcp`-listens; `web_socket.ex`
+and `server.ex` sit beside it) or a bare `:gen_tcp` listener created by the
+test itself. The in-process mock is the primary seam; the socket test is the
+one that proves framing, and its transport is the daemon's, not live's.
+
+**checked and CORRECT**: `priv/lib/veritas/mock.bl` does define exactly the
+functions the revision names — `contract-from`, `synth`, `synth-seeded`,
+`synth-invalid`, `make-mock`, `answer`, `synth-boundary`, `check`, plus
+`satisfiable?` and `satisfiable-status`. The W7 API claims stand.
+
+** 2. W8's claim about `ward` was overstated
+
+Measured, from `priv/std/reload/ward.bl`'s own header: ward is *"a warm,
+isolated, coherence-guarded pure-bl **test** runner"*, built on four properties —
+
+1. **isolation**: each file runs in `env/isolated`, its own var registry,
+   destroyed on the way out (no cross-file contamination is *representable*);
+2. **coherence-gate**: `reload/coherence` judges a file STATICALLY before it
+   runs, so a broken file yields a report with every reason instead of taking
+   the run down;
+3. **always-latest**: the source is read fresh and evaluated; **nothing
+   consults a compiled beam** — "the stale-beam class is structurally
+   impossible here, because there is no beam in the loop";
+4. **warm**: prelude and test library load once into a warm base env; each file
+   forks off it.
+
+∴ what W8 takes from ward is the **model**: a warm base, a static gate before
+work starts, per-unit isolation so one unit's failure does not sink the run.
+What it CANNOT take is the mechanism: a build's entire product is beams written
+into the tree, and ward's isolation *discards effects* by design. So "the build
+is one more ward job" is wrong; the build is a bundle committed into the tree
+(W8's main body), with ward's shape borrowed for the warm path.
+
+** 3. W1-R1 has a stronger answer than "compare digests" — found by reading ward
+
+W1-R1 (from W1): `fresh?` trusts a beam that EXISTS rather than one that is
+RIGHT. The plan's repair was detection — record per-module sha256s in the
+manifest and compare them. Ward's property 3 is the stronger form: make the
+class IMPOSSIBLE rather than detected. Applied to beams, that is the store rule
+the project already uses (`<name>-<vsn>-<sha8>`, `AOTCache`'s temp-dir+rename):
+**key the beam's path by its source digest**, so a beam that exists IS a beam
+that is right, and a changed source can only ever produce a new path.
+
+Cost, stated honestly: superseded beams accumulate and need a sweep (the W2 log
+already records what it built, so the log can say what is no longer reachable);
+and the tree's `ebin` gains hashed paths, which affects the release assembly's
+`copy-app!` and the provenance stamp. Both are ordinary work, not research.
+Prefer this to digest comparison in the manifest, and record the choice in W9 or
+W10 — whichever lands first — since W6 makes self-built trees normal.
+
+* W6 GATE MACHINERY LANDED (2026-09-13) — the comparison, with teeth
+
+Commits in the worktree: `cbb85f8` (a dead duplicate gzip codec cut from
+`drop.bl` — proved harmless by the pack suite still reporting our tar
+byte-identical to `drop pack`'s, 9728 B each) and `cd857c3`
+(`priv/build/pristine.bl`, `lib/beam_lisp/pristine.ex`, its suite, `pristine`
+added to the driver tier).
+
+Verification, observed: **27 passed** across the five touched suites (pristine,
+the tier barrier, drop, pack, release) and the driver's own `.bl` suite 34/34.
+
+** What it is
+
+| layer | what it decides |
+|---|---|
+| `trees/2` | every file's path → (size, sha256) compared as SETS — an extra or missing path is a finding, which a subset check would smooth over — plus the tar byte-for-byte |
+| `drops/2` | producer-independent trailer fields, `offset + len + 56 == size`, each trailer's digest against its own payload, and the digest of the payload DECOMPRESSED |
+| `report/1` | EVERY difference, one line each, never the first |
+| `compounds-identical?/2` | the fixpoint ONE producer can demand of itself |
+
+** Why this is the part to land first
+
+A comparison that always says "identical" is not a gate, so the suite proves it
+can FAIL: three mutations at once (added path, removed path, changed byte) yield
+three named findings and a report naming all three; a one-byte edit moves the
+tar's CONTENT even when 512 B block-granularity keeps its size equal; a non-drop
+is refused by name. Cross-producer: the Rust packer's compound and ours, for one
+tree, agree on trailer fields, payload digest and DECOMPRESSED payload while
+their compressed lengths differ (1977 vs 1999 B measured). Single-producer: two
+packs of one tree made in one run are the same file byte for byte (`bf58b686…`).
+
+** Four facts the tests found, not assumed
+
+1. A trailer's `:len` is the COMPRESSED payload's length — producer-dependent,
+   NOT a property of the tree. The first version compared it as if it were, and
+   the run said so.
+2. bl keywords containing a hyphen cross to Elixir as BINARY keys; keywords
+   without one cross as atoms. Hence letters-only keys on that boundary.
+3. `walk-files` yields `[rel abs]` PAIRS, not paths — the first `index` handed a
+   Vector to `Path.join`.
+4. `String/join` is not what the runtime uses: core's `(join sep coll)` is.
+
+Also carried as a caveat: a stored pack fixture goes stale whenever the LAUNCHER
+is rebuilt, because the launcher's length IS the trailer's `offset`. One
+comparison here first looked like packer nondeterminism and was a stale fixture;
+the fix is that the determinism check packs twice in its own run, and that
+`:offset` is a compared field, so a launcher change shows up as a difference
+instead of a mystery.
+
+** What W6 still owes
+
+Nothing above has run a BUILD twice. "The same sources built twice give an
+identical tree" is now CHECKABLE, not checked — and the composition (substrate →
+AOT waves → assemble → pack → compare) plus the verb that drives it are exactly
+what `bl self-build` must add. The pristine layers are the gate's floor, not the
+gate.
+
+* W6 GATE MACHINERY — SECOND PASS (2026-09-13): the property, CHECKED
+
+Commits `aaf426a` (code) and `b61ee6b` (record). The first pass landed the
+comparison; this pass ran the property it exists for.
+
+** What was actually run
+
+Two INDEPENDENT builds of the same nine driver sources (`priv/build/*.bl`), each
+with its own output dir, its own manifest and its own log, then compared:
+
+- **22 files, 858,453 bytes, every digest equal** — including the manifest, with
+  its per-source hashes and keys.
+- **one file differs: `build.log`** — it records the run id and the time.
+
+That is not a defect, it is the shape of the thing, and it forces a rule:
+
+** Build state must be NAMED, never guessed
+
+`index/2` and `trees/3` take a list of relative paths the CALLER names as build
+state. The comparison does not decide which files are state — a gate that
+quietly ignores files is one that passes while something is wrong. With any
+exclusion:
+- the tar layer reports **NOT COMPARED** with the reason (a tar is the whole
+  directory, so it cannot be filtered), and `:same?` rests on the index layer
+  alone — said in the result rather than silently passing;
+- and WITHOUT the exclusion the same comparison reports **exactly** that one
+  differing path — which is the test's proof that the mechanism is a disclosure,
+  not a blindfold. Both directions are asserted.
+
+** A release tree carries NO build state
+
+Verified: no `build.log`, no manifest, no lock among a release tree's 2,099
+files. ∴ the gen-2/gen-3 fixpoint W6 owes can be compared STRICTLY, with no
+exclusion at all. The exclusion exists for the build's own intermediate trees,
+not for what it ships — which also means a release that ever shipped a log or a
+manifest would be caught by the strict comparison rather than excused by it.
+
+** Suite state
+
+8/8 in the pristine suite; **37 passed** across the seven touched suites
+(pristine, the tier barrier, drop, pack, release, log, substrate).
+
+** Still owed by W6
+
+The composition: substrate → AOT waves → assemble → pack → compare, as one verb
+(`bl self-build`), and the gate that runs it twice (gen-2 vs gen-3). Every layer
+it needs now exists and has been exercised against real artifacts — what is
+missing is the verb that drives them in one process, plus the `:root` threading
+that lets the language build a tree while running from a payload.
+
+* W6-W8 LANDED (2026-09-13, autonomous pass); W9-W10 NOT STARTED
+
+** W6 — THE DROP BUILDS ITSELF. LANDED AND PROVEN.**
+
+`bl self-build` (commit `cd78605`): inside a shipped drop, assemble the release
+from the apps the VM is running from, rebuild every tier source into the new
+tree, seal it with the running launcher's own prefix bytes, verify. Measured end
+to end:
+
+    gen-1 (mix + the stock Rust launcher) → gen-2 → gen-3
+    gen-2 boots: `beam-lisp 0.1.0`, `(+ 40 2)` → 42
+    gen-2 and gen-3 are BYTE-IDENTICAL: 102,601,412 bytes each, cmp clean
+    166 tier sources rebuilt per generation, ~112 s each
+
+The gate is in the suite (`test/beam_lisp/self_build_gate_test.exs`, tagged
+`:selfbuild`, 309.5 s, PASSED) where it packs three drops and runs the fixpoint.
+Four defects were found by running it, each fixed and documented where it bit:
+the release carried no `sasl` (no boot script possible from a drop);
+`Application.spec/2` answers nil for an app that is not loaded, so inside a drop
+the app closure was one app deep and every version read "0"; the Elixir wrappers
+were sourced from a root guessed out of `BL_BIN` (the compound's path), so the
+new drop died on `bin/bl` line 15; and each generation invented its own COOKIE,
+which was the last difference between generations.
+
+Two structural changes were needed for the fixpoint to be reachable at all:
+ROOT THREADING (a source's tier key is decided by its path, so a build over a
+staged priv read every source as ordinary — `Tiers`, `AOTCache`, `build-log` and
+`build/run` now take the root, defaulting to the running priv) and STAGING AT A
+FIXED ROOT (a beam embeds the source path, and a payload lives under a directory
+named for its own hash, so all 438 beams differed between generations until the
+sources were staged at a stable, claimed path).
+
+** W7 — THE STORE AND THE HEX CLIENT. LANDED.**
+
+Commit `a399b10`. `bl deps verify|list|fetch` over a store addressed by content
+(`<name>-<vsn>-<sha8>` from the lock's digest), installed by temp+rename; a hex
+client whose transport is a RESOURCE (a value, never a stubbed function) and
+whose checks run cheapest-first with nothing written until all pass; `bl.lock` as
+line-facts, the same idiom as the build log. Measured: a hex tarball is a PLAIN
+tar whose inner `contents.tar.gz` is gzipped and CHECKSUM is UPPERCASE.
+6/6 ExUnit (install, wrong-lock refusal, lying-CHECKSUM refusal, offline verify,
+list-from-disk, sweep) and 13 `.bl` cases. The z3-backed cases GUARD and announce
+their skip: this worktree's SMT port answers nil, which is why the shipped
+`test/bl/veritas/*.bl` also fail here — an environment gap, not a behaviour.
+
+** W8 — A BUILD IS A SESSION. LANDED, with three recorded gaps.**
+
+Commit `1a34753`. `claim`: a claim is a FILE, one fact per line, naming its owner
+pid — a live foreign claim REFUSES a second builder and NAMES the holder, and a
+claim whose pid has no `/proc` entry is SWEPT, so a killed build does not wedge
+the tree; liveness is conservative on purpose. `bl build` claims its output
+directory and publishes `:build/start`/`:build/done` into `reload`'s journal
+(`reload/event!` is the public door). The NATIVE STAGE exists and is verified end
+to end on a real crate — content-keyed, claimed target dir, cdylib installed at
+`priv/native/<crate>` — 4/4 ExUnit and 7 `.bl` cases (`test/bl/native_test.bl`).
+
+Three bugs the tests found: claim files were written with `pr-str` and read with
+`read-string`, and bl's reader answers NODES, so every claim read as nil and THE
+EXCLUSION SILENTLY DID NOTHING; `native-root` read `XDG_CACHE_HOME` directly and
+`Path/join` answered a chardata error when it was nil; `:os.cmd` wants a charlist.
+
+**GAPS CARRIED, none of them hidden:**
+
+1. **The native stage's REUSE path.** A second run reports `:built 0 :cached 0` —
+   it neither rebuilds nor recognises the artefact it has, so the probe looks in
+   the wrong place for what cargo wrote. The stage works and is slower than it
+   should be. Until this is fixed, W10 must NOT delete `lib/mix/tasks/*`: that
+   task is still the only *verified* native driver.
+2. **The build-level claim is in the CLI**, not inside `build/run`. A
+   programmatic caller must claim for itself; `run` does not exclude on its own.
+3. **`bl build`'s journal events were not exercised from a separate VM.** The
+   event contract is tested (`reload/event!` writes into the journal); the CLI's
+   use of it across a process boundary is not.
+
+** W9 — NOT STARTED.** `:app`/`:build`/`:release`/`:deps` in `env.bl`, `bl seed`
+replacing the `.exs`, `bl doctor --deep`. Nothing was done here.
+
+** W10 — NOT STARTED.** `bl test` for `.exs` (ExUnit into the payload), the
+deletions (`mix.exs`, `mix.lock`, `lib/mix/tasks/*`, `deps/`), CI on
+`bl self-build`, docs. Nothing was done here, and the cutover MUST NOT begin
+before gap 1 is closed.
+
+** Why they were not reached, stated plainly.** The pass spent its budget on
+W6-W8: each wave's debugging was several times its estimate (W6 alone needed four
+root-cause fixes inside the drop, plus two structural changes), and the work was
+verified rather than rushed — the fixpoint gate, the refusals, and the claim
+semantics each cost iterations that the plan did not anticipate. W9 and W10 are
+the remaining work, with W10 additionally blocked on gap 1.
+
+* THE NATIVE PROBE FIXED, AND W9a LANDED (2026-09-13)
+
+** The W10 prerequisite is closed: the native stage reuses.
+
+The stage never reused anything. The reason was measured, not deduced: two key
+directories under the store for one unchanged crate —
+
+    ~/.cache/beam_lisp/native/5d75c2f9cae262bbf8f93358581351d7/tiny/release/libtiny.so
+    ~/.cache/beam_lisp/native/3aeefb6eda15d44e6f2f8f67e5cc428d/tiny/release/libtiny.so
+
+— and `:built 0 :cached 0` on the second run: it neither rebuilt nor recognised.
+`Cargo.lock` sat in the key's input set UNCONDITIONALLY, and cargo WRITES that
+file when it is missing, so the first build hashed a set without it and every run
+after hashed a set with it.
+
+The rule now: a lock naming ONLY the crate is not an input — its content is a
+function of `Cargo.toml` and carries nothing the manifest does not. A lock naming
+other packages IS an input: it is a real declaration, it is checked in, and cargo
+leaves a consistent lock alone. Nothing is lost — all five crates in `native/`
+ship committed locks of 15, 15, 57, 114 and 275 packages.
+
+Observed after the fix (fresh crate in one VM, real crate in a separate VM):
+
+    tiny:      key before any build == key after the build (cargo wrote Cargo.lock)
+               R1 built 1 cached 0 · R2 built 0 cached 1 · R3 built 0 cached 1
+               edit src/lib.rs → a different key → R4 built 1 (staleness intact)
+    lazy_memo: key 6dcbadc3… before == after · R1 built 0 cached 1 IN A SECOND VM ·
+               dest priv/native/lazy_memo exists, 706,760 bytes · R2 cached 1
+
+Commit `e904770`. `test/bl/native_test.bl` 12 passed, including
+`a-generated-lock-does-not-move-the-key` — the regression case, by name.
+
+** W9a landed: the project declares what it IS, and the image kind replaces Mix.
+
+Commit `d368209`. `env.bl` gains `:app`, `:build`, `:release`, `:deps`, normalized
+by the same total normalizers (one error per problem, all problems in one pass,
+no key silently ignored), and beam-lisp's own `env.bl` declares all four. A test
+reads THIS repository's file, so it is a live contract rather than an example.
+
+reload no longer asks whether Mix is loaded. It asks what KIND of image this is,
+declared by whoever built it: `BL_BIN` set (a drop's Rust launcher names its
+compound), `BEAM_LISP_IMAGE=release` (the shell launcher now states its kind),
+neither (a development VM) — with `BEAM_LISP_DEV=1` forcing development, which is
+how a tree declares itself and which beam-lisp's env.bl now does. Deleting Mix can
+no longer flip development to production; an answer that disappears with a
+dependency is not a signal.
+
+Two real errors found by running things, not by reading them:
+
+1. `:build :ex :exclude` entries are paths RELATIVE TO `:ex :root` (matched
+   against each file's path relative to it), so expanding them against the project
+   root made them match NOTHING — `"mix"` became `/tmp/…/mix` and the exclusion
+   excluded zero files. They are names, not paths.
+2. `unknown-errs` was called at 2 arity in three places; and a keyword inside a
+   message renders WITHOUT its colon (`unknown key wat`), which a test caught.
+
+Verified: `test/bl/env_test.bl` 34 passed; `test/bl/reload/image_test.bl` 14
+passed; the whole reload directory 7 files / 185 tests green; the launcher marker
+present in `Elixir.BeamLisp.Ns.Release.beam` and the reader in
+`Elixir.BeamLisp.Ns.Reload.beam`.
+
+NOT verified, and recorded as such: no release tree or drop was assembled in this
+pass, so the GENERATED launcher file was not read end to end (the last full
+assembly was W4's gate, before this change). The four new keys are DECLARED but no
+build path consumes them yet — `bl build`/`bl self-build` still take flags, which
+is the next piece of W9.
+
+** An honest unknown.** An earlier phrasing of the four new doc bullets broke the
+literate compile of `env.bl.md` ("argument error"). The code was provably fine —
+the same text compiles as a plain `.bl` — and I bisected to code-only (green) vs
+prose (red), but did NOT isolate the offending line. The shipped phrasing compiles
+and its tests pass. What is known: prose in this file is load-bearing in a way I
+have not characterised, so prose edits there deserve a compile immediately after.
+
+** Remaining: W9's `bl seed` and `doctor --deep`, the key CONSUMERS, and all of
+W10 (`bl test` with ExUnit in the payload, the deletions, CI, docs).
+** W9b — the declared keys have a consumer (2026-09-13, commit `bbb80f2`).
+
+`bl build` with no arguments now builds what the tree declared: `:build`'s roots,
+output dir, width and natives, with flags still winning. The observed payoff is
+that `:native` from the declaration exercised ALL FIVE real crates — built once,
+then "from cache" on two later runs in separate VMs (datom_datalog, datom_fjall,
+datom_vector, lazy_memo, wry_webview at 275 packages). The caveat carried after
+`e904770` ("the other four crates share the code path but were not built") is
+resolved by observation.
+
+One bug found by running it: `:paths` are ROOTS and the driver takes FILES, so
+the declared root was read as a single source and answered `illegal operation on
+a directory`. Roots are expanded like a PATH argument now.
+
+One inference of mine measured WRONG and corrected: I read a run that printed a
+read error and said "up to date" as exiting 0 with errors swallowed. It does not
+— the read error reaches `:errors` (build.bl:463 → :476) and the exit code is 1.
+`build/run` was already honest; I had not looked at the exit code.
+
+`test/bl/env_test.bl` 40 passed, now including a live contract: this repository's
+own env.bl must name real directories holding ≥14 `.bl` sources, its seed must
+exist, and its release cookie must be `:inherit` — the property the self-build
+fixpoint depends on.
+
+** Still open in W9: `bl seed` (replacing `mix run priv/bootstrap/gen_manifest.exs`),
+`bl doctor --deep`, and the `:app`/`:release` consumers — which arrive with the
+`bl build --release` / `--self` unification, since `assemble` currently derives the
+release's identity from the RUNNING app rather than from the declaration.
+
+* W10 LANDED, WITH ONE MEASURED BLOCKER (2026-09-13)
+
+** The toolchain runs without Mix — proven, not asserted.
+
+`bin/bl` starts the application, puts the app's and its dependencies' beams on the
+code path, and calls `bl.cli/run-argv` — the same entry the drop uses — with
+`elixir` alone. Observed: `./bin/bl version` → beam-lisp 0.1.0; `./bin/bl eval
+'(println (+ 40 2))'` → 42; `./bin/bl test test/bl/env_test.bl` → 40 passed.
+
+** The build driver left the Mix tasks.
+
+`Mix.Tasks.Compile.BeamLisp` and `…BeamLispNative` were already shells over
+decisions made in `priv/build/build.bl`. Their Elixir side — flag parsing, result
+shaping, `clean/1`, `refresh_staged_build?/1`, `nif_ext/0`, `installed_path/1` — is
+now `BeamLisp.BuildTask` and `BeamLisp.NativeTask`, which need no Mix, and the Mix
+modules delegate. Thirteen test files follow the behaviour; the eleven suites that
+touch them pass 58/58.
+
+** `bl test` runs BOTH halves.
+
+`.bl` through ward (isolated forks, unchanged), `.exs` through ExUnit, one command,
+no Mix — `--json` emitting exactly one object, a failing suite exiting 1. Three
+things had to be true, each found by measurement: `test/support` compiled onto the
+code path; ExUnit started with `autorun: false` (with autorun on, its at-exit run
+printed a SECOND, empty report after ours — measured: two reports, the second
+saying `0 tests` — because an exit runs at_exit hooks, so the number a caller read
+would have been the wrong one); and no default tag exclusions, since `mix test` ran
+every tag and this must not quietly run fewer.
+
+With no arguments the corpus is the conventional one: `test/**/*_test.bl` (176)
+plus `test/**/*_test.exs` (115). Of 340 `.bl` files under `test/`, 164 are
+fixtures — running a fixture as a suite is a failure with a misleading name.
+
+** The image kind replaced `mix-present?`, in one place.
+
+`BeamLisp.Image.kind/0`: `BL_BIN` ⇒ drop, `BEAM_LISP_IMAGE` ⇒ release, neither ⇒
+dev, `BEAM_LISP_DEV=1` ⇒ dev whatever the image. `reload` (in bl) calls it to gate
+mutating reloads; the application calls it to decide whether to start the dev
+server. Both used to ask whether Mix was loaded — an answer that vanishes with Mix,
+and vanishes in the dangerous direction. beam-lisp's own `env.bl` declares
+`BEAM_LISP_DEV=1`, so the tree declares itself.
+
+** `bl.lock` replaced `mix.lock`, converted rather than re-resolved.
+
+47 facts: the same names, versions and TARBALL digests. `BeamLisp.DepsLockTest`
+refuses to let the two disagree while both exist, so the conversion cannot drift
+into a lie about what a build installs.
+
+** THE BLOCKER, measured rather than assumed.
+
+Dependency PROVISIONING still needs Mix: of the 47 locked packages, 44 build with
+`mix` and 3 with `rebar3`, and `deps/` is gitignored — a fresh clone never had the
+sources. `bl deps fetch` obtains and verifies hex tarballs into a content-addressed
+store; the substrate compiles `.ex` in one batch; nothing joins the two, so no
+compiled dependency reaches the code path without Mix.
+
+Deleting `mix.exs`, `mix.lock` and `deps/` today would leave a fresh clone
+unbuildable — a regression wearing a completion's clothes. They stay, CI keeps one
+visible Mix step (`mix deps.get && mix deps.compile`) as its FIRST step, and the
+gap is filed as FUP-050 with its acceptance written down. Everything after that step
+in CI is `bl`.
+
+** The full suite, run for the first time since W2.
+
+`bl test` over the whole corpus: 1580/1595 passed in 641 s. Fifteen failures,
+classified rather than waved at:
+
+  * ONE mine and real: `pristine.ex` used a bare `is_map/1`, which the project's
+    lint rejects (a struct is a map too; eleven beam-lisp kinds must never take a
+    map path). Fixed, with the reason it is correct there.
+  * ONE a stale expectation of mine: `build_release_test` demanded every app in the
+    `.rel` be `permanent`, but `:sasl` is `none` BY DESIGN — the assembly tools are
+    carried, not started, which is how a drop can run `bl self-build`. The test now
+    takes the permanent set from the API, and
+    `BeamLisp.Release.app_permanent_set/1` exists so it can.
+  * ELEVEN pass in isolation and fail in batches: `BuildSessionTest` (spawning
+    `mix bl build` under a 60 s timeout), both `DaemonEnvTest` cases,
+    `DaemonExecutorTest`, `DaemonPortsTest`, and all four `TestVerbTest` cases.
+    They start daemons and child VMs; this host runs zram under load (AGENTS.md:
+    46 GB RAM with zram holding ~19 GB, heavy builds competing with vCPUs).
+    Attributed to contention, with the evidence that each passes alone.
+  * TWO NOT attributed: `AnfDirectEmitTest` (68 frozen compiler-corpus snapshots
+    differ) and three `ExamplesTest` cases (`examples/system/02`,
+    `examples/semantic/13`, `examples/veritas/03` — the last needs z3, whose SMT
+    port answers nil in this worktree, which is also why the shipped
+    `test/bl/veritas/*.bl` fail here). Neither is plausibly downstream of W9/W10;
+    neither was chased to a cause. Open, not excused.
+
+** Prose in a literate file is load-bearing in a way I did not characterise.** An
+earlier phrasing of four doc bullets broke the compile of `env.bl.md`; I bisected to
+prose (the same code compiles as a plain `.bl`) but never isolated the line. The
+shipped phrasing compiles and its tests pass. Worth knowing before the next prose
+edit there.
+
+** Still open after W10: `bl seed` (W9c, not ported) and `bl doctor --deep` (W9d,
+not written). Both are named in `docs/build/the-toolchain-without-mix.md` as not
+done, rather than left to read as complete.
+

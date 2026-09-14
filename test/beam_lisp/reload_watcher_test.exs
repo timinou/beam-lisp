@@ -199,4 +199,100 @@ defmodule BeamLisp.ReloadWatcherTest do
         :ok
     end
   end
+  # ── debounce (blueprint FUP-020) ─────────────────────────────────────
+  #
+  # One save is many inotify events (create + modify + attrib + close; more
+  # under an editor's write-tmp/rename dance). Before the debounce each event
+  # ran the full stage→commit: ONE save committed the same bundle 13 times on
+  # the reference host, and an event landing mid-write staged partial
+  # content. These tests drive the watcher with SYNTHETIC events (the
+  # FileSystem message shape) so the multiplicity is exact, not observed.
+
+  test "a burst of events for one path applies ONCE", %{dir: dir} do
+    path = write!(dir, "burst.bl", "(ns w.burst)\n(defn v [] 1)\n")
+    test_pid = self()
+
+    apply_counting = fn _source, p, _commit? ->
+      send(test_pid, {:applied, p})
+      %{status: :applied, applied: [], errors: []}
+    end
+
+    {:ok, _} =
+      ReloadWatcher.start_link(
+        dirs: [dir],
+        name: :wtest_burst,
+        apply: apply_counting,
+        quiet_ms: 30
+      )
+
+    on_exit(fn -> stop(:wtest_burst) end)
+
+    # The inotify reality of one save, delivered as a burst. The watcher's
+    # handler only accepts events from ITS FileSystem process, so the
+    # synthetic sender is the watcher's own fs pid.
+    fs = :sys.get_state(:wtest_burst).fs
+
+    for events <- [[:created], [:modified], [:modified], [:attrib], [:closed]] do
+      send(:wtest_burst, {:file_event, fs, {path, events}})
+    end
+
+    ReloadWatcher.drain(:wtest_burst)
+
+    received = collect_applied([])
+    assert received == [path], "expected exactly one apply, got: #{inspect(received)}"
+  end
+
+  test "a deleted file reports :removed once and never stages", %{dir: dir} do
+    path = write!(dir, "gone.bl", "(ns w.gone)\n(defn v [] 1)\n")
+    test_pid = self()
+
+    apply_counting = fn _source, p, _commit? ->
+      send(test_pid, {:applied, p})
+      %{status: :applied, applied: [], errors: []}
+    end
+
+    on_result = fn result -> send(test_pid, {:result, result}) end
+
+    {:ok, _} =
+      ReloadWatcher.start_link(
+        dirs: [dir],
+        name: :wtest_gone,
+        apply: apply_counting,
+        on_result: on_result,
+        quiet_ms: 30
+      )
+
+    on_exit(fn -> stop(:wtest_gone) end)
+
+    File.rm!(path)
+
+    fs = :sys.get_state(:wtest_gone).fs
+
+    for events <- [[:attrib], [:deleted]] do
+      send(:wtest_gone, {:file_event, fs, {path, events}})
+    end
+
+    ReloadWatcher.drain(:wtest_gone)
+
+    # Nothing was staged (no file to read)…
+    assert collect_applied([]) == []
+    # …and the subscriber heard ONE :removed, tagged with the path.
+    assert [%{status: :removed, path: ^path}] = collect_results([])
+  end
+
+  defp collect_applied(acc) do
+    receive do
+      {:applied, path} -> collect_applied([path | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_results(acc) do
+    receive do
+      {:result, r} -> collect_results([r | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
 end

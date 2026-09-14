@@ -17,9 +17,11 @@
 ; live fact changes through datom's watch: "tell me when my function gains or
 ; loses a caller".
 ;
-; The tools run against beam-lisp indexing ITSELF (priv/std/codebase.bl +
-; priv/std/typed.bl). The datom conn is built on first use, so requiring this
-; namespace reads no files and transacts nothing.
+; The tools serve TWO mounts, in order: beam-lisp's own engine (priv/std/
+; codebase.bl + priv/std/typed.bl — the very code answering these questions),
+; and, when the command runs inside a project, that tree's own namespaces read
+; from env.bl's `:paths`. The datom conn is built on first use, so requiring
+; this namespace reads no files and transacts nothing.
 ;
 ; Design principle (Anthropic's code-execution-with-MCP; CodeRLM; LogicLoc,
 ; arXiv 2604.16021): only answers cross the wire.
@@ -33,30 +35,118 @@
 
 (ns mcp.tools
   (:require [bl.ask :as ask]
+            [bl.env :as env]
+            [bl.util :as u]
             [codebase]
+            [code.index]
             [typed]
             [datom]
             [datom.watch]
             [mcp.instructions :as instr]
             [system.core :as sys]
-            [z3]))
+            [system.decide :as decide]
+            [z3]
+            [bl.oracle :as bo]))
 
-;; ── the mounted codebase (a real fixture: beam-lisp indexing itself) ──
+;; ── what gets mounted: the engine, then the tree you are standing in ──
 ;;
-;; We dogfood: index priv/std/codebase.bl and priv/std/typed.bl — the very engine
-;; answering these questions — into one fact database. "The checker as a
-;; database" (examples/typing/02_codebase_demo.bl, act 2).
+;; The engine indexes ITSELF — priv/std/codebase.bl and priv/std/typed.bl, the
+;; very code answering these questions ("the checker as a database",
+;; examples/typing/02_codebase_demo.bl act 2) — and that is always mounted:
+;; every answer about the language needs it, and it is two namespaces.
+;;
+;; On top of it, when the command runs inside a PROJECT (an env.bl, found by
+;; walking up from the client's cwd), the tree's OWN namespaces are mounted,
+;; read from env.bl's `:paths`. Those are the same roots `bl` hands the loader,
+;; so "what this server serves" and "what a require resolves" cannot drift
+;; apart — and `bl mcp` in a checkout answers questions about the code the
+;; caller is editing, not only about the language it is written in. With no
+;; project file (or nothing loadable under its roots) the engine alone is the
+;; honest answer, which is what a bare `bl mcp` from /tmp gets.
+;;
+;; A namespace's SOURCE is read the way the loader reads it
+;; (`BeamLisp.Loader/read_source`: the bytes for a plain `.bl`, the concatenated
+;; code cells for a literate `.bl.md`), and its NAME is the one the file
+;; DECLARES (`bl.util/ns-of`), never the one its path would suggest: the loader
+;; itself skips a candidate whose declared ns differs, so a project file may be
+;; named after the tool it is (`tooling/catalog.bl` declaring
+;; `tooling.catalog-app`) without hijacking a shipped namespace.
 
 (def sigs (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
 
-(def MOUNTED
-  ;; The namespaces that become facts, by NAME. A source is resolved the way
-  ;; the loader resolves any require — through the priv tiers, wherever the
-  ;; application is installed — so the mount is independent of the process's
-  ;; cwd. A repo-relative path here worked only when you happened to run from
-  ;; the checkout (`bl mcp` in a release, from anywhere else: `:enoent` read as
-  ;; a source string, then a reader crash that named nothing).
-  ["codebase" "typed"])
+(def engine-mount
+  ;; The language's own two namespaces, spelled as a mount group like any other.
+  ;; They have no file of their own to read, so a source of nil means "resolve
+  ;; this one BY NAME through the load path" (see mount-source): a name is what
+  ;; resolves in a release installed anywhere, while a path only ever resolved
+  ;; from the checkout that wrote it.
+  {:name "beam-lisp"
+   :title "beam-lisp self-index (codebase.bl + typed.bl)"
+   :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
+   :sources (to-list (map (fn [ns-str] [ns-str nil]) ["codebase" "typed"]))})
+
+(defn- project-roots
+  "The tree's declared roots and the loader sources under them, WITHOUT reading
+   a byte of any of them. A plan is a count and a name; reading every source to
+   name them would cost what the mount costs (see mount-plan)."
+  []
+  (let [p (env/project (BeamLisp/cwd))
+        roots (to-list (:paths p))]
+    (when (seq roots)
+      {:name (or (:name p) "project")
+       :roots roots
+       :files (to-list (mapcat u/expand-targets roots))})))
+
+(defn- project-mount
+  "The tree's own namespaces as a mount group — from env.bl's `:paths`, which
+   are absolute, already discovered by walking up from the command's cwd — or
+   nil when there is no project file, no roots, or nothing loadable under them.
+   `exclude` names namespaces another group already mounts, so one source is
+   never indexed twice. This is where the tree is READ: `u/ns-of` parses each
+   file's head, which is why the plan above does not do it."
+  [exclude]
+  (let [p (env/project (BeamLisp/cwd))
+        roots (to-list (:paths p))]
+    (when (seq roots)
+      (let [sources (reduce
+                      (fn [acc f]
+                        (let [src (BeamLisp.Loader/read_source f)
+                              ns-str (u/ns-of src)]
+                          (if (or (= "user" ns-str)
+                                  (contains? exclude ns-str)
+                                  (some (fn [pr] (= ns-str (first pr))) acc))
+                            acc
+                            (conj acc [ns-str src]))))
+                      []
+                      (mapcat u/expand-targets roots))
+            name (or (:name p) "project")]
+        (when (seq sources)
+          {:name name
+           :title (str name " — " (count sources) " namespaces under " (join " " roots))
+           :description "The project's own namespaces, read from env.bl's :paths: fn/call facts, return types, call graph."
+           :roots (to-list roots)
+           :sources sources})))))
+
+(defn- mount-groups
+  "The mounts, in order: the engine, then this tree."
+  []
+  (let [tree (project-mount (set (map first (:sources engine-mount))))]
+    (if (some? tree) [engine-mount tree] [engine-mount])))
+
+(defn mount-plan
+  "What a mount WOULD index, without reading a byte of it: one row per group,
+   with the roots and a source COUNT. A handshake has to answer fast, and naming
+   the sources costs a parse each — minutes on a real corpus — so the plan speaks
+   in counts, and `project-mount` does the reading when the mount is paid for."
+  []
+  (let [tree (project-roots)]
+    (to-list
+      (concat [{:name (:name engine-mount) :title (:title engine-mount)
+                :sources (count (:sources engine-mount))}]
+              (when (some? tree)
+                [{:name (:name tree)
+                  :sources (count (:files tree))
+                  :roots (to-list (:roots tree))}])))))
 
 (defn- offset-facts
   "Shift every :db/id by delta so multiple files never collide. codebase.bl
@@ -80,69 +170,195 @@
     (throw (ex-info (str "mcp.tools: no source for " ns-str " on the load path")
                     {:ns ns-str :searched (BeamLisp.Tiers/dirs)}))))
 
-(defn- mount!
-  "Index every MOUNTED namespace into one fresh datom conn, id-offset each."
-  []
-  (let [conn (codebase/connect-codebase)]
-    (reduce (fn [i ns-str]
-              (let [facts (codebase/index-source sigs ns-str (mount-source ns-str))
-                    delta (* i 1000000)
-                    all (concat (offset-facts (:fn facts) delta)
-                                (offset-facts (:calls facts) delta)
-                                (offset-facts (:instr facts) delta))]
-                (datom/transact! conn all)
-                (+ i 1)))
-            0 MOUNTED)
-    ;; The instruction corpus mounts beside the code facts: one conn, so
-    ;; code/query reaches the :instr/* facts with the same datalog.
-    (instr/mount! conn)
-    conn))
+(defn tree-key
+  "Which tree a mount belongs to: the project file's root, or the command's cwd
+   when there is none. Read it where a binding is LIVE — a spawned process does
+   not inherit the process dictionary, so a server reads it once at startup and
+   binds it per request (mcp.server), rather than asking again inside the process
+   that does the indexing.
 
-; Built once, on first use — requiring this namespace reads no files and
-; transacts nothing; the mount happens the first time a tool asks for `conn`.
+   The memo is PER VM and one daemon serves many clients from it, so a mount may
+   only be reused for the tree it was built for — otherwise a client standing in
+   one project would be answered with another one's facts, which is worse than
+   being slow."
+  []
+  (let [p (env/project (BeamLisp/cwd))]
+    (or (:root p) (BeamLisp/cwd))))
+
+(defn- group-metadata
+  "The `{:groups … :core-names …}` a mount reports, from the per-source tally
+   the index kept when it read the facts.
+
+   ONE shape for both paths — the tree's shared index and a mount built here —
+   so the two cannot disagree, and neither re-reads a source to count what the
+   indexing pass already counted. `per-source` is nil for a mount built here,
+   in which case the rows that pass produced are the tally."
+  [groups conn per-source rows]
+  (let [rs (to-list (or per-source rows))
+        of-group (fn [g] (filter (fn [r] (contains? (set (map first (:sources g))) (:ns r))) rs))
+        counted (reduce (fn [acc r]
+                          (if (contains? acc (:ns r))
+                            acc
+                            (assoc acc (:ns r) r)))
+                        {} rs)]
+    (into {:key nil :conn conn}
+          {:groups (to-list
+                     (map (fn [g]
+                            (let [grs (of-group g)
+                                  m {:name (:name g)
+                                     :title (:title g)
+                                     :description (:description g)
+                                     :sources (to-list (map first (:sources g)))
+                                     :entities {:namespaces (to-list (sort (distinct (map :ns grs))))
+                                                :functions (reduce (fn [n r] (+ n (:functions r))) 0 grs)
+                                                :calls (reduce (fn [n r] (+ n (:calls r))) 0 grs)}
+                                     :uri (str "code://" (:name g) "/schema")}]
+                              (if (some? (:roots g)) (assoc m :roots (to-list (:roots g))) m)))
+                          groups))
+           ;; core + every name the index holds. Asked of the FACTS, not of
+           ;; `Env/public_names`: that call LOADS the namespace, and loading a
+           ;; forty-file plant to answer a question about its call graph is the cost
+           ;; this server exists to avoid. The set is a superset of the public names
+           ;; (a private def is defined too), which is the safe direction for
+           ;; `unknown-callees`: it flags a callee with no definition anywhere, and
+           ;; every name here is one we just indexed.
+           :core-names (into (set (BeamLisp.Env/public_names "core"))
+                             (mapcat (fn [r] (:names r)) (vals counted)))})))
+
+(defn- index-groups!
+  "Index `groups` into one datom conn, id-offsetting each source so two files
+   never collide, and tally what each group contributed.
+
+   `:conn` is the TREE'S OWN index when the groups are the ones it holds — the
+   engine and this project, which is every normal mount. That conn belongs to
+   the daemon's index worker, so it survives the request (that is the whole
+   FUP-022 lesson) and is shared with `bl ask` and `bl search`: three doors, one
+   index, one analysis. Only a mount the tree's index does NOT cover (a caller
+   standing elsewhere) falls back to building here, from the same per-source
+   caches."
+  [groups key]
+  (let [shared (try (code.index/ensure-tree (BeamLisp/cwd)) (catch e nil))
+        n-sources (count (to-list (mapcat (fn [g] (:sources g)) groups)))]
+    (if (and (some? shared)
+             (= (count (to-list (:sources shared))) (+ n-sources 2)))
+      ; The tree's own index — the engine's 2 bands plus every source these
+      ; groups name — already holds exactly this mount. Reuse it: it belongs to
+      ; the index worker, so it outlives this request and is shared with
+      ; `bl ask` and `bl search`.
+      (do
+        ; The instruction corpus mounts beside the code facts — one conn, so
+        ; code/query reaches :instr/* with the same datalog — and mounting is
+        ; idempotent (`:instr/id` is an identity), so the shared conn can carry
+        ; it just as the local one does.
+        (instr/mount! (:conn shared))
+        (assoc (group-metadata groups (:conn shared) (:per-source shared) nil) :key key))
+      (let [conn (codebase/connect-codebase)
+            rows (reduce
+                   (fn [acc [g [ns-str src]]]
+                     (let [facts (codebase/index-source sigs ns-str (or src (mount-source ns-str)))
+                           delta (* (:i acc) 1000000)
+                           all (concat (offset-facts (:fn facts) delta)
+                                       (offset-facts (:calls facts) delta)
+                                       (offset-facts (:instr facts) delta))]
+                       (datom/transact! conn all)
+                       {:i (+ (:i acc) 1)
+                        :rows (conj (:rows acc)
+                                    {:group (:name g) :ns ns-str
+                                     :functions (count (:fn facts))
+                                     :calls (count (:calls facts))
+                                     :names (mapv (fn [f] (get f :fn/name)) (:fn facts))})}))
+                   {:i 0 :rows []}
+                   (mapcat (fn [g] (map (fn [s] [g s]) (:sources g))) groups))]
+        (assoc (group-metadata groups conn nil (:rows rows)) :key key)))))
+
+; The mount is built on first use, and it is built in the order a client
+; experiences it: the ENGINE first — two namespaces, seconds — because a
+; handshake has to answer fast (an editor gives up on a slow one) and because
+; the instruction corpus is read off it. The TREE follows, from env.bl's
+; :paths, the moment a code question actually arrives: a real tree is minutes to
+; index (blueprint: 43 sources, ~90s; beam-lisp's OWN :paths, 327 sources,
+; minutes), and charging that to `initialize` would make the server look dead
+; before it had been asked anything. `mounted?` tells the two states apart and
+; `plan-line` says what is still coming.
 ;
 ; "Once" means once while the memo is USABLE. A conn's store and blob store are
-; ETS tables owned by the process that mounted them, so this atom — VM-global,
-; written by whichever process asked first — can outlive what it names. In the
+; ETS tables owned by the process that mounted them, so these atoms — VM-global,
+; written by whichever process asked first — can outlive what they name. In the
 ; daemon that is the normal case, not an edge: commands run in one worker, and
 ; a worker that dies (a linked crash, a staleness restart) takes the tables
 ; with it while the memo keeps handing the dead conn out. Every later request
 ; then dies inside `:ets.lookup` with "the table identifier does not refer to an
 ; existing ETS table", which reads like a corrupt store rather than what it is:
 ; a memo outliving its owner. So ask before trusting one.
-(def ^:private the-conn (atom nil))
+;
+; Each mount is held as ONE value — conn, groups and core-names together — so a
+; re-mount cannot hand out a conn from one build and counts from another.
+(def ^:private the-engine (atom nil))
+(def ^:private the-mount (atom nil))
+
+(defn- live-mount
+  "The memo discipline in one place, for both mounts: hand back the current one
+   when its substrate is still there AND it belongs to this tree, otherwise
+   rebuild and CAS it in."
+  [cell key rebuild]
+  (let [m @cell]
+    (if (and (some? m) (= key (:key m)) (datom/alive? (:conn m)))
+      m
+      (let [_ (when (some? m) (datom/release! (:conn m)))
+            fresh (rebuild)]
+        (if (compare-and-set! cell m fresh) fresh @cell)))))
+
+(defn- mount-engine! [] (index-groups! [engine-mount] nil))
+(defn- mount! [] (index-groups! (mount-groups) (tree-key)))
+
+(defn engine-conn
+  "The language's own index, on its own: what the handshake and the instruction
+   corpus read, so a client is told how to hold this server without waiting for
+   a tree to be indexed first. It does not depend on the tree, so it is not
+   keyed by one."
+  []
+  (:conn (live-mount the-engine nil mount-engine!)))
+
+(defn mounted?
+  "Whether THIS tree has been indexed yet — the question the instruction corpus
+   asks before it reports counts (a plan is honest; a count of zero is not)."
+  []
+  (let [m @the-mount]
+    (and (some? m) (= (tree-key) (:key m)) (datom/alive? (:conn m)))))
 
 (defn conn
-  "The self-indexed codebase: one datom conn over every MOUNTED source."
+  "The self-indexed codebase: one datom conn over every mounted source. First
+   use indexes the tree as well, so this is the call a code question pays for."
   []
-  (let [c @the-conn]
-    (if (and (some? c) (datom/alive? c))
-      c
-      (let [_ (when (some? c) (datom/release! c))
-            fresh (mount!)]
-        (if (compare-and-set! the-conn c fresh) fresh @the-conn)))))
+  (:conn (live-mount the-mount (tree-key) mount!)))
 
-;; core callee set for the mounted namespaces — the "always defined" names
-;; (core + each mounted ns's publics) so unknown-callees does not flag them.
-(def core-names
-  (reduce (fn [s ns-str]
-            (into s (codebase/core-callee-names ns-str)))
-          #{} MOUNTED))
+(defn mounts
+  "What this server serves, in order: the engine, then — when the command runs
+   inside a project — this tree's own namespaces, read from env.bl's `:paths`.
+   Each entry is a `code/list` row: name, title, description, its namespaces,
+   the fn/call counts it contributed, and (for a tree) the roots it came from."
+  []
+  (:groups (live-mount the-mount (tree-key) mount!)))
 
-;; ── helpers ─────────────────────────────────────────────────────────
+(defn core-names
+  "The always-defined set `unknown-callees` measures against: the public core
+   names plus every function this mount indexed (see index-groups!'s note)."
+  []
+  (:core-names (live-mount the-mount (tree-key) mount!)))
 
-(defn- keywordize [m]
-  (reduce (fn [out kv] (assoc out (keyword (key kv)) (val kv)))
-          {} (to-list m)))
-
-(defn- manifest [db]
-  {:namespaces (to-list (map first
-                             (sort (into [] (datom/q '[:find ?ns
-                                                       :where [?d :fn/ns ?ns]] db)))))
-   :functions (or (get (get (into [] (datom/q '[:find (count ?d)
-                                                :where [?d :fn/name _]] db)) 0) 0) 0)
-   :calls (or (get (get (into [] (datom/q '[:find (count ?c)
-                                            :where [?c :call/caller _]] db)) 0) 0) 0)})
+(defn plan-line
+  "The mount plan as one sentence, in the voice of the live counts it stands in
+   for — what a client is owed when the tree is not indexed yet."
+  []
+  (join " + "
+        (map (fn [r]
+               (str (get r :name) " (" (get r :sources)
+                    (if (= 1 (get r :sources)) " source" " sources")
+                    (if (some? (get r :roots))
+                      (str " under " (join " " (get r :roots)))
+                      "")
+                    ")"))
+             (to-list (mount-plan)))))
 
 ;; ── tool 1: code/list ───────────────────────────────────────────────
 
@@ -150,15 +366,10 @@
   {:type "object" :properties {} :required []})
 
 (defn code-list-handler [_args]
-  (let [db (datom/db (conn))
-        m (manifest db)]
-    {:codebases
-     [{:name "beam-lisp"
-       :title "beam-lisp self-index (codebase.bl + typed.bl)"
-       :description "The code-as-facts engine indexed over itself: fn/call facts, return types, call graph."
-       :sources (to-list MOUNTED)
-       :entities m
-       :uri "code://beam-lisp/schema"}]}))
+  ;; Straight off the mount: what was indexed, from where, and how much of it.
+  ;; A client that asks "what are you serving?" gets the same list the server
+  ;; built its facts from, not a re-derivation from the store.
+  {:codebases (to-list (mounts))})
 
 ;; ── tool 2: code/query (the datalog escape hatch) ───────────────────
 ;;
@@ -233,7 +444,8 @@
                 [[] user-binds]
                 (if (empty? toks) ['$] toks))
         result (apply datom/q query-vec inputs)]
-    {:codebase (or (get args "codebase") "beam-lisp")
+    {:codebase (or (get args "codebase")
+                   (:name (first (mounts))))
      :rows (to-list (map to-list result))}))
 
 ;; ── tool 3: code/ask (named questions; MRTR for missing target) ─────
@@ -288,16 +500,18 @@
       {:resultType "complete"
        :question question
        :target target
-       :rows (ask/answer (datom/db (conn)) question target core-names)})))
+       :rows (ask/answer (datom/db (conn)) question target (core-names))})))
 
 ;; ── tool 4: code/verify (the PROVER as a tool) ──────────────────────
 ;;
 ;; "Is this change safe?" answered by a proof, not a vibe. The client sends
 ;; the SOURCE of a defserver carrying ^{:invariant …}; system.core proves the
-;; invariant holds for every state and input (z3), and when it does NOT,
-;; synthesizes the weakest guard that repairs it (the checker run backwards).
-;; This is the single-most differentiated coding-agent tool: no other MCP can
-;; return a machine-checked safety verdict + an auto-repair for a state machine.
+;; invariant holds for every transition it can MODEL (z3 — and it says how many
+;; that was: :complete/:unmodelled travel with the verdict), and when it does
+;; NOT, synthesizes the weakest guard that repairs it (the checker run
+;; backwards). This is the single-most differentiated coding-agent tool: no
+;; other MCP can return a machine-checked safety verdict + an auto-repair for a
+;; state machine.
 ;;
 ;; The z3 port is opened lazily and memoized in an atom — z3 is a real OS
 ;; process, so we pay for it only when the first verify arrives. The memo must
@@ -326,35 +540,81 @@
              :description "When the invariant fails, synthesize the weakest repairing guard"}}
    :required ["source"]})
 
-(defn code-verify-handler [args]
+(defn- proof-coverage
+  "What the checker knows about its OWN coverage. `:complete false` means some
+   transition's next-state could not be modelled and was therefore NOT checked;
+   `:unmodelled` names them. The verdict alone cannot carry that — `holds` over
+   the modelled transitions is a PARTIAL proof, and a client that cannot see the
+   difference reads it as a total one (FUP-012).
+
+   The vacuity is measured, not argued: the checker models one init parameter per
+   state variable, so
+
+     (defserver ^{:invariant (and (>= head 0) (< head length))} m
+       (init [length] (ok [0 length])) …)                       → holds, complete=false, unmodelled=[:undo]
+     …with (init [length] (ok [-1 length]))                     → holds, complete=false, unmodelled=[:undo]
+
+   The second one is an invariant that is FALSE in `head` and answered `holds`,
+   because the only transition that could catch it was never modelled."
+  [r]
+  {:complete (get r :complete)
+   :unmodelled (to-list (get r :unmodelled))})
+
+(defn- code-verify-handler-raw [args]
   (let [source (get args "source")
         want-repair (get args "repair")
         port (port!)
         node (read1 source)
-        r (sys/verify-process port node)]
+        r (sys/verify-process port node)
+        ;; What the solver could NOT decide, read from the trail `code-verify-handler`
+        ;; cleared before this call. Read once, before any branch uses it.
+        gave-up (decide/undecided)]
     (cond
       ;; nothing to prove (no ^{:invariant} or not translatable) — say so honestly.
       (not (get r :checked))
       {:resultType "complete"
        :verdict "unchecked"
+       ;; nothing was proven, so it is certainly not a total proof — the same
+       ;; field the checked arms carry, so a client never has to special-case
+       ;; the absence of one.
+       :complete false
        :reason (or (get r :reason) "no ^{:invariant} annotation to prove")}
 
-      ;; proven safe.
+      ;; The solver GAVE UP on at least one obligation. z3 answered `unknown` — a
+      ;; fragment it cannot decide, or the ceiling the pool arms — and `:holds false`
+      ;; cannot tell that apart from a counterexample, so rendering it as "violated"
+      ;; is a claim stronger than the evidence. Measured: with the ceiling at 1 ms,
+      ;; this machine — whose invariant z3 proves in milliseconds — came back
+      ;; `violated`, "invariant not preserved by withdraw" (FUP-058). Neither
+      ;; verdict is its verdict, so it gets its own.
+      (seq gave-up)
+      (assoc (proof-coverage r)
+             :resultType "complete"
+             :verdict "undecided"
+             :machine (str (get r :name))
+             :undecided (count gave-up)
+             :complete false
+             :reason "the solver did not decide every obligation: neither proved nor violated")
+
+      ;; proven safe — for the transitions the checker could model; see
+      ;; proof-coverage above for why the verdict is not the whole answer.
       (get r :holds)
-      {:resultType "complete"
-       :verdict "holds"
-       :machine (str (get r :name))}
+      (merge {:resultType "complete"
+              :verdict "holds"
+              :machine (str (get r :name))}
+             (proof-coverage r))
 
       ;; invariant violated — return the warnings, and a repair if asked.
       :else
-      (let [base {:resultType "complete"
-                  :verdict "violated"
-                  :machine (str (get r :name))
-                  :warnings (to-list (map (fn [w]
-                                            {:message (get w :msg)
-                                             :line (get w :line)
-                                             :col (get w :col)})
-                                          (get r :warnings)))}]
+      (let [base (merge {:resultType "complete"
+                         :verdict "violated"
+                         :machine (str (get r :name))
+                         :warnings (to-list (map (fn [w]
+                                                   {:message (get w :msg)
+                                                    :line (get w :line)
+                                                    :col (get w :col)})
+                                                 (get r :warnings)))}
+                        (proof-coverage r))]
         (if (not (= want-repair true))
           base
           (let [rp (sys/repair-process port node)]
@@ -368,6 +628,36 @@
                    (to-list (map (fn [x] {:transition (name (get x :label))
                                           :guard (pr-str (get x :guard))})
                                  (get rp :repairs))))))))))
+
+;; The tool entry. It adds one thing to the proof itself: WHICH TIER answered.
+;; `:tier :native-witness` means a bounded search in BEAM found the answer;
+;; `:tier :oracle` means it is the solver's. The WEAKEST link is reported, so a mixed
+;; proof never claims more than it has.
+(defn code-verify-handler [args]
+  (decide/clear-here!)
+  (let [out (code-verify-handler-raw args)
+        tiers (decide/here)
+        ;; A "holds" verdict means an UNSAT was proved, and the native rung never
+        ;; claims unsat — so a proof can only be the oracle's, whatever this
+        ;; process's trail saw. (The trail is per-process, and the verify path
+        ;; evaluates lazily, so it can legitimately miss the checks that ran
+        ;; elsewhere: under-reporting z3's part in a PROOF would be the dangerous
+        ;; direction, and this closes it by construction.)
+        tier (if (= "holds" (:verdict out)) :oracle (decide/tier-for tiers))]
+    (assoc out :tiers tiers :tier tier)))
+
+(def code-verify-stats-descriptor
+  {:type "object"
+   :properties
+   {"paths" {:type "array" :items {:type "string"}}
+    "walk" {:type "boolean"}}
+   :required []})
+
+(defn code-verify-stats-handler [args]
+  (let [paths (get args "paths")
+        walk (get args "walk")]
+    (bo/stats-report {:dirs (if (empty? paths) ["priv" "examples"] paths)
+                      :walk? (if (nil? walk) true walk)})))
 
 ;; ── tool 5: code/subscribe + code/poll (LIVE fact changes via datom/watch) ─
 ;;
@@ -458,9 +748,13 @@
     code-ask-descriptor
     code-ask-handler]
    ["code/verify"
-    "Prove a defserver's ^{:invariant} holds (z3); synthesize a repair if it fails"
+    "Prove a defserver's ^{:invariant} holds; synthesize a repair if it fails"
     code-verify-descriptor
     code-verify-handler]
+   ["code/verify-stats"
+    "What the oracle answered across a tree, and what it cost — per-machine outcomes, microseconds and tiers"
+    code-verify-stats-descriptor
+    code-verify-stats-handler]
    ["code/subscribe"
     "Watch the fact space: fire when a fn gains/loses a caller (datom L3 watch)"
     code-subscribe-descriptor

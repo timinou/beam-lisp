@@ -164,11 +164,35 @@
 
 ;; ── run a suite of files ──────────────────────────────────────────────────
 
-(defn- deftest-available?
-  "Whether the test library's `deftest` macro resolves in core — the signal that
-   the suite lib is already loaded into this image."
+(def ^:private core-module
+  "The compiled module a test file's assertions CALL: the `core` namespace
+   compiles to `BeamLisp.Ns.Core` (Link.module_for)."
+  (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Core"))
+
+(defn- assertion-runtime-loaded?
+  "Whether the assertion runtime is present in the COMPILED core module — the
+   thing a compiled test file actually calls. `is` expands into a call to
+   `is-report/4` / `is-eq-report/7` and `deftest` into `test-record/6`, and
+   those are module calls, not env lookups.
+
+   The module and core's ENV can disagree, and when they do every cheap check
+   says the library is fine while every run is broken: reloading `core` puts
+   the module back from its beam (core.bl alone — the test library is not in
+   it), while the env keeps the macro's home. `deftest` therefore still
+   resolves, the load below is skipped, and each file dies with
+   `is-report/4 is undefined or private`."
   []
-  (not (= :error (BeamLisp.Env/fetch "core" "deftest"))))
+  (and (erlang/function_exported core-module :is-report 4)
+       (erlang/function_exported core-module :test-record 6)))
+
+(defn- deftest-available?
+  "Whether the test library is USABLE in this image: the macro's home in core's
+   env AND the functions it expands into, in the compiled module. Both, because
+   the first is what makes `deftest` resolve at all and the second is what a
+   compiled file calls."
+  []
+  (and (not (= :error (BeamLisp.Env/fetch "core" "deftest")))
+       (assertion-runtime-loaded?)))
 
 (defn- ensure-test-lib!
   "Load the test library (`deftest`/`is`/`run-tests`) into core if it is not
@@ -219,15 +243,65 @@
          (catch _ nil)))
   r)
 
+;; ── the process environment, per file ────────────────────────────────────
+;;
+;; The env fork isolates the VAR registry. It does NOT isolate the OS
+;; environment: `System/put_env` is `os:putenv`, one table for the whole node,
+;; and the analysis store reads it (`BLANALYSIS_DIR`, `BL_CACHE_DIR`). A file
+;; that points a store at its own temp root at LOAD time (`test/bl/code/*`,
+;; `test/bl/datom/blanalysis-cache-test`) therefore points every LATER file's
+;; store there too — and those files fail over a resolution they never made
+;; (`bl cache prune`'s corpus tier, `bl ask`'s per-source artifacts). Green
+;; file-by-file, red in a suite: the order-dependence IS the bug. So the
+;; environment is snapshotted before a file and put back after it, exactly as
+;; the var registry is forked for it.
+;;
+;; The CONCURRENT runner (`bl test --async`) cannot do this: its files share one
+;; process, so there is no per-file environment to give them.
+
+(defn- os-env
+  "The whole process environment as {name value}, strings both. `:os.getenv/0`
+   answers \"NAME=VALUE\" per variable; a value may hold `=` itself, so only the
+   FIRST one separates name from value."
+  []
+  (reduce (fn [m kv]
+            (let [i (index-of kv "=")]
+              (assoc m (subs kv 0 i) (subs kv (inc i)))))
+          {}
+          (map (fn [kv] (erlang/list_to_binary kv))
+               (erlang/apply :os :getenv (list)))))
+
+(defn- restore-os-env!
+  "Put the process environment back the way `snap` found it: names this file
+   introduced are removed, everything else is rewritten. Additions have to be
+   named explicitly — `os:putenv` sets and unsets ONE variable, and never
+   enumerates what it added."
+  [snap]
+  (doseq [kv (map (fn [kv] (erlang/list_to_binary kv))
+                  (erlang/apply :os :getenv (list)))]
+    (let [k (subs kv 0 (index-of kv "="))]
+      (when-not (contains? snap k)
+        (System/delete_env k))))
+  (doseq [k (keys snap)]
+    (System/put_env k (get snap k))))
+
 (defn- run-file-eventful
   "Run one file, firing `:file-start` (with the file's ns, read before the fork)
    BEFORE it runs and `:file-done` after — so a live view shows the tile go from
    running to resolved. `prep` optionally transforms the source (run-sandboxed's
-   ns-prefixing) and `fix` optionally repairs the result's :ns."
+   ns-prefixing) and `fix` optionally repairs the result's :ns.
+
+   The file runs against the environment it FOUND: the OS environment is
+   snapshotted before the run and restored after it, so a file that points the
+   analysis store at its own temp root cannot decide where the NEXT file's store
+   lives (`os-env`)."
   [base src on-event prep fix]
-  (let [ns (ns-of src)]
+  (let [ns (ns-of src)
+        before (os-env)]
     (emit-start! on-event ns)
-    (let [r0 (run-file base (prep src))
+    (let [r0 (try
+               (run-file base (prep src))
+               (finally (restore-os-env! before)))
           r  (fix r0 ns)]
       (emit! on-event r))))
 
@@ -454,6 +528,10 @@
      "runs a transitive datalog impact query over the ENTIRE compiler source
       graph — correct but ~27s standalone, over the 30s deadline in an
       isolated fork with cold caches. Run it via `bl run`."
+   "examples/code-semantic/01-search-by-meaning.bl"
+     "indexes EIGHT real source files, so a fresh checkout pays the full cold
+      analysis (~79s) — over the 30s deadline. The mechanism is covered by
+      test/bl/code/semantic_test.bl; run the demo via `mix bl run`"
    "examples/catalog.bl"
      "indexes and serves the whole loom showcase (~25s standalone, over the 30s
       deadline with cold caches) and is a server meant for `bl serve`"})
@@ -467,14 +545,20 @@
 (defn- optional-dep-skip
   "If an error message names an ABSENT OPTIONAL dependency, return a short
    human reason to SKIP the example; otherwise nil (a real failure). The set is
-   deliberately small and explicit — a bundled solver binary and two optional
-   web libraries — so a genuine error is never silently swallowed as a skip."
+   deliberately small and explicit — a bundled solver binary, a DOWNLOADED
+   model, and two optional web libraries — so a genuine error is never
+   silently swallowed as a skip. The model is on the list because it is the one
+   dependency no checkout has and no `mix compile` produces: absence is its
+   ordinary state, and `code.embed` prefixes its error (“code embeddings
+   unavailable”) so that a missing model lands HERE rather than as a failure."
   [msg]
   ;; NB `index-of` returns nil (NOT -1) on a miss, and `(>= nil 0)` is TRUE in
   ;; BEAM term order — so presence MUST be tested with `some?`, never `>= 0`,
   ;; or every message would match the first branch.
   (cond
-    (some? (index-of msg "bundled z3 missing")) "z3 solver not fetched"
+    (some? (index-of msg "bundled z3 not found"))  "z3 solver not fetched"
+    (some? (index-of msg "code embeddings unavailable"))
+      "static code model not fetched (mix bl.embed.fetch)"
     (some? (index-of msg "Phoenix.PubSub"))     "Phoenix.PubSub not available"
     (some? (index-of msg "module Bandit"))      "Bandit not available"
     :else nil))

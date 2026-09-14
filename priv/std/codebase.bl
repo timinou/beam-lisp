@@ -369,16 +369,22 @@
   (index-forms sigs ns-str (BeamLisp.Reader/read_string src)))
 
 (defn connect-codebase
-  "A fresh datom conn with the codebase schema."
-  []
-  (datom/connect SCHEMA))
+  "A fresh datom conn with the codebase schema, plus `extra` definitions.
+
+   The extra is what a CALLER's derivations need. `analyze-cached` fills columns
+   into whatever connection it hands back, and the in-memory one has no store to
+   recover a schema from — so passing the columns here is the difference between
+   an uncached run that answers and one that raises `:unknown-attribute` on its
+   first fill. Unavailability is not a reason to answer differently."
+  ([] (connect-codebase []))
+  ([extra] (datom/connect (concat SCHEMA extra))))
 
 (defn transact-source! [conn sigs ns-str src]
   (let [facts (index-source sigs ns-str src)]
     (datom/transact! conn (concat (:fn facts) (:calls facts) (:instr facts)))
     facts))
 
-; --- persistent .blanalysis cache --------------------------------------------
+; --- the analysis cache: content-addressed stores -------------------------------
 ;
 ; Indexing a source (parse -> facts) and transacting those facts into a store is
 ; the expensive part of code analysis — seconds for a large file, and it is
@@ -387,7 +393,8 @@
 ; datoms. So the analysis is CONTENT-ADDRESSABLE. We persist the fully-indexed
 ; datom store at a path keyed by sha256(source); an unchanged source reopens
 ; that store (tens of ms) instead of re-indexing (seconds). This is the
-; `.blanalysis` cache — an .olean/.beam-style compiled-analysis artifact.
+; analysis cache — an .olean/.beam-style compiled-analysis artifact, kept beside
+; the project it describes (or in the host cache when that cannot be written to).
 ;
 ; Correctness never depends on the cache: a missing or stale entry just means a
 ; fresh index, and the reopened store is BYTE-IDENTICAL to a fresh one because
@@ -395,34 +402,223 @@
 ; invalidation key — change one byte and the path changes, so a stale artifact
 ; is never consulted.
 
+(defn cache-available?
+  "Whether the persistent fjall backend is USABLE in this process.
+
+   The answer can be false for a backend that is merely NOT LOADED YET: the
+   native's host module is created when the namespace that declares it is
+   initialized, and nothing in this path forces that to have happened. Observed
+   on `bl search -p priv/lib/code`: runs that happened to load the namespace in
+   process reported true and served the corpus from the store (index 176 ms);
+   runs that used the cached beams reported false and re-derived everything
+   (index 11993 ms). Filed as BUG-044 — the load is the AOT path's business, not
+   this probe's.
+
+   Public because a command about to run uncached must be able to SAY so: see
+   `bl.search`, which prints it. A silent 70x is the failure mode this exists to
+   stop."
+  []
+  (datom.store-fjall/available?))
+
+(defn- cache-writable?
+  "Whether `dir` exists or can be created. `File/mkdir_p` is Elixir's: `:ok`, or
+   an `{:error, reason}` TUPLE (not a map — `(map? {:error, :enotdir})` is false,
+   so success is what gets tested for).
+
+   This is the question that picks the TIER (below), so it runs before anything
+   is written. It is about the DIRECTORY, not the artifact: a store file that is
+   present but unopenable still raises, as it did before this check existed."
+  [dir]
+  (= :ok (File/mkdir_p dir)))
+
 (defn blanalysis-dir
-  "Where .blanalysis artifacts live: $BLANALYSIS_DIR, else /tmp/blanalysis.
+  "Where the analysis stores live: with the project that owns the corpus.
+
+   Four tiers, in order:
+     0. `$BL_CACHE_DIR` — move the store, anywhere, for every caller at once. Set
+        it and NOTHING else is consulted: not the project tier, not the host
+        cache, not the `$BLANALYSIS_DIR` below it. This is the CI lever — the
+        store goes on a volume, or into a scratch directory the job deletes —
+        and it moves ONLY the store: the model lives under the cache root
+        (`$XDG_CACHE_HOME/beam_lisp/models`), so `XDG_CACHE_HOME` is not a
+        substitute for it. A relative value resolves against the command's cwd.
+     1. `$BLANALYSIS_DIR` — the per-call spelling of the same idea, which tests
+        and single commands use. Expanded the same way.
+     2. `<project>/.local/bl/cache` — the project that owns `root`, beside the
+        other per-checkout state (`.local/blrun`, `.local/bltest`). Artifacts
+        derived from a tree belong to that tree: they are deleted with it, and
+        two checkouts never read each other's stores.
+     3. `$XDG_CACHE_HOME/beam_lisp/cache/<tree id>` — the HOST cache, for a
+        project that cannot be written to: an installed drop, a mounted
+        checkout, a CI read-only bind. Keyed by the same 16 hex a `bl` daemon
+        uses to name a tree, so re-extracting a payload finds its analysis
+        again instead of paying for it twice. Without this tier a read-only tree
+        re-analyzes from source on every run — correct, and minutes of work.
+
+   `root` is the corpus the caller is about to analyze; with none, the command's
+   own directory. `BeamLisp.Cache` does the filesystem half — which project, and
+   where the host cache is — and this decides the tier.
+
    Read PER CALL, not once at load — a test (or a build) that wants its own
    cache sets the variable and gets it, whether or not `codebase` was already
    loaded. A load-time `def` here meant the first loader of `codebase` fixed
    the directory for every later caller in the VM, and a suite asserting
-   «first analyze is a miss» against the shared /tmp cache failed on every
-   run after the first: the cache was doing its job."
-  []
-  (let [env (System/get_env "BLANALYSIS_DIR")]
-    (if (nil? env) "/tmp/blanalysis" env)))
+   «first analyze is a miss» failed on every run after the first: the cache was
+   doing its job.
+
+   `.local/bl/` is gitignored and `bl doctor` reports the directory either way."
+  ([] (blanalysis-dir nil))
+  ([root]
+   (let [forced (System/get_env "BL_CACHE_DIR")
+         env (System/get_env "BLANALYSIS_DIR")
+         base (or root (BeamLisp/cwd))
+         project (BeamLisp.Cache/project_dir base)]
+     (cond
+       (some? forced) (Path/expand forced (BeamLisp/cwd))
+       (some? env) (Path/expand env (BeamLisp/cwd))
+       (cache-writable? project) project
+       :else (BeamLisp.Cache/host_dir base)))))
 
 (defn cache-path
-  "The .blanalysis store path for `ns-str` at content hash `sha`. The ns is in
-   the name for legibility; the sha is what makes it sound — a byte-change moves
-   the path, so a stale artifact is structurally unreachable."
-  [ns-str sha]
-  (str (blanalysis-dir) "/" ns-str "." sha ".fjall"))
+  "The analysis store path for `ns-str` at content hash `sha`, in `root`'s
+   project. The ns is in the name for legibility; the sha is what makes it
+   sound — a byte-change moves the path, so a stale artifact is structurally
+   unreachable."
+  ([ns-str sha] (cache-path nil ns-str sha))
+  ([root ns-str sha]
+   (str (blanalysis-dir root) "/" ns-str "." sha ".fjall")))
 
-(defn- cache-available?
-  "Whether the persistent fjall backend loaded. Without it the cache is a no-op
-   and every analyze indexes fresh (correct, just not cached)."
-  []
-  (datom.store-fjall/available?))
+(defn manifest-key
+  "The identity of a corpus's analysis: the model that read it, and each
+   source's content hash, IN ORDER.
+
+   Order is part of the key rather than an accident of the file system: `index!`
+   gives source `i` the id band `(offset-for i)`, so the same files in another
+   order are a different index — and a memo that ignored the order would hand
+   back facts banded for a corpus that no longer exists.
+
+   `entries` is `[[ns-string sha] …]`."
+  [model-id entries]
+  (sha256-hex
+    (str model-id "|"
+         (join ";" (map (fn [e] (str (get e 0) " " (get e 1))) (to-list entries))))))
+
+(defn manifest-path
+  "The corpus memo for `key`, beside the per-file stores: same tier, same
+   directory, same cap, same eviction — an entry is an artifact, whether it is a
+   store, a loose analysis, or a whole corpus's worth of them."
+  ([key] (manifest-path nil key))
+  ([root key] (str (blanalysis-dir root) "/manifest." key ".term")))
+
+(defn read-manifest
+  "The memo for `key`: `{:value v}`, `{:absent true}` or `{:corrupt reason}`.
+
+   THREE answers rather than nil, because a caller has to be able to tell a memo
+   that is not there yet from one that is there and unreadable. The first is the
+   normal cold path. The second is a fact about the disk, and the run that found
+   it says so rather than quietly paying for the analysis a second time."
+  ([key] (read-manifest nil key))
+  ([root key]
+   (let [p (manifest-path root key)]
+     (if (File/exists? p)
+       (try
+         {:value (erlang/binary_to_term (File/read! p))}
+         (catch e {:corrupt (ex-message e)}))
+       {:absent true}))))
+
+(defn write-manifest!
+  "Remember `value` as the memo for `key`. `{:ok path}` or `{:error reason}`.
+
+   Written whole, so no reader ever sees half a memo, and named by content, so a
+   stale one is unreachable rather than wrong. Failure is RETURNED, not raised:
+   a corpus that cannot be written to — an installed drop, a read-only mount —
+   is a corpus that re-derives, not a command that fails."
+  ([key value] (write-manifest! nil key value))
+  ([root key value]
+   (try
+     (let [p (manifest-path root key)]
+       (File/write! p (erlang/term_to_binary value))
+       {:ok p})
+     (catch e {:error (ex-message e)}))))
+
+; --- derived columns ---------------------------------------------------------
+;
+; A source's ANALYSIS is cached above. Callers derive MORE from the same source
+; — `code.semantic` adds a vector per function — and that derivation is the
+; expensive half of a warm run: the reader pass and the model call are re-paid
+; every time, while the facts come back from the store in milliseconds.
+;
+; A COLUMN is such a derivation, declared by the caller and remembered by the
+; store:
+;
+;   {:ident   :fn/embedding          the attribute the column fills
+;    :schema  [{:db/ident …}]        the attribute definitions it needs
+;    :version "potion-…@1a2b3c4d"    what the store holds when it is fresh
+;    :fill    (fn [db src] [datom …])}
+;
+; VERSION is the invalidation key and it belongs to the caller: for the
+; embedding column it is the model's identity, so a new model refills the column
+; without touching a single fact. A store written before the column existed and
+; a column whose version moved are the SAME case — fill it, on the same store,
+; keeping the facts — which is why an old artifact evolves instead of missing.
+;
+; The marker is ONE datom on entity 0, an id nothing else uses: codebase numbers
+; facts from 1000 and 100000, and datom's own attribute entities start at 1.
+
+(def FILLED-WITH
+  "The attribute the marker datom carries: which column the store holds and at
+   which version — `\"fn/embedding=potion-code-16M-v2@1a2b3c4d\"`.
+
+   A string, because a datom's value must be one of the schema's value types.
+   With a second column this becomes one marker attribute per column, which is
+   a change here and nowhere else."
+  {:db/ident :code/filled-with :db/valueType :db.type/string})
+
+(def MARKER-ID
+  "The entity the marker datom lives on — below every id in use."
+  0)
+
+(defn- filled-with
+  "The marker string this store carries, or nil when it carries none."
+  [db]
+  (let [rows (into [] (datom/q '[:find ?v :where [?e :code/filled-with ?v]] db))]
+    (if (empty? rows) nil (get (first rows) 0))))
+
+(defn- column-marker
+  "What the store says once `col` is fresh."
+  [col]
+  (str (name (:ident col)) "=" (:version col)))
+
+(defn- fill-columns!
+  "Bring every column in `columns` up to its `:version`, on `conn`. Returns
+   `{ident :cached|:filled}`.
+
+   A column whose marker already matches costs one query and NOTHING else: the
+   source is not read again and the model is not called again. That is the whole
+   point of a column, and it is why the caller gets this map back — a run that
+   re-derived everything and a run that re-derived nothing must not look alike.
+
+   The fill is handed the db and the source, and answers with datoms. It runs
+   ONLY when the marker moved, so a fill that is expensive (a model, say) is
+   paid once per source per version rather than once per run."
+  [conn src columns]
+  (loop [cs (to-list columns) filled {}]
+    (if (empty? cs)
+      filled
+      (let [col (first cs)
+            marker (column-marker col)]
+        (if (= marker (filled-with (datom/db conn)))
+          (recur (rest cs) (assoc filled (:ident col) :cached))
+          (do
+            (datom/transact! conn
+                             (concat ((:fill col) (datom/db conn) src)
+                                     [{:db/id MARKER-ID
+                                       (:db/ident FILLED-WITH) marker}]))
+            (recur (rest cs) (assoc filled (:ident col) :filled))))))))
 
 (defn analyze-cached
   "A codebase connection for `ns-str`'s `src`, using the content-addressed
-   .blanalysis cache. Returns `{:conn :db :hit :sha}`.
+   analysis store. Returns `{:conn :db :hit :sha}`.
 
    HIT (the artifact for this exact source exists): reopen the persistent store
    — tens of ms, no indexing, no transacting. The datoms are already there and
@@ -434,29 +630,65 @@
    way the returned db answers every codebase query identically.
 
    `sigs` are the type seeds `index-source` needs; `ns-str` names the source;
-   `src` is its text."
-  [sigs ns-str src]
-  (let [sha (sha256-hex src)]
-    (if (not (cache-available?))
-      ; no persistent backend: index fresh into an in-memory conn (uncached)
-      (let [conn (connect-codebase)]
+   `src` is its text.
+
+   `opts` has two keys. `:root` is the corpus the source came from, which
+   decides WHERE the store lives (`blanalysis-dir`) — with none it is the
+   command's own directory. `:columns` are derivations from the same source,
+   filled into the SAME store and remembered there by version (see the column
+   section above); the result reports each as `:cached` — the store already held
+   it, and the fill did not run — or `:filled`."
+  ([sigs ns-str src] (analyze-cached sigs ns-str src {}))
+  ([sigs ns-str src opts]
+  (let [sha (sha256-hex src)
+        columns (:columns opts [])
+        ; The store follows the SOURCES, not the shell that invoked the command:
+        ; a corpus in another tree cannot scatter its stores into the cwd.
+        root (:root opts)
+        ; Every definition the columns need, plus the marker attribute. BOTH
+        ; branches install it: the durable one so the store can hold the column,
+        ; the in-memory one so the fill can write it at all. Safe to pass on a
+        ; HIT — `connect-with` writes only what the store does not already carry,
+        ; so this costs nothing when the column is there, and it is what EVOLVES
+        ; a store written before the column existed.
+        column-schema (concat (mapcat :schema columns) [FILLED-WITH])]
+    (if-not (and (cache-available?) (cache-writable? (blanalysis-dir root)))
+      ; no persistent backend, or a directory we cannot write: index fresh into
+      ; an in-memory conn (uncached)
+      (let [conn (connect-codebase column-schema)]
         (transact-source! conn sigs ns-str src)
-        {:conn conn :db (datom/db conn) :hit false :sha sha})
-      (let [path (cache-path ns-str sha)]
+        ; No store to remember anything in: fill the columns into this conn, so
+        ; the answers match a cached run's exactly. The SAME schema the durable
+        ; path installs, for the SAME reason: a column's fill writes attributes
+        ; it declared, and a connection that never heard of them rejects the
+        ; transaction — the uncached path would be broken rather than slow.
+        {:conn conn :db (datom/db conn) :hit false :sha sha
+         :columns (fill-columns! conn src columns)})
+      (let [path (cache-path root ns-str sha)]
         (if (= true (File/exists? path))
-          ; HIT: reopen the persistent store; no schema arg — it is recovered
-          ; from the stored schema datoms, and re-passing it would re-transact.
+          ; HIT: reopen the persistent store. The schema is recovered from the
+          ; store's own datoms; the columns' definitions ride along because
+          ; `connect-with` writes only the ones the store does not carry —
+          ; re-passing a recovered definition would create a SECOND attribute
+          ; entity for a unique ident and be rejected.
           (let [store (datom.store-fjall/open path)
-                conn (datom.conn/connect-with store)]
-            {:conn conn :db (datom/db conn) :hit true :sha sha})
-          ; MISS: create the dir, open a fresh persistent store, index+persist
+                conn (datom.conn/connect-with store column-schema)]
+            {:conn conn :db (datom/db conn) :hit true :sha sha
+             :columns (fill-columns! conn src columns)})
+          ; MISS: open a fresh persistent store, index + persist. The directory
+          ; is already there — `cache-writable?` asked for it above.
           (do
-            (File/mkdir_p (blanalysis-dir))
             (let [store (datom.store-fjall/open path)
-                  conn (datom.conn/connect-with store SCHEMA)]
+                  conn (datom.conn/connect-with store (concat SCHEMA column-schema))]
               (transact-source! conn sigs ns-str src)
+              ; The facts go durable BEFORE the column is attempted: when the
+              ; fill raises (no model yet), the analysis it depends on is
+              ; already cached for the run that has one.
               (datom.store-fjall/sync! store)
-              {:conn conn :db (datom/db conn) :hit false :sha sha})))))))
+              (let [columns (fill-columns! conn src columns)]
+                (datom.store-fjall/sync! store)
+                {:conn conn :db (datom/db conn) :hit false :sha sha
+                 :columns columns})))))))))
 
 ; --- the queries ----------------------------------------------------------------
 
@@ -464,6 +696,18 @@
   '[[(calls ?from ?to) [?c :call/caller ?from] [?c :call/callee ?to]]
     [(reaches ?a ?b) (calls ?a ?b)]
     [(reaches ?a ?b) (calls ?a ?x) (reaches ?x ?b)]])
+
+; The SAME edges flipped. The native magic-sets kernel demand-scopes on a
+; predicate's FIRST argument, so a reverse (impact) question asked of REACH
+; pins position 1 and cannot be demand-scoped; asked of REACH-REV it pins
+; position 0 and can. impact(b) = the forward cone of b in the flipped
+; graph: (reaches-r b a) ⟺ a transitively calls b. Without this, every
+; impact query materialised and decoded the FULL closure and filtered it
+; afterwards — measured 200 s on a 7875-edge graph vs milliseconds scoped.
+(def REACH-REV
+  '[[(calls-r ?to ?from) [?c :call/caller ?from] [?c :call/callee ?to]]
+    [(reaches-r ?b ?a) (calls-r ?b ?a)]
+    [(reaches-r ?b ?a) (calls-r ?b ?x) (reaches-r ?x ?a)]])
 
 ; The two "whole-codebase" questions are each ONE pass over calls joined against
 ; ONE pass over definitions, with the join done as set lookups in beam-lisp. A
@@ -561,9 +805,11 @@
               (into [] (datom/q '[:find ?b :in $ % ?a :where (reaches ?a ?b)]
                                 db REACH from)))
       (some? to)
+        ; reverse cone: asked of the FLIPPED rules so the bound slot is the
+        ; first argument and the magic-sets kernel computes only the cone.
         (mapv (fn [r] [(get r 0) to])
-              (into [] (datom/q '[:find ?a :in $ % ?b :where (reaches ?a ?b)]
-                                db REACH to)))
+              (into [] (datom/q '[:find ?a :in $ % ?b :where (reaches-r ?b ?a)]
+                                db REACH-REV to)))
       :else
         (mapv (fn [r] [(get r 0) (get r 1)])
               (into [] (datom/q '[:find ?a ?b :in $ % :where (reaches ?a ?b)]

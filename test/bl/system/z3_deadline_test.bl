@@ -1,0 +1,109 @@
+; test/bl/system/z3_deadline_test.bl — the three bounds, and the ORDER between them.
+;
+; FUP-057. The bound that used to decide a z3 query was neither z3's nor the
+; pool's: it was `call`'s COMPILED-IN 5000 ms (priv/boot/compiler.bl:2597). So a
+; query needing 6 s killed its caller with `{:exit, {:timeout, {:gen_server,
+; :call, …}}}` — an EXIT no `try/catch` in this language can see, and no verdict —
+; and with that raised, a query needing 10 s died inside
+; BeamLisp.Z3Port.read_answer/2 with an EMPTY accumulator, naming nothing at all.
+;
+; The chain now, innermost first, and only the innermost yields a verdict:
+;
+;   z3's own ceiling   z3pool/z3-timeout-ms      armed per lease   → :unknown
+;   the port's read    Z3Port/read_timeout       20 s default      → raises: a bug
+;   the caller's call  z3pool/call-timeout-ms    60 s              → raises: a bug
+;
+; THE HARD INSTANCE is p·q = 43925755729223607997806993733463, two 16-digit
+; primes. Bare z3 4.16 does not answer it in 30 s (measured against the binary),
+; which is what lets a test outrun a bound ON PURPOSE rather than by luck.
+
+(ns z3.deadline.test
+  (:require [z3]
+            [oracle]
+            [z3pool]))
+
+(def semi "43925755729223607997806993733463")
+
+(defn- until
+  "Poll `pred` for up to 30 s. A killed process and a port close are both
+   asynchronous, and neither has a duration worth sleeping for."
+  [pred]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n 3000) false
+      :else (do (Process/sleep 10) (recur (inc n))))))
+
+(defn- hard
+  "The same unfinishable query, with an OPTIONAL caller ceiling. With `ms` nil the
+   caller sets none, so whatever fires is the POOL's."
+  [ms]
+  (str (if (nil? ms) "" (str "(set-option :timeout " ms ") "))
+       "(declare-const p Int) (declare-const q Int) "
+       "(assert (> p 1)) (assert (> q 1)) (assert (= (* p q) " semi "))"))
+
+;; ── the ordering itself ──────────────────────────────────────────────────
+
+(deftest the-three-bounds-are-ordered
+  ;; The invariant that was violated. The innermost bound has to be the one that
+  ;; yields a verdict, so z3's ceiling sits under the port's read deadline, which
+  ;; sits under the caller's patience — and a bound above the one above it can
+  ;; never report anything.
+  (is (< (z3pool/z3-timeout-ms) (BeamLisp.Z3Port/read_timeout))
+      "z3's ceiling is under the port's read deadline")
+  (is (< (BeamLisp.Z3Port/read_timeout) z3pool/call-timeout-ms)
+      "which is under the caller's call timeout"))
+
+(deftest the-port-deadline-is-movable-and-never-disarmed
+  (is (= 20000 (BeamLisp.Z3Port/read_timeout)) "the default")
+  (try
+    (System/put_env "BL_Z3_READ_TIMEOUT" "1234")
+    (is (= 1234 (BeamLisp.Z3Port/read_timeout)) "and the env moves it")
+    (System/put_env "BL_Z3_READ_TIMEOUT" "0")
+    (is (= 20000 (BeamLisp.Z3Port/read_timeout)) "zero does not disarm the read")
+    (System/put_env "BL_Z3_READ_TIMEOUT" "abc")
+    (is (= 20000 (BeamLisp.Z3Port/read_timeout)) "and neither does nonsense")
+    (finally (System/delete_env "BL_Z3_READ_TIMEOUT"))))
+
+;; ── the ceiling is armed, and the caller can overrule it ─────────────────
+
+(deftest a-callers-ceiling-overrides-the-pools
+  ;; Last-wins is what makes the pool's number a DEFAULT rather than a policy the
+  ;; callers cannot escape: the pool arms 10 s at lease time, and a `(set-option
+  ;; :timeout …)` sent later replaces it. 50 ms against an instance that needs
+  ;; more than 30 s is only fast if the CALLER's number is the one in force, so
+  ;; the speed is the evidence — with a 60x margin against the other ceiling.
+  (let [t0 (erlang/monotonic_time :millisecond)
+        said (z3/check nil (hard 50))
+        ms (- (erlang/monotonic_time :millisecond) t0)]
+    (is (oracle/undecided? said) "the solver gives up instead of answering — a verdict, not a crash")
+    (is (< ms 3000) "because the caller's 50 ms is what made it give up")))
+
+(deftest the-pools-ceiling-answers-unknown-rather-than-killing-the-caller
+  ;; No caller ceiling, so the pool's is the one that fires — and this is the
+  ;; FUP-057 regression in one line. Before the ordered chain, this query killed
+  ;; its caller at 5624 ms on the transport's compiled-in 5000 ms. Now the
+  ;; innermost bound is z3's, and what comes back is a VERDICT.
+  (let [t0 (erlang/monotonic_time :millisecond)
+        said (z3/check nil (hard nil))
+        ms (- (erlang/monotonic_time :millisecond) t0)]
+    (is (oracle/undecided? said) "unknown, not a crash and not a silence")
+    (is (< ms 20000)
+        "and some ceiling fired: z3 alone needs more than 30 s on this instance")))
+
+(deftest the-ports-deadline-is-the-backstop-that-raises
+  ;; The middle bound, and the one that must never fire in normal operation: it is
+  ;; what makes "z3 ignored its own ceiling" a LOUD event instead of a silent
+  ;; twenty-second wait. Moved down to 300 ms here so the test costs a third of a
+  ;; second rather than twenty: the query asks z3 for 60 s, the port allows 300 ms,
+  ;; and the caller must DIE — not return a verdict. That distinction is the whole
+  ;; design: only the innermost bound is allowed to answer.
+  (try
+    (System/put_env "BL_Z3_READ_TIMEOUT" "300")
+    (let [said (atom nil)
+          pid (erlang/spawn (fn [] (reset! said (z3/check nil (hard 60000)))))]
+      (is (until (fn [] (not (Process/alive? pid))))
+          "the caller was killed by the port's read deadline")
+      (is (nil? @said) "and got no verdict, which is the difference"))
+    (finally (System/delete_env "BL_Z3_READ_TIMEOUT"))))
+

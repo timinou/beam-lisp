@@ -269,14 +269,13 @@ never has to know what a beam-lisp vector is.
   (error-resp nil -32700 (str "Parse error: " (name reason))))
 
 (defn internal-error
-  "The response to a handler that raised: JSON-RPC -32603. `detail` names the
-   method and the raise — a bare \"Internal error\" teaches the client nothing
-   and the user less."
+  "The response to a handler that raised: JSON-RPC -32603. The message stays
+   the constant the spec intends (a category, not a report); `detail` — which
+   method raised and why — rides in the error's `data`, and on the server's
+   stderr, where the client log surfaces it."
   [id detail]
-  (error-resp id -32603
-              (if (nil? detail)
-                "Internal error"
-                (str "Internal error: " detail))))
+  (let [r (error-resp id -32603 "Internal error")]
+    (if (nil? detail) r (assoc-in r ["error" "data"] detail))))
 ```
 
 ## Capabilities
@@ -383,13 +382,51 @@ no plugin: it rides the one request every editor already sends.
          (str " · calls " (join ", " (into [] (:calls p))))
          "")))
 
+(defn- name-token-end
+  "The 0-based end index (exclusive) of the name token starting at `from` in
+   `line`: the first delimiter."
+  [line from]
+  (let [n (count line)]
+    (loop [i from]
+      (if (or (>= i n) (name-boundary? line i))
+        i
+        (recur (inc i))))))
+
+(defn- defn-name-at
+  "The name of the top-level defn whose NAME TOKEN contains [line col]
+   (1-based), or nil. find-defn goes name → position; this goes the other
+   way, so pointing AT a definition's head is as answerable as pointing at a
+   call."
+  [text line col]
+  (let [line-text (get (split text "\n") (dec line))]
+    (when (some? line-text)
+      (first
+       (filter some?
+        (map (fn [head]
+               (let [k (index-of line-text head)]
+                 (when (some? k)
+                   (let [start (+ k (count head))
+                         end (name-token-end line-text start)]
+                     ;; col is 1-based; token spans (start, end] in 1-based terms
+                     (when (and (> end start) (>= (dec col) start) (< (dec col) end))
+                       (subs line-text start end))))))
+             ["(defn " "(defn- "]))))))
+
 (defn- hover-value [text line col]
   (let [hv (lsp/hover text line col)
         d (lsp/definition text line col)
         nm (:resolves-to d)
         card (when (and (some? nm) (= :user-fn (:kind d)))
                (lsp/proof-hover text nm))]
-    (if (nil? card) hv (str hv "\n\n---\n\n" (proof-markdown card)))))
+    (cond
+      (some? card) (str hv "\n\n---\n\n" (proof-markdown card))
+      ;; pointing at a definition's own head answers its proof card — the
+      ;; most natural place to ask "what does this fn do" cannot stay ∅
+      (= "∅ nothing here" hv) (let [dn (defn-name-at text line col)]
+                                (if (nil? dn)
+                                  hv
+                                  (proof-markdown (lsp/proof-hover text dn))))
+      :else hv)))
 
 (defn- hover-out [state params id]
   (let [uri (get-in params ["textDocument" "uri"])
@@ -406,9 +443,11 @@ no plugin: it rides the one request every editor already sends.
 ## Definition, references, highlight
 
 All three resolve a name at the cursor through the call graph and then map the
-name back to a span in the text. A `:host` callee (an Erlang or Elixir
-function) has no source to jump to, so definition answers null — honest about
-the boundary of what the program owns.
+name back to text spans: definition answers the defining head, references and
+highlight answer the real call SITES the ANF walk finds (including a script's
+top-level uses, which live in the synthetic `<top>` body). A `:host` callee
+(an Erlang or Elixir function) has no source to jump to, so definition answers
+null — honest about the boundary of what the program owns.
 
 ```beam-lisp
 (defn- definition-out [state params id]
@@ -420,8 +459,9 @@ the boundary of what the program owns.
       (let [text (:text d)
             bl (lsp->bl text (get pos "line") (get pos "character"))
             res (lsp/definition text (:line bl) (:col bl))
-            nm (:resolves-to res)
-            p (when (and (some? nm) (= :user-fn (:kind res))) (find-defn text nm))]
+            nm (or (:resolves-to res) (defn-name-at text (:line bl) (:col bl)))
+            kind (if (some? (:resolves-to res)) (:kind res) :user-fn)
+            p (when (and (some? nm) (= :user-fn kind)) (find-defn text nm))]
         [state [(response id
                           (if (nil? p)
                             nil
@@ -435,16 +475,27 @@ the boundary of what the program owns.
       [state [(response id [])]]
       (let [text (:text d)
             bl (lsp->bl text (get pos "line") (get pos "character"))
-            target (:resolves-to (lsp/definition text (:line bl) (:col bl)))
-            callers (if (some? target) (into [] (lsp/references text target)) [])
-            locs (into [] (filter some?
-                           (map (fn [c]
-                                  (let [p (find-defn text c)]
-                                    (when (some? p)
-                                      {"uri" uri
-                                       "range" (point-range text (:line p) (:col p) c)})))
-                                callers)))]
-        [state [(response id locs)]]))))
+            target (or (:resolves-to (lsp/definition text (:line bl) (:col bl)))
+                       (defn-name-at text (:line bl) (:col bl)))]
+        (if (nil? target)
+          [state [(response id [])]]
+          ;; call SITES, not caller defns: the ANF walk finds real occurrences
+          ;; (including the synthetic <top>'s, so a script's use of a fn is a
+          ;; reference like any other); includeDeclaration adds the head.
+          (let [sites (into [] (lsp/document-highlight text target))
+                locs (into []
+                       (map (fn [s]
+                              {"uri" uri
+                               "range" {"start" (bl->lsp text (:line s) (:col s))
+                                        "end" (bl->lsp text (:line s) (:end-col s))}})
+                            sites))
+                decl (if (get-in params ["context" "includeDeclaration"])
+                       (let [p (find-defn text target)]
+                         (if (nil? p)
+                           []
+                           [{"uri" uri "range" (point-range text (:line p) (:col p) target)}]))
+                       [])]
+            [state [(response id (into [] (concat decl locs)))]]))))))
 
 (defn- highlight-out [state params id]
   (let [uri (get-in params ["textDocument" "uri"])

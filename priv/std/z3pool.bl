@@ -35,6 +35,54 @@
    different tree, not a runtime knob."
   4)
 
+;; ── the deadline chain ───────────────────────────────────────────────────
+;;
+;; Three bounds, and the ORDER between them is the whole design. Innermost
+;; first, because only the innermost produces a verdict:
+;;
+;;   z3-timeout-ms     z3's own ceiling (10000, BL_Z3_TIMEOUT). Fires first and
+;;                     answers `unknown` — a verdict, so this is the one that
+;;                     should ever trip.
+;;   read_timeout      the port's read deadline (20_000, BL_Z3_READ_TIMEOUT).
+;;                     Above the ceiling, so it can only fire if z3 ignored
+;;                     its own — a real bug — or if the port is driven
+;;                     directly, as its tests do.
+;;
+;;   call-timeout-ms   how long a caller waits for a pool process to answer.
+;;                     Above the port's deadline: the caller must outlive the
+;;                     message it is waiting for.
+;;
+;; Both movable bounds are read from the environment PER USE, not at load: a knob
+;; that needed a rebuild would be no knob, and the `unknown` path would be
+;; unreachable from a test that cannot bring the ceiling down.
+;;
+;; Before this existed the innermost bound was `call`'s COMPILED-IN 5000 ms
+;; (priv/boot/compiler.bl:2597), so a query needing 6 s killed its caller with
+;; an uncatchable `{:exit, {:timeout, {:gen_server, :call, …}}}` and no
+;; verdict, and one needing 10 s died in the port with an EMPTY accumulator.
+;; Both measured, both directions, in FUP-057.
+
+(defn z3-timeout-ms
+  "The solver's own ceiling, in ms, armed on every lease (see `with-solver`). A
+   caller that wants a different one sets it LATER in its conversation:
+   `(set-option :timeout …)` is global and last-wins, so the caller's choice
+   overrides this without any parameter being threaded — which is how the veritas
+   dialects keep their own 3000 ms.
+
+   Read from `BL_Z3_TIMEOUT` at each lease, the way the port's read deadline
+   reads `BL_Z3_READ_TIMEOUT`. This is the bound that decides whether a hard
+   question is ANSWERED (`unknown`) or merely outlived, so an operator has to be
+   able to move it without a rebuild — and a test has to be able to bring it down
+   to milliseconds, which is otherwise the only way to reach the `unknown` path."
+  []
+  (BeamLisp.Z3Port/env_ms "BL_Z3_TIMEOUT" 10000))
+
+(def call-timeout-ms
+  "How long a caller waits for a pool process to answer. Must stay ABOVE the
+   port's read deadline, so a solver that ignores its own ceiling is reported
+   by the port rather than pre-empted by the caller."
+  60000)
+
 ;; ── one z3 process, as a server ──────────────────────────────────────────
 
 (defserver z3-solver
@@ -48,6 +96,9 @@
   ;; which is what makes the lease load-bearing rather than decorative.
   (handle-call [:command smt] [_from st]
     (reply (BeamLisp.Z3Port/raw_command (:port st) smt) st))
+
+  (handle-call [:scoped smt model?] [_from st]
+    (reply (BeamLisp.Z3Port/raw_scoped (:port st) smt model?) st))
 
   (handle-call [:check-here assume core? model?] [_from st]
     (reply (BeamLisp.Z3Port/raw_check_here3 (:port st) assume core? model?) st))
@@ -66,6 +117,15 @@
 ;; the verify dialect wants a bare field, not an accessor call (an accessor
 ;; silently fails to prove — a lesson from PLAN-085).
 
+(defn- tree-pid
+  "The pool's supervisor pid, through the keeper — the one place children are
+   looked up. (An earlier version had the registry resolve them through a NAME,
+   which stopped being registered when the keeper took over: the registry then saw
+   no solvers, every checkout returned nil, and every check timed out. One source
+   of truth.)"
+  []
+  (call :z3-keeper [:pid] call-timeout-ms))
+
 (defn- pool-children
   "The pool's SOLVER children — every child that is not the lease server. Selected
    by child ID, not by comparing pids: a pid comparison against `(erlang/self)`
@@ -73,26 +133,24 @@
    registry, and reported five solvers everywhere else — measured). Resolved fresh
    on every checkout, so a restarted child is found by its new pid and a dead one
    is skipped."
-  [sup-name]
-  (let [sup (Process/whereis sup-name)]
-    (if (nil? sup)
+  [sup]
+  (if (nil? sup)
       (to-list [])
       (vec (filter (fn [c] (and (not= (:id c) :leases) (Process/alive? (:pid c))))
-                   (super/children sup))))))
+                   (super/children sup)))))
 
 (defn- free-solver [st]
   (let [taken (vals (:leases st))]
     (first (filter (fn [c] (not (some (fn [p] (= p (:pid c))) taken)))
-                   (pool-children (:sup st))))))
+                   (pool-children (tree-pid))))))
 
 (defn- release
   "Drop a lease and its monitor. Called by checkin and by :DOWN alike."
   [st lease]
   (let [monref (first (filter (fn [kv] (= (val kv) lease)) (:mon st)))]
-    (when (not (nil? monref))
+    (when (some? monref)
       (Process/demonitor (key monref) (list :flush)))
-    {:sup (:sup st)
-     :leases (dissoc (:leases st) lease)
+    {:leases (dissoc (:leases st) lease)
      :mon (if (nil? monref) (:mon st) (dissoc (:mon st) (key monref)))
      :high-water (:high-water st)}))
 
@@ -102,7 +160,7 @@
   ;; verify dialect proves bare fields, and an accessor call silently fails.
   (invariant [leases] (<= (count leases) 4))
 
-  (init [sup] (ok {:sup sup :leases {} :mon {} :high-water 0}))
+  (init [_] (ok {:leases {} :mon {} :high-water 0}))
 
   (handle-call [:checkout who] [_from st]
     (let [c (free-solver st)]
@@ -110,8 +168,7 @@
         (reply nil st)
         (let [lease (erlang/make_ref)]
           (reply {:solver (:pid c) :lease lease}
-                 {:sup (:sup st)
-                  :leases (assoc (:leases st) lease (:pid c))
+                 {:leases (assoc (:leases st) lease (:pid c))
                   :mon (assoc (:mon st) (Process/monitor who) lease)
                   :high-water (max (:high-water st) (inc (count (:leases st))))})))))
 
@@ -133,54 +190,100 @@
   (strategy :one-for-one)
   (intensity 5 5000)
   ;; the registry is NAMED, which is how the prelude verbs address it
-  (child :leases z3-leases :z3-pool)
+  (child :leases z3-leases 0)
   (child :s0 z3-solver 0)
   (child :s1 z3-solver 1)
   (child :s2 z3-solver 2)
   (child :s3 z3-solver 3))
 
-(defn up? [] (not (nil? (Process/whereis :z3-pool))))
+;; Everything below addresses the pool through its KEEPER. `start-link` links a
+;; tree to whoever asked first — for a solver that is arbitrary: the caller is a
+;; worker, a request handler, a test process, and when it exits the pool goes with
+;; it. Measured: a soak's checks were all correct and the tree was gone by the
+;; next question, which is exactly how a mid-flight check turns into a wrong
+;; verdict. So one VM-lifetime process owns the tree, and the tree is linked to it.
+
+(defserver z3-keeper
+  ;; `start-link` answers with a tree RECORD (a map carrying the pid among other
+  ;; things); normalise once here so the rest of this file deals in pids.
+  (init [_]
+    (let [started (start-link z3-pool)]
+      (ok {:pid (if (map? started) (:pid started) started)})))
+  (handle-call [:pid] [_from st] (reply (:pid st) st))
+  (handle-info _msg [st] (noreply st)))
+
+(defn up?
+  "Is the pool running? The keeper's presence is the whole question: the tree is
+   linked to it, so a dead keeper means a dead tree, and `pool-stop!` stops the
+   keeper. Asking the keeper itself would be worse than useless here — a call to a
+   process that is not there is an EXIT, which a beam-lisp `catch` does not see, so
+   the first `ensure!` in a fresh VM would kill its own caller (measured: every
+   check in a 200-answer soak failed that way)."
+  []
+  (some? (Process/whereis :z3-keeper)))
 
 (defn registry
   "The lease server, looked up through the tree each time. Asked afresh so a child
-   that OTP has restarted is found by its NEW pid — the reason the tree carries the
-   name and its children do not."
+   that OTP has restarted is found by its NEW pid — the reason the keeper carries
+   the name and the children do not."
   []
-  (if (up?)
-    (super/child-of (Process/whereis :z3-pool) :leases)
-    nil))
+  (when (up?)
+    (super/child-of (tree-pid) :leases)))
 
 (defn pool!
   "Start the tree (idempotent). Returns the number of solvers."
   []
+  ;; START AND NAME IT, race-safely. `start-link` does not register the tree, so
+  ;; the name is this function's job — and several callers can be inside this
+  ;; `when` at once (every `z3/check` ensures the pool). Measured before the fix:
+  ;; the loser of that race raised "name is already taken", and the pool it had
+  ;; just started was left running unregistered forever — which is how a check
+  ;; ended up calling a nil registry.
   (when (not (up?))
-    (let [pid (start-link z3-pool)]
-      ;; the tree itself is unregistered; give it the name its children look for
-      (Process/register pid :z3-pool)))
+    ;; `start`, not `start-link`: the keeper must outlive whoever asked for a
+    ;; solver. Several callers can be inside this branch at once, so the loser of
+    ;; the registration race stops the keeper it made — exactly one pool survives.
+    (let [pid (start z3-keeper)]
+      (when (nil? pid) (throw "z3-keeper failed to start"))
+      (try
+        (Process/register pid :z3-keeper)
+        (catch e (stop pid)))))
   n-solvers)
 
 (defn ensure! [] (if (up?) n-solvers (pool!)))
 (defn pool-size [] (if (up?) n-solvers 0))
-(defn pool-stop! [] (when (up?) (stop :z3-pool)) :ok)
+(defn pool-stop!
+  "Stop the pool: the KEEPER goes, and the tree it owns goes with it (that link is
+   the point of the keeper). Stopping only the tree left a keeper holding a dead
+   pid — measured as :noproc on the next checkout."
+  []
+  (let [k (Process/whereis :z3-keeper)]
+    (when (some? k) (stop k)))
+  :ok)
 
 (defn high-water
   "The most conversations that were in flight at once — the number that says
    whether N is right."
   []
-  (if (up?) (call (registry) [:high-water]) -1))
+  (if (up?) (call (registry) [:high-water] call-timeout-ms) -1))
 
-(defn busy [] (if (up?) (call (registry) [:busy]) -1))
+(defn busy [] (if (up?) (call (registry) [:busy] call-timeout-ms) -1))
 
 (defn solvers
   "The solver pids in the tree, as `super/children` reports them — the same view
    an operator gets from the supervisor bundle."
-  [] (if (up?) (map (fn [c] (:pid c)) (pool-children :z3-pool)) (to-list [])))
+  []
+  (if (up?)
+    (map (fn [c] (:pid c)) (pool-children (tree-pid)))
+    (to-list [])))
 
 ;; ── leasing, bounded by a fence ──────────────────────────────────────────
 
 (defn with-solver
   "Run `f` holding ONE solver for a whole conversation, waiting at most `ms` for
-   one to come free. The lease is returned in a finally; a killed borrower is
+   one to come free — the fence bounds CONTENTION only: it neither bounds the
+     conversation nor displaces the solver's own ceiling, which is armed on the
+     fresh context below. The lease is returned in a finally; a killed borrower is
    released by the registry's monitor. Raises when the bound expires — a value
    the caller can also get with `try-checkout`."
   ([f] (with-solver 30000 f))
@@ -188,20 +291,32 @@
    (ensure!)
    (let [deadline (+ (erlang/monotonic_time :millisecond) ms)]
      (loop []
-       (let [got (call (registry) [:checkout (erlang/self)])]
+       (let [got (call (registry) [:checkout (erlang/self)] call-timeout-ms)]
          (cond
-           (not (nil? got))
+           (some? got)
            (let [solver (:solver got)]
              (try
                (erlang/put :z3-current solver)
                ;; A leased solver starts from a CLEAN context. Without this, a
                ;; conversation inherits the previous borrower's assertions —
                ;; measured as an inexplicable `unsat` in an unrelated test.
-               (call solver [:reset])
+               (call solver [:reset] call-timeout-ms)
+               ;; Arm the pool's ceiling on the FRESH context — once per lease, not
+               ;; before every check: `(set-option :timeout …)` is global and
+               ;; last-wins, so a caller that sets its own later keeps it.
+               (call solver [:command (str "(set-option :timeout " (z3-timeout-ms) ")")]
+                     call-timeout-ms)
+               ;; And let a conversation be asked for the UNSAT CORE of a refusal —
+               ;; the names of the assertions that are jointly unsatisfiable. Armed
+               ;; here, once per lease, next to the ceiling, so `check-core` works
+               ;; wherever a conversation does; a core costs nothing until a caller
+               ;; asks for one on a refusal.
+               (call solver [:command "(set-option :produce-unsat-cores true)"]
+                     call-timeout-ms)
                (f)
                (finally
                  (erlang/put :z3-current nil)
-                 (call (registry) [:checkin (:lease got)]))))
+                 (call (registry) [:checkin (:lease got)] call-timeout-ms))))
 
            (< (erlang/monotonic_time :millisecond) deadline)
            (do (Process/sleep 5) (recur))
@@ -216,11 +331,34 @@
 ;; ── the verbs a conversation is made of ──────────────────────────────────
 
 (defn check
-  "One-shot conversation: reset, assert, check-sat, return the status."
-  [smt model?]
-  (with-solver (fn [] (:status (call (current) [:check smt model?])))))
+  "One-shot conversation: reset, assert, check-sat. → {:status s :model m-or-nil}.
 
-(defn command [smt] (call (current) [:command smt]))
+   The MODEL comes back with the status. It used to be dropped here, and
+   `z3/check-model` passed both through to callers that read `(:status r)` — so every
+   one of them saw nil and reported false (four failures in the system tests: an
+   invariant that is proven read as unproven). The flag was already being sent to the
+   port; only the reply was being thrown away."
+  [smt model?]
+  (let [r (with-solver (fn [] (call (current) [:check smt model?] call-timeout-ms)))]
+    {:status (:status r) :model (:model r) :why (:why r)}))
+
+(defn- need-conversation!
+  "Refuse conversation verbs outside a lease. Without this the call goes to a nil
+   solver, which is an EXIT rather than an exception — invisible to every
+   `try/catch` in the language, and a silent death instead of an explanation."
+  []
+  (when (nil? (current))
+    (throw "no conversation is open — wrap this in z3/with-solver"))
+  (current))
+
+(defn command [smt] (call (need-conversation!) [:command smt] call-timeout-ms))
+(defn scoped
+  "ONE scoped question inside the held conversation: push, assert, check, pop — a
+   single call into the solver server. The prelude the conversation already sent is
+   what makes this cheap; `check-here` remains for a caller that wants to manage
+   push/pop itself."
+  ([smt model?] (call (need-conversation!) [:scoped smt model?] call-timeout-ms)))
+
 (defn check-here
   ([] (check-here (to-list []) false false))
-  ([assume core? model?] (call (current) [:check-here assume core? model?])))
+  ([assume core? model?] (call (need-conversation!) [:check-here assume core? model?] call-timeout-ms)))

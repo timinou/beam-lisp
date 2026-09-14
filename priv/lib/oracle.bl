@@ -1,0 +1,404 @@
+; oracle.bl — PROTOTYPE: z3 as if it had been written in beam-lisp.
+;
+; This file is the target shape of the cutover, written once so every layer of
+; it can be MEASURED against today's `z3/check` path before any consumer moves.
+; Nothing in `z3.bl`, `system/core.bl` or `veritas.bl` is changed by loading it.
+;
+; The thesis: the oracle's INPUTS are already language values (smt.bl: forms,
+; one printer). Its OUTPUTS are not — a verdict is a string compared at 44 sites,
+; a model is text parsed at 39. Its LIFETIME is a bundle (z3pool). Asking it is a
+; bare call. This file closes the three gaps:
+;
+;   L2  verdict as a VALUE       (verdict / proven? refuted? undecided? / model as bl values)
+;   L4  conversation by default  (session / scoped — declare once, push/pop per question)
+;   L5  obligation + memo        (obligation / memo tier: same script ⇒ no solver call)
+;   L6  the oracle as an EFFECT  (with-oracle — a handler the engine never sees)
+;   L7  fan-out through the pool (ask-all — N questions over N solvers)
+;
+; Every verb here is a function call away from `system/core.bl`'s twenty sites.
+
+(ns oracle
+  (:require [smt :as smtlib]
+            [z3pool]
+            [system.decide :as decide]
+            [typed]))
+
+;; ── L2: the verdict record ────────────────────────────────────────────────
+;;
+;; ONE shape for every answer the oracle gives. Status is a KEYWORD (the wire
+;; string is read once, here); a model is bl VALUES; a core is NAMES; the cost
+;; is on the record because the ledger needs it and so does the ceiling.
+
+(defn- status-kw [s]
+  (cond (= s "unsat") :unsat (= s "sat") :sat (= s "unknown") :unknown :else :error))
+
+(defn- model-value
+  "A define-fun VALUE node → bl value: scalar, (- n) → -n, (/ a b) → a÷b."
+  [vnode]
+  (let [f (typed/node-form vnode) tg (typed/node-tag f)]
+    (cond
+      (= tg :scalar) f
+      (= tg :list)
+        (let [its (typed/node-items f)
+              op (if (empty? its) nil (typed/node-name (typed/node-form (first its))))]
+          (cond (and (= op "-") (= 2 (count its))) (- 0 (model-value (second its)))
+                (and (= op "/") (= 3 (count its))) (/ (model-value (second its)) (model-value (nth its 2)))
+                :else f))
+      :else f)))
+
+(defn parse-model
+  "z3 model TEXT → {name-string → bl value}. The ONE model parser (today veritas
+   owns a private copy and core.bl matches `define-fun` textually at 14 sites)."
+  [text]
+  (if (or (nil? text) (= "" text))
+    {}
+    (let [top (first (BeamLisp.Reader/read_string text))]
+      (into {}
+        (keep (fn [d]
+                (let [its (typed/node-items d)]
+                  (when (and (>= (count its) 5)
+                             (= "define-fun" (typed/node-name (typed/node-form (first its)))))
+                    [(typed/node-name (typed/node-form (second its))) (model-value (nth its 4))])))
+              (typed/node-items top))))))
+
+(defn- parse-core
+  "`(g_pos g_neg)` → [\"g_pos\" \"g_neg\"]."
+  [text]
+  (if (or (nil? text) (= "" text))
+    []
+    (let [top (first (BeamLisp.Reader/read_string text))]
+      (vec (map (fn [n] (typed/node-name (typed/node-form n))) (typed/node-items top))))))
+
+(defn- why-kw
+  "z3's own words for an `unknown`, as a keyword: :timeout | :memout | :canceled |
+   :incomplete. nil when there is no reason to give — a decided check answers the
+   EMPTY string, and that must never read as a reason — and an UNRECOGNISED reason
+   is passed through verbatim rather than mapped to a label it does not have."
+  [s]
+  (cond
+    (or (nil? s) (= "" s)) nil
+    (= "timeout" s) :timeout
+    (= "memout" s) :memout
+    (= "canceled" s) :canceled
+    (= "incomplete" s) :incomplete
+    :else s))
+
+(defn verdict
+  "A raw port reply {:status str :model text :core text} + cost → the record.
+   The raw TEXT is kept alongside the parsed values (`:raw-model` / `:raw-core`): the
+   engine's own outward contract is still text, and a cutover that changed two things
+   at once would be unreadable. New callers read the values."
+  [raw tier us]
+  {:status (status-kw (:status raw))
+   :model  (parse-model (:model raw))
+   :core   (parse-core (:core raw))
+   :raw-model (:model raw)
+   :raw-core  (:core raw)
+   :why    (why-kw (:why raw))
+   :tier   tier
+   :us     us})
+
+(defn proven?    [v] (= :unsat (:status v)))
+(defn refuted?   [v] (= :sat (:status v)))
+(defn undecided? [v] (= :unknown (:status v)))
+
+;; ── a refusal as BLAME, not just as a word ───────────────────────────────
+;;
+;; A refuted step is a sentence z3 found unsatisfiable. WHICH sentence is a
+;; question, and z3 will answer it: name the parts and ask for the unsat core. The
+;; engine names three (`g_guard`, `g_next`, `g_inv2` — see core.bl's
+;; `step-obligation`), so the core says what to FIX rather than that something,
+;; somewhere, is wrong.
+
+(defn witness
+  "A REFUTATION's counterexample, as values — for a question whose expected answer
+   is UNSAT (an induction step: guard ∧ next ∧ ¬Inv', where unsat ⟹ preserved).
+
+   A `sat` answer to such a question IS the answer, and the model is the STATE and
+   INPUT that break it: the concrete numbers to put in a failing test, and the
+   shortest path to a fix. Pass `names` (the machine's state and input variables) to
+   report those and nothing else — z3 also models the constants that `:named`
+   assertions introduce, and a caller wants the bug, not the bookkeeping.
+
+   The DUAL lane is `explain`: an UNSAT CORE names the assertions that are jointly
+   unsatisfiable, which is the blame for a question whose expected answer is SAT (a
+   synthesis, a repair search). Asking for a core of a `sat` answer is asking z3 for
+   something it does not have — measured, and the reason this lane exists."
+  ([v] (witness v nil))
+  ([v names]
+   (let [m (:model v)
+         sel (if (nil? names) (vec (keys m)) (vec names))
+         vals (into {} (keep (fn [k] (when (some? (get m k)) [k (get m k)])) sel))
+         ks (vec (keys vals))]
+     {:model vals
+      :sentence (if (empty? ks)
+                  "refuted without a usable model — check the variable names, or ask with the model on"
+                  (str "counterexample: "
+                       (join ", " (map (fn [k] (str k " = " (get vals k))) ks))))})))
+
+(defn explain
+  "An unsat core as blame for a refuted step. → {:blame :core :sentence}.
+
+   The names come from `step-obligation`, which splits a transition's question
+   into three assertions labelled:
+     g_guard   the transition was allowed to happen
+     g_next    the post-state is the next-state expression
+     g_inv2    the post-state violates the invariant
+
+   and the core is a subset of those names, so the subset IS the diagnosis:
+
+     g_inv2 alone          the invariant is unsatisfiable for ANY post-state —
+                           it is too strong, or is not a formula over the state
+     g_next + g_inv2       no guard is needed to break it: EVERY step breaks it,
+                           so the next-state expression is what is wrong
+     all three             the guard admits a state whose successor breaks the
+                           invariant — the guard is too weak (the common case)
+
+   An unrecognised core is reported as such rather than approximated into one of
+   the three; a caller who cannot fix what it is told cannot tell it was guessed."
+  [v]
+  (let [core (vec (:core v))
+        has? (fn [n] (some (fn [c] (= n c)) core))
+        g? (has? "g_guard")
+        n? (has? "g_next")
+        i? (has? "g_inv2")]
+    (cond
+      (empty? core)
+        {:blame :no-core :core [] :status (:status v)
+         :sentence (if (= :unsat (:status v))
+                     "refuted, but with no core: the assertions were not named"
+                     (str "asked again for the core and got " (name (:status v))
+                          " rather than unsat — the conversation is not in the state the refusal came from"))}
+
+      (and i? (not n?) (not g?))
+        {:blame :invariant-impossible :core core
+         :sentence "the invariant is unsatisfiable on its own — it is too strong"}
+
+      (and i? n? (not g?))
+        {:blame :next-step-breaks-it :core core
+         :sentence "every step breaks the invariant, guard or not — the next-state expression is wrong"}
+
+      (and i? n? g?)
+        {:blame :guard-too-weak :core core
+         :sentence "the guard admits a state whose successor breaks the invariant — strengthen the guard"}
+
+      :else
+        {:blame :unrecognised-core :core core
+         :sentence "the core names parts this explainer does not know"})))
+
+;; ── L5: obligations, and a memo above the oracle ─────────────────────────
+;;
+;; An obligation is a VALUE: a label and the commands. Its identity is the
+;; content of the script it emits — so the memo is exactly "have I asked this
+;; before", and a re-verify of an unchanged tree asks the solver nothing.
+
+(defn- script-lines
+  "A list of raw SMT-LIB STRINGS → a script item. `smt/script` renders a string as
+   an SMT-LIB string LITERAL, so `[\"(assert (> z 1))\"]` used to compile to an inert
+   literal: the pushed scope stayed EMPTY and z3 answered `sat` for `z > 1 ∧ z < 0`
+   (measured, and the reason the prototype's first probe lied). All-strings and
+   all-forms are both unambiguous; a MIXED list is not, and says so instead of
+   picking one."
+  [cmds]
+  (let [cs (vec cmds)
+        strs (count (filter (fn [c] (string? c)) cs))]
+    (cond
+      (zero? strs) cs
+      (= strs (count cs)) (to-list [(smtlib/raw (join "\n" cs))])
+      :else (throw (ex-info "oracle/obligation: a script is all forms or all raw strings, not both"
+                            {:cmds cmds})))))
+
+(defn obligation
+  "A question as a VALUE. Rendered and classified ONCE, here — measured: doing both
+   per ask cost 0.8 ms, eight times what the solver itself takes on a push/pop
+   question. The text is the identity (memo key); the fragment is what the ledger
+   and the native rung read."
+  [label cmds]
+  (let [text (if (string? cmds) cmds (smtlib/script (script-lines cmds)))]
+    {:label label :cmds cmds :text text :frag (decide/classify cmds) :key (erlang/phash2 text)}))
+
+(def ^:private memo-tab :oracle-memo)
+
+(defn- memo! []
+  (when (= :undefined (ets/info memo-tab))
+    (ets/new memo-tab (to-list [:set :public :named_table])))
+  memo-tab)
+
+(defn- ->tuple [k v] (erlang/list_to_tuple (to-list [k v])))
+
+(def ^:private memo-key :oracle-memo-on)
+
+(defn memo-clear! [] (when (not= :undefined (ets/info memo-tab)) (ets/delete_all_objects memo-tab)) :ok)
+(defn memo-size [] (if (= :undefined (ets/info memo-tab)) 0 (ets/info memo-tab :size)))
+
+(defn memo-on!
+  "Answer an identical script from memory instead of the solver. SOUND for `ask`,
+   which always sends a COMPLETE script (declarations + assertions + check): the
+   same bytes have the same answer. A conversation (`scoped`) is never memoised —
+   its meaning depends on the state the caller built."
+  [] (erlang/put memo-key true) :on)
+
+(defn memo-off! [] (erlang/put memo-key false) :off)
+
+;; UNset means ON: the memo is sound for `ask` (a complete script has one answer),
+;; so the default is to use it and `memo-off!` is the deliberate exception.
+(defn memo-on? [] (let [v (erlang/get memo-key)] (if (or (nil? v) (= :undefined v)) true (if (= v false) false true))))
+
+(defn with-memo
+  "Run `f` with the memo on or off, restoring the previous setting."
+  [on? f]
+  (let [prev (erlang/get memo-key)]
+    (erlang/put memo-key on?)
+    (try (f) (finally (erlang/put memo-key prev)))))
+
+(defn memo-stats [] {:entries (memo-size) :on (memo-on?)})
+
+;; ── L6: the oracle as an EFFECT ──────────────────────────────────────────
+;;
+;; `ask` PERFORMS the effect; whoever is in `with-oracle` HANDLES it. The default
+;; handler is the pool. A test hands in a table; a sandbox hands in `deny`. The
+;; engine (core.bl) calls `ask` and never knows which.
+
+(def ^:private handler-key :oracle-handler)
+(def ^:private session-prelude-key :oracle-session-prelude)
+
+(defn pool-handler
+  "The DEFAULT handler: the real oracle, one leased conversation per question.
+   Public because a test that counts asks wraps it — the instrument is the same
+   thing the system uses."
+  [text model?]
+  (z3pool/check text model?))
+
+(defn with-oracle
+  "Run `f` with every `ask` answered by `handler` — (fn [script-text model?] raw)."
+  [handler f]
+  (let [prev (erlang/get handler-key)]
+    (erlang/put handler-key handler)
+    (try (f) (finally (if (= :undefined prev) (erlang/erase handler-key) (erlang/put handler-key prev))))))
+
+(defn deny
+  "A handler that refuses: the sandbox's oracle."
+  [_text _model?]
+  (throw (ex-info "oracle: denied in this context" {})))
+
+(defn table
+  "A handler that answers from {script-text → status-string}; unlisted → unknown."
+  [answers]
+  (fn [text _model?] {:status (get answers text "unknown") :model nil :core nil}))
+
+;; `erlang/get` answers :undefined for an unset key — not nil — so `or` is wrong here.
+(defn- handler [] (let [h (erlang/get handler-key)] (if (or (nil? h) (= :undefined h)) pool-handler h)))
+
+(defn- custom-handler?
+  "True when someone is HANDLING the oracle — the session path must route through
+   the handler too, or `with-oracle` would be a lie for the engine (measured: a
+   table handler intercepted `ask` and the engine's sessions went to z3 anyway)."
+  []
+  (let [h (erlang/get handler-key)]
+    (not (or (nil? h) (= :undefined h)))))
+
+(defn- prelude-text [] (let [p (erlang/get session-prelude-key)] (if (= :undefined p) "" (or p ""))))
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+
+(defn ask
+  "The ONE way to ask. obligation → verdict. Memo first, then the handler in
+   force; every answer lands in the ledger with its status and its cost."
+  ([obl] (ask obl false))
+  ([obl model?]
+   (let [text (:text obl)
+         k (:key obl)
+         hit (if (memo-on?) (ets/lookup (memo!) k) (to-list []))]
+     (if (and (seq hit) (not model?))
+       (let [v (erlang/element 2 (first hit))]
+         (BeamLisp.Z3.Ledger/record (:frag obl) :memo (name (:status v)) 0 (:why v))
+         (assoc v :tier :memo :us 0))
+       (let [t0 (now-us)
+             raw ((handler) text model?)
+             v (verdict raw :oracle (- (now-us) t0))]
+         (BeamLisp.Z3.Ledger/record (:frag obl) :oracle (name (:status v)) (:us v) (:why v))
+         ;; only a real answer is cached: `unknown` is not one (the ceiling), and
+         ;; `error` is a transport failure that must not stick to the script.
+         ;; `(memo!)`, not the bare name: the insert is what must create the table
+         ;; when a memo-OFF lookup skipped that step above (it did not, and the
+         ;; insert raised ArgumentError — measured).
+         (when (or (proven? v) (refuted? v)) (ets/insert (memo!) (->tuple k v)))
+         v)))))
+
+;; ── L4: a conversation by default ────────────────────────────────────────
+;;
+;; The engine's loops all have one shape: a PRELUDE (sorts, decls, the invariant
+;; as define-fun) and N questions over it. Today each question re-sends the
+;; prelude after a (reset) — and z3's first declaration after a reset costs
+;; ~1.6 ms (measured on the bare binary), the whole question ~3 ms. In a
+;; session the prelude is declared ONCE and each question is push/assert/check/
+;; pop: ~0.1 ms at the solver.
+
+(defn session
+  "Hold one solver, declare `prelude` once, run `f` — inside it use `scoped`.
+
+   When a HANDLER is installed, `f` never touches a solver: each `scoped` sends the
+   prelude + its own commands to the handler as one script, so a table (or `deny`)
+   answers the engine's questions exactly as it answers a bare `ask`."
+  [prelude f]
+  (let [text (smtlib/script prelude)
+        prev (erlang/get session-prelude-key)]
+    (erlang/put session-prelude-key text)
+    (try
+      (if (custom-handler?)
+        (f)
+        (z3pool/with-solver
+          (fn []
+            (z3pool/command text)
+            (f))))
+      (finally (if (= :undefined prev) (erlang/erase session-prelude-key) (erlang/put session-prelude-key prev))))))
+
+(defn scoped
+  "One question inside a session: push, assert `cmds`, check, pop → verdict."
+  ([obl] (scoped obl false))
+  ([obl model?]
+   (let [t0 (now-us)
+         ;; with a HANDLER installed, the question is the whole script (the prelude
+         ;; the session put in the process dictionary + this scope's commands), so a
+         ;; table or `deny` answers the engine exactly as it answers a bare `ask`
+         raw (if (custom-handler?)
+               ((handler) (str (prelude-text) "\n" (:text obl)) model?)
+               (z3pool/scoped (:text obl) model?))
+         v (verdict raw :oracle (- (now-us) t0))]
+     (BeamLisp.Z3.Ledger/record (:frag obl) :oracle (name (:status v)) (:us v) (:why v))
+     v)))
+
+(defn here-verdict
+  "The CURRENT conversation's answer as a verdict record — no push/pop, because the
+   caller owns the conversation's scope (`session`/`scoped` bracket, this reads).
+   Options: `:core?` (the unsat core, for named assertions), `:model?`."
+  ([opts]
+   (let [t0 (now-us)
+         raw (z3pool/check-here (to-list (get opts :assume (to-list [])))
+                                (get opts :core? false)
+                                (get opts :model? false))
+         v (verdict raw :oracle (- (now-us) t0))]
+     ;; `:general` — a conversation check is not a classified fragment, and the
+     ;; bucket that disables the witness rung is the honest one for it
+     (BeamLisp.Z3.Ledger/record :general :oracle (name (:status v)) (:us v) (:why v))
+     v))
+  ([] (here-verdict {})))
+
+;; ── L7: fan-out through the pool ─────────────────────────────────────────
+;;
+;; N independent obligations over the N solvers the pool already runs. Today
+;; every consumer asks serially, so the pool's high-water mark is 1.
+
+(defn ask-all
+  "obligations → verdicts, in order, one BEAM process per question; the lease
+   registry is the backpressure."
+  [obls]
+  (let [parent (erlang/self)
+        n (count obls)]
+    (vec (map (fn [o] (erlang/spawn (fn [] (erlang/send parent [:verdict (:label o) (ask o)]))))
+              obls))
+    (let [got (reduce (fn [acc _]
+                        (let [m (receive [:verdict l v] [l v] (after 60000 :timeout))]
+                          (if (= m :timeout) acc (assoc acc (first m) (second m)))))
+                      {} (range n))]
+      (vec (map (fn [o] (get got (:label o))) obls)))))

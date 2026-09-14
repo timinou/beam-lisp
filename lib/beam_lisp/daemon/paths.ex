@@ -215,6 +215,7 @@ defmodule BeamLisp.Daemon.Paths do
     File.write!(path, "")
 
     uid =
+
       case :file.read_file_info(String.to_charlist(path)) do
         {:ok, info} -> elem(info, 12)
         _ -> 0

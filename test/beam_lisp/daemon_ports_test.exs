@@ -35,7 +35,7 @@ defmodule BeamLisp.DaemonPortsTest do
       end
     end)
 
-    %{root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_fingerprint(root)}
+    %{root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_id(root)}
   end
 
   # ── the registry ──────────────────────────────────────────────────────
@@ -44,22 +44,58 @@ defmodule BeamLisp.DaemonPortsTest do
     name = "t#{:erlang.unique_integer([:positive])}"
     {:ok, port} = Ports.claim(name, 0, root: "/tmp/a")
     assert is_integer(port) and port > 0
-    assert Ports.port_of(name) == port
+    assert Ports.port_of(name, root: "/tmp/a") == port
     assert {:ok, ^port} = Ports.claim(name, 0, root: "/tmp/a")
-    assert %{name: ^name, port: ^port, root: "/tmp/a"} = Ports.holder(port)
-    Ports.release(name)
-    assert Ports.port_of(name) == nil
+    assert %{name: ^name, port: ^port, pinned: false, root: "/tmp/a"} = Ports.holder(port)
+    Ports.release(name, root: "/tmp/a")
+    assert Ports.port_of(name, root: "/tmp/a") == nil
   end
 
-  test "a name another session holds is refused, naming the owner" do
+  # An ephemeral port is nobody's promise — the OS chose the number — so asking
+  # for one is a SESSION's question, and two sessions must both be answered.
+  # Keying these by name alone made the second tree's dashboard fail to start
+  # because an unrelated tree happened to be running one, which is how this was
+  # found: a warm session in a checkout with a sibling tree's daemon up came up
+  # "ui: not served — taken by /other/tree".
+  test "two trees may each hold the same ephemeral name" do
     name = "t#{:erlang.unique_integer([:positive])}"
-    {:ok, _} = Ports.claim(name, 0, root: "/tmp/owner-tree")
+
+    assert {:ok, one} = Ports.claim(name, 0, root: "/tmp/one")
+    assert {:ok, two} = Ports.claim(name, 0, root: "/tmp/two")
+    assert one != two
+
+    assert Ports.port_of(name, root: "/tmp/one") == one
+    assert Ports.port_of(name, root: "/tmp/two") == two
+
+    Ports.release(name, root: "/tmp/one")
+    Ports.release(name, root: "/tmp/two")
+  end
+
+  test "a chosen port is machine-wide: a second tree is refused, naming the owner" do
+    name = "t#{:erlang.unique_integer([:positive])}"
+    {:ok, free} = free_port()
+
+    {:ok, ^free} = Ports.claim(name, free, root: "/tmp/owner-tree")
 
     assert {:error, {:taken, claim}} =
-             Ports.claim(name, 0, root: "/tmp/thief-tree", pid: 4_194_303)
+             Ports.claim(name, free, root: "/tmp/thief-tree", pid: 4_194_303)
 
     assert claim.root == "/tmp/owner-tree"
-    Ports.release(name)
+    Ports.release(name, root: "/tmp/owner-tree")
+  end
+
+  test "releasing a name leaves another tree's claim alone" do
+    name = "t#{:erlang.unique_integer([:positive])}"
+    {:ok, free} = free_port()
+    {:ok, ^free} = Ports.claim(name, free, root: "/tmp/holder")
+
+    # a different session saying "I am done with this name" must not erase the
+    # holder's claim file — its address would vanish while it was still serving
+    Ports.release(name, root: "/tmp/bystander")
+    assert Ports.port_of(name, root: "/tmp/holder") == free
+
+    Ports.release(name, root: "/tmp/holder")
+    assert Ports.port_of(name, root: "/tmp/holder") == nil
   end
 
   test "a stale claim — its owner gone — is swept, not respected" do
@@ -68,7 +104,7 @@ defmodule BeamLisp.DaemonPortsTest do
 
     # rewrite the claim as if a process that no longer exists had made it
     {:ok, dir} = ports_dir()
-    path = Path.join(dir, name)
+    path = Path.join(dir, "#{name}@#{Paths.tree_id("/tmp/dead")}")
     dead = %{name: name, port: port, tree_id: "dead", root: "/tmp/dead", pid: 999_999_999, claimed_at: 0}
     File.write!(path, :erlang.term_to_binary(dead))
 
@@ -89,25 +125,38 @@ defmodule BeamLisp.DaemonPortsTest do
   # ── the session's address ─────────────────────────────────────────────
 
   test "the daemon claims :ui, serves the page, and lists ports as JSON", ctx do
-    port = Ports.port_of(:ui)
+    port = session_port(ctx.root)
     assert is_integer(port), "the daemon claims :ui at boot"
 
-    page = Req.get!("http://127.0.0.1:#{port}/")
+    page = get!("http://127.0.0.1:#{port}/")
     assert page.status == 200
     assert page.body =~ "warm session"
     assert page.body =~ Path.basename(ctx.root)
     assert page.body =~ ">ui<"
 
-    ports = Req.get!("http://127.0.0.1:#{port}/ports")
+    ports = get!("http://127.0.0.1:#{port}/ports")
     assert ports.status == 200
-    assert [%{"name" => "ui", "port" => ^port}] = ports.body
+
+    # The registry is machine-wide ON PURPOSE — a claim is a file so that
+    # another tree's session is visible rather than invisible — so assert THIS
+    # session's claim, not that it is the only one: other trees (and other test
+    # runs) legitimately hold claims at the same moment.
+    mine = Enum.find(ports.body, fn c -> c["name"] == "ui" and c["root"] == ctx.root end)
+    assert mine, "this session's :ui claim is in the table"
+    assert mine["port"] == port
+    assert mine["tree"] == ctx.tree
   end
 
+  # The first `/mcp` request of a session mounts the codebase index; inside a
+  # full suite that mount competes with every other test for the machine, so the
+  # default 60s is a latency assertion this test must not be making. What is
+  # under test is that the endpoint answers the same dispatch as `bl mcp`.
+  @tag timeout: 300_000
   test "the MCP endpoint answers the same dispatch as `bl mcp`", ctx do
-    port = Ports.port_of(:ui)
+    port = session_port(ctx.root)
 
     resp =
-      Req.post!("http://127.0.0.1:#{port}/mcp",
+      post!("http://127.0.0.1:#{port}/mcp",
         json: %{
           "jsonrpc" => "2.0",
           "id" => 1,
@@ -128,6 +177,11 @@ defmodule BeamLisp.DaemonPortsTest do
     assert "code/ask" in names
   end
 
+  # Starting a daemon, drawing its page and then RUNNING a task through the
+  # executor is several daemon lifetimes in one test; this machine gives each VM
+  # one dirty-IO scheduler, so a compile overlapping the run is enough to blow a
+  # 60-second default.
+  @tag timeout: 300_000
   test "the dashboard renders the model, and an intent runs a task", ctx do
     root = Path.join(System.tmp_dir!(), "bl_dash_#{:erlang.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(root, "priv/boot"))
@@ -146,28 +200,28 @@ defmodule BeamLisp.DaemonPortsTest do
     wait_for(fn -> File.exists?(ep.token) end)
     on_exit(fn -> stop_quietly(pid) end)
 
-    port = Ports.port_of(:ui)
+    port = session_port(root)
     assert is_integer(port)
 
-    page = Req.get!("http://127.0.0.1:#{port}/")
+    page = get!("http://127.0.0.1:#{port}/")
     assert page.status == 200
     assert page.body =~ "runTask('hi')", "a runnable task offers a button"
     assert page.body =~ "run without the daemon", "a :watch task says why it has none"
     assert page.body =~ "hello from a task" == false
 
-    model = Req.get!("http://127.0.0.1:#{port}/model")
+    model = get!("http://127.0.0.1:#{port}/model")
     assert model.status == 200
     assert Enum.map(model.body["tasks"], & &1["name"]) == ["hi", "loop"]
 
     # an intent without the token is refused: a page the developer visits must
     # not be able to drive their daemon
-    refused = Req.post!("http://127.0.0.1:#{port}/intent", json: %{"name" => "hi"})
+    refused = post!("http://127.0.0.1:#{port}/intent", json: %{"name" => "hi"})
     assert refused.status == 403
 
     token = Base.encode16(File.read!(ep.token), case: :lower)
 
     ok =
-      Req.post!("http://127.0.0.1:#{port}/intent",
+      post!("http://127.0.0.1:#{port}/intent",
         json: %{"name" => "hi"},
         headers: %{"x-bl-token" => token},
         receive_timeout: 120_000
@@ -179,7 +233,7 @@ defmodule BeamLisp.DaemonPortsTest do
 
     # a :watch task is refused with a reason, not parked on the worker
     watched =
-      Req.post!("http://127.0.0.1:#{port}/intent",
+      post!("http://127.0.0.1:#{port}/intent",
         json: %{"name" => "loop"},
         headers: %{"x-bl-token" => token}
       )
@@ -192,17 +246,24 @@ defmodule BeamLisp.DaemonPortsTest do
   end
 
   test "an unknown path is a JSON 404", ctx do
-    port = Ports.port_of(:ui)
-    resp = Req.get!("http://127.0.0.1:#{port}/nope")
+    port = session_port(ctx.root)
+    resp = get!("http://127.0.0.1:#{port}/nope")
     assert resp.status == 404
   end
 
   test "the startup message names the session and how to pin its port", ctx do
+    # the NAME is the session's address, and the loopback one is what still
+    # answers without the gateway — so the message prints both, for the same
+    # reason it prints how to pin a port nobody should have to remember
+    host = BeamLisp.Daemon.Names.host(ctx.root, "ui")
+
     msg = Server.startup_message(ctx.root, %{port: 43_123, pinned: false, error: nil})
     assert msg =~ "bl daemon up for #{ctx.root}"
-    assert msg =~ "http://127.0.0.1:43123"
+    assert msg =~ "http://#{host}"
+    assert msg =~ "127.0.0.1:43123"
     assert msg =~ "ephemeral — pin it in env.bl"
-    assert msg =~ "http://127.0.0.1:43123/mcp"
+    assert msg =~ "http://#{host}/mcp"
+    assert msg =~ "bl gateway start"
 
     pinned = Server.startup_message(ctx.root, %{port: 7700, pinned: true, error: nil})
     assert pinned =~ "pinned by env.bl"
@@ -221,11 +282,39 @@ defmodule BeamLisp.DaemonPortsTest do
     # pinning 0 is still ephemeral; the point is that the value comes from the
     # project rather than from the daemon's default.
     assert BeamLisp.Daemon.Server.startup_message(root, %{port: 5, pinned: true, error: nil}) =~ "pinned"
-    assert Ports.port_of(:ui) == Ports.port_of(:ui)
     _ = ctx
   end
 
   # ── helpers ──
+
+  # The page is a synchronous read of live state, and this machine gives each VM
+  # ONE dirty-IO scheduler (`ELIXIR_ERL_OPTIONS=+SDio 1:1`) — so a file
+  # operation in flight anywhere in the VM delays every read queued behind it.
+  # These tests assert CONTENT: how fast a shared file server answers while a
+  # build runs beside it is not a property of the page.
+  @page_timeout 120_000
+
+  defp get!(url), do: Req.get!(url, receive_timeout: @page_timeout, retry: false)
+
+  defp post!(url, opts \\ []) do
+    Req.post!(url, Keyword.put(opts, :receive_timeout, @page_timeout))
+  end
+
+  defp free_port do
+    {:ok, lsock} = :gen_tcp.listen(0, [:binary, ip: {0, 0, 0, 0}])
+    {:ok, {_ip, port}} = :inet.sockname(lsock)
+    :gen_tcp.close(lsock)
+    {:ok, port}
+  end
+
+  # The port THIS session holds for `name`. The registry is machine-wide and an
+  # ephemeral name is keyed by tree, so another tree (or a parallel run) can hold
+  # `:ui` at the same instant with a port of its own. Ask for OUR tree's claim.
+  defp session_port(root, name \\ :ui) do
+    Enum.find_value(Ports.list(), fn c ->
+      if to_string(c.name) == to_string(name) and c.root == root, do: c.port
+    end)
+  end
 
   defp ports_dir do
     with {:ok, base} <- Paths.runtime_dir(), do: {:ok, Path.join(base, "ports")}

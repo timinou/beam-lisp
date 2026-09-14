@@ -215,6 +215,29 @@ When the changes are good, `bl check --update` accepts the new state as the
 baseline. `bl check --install-hook` makes that check run before every commit —
 see [00-the-cli.md](00-the-cli.md#the-baseline-and-the-pre-commit-hook).
 
+## Search the code by meaning
+
+`bl search` answers a question about a corpus in English — the way you would ask
+a colleague — instead of matching the words you can name:
+
+```sh
+bl search "read a file into lines" -p src -k 5
+```
+
+It ranks functions by MEANING: a 256-dimension vector per function, from a 32 MB
+static model (a lookup table plus a mean, not a transformer), stored with the
+analysis that produced it and cached per project.
+
+Nothing to set up in a `bl` you downloaded: the weights ship inside the drop, no
+network is touched at query time, and `bl doctor` says which copy is answering
+(`embedding  present (ships with this bl: …)`). A checkout fetches them once with
+`mix bl.embed.fetch`; `BEAM_LISP_MODEL_DIR` pins a copy of your own.
+
+The first run over a corpus pays the analysis (seconds to minutes for a few
+hundred files); every run after it reopens the store. See
+[`docs/code-semantic-search.md`](../code-semantic-search.md) for what it costs,
+and for where it is the wrong tool (`grep` still wins on names).
+
 ## Where to go next
 
 - [00-the-cli.md](00-the-cli.md) — every verb, flag, and exit code.

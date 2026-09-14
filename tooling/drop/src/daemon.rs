@@ -370,6 +370,9 @@ pub enum Attach {
     /// The connection was lost AFTER the request was sent — unknown outcome.
     /// Never retry; exit non-zero.
     LostAfterSend,
+    /// Nothing arrived for the read timeout, but the socket is still OPEN. The
+    /// command is probably still running: silence is not loss.
+    Stalled(u64),
 }
 
 #[cfg(unix)]
@@ -390,7 +393,7 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
         Ok(s) => s,
         Err(_) => return Attach::Fallback,
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(read_timeout()));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     // hello
@@ -400,7 +403,12 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
         return Attach::Fallback;
     }
 
-    match recv_frame(&mut stream).and_then(|b| decode(&b)) {
+    let hello_reply = match recv_frame(&mut stream) {
+        Ok(b) => decode(&b),
+        // a daemon that cannot answer hello within the timeout is unusable: cold.
+        Err(_) => return Attach::Fallback,
+    };
+    match hello_reply {
         Some(Term::Tuple(t)) if is_ready(&t) => {}
         Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => return Attach::RestartRequired,
         Some(Term::Tuple(_)) => return Attach::Fallback, // other reject (wrong tree/unauthorized)
@@ -414,6 +422,14 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
     if send_frame(&mut stream, &req).is_err() {
         return Attach::LostAfterSend;
     }
+
+    // Silence is not loss: the read deadline that follows (1800 s, or
+    // BL_DAEMON_READ_TIMEOUT) is what turns a stalled wait into an HONEST
+    // message — "the command is probably still running, and it is NOT re-run
+    // here" — instead of the false "connection lost" that used to be printed
+    // at 30 s and made a caller retry a command that had already run
+    // (FUP-013). Measured under this deadline: `bl test` 210 s, `bl lsp check`
+    // over the plant 9 m 37 s through a warm daemon, both completed.
 
     stream_until_exit(&mut stream)
 }
@@ -434,8 +450,13 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
     let mut wrote_anything = false;
     loop {
         let frame = match recv_frame(stream) {
-            Some(f) => f,
-            None => return Attach::LostAfterSend,
+            Ok(f) => f,
+            // Silence is not loss. The socket is still open and the worker is
+            // still running; only our patience ran out. Saying "connection lost"
+            // here is a false diagnosis — measured: a 210s test crossed a 30s
+            // timeout that had nothing to do with the connection.
+            Err(FrameErr::Timeout) => return Attach::Stalled(read_timeout_secs()),
+            Err(FrameErr::Lost) => return Attach::LostAfterSend,
         };
         let term = match decode(&frame) {
             Some(t) => t,
@@ -514,17 +535,59 @@ fn send_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// Why a frame read ended. The distinction is the point: a TIMEOUT means the
+/// socket is healthy and the peer is quiet, a LOSS means it is gone.
 #[cfg(unix)]
-fn recv_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+#[derive(Debug, PartialEq, Eq)]
+enum FrameErr {
+    Timeout,
+    Lost,
+}
+
+/// How long the client waits for the NEXT frame before giving up. A command can
+/// run for minutes without printing anything — the pool test takes 210s — and
+/// the old hardcoded 30s turned that silence into "connection lost mid-command;
+/// outcome unknown", a diagnosis that was simply false. Override with
+/// `BL_DAEMON_READ_TIMEOUT` (seconds).
+#[cfg(unix)]
+fn read_timeout_secs() -> u64 {
+    std::env::var("BL_DAEMON_READ_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_READ_TIMEOUT_SECS)
+}
+
+#[cfg(unix)]
+fn read_timeout() -> Duration {
+    Duration::from_secs(read_timeout_secs())
+}
+
+/// Long enough for a real test suite to finish in silence, short enough that a
+/// genuinely wedged daemon does not hold a terminal forever.
+#[cfg(unix)]
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 1_800;
+
+#[cfg(unix)]
+fn recv_frame(stream: &mut UnixStream) -> Result<Vec<u8>, FrameErr> {
     let mut lenbuf = [0u8; 4];
-    stream.read_exact(&mut lenbuf).ok()?;
+    read_exact_classified(stream, &mut lenbuf)?;
     let n = u32::from_be_bytes(lenbuf) as usize;
     if n > 64 * 1024 * 1024 {
-        return None;
+        return Err(FrameErr::Lost);
     }
     let mut buf = vec![0u8; n];
-    stream.read_exact(&mut buf).ok()?;
-    Some(buf)
+    read_exact_classified(stream, &mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(unix)]
+fn read_exact_classified(stream: &mut UnixStream, buf: &mut [u8]) -> Result<(), FrameErr> {
+    use std::io::ErrorKind;
+    stream.read_exact(buf).map_err(|e| match e.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => FrameErr::Timeout,
+        _ => FrameErr::Lost,
+    })
 }
 
 // ── frame builders ───────────────────────────────────────────────────────────
@@ -778,5 +841,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Silence is a timeout, not a loss — and the client can tell them apart.
+    /// Measured cause: a 210s test crossed a hardcoded 30s read timeout, the
+    /// socket was healthy the whole time, and the user was told the connection
+    /// had been lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_socket_times_out_and_a_closed_one_is_lost() {
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        assert_eq!(recv_frame(&mut a), Err(FrameErr::Timeout), "silence is a timeout");
+
+        let (mut c, d) = UnixStream::pair().unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(1_000))).unwrap();
+        drop(d);
+        assert_eq!(recv_frame(&mut c), Err(FrameErr::Lost), "a closed peer is a loss");
+    }
+
+    /// The patience is a knob, and a nonsense value falls back to the default
+    /// rather than disabling the guard.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_timeout_is_configurable_but_never_zero() {
+        std::env::remove_var("BL_DAEMON_READ_TIMEOUT");
+        assert_eq!(read_timeout_secs(), DEFAULT_READ_TIMEOUT_SECS);
+        std::env::set_var("BL_DAEMON_READ_TIMEOUT", "42");
+        assert_eq!(read_timeout_secs(), 42);
+        std::env::set_var("BL_DAEMON_READ_TIMEOUT", "0");
+        assert_eq!(
+            read_timeout_secs(),
+            DEFAULT_READ_TIMEOUT_SECS,
+            "zero would mean no guard at all"
+        );
+        std::env::set_var("BL_DAEMON_READ_TIMEOUT", "soon");
+        assert_eq!(read_timeout_secs(), DEFAULT_READ_TIMEOUT_SECS);
+        std::env::remove_var("BL_DAEMON_READ_TIMEOUT");
     }
 }

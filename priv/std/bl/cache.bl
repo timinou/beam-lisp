@@ -1,0 +1,261 @@
+; cache.bl — `bl cache`: what the analysis store holds, and pruning it.
+;
+; The store is CONTENT-ADDRESSED: one artifact per (source, source-revision).
+; That is what makes a stale store unreachable — and it is also what makes
+; stores ACCUMULATE. Every edit mints a new store, and the old one is garbage
+; the moment the source moves on. Nothing deletes it on its own, so a cap, plus
+; a verb to see and enforce it, is not a nicety: without them the store grows
+; forever. (A reboot used to be the eviction policy. That is not a policy.)
+;
+; The cap is a total in bytes over the stores of one tree. `BL_CACHE_MAX_MB`
+; overrides the default, and pruning takes the OLDEST first — never the newest,
+; which is the store the run that just finished wrote (see `evict`).
+
+(ns bl.cache
+  (:require [bl.util :as u] [bl.cli :as cli] [codebase]))
+
+(def DEFAULT-MAX-MB 2048)
+
+; 2 GB, because the store is not small and the corpus that matters is this one:
+; measured 2026-09, `priv/lib` (101 files, 1655 functions) holds ~500 MB of
+; analyses — about 5 MB a file, the vectors dominating. A 512 MB ceiling meant
+; the tool's OWN corpus crossed the cap, so a run pruned analyses it had just
+; written and the next run bought them again. A ceiling that the default corpus
+; cannot fit under is a treadmill, not a policy.
+
+;; ── measuring the store ─────────────────────────────────────────────
+
+(defn- size-of
+  "Bytes under `path` — a file, or a directory walked recursively."
+  [path]
+  (if (File/dir? path)
+    (reduce (fn [n child] (+ n (size-of (str path "/" child)))) 0 (u/to-list (File/ls! path)))
+    (:size (File/stat! path))))
+
+(defn entries
+  "Every cache artifact in `dir`, as `{:name :path :bytes :mtime}` — ONE entry per
+   artifact.
+
+   A store on disk is `<ns>.<sha>.fjall` plus everything named beside it: the
+   `.fjall.blobs` sibling holds the values too large to inline and belongs to the
+   same artifact. Counting it separately would double the reported size and let a
+   prune delete half a store — a store that opens, answers, and is missing
+   entries, which is worse than one that is gone.
+
+   A `<kind>.<sha>.term` file is an entry of the same family: one analysis of one
+   source revision, written by the same runs and stale the same way. Leaving them
+   out would let a capped cache grow through the files the cap does not count."
+  [dir]
+  (if-not (File/dir? dir)
+    []
+    (into []
+      (keep (fn [name]
+              (cond
+                (ends-with? name ".fjall")
+                (let [p (str dir "/" name)
+                      blobs (str p ".blobs")
+                      has-blobs (File/exists? blobs)]
+                  {:name (subs name 0 (- (count name) 6))
+                   :path p
+                   :blobs (when has-blobs blobs)
+                   :bytes (+ (size-of p) (if has-blobs (size-of blobs) 0))
+                   :mtime (:mtime (File/stat! p))})
+
+                (ends-with? name ".term")
+                (let [p (str dir "/" name)]
+                  {:name name :path p :bytes (size-of p) :mtime (:mtime (File/stat! p))})))
+            (u/to-list (File/ls! dir))))))
+
+(defn human
+  "Bytes as something a person reads: `12 B`, `340 KB`, `1 MB`."
+  [n]
+  (cond
+    (< n 1024) (str n " B")
+    (< n (* 1024 1024)) (str (quot n 1024) " KB")
+    :else (str (quot n (* 1024 1024)) " MB")))
+
+(defn cap-bytes
+  "The ceiling in bytes: `BL_CACHE_MAX_MB` megabytes, else `DEFAULT-MAX-MB`.
+
+   Read per call, like every other knob here: a test (or a CI run with a small
+   disk) sets the variable and gets it."
+  []
+  (let [env (System/get_env "BL_CACHE_MAX_MB")
+        mb (if (nil? env) nil (cli/parse-int env))]
+    (* 1024 1024 (if (nil? mb) DEFAULT-MAX-MB mb))))
+
+;; ── deciding what goes ──────────────────────────────────────────────
+
+(defn evict
+  "The names to delete to bring `entries` under `cap` bytes: oldest first, and
+   never the newest entry.
+
+   The newest is the store the run that just finished wrote — the one the next
+   run is most likely to ask for — so it survives even a cap of zero. That is
+   why a store bigger than the whole cap is kept: the cap is a ceiling on the
+   OLD, not a reason to throw away what was just paid for.
+
+   Oldest-first is the right order for a content-addressed cache: a store exists
+   for one revision of one source, so the oldest is the least likely to be asked
+   for again. (Biggest-first would trade one large file's analysis for a dozen
+   tiny ones.) Pure, and it reads mtimes from its argument, so the order is a
+   property a test can state rather than whatever the filesystem stamped.
+
+   `keep` names entries that count toward the total and are never chosen: what the
+   CURRENT run wrote. Without it a corpus large enough to pass the cap evicted
+   the analyses it had just paid for — measured on `priv/lib/datom` (38 files),
+   `bl cache: pruned 23 entries, freed 103 MB`, and the next run still re-derived
+   most of them (`cached 15/38`). An eviction that the next run immediately
+   undoes is not a cache policy, it is a bill."
+  ([entries cap] (evict entries cap #{}))
+  ([entries cap keep]
+  (let [total (reduce (fn [n e] (+ n (:bytes e))) 0 entries)
+        oldest-first (sort-by (fn [e] (:mtime e)) entries)
+        candidates (if (empty? oldest-first)
+                     []
+                     (take (dec (count oldest-first)) oldest-first))]
+    (loop [cs (remove (fn [e] (contains? keep (:name e))) candidates)
+           remaining total out []]
+      (if (or (empty? cs) (<= remaining cap))
+        out
+        (recur (rest cs)
+               (- remaining (:bytes (first cs)))
+               (conj out (:name (first cs)))))))))
+
+(defn entry-names
+  "Every entry name across `dirs` — what a run snapshots BEFORE it indexes, so
+   the prune after it can tell its own work from what was already there."
+  [dirs]
+  (into #{} (mapcat (fn [d] (map (fn [e] (:name e)) (to-list (entries d)))) (to-list dirs))))
+
+(defn doomed
+  "What a prune would remove from `dir` under `cap`, and what it would leave:
+   `{:dying [entry …] :freed n :kept n :remaining n}`.
+
+   Pure, and the reason `--dry-run` can be honest: deciding and deleting are one
+   step apart, so the dry run asks this and the prune is this plus the deletion.
+   Interleaved, the flag ends up consulting state it has already changed — the
+   report describes a directory the same call just emptied.
+
+   `keep` (a set of entry names, or nil) is passed straight to `evict`: it is the
+   caller's way of saying what this run must not delete."
+  ([dir cap] (doomed dir cap nil))
+  ([dir cap keep]
+  (let [es (to-list (entries dir))
+        gone (into #{} (evict (entries dir) cap (or keep #{})))
+        dying (filterv (fn [e] (contains? gone (:name e))) es)
+        left (filterv (fn [e] (not (contains? gone (:name e)))) es)]
+    {:dying dying
+     :freed (reduce (fn [n e] (+ n (:bytes e))) 0 (to-list dying))
+     :kept (count left)
+     :remaining (reduce (fn [n e] (+ n (:bytes e))) 0 (to-list left))})))
+
+(defn prune!
+  "Delete stores until every directory in `dirs` is under `cap` bytes.
+
+   Returns `{:removed :freed :kept :remaining}` over all of them. Idempotent: a
+   second run finds nothing to do, which is also the assertion that `kept` is
+   right.
+
+   `keep` (a set of entry names, or nil) survives: what the calling run just
+   wrote. A prune that may delete the work that prompted it turns every capped
+   corpus into a treadmill — the analyses are re-bought on the next run."
+  ([dirs cap] (prune! dirs cap nil))
+  ([dirs cap keep]
+  (reduce
+    (fn [acc dir]
+      (let [p (doomed dir cap keep)]
+        (doseq [e (to-list (:dying p))]
+          (File/rm_rf! (:path e))
+          (when (:blobs e) (File/rm_rf! (:blobs e))))
+        {:removed (+ (:removed acc) (count (:dying p)))
+         :freed (+ (:freed acc) (:freed p))
+         :kept (+ (:kept acc) (:kept p))
+         :remaining (+ (:remaining acc) (:remaining p))}))
+    {:removed 0 :freed 0 :kept 0 :remaining 0}
+    (to-list dirs))))
+
+(defn store-dirs
+  "The directories holding the stores for `root` — the CORPUS, not the shell.
+
+   The live tier `codebase/blanalysis-dir` resolves to, PLUS the host tier when
+   it has stores — a project that could not be written to once (a read-only
+   mount, an installed drop) leaves its artifacts there, and reporting only the
+   live tier would hide exactly the ones a prune exists for.
+
+   `root` matters: `bl search -p elsewhere` maintains ELSEWHERE's stores. With
+   none, the command's own project."
+  ([] (store-dirs nil))
+  ([root]
+   (let [base (or root (BeamLisp/cwd))
+         live (codebase/blanalysis-dir base)
+         host (BeamLisp.Cache/host_dir base)]
+     (distinct (concat [live] (if (and (File/dir? host) (not= host live)) [host] []))))))
+
+;; ── the command ─────────────────────────────────────────────────────
+
+
+(defn things
+  "`n` and the word for it — so a count never prints `1 store(s)` or `2 entrys`.
+   Shared, because two verbs report the same kind of count."
+  [n one many]
+  (str n " " (if (= 1 n) one many)))
+
+(defn- report
+  "One line per directory plus the total, and whether the cap is breached."
+  [dirs cap]
+  (let [rows (mapv (fn [d] {:dir d :entries (entries d)}) dirs)
+        bytes-of (fn [es] (reduce (fn [n e] (+ n (:bytes e))) 0 es))
+        total (reduce (fn [n r] (+ n (bytes-of (:entries r)))) 0 rows)]
+    (doseq [r rows]
+      (println (str "  " (things (count (:entries r)) "entry" "entries") "  " (human (bytes-of (:entries r)))
+                    "  " (:dir r))))
+    (println (str "total " (human total) " · cap " (human cap)
+                  (if (> total cap) " (over — run `bl cache prune`)" " (under)")))
+    0))
+
+(defn run
+  "`bl cache status | prune [--max-mb N] [--dry-run]`
+
+   status — what this tree's cache holds, per directory, and whether the total is
+   over the cap. prune — delete oldest-first until it is not, and say what was
+   freed. `--dry-run` on prune reports the same thing and deletes nothing, which
+   is the way to see what would go before it goes.
+
+   The flags come from the SHARED argv table (`bl.cli/parse-argv`), not from
+   parsing here: a verb that reads its own flags is a verb the dispatcher rejects
+   as an unknown flag before it ever runs, and the two would drift.
+
+   The default cap is 512 MB (`BL_CACHE_MAX_MB` overrides). Stores are per source
+   revision, so nothing here is precious: every one can be rebuilt from the source
+   it came from — the only thing pruning costs is the next run's time."
+  [args st]
+  (let [sub (first (to-list args))
+        ; `--max-mb` wins, then the environment, then the default — the order
+        ; every other knob here follows.
+        cap (if (:max_mb st) (* (:max_mb st) 1024 1024) (cap-bytes))]
+    (cond
+      (= sub "status") (report (store-dirs) cap)
+
+      (= sub "prune")
+        ;; The plan is computed on BOTH paths, and the deletion only on one:
+        ;; asking what would go must not be the thing that makes it go.
+        (let [dirs (store-dirs)
+              plans (mapv (fn [d] (doomed d cap)) (to-list dirs))
+              removed (reduce (fn [n p] (+ n (count (:dying p)))) 0 (to-list plans))
+              freed (reduce (fn [n p] (+ n (:freed p))) 0 (to-list plans))]
+          (report dirs cap)
+          (if (:dry_run st)
+            (do (println (str "would prune " (things removed "entry" "entries")
+                              ", freeing " (human freed)
+                              " · kept " (reduce (fn [n p] (+ n (:kept p))) 0 (to-list plans))
+                              " (" (human (reduce (fn [n p] (+ n (:remaining p))) 0 (to-list plans))) ")"))
+                0)
+            (let [r (prune! dirs cap)]
+              (println (str "pruned " (things (:removed r) "entry" "entries") ", freed " (human (:freed r))
+                            " · kept " (:kept r) " (" (human (:remaining r)) ")"))
+              0)))
+
+      :else (do (u/io-err "usage: bl cache status | prune [--max-mb N] [--dry-run]")
+                2))))
+

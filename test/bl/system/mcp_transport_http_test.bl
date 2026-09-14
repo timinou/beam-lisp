@@ -1,0 +1,225 @@
+; test/bl/system/mcp_transport_http_test.bl — MCP over HTTP, and its OAuth door.
+;
+; The transport is what a hosted server uses instead of stdio, and the shape of
+; the 401 is what an MCP client uses to find a token endpoint AT ALL. So these
+; tests are as much about the refusals as about the answers: a wrong path, a
+; wrong method, a missing token, a malformed body, a notification — each has a
+; specified response, and a transport that gets one of them wrong fails in a way
+; no application test notices until a real client will not connect.
+;
+; Run: mix bl test test/bl/system/mcp_transport_http_test.bl
+(ns system.mcp-transport-http-test
+  (:require [mcp.transport-http :as http]
+            [mcp.server :as server]))
+
+(def ^:private metadata-url
+  "https://knowledger.test/.well-known/oauth-protected-resource/mcp")
+
+(defn- body-of [m]
+  (Jason/encode! m))
+
+(defn- rpc
+  ([id method] (rpc id method nil))
+  ([id method params]
+   (merge {"jsonrpc" "2.0" "id" id "method" method
+           "_meta" {"io.modelcontextprotocol/protocolVersion" "2026-07-28"}}
+          (if (nil? params) {} {"params" params}))))
+
+(defn- array-of
+  "A JSON array of encoded messages. A beam-lisp vector is not encodable by
+   Jason, and neither is a lazy seq, so the array is built as text — which is
+   also exactly what a client SENDs us."
+  [messages]
+  (str "[" (join "," (map (fn [m] (Jason/encode! m)) messages)) "]"))
+
+(defn- req
+  ([body] (req body {}))
+  ([body headers]
+   {:method "POST" :uri "/mcp" :headers headers :body body}))
+
+(defn- registry-for [principal]
+  (server/registry-state
+   {:tools
+    [["who" "who am I" {"type" "object" "properties" {}}
+      (fn [_args] {"principal" (str principal)})]]
+    :resources [{"uri" "who://me" "name" "who"}]
+    :resource-read
+    (fn [state uri]
+      (if (= uri "who://me")
+        {"contents" [{"uri" uri "text" (str (get state :auth))}]}
+        nil))}))
+
+(defn- opts
+  ([principal] (opts principal true))
+  ([principal with-auth]
+   {:state (fn [p] (registry-for p))
+    :resource-metadata-url metadata-url
+    :protocol-version "2026-07-28"
+    :authenticate (if with-auth (fn [_r] principal) nil)}))
+
+(defn- decoded [response]
+  (Jason/decode! (get response :body)))
+
+;; ── the door ────────────────────────────────────────────────────────
+
+(deftest an-unauthenticated-call-is-401-with-a-challenge
+  (let [r (http/handle (req (body-of (rpc 1 "tools/list")))
+                       (opts nil true))]
+    (is (= 401 (get r :status)) "401, not 403 and not 200")
+    (is (= -32001 (get-in (decoded r) ["error" "code"]))
+        "a JSON-RPC error body, so a JSON-RPC client can read the refusal")
+    (is (some? (get (get r :headers) "www-authenticate"))
+        "the challenge header is what lets a client discover the token endpoint")))
+
+(deftest the-challenge-names-the-resource-metadata-document
+  (let [r (http/handle (req (body-of (rpc 1 "tools/list"))) (opts nil true))
+        challenge (get (get r :headers) "www-authenticate")]
+    (is (= (str "Bearer realm=\"mcp\", resource_metadata=\"" metadata-url "\"")
+           challenge)
+        "RFC 9728 discovery travels in the header, and nowhere else")))
+
+(deftest the-metadata-document-carries-only-what-it-was-given
+  (let [full (http/protected-resource-metadata
+              {:resource "https://knowledger.test/mcp"
+               :authorization-servers ["https://knowledger.test"]
+               :scopes-supported ["memory.read" "memory.write"]
+               :resource-name "Knowledger"})
+        bare (http/protected-resource-metadata {:resource "https://k.test/mcp"})]
+    (is (= "https://knowledger.test/mcp" (get full "resource")))
+    (is (= "https://knowledger.test" (first (get full "authorization_servers"))))
+    (is (= "header" (first (get full "bearer_methods_supported"))))
+    (is (= "Knowledger" (get full "resource_name")))
+    (is (nil? (get bare "authorization_servers"))
+        "an app that names no authorization server says nothing, not null")
+    (is (nil? (get bare "resource_documentation"))
+        "and says nothing about docs it does not have")))
+
+(deftest bearer-extraction-accepts-what-clients-actually-send
+  (let [h (fn [v] (http/bearer {:headers {"authorization" v}}))]
+    (is (= "abc" (h "Bearer abc")) "the canonical form")
+    (is (= "abc" (h "bearer abc")) "a lower-case scheme, which clients do send")
+    (is (= "abc" (h "Bearer   abc")) "extra padding is not a security event")
+    (is (nil? (h "Basic abc")) "another scheme is not a bearer token")
+    (is (nil? (h "Bearer")) "a scheme with no token is no token")))
+
+;; ── the transport ───────────────────────────────────────────────────
+
+(deftest an-authenticated-call-reaches-a-registry-built-for-that-principal
+  (let [r (http/handle (req (body-of (rpc 2 "tools/call"
+                                          {"name" "who" "arguments" {}}))
+                       {"authorization" "Bearer t" "content-type" "application/json"})
+                       (opts "alice@acme.test" true))]
+    (is (= 200 (get r :status)))
+    (is (= "alice@acme.test" (get-in (decoded r) ["result" "principal"]))
+        "the handler saw the principal the verifier returned")
+    (is (= "2026-07-28" (get (get r :headers) "mcp-protocol-version"))
+        "the version is echoed so a client can pin it")))
+
+(deftest a-different-token-gets-a-different-server
+  ;; the property that makes delegation safe: the state is built FROM the
+  ;; principal per request, so nothing from one caller can leak into another's.
+  (let [call (fn [who]
+               (http/handle (req (body-of (rpc 3 "tools/call"
+                                               {"name" "who" "arguments" {}})))
+                            (opts who true)))]
+    (is (= "alice" (get-in (decoded (call "alice")) ["result" "principal"])))
+    (is (= "bob" (get-in (decoded (call "bob")) ["result" "principal"])))))
+
+(deftest the-principal-is-merged-into-the-state-for-hooks-that-receive-it
+  (let [r (http/handle (req (body-of (rpc 4 "resources/read" {"uri" "who://me"})))
+                       (opts "carol" true))]
+    (is (= "carol" (get (first (get-in (decoded r) ["result" "contents"])) "text"))
+        "resource-read is handed a state whose :auth is the principal")))
+
+(deftest an-open-server-needs-no-verifier
+  (let [r (http/handle (req (body-of (rpc 5 "tools/list"))) (opts nil false))]
+    (is (= 200 (get r :status)) "no verifier means no 401")
+    (is (= "who" (get (first (get-in (decoded r) ["result" "tools"])) "name")))))
+
+(deftest a-notification-is-answered-with-no-body
+  (let [r (http/handle (req (body-of {"jsonrpc" "2.0" "method" "notifications/initialized"}))
+                       (opts "alice" true))]
+    (is (= 202 (get r :status)))
+    (is (= "" (get r :body)) "an answer to a notification is an answer nobody asked for")))
+
+(deftest a-batch-of-requests-answers-an-array
+  (let [r (http/handle (req (array-of [(rpc 6 "tools/list") (rpc 7 "tools/list")]))
+                       (opts "alice" true))
+        out (decoded r)]
+    (is (= 200 (get r :status)))
+    (is (= 2 (count out)) "two answers for two requests")
+    (is (= 7 (get (second out) "id")) "ids are preserved in order")))
+
+(deftest a-batch-of-only-notifications-has-no-body
+  (let [r (http/handle
+           (req (array-of [{"jsonrpc" "2.0" "method" "notifications/initialized"}]))
+           (opts "alice" true))]
+    (is (= 202 (get r :status)))
+    (is (= "" (get r :body)))))
+
+;; ── the refusals ────────────────────────────────────────────────────
+
+(deftest a-malformed-body-is-a-json-rpc-parse-error
+  (let [r (http/handle (req "{not json") (opts "alice" true))]
+    (is (= 400 (get r :status)))
+    (is (= -32700 (get-in (decoded r) ["error" "code"])))))
+
+(deftest a-get-is-method-not-allowed
+  (let [r (http/handle {:method "GET" :uri "/mcp" :headers {} :body ""} (opts "alice" true))]
+    (is (= 405 (get r :status)))
+    (is (= "POST" (get (get r :headers) "allow")) "the response says what is allowed")))
+
+(deftest another-path-is-not-the-endpoint
+  (let [r (http/handle {:method "POST" :uri "/other" :headers {} :body "{}"}
+                       (opts "alice" true))]
+    (is (= 404 (get r :status)))))
+
+(deftest the-auth-refusal-does-not-need-a-parsable-body
+  ;; a client that posts garbage with no token gets the DOOR (401), not a parse
+  ;; error: what it must fix first is that it is not authenticated.
+  (let [r (http/handle (req "{not json") (opts nil true))]
+    (is (= 401 (get r :status)))))
+
+;; ── the stateless lifecycle: classic clients over HTTP ─────────────
+;;
+;; stdio carries `:lifecycle :legacy` in its connection state once the
+;; initialize handshake settles the revision; HTTP has no connection state,
+;; so the transport re-derives the lifecycle per message: no `_meta` version
+;; and not `initialize` ⇒ classic. Without the derivation every standard
+;; client's first call after a SUCCESSFUL handshake was refused -32022 —
+;; initialize answered, then nothing else spoke (the version gate looked for
+;; a `_meta` stamp a classic client never sends).
+
+(deftest a-version-less-call-after-initialize-is-classic-not-refused
+  (let [r (http/handle (req (body-of {"jsonrpc" "2.0" "id" 20 "method" "tools/list"})
+                          {"authorization" "Bearer t"})
+                       (opts "alice" true))
+        d (decoded r)]
+    (is (= 200 (get r :status)))
+    (is (nil? (get d "error"))
+        "no -32022 for a classic client's post-handshake request")
+    (is (some? (get (get d "result") "tools"))
+        "…and the tools listing itself answers")))
+
+(deftest a-version-less-tool-call-gets-the-classic-envelope
+  ;; a classic client renders NOTHING without content[] — the bare-rows shape
+  ;; a modern client reads buys it a hang, not an answer.
+  (let [r (http/handle (req (body-of {"jsonrpc" "2.0" "id" 21 "method" "tools/call"
+                                      "params" {"name" "who" "arguments" {}}})
+                          {"authorization" "Bearer t"})
+                       (opts "alice" true))
+        result (get (decoded r) "result")]
+    (is (some? (get result "content"))
+        "the classic envelope carries content[]")
+    (is (= "alice" (get (get result "structuredContent") "principal"))
+        "…with the rows repeated as structuredContent")))
+
+(deftest a-stamped-modern-request-keeps-bare-rows
+  ;; the other side of the per-message derivation: a `_meta`-stamped request
+  ;; is modern, and its result is NOT wrapped in the classic envelope.
+  (let [r (http/handle (req (body-of (rpc 22 "tools/call" {"name" "who" "arguments" {}}))
+                          {"authorization" "Bearer t"})
+                       (opts "alice" true))
+        result (get (decoded r) "result")]
+    (is (nil? (get result "content")) "modern results stay bare rows")
+    (is (= "alice" (get result "principal")))))

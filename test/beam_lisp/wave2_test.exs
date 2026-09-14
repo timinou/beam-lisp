@@ -124,7 +124,9 @@ defmodule BeamLisp.Wave2Test do
     end
 
     test "too few args raises" do
-      assert_raise RuntimeError, ~r/at least 2/, fn ->
+      # the runtime names the SHAPE it could not call (RT.call_shape_error):
+      # an ArgumentError, not the bare RuntimeError this used to pin.
+      assert_raise ArgumentError, ~r/taking 2 or more arguments/, fn ->
         eval("(defn f [a b & rest] a) (f 1)")
       end
     end

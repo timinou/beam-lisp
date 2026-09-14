@@ -1,0 +1,142 @@
+; test/bl/system/mcp_project_mount_test.bl — `bl mcp` serves the TREE you are in.
+;
+; The gap this pins, found by running the server inside a real project:
+;
+;   $ cd ~/code/ora/blueprint && ./bl mcp
+;   → code/list: ONE codebase, "beam-lisp", whose facts are the LANGUAGE's own
+;     sources (priv/std/codebase.bl + typed.bl)
+;   → code/ask callers <a function of the project>   → []
+;
+; The mount was a hardcoded ["codebase" "typed"] — the engine indexing itself —
+; so a client asking the server about its OWN code got an empty answer, and the
+; honest description of that ("facts about your tree come from `bl ask`") was a
+; statement about the MOUNT, not about the tools.
+;
+; The mount now follows the project: env.bl's `:paths` — the same roots `bl`
+; hands the loader — discovered by walking up from the COMMAND's cwd, which the
+; daemon binds per request to the client's (`Env`'s `:bl_cwd`, `BeamLisp/with_cwd`).
+;
+; The namespaces come from the FILES under those roots, read the way the loader
+; reads them (Loader/read_source, so a literate `.bl.md` mounts as the program
+; it compiles to), and named the way the file DECLARES (bl.util/ns-of) — the
+; loader itself skips a candidate whose declared ns differs, so a project file
+; may be named after the tool it is without hijacking a shipped namespace.
+
+(ns system.mcp-project-mount-test
+  (:require [mcp.server :as server]
+            [mcp.tools :as tools]))
+
+(defn- until
+  "Poll `pred` for up to 30 s — a mount takes seconds, an exit milliseconds."
+  [pred]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n 3000) false
+      :else (do (Process/sleep 10) (recur (inc n))))))
+
+(defn- tmp-project
+  "A project on disk, in the shape a real one has: env.bl at the root, sources
+   under a declared root. Returns its directory."
+  []
+  (let [dir (str (System/tmp_dir!) "/bl_mcp_project_"
+                 (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p (str dir "/src/acme"))
+    (File/write! (str dir "/env.bl")
+                 "{:name \"acme\" :paths [\"src\"]}\n")
+    (File/write! (str dir "/src/acme/thing.bl")
+                 (str "(ns acme.thing)\n"
+                      "(defn helper [] 1)\n"
+                      "(defn caller [] (helper))\n"))
+    dir))
+
+(defn- in-dir
+  "Call `f` in a process whose COMMAND cwd is `dir`, and return what it returned.
+   The process then EXITS, which is what invalidates the VM-global mount memo
+   (a conn's ETS tables are owned by the process that mounted them — the rule
+   mcp_conn_memo_test.bl pins): without that, the second test below would be
+   answered by the first test's mount, and its cwd would never be consulted."
+  [dir f]
+  (let [out (atom nil)
+        done (atom false)
+        owner (erlang/spawn (fn []
+                              (BeamLisp/with_cwd dir (fn [] (reset! out (f))))
+                              (reset! done true)))]
+    (is (until (fn [] @done)) "the owner mounted and answered")
+    (is (until (fn [] (not (Process/alive? owner)))) "and then exited")
+    @out))
+
+(defn- call [id method params]
+  {"jsonrpc" "2.0" "id" id "method" method
+   "_meta" {"io.modelcontextprotocol/protocolVersion" "2026-07-28"}
+   "params" params})
+
+(deftest a-project-mounts-its-own-namespaces
+  (let [dir (tmp-project)
+        ms (to-list (in-dir dir (fn [] (tools/mounts))))
+        tree (second ms)]
+    (is (= 2 (count ms)) "the engine, then the tree")
+    (is (= "beam-lisp" (:name (first ms))) "the engine is still mounted first")
+    (is (= "acme" (:name tree)) "the group is named by env.bl's :name")
+    (is (= (to-list [(str dir "/src")]) (to-list (:roots tree)))
+        "the roots are env.bl's :paths")
+    (is (= (to-list ["acme.thing"]) (to-list (:sources tree)))
+        "the namespace is the one the FILE declares")
+    (is (<= 2 (get-in tree [:entities :functions])) "helper + caller")
+    (is (pos? (get-in tree [:entities :calls])) "and the call between them")
+    (is (= (to-list ["acme.thing"]) (to-list (get-in tree [:entities :namespaces]))))))
+
+(deftest the-served-surface-answers-about-the-tree
+  ;; Through the same entry the transport uses, and the way a client asks: a
+  ;; named question about a function of THIS tree.
+  (let [dir (tmp-project)
+        r (in-dir dir (fn []
+                        (server/request-response
+                          (server/state)
+                          (call 1 "tools/call"
+                                {"name" "code/ask"
+                                 "arguments" {"question" "callers" "target" "helper"}}))))]
+    (is (= "complete" (get-in r ["result" "resultType"])))
+    (is (= "helper" (get-in r ["result" "target"])))
+    (is (some (fn [row] (= "caller" (first (to-list row))))
+              (to-list (get-in r ["result" "rows"])))
+        "the tree's own call edge is in the fact database")))
+
+(deftest code-list-reports-both-mounts
+  (let [dir (tmp-project)
+        r (in-dir dir (fn []
+                        (server/request-response
+                          (server/state)
+                          (call 2 "tools/call"
+                                {"name" "code/list" "arguments" {}}))))
+        names (map (fn [c] (get c "name")) (to-list (get-in r ["result" "codebases"])))]
+    (is (= (to-list ["beam-lisp" "acme"]) (to-list names))
+        "a client is told what it is being served, in order")))
+
+(deftest a-spawned-server-answers-about-the-callers-tree
+  ;; The tests above ask THROUGH `server/request-response`, which runs in the
+  ;; asking process — where the cwd binding is live, so they cannot see this.
+  ;; A real server is a SPAWNED process, and a spawned process does NOT inherit
+  ;; the process dictionary (measured: `erlang/spawn` + `(BeamLisp/cwd)` in the
+  ;; child answers the OS cwd). The mount happens where the code question arrives
+  ;; — inside that child — so without the state carrying the caller's root, the
+  ;; client is answered with whatever tree the server was started from. Over
+  ;; stdio the two agree; under the daemon (one worker, many clients, each bound
+  ;; per request) they do not.
+  (let [dir (tmp-project)
+        r (in-dir dir (fn []
+                        (server/request
+                          (server/start)
+                          (call 3 "tools/call"
+                                {"name" "code/list" "arguments" {}}))))
+        names (map (fn [c] (get c "name")) (to-list (get-in r ["result" "codebases"])))]
+    (is (= (to-list ["beam-lisp" "acme"]) (to-list names))
+        "the server process mounts the CLIENT's tree, not the cwd it was spawned in")))
+
+(deftest no-project-means-the-engine-alone
+  ;; The honest answer outside a tree: /tmp has no env.bl above it (discovery
+  ;; walks up), so there is no "caller's code" to mount and the language's own
+  ;; index is all the server claims to serve.
+  (let [ms (to-list (in-dir (System/tmp_dir!) (fn [] (tools/mounts))))]
+    (is (= 1 (count ms)) "one mount, not two")
+    (is (= "beam-lisp" (:name (first ms))))))

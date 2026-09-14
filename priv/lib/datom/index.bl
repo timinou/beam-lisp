@@ -209,61 +209,130 @@
   [schema d]
   (mapv (fn [index] [:put (key-for index d) d]) (indexes-for schema (-a d))))
 
-(def ^:private keycodec-batch-available?
-  (BeamLisp.Native/available? "datom.store-fjall"))
+(def ^:private native-batch-loaded?
+  "Set once the native batch key codec has been seen AVAILABLE.
+
+   A load-time `def` held this answer up to the moment `datom.index` was
+   loaded — which is BEFORE the native tier is, in every entry point — so it
+   read `false` for the whole VM and the batch path below never ran: the ~630x
+   the native codec measures was never collected, on any transaction, in any
+   process. Asking at RUN time (and remembering only the `true`, so a store
+   written before the tier loads still finds it afterwards) costs one cheap
+   check per index write and removes the dependency on require order."
+  (atom false))
+
+(defn- native-batch-codec?
+  []
+  (or (deref native-batch-loaded?)
+      (let [ok? (BeamLisp.Native/available? "datom.store-fjall")]
+        (if ok? (reset! native-batch-loaded? true) false))))
 
 (defn- datom->tuple
   "A datom as the erlang 5-tuple {e a v tx op} the batch key NIF reads."
   [d]
   (erlang/list_to_tuple (to-list [(-e d) (-a d) (-v d) (-tx d) (-op d)])))
 
-(defn- native-put-ops
-  "All `[:put key d]` ops for `datoms`, keys built in ONE native crossing — or
-   nil to fall back to the per-datom bl path.
+(defn- native-lane?
+  "Whether the native codec encodes `x` byte-identically to the bl codec.
 
-   Builds each datom's index-tag list once (per attribute, via the same
-   `indexes-for`/`index-tag` the bl path uses), hands the datoms + tag-lists to
-   the batch NIF, and zips the returned flat key list back with the datoms in
-   the identical datom-major, index order. Returns nil when the NIF is absent OR
-   any component is out of a native lane (the NIF returns nil), so correctness
-   never depends on it — only speed. Measured ~630x on the key work (44k keys:
-   ~46s bl vs ~72ms native), because classification and encoding happen entirely
-   in Rust with a single BEAM crossing instead of one per key."
+   CONSERVATIVE by design, because the two DISAGREE outside the four bulk
+   lanes in a way that is silent rather than loud: the native classifier reads
+   any atom as a keyword, so `nil` — which the bl codec gives its own tag —
+   would encode as the KEYWORD `nil` and produce a key that sorts wrong in
+   every index. `nil`, floats, collections, pids and bignums past 2^53 are all
+   outside, so a datom holding one goes to the bl codec."
+  [x]
+  (cond
+    (erlang/is_integer x) (and (<= x datom.codec/MAX-EXACT-INT)
+                               (>= x (- 0 datom.codec/MAX-EXACT-INT)))
+    (erlang/is_binary x) true
+    (keyword? x) true
+    (erlang/is_boolean x) true
+    :else false))
+
+(defn- native-datom?
+  "Whether EVERY component of `d` is in a lane the native codec covers."
+  [d]
+  (and (native-lane? (get d 0)) (native-lane? (get d 1)) (native-lane? (get d 2))
+       (native-lane? (get d 3)) (native-lane? (get d 4))))
+
+(defn- native-put-ops
+  "All `[:put key d]` ops for `datoms` — the in-lane majority built in ONE native
+   crossing, the rest by the bl codec — or nil when the native tier is absent or
+   declines, leaving `write-datoms` its bl floor.
+
+   The NIF answers `nil` for the WHOLE batch when ANY component is out of lane,
+   and that is why the fast path collected nothing on a real corpus: blueprint's
+   59156-datom load carries 866 embedding VECTOR values, so 866 values outside
+   the four lanes sent all 59156 datoms to the bl codec — 8.3 s of key building
+   for work the lanes cover in tens of milliseconds.
+
+   Partitioning keeps the covered majority native and pays bl only for the
+   remainder. The NIF still gets the last word: a `nil` reply for the in-lane
+   subset falls back to bl for the whole batch, so correctness never depends on
+   `native-lane?` being exactly right — only on it being conservative.
+
+   Ops come back in the SAME datom-major, index order the bl path produces."
   [schema datoms]
-  (if (not keycodec-batch-available?)
+  (if (not (native-batch-codec?))
     nil
-    (let [; per-datom index list, caching indexes-for per attribute
-          idx-result (reduce
-                       (fn [acc d]
-                         (let [a (-a d)
-                               cached (get (get acc 1) a)
-                               indexes (if (some? cached) cached (indexes-for schema a))
-                               tags (mapv index-tag indexes)]
-                           [(conj (get acc 0) tags)
-                            (if (some? cached) (get acc 1) (assoc (get acc 1) a indexes))]))
-                       [[] {}]
-                       datoms)
-          tag-lists (get idx-result 0)
-          tuples (mapv datom->tuple datoms)
-          keys (BeamLisp.Native.Datom.StoreFjall/keycodec_batch
-                 (to-list tuples) (to-list (mapv to-list tag-lists)))]
-      (if (nil? keys)
+    (let [; ONE pass over `datoms`, binding each datom DIRECTLY to a parameter.
+          ; Indexing a captured collection from inside a `mapv`/`filterv`
+          ; closure — `(mapv (fn [i] (get datoms i)) (range n))` — is the
+          ; quadratic shape this file keeps meeting: 8000 elements cost 400 ms
+          ; that way and 20 ms as a `reduce`, because a closure's `get` does
+          ; not compile to a direct element access. Each datom's index list is
+          ; cached per attribute; only the IN-LANE datoms pay for a tuple and
+          ; a tag list.
+          built (reduce
+                  (fn [acc d]
+                    (let [a (-a d)
+                          cached (get (get acc :cache) a)
+                          indexes (if (some? cached) cached (indexes-for schema a))
+                          covered (native-datom? d)]
+                      {:cache (if (some? cached) (get acc :cache)
+                                  (assoc (get acc :cache) a indexes))
+                       :tags (conj (get acc :tags) indexes)
+                       :lanes (conj (get acc :lanes) covered)
+                       :tuples (if covered (conj (get acc :tuples) (datom->tuple d))
+                                   (get acc :tuples))
+                       :taglists (if covered
+                                   (conj (get acc :taglists)
+                                         (to-list (mapv index-tag indexes)))
+                                   (get acc :taglists))}))
+                  {:cache {} :tags [] :lanes [] :tuples [] :taglists []}
+                  datoms)
+          tuples (get built :tuples)
+          ks (if (empty? tuples)
+               []
+               (BeamLisp.Native.Datom.StoreFjall/keycodec_batch
+                 (to-list tuples)
+                 (to-list (get built :taglists))))]
+      (if (nil? ks)
         nil
-        ; zip the flat key list back to [:put key d] ops, datom-major,
-        ; index-order — the exact order the NIF produced them.
-        (let [kv (into [] keys)]
-          (get (reduce
-                 (fn [acc i]
-                   (let [d (get datoms i)
-                         tags (get tag-lists i)
-                         base (get acc 1)]
-                     [(reduce (fn [ops j] (conj ops [:put (get kv (+ base j)) d]))
-                              (get acc 0)
-                              (range (count tags)))
-                      (+ base (count tags))]))
-                 [[] 0]
-                 (range (count datoms)))
-               0))))))
+        ; Zip the flat key list back to [:put key d] ops in datom order: the
+        ; in-lane datoms take theirs by CURSOR (the NIF's order is fixed), the
+        ; rest are built here.
+        (let [tags (get built :tags)
+              lanes (get built :lanes)
+              keys (into [] ks)
+              n (count datoms)]
+          (loop [i 0 c 0 out []]
+            (if (>= i n)
+              out
+              (let [d (get datoms i)
+                    ts (get tags i)]
+                (if (get lanes i)
+                  (let [k (count ts)
+                        out (loop [j 0 acc out]
+                              (if (>= j k)
+                                acc
+                                (recur (+ j 1) (conj acc [:put (get keys (+ c j)) d]))))]
+                    (recur (+ i 1) (+ c k) out))
+                  (recur (+ i 1) c
+                         (reduce (fn [acc index] (conj acc [:put (key-for index d) d]))
+                                 out
+                                 ts)))))))))))
 
 (defn write-datoms
   "Commit `datoms` to `store`, writing every index they belong in,

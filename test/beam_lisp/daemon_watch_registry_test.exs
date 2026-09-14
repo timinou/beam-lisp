@@ -57,6 +57,25 @@ defmodule BeamLisp.Daemon.WatchRegistryTest do
     end)
   end
 
+  test "two DIFFERENT dirs each get their own watcher", %{reg: reg, dir: dir} do
+    # Regression: the registry starts one ReloadWatcher per directory, but the
+    # watcher's start_link took the DEFAULT GLOBAL name — the second
+    # directory's start failed {:already_started, pid} and the tree kept
+    # exactly one watched root. A daemon-hosted `bl watch src` + `bl watch
+    # tooling` was the reporter: tooling never got a watcher.
+    dir2 = Path.join(System.tmp_dir!(), "blwreg2-#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(dir2)
+    on_exit(fn -> File.rm_rf!(dir2) end)
+
+    on_fs(reg, dir, fn ->
+      assert :ok = WatchRegistry.watch(reg, dir, {self(), :a}, fn _ -> :ok end)
+      assert :ok = WatchRegistry.watch(reg, dir2, {self(), :b}, fn _ -> :ok end)
+
+      assert length(WatchRegistry.watched(reg)) == 2,
+             "each directory holds its own watcher"
+    end)
+  end
+
   test "unwatching one subscriber keeps the watcher for the other", %{reg: reg, dir: dir} do
     parent = self()
 
