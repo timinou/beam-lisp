@@ -134,11 +134,11 @@ defmodule BeamLisp.ModelTest do
   end
 
   # A fetch's completion record: DIGEST is written LAST, after every weight has
-  # verified against its pinned sha256, which is why it — and not
-  # `model.safetensors` — is what "this copy is complete" means.
+  # verified against its pinned sha256 — and the files it stands for are what
+  # make the directory readable. A complete copy is both (`Model.fetched?/1`).
   defp fetch!(dir) do
     File.mkdir_p!(dir)
-    File.write!(Path.join(dir, "model.safetensors"), "weights")
+    Enum.each(BeamLisp.Model.files(), fn f -> File.write!(Path.join(dir, f), "x") end)
     File.write!(Path.join(dir, "DIGEST"), "75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c")
     dir
   end
