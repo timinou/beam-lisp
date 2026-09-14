@@ -173,13 +173,48 @@ it.
 
 (defn run-ui
   "`bl ui [--open]` — the session's URL, printed; `--open` hands it to the
-   desktop's opener. One address for the whole session: the page and /mcp."
+   desktop's opener. One address for the whole session: the page and /mcp.
+
+   It also STARTS THE TREE'S INDEX if one is not built yet, in the background,
+   and says so. Opening a session is the moment a developer is willing to wait
+   — the work belongs there, not behind a surprise minute of silence on their
+   first code question. The dashboard shows the same build's progress (its Index
+   pane reads the same row), so `bl ui` is the door and the page is the room.
+
+   Asking is idempotent and cheap: a tree already indexed hits the memo in
+   milliseconds, and a build in flight is not started twice."
   [args _st]
   (let [c (claim-for "ui")]
     (if (nil? c)
       (do (u/io-err "bl ui: no session is running for this tree (bl daemon start)")
           1)
-      (open-url "ui" args))))
+      (do (start-index!)
+          (open-url "ui" args)))))
+
+(defn- start-index!
+  "Ask the running session to index this tree, and report what it found.
+
+   The daemon owns the index (see `BeamLisp.Daemon.IndexWorker`), so this asks
+   IT rather than building anything here — a conn built in this process would die
+   with the command, which is the whole failure this change removes. A VM with no
+   session (a cold command) has nothing to ask, and nothing to report."
+  []
+  (let [p (erlang/whereis :"Elixir.BeamLisp.Daemon.IndexWorker")]
+    (if (= :undefined p)
+      nil
+      (do
+        (BeamLisp.Daemon.IndexWorker/ensure_building)
+        (let [s (BeamLisp.Daemon.IndexWorker/progress)]
+          (u/io-err
+            (str "bl ui: "
+                 (case (:phase s)
+                   :building (str "indexing this tree now — watch "
+                                  "http://127.0.0.1:" (or (get (claim-for "ui") :port) "?") "/")
+                   :ready (str "index ready (" (get-in s [:stats :files]) " files, "
+                               (get-in s [:stats :functions]) " functions)")
+                   :error (str "index failed: " (:message s))
+                   (str "index: " (name (or (:phase s) :cold)))))))
+        nil))))
 
 (defn run-open
   "`bl open NAME [--open] [--port N]` — the address behind a port NAME (or a

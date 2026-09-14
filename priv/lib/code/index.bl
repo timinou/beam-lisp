@@ -1,0 +1,435 @@
+; code/index.bl — ONE index per tree, and every question reads it.
+;
+; ── why this namespace exists ───────────────────────────────────────────
+;
+; `bl ask`, `bl search`, the MCP `code/*` tools and the LSP's graph answers all
+; ask the same kind of question — "what does this tree's code look like?" — and
+; each used to build its own answer. Three callers, three caches, three conns:
+;
+;   bl ask     facts.<sha>.term + askset.<pathset>.fjall   (key = the PATH SET)
+;   bl search  <ns>.<sha>.fjall + manifest.<corpus>.term  (one fjall per file)
+;   MCP mount  codebase/index-source, nothing on disk at all
+;
+; So the same analysis was paid up to three times per tree, and — this is the
+; part the numbers make obvious — even a run whose report said "corpus cached"
+; still pushed every fact through `datom/transact!` into a FRESH conn. On
+; blueprint's 43-source tree the memo read was 30 ms and the reassembly was
+; 41 s. The caching was already right; there was no one to HOLD the result.
+;
+; This namespace is that holder's beam-lisp half. The analysis is a pure
+; function of a source's bytes, so:
+;
+;   a file's FACTS are cached under its content hash (one term file, one read);
+;   a TREE's index is those facts in one conn, named by every file's hash in
+;   order — and the conn itself is held, so an unchanged tree costs ZERO work
+;   rather than a re-assembly.
+;
+; ── who owns the conn ───────────────────────────────────────────────────
+;
+; A datom conn's ETS tables live exactly as long as the process that opened
+; them. A command process dies with its answer, so a conn it built is gone by
+; the time the next question arrives — which is why every command rebuilt one.
+; The conn must therefore be owned by something that outlives requests, and in
+; a warm session that something already exists: the daemon's index worker
+; (BeamLisp.Daemon.IndexWorker; the HTTP MCP mount owner before it).
+;
+; So the rule is: the DAEMON VM owns the index when there is one in this VM, and
+; the calling process owns it when there is not. `ensure` is the single place
+; that decides, and every caller — CLI or HTTP or editor — comes through it.
+; A standalone command (no daemon) still works and still caches to disk; it just
+; cannot hand its conn to the next command, because it does not outlive it.
+
+(ns code.index
+  (:require [codebase] [datom] [typed] [bl.env :as env] [bl.util :as u]))
+
+(def MANIFEST-VERSION
+  "Bumped when the SHAPE of a memo changes — not when a source does. A memo
+   written by an older version is read as absent and re-derived."
+  1)
+
+; ── what a tree is ───────────────────────────────────────────────────────
+
+(defn tree-sources
+  "The tree's OWN sources: every loader source under env.bl's `:paths`, as
+   `[ns path]` pairs, sorted — or nil when there is no project file, no roots,
+   or nothing loadable under them.
+
+   `root` is the tree, not the shell's cwd, so a question about a tree resolves
+   against THAT tree however it was launched. A file the tree cannot own is left
+   out: a namespace declared `user`, a duplicate ns, and `codebase`/`typed` —
+   which the language indexes as its own engine (see `mcp.tools/engine-mount`)
+   and would otherwise be indexed twice into one conn.
+
+   Files that only DECLARE nothing (no ns head parseable) get the name the
+   loader's own rule gives them, `user` — and are skipped for the same reason."
+  [root]
+  (let [p (env/project root)
+        roots (to-list (:paths p))]
+    (when (seq roots)
+      (let [sources (reduce
+                      (fn [acc f]
+                        (let [ns-str (u/ns-of (File/read! f))]
+                          (if (or (= "user" ns-str)
+                                  (contains? #{ "codebase" "typed"} ns-str)
+                                  (some (fn [pr] (= ns-str (get pr 0))) acc))
+                            acc
+                            (conj acc [ns-str f]))))
+                      []
+                      (sort (mapcat u/expand-targets roots)))]
+        (when (seq sources) sources)))))
+
+(defn sources
+  "Every loader source under each of `roots`, as `[ns-string path]` pairs, sorted.
+
+   Sorted because an index's id bands follow the ORDER (source `i` gets band
+   `i`), so the same tree must give the same order on every machine and every
+   run — that is what makes two runs comparable and a memo reusable.
+
+   `roots` are the tree's own library paths (env.bl's `:paths`), not the shell's
+   cwd: a question about a tree resolves against THAT tree."
+  [roots]
+  (reduce
+    (fn [acc root]
+      (concat acc
+              (mapv (fn [p] [(u/ns-of (File/read! p)) p])
+                    (to-list (sort (Path/wildcard (str root "/**/*.bl")))))))
+    []
+    (to-list roots)))
+
+(defn- source-text
+  "A source's bytes: the file at `path`, or — for a namespace with no file of
+   its own (the engine's `codebase`/`typed`) — the text the loader would compile
+   for that name, found on the load path."
+  [ns-str path]
+  (if (nil? path) (BeamLisp.Loader/source_content ns-str) (File/read! path)))
+
+(defn- sha-of
+  "A source's content hash. Content and nothing else: a file moved or renamed
+   with its text intact is the same analysis, and the same memo key."
+  [pair]
+  (sha256-hex (source-text (get pair 0) (get pair 1))))
+
+(defn key-of
+  "The identity of a corpus: every source's namespace and content hash, IN
+   ORDER, plus this namespace's memo version.
+
+   Order is part of the key rather than an accident of the filesystem — the id
+   bands follow position, so the same files in another order are a different
+   index, and a memo that ignored the order would hand back facts banded for a
+   corpus that no longer exists."
+  [pairs]
+  (sha256-hex
+    (str MANIFEST-VERSION "|"
+         (join ";" (map (fn [p] (str (get p 0) " " (sha-of p))) (to-list pairs))))))
+
+(defn- band-of
+  "The id band for source `i`. Files never collide because no two files share a
+   band, and the band is derived from POSITION so an index is reproducible."
+  [i] (* i 1000000))
+
+(defn- shift [facts delta]
+  (mapv (fn [f] (assoc f :db/id (+ (get f :db/id) delta))) (to-list facts)))
+
+; ── one file's facts, cached under its content hash ──────────────────────
+
+(defn- facts-path
+  "Where a source's facts live: `facts.<sha>.term`, keyed by content and
+   nothing else.
+
+   Deliberately the SAME artifact `bl.ask` already writes (`source-facts`): one
+   source analyzed is then cached once for every door, and a tree that has been
+   asked a question does not re-analyze those files to answer a search. The ns
+   is not in the name because the bytes already identify the analysis — a file
+   moved or renamed with its text intact is the same analysis.
+
+   A whole-file term, not a store per file: reopening one fjall directory per
+   source was measured at 94 s over 101 files, while every fact together is a
+   few MB that ONE read delivers."
+  [root sha]
+  (str (codebase/blanalysis-dir root) "/facts." sha ".term"))
+
+(defn- read-facts [path]
+  (try
+    (let [v (erlang/binary_to_term (File/read! path))]
+      (if (map? v) v nil))
+    (catch e nil)))
+
+(defn- write-facts! [path facts]
+  (try
+    (File/mkdir_p (Path/dirname path))
+    (File/write! path (erlang/term_to_binary facts))
+    true
+    (catch e false)))
+
+(defn- norm-facts
+  "An analysis with all three fact streams present.
+
+   `bl.ask` writes `{:ns :fn :calls}` — its questions never need instructions —
+   so an entry this reads back may lack `:instr`. Normalised here rather than at
+   each use, so one reader tolerates both writers."
+  [facts]
+  (assoc facts :fn (to-list (or (:fn facts) []))
+               :calls (to-list (or (:calls facts) []))
+               :instr (to-list (or (:instr facts) []))))
+
+(defn facts-for
+  "One source's facts, from its content-addressed cache or freshly analyzed.
+
+   A pair whose path is nil is a namespace with no file of its own — the
+   language's own `codebase`/`typed` — resolved BY NAME through the load path,
+   which is what resolves in a checkout and in a release alike.
+
+   The return says WHERE they came from — a run that re-analyzed every file and
+   a run that re-analyzed none must not look alike — and the cache is written on
+   a miss so the next run is the other case.
+
+   `sigs` are the type seeds the indexer reads return annotations against."
+  [sigs root ns-str path]
+  (let [src (source-text ns-str path)
+        sha (sha256-hex src)
+        p (facts-path root sha)
+        hit (read-facts p)]
+    (if (some? hit)
+      {:facts (norm-facts hit) :from :cache :sha sha}
+      (let [facts (norm-facts (codebase/index-source sigs ns-str src))]
+        (write-facts! p facts)
+        {:facts facts :from :analyzed :sha sha}))))
+
+; ── the conn ─────────────────────────────────────────────────────────────
+
+(defn- unbanded
+  "A file's facts with their band removed, so `band-of` can place them."
+  [f]
+  (assoc f :db/id (mod (get f :db/id) 1000000)))
+
+(defn- load-facts!
+  "Write `facts` into `conn` through the bulk path when this build carries one.
+
+   `datom/load-facts!` skips everything the general pipeline must do for data a
+   caller warrants to be new and clean (no tx fns, no tempids, no store scans
+   per op). The fallback keeps the shape honest on a build without it: same
+   answers, slower."
+  [conn facts]
+  (let [bulk (try (BeamLisp.Env/fetch! "datom" "load-facts!") (catch e nil))]
+    (if (some? bulk)
+      (bulk conn facts)
+      (datom/transact! conn facts))))
+
+(defn- one-band
+  "`acc` grown by source `i`'s facts — its id band applied, its stats counted."
+  [acc i pair sigs root report n]
+  (let [r (facts-for sigs root (get pair 0) (get pair 1))
+        facts (:facts r)
+        from (:from r)
+        _ (if (some? report)
+            (report {:phase :file :i i :n n :file (or (get pair 1) (get pair 0)) :from from})
+            nil)
+        d (band-of i)]
+    (-> acc
+        (update :facts into (concat (shift (:fn facts) d)
+                                    (shift (:calls facts) d)
+                                    (shift (:instr facts) d)))
+        (update :analyzed + (if (= :analyzed from) 1 0))
+        (update :cached + (if (= :cache from) 1 0))
+        (update :functions + (count (:fn facts)))
+        (update :skipped (fn [s] (if (:skipped facts) (conj s (get pair 1)) s)))
+        ; The per-source tally, kept where the facts were read: a caller that
+        ; wants to report what a corpus is made of (the MCP `code/list` groups)
+        ; would otherwise re-read every source's cache to count what this pass
+        ; already counted.
+        (update :per-source conj {:ns (get pair 0)
+                                  :file (get pair 1)
+                                  :functions (count (:fn facts))
+                                  :calls (count (:calls facts))
+                                  :names (mapv (fn [f] (get f :fn/name)) (:fn facts))}))))
+
+(defn assemble!
+  "A conn holding every source's facts, in `pairs` order, with ONE bulk write.
+
+   Fresh conn per assembly, and the caller swaps it in whole: a reader never
+   sees a conn with half a corpus in it, which is the failure mode a partial
+   merge into a live conn would produce."
+  [sigs pairs root report]
+  (let [n (count (to-list pairs))
+        v (vec (to-list pairs))
+        _ (if (some? report) (report {:phase :start :n n}) nil)
+        acc (reduce (fn [a i] (one-band a i (get v i) sigs root report n))
+                    {:facts [] :analyzed 0 :cached 0 :functions 0 :skipped [] :per-source []}
+                    (range n))
+        conn (codebase/connect-codebase)]
+    (load-facts! conn (to-list (:facts acc)))
+    {:conn conn
+     :per-source (to-list (filterv (fn [r] (some? (:file r))) (:per-source acc)))
+     :stats {:files n :functions (:functions acc)
+             :analyzed (:analyzed acc) :cached (:cached acc)
+             :skipped (to-list (:skipped acc))}}))
+
+; ── the held index ───────────────────────────────────────────────────────
+
+; A memo of the LAST index built in this VM: its corpus key, its conn, its
+; stats. Process-wide rather than per-caller, because the whole point is that
+; the second question does not rebuild what the first one built.
+(def ^:private held (atom nil))
+
+(defn held-key []
+  (let [h (deref held)] (if (nil? h) nil (:key h))))
+
+(defn held-index [] (deref held))
+
+; ── the daemon seam ──────────────────────────────────────────────────────
+;
+; Two calls, and they are the whole coupling between "the tree's index" and
+; "the process that keeps it alive". They are here, named, rather than spread
+; through the file, so the dependency is one thing to read and one thing to
+; change: an index needs an OWNER that outlives a command, and in a warm
+; session that owner is the daemon's index worker (BeamLisp.Daemon.IndexWorker
+; — the HTTP MCP mount owner before it, which is why `bl mcp` and `bl ask` can
+; now share one conn instead of two).
+;
+; With no daemon in this VM the same code runs on the calling process and still
+; caches to disk; it just cannot hand its conn to the next command, because it
+; does not outlive it.
+
+(defn- daemon-owner
+  "The daemon's index worker in THIS VM, or nil."
+  []
+  (let [p (erlang/whereis :"Elixir.BeamLisp.Daemon.IndexWorker")]
+    (if (= :undefined p) nil p)))
+
+(defn- daemon-run
+  "Run `f` on the owner, so whatever it builds is owned by a process that
+   outlives this command."
+  [f]
+  (BeamLisp.Daemon.IndexWorker/run f))
+
+(defn- daemon-report!
+  "Show the work in the daemon's UI: one row the dashboard reads, with no query
+   to the worker — the worker is the one building, so it cannot answer one."
+  [m]
+  (BeamLisp.Daemon.IndexWorker/progress! m))
+
+(defn- reporter
+  "The progress function a build will call: the daemon's own when there is a
+   daemon (so a background build is VISIBLE rather than minutes of silence),
+   else whatever the caller passed."
+  [owner caller-progress]
+  (if (nil? owner)
+    caller-progress
+    (fn [m]
+      (daemon-report! m)
+      (if (some? caller-progress) (caller-progress m) nil))))
+
+(defn- build!
+  "The work: read the corpus key, and on a miss assemble the conn. Runs ON THE
+   OWNER when there is one (see `ensure`), which is what makes the conn's tables
+   outlive the answer."
+  [sigs pairs root report]
+  (let [t0 (System/monotonic_time :millisecond)
+        k (key-of pairs)
+        h (deref held)
+        ms (fn [] (- (System/monotonic_time :millisecond) t0))
+        tell (fn [m] (if (some? report) (report m) nil))]
+    (if (and (some? h) (= k (:key h)) (datom/alive? (:conn h)))
+      (do (tell {:phase :ready :hit true :ms (ms) :stats (:stats h)}) h)
+      (try
+        (let [built (assemble! sigs pairs root report)
+              v (assoc built
+                       :key k
+                       :built-at (System/monotonic_time :millisecond)
+                       :sources (mapv (fn [p] [(get p 0) (sha-of p)]) pairs))]
+          (reset! held v)
+          (tell {:phase :ready :hit false :ms (ms) :stats (:stats built)})
+          v)
+        (catch e
+          (tell {:phase :error :message (ex-message e)})
+          (throw e))))))
+
+(defn ensure
+  "The tree's index: `{:conn :key :stats …}`, building it if it is stale.
+
+   A HIT costs nothing but the key — every source hashed, tens of ms for a
+   hundred files — and no assembly at all, because the conn from the last build
+   is still standing. A MISS re-analyzes only the files whose bytes moved (the
+   rest come from their content-addressed caches) and assembles one conn.
+
+   `opts` keys: `:root` (where artifacts live — the tree the sources belong
+   to), `:on-progress` (`(fn [m] …)`, for a caller that wants the work)."
+  ([sigs pairs] (ensure sigs pairs {}))
+  ([sigs pairs opts]
+   (let [root (:root opts (first (map (fn [p] (get p 1)) (to-list pairs))))
+         owner (daemon-owner)
+         report (reporter owner (:on-progress opts))
+         job (fn [] (build! sigs pairs root report))]
+     (if (or (nil? owner) (= owner (erlang/self)))
+       ; No owner, or we ARE the owner: run here. The second case is the
+       ; daemon's own boot build, which runs on the worker — asking the worker
+       ; to run a function that is already running there is a call to itself,
+       ; and a GenServer cannot answer that.
+       (job)
+       (daemon-run job)))))
+
+(defn reuse-for-paths
+  "The tree index at `root`, when it holds exactly the sources `paths` name —
+   otherwise nil.
+
+   EXACT, not a superset, and that is the whole subtlety. `impact` and `callers`
+   answer from the whole graph, so an index carrying one more file than the
+   caller asked about would answer with a caller that file contributes — a wrong
+   answer that looks like a more complete one. A narrower question therefore
+   falls back to its own path, and only the question that means "this tree"
+   reuses the tree's index.
+
+   Comparing content hashes rather than paths is what makes it hit: the daemon
+   built its index from env.bl's absolute `:paths` while a command may have
+   arrived with relative ones, and a file moved with its text intact is the same
+   sources for this purpose."
+  [root paths]
+  (let [want (sort (to-list (map (fn [p] (sha256-hex (File/read! p))) (to-list paths))))
+        idx (ensure-tree root)]
+    (when (some? idx)
+      ; The engine's two bands lead every index (see `engine-pairs`) and are
+      ; never part of a caller's question about ITS sources, so they are dropped
+      ; from the comparison rather than counted against every caller.
+      (let [have (sort (to-list (map (fn [s] (get s 1)) (drop 2 (to-list (:sources idx))))))]
+        (if (= (to-list want) (to-list have)) idx nil)))))
+
+(def sigs
+  "The type seeds the indexer reads return annotations against — the same three
+   the MCP code surface mounts with, so a fact indexed here and a fact indexed
+   there are the same fact."
+  (merge typed/core-sigs typed/core-seeds-v2 typed/host-seeds))
+
+(def engine-pairs
+  "The language's own two namespaces, the FIRST bands of every index.
+
+   They have no file of their own — their children resolve the name through the
+   load path — and every index carries them, so the call graph of the language
+   and the call graph of the tree are ONE graph. `code/query` reaching a
+   `typed/…` call from a `printflow/…` caller is that fact, not a join."
+  [["codebase" nil] ["typed" nil]])
+
+(defn index-pairs
+  "What an index over the tree at `root` holds, in band order: the engine first,
+   then the tree's own sources in their sorted order.
+
+   The engine is indexed even with no tree at all, which is what makes a bare
+   `bl` outside any project answer about the language itself rather than index
+   nothing."
+  [root]
+  (concat engine-pairs (or (tree-sources root) [])))
+
+(defn ensure-tree
+  "The index for the TREE at `root` — the entry every door uses.
+
+   Returns nil when the tree has no sources to index (no env.bl, or nothing
+   loadable under its `:paths`), which is a fact a caller must be able to tell
+   from an empty index: there is no such thing as an index of nothing.
+
+   `opts`: `:on-progress` `(fn [i n path from] …)`, `:roots` to index an
+   explicit set of paths instead of the project's."
+  ([root] (ensure-tree root {}))
+  ([root opts]
+   (let [pairs (or (:pairs opts) (index-pairs root))]
+     (if (nil? pairs)
+       nil
+       (ensure sigs (to-list pairs) (assoc opts :root root))))))

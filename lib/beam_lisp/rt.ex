@@ -1934,34 +1934,72 @@ defmodule BeamLisp.RT do
   @doc "`(concat & seqs)` — a lazy seq of every input, in order."
   def concat(seqs) when is_list(seqs) do
     seqs = Enum.map(seqs, &LazySeq.input/1)
-    LazySeq.new(fn -> concat_chunk(seqs) end)
+
+    # The not-yet-reached seqs live in a native cursor, not a heap list.
+    # `LazySeq.new` scans a thunk's closure env for dependency edges and
+    # flat-sizes it, so a chunk tail capturing the shrinking seq LIST made
+    # both O(remaining) per chunk — quadratic for the
+    # `(mapcat (fn [x] [x]) …)` shape `datom.tx/expand-tx-fns` uses. A cursor
+    # keeps at most one 32-seq chunk on the heap; the rest is native storage
+    # the scan crosses in one step.
+    cursor = BeamLisp.SeqCursor.new(seqs)
+    LazySeq.new(fn -> concat_chunk(nil, cursor) end)
   end
 
-  # A chunk is drawn from ONE source seq (up to @chunk_size elements). It
-  # does not cross into a later seq mid-chunk, so taking the head of a
-  # concat of a realized head + a huge lazy tail never realizes the tail —
-  # Clojure's concat advances seqs lazily too. Returns `:empty`, a proper
-  # list (all consumed), or `{elems, rest_seqs}` for a lazy tail.
-  defp concat_chunk(seqs) do
-    seqs = Enum.map(seqs, &LazySeq.input/1)
-    case concat_pull(seqs, LazySeq.chunk_size(), []) do
-      :empty -> nil
-      {[], rest} -> concat_chunk(rest)
-      {elems, []} -> elems
-      {elems, rest} -> LazySeq.chain(elems, fn -> concat_chunk(rest) end)
+  # `cur` is the seq being drained (`nil` when the next one comes from
+  # `cursor`). A chunk is up to @chunk_size elements from ONE source seq: it
+  # does not cross into a later seq mid-chunk, so taking the head of a concat
+  # of a realized head + a huge lazy tail never realizes the tail — Clojure's
+  # concat advances seqs lazily too, and wave 26 pins exactly that shape.
+  # An exhausted cursor ends the seq as a proper list (`elems`), so a small
+  # concat terminates without an empty LazySeq tail.
+  defp concat_chunk(cur, cursor) do
+    case concat_pull(cur, cursor, LazySeq.chunk_size(), []) do
+      :empty ->
+        nil
+
+      {elems, nil, cursor} ->
+        if BeamLisp.SeqCursor.cell(cursor) == nil,
+          do: elems,
+          else: LazySeq.chain(elems, fn -> concat_chunk(nil, cursor) end)
+
+      {elems, cur, cursor} ->
+        LazySeq.chain(elems, fn -> concat_chunk(cur, cursor) end)
     end
   end
 
-  defp concat_pull([], _n, []), do: :empty
-  defp concat_pull([], _n, acc), do: {Enum.reverse(acc), []}
-  defp concat_pull(seqs, 0, acc), do: {Enum.reverse(acc), seqs}
+  # Drain up to `n` elements. An exhausted `cur` ENDS the chunk rather than
+  # reaching into `cursor` for the next seq; `cur == nil` is the other side of
+  # that boundary — it takes one seq from the cursor and starts draining it.
+  # Empty inputs (`nil`, `[]`, an exhausted seq) are skipped in `next_seq`, so
+  # a chunk never ends merely because the next input is empty.
+  defp concat_pull(cur, cursor, 0, acc), do: {Enum.reverse(acc), cur, cursor}
 
-  defp concat_pull([s | rest], n, acc) do
-    case LazySeq.cell(s) do
-      # An exhausted leading seq is dropped here; the next chunk continues
-      # from the remaining seqs rather than pulling them in this one.
-      nil -> {Enum.reverse(acc), rest}
-      [h | t] -> concat_pull([t | rest], n - 1, [h | acc])
+  defp concat_pull(nil, cursor, n, acc) do
+    case next_seq(cursor) do
+      :none -> if acc == [], do: :empty, else: {Enum.reverse(acc), nil, cursor}
+      {[h | t], cursor} -> concat_pull(t, cursor, n - 1, [h | acc])
+    end
+  end
+
+  defp concat_pull(cur, cursor, n, acc) do
+    case LazySeq.cell(cur) do
+      # Exhausted: the chunk ends at the seq boundary.
+      nil -> {Enum.reverse(acc), nil, cursor}
+      [h | t] -> concat_pull(t, cursor, n - 1, [h | acc])
+    end
+  end
+
+  defp next_seq(cursor) do
+    case BeamLisp.SeqCursor.cell(cursor) do
+      nil ->
+        :none
+
+      [seq | cursor] ->
+        case LazySeq.cell(seq) do
+          nil -> next_seq(cursor)
+          cell -> {cell, cursor}
+        end
     end
   end
 

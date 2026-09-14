@@ -39,6 +39,7 @@ defmodule BeamLisp.Daemon.Inspect do
       ports: ports(),
       tasks: tasks(root),
       queue: queue(),
+      index: index(),
       image: image(opts)
     }
   end
@@ -55,9 +56,16 @@ defmodule BeamLisp.Daemon.Inspect do
       "ports" => Enum.map(m.ports, &stringify/1),
       "tasks" => Enum.map(m.tasks, &stringify/1),
       "queue" => stringify(m.queue),
+      "index" => stringify(m.index),
       "image" => m[:image] && stringify(m.image)
     }
   end
+
+  # The tree's code index, off the worker's ETS row: the same value the
+  # dashboard's Index pane renders, so the page, /model and `bl daemon status`
+  # cannot disagree about what the session is doing. Never a call to the worker —
+  # the worker may be the one building it.
+  defp index, do: BeamLisp.Daemon.IndexWorker.progress()
 
   # --- the parts ---
 
@@ -212,9 +220,44 @@ defmodule BeamLisp.Daemon.Inspect do
       uptime_ms     #{id.uptime_ms}
     #{render_ports(m.ports)}
     #{render_tasks(m.tasks)}
-    #{render_queue(m.queue)}#{render_image(m[:image])}
+    #{render_queue(m.queue)}#{render_index(m[:index])}#{render_image(m[:image])}
     """
   end
+
+  # The index line: what the session's first code question would cost right now.
+  # A tree with no index yet says so rather than showing a zero — the difference
+  # between "nothing indexed" and "nothing there" is the whole point.
+  defp render_index(nil), do: ""
+
+  defp render_index(%{phase: :ready} = p) do
+    s = Map.get(p, :stats) || %{}
+
+    "\n  index         ready  #{count(s, :files)} files, #{count(s, :functions)} functions" <>
+      "  (#{count(s, :analyzed)} analyzed, #{count(s, :cached)} from cache, #{ms(p[:ms])})"
+  end
+
+  defp render_index(%{phase: :building} = p) do
+    done = Map.get(p, :done, 0)
+    total = Map.get(p, :total, 0)
+
+    "\n  index         building  #{done}/#{if total > 0, do: total, else: "?"}" <>
+      "#{if Map.get(p, :file), do: "  " <> Map.get(p, :file), else: ""}"
+  end
+
+  defp render_index(%{phase: :error} = p) do
+    "\n  index         failed  #{Map.get(p, :message, "")}"
+  end
+
+  defp render_index(_), do: "\n  index         (none — it will build on the first code question)"
+
+  defp count(s, k), do: to_int(Map.get(s, k))
+
+  defp to_int(n) when is_integer(n), do: n
+  defp to_int(_), do: 0
+
+  defp ms(nil), do: "—"
+  defp ms(n) when is_integer(n), do: "#{div(n, 1000)}.#{rem(div(n, 100), 10)}s"
+  defp ms(_), do: "—"
 
   defp render_ports([]), do: "  ports         (none claimed)"
 

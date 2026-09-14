@@ -1,7 +1,7 @@
 defmodule BeamLisp.Daemon.Workers do
   @moduledoc """
   The daemon's three stateful workers — the command `Executor`, the
-  `WatchRegistry` and the HTTP MCP mount owner (`McpWorker`) — under ONE
+  `WatchRegistry` and the tree's index owner (`IndexWorker`) — under ONE
   supervisor, so a death is a RESTART.
 
   ## Why this module exists
@@ -30,16 +30,27 @@ defmodule BeamLisp.Daemon.Workers do
   the idle timer) still takes the tree down with it.
   """
 
-  @workers [BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry, BeamLisp.Daemon.McpWorker]
+  @workers [BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry]
 
   @doc """
   Start the worker supervisor, or hand back the one already running.
 
   Idempotent by name: the daemon's `init/1` may run twice in one VM, and the
   second call must find the first supervisor rather than fail on it.
+
+  `root` is the tree the daemon serves, and it is handed to the index worker
+  and nowhere else: the other two learn the tree per request (a command binds
+  the caller's cwd), while the index is built by a BACKGROUND build that has no
+  request to read it from. Without it, a daemon started in one directory would
+  index whatever directory a later request happened to stand in.
   """
-  def ensure_started do
-    case Supervisor.start_link(@workers, strategy: :one_for_one, name: __MODULE__) do
+  def ensure_started(opts \\ []) do
+    root = Keyword.get(opts, :root, File.cwd!())
+
+    children =
+      @workers ++ [{BeamLisp.Daemon.IndexWorker, [root: root]}]
+
+    case Supervisor.start_link(children, strategy: :one_for_one, name: __MODULE__) do
       {:ok, pid} -> {:ok, pid}
       {:error, {:already_started, pid}} -> {:ok, pid}
     end

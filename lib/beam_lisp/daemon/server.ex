@@ -77,7 +77,7 @@ defmodule BeamLisp.Daemon.Server do
       # crash it links (`examples/mcp-demo.bl` starting an in-process MCP
       # server) used to leave the daemon healthy-looking and permanently
       # unable to run anything (`:noproc`). See `BeamLisp.Daemon.Workers`.
-      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started()
+      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started(root: root)
 
       # The session's address. `:ui` is claimed first (the registry is what
       # decides whether a project's pinned port is free), then served — the page
