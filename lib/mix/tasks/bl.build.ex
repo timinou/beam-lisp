@@ -24,7 +24,7 @@ defmodule Mix.Tasks.Bl.Build do
     * `--skip-cargo`   reuse a previously built launcher/pack tool
     * `--target T`     cross-target (`linux/x86_64` etc.; needs per-target NIFs)
     * `--no-embed`     build WITHOUT the embedding weights. The drop is then
-      ~33 MB smaller and `bl search` needs `mix bl.embed.fetch` on the machine
+      ~32 MB smaller and `bl search` needs `mix bl.embed.fetch` on the machine
       that runs it — which a user of a drop cannot do. The weights are part of
       the default distribution on purpose: the drop carries no Mix and no
       network assumption, and a capability that ships absent reads as a bug.
@@ -87,6 +87,7 @@ defmodule Mix.Tasks.Bl.Build do
     # loss in the artifact users install, so the build refuses instead of
     # shipping it.
     if opts[:embed] == false do
+      strip_embedded!(release_dir)
       Mix.shell().info("bl.build: --no-embed: `bl search` will need the weights on the machine that runs this drop")
     else
       ensure_embedded!(release_dir)
@@ -129,6 +130,19 @@ defmodule Mix.Tasks.Bl.Build do
     size_mb = (File.stat!(out).size / 1_048_576) |> Float.round(1)
     Mix.shell().info("bl.build: wrote #{out} (#{size_mb} MB)")
     Mix.shell().info("bl.build: run it with `#{out} version`; start a warm loop with `#{out} daemon start`")
+  end
+
+  # `--no-embed` means the DROP ships without weights, not merely that THIS build
+  # skipped the fetch. A priv/embed already populated in the tree (a dev who
+  # fetched, a reused `--release`) is copied into the release by `mix release`,
+  # so without this the flag would be a lie — the drop would still carry 32 MB
+  # and answer `bl search`. Strip them from the release COPY, never the source.
+  defp strip_embedded!(release_dir) do
+    for dir <- Path.wildcard(Path.join([release_dir, "lib", "beam_lisp-*", "priv", "embed", "*"])),
+        File.dir?(dir) do
+      File.rm_rf!(dir)
+      Mix.shell().info("bl.build: --no-embed: removed #{Path.relative_to(dir, release_dir)} from the payload")
+    end
   end
 
   # Refuse to pack a drop whose PAYLOAD has no usable weights (see the call site
