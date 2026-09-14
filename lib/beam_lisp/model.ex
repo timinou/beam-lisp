@@ -1,24 +1,36 @@
 defmodule BeamLisp.Model do
   @moduledoc """
-  Where a *downloaded model* lives on this machine.
+  Where the static code model's weights live, and WHICH copy to read.
 
-  ## Why this is not under `priv/`
+  ## Three roots, and the reason each exists
 
-  `priv/z3/` sets the precedent for a fetched binary, and it is the wrong one
-  here for a reason that is a matter of arithmetic. A solver is ~50 MB and is
-  fetched per checkout to match the pinned release. A static embedding model is
-  the same 33 MB for every checkout, every project and every worktree on the
-  box, and it is not *built* — it is *cached*. Copying it into each tree buys
-  nothing and costs 33 MB each.
+  A vector space is identified by its weights, so "which copy" is a real
+  question with a real answer: `dir/1` returns the first root below that holds a
+  COMPLETE fetched copy.
 
-  So the model is ambient, like the AOT cache (`BeamLisp.AOTCache`) and the Cargo
-  target dir: kept in the user cache, addressed by name, shared by everything
-  that asks for it.
+    1. `$BEAM_LISP_MODEL_DIR` — an explicit pin. SET MEANS ANSWER: nothing falls
+       through from it, so a test (or a CI job) that points it at an empty
+       directory is testing absence, not whatever else the machine holds.
+    2. `priv/embed/<name>` — the BUNDLED copy. `mix bl.build` fetches the weights
+       in before it packs (`--no-embed` opts out), so a shipped `bl` answers
+       semantic queries with no network, no Mix and no cache on the box. The
+       drop is the default distribution; the weights ship inside it.
+    3. `$XDG_CACHE_HOME/beam_lisp/models/<name>` — the AMBIENT cache
+       `mix bl.embed.fetch` fills by default. Shared across checkouts, worktrees
+       and branches, which is the arithmetic that keeps 33 MB out of every tree:
+       the model is the same bytes for every checkout and is cached rather than
+       built. `priv/z3/`'s precedent (fetch per checkout, to match a pinned
+       release) buys nothing for it.
+
+  So a source tree works from tier 3 and a drop works from tier 2, and both name
+  the same pinned bytes: the sha256 contract lives in the fetch task, and the
+  digest file each tier carries is what makes a copy identifiable as those
+  bytes.
 
   ## One rule, two callers
 
-  The `.bl` side (`code.embed`) and the Mix fetch task both need this path, and
-  they must agree — a fetch into one directory and a load from another is a
+  The `.bl` side (`code.embed`) and the Mix tasks both need this answer, and
+  they must agree — weights fetched into one root and read from another is a
   capability that silently reads as absent. So the rule lives here once and both
   call it: Elixir owns the filesystem question, beam-lisp owns what to do about
   the answer.
@@ -27,10 +39,13 @@ defmodule BeamLisp.Model do
   @env_dir "BEAM_LISP_MODEL_DIR"
 
   @doc """
-  Root of the model cache: `$BEAM_LISP_MODEL_DIR`, else
+  The AMBIENT root: `$BEAM_LISP_MODEL_DIR`, else
   `$XDG_CACHE_HOME/beam_lisp/models` — the `models` subdirectory of the host
   cache root (`BeamLisp.Cache`), which owns the one answer to "where does this
   machine keep beam-lisp's derived state".
+
+  This is where a fetch writes by DEFAULT. Readers ask `dir/1`, which prefers a
+  bundled copy when one is present.
 
   Resolved PER CALL, never memoised: a test (or a fetch with `--dir`) sets the
   variable and expects the next call to see it. `BeamLisp.AOTCache` learned this
@@ -45,9 +60,82 @@ defmodule BeamLisp.Model do
     end
   end
 
-  @doc "The directory for the model named `name` (`minishlab/potion-code-16M-v2`)."
+  @doc """
+  The BUNDLED root, `priv/embed/`: what `mix bl.build` ships, and what a drop
+  reads.
+
+  Resolved through `BeamLisp.Tiers.priv_root/0` and not `:code.priv_dir/1`, for
+  the reason `BeamLisp.Z3.Port` gives: inside an escript `priv_dir` answers with
+  a pseudo-path inside the archive, which is not a directory on disk.
+  """
+  @spec bundled_root() :: String.t()
+  def bundled_root, do: Path.join(BeamLisp.Tiers.priv_root(), "embed")
+
+  @doc "The ambient directory for `name` — where a plain fetch writes."
+  @spec ambient_dir(String.t()) :: String.t()
+  def ambient_dir(name), do: Path.join(root(), name)
+
+  @doc "The bundled directory for `name` — where `mix bl.embed.fetch --bundle` writes."
+  @spec bundled_dir(String.t()) :: String.t()
+  def bundled_dir(name), do: Path.join(bundled_root(), name)
+
+  @doc """
+  The directory to READ `name` from: the first tier that holds a complete copy
+  (see the moduledoc for the order and why each tier earns its place).
+
+  Falls back to the ambient directory when NOTHING is fetched, so a caller's
+  error message can name where a fetch was expected to land.
+  """
   @spec dir(String.t()) :: String.t()
-  def dir(name), do: Path.join(root(), name)
+  def dir(name) do
+    case System.get_env(@env_dir) do
+      dir when is_binary(dir) ->
+        Path.join(Path.expand(dir), name)
+
+      nil ->
+        Enum.find([bundled_dir(name), ambient_dir(name)], &fetched?/1) || ambient_dir(name)
+    end
+  end
+
+  @doc """
+  Which tier answers `dir/1` for `name`: `:env`, `:bundled`, `:ambient`, or
+  `:absent` when no tier holds a complete copy.
+
+  A diagnostic, so a person or a test names the copy in use instead of inferring
+  it from whichever directory happened to come back.
+  """
+  @spec tier(String.t()) :: :env | :bundled | :ambient | :absent
+  def tier(name) do
+    case System.get_env(@env_dir) do
+      dir when is_binary(dir) ->
+        if fetched?(Path.join(Path.expand(dir), name)), do: :env, else: :absent
+
+      nil ->
+        cond do
+          fetched?(bundled_dir(name)) -> :bundled
+          fetched?(ambient_dir(name)) -> :ambient
+          true -> :absent
+        end
+    end
+  end
+
+  @doc """
+  The directories `dir/1` consults, in order — for a message that must not lie
+  about where the weights were looked for.
+  """
+  @spec searched_dirs(String.t()) :: [String.t()]
+  def searched_dirs(name), do: Enum.uniq([bundled_dir(name), ambient_dir(name)])
+
+  @doc """
+  Whether `dir` holds a COMPLETE fetched copy: the `DIGEST` file the fetch task
+  writes LAST, after every weight has verified against its pinned sha256.
+
+  That file and not `model.safetensors`, on purpose: a partial download must not
+  look like a model, and weights with no digest have no provenance — the digest
+  is what identifies the vector space every stored embedding was made in.
+  """
+  @spec fetched?(String.t()) :: boolean()
+  def fetched?(dir), do: File.regular?(Path.join(dir, "DIGEST"))
 
   @doc "The env var that overrides `root/0`."
   @spec dir_env() :: String.t()

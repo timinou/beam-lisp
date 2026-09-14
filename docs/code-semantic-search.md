@@ -74,16 +74,34 @@ is worse than one that can ask either.
 
 ## The model is data, and lives where data lives
 
-The weights are downloaded, sha256-pinned, and kept under
-`$BEAM_LISP_MODEL_DIR` or `$XDG_CACHE_HOME/beam_lisp/models`. They are not in
-`priv/` — the solver's precedent, and the wrong one here: a solver binary is
-fetched per checkout, while a model is the same bytes for every checkout,
-project and worktree on the machine, and copying it per tree buys nothing.
+The weights are downloaded, sha256-pinned (three files, and the digest of
+`model.safetensors` is the model's identity), and read from the FIRST of three
+roots that holds a complete copy:
 
-Nothing at query time touches the network. `mix bl.embed.fetch` is the
-only step that does, and after it, search runs with the cable unplugged.
+| root | who puts it there | who reads it |
+|---|---|---|
+| `$BEAM_LISP_MODEL_DIR` | you, explicitly | anything — an explicit pin is an ANSWER, never a fallthrough |
+| `<drop>/priv/embed/potion-code-16M-v2` | `mix bl.build`, so the `bl` you install already carries it | a drop: no network, no Mix, no cache needed |
+| `$XDG_CACHE_HOME/beam_lisp/models/…` | `mix bl.embed.fetch` (its default) | a source checkout — one copy per machine, not per worktree |
 
-Absence is the ordinary state of a fresh checkout, so absence reads as absent:
+The middle root is why the shipped `bl` can answer at all: a drop carries no
+Mix, so "fetch the model first" is not an instruction a drop's user can follow.
+The weights travel inside it, and `--no-embed` is the one way to build a drop
+without them. The third root is why a working tree carries no 33 MB per branch:
+the bytes are identical everywhere on the box, so they are cached rather than
+copied per checkout — the z3 precedent buys nothing here.
+
+What makes a copy identifiable is the `DIGEST` file the fetch writes LAST, after
+every weight has verified against its pinned sha256: a partial download must not
+look like a model, and weights with no digest have no provenance — the digest
+is what identifies the vector space every stored embedding was made in.
+
+Nothing at query time touches the network. Only a fetch does, and after one
+fetch (or one build) search runs with the cable unplugged.
+
+Absence is the ordinary state of a checkout that has neither fetched nor built,
+so absence reads as absent — and names every root it looked in, which is also the
+diagnosis (the shape of that message is under `bl search` below).
 
 ```
 code.embed/available?     can semantic search run here?
@@ -310,9 +328,10 @@ Exit codes are the CLI's usual three: `0` a search ran, `1` something broke,
 missing model is `2` as well, and says so:
 
 ```
-bl search: the model weights are not on disk — run `mix bl.embed.fetch` (expected in ~/.cache/beam_lisp/models/potion-code-16M-v2)
-  fetch the model once, then search offline forever:
+bl search: the model weights are not on disk — looked in <drop>/priv/embed/potion-code-16M-v2, ~/.cache/beam_lisp/models/potion-code-16M-v2 (`mix bl.embed.fetch` fetches them into the cache; a built `bl` ships them)
+  a source checkout fetches the weights once, then searches offline forever:
     mix bl.embed.fetch
+  a built `bl` carries them (`mix bl.build`; `--no-embed` leaves them out)
 ```
 
 ### What it costs
