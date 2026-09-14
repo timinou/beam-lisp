@@ -51,6 +51,22 @@ defmodule BeamLisp.AnfDirectEmitTest do
           assert Enum.all?(entries, fn {_, outcome} -> match?({:ok, _}, outcome) end)
           env = Map.put(bl("compiler", "new-env", ["anfcensus"]), :ns, "anfcensus")
 
+          # `ANF_CORPUS_REFREEZE=1 mix test test/beam_lisp/anf_direct_emit_test.exs`
+          # re-blesses the snapshots from the CURRENT compiler, in exactly the
+          # scope the comparison runs in. For a deliberate emit change (a new
+          # link target, a new special form) — never to make a red run green
+          # without reading the diff first.
+          if System.get_env("ANF_CORPUS_REFREEZE") == "1" do
+            refrozen =
+              Enum.map(entries, fn {form, _} ->
+                bl("compiler", "reset-fresh!", [])
+                {form, {:ok, BeamLisp.Compiler.compile(form, env)}}
+              end)
+
+            File.write!(snapshot_path(path), :erlang.term_to_binary(%{version: 2, source: path, entries: refrozen}))
+            IO.puts("refroze #{path}: #{length(refrozen)} forms")
+          end
+
           entries
           |> Enum.with_index()
           |> Enum.reduce(acc, fn {{form, {:ok, expected}}, i}, acc ->

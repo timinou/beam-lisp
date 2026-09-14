@@ -996,7 +996,7 @@ defmodule BeamLisp.RT do
   def symbol?(_), do: false
 
   def string?(x), do: is_binary(x)
-  def number?(x), do: is_number(x)
+  defdelegate number?(x), to: BeamLisp.Num
   def int?(x), do: is_integer(x)
   # A record answers `true` here, as it does in Clojure, because a record IS a
   # user-facing map in this language: `count`, `seq`, `get`, `assoc`, `find`
@@ -1241,6 +1241,8 @@ defmodule BeamLisp.RT do
   def compare(a, b) do
     cond do
       a == b -> 0
+      # `1.0M` and `1.00M` are not `==` but compare as 0: numeric rank
+      # decides through the tower, never through term order.
       rank(a) != rank(b) -> sign(rank(a) - rank(b))
       true -> cmp_same(rank(a), a, b)
     end
@@ -1250,6 +1252,7 @@ defmodule BeamLisp.RT do
   defp rank(false), do: 1
   defp rank(true), do: 2
   defp rank(x) when is_number(x), do: 3
+  defp rank(%BeamLisp.Decimal{}), do: 3
   defp rank(x) when is_binary(x), do: 4
   defp rank({:symbol, _}), do: 5
   defp rank(x) when is_atom(x), do: 6
@@ -1300,7 +1303,7 @@ defmodule BeamLisp.RT do
   defp rank(x) when is_tuple(x), do: 12
   defp rank(_), do: 13
 
-  defp cmp_same(3, a, b), do: sign_num(a, b)
+  defp cmp_same(3, a, b), do: BeamLisp.Num.cmp(a, b)
   defp cmp_same(4, a, b), do: sign_str(a, b)
   defp cmp_same(5, a, b), do: sign_str(sym_name(a), sym_name(b))
   defp cmp_same(6, a, b), do: sign_str(Atom.to_string(a), Atom.to_string(b))
@@ -1333,8 +1336,6 @@ defmodule BeamLisp.RT do
   defp erlang_order(a, b) when a > b, do: 1
   defp erlang_order(_, _), do: 0
 
-  defp sign_num(a, b) when a < b, do: -1
-  defp sign_num(_a, _b), do: 1
   defp sign_str(a, b) when a < b, do: -1
   defp sign_str(_a, _b), do: 1
   defp sign(n) when n < 0, do: -1
@@ -1520,8 +1521,8 @@ defmodule BeamLisp.RT do
   @doc "jank's `cpp/jank.runtime.is_ratio`: beam-lisp has no Ratio type (no exact rationals), so nothing is one."
   def ratio?(_), do: false
 
-  @doc "jank's `cpp/jank.runtime.is_big_decimal`: beam-lisp has no BigDecimal type, so nothing is one."
-  def decimal?(_), do: false
+  @doc "A `BeamLisp.Decimal` — the exact decimal `123.45M` reads as."
+  def decimal?(x), do: is_struct(x, BeamLisp.Decimal)
 
   # NB: `sorted?/1` now lives with the sorted-collection primitives above
   # (it answers true for SortedMap/SortedSet since PLAN-033 wave 1). jank's
@@ -2164,9 +2165,9 @@ defmodule BeamLisp.RT do
 
   def even?(x), do: rem(x, 2) == 0
   def odd?(x), do: rem(x, 2) != 0
-  def zero?(x), do: x == 0
-  def pos?(x), do: x > 0
-  def neg?(x), do: x < 0
+  defdelegate zero?(x), to: BeamLisp.Num
+  defdelegate pos?(x), to: BeamLisp.Num
+  defdelegate neg?(x), to: BeamLisp.Num
 
   def print_str(%BeamLisp.Vector{} = v) do
     "[" <> Enum.map_join(BeamLisp.Vector.to_list(v), " ", &print_elem/1) <> "]"
@@ -2223,6 +2224,9 @@ defmodule BeamLisp.RT do
   # A reference is not a map — printing it as a map would leak its backing
   # process (`{:pid #PID…}`); print it via inspect instead.
   def print_str(%{__struct__: mod} = r) when is_atom(mod) and is_ref_type(r), do: inspect(r)
+  # A decimal prints as the literal it reads from, `123.45M`, so `pr-str`
+  # round-trips and the scale is visible.
+  def print_str(%BeamLisp.Decimal{} = d), do: BeamLisp.Decimal.to_literal(d)
 
   def print_str(%{__struct__: mod} = r) when is_atom(mod) do
     if BeamLisp.Record.record?(r) do
@@ -2368,6 +2372,9 @@ defmodule BeamLisp.RT do
   end
 
   defp to_str(nil), do: ""
+  # `str` is Clojure's `toString`: a decimal prints plain (`"1.50"`), while
+  # `pr-str` keeps the readable literal (`1.50M`).
+  defp to_str(%BeamLisp.Decimal{} = d), do: BeamLisp.Decimal.to_plain_string(d)
   defp to_str(x) when is_binary(x), do: x
   defp to_str(x) when is_atom(x), do: Atom.to_string(x)
   # A symbol stringifies to its name — `(str 'foo)` is "foo", which
@@ -2406,18 +2413,20 @@ defmodule BeamLisp.RT do
   def seed_core do
     # Clojure arithmetic is variadic: (+ 1 2 3), (*) → 1, (- 5) → -5.
     arith = %{
-      "+" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 0, &Kernel.+/2) end}),
-      "*" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 1, &Kernel.*/2) end}),
+      # Every arity folds through BeamLisp.Num, the tower's seam: int/float
+      # take the BIF on its first clause, a decimal operand promotes.
+      "+" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 0, &BeamLisp.Num.add/2) end}),
+      "*" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 1, &BeamLisp.Num.mul/2) end}),
       "-" => multi_fn(%{}, {1, fn x, rest ->
         case rest do
-          [] -> -x
-          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel.-(acc, e) end)
+          [] -> BeamLisp.Num.neg(x)
+          _ -> Enum.reduce(rest, x, fn e, acc -> BeamLisp.Num.sub(acc, e) end)
         end
       end}),
       "/" => multi_fn(%{}, {1, fn x, rest ->
         case rest do
-          [] -> 1 / x
-          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel./(acc, e) end)
+          [] -> BeamLisp.Num.div(1, x)
+          _ -> Enum.reduce(rest, x, fn e, acc -> BeamLisp.Num.div(acc, e) end)
         end
       end})
     }
@@ -2432,10 +2441,11 @@ defmodule BeamLisp.RT do
     end
 
     prims = Map.merge(arith, %{
-      "<" => chain.(&Kernel.</2),
-      ">" => chain.(&Kernel.>/2),
-      "<=" => chain.(&Kernel.<=/2),
-      ">=" => chain.(&Kernel.>=/2),
+      "<" => chain.(&BeamLisp.Num.lt/2),
+      ">" => chain.(&BeamLisp.Num.gt/2),
+      "<=" => chain.(&BeamLisp.Num.le/2),
+      ">=" => chain.(&BeamLisp.Num.ge/2),
+      "==" => chain.(&BeamLisp.Num.num_eq/2),
       "=" => eqv_chain(),
       "not" => &not_/1,
       "identical?" => &identical?/2,
@@ -2678,19 +2688,21 @@ defmodule BeamLisp.RT do
     # name-is-the-BIF assumption silently linked `<=` to a function
     # that does not exist: `(<= 1 2)` raised :erlang.<=/2 undefined
     # while the chained `(<= 1 2 3)` went through invoke and worked.
-    bif2 = [{"+", :+}, {"-", :-}, {"*", :*}, {"/", :/}, {"<", :<}, {">", :>},
-            {"<=", :"=<"}, {">=", :>=}, {"==", :==},
-            {"rem", :rem}]
+    # The 2-arities link to BeamLisp.Num, whose first clause is the
+    # int/float BIF behind a type guard — one extra local call over the raw
+    # BIF, and every operator sees a decimal. `rem` stays integer-only.
+    num2 = [{"+", :add}, {"-", :sub}, {"*", :mul}, {"/", :div}, {"<", :lt}, {">", :gt},
+            {"<=", :le}, {">=", :ge}, {"==", :num_eq}]
 
-    for {name, op} <- bif2 do
-      Env.put_link("core", name, {:erlang, %{2 => op}, nil})
+    for {name, op} <- num2 do
+      Env.put_link("core", name, {BeamLisp.Num, %{2 => op}, nil})
     end
 
-    # Unary + - * are identity/negate on the BIFs; (= x) and friends
-    # stay invoke (chain semantics).
-    Env.put_link("core", "+", {:erlang, %{1 => :+, 2 => :+}, nil})
-    Env.put_link("core", "-", {:erlang, %{1 => :-, 2 => :-}, nil})
-    Env.put_link("core", "*", {:erlang, %{1 => :*, 2 => :*}, nil})
+    Env.put_link("core", "rem", {:erlang, %{2 => :rem}, nil})
+
+    # Unary `-` negates through the tower (it is the only unary that does
+    # work); `(+ x)` / `(* x)` stay on invoke, as `(= x)` does.
+    Env.put_link("core", "-", {BeamLisp.Num, %{1 => :neg, 2 => :sub}, nil})
     # `=` links to lazy-aware equality (realizes lazy operands) so
     # comparing a lazy seq stays Clojure-shaped.
     Env.put_link("core", "=", {BeamLisp.RT, %{2 => :eqv}, nil})
