@@ -160,10 +160,16 @@ defmodule BeamLisp.ClojureSourceTest do
     assert [] == BeamLisp.Compiler.eval_string("[#?@(:cljs [1 2 3])]") |> Enum.to_list()
     assert [1] == BeamLisp.Compiler.eval_string("[1 #?( :cljs :skipped)]") |> Enum.to_list()
 
-    # A malformed conditional is still a syntax error — the skip is for a
-    # platform decision, not for a broken form.
+    # A dangling feature with NO expr: skipped when it is not ours (there is no
+    # branch to take), an error when it IS ours (the form is malformed). Both
+    # verified against the JVM reader: `[1 #?(:cljs) 2]` → `[1 2]`, while
+    # `[1 #?(:clj) 2]` raises, and a dangling feature AFTER a match is never
+    # reached at all.
+    assert [1, 2] == BeamLisp.Compiler.eval_string("[1 #?(:cljs) 2]") |> Enum.to_list()
+    assert [1] == BeamLisp.Compiler.eval_string("[#?(:clj 1 :cljs)]") |> Enum.to_list()
+
     assert_raise BeamLisp.Reader.SyntaxError, ~r/odd number of forms/, fn ->
-      BeamLisp.Compiler.eval_string("[1 #?(:cljs) 2]")
+      BeamLisp.Compiler.eval_string("[1 #?(:clj) 2]")
     end
   end
 
@@ -217,5 +223,84 @@ defmodule BeamLisp.ClojureSourceTest do
     assert 21 == BeamLisp.Compiler.eval_string("(#{pkg}/tax 7)")
 
     File.rm_rf!(dir)
+  end
+
+  # The reader's answers for reader conditionals, CAPTURED FROM THE JVM READER
+  # AND EVALUATOR (`clojure -M -e` over these exact sources) — an oracle, not a
+  # re-statement of this implementation. Which cases pin which rule:
+  #
+  #   [#?(:cljs)]            -> []      a dangling NON-matching feature is no
+  #                                     branch to take, not a malformed form
+  #   [#?(:clj)]             -> error   a dangling MATCHING feature is malformed
+  #   [#?(:clj 1 :cljs)]     -> [1]     …and a dangling feature after a match is
+  #                                     never reached
+  #   [1 #? (:cljs 2) 3]     -> [1 3]   `#? (` may carry whitespace
+  #   [1 #?@ (:clj [2 3]) 4] -> [1 2 3 4]
+  #   [1 # (inc 1) 2]        -> error   but `# (` is a tag, and stays an error
+  @conditional_cases [
+    {"[1 #?(:clj 2) 3]", "[1 2 3]"},
+    {"[1 #?(:cljs 2) 3]", "[1 3]"},
+    {"[1 #?(:cljs 2)]", "[1]"},
+    {"[#?(:clj 1)]", "[1]"},
+    {"[#?(:cljs 1)]", "[]"},
+    {"[#?@(:clj [1 2])]", "[1 2]"},
+    {"[#?@(:cljs [1 2])]", "[]"},
+    {"[1 #?@(:cljs [2 3]) 4]", "[1 4]"},
+    {"[1 #?@(:clj [2 3]) 4]", "[1 2 3 4]"},
+    {"{:a 1 #?(:cljs :b) 2}", :error},
+    {"\#{1 #?(:cljs 2)}", "\#{1}"},
+    {"[1 #?(:cljs 2 :default 3) 4]", "[1 3 4]"},
+    {"(list 1 #?(:cljs 2) 3)", "(1 3)"},
+    {"[#?(:cljs)]", "[]"},
+    {"[1 #?(:cljs 2) #?(:cljs 3) 4]", "[1 4]"},
+    {"[#?@(:cljs [])]", "[]"},
+    {"[#?(:cljs [1 2])]", "[]"},
+    {"[1 #? (:cljs 2) 3]", "[1 3]"},
+    {"[[1 #?(:cljs 2)] 3]", "[[1] 3]"},
+    {"[#?(:cljs 1 :clj 2)]", "[2]"},
+    {"[1 #?(:clj 2 :default 3) 4]", "[1 2 4]"},
+    {"{:a #?(:cljs 1) :b 2}", :error},
+    {"[1 #?(:cljs 2) #?(:clj 3) 4]", "[1 3 4]"},
+    {"[#?(:clj)]", :error},
+    {"[#?(:cljs)]", "[]"},
+    {"[#?(:cljs 1 :clj)]", :error},
+    {"[#?(:clj 1 :cljs)]", "[1]"},
+    {"[1 #?@ (:cljs [2 3]) 4]", "[1 4]"},
+    {"[1 #?@(:clj [2 3]) 4]", "[1 2 3 4]"},
+    {"[1 #_ 2 3]", "[1 3]"},
+    {"[#_]", :error},
+    {"[1 #_ 2]", "[1]"},
+    {"[(#(inc 1))]", "[2]"},
+    {"[1 # (inc 1) 2]", :error},
+    {"[\#{1 2}]", "[\#{1 2}]"},
+    {"[1 # {1} 2]", :error},
+    {"[1 #?@ ( :clj [2]) 3]", "[1 2 3]"},
+    {"[#?()]", "[]"},
+    {"[#? ()]", "[]"},
+    {"[1 #? () 2]", "[1 2]"},
+    {"[1 #?@ () 2]", "[1 2]"},
+    {"[1 #? (:cljs 2 :default 3) 4]", "[1 3 4]"},
+    {"[1 #?@ (:clj [2]) 3]", "[1 2 3]"},
+    {"{:a 1 #?(:clj :b 2)}", :error},
+    {"[1 #?(:cljs 2) 3 #?(:clj 4) 5]", "[1 3 4 5]"},
+    {"[#?@(:cljs [1]) #?@(:clj [2])]", "[2]"},
+  ]
+
+  test "reader-conditional answers match the JVM reader" do
+    pr = fn v -> BeamLisp.RT.invoke(BeamLisp.Env.fetch!("core", "pr-str"), [v]) end
+
+    for {src, expected} <- @conditional_cases do
+      got =
+        try do
+          pr.(BeamLisp.Compiler.eval_string(src))
+        rescue
+          _ -> :error
+        catch
+          _, _ -> :error
+        end
+
+      assert got == expected,
+             "reader conditional #{src}: JVM said #{inspect(expected)}, this reader said #{inspect(got)}"
+    end
   end
 end
