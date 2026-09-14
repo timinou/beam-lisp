@@ -384,10 +384,12 @@ defmodule BeamLisp.Loader do
   @doc """
   The path a namespace loads from over the load path, or nil.
 
-  The one implementation of the ns-to-file rule: the loader resolves requires
-  through it, and code that needs to READ a namespace's source (the self-hosted
-  `verify`, tooling, a doc build) resolves the same path instead of rebuilding
-  the string and drifting from it.
+  The one place the ns-to-file rule is decided, so a caller that needs the file a
+  namespace lives in asks here instead of rebuilding the string. One caller still
+  does not: `verify` in `priv/lib/system/core.bl` walks the cwd and the load path
+  stack for its own `<ns>.bl` relative path, so it sees neither a `.clj`/`.cljc`
+  file nor a munged name. That is a known difference, not a claimed one —
+  `require`, which is what runs code, goes through here.
   """
   def source_path(ns) do
     Enum.find_value(search_dirs(), fn dir ->
