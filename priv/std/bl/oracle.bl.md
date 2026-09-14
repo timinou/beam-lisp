@@ -1,4 +1,4 @@
-# bl.z3 — the oracle's own dashboard
+# bl.oracle — the oracle's own dashboard
 
 The tree can already measure itself in three places, and none of them adds up.
 `decide/cost` times one process's decisions. `Z3.Ledger` keeps a `:counters`
@@ -8,7 +8,7 @@ thing a developer actually runs: **one command that rolls those up and prints
 the verdict of a whole corpus, with the price of it and the reason for every
 refusal.**
 
-`bl z3 stats` is that command. It walks the corpus once, then prints five
+`bl oracle stats` is that command. It walks the corpus once, then prints five
 labelled sections — the corpus and its coverage, the cost, the tier and fragment
 histogram, the undecided machines each with z3's own `:why`, and the failures —
 and every number in them was measured by the run that prints it.
@@ -22,7 +22,7 @@ private: the report is a *view over VM state*, and the example that ships with
 this verb reads the same state two ways to prove it.
 
 ```beam-lisp
-(ns bl.z3
+(ns bl.oracle
   (:require [bl.util :as u]
             [z3]
             [z3corpus :as cor]
@@ -128,8 +128,8 @@ is exactly the silent green the guard exists to catch.
      :ok true}))
 
 (defn stats-report
-  "The whole rollup as a VALUE — the data `bl z3 stats` prints and a future MCP
-   tool returns. `opts`:
+  "The whole rollup as a VALUE — the data `bl oracle stats` prints and the MCP
+   tool `code/verify-stats` returns. `opts`:
 
      :dirs   the directories to walk (default `default-dirs`)
      :walk?  false to skip the corpus walk and report the ledger alone
@@ -216,7 +216,7 @@ fact a reader needs a reason for.
   (let [t (:tiers r) ts (:tiers t) fr (:fragments t)]
     [(str "3. tiers (ledger histogram)")
      (str "   total " (:total t)
-          " | :z3 " (get ts :z3)
+          " | :oracle " (get ts :oracle)
           " | :memo " (get ts :memo)
           " | :native-witness " (get ts :native-witness)
           (if (= 0 (:total t))
@@ -260,7 +260,7 @@ fact a reader needs a reason for.
   [r]
   (join "\n"
     (concat
-      [(str "bl z3 stats — " (mode-line r))]
+      [(str "bl oracle stats — " (mode-line r))]
       (corpus-lines r)
       (cost-lines r)
       (tier-lines r)
@@ -274,7 +274,7 @@ fact a reader needs a reason for.
 
 ## The command
 
-`bl z3 stats [--path DIR …] [--dry-run] [--json]`. `--path` chooses the
+`bl oracle stats [--path DIR …] [--dry-run] [--json]`. `--path` chooses the
 directories to walk (default `priv` + `examples`); `--dry-run` skips the walk
 (the ~9 s part) and reports the ledger alone. The mode that ran is printed, so a
 ledger-only run can never be mistaken for a clean corpus.
@@ -290,7 +290,7 @@ exposes.
 
 ```beam-lisp
 (defn run
-  "`bl z3 stats [--path DIR …] [--dry-run] [--json]`. Returns an exit code."
+  "`bl oracle stats [--path DIR …] [--dry-run] [--json]`. Returns an exit code."
   [args st]
   (u/register-paths st)
   (let [sub (if (empty? args) "stats" (first args))
@@ -305,7 +305,7 @@ exposes.
         (if (:ok report) 0 1))
 
       (or (= sub "help") (= sub "--help") (= sub "-h"))
-      (do (println "bl z3 stats [--path DIR …] [--dry-run] [--json]")
+      (do (println "bl oracle stats [--path DIR …] [--dry-run] [--json]")
           (println "  the oracle's own dashboard: the corpus and its coverage, the cost,")
           (println "  the tier/fragment histogram, the undecided machines (with z3's :why),")
           (println "  and the failures.")
@@ -313,7 +313,7 @@ exposes.
           0)
 
       :else
-      (u/usage-error (str "bl z3: unknown subcommand \"" sub "\" (stats)")))))
+      (u/usage-error (str "bl oracle: unknown subcommand \"" sub "\" (stats)")))))
 ```
 
 ```beam-lisp

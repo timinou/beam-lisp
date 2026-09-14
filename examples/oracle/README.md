@@ -1,4 +1,4 @@
-# The z3 lane — a map
+# The oracle lane — a map
 
 Thirteen runnable programs that show how beam-lisp asks z3 a question and what it
 does with the answer. Read them in order; each one is a single idea.
@@ -48,33 +48,33 @@ cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 | `09-blame.bl` | when repair cannot help, it says why | a refusal is `sat` → its hint is a MODEL; a blame is `unsat` → its hint is a CORE. Three unrepairable machines print their failure maps side by side | `drain → :next-step-breaks-it (core [g_next g_inv2]) · blocked → :guard-too-weak · impossible → :invariant-impossible (core [g_inv2])` |
 | `06-no-strings.bl` | how a predicate reaches the solver | a legacy TEXT predicate used to be pasted into the script and arrived at z3 as an INERT string literal; read once at the boundary, a form, a string and a bl source body emit BYTE-IDENTICAL scripts — and malformed text throws naming the text | `the three scripts are the same text: true` / `verdicts: [:unsat :unsat :unsat]` / `predicates: 10 \| read then emitted back identically: 10 \| mismatches: 0` |
 | `10-corpus.bl` | does the whole tree still check out | every `defserver` in `priv` + `examples`, verified machine by machine; the coverage line is an ASSERTION against an independent grep bound, so a cheerful zero fails | `machines 80 ≥ grep bound 62 → PASS` / `proved 27 \| refuted 19 \| undecided 0 \| declined 34` / the outcome column is byte-identical across runs |
-| `12-stats.bl` | what the oracle cost, in one view | the same state read two ways — through `bl z3 stats` and directly (a `:counters` histogram, `(decide/cost)`, `(ets/info :oracle-memo :size)`) — so the CLI is visibly a view over VM state, not a source of truth | `files 401 · machines 80` / `decisions 88 \| total 155559 us \| median 8242 us \| worst 60926 us` (`examples/bundles/00-all-five.bl · worker`) |
+| `12-stats.bl` | what the oracle cost, in one view | the same state read two ways — through `bl oracle stats` and directly (a `:counters` histogram, `(decide/cost)`, `(ets/info :oracle-memo :size)`) — so the CLI is visibly a view over VM state, not a source of truth | `files 401 · machines 80` / `decisions 88 \| total 155559 us \| median 8242 us \| worst 60926 us` (`examples/bundles/00-all-five.bl · worker`) |
 | `13-faults.bl` | a fault has to cross a process boundary as text | the inert-literal trap caught in the act: emitted raw, `(>= v -40)` reaches z3 as the string `"(>= v -40)"`; read once it emits as `(>= v (- 40))`. Both lanes end on the same verdict | `STRING clauses == FORM clauses byte-identical: true` / `{:clause 0 :status :sat :modality :proven :implied false :value {:v -41}}` |
 
 ## Running them
 
 ```sh
 # one example
-BL_DAEMON=off timeout 240 mix bl run examples/z3/01-why-unknown.bl
-BL_DAEMON=off timeout 240 mix bl run examples/z3/02-blame.bl
-BL_DAEMON=off timeout 240 mix bl run examples/z3/03-memo.bl
-BL_DAEMON=off timeout 240 mix bl run examples/z3/04-ceiling.bl
-BL_DAEMON=off timeout 240 mix bl run examples/z3/05-sorts.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/07-sessions.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/09-blame.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/08-k-induction.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/11-annotated.bl
-BL_DAEMON=off timeout 240 mix bl run examples/z3/06-no-strings.bl
-BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/z3/10-corpus.bl
-BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/z3/12-stats.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/13-faults.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/01-why-unknown.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/02-blame.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/03-memo.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/04-ceiling.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/05-sorts.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/07-sessions.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/09-blame.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/08-k-induction.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/11-annotated.bl
+BL_DAEMON=off timeout 240 mix bl run examples/oracle/06-no-strings.bl
+BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/oracle/10-corpus.bl
+BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/oracle/12-stats.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/13-faults.bl
 
 # the same rollup through the CLI (needs a repacked drop: priv/std is AOT'd into it)
-./bl z3 stats            # five sections: corpus, cost, tiers, undecided, failures
-./bl z3 stats --dry-run  # ledger-only; skips the ~9 s walk and says which mode ran
+./bl oracle stats            # five sections: corpus, cost, tiers, undecided, failures
+./bl oracle stats --dry-run  # ledger-only; skips the ~9 s walk and says which mode ran
 
 # every one of them, isolated and timed by ward
-BL_DAEMON=off timeout 600 mix bl examples examples/z3/*.bl
+BL_DAEMON=off timeout 600 mix bl examples examples/oracle/*.bl
 
 # the lane's tests
 BL_DAEMON=off timeout 1500 mix bl test test/bl/system/oracle_test.bl
@@ -99,7 +99,7 @@ BL_DAEMON=off timeout 300 mix bl run --path priv --path examples bench/oracle_be
 
 ## Honest limits
 
-- **The corpus rollup measures the tree, not the tool.** `bl z3 stats` walks
+- **The corpus rollup measures the tree, not the tool.** `bl oracle stats` walks
   `priv` + `examples` (a serial walk, ~9 s) and reports what it found: 80
   machines today. It reads the same ledger `decide/cost` reads, so its `:why`
   column is z3's own reason and nothing else. What it does NOT do: attribute
@@ -144,7 +144,7 @@ BL_DAEMON=off timeout 300 mix bl run --path priv --path examples bench/oracle_be
 - **verdict** — the one record every answer arrives in: `:status`
   (`:sat` / `:unsat` / `:unknown` / `:error`), `:model`, `:core`, `:why`,
   `:tier`, `:us`.
-- **tier** — who answered: `:native-witness` (the BEAM search, opt-in), `:z3`,
+- **tier** — who answered: `:native-witness` (the BEAM search, opt-in), `:oracle`,
   or `:memo`.
 - **fragment** — what the question is made of: `:tag-lattice` (the value
   model), `:arith` (linear integer arithmetic), `:general` (anything else,
