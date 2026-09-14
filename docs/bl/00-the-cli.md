@@ -704,8 +704,9 @@ Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
 #### `bl doctor [--json]`
 
 Report what this host can do: the language, OTP and Elixir, the native tiers
-(`datom_fjall`, `explorer`, `lazy_memo`, `wry`), the solver, the daemon, the
-search and code paths, and the checkout's own markers. Two probes are required —
+(`datom_fjall`, `explorer`, `code_embed`, `lazy_memo`, `wry`), the solver, the
+daemon, the search and code paths, the embedding weights (which of the three
+copies is answering), and the checkout's own markers. Two probes are required —
 the language evaluates, and the LazyMemo fast lane answers. An absent optional
 native is a line in the table, never a crash.
 
@@ -721,6 +722,7 @@ beam-lisp doctor
   ok   code-paths        44 dirs
   ok   datom_fjall       loaded
   ok   explorer          loaded
+  ok   code_embed        loaded
   ok   lazy_memo         65536 bytes fast lane
   ok   z3                sat
   ok   wry               loaded
@@ -728,6 +730,7 @@ beam-lisp doctor
   --   src/              absent
   ok   .bl-check.edn     present
   ok   .local/bl/cache/  present
+  ok   embedding         present (ships with this bl: ~/.local/share/drop/<payload>/lib/beam_lisp-0.1.0/priv/embed/potion-code-16M-v2)
 
   ✓ 2 required probes ok; 2 optional absent
 ```

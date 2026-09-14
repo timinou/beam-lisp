@@ -2,7 +2,7 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
   @moduledoc """
   Fetch the pinned static code-embedding model into the user cache.
 
-      mix bl.embed.fetch [--dir PATH] [--force]
+      mix bl.embed.fetch [--dir PATH] [--bundle] [--force]
 
   ## What is fetched, and why this model
 
@@ -23,11 +23,23 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
 
   ## Where it goes
 
-  `BeamLisp.Model.root/0` — `$BEAM_LISP_MODEL_DIR`, else
-  `$XDG_CACHE_HOME/beam_lisp/models`. Shared across checkouts and worktrees, for
-  the reason given in that module. The capability is OPTIONAL: everything that
-  uses it checks availability first and reads as absent when it is not there
-  (see `priv/lib/code/embed.bl`).
+  Two roots, and which one you want depends on who will READ the weights:
+
+  * default — `BeamLisp.Model.ambient_dir/1`: `$BEAM_LISP_MODEL_DIR`, else
+    `$XDG_CACHE_HOME/beam_lisp/models`. Shared across checkouts and worktrees,
+    for the reason given in that module: one 33 MB copy per machine, not per
+    tree. This is what a person working on beam-lisp wants.
+  * `--bundle` — `priv/embed/`, the copy `mix bl.build` packs into the drop.
+    That is what makes a shipped `bl` answer with no network, no Mix and no
+    cache on the box; `mix bl.build` runs exactly this step before it packs.
+
+  A drop reads the BUNDLED copy; a source tree reads whichever exists (see
+  `BeamLisp.Model.dir/1`). `--dir PATH` writes into PATH itself, for a test or
+  an unusual install.
+
+  The capability stays OPTIONAL either way: everything that uses it checks
+  availability first and reads as absent when the weights are not there (see
+  `priv/lib/code/embed.bl`).
 
   ## Offline
 
@@ -62,8 +74,15 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
 
   @impl true
   def run(argv) do
-    {opts, _args} = OptionParser.parse!(argv, strict: [dir: :string, force: :boolean])
-    dest = opts[:dir] || BeamLisp.Model.dir(@dir_name)
+    {opts, _args} = OptionParser.parse!(argv, strict: [dir: :string, bundle: :boolean, force: :boolean])
+
+    dest =
+      cond do
+        opts[:dir] -> opts[:dir]
+        opts[:bundle] -> BeamLisp.Model.bundled_dir(@dir_name)
+        true -> BeamLisp.Model.ambient_dir(@dir_name)
+      end
+
     File.mkdir_p!(dest)
 
     Mix.shell().info("fetching #{@model} into #{dest}")
@@ -110,8 +129,50 @@ defmodule Mix.Tasks.Bl.Embed.Fetch do
     # pinning them buys.
     File.write!(Path.join(dest, "DIGEST"), @files["model.safetensors"])
 
+    # Provenance, because these weights now SHIP inside the drop: a
+    # redistributed artifact carries its origin, its licence and the digests it
+    # was pinned by, next to the bytes rather than in a commit message nobody
+    # has. MIT (per the upstream model card) requires the notice to travel with
+    # the copy.
+    File.write!(Path.join(dest, "PROVENANCE"), provenance(dest))
+
     Mix.shell().info("static code model ready: #{dest}")
-    Mix.shell().info("try it:  bl run examples/code-semantic/01-search-by-meaning.bl")
+
+    if opts[:bundle] do
+      Mix.shell().info("bundled — `mix bl.build` now ships it (opt out with --no-embed)")
+    else
+      Mix.shell().info("try it:  bl run examples/code-semantic/01-search-by-meaning.bl")
+    end
+  end
+
+  defp provenance(dest) do
+    digests =
+      @files
+      |> Enum.sort()
+      |> Enum.map_join("\n", fn {name, sha} -> "  #{String.pad_trailing(name, 18)} #{sha}" end)
+
+    """
+    PROVENANCE — #{@model}
+
+    A static code-embedding model (Model2Vec: a lookup table and a mean, not a
+    transformer), redistributed inside a beam-lisp drop.
+
+      upstream:  https://huggingface.co/#{@model}
+      fetched:   #{DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()}
+      by:        mix bl.embed.fetch (--bundle for the copy a drop carries)
+      into:      #{dest}
+      licence:   MIT (per the upstream model card; the upstream repository
+                 ships no separate LICENSE file — see the model card)
+
+    sha256 of the three files this pinned revision is identified by:
+
+    #{digests}
+
+    Those digests are the contract, and the model.safetensors one is the model's
+    IDENTITY: every stored embedding records it, so weights that change silently
+    would make every cached vector a lie. A copy without a DIGEST file beside it
+    is not a model any caller will read (see BeamLisp.Model.fetched?/1).
+    """
   end
 
   defp verified?(path, sha) do

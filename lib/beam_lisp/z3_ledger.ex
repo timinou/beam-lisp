@@ -64,8 +64,12 @@ defmodule BeamLisp.Z3.Ledger do
   The status is half the record. The tier says WHO answered; the status says
   whether there was an answer at all, and `unknown` collapsed into a boolean is how
   a machine whose invariant holds came to be reported as violated (FUP-058).
+
+  `why` carries z3's own reason for an `unknown` (timeout, memout, canceled, or
+  incomplete), so a refusal names WHY beside the status; nil for a decided
+  answer.
   """
-  def record(fragment, tier, status \\ nil, us \\ nil) do
+  def record(fragment, tier, status \\ nil, us \\ nil, why \\ nil) do
     start()
     bump(fragment)
     bump(tier)
@@ -75,7 +79,7 @@ defmodule BeamLisp.Z3.Ledger do
     # tier-for fall through to its default. Atom keys on a plain map read fine — the
     # z3 results have been read that way all along.
     Process.put({__MODULE__, :here}, [
-      %{fragment: fragment, tier: tier, status: status, us: us} | Process.get({__MODULE__, :here}, [])
+      %{fragment: fragment, tier: tier, status: status, us: us, why: why} | Process.get({__MODULE__, :here}, [])
     ])
     :ok
   end

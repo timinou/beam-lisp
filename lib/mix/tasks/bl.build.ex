@@ -12,16 +12,22 @@ defmodule Mix.Tasks.Bl.Build do
   This task chains, in order:
 
     1. `mix compile`                         — the beams, AOT prelude, NIFs
-    2. `mix release bl` (prod)               — the ERTS-carrying release tree
-    3. `cargo build --release` in tooling/drop — the launcher + pack tool
-    4. `drop pack`                           — graft launcher + payload + trailer
-    5. install to `--out` (default ./bl)     — atomic rename
+    2. `mix bl.embed.fetch --bundle`         — the pinned embedding weights
+    3. `mix release bl` (prod)               — the ERTS-carrying release tree
+    4. `cargo build --release` in tooling/drop — the launcher + pack tool
+    5. `drop pack`                           — graft launcher + payload + trailer
+    6. install to `--out` (default ./bl)     — atomic rename
 
   Options:
     * `--out PATH`     where to write the `bl` binary (default `./bl`)
-    * `--release DIR`  reuse an existing release tree (skip step 2)
+    * `--release DIR`  reuse an existing release tree (skip step 3)
     * `--skip-cargo`   reuse a previously built launcher/pack tool
     * `--target T`     cross-target (`linux/x86_64` etc.; needs per-target NIFs)
+    * `--no-embed`     build WITHOUT the embedding weights. The drop is then
+      ~33 MB smaller and `bl search` needs `mix bl.embed.fetch` on the machine
+      that runs it — which a user of a drop cannot do. The weights are part of
+      the default distribution on purpose: the drop carries no Mix and no
+      network assumption, and a capability that ships absent reads as a bug.
 
   The escript path is **removed** (no `escript:` in mix.exs): an escript is a
   single BEAM archive with no way to carry native artifacts (z3/datom NIFs,
@@ -39,7 +45,7 @@ defmodule Mix.Tasks.Bl.Build do
   def run(argv) do
     {opts, _, _} =
       OptionParser.parse(argv,
-        strict: [out: :string, release: :string, skip_cargo: :boolean, target: :string]
+        strict: [out: :string, release: :string, skip_cargo: :boolean, target: :string, embed: :boolean]
       )
 
     out = Path.expand(opts[:out] || "./bl")
@@ -49,7 +55,17 @@ defmodule Mix.Tasks.Bl.Build do
     Mix.shell().info("bl.build: compiling…")
     Mix.Task.run("compile", [])
 
-    # 2. release (unless reusing one)
+    # 2. the embedding, BEFORE the release copies priv/ into the payload: a
+    #    release packed without the weights cannot be fixed by packing harder.
+    #    The fetch is idempotent and sha256-verified per file, so a warm
+    #    priv/embed costs one digest check and no network.
+    unless opts[:embed] == false do
+      Mix.shell().info("bl.build: fetching the code-embedding weights…")
+      Mix.Task.run("bl.embed.fetch", ["--bundle"])
+      Mix.shell().info("bl.build: embedding bundled: #{Float.round(bundled_bytes() / 1_048_576, 1)} MB")
+    end
+
+    # 3. release (unless reusing one)
     release_dir =
       case opts[:release] do
         nil ->
@@ -63,7 +79,20 @@ defmodule Mix.Tasks.Bl.Build do
           dir
       end
 
-    # 3. cargo build the launcher + pack tool
+    # The weights must be INSIDE the payload, not merely beside it. The drop
+    # packs the release tree, and the release copies priv/ when IT is built — so
+    # a fetch that ran after the release, or a `--release DIR` older than the
+    # fetch, produces a drop that looks complete and answers "the model weights
+    # are not on disk" to the first `bl search`. That is a silent capability
+    # loss in the artifact users install, so the build refuses instead of
+    # shipping it.
+    if opts[:embed] == false do
+      Mix.shell().info("bl.build: --no-embed: `bl search` will need the weights on the machine that runs this drop")
+    else
+      ensure_embedded!(release_dir)
+    end
+
+    # 4. cargo build the launcher + pack tool
     unless opts[:skip_cargo] do
       Mix.shell().info("bl.build: building drop launcher + pack tool…")
       {_, 0} = cmd("cargo", ["build", "--release"], cd: drop_dir)
@@ -79,7 +108,7 @@ defmodule Mix.Tasks.Bl.Build do
       Mix.raise("bl.build: drop tool not found in #{cargo_release} (cargo build failed?)")
     end
 
-    # 4. pack
+    # 5. pack
     tmp_out = out <> ".tmp"
     pack_args =
       ["pack", "--release", release_dir, "--out", tmp_out] ++
@@ -93,13 +122,66 @@ defmodule Mix.Tasks.Bl.Build do
     if packstatus != 0, do: Mix.raise("bl.build: drop pack failed:\n#{packout}")
     Mix.shell().info(String.trim_trailing(packout))
 
-    # 5. atomic install
+    # 6. atomic install
     File.rename!(tmp_out, out)
     _ = File.chmod(out, 0o755)
 
     size_mb = (File.stat!(out).size / 1_048_576) |> Float.round(1)
     Mix.shell().info("bl.build: wrote #{out} (#{size_mb} MB)")
     Mix.shell().info("bl.build: run it with `#{out} version`; start a warm loop with `#{out} daemon start`")
+  end
+
+  # Refuse to pack a drop whose PAYLOAD has no usable weights (see the call site
+  # for why this is a check and not a hope). "Usable" is the reader's own
+  # predicate — `BeamLisp.Model.fetched?/1` — so the build and the query agree
+  # about what "the release carries a model" means.
+  defp ensure_embedded!(release_dir) do
+    # The SAME predicate the reader uses (`Model.fetched?/1`), not a wildcard for
+    # the digest alone: a payload carrying a digest with no weights beside it is
+    # exactly the state this check exists to refuse, and a check that accepts it
+    # would ship a drop whose first search says "not on disk" while pointing at a
+    # directory that looks, to everything else, like a model.
+    candidates = Path.wildcard(Path.join([release_dir, "lib", "beam_lisp-*", "priv", "embed", "*"]))
+
+    case Enum.filter(candidates, &BeamLisp.Model.fetched?/1) do
+      [dir | _] ->
+        size =
+          dir
+          |> Path.join("**/*")
+          |> Path.wildcard()
+          |> Enum.filter(&File.regular?/1)
+          |> Enum.map(&File.stat!(&1).size)
+          |> Enum.sum()
+
+        Mix.shell().info(
+          "bl.build: embedding in the payload: #{dir} (#{Float.round(size / 1_048_576, 1)} MB)"
+        )
+
+      [] ->
+        Mix.raise("""
+        bl.build: the release tree carries no complete embedding weights.
+
+          looked in: #{release_dir}/lib/beam_lisp-*/priv/embed/*
+          a copy needs: #{Enum.join(BeamLisp.Model.files(), ", ")} and DIGEST
+
+        `bl search` in the drop this would produce would answer "the model
+        weights are not on disk — looked in …/priv/embed/…" — a capability the
+        default distribution is supposed to have. Rebuild the release after the
+        fetch (drop `--release DIR`), or say `--no-embed` to leave it out on
+        purpose.
+        """)
+    end
+  end
+
+  # Bytes under `priv/embed/` — what the embedding adds to the drop, said in
+  # the units a person sizing a download thinks in.
+  defp bundled_bytes do
+    BeamLisp.Model.bundled_root()
+    |> Path.join("**/*")
+    |> Path.wildcard()
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.map(&File.stat!(&1).size)
+    |> Enum.sum()
   end
 
   # Run a command, streaming output; return {output, exit_status}.
