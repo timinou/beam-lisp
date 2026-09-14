@@ -11,7 +11,8 @@
 ;      answers reflect the new source, never the stale artifact.
 
 (ns datom.blanalysis-cache.test
-  (:require [codebase :as cb] [typed :as t] [datom :as d]))
+  (:require [codebase :as cb] [typed :as t] [datom :as d] [datom.db]
+            [datom.conn] [datom.store-fjall]))
 
 ;; A cache test owns its cache: a fresh directory per run, so "first analyze
 ;; is a miss" is about THIS run, not about whoever ran the suite last week
@@ -29,6 +30,188 @@
 (defn- fn-names [db]
   (into [] (sort (into [] (mapv (fn [r] (get r 0))
                        (into [] (d/q '[:find ?n :where [?d :fn/name ?n]] db)))))))
+
+;; ── 0. the store belongs to the PROJECT ─────────────────────────────
+
+(deftest the-cache-dir-follows-the-project
+  ;; The store belongs to the PROJECT that owns the corpus: `.local/bl/cache`,
+  ;; beside the other per-checkout state (`.local/blrun`, `.local/bltest`) and
+  ;; ignored by git so it never shows up in `git status`. A worktree carries its
+  ;; own store, deleting the project takes the store with it, and two checkouts
+  ;; never read each other's artifacts. `BLANALYSIS_DIR` still wins — tests and
+  ;; builds point it at a throwaway directory, and this suite is the proof.
+  (let [saved (System/get_env "BLANALYSIS_DIR")
+        tree (str (System/tmp_dir!) "/bl_project_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p (str tree "/src/inner"))
+    (File/write! (str tree "/mix.exs") "")          ; what makes it a project
+    (System/delete_env "BLANALYSIS_DIR")
+    (try
+      (is (= (str tree "/.local/bl/cache") (cb/blanalysis-dir tree))
+          "with no override the store lives in the project")
+      (is (= (str tree "/.local/bl/cache") (cb/blanalysis-dir (str tree "/src/inner")))
+          "a corpus nested in the project resolves UP to the project, not beside the file")
+      (is (starts-with? (cb/blanalysis-dir) (BeamLisp/cwd))
+          "no argument means the command's own project")
+      (is (ends-with? (cb/blanalysis-dir) "/.local/bl/cache")
+          "which is where a project keeps it")
+      (finally
+        (if (nil? saved)
+          (System/delete_env "BLANALYSIS_DIR")
+          (System/put_env "BLANALYSIS_DIR" saved))
+        (File/rm_rf! tree)))
+    (is (= saved (cb/blanalysis-dir)) "an explicit directory still wins")))
+
+(deftest a-corpus-with-no-project-around-it-is-its-own
+  ;; Not every corpus is a checkout: a scratch directory of .bl files, a mounted
+  ;; sample, an extracted tarball. With no project marker above it, the corpus you
+  ;; POINTED AT is the project. That matters more than it looks: a walk with no
+  ;; fallback keeps climbing, and the last directory above every corpus on the box
+  ;; is `/` — the one place a cache must never land.
+  (let [saved (System/get_env "BLANALYSIS_DIR")
+        loose (str (System/tmp_dir!) "/bl_loose_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p (str loose "/deep/deeper"))
+    (System/delete_env "BLANALYSIS_DIR")
+    (try
+      (is (= (str loose "/.local/bl/cache") (cb/blanalysis-dir loose)))
+      (is (= (str loose "/deep/deeper/.local/bl/cache")
+             (cb/blanalysis-dir (str loose "/deep/deeper")))
+          "the walk stops at the corpus rather than climbing to the filesystem root")
+      (finally
+        (if (nil? saved)
+          (System/delete_env "BLANALYSIS_DIR")
+          (System/put_env "BLANALYSIS_DIR" saved))
+        (File/rm_rf! loose)))))
+
+;; ── 0c. one variable moves the store ────────────────────────────────
+
+(deftest the-store-can-be-moved-with-one-variable
+  ;; CI and containers want the store on a volume, or in a scratch directory the
+  ;; job deletes — and they want it moved WITHOUT moving the model. The two share
+  ;; one cache root, so `XDG_CACHE_HOME` is not that lever: pointing it at a
+  ;; scratch directory takes the weights with it and the run dies before it
+  ;; indexes. `BL_CACHE_DIR` is the lever, and it wins over everything: the
+  ;; project tier, the host tier, and the older per-call `BLANALYSIS_DIR`.
+  (let [saved-new (System/get_env "BL_CACHE_DIR")
+        saved-old (System/get_env "BLANALYSIS_DIR")
+        tree (str (System/tmp_dir!) "/bl_moved_" (erlang/unique_integer (list :positive)))
+        abs  (str (System/tmp_dir!) "/bl_moved_abs_" (erlang/unique_integer (list :positive)))
+        rel  (str "bl_moved_rel_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p (str tree "/src"))
+    (File/write! (str tree "/mix.exs") "")
+    (try
+      (System/put_env "BLANALYSIS_DIR" "/tmp/blanalysis_should_lose")
+      (System/put_env "BL_CACHE_DIR" abs)
+      (is (= abs (cb/blanalysis-dir tree)) "an absolute value is used as given")
+      (is (= abs (cb/blanalysis-dir)) "…and for the command's own project too")
+      (let [r (cb/analyze-cached sigs "cache_moved" src-a {:root tree})]
+        (is (= false (:hit r)) "no store under the new directory yet")
+        (is (pos? (count (File/ls! abs)))
+            "and the analysis was written where the variable points"))
+      (System/put_env "BL_CACHE_DIR" rel)
+      (is (= (Path/expand rel (BeamLisp/cwd)) (cb/blanalysis-dir tree))
+          "a relative value resolves against the command's cwd, not the corpus")
+      (finally
+        (if (nil? saved-new)
+          (System/delete_env "BL_CACHE_DIR")
+          (System/put_env "BL_CACHE_DIR" saved-new))
+        (if (nil? saved-old)
+          (System/delete_env "BLANALYSIS_DIR")
+          (System/put_env "BLANALYSIS_DIR" saved-old))
+        (File/rm_rf! tree)
+        (File/rm_rf! abs)))
+    (is (= saved-old (cb/blanalysis-dir)) "with nothing set, the old variable still wins")))
+
+;; ── 0d. a project that cannot be written to uses the HOST cache ─────
+
+(deftest a-read-only-project-uses-the-host-cache
+  ;; The project store is right until the project cannot be written to — an
+  ;; installed drop, a mounted checkout, a CI read-only bind. Then remembering
+  ;; moves to the HOST cache, addressed by the project's own tree id (the same
+  ;; 16 hex the daemon uses to name a tree), so re-extracting the same payload
+  ;; finds its analysis instead of paying for it again. A regular FILE where the
+  ;; directory should be is the portable way to make the mkdir fail.
+  (let [saved-env (System/get_env "BLANALYSIS_DIR")
+        saved-xdg (System/get_env "XDG_CACHE_HOME")
+        tree (str (System/tmp_dir!) "/bl_ro_" (erlang/unique_integer (list :positive)))
+        xdg  (str (System/tmp_dir!) "/bl_xdg_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p tree)
+    (File/write! (str tree "/mix.exs") "")
+    (File/write! (str tree "/.local") "a file where the cache directory has to be")
+    (System/delete_env "BLANALYSIS_DIR")
+    (System/put_env "XDG_CACHE_HOME" xdg)
+    (try
+      (let [dir (cb/blanalysis-dir tree)]
+        (is (starts-with? dir xdg) "the host cache, under XDG_CACHE_HOME")
+        (is (includes? dir "/beam_lisp/cache/") "…in the beam-lisp cache namespace")
+        (is (ends-with? dir (BeamLisp.Daemon.Paths/tree_id tree))
+            "keyed like a tree, so a re-extract finds it again")
+        (let [r (cb/analyze-cached sigs "cache_ro" src-a {:root tree})]
+          (is (= false (:hit r)) "no store yet, so no hit")
+          (is (= ["bar" "foo"] (fn-names (:db r))) "but every answer is still there")
+          (is (File/dir? dir) "the fallback directory was created")
+          (is (= true (:hit (cb/analyze-cached sigs "cache_ro" src-a {:root tree})))
+              "and the second analyze is a hit: the memory survived")))
+      (finally
+        (if (nil? saved-env)
+          (System/delete_env "BLANALYSIS_DIR")
+          (System/put_env "BLANALYSIS_DIR" saved-env))
+        (if (nil? saved-xdg)
+          (System/delete_env "XDG_CACHE_HOME")
+          (System/put_env "XDG_CACHE_HOME" saved-xdg))
+        (File/rm_rf! tree)
+        (File/rm_rf! xdg)))))
+
+;; ── 0c. derived columns: filled once, then remembered ────────────────
+;;
+;; A COLUMN is a derivation declared by a caller — `code.semantic`'s vector per
+;; function is the one that exists — and the store remembers which version it
+;; holds. These use a stub column, so the mechanism is tested without a model:
+;; the fill writes a known string and the version is whatever the test says.
+
+(defn- stub-column
+  "A column that marks every function's entities with `v`, at `version`."
+  [version v]
+  {:ident :fn/marked
+   :schema [{:db/ident :fn/marked :db/valueType :db.type/string}]
+   :version version
+   :fill (fn [db _src]
+           (mapv (fn [r] {:db/id (get r 0) :fn/marked v})
+                 (into [] (d/q '[:find ?e :where [?e :fn/name ?n]] db))))})
+
+(defn- marked-values [db]
+  (set (mapv (fn [r] (get r 0))
+             (into [] (d/q '[:find ?v :where [?e :fn/marked ?v]] db)))))
+
+(deftest a-column-fills-once-and-is-remembered
+  (let [src "(ns col.a)\n(defn f [x] x)\n(defn g [y] y)\n"
+        col (stub-column "v1" "hello")]
+    (let [r1 (cb/analyze-cached sigs "col_a" src {:columns [col]})]
+      (is (= :filled (:fn/marked (:columns r1))) "a fresh store fills the column")
+      (is (= #{"hello"} (marked-values (:db r1)))))
+    (let [r2 (cb/analyze-cached sigs "col_a" src {:columns [col]})]
+      (is (= true (:hit r2)) "the second open is a hit")
+      (is (= :cached (:fn/marked (:columns r2)))
+          "and the column did NOT run again — that is the whole point"))))
+
+(deftest a-new-column-version-refills-and-keeps-the-facts
+  (let [src "(ns col.b)\n(defn f [x] x)\n"]
+    (cb/analyze-cached sigs "col_b" src {:columns [(stub-column "v1" "one")]})
+    (let [r (cb/analyze-cached sigs "col_b" src {:columns [(stub-column "v2" "two")]})]
+      (is (= true (:hit r)) "a new model does not touch the analysis")
+      (is (= :filled (:fn/marked (:columns r))) "only the column is redone")
+      (is (= #{"two"} (marked-values (:db r)))
+          "and the stale values are REPLACED, not accumulated")
+      (is (= ["f"] (fn-names (:db r))) "the facts are the same facts"))))
+
+(deftest a-store-written-before-the-column-gets-it-installed
+  (let [src "(ns col.c)\n(defn f [x] x)\n"]
+    (cb/analyze-cached sigs "col_c" src)                    ; facts only
+    (let [r (cb/analyze-cached sigs "col_c" src {:columns [(stub-column "v1" "hey")]})]
+      (is (= true (:hit r)) "the analysis was already there")
+      (is (= :filled (:fn/marked (:columns r))) "the column is filled on top of it")
+      (is (contains? (datom.db/schema-of (:db r)) :fn/marked)
+          "and the attribute it needs is now IN the store's schema")
+      (is (= #{"hey"} (marked-values (:db r)))))))
 
 ;; ── 1. a fresh analyze (miss) indexes and reports correctly ─────────
 
@@ -69,3 +252,33 @@
     ;; foo calls bar, so bar is reachable from foo, and foo is in bar's impact.
     (is (contains? (into #{} (mapv (fn [x] (get x 0)) (cb/reachable (:db r) "foo"))) "bar")
         "reachable(foo) includes bar through the cached call graph")))
+
+; ── 0d. a column fills with no persistent store ────────────────────────
+
+(deftest a-column-fills-without-a-persistent-store
+  ;; The store is an OPTIMISATION, and the no-persistent-backend path promises the
+  ;; same answers uncached. A column's schema is part of that promise: the
+  ;; in-memory connection is the one that must carry it, or the fill's datoms are
+  ;; rejected as unknown attributes and the uncached path is not slow but BROKEN —
+  ;; invisibly, because the durable path works and every test that exercises it
+  ;; passes (FUP-040's neighbours).
+  (let [saved (System/get_env "BL_CACHE_DIR")]
+    ;; A directory that cannot be created: `/dev/null` is a file, so the tier
+    ;; heading for it fails and the caller falls back to memory.
+    (System/put_env "BL_CACHE_DIR" "/dev/null/bl_no_store_here")
+    (try
+      (let [column {:ident :probe/flag
+                    :schema [{:db/ident :probe/flag :db/valueType :db.type/string}]
+                    :version "v1"
+                    :fill (fn [db src] [{:db/id 999999 :probe/flag "filled"}])}
+            res (cb/analyze-cached sigs "demo" src-a {:columns [column]})
+            db (:db res)]
+        (is (= :filled (get-in res [:columns :probe/flag]))
+            "the column reports itself filled")
+        (is (= "filled" (get (first (d/q '[:find ?v :where [_ :probe/flag ?v]] db)) 0))
+            "and its datom is in the database"))
+      (finally
+        (if saved
+          (System/put_env "BL_CACHE_DIR" saved)
+          (System/delete_env "BL_CACHE_DIR"))))))
+

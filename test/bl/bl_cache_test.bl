@@ -1,0 +1,291 @@
+; test/bl/bl_cache_test.bl — `bl cache`: what the store holds, and pruning it.
+; Run: mix bl test test/bl/bl_cache_test.bl
+;
+; ── What must hold ────────────────────────────────────────────────────
+;
+; 1. One ENTRY is one STORE. `<ns>.<sha>.fjall` and its `.blobs` sibling are a
+;    single artifact — blobs are the values too large to inline — so counting
+;    them as two would double the reported size and could delete half a store,
+;    leaving a store that opens and answers wrongly.
+; 2. Pruning takes the OLDEST first and NEVER the newest. The newest is the one
+;    the next run is most likely to want, and a store per source revision means
+;    the oldest is the least likely to be asked for again. Evicting the biggest
+;    instead would trade a large file's analysis for a dozen tiny ones.
+; 3. Under the cap, nothing is deleted — the cap is a ceiling, not a target.
+; 4. The store directory is gitignored, so artifacts never appear in
+;    `git status` and never get committed by accident.
+
+(ns bl.cache.test
+  (:require [bl.cache :as c] [bl.cli]))
+
+(defn- fake-store!
+  "A store named `name` in `dir` holding `bytes` bytes, plus its `.blobs` sibling
+   holding `blobs` more — the shape a real store has on disk."
+  [dir name bytes blobs]
+  (let [p (str dir "/" name ".fjall")
+        b (str p ".blobs")]
+    (File/mkdir_p (str p "/datoms"))
+    (File/write! (str p "/datoms/00000001") (String/duplicate "x" bytes))
+    (File/mkdir_p b)
+    (File/write! (str b "/00000001") (String/duplicate "y" blobs))
+    {:store p :blobs b}))
+
+;; ── 1. what counts as an entry ───────────────────────────────────────
+
+(deftest a-store-and-its-blobs-are-one-entry
+  (let [dir (str (System/tmp_dir!) "/bl_cache_entries_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p dir)
+    (try
+      (fake-store! dir "code.semantic.aaaa" 100 50)
+      (fake-store! dir "code.semantic.bbbb" 20 0)
+      (let [es (c/entries dir)]
+        (is (= 2 (count es)) "two stores, two entries — not four")
+        (is (= #{"code.semantic.aaaa" "code.semantic.bbbb"}
+               (into #{} (map (fn [e] (:name e))) es))
+            "named by the store, without the suffix")
+        (is (= 150 (:bytes (first (filterv (fn [e] (= "code.semantic.aaaa" (:name e))) es))))
+            "a store's size is its own bytes PLUS its blobs"))
+      (finally (File/rm_rf! dir)))))
+
+;; ── 2. which entries go ──────────────────────────────────────────────
+
+(deftest evict-takes-the-oldest-first
+  ;; mtimes are explicit here, so the ORDER is the assertion rather than
+  ;; whatever the filesystem happened to stamp.
+  (let [es [{:name "old"    :bytes 100 :mtime 1000}
+            {:name "middle" :bytes 100 :mtime 2000}
+            {:name "new"    :bytes 100 :mtime 3000}]]
+    (is (= ["old"] (c/evict es 250))
+        "one entry's worth over the cap: the oldest goes")
+    (is (= ["old" "middle"] (c/evict es 100))
+        "still over: it keeps taking, oldest first")
+    (is (= [] (c/evict es 300)) "at the cap, nothing goes")
+    (is (= [] (c/evict es 100000)) "under the cap, nothing goes")))
+
+(deftest evict-never-takes-the-newest
+  ;; A store bigger than the whole cap is still kept: it is the one the run that
+  ;; just finished wrote, and evicting it would make the next run re-analyze
+  ;; everything it just paid for. A cap is a ceiling on the OLD, not a reason to
+  ;; throw away the current.
+  (let [es [{:name "old"  :bytes 100 :mtime 1000}
+            {:name "huge" :bytes 900 :mtime 9000}]]
+    (is (= ["old"] (c/evict es 0)) "everything but the newest")
+    (is (= ["old"] (c/evict es 500)) "even far under the cap, the newest stays")))
+
+;; ── 3. pruning on disk ───────────────────────────────────────────────
+
+(deftest under-the-cap-pruning-deletes-nothing
+  (let [dir (str (System/tmp_dir!) "/bl_cache_keep_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p dir)
+    (try
+      (fake-store! dir "a.1" 10 0)
+      (fake-store! dir "b.2" 10 0)
+      (let [r (c/prune! [dir] (* 10 1024 1024))]
+        (is (zero? (:removed r)) "nothing removed")
+        (is (zero? (:freed r)) "nothing freed")
+        (is (= 2 (count (c/entries dir))) "both stores still there"))
+      (finally (File/rm_rf! dir)))))
+
+(deftest over-the-cap-pruning-keeps-exactly-the-newest
+  (let [dir (str (System/tmp_dir!) "/bl_cache_evict_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p dir)
+    (try
+      (fake-store! dir "a.1" 10 0)
+      (fake-store! dir "b.2" 10 0)
+      (fake-store! dir "c.3" 10 0)
+      (let [r (c/prune! [dir] 0)]
+        (is (= 2 (:removed r)) "a zero cap leaves one store standing")
+        (is (pos? (:freed r)) "and reports what it freed")
+        (is (= 1 (count (c/entries dir))) "one entry left")
+        (is (zero? (:removed (c/prune! [dir] 0))) "pruning again finds nothing to do"))
+      (finally (File/rm_rf! dir)))))
+
+;; ── 4. the artifacts stay out of git ─────────────────────────────────
+
+(deftest the-store-directory-is-gitignored
+  ;; The store is per project, so it lives inside one — and a cache that shows up
+  ;; in `git status` is a cache someone will commit.
+  (is (includes? (File/read! ".gitignore") ".local/bl/")
+      "`.local/bl/` is ignored, beside .embcache/ and .gencache/"))
+
+;; ── 5. the command ───────────────────────────────────────────────────
+
+(deftest the-command-is-registered-where-a-command-lives
+  ;; A verb lives in three places: the dispatcher map, the help map, and the
+  ;; usage list. Two of three is a command that runs and cannot be discovered, or
+  ;; is documented and cannot be run.
+  (is (contains? bl.cli/commands "cache") "the dispatcher must know it")
+  (is (some? (get bl.cli/command-help "cache")) "help must know it")
+  (is (pos? (count (filterv (fn [c] (= c "cache")) (mapcat second bl.cli/usage-groups))))
+      "`bl` alone prints the usage, and the verb has to appear in it"))
+
+(deftest the-cap-and-the-dry-run-are-flags-the-cli-knows
+  ;; The flags belong to the SHARED argv table, not to this verb: a verb that
+  ;; parsed its own flags would be one the dispatcher rejects as an unknown flag
+  ;; before it ever runs — the failure this test exists to prevent, and the one
+  ;; that actually happened (found by running `bl cache prune --dry-run`, not by
+  ;; reading the code).
+  (is (= 7 (:max_mb (bl.cli/parse-argv ["cache" "prune" "--max-mb" "7"]))) "a number is taken")
+  (is (= true (:dry_run (bl.cli/parse-argv ["cache" "prune" "--dry-run"])))
+      "the dry run is a flag")
+  (is (= "missing value for --max-mb" (:error (bl.cli/parse-argv ["cache" "prune" "--max-mb"])))
+      "a flag with no value is a usage error")
+  (is (includes? (:error (bl.cli/parse-argv ["cache" "prune" "--max-mb" "abc"]))
+                 "--max-mb needs a number")
+      "a non-number is a usage error, and the message names the flag")
+  (is (= 2 (c/run ["frobnicate"] {}))
+      "and an unknown subcommand says what the command takes"))
+
+
+(deftest the-cap-follows-the-environment-with-a-real-default
+  ;; A smaller ceiling is one variable away (a CI box with a small disk), and a
+  ;; value that is not a number falls back to the default rather than raising: a
+  ;; knob read on every run must not be able to break the run.
+  (let [saved (System/get_env "BL_CACHE_MAX_MB")]
+    (System/put_env "BL_CACHE_MAX_MB" "3")
+    (let [three (c/cap-bytes)]
+      (System/put_env "BL_CACHE_MAX_MB" "not a number")
+      (let [garbage (c/cap-bytes)]
+        (if (nil? saved)
+          (System/delete_env "BL_CACHE_MAX_MB")
+          (System/put_env "BL_CACHE_MAX_MB" saved))
+        (is (= (* 3 1024 1024) three) "megabytes, per the variable")
+        (is (= (* c/DEFAULT-MAX-MB 1024 1024) garbage)
+            "a value that is not a number falls back to the default")))))
+
+
+(deftest the-prune-follows-the-corpus-not-the-shell
+  ;; `bl search -p elsewhere` must maintain ELSEWHERE's stores. Resolving the
+  ;; prune target from the shell's cwd is the same defect the store LOCATION had,
+  ;; one layer down: it prunes the project you happen to be standing in while the
+  ;; corpus you actually indexed keeps accumulating — and the run reports success
+  ;; while doing it. Found by running a prune over a corpus in another tree, not
+  ;; by reading the call.
+  (let [root (str (System/tmp_dir!) "/bl_prune_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p (str root "/priv"))
+    (File/write! (str root "/mix.exs") "")
+    (try
+      (let [dirs (c/store-dirs root)]
+        (is (= 1 (count (filterv (fn [d] (= d (str root "/.local/bl/cache"))) dirs)))
+            "the corpus's own tier is what gets pruned")
+        (is (zero? (count (filterv (fn [d] (= d (str (BeamLisp/cwd) "/.local/bl/cache"))) dirs)))
+            "…and never the shell's, which is a different project"))
+      (finally (File/rm_rf! root)))))
+
+
+(deftest the-override-moves-what-cache-status-reports
+  ;; `bl cache status` and `bl cache prune` must look where the stores actually
+  ;; are — otherwise a CI job with the store on a volume would be told about a
+  ;; directory it never writes to, and would prune nothing.
+  (let [saved (System/get_env "BL_CACHE_DIR")
+        dir (str (System/tmp_dir!) "/bl_cache_dir_" (erlang/unique_integer (list :positive)))]
+    (System/put_env "BL_CACHE_DIR" dir)
+    (let [dirs (c/store-dirs)]
+      (if (nil? saved)
+        (System/delete_env "BL_CACHE_DIR")
+        (System/put_env "BL_CACHE_DIR" saved))
+      (is (= 1 (count (filterv (fn [d] (= d dir)) dirs))) "the override is the tier")
+      (is (zero? (count (filterv (fn [d] (ends-with? d "/.local/bl/cache")) dirs)))
+          "and the project tier is not in play while it is set"))))
+
+
+
+;; ── 5. the per-file analyses are entries too ─────────────────────────
+
+(deftest a-loose-analysis-is-an-entry
+  ; `facts.<sha>.term` and `symbols.<sha>.term` sit beside the stores: one analysis
+  ; of one source revision, written by the same runs and stale the same way. What a
+  ; cap does not measure, it does not bound.
+  (let [dir (str (System/tmp_dir!) "/bl_cache_terms_" (erlang/unique_integer (list :positive)))
+        term (str dir "/symbols.aaaa.term")]
+    (File/mkdir_p dir)
+    (fake-store! dir "code.semantic.aaaa" 100 50)
+    (File/write! term (String/duplicate "z" 30))
+    (let [es (c/entries dir)
+          by-name (into {} (map (fn [e] [(:name e) e]) es))]
+      (is (= 2 (count es)) "the store and the analysis beside it")
+      (is (= 30 (:bytes (get by-name "symbols.aaaa.term"))) "measured, not ignored")
+      (is (= 180 (reduce (fn [n e] (+ n (:bytes e))) 0 es)) "and it counts toward the cap"))
+    (File/rm_rf! dir)))
+
+(deftest a-prune-removes-the-analysis-file-itself
+  ; The file has no `.fjall` suffix, so a prune that reconstructed paths from names
+  ; would delete `symbols.old.term.fjall` — a file that never existed — and leave
+  ; the real one to accumulate forever. The oldest goes, as a FILE.
+  (let [dir (str (System/tmp_dir!) "/bl_cache_termprune_" (erlang/unique_integer (list :positive)))
+        old (str dir "/symbols.old.term")]
+    (File/mkdir_p dir)
+    (File/write! old (String/duplicate "z" 30))
+    (Process/sleep 1100)
+    (fake-store! dir "code.semantic.new" 100 0)
+    (let [r (c/prune! [dir] 0)]
+      (is (not (File/exists? old)) "the oldest entry is gone as a file")
+      (is (File/exists? (str dir "/code.semantic.new.fjall")) "the newest survives")
+      (is (= 1 (:removed r))))
+    (File/rm_rf! dir)))
+
+; ── 5. a dry run deletes nothing ──────────────────────────────────────
+
+(deftest a-dry-run-prunes-nothing
+  ;; Found by RUNNING it: `--dry-run` was consulted after the prune had already
+  ;; happened, so the flag changed the wording and not the world — asking
+  ;; `bl cache prune --dry-run` what would go emptied the directory it was asked
+  ;; to describe. The order is the whole of it, and only a run can see it: the
+  ;; flag was in the argv table (a test asserted that) and the report printed the
+  ;; right shape (a test could have asserted that too) while every store was
+  ;; already gone.
+  (let [dir (str (System/tmp_dir!) "/bl_cache_dry_" (erlang/unique_integer (list :positive)))
+        saved (System/get_env "BL_CACHE_DIR")]
+    (File/mkdir_p dir)
+    (try
+      (fake-store! dir "a.aaa" 100 0)
+      (fake-store! dir "b.bbb" 100 0)
+      ;; a real mtime apart, so "the oldest goes first" has an oldest to take.
+      (Process/sleep 1100)
+      (fake-store! dir "c.ccc" 100 0)
+      (System/put_env "BL_CACHE_DIR" dir)
+      (let [before (count (File/ls! dir))
+            st (bl.cli/parse-argv ["cache" "prune" "--dry-run" "--max-mb" "0"])]
+        (is (= true (:dry_run st)) "the flag is in the shared argv table")
+        (is (= 0 (:max_mb st)) "and so is the cap, here set to evict everything")
+        (c/run ["prune"] st)
+        (is (= before (count (File/ls! dir)))
+            "a dry run reports what would go; it does not go")
+        (is (= 3 (count (c/entries dir))) "all three stores survive"))
+      (finally
+        (if saved
+          (System/put_env "BL_CACHE_DIR" saved)
+          (System/delete_env "BL_CACHE_DIR"))
+        (File/rm_rf! dir)))))
+
+
+; ── 6. a prune never evicts the run's own work ───────────────────────
+
+(deftest a-prune-never-evicts-this-runs-work
+  ;; `bl search` prunes straight after indexing, against the corpus's total. On a
+  ;; corpus big enough to pass the cap, the stores it had JUST written were the
+  ;; oldest candidates — so it deleted the analyses it had just paid for, and the
+  ;; next run derived them again. Measured on priv/lib/datom (38 files): the run
+  ;; printed `bl cache: pruned 23 entries, freed 103 MB` and the next reported
+  ;; `cached 15/38`.
+  (let [dir (str (System/tmp_dir!) "/bl_cache_since_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p dir)
+    (try
+      (fake-store! dir "old.aaa" 100 0)
+      (Process/sleep 1100)
+      (fake-store! dir "fresh.bbb" 100 0)
+      (let [names (fn [cap keep]
+                    (mapv (fn [e] (:name e))
+                          (to-list (:dying (if (nil? keep)
+                                             (c/doomed dir cap)
+                                             (c/doomed dir cap keep))))))]
+        ;; A cap that would evict EVERYTHING, and one entry from before the run.
+        (is (= ["old.aaa"] (names 0 #{"fresh.bbb"}))
+            "only what predates the run is a candidate")
+        (is (= [] (names 0 #{"old.aaa" "fresh.bbb"}))
+            "nothing written during the run may be evicted, even over the cap")
+        (is (= ["old.aaa"] (names 0 nil))
+            "with no keep set, oldest-first is what it always was — the newest is
+             still protected by the rule itself"))
+      (finally (File/rm_rf! dir)))))
+

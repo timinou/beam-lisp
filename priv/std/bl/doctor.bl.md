@@ -144,7 +144,20 @@ invocation, so it reports `not running` and changes nothing.
 
    (probe ".bl-check.edn" false
      (fn [] (let [ok? (File/regular? (u/resolve ".bl-check.edn"))]
-              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))])
+              {:ok ok? :detail (if ok? "present" "absent (run `bl check --update`)")})))
+
+   (probe ".local/bl/cache/" false
+     (fn [] (let [forced (System/get_env "BL_CACHE_DIR")
+                  dir (if (nil? forced)
+                        (u/resolve ".local/bl/cache")
+                        (Path/expand forced (BeamLisp/cwd)))
+                  ok? (File/dir? dir)]
+              {:ok ok?
+               :detail (cond
+                         (and (some? forced) ok?) (str "present (" dir " — BL_CACHE_DIR)")
+                         (some? forced) (str dir " (BL_CACHE_DIR; created on first use)")
+                         ok? "present"
+                         :else "absent (created by the first codebase read)")})))])
 ```
 
 ## The report

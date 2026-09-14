@@ -286,6 +286,14 @@ Rows are tab-separated. Exit `0` for any valid question, even one with no rows;
 
 `--json` keys: `question`, `target`, `rows`, `count`.
 
+A source question (`symbols`, `dead-code`) is answered from an ANALYSIS of each
+file — its document symbols — and that analysis is remembered per source
+revision, beside the stores, under the project the sources belong to (the same
+rule as everything else here: the PATH decides, not the shell). Asking twice over
+an unchanged file pays for that analysis once; an edit is a new entry, because
+the name is the content hash. `symbols` and `dead-code` share the one analysis,
+which is why `dead-code` — two analyses' worth of work — costs one.
+
 ### override
 
 The `.bl` the compiler ships is on every tree's search path — and the search
@@ -705,23 +713,55 @@ native is a line in the table, never a crash.
 $ bl doctor
 beam-lisp doctor
 
-  ok   language       (+ 1 2) → 3
-  ok   otp            29
-  ok   elixir         1.20.2
-  ok   beam-lisp      2026.0.0
-  ok   search-paths   0 root(s)
-  ok   code-paths     44 dir(s)
-  ok   datom_fjall    loaded
-  ok   explorer       loaded
-  ok   lazy_memo      65536 bytes fast lane
-  ok   z3             sat
-  ok   wry            loaded
-  --   daemon         not running (:no_socket)
-  --   src/           absent
-  --   .bl-check.edn  absent (run `bl check --update`)
+  ok   language          (+ 1 2) → 3
+  ok   otp               29
+  ok   elixir            1.20.2
+  ok   beam-lisp         0.1.0
+  ok   search-paths      0 roots
+  ok   code-paths        44 dirs
+  ok   datom_fjall       loaded
+  ok   explorer          loaded
+  ok   lazy_memo         65536 bytes fast lane
+  ok   z3                sat
+  ok   wry               loaded
+  --   daemon            not running (:no_socket)
+  --   src/              absent
+  ok   .bl-check.edn     present
+  ok   .local/bl/cache/  present
 
-  ✓ 2 required probes ok; 3 optional absent
+  ✓ 2 required probes ok; 2 optional absent
 ```
+
+#### `bl cache status | prune [--max-mb N] [--dry-run]`
+
+The analysis store is content-addressed: one artifact per source *revision*,
+which is what makes a stale one unreachable — and also what makes them pile up.
+`status` says what this tree's stores hold, per directory, and whether the total
+is over the cap; `prune` deletes the OLDEST first, never the newest (the one the
+run that just finished wrote), until it is under.
+
+An ENTRY is one artifact: a store — `<ns>.<sha>.fjall` with its `.blobs` sibling,
+which holds the values too large to inline — or a remembered per-file analysis,
+`<kind>.<sha>.term`, which the source questions leave behind. Counting one kind
+and not the other would let a capped cache grow through the files the cap does
+not see. `--dry-run` reports and deletes
+nothing, `--max-mb` overrides the cap for one run, and `BL_CACHE_MAX_MB`
+(default 512) for every run. `BL_CACHE_DIR` moves the store itself — every tier
+below it is skipped — which is what a CI job or a container wants: the analysis
+goes on a volume, or into a directory the job deletes, and the model stays where
+it is. Relative values resolve against the command's cwd. `bl search` prunes
+after it indexes, so the ceiling holds without anyone remembering it.
+
+```sh
+$ bl cache status
+  10 entries  65 MB  /home/user/code/undefine/beam-lisp--semantic/.local/bl/cache
+total 65 MB · cap 512 MB (under)
+```
+
+A store per source revision means nothing here is precious: every one can be
+rebuilt from the source it came from, and the only thing pruning costs is the
+next run's time. Where they live is a project question — see
+`docs/code-semantic-search.md`.
 
 Exit `0` when the required probes pass, `1` otherwise.
 
@@ -781,6 +821,9 @@ Flags may appear anywhere before `--`.
 | `BL_DAEMON` | `off` skips the daemon fast path; `auto` starts a missing daemon and retries once |
 | `BL_DAEMON_ROOT` | the tree root the daemon serves (default: the current directory) |
 | `BL_DAEMON_IDLE_SECONDS` | stop an idle daemon after this many seconds; default `28800` (8 hours), `0` disables the timer |
+| `BL_CACHE_DIR` | where the analysis store lives — overrides every tier, relative to the cwd; the model is unaffected, so a CI job can point the store at a scratch volume without moving the weights |
+| `BL_CACHE_MAX_MB` | the store cap in MB, default `512` |
+| `BLANALYSIS_DIR` | one explicit store directory for a single run; `BL_CACHE_DIR` wins over it |
 | `BL_VERSION` | stamps a release build; `bl version` reports it |
 
 ## Where a namespace is found

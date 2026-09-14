@@ -1,0 +1,227 @@
+; bl/search.bl — `bl search`: ask a codebase a question in English.
+;
+; `code.semantic` answers "which functions mean what I am describing?" over a
+; fact space built from source. This namespace is the COMMAND around that
+; question: find the sources, build the fact space, ask, print.
+;
+; ── why this is not in cli.bl ─────────────────────────────────────────
+;
+; `bl.cli` is the CLI's own machinery — argv, help, exit codes — and it must
+; load on a machine that will never search code for meaning. The embedding
+; model is OPTIONAL (33 MB of weights, fetched, not shipped), so the command
+; that needs it lives here and `cli.bl` reaches it by NAME at runtime, the
+; same way `bl build` reaches `build/run`. A namespace edge from the CLI to
+; the model would make the CLI's own load depend on an optional feature's
+; source; a name lookup does not.
+;
+; ── what a run costs (measured on a laptop, 2026-09) ────────────────
+;
+;   read 156 files                          17 ms
+;   ANALYZE them (`codebase/index-source`)  ~520 s   <- the whole cost
+;   embed 2565 functions                    ~0.5 s   (0.2 ms each)
+;   answer one query                        ~250 ms
+;
+; ANALYZING is what costs, and it costs seconds PER FILE — macroexpansion of
+; every form, 0.7 s for a small file and 30 s for `priv/boot/compiler.bl`. So
+; indexing a tree takes minutes, and the honest advice is to point this at a
+; directory rather than a monorepo.
+;
+; That is what the store does: `codebase/analyze-cached` keeps a source's
+; facts under sha256(source), because an analysis is a pure function of bytes,
+; so an unchanged file REPOPENS its store in tens of ms
+; instead of re-indexing in seconds. A semantic index on top of that store is
+; the difference between this command being slow and being instant.
+;
+; Files are analyzed a few at a time: `$BL_INDEX_WORKERS` (default 4, `1` for
+; the serial path) files in flight, merged in input order so an index stays
+; reproducible. The analyzer is the cost and it is in-process, so the ceiling
+; is not the core count — measured at 1.4x for four workers where four
+; processes on the same files get 4x. A warm corpus does not care either way.
+;
+; ── the optional contract ─────────────────────────────────────────────
+;
+; Absent model reads as ABSENT: the command says which file is missing and
+; which one command fetches it, and exits 2 as a usage error. It never
+; pretends an empty answer is an answer — a search that cannot run says so.
+
+(ns bl.search
+  (:require [code.embed] [code.semantic] [codebase] [datom] [bl.cache :as cache] [bl.cli :as cli]))
+
+(def DEFAULT-K 10)
+
+(defn- err [s] (IO/puts :stderr s))
+
+(defn- ms
+  "Milliseconds between two `now` readings.
+
+   The UNIT is explicit because the default is not milliseconds: bare
+   `(System/monotonic_time)` answers NANOSECONDS, so a delta divided by 1000
+   renders as microseconds — a number that is wrong by 1000× in the one
+   direction nobody questions (it looks like a plausible millisecond count).
+   Measured: 352 ms of work reads as 351647384."
+  [t0 t1] (- t1 t0))
+
+(defn- now [] (System/monotonic_time :millisecond))
+
+(defn- sources
+  "Every `*.bl` under `roots` as `[ns-string path]`, in a stable order.
+
+   Sorted so an index is reproducible: the same tree gives the same bands to
+   the same files, which is what makes two runs comparable."
+  [roots]
+  (reduce
+    (fn [acc root]
+      (concat acc
+              (mapv (fn [p] [(code.semantic/ns-of-file p) p])
+                    (to-list (sort (Path/wildcard (str root "/**/*.bl")))))))
+    []
+    roots))
+
+(defn- worker-count
+  "`$BL_INDEX_WORKERS`, or nil for the default.
+
+   The knob lives here rather than in `code.semantic` so the library keeps
+   taking numbers instead of parsing strings, and so there is exactly ONE place
+   a user can move it — the same shape as `$BL_CACHE_DIR`, which also earns a
+   single sentence in one document."
+  []
+  (let [s (System/get_env "BL_INDEX_WORKERS")]
+    (if (erlang/is_binary s) (cli/parse-int s) nil)))
+
+(defn- index-all!
+  "Index `pairs` through the ONE path and summarise it.
+
+   Resilience and the analysis cache live in `code.semantic/index!`, not here:
+   the CLI is not the only caller that wants to survive an unreadable file, and
+   a second per-file loop here is how the two drift apart."
+  [conn pairs root]
+  (let [w (worker-count)
+        results (code.semantic/index! conn pairs {:root root :workers w})
+        ; the PATH comes along with the reason: which file was left out is the
+        ; actionable half of the message, and a reason on its own reads as if
+        ; the whole run had a problem rather than one file.
+        skipped (into [] (keep (fn [r]
+                                 (if (:skipped r)
+                                   (str (:file r) " — " (:skipped r))
+                                   nil))
+                               results))]
+    {:functions (reduce (fn [n r] (+ n (or (:functions r) 0))) 0 results)
+     :files (- (count results) (count skipped))
+     :cached (count (filterv (fn [r] (= :cached (:analysis r))) results))
+     :vectors-cached (count (filterv (fn [r] (= :cached (:vectors r))) results))
+     ; How many sources came from the CORPUS MEMO rather than from a store each:
+     ; the one number that says whether this run opened a hundred files or one.
+     :manifested (count (filterv (fn [r] (= :manifest (:analysis r))) results))
+     :workers (code.semantic/workers-for (count pairs) {:workers w})
+     :skipped skipped}))
+
+(defn- show-rows
+  "One line per hit: `ns/name  line N  score`."
+  [rows]
+  (doseq [r rows]
+    (println (str "  " (:ns r) "/" (:name r)
+                  "   line " (:line r)
+                  "   " (:score r)))))
+
+(defn- n-sources
+  "How many sources to read: the `-p` roots if given, else the working tree.
+
+   `-p` is the CLI's library-root flag, and a codebase IS the library roots —
+   so a question about your own source is `bl search … -p priv`, the same flag
+   `bl run` already takes, with no second vocabulary to learn."
+  [st]
+  (if (empty? (:paths st)) ["."] (:paths st)))
+
+(defn run
+  "`bl search QUERY [-k N] [--ns NS] [--like NAME] [-p DIR]`
+
+   QUERY is the question in English. `--like NAME` asks the other question —
+   functions that look like `NAME` — and takes no QUERY. `--ns` narrows to one
+   namespace, `-k` sets how many hits come back (default 10)."
+  [args st]
+  (if-not (code.embed/available?)
+    (do (err (str "bl search: " (code.embed/why-unavailable)))
+        (err "  fetch the model once, then search offline forever:")
+        (err "    mix bl.embed.fetch")
+        2)
+    (let [like (:like st)
+          query (join " " (to-list args))
+          k (or (:k st) DEFAULT-K)
+          roots (n-sources st)]
+      (if (and (nil? like) (= "" query))
+        (do (err "usage: bl search QUERY [-k N] [--ns NS] [--like NAME] [-p DIR]")
+            2)
+        (let [t0 (now)
+              conn (code.semantic/connect)
+              pairs (sources roots)
+              ; Snapshot BEFORE indexing. The prune at the end enforces the cap on
+              ; the corpus's total, and without this it counted this run's own
+              ; stores as the oldest candidates — deleting the analyses the run
+              ; had just bought (measured: `pruned 23 entries, freed 103 MB`, and
+              ; the next run still derived them: `cached 15/38`).
+              dirs (cache/store-dirs (first roots))
+              keep (cache/entry-names dirs)
+              ; Said BEFORE the work, on stderr, because indexing a large tree
+              ; is minutes of silence — analysis, not embedding, is the cost
+              ; (see the namespace header) — and a command that looks hung gets
+              ; killed. stdout stays the result alone.
+              _ (err (str "bl search: indexing " (count pairs) " files…"))
+              ; Bring the store's backend up BEFORE deciding to use it: the
+              ; native's host module exists only once the namespace declaring it
+              ; has been initialized, and nothing in this path loads it. Without
+              ; this the same corpus indexed uncached at 11993 ms where the store
+              ; would have answered in 176 ms (FUP-055).
+              ;
+              ; Inline, and not in `codebase` or `bl.cache`: both sit in the AOT
+              ; compiler's own dependency graph, so loading a namespace from
+              ; either is a cycle and the build dies with
+              ; "1st argument: not a tuple". A shared helper belongs at the edge
+              ; (see BUG-039).
+              _ (try (BeamLisp.AOT/ensure_loaded "datom.store-fjall") (catch e nil))
+              ; A run that still cannot cache must SAY so: the only other sign of
+              ; it is a footer that stays silent when nothing hits (FUP-055).
+              _ (if (codebase/cache-available?)
+                  nil
+                  (err "bl search: analysis store unavailable — indexing uncached (native datom_fjall did not load)"))
+              built (index-all! conn pairs (first roots))
+              ; The cap is enforced where the stores are MADE, not only where
+              ; someone remembers to ask: an eviction policy that needs a human
+              ; is not a policy. The target is the CORPUS's stores — the tree the
+              ; cwd is in may be an entirely different project.
+              pruned (cache/prune! dirs (cache/cap-bytes) keep)
+              _ (if (pos? (:removed pruned))
+                  (err (str "bl cache: pruned " (cache/things (:removed pruned) "entry" "entries")
+                            ", freed " (cache/human (:freed pruned)))))
+              t1 (now)
+              db (datom/db conn)
+              rows (cond
+                     (some? like)
+                     (code.semantic/similar db like k)
+
+                     (some? (:ns st))
+                     (code.semantic/search-in-ns db (code.embed/embed query) (:ns st) k)
+
+                     :else
+                     (code.semantic/search-text db query k))
+              t2 (now)]
+          (doseq [s (:skipped built)] (err (str "bl search: skipped " s)))
+          (println (str (count rows) " of " (:functions built)
+                        " functions in " (:files built) " files"
+                        "  (index " (ms t0 t1) " ms · query " (ms t1 t2) " ms"
+                        (if (pos? (:cached built))
+                          (str " · cached " (:cached built) "/" (:files built))
+                          "")
+                        (if (pos? (:vectors-cached built))
+                          (str " · vectors " (:vectors-cached built) "/" (:files built))
+                          "")
+                        ; The memo answered the whole corpus: say so INSTEAD of the
+                        ; worker count, because a run that read one file did not fan
+                        ; out over a hundred — and the two facts would contradict.
+                        (if (pos? (:manifested built))
+                          (str " · corpus cached " (:manifested built) "/" (:files built))
+                          (if (> (:workers built) 1)
+                            (str " · " (:workers built) " workers")
+                            ""))
+                        ")"))
+          (show-rows rows)
+          0)))))
