@@ -170,7 +170,7 @@ invocation, so it reports `not running` and changes nothing.
    ; alone would hide a drop built `--no-embed` that is silently degraded.
    (probe "embedding" false
      (fn []
-       (let [m    (BeamLisp/eval "(code.embed/MODEL)")
+       (let [m    (BeamLisp/eval "code.embed/MODEL")
              tier (BeamLisp.Model/tier m)
              dir  (BeamLisp.Model/dir m)]
          (case tier

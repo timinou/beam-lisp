@@ -39,11 +39,15 @@ defmodule BeamLisp.ModelTest do
     bundled: bundled,
     ambient: ambient
   } do
-    pinned = fetch!(Path.join(ambient, "pinned"))
-    System.put_env(BeamLisp.Model.dir_env(), pinned)
+    # With a pin, the VALUE is the ROOT and the model is its `<name>`
+    # subdirectory — `dir/1` is `root()/name` either way, so the pin has to be
+    # written where a fetch would have written it.
+    root = Path.join(ambient, "pinned-root")
+    pinned = fetch!(Path.join(root, @name))
+    System.put_env(BeamLisp.Model.dir_env(), root)
 
     assert BeamLisp.Model.tier(@name) == :env
-    assert BeamLisp.Model.dir(@name) == Path.join(pinned, @name)
+    assert BeamLisp.Model.dir(@name) == pinned
 
     # The same pin with nothing in it is ABSENT — it does not fall through to a
     # bundled copy that is very likely sitting in this checkout, or a test that
