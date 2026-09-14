@@ -225,6 +225,55 @@ defmodule BeamLisp.ClojureSourceTest do
     File.rm_rf!(dir)
   end
 
+  test "an :import clause records the class by short name and loads nothing" do
+    BeamLisp.Compiler.eval_string("""
+    (ns import.probe
+      (:import [java.math BigDecimal RoundingMode]
+               (java.util Date)
+               java.security.MessageDigest))
+    """)
+
+    assert "java.math.BigDecimal" == BeamLisp.Env.import_target("import.probe", "BigDecimal")
+    assert "java.math.RoundingMode" == BeamLisp.Env.import_target("import.probe", "RoundingMode")
+    assert "java.util.Date" == BeamLisp.Env.import_target("import.probe", "Date")
+    assert "java.security.MessageDigest" == BeamLisp.Env.import_target("import.probe", "MessageDigest")
+    assert nil == BeamLisp.Env.import_target("import.probe", "UUID")
+  end
+
+  test "an :import spec must be package-qualified with class names" do
+    assert_raise BeamLisp.CompileError, ~r/invalid :import spec/, fn ->
+      BeamLisp.Compiler.eval_string("(ns import.bad (:import [java.math]))")
+    end
+
+    assert_raise BeamLisp.CompileError, ~r/invalid :import spec/, fn ->
+      BeamLisp.Compiler.eval_string("(ns import.bad2 (:import Date))")
+    end
+  end
+
+  test ":refer-clojure :exclude is recorded and the same-ns def shadows core" do
+    r =
+      BeamLisp.Compiler.eval_string("""
+      (do
+        (ns refer.probe (:refer-clojure :exclude [zero? name]))
+        (defn zero? [_] :shadowed)
+        (zero? 0))
+      """)
+
+    assert :shadowed == r
+    assert ["zero?", "name"] == BeamLisp.Env.core_excludes("refer.probe")
+    assert [] == BeamLisp.Env.core_excludes("import.probe")
+
+    assert_raise BeamLisp.CompileError, ~r/supports only :exclude/, fn ->
+      BeamLisp.Compiler.eval_string("(ns refer.bad (:refer-clojure :only [inc]))")
+    end
+  end
+
+  test "an unknown ns clause is refused by name" do
+    assert_raise BeamLisp.CompileError, ~r/got :use/, fn ->
+      BeamLisp.Compiler.eval_string("(ns clause.bad (:use [x]))")
+    end
+  end
+
   # The reader's answers for reader conditionals, CAPTURED FROM THE JVM READER
   # AND EVALUATOR (`clojure -M -e` over these exact sources) — an oracle, not a
   # re-statement of this implementation. Which cases pin which rule:

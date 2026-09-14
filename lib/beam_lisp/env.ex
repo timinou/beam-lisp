@@ -838,6 +838,46 @@ defmodule BeamLisp.Env do
     :ok
   end
 
+  @doc """
+  Record that `(:import [pkg Class])` in `ns` names the host class
+  `"pkg.Class"` by its short name. A class import is a DECLARATION, not a
+  load: nothing is resolved here. The interop manifest consults
+  `import_target/2` when it compiles `Class/static`, `(Class. …)` and a
+  `catch Class` — an imported class the manifest does not know is refused
+  THERE, with the manifest's list in hand, never at the `ns` form.
+  """
+  def add_import(ns, short, qualified) do
+    put_key({:import, ns, short}, qualified)
+    :ok
+  end
+
+  @doc "The fully-qualified class `short` was imported as inside `ns`, or nil."
+  def import_target(ns, short) do
+    case lookup({:import, ns, short}) do
+      {:ok, target} -> target
+      :error -> nil
+    end
+  end
+
+  @doc """
+  The core names `ns` declared it shadows with `(:refer-clojure :exclude [...])`.
+  Shadowing a core name with a same-ns `def` already works without the clause
+  (the ns's own var wins the lookup chain); recording the list keeps the
+  declaration queryable and lets the loader/monitors distinguish an intended
+  shadow from an accidental one.
+  """
+  def add_core_excludes(ns, names) when is_list(names) do
+    put_key({:refer_clojure_exclude, ns}, names)
+    :ok
+  end
+
+  def core_excludes(ns) do
+    case lookup({:refer_clojure_exclude, ns}) do
+      {:ok, names} -> names
+      :error -> []
+    end
+  end
+
   @doc "The namespace `alias` points to inside `ns`, if any."
   def alias_target(ns, alias_) do
     case lookup({:alias, ns, alias_}) do
