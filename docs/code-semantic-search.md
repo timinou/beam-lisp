@@ -222,7 +222,8 @@ Three properties belong to the door rather than to any caller:
   is a pure function of the source bytes: nothing re-analyzes an unchanged file.
   `codebase/blanalysis-dir` resolves in four tiers — `$BL_CACHE_DIR` (set it and
   nothing else is consulted: the store goes where you point, which is the CI
-  lever, and it moves ONLY the store — the model lives under the cache root, so
+  lever, and it moves ONLY the store — the embedding weights resolve through
+  `BeamLisp.Model` instead (pin, bundled, or cache), so
   `XDG_CACHE_HOME` is not a substitute for it), else `$BLANALYSIS_DIR` (the
   per-call spelling tests use), else `<project>/.local/bl/cache`, else
   `$XDG_CACHE_HOME/beam_lisp/cache/<tree id>` for a project that cannot be

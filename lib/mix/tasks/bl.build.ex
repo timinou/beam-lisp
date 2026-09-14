@@ -79,6 +79,19 @@ defmodule Mix.Tasks.Bl.Build do
           dir
       end
 
+    # The weights must be INSIDE the payload, not merely beside it. The drop
+    # packs the release tree, and the release copies priv/ when IT is built — so
+    # a fetch that ran after the release, or a `--release DIR` older than the
+    # fetch, produces a drop that looks complete and answers "the model weights
+    # are not on disk" to the first `bl search`. That is a silent capability
+    # loss in the artifact users install, so the build refuses instead of
+    # shipping it.
+    if opts[:embed] == false do
+      Mix.shell().info("bl.build: --no-embed: `bl search` will need the weights on the machine that runs this drop")
+    else
+      ensure_embedded!(release_dir)
+    end
+
     # 4. cargo build the launcher + pack tool
     unless opts[:skip_cargo] do
       Mix.shell().info("bl.build: building drop launcher + pack tool…")
@@ -116,6 +129,42 @@ defmodule Mix.Tasks.Bl.Build do
     size_mb = (File.stat!(out).size / 1_048_576) |> Float.round(1)
     Mix.shell().info("bl.build: wrote #{out} (#{size_mb} MB)")
     Mix.shell().info("bl.build: run it with `#{out} version`; start a warm loop with `#{out} daemon start`")
+  end
+
+  # Refuse to pack a drop whose PAYLOAD has no weights (see the call site for
+  # why this is a check and not a hope). The marker is the fetch's DIGEST, the
+  # same completion record `BeamLisp.Model.fetched?/1` reads, so "the release
+  # carries a model" means the same thing here as it does at query time.
+  defp ensure_embedded!(release_dir) do
+    case Path.wildcard(Path.join([release_dir, "lib", "beam_lisp-*", "priv", "embed", "**", "DIGEST"])) do
+      [digest | _] ->
+        dir = Path.dirname(digest)
+
+        size =
+          dir
+          |> Path.join("**/*")
+          |> Path.wildcard()
+          |> Enum.filter(&File.regular?/1)
+          |> Enum.map(&File.stat!(&1).size)
+          |> Enum.sum()
+
+        Mix.shell().info(
+          "bl.build: embedding in the payload: #{dir} (#{Float.round(size / 1_048_576, 1)} MB)"
+        )
+
+      [] ->
+        Mix.raise("""
+        bl.build: the release tree carries no embedding weights.
+
+          looked for: #{release_dir}/lib/beam_lisp-*/priv/embed/**/DIGEST
+
+        `bl search` in the drop this would produce would answer "the model
+        weights are not on disk — looked in …/priv/embed/…" — a capability the
+        default distribution is supposed to have. Rebuild the release after the
+        fetch (drop `--release DIR`), or say `--no-embed` to leave it out on
+        purpose.
+        """)
+    end
   end
 
   # Bytes under `priv/embed/` — what the embedding adds to the drop, said in
