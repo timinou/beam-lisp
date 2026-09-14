@@ -201,6 +201,94 @@ died on a function the guard had just certified.
   had been paying for a library that was never loaded.
 ])
 
+= Two bugs the machine found
+
+The last pass of this work was not new surface. It was the two defects the
+workstation exposed once this tree came back up — both in code this plan ships,
+both reproduced before and after the fix, both now covered by a test that fails
+without it.
+
+== The page that waited for the file server
+
+The dashboard stopped answering: `GET /` hung, first in ExUnit at the 60-second
+test timeout, then at 120 seconds to a raw `:gen_tcp` client, with the daemon
+idle and its `:ui` port bound. Reproduced in a bare `mix run`, so it was never
+the test harness. The stalled process names its own blocker:
+
+```
+Process.info(stalled, :monitors)          #→ [process: #PID<0.53.0>]
+Process.whereis(:file_server_2)           #→ #PID<0.53.0>
+```
+
+Stack, read from the process rather than guessed: `Gateway.url/2` →
+`Paths.runtime_dir/0` → `ensure_secure_dir/1` → `:file.call/2` →
+`gen_server:call(:file_server_2, …)` — **with `infinity` as the timeout**. This
+host runs every Elixir VM with one dirty-IO scheduler:
+
+```
+ELIXIR_ERL_OPTIONS=+S 4:4 +SDcpu 2:2 +SDio 1:1 +sbwt none +sbwtdio none
+```
+
+so a file-server round trip queues behind any other dirty-IO operation in the
+same VM and waits without a deadline. The page was paying for that queue once
+per element: `Gateway.url/1` looks the port up per call, and the lookup reads
+the runtime dir and the endpoint file — 2N file round trips to draw a page with
+N named ports.
+
+#list(
+  [Fix: the model asks the gateway for its port ONCE per render (one file
+    round trip, not 2N) and hands the number to `Gateway.url/2`.],
+  [Observed: `GET /` → 200 in 30 ms, 764 file-server reductions, 4836-byte body
+    (was: no answer in 120 s).],
+  [The host fact is recorded where host facts belong (`~/.agents/AGENTS.md`),
+    with the diagnosis recipe, because it will bite any Elixir project here.],
+)
+
+== A sibling tree switched this tree's page off
+
+Once the page answered, its test still failed — for an unrelated reason that
+turned out to be the sharper bug. This tree's daemon printed:
+
+```
+ui:   not served — {:taken, %{name: "ui", port: 51981, root: "…/beam-lisp--autovcs"}}
+```
+
+A *different checkout's* session held the name `ui`, and the registry — which
+keys claims by name alone, on purpose, so that two trees cannot both promise the
+same NUMBER — refused the second tree its own ephemeral port. The user sees a
+session with no page, for a reason they can neither see nor fix.
+
+The key now says what kind of claim it is:
+
+#list(
+  [A CHOSEN port (`:ports {:ui 7700}`) is a promise about a NUMBER. The name is
+    the key, machine-wide: a second tree is refused, naming the owner.],
+  [An EPHEMERAL port is nobody's promise — the OS picked the number — so the
+    claim is the SESSION's address and is keyed by name AND tree.],
+  [Observed after: `ui: http://beam-lisp.test → 127.0.0.1:52435 (ephemeral —
+    pin it in env.bl with :ports {:ui 7700})` while the sibling tree still holds
+    `ui`.],
+  [Regression test on both sides: “two trees may each hold the same ephemeral
+    name” (ExUnit and the `bl.ports` corpus), plus “a chosen port is
+    machine-wide” for the refusal that must still happen.],
+)
+
+== What the docs had to say about it
+
+The walkthrough gate caught the behaviour change honestly: after the keying fix,
+
+#ran("bl doc run docs/dev/the-warm-session.bl.md --check", "stored results are stale; run `bl doc run` to refresh")
+
+and the refresh showed the prose was now wrong in two cells: a release that did
+not name the tree left its claim behind (`(true false)` → `(true true)`), and the
+“two trees are refused” example — which is only true of a *chosen* port — died on
+an `argument error` because the second claim now succeeds. Both cells were
+rewritten and the section now states the rule instead of the old behaviour:
+every checkout gets its own session page at once; a chosen port is the promise
+the machine keeps once.
+
+#ran("bl doc run docs/dev/the-warm-session.bl.md", "6 cells, 0 cell errors")
+
 = What is not done
 
 
@@ -211,6 +299,15 @@ died on a function the guard had just certified.
   [G2, above — `u/kw` silently drops what it cannot express.],
   [G3, above — one mid-write source file stops every `bl` command, the daemon
     included. FUP-050 has the mechanism and the reproduction.],
+  [The verb livebooks `bl.env`, `bl.test`, `bl.ports` are gated clean (their
+    definition cells are `silent`, so they run without storing function
+    references as “results”). Every OTHER `priv/std/bl/*.bl.md` still reports
+    stale for the same reason — FUP-054 has the mechanism and the confirmed
+    mechanical fix. Running `bl doc run` on them is NOT the fix.],
+  [A file read in a session can still stall behind another operation in the
+    same VM — this host gives every Elixir VM one dirty-IO scheduler. The page
+    now asks once per render instead of once per port; the rest is the host's
+    setting, not a property of the session.],
   [The dashboard REPL pane (FUP-038) and the editing/file-browsing spike
     (FUP-039) remain follow-ups, as planned.],
   [The plan listed five walkthroughs (`env.bl`, `daemon`, `tasks`, `ports`,
@@ -222,17 +319,21 @@ died on a function the guard had just certified.
 = The red corpus, attributed
 
 The corpus (`bl test test/bl/`) is red as this report is written, and the
-attribution matters more than the count. Of 168 files: 156 pass, 4 fail, 12 are
-incoherent — and every one of those is a symptom of the *other* session editing
-this same checkout at the same time. The AOT loader names the cause itself, one
-line per file:
+attribution matters more than the count:
 
-#ran("mix bl test test/bl/", "156 passed, 4 failed, 12 incoherent  (one run; the counts move with their edits)")
+#ran("mix bl test test/bl/", "147 file(s) passed, 30 failed, 1 incoherent  (one run; the counts move with their edits)")
+
+Every failing file is in the surface the *other* session is editing in this same
+checkout at the same time — the solver and its callers (reporting
+`smt/emit: nil is not an SMT term`, `:verdict :unknown`, and one ETS `table
+identifier does not refer to an existing ETS table`):
 
 #list(
-  [The failures are theirs, by their assertions: `build.test` / `poisoned-manifest-is-ignored` (`b/read-manifest` → `%ArgumentError{}`), `datom.blanalysis-cache.test` / `hit-returns-identical-answers`, `live.session.test` / `session-conn-dies-with-owner` (`ets/info tbl :owner` → `:undefined`), `ns-interface.test` / `real-prelude-body-edit-rebuilds-one` (a `Reader.SyntaxError` — reading a file mid-write).],
-  [The 12 incoherent files are theirs, by their own message: `⊘ INCOHERENT — test file declares no (ns …) form` — new test files being written right now (`z3_concurrent_test.bl`, `mcp_z3_port_test.bl`, `daemon_names_test.exs`).],
-  [Not one failure text mentions this work's surfaces, and the suites that exercise them are green *through* the breakage — which is the useful half of the observation.],
+  [`reload.migrate-test`, `reload.upgrade-test`, `reload.verify-adversarial-test` — the SMT-backed verification of a migration.],
+  [`system.anf-smt-test`, `system.smt-defn-test`, `system.smt-fragment-test`, `system.smt-quot-rem-test`, `system.theories-test`, `system.repair-test`, `system.seam-test`, `system.interproc-wins-test` — the solver layer.],
+  [`veritas-test` and `veritas.*` (fault, mock, covers-symbolic, hypothesis-symbolic, theories, tuple-positional) — 10 of 14 red, their largest single file.],
+  [`system.lsp-test`, `system.lsp-cli-test`, `system.linear-test`, `system.check-test`, `system.mcp-project-mount-test`, `system.system-test` — files they were mid-writing (`priv/lib/lsp*`, `priv/lib/system/linear.bl`, `priv/lib/mcp/tools.bl`).],
+  [Not one failure text mentions this work’s surfaces. `test/bl/smt_test.bl` itself is green (28 passed) while the layers above it are not.],
 )
 
 That last point is the one worth keeping: the warm runner stayed green for this

@@ -33,12 +33,28 @@ defmodule BeamLisp.Daemon.Gateway do
   on the machine. `*.localhost` resolves to `::1` on a systemd host, so the v6
   listener is not a nicety.
 
-  Port 80 is the one HTTP port a URL may omit. Binding it needs either privilege
-  or the one sysctl that makes low ports unprivileged
-  (`net.ipv4.ip_unprivileged_port_start=80`); without it an unpinned gateway
-  falls back to #{7777} and says so, in as many words, with the fix. It never
-  silently moves a port a caller PINNED — a pinned port that is taken is an
-  error, not an inconvenience to paper over.
+  Port 80 is the one HTTP port a URL may omit, and a name is only worth
+  anything here because it can be typed without a port. There are two ways 80
+  gets answered, and this module is indifferent to which one is in force:
+
+    * **the gateway holds it.** Binding 80 needs either privilege or the one
+      sysctl that makes low ports unprivileged
+      (`net.ipv4.ip_unprivileged_port_start=80`); without it an unpinned
+      gateway falls back to #{7777} and says so, in as many words, with the fix.
+    * **something loopback-local fronts it.** `bl install redirect` writes one
+      nft rule — packets to `127.0.0.0/8:80` and `[::1]:80` are redirected to
+      the port the gateway already holds. No privilege, no machine-wide policy
+      change, and nothing on the LAN is affected; the gateway keeps standing on
+      #{7777} and is reached on 80.
+
+  Which one is in force is not configured and not guessed: `fronted_on?/1`
+  PROBES port 80 and asks whether a beam-lisp gateway answers there. That is
+  what makes the printed address honest — it shows a port exactly when a port
+  is needed, and the day the redirect is removed every address grows its port
+  back on its own.
+
+  It never silently moves a port a caller PINNED — a pinned port that is taken
+  is an error, not an inconvenience to paper over.
   """
 
   use GenServer
@@ -48,6 +64,10 @@ defmodule BeamLisp.Daemon.Gateway do
 
   @preferred_port 80
   @fallback_port 7777
+  @marker_header "x-bl-gateway"
+  @probe_timeout 1_000
+  @probe_limit 8 * 1024
+  @probe_request "GET / HTTP/1.1\r\nhost: gateway-probe\r\nconnection: close\r\n\r\n"
   @endpoint_name "gateway"
   @head_limit 32 * 1024
   @head_timeout 10_000
@@ -130,7 +150,19 @@ defmodule BeamLisp.Daemon.Gateway do
         GenServer.call(pid, :port)
     end
   end
+  @doc """
+  The live facts an address depends on, resolved ONCE per render: the port the
+  gateway is on, and whether port 80 answers for it.
 
+  A caller printing N addresses must not ask N times. `url/1` reads the runtime
+  dir (via `port/0`) and probes port 80 (via `fronted_on?/1`); those round trips
+  queue behind every other file operation in the VM, which is how drawing one
+  page turns into a client timeout. Resolve here, render with `url/3`.
+  """
+  def live do
+    port = port()
+    %{port: port, fronted: fronted_on?(port)}
+  end
   @doc """
   The address `host` answers at — what a human should type, and what every verb
   prints.
@@ -148,8 +180,89 @@ defmodule BeamLisp.Daemon.Gateway do
   def url(host, port \\ nil)
 
   def url(host, nil), do: url(host, port())
-  def url(host, port) when port == nil or port == @preferred_port, do: "http://#{host}/"
-  def url(host, port), do: "http://#{host}:#{port}/"
+  def url(host, port), do: url(host, port, fronted_on?(port))
+
+  # The rule itself, with the port-80 answer supplied: `false` means the port
+  # must be shown. Split out because "is port 80 ours?" is answered by a PROBE
+  # (`fronted_on?/1`) and a probe cannot be part of a test's expectation. What
+  # an address looks like is a pure function of three facts.
+  def url(host, nil, _fronted), do: "http://#{host}/"
+  def url(host, @preferred_port, _fronted), do: "http://#{host}/"
+  def url(host, _port, true), do: "http://#{host}/"
+  def url(host, port, _fronted), do: "http://#{host}:#{port}/"
+
+  @doc """
+  Does port 80 reach this gateway?
+
+  Two ways that can be true, and from the outside they are indistinguishable:
+  the gateway HOLDS port 80, or something loopback-local forwards :80 to it —
+  `bl install redirect` writes exactly that, because binding 80 needs either
+  privilege or a machine-wide sysctl, and a dev tool has no business demanding
+  either. A redirect rewrites the packet, not our sockets, so no socket option
+  can see it: the only honest way to know is to ASK. Connect to 80 and see
+  whether a beam-lisp gateway answers.
+
+  So a printed address follows evidence, not configuration. Install the
+  redirect and names lose their port; remove it and the port comes back into
+  every address — nothing to reconfigure, no stale state to explain.
+  """
+  def fronted_on?(@preferred_port), do: true
+  def fronted_on?(nil), do: false
+  def fronted_on?(_port), do: ours_on?(@preferred_port)
+
+  @doc """
+  True when a beam-lisp gateway answers on `port`.
+
+  One loopback connect and a read of the head, looking for
+  `#{@marker_header}:` — the header every page this module serves carries.
+  Fast enough to ask while printing (`bl ports` asks once per row) and honest
+  in the only sense that matters: the answer describes what a client gets.
+  """
+  def ours_on?(port, timeout \\ @probe_timeout) do
+    case :gen_tcp.connect({127, 0, 0, 1}, port, @socket_opts, timeout) do
+      {:ok, sock} ->
+        answered =
+          with :ok <- :gen_tcp.send(sock, @probe_request),
+               {:ok, head} <- read_answer(sock, <<>>, timeout) do
+            gateway_answer?(head)
+          else
+            _ -> false
+          end
+
+        _ = :gen_tcp.close(sock)
+        answered
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  @doc """
+  The classifier behind the probe: did this response head come from us? A
+  server that is not a beam-lisp gateway sends no `#{@marker_header}` header,
+  and one that closes without answering at all is not ours either.
+  """
+  def gateway_answer?(head) when is_binary(head),
+    do: head |> String.downcase() |> String.contains?(@marker_header <> ":")
+
+  def gateway_answer?(_), do: false
+
+  # Read until the blank line that ends a head, with a cap: a server answering
+  # with an endless body must not leave the probe — and the verb that asked —
+  # waiting.
+  defp read_answer(_sock, acc, _timeout) when byte_size(acc) > @probe_limit,
+    do: {:error, :head_too_long}
+
+  defp read_answer(sock, acc, timeout) do
+    if String.contains?(acc, "\r\n\r\n") do
+      {:ok, acc}
+    else
+      case :gen_tcp.recv(sock, 0, timeout) do
+        {:ok, data} -> read_answer(sock, acc <> data, timeout)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
 
   @doc """
   Stop the running gateway. A signal, not a protocol: the gateway is one OS
@@ -277,12 +390,38 @@ defmodule BeamLisp.Daemon.Gateway do
     "port #{port} cannot be bound (#{inspect(reason)})"
   end
 
-  # The one root step that makes low ports the user's (a reboot-surviving copy
-  # belongs in /etc/sysctl.d/). One sentence, used by the banner AND by a
-  # refusal, so the two cannot drift.
-  defp sysctl_advice do
+  @doc """
+  The one sentence about how port 80 gets answered — shared by the degraded
+  banner, a pinned refusal and `bl install gateway`, so the three cannot drift
+  into three different stories about the same port.
+
+  The redirect comes first because it is the smaller ask: loopback-only,
+  removable, and it changes no machine-wide policy. The sysctl is named second
+  with its cost visible (`ANY local process may bind 80-1023`), which is a
+  tradeoff a developer can weigh rather than a rule to obey.
+  """
+  def port_80_advice do
+    [
+      "names need no port, which takes one of two root steps:",
+      "  bl install redirect                      (loopback only, removable — recommended)",
+      "  #{sysctl_command()}   (lets ANY local process bind 80-1023)"
+    ]
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  The sysctl that makes low ports unprivileged, as a command a developer can
+  paste. One spelling, in one place: everything that names this knob names it
+  exactly here.
+  """
+  def sysctl_command do
     "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=#{@preferred_port}"
   end
+
+  # The banner's own line: shorter than the two-way advice, because the banner
+  # is printed at every gateway start and the reason it is not on 80 may be
+  # something else entirely (the port could be taken, not privileged).
+  defp sysctl_advice, do: sysctl_command()
 
   @impl true
   def handle_call(:port, _from, state), do: {:reply, state.port, state}
@@ -370,8 +509,7 @@ defmodule BeamLisp.Daemon.Gateway do
         :eacces ->
           """
           port #{@preferred_port} is privileged here — on #{port} for now.
-            one root step frees it, for good:
-              #{sysctl_advice()}  (in /etc/sysctl.d/ to survive a reboot)\
+          #{Enum.map_join(String.split(port_80_advice(), "\n"), "\n  ", & &1)}\
           """
 
         :eaddrinuse ->
@@ -730,7 +868,7 @@ defmodule BeamLisp.Daemon.Gateway do
     resp = [
       "HTTP/1.1 #{status} #{reason}\r\n",
       "content-type: text/html; charset=utf-8\r\n",
-      "x-bl-gateway: #{@preferred_port}\r\n",
+      "#{@marker_header}: beam-lisp\r\n",
       "content-length: #{byte_size(body)}\r\n",
       "connection: close\r\n\r\n",
       body

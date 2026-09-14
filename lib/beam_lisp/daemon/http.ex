@@ -355,14 +355,26 @@ defmodule BeamLisp.Daemon.HTTP do
   defp conn_opts(opts), do: Keyword.take(opts, [:status_fun, :tree_id])
 
   defp ports_json do
+    # One lookup and one probe for the whole table, for the reason the
+    # read-model resolves it once: the live facts cost a runtime-dir read and a
+    # port-80 probe, and a table of N names should not pay that N times.
+    live = Gateway.live()
+
     Enum.map(Ports.list(), fn p ->
       hosts = Map.get(p, :hosts, [])
+
+      url =
+        if hosts == [] do
+          "http://127.0.0.1:#{p.port}/"
+        else
+          Gateway.url(hd(hosts), live.port, live.fronted)
+        end
 
       %{
         "name" => p.name,
         "port" => p.port,
         "hosts" => hosts,
-        "url" => if(hosts == [], do: "http://127.0.0.1:#{p.port}/", else: Gateway.url(hd(hosts))),
+        "url" => url,
         "tree" => p.tree_id,
         "root" => p.root,
         "pid" => p.pid,

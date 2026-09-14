@@ -452,12 +452,19 @@ declared — still lists, with its loopback address.
 
 ```sh
 $ bl ports
-  ui    http://beam-lisp.test        → 51337  beam-lisp (pid 1812553)
-  web   http://web.beam-lisp.test    → 4000   beam-lisp (pid 1812553)
+  ui    http://beam-lisp.test:7777/     → 51337  beam-lisp (pid 1812553)
+  web   http://web.beam-lisp.test:7777/ → 4000   beam-lisp (pid 1812553)
 
   2 name(s) registered, but no gateway answers them:
       bl gateway start    (one per user; see bl install gateway)
 ```
+
+The address shows the port when it has to and no port when it does not: the one
+HTTP port a URL may leave out is 80, so a gateway standing on 80 (or one fronted
+by `bl install redirect`) prints `http://web.beam-lisp.test/`, and anything else
+prints the port — an address that omitted the port nothing is listening on would
+look clickable and refuse. With no gateway at all the names print bare, and the
+hint above says what is missing.
 
 The last two lines appear only when names are registered and nothing is
 listening for them. Exit `0`; an empty registry prints one line saying so.
@@ -472,9 +479,13 @@ argument.
 
 ```sh
 $ bl open web
-http://web.beam-lisp.test/
+http://web.beam-lisp.test:7777/
   → http://127.0.0.1:4000/
 ```
+
+One URL, and the port in it is the one that works: with the gateway answering on
+port 80 — itself or through `bl install redirect` — it is
+`http://web.beam-lisp.test/` instead.
 
 #### `bl ui [--open]`
 
@@ -493,9 +504,14 @@ the port, and every name it routes.
 ```sh
 $ bl gateway
 bl gateway on 127.0.0.1:80 and [::1]:80   (pid 1900112)
+  port 80: answered — names need no port in the URL
   beam-lisp.test       → 127.0.0.1:51337  beam-lisp
   web.beam-lisp.test   → 127.0.0.1:4000   beam-lisp
 ```
+
+The `port 80` line is the one thing a developer cannot read off the rest: it is
+probed, not configured, and when nothing answers there it says
+`not answered — bl install redirect` instead.
 
 `start` uses the systemd user unit when one is installed and detaches otherwise;
 `stop` stops the running one; `run` is the foreground process the unit execs —
@@ -504,6 +520,19 @@ a silent move.
 
 Exit `0` when the gateway is up; `stop` and `status` exit `1` when none was
 running; `2` on an unknown subcommand.
+
+Port 80 is the only piece that needs root. Two ways to get it, and either one
+ends with every printed address losing its port:
+
+```sh
+bl install redirect          # loopback-only nftables redirect + a system unit — recommended
+# or hand the gateway the port itself:
+printf 'net.ipv4.ip_unprivileged_port_start=80\n' | sudo tee /etc/sysctl.d/60-beam-lisp-gateway.conf
+sudo sysctl --system
+```
+
+Which one is in force is not configured and not guessed: the gateway probes port
+80 and prints the address that answers. `bl gateway` reports the port it holds.
 
 Names are derived from the tree, so the whole story is in
 [../dev/names.bl.md](../dev/names.bl.md): `<port>.<project>.test` and its
@@ -603,11 +632,11 @@ startup (a few seconds); every request after that reads the conn it built.
 
 ### install
 
-#### `bl install [TARGET [DIR]] [--check] [--json]`
+#### `bl install [TARGET [DIR]] [--check] [--remove] [--json]`
 
 Install beam-lisp into your tools. With no TARGET, lists the targets. A target
 writes what the tool needs and reports each step; `--check` verifies an
-installation without writing anything.
+installation without writing anything; `--remove` undoes what a target wrote.
 
 ```sh
 $ bl install doom
@@ -631,6 +660,32 @@ same facts the MCP server serves over `prompts/get` — and writes
 `beam-lisp-mcp.onboarding.md` and `beam-lisp-mcp.usage.md` into DIR (default
 `.`), with the client registration snippet in each. An agent reads the files;
 a client can also just run the server.
+
+`gateway` writes a systemd **user** unit so the name gateway starts at login.
+
+`redirect` makes port 80 answer for the gateway without giving anything else on
+the machine the right to: one nftables table sends packets addressed to
+`127.0.0.0/8:80` and `[::1]:80` to the port the gateway already holds, plus a
+system unit that reapplies it at boot. It is the recommended way to get a
+portless address (loopback only, removable with `--remove`), and it is the one
+target that needs root, so it runs its script with `sudo` when it can and
+otherwise prints exactly what to paste:
+
+```sh
+$ bl install redirect
+bl install redirect
+
+this one needs root — run it:
+
+set -e
+install -D -m644 ~/.local/state/beam-lisp/redirect/redirect.nft /etc/bl-gateway-redirect.nft
+…
+systemctl enable --now bl-gateway-redirect.service
+
+  --   ruleset     needs root — the script printed above
+  --   port 80     not answered yet — the gateway is on 7777
+  ok   gateway port on the fallback port 7777 — the boot rule stays right
+```
 
 Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
 
@@ -709,6 +764,7 @@ Flags may appear anywhere before `--`.
 | `--update` | check: record the new baseline |
 | `--fix` | check: apply the safe rewrite |
 | `--check` | doc: report drift without writing; install: verify, don't write |
+| `--remove` | install: undo what a target wrote |
 | `--native` | build: also emit native modules |
 | `--install-hook` | check: install the pre-commit hook |
 | `--json` | machine-readable output where a command offers it |

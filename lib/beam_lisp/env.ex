@@ -365,6 +365,7 @@ defmodule BeamLisp.Env do
     ]
 
     :ets.select_delete(@table, spec)
+    bump_epoch()
 
     Agent.update(__MODULE__, fn s ->
       Map.update(s, :envs, %{}, &Map.delete(&1, env))
@@ -506,10 +507,50 @@ defmodule BeamLisp.Env do
   @doc "Insert `{key, value}` into the CURRENT env (writes never cross envs)."
   def put_key(k, value) do
     :ets.insert(@table, {key(k), value})
+    bump_epoch()
   end
 
   @doc "Delete an old-shape key from the CURRENT env only."
-  def delete_key(k), do: :ets.delete(@table, key(k))
+  def delete_key(k) do
+    :ets.delete(@table, key(k))
+    bump_epoch()
+  end
+
+  # --- fetch memo: epoch + per-process cache -------------------------------
+  #
+  # Every var deref is an :ets.lookup, and an ETS read COPIES the term into
+  # the caller's heap — a `(def big 20k-elem-vector)` referenced in a hot loop
+  # pays ~40 µs per reference (measured: 807 ms for 20k derefs vs 1 ms for a
+  # let-bound local; blueprint FUP-019). Writes are rare and ALL flow through
+  # the four mutation points above, so: one global atomics epoch, bumped by
+  # every mutation, and a per-process memo keyed by {chain, ns, name}.
+  # A deref on the fast path is a pdict read + an atomics read — no copy.
+  #
+  # The epoch is read BEFORE the ETS walk and the result cached under THAT
+  # epoch: a writer racing the walk bumps after its mutation, so a walk that
+  # saw old rows is cached under the old epoch and the next deref refetches —
+  # never the reverse (new rows cached as current forever).
+
+  @epoch_key {__MODULE__, :epoch_ref}
+
+  defp epoch_ref do
+    case :persistent_term.get(@epoch_key, nil) do
+      nil ->
+        ref = :atomics.new(1, signed: false)
+        :persistent_term.put(@epoch_key, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
+
+  defp current_epoch, do: :atomics.get(epoch_ref(), 1)
+
+  defp bump_epoch do
+    :atomics.add(epoch_ref(), 1, 1)
+    :ok
+  end
 
   @doc """
   Chain-walking `:ets.match/2`: the whole-row pattern's key half gets the
@@ -712,6 +753,28 @@ defmodule BeamLisp.Env do
   is an alias in `ns`, it resolves to the alias target instead.
   """
   def fetch(ns, name) do
+    memo_key = {:env_fetch_memo, chain(), ns, name}
+
+    case Process.get(memo_key) do
+      {epoch, result} ->
+        if epoch == current_epoch(), do: result, else: fetch_fresh(ns, name, memo_key)
+
+      nil ->
+        fetch_fresh(ns, name, memo_key)
+    end
+  end
+
+  # Read the epoch BEFORE the walk and cache under THAT epoch: a writer bumps
+  # after its mutation, so a walk that raced it and saw old rows is cached as
+  # stale (next deref refetches) — never new rows cached as current forever.
+  defp fetch_fresh(ns, name, memo_key) do
+    epoch = current_epoch()
+    result = fetch_uncached(ns, name)
+    Process.put(memo_key, {epoch, result})
+    result
+  end
+
+  defp fetch_uncached(ns, name) do
     cands = candidates(ns, name)
 
     Enum.find_value(chain(), :error, fn env ->

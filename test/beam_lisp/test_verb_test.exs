@@ -74,10 +74,22 @@ defmodule BeamLisp.TestVerbTest do
     assert out =~ "2 file(s) passed"
   end
 
-  test "the shared escape still runs the suite", %{dir: dir} do
+  test "the shared escape runs the FILES, not every suite this VM has run", %{dir: dir} do
     write(dir, "test/plain_test.bl", "(ns plain-test)\n(deftest fine (is (= 1 1)))\n")
-    {code, _out} = run(dir, ["test", "--shared"])
-    assert code == 0
+
+    # Two runs in ONE image. `--shared` forks the caller's image, so the second
+    # run's registry holds the files it named and nothing else; before that fork
+    # `run-tests :all` meant "everything this image ever ran", and a second run
+    # answered with the first run's tests — or, inside a warm daemon, with tests
+    # from the request before it.
+    {code, out} = run(dir, ["test", "--shared"])
+    assert code == 0, "the shared run must be green; it said:\n#{out}"
+    {code2, out2} = run(dir, ["test", "--shared"])
+    assert code2 == 0, "the second shared run must be green; it said:\n#{out2}"
+
+    ran = fn text -> Regex.run(~r/Ran (\d+) tests?/, text) |> List.last() end
+    assert ran.(out) == ran.(out2),
+           "the same files must run the same tests; first #{ran.(out)}, then #{ran.(out2)}"
   end
 
   test "the aggregate is available as JSON", %{dir: dir} do

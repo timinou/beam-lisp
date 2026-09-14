@@ -257,19 +257,32 @@ defmodule BeamLisp.TestRT do
     end
   end
 
+  # The shared run: every named file in ONE image, forked from the caller's.
+  #
+  # The fork is not isolation BETWEEN the files — they share it, which is the
+  # point of `--shared`. It is isolation from what the caller's image already
+  # holds: `run-tests :all` runs the IMAGE's registry, so in a warm image (a
+  # daemon request, or a second suite in one VM) every suite that ran before
+  # would run again beside the files just named. `--shared test/a.bl` answering
+  # with another test's failures is the bug that made this clear. Forking makes
+  # `:all` here mean "all the tests these files registered".
   defp run_suite_serial(paths) do
     BeamLisp.init()
-    Compiler.eval_string(test_lib(), Compiler.new_env("core"))
+    base = Env.fork(:global)
 
-    Enum.each(paths, fn path ->
-      Env.in_ns("user")
+    Env.with_env(base, fn ->
+      Compiler.eval_string(test_lib(), Compiler.new_env("core"))
 
-      BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-        Compiler.eval_string(File.read!(path))
+      Enum.each(paths, fn path ->
+        Env.in_ns("user")
+
+        BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
+          Compiler.eval_string(File.read!(path))
+        end)
       end)
-    end)
 
-    RT.invoke(Env.fetch!("core", "run-tests"), [:all])
+      RT.invoke(Env.fetch!("core", "run-tests"), [:all])
+    end)
   end
 
   defp run_suite_async(paths) do

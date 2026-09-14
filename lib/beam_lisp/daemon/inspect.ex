@@ -75,6 +75,14 @@ defmodule BeamLisp.Daemon.Inspect do
   end
 
   defp ports do
+    # The live facts are asked ONCE for the whole render: `Gateway.live/0`
+    # returns the gateway's port and whether port 80 answers for it. Asking per
+    # row would read the runtime dir and probe port 80 once per named port —
+    # round trips that queue behind every other file operation in this VM (a
+    # single dirty-IO scheduler), which is how drawing a page turns into a
+    # client timeout.
+    live = BeamLisp.Daemon.Gateway.live()
+
     Enum.map(Ports.list(), fn p ->
       # The claim carries the names it answers to, so the model reads them
       # rather than deriving anything: one place decides what a port is
@@ -88,7 +96,7 @@ defmodule BeamLisp.Daemon.Inspect do
         root: p.root,
         tree_id: p.tree_id,
         pid: p.pid,
-        url: named_url(hosts, p.port),
+        url: named_url(hosts, p.port, live),
         loopback: "http://127.0.0.1:#{p.port}/",
         claimed_at: p.claimed_at
       }
@@ -96,11 +104,13 @@ defmodule BeamLisp.Daemon.Inspect do
   end
 
   # The address a human keeps, and — when a port has no name — the address
-  # that is always true. The port rule itself lives in `Gateway.url/1`: an
+  # that is always true. The port rule itself lives in `Gateway.url/3`: an
   # address that omits the port nothing is listening on looks clickable and
   # answers `connection refused`.
-  defp named_url([host | _], _port), do: BeamLisp.Daemon.Gateway.url(host)
-  defp named_url([], port), do: "http://127.0.0.1:#{port}/"
+  defp named_url([host | _], _port, %{port: port, fronted: fronted}),
+    do: BeamLisp.Daemon.Gateway.url(host, port, fronted)
+
+  defp named_url([], port, _live), do: "http://127.0.0.1:#{port}/"
 
   defp tasks(root) do
     project = project(root)

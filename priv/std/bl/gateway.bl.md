@@ -10,7 +10,8 @@ bl gateway            is it up, and which names does it answer?
 bl gateway start      start it (the systemd unit when installed, detached otherwise)
 bl gateway stop       stop the running one
 bl gateway run        run it in the foreground — what the unit execs
-bl install gateway    the systemd unit, and the one sysctl that frees port 80
+bl install gateway    the systemd unit, so it starts at login
+bl install redirect   make port 80 answer for it — the portless address, one root step
 ```
 
 The gateway itself is `BeamLisp.Daemon.Gateway`: it reads `Host:`, looks the
@@ -79,9 +80,17 @@ registry `bl ports` prints, seen from the other end.
       (println "  bl install gateway     keep it running across logins")
       1)
     (let [ep (endpoint)
-          rs (routes)]
-      (println (str "bl gateway on 127.0.0.1:" (port-of)
-                    " and [::1]:" (port-of) "   (pid " (:pid ep) ")"))
+          rs (routes)
+          p (port-of)]
+      (println (str "bl gateway on 127.0.0.1:" p
+                    " and [::1]:" p "   (pid " (:pid ep) ")"))
+      ;; The one question a developer has about a name gateway: can I leave the
+      ;; port out? Answered by PROBING port 80 — a redirect rewrites the packet
+      ;; and not our sockets, so only a probe can tell — and paired with the
+      ;; verb that changes it.
+      (println (str "  port 80: " (if (BeamLisp.Daemon.Gateway/fronted_on? p)
+                                     "answered — names need no port in the URL"
+                                     "not answered — bl install redirect")))
       (if (empty? rs)
         (println "  no names registered yet — a project registers them with :ports in env.bl")
         (u/each

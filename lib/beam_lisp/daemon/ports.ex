@@ -12,16 +12,29 @@ defmodule BeamLisp.Daemon.Ports do
 
   ## Truth is a file, not a table
 
-  Each claim is one file under the runtime dir — `<tree_id>.<name>`, a term
-  holding the name, the port, the owning tree, the OS pid and the time. The
-  obvious alternative (a GenServer per daemon, mirroring `WatchRegistry`) cannot
-  answer the question that matters: the collision this exists to catch is
+  Each claim is one file under the runtime dir, a term holding the name, the
+  port, whether the port was chosen, the owning tree, the OS pid and the time.
+  The obvious alternative (a GenServer per daemon, mirroring `WatchRegistry`)
+  cannot answer the question that matters: the collision this exists to catch is
   BETWEEN daemons, and one VM's table cannot see another's. Files can, and they
   survive a crash, which is exactly when a stale claim needs cleaning.
 
   A claim whose process is gone is stale and is swept on sight; a claim whose
   port is held by some process nobody claimed is reported as such, never
   silently taken over.
+
+  ## The key says what kind of claim it is
+
+  A PINNED port is a promise about a NUMBER — `:ports {:web 4000}` means this
+  project serves on 4000 — and only one tree on the machine can keep that
+  promise, so the name alone is the key and a second tree is refused by name.
+
+  An EPHEMERAL port is nobody's promise: the OS chose the number, so the claim
+  is a SESSION's own address and is keyed by name AND tree. Keying it by name
+  alone made a second tree's dashboard fail to start because an unrelated tree
+  happened to be running one — a collision the user could neither see nor fix,
+  and never a real one: two ephemeral claims take different numbers by
+  construction.
 
   ## A claim carries its NAMES
 
@@ -50,7 +63,7 @@ defmodule BeamLisp.Daemon.Ports do
     hosts = normalize_hosts(Keyword.get(opts, :hosts))
 
     with {:ok, dir} <- ports_dir() do
-      case held_here(dir, name, pid) do
+      case held_here(dir, name, want, root, pid) do
         # this session already holds the NAME. Asking for 0 means "any port",
         # and it already has one — re-probing would move a live listener.
         {:ok, existing} when want == 0 -> {:ok, existing}
@@ -85,8 +98,8 @@ defmodule BeamLisp.Daemon.Ports do
   defp normalize_pid(pid) when is_list(pid), do: List.to_integer(pid)
   defp normalize_pid(other), do: other
 
-  defp held_here(dir, name, pid) do
-    case read_claim(Path.join(dir, file_name(name))) do
+  defp held_here(dir, name, want, root, pid) do
+    case read_claim(Path.join(dir, file_name(name, want, root))) do
       {:ok, %{pid: ^pid} = claim} -> {:ok, claim.port}
       {:ok, claim} -> if alive?(claim), do: {:held, claim}, else: :free
       _ -> :free
@@ -99,6 +112,7 @@ defmodule BeamLisp.Daemon.Ports do
         claim = %{
           name: to_string(name),
           port: port,
+          pinned: want != 0,
           hosts: hosts,
           tree_id: Paths.tree_id(root),
           root: root,
@@ -106,7 +120,7 @@ defmodule BeamLisp.Daemon.Ports do
           claimed_at: System.system_time(:second)
         }
 
-        with :ok <- write_claim(dir, claim), do: {:ok, port}
+        with :ok <- write_claim(dir, file_name(name, want, root), claim), do: {:ok, port}
 
       {:error, :eaddrinuse} ->
         {:error, {:port_busy, want, holder(want)}}
@@ -116,20 +130,33 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  @doc "Give up `name`. Idempotent: releasing a name nobody holds is `:ok`."
-  def release(name) do
+  @doc """
+  Give up `name` for this session. Idempotent: releasing a name nobody holds
+  is `:ok`.
+
+  Only claims THIS tree made are dropped — the session's own ephemeral key and
+  the pinned key when this session holds it. Another tree can hold the pinned
+  key, and one session ending must never erase another session's address.
+  """
+  def release(name, opts \\ []) do
+    root = Keyword.get(opts, :root, File.cwd!())
+
     with {:ok, dir} <- ports_dir() do
-      File.rm(Path.join(dir, file_name(name)))
+      for key <- [file_name(name, 0, root), file_name(name, 1, root)] do
+        case read_claim(Path.join(dir, key)) do
+          {:ok, %{root: ^root}} -> File.rm(Path.join(dir, key))
+          _ -> :ok
+        end
+      end
     end
 
     :ok
   end
 
-  @doc """
-  Every live claim, oldest name first, as maps `%{name, port, hosts, tree_id,
-  root, pid, claimed_at}`. Stale claims (owner gone) are swept as they are met,
-  so a crashed daemon leaves nothing behind for the next one to trip over.
-  """
+  @doc "Every live claim, oldest name first, as maps `%{name, port, pinned, hosts,
+  tree_id, root, pid, claimed_at}`. Stale claims (owner gone) are swept as they
+  are met, so a crashed daemon leaves nothing behind for the next one to trip
+  over."
   def list do
     case ports_dir() do
       {:ok, dir} ->
@@ -143,14 +170,26 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  @doc "The port `name` is bound to, or nil."
-  def port_of(name) do
+  @doc """
+  The port `name` is held on for `:root`'s session, or nil.
+
+  The session's OWN claim wins. An ephemeral name belongs to the tree that
+  claimed it — nobody chose that number — so a second tree asking must learn ITS
+  port, never the neighbour's. Only when the session holds nothing does the
+  machine-wide PINNED claim answer, which is what makes a name somebody chose
+  shared truth rather than a coincidence.
+  """
+  def port_of(name, opts \\ []) do
+    root = Keyword.get(opts, :root, File.cwd!())
+
     case ports_dir() do
       {:ok, dir} ->
-        case read_claim(Path.join(dir, file_name(name))) do
-          {:ok, claim} -> if alive?(claim), do: claim.port, else: nil
-          _ -> nil
-        end
+        Enum.find_value([file_name(name, 0, root), file_name(name, 1, root)], fn key ->
+          case read_claim(Path.join(dir, key)) do
+            {:ok, claim} -> if alive?(claim), do: claim.port, else: nil
+            _ -> nil
+          end
+        end)
 
       _ ->
         nil
@@ -191,10 +230,9 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  defp file_name(name) do
-    name
-    |> to_string()
-    |> String.replace(~r/[^A-Za-z0-9_-]/, "_")
+  defp file_name(name, want, root) do
+    name = name |> to_string() |> String.replace(~r/[^A-Za-z0-9_-]/, "_")
+    if want == 0, do: "#{name}@#{Paths.tree_id(root)}", else: name
   end
 
   # Bind the wanted port and let it go again. For `0` this is how an ephemeral
@@ -235,8 +273,8 @@ defmodule BeamLisp.Daemon.Ports do
     end
   end
 
-  defp write_claim(dir, claim) do
-    path = Path.join(dir, file_name(claim.name))
+  defp write_claim(dir, key, claim) do
+    path = Path.join(dir, key)
     tmp = path <> ".tmp.#{:erlang.unique_integer([:positive])}"
 
     with :ok <- File.write(tmp, :erlang.term_to_binary(claim)) do

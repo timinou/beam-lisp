@@ -99,7 +99,7 @@ DNS maps a name to an ADDRESS. It never maps one to a port, and the port is the
 thing we are trying not to think about. So one process reads the name off each
 request and hands it to the port that registered it.
 
-That process is the gateway: `BeamLisp.Daemon.Gateway`, one per USER, holding
+That process is the gateway: `BeamLisp.Daemon.Gateway`, one per USER, preferring
 port 80 — the one HTTP port a URL may leave out. It reads only the request head,
 for the `Host:` line; everything after it is spliced straight through. That is
 what makes a WebSocket, a Server-Sent-Event stream and a chunked upload work
@@ -133,17 +133,34 @@ answers to, because the process holding the port is the one that knows its name:
     bl gateway start      start it now (the unit when installed, else detached)
     bl gateway stop       stop it
     bl gateway run        run it in the foreground — what the unit execs
-    bl install gateway    a systemd user unit, plus the one root step for port 80
+    bl install gateway    a systemd user unit, so it starts at login
+    bl install redirect   make port 80 answer for it (one root step, loopback only)
 
-Port 80 is the only privileged piece. On a stock Linux a user cannot bind it;
-one sysctl makes low ports unprivileged, and then it is the user's:
+Port 80 is the only piece that needs root, and there are two ways to get it.
+
+**The redirect** is the smaller ask, and the one to reach for first. The
+gateway keeps standing on 7777; one nftables table sends packets to
+`127.0.0.0/8:80` and `[::1]:80` to it. Loopback only, so a LAN neighbour and a
+service on a real address are untouched; no machine-wide policy changes; and
+`bl install redirect --remove` takes it back out. The install is a script —
+nftables plus a system unit that reapplies it at boot — so the verb runs it when
+it can and otherwise prints exactly what to paste.
+
+**The sysctl** hands port 80 to the gateway itself:
 
     printf 'net.ipv4.ip_unprivileged_port_start=80\n' | sudo tee /etc/sysctl.d/60-beam-lisp-gateway.conf
     sudo sysctl --system
 
-Without it the gateway binds 7777 and says so, names still work with the port
-in the URL, and nothing else changes. A port that was PINNED is never silently
-moved — a pinned port that is taken is an error naming the owner.
+One line, survives a reboot; the cost is that from then on ANY local process may
+bind 80–1023. Either way the gateway ends up reachable on 80, which is what lets
+a URL leave the port out.
+
+Which way is in force is never configured and never guessed. The gateway PROBES
+port 80 (`fronted_on?/1`) and asks whether a beam-lisp gateway answers there, so
+the address it prints is the address that works:
+`http://web.pulse.test:7777/` before, `http://web.pulse.test/` after — and the
+port comes back on its own if the redirect is removed. A port that was PINNED is
+never silently moved: a pinned port that is taken is an error naming the owner.
 
 ## What is not here
 

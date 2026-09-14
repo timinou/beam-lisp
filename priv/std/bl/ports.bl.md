@@ -2,7 +2,7 @@
 
 A project declares the ports it serves on. `env.bl` names them:
 
-```beam-lisp
+```beam-lisp silent
 {:name "pulse"
  :ports {:web 4000 :metrics {:port 0} :ui 7700}}
 ```
@@ -14,12 +14,19 @@ the runtime dir (see `BeamLisp.Daemon.Ports`), which is what lets one tree's
 session see what ANOTHER tree's session holds — the collision worth catching is
 between trees, and an in-VM table cannot see across.
 
+Who that collision is between depends on what kind of claim it is. A CHOSEN
+number is a promise about a port, and the machine keeps that promise once: two
+checkouts cannot both serve `:web 4000`. An EPHEMERAL port is nobody's promise —
+the OS picked the number — so it belongs to the session that asked, and every
+checkout can run its own `:ui` at the same time. Claim files are keyed to say
+which: a chosen name stands alone, an ephemeral one carries its tree.
+
 Every claim also carries the HOSTS its port answers to — `web.pulse.test` and
 its `.localhost` twin (see `BeamLisp.Daemon.Names`). That is what makes a port
 something a developer never reads: the gateway routes a name to the number, and
 these verbs print the name.
 
-```beam-lisp
+```beam-lisp silent
 (ns bl.ports
   (:require [bl.util :as u]))
 ```
@@ -31,9 +38,10 @@ program needs: the number behind a name. Both read whatever is LIVE — a claim
 whose owner is gone is swept as it is met, so a crashed session never blocks the
 next one.
 
-```beam-lisp
+```beam-lisp silent
 (defn list-ports
-  "Every live claim: a list of maps with :name :port :hosts :root :tree_id :pid."
+  "Every live claim: a list of maps with :name :port :pinned :hosts :root
+   :tree_id :pid."
   []
   (to-list (BeamLisp.Daemon.Ports/list)))
 
@@ -46,24 +54,51 @@ next one.
 
 (defn claim-for
   "The live claim `name` refers to, or nil. The name is the one the project
-   declared: `web`, `ui`."
-  [name]
-  (let [n (name-str name)]
-    (some (fn [c] (when (= n (:name c)) c)) (list-ports))))
+   declared: `web`, `ui`.
 
-(defn url-for
-  "The address `name` answers at — its first host, through the gateway, so a
-   human opens the app by name. The PORT appears only when it has to: on 80 the
-   name stands alone; standing on the fallback it does not. A printed address
-   that omits the port nothing is listening on looks clickable and answers
-   `connection refused`. nil when nothing holds the name, or when its claim
-   registered no host (a port claimed without a project to name it)."
+   A PINNED name is machine-wide — it is a promise about a number — so there is
+   one claim to find. An EPHEMERAL name belongs to the session that asked for
+   it, so two trees may hold `ui` at once and the answer is THIS tree's claim:
+   printed addresses must describe the session you are in, not the neighbour's."
   [name]
+  (let [n (name-str name)
+        here (second (File/cwd))
+        live (filter (fn [c] (= n (:name c))) (list-ports))]
+    (or (some (fn [c] (when (= here (:root c)) c)) live)
+        (first live))))
+
+(defn live
+  "The two facts every printed address depends on, resolved ONCE: the gateway's
+   port, and whether port 80 answers for it. `url-for` is then arithmetic on
+   them, so printing a table of N addresses costs one lookup and one probe
+   instead of N of each."
+  []
+  (let [p (BeamLisp.Daemon.Gateway/port)]
+    {:port p :fronted (BeamLisp.Daemon.Gateway/fronted_on? p)}))
+
+(defn url-for*
+  "`url-for` with the live facts already in hand — the same rule, for a caller
+   printing many addresses."
+  [name facts]
   (let [c (claim-for name)]
     (if (nil? c)
       nil
       (let [hs (:hosts c)]
-        (if (empty? hs) nil (BeamLisp.Daemon.Gateway/url (first hs)))))))
+        (if (empty? hs)
+          nil
+          (BeamLisp.Daemon.Gateway/url (first hs) (:port facts) (:fronted facts)))))))
+
+(defn url-for
+  "The address `name` answers at — its first host, through the gateway, so a
+   human opens the app by name. The PORT appears only when it has to: when port
+  80 answers for the gateway the name stands alone, and otherwise the port is
+   printed — an address that omits the port nothing is listening on looks
+   clickable and answers `connection refused`. nil when nothing holds the name,
+   or when its claim registered no host (a port claimed without a project to
+   name it). Resolves the live facts for ONE address; a caller printing many
+   should resolve once and use `url-for*`."
+  [name]
+  (url-for* name (live)))
 
 (defn- loopback-url
   "The same listener with no name in it. Never depends on the gateway — this is
@@ -78,7 +113,7 @@ next one.
 until someone asks for it. Each row shows the name first, because that is the
 address a human keeps; the number is the implementation detail beside it.
 
-```beam-lisp
+```beam-lisp silent
 (defn- pad [s] (String/pad_trailing (str s) 10))
 
 (defn run
@@ -87,11 +122,11 @@ address a human keeps; the number is the implementation detail beside it.
   (let [ps (list-ports)]
     (if (empty? ps)
       (println "bl ports: no session has claimed a port")
-      (do
+      (let [facts (live)]
         (u/each
           (fn [p]
             (println (str "  " (pad (:name p))
-                          (or (url-for (:name p)) (loopback-url p))
+                          (or (url-for* (:name p) facts) (loopback-url p))
                           "  → " (:port p)
                           "  " (Path/basename (:root p)) " (pid " (:pid p) ")")))
           (sort-by (fn [p] (:name p)) ps))
@@ -109,7 +144,7 @@ address a human keeps; the number is the implementation detail beside it.
 "where is this thing", so the terminal and the dashboard cannot disagree about
 it.
 
-```beam-lisp
+```beam-lisp silent
 (defn open-url
   "Print `name`'s address — the name, and the loopback address it routes to —
    and hand the first one to the desktop opener with `--open`. Returns the exit

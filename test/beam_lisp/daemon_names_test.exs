@@ -16,6 +16,13 @@ defmodule BeamLisp.DaemonNamesTest do
 
   alias BeamLisp.Daemon.{Gateway, Names, Paths, Ports}
 
+  # Every claim in this file is made for one root. A claim is keyed by name AND
+  # tree, so releasing with a different root removes nothing and leaves the
+  # claim answering — a whole class of false test failures, closed by keeping
+  # the root in one place. (The gateway test below caught it: a name that was
+  # released still answered.)
+  @claim_root "/tmp/names"
+
   # ── the derivation ────────────────────────────────────────────────────
 
   test "a project names its ports, and the bare name is the session's own" do
@@ -86,8 +93,8 @@ defmodule BeamLisp.DaemonNamesTest do
 
   test "a claim carries its hosts, lowercased and deduped" do
     name = unique()
-    {:ok, port} = Ports.claim(name, 0, root: "/tmp/names", hosts: ["Web.Pulse.Test", "web.pulse.test", "web.pulse.localhost"])
-    on_exit(fn -> Ports.release(name) end)
+    {:ok, port} = Ports.claim(name, 0, root: @claim_root, hosts: ["Web.Pulse.Test", "web.pulse.test", "web.pulse.localhost"])
+    on_exit(fn -> Ports.release(name, root: @claim_root) end)
 
     claim = Ports.holder(port)
     assert claim.hosts == ["web.pulse.test", "web.pulse.localhost"]
@@ -102,8 +109,9 @@ defmodule BeamLisp.DaemonNamesTest do
     {:ok, port} = Ports.claim(name, 0, root: "/tmp/old")
     {:ok, dir} = ports_dir()
 
-    # the shape an older build wrote: no :hosts key at all
-    File.write!(Path.join(dir, name), :erlang.term_to_binary(%{
+    # The shape an older build wrote, in the file that build would have written
+    # it to (a claim is keyed by name AND tree) — and no `:hosts` key at all.
+    File.write!(Path.join(dir, "#{name}@#{Paths.tree_id("/tmp/old")}"), :erlang.term_to_binary(%{
       name: name,
       port: port,
       tree_id: "old",
@@ -116,7 +124,7 @@ defmodule BeamLisp.DaemonNamesTest do
     assert claim.hosts == []
     refute Enum.any?(Gateway.routes(), fn c -> c.name == name end)
 
-    Ports.release(name)
+    Ports.release(name, root: "/tmp/old")
   end
 
   # ── the gateway ───────────────────────────────────────────────────────
@@ -146,7 +154,7 @@ defmodule BeamLisp.DaemonNamesTest do
     assert recv_until(sock, "PONG") =~ "PONG"
 
     :gen_tcp.close(sock)
-    Ports.release(name)
+    Ports.release(name, root: @claim_root)
     stop_gateway(gw)
   end
 
@@ -160,7 +168,7 @@ defmodule BeamLisp.DaemonNamesTest do
     assert recv_until(sock, "hello") =~ "200 OK"
 
     :gen_tcp.close(sock)
-    Ports.release(name)
+    Ports.release(name, root: @claim_root)
     stop_gateway(gw)
   end
 
@@ -186,7 +194,7 @@ defmodule BeamLisp.DaemonNamesTest do
     assert index =~ "listed.test"
     :gen_tcp.close(sock2)
 
-    Ports.release(name)
+    Ports.release(name, root: @claim_root)
     stop_gateway(gw)
   end
 
@@ -200,7 +208,7 @@ defmodule BeamLisp.DaemonNamesTest do
     assert recv_until(sock, "hello") =~ "200 OK"
     :gen_tcp.close(sock)
 
-    Ports.release(name)
+    Ports.release(name, root: @claim_root)
 
     sock2 = connect(Gateway.port())
     :ok = :gen_tcp.send(sock2, "GET / HTTP/1.1\r\nHost: live.test\r\n\r\n")
@@ -229,20 +237,59 @@ defmodule BeamLisp.DaemonNamesTest do
     assert body =~ to_string(backend_port)
     :gen_tcp.close(sock2)
 
-    Ports.release(name)
+    Ports.release(name, root: @claim_root)
     stop_gateway(gw)
   end
 
   test "an address carries the port only when it has to" do
-    # On 80 (the one HTTP port a URL may leave out) the name stands alone; on
-    # anything else the port is printed. An address that omits the port nothing
-    # is listening on looks clickable and answers `connection refused`.
-    assert Gateway.url("web.pulse.test", 80) == "http://web.pulse.test/"
-    assert Gateway.url("web.pulse.test", 7777) == "http://web.pulse.test:7777/"
+    # The pure rule: three facts decide what a developer types. On 80 — the one
+    # HTTP port a URL may leave out — the name stands alone; anywhere else the
+    # port is printed, because an address that omits the port nothing is
+    # listening on looks clickable and answers `connection refused`.
+    assert Gateway.url("web.pulse.test", 80, false) == "http://web.pulse.test/"
+    assert Gateway.url("web.pulse.test", 7777, false) == "http://web.pulse.test:7777/"
 
-    # `url/1` is `url/2` with the LIVE port — in-VM first, else the machine's
-    # gateway, else nothing (and then the bare name is what a human types).
-    assert Gateway.url("web.pulse.test") == Gateway.url("web.pulse.test", Gateway.port())
+    # …and when port 80 IS answered — by this gateway, or by a loopback
+    # redirect in front of it — the port drops out although the socket is
+    # elsewhere. That is the whole point of `bl install redirect`.
+    assert Gateway.url("web.pulse.test", 7777, true) == "http://web.pulse.test/"
+    assert Gateway.url("web.pulse.test", nil, true) == "http://web.pulse.test/"
+
+    # `url/1,2` answer that live question (a probe of port 80). What they
+    # answer is asserted in the probe test below, against real sockets — a
+    # fixture cannot stand in for evidence, and re-asking the machine here would
+    # only make this test depend on whatever it is running.
+    assert Gateway.url("web.pulse.test", nil, false) == "http://web.pulse.test/"
+  end
+
+  test "the port-80 probe answers for a gateway, and only for a gateway" do
+    # `fronted_on?/1` asks a question about EVIDENCE, so the test answers it
+    # with real sockets: a server that identifies itself the way the gateway
+    # does, one that does not, and a port where nothing is listening at all.
+    ours =
+      start_socket_server(fn ->
+        "HTTP/1.1 404 Not Found\r\nx-bl-gateway: beam-lisp\r\ncontent-length: 0\r\n\r\n"
+      end)
+
+    assert Gateway.ours_on?(ours)
+
+    theirs =
+      start_socket_server(fn ->
+        "HTTP/1.1 200 OK\r\nserver: nginx\r\ncontent-length: 0\r\n\r\n"
+      end)
+
+    refute Gateway.ours_on?(theirs)
+    refute Gateway.ours_on?(free_port()), "a refused connection is not us"
+
+    # the classifier behind the probe
+    assert Gateway.gateway_answer?("HTTP/1.1 200 OK\r\nX-BL-Gateway: beam-lisp\r\n\r\n")
+    refute Gateway.gateway_answer?("HTTP/1.1 200 OK\r\nx-powered-by: beam-lisp\r\n\r\n")
+    refute Gateway.gateway_answer?("")
+    refute Gateway.gateway_answer?(nil)
+
+    # port 80 itself is a fact, not a probe: holding it IS being answered there
+    assert Gateway.fronted_on?(80)
+    refute Gateway.fronted_on?(nil)
   end
 
   test "an ephemeral gateway answers in-VM but publishes no endpoint" do
@@ -282,15 +329,20 @@ defmodule BeamLisp.DaemonNamesTest do
   end
 
 
-  defp unique, do: "t_names_#{:erlang.unique_integer([:positive])}"
+  # Names must be unique across VMs, not just within one: the port registry and
+  # the TLDs it serves are per USER, so a second checkout running its tests at
+  # the same moment draws from the same `unique_integer` sequence and lands on
+  # the same name. The OS pid separates the VMs; the integer separates the
+  # tests inside one.
+  defp unique, do: "t_names_#{:os.getpid()}_#{:erlang.unique_integer([:positive])}"
 
   # A claim on an EPHEMERAL port, then a backend bound exactly where the claim
   # points. That is the real order: an app asks for a named port and binds what
   # it was given, so the registry never has to take a port away from anyone.
   defp claim_named(host) do
     name = unique()
-    {:ok, port} = Ports.claim(name, 0, root: "/tmp/names", hosts: [host])
-    on_exit(fn -> Ports.release(name) end)
+    {:ok, port} = Ports.claim(name, 0, root: @claim_root, hosts: [host])
+    on_exit(fn -> Ports.release(name, root: @claim_root) end)
     {name, port}
   end
 
@@ -386,6 +438,38 @@ defmodule BeamLisp.DaemonNamesTest do
         {:error, _} -> acc
       end
     end
+  end
+
+  # A one-shot server that answers with whatever `body` returns, on an
+  # ephemeral port. The probe reads a response HEAD, so a test can be the thing
+  # on the other end — the only way to test a question about evidence.
+  defp start_socket_server(body) do
+    opts = [:binary, {:packet, :raw}, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}]
+    {:ok, lsock} = :gen_tcp.listen(0, opts)
+    {:ok, {_ip, port}} = :inet.sockname(lsock)
+
+    spawn_link(fn ->
+      case :gen_tcp.accept(lsock, 5_000) do
+        {:ok, sock} ->
+          {:ok, _request} = :gen_tcp.recv(sock, 0, 5_000)
+          :gen_tcp.send(sock, body.())
+          :gen_tcp.close(sock)
+
+        _ ->
+          :ok
+      end
+    end)
+
+    port
+  end
+
+  # A port nothing is listening on: bound, then released. The probe must answer
+  # `false` on the refusal, not raise and not hang.
+  defp free_port do
+    {:ok, sock} = :gen_tcp.listen(0, [{:ip, {127, 0, 0, 1}}, :binary])
+    {:ok, {_ip, port}} = :inet.sockname(sock)
+    :gen_tcp.close(sock)
+    port
   end
 
   defp ports_dir do

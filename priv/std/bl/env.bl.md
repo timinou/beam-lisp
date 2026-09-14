@@ -23,7 +23,7 @@ full path return the same project value.
 as data. A broken `env.bl` degrades what the tree can do — its tasks, its ports
 — and never stops the command that read it, let alone the daemon hosting it.
 
-```beam-lisp
+```beam-lisp silent
 (ns bl.env
   (:require [bl.util :as u]))
 ```
@@ -34,7 +34,7 @@ The walk starts at the command's own directory and climbs until it finds an
 `env.bl` or runs out of directories. One project file per tree, found the same
 way from anywhere inside it.
 
-```beam-lisp
+```beam-lisp silent
 (def file-name "env.bl")
 
 (defn- parent [d] (Path/dirname d))
@@ -67,7 +67,7 @@ Both answer with a tagged result, `{:ok v}` or `{:error msg}`, so a caller
 never has to guess whether a map it received is the project or a report about
 one.
 
-```beam-lisp
+```beam-lisp silent
 (defn literal
   "`env.bl` as DATA: its last top-level form, parsed and not evaluated. Returns
    `{:ok map}` when that form is the project map (write the file this way),
@@ -125,7 +125,7 @@ Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
-```beam-lisp
+```beam-lisp silent
 (def known-keys [:name :instance :paths :tasks :ports :env :doc])
 
 (defn- key-name
@@ -210,7 +210,7 @@ problems reports all three in one pass.
 a list, `:paths` is a list, `:tasks` and `:ports` are maps — always the right
 shape, whatever the file said.
 
-```beam-lisp
+```beam-lisp silent
 (defn normalize
   "The project value as the runtime reads it: `:paths` absolute against `root`,
    tasks and ports keyed by name, `:errors` — every shape problem found, as
@@ -252,7 +252,7 @@ shape, whatever the file said.
 test. It finds the file, reads it, and returns a project value whether or not
 the tree has one at all.
 
-```beam-lisp
+```beam-lisp silent
 (defn project
   "The project value for the tree containing `cwd`. Always a map: `:path` is the
    env.bl (or nil), `:root` the directory relative paths resolve against, and

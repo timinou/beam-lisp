@@ -31,22 +31,26 @@ bl daemon up for /home/user/code/undefine/beam-lisp
 ```
 
 The port is EPHEMERAL unless the project pins it: two trees on one machine must
-never fight over a number nobody chose. `:ports {:ui 7700}` in `env.bl` says you
-want that one specifically, and if it is taken the session says so — naming
-whoever holds it — instead of quietly serving somewhere else:
+never fight over a number nobody chose. So every checkout gets its own session
+page, at the same time, without anyone arranging ports. `:ports {:ui 7700}` in
+`env.bl` says you want that one specifically — a promise about a number, which
+the whole machine keeps once — and if it is taken the session says so, naming
+whoever holds it, instead of quietly serving somewhere else:
 
 ```beam-lisp id=ports-list
 ;; A name nobody else uses, so the answer does not depend on which sessions are
 ;; running. What this proves is the registry's contract: a claim shows up, and
-;; release takes it away.
+;; release takes it away. Claim and release name the same tree because that is
+;; what the claim belongs to.
 (let [name (str "doc-list-" (erlang/unique_integer (list :positive)))
+      root "/tmp/doc-tree"
       listed? (fn [] (not (nil? (some (fn [c] (= name (:name c))) (ports/list-ports)))))]
   (try
-    (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root "/tmp/doc-tree"]))
+    (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root root]))
     (let [claimed (listed?)]
-      (BeamLisp.Daemon.Ports/release name)
+      (BeamLisp.Daemon.Ports/release name (u/kw [:root root]))
       (list claimed (listed?)))
-    (finally (BeamLisp.Daemon.Ports/release name))))
+    (finally (BeamLisp.Daemon.Ports/release name (u/kw [:root root])))))
 ```
 
 ```bl-result ports-list
@@ -56,20 +60,29 @@ whoever holds it — instead of quietly serving somewhere else:
 ## What a port costs when it is taken
 
 A port claim is a file, and the file names its owner. That is what makes the
-refusal useful:
+refusal useful — and it is the CHOSEN number that is refused, because a chosen
+number is a promise about a port: two trees cannot both keep it. (An ephemeral
+name is the other way round: nobody chose that number, so each session gets one
+and nobody is refused.)
 
 ```beam-lisp id=claim-and-refuse
-(let [name (str "doc-" (erlang/unique_integer (list :positive)))]
+(let [name (str "doc-" (erlang/unique_integer (list :positive)))
+      ;; a port the OS just handed out and nobody bound, so it is provably free
+      [_t free] (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root "/tmp/doc-tree"]))
+      pinned (str name "-pin")]
   (try
-    (let [[t1 p1] (BeamLisp.Daemon.Ports/claim name 0 (u/kw [:root "/tmp/doc-tree"]))
-          [t2 e] (BeamLisp.Daemon.Ports/claim name 0
+    (let [[t1 p1] (BeamLisp.Daemon.Ports/claim pinned free (u/kw [:root "/tmp/doc-tree"]))
+          [t2 e] (BeamLisp.Daemon.Ports/claim pinned free
                    (u/kw [:root "/tmp/other-tree"] [:pid 4194303]))]
-      (list t1 t2 (:root (erlang/element 2 e))))
-    (finally (BeamLisp.Daemon.Ports/release name))))
+      (list t1 (= free p1) t2 (:root (erlang/element 2 e))))
+    (finally
+      (BeamLisp.Daemon.Ports/release name (u/kw [:root "/tmp/doc-tree"]))
+      (BeamLisp.Daemon.Ports/release pinned (u/kw [:root "/tmp/doc-tree"]))
+      (BeamLisp.Daemon.Ports/release pinned (u/kw [:root "/tmp/other-tree"])))))
 ```
 
 ```bl-result claim-and-refuse
-(:ok :error "/tmp/doc-tree")
+(:ok true :error "/tmp/doc-tree")
 ```
 
 The second claim is refused with `{:taken, claim}`, and the claim carries the

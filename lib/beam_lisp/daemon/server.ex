@@ -149,7 +149,7 @@ defmodule BeamLisp.Daemon.Server do
   def terminate(_reason, state) do
     :counters.put(state.stop_flag, 1, 1)
     _ = :gen_tcp.close(state.lsock)
-    Ports.release(:ui)
+    Ports.release(:ui, root: state.root)
     ep = state.endpoints
     for f <- [ep.sock, ep.token, ep.pid, ep.meta, ep.lock], do: File.rm(f)
     :ok
