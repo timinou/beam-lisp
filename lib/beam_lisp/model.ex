@@ -127,15 +127,34 @@ defmodule BeamLisp.Model do
   def searched_dirs(name), do: Enum.uniq([bundled_dir(name), ambient_dir(name)])
 
   @doc """
-  Whether `dir` holds a COMPLETE fetched copy: the `DIGEST` file the fetch task
-  writes LAST, after every weight has verified against its pinned sha256.
+  The files the reader opens, in the order the fetch writes them: what makes a
+  directory a model at all.
 
-  That file and not `model.safetensors`, on purpose: a partial download must not
-  look like a model, and weights with no digest have no provenance — the digest
-  is what identifies the vector space every stored embedding was made in.
+  Here and not in the fetch task or in `code.embed` because it is the SHAPE of a
+  model, which is this module's business: the fetch task owns the pin (these
+  names → sha256), the reader owns what to do with the bytes, and "is this copy
+  complete?" must be the same question in all three. It was three lists once,
+  and a `DIGEST` with no weights beside it read as a complete model.
+  """
+  @spec files() :: [String.t()]
+  def files, do: ~w(config.json tokenizer.json model.safetensors)
+
+  @doc """
+  Whether `dir` holds a COMPLETE fetched copy: the `DIGEST` file the fetch task
+  writes LAST, after every weight has verified against its pinned sha256, AND
+  the files that digest stands for.
+
+  The digest is the identity — it is what every stored embedding records, so a
+  copy without one has no provenance — and the files are the substance: a
+  `DIGEST` alone is not a model, it is a claim about weights that are not there.
+  Both halves are required, because a directory that passes this and cannot be
+  read is worse than an absent one: the caller stops looking, and the failure
+  surfaces later as a parse error instead of as "not on disk".
   """
   @spec fetched?(String.t()) :: boolean()
-  def fetched?(dir), do: File.regular?(Path.join(dir, "DIGEST"))
+  def fetched?(dir) do
+    File.regular?(Path.join(dir, "DIGEST")) and Enum.all?(files(), &File.regular?(Path.join(dir, &1)))
+  end
 
   @doc "The env var that overrides `root/0`."
   @spec dir_env() :: String.t()

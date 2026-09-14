@@ -92,9 +92,11 @@ the bytes are identical everywhere on the box, so they are cached rather than
 copied per checkout — the z3 precedent buys nothing here.
 
 What makes a copy identifiable is the `DIGEST` file the fetch writes LAST, after
-every weight has verified against its pinned sha256: a partial download must not
-look like a model, and weights with no digest have no provenance — the digest
-is what identifies the vector space every stored embedding was made in.
+every weight has verified against its pinned sha256 — and a copy counts as
+complete only when that digest AND the files it stands for are present
+(`BeamLisp.Model.fetched?/1`, the one question the reader, the fetch and the
+build all ask): a digest alone is a claim about weights that are not there, and
+a partial download must not look like a model.
 
 Nothing at query time touches the network. Only a fetch does, and after one
 fetch (or one build) search runs with the cable unplugged.

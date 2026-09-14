@@ -131,15 +131,20 @@ defmodule Mix.Tasks.Bl.Build do
     Mix.shell().info("bl.build: run it with `#{out} version`; start a warm loop with `#{out} daemon start`")
   end
 
-  # Refuse to pack a drop whose PAYLOAD has no weights (see the call site for
-  # why this is a check and not a hope). The marker is the fetch's DIGEST, the
-  # same completion record `BeamLisp.Model.fetched?/1` reads, so "the release
-  # carries a model" means the same thing here as it does at query time.
+  # Refuse to pack a drop whose PAYLOAD has no usable weights (see the call site
+  # for why this is a check and not a hope). "Usable" is the reader's own
+  # predicate — `BeamLisp.Model.fetched?/1` — so the build and the query agree
+  # about what "the release carries a model" means.
   defp ensure_embedded!(release_dir) do
-    case Path.wildcard(Path.join([release_dir, "lib", "beam_lisp-*", "priv", "embed", "**", "DIGEST"])) do
-      [digest | _] ->
-        dir = Path.dirname(digest)
+    # The SAME predicate the reader uses (`Model.fetched?/1`), not a wildcard for
+    # the digest alone: a payload carrying a digest with no weights beside it is
+    # exactly the state this check exists to refuse, and a check that accepts it
+    # would ship a drop whose first search says "not on disk" while pointing at a
+    # directory that looks, to everything else, like a model.
+    candidates = Path.wildcard(Path.join([release_dir, "lib", "beam_lisp-*", "priv", "embed", "*"]))
 
+    case Enum.filter(candidates, &BeamLisp.Model.fetched?/1) do
+      [dir | _] ->
         size =
           dir
           |> Path.join("**/*")
@@ -154,9 +159,10 @@ defmodule Mix.Tasks.Bl.Build do
 
       [] ->
         Mix.raise("""
-        bl.build: the release tree carries no embedding weights.
+        bl.build: the release tree carries no complete embedding weights.
 
-          looked for: #{release_dir}/lib/beam_lisp-*/priv/embed/**/DIGEST
+          looked in: #{release_dir}/lib/beam_lisp-*/priv/embed/*
+          a copy needs: #{Enum.join(BeamLisp.Model.files(), ", ")} and DIGEST
 
         `bl search` in the drop this would produce would answer "the model
         weights are not on disk — looked in …/priv/embed/…" — a capability the

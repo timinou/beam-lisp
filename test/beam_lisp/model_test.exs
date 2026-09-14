@@ -92,6 +92,35 @@ defmodule BeamLisp.ModelTest do
     assert BeamLisp.Model.tier(@name) == :absent
   end
 
+  test "a digest with no weights is not a copy either", %{ambient: ambient} do
+    # The converse, and the reason `fetched?/1` asks for both halves: a DIGEST
+    # alone is a CLAIM about weights that are not there. Reading it as complete
+    # points every later caller at a directory that cannot be opened, and the
+    # failure surfaces as a parse error instead of as "not on disk".
+    claim = Path.join(ambient, "digest-only")
+    File.mkdir_p!(claim)
+    File.write!(Path.join(claim, "DIGEST"), "75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c")
+
+    refute BeamLisp.Model.fetched?(claim)
+    assert BeamLisp.Model.tier(@name) == :absent
+
+    # And a copy missing ONE file is not a copy: the reader opens all three.
+    almost = fetch!(Path.join(ambient, "almost"))
+    File.rm!(Path.join(almost, "tokenizer.json"))
+
+    refute BeamLisp.Model.fetched?(almost)
+  end
+
+  test "the shape of a model is declared once", %{ambient: ambient} do
+    # `code.embed/present?` and the build's payload check ask this module what
+    # files make a model, so the three lists that once existed here cannot drift
+    # apart again.
+    assert BeamLisp.Model.files() == ["config.json", "tokenizer.json", "model.safetensors"]
+
+    complete = fetch!(Path.join(ambient, "complete"))
+    assert BeamLisp.Model.fetched?(complete)
+  end
+
   test "with nothing fetched, dir names where a fetch was expected", %{
     bundled: bundled,
     ambient: ambient
