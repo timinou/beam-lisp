@@ -41,7 +41,9 @@ cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 | `02-blame.bl` | a refused step is a *witness*, not a wall | the polarity: `unsat` = preserved, `sat` = the model IS the counterexample | `step :withdraw → counterexample: amt = 1, balance = 0, balance2 = -1` |
 | `03-memo.bl` | does asking the same question twice cost anything | the second ask never reaches the solver — one ETS read — and `unknown` is not cached | `second → :unsat \| tier: :memo \| us: 0 \| solver calls: 0 \| memo entries: 1` |
 | `04-ceiling.bl` | where the 10 s z3 ceiling came from | every decision is timed; the ratio is a single-run snapshot, so watch it move | `median ordinary: 4701 us    the ceiling is 64 × that` (a second run: `5596 us` / `54 ×`) |
-| `05-sorts.bl` | a field's type decides which arithmetic z3 does | one word (`Real`→`Int`) flips `unsat`→`sat`; `holds: false` with `failures: 0` is an *establishment* failure | `── the same invariant with 0.75 \| holds: false \| warned: 0 \| failures: 0` |
+| `05-sorts.bl` | a field's type decides which arithmetic z3 does | one word (`Real`→`Int`) flips `unsat`→`sat`; the `0.75` control now names the check that refused AND carries the state | `── the same invariant with 0.75 \| holds: false \| warned: 1 \| failures: 1` / `init → counterexample: x = 0.75` |
+| `07-sessions.bl` | why a conversation beats a question | `discover-invariant` twice, sessions off/on: the same invariant, the same 10 questions, a fraction of the µs; `(z3pool/current)` is a pid inside a session, nil outside | `ledger ~65–77k µs → ~2.4–2.7k µs per discovery (≈6.5–7.7k → ≈0.24–0.27k µs/question across two runs); discovered identical: true` |
+| `09-blame.bl` | when repair cannot help, it says why | a refusal is `sat` → its hint is a MODEL; a blame is `unsat` → its hint is a CORE. Three unrepairable machines print their failure maps side by side | `drain → :next-step-breaks-it (core [g_next g_inv2]) · blocked → :guard-too-weak · impossible → :invariant-impossible (core [g_inv2])` |
 
 ## Running them
 
@@ -52,6 +54,8 @@ BL_DAEMON=off timeout 240 mix bl run examples/z3/02-blame.bl
 BL_DAEMON=off timeout 240 mix bl run examples/z3/03-memo.bl
 BL_DAEMON=off timeout 240 mix bl run examples/z3/04-ceiling.bl
 BL_DAEMON=off timeout 240 mix bl run examples/z3/05-sorts.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/07-sessions.bl
+BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/z3/09-blame.bl
 
 # all five, isolated and timed by ward
 BL_DAEMON=off timeout 600 mix bl examples examples/z3/*.bl
