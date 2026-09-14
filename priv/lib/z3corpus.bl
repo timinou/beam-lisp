@@ -1,0 +1,339 @@
+; z3corpus.bl — walk a tree of .bl files and ask the verifier about EVERY machine.
+;
+; ── what this is ─────────────────────────────────────────────────────────────
+; `system.core/verify-process` checks ONE process form: it reads ^{:invariant …},
+; translates the machine's guards and next-states to SMT, and proves □Inv. This
+; file is the thing that FINDS the forms to hand it — every `defserver` in a
+; source tree — and reports what the engine said, per machine, with a cost.
+;
+; ── why it is written the way it is (three measured traps) ───────────────────
+; 1. READING A NON-SOURCE FILE AS SOURCE KILLS THE VM. Hand the reader a `.md`
+;    file and it meets prose with an unterminated string; the process exits with
+;    rc=141 (SIGPIPE) and no diagnostic. So the file filter is not a convenience
+;    — only `.bl` text ever reaches the reader.
+; 2. A MACHINE IS OFTEN A STRING. In tests and examples the canonical fixture is
+;    `(def m "(defserver account …)")` — a machine living inside a string literal.
+;    Finding it means descending into string nodes and RE-READING their text; and
+;    when the source is spread over `(str "…" "…")` FRAGMENTS, re-reading the
+;    concatenation, because no single literal holds a whole form.
+; 3. A MACHINE WITH AN INVARIANT IS METADATA-WRAPPED. `(defserver ^{:invariant …}
+;    account …)` parses to a `:meta` node around the list. A walker that matches
+;    only top-level `:list` nodes therefore MISSES exactly the annotated machines
+;    — the ones worth checking. This is the whole reason a first attempt at this
+;    instrument reported "machines: 4" over 104 files and was deleted.
+;
+; A cheerful zero is worse than no instrument, so the walker never silently
+; drops a file: a read or parse that fails is recorded as UNREADABLE, and a
+; string re-read that throws is recorded as a FAILURE with the file named.
+;
+; ── the shape of the report ──────────────────────────────────────────────────
+;   {:machines   [{:file :name :outcome :us :calls :why} …]
+;    :counts     {:proven n :refuted n :undecided n :declined n :error n}
+;    :ledger     {:count :total_us :max_us :tiers {tier n}}
+;    :files      n
+;    :unreadable [path …]
+;    :failures   [{:file :text :error} …]
+;    :median     µs      ; over the machines' :us — measured, not estimated
+;    :worst      µs}
+;
+; `z3corpus/grep-bound` is the independent anti-zero guard: a raw-text count of
+; the FILES the node walk must out-reach. `z3corpus/corpus` does not consult it;
+; the caller compares the two (see examples/z3/10-corpus.bl).
+
+(ns z3corpus
+  (:require [typed]
+            [system.model :as model]
+            [system.core :as sys]
+            [z3]
+            [system.decide :as decide]))
+
+;; The directories the instrument walks by default: the shipped runtime and the
+;; runnable examples. A caller may override with `(corpus dirs)`.
+(def default-dirs ["priv" "examples"])
+
+;; ── the file filter ─────────────────────────────────────────────────────────
+
+(defn bl-file?
+  "True when `path` names a beam-lisp SOURCE file. Not cosmetic: a `.md` handed
+   to the reader KILLS the VM (rc=141, no diagnostic), so this filter is a
+   guard."
+  [path]
+  (and (string? path) (String/ends_with? path ".bl")))
+
+;; ── the walker ──────────────────────────────────────────────────────────────
+
+(defn- core-node
+  "Peel EVERY `:meta` wrapper from `node`. The reader wraps a form carrying
+   ^{:invariant …} in metadata; `node-form` peels exactly one layer, so peel
+   until the node is bare."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (= :meta (typed/node-tag f)) (core-node f) f)))
+
+(defn- tail-name
+  "The last `/`-segment of a possibly namespace-qualified head name —
+   `super/defserver` → `defserver`."
+  [s]
+  (last (String/split s "/")))
+
+(defn machine?
+  "True when `node` is a `defserver` form. A qualified head (`super/defserver`)
+   counts; `defsupervisor` does not (its head tail is `defsupervisor`)."
+  [node]
+  (let [f (core-node node)]
+    (and (= :list (typed/node-tag f))
+         (let [h (model/head-name f)]
+           (and (some? h) (= "defserver" (tail-name h)))))))
+
+(defn- parse
+  "Parse `src` into top-level reader nodes. A parse that THROWS is an error
+   VALUE, so the caller can count it rather than lose it."
+  [src]
+  (try {:nodes (vec (BeamLisp.Reader/read_string src)) :error nil}
+       (catch e {:nodes [] :error (str e)})))
+
+(declare walk)
+
+(defn- scan
+  "walk every node, concatenating machines and failures. A reduce (not `mapcat`)
+   so a deep tree does not build intermediate lists at every level."
+  [nodes]
+  (reduce (fn [acc n]
+            (let [r (walk n)]
+              {:nodes (into (:nodes acc) (:nodes r))
+               :failures (into (:failures acc) (:failures r))}))
+          {:nodes [] :failures []}
+          (vec nodes)))
+
+;; A string's TEXT re-read as source, tolerantly: the machines it holds, or a
+;; FAILURE the caller names. A bad re-read is a VALUE here, never an exception
+;; the caller could lose, and never a silent drop.
+(defn- reread [text]
+  (let [r (parse text)]
+    (if (nil? (:error r))
+      (scan (:nodes r))
+      {:nodes [] :failures [{:text text :error (:error r)}]})))
+
+(defn- containers [f] (typed/node-items f))
+
+(defn- literal [n]
+  "`n` as a string literal (peeling meta), else nil."
+  (let [f (core-node n)] (if (string? f) f nil)))
+
+(defn- concat-literal
+  "The text of a `(str …)` form when EVERY argument is a string literal, else nil.
+
+   Tests and examples build a machine out of FRAGMENTS —
+   `(str \"(defserver acct\\n\" \"  (init [] (ok 100))\\n\" …)` — so no single
+   literal holds the form and no per-literal re-read can see it. Concatenating
+   the literals recovers the source the program will hand the reader."
+  [f]
+  (let [h (model/head-name f)]
+    (if (and (some? h) (= "str" (tail-name h)))
+      (let [lits (vec (map literal (vec (rest (vec (containers f))))))]
+        (if (and (seq lits) (every? (fn [x] (some? x)) lits))
+          (reduce str "" lits)
+          nil))
+      nil)))
+
+(defn- walk [node]
+  (let [f (core-node node)
+        tag (typed/node-tag f)]
+    (cond
+      ;; the annotated form the naive walker missed: kept as the ORIGINAL node,
+      ;; meta wrapper and all, because that is what verify-process reads.
+      (machine? f) {:nodes [node] :failures []}
+
+      (or (= tag :list) (= tag :vector) (= tag :set))
+        (let [lc (if (= tag :list) (concat-literal f) nil)]
+          (if (and (string? lc) (includes? lc "defserver"))
+            (reread lc)
+            (scan (containers f))))
+
+      ;; a map's children are (k v) tuples; both halves may hold a machine
+      (= tag :map)
+        (scan (mapcat (fn [p] (vec (to-list (erlang/tuple_to_list p))))
+                      (containers f)))
+
+      ;; a string literal: re-read it, tolerantly. Only strings that can possibly
+      ;; hold a machine are re-read — the substring test is exact (a form cannot
+      ;; appear in text that does not spell its head), and it keeps arbitrary
+      ;; prose out of the reader, which is the SIGPIPE trap.
+      (and (string? f) (includes? f "defserver"))
+        (reread f)
+
+      :else {:nodes [] :failures []})))
+
+(defn machines-in-source
+  "Every `defserver` form in `src` (text): descends `:meta` wrappers, containers,
+   and STRING LITERALS (re-read, tolerantly). → {:machines [node …]
+   :failures [{:text :error} …]}."
+  [src]
+  (let [r (parse src)]
+    (if (nil? (:error r))
+      (let [s (scan (:nodes r))]
+        {:machines (:nodes s) :failures (:failures s)})
+      {:machines [] :failures [{:text nil :error (:error r)}]})))
+
+(defn machines-in-file
+  "Read `path`, find its machines. A read or parse that fails marks the file
+   `:readable false` and is reported — never silently dropped."
+  [path]
+  (try
+    (let [contents (second (File/read path))]
+      (if (string? contents)
+        (let [r (machines-in-source contents)]
+          {:file path :readable true
+           :machines (:machines r) :failures (:failures r)})
+        {:file path :readable false :machines []
+         :failures [{:text nil :error "read: unreadable path"}]}))
+    (catch e
+      {:file path :readable false :machines []
+       :failures [{:text nil :error (str e)}]})))
+
+;; ── the file set, and the independent lower bound ───────────────────────────
+
+(defn- dir-files [dir]
+  (if (File/dir? dir)
+    (vec (mapcat
+           (fn [name]
+             (let [p (str dir "/" name)]
+               (cond
+                 (File/dir? p) (dir-files p)
+                 (bl-file? p) [p]
+                 :else [])))
+           (sort (vec (to-list (File/ls! dir))))))
+    []))
+
+(defn files
+  "Every `.bl` file under each of `dirs`, recursively, sorted and de-duplicated."
+  [dirs]
+  (vec (sort (distinct (vec (mapcat dir-files dirs))))))
+
+(defn grep-bound
+  "The number of `.bl` FILES under `dirs` whose RAW TEXT contains `needle`.
+
+   Deliberately a DIFFERENT mechanism from the node walk — bytes, not forms — so
+   a walker bug shows up as a failed comparison instead of a cheerful zero.
+
+   HONESTLY, this bounds FILES-THAT-MENTION-THE-WORD, not files that hold a
+   machine — some of the tree's files spell `defserver` only in a comment or a
+   docstring (the example prints the exact counts). It is still the right guard
+   against a cheerful zero, because the walker's MACHINE count (several per
+   file) must exceed it — a walker that returns `machines: 4` cannot. Compare
+   the machine count to it, not the file count."
+  [dirs needle]
+  (count (filter (fn [p]
+                   (let [c (second (File/read p))]
+                     (and (string? c) (includes? c needle))))
+                 (files dirs))))
+
+;; ── the engine verdict, as four outcomes ────────────────────────────────────
+
+(defn outcome
+  "verify-process's result as one of four outcomes:
+
+     :proven    the engine's `true`  — □Inv, checked and holding
+     :refuted   the engine's `false` — a counterexample exists
+     :undecided checked, but the solver gave up (the ceiling), so neither
+     :declined  `:checked false` — no invariant, or one the translator cannot
+                model: a LIVE/REACTIVE machine, which the engine honestly refuses
+
+   And `:error` when the engine threw on the form — a walker-side failure that
+   must not be laundered into `:declined`."
+  [r]
+  (cond
+    (some? (:error r)) :error
+    (not (:checked r)) :declined
+    (= true (:holds r)) :proven
+    (seq (:undecided r)) :undecided
+    :else :refuted))
+
+;; ── per-machine verification ────────────────────────────────────────────────
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+
+(defn- trail [] (vec (decide/here)))
+
+(defn- verify-machine
+  "verify one form and its cost. `:calls` is the number of DECISIONS the engine
+   made for it, read from the per-process ledger trail as a delta — the trail is
+   shared by everything this process did, so a delta is the only honest count.
+   `:why` is the distinct SOLVER REASONS (`:timeout`, …) this machine's own
+   decisions carried — z3's word for a refusal, not a label invented here."
+  [path form]
+  (let [before (trail)
+        t0 (now-us)
+        r (try (sys/verify-process (z3/open) form)
+               (catch e {:name nil :error (str e)}))
+        us (- (now-us) t0)
+        delta (vec (drop (count before) (trail)))]
+    {:file path
+     :name (if (some? (:name r)) (:name r) "?")
+     :outcome (outcome r)
+     :us us
+     :calls (count delta)
+     :why (vec (distinct (keep (fn [d] (:why d)) delta)))}))
+
+;; ── statistics over the measured costs ──────────────────────────────────────
+
+(defn median
+  "The upper median of `xs`, or 0 when empty. Over `:us` this is the unit of work
+   the corpus actually spends, which a mean would hide."
+  [xs]
+  (let [s (vec (sort xs)) n (count s)]
+    (if (zero? n) 0 (nth s (quot n 2)))))
+
+(defn worst
+  "The largest of `xs`, or 0 when empty."
+  [xs]
+  (if (empty? xs) 0 (apply max xs)))
+
+(defn- tally [pred ms] (count (filter pred ms)))
+
+(defn- counts-of [ms]
+  {:proven    (tally (fn [m] (= :proven (:outcome m))) ms)
+   :refuted   (tally (fn [m] (= :refuted (:outcome m))) ms)
+   :undecided (tally (fn [m] (= :undecided (:outcome m))) ms)
+   :declined  (tally (fn [m] (= :declined (:outcome m))) ms)
+   :error     (tally (fn [m] (= :error (:outcome m))) ms)})
+
+(defn- ledger-of
+  "The measured ledger over `trail` (one process's decisions): total, worst, and
+   the per-tier counts, so the tier that answered is a number, not a claim."
+  [trail]
+  (let [us (map (fn [d] (or (:us d) 0)) trail)]
+    {:count (count trail)
+     :total_us (reduce + 0 us)
+     :max_us (worst us)
+     :tiers (reduce (fn [acc d] (assoc acc (:tier d) (inc (get acc (:tier d) 0))))
+                    {} trail)}))
+
+;; ── the instrument ──────────────────────────────────────────────────────────
+
+(defn corpus
+  "Walk `dirs` (default `default-dirs`), find every machine, verify each, and
+   return the report map. Serial on purpose: the ledger trail and the ledger
+   delta are per-process, and a per-machine cost is only meaningful when one
+   machine runs at a time."
+  ([] (corpus default-dirs))
+  ([dirs]
+   (let [start (count (trail))
+         fs (files dirs)
+         per (vec (map machines-in-file fs))
+         machines (vec (mapcat
+                         (fn [fr]
+                           (map (fn [form] (verify-machine (:file fr) form))
+                                (:machines fr)))
+                         per))
+         uss (vec (map (fn [m] (:us m)) machines))]
+     {:machines machines
+      :counts (counts-of machines)
+      :ledger (ledger-of (vec (drop start (trail))))
+      :files (count fs)
+      :unreadable (vec (keep (fn [fr] (when (not (:readable fr)) (:file fr))) per))
+      :failures (vec (mapcat
+                       (fn [fr] (map (fn [x] (assoc x :file (:file fr))) (:failures fr)))
+                       per))
+      :median (median uss)
+      :worst (worst uss)})))
