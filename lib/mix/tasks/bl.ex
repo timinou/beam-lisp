@@ -28,6 +28,16 @@ defmodule Mix.Tasks.Bl do
   def run(argv) do
     Mix.Task.run("app.start")
 
+    # Optional code paths the CALLER wants visible to the run (a precompiled
+    # NIF binding such as librarium's xberg_rt, a prebuilt ebin). They must be
+    # added AFTER app.start: mix prunes the code path to the project's own
+    # deps when the app starts, so -pa / ERL_LIBS given at VM boot are gone by
+    # the time any .bl code runs. Same variable and format (colon-separated
+    # ebin dirs) the apps' run-bl.sh scripts already use.
+    (System.get_env("BL_EXTRA_PATHS") || "")
+    |> String.split(":", trim: true)
+    |> Enum.each(&Code.prepend_path/1)
+
     BeamLisp.Loader.ensure_loaded("bl.cli")
     code = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.cli", "run-argv"), [argv])
 
