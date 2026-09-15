@@ -94,7 +94,7 @@ bless a new floor:
 
 ```
 mix compile.beam_lisp
-mix run priv/bootstrap/gen_manifest.exs
+bl seed
 ```
 
 Git history holds every past seed, so there is always a floor to fall back to.

@@ -9,22 +9,24 @@ still does.
 | what | was | is |
 |---|---|---|
 | compile | `mix compile` | `bl build` |
+| compile the Elixir side | `mix compile` (elixirc) | `bl build` — the `:ex` stage `env.bl` declares |
 | test | `mix test` | `bl test` (`.bl` **and** `.exs`) |
 | run a project task | `mix <task>` | `bl <task>` (`env.bl`'s `:tasks`) |
 | assemble a release | `mix release` | `bl self-build` (it assembles one and seals it) |
-| rebuild the drop | `mix bl.build` | `bl self-build` |
-
-(A `bl build --release` / `--self` — one verb, one pipeline, the output shape a
-parameter — is the first half of FUP-056 and is *not* implemented; today the
-release path is reachable only through `bl self-build`, which reproduces a drop
-from inside one.)
-| seed the bootstrap floor | `mix run priv/bootstrap/gen_manifest.exs` | **not ported yet** — `bl seed` is written up in PLAN-108's W9c and not implemented |
+| seed the bootstrap floor | `mix run priv/bootstrap/gen_manifest.exs` | `bl seed` |
 | dependencies | `mix deps.get` | `bl deps fetch` (see *the gap*, below) |
 | CLI from a checkout | `mix bl …` | `./bin/bl …` |
+| environment report | — | `bl doctor [--deep] [--json]` |
+
+A `bl build --release` / `--self` — one pipeline with the output shape as a
+parameter — is the first half of FUP-056 and is *not* implemented; the release
+path is reachable through `bl self-build`, which reproduces a drop from inside
+one.
 
 `bl build` with no arguments builds what the tree **declared**: `:build` in
-`env.bl` names the roots, the output directory, the width and whether the tree
-has natives. A flag still wins, and a PATH argument still means what it meant.
+`env.bl` names the roots, the output directory, the width, whether the tree has
+natives, and the substrate's `:ex` root and excludes. A flag still wins, and a
+PATH argument still means what it meant.
 
 ## `env.bl` declares, state lives outside the tree
 
@@ -46,6 +48,7 @@ has been built or fetched; that lives beside the work:
 | libraries | `~/.cache/beam_lisp/lib/<name>-<vsn>-<sha8>` | content-addressed, so a directory that exists is a library that is complete |
 | native artefacts | `~/.cache/beam_lisp/native/<key>/<crate>` | keyed by the content of `src/**/*.rs`, `Cargo.toml`, `.cargo/config.toml` and a lock **that constrains something** |
 | who is building | a claim file in the out dir | a claim NAMES its owner; a lock names nobody |
+| the bootstrap floor | `priv/bootstrap/seed/` (committed) | the beams a tree with no generation boots the compiler from, and the manifest that says which toolchain built them (`bl seed` regenerates both) |
 
 A release carries **no build state**: the log and the manifest stay outside the
 tree, so two independent builds of the same sources produce byte-identical trees
@@ -69,6 +72,29 @@ answer disappears the day Mix is deleted — and it disappears in the wrong
 direction: every development image would look like production and refuse
 mutating reloads. `BeamLisp.Image` is now the one implementation of the rule;
 `reload` (in bl) and the application's dev-server decision both call it.
+
+## The toolchain reports on itself
+
+`bl doctor` answers *can this host run a beam-lisp?* `bl doctor --deep` answers a
+different question — *is this toolchain free of the build system it replaced?* —
+and it is the one place that deletion is OBSERVABLE:
+
+```
+mix            required, and PASSES when Mix is absent — a `bl` that needed Mix
+               would fail the probe that exists to witness its removal
+mix-residue    what is left, named: mix.exs, mix.lock, lib/mix/tasks (n files),
+               deps/ — reported and NOT required, because they stay until a
+               locked library can be compiled onto the code path without Mix
+bl.lock        how many libraries the tree declares
+store          locked vs present in the content-addressed store, offline
+seed           which toolchain built the floor, and whether it is this one
+image          dev / release / drop, and whether reloads may mutate in place
+```
+
+Residue is a fact, not a verdict. A required probe this repository cannot pass
+would be a probe that lies about the tree it reports on, which is why `mix` is
+the only required one — and why its PASS means *absent*. `--json` carries the
+same facts as one object; the exit code follows the required probes only.
 
 ## The gap, stated plainly
 

@@ -1,7 +1,7 @@
 # beam-lisp bootstrap seed manifest — generated, do not edit by hand.
-# Regenerate: mix run priv/bootstrap/gen_manifest.exs (after a keyed build).
+# Regenerate: bl seed (after a keyed build).
 %{
-  "build_key" => "1cacdb9a1d3afb378b4ede69bcfe344ef68e5044421f7814c94a6b8c26959bc8",
+  "build_key" => "ee972f7e9e6f638051c0be8e635ddbe58b0f83484ff2cff1cc4fddeb79e6113b",
   "compiler_key" => "fb074cf32afd41c4f681c38cc5beb11c9e110e9ac785e4453db0144f2d8f75f5",
   "elixir" => "1.20.2",
   "modules" => %{

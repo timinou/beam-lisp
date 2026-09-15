@@ -52,8 +52,8 @@ defmodule BeamLisp.Bootstrap do
       The self-hosted compiler boots from a committed seed (the AOT-compiled
       `compiler`/`reader-node` closure). Without it there is no compiler to
       build the sources. If you are developing beam-lisp itself, rebuild and
-      commit the seed (mix run priv/bootstrap/gen_manifest.exs after a keyed
-      build); otherwise your checkout is incomplete.
+      commit the seed (`bl seed`, after a keyed build); otherwise your checkout
+      is incomplete.
       """
     end
 
@@ -182,11 +182,27 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
+  @doc """
+  The committed seed's manifest as data, or `nil` when there is no seed.
+
+  The SEED'S IDENTITY is reported, never inferred: `bl doctor --deep` answers
+  "which toolchain built this floor?" by reading these keys, and the only way to
+  answer it wrongly is to compute it from something else.
+  """
+  def manifest do
+    path = Path.join(seed_dir(), @manifest_name)
+    if File.exists?(path), do: read_manifest!(path), else: nil
+  end
+
   # Whether the committed seed's `compiler_key` matches this toolchain's. A seed
   # built for a different key cannot be trusted to intern correct code here, so
   # the installer skips it rather than seeding a foreign beam. (The genesis path,
   # while it exists, rebuilds fresh beams regardless; see `install!/1`.)
-  defp key_matches?(manifest) do
+  #
+  # Public because the answer is a FACT ABOUT THE TREE, not private bookkeeping:
+  # `bl doctor --deep` reports it, and a tree whose floor was built by another
+  # toolchain should say so before someone boots from it.
+  def key_matches?(manifest) do
     manifest["compiler_key"] == BeamLisp.AOTCache.compiler_key() and
       manifest["build_key"] == BeamLisp.AOTCache.build_key()
   end
@@ -233,7 +249,7 @@ defmodule BeamLisp.Bootstrap do
   # output) and strictly supersedes the gen-N seed. Overwriting it would
   # un-supersede the rebuild on every boot — ebin would oscillate between
   # seed and rebuild, and seed regeneration could never observe fresh beams
-  # (a boot between build and gen_manifest would re-poison ebin). Skip the
+  # (a boot between build and `bl seed` would re-poison ebin). Skip the
   # copy; the purge+load below then loads the fresh beam, which is exactly
   # the code this VM should run.
   defp maybe_install_one(src, dst, want_sha, current_key) do

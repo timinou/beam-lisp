@@ -105,7 +105,7 @@ To bless a new generation as the committed floor, rebuild and regenerate:
 
 ```
 mix compile.beam_lisp
-mix run priv/bootstrap/gen_manifest.exs   # copies the fresh boot beams → seed/
+bl seed                                   # copies the fresh boot beams → seed/
 ```
 
 Git history is the ultimate recovery floor: any past seed is a `git checkout`
