@@ -34,7 +34,18 @@ defmodule BeamLisp.Daemon.IndexWorkerTest do
   setup do
     if pid = Process.whereis(BeamLisp.Daemon.Workers), do: stop_sup(pid)
 
-    {:ok, sup} = BeamLisp.Daemon.Workers.ensure_started()
+    # An EMPTY temp root, not the checkout: the worker still boot-builds (it
+    # always indexes the engine's own two namespaces), but over nothing else, so
+    # the build is seconds not the whole tree's ~40s. This keeps the restart test
+    # — which kills the worker and waits for its replacement's fresh build — well
+    # under the ExUnit timeout even when the full suite has a real daemon churning
+    # the same global name. The property under test is table-OWNERSHIP across a
+    # process boundary, which an empty root exercises exactly as a full one does.
+    tmp = Path.join(System.tmp_dir!(), "iw_root_#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+    on_exit(fn -> File.rm_rf(tmp) end)
+
+    {:ok, sup} = BeamLisp.Daemon.Workers.ensure_started(root: tmp)
     on_exit(fn -> stop_sup(sup) end)
     wait_ready()
     :ok
