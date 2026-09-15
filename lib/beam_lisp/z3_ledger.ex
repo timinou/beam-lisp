@@ -7,7 +7,7 @@ defmodule BeamLisp.Z3.Ledger do
 
     * the FRAGMENT the question lives in (`:tag-lattice`, `:arith`, `:general`) —
       what a native rung would have to decide; and
-    * the TIER that actually answered (`:native-witness`, `:z3`).
+    * the TIER that actually answered (`:native-witness`, `:oracle`).
 
   The histogram over those counters is the measurement that decides whether
   another native rung is worth building: a number, not a taste.
@@ -24,7 +24,7 @@ defmodule BeamLisp.Z3.Ledger do
   """
 
   @fragments [:"tag-lattice", :arith, :general]
-  @tiers [:"native-witness", :z3, :memo]
+  @tiers [:"native-witness", :oracle, :memo]
 
   # EVERY slot, and the key → slot map. Module attributes resolve where they are
   # used, so these sit above the functions that need them. `:total` is a slot like any

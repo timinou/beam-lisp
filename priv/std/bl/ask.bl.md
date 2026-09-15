@@ -26,6 +26,7 @@ has ONE definition, and every interface projects it.
 (ns bl.ask
   (:require [bl.util :as u]
             [codebase]
+            [code.index]
             [typed]
             [datom]
             [datom.conn]
@@ -225,34 +226,42 @@ set lives in memory for this run only — the same answers, just not remembered.
 (defn connect-set!
   "A connection holding the facts of every source in `paths`: reopened from the
    persistent set store when this exact set has been indexed before, otherwise
-   indexed and stored. Returns `{:conn :nss}`."
+   indexed and stored. Returns `{:conn :nss}`.
+
+   The tree's own sources FIRST, through `code.index`: when the question is
+   about the tree the caller stands in — no `-p`, which is most of them — the
+   daemon has already indexed exactly these sources, and reusing its conn costs
+   a hash of each file (tens of ms) instead of reopening a store or re-indexing
+   anything. The askset below is the fallback for a question about a DIFFERENT
+   set of sources (an explicit `-p`, a single file), where the set really is a
+   different corpus."
   [sigs paths]
   (let [paths (u/to-list paths)
-        ; The SOURCES decide where the store lives: a question about a checkout
-        ; elsewhere keeps its store there, the way `bl search` does. Resolving it
-        ; from the shell is how the cwd's project accumulated another tree's
-        ; asksets.
         root (first paths)
-        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))]
-    ; The store's host module exists only once the namespace declaring it has
-    ; been initialized, and nothing on this path loads it: without this the ask
-    ; set is rebuilt every run. Inline for the same reason `bl.search` is (see
-    ; the note there — a helper in `codebase` or `bl.cache` cycles the AOT build).
-    (try (BeamLisp.AOT/ensure_loaded "datom.store-fjall") (catch e nil))
-    (if (not (datom.store-fjall/available?))
-      (let [conn (codebase/connect-codebase)]
-        {:conn conn :nss (index! conn sigs paths)})
-      (let [path (set-store-path (set-hash paths) root)]
-        (if (File/exists? path)
-          {:conn (datom.conn/connect-with (datom.store-fjall/open path))
-           :nss (nss-of)}
-          (do
-            (File/mkdir_p (codebase/blanalysis-dir root))
-            (let [store (datom.store-fjall/open path)
-                  conn (datom.conn/connect-with store codebase/SCHEMA)
-                  nss (index! conn sigs paths)]
-              (datom.store-fjall/sync! store)
-              {:conn conn :nss nss})))))))
+        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))
+        shared (try (code.index/reuse-for-paths (BeamLisp/cwd) paths) (catch e nil))]
+    (if (some? shared)
+      {:conn (:conn shared) :nss (nss-of)}
+      (do
+        ; The store's host module exists only once the namespace declaring it has
+        ; been initialized, and nothing on this path loads it: without this the ask
+        ; set is rebuilt every run. Inline for the same reason `bl.search` is (see
+        ; the note there — a helper in `codebase` or `bl.cache` cycles the AOT build).
+        (try (BeamLisp.AOT/ensure_loaded "datom.store-fjall") (catch e nil))
+        (if (not (datom.store-fjall/available?))
+          (let [conn (codebase/connect-codebase)]
+            {:conn conn :nss (index! conn sigs paths)})
+          (let [path (set-store-path (set-hash paths) root)]
+            (if (File/exists? path)
+              {:conn (datom.conn/connect-with (datom.store-fjall/open path))
+               :nss (nss-of)}
+              (do
+                (File/mkdir_p (codebase/blanalysis-dir root))
+                (let [store (datom.store-fjall/open path)
+                      conn (datom.conn/connect-with store codebase/SCHEMA)
+                      nss (index! conn sigs paths)]
+                  (datom.store-fjall/sync! store)
+                  {:conn conn :nss nss})))))))))
 ```
 
 ## Answering a database question

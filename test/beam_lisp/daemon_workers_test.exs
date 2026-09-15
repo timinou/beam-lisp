@@ -24,7 +24,7 @@ defmodule BeamLisp.Daemon.WorkersTest do
   test "all three workers run under the supervisor" do
     assert Process.whereis(BeamLisp.Daemon.Executor)
     assert Process.whereis(BeamLisp.Daemon.WatchRegistry)
-    assert Process.whereis(BeamLisp.Daemon.McpWorker)
+    assert Process.whereis(BeamLisp.Daemon.IndexWorker)
     assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 3
   end
 

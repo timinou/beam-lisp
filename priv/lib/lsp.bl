@@ -50,15 +50,80 @@
       (or (some (fn [c] (innermost-at c line col)) (ir/child-nodes n)) n)
       (some (fn [c] (innermost-at c line col)) (ir/child-nodes n)))))
 
-(defn- analyzed
+; ── the content memo ─────────────────────────────────────────────────────
+;
+; Every request below is a pure function of the source text, and the expensive
+; projection — whole-program summaries plus every fn's ANF body — was recomputed
+; per CALL: lsp.cli/report asked for it once PER SYMBOL, so a 133-defn file paid
+; 133 whole-program analyses. The memo answers each request from one bundle.
+;
+; The key IS the bytes — sha256 of the source — so a hit can never be stale:
+; there is no version to compare and nothing to invalidate. Bounded to four
+; sources: an editor holds a handful of open documents and `check` needs one,
+; while a bundle is its summaries plus its ANF bodies (the real memory), so the
+; bound is a deliberate ceiling on retained analysis, not a guess. Eviction is
+; oldest-first; an LRU buys nothing for a working set this small.
+
+(def ^:private memo-cap 4)
+
+(def ^:private analyzed-cache (atom []))    ; [sha bundle], newest first
+(def ^:private growth-cache (atom []))      ; [sha growth]
+(def ^:private diagnostics-cache (atom [])) ; [[ns sha] diags]
+
+(def ^:private analysis-builds (atom 0))    ; misses of `analyzed`
+(def ^:private growth-builds (atom 0))      ; misses of `growth-of-src`
+
+(defn- memo-get
+  "The value under `k`, or nil. Memo values are maps and seqs, never false."
+  [cache k]
+  (some (fn [pair] (when (= k (get pair 0)) (get pair 1))) (deref cache)))
+
+(defn- memo-put
+  "`v` under `k`, newest first, evicting past `memo-cap`. Returns `v` so it
+   composes with the miss branch that calls it."
+  [cache k v]
+  (reset! cache
+          (into [[k v]]
+                (take (dec memo-cap)
+                      (remove (fn [pair] (= k (get pair 0))) (deref cache)))))
+  v)
+
+(defn analyzed
   "The reusable analysis bundle for `src`: whole-program summaries, the return
    table for the type checker, and per-fn ANF bodies. Every request projects
-   from this — computed once."
+   from this, and it is memoized by the source's SHA-256 — the key is the
+   bytes, so a hit cannot be stale and a miss builds exactly the
+   {:summaries :bodies :known} the unmemoized call built."
   [src]
-  (let [summaries (analyze/analyze src)
-        bodies (analyze/fn-bodies src)
-        known (reduce (fn [m [name s]] (assoc m name (:returns s))) {} (into [] summaries))]
-    {:summaries summaries :bodies bodies :known known}))
+  (let [sha (sha256-hex src)]
+    (or (memo-get analyzed-cache sha)
+        (let [summaries (analyze/analyze src)
+              bodies (analyze/fn-bodies src)
+              known (reduce (fn [m [name s]] (assoc m name (:returns s))) {} (into [] summaries))]
+          (swap! analysis-builds inc)
+          (memo-put analyzed-cache sha
+                    {:summaries summaries :bodies bodies :known known})))))
+
+(defn- growth-of-src
+  "`term/growth`, memoized by the source bytes. document-symbols needs it and no
+   other request does, so a keystroke must not re-walk every fn's recursion
+   shape."
+  [src]
+  (let [sha (sha256-hex src)]
+    (or (memo-get growth-cache sha)
+        (do (swap! growth-builds inc)
+            (memo-put growth-cache sha (term/growth src))))))
+
+(defn memo-stats
+  "The content memos' occupancy, plus how many times each actually computed —
+   the observable side of the memo, so a test can assert ONE analysis per source
+   (deterministically) instead of timing."
+  []
+  {:analyzed (count (deref analyzed-cache))
+   :growth (count (deref growth-cache))
+   :diagnostics (count (deref diagnostics-cache))
+   :builds (deref analysis-builds)
+   :growth-builds (deref growth-builds)})
 
 (defn- fn-at
   "[fn-name node] for the innermost node at [line col], searching every fn body.
@@ -97,13 +162,20 @@
    checker, the inter-procedural checker, and (extensible) any other engine.
    Returns a list of {:msg :line :col :end-col ...} ready to render as squiggles."
   [src ns]
-  (let [interproc (tc/check-source src)
-        local (:warnings (typed/check-source src ns))
-        ; emission linearity (system.linear tier 3): a fn whose compiled body
-        ; carries a duplicated subtree is paying for a macro/constructor that
-        ; splices a child twice — exponential in nesting, invisible otherwise
-        linear (lin/diagnostics src)]
-    (concat interproc local linear)))
+  (let [k [ns (sha256-hex src)]]
+    (or (memo-get diagnostics-cache k)
+        (let [a (analyzed src)
+              ; the bundle IS the whole-program analysis, so hand its tables to
+              ; the checker instead of letting tc analyze a second time. typed
+              ; and lin keep one pass each: they read their own parse/ANF walk,
+              ; not the bundle (measured — they cannot share it).
+              interproc (tc/check-source* (:known a) (:bodies a))
+              local (:warnings (typed/check-source src ns))
+              ; emission linearity (system.linear tier 3): a fn whose compiled body
+              ; carries a duplicated subtree is paying for a macro/constructor that
+              ; splices a child twice — exponential in nesting, invisible otherwise
+              linear (lin/diagnostics src)]
+          (memo-put diagnostics-cache k (concat interproc local linear))))))
 
 (defn document-symbols
   "textDocument/documentSymbol — every top-level definition with its span and
@@ -115,7 +187,7 @@
    analysis plumbing, not a definition — never in the outline."
   [src]
   (let [a (analyzed src)
-        growths (term/growth src)]
+        growths (growth-of-src src)]
     (map (fn [[name s]]
            (let [g (get growths name)]
              {:name name
@@ -132,7 +204,7 @@
   "The growth entry {:class :label :witness :detail} for `fn-name` in `src`, or
    nil when it is not self-recursive."
   [src fn-name]
-  (get (term/growth src) fn-name))
+  (get (growth-of-src src) fn-name))
 
 (defn definition
   "textDocument/definition — for a call/var under the cursor, the name it
@@ -178,19 +250,25 @@
        :returns (sort (into [] (:returns s)))
        :calls (into [] (:edges s))})))
 
+(defn native-eligible*
+  "`native-eligible` over an already-computed `analyzed` bundle. A caller that
+   renders EVERY symbol holds the bundle once (lsp.cli/report asks for a
+   whole-program analysis per symbol otherwise)."
+  [a fn-name]
+  (let [s (get (:summaries a) fn-name)]
+    (cond
+      (nil? s) {:eligible false :reason (str "no such fn: " fn-name)}
+      (seq (:footprint s)) {:eligible false :reason :impure :footprint (:footprint s)}
+      (not (:terminates s)) {:eligible false :reason :may-diverge}
+      :else {:eligible true :note "pure ∧ terminating — candidate for native offload"})))
+
 (defn native-eligible
   "No LSP request for this either. Answer, per function, whether it could be
    compiled to a native NIF — the doc-05 conjunction (pure ∧ terminates), read
    straight off the summary. A green light in the gutter for 'this can go
    native'; a refusal names the theorem that failed."
   [src fn-name]
-  (let [a (analyzed src)
-        s (get (:summaries a) fn-name)]
-    (cond
-      (nil? s) {:eligible false :reason (str "no such fn: " fn-name)}
-      (seq (:footprint s)) {:eligible false :reason :impure :footprint (:footprint s)}
-      (not (:terminates s)) {:eligible false :reason :may-diverge}
-      :else {:eligible true :note "pure ∧ terminating — candidate for native offload"})))
+  (native-eligible* (analyzed src) fn-name))
 
 (defn impact
   "No LSP request for this. Every function that transitively CALLS `fn-name` —
