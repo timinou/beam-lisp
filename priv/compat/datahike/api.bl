@@ -1,0 +1,250 @@
+; datahike/api.bl — datahike.api as a PROJECTION of datom, not a second engine.
+;
+; ── The one rule (PLAN-115) ───────────────────────────────────────────────
+;
+; datom is the single engine. Every fn here is either a thin adapter that hands
+; its arguments to `datom.*` unchanged, or a pure DATA rewrite (a cfg map into a
+; store, a datahike op keyword into datom's, a report key rename, a string
+; tempid into a negative int). If a fn in this file ever grows a loop over
+; datoms or a private index, it has stopped projecting and started emulating —
+; that is the bug this layer exists to refuse.
+;
+; kontor calls 16 datahike fns at 565 sites; this file is what lets its 63
+; `(:require [datahike.api :as d])` namespaces LOAD and, for the surface that
+; already projects 1:1, RUN. The features datom still lacks (decimals, valid
+; time, guards, tuple keys, richer find-specs, branches, excision) arrive in
+; later waves AS DATOM FEATURES; this shim only ever maps the datahike spelling
+; onto them.
+;
+; ── What connects to what ──────────────────────────────────────────────────
+;
+; datahike separates create-database / connect / (schema via transact); datom
+; takes schema at connect and hands out immutable db VALUES. So the shim keeps a
+; cfg→conn registry: `create-database` opens the datom conn, `connect` returns
+; it, `transact` feeds datom's writer and RENAMES the report's :tx-datoms to
+; :tx-data (the only key kontor reads by a datahike-specific name).
+
+(ns datahike.api
+  (:require [datom]
+            [datom.conn]
+            [datom.db]
+            [datom.pull]
+            [datom.query.engine]
+            [datom.time]))
+
+;; ── cfg → conn registry ────────────────────────────────────────────────────
+;;
+;; datahike identifies a database by its config's `[:store :id]`. datom
+;; identifies it by the live conn (an ETS store + writer). The registry is the
+;; one stateful thing here — a map {store-id → datom-conn} in an atom — and it
+;; holds only what datahike's create/connect/database-exists? lifecycle needs;
+;; every READ and WRITE still goes straight to datom.
+
+(def ^:private registry (atom {}))
+
+(defn- cfg-id
+  "The stable identity of a datahike config: its store id, else the whole
+   store map (an in-memory store with no :id is its own key)."
+  [cfg]
+  (let [store (get cfg :store {})]
+    (or (get store :id) store)))
+
+;; ── database lifecycle ───────────────────────────────────────────────────
+
+(defn create-database
+  "Open the datom conn for `cfg` and register it. datahike separates creating a
+   database from connecting to it; datom's stores are opened, not \"created\", so
+   this simply ensures the conn exists. Idempotent — a second call returns the
+   same conn. Returns `cfg` (datahike returns the config)."
+  ([] (create-database {}))
+  ([cfg]
+   (let [id (cfg-id cfg)]
+     (when (nil? (get (deref registry) id))
+       (swap! registry assoc id (datom.conn/connect [])))
+     cfg)))
+
+(defn database-exists?
+  "Whether a database for `cfg` has been created in this VM."
+  ([] (database-exists? {}))
+  ([cfg] (some? (get (deref registry) (cfg-id cfg)))))
+
+(defn delete-database
+  "Forget the registered conn for `cfg`. datom never deletes durable data on
+   disk (conn.bl close!); for the in-memory stores kontor's tests use this drops
+   the registry entry so a subsequent create-database opens a fresh store."
+  ([] (delete-database {}))
+  ([cfg]
+   (let [id (cfg-id cfg) c (get (deref registry) id)]
+     (when (some? c) (datom.conn/release! c))
+     (swap! registry dissoc id)
+     nil)))
+
+(defn connect
+  "The datom conn for `cfg`, creating it on first use. datahike returns a
+   connection; so does datom, and it is the same object every read and write
+   here threads through."
+  ([] (connect {}))
+  ([cfg]
+   (let [id (cfg-id cfg)]
+     (or (get (deref registry) id)
+         (do (create-database cfg)
+             (get (deref registry) id))))))
+
+(defn release
+  "Release a connection (datahike's `release`)."
+  [conn]
+  (datom.conn/release! conn))
+
+;; ── string tempids ─────────────────────────────────────────────────────────
+;;
+;; datahike accepts STRING tempids ("datomic.tx", or any (str …)-generated
+;; label); datom accepts negative ints. The rewrite maps every DISTINCT string
+;; in a tx to a fresh negative int (W0: kontor generates arbitrary tempid
+;; strings, not a fixed set), and "datomic.tx" specifically to datom's
+;; :db/current-tx sentinel so tx-entity annotations land on the transaction.
+
+(defn- tempid-rewriter
+  "A stateful rewriter {string → negative-int}, as an atom, plus a counter."
+  []
+  (atom {:map {} :next -1}))
+
+(defn- rewrite-tempid
+  [state s]
+  (if (= s "datomic.tx")
+    :db/current-tx
+    (let [st (deref state)
+          existing (get (:map st) s)]
+      (if (some? existing)
+        existing
+        (let [id (:next st)]
+          (swap! state (fn [x] (assoc x :map (assoc (:map x) s id) :next (- (:next x) 1))))
+          id)))))
+
+(defn- rewrite-tx-value
+  "Rewrite string tempids anywhere they appear in a tx form: in `:db/id`, in an
+   op vector's entity slot, and in a ref VALUE (a string tempid used as a ref)."
+  [state v]
+  (cond
+    (string? v) (rewrite-tempid state v)
+    (map? v)    (into {} (map (fn [kv]
+                                (let [k (first kv) val (second kv)]
+                                  [k (if (= k :db/id) (rewrite-tx-value state val) val)]))
+                              v))
+    (vector? v) (into [] (map (fn [x] (rewrite-tx-value state x)) v))
+    :else v))
+
+(defn- rewrite-tempids
+  "Rewrite an entire tx-data vector, returning `[tx-data state]`."
+  [tx-data]
+  (let [state (tempid-rewriter)]
+    [(into [] (map (fn [form] (rewrite-tx-value state form)) tx-data)) state]))
+
+;; ── transactions ───────────────────────────────────────────────────────────
+
+(defn- schema-def?
+  "A tx form that DEFINES an attribute (datahike installs schema by transacting
+   these): a map with `:db/ident` and no `:db/id`. datom installs schema through
+   a separate writer path (`install-schema!`), so the shim splits them out."
+  [form]
+  (and (map? form) (contains? form :db/ident) (not (contains? form :db/id))))
+
+(defn transact
+  "Record `tx-data`, returning a report shaped as datahike's: `:db-before`,
+   `:db-after`, `:tx-data` (datom's `:tx-datoms`, renamed — the one key kontor
+   reads by a datahike name), `:tempids`. datahike's `transact` is synchronous
+   in kontor's use; so is datom's.
+
+   datahike installs schema by transacting attribute-definition maps; datom has
+   a dedicated `install-schema!`. A tx that carries schema defs is split: the
+   defs install first, the rest transacts — so kontor's `(d/transact conn all)`
+   schema seed and its ordinary writes both work through the one datahike fn."
+  [conn tx-data]
+  (let [defs (filterv schema-def? tx-data)
+        data (filterv (fn [f] (not (schema-def? f))) tx-data)]
+    (when (seq defs) (datom.conn/install-schema! conn (into [] defs)))
+    (if (empty? data)
+      (let [db (datom.conn/db conn)]
+        {:db-before db :db-after db :tx-data [] :tempids {} :tx (datom.db/basis-t db)})
+      (let [pair (rewrite-tempids data)
+            report (datom.conn/transact! conn (get pair 0))]
+        {:db-before (:db-before report)
+         :db-after (:db-after report)
+         :tx-data (:tx-datoms report)
+         :tempids (:tempids report)
+         :tx (:tx report)}))))
+
+(defn transact!
+  "datahike's async `transact!`. kontor treats the result synchronously; this is
+   `transact` (the report is realised, not a future)."
+  [conn tx-data]
+  (transact conn tx-data))
+
+;; ── reads (all straight to datom) ────────────────────────────────────────────
+
+(defn db
+  "The current database value."
+  [conn]
+  (datom.conn/db conn))
+
+(defn q
+  "Datalog query. datahike is `(q query & inputs)` with the db as the first
+   input; datom is `(q query db & inputs)`. Same query data, same result set —
+   the shim only reorders db to the front."
+  [query & inputs]
+  (apply datom.query.engine/q query (first inputs) (rest inputs)))
+
+(defn- pattern-wants-id?
+  "Whether a pull pattern asks for the top-level `:db/id` — explicitly, or via
+   the `*` wildcard. datom always seeds `{:db/id e}`; datahike includes it only
+   when requested, so the shim strips it otherwise."
+  [pattern]
+  (some (fn [el] (or (= el :db/id) (= el (quote *)) (= el :*))) pattern))
+
+(defn pull
+  "Pull a shape. datahike is `(pull db pattern eid)`; datom is `(pull db pattern
+   e)`. Nested ref values are `{:db/id N}` on both engines. The one presentation
+   difference: datom always includes the top-level `:db/id`, datahike only when
+   the pattern asks — so the shim drops it unless requested."
+  [db pattern eid]
+  (let [r (datom.pull/pull db pattern eid)]
+    (if (or (nil? r) (pattern-wants-id? pattern)) r (dissoc r :db/id))))
+
+(defn pull-many
+  [db pattern eids]
+  (datom.pull/pull-many db pattern eids))
+
+(defn entity
+  "Entity as a map. datom now resolves lookup-ref entity args natively
+   (db.bl resolve-eid), so kontor's `(d/entity db [:attr v])` reads work."
+  [db eid]
+  (datom.db/entity db eid))
+
+(defn datoms
+  "Raw datoms from `index`."
+  [db index & components]
+  (apply datom.db/datoms db index components))
+
+(defn schema
+  "The schema map `{attr → def-map}`. datahike takes a DB here (kontor calls
+   `(d/schema db)`); datom keeps the schema ON the db value, so this reads the
+   field — no conn round-trip."
+  [db]
+  (datom.db/schema-of db))
+
+;; ── time views ─────────────────────────────────────────────────────────────
+
+(defn as-of  [db t] (datom.time/as-of db t))
+(defn since  [db t] (datom.time/since db t))
+(defn history [db]  (datom.time/history db))
+
+;; ── speculative ──────────────────────────────────────────────────────────────
+
+(defn db-with
+  "The db value that WOULD result from applying `tx-data` to `db`, without
+   committing. datahike is `(db-with db tx)`; datom's `with` is conn-scoped and
+   returns a report, so this resolves the db's conn, runs `with`, and returns
+   `:db-after`."
+  [db tx-data]
+  (let [pair (rewrite-tempids tx-data)
+        conn (datom.conn/conn-of db)]
+    (:db-after (datom.conn/with conn (get pair 0)))))

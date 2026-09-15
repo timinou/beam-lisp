@@ -361,6 +361,30 @@
     (java-class-of env name)
     nil))
 
+(defn- dotted-var-ref
+  "A fully-qualified DOTTED reference to a var in another namespace, JVM-class
+   style: `datalog.parser.type.Function` → `[ns \"Function\"]` when `Function` is
+   uppercase-first (a record/type name by convention), the prefix
+   `datalog.parser.type` names a loaded namespace, and that namespace binds
+   `Function`. This is how an unmodified Clojure source refers to a defrecord
+   type by its class name (`(= (type x) datalog.parser.type.Function)`); datom
+   spells the same value `datalog.parser.type/Function`, so the two are one var.
+
+   Returns `[ns var]` or nil. Only fires for a dotted, slash-free, uppercase-tail
+   symbol whose prefix is already a loaded namespace with that var — so an
+   ordinary lowercase dotted name, or a class the java manifest owns, is
+   untouched."
+  [env name]
+  (if (or (has-slash? name) (nil? (index-of name ".")))
+    nil
+    (let [parts (split-dots name)
+          tail (lists/last parts)
+          prefix (join "." (butlast parts))]
+      (if (not (uppercase-first? tail))
+        nil
+        (do (try (BeamLisp.Loader/ensure_loaded prefix) (catch e nil))
+            (if (BeamLisp.Env/bound? prefix tail) [prefix tail] nil))))))
+
 (defn- java-class-of
   "The fully-qualified Java class a prefix names in `env`, or nil: an
    `:import`ed short name (`BigDecimal` → `java.math.BigDecimal`) or a
@@ -522,6 +546,12 @@
           ; a var in another namespace: refuse a private one, else a reference
           (do (reject-private! env (second tgt) (nth tgt 2))
               (a/global (second tgt) (nth tgt 2)))))
+    ; a dotted class-name reference to a record/type in another ns
+    ; (`datalog.parser.type.Function`): the same var as `…/Function`
+    (some? (dotted-var-ref env name))
+      (let [ref (dotted-var-ref env name)]
+        (reject-private! env (first ref) (second ref))
+        (a/global (first ref) (second ref)))
     :else
       (a/global (:ns env) name)))
 
@@ -886,7 +916,7 @@
   #{"ns" "if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
     "defrecord" "deftype" "reify" "defnative" "defserver"
-    "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
+    "let" "let*" "loop" "loop*" "fn" "fn*" "recur" "var"})
 
 (defn- compile-body
   "Compile body forms into one bl-ANF node (a single form, or a :do)."
@@ -1094,6 +1124,20 @@
   [pair]
   (second (erlang/tuple_to_list pair)))
 
+(defn- keys-directive?
+  "Whether a keyword name is a `:keys` directive — bare `keys`, or namespaced
+   `some.ns/keys` (Clojure's namespaced-keys destructuring)."
+  [kw-name]
+  (or (= "keys" kw-name)
+      (let [i (last-index-of kw-name "/")]
+        (and (some? i) (= "keys" (subs kw-name (inc i)))))))
+
+(defn- directive-namespace
+  "The namespace part of a `some.ns/keys` directive, or nil for a bare `keys`."
+  [kw-name]
+  (let [i (last-index-of kw-name "/")]
+    (if (nil? i) nil (subs kw-name 0 i))))
+
 (defn- destructure-map
   "Expand a map pattern against `whole-ast`.
 
@@ -1120,17 +1164,24 @@
         (let [k (rn/node-form (kv-key pair))
               v (kv-val pair)]
           (cond
-            ; :keys [a b] — bind each symbol to its keyword key
-            (and (= :keyword (rn/node-tag k)) (= "keys" (rn/node-name k)))
-              (reduce (fn [a2 sym]
-                        (let [name (rn/node-name (rn/node-form sym))
-                              default (get ors name)
-                              default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
-                              r (destructure-symbol name
-                                   (rt-get-node whole-var (erlang/binary_to_atom name) default-node)
-                                   (:env a2))]
-                          {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
-                      acc (rn/node-items (rn/node-form v)))
+            ; :keys [a b] — bind each symbol to its keyword key. A NAMESPACED
+            ; `:some.ns/keys [a b]` binds `a` to the namespaced key `:some.ns/a`
+            ; (Clojure's namespaced-keys destructuring, e.g. kontor's
+            ; `{:kontor.ledger/keys [type]}` → local `type` from `:kontor.ledger/type`).
+            ; The local name stays bare; only the lookup key carries the namespace.
+            (and (= :keyword (rn/node-tag k)) (keys-directive? (rn/node-name k)))
+              (let [kw-ns (directive-namespace (rn/node-name k))]
+                (reduce (fn [a2 sym]
+                          (let [name (rn/node-name (rn/node-form sym))
+                                key-atom (erlang/binary_to_atom
+                                           (if (nil? kw-ns) name (str kw-ns "/" name)))
+                                default (get ors name)
+                                default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
+                                r (destructure-symbol name
+                                     (rt-get-node whole-var key-atom default-node)
+                                     (:env a2))]
+                            {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
+                        acc (rn/node-items (rn/node-form v))))
             ; :strs [s t] — like :keys, but the lookup key is the STRING of
             ; each name (`{:strs [a]}` reads key "a"), not the keyword.
             (and (= :keyword (rn/node-tag k)) (= "strs" (rn/node-name k)))
@@ -1740,6 +1791,25 @@
    constant in the compiled code."
   [form]
   (a/lit (datum form)))
+
+(defn- compile-var
+  "Turn `(var sym)` — the `#'sym` var-quote — into the var HANDLE `[ns name]`, the
+   same 2-vector `alter-var-root`/`bound?`/`resolve` accept. The symbol resolves
+   exactly as a value reference would: an alias or namespace prefix through
+   `slash-target` (`dq/built-ins` → `[\"datahike.query\" \"built-ins\"]`), a bare
+   name against the current namespace. A var-quote NAMES a var; it does not read
+   its value, so this never fetches."
+  [form env]
+  (let [handle (fn [ns nm]
+                 (a/structt mod-vector
+                            (list [(a/lit :items) (a/tup (list (a/lit ns) (a/lit nm)))])))
+        name (rn/node-name form)]
+    (if (has-slash? name)
+      (let [tgt (slash-target env name)]
+        (if (= :var (first tgt))
+          (handle (second tgt) (nth tgt 2))
+          (compile-error env (str "var: " name " does not name a beam-lisp var"))))
+      (handle (:ns env) name))))
 
 ; ── guards ────────────────────────────────────────────────────────────────────
 ;
@@ -3518,7 +3588,22 @@
             (erlang/is_binary (rn/node-form (first after-attr)))
               (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
             :else nil)
-        mod (BeamLisp.Link/module_for (:ns env))
+        ; A defn nested inside a scope that BINDS locals (a top-level
+        ; `(let [x …] (defn f … x))`, as an unmodified Clojure source writes a
+        ; closed-over helper) cannot become a top-level linked module fn: the
+        ; link's body is a bare BEAM function and cannot see `x`. Clojure's own
+        ; answer is that this `defn` is `(def f (fn … x))`, whose value CLOSES
+        ; over the let. So when `env` has locals in scope, compile the clauses as
+        ; an fn VALUE (which captures) and intern it under the name — the exact
+        ; `def`-of-`fn` path, closure and all. A top-level defn (no locals) keeps
+        ; the fast linked path unchanged.
+        nested? (not (empty? (:locals env)))]
+    (if nested?
+      (compile-def (cons (first args)
+                         (concat (if has-doc (list (first rest-args)) (list))
+                                 (list (rn/list-node (cons (rn/sym-node "fn") after-attr)))))
+                   env)
+  (let [mod (BeamLisp.Link/module_for (:ns env))
         clauses (parse-fn-clauses after-attr env)
         ; PRE-LINK before compiling the clauses. A non-tail self-reference in
         ; a body — `(bind …)` inside `bind`, or `mplus` calling `bind` calling
@@ -3552,7 +3637,7 @@
               (a/doo (list (a/remote mod-env :put_meta
                                      (list (a/lit (:ns env)) (a/lit name)
                                            (a/lit meta)))
-                           (a/var "value")))))))
+                           (a/var "value")))))))))
 
 (defn- compile-special
   "Compile a special form by name."
@@ -3565,6 +3650,7 @@
     (= head "try") (compile-try args env)
     (= head "receive") (compile-receive args env)
     (= head "quote") (compile-quote (first args))
+    (= head "var") (compile-var (first args) env)
     (= head "syntax-quote") (compile-syntax-quote (first args) env)
     (= head "ns") (compile-ns (first args) (rest args) env)
     (= head "def") (compile-def args env)
