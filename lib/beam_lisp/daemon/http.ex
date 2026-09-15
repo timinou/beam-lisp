@@ -81,6 +81,8 @@ defmodule BeamLisp.Daemon.HTTP do
   # left out rather than rendered as `nil` fields.
   defp index_stats(nil), do: nil
 
+  # is_map-ok: `s` is a plain index-stats map from the indexer, never a beam-lisp
+  # value; this only reads well-known atom keys off it for the JSON face.
   defp index_stats(s) when is_map(s) do
     %{
       "files" => to_int(Map.get(s, :files)),

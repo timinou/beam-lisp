@@ -94,6 +94,8 @@ defmodule BeamLisp.Daemon.IndexWorker do
   could not be told about it, so a frame this does not understand is still
   stored — the dashboard renders what it finds and ignores what it does not.
   """
+  # is_map-ok: `frame` is a plain progress-frame map (atom keys → counters) the
+  # dashboard renders; it is never a beam-lisp value, so accepting any map is right.
   def progress!(frame) when is_map(frame) do
     :ets.insert(@table, {:progress, Map.put(frame, :at, System.system_time(:millisecond))})
     :ok
