@@ -54,6 +54,19 @@ defmodule BeamLisp.ClojureCompatDocsTest do
     assert out =~ "accounts if applied: 4"
   end
 
+  test "docs/datom-find-specs.bl.md shows every find spec and the :with fix" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-find-specs.bl.md") end)
+
+    assert out =~ "relation:  ([\"Ada\" 100] [\"Grace\" 100] [\"Lin\" 90])"
+    assert out =~ "scalar:    90"
+    assert out =~ "collection: (\"Ada\" \"Grace\" \"Lin\")"
+    assert out =~ "tuple:     [\"Ada\" 100]"
+    assert out =~ "sum of distinct pay values:  190"
+    assert out =~ "sum of pay per person:       290"
+    assert out =~ "pay by dept:  ([\"eng\" 200] [\"sales\" 90])"
+    assert out =~ "count by dept: ([\"eng\" 2] [\"sales\" 1])"
+  end
+
   test "docs/datom-for-accounting.bl.md exercises decimals, tuple keys and guards" do
     out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-for-accounting.bl.md") end)
 
