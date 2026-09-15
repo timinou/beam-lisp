@@ -164,7 +164,7 @@ of the pattern \u2014 the roster machinery is `data.registry`, not bespoke code.
    untracked cell still counts in the native vitals; it simply has no row."
   ([kind name reader] (track kind name reader nil))
   ([kind name reader writer]
-   (registry/enroll (reg) kind name {:reader reader :writer writer})))
+   (registry/enroll (reg) kind name {:reader reader :writer writer :where :be})))
 
 (defn set!
   "Write `value` (an EDN string, read here) into the tracked cell `name`
@@ -184,7 +184,101 @@ of the pattern \u2014 the roster machinery is `data.registry`, not bespoke code.
   "Drop a tracked cell from the dashboard."
   [id]
   (registry/retire (reg) id))
-```
+  ```
+
+  ## Where the value lives: frontend cells
+
+  Until now every row in the roll-call was the same kind of thing: a name, a kind,
+  and a reader the node calls to see the value. That is a **backend cell** \u2014 the
+  value lives in this VM and the snapshot reads it here. The chip now draws the
+  other half: a **frontend cell**, where the value lives in the browser and the
+  node keeps only the row plus a mirror of the last value the page pushed.
+
+  Nothing else changes. `track-fe` enrolls the row with `:where :fe`; `fe-push!`
+  is the page saying "this is the value now"; `locality` counts both sides so the
+  chip can badge every row `fe` or `be` and label the collapsed badge `2fe \u00b7 5be`.
+
+  ```beam-lisp
+  (def ^:private fe-mirror (atom {}))
+
+  (defn track-fe
+    "Track a cell whose VALUE lives in the browser: the node keeps the row and a
+     mirror of the last value the page pushed. The page is the authority; the
+     snapshot reports what the page last said, not a value the node computed."
+    [kind name]
+    (registry/enroll (reg) kind name
+      {:where :fe
+       :reader (fn [] (let [v (get @fe-mirror name)]
+                        (if (nil? v) :unset v)))
+       :writer (fn [v] (swap! fe-mirror assoc name v))}))
+
+  (defn fe-known?
+    "Is `cell-name` a tracked frontend cell?"
+    [cell-name]
+    (some (fn [e] (and (= :fe (get (:meta e) :where :be))
+                       (= (str (:name e)) (str cell-name))))
+          (registry/entries (reg))))
+
+  (def ^:private fe-max
+    "How many frontend cells the wire may announce. Pulse accepts announces
+     from any page script; the cap is what keeps that from being an unbounded
+     registry."
+    64)
+
+  (defn fe-admit?
+    "May a frontend cell be enrolled right now? The rule as a QUESTION: `kind`
+     and `name` must be non-empty strings, and the frontend side must stay under
+     `cap` rows — so a looping or hostile announcer cannot grow the roll-call
+     without bound. Testable without enrolling anything."
+    ([kind name] (fe-admit? kind name fe-max))
+    ([kind name cap]
+     (and (string? kind) (< 0 (String/length kind))
+          (string? name) (< 0 (String/length name))
+          (< (count (filter (fn [c] (= :fe (:where c))) (cells))) cap))))
+
+  (defn fe-track!
+    "The page announced a browser-held cell. Idempotent — a reconnecting chip
+     re-announcing its cells never doubles a row — and REFUSING anything that is
+     not a (kind name) pair of non-empty strings, under the cap. Re-announcing a
+     cell that is already known always succeeds, so a chip at the cap still
+     reconnects."
+    [kind name]
+    (cond
+      (fe-known? name)            {:ok (str name)}
+      (not (fe-admit? kind name)) {:error "fe-track wants (kind name) of non-empty strings, under the frontend cap"}
+      :else (do (track-fe (keyword kind) name) {:ok (str name)})))
+
+  (defn fe-push!
+    "The page pushed the current value of a frontend cell: mirror it so every
+     viewer of the snapshot reads the same value. {:ok name} or {:error why}."
+    [cell-name v]
+    (if (fe-known? cell-name)
+      (do (swap! fe-mirror assoc (str cell-name) v)
+          {:ok (str cell-name)})
+      {:error (str "no frontend cell " cell-name)}))
+
+  (defn locality
+    "How many tracked cells live where: {:fe n :be m}."
+    []
+    (reduce (fn [acc c] (update acc (:where c) (fn [n] (+ 1 (or n 0)))))
+            {:fe 0 :be 0}
+            (cells)))
+
+  (defn fe-declare
+    "Hiccup declaring browser-held cells in the page's store: [[kind name init] \u2026].
+     The declaration is QUEUED in `window.__pulseFeQ` and drained when the chip
+     boots, so a view can carry it without knowing whether the chip's script has
+     run yet."
+    [cells]
+    [:script
+     (str "(function(){var q=window.__pulseFeQ=window.__pulseFeQ||[];"
+          (apply str
+                 (map (fn [c]
+                        (str "q.push(['" (nth c 0) "','" (nth c 1) "',"
+                             (Jason/encode! (interop/jsonable (nth c 2))) "]);"))
+                      cells))
+          "})();")])
+  ```
 
 ## Vitals and snapshot
 
@@ -215,6 +309,7 @@ kind histogram, and the tracked cells.
              :name (:name e)
              :age-ms (- now (:since e))
              :writable (some? (:writer (:meta e)))
+             :where (get (:meta e) :where :be)
              :value (try (pr-str ((:reader (:meta e)))) (catch _ ":unreadable"))})
           (registry/entries (reg)))))
 
@@ -237,6 +332,7 @@ kind histogram, and the tracked cells.
                       (filter (fn [e] (= :recompute (:kind e))))
                       (mapv (fn [e] (str (:label e))))))]
     {:vitals (vitals)
+     :locality (locality)
      :by-kind (by-kind)
      :cells (cells)
      :trace {:recomputed recent
@@ -403,13 +499,41 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "#pc-tl-actions{margin-top:6px}#pc-export{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 8px;font:inherit;font-size:10px;cursor:pointer}"
    "#pc-export-out{width:100%;height:120px;margin-top:6px;background:#0a0e14;color:#c9d1d9;border:1px solid #1f2733;border-radius:6px;font:10px/1.35 ui-monospace,Menlo,monospace;padding:6px;box-sizing:border-box;resize:vertical}"
    "#pc-graph{margin-bottom:10px;background:#121821;border:1px solid #1f2733;border-radius:8px;padding:6px 10px}"
-   "#pc-graph svg{display:block}#pc-graph text{font-family:inherit}.pcempty{color:#7d8590;font-size:10px}"))
+   "#pc-graph svg{display:block}#pc-graph text{font-family:inherit}.pcempty{color:#7d8590;font-size:10px}"
+   ".pcg{color:#7d8590;font-size:10px;text-transform:uppercase;letter-spacing:.1em;margin:6px 0 2px}"
+   ".pcc .w{font-style:normal;font-size:9px;text-transform:uppercase;letter-spacing:.08em;border:1px solid;border-radius:4px;padding:0 4px;margin-right:6px}"
+   ".pcc .w.fe{color:#46d18f;border-color:#46d18f}"
+   ".pcc .w.be{color:#39d0d8;border-color:#39d0d8}"))
 
 (defn- chip-js []
   (str
    "(function(){var root=document.getElementById('pulse-chip');"
    "var ep=root.getAttribute('data-ep');"
    "var badge=document.getElementById('pc-badge'),panel=document.getElementById('pc-panel');"
+      ;; \u2500\u2500 the frontend store: cells whose value lives in this page \u2500\u2500\u2500\u2500\u2500\u2500\u2500────\u2500
+      "var fe={},feSubs=[],outq=[],lastSnap=null;"
+      "function feDeclare(kind,name,init){fe[name]={kind:kind,name:name,value:init,where:'fe'};send(['fe-track',kind,name]);feSubs.forEach(function(f){f()})}"
+      "function feSet(name,value){if(!fe[name])fe[name]={kind:'atom',name:name,value:value,where:'fe'};fe[name].value=value;"
+      "send(['fe-set',name,value]);feSubs.forEach(function(f){f()});renderCells(lastSnap)}"
+      "function feEval(s){try{return JSON.parse(s)}catch(e){return s}}"
+      "window.__pulseFe={declare:feDeclare,set:feSet,get:function(n){return fe[n]?fe[n].value:undefined},"
+      "cells:function(){return Object.keys(fe).map(function(k){return fe[k]})},"
+      "subscribe:function(f){feSubs.push(f);return function(){feSubs=feSubs.filter(function(g){return g!==f})}}};"
+      "function esc(s){return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split('\"').join('&quot;')}"
+      "function feBadge(w){return '<i class=\"w '+w+'\">'+w+'</i>'}"
+      "function renderCells(s){s=s||lastSnap||{};lastSnap=s;var rows={};"
+      "(s.cells||[]).forEach(function(c){rows[c.name]={kind:c.kind,name:c.name,value:c.value,where:c.where||'be',writable:c.writable}});"
+      "Object.keys(fe).forEach(function(k){var l=fe[k];rows[k]={kind:l.kind,name:l.name,value:String(l.value),where:'fe',writable:true}});"
+      "function row(c){return '<div class=pcc>'+feBadge(c.where==='fe'?'fe':'be')+'<span class=k>'+esc(c.kind)+':'+esc(c.name)+'</span>'+'<span class=v>'+esc(c.value)+'</span>'+("
+      "c.writable?'<button class=\"set\" data-cell=\"'+esc(c.name)+'\" data-where=\"'+((c.where==='fe')?'fe':'be')+'\" data-val=\"'+esc(c.value)+'\">\u270e</button>':'')+'</div>'}"
+      "var fs=Object.keys(rows).filter(function(k){return rows[k].where==='fe'}),bs=Object.keys(rows).filter(function(k){return rows[k].where!=='fe'});"
+      "var el=document.getElementById('pc-cells');"
+      "el.innerHTML=(fs.length?'<div class=pcg>frontend \u00b7 held in this page ('+fs.length+')</div>'+fs.map(function(k){return row(rows[k])}).join(''):'')"
+      "+(bs.length?'<div class=pcg>backend \u00b7 held on the node ('+bs.length+')</div>'+bs.map(function(k){return row(rows[k])}).join(''):'');"
+      "document.getElementById('pc-label').textContent=fs.length+'fe \u00b7 '+bs.length+'be';"
+      "el.querySelectorAll('.set').forEach(function(b){b.onclick=function(){var n=b.getAttribute('data-cell'),v=prompt('set '+n+' to (edn):',b.getAttribute('data-val'));"
+      "if(v==null)return;if(b.getAttribute('data-where')==='fe')feSet(n,feEval(v));else send(['set',n,v])}})}"
+      "function drainFeQ(){var q=window.__pulseFeQ||[];window.__pulseFeQ=[];q.forEach(function(c){feDeclare(c[0],c[1],c[2])})}"
    "badge.onclick=function(){panel.hidden=!panel.hidden};"
    ;; instrument toggles → Studio.toggle; reflect state (incl. restored) on the buttons
    "function syncTools(){if(!window.Studio)return;root.querySelectorAll('.pct').forEach(function(b){"
@@ -422,21 +546,21 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    "document.getElementById('pc-vitals').innerHTML="
    "`<div class=pcv><b>${s.vitals['tracked']}</b><i>tracked</i></div>`+"
    "`<div class=pcv><b>${fb(s.vitals['retained-bytes'])}</b><i>retained</i></div>`;"
-   "document.getElementById('pc-cells').innerHTML=(s.cells||[]).map(c=>"
-   "`<div class=pcc><span class=k>${c.kind}:${c.name}</span><span class=v title=\"${String(c.value).replace(/\"/g,'&quot;')}\">${c.value}</span>${c.writable?`<button class=set data-cell=\"${c.name}\" data-val=\"${String(c.value).replace(/\"/g,'&quot;')}\">✎</button>`:''}</div>`).join('');"
-   "document.querySelectorAll('#pc-cells .set').forEach(function(b){b.onclick=function(){var v=prompt('set '+b.getAttribute('data-cell')+' to (edn):',b.getAttribute('data-val'));if(v!=null)send(['set',b.getAttribute('data-cell'),v])}});"
+   "renderCells(s);"
    "var t=s.trace||{},rc=(t.recomputed||[]);var tl=document.getElementById('pc-trace');"
    "var ce=document.getElementById('pc-cost');if(ce&&s.cost)ce.innerHTML=s.cost;"
    "var ge=document.getElementById('pc-graph');if(ge&&s.graph)ge.innerHTML=s.graph;"
    "var f=s.frame;var fl=f?`t${f.t} · ${f.kind} · ${f['op-count']} op · ${(+f.ms).toFixed(1)}ms`+(f.event&&f.event!=='nil'?` · ${f.event}`:''):'';"
    "if(tl)tl.innerHTML=rc.length?`↻ ${rc.join(', ')} → ${t['patch-ops']} op<br>${fl}`:(fl||'idle');}"
-   "var ws=null;function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m))}"
+   "var ws=null;function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m));else outq.push(m)}"
    "function conn(){ws=new WebSocket(ep);window.__pulseWs=ws;"
+   "ws.onopen=function(){var q=outq.splice(0);q.forEach(function(m){ws.send(JSON.stringify(m))})};"
    "ws.onmessage=function(e){var m=JSON.parse(e.data);"
    "if(m.msg==='snapshot'){render(m);if(window.Studio&&Studio.onSnapshot)Studio.onSnapshot(m)}"
+      "else if(m.msg==='fe-set'){if(fe[m.cell]){fe[m.cell].value=m.value;feSubs.forEach(function(f){f()})}renderCells(lastSnap)}"
    "else if(window.Studio&&Studio.onMessage)Studio.onMessage(m)};"
    "ws.onclose=function(){setTimeout(conn,1000)};}conn();"
-   "window.__pulseSend=send;})();"))
+   "window.__pulseSend=send;drainFeQ();renderCells(null);})();"))
 ```
 
 ## The bold part: inject the chip into any live view, natively
@@ -760,6 +884,8 @@ its router; `mount` returns everything a host needs.
       (= verb "time")     (reply state (assoc (or (frame-at (nth req 1)) {:t (nth req 1) :missing true}) :msg "time"))
       (= verb "inspect")  (reply state (assoc (inspect (into [] (nth req 1))) :msg "inspect"))
       (= verb "set")      (reply state (assoc (set! (nth req 1) (nth req 2)) :msg "set"))
+      (= verb "fe-track") (reply state (assoc (fe-track! (nth req 1) (nth req 2)) :msg "fe-track"))
+      (= verb "fe-set")   (reply state (assoc (fe-push! (nth req 1) (nth req 2)) :msg "fe-set"))
       (= verb "export")   (let [steps (scenario (nth req 1) (nth req 2))]
                             (reply state {:msg "export"
                                           :steps (count steps)
