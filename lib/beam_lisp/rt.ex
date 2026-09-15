@@ -1959,6 +1959,17 @@ defmodule BeamLisp.RT do
       :empty ->
         nil
 
+      {[], nil, cursor} ->
+        # An EMPTY chunk with seqs still in the cursor: the first seq's length
+        # was an exact multiple of the chunk size, so draining it hit n=0 right
+        # at its boundary and the next pull found it exhausted with nothing
+        # taken. `chain([], …)` is `nil` — it would END the seq here and DROP
+        # every remaining input (the `(concat (vec (range 32)) [:x])` bug: the
+        # 32-element head consumed the chunk exactly, and `:x` vanished). Recur
+        # straight into the cursor instead, so an empty boundary chunk advances
+        # to the next seq rather than terminating.
+        concat_chunk(nil, cursor)
+
       {elems, nil, cursor} ->
         if BeamLisp.SeqCursor.cell(cursor) == nil,
           do: elems,
