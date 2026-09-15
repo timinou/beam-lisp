@@ -68,7 +68,7 @@
     (when (seq roots)
       (let [sources (reduce
                       (fn [acc f]
-                        (let [ns-str (u/ns-of (File/read! f))]
+                        (let [ns-str (u/ns-of (BeamLisp.Loader/read_source f))]
                           (if (or (= "user" ns-str)
                                   (contains? #{ "codebase" "typed"} ns-str)
                                   (some (fn [pr] (= ns-str (get pr 0))) acc))
@@ -99,9 +99,15 @@
 (defn- source-text
   "A source's bytes: the file at `path`, or — for a namespace with no file of
    its own (the engine's `codebase`/`typed`) — the text the loader would compile
-   for that name, found on the load path."
+   for that name, found on the load path.
+
+   The FILE branch goes through the loader for the same reason the name branch
+   does: a literate `.bl.md` source is its code cells, not its prose, and
+   `read_source` is the one rule that says so. Reading the bytes here instead
+   would analyze a document as if it were code whenever the extension is not
+   `.bl` — a wrong index, cached under a hash that looks perfectly valid."
   [ns-str path]
-  (if (nil? path) (BeamLisp.Loader/source_content ns-str) (File/read! path)))
+  (if (nil? path) (BeamLisp.Loader/source_content ns-str) (BeamLisp.Loader/read_source path)))
 
 (defn- sha-of
   "A source's content hash. Content and nothing else: a file moved or renamed
@@ -203,17 +209,14 @@
   (assoc f :db/id (mod (get f :db/id) 1000000)))
 
 (defn- load-facts!
-  "Write `facts` into `conn` through the bulk path when this build carries one.
+  "Write `facts` into `conn` through the bulk path.
 
    `datom/load-facts!` skips everything the general pipeline must do for data a
    caller warrants to be new and clean (no tx fns, no tempids, no store scans
-   per op). The fallback keeps the shape honest on a build without it: same
-   answers, slower."
+   per op): `assemble!` hands it a FRESH conn and one band per source, so every
+   id it writes names nothing yet. See `datom/load-facts!` for the warrant."
   [conn facts]
-  (let [bulk (try (BeamLisp.Env/fetch! "datom" "load-facts!") (catch e nil))]
-    (if (some? bulk)
-      (bulk conn facts)
-      (datom/transact! conn facts))))
+  (datom/load-facts! conn facts))
 
 (defn- one-band
   "`acc` grown by source `i`'s facts — its id band applied, its stats counted."
@@ -259,7 +262,12 @@
         conn (codebase/connect-codebase)]
     (load-facts! conn (to-list (:facts acc)))
     {:conn conn
-     :per-source (to-list (filterv (fn [r] (some? (:file r))) (:per-source acc)))
+     ; The ENGINE's rows are in here too, with a nil `:file` — they are what
+     ; `code/list` reports for the language's own group, and dropping them (as
+     ; this did) told every client that the engine holds zero functions. Caught
+     ; by `examples/mcp-demo.bl`, which asserts the first group is non-empty: the
+     ; demo is the client that reads this at face value.
+     :per-source (to-list (:per-source acc))
      :stats {:files n :functions (:functions acc)
              :analyzed (:analyzed acc) :cached (:cached acc)
              :skipped (to-list (:skipped acc))}}))
@@ -368,30 +376,64 @@
        (job)
        (daemon-run job)))))
 
-(defn reuse-for-paths
-  "The tree index at `root`, when it holds exactly the sources `paths` name —
-   otherwise nil.
+(defn covers?
+  "Does `index` hold exactly this corpus — the same namespaces in the same
+   bands, each with the same content hash? `pairs` are `[ns sha]`, the shape an
+   index's `:sources` already has.
 
    EXACT, not a superset, and that is the whole subtlety. `impact` and `callers`
    answer from the whole graph, so an index carrying one more file than the
    caller asked about would answer with a caller that file contributes — a wrong
-   answer that looks like a more complete one. A narrower question therefore
-   falls back to its own path, and only the question that means \"this tree\"
-   reuses the tree's index.
+   answer wearing the costume of a more complete one. A narrower question
+   therefore falls back to its own path, and only a question that means THIS
+   TREE reuses the tree's index.
 
-   Comparing content hashes rather than paths is what makes it hit: the daemon
-   built its index from env.bl's absolute `:paths` while a command may have
-   arrived with relative ones, and a file moved with its text intact is the same
-   sources for this purpose."
+   Compare CONTENT, not paths: the daemon built its index from env.bl's absolute
+   `:paths` while a command may arrive with relative ones, and a file moved with
+   its text intact is the same sources here.
+
+   Compare the SET, not the sequence, and that is a correction rather than a
+   liberty. An index's id bands follow its own source order, but a caller that
+   REUSES the conn never sees a band — it asks by name and by attribute, and the
+   bands exist only so two files cannot collide. Both orders still name the same
+   sources, so both must reuse; requiring the sequence made the MCP mount pay
+   for its own index AND the tree's (its `project-mount` reads the roots in
+   `expand-targets` order while `code.index` sorts), which is the duplication
+   this whole namespace exists to remove. Order still matters to an index's own
+   IDENTITY (`key-of`), where a different order really is a different index."
+  [index pairs]
+  (let [as-rows (fn [ps]
+                  (sort (map (fn [p] (str (get p 0) " " (get p 1))) (to-list ps))))]
+    (= (as-rows (:sources index)) (as-rows pairs))))
+
+(defn sha-of-pair
+  "The content hash of a `[ns path]` pair — the same hash an index keys its
+   `:sources` by, so a caller holding paths can build `[ns sha]` pairs to compare
+   with `covers?`."
+  [pair]
+  (sha256-hex (source-text (get pair 0) (get pair 1))))
+
+(defn reuse-for-paths
+  "The tree index at `root`, when it holds exactly the sources `paths` name —
+   otherwise nil.
+
+   `paths` are what a question arrives with: directories (the usual `bl ask …
+   src`), single files, or both. They are expanded to loader sources here, by
+   the loader's own rule, because the index holds FILES and a caller naming a
+   directory means every source under it."
   [root paths]
-  (let [want (sort (to-list (map (fn [p] (sha256-hex (File/read! p))) (to-list paths))))
-        idx (ensure-tree root)]
+  (let [idx (ensure-tree root)]
     (when (some? idx)
-      ; The engine's two bands lead every index (see `engine-pairs`) and are
-      ; never part of a caller's question about ITS sources, so they are dropped
-      ; from the comparison rather than counted against every caller.
-      (let [have (sort (to-list (map (fn [s] (get s 1)) (drop 2 (to-list (:sources idx))))))]
-        (if (= (to-list want) (to-list have)) idx nil)))))
+      (let [files (to-list (sort (mapcat u/expand-targets (to-list paths))))
+            want (mapv (fn [f] [(u/ns-of (BeamLisp.Loader/read_source f))
+                               (sha256-hex (BeamLisp.Loader/read_source f))])
+                       files)]
+        ; The engine's two bands lead every index (see `engine-pairs`) and are
+        ; never part of a caller's question about ITS sources, so they are dropped
+        ; from the comparison rather than counted against every caller.
+        (if (covers? (assoc idx :sources (drop 2 (to-list (:sources idx)))) want)
+          idx
+          nil)))))
 
 (def sigs
   "The type seeds the indexer reads return annotations against — the same three

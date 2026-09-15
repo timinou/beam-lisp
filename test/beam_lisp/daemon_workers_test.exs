@@ -16,8 +16,12 @@ defmodule BeamLisp.Daemon.WorkersTest do
   # restarted it. A daemon that looks alive and can do nothing is the worst way
   # to fail, which is this module's own stated rule.
 
+  # The supervisor is OWNED by the test — see the note in
+  # `daemon_index_worker_test.exs`. `ensure_started/1` LINKS it to the caller, so
+  # the case that called it exited and took the supervisor with it; the next case
+  # then raced a supervisor on its way down.
   setup do
-    {:ok, _} = BeamLisp.Daemon.Workers.ensure_started()
+    start_supervised!({BeamLisp.Daemon.Workers, root: File.cwd!(), build: false})
     :ok
   end
 

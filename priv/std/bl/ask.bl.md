@@ -238,7 +238,7 @@ set lives in memory for this run only — the same answers, just not remembered.
   [sigs paths]
   (let [paths (u/to-list paths)
         root (first paths)
-        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (File/read! p))) paths)))
+        nss-of (fn [] (u/to-list (map (fn [p] (u/ns-of (BeamLisp.Loader/read_source p))) paths)))
         shared (try (code.index/reuse-for-paths (BeamLisp/cwd) paths) (catch e nil))]
     (if (some? shared)
       {:conn (:conn shared) :nss (nss-of)}

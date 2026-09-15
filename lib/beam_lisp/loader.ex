@@ -494,7 +494,15 @@ defmodule BeamLisp.Loader do
   # name made `find_file/1` reject the file as `{:wrong_ns, …}`, so
   # `source_content/1` answered nil for a namespace that ships in priv, and the
   # MCP codebase mount (which indexes exactly this file) failed at first use.
-  defp declared_ns(source) do
+  # PUBLIC because it is the ONE rule for a question every layer asks: the loader
+  # asks it to accept or reject a candidate file, and `bl.util/ns-of` — which the
+  # index, the MCP mount and `bl ask` all ask per source — asks it to name what it
+  # is about to index. Answering that by parsing the WHOLE source cost 949 ms over
+  # a 43-source tree, on every index key check; this scan costs microseconds
+  # because it stops at the name. Two implementations of one rule also means two
+  # answers when they disagree, and here a disagreement silently drops a file from
+  # an index.
+  def declared_ns(source) do
     case skip_leading(source) do
       "(" <> rest ->
         rest = skip_leading(rest)

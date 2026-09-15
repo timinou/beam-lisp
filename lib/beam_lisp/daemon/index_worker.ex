@@ -99,11 +99,29 @@ defmodule BeamLisp.Daemon.IndexWorker do
   stored — the dashboard renders what it finds and ignores what it does not.
   """
   def progress!(frame) when BeamLisp.Guards.is_bl_map(frame) do
-    :ets.insert(@table, {:progress, Map.put(frame, :at, System.system_time(:millisecond))})
+    :ets.insert(@table, {:progress, row(frame)})
     :ok
   rescue
     ArgumentError -> :ok
   end
+
+  # One row shape, whichever frame arrived. A build reports itself as `:start`
+  # and then `:file` while it runs; a reader that matched on `:building` would
+  # fall through to "nothing indexed" in the middle of a build — the one moment
+  # the row exists for. The worker is the row's single writer, so the mapping
+  # from a build's frames to a readable one lives here, not in each reader (the
+  # dashboard, `/model`, `bl daemon status` and `bl ui` all render this shape).
+  defp row(f) do
+    now = System.system_time(:millisecond)
+
+    case Map.get(f, :phase) do
+      :start -> %{phase: :building, done: 0, total: get(f, :n), file: nil, at: now}
+      :file -> %{phase: :building, done: get(f, :i) + 1, total: get(f, :n), file: f[:file], at: now}
+      _ -> Map.put(f, :at, now)
+    end
+  end
+
+  defp get(f, k), do: Map.get(f, k) || 0
 
   # The other half of "total on purpose": a frame that is not a beam-lisp map is
   # not a frame at all — a Vector or a Set is an Erlang map carrying `:__struct__`,
@@ -144,7 +162,10 @@ defmodule BeamLisp.Daemon.IndexWorker do
     # that the work happened before anyone asked. Deferred through the mailbox so
     # `init` stays instant and the daemon's listener is bound before the tree is
     # read — the build then runs in this worker, where nobody is waiting.
-    send(self(), :build)
+    #
+    # `build: false` is for a caller that owns this worker for one assertion (a
+    # test): starting a supervisor must not index a real tree behind its back.
+    if Keyword.get(opts, :build, true), do: send(self(), :build)
 
     {:ok, %{root: Keyword.get(opts, :root) || File.cwd!(), built: nil}}
   end

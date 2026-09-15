@@ -16,8 +16,15 @@ defmodule BeamLisp.Daemon.IndexWorkerTest do
   # these tests assert the property at the only level that matters — table
   # ownership — without standing up the bl runtime.
 
+  # The supervisor is OWNED by the test (ExUnit stops it after the case), not
+  # linked to whichever process called `ensure_started/1` first. That link was
+  # the whole flake: the case that started it exited, taking the supervisor down
+  # with it, and the next case's setup found the name either still taken (by a
+  # supervisor already shutting down) or free but about to die. `build: false`
+  # because this file pins OWNERSHIP, not indexing — a real tree index behind a
+  # unit test's back is both slow and not the thing under test.
   setup do
-    {:ok, _} = BeamLisp.Daemon.Workers.ensure_started()
+    start_supervised!({BeamLisp.Daemon.Workers, root: File.cwd!(), build: false})
     :ok
   end
 
