@@ -47,9 +47,23 @@ defmodule BeamLisp.ClojureCompatDocsTest do
 
     assert out =~ "tx-data datoms: 10"
     assert out =~ "in credit: ([\"Bank\" 250] [\"Cash\" 100])"
-    assert out =~ "pull cash: {:account/name \"Cash\", :account/balance 100}"
+    assert out =~ ~r/pull cash: \{.*:account\/name "Cash".*\}/
+    assert out =~ ~r/pull cash: \{.*:account\/balance 100.*\}/
     assert out =~ "bank name: Bank balance: 250"
     assert out =~ "accounts now: 3"
     assert out =~ "accounts if applied: 4"
+  end
+
+  test "docs/datom-for-accounting.bl.md exercises decimals, tuple keys and guards" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-for-accounting.bl.md") end)
+
+    assert out =~ "ascending: (\"9.99\" \"100.05\" \"100.50\")"
+    assert out =~ "1.0M == 1.00M by value: true"
+    assert out =~ "derived key: [100 1]"
+    assert out =~ "duplicate (100,1) refused: refused"
+    assert out =~ "distinct postings: 2"
+    assert out =~ "balanced entry committed: 2"
+    assert out =~ "unbalanced entry: refused"
+    assert out =~ "batch 2 datoms after refusal: 0"
   end
 end
