@@ -7,6 +7,8 @@
 //
 // Wire protocol (JSON over a WebSocket):
 //   server → client:  ["mount", html]            first paint (full HTML)
+//                     ["style", css]              rules for classes the next
+//                                                 mount/patch introduces
 //                     ["patch", ops]              a list of patch ops
 //                     ["denied", why]             an intent was refused
 //   client → server:  ["event", term, data]      a fired event + its data
@@ -401,6 +403,13 @@
         if (kind === "mount") {
           root.innerHTML = a;
           announce("live:mount", { root: root });
+        } else if (kind === "style") {
+          // the head sheet holds what the warm reached; a socket that renders
+          // a class the warm never did ships its rule first (see socket.bl
+          // ship-css!). Append, never replace: the warm rules stay.
+          let tag = document.getElementById("live-style");
+          if (!tag) { tag = document.createElement("style"); tag.id = "live-style"; document.head.appendChild(tag); }
+          tag.appendChild(document.createTextNode(a + "\n"));
         } else if (kind === "patch") {
           applyPatch(root, a);
           announce("live:patch", { root: root, ops: a });
