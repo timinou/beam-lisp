@@ -1,7 +1,7 @@
 defmodule BeamLisp.Daemon.Workers do
   @moduledoc """
-  The daemon's three stateful workers — the command `Executor`, the
-  `WatchRegistry` and the tree's index owner (`IndexWorker`) — under ONE
+  The daemon's four workers — the command `Executor`, the `WatchRegistry`, the
+  tree's index owner (`IndexWorker`) and the stderr device (`StdErr`) — under ONE
   supervisor, so a death is a RESTART.
 
   ## Why this module exists
@@ -35,9 +35,21 @@ defmodule BeamLisp.Daemon.Workers do
   that exits (every ExUnit case) takes the whole tree with it, and the next
   caller races a supervisor that is on its way down. Owning the lifecycle
   explicitly is the only shape that works for both.
+
+  ## Why the stderr device is FIRST
+
+  `StdErr` is the tree's first child because the other two can print: the
+  executor runs programs (whose stderr must become frames on a client socket)
+  and the watcher logs what it applies. Started last, a crash-restart of the
+  supervisor could bring them up before the device exists, and their first lines
+  would go to the daemon's fd 2 instead — the exact loss this worker exists to
+  prevent. `:rest_for_one` would express that ordering as an invariant rather
+  than a convention, but it would also mean a stderr-device crash TAKES DOWN a
+  running command; `:one_for_one` with the device first keeps a command alive
+  and merely loses one device generation.
   """
 
-  @workers [BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry]
+  @workers [BeamLisp.Daemon.StdErr, BeamLisp.Daemon.Executor, BeamLisp.Daemon.WatchRegistry]
 
   @doc """
   The supervision tree — started by the daemon, owned by its caller.

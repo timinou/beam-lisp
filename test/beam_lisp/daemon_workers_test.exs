@@ -25,11 +25,29 @@ defmodule BeamLisp.Daemon.WorkersTest do
     :ok
   end
 
-  test "all three workers run under the supervisor" do
+  test "every worker runs under the supervisor" do
+    # The stderr device is nameless by design — it holds :standard_error.
+    assert Process.whereis(:standard_error)
     assert Process.whereis(BeamLisp.Daemon.Executor)
     assert Process.whereis(BeamLisp.Daemon.WatchRegistry)
     assert Process.whereis(BeamLisp.Daemon.IndexWorker)
-    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 3
+    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 4
+  end
+
+  test "the stderr device owns :standard_error, and gives it back on stop" do
+    # A command's stderr is only forwarded if the daemon's device HOLDS the
+    # global name: `IO.puts(:stderr, …)` resolves the atom, so a device that is
+    # merely alive routes nothing.
+    assert is_pid(Process.whereis(:standard_error))
+
+    dev = BeamLisp.Daemon.StdErr.device()
+    assert is_pid(dev)
+
+    # Stop the tree the way the daemon does, and the name must go back to the
+    # device that had it — otherwise every later `IO.puts(:stderr, …)` in this
+    # VM raises, in callers that have nothing to do with the daemon.
+    Supervisor.stop(BeamLisp.Daemon.Workers)
+    assert Process.whereis(:standard_error) == dev
   end
 
   test "a killed worker is restarted, not lost" do

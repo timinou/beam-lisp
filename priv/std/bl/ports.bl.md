@@ -199,9 +199,10 @@ it.
    with the command, which is the whole failure this change removes. A VM with no
    session (a cold command) has nothing to ask, and nothing to report.
 
-   The report goes to `println`, like the URL above it, and NOT to `io-err`: under
-   the daemon a command's stderr is not forwarded to the client, so an error-level
-   line here would reach nobody. Two lines, one stream, one story."
+   The report goes to `io-err` — it is a status line about work the session is
+   doing, not the command's output. It used to have to go to stdout because the
+   daemon dropped a command's stderr; `BeamLisp.Daemon.StdErr` forwards it now, so
+   the line can be on the stream it belongs to."
   []
   (let [p (erlang/whereis :"Elixir.BeamLisp.Daemon.IndexWorker")]
     (if (= :undefined p)
@@ -209,7 +210,7 @@ it.
       (do
         (BeamLisp.Daemon.IndexWorker/ensure_building)
         (let [s (BeamLisp.Daemon.IndexWorker/progress)]
-          (println
+          (u/io-err
             (str "  index: "
                  (case (:phase s)
                    :building (str "building now — " (get s :done) "/"
