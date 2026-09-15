@@ -174,6 +174,24 @@
 
 (def REGISTRY :datom-conn-registry)
 
+(def GUARD-REGISTRY :datom-guard-registry)
+
+(defn- guard-registry
+  "The process-wide map from a store key to its transaction GUARDS: a map
+   `{store-key {guard-name pred}}` where each `pred` is `(fn [report] -> nil |
+   problems)`. A guard runs in the writer over the fully-resolved speculative
+   report BEFORE the real commit; a non-nil result aborts the transaction.
+   Named like the connection registry so the lookup is race-safe."
+  []
+  (let [existing (erlang/whereis GUARD-REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(->tuple-2 :name GUARD-REGISTRY)]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
 (defn- registry
   "The process-wide map from a store to its writer and basis.
 
@@ -893,6 +911,74 @@
   [conn tx-data]
   (with-writer conn (fn [] (with-in-writer conn tx-data))))
 
+;; ── transaction guards (PLAN-115 B3) ────────────────────────────────────────
+;;
+;; A GUARD is a predicate `(fn [report] -> nil | problems)` run in the writer
+;; over the fully-resolved report — `:db-before`, `:db-after` (speculative),
+;; `:tx-datoms` — AFTER the transaction realizes but BEFORE it commits. A
+;; non-nil result aborts the commit. This is the one seam where "every committed
+;; write is validated" can be enforced without a second engine: it reuses the
+;; SAME speculative `:db-after` that `with` builds, so a guard sees exactly the
+;; database the transaction would produce, and refusing it means nothing was
+;; written. datahike's `datahike.tx-preds/register-tx-pred!` projects onto this.
+
+(defn guard!
+  "Register `pred` under `name` as a writer-run transaction guard on `conn`'s
+   store. `pred` is `(fn [report] -> nil | problems)`; a non-nil `problems`
+   aborts any transaction with `ex-info \"transaction refused\"`. Idempotent per
+   `[store name]`. Returns the store key."
+  [conn name pred]
+  (register-store-guard! (store-key (:store conn)) name pred))
+
+(defn unguard!
+  "Remove the guard registered under `name` on `conn`'s store."
+  [conn name]
+  (unregister-store-guard! (store-key (:store conn)) name))
+
+(defn register-store-guard!
+  "Register `pred` as a guard on `store-k` (the store key, or any stable
+   per-store identity a shim supplies). datahike's `register-tx-pred!` keys by a
+   store id and registers ONE predicate; passing `:default` for `name` matches
+   that single-predicate shape while `guard!` allows several by name."
+  ([store-k pred] (register-store-guard! store-k :default pred))
+  ([store-k name pred]
+   (agent-get-and-update
+     (guard-registry)
+     (fn [reg]
+       (let [cur (get reg store-k {})]
+         (->tuple-2 store-k (assoc reg store-k (assoc cur name pred)))))
+     30000)))
+
+(defn unregister-store-guard!
+  "Remove a guard on `store-k`. With no `name`, removes the `:default` one."
+  ([store-k] (unregister-store-guard! store-k :default))
+  ([store-k name]
+   (agent-get-and-update
+     (guard-registry)
+     (fn [reg]
+       (let [cur (get reg store-k {})]
+         (->tuple-2 :ok (assoc reg store-k (dissoc cur name)))))
+     30000)))
+
+(defn- guards-for
+  "The guard predicates registered on `store`, as a list, or `()`."
+  [store]
+  (let [reg (Agent/get (guard-registry) (fn [m] m))]
+    (vals (get reg (store-key store) {}))))
+
+(defn- run-guards!
+  "Run every guard on `conn`'s store over `report`. The FIRST guard whose result
+   is non-nil aborts with `ex-info \"transaction refused\"` carrying its problems;
+   all pass ⇒ nil. Called inside the writer, before the real commit."
+  [conn report]
+  (let [gs (guards-for (:store conn))]
+    (reduce (fn [_ pred]
+              (let [problems (pred report)]
+                (if (nil? problems)
+                  nil
+                  (throw (ex-info "transaction refused" {:problems problems})))))
+            nil gs)))
+
 (defn- with-in-writer
   "The body of `with`, already inside the writer process. Mirrors
    `transact-in-writer`, but commits into an overlay and advances no
@@ -942,7 +1028,11 @@
         ; runs first, on the unexpanded ops — which is correct, because
         ; neither form introduces a tempid.
         resolved (datom.tx/resolve-tempids store schema ops (fn [] (next-entity-id store)))
-        expanded (datom.tx/expand-store-ops store schema (get resolved 0))
+        expanded0 (datom.tx/expand-store-ops store schema (get resolved 0))
+        ; DERIVE tuple values (`:db.type/tuple` / `:db/tupleAttrs`) from the
+        ; components this transaction touched, and append them BEFORE validation
+        ; so composite `:db.unique/identity` is enforced on the derived tuple.
+        expanded (into expanded0 (datom.tx/derive-tuple-ops store schema expanded0))
         problems (datom.tx/validate store schema expanded)]
     (if (seq problems)
       (throw (ex-info "transaction rejected by schema" {:problems problems}))
@@ -982,7 +1072,15 @@
    a unique value, appending to the indexes — and none of it is atomic as
    a unit. It is correct because exactly one process runs it at a time."
   [conn tx-data]
-  (let [db-before (db conn)
+  (let [; Guards run over the fully-resolved report BEFORE the real commit. When
+        ; any are registered, a speculative `with` builds the exact `:db-after`
+        ; and `:tx-datoms` the transaction would produce (over an overlay that
+        ; never touches the real store), the guards inspect it, and only if they
+        ; all pass does the real pipeline run. A refusal throws before a single
+        ; datom reaches the store — the whole point of a writer-run predicate.
+        _ (when (seq (guards-for (:store conn)))
+            (run-guards! conn (with-in-writer conn tx-data)))
+        db-before (db conn)
         result (run-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before tx-data)
         tx (get result :tx)]
     ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
