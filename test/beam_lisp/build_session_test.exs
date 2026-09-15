@@ -22,7 +22,7 @@ defmodule BeamLisp.BuildSessionTest do
   setup do
     BeamLisp.init()
     BeamLisp.Loader.ensure_loaded("claim")
-    cache = "/tmp/beam_lisp_session_cache"
+    cache = Path.join(System.tmp_dir!(), "beam_lisp_session_#{System.pid()}")
     File.rm_rf!(cache)
     File.mkdir_p!(cache)
     System.put_env("XDG_CACHE_HOME", cache)
@@ -91,28 +91,49 @@ defmodule BeamLisp.BuildSessionTest do
   # Reaching it from here would mean going through the Elixir/ bl boundary for no
   # extra coverage.
 
+  # The CLI is the thing that journals a build, and `bl.cli/run-argv` is the
+  # re-entrant seam that makes it testable from here: it parses argv, takes the
+  # claim, writes the events and releases the claim, all in THIS VM — so the
+  # journal it writes is the journal this test reads.
+  #
+  # What this replaced: a `System.cmd("mix", ["bl", "build", …])`. A subprocess
+  # is a separate VM with its own journal, so the test could not assert on
+  # anything the build wrote — it spawned the build, threw the result away, then
+  # fired the two events by hand and asserted they were there. It timed out at
+  # the 60 s default on a cold tree (the subprocess recompiles the prelude) and
+  # its own comment admitted the assertion proved nothing about the build. The
+  # same run then raced the next test's `File.rm_rf!` on a fixed /tmp path.
   @tag :slow
-  test "a build writes its own start and finish into reload's journal" do
-    out = "/tmp/beam_lisp_session_out"
-    File.rm_rf!(out)
-
-    src = Path.join("/tmp/beam_lisp_session_src", "tiny.bl")
+  test "the CLI build writes build/start and build/done into the journal", %{cache: cache} do
+    out = Path.join(cache, "out")
+    src = Path.join(cache, "src/tiny.bl")
     File.mkdir_p!(Path.dirname(src))
     File.write!(src, "(ns tiny) (defn answer [] 42)\n")
 
+    BeamLisp.Loader.ensure_loaded("bl.cli")
+    run = BeamLisp.Env.fetch!("bl.cli", "run-argv")
+
     before = call("reload", "journal", []) |> BeamLisp.Vector.to_list() |> length()
-    {_o, code} = System.cmd("mix", ["bl", "build", src, "--out", out], stderr_to_stdout: true)
+    # Bind THIS command's cwd to the scratch tree, the way the daemon binds a
+    # client's. Without it the build discovers the REPO's env.bl by walking up
+    # from the VM's cwd, and its `:ex` stage compiles all of lib/**/*.ex inside
+    # this test — which is what made it exceed the 60 s budget when the
+    # subprocess was replaced by an in-process call.
+    code =
+      BeamLisp.with_cwd(cache, fn ->
+        BeamLisp.RT.invoke(run, [["build", src, "--out", out]])
+      end)
     assert code == 0
 
-    after_ = call("reload", "journal", []) |> BeamLisp.Vector.to_list()
-    # A CLI build is a separate VM, so ITS journal is not this one's. What this
-    # asserts is the shape the CLI writes: run it in-process through the same
-    # fetch!/invoke path the CLI uses, then read the journal here.
-    call("reload", "event!", [%{event: :"build/start", out: out, sources: 1}])
-    call("reload", "event!", [%{event: :"build/done", out: out, built: 1, errors: 0}])
     j = call("reload", "journal", []) |> BeamLisp.Vector.to_list()
-    assert length(j) == length(after_) + 2
-    assert List.last(j)[:event] == :"build/done"
-    assert length(j) >= before + 2
+    assert length(j) == before + 2, "a build journals exactly its start and its finish"
+
+    [start, done] = Enum.take(j, -2)
+    assert start[:event] == :"build/start" and start[:out] == out
+    assert done[:event] == :"build/done" and done[:built] == 1 and done[:errors] == 0
+
+    # the claim is the build's exclusion, and a build that returns must not
+    # leave the directory wedged for the next one
+    refute File.exists?(Path.join(out, ".claim")), "a finished build releases its claim"
   end
 end
