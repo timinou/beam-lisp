@@ -305,6 +305,110 @@ defmodule BeamLisp.Decimal do
   @doc "The reader literal form: `to_plain_string` with the `M` suffix."
   def to_literal(%__MODULE__{} = d), do: to_plain_string(d) <> "M"
 
+  # ── order-preserving index key (PLAN-115 B1) ─────────────────────────
+  #
+  # A Decimal must sort NUMERICALLY among every other number in datom's AVET
+  # index (so `(compare 1.5M 2)` and a range scan `[(>= ?amt 100.00M)]` are
+  # right), and index BY NUMERIC VALUE — `1.0M` and `1.00M` collide, as
+  # Datomic/datahike AVET does. codec.bl puts every number under one TAG-NUM
+  # ordered by its binary64 magnitude, with an exact tie-break suffix for values
+  # that share a float. This mirrors that scheme for a Decimal:
+  #
+  #   TAG-NUM || F(q) || rel || D(x)?
+  #
+  # where q = the Decimal rounded to binary64 (the same 8 order-preserving bytes
+  # `encode-float` emits — computed here so the delicate side/exact math is one
+  # tested unit), `rel` is 0/1/2 for exact-value BELOW/EQUAL/ABOVE its rounded
+  # float, and D(x) is the exact canonical suffix present only when rel≠1. The
+  # design and its ordering proof: oracle 9-DecimalKeyDesign, 2026-09-14.
+
+
+  @doc """
+  The order-preserving index-key BODY for a Decimal: `<<rel, suffix::binary>>`
+  appended AFTER the shared `TAG-NUM || F(q)` float prefix that codec.bl builds.
+  Returns `{q_float, rel_byte, suffix_binary}` so codec.bl reuses its own
+  `encode-float` for the 8-byte prefix (one IEEE transform, not two).
+
+  `rel` = 0/1/2 for the exact value below/equal/above its rounded float `q`.
+  `suffix` is empty when `rel == 1`, else the exact canonical encoding `D(x)`.
+  """
+  def codec_key_parts(%__MODULE__{} = d) do
+    d = strip_zeros(d)
+    q = to_float(d)
+    # exact value U/10^S vs q's exact dyadic rational P/2^K, by cross-multiply
+    rel = compare_to_float(d, q)
+    suffix = if rel == 1, do: <<>>, else: exact_suffix(d)
+    {q, rel, suffix}
+  end
+
+  # Compare a Decimal U/10^S to a finite float exactly. q = m * 2^e (Float
+  # decomposition); compare U * 2^max(0,-e) * ... — reduce to integer compare by
+  # putting both over a common denominator 10^S * 2^(-e when e<0).
+  defp compare_to_float(%__MODULE__{unscaled: u, scale: s}, q) do
+    {m, e} = float_to_ratio(q)          # q = m * 2^e, m integer, e integer
+    # value = u / 10^s ; q = qn/qd (qd a power of two). Compare u*qd vs qn*10^s.
+    {qn, qd} = scale_pow2(m, e)
+    left = u * qd
+    right = qn * pow10(s)
+    cond do
+      left < right -> 0   # value < q  → BELOW
+      left > right -> 2   # value > q  → ABOVE
+      true -> 1           # exactly equal
+    end
+  end
+
+  # q = m*2^e as a reduced fraction qn/qd with qd a power of two (or 1).
+  defp scale_pow2(m, e) when e >= 0, do: {m * Integer.pow(2, e), 1}
+  defp scale_pow2(m, e), do: {m, Integer.pow(2, -e)}
+
+  # Decompose a finite float into {mantissa_integer, exponent} with value = m*2^e.
+  defp float_to_ratio(f) do
+    <<sign::1, exp::11, frac::52>> = <<f::float>>
+    cond do
+      exp == 0 and frac == 0 -> {0, 0}
+      exp == 0 -> signed({frac, -1074}, sign)                 # subnormal
+      true -> signed({frac + 4503599627370496, exp - 1075}, sign)  # normal: 2^52 + frac
+    end
+  end
+
+  defp signed({m, e}, 0), do: {m, e}
+  defp signed({m, e}, 1), do: {-m, e}
+
+  # The exact canonical suffix D(x): floor(x) as an ordered signed-int magnitude,
+  # then — when x is non-integral — 0xFF and the minimal fractional decimal digits
+  # (each byte digit+1, 0x00 terminator). Matches codec.bl encode-bignum-magnitude
+  # for the integer anchor so an integral Decimal collides with the equal integer.
+  defp exact_suffix(%__MODULE__{unscaled: u, scale: s}) do
+    p = pow10(s)
+    n = Integer.floor_div(u, p)          # mathematical floor (not trunc)
+    a = u - n * p                        # 0 <= a < 10^s, the fractional part * 10^s
+    anchor = bignum_magnitude(n)
+    if a == 0 do
+      anchor
+    else
+      digits = a |> Integer.to_string() |> String.pad_leading(s, "0") |> String.trim_trailing("0")
+      frac = for <<c <- digits>>, into: <<>>, do: <<c - ?0 + 1>>
+      anchor <> <<0xFF>> <> frac <> <<0>>
+    end
+  end
+
+  # Order-preserving signed-integer magnitude — the SAME format as codec.bl
+  # encode-bignum-magnitude (nonneg: 01 || u32be(len) || bytes; neg: 00 ||
+  # u32be(0xffffffff-len) || complemented bytes).
+  defp bignum_magnitude(n) when n >= 0 do
+    bytes = :binary.encode_unsigned(n)
+    len = if n == 0, do: 0, else: byte_size(bytes)
+    body = if n == 0, do: <<>>, else: bytes
+    <<1, len::32>> <> body
+  end
+
+  defp bignum_magnitude(n) do
+    bytes = :binary.encode_unsigned(-n)
+    len = byte_size(bytes)
+    complemented = for <<b <- bytes>>, into: <<>>, do: <<255 - b>>
+    <<0, 4_294_967_295 - len::32>> <> complemented
+  end
+
   # ── helpers ──────────────────────────────────────────────────────────
 
   # Both unscaled values at the larger scale.
