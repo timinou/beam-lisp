@@ -67,6 +67,15 @@ defmodule BeamLisp.ClojureCompatDocsTest do
     assert out =~ "count by dept: ([\"eng\" 2] [\"sales\" 1])"
   end
 
+  test "docs/datom-branches.bl.md isolates copy-on-write branches over one template" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-branches.bl.md") end)
+
+    assert out =~ "template: ([\"cash\" 1000] [\"loan\" -500])"
+    assert out =~ "payoff branch:   ([\"cash\" 500] [\"loan\" 0])"
+    assert out =~ "withdraw branch: ([\"cash\" 700] [\"loan\" -500])"
+    assert out =~ "template still:  ([\"cash\" 1000] [\"loan\" -500])"
+  end
+
   test "docs/datom-bitemporal.bl.md shows valid time as the second axis" do
     out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-bitemporal.bl.md") end)
 
