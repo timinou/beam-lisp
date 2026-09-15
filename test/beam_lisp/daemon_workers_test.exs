@@ -16,43 +16,38 @@ defmodule BeamLisp.Daemon.WorkersTest do
   # restarted it. A daemon that looks alive and can do nothing is the worst way
   # to fail, which is this module's own stated rule.
 
-  # Own the supervisor's lifecycle rather than sharing the global one. Another
-  # file in the same VM — or a real daemon (`BeamLisp.Daemon.Server` calls the
-  # same `Workers.ensure_started/1`) — registers this exact name and TAKES IT
-  # DOWN when it stops, which is FUP-074's `(EXIT) shutdown` / `no process`
-  # racing a lifecycle we do not own. Stop any existing instance, start a fresh
-  # one, tear it down on exit.
+  # The supervisor is OWNED by the test — see the note in
+  # `daemon_index_worker_test.exs`. `ensure_started/1` LINKS it to the caller, so
+  # the case that called it exited and took the supervisor with it; the next case
+  # then raced a supervisor on its way down.
   setup do
-    if pid = Process.whereis(BeamLisp.Daemon.Workers), do: stop_sup(pid)
-
-    {:ok, sup} = BeamLisp.Daemon.Workers.ensure_started()
-    on_exit(fn -> stop_sup(sup) end)
+    start_supervised!({BeamLisp.Daemon.Workers, root: File.cwd!(), build: false})
     :ok
   end
 
-  defp stop_sup(pid) do
-    ref = Process.monitor(pid)
-    # Unlink first: setup runs in the test process and `ensure_started` used
-    # `start_link`, so a bare stop would deliver the supervisor's exit to us.
-    Process.unlink(pid)
-    Supervisor.stop(pid, :normal, 10_000)
-
-    receive do
-      {:DOWN, ^ref, :process, ^pid, _} -> :ok
-    after
-      10_000 -> :ok
-    end
-  rescue
-    _ -> :ok
-  catch
-    _, _ -> :ok
-  end
-
-  test "all three workers run under the supervisor" do
+  test "every worker runs under the supervisor" do
+    # The stderr device is nameless by design — it holds :standard_error.
+    assert Process.whereis(:standard_error)
     assert Process.whereis(BeamLisp.Daemon.Executor)
     assert Process.whereis(BeamLisp.Daemon.WatchRegistry)
     assert Process.whereis(BeamLisp.Daemon.IndexWorker)
-    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 3
+    assert Supervisor.which_children(BeamLisp.Daemon.Workers) |> length() == 4
+  end
+
+  test "the stderr device owns :standard_error, and gives it back on stop" do
+    # A command's stderr is only forwarded if the daemon's device HOLDS the
+    # global name: `IO.puts(:stderr, …)` resolves the atom, so a device that is
+    # merely alive routes nothing.
+    assert is_pid(Process.whereis(:standard_error))
+
+    dev = BeamLisp.Daemon.StdErr.device()
+    assert is_pid(dev)
+
+    # Stop the tree the way the daemon does, and the name must go back to the
+    # device that had it — otherwise every later `IO.puts(:stderr, …)` in this
+    # VM raises, in callers that have nothing to do with the daemon.
+    Supervisor.stop(BeamLisp.Daemon.Workers)
+    assert Process.whereis(:standard_error) == dev
   end
 
   test "a killed worker is restarted, not lost" do

@@ -128,7 +128,10 @@ The reader counts lines and columns from 1, and columns in codepoints. LSP
 counts from 0, and its `character` counts UTF-16 code units — the width of a
 JavaScript string. A line holding an emoji shifts every later column by one
 unit. These two functions are the only place the conversion happens, in both
-directions.
+directions — and they are TOTAL. A position that lies outside the document
+clamps to the nearest line that exists (`line-text`): a diagnostic position is
+data from another engine, and a server that raises on it costs the editor every
+answer it was asked for.
 
 ```beam-lisp
 (defn- utf16-width
@@ -139,21 +142,52 @@ directions.
 (defn- utf16-length [s]
   (reduce (fn [n cp] (+ n (utf16-width cp))) 0 (String/codepoints s)))
 
-(defn bl->lsp
-  "bl's 1-based [line col] (col = codepoints) → LSP's 0-based [line character]."
-  [text line col]
+(defn- line-text
+  "The 1-based `line` of `text` nearest an existing one, WITH that line's text
+   as `[line text]`.
+
+   A diagnostic position is data from another engine, and the engines do emit
+   0: `typed/warn!` spells a warning the compiler could not place as `:line 0`,
+   and `system.linear/diagnostics` defaults a body annotation's line the same
+   way. `(dec 0)` indexes the line list at -1, and beam-lisp's `get` answers
+   nil there rather than raising — so the raise landed one call later, in
+   `String.codepoints(nil)`, inside a handler that owes the editor an answer
+   (`bl lsp serve: handler raised: textDocument/didOpen: no function clause
+   matching in String.codepoints/1`). Clamping keeps the promise the layers
+   above already made: `diagnostic->lsp` defaults a line it does not have to 1,
+   so a position that cannot exist belongs at the top of the file, not in an
+   exception."
+  [text line]
   (let [lines (split text "\n")
-        l (if (and (int? line) (<= line (count lines))) (get lines (dec line)) "")
-        prefix (take (dec col) (String/codepoints l))]
+        n (count lines)
+        line (cond
+               (not (int? line)) 1
+               (< line 1) 1
+               (> line n) n
+               :else line)]
+    [line (get lines (dec line))]))
+
+(defn bl->lsp
+  "bl's 1-based [line col] (col = codepoints) → LSP's 0-based [line character].
+   A line outside the document clamps to the nearest real one, and a column
+   before the first codepoint counts 0 — an answer an editor can place, always."
+  [text line col]
+  (let [[line l] (line-text text line)
+        prefix (take (max 0 (dec col)) (String/codepoints l))]
     {:line (dec line)
      :character (reduce (fn [n cp] (+ n (utf16-width cp))) 0 prefix)}))
 
 (defn lsp->bl
   "LSP's 0-based [line character] → bl's 1-based [line col]. A character that
-   lands mid-surrogate-pair floors to the codepoint that opens it."
+   lands mid-surrogate-pair floors to the codepoint that opens it. A client
+   line the document does not have has no text to walk, so the answer is that
+   line's first column — an empty result upstream, never a raise: a negative
+   line is not an index off the end of the line list, and a `line` that is not
+   a number at all has no `inc`."
   [text line character]
   (let [lines (split text "\n")
-        l (if (and (int? line) (< line (count lines))) (get lines line) "")
+        line (if (and (int? line) (>= line 0)) line 0)
+        l (if (< line (count lines)) (get lines line) "")
         cps (String/codepoints l)]
     (loop [cs cps, col 1, seen 0]
       (if (empty? cs)
@@ -229,18 +263,16 @@ specifies for go-to-definition.
    "end" (bl->lsp text line (+ col (count nm)))})
 
 (defn- line-range
-  "An LSP range spanning the whole of 1-based `line`."
+  "An LSP range spanning the whole of 1-based `line` (clamped: `line-text`)."
   [text line]
-  (let [lines (split text "\n")
-        l (if (<= line (count lines)) (get lines (dec line)) "")]
+  (let [[line l] (line-text text line)]
     {"start" (bl->lsp text line 1)
      "end" {"line" (dec line) "character" (utf16-length l)}}))
 
 (defn- line-end
   "The LSP position just past the last character of 1-based `line`."
   [text line]
-  (let [lines (split text "\n")
-        l (if (<= line (count lines)) (get lines (dec line)) "")]
+  (let [[line l] (line-text text line)]
     {"line" (dec line) "character" (utf16-length l)}))
 
 (def ^:private zero-range
@@ -356,12 +388,17 @@ it is how a closed or clean document clears its squiggles.
         ;; An edit in flight is often unbalanced. The reader refuses it, so
         ;; answer with one parse-error diagnostic at the top instead of letting
         ;; the whole publish raise: the server stays up and the editor shows a
-        ;; squiggle on the document being typed.
-        ds (try (into [] (lsp/diagnostics text ns))
-                (catch e [{:msg (str "parse error: " (ex-message e)) :line 1 :col 1}]))]
+        ;; squiggle on the document being typed. The LOWERING rides inside the
+        ;; try with the analysis, because a publish has one job — never take
+        ;; the didOpen down with it — and the analysis is only one of the two
+        ;; things that can fail on the way to the wire.
+        ds (try (into [] (map (fn [x] (diagnostic->lsp text x))
+                              (lsp/diagnostics text ns)))
+                (catch e [(diagnostic->lsp text {:msg (str "parse error: " (ex-message e))
+                                                 :line 1 :col 1})]))]
     (notification "textDocument/publishDiagnostics"
                   {"uri" uri
-                   "diagnostics" (into [] (map (fn [x] (diagnostic->lsp text x)) ds))})))
+                   "diagnostics" ds})))
 ```
 
 ## Hover, with the proof card

@@ -258,13 +258,18 @@ the loader applies. Reading one form is cheap and needs no loader.
 
 ```beam-lisp
 (defn ns-of
-  "The namespace `src` declares in its first `(ns NAME …)` form, else \"user\"."
+  "The namespace `src` declares in its first `(ns NAME …)` form, else \"user\".
+
+   Delegates to `BeamLisp.Loader/declared_ns`, the SAME head scan the loader uses
+   to accept or reject a candidate file: one rule, one answer, and a disagreement
+   between two implementations of it would silently drop a file from an index.
+   Reading every top-level form here instead — which is what this did — cost
+   949 ms over a 43-source tree, paid on every index key check and mount plan,
+   where the head scan costs microseconds."
   [src]
   (try
-    (let [f0 (first (BeamLisp.Compiler/read_all_data src))]
-      (if (and (list? f0) (= 'ns (first f0)) (symbol? (second f0)))
-        (name (second f0))
-        "user"))
+    (let [n (BeamLisp.Loader/declared_ns src)]
+      (if (string? n) n "user"))
     (catch _ "user")))
 ```
 

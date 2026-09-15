@@ -197,7 +197,12 @@ it.
    The daemon owns the index (see `BeamLisp.Daemon.IndexWorker`), so this asks
    IT rather than building anything here — a conn built in this process would die
    with the command, which is the whole failure this change removes. A VM with no
-   session (a cold command) has nothing to ask, and nothing to report."
+   session (a cold command) has nothing to ask, and nothing to report.
+
+   The report goes to `io-err` — it is a status line about work the session is
+   doing, not the command's output. It used to have to go to stdout because the
+   daemon dropped a command's stderr; `BeamLisp.Daemon.StdErr` forwards it now, so
+   the line can be on the stream it belongs to."
   []
   (let [p (erlang/whereis :"Elixir.BeamLisp.Daemon.IndexWorker")]
     (if (= :undefined p)
@@ -206,14 +211,17 @@ it.
         (BeamLisp.Daemon.IndexWorker/ensure_building)
         (let [s (BeamLisp.Daemon.IndexWorker/progress)]
           (u/io-err
-            (str "bl ui: "
+            (str "  index: "
                  (case (:phase s)
-                   :building (str "indexing this tree now — watch "
-                                  "http://127.0.0.1:" (or (get (claim-for "ui") :port) "?") "/")
-                   :ready (str "index ready (" (get-in s [:stats :files]) " files, "
-                               (get-in s [:stats :functions]) " functions)")
-                   :error (str "index failed: " (:message s))
-                   (str "index: " (name (or (:phase s) :cold)))))))
+                   :building (str "building now — " (get s :done) "/"
+                                  (if (> (get s :total) 0) (get s :total) "?") " files"
+                                  (if (get s :file) (str ", " (get s :file)) "")
+                                  " — the Index pane on this page follows it")
+                   :ready (str "ready (" (get-in s [:stats :files]) " files, "
+                               (get-in s [:stats :functions]) " functions, "
+                               (get-in s [:stats :cached]) " from cache)")
+                   :error (str "failed: " (:message s))
+                   (str (name (or (:phase s) :cold)))))))
         nil))))
 
 (defn run-open

@@ -29,7 +29,44 @@ defmodule BeamLisp.Daemon.IO do
   order the terminal frame after the last output.
   """
   def start(sock, id, parent) do
-    spawn_link(fn -> loop(%{sock: sock, id: id, parent: parent, seq: 0, stdin_seq: 0}) end)
+    spawn_link(fn ->
+      # The marker `BeamLisp.Daemon.StdErr` routes by: a process whose group
+      # leader is this one writes stderr ON THIS REQUEST. Set here rather than
+      # in a registry because it must die WITH the proxy — a stale entry would
+      # send a later process's stderr to a finished client's socket.
+      Process.put(:beam_lisp_io_proxy, self())
+      loop(%{sock: sock, id: id, parent: parent, seq: 0, stdin_seq: 0})
+    end)
+  end
+
+  @doc """
+  Emit `bin` on this proxy's stderr stream — the SAME sequence counter as its
+  stdout, so a client can interleave the two causally. Synchronous: the caller
+  blocks until the proxy has handed the bytes to the socket, which is where the
+  backpressure lives (a slow client must slow the writer, not grow the heap).
+
+  Called by the stderr device, never by the program: a program's stderr reaches
+  here because its group leader is this proxy.
+  """
+  def stderr(proxy, bin) when is_pid(proxy) and is_binary(bin) do
+    # A proxy that is already gone must not cost the writer a timeout: it can
+    # outlive its request (a lingering process printing after its command
+    # finished), and its marker dies with it. `alive?` first, so the common case
+    # of "nobody is listening" is free.
+    if Process.alive?(proxy) do
+      ref = make_ref()
+      send(proxy, {:emit, :stderr, bin, self(), ref})
+
+      receive do
+        {:emitted, ^ref} -> :ok
+      after
+        # A wedged proxy must not wedge the WRITER's stderr forever. Nothing is
+        # retried: a lost stderr line beats a daemon that cannot report anything.
+        30_000 -> :ok
+      end
+    else
+      :ok
+    end
   end
 
   @doc "Flush + tell the proxy no more output is coming; returns the final seq."
@@ -52,6 +89,13 @@ defmodule BeamLisp.Daemon.IO do
         {reply, state} = handle_io(req, state)
         send(from, {:io_reply, reply_as, reply})
         loop(state)
+
+      # An emit from the stderr device (see `stderr/2`): the same path the
+      # proxy's own `put_chars` takes, so the two streams share one counter and
+      # one chunking/backpressure rule.
+      {:emit, stream, chars, from, ref} ->
+        send(from, {:emitted, ref})
+        loop(emit(state, stream, chars))
 
       {:finish, from, ref} ->
         send(from, {:finished, ref, state.seq})
