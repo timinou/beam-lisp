@@ -316,8 +316,20 @@ is what makes it stick.
 (defn register-paths
   "Apply the parsed command's library roots and code paths. Library roots go to
    the loader's search path; code paths go on the VM's code path, expanded
-   against the command's cwd."
+   against the command's cwd.
+
+   The third source is the one that makes a tree Mix-free: `bl deps compile`
+   writes a library's beams into a content-addressed directory beside the
+   library store, and naming those here is the whole search-path rule (FUP-050
+   step 2). A tree with no `deps/` and no `_build` therefore runs against its
+   libraries — and because the directories are addressed by content and tagged
+   with the runtime that built them, every worktree on a machine shares one
+   compilation while a drop carrying its own erts never loads a checkout's
+   beams."
   [st]
   (each (fn [d] (BeamLisp.Env/add_search_path d)) (:paths st))
-  (each (fn [d] (Code/prepend_path (resolve d))) (code-paths st)))
+  (each (fn [d] (Code/prepend_path (resolve d))) (code-paths st))
+  (BeamLisp.Loader/ensure_loaded "deps-compile")
+  (each (fn [d] (Code/prepend_path d))
+        (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list))))
 ```

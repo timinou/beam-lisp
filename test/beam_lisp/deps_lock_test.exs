@@ -7,6 +7,16 @@ defmodule BeamLisp.DepsLockTest do
   be a lie about what a build installs, and nothing else in the tree would
   notice, so it is pinned here.
 
+  WHICH digest is pinned matters, and the first version got it wrong in a way
+  this test could not see because it made the same mistake: `mix.lock` carries
+  TWO, and the 4th field is hex's deprecated INNER checksum (the value of the
+  `CHECKSUM` file inside the tarball), while the 8th is sha256 of the tarball as
+  served — what `bl deps fetch` downloads, hashes, and must compare against.
+  Measured on toml 0.7.0: 4th = fbcd773c…, 8th = 0690246a…, and neither is
+  sha256 of contents.tar.gz (that is a third value, 8cf00edd…). Comparing `bl.lock`
+  against the wrong field is how the fetcher came to refuse all 47 real packages
+  while its own suite stayed green. So this test compares field 8.
+
   When `mix.lock` is eventually deleted (the toolchain does not need it; the
   dependency PROVISIONING path still does — 44 of the 47 packages build with
   `mix`, 3 with `rebar3`, so a Mix-free fetch-and-compile is its own piece of
@@ -59,8 +69,8 @@ defmodule BeamLisp.DepsLockTest do
     {map, _} = Code.eval_file(path)
 
     Map.new(map, fn {name, entry} ->
-      {:hex, _name, vsn, sha, _tools, _deps, _repo, _inner} = entry
-      {to_string(name), {vsn, sha}}
+      {:hex, _name, vsn, _inner, _tools, _deps, _repo, outer} = entry
+      {to_string(name), {vsn, outer}}
     end)
   end
 end

@@ -68,7 +68,14 @@ defmodule BeamLisp.BuildDepsTest do
     File.rm_rf!(work)
     File.mkdir_p!(work)
     inner_bytes = contents_tar_gz!(work)
-    inner_sha = :crypto.hash(:sha256, inner_bytes) |> Base.encode16()
+    # 64 hex characters — the SHAPE hex writes. What hex puts in this file is its
+    # canonical INNER checksum, which this client does not recompute: measured on
+    # toml 0.7.0 it is neither sha256(outer tar) nor sha256(contents.tar.gz), and
+    # hex_core calls it deprecated in favour of the outer checksum. The fixture
+    # therefore only has to have the shape — the outer digest below is the one
+    # that pins the bytes.
+    _ = inner_bytes
+    inner_sha = String.duplicate("F", 64)
 
     File.write!(Path.join(work, "CHECKSUM"), checksum_override || inner_sha)
     File.write!(Path.join(work, "VERSION"), "3")
@@ -119,12 +126,17 @@ defmodule BeamLisp.BuildDepsTest do
     refute call("store", "present?", ["jason", "1.4.4", t.sha])
   end
 
-  test "a tarball whose CHECKSUM lies is refused even though the outer digest matches", %{scratch: scratch} do
-    t = hex_tarball!(scratch, "jason", "1.4.4", String.duplicate("A", 64))
+  # This test used to assert the opposite rule — that CHECKSUM is sha256 of
+  # contents.tar.gz — and so AGREED with a client that could not install a single
+  # real package. It is now about the rule that exists: the value must have the
+  # shape hex writes, because 47 of 47 real tarballs have it and a malformed one
+  # is a reason to stop.
+  test "a tarball whose CHECKSUM is not sha256-shaped is refused", %{scratch: scratch} do
+    t = hex_tarball!(scratch, "jason", "1.4.4", "not-a-digest")
     r = call("hex", "install!", [transport_for(t.bytes), %{name: "jason", vsn: "1.4.4", sha: t.sha}, scratch])
 
     refute r[:ok?]
-    assert r[:why] =~ "contents digest differs"
+    assert r[:why] =~ "not sha256-shaped"
     refute call("store", "present?", ["jason", "1.4.4", t.sha])
   end
 
