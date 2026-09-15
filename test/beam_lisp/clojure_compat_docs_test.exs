@@ -67,6 +67,17 @@ defmodule BeamLisp.ClojureCompatDocsTest do
     assert out =~ "count by dept: ([\"eng\" 2] [\"sales\" 1])"
   end
 
+  test "docs/datom-bitemporal.bl.md shows valid time as the second axis" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-bitemporal.bl.md") end)
+
+    assert out =~ "price on day 90:   100"
+    assert out =~ "price on day 200:  120"
+    assert out =~ "price on day 180:  120"
+    assert out =~ "price on day 90, still: 100"
+    assert out =~ "pulled @day 90:  100"
+    assert out =~ "prices true across days 90..200: ([100] [120])"
+  end
+
   test "docs/datom-for-accounting.bl.md exercises decimals, tuple keys and guards" do
     out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-for-accounting.bl.md") end)
 
