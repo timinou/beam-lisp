@@ -21,7 +21,7 @@ tree (a stale drop reports the tree's new namespaces as undefined vars).
 The committed bootstrap seed supplies the compiler needed to build current source. Ordinary development builds do not regenerate that seed. Regenerate it at the commit-time bootstrap gate:
 
 ```sh
-mix run priv/bootstrap/gen_manifest.exs
+bl seed
 ```
 
 ## One compiler generation at a time

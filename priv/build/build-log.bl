@@ -1,0 +1,369 @@
+; build/build-log.bl — the build's FACT LOG.
+;
+; The build used to keep one mutable document (the manifest, a term_to_binary
+; map) and rewrite it after EVERY source. That is O(n) writes of O(n) bytes to
+; say what one source did, and an interrupted build leaves a file that is
+; neither the old truth nor the new one. Worse, the manifest can only answer
+; one question — "is this source fresh?" — so everything else the build knows
+; (what was cached, what failed, what left) was discarded at the end of `run`.
+;
+; This is the same information as a LOG OF FACTS: append-only, one fact per
+; line, in the language's own data syntax, read back by the language's own
+; reader. The last fact about a path wins, so replay is a fold; the manifest
+; Mix reads becomes a PROJECTION of the log (`manifest`), never a second
+; source of truth. Both are written together at the end of a run, and
+; `test/beam_lisp/build_log_test.exs` pins that they agree.
+;
+; Why facts, not the manifest:
+;
+;   * append-only ⇒ a build interrupted mid-wave resumes from the last
+;     COMPLETE fact (the manifest's single rewrite cannot be resumed at all);
+;   * the log answers what the manifest cannot — stale, impact, coverage, and
+;     WHY a source is not built — which is the query surface `bl build --status`
+;     needs and the manifest could never provide;
+;   * it is text a human can read and grep, and a fact is written once.
+;
+; Why the language's reader as the parser: a previous build's log is INPUT, so
+; it is parsed as DATA — the same reader every source goes through, guarded per
+; line, so a torn last line (a crash mid-append) is dropped rather than fatal.
+; The one thing the reader does NOT carry is a writer: `pr-str` is a VALUE
+; printer (it emits `priv/std/errors.bl` for a string), so a log written with it
+; would not read back. `quote-string` here is the little serializer the fact
+; shapes need, and `research/selfbuild/w2_probe*.bl` is where the round-trip was
+; checked before this module was written.
+;
+; And one trap the probes caught: a reader NODE is a tagged TUPLE
+; (`{:vector [elem …]}`), not a vector — `vector?` is false for it, while
+; `count`/`first`/`second` answer anyway. `node?` is the test that says so, and
+; it is the reason the first version of `read-facts` returned [] for every line
+; of a log that was plainly there.
+;
+; ── Facts ────────────────────────────────────────────────────────────────────
+;
+;   [:build/run id at-ms]                     a build started
+;   [:build/built path key tier [mods] cached?]
+;                                             path is fresh under these keys
+;   [:build/failed path reason]                path did not compile
+;   [:build/dropped path]                      path left the build
+;   [:build/end id built errors]               how the run ended
+;   [:build/ex path hash [modules]]            an ELIXIR source is compiled (see
+;                                             `substrate`): fresh by content hash
+;
+; `key` is the plan's per-source interface key, `tier` is
+; `BeamLisp.AOTCache/key_for_source` — the SAME value the beam is stamped with
+; and the runtime drift gate recomputes. Module names travel as STRINGS: the
+; log is text, and a string names a beam file without creating an atom for it.
+;
+; ── API ──────────────────────────────────────────────────────────────────────
+;
+;   (path-for manifest-path)          → the log that belongs to a manifest
+;   (read-facts path)                 → [fact …]      (blank/torn lines dropped)
+;   (append! path facts)              → :ok
+;   (write! path facts)               → :ok           (compact: tmp + rename)
+;   (replay facts)                    → {:sources {path → entry} :runs [_] :errors [_]}
+;   (manifest state)                  → {path → {:hash :key :modules}}   (the projection)
+;   (state-of-manifest m)             → a state from a manifest (migration)
+;   (facts-of state)                  → the compacted fact list for a state
+;   (fresh? state path key tier out)  → bool
+;   (stale plan state out)            → [path …]      (in plan order)
+;   (coverage plan state out)         → {:sources n :fresh n :stale [p] :recorded n}
+;   (impact plan path)                → [path …]      (everything depending on it)
+(ns build-log)
+
+; ── facts ────────────────────────────────────────────────────────────────────
+
+(defn run-fact [id at] [:build/run id at])
+
+(defn built-fact
+  "`modules` are module ATOMS as the compiler emitted them; they travel as text
+   so a reader that only wants to know a beam exists never touches an atom."
+  [path key tier modules cached?]
+  [:build/built path key tier (module-names modules) cached?])
+
+(defn failed-fact [path reason] [:build/failed path reason])
+
+(defn dropped-fact [path] [:build/dropped path])
+
+(defn end-fact [id built errors] [:build/end id built errors])
+
+; ── writing ──────────────────────────────────────────────────────────────────
+
+(defn- quote-string
+  "A string, as data that reads back: escaped, then wrapped in quotes. Backslash
+   FIRST — escaping it after the others would double the escapes it introduced."
+  [s]
+  (str "\""
+       (-> s
+           (String/replace "\\" "\\\\")
+           (String/replace "\"" "\\\"")
+           (String/replace "\n" "\\n")
+           (String/replace "\r" "\\r")
+           (String/replace "\t" "\\t"))
+       "\""))
+
+(defn- write-form
+  "One value, as data. Total over the shapes a fact may carry: a keyword keeps
+   its namespace (`(str :build/run)` is \"build/run\", so the colon is restored
+   here), a string is quoted, a vector recurses, and anything else is printed by
+   the language. A fact is written by us and read by us, so an unknown shape
+   printing as itself is the right failure: visible in the log, not a crash."
+  [x]
+  (cond
+    (keyword? x) (str ":" x)
+    (string? x) (quote-string x)
+    (vector? x) (str "[" (join " " (mapv write-form x)) "]")
+    (nil? x) "nil"
+    (= x true) "true"
+    (= x false) "false"
+    :else (str x)))
+
+(defn module-names
+  "Module names as strings — the log's own spelling, and the one every
+   comparison uses. A caller that holds a fresh compile's module ATOMS and a
+   log entry's module STRINGS has to compare them in one domain; this is it."
+  [mods]
+  (mapv (fn [m] (if (string? m) m (str (erlang/atom_to_binary m)))) mods))
+
+(defn beam-path
+  "Where a module's beam lives under `out`. One definition, because the log's
+   freshness check, the build's cleanup after a recompile, and `clean` all ask
+   the same question and must answer it identically."
+  [out mod]
+  (Path/join out (str (if (string? mod) mod (erlang/atom_to_binary mod)) ".beam")))
+
+(defn fact->line [f] (str "[" (join " " (mapv write-form f)) "]"))
+
+(defn path-for
+  "The log that belongs to a manifest: the two are one pair, so the log lives
+   beside the manifest rather than beside the beams (an isolated `--out` build
+   then keeps its whole state in one directory)."
+  [manifest-path]
+  (Path/join (Path/dirname manifest-path) "build.log"))
+
+; ── reading ──────────────────────────────────────────────────────────────────
+
+(defn- node?
+  "Is `x` a reader node with this tag? A node is a TAGGED TUPLE —
+   `{:vector [elem …]}` — so `vector?` is FALSE for it and `count`/`first`
+   work anyway. Checked before the payload is touched, so a string child (where
+   `count` would answer its length) can never be mistaken for a node."
+  [x tag]
+  (and (erlang/is_tuple x) (= 2 (count x)) (= tag (first x))))
+
+(defn- node->data
+  "A reader NODE as data: `[:vector [elem …]]` is the only shape a fact uses.
+   Keyword nodes become keywords (`{:keyword \"build/built\"}` → `:build/built`),
+   every other child is already a bare value — strings arrive as binaries."
+  [n]
+  (if (node? n :vector)
+    (mapv (fn [c]
+            (cond
+              (node? c :keyword) (keyword (second c))
+              (node? c :vector) (node->data c)
+              :else c))
+          (second n))
+    nil))
+
+(defn read-facts
+  "Every fact in the log at `path`, in order. Absent file ⇒ []. A line that is
+   blank, half-written, or not a vector is DROPPED — never a crash: the log is
+   on-disk input, and the cost of dropping a torn final fact is rebuilding one
+   source, while the cost of raising is a build that cannot start until a human
+   deletes a file."
+  [path]
+  (if (File/exists? path)
+    (let [lines (String/split (File/read! path) "\n")]
+      (vec (keep (fn [line]
+                   (when (pos? (count line))
+                     (try
+                       (let [forms (BeamLisp.Reader/read_string line nil)]
+                         (when (pos? (count forms)) (node->data (first forms))))
+                       (catch _ nil))))
+                 lines)))
+    []))
+
+(defn append!
+  "Append `facts` to the log, one line each. Called by the build's PARENT
+   process only (never a worker), so lines land in plan order and a wave's
+   facts arrive together."
+  [path facts]
+  (when (pos? (count facts))
+    (File/mkdir_p! (Path/dirname path))
+    (File/write! path (str (join "\n" (mapv fact->line facts)) "\n") (list :append)))
+  :ok)
+
+(defn write!
+  "Replace the log with exactly `facts` — the compaction. Atomic (temp file +
+   rename), so a reader sees either the whole old log or the whole new one, and
+   an interrupted build keeps every fact it had already appended."
+  [path facts]
+  (File/mkdir_p! (Path/dirname path))
+  (let [tmp (str path ".tmp")]
+    (File/write! tmp (if (pos? (count facts)) (str (join "\n" (mapv fact->line facts)) "\n") ""))
+    (File/rename! tmp path))
+  :ok)
+
+; ── replay: facts → state ────────────────────────────────────────────────────
+
+(defn- apply-fact [st f]
+  (let [tag (first f) path (second f)]
+    (cond
+      (= tag :build/built)
+      (assoc st :sources
+             (assoc (:sources st) path
+                    {:key (nth f 2) :tier (nth f 3) :modules (nth f 4) :cached? (nth f 5)}))
+
+      ; A failure REPLACES what the path had: the beam it produced before is not
+      ; this build's output. `manifest` drops such an entry, which is what makes
+      ; `clean` and Mix's staleness tracking see exactly the same set.
+      (= tag :build/failed)
+      (assoc st :sources (assoc (:sources st) path {:failed (nth f 2)}))
+
+      (= tag :build/dropped)
+      (assoc st :sources (dissoc (:sources st) path))
+
+      (= tag :build/ex)
+      (assoc st :ex (assoc (:ex st) path {:hash (nth f 2) :modules (nth f 3)}))
+
+      (= tag :build/run)
+      (assoc st :runs (conj (:runs st) {:id path :at (nth f 2)}))
+
+      (= tag :build/end)
+      (assoc st :ended {:id path :built (nth f 2) :errors (nth f 3)})
+
+      :else st)))
+
+(defn apply-facts
+  "Fold `facts` (oldest first) into `st`. The one fold: `replay` starts from
+   empty, the build folds each wave's facts into the state it already has."
+  [st facts]
+  (reduce (fn [st f] (apply-fact st f)) st facts))
+
+(defn replay
+  "Fold `facts` (oldest first, per `read-facts`) into the build's STATE: the
+   last fact about a path wins. This is the only definition of what the log
+   means — the projection and the queries below are all built on it."
+  [facts]
+  (apply-facts {:sources {} :ex {} :runs [] :errors []} facts))
+
+(defn state-of-manifest
+  "A state built from a manifest — the MIGRATION path, so a build directory made
+   before this log existed keeps its incrementality instead of rebuilding the
+   world once. A manifest entry has no `tier`, so it is read here rather than
+   assumed; the next run stamps both."
+  [m]
+  (reduce (fn [st path]
+            (let [e (get m path)
+                  entry {:key (:hash e) :tier (:key e) :modules (module-names (:modules e))}]
+              (assoc st :sources (assoc (:sources st) path entry))))
+          {:sources {} :ex {} :runs [] :errors []}
+          (keys m)))
+
+(defn manifest
+  "The projection: the manifest Mix consumes, derived from the state. Only
+   sources with a real build (`:key`) appear — a failed or dropped path is
+   absent, exactly as the old `run` had it. Module names go back to atoms here
+   because this is the document Mix and `clean` read."
+  [state]
+  (reduce (fn [m path]
+            (let [e (get (:sources state) path)]
+              (if (some? (:key e))
+                (assoc m path {:hash (:key e) :key (:tier e)
+                               :modules (mapv (fn [mod] (if (string? mod) (erlang/binary_to_atom mod) mod)) (:modules e))})
+                m)))
+          {}
+          (sort (keys (:sources state)))))
+
+(defn facts-of
+  "The minimal fact list that replays to `state`: the run the state came from,
+   one fact per source it knows (a build, or the failure that replaced one),
+   and how the run ended. This is what `write!` compacts to, so the log stays
+   proportional to the SOURCE SET instead of to the number of builds ever run
+   in this directory — and, because the compaction keeps only the LAST run, a
+   replayed log always reports exactly one."
+  [state]
+  (let [built (vec (keep (fn [path]
+                           (let [e (get (:sources state) path)]
+                             (cond
+                               (some? (:key e))
+                               (built-fact path (:key e) (:tier e) (:modules e) (:cached? e))
+
+                               (some? (:failed e))
+                               (failed-fact path (:failed e))
+
+                               :else nil)))
+                         (sort (keys (:sources state)))))
+        ex (vec (map (fn [path]
+                       (let [e (get (:ex state) path)]
+                         [:build/ex path (:hash e) (vec (:modules e))]))
+                     (sort (keys (:ex state)))))
+        runs (vec (:runs state))
+        facts (if (pos? (count runs))
+                (let [r (last runs)] (into [(run-fact (:id r) (:at r))] built))
+                built)]
+    (if (some? (:ended state))
+      (conj (into facts ex) (end-fact (:id (:ended state)) (:built (:ended state)) (:errors (:ended state))))
+      (into facts ex))))
+
+; ── queries ──────────────────────────────────────────────────────────────────
+
+(defn fresh?
+  "Is `path` up to date? A fact for it under THIS key and tier, with every beam
+   it named on disk. The manifest said the same thing in the same shape; the
+   difference is where it was read from."
+  [state path key tier out]
+  (let [e (get (:sources state) path)]
+    (and (some? (:key e))
+         (= key (:key e))
+         (= tier (:tier e))
+         (every? (fn [mod] (File/exists? (beam-path out mod))) (:modules e)))))
+
+(defn stale
+  "The sources in `plan` the log cannot vouch for, in plan order — the build's
+   own worklist, and the answer to \"what would a build do right now?\" The
+   PATHS, not the plan nodes: this is a question about files.
+
+   `root` is the priv the tier keys are judged against (see
+   `Tiers/build-source?`): the running one by default, a staged one for a build
+   that stages its sources."
+  ([plan state out] (stale plan state out nil))
+  ([plan state out root]
+   (vec (keep (fn [n]
+                (when-not (fresh? state (:path n) (get (:key plan) (:path n))
+                                   (if (nil? root)
+                                     (BeamLisp.AOTCache/key_for_source (:path n))
+                                     (BeamLisp.AOTCache/key_for_source (:path n) root))
+                                   out)
+                  (:path n)))
+              (:order plan)))))
+
+(defn coverage
+  "How much of the plan the log accounts for: `:recorded` are the sources with
+   ANY fact (built or failed), so `:recorded` = `:fresh` + failures."
+  [plan state out]
+  (let [paths (vec (map :path (:order plan)))
+        st (stale plan state out)
+        recorded (vec (filter (fn [path] (some? (get (:sources state) path))) paths))]
+    {:sources (count paths)
+     :fresh (- (count paths) (count st))
+     :stale st
+     :recorded (count recorded)}))
+
+(defn impact
+  "Everything that depends on `path`, transitively, in discovery order — the
+   reverse of the plan's `:deps`, which is what tells a human (or a rebuild)
+   what an edit can reach. `path` itself is excluded: it is the change, not a
+   consequence of it."
+  [plan path]
+  (let [rev (reduce (fn [m p]
+                      (reduce (fn [m dep] (update m dep (fn [v] (conj (or v []) p))))
+                              m
+                              (get (:deps plan) p [])))
+                    {}
+                    (keys (:deps plan)))]
+    (loop [frontier [path] seen (set [path]) acc []]
+      (if (empty? frontier)
+        acc
+        (let [next (vec (remove (fn [p] (contains? seen p))
+                                (apply concat (mapv (fn [p] (get rev p [])) frontier))))]
+          (recur next (into seen next) (into acc next)))))))

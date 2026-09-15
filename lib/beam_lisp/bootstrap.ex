@@ -52,8 +52,8 @@ defmodule BeamLisp.Bootstrap do
       The self-hosted compiler boots from a committed seed (the AOT-compiled
       `compiler`/`reader-node` closure). Without it there is no compiler to
       build the sources. If you are developing beam-lisp itself, rebuild and
-      commit the seed (mix run priv/bootstrap/gen_manifest.exs after a keyed
-      build); otherwise your checkout is incomplete.
+      commit the seed (`bl seed`, after a keyed build); otherwise your checkout
+      is incomplete.
       """
     end
 
@@ -95,12 +95,10 @@ defmodule BeamLisp.Bootstrap do
     #
     # Integrity (sha256) is verified regardless: a corrupt seed is fatal, a
     # merely-differently-keyed one is a valid bootstrap stage.
-    current_key = BeamLisp.AOTCache.compiler_key()
-
     Enum.each(manifest["modules"], fn {name, want_sha} ->
       src = Path.join(seed_dir, name)
       verify_seed_file!(src, name, want_sha)
-      maybe_install_one(src, Path.join(ebin, name), want_sha, current_key)
+      maybe_install_one(src, Path.join(ebin, name), want_sha, expected_key(name))
     end)
 
     # Make the code server SEE the just-installed beams immediately. The build
@@ -131,11 +129,17 @@ defmodule BeamLisp.Bootstrap do
       # install. Without this, the gate would rule the staged seed stale, route
       # `compiler`/`reader-node` to the SOURCE path, and — with genesis gone —
       # have nothing to compile them with.
+      # ...and the BUILD DRIVER is never staged, even if a seed carries it. A
+      # staged driver is a mixed toolchain, not a bootstrap: its caller (the Mix
+      # task) depends on the current contract, and a shim/body pair spanning a
+      # generation boundary fails as `undefined or private` at build time. The
+      # seed floors the CODEGEN only; the driver is read from the current tree.
       staged_ns =
         manifest["modules"]
         |> Map.keys()
         |> Enum.map(&seed_module_to_ns/1)
         |> Enum.reject(&is_nil/1)
+        |> Enum.reject(&(&1 in BeamLisp.Tiers.build_namespaces()))
         |> Enum.uniq()
 
       Application.put_env(:beam_lisp, :bootstrap_staging, staged_ns)
@@ -178,12 +182,50 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
+  @doc """
+  The committed seed's manifest as data, or `nil` when there is no seed.
+
+  The SEED'S IDENTITY is reported, never inferred: `bl doctor --deep` answers
+  "which toolchain built this floor?" by reading these keys, and the only way to
+  answer it wrongly is to compute it from something else.
+  """
+  def manifest do
+    path = Path.join(seed_dir(), @manifest_name)
+    if File.exists?(path), do: read_manifest!(path), else: nil
+  end
+
   # Whether the committed seed's `compiler_key` matches this toolchain's. A seed
   # built for a different key cannot be trusted to intern correct code here, so
   # the installer skips it rather than seeding a foreign beam. (The genesis path,
   # while it exists, rebuilds fresh beams regardless; see `install!/1`.)
-  defp key_matches?(manifest) do
-    manifest["compiler_key"] == BeamLisp.AOTCache.compiler_key()
+  #
+  # Public because the answer is a FACT ABOUT THE TREE, not private bookkeeping:
+  # `bl doctor --deep` reports it, and a tree whose floor was built by another
+  # toolchain should say so before someone boots from it.
+  def key_matches?(manifest) do
+    manifest["compiler_key"] == BeamLisp.AOTCache.compiler_key() and
+      manifest["build_key"] == BeamLisp.AOTCache.build_key()
+  end
+
+  # The tier key a seed beam is expected to carry. The seed spans both toolchain
+  # tiers — the codegen (`priv/boot/`) and the build driver (`priv/build/`) — so
+  # one key cannot judge it: a driver beam is stamped with `build_key/0` and a
+  # codegen beam with `compiler_key/0`. Kept in step with the emitter through
+  # `AOTCache.key_for_ns/1`.
+  defp expected_key(name), do: BeamLisp.AOTCache.key_for_ns(seed_module_ns(name))
+
+  # The namespace ANY seed beam shape belongs to: `Ns.X`, `Ns.Body.X` and
+  # `Ns.Init.X` are one generation unit, and the tier key is a property of the
+  # namespace, so the companions answer like their shim.
+  defp seed_module_ns(filename) do
+    base =
+      filename
+      |> Path.basename(".beam")
+      |> String.replace_prefix("Elixir.BeamLisp.Ns.", "")
+      |> String.replace_prefix("Body.", "")
+      |> String.replace_prefix("Init.", "")
+
+    base |> String.split("-") |> Enum.map_join("-", &Macro.underscore/1)
   end
 
   defp verify_seed_file!(src, name, want_sha) do
@@ -207,7 +249,7 @@ defmodule BeamLisp.Bootstrap do
   # output) and strictly supersedes the gen-N seed. Overwriting it would
   # un-supersede the rebuild on every boot — ebin would oscillate between
   # seed and rebuild, and seed regeneration could never observe fresh beams
-  # (a boot between build and gen_manifest would re-poison ebin). Skip the
+  # (a boot between build and `bl seed` would re-poison ebin). Skip the
   # copy; the purge+load below then loads the fresh beam, which is exactly
   # the code this VM should run.
   defp maybe_install_one(src, dst, want_sha, current_key) do

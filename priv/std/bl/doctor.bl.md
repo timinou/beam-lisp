@@ -129,7 +129,11 @@ invocation, so it reports `not running` and changes nothing.
    (probe "z3" false
      (fn [] (let [p (z3/open)
                   r (z3/check p "(assert true)")]
-              {:ok (= "sat" r) :detail (pr-str r)})))
+              ;; The solver answers with a STATUS MAP on the oracle tier and a
+              ;; bare string on the older port; a probe that accepted only one
+              ;; shape reported a working solver as absent (measured: `--` beside
+              ;; a `:status :sat`).
+              {:ok (= :sat (if (map? r) (:status r) r)) :detail (pr-str r)})))
 
    (probe "wry" false
      (fn [] (let [ok? (native-tier "(wry/available?)")]
@@ -182,6 +186,141 @@ invocation, so it reports `not running` and changes nothing.
                          (join ", " (BeamLisp.Model/searched_dirs m)))}))))])
 ```
 
+## The deep probes
+
+`--deep` asks a different question. The probes above are about the HOST — can
+this machine run a beam-lisp? The deep probes are about the TOOLCHAIN: does this
+`bl` need Mix, what is left of Mix in the tree, is the dependency declaration
+intact, what kind of image is this, was the bootstrap floor built by this
+toolchain, and does the library store hold what the lock names. A user asking
+whether their program can run should not have to read any of it, which is why it
+is opt-in.
+
+`mix` is REQUIRED here and passes when Mix is ABSENT: this is the one place the
+deletion is observable, and a `bl` that needed Mix would be the failure the whole
+programme exists to remove. Residue is reported and NOT required — `mix.exs`,
+`mix.lock`, `lib/mix/tasks/` and `deps/` stay until a locked library can be
+compiled onto the code path without Mix (FUP-050), and a REQUIRED probe this
+repository cannot pass would be a probe that lies about the tree it is reporting
+on. It says what is left and why, which is the fact a reader acts on.
+
+Nothing here infers an answer it could read. The image kind is asked
+(`BeamLisp.Image/kind`, the one implementation), the floor's provenance is read
+from the manifest the floor shipped with (`Bootstrap/manifest`), and the seed's
+verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
+
+```beam-lisp
+(defn- mix-loaded?
+  "Whether the Elixir build tool is RUNNING in this VM. Not a signal this
+   toolchain needs — `BeamLisp.Image/kind` answers the questions that used to be
+   asked of Mix — but the honest answer to \"does this `bl` depend on Mix?\".
+
+   RUNNING, not loadable, and the difference is the whole probe: `mix/ebin` ships
+   with Elixir and sits on the code path of any Elixir VM, so asking whether the
+   module can be loaded answers yes under `bl` too — measured, and it made this
+   required probe fail in the image it exists to clear. What means \"this build
+   depends on Mix\" is that Mix is STARTED.
+
+   The module is named as a STRING and turned into an atom: `Elixir.Mix` written
+   as a bare symbol is a var this compiler resolves at compile time, and with no
+   Mix in the image that resolution fails — the probe reported `undefined var:
+   bl.doctor/Elixir.Mix` (measured) instead of the fact it exists to report. A
+   question about a module that may not be there cannot require it to be there."
+  []
+  (Enum/any? (Application/started_applications)
+             (fn [t] (= :mix (erlang/element 1 t)))))
+
+(defn- residue
+  "What is left of Mix in this tree, as named pieces. A directory is named with
+   its file count, because `lib/mix/tasks (6 files)` is a different fact from
+   `lib/mix/tasks (0 files)`."
+  []
+  (let [files (filter (fn [p] (File/regular? p)) ["mix.exs" "mix.lock"])
+        tasks (if (File/dir? "lib/mix/tasks")
+                (count (Path/wildcard "lib/mix/tasks/*.ex"))
+                0)]
+    (concat files
+            (if (> tasks 0) [(str "lib/mix/tasks (" tasks " files)")] [])
+            (if (File/dir? "deps") ["deps/"] []))))
+
+(defn- lock-line []
+  (let [p "bl.lock"]
+    (if (not (File/exists? p))
+      {:ok false :detail "absent (no bl.lock in this tree)"}
+      (let [n (count (filter (fn [l] (includes? l "[:dep "))
+                             (String/split (File/read! p) "\n")))]
+        {:ok true :detail (str n " declared")}))))
+
+(defn- store-line
+  "What the store holds against what the lock names. The `deps` namespace is
+   loaded on demand, because a namespace that is not in this image is a fact to
+   report and not a reason to fail."
+  []
+  (do (BeamLisp.Loader/ensure_loaded "deps")
+      (let [r (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps" "verify")
+                                  (list (BeamLisp/cwd)))]
+        (if (:ok? r)
+          {:ok true :detail (str (:checked r) " locked, all present offline")}
+          {:ok false :detail (str (:checked r) " locked, " (count (:missing r))
+                                  " missing (run `bl deps fetch`)")}))))
+
+(defn- seed-line
+  "The bootstrap floor's identity: which toolchain built the beams a
+   genesis-less tree boots from. A floor built by another toolchain is reported
+   as such — booting from it is how a stale floor turns into a compiler that
+   disagrees with its own sources."
+  []
+  (let [m (BeamLisp.Bootstrap/manifest)]
+    (if (nil? m)
+      {:ok false :detail "absent (no priv/bootstrap/seed/manifest.exs)"}
+      (let [n (count (keys (get m "modules")))
+            ok? (BeamLisp.Bootstrap/key_matches? m)]
+        {:ok ok?
+         :detail (if ok?
+                   (str n " beams, built by this toolchain")
+                   (str n " beams, built by ANOTHER toolchain (codegen "
+                        (subs (get m "compiler_key") 0 12) "… vs "
+                        (subs (BeamLisp.AOTCache/current_compiler_key) 0 12)
+                        "…) — reseed with `bl seed`"))}))))
+
+(defn- image-line []
+  (let [k (BeamLisp.Image/kind)]
+    {:ok true
+     :detail (str k
+                  (if (BeamLisp.Image/mutable?)
+                    " (mutating reloads allowed)"
+                    " (reloads refuse to mutate in place)"))}))
+
+(defn deep-probes
+  "The toolchain's own facts, in reading order — `bl doctor --deep`. `mix` is the
+   only required one, and it passes when Mix is ABSENT."
+  []
+  [(probe "mix" true
+     (fn [] (if (mix-loaded?)
+              {:ok false :detail "loaded in this VM (bl itself does not need it)"}
+              {:ok true :detail "absent — nothing here asks for it"})))
+
+   (probe "mix-residue" false
+     (fn [] (let [r (residue)]
+              {:ok (empty? r)
+               :detail (if (empty? r)
+                         "none"
+                         (str (join ", " r)
+                              " — kept until a locked library compiles onto the code path without Mix (FUP-050)"))})))
+
+   (probe "bl.lock" false
+     (fn [] (lock-line)))
+
+   (probe "store" false
+     (fn [] (store-line)))
+
+   (probe "seed" false
+     (fn [] (seed-line)))
+
+   (probe "image" false
+     (fn [] (image-line)))])
+```
+
 ## The report
 
 The table is two fixed columns and a detail: `ok` or `--`, the name padded to
@@ -192,9 +331,11 @@ natives is visible without reading every row.
 ```beam-lisp
 (defn render
   "The human report: one aligned line per probe, then the verdict. The detail
-   carries the reason, so `--` is a fact and not a mystery."
+   carries the reason, so `--` is a fact and not a mystery. The title names the
+   question that was asked, because a deep report's rows answer a different one."
   [d]
   (let [ps (:probes d)
+        title (if (:deep d) "beam-lisp doctor --deep" "beam-lisp doctor")
         w  (reduce (fn [m p] (max m (count (:name p)))) 8 ps)
         line (fn [p]
                (str "  " (if (:ok p) "ok" "--") "   "
@@ -204,7 +345,7 @@ natives is visible without reading every row.
         absent (count (filter (fn [p] (and (not (:required p)) (not (:ok p)))) ps))]
     (join "\n"
       (concat
-        ["beam-lisp doctor" ""]
+        [title ""]
         (map line ps)
         [""]
         (if (:ok d)
@@ -222,16 +363,18 @@ exit code. The text printer and the JSON printer read the same value, so
 
 ```beam-lisp
 (defn run
-  "`bl doctor [--json]`. Every probe runs; the exit code is 0 when the required
-   probes pass, 1 otherwise. An absent optional native is reported, never
-   failed."
+  "`bl doctor [--deep] [--json]`. Every probe runs; the exit code is 0 when the
+   required probes pass, 1 otherwise. An absent optional native is reported, never
+   failed; `--deep` adds the toolchain's own facts — where Mix is absent, that is
+   a PASS, and where it is still present, that is reported as the residue it is
+   until the dependency path no longer needs it (FUP-050)."
   [args st]
   (if (empty? args)
     (do (u/register-paths st)
-        (let [ps  (probes)
+        (let [ps  (concat (probes) (if (:deep st) (deep-probes) []))
               bad (filter (fn [p] (and (:required p) (not (:ok p)))) ps)
-              d   {:ok (empty? bad) :probes ps}]
+              d   {:ok (empty? bad) :probes ps :deep (boolean (:deep st))}]
           (u/emit st d render)
           (if (:ok d) 0 1)))
-    (u/usage-error "usage: bl doctor [--json]")))
+    (u/usage-error "usage: bl doctor [--deep] [--json]")))
 ```

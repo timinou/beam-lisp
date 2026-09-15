@@ -1,0 +1,181 @@
+; build/selfbuild.bl — THE DROP BUILDS ITSELF (PLAN-108 W6).
+;
+; Run from inside a shipped drop, `self-build` reproduces that drop: it takes the
+; payload it is ALREADY RUNNING FROM, rebuilds every tier source into a fresh
+; tree, re-assembles the release, and seals it with the very launcher that is
+; running. The launcher's bytes are in the file `BL_BIN` names (measured: in a
+; packed drop the launcher exports the COMPOUND's own path), so recovering them is
+; a read of the first `offset` bytes — no Rust tool, no checkout, no Mix.
+;
+; ── The four stages, and why each is separate ──────────────────────────────
+;
+;   assemble   `Release/value(:beam_lisp)` — the apps the VM is running from —
+;              into a scratch tree, with `.rel`s, boot scripts and wrappers.
+;   compile    every tier source, STAGED first (see `staging-root`), into the new
+;              tree's app ebin; manifest and log go OUTSIDE the tree, because a
+;              release must carry no build state (measured: none of a release
+;              tree's 2,099 files is a log, manifest or lock).
+;   pack       the tree, sealed with the running launcher's own prefix bytes.
+;   verify     the new compound against its own trailer.
+;
+; Each stage is a function from a result map to a result map that does nothing
+; once one has failed, so a half-assembled tree is never presented as a drop.
+;
+; ── What it does NOT do, and says so ───────────────────────────────────────
+;
+; The compiler that rebuilds the tier sources is the one RUNNING — the payload's
+; own codegen. That is the bootstrap reality, and it is why the proof that matters
+; is the fixpoint gate (build with gen-N, then with gen-N+1, compare), not this
+; run. The shipped payload carries no Elixir sources either, so the substrate
+; stage compiles nothing and the result reports `:ex 0` rather than implying a
+; rebuild that did not happen.
+
+(ns selfbuild
+  (:require [release :as rel] [drop :as d] [build :as b] [substrate :as sub] [claim :as c]))
+
+(defn staging-root
+  "Where a self-build stages the sources it is about to compile.
+
+   FIXED, not per-run, and that is load-bearing: a beam embeds the path of the
+   source it was compiled from, so two generations would differ in every beam if
+   each staged somewhere new. Measured: gen-2 and gen-3 differed in 438 beams,
+   every one of them by the extraction path, before this existed.
+
+   A claim keeps two concurrent self-builds from sharing it (see `claim`)."
+  []
+  (Path/join (System/tmp_dir) "bl-selfbuild-src"))
+
+(defn running-root
+  "The root of the running image: the VM answers `<root>/lib/<app>-<vsn>` as the
+   app's lib dir, so the root is two levels up. Reported, so a self-build says
+   WHICH image it reproduced."
+  []
+  (Path/dirname (Path/dirname (rel/text (erlang/apply :code :lib_dir (list :beam_lisp))))))
+
+(defn- app-dir
+  "`lib/<app>-<vsn>` inside the assembled tree."
+  [tree v app]
+  (let [info (first (filter (fn [a] (= app (:app a))) (:apps v)))]
+    (Path/join tree (str "lib/" (:app info) "-" (:vsn info)))))
+
+(defn- launcher-file
+  "Write the running drop's launcher prefix to `out`; the prefix is the compound's
+   own first `offset` bytes, which its trailer states."
+  [bin c out]
+  (File/write! out (d/read-slice bin 0 (:len (:launcher c))))
+  out)
+
+(defn- stage-sources!
+  "Copy the running priv's tiers into `stage`, preserving the tier layout, and
+   answer the staged sources. Staging is what makes the compiled-in path stable:
+   the payload sits under a directory named for its own hash, so compiling
+   straight from it bakes a different path into every generation."
+  [stage]
+  (File/rm_rf! stage)
+  (File/mkdir_p! stage)
+  (doseq [t (BeamLisp.Tiers/library_names)]
+    (let [src (Path/join (BeamLisp.Tiers/priv_root) (name t))]
+      (when (File/dir? src)
+        (File/cp_r! src (Path/join stage (name t))))))
+  (vec (BeamLisp.Tiers/sources stage)))
+
+(defn- failed? [acc] (not (:ok? acc)))
+
+(defn- with-error [acc msg]
+  (assoc acc :ok? false :errors (conj (vec (:errors acc)) msg)))
+
+(defn- do-assemble
+  "Stage 1: the release tree."
+  [acc v tree]
+  (if (failed? acc)
+    acc
+    (let [a (rel/assemble v tree)]
+      (if (:ok? a)
+        (assoc acc :stages (assoc (:stages acc) :assemble (:apps a)))
+        (reduce with-error acc (map (fn [e] (str "assemble: " e)) (:errors a)))))))
+
+(defn- do-compile
+  "Stage 2: the language half, from the staged sources."
+  [acc stage scratch ebin jobs]
+  (if (failed? acc)
+    acc
+    (let [srcs (stage-sources! stage)
+          r (b/run {:sources srcs
+                    :root stage
+                    :out ebin
+                    :manifest (Path/join scratch "manifest")
+                    :log-path (Path/join scratch "build.log")
+                    :force? true
+                    :jobs jobs
+                    :log nil})]
+      (if (pos? (count (:errors r)))
+        (reduce with-error acc (map (fn [e] (str "build: " e)) (:errors r)))
+        (assoc acc :built (:built r)
+                    :stages (assoc (:stages acc) :sources (count srcs)))))))
+
+(defn- do-pack
+  "Stage 3: seal the tree with the launcher we are running as."
+  [acc tree bin c out os scratch]
+  (if (failed? acc)
+    acc
+    (let [p (d/pack tree (launcher-file bin c (Path/join scratch "launcher")) out os)]
+      (if (:ok? p)
+        (assoc acc :os os :offset (:offset p) :len (:len p) :sha (:sha p))
+        (reduce with-error acc (map (fn [e] (str "pack: " e)) (:errors p)))))))
+
+(defn- do-verify
+  "Stage 4: the new compound must pass its own check."
+  [acc out]
+  (if (failed? acc)
+    acc
+    (let [vf (d/verify out)]
+      (if (:ok? vf)
+        (assoc acc :stages (assoc (:stages acc) :verify true))
+        (with-error acc (str "the new compound does not verify: " (:expected vf)
+                             " vs " (:actual vf)))))))
+
+(defn run
+  "Build a drop from the drop we are running as.
+
+   opts: `{:out path :scratch dir :bin path :os n :jobs n}` — `:bin` defaults to
+   `BL_BIN`, `:os` to the source drop's own tag.
+
+   → `{:ok? bool :out :tree :built :len :sha :stages {…} :errors [msg …]}`"
+  [opts]
+  (let [out (rel/text (:out opts))
+        scratch (rel/text (or (:scratch opts) (Path/join (System/tmp_dir) "bl-selfbuild")))
+        bin (some-> (:bin opts) rel/text)
+        c (if (some? bin) (d/compound bin) nil)
+        tree (Path/join scratch "tree")
+        stage (staging-root)
+        other (c/held-by stage)
+        base {:ok? true :out out :tree tree :built 0 :ex 0 :errors []
+              :running-root (running-root)
+              :stages {:assemble 0 :sources 0 :verify false}}]
+    (cond
+      (nil? bin)
+      (with-error base "no BL_BIN and no :bin — self-build reproduces a DROP, and needs the compound it is running from")
+
+      (nil? c)
+      (with-error base (str "not a v1 drop: " bin))
+
+      (some? other)
+      (with-error base (str "another self-build holds the staging root " stage
+                            " (pid " (:pid other) ", since " (:at other) ")"))
+
+      :else
+      (do
+        (c/acquire! stage bin)
+        (try
+          (let [v (rel/value :beam_lisp)
+                os (or (:os opts) (:os (:trailer c)))
+                jobs (or (:jobs opts) 4)
+                ebin (Path/join (app-dir tree v :beam_lisp) "ebin")]
+            (File/rm_rf! tree)
+            (File/mkdir_p! tree)
+            (-> base
+                (do-assemble v tree)
+                (do-compile stage scratch ebin jobs)
+                (do-pack tree bin c out os scratch)
+                (do-verify out)))
+          (finally (c/release! stage)))))))

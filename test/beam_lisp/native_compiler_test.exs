@@ -65,22 +65,22 @@ defmodule BeamLisp.NativeCompilerTest do
       # Every unix — darwin included — takes the `.so` arm. This is the line
       # that makes a macOS `.dylib` loadable.
       if match?({:win32, _}, :os.type()) do
-        assert Mix.Tasks.Compile.BeamLispNative.nif_ext() == ".dll"
+        assert BeamLisp.NativeTask.nif_ext() == ".dll"
       else
-        assert Mix.Tasks.Compile.BeamLispNative.nif_ext() == ".so"
+        assert BeamLisp.NativeTask.nif_ext() == ".so"
       end
 
       # cargo's `lib` prefix is dropped: `BeamLisp.Native` asks for
       # `priv/native/<crate>`.
-      assert Mix.Tasks.Compile.BeamLispNative.installed_path("lazy_memo") ==
-               "priv/native/lazy_memo#{Mix.Tasks.Compile.BeamLispNative.nif_ext()}"
+      assert BeamLisp.NativeTask.installed_path("lazy_memo") ==
+               "priv/native/lazy_memo#{BeamLisp.NativeTask.nif_ext()}"
     end
   end
 
   test "missing required runtime fails before AOT when cargo is absent", %{root: root} do
     File.cd!(root, fn ->
-      assert_raise Mix.Error, ~r/LazySeq requires the lazy_memo native runtime/, fn ->
-        Mix.Tasks.Compile.BeamLispNative.run([])
+      assert_raise RuntimeError, ~r/LazySeq requires the lazy_memo native runtime/, fn ->
+        BeamLisp.NativeTask.run([])
       end
     end)
   end
@@ -90,7 +90,7 @@ defmodule BeamLisp.NativeCompilerTest do
       File.mkdir_p!("priv/native")
       File.write!("priv/native/lazy_memo.so", "fixture artifact; this test does not load it")
       File.touch!("native/lazy_memo/Cargo.toml", {{2000, 1, 1}, {0, 0, 0}})
-      assert {:ok, []} = Mix.Tasks.Compile.BeamLispNative.run([])
+      assert {:ok, []} = BeamLisp.NativeTask.run([])
     end)
   end
 
@@ -102,8 +102,8 @@ defmodule BeamLisp.NativeCompilerTest do
       File.touch!("native/lazy_memo/Cargo.toml", {{2000, 1, 1}, {0, 0, 0}})
       File.write!("native/lazy_memo/Cargo.lock", "changed dependency lock")
 
-      assert_raise Mix.Error, ~r/Install cargo/, fn ->
-        Mix.Tasks.Compile.BeamLispNative.run([])
+      assert_raise RuntimeError, ~r/Install cargo/, fn ->
+        BeamLisp.NativeTask.run([])
       end
     end)
   end

@@ -1,5 +1,5 @@
 defmodule BeamLisp.SourceGraphTest do
-  # The graph is beam-lisp code (priv/boot/source-graph.bl): the runtime must
+  # The graph is beam-lisp code (priv/build/source-graph.bl): the runtime must
   # be up. `async: false` because `init/0` seeds the VM-wide Env.
   use ExUnit.Case, async: false
 

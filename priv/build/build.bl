@@ -1,0 +1,551 @@
+; build/build.bl — the AOT build, as a program.
+;
+; What `mix compile.beam_lisp` and `bl build` do, in the language, so the
+; build is one thing: plan the sources (build-plan), skip what is fresh (the
+; FACTS in build-log), compile the rest wave by wave in parallel, fetch from or
+; store to the shared cache, append a fact per source. The Elixir Mix task is a
+; shell around `run` — it parses flags, finds the compile path, and returns
+; the shape Mix wants. It decides nothing.
+;
+; ── Contract ────────────────────────────────────────────────────────────────
+;
+;   (run {:sources [paths]              every source: .bl, .bl.md, .bl.org
+;         :out "dir"                     where beams go
+;         :manifest "path"               the manifest file (default <out>/compile.beam_lisp)
+;         :log-path "path"               the fact log (default build.log beside the manifest)
+;         :ex {:root "lib"               compile a project's Elixir sources too
+;              :exclude ["dev" "mix"]}     (RELATIVE TO :root); nil = skip the stage
+;         :force? bool                   rebuild everything
+;         :jobs n                        parallel width per wave
+;         :log (fn [msg])                progress lines (nil = silent)})
+;   → {:built n :errors [msg …] :manifest {path → entry}}
+;
+; ── Where the build's memory lives ──────────────────────────────────────────
+;
+; The LOG is the build's memory: one APPENDED fact per source (see
+; `build-log`), replayed on the next run. The manifest —
+; `{path → {:hash key :key tier-key :modules [mod …]}}`, the document Mix
+; reads — is a PROJECTION of that log, written at the end of the run. `key` is
+; the plan's per-source freshness key (interface-keyed, see build-plan);
+; `tier-key` is `BeamLisp.AOTCache.key_for_source/1` for that source: the
+; codegen key for codegen and ordinary sources, the driver key for the build
+; driver. A source is FRESH iff the log records it under both keys and every
+; module's beam is on disk.
+;
+; Facts are appended as each wave lands, so an interrupted build resumes from
+; the last complete fact rather than from a document that was never written —
+; and the log can answer questions the manifest never could (what is stale,
+; what an edit impacts, how much of the plan is covered: see the queries in
+; `build-log`). A build directory that predates the log is read through
+; `build-log/state-of-manifest` once, so migrating costs no rebuild.
+;
+; Why keys and not mtimes: mtime is scrambled by checkout, worktrees and
+; tar; the key is a function of the bytes. Why the manifest stores the
+; plan's key (not the file's content hash): it is the same key the beam is
+; stamped with and the runtime drift gate recomputes, so a dependent whose
+; required interface changed is rebuilt here, not rejected at boot.
+;
+; ── Concurrency ─────────────────────────────────────────────────────────────
+;
+; A wave's sources depend only on earlier waves, so a wave compiles in
+; parallel: one process per source, all interning into the `:global` Env.
+; What an emitter mutates is keyed by its own namespace, so two sources in
+; one wave never touch the same rows; `*ns*` is per-process. Results fold
+; back in plan order, so the manifest and cache stores are as deterministic
+; as a serial build (and the beams are byte-identical — pinned by
+; test/beam_lisp/aot_reproducible_test.exs).
+;
+; ── Failure ─────────────────────────────────────────────────────────────────
+;
+; One source failing does not stop the wave or the build: its error is
+; collected, its manifest entry left as it was, and later waves proceed
+; (a dependent of a failed source will fail loudly on its own). The caller
+; decides what an error list means (Mix: `{:error, …}`; `bl build`: exit 1).
+
+(ns build
+  (:require [build-plan :as plan]
+            [build-log :as blog]
+            [substrate :as sub]
+            [drop :as d]
+            [store :as st]
+            [claim :as c]))
+
+; ── manifest ─────────────────────────────────────────────────────────────────
+
+(defn manifest-path [out] (Path/join out "compile.beam_lisp"))
+
+(defn- entry?
+  "A well-formed manifest entry: two hash strings and a realised list of
+   module atoms. Anything else — an older schema, a serialised thunk — is
+   treated as absent, so the source simply rebuilds."
+  [e]
+  (and (map? e)
+       (string? (:hash e)) (string? (:key e))
+       (let [mods (:modules e)]
+         (and (or (vector? mods) (erlang/is_list mods))
+              (every? (fn [m] (erlang/is_atom m)) mods)))))
+
+(defn read-manifest
+  "The manifest at `path`, or {} when absent/unreadable. Malformed entries
+   are dropped, never trusted: the manifest is on-disk input.
+
+   The build no longer READS this to decide freshness — the log does that —
+   so this is reached twice: by the one-time migration of a build directory
+   written before the log existed, and by `clean` when there is no log."
+  [path]
+  (let [r (File/read path)]
+    (if (= :ok (erlang/element 1 r))
+      (let [bin (erlang/element 2 r)
+            t (if (= bin "") {} (try (erlang/binary_to_term bin) (catch _ {})))]
+        (if (map? t)
+          (reduce (fn [m k] (let [e (get t k)] (if (and (string? k) (entry? e)) (assoc m k e) m)))
+                  {} (keys t))
+          {}))
+      {})))
+
+(defn write-manifest
+  "Persist `m` — the LOG'S PROJECTION, the document Mix reads. Module lists
+   are realised to vectors first: a lazy seq would serialise as a closure
+   over a process that no longer exists."
+  [path m]
+  (File/mkdir_p! (Path/dirname path))
+  (File/write! path (erlang/term_to_binary
+                       (reduce (fn [acc k] (assoc acc k (update (get m k) :modules vec))) {} (keys m)))))
+
+(defn- delete-beam
+  "Remove a module's beam. `mod` is an atom from the compiler or a name from
+   the log; `build-log/beam-path` takes both, so the build and the log cannot
+   disagree about where a beam lives."
+  [out mod]
+  (let [p (blog/beam-path out mod)] (when (File/exists? p) (File/rm p))))
+
+; ── one source ───────────────────────────────────────────────────────────────
+
+(defn- retry-after-settle
+  "`thunk`, retried once after a short settle when it raises. An editor that
+   writes in place (truncate, then write) leaves a window where a concurrent
+   build reads a TRUNCATED file — a real parse error on bytes that are about
+   to be replaced. One retry after 150ms turns that race into a correct read;
+   a genuinely unbalanced file still fails, twice as slowly but honestly.
+
+   `Process/sleep`, not `Thread/sleep`: there is no `Thread` module (measured —
+   `Code.ensure_loaded(Thread)` is `{:error, :nofile}`), so the retry itself raised
+   `Thread.sleep/1 is undefined` and MASKED the original error. That is the whole of
+   FUP-055: the AOT blocker was this catch reporting itself instead of the
+   unbalanced source it was called for."
+  [thunk]
+  (try (thunk)
+       (catch _e
+         ; A settle that cannot settle must not REPLACE the error it was
+         ; retrying: the first failure is the one that names the file, and
+         ; losing it turns one broken source into a mystery in the build.
+         (try (Process/sleep 150) (catch _e2 nil))
+         (thunk))))
+
+(defn- build-one
+  "Compile `path` (or link it from the shared cache) into `out`.
+   → {:path :key :tkey :closure-key :cached? :result} where result is
+   [:ok modules] or [:error msg].
+
+   Runs in a WORKER process (pmap-ordered). Everything it returns is fully
+   realised before it is sent back: a lazy seq's thunk is a closure over
+   the worker's stack and would be forced in the parent after the worker
+   exited — a `map` here must be `mapv`, and `mods` a vector."
+  [path key tkey cache-key closure-key out log]
+  (when log (log (str "  " path)))
+  (let [cached (if closure-key (BeamLisp.AOTCache/fetch cache-key closure-key out) :miss)
+        ; fetch → {:ok modules} | :miss
+        hit? (and (erlang/is_tuple cached) (= :ok (erlang/element 1 cached)))
+        result (if hit?
+                 (let [mods (vec (erlang/element 2 cached))]
+                   (BeamLisp.AOTCache/run_init_modules mods out)
+                   [:ok mods])
+                 (try
+                   (let [mods (retry-after-settle
+                               (fn [] (BeamLisp.AOT/compile_file path (list (erlang/list_to_tuple (list :output_dir out))))))]
+                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (erlang/element 1 m))))])
+                   (catch e
+                     [:error (str "beam-lisp AOT: " path ": " (ex-message e))])))]
+    {:path path :key key :tkey tkey :closure-key closure-key :cached? hit? :result result}))
+
+; ── parallel wave ────────────────────────────────────────────────────────────
+
+(defn- chunks-of
+  "`xs` in consecutive groups of at most `n` (the last may be short)."
+  [n xs]
+  (loop [xs (seq xs) acc []]
+    (if (nil? xs)
+      acc
+      (recur (seq (drop n xs)) (conj acc (vec (take n xs)))))))
+
+(defn- pmap-ordered
+  "Map `f` over `xs` in parallel (at most `n` at once), results in order.
+   Plain spawn/receive: one process per element in a chunk, each sending
+   `[ref result]` back; collected in chunk order. A crash in `f` is
+   linked, so it surfaces as the build's own failure — `build-one` already
+   catches compile errors into a result, so a crash here is a real bug."
+  [n f xs]
+  (let [me (erlang/self)]
+    (apply concat
+      (map (fn [chunk]
+             (let [refs (mapv (fn [x]
+                                (let [ref (erlang/make_ref)]
+                                  ; CONVEYED, not merely spawned: a worker's env
+                                  ; does not cross a process boundary on its own,
+                                  ; and a worker that resolves at `:global` has no
+                                  ; module caps — which is how the retry below
+                                  ; turned into `function Thread.sleep/1 is
+                                  ; undefined (module Thread is not available)`
+                                  ; instead of building anything.
+                                  (erlang/spawn_link (fn [] (erlang/send me (erlang/list_to_tuple (list ref ((BeamLisp.Env/convey f) x))))))
+                                  ref))
+                              chunk)]
+               (mapv (fn [ref] (receive [r v] :when (= r ref) v)) refs)))
+           (chunks-of n xs)))))
+
+; ── structural toolchain barrier ───────────────────────────────────────────────
+
+(defn toolchain-source? [path] (BeamLisp.Tiers/toolchain_source? path))
+
+(defn partition-plan
+  "Split a plan into the serial TOOLCHAIN prefix and the parallel ordinary waves.
+
+   Toolchain = codegen (`priv/boot/`) plus the build driver (`priv/build/`):
+   the compiler and the program scheduling it must both be sound before
+   anything else builds."
+  [p]
+  (let [tc (vec (filter (fn [n] (toolchain-source? (:path n))) (:order p)))
+        tc-paths (set (map :path tc))
+        errors (vec (apply concat
+                      (map (fn [n]
+                             (map (fn [dep] (str "beam-lisp AOT: toolchain source " (:path n) " requires ordinary source " dep))
+                                  (filter (fn [dep] (not (contains? tc-paths dep)))
+                                          (get (:deps p) (:path n) [])))) tc)))
+        ordinary-waves (vec (filter (fn [w] (not (empty? w)))
+                               (map (fn [w] (vec (filter (fn [n] (not (contains? tc-paths (:path n)))) w)))
+                                    (:waves p))))]
+    {:toolchain tc :ordinary-waves ordinary-waves :errors errors}))
+
+;; The toolchain barrier: an error IN A TOOLCHAIN SOURCE (codegen under
+;; `priv/boot/`, or the driver under `priv/build/`) — or a toolchain source
+;; requiring an ordinary one — means the compiler or the program scheduling it
+;; is not sound, so the build stops. An error in an ORDINARY source — a typo in b.bl — is a
+;; report, not a barrier: a (needing nothing) still builds, c (needing b)
+;; fails on its require and is reported too. Gating on ANY error (as the
+;; barrier first shipped) turned one unreadable file into "nothing built".
+;; `index-of` answers nil for "absent", and `(>= nil 0)` is TRUE under the
+;; total ordering `>=` implements — so the old `(>= (index-of msg path) 0)`
+;; called every message a boot error, and one ordinary source failing closed
+;; the whole build (the barrier 1baaab4 meant to narrow never was). Ask for
+;; a number before comparing.
+(defn- toolchain-error? [msg toolchain-paths]
+  (some (fn [path] (and (string? msg) (number? (index-of msg path)))) toolchain-paths))
+
+(defn continue-after-toolchain?
+  "Proceed to the ordinary waves? Yes unless a TOOLCHAIN source failed."
+  [st]
+  (not (some (fn [e] (toolchain-error? e (:toolchain-paths st))) (:errors st))))
+
+(defn- result-fact
+  "The fact a finished source writes: what it is fresh under, or why it is not."
+  [r]
+  (let [[tag payload] (:result r) path (:path r)]
+    (if (= tag :ok)
+      (blog/built-fact path (:key r) (:tkey r) payload (:cached? r))
+      (blog/failed-fact path payload))))
+
+(defn- fold-results
+  "Append this wave's facts, then fold them into the state.
+
+   The log is written AS each source lands, so an interrupted build keeps every
+   completed source — and both effects come from the ONE fact list, so what the
+   log records and what the state believes cannot drift."
+  [st results out log-path]
+  (let [facts (vec (map result-fact results))]
+    (blog/append! log-path facts)
+    (reduce (fn [st r]
+      (let [[tag payload] (:result r) path (:path r)
+            old (get-in (:state st) [:sources path :modules] [])
+            ; what the source produces NOW — a failure produces nothing, so
+            ; every beam it had is removed below
+            names (set (if (= tag :ok) (blog/module-names payload) []))]
+        (doseq [mod (remove (fn [m] (contains? names m)) (blog/module-names old))]
+          (delete-beam out mod))
+        (if (= tag :ok)
+          (do (when (and (:closure-key r) (not (:cached? r)))
+                (BeamLisp.AOTCache/store (:tkey r) (:closure-key r) out payload))
+              (assoc st :built (inc (:built st))))
+          (assoc st :errors (conj (vec (:errors st)) payload)))))
+      (assoc st :state (blog/apply-facts (:state st) facts))
+      results)))
+
+(defn- source-key
+  "The tier key a source's beam is stamped with: codegen for `priv/boot/` and
+   for every ordinary namespace, the driver key for `priv/build/`. The manifest
+   and the runtime gate both route through `AOTCache/key_for_source`, so a
+   beam's stamp and the judgement of it cannot disagree.
+
+   `root` is the priv the source belongs to — the running one normally, a staged
+   copy when a self-build stages its sources."
+  [root path]
+  (if (nil? root)
+    (BeamLisp.AOTCache/key_for_source path)
+    (BeamLisp.AOTCache/key_for_source path root)))
+
+(defn- build-wave [wave jobs st p todo? cache? hashes out log-path log root]
+  (let [state (:state st)
+        paths (vec (map :path (filter (fn [n] (todo? state (:path n))) wave)))
+        results (pmap-ordered jobs (fn [path]
+                  (let [tkey (source-key root path)
+                        cache-key (when cache? tkey)]
+                    (build-one path (get (:key p) path) tkey cache-key
+                      (when cache-key (BeamLisp.AOTCache/closure_key path (:deps p) hashes)) out log))) paths)]
+    (fold-results st results out log-path)))
+
+(defn- build-ordinary [waves jobs st p todo? cache? hashes out log-path log root]
+  (reduce (fn [s w] (build-wave w jobs s p todo? cache? hashes out log-path log root)) st waves))
+
+(defn- build-substrate
+  "The ELIXIR SUBSTRATE stage (`substrate`): compile the project's `.ex`
+   sources that the log cannot vouch for, BEFORE any `.bl` wave — a `.bl`
+   source may call into the substrate, and its facts belong to the same run.
+
+   Its errors are a REPORT, not a barrier: an Elixir file that will not compile
+   does not make the `.bl` compiler unsound, and the caller decides what an
+   error list means. `(nil? ex)` skips the stage entirely (a consumer that
+   ships only `.bl`)."
+  [st ex out log-path log]
+  (if (nil? ex)
+    st
+    (let [srcs (sub/sources (:root ex) (or (:exclude ex) []))
+          todo (sub/stale (:state st) srcs out)]
+      (if (empty? todo)
+        (assoc st :ex-built 0)
+        (let [r (sub/compile! todo out)
+              facts (:facts r)]
+          (when log (log (str "beam-lisp substrate: building " (count todo) " source(s)")))
+          (blog/append! log-path facts)
+          (assoc st
+                 :state (blog/apply-facts (:state st) facts)
+                 :errors (vec (concat (:errors st) (:errors r)))
+                 :ex-built (:compiled r)))))))
+
+(defn- build-toolchain [nodes st p todo? cache? hashes out log-path log root]
+  (loop [xs (seq nodes) st st]
+    (if (or (nil? xs) (not (continue-after-toolchain? st))) st
+      (recur (seq (rest xs)) (build-wave [(first xs)] 1 st p todo? cache? hashes out log-path log root)))))
+
+; ── the native stage ────────────────────────────────────────────────────────
+;
+; Crates live under `native/<crate>/`; the artefact a build must place is
+; `priv/native/<crate>` (no `lib` prefix — `BeamLisp.Native` loads it by that
+; name). Two things make this a stage rather than a shell-out:
+;
+;   the KEY IS CONTENT   `(crate source digest, cargo version)`, so the same
+;                        inputs name the same artefact and a build either finds
+;                        it or makes it;
+;   the TARGET IS CLAIMED  cargo is run with a target dir under the store, and a
+;                        claim means two builds never run cargo over the same
+;                        target dir. That is the lock cargo would otherwise hold
+;                        on a shared target, replaced by a claim that says who
+;                        has it (see `claim`).
+;
+; The inputs are the ones the Mix task used before this existed
+; (`src/**/*.rs`, `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`) — read off
+; that task rather than invented, because a staleness key that disagrees with the
+; artefact is worse than no cache at all.
+
+(defn- dep-lock?
+  "Whether `path` is a lock that CONSTRAINS something: one that names a package
+   other than the crate itself. A lock holding only the crate is a function of
+   `Cargo.toml` and carries nothing the manifest does not."
+  [path]
+  (and (File/regular? path)
+       (let [text (d/read-slice path 0 (d/file-size path))]
+         (and (some? text) (>= (count (split text "[[package]]")) 3)))))
+
+(defn native-decl-files
+  "The files whose contents decide a crate's artefact: its sources and manifest,
+   plus a lock only when the lock constrains something.
+
+   `Cargo.lock` sat in this set unconditionally and that was MEASURED to be a bug:
+   cargo WRITES the lock when it is missing, so the first build hashed a set
+   without it and every run after hashed a set with it — two key directories under
+   the store and an unchanged crate rebuilt on the next run (`:built 1 :cached 0`,
+   observed). Dropping a lock that names only the crate loses nothing, because
+   such a lock's content is a function of the manifest; a lock naming other
+   packages is a real declaration, is checked in, and cargo leaves a consistent
+   lock alone. All five crates in `native/` ship locks of 15-275 packages, so
+   nothing is lost there — and a fresh crate with no dependencies now keys to the
+   same value before and after its first build."
+  [crate-dir]
+  (let [globbed (mapcat (fn [g] (Path/wildcard (Path/join crate-dir g)))
+                        ["src/**/*.rs"])
+        fixed   (filter (fn [f] (File/regular? f))
+                        [(Path/join crate-dir "Cargo.toml")
+                         (Path/join crate-dir ".cargo/config.toml")])
+        lock    (Path/join crate-dir "Cargo.lock")]
+    (sort (concat globbed fixed (if (dep-lock? lock) [lock] [])))))
+
+(defn native-key
+  "The content key of a crate: its declared inputs' digests in sorted path order,
+   plus the cargo version. Version-qualified because a different compiler is a
+   different artefact."
+  [crate-dir]
+  (let [files (vec (native-decl-files crate-dir))
+        parts (map (fn [f] (str (Path/relative_to f crate-dir) ":"
+                                (d/sha256-hex-of f 0 (d/file-size f))))
+                   files)]
+    (subs (d/sha256-hex (str (join "\n" parts) "\ncargo")) 0 32)))
+
+(defn native-root
+  "Where built natives live: content-addressed, beside the library store — and
+   derived FROM the store rather than repeating its `XDG_CACHE_HOME`/`HOME`
+   fallback. The first version read `XDG_CACHE_HOME` directly, which is nil in a
+   bare test VM, and `Path/join` answered with a chardata error."
+  []
+  (Path/join (Path/dirname (st/root)) "native"))
+
+(defn- cdylib-in
+  "The cdylib cargo wrote for `crate` under `dir`, or nil."
+  [dir crate]
+  (first (filter (fn [p] (File/exists? p))
+                 [(Path/join dir (str "lib" crate ".so"))
+                  (Path/join dir (str "lib" crate ".dylib"))
+                  (Path/join dir (str crate ".dll"))])))
+
+(defn- native-one
+  "One crate: find the artefact its inputs name, or make it. Written as explicit
+   `assoc`s rather than a threading chain — a stage that reports counts should
+   not also be a puzzle about which arity of `update` it meant."
+  [acc crate-dir root log]
+  (let [crate (Path/basename crate-dir)
+        key (native-key crate-dir)
+        dir (Path/join (Path/join (native-root) key) crate)
+        dest (Path/join (Path/join root "priv/native") crate)
+        found (cdylib-in (Path/join dir "release") crate)]
+    (cond
+      (some? found)
+      (do (File/mkdir_p! (Path/dirname dest))
+          (File/cp! found dest)
+          (when (some? log) (log (str "beam-lisp native: " crate " from cache")))
+          (assoc acc
+                 :cached (+ 1 (:cached acc))
+                 :artifacts (conj (:artifacts acc) dest)))
+
+      (some? (c/held-by dir))
+      (assoc acc :errors (conj (:errors acc)
+                               (str "native: " crate " is being built by pid "
+                                    (:pid (c/held-by dir)))))
+
+      :else
+      (do
+        (c/acquire! dir crate)
+        (try
+          (File/mkdir_p! dir)
+          ; `:os.cmd` wants a LIST OF CHARACTERS, not a binary — passing a
+          ; binary answers with `not a list of characters` and no build.
+          (erlang/apply :os :cmd
+                        (list (erlang/binary_to_list
+                                (str "cd " crate-dir " && cargo build --release --target-dir " dir))))
+          (let [built (cdylib-in (Path/join dir "release") crate)]
+            (if (nil? built)
+              (assoc acc :errors (conj (:errors acc)
+                                       (str "native: cargo produced no cdylib for " crate)))
+              (do
+                (File/mkdir_p! (Path/dirname dest))
+                (File/cp! built dest)
+                (when (some? log) (log (str "beam-lisp native: " crate " built")))
+                (assoc acc
+                       :built (+ 1 (:built acc))
+                       :artifacts (conj (:artifacts acc) dest)))))
+          (finally (c/release! dir)))))))
+
+(defn build-native
+  "Build (or find) every crate's artefact and install it at `priv/native/<crate>`.
+   Returns `{:built n :cached n :artifacts [path …] :errors [msg …]}`."
+  [root log]
+  (let [crates (vec (filter (fn [dir] (File/exists? (Path/join dir "Cargo.toml")))
+                            (sort (Path/wildcard (Path/join root "native/*")))))]
+    (loop [cs crates
+           acc {:built 0 :cached 0 :artifacts [] :errors []}]
+      (if (empty? cs)
+        acc
+        (recur (rest cs) (native-one acc (first cs) root log))))))
+
+(defn run [opts]
+  (let [sources (vec (:sources opts)) out (:out opts) force? (= true (:force? opts))
+        root (:root opts)
+        jobs (or (:jobs opts) (erlang/system_info :schedulers_online)) log (:log opts)
+        mpath (or (:manifest opts) (manifest-path out))
+        lpath (or (:log-path opts) (blog/path-for mpath))
+        run-id (str (erlang/system_time :millisecond))
+        started (blog/run-fact run-id (erlang/system_time :millisecond))
+        cache? (and (BeamLisp.AOTCache/enabled?) (not force?))
+        ; THE LOG IS THE MEMORY. A build directory written before the log
+        ; existed is read from its manifest ONCE — the migration — so adopting
+        ; the log costs no rebuild; after that the manifest is only written.
+        logged (blog/replay (blog/read-facts lpath))
+        state0 (if (pos? (count (:sources logged))) logged
+                   (blog/state-of-manifest (read-manifest mpath)))
+        read-results (map (fn [path] (try [:ok (retry-after-settle
+                                                (fn [] (plan/node-from path (BeamLisp.Loader/read_source path))))]
+                                      (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))) sources)
+        read-errors (vec (map second (filter (fn [r] (= :error (first r))) read-results)))
+        p (plan/plan (map second (filter (fn [r] (= :ok (first r))) read-results)))
+        part (partition-plan p) hashes (into {} (map (fn [n] [(:path n) (:hash n)]) (:order p)))
+        todo? (fn [state path] (or force? (not (blog/fresh? state path (get (:key p) path) (source-key root path) out))))
+        total (count (filter (fn [n] (todo? state0 (:path n))) (:order p)))]
+    (when (and log (pos? total)) (log (str "beam-lisp AOT: building " total " source(s)")))
+    ; the run fact goes down BEFORE the first source, and into the state with
+    ; it: a build killed mid-wave leaves a log that says a run started and how
+    ; far it got, and the run that finishes writes itself into the compaction
+    (blog/append! lpath [started])
+    (let [tc-paths (set (map :path (:toolchain part)))
+          initial {:state (blog/apply-facts state0 [started]) :built 0 :toolchain-paths tc-paths
+                   :errors (vec (concat read-errors (:errors part)))}
+          ; toolchain sources build only from a clean slate: a barrier error (a
+          ; toolchain source requiring an ordinary one) or an unreadable
+          ; toolchain source means the compiler or its driver is unsound, so
+          ; nothing further is attempted
+          ; THE SUBSTRATE FIRST: it may be what a .bl source calls, and its
+          ; facts are this run's facts
+          with-ex (build-substrate initial (:ex opts) out lpath log)
+          built (if (continue-after-toolchain? with-ex)
+                  (build-toolchain (:toolchain part) with-ex p todo? cache? hashes out lpath log root) with-ex)
+          final (if (continue-after-toolchain? built)
+                  (build-ordinary (:ordinary-waves part) jobs built p todo? cache? hashes out lpath log root) built)
+          keep (set sources)
+          st0 (:state final)
+          gone (vec (remove (fn [path] (contains? keep path)) (keys (:sources st0))))
+          ; the beams to remove are read BEFORE the drop facts land
+          gone-beams (vec (map (fn [path] (get-in st0 [:sources path :modules] [])) gone))
+          st (if (pos? (count gone))
+               (blog/apply-facts st0 (mapv blog/dropped-fact gone))
+               st0)
+          st (assoc st :ended {:id run-id :built (:built final) :errors (count (:errors final))})
+          projection (blog/manifest st)]
+      (doseq [mods gone-beams] (doseq [mod mods] (delete-beam out mod)))
+      ; ONE compacted log and its projection, written together at the END.
+      ; Everything before this line was appended as it happened; this is the
+      ; point where the log stops being history and becomes the current state.
+      (blog/write! lpath (blog/facts-of st))
+      (write-manifest mpath projection)
+      (let [nat (if (:native opts) (build-native (or (:root opts) ".") log)
+                                  {:built 0 :cached 0 :artifacts [] :errors []})]
+        {:built (:built final) :errors (vec (concat (:errors final) (:errors nat)))
+         :manifest projection
+         :ex-built (:ex-built with-ex)
+         :native nat}))))
+
+(defn clean [out mpath]
+  (let [lpath (blog/path-for mpath)
+        logged (blog/replay (blog/read-facts lpath))
+        st (if (pos? (count (:sources logged))) logged (blog/state-of-manifest (read-manifest mpath)))]
+    (doseq [path (keys (:sources st))]
+      (doseq [mod (get-in st [:sources path :modules] [])] (delete-beam out mod)))
+    ; BOTH files are this build's state. Removing the manifest and leaving the
+    ; log would leave a log claiming beams that no longer exist.
+    (when (File/exists? mpath) (File/rm mpath))
+    (when (File/exists? lpath) (File/rm lpath))
+    :ok))

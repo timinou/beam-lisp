@@ -207,10 +207,10 @@ defmodule BeamLisp.PerEnvDefTest do
     @compile_path Path.join(System.tmp_dir!(), "beam_lisp_per_env_fixtures")
 
     setup do
-      Mix.Tasks.Compile.BeamLisp.clean(@compile_path)
+      BeamLisp.BuildTask.clean(@compile_path)
 
       assert {:ok, _} =
-               Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @compile_path])
+               BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @compile_path])
 
       Code.append_path(@compile_path)
       # Load the AOT namespace exactly as a fresh VM would.

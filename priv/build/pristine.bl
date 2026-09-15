@@ -1,0 +1,231 @@
+; build/pristine.bl — the PRISTINE comparison: whether two trees (or two drops)
+; are the same thing, in layers that cannot hide a difference from each other.
+;
+; The fixpoint gate (PLAN-108 W6) is only as strong as the comparison behind it,
+; and the comparison has one MEASURED trap: two packs of ONE tree produce
+; different compounds, because flate2 and Erlang's zlib are different
+; compressors (measured in W5). A whole-file byte-compare therefore fails for a
+; reason nobody intends to fix, while a looser compare can pass while a real
+; difference hides inside the deflate stream.
+;
+; So the comparison is layered, and `same?` means EVERY layer agreed:
+;
+;   1. TREES    every file's path → (size, sha256), compared as SETS: a path in
+;               one tree and not the other is reported as such. A subset check
+;               would pass while a stale beam sat in one of them.
+;   2. TAR      byte-for-byte, walked with the packer's own walker — so the two
+;               agree on what the tree IS, not merely on what it contains.
+;   3. PAYLOAD  the DECOMPRESSED bytes' sha256, so the known deflate difference
+;               cannot hide a payload difference.
+;   4. TRAILER  the six fields, plus `offset + len + 56 == size` per file.
+;
+; `report` prints EVERY difference, never just the first: a gate that reports
+; one mismatch at a time turns a fixpoint into a guessing game.
+;
+; Nothing here decides "the same" loosely, and nothing here decompresses
+; anything it has not been asked to compare.
+;
+; ── Two interop facts this file is written around (both OBSERVED, not assumed)
+;
+;   * Keys that cross to Elixir are LETTERS ONLY (`:same?` `:fields` `:sizes`,
+;     …). A bl keyword containing a hyphen arrives in Elixir as a BINARY key
+;     (`:a-size` → `"a-size"`), while one without arrives as an atom — seen in a
+;     real run of this code, and the reason no key here has a hyphen. The Elixir
+;     façade's callers read atoms.
+;   * `walk-files` yields `[rel abs]` PAIRS, not paths — the packer's own
+;     convention. The first version of `index` treated an element as a path and
+;     handed a Vector to `Path.join`.
+
+(ns pristine
+  (:require [drop :as d]))
+
+(defn index
+  "`rel-path → {:size n :sha hex}` for every file under `root`, walked with the
+   packer's own walker so the two agree on what the tree IS — same order, same
+   file set, no directory entries.
+
+   `exclude` names relative paths to leave OUT, and the caller must name them:
+   a build's own memory (`build.log`) records the run id and the time, so it can
+   never be part of a fixpoint. The comparison does not guess which files are
+   state — a gate that quietly ignores files is one that passes while something
+   is wrong."
+  ([root] (index root []))
+  ([root exclude]
+   (let [skip (set exclude)]
+     (reduce (fn [acc e]
+               (let [rel (first e)
+                     p (second e)
+                     n (d/file-size p)]
+                 (if (contains? skip rel)
+                   acc
+                   (assoc acc rel {:size n :sha (d/sha256-hex-of p 0 n)}))))
+             {} (d/walk-files root)))))
+
+(defn- size-of
+  "Total bytes an index describes."
+  [idx]
+  (reduce (fn [s rel] (+ s (:size (get idx rel)))) 0 (keys idx)))
+
+(defn index-diff
+  "The set difference between two indexes: `:removed` (in A, not B), `:added`
+   (in B, not A), `:changed` (in both, differing size or digest), with the file
+   counts and byte totals of each."
+  [a b]
+  (let [only-a (filter (fn [rel] (nil? (get b rel))) (keys a))
+        only-b (filter (fn [rel] (nil? (get a rel))) (keys b))
+        both   (filter (fn [rel] (some? (get b rel))) (keys a))
+        differ (filter (fn [rel] (not= (get a rel) (get b rel))) both)]
+    {:same? (and (empty? only-a) (empty? only-b) (empty? differ))
+     :removed (vec (sort only-a))
+     :added (vec (sort only-b))
+     :changed (vec (sort differ))
+     :files {:a (count a) :b (count b)}
+     :bytes {:a (size-of a) :b (size-of b)}}))
+
+(defn trees
+  "Layers 1 and 2, for two release roots: the set difference and the tar bytes.
+   `:same?` is both agreeing.
+
+   With `exclude` (names of build STATE, not artifacts — see `index`) the TAR
+   layer cannot apply, because a tar is the whole directory: it is reported as
+   NOT COMPARED, with the reason, rather than silently passing. `:same?` then
+   rests on the index layer alone."
+  ([a b] (trees a b []))
+  ([a b exclude]
+   (let [diff (index-diff (index a exclude) (index b exclude))
+         skipped (vec exclude)
+         tar (if (empty? skipped)
+               (let [ta (d/tar a)
+                     tb (d/tar b)]
+                 {:same? (= ta tb)
+                  :sizes {:a (erlang/byte_size ta) :b (erlang/byte_size tb)}})
+               {:same? nil :skipped skipped})]
+     {:trees diff
+      :tar tar
+      :same? (and (:same? diff) (if (empty? skipped) (:same? tar) true))})))
+
+(defn drop-view
+  "Everything about one compound that can be checked independently: its size,
+   the trailer's PRODUCER-INDEPENDENT fields (offset, os, arch, version), whether
+   the arithmetic closes, the digest the trailer STORES against the one the
+   payload actually has, that payload's compressed length and digest, and the
+   digest of the payload DECOMPRESSED.
+
+   `:len` and the digest belong to `:compressed`, not to `:fields`, and that
+   split is the whole point: they describe the COMPRESSED payload, so two
+   different compressors produce different ones for identical bytes. Found by
+   running this — the first version compared `:len` as if it were a property of
+   the tree."
+  [path]
+  (let [c (d/compound path)]
+    (if (nil? c)
+      {:path path :drop? false}
+      (let [t (:trailer c)
+            off (:offset t)
+            len (:len t)
+            size (d/file-size path)]
+        {:path path
+         :drop? true
+         :size size
+         :fields {:offset off :os (:os t) :arch (:arch t) :version (:version t)}
+         :arithmetic (= size (+ off len d/trailer-len))
+         :stored (d/deref-trailer c)
+         :compressed {:len len :sha (d/sha256-hex-of path off len)}
+         :decompressed (d/sha256-hex (d/gunzip (d/read-slice path off len)))}))))
+
+(defn drops
+  "Layers 3 and 4, for two compounds. `:same?` means: both are v1 drops, the
+   same producer-independent trailer fields, both arithmetics closed, each
+   trailer's digest agreeing with its own payload, and the same DECOMPRESSED
+   payload — i.e. the same bytes, whatever compressor wrote them.
+
+   Two sections are reported and deliberately NOT part of `:same?`, because they
+   can only agree when the SAME packer wrote both files: `:compressed` (the
+   payload's compressed length and digest) and `:sizes` (the file's own size).
+   So the fixpoint across two different producers is the DECOMPRESSED layer,
+   while the fixpoint for one producer can demand the whole file and does —
+   `compounds-identical?`."
+  [a b]
+  (let [va (drop-view a)
+        vb (drop-view b)
+        both? (and (:drop? va) (:drop? vb))
+        fields-same? (= (:fields va) (:fields vb))
+        arith? (and (:arithmetic va) (:arithmetic vb))
+        stored? (and (= (:stored va) (:sha (:compressed va)))
+                     (= (:stored vb) (:sha (:compressed vb))))
+        comp-same? (and (= (:compressed va) (:compressed vb))
+                        (= (:stored va) (:stored vb)))
+        decomp-same? (= (:decompressed va) (:decompressed vb))]
+    {:a va
+     :b vb
+     :fields {:same? fields-same? :a (:fields va) :b (:fields vb)}
+     :arithmetic {:same? arith? :a (:arithmetic va) :b (:arithmetic vb)}
+     :stored {:same? stored? :a (:stored va) :b (:stored vb)}
+     :compressed {:same? comp-same? :a (:compressed va) :b (:compressed vb)}
+     :decompressed {:same? decomp-same? :a (:decompressed va) :b (:decompressed vb)}
+     :sizes {:same? (= (:size va) (:size vb)) :a (:size va) :b (:size vb)}
+     :same? (and both? fields-same? arith? stored? decomp-same?)}))
+
+(defn compounds-identical?
+  "Whether two compounds are byte-identical, which is the fixpoint ONE producer
+   can demand of itself — our packer is deterministic (two packs of one release
+   tree gave the same file digest). Deliberately separate from `drops`/`same?`,
+   which has to hold for two different compressors."
+  [a b]
+  (= (d/sha256-hex-of a 0 (d/file-size a))
+     (d/sha256-hex-of b 0 (d/file-size b))))
+
+
+(defn- section-lines
+  "The lines for one comparison section, when it reports a difference or a
+   DISCLOSED skip. A section with nothing on either side says nothing: two files
+   that are not drops at all have no arithmetic to compare, and a line claiming
+   they do is noise."
+  [label s]
+  (cond
+    (or (nil? s) (= true (:same? s)))
+    []
+
+    (some? (:skipped s))
+    (list (str "  " label ": NOT COMPARED — build state excluded: "
+               (pr-str (:skipped s))))
+
+    (and (nil? (:a s)) (nil? (:b s)))
+    []
+
+    :else
+    (list (str "  " label ": differs"
+               (if (nil? (:a s))
+                 ""
+                 (str " — " (pr-str (:a s)) " vs " (pr-str (:b s))))))))
+
+(defn report
+  "EVERY difference, one line each, never just the first — a gate that reports
+   one mismatch at a time turns a fixpoint into a guessing game. Works for the
+   value `trees` returns and for the value `drops` returns."
+  [d]
+  (let [removed (or (get-in d [:trees :removed]) [])
+        added (or (get-in d [:trees :added]) [])
+        changed (or (get-in d [:trees :changed]) [])
+        lines (vec (concat
+                     (map (fn [p] (str "  removed:  " p)) removed)
+                     (map (fn [p] (str "  added:    " p)) added)
+                     (map (fn [p] (str "  changed:  " p)) changed)
+                     (if (= false (get-in d [:a :drop?]))
+                       (list (str "  a is not a v1 drop: " (get-in d [:a :path])))
+                       [])
+                     (if (= false (get-in d [:b :drop?]))
+                       (list (str "  b is not a v1 drop: " (get-in d [:b :path])))
+                       [])
+                     (section-lines "tar" (:tar d))
+                     (section-lines "fields" (:fields d))
+                     (section-lines "arithmetic" (:arithmetic d))
+                     (section-lines "stored" (:stored d))
+                     (section-lines "compressed" (:compressed d))
+                     (section-lines "decompressed" (:decompressed d))
+                     (section-lines "sizes" (:sizes d))))]
+    (if (empty? lines)
+      (if (= true (:same? d))
+        "identical"
+        (str "not identical, but no single difference was recorded " (pr-str d)))
+      (join "\n" lines))))

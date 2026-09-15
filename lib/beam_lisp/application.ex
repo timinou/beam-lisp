@@ -82,8 +82,12 @@ defmodule BeamLisp.Application do
   # (lib/dev is excluded from other elixirc_paths, so dependents never see it);
   # Mix itself may be absent on embedded runtimes (Mob deploys app beams only).
   defp dev_server? do
-    Code.ensure_loaded?(BeamLisp.DevServer) and Code.ensure_loaded?(Mix) and
-      Mix.env() == :dev and not cli_task?()
+    # The KIND of image decides, not whether Mix is loaded: deleting Mix would
+    # otherwise keep `Mix.env()` from answering and quietly stop starting the dev
+    # server in development. See BeamLisp.Image — one implementation, also used
+    # by `reload` to gate mutating reloads.
+    Code.ensure_loaded?(BeamLisp.DevServer) and BeamLisp.Image.dev?() and
+      not cli_task?()
   end
 
   defp cli_task? do

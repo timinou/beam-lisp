@@ -21,6 +21,11 @@ defmodule BeamLisp.AotBuildKeyTest do
   # `mix compile` rebuilds + re-stamps — no `--force` needed. This test forges
   # the drift by rewriting the manifest's stored key and asserts the next
   # (non-force) run rebuilds rather than no-ops.
+  #
+  # WHERE THE DRIFT IS FORGED MOVED: the build's memory is the fact log now
+  # (`priv/build/build-log.bl`) and the manifest is its projection, so a
+  # manifest edit changes nothing at all (pinned below) and the forge has to
+  # happen where the memory is. Same property, one layer down.
 
   @fixture_dir "test/fixtures/aot"
   @out Path.join(System.tmp_dir!(), "beam_lisp_aot_build_key")
@@ -28,12 +33,12 @@ defmodule BeamLisp.AotBuildKeyTest do
 
   setup do
     BeamLisp.init()
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
-    on_exit(fn -> Mix.Tasks.Compile.BeamLisp.clean(@out) end)
+    BeamLisp.BuildTask.clean(@out)
+    on_exit(fn -> BeamLisp.BuildTask.clean(@out) end)
     :ok
   end
 
-  defp build!, do: Mix.Tasks.Compile.BeamLisp.run(["--source-dir", @fixture_dir, "--out", @out])
+  defp build!, do: BeamLisp.BuildTask.run(["--source-dir", @fixture_dir, "--out", @out])
 
   defp read_manifest, do: @manifest |> File.read!() |> :erlang.binary_to_term()
   defp write_manifest(m), do: File.write!(@manifest, :erlang.term_to_binary(m))
@@ -59,46 +64,68 @@ defmodule BeamLisp.AotBuildKeyTest do
     assert {:noop, []} = build!()
   end
 
-  test "a toolchain-key drift forces a rebuild without --force" do
+  test "a tier-key drift forces a rebuild without --force" do
     assert {:ok, _} = build!()
     path = math_source_path()
 
-    # Sanity: a plain second run is a no-op (key + hash both match).
+    # Sanity: a plain second run is a no-op (key + tier both match).
     assert {:noop, []} = build!()
 
-    # Forge the exact desync a codegen edit produces: same source bytes, but
-    # the beam was stamped by a toolchain whose key no longer matches. Rewrite
-    # ONLY the stored key; leave the source-hash correct.
+    # The manifest is a PROJECTION, so rewriting it changes nothing: the build
+    # no longer reads it. Worth pinning, because "the manifest is derived" is
+    # now the shape of the whole build.
     m = read_manifest()
-    entry = Map.fetch!(m, path)
-    stale = %{entry | key: "deadbeef-not-the-current-compiler-key"}
-    write_manifest(Map.put(m, path, stale))
+    write_manifest(Map.put(m, path, %{Map.fetch!(m, path) | key: "deadbeef-not-current"}))
+    assert {:noop, []} = build!()
 
-    # The build must now REBUILD (not no-op): the key check in up_to_date?/5
-    # fails even though the source hash is unchanged. This is the whole fix —
-    # the build gate agreeing with the runtime gate.
+    # Forge the exact desync a codegen edit produces, where the memory is: same
+    # source bytes, but the recorded fact says the beam came from a toolchain
+    # whose key is gone. The build must REBUILD, not no-op — the build gate
+    # agreeing with the runtime gate. This is the whole fix.
+    forge_recorded_tier!(path, "deadbeef-not-the-current-compiler-key")
+    refute recorded_tier(path) == BeamLisp.AOTCache.compiler_key()
+
     assert {:ok, _} = build!()
 
-    # And it re-stamps the entry with the live key, so the tree is warm again.
-    restamped = read_manifest() |> Map.fetch!(path)
-    assert restamped.key == BeamLisp.AOTCache.compiler_key()
+    # And it re-records the live key, so the tree is warm again.
+    assert recorded_tier(path) == BeamLisp.AOTCache.compiler_key()
     assert {:noop, []} = build!()
   end
 
-  test "an old-format manifest entry (no :key) rebuilds once, then warms" do
+  test "a pre-log build directory migrates from its manifest, then warms" do
     assert {:ok, _} = build!()
     path = math_source_path()
 
-    # Simulate a manifest written by the pre-fix task: entries had only
-    # :hash and :modules. Such an entry must fail the match exactly once and
-    # rebuild (re-stamping the key), a safe one-time migration.
+    # A build directory written before the log existed: a manifest, no log, and
+    # an entry in the OLD shape (no :key). The build reads it ONCE — rebuilding
+    # the source whose tier key it cannot vouch for, re-stamping it — and is
+    # warm from then on. Safe by construction: a missing tier key can only fail
+    # the match, never pass it.
+    File.rm!(log_path())
     m = read_manifest()
-    entry = Map.fetch!(m, path)
-    legacy = Map.delete(entry, :key)
+    legacy = m |> Map.fetch!(path) |> Map.delete(:key)
     write_manifest(Map.put(m, path, legacy))
 
     assert {:ok, _} = build!()
+    assert recorded_tier(path) == BeamLisp.AOTCache.compiler_key()
     assert read_manifest() |> Map.fetch!(path) |> Map.has_key?(:key)
     assert {:noop, []} = build!()
+  end
+
+  # ── the fact log ─────────────────────────────────────────────────────────
+
+  defp log_path, do: BeamLisp.BuildLog.path_for(@manifest)
+
+  defp recorded_tier(path),
+    do: Map.fetch!(BeamLisp.BuildLog.state(log_path()).sources, path).tier
+
+  # The log is TEXT — that is the point of it — so a forge is a string edit, not
+  # a rebuild of the structures the reader uses. If the format moves out from
+  # under this pattern the test fails loudly rather than passing vacuously.
+  defp forge_recorded_tier!(path, tier) do
+    text = File.read!(log_path())
+    pattern = ~r/(\[:build\/built "#{Regex.escape(path)}" "[0-9a-f]+" )"[^"]*"/
+    assert Regex.match?(pattern, text), "no :build/built fact for #{path} in the log"
+    File.write!(log_path(), Regex.replace(pattern, text, "\\1\"#{tier}\"", global: false))
   end
 end

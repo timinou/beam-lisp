@@ -60,6 +60,9 @@ defmodule BeamLisp.AOTCache do
   # lives in `compiler.bl` and is caught by the `.bl` source hash.
   # Memoization slot for the toolchain key (a VM constant in normal use).
   @toolchain_key_pt {__MODULE__, :toolchain_key}
+  # Memoization slot for the build-DRIVER key, kept separate on purpose: a
+  # build-tool edit must not invalidate codegen beams. See `build_key/0`.
+  @build_key_pt {__MODULE__, :build_key}
 
   # TIER-1 = `priv/boot/` (see BeamLisp.Tiers). Everything there can alter
   # EVERY emitted byte, so it hashes into `compiler_key/0` (invalidate all)
@@ -160,12 +163,89 @@ defmodule BeamLisp.AOTCache do
   """
   def current_compiler_key, do: compute_compiler_key()
 
+  @doc "Like `current_compiler_key/0` for the build tier: the LIVE value, unmemoized."
+  def current_build_key, do: compute_build_key()
+
+  @doc """
+  Hash of the BUILD DRIVER tier (`priv/build/`): `build`, `build-plan`,
+  `source-graph`, `ns-interface`.
+
+  These namespaces decide WHAT to build; they cannot change an emitted byte.
+  Hashing them into `compiler_key/0` meant every build-tool edit moved the
+  toolchain key and rebuilt every beam in the tree — measured as 8 key
+  generations in 21h, each a full prelude rebuild to change a scheduler.
+
+  The driver's own beams are compiled BY the codegen, so this key folds in
+  `compiler_key/0`: a codegen change still invalidates the driver, while a
+  driver change invalidates the driver alone.
+
+  The driver is also the set the drift gate runs on, so it can never be vetted
+  by interface closure — asking for `build-plan`'s closure would ask the gate to
+  load the namespace it is vetting. A tier key is the only sound answer.
+  """
+  def build_key do
+    case :persistent_term.get(@build_key_pt, :undefined) do
+      :undefined ->
+        key = compute_build_key()
+        :persistent_term.put(@build_key_pt, key)
+        key
+
+      key ->
+        key
+    end
+  end
+
+  defp compute_build_key, do: hash_parts([compiler_key() | build_source_contents()])
+
+  # Content of every build-driver source, sorted by path. Read DIRECTLY (no
+  # reader, no Env) for the same reason `toolchain_source_contents/0` is: this
+  # runs before `BeamLisp.init/0`. An unreadable file contributes nothing
+  # rather than crashing the key computation.
+  defp build_source_contents do
+    BeamLisp.Tiers.build_dir()
+    |> Path.join("**/*.bl")
+    |> Path.wildcard()
+    |> Enum.sort()
+    |> Enum.flat_map(fn path ->
+      case File.read(path) do
+        {:ok, bytes} -> [bytes]
+        _ -> []
+      end
+    end)
+  end
+
+  @doc """
+  The key a SOURCE's beam is stamped with: the tier it belongs to.
+
+  `boot/` and every ordinary source use the codegen key; `build/` uses
+  `build_key/0`. The build manifest and the emitter both route through here, so
+  a beam's stamp and the gate that judges it cannot disagree.
+  """
+  def key_for_source(path, root \\ BeamLisp.Tiers.priv_root()) do
+    if BeamLisp.Tiers.build_source?(path, root), do: build_key(), else: compiler_key()
+  end
+
+  @doc "The key a NAMESPACE's beam is stamped with: `BeamLisp.Tiers.tier_of_ns/1`."
+  def key_for_ns(ns) when is_binary(ns), do: key_for_tier(BeamLisp.Tiers.tier_of_ns(ns))
+
+  @doc "The key for a tier: `:build` → `build_key/0`, anything else → `compiler_key/0`."
+  def key_for_tier(:build), do: build_key()
+  def key_for_tier(_tier), do: compiler_key()
   @doc false
   # Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
   # The key is a VM-constant in normal use (codegen beams + tier-1 sources do
   # not change under a running node), so this exists only for tests that mutate
   # a hashed input in-process and must observe the new key.
   def reset_compiler_key, do: :persistent_term.erase(@toolchain_key_pt)
+
+  @doc false
+  # Drop BOTH memoized tier keys, so the next `compiler_key/0` and `build_key/0`
+  # recompute. Tests that mutate a hashed input in-process use this.
+  def reset_keys do
+    :persistent_term.erase(@toolchain_key_pt)
+    :persistent_term.erase(@build_key_pt)
+    :ok
+  end
 
   defp compute_compiler_key do
     # Loading metadata does not start the app. Builds and ordinary startup

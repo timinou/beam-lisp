@@ -1,0 +1,511 @@
+; build/release.bl — THE RELEASE IS A VALUE; this is where the value comes from,
+; and (below) how it becomes a `.rel` that `systools` accepts.
+;
+; A Mix release is a tree assembled by a 700-line Elixir module that reads the
+; project, the dependency graph, the OTP installation and a pile of templates.
+; The drop needs the same tree, so the first thing to get right is WHAT GOES IN
+; IT — as data, derivable from the running VM, so the assembly stage (the rest
+; of this wave) never has to ask Mix anything.
+;
+; The value:
+;
+;   {:name "bl" :vsn "0.1.0"
+;    :erts {:vsn "17.0.1" :dir "/usr/lib/erlang"}
+;    :apps [{:app :kernel :vsn "10.0.1" :dir "/usr/lib/erlang/lib/kernel-10.0.1"} …]}
+;
+; Derivation rules, each of which an assembled tree depends on:
+;
+;   * the APP SET is the transitive `:applications` closure of the root app —
+;     exactly what a release boots, and what `:systools` will insist on: a
+;     missing app is a script error, an extra one is a permanent app that must
+;     start. `:kernel` and `:stdlib` come along because every app applies them.
+;   * an app's DIR is `:code.lib_dir/1`, which answers for OTP apps and for
+;     `_build/<env>/lib/<app>` dependencies alike — the VM already has the whole
+;     closure on its code path, so no dependency file is read here.
+;   * VERSIONS are the `.app` files' own, because that is what `systools`
+;     compares against the `.rel`.
+;
+; `rel-text` writes the classic `Name.rel` term:
+;
+;   {release, {"bl", "0.1.0"}, {erts, "17.0.1"}, [{kernel, "10.0.1", permanent}, …]}.
+;
+; `write-rel!` puts it where `systools` looks when it is told `:path` — the
+; release's own directory — and that term is written through Erlang's own
+; printer (`~p`), so what comes out is Erlang syntax, not this project's.
+(ns release)
+
+(defn text
+  "A charlist or binary as a binary. `:erlang` answers with charlists; bl
+   strings are binaries; `~w` wants one shape for both.
+
+   Public because the driver tier shares it: `selfbuild` reads a root out of
+   `:code` the same way, and a second copy of a four-line coercion is a second
+   place for it to drift."
+  [x]
+  (cond
+    (string? x) x
+    (erlang/is_list x) (erlang/list_to_binary x)
+    :else (str x)))
+
+(defn spec-of
+  "`key` from an application's spec, LOADING it first when it is not loaded.
+
+   This is the difference between a dev VM and a drop, and it is not cosmetic:
+   inside a drop the app dirs are on the code path but NOTHING is loaded, and
+   `Application.spec/2` answers nil for an app that is not loaded. Asking without
+   this made a self-build see a closure of one app, copy two of the thirty-nine,
+   and then fail boot-scripting with `{:undefined_applications, …}` — measured,
+   twice, before it was written down. Loading is not starting: an app on the code
+   path that is never booted behaves exactly as before."
+  [app key]
+  (or (Application/spec app key)
+      (do (erlang/apply :application :load (list app))
+          (Application/spec app key))))
+
+(defn- vsn-of
+  "An application's version, from the three places that can answer, in the order
+   that prefers the app's own declaration: the loaded spec, the spec after
+   loading, and — for a tool app resolved from the ERTS root, where nothing is
+   loadable — the directory NAME."
+  [app dir]
+  (or (spec-of app :vsn)
+      (second (String/split (Path/basename dir) "-"))))
+
+(defn app-info
+  "`{:app :vsn :dir}` for one application, or nil when the VM cannot see it.
+   `nil` is the honest answer for an app that is not loaded and not on the code
+   path: the closure below drops it, and `systools` will say so if it mattered.
+
+   A TOOL app (see `tool-apps`) is on no code path at all in a dev VM — measured:
+   `:code.lib_dir(:sasl)` answers `{:error, :bad_name}` — so it is resolved from
+   the ERTS root's own `lib/`, which is where `ensure-systools!` looks too."
+  [app]
+  (let [on-path (erlang/apply :code :lib_dir (list app))]
+    (cond
+      (erlang/is_list on-path)
+      (let [dir (text on-path)]
+        {:app app :vsn (text (vsn-of app dir)) :dir dir})
+
+      :else
+      (let [root (Path/join (erts-root) "lib")
+            hits (if (File/dir? root) (Path/wildcard (Path/join root (str (name app) "-*"))) [])]
+        (if (empty? hits)
+          nil
+          (let [dir (first (sort hits))]
+            {:app app :vsn (text (vsn-of app dir)) :dir dir}))))))
+
+(defn erts-root
+  "The ERTS install root — `<root>/erts-<vsn>` lives under it, and so does the
+   `lib/` a tool app is resolved from."
+  []
+  (text (erlang/apply :code :root_dir (list))))
+
+(defn app-closure
+  "Every application the root app needs, transitively, in `:applications`
+   order — the set a release must carry. Sorted inside each depth step, so the
+   result is deterministic for a given VM."
+  [root]
+  (loop [seen (set [root]) frontier [root] out [root]]
+    (if (empty? frontier)
+      out
+      (let [next (vec (sort (distinct
+                              (vec (remove (fn [a] (contains? seen a))
+                                           (vec (mapcat (fn [a] (or (spec-of a :applications) []))
+                                                        frontier)))))))]
+        (recur (into seen next) next (into out next))))))
+
+(defn value
+  "The release value for `root`, deriving everything the assembly stage needs
+   from the RUNNING VM."
+  [root]
+  (let [apps (vec (keep app-info (distinct (concat (app-closure root) (tool-apps)))))
+        erts-vsn (text (erlang/system_info :version))]
+    {:name (text root)
+     :vsn (text (or (Application/spec root :vsn) "0.1.0"))
+     :erts {:vsn erts-vsn
+            :dir (text (erlang/apply :code :root_dir (list)))}
+     :apps apps}))
+
+(defn mandatory-apps
+  "The apps a `.rel` may NOT mark `none`. `systools` answers
+   `{:mandatory_app, :kernel, :none}` when one is (observed), and the reason is
+   plain: a release that does not start `kernel` starts nothing at all.
+   Everything else in `start_clean` is CARRIED — on the code path, not started —
+   which is the whole point of a clean boot."
+  []
+  (set [:kernel :stdlib :elixir]))
+
+(defn tool-apps
+  "Apps the ASSEMBLY stage itself needs at BUILD time, carried in the release and
+   never started.
+
+   `:sasl` holds `:systools`, which generates the boot script, so a release that
+   must be able to re-assemble ITSELF has to carry it: without it a self-build
+   inside a drop dies with `no sasl under <root>` and no boot script is possible —
+   found by running one, not by reading. Listed `none` in the `.rel` (on the code
+   path, not started), which is the difference between carrying a tool and
+   booting it."
+  []
+  [:sasl])
+
+(defn app-permanent-set
+  "Every app in the value, as the permanent set: a release's own boot starts
+   all of them — except the assembly TOOLS, which are carried and not started."
+  [v]
+  (set (map (fn [a] (:app a))
+            (remove (fn [a] (contains? (set (tool-apps)) (:app a))) (:apps v)))))
+
+(defn- rel-term
+  "The `.rel` term as an Erlang tuple tree.
+
+   Two shapes here are not free choices, both taken from the release mix built
+   for this project (`releases/<vsn>/<name>.rel` in a shipped drop):
+
+   * the app entries are 3-tuples carrying a TYPE — `permanent` for an app in
+     `permanent`, `none` for one that is carried but not started (`iex` is
+     mix's example) — which is what `systools` reads to decide what to boot;
+   * strings are CHARLISTS, because the writer is `~p` — `~w` prints a binary
+     as `<<98,101,…>>`, which `erl` will not read as a release name. `~p` of a
+     charlist prints `\"bl\"`, and of an atom prints it bare: Erlang syntax,
+     which is the syntax a `.rel` is written in.
+
+   The app list must be a REAL list: a lazy seq would print as a closure and
+   `systools` would reject the file."
+  [v name permanent]
+  (erlang/list_to_tuple
+    (list :release
+          (erlang/list_to_tuple (list (String/to_charlist name)
+                                      (String/to_charlist (:vsn v))))
+          (erlang/list_to_tuple (list :erts (String/to_charlist (:vsn (:erts v)))))
+          (Enum/to_list (map (fn [a]
+                               (erlang/list_to_tuple
+                                 (list (:app a) (String/to_charlist (:vsn a))
+                                       (if (contains? permanent (:app a)) :permanent :none))))
+                             (:apps v))))))
+
+(defn rel-text
+  "The `<name>.rel` text for a value: the release's own name, every app
+   `permanent` (mix writes it that way, and a release's apps are meant to
+   start)."
+  [v]
+  (rel-text-for v (:name v) (app-permanent-set v)))
+
+(defn rel-text-for
+  "`rel-text` with the name and the PERMANENT SET chosen.
+
+   An app not in the set is written `none`: carried on the code path, never
+   started. That is the whole difference between the release's boot script and
+   `start_clean` — the same app set, only the mandatory apps permanent — which
+   is what mix's `start_clean.script` is (measured: it names every app in the
+   release) and how `bl eval` reaches the release's own code without booting
+   it."
+  [v name permanent]
+  (erlang/iolist_to_binary
+    (erlang/apply :io_lib :format (list "~p.~n" (list (rel-term v name permanent))))))
+
+(defn rel-file
+  "The `.rel` path: `releases/<vsn>/<name>.rel` under the tree."
+  [out name vsn]
+  (Path/join (Path/join (Path/join out "releases") vsn) (str name ".rel")))
+
+(defn write-rel!
+  "Write the `.rel` and answer its path."
+  [v out]
+  (let [path (rel-file out (:name v) (:vsn v))]
+    (File/mkdir_p! (Path/dirname path))
+    (File/write! path (rel-text v))
+    path))
+
+(defn write-rel-for!
+  "Write a `.rel` under a chosen NAME (`start_clean` next to the release's own)
+   and answer its path."
+  [v name permanent out]
+  (let [path (rel-file out name (:vsn v))]
+    (File/mkdir_p! (Path/dirname path))
+    (File/write! path (rel-text-for v name permanent))
+    path))
+
+; ── assembly ────────────────────────────────────────────────────────────────
+;
+; The tree, in the order that makes each step checkable, and the reason for
+; each order-of-operations (both learned from the release mix built for this
+; project — see `research/selfbuild/README.md`):
+;
+;   apps + ERTS first, because `systools` validates the `.rel` against the
+;   DIRECTORY it is given (`:path`): a missing app dir is an error, not a
+;   warning. Then the `.rel`, then the boot scripts, then the pieces a script
+;   cannot generate (the Elixir CLI wrappers, the templates, the launcher).
+;
+; Why the rewrite sits between `make_script` and `script2boot`: the boot file is
+; COMPILED from the script text, so a `$ROOT` left in the script is a `$ROOT`
+; compiled into the boot file — the paths must be right before the second step,
+; not after it.
+
+(defn- copy-app!
+  "One app's `ebin` (and `priv`, when it has one) into `<lib>/<app>-<vsn>/`.
+   Nothing else: `include`, `src` and `test` are development surface, and a
+   release that carried them would carry the project's history into production.
+
+   `priv/.spell` is dropped: it is editor/agent state, not the application (the
+   shipped drop carries it, which is one of the two packaging defects W0 found)."
+  [app lib-dir]
+  (let [dest (Path/join lib-dir (str (str (:app app)) "-" (:vsn app)))]
+    (File/mkdir_p! dest)
+    (File/cp_r! (Path/join (:dir app) "ebin") (Path/join dest "ebin")
+                (list (erlang/list_to_tuple (list :dereference_symlinks true))))
+    ; `dereference_symlinks: true` is not fastidiousness: Mix makes
+    ; `_build/<env>/lib/<app>/priv` a RELATIVE SYMLINK (`../../../../priv`), so a
+    ; release copied with links intact ships a priv pointing at nothing — the
+    ; language's own `.bl` sources missing from the drop that exists to carry
+    ; them. Found by the packer walking a release tree and failing to read the
+    ; very directory this function had just written.
+    (when (File/exists? (Path/join (:dir app) "priv"))
+      (File/cp_r! (Path/join (:dir app) "priv") (Path/join dest "priv")
+                  (list (erlang/list_to_tuple (list :dereference_symlinks true))))
+      (when (File/exists? (Path/join dest "priv/.spell"))
+        (File/rm_rf! (Path/join dest "priv/.spell"))))
+    dest))
+
+(defn- make-boot-script!
+  "`systools.make_script/2` → `$ROOT/lib` → `$RELEASE_LIB` → `script2boot/1`.
+
+   `systools` is told `:path [rel-dir lib-dir]` (so it finds the `.rel` and
+   every app's `.app`) and `:outdir rel-dir`. `script2boot` is given the
+   extension-less STEM — it appends `.boot` itself. The rewrite is global
+   because the launcher passes `--boot-var RELEASE_LIB \"$ROOT/lib\"`: both
+   spellings resolve to the same directory, and one rewrite covers the OTP apps
+   and the dependencies alike."
+  [out vsn name]
+  (let [rel-dir (Path/join (Path/join out "releases") vsn)
+        lib-dir (Path/join out "lib")
+        script (Path/join rel-dir (str name ".script"))
+        r (erlang/apply :systools :make_script
+                        (list (String/to_charlist name)
+                              (list (erlang/list_to_tuple
+                                      (list :path (list (String/to_charlist rel-dir)
+                                                        (String/to_charlist lib-dir))))
+                                    (erlang/list_to_tuple (list :outdir (String/to_charlist rel-dir)))
+                                    :silent)))]
+    (if (= :error (erlang/element 1 r))
+      {:ok? false :reason (pr-str (erlang/element 3 r))}
+      (do
+        (File/write! script (String/replace (File/read! script) "$ROOT/lib" "$RELEASE_LIB"))
+        (let [boot (erlang/apply :systools :script2boot (list (String/to_charlist (Path/join rel-dir name))))]
+          {:ok? (= :ok boot)
+           :warnings (count (erlang/element 3 r))
+           :reason (if (= :ok boot) nil (pr-str boot))})))))
+
+(defn- write-templates!
+  "The four files a release carries that are configuration, not code. They are
+   deliberately minimal: `vm.args` must NOT set the cookie or the node name
+   (the launcher passes `--cookie`), and `sys.config` is the logger handler
+   mix's own template emits, so a release logs to stderr the way a mix release
+   does."
+  [rel-dir]
+  (File/write! (Path/join rel-dir "sys.config")
+               "%% coding: utf-8\n%% RUNTIME_CONFIG=false\n[{logger,[{default_handler,[{config,#{type=>standard_error}}]}]}].\n")
+  (File/write! (Path/join rel-dir "vm.args")
+               (str "## Flags for the VM. -mode/-name/-sname/-setcookie are set by the\n"
+                    "## launcher (--cookie, --erl \"-mode embedded\"), so do not set them here.\n"
+                    "## +Q 65536\n"))
+  (File/write! (Path/join rel-dir "remote.vm.args")
+               (str "## Flags for a remote shell.\n"
+                    "## -hidden is set by the launcher; distribution flags are not.\n"))
+  (File/write! (Path/join rel-dir "env.sh")
+               (str "#!/bin/sh\n\n"
+                    "# Sourced by the launcher before it runs the release. Set\n"
+                    "# RELEASE_* overrides here (RELEASE_DISTRIBUTION, RELEASE_NODE,\n"
+                    "# RELEASE_MODE, RELEASE_TMP, ...).\n"
+                    "#\n"
+                    "# This image is marked BEAM_LISP_IMAGE=release by the\n"
+                    "# launcher: that is what makes `reload` treat a mutating\n"
+                    "# reload here as prod, needing BEAM_LISP_RELOAD=1 to opt in.\n")))
+
+(defn- host-elixir-bin
+  "The HOST install's `bin`: the `elixir` app lives at `lib/elixir`, so its
+   wrappers are two levels up."
+  []
+  (Path/expand (Path/join (Path/join (text (erlang/apply :code :lib_dir (list :elixir))) "../..") "bin")))
+
+(defn- elixir-cli-src
+  "The directory holding the `elixir`/`iex` wrappers for the new release.
+
+   Inside a drop the answer is the RUNNING release's own `releases/<vsn>/`: a
+   release root has `releases/start_erl.data`, and `erts-root` is exactly that
+   root when the VM is a release (`code:root_dir()` answers the payload) and the
+   ERTS install when it is a dev VM, where there is no `releases/` and the
+   wrappers come from the host install instead.
+
+   An earlier version derived this from `BL_BIN` by taking two dirnames — wrong,
+   and measured wrong: `BL_BIN` is the COMPOUND's path, so the derived root was
+   `/`, no wrappers were found, the copied tree had no `releases/<vsn>/elixir`,
+   and the new drop died on `bin/bl` line 15. Asking the runtime cannot be
+   wrong about where the runtime is."
+  []
+  (let [root (erts-root)
+        data (Path/join (Path/join root "releases") "start_erl.data")
+        parts (if (File/exists? data) (String/split (String/trim (File/read! data)) " ") [])
+        vsn (if (= 2 (count parts)) (second parts) nil)
+        own (if (some? vsn) (Path/join (Path/join root "releases") vsn) nil)]
+    (if (and (some? own) (File/exists? (Path/join own "elixir")))
+      own
+      (host-elixir-bin))))
+
+(defn- patch-elixir-cli
+  "The two substitutions mix makes when it copies Elixir's own wrappers into a
+   release — both measured against `releases/<vsn>/elixir` in a shipped drop:
+   point `ERTS_BIN` at the release's `erts-<vsn>/bin` (in a release the wrapper
+   is two levels deeper than in an install), and drop the `-elixir_root`/`-pa`
+   pair, because in a release the code path comes from the boot script."
+  [text erts-vsn]
+  (-> text
+      (String/replace "ERTS_BIN=\"$ERTS_BIN\"" (str "ERTS_BIN=\"$SCRIPT_PATH\"/../../erts-" erts-vsn "/bin/"))
+      (String/replace " -elixir_root \"$SCRIPT_PATH\"/../lib -pa \"$SCRIPT_PATH\"/../lib/elixir/ebin" "")))
+
+(defn- write-elixir-cli! [rel-dir erts-vsn]
+  (let [src (elixir-cli-src)]
+    (doseq [f ["elixir" "iex"]]
+      (let [from (Path/join src f)]
+        (when (File/exists? from)
+          (let [to (Path/join rel-dir f)]
+            (File/write! to (patch-elixir-cli (File/read! from) erts-vsn))
+            (File/chmod! to 493)))))))   ; 0755
+
+(defn- launch-lines
+  "The launcher, line by line: `eval` boots `start_clean` (so the release's
+   code is on the path but nothing is started) and `start` boots the release
+   itself. Both pass `--boot-var RELEASE_LIB`, which is what the rewritten
+   `$RELEASE_LIB` paths in the boot script resolve against."
+  [name]
+  ["#!/bin/sh"
+   "# A release launcher: enough to run this release, and nothing that guesses."
+   "set -e"
+   "# Declare the KIND of image this is. `reload` gates MUTATING reloads on"
+   "# it, and the answer it used to use — whether Mix was loaded — stops"
+   "# existing the day Mix is deleted, which would refuse mutating reloads in"
+   "# every development image. A drop states the same thing with BL_BIN."
+   "export BEAM_LISP_IMAGE=release"
+   "SELF=$(cd \"$(dirname \"$0\")\" && pwd -P)/$(basename \"$0\")"
+   "ROOT=$(CDPATH='' cd \"$(dirname \"$SELF\")/..\" && pwd -P)"
+   "VS=$(cut -d' ' -f2 \"$ROOT/releases/start_erl.data\")"
+   "REL=\"$ROOT/releases/$VS\""
+   "COOKIE=$(cat \"$ROOT/releases/COOKIE\")"
+   "command=${1:-}"
+   "[ $# -gt 0 ] && shift"
+   "case \"$command\" in"
+   "  eval)"
+   "    [ -n \"$1\" ] || { echo \"ERROR: eval expects an expression\" >&2; exit 1; }"
+   "    expression=\"$1\"; shift"
+   "    exec \"$REL/elixir\" --cookie \"$COOKIE\" --erl-config \"$REL/sys\" \\"
+   "      --boot \"$REL/start_clean\" --boot-var RELEASE_LIB \"$ROOT/lib\" \\"
+   "      --vm-args \"$REL/vm.args\" --eval \"$expression\" -- \"$@\""
+   "    ;;"
+   "  start)"
+   "    exec \"$REL/elixir\" --cookie \"$COOKIE\" --erl-config \"$REL/sys\" \\"
+   "      --erl \"-mode embedded\" --boot \"$REL/NAME\" --boot-var RELEASE_LIB \"$ROOT/lib\" \\"
+   "      --vm-args \"$REL/vm.args\" --no-halt"
+   "    ;;"
+   "  version) echo \"NAME $VS\" ;;"
+   "  *)"
+   "    echo \"Usage: $(basename \"$0\") COMMAND [ARGS]\" >&2"
+   "    echo '  eval \"EXPR\"  evaluate an expression (nothing is started)' >&2"
+   "    echo '  start        boot the release and keep running' >&2"
+   "    echo '  version      print the release name and version' >&2"
+   "    exit 2"
+   "    ;;"
+   "esac"])
+
+(defn- write-launcher! [out name]
+  (let [path (Path/join (Path/join out "bin") "bl")
+        body (String/replace (join "\n" (launch-lines name)) "NAME" name)]
+    (File/write! path (str body "\n"))
+    (File/chmod! path 493)
+    path))
+
+(defn- cookie!
+  "A cookie for the release: the RUNNING release's cookie when there is one, else
+   a fresh random one, else a fixed string (crypto answers in practice — a release
+   that cannot start because a cookie could not be invented would be a poor
+   trade).
+
+   Inheriting is what makes a self-build reproducible, and it is also the honest
+   answer to what a rebuild IS: the same deployment, rebuilt. Measured before it
+   was written down — two generations differed in exactly ONE file,
+   `releases/COOKIE`, because each invented its own; with the difference down to
+   one file the fixpoint had nowhere left to hide."
+  []
+  (let [ours (Path/join (Path/join (erts-root) "releases") "COOKIE")]
+    (cond
+      (File/exists? ours) (String/trim (File/read! ours))
+      :else (try
+              (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 32)))
+              (catch _ "bl-local-cookie")))))
+
+(defn- ensure-systools!
+  "`:systools` lives in OTP's `sasl`, and a `start_clean` VM does not put
+   `lib/sasl-*/ebin` on the code path — Elixir boots through kernel/stdlib/elixir
+   plus the project's own paths, and `sasl` is nobody's dependency here.
+
+   But `sasl` is a BUILD tool for this stage: it turns a `.rel` into a boot
+   script. So the ebin is added from the ERTS root we are already copying from,
+   and the answer is either nil (fine) or a sentence explaining why no boot
+   script can be generated — reported, never raised, because the caller is what
+   knows whether a tree was required."
+  [erts-dir]
+  (if (Code/ensure_loaded? :systools)
+    nil
+    (let [dir (first (sort (Path/wildcard (Path/join (Path/join erts-dir "lib") "sasl-*/ebin"))))]
+      (if (nil? dir)
+        (str "no sasl under " erts-dir " — `:systools` cannot be loaded, so no boot script")
+        (do
+          (Code/append_path dir)
+          (if (Code/ensure_loaded? :systools)
+            nil
+            (str "`systools` is not loadable from " dir)))))))
+
+(defn assemble
+  "Assemble the tree for `v` at `out`. Returns
+   `{:ok? bool :out :apps n :warnings n :errors [msg …]}`.
+
+   Order, and why: the apps and ERTS land FIRST because `systools` validates the
+   `.rel` against the directory it is handed — a missing app is an error there,
+   not a warning; then the `.rel`s, then the boot scripts, then what a script
+   cannot generate (the Elixir wrappers, the templates, the launcher, the
+   cookie)."
+  [v out]
+  (let [name (:name v) vsn (:vsn v) erts-vsn (:vsn (:erts v))
+        releases-dir (Path/join out "releases")
+        rel-dir (Path/join releases-dir vsn)
+        lib-dir (Path/join out "lib")]
+    (File/mkdir_p! (Path/join out "bin"))
+    (File/mkdir_p! rel-dir)
+    (File/mkdir_p! lib-dir)
+    (doseq [a (:apps v)] (copy-app! a lib-dir))
+    ; ERTS: only `bin` — that is what an OTP install's `erts-<vsn>/` holds, and
+    ; what the patched Elixir wrapper execs (`"$SCRIPT_PATH"/../../erts-<vsn>/bin/`).
+    ; The parent must exist: `cp_r` creates the destination, not its parents.
+    (let [erts-dest (Path/join out (str "erts-" erts-vsn))]
+      (File/mkdir_p! erts-dest)
+      (File/cp_r! (Path/join (Path/join (:dir (:erts v)) (str "erts-" erts-vsn)) "bin")
+                  (Path/join erts-dest "bin")))
+    (write-rel! v out)
+    (write-rel-for! v "start_clean" (mandatory-apps) out)
+    (let [prep (ensure-systools! (:dir (:erts v)))]
+      (if (some? prep)
+        ; No boot script is possible: report it before anything half-assembled
+        ; is presented as a tree.
+        {:ok? false :out out :apps 0 :warnings 0 :errors [prep]}
+        (let [start (make-boot-script! out vsn name)
+              clean (make-boot-script! out vsn "start_clean")
+              errors (vec (remove nil? [(when-not (:ok? start) (str name ": " (:reason start)))
+                                        (when-not (:ok? clean) (str "start_clean: " (:reason clean)))]))]
+          (if (pos? (count errors))
+            {:ok? false :out out :apps 0 :warnings 0 :errors errors}
+            (do
+              (write-templates! rel-dir)
+              (write-elixir-cli! rel-dir erts-vsn)
+              (File/write! (Path/join releases-dir "start_erl.data") (str erts-vsn " " vsn))
+              (File/write! (Path/join releases-dir "COOKIE") (cookie!))
+              (write-launcher! out name)
+              {:ok? true :out out :apps (count (:apps v))
+               :warnings (+ (:warnings start) (:warnings clean)) :errors []})))))))

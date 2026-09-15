@@ -1,0 +1,470 @@
+; build/deps-compile.bl — COMPILE A LIBRARY: the half that was missing.
+;
+; `bl deps fetch` proves the store holds the BYTES a lock names. It does not make
+; them usable. A library is usable when its beams are compiled FOR THE RUNNING
+; ERTS and its `ebin` is on the code path — and until this file existed the only
+; thing in the tree that could produce those beams was Mix. That is the last
+; dependency on Mix in the language's own build, and it is why FUP-050 says a
+; fresh clone with `deps/` and `mix.lock` deleted could fetch 47 packages and
+; still not build.
+;
+; ── Where the output goes, and why not `_build` ────────────────────────────
+;
+; `_build/<env>/lib/<app>/ebin` is Mix's answer, and it is PER TREE. This
+; workstation keeps a dozen worktrees, so per-tree output means 47 packages
+; compiled once per worktree — exactly the duplication the content-addressed
+; store exists to remove. So the output is addressed the way the store and the
+; native cache are:
+;
+;     ~/.cache/beam_lisp/lib/<name>-<vsn>-<sha8>/            sources (the store)
+;     ~/.cache/beam_lisp/native/<key>/<crate>/               natives
+;     ~/.cache/beam_lisp/ebin/<name>-<vsn>-<sha8>-<rt>/ebin  ← here
+;
+; `<rt>` is the RUNTIME TAG (ERTS + the language's version). Content addressing
+; keys the SOURCES; this keys the COMPILATION, because the same sources compiled
+; by another ERTS are different beams — and this language ships a payload that
+; carries its OWN erts, so a drop and a checkout on one machine can disagree
+; about which one is "the" runtime.
+;
+; The directory name begins `<name>-<vsn>` because OTP decides what an
+; application IS from its path: a directory on the code path ending in `ebin` is
+; an app, and `:code.lib_dir/1` returns everything before it. That is what makes
+; `priv/` resolvable — symlinked from the store rather than copied, so a library
+; is on disk once however many trees compile it.
+;
+; ── "A directory that exists is a library that is complete" ─────────────────
+;
+; The store's rule, kept here the way `hex/install!` keeps it: the `.app` is
+; written LAST and IS the completion marker. A build that dies halfway leaves
+; beams and no `.app`, so the next run redoes it rather than trusting it.
+;
+; ── What this does NOT do, stated rather than discovered ───────────────────
+;
+;   * Not a resolver. It compiles what the lock names; it never chooses a
+;     version.
+;   * `mod:` is written as `{module, []}` — the shape every package in this
+;     lock uses. A callback taking arguments would need its args carried.
+;   * NIF-carrying packages (rustler, rustler_precompiled) need a crates build
+;     or a precompiled download, which is the native stage's job. They are
+;     REPORTED BY NAME, not half-built.
+
+(ns deps-compile
+  (:require [store :as st] [deps :as dp] [substrate :as sub] [claim :as c]))
+
+; ── where a compiled library lives ─────────────────────────────────────────
+
+(defn runtime-tag
+  "What COMPILED a library, as a readable tag: the ERTS and the language's own
+   version. Readable on purpose — `ls ~/.cache/beam_lisp/ebin` should answer
+   \"which runtime built these\" without a tool."
+  []
+  (str "erts" (erlang/list_to_binary (erlang/system_info :version)) "-elixir" (System/version)))
+
+(defn root
+  "Beside the store and the native cache, not under them: those two hold what a
+   LOCK names, this holds what a BUILD made of it."
+  []
+  (Path/join (Path/dirname (st/root)) "ebin"))
+
+(defn app-dir [e]
+  (Path/join (root) (str (:name e) "-" (:vsn e) "-" (subs (:sha e) 0 8) "-" (runtime-tag))))
+
+(defn ebin-dir [e] (Path/join (app-dir e) "ebin"))
+
+(defn app-file [e] (Path/join (ebin-dir e) (str (:name e) ".app")))
+
+(defn marker-file
+  "The completion marker, beside the `.app`.
+
+   NOT the `.app` itself, which is what the first version used and could not
+   work: a package's own module can ask `:code.priv_dir/1` while it is being
+   LOADED (abnf_parsec does, on line 4 of `generator.ex`), so the application has
+   to be findable on the code path BEFORE its sources compile — and an `.app`
+   that must exist during the compile cannot also be the proof that the compile
+   finished. Measured, not theorised: the first run died at exactly that line."
+  [e]
+  (Path/join (app-dir e) ".compiled"))
+
+(defn compiled?
+  "Complete, by the marker rule above."
+  [e]
+  (File/exists? (marker-file e)))
+
+(defn search-paths
+  "Every compiled library's `ebin` that THIS runtime can load, sorted.
+
+   Two filters, and both are load-bearing:
+
+   * the RUNTIME TAG, because a beam compiled by another ERTS is not a beam this
+     VM may load, and this language ships a drop carrying its own erts — so a
+     checkout and a drop on one machine keep their compilations apart by
+     construction rather than by hoping;
+   * the MARKER, because a directory whose compile was interrupted has beams and
+     no `.compiled`. Naming it would shadow a working copy of the same library
+     with a half-built one — measured: a failed `explorer` build (its prebuilt
+     NIF needs the native stage) put an incomplete directory on the code path
+     ahead of the one Mix had built, and `examples/datom/df/*.bl` stopped being
+     able to create a Series while reporting only that a module 'is not
+     available'."
+  []
+  (let [tag (runtime-tag)]
+    (vec (sort (keep (fn [d]
+                       (let [e (Path/join d "ebin")]
+                         (if (and (String/ends_with? d tag)
+                                  (File/exists? (Path/join d ".compiled"))
+                                  (File/dir? e))
+                           e
+                           nil)))
+                     (Path/wildcard (Path/join (root) "*")))))))
+
+(defn install-paths!
+  "Put every compiled library on the code path. Returns how many."
+  []
+  (let [ds (search-paths)]
+    (doseq [d ds] (Code/append_path d))
+    (count ds)))
+
+; ── what kind of package is this ───────────────────────────────────────────
+
+(defn tool-of
+  "Which build tool's conventions a package's sources follow.
+
+   `.app.src` is asked FIRST, before `mix.exs`, because it is rebar's own
+   declaration and an Elixir package never has one while an Erlang package
+   always does. Some Erlang packages also ship a `mix.exs` shim for Mix users
+   (`telemetry` does), and letting that win sends the Erlang sources down the
+   Elixir path — which finds no `lib/**/*.ex` and reports a package that has
+   simply been misread."
+  [dir]
+  (cond
+    (pos? (count (Path/wildcard (Path/join dir "src/*.app.src")))) :erlang
+    (File/exists? (Path/join dir "mix.exs")) :elixir
+    (pos? (count (Path/wildcard (Path/join dir "lib/**/*.ex")))) :elixir
+    (File/dir? (Path/join dir "src")) :erlang
+    :else :unknown))
+
+(defn sources-of [dir tool]
+  (if (= tool :erlang)
+    (vec (sort (Path/wildcard (Path/join dir "src/**/*.erl"))))
+    (vec (sort (Path/wildcard (Path/join dir "lib/**/*.ex"))))))
+
+; ── the project's own declaration, without Mix ─────────────────────────────
+
+(defn- kg
+  "`Keyword.get`, via proplists: a keyword list is a flat proplist, and this must
+   read one whether it arrived as a bl value or as an Erlang term.
+
+   `undefined` becomes nil. `proplists:get_value/2` answers the ATOM for a key a
+   project did not declare — not nil — and the two are not interchangeable here:
+   `(vec :undefined)` asks bl to turn an atom into a Vector and dies with `no
+   function clause matching in BeamLisp.Vector.new/1`, naming neither the package
+   nor the field. Measured across all 47 locked packages: 17 of them omit
+   `extra_applications`."
+  [k list-]
+  (let [v (erlang/apply :proplists :get_value (list k list-))]
+    (if (= :undefined v) nil v)))
+
+(defn project-of
+  "A package's `project/0` and `application/0`, as data.
+
+   `mix.exs` is Elixir code and the honest way to read a project's own
+   declaration is to run it — which normally means Mix. It does not have to:
+   `use Mix.Project` installs an after-compile hook, so a copy with that one line
+   removed evaluates anywhere, and the module it defines answers `project/0` and
+   `application/0` with exactly the keyword lists Mix would have got.
+
+   Best-effort and wrapped: a `mix.exs` that calls into Mix in the middle of its
+   project function gets `{:ok? false …}` and keeps a minimal `.app`, which is
+   REPORTED rather than hidden."
+  [dir]
+  (let [mix (Path/join dir "mix.exs")]
+    (if (not (File/exists? mix))
+      {:ok? false :why "no mix.exs"}
+      (let [tmp (Path/join (System/tmp_dir) (str "bl-project-" (erlang/unique_integer) ".exs"))]
+        (try
+          (File/write! tmp (String/replace (File/read! mix) "use Mix.Project" ""))
+          (Code/compiler_options (list (erlang/list_to_tuple (list :ignore_module_conflict true))))
+          (let [compiled (Code/compile_file tmp)
+                m (erlang/element 1 (erlang/hd compiled))
+                pr (erlang/apply m :project (list))
+                app (try (erlang/apply m :application (list)) (catch e (list)))]
+            {:ok? true
+             :app (kg :app pr)
+             :vsn (kg :version pr)
+             :applications (kg :extra_applications app)
+             :mod (kg :mod app)})
+          (catch e {:ok? false :why (ex-message e)})
+          (finally (File/rm tmp)))))))
+
+(defn- erlang-declared
+  "The `applications` and `mod` an Erlang package's `.app.src` declares."
+  [dir]
+  (let [srcs (Path/wildcard (Path/join dir "src/*.app.src"))]
+    (if (empty? srcs)
+      {}
+      (let [r (erlang/apply :file :consult (list (erlang/binary_to_list (first srcs))))]
+        (if (= :ok (erlang/element 1 r))
+          (let [props (erlang/element 3 (erlang/hd (erlang/element 2 r)))]
+            {:applications (kg :applications props)
+             :mod (kg :mod props)})
+          {})))))
+
+; ── writing the .app, and proving it reads ─────────────────────────────────
+
+(defn- atom-of
+  "A name as an atom, whichever form it arrives in: MODULE names come from the
+   compiler as strings, while `applications` a project declares as `[:logger]` —
+   already atoms. Coercing the second as a binary fails with 'not a binary' and
+   names neither the list nor the package."
+  [s]
+  (if (erlang/is_binary s) (erlang/binary_to_atom s :utf8) s))
+
+(defn- erl-list
+  "An Erlang LIST from a collection.
+
+   `map` and `vec` answer bl Vectors, and a Vector is a struct — an Erlang map.
+   Handed to Erlang's term printer it prints as `#{meta => nil, items => {…},
+   '__struct__' => 'Elixir.BeamLisp.Vector'}`, so the `.app` this file writes
+   would carry a map where OTP wants a list of modules. Caught by reading the
+   file it produced."
+  [coll]
+  (Enum/to_list coll))
+
+(defn- mod-prop
+  "`{mod, {Module, Args}}` for an application callback.
+
+   A project declares this as `mod: {Bandit.Application, []}`, so the value is a
+   TUPLE and the module inside it is already an atom. `(str …)` on the tuple is
+   what the first version did, and it asked bl to turn a tuple into a Vector —
+   the run died with `no function clause matching in BeamLisp.Vector.new/1`,
+   naming neither the project nor the field."
+  [mod]
+  (if (nil? mod)
+    nil
+    (let [m (if (erlang/is_tuple mod) (erlang/element 1 mod) mod)
+          args (if (erlang/is_tuple mod) (erlang/element 2 mod) (list))]
+      (erlang/list_to_tuple
+        (list :mod (erlang/list_to_tuple (list (atom-of m) args)))))))
+
+(defn- app-term
+  "The `{application, Name, Props}` term, built in ERLANG terms so `io_lib` can
+   print it: hand-formatting a term file is how a `.app` ends up subtly wrong in
+   a way only `file:consult` notices.
+
+   `vsn` is a string (charlist) because that is what an `.app` carries — the lock
+   holds it as a binary, and the two are not the same term."
+  [name vsn mods apps mod]
+  (let [props (list (erlang/list_to_tuple (list :description (list)))
+                    (erlang/list_to_tuple (list :vsn (erlang/binary_to_list vsn)))
+                    (erlang/list_to_tuple (list :modules (erl-list (map atom-of (erl-list mods)))))
+                    (erlang/list_to_tuple (list :registered (list)))
+                    (erlang/list_to_tuple (list :applications (erl-list (map atom-of (erl-list apps))))))
+        extra (mod-prop mod)
+        props (if (nil? extra)
+                props
+                (erlang/apply :lists :append (list props (list extra))))]
+    (erlang/list_to_tuple (list :application (atom-of name) props))))
+
+(defn write-app!
+  "Write the `.app` and CONSULT IT BACK. A term file nobody can read is not an
+   application, and the failure would otherwise surface as a missing app two
+   stages later."
+  [e mods apps mod]
+  (File/mkdir_p! (ebin-dir e))
+  (let [text (erlang/iolist_to_binary (erlang/apply :io_lib :format
+                                                    (list "~p.~n" (list (app-term (:name e)
+                                                                                 (:vsn e)
+                                                                                 mods apps mod)))))
+        path (app-file e)]
+    (File/write! path text)
+    (let [r (erlang/apply :file :consult (list (erlang/binary_to_list path)))]
+      (if (= :ok (erlang/element 1 r))
+        {:ok? true :path path}
+        {:ok? false :why (str "the .app just written will not read: " (pr-str r))}))))
+
+(defn- link-priv!
+  "`priv/` is the library's data directory and OTP finds it by path, so it must
+   sit beside `ebin`. Symlinked, not copied: the bytes are the store's, and the
+   store is content-addressed."
+  [e]
+  (let [from (Path/join (st/dir-for (:name e) (:vsn e) (:sha e)) "priv")
+        to (Path/join (app-dir e) "priv")]
+    (when (and (File/dir? from) (not (File/exists? to)))
+      (File/ln_s! from to))))
+
+; ── compiling ──────────────────────────────────────────────────────────────
+
+(defn- why-of
+  "An exception's message, or a stand-in.
+
+   A REPORTING path must not be able to fail: `ex-message` itself raises for a
+   compiler error assembled from diagnostics, and the run then reports `no
+   function clause matching in BeamLisp.RT.count/1` — a message about the
+   reporter, for a package whose real error (a missing module) is sitting in the
+   compiler's own output one line above."
+  [ex]
+  (try (str (ex-message ex)) (catch e "unprintable exception")))
+
+(defn modules-in
+  "The modules present in an `ebin` directory, read from the directory itself.
+
+   The compiler's own attribution (substrate's `:source` compile-info) is the
+   right answer for a build LOG, where each fact must name the file it came from.
+   For an `.app` the question is only which modules are there, and the directory
+   answers it directly — which is also what makes this independent of whether the
+   beam was compiled in this VM or was already on disk and up to date. Measured:
+   attributing through compile-info answered ZERO modules for a module that was
+   already loaded, so the `.app` named none. "
+  [ebin]
+  (vec (sort (map (fn [p]
+                    (let [b (Path/basename p)]
+                      (subs b 0 (- (count b) 5))))
+                  (Path/wildcard (Path/join ebin "*.beam"))))))
+
+(defn- compile-elixir!
+  "The Elixir half: the substrate stage, one batch, the same compiler `bl build`
+   uses for a project's own `lib/`."
+  [dir e]
+  (let [sources (sources-of dir :elixir)]
+    (if (empty? sources)
+      {:ok? false :why "no lib/**/*.ex to compile"}
+      (let [r (sub/compile! sources (ebin-dir e))]
+        (if (empty? (:errors r))
+          {:ok? true :modules (vec (mapcat (fn [f] (nth f 3)) (:facts r)))}
+          {:ok? false :why (first (:errors r))})))))
+
+(defn- compile-erlang!
+  "The Erlang half: `:compile.file` per source, into the same output directory.
+   No rebar3 — `erlc` is in the payload (`:compiler` ships with ERTS), and the
+   conventions rebar adds on top are what the `.app.src` carries."
+  [dir e]
+  (let [sources (sources-of dir :erlang)
+        out (ebin-dir e)]
+    (if (empty? sources)
+      {:ok? false :why "no src/**/*.erl to compile"}
+      (do
+        (File/mkdir_p! out)
+        (let [rs (map (fn [p]
+                        (erlang/apply :compile :file
+                                      (list (erlang/binary_to_list p)
+                                            (list (erlang/list_to_tuple (list :outdir (erlang/binary_to_list out)))
+                                                  (erlang/list_to_tuple (list :i (erlang/binary_to_list dir)))
+                                                  (erlang/list_to_tuple (list :i (erlang/binary_to_list (Path/join dir "include"))))
+                                                  :return_errors))))
+                      sources)
+              bad (vec (filter (fn [r] (not= :ok (erlang/element 1 r))) rs))]
+          (if (empty? bad)
+            {:ok? true :modules (vec (map (fn [r] (str (erlang/element 2 r))) rs))}
+            {:ok? false :why (str "erlc refused: " (pr-str (first bad)))}))))))
+
+(defn- wait-for
+  "A live holder is compiling the same address. A cache fill cannot DISAGREE with
+   itself, so waiting is right here in a way it is not for a build — and a claim
+   whose owner died is swept, so the wait ends either way."
+  [e wait-ms]
+  (loop [left wait-ms]
+    (cond
+      (compiled? e) {:name (:name e) :vsn (:vsn e) :state :cached :waited true}
+      (<= left 0) {:name (:name e) :vsn (:vsn e) :state :held
+                   :why "another process is compiling it"}
+      :else (do (erlang/apply :timer :sleep (list 200))
+                (recur (- left 200))))))
+
+(defn ensure!
+  "One locked library, compiled or found compiled."
+  [e log wait-ms]
+  (let [name (:name e)
+        vsn (:vsn e)
+        dir (st/dir-for name vsn (:sha e))]
+    (cond
+      (compiled? e)
+      {:name name :vsn vsn :state :cached}
+
+      (not (File/dir? dir))
+      {:name name :vsn vsn :state :missing :why "not in the store — run `bl deps fetch`"}
+
+      (= :unknown (tool-of dir))
+      {:name name :vsn vsn :state :unknown :why "neither mix.exs nor src/*.app.src"}
+
+      :else
+      (let [ad (app-dir e)]
+        (File/mkdir_p! ad)
+        (let [acq (c/acquire! ad (str "bl deps compile " name))]
+          (if (not (:ok? acq))
+            (wait-for e wait-ms)
+            (try
+              (let [tool (tool-of dir)
+                    pr (if (= tool :erlang) (erlang-declared dir) (project-of dir))
+                    extra (vec (or (:applications pr) []))
+                    apps (vec (concat (list "kernel" "stdlib")
+                                      (if (= tool :elixir) (list "elixir") (list))
+                                      extra))]
+                (when (some? log)
+                  (log (str "beam-lisp deps: compiling " name " " vsn " (" (name tool) ")")))
+                ; The `.app` and the priv link go down BEFORE the sources are
+                ; compiled, and the directory joins the code path first: a
+                ; package's own module can ask `:code.priv_dir/1` while it LOADS,
+                ; which needs the application to be findable already. Modules are
+                ; filled in once they are known.
+                (do (link-priv! e)
+                    (write-app! e (list) apps (:mod pr))
+                    (Code/append_path (ebin-dir e)))
+                ; One package's exception must not end the run: a module-level
+                ; crash inside the parallel compiler arrives here as a raise, not
+                ; as an error list.
+                (let [r (try (File/cd! dir (fn [] (if (= tool :erlang)
+                                                   (compile-erlang! dir e)
+                                                   (compile-elixir! dir e))))
+                             (catch ex {:ok? false :why (why-of ex)}))]
+                  (if (not (:ok? r))
+                    {:name name :vsn vsn :state :failed :why (:why r)}
+                    (let [mods (modules-in (ebin-dir e))
+                          wr (write-app! e mods apps (:mod pr))]
+                      (if (:ok? wr)
+                        (do (File/write! (marker-file e) (str vsn "\n"))
+                            {:name name :vsn vsn :state :compiled
+                             :tool tool :modules (count mods)})
+                        {:name name :vsn vsn :state :failed :why (:why wr)})))))
+              (finally (c/release! ad)))))))))
+
+(defn compile!
+  "Compile what the lock names, in passes until it stops making progress.
+
+   Passes rather than a topological sort because the order a library's
+   dependencies must be compiled in is already encoded in what compiles: a
+   package whose dependency is not on the code path yet fails, and the next pass
+   — with it there — succeeds. The lock is ordered by NAME, so one pass would put
+   `bandit` before `hpax`; a few passes settle it without this file having to own
+   a graph."
+  [dir wait-ms log]
+  (let [lock (dp/read-lock dir)
+        want (vec (filter (fn [e] (= :hex (:source e))) (:deps lock)))]
+    (if (:missing lock)
+      {:ok? false :passes 0 :results [] :why (str "no lock at " (:path lock))}
+      (loop [todo want done [] pass 1]
+        (if (or (empty? todo) (> pass 6))
+          {:ok? (every? (fn [r] (or (= :compiled (:state r)) (= :cached (:state r)))) done)
+           :passes pass
+           :results (vec (sort-by (fn [r] (:name r)) done))}
+          (let [; Each result travels WITH the entry it came from. On the next
+                ; pass only the ENTRIES are re-tried, and feeding result maps
+                ; back in instead is what a first version did: every retry then
+                ; died in `app-dir` on `(subs (:sha e) 0 8)`, because a result
+                ; map names no digest — `subs: index out of range 0 8 for length
+                ; 0`, fourteen times, naming no package.
+                pairs (vec (map (fn [e]
+                                  [(try (ensure! e log wait-ms)
+                                        (catch ex {:name (:name e) :vsn (:vsn e)
+                                                   :state :failed
+                                                   :why (why-of ex)}))
+                                   e])
+                                todo))
+                ok? (fn [pair]
+                      (let [s (:state (first pair))]
+                        (or (= :compiled s) (= :cached s))))
+                good (vec (filter ok? pairs))
+                bad (vec (remove ok? pairs))]
+            (if (empty? good)
+              {:ok? false :passes pass
+               :results (vec (sort-by (fn [r] (:name r)) (into done (map first bad))))}
+              (recur (vec (map second bad)) (into done (map first good)) (+ pass 1)))))))))

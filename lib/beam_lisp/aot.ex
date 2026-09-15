@@ -159,13 +159,14 @@ defmodule BeamLisp.AOT do
     end)
   end
 
-  # The namespaces the drift gate itself runs on (`ns_closure_hash/1` →
-  # `BuildPlan.key_for/3` → `build-plan` and its requires). Vetting one of
-  # THESE by closure hash would ask the gate to load what it is vetting, and
-  # the loader's cycle guard turns that into `undefined var: build-plan/…`.
-  # They are boot-tier by construction; naming them here keeps that true
-  # even where `Tiers.boot_namespaces/0` cannot see the source tree.
-  @gate_namespaces ~w(build-plan source-graph ns-interface reader-node)
+  # `reader-node`, `build-plan`, `source-graph` and `ns-interface` are the
+  # namespaces the drift gate itself runs on (`ns_closure_hash/1` →
+  # `BuildPlan.key_for/3` → `build-plan` and its requires). Vetting one of them
+  # by closure hash would ask the gate to load what it is vetting, and the
+  # loader's cycle guard turns that into `undefined var: build-plan/…`. They are
+  # therefore TIER-keyed, never closure-keyed: `reader-node` is `boot/` (codegen),
+  # the other three are `build/` (the driver). The tier DIRECTORIES — not a list
+  # written here — are what says so, so this can never drift from the tree.
 
   @doc """
   Ensure namespace `ns` is usable in this VM: load its AOT module if a
@@ -556,14 +557,19 @@ defmodule BeamLisp.AOT do
     filename = file || "beam_lisp_aot/#{ns}.bl"
     ns_defs = stabilise_body_modules(ns, Env.ns_defs(ns))
     source_hash = if file, do: ns_closure_hash(ns, file), else: nil
-    compiler_key = BeamLisp.AOTCache.compiler_key()
+
+    # The stamp key is the namespace's TIER key: the codegen key for `boot/`
+    # and ordinary namespaces, the build-driver key for `build/`. The runtime
+    # gate compares against the same function (`AOTCache.key_for_ns/1`), so a
+    # beam's stamp and the judgement of it cannot disagree.
+    stamp_key = BeamLisp.AOTCache.key_for_ns(ns)
 
     {init_clause, companion_descriptor} = build_init_ast(ns, mod, ns_defs, value_defs, ns_meta)
 
     provenance_clause =
       Emit.function_clause(
         :__bl_provenance__,
-        %{op: :tuple, elems: [Emit.lit(source_hash), Emit.lit(compiler_key)], ann: %{}}
+        %{op: :tuple, elems: [Emit.lit(source_hash), Emit.lit(stamp_key)], ann: %{}}
       )
 
     namespace_clauses =
@@ -573,7 +579,7 @@ defmodule BeamLisp.AOT do
         %{clause | body: Map.put(clause.body, :ann, ann)}
       end)
     namespace_descriptor =
-      Emit.descriptor_for(mod, namespace_clauses, [bl_source_hash: source_hash, bl_compiler_key: compiler_key], %{file: filename})
+      Emit.descriptor_for(mod, namespace_clauses, [bl_source_hash: source_hash, bl_compiler_key: stamp_key], %{file: filename})
 
     body_descriptors =
       for {body_mod, clauses} <- Emit.body_modules(ns_defs) do
@@ -829,7 +835,7 @@ defmodule BeamLisp.AOT do
 
   # DRIFT GATE (Wave 1 / L2). A compiled beam is trusted only when it still
   # matches the source it was built from. Reads the beam's `__bl_provenance__/0`
-  # stamp (source hash + toolchain key) and compares to the LIVE source.
+  # stamp (source hash + TIER key) and compares to the LIVE source.
   #
   #   source absent (prod release: no `.bl` ships)  -> NOT stale (trust the beam;
   #                                                    nothing to compare against)
@@ -882,21 +888,8 @@ defmodule BeamLisp.AOT do
         false
 
       {beam_hash, beam_key} ->
-        cond do
-          # A BOOT-tier namespace's freshness IS the toolchain key: every file
-          # under `priv/boot/` hashes into `compiler_key/0`, so a key match
-          # means the source it was built from is byte-for-byte the source on
-          # disk. No closure hash to compute — and none MAY be computed here:
-          # the closure hash is answered by `source-graph`, itself a boot
-          # namespace, so asking would recurse into the load this gate vets.
-          ns in BeamLisp.Tiers.boot_namespaces() or ns in @gate_namespaces ->
-            # No toolchain sources on disk (an escript or release away from
-            # its checkout) ⇒ nothing to compare against: trust the beam, as
-            # the closure branch does when no source resolves.
-            BeamLisp.Tiers.boot_namespaces() != [] and
-              beam_key != BeamLisp.AOTCache.compiler_key()
-
-          true ->
+        case BeamLisp.Tiers.tier_of_ns(ns) do
+          :library ->
             # The live tier-2 closure hash: this ns plus its transitive
             # `:require` closure. `nil` when no source resolves (packaged
             # release) — trust the beam. Computed the SAME way emit stamped it
@@ -909,9 +902,33 @@ defmodule BeamLisp.AOT do
               strict_aot?() -> raise stale_beam_error(ns, mod, beam_hash, src_hash)
               true -> true
             end
+
+          tier ->
+            # A TIER-KEYED namespace's freshness IS its tier key: every source
+            # under `priv/boot/` hashes into `compiler_key/0` and every source
+            # under `priv/build/` into `build_key/0`, so a key match means the
+            # source it was built from is byte-for-byte the source on disk. No
+            # closure hash to compute — and none MAY be computed for the build
+            # tier: the closure hash is answered by `source-graph`, itself a
+            # driver namespace, so asking would recurse into the load this gate
+            # vets.
+            tier_key_moved?(tier, beam_key)
         end
     end
   end
+
+  # Has the namespace's TIER key moved since its beam was stamped? No tier
+  # sources on disk (an escript, or a release away from its checkout) means
+  # nothing to compare against: trust the beam, exactly as the closure branch
+  # does when no source resolves. Only the two TIER-KEYED tiers appear here:
+  # the `case` above routes `:library` to the closure branch, so a third tier
+  # could only arrive with a clause added for it — and without one the gate
+  # would fail loudly here rather than silently trust a beam.
+  defp tier_key_moved?(:boot, beam_key),
+    do: BeamLisp.Tiers.boot_namespaces() != [] and beam_key != BeamLisp.AOTCache.compiler_key()
+
+  defp tier_key_moved?(:build, beam_key),
+    do: BeamLisp.Tiers.build_namespaces() != [] and beam_key != BeamLisp.AOTCache.build_key()
 
   # `{source_hash, compiler_key}` from a compiled shim, or `nil` when the module
   # carries no stamp (predates L1) or its code cannot be loaded. `ensure_loaded/1`
@@ -940,7 +957,12 @@ defmodule BeamLisp.AOT do
   defp short(nil), do: "<none>"
   defp short(h), do: String.slice(h, 0, 12)
 
-  defp default_output_dir do
+  @doc """
+  The output directory a build defaults to: the Mix project's compile path when a
+  Mix project is loaded, else an error naming what to pass instead. Public because
+  the build driver needs the same answer, and two answers would be two defaults.
+  """
+  def default_output_dir do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix.Project, :compile_path, 0) do
       Mix.Project.compile_path()
     else

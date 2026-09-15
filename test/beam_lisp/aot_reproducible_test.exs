@@ -46,16 +46,16 @@ defmodule BeamLisp.AotReproducibleTest do
 
     on_exit(fn ->
       File.rm_rf!(@src)
-      Mix.Tasks.Compile.BeamLisp.clean(@out)
+      BeamLisp.BuildTask.clean(@out)
     end)
 
     :ok
   end
 
   defp build!(jobs) do
-    Mix.Tasks.Compile.BeamLisp.clean(@out)
+    BeamLisp.BuildTask.clean(@out)
     args = ["--source-dir", @src, "--out", @out, "--force", "--jobs", Integer.to_string(jobs)]
-    assert {:ok, _} = Mix.Tasks.Compile.BeamLisp.run(args)
+    assert {:ok, _} = BeamLisp.BuildTask.run(args)
 
     @out
     |> Path.join("Elixir.BeamLisp.Ns.*Repro.*.beam")

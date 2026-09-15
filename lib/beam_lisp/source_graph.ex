@@ -1,6 +1,6 @@
 defmodule BeamLisp.SourceGraph do
   @moduledoc """
-  The namespace graph, delegated to the language: `priv/boot/source-graph.bl`.
+  The namespace graph, delegated to the language: `priv/build/source-graph.bl`.
 
   Every freshness question the build asks — a file's declared ns and requires,
   a namespace's transitive closure, the closure hash the manifest stores and

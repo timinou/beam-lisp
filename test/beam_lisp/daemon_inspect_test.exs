@@ -69,7 +69,11 @@ defmodule BeamLisp.DaemonInspectTest do
 
   test "the JSON face is JSON-safe: string keys, no structs" do
     js = Inspect.json()
-    assert Map.keys(js) |> Enum.sort() == ["identity", "image", "ports", "queue", "tasks"]
+    # `index` joined the read-model when the daemon grew an index worker (the
+    # tree's code index, reported as it builds). This list is the face's whole
+    # contract, so a key that appears in the model and not here is the test
+    # failing to notice the model grew — which is what it is for.
+    assert Map.keys(js) |> Enum.sort() == ["identity", "image", "index", "ports", "queue", "tasks"]
     assert is_map(js["identity"])
     assert Enum.all?(Map.keys(js["identity"]), fn k -> is_binary(k) end)
     # encoding it is the proof it is JSON-safe

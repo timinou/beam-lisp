@@ -1,7 +1,7 @@
 # The build is a program: source-graph, build-plan, and what "fresh" means
 
 An executable document (`bl doc run docs/build/the-build-is-a-program.bl.md`).
-It walks the three `.bl` modules in `priv/boot/` that decide what `mix compile`
+It walks the `.bl` modules in `priv/build/` that decide what `mix compile`
 does, and runs them on the tree they live in.
 
 ```beam-lisp
@@ -15,12 +15,12 @@ does, and runs them on the tree they live in.
 
 ## The tiers
 
-beam-lisp's own sources live in three tiers under `priv/`, and the tier says
+beam-lisp's own sources live in tiers under `priv/`, and the tier says
 how a change propagates:
 
-- `boot/` — the toolchain: reader, compiler, `core`, `sugar`, data readers, and
-  the three build modules this document is about. Anything here can alter
-  *every* emitted byte, so the toolchain key hashes the **whole directory** and a
+- `boot/` — the CODEGEN: reader, compiler, `core`, `sugar`, data readers, and
+  the Core-Erlang backend (`anf`, `lower`). Anything here can alter *every*
+  emitted byte, so the **codegen key** hashes the **whole directory** and a
   change rotates every beam. The tier is closed under `:require` — the compiler
   needs only `reader-node`; nothing in it reaches outside — which is exactly what
   makes "hash the directory" the same as "hash the closure":
@@ -29,14 +29,27 @@ how a change propagates:
 (def boot-files (Enum/to_list (sort (Path/wildcard "priv/boot/*.bl"))))
 (def boot-nss (set (map (fn [p] (first (sg/header (File/read! p)))) boot-files)))
 (def boot-reqs (set (mapcat (fn [p] (second (sg/header (File/read! p)))) boot-files)))
-(println "boot namespaces:" (count boot-nss))
-(println "boot requires outside boot:" (remove (fn [r] (contains? boot-nss r)) boot-reqs))
+(println "codegen namespaces:" (count boot-nss))
+(println "codegen requires outside its tier:"
+         (remove (fn [r] (contains? boot-nss r)) boot-reqs))
+(def drv-files (Enum/to_list (sort (Path/wildcard "priv/build/*.bl"))))
+(def drv-nss (set (map (fn [p] (first (sg/header (File/read! p)))) drv-files)))
+(def drv-reqs (set (mapcat (fn [p] (second (sg/header (File/read! p)))) drv-files)))
+(println "driver namespaces:" (count drv-nss))
+(println "driver requires outside codegen+driver:"
+         (remove (fn [r] (or (contains? drv-nss r) (contains? boot-nss r))) drv-reqs))
 ```
 
 ```bl-result boot-files
 :ok
 ```
 
+- `build/` — the BUILD DRIVER: `build`, `build-plan`, `source-graph`,
+  `ns-interface` — the three modules this document is about, plus the driver that
+  calls them. None of them can change an emitted byte, so they carry their **own
+  key** (`AOTCache.build_key/0`, which folds the codegen key in, because the
+  codegen compiles the driver). Editing a build-tool file used to rotate the
+  toolchain key and rebuild every beam in the tree; now it rebuilds the driver.
 - `std/` — the standard library, keyed per namespace.
 - `lib/` — batteries (`datom`, `auth`, `live`, `loom`, `veritas`, `z3`, …), keyed
   per namespace, optional in a release.
@@ -114,7 +127,9 @@ nodes the key is byte-identical to the old closure hash:
 
 Three consumers hold that key and must agree:
 
-1. the build's **manifest** (`_build/…/compile.beam_lisp`) stores it per source;
+1. the build's **fact log** (`_build/…/build.log`; `priv/build/build-log.bl`)
+   records it per source — the manifest beside it is that log's PROJECTION,
+   written for Mix to read and for nothing else;
 2. the emitted beam's **stamp** (`__bl_provenance__/0`) carries it;
 3. the runtime **drift gate** (`BeamLisp.AOT.stale?/2`) recomputes it from live
    sources before trusting a beam.
@@ -160,23 +175,42 @@ parallel, and post-perturbation builds emit byte-identical beams.
 
 ## The driver: `build/run`
 
-The build itself is `priv/boot/build.bl`. One function, one map in, one map out:
+The build itself is `priv/build/build.bl`. One function, one map in, one map out:
 
 ```
-(build/run {:sources [paths] :out "dir" :manifest "path"
+(build/run {:sources [paths] :out "dir" :manifest "path" :log-path "path"
             :force? bool :jobs n :log fn})
-→ {:built n :errors [msg …] :manifest {path {:hash key :key toolchain :modules [mod …]}}}
+→ {:built n :errors [msg …] :manifest {path {:hash key :key tier :modules [mod …]}}}
 ```
 
 It plans the sources (`build-plan/plan` over `node-from`), walks the waves,
 and inside each wave runs `build-one` for every source that is not fresh —
 in parallel, `:jobs` at a time, results collected in order. A source is
-**fresh** when its manifest entry has this key, this toolchain key, and every
+**fresh** when the LOG records it under this key and this tier key, and every
 module it names is on disk. `build-one` asks the shared cache first
-(`AOTCache.fetch`); on a miss it compiles and publishes. The manifest is
-rewritten after every source, so an interrupted build resumes where it
-stopped. Sources that vanished lose their beams. A source the reader
-rejects is one entry in `:errors` — the rest still builds.
+(`AOTCache.fetch`); on a miss it compiles and publishes, and the wave APPENDS a
+fact per source (`build-log/append!`) — so an interrupted build resumes from the
+last complete fact, where the old single-document manifest could not be resumed
+at all. At the end one compaction writes the log's current state, and the
+manifest as its projection. Sources that vanished lose their beams. A source the
+reader rejects is one entry in `:errors` — the rest still builds.
+
+The log is also the build's QUERY SURFACE, which a manifest could never be:
+`build-log/stale` (what a build would recompile, in plan order),
+`build-log/impact` (everything an edit reaches — the reverse of the plan's
+`:deps`), and `build-log/coverage` (how much of the plan the log accounts for,
+and which facts are missing). `BeamLisp.BuildLog` is the Elixir call surface.
+
+A run also carries an optional ELIXIR SUBSTRATE stage (`priv/build/substrate.bl`,
+`[:build/ex path hash [modules]]` facts in the same log): `lib/**/*.ex` minus
+the Mix-task shells and the dev server, compiled in ONE
+`Kernel.ParallelCompiler` batch — one batch, because the parallel compiler
+resolves cross-file dependencies itself, and still a FACT PER FILE, because
+every compiled module reports the file it came from in its compile info.
+Freshness is the content hash, and the module list is recorded so a beam that
+vanished pulls its own source back into the build. This is the stage that lets
+the shipped `bl` compile a project's Elixir sources with no Mix project, no
+`_build` and no `MIX_ENV` — Elixir's compiler ships in the payload.
 
 The same function has two shells, and neither decides anything:
 
@@ -192,12 +226,13 @@ uses when it is required, so a document compiles to exactly the program it
 loads as.
 
 Pinned by `test/bl/build_test.bl`: fresh tree, no-op, body edit → 1, interface
-edit → closure, broken source → error, deleted source → swept, poisoned
-manifest → ignored, `clean`.
+edit → closure, broken source → error, deleted source → swept, a poisoned
+manifest costs nothing (the projection is repaired, never trusted), the log is
+the memory, `clean` removes both files.
 
 ## Where the Elixir still is
 
-`Mix.Task.Compiler` is an Elixir behaviour, and the toolchain key that
+`Mix.Task.Compiler` is an Elixir behaviour, and the codegen key that
 validates the bootstrap seed runs *before* the language exists — so the two
 shells above are Elixir, and so is the substrate they boot. Everything the
 build *decides* — order, waves, keys, coverage, freshness, what to run and

@@ -303,7 +303,7 @@ defmodule BeamLisp.LazyMemoNativeTest do
     {output, status} =
       System.cmd(
         System.find_executable("elixir"),
-        ["-pa", Mix.Project.compile_path(), "-e", script], stderr_to_stdout: true)
+        ["-pa", BeamLisp.AOT.default_output_dir(), "-e", script], stderr_to_stdout: true)
 
     assert status == 0, output
     assert output =~ "unload-ok"

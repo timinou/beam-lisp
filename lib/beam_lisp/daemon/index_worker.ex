@@ -1,4 +1,8 @@
 defmodule BeamLisp.Daemon.IndexWorker do
+  # `is_bl_map/1` is a defguard — a macro — so it must be required before use in
+  # a guard clause.
+  require BeamLisp.Guards
+
   @moduledoc """
   Owns the tree's code index — the one conn every code question reads.
 
@@ -94,14 +98,19 @@ defmodule BeamLisp.Daemon.IndexWorker do
   could not be told about it, so a frame this does not understand is still
   stored — the dashboard renders what it finds and ignores what it does not.
   """
-  # is_map-ok: `frame` is a plain progress-frame map (atom keys → counters) the
-  # dashboard renders; it is never a beam-lisp value, so accepting any map is right.
-  def progress!(frame) when is_map(frame) do
+  def progress!(frame) when BeamLisp.Guards.is_bl_map(frame) do
     :ets.insert(@table, {:progress, Map.put(frame, :at, System.system_time(:millisecond))})
     :ok
   rescue
     ArgumentError -> :ok
   end
+
+  # The other half of "total on purpose": a frame that is not a beam-lisp map is
+  # not a frame at all — a Vector or a Set is an Erlang map carrying `:__struct__`,
+  # and storing one would put a struct in the table the dashboard renders from.
+  # `code.index` builds the frame on line 309 and passes a map; anything else is
+  # a caller's mistake, and the build must not fail for the UI's sake.
+  def progress!(_), do: :ok
 
   @doc """
   Index the tree now, in the background. Idempotent in the only sense that

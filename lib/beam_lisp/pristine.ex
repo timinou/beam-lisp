@@ -1,0 +1,76 @@
+defmodule BeamLisp.Pristine do
+  @moduledoc """
+  The PRISTINE comparison, delegated to the language: `priv/build/pristine.bl`.
+
+  The fixpoint gate (PLAN-108 W6) is only as strong as the comparison behind it,
+  and the comparison has one measured trap: two packs of ONE tree produce
+  different compounds, because flate2 and Erlang's `:zlib` are different
+  compressors. So this module compares in layers, and `same?` means every layer
+  agreed:
+
+    1. `trees/2` — every file's path → (size, sha256), compared as SETS (an
+       extra or missing path is reported as such, not smoothed over), plus the
+       tar bytes, byte for byte.
+    2. `drops/2` — the trailer's fields, `offset + len + 56 == size`, the stored
+       against the recomputed payload digest, and the digest of the payload
+       DECOMPRESSED.
+
+  `report/1` renders EVERY difference, never just the first. The file bytes of
+  two compounds are reported but deliberately not part of `same?`: two
+  compressors can never promise identity there, and a gate that demanded it
+  would be demanding something nobody intends to fix.
+
+  Like `BeamLisp.Drop` and `BeamLisp.Release`, this is the Elixir call surface;
+  the logic is in `priv/build/pristine.bl`.
+  """
+
+  @ns "pristine"
+
+  @doc "`%{rel_path => %{size: n, sha: hex}}` for every file under `root`."
+  @spec index(binary) :: map
+  def index(root) when is_binary(root), do: call("index", [root])
+
+  @doc """
+  Layers 1 and 2 for two release roots: the set difference and the tar bytes.
+
+  `exclude` names relative paths that are build STATE rather than artifact (a
+  build log records the run id and time, so it can never be part of a fixpoint).
+  The caller must name them: the comparison does not guess. With any exclusion
+  the tar layer is reported as NOT COMPARED — a tar is the whole directory — so
+  `same?` rests on the index layer alone, and says so.
+  """
+  @spec trees(binary, binary, [binary]) :: map
+  def trees(a, b, exclude \\ [])
+
+  def trees(a, b, exclude) when is_binary(a) and is_binary(b) and is_list(exclude),
+    do: call("trees", [a, b, exclude])
+
+  @doc """
+  Layers 3 and 4 for two compounds: trailer fields, arithmetic, payload digest,
+  decompressed payload digest — and, separately, whether the files themselves
+  are the same length.
+  """
+  @spec drops(binary, binary) :: map
+  def drops(a, b) when is_binary(a) and is_binary(b), do: call("drops", [a, b])
+
+  @doc "Every difference, one line each. `\"identical\"` when there are none."
+  @spec report(map) :: binary
+  # is_map-ok: `diff` is the plain Elixir map `diff/2` returns — counts and lists
+  # of differing paths — never a beam-lisp value, so a struct must not pass here
+  # either and the stricter guard would reject the very map this is for.
+  def report(diff) when is_map(diff), do: call("report", [diff])
+
+  @doc """
+  Whether two compounds are byte-identical — the fixpoint ONE producer can
+  demand of itself (our packer is deterministic). Deliberately separate from
+  `drops/2`, whose `same?` has to hold across two different compressors.
+  """
+  @spec compounds_identical?(binary, binary) :: boolean
+  def compounds_identical?(a, b) when is_binary(a) and is_binary(b),
+    do: call("compounds-identical?", [a, b])
+
+  defp call(name, args) do
+    BeamLisp.Loader.ensure_loaded(@ns)
+    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, name), args)
+  end
+end
