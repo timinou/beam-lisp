@@ -16,9 +16,36 @@ defmodule BeamLisp.Daemon.WorkersTest do
   # restarted it. A daemon that looks alive and can do nothing is the worst way
   # to fail, which is this module's own stated rule.
 
+  # Own the supervisor's lifecycle rather than sharing the global one. Another
+  # file in the same VM — or a real daemon (`BeamLisp.Daemon.Server` calls the
+  # same `Workers.ensure_started/1`) — registers this exact name and TAKES IT
+  # DOWN when it stops, which is FUP-074's `(EXIT) shutdown` / `no process`
+  # racing a lifecycle we do not own. Stop any existing instance, start a fresh
+  # one, tear it down on exit.
   setup do
-    {:ok, _} = BeamLisp.Daemon.Workers.ensure_started()
+    if pid = Process.whereis(BeamLisp.Daemon.Workers), do: stop_sup(pid)
+
+    {:ok, sup} = BeamLisp.Daemon.Workers.ensure_started()
+    on_exit(fn -> stop_sup(sup) end)
     :ok
+  end
+
+  defp stop_sup(pid) do
+    ref = Process.monitor(pid)
+    # Unlink first: setup runs in the test process and `ensure_started` used
+    # `start_link`, so a bare stop would deliver the supervisor's exit to us.
+    Process.unlink(pid)
+    Supervisor.stop(pid, :normal, 10_000)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _} -> :ok
+    after
+      10_000 -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   test "all three workers run under the supervisor" do
