@@ -41,4 +41,15 @@ defmodule BeamLisp.ClojureCompatDocsTest do
     assert out =~ "[33.34M 33.33M 33.33M] sum 100.00M"
     assert out =~ ":decimal/inexact-operand"
   end
+
+  test "docs/datahike-on-datom.bl.md drives the datahike.api shim over datom end to end" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datahike-on-datom.bl.md") end)
+
+    assert out =~ "tx-data datoms: 10"
+    assert out =~ "in credit: ([\"Bank\" 250] [\"Cash\" 100])"
+    assert out =~ "pull cash: {:account/name \"Cash\", :account/balance 100}"
+    assert out =~ "bank name: Bank balance: 250"
+    assert out =~ "accounts now: 3"
+    assert out =~ "accounts if applied: 4"
+  end
 end
