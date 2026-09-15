@@ -40,7 +40,13 @@
 ; cannot hand its conn to the next command, because it does not outlive it.
 
 (ns code.index
-  (:require [codebase] [datom] [typed] [bl.env :as env] [bl.util :as u]))
+  (:require [code.embed]
+            [code.semantic]
+            [codebase]
+            [datom]
+            [typed]
+            [bl.env :as env]
+            [bl.util :as u]))
 
 (def MANIFEST-VERSION
   "Bumped when the SHAPE of a memo changes — not when a source does. A memo
@@ -246,12 +252,13 @@
                                   :calls (count (:calls facts))
                                   :names (mapv (fn [f] (get f :fn/name)) (:fn facts))}))))
 
-(defn assemble!
-  "A conn holding every source's facts, in `pairs` order, with ONE bulk write.
+(defn- assemble-plain!
+  "The model-less assembly: facts only, from the per-source term cache.
 
-   Fresh conn per assembly, and the caller swaps it in whole: a reader never
-   sees a conn with half a corpus in it, which is the failure mode a partial
-   merge into a live conn would produce."
+   Used when this build carries no embedding model (`--no-embed`, or a missing
+   NIF). The facts are the ones every code question is answered from; the only
+   thing missing is the vector column, which is exactly what `bl search` says
+   when it cannot rank them."
   [sigs pairs root report]
   (let [n (count (to-list pairs))
         v (vec (to-list pairs))
@@ -272,17 +279,110 @@
              :analyzed (:analyzed acc) :cached (:cached acc)
              :skipped (to-list (:skipped acc))}}))
 
+(defn- assemble-embedded!
+  "The one assembly: `code.semantic` analyzes the corpus, into a conn whose
+   schema carries the embedding column.
+
+   This is the shape this namespace was FOR. Before it, a tree needed two
+   databases: this one (facts — what `bl ask`, `bl lsp` and the MCP mount read)
+   and `code.semantic`'s (facts + vectors — what `bl search` read). The same
+   analysis, paid for twice, cached twice, into two conns that could not see
+   each other. Now: ONE analysis (`code.semantic`'s, which is the only one that
+   knows how to attach a vector to a function), one per-source cache and one
+   corpus memo behind it, and one conn in front of every door.
+
+   The banding is the same rule in both namespaces — source `i` lands at
+   `(* i 1000000)` — so a door sees the same ids whichever path assembled them,
+   and a memo hit stays byte-identical to a fresh run. What is NOT the same is
+   the cache behind it, which is why this is a delegation rather than a copy.
+
+   `opts` is forwarded whole to `code.semantic/index!`, so a caller's `:workers`
+   (the CLI's `$BL_INDEX_WORKERS` knob) still reaches the fan-out: the library
+   takes a number, the CLI parses a string, and neither has learned about the
+   other."
+  [pairs root report opts]
+  (let [n (count (to-list pairs))
+        _ (if (some? report) (report {:phase :start :n n}) nil)
+        conn (codebase/connect-codebase [code.semantic/EMBEDDING])
+        rows (to-list (code.semantic/index! conn (to-list pairs) (assoc opts :root root)))
+        sum (fn [k] (reduce (fn [a r] (+ a (or (get r k) 0))) 0 rows))]
+    {:conn conn
+     :per-source (mapv (fn [r] {:ns (:ns r) :file (:file r)
+                                :functions (:functions r) :calls (:calls r)
+                                :names (:names r)})
+                       rows)
+     :stats {:files n
+             :functions (sum :functions)
+             :analyzed (count (filter (fn [r] (= :indexed (:analysis r))) rows))
+             :cached (count (filter (fn [r] (and (not (:skipped r))
+                                                 (not= :indexed (:analysis r)))) rows))
+             ; The two numbers a caller's footer reports about HOW the analysis
+             ; was answered: the memo (one file for the whole corpus) and the
+             ; per-file stores' vector columns. Derived from the pass's own
+             ; results rather than re-measured, so they cannot disagree with it.
+             :manifested (count (filter (fn [r] (= :manifest (:analysis r))) rows))
+             :vectors-cached (count (filter (fn [r] (= :cached (:vectors r))) rows))
+             ; The PATH comes along with the reason: which file was left out is
+             ; the actionable half of the message, and a reason on its own reads
+             ; as if the whole run had a problem rather than one file.
+             :skipped (to-list (map (fn [r] (str (:file r) " — " (:skipped r)))
+                                    (filter :skipped rows)))}}))
+
+(defn assemble!
+  "A conn holding every source's facts, in `pairs` order, with ONE bulk write.
+
+   Fresh conn per assembly, and the caller swaps it in whole: a reader never
+   sees a conn with half a corpus in it, which is the failure mode a partial
+   merge into a live conn would produce.
+
+   WHICH analysis runs is decided by whether this build can fill the vector
+   column, and by nothing else. Both paths return the same keys, so a caller
+   never asks which one ran; the difference a caller CAN see is `:vectors` in
+   the semantic results, and `bl search` is the door that cares."
+  [sigs pairs root report opts]
+  (if (code.embed/available?)
+    (assemble-embedded! pairs root report opts)
+    (assemble-plain! sigs pairs root report)))
+
 ; ── the held index ───────────────────────────────────────────────────────
 
-; A memo of the LAST index built in this VM: its corpus key, its conn, its
-; stats. Process-wide rather than per-caller, because the whole point is that
-; the second question does not rebuild what the first one built.
-(def ^:private held (atom nil))
+; A memo of the indexes built in this VM, by CORPUS key: conn, stats, sources.
+; Process-wide rather than per-caller, because the whole point is that the second
+; question does not rebuild what the first one built.
+;
+; A MAP, not a single slot, because a tree asks about more than one corpus in
+; practice: its declared sources (env.bl `:paths` — `bl ask`, `bl lsp`, the MCP
+; mount) and every `.bl` under the root (`bl search`'s default, which includes
+; `test/` and `examples/`). One slot made those two evict each other, so
+; alternating `bl search` and `bl ask` rebuilt an index every time — the exact
+; cost this namespace exists to remove.
+(def ^:private HELD-MAX
+  "How many corpora one VM keeps standing. Two are asked about in practice; the
+   rest is room to move, and an index is a database held open, so there is a
+   ceiling rather than none."
+  4)
+
+(def ^:private held (atom {:order [] :by-key {}}))
+
+(defn held-index []
+  (let [s (deref held) k (last (:order s))]
+    (if (nil? k) nil (get (:by-key s) k))))
 
 (defn held-key []
-  (let [h (deref held)] (if (nil? h) nil (:key h))))
+  (let [h (held-index)] (if (nil? h) nil (:key h))))
 
-(defn held-index [] (deref held))
+(defn- remember!
+  "Keep this conn under its key, and forget the oldest beyond `HELD-MAX`."
+  [v]
+  (swap! held
+         (fn [s]
+           (let [k (:key v)
+                 by-key (assoc (:by-key s) k v)
+                 order (vec (concat (remove (fn [x] (= x k)) (:order s)) [k]))
+                 drop-n (max 0 (- (count order) HELD-MAX))
+                 keep (vec (drop drop-n order))]
+             {:order keep :by-key (select-keys by-key keep)})))
+  v)
 
 ; ── the daemon seam ──────────────────────────────────────────────────────
 ;
@@ -331,21 +431,21 @@
   "The work: read the corpus key, and on a miss assemble the conn. Runs ON THE
    OWNER when there is one (see `ensure`), which is what makes the conn's tables
    outlive the answer."
-  [sigs pairs root report]
+  [sigs pairs root report opts]
   (let [t0 (System/monotonic_time :millisecond)
         k (key-of pairs)
-        h (deref held)
+        h (get-in (deref held) [:by-key k])
         ms (fn [] (- (System/monotonic_time :millisecond) t0))
         tell (fn [m] (if (some? report) (report m) nil))]
-    (if (and (some? h) (= k (:key h)) (datom/alive? (:conn h)))
+    (if (and (some? h) (datom/alive? (:conn h)))
       (do (tell {:phase :ready :hit true :ms (ms) :stats (:stats h)}) h)
       (try
-        (let [built (assemble! sigs pairs root report)
+        (let [built (assemble! sigs pairs root report opts)
               v (assoc built
                        :key k
                        :built-at (System/monotonic_time :millisecond)
                        :sources (mapv (fn [p] [(get p 0) (sha-of p)]) pairs))]
-          (reset! held v)
+          (remember! v)
           (tell {:phase :ready :hit false :ms (ms) :stats (:stats built)})
           v)
         (catch e
@@ -367,7 +467,7 @@
    (let [root (:root opts (first (map (fn [p] (get p 1)) (to-list pairs))))
          owner (daemon-owner)
          report (reporter owner (:on-progress opts))
-         job (fn [] (build! sigs pairs root report))]
+         job (fn [] (build! sigs pairs root report opts))]
      (if (or (nil? owner) (= owner (erlang/self)))
        ; No owner, or we ARE the owner: run here. The second case is the
        ; daemon's own boot build, which runs on the worker — asking the worker
@@ -413,6 +513,23 @@
   [pair]
   (sha256-hex (source-text (get pair 0) (get pair 1))))
 
+(defn- files-of
+  "The FILES a set of paths names — directories expanded through the loader, made
+   absolute against `base` and sorted.
+
+   Nothing is analyzed and nothing is written: this is the CHEAP half of the
+   reuse question, and it exists so a question about one tree cannot build — or
+   leave a cache artifact in — another."
+  [paths base]
+  (vec (sort (to-list (map (fn [f] (Path/expand f base))
+                           (mapcat u/expand-targets (to-list paths)))))))
+
+(defn- files-held
+  "The tree's own source FILES, absolute against the tree."
+  [root]
+  (vec (sort (to-list (map (fn [p] (Path/expand (get p 1) root))
+                           (to-list (tree-sources root)))))))
+
 (defn reuse-for-paths
   "The tree index at `root`, when it holds exactly the sources `paths` name —
    otherwise nil.
@@ -420,20 +537,35 @@
    `paths` are what a question arrives with: directories (the usual `bl ask …
    src`), single files, or both. They are expanded to loader sources here, by
    the loader's own rule, because the index holds FILES and a caller naming a
-   directory means every source under it."
+   directory means every source under it.
+
+   TWO STEPS, cheapest first, and the order is the point. The FILES are compared
+   before anything is built: a question about a corpus somewhere else — what a
+   probe is, and what an `ask` about another tree is — used to build THIS tree's
+   index first and only then discover it was not wanted. That cost a full
+   analysis and left its artifacts here, caught by
+   `bl_ask_test/what-ask-remembers-lives-with-the-sources`, which counts the
+   shell's cache directory before and after the question. Only when the file
+   sets agree is the index built and the CONTENT hashes compared.
+
+   EXACT, not a superset (see `covers?`)."
   [root paths]
-  (let [idx (ensure-tree root)]
-    (when (some? idx)
-      (let [files (to-list (sort (mapcat u/expand-targets (to-list paths))))
-            want (mapv (fn [f] [(u/ns-of (BeamLisp.Loader/read_source f))
-                               (sha256-hex (BeamLisp.Loader/read_source f))])
-                       files)]
-        ; The engine's two bands lead every index (see `engine-pairs`) and are
-        ; never part of a caller's question about ITS sources, so they are dropped
-        ; from the comparison rather than counted against every caller.
-        (if (covers? (assoc idx :sources (drop 2 (to-list (:sources idx)))) want)
-          idx
-          nil)))))
+  (let [want (files-of paths (BeamLisp/cwd))
+        have (files-held root)]
+    (when (and (seq want) (= want have))
+      (let [idx (ensure-tree root)]
+        (when (some? idx)
+          (let [files (to-list (sort (mapcat u/expand-targets (to-list paths))))
+                want-shas (mapv (fn [f] [(u/ns-of (BeamLisp.Loader/read_source f))
+                                         (sha256-hex (BeamLisp.Loader/read_source f))])
+                                files)]
+            ; The engine's two bands lead every index (see `engine-pairs`) and are
+            ; never part of a caller's question about ITS sources, so they are
+            ; dropped from the comparison rather than counted against every
+            ; caller.
+            (if (covers? (assoc idx :sources (drop 2 (to-list (:sources idx)))) want-shas)
+              idx
+              nil)))))))
 
 (def sigs
   "The type seeds the indexer reads return annotations against — the same three
