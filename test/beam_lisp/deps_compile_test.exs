@@ -80,14 +80,14 @@ defmodule BeamLisp.DepsCompileTest do
   @elixir_pkg [
     {"mix.exs",
      """
-     defmodule Thing.MixProject do
+     defmodule DepsCompileFx.MixProject do
        use Mix.Project
 
        def project, do: [app: :thing, version: "0.1.0"]
        def application, do: [extra_applications: [:logger]]
      end
      """},
-    {"lib/thing.ex", "defmodule Thing do\n  def answer, do: 42\nend\n"},
+    {"lib/deps_compile_fx.ex", "defmodule DepsCompileFx do\n  def answer, do: 42\nend\n"},
     {"priv/data.txt", "the library's data directory\n"}
   ]
 
@@ -117,13 +117,13 @@ defmodule BeamLisp.DepsCompileTest do
     assert File.dir?(app_dir), "expected #{app_dir}"
 
     # the beams
-    assert File.exists?(Path.join(app_dir, "ebin/Elixir.Thing.beam"))
+    assert File.exists?(Path.join(app_dir, "ebin/Elixir.DepsCompileFx.beam"))
 
     # the .app CONSULTS — that is the property, not that a file exists
     app = Path.join(app_dir, "ebin/thing.app")
     assert {:ok, [term]} = :file.consult(String.to_charlist(app))
     assert {:application, :thing, props} = term
-    assert Enum.any?(props, fn {k, v} -> k == :modules and v == [Thing] end),
+    assert Enum.any?(props, fn {k, v} -> k == :modules and v == [DepsCompileFx] end),
            "the modules list must be an Erlang list of atoms, got #{inspect(props[:modules])}"
     assert Enum.any?(props, fn {k, v} -> k == :applications and :logger in v end)
 

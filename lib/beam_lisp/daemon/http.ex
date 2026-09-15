@@ -1,4 +1,8 @@
 defmodule BeamLisp.Daemon.HTTP do
+  # `is_bl_map/1` is a defguard — a macro — so it must be required before it can
+  # be used in a guard clause.
+  require BeamLisp.Guards
+
   @moduledoc """
   The session's HTTP face, served on the port the daemon claims as `:ui`.
 
@@ -81,7 +85,12 @@ defmodule BeamLisp.Daemon.HTTP do
   # left out rather than rendered as `nil` fields.
   defp index_stats(nil), do: nil
 
-  defp index_stats(s) when is_map(s) do
+  # `is_bl_map`, not `is_map`: every beam-lisp struct (Vector, Set, LazySeq,
+  # records) is an Erlang map carrying `:__struct__`, so a bare `is_map` here
+  # would let a Vector take the "beam-lisp map of stats" path and answer a row of
+  # zeroes instead of being refused. `index_stats(_) -> nil` below is the
+  # refusal; this is the guard that has to be able to reach it.
+  defp index_stats(s) when BeamLisp.Guards.is_bl_map(s) do
     %{
       "files" => to_int(Map.get(s, :files)),
       "functions" => to_int(Map.get(s, :functions)),
