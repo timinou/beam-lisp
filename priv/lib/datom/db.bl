@@ -138,17 +138,78 @@
        (let [r (get retractions (retraction-key d))]
          (or (nil? r) (< r (datom.index/-tx d))))))
 
+(def ^:private VALID-FOREVER 253402300799999)  ; #inst "9999-12-31T23:59:59.999" ms
+
+(defn- tx-valid-window
+  "The `[from to)` valid-time window of transaction `tx`, read from its
+   `:db.valid/from` / `:db.valid/to` datoms. A tx with no `:db.valid/from` is
+   always-valid: `[MIN, MAX)`. Reads the tx entity's own datoms directly from
+   the store (a tx entity is small), UNFILTERED — the window is metadata about
+   when facts are true, not itself a time-travelled fact."
+  [db tx]
+  (let [ds (datom.index/scan (store-of db) :eavt tx)
+        from (reduce (fn [acc d] (if (= :db.valid/from (datom.index/-a d)) (datom.index/-v d) acc)) nil ds)
+        to (reduce (fn [acc d] (if (= :db.valid/to (datom.index/-a d)) (datom.index/-v d) acc)) nil ds)]
+    [(or from 0) (or to VALID-FOREVER)]))
+
+(defn- valid-keep?
+  "Whether datom `d` survives this value's valid-time filter. `window-of` is a
+   memoised tx→window lookup. `:valid-at t` keeps a datom whose tx window
+   contains `t` (`from <= t < to`); `:valid-between [a b]` keeps one whose window
+   overlaps `[a b]`. No valid-time bound keeps everything."
+  [db window-of d]
+  (let [va (:valid-at db) vb (:valid-between db)]
+    (cond
+      (some? va)
+        (let [w (window-of (datom.index/-tx d))]
+          (and (<= (get w 0) va) (< va (get w 1))))
+      (some? vb)
+        (let [w (window-of (datom.index/-tx d)) a (get vb 0) b (get vb 1)]
+          (and (< (get w 0) b) (> (get w 1) a)))    ; [from,to) overlaps [a,b]
+      :else true)))
+
 (defn filter-datoms
   "Apply this value's filter to a scan result, in ONE pass.
 
    `:history` keeps every visible datom — including retractions, which
    are the record of what STOPPED being true and when. `:current` keeps
-   only what holds at the basis."
+   only what holds at the basis. A `:valid-at`/`:valid-between` bound then
+   filters by VALID time — when each fact's transaction says it is true in the
+   world — the second bitemporal axis, applied here so every reader honours it."
   [db candidates]
-  (if (= (:filter-mode db) :history)
-    (filterv (fn [d] (visible? db d)) candidates)
-    (let [retractions (retraction-index db candidates)]
-      (filterv (fn [d] (current-in? db retractions d)) candidates))))
+  (if (and (nil? (:valid-at db)) (nil? (:valid-between db)))
+    ; no valid-time bound: transaction-time filtering only, as before.
+    (if (= (:filter-mode db) :history)
+      (filterv (fn [d] (visible? db d)) candidates)
+      (let [retractions (retraction-index db candidates)]
+        (filterv (fn [d] (current-in? db retractions d)) candidates)))
+    ; A valid-time bound changes the ORDER: valid-time is filtered FIRST, then
+    ; transaction-time supersession is computed AMONG the surviving datoms.
+    ; This is the essence of bitemporality — a fact superseded by a later
+    ; transaction whose VALID window does not cover `t` is still current AT `t`.
+    ; (A newer price valid from Jan 15 does not un-current the Jan 1 price when
+    ; asking "what was true on Jan 10?".) Retraction/basis still apply within
+    ; the valid-time slice.
+    (let [cache (atom {})
+          window-of (fn [tx]
+                      (let [hit (get (deref cache) tx)]
+                        (if (some? hit) hit
+                          (let [w (tx-valid-window db tx)]
+                            (swap! cache assoc tx w) w))))
+          in-valid (filterv (fn [d] (valid-keep? db window-of d)) candidates)]
+      (cond
+        ; a RANGE (valid-between) is history-like: a fact valid anywhere in the
+        ; range belongs in the answer, so cardinality-one supersession must NOT
+        ; collapse two values that were each true at different points. Keep every
+        ; visible assertion in the range (basis/since still apply).
+        (some? (:valid-between db))
+          (filterv (fn [d] (and (visible? db d) (datom.index/assertion? d))) in-valid)
+        (= (:filter-mode db) :history)
+          (filterv (fn [d] (visible? db d)) in-valid)
+        ; a POINT (valid-at) is a single world-state: supersede within the slice.
+        :else
+          (let [retractions (retraction-index db in-valid)]
+            (filterv (fn [d] (current-in? db retractions d)) in-valid))))))
 
 ;; ── reading ─────────────────────────────────────────────────────────
 
