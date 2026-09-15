@@ -67,6 +67,18 @@ defmodule BeamLisp.ClojureCompatDocsTest do
     assert out =~ "count by dept: ([\"eng\" 2] [\"sales\" 1])"
   end
 
+  test "docs/datom-excision.bl.md erases from every index and from history" do
+    out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-excision.bl.md") end)
+
+    assert out =~ ~S(temp — history: #{["Temp"]})
+    assert out =~ "ssn after erasure:  nil"
+    assert out =~ "name still there:   Alice"
+    assert out =~ ~S(ssn in history:     #{})
+    assert out =~ "datoms excised: 2"
+    assert out =~ "alice — current: nil"
+    assert out =~ ~S(alice — history: #{})
+  end
+
   test "docs/datom-branches.bl.md isolates copy-on-write branches over one template" do
     out = ExUnit.CaptureIO.capture_io(fn -> BeamLisp.run_file("docs/datom-branches.bl.md") end)
 
