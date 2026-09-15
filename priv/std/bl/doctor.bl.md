@@ -211,9 +211,15 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
 
 ```beam-lisp
 (defn- mix-loaded?
-  "Whether the Elixir build tool is loaded in this VM. Not a signal this
+  "Whether the Elixir build tool is RUNNING in this VM. Not a signal this
    toolchain needs — `BeamLisp.Image/kind` answers the questions that used to be
    asked of Mix — but the honest answer to \"does this `bl` depend on Mix?\".
+
+   RUNNING, not loadable, and the difference is the whole probe: `mix/ebin` ships
+   with Elixir and sits on the code path of any Elixir VM, so asking whether the
+   module can be loaded answers yes under `bl` too — measured, and it made this
+   required probe fail in the image it exists to clear. What means \"this build
+   depends on Mix\" is that Mix is STARTED.
 
    The module is named as a STRING and turned into an atom: `Elixir.Mix` written
    as a bare symbol is a var this compiler resolves at compile time, and with no
@@ -221,7 +227,8 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
    bl.doctor/Elixir.Mix` (measured) instead of the fact it exists to report. A
    question about a module that may not be there cannot require it to be there."
   []
-  (Code/ensure_loaded? (String/to_atom "Elixir.Mix")))
+  (Enum/any? (Application/started_applications)
+             (fn [t] (= :mix (erlang/element 1 t)))))
 
 (defn- residue
   "What is left of Mix in this tree, as named pieces. A directory is named with
