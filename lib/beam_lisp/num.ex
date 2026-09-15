@@ -44,18 +44,22 @@ defmodule BeamLisp.Num do
 
   # ── ordering ─────────────────────────────────────────────────────────
 
+  # The ordering ops were, and stay, TOTAL over Erlang term order — `(< "A"
+  # "B")` and `(> :b :a)` answer as they always did; only a decimal operand
+  # takes the tower. (`compare` is the Clojure-ranked comparison; these are
+  # the raw BIFs' contract.)
   def lt(a, b) when is_number(a) and is_number(b), do: a < b
-  def lt(a, b), do: cmp(a, b) < 0
+  def lt(a, b), do: if(decimal_pair?(a, b), do: cmp(a, b) < 0, else: a < b)
   def gt(a, b) when is_number(a) and is_number(b), do: a > b
-  def gt(a, b), do: cmp(a, b) > 0
+  def gt(a, b), do: if(decimal_pair?(a, b), do: cmp(a, b) > 0, else: a > b)
   def le(a, b) when is_number(a) and is_number(b), do: a <= b
-  def le(a, b), do: cmp(a, b) <= 0
+  def le(a, b), do: if(decimal_pair?(a, b), do: cmp(a, b) <= 0, else: a <= b)
   def ge(a, b) when is_number(a) and is_number(b), do: a >= b
-  def ge(a, b), do: cmp(a, b) >= 0
+  def ge(a, b), do: if(decimal_pair?(a, b), do: cmp(a, b) >= 0, else: a >= b)
 
   @doc "Numeric equality: `(== 1 1.0)` and `(== 1.0M 1.00M)` are true."
   def num_eq(a, b) when is_number(a) and is_number(b), do: a == b
-  def num_eq(a, b), do: cmp(a, b) == 0
+  def num_eq(a, b), do: if(decimal_pair?(a, b), do: cmp(a, b) == 0, else: a == b)
 
   @doc "Three-way numeric comparison for the tower's members."
   def cmp(a, b) when is_number(a) and is_number(b) do
@@ -67,6 +71,10 @@ defmodule BeamLisp.Num do
   end
 
   def cmp(a, b), do: Decimal.compare(promote(a, b), promote(b, a))
+
+  defp decimal_pair?(%Decimal{}, _), do: true
+  defp decimal_pair?(_, %Decimal{}), do: true
+  defp decimal_pair?(_, _), do: false
 
   # Total, and for a non-number exactly the Erlang term comparison it was
   # before — so the `:when (pos? x)` guard (compiler.bl guard-special, which
