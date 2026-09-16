@@ -444,9 +444,10 @@ defmodule BeamLisp.Loader do
                   raw = File.read!(path)
                   content = doc_content(path, raw)
 
-                  case declared_ns(content) do
-                    ^ns -> {:ok, path, content}
-                    other -> acc || {:wrong_ns, path, other}
+                  if declares?(content, ns) do
+                    {:ok, path, content}
+                  else
+                    acc || {:wrong_ns, path, declared_ns(content)}
                   end
                 else
                   acc
@@ -555,6 +556,35 @@ defmodule BeamLisp.Loader do
       take_until(rest, pred, [line | acc])
     end
   end
+  # Whether `content` declares `ns` ANYWHERE — not only as its first form.
+  #
+  # The FIRST form is the wrong question for a LITERATE document. A `.bl.md`
+  # whose first code cell illustrates an `(ns …)` — `priv/lib/mcp/instructions.bl.md`
+  # does, to show where `^{:instr …}` goes — declares `my.ns` first and
+  # `mcp.instructions` second, and the guard read only the first. Measured on a
+  # COLD cache: nothing could resolve `mcp.instructions` (`mcp/server.bl` and
+  # `mcp/tools.bl` both require it), so `bl self-build` from a fresh clone died in
+  # its build stage and `bl mcp` would fail the same way. A warm cache hid it
+  # completely, because the namespace was already loaded and no file had to be
+  # found.
+  #
+  # The guard's INTENT is unchanged: a same-named file serving ANOTHER namespace
+  # — a stray copy, a hijack — still declares this one NOWHERE and is still
+  # rejected. Only the search moves, and it reuses the one extraction rule
+  # (`declared_ns/1`) rather than adding a second one.
+  defp declares?(content, ns) do
+    lines = String.split(content, "\n")
+
+    lines
+    |> Enum.with_index()
+    |> Enum.any?(fn {line, i} ->
+      trimmed = String.trim_leading(line)
+
+      (trimmed == "(ns" or String.starts_with?(trimmed, "(ns ")) and
+        declared_ns(lines |> Enum.drop(i) |> Enum.join("\n")) == ns
+    end)
+  end
+
   # The declared name is the first SYMBOL after `ns`. Metadata is not a symbol,
   # so `(ns ^{:instr {…}} codebase …)` — how priv/std/codebase.bl declares
   # itself — must skip it rather than read it as the name. Reading it as the
