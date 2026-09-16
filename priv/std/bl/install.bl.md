@@ -342,6 +342,34 @@ the corpus assembles.
   (str "run: bl install redirect (loopback only, removable), or: "
        (BeamLisp.Daemon.Gateway/sysctl_command)))
 
+(defn- answer-on-80
+  "What is on port 80 right now: :ours, :other or :closed.
+
+   Three answers, because the two ways of not being ours need different
+   sentences. A closed port is nobody's and can be opened for us. A port another
+   server holds is somebody's working service — and there the redirect does not
+   open a free port, it takes loopback 80 away from that server, so the report
+   has to say that before handing over the paste."
+  []
+  (BeamLisp.Daemon.Gateway/answer_on? 80))
+
+(defn- port-80-step
+  "The report line about port 80, from what the probe found. `mine` is what to
+   say when the gateway answers there, which each verb words its own way; the
+   other two states read the same wherever they are printed."
+  [state mine]
+  (cond
+    (= state :ours)
+    {:name "port 80" :ok true :detail mine}
+
+    (= state :other)
+    {:name "port 80" :ok false
+     :detail (str "something else answers — not a beam-lisp gateway. The redirect would send ALL "
+                  "loopback :80 traffic to the gateway, including requests to whatever is there now")}
+
+    :else
+    {:name "port 80" :ok false :detail (str "not answered — " (port-80-pointer))}))
+
 (defn- run-gateway [_arg]
   (let [bin (BeamLisp.Daemon.Gateway/command)
         unit (unit-file)]
@@ -508,29 +536,21 @@ the corpus assembles.
         (println script)
         {:error "needs root — the script printed above"})))
 
-(defn- answered-on-80?
-  "The only honest question: does a beam-lisp gateway answer on port 80?"
-  []
-  (BeamLisp.Daemon.Gateway/ours_on? 80))
 
 (defn- run-redirect [_arg]
   (let [port (BeamLisp.Daemon.Gateway/port)]
     (cond
-      (answered-on-80?)
-      [{:name "port 80" :ok true :detail "already answered — nothing to install"}]
+      (= :ours (answer-on-80))
+      [(port-80-step :ours "already answered — nothing to install")]
 
       (nil? port)
       [{:name "gateway" :ok false
         :detail "not running — bl gateway start first (a redirect would have nothing to forward to)"}]
 
       :else
-      (let [r (run-script (install-script (write-stage port)))
-            answered (answered-on-80?)]
+      (let [r (run-script (install-script (write-stage port)))]
         [{:name "ruleset" :ok (not (contains? r :error)) :detail (or (get r :ok) (get r :error))}
-         {:name "port 80" :ok answered
-          :detail (if answered
-                    "names answer here without a port"
-                    (str "not answered yet — the gateway is on " port))}
+         (port-80-step (answer-on-80) "names answer here without a port")
          {:name "gateway port" :ok (= port redirect-port)
           :detail (if (= port redirect-port)
                     (str "on the fallback port " redirect-port " — the boot rule stays right")
@@ -540,24 +560,22 @@ the corpus assembles.
          {:name "next" :ok true :detail "bl ports — the addresses printed there need no port"}]))))
 
 (defn- remove-redirect [_arg]
-  (let [r (run-script (remove-script))
-        still (answered-on-80?)]
+  (let [r (run-script (remove-script))]
     [{:name "ruleset" :ok (not (contains? r :error)) :detail (or (get r :ok) (get r :error))}
-     {:name "port 80" :ok true
-      :detail (if still
-                "still answered — by the gateway itself, which holds 80"
-                "no longer answered — every address shows its port again")}]))
+     (port-80-step (answer-on-80)
+                   "still answered — by the gateway itself, which holds 80")]))
 
 (defn- check-redirect [_arg]
-  (let [answered (answered-on-80?)
+  (let [state (answer-on-80)
         enabled (String/trim (erlang/element 1 (System/cmd "systemctl"
                                                            (u/to-list ["is-enabled" "bl-gateway-redirect.service"])
                                                            (u/kw [:stderr_to_stdout true]))))]
-    [{:name "port 80" :ok answered
-      :detail (if answered "a name needs no port here" "not answered — run: bl install redirect")}
+    [(port-80-step state "a name needs no port here")
      {:name "ruleset file" :ok (File/regular? redirect-rules-path)
       :detail (if (File/regular? redirect-rules-path) redirect-rules-path
-                "absent — run: bl install redirect")}
+                (if (= state :ours)
+                  "absent — port 80 is answered without it (the sysctl, or the gateway holds it)"
+                  "absent — run: bl install redirect"))}
      {:name "unit" :ok (= enabled "enabled")
       :detail (if (= enabled "enabled") "enabled" (str enabled " — run: bl install redirect"))}]))
 

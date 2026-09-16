@@ -195,15 +195,44 @@ fn unpack_into(payload: &[u8], tmp: &std::path::Path) -> std::io::Result<()> {
 /// — same sha256, verified before unpacking — so the tree already in place is
 /// the tree we were about to publish. What must not happen is publishing over
 /// it, or reporting failure for a `bl` that is ready to run.
+///
+/// A tree at `dest` with no `bin/` is the other case, and it used to be
+/// permanent: the install check is `dest/bin`, so a half-extracted tree reads
+/// as "version missing", every later run re-extracts, and every later run dies
+/// on the same `ENOTEMPTY` — `bl` unusable until a human deletes the directory
+/// (observed after a reboot landed in the middle of a first run). Such a tree
+/// holds nothing that can be running, so it is cleared and replaced.
 fn publish(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
-        Err(e) => {
+        Err(_) => {
             if dest.join("bin").exists() {
                 let _ = std::fs::remove_dir_all(tmp);
                 Ok(())
             } else {
-                Err(e)
+                // Debris: an extraction a reboot or a kill cut in half. The
+                // install check (`dest/bin`) still reads the version as
+                // missing, so every later run re-extracts and loses this same
+                // rename with ENOTEMPTY — `bl` stays dead until someone clears
+                // the tree by hand. Nothing runs out of a tree with no `bin/`.
+                if dest.is_dir() {
+                    let _ = std::fs::remove_dir_all(dest);
+                } else {
+                    let _ = std::fs::remove_file(dest);
+                }
+
+                match std::fs::rename(tmp, dest) {
+                    Ok(()) => Ok(()),
+                    Err(second) => {
+                        let _ = std::fs::remove_dir_all(tmp);
+                        // A sibling may have published a complete tree meanwhile.
+                        if dest.join("bin").exists() {
+                            Ok(())
+                        } else {
+                            Err(second)
+                        }
+                    }
+                }
             }
         }
     }

@@ -218,6 +218,79 @@ defmodule BeamLisp.DaemonNamesTest do
     stop_gateway(gw)
   end
 
+  test "an absolute-form request is routed by its authority, not by a header" do
+    # A proxy client sends `GET http://name/path HTTP/1.1`, and there the
+    # authority REPLACES any Host header (RFC 9112 §3.2.2). So a request naming
+    # one host in the request line and another in `Host:` must reach the one in
+    # the request line, and the app must never see the other name.
+    {name, port} = claim_named("proxied.test")
+    start_backend(port, self())
+    gw = start_gateway()
+
+    sock = connect(Gateway.port())
+    :ok = :gen_tcp.send(sock, "GET http://proxied.test/a/b?x=1 HTTP/1.1\r\nHost: wrong.test\r\n\r\n")
+
+    assert recv_until(sock, "hello") =~ "200 OK"
+    assert_receive {:backend_first, first}, 1_000
+    assert first =~ "GET /a/b?x=1 HTTP/1.1", "the path survives the rewrite"
+    assert first =~ "host: proxied.test"
+    refute first =~ "wrong.test", "the other name must not reach the app"
+
+    :gen_tcp.close(sock)
+    Ports.release(name, root: @claim_root)
+    stop_gateway(gw)
+  end
+
+  test "a proxied connection ends after one response, so two names never share a route" do
+    # Routing happens once per connection and the splice is opaque from the first
+    # byte, so a client that reused ONE proxy connection for two names used to
+    # have its second request answered by the FIRST name's app — measured live:
+    # `web.beam-lisp.test` then `nope.beam-lisp.test` on one connection returned
+    # 200 twice, where fresh connections correctly return 200 then 404. The
+    # gateway now asks the app to close, so the client is sent a new connection
+    # for its next request and routing is re-decided.
+    {name, port} = claim_named("first.test")
+    start_backend(port, self())
+    gw = start_gateway()
+
+    sock = connect(Gateway.port())
+    :ok = :gen_tcp.send(sock, "GET http://first.test/ HTTP/1.1\r\n\r\n")
+    assert recv_until(sock, "hello") =~ "200 OK"
+
+    assert_receive {:backend_first, first}, 1_000
+    assert first =~ "connection: close", "the app is asked to end the connection"
+
+    assert :gen_tcp.recv(sock, 0, 2_000) == {:error, :closed},
+           "the close is passed through, so the client cannot reuse the route"
+
+    :gen_tcp.close(sock)
+    Ports.release(name, root: @claim_root)
+    stop_gateway(gw)
+  end
+
+  test "origin-form keep-alive is untouched" do
+    # The direct path (`http://name:7777/`) is one origin per connection, and
+    # browsers keep it alive. The proxy fix must not start closing those.
+    {name, port} = claim_named("direct.test")
+    start_backend(port, self())
+    gw = start_gateway()
+
+    sock = connect(Gateway.port())
+    :ok = :gen_tcp.send(sock, "GET / HTTP/1.1\r\nHost: direct.test\r\n\r\n")
+    assert recv_until(sock, "hello") =~ "200 OK"
+
+    assert_receive {:backend_first, first}, 1_000
+    refute first =~ "connection: close"
+
+    # still usable: the fake echoes, so the second request comes back
+    :ok = :gen_tcp.send(sock, "GET /again HTTP/1.1\r\nHost: direct.test\r\n\r\n")
+    assert recv_until(sock, "/again") =~ "/again"
+
+    :gen_tcp.close(sock)
+    Ports.release(name, root: @claim_root)
+    stop_gateway(gw)
+  end
+
   test "a request with no Host is refused, and a claimed-but-dead port is a 502" do
     {name, backend_port} = claim_named("dead.test")
     gw = start_gateway()
@@ -264,22 +337,43 @@ defmodule BeamLisp.DaemonNamesTest do
 
   test "the port-80 probe answers for a gateway, and only for a gateway" do
     # `fronted_on?/1` asks a question about EVIDENCE, so the test answers it
-    # with real sockets: a server that identifies itself the way the gateway
-    # does, one that does not, and a port where nothing is listening at all.
+    # with real sockets. The helper is ONE-SHOT — one accept, one reply — so
+    # each server here gets exactly one probe: asking twice would be answered
+    # by the closed listener, not by the server, and would fail a probe that is
+    # working.
     ours =
       start_socket_server(fn ->
         "HTTP/1.1 404 Not Found\r\nx-bl-gateway: beam-lisp\r\ncontent-length: 0\r\n\r\n"
       end)
 
-    assert Gateway.ours_on?(ours)
+    assert Gateway.answer_on?(ours) == :ours
+
+    ours_again =
+      start_socket_server(fn ->
+        "HTTP/1.1 404 Not Found\r\nx-bl-gateway: beam-lisp\r\ncontent-length: 0\r\n\r\n"
+      end)
+
+    assert Gateway.ours_on?(ours_again)
 
     theirs =
       start_socket_server(fn ->
         "HTTP/1.1 200 OK\r\nserver: nginx\r\ncontent-length: 0\r\n\r\n"
       end)
 
-    refute Gateway.ours_on?(theirs)
-    refute Gateway.ours_on?(free_port()), "a refused connection is not us"
+    assert Gateway.answer_on?(theirs) == :other
+
+    # A server that accepts and then says nothing at all is still somebody's
+    # port: `:other`, never `:closed`. The two are different facts about the
+    # machine, and the sentence that follows port 80 tells them apart.
+    silent = start_socket_server(fn -> Process.sleep(2_000) && "" end)
+
+    assert Gateway.answer_on?(silent, 200) == :other
+
+    # A port nothing listens on is nobody's, and the refusal is not an error.
+    closed = free_port()
+
+    assert Gateway.answer_on?(closed) == :closed
+    refute Gateway.ours_on?(closed), "a refused connection is not us"
 
     # the classifier behind the probe
     assert Gateway.gateway_answer?("HTTP/1.1 200 OK\r\nX-BL-Gateway: beam-lisp\r\n\r\n")
@@ -290,6 +384,40 @@ defmodule BeamLisp.DaemonNamesTest do
     # port 80 itself is a fact, not a probe: holding it IS being answered there
     assert Gateway.fronted_on?(80)
     refute Gateway.fronted_on?(nil)
+  end
+
+  test "the port-80 advice names what is actually there" do
+    # Three sentences from one probe. The middle one is the reason the probe
+    # kept its third case: when a server already holds 80, the redirect does not
+    # open a free port, it takes loopback 80 away from that server — and the
+    # tool must say so before handing over the paste, not after.
+    closed = Gateway.port_80_advice(:closed)
+    assert closed =~ "bl install redirect"
+    assert closed =~ Gateway.sysctl_command()
+    refute closed =~ "something else answers"
+
+    other = Gateway.port_80_advice(:other)
+    assert other =~ "something else answers on port 80"
+    assert other =~ "not a beam-lisp gateway"
+    assert other =~ "including requests to whatever is there now"
+
+    ours = Gateway.port_80_advice(:ours)
+    assert ours =~ "names need no port here"
+    refute ours =~ "root steps"
+
+    # The default asks the machine — so assert it AGREES with the machine
+    # rather than with whatever state this suite happens to run in. A test that
+    # asserted ":closed" here would fail the moment the developer did the thing
+    # the advice recommends.
+    state = Gateway.answer_on?(80)
+    
+    assert Gateway.port_80_advice() == Gateway.port_80_advice(state)
+
+    if state == :other do
+      assert Gateway.port_80_advice() =~ "something else answers"
+    else
+      refute Gateway.port_80_advice() =~ "something else answers"
+    end
   end
 
   test "an ephemeral gateway answers in-VM but publishes no endpoint" do
@@ -369,12 +497,19 @@ defmodule BeamLisp.DaemonNamesTest do
       {:ok, first} ->
         send(test, {:backend_first, first})
 
-        :gen_tcp.send(
-          sock,
-          "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: keep-alive\r\n\r\nhello"
-        )
+        # An app honours `connection: close`: the gateway relies on that to end a
+        # proxied connection after one response, so the fake has to as well —
+        # otherwise the test would prove the fake's behaviour, not the gateway's.
+        headers =
+          if String.contains?(String.downcase(first), "connection: close") do
+            "connection: close"
+          else
+            "connection: keep-alive"
+          end
 
-        echo(sock, test)
+        :gen_tcp.send(sock, "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n#{headers}\r\n\r\nhello")
+
+        unless headers == "connection: close", do: echo(sock, test)
 
       _ ->
         :ok

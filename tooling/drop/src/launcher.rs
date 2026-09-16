@@ -206,13 +206,26 @@ fn sweepable(
     name != keep && matches!(modified, Some(t) if t < cutoff)
 }
 
-/// Sweep version dirs past the retention window (docs §6, step 3).
+/// Sweep version dirs past the retention window (docs §6, step 3), and staging
+/// dirs on a much shorter one.
+///
+/// `<sha8>.tmp-<pid>` is what an extraction unpacks into before it publishes.
+/// One that outlives its extractor means the process died mid-unpack (a reboot,
+/// a `kill -9`), and it is ~100 MB of nothing. An extraction takes seconds, so a
+/// day-old staging dir is debris by any measure while a live one — seconds or
+/// minutes old — is never in reach.
+const TMP_KEEP_HOURS: u64 = 24;
+
 fn gc_old_versions(install: &std::path::Path, keep: &str) {
     let Some(cutoff) = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(keep_days().saturating_mul(86_400)))
     else {
         return;
     };
+
+    let tmp_cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(TMP_KEEP_HOURS * 3_600))
+        .unwrap_or(cutoff);
 
     if let Ok(rd) = std::fs::read_dir(install) {
         for d in rd.flatten() {
@@ -223,8 +236,9 @@ fn gc_old_versions(install: &std::path::Path, keep: &str) {
             }
 
             let modified = d.metadata().and_then(|m| m.modified()).ok();
+            let window = if name.contains(".tmp-") { tmp_cutoff } else { cutoff };
 
-            if sweepable(&name, keep, modified, cutoff) {
+            if sweepable(&name, keep, modified, window) {
                 let _ = std::fs::remove_dir_all(d.path());
             }
         }
@@ -545,5 +559,61 @@ mod gc_tests {
         assert!(!sweepable("current", "current", ago(400), cutoff));
         // undatable → kept, never deleted
         assert!(!sweepable("undated", "current", None, cutoff));
+    }
+
+    // ── the other half of the same failure ──────────────────────────────
+
+    /// A reboot in the middle of a first run left `<sha8>/lib` and
+    /// `<sha8>/releases` but no `bin/`. The install check reads that as "version
+    /// missing", so every run re-extracted and every run died on ENOTEMPTY —
+    /// `bl` was dead until the directory was deleted by hand. Publishing must
+    /// clear debris and take its place.
+    #[test]
+    fn publish_heals_a_half_extracted_version() {
+        let dir = scratch("debris");
+        let dest = dir.join("df3bf671");
+        let tmp = dir.join("df3bf671.tmp-1234");
+
+        // the debris: a partial tree, no bin/
+        std::fs::create_dir_all(dest.join("lib")).unwrap();
+        std::fs::write(dest.join("lib/partial.beam"), b"half").unwrap();
+        // the finished staging tree
+        std::fs::create_dir_all(tmp.join("bin")).unwrap();
+        std::fs::write(tmp.join("bin/bl"), b"#!/bin/sh\n").unwrap();
+
+        publish(&tmp, &dest).expect("debris must not be fatal");
+
+        assert!(dest.join("bin/bl").is_file(), "the complete tree is published");
+        assert!(!tmp.exists(), "the staging tree moves, not copies");
+        assert!(
+            !dest.join("lib/partial.beam").exists(),
+            "nothing from the half-extracted tree survives"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The race the original tolerated: another process published the SAME
+    /// payload while we unpacked. Losing costs our staging tree and nothing
+    /// else — never the winner's tree.
+    #[test]
+    fn publish_concedes_a_race_to_a_complete_tree() {
+        let dir = scratch("race");
+        let dest = dir.join("c94bd7eb");
+        let tmp = dir.join("c94bd7eb.tmp-4321");
+
+        std::fs::create_dir_all(dest.join("bin")).unwrap();
+        std::fs::write(dest.join("bin/bl"), b"winner\n").unwrap();
+        std::fs::create_dir_all(tmp.join("bin")).unwrap();
+        std::fs::write(tmp.join("bin/bl"), b"loser\n").unwrap();
+
+        publish(&tmp, &dest).expect("losing the race is not failure");
+
+        assert_eq!(
+            std::fs::read(dest.join("bin/bl")).unwrap(),
+            b"winner\n",
+            "the published tree is left exactly as the winner wrote it"
+        );
+        assert!(!tmp.exists(), "the loser's staging tree is cleaned up");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

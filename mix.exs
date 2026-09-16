@@ -97,6 +97,11 @@ defmodule BeamLisp.MixProject do
   defp deps do
     [
       {:tidewave, "~> 0.5", only: :dev},
+      # x509 builds the local certificate authority behind `https://name/`. OTP
+      # can parse and VERIFY X.509 but has no API to generate it, and `bl` mints
+      # its own chain rather than shelling out to openssl or mkcert. Pure Elixir
+      # over `:public_key`, so it ships in the release with everything else.
+      {:x509, "~> 0.9"},
       # Bandit is the HTTP server behind `web/serve` and therefore `bl serve`
       # (and the dev-only Tidewave playground, lib/dev/dev_server.ex). It ships
       # in the release: a drop that advertises `bl serve` must be able to run it.

@@ -211,31 +211,49 @@ defmodule BeamLisp.Daemon.Gateway do
   def fronted_on?(_port), do: ours_on?(@preferred_port)
 
   @doc """
-  True when a beam-lisp gateway answers on `port`.
+  What is on `port` right now: `:ours`, `:other`, or `:closed`.
 
-  One loopback connect and a read of the head, looking for
-  `#{@marker_header}:` — the header every page this module serves carries.
-  Fast enough to ask while printing (`bl ports` asks once per row) and honest
-  in the only sense that matters: the answer describes what a client gets.
+  One loopback connect and, when something answers, a read of the head looking
+  for `#{@marker_header}:` — the header every page this module serves carries.
+
+  Three answers, because the two ways of being *not ours* are not the same
+  fact. A closed port is nobody's and can be opened for us; a port another
+  server holds is somebody's working service, and telling a developer to
+  redirect it away, without saying that the redirect would take it, would be
+  the tool lying by omission about what its own paste does.
   """
-  def ours_on?(port, timeout \\ @probe_timeout) do
+  def answer_on?(port, timeout \\ @probe_timeout) do
     case :gen_tcp.connect({127, 0, 0, 1}, port, @socket_opts, timeout) do
       {:ok, sock} ->
         answered =
           with :ok <- :gen_tcp.send(sock, @probe_request),
                {:ok, head} <- read_answer(sock, <<>>, timeout) do
-            gateway_answer?(head)
+            if gateway_answer?(head), do: :ours, else: :other
           else
-            _ -> false
+            # Accepted the connection, then said nothing we could read: there
+            # is a server there, and it is not a beam-lisp gateway.
+            _ -> :other
           end
 
         _ = :gen_tcp.close(sock)
         answered
 
       {:error, _reason} ->
-        false
+        :closed
     end
   end
+
+  @doc """
+  True when a beam-lisp gateway answers on `port` — the evidence a printed
+  address follows, and the only value the address rule needs.
+
+  One connect and at most one read, so it is fast enough to ask while printing,
+  and honest in the only sense that matters: the answer describes what a client
+  gets. `answer_on?/2` is the same probe with the third case kept, for the
+  places that must SAY what is there rather than just decide a URL.
+  """
+  def ours_on?(port, timeout \\ @probe_timeout),
+    do: answer_on?(port, timeout) == :ours
 
   @doc """
   The classifier behind the probe: did this response head come from us? A
@@ -391,22 +409,46 @@ defmodule BeamLisp.Daemon.Gateway do
   end
 
   @doc """
-  The one sentence about how port 80 gets answered — shared by the degraded
-  banner, a pinned refusal and `bl install gateway`, so the three cannot drift
-  into three different stories about the same port.
+  What to say about port #{@preferred_port} — shared by the degraded banner, a
+  pinned refusal and `bl install gateway`, so the three cannot drift into three
+  stories about the same port.
 
-  The redirect comes first because it is the smaller ask: loopback-only,
-  removable, and it changes no machine-wide policy. The sysctl is named second
-  with its cost visible (`ANY local process may bind 80-1023`), which is a
-  tradeoff a developer can weigh rather than a rule to obey.
+  Pass what the probe found (`answer_on?/1`) so the sentence follows the
+  MACHINE rather than the configuration; the default asks.
+
+  `:closed` gets the two ways, because both work and the redirect is the smaller
+  ask: loopback-only, removable, no machine-wide policy change. The sysctl is
+  named second with its cost visible (`ANY local process may bind 80-1023`),
+  which is a tradeoff a developer can weigh rather than a rule to obey.
+
+  `:other` gets a different sentence entirely, and that is the reason the third
+  case exists: with a server already there, the redirect does not open a free
+  port — it takes loopback port #{@preferred_port} away from whatever holds it,
+  and every request to it by address then lands on the gateway. Say that before
+  handing over the paste, not after.
   """
-  def port_80_advice do
-    [
-      "names need no port, which takes one of two root steps:",
-      "  bl install redirect                      (loopback only, removable — recommended)",
-      "  #{sysctl_command()}   (lets ANY local process bind 80-1023)"
-    ]
-    |> Enum.join("\n")
+  def port_80_advice(answer \\ nil) do
+    case answer || answer_on?(@preferred_port) do
+      :ours ->
+        "port #{@preferred_port} answers for a beam-lisp gateway — names need no port here"
+
+      :other ->
+        [
+          "something else answers on port #{@preferred_port}, and it is not a beam-lisp gateway.",
+          "  bl install redirect   (loopback only, removable — but it sends ALL loopback :#{@preferred_port} traffic",
+          "                         to the gateway, including requests to whatever is there now)",
+          "  #{sysctl_command()}   (lets ANY local process bind 80-1023)"
+        ]
+        |> Enum.join("\n")
+
+      _closed ->
+        [
+          "names need no port, which takes one of two root steps:",
+          "  bl install redirect                      (loopback only, removable — recommended)",
+          "  #{sysctl_command()}   (lets ANY local process bind 80-1023)"
+        ]
+        |> Enum.join("\n")
+    end
   end
 
   @doc """
@@ -660,6 +702,9 @@ defmodule BeamLisp.Daemon.Gateway do
   end
 
   defp route(client, head, rest) do
+    # A proxy request first: absolute-form is legal only for a proxy, and the
+    # app is not one (see `proxy_head/1`).
+    head = proxy_head(head)
     host = host_of(head)
 
     cond do
@@ -854,6 +899,74 @@ defmodule BeamLisp.Daemon.Gateway do
 
   defp strip_scheme(url) do
     url |> String.replace_prefix("http://", "") |> String.replace_prefix("https://", "")
+  end
+
+  # A request that arrives in absolute-form (`GET http://name/path HTTP/1.1`) is a
+  # PROXY request: the client pointed its proxy setting at us and left the URL
+  # alone. Two things must happen before it can be spliced to an app.
+  #
+  # The request line is rewritten to origin-form, because the app is not a proxy,
+  # and the authority takes over from any Host header (RFC 9112 §3.2.2: in
+  # absolute-form the authority replaces it).
+  #
+  # And the connection is forced CLOSED after this response. Routing happens ONCE
+  # per connection — a splice is opaque from the first byte on — so a client that
+  # reuses one proxy connection for two names would otherwise be answered by the
+  # FIRST name's app: measured, `web.beam-lisp.test` then `nope.beam-lisp.test`
+  # on ONE connection returned 200 twice, where two fresh connections correctly
+  # return 200 then 404. Asking the app to close keeps the promise routing has
+  # already made, without teaching the gateway to parse HTTP framing.
+  defp proxy_head(head) do
+    case :binary.split(head, "\r\n") do
+      [line, rest] ->
+        case absolute_target(line) do
+          nil ->
+            head
+
+          {method, authority, path} ->
+            rest
+            |> drop_header("host")
+            |> drop_header("connection")
+            |> then(fn tail ->
+              [
+                method,
+                " ",
+                path,
+                " HTTP/1.1\r\nhost: ",
+                authority,
+                "\r\nconnection: close\r\n",
+                tail
+              ]
+            end)
+            |> IO.iodata_to_binary()
+        end
+
+      _ ->
+        head
+    end
+  end
+
+  # `GET http://name:port/path?q HTTP/1.1` → `{"GET", "name:port", "/path?q"}`.
+  # Only `http://` is rewritten: a client that wants TLS through us has to use
+  # CONNECT, and anything else is left exactly as it arrived.
+  defp absolute_target(line) do
+    with [method, target | _] <- String.split(line, " "),
+         true <- String.starts_with?(target, "http://"),
+         [authority | path] <-
+           String.split(String.replace_prefix(target, "http://", ""), "/", parts: 2) do
+      {method, authority, "/" <> Enum.join(path, "/")}
+    else
+      _ -> nil
+    end
+  end
+
+  defp drop_header(block, name) do
+    needle = String.downcase(name) <> ":"
+
+    block
+    |> String.split("\r\n")
+    |> Enum.reject(&String.starts_with?(String.downcase(&1), needle))
+    |> Enum.join("\r\n")
   end
 
   defp index_host?(host) do
