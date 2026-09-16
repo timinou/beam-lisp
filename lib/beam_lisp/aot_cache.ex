@@ -14,9 +14,9 @@ defmodule BeamLisp.AOTCache do
   Keys:
 
     * `compiler_key/0` — the TOOLCHAIN tier (FEAT-030): beam_lisp's version,
-      Elixir and OTP versions, the contents of the codegen modules' beams
-      (AOT/Emit/Link/Ns/Reader/AtomGuard/Native — NOT the Compiler
-      orchestration module, whose bytes no longer affect emitted code) and
+      Elixir and OTP versions, the SHA-256 of the codegen modules' SOURCES
+      (AOT/AtomGuard/CompilerData/Record/Emit/Link/Native — NOT the Compiler
+      orchestration module, which does not affect emitted code) and
       every source in `priv/boot/` (the self-hosted compiler, the reader
       providers, and the ambient `core`/`sugar` prelude — not the whole
       `priv/**/*.bl`). A change to a tier-1 source invalidates every beam; a
@@ -88,6 +88,35 @@ defmodule BeamLisp.AOTCache do
   # source, `priv/boot/{compiler,reader}.bl`, is already hashed as a tier-1
   # toolchain source below). Hashing the facades would rotate the key on a mere
   # doc/plumbing edit that cannot change a single emitted byte.
+  # The Elixir modules whose SOURCES affect emitted code, so a change to any of
+  # them must rotate `compiler_key/0` (invalidate every AOT beam). These are the
+  # genuine codegen host: AOT driver, atom guard, the emitter, linker, native
+  # bridge.
+  #
+  # SOURCES, NOT BEAMS — and that distinction is the whole of BUG-048. This list
+  # used to be hashed as `:code.get_object_code/1` bytes, and those bytes are
+  # written by TWO compilers in the same tree: `bin/bl`'s cold path compiles
+  # `lib/**/*.ex` with `elixirc`, and `bl build`'s substrate stage compiles the
+  # same files in process. Same source, different `debug_info`/metadata bytes,
+  # different key — measured: every one of these modules had a different md5
+  # after each compiler ran, with `lib/beam_lisp/*.ex` untouched. So the key was
+  # a property of the compiler that LAST WROTE the beams rather than of the
+  # toolchain, and it moved under beams that were stamped with the previous one:
+  # the drift gate called them stale while the emitter called them current, no
+  # re-emission happened, the gate routed the namespace to the source path, and
+  # that path needs the reader to read the reader —
+  # `undefined var: reader/delimiters`. A drop built from such a checkout was
+  # born stale for the same reason.
+  #
+  # A source digest is compiler-independent, which is what a toolchain key has
+  # always claimed to be. For an image that ships no `.ex` (a release drop) the
+  # digest is read from `priv/codegen.sources`, baked by the checkout whenever it
+  # computes the key — see `codegen_part/0`.
+  #
+  # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
+  # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
+  # is produced, so it contributed nothing to the key in every image while
+  # implying it was covered.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
@@ -95,8 +124,7 @@ defmodule BeamLisp.AOTCache do
     BeamLisp.Record,
     BeamLisp.Emit,
     BeamLisp.Link,
-    BeamLisp.Native,
-    BeamLisp.Ns
+    BeamLisp.Native
   ]
 
   @doc "Whether the cache participates in compilation. Default on."
@@ -269,21 +297,7 @@ defmodule BeamLisp.AOTCache do
       "aot_backend:#{aot_backend()}"
     ]
 
-    beams =
-      Enum.flat_map(@codegen_modules, fn mod ->
-        # `:code.get_object_code/1` answers the module's bytes wherever the
-        # code server found them — a real ebin OR an escript archive. Reading
-        # `:code.which/1`'s path with `File.read` fails inside an escript (the
-        # path is virtual), which silently dropped every codegen beam from the
-        # key, so a packaged `bl` computed a DIFFERENT key from the build that
-        # stamped its beams and treated its whole stdlib as stale — 80s boots
-        # from source, or a refusal under BEAM_LISP_AOT_STRICT. Degrade (never
-        # crash) when a module is genuinely absent.
-        case :code.get_object_code(mod) do
-          {^mod, bin, _path} -> [bin]
-          _ -> []
-        end
-      end)
+    codegen = codegen_part()
 
     # TIER-1 sources: the self-hosted compiler, the reader providers, and the
     # ambient prelude — the whole `priv/boot/` tier. A change to ANY of
@@ -297,7 +311,153 @@ defmodule BeamLisp.AOTCache do
     # runs from `Bootstrap.install!/1` BEFORE `BeamLisp.init/0`.
     toolchain_sources = toolchain_source_contents()
 
-    hash_parts(parts ++ beams ++ toolchain_sources)
+    hash_parts(parts ++ codegen ++ toolchain_sources)
+  end
+
+  # --- the codegen contribution (BUG-048) ---
+
+  # The codegen host's contribution to the toolchain key, as a LIST of hash
+  # parts (the legacy branch splices in several binaries, exactly as it did).
+  #
+  # Three images, three answers, and the ORDER is the soundness argument:
+  #
+  #   live sources present -> hash them, and BAKE the digest for images that ship
+  #                           none. A checkout is authoritative: an edit under
+  #                           `lib/` must rotate the key, or the drift gate would
+  #                           accept beams produced by a different codegen.
+  #   baked digest present -> a release drop. It carries no `.ex`, so the digest
+  #                           its packing checkout wrote is the only
+  #                           compiler-independent answer — and it is the SAME
+  #                           value that checkout computes, which is what makes a
+  #                           drop built FROM a checkout boot instead of being
+  #                           born stale.
+  #   neither              -> beam BYTES, the pre-BUG-048 rule, kept so drops
+  #                           built before `priv/codegen.sources` existed still
+  #                           compute the key their beams were stamped with.
+  #                           Without this branch every such drop would treat its
+  #                           whole stdlib as stale (80s source boots).
+  defp codegen_part do
+    case live_codegen_digest() do
+      {:ok, digest} ->
+        bake_codegen_digest(digest)
+        ["codegen-source:#{digest}"]
+
+      :error ->
+        case baked_codegen_digest() do
+          {:ok, digest} -> ["codegen-source:#{digest}"]
+          :error -> legacy_codegen_beam_bytes()
+        end
+    end
+  end
+
+  # sha256 over the codegen modules' source files, each named by its module so a
+  # rename or a reordering cannot collide. `:error` when ANY source is missing: a
+  # partial answer would describe a different toolchain than the one running.
+  defp live_codegen_digest do
+    parts =
+      Enum.reduce_while(@codegen_modules, [], fn mod, acc ->
+        case File.read(codegen_source_path(mod)) do
+          {:ok, bytes} -> {:cont, [Atom.to_string(mod), bytes | acc]}
+          _ -> {:halt, :missing}
+        end
+      end)
+
+    case parts do
+      :missing -> :error
+      parts -> {:ok, hash_parts(["codegen" | Enum.reverse(parts)])}
+    end
+  end
+
+  # `lib/beam_lisp/atom_guard.ex` for `BeamLisp.AtomGuard` — derived from the
+  # module name rather than listed beside it, so a module added to
+  # `@codegen_modules` cannot be silently uncovered. Nil when no candidate root
+  # has it, which is what a release drop looks like (`:error` upstream).
+  defp codegen_source_path(mod) do
+    name = Enum.map_join(Module.split(mod), "/", &Macro.underscore/1) <> ".ex"
+    Enum.find_value(codegen_source_roots(), fn root -> File.exists?(Path.join(root, name)) && Path.join(root, name) end) ||
+      Path.join(hd(codegen_source_roots()), name)
+  end
+
+  # Where the codegen `.ex` sources live, in order of authority:
+  #
+  #   1. the source tree THIS MODULE WAS COMPILED FROM. Authoritative for a
+  #      checkout, and the reason `Tiers.priv_root/0` cannot be used here: with
+  #      the app-shaped image (`.bl/lib/beam_lisp-0.1.0/{ebin,priv}`) that a
+  #      launcher builds, `priv_root/0` answers the IMAGE's priv, whose parent
+  #      holds no `lib/` at all — measured: the digest came out `:error` and the
+  #      key silently fell back to the legacy beam-bytes rule, which is the very
+  #      instability BUG-048 is about.
+  #   2. `lib/` beside the app's `priv/` — a checkout laid out as an OTP app.
+  #
+  # A release drop has neither: `__DIR__` names the PACKING machine's tree (the
+  # path rides in debug_info), which on that machine may still exist. That reads
+  # as "live sources" for a drop packed and run on the same box, and it is
+  # harmless: the drop then hashes the sources it was built from — the key its
+  # beams carry — and if that tree changed since packing, the drop merely re-emits
+  # its own payload's tiers. It never accepts a beam from another toolchain, which
+  # is the property the key exists for.
+  defp codegen_source_roots do
+    [Path.expand("../../lib", __DIR__), Path.join(Path.dirname(BeamLisp.Tiers.priv_root()), "lib")]
+  end
+
+  # Where the digest is baked, for images that ship no `.ex`. Beside the tiers in
+  # `priv/` because assembling a drop copies `priv/` wholesale.
+  defp baked_codegen_sources_path do
+    Path.join(BeamLisp.Tiers.priv_root(), "codegen.sources")
+  end
+
+  defp baked_codegen_digest do
+    with {:ok, text} <- File.read(baked_codegen_sources_path()),
+         digest when is_binary(digest) <- text |> String.split("\n") |> List.first(),
+         true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) do
+      {:ok, digest}
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  # Best-effort and atomic. This runs inside key computation, which is reached
+  # from boot paths that must never fail on a cache: a read-only image ignores
+  # the failure (it already carries the file, or it is a checkout that will try
+  # again on the next command).
+  defp bake_codegen_digest(digest) do
+    path = baked_codegen_sources_path()
+
+    current =
+      case File.read(path) do
+        {:ok, text} -> String.trim(text)
+        _ -> nil
+      end
+
+    if current != digest do
+      tmp = "#{path}.tmp-#{System.unique_integer([:positive])}"
+      File.write!(tmp, digest <> "\n")
+      File.rename!(tmp, path)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # The pre-BUG-048 rule, kept verbatim for images built under it.
+  defp legacy_codegen_beam_bytes do
+    Enum.flat_map(@codegen_modules, fn mod ->
+      # `:code.get_object_code/1` answers the module's bytes wherever the
+      # code server found them — a real ebin OR an escript archive. Reading
+      # `:code.which/1`'s path with `File.read` fails inside an escript (the
+      # path is virtual), which silently dropped every codegen beam from the
+      # key, so a packaged `bl` computed a DIFFERENT key from the build that
+      # stamped its beams and treated its whole stdlib as stale — 80s boots
+      # from source, or a refusal under BEAM_LISP_AOT_STRICT. Degrade (never
+      # crash) when a module is genuinely absent.
+      case :code.get_object_code(mod) do
+        {^mod, bin, _path} -> [bin]
+        _ -> []
+      end
+    end)
   end
 
   # Content of every tier-1 source: everything under `priv/boot/`, sorted by
