@@ -138,7 +138,7 @@ defmodule BeamLisp.BuildTask do
     # A consuming app must not receive its own copy of the bootstrap floor:
     # that copy can shadow a newer compiler already built in the dependency.
     compiler_path =
-      if Mix.Project.config()[:app] == :beam_lisp do
+      if language_tree?(mix_project()[:app], source_dirs) do
         BeamLisp.AOT.default_output_dir()
       else
         case :code.lib_dir(:beam_lisp) do
@@ -198,7 +198,7 @@ defmodule BeamLisp.BuildTask do
   end
 
   defp source_dirs_from_config do
-    project_config = Mix.Project.config()[:beam_lisp] || []
+    project_config = mix_project()[:beam_lisp] || []
 
     configured =
       project_config[:source_dirs] || project_config[:source_dir] ||
@@ -206,6 +206,35 @@ defmodule BeamLisp.BuildTask do
         Application.get_env(:beam_lisp, :source_dir, "bl")
 
     List.wrap(configured)
+  end
+
+  # A Mix PROJECT is loaded exactly when Mix's project stack is running — which
+  # is the guard Mix's own code uses, and the only one that is TRUE.
+  #
+  # `Code.ensure_loaded?(Mix)` is not the question and never was: Mix ships with
+  # Elixir, so it is loadable in every VM a checkout runs — while
+  # `Mix.Project.config/0` then EXITS with `GenServer.call(Mix.ProjectStack, …):
+  # no process`. Measured in a plain `elixir` VM, which is where `bl build` and
+  # CI run. With `mix.exs` deleted there is no project stack in this repository
+  # at all, so this answers `[]` and every caller falls through to its declared
+  # default.
+  defp mix_project do
+    if Process.whereis(Mix.ProjectStack), do: Mix.Project.config(), else: []
+  end
+
+  # Whether the tree being built IS the language, rather than an application that
+  # depends on it.
+  #
+  # Mix answered this from the project config (`[:app] == :beam_lisp`). With no
+  # Mix project the question is put to the TREE, where the answer lives anyway:
+  # only the language's own checkout carries the codegen sources, and a consumer
+  # application that happens to be named `beam_lisp` would still have no boot
+  # tier to install. Getting this wrong is not cosmetic — the `else` branch
+  # installs the floor into the DEPENDENCY's ebin instead of the tree's, and the
+  # comment below records what that protects against.
+  defp language_tree?(app, source_dirs) do
+    app == :beam_lisp or
+      Enum.any?(List.wrap(source_dirs), fn d -> File.exists?(Path.join(d, "compiler.bl")) end)
   end
 
   # `GenServer.stop/1` rather than `Process.exit/2`: these servers own ETS
@@ -219,11 +248,13 @@ defmodule BeamLisp.BuildTask do
     :exit, _ -> :ok
   end
 
-  # Where this build keeps its state. Under Mix that is Mix's manifest directory;
-  # standalone it sits beside the output directory, because after W10 there is no
-  # Mix to ask and a build's state still has to live where the build can find it.
+  # Where this build keeps its state: beside the output directory. It used to be
+  # Mix's manifest directory when a Mix project was loaded; with no Mix project
+  # there is nothing to ask, and a build's state still has to live where the
+  # build can find it (the `Process.whereis` guard, not `ensure_loaded?`, is what
+  # makes that question answerable — see `mix_project/0`).
   defp manifest_dir do
-    if Code.ensure_loaded?(Mix) and function_exported?(Mix.Project, :manifest_path, 0) do
+    if Process.whereis(Mix.ProjectStack) do
       Mix.Project.manifest_path()
     else
       Path.join(BeamLisp.AOT.default_output_dir(), ".beam_lisp")

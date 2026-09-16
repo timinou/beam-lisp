@@ -61,6 +61,32 @@ defmodule BeamLisp.Bootstrap do
     ebin = to_string(compile_path)
     File.mkdir_p!(ebin)
 
+    # THE APP RESOURCE FIRST — before the key is judged below, and the order is
+    # load-bearing rather than tidy.
+    #
+    # `AOTCache.compiler_key/0` folds in the application's VSN, read through
+    # `:application.load(:beam_lisp)`. On a checkout that has never been built
+    # there is no `.app` yet, so the key was computed with `vsn: "unknown"`,
+    # NEVER matched the floor, and every fresh clone staged the seed — the path
+    # that leaves the codegen tier unrebuildable (BUG-048). Installing the
+    # floor's app resource first makes the key this tree's real key, so
+    # `key_matches?` can answer yes on a clean checkout.
+    #
+    # A floor is a bootstrap, not a correction: installed only when the
+    # destination has NONE, so a tree that ran `bl build` (which writes the
+    # tree's own `.app`, derived from the current project value) keeps its own.
+    case manifest["app"] do
+      %{"file" => file, "sha256" => want} ->
+        src = Path.join(seed_dir, file)
+        dst = Path.join(ebin, file)
+        verify_seed_file!(src, file, want)
+        unless File.exists?(dst), do: File.cp!(src, dst)
+
+      _ ->
+        :ok
+    end
+
+
     # The seed is a bootstrap FLOOR, not a mandate. Install it only when its
     # `compiler_key` matches this toolchain: a matching seed is a pre-built,
     # trustworthy `compiler` beam that lets a genesis-less tree boot with no
@@ -100,6 +126,7 @@ defmodule BeamLisp.Bootstrap do
       verify_seed_file!(src, name, want_sha)
       maybe_install_one(src, Path.join(ebin, name), want_sha, expected_key(name))
     end)
+
 
     # Make the code server SEE the just-installed beams immediately. The build
     # boots in THIS VM; a module the code server already resolved to

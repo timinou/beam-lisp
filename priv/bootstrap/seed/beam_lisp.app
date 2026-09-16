@@ -1,0 +1,9 @@
+{application,beam_lisp,
+             [{description,[]},
+              {vsn,"0.1.0"},
+              {modules,[]},
+              {registered,[]},
+              {applications,[kernel,stdlib,elixir,logger,ssh,x509,bandit,
+                             websock_adapter,file_system,explorer,req,
+                             aws_signature]},
+              {mod,{'Elixir.BeamLisp.Application',[]}}]}.

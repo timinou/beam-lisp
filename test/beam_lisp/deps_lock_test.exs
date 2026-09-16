@@ -17,11 +17,14 @@ defmodule BeamLisp.DepsLockTest do
   against the wrong field is how the fetcher came to refuse all 47 real packages
   while its own suite stayed green. So this test compares field 8.
 
-  When `mix.lock` is eventually deleted (the toolchain does not need it; the
-  dependency PROVISIONING path still does — 44 of the 47 packages build with
-  `mix`, 3 with `rebar3`, so a Mix-free fetch-and-compile is its own piece of
-  work), this test stops comparing and starts asserting that `bl.lock` is the
-  only truth and is still whole.
+  `mix.lock` has since been DELETED, so this test is now the only thing standing
+  behind the lock: it asserts that `bl.lock` is the whole truth — the resolved
+  closure, not a sample, with a version and a 64-hex tarball digest per entry.
+  The comparison branch stays for a tree that still carries a `mix.lock`, and it
+  earned its place: the conversion DID drift once, by exactly one package
+  (`x509`, added to `mix.lock` by the merge that gave `bl` its local CA), and the
+  compare is what named it. A lock that is merely *plausible* is a lie about what
+  a build installs.
   """
   use ExUnit.Case, async: true
 
