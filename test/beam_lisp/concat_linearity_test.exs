@@ -106,5 +106,26 @@ defmodule BeamLisp.ConcatLinearityTest do
     test "the lazy tail is still reached once the head is exhausted" do
       assert eval("(vec (take 4 (concat [1 2] (range))))") == Vector.new([1, 2, 0, 1])
     end
+
+    test "a first seq whose length is an exact chunk multiple keeps the rest" do
+      # Regression: `concat_chunk` returned an EMPTY chunk when the first seq
+      # exhausted exactly at the 32-element chunk boundary, and `chain([], …)`
+      # is nil — so every later seq was silently DROPPED. `(concat v32 [:x])`
+      # answered `(0 … 31)` with `:x` gone. Exercise each boundary multiple.
+      for n <- [31, 32, 33, 63, 64, 65, 96, 128] do
+        got = eval("(count (to-list (concat (vec (range #{n})) [:x])))")
+        assert got == n + 1, "concat dropped the tail after a #{n}-element head"
+
+        assert eval("(contains? (set (to-list (concat (vec (range #{n})) [:x]))) :x)") ==
+                 true
+      end
+    end
+
+    test "a deep left-nested concat accumulator keeps every element" do
+      # The `(reduce (fn [a i] (concat a [i])) [] …)` shape the code indexer's
+      # per-file call accumulation uses: it truncated at 32 before the fix.
+      assert eval("(count (to-list (reduce (fn [a i] (concat a [i])) [] (range 50))))") == 50
+      assert eval("(count (to-list (reduce (fn [a i] (concat a [i])) [] (range 500))))") == 500
+    end
   end
 end

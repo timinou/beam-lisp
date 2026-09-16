@@ -285,6 +285,38 @@
           ; Float.parse, which accepted `1e3` as 1.0e3.
           (exp-float chars))))))
 
+(defn- suffixed-number
+  "Clojure's two numeric suffixes. `123.45M` / `1e3M` is an exact decimal —
+   a `BeamLisp.Decimal` value carried in the scalar node like any number.
+   `123N` is a bigint, which on the BEAM is just an integer, so the suffix is
+   dropped. nil when `chars` carries neither suffix or the body is not a
+   number; a malformed body such as `1.2.3M` raises the reader's error, not
+   a silent symbol."
+  [chars]
+  (let [n (count chars)]
+    (if (< n 2)
+      nil
+      (let [suffix (lists/last chars)
+            body (lists/sublist chars (dec n))
+            first-c (first body)
+            numeric-start? (or (and (>= first-c 48) (<= first-c 57))
+                               (and (or (= first-c 45) (= first-c 43))
+                                    (> (count body) 1)
+                                    (>= (second body) 48) (<= (second body) 57)))]
+        (cond
+          (not numeric-start?) nil
+          (= suffix 77)                                          ; M
+            (let [r (BeamLisp.Decimal/parse (chars->string body))]
+              (if (= r :error)
+                (syntax-error (str "invalid decimal literal: " (chars->string chars)))
+                (erlang/element 2 r)))
+          (= suffix 78)                                          ; N
+            (let [r (string/to_integer body)]
+              (if (and (not= (erlang/element 1 r) :error) (empty? (erlang/element 2 r)))
+                (erlang/element 1 r)
+                (syntax-error (str "invalid bigint literal: " (chars->string chars)))))
+          :else nil)))))
+
 (defn- exp-float
   "Parse an exponent float whose mantissa has no decimal point (`1e3`, `2E-4`)
    by inserting `.0` before the `e`/`E`; nil when the token is not such a float.
@@ -344,7 +376,8 @@
           (BeamLisp.AtomGuard/account! (str ":" name))
           (node :keyword name))
       (= 92 (first chars)) (character-literal token chars)
-      :else (let [number (whole-number chars)]
+      :else (let [number (let [w (whole-number chars)]
+                           (if (nil? w) (suffixed-number chars) w))]
               (if (nil? number)
                 ; A symbol likewise interns an atom downstream: account it too.
                 ; A number interns nothing, so it stays outside the guard.
@@ -568,12 +601,30 @@
 
 (defn- select-conditional
   "Walk `feat expr feat expr …` reader nodes; return the expr of the first
-   feature this platform takes. `:default` is last-resort. No match raises,
-   as in Clojure — a silent empty read would hide a branch-selection bug."
+   feature this platform takes, or `:reader-discard` when no branch matches.
+
+   `:default` is last-resort. A conditional with NO matching branch reads as
+   NOTHING, exactly as Clojure does — `[1 #?(:cljs :x) 2]` is `[1 2]` on the JVM
+   — and `.cljc` sources lean on that: a library skips its cljs require and its
+   cljs implementation this way, without an `:default` to catch it. Raising here
+   made every such file unreadable, which is a far larger surface than the one
+   branch it refused.
+
+   An ODD number of forms still raises: that is a malformed conditional, not a
+   platform decision."
   [items]
   (cond
-    (empty? items) (syntax-error "no matching reader-conditional branch")
-    (empty? (rest items)) (syntax-error "reader conditional has an odd number of forms")
+    (empty? items) :reader-discard
+    (empty? (rest items))
+      ; A dangling feature with no expr. Malformed only when it is the feature
+      ; WE would take — the JVM reader errors on `[#?(:clj)]` ("read-cond
+      ; requires an even number of forms") but reads `[#?(:cljs)]` as nothing,
+      ; where there is simply no branch to take. Verified against both).
+      (let [feat (first items)]
+        (if (and (keyword-node? feat)
+                 (feature-selected? (second (erlang/tuple_to_list feat))))
+          (syntax-error "reader conditional has an odd number of forms")
+          :reader-discard))
     :else
       (let [feat (first items) expr (second items)]
         (if-not (keyword-node? feat) (syntax-error "reader conditional feature must be a keyword") (if (feature-selected? (second (erlang/tuple_to_list feat)))
@@ -611,9 +662,15 @@
    position of the char after the `?` (i.e. the `@` or `(`)."
   [chars in-fn? pos]
   (cond
-    (and (not (empty? chars)) (= 64 (first chars)) (= 40 (second chars)))
-      (let [[items after fpos] (read-until (rest (rest chars)) 41 in-fn? (advance-pos (advance-pos pos 64) 40))]
-        [(splice-marker (select-conditional items)) after fpos])
+    (and (not (empty? chars)) (= 64 (first chars)))
+      (let [[after-at apos] (skip-pos (rest chars) (advance-pos pos 64))]
+        (if (and (not (empty? after-at)) (= 40 (first after-at)))
+          (let [[items after fpos] (read-until (rest after-at) 41 in-fn? (advance-pos apos 40))
+                selected (select-conditional items)]
+            ; a skipped `#?@` splices NOTHING — `:reader-discard` is the same
+            ; sentinel `#_` yields, so the surrounding collection drops it.
+            [(if (= selected :reader-discard) :reader-discard (splice-marker selected)) after fpos])
+          (syntax-error "reader conditional must be #?( ... ) or #?@( ... )")))
     (and (not (empty? chars)) (= 40 (first chars)))
       (let [[items after fpos] (read-until (rest chars) 41 in-fn? (advance-pos pos 40))]
         [(select-conditional items) after fpos])
@@ -709,7 +766,18 @@
                 (if (= form :reader-discard)
                   (let [[nxt npos] (skip-pos after-discard fpos)] (recur nxt npos))
                   [:reader-discard after-discard fpos])))))
-      (= 63 (first chars)) (read-reader-conditional (rest chars) in-fn? (advance-pos after-hash 63))
+      (= 63 (first chars))
+        ; Clojure's `#` dispatch skips whitespace/commas/comments between the
+        ; dispatch token and its payload, so `#? (` and `#?@ (` read exactly like
+        ; `#?(` and `#?@(` — verified against the JVM reader, which accepts both
+        ; and rejects `# (` ("Reader tag must be a symbol") and `# {`.
+        (let [[after wpos] (skip-pos (rest chars) (advance-pos after-hash 63))]
+          (read-reader-conditional after in-fn? wpos))
+      (= 39 (first chars))
+        ; `#'x` is the var-quote: it reads to `(var x)`. `var` resolves the
+        ; (possibly aliased, possibly bare) symbol to its var handle so
+        ; `alter-var-root`, `with-bindings` and friends can name a var by value.
+        (wrap-prefix (rest chars) "var" in-fn? (advance-pos after-hash 39))
       :else (read-tag chars in-fn? pos0 after-hash))))
 
 (defn- read-atom

@@ -156,6 +156,13 @@
 ; atoms; anf-list builds a LIST VALUE node (a cons chain) from a list of nodes.
 
 (def ^:private mod-erlang :erlang)
+(def ^:private mod-num (erlang/binary_to_atom "Elixir.BeamLisp.Num"))
+
+(def ^:private num-bifs
+  "BeamLisp.Num 2-arity names and the Erlang BIF each is on int/float — the
+   inline fast path `linked-call` emits ahead of the tower call."
+  {:add :+ :sub :- :mul :* :div :/
+   :lt :< :gt :> :le :"=<" :ge :>= :num_eq :==})
 (def ^:private mod-body-lower (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Body.Lower"))
 (def ^:private mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.RT"))
 (def ^:private mod-env (erlang/binary_to_atom "Elixir.BeamLisp.Env"))
@@ -329,6 +336,101 @@
       (str "module " (module-label module) " is not granted in this environment "
            "(this code runs under a capability-restricted environment)"))))
 
+(defn- java-method-name
+  "`.name` → `\"name\"` for a Java-method-shaped head: a leading `.`, not the
+   `.-` field form, not the lone `.`, and a letter after the dot."
+  [s]
+  (if (and (> (count s) 1) (= 46 (first (erlang/binary_to_list s))) (not= 45 (second (erlang/binary_to_list s))))
+    (subs s 1)
+    nil))
+
+(defn- java-ctor-class
+  "`Class.` (trailing dot) → the qualified class when it is imported or a
+   manifest class; nil otherwise."
+  [env s]
+  (let [n (count s)]
+    (if (and (> n 1) (= 46 (lists/last (erlang/binary_to_list s))) (uppercase-first? s))
+      (java-class-of env (subs s 0 (dec n)))
+      nil)))
+
+(defn- java-value-class
+  "A bare symbol that is an imported class, or a `java.`-spelled one, used as
+   a value; nil for anything else (a local shadows it — checked before)."
+  [env name]
+  (if (and (uppercase-first? name) (not (has-slash? name)))
+    (java-class-of env name)
+    nil))
+
+(defn- dotted-var-ref
+  "A fully-qualified DOTTED reference to a var in another namespace, JVM-class
+   style: `datalog.parser.type.Function` → `[ns \"Function\"]` when `Function` is
+   uppercase-first (a record/type name by convention), the prefix
+   `datalog.parser.type` names a loaded namespace, and that namespace binds
+   `Function`. This is how an unmodified Clojure source refers to a defrecord
+   type by its class name (`(= (type x) datalog.parser.type.Function)`); datom
+   spells the same value `datalog.parser.type/Function`, so the two are one var.
+
+   Returns `[ns var]` or nil. Only fires for a dotted, slash-free, uppercase-tail
+   symbol whose prefix is already a loaded namespace with that var — so an
+   ordinary lowercase dotted name, or a class the java manifest owns, is
+   untouched."
+  [env name]
+  (if (or (has-slash? name) (nil? (index-of name ".")))
+    nil
+    (let [parts (split-dots name)
+          tail (lists/last parts)
+          prefix (join "." (butlast parts))]
+      (if (not (uppercase-first? tail))
+        nil
+        (do (try (BeamLisp.Loader/ensure_loaded prefix) (catch e nil))
+            (if (BeamLisp.Env/bound? prefix tail) [prefix tail] nil))))))
+
+(defn- java-class-of
+  "The fully-qualified Java class a prefix names in `env`, or nil: an
+   `:import`ed short name (`BigDecimal` → `java.math.BigDecimal`) or a
+   spelled-out qualified class that the manifest knows (`java.math.BigDecimal`)."
+  [env prefix]
+  (or (let [t (BeamLisp.Env/import_target (:ns env) prefix)] (if (erlang/is_binary t) t nil))
+      ; java.lang is imported everywhere in Clojure without a clause. The
+      ; names are a FIXED set here (not a manifest question) so the boot
+      ; compiler's own build — where the lib tier is not loadable yet — never
+      ; asks; an unlisted java.lang class simply is not Java to us.
+      (if (contains? java-lang-classes prefix) (str "java.lang." prefix) nil)
+      ; only a `java.`/`javax.`/`clojure.lang.` spelling asks the manifest —
+      ; an Elixir module (`BeamLisp.Env`) must never load the lib tier from
+      ; inside the boot compiler's own compilation.
+      (and (java-spelled? prefix)
+           (java-manifest "known-class?" (list prefix))
+           prefix)))
+
+(def ^:private java-lang-classes
+  ; `String`, `Integer`, `Float` and `System` are ELIXIR modules this language
+  ; calls into (`String/split` in core.bl); those stay host modules and their
+  ; Java spellings reach the manifest only through an explicit `:import`.
+  #{"Long" "Double" "Boolean" "Character" "Math"
+    "Throwable" "Exception" "RuntimeException" "NumberFormatException"
+    "ArithmeticException" "IllegalArgumentException" "IllegalStateException"})
+
+(defn- java-spelled?
+  [s]
+  (or (= 0 (index-of s "java.")) (= 0 (index-of s "javax.")) (= 0 (index-of s "clojure.lang."))))
+
+(defn- java-manifest
+  "Ask the interop manifest (`priv/lib/java/manifest.bl`) a question by name.
+   Loaded on first use, so a program that never touches Java pays nothing."
+  [fname args]
+  (BeamLisp.Loader/ensure_loaded "java.manifest")
+  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "java.manifest" fname) args))
+
+(defn- manifest-answer->node
+  "A manifest answer — `[:fn ns name]` or `[:lit v]` — as the ANF node that
+   yields it: a global var reference, or the constant folded in."
+  [answer]
+  (let [kind (nth answer 0)]
+    (if (= kind :lit)
+      (a/lit (nth answer 1))
+      (a/global (nth answer 1) (nth answer 2)))))
+
 (defn- slash-target
   "Decide what a qualified name `prefix/member` refers to.
 
@@ -346,6 +448,16 @@
       ; an alias or an existing beam-lisp namespace resolves to a VAR — not a
       ; host escape — so it is never capability-gated.
       (some? alias) (list :var alias member)
+      ; an IMPORTED Java class (`BigDecimal/ZERO`, `RoundingMode/HALF_EVEN`)
+      ; resolves through the interop manifest — to a beam-lisp var or a
+      ; constant — and never to a host module. A class the manifest does not
+      ; know, or a static it does not list, is refused HERE with the list.
+      (erlang/is_binary (java-class-of env prefix))
+        (let [class (java-class-of env prefix)
+              answer (java-manifest "static-target" (list class member))]
+          (if (nil? answer)
+            (compile-error env (java-manifest "explain-static" (list class member)))
+            (list :java answer)))
       ; an UPPERCASE prefix is an Elixir host module; a lowercase unknown prefix
       ; is an Erlang host module. Both are remote calls into the host, so they
       ; pass through the compile-time capability gate before resolving.
@@ -414,14 +526,32 @@
     (local? env name)
       (let [lv (local-var env name)]
         (if (erlang/is_binary lv) (a/var lv) lv))
+    ; an imported Java class as a VALUE (`(instance? BigDecimal x)`): its
+    ; beam-lisp type identity, folded in — the same value `(type x)` answers
+    (erlang/is_binary (java-value-class env name))
+      (let [class (java-value-class env name)
+            answer (java-manifest "type-target" (list class))]
+        (if (nil? answer)
+          (compile-error env (str "class " class " has no runtime type in the interop manifest"))
+          (manifest-answer->node answer)))
     (has-slash? name)
       (let [tgt (slash-target env name)]
-        (if (= :remote (first tgt))
+        (cond
+          ; a Java static/constant through the manifest: the var or the literal
+          (= :java (first tgt)) (manifest-answer->node (second tgt))
+          (= :remote (first tgt))
           ; Module/fun as a VALUE: a runtime remote-function reference
           (a/remote mod-rt :remote_fun (list (a/lit (second tgt)) (a/lit (nth tgt 2))))
+          :else
           ; a var in another namespace: refuse a private one, else a reference
           (do (reject-private! env (second tgt) (nth tgt 2))
               (a/global (second tgt) (nth tgt 2)))))
+    ; a dotted class-name reference to a record/type in another ns
+    ; (`datalog.parser.type.Function`): the same var as `…/Function`
+    (some? (dotted-var-ref env name))
+      (let [ref (dotted-var-ref env name)]
+        (reject-private! env (first ref) (second ref))
+        (a/global (first ref) (second ref)))
     :else
       (a/global (:ns env) name)))
 
@@ -477,14 +607,47 @@
    loops fast. `link-info` is what `BeamLisp.Env/link` returned: a
    `{module, arity=>function-name map, variadic-or-nil}` triple. Returns the
    direct-call tree, or nil when the arity does not match (so the caller falls
-   back to the general path)."
-  [link-info arg-nodes]
+   back to the general path).
+
+   SELF-HOSTING LADDER: the 2-arity stays. Every `defn` here is `Link.defvar`'d
+   while the PREVIOUS generation of this very namespace is still driving the
+   compile, and defvar rebuilds the `BeamLisp.Ns.Compiler` shim from the defs
+   seen so far — so a boot fn the running compiler calls mid-unit may GAIN an
+   arity but must never lose one, or gen-N's `compile-call` finds its
+   `linked-call/2` gone from the shim before gen-N+1 exists."
+  ([link-info arg-nodes] (linked-call link-info arg-nodes nil))
+  ([link-info arg-nodes env]
   (let [parts (erlang/tuple_to_list link-info)
         mod (first parts)
         fixed (second parts)
         variadic (nth parts 2)
         arity (count arg-nodes)]
     (cond
+      ; the numeric tower: a 2-arity link into BeamLisp.Num compiles to the
+      ; raw BIF unless an operand is a map (a decimal is a struct), in which
+      ; case the tower is called. So int/float keep the BIF's speed AND its
+      ; frames (`:erlang.+/2` on top of an ArithmeticError, the user's frame
+      ; right under it — a tail call into Num would drop that frame), and
+      ; only a struct operand pays for the dispatch. The call's own source
+      ; position is stamped on the BIF call: the outer wrapper's position
+      ; lands on the `let` scaffold, which lowering does not carry into the
+      ; line table, and the frame the user reads is the BIF's.
+      (and (= mod mod-num) (= 2 arity) (contains? fixed arity)
+           (contains? num-bifs (get fixed arity)))
+        (let [fname (get fixed arity)
+              bif (get num-bifs fname)
+              a (fresh-var "na")
+              b (fresh-var "nb")
+              line (if (erlang/is_map env) (:line env) nil)
+              file (if (erlang/is_map env) (:file env) nil)
+              at (fn [node] (if (erlang/is_integer line) (with-ann node {:line line :file file} file) node))]
+          (a/lett a (first arg-nodes)
+            (a/lett b (second arg-nodes)
+              (a/iff (a/iff (a/remote mod-erlang :is_map (list (a/var a)))
+                            (a/lit true)
+                            (a/remote mod-erlang :is_map (list (a/var b))))
+                     (at (a/remote mod fname (list (a/var a) (a/var b))))
+                     (at (a/remote mod-erlang bif (list (a/var a) (a/var b))))))))
       ; a fixed arity match: Module.fname(args)
       (contains? fixed arity)
         (let [fname (get fixed arity)]
@@ -501,7 +664,7 @@
           ; collect the trailing args into one list literal: f(a1..amin, [rest...])
           (a/remote mod fname
                     (apply list (concat fixed-args (list (anf-list rest-args))))))
-      :else nil)))
+      :else nil))))
 
 (defn- core-qualified
   "Map `clojure.core/x` to `core/x`, leaving every other name unchanged.
@@ -655,9 +818,18 @@
       ; (Module/fun args), (alias/var args), or (ns/var args)
       (and (= tag :symbol) (has-slash? (rn/node-name head)))
         (let [tgt (slash-target env (rn/node-name head))]
-          (if (= :remote (first tgt))
+          (cond
+            ; `(BigDecimal/valueOf x)`: call the manifest's fn; a constant
+            ; in call position is the literal-head error it would be anywhere
+            (= :java (first tgt))
+              (let [answer (second tgt)]
+                (if (= :lit (first answer))
+                  (compile-error env (BeamLisp.RT/call_shape_error (second answer) (count args)) (first items))
+                  (anf-invoke (manifest-answer->node answer) arg-nodes)))
+            (= :remote (first tgt))
             ; a host-module call: Module.fun(args) directly
             (a/remote (second tgt) (nth tgt 2) arg-nodes)
+            :else
             ; a var in another namespace: refuse a private one FIRST (before the
             ; linked direct-call shortcut, which bypasses the fetch path), then
             ; use the linked direct call when it is a linked defn, else invoke
@@ -666,8 +838,32 @@
               (reject-private! env tns tvar)
               (let [link (BeamLisp.Env/link tns tvar)]
                 (or (and (not= link :error)
-                         (linked-call (second (erlang/tuple_to_list link)) arg-nodes))
+                         (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
                     (anf-invoke (a/global tns tvar) arg-nodes))))))
+
+      ; (.method recv args…) — a Java instance method through the manifest.
+      ; Keyed by method NAME (a call site names no class); the target is a
+      ; beam-lisp fn called as `(f recv args…)`. Checked BEFORE the deftype
+      ; field branch so `(.add a b)` is decimal addition, while a name the
+      ; manifest does not list falls through: with one arg it is the field
+      ; read it always was; with more it is an error naming the method.
+      (and (= tag :symbol) (java-method-name (rn/node-name head))
+           (not (empty? args))
+           (or (some? (java-manifest "method-target" (list (java-method-name (rn/node-name head)))))
+               (not= 1 (count args))))
+        (let [mname (java-method-name (rn/node-name head))
+              answer (java-manifest "method-target" (list mname))]
+          (if (some? answer)
+            (anf-invoke (manifest-answer->node answer) arg-nodes)
+            (compile-error env (java-manifest "explain-method" (list mname)))))
+
+      ; (Class. args…) — a Java constructor through the manifest.
+      (and (= tag :symbol) (java-ctor-class env (rn/node-name head)))
+        (let [class (java-ctor-class env (rn/node-name head))
+              answer (java-manifest "ctor-target" (list class))]
+          (if (nil? answer)
+            (compile-error env (str "class " class " has no constructor in the interop manifest"))
+            (anf-invoke (manifest-answer->node answer) arg-nodes)))
 
       ; deftype field access: `(.-x obj)` and `(.x obj)` both read field `x`
       ; off a deftype instance. Records have no field surface (keyword lookup
@@ -695,7 +891,7 @@
             (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))
                   local-node (compile-symbol name env)
                   direct (and (not= link :error)
-                              (linked-call (second (erlang/tuple_to_list link)) arg-nodes))]
+                              (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))]
               (if direct
                 (a/iff (a/remote mod-rt :invocable? (list local-node (a/lit (count arg-nodes))))
                        (anf-invoke local-node arg-nodes)
@@ -703,7 +899,7 @@
                 (anf-invoke local-node arg-nodes)))
             (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))]
               (or (and (not= link :error)
-                       (linked-call (second (erlang/tuple_to_list link)) arg-nodes))
+                       (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
                   (anf-invoke (compile-symbol name env) arg-nodes)))))
 
       ; (expr args) with a compound head — compile it, then call it
@@ -720,7 +916,7 @@
   #{"ns" "if" "do" "throw" "try" "receive" "quote" "syntax-quote" "def" "defn" "defn-" "defmacro"
     "defmulti" "defmethod" "defprotocol" "extend-type" "extend-protocol" "satisfies?"
     "defrecord" "deftype" "reify" "defnative" "defserver"
-    "let" "let*" "loop" "loop*" "fn" "fn*" "recur"})
+    "let" "let*" "loop" "loop*" "fn" "fn*" "recur" "var"})
 
 (defn- compile-body
   "Compile body forms into one bl-ANF node (a single form, or a :do)."
@@ -928,6 +1124,20 @@
   [pair]
   (second (erlang/tuple_to_list pair)))
 
+(defn- keys-directive?
+  "Whether a keyword name is a `:keys` directive — bare `keys`, or namespaced
+   `some.ns/keys` (Clojure's namespaced-keys destructuring)."
+  [kw-name]
+  (or (= "keys" kw-name)
+      (let [i (last-index-of kw-name "/")]
+        (and (some? i) (= "keys" (subs kw-name (inc i)))))))
+
+(defn- directive-namespace
+  "The namespace part of a `some.ns/keys` directive, or nil for a bare `keys`."
+  [kw-name]
+  (let [i (last-index-of kw-name "/")]
+    (if (nil? i) nil (subs kw-name 0 i))))
+
 (defn- destructure-map
   "Expand a map pattern against `whole-ast`.
 
@@ -954,17 +1164,24 @@
         (let [k (rn/node-form (kv-key pair))
               v (kv-val pair)]
           (cond
-            ; :keys [a b] — bind each symbol to its keyword key
-            (and (= :keyword (rn/node-tag k)) (= "keys" (rn/node-name k)))
-              (reduce (fn [a2 sym]
-                        (let [name (rn/node-name (rn/node-form sym))
-                              default (get ors name)
-                              default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
-                              r (destructure-symbol name
-                                   (rt-get-node whole-var (erlang/binary_to_atom name) default-node)
-                                   (:env a2))]
-                          {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
-                      acc (rn/node-items (rn/node-form v)))
+            ; :keys [a b] — bind each symbol to its keyword key. A NAMESPACED
+            ; `:some.ns/keys [a b]` binds `a` to the namespaced key `:some.ns/a`
+            ; (Clojure's namespaced-keys destructuring, e.g. kontor's
+            ; `{:kontor.ledger/keys [type]}` → local `type` from `:kontor.ledger/type`).
+            ; The local name stays bare; only the lookup key carries the namespace.
+            (and (= :keyword (rn/node-tag k)) (keys-directive? (rn/node-name k)))
+              (let [kw-ns (directive-namespace (rn/node-name k))]
+                (reduce (fn [a2 sym]
+                          (let [name (rn/node-name (rn/node-form sym))
+                                key-atom (erlang/binary_to_atom
+                                           (if (nil? kw-ns) name (str kw-ns "/" name)))
+                                default (get ors name)
+                                default-node (if (nil? default) (a/lit nil) (compile-node default (:env a2)))
+                                r (destructure-symbol name
+                                     (rt-get-node whole-var key-atom default-node)
+                                     (:env a2))]
+                            {:steps (concat (:steps a2) (:steps r)) :env (:env r)}))
+                        acc (rn/node-items (rn/node-form v))))
             ; :strs [s t] — like :keys, but the lookup key is the STRING of
             ; each name (`{:strs [a]}` reads key "a"), not the keyword.
             (and (= :keyword (rn/node-tag k)) (= "strs" (rn/node-name k)))
@@ -1333,21 +1550,53 @@
         first-node (rn/node-form (second items))
         first-tag (rn/node-tag first-node)]
     (if-not (= :symbol first-tag) (compile-error env (str "catch requires a variable or Module.Name, got a " (rn/node-tag first-node))) (let [name (rn/node-name first-node)]
-        (if (uppercase-first? name)
+        ; a typed catch: `Module.Name`, or a Java class spelled in full
+        ; (`java.io.IOException`) which is lowercase-first but a class
+        (if (or (uppercase-first? name) (java-spelled? name))
           ; typed: (catch Module.Name e handler…)
           (let [rest-items (rest (rest items))
                 e-name (rn/node-name (rn/node-form (first rest-items)))
                 handler-forms (rest rest-items)
+                ; A JAVA exception class (`Exception`, `Throwable`,
+                ; `NumberFormatException`, an imported one) goes through the
+                ; interop manifest: `:any` is the untyped catch, a module atom
+                ; is a struct match, `[:ex-info type]` matches an ExInfo by its
+                ; `:type`. Only when the manifest does not know the name is it
+                ; an Elixir module, as before. A name that LOOKS Java
+                ; (imported, or `java.`/`clojure.lang.`-qualified) but is not in
+                ; the table is refused with the table's list.
+                imported (let [t (BeamLisp.Env/import_target (:ns env) name)] (if (erlang/is_binary t) t nil))
+                java-ish? (or (some? imported) (java-spelled? name)
+                              (contains? #{"Exception" "Throwable" "RuntimeException" "ExceptionInfo"
+                                           "NumberFormatException" "ArithmeticException"
+                                           "IllegalArgumentException"} name))
+                jmatch (if java-ish? (java-manifest "exception-match" (list (or imported name))) nil)
+                _ (when (and java-ish? (nil? jmatch))
+                    (compile-error env (java-manifest "explain-exception" (list (or imported name)))))
                 ; the module the type names, as its BEAM atom
-                mod-atom (module-atom name)
+                mod-atom (cond
+                           (nil? jmatch) (module-atom name)
+                           (erlang/is_atom jmatch) jmatch
+                           :else nil)
+                struct-test (fn [m]
+                              (anf-and2 (anf-and2 (a/remote mod-erlang :is_map (list (a/var e-var)))
+                                                  (a/remote mod-erlang :is_map_key (list (a/lit :__struct__) (a/var e-var))))
+                                        (a/remote mod-erlang (erlang/binary_to_atom "=:=")
+                                                  (list (a/remote mod-erlang :map_get (list (a/lit :__struct__) (a/var e-var)))
+                                                        (a/lit m)))))
                 ; `is_struct(e, Mod)` is a Kernel guard, not an :erlang BIF, so
                 ; build its expansion directly: e is a map whose :__struct__ is
                 ; exactly Mod. `and` lowers as the if-chain the normaliser uses.
-                test (anf-and2 (anf-and2 (a/remote mod-erlang :is_map (list (a/var e-var)))
-                                         (a/remote mod-erlang :is_map_key (list (a/lit :__struct__) (a/var e-var))))
-                               (a/remote mod-erlang (erlang/binary_to_atom "=:=")
-                                         (list (a/remote mod-erlang :map_get (list (a/lit :__struct__) (a/var e-var)))
-                                               (a/lit mod-atom))))
+                test (cond
+                       (= jmatch :any) (a/lit true)
+                       (some? mod-atom) (struct-test mod-atom)
+                       ; [:ex-info type]: an ExInfo whose data carries :type
+                       :else (anf-and2 (struct-test (erlang/binary_to_atom "Elixir.BeamLisp.ExInfo"))
+                                       (a/remote mod-erlang (erlang/binary_to_atom "=:=")
+                                                 (list (a/remote mod-rt :get
+                                                                 (list (a/remote (erlang/binary_to_atom "Elixir.BeamLisp.ExInfo") :ex_data (list (a/var e-var)))
+                                                                       (a/lit :type) (a/lit nil)))
+                                                       (a/lit (second jmatch))))))
                 handler (catch-handler-node e-name handler-forms e-var env)]
             (a/clause (list test) nil handler))
           ; untyped: (catch e handler…)
@@ -1543,6 +1792,25 @@
   [form]
   (a/lit (datum form)))
 
+(defn- compile-var
+  "Turn `(var sym)` — the `#'sym` var-quote — into the var HANDLE `[ns name]`, the
+   same 2-vector `alter-var-root`/`bound?`/`resolve` accept. The symbol resolves
+   exactly as a value reference would: an alias or namespace prefix through
+   `slash-target` (`dq/built-ins` → `[\"datahike.query\" \"built-ins\"]`), a bare
+   name against the current namespace. A var-quote NAMES a var; it does not read
+   its value, so this never fetches."
+  [form env]
+  (let [handle (fn [ns nm]
+                 (a/structt mod-vector
+                            (list [(a/lit :items) (a/tup (list (a/lit ns) (a/lit nm)))])))
+        name (rn/node-name form)]
+    (if (has-slash? name)
+      (let [tgt (slash-target env name)]
+        (if (= :var (first tgt))
+          (handle (second tgt) (nth tgt 2))
+          (compile-error env (str "var: " name " does not name a beam-lisp var"))))
+      (handle (:ns env) name))))
+
 ; ── guards ────────────────────────────────────────────────────────────────────
 ;
 ; A clause can carry a `:when` guard — a test the BEAM checks BEFORE running
@@ -1623,6 +1891,9 @@
       (= tag :guard_nil) (erl-call :erlang (erlang/binary_to_atom "=:=") (list x (a/lit nil)))
       (= tag :guard_some) (erl-call :erlang (erlang/binary_to_atom "=/=") (list x (a/lit nil)))
       (= tag :guard_true) (erl-call :erlang (erlang/binary_to_atom "=:=") (list x (a/lit true)))
+      ; A guard cannot call the numeric tower, so a decimal is not positive
+      ; in a guard; the function forms (`RT.pos?` → `Num.pos?`) agree by being
+      ; the same term comparison, and a decimal there dispatches by struct.
       (= tag :guard_zero) (erl-call :erlang :== (list x (a/lit 0)))
       (= tag :guard_pos) (erl-call :erlang :> (list x (a/lit 0)))
       (= tag :guard_neg) (erl-call :erlang :< (list x (a/lit 0)))
@@ -2710,6 +2981,26 @@
 ; that declares the namespace, enters it, runs the requires, installs aliases
 ; and refers, and returns the namespace name as an atom.
 
+(defn- ns-clauses
+  "The `(ns …)` clause forms, with the namespace DOCSTRING dropped.
+
+   The reader hands a bare string back as a SCALAR node — not a tuple, no
+   `:keyword` head — so `(ns app \"…\" (:require [x]))` would otherwise reach the
+   clause walker as a string, and walking it as a list ends inside the host with
+   a raw argument error instead of a located diagnostic. Clojure keeps that
+   string as the namespace's `:doc` and does not treat it as a clause; dropping
+   it here is the same reading.
+
+   A FINITE list, built eagerly: a compiler collection must be finite data, and
+   `remove` returns a lazy seq no layer below the runtime can walk."
+  [clauses]
+  (reduce (fn [kept clause]
+            (if (= :scalar (rn/node-tag (rn/node-form clause)))
+              kept
+              (conj kept clause)))
+          (list)
+          clauses))
+
 (defn- parse-require-spec
   "Parse one :require spec into [target as-alias refer]. A bare symbol is just a
    target; a vector `[target :as a :refer [x y]]` carries an alias and/or refer
@@ -2741,24 +3032,104 @@
                          nil)
                 :else (compile-error env (str "invalid :require spec for " target))))))))))
 
+(defn- ns-clause-head
+  "The keyword naming an `(ns …)` clause — `\"require\"`, `\"import\"`,
+   `\"refer-clojure\"` — or nil for a clause that does not start with one."
+  [clause]
+  (let [head (rn/node-form (first (rn/node-items (rn/node-form clause))))]
+    (if (= :keyword (rn/node-tag head)) (rn/node-name head) nil)))
+
+(defn- clause-specs
+  "Every spec of every clause headed by `kw`, in source order."
+  [kw clauses]
+  (mapcat (fn [clause]
+            (if (= kw (ns-clause-head clause))
+              (rest (rn/node-items (rn/node-form clause)))
+              (list)))
+          clauses))
+
+(defn- parse-import-spec
+  "One `:import` spec as a finite list of `[short qualified]` pairs. Clojure
+   allows `[java.math BigDecimal RoundingMode]` (a package then class names),
+   `(java.util Date)` (same, as a list) and a bare `java.util.Date` symbol."
+  [spec env]
+  (let [f (rn/node-form spec)
+        tag (rn/node-tag f)]
+    (cond
+      (= tag :symbol)
+        (let [q (rn/node-name f)
+              i (last-index-of q ".")]
+          (if (nil? i)
+            (compile-error env (str "invalid :import spec " q " (a bare class must be package-qualified)"))
+            (list (list (subs q (inc i)) q))))
+      (or (= tag :vector) (= tag :list))
+        (let [items (rn/node-items f)
+              pkg (rn/node-name (rn/node-form (first items)))]
+          (if (empty? (rest items))
+            (compile-error env (str "invalid :import spec [" pkg "] (no class names)"))
+            (apply list
+              (map (fn [c]
+                     (let [short (rn/node-name (rn/node-form c))]
+                       (list short (str pkg "." short))))
+                   (rest items)))))
+      :else (compile-error env "invalid :import spec"))))
+
+(defn- parse-refer-clojure
+  "The names an `(:refer-clojure :exclude [a b])` clause excludes. Only
+   `:exclude` is meaningful here — beam-lisp resolves a same-ns def before
+   core already — so `:only`/`:rename` are refused rather than silently
+   accepted with different semantics."
+  [specs env]
+  (loop [fs specs names (list) expect nil]
+    (if (empty? fs)
+      names
+      (let [x (rn/node-form (first fs))
+            tag (rn/node-tag x)]
+        (cond
+          (and (= tag :keyword) (= "exclude" (rn/node-name x)))
+            (recur (rest fs) names :exclude)
+          (= tag :keyword)
+            (compile-error env (str ":refer-clojure supports only :exclude, got :" (rn/node-name x)))
+          (and (= expect :exclude) (= tag :vector))
+            (recur (rest fs)
+                   (concat names (map (fn [s] (rn/node-name (rn/node-form s))) (rn/node-items x)))
+                   nil)
+          :else (compile-error env "invalid :refer-clojure clause"))))))
+
 (defn- compile-ns
   "Compile (ns name clauses...) into the block that declares and enters the
-   namespace and processes its :require clauses.
+   namespace and processes its :require, :import and :refer-clojure clauses.
 
    Emits: bind `ns` = name, declare it, enter it, load each required target,
-   install aliases and refers, and return the namespace as an atom. The
-   namespace is declared BEFORE requiring so a circular require finds it
-   present."
+   install aliases and refers, record class imports and core excludes, and
+   return the namespace as an atom. The namespace is declared BEFORE requiring
+   so a circular require finds it present.
+
+   `:import` records `short → pkg.Class` on the namespace (`Env.add_import`)
+   and loads nothing: which classes exist is the interop manifest's question,
+   asked where the class is USED. `:refer-clojure :exclude` is recorded and
+   otherwise a no-op — a same-ns def already shadows core here."
   [name-form clauses env]
   (let [name (rn/node-name (rn/node-form name-form))
-        ; gather all :require specs across the clauses
-        specs (mapcat (fn [clause]
-                        (let [items (rn/node-items (rn/node-form clause))
-                              head (rn/node-form (first items))]
-                          (if (and (= :keyword (rn/node-tag head)) (= "require" (rn/node-name head)))
-                            (rest items)
-                            (compile-error env "ns supports only :require clauses"))))
-                      clauses)
+        clauses (ns-clauses clauses)
+        _ (reduce (fn [_ c]
+                    (let [h (ns-clause-head c)]
+                      (if (or (= h "require") (= h "import") (= h "refer-clojure"))
+                        nil
+                        (compile-error env (str "ns supports :require, :import and :refer-clojure clauses"
+                                                (if (nil? h) "" (str ", got :" h)))))))
+                  nil clauses)
+        specs (clause-specs "require" clauses)
+        imports (apply concat (map (fn [s] (parse-import-spec s env)) (clause-specs "import" clauses)))
+        import-ops (apply list
+                     (map (fn [p] (a/remote mod-env :add_import
+                                            (list (a/lit name) (a/lit (first p)) (a/lit (second p)))))
+                          imports))
+        excludes (parse-refer-clojure (clause-specs "refer-clojure" clauses) env)
+        exclude-ops (if (empty? excludes)
+                      (list)
+                      (list (a/remote mod-env :add_core_excludes
+                                      (list (a/lit name) (a/lit (apply list excludes))))))
         parsed (map (fn [s] (parse-require-spec s env)) specs)
         loads (apply list
                 (map (fn [p] (a/remote mod-loader :ensure_loaded (list (a/lit (first p)))))
@@ -2803,6 +3174,8 @@
                              loads
                              aliases
                              refers
+                             import-ops
+                             exclude-ops
                              (list (a/remote (erlang/binary_to_atom "Elixir.String") :to_atom
                                              (list nsvar)))))))))
 
@@ -3215,7 +3588,22 @@
             (erlang/is_binary (rn/node-form (first after-attr)))
               (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
             :else nil)
-        mod (BeamLisp.Link/module_for (:ns env))
+        ; A defn nested inside a scope that BINDS locals (a top-level
+        ; `(let [x …] (defn f … x))`, as an unmodified Clojure source writes a
+        ; closed-over helper) cannot become a top-level linked module fn: the
+        ; link's body is a bare BEAM function and cannot see `x`. Clojure's own
+        ; answer is that this `defn` is `(def f (fn … x))`, whose value CLOSES
+        ; over the let. So when `env` has locals in scope, compile the clauses as
+        ; an fn VALUE (which captures) and intern it under the name — the exact
+        ; `def`-of-`fn` path, closure and all. A top-level defn (no locals) keeps
+        ; the fast linked path unchanged.
+        nested? (not (empty? (:locals env)))]
+    (if nested?
+      (compile-def (cons (first args)
+                         (concat (if has-doc (list (first rest-args)) (list))
+                                 (list (rn/list-node (cons (rn/sym-node "fn") after-attr)))))
+                   env)
+  (let [mod (BeamLisp.Link/module_for (:ns env))
         clauses (parse-fn-clauses after-attr env)
         ; PRE-LINK before compiling the clauses. A non-tail self-reference in
         ; a body — `(bind …)` inside `bind`, or `mplus` calling `bind` calling
@@ -3249,7 +3637,7 @@
               (a/doo (list (a/remote mod-env :put_meta
                                      (list (a/lit (:ns env)) (a/lit name)
                                            (a/lit meta)))
-                           (a/var "value")))))))
+                           (a/var "value")))))))))
 
 (defn- compile-special
   "Compile a special form by name."
@@ -3262,6 +3650,7 @@
     (= head "try") (compile-try args env)
     (= head "receive") (compile-receive args env)
     (= head "quote") (compile-quote (first args))
+    (= head "var") (compile-var (first args) env)
     (= head "syntax-quote") (compile-syntax-quote (first args) env)
     (= head "ns") (compile-ns (first args) (rest args) env)
     (= head "def") (compile-def args env)
@@ -3573,8 +3962,13 @@
               ; thread this form's source position (:line/:file) onto the env so
               ; every step below can name the user's file and line in an error
               penv (pos-env env m)
+              ; `:tag` is a TYPE HINT (`^BigDecimal x`, `^String s`): advice to
+              ; a JVM compiler, never data on the value. Dropped here, like the
+              ; position keys, so a hint naming a class this language does not
+              ; have is not compiled as an expression and does not survive as
+              ; metadata that a `=` on the value would then see.
               author (if (erlang/is_map m)
-                       (maps/without (list :line :col :file :end-line :end-col) m)
+                       (maps/without (list :line :col :file :end-line :end-col :tag) m)
                        {})
               inner-node (with-ann (compile-node inner penv) m (:file penv))]
           (if (or (not (erlang/is_map author)) (zero? (erlang/map_size author)))

@@ -167,6 +167,38 @@ defmodule BeamLisp.ReloadWatcherTest do
     save_until(p, doc.(":second"), fn -> safe_eval("(w.doc/v)") == :second end)
     assert safe_eval("(w.doc/v)") == :second
   end
+  # The Clojure twin: a `.clj` save is the same kind of event, and the file
+  # arrives wearing the two conventions a Clojure library uses — a dashed
+  # namespace that munges to an underscore file name, and a namespace docstring.
+  # The watcher stages it through the same seam as any other source, so a
+  # `.clj` file in a watched tree is live-editable like a beam-lisp one.
+  test "a saved .clj file updates the running image through the same seam", %{dir: dir} do
+    src = fn v ->
+      """
+      (ns w.clj-sourced
+        "A docstring the reload path must survive too.")
+
+      (defn v [] #{v})
+      """
+    end
+
+    {:ok, _} = ReloadWatcher.start_link(dirs: [dir], name: :wtest_clj)
+    on_exit(fn -> stop(:wtest_clj) end)
+    await_watching()
+
+    # The munged file name, not the dashed namespace: `w.clj-sourced` lives at
+    # `w_clj_sourced.clj`, exactly as it would in any Clojure tree.
+    p = Path.join(dir, "w_clj_sourced.clj")
+    File.write!(p, src.(":first"))
+
+    save_until(p, src.(":first"), fn -> safe_eval("(w.clj-sourced/v)") == :first end)
+    assert safe_eval("(w.clj-sourced/v)") == :first
+
+    # edit the source → the running fn changes, no restart
+    save_until(p, src.(":second"), fn -> safe_eval("(w.clj-sourced/v)") == :second end)
+    assert safe_eval("(w.clj-sourced/v)") == :second
+  end
+
 
   # NB the RELOAD CONTRACT the watcher wraps — a change applies, an incoherent
   # change is held with the old code serving, successive changes land in order,

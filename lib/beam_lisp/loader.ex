@@ -296,8 +296,24 @@ defmodule BeamLisp.Loader do
   # is EVALUATED (not required) into its fork, so its defs, its tests,
   # and its shadows (a fork-local `(ns relay.ratelimit) (defn …)` beats
   # the global var on that fork's chain) stay private.
+  # A `.clj`/`.cljc` source is written against clojure.core, not against the
+  # prelude: `defonce`, `format`, `hash`, `re-find`, `str/…` and the rest are
+  # unqualified there. The compat tier interns those into `core` when it loads,
+  # so a Clojure source is preceded by it — once per VM (each is an ordinary
+  # namespace load; a second require is a lookup). A `.bl` file pays nothing.
+  @clojure_prelude ~w(clojure.core-ext clojure.core-more clojure.re)
+
+  defp clojure_prelude!(path) do
+    if Path.extname(path) in [".clj", ".cljc"] do
+      for ns <- @clojure_prelude, do: ensure_loaded(ns)
+    end
+
+    :ok
+  end
+
   defp do_load(ns, path, content) do
     prev_ns = Env.current_ns()
+    clojure_prelude!(path)
 
     try do
       with_load_path(Path.dirname(path), fn ->
@@ -346,9 +362,61 @@ defmodule BeamLisp.Loader do
       end
   end
 
-  @doc_extensions [".bl", ".bl.md", ".bl.org"]
+  # The source extensions the loader resolves, in order. A plain `.bl` (and its
+  # literate twins `.bl.md` / `.bl.org`) is beam-lisp's own source and shadows
+  # any Clojure file that declares the same namespace. `.clj` then `.cljc`
+  # follow, in the order JVM Clojure resolves them, so a library shipping both
+  # hands the loader the same file it hands the JVM. `.cljs` is deliberately
+  # absent: its contents are ClojureScript, and this platform presents as
+  # `:clj`, so the branch a `.cljs` file would take is not the one its author
+  # wrote.
+  @doc_extensions [".bl", ".bl.md", ".bl.org", ".clj", ".cljc"]
 
-  # Search the load paths for a regular `<ns>.bl` whose declared ns
+  # Extensions whose bytes ARE the program. Every other extension the loader
+  # recognises is a literate document whose code cells are extracted first.
+  @plain_extensions [".bl", ".clj", ".cljc"]
+
+  @doc """
+  The relative source paths a namespace may live at, in resolution order.
+
+  Two spellings, because two conventions meet here. A dotted ns maps onto
+  directories (`.`, the only rule beam-lisp itself ever needed). A dash inside
+  a segment maps onto an underscore — Clojure's munging, which every Clojure
+  library on disk relies on: the ns `kontor.tax.corporate-income-tax` lives at
+  `kontor/tax/corporate_income_tax.clj`, never at the dashed spelling. The
+  literal spelling is tried first, so a beam-lisp tree that named a file
+  `a-b.bl` keeps resolving, and an underscore-named Clojure file becomes
+  reachable for the first time.
+  """
+  def source_relatives(ns) do
+    base = String.replace(ns, ".", "/")
+    munged = base |> String.split("/") |> Enum.map(&String.replace(&1, "-", "_")) |> Enum.join("/")
+
+    names = if munged == base, do: [base], else: [base, munged]
+
+    for name <- names, ext <- @doc_extensions, do: name <> ext
+  end
+
+  @doc """
+  The path a namespace loads from over the load path, or nil.
+
+  The one place the ns-to-file rule is decided, so a caller that needs the file a
+  namespace lives in asks here instead of rebuilding the string. One caller still
+  does not: `verify` in `priv/lib/system/core.bl` walks the cwd and the load path
+  stack for its own `<ns>.bl` relative path, so it sees neither a `.clj`/`.cljc`
+  file nor a munged name. That is a known difference, not a claimed one —
+  `require`, which is what runs code, goes through here.
+  """
+  def source_path(ns) do
+    Enum.find_value(search_dirs(), fn dir ->
+      Enum.find_value(source_relatives(ns), fn rel ->
+        path = Path.join(dir, rel)
+        if File.regular?(path), do: path
+      end)
+    end)
+  end
+
+  # Search the load paths for a regular source file whose declared ns
   # matches. Returns {:ok, path, content} for the first matching file;
   # else the first same-named file whose declared ns differs (so the
   # error can name both); else nil when no file exists at all. A
@@ -358,21 +426,19 @@ defmodule BeamLisp.Loader do
   # the require. The matching file's content is returned to avoid
   # reading it twice: once for the ns check, once for the load.
   defp find_file(ns) do
-    base = String.replace(ns, ".", "/")
-
     Enum.reduce(search_dirs(), nil, fn dir, acc ->
       case acc do
         {:ok, _, _} ->
           acc
 
         _ ->
-          Enum.reduce(@doc_extensions, acc, fn ext, acc ->
+          Enum.reduce(source_relatives(ns), acc, fn rel, acc ->
             case acc do
               {:ok, _, _} ->
                 acc
 
               _ ->
-                path = Path.join(dir, base <> ext)
+                path = Path.join(dir, rel)
 
                 if File.regular?(path) do
                   raw = File.read!(path)
@@ -408,12 +474,13 @@ defmodule BeamLisp.Loader do
   @doc "The source extensions the loader (and the build) recognise."
   def doc_extensions, do: @doc_extensions
 
-  # A document's loadable source: itself when plain .bl, else its code cells.
+  # A document's loadable source: itself when the bytes are the program (a
+  # plain `.bl`, or a Clojure `.clj`/`.cljc` source), else its code cells.
   defp doc_content(path, raw) do
-    if String.ends_with?(path, ".bl") do
-      strip_shebang(raw)
-    else
-      doc_source(raw, if(String.ends_with?(path, ".org"), do: :org, else: :md))
+    case Path.extname(path) do
+      ext when ext in @plain_extensions -> strip_shebang(raw)
+      ".org" -> doc_source(raw, :org)
+      _ -> doc_source(raw, :md)
     end
   end
 

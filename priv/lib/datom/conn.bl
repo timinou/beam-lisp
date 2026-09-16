@@ -174,6 +174,24 @@
 
 (def REGISTRY :datom-conn-registry)
 
+(def GUARD-REGISTRY :datom-guard-registry)
+
+(defn- guard-registry
+  "The process-wide map from a store key to its transaction GUARDS: a map
+   `{store-key {guard-name pred}}` where each `pred` is `(fn [report] -> nil |
+   problems)`. A guard runs in the writer over the fully-resolved speculative
+   report BEFORE the real commit; a non-nil result aborts the transaction.
+   Named like the connection registry so the lookup is race-safe."
+  []
+  (let [existing (erlang/whereis GUARD-REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(->tuple-2 :name GUARD-REGISTRY)]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
 (defn- registry
   "The process-wide map from a store to its writer and basis.
 
@@ -605,6 +623,111 @@
   [conn]
   (deref (:schema conn)))
 
+(def BRANCH-REGISTRY :datom-branch-registry)
+
+(defn- branch-registry
+  "The process-wide map from a branch NAME to its overlay store: `{name store}`.
+   A branch is a long-lived copy-on-write overlay over another store — a named,
+   speculative what-if database. Named like the connection registry so the
+   lookup is race-safe."
+  []
+  (let [existing (erlang/whereis BRANCH-REGISTRY)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(->tuple-2 :name BRANCH-REGISTRY)]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+(defn branch!
+  "Create a named copy-on-write BRANCH off `conn`'s store and register it under
+   `name`. A branch is a long-lived `store-overlay` (reads fall through to the
+   base, writes stay private), so a connection opened over it (`connect-branch`)
+   sees the base's data plus its own changes, and the base — the shared
+   template — is never touched. This is what makes per-test isolation off one
+   seeded database O(1): kontor branches a fresh book per test instead of
+   re-seeding. Branches are never merged back (a what-if is discarded, not
+   applied). Returns `name`."
+  [conn name]
+  (let [overlay (datom.store-overlay/open (:store conn))]
+    (agent-get-and-update
+      (branch-registry)
+      (fn [reg] (->tuple-2 name (assoc reg name overlay)))
+      30000)))
+
+(defn connect-branch
+  "Open a connection over the branch registered under `name`. The connection is
+   an ordinary one over the branch's overlay store, so every read and write goes
+   through the normal path — the overlay just keeps the writes private to the
+   branch. `schema-defs` are installed if the branch does not already carry
+   them. Throws when no branch is registered under `name`."
+  ([name] (connect-branch name []))
+  ([name schema-defs]
+   (let [overlay (get (Agent/get (branch-registry) (fn [m] m)) name)]
+     (if (nil? overlay)
+       (throw (ex-info "no branch registered under this name" {:branch name}))
+       (connect-with overlay schema-defs {})))))
+
+(defn- excise-in-writer
+  "Physically remove datoms from `conn`'s store — EVERY index and ALL of history
+   — for the entities/attributes named by `specs`. Each spec is `[:entity e]`
+   (all of e's datoms) or `[:attr e a]` (only e's datoms for attribute a). Runs
+   inside the writer, so it serialises against every other write. Returns the
+   count of raw datoms removed.
+
+   This is EXCISION, the deliberate hole in an append-only log: unlike
+   `:db/retractEntity`, which appends a tombstone and leaves history able to
+   reproduce the fact, this DELETES the keys, so `as-of`/`history` can no longer
+   see the datom. It exists for legal erasure (GDPR right-to-be-forgotten) and
+   for shedding data an append-only store must never have kept. `docs/trust-
+   boundary.md` documents the audit-guarantee exception this creates."
+  [conn specs]
+  (let [store (:store conn)
+        schema (deref (:schema conn))
+        ; the RAW datoms (assertions AND retractions, every tx) each spec names
+        raw (mapcat
+              (fn [spec]
+                (let [kind (get spec 0) e (get spec 1)]
+                  (if (= kind :attr)
+                    (into [] (datom.index/scan store :eavt e (get spec 2)))
+                    (into [] (datom.index/scan store :eavt e)))))
+              specs)
+        ops (into [] (mapcat (fn [d] (datom.index/delete-ops schema d)) raw))]
+    (when (seq ops) (datom.store/-commit store ops))
+    (count raw)))
+
+(defn excise!
+  "Physically remove data, returning a report `{:excised n}`. `specs` is a list
+   of `[:entity e]` / `[:attr e a]`. The removal is irreversible — the datoms
+   leave every index and all of history. datahike's `:db/purge` /
+   `:db.purge/entity` / `:db.purge/attribute` project onto this.
+
+   Excision is itself a change worth recording; the caller (or the datahike
+   shim) transacts an audit datom separately — excise! only does the deletion,
+   through the writer so it cannot race a concurrent commit."
+  [conn specs]
+  (with-writer conn (fn [] {:excised (excise-in-writer conn (into [] specs))})))
+
+(defn conn-of
+  "The connection behind a db VALUE.
+
+   A db is `{store schema basis-t …}`; the store keys the connection registry,
+   so this recovers the live conn (writer, basis atom, subscriber table, blob
+   store) for the db's store. The db's schema is a plain value, wrapped back
+   into the atom a Conn holds. Used by the datahike shim's `db-with`, whose
+   datahike signature is db-scoped while datom's `with` is conn-scoped.
+
+   Throws when the db's store has no registered connection in this VM (a db
+   value outlived its conn's release)."
+  [db]
+  (let [store (:store db)
+        cell (get (Agent/get (registry) (fn [m] m)) (store-key store))]
+    (if (nil? cell)
+      (throw (ex-info "no live connection for this db's store" {:store store}))
+      (->Conn store (atom (:schema db)) (:basis cell) (:writer cell)
+              (:subs cell) (:blobs cell)))))
+
 (defn conns
   "Every live connection cell in this VM, one map per store:
 
@@ -874,6 +997,74 @@
   [conn tx-data]
   (with-writer conn (fn [] (with-in-writer conn tx-data))))
 
+;; ── transaction guards (PLAN-115 B3) ────────────────────────────────────────
+;;
+;; A GUARD is a predicate `(fn [report] -> nil | problems)` run in the writer
+;; over the fully-resolved report — `:db-before`, `:db-after` (speculative),
+;; `:tx-datoms` — AFTER the transaction realizes but BEFORE it commits. A
+;; non-nil result aborts the commit. This is the one seam where "every committed
+;; write is validated" can be enforced without a second engine: it reuses the
+;; SAME speculative `:db-after` that `with` builds, so a guard sees exactly the
+;; database the transaction would produce, and refusing it means nothing was
+;; written. datahike's `datahike.tx-preds/register-tx-pred!` projects onto this.
+
+(defn guard!
+  "Register `pred` under `name` as a writer-run transaction guard on `conn`'s
+   store. `pred` is `(fn [report] -> nil | problems)`; a non-nil `problems`
+   aborts any transaction with `ex-info \"transaction refused\"`. Idempotent per
+   `[store name]`. Returns the store key."
+  [conn name pred]
+  (register-store-guard! (store-key (:store conn)) name pred))
+
+(defn unguard!
+  "Remove the guard registered under `name` on `conn`'s store."
+  [conn name]
+  (unregister-store-guard! (store-key (:store conn)) name))
+
+(defn register-store-guard!
+  "Register `pred` as a guard on `store-k` (the store key, or any stable
+   per-store identity a shim supplies). datahike's `register-tx-pred!` keys by a
+   store id and registers ONE predicate; passing `:default` for `name` matches
+   that single-predicate shape while `guard!` allows several by name."
+  ([store-k pred] (register-store-guard! store-k :default pred))
+  ([store-k name pred]
+   (agent-get-and-update
+     (guard-registry)
+     (fn [reg]
+       (let [cur (get reg store-k {})]
+         (->tuple-2 store-k (assoc reg store-k (assoc cur name pred)))))
+     30000)))
+
+(defn unregister-store-guard!
+  "Remove a guard on `store-k`. With no `name`, removes the `:default` one."
+  ([store-k] (unregister-store-guard! store-k :default))
+  ([store-k name]
+   (agent-get-and-update
+     (guard-registry)
+     (fn [reg]
+       (let [cur (get reg store-k {})]
+         (->tuple-2 :ok (assoc reg store-k (dissoc cur name)))))
+     30000)))
+
+(defn- guards-for
+  "The guard predicates registered on `store`, as a list, or `()`."
+  [store]
+  (let [reg (Agent/get (guard-registry) (fn [m] m))]
+    (vals (get reg (store-key store) {}))))
+
+(defn- run-guards!
+  "Run every guard on `conn`'s store over `report`. The FIRST guard whose result
+   is non-nil aborts with `ex-info \"transaction refused\"` carrying its problems;
+   all pass ⇒ nil. Called inside the writer, before the real commit."
+  [conn report]
+  (let [gs (guards-for (:store conn))]
+    (reduce (fn [_ pred]
+              (let [problems (pred report)]
+                (if (nil? problems)
+                  nil
+                  (throw (ex-info "transaction refused" {:problems problems})))))
+            nil gs)))
+
 (defn- with-in-writer
   "The body of `with`, already inside the writer process. Mirrors
    `transact-in-writer`, but commits into an overlay and advances no
@@ -923,7 +1114,11 @@
         ; runs first, on the unexpanded ops — which is correct, because
         ; neither form introduces a tempid.
         resolved (datom.tx/resolve-tempids store schema ops (fn [] (next-entity-id store)))
-        expanded (datom.tx/expand-store-ops store schema (get resolved 0))
+        expanded0 (datom.tx/expand-store-ops store schema (get resolved 0))
+        ; DERIVE tuple values (`:db.type/tuple` / `:db/tupleAttrs`) from the
+        ; components this transaction touched, and append them BEFORE validation
+        ; so composite `:db.unique/identity` is enforced on the derived tuple.
+        expanded (into expanded0 (datom.tx/derive-tuple-ops store schema expanded0))
         problems (datom.tx/validate store schema expanded)]
     (if (seq problems)
       (throw (ex-info "transaction rejected by schema" {:problems problems}))
@@ -963,7 +1158,15 @@
    a unique value, appending to the indexes — and none of it is atomic as
    a unit. It is correct because exactly one process runs it at a time."
   [conn tx-data]
-  (let [db-before (db conn)
+  (let [; Guards run over the fully-resolved report BEFORE the real commit. When
+        ; any are registered, a speculative `with` builds the exact `:db-after`
+        ; and `:tx-datoms` the transaction would produce (over an overlay that
+        ; never touches the real store), the guards inspect it, and only if they
+        ; all pass does the real pipeline run. A refusal throws before a single
+        ; datom reaches the store — the whole point of a writer-run predicate.
+        _ (when (seq (guards-for (:store conn)))
+            (run-guards! conn (with-in-writer conn tx-data)))
+        db-before (db conn)
         result (run-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before tx-data)
         tx (get result :tx)]
     ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
