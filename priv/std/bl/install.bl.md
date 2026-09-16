@@ -579,10 +579,64 @@ the corpus assembles.
      {:name "unit" :ok (= enabled "enabled")
       :detail (if (= enabled "enabled") "enabled" (str enabled " — run: bl install redirect"))}]))
 
+(defn- asset-fetch-steps
+  "Run one pinned-asset fetcher and answer install STEPS.
+
+   `bl install` is where the language says "put the thing on this machine where
+   the language looks for it", and a pinned asset — the solver, the embedding
+   weights — is exactly that. Each fetcher is its own namespace because the
+   RULES (URL, sha256 pins, destination) are data about the artifact; the verb is
+   the door. Before this existed the door was a Mix task, and the messages that
+   tell a user what to run said `mix bl.z3.fetch` — in a toolchain whose whole
+   point is that Mix is gone."
+  [ns-name dir-name]
+  (BeamLisp.Loader/ensure_loaded ns-name)
+  (let [r (BeamLisp.RT/invoke (BeamLisp.Env/fetch! ns-name "fetch!")
+                              (list {:bundle false :force false}))]
+    (if (true? (:ok? r))
+      (let [d (or (:dir r) dir-name)]
+        (if (empty? (:files r))
+          [{:name ns-name :ok true :detail (str "present — " d)}]
+          (mapv (fn [f] {:name f :ok true :detail "verified (pinned sha256)"}) (:files r))))
+      [{:name ns-name :ok false :detail (str (or (:why r) "failed") " — run: bl install " dir-name)}])))
+
+(defn- embed-check-steps
+  "The `--check` half for the embedding: present or not, WITHOUT downloading."
+  [_arg]
+  (BeamLisp.Loader/ensure_loaded "embed-asset")
+  (let [dir (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "dest-for")
+                                (list {:bundle false}))
+        ok (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetched?")
+                               (list dir))]
+    [{:name "embedding" :ok (true? ok)
+      :detail (if (true? ok) (str "present — " dir) (str "absent — run: bl install embed"))}]))
+
+(defn- z3-check-steps
+  "The `--check` half for the solver: the binary exists AND runs.
+
+   Presence alone is not the property that matters — a half-extracted or
+   wrong-architecture binary is present and useless — so the check is the smoke
+   run `mix bl.z3.fetch` used to do at the end of a fetch."
+  [_arg]
+  (let [bin (Path/join (BeamLisp.Tiers/priv_root) "z3/bin/z3")]
+    (if (not (File/exists? bin))
+      [{:name "z3" :ok false :detail "absent — run: bl install z3"}]
+      (let [r (try (System/cmd bin (list "--version")) (catch e [nil 1 (str e)]))]
+        [{:name "z3" :ok (= 0 (second r))
+          :detail (if (= 0 (second r))
+                    (str (String/trim (first r)) " — " bin)
+                    (str "present but does not run: " bin))}]))))
+
 (def targets
   {"doom" {:summary "Doom Emacs: the beamlisp module, tree-sitter grammar, init.el wiring"
            :run run-doom
            :check check-doom}
+   "z3"   {:summary "The pinned z3 solver, into priv/z3 (sha256-verified)"
+           :run (fn [_] (asset-fetch-steps "z3-asset" "z3"))
+           :check z3-check-steps}
+   "embed" {:summary "The pinned embedding weights, into the model cache (sha256-verified)"
+            :run (fn [_] (asset-fetch-steps "embed-asset" "embed"))
+            :check embed-check-steps}
    "gateway" {:summary "The name gateway: one per user, holding the port a URL may leave out"
               :run run-gateway
               :check check-gateway}

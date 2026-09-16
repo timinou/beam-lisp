@@ -87,7 +87,7 @@ defmodule BeamLisp.Z3Port do
   keeps the port for its whole life and serializes every conversation on it.
 
   The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the pinned
-  binary fetched by `mix bl.z3.fetch` — never the PATH: what proves your rules
+  binary fetched by `bl install z3` — never the PATH: what proves your rules
   is the artifact the repo pinned, not whatever a shell happens to resolve. The
   error names the remedy when it is absent.
   """
@@ -102,7 +102,7 @@ defmodule BeamLisp.Z3Port do
     """
     bundled z3 not found. Looked (in order) at:
     #{candidate_paths() |> Enum.map(&("  - " <> &1)) |> Enum.join("\n")}
-    run: mix bl.z3.fetch   (or set BEAM_LISP_Z3=/path/to/z3)\
+    run: bl install z3   (or set BEAM_LISP_Z3=/path/to/z3)\
     """
   end
 

@@ -16,7 +16,7 @@ defmodule BeamLisp.Model do
        semantic queries with no network, no Mix and no cache on the box. The
        drop is the default distribution; the weights ship inside it.
     3. `$XDG_CACHE_HOME/beam_lisp/models/<name>` — the AMBIENT cache
-       `mix bl.embed.fetch` fills by default. Shared across checkouts, worktrees
+       `bl install embed` fills by default. Shared across checkouts, worktrees
        and branches, which is the arithmetic that keeps 33 MB out of every tree:
        the model is the same bytes for every checkout and is cached rather than
        built. `priv/z3/`'s precedent (fetch per checkout, to match a pinned
@@ -75,7 +75,7 @@ defmodule BeamLisp.Model do
   @spec ambient_dir(String.t()) :: String.t()
   def ambient_dir(name), do: Path.join(root(), name)
 
-  @doc "The bundled directory for `name` — where `mix bl.embed.fetch --bundle` writes."
+  @doc "The bundled directory for `name` — where `bl install embed` writes."
   @spec bundled_dir(String.t()) :: String.t()
   def bundled_dir(name), do: Path.join(bundled_root(), name)
 

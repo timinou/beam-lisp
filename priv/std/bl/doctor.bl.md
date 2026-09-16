@@ -304,9 +304,9 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
      (fn [] (let [r (residue)]
               {:ok (empty? r)
                :detail (if (empty? r)
-                         "none"
+                         "none — no mix.exs, no mix.lock, no lib/mix, no deps/"
                          (str (join ", " r)
-                              " — kept until a locked library compiles onto the code path without Mix (FUP-050)"))})))
+                              " — Mix residue; this toolchain does not need it"))})))
 
    (probe "bl.lock" false
      (fn [] (lock-line)))
