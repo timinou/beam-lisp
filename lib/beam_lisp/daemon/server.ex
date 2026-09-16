@@ -283,6 +283,9 @@ defmodule BeamLisp.Daemon.Server do
       ui_port: (state.ui && state.ui.port) || nil,
       control_fun: fn :stop -> GenServer.cast(__MODULE__, :stop) end,
       queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end,
+      # What the worker is running, so the handshake can say "busy" before a
+      # client sends anything (the launcher's busy → cold decision).
+      executor_state_fun: fn -> BeamLisp.Daemon.Executor.state() end,
       # Self-drift: has the checkout changed under the running daemon? Compare
       # the key we booted with to the live on-disk key. If it moved, this VM is
       # stale and MUST be restarted, never trusted — hot-swapping would mix old

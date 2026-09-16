@@ -138,13 +138,19 @@ defmodule BeamLisp.Daemon.Inspect do
   end
 
   defp queue do
-    %{depth: depth()}
+    %{depth: depth(), busy: busy()}
   end
 
   defp depth do
     BeamLisp.Daemon.Executor.queue_depth()
   rescue
     _ -> 0
+  end
+
+  defp busy do
+    Map.get(BeamLisp.Daemon.Executor.state(), :busy)
+  rescue
+    _ -> nil
   end
 
   # The reload read-model, only when the language side has it loaded: asking a
@@ -287,7 +293,27 @@ defmodule BeamLisp.Daemon.Inspect do
     end)
   end
 
+  # The worker line: WHAT is running and for how long, then how many commands
+  # are ahead. An idle session says so in one line; a busy one names the command
+  # — because "queue_depth 1" without the holder is the same silence that made a
+  # parked client look like a hung one.
+  defp render_queue(%{depth: d, busy: nil}), do: "  queue_depth   #{d}"
+
+  defp render_queue(%{depth: d, busy: b}) do
+    "  running       #{render_busy(b)}\n  queue_depth   #{d}"
+  end
+
   defp render_queue(%{depth: d}), do: "  queue_depth   #{d}"
+
+  defp render_busy(%{argv: argv, cwd: cwd, since_ms: since}) when is_integer(since) do
+    age = System.monotonic_time(:millisecond) - since
+    cmd = argv |> Enum.take(4) |> Enum.join(" ")
+    "#{cmd}#{if length(argv) > 4, do: " …", else: ""}  (#{div(age, 1000)}s, cwd #{cwd})"
+  end
+
+  defp render_busy(%{argv: argv, cwd: cwd}) do
+    "#{argv |> Enum.take(4) |> Enum.join(" ")}  (cwd #{cwd})"
+  end
 
   defp render_image(nil), do: ""
 

@@ -1,0 +1,179 @@
+#+TITLE: PLAN-118 — derived artifacts are values, not places: lock-free reads, env-carrying requests, declarations that reach the transport
+#+STATE: DOING
+#+SESSION_ID: 1581b4ed0954e773
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-16T09-48-44-965Z_1581b4ed0954e773.jsonl]]
+#+CUSTOM_ID: PLAN-118-plan-118-derived-artifacts-are-values-no
+
+* Initial Message
+
+vendor librarium so someone with just `bl` and this repo can run knowledger
+
+** Thesis
+=bl= treats expensive derived artifacts as **live, locked, owned objects** — a long-lived
+VM holding a loaded image; an ETS conn assembled per process; an open fjall handle per
+analysis artifact (fjall's =open= takes an EXCLUSIVE file lock, freed only by GC). Every
+symptom we hit on 2026-09-16 follows from that one shape:
+
+#+BEGIN_EXAMPLE
+  symptom                                    shape
+  ─────────────────────────────────────────  ────────────────────────────────────────
+  bl check waits 30 min, 1m27s CPU           a reader parked on a writer's open handle
+  12m13s CPU / 15m wall in a cold clone      assembly is O(corpus) per process
+  FOO=bar bl eval → nil warm                 a request carries no environment
+  warm ≠ cold for caches/env/cassettes       the image IS the state
+  env.bl cannot say BL_DAEMON=off            the transport is chosen before env.bl
+  an app binding 4040 dies :eaddrinuse       a port as a number, not a name (PLAN-117)
+#+END_EXAMPLE
+
+The cache design is ALREADY content-addressed (=<ns>.<sha>.fjall= per source;
+=manifest.<key>.term= keyed by model + the ordered [(ns, sha)]; AOT beams stamped with a
+closure hash and a toolchain key, verified by =AOT.ensure_loaded/1='s drift gate). What is
+missing is that **nothing consumes those values as values** — reads still go through a
+writer, a lock, and an owner.
+
+** Coordinate: who owns what (2026-09-16, this tree, ≥3 live sessions)
+We do NOT touch these; the listed sessions own them and are editing them right now:
+
+| surface | owner |
+|---|---|
+| =priv/lib/system/analyze.bl=, =priv/lib/lsp.bl= (diagnostics accounting) | BUG-041 — session 157bcd97046112e7 (DOING) |
+| =priv/lib/system/linear.bl= (constructor-call checker) | BUG-054 — session 158190337cc00a7b |
+| =priv/std/reload/ward*.bl=, =priv/std/test.bl=, =priv/std/bl/test.bl.md=, =priv/std/env.bl= | BUG-052/053 + the test harness — session 158190337cc00a7b (DOING) |
+| daemon image drift → reconcile gate (warm-apply / warm-handover) | FUP-084 — session 158190337cc00a7b |
+| names instead of ports | PLAN-117 |
+
+Our surfaces: =priv/std/codebase.bl= **store/read half only** (cache-path, manifest,
+connect/read, the open path) — NOT the fact-extraction half (=index-source=, =defn-facts=,
+=walk-calls=), which is the analyzer's; =lib/beam_lisp/daemon/=*; =tooling/drop/src/daemon.rs=;
+=priv/std/bl/{daemon,doctor}.bl=; =native/datom_fjall/= (only if a read-only open is needed).
+
+** W1 — reads never block on a writer (the 30-minute hang)
+Evidence: =bl check= burned 1m27s CPU in 30m of wall clock and printed nothing; =static-check.sh=
+carries the same observation ("a build-lock wait fits in 180s"). Artifacts are
+content-addressed and byte-identical to a fresh index, so exclusivity is not a
+requirement — it is an artifact of opening the value's *place*.
+
+Change:
+1. The read path opens an artifact **non-blocking**. A lock conflict is caught, not
+   waited on.
+2. **Copy-on-read**: when the place is taken, copy the artifact directory to a temp path
+   and open THAT. Copying a value is always sound because the key is its sha; the copy is
+   deleted with the process. Order of magnitude: a directory copy (MBs) vs 30 minutes.
+3. Any remaining exclusive open gets a **lease**: bounded, owner-named (pid, tree,
+   artifact, since), and a caller that cannot take it proceeds from the copy.
+4. Never hold an artifact handle longer than the question that needed it.
+
+Acceptance: two processes read the same artifact corpus while a third writes; no wait
+exceeds ~1s; both readers answer and say which mode they used.
+
+** W2 — the request carries the caller's environment
+=Daemon.Executor= states the premise and the hole: "Env vars ARE forked per request
+(=Env.isolated=), but the global layer cannot be"; the payload is
+=%{argv, cwd, env_paths, tty}= — no env, so the daemon's env is the base and warm ≠ cold
+(=FOO=bar bl eval '(System/get_env \"FOO\")'= → nil warm, bar cold — D17's measurement).
+
+Change: the client sends its environment (or the delta plus a hash), the executor applies
+it in the worker before =bl.daemon/handle=, and =hello=/=status= report the env revision
+they will serve. Then D17's cutover (=bl serve= for servers, =BL_DAEMON=off= in the suites)
+stops being a correctness requirement and becomes a performance choice.
+
+Acceptance: =for i in $(seq 20); do FOO=$i bl eval '(System/get_env \"FOO\")'; done= with a
+warm daemon answers $i every time; the same command with =BL_DAEMON=off= answers identically.
+
+** W3 — the tree's declaration reaches the transport
+Measured: env.bl declares =BL_DAEMON=off=, =bl eval= confirms the variable is set, and the
+run still goes through =BeamLisp.Daemon.Executor= — the decision is made in the launcher
+(=tooling/drop/src/daemon.rs=) before the project env is applied, so a tree cannot opt out.
+
+Change: the launcher reads the tree's =env.bl= (=:env=, and a top-level =:daemon= key if we
+add one) before choosing warm vs cold, and honours =BL_DAEMON=off= exactly as the shell
+prefix does.
+
+Acceptance: with a daemon warm, a tree whose env.bl says =BL_DAEMON=off= runs cold; remove
+the declaration and it goes warm again. Same tree, same command, one line of env.bl.
+
+** W4 — say what is happening (the observability that would have saved this debugging)
+=bl daemon status= and =bl doctor= must report: warm vs cold for THIS invocation; the
+daemon's boot id and the fingerprint it is serving (env.bl hash + toolchain key); the
+artifacts it holds leases on; and the drift class (none | tree | toolchain) — the last one
+overlapping FUP-084, whose *application* half we do not implement here.
+
+Acceptance: one command answers "why did this run differ?" without =ps=, =ss=, =/proc= or a
+stack trace.
+
+** Measurement protocol (after only — no before numbers)
+Everything below is measured on this machine, this tree, with the commands written out:
+1. =bl check= on a real corpus with a writer holding an artifact → wall time, max wait.
+2. Two concurrent readers + one writer on the same corpus → both complete; report the mode
+   each used (shared copy vs direct).
+3. Warm/cold environment equality (20 iterations, mixed values).
+4. =env.bl= =BL_DAEMON=off= honoured with a warm daemon (cold-run evidence).
+5. =bl doctor= / =bl daemon status= output, verbatim.
+6. The suites that must not regress: =bl test test/bl/=, =bl check priv/lib priv/std=.
+
+** Non-goals
+- Not routing daemon drift through =reload.reconcile= (FUP-084 owns it; we only *report*
+  the drift class).
+- Not the diagnostics-accounting leak (BUG-041) or the linear checker (BUG-054).
+- Not the test-runner stale-seed gate (BUG-052).
+- Not port naming (PLAN-117).
+- No change to the fact-extraction half of =codebase.bl=.
+
+NOTE [2026-09-16]: ROOT CAUSE CORRECTED, by measurement (session 1581b4ed0954e773, 2026-09-16, same hour). The lock story I wrote into W1 is FALSIFIED — two processes may hold the same fjall artifact open at once:
+
+#+BEGIN_EXAMPLE
+  $ bl eval '(datom.store-fjall/open "/tmp/lockprobe.fjall")' &   # holds it 40s
+  $ bl eval '(datom.store-fjall/open "/tmp/lockprobe.fjall")'     # → open ok=true
+#+END_EXAMPLE
+
+and there is no lock file anywhere (`find . ~/.cache/beam_lisp -name '*.lock'` → only `bl.lock`, the dependency lock). So artifacts are not the blocker.
+
+THE ACTUAL MECHANISM — the daemon's FIFO, reproduced in 20 seconds in a scratch tree:
+
+#+BEGIN_EXAMPLE
+  $ bl daemon start                       # warm for /tmp/fifo-tree
+  $ bl run src/t/sleeper.bl &             # sleeps 120s ON THE SINGLE WORKER
+  $ bl run src/t/q.bl                     # prints one line … parked, 0 output
+  wall=20295ms   (hit a 20s timeout; it would wait the full 120s)
+#+END_EXAMPLE
+
+`Daemon.Executor.run/run_reload/run_capture` are `GenServer.call(…, :infinity)` on ONE worker, so a client waits behind whatever the daemon is running — with no output, no holder, no bound. That is exactly the shape of my 28-minute `bl check` (1m27s CPU in 30m wall) and of the durability anomaly: the tree had a warm daemon (pid 1887472) doing another session's work, and every command I ran queued behind it silently. A park is indistinguishable from a hang, which is why it cost hours.
+
+REVISED W1 — a busy daemon never parks a caller:
+1. The EXECUTOR publishes what it is doing (public ETS row, the same pattern IndexWorker already uses for progress): in-flight argv, cwd, started-at, queue depth. Idle is a state, not an absence.
+2. The `hello`/status reply carries it (the launcher already has a hello TIMEOUT and a "daemon unusable → cold exec" path — daemon.rs:365-408). Extend the DECISION, not the protocol: **busy → cold-exec**, with one line saying why ("daemon busy with `bl run …` (42s) — running cold"). Semantically identical to "no daemon running", which is the launcher's default, so no new semantics appear.
+3. A caller that genuinely wants the daemon's image may ask to queue (`--queue`), and then it gets a heartbeat naming the holder and a bounded wait — never silence.
+4. `bl daemon status` / `bl doctor` render the same row (who is running what, since when, how many are waiting).
+
+Artifacts stay as they are: content-addressed, freshly re-openable, no lock to negotiate. The plan's thesis survives (a value that can be re-opened by anyone is why the artifact path is *not* the problem) — what fails is treating a single worker's *turn* as something a caller can only wait for.
+
+NOTE [2026-09-16]: IMPLEMENTED AND MEASURED, 2026-09-16 (session 1581b4ed0954e773). After-only numbers, as asked; each one is a command you can re-run.
+
+WHAT LANDED (files)
+- lib/beam_lisp/daemon/executor.ex — the worker PUBLISHES its state as data in a public ETS row (`:bl_executor_state`): `%{busy: nil | %{argv, cwd, since_ms}, queued: n}` where queued = in-flight + mailbox. `queue_depth/0` reads that row instead of returning a counter nothing incremented (`state.active` was always 0 — the reason a busy daemon looked idle). `state/0` never calls the worker.
+- lib/beam_lisp/daemon/listener.ex — the hello `ready` meta carries `busy` (flattened: the running command or nil; `queue_depth` is its own key, and the age is sent as `age_ms` because a monotonic stamp is meaningless in another OS process); a request that arrives when the worker is busy gets an `accepted` frame with its queue position.
+- lib/beam_lisp/daemon/server.ex — ctx wires `executor_state_fun`.
+- lib/beam_lisp/daemon/inspect.ex — the read-model and `bl daemon status` render `running <cmd> (Ns, cwd …)` + `queue_depth N` (never a queue without a holder).
+- lib/beam_lisp/daemon/protocol.ex — `:request` accepts an optional `env` map (bounded: 1024 names, 64 KiB/name) and passes it through.
+- lib/beam_lisp/daemon/executor.ex — a request's `env` is applied INSIDE the per-request `Env.isolated` fork, faithfully (the caller's vars are put, vars the caller did not have are deleted, minus the daemon's own runtime: BL_BIN, BL_DAEMON_ROOT, XDG_*, HOME, TMPDIR).
+- tooling/drop/src/daemon.rs — `Attach::Busy{argv, age_ms, queued}`; the busy decision is made BEFORE the request is sent (so a cold exec is still allowed and no side effect can double-run); `daemon_mode/1` (Off|Auto|Queue) reads the CALLER's `BL_DAEMON` first and then the tree's own `env.bl` declaration (a bounded scan for `"BL_DAEMON"`, only accepting off/auto/queue — prose cannot become policy); request frames now carry the caller's environment (bounded); `accepted` is handled (prints the queue position) and `heartbeat`/`watch` remain liveness-only.
+- tooling/drop/src/launcher.rs — the transport decision uses `daemon_mode(root)` (the tree's declaration now reaches it); `Attach::Busy` prints WHICH command is running and how long, then runs cold, never autostarting a second daemon.
+- test/bl/daemon/executor_state_test.bl — 13 assertions: the row is readable as data without queueing behind the work, busy carries argv+cwd+since, and `queued` counts what is ahead.
+- tooling/drop/src/daemon.rs (tests) — 3 new unit tests (20 total): the tree's declaration is honoured and the shell wins; a non-mode value is ignored; `busy` is parsed out of the ready meta with BINARY argv.
+
+MEASURED (this machine, 2026-09-16)
+1. THE HANG → A CHOICE. scratch tree, daemon warm, one client running a 90s command:
+   - `bl daemon status` → `running  run src/t/sleeper.bl  (10s, cwd /tmp/fifo2)` + `queue_depth 1`
+   - default client: `bl: the daemon for this tree is busy with \`run src/t/sleeper.bl\` (10s) — running this command cold instead (BL_DAEMON=queue waits for its turn)` → **completed in 2411 ms**, where the same command previously parked for 46.6 s and, in the original tree earlier today, 28 minutes (measured: 1m27s CPU in 30m of wall clock).
+   - `BL_DAEMON=queue` client: waits its turn (77 s, the remaining length of the sleeper) — a wait is still possible, now chosen.
+2. WARM == COLD FOR ENVIRONMENT (D17's hole). Daemon started with `DAEMON_ONLY=yes` in its environment:
+   `FOO=bar bl eval '(System/get_env "FOO"/"DAEMON_ONLY")'` → cold `FOO=bar DAEMON_ONLY=`; **warm `FOO=bar DAEMON_ONLY=`** — identical, and the daemon's own variable is not inherited.
+3. THE TREE'S DECLARATION REACHES THE TRANSPORT. Unit-tested in the launcher: `env.bl :env {"BL_DAEMON" "off"}` → Off; the shell's value wins over it; an unknown value is ignored (Off/Queue/Auto only). Before: env.bl's declaration was inert — the transport was chosen before the project env was applied.
+4. BUILT AND RAN the whole thing: `cargo test` 20/20; `bin/bl test test/bl/daemon/` 13/13; the sealed drop (`bl self-build`, 139,971,782 payload bytes) used for (1) and (2) above.
+
+FALSIFIED ON THE WAY (worth keeping): the analysis artifacts were NEVER the blocker. Two processes can hold the same fjall store open at once (measured: a second `datom.store-fjall/open` on a held path returns ok), and there is no lock file anywhere in the tree or the caches. The 30-minute wait was the FIFO, made invisible by a `queue_depth` constant — which is why this plan's W1 is "no caller parks silently" and not "unlock the cache". The artifacts stay as they are: content-addressed, re-openable, no lock to negotiate.
+
+NOT DONE (honest scope)
+- W4's drift class (`none | tree | toolchain`) is NOT reported: that belongs to FUP-084 (warm-apply / warm-handover) and to BUG-052's gate. What landed is the rest of W4: what is running, for how long, in which cwd, and how many are ahead.
+- The sealed drop was built from a COPY of this checkout (/tmp/bl-build) because `priv/std/browser.bl` (another session's untracked file, mid-edit) does not compile and `self-build` AOTs the whole tier; also note `self-build` from a checkout produced a payload whose daemon cannot start (a missing `ThousandIsland` → the UI listener dies), so the daemon used for measurement was started from the SOURCE (`bin/bl daemon start`, BL_DAEMON_ROOT=/tmp/fifo2) and the CLIENT was the sealed drop — both halves of this change exercised, in one protocol.
+- Regression evidence: daemon-adjacent tests all pass (`system.gateway-test`, `system.watch-test`, `system.test-verb-test`, `system.cli-test`); `test/bl/system/` shows 3 failures + 1 timeout that are NOT mine and reproduce without my code in the path (`system.growth-test` passes alone; `system.lsp-test` is BUG-041's analyzer; `system.tasks-test`'s exit code comes from `priv/std/bl/test.bl.md`/`ward*.bl`, edited in this tree by another session minutes ago).

@@ -137,6 +137,15 @@ defmodule BeamLisp.Daemon.Listener do
   # this process owns the socket and routes `:stdin_reply` frames it reads to
   # the proxy pid the executor registers via `{:route_stdin, id, proxy}`.
   defp serve_request(sock, id, req, ctx) do
+    # SAY WHERE THE CLIENT STANDS before it waits. A caller that chose to queue
+    # (BL_DAEMON=queue) gets an `accepted` frame naming the position, so a wait
+    # is visibly a WAIT — the launcher prints it. A caller that would rather not
+    # wait never reaches this point: it read `busy` from `ready` and ran cold.
+    case executor_state(ctx) do
+      %{queued: q} when is_integer(q) and q > 0 -> send_frame(sock, Protocol.accepted(id, q))
+      _ -> :ok
+    end
+
     me = self()
     task = spawn_monitor(fn -> ctx.execute_fun.(sock, id, req, me) end)
     pump_stdin(sock, id, task, nil)
@@ -223,8 +232,42 @@ defmodule BeamLisp.Daemon.Listener do
       compiler_key: ctx[:compiler_key],
       daemon_build_id: ctx[:daemon_build_id],
       uptime_ms: uptime_ms(ctx),
-      queue_depth: (if is_function(ctx[:queue_depth_fun], 0), do: ctx.queue_depth_fun.(), else: 0)
+      queue_depth: (if is_function(ctx[:queue_depth_fun], 0), do: ctx.queue_depth_fun.(), else: 0),
+      # WHAT THE WORKER IS DOING, in the handshake, before the client sends a
+      # request. The launcher reads this and decides: wait (BL_DAEMON=queue) or
+      # run cold. Without it the only honest reading of a busy daemon was
+      # "no output", which is the same as a hang — measured: a trivial command
+      # parked for the whole length of another client's 120s command.
+      busy: executor_state(ctx)
     }
+  end
+
+  # The handshake carries the WORKER, not the whole state map: `busy` is the
+  # running command or nil, and `queue_depth` (its own key, above) is the count.
+  # Nesting one inside the other put the row's shape on the wire and left the
+  # client parsing a map it never asked for — found by printing the meta the
+  # launcher actually receives, not by reading the code.
+  defp executor_state(ctx) do
+    if is_function(ctx[:executor_state_fun], 0) do
+      case ctx.executor_state_fun.() do
+        %{busy: nil} ->
+          nil
+
+        # AGE, not an absolute stamp: the launcher is a different OS process, and
+        # a monotonic reading is only meaningful inside the VM that took it.
+        %{busy: %{since_ms: since} = b} ->
+          # Map.put, NOT `%{b | age_ms: …}`: a map-update raises KeyError when the
+          # key is absent, this function rescues to `nil`, and the handshake then
+          # reported `busy: nil` while the status page reported the running
+          # command — two readers of one row, disagreeing (measured 2026-09-16).
+          Map.put(b, :age_ms, System.monotonic_time(:millisecond) - since)
+
+        _ ->
+          nil
+      end
+    end
+  rescue
+    _ -> nil
   end
 
   # The status a client sees is the SESSION'S READ-MODEL, rendered — the same

@@ -99,6 +99,11 @@ defmodule BeamLisp.Daemon.Protocol do
       when is_binary(id) and byte_size(id) == 16 and is_list(argv) and is_binary(cwd) do
     env_paths = Map.get(m, :env_paths, [])
     tty = Map.get(m, :tty, %{})
+    # The CALLER's environment (D17 measured the hole: a daemon runs a request in
+    # its own env, so `FOO=bar bl eval '(System/get_env "FOO")'` answered nil
+    # warm and bar cold). Optional — an older launcher sends no `env`, and then a
+    # request means exactly what it meant before.
+    env = Map.get(m, :env, %{})
 
     cond do
       length(argv) > @max_argv -> {:error, :argv_too_long}
@@ -106,7 +111,8 @@ defmodule BeamLisp.Daemon.Protocol do
       byte_size(cwd) > @max_path_len -> {:error, :malformed}
       not (is_list(env_paths) and Enum.all?(env_paths, &valid_arg?/1)) -> {:error, :malformed}
       not is_map(tty) -> {:error, :malformed}
-      true -> {:ok, {:request, id, %{argv: argv, cwd: cwd, env_paths: env_paths, tty: tty}}}
+      not valid_env?(env) -> {:error, :malformed}
+      true -> {:ok, {:request, id, %{argv: argv, cwd: cwd, env_paths: env_paths, tty: tty, env: env}}}
     end
   end
 
@@ -125,6 +131,21 @@ defmodule BeamLisp.Daemon.Protocol do
   defp opt_bin(nil), do: true
   defp opt_bin(v) when is_binary(v), do: true
   defp opt_bin(_), do: false
+
+  # Bounded, like the rest of this schema: a request may not make the daemon
+  # allocate an unbounded environment. Names and values are binaries by
+  # construction (they come from a POSIX environment).
+  @max_env 1024
+  @max_env_value 65_536
+
+  defp valid_env?(env) when is_map(env) and map_size(env) <= @max_env do
+    Enum.all?(env, fn
+      {k, v} when is_binary(k) and is_binary(v) -> byte_size(v) <= @max_env_value
+      _ -> false
+    end)
+  end
+
+  defp valid_env?(_), do: false
 
   defp valid_arg?(a), do: is_binary(a) and byte_size(a) <= @max_path_len
 end

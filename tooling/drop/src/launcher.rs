@@ -325,6 +325,21 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
     match try_attach(&root, argv) {
         Attach::Exit(code) => Some(code),
         a @ (Attach::LostAfterSend | Attach::Stalled(_)) => after_attach(a),
+        Attach::Busy { argv: running, age_ms, queued } => {
+            // A busy daemon is not a broken one — but it is one that cannot serve
+            // this command NOW, and waiting for it is a choice the caller should
+            // get to make. Never autostart a second daemon here: one exists, and
+            // it is working. (BL_DAEMON=queue waits; see daemon_mode.)
+            let held = if running.is_empty() { "a command".to_string() } else { format!("`{running}`") };
+            let secs = age_ms / 1000;
+            let ahead = if queued > 1 { format!(", {queued} commands ahead") } else { String::new() };
+            eprintln!(
+                "bl: the daemon for this tree is busy with {held} ({secs}s{ahead}) — \
+                 running this command cold instead (BL_DAEMON=queue waits for its turn)",
+                ahead = ahead
+            );
+            None
+        }
         Attach::RestartRequired => {
             // the daemon is stale (checkout changed). Stop it, restart, retry once.
             // Say so: a daemon that vanishes without a word looks like a command
@@ -446,7 +461,13 @@ fn main() {
     // daemon and its reloads stay ordered with the runs and tests it serves.
     #[cfg(unix)]
     {
-        let off = std::env::var("BL_DAEMON").map(|v| v == "off").unwrap_or(false);
+        let mode = std::env::current_dir()
+            .ok()
+            .as_deref()
+            .and_then(resolve_root)
+            .map(|r| daemon_mode(&r))
+            .unwrap_or(DaemonMode::Auto);
+        let off = mode == DaemonMode::Off;
         let verb = verb_of(&argv);
         let is_lifecycle = verb.as_deref() == Some("daemon");
         let owns_process = verb.is_none()

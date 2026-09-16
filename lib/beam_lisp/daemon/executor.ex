@@ -31,8 +31,52 @@ defmodule BeamLisp.Daemon.Executor do
 
   # --- public API ---
 
+  # The worker's state is PUBLISHED, not answered: a caller about to decide
+  # "wait or run cold" must not have to queue behind the thing it is asking
+  # about. Same shape as IndexWorker's progress row, for the same reason.
+  @state_table :bl_executor_state
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @doc """
+  What the single worker is doing, as DATA — never a call.
+
+  `%{busy: nil | %{argv: [...], cwd: path, since_ms: n}, queued: n}`, where
+  `queued` counts the commands that would run before one submitted now: the one
+  in flight plus everything already waiting in the mailbox.
+
+  This exists because the silence was AMBIGUOUS. `hello` reported a
+  `queue_depth` read from a counter that was never incremented, so a client
+  could not tell "the daemon is idle" from "the daemon is running someone
+  else's two-minute command and you are next" — and a command that parks on a
+  busy worker is indistinguishable from a hang. Measured 2026-09-16: a trivial
+  `bl run` produced no output and no progress for the full length of another
+  client's 120s command.
+  """
+  def state do
+    busy =
+      case :ets.lookup(@state_table, :busy) do
+        [{:busy, b}] -> b
+        _ -> nil
+      end
+
+    waiting =
+      case Process.whereis(__MODULE__) do
+        pid when is_pid(pid) ->
+          case Process.info(pid, :message_queue_len) do
+            {:message_queue_len, n} -> n
+            _ -> 0
+          end
+
+        _ ->
+          0
+      end
+
+    %{busy: busy, queued: (if busy, do: 1, else: 0) + waiting}
+  rescue
+    ArgumentError -> %{busy: nil, queued: 0}
   end
 
   @doc """
@@ -45,9 +89,10 @@ defmodule BeamLisp.Daemon.Executor do
     GenServer.call(server, {:run, sock, id, req, conn}, :infinity)
   end
 
-  @doc "Current queue depth (0 when idle)."
+  @doc "Current queue depth: how many commands run before one submitted now."
   def queue_depth(server \\ __MODULE__) do
-    GenServer.call(server, :queue_depth)
+    _ = server
+    Map.get(state(), :queued, 0)
   catch
     :exit, _ -> 0
   end
@@ -79,24 +124,36 @@ defmodule BeamLisp.Daemon.Executor do
 
   @impl true
   def init(opts) do
-    {:ok, %{active: 0, handler: Keyword.get(opts, :handler, &default_handler/2)}}
-  end
+    if :ets.whereis(@state_table) == :undefined do
+      :ets.new(@state_table, [:set, :public, :named_table, read_concurrency: true])
+    end
 
-  @impl true
-  def handle_call(:queue_depth, _from, state) do
-    {:reply, state.active, state}
+    :ets.insert(@state_table, {:busy, nil})
+
+    {:ok, %{active: 0, handler: Keyword.get(opts, :handler, &default_handler/2)}}
   end
 
   @impl true
   def handle_call({:run, sock, id, req, conn}, _from, state) do
     # Serialized: this call blocks the executor until the command finishes, so
-    # only one program runs at a time. Concurrent clients queue in the mailbox.
-    code = execute(sock, id, req, conn, state.handler)
+    # only one program runs at a time. Concurrent clients queue in the mailbox —
+    # and now a client can SEE that, and choose not to (launcher: busy → cold).
+    publish(%{argv: req.argv, cwd: req.cwd})
+
+    code =
+      try do
+        execute(sock, id, req, conn, state.handler)
+      after
+        publish(nil)
+      end
+
     {:reply, code, state}
   end
 
   @impl true
   def handle_call({:run_capture, fun}, _from, state) do
+    publish(%{argv: ["(captured intent)"], cwd: File.cwd!()})
+
     {:ok, io} = StringIO.open("")
     prev = Process.group_leader()
     Process.group_leader(self(), io)
@@ -112,6 +169,7 @@ defmodule BeamLisp.Daemon.Executor do
 
     Process.group_leader(self(), prev)
     {_, output} = StringIO.contents(io)
+    publish(nil)
     {:reply, {result, output}, state}
   end
 
@@ -119,6 +177,8 @@ defmodule BeamLisp.Daemon.Executor do
   def handle_call({:run_reload, fun}, _from, state) do
     # A reload commit shares the one worker with runs/tests — ordered, never
     # concurrent with a program mutating the same image.
+    publish(%{argv: ["(reload commit)"], cwd: File.cwd!()})
+
     result =
       try do
         fun.()
@@ -128,7 +188,18 @@ defmodule BeamLisp.Daemon.Executor do
         kind, v -> {:error, {kind, v}}
       end
 
+    publish(nil)
     {:reply, result, state}
+  end
+
+  # --- the published row ---
+
+  defp publish(nil), do: :ets.insert(@state_table, {:busy, nil})
+
+  defp publish(%{argv: argv, cwd: cwd}) do
+    :ets.insert(@state_table, {:busy, %{argv: argv, cwd: cwd, since_ms: System.monotonic_time(:millisecond)}})
+  rescue
+    ArgumentError -> :ok
   end
 
   # --- execution ---
@@ -145,6 +216,14 @@ defmodule BeamLisp.Daemon.Executor do
     code =
       try do
         BeamLisp.Env.isolated(:global, fn ->
+          # THE CALLER'S ENVIRONMENT IS THE PROGRAM'S ENVIRONMENT. The fork above
+          # starts from the daemon's env; this corrects it to what the caller
+          # actually had, so a warm run and a cold run of one command are the same
+          # program (D17 measured the difference: `FOO=bar bl eval …` answered nil
+          # warm, bar cold). A request from an older launcher carries no `env`,
+          # and then nothing changes.
+          apply_env(Map.get(req, :env))
+
           BeamLisp.Loader.with_ambient_dirs(ambient_dirs(req), fn ->
             # The program argv (post-`--`) is bound by `bl.cli/cmd-run` from the
             # parsed `:dd`; the handler owns that. Here we only fix the roots
@@ -175,6 +254,25 @@ defmodule BeamLisp.Daemon.Executor do
     frame = if is_integer(code), do: Protocol.exit(id, code), else: Protocol.exit(id, 0)
     _ = :gen_tcp.send(sock, frame)
     code
+  end
+
+  # `nil`/absent env (an older launcher) means "change nothing".
+  defp apply_env(nil), do: :ok
+  defp apply_env(env) when map_size(env) == 0, do: :ok
+
+  # Faithful REPLACE, minus what the daemon itself needs to keep running. A
+  # request that did not carry those would otherwise strip the worker's own
+  # runtime (BL_* handles, the XDG dirs, HOME, TMPDIR) along with the caller's
+  # environment — the fork is the daemon's, and these are the daemon's own.
+  @daemon_keeps ~w(BL_BIN BL_DAEMON_ROOT XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME HOME TMPDIR)
+
+  defp apply_env(env) when is_map(env) do
+    for {k, _v} <- System.get_env(), not Map.has_key?(env, k), k not in @daemon_keeps do
+      System.delete_env(k)
+    end
+
+    for {k, v} <- env, do: System.put_env(k, v)
+    :ok
   end
 
   # The client's roots: its cwd first, then each `-p` path resolved to absolute

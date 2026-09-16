@@ -373,6 +373,10 @@ pub enum Attach {
     /// Nothing arrived for the read timeout, but the socket is still OPEN. The
     /// command is probably still running: silence is not loss.
     Stalled(u64),
+    /// The daemon is UP but its single worker is busy with someone else's
+    /// command. Returned BEFORE the request is sent, so the caller may still
+    /// choose: run cold now (default) or queue and wait (BL_DAEMON=queue).
+    Busy { argv: String, age_ms: i64, queued: i64 },
 }
 
 #[cfg(unix)]
@@ -409,7 +413,21 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
         Err(_) => return Attach::Fallback,
     };
     match hello_reply {
-        Some(Term::Tuple(t)) if is_ready(&t) => {}
+        Some(Term::Tuple(t)) if is_ready(&t) => {
+            // BUSY IS A CHOICE, MADE BEFORE THE REQUEST IS SENT. The worker runs
+            // one command at a time, so a second client waits in the mailbox;
+            // the waiting used to be invisible (no output, no progress, no
+            // holder) and therefore indistinguishable from a hang. Measured
+            // 2026-09-16: a trivial `bl run` printed nothing for the full 120s
+            // of another client's command. Sending the request first would make
+            // running it here unsafe (side effects may happen), so the decision
+            // belongs here, where a cold exec is still allowed.
+            if let Some(b) = ready_busy(&t) {
+                if daemon_mode(root) != DaemonMode::Queue {
+                    return Attach::Busy { argv: b.argv, age_ms: b.age_ms, queued: b.queued };
+                }
+            }
+        }
         Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => return Attach::RestartRequired,
         Some(Term::Tuple(_)) => return Attach::Fallback, // other reject (wrong tree/unauthorized)
         _ => return Attach::Fallback,
@@ -418,7 +436,13 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
     // request — from here, NEVER fall back (side effects may happen).
     let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
     let env_paths = collect_env_paths();
-    let req = encode_request(argv, &cwd, &env_paths);
+    // THE CALLER'S ENVIRONMENT, on the wire. A daemon runs a request in its OWN
+    // environment (D17: `FOO=bar bl eval '(System/get_env "FOO")'` answered nil
+    // warm and bar cold), which is why serving had to be cut over to `bl serve`
+    // and why the suites export BL_DAEMON=off. Carrying it here makes a warm run
+    // and a cold run the same program, which is what lets those workarounds go
+    // back to being performance choices.
+    let req = encode_request(argv, &cwd, &env_paths, &collect_env());
     if send_frame(&mut stream, &req).is_err() {
         return Attach::LostAfterSend;
     }
@@ -481,6 +505,30 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                         wrote_anything = wrote_anything || !b.is_empty();
                     }
                 }
+                // {:bl, 1, :accepted, id, %{queue_position: n}} — sent when the
+                // worker was busy and this client chose to wait (the daemon said
+                // so in `ready`; BL_DAEMON=queue keeps the old behaviour). Say
+                // where it stands: an invisible queue IS the bug.
+                "accepted" => {
+                    if let Some(n) = t.get(4).and_then(|x| match x {
+                        Term::Map(pairs) => pairs
+                            .iter()
+                            .find(|(k, _)| k.as_atom() == Some("queue_position"))
+                            .and_then(|(_, v)| v.as_int()),
+                        _ => None,
+                    }) {
+                        if n > 0 {
+                            eprintln!(
+                                "bl: queued behind {n} command(s) on this tree's daemon \
+                                 (BL_DAEMON=off runs this cold instead)"
+                            );
+                        }
+                    }
+                }
+                // {:bl, 1, :heartbeat, id, ms} and {:bl, 1, :watch, id, seq,
+                // payload} are liveness/streaming frames a one-shot command does
+                // not act on — the read deadline is the real limit.
+                // (handled by the catch-all below)
                 // {:bl, 1, :stdin, id, seq, prompt} — seq is index 4
                 "stdin" => {
                     // request one line from our stdin, reply
@@ -518,7 +566,10 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                     }
                     return Attach::Exit(code as i32);
                 }
-                "heartbeat" | "accepted" | "watch" => {}
+                // heartbeat/watch/other liveness frames: a one-shot command has
+                // nothing to do with them, and the read deadline is the real
+                // limit on "still running".
+                "heartbeat" | "watch" => {}
                 _ => {}
             }
         }
@@ -606,7 +657,7 @@ fn encode_hello(tree: &[u8], token: &[u8]) -> Vec<u8> {
     e.finish()
 }
 
-fn encode_request(argv: &[String], cwd: &Path, env_paths: &[String]) -> Vec<u8> {
+fn encode_request(argv: &[String], cwd: &Path, env_paths: &[String], env: &[(String, String)]) -> Vec<u8> {
     let mut e = Enc::new();
     e.tuple_header(5);
     e.atom("bl");
@@ -615,17 +666,38 @@ fn encode_request(argv: &[String], cwd: &Path, env_paths: &[String]) -> Vec<u8> 
     // 16-byte request id
     let id = request_id();
     e.binary(&id);
-    // map %{argv, cwd, env_paths, tty}
-    e.map_header(4);
+    // map %{argv, cwd, env_paths, env, tty}
+    e.map_header(5);
     e.atom("argv");
     e.list_of_binaries(&argv.iter().map(|a| a.as_bytes().to_vec()).collect::<Vec<_>>());
     e.atom("cwd");
     e.binary(cwd.to_string_lossy().as_bytes());
     e.atom("env_paths");
     e.list_of_binaries(&env_paths.iter().map(|p| p.as_bytes().to_vec()).collect::<Vec<_>>());
+    e.atom("env");
+    e.map_header(env.len());
+    for (k, v) in env {
+        e.binary(k.as_bytes());
+        e.binary(v.as_bytes());
+    }
     e.atom("tty");
     e.map_header(0);
     e.finish()
+}
+
+/// The environment to send: the caller's, bounded.
+///
+/// Bounded because the frame is one term and a hostile environment should not
+/// be able to make the daemon allocate without limit; 1024 names and 64 KiB per
+/// value is far above any real shell (a PATH with 200 entries is ~10 KiB).
+fn collect_env() -> Vec<(String, String)> {
+    const MAX_VARS: usize = 1024;
+    const MAX_VALUE: usize = 64 * 1024;
+
+    std::env::vars()
+        .filter(|(_, v)| v.len() <= MAX_VALUE)
+        .take(MAX_VARS)
+        .collect()
 }
 
 fn encode_stdin_reply(seq: i64, data: &[u8]) -> Vec<u8> {
@@ -696,6 +768,115 @@ fn collect_env_paths() -> Vec<String> {
 }
 
 // ── term shape helpers ───────────────────────────────────────────────────────
+
+// ── the transport decision, shaped by the tree ───────────────────────────────
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum DaemonMode {
+    /// Never attach: a cold VM per command (`BL_DAEMON=off`).
+    Off,
+    /// Attach when the daemon is FREE; run cold when its worker is busy.
+    Auto,
+    /// Attach and take the busier route: wait for the worker's turn.
+    Queue,
+}
+
+/// The effective mode: the CALLER's environment first, else the tree's own
+/// declaration in `env.bl`.
+///
+/// The declaration half is new, and it was impossible before: the transport was
+/// chosen HERE, before the project env is applied, so a tree declaring
+/// `env.bl :env {"BL_DAEMON" "off"}` was still served by a warm daemon —
+/// measured 2026-09-16, in a tree that declared exactly that and could not tell
+/// why its runs kept the daemon's environment. A declaration is a DEFAULT, so a
+/// value in the environment still wins.
+pub fn daemon_mode(root: &Path) -> DaemonMode {
+    let raw = std::env::var("BL_DAEMON")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| declared_daemon_mode(root));
+
+    match raw.as_deref() {
+        Some("off") => DaemonMode::Off,
+        Some("queue") => DaemonMode::Queue,
+        _ => DaemonMode::Auto,
+    }
+}
+
+/// `"BL_DAEMON" "off"` out of the tree's `env.bl`, by SCAN.
+///
+/// A scan, not an evaluation: the launcher must never run the tree's code to
+/// decide how to run its commands, and the value it wants is a literal in a data
+/// map by construction (`env.bl` is read as data — its own header says so).
+/// Only a value the transport understands is accepted, so a mention of the key
+/// in prose cannot silently become policy.
+fn declared_daemon_mode(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("env.bl")).ok()?;
+    let key = "\"BL_DAEMON\"";
+    let at = text.find(key)?;
+    let rest = &text[at + key.len()..];
+    let open = rest.find('"')?;
+    let tail = &rest[open + 1..];
+    let close = tail.find('"')?;
+    let value = tail[..close].to_string();
+
+    matches!(value.as_str(), "off" | "auto" | "queue").then_some(value)
+}
+
+struct BusyInfo {
+    argv: String,
+    age_ms: i64,
+    queued: i64,
+}
+
+/// `busy` out of the `ready` meta — `%{busy: %{argv: [...], cwd: path, age_ms:
+/// n}, queue_depth: n}`. `None` when the worker is idle, which is the common
+/// case and must cost nothing.
+fn ready_busy(t: &[Term]) -> Option<BusyInfo> {
+    let meta = match t.get(3) {
+        Some(Term::Map(pairs)) => pairs,
+        _ => return None,
+    };
+    let field = |name: &str| {
+        meta.iter()
+            .find(|(k, _)| k.as_atom() == Some(name))
+            .map(|(_, v)| v)
+    };
+
+    let pairs = match field("busy") {
+        Some(Term::Map(p)) => p,
+        _ => return None,
+    };
+    let inner = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k.as_atom() == Some(name))
+            .map(|(_, v)| v)
+    };
+
+    let argv = match inner("argv") {
+        // argv words are BINARIES in the wire shape (strings are binaries in
+        // beam-lisp). Reading them as atoms produced an empty command line and
+        // the notice degenerated to "a command" — visible in the first run of
+        // this change, which is why the unit test below pins BINARIES.
+        Some(Term::List(items)) => items
+            .iter()
+            .filter_map(|x| match x {
+                Term::Binary(b) => Some(String::from_utf8_lossy(b).to_string()),
+                Term::Atom(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+
+    Some(BusyInfo {
+        argv,
+        age_ms: inner("age_ms").and_then(|v| v.as_int()).unwrap_or(0),
+        queued: field("queue_depth").and_then(|v| v.as_int()).unwrap_or(0),
+    })
+}
 
 fn is_ready(t: &[Term]) -> bool {
     t.len() >= 3
@@ -782,11 +963,12 @@ mod tests {
         }
     }
 
-    // our request encoder produces a 5-tuple with argv/cwd
+    // our request encoder produces a 5-tuple whose map carries argv, cwd and env
     #[test]
     fn request_encodes_argv_and_cwd() {
         let argv = vec!["eval".to_string(), "(+ 1 2)".to_string()];
-        let enc = encode_request(&argv, std::path::Path::new("/tmp"), &[]);
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let enc = encode_request(&argv, std::path::Path::new("/tmp"), &[], &env);
         if let Term::Tuple(v) = decode(&enc).unwrap() {
             assert_eq!(v[2].as_atom(), Some("request"));
             // v[4] is the request map
@@ -794,6 +976,17 @@ mod tests {
                 let has_argv = pairs.iter().any(|(k, _)| k.as_atom() == Some("argv"));
                 let has_cwd = pairs.iter().any(|(k, _)| k.as_atom() == Some("cwd"));
                 assert!(has_argv && has_cwd);
+                let env_pairs = pairs
+                    .iter()
+                    .find(|(k, _)| k.as_atom() == Some("env"))
+                    .and_then(|(_, v)| match v {
+                        Term::Map(p) => Some(p.clone()),
+                        _ => None,
+                    })
+                    .expect("the env map must ride on the request");
+                assert!(env_pairs.iter().any(|(k, v)| {
+                    k.as_bytes() == Some(&b"FOO"[..]) && v.as_bytes() == Some(&b"bar"[..])
+                }));
             } else {
                 panic!("v[4] not a map");
             }
@@ -878,5 +1071,96 @@ mod tests {
         std::env::set_var("BL_DAEMON_READ_TIMEOUT", "soon");
         assert_eq!(read_timeout_secs(), DEFAULT_READ_TIMEOUT_SECS);
         std::env::remove_var("BL_DAEMON_READ_TIMEOUT");
+    }
+
+    // ── the transport decision ──────────────────────────────────────────────
+
+    /// A tree can declare its own daemon policy, and the shell can override it.
+    /// Before this the declaration was INERT: the transport was chosen before
+    /// the project env was applied, so a tree saying `BL_DAEMON=off` was still
+    /// served warm — measured 2026-09-16, in a tree that declared exactly that.
+    #[test]
+    fn the_trees_declaration_is_honoured_and_the_shell_wins() {
+        let dir = std::env::temp_dir().join(format!("bl-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("env.bl"),
+            ";; a comment mentioning BL_DAEMON is not policy\n{:name \"t\" :env {\"BL_DAEMON\" \"off\"}}\n",
+        )
+        .unwrap();
+
+        std::env::remove_var("BL_DAEMON");
+        assert_eq!(daemon_mode(&dir), DaemonMode::Off, "the tree's word is policy");
+
+        std::env::set_var("BL_DAEMON", "queue");
+        assert_eq!(daemon_mode(&dir), DaemonMode::Queue, "the caller's word wins");
+
+        std::env::set_var("BL_DAEMON", "off");
+        assert_eq!(daemon_mode(&dir), DaemonMode::Off);
+        std::env::remove_var("BL_DAEMON");
+
+        // an unreadable/absent declaration is not an error: auto is the default
+        let empty = std::env::temp_dir().join(format!("bl-mode-none-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(daemon_mode(&empty), DaemonMode::Auto);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// Prose must not become policy: only a value the transport understands is
+    /// accepted, so a sentence in `env.bl` cannot silently disable the daemon.
+    #[test]
+    fn a_value_that_is_not_a_mode_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("bl-mode-junk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("env.bl"), ":env {\"BL_DAEMON\" \"whenever\"}\n").unwrap();
+        std::env::remove_var("BL_DAEMON");
+        assert_eq!(daemon_mode(&dir), DaemonMode::Auto);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `busy` is what turns "no output" into "someone else's command is
+    /// running, here it is". The client reads it from the ready meta.
+    #[test]
+    fn busy_is_read_out_of_the_ready_meta() {
+        let meta = Term::Map(vec![
+            (Term::Atom("queue_depth".into()), Term::Int(2)),
+            (
+                Term::Atom("busy".into()),
+                Term::Map(vec![
+                    (
+                        Term::Atom("argv".into()),
+                        Term::List(vec![
+                            Term::Binary(b"run".to_vec()),
+                            Term::Binary(b"src/t/sleeper.bl".to_vec()),
+                        ]),
+                    ),
+                    (Term::Atom("age_ms".into()), Term::Int(42_000)),
+                ]),
+            ),
+        ]);
+        let ready = vec![
+            Term::Atom("bl".into()),
+            Term::Int(1),
+            Term::Atom("ready".into()),
+            meta,
+        ];
+
+        let b = ready_busy(&ready).expect("busy must be found");
+        assert_eq!(b.argv, "run src/t/sleeper.bl");
+        assert_eq!(b.age_ms, 42_000);
+        assert_eq!(b.queued, 2, "queue_depth rides along for the notice");
+
+        let idle = vec![
+            Term::Atom("bl".into()),
+            Term::Int(1),
+            Term::Atom("ready".into()),
+            Term::Map(vec![(
+                Term::Atom("busy".into()),
+                Term::Atom("nil".into()),
+            )]),
+        ];
+        assert!(ready_busy(&idle).is_none(), "an idle worker costs nothing");
     }
 }
