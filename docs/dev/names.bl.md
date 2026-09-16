@@ -146,6 +146,13 @@ service on a real address are untouched; no machine-wide policy changes; and
 nftables plus a system unit that reapplies it at boot — so the verb runs it when
 it can and otherwise prints exactly what to paste.
 
+One thing to know before pasting it: **if something else is already answering on
+port 80, the redirect takes it.** The rule is unconditional for loopback
+destination port 80, so a request to whatever holds it — by `http://localhost/`,
+by address — lands on the gateway instead. The verb says so in its report rather
+than letting the developer discover it from a broken service elsewhere, and
+`--remove` gives it back.
+
 **The sysctl** hands port 80 to the gateway itself:
 
     printf 'net.ipv4.ip_unprivileged_port_start=80\n' | sudo tee /etc/sysctl.d/60-beam-lisp-gateway.conf

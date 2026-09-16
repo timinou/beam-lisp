@@ -691,11 +691,18 @@ install -D -m644 ~/.local/state/beam-lisp/redirect/redirect.nft /etc/bl-gateway-
 systemctl enable --now bl-gateway-redirect.service
 
   --   ruleset     needs root — the script printed above
-  --   port 80     not answered yet — the gateway is on 7777
+  --   port 80     not answered — run: bl install redirect (loopback only, removable), or: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
   ok   gateway port on the fallback port 7777 — the boot rule stays right
 ```
 
 Exit `0` when every step is ok, `1` when one failed, `2` on a bad invocation.
+
+The rule is unconditional for loopback destination port 80, so **if something
+else already answers there, the redirect takes it**: a request to whatever holds
+it — `http://localhost/`, or by address — lands on the gateway instead. The
+report says which of the three states it found (answered by a gateway, answered
+by something else, not answered) rather than assuming the port is free, and
+`bl install redirect --remove` gives it back.
 
 `--json` keys: `target`, `ok`, `steps` (each `name`, `ok`, `detail`).
 
