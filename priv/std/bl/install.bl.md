@@ -579,26 +579,37 @@ the corpus assembles.
      {:name "unit" :ok (= enabled "enabled")
       :detail (if (= enabled "enabled") "enabled" (str enabled " — run: bl install redirect"))}]))
 
-(defn- asset-fetch-steps
-  "Run one pinned-asset fetcher and answer install STEPS.
+(defn- asset-steps
+  "Turn a fetcher's answer into install STEPS, one per artifact it reports."
+  [ns-name target r]
+  (if (true? (:ok? r))
+    (let [d (or (:dir r) "")]
+      (if (empty? (:files r))
+        [{:name target :ok true :detail (str "present" (if (= "" d) "" (str " — " d))) }]
+        (mapv (fn [f] {:name f :ok true :detail "sha256 verified against the pin"})
+              (:files r))))
+    [{:name target :ok false
+      :detail (str (or (:why r) "failed") " — run: bl install " target)}]))
 
-   `bl install` is where the language says "put the thing on this machine where
-   the language looks for it", and a pinned asset — the solver, the embedding
-   weights — is exactly that. Each fetcher is its own namespace because the
-   RULES (URL, sha256 pins, destination) are data about the artifact; the verb is
-   the door. Before this existed the door was a Mix task, and the messages that
-   tell a user what to run said `mix bl.z3.fetch` — in a toolchain whose whole
-   point is that Mix is gone."
-  [ns-name dir-name]
-  (BeamLisp.Loader/ensure_loaded ns-name)
-  (let [r (BeamLisp.RT/invoke (BeamLisp.Env/fetch! ns-name "fetch!")
-                              (list {:bundle false :force false}))]
-    (if (true? (:ok? r))
-      (let [d (or (:dir r) dir-name)]
-        (if (empty? (:files r))
-          [{:name ns-name :ok true :detail (str "present — " d)}]
-          (mapv (fn [f] {:name f :ok true :detail "verified (pinned sha256)"}) (:files r))))
-      [{:name ns-name :ok false :detail (str (or (:why r) "failed") " — run: bl install " dir-name)}])))
+;; Two fetchers, two arities, on purpose: `z3-asset/fetch!` takes nothing (it has
+;; one pinned asset per platform, and the platform is the answer to "which"),
+;; while `embed-asset/fetch!` takes the destination because the embedding has an
+;; ambient cache AND a bundled copy, and WHICH one is a caller's decision —
+;; `bl install embed DIR` is how the release pipeline asks for the bundled one.
+(defn- z3-fetch-steps
+  [_arg]
+  (BeamLisp.Loader/ensure_loaded "z3-asset")
+  (asset-steps "z3-asset" "z3"
+               (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "z3-asset" "fetch!") (list))))
+
+(defn- embed-fetch-steps
+  [arg]
+  (BeamLisp.Loader/ensure_loaded "embed-asset")
+  (let [opts (if (some? arg)
+               {:dir (u/resolve arg) :bundle false :force false}
+               {:bundle false :force false})]
+    (asset-steps "embed-asset" "embed"
+                 (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetch!") (list opts)))))
 
 (defn- embed-check-steps
   "The `--check` half for the embedding: present or not, WITHOUT downloading."
@@ -632,10 +643,10 @@ the corpus assembles.
            :run run-doom
            :check check-doom}
    "z3"   {:summary "The pinned z3 solver, into priv/z3 (sha256-verified)"
-           :run (fn [_] (asset-fetch-steps "z3-asset" "z3"))
+           :run z3-fetch-steps
            :check z3-check-steps}
-   "embed" {:summary "The pinned embedding weights, into the model cache (sha256-verified)"
-            :run (fn [_] (asset-fetch-steps "embed-asset" "embed"))
+   "embed" {:summary "The pinned embedding weights, into the model cache (sha256-verified); `bl install embed DIR` writes into DIR (the bundled copy)"
+            :run embed-fetch-steps
             :check embed-check-steps}
    "gateway" {:summary "The name gateway: one per user, holding the port a URL may leave out"
               :run run-gateway
