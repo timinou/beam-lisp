@@ -580,17 +580,30 @@ the corpus assembles.
       :detail (if (= enabled "enabled") "enabled" (str enabled " — run: bl install redirect"))}]))
 
 (defn- asset-steps
-  "Turn a fetcher's answer into install STEPS, one per artifact it reports."
-  [ns-name target r]
-  (if (true? (:ok? r))
-    (let [d (or (:dir r) "")]
-      (if (empty? (:files r))
-        [{:name target :ok true :detail (str "present" (if (= "" d) "" (str " — " d))) }]
-        (mapv (fn [f] {:name f :ok true :detail "sha256 verified against the pin"})
-              (:files r))))
-    [{:name target :ok false
-      :detail (str (or (:why r) "failed") " — run: bl install " target)}]))
+  "Turn a fetcher's answer into install STEPS.
 
+   The two fetchers answer DIFFERENT shapes, and that is fine — what is not fine
+   is a door that reads one and lies about the other. `z3-asset/fetch!` answers
+   `{:ok? :path :asset :sha :version :cached}` (one asset, one destination);
+   `embed-asset/fetch!` answers `{:ok? :dir :files :fetched}` (three files, one
+   directory). Both are read here, and `:cached` is reported rather than hidden:
+   a second `bl install z3` that re-downloaded 50 MB would be a bug."
+  [target r]
+  (if (not (= true (:ok? r)))
+    [{:name target :ok false
+      :detail (str (or (:why r) "failed") " — run: bl install " target)}]
+    (cond
+      (some? (:files r))
+      (mapv (fn [f] {:name f :ok true :detail "sha256 verified against the pin"}) (:files r))
+
+      (some? (:path r))
+      [{:name target :ok true
+        :detail (str (or (:version r) "installed")
+                     (if (= true (:cached r)) " (cached)" "")
+                     " — " (:path r))}]
+
+      :else
+      [{:name target :ok true :detail "installed"}])))
 ;; Two fetchers, two arities, on purpose: `z3-asset/fetch!` takes nothing (it has
 ;; one pinned asset per platform, and the platform is the answer to "which"),
 ;; while `embed-asset/fetch!` takes the destination because the embedding has an
@@ -599,7 +612,7 @@ the corpus assembles.
 (defn- z3-fetch-steps
   [_arg]
   (BeamLisp.Loader/ensure_loaded "z3-asset")
-  (asset-steps "z3-asset" "z3"
+  (asset-steps "z3"
                (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "z3-asset" "fetch!") (list))))
 
 (defn- embed-fetch-steps
@@ -608,7 +621,7 @@ the corpus assembles.
   (let [opts (if (some? arg)
                {:dir (u/resolve arg) :bundle false :force false}
                {:bundle false :force false})]
-    (asset-steps "embed-asset" "embed"
+    (asset-steps "embed"
                  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetch!") (list opts)))))
 
 (defn- embed-check-steps
@@ -619,8 +632,8 @@ the corpus assembles.
                                 (list {:bundle false}))
         ok (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetched?")
                                (list dir))]
-    [{:name "embedding" :ok (true? ok)
-      :detail (if (true? ok) (str "present — " dir) (str "absent — run: bl install embed"))}]))
+    [{:name "embedding" :ok (= true ok)
+      :detail (if (= true ok) (str "present — " dir) (str "absent — run: bl install embed"))}]))
 
 (defn- z3-check-steps
   "The `--check` half for the solver: the binary exists AND runs.

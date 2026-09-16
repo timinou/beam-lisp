@@ -1,0 +1,344 @@
+; build/z3-asset.bl — THE PINNED Z3 SOLVER, fetched without Mix.
+;
+; ── Why this file exists ────────────────────────────────────────────────────
+;
+; z3 is a NATIVE CALL, and the solver is resolved at exactly one place —
+; `priv/z3/bin/z3`, never the PATH. Until now the only thing that could put it
+; there was `mix bl.z3.fetch`, i.e. Mix. This is that task as a namespace, so
+; `bl` can install its own solver: it downloads the official release zip for
+; the current platform, checks it against the pinned sha256, extracts `bin/`,
+; prunes the bindings nobody loads (python, java, .NET, headers — ~110 MB of
+; dead weight per machine), smoke-runs `--version`, and only then publishes the
+; result. `Mix.Tasks.Bl.Z3.Fetch` is the reference and this file is a port of
+; it, pins included; the module ends up unused once the verbs are wired.
+;
+; The fetched tree is gitignored (`/priv/z3`): a derived artifact, reproducible
+; by re-running this. Re-pinning z3 means bumping `version` and the digests in
+; `assets` (GitHub prints them per asset as `digest: sha256:…`).
+;
+; ── The transport is hex's CONTRACT, not hex's options ──────────────────────
+;
+; `hex` already owns "go get bytes over HTTPS": `fetch` takes a transport — a
+; function of `[url {:binary? bool}]` answering `{:ok body}` | `{:error reason}`
+; — and `httpc-transport` is the production one. But that transport's option
+; list (`verify_peer` + `cacerts` and nothing else) CANNOT reach a GitHub
+; release asset. Measured on this machine, same URL, both ways:
+;
+;     hex's options            -> {:failed_connect, … {:hostname_check_failed,
+;                                 {:requested, "release-assets.githubusercontent.com"}, …}}
+;     + depth: 3               -> 200, 52 375 919 bytes
+;     + depth: 3 + https match -> 200, 52 375 919 bytes
+;
+; GitHub redirects `github.com/…/releases/download/…` to
+; `release-assets.githubusercontent.com`, and the chain it serves needs the
+; Mix task's options to verify. So the transport is rebuilt here with those
+; options, and the CONTRACT is reused: `fetch!` calls `hex/fetch`, so the
+; client half of hex is unchanged and this file only supplies the resource.
+;
+; ── Nothing is written until the digest matches ─────────────────────────────
+;
+; A 52 MB download that fails its digest is a supply-chain event, not a flake:
+; the body is hashed FIRST and a mismatch writes nothing at all. Extraction
+; then goes to a hidden staging directory beside the target, and the tree is
+; PUBLISHED BY RENAME — atoms are not, so a run interrupted mid-extract leaves
+; `.z3-staging-<n>` (swept on the next run) and never a `z3/` that looks
+; installed while missing half its libs. A `.fetched` marker naming the digest
+; is the same completion rule `deps-compile` uses with `.compiled`.
+
+(ns z3-asset
+  (:require [hex :as h] [drop :as d]))
+
+(def version "4.16.0")
+(def base-url (str "https://github.com/Z3Prover/z3/releases/download/z3-" version))
+
+; {os-arch => [asset basename, sha256 of the zip]} — ported verbatim from
+; `Mix.Tasks.Bl.Z3.Fetch.@assets`. Keyed by `"<os>-<arch>"` rather than a tuple
+; because a bl Vector is a struct and a struct is an Erlang map: a map keyed by
+; one is a key nobody can look up twice.
+(def assets
+  {"linux-x64"     ["z3-4.16.0-x64-glibc-2.39.zip"
+                    "7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e"]
+   "linux-arm64"   ["z3-4.16.0-arm64-glibc-2.38.zip"
+                    "87fcd963d3eecb0f12cf1c3ef0ad74e84a3a7bd3caed5d94445645ef94ae6274"]
+   "macos-x64"     ["z3-4.16.0-x64-osx-15.7.3.zip"
+                    "d95519c4f3ed9393bb5f996e514c8f177bb148989bdfc32e95587f0307c4e7b0"]
+   "macos-arm64"   ["z3-4.16.0-arm64-osx-15.7.3.zip"
+                    "41828fa07d5cb77bfaee326e8e6dac074f26329c09c633f9e66012bb917cf8ae"]
+   "windows-x64"   ["z3-4.16.0-x64-win.zip"
+                    "de4d813e47202394a093547dbdb5699ee076529aa853463e007539775cd7e836"]
+   "windows-arm64" ["z3-4.16.0-arm64-win.zip"
+                    "f98dd099a69ae9784a13eec76eeced12aa733f4f30389b5ddc724c4c21747e94"]})
+
+; The release zip ships bindings we never touch; keep the solver, its shared
+; lib, and the licence. Same list as the Mix task's `@keep`.
+(def keep ["z3" "z3.exe" "libz3.so" "libz3.dylib" "libz3.dll" "LICENSE.txt"])
+
+(def marker-name ".fetched")
+
+; A hidden staging directory is how the install is built without ever making a
+; half-extracted `z3/` visible; it is swept by NAME, not by a glob, because
+; `Path/wildcard` never matches a dot-prefixed entry — measured: the pattern
+; `priv/.z3-staging-*` answers `()` while the directory is sitting right there.
+(def staging-prefix ".z3-staging-")
+
+; ── platform ────────────────────────────────────────────────────────────────
+
+(defn- os-key
+  "`:linux` | `:macos` | `:windows`, or nil for anything else.
+
+   `:os.type/0`, not `:erlang.system_info(:os)` — the latter is not a key OTP
+   answers and fails as a bare `argument error` naming nothing."
+  []
+  (let [t (erlang/apply :os :type (list))
+        family (erlang/element 1 t)
+        name (erlang/element 2 t)]
+    (cond
+      (and (= family :unix) (= name :darwin)) :macos
+      (and (= family :unix) (= name :linux)) :linux
+      (= family :win32) :windows
+      :else nil)))
+
+(defn- arch-key
+  "`:x64` | `:arm64`, or nil.
+
+   `:system_info(:system_architecture)` answers a CHARLIST (`x86_64-pc-linux-gnu`),
+   so it is converted before any `String/` predicate sees it."
+  []
+  (let [s (erlang/list_to_binary (erlang/system_info :system_architecture))]
+    (cond
+      (or (String/starts_with? s "x86_64") (String/starts_with? s "amd64")) :x64
+      (or (String/starts_with? s "aarch64") (String/starts_with? s "arm64")) :arm64
+      :else nil)))
+
+(defn- priv-root
+  "The tree's `priv/`. `BeamLisp.Tiers/priv_root` prefers the running app's
+   `:code.priv_dir/1` (which a `_build` symlink resolves back to the checkout);
+   a VM where that module is absent falls back to the working directory."
+  []
+  (try
+    (BeamLisp.Tiers/priv_root)
+    (catch _ (Path/join (System/cwd) "priv"))))
+
+(defn- exe-name []
+  (if (= :windows (os-key)) "z3.exe" "z3"))
+
+; ── the transport ───────────────────────────────────────────────────────────
+
+(defn- kw [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- httpc-transport
+  "OTP's `:httpc`, verified, with the option set the pin needs (see the header).
+
+   The same shape `hex/httpc-transport` answers — a resource of
+   `[url opts] → {:ok body} | {:error reason}` — so `hex/fetch` drives it and
+   the client stays unaware of where bytes came from."
+  []
+  (fn [url _opts]
+    (erlang/apply :application :ensure_all_started (list :inets))
+    (erlang/apply :application :ensure_all_started (list :ssl))
+    (let [ssl (list (kw :verify :verify_peer)
+                    (kw :cacerts (erlang/apply :public_key :cacerts_get (list)))
+                    (kw :depth 3)
+                    (kw :customize_hostname_check
+                        (list (kw :match_fun
+                                  (erlang/apply :public_key :pkix_verify_hostname_match_fun (list :https))))))
+          r (erlang/apply :httpc :request
+                          (list :get
+                                ; `{Url, Headers}` is a TUPLE and `:httpc` matches it
+                                ; structurally; a bl list here is a map, not two elements.
+                                (erlang/list_to_tuple (list (erlang/binary_to_list url) (list)))
+                                ; `request/4` — `request/3` does not exist (OTP exports
+                                ; 1, 2, 4 and 5), and the arity error reads like a missing
+                                ; application. Same trap hex documents.
+                                (list (kw :ssl ssl)
+                                      (kw :timeout 300000)
+                                      (kw :connect_timeout 30000))
+                                ; `body_format` is a REQUEST option; in the HTTP list it
+                                ; is ignored, the body arrives as a LIST of binaries, and
+                                ; the first thing wanting a binary dies with a clause error
+                                ; naming neither.
+                                (list (kw :body_format :binary))))]
+      (cond
+        (not= :ok (erlang/element 1 r)) {:error (pr-str (erlang/element 2 r))}
+        ; `{:ok, {{Version, Code, Reason}, Headers, Body}}` — the status is INSIDE
+        ; the response tuple, so the code is element 2 of element 1 of element 2.
+        :else
+        (let [resp (erlang/element 2 r)
+              code (erlang/element 2 (erlang/element 1 resp))
+              body (erlang/element 3 resp)]
+          (if (and (>= code 200) (< code 300))
+            {:ok (if (erlang/is_binary body) body (erlang/iolist_to_binary body))}
+            {:error (str "HTTP " code)}))))))
+
+; ── small helpers over bl collections ───────────────────────────────────────
+
+(defn- member? [coll x]
+  (pos? (count (filter (fn [e] (= e x)) coll))))
+
+(defn- del-dir! [d]
+  (erlang/apply :file :del_dir (list (erlang/binary_to_list d))))
+
+(defn- sweep-staging!
+  "Delete every abandoned staging directory under `dir`. A run interrupted
+   mid-extract leaves one of these and nothing that looks installed; the next
+   run clears it rather than accumulating 100 MB of half-extracted bindings.
+   Names are read with `File/ls!`, which does return dotfiles."
+  [dir]
+  (try
+    (doseq [entry (File/ls! dir)]
+      (when (String/starts_with? entry staging-prefix)
+        (File/rm_rf! (Path/join dir entry))))
+    (catch _ nil)))
+
+(defn- run-version
+  "`--version` from the solver at `exe`, trimmed, or nil when it will not run.
+   nil — not a raise — because \"the binary is not usable\" is a result the
+   caller reports, and a wrong-arch or half-written executable arrives here as
+   an exception from the spawn."
+  [exe]
+  (try
+    (let [r (System/cmd exe (list "--version"))
+          code (erlang/element 2 r)]
+      (if (= 0 code) (String/trim (erlang/element 1 r)) nil))
+    (catch _ nil)))
+
+; ── extraction, as the Mix task does it ─────────────────────────────────────
+
+(defn- strip-root!
+  "The release zip wraps everything in ONE top-level `z3-<vsn>-<arch>/`
+   directory; move that directory's contents up into `dest` and drop the shell.
+   Any other layout is refused rather than half-flattened."
+  [dest files]
+  (let [roots (distinct (map (fn [p] (first (String/split (Path/relative_to p dest) "/"))) files))]
+    (if (not= 1 (count roots))
+      {:ok? false :why (str "unexpected zip layout, roots: " (pr-str roots))}
+      (let [root (first roots)]
+        (doseq [entry (File/ls! (Path/join dest root))]
+          (File/rename! (Path/join dest (Path/join root entry)) (Path/join dest entry)))
+        (File/rm_rf! (Path/join dest root))
+        {:ok? true}))))
+
+(defn- prune!
+  "Keep the solver, its shared lib and the licence; delete every other file,
+   then the directories the file pass emptied (deepest first, the root kept).
+
+   `:erlang.byte_size`, not `count`, for the depth order: `count` on a binary
+   counts something else in this runtime, and \"deepest first\" is the whole
+   property that makes removing parents safe."
+  [dest]
+  (doseq [p (Path/wildcard (Path/join dest "**/*"))]
+    (when (and (not (File/dir? p)) (not (member? keep (Path/basename p))))
+      (File/rm_rf! p)))
+  (doseq [d (sort-by (fn [p] (- (erlang/byte_size p)))
+                     (filter (fn [p] (File/dir? p)) (Path/wildcard (Path/join dest "**/*"))))]
+    (when (empty? (File/ls! d)) (del-dir! d))))
+
+; ── install ─────────────────────────────────────────────────────────────────
+
+(defn- install!
+  "Download the pinned zip, verify it, and publish a complete `dest`.
+
+   → `{:ok? true :version v}` | `{:ok? false :why}`. Order is the point: the
+   digest is checked BEFORE a byte is written; the tree is built at a hidden
+   staging path beside the target; the smoke run happens there; and a single
+   `rename` makes `dest` exist only as a finished, runnable install."
+  [dest asset sha]
+  (let [url (str base-url "/" asset)
+        got (h/fetch (httpc-transport) url {:binary? true})]
+    (if (:error got)
+      {:ok? false :why (str "download failed: " (:error got) " from " url)}
+      (let [body (:ok got)
+            actual (d/sha256-hex body)]
+        (if (not= actual sha)
+          {:ok? false :why (str "sha256 mismatch: pinned " sha " actual " actual)}
+          (let [staging (Path/join (Path/dirname dest)
+                                   (str staging-prefix
+                                        (erlang/apply :erlang :unique_integer (list (list :positive)))))]
+            (File/rm_rf! staging)
+            (File/mkdir_p! staging)
+            (let [ex (erlang/apply :zip :extract
+                                   (list body (list (kw :cwd (erlang/binary_to_list staging)))))]
+              (if (not= :ok (erlang/element 1 ex))
+                (do (File/rm_rf! staging)
+                    {:ok? false :why (str "the zip will not extract: " (pr-str ex))})
+                (let [files (map (fn [f] (erlang/list_to_binary f)) (erlang/element 2 ex))
+                      sr (strip-root! staging files)]
+                  (if (not (:ok? sr))
+                    (do (File/rm_rf! staging) sr)
+                    (do
+                      (prune! staging)
+                      (let [exe (Path/join staging (Path/join "bin" (exe-name)))
+                            _ (File/chmod! exe 493)
+                            v (run-version exe)]
+                        (if (nil? v)
+                          (do (File/rm_rf! staging)
+                              {:ok? false :why (str "the z3 binary at " exe " does not run")})
+                          (do
+                            (File/write! (Path/join staging marker-name) (str sha "\n"))
+                            (File/rm_rf! dest)
+                            (File/rename! staging dest)
+                            {:ok? true :version v}))))))))))))))
+
+(defn- installed?
+  "A complete install: the marker names THIS digest and the binary is there."
+  [dest sha]
+  (and (File/exists? (Path/join dest marker-name))
+       (File/exists? (Path/join dest (Path/join "bin" (exe-name))))
+       (= sha (String/trim (File/read! (Path/join dest marker-name))))))
+
+(defn- forced?
+  "`BEAM_LISP_Z3_FORCE` — the `--force` the Mix task took as a flag. Present and
+   not obviously off is on; the variable, not a CLI parse, is what a `bl` verb
+   can pass through."
+  []
+  (let [v (System/get_env "BEAM_LISP_Z3_FORCE")]
+    (and (some? v) (not= "" v) (not= "0" v))))
+
+(defn- ok-map [dest asset sha version cached]
+  {:ok? true :path dest :asset asset :sha sha :version version :cached cached :why nil})
+
+(defn fetch!
+  "Ensure the pinned z3 solver is installed at `<priv-root>/z3` and runnable.
+
+   → `{:ok? true :path dir :asset name :sha hex :version string :cached bool :why nil}`
+   | `{:ok? false :why string}`
+
+   Never raises for an unsupported platform, a failed download, a digest that
+   does not match, an unreadable archive, or a binary that will not run — each
+   of those is a `:why`. A verified install already on disk is reported and NOT
+   re-downloaded, unless `BEAM_LISP_Z3_FORCE` asks for it."
+  []
+  (let [os (os-key)
+        arch (arch-key)]
+    (cond
+      (nil? os)
+      {:ok? false :why (str "unsupported OS: " (pr-str (erlang/apply :os :type (list))))}
+
+      (nil? arch)
+      {:ok? false :why (str "unsupported CPU architecture: "
+                            (erlang/list_to_binary (erlang/system_info :system_architecture)))}
+
+      :else
+      (let [entry (get assets (str (name os) "-" (name arch)))]
+        (if (nil? entry)
+          {:ok? false :why (str "no pinned z3 asset for " (name os) "/" (name arch)
+                                " (z3 " version ")")}
+          (let [asset (first entry)
+                sha (second entry)
+                dest (Path/join (priv-root) "z3")
+                exe (Path/join dest (Path/join "bin" (exe-name)))]
+            ; A run that died mid-extract leaves staging, never `z3/`. Sweep it.
+            (sweep-staging! (Path/dirname dest))
+            (cond
+              (and (not (forced?)) (installed? dest sha))
+              (let [v (run-version exe)]
+                ; A marker says the digest arrived, not that the bytes still RUN.
+                ; The smoke check is what keeps `cached` honest.
+                (if (nil? v)
+                  (let [r (install! dest asset sha)]
+                    (if (:ok? r) (ok-map dest asset sha (:version r) false) r))
+                  (ok-map dest asset sha v true)))
+
+              :else
+              (let [r (install! dest asset sha)]
+                (if (:ok? r) (ok-map dest asset sha (:version r) false) r)))))))))
