@@ -1,0 +1,124 @@
+; vm/wire.bl — the client↔daemon frame codec (ports Daemon.Protocol).
+;
+; ══ WHAT MOVED HERE (FUP-082 T2/D2) ═════════════════════════════════════════
+;
+; Every frame on the AF_UNIX {packet,4} stream is ONE Erlang term (ETF). The
+; codec is `term_to_binary` one way and `binary_to_term [:safe]` + a total,
+; allowlisted schema check the other. Pure — it binds no socket (that is
+; vm.net) — and lives in `vm.*` because any host speaking the protocol reuses
+; it. The wire shape is a CONTRACT with the Rust launcher (daemon.rs) and must
+; stay byte-identical — golden-tested.
+;
+; NB the old :accepted/:queue_position frame is GONE (PLAN-121/123: the daemon
+; never queues — each request runs as its own VM process).
+;
+;   (wire/exit id code)             → bytes   server→client terminal
+;   (wire/stdout id seq bytes)      → bytes
+;   (wire/ready meta)               → bytes
+;   (wire/decode bin)              → {:ok frame} | {:error reason}   client frames
+
+(ns vm.wire)
+
+(def VERSION 1)
+(def MAX-FRAME 16777216)
+(def MAX-ARGV 4096)
+(def MAX-PATH 4096)
+(def MAX-ENV 1024)
+(def MAX-ENV-VALUE 65536)
+(def REJECT-REASONS
+  #{:unauthorized :wrong_tree :protocol_mismatch :restart_required :shutting_down :malformed})
+
+(defn- encode [term] (erlang/apply :erlang :term_to_binary (list term)))
+
+;; ── server → client encoders ────────────────────────────────────────────────
+
+(defn ready [meta] (encode (tuple :bl VERSION :ready meta)))
+(defn reject [reason msg meta] (encode (tuple :bl VERSION :reject reason (str msg) meta)))
+(defn stdout [id seq bytes] (encode (tuple :bl VERSION :stdout id seq bytes)))
+(defn stderr [id seq bytes] (encode (tuple :bl VERSION :stderr id seq bytes)))
+(defn stdin-req [id seq prompt] (encode (tuple :bl VERSION :stdin id seq prompt)))
+(defn watch [id seq payload] (encode (tuple :bl VERSION :watch id seq payload)))
+(defn heartbeat [id] (encode (tuple :bl VERSION :heartbeat id (System/monotonic_time :millisecond))))
+(defn exit [id code] (encode (tuple :bl VERSION :exit id code)))
+(defn failed [id code msg] (encode (tuple :bl VERSION :failed id code (str msg))))
+
+;; ── decode + validate (total, allowlisted) ──────────────────────────────────
+
+(defn- opt-bin? [v] (or (nil? v) (erlang/is_binary v)))
+
+(defn- valid-arg? [a]
+  (and (erlang/is_binary a) (<= (erlang/byte_size a) MAX-PATH)))
+
+(defn- valid-env? [env]
+  (and (map? env)
+       (<= (count env) MAX-ENV)
+       (every? (fn [kv]
+                 (let [k (first kv) v (second kv)]
+                   (and (erlang/is_binary k) (erlang/is_binary v)
+                        (<= (erlang/byte_size v) MAX-ENV-VALUE))))
+               (seq env))))
+
+(defn- validate [term]
+  ;; term is an Erlang tuple {:bl, 1, tag, ...}
+  (if (not (and (erlang/is_tuple term) (>= (erlang/tuple_size term) 3)
+                (= :bl (elem term 0)) (= VERSION (elem term 1))))
+    {:error :unknown_frame}
+    (let [tag (elem term 2)]
+      (cond
+        ;; {:bl 1 :hello %{tree token …}}
+        (= tag :hello)
+        (let [m (elem term 3)
+              tree (get m :tree) token (get m :token)]
+          (if (and (erlang/is_binary tree) (= 32 (erlang/byte_size tree))
+                   (erlang/is_binary token) (= 32 (erlang/byte_size token))
+                   (opt-bin? (get m :compiler_key)) (opt-bin? (get m :daemon_build_id)))
+            {:ok (tuple :hello {:tree tree :token token
+                                :compiler_key (get m :compiler_key)
+                                :daemon_build_id (get m :daemon_build_id)})}
+            {:error :malformed}))
+
+        ;; {:bl 1 :request id %{argv cwd …}}
+        (= tag :request)
+        (let [id (elem term 3) m (elem term 4)
+              argv (get m :argv) cwd (get m :cwd)
+              env-paths (or (get m :env_paths) (list))
+              tty (or (get m :tty) {})
+              env (or (get m :env) {})]
+          (cond
+            (not (and (erlang/is_binary id) (= 16 (erlang/byte_size id))
+                      (erlang/is_list argv) (erlang/is_binary cwd))) {:error :malformed}
+            (> (count argv) MAX-ARGV) {:error :argv_too_long}
+            (not (every? valid-arg? (seq argv))) {:error :malformed}
+            (> (erlang/byte_size cwd) MAX-PATH) {:error :malformed}
+            (not (and (erlang/is_list env-paths) (every? valid-arg? (seq env-paths)))) {:error :malformed}
+            (not (map? tty)) {:error :malformed}
+            (not (valid-env? env)) {:error :malformed}
+            :else {:ok (tuple :request id {:argv argv :cwd cwd :env-paths env-paths :tty tty :env env})}))
+
+        ;; {:bl 1 :stdin_reply id seq data}
+        (= tag :stdin_reply)
+        (let [id (elem term 3) seq (elem term 4) data (elem term 5)]
+          (if (and (erlang/is_binary id) (erlang/is_integer seq)
+                   (or (erlang/is_binary data) (= data :eof)))
+            {:ok (tuple :stdin_reply id seq data)}
+            {:error :malformed}))
+
+        ;; {:bl 1 :control id op}
+        (= tag :control)
+        (let [id (elem term 3) op (elem term 4)]
+          (if (and (erlang/is_binary id) (contains? #{:status :stop} op))
+            {:ok (tuple :control id op)}
+            {:error :malformed}))
+
+        :else {:error :unknown_frame}))))
+
+(defn decode
+  "Decode one frame payload. {:ok frame} | {:error reason}. Refuses oversized
+   frames, non-ETF bytes, unsafe terms (atoms not already in the table), and any
+   shape outside the schema."
+  [bin]
+  (if (> (erlang/byte_size bin) MAX-FRAME)
+    {:error :frame_too_large}
+    (try
+      (validate (erlang/apply :erlang :binary_to_term (list bin (to-list [:safe]))))
+      (catch _ {:error :malformed}))))
