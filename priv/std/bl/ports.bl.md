@@ -28,7 +28,7 @@ these verbs print the name.
 
 ```beam-lisp silent
 (ns bl.ports
-  (:require [bl.util :as u] [vm.ports]))
+  (:require [bl.util :as u] [vm.ports] [vm.index]))
 ```
 
 ## Reading
@@ -194,7 +194,7 @@ it.
 (defn- start-index!
   "Ask the running session to index this tree, and report what it found.
 
-   The daemon owns the index (see `BeamLisp.Daemon.IndexWorker`), so this asks
+   The daemon owns the index (see `vm.index`), so this asks
    IT rather than building anything here — a conn built in this process would die
    with the command, which is the whole failure this change removes. A VM with no
    session (a cold command) has nothing to ask, and nothing to report.
@@ -204,12 +204,12 @@ it.
    daemon dropped a command's stderr; `BeamLisp.Daemon.StdErr` forwards it now, so
    the line can be on the stream it belongs to."
   []
-  (let [p (erlang/whereis :"Elixir.BeamLisp.Daemon.IndexWorker")]
-    (if (= :undefined p)
+  (let [p (vm.index/owner-pid)]
+    (if (nil? p)
       nil
       (do
-        (BeamLisp.Daemon.IndexWorker/ensure_building)
-        (let [s (BeamLisp.Daemon.IndexWorker/progress)]
+        (vm.index/ensure-building)
+        (let [s (vm.index/progress)]
           (u/io-err
             (str "  index: "
                  (case (:phase s)
