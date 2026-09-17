@@ -71,13 +71,20 @@ defmodule BeamLisp.Daemon.Server do
       _ = write_pid(ep.pid, root)
       _ = write_meta(ep.meta, root, token)
 
-      # The stateful workers — the single-worker command serializer, the
-      # watcher registry and the HTTP MCP mount owner — under one supervisor, because a bare `start_link` is
-      # linked but never RESTARTED: user code runs inside the worker, so a
-      # crash it links (`examples/mcp-demo.bl` starting an in-process MCP
-      # server) used to leave the daemon healthy-looking and permanently
-      # unable to run anything (`:noproc`). See `BeamLisp.Daemon.Workers`.
-      {:ok, _workers} = BeamLisp.Daemon.Workers.ensure_started(root: root)
+      # THE CUTOVER (PLAN-121): the COMMAND path is no longer a single serial
+      # worker. Commands now run through the pure-beam-lisp global VM manager
+      # (vm.manager) — one BEAM process per request, each under its project VM's
+      # capped env, so N requests run concurrently with no FIFO and a program's
+      # `System/halt` can only scope to its own VM.
+      #
+      # Workers still starts here for what remains legitimately serial or
+      # node-global: StdErr (the node-wide stderr router), WatchRegistry (the
+      # `bl watch` host), IndexWorker, and Executor — the latter now ONLY as the
+      # reload-commit SEQUENCER (watch_registry → Executor.run_reload), whose
+      # serialisation against a running program is load-bearing correctness
+      # (PLAN-121 D3a), not the command bottleneck. No command takes its turn.
+      {:ok, _} = BeamLisp.Daemon.Workers.ensure_started(root: root)
+      boot_vm_manager()
 
       # The session's address. `:ui` is claimed first (the registry is what
       # decides whether a project's pinned port is free), then served — the page
@@ -329,7 +336,7 @@ defmodule BeamLisp.Daemon.Server do
         refuse_owning_verb(sock, id)
 
       :no ->
-        BeamLisp.Daemon.Executor.run(sock, id, req, conn)
+        vm_execute(sock, id, req, conn)
     end
   rescue
     e -> fail_execute(sock, id, Exception.message(e))
@@ -354,6 +361,74 @@ defmodule BeamLisp.Daemon.Server do
   # the Executor would park on its single worker and every later client would
   # wait forever — the daemon would still look alive, which is the worst way to
   # fail.
+  # THE VM COMMAND RUNNER (PLAN-121). Reuses the transport plumbing the old
+  # Executor used — a per-request IO group-leader proxy so the program's stdout /
+  # stdin become wire frames, and the client's `-p` roots bound as ambient search
+  # dirs — but instead of a single serial GenServer it calls the pure-beam-lisp
+  # `bl.daemon/handle-in-vm`, which resolves the request's project VM
+  # (get-or-spawn, collision-proof id), binds the client's env PROCESS-LOCALLY
+  # (never the node-global OS table), and runs `bl.cli/run-argv` under that VM's
+  # capped env + scope. This body runs in the per-connection task the acceptor
+  # spawned, so N concurrent requests are N processes — the FIFO is gone.
+  defp vm_execute(sock, id, req, conn) do
+    proxy = BeamLisp.Daemon.IO.start(sock, id, self())
+    if is_pid(conn), do: send(conn, {:route_stdin, id, proxy})
+
+    worker = self()
+    prev_gl = Process.group_leader()
+    :erlang.group_leader(proxy, worker)
+
+    code =
+      try do
+        BeamLisp.Loader.with_ambient_dirs(vm_ambient_dirs(req), fn ->
+          handle = BeamLisp.Env.fetch!("bl.daemon", "handle-in-vm")
+          result =
+            BeamLisp.RT.invoke(handle, [req.argv, req.cwd, Map.get(req, :env) || %{}])
+
+          if is_integer(result), do: result, else: 0
+        end)
+      rescue
+        e ->
+          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: #{Exception.message(e)}\n"))
+          1
+      catch
+        :throw, v ->
+          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: uncaught throw: #{inspect(v)}\n"))
+          1
+
+        :exit, v ->
+          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: process exit: #{inspect(v)}\n"))
+          1
+      after
+        :erlang.group_leader(prev_gl, worker)
+      end
+
+    _final_seq = BeamLisp.Daemon.IO.finish(proxy)
+    frame = if is_integer(code), do: Protocol.exit(id, code), else: Protocol.exit(id, 0)
+    _ = :gen_tcp.send(sock, frame)
+    code
+  end
+
+  # The client's library roots: its cwd first, then each `-p` path resolved
+  # absolute against that cwd (same rule the old Executor used).
+  defp vm_ambient_dirs(req) do
+    cwd = req.cwd
+    paths = for p <- Map.get(req, :env_paths, []), do: Path.expand(p, cwd)
+    [cwd | paths]
+  end
+
+  # Start the pure-beam-lisp global VM manager (idempotent). Called once at
+  # boot; the manager is a named defserver (:vm-manager) that hosts every
+  # project VM for the life of the node.
+  defp boot_vm_manager do
+    BeamLisp.Loader.ensure_loaded("bl.daemon")
+    boot = BeamLisp.Env.fetch!("bl.daemon", "boot-manager")
+    BeamLisp.RT.invoke(boot, [])
+    :ok
+  rescue
+    e -> Logger.error("bl daemon: vm.manager boot failed: #{Exception.message(e)}")
+  end
+
   defp refuse_owning_verb(sock, id) do
     msg =
       "bl daemon: this command keeps its own process — run it without the daemon " <>

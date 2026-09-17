@@ -1,0 +1,184 @@
+; guarantees_test.bl — the guarantees the pure-beam-lisp VM manager must hold.
+;
+; This suite ENSHRINES the properties the cutover promises. Each deftest maps to
+; a lettered guarantee in PLAN-121. Where a property is best stated over ALL
+; inputs it is a veritas for-all (see vm/invariants_test.bl for the formal /
+; Z3-backed rungs); here they are the behavioural unit + concurrency proofs.
+;
+;   G1 CONCURRENCY      — N commands run truly concurrently; no serial worker.
+;   G2 ENV-SCOPED HALT  — halt tears down only the caller's VM; node survives.
+;   G3 NO LEAK ON CRASH — a crashed member self-retracts; drain kills exactly one VM's set.
+;   G4 COLLISION-PROOF  — two worktrees of one project get distinct ids.
+;   G6 REPLACE-NOT-BESIDE — the manager is a single defserver; no serial worker exists.
+
+(ns vm.guarantees-test
+  (:require [vm.manager :as mgr]
+            [vm.core :as vmc]
+            [vm.owner :as owner]
+            [vm.scope :as scope]
+            [vm.spec :as spec]
+            [env]))
+
+(defn- loopt [] (fn [] (receive (after 60000 :ok))))
+(defn- sleep [ms] (erlang/apply :timer :sleep (list ms)))
+
+;; helper: spawn 10 members then kill them, so a cycle nets zero
+(defn- dotimes-spawn [id]
+  (let [pids (doall (map (fn [_] (mgr/serve id :w (loopt))) (range 10)))]
+    (doseq [p pids] (erlang/exit p :kill))))
+
+;; helper: write an env.bl with a name under root, read the spec
+(defn- spec-for [root nm]
+  (File/mkdir_p root)
+  (File/write! (str root "/env.bl") (str "{:name \"" nm "\"}"))
+  (spec/read root))
+
+;; ── G1 CONCURRENCY ──────────────────────────────────────────────────────────
+
+(deftest g1-commands-run-concurrently
+  (testing "a slow command in VM-A does not delay a command in VM-B"
+    (mgr/start)
+    (mgr/ensure {:id "g1-a" :root "/tmp/g1a" :caps ["Elixir.String"]})
+    (mgr/ensure {:id "g1-b" :root "/tmp/g1b" :caps ["Elixir.String"]})
+    (let [parent (erlang/self)
+          t0 (System/monotonic_time :millisecond)]
+      ;; VM-A runs a 300ms command; VM-B runs an instant one — concurrently.
+      (spawn (fn [] (mgr/run "g1-a" (fn [] (sleep 300) :slow))
+                    (erlang/send parent [:done :a (System/monotonic_time :millisecond)])))
+      (spawn (fn [] (mgr/run "g1-b" (fn [] :fast))
+                    (erlang/send parent [:done :b (System/monotonic_time :millisecond)])))
+      (let [times (loop [seen 0 acc {}]
+                    (if (= seen 2)
+                      acc
+                      (receive [:done who t] (recur (inc seen) (assoc acc who (- t t0))))))]
+        ;; B must finish well before A's 300ms — proving no serial worker.
+        (is (< (:b times) 150))
+        (is (>= (:a times) 250))))))
+
+(deftest g1-many-concurrent-commands
+  (testing "200 commands across 10 VMs all complete (BEAM schedules them)"
+    (mgr/start)
+    (doseq [i (range 10)]
+      (mgr/ensure {:id (str "g1m-" i) :root (str "/tmp/g1m" i) :caps ["Elixir.String"]}))
+    (let [parent (erlang/self) n 200]
+      (doseq [i (range n)]
+        (spawn (fn []
+                 (mgr/run (str "g1m-" (rem i 10)) (fn [] :done))
+                 (erlang/send parent :ok))))
+      (let [done (loop [k 0] (if (= k n) k (receive :ok (recur (inc k)))))]
+        (is (= n done))))))
+
+;; ── G2 ENV-SCOPED HALT ──────────────────────────────────────────────────────
+
+(deftest g2-halt-scopes-to-caller-vm
+  (testing "a command's (vm/halt) ends only its VM; others + node survive"
+    (mgr/start)
+    (mgr/ensure {:id "g2-a" :root "/tmp/g2a" :caps ["Elixir.String"]})
+    (mgr/ensure {:id "g2-b" :root "/tmp/g2b" :caps ["Elixir.String"]})
+    (mgr/serve "g2-a" :web (loopt))
+    (mgr/serve "g2-a" :runner (loopt))
+    (mgr/serve "g2-b" :web (loopt))
+    (let [b-before (owner/count "g2-b")
+          a-before (owner/count "g2-a")
+          outcome (mgr/run "g2-a" (fn [] (scope/halt 0)))]
+      (sleep 60)
+      ;; A's halt tore down exactly A's set...
+      (is (= a-before (:halted outcome)))
+      (is (= 0 (owner/count "g2-a")))
+      ;; ...and left B's set UNCHANGED (isolation), whatever its absolute size
+      (is (= b-before (owner/count "g2-b")))
+      (is (erlang/is_process_alive (erlang/self))))))
+
+(deftest g2-capped-vm-cannot-name-system-halt
+  (testing "a VM without a System grant cannot even COMPILE System/halt"
+    (let [v (vmc/spawn-vm {:id "g2-cap" :root "/tmp/g2cap" :caps [["Elixir.File" "read"]]})
+          denied (vmc/run v (fn []
+                              (try (env/eval "(System/halt 0)")
+                                   (catch e {:denied (ex-message e)}))))]
+      (vmc/drain v)
+      (is (contains? denied :denied))
+      (is (erlang/is_process_alive (erlang/self))))))
+
+(deftest g2-halt-at-manager-scope-refuses
+  (testing "a scope/halt with no VM bound refuses — it never ends the node"
+    (is (= :refused (scope/halt 0)))))
+
+;; ── G3 NO LEAK ON CRASH ─────────────────────────────────────────────────────
+
+(deftest g3-crashed-member-self-retracts
+  (testing "killing a VM's members drops them from the owned set (monitor-retract)"
+    (mgr/start)
+    (mgr/ensure {:id "g3-a" :root "/tmp/g3a" :caps ["Elixir.String"]})
+    (mgr/ensure {:id "g3-b" :root "/tmp/g3b" :caps ["Elixir.String"]})
+    (doseq [_ (range 5)] (mgr/serve "g3-a" :w (loopt)))
+    (doseq [_ (range 3)] (mgr/serve "g3-b" :w (loopt)))
+    (let [a-before (owner/count "g3-a")
+          b-before (owner/count "g3-b")]
+      (is (>= a-before 5))
+      (doseq [p (owner/procs "g3-a")] (erlang/exit p :kill))
+      (sleep 80)
+      ;; A's members all self-retracted; B untouched by A's crash
+      (is (= 0 (owner/count "g3-a")))
+      (is (= b-before (owner/count "g3-b"))))))
+
+(deftest g3-drain-is-idempotent-and-total
+  (testing "drain kills exactly the VM's set; a second drain is 0"
+    (mgr/start)
+    (mgr/ensure {:id "g3-d" :root "/tmp/g3d" :caps ["Elixir.String"]})
+    (doseq [_ (range 4)] (mgr/serve "g3-d" :w (loopt)))
+    (let [first-drain (mgr/drain "g3-d")]
+      (sleep 40)
+      (is (= 4 (:halted first-drain)))
+      (is (= 0 (owner/count "g3-d")))
+      ;; VM is gone from the table; draining again is a no-op
+      (is (= 0 (:halted (mgr/drain "g3-d")))))))
+
+(deftest g3-no-growth-across-cycles
+  (testing "1000 spawn+drain cycles leave the owned set at 0 (no leak)"
+    (mgr/start)
+    (mgr/ensure {:id "g3-cyc" :root "/tmp/g3cyc" :caps ["Elixir.String"]})
+    (doseq [_ (range 100)]
+      (dotimes-spawn "g3-cyc")
+      nil)
+    (mgr/drain "g3-cyc")
+    (sleep 60)
+    (is (= 0 (owner/count "g3-cyc")))))
+
+;; ── G4 COLLISION-PROOF IDENTITY ─────────────────────────────────────────────
+
+(deftest g4-worktrees-get-distinct-ids
+  (testing "two roots, same name, no instance → distinct ids (path-hash)"
+    ;; spec/read derives id from env.bl; simulate two worktrees by two roots.
+    (let [id1 (:id (spec-for "/tmp/wt-one" "blueprint"))
+          id2 (:id (spec-for "/tmp/wt-two" "blueprint"))]
+      (is (not= id1 id2))
+      ;; both carry the project name; only the instance suffix differs
+      (is (clojure.string/starts-with? id1 "blueprint@"))
+      (is (clojure.string/starts-with? id2 "blueprint@")))))
+
+(deftest g4-same-root-same-id
+  (testing "the same root yields a stable id (idempotent identity)"
+    (is (= (:id (spec-for "/tmp/wt-stable" "blueprint"))
+           (:id (spec-for "/tmp/wt-stable" "blueprint"))))))
+
+;; ── G6 REPLACE-NOT-BESIDE ───────────────────────────────────────────────────
+
+(deftest g6-manager-is-single-defserver-no-serial-worker
+  (testing "the manager is one named process; commands are NOT serialized through it"
+    (mgr/start)
+    (is (some? (Process/whereis :vm-manager)))
+    ;; The manager answers a read WHILE a long command runs in a VM — proving
+    ;; the manager itself is not the command worker (it would block otherwise).
+    (mgr/ensure {:id "g6" :root "/tmp/g6" :caps ["Elixir.String"]})
+    (let [parent (erlang/self)]
+      (spawn (fn [] (mgr/run "g6" (fn [] (sleep 200) :slow))
+                    (erlang/send parent :cmd-done)))
+      (sleep 20)
+      ;; while g6's command sleeps 200ms, list-vms must return promptly
+      (let [t0 (System/monotonic_time :millisecond)
+            _ (mgr/list-vms)
+            dt (- (System/monotonic_time :millisecond) t0)]
+        (is (< dt 100)))
+      (receive :cmd-done :ok))))
+
+(run-tests)

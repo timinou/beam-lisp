@@ -79,16 +79,6 @@ defmodule BeamLisp.Daemon.Executor do
     ArgumentError -> %{busy: nil, queued: 0}
   end
 
-  @doc """
-  Submit a client request for serialized execution. `conn` is the connection
-  handler pid (receives stdin routing); returns after the command completes and
-  the terminal frame is sent. Blocking by design — the caller is the per-conn
-  handler, one per client.
-  """
-  def run(server \\ __MODULE__, sock, id, req, conn) do
-    GenServer.call(server, {:run, sock, id, req, conn}, :infinity)
-  end
-
   @doc "Current queue depth: how many commands run before one submitted now."
   def queue_depth(server \\ __MODULE__) do
     _ = server
@@ -130,24 +120,7 @@ defmodule BeamLisp.Daemon.Executor do
 
     :ets.insert(@state_table, {:busy, nil})
 
-    {:ok, %{active: 0, handler: Keyword.get(opts, :handler, &default_handler/2)}}
-  end
-
-  @impl true
-  def handle_call({:run, sock, id, req, conn}, _from, state) do
-    # Serialized: this call blocks the executor until the command finishes, so
-    # only one program runs at a time. Concurrent clients queue in the mailbox —
-    # and now a client can SEE that, and choose not to (launcher: busy → cold).
-    publish(%{argv: req.argv, cwd: req.cwd})
-
-    code =
-      try do
-        execute(sock, id, req, conn, state.handler)
-      after
-        publish(nil)
-      end
-
-    {:reply, code, state}
+    {:ok, %{active: 0}}
   end
 
   @impl true
@@ -202,100 +175,13 @@ defmodule BeamLisp.Daemon.Executor do
     ArgumentError -> :ok
   end
 
-  # --- execution ---
-
-  defp execute(sock, id, req, conn, handler) do
-    proxy = IO.start(sock, id, self())
-    # route this request's stdin replies from the connection handler to the proxy
-    if is_pid(conn), do: send(conn, {:route_stdin, id, proxy})
-
-    worker = self()
-    prev_gl = Process.group_leader()
-    :erlang.group_leader(proxy, worker)
-
-    code =
-      try do
-        BeamLisp.Env.isolated(:global, fn ->
-          # THE CALLER'S ENVIRONMENT IS THE PROGRAM'S ENVIRONMENT. The fork above
-          # starts from the daemon's env; this corrects it to what the caller
-          # actually had, so a warm run and a cold run of one command are the same
-          # program (D17 measured the difference: `FOO=bar bl eval …` answered nil
-          # warm, bar cold). A request from an older launcher carries no `env`,
-          # and then nothing changes.
-          apply_env(Map.get(req, :env))
-
-          BeamLisp.Loader.with_ambient_dirs(ambient_dirs(req), fn ->
-            # The program argv (post-`--`) is bound by `bl.cli/cmd-run` from the
-            # parsed `:dd`; the handler owns that. Here we only fix the roots
-            # and the fresh env; the language dispatch does the rest.
-            handler.(req.argv, req.cwd)
-          end)
-        end)
-      rescue
-        e ->
-          msg = Exception.message(e)
-          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: #{msg}\n"))
-          1
-      catch
-        :throw, v ->
-          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: uncaught throw: #{inspect(v)}\n"))
-          1
-
-        :exit, v ->
-          _ = :gen_tcp.send(sock, Protocol.stderr(id, 999_999, "bl: process exit: #{inspect(v)}\n"))
-          1
-      after
-        :erlang.group_leader(prev_gl, worker)
-      end
-
-    # order the terminal frame after the last output flush
-    _final_seq = IO.finish(proxy)
-
-    frame = if is_integer(code), do: Protocol.exit(id, code), else: Protocol.exit(id, 0)
-    _ = :gen_tcp.send(sock, frame)
-    code
-  end
-
-  # `nil`/absent env (an older launcher) means "change nothing".
-  defp apply_env(nil), do: :ok
-  defp apply_env(env) when map_size(env) == 0, do: :ok
-
-  # Faithful REPLACE, minus what the daemon itself needs to keep running. A
-  # request that did not carry those would otherwise strip the worker's own
-  # runtime (BL_* handles, the XDG dirs, HOME, TMPDIR) along with the caller's
-  # environment — the fork is the daemon's, and these are the daemon's own.
-  @daemon_keeps ~w(BL_BIN BL_DAEMON_ROOT XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME HOME TMPDIR)
-
-  defp apply_env(env) when is_map(env) do
-    for {k, _v} <- System.get_env(), not Map.has_key?(env, k), k not in @daemon_keeps do
-      System.delete_env(k)
-    end
-
-    for {k, v} <- env, do: System.put_env(k, v)
-    :ok
-  end
-
-  # The client's roots: its cwd first, then each `-p` path resolved to absolute
-  # against that cwd, then the daemon's own extra dirs so libraries in the
-  # checkout still resolve.
-  defp ambient_dirs(req) do
-    cwd = req.cwd
-    paths = for p <- req.env_paths, do: Path.expand(p, cwd)
-    [cwd | paths]
-  end
-
-
-  # The command handler: route through the beam-lisp `bl.daemon/handle`, which
-  # binds cwd and dispatches via the SAME `bl.cli/run-argv` a standalone `bl`
-  # runs. The worker's group leader is the IO proxy, so every print the program
-  # performs becomes a client frame. The result is an exit-code integer.
-  #
-  # `cwd` is already bound linguistically inside handle/2; it is also passed so
-  # a caller-injected test handler can use it directly.
-  defp default_handler(argv, cwd) do
-    BeamLisp.Loader.ensure_loaded("bl.daemon")
-    handle = BeamLisp.Env.fetch!("bl.daemon", "handle")
-    code = BeamLisp.RT.invoke(handle, [argv, cwd])
-    if is_integer(code), do: code, else: 0
-  end
+  # ── NOTE (PLAN-121 cutover) ──────────────────────────────────────────────
+  # The single-serial-worker COMMAND path (run/4, handle_call({:run,…}),
+  # execute/5, and the node-global apply_env) has been REMOVED. Commands now run
+  # through the pure-beam-lisp VM manager via BeamLisp.Daemon.Server.vm_execute
+  # → bl.daemon/handle-in-vm — one BEAM process per request, env bound
+  # PROCESS-LOCALLY (the old apply_env mutated the node-global OS env, a race the
+  # FIFO masked). What remains here is the reload-commit SEQUENCER (run_reload)
+  # and the dashboard-intent runner (run_capture), both legitimately serial, plus
+  # the published busy row that inspect/listener still read.
 end

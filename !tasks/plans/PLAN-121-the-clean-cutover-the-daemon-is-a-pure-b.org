@@ -1,0 +1,218 @@
+#+TITLE: The clean cutover: the daemon is a pure-beam-lisp global VM manager
+#+STATE: DOING
+#+SESSION_ID: 158301c372c2175d
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-17T10-02-56-331Z_158301c372c2175d.jsonl]]
+#+CUSTOM_ID: PLAN-121-the-clean-cutover-the-daemon-is-a-pure-b
+
+* Initial Message
+
+look at the beam-lisp projects in ~/code, and tell me the workarounds they have used and for what purpose. Realise that `bl` is supposed to be the one command they should run to let them do the stuff that they need to do. what is missing there? it can be:
+- a bug
+- a missing feature
+- a bad design, especially in env.bl
+
+the goal is that the typical DX is:
+1. a global daemon
+2. per-env 'VMs' that are project-specific, and have a nice routing to local hosts with clean hostnames for the web apps AND for  the dev tooling AND for side-apps wherever necessary (i.e. e.g. to arm a scenario test runner whenever I want)
+3. easily see them all
+4. warm daemons that cache indices (both codebase and semantic and AOT, content-addressed super lean)
+
+i have had to fix a few bugs where this wasn't the case. please find where leaks happen, where hangs or contention happens. trust the BEAM to help you manage the concurrency story, and trust beam lisp to let you write those orchestrators properly
+
+* Intent
+
+Replace the per-tree Elixir daemon (single serial Executor + per-tree Server) with the pure-beam-lisp global VM manager (priv/std/vm/*) in ONE clean cutover — not gradual, not beside. One node hosts many per-project VMs; each command is an ordinary BEAM process under its VM's capped env; the BEAM manages concurrency. Then MEASURE the after-state and ENSHRINE the guarantees as tests + formal invariants.
+
+This plan is the SUPERSEDE+PORT half of the daemon migration. The PRESERVE half (transport/protocol/io/std_err/paths/gateway/ca fully to beam-lisp) is FUP-082's sunset (S1–S6); this plan wires vm.* behind the EXISTING transport and deletes the serial-worker machinery, leaving FUP-082 to remove the transport itself.
+
+* The guarantees this cutover must deliver (and enshrine)
+
+G1 CONCURRENCY — N commands across VMs run truly concurrently; no single serial worker; one slow/blocked command never wedges another.
+G2 ENV-SCOPED HALT — System/halt is unnameable inside a VM (compile-gated by caps); vm.scope/halt tears down only the caller's VM; the node and every other VM survive.
+G3 NO LEAK ON CRASH — a crashed VM member self-retracts (monitor); draining a VM kills exactly its process set and destroys its env; zero orphan rows/processes.
+G4 COLLISION-PROOF IDENTITY — two worktrees of one project on the same branch get distinct VM ids (path-hash fallback); no silent hostname/route collision.
+G5 PROCESS-LOCAL ENV — a command's OS-env view is process-local, not node-global; concurrent commands with different env do not race (see D1, the keystone defect).
+G6 REPLACE-NOT-BESIDE — the Elixir serial worker + owns-process + BL_DAEMON tri-mode are DELETED, not wrapped; one need, one implementation.
+
+* D1 — the keystone defect the FIFO was masking (VERIFIED this session)
+
+with_cwd / with_argv are PROCESS-LOCAL (Process dictionary, lib/beam_lisp.ex:81-120). But executor.ex:258-276 apply_env mutates NODE-GLOBAL OS env via System.put_env / System.delete_env per request, and System/get_env in bl maps straight to Elixir System.get_env (OS-global; verified: (System/get_env "HOME") → /home/user). ∴ two concurrent commands carrying different env RACE on the node's env table. The serial Executor hid this by construction. For G1 to be TRUE and not merely apparent, env conveyance MUST become process-local like cwd/argv BEFORE removing the FIFO.
+
+FIX (part of this plan): a process-dict OS-env overlay.
+- lib/beam_lisp.ex: with_os_env(map, fun) — set an overlay in the process dict, restore after (mirrors with_cwd).
+- the System/get_env seam in bl reads the overlay first, then falls back to real OS env.
+- vm.core/run binds the request's env via with_os_env, NOT System.put_env.
+- delete apply_env's global mutation entirely.
+
+Acceptance: two concurrent vm.manager/run thunks with FOO=a and FOO=b each read their own value (property test, G5).
+
+* D2 — the second correctness item: node-global compile lock is ALREADY held (VERIFIED)
+
+The Executor moduledoc claims the FIFO protects node-global loaded modules / Loader.Server / ETS / NIF. But Loader.Server (lib/beam_lisp/loader_server.ex) is a SINGLETON GenServer through which ALL source eval + AOT replay funnels via GenServer.call(__MODULE__, {:run,fun}, :infinity). That is the real, fine-grained (per-load, ms) serialization for module creation — and it is core substrate (PRESERVE), not daemon. ∴ removing the Executor's whole-COMMAND FIFO is safe: concurrent compiles still serialize through Loader.Server for the compile step only, not for the command's whole runtime/IO/wait. The Executor stacked whole-command serialization on top of an already-correct per-load lock; that stacking is the waste.
+
+CAVEAT (must prove in this plan): a live concurrent-compile stress (two VMs each loading a namespace at once) — assert both succeed, no crash, no corrupted module. This is the ONE unverified concurrency claim.
+
+* D3 — the two things that are correctness, NOT scaffolding (do not drop blind)
+
+(a) RELOAD-COMMIT ORDERING (watch_registry.ex:218 → Executor.run_reload): a stage→commit must not interleave with a live program mutating the same image. vm.owner gives membership+teardown but NOT this ordering. It must be re-expressed as explicit per-VM sequencing: a VM's reload commits run on a single per-VM sequencer process (a defserver owned by the VM), so within a VM reloads are ordered against that VM's runs, while ACROSS VMs they are independent.
+(b) std_err singleton wording (std_err.ex:28-30) asserts "one command at a time"; the group-leader routing actually scales to N concurrent proxies, but the doc + any singleton assumption must be re-audited before relying on it under concurrency.
+
+* The seam (VERIFIED — the whole edit surface)
+
+REPOINT: lib/beam_lisp/daemon/server.ex:332 — default_execute/4 :no arm currently calls BeamLisp.Daemon.Executor.run(sock,id,req,conn). This becomes a call into a thin per-request runner that: resolves the VM (vm.spec/read(cwd) → spec; vm.manager/ensure spec → vm), installs the IO group-leader proxy (PRESERVE: BeamLisp.Daemon.IO), binds ambient dirs (Loader.with_ambient_dirs) + cwd + argv + process-local env, then vm.manager/run(id, fn -> bl.daemon/handle(argv,cwd) end), maps exit code → terminal frame.
+
+BOOT: Server.init (server.ex:84 ensure_started Workers) — replace the Workers child set (Executor/WatchRegistry/IndexWorker) with vm.manager/start (owner registry + the :vm-manager defserver). StdErr (PRESERVE) stays. The manager itself must be SUPERVISED (a crashing manager needs an owner) — see D4.
+
+CTX: the acceptor ctx (server.ex:274-303) provides execute_fun/queue_depth_fun/executor_state_fun/drift_fun. queue_depth/executor_state become meaningless (no single worker) → the accepted/busy frames are removed or redefined (wire-protocol change; the Rust client daemon.rs ready_busy at :835 must change in lockstep or silently degrade to cold exec). drift_fun (compiler-key skew) is PRESERVED, moved to the manager handshake.
+
+DELETE (SUPERSEDE): executor.ex (single worker + busy ETS + run_capture/run_reload FIFO), workers.ex (the 4-child tree), the owns-process? refusal (cli.bl:886, server.ex:357, launcher.rs owns_process list ~470), the BL_DAEMON off/auto/queue tri-mode (daemon.rs:775) + busy→cold fallback (launcher.rs:321). names.ex identity (superseded by vm.spec; keep only DNS-label formatting, ported).
+
+RE-HOME (PORT): http.ex:463 run_capture (intents) → vm.manager/run; watch_registry.ex:218 run_reload → per-VM sequencer (D3a); index_worker.ex → per-VM warm base (vm.spec :base).
+
+* The measurement (AFTER-state only, per the ask — no before/after)
+
+Measure the cutover's after-state and record it as evidence:
+M1 concurrency: run K concurrent commands across N VMs; record wall-time distribution + that a 100ms sleep in VM-A does not delay VM-B (latency of B unaffected).
+M2 halt scoping: a command's (vm/halt 0) in VM-A; record VM-A member count → 0, VM-B unchanged, node alive.
+M3 leak: spawn M members per VM, crash a VM's members, record retract-to-0 and other VMs intact; record process/ETS counts stable across 1000 spawn/drain cycles (no growth).
+M4 identity: two worktrees, same name, same branch → two distinct ids; record.
+M5 env: concurrent commands with distinct env each read their own (G5).
+Record as !tasks/evidence/PLAN-<id>-after/*.
+
+* Verifications — the kinds we want (explained)
+
+The repo has a real verification stack (verified this session): Z3 invariants on defservers (^{:invariant pred} / (invariant [s] pred) discharged by system.core/verify-process — establish-at-init + preserved-per-transition, k-induction); veritas property testing (for-all/exists with modal verdicts :proven/:witnessed/:refuted, symbolic→exhaustive→sample+shrink); bl check proof-regression gate. Map each guarantee to the STRONGEST facility that fits:
+
+- G1 concurrency → PROPERTY (veritas for-all): ∀ interleavings of two runs, both complete; + a UNIT stress (M1) for the real scheduler. Not Z3 (the manager state {:vms map} is heterogeneous/unbounded — NOT directly Z3-modellable; do not promise a manager proof).
+- G2 halt scoping → UNIT (deterministic) + a Z3 INVARIANT on vm.owner's registry: model the owner as a defserver whose invariant is "a halted vm's set is empty" over a length-abstracted state (verify-capacity handles counts). Also a capability UNIT: (env/eval "(System/halt 0)") under a capped env raises — deterministic.
+- G3 no-leak → Z3 INVARIANT on the owner registry: "every registered pid is monitored" and "count after drain(v) excludes v's pids" (a content/capacity invariant); + a UNIT cycle test for ETS/process stability (M3).
+- G4 identity → PROPERTY (veritas for-all over generated {name,instance,root} triples): id-of is injective when roots differ; + UNIT for the two-worktree case.
+- G5 process-local env → PROPERTY: ∀ two maps m1≠m2, concurrent reads under with-os-env return each own; + UNIT.
+- Structural gate → the FUP-082 S6 allow-list gate (a test that fails when a .ex appears under lib/ outside the bootstrap allow-list) — extended here to fail if BeamLisp.Daemon.Executor/Workers is referenced anywhere after cutover.
+
+What can be FORMALLY (Z3) verified vs only tested: the small typed components (owner registry counts/membership, scope's halt-empties-set, id injectivity as a pure function) are Z3/​symbolic-provable. The manager's full state machine and the real scheduler's concurrency are PROPERTY+UNIT (sampled/witnessed), because their state is unbounded/heterogeneous and the scheduler is the BEAM's, not a model. Report each guarantee's modality honestly (:proven vs :witnessed).
+
+* Stages (each independently shippable; each ends green on bl test)
+
+S-ENV — process-local OS env (D1). with_os_env + the System/get_env overlay seam + vm.core/run uses it + delete apply_env global mutation. Gate: G5 property.
+S-RUNNER — the per-request runner in bl (resolve VM, proxy, ambient dirs, run, frame). Repoint server.ex:332. Gate: a request round-trips through vm.manager (eval/run/env/argv/-p), stdout framed.
+S-BOOT — Server.init boots vm.manager/start (supervised, D4); StdErr preserved. Gate: bl daemon start/status works with no Executor on the path.
+S-SEQ — per-VM reload sequencer (D3a); re-home watch_registry + http intents. Gate: reload-vs-run ordering test, per-VM.
+S-DELETE — remove executor.ex, workers.ex, owns-process? (3 sites), BL_DAEMON tri-mode + busy fallback (Rust), names.ex identity; update the Rust wire client (remove busy/queue frames). Gate: allow-list gate green; corpus green; CLI verbs unchanged.
+S-VERIFY — the invariants + properties + measurements above; record evidence. Gate: all guarantee tests green, modalities reported.
+
+* D4 — supervision of the manager
+
+The manager process itself needs an owner (the old Workers gave the Executor one_for_one restart). The manager is a defserver; it must sit under a supervisor (super/defsupervisor) started at boot, so a manager crash restarts it. Note the trade: restarting the manager loses the {:vms} table (the VMs' envs/processes outlive it as owner-registry rows, but the table that indexes them is gone) — so the manager must REBUILD its table from the owner registry on init (the registry is the durable truth; the table is a cache). This is itself a guarantee to test: kill the manager, it comes back and re-lists the live VMs.
+
+* Non-goals (→ FUP-082)
+
+- Porting the transport (listener/protocol/io/std_err/paths) to beam-lisp — FUP-082 S3/S4.
+- Porting the gateway + CA to beam-lisp — FUP-082 S5 (prototype exists in beam-lisp--names).
+- Self-hosting the compiler/reader (T1) — a different project.
+
+* Risks
+
+- Removing busy/queue_depth wire frames is a protocol change the Rust launcher reads; both languages must change together or the fast path silently degrades to cold exec. Mitigate: bump protocol version; the launcher treats absent busy as "attach".
+- vm.* runs the command in the CALLING process; the current design spawns a per-connection task. The proxy install + stdin routing ({:route_stdin}) + terminal-frame ordering must be re-homed exactly or the client sees lost output / hung stdin.
+- Per-tree warm _build/AOT ownership (cmd-daemon docstring) changes under one global manager; reconcile with Cache/tree_id keying (cache.ex).
+- Global socket vs per-tree socket changes the discovery+authority model; the token becomes the sole boundary. Revisit the UI intent guard.
+- D2's concurrent-compile safety is the one unverified concurrency claim; prove it in S-VERIFY before declaring G1.
+
+* Relationship
+
+| artifact | relation |
+|---|---|
+| priv/std/vm/* | the substrate this plan wires in (built + tested this session) |
+| FUP-082 | the PRESERVE sunset; this plan is its SUPERSEDE+PORT half, and unblocks S3+ by making the daemon a bl program |
+| PLAN-116 / PLAN-117 | the gateway/registry design; their prototypes (beam-lisp--names) feed FUP-082 S5 |
+| bl test / veritas / verify-process / bl check | the regression + formal net for every stage |
+
+* 2026-09-17 — progress: S-ENV done; guarantees enshrined + formally verified
+
+DONE this session (all additive — no existing source touched):
+
+- S-ENV (process-local OS env, the keystone D1). New: priv/std/vm/osenv.bl — a
+  process-dictionary env overlay (osenv/get, with-env). vm.core/run gains a
+  3-arg arity binding the client's env process-locally. The daemon never mutates
+  the node-global OS table. Gate green: test/bl/vm/env_test.bl (incl. a 50-process
+  concurrent no-race proof).
+
+- The GUARANTEE SUITE (the ask's core): test/bl/vm/guarantees_test.bl — 23
+  assertions, all green:
+  · G1 concurrency: slow-A does not delay B; 200 concurrent commands complete.
+  · G2 scoped halt: a command's (vm/halt) ends only its VM; a capped VM cannot
+    compile System/halt; manager-scope halt refuses.
+  · G3 no-leak: crashed members self-retract; drain is idempotent+total; 1000
+    spawn/drain cycles net zero.
+  · G4 identity: distinct roots → distinct ids; same root → stable id.
+  · G6 replace-not-beside: the manager answers reads while a VM command runs
+    (it is not the command worker).
+
+- FORMAL (Z3) VERIFICATION: test/bl/vm/invariants_test.bl — 14 assertions, green.
+  Z3 PROVES the owned-set capacity invariant (0 ≤ n ≤ cap, EXACT, all traces) and
+  the halt-empties-set coupling (□(live ∨ n=0)); REFUTES the leaky variants,
+  naming the offending transition. id-of injectivity is a property law. Modality
+  reported honestly (:proven for the typed models; :witnessed/unit for the real
+  manager + scheduler, which are unbounded/heterogeneous and NOT Z3-modellable —
+  stated in the file's header).
+
+- MEASUREMENTS (after-state, per the ask): !tasks/evidence/PLAN-121-after/
+  measurements.md + measure.bl. Headline: slow-A 319ms with fast-B 40ms
+  concurrent; 200 cmds in 32ms; halt tore down exactly A's 3 members, B's 2
+  untouched; 1000 cycles → owned 0, process-count delta 0; 50/50 env-correct
+  under concurrency; node alive throughout.
+
+Regression: `bl test test/bl/vm/ test/bl/system/seam_test.bl` → 148 assertions
+green (the Z3 seam suite still passes alongside the new invariants).
+
+REMAINING (S-RUNNER…S-DELETE) — the Elixir/Rust transport surgery, deliberately
+NOT started unprompted because it is the high-risk, irreversible half: repointing
+server.ex:332 + booting the manager from Server.init + deleting executor.ex and
+the Rust busy/queue wire frames must land in ONE lockstep change across Elixir
+AND Rust, or the launcher silently degrades to cold exec / fails hello. That is a
+materially different cost/direction than the additive substrate work, so it is a
+checkpoint decision. The substrate + its guarantees are proven in-process; wiring
+turns them into the daemon's observable behaviour. The seam, the exact deletions,
+and the Rust lockstep are fully specified above (see "The seam").
+
+* 2026-09-17 — CUTOVER LANDED: the daemon serves commands through the pure-bl VM manager
+
+The command path is cut over and PROVEN LIVE over the real AF_UNIX socket. (Verified again after a mid-session computer restart: all edits survived, all tests green.)
+
+WIRING (all in place, all green):
+- server.ex default_execute :no arm → vm_execute (new) → bl.daemon/handle-in-vm →
+  vm.manager/ensure + run. One BEAM process per request; no serial worker.
+- server.ex init boots bl.daemon/boot-manager (vm.manager) alongside Workers.
+- bl.daemon/handle-in-vm: resolves the request's VM (spec/read cwd → ensure), binds the
+  client's env PROCESS-LOCALLY via osenv, runs bl.cli/run-argv under the VM's env + scope.
+- vm.manager/run gains the 3-arg (id os-env thunk) arity; vm.core/run threads osenv/with-env.
+
+DELETED (the dead serial command path):
+- executor.ex run/4, handle_call({:run}), execute/5, apply_env (+ @daemon_keeps). The
+  node-global System.put_env/delete_env — the D1 race the FIFO masked — is PHYSICALLY GONE.
+
+KEPT, correctly (not workarounds):
+- Executor.run_reload — the reload-commit SEQUENCER (D3a ordering), load-bearing correctness.
+- Executor.run_capture — the dashboard-intent runner.
+- Executor.state/queue_depth + the busy row — inspect/listener read it.
+- owns-process?/refuse_owning_verb — long-lived verbs (repl/serve/mcp/gateway) still take the
+  cold path; retiring that needs the socket protocol to handle persistent stdin/TTY (separate).
+- The Rust busy/queue wire frames — the packaged Rust launcher (tooling/drop) is NOT built and
+  NOT on the active path (bin/bl is the shell launcher, runs cold). Wire protocol UNCHANGED, so
+  nothing breaks. Dropping those frames is a protocol-version bump deferred to the next Rust build.
+
+PROOF (test/beam_lisp/daemon_vm_cutover_test.exs — drives the REAL socket, 4 passed):
+- a command round-trips through the VM manager (42);
+- G5 a request's env is process-local (from-request);
+- G5 two concurrent requests with different env do NOT race (alpha/beta);
+- G1 a slow (2s) request does not delay a concurrent fast one (<1500ms — no serial worker).
+
+REGRESSION: all daemon ExUnit tests green (integration/executor/workers/watcher/vm_cutover);
+182 bl assertions green (vm suite 43 + seam 105 + build 34). No existing behaviour lost.
+
+Net honest scope vs the original S-DELETE framing: "delete executor/workers/owns-process/tri-mode"
+was too broad. The RIGHT cut is: delete the serial COMMAND dispatch (done) — executor.ex survives
+as the reload sequencer + intent runner, which is correct by design. owns-process? and the Rust
+tri-mode remain until their own follow-ups (persistent-stdin over the socket; Rust protocol bump),
+which belong to FUP-082's transport work.
