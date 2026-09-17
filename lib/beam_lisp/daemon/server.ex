@@ -289,10 +289,6 @@ defmodule BeamLisp.Daemon.Server do
       execute_fun: state.execute_fun,
       ui_port: (state.ui && state.ui.port) || nil,
       control_fun: fn :stop -> GenServer.cast(__MODULE__, :stop) end,
-      queue_depth_fun: fn -> BeamLisp.Daemon.Executor.queue_depth() end,
-      # What the worker is running, so the handshake can say "busy" before a
-      # client sends anything (the launcher's busy → cold decision).
-      executor_state_fun: fn -> BeamLisp.Daemon.Executor.state() end,
       # Self-drift: has the checkout changed under the running daemon? Compare
       # the key we booted with to the live on-disk key. If it moved, this VM is
       # stale and MUST be restarted, never trusted — hot-swapping would mix old
@@ -328,12 +324,13 @@ defmodule BeamLisp.Daemon.Server do
   # `Executor.run_reload/2` — which is what orders a reload against the runs and
   # tests the daemon is serving. Every other argv path is unchanged.
   defp default_execute(sock, id, req, conn) do
+    # PLAN-121/123: no verb is REFUSED. A long-lived command (repl, serve, mcp)
+    # is just a process under its VM's capped env — the single serial worker it
+    # would have parked is gone. `bl watch` is still HOSTED here (dedup + reload
+    # ordering, not a bottleneck); every other argv runs in its VM via vm_execute.
     case watch_request(req.argv, req.cwd) do
       {:ok, st} ->
         watch_session(sock, id, req, conn, st)
-
-      :refuse ->
-        refuse_owning_verb(sock, id)
 
       :no ->
         vm_execute(sock, id, req, conn)
@@ -352,24 +349,6 @@ defmodule BeamLisp.Daemon.Server do
     :exit, reason -> fail_execute(sock, id, "the command worker died: #{inspect(reason)}")
   end
 
-  # The commands that own their process for as long as it lives: a repl waiting
-  # on stdin, a server, a watcher that repaints, an editor/agent transport, or a
-  # project task declared `:watch`. The launcher already sends the first four to
-  # a cold VM (see `owns_process` in tooling/drop/src/launcher.rs), so this is
-  # the SAFETY NET for a spelling its own token test misses (`bl -p lib repl`)
-  # and for the project-declared kind it cannot know about at all. Without it
-  # the Executor would park on its single worker and every later client would
-  # wait forever — the daemon would still look alive, which is the worst way to
-  # fail.
-  # THE VM COMMAND RUNNER (PLAN-121). Reuses the transport plumbing the old
-  # Executor used — a per-request IO group-leader proxy so the program's stdout /
-  # stdin become wire frames, and the client's `-p` roots bound as ambient search
-  # dirs — but instead of a single serial GenServer it calls the pure-beam-lisp
-  # `bl.daemon/handle-in-vm`, which resolves the request's project VM
-  # (get-or-spawn, collision-proof id), binds the client's env PROCESS-LOCALLY
-  # (never the node-global OS table), and runs `bl.cli/run-argv` under that VM's
-  # capped env + scope. This body runs in the per-connection task the acceptor
-  # spawned, so N concurrent requests are N processes — the FIFO is gone.
   defp vm_execute(sock, id, req, conn) do
     proxy = BeamLisp.Daemon.IO.start(sock, id, self())
     if is_pid(conn), do: send(conn, {:route_stdin, id, proxy})
@@ -429,52 +408,23 @@ defmodule BeamLisp.Daemon.Server do
     e -> Logger.error("bl daemon: vm.manager boot failed: #{Exception.message(e)}")
   end
 
-  defp refuse_owning_verb(sock, id) do
-    msg =
-      "bl daemon: this command keeps its own process — run it without the daemon " <>
-        "(BL_DAEMON=off bl ...)\n"
 
-    _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, msg))
-    _ = :gen_tcp.send(sock, Protocol.exit(id, 1))
-    1
-  end
-
-  # The message is a STRING, not an exception: two callers reach here — a
-  # command that raised (message from the exception) and a command worker that
-  # died (message from the exit reason).
   defp fail_execute(sock, id, message) when is_binary(message) do
     _ = :gen_tcp.send(sock, Protocol.stderr(id, 0, "bl daemon: #{message}\n"))
     _ = :gen_tcp.send(sock, Protocol.exit(id, 70))
     70
   end
 
-  # Which of the three ways a request can go: a `bl watch` session the daemon
-  # HOSTS, a command that keeps its own process (refused), or ordinary work for
-  # the Executor.
-  #
-  # The decision is the CLI's OWN: `parse-argv` plus `bl.cli/owns-process?`, on
-  # the CLIENT's cwd — the same grammar and the same project file a standalone
-  # `bl` reads, so the two hosts cannot disagree about which spelling must go
-  # cold. There is no cheap token pre-filter any more: a task name is only
-  # knowable through the project, and a watch that fell through to the Executor
-  # would park the single worker forever.
-  defp watch_request(argv, cwd) do
+  # Which of the two ways a request can go: a `bl watch` session the daemon
+  # HOSTS (dedup + reload ordering), or ordinary work that runs in its VM via
+  # `vm_execute`. Nothing is refused — a long-lived command is just a process
+  # under its VM's env (PLAN-121). The decision is the CLI's OWN `parse-argv`,
+  # so the daemon and a standalone `bl` cannot disagree about what `watch` is.
+  defp watch_request(argv, _cwd) do
     st = parse_argv(argv)
-
-    cond do
-      st.cmd == "watch" -> {:ok, st}
-      owns_process?(argv, cwd) -> :refuse
-      true -> :no
-    end
+    if st.cmd == "watch", do: {:ok, st}, else: :no
   end
 
-  # The CLI's answer to "does this command keep its process?"
-  defp owns_process?(argv, cwd) do
-    fun = BeamLisp.Env.fetch!("bl.cli", "owns-process?")
-    BeamLisp.RT.invoke(fun, [argv, cwd]) == true
-  rescue
-    _ -> false
-  end
 
   # A watch session. Frames it emits, all on the request id:
   #

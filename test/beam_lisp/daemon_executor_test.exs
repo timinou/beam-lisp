@@ -100,9 +100,6 @@ defmodule BeamLisp.DaemonExecutorTest do
       File.rm_rf!(dir)
     end
 
-    test "queue_depth is 0 when idle", _ctx do
-      assert BeamLisp.Daemon.Executor.queue_depth() == 0
-    end
   end
 
   # ── helpers ──

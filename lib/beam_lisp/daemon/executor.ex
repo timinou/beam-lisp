@@ -1,132 +1,58 @@
 defmodule BeamLisp.Daemon.Executor do
   @moduledoc """
-  The daemon's serialization point. Every command (and, later, every reload
-  commit) runs through ONE worker at a time — because a beam-lisp program shares
-  VM-global state with the daemon: loaded modules, the pinned Loader.Server, ETS
-  tables, NIF state. Parallel requests would race namespace loads and module
-  creation. Env vars ARE forked per request (`Env.isolated`), but the global
-  layer cannot be; the FIFO is what keeps "one program at a time" honest while
-  clients stay responsive via queue/heartbeat frames on their own sockets.
+  The daemon's SEQUENCER for the two operations that must not run concurrently
+  with a live program mutating the VM image: a reload commit and a dashboard
+  intent. Commands themselves no longer pass through here — since PLAN-121 they
+  run as per-request processes under their VM's capped env (see
+  `BeamLisp.Daemon.Server.vm_execute` → `bl.daemon/handle-in-vm`), so there is
+  no single serial command worker and nothing queues.
 
-  A request is `%{argv, cwd, env_paths, tty}` plus the client socket and request
-  id. The executor:
+  What remains is a single GenServer whose mailbox orders exactly two things:
 
-    1. installs a per-request group-leader proxy (BeamLisp.Daemon.IO) so the
-       program's stdout/stdin become wire frames,
-    2. binds the CLIENT's roots (`Loader.with_ambient_dirs`) and program argv
-       (`BeamLisp.with_argv`) and a fresh forked env (`Env.isolated`),
-    3. calls the language entry `bl.daemon/handle` with the raw argv + cwd,
-    4. maps the returned exit code (or a caught fault → 1) to an `:exit` /
-       `:failed` terminal frame ordered AFTER the last output.
+    * `run_reload/2` — a watcher's stage→commit, so it never interleaves with a
+      program the daemon is running (PLAN-121 D3a: reload ordering is
+      correctness, not a bottleneck);
+    * `run_capture/2` — a dashboard intent, run with output captured, taking its
+      turn against a reload the same way.
 
-  `System.halt` inside a program is NOT trappable and kills the whole daemon;
-  that is the same trust level as a standalone run and is documented, not
-  worked around. A client that loses the socket mid-request gets "unknown
-  outcome"; the executor never replays.
+  Both are legitimately serial. Neither is the old command FIFO, which is gone.
   """
 
   use GenServer
 
-  alias BeamLisp.Daemon.{IO, Protocol}
-
   # --- public API ---
-
-  # The worker's state is PUBLISHED, not answered: a caller about to decide
-  # "wait or run cold" must not have to queue behind the thing it is asking
-  # about. Same shape as IndexWorker's progress row, for the same reason.
-  @state_table :bl_executor_state
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
-  What the single worker is doing, as DATA — never a call.
-
-  `%{busy: nil | %{argv: [...], cwd: path, since_ms: n}, queued: n}`, where
-  `queued` counts the commands that would run before one submitted now: the one
-  in flight plus everything already waiting in the mailbox.
-
-  This exists because the silence was AMBIGUOUS. `hello` reported a
-  `queue_depth` read from a counter that was never incremented, so a client
-  could not tell "the daemon is idle" from "the daemon is running someone
-  else's two-minute command and you are next" — and a command that parks on a
-  busy worker is indistinguishable from a hang. Measured 2026-09-16: a trivial
-  `bl run` produced no output and no progress for the full length of another
-  client's 120s command.
-  """
-  def state do
-    busy =
-      case :ets.lookup(@state_table, :busy) do
-        [{:busy, b}] -> b
-        _ -> nil
-      end
-
-    waiting =
-      case Process.whereis(__MODULE__) do
-        pid when is_pid(pid) ->
-          case Process.info(pid, :message_queue_len) do
-            {:message_queue_len, n} -> n
-            _ -> 0
-          end
-
-        _ ->
-          0
-      end
-
-    %{busy: busy, queued: (if busy, do: 1, else: 0) + waiting}
-  rescue
-    ArgumentError -> %{busy: nil, queued: 0}
-  end
-
-  @doc "Current queue depth: how many commands run before one submitted now."
-  def queue_depth(server \\ __MODULE__) do
-    _ = server
-    Map.get(state(), :queued, 0)
-  catch
-    :exit, _ -> 0
-  end
-
-  @doc """
-  Run `fun` on the single command worker — the SAME FIFO that serves runs and
-  tests. The watcher submits a reload commit here so a stage->commit never races
-  a program the daemon is running: whichever reached the mailbox first wins, and
-  the other waits. Returns `fun`'s value.
+  Run `fun` on the sequencer — the same turn a dashboard intent takes — so a
+  reload commit never races a program the daemon is running. Returns `fun`'s
+  value.
   """
   def run_reload(server \\ __MODULE__, fun) when is_function(fun, 0) do
     GenServer.call(server, {:run_reload, fun}, :infinity)
   end
 
   @doc """
-  Run `fun` on the single command worker with output CAPTURED, returning
-  `{result, output}`.
-
-  The FIFO is the point: an intent from the dashboard takes the same turn a
-  client's command would, so it never races a reload commit or a run. Capturing
-  needs the group-leader swap to happen in the process that PRINTS — this one —
-  so the caller cannot do it; hence a variant here rather than a wrapper there.
+  Run `fun` on the sequencer with output CAPTURED, returning `{result, output}`.
+  Capturing needs the group-leader swap to happen in the process that PRINTS —
+  this one — so the caller cannot do it; hence a variant here.
   """
   def run_capture(server \\ __MODULE__, fun) when is_function(fun, 0) do
     GenServer.call(server, {:run_capture, fun}, :infinity)
   end
 
-  # --- GenServer: a single worker, calls serialized by the mailbox ---
+  # --- GenServer: a single sequencer, calls ordered by the mailbox ---
 
   @impl true
-  def init(opts) do
-    if :ets.whereis(@state_table) == :undefined do
-      :ets.new(@state_table, [:set, :public, :named_table, read_concurrency: true])
-    end
-
-    :ets.insert(@state_table, {:busy, nil})
-
-    {:ok, %{active: 0}}
+  def init(_opts) do
+    {:ok, %{}}
   end
 
   @impl true
   def handle_call({:run_capture, fun}, _from, state) do
-    publish(%{argv: ["(captured intent)"], cwd: File.cwd!()})
-
     {:ok, io} = StringIO.open("")
     prev = Process.group_leader()
     Process.group_leader(self(), io)
@@ -142,16 +68,11 @@ defmodule BeamLisp.Daemon.Executor do
 
     Process.group_leader(self(), prev)
     {_, output} = StringIO.contents(io)
-    publish(nil)
     {:reply, {result, output}, state}
   end
 
   @impl true
   def handle_call({:run_reload, fun}, _from, state) do
-    # A reload commit shares the one worker with runs/tests — ordered, never
-    # concurrent with a program mutating the same image.
-    publish(%{argv: ["(reload commit)"], cwd: File.cwd!()})
-
     result =
       try do
         fun.()
@@ -161,27 +82,6 @@ defmodule BeamLisp.Daemon.Executor do
         kind, v -> {:error, {kind, v}}
       end
 
-    publish(nil)
     {:reply, result, state}
   end
-
-  # --- the published row ---
-
-  defp publish(nil), do: :ets.insert(@state_table, {:busy, nil})
-
-  defp publish(%{argv: argv, cwd: cwd}) do
-    :ets.insert(@state_table, {:busy, %{argv: argv, cwd: cwd, since_ms: System.monotonic_time(:millisecond)}})
-  rescue
-    ArgumentError -> :ok
-  end
-
-  # ── NOTE (PLAN-121 cutover) ──────────────────────────────────────────────
-  # The single-serial-worker COMMAND path (run/4, handle_call({:run,…}),
-  # execute/5, and the node-global apply_env) has been REMOVED. Commands now run
-  # through the pure-beam-lisp VM manager via BeamLisp.Daemon.Server.vm_execute
-  # → bl.daemon/handle-in-vm — one BEAM process per request, env bound
-  # PROCESS-LOCALLY (the old apply_env mutated the node-global OS env, a race the
-  # FIFO masked). What remains here is the reload-commit SEQUENCER (run_reload)
-  # and the dashboard-intent runner (run_capture), both legitimately serial, plus
-  # the published busy row that inspect/listener still read.
 end

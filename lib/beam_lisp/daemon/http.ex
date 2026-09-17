@@ -187,9 +187,8 @@ defmodule BeamLisp.Daemon.HTTP do
       </section>
 
       <section>
-        <h2>Worker</h2>
+        <h2>Session</h2>
         <table>
-          <tr><td class="name">queue_depth</td><td class="note mono">#{m.queue.depth}</td></tr>
           <tr><td class="name">compiler_key</td><td class="note mono">#{esc(short(id.compiler_key))}</td></tr>
         </table>
       </section>
@@ -376,7 +375,7 @@ defmodule BeamLisp.Daemon.HTTP do
   defp image_pane(image) do
     text = BeamLisp.Daemon.Inspect.render_text(%{
       identity: %{name: "", root: "", pid: "", tree_id: "", compiler_key: nil, daemon_build_id: nil, uptime_ms: 0},
-      ports: [], tasks: [], queue: %{depth: 0}, image: image
+      ports: [], tasks: [], image: image
     })
 
     "<pre>#{esc(String.trim(text))}</pre>"
@@ -408,6 +407,9 @@ defmodule BeamLisp.Daemon.HTTP do
       {:error, :no_such_task} ->
         json(conn, 404, %{"error" => "this tree declares no such task"})
 
+      # A watch task has no HTTP request/response — it runs forever; the dashboard
+      # intent path declines it (this is HTTP semantics, not the old serial-worker
+      # refusal, which is gone).
       {:error, :owns_process} ->
         json(conn, 400, %{
           "error" => "that task keeps its own process — run it without the daemon"

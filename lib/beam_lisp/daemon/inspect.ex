@@ -13,7 +13,6 @@ defmodule BeamLisp.Daemon.Inspect do
     * identity    — the tree, its pid, its age, the compiler key it booted with
     * ports       — every live claim, whoever made it
     * tasks       — what the project declares (`env.bl`)
-    * queue       — the single worker's depth: is the session busy right now
     * image       — the reload read-model (`reload/inspect`), when the language
                     side is loaded: namespaces, vars, the reload journal
 
@@ -38,7 +37,6 @@ defmodule BeamLisp.Daemon.Inspect do
       identity: identity(status, root),
       ports: ports(),
       tasks: tasks(root),
-      queue: queue(),
       index: index(),
       image: image(opts)
     }
@@ -55,7 +53,6 @@ defmodule BeamLisp.Daemon.Inspect do
       "identity" => stringify(m.identity),
       "ports" => Enum.map(m.ports, &stringify/1),
       "tasks" => Enum.map(m.tasks, &stringify/1),
-      "queue" => stringify(m.queue),
       "index" => stringify(m.index),
       "image" => m[:image] && stringify(m.image)
     }
@@ -137,21 +134,6 @@ defmodule BeamLisp.Daemon.Inspect do
     end)
   end
 
-  defp queue do
-    %{depth: depth(), busy: busy()}
-  end
-
-  defp depth do
-    BeamLisp.Daemon.Executor.queue_depth()
-  rescue
-    _ -> 0
-  end
-
-  defp busy do
-    Map.get(BeamLisp.Daemon.Executor.state(), :busy)
-  rescue
-    _ -> nil
-  end
 
   # The reload read-model, only when the language side has it loaded: asking a
   # daemon that never loaded `reload` to produce one would mean loading it here,
@@ -226,7 +208,7 @@ defmodule BeamLisp.Daemon.Inspect do
       uptime_ms     #{id.uptime_ms}
     #{render_ports(m.ports)}
     #{render_tasks(m.tasks)}
-    #{render_queue(m.queue)}#{render_index(m[:index])}#{render_image(m[:image])}
+    #{render_index(m[:index])}#{render_image(m[:image])}
     """
   end
 
@@ -291,28 +273,6 @@ defmodule BeamLisp.Daemon.Inspect do
       "  task          #{t.name}#{if t.doc != "", do: "  — " <> t.doc, else: ""}" <>
         "#{if t.watch, do: "  [watch]", else: ""}"
     end)
-  end
-
-  # The worker line: WHAT is running and for how long, then how many commands
-  # are ahead. An idle session says so in one line; a busy one names the command
-  # — because "queue_depth 1" without the holder is the same silence that made a
-  # parked client look like a hung one.
-  defp render_queue(%{depth: d, busy: nil}), do: "  queue_depth   #{d}"
-
-  defp render_queue(%{depth: d, busy: b}) do
-    "  running       #{render_busy(b)}\n  queue_depth   #{d}"
-  end
-
-  defp render_queue(%{depth: d}), do: "  queue_depth   #{d}"
-
-  defp render_busy(%{argv: argv, cwd: cwd, since_ms: since}) when is_integer(since) do
-    age = System.monotonic_time(:millisecond) - since
-    cmd = argv |> Enum.take(4) |> Enum.join(" ")
-    "#{cmd}#{if length(argv) > 4, do: " …", else: ""}  (#{div(age, 1000)}s, cwd #{cwd})"
-  end
-
-  defp render_busy(%{argv: argv, cwd: cwd}) do
-    "#{argv |> Enum.take(4) |> Enum.join(" ")}  (cwd #{cwd})"
   end
 
   defp render_image(nil), do: ""
