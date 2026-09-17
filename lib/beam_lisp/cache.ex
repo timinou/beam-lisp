@@ -22,8 +22,7 @@ defmodule BeamLisp.Cache do
   answer. `priv/std/codebase.bl` asks here and picks the tier.
   """
 
-  alias BeamLisp.Daemon.Paths
-
+  @tree_id_len 16
   @markers [".git", ".hg", "mix.exs", "priv/boot/core.bl"]
 
   @doc """
@@ -60,9 +59,36 @@ defmodule BeamLisp.Cache do
 
   @doc "The 16-hex id of the project containing `path` — the daemon's own tree id."
   @spec tree_id(String.t()) :: String.t()
-  def tree_id(path), do: Paths.tree_id(project_root(path))
+  def tree_id(path), do: tree_id_of(project_root(path))
 
   # --- internals ---
+
+  # The canonical 16-hex tree id for `root`: sha256 of its realpath, first 16
+  # hex. The same id a `bl` daemon files its endpoints under (vm.paths/tree-id),
+  # kept in step by construction — one sha256 over one canonical path.
+  defp tree_id_of(root) do
+    canonical =
+      case File.stat(root, time: :posix) do
+        {:ok, _} -> real_path(root)
+        _ -> Path.expand(root)
+      end
+
+    :crypto.hash(:sha256, canonical)
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, @tree_id_len)
+  end
+
+  defp real_path(path) do
+    case :file.read_link_all(String.to_charlist(path)) do
+      {:ok, target} ->
+        resolved = List.to_string(target)
+        abs = if Path.type(resolved) == :absolute, do: resolved, else: Path.join(Path.dirname(path), resolved)
+        real_path(Path.expand(abs))
+
+      _ ->
+        Path.expand(path)
+    end
+  end
 
   defp walk(dir, fallback) do
     cond do

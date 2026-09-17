@@ -28,7 +28,7 @@ these verbs print the name.
 
 ```beam-lisp silent
 (ns bl.ports
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [vm.ports]))
 ```
 
 ## Reading
@@ -43,12 +43,12 @@ next one.
   "Every live claim: a list of maps with :name :port :pinned :hosts :root
    :tree_id :pid."
   []
-  (to-list (BeamLisp.Daemon.Ports/list)))
+  (to-list (vm.ports/list-claims)))
 
 (defn port-of
   "The port behind `name`, or nil when nothing live holds it."
   [name]
-  (BeamLisp.Daemon.Ports/port_of (name-str name)))
+  (vm.ports/port-of (name-str name) (BeamLisp/cwd)))
 
 (defn- name-str [n] (if (keyword? n) (name n) (str n)))
 

@@ -16,7 +16,7 @@ The post-`--` arguments reach the program through `BeamLisp/argv`, exactly as
 
 ```beam-lisp
 (ns bl.serve
-  (:require [bl.env :as env] [bl.util :as u]))
+  (:require [bl.env :as env] [bl.util :as u] [vm.names] [vm.ports]))
 ```
 
 ## The port
@@ -54,10 +54,9 @@ file; what a developer opens is `http://web.<project>.test`.
    (let [n (name-str name)
          root (BeamLisp/cwd)
          want (or @port-override (declared n) default)
-         r (BeamLisp.Daemon.Ports/claim
+         r (vm.ports/claim
              n want
-             (u/kw [:root root]
-                   [:hosts (u/to-list (BeamLisp.Daemon.Names/hosts root n))]))]
+             {:root root :hosts (u/to-list (vm.names/hosts root n))})]
      (if (= :ok (erlang/element 1 r))
        (erlang/element 2 r)
        (throw (ex-info (str "bl.serve: cannot serve \"" n "\": "

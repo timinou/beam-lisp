@@ -1,0 +1,286 @@
+; vm/ports.bl — named ports for a tree's warm session (ports Daemon.Ports).
+;
+; ══ TRUTH IS A FILE, NOT A TABLE ════════════════════════════════════════════
+;
+; A project declares the ports it serves on in env.bl:
+;
+;     :ports {:web 4000 :metrics {:port 0} :ui 7700}
+;
+; {:port 0} is ephemeral: the OS chooses, the registry records it, nobody cares.
+; A number means the project wants THAT port; if it is taken the session says so
+; rather than quietly serving elsewhere.
+;
+; Each claim is ONE FILE under the runtime dir — a term holding the name, port,
+; whether the port was chosen (pinned), the owning tree, the OS pid, the hosts,
+; the time. A GenServer per daemon (like WatchRegistry) cannot answer the one
+; question that matters: the collision this catches is BETWEEN daemons, and one
+; VM's table cannot see another's. Files can, and they survive a crash — exactly
+; when a stale claim needs sweeping. A claim whose process is gone is swept on
+; sight; a port held by some unclaimed process is reported, never taken over.
+;
+; ══ THE KEY SAYS WHAT KIND OF CLAIM IT IS ═══════════════════════════════════
+;
+; A PINNED port is a promise about a NUMBER — one tree on the machine keeps it,
+; so the NAME alone is the key and a second tree is refused by name. An
+; EPHEMERAL port is nobody's promise — the OS chose it, so the claim is a
+; session's own address, keyed by name AND tree-id (name@treeid). Two ephemeral
+; claims take different numbers by construction, so two trees never collide.
+;
+; ══ F6: DROP [:safe], SHAPE-CHECK INSTEAD ═══════════════════════════════════
+;
+; binary_to_term(bin, [:safe]) throws when a claim carries an atom the reader's
+; table lacks (:dest, :unix on a fresh VM) — and a thrown read silently EMPTIES
+; the registry, so every route vanishes. A claim is our own trusted write, so we
+; decode WITHOUT [:safe] and gate on SHAPE: a map with :name :port :pid is a
+; claim, anything else is swept. (The gateway edge learned this the hard way.)
+
+(ns vm.ports
+  (:require [vm.paths :as paths]))
+
+;; ── shape helpers ───────────────────────────────────────────────────────────
+
+(defn- to-str [x]
+  (cond (erlang/is_binary x) x
+        (erlang/is_atom x) (erlang/atom_to_binary x :utf8)
+        (erlang/is_list x) (erlang/list_to_binary x)
+        :else (str x)))
+
+(defn- normalize-hosts
+  "Hosts are strings, lowercased and deduped: a Host: header is compared verbatim
+   and no caller should guess the case a name was claimed in. Non-strings drop."
+  [hosts]
+  (if (or (erlang/is_list hosts) (vector? hosts))
+    (to-list (distinct (map (fn [h] (erlang/apply :string :lowercase (list h)))
+                            (filter erlang/is_binary hosts))))
+    (to-list [])))
+
+(defn- os-pid []
+  (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+
+(defn- normalize-pid
+  "os/getpid answers a CHARLIST; a pid kept in that shape compares unequal to the
+   integer a caller passes — which made every claim look stale the moment it was
+   written. One shape: integers."
+  [pid]
+  (cond (nil? pid) (os-pid)
+        (erlang/is_integer pid) pid
+        (erlang/is_list pid) (erlang/list_to_integer pid)
+        :else pid))
+
+;; ── liveness ────────────────────────────────────────────────────────────────
+
+(defn alive-pid?
+  "Whether the OS process `pid` is alive. Every endpoint that outlives the VM
+   that wrote it needs this — a port claim, the gateway's own endpoint — because
+   'the file is there' stops being true the moment its owner dies. Our own pid
+   is checked in-VM; a foreign one through /proc. Where /proc is absent a claim
+   is RESPECTED, not swept — refusing a port is recoverable, stealing one is not."
+  [pid]
+  (cond
+    (not (erlang/is_integer pid)) false
+    (= pid (os-pid)) true
+    (File/dir? "/proc") (File/dir? (str "/proc/" pid))
+    :else true))
+
+(defn- alive? [claim] (alive-pid? (get claim :pid)))
+
+;; ── the ports dir ───────────────────────────────────────────────────────────
+
+(defn- ports-dir
+  "The runtime dir's ports/ subdir, created 0700. {:ok dir} or {:error …}."
+  []
+  (let [rd (paths/runtime-dir)]
+    (if (contains? rd :ok)
+      (let [dir (str (:ok rd) "/ports")]
+        (File/mkdir_p! dir)
+        (File/chmod dir 448)   ; 0o700
+        {:ok dir})
+      rd)))
+
+(defn- file-name
+  "The claim's filename. Pinned → the name alone (one tree keeps the promise).
+   Ephemeral (want=0) → name@tree-id (a session's own address, per-tree)."
+  [name want root]
+  (let [safe (erlang/apply :re :replace
+               (list (to-str name) "[^A-Za-z0-9_-]" "_"
+                     (to-list [:global (tuple :return :binary)])))]
+    (if (= want 0) (str safe "@" (paths/tree-id root)) safe)))
+
+;; ── claim IO (F6-safe) ──────────────────────────────────────────────────────
+
+(defn- read-claim
+  "The claim at `path`, or nil. Decoded WITHOUT [:safe] (our own trusted write)
+   then SHAPE-CHECKED: a map with :name :port :pid is a claim; anything else —
+   an older format, a truncated write, a foreign term — is nil and swept. A
+   claim written before hosts existed simply has none."
+  [path]
+  (let [r (try (File/read! path) (catch e nil))]
+    (if (or (nil? r) (not (erlang/is_binary r)))
+      nil
+      (let [term (try (erlang/binary_to_term r) (catch e nil))]
+        (if (and (map? term) (contains? term :name) (contains? term :port) (contains? term :pid))
+          (assoc term :hosts (or (get term :hosts) (to-list [])))
+          nil)))))
+
+(defn- write-claim
+  "Write `claim` to key atomically: term_to_binary → 0600 tmp → rename."
+  [dir key claim]
+  (let [path (str dir "/" key)
+        tmp (str path ".tmp." (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/write! tmp (erlang/term_to_binary claim))
+    (File/chmod tmp 384)   ; 0o600
+    (let [r (erlang/apply :file :rename (list (erlang/binary_to_list tmp) (erlang/binary_to_list path)))]
+      (if (= :ok r) :ok (do (File/rm tmp) {:error (tuple :write_claim r)})))))
+
+;; ── binding probe ───────────────────────────────────────────────────────────
+
+(defn- probe
+  "A listen on ANY address (0.0.0.0), not loopback: 'is this port free' must
+   hold on every interface the server might take. reuseaddr false for the same
+   reason. Returns {:ok actual-port} or {:error reason}. Port 0 asks the OS to
+   choose (how an ephemeral port is picked); a number proves it free right now."
+  [port]
+  (let [opts (to-list [:binary (tuple :packet 4) (tuple :active false)
+                       (tuple :reuseaddr false) (tuple :ip (tuple 0 0 0 0))])
+        r (erlang/apply :gen_tcp :listen (list port opts))]
+    (if (= :ok (elem r 0))
+      (let [lsock (elem r 1)
+            sn (erlang/apply :inet :sockname (list lsock))
+            actual (if (= :ok (elem sn 0)) (elem (elem sn 1) 1) port)]
+        (erlang/apply :gen_tcp :close (list lsock))
+        {:ok actual})
+      {:error (elem r 1)})))
+
+(defn- bindable [want]
+  (cond
+    (= want 0) (probe 0)
+    (and (erlang/is_integer want) (> want 0))
+      (let [r (probe want)]
+        (if (and (contains? r :ok) (= want (:ok r))) {:ok want} r))
+    :else {:error (tuple :bad_port want)}))
+
+;; ── the registry (list / holders) ───────────────────────────────────────────
+
+(defn- read-live
+  "The live claim at `path` as a 1-list, or [] — sweeping it if its owner is gone."
+  [path]
+  (let [claim (read-claim path)]
+    (cond
+      (nil? claim) (to-list [])
+      (alive? claim) (to-list [claim])
+      :else (do (File/rm path) (to-list [])))))
+
+(defn list-claims
+  "Every live claim, oldest name first. Stale claims (owner gone) are swept as
+   met, so a crashed daemon leaves nothing for the next one to trip over."
+  []
+  (let [d (ports-dir)]
+    (if (contains? d :ok)
+      (let [dir (:ok d)
+            lr (erlang/apply :file :list_dir (list (erlang/binary_to_list dir)))]
+        (if (= :ok (elem lr 0))
+          (to-list
+            (mapcat (fn [nm] (read-live (str dir "/" (erlang/list_to_binary nm))))
+                    (sort (elem lr 1))))
+          (to-list [])))
+      (to-list []))))
+
+(defn holder
+  "The live claim holding `port`, or nil."
+  [port]
+  (first (filter (fn [c] (= (get c :port) port)) (list-claims))))
+
+(defn holder-of-host
+  "The live claim answering to `host`, or nil. Matched on the claim's own host
+   list, lowercased — Host: headers arrive in whatever case, DNS is case-blind."
+  [host]
+  (let [wanted (erlang/apply :string :trim
+                 (list (erlang/apply :string :lowercase (list host))))]
+    (first (filter (fn [c] (some #(= wanted %) (get c :hosts (to-list []))))
+                   (list-claims)))))
+
+(defn port-of
+  "The port `name` is held on for `root`'s session, or nil. The session's OWN
+   claim wins (an ephemeral name belongs to the tree that claimed it); only when
+   the session holds nothing does the machine-wide PINNED claim answer."
+  [name root]
+  (let [d (ports-dir)]
+    (if (contains? d :ok)
+      (let [dir (:ok d)]
+        (some (fn [key]
+                (let [claim (read-claim (str dir "/" key))]
+                  (if (and claim (alive? claim)) (get claim :port) nil)))
+              (list (file-name name 0 root) (file-name name 1 root))))
+      nil)))
+
+;; ── claiming ────────────────────────────────────────────────────────────────
+
+(defn- held-here [dir name want root pid]
+  (let [claim (read-claim (str dir "/" (file-name name want root)))]
+    (cond
+      (nil? claim) :free
+      (= (get claim :pid) pid) {:ok (get claim :port)}
+      (alive? claim) {:held claim}
+      :else :free)))
+
+(defn- take-port [dir name want root pid hosts]
+  (let [b (bindable want)]
+    (cond
+      (contains? b :ok)
+        (let [port (:ok b)
+              ;; keys match Daemon.Ports EXACTLY (:tree_id, :claimed_at) so any
+              ;; reader — the live Elixir gateway during transition, vm.gateway
+              ;; after — agrees on one on-disk shape.
+              claim {:name (to-str name)
+                     :port port
+                     :pinned (not= want 0)
+                     :hosts hosts
+                     :tree_id (paths/tree-id root)
+                     :root root
+                     :pid pid
+                     :claimed_at (erlang/system_time :second)}]
+          (let [w (write-claim dir (file-name name want root) claim)]
+            (if (= :ok w) {:ok port} w)))
+      (= :eaddrinuse (:error b))
+        {:error (tuple :port_busy want (holder want))}
+      :else {:error (:error b)})))
+
+(defn claim
+  "Claim `name` for this session, preferring `want`. 0 asks the OS for a free
+   port. `opts` = {:root … :pid … :hosts […]}. Returns {:ok port} or {:error
+   reason} where reason is {:taken claim} (another session holds the name) or
+   {:port_busy port claim} (the wanted number is in use). Re-claiming a name
+   this process already holds keeps its port — idempotent."
+  ([name want] (claim name want {}))
+  ([name want opts]
+   (let [root (or (get opts :root) (BeamLisp/cwd))
+         pid (normalize-pid (get opts :pid))
+         hosts (normalize-hosts (get opts :hosts))
+         d (ports-dir)]
+     (if (contains? d :ok)
+       (let [dir (:ok d)
+             h (held-here dir name want root pid)]
+         (cond
+           ;; this session already holds the NAME with an ephemeral port
+           (and (contains? h :ok) (= want 0)) {:ok (:ok h)}
+           (and (contains? h :ok) (= (:ok h) want)) {:ok want}
+           (contains? h :ok) (take-port dir name want root pid hosts)  ; move it
+           (contains? h :held) {:error (tuple :taken (:held h))}
+           :else (take-port dir name want root pid hosts)))
+       d))))
+
+(defn release
+  "Give up `name` for this session. Idempotent. Only claims THIS tree made are
+   dropped — the session's own ephemeral key and the pinned key when this
+   session holds it. One session ending must never erase another's address."
+  ([name] (release name {}))
+  ([name opts]
+   (let [root (or (get opts :root) (BeamLisp/cwd))
+         d (ports-dir)]
+     (when (contains? d :ok)
+       (let [dir (:ok d)]
+         (doseq [key (list (file-name name 0 root) (file-name name 1 root))]
+           (let [claim (read-claim (str dir "/" key))]
+             (when (and claim (= (get claim :root) root))
+               (File/rm (str dir "/" key)))))))
+     :ok)))
