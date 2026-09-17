@@ -10,7 +10,7 @@ A project declares the ports it serves on. `env.bl` names them:
 A number is a preference: if that port is taken, the session SAYS so rather
 than quietly serving somewhere else. `{:port 0}` means the OS chooses, and
 whoever asks gets the number it chose. The registry behind this is files under
-the runtime dir (see `BeamLisp.Daemon.Ports`), which is what lets one tree's
+the runtime dir (see `vm.ports`), which is what lets one tree's
 session see what ANOTHER tree's session holds — the collision worth catching is
 between trees, and an in-VM table cannot see across.
 
@@ -22,7 +22,7 @@ checkout can run its own `:ui` at the same time. Claim files are keyed to say
 which: a chosen name stands alone, an ephemeral one carries its tree.
 
 Every claim also carries the HOSTS its port answers to — `web.pulse.test` and
-its `.localhost` twin (see `BeamLisp.Daemon.Names`). That is what makes a port
+its `.localhost` twin (see `vm.names`). That is what makes a port
 something a developer never reads: the gateway routes a name to the number, and
 these verbs print the name.
 

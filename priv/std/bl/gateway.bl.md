@@ -14,7 +14,7 @@ bl install gateway    the systemd unit, so it starts at login
 bl install redirect   make port 80 answer for it — the portless address, one root step
 ```
 
-The gateway itself is `BeamLisp.Daemon.Gateway`: it reads `Host:`, looks the
+The gateway itself is `vm.gateway`: it reads `Host:`, looks the
 name up in the port registry (the claim carries its own hosts, so no project
 file is read here), and splices the two sockets together. Everything after the
 request head is forwarded untouched, which is what makes a WebSocket, an SSE
