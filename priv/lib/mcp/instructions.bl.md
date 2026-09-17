@@ -162,7 +162,151 @@ instructions describing themselves, queryably.
     :instr/text
     "One corpus, every surface. If an instruction is worth saying to an agent over MCP, it is worth saying identically in the bl install mcp files and in any editor onboarding. Add it as a fact once; every projection picks it up. An instruction that lives in only one projection is a bug."}])
 
-(def CORPUS (concat onboarding usage protocol))
+```
+
+## The corpus: skill
+
+The same facts, addressed to a reader who has no database yet. `:instr/for
+"skill"` is the surface an agent meets **before** its first tool call: what
+beam-lisp is, which modules are worth knowing first, and where the rest of the
+documentation lives.
+
+On this surface a `:instr/kind` names the **file** the fragments land in, which
+is how one corpus becomes a skill directory:
+
+| kind | file | who reads it |
+|---|---|---|
+| `:onboarding` | `SKILL.md` | the agent, on first contact |
+| `:modules` | `modules.bl.md` | whoever wants the calls, running |
+| `:usage` | `usage.bl.md` | the agent, on task start |
+| `:protocol` | `protocol.bl.md` | whoever extends the skill |
+
+A fragment may carry `:instr/code` beside `:instr/text`: a form the module
+index shows *and a test can run*, so an idiom that stops being true fails the
+suite instead of misleading a reader. `mcp.skill` renders both; the
+`beam-lisp/skill` MCP prompt renders the same facts without the fences.
+
+```beam-lisp
+(def skill-orientation
+  [{:instr/id "skill/onboarding/what"
+    :instr/for "skill" :instr/kind :onboarding :instr/order 10
+    :instr/title "What beam-lisp is"
+    :instr/text
+    "beam-lisp is a Clojure-reader dialect on the BEAM: Clojure's syntax and data model (lists, vectors, maps, sets, keywords, symbols, lazy seqs, destructuring, protocols, multimethods) running on Erlang's runtime (cheap processes, message passing, supervisors, per-process heaps), with total type inference and logic solvers on top. Two habits carry you through the first day. Values are IMMUTABLE — you build a new one rather than changing the one you have — and a namespace is named by its `(ns …)` head, its functions called as `(ns/fn …)` and pulled in with `:require [ns :as alias]`. It is a dialect, not Clojure: where the two might disagree, ask `bl eval` rather than assume."}
+
+   {:instr/id "skill/modules/map"
+    :instr/for "skill" :instr/kind :modules :instr/order 10
+    :instr/title "Modules worth knowing first"
+    :instr/text
+    "Seven names answer most questions, each with the handful of calls that carry it.\n\n- **datom** — the database: facts in, datalog out, time for free. `(datom/connect SCHEMA)` · `(datom/transact! conn facts)` · `(datom/q '[:find ?e :where …] (datom/db conn))` · `(datom/pull db '[*] eid)` · `(datom/as-of db t)` / `(datom/history db)`.\n- **codebase** — the source index: every definition and call as a fact. `^{:ret \"string\"}` / `^{:instr {…}}` annotations on a name · `(codebase/index-source sigs ns src)` · `(codebase/transact-source! conn sigs ns src)` · `(codebase/connect-codebase extra)`.\n- **web** — the HTTP edge, on Bandit. `(web/serve {:port 4000 :plug router})` · `(web/text conn \"ok\")` · `(web/json conn data)` · `(web/html conn s)` · `(web/read-body conn)` / `(web/form-params conn)` — a plug is one function, conn in, conn out.\n- **auth** — capability tokens, offline. `(auth/keypair)` · `(auth/issue root facts)` · `(auth/attenuate token spec)` · `(auth/authorize root-pub token ctx)` · `(auth/guard query filters)` — the last is row-level security: one query, filtered per principal.\n- **live** — live queries that are allowed to be live. `(live/check-query q)` says whether a query is monotone · `(live/register-live! conn query inputs ns cb-name)` gates on that before watching · `(live/violations …)` names every reason a query cannot be watched.\n- **deodorant** — the linter and the fixer. `(deodorant/rules-of-tier :safe)` · `(deodorant/scan rules form)` (pure, changes nothing) · `(deodorant/report rules form)` (a count per smell) · `(deodorant/fix-file! path)` — the same rule set behind `bl lint` and `bl fix`.\n- **veritas** — properties, checked rather than hoped. `(veritas/int-of lo hi)` / `(veritas/string-of prefix min max)` generators · `(veritas/for-all port var gen pred)` · `(veritas/exists port var gen pred)` · `(veritas/covers port fn-src gen)` — verdicts are modal: `:proven`, `:refuted` (with a witness), `:witnessed` (sampled, not proved)."}
+
+   {:instr/id "skill/modules/datom"
+    :instr/for "skill" :instr/kind :modules :instr/order 20
+    :instr/title "datom, executed"
+    :instr/code
+    "(let [conn (datom/connect [{:db/ident :note/body :db/valueType :db.type/string}])]\n  (datom/transact! conn [{:db/id -1 :note/body \"hello\"}])\n  (first (first (datom/q '[:find ?b :where [?n :note/body ?b]] (datom/db conn)))))"}
+
+   {:instr/id "skill/modules/codebase"
+    :instr/for "skill" :instr/kind :modules :instr/order 30
+    :instr/title "codebase, executed"
+    :instr/code
+    "(count (get (codebase/index-source [] \"demo\" \"(ns demo)\\n(defn add [a b] (+ a b))\") :fn))"}
+
+   {:instr/id "skill/modules/web"
+    :instr/for "skill" :instr/kind :modules :instr/order 40
+    :instr/title "web, executed"
+    :instr/text
+    "The one shape, because it is the whole idea: a plug is a one-argument function, conn in, conn out, and `web/serve` is what wraps it in Bandit. Of all the modules here this is the one whose calls only mean something with a live request in hand, so the example shows the shape rather than a round trip."
+    :instr/code
+    "(fn? (fn [conn] (web/text conn \"ok\")))"}
+
+   {:instr/id "skill/modules/auth"
+    :instr/for "skill" :instr/kind :modules :instr/order 50
+    :instr/title "auth, executed"
+    :instr/code
+    "(let [kp (auth/keypair)\n      token (auth/issue kp [[\"right\" \"doc-42\" \"read\"]])\n      public (auth/public kp)]\n  (auth/verify public token))"}
+
+   {:instr/id "skill/modules/live"
+    :instr/for "skill" :instr/kind :modules :instr/order 60
+    :instr/title "live, executed"
+    :instr/code
+    "(get (live/check-query '[:find ?e :where [?e :note/body _]]) :monotone)"}
+
+   {:instr/id "skill/modules/deodorant"
+    :instr/for "skill" :instr/kind :modules :instr/order 70
+    :instr/title "deodorant, executed"
+    :instr/code
+    "(deodorant/report (deodorant/every-rule) '(if (not (nil? x)) 1 2))"}
+
+   {:instr/id "skill/modules/veritas"
+    :instr/for "skill" :instr/kind :modules :instr/order 80
+    :instr/title "veritas, executed"
+    :instr/code
+    "(veritas/holds? \"v\" '(> v 0) 3)"}
+
+   {:instr/id "skill/onboarding/docs"
+    :instr/for "skill" :instr/kind :onboarding :instr/order 30
+    :instr/title "Getting the full documentation"
+    :instr/text
+    "This skill is the doorway, not the room. Register the server — `claude mcp add beam-lisp -- bl mcp`, or `mcp { server \"beam-lisp\" { command \"bl\"; args \"mcp\" } }` in a spell.kdl — and the whole surface is a prompt away: prompts/get `beam-lisp/onboarding` (the wire, the fact model, the rules of engagement), `beam-lisp/usage` (the day-to-day grammar, closing with the LIVE tool registry), `beam-lisp/protocol` (how the instruction layer itself works), and `beam-lisp/skill` (this text, fetched rather than read from disk). Two resources carry the vocabulary: `code://beam-lisp/schema` (every attribute and what it means) and `code://beam-lisp/namespaces` (what is mounted right now). Without an MCP client: `bl ask \"question\"` answers about this tree, `bl search \"what it means\"` finds functions by intent, and `docs/bl/*.md` is the prose corpus, indexed by `docs/bl/00-the-cli.md`.\n\nOnly answers cross the MCP wire, never whole files: name the question, keep `:find` to the columns you need, and bind every target via `:in` — a free variable inside a rule means \"reaches anything\", not \"reaches X\"."}])
+
+```
+
+## The corpus: skill — usage
+
+The `:usage` half is what an agent re-reads on task start: the verbs, the
+literate file format, and the habit of asking before reading.
+
+```beam-lisp
+(def skill-usage
+  [{:instr/id "skill/usage/verbs"
+    :instr/for "skill" :instr/kind :usage :instr/order 10
+    :instr/title "The CLI is the harness"
+    :instr/text
+    "`bl run FILE` executes a program (the last value prints) · `bl eval EXPR` evaluates one expression · `bl repl` is a live session you keep adding code to · `bl test [PATH…]` runs `.bl` tests with each file in its own isolated ward · `bl check --changed` compiles and analyses what moved · `bl lint` reports smells and `bl fix` applies the safe tier · `bl doc run FILE` executes a literate document and checks its cells. Every report command also answers `--json`, which is the same report for a program to read."}
+
+   {:instr/id "skill/usage/literate"
+    :instr/for "skill" :instr/kind :usage :instr/order 20
+    :instr/title "Literate source: .bl.md and .bl.org"
+    :instr/text
+    "A `.bl.md` is prose with fenced beam-lisp cells: the prose is the narrative, the cells are the program, and the cells are concatenated in document order and compiled as one unit. The same file is therefore source, documentation and test corpus at once — `bl run docs/x.bl.md` executes it. Write new explanations this way and put the supporting files beside the skill as `.bl.md`: the doc cannot drift from the code because it IS the code."}
+
+   {:instr/id "skill/usage/explore"
+    :instr/for "skill" :instr/kind :usage :instr/order 30
+    :instr/title "Ask before you read"
+    :instr/text
+    "`bl ask \"who calls X?\"` and `bl search \"what it means\"` answer from the source-index facts, not from a grep over text — the answer is the call graph, with lines. `bl lint --tier safe` and `bl check --changed` are the two cheap gates to run before calling a change done."}
+
+   {:instr/id "skill/usage/idioms"
+    :instr/for "skill" :instr/kind :usage :instr/order 40
+    :instr/title "Three lines of the dialect"
+    :instr/text
+    "Threading, anonymous functions, lazy sequences, and core predicates compose the way they do in Clojure — that is the point of a reader-compatible dialect. A pipeline reads top to bottom, and nothing runs until something demands the value."
+    :instr/code
+    "(->> (range 1 6)\n     (map (fn [n] (* n n)))\n     (filter even?)\n     (reduce +))"}])
+
+```
+
+## The corpus: skill — protocol
+
+The meta layer, for whoever extends the skill: it is a projection, and it says
+which release it was projected from.
+
+```beam-lisp
+(def skill-protocol
+  [{:instr/id "skill/protocol/facts"
+    :instr/for "skill" :instr/kind :protocol :instr/order 10
+    :instr/title "This skill is a projection"
+    :instr/text
+    "Nothing in this skill is hand-kept. Each heading is an `:instr/*` fact — `:instr/id`, `:instr/for \"skill\"`, `:instr/kind`, `:instr/order`, `:instr/title`, `:instr/text` (and the optional `:instr/code`, a form the renderer shows as a cell a test can RUN) — in the same fact space that holds the code facts. The directory on disk is those facts assembled by `mcp.skill`; the `beam-lisp/skill` prompt is the same query through `mcp.instructions/prompt`. Amend a fragment by re-asserting its `:instr/id`. The covenant holds here too: an instruction that lives in only one projection is a bug."}
+
+   {:instr/id "skill/protocol/tag"
+    :instr/for "skill" :instr/kind :protocol :instr/order 20
+    :instr/title "The release tag"
+    :instr/text
+    "The skill carries the release number of the `bl` that wrote it (`version:` in the frontmatter, from `bl.util/version` — the CalVer tag in a built drop, `0.1.0` in a checkout). `bl install mcp --check` compares that tag against the running `bl` and reports a skill written by an older release rather than quietly leaving it in place. A skill that cannot say which release it describes cannot be trusted to describe the one you are running."}])
+
+(def CORPUS (concat onboarding usage protocol skill-orientation skill-usage skill-protocol))
 ```
 
 ## Mounting and assembly
@@ -194,30 +338,56 @@ query: the fragments of one kind, in order, joined as markdown.
   conn)
 
 (defn fragments
-  "The `kind` fragments of surface `for`, ordered — [[order title text] …]."
+  "The `kind` fragments of surface `for`, ordered: [{:order :title :text
+   :code} …]. A fragment may carry prose, a form, or both; `:code` is absent
+   when it carries no runnable form.
+
+   `get-else` is what keeps the optional attributes optional. Both are read
+   with it, because the alternative — a required join — makes a fragment
+   without prose or without code vanish from the answer entirely, which reads
+   as \"this instruction does not exist\" when the truth is \"this
+   instruction is a form\"."
   [db for kind]
-  (sort-by (fn [row] (first row))
-           (into []
-                 (datom/q '[:find ?order ?title ?text
-                            :in $ ?for ?kind
-                            :where
-                            [?i :instr/for ?for]
-                            [?i :instr/kind ?kind]
-                            [?i :instr/order ?order]
-                            [?i :instr/title ?title]
-                            [?i :instr/text ?text]]
-                          db for kind))))
+  (sort-by (fn [frag] (:order frag))
+           (map (fn [row]
+                  (let [text (nth row 2)
+                        code (nth row 3)
+                        frag {:order (first row) :title (second row) :text text}]
+                    (if (nil? code) frag (assoc frag :code code))))
+                (datom/q '[:find ?order ?title ?text ?code
+                           :in $ ?for ?kind
+                           :where
+                           [?i :instr/for ?for]
+                           [?i :instr/kind ?kind]
+                           [?i :instr/order ?order]
+                           [?i :instr/title ?title]
+                           [(get-else $ ?i :instr/text "") ?text]
+                           [(get-else $ ?i :instr/code nil) ?code]]
+                         db for kind))))
+
+(defn- fragment-md
+  "One fragment as markdown: the heading, the prose, and — when the fragment
+   carries one — the form as a beam-lisp cell. A literate document is exactly
+   this, so a fragment with :instr/code is a literate document with a cell."
+  [frag]
+  (str "## " (:title frag) "\n\n"
+       (let [text (:text frag)]
+         (if (or (nil? text) (= "" text)) "" (str text "\n\n")))
+       (if (some? (:code frag))
+         (str "```beam-lisp\n" (:code frag) "\n```\n")
+         "")))
+
+(defn assemble-for
+  "One surface's `kind` as markdown: a heading per fragment, in :instr/order.
+   The whole instruction layer is this function — a prompt is a query result,
+   and so is a skill file."
+  [db for kind]
+  (join "\n" (map fragment-md (fragments db for kind))))
 
 (defn assemble
-  "One kind's prompt as markdown: a heading per fragment, in :instr/order.
-   The whole instruction layer is this function — a prompt is a query result."
+  "`assemble-for` for the MCP surface — the surface every older caller means."
   [db kind]
-  (join "\n\n"
-        (map (fn [row]
-               (let [title (second row)
-                     text (nth row 2)]
-                 (str "## " title "\n\n" text)))
-             (fragments db "mcp" kind))))
+  (assemble-for db "mcp" kind))
 ```
 
 ## Prompts
@@ -234,7 +404,9 @@ the registry itself.
    {"name" "beam-lisp/usage"
     "description" "The day-to-day grammar: recipes per question, resources, cost discipline — closing with the live tool registry. Re-fetch on task start."}
    {"name" "beam-lisp/protocol"
-    "description" "How the instruction layer works: the :instr/* fact schema, the kinds, how to compose or amend fragments. Read before extending these instructions."}])
+    "description" "How the instruction layer works: the :instr/* fact schema, the kinds, how to compose or amend fragments. Read before extending these instructions."}
+   {"name" "beam-lisp/skill"
+    "description" "The skill: what beam-lisp is, the modules worth knowing first, where the full documentation lives. The same corpus bl install mcp writes into an agent's skills directory."}])
 
 (defn manifest-line
   "One sentence of live counts — the database introduces itself."
@@ -267,6 +439,17 @@ the registry itself.
     {:description "The instruction layer, described by itself."
      :text (str "# beam-lisp MCP — the instruction protocol\n\n"
                 (assemble db :protocol))}
+
+    ;; The skill is the SAME corpus, addressed to a reader with no database
+    ;; yet: the mcp prompts teach questions, the skill teaches the language.
+    ;; One query, two readers — and `mcp.skill` renders it a third time, to
+    ;; files. Three projections, one corpus, no drift.
+    (= name "beam-lisp/skill")
+    {:description "beam-lisp itself: what it is, which modules to know, how to reach the rest."
+     :text (str "# beam-lisp — the skill\n\n"
+                (assemble-for db "skill" :onboarding)
+                "\n\n" (assemble-for db "skill" :modules)
+                "\n\n" (assemble-for db "skill" :usage))}
 
     :else nil))
 ```
