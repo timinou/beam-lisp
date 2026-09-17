@@ -1,0 +1,217 @@
+; vm/ca.bl — a certificate authority in pure beam-lisp (ports Daemon.CA).
+;
+; ══ WHAT MOVED HERE (FUP-085 / the routing edge) ════════════════════════════
+;
+; A browser accepts https://<name>/ only if it can verify the cert, and no
+; public CA vouches for web.pulse.test. So bl mints its own chain — one root,
+; a leaf per NAME with that name in the SAN — using ONLY :public_key + :crypto
+; BIFs. No x509 library, no openssl, no mkcert. This is option B: the whole
+; authority is beam-lisp; the substrate is the BEAM's own crypto.
+;
+; ══ THE RECIPE (proven by spike) ════════════════════════════════════════════
+;
+; · RSA key: (crypto/generate_key :rsa {2048 65537}) → [E N] pub / [E N D P Q …]
+;   priv; each MPInt is a binary → :binary.decode_unsigned → the RSAPrivateKey /
+;   RSAPublicKey integer fields.
+; · Cert: an OTPTBSCertificate tuple → (public_key/pkix_sign tbs priv-key).
+; · KNOWN EXTENSIONS take the STRUCTURED record as extnValue, NOT pre-DER —
+;   {:BasicConstraints true :asn1_NOVALUE}, a GeneralNames list for the SAN.
+; · SignatureAlgorithm params = :asn1_NOVALUE; PublicKeyAlgorithm params = :NULL.
+; · pkix_path_validation confirms a leaf verifies against the root.
+;
+; ══ K10: state lives OUTSIDE the namespace ══════════════════════════════════
+;
+; The root + leaves are cached in :persistent_term (survives a hot reload) and
+; on disk under the runtime dir. A reload swaps this code; the authority keeps
+; its keys.
+;
+;   (ca/ensure-started)      → mint-or-load the root (idempotent)
+;   (ca/root-pem)            → the root cert PEM (served at /bl-ca.crt)
+;   (ca/ssl-opts name)       → {:ok opts} :ssl options serving `name` (leaf+key)
+;   (ca/sni-fun)             → an fn for :ssl :sni_fun (per-name leaf selection)
+
+(ns vm.ca
+  (:require [vm.paths :as paths]))
+
+(def LEAF-DAYS 825)   ; Apple's cap for a user-root leaf — no renewal thoughts
+(def ROOT-DAYS 3650)
+
+(def PT-ROOT (tuple :vm-ca :root))     ; {:cert-der :key-record :subject}
+(def PT-LEAVES (tuple :vm-ca :leaves)) ; name → ssl-opts
+
+;; ── ASN.1 helpers ───────────────────────────────────────────────────────────
+
+(defn- oid [parts] (erlang/list_to_tuple parts))
+(def SHA256-RSA (oid (list 1 2 840 113549 1 1 11)))
+(def RSA-ENC (oid (list 1 2 840 113549 1 1 1)))
+(def CN-OID (oid (list 2 5 4 3)))
+(def BC-OID (oid (list 2 5 29 19)))
+(def SAN-OID (oid (list 2 5 29 17)))
+(def SIG-ALGO (tuple :SignatureAlgorithm SHA256-RSA :asn1_NOVALUE))
+
+(defn- b2i [b] (erlang/apply :binary :decode_unsigned (list b)))
+
+(defn- rsa-priv-record
+  "The :public_key RSAPrivateKey record from crypto's [E N D P Q dP dQ qInv]."
+  [priv]
+  (erlang/apply :erlang :list_to_tuple
+    (list (list :RSAPrivateKey 0
+                (b2i (nth priv 1)) (b2i (nth priv 0)) (b2i (nth priv 2))
+                (b2i (nth priv 3)) (b2i (nth priv 4)) (b2i (nth priv 5))
+                (b2i (nth priv 6)) (b2i (nth priv 7)) :asn1_NOVALUE))))
+
+(defn- rsa-pub-record [priv]
+  (tuple :RSAPublicKey (b2i (nth priv 1)) (b2i (nth priv 0))))
+
+(defn- spki [priv]
+  (tuple :OTPSubjectPublicKeyInfo
+         (tuple :PublicKeyAlgorithm RSA-ENC :NULL)
+         (rsa-pub-record priv)))
+
+(defn- rdn-cn [s]
+  (tuple :rdnSequence
+    (list (list (tuple :AttributeTypeAndValue CN-OID (tuple :utf8String s))))))
+
+(defn- days-from-now->utc [days]
+  ;; UTCTime "YYMMDDHHMMSSZ"; a wide window (bl is a dev CA, not a public one)
+  (let [secs (+ (erlang/system_time :second) (* days 86400))
+        dt (erlang/apply :calendar :system_time_to_universal_time (list secs :second))
+        date (elem dt 0) time (elem dt 1)
+        yy (rem (elem date 0) 100)
+        fmt (fn [n] (if (< n 10) (str "0" n) (str n)))]
+    (tuple :utcTime
+      (erlang/binary_to_list
+        (str (fmt yy) (fmt (elem date 1)) (fmt (elem date 2))
+             (fmt (elem time 0)) (fmt (elem time 1)) (fmt (elem time 2)) "Z")))))
+
+(defn- validity [days]
+  (tuple :Validity (days-from-now->utc -1) (days-from-now->utc days)))
+
+(defn- bc-ext []
+  (tuple :Extension BC-OID true (tuple :BasicConstraints true :asn1_NOVALUE)))
+
+(defn- san-ext [names]
+  (tuple :Extension SAN-OID false
+    (to-list (map (fn [n] (tuple :dNSName (erlang/binary_to_list n))) names))))
+
+;; ── minting ─────────────────────────────────────────────────────────────────
+
+(defn- new-key []
+  (erlang/element 2 (erlang/apply :crypto :generate_key (list :rsa (tuple 2048 65537)))))
+
+(defn- serial [] (erlang/abs (erlang/apply :erlang :unique_integer (list (to-list [:monotonic])))))
+
+(defn- sign-cert [tbs signing-key]
+  (erlang/apply :public_key :pkix_sign (list tbs signing-key)))
+
+(defn- mint-root []
+  (let [priv-raw (new-key)
+        priv (rsa-priv-record priv-raw)
+        subj (rdn-cn (root-subject))
+        tbs (tuple :OTPTBSCertificate :v3 (serial) SIG-ALGO
+                   subj (validity ROOT-DAYS) subj (spki priv-raw)
+                   :asn1_NOVALUE :asn1_NOVALUE (list (bc-ext)))
+        cert-der (sign-cert tbs priv)]
+    {:cert-der cert-der :key priv :subject subj :key-der (erlang/apply :public_key :der_encode (list :RSAPrivateKey priv))}))
+
+(defn- root-subject []
+  (let [who (or (System/get_env "USER") "user")
+        host (first (erlang/apply :string :split
+                      (list (or (System/get_env "HOSTNAME") "localhost") ".")))]
+    (str "beam-lisp local CA (" who "@" host ")")))
+
+(defn- mint-leaf [root name names]
+  (let [priv-raw (new-key)
+        priv (rsa-priv-record priv-raw)
+        tbs (tuple :OTPTBSCertificate :v3 (serial) SIG-ALGO
+                   (:subject root) (validity LEAF-DAYS) (rdn-cn name) (spki priv-raw)
+                   :asn1_NOVALUE :asn1_NOVALUE (list (san-ext names)))
+        cert-der (sign-cert tbs (:key root))
+        key-der (erlang/apply :public_key :der_encode (list :RSAPrivateKey priv))]
+    {:cert-der cert-der :key-der key-der}))
+
+;; ── persistence (disk + persistent_term, survives reload) ───────────────────
+
+(defn- ca-dir []
+  (let [rd (paths/runtime-dir)]
+    (if (nil? (:ok rd)) nil (str (:ok rd) "/ca"))))
+
+(defn- pem-cert [der]
+  (erlang/apply :public_key :pem_encode (list (list (tuple :Certificate der :not_encrypted)))))
+
+(defn- load-root-from-disk [dir]
+  (let [cert-path (str dir "/root.der") key-path (str dir "/root.key.der")]
+    (if (and (File/exists? cert-path) (File/exists? key-path))
+      (let [cert-der (File/read! cert-path)
+            key-der (File/read! key-path)
+            key (erlang/apply :public_key :der_decode (list :RSAPrivateKey key-der))
+            decoded (erlang/apply :public_key :pkix_decode_cert (list cert-der :otp))
+            ;; recover the subject from the decoded cert's tbs
+            tbs (elem decoded 1)
+            subj (elem tbs 6)]
+        {:cert-der cert-der :key key :subject subj :key-der key-der})
+      nil)))
+
+(defn- persist-root [dir root]
+  (File/mkdir_p! dir)
+  (File/write! (str dir "/root.der") (:cert-der root))
+  (File/write! (str dir "/root.key.der") (:key-der root))
+  (File/chmod (str dir "/root.key.der") 384)  ; 0o600
+  (File/write! (str dir "/root.pem") (pem-cert (:cert-der root))))
+
+;; ── public API ──────────────────────────────────────────────────────────────
+
+(defn ensure-started
+  "Mint-or-load the root (idempotent). Cached in persistent_term (survives a hot
+   reload) and on disk. Returns the root map."
+  []
+  (let [cached (erlang/apply :persistent_term :get (list PT-ROOT :undefined))]
+    (if (not= cached :undefined)
+      cached
+      (let [dir (ca-dir)
+            root (or (load-root-from-disk dir) (mint-root))]
+        (persist-root dir root)
+        (erlang/apply :persistent_term :put (list PT-ROOT root))
+        (erlang/apply :persistent_term :put (list PT-LEAVES {}))
+        root))))
+
+(defn root-pem
+  "The root certificate PEM — what a client trusts, served at /bl-ca.crt."
+  []
+  (pem-cert (:cert-der (ensure-started))))
+
+(defn root-der [] (:cert-der (ensure-started)))
+
+(defn- leaf-names
+  "The names a leaf answers to: the name, plus localhost when it lives under
+   .localhost, so one leaf serves both spellings."
+  [name]
+  (if (or (= name "localhost") (erlang/apply :string :find (list name ".localhost") ))
+    (distinct (list name "localhost"))
+    (list name)))
+
+(defn ssl-opts
+  "The :ssl options serving `name`: the leaf cert + key (DER). Minted on first
+   ask, cached in persistent_term. Returns {:ok opts}."
+  [name]
+  (let [root (ensure-started)
+        leaves (erlang/apply :persistent_term :get (list PT-LEAVES {}))]
+    (if (contains? leaves name)
+      {:ok (get leaves name)}
+      (let [leaf (mint-leaf root name (leaf-names name))
+            opts (list (tuple :cert (:cert-der leaf))
+                       (tuple :key (tuple :RSAPrivateKey (:key-der leaf)))
+                       (tuple :verify :verify_none)
+                       (tuple :versions (list :"tlsv1.2" :"tlsv1.3")))]
+        (erlang/apply :persistent_term :put (list PT-LEAVES (assoc leaves name opts)))
+        {:ok opts}))))
+
+(defn sni-fun
+  "An fn for :ssl :sni_fun — picks the leaf for the handshake's SNI name. The
+   gateway installs this so one listener serves every live name's cert."
+  []
+  (fn [servername]
+    (let [name (if (erlang/is_list servername) (erlang/list_to_binary servername) servername)]
+      (if (or (nil? name) (= name ""))
+        :undefined
+        (to-list (:ok (ssl-opts name)))))))
