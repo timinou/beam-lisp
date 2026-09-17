@@ -325,21 +325,6 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
     match try_attach(&root, argv) {
         Attach::Exit(code) => Some(code),
         a @ (Attach::LostAfterSend | Attach::Stalled(_)) => after_attach(a),
-        Attach::Busy { argv: running, age_ms, queued } => {
-            // A busy daemon is not a broken one — but it is one that cannot serve
-            // this command NOW, and waiting for it is a choice the caller should
-            // get to make. Never autostart a second daemon here: one exists, and
-            // it is working. (BL_DAEMON=queue waits; see daemon_mode.)
-            let held = if running.is_empty() { "a command".to_string() } else { format!("`{running}`") };
-            let secs = age_ms / 1000;
-            let ahead = if queued > 1 { format!(", {queued} commands ahead") } else { String::new() };
-            eprintln!(
-                "bl: the daemon for this tree is busy with {held} ({secs}s{ahead}) — \
-                 running this command cold instead (BL_DAEMON=queue waits for its turn)",
-                ahead = ahead
-            );
-            None
-        }
         Attach::RestartRequired => {
             // the daemon is stale (checkout changed). Stop it, restart, retry once.
             // Say so: a daemon that vanishes without a word looks like a command
@@ -449,16 +434,12 @@ fn main() {
     let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { "bin/bl" });
 
     // ── daemon fast-path (unix) ──────────────────────────────────────────────
-    // A warm `bl daemon` for the caller's tree serves the command over a socket
-    // in ~30ms instead of a ~1.2s cold VM boot. Skipped when BL_DAEMON=off, for
-    // the daemon lifecycle verbs themselves (which must reach the release), and
-    // for the verbs that own their process for as long as it lives: a repl, a
-    // repainting monitor, a server, an editor/agent transport. The daemon runs
-    // one command at a time in one worker, so a command that never returns
-    // would hold every later client's turn; these run cold in their own VM
-    // instead. `watch` is NOT one of them: the daemon HOSTS the watcher (its
-    // WatchRegistry) and streams commits back, so `bl watch` rides the warm
-    // daemon and its reloads stay ordered with the runs and tests it serves.
+    // A warm global daemon serves the command over a socket in ~30ms instead of
+    // a ~1.2s cold VM boot. Skipped only when BL_DAEMON=off and for the `bl
+    // daemon` lifecycle verbs (which must reach the release). Every other verb —
+    // including repl/serve/mcp/gateway and `bl watch` — runs in its own VM
+    // process under the daemon (PLAN-121), so nothing is exiled to a cold VM to
+    // avoid parking a serial worker: there is no serial worker.
     #[cfg(unix)]
     {
         let mode = std::env::current_dir()
@@ -470,15 +451,10 @@ fn main() {
         let off = mode == DaemonMode::Off;
         let verb = verb_of(&argv);
         let is_lifecycle = verb.as_deref() == Some("daemon");
-        let owns_process = verb.is_none()
-            || matches!(
-                verb.as_deref(),
-                // `gateway` is the per-user listener every tree's names route
-                // through: it blocks for the machine's lifetime, so it must
-                // never be parked on a tree daemon's single worker.
-                Some("repl" | "monitor" | "serve" | "mcp" | "gateway")
-            )
-            || (verb.as_deref() == Some("lsp") && argv.iter().any(|a| a == "serve"));
+        // PLAN-121/123: NO verb is exiled to a cold VM. A long-lived command
+        // (repl, serve, mcp, gateway, lsp serve) is just a process under its
+        // VM's capped env — the single serial worker it would have parked is
+        // gone. Only `bl daemon` lifecycle verbs still reach the release path.
 
         // `bl daemon start` is a REQUEST for a daemon, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with
@@ -507,7 +483,7 @@ fn main() {
             }
         }
 
-        if !off && !is_lifecycle && !owns_process {
+        if !off && !is_lifecycle {
             if let Some(code) = maybe_attach_daemon(&argv, &bin) {
                 std::process::exit(code);
             }

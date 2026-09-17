@@ -410,7 +410,7 @@ defmodule BeamLisp.Daemon.HTTP do
       # A watch task has no HTTP request/response — it runs forever; the dashboard
       # intent path declines it (this is HTTP semantics, not the old serial-worker
       # refusal, which is gone).
-      {:error, :owns_process} ->
+      {:error, :long_lived} ->
         json(conn, 400, %{
           "error" => "that task keeps its own process — run it without the daemon"
         })
@@ -449,7 +449,7 @@ defmodule BeamLisp.Daemon.HTTP do
 
     case Enum.find(m.tasks, fn t -> t.name == name end) do
       nil -> {:error, :no_such_task}
-      %{watch: true} -> {:error, :owns_process}
+      %{watch: true} -> {:error, :long_lived}
       task -> {:ok, task}
     end
   end

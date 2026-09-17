@@ -373,10 +373,6 @@ pub enum Attach {
     /// Nothing arrived for the read timeout, but the socket is still OPEN. The
     /// command is probably still running: silence is not loss.
     Stalled(u64),
-    /// The daemon is UP but its single worker is busy with someone else's
-    /// command. Returned BEFORE the request is sent, so the caller may still
-    /// choose: run cold now (default) or queue and wait (BL_DAEMON=queue).
-    Busy { argv: String, age_ms: i64, queued: i64 },
 }
 
 #[cfg(unix)]
@@ -413,21 +409,9 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
         Err(_) => return Attach::Fallback,
     };
     match hello_reply {
-        Some(Term::Tuple(t)) if is_ready(&t) => {
-            // BUSY IS A CHOICE, MADE BEFORE THE REQUEST IS SENT. The worker runs
-            // one command at a time, so a second client waits in the mailbox;
-            // the waiting used to be invisible (no output, no progress, no
-            // holder) and therefore indistinguishable from a hang. Measured
-            // 2026-09-16: a trivial `bl run` printed nothing for the full 120s
-            // of another client's command. Sending the request first would make
-            // running it here unsafe (side effects may happen), so the decision
-            // belongs here, where a cold exec is still allowed.
-            if let Some(b) = ready_busy(&t) {
-                if daemon_mode(root) != DaemonMode::Queue {
-                    return Attach::Busy { argv: b.argv, age_ms: b.age_ms, queued: b.queued };
-                }
-            }
-        }
+        // PLAN-121/123: the daemon runs each request as its OWN VM process, so
+        // it is never "busy" — a ready hello means attach and send.
+        Some(Term::Tuple(t)) if is_ready(&t) => {}
         Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => return Attach::RestartRequired,
         Some(Term::Tuple(_)) => return Attach::Fallback, // other reject (wrong tree/unauthorized)
         _ => return Attach::Fallback,
@@ -503,26 +487,6 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                         let _ = std::io::stderr().write_all(b);
                         let _ = std::io::stderr().flush();
                         wrote_anything = wrote_anything || !b.is_empty();
-                    }
-                }
-                // {:bl, 1, :accepted, id, %{queue_position: n}} — sent when the
-                // worker was busy and this client chose to wait (the daemon said
-                // so in `ready`; BL_DAEMON=queue keeps the old behaviour). Say
-                // where it stands: an invisible queue IS the bug.
-                "accepted" => {
-                    if let Some(n) = t.get(4).and_then(|x| match x {
-                        Term::Map(pairs) => pairs
-                            .iter()
-                            .find(|(k, _)| k.as_atom() == Some("queue_position"))
-                            .and_then(|(_, v)| v.as_int()),
-                        _ => None,
-                    }) {
-                        if n > 0 {
-                            eprintln!(
-                                "bl: queued behind {n} command(s) on this tree's daemon \
-                                 (BL_DAEMON=off runs this cold instead)"
-                            );
-                        }
                     }
                 }
                 // {:bl, 1, :heartbeat, id, ms} and {:bl, 1, :watch, id, seq,
@@ -775,10 +739,9 @@ fn collect_env_paths() -> Vec<String> {
 pub enum DaemonMode {
     /// Never attach: a cold VM per command (`BL_DAEMON=off`).
     Off,
-    /// Attach when the daemon is FREE; run cold when its worker is busy.
+    /// Attach to the global daemon (the default). There is no "busy" — each
+    /// request runs as its own VM process (PLAN-121), so there is no queue mode.
     Auto,
-    /// Attach and take the busier route: wait for the worker's turn.
-    Queue,
 }
 
 /// The effective mode: the CALLER's environment first, else the tree's own
@@ -798,7 +761,6 @@ pub fn daemon_mode(root: &Path) -> DaemonMode {
 
     match raw.as_deref() {
         Some("off") => DaemonMode::Off,
-        Some("queue") => DaemonMode::Queue,
         _ => DaemonMode::Auto,
     }
 }
@@ -820,62 +782,7 @@ fn declared_daemon_mode(root: &Path) -> Option<String> {
     let close = tail.find('"')?;
     let value = tail[..close].to_string();
 
-    matches!(value.as_str(), "off" | "auto" | "queue").then_some(value)
-}
-
-struct BusyInfo {
-    argv: String,
-    age_ms: i64,
-    queued: i64,
-}
-
-/// `busy` out of the `ready` meta — `%{busy: %{argv: [...], cwd: path, age_ms:
-/// n}, queue_depth: n}`. `None` when the worker is idle, which is the common
-/// case and must cost nothing.
-fn ready_busy(t: &[Term]) -> Option<BusyInfo> {
-    let meta = match t.get(3) {
-        Some(Term::Map(pairs)) => pairs,
-        _ => return None,
-    };
-    let field = |name: &str| {
-        meta.iter()
-            .find(|(k, _)| k.as_atom() == Some(name))
-            .map(|(_, v)| v)
-    };
-
-    let pairs = match field("busy") {
-        Some(Term::Map(p)) => p,
-        _ => return None,
-    };
-    let inner = |name: &str| {
-        pairs
-            .iter()
-            .find(|(k, _)| k.as_atom() == Some(name))
-            .map(|(_, v)| v)
-    };
-
-    let argv = match inner("argv") {
-        // argv words are BINARIES in the wire shape (strings are binaries in
-        // beam-lisp). Reading them as atoms produced an empty command line and
-        // the notice degenerated to "a command" — visible in the first run of
-        // this change, which is why the unit test below pins BINARIES.
-        Some(Term::List(items)) => items
-            .iter()
-            .filter_map(|x| match x {
-                Term::Binary(b) => Some(String::from_utf8_lossy(b).to_string()),
-                Term::Atom(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    };
-
-    Some(BusyInfo {
-        argv,
-        age_ms: inner("age_ms").and_then(|v| v.as_int()).unwrap_or(0),
-        queued: field("queue_depth").and_then(|v| v.as_int()).unwrap_or(0),
-    })
+    matches!(value.as_str(), "off" | "auto").then_some(value)
 }
 
 fn is_ready(t: &[Term]) -> bool {
@@ -1092,11 +999,11 @@ mod tests {
         std::env::remove_var("BL_DAEMON");
         assert_eq!(daemon_mode(&dir), DaemonMode::Off, "the tree's word is policy");
 
-        std::env::set_var("BL_DAEMON", "queue");
-        assert_eq!(daemon_mode(&dir), DaemonMode::Queue, "the caller's word wins");
-
         std::env::set_var("BL_DAEMON", "off");
         assert_eq!(daemon_mode(&dir), DaemonMode::Off);
+
+        std::env::set_var("BL_DAEMON", "auto");
+        assert_eq!(daemon_mode(&dir), DaemonMode::Auto, "the caller's word wins");
         std::env::remove_var("BL_DAEMON");
 
         // an unreadable/absent declaration is not an error: auto is the default
@@ -1120,47 +1027,4 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `busy` is what turns "no output" into "someone else's command is
-    /// running, here it is". The client reads it from the ready meta.
-    #[test]
-    fn busy_is_read_out_of_the_ready_meta() {
-        let meta = Term::Map(vec![
-            (Term::Atom("queue_depth".into()), Term::Int(2)),
-            (
-                Term::Atom("busy".into()),
-                Term::Map(vec![
-                    (
-                        Term::Atom("argv".into()),
-                        Term::List(vec![
-                            Term::Binary(b"run".to_vec()),
-                            Term::Binary(b"src/t/sleeper.bl".to_vec()),
-                        ]),
-                    ),
-                    (Term::Atom("age_ms".into()), Term::Int(42_000)),
-                ]),
-            ),
-        ]);
-        let ready = vec![
-            Term::Atom("bl".into()),
-            Term::Int(1),
-            Term::Atom("ready".into()),
-            meta,
-        ];
-
-        let b = ready_busy(&ready).expect("busy must be found");
-        assert_eq!(b.argv, "run src/t/sleeper.bl");
-        assert_eq!(b.age_ms, 42_000);
-        assert_eq!(b.queued, 2, "queue_depth rides along for the notice");
-
-        let idle = vec![
-            Term::Atom("bl".into()),
-            Term::Int(1),
-            Term::Atom("ready".into()),
-            Term::Map(vec![(
-                Term::Atom("busy".into()),
-                Term::Atom("nil".into()),
-            )]),
-        ];
-        assert!(ready_busy(&idle).is_none(), "an idle worker costs nothing");
-    }
 }
