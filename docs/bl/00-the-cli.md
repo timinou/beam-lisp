@@ -47,7 +47,9 @@ BL_DAEMON=auto   a missing daemon is started detached, then the command is retri
 ```
 
 `bl daemon start`, `stop` and `status` are the lifecycle — see
-[03-the-live-loop.md](03-the-live-loop.md).
+[03-the-live-loop.md](03-the-live-loop.md) for the reload loop and
+[06-the-warm-daemon.md](06-the-warm-daemon.md) for the whole warm-VM DX: named
+ports, the gateway that resolves the names, and the live dashboard.
 
 ## Commands
 

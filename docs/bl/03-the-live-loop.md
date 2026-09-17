@@ -34,8 +34,11 @@ bl daemon: stopped (…/beam-lisp)
 - **The socket is discovery; an authenticated hello is authority.** A client
   connects over a Unix socket and presents the tree's token; only then does the
   daemon run its command.
-- **One worker.** Commands run one at a time, because a beam-lisp program shares
-  VM-global state with the daemon. Two `bl run`s from two terminals queue.
+- **Each command is its own process, in its own VM.** The daemon holds one warm
+  VM per project and runs each request as a fresh process under it, with the
+  caller's environment bound process-locally — so concurrent commands never
+  queue and never leak env into one another. A long `bl test` and a quick
+  `bl eval` from two terminals run at once.
 - **Staleness is a restart, never a hot-swap.** The daemon freezes the compiler
   key it booted with. When the checkout changes under it — or a client presents
   a different key — it refuses work with `restart_required`; the launcher stops
@@ -45,8 +48,11 @@ bl daemon: stopped (…/beam-lisp)
 
 The drop's launcher uses the daemon automatically: a served command returns in
 tens of milliseconds instead of ~1s. `BL_DAEMON=off` skips the daemon entirely;
-`BL_DAEMON=auto` starts one detached when none is up. Inside a checkout the same
-lifecycle works through `mix bl daemon …`.
+`BL_DAEMON=auto` starts one detached when none is up.
+
+For the whole warm-VM DX — the per-tree daemon, the named ports, the gateway
+that resolves those names, and the dashboard that renders it all live — see
+[06-the-warm-daemon.md](06-the-warm-daemon.md).
 
 `bl daemon status` exits `0` when a daemon answers, `1` when none is running.
 
@@ -66,17 +72,18 @@ serving. That is the same stage → check → commit pipeline the daemon and the
 monitor use.
 
 When a daemon is running for your tree, the **daemon hosts the watcher**: the
-watch request does not occupy the daemon's worker, and every reload's apply
-rides its queue, so a reload is ordered against the runs and tests the daemon is
-serving rather than racing them. A second client can `bl ask` or `bl test` while
+watch runs as its own process like any request, and every reload's apply rides
+the daemon's sequencer, so a reload is ordered against the other reloads and
+intents rather than racing them. A second client can `bl ask` or `bl test` while
 your watch streams. Results arrive as ordinary output frames, plus a heartbeat
 while the tree is quiet, so the stream stays live without a terminal frame.
 Without a daemon (`BL_DAEMON=off`, or no daemon for this tree) the same verb
 runs the same watcher in its own VM.
 
 The verbs that hold a process of their own — `bl repl`, `bl monitor`,
-`bl serve`, `bl mcp`, `bl lsp serve` — are never routed to the daemon's worker;
-they take a cold VM so the daemon keeps answering everyone else.
+`bl serve`, `bl mcp`, `bl lsp serve` — take a VM of their own rather than the
+tree's warm one, so a parked server never sits inside the daemon everyone else
+is using.
 
 Live reload needs the `:file_system` application, which the release ships.
 

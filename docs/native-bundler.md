@@ -286,17 +286,17 @@ check — a malformed or oversized frame is refused, never executed. A client
 `restart_required` · `shutting_down`). Then one `request` (`argv`, `cwd`,
 `env_paths`) streams back `stdout`/`stderr`/`stdin`/`exit` frames.
 
-### One worker, one image
+### A VM per project, a process per request
 
-Every command runs on a **single Executor FIFO** — because a beam-lisp program
-shares VM-global state (loaded modules, the pinned loader, ETS, NIFs) with the
-daemon, two programs cannot run at once. Per request the daemon forks a fresh
-env (`Env.isolated`), binds the client's roots (`Loader.with_ambient_dirs`) and
-cwd/argv, and routes stdout through a per-request group-leader proxy. Two
-concurrent `bl run` from two terminals attach to the same daemon and queue —
-there is no cross-VM build lock to contend on. Live-reload (`bl watch`) runs
-inside the daemon too; a save's stage→commit rides the same FIFO, so it is
-ordered against the runs and tests, never concurrent with them.
+The daemon holds a **warm VM per project** and runs each command as its own
+process under that VM. Per request it forks a fresh env, binds the client's
+roots and cwd/argv, overlays the client's environment *process-locally* (never
+the node-global table), and routes stdout through a per-request group-leader
+proxy — so N concurrent commands are N processes, never a queue, and one
+command's env never leaks into the next. Two `bl run`s from two terminals run at
+once. Only the reload/intent **sequencer** takes turns: a save's stage→commit
+and a dashboard-launched task ride one sequencer so they are ordered against
+each other, never racing a program the daemon is running.
 
 ### Staleness is a restart, never a hot-swap
 
