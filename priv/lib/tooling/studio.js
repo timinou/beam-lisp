@@ -355,23 +355,77 @@
   };
 
   // ── Click-to-test: export the frames from the scrubber position to now
+  //
+  //   pc-export      the legacy deftest text: shown in the textarea and
+  //                  copied to the clipboard.
+  //   pc-export-org  the same recording as a `.bl.org` scenario DRAFT,
+  //                  DOWNLOADED. The document says it is pending
+  //                  consolidation; it is event replay, not a browser
+  //                  selector recording, and not a passing browser proof.
+  //                  Secret-like payload values arrive already redacted.
+  var wantOrg = false;
+  function exportRange() {
+    var fs = timeline.frames;
+    if (!fs.length) return null;
+    var from = timeline.cur != null ? timeline.cur + 1 : fs[0].t;
+    return [from, fs[fs.length - 1].t];
+  }
+  function download(name, text) {
+    try {
+      var url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = name || "scenario-draft.bl.org";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      return true;
+    } catch (_e) { return false; }
+  }
   function wireExport() {
     var b = document.getElementById("pc-export");
-    if (!b || b.__wired) return;
-    b.__wired = true;
-    b.onclick = function () {
-      var fs = timeline.frames;
-      if (!fs.length) return;
-      var from = timeline.cur != null ? timeline.cur + 1 : fs[0].t;
-      var to = fs[fs.length - 1].t;
-      if (window.__pulseSend) window.__pulseSend(["export", from, to]);
-    };
+    if (b && !b.__wired) {
+      b.__wired = true;
+      b.onclick = function () {
+        var r = exportRange();
+        if (!r) return;
+        wantOrg = false;
+        if (window.__pulseSend) window.__pulseSend(["export", r[0], r[1]]);
+      };
+    }
+    var o = document.getElementById("pc-export-org");
+    if (o && !o.__wired) {
+      o.__wired = true;
+      o.onclick = function () {
+        var r = exportRange();
+        if (!r) return;
+        var dflt = "recorded-t" + r[0] + "-t" + r[1];
+        if (!window.prompt) return;
+        var name = window.prompt("name this .bl.org scenario draft", dflt);
+        if (name === null || !String(name).trim()) name = dflt;
+        wantOrg = true;
+        if (window.__pulseSend) window.__pulseSend(["export", r[0], r[1], name]);
+      };
+    }
   }
   document.addEventListener("studio:toggle", wireExport);
   setTimeout(wireExport, 100);
 
   Studio.onMessage = function (m) {
     if (m.msg === "export") {
+      // the draft button wants the document, not the textarea
+      if (wantOrg && m.draft) {
+        wantOrg = false;
+        var o = document.getElementById("pc-export-org");
+        var ok = download(m.filename, m.draft);
+        if (o) {
+          o.textContent = ok ? "⤓ saved " + m.filename : "⤓ download blocked";
+          setTimeout(function () { o.textContent = "⤓ .bl.org draft"; }, 3000);
+        }
+        return;
+      }
+      wantOrg = false;
       var out = document.getElementById("pc-export-out");
       if (out) { out.hidden = false; out.value = m.source; out.select(); }
       try { navigator.clipboard && navigator.clipboard.writeText(m.source); } catch (_e) {}

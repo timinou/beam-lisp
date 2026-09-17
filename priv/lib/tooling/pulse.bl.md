@@ -496,7 +496,7 @@ script so it can be dropped into *any* page \u2014 a standalone HTML fragment, o
    ".pcost{display:flex;align-items:center;gap:8px;padding:2px 0}.pcost .l{color:#7d8590;width:30px}"
    ".pcost svg{flex:1;height:18px}.pcost b{width:56px;text-align:right;color:#e6edf3}.pcost i{color:#7d8590;font-style:normal;font-size:9px;margin-left:2px}"
    ".pcidle{margin-top:4px;color:#46d18f}.pcidle.bad{color:#ff5c8a;font-weight:700}"
-   "#pc-tl-actions{margin-top:6px}#pc-export{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 8px;font:inherit;font-size:10px;cursor:pointer}"
+   "#pc-tl-actions{margin-top:6px}#pc-export,#pc-export-org{background:#1f2733;color:#e6edf3;border:1px solid #2b3542;border-radius:6px;padding:2px 8px;font:inherit;font-size:10px;cursor:pointer}"
    "#pc-export-out{width:100%;height:120px;margin-top:6px;background:#0a0e14;color:#c9d1d9;border:1px solid #1f2733;border-radius:6px;font:10px/1.35 ui-monospace,Menlo,monospace;padding:6px;box-sizing:border-box;resize:vertical}"
    "#pc-graph{margin-bottom:10px;background:#121821;border:1px solid #1f2733;border-radius:8px;padding:6px 10px}"
    "#pc-graph svg{display:block}#pc-graph text{font-family:inherit}.pcempty{color:#7d8590;font-size:10px}"
@@ -605,7 +605,8 @@ raw-text tags, emitted verbatim). `with-chip` is the decorator.
      [:div {:id "pc-tl-info"}]
      [:div {:id "pc-tl-ticks"}]
      [:div {:id "pc-tl-actions"}
-      [:button {:id "pc-export" :title "turn the frames from here to now into a deftest"} "⤓ test from here"]]
+      [:button {:id "pc-export" :title "turn the frames from here to now into a deftest (text, copied to the clipboard)"} "⤓ test from here"]
+      [:button {:id "pc-export-org" :title "download the frames from here to now as a .bl.org scenario draft, pending consolidation — event replay, redacted, not a browser proof"} "⤓ .bl.org draft"]]
      [:textarea {:id "pc-export-out" :hidden true :readonly true :spellcheck "false"}]]
     [:div {:id "pc-vitals"}]
     [:div {:id "pc-trace"}]
@@ -705,13 +706,16 @@ its router; `mount` returns everything a host needs.
 (defn- signature [ops] (mapv (fn [op] (keyword (name (first op)))) ops))
 
 (defn scenario
-  "Frames `from`..`to` (commits with a causing event) as [{:event :expect}]."
-  [from to]
-  (into []
-    (keep (fn [f]
-            (when (and (= :commit (:kind f)) (some? (:event f)))
-              {:event (:event f) :expect (signature (:ops f))}))
-          (tap/between (tap) from to))))
+  "Frames `from`..`to` (commits with a causing event) as [{:event :expect}].
+   Optional `t` reads an EXPLICIT tap instead of the process-wide one, so a
+   caller with its own recording never has to share the ring."
+  ([from to] (scenario from to (tap)))
+  ([from to t]
+   (into []
+     (keep (fn [f]
+             (when (and (= :commit (:kind f)) (some? (:event f)))
+               {:event (:event f) :expect (signature (:ops f))}))
+           (tap/between t from to)))))
 
 (defn replay
   "Run `steps` ([{:event :expect}]) against a fresh headless socket built by
@@ -739,6 +743,275 @@ its router; `mount` returns everything a host needs.
        "        runs (tooling.pulse/replay (fn [] " mount-expr ") steps)]\n"
        "    (doseq [r runs]\n"
        "      (is (= (:expect r) (:got r)) (str \"after \" (pr-str (:event r)))))))\n"))
+
+```
+
+## A draft, not a decision: the `.bl.org` scenario
+
+The chip can already lift a run of frames off the tap ring into a `deftest`
+(`scenario-source`), and the studio's *test from here* button copies that text
+into the textarea and the clipboard. That is the right output when the test is
+about to be pasted next to the code it guards.
+
+It is the wrong output when the recording is a **finding**: something to keep,
+name, read, and decide about later. `.bl.org` is already a source format, so the
+same recording can be written as a literate DOCUMENT — prose saying what this
+is, metadata saying who recorded it and what state it is in, and one
+`beam-lisp` cell carrying the test. `draft-source` prints that document, and
+`draft-file!` writes it under an explicit directory for a scenario runner.
+
+What a draft is NOT is stated in the document itself, because a file that
+names a problem should also admit what it does not prove:
+
+- **event replay, not a browser selector recording** — nothing was captured
+  from the DOM and no locator was recorded; the test drives the app's own event
+  stream into a headless socket;
+- **not a passing browser proof** — the replay asserts each step's op signature
+  (the kinds of ops, in order) and nothing else. No semantic assertion is ever
+  synthesized: deciding what a step must establish, and naming the claim, is
+  the human work the draft waits for.
+
+`#+BL_STATUS: pending-consolidation` is the point of the artifact being a draft
+rather than a test: a green run of a lifted recording is not evidence that the
+product does what the journey meant.
+
+Two rules keep a draft safe to commit:
+
+- **Secret-like payload values are redacted by default.** `redact-event` walks
+  the event and replaces the value of any secret-like key with
+  `...redacted...`, so a credential cannot ride into a document that gets
+  reviewed and committed. The draft says how many steps changed — a redacted
+  step does not replay as recorded, deliberately.
+- **Caller-supplied names cannot forge structure.** A name goes through
+  `draft-slug`, so what reaches the reader is a symbol and never a number; and
+  through `org-line`, so what reaches the document is ONE line. A name can
+  therefore never open a fence or a heading — in the code, the metadata or the
+  prose.
+
+The boundary that follows: the DRAFT is the redacted artifact — the one that
+gets named, committed and reviewed. The legacy `scenario-source` text (the
+chip's *test from here* button) stays exactly what it was: the raw, replayable
+recording. A redacted step cannot replay, so the two projections differ on
+purpose rather than by oversight.
+
+```beam-lisp
+;; ── The `.bl.org` draft: a recording a human finishes ─────────────────
+;;
+;; `scenario-source` prints a bare deftest — the right output when the test is
+;; about to be pasted beside the code it guards. A DRAFT is the same recording
+;; when it is a FINDING instead: a literate document carrying the names, the
+;; pending status, and the honest limits of a lifted recording, so the file
+;; that names a problem is also the file that admits what it does not prove.
+;;
+;; A third, quieter rule: secret-like payload values are redacted BEFORE the
+;; steps are printed, so a credential never rides into a document that gets
+;; reviewed and committed.
+
+(def ^:private unsafe-name
+  "The characters a plain symbol may not carry, as one run."
+  (Regex/compile! "[^A-Za-z0-9_-]+"))
+
+(def ^:private unsafe-ns
+  "As `unsafe-name`, but `.` survives: an app namespace is dotted."
+  (Regex/compile! "[^A-Za-z0-9_.-]+"))
+
+(def ^:private edge-dash (Regex/compile! "^-+|-+$"))
+(def ^:private edge-dot  (Regex/compile! "^[.]+|[.]+$"))
+(def ^:private a-digit   (Regex/compile! "^[0-9]"))
+
+(defn draft-slug
+  "`s` as a name the READER can take, or nil when nothing survives. Every
+   character outside the class becomes `-`, edge separators are trimmed, and a
+   leading digit is prefixed so the token is a symbol and never a number.
+   `dotted?` keeps `.` (an app namespace); everything else drops it, so a slug
+   is never a namespaced symbol by accident.
+
+   A newline is in the unsafe class. A caller-supplied name therefore cannot
+   end a line, so it can never open a `#+begin_src` fence, a `#+end_src`, or a
+   heading in the document it is printed into — in code, metadata or prose."
+  ([s] (draft-slug s false))
+  ([s dotted?]
+   (let [fill (if dotted? unsafe-ns unsafe-name)
+         t0   (Regex/replace fill (str s) "-")
+         t1   (Regex/replace edge-dash t0 "")
+         t    (Regex/replace edge-dot t1 "")]
+     (cond
+       (blank? t) nil
+       (Regex/match? a-digit t) (str "s-" t)
+       :else t))))
+
+(defn- org-line
+  "`s` as ONE line of Org text: a newline, carriage return or tab becomes a
+   space. Every caller-supplied value the draft prints in metadata or prose
+   goes through here, so text that came off the wire can never start a line."
+  [s]
+  (trim (reduce (fn [acc ch]
+                  (if (or (= ch "\n") (= ch "\r") (= ch "\t")) (str acc " ") (str acc ch)))
+                "" (to-list (str s)))))
+
+(def ^:private secret-keys
+  "Payload keys whose VALUE must never reach a document that gets committed.
+   Matched as lower-cased SUBSTRINGS, so `:password`, `\"apiKey\"`, `:token`,
+   `:x-auth-token` and `\"Authorization\"` all hit without an exhaustive list
+   of spellings."
+  ["password" "passwd" "secret" "token" "api-key" "apikey" "api_key"
+   "authorization" "auth" "bearer" "cookie" "session" "credential"
+   "private-key" "access-key" "refresh-token" "otp" "pin" "ssn"])
+
+(def ^:private redacted-value "...redacted...")
+
+(defn- secret-key? [k]
+  (let [s (lower-case (name k))]
+    (some (fn [needle] (includes? s needle)) secret-keys)))
+
+(defn redact-event
+  "`event` with every secret-like payload VALUE replaced by `...redacted...`,
+   recursively through maps and sequences. Pure: the recording is untouched —
+   only the projection is redacted. A shape it cannot walk (a fn, a pid) comes
+   back as it was rather than dropped."
+  [event]
+  (cond
+    (map? event)
+    (reduce (fn [m e]
+              (let [k (key e)]
+                (assoc m k (if (secret-key? k) redacted-value (redact-event (val e))))))
+            {} (seq event))
+
+    ;; shape is preserved: a vector stays a vector, a list stays a list — the
+    ;; projection may mask a value, never silently restructure the recording
+    (vector? event) (mapv redact-event event)
+    (seq? event) (apply list (map redact-event event))
+
+    :else event))
+
+(defn redacted-event?
+  "Would redaction change this event? The question the metadata answers."
+  [event]
+  (not= event (redact-event event)))
+
+(defn redact-steps
+  "`steps` with every event redacted (`redact-event`). A redacted step is a
+   deliberate hole a fixture fills — never a real credential in the document."
+  [steps]
+  (mapv (fn [s] (assoc s :event (redact-event (:event s)))) steps))
+
+(defn redactions
+  "How many of `steps` carry a secret-like value that redaction replaces. The
+   draft prints this as `#+BL_REDACTED`, and states that a redacted step does
+   not replay as recorded."
+  [steps]
+  (count (filter (fn [s] (redacted-event? (:event s))) steps)))
+
+(defn draft-source
+  "The recording as a `.bl.org` literate DRAFT, marked
+   `#+BL_STATUS: pending-consolidation` and meant to be finished by a human.
+   PURE: no clock, no env, no tap — every value it prints came in as an
+   argument.
+
+   `scenario-name` names the scenario (and, slugged, the deftest and the
+   document's `:CUSTOM_ID`); `app-ns`/`app-fn` name the mount expression the
+   draft replays against; `steps` is [{:event :expect}] exactly as `scenario`
+   yields. `opts` (optional) supplies {:user \"…\" :at <epoch-ms> :note \"…\"}.
+
+   The cell is `scenario-source`'s own output, so a draft and a pasted test can
+   never drift. Secret-like payload values are redacted by default; the test
+   asserts each step's op signature only — event replay, not a browser
+   selector recording, and not a browser proof."
+  ([scenario-name app-ns app-fn steps]
+   (draft-source scenario-name app-ns app-fn steps {}))
+  ([scenario-name app-ns app-fn steps opts]
+   (let [slug  (or (draft-slug scenario-name) "recorded-scenario")
+         ns    (or (draft-slug app-ns true) "my.app")
+         fn    (or (draft-slug app-fn) "mount-for-test")
+         title (or (org-line scenario-name) "recorded-scenario")
+         raw   (vec steps)
+         n     (count raw)
+         nred  (redactions raw)
+         user  (org-line (get opts :user ""))
+         at    (org-line (str (get opts :at "")))
+         note  (org-line (get opts :note ""))]
+     (str
+      "#+TITLE: " title " - a scenario draft\n"
+      "#+BL_STATUS: pending-consolidation\n"
+      "#+BL_KIND: pulse-scenario-draft\n"
+      "#+BL_SOURCE: event-replay\n"
+      "#+BL_SCENARIO: " title "\n"
+      "#+BL_APP: " (org-line (str app-ns)) "/" (org-line (str app-fn)) "\n"
+      "#+BL_STEPS: " n "\n"
+      "#+BL_REDACTED: " nred "\n"
+      (if (blank? user) "" (str "#+BL_USER: " user "\n"))
+      (if (blank? at) "" (str "#+BL_RECORDED_AT: " at "\n"))
+      (if (blank? note) "" (str "#+BL_NOTE: " note "\n"))
+      "\n"
+      "* " title "\n"
+      ":PROPERTIES:\n"
+      ":CUSTOM_ID: " slug "\n"
+      ":END:\n"
+      "\n"
+      "This is a pulse tap DRAFT, lifted from recorded frames and left pending\n"
+      "consolidation. Two honest limits travel with it.\n"
+      "\n"
+      "- It is *event replay, not a browser selector recording*: nothing here\n"
+      "  was captured from the DOM and no locator was recorded. The generated\n"
+      "  test drives the app's own event stream into a headless socket.\n"
+      "- It is *not a passing browser proof*: the replay asserts each step's op\n"
+      "  signature — the kinds of ops, in order — and nothing else. No semantic\n"
+      "  assertion is synthesized. Deciding what a step must establish, and\n"
+      "  naming the claim, is the work this draft is waiting for.\n"
+      "\n"
+      "Steps recorded: " n
+      (if (pos? nred) (str ", of which " nred " had a secret-like value redacted") "")
+      ".\n"
+      (if (pos? nred)
+        (str "\nA redacted step does not replay as recorded; fill the hole from a\n"
+             "fixture, and never re-record a live credential into a committed file.\n")
+        "")
+      "\n"
+      "Consolidate it by giving the scenario the name you will look for, pointing\n"
+      "the require at the namespace that builds the test world, replacing\n"
+      "(app/" fn ") with the mount expression you trust, and adding the claims\n"
+      "this journey is actually about.\n"
+      "\n"
+      "#+begin_src beam-lisp\n"
+      "(ns tooling.pulse.draft." slug "\n"
+      "  (:require [" ns " :as app]))\n"
+      "\n"
+      (scenario-source slug (str "(app/" fn ")") (redact-steps raw))
+      "#+end_src\n"))))
+
+(defn draft-from
+  "`draft-source` for frames `from`..`to` of tap `t` — the draft projection of
+   `scenario`. Pass `t` (from `tap/open`) and the recording never touches the
+   process-wide ring, so a scenario runner's draft cannot absorb another run's
+   frames; omit it and the process tap is used, exactly as `scenario` does."
+  ([scenario-name app-ns app-fn from to]
+   (draft-from scenario-name app-ns app-fn from to (tap) {}))
+  ([scenario-name app-ns app-fn from to t]
+   (draft-from scenario-name app-ns app-fn from to t {}))
+  ([scenario-name app-ns app-fn from to t opts]
+   (draft-source scenario-name app-ns app-fn (scenario from to t) opts)))
+
+(defn draft-file!
+  "Write `draft-source` to `<dir>/<slug>.bl.org` and return {:ok path}, or
+   {:error why}. `dir` is EXPLICIT — never inferred, never the cwd — must
+   already exist, and the file must land inside it: the slug carries no
+   separator to escape WITH, and the resolved path is checked anyway. Nothing
+   here runs on load; a scenario runner calls this when a human asks for a
+   draft."
+  ([dir scenario-name app-ns app-fn steps]
+   (draft-file! dir scenario-name app-ns app-fn steps {}))
+  ([dir scenario-name app-ns app-fn steps opts]
+   (let [d      (str dir)
+         slug   (or (draft-slug scenario-name) "recorded-scenario")
+         base   (Path/expand (if (blank? d) "." d))
+         inner  (if (ends-with? base "/") base (str base "/"))
+         target (Path/expand (Path/join base (str slug ".bl.org")))]
+     (cond
+       (blank? d) {:error "draft-file!: an explicit directory is required"}
+       (not (File/exists? base)) {:error (str "draft-file!: no such directory " base)}
+       (not (starts-with? target inner)) {:error (str "draft-file!: refusing to write outside " base)}
+       :else (do (File/write! target (draft-source scenario-name app-ns app-fn steps opts))
+                 {:ok target})))))
 
 (defn- ws-init [_state]
   ;; per-commit push: this ws process subscribes to the tap, so a frame is
@@ -875,10 +1148,16 @@ its router; `mount` returns everything a host needs.
 
 (defn- ws-in
   "Requests from the chip, each a JSON list of verb and args:
-   timeline -> the scrubber index; time t -> the screen at frame t."
+   timeline -> the scrubber index; time t -> the screen at frame t;
+   export from to [name app-ns app-fn] -> the recording as BOTH projections:
+   the legacy deftest text and the `.bl.org` draft."
   [frame state]
   (let [req (try (interop/json-> (nth frame 1)) (catch _ nil))
-        verb (if (sequential? req) (first req) nil)]
+        verb (if (sequential? req) (first req) nil)
+        rarg (fn [i] (nth req i nil))
+        rnamed (fn [i fallback]
+                 (let [v (rarg i)]
+                   (if (blank? (str v)) fallback v)))]
     (cond
       (= verb "timeline") (reply state {:msg "timeline" :frames (timeline-index)})
       (= verb "time")     (reply state (assoc (or (frame-at (nth req 1)) {:t (nth req 1) :missing true}) :msg "time"))
@@ -886,12 +1165,29 @@ its router; `mount` returns everything a host needs.
       (= verb "set")      (reply state (assoc (set! (nth req 1) (nth req 2)) :msg "set"))
       (= verb "fe-track") (reply state (assoc (fe-track! (nth req 1) (nth req 2)) :msg "fe-track"))
       (= verb "fe-set")   (reply state (assoc (fe-push! (nth req 1) (nth req 2)) :msg "fe-set"))
-      (= verb "export")   (let [steps (scenario (nth req 1) (nth req 2))]
-                            (reply state {:msg "export"
-                                          :steps (count steps)
-                                          :source (scenario-source
-                                                    (str "recorded-t" (nth req 1) "-t" (nth req 2))
-                                                    "(my-app/mount-for-test)" steps)}))
+
+      ;; export: `:source` is byte-identical to the old reply whenever no name
+      ;; is supplied (the chip's legacy button), and `:draft` is the `.bl.org`
+      ;; document the new button downloads. One request, two projections — and
+      ;; they differ ON PURPOSE: `:source` is the raw, replayable recording
+      ;; (contract unchanged), while `:draft` is the redacted artifact that
+      ;; gets named, committed and reviewed.
+      (and (= verb "export") (sequential? req) (>= (count req) 3))
+      (let [from   (rarg 1)
+            to     (rarg 2)
+            name   (rnamed 3 (str "recorded-t" from "-t" to))
+            app-ns (rnamed 4 "my-app")
+            app-fn (rnamed 5 "mount-for-test")
+            steps  (scenario from to)]
+        (reply state {:msg "export"
+                      :steps (count steps)
+                      :name name
+                      :filename (str (draft-slug name) ".bl.org")
+                      :source (scenario-source (draft-slug name)
+                                               (str "(" app-ns "/" app-fn ")") steps)
+                      :draft (draft-source name app-ns app-fn steps
+                                           {:user (or (System/get_env "USER") "")
+                                            :at (System/system_time :millisecond)})}))
       :else [:ok state])))
 
 (def ws-handlers
