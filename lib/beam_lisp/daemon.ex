@@ -14,7 +14,7 @@ defmodule BeamLisp.Daemon do
   speak the wire protocol, so they exercise the same path a real client does.
   """
 
-  alias BeamLisp.Daemon.{Paths, Protocol, Server}
+  alias BeamLisp.Daemon.{Paths, Protocol}
 
   @connect_timeout 500
 
@@ -32,21 +32,35 @@ defmodule BeamLisp.Daemon do
         :already_running
 
       _ ->
-        case Server.start_link(root: root, boot: true) do
-          {:ok, pid} ->
-            ref = Process.monitor(pid)
+        # PLAN-123 D3: the daemon is a pure-beam-lisp SESSION now — vm.session
+        # composes vm.net (transport) + vm.io (proxy) + vm.manager (VMs) +
+        # bl.daemon/handle-in-vm (commands). No Elixir Server. This boots it and
+        # blocks until a :control :stop frame flips the persistent-term flag.
+        BeamLisp.Loader.ensure_loaded("vm.session")
+        start = BeamLisp.Env.fetch!("vm.session", "start")
 
-            receive do
-              {:DOWN, ^ref, :process, ^pid, _} -> :ok
-            end
+        case BeamLisp.RT.invoke(start, [root]) do
+          %{ok: _listener} = ok ->
+            :persistent_term.put({:vm_session, :stop}, false)
+            wait_for_stop()
+            listener = Map.fetch!(ok, :ok)
+            _ = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.session", "stop"), [listener])
+            :ok
 
-          {:error, {:already_started, _}} ->
-            :already_running
-
-          {:error, reason} ->
-            IO.puts(:stderr, "bl daemon: failed to start: #{inspect(reason)}")
-            {:error, reason}
+          other ->
+            IO.puts(:stderr, "bl daemon: failed to start: #{inspect(other)}")
+            {:error, other}
         end
+    end
+  end
+
+  # Block the foreground caller until a :control :stop frame sets the flag.
+  defp wait_for_stop do
+    if :persistent_term.get({:vm_session, :stop}, false) do
+      :ok
+    else
+      Process.sleep(200)
+      wait_for_stop()
     end
   end
 
