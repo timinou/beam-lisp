@@ -1,0 +1,324 @@
+; vm/http.bl — the session's HTTP face, on the port the daemon claims as :ui.
+;
+; (ports Daemon.HTTP)
+;
+;   GET  /       — the dashboard: the session's read-model (vm.inspect), rendered
+;   GET  /model  — the same read-model as JSON
+;   GET  /ports  — the port table alone, as JSON
+;   GET  /index  — the code index's phase, off vm.index's ETS row
+;   POST /mcp    — the SAME MCP server `bl mcp` serves over stdio, one msg/request
+;   POST /intent — run a project task on the sequencer (vm.exec), output captured
+;   POST /index  — ask for a build
+;
+; ══ ONE MODEL, TWO FACES ════════════════════════════════════════════════════
+;
+; Everything rendered here comes from vm.inspect. `bl daemon status` renders the
+; same value, so the two faces cannot disagree: a pane here is a field there.
+;
+; ══ WHY THE WRITE PATH WANTS A HEADER ═══════════════════════════════════════
+;
+; Loopback is not a trust boundary: any page a developer visits can POST to
+; 127.0.0.1, and running a project's tasks on someone else's say-so is the hole
+; this face must not open. So the page carries the daemon's own token (server-
+; rendered, unreadable cross-origin) and every write must present it in
+; x-bl-token — a header a cross-origin caller cannot set without a preflight this
+; server never approves.
+
+(ns vm.http
+  (:require [web] [vm.inspect :as inspect] [vm.ports :as ports]
+            [vm.gateway :as gateway] [vm.index :as index] [vm.exec :as exec]))
+
+(def PT-MCP (tuple :vm-http :mcp-state))
+
+;; ── the router ──────────────────────────────────────────────────────────────
+
+(defn router
+  "A 1-arg plug: dispatch by method + path. `opts` = {:root :tree-id :token
+   :started-at} threaded from the session."
+  [opts]
+  (fn [conn]
+    (let [m (web/method conn) p (web/path conn)]
+      (cond
+        (and (= m "get") (= p "/")) (dashboard conn opts)
+        (and (= m "get") (= p "/model")) (web/json conn 200 (inspect/json opts))
+        (and (= m "get") (= p "/ports")) (web/json conn 200 (ports-json))
+        (and (= m "get") (= p "/index")) (web/json conn 200 (index-json))
+        (and (= m "post") (= p "/mcp")) (mcp conn opts)
+        (and (= m "post") (= p "/intent")) (intent conn opts)
+        (and (= m "post") (= p "/index")) (index-now conn opts)
+        :else (web/json conn 404 {"error" "not found" "path" p})))))
+
+;; ── the index face ──────────────────────────────────────────────────────────
+
+(defn- to-int [n] (if (erlang/is_integer n) n 0))
+
+(defn- index-stats [s]
+  (if (and (map? s) (not (contains? s :__struct__)))
+    {"files" (to-int (get s :files))
+     "functions" (to-int (get s :functions))
+     "analyzed" (to-int (get s :analyzed))
+     "cached" (to-int (get s :cached))
+     "skipped" (count (or (get s :skipped) (to-list [])))}
+    nil))
+
+(defn- index-json []
+  (let [p (index/progress)]
+    {"phase" (name (get p :phase))
+     "done" (get p :done 0)
+     "total" (get p :total 0)
+     "file" (get p :file)
+     "ms" (get p :ms)
+     "hit" (get p :hit)
+     "message" (get p :message)
+     "at" (get p :at)
+     "stats" (index-stats (get p :stats))}))
+
+(defn- index-now [conn opts]
+  (web/read-body conn)
+  (if (token-ok? conn opts)
+    (do (index/ensure-building) (web/json conn 200 (index-json)))
+    (web/json conn 403 {"error" "missing or wrong x-bl-token"})))
+
+;; ── ports face ──────────────────────────────────────────────────────────────
+
+(defn- ports-json []
+  (let [live (gateway/live)]
+    (to-list
+      (map (fn [p]
+             (let [hosts (get p :hosts (to-list []))
+                   url (if (empty? hosts)
+                         (str "http://127.0.0.1:" (get p :port) "/")
+                         (gateway/url (first hosts) (get live :port) (get live :fronted)))]
+               {"name" (get p :name) "port" (get p :port) "hosts" hosts "url" url
+                "tree" (get p :tree_id) "root" (get p :root) "pid" (get p :pid)
+                "claimed_at" (get p :claimed_at)}))
+           (ports/list-claims)))))
+
+;; ── token auth ──────────────────────────────────────────────────────────────
+
+(defn- session-token [opts]
+  (let [t (get opts :token)]
+    (if (erlang/is_binary t) (String/downcase (Base/encode16 t)) "")))
+
+(defn- token-ok? [conn opts]
+  (let [want (session-token opts)
+        given (or (web/req-header conn "x-bl-token") "")]
+    (and (erlang/is_binary want) (> (erlang/byte_size want) 0)
+         (= (erlang/byte_size want) (erlang/byte_size given))
+         (erlang/apply :crypto :hash_equals (list want given)))))
+
+;; ── intents ─────────────────────────────────────────────────────────────────
+
+(defn- intent [conn opts]
+  (let [body (web/read-body conn)]
+    (if (not (token-ok? conn opts))
+      (web/json conn 403 {"error" "missing or wrong x-bl-token"})
+      (let [parsed (try (Jason/decode! body) (catch e nil))
+            name (if (map? parsed) (get parsed "name") nil)]
+        (if (nil? name)
+          (web/json conn 400 {"error" "expected {\"name\": \"<task>\"}"})
+          (let [task (task-spec name opts)]
+            (cond
+              (= :none task) (web/json conn 404 {"error" "this tree declares no such task"})
+              (= :watch task) (web/json conn 400 {"error" "that task keeps its own process — run it without the daemon"})
+              :else
+              (let [rc (run-task name opts)]
+                (web/json conn 200 {"name" name "exit" (get rc :exit)
+                                    "output" (get rc :output) "run" (get task :run)})))))))))
+
+(defn- task-spec [name opts]
+  (let [m (inspect/model opts)
+        t (some (fn [t] (if (= name (:name t)) t nil)) (:tasks m))]
+    (cond (nil? t) :none (:watch t) :watch :else t)))
+
+(defn- run-task [name opts]
+  (BeamLisp.Loader/ensure_loaded "bl.cli")
+  (let [root (get-in (inspect/model opts) [:identity :root])
+        cap (exec/run-capture
+              (fn [] (BeamLisp/with_cwd root
+                       (fn [] (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "bl.cli" "run-argv")
+                                                  (to-list [(to-list [name])]))))))
+        result (:result cap)
+        exit (if (erlang/is_integer result) result (if (and (map? result) (contains? result :error)) 1 0))]
+    {:exit exit :output (:output cap)}))
+
+;; ── MCP over HTTP ───────────────────────────────────────────────────────────
+
+(defn- mcp [conn opts]
+  (let [body (web/read-body conn)
+        request (try (Jason/decode! body) (catch e nil))]
+    (if (nil? request)
+      (web/json conn 400 {"jsonrpc" "2.0" "id" nil "error" {"code" -32700 "message" "Parse error"}})
+      ;; on the index owner, not this per-request process: the mount the request
+      ;; may trigger builds ETS tables owned by their creator, and a connection
+      ;; process dies with its response (see vm.index).
+      (web/json conn 200 (index/run (fn [] (mcp-request request opts)))))))
+
+(defn- mcp-request [request opts]
+  (try
+    (let [state (mcp-state opts)]
+      (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.server" "request-response")
+                          (to-list [state request])))
+    (catch e
+      {"jsonrpc" "2.0" "id" (if (map? request) (get request "id") nil)
+       "error" {"code" -32603 "message" (str "Internal error: " (ex-message e))}})))
+
+(defn- mcp-state [opts]
+  (let [key (tuple :vm-http :mcp-state (or (get opts :tree-id) "default"))
+        cached (erlang/apply :persistent_term :get (list key nil))]
+    (if (nil? cached)
+      (do (BeamLisp.Loader/ensure_loaded "mcp.server")
+          (let [state (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.server" "state") (to-list []))]
+            (erlang/apply :persistent_term :put (list key state))
+            state))
+      cached)))
+
+;; ── HTML helpers ────────────────────────────────────────────────────────────
+
+(defn- esc [v]
+  (if (nil? v)
+    ""
+    (-> (str v)
+        (String/replace "&" "&amp;") (String/replace "<" "&lt;")
+        (String/replace ">" "&gt;") (String/replace "\"" "&quot;")
+        (String/replace "'" "&#39;"))))
+
+(defn- uptime [ms]
+  (if (erlang/is_integer ms)
+    (let [s (quot ms 1000)]
+      (if (< s 60) (str s "s") (str (quot s 60) "m " (rem s 60) "s")))
+    "?"))
+
+(defn- short [key]
+  (cond (nil? key) "(none)"
+        (and (erlang/is_binary key) (> (erlang/byte_size key) 16))
+          (str (erlang/apply :binary :part (list key 0 16)) "…")
+        :else key))
+
+;; ── the dashboard ───────────────────────────────────────────────────────────
+
+(defn- tasks-pane [tasks]
+  (if (empty? tasks)
+    "<p class=\"empty\">this tree declares no tasks — add a :tasks map to env.bl</p>"
+    (str "<table>"
+         (join "\n"
+           (map (fn [t]
+                  (str "<tr><td class=\"name\">" (esc (:name t)) "</td><td class=\"note\">"
+                       (esc (:doc t)) "<br><span class=\"mono\">" (esc (:run t)) "</span>"
+                       (if (:watch t) " · watch" "") "</td>"
+                       "<td style=\"text-align:right\">"
+                       (if (:watch t)
+                         "<span class=\"note\">run without the daemon</span>"
+                         (str "<button onclick=\"runTask('" (esc (:name t)) "')\">run</button>"))
+                       "</td></tr>"))
+                tasks))
+         "</table>")))
+
+(defn- ports-pane [ports]
+  (if (empty? ports)
+    "<p class=\"empty\">no ports claimed</p>"
+    (str "<table>"
+         (join "\n"
+           (map (fn [p]
+                  (str "<tr><td class=\"name\">" (esc (:name p)) "</td>"
+                       "<td class=\"port\">" (:port p) "</td>"
+                       "<td class=\"note\"><a href=\"" (esc (:url p)) "\">" (esc (:url p)) "</a><br>"
+                       (esc (erlang/apply :filename :basename (list (:root p)))) " · pid " (:pid p) "</td></tr>"))
+                ports))
+         "</table>")))
+
+(defn- progress-bar [done total]
+  (if (= total 0)
+    "<div class=\"bar\"><i style=\"width:2%\"></i></div>"
+    (let [pct (min 100 (round (* (/ done (max total 1)) 100)))]
+      (str "<div class=\"bar\"><i style=\"width:" pct "%\"></i></div> <span class=\"note\">" pct "%</span>"))))
+
+(defn- index-pane []
+  (let [p (index/progress)
+        done (get p :done 0) total (get p :total 0)
+        body (cond
+               (= :ready (:phase p))
+                 (let [s (or (:stats p) {}) hit (if (= true (:hit p)) " (unchanged)" "")]
+                   (str "<p><span class=\"ok\">ready</span>" hit " · "
+                        (to-int (get s :files)) " files · " (to-int (get s :functions)) " functions · "
+                        (to-int (get s :analyzed)) " analyzed now, " (to-int (get s :cached)) " from cache · "
+                        "built in " (uptime (get p :ms)) "</p>"))
+               (= :building (:phase p))
+                 (str "<p>indexing — " (if (> total 0) (str done " / " total " files") "starting…") "</p>"
+                      (progress-bar done total)
+                      "<p class=\"note mono\">" (esc (or (:file p) "")) "</p>")
+               (= :error (:phase p))
+                 (str "<p><span class=\"bad\">index failed</span> <span class=\"mono\">" (esc (or (:message p) "")) "</span></p>")
+               :else
+                 "<p class=\"empty\">no index yet — <button onclick=\"indexNow()\">index this tree</button></p>")]
+    (str body "<pre id=\"index-out\" class=\"mono\"></pre>")))
+
+(defn- image-pane [image]
+  (if (nil? image)
+    "<p class=\"empty\">the reload image is not loaded in this session — run <span class=\"mono\">bl watch</span> or <span class=\"mono\">bl monitor</span> to give it one</p>"
+    (str "<pre>" (esc (String/trim (inspect/render-text
+                                     {:identity {:name "" :root "" :pid "" :tree-id "" :compiler-key nil :uptime-ms 0}
+                                      :ports (to-list []) :tasks (to-list []) :image image}))) "</pre>")))
+
+(defn- dashboard [conn opts]
+  (let [m (inspect/model opts)
+        id (:identity m)
+        token (session-token opts)
+        js-token (Jason/encode! token)
+        body (str
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    "<title>bl session — " (esc (:name id)) "</title>"
+    "<style>"
+    ":root{color-scheme:dark}body{margin:0;padding:2.6rem 1.5rem 5rem;background:#0b0a10;color:#ece9f5;font:15px/1.6 ui-sans-serif,system-ui,sans-serif}"
+    "main{max-width:52rem;margin:0 auto}h1{font-size:1.4rem;margin:0 0 .15rem}"
+    ".kicker{color:#b4551f;letter-spacing:.18em;font-size:.72rem;text-transform:uppercase}"
+    ".sub{color:#9891ad;margin:0 0 2rem}section{border-top:1px solid #2c2838;padding:1.1rem 0}"
+    "h2{font-size:.74rem;letter-spacing:.13em;text-transform:uppercase;color:#9891ad;margin:0 0 .8rem;font-weight:600}"
+    "code,.mono,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85rem}"
+    "table{border-collapse:collapse;width:100%}td{padding:.3rem 0;vertical-align:top}"
+    "td.name{width:9rem;font-weight:600}td.port{width:5rem;color:#b4551f}td.note{color:#9891ad}"
+    ".empty{color:#9891ad}a{color:#7c5cff}"
+    "button{font:inherit;font-size:.8rem;color:#ece9f5;background:#201d2c;border:1px solid #2c2838;border-radius:9999px;padding:.18rem .75rem;cursor:pointer}"
+    "button:hover{border-color:#7c5cff}"
+    "pre{background:#16141f;border:1px solid #2c2838;border-radius:8px;padding:.7rem .8rem;margin:.6rem 0 0;white-space:pre-wrap}"
+    ".ok{color:#46d18f}.bad{color:#ff8f8f}"
+    ".bar{background:#201d2c;border:1px solid #2c2838;border-radius:9999px;height:.5rem;width:100%;max-width:28rem;overflow:hidden;margin:.5rem 0 .2rem}"
+    ".bar>i{display:block;height:100%;background:#7c5cff;transition:width .3s}.note{color:#9891ad}"
+    "</style></head><body><main>"
+    "<div class=\"kicker\">beam-lisp · warm session</div>"
+    "<h1>" (esc (:name id)) "</h1>"
+    "<p class=\"sub\">pid " (:pid id) " · up " (uptime (:uptime-ms id)) " · "
+    "<span class=\"mono\">" (esc (:root id)) "</span> · <a href=\"/model\">model.json</a></p>"
+    "<section><h2>Tasks</h2>" (tasks-pane (:tasks m)) "<pre id=\"intent-out\" class=\"mono\"></pre></section>"
+    "<section><h2>Ports</h2>" (ports-pane (:ports m)) "</section>"
+    "<section><h2>Index</h2>" (index-pane) "</section>"
+    "<section><h2>Image</h2>" (image-pane (:image m)) "</section>"
+    "<section><h2>Session</h2><table>"
+    "<tr><td class=\"name\">compiler_key</td><td class=\"note mono\">" (esc (short (:compiler-key id))) "</td></tr></table></section>"
+    "<section><h2>Transport</h2><table>"
+    "<tr><td class=\"name\">mcp</td><td class=\"note\"><span class=\"mono\">POST /mcp</span> — the same server <span class=\"mono\">bl mcp</span> serves over stdio</td></tr>"
+    "<tr><td class=\"name\">model</td><td class=\"note\"><span class=\"mono\">GET /model</span> — the read-model this page is rendered from</td></tr>"
+    "<tr><td class=\"name\">terminal</td><td class=\"note\"><span class=\"mono\">bl daemon status</span> — the same model, the terminal's face of it</td></tr>"
+    "</table></section></main>"
+    "<script>const TOKEN=" js-token ";"
+    "async function runTask(name){const out=document.getElementById('intent-out');out.textContent='running '+name+' …';out.className='mono';"
+    "try{const r=await fetch('/intent',{method:'POST',headers:{'content-type':'application/json','x-bl-token':TOKEN},body:JSON.stringify({name})});"
+    "const data=await r.json();out.className=data.exit===0?'mono ok':'mono bad';"
+    "out.textContent='$ bl '+name+'   (exit '+data.exit+')'+String.fromCharCode(10)+data.output;}catch(e){out.className='mono bad';out.textContent='intent failed: '+e;}}"
+    "async function indexNow(){const out=document.getElementById('index-out');out.textContent='indexing…';"
+    "try{await fetch('/index',{method:'POST',headers:{'content-type':'application/json','x-bl-token':TOKEN},body:'{}'});pollIndex();}catch(e){out.textContent='index request failed: '+e;}}"
+    "async function pollIndex(){const out=document.getElementById('index-out');try{const p=await (await fetch('/index')).json();"
+    "if(p.phase==='building'){out.textContent='indexing '+p.done+'/'+p.total+' — '+(p.file||'');setTimeout(pollIndex,700);}"
+    "else if(p.phase==='ready'){out.textContent='index ready in '+p.ms+' ms — reload to see it';setTimeout(()=>location.reload(),700);}"
+    "else if(p.phase==='error'){out.textContent='index failed: '+(p.message||'');}else{out.textContent='';}}catch(e){out.textContent='poll failed: '+e;}}"
+    "(async function(){try{const p=await (await fetch('/index')).json();if(p.phase==='cold')indexNow();else if(p.phase==='building')pollIndex();}catch(e){}})();"
+    "</script></body></html>")]
+    (web/html conn 200 body)))
+
+;; ── serving ─────────────────────────────────────────────────────────────────
+
+(defn serve
+  "Start the dashboard on `port` (loopback), for the session at `root`. `opts` =
+   {:root :tree-id :token :started-at}. Returns {:ok pid} | {:error reason}."
+  [port opts]
+  (web/serve {:port port :ip (tuple 127 0 0 1) :plug (router opts)}))

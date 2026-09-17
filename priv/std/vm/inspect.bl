@@ -1,0 +1,210 @@
+; vm/inspect.bl — the session's read-model, one value, two faces (ports Daemon.Inspect).
+;
+; The rule this keeps is reload.monitor's, made universal: the terminal and the
+; browser never disagree, because there is ONE model and two renderers. `bl
+; daemon status` renders this; the session page (vm.http) renders this; the JSON
+; endpoint serves this. A pane added to one is a field added HERE.
+;
+; The model answers, in one map:
+;   · identity — the tree, its pid, its age, the compiler key it booted with
+;   · ports    — every live claim, whoever made it, with the address a human keeps
+;   · tasks    — what the project declares (env.bl)
+;   · index    — the code index's phase, off vm.index's ETS row (never a call)
+;   · image    — the reload read-model, when the language side has it loaded
+;
+; identity/image are reached through the runtime, not reimplemented: the
+; language owns what the language knows. Absent keys describe what the model has
+; rather than pretending to have everything.
+
+(ns vm.inspect
+  (:require [vm.paths :as paths] [vm.ports :as ports] [vm.gateway :as gateway]
+            [vm.index :as index] [bl.env :as env]))
+
+;; ── the model ───────────────────────────────────────────────────────────────
+
+(defn model
+  "The read-model for the running daemon. Cheap enough per request: one ETS read
+   for the index, one dir scan for ports, one env.bl read for tasks, the reload
+   read-model only when already loaded. `opts` may carry {:root … :started-at …
+   :pid …} from the session; defaults resolve from the process/cwd."
+  ([] (model {}))
+  ([opts]
+   (let [root (or (get opts :root) (BeamLisp/cwd))]
+     {:identity (identity-of opts root)
+      :ports (ports-of)
+      :tasks (tasks-of root)
+      :index (index/progress)
+      :image (image-of)})))
+
+(defn- identity-of [opts root]
+  (let [started (get opts :started-at)
+        now (erlang/system_time :second)]
+    {:root root
+     :name (erlang/apply :filename :basename (list root))
+     :tree-id (paths/tree-id root)
+     :pid (or (get opts :pid) (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+     :uptime-ms (if (erlang/is_integer started) (* 1000 (- now started)) 0)
+     :compiler-key (compiler-key)
+     :started-at started}))
+
+(defn- compiler-key []
+  (try (BeamLisp.AOTCache/compiler_key) (catch e nil)))
+
+(defn- ports-of []
+  ;; the live facts are asked ONCE for the whole render (vm.gateway/live): the
+  ;; gateway port and whether 80 fronts it. Asking per row would probe port 80
+  ;; once per named port — round trips that queue behind every file op in this
+  ;; VM's single dirty-IO scheduler, which is how drawing a page times a client out.
+  (let [live (gateway/live)]
+    (map (fn [p]
+           (let [hosts (get p :hosts (to-list []))]
+             {:name (get p :name)
+              :port (get p :port)
+              :hosts hosts
+              :root (get p :root)
+              :tree-id (get p :tree_id)
+              :pid (get p :pid)
+              :url (named-url hosts (get p :port) live)
+              :loopback (str "http://127.0.0.1:" (get p :port) "/")
+              :claimed-at (get p :claimed_at)}))
+         (ports/list-claims))))
+
+(defn- named-url [hosts port live]
+  (if (empty? hosts)
+    (str "http://127.0.0.1:" port "/")
+    (gateway/url (first hosts) (get live :port) (get live :fronted))))
+
+(defn- tasks-of [root]
+  (let [project (project-of root)
+        declared (or (get project :tasks) {})]
+    (map (fn [name]
+           (let [spec (get declared name {})]
+             {:name name
+              :run (get spec :run "")
+              :doc (or (get spec :doc) "")
+              :watch (get spec :watch false)
+              :paths (get spec :paths (to-list []))}))
+         (sort (keys declared)))))
+
+(defn- project-of [root]
+  (try
+    (do (BeamLisp.Loader/ensure_loaded "bl.env")
+        (let [p (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "bl.env" "project") (to-list [root]))]
+          (if (map? p) p {})))
+    (catch e {})))
+
+(defn- image-of []
+  (try
+    (when (BeamLisp.Env/loaded_ns? "reload")
+      (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "reload" "inspect") (to-list [])))
+    (catch e nil)))
+
+;; ── JSON shaping ────────────────────────────────────────────────────────────
+
+(defn- jsonable [v]
+  (cond
+    (erlang/is_pid v) (pr-str v)
+    (and (map? v) (contains? v :__struct__)) (pr-str v)
+    (and (erlang/is_atom v) (or (= v true) (= v false))) v
+    (nil? v) nil
+    (erlang/is_atom v) (erlang/atom_to_binary v :utf8)
+    (or (erlang/is_list v) (vector? v)) (to-list (map jsonable v))
+    (and (map? v) (not (contains? v :__struct__))) (stringify v)
+    (erlang/is_tuple v) (pr-str v)
+    :else v))
+
+(defn- stringify [m]
+  (if (and (map? m) (not (contains? m :__struct__)))
+    (into {} (map (fn [kv] [(if (keyword? (first kv)) (name (first kv)) (str (first kv)))
+                            (jsonable (second kv))])
+                  m))
+    (jsonable m)))
+
+(defn json
+  "The model as JSON-safe data — string keys, no structs, no pids as terms. The
+   HTTP face serves exactly this, so a client sees what the page sees."
+  ([] (json {}))
+  ([opts]
+   (let [m (model opts)]
+     {"identity" (stringify (:identity m))
+      "ports" (to-list (map stringify (:ports m)))
+      "tasks" (to-list (map stringify (:tasks m)))
+      "index" (stringify (:index m))
+      "image" (if (:image m) (stringify (:image m)) nil)})))
+
+;; ── the terminal face ───────────────────────────────────────────────────────
+
+(defn render-text
+  "The model as the terminal's text — the face `bl daemon status` shows.
+   Rendered FROM the model, so the two faces are two renderings, not two truths."
+  [m]
+  (let [id (:identity m)]
+    (str "bl daemon\n"
+         "  tree          " (:name id) "  (" (:root id) ")\n"
+         "  pid           " (:pid id) "\n"
+         "  tree_id       " (:tree-id id) "\n"
+         "  compiler_key  " (or (:compiler-key id) "(none)") "\n"
+         "  uptime_ms     " (:uptime-ms id) "\n"
+         (render-ports (:ports m)) "\n"
+         (render-tasks (:tasks m)) "\n"
+         (render-index (:index m)) (render-image (:image m)))))
+
+(defn- to-int [n] (if (erlang/is_integer n) n 0))
+(defn- cnt [s k] (to-int (get s k)))
+
+(defn- ms-str [n]
+  (cond (nil? n) "—"
+        (erlang/is_integer n) (str (quot n 1000) "." (rem (quot n 100) 10) "s")
+        :else "—"))
+
+(defn- render-index [p]
+  (cond
+    (nil? p) ""
+    (= :ready (:phase p))
+      (let [s (or (:stats p) {})]
+        (str "\n  index         ready  " (cnt s :files) " files, " (cnt s :functions) " functions"
+             "  (" (cnt s :analyzed) " analyzed, " (cnt s :cached) " from cache, " (ms-str (:ms p)) ")"))
+    (= :building (:phase p))
+      (str "\n  index         building  " (get p :done 0) "/"
+           (if (> (get p :total 0) 0) (:total p) "?")
+           (if (:file p) (str "  " (:file p)) ""))
+    (= :error (:phase p))
+      (str "\n  index         failed  " (get p :message ""))
+    :else "\n  index         (none — it will build on the first code question)"))
+
+(defn- render-ports [ports]
+  (if (empty? ports)
+    "  ports         (none claimed)"
+    (str (join "\n"
+           (map (fn [p]
+                  (str "  port          " (:name p) " = " (:url p) "  → " (:port p)
+                       "  (" (erlang/apply :filename :basename (list (:root p))) ", pid " (:pid p) ")"))
+                ports))
+         (ports-urls ports))))
+
+(defn- ports-urls [ports]
+  (let [ui (some (fn [p] (if (= "ui" (:name p)) p nil)) ports)]
+    (if (nil? ui)
+      ""
+      (str "\n  ui            " (:url ui) "\n"
+           "  mcp           " (:url ui) "mcp  (the same MCP `bl mcp` serves over stdio)"))))
+
+(defn- render-tasks [tasks]
+  (if (empty? tasks)
+    "  tasks         (this tree declares none)"
+    (join "\n"
+      (map (fn [t]
+             (str "  task          " (:name t)
+                  (if (not= (:doc t) "") (str "  — " (:doc t)) "")
+                  (if (:watch t) "  [watch]" "")))
+           tasks))))
+
+(defn- render-image [image]
+  (if (nil? image)
+    ""
+    (try
+      (let [r (BeamLisp.Env/fetch "reload.monitor" "render-text")]
+        (if (and (erlang/is_tuple r) (= :ok (elem r 0)))
+          (str "\n" (BeamLisp.RT/invoke (elem r 1) (to-list [image])))
+          ""))
+      (catch e ""))))
