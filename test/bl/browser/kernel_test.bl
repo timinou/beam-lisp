@@ -1,0 +1,378 @@
+; test/bl/browser/kernel_test.bl — the Kernel client over a transport that is a
+; VALUE.
+;
+; The client's job is to decide about a server it does not own, so the server is
+; a QUEUE here: every test queues exactly the answers it expects and asserts on
+; the requests that were actually built (method, URL, headers, JSON body). No
+; socket, no paid call, no clock, no retry — the transport is a function of one
+; request map, so `{:error …}` and `{:ok {:status 202 …}}` are as easy to write
+; as 200. This is the doctrine `test/bl/deps_test.bl` uses for the hex client,
+; and it is why `browser.kernel` has no test-only branch inside it: the mock is
+; a value, not a mode.
+;
+; What is pinned here is the CONTRACT the orchestrator will rely on:
+;
+;   * the defaults (https://api.onkernel.com, KERNEL_API_KEY / KERNEL_BASE);
+;   * the key is resolved AT THE CALL, so an env.bl-built client never holds it
+;     and no diagnostic can echo it;
+;   * the routes and wire names of create / close / playwright / replays;
+;   * the escape hatch is confined to the provider's base;
+;   * `with-session` deletes the session on the success path, on the raising
+;     path, and preserves the body's error when cleanup ALSO fails.
+;
+; Run: BEAM_LISP_PATH=priv/std bl test test/bl/browser/kernel_test.bl
+;      (the path flag puts THIS tree's priv/std ahead of an installed drop)
+
+(ns browser.kernel.test
+  (:require [browser.kernel :as k] [interop]))
+
+(def ^:private key-var "BL_TEST_KERNEL_API_KEY")
+
+;; ── the mock transport ────────────────────────────────────────────────
+
+(defn- jresp
+  "A JSON answer, the shape the real transport answers (bytes, not a map)."
+  ([body] (jresp 200 body))
+  ([status body]
+   {:ok {:status status
+         :headers {"content-type" ["application/json"]}
+         :body (if (nil? body) "" (interop/->json body))}}))
+
+(defn- raw-resp [status content-type body]
+  {:ok {:status status :headers {"content-type" [content-type]} :body body}})
+
+(defn- mock
+  "A transport that records every request and answers `responses` in order."
+  [responses]
+  (let [calls (atom [])
+        queue (atom (vec responses))]
+    {:calls calls
+     :transport (fn [req]
+                  (swap! calls conj req)
+                  (let [r (first @queue)]
+                    (swap! queue (fn [q] (vec (rest q))))
+                    (if (nil? r) {:error "mock: no response queued"} r)))}))
+
+(defn- c-for
+  ([m] (c-for m {}))
+  ([m opts]
+   (k/client (merge {:api-key "test-key"
+                     :base-url "https://kernel.test"
+                     :transport (:transport m)}
+                    opts))))
+
+(defn- sent [m] (vec (map (fn [r] (:method r)) @(:calls m))))
+(defn- urls [m] (vec (map (fn [r] (:url r)) @(:calls m))))
+(defn- json-of [req] (interop/json-> (:body req)))
+
+(defn- auth-of [m] (k/header (first @(:calls m)) "authorization"))
+
+;; ── the client ────────────────────────────────────────────────────────
+
+(deftest the-defaults-are-the-documented-ones
+  (is (= "https://api.onkernel.com" k/default-base-url) "the API host, not the marketing host")
+  (is (= "KERNEL_API_KEY" k/default-api-key-env))
+  (is (= "KERNEL_BASE" k/default-base-url-env)))
+
+(deftest the-key-is-resolved-from-its-variable-at-call-time
+  (let [saved (System/get_env key-var)
+        m (mock [(jresp {"session_id" "s1"})])]
+    (System/put_env key-var "envy-key")
+    (try
+      (let [c (c-for m {:api-key nil :api-key-env key-var})]
+        (is (= "s1" (:session-id (k/create! c {}))) "the call goes out")
+        (is (= "Bearer envy-key" (auth-of m)) "and carries the environment's value")
+        (is (not (includes? (pr-str c) "envy-key"))
+            "the client VALUE never holds it: env.bl's :browser names only the variable"))
+      (finally
+        (if (nil? saved)
+          (System/delete_env key-var)
+          (System/put_env key-var saved))))))
+
+(deftest a-missing-key-is-an-explicit-error
+  (let [c (k/client {:api-key-env "BL_TEST_ABSENT_KEY_VAR"
+                     :base-url "https://kernel.test"
+                     :transport (fn [_] {:error "must never be called"})})
+        r (k/request c "GET" "/browsers" {})]
+    (is (= :missing-api-key (get-in r [:error :reason])))
+    (is (= "BL_TEST_ABSENT_KEY_VAR" (get-in r [:error :env])) "the error names the variable to set")
+    (is (thrown? (k/request! c "GET" "/browsers" {})))))
+
+(deftest a-declared-browser-map-becomes-a-client
+  ; the shape env.bl's :browser normalizes to (see bl.env)
+  (let [m (mock [])
+        c (k/client {:provider :kernel
+                     :api-key "k"
+                     :api-key-env key-var
+                     :base-url "https://api.onkernel.com"
+                     :timeout-ms 1234
+                     :session {:viewport {:width 1 :height 2}}
+                     :transport (:transport m)})]
+    (is (= :kernel (:provider c)))
+    (is (= "https://api.onkernel.com" (k/api-base c)))
+    (is (= 1234 (:timeout-ms c)) "the file's timeout reaches the client")
+    (is (= {:viewport {:width 1 :height 2}} (:session c)) "and its session options arrive verbatim")
+    (is (= :kernel (:provider (k/client {:provider "kernel"
+                                         :transport (:transport m)})))
+        "a string provider name is accepted (a file read as data could carry one)")))
+
+(deftest another-provider-is-refused
+  (is (thrown? (k/client {:provider :browserbase})) "this namespace speaks Kernel only"))
+
+(deftest api-base-is-safe-to-print
+  (let [m (mock [])]
+    (is (= "https://kernel.test" (k/api-base (c-for m {:api-key "sk-secret"}))))
+    (is (not (includes? (k/api-base (c-for m {:api-key "sk-secret"})) "sk-secret")))))
+
+;; ── create ────────────────────────────────────────────────────────────
+
+(deftest create-posts-the-documented-wire-body
+  (let [m (mock [(jresp {"session_id" "s1" "base_url" "https://metro/browser/kernel"})])
+        s (k/create! (c-for m) {:stealth true
+                                :viewport {:width 1280 :height 800}
+                                :timeout-seconds 60
+                                :start-url "https://example.com"})]
+    (is (= "s1" (:session-id s)))
+    (is (= "https://metro/browser/kernel" (:base-url s)) "the metro handle is kept")
+    (is (= "POST" (first (sent m))))
+    (is (= "https://kernel.test/browsers" (first (urls m))) "the route is the API's")
+    (is (= "Bearer test-key" (auth-of m)))
+    (is (= "application/json" (k/header (first @(:calls m)) "content-type")))
+    (let [b (json-of (first @(:calls m)))]
+      (is (= true (get b "stealth")))
+      (is (= {"width" 1280 "height" 800} (get b "viewport")))
+      (is (= 60 (get b "timeout_seconds")) "author :timeout-seconds maps to the wire name")
+      (is (= "https://example.com" (get b "start_url"))))))
+
+(deftest a-declared-session-map-is-the-default-create-body
+  (let [declared {:viewport {:width 800 :height 600}
+                  :timeout_seconds 30
+                  :network {:private_hosts true}
+                  :profiles [{:name "default"}]}
+        m (mock [(jresp {"session_id" "s1"})])
+        c (c-for m {:session declared})]
+    (k/create! c)
+    (let [b (json-of (first @(:calls m)))]
+      (is (= {"width" 800 "height" 600} (get b "viewport")))
+      (is (= 30 (get b "timeout_seconds")) "the declared wire spelling is honored")
+      (is (= {"private_hosts" true} (get b "network")))
+      (is (= [{"name" "default"}] (vec (get b "profiles")))
+          "the provider's OWN options pass through untouched"))))
+
+(deftest an-explicit-session-option-merges-over-the-mapped-ones
+  (let [m (mock [(jresp {"session_id" "s1"})])
+        c (c-for m {:session {:profiles [{:name "p"}]}})]
+    (k/create! c {:stealth true :session {:region "eu"}})
+    (let [b (json-of (first @(:calls m)))]
+      (is (= true (get b "stealth")))
+      (is (= [{"name" "p"}] (vec (get b "profiles"))) "the client's declared :session is the base")
+      (is (= "eu" (get b "region")) "and the call's :session merges over it"))))
+
+(deftest an-unknown-create-option-is-refused-before-the-wire
+  (let [m (mock [])
+        r (k/create (c-for m) {:headles true})]
+    (is (= :unknown-option (get-in r [:error :reason])))
+    (is (= [:headles] (get-in r [:error :keys])))
+    (is (empty? @(:calls m)) "nothing was sent: a typo is not a mystery session")))
+
+(deftest a-viewport-is-checked
+  (let [m (mock [])]
+    (is (= :invalid-option (get-in (k/create (c-for m) {:viewport {:width 1}}) [:error :reason])))
+    (is (empty? @(:calls m)))))
+
+(deftest an-answer-without-a-session-id-is-an-error
+  (let [m (mock [(jresp {"name" "no-id"})])]
+    (is (= :malformed-response (get-in (k/create (c-for m) {}) [:error :reason])))
+    (is (= :malformed-response
+           (get-in (k/create (c-for (mock [(raw-resp 200 "text/plain" "not json")])) {})
+                   [:error :reason]))
+        "a non-object body is refused, not guessed at")))
+
+;; ── request: status, transport, confinement ───────────────────────────
+
+(deftest a-non-2xx-is-an-error-carrying-the-server-body
+  (let [m (mock [(jresp 401 {"code" "unauthorized" "message" "bad key"})
+                 (jresp 401 {"code" "unauthorized" "message" "bad key"})])
+        c (c-for m)
+        r (k/request c "POST" "/browsers" {:body {}})]
+    (is (= :http-status (get-in r [:error :reason])))
+    (is (= 401 (get-in r [:error :status])))
+    (is (= "bad key" (get (get-in r [:error :body]) "message")) "the server's reason is kept")
+    (let [msg (try (k/request! c "POST" "/browsers" {:body {}}) (catch e (ex-message e)))]
+      (is (includes? msg "401") "and the raise names the status"))))
+
+(deftest a-transport-failure-is-an-error-value
+  (let [c (k/client {:api-key "test-key"
+                     :base-url "https://kernel.test"
+                     :transport (fn [_] {:error "connection refused"})})
+        r (k/request c "GET" "/browsers" {})]
+    (is (= :transport (get-in r [:error :reason])))
+    (is (includes? (get-in r [:error :message]) "connection refused"))))
+
+(deftest the-escape-hatch-is-confined-to-the-provider-base
+  (let [m (mock [(jresp 200 []) (jresp 200 [])])
+        c (c-for m)]
+    (doseq [bad ["https://evil.test/browsers"
+                 "//evil.test/browsers"
+                 "/browsers\r\nx-evil: 1"
+                 "/browsers\nx-evil: 1"
+                 "relative"
+                 ""]]
+      (is (= :invalid-path (get-in (k/request c "GET" bad {}) [:error :reason]))
+          (str (pr-str bad) " is refused")))
+    (is (empty? @(:calls m)) "not one refused path reached the transport")
+    (is (= "https://kernel.test/browsers" (:url (:ok (k/request c "GET" "/browsers" {}))))
+        "an accepted path is base + path, nothing else")))
+
+(deftest a-method-is-a-token-not-a-second-request-line
+  (let [m (mock [])
+        c (c-for m)]
+    (is (= :invalid-method (get-in (k/request c "GET /evil HTTP/1.1" "/x" {}) [:error :reason])))
+    (is (= :invalid-method (get-in (k/request c "" "/x" {}) [:error :reason])))
+    (is (empty? @(:calls m)))))
+
+;; ── close ─────────────────────────────────────────────────────────────
+
+(deftest close-deletes-and-is-idempotent
+  (let [m (mock [{:ok {:status 204 :headers {} :body ""}}
+                 (jresp 404 {"code" "not_found" "message" "gone"})
+                 (jresp 500 {"code" "internal_error" "message" "boom"})])
+        c (c-for m)]
+    (is (= true (k/close! c {:session-id "s9"})))
+    (is (= ["DELETE"] (sent m)))
+    (is (= "https://kernel.test/browsers/s9" (first (urls m))))
+    (is (= true (k/close! c "s9")) "a bare id works, and a 404 means already gone")
+    (is (thrown? (k/close! c {:session-id "s9"})) "a 500 still refuses")
+    (is (thrown? (k/close! c {})) "a value naming no session is refused before the wire")))
+
+;; ── playwright ────────────────────────────────────────────────────────
+
+(deftest playwright-runs-code-and-returns-the-result
+  (let [m (mock [(jresp {"success" true "result" 42})])
+        v (k/playwright! (c-for m) {:session-id "s1"} "return 42;" {:timeout-sec 12})]
+    (is (= 42 v))
+    (let [req (first @(:calls m))
+          b (json-of req)]
+      (is (= "https://kernel.test/browsers/s1/playwright/execute" (:url req))
+          "the documented execute route")
+      (is (= "return 42;" (get b "code")))
+      (is (= 12 (get b "timeout_sec"))))))
+
+(deftest a-failed-playwright-execution-is-an-explicit-error
+  (let [m (mock [(jresp {"success" false
+                         "error" "locator.click: Timeout 30000ms exceeded"
+                         "stderr" "at foo"
+                         "stdout" "step 1"})
+                 (jresp {"success" false "error" "boom"})])
+        c (c-for m)]
+    (is (= :playwright (get-in (k/playwright c {:session-id "s1"} "boom") [:error :reason])))
+    (let [e (try (k/playwright! c {:session-id "s1"} "boom") (catch e e))]
+      (is (includes? (ex-message e) "Timeout 30000ms") "the browser's own message survives")
+      (is (= "locator.click: Timeout 30000ms exceeded" (get (ex-data e) :error)))
+      (is (= "at foo" (get (ex-data e) :stderr)) "stderr rides along"))))
+
+(deftest an-answer-without-a-success-flag-is-not-a-success
+  (let [m (mock [(jresp {"result" "looks fine"})])]
+    (is (= :malformed-response
+           (get-in (k/playwright (c-for m) {:session-id "s1"} "return 1;") [:error :reason]))
+        "guessing success here would report a failed run as a quiet nil")))
+
+(deftest a-playwright-timeout-outside-the-api-range-is-refused
+  (let [m (mock [])
+        c (c-for m)]
+    (doseq [t [0 301 "60"]]
+      (is (= :invalid-timeout
+             (get-in (k/playwright c {:session-id "s1"} "return 1;" {:timeout-sec t})
+                     [:error :reason]))
+          (str "timeout-sec " (pr-str t) " is out of range")))
+    (is (= :invalid-timeout
+           (get-in (k/playwright c {:session-id "s1"} "return 1;" {}) [:error :reason]))
+        "and the default is not silently substituted")
+    (is (empty? @(:calls m)))))
+
+(deftest playwright-needs-a-session
+  (let [m (mock [])]
+    (is (= :no-session (get-in (k/playwright (c-for m) {} "return 1;") [:error :reason])))
+    (is (empty? @(:calls m)))))
+
+;; ── replays ───────────────────────────────────────────────────────────
+
+(deftest the-replay-lifecycle-is-the-documented-routes
+  (let [m (mock [(jresp 201 {"replay_id" "r1" "started_at" "2026-01-01T00:00:00Z"})
+                 {:ok {:status 200 :headers {} :body ""}}
+                 (jresp 200 [{"replay_id" "r1"} {"replay_id" "r2"}])])
+        c (c-for m)
+        r (k/replay-start! c {:session-id "s1"} {:framerate 15 :max-duration-seconds 30})]
+    (is (= "r1" (:replay-id r)))
+    (is (= {"framerate" 15 "max_duration_in_seconds" 30} (json-of (first @(:calls m)))) "the start body")
+    (is (= true (k/replay-stop! c {:session-id "s1"} "r1")))
+    (is (= 2 (count (k/replays c {:session-id "s1"}))))
+    (is (= ["https://kernel.test/browsers/s1/replays"
+            "https://kernel.test/browsers/s1/replays/r1/stop"
+            "https://kernel.test/browsers/s1/replays"]
+           (urls m)))))
+
+(deftest a-replay-download-returns-bytes-and-202-is-pending
+  (let [m (mock [(raw-resp 200 "video/mp4" "<mp4 bytes>")
+                 (raw-resp 202 "application/json" "")])
+        c (c-for m)]
+    (is (= "<mp4 bytes>" (k/replay-download! c {:session-id "s1"} "r1"))
+        "an mp4 arrives as bytes, never as a mangled string")
+    (let [e (try (k/replay-download! c {:session-id "s1"} "r2") (catch e e))]
+      (is (= :replay-pending (get (ex-data e) :reason)))
+      (is (includes? (ex-message e) "still recording")))))
+
+(deftest a-replay-start-without-an-id-is-refused
+  (let [m (mock [(jresp 201 {"started_at" "now"})])
+        c (c-for m)]
+    (is (thrown? (k/replay-start! c {:session-id "s1"})))
+    (is (thrown? (k/replay-start! c {:session-id "s1"} {:framerate 0}))
+        "a framerate the API would clamp is refused here")
+    (is (thrown? (k/replay-stop! c {:session-id "s1"} nil)))))
+
+;; ── with-session: the owned lifecycle ─────────────────────────────────
+
+(deftest with-session-always-closes
+  (let [m (mock [(jresp {"session_id" "s1"}) {:ok {:status 204 :headers {} :body ""}}])
+        v (k/with-session (c-for m) {} (fn [s] (:session-id s)))]
+    (is (= "s1" v) "the body's value comes back")
+    (is (= ["POST" "DELETE"] (sent m)) "and the session was deleted")))
+
+(deftest with-session-closes-when-the-body-raises
+  (let [m (mock [(jresp {"session_id" "s1"}) {:ok {:status 204 :headers {} :body ""}}])
+        e (try (k/with-session (c-for m) {} (fn [_] (throw (ex-info "body exploded" {}))))
+               (catch e e))]
+    (is (= "body exploded" (ex-message e)))
+    (is (= ["POST" "DELETE"] (sent m)) "cleanup ran on the raising path too")))
+
+(deftest with-session-preserves-the-body-error-when-cleanup-also-fails
+  (let [m (mock [(jresp {"session_id" "s1"}) (jresp 500 {"code" "internal_error"})])
+        e (try (k/with-session (c-for m) {} (fn [_] (throw (ex-info "body exploded" {}))))
+               (catch e e))]
+    (is (= "body exploded" (ex-message e))
+        "a cleanup that replaces the failure it cleaned up after hides the bug")))
+
+(deftest with-session-surfaces-a-close-failure
+  (let [m (mock [(jresp {"session_id" "s1"}) (jresp 500 {"code" "internal_error"})])
+        e (try (k/with-session (c-for m) {} (fn [_] :ok)) (catch e e))]
+    (is (includes? (ex-message e) "500") "a failed cleanup on a good body is not swallowed")))
+
+(deftest with-session-uses-the-declared-options
+  (let [m (mock [(jresp {"session_id" "s1"}) {:ok {:status 204 :headers {} :body ""}}])
+        c (c-for m {:session {:viewport {:width 320 :height 240}}})]
+    (k/with-session c (fn [_] :ok))
+    (is (= {"width" 320 "height" 240} (get (json-of (first @(:calls m))) "viewport"))
+        "the 2-arity form takes the declared session options")))
+
+;; ── secrets ───────────────────────────────────────────────────────────
+
+(deftest the-key-never-reaches-a-diagnostic
+  (let [c (k/client {:api-key "sk-live-secret"
+                     :base-url "https://kernel.test"
+                     :transport (fn [_] {:error "boom sk-live-secret boom"})})
+        r (k/request c "GET" "/browsers" {})]
+    (is (not (includes? (get-in r [:error :message]) "sk-live-secret"))
+        "a transport that echoes its request cannot leak the key")
+    (is (includes? (get-in r [:error :message]) "[redacted]"))
+    (is (not (includes? (pr-str c) "sk-live-secret"))
+        "and the client VALUE is not where a key is stored for logging")))

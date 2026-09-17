@@ -37,7 +37,7 @@ This repository's own file, at the root:
                   :doc "the isolated test runner, running four adversarial files"}}}
 ```
 
-Six keys, and no others:
+The keys a project may declare:
 
 - `:name` — what the project is called.
 - `:instance` — which checkout of this project is running, when more than one
@@ -51,6 +51,15 @@ Six keys, and no others:
   `{:web {:port 0}}` to let the OS choose. A name is what the port answers to —
   `http://web.<project>.test` — so nobody has to read the number.
 - `:env` — environment variables the project expects.
+- `:app` — what the tree IS as an OTP application (`:name :vsn :applications
+  :mod`), so a build need not interrogate the running VM about itself.
+- `:build` — which roots hold build sources, where the output goes, which
+  crates are native, how wide to compile.
+- `:release` — what to assemble, and what must be permanent in it.
+- `:deps` — the libraries the tree requires. The digests a resolution produced
+  live in `bl.lock`, not here, so the declaration cannot disagree with itself.
+- `:browser` — how the tree reaches a browser provider. See
+  [Talking to a browser](#talking-to-a-browser).
 
 Anything else is reported as an unknown key. A typo that silently does nothing
 is the worst kind of configuration bug, so it is not allowed to be silent:
@@ -131,6 +140,67 @@ surviving tasks:
 (nil [] (":paths must be a list of strings" ":name must be a string" "unknown key wat"))
 ```
 
+
+## Talking to a browser
+
+Some trees drive a real browser: a provider hosts one on the far side of an
+HTTP API, and the project says which provider and how to reach it. That is
+`:browser`, and reading it is reading any other key:
+
+```beam-lisp id=browser
+(scratch
+  (fn [d]
+    (File/write! (str d "/env.bl")
+                 (str "{:name \"browsing\""
+                      " :browser {:provider :kernel"
+                      "           :api-key-env \"KERNEL_API_KEY\""
+                      "           :base-url \"https://api.onkernel.com\""
+                      "           :timeout-ms 30000"
+                      "           :session {:viewport {:width 1280 :height 800}"
+                      "                     :network {:private_hosts true}}}}"))
+    (:browser (env/project d))))
+```
+
+```bl-result browser
+{:session {:viewport {:width 1280, :height 800}, :network {:private_hosts true}}, :provider :kernel, :api-key-env "KERNEL_API_KEY", :base-url "https://api.onkernel.com", :timeout-ms 30000}
+```
+
+Five keys, and what each one is for:
+
+- `:provider` — which provider, a name: `:kernel`. It is what turns the rest of
+  the map into requests.
+- `:api-key-env` — the NAME of the environment variable that holds the key.
+  **The key itself never appears in the file.** It is resolved where the call is
+  made — the server reads `KERNEL_API_KEY` from its own environment — so the
+  file stays commit-safe, and rotating the key needs no edit here.
+- `:base-url` — where that provider's API lives.
+- `:timeout-ms` — how long a call may take, a positive number of milliseconds.
+- `:session` — the provider's OWN options, passed through untouched:
+  `viewport`, `timeout_seconds`, `network.private_hosts`, `profiles`, and
+  whatever else it accepts. Nothing in this map is interpreted here; only the
+  provider knows its own vocabulary.
+
+Two things `:browser` deliberately does not do.
+
+**It never holds the key.** There is no `:api-key`. A key typed into the file is
+an unknown key — an error, not a stored secret:
+
+```beam-lisp id=browser-secret
+(scratch
+  (fn [d]
+    (File/write! (str d "/env.bl") "{:browser {:api-key \"sk-live-oops\"}}")
+    (:errors (env/project d))))
+```
+
+```bl-result browser-secret
+(":browser has unknown key api-key")
+```
+
+**It provisions nothing.** Declaring `:browser` opens no browser and reserves no
+session: it says how to reach a provider, and a session is created by a call
+that asks for one. Reading the project stays free of side effects, like every
+other key. A tree that declares no `:browser` reads `nil` — not an empty map, and
+not a special case.
 
 That is the whole idea: a project file you can read in one screen, in two ways
 that cannot disagree, that a typo cannot silently corrupt, and that never stops

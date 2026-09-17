@@ -106,7 +106,7 @@ one.
 
 ## The shape
 
-A project map declares eleven keys. Anything else is reported as an unknown key
+A project map declares twelve keys. Anything else is reported as an unknown key
 rather than ignored, because a typo'd key that silently does nothing is the
 worst kind of configuration bug.
 
@@ -131,6 +131,11 @@ worst kind of configuration bug.
 - `:deps` — `[{:name :vsn} …]`: what this tree requires. The digests a
   resolution produced live in `bl.lock`, not here, so the declaration cannot
   disagree with itself.
+- `:browser` — `{:provider :api-key-env :base-url :timeout-ms :session}`: how
+  this tree reaches a browser provider. `:api-key-env` names the environment
+  variable that holds the key — the key itself never appears here — and
+  `:session` is handed to the provider verbatim, since only the provider knows
+  its own vocabulary.
 
 Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
@@ -138,7 +143,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :paths :tasks :ports :env :doc
-                 :app :build :release :deps])
+                 :app :build :release :deps :browser])
 
 (defn- unknown-keys
   "The keys of `m` that nothing declares."
@@ -390,6 +395,56 @@ problems reports all three in one pass.
               [(nth acc 0) (concat (nth acc 1) errs)])))
         [[] []]
         v)))
+
+(defn- norm-browser
+  "`:browser` — how this tree reaches a browser provider: which provider, the
+   NAME of the environment variable that holds its key, the provider's base
+   URL, a request timeout, and the provider's own session options.
+
+   The key itself is never here. `:api-key-env` names the variable that holds
+   it, so the file stays commit-safe and a rotated key needs no edit; whoever
+   calls the provider resolves it (server-side, from that variable) at call
+   time. `:session` is PASS-THROUGH — viewport, `timeout_seconds`,
+   `network.private_hosts`, `profiles` and whatever else a provider accepts go
+   to the client unread, because only the provider knows its own vocabulary.
+
+   Declaring this provisions nothing: no browser, no session is opened until
+   something asks for one."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":browser must be a map"]]
+    :else
+      (let [provider (:provider v)
+            perr (cond
+                   (nil? provider) []
+                   (keyword? provider) []
+                   (string? provider) []
+                   :else [":browser :provider must be a name"])
+            key-env (:api-key-env v)
+            kerr (if (or (nil? key-env) (string? key-env)) []
+                     [":browser :api-key-env must be a string"])
+            base (:base-url v)
+            berr (if (or (nil? base) (string? base)) []
+                     [":browser :base-url must be a string"])
+            timeout (:timeout-ms v)
+            terr (if (or (nil? timeout) (and (erlang/is_integer timeout)
+                                             (pos? timeout)))
+                   []
+                   [":browser :timeout-ms must be a positive number"])
+            session (:session v)
+            serr (if (or (nil? session) (map? session)) []
+                     [":browser :session must be a map"])
+            errs (concat perr kerr berr terr serr
+                         (unknown-errs v [:provider :api-key-env :base-url
+                                          :timeout-ms :session] ":browser"))]
+        [(when (empty? errs)
+           {:provider (if (string? provider) (keyword provider) provider)
+            :api-key-env key-env
+            :base-url base
+            :timeout-ms timeout
+            :session session})
+         errs])))
 ```
 
 `normalize` assembles the value the runtime holds. It is total too: `:errors` is
@@ -413,7 +468,8 @@ shape, whatever the file said.
         [app aerr]     (norm-app (:app m))
         [bld berr]     (norm-build (:build m) root)
         [rel rerr]     (norm-release (:release m) root)
-        [deps derr]    (norm-deps (:deps m))]
+        [deps derr]    (norm-deps (:deps m))
+        [brw brerr]    (norm-browser (:browser m))]
     {:path path
      :root root
      :name (if (string? nm) nm nil)
@@ -426,7 +482,8 @@ shape, whatever the file said.
      :build bld
      :release rel
      :deps deps
-     :errors (concat perr nerr ierr terr porerr eerr aerr berr rerr derr
+     :browser brw
+     :errors (concat perr nerr ierr terr porerr eerr aerr berr rerr derr brerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -434,7 +491,7 @@ shape, whatever the file said.
    case — every accessor reads it the same way it reads a declared one."
   [root]
   {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
-   :env {} :app nil :build nil :release nil :deps [] :errors []})
+   :env {} :app nil :build nil :release nil :deps [] :browser nil :errors []})
 ```
 
 ## The project value for a directory
