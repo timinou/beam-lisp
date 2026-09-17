@@ -1,0 +1,571 @@
+; vm/gateway.bl — the reverse proxy that answers names (ports Daemon.Gateway).
+;
+; ══ WHAT IT IS ══════════════════════════════════════════════════════════════
+;
+; One process per machine, holding the port a URL may omit (80, else 7777),
+; that reads a request's Host: and splices the connection to whichever live
+; port CLAIMED that name (vm.ports is the routing table — a claim carries the
+; hosts it answers to, so the gateway never reads an env.bl). https names are
+; served with a per-name leaf from vm.ca. No name resolves to a number a human
+; must remember: http://web.pulse.test/ just works.
+;
+; ══ WHY A SEPARATE OS PROCESS, NOT A DAEMON NAMESPACE ═══════════════════════
+;
+; The gateway holds a privileged-ish port and blocks; it is its own foreground
+; process (`bl gateway run`, or a systemd unit that execs it), discovered by an
+; endpoint FILE under the runtime dir. Its liveness is the endpoint owner's
+; liveness — a crashed gateway leaves a file that the next reader sweeps by pid,
+; never a false "already running". This is the K10 lesson made concrete: the
+; listener + route table live in the OS process and on disk, not in reloadable
+; namespace state.
+;
+; ══ THE API ═════════════════════════════════════════════════════════════════
+;
+;   (gateway/run opts)          → block, serving; {:error reason} on bind fail
+;   (gateway/port)              → the live gateway's port, or nil
+;   (gateway/endpoint)          → {:ok {:pid :port :started-at}} | :error
+;   (gateway/stop)              → kill the running gateway
+;   (gateway/routes)            → the live claims that carry hosts (the routes)
+;   (gateway/url host …)        → the address a human types (port only if needed)
+;   (gateway/fronted-on? p)     → does port 80 reach us?
+;   (gateway/answer-on? p)      → :ours | :other | :closed
+;   (gateway/command)           → which `bl` to exec (systemd/detached start)
+
+(ns vm.gateway
+  (:require [vm.paths :as paths] [vm.ports :as ports] [vm.ca :as ca]))
+
+;; string helpers — core provides these; alias so the proxy logic reads clean
+(defn- s-split [s sep] (split s sep))
+(defn- s-down [s] (String/downcase s))
+(defn- s-trim [s] (String/trim s))
+(defn- s-starts? [s p] (String/starts_with? s p))
+(defn- s-has? [s sub] (String/contains? s sub))
+(defn- s-join [sep xs] (join sep (to-list xs)))
+(defn- s-replace [s a b] (String/replace s a b))
+(defn- to-bin [s] (if (erlang/is_binary s) s (erlang/iolist_to_binary s)))
+
+(def PREFERRED 80)
+(def FALLBACK 7777)
+(def MARKER "x-bl-gateway")
+(def ENDPOINT-NAME "gateway")
+(def HEAD-LIMIT 32768)
+(def IDLE-MS 600000)
+(def CONNECT-TIMEOUT 2000)
+(def PROBE-TIMEOUT 1000)
+(def PT-PORT (tuple :vm-gateway :port))
+(def OWNER :vm-gateway)
+
+(def INDEX-HOSTS #{"localhost" "127.0.0.1" "[::1]" "::1" "0.0.0.0"})
+
+;; ── transport abstraction: one algorithm, plain gen_tcp or ssl ──────────────
+
+(defn- x-recv [tls s ms]
+  (if tls (erlang/apply :ssl :recv (list s 0 ms)) (erlang/apply :gen_tcp :recv (list s 0 ms))))
+(defn- x-send [tls s d]
+  (if tls (erlang/apply :ssl :send (list s d)) (erlang/apply :gen_tcp :send (list s d))))
+(defn- x-close [tls s]
+  (if tls (erlang/apply :ssl :close (list s)) (erlang/apply :gen_tcp :close (list s))))
+
+;; ── head reading (carry the body already in flight) ─────────────────────────
+
+(defn- read-head
+  "Read until the blank line ending the head. Returns {:ok head rest} — `rest`
+   is any body bytes already received, carried untouched so a POST in flight is
+   never lost between the read and the splice — or {:error reason}."
+  [tls s]
+  (loop [acc ""]
+    (cond
+      (> (erlang/byte_size acc) HEAD-LIMIT) {:error :head_too_large}
+      :else
+      (let [m (erlang/apply :binary :match (list acc "\r\n\r\n"))]
+        (if (and (erlang/is_tuple m) (= 2 (erlang/tuple_size m)))
+          (let [pos (elem m 0) len (+ pos 4)]
+            {:ok (erlang/apply :binary :part (list acc 0 len))
+             :rest (erlang/apply :binary :part (list acc len (- (erlang/byte_size acc) len)))})
+          (let [r (x-recv tls s 10000)]
+            (if (and (erlang/is_tuple r) (= :ok (elem r 0)))
+              (recur (str acc (elem r 1)))
+              {:error (if (erlang/is_tuple r) (elem r 1) r)})))))))
+
+;; ── head parsing ────────────────────────────────────────────────────────────
+
+(defn- head-lines [head]
+  (filter (fn [l] (not= l "")) (s-split head "\r\n")))
+
+(defn- request-line [head] (first (s-split head "\r\n")))
+
+(defn- req-parts [head] (s-split (request-line head) " "))
+
+(defn- header-val
+  "The value of header `key` (case-insensitive), or nil."
+  [head key]
+  (let [k (str (s-down key) ":")]
+    (some (fn [l]
+            (if (s-starts? (s-down l) k)
+              (s-trim (subs l (count k)))
+              nil))
+          (rest (head-lines head)))))
+
+(defn- normalize-host
+  "A Host: value or authority reduced to the bare hostname, lowercased. An IPv6
+   literal keeps its brackets; anything else drops the :port."
+  [host]
+  (if (or (nil? host) (= host ""))
+    nil
+    (let [h (s-down (s-trim host))]
+      (if (s-starts? h "[")
+        (let [parts (s-split h "]")] (str (first parts) "]"))
+        (s-trim (first (s-split h ":")))))))
+
+(defn- strip-scheme [url]
+  (cond
+    (s-starts? url "http://") (subs url 7)
+    (s-starts? url "https://") (subs url 8)
+    :else url))
+
+(defn- request-line-host
+  "An absolute-form request line (GET http://name/x HTTP/1.1) names the host
+   with no header. Rare, legal, one line to honour."
+  [line]
+  (let [parts (s-split line " ")
+        target (second parts)]
+    (if (and target (or (s-starts? target "http://") (s-starts? target "https://")))
+      (normalize-host (first (s-split (strip-scheme target) "/")))
+      nil)))
+
+(defn- host-of [head]
+  (or (normalize-host (header-val head "host"))
+      (request-line-host (request-line head))))
+
+(defn- index-host? [host]
+  (or (contains? INDEX-HOSTS host) (s-starts? host "127.")))
+
+;; ── absolute-form → origin-form (a proxy request) ───────────────────────────
+
+(defn- drop-header [lines name]
+  (let [needle (str (s-down name) ":")]
+    (filter (fn [l] (not (s-starts? (s-down l) needle))) lines)))
+
+(defn- proxy-head
+  "A request in absolute-form (GET http://name/path HTTP/1.1) is a PROXY request
+   — the client pointed its proxy at us and left the URL alone. Rewrite to
+   origin-form (the app is not a proxy), let the authority replace any Host, and
+   force connection:close so this connection routes exactly ONE request: a
+   splice is opaque from the first byte, so a reused proxy connection for a
+   second name would otherwise be answered by the FIRST name's app."
+  [head]
+  (let [line (request-line head)
+        parts (s-split line " ")
+        method (first parts)
+        target (second parts)]
+    (if (and target (s-starts? target "http://"))
+      (let [auth-path (s-split (subs target 7) "/")
+            authority (first auth-path)
+            path (str "/" (s-join (rest auth-path) "/"))
+            body-lines (drop-header (drop-header (rest (head-lines head)) "host") "connection")]
+        (str method " " path " HTTP/1.1\r\nhost: " authority
+             "\r\nconnection: close\r\n" (s-join body-lines "\r\n") "\r\n\r\n"))
+      head)))
+
+;; ── the backend splice ──────────────────────────────────────────────────────
+
+(defn- connect-backend
+  "Connect to a claimed backend port. Loopback v4 first (bandit's default takes
+   every interface), then v6-only. {:ok sock} | {:error reason}."
+  [port]
+  (let [opts (to-list [:binary (tuple :packet :raw) (tuple :active false) (tuple :nodelay true)])
+        r (erlang/apply :gen_tcp :connect (list (tuple 127 0 0 1) port opts CONNECT-TIMEOUT))]
+    (if (= :ok (elem r 0))
+      {:ok (elem r 1)}
+      (let [r6 (erlang/apply :gen_tcp :connect
+                 (list (tuple 0 0 0 0 0 0 0 1) port (to-list (cons :inet6 opts)) CONNECT-TIMEOUT))]
+        (if (= :ok (elem r6 0)) {:ok (elem r6 1)} {:error (elem r6 1)})))))
+
+(defn- arm [tls s]
+  (if tls
+    (erlang/apply :ssl :setopts (list s (to-list [(tuple :active :once)])))
+    (erlang/apply :inet :setopts (list s (to-list [(tuple :active :once)])))))
+
+(defn- pump
+  "One process, both directions, active:once on each socket so a close on EITHER
+   side is seen while the other is quiet. Handles both plain (:tcp) and TLS
+   (:ssl) active messages, so a CONNECT-tunnelled client (ssl) spliced to a
+   plain backend works in one loop. A half-close is a write-shutdown, not a
+   hang — an HTTP client that finished sending still reads the whole response."
+  [ctls client btls backend]
+  (arm ctls client)
+  (arm btls backend)
+  (loop []
+    (receive
+      [:tcp sock data]
+      (do (if (= sock client) (do (x-send btls backend data) (arm ctls client))
+                              (do (x-send ctls client data) (arm btls backend)))
+          (recur))
+      [:ssl sock data]
+      (do (if (= sock client) (do (x-send btls backend data) (arm ctls client))
+                              (do (x-send ctls client data) (arm btls backend)))
+          (recur))
+      [:tcp_closed _sock] (do (x-close ctls client) (x-close btls backend))
+      [:ssl_closed _sock] (do (x-close ctls client) (x-close btls backend))
+      [:tcp_error _sock _r] (do (x-close ctls client) (x-close btls backend))
+      [:ssl_error _sock _r] (do (x-close ctls client) (x-close btls backend))
+      (after IDLE-MS (do (x-close ctls client) (x-close btls backend))))))
+
+(defn- splice [ctls client claim head rest]
+  (let [b (connect-backend (get claim :port))]
+    (if (contains? b :ok)
+      (let [backend (:ok b)]
+        (x-send false backend (str head rest))
+        (pump ctls client false backend))
+      (reply ctls client 502
+        (page (str (esc (get claim :name)) " is claimed but not answering")
+              (str "<p><code>" (esc (get claim :name)) "</code> is the name of port "
+                   (get claim :port) " (pid " (get claim :pid) ") and nothing accepted "
+                   "the connection there. The process may be on its way down; a claim is "
+                   "swept as soon as its owner is gone.</p>"))))))
+
+;; ── answering (pages + refusal) ─────────────────────────────────────────────
+
+(defn- esc [s]
+  (-> (str s)
+      (s-replace "&" "&amp;") (s-replace "<" "&lt;")
+      (s-replace ">" "&gt;") (s-replace "\"" "&quot;")))
+
+(defn- reason-phrase [status]
+  (cond (= status 200) "OK" (= status 400) "Bad Request"
+        (= status 404) "Not Found" (= status 502) "Bad Gateway" :else "OK"))
+
+(defn- reply [tls s status body]
+  (let [resp (str "HTTP/1.1 " status " " (reason-phrase status) "\r\n"
+                  "content-type: text/html; charset=utf-8\r\n"
+                  MARKER ": beam-lisp\r\n"
+                  "content-length: " (erlang/byte_size (to-bin body)) "\r\n"
+                  "connection: close\r\n\r\n" body)]
+    (x-send tls s resp)
+    (x-close tls s)))
+
+(defn- send-body [tls s status ct body]
+  (x-send tls s (str "HTTP/1.1 " status "\r\ncontent-type: " ct
+                     "\r\ncontent-length: " (erlang/byte_size (to-bin body))
+                     "\r\nconnection: close\r\n\r\n" body))
+  (x-close tls s))
+
+(defn- page [title body]
+  (str "<!doctype html><html><head><meta charset=\"utf-8\"><title>" (esc title) "</title>"
+       "<style>body{font:14px ui-monospace,monospace;margin:3rem auto;max-width:46rem;color:#ddd;background:#111}"
+       "h1{font-size:1.1rem;font-weight:600}a{color:#7bd}table{border-collapse:collapse;width:100%}"
+       "td,th{text-align:left;padding:.3rem .6rem;border-bottom:1px solid #333}code{color:#9e9}</style>"
+       "</head><body><h1>" (esc title) "</h1>" body "</body></html>"))
+
+(defn routes
+  "The live claims that answer to a name — the routes the gateway serves. A claim
+   without hosts is a port nobody named, and is not routable."
+  []
+  (filter (fn [c] (not (empty? (get c :hosts (to-list []))))) (ports/list-claims)))
+
+(defn- index-body []
+  (let [rs (routes)]
+    (if (empty? rs)
+      "<p>No port has a name yet. A project registers one by declaring <code>:ports</code> in its <code>env.bl</code> and serving through <code>bl serve</code>.</p>"
+      (str "<table><thead><tr><th>name</th><th>address</th><th>port</th><th>tree</th></tr></thead><tbody>"
+           (s-join "\n"
+             (map (fn [c]
+                    (let [host (first (get c :hosts))]
+                      (str "<tr><td><code>" (esc (get c :name)) "</code></td>"
+                           "<td><a href=\"http://" (esc host) "/\">" (esc host) "</a></td>"
+                           "<td><code>" (get c :port) "</code></td>"
+                           "<td>" (esc (erlang/apply :filename :basename (list (get c :root)))) "</td></tr>")))
+                  rs))
+           "</tbody></table>"))))
+
+;; ── /bl.pac and /bl-ca.crt ──────────────────────────────────────────────────
+
+(defn- pac [gw-port]
+  (str "function FindProxyForURL(url, host) {\n"
+       "  if (shExpMatch(host, \"*.test\") || shExpMatch(host, \"*.localhost\")) {\n"
+       "    return \"PROXY 127.0.0.1:" gw-port "\";\n  }\n  return \"DIRECT\";\n}\n"))
+
+;; ── the CONNECT tunnel (https names) ────────────────────────────────────────
+
+(defn- refusal [host]
+  (str "no claim holds \"" host "\" — nothing on this machine answers to that name.\n"
+       "run `bl ports` to see the names that are live.\n"))
+
+(defn- ca-opts [host]
+  (to-list (concat (to-list (:ok (ca/ssl-opts host))) (list (tuple :active false)))))
+
+(defn- handle-connect [client authority]
+  (let [host (first (s-split authority ":"))
+        claim (ports/holder-of-host host)]
+    (if (nil? claim)
+      (send-body false client "404 Not Found" "text/plain" (refusal host))
+      (do
+        (x-send false client "HTTP/1.1 200 Connection Established\r\n\r\n")
+        (let [hr (erlang/apply :ssl :handshake (list client (ca-opts host) 15000))]
+          (if (and (erlang/is_tuple hr) (= :ok (elem hr 0)))
+            (let [h (elem hr 1) hd (read-head true h)]
+              (if (contains? hd :ok)
+                (splice true h claim (proxy-head (:ok hd)) (:rest hd))
+                (x-close true h)))
+            (x-close false client)))))))
+
+;; ── one request ─────────────────────────────────────────────────────────────
+
+(defn- route [client head rest gw-port]
+  (let [head (proxy-head head)
+        host (host-of head)
+        target (second (req-parts head))]
+    (cond
+      (= target "/bl.pac") (send-body false client "200 OK" "application/x-ns-proxy-autoconfig" (pac gw-port))
+      (= target "/bl-ca.crt") (send-body false client "200 OK" "application/x-x509-ca-cert" (ca/root-pem))
+      (nil? host) (reply false client 400 (page "no Host header" "<p>An HTTP/1.1 request must name the host it wants.</p>"))
+      (index-host? host) (reply false client 200 (page "beam-lisp gateway" (index-body)))
+      :else
+      (let [claim (ports/holder-of-host host)]
+        (if (nil? claim)
+          (reply false client 404 (page (str "nothing answers to " (esc host))
+                                        (str "<p>No live port claims that name.</p>" (index-body))))
+          (splice false client claim head rest))))))
+
+(defn- handle [client gw-port]
+  (let [hd (read-head false client)]
+    (if (contains? hd :ok)
+      (let [head (:ok hd)
+            parts (req-parts head)
+            method (first parts)
+            target (second parts)]
+        (if (= method "CONNECT")
+          (handle-connect client target)
+          (route client head (:rest hd) gw-port)))
+      (erlang/apply :gen_tcp :close (list client)))))
+
+;; ── accepting ───────────────────────────────────────────────────────────────
+
+(defn- accept-loop [lsock gw-port]
+  (let [ar (erlang/apply :gen_tcp :accept (list lsock :infinity))]
+    (cond
+      (and (erlang/is_tuple ar) (= :ok (elem ar 0)))
+      (let [client (elem ar 1)
+            ;; hand the socket to the handler BEFORE it reads: active messages go
+            ;; to the controlling process, which accept leaves as this acceptor.
+            handler (spawn (fn [] (receive [:go s] (handle s gw-port) (after 5000 (erlang/apply :gen_tcp :close (list client))))))]
+        (erlang/apply :gen_tcp :controlling_process (list client handler))
+        (erlang/send handler [:go client])
+        (accept-loop lsock gw-port))
+      (and (erlang/is_tuple ar) (= :closed (elem ar 1))) :ok
+      :else (accept-loop lsock gw-port))))
+
+;; ── binding ─────────────────────────────────────────────────────────────────
+
+(defn- sock-opts []
+  (to-list [:binary (tuple :packet :raw) (tuple :active false)
+            (tuple :nodelay true) (tuple :reuseaddr true)]))
+
+(defn- bind-one [port]
+  (erlang/apply :gen_tcp :listen
+    (list port (to-list (cons (tuple :ip (tuple 127 0 0 1)) (sock-opts))))))
+
+(defn- bind-v6 [port]
+  (erlang/apply :gen_tcp :listen
+    (list port (to-list (cons (tuple :ip (tuple 0 0 0 0 0 0 0 1)) (cons :inet6 (sock-opts)))))))
+
+(defn- bind-all
+  "Loopback v4, plus v6 (::1) when the host has it — a browser that resolves
+   localhost to ::1 still reaches the gateway. {:ok [lsock…] port} | {:error r}."
+  [port]
+  (let [r (bind-one port)]
+    (if (= :ok (elem r 0))
+      (let [v4 (elem r 1)
+            sn (erlang/apply :inet :sockname (list v4))
+            actual (if (= :ok (elem sn 0)) (elem (elem sn 1) 1) port)
+            r6 (bind-v6 actual)
+            socks (if (= :ok (elem r6 0)) (list v4 (elem r6 1)) (list v4))]
+        {:ok socks :port actual})
+      {:error (elem r 1)})))
+
+(defn- listen-pinned [want]
+  (let [r (bind-all want)]
+    (if (contains? r :ok) r {:error (pinned-refusal want (:error r))})))
+
+(defn- listen-unpinned []
+  (loop [cands (list PREFERRED FALLBACK 0)]
+    (if (empty? cands)
+      {:error :no_port}
+      (let [r (bind-all (first cands))]
+        (if (contains? r :ok) r
+          (if (= 0 (first cands)) {:error (:error r)} (recur (rest cands))))))))
+
+(defn- pinned-refusal [port reason]
+  (cond
+    (= reason :eacces) (str "port " port " is privileged here — " (sysctl-command)
+                            " (or run it unpinned: it prefers " PREFERRED " and falls back to " FALLBACK ")")
+    (= reason :eaddrinuse) (str "port " port " is already held by something else — pick another, "
+                                "or run unpinned (prefers " PREFERRED ", falls back to " FALLBACK ")")
+    :else (str "port " port " cannot be bound (" (pr-str reason) ")")))
+
+;; ── the endpoint file (discovery) ───────────────────────────────────────────
+
+(defn- endpoint-path []
+  (let [rd (paths/runtime-dir)]
+    (if (contains? rd :ok) (str (:ok rd) "/" ENDPOINT-NAME) nil)))
+
+(defn- write-endpoint [port]
+  (let [path (endpoint-path)]
+    (when path
+      (let [tmp (str path ".tmp")
+            ep {:pid (erlang/list_to_integer (erlang/apply :os :getpid (list)))
+                :port port
+                :started-at (erlang/system_time :second)}]
+        (File/write! tmp (erlang/term_to_binary ep))
+        (File/chmod tmp 384)
+        (erlang/apply :file :rename (list (erlang/binary_to_list tmp) (erlang/binary_to_list path)))))))
+
+(defn endpoint
+  "The endpoint of a LIVE gateway: {:ok {:pid :port :started-at}} or :error.
+   The file's existence is discovery; its owner's liveness makes it true, so a
+   crashed gateway leaves nothing behind to trip over."
+  []
+  (let [path (endpoint-path)]
+    (if (nil? path)
+      :error
+      (let [r (try (File/read! path) (catch e nil))]
+        (if (or (nil? r) (not (erlang/is_binary r)))
+          :error
+          (let [ep (try (erlang/binary_to_term r) (catch e nil))]
+            (if (and (map? ep) (contains? ep :pid))
+              (if (ports/alive-pid? (get ep :pid))
+                {:ok ep}
+                (do (File/rm path) :error))
+              :error)))))))
+
+;; ── port / stop (clients that read the endpoint) ────────────────────────────
+
+(defn port
+  "The port the live gateway answers on, or nil. A gateway in THIS process
+   answers for itself (persistent_term); otherwise the endpoint file does."
+  []
+  (if (not (nil? (Process/whereis OWNER)))
+    (erlang/apply :persistent_term :get (list PT-PORT nil))
+    (let [e (endpoint)] (if (contains? e :ok) (get (:ok e) :port) nil))))
+
+(defn stop
+  "Stop the running gateway. A signal, not a protocol: the gateway is one OS
+   process and kill is what Unix has for this. :ok when gone."
+  []
+  (let [e (endpoint)]
+    (if (contains? e :ok)
+      (let [pid (get (:ok e) :pid)]
+        (erlang/apply :os :cmd (list (erlang/binary_to_list (str "kill -TERM " pid))))
+        (loop [t 5000]
+          (cond (<= t 0) {:error :still_running}
+                (ports/alive-pid? pid) (do (erlang/apply :timer :sleep (list 50)) (recur (- t 50)))
+                :else :ok)))
+      :ok)))
+
+;; ── port-80 probe (does a URL need its port shown?) ─────────────────────────
+
+(defn- gateway-answer? [head]
+  (and (erlang/is_binary head)
+       (s-has? (s-down head) (str MARKER ":"))))
+
+(defn answer-on?
+  "What is on `port`: :ours (a beam-lisp gateway), :other (some server), or
+   :closed. One loopback connect, one head read for the marker header."
+  [port]
+  (let [opts (to-list [:binary (tuple :packet :raw) (tuple :active false)])
+        r (erlang/apply :gen_tcp :connect (list (tuple 127 0 0 1) port opts PROBE-TIMEOUT))]
+    (if (= :ok (elem r 0))
+      (let [sock (elem r 1)]
+        (erlang/apply :gen_tcp :send (list sock "GET / HTTP/1.1\r\nhost: gateway-probe\r\nconnection: close\r\n\r\n"))
+        (let [rr (erlang/apply :gen_tcp :recv (list sock 0 PROBE-TIMEOUT))
+              ans (if (and (erlang/is_tuple rr) (= :ok (elem rr 0)))
+                    (if (gateway-answer? (elem rr 1)) :ours :other)
+                    :other)]
+          (erlang/apply :gen_tcp :close (list sock))
+          ans))
+      :closed)))
+
+(defn ours-on? [port] (= :ours (answer-on? port)))
+
+(defn fronted-on?
+  "Does port 80 reach this gateway? Either it holds 80, or a loopback redirect
+   forwards :80 to it (bl install redirect) — a redirect rewrites packets, not
+   sockets, so the only honest way to know is to ASK."
+  [p]
+  (cond (= p PREFERRED) true (nil? p) false :else (ours-on? PREFERRED)))
+
+(defn live
+  "The facts an address depends on, resolved ONCE per render: the gateway port
+   and whether 80 fronts it. A caller printing N addresses must not ask N times."
+  []
+  (let [p (port)] {:port p :fronted (fronted-on? p)}))
+
+(defn url
+  "The address `host` answers at. The port appears ONLY when it must: on 80 (the
+   port a URL may omit) the name stands alone; on the fallback it does not."
+  ([host] (url host (port)))
+  ([host p] (url host p (fronted-on? p)))
+  ([host p fronted]
+   (cond
+     (nil? p) (str "http://" host "/")
+     (= p PREFERRED) (str "http://" host "/")
+     fronted (str "http://" host "/")
+     :else (str "http://" host ":" p "/"))))
+
+;; ── advice ──────────────────────────────────────────────────────────────────
+
+(defn sysctl-command []
+  (str "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=" PREFERRED))
+
+(defn command
+  "The command that starts THIS beam-lisp: $BL_BIN, else `bl` on PATH, else nil."
+  []
+  (let [bin (System/get_env "BL_BIN")]
+    (if (and (string? bin) (not= bin ""))
+      bin
+      (let [f (erlang/apply :os :find_executable (list (erlang/binary_to_list "bl")))]
+        (if (erlang/is_list f) (erlang/list_to_binary f) nil)))))
+
+;; ── run (the foreground gateway process) ────────────────────────────────────
+
+(defn run
+  "Bind, publish the endpoint, serve until stopped. Blocks. `opts` = {:port N}
+   — a pinned port is a promise (fail loudly if not ours); unpinned prefers 80,
+   falls back to 7777, then the OS. Returns {:error reason} on bind failure
+   (a value, not a crash, so the CLI can print a sentence)."
+  ([] (run {}))
+  ([opts]
+   (let [want (get opts :port)]
+     ;; ONE gateway per user: a second start (with a pinned/default port) names
+     ;; the running one rather than overwriting its endpoint. Port 0 is exempt
+     ;; (a test, or one deliberately moved aside).
+     (if (and (not= want 0) (contains? (endpoint) :ok))
+       (let [ep (:ok (endpoint))]
+         {:error (str "a gateway is already up on port " (get ep :port) " (pid " (get ep :pid)
+                      ") — `bl gateway stop` first, or run one on an ephemeral port with --port 0")})
+       (let [r (if (and (erlang/is_integer want) (> want 0)) (listen-pinned want)
+                 (if (= want 0) (bind-all 0) (listen-unpinned)))]
+         (if (contains? r :error)
+           r
+           (let [lsocks (:ok r) gw-port (:port r)]
+             (erlang/apply :ssl :start (list))
+             (ca/ensure-started)
+             ;; register as THE gateway of this node; a prior ephemeral one (a
+             ;; test) may still hold the name, so replace it.
+             (when (not (nil? (Process/whereis OWNER)))
+               (erlang/apply :erlang :unregister (list OWNER)))
+             (erlang/register OWNER (erlang/self))
+             (erlang/apply :persistent_term :put (list PT-PORT gw-port))
+             (when (not= want 0) (write-endpoint gw-port))
+             (println (str "bl gateway on 127.0.0.1:" gw-port))
+             (println (str "  names answer here: " (route-summary)))
+             (println (str "  pac  http://127.0.0.1:" gw-port "/bl.pac"
+                           "   root http://127.0.0.1:" gw-port "/bl-ca.crt"))
+             (doseq [ls lsocks] (spawn (fn [] (accept-loop ls gw-port))))
+             (erlang/apply :timer :sleep (list :infinity)))))))))
+
+(defn- route-summary []
+  (let [rs (routes)]
+    (if (empty? rs)
+      "none yet (a claim that carries hosts registers one)"
+      (s-join ", " (map (fn [c] (str (first (get c :hosts)) " → " (get c :port))) rs)))))

@@ -21,7 +21,7 @@ to drift.
 
 ```beam-lisp
 (ns bl.install
-  (:require [bl.util :as u] [datom] [clojure.string :as str]))
+  (:require [bl.util :as u] [datom] [clojure.string :as str] [vm.gateway]))
 ```
 
 ## Where things live
@@ -677,7 +677,7 @@ the corpus assembles.
    the verbs a developer types."
   []
   (str "run: bl install redirect (loopback only, removable), or: "
-       (BeamLisp.Daemon.Gateway/sysctl_command)))
+       (vm.gateway/sysctl-command)))
 
 (defn- answer-on-80
   "What is on port 80 right now: :ours, :other or :closed.
@@ -688,7 +688,7 @@ the corpus assembles.
    open a free port, it takes loopback 80 away from that server, so the report
    has to say that before handing over the paste."
   []
-  (BeamLisp.Daemon.Gateway/answer_on? 80))
+  (vm.gateway/answer-on? 80))
 
 (defn- port-80-step
   "The report line about port 80, from what the probe found. `mine` is what to
@@ -708,7 +708,7 @@ the corpus assembles.
     {:name "port 80" :ok false :detail (str "not answered — " (port-80-pointer))}))
 
 (defn- run-gateway [_arg]
-  (let [bin (BeamLisp.Daemon.Gateway/command)
+  (let [bin (vm.gateway/command)
         unit (unit-file)]
     (if (nil? bin)
       {:error "no `bl` on PATH — set BL_BIN to this build, then re-run"}
@@ -737,8 +737,8 @@ the corpus assembles.
 (defn- check-gateway [_arg]
   (let [unit (unit-file)
         verdict (port-80-verdict)
-        answered (BeamLisp.Daemon.Gateway/ours_on? 80)
-        up (BeamLisp.Daemon.Gateway/port)]
+        answered (vm.gateway/ours-on? 80)
+        up (vm.gateway/port)]
     [{:name "unit" :ok (File/regular? unit)
       :detail (if (File/regular? unit) unit "absent — run: bl install gateway")}
      {:name "gateway" :ok (not (nil? up))
@@ -763,7 +763,7 @@ the corpus assembles.
 ;; OUTPUT chain and matches loopback destinations), no policy is loosened (a
 ;; local process still cannot bind 1023), and the gateway's printed addresses
 ;; lose their port by themselves — they are derived from a probe of port 80
-;; (BeamLisp.Daemon.Gateway/fronted_on?).
+;; (vm.gateway/fronted-on?).
 ;;
 ;; Root is still needed for the rule. So the install is a SCRIPT: printed for
 ;; the user when this process has no password, run with `sudo -n` when it does.
@@ -875,7 +875,7 @@ the corpus assembles.
 
 
 (defn- run-redirect [_arg]
-  (let [port (BeamLisp.Daemon.Gateway/port)]
+  (let [port (vm.gateway/port)]
     (cond
       (= :ours (answer-on-80))
       [(port-80-step :ours "already answered — nothing to install")]

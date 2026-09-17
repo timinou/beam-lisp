@@ -22,7 +22,7 @@ stream and a chunked upload work without this code knowing what any of them are.
 
 ```beam-lisp
 (ns bl.gateway
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [vm.gateway]))
 ```
 
 ## Reading it
@@ -45,14 +45,14 @@ It is read, never trusted — a file whose process is gone is swept on sight, so
   "The live gateway's pid and port as a map, or nil. {:ok %{…}} | :error from
    the Elixir side, unwrapped here so a verb reads one shape."
   []
-  (let [r (BeamLisp.Daemon.Gateway/endpoint)]
-    (if (tuple? r) (erlang/element 2 r) nil)))
+  (let [r (vm.gateway/endpoint)]
+    (if (contains? r :ok) (:ok r) nil)))
 
-(defn running? [] (not (nil? (BeamLisp.Daemon.Gateway/port))))
+(defn running? [] (not (nil? (vm.gateway/port))))
 
-(defn- port-of [] (BeamLisp.Daemon.Gateway/port))
+(defn- port-of [] (vm.gateway/port))
 
-(defn- routes [] (to-list (BeamLisp.Daemon.Gateway/routes)))
+(defn- routes [] (to-list (vm.gateway/routes)))
 
 (defn- installed? [] (File/regular? (unit-path)))
 
@@ -88,7 +88,7 @@ registry `bl ports` prints, seen from the other end.
       ;; port out? Answered by PROBING port 80 — a redirect rewrites the packet
       ;; and not our sockets, so only a probe can tell — and paired with the
       ;; verb that changes it.
-      (println (str "  port 80: " (if (BeamLisp.Daemon.Gateway/fronted_on? p)
+      (println (str "  port 80: " (if (vm.gateway/fronted-on? p)
                                      "answered — names need no port in the URL"
                                      "not answered — bl install redirect")))
       (if (empty? rs)
@@ -137,7 +137,7 @@ command the unit would run, so both paths start the same process.
    its output goes to a log file rather than nowhere. The gateway's own endpoint
    file is still how it is found again — it needs no parent watching it."
   []
-  (let [bin (BeamLisp.Daemon.Gateway/command)]
+  (let [bin (vm.gateway/command)]
     (if (nil? bin)
       (do (u/io-err "bl gateway: no `bl` on PATH — run `bl gateway run` from a checkout, or set BL_BIN")
           nil)
@@ -183,7 +183,7 @@ with reality immediately after.
     (do
       (if (and (installed?) (systemctl?))
         (System/cmd "systemctl" (u/to-list ["--user" "stop" unit-name]))
-        (BeamLisp.Daemon.Gateway/stop))
+        (vm.gateway/stop))
       (println "bl gateway: stopped")
       0)))
 ```
@@ -193,23 +193,20 @@ what a systemd `Type=simple` service wants.
 
 ```beam-lisp
 (defn- refusal
-  "The sentence the gateway refused with: `{:error, {:gateway_failed, msg}}`,
-   `{:error, msg}`, or anything else rendered as itself. A caller reads it."
+  "The sentence the gateway refused with. vm.gateway/run returns {:error msg}
+   (a value, not a crash) so the CLI can print a sentence; anything else renders
+   as itself."
   [r]
-  (if (string? r)
-    r
-    (let [inner (try (erlang/element 2 r) (catch _ nil))]
-      (cond
-        (string? inner) inner
-        (tuple? inner) (let [m (try (erlang/element 2 inner) (catch _ nil))]
-                         (if (string? m) m (pr-str r)))
-        :else (pr-str r)))))
+  (cond
+    (string? r) r
+    (and (map? r) (string? (:error r))) (:error r)
+    :else (pr-str r)))
 
 (defn run-run
   "`bl gateway run [--port N]` — the gateway in the foreground. A pinned port
    that cannot be bound is an error, never a silent move."
   [_args st]
-  (let [r (BeamLisp.Daemon.Gateway/run (u/kw [:port (:port st)]))]
+  (let [r (vm.gateway/run {:port (:port st)})]
     (u/io-err (str "bl gateway: " (refusal r)))
     1))
 ```

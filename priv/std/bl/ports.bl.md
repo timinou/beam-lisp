@@ -28,7 +28,7 @@ these verbs print the name.
 
 ```beam-lisp silent
 (ns bl.ports
-  (:require [bl.util :as u] [vm.ports] [vm.index]))
+  (:require [bl.util :as u] [vm.ports] [vm.index] [vm.gateway]))
 ```
 
 ## Reading
@@ -73,8 +73,8 @@ next one.
    them, so printing a table of N addresses costs one lookup and one probe
    instead of N of each."
   []
-  (let [p (BeamLisp.Daemon.Gateway/port)]
-    {:port p :fronted (BeamLisp.Daemon.Gateway/fronted_on? p)}))
+  (let [p (vm.gateway/port)]
+    {:port p :fronted (vm.gateway/fronted-on? p)}))
 
 (defn url-for*
   "`url-for` with the live facts already in hand — the same rule, for a caller
@@ -86,7 +86,7 @@ next one.
       (let [hs (:hosts c)]
         (if (empty? hs)
           nil
-          (BeamLisp.Daemon.Gateway/url (first hs) (:port facts) (:fronted facts)))))))
+          (vm.gateway/url (first hs) (:port facts) (:fronted facts)))))))
 
 (defn url-for
   "The address `name` answers at — its first host, through the gateway, so a
@@ -132,7 +132,7 @@ address a human keeps; the number is the implementation detail beside it.
           (sort-by (fn [p] (:name p)) ps))
         (let [named (filter (fn [p] (not (empty? (:hosts p)))) ps)]
           (when (and (not (empty? named))
-                     (nil? (BeamLisp.Daemon.Gateway/port)))
+                     (nil? (vm.gateway/port)))
             (println "")
             (println (str "  " (count named) " name(s) registered, but no gateway answers them:"))
             (println "      bl gateway start    (one per user; `bl install gateway` keeps it running)")))))
