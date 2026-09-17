@@ -129,6 +129,110 @@ defmodule BeamLisp.TestVerbTest do
     assert code == 0, "a run in this state must still work; it said:\n#{out}"
   end
 
+  # ── how a test file is READ ──
+  #
+  # A `.bl.md` / `.bl.org` test file is a DOCUMENT whose program is its code
+  # cells, and a `.bl` script may open with a `#!/usr/bin/env bl` shebang. Both
+  # are the loader's business: the runner reads through `Loader.read_source/1` —
+  # the loader's own read, the one `bl run`, `bl build` and `require` use — so
+  # the prose between the cells never reaches the reader and the shebang line is
+  # stripped. A raw read reached the reader with both: every literate file
+  # answered `INCOHERENT — test file declares no (ns …) form` however clean its
+  # cells were, `--shared`/`--async` died on the document's first `#` heading,
+  # and a shebanged script died on `unresolved qualified name #!/usr/bin/env`.
+
+  @literate_md """
+  # A literate test
+
+  This prose is not code. `(ns prose-decoy)` is a sentence here, and so is
+  `(deftest prose-decoy (is false))`.
+
+  ```beam-lisp
+  (ns doc-test)
+  ```
+
+  A cell that passes:
+
+  ```beam-lisp
+  (deftest lit-passes (is (= 2 (+ 1 1))))
+  ```
+
+  A fence in another language is not this file's program:
+
+  ```clojure
+  (deftest wrong-language (is false))
+  ```
+  """
+
+  test "a literate .bl.md test runs its code cells, not its prose", %{dir: dir} do
+    rel = "test/doc_test.bl.md"
+    write(dir, rel, @literate_md)
+
+    # The read the runner uses, asserted at the seam: the cells are the program,
+    # the prose (and a fence in another language) is not.
+    src = BeamLisp.Loader.read_source(Path.join(dir, rel))
+    assert src =~ "(ns doc-test)"
+    refute src =~ "prose-decoy"
+    refute src =~ "wrong-language"
+
+    {code, out} = run(dir, ["test", "test/doc_test.bl.md"])
+    assert code == 0, "a literate file must run; it said:\n#{out}"
+    assert out =~ "✓ doc-test", "the ns comes from the cells"
+    assert out =~ "1 passed", "one test: the one the cells declare"
+    refute out =~ "prose-decoy", "prose is not code"
+    refute out =~ "wrong-language", "nor is a fence in another language"
+  end
+
+  @literate_org """
+  #+TITLE: A literate org test
+
+  The prose here is not code; (ns prose-decoy) is a sentence.
+
+  #+begin_src beam-lisp
+  (ns org-test)
+  #+end_src
+
+  #+begin_src beam-lisp
+  (deftest org-fails (is (= 1 2)))
+  #+end_src
+  """
+
+  test "a literate .bl.org test is red on its code, with the why", %{dir: dir} do
+    write(dir, "test/org_test.bl.org", @literate_org)
+
+    {code, out} = run(dir, ["test", "test/org_test.bl.org"])
+    assert code == 1, "the failing cell makes the run red; it said:\n#{out}"
+    assert out =~ "org-test", "the ns comes from the cells"
+    assert out =~ "org-fails", "the failing test is named"
+    assert out =~ "expected:", "and the why is reported, not a prose crash"
+    assert out =~ "actual:"
+    refute out =~ "prose-decoy"
+  end
+
+  test "a shebanged script is a test file, as it is under bl run", %{dir: dir} do
+    write(
+      dir,
+      "test/script_test.bl",
+      "#!/usr/bin/env bl\n(ns script-test)\n(deftest a (is true))\n"
+    )
+
+    {code, out} = run(dir, ["test", "test/script_test.bl"])
+    assert code == 0, "an executable test script must run; it said:\n#{out}"
+    assert out =~ "✓ script-test"
+    assert out =~ "1 passed"
+  end
+
+  test "a literate file runs the same under --shared and --async", %{dir: dir} do
+    write(dir, "test/doc_test.bl.md", @literate_md)
+
+    for mode <- ["--shared", "--async"] do
+      {code, out} = run(dir, ["test", "test/doc_test.bl.md", mode])
+      assert code == 0, "#{mode} must run the literate file; it said:\n#{out}"
+      assert out =~ "Ran 1 tests", "#{mode} runs the one test the cells declare"
+      refute out =~ "prose-decoy", "#{mode} reads the cells, not the prose"
+    end
+  end
+
   # ── helpers ──
 
   defp write(dir, rel, text) do

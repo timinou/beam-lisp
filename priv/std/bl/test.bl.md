@@ -42,6 +42,20 @@ that mutates globals wants the default instead.
       (filter (fn [p] (ends-with? p "_test.bl")) ps)
       ps)))
 
+(defn missing-targets
+  "The path arguments that name nothing loadable — a typo'd file, or a directory
+   with no sources under it.
+
+   An argument that resolves to nothing is never silently dropped. A caller who
+   typed a file name and got a green run over the OTHER files has been told
+   something false: what they named is a hole in the run, and `run` says so by
+   name."
+  [args]
+  ; Report the RESOLVED path: the run's cwd may not be the caller's by the time
+  ; the message is read, and a relative name would point nowhere.
+  (let [rs (map u/resolve args)]
+    (filter (fn [p] (empty? (u/expand-targets p))) rs)))
+
 (defn- exs-under
   "The `*_test.exs` files under one path: a file contributes itself when that is
    what it is, a directory contributes what is beneath it. `files` above answers
@@ -72,7 +86,29 @@ that mutates globals wants the default instead.
      :error (reduce (fn [n f] (+ n (get-in f [:totals :error] 0))) 0 fs)
      :files (count fs)}))
 
-(defn- sources [paths] (map (fn [p] (File/read! p)) paths))
+(defn- entries
+  "The runner's input for each file: its PATH and its PROGRAM. A `.bl` IS its
+   bytes; a literate `.bl.md` / `.bl.org` is its code cells, read through
+   `Loader/read_source` — the loader's own read, the one `bl run`, `bl build`
+   and a `require` all use.
+
+   A raw `File/read!` fed ward the document's PROSE: `bl test doc.bl.md`
+   answered `INCOHERENT — test file declares no (ns …) form` however clean the
+   file's cells were, and `--shared`/`--async` died in the reader on the first
+   `#` heading. A second extractor here would be a second answer to a question
+   the loader already answers, and there is no line map to carry: the loader's
+   extraction is that one answer (see `BeamLisp.Loader.doc_source/2`).
+
+   The PATH rides with the source because a file has no other name when its
+   namespace cannot name it: a file whose source cannot be read is still an
+   entry — source-less, with the reason — so the run REPORTS it by name instead
+   of quietly shrinking."
+  [paths]
+  (map (fn [p]
+         (try
+           {:path p :src (BeamLisp.Loader/read_source p)}
+           (catch e {:path p :src nil :unreadable (ex-message e)})))
+       paths))
 ```
 
 ## The verb
@@ -83,16 +119,39 @@ anything reading the number rather than the picture.
 
 ```beam-lisp silent
 (defn run-isolated
-  "Run files through the isolated runner and report. Returns an exit code."
+  "Run files through the isolated runner and report. Returns an exit code.
+
+   With `--diagnose`, the run carries the CONTAMINATION LEDGER
+   (reload.ward-diag): at every file's boundaries it records the shared state
+   the file could have read without having written it — a message in the
+   runner's mailbox, a variable left in the VM environment, a memo key with no
+   env-id in it. Warnings print after the report (BUG-041); `--deep` adds the
+   per-surface counters and the keys each file wrote. A clean run prints
+   NOTHING extra, and without the flag the ledger is not even loaded."
   [paths st]
   (BeamLisp.Loader/ensure_loaded "reload")
   (BeamLisp.Loader/ensure_loaded "reload.ward")
   (let [ward (BeamLisp.Env/fetch! "reload.ward" "run")
         report (BeamLisp.Env/fetch! "reload.ward" "report")
-        result (ward (to-list (sources paths)))]
+        diag (if (:diagnose st)
+               (do (BeamLisp.Loader/ensure_loaded "reload.ward-diag")
+                   (BeamLisp.Env/fetch! "reload.ward-diag" "observer"))
+               nil)
+        result (if (nil? diag)
+                 (ward (to-list (entries paths)))
+                 (ward (to-list (entries paths)) (diag {:deep (:deep st)})))]
     (if (:json st)
-      (u/emit st (assoc (totals result) :ok (get result :ok?)) nil)
-      (println (report result)))
+      (u/emit st (assoc (totals result) :ok (get result :ok?)
+                        :contamination
+                        (if (nil? diag)
+                          nil
+                          ((BeamLisp.Env/fetch! "reload.ward-diag" "summary"))))
+              nil)
+      (do
+        (println (report result))
+        (when (some? diag)
+          (let [text ((BeamLisp.Env/fetch! "reload.ward-diag" "report"))]
+            (when (some? text) (println text))))))
     (if (:ok? result) 0 1)))
 
 (defn run-shared
@@ -160,15 +219,25 @@ anything reading the number rather than the picture.
     (ExUnit/start (to-list opts))))
 
 (defn run
-  "`bl test [PATH...] [--shared] [--async] [--include TAG] [--json]`. Both halves
-   of the suite, in one command and with no Mix: `.bl` files through `ward`
-   (isolated forks are the default; one runner, no second word to learn), `.exs`
-   files through ExUnit."
+  "`bl test [PATH...] [--shared] [--async] [--diagnose] [--include TAG] [--json]`.
+   Both halves of the suite, in one command and with no Mix: `.bl` files through
+   `ward` (isolated forks are the default; one runner, no second word to learn),
+   `.exs` files through ExUnit."
   [args st]
   (u/register-paths st)
-  (let [bls (files args)
+  (let [missing (missing-targets args)
+        bls (files args)
         exs (exs-files args)]
+    ; A named file that is not there is a hole in the run, not an absence to
+    ; shrug at: it is REPORTED by name, and it keeps the run from being green.
+    (u/each (fn [p] (u/io-err (str "bl test: nothing to run for " p))) missing)
     (cond
+      (and (:diagnose st) (or (:shared st) (:async st)))
+      (u/usage-error "bl test: --diagnose needs the isolated runner (not --shared/--async)")
+      ; Every named target a hole: the report above already named them, then the
+      ; usage-class exit (2) — pytest/grep treat a missing named file the same.
+      ; A hole AMONG good targets is different: the run happened but is
+      ; incomplete, which the (empty? missing) check below answers 1 for.
       (and (empty? bls) (empty? exs)) (u/usage-error "bl test: no test files found")
       :else
         (let [a (if (empty? bls)
@@ -177,5 +246,5 @@ anything reading the number rather than the picture.
                     (run-shared bls st)
                     (run-isolated bls st)))
               b (if (empty? exs) 0 (run-exunit exs st))]
-          (if (= 0 (+ a b)) 0 1)))))
+          (if (= 0 (+ a b)) (if (empty? missing) 0 1) 1)))))
 ```
