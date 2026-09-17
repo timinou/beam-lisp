@@ -1,0 +1,141 @@
+; vm/net.bl — the AF_UNIX transport for a bl daemon (ports Daemon.Listener).
+;
+; ══ WHAT MOVED HERE (FUP-082 T2/D2-D3) ══════════════════════════════════════
+;
+; The socket the daemon binds, the accept loop, the per-connection process, the
+; 0600 perms guard, and the hello/token handshake — all beam-lisp now. Proven
+; end-to-end: a bl server accepts a {packet,4} connection, decodes a frame with
+; vm.wire, and frames a response back (see the net round-trip proof).
+;
+; It lives in `vm.*` because it is runtime substrate any host reuses, and —
+; critically (K10: namespace state does NOT survive a hot reload) — the LISTEN
+; SOCKET is owned by a long-lived process started via `listen`, NOT held as
+; namespace state. A reload swaps the handler code; the socket and the accept
+; loop keep running.
+;
+;   (net/listen root handler)   → {:ok listener} | {:error reason}
+;       handler : (fn [frame conn-send] …)  called per decoded request frame;
+;                 conn-send is (fn [bytes] …) to write a frame back.
+;   (net/stop listener)         → :ok
+
+(ns vm.net
+  (:require [vm.wire :as wire] [vm.paths :as paths]))
+
+(defn- listen-opts [charlist]
+  ;; Erlang 2-tuple opts (NEVER bl maps — a bl-map opt gives {:exit :badarg}).
+  (list (tuple :inet_backend :inet)
+        :local
+        (tuple :ifaddr (tuple :local charlist))
+        :binary
+        (tuple :packet 4)
+        (tuple :active false)
+        (tuple :reuseaddr true)))
+
+(defn- connect-opts []
+  (list (tuple :inet_backend :inet) :local :binary (tuple :packet 4) (tuple :active false)))
+
+(defn- frame-recv [conn timeout-ms]
+  (let [r (gen_tcp/recv conn 0 timeout-ms)]
+    (if (= :ok (elem r 0)) {:ok (elem r 1)} {:error (elem r 1)})))
+
+(defn- frame-send [conn payload]
+  (gen_tcp/send conn payload))
+
+;; ── the per-connection handler ──────────────────────────────────────────────
+;;
+;; hello first (authenticated: the token file's bytes must match), then a
+;; request loop. The connection process owns its socket for its whole life; it
+;; dies when the client disconnects, taking nothing else with it.
+
+(defn- serve-conn [conn root token handler]
+  (let [hello (frame-recv conn 5000)]
+    (when (some? (:ok hello))
+      (let [decoded (wire/decode (:ok hello))
+            frame (:ok decoded)]
+        (if (and (some? frame) (= :hello (elem frame 0)))
+          (let [m (elem frame 1)
+                given (:token m)
+                tree (:tree m)]
+            (if (and (erlang/is_binary given)
+                     (= (erlang/byte_size given) (erlang/byte_size token))
+                     (erlang/apply :crypto :hash_equals (list given token))
+                     (= tree (paths/fingerprint root)))
+              (do
+                ;; ready — the handshake meta. No queue/busy (PLAN-121): attach.
+                (frame-send conn (wire/ready {:pid (erlang/list_to_binary (erlang/apply :os :getpid (list)))
+                                              :queue_depth 0 :busy nil}))
+                (serve-requests conn handler))
+              (frame-send conn (wire/reject :unauthorized "bad token or wrong tree" {}))))
+          (frame-send conn (wire/reject :malformed "expected hello" {})))))))
+
+(defn- serve-requests [conn handler]
+  (let [req (frame-recv conn 1800000)]  ; 30min read window (a test can run long)
+    (when (some? (:ok req))
+      (let [decoded (wire/decode (:ok req))
+            frame (:ok decoded)]
+        (when (and (some? frame) (= :request (elem frame 0)))
+          (handler frame (fn [bytes] (frame-send conn bytes))))
+        ;; one request per connection (the launcher opens a fresh conn each time)
+        (gen_tcp/close conn)))))
+
+;; ── the accept loop (a long-lived process, NOT namespace state) ─────────────
+
+(defn- accept-loop [lsock root token handler]
+  (let [ar (gen_tcp/accept lsock 5000)]
+    (cond
+      (= :ok (elem ar 0))
+      (let [conn (elem ar 1)]
+        ;; hand the connection to its own process; consume the DOWN so the
+        ;; acceptor's mailbox never grows (the leak the Elixir acceptor had).
+        (let [pair (erlang/apply :erlang :spawn_monitor
+                     (list (fn [] (serve-conn conn root token handler))))]
+          (erlang/apply :gen_tcp :controlling_process (list conn (elem pair 0)))
+          (accept-drain-down))
+        (accept-loop lsock root token handler))
+
+      ;; timeout is normal — loop again so the process stays responsive to stop
+      (= :timeout (elem ar 1))
+      (accept-loop lsock root token handler)
+
+      ;; listener closed (stop) — exit the loop
+      :else :stopped)))
+
+(defn- accept-drain-down []
+  ;; non-blocking: consume a pending {:DOWN,…} if present, else move on
+  (receive
+    [:DOWN _ref :process _pid _reason] :ok
+    (after 0 :ok)))
+
+(defn listen
+  "Bind the daemon socket for `root` and accept connections, dispatching each
+   decoded request frame to `handler` (fn [frame conn-send]). Returns
+   {:ok {:lsock :pid :sock-path}} | {:error reason}. The socket is chmod 0600 —
+   the security boundary is file perms + the hello token."
+  [root handler]
+  (let [ep (paths/endpoints root)]
+    (if (nil? (:ok ep))
+      ep
+      (let [paths-map (:ok ep)
+            sock-path (:sock paths-map)
+            token-path (:token paths-map)
+            charlist (erlang/binary_to_list sock-path)]
+        (File/rm sock-path)
+        (let [lr (gen_tcp/listen 0 (listen-opts charlist))]
+          (if (not= :ok (elem lr 0))
+            {:error (elem lr 1)}
+            (let [lsock (elem lr 1)]
+              (File/chmod sock-path 384)  ; 0o600
+              ;; mint + persist the token if absent
+              (when (not (File/exists? token-path))
+                (File/write! token-path (erlang/apply :crypto :strong_rand_bytes (list 32)))
+                (File/chmod token-path 384))
+              (let [token (File/read! token-path)
+                    pid (spawn (fn [] (accept-loop lsock root token handler)))]
+                {:ok {:lsock lsock :pid pid :sock-path sock-path}}))))))))
+
+(defn stop
+  "Stop a listener: close the socket (ends the accept loop) and unlink the path."
+  [listener]
+  (gen_tcp/close (:lsock listener))
+  (File/rm (:sock-path listener))
+  :ok)

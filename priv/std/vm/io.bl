@@ -1,0 +1,87 @@
+; vm/io.bl — a per-request group-leader proxy (ports Daemon.IO).
+;
+; ══ WHAT MOVED HERE (FUP-082 T2/D2-D3) ══════════════════════════════════════
+;
+; A command's stdout/stdin must become wire frames. This is a process running
+; the Erlang I/O-server protocol: set as a command's group leader, every
+; put_chars (IO.puts, a printed value) becomes a :stdout frame, every get_line
+; becomes a :stdin request. It is pure BEAM message protocol — bl implements it
+; the same way Elixir did. Output is chunked ≤64KiB and sent SYNCHRONOUSLY, so a
+; slow client applies backpressure instead of growing the daemon heap.
+;
+;   (io/start conn id)          → proxy pid; set a worker's group_leader to it
+;   (io/finish proxy)           → the final seq (flush marker)
+
+(ns vm.io
+  (:require [vm.wire :as wire]))
+
+(def CHUNK 65536)
+
+(defn- send-chunks [send-fn id stream seq bin]
+  (if (= 0 (erlang/byte_size bin))
+    seq
+    (let [take (erlang/min CHUNK (erlang/byte_size bin))
+          chunk (erlang/apply :binary :part (list bin 0 take))
+          rest (erlang/apply :binary :part (list bin take (- (erlang/byte_size bin) take)))
+          frame (if (= stream :stderr) (wire/stderr id seq chunk) (wire/stdout id seq chunk))]
+      (send-fn frame)                     ; synchronous = bounded backpressure
+      (send-chunks send-fn id stream (+ seq 1) rest))))
+
+(defn- normalize [chars]
+  (cond
+    (erlang/is_binary chars) chars
+    (erlang/is_list chars) (erlang/apply :erlang :iolist_to_binary (list chars))
+    :else (erlang/apply :erlang :iolist_to_binary
+            (list (erlang/apply :io_lib :format (list "~p" (list chars)))))))
+
+(defn- emit [send-fn id stream seq chars]
+  (send-chunks send-fn id stream seq (normalize chars)))
+
+;; handle one io_request body → {reply new-seq}
+(defn- handle-io [send-fn id seq req]
+  (cond
+    ;; {:put_chars, enc, chars} | {:put_chars, chars}
+    (and (erlang/is_tuple req) (= :put_chars (elem req 0)))
+    (let [chars (elem req (- (erlang/tuple_size req) 1))]
+      (tuple :ok (emit send-fn id :stdout seq chars)))
+
+    ;; setopts / getopts / geometry — benign replies
+    (and (erlang/is_tuple req) (= :setopts (elem req 0))) (tuple :ok seq)
+    (= req :getopts) (tuple (list (tuple :binary true) (tuple :encoding :unicode)) seq)
+    (and (erlang/is_tuple req) (= :get_geometry (elem req 0)))
+    (tuple (if (= :columns (elem req 1)) 80 24) seq)
+
+    ;; get_line / get_chars → stdin request (kept minimal: EOF for now)
+    (and (erlang/is_tuple req)
+         (contains? #{:get_line :get_chars :get_until} (elem req 0)))
+    (tuple :eof seq)
+
+    :else (tuple (tuple :error :request) seq)))
+
+(defn- io-loop [send-fn id seq]
+  (receive
+    [:io_request from reply-as req]
+    (let [r (handle-io send-fn id seq req)]
+      (erlang/send from (tuple :io_reply reply-as (elem r 0)))
+      (io-loop send-fn id (elem r 1)))
+
+    [:finish from ref]
+    (do (erlang/send from (tuple :finished ref seq)) :ok)
+
+    (after 1800000 :ok)))
+
+(defn start-with-send
+  "Spawn a group-leader proxy for request `id` that emits frames via `send-fn`
+   (a 1-arg fn taking framed bytes). Returns the proxy pid; set a worker's group
+   leader to it with erlang/group_leader."
+  [send-fn id]
+  (spawn (fn [] (io-loop send-fn id 0))))
+
+(defn finish
+  "Flush marker: tell the proxy no more output is coming; returns the final seq."
+  [proxy]
+  (let [ref (erlang/apply :erlang :make_ref (list))]
+    (erlang/send proxy (tuple :finish (erlang/self) ref))
+    (receive
+      [:finished r seq] seq
+      (after 5000 0))))
