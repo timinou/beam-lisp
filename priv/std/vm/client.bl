@@ -1,0 +1,142 @@
+; vm/client.bl — the `bl daemon` lifecycle from the CLI (ports Daemon facade).
+;
+; The three verbs a terminal (and the launcher) drive:
+;
+;   (client/start-foreground root)  → become the daemon (blocks). The launcher
+;      runs this detached; `bl daemon start` in a terminal runs it foreground.
+;   (client/status root)            → connect, print the daemon's status. 0/1.
+;   (client/stop root)              → ask the daemon to drain and exit. 0/1.
+;   (client/probe root)             → {:ok ready-meta} | {:error reason}, the
+;      launcher's fast path and start's double-start guard.
+;
+; start becomes a pure-beam-lisp SESSION (vm.session composes vm.net + vm.io +
+; vm.manager + bl.daemon/handle-in-vm); status/stop/probe are ordinary clients
+; speaking vm.wire frames over the AF_UNIX socket — the SAME path a real client
+; runs, so they exercise the transport end to end.
+
+(ns vm.client
+  (:require [vm.session :as session] [vm.paths :as paths] [vm.wire :as wire]))
+
+(def CONNECT-TIMEOUT 500)
+(def PT-STOP (tuple :vm_session :stop))
+
+;; ── start (become the daemon) ───────────────────────────────────────────────
+
+(defn start-foreground
+  "Run as the daemon for `root` (default BL_DAEMON_ROOT or cwd), blocking until
+   a :control :stop frame flips the stop flag. If one is already up for this
+   tree, prints a notice and returns :already_running."
+  [root]
+  (let [root (or root (System/get_env "BL_DAEMON_ROOT") (BeamLisp/cwd))
+        p (probe root)]
+    (if (contains? p :ok)
+      (do (println (str "bl daemon: already running for " root)) :already_running)
+      (let [r (session/start root)]
+        (if (contains? r :ok)
+          (let [listener (:ok r)]
+            (erlang/apply :persistent_term :put (list PT-STOP false))
+            (wait-for-stop)
+            (session/stop listener)
+            :ok)
+          (do (IO/puts :stderr (str "bl daemon: failed to start: " (pr-str r)))
+              {:error r}))))))
+
+(defn- wait-for-stop []
+  (if (erlang/apply :persistent_term :get (list PT-STOP false))
+    :ok
+    (do (erlang/apply :timer :sleep (list 200)) (wait-for-stop))))
+
+;; ── the client side (status / stop / probe) ─────────────────────────────────
+
+(defn- resolve-root [root]
+  (or root (System/get_env "BL_DAEMON_ROOT") (BeamLisp/cwd)))
+
+(defn- do-connect [sock-path]
+  (let [r (gen_tcp/connect (tuple :local (erlang/binary_to_list sock-path)) 0
+            (to-list [(tuple :inet_backend :inet) :local :binary
+                      (tuple :packet 4) (tuple :active false)])
+            CONNECT-TIMEOUT)]
+    (if (= :ok (elem r 0)) {:ok (elem r 1)} {:error (elem r 1)})))
+
+(defn- recv-frame [sock]
+  (let [r (gen_tcp/recv sock 0 10000)]
+    (if (= :ok (elem r 0))
+      {:ok (erlang/apply :erlang :binary_to_term (list (elem r 1)))}
+      {:error (elem r 1)})))
+
+(defn- connect-hello
+  "Connect + the hello/token handshake; {:ok sock ready-meta} | {:error reason}."
+  [root]
+  (let [ep (paths/endpoints root)]
+    (if (not (contains? ep :ok))
+      {:error :no_endpoints}
+      (let [em (:ok ep)]
+        (if (not (File/exists? (:sock em)))
+          {:error :no_socket}
+          (let [token (File/read! (:token em))
+                c (do-connect (:sock em))]
+            (if (not (contains? c :ok))
+              {:error (:error c)}
+              (let [sock (:ok c)]
+                (gen_tcp/send sock (erlang/apply :erlang :term_to_binary
+                                     (list (tuple :bl 1 :hello {:tree (paths/fingerprint root) :token token}))))
+                (let [f (recv-frame sock)]
+                  (if (not (contains? f :ok))
+                    (do (gen_tcp/close sock) {:error (:error f)})
+                    (let [frame (:ok f) tag (elem frame 2)]
+                      (cond
+                        (= tag :ready) {:ok sock :ready (elem frame 3)}
+                        (= tag :reject) (do (gen_tcp/close sock) {:error (tuple :reject (elem frame 3))})
+                        :else (do (gen_tcp/close sock) {:error frame})))))))))))))
+
+(defn- drain-to-exit
+  "Read frames for request `id`, writing stdout/stderr, until :exit."
+  [sock id]
+  (let [f (recv-frame sock)]
+    (if (not (contains? f :ok))
+      :ok
+      (let [frame (:ok f) tag (elem frame 2)]
+        (cond
+          (and (= tag :stdout) (= (elem frame 3) id)) (do (IO/write (elem frame 5)) (drain-to-exit sock id))
+          (and (= tag :stderr) (= (elem frame 3) id)) (do (IO/write :stderr (elem frame 5)) (drain-to-exit sock id))
+          (and (= tag :exit) (= (elem frame 3) id)) :ok
+          :else (drain-to-exit sock id))))))
+
+(defn- control [root op done-msg]
+  (let [root (resolve-root root)
+        c (connect-hello root)]
+    (if (contains? c :ok)
+      (let [sock (:ok c)
+            id (erlang/apply :crypto :strong_rand_bytes (list 16))]
+        (gen_tcp/send sock (erlang/apply :erlang :term_to_binary
+                             (list (tuple :bl 1 :control id op))))
+        (drain-to-exit sock id)
+        (gen_tcp/close sock)
+        (when done-msg (println done-msg))
+        0)
+      c)))
+
+(defn status
+  "Print the daemon's status for `root`, or 'not running'. Returns 0/1."
+  [root]
+  (let [root (resolve-root root)
+        r (control root :status nil)]
+    (if (= 0 r) 0
+      (do (println (str "bl daemon: not running for " root " (" (pr-str (:error r)) ")")) 1))))
+
+(defn stop
+  "Stop the daemon for `root`. Returns 0 on stop, 1 if none was running."
+  [root]
+  (let [root (resolve-root root)
+        r (control root :stop (str "bl daemon: stopped (" root ")"))]
+    (if (= 0 r) 0
+      (do (println (str "bl daemon: not running for " root)) 1))))
+
+(defn probe
+  "Whether a live, authenticated daemon answers for `root`. {:ok ready-meta} |
+   {:error reason}. Used by the launcher's fast path and start's guard."
+  [root]
+  (let [c (connect-hello (resolve-root root))]
+    (if (contains? c :ok)
+      (do (gen_tcp/close (:ok c)) {:ok (:ready c)})
+      c)))

@@ -261,25 +261,27 @@ defmodule BeamLisp.TestVerbTest do
     {code, out}
   end
 
+  # The daemon is pure beam-lisp now (vm.session composes vm.net + vm.io +
+  # vm.manager + bl.daemon). Boot it through the runtime and speak the SAME
+  # AF_UNIX wire a real client speaks — raw ETF frames, the vm.paths endpoints.
   defp daemon_request(ctx, argv, dir) do
-    alias BeamLisp.Daemon.{Paths, Protocol, Server}
-
     root = File.cwd!()
+    BeamLisp.Loader.ensure_loaded("vm.session")
+    BeamLisp.Loader.ensure_loaded("vm.paths")
 
-    case Process.whereis(Server) do
-      nil -> :ok
-      old -> try do: GenServer.stop(old, :normal, 2_000), catch: (:exit, _ -> :ok)
-    end
+    started = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.session", "start"), [root])
+    listener = Map.fetch!(started, :ok)
 
-    {:ok, pid} = Server.start_link(root: root, boot: true, idle_seconds: 0)
-    {:ok, ep} = Paths.endpoints(root)
+    ep = Map.fetch!(BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.paths", "endpoints"), [root]), :ok)
+    sock_path = Map.fetch!(ep, :sock)
+    token_path = Map.fetch!(ep, :token)
 
-    wait_for(fn -> File.exists?(ep.token) end)
-    token = File.read!(ep.token)
-    tree = Paths.tree_fingerprint(root)
+    wait_for(fn -> File.exists?(token_path) end)
+    token = File.read!(token_path)
+    tree = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.paths", "fingerprint"), [root])
 
     {:ok, sock} =
-      :gen_tcp.connect({:local, String.to_charlist(ep.sock)}, 0, [
+      :gen_tcp.connect({:local, String.to_charlist(sock_path)}, 0, [
         {:inet_backend, :inet},
         :local,
         :binary,
@@ -287,14 +289,14 @@ defmodule BeamLisp.TestVerbTest do
         {:active, false}
       ])
 
-    :gen_tcp.send(sock, Protocol.encode({:bl, 1, :hello, %{tree: tree, token: token}}))
+    :gen_tcp.send(sock, :erlang.term_to_binary({:bl, 1, :hello, %{tree: tree, token: token}}))
     {:ok, _} = :gen_tcp.recv(sock, 0, 10_000)
     id = :crypto.strong_rand_bytes(16)
-    :gen_tcp.send(sock, Protocol.encode({:bl, 1, :request, id, %{argv: argv, cwd: dir, env_paths: []}}))
+    :gen_tcp.send(sock, :erlang.term_to_binary({:bl, 1, :request, id, %{argv: argv, cwd: dir, env: %{}}}))
     result = collect(sock, id, "")
     :gen_tcp.close(sock)
 
-    if Process.alive?(pid), do: GenServer.stop(pid, :normal, 2_000)
+    _ = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.session", "stop"), [listener])
     _ = ctx
     result
   end

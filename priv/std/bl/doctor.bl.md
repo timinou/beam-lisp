@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [vm.client]))
 ```
 
 ## A probe never crashes
@@ -141,10 +141,10 @@ invocation, so it reports `not running` and changes nothing.
 
    (probe "daemon" false
      (fn []
-       (let [[tag detail] (BeamLisp.Daemon/probe (BeamLisp/cwd))]
-         (if (= :ok tag)
+       (let [r (vm.client/probe (BeamLisp/cwd))]
+         (if (contains? r :ok)
            {:ok true :detail "running (warm VM for this tree)"}
-           {:ok false :detail (str "not running (" (pr-str detail) ")")}))))
+           {:ok false :detail (str "not running (" (pr-str (:error r)) ")")}))))
 
    (probe "src/" false
      (fn [] (let [ok? (File/dir? (u/resolve "src"))]

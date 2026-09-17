@@ -10,12 +10,10 @@ changed, whether the bundle applied or was held, and the namespaces it touched.
 The verb runs in one of two places, and they share every line of output.
 
 * **A warm daemon hosts the watcher.** `bl watch` reaches the daemon as a
-  request; the daemon registers a watcher in its `BeamLisp.Daemon.WatchRegistry`
-  and streams this function's rendering back over the socket. Every reload
-  commit rides the daemon's single `Executor` worker, so it is ordered against
-  the runs and tests the daemon is serving — a reload never races a program
-  mutating the same image. The registry starts ONE watcher per directory and
-  fans its results out to every `bl watch` client watching that tree.
+  request; the watcher's rendering streams back over the socket. Every reload
+  commit rides the daemon's sequencer (`vm.exec/run-reload`), so it is ordered
+  against the runs and tests the daemon is serving — a reload never races a
+  program mutating the same image.
 * **Without a daemon the verb owns its process.** A standalone `bl watch`
   starts a `BeamLisp.ReloadWatcher` bound to this VM and parks; every commit
   prints here, in the CLI's own process.

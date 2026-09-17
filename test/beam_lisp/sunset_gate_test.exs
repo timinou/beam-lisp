@@ -13,9 +13,29 @@ defmodule BeamLisp.SunsetGateTest do
   # Module names that have been sunset — their policy is now beam-lisp.
   # A `defmodule <name>` under lib/ for any of these is a regression.
   @sunset_modules [
+    # PLAN-122 (T3/native)
     "BeamLisp.Native",
     "BeamLisp.NativeTask",
-    "BeamLisp.Cargo"
+    "BeamLisp.Cargo",
+    # PLAN-123 + FUP-085 (T2/daemon + the routing edge): the WHOLE daemon is
+    # beam-lisp now (priv/std/vm/*.bl). No BeamLisp.Daemon.* may return.
+    "BeamLisp.Daemon",
+    "BeamLisp.Daemon.Paths",
+    "BeamLisp.Daemon.Names",
+    "BeamLisp.Daemon.Ports",
+    "BeamLisp.Daemon.Gateway",
+    "BeamLisp.Daemon.CA",
+    "BeamLisp.Daemon.IndexWorker",
+    "BeamLisp.Daemon.Server",
+    "BeamLisp.Daemon.Listener",
+    "BeamLisp.Daemon.IO",
+    "BeamLisp.Daemon.Protocol",
+    "BeamLisp.Daemon.Inspect",
+    "BeamLisp.Daemon.HTTP",
+    "BeamLisp.Daemon.Executor",
+    "BeamLisp.Daemon.Workers",
+    "BeamLisp.Daemon.WatchRegistry",
+    "BeamLisp.Daemon.StdErr"
   ]
 
   @lib_root Path.expand("../../lib", __DIR__)
@@ -60,15 +80,18 @@ defmodule BeamLisp.SunsetGateTest do
     "BL_DAEMON=queue"
   ]
 
+  # The daemon is beam-lisp now (priv/std/vm); the token gate still watches the
+  # whole runtime + the Rust launcher for a serial-worker assumption creeping back.
   @daemon_src [
-    Path.expand("../../lib/beam_lisp/daemon", __DIR__),
+    Path.expand("../../priv/std/vm", __DIR__),
+    Path.expand("../../lib/beam_lisp", __DIR__),
     Path.expand("../../tooling/drop/src", __DIR__)
   ]
 
   test "no workaround-ecosystem token reappears in daemon source" do
     files =
       @daemon_src
-      |> Enum.flat_map(fn dir -> Path.wildcard(Path.join(dir, "**/*.{ex,rs}")) end)
+      |> Enum.flat_map(fn dir -> Path.wildcard(Path.join(dir, "**/*.{ex,rs,bl}")) end)
 
     offenders =
       for file <- files,

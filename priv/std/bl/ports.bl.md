@@ -201,8 +201,8 @@ it.
 
    The report goes to `io-err` — it is a status line about work the session is
    doing, not the command's output. It used to have to go to stdout because the
-   daemon dropped a command's stderr; `BeamLisp.Daemon.StdErr` forwards it now, so
-   the line can be on the stream it belongs to."
+   daemon dropped a command's stderr; the per-request group-leader proxy (vm.io)
+   forwards it now, so the line can be on the stream it belongs to."
   []
   (let [p (vm.index/owner-pid)]
     (if (nil? p)
