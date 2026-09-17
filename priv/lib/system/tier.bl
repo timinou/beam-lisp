@@ -1,0 +1,311 @@
+; tier.bl — PROTOTYPE: progressive lowering for bl-ANF (option C).
+;
+; ── What this demonstrates ──────────────────────────────────────────────
+;
+; Today the numeric-tower scaffold is born at ANF CONSTRUCTION time:
+; compiler.bl's linked-call expands a 2-arity core numeric op into
+;
+;   (let [a x] (let [b y] (if (if (is_map a) true (is_map b))
+;                            (Num.op a b) (erlang.bif a b))))
+;
+; before any analysis ever sees the tree. Every proof engine then has to
+; know that shape to see the arithmetic through it — arith-bif is the
+; fourth place that knowledge had to be written down, and BUG-054/061/062
+; are the three places it was missing or stale. That is shape blindness:
+; the lowering happened too EARLY, at the tier where the abstraction was
+; still intact.
+;
+; Option C inverts the responsibility. The canonical tier keeps the
+; abstraction — one node:
+;
+;   {:op :arith :fun :add :bif :+ :args (x y)}
+;
+; and the scaffold appears only at LOWERING, on the way to BEAM, where no
+; analysis looks. This file is the bridge that makes the claim concrete:
+;
+;   raise      canonical ANF  →  raised tier (scaffolds become :arith)
+;   lower      raised tier    →  canonical ANF (:arith becomes the scaffold)
+;   alpha=     the proof obligation: lower(raise(anf)) ≡ anf, modulo the
+;              scaffold's invented names and the line/file annotations the
+;              compiler stamps. If that holds for the corpus, the raised
+;              tier carries EVERYTHING the canonical tier does — analysis
+;              can live there losslessly, and the scaffold can move to the
+;              emitter without any consumer noticing.
+;
+; What production would change (NOT done here — this is the prototype):
+; linked-call emits :arith instead of the scaffold, the BEAM emitter calls
+; lower, and every analysis drops its scaffold clause. arith-bif,
+; measure-dir's unwrap, the linear recogniser's two shapes and BUG-061's
+; compiled-init? all collapse into `(:op n) = :arith`.
+;
+; ── The traversal pair ──────────────────────────────────────────────────
+;
+; ir/child-nodes reads a node's children op-agnostically; map-children is
+; its dual, REBUILDING the node with transformed children. raise, lower and
+; every tier-to-tier transform fold over this pair, so the op vocabulary
+; is named in exactly two places (here and ir.bl) rather than in every
+; pass. alpha= needs the same table a third time because it walks TWO
+; trees under a renaming environment — the production version should
+; unify all three behind one zipper.
+
+(ns system.tier
+  (:require [system.ir :as ir]))
+
+; ── the tower's vocabulary (mirrors compiler.bl:158-165) ────────────────
+
+(def ^:private mod-num (erlang/binary_to_atom "Elixir.BeamLisp.Num"))
+
+(def ^:private num-bifs
+  "BeamLisp.Num 2-arity names and the Erlang BIF each is on int/float."
+  {:add :+ :sub :- :mul :* :div :/
+   :lt :< :gt :> :le :"=<" :ge :>= :num_eq :==})
+
+; ── recognising the scaffold ────────────────────────────────────────────
+
+(defn- remote-call?
+  "Whether `n` is `{:op :remote}` with this mod, fun and argument count."
+  [n mod fun argc]
+  (and (map? n) (= :remote (:op n)) (= mod (:mod n)) (= fun (:fun n))
+       (= argc (count (:args n)))))
+
+(defn- var-named?
+  "Whether `n` is the `:var` node for `name`."
+  [n name]
+  (and (map? n) (= :var (:op n)) (= name (:name n))))
+
+(defn arith-node
+  "If `n` is EXACTLY the numeric-tower scaffold linked-call emits, the
+   raised-tier node `{:op :arith :fun f :bif b :args (x y)}` over the
+   original operand nodes; else nil. Strict — unlike ir/arith-bif (which
+   only needs the fast path), the round trip is only lossless if the
+   dispatch test and the tower branch are verified too, so a user-written
+   let-let-if that merely rhymes with the scaffold is left alone."
+  [n]
+  (if (and (map? n) (= :let (:op n))
+           (map? (:body n)) (= :let (:op (:body n))))
+    (let [a (:name n) x (:init n)
+          inner (:body n)
+          b (:name inner) y (:init inner)
+          body (:body inner)]
+      (if (and (map? body) (= :if (:op body))
+               ; the dispatch: (if (is_map a) true (is_map b))
+               (remote-call? (:test (:test body)) :erlang :is_map 1)
+               (var-named? (first (:args (:test (:test body)))) a)
+               (and (map? (:then (:test body))) (= :lit (:op (:then (:test body))))
+                    (= true (:val (:then (:test body)))))
+               (remote-call? (:else (:test body)) :erlang :is_map 1)
+               (var-named? (first (:args (:else (:test body)))) b)
+               ; the tower branch: (Num.f a b), the fast path: (erlang.bif a b)
+               (map? (:then body)) (remote-call? (:then body) mod-num (:fun (:then body)) 2)
+               (var-named? (first (:args (:then body))) a)
+               (var-named? (second (:args (:then body))) b)
+               (remote-call? (:else body) :erlang (:fun (:else body)) 2)
+               (var-named? (first (:args (:else body))) a)
+               (var-named? (second (:args (:else body))) b)
+               ; …and the two branches really are the tower's f and its BIF
+               (= (:fun (:else body)) (get num-bifs (:fun (:then body)))))
+        {:op :arith :fun (:fun (:then body)) :bif (:fun (:else body))
+         :args (list x y) :ann (:ann n)}
+        nil))
+    nil))
+
+; ── the scaffold, regenerated ───────────────────────────────────────────
+
+(defn- fresh
+  "A name no source program can carry — unique per BEAM, no state to reset."
+  [base]
+  (str base "_" (erlang/unique_integer (list :positive))))
+
+(defn lower-arith
+  "The :arith node expanded to the scaffold, mirroring linked-call. The
+   line/file stamping the compiler does is annotation, not structure — it
+   lives in :ann, which alpha= ignores and the emitter re-stamps anyway."
+  [n]
+  (let [a (fresh "na") b (fresh "nb")
+        av {:op :var :name a}
+        bv {:op :var :name b}]
+    {:op :let :name a :init (first (:args n))
+     :body {:op :let :name b :init (second (:args n))
+            :body {:op :if
+                   :test {:op :if
+                          :test {:op :remote :mod :erlang :fun :is_map :args (list av)}
+                          :then {:op :lit :val true}
+                          :else {:op :remote :mod :erlang :fun :is_map :args (list bv)}}
+                   :then {:op :remote :mod mod-num :fun (:fun n) :args (list av bv)}
+                   :else {:op :remote :mod :erlang :fun (:bif n) :args (list av bv)}}
+            :ann (:ann n)}
+     :ann (:ann n)}))
+
+; ── the traversal pair ──────────────────────────────────────────────────
+
+(defn- map-list [f xs] (apply list (map f xs)))
+
+(defn- map-clauses
+  "f over every clause's guard (when present) and body."
+  [f clauses]
+  (map-list (fn [cl]
+              (assoc cl
+                     :guard (if (nil? (:guard cl)) nil (f (:guard cl)))
+                     :body (f (:body cl))))
+            clauses))
+
+(defn map-children
+  "The dual of ir/child-nodes: `n` rebuilt with f applied to each immediate
+   executable child node, evaluation order preserved. :arith's operands
+   ARE children — a tier transform that could not descend into the raised
+   node would strand nested scaffolds inside it."
+  [f n]
+  (let [o (:op n)]
+    (cond
+      (contains? #{:lit :var :global :enil} o) n
+      (= o :arith)  (assoc n :args (map-list f (:args n)))
+      (= o :remote) (assoc n :args (map-list f (:args n)))
+      (= o :apply)  (assoc n :fn (f (:fn n)) :args (map-list f (:args n)))
+      (= o :let)    (assoc n :init (f (:init n)) :body (f (:body n)))
+      (= o :if)     (assoc n :test (f (:test n)) :then (f (:then n)) :else (f (:else n)))
+      (= o :do)     (assoc n :stmts (map-list f (:stmts n)))
+      (= o :case)   (assoc n :subj (f (:subj n)) :clauses (map-clauses f (:clauses n)))
+      (= o :fn)     (assoc n :clauses (map-clauses f (:clauses n)))
+      (= o :try)    (assoc n :body (f (:body n)) :catch (map-clauses f (:catch n))
+                            :after (if (nil? (:after n)) nil (f (:after n))))
+      (= o :recv)   (assoc n :clauses (map-clauses f (:clauses n))
+                            :timeout (if (nil? (:timeout n)) nil (f (:timeout n)))
+                            :after (if (nil? (:after n)) nil (f (:after n))))
+      (= o :tuple)  (assoc n :elems (map-list f (:elems n)))
+      (= o :map)    (assoc n :pairs (map-list (fn [pr] (list (f (first pr)) (f (second pr))))
+                                              (:pairs n)))
+      (= o :cons)   (assoc n :head (f (:head n)) :tail (f (:tail n)))
+      (= o :struct) (assoc n :fields (map-list (fn [pr] (list (f (first pr)) (f (second pr))))
+                                               (:fields n)))
+      :else n)))
+
+(defn- postwalk
+  "Bottom-up: children first, then f on the rebuilt node. Bottom-up is what
+   lets raise recognise a scaffold whose operands were already raised, and
+   lower expand a node whose operands were already lowered."
+  [f n]
+  (f (map-children (fn [c] (postwalk f c)) n)))
+
+(defn raise
+  "Canonical ANF with every numeric-tower scaffold re-abstracted to :arith.
+   Nodes that are not the scaffold pass through untouched."
+  [anf]
+  (postwalk (fn [n] (let [r (arith-node n)] (if (nil? r) n r))) anf))
+
+(defn lower
+  "The raised tier with every :arith expanded to the scaffold — the pass
+   the BEAM emitter would run, so analysis above never sees the dispatch."
+  [raised]
+  (postwalk (fn [n] (if (and (map? n) (= :arith (:op n))) (lower-arith n) n)) raised))
+
+; ── the proof obligation ────────────────────────────────────────────────
+;
+; lower(raise(anf)) regenerates the scaffold with FRESH names where the
+; compiler used its own fresh names, so raw `=` can never hold — compiling
+; the same source twice already fails it. The honest statement is
+; alpha-equivalence: same tree modulo the names of let-bound locals and
+; the :ann metadata. Only :let names need the environment (the scaffold
+; introduces no patterns), so pattern-bearing nodes compare their patterns
+; literally and extend nothing.
+
+(declare alpha=)
+
+(defn- alpha-args
+  "Pairwise alpha= over two child lists under the same environment."
+  [xs ys env]
+  (and (= (count xs) (count ys))
+       (every? (fn [pr] (alpha= (first pr) (second pr) env))
+               (map list xs ys))))
+
+(defn- alpha-clauses
+  "Pairwise over clauses: patterns literal, guard/body under the shared env
+   (patterns bind the SAME names on both sides — the transform under test
+   never touches them)."
+  [xs ys env]
+  (and (= (count xs) (count ys))
+       (every? (fn [pr]
+                 (let [cx (first pr) cy (second pr)]
+                   (and (= (:pats cx) (:pats cy))
+                        (alpha= (:guard cx) (:guard cy) env)
+                        (alpha= (:body cx) (:body cy) env))))
+               (map list xs ys))))
+
+(defn- alpha-maybe
+  "alpha= over an optional child (nil :after/:timeout/:guard)."
+  [x y env]
+  (if (nil? x) (nil? y) (and (some? y) (alpha= x y env))))
+
+(defn alpha=
+  "Alpha-equivalence of two ANF trees: same op structure, same literals,
+   same globals and free names, let-bound locals equal up to consistent
+   renaming, :ann ignored everywhere. env is [ma mb], renaming tokens for
+   each side's bound names."
+  ([x y] (alpha= x y [{} {}]))
+  ([x y env]
+   (if (or (nil? x) (nil? y))
+     (= x y)
+     (if (not (and (ir/node? x) (ir/node? y)))
+       (= x y)
+       (and
+         (= (:op x) (:op y))
+         (let [o (:op x)
+               ma (first env) mb (second env)]
+           (cond
+             (= o :lit)    (= (:val x) (:val y))
+             (contains? #{:enil} o) true
+             (= o :var)    (= (get ma (:name x) (:name x)) (get mb (:name y) (:name y)))
+             (= o :global) (and (= (:name x) (:name y)) (= (:ns x) (:ns y)))
+             (= o :arith)  (and (= (:fun x) (:fun y)) (= (:bif x) (:bif y))
+                                (alpha-args (:args x) (:args y) env))
+             (= o :remote) (and (= (:mod x) (:mod y)) (= (:fun x) (:fun y))
+                                (alpha-args (:args x) (:args y) env))
+             (= o :apply)  (and (alpha= (:fn x) (:fn y) env)
+                                (alpha-args (:args x) (:args y) env))
+             (= o :let)    (and (alpha= (:init x) (:init y) env)
+                                (let [token (fresh "alpha")]
+                                  (alpha= (:body x) (:body y)
+                                          (list (assoc ma (:name x) token)
+                                                (assoc mb (:name y) token)))))
+             (= o :if)     (and (alpha= (:test x) (:test y) env)
+                                (alpha= (:then x) (:then y) env)
+                                (alpha= (:else x) (:else y) env))
+             (= o :do)     (alpha-args (:stmts x) (:stmts y) env)
+             (= o :case)   (and (alpha= (:subj x) (:subj y) env)
+                                (alpha-clauses (:clauses x) (:clauses y) env))
+             (= o :fn)     (alpha-clauses (:clauses x) (:clauses y) env)
+             (= o :try)    (and (alpha= (:body x) (:body y) env)
+                                (alpha-clauses (:catch x) (:catch y) env)
+                                (alpha-maybe (:after x) (:after y) env))
+             (= o :recv)   (and (alpha-clauses (:clauses x) (:clauses y) env)
+                                (alpha-maybe (:timeout x) (:timeout y) env)
+                                (alpha-maybe (:after x) (:after y) env))
+             (= o :tuple)  (alpha-args (:elems x) (:elems y) env)
+             (= o :map)    (alpha-args (mapcat identity (:pairs x))
+                                       (mapcat identity (:pairs y)) env)
+             (= o :cons)   (and (alpha= (:head x) (:head y) env)
+                                (alpha= (:tail x) (:tail y) env))
+             (= o :struct) (alpha-args (mapcat identity (:fields x))
+                                       (mapcat identity (:fields y)) env)
+             :else false)))))))
+
+; ── the showcase: analysis on the raised tier ───────────────────────────
+
+(defn arith-ops
+  "Every numeric-tower op in a RAISED tree, in evaluation order — the
+   one-clause version of what termination.bl's arithmetic-image and the
+   linear recogniser each re-derived from the raw scaffold. On the raised
+   tier the dispatch has not happened yet, so there is nothing to know."
+  [n]
+  (if (and (ir/node? n) (= :arith (:op n)))
+    (concat (mapcat arith-ops (:args n)) (list (:fun n)))
+    (mapcat arith-ops (ir/child-nodes n))))
+
+(defn arith-image
+  "BUG-062's growth-classifier need, stated on the raised tier: the BIF a
+   node computes with, or nil. One clause replaces the scaffold unwrap —
+   and it cannot rot, because the scaffold is not here."
+  [n]
+  (cond
+    (and (ir/node? n) (= :arith (:op n))) (:bif n)
+    (and (ir/node? n) (= :remote (:op n))) (:fun n)
+    :else nil))
