@@ -45,4 +45,56 @@ defmodule BeamLisp.SunsetGateTest do
     |> String.split("\n")
     |> Enum.any?(fn line -> Regex.match?(~r/^\s*defmodule\s+#{Regex.escape(mod)}\s+do/, line) end)
   end
+  # ── the workaround ecosystem (PLAN-121/123) must not return ──
+  #
+  # The single serial worker is gone, and so is everything that compensated for
+  # it. These tokens naming that scaffolding must not reappear in daemon code —
+  # if one does, a serial-worker assumption has crept back in.
+  @banned_tokens [
+    "owns_process",
+    "owns-process?",
+    "refuse_owning",
+    "Attach::Busy",
+    "ready_busy",
+    "DaemonMode::Queue",
+    "BL_DAEMON=queue"
+  ]
+
+  @daemon_src [
+    Path.expand("../../lib/beam_lisp/daemon", __DIR__),
+    Path.expand("../../tooling/drop/src", __DIR__)
+  ]
+
+  test "no workaround-ecosystem token reappears in daemon source" do
+    files =
+      @daemon_src
+      |> Enum.flat_map(fn dir -> Path.wildcard(Path.join(dir, "**/*.{ex,rs}")) end)
+
+    offenders =
+      for file <- files,
+          token <- @banned_tokens,
+          line <- lines_with(file, token),
+          # allow a comment that documents the REMOVAL (names the token to say
+          # it is gone) — only a real code use is a regression.
+          not documents_removal?(line),
+          do: {token, Path.basename(file), String.trim(line)}
+
+    assert offenders == [],
+           "workaround tokens reappeared in daemon source (the serial worker is gone):\n" <>
+             Enum.map_join(offenders, "\n", fn {tok, f, l} -> "  #{tok}  ← #{f}: #{l}" end)
+  end
+
+  defp lines_with(file, token) do
+    file |> File.read!() |> String.split("\n") |> Enum.filter(&String.contains?(&1, token))
+  end
+
+  # A line that mentions a token only to say it was removed (a `//` or `#`
+  # comment containing "gone", "removed", "no ", "PLAN-121", etc.) is allowed.
+  defp documents_removal?(line) do
+    trimmed = String.trim(line)
+    comment? = String.starts_with?(trimmed, "#") or String.starts_with?(trimmed, "//") or
+                 String.starts_with?(trimmed, "///")
+    comment? and Regex.match?(~r/gone|removed|no longer|deleted|PLAN-12[13]|there is no|never busy/i, line)
+  end
+
 end
