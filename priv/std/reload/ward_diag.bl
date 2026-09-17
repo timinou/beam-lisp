@@ -1,0 +1,496 @@
+; reload/ward_diag.bl — the contamination ledger: what a test file could have
+; read that the file did not create.
+;
+; A file that PASSES alone and FAILS in the suite is the signature of state
+; shared across files (BUG-041). ward forks the var registry per file, and the
+; fixes extend that to the mailbox and the analyzer memos — but a run leaves no
+; TRACE of what crossed. This ledger is that trace. At each file's boundaries it
+; looks at the surfaces a fork does NOT own, and records what the file could
+; have read without having written it:
+;
+;   surface     what is inspected                      a finding means
+;   ───────     ─────────────────                      ───────────────
+;   mailbox     this process's message queue            a message arrived the
+;               (process_info(self,:messages))          runner did not send
+;                                                       itself
+;   os-env      the process environment                 a variable stayed in the
+;               (System/put_env is node-global)         VM past the file that
+;                                                       set it
+;   <memo>      a registered VM-global memo              a key carries no env-id,
+;               (lsp/analyzed, lsp/growth,              so ANY fork can read the
+;               lsp/diagnostics, + register! yours)     entry some env wrote
+;
+; Every finding names its SURFACE, the FILE it was observed under, and the KEY
+; (for a memo) or the variable/message (otherwise) — the three things a reader
+; needs to go look. Env ids render as e1, e2 … so a finding reads as prose; the
+; raw id is not printed because a ref is not a name.
+;
+; DEV-ONLY, and OFF unless `bl test --diagnose` installs the observer: with no
+; observer nothing in this file runs, and a run whose state never crossed a
+; boundary prints nothing at all.
+;
+; What it CANNOT see, stated rather than hidden: the FORK's own mailbox. The
+; worker dies with its mailbox, so what is observable is the RUNNER's queue —
+; which is also the queue a test would share if worker isolation regressed.
+; A memo entry whose key IS env-scoped is reported as retained, never as a leak:
+; the scope is what makes it unreachable, and calling that a leak would be noise.
+
+(ns reload.ward-diag
+  "The contamination ledger for `bl test --diagnose` (BUG-041, observability).")
+
+;; ── surfaces: the VM-global memos a fork does not own ─────────────────────
+
+(def ^:private registry
+  "Watched surfaces, as [name entries] pairs — a LIST, not a map. An empty
+   beam-lisp map is a term `vec` and `keys` do not accept (measured: both raise
+   `no function clause matches`), and a ledger that holds NOTHING must be as
+   ordinary as one that holds something."
+  (atom []))
+
+(defn register!
+  "Watch the VM-global memo `name`. `entries` returns the memo's live entries as
+   [{:key k :owner env-id}], where `:owner` is the env that wrote the entry when
+   the key says so and nil when the key carries no env (the pre-BUG-041 shape).
+   Returns `name`.
+
+   Public because a surface is a thing, and this is where you say so: the
+   analyzer's memos register themselves below, and a test or a dev session can
+   watch one of its own without editing this file."
+  [name entries]
+  (swap! registry
+         (fn [rs]
+           (conj (vec (remove (fn [p] (= name (get p 0))) rs)) [name entries])))
+  name)
+
+(defn registered
+  "The watched surfaces' names, sorted."
+  []
+  (vec (sort (map (fn [p] (get p 0)) (deref registry)))))
+
+(defn- watched
+  "The watched surfaces as [name entries] pairs."
+  []
+  (deref registry))
+
+(defn- env-id?
+  "Whether `x` is an env id: `:global` (the zero env) or a fork's `{:env, ref}`."
+  [x]
+  (or (= :global x)
+      (and (erlang/is_tuple x)
+           (> (erlang/tuple_size x) 1)
+           (= :env (erlang/element 1 x)))))
+
+(defn- key-owner
+  "The env that wrote a memo entry, read from the entry's KEY — BUG-041's fix IS
+   the key: `[env-id sha]` scopes an entry to the fork that built it. A key of
+   any other shape carries no env: nil, and its surface is unscoped."
+  [k]
+  (when (and (vector? k) (>= (count k) 2) (env-id? (get k 0)))
+    (get k 0)))
+
+(def ^:private labels (atom {}))
+(def ^:private label-count (atom 0))
+
+(defn- env-label
+  "A short stable name for an env id (`e1`, `e2`) so a finding reads as prose.
+   Interned because the SAME foreign env must read the same across findings."
+  [e]
+  (if (= :global e)
+    "global"
+    (let [k (pr-str e)]
+      (or (get (deref labels) k)
+          (let [n (swap! label-count (fn [n] (inc n)))
+                label (str "e" n)]
+            (swap! labels assoc k label)
+            label)))))
+
+(def ^:private analyzer-memos
+  "lsp's content memos, the surfaces BUG-041 was about. Read by name so this
+   file does not require lsp: an image without the analyzer simply watches
+   nothing, and `bl test` on a corpus that never loads lsp pays nothing."
+  [["lsp/analyzed" "analyzed-cache"]
+   ["lsp/growth" "growth-cache"]
+   ["lsp/diagnostics" "diagnostics-cache"]])
+
+(defn- memo-cell
+  "lsp's memo atom for `var`, or nil when lsp is not loaded. The ledger PEEKS at
+   the memo through the env, deliberately: the memo's owner is lsp, and a
+   diagnostic that had to edit lsp — or that broke when lsp moved a private def —
+   would be a second thing to keep in step. A var that is not there is a surface
+   that is not watched, never an error."
+  [var]
+  (let [r (BeamLisp.Env/fetch "lsp" var)]
+    (if (= :error r) nil (erlang/element 2 r))))
+
+(defn- memo-entries
+  "One memo's live entries: {:key k :owner env-id|nil}. Each cache holds
+   [k v] pairs newest-first, so an entry's key is element 0 of the pair."
+  [var]
+  (let [cell (memo-cell var)]
+    (if (nil? cell)
+      []
+      (map (fn [pair]
+             (let [k (get pair 0)]
+               {:key k :owner (key-owner k)}))
+           (deref cell)))))
+
+(defn watch-analyzer!
+  "Register the analyzer's memos as watched surfaces when lsp is in the image.
+   Idempotent, and safe to call before lsp is loaded (it then registers nothing);
+   called again at every file boundary, so a file that loads lsp mid-run is
+   watched from the next file on."
+  []
+  (doseq [pair analyzer-memos]
+    (let [var (get pair 1)]
+      (when (some? (memo-cell var))
+        (register! (get pair 0)
+                   (let [v var] (fn [] (memo-entries v))))))))
+
+;; ── the three surfaces, observed ───────────────────────────────────────────
+
+(defn- messages
+  "This process's message queue. `process_info` does not CONSUME, so a finding
+   never steals a message from the code that owns it."
+  []
+  (erlang/element 2 (erlang/process_info (erlang/self) :messages)))
+
+(defn- ward-message?
+  "ward's own result handoff — the one message the runner legitimately receives
+   while a file runs (`run-file`'s worker sends it)."
+  [m]
+  (and (vector? m) (= :ward-result (get m 0))))
+
+(defn- daemon-tuple?
+  "The daemon protocol is BEAM TUPLES (`{:\"$gen_call\", …}`, `{:run, port, …}`)
+   — the shapes a test's `receive` used to catch. Recognised separately from a
+   bl-level message because when the RUNNER is the daemon's worker they are its
+   normal traffic, not a test's."
+  [m]
+  (and (not (vector? m)) (erlang/is_tuple m)))
+
+(defn- daemon-executor?
+  "Whether this process IS the daemon's executor — the runner whose mailbox
+   legitimately carries daemon protocol traffic in a warm session."
+  []
+  (= (erlang/self) (erlang/whereis :"Elixir.BeamLisp.Daemon.Executor")))
+
+(defn- env-names
+  "The whole process environment's NAMES. `:os.getenv/0` answers \"NAME=VALUE\"
+   per variable; a value may hold `=` itself, so only the first one separates."
+  []
+  (into #{}
+        (map (fn [kv]
+               (let [kv (erlang/list_to_binary kv)]
+                 (subs kv 0 (index-of kv "="))))
+             (erlang/apply :os :getenv (list)))))
+
+(defn- msg-tag
+  "What a message calls itself: the head of a bl vector, the tag of a BEAM tuple,
+   or the message itself when it is neither."
+  [m]
+  (cond
+    (vector? m)        (get m 0)
+    (daemon-tuple? m)  (erlang/element 1 m)
+    :else              m))
+
+(defn- msg-from
+  "Best-effort sender: a protocol message carries the caller inside itself
+   (`{:\"$gen_call\", {pid, ref}, …}`); a bl message names one only when its
+   second element IS a process. nil when the message names no process — a bare
+   `[:tag 1]` is a tag and a payload, not a tag and a sender."
+  [m]
+  (cond
+    (and (daemon-tuple? m)
+         (> (erlang/tuple_size m) 1)
+         (erlang/is_tuple (erlang/element 2 m)))
+      (let [p (erlang/element 1 (erlang/element 2 m))]
+        (when (erlang/is_pid p) p))
+    (and (vector? m) (>= (count m) 2) (erlang/is_pid (get m 1))) (get m 1)
+    :else nil))
+
+(def ^:private state
+  "The ledger itself: the boundary snapshots and the findings folded from them.
+   One atom because the observer is called from the runner's process and the
+   report is read from it — no second lifetime to keep in step."
+  (atom {:on? false :deep false :runner nil
+         :mailbox [] :env #{} :keys {}
+         :findings [] :files 0}))
+
+(defn- surface-keys
+  "Every watched entry's key, per surface, as its printed form — the snapshot a
+   file's writes are diffed against."
+  []
+  (reduce (fn [m pair]
+            (let [es ((get pair 1))]
+              (assoc m (get pair 0)
+                       (into #{} (map (fn [e] (pr-str (:key e))) es)))))
+          {}
+          (watched)))
+
+(defn- mail-finding
+  "One message from the runner's queue as a finding. `:ambient` when the runner
+   is the daemon's executor and the message is that protocol (its normal
+   traffic); `:warning` otherwise — a message no part of ward sent."
+  [file m]
+  (let [ambient (and (daemon-tuple? m) (daemon-executor?))
+        from (msg-from m)]
+    {:surface :mailbox
+     :class (if ambient :ambient :warning)
+     :kind :received
+     :file file
+     :tag (msg-tag m)
+     :from from
+     :alive? (if (erlang/is_pid from) (Process/alive? from) nil)
+     :message (pr-str m)}))
+
+(defn- memo-findings
+  "What this file's memo boundaries say. Two things, both about the KEY:
+
+   1. a surface whose keys carry NO env-id is readable from every fork — the
+      leak BUG-041 fixed for the analyzer, still a leak wherever it remains.
+      That is a warning, and it names the surface, the key, and the env that
+      wrote it when the surface knows.
+   2. entries that APPEARED while this file ran: the file wrote into a
+      VM-global memo. Informational for a scoped surface (the key keeps it to
+      this fork); for an unscoped one the first clause already warns."
+  [file before]
+  (mapcat
+    (fn [pair]
+      (let [name (get pair 0)
+            es ((get pair 1))
+            ; A surface first seen HERE (this file is what loaded the library
+            ; that owns it) has no start snapshot to diff against: its entries
+            ; are REPORTED, never claimed as this file's writes — an observation
+            ; we did not make is not one we may assert.
+            fresh (if (contains? before name)
+                    (remove (fn [e] (contains? (get before name) (pr-str (:key e)))) es)
+                    [])
+            unscoped (filter (fn [e] (nil? (:owner e))) es)
+            written (if (empty? unscoped) fresh [])
+            warn-rows (map (fn [e]
+                             {:surface name :class :warning :kind :unscoped :file file
+                              :key (:key e) :owner (:owner e)})
+                           unscoped)
+            write-rows (map (fn [e]
+                              {:surface name :class :info :kind :write :file file
+                               :key (:key e) :owner (:owner e)})
+                            written)]
+        (concat warn-rows write-rows)))
+    (watched)))
+
+(defn file-start!
+  "Record the state a file BEGINS against — the runner's identity, its mailbox,
+   the process environment, and every watched memo's keys. Public so a test can
+   drive the ledger's two boundaries without a runner."
+  [ns]
+  (watch-analyzer!)
+  (swap! state (fn [s]
+                 (assoc s
+                        :runner (or (:runner s) (erlang/self))
+                        :mailbox (messages)
+                        :env (env-names)
+                        :keys (surface-keys))))
+  ns)
+
+(defn file-done!
+  "Fold one file's boundaries into findings: what arrived, what leaked, what was
+   written. Public for the same reason as `file-start!`."
+  [ns]
+  ; Also HERE: the file that LOADS lsp is the file that creates the analyzer's
+  ; memos, so a memo can appear mid-run — and if the boundary after it did not
+  ; look, the one file that filled them would be the one file not watched.
+  (watch-analyzer!)
+  (let [s (deref state)
+        seen (into #{} (map (fn [m] (pr-str m)) (:mailbox s)))
+        fresh-mail (remove (fn [m] (or (ward-message? m)
+                                       (contains? seen (pr-str m))))
+                           (messages))
+        env-now (env-names)
+        leaked (remove (fn [v] (contains? (:env s) v)) env-now)]
+    (swap! state
+           (fn [st]
+             (assoc st
+                    :files (inc (:files st))
+                    :findings
+                    (into (:findings st)
+                          (concat
+                            (map (fn [m] (mail-finding ns m)) fresh-mail)
+                            (map (fn [v] {:surface :os-env :class :warning
+                                          :kind :leak :file ns
+                                          :var v :value (System/get_env v)})
+                                 leaked)
+                            (memo-findings ns (:keys s))))))))
+  ns)
+
+(defn watch!
+  "Turn the ledger on: from here on `file-start!` / `file-done!` record findings
+   and `report` renders them. `opts {:deep true}` also asks for the per-surface
+   counters (and every key). Public so a dev session or a test can drive the two
+   boundaries without a runner; `observer` calls this for `bl test --diagnose`."
+  [opts]
+  (swap! state (fn [s] (assoc s :on? true :deep (get opts :deep false))))
+  nil)
+
+(defn observer
+  "The ward `on-event` callback. Install with `(ward/run sources (observer))`;
+   every file's boundaries are then recorded in the ledger, and `report` renders
+   them. `opts {:deep true}` asks for the per-surface counters (and every key)
+   as well as the warnings.
+
+   Guarded end to end: a ledger that threw would be a new way for a test run to
+   fail, which is the opposite of the point."
+  ([] (observer {}))
+  ([opts]
+   (watch! opts)
+   (fn [ev]
+     (try
+       (cond
+         (= :file-start (:phase ev)) (file-start! (:ns ev))
+         (= :file-done (:phase ev))  (file-done! (:ns ev))
+         :else nil)
+       (catch _ nil)))))
+
+(defn runner
+  "The process that installed the observer — the one whose mailbox findings
+   name. A test file can read it to prove a message reaches the runner's queue."
+  []
+  (:runner (deref state)))
+
+;; ── rendering ──────────────────────────────────────────────────────────────
+
+(defn findings
+  "Every finding this run recorded, in file order."
+  []
+  (vec (:findings (deref state))))
+
+(defn warnings
+  "The findings that name a leak: a message the runner did not send itself, a
+   variable a file left in the VM, or a memo key with no env-id in it."
+  []
+  (vec (filter (fn [f] (= :warning (:class f))) (:findings (deref state)))))
+
+(defn summary
+  "The ledger as a JSON-safe map — what `bl test --diagnose --json` reports. It
+   carries counts and NAMES (surface, file, key/message), never a pid or a raw
+   env ref: a machine that reads this wants to point a human at state, and a
+   ref is not pointing."
+  []
+  (let [ws (warnings)]
+    {:watched (:files (deref state))
+     :warnings (count ws)
+     :surfaces (vec (distinct (map (fn [f] (str (:surface f))) ws)))
+     :files (vec (distinct (map (fn [f] (str (:file f))) ws)))
+     :details (vec (map (fn [f]
+                          {:surface (str (:surface f))
+                           :file (str (:file f))
+                           :key (key-text (or (:key f) (:var f) (:tag f)))})
+                        ws))}))
+
+(defn- file-name [f] (or (:file f) "?"))
+
+(defn- key-text
+  "A key as text, with any env id in it replaced by its short label: a raw
+   `#Reference<…>` names nothing, and the label is what a finding already uses."
+  [k]
+  (if (vector? k)
+    (join " " (map (fn [x] (if (env-id? x) (env-label x) (pr-str x))) k))
+    (pr-str k)))
+
+(defn- warning-line
+  "One warning as a terminal line: the surface, the file, and the key — what a
+   reader needs to go look. The surface names the KIND of state, which is what
+   picks the fix (narrow the receive, restore the env, scope the key)."
+  [f]
+  (cond
+    (= :mailbox (:surface f))
+    (str "  ⚠ mailbox     " (file-name f) " — the runner received a message it "
+         "did not send: " (:message f)
+         (if (some? (:from f))
+           (str "  (from " (pr-str (:from f))
+                (if (= false (:alive? f)) ", dead" "") ")")
+           ""))
+
+    (= :os-env (:surface f))
+    (str "  ⚠ os-env      " (file-name f) " — $" (:var f) " was still set after "
+         "the file ran (value " (pr-str (:value f)) "); it belongs to the NEXT file")
+
+    :else
+    (str "  ⚠ memo        " (file-name f) " — " (:surface f) " key "
+         (key-text (:key f)) " carries no env-id"
+         (if (some? (:owner f))
+           (str " (written by " (env-label (:owner f)) ")")
+           "")
+         "; any fork can read it")))
+
+(defn- surface-line
+  "One watched surface's counters, and — with deep? — every key it holds."
+  [deep? pair]
+  (let [name (get pair 0)
+        es ((get pair 1))
+        n (count es)
+        owners (vec (distinct (remove (fn [o] (nil? o)) (map (fn [e] (:owner e)) es))))]
+    (join "\n"
+      (concat
+        [(str "  " name "   " n " entr" (if (= 1 n) "y" "ies")
+              (cond
+                (zero? n)                    ""
+                (empty? owners)              "  (no env in the key — unscoped)"
+                :else                        (str "  env-scoped: " (join ", " (map env-label owners)))))]
+        (if deep?
+          (map (fn [e] (str "      " (key-text (:key e))))
+               es)
+          [])))))
+
+(defn- write-line
+  "The entries a file ADDED to a watched surface: the file wrote VM-global memo
+   state, named by key. Informational — with an env-scoped key it stays in the
+   fork, and an unscoped surface has already warned."
+  [f]
+  (str "  · " (file-name f) " wrote " (:surface f) " " (key-text (:key f))
+       (if (some? (:owner f)) (str "  (" (env-label (:owner f)) ")") "")))
+
+(defn report
+  "The ledger as text, or nil when there is nothing to say — a clean run prints
+   NOTHING. Warnings always render; with deep? the per-surface counters, the
+   entries each file WROTE, and every key render too. Returns the text; the
+   caller prints it."
+  []
+  (let [s (deref state)
+        warns (warnings)
+        writes (vec (filter (fn [f] (= :info (:class f))) (:findings s)))
+        deep? (:deep s)]
+    (if (and (empty? warns) (not deep?))
+      nil
+      (join "\n"
+        (concat
+          ["── ward: contamination ledger ──" ""]
+          (if (empty? warns)
+            ["  ✓ no state crossed a file boundary"]
+            (map warning-line warns))
+          [""]
+          (if-not deep?
+            []
+            (concat
+              ["  watched surfaces:"]
+              (if (empty? (watched))
+                ["    (none loaded — nothing in this run registered a shared memo)"]
+                (map (fn [pair] (surface-line deep? pair)) (watched)))
+              [""]
+              (if (empty? writes)
+                []
+                (concat ["  memo writes this run:"]
+                        (map write-line writes)
+                        [""]))))
+          [(str "  " (:files s) " file(s) watched, " (count warns) " warning(s)")])))))
+
+(defn clear!
+  "Forget everything — the surfaces, the labels, the ledger. For a test that
+   needs a known-empty ledger, and for a long-lived dev session."
+  []
+  (reset! registry [])
+  (reset! labels {})
+  (reset! label-count 0)
+  (reset! state {:on? false :deep false :runner nil
+                 :mailbox [] :env #{} :keys {}
+                 :findings [] :files 0})
+  nil)
