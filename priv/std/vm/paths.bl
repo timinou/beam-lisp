@@ -1,0 +1,151 @@
+; vm/paths.bl — filesystem identity for a bl daemon (ports Daemon.Paths).
+;
+; ══ WHAT MOVED HERE (FUP-082 T2/D1) ═════════════════════════════════════════
+;
+; The daemon's on-disk identity — tree id, runtime dir, endpoint paths — is
+; pure fs + crypto + string arithmetic. It lives in `vm.*` (not `bl.*`) because
+; it is reusable substrate: any host that binds a per-tree socket wants it, not
+; only the CLI. The tree id + fingerprint MUST match the Rust launcher's copy
+; (daemon.rs tree_id/tree_fingerprint) and the old Elixir Paths byte-for-byte,
+; or a client looks for the daemon in the wrong place — golden-tested.
+;
+;   (paths/tree-id root)        → "57461829a20cc2af"  (16 hex of sha256(realpath))
+;   (paths/fingerprint root)    → the 32-byte sha256 (the hello :tree field)
+;   (paths/runtime-dir)         → {:ok dir} | {:error …}  (0700, owned, XDG)
+;   (paths/endpoints root)      → {:ok {:tree-id :sock :token :pid :meta :lock}}
+;   (paths/resolve-root cwd)    → {:ok root} | {:error :no-root}
+
+(ns vm.paths)
+
+(def TREE-ID-LEN 16)
+
+(defn- real-path
+  "realpath via readlink chasing; falls back to expand when the path is absent."
+  [path]
+  (let [r (erlang/apply :file :read_link_all (list (erlang/binary_to_list path)))]
+    (if (and (erlang/is_tuple r) (= :ok (elem r 0)))
+      (let [target (erlang/list_to_binary (elem r 1))
+            abs (if (= :absolute (erlang/apply :filename :pathtype (list target)))
+                  target
+                  (erlang/apply :filename :join
+                    (list (erlang/apply :filename :dirname (list path)) target)))]
+        (real-path (erlang/apply :filename :absname (list abs))))
+      (erlang/apply :filename :absname (list path)))))
+
+(defn- canonical [root]
+  (if (File/exists? root) (real-path root) (erlang/apply :filename :absname (list root))))
+
+(defn fingerprint
+  "The 32-byte sha256 of `root`'s real path — the hello :tree field."
+  [root]
+  (erlang/apply :crypto :hash (list :sha256 (canonical root))))
+
+(defn tree-id
+  "The canonical 16-hex tree id for `root` (filenames use this)."
+  [root]
+  (erlang/apply :string :lowercase
+    (list (erlang/apply :binary :part
+            (list (erlang/apply :binary :encode_hex (list (fingerprint root))) 0 TREE-ID-LEN)))))
+
+;; ── the user's real uid (probe once, memoise) ───────────────────────────────
+
+(defn- probe-uid []
+  (let [path (str (erlang/apply :filename :basedir (list :user_cache "beam_lisp"))
+                  "/uid-probe-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! (erlang/apply :filename :dirname (list path)))
+    (File/write! path "")
+    (let [info (erlang/apply :file :read_file_info (list (erlang/binary_to_list path)))
+          uid (if (and (erlang/is_tuple info) (= :ok (elem info 0)))
+                (elem (elem info 1) 12)   ; file_info: uid is element 12 (0-indexed)
+                0)]
+      (File/rm path)
+      uid)))
+
+(defn- current-uid []
+  (let [override (System/get_env "BL_TEST_UID")]
+    (if (and (string? override) (not= override ""))
+      (erlang/binary_to_integer override)
+      (let [cached (erlang/apply :persistent_term :get (list (tuple :vm-paths :uid) :undefined))]
+        (if (= cached :undefined)
+          (let [uid (probe-uid)]
+            (erlang/apply :persistent_term :put (list (tuple :vm-paths :uid) uid))
+            uid)
+          cached)))))
+
+;; ── the runtime dir (0700, owned, XDG-preferred) ────────────────────────────
+
+(defn- ensure-secure-dir [dir]
+  (let [info (erlang/apply :file :read_link_info (list (erlang/binary_to_list dir)))]
+    (cond
+      (and (erlang/is_tuple info) (= :ok (elem info 0)))
+        (let [fi (elem info 1)
+              type (elem fi 2) mode (elem fi 7) uid (elem fi 12)]
+          (cond
+            (not= type :directory) {:error (tuple :not_a_directory dir)}
+            (not= uid (current-uid)) {:error (tuple :wrong_owner dir uid)}
+            (not= 0 (erlang/band mode 63)) (do (File/chmod dir 448) :ok)  ; 0o077 mask, tighten to 0o700
+            :else :ok))
+      (and (erlang/is_tuple info) (= :error (elem info 1)) (= :enoent (elem info 1)))
+        (do (File/mkdir_p! dir) (File/chmod dir 448) :ok)
+      ;; enoent may arrive as {:error :enoent}
+      (and (erlang/is_tuple info) (= :error (elem info 0)))
+        (if (= :enoent (elem info 1))
+          (do (File/mkdir_p! dir) (File/chmod dir 448) :ok)
+          {:error (tuple :stat_failed dir (elem info 1))})
+      :else {:error (tuple :stat_failed dir info)})))
+
+(defn runtime-dir
+  "The user-owned 0700 runtime dir holding this user's daemon endpoints.
+   Prefers $XDG_RUNTIME_DIR/beam_lisp, else /tmp/beam_lisp-<uid>."
+  []
+  (let [xdg (System/get_env "XDG_RUNTIME_DIR")
+        base (if (and (string? xdg) (not= xdg ""))
+               (str xdg "/beam_lisp")
+               (str (erlang/apply :filename :basedir (list :user_cache ""))
+                    "/../beam_lisp-" (current-uid)))]
+    ;; normalise the tmp fallback to the real tmp dir
+    (let [base (if (and (string? xdg) (not= xdg ""))
+                 base
+                 (str "/tmp/beam_lisp-" (current-uid)))
+          r (ensure-secure-dir base)]
+      (if (= :ok r) {:ok base} r))))
+
+(defn endpoints
+  "The endpoint path set for `root`: {:tree-id :sock :token :pid :meta :lock}.
+   Fails if the runtime dir cannot be secured or the socket path is too long."
+  [root]
+  (let [rd (runtime-dir)]
+    (if (nil? (:ok rd))
+      rd
+      (let [dir (:ok rd)
+            id (tree-id root)
+            sock (str dir "/" id ".sock")]
+        (if (> (erlang/byte_size sock) 100)
+          {:error (tuple :socket_path_too_long sock)}
+          {:ok {:tree-id id
+                :sock sock
+                :token (str dir "/" id ".token")
+                :pid (str dir "/" id ".pid")
+                :meta (str dir "/" id ".meta")
+                :lock (str dir "/" id ".start")}})))))
+
+;; ── root resolution ─────────────────────────────────────────────────────────
+
+(defn- tree-root? [dir]
+  (or (File/exists? (str dir "/priv/boot/core.bl"))
+      (and (File/exists? (str dir "/bin/bl")) (File/dir? (str dir "/releases")))))
+
+(defn- find-root [dir]
+  (cond
+    (tree-root? dir) {:ok (real-path dir)}
+    (or (= dir "/") (= dir ".")) {:error :no-root}
+    :else (find-root (erlang/apply :filename :dirname (list dir)))))
+
+(defn resolve-root
+  "The daemon root for `cwd`: the nearest ancestor that looks like a bl tree.
+   BL_DAEMON_ROOT overrides. Returns {:ok root} | {:error :no-root}."
+  [cwd]
+  (let [override (System/get_env "BL_DAEMON_ROOT")]
+    (if (and (string? override) (not= override ""))
+      {:ok (real-path override)}
+      (find-root (erlang/apply :filename :absname (list cwd))))))
