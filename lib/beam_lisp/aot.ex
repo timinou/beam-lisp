@@ -717,10 +717,17 @@ defmodule BeamLisp.AOT do
         end)
 
     native_ops =
-      case BeamLisp.Native.declaration(ns) do
+      # PLAN-122: the declaration registry + declare policy are beam-lisp
+      # (vm.native). AOT reads the same VM-wide ETS table and emits a replay
+      # call to the bl declare — ensure_loaded first so the policy ns exists in
+      # the fresh VM before a consumer's __bl_init__ runs it.
+      case native_declaration(ns) do
         nil -> []
         {crate, signatures} ->
-          [Emit.remote(BeamLisp.Native, :declare, Enum.map([ns, crate, signatures], &Emit.lit/1))]
+          [
+            Emit.remote(BeamLisp.Loader, :ensure_loaded, [Emit.lit("vm.native")]),
+            Emit.remote(BeamLisp.Ns.Vm.Native, :declare, Enum.map([ns, crate, signatures], &Emit.lit/1))
+          ]
       end
 
     fn_ops =
@@ -782,6 +789,21 @@ defmodule BeamLisp.AOT do
       )
 
     {Emit.function_clause(:__bl_init__, body), companion_descriptor}
+  end
+
+  # The native declaration for `ns` straight from vm.native's VM-wide ETS table
+  # ({{:native, ns}, {crate, signatures}}), or nil. Read here rather than through
+  # the bl `vm.native/declaration` so the AOT emitter needs no bl module loaded
+  # at build time — the table is populated by `defnative`'s own eval-time declare.
+  defp native_declaration(ns) do
+    case :ets.whereis(:beam_lisp_native_declarations) do
+      :undefined -> nil
+      _ ->
+        case :ets.lookup(:beam_lisp_native_declarations, {:native, ns}) do
+          [{_, {crate, signatures}}] -> {crate, signatures}
+          _ -> nil
+        end
+    end
   end
 
   defp compile_initializer(form, env) do

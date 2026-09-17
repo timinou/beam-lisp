@@ -13,7 +13,7 @@ defmodule BeamLisp.PerfProbe do
 
   # Owned by the pinned Loader.Server so a probe table created inside a
   # short-lived process (a parallel-build worker, an async test fork) does
-  # not vanish with it. See BeamLisp.Native.table/0.
+  # not vanish with it. See vm.native (the declarations ETS table).
   defp tab do
     case :ets.whereis(@tab) do
       :undefined ->

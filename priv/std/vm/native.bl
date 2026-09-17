@@ -1,0 +1,361 @@
+; vm/native.bl — defnative's policy, in beam-lisp.
+;
+; ══ WHAT MOVED HERE (FUP-082 T3, PLAN-122) ══════════════════════════════════
+;
+; A NIF is substrate; the DECLARATION that one exists is not. `defnative`
+; (a compiler macro) lowers onto `vm.native/declare`, which:
+;   1. synthesizes a host BEAM module named after the ns (the rustler::init!
+;      contract), with an @on_load that loads the crate + one nif_error stub
+;      per signature — via the pure-bl module synthesis toolkit (anf + lower),
+;      no BeamLisp.Emit, no Elixir policy;
+;   2. links each name into the ns as an ordinary var (callable AND a value);
+;   3. records the declaration so AOT can replay it into emitted modules.
+;
+; This lives in `vm.*` (not `bl.*`) because `defnative` is used far outside the
+; CLI — every native-backed library (datom stores, wry, code/embed) declares
+; through it. It is runtime substrate, reusable by any host.
+;
+; The Rust artifact stays; ONLY this policy is beam-lisp now. The irreducible
+; substrate is three BIFs: erlang/load_nif, code/ensure_loaded, and the
+; anf→core→beam synthesis (all of which bl already drives).
+
+(ns vm.native
+  (:require [anf] [lower]))
+
+(defn- rep-bin
+  "erlang:string:replace with :all returns IODATA (a list); flatten to a binary."
+  [s a b]
+  (erlang/apply :erlang :iolist_to_binary
+    (list (erlang/apply :string :replace (list s a b :all)))))
+
+;; ── the declarations registry ───────────────────────────────────────────────
+;;
+;; VM-wide state that must OUTLIVE whichever process first declared a native:
+;; a parallel-build worker declaring, then exiting, must not drop the row (that
+;; is BUG-021 — a module then AOT-emits WITHOUT its native replay, silently).
+;; So the table is created inside the pinned Loader.Server, whose lifetime is
+;; the VM's, exactly as native.ex did.
+
+(def TABLE :beam_lisp_native_declarations)
+
+(defn- ensure-table []
+  (if (= :undefined (erlang/apply :ets :whereis (list TABLE)))
+    (BeamLisp.Loader.Server/run
+      (fn []
+        (try
+          (erlang/apply :ets :new
+            (list TABLE (list :named_table :public :set (tuple :read_concurrency true))))
+          (catch _ :ok))
+        TABLE))
+    TABLE))
+
+;; ── the host-module name: THE contract with rustler::init! ──────────────────
+;;
+;; `datom.store-fjall` → `Elixir.BeamLisp.Native.Datom.StoreFjall`. This MUST
+;; match the string each crate passes to rustler::init! at compile time, or
+;; load_nif returns {:bad_lib}. Ported character-for-character from native.ex:
+;; split on ".", each segment: replace "-"→"_" then CamelCase, join under
+;; BeamLisp.Native.
+
+(defn- camelize
+  "`store_fjall` → `StoreFjall`. Upcase the first char of each `_`-part, drop
+   the separators (the Macro.camelize rule native.ex used)."
+  [s]
+  (let [parts (erlang/apply :string :split (list s "_" :all))]
+    (erlang/apply :erlang :iolist_to_binary
+      (list (to-list (map (fn [p]
+                   (if (= p "")
+                     ""
+                     (str (erlang/apply :string :uppercase (list (erlang/apply :string :slice (list p 0 1))))
+                          (erlang/apply :string :slice (list p 1)))))
+                 parts))))))
+
+(defn host-module
+  "The BEAM module atom hosting `ns`'s NIF. THE rustler::init! contract."
+  [ns]
+  (let [segs (erlang/apply :string :split (list ns "." :all))
+        camel (map (fn [seg] (camelize (rep-bin seg "-" "_"))) segs)
+        joined (erlang/apply :erlang :iolist_to_binary
+                 (list (erlang/apply :lists :join (list "." (to-list camel)))))]
+    (erlang/binary_to_atom (str "Elixir.BeamLisp.Native." joined) :utf8)))
+
+(defn- snake
+  "kebab var name → snake NIF fname atom: `compare-and-swap` → `:compare_and_swap`."
+  [name]
+  (erlang/binary_to_atom (rep-bin name "-" "_") :utf8))
+
+;; ── lib-path resolution: consumer apps first, beam_lisp last ────────────────
+
+(defn- app-priv-dir [app]
+  (if (= app :beam_lisp)
+    (BeamLisp.Tiers/priv_root)
+    (let [d (erlang/apply :code :priv_dir (list app))]
+      (if (and (not (and (erlang/is_tuple d) (= :error (elem d 0))))
+               (File/dir? (erlang/apply :erlang :list_to_binary (list d))))
+        (erlang/apply :erlang :list_to_binary (list d))
+        nil))))
+
+(defn lib-path
+  "The extension-less path erlang/load_nif wants for `crate`. Searches every
+   loaded app's priv/native (consumers first, beam_lisp last); falls back to
+   beam_lisp's priv so a load error names a sensible location."
+  [crate]
+  (let [apps (erlang/apply :lists :map
+               (list (fn [a] (elem a 0))
+                     (erlang/apply :application :loaded_applications (list))))
+        others (erlang/apply :lists :filter (list (fn [a] (not= a :beam_lisp)) apps))
+        ordered (concat others (list :beam_lisp))
+        found (some (fn [app]
+                      (let [dir (app-priv-dir app)]
+                        (if (nil? dir)
+                          nil
+                          (let [p (str dir "/native/" crate)]
+                            (if (File/exists? (str p ".so")) p nil)))))
+                    ordered)]
+    (or found (str (BeamLisp.Tiers/priv_root) "/native/" crate))))
+
+(defn installed-path
+  "Where the built .so lives: priv/native/<crate>.so."
+  [crate]
+  (str (BeamLisp.Tiers/priv_root) "/native/" crate ".so"))
+
+;; ── warn on a failed load (a capability answer, not a crash) ────────────────
+
+(defn nif-load-failed [ns crate lib reason]
+  (BeamLisp.IO/warn
+    (str "the NIF for " ns " did not load: " (pr-str reason) "\n"
+         "  crate:   " crate "\n"
+         "  library: " lib ".so\n"
+         "  A \"Function not found\" reason means a declared name or arity\n"
+         "  disagrees with the crate; run `bl build` if it is simply missing.\n"))
+  :ok)
+
+;; ── host-module synthesis (the substrate seam: anf → core → beam) ───────────
+;;
+;; Builds a module with:
+;;   __load_nif__/0  — the @on_load target: erlang/load_nif(charlist, 0),
+;;                     on {:error, r} warn, else return the load result;
+;;   __nif_loaded__/0 — a stub the loaded NIF overwrites to return true;
+;;   <fname>/<arity>  — one nif_error stub per signature, overwritten at load.
+;; The on_load attribute value is a LIST [{fname,arity}] (a bare tuple crashes
+;; beam_ssa_opt — locked by spike).
+
+(defn- create-host [mod ns crate signatures]
+  (let [lib (lib-path crate)
+        charlist (erlang/binary_to_list lib)
+        ;; __load_nif__/0: case erlang:load_nif(charlist, 0) of ...
+        ;; on_load MUST return :ok even when the .so is absent — the module then
+        ;; loads with its nif_error stubs intact and available? answers false
+        ;; ("absent = absent"). We call load_nif for its SIDE EFFECT (installing
+        ;; the NIF when present) then discard the result and return :ok.
+        load-body
+        (anf/doo (list
+                  (anf/remote :erlang :load_nif (list (anf/lit charlist) (anf/lit 0)))
+                  (anf/lit :ok)))
+        load-clause {:op :defn-clause :fname :__load_nif__ :params (list)
+                     :guard nil :body load-body :ann {}}
+        stub-body (anf/remote :erlang :nif_error (list (anf/lit :nif_not_loaded)))
+        loaded-clause {:op :defn-clause :fname :__nif_loaded__ :params (list)
+                       :guard nil :body stub-body :ann {}}
+        stub-clauses (map (fn [sig]
+                            (let [fname (snake (first sig))
+                                  arity (second sig)
+                                  params (map (fn [i] {:pop :pvar :name (str "arg" i)})
+                                              (range 1 (inc arity)))]
+                              {:op :defn-clause :fname fname :params (apply list params)
+                               :guard nil :body stub-body :ann {}}))
+                          signatures)
+        exports (concat (list [:__nif_loaded__ 0])
+                        (map (fn [sig] [(snake (first sig)) (second sig)]) signatures))
+        desc (anf/module mod
+               (apply list (concat (list load-clause loaded-clause) stub-clauses))
+               (apply list exports)
+               (list [:on_load (list (tuple :__load_nif__ 0))]))]
+    (lower/reload-descriptor! desc)
+    mod))
+
+;; ── link a native name into the ns (callable + value) ───────────────────────
+
+(defn- link-var [ns mod name arity]
+  (let [fname (snake name)]
+    ;; put_link → the compiler emits a direct remote call (no dispatch cost);
+    ;; intern → the name is also a VALUE (passable to map, stored, applied).
+    (BeamLisp.Env/put_link ns name (tuple mod (assoc {} arity fname) nil))
+    (BeamLisp.Env/intern ns name (erlang/apply :erlang :make_fun (list mod fname arity)))))
+
+;; ── guards ──────────────────────────────────────────────────────────────────
+
+(defn- guard-duplicates! [ns signatures]
+  (let [names (map first signatures)
+        dupes (->> names frequencies (filter (fn [kv] (> (second kv) 1))) (map first))]
+    (when (not (empty? dupes))
+      (throw (ex-info (str "defnative in " ns ": "
+                           (erlang/apply :lists :join (list ", " dupes))
+                           " declared more than once") {:ns ns})))))
+
+(defn- guard-shadowing! [ns signatures]
+  (let [clashes (filter (fn [name]
+                          (let [r (BeamLisp.Env/fetch "core" name)]
+                            (and (erlang/is_tuple r) (= :ok (elem r 0)))))
+                        (map first signatures))]
+    (when (not (empty? clashes))
+      (throw (ex-info (str "defnative in " ns ": "
+                           (erlang/apply :lists :join (list ", " clashes))
+                           " would shadow core — prefix them (e.g. store-get)") {:ns ns})))))
+
+;; ── the public surface ──────────────────────────────────────────────────────
+
+(defn declare
+  "Declare that `ns` is backed by NIF crate `crate`. `signatures` is a list of
+   [name arity]. Synthesizes the host module, links each name, records the
+   declaration for AOT replay. Returns the host module atom. A VM-wide critical
+   section (per host module) guards concurrent same-ns loads."
+  [ns crate signatures]
+  (let [mod (host-module ns)]
+    (erlang/apply :global :trans
+      (list (tuple mod (erlang/self))
+            (fn []
+              (guard-duplicates! ns signatures)
+              (guard-shadowing! ns signatures)
+              ;; ensure_loaded → {:module,_}|{:error,_}; synth only when absent
+              (when (= :error (elem (erlang/apply :code :ensure_loaded (list mod)) 0))
+                (create-host mod ns crate signatures))
+              (ensure-table)
+              (erlang/apply :ets :insert
+                (list TABLE (tuple (tuple :native ns) (tuple crate signatures))))
+              (doseq [sig signatures] (link-var ns mod (first sig) (second sig)))
+              mod)))))
+
+(defn declaration
+  "The declaration for `ns` as {:crate c :sigs [[n a]…]}, or nil."
+  [ns]
+  (ensure-table)
+  (let [hits (erlang/apply :ets :lookup (list TABLE (tuple :native ns)))]
+    (if (empty? hits)
+      nil
+      (let [decl (elem (first hits) 1)]
+        {:crate (elem decl 0) :sigs (elem decl 1)}))))
+
+(defn declarations
+  "Every native declaration so far, as [{:ns … :crate … :sigs …} …]. AOT reads
+   this to replay declarations into the modules it emits."
+  []
+  (ensure-table)
+  (map (fn [row]
+         (let [ns (elem (elem row 0) 1)
+               decl (elem row 1)]
+           {:ns ns :crate (elem decl 0) :sigs (elem decl 1)}))
+       (erlang/apply :ets :match_object (list TABLE (tuple (tuple :native :_) :_)))))
+
+(defn available?
+  "Whether the NIF for `ns` loaded. A capability question — never raises. The
+   host stub raises; only the loaded NIF's __nif_loaded__ returns true."
+  [ns]
+  (let [mod (host-module ns)]
+    (try
+      (and (erlang/is_tuple (erlang/apply :code :ensure_loaded (list mod)))
+           (= :module (elem (erlang/apply :code :ensure_loaded (list mod)) 0))
+           (erlang/apply mod :__nif_loaded__ (list)))
+      (catch _ false))))
+
+;; ── the build: cargo in, cdylib out (folds native_task + cargo) ─────────────
+;;
+;; Boot-safe: only System/cmd + File, no language dependency — so bin/bl can
+;; call it before the prelude is fully interned (the lazy_memo crate must exist
+;; before LazySeq loads). When artefacts are current it costs a stat per crate;
+;; when cargo is absent it says so and returns, so a checkout with no toolchain
+;; still boots (natives read as ABSENT).
+
+(def NATIVE-DIR "native")          ; crate SOURCES, cwd-relative (project root)
+(def INSTALL-DIR "priv/native")    ; where the built .so is installed, cwd-relative
+
+(defn- nif-ext [] ".so")  ; every unix (macOS included) uses .so for erl_ddll
+
+(defn- cargo-target-dir
+  "cargo's target dir for `crate-dir` — ASKED, never assumed (CARGO_TARGET_DIR,
+   a .cargo/config, or a workspace all redirect it)."
+  [crate-dir]
+  (let [r (System/cmd "cargo"
+            (to-list ["metadata" "--format-version" "1" "--no-deps"])
+            (to-list [(tuple :cd crate-dir) (tuple :stderr_to_stdout true)]))]
+    (if (= 0 (elem r 1))
+      (let [m (erlang/apply :re :run
+                (list (elem r 0) "\"target_directory\"\\s*:\\s*\"([^\"]+)\""
+                      (to-list [(tuple :capture (to-list [1]) :binary)])))]
+        (if (and (erlang/is_tuple m) (= :match (elem m 0)))
+          (first (elem m 1))
+          (str crate-dir "/target")))
+      (str crate-dir "/target"))))
+
+(defn- built-cdylib
+  "The cdylib cargo produced for `crate` in `release-dir`, or nil."
+  [release-dir crate]
+  (some (fn [p] (if (File/exists? p) p nil))
+        (list (str release-dir "/lib" crate ".so")
+              (str release-dir "/lib" crate ".dylib")
+              (str release-dir "/" crate ".dll"))))
+
+(defn- crate-fresh?
+  "Is the installed .so newer than every source of the crate? (skip cargo)."
+  [crate crate-dir]
+  (let [dest (str INSTALL-DIR "/" crate (nif-ext))]
+    (if (not (File/exists? dest))
+      false
+      (let [mt (erlang/apply :filelib :last_modified (list (erlang/binary_to_list dest)))
+            built (if (and mt (erlang/is_tuple mt))
+                    (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt))
+                    0)
+            newest (crate-newest-source crate-dir)]
+        (< newest built)))))
+
+(defn- crate-newest-source [crate-dir]
+  ;; newest mtime among the crate's real sources
+  (let [globs (list "src/**/*.rs" "Cargo.toml" "Cargo.lock" ".cargo/config.toml")
+        files (mapcat (fn [g] (to-list (erlang/apply :filelib :wildcard
+                                          (list (erlang/binary_to_list (str crate-dir "/" g))))))
+                      globs)]
+    (reduce (fn [acc f]
+              (let [fp (erlang/list_to_binary f)
+                    mt (try (erlang/apply :filelib :last_modified (list f)) (catch _ 0))]
+                (if (and mt (erlang/is_tuple mt) (> (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt)) acc))
+                  (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt))
+                  acc)))
+            0 files)))
+
+(defn build!
+  "Build one crate with cargo, install its cdylib into priv/native/<crate>.so.
+   Returns {:ok path} | {:skipped :fresh} | {:error reason}. Raises on a real
+   compile failure (broken Rust source is different from an absent toolchain)."
+  [crate]
+  (let [crate-dir (str NATIVE-DIR "/" crate)]
+    (if (crate-fresh? crate crate-dir)
+      {:skipped :fresh}
+      (let [r (System/cmd "cargo" (to-list ["build" "--release"])
+                (to-list [(tuple :cd crate-dir) (tuple :stderr_to_stdout true)]))]
+        (if (not= 0 (elem r 1))
+          (throw (ex-info (str "cargo build failed for " crate " (exit " (elem r 1) "):\n" (elem r 0)) {:crate crate}))
+          (let [release (str (cargo-target-dir crate-dir) "/release")
+                built (built-cdylib release crate)]
+            (if (nil? built)
+              (throw (ex-info (str "cargo reported success but produced no " crate " cdylib in " release) {:crate crate}))
+              (let [dest (str INSTALL-DIR "/" crate (nif-ext))
+                    tmp (str dest ".tmp-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+                (File/mkdir_p! INSTALL-DIR)
+                (File/cp! built tmp)
+                (erlang/apply :file :rename (list tmp dest))
+                {:ok dest}))))))))
+
+(defn build-all!
+  "Discover every priv/native/<crate>/Cargo.toml and build it (skipping fresh).
+   Boot-safe. When cargo is absent, reports it and returns — natives read as
+   ABSENT rather than crashing the boot. Returns [{crate result} …]."
+  []
+  (let [dir NATIVE-DIR]
+    (if (not (File/dir? dir))
+      (list)
+      (if (nil? (erlang/apply :os :find_executable (list (erlang/binary_to_list "cargo"))))
+        (do (println "no cargo on PATH — native backends will report unavailable")
+            (list))
+        (let [entries (to-list (File/ls! dir))
+              crates (filter (fn [e] (File/exists? (str dir "/" e "/Cargo.toml"))) entries)]
+          (map (fn [c] (list c (build! c))) crates))))))

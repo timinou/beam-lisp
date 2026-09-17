@@ -21,7 +21,7 @@ defmodule BeamLisp.ExUnitCase do
       the test needs with `BeamLisp.Sandbox.load_ns/1`, `load_file/1`, or
       `eval/1`. This is the COLD shape.
     * `async: false` — opt out for tests that touch the documented-global
-      registries (`BeamLisp.Record`, `BeamLisp.Native`). Lazy sequence values
+      registries (`BeamLisp.Record`, and vm.native). Lazy sequence values
       are resource-owned; tests changing their global budget or measuring
       VM-wide native allocation counters still require `async: false`.
 

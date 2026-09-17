@@ -123,8 +123,7 @@ defmodule BeamLisp.AOTCache do
     BeamLisp.CompilerData,
     BeamLisp.Record,
     BeamLisp.Emit,
-    BeamLisp.Link,
-    BeamLisp.Native
+    BeamLisp.Link
   ]
 
   @doc "Whether the cache participates in compilation. Default on."
