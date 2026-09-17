@@ -61,6 +61,33 @@
   [src]
   (reload/declared-ns src))
 
+;; ── what a run is given ────────────────────────────────────────────────
+;;
+;; A run's input is one ENTRY per file. The runner was born taking a source
+;; string — what `reload` stages, and what every existing caller still
+;; passes — and an entry may ALSO be `{:path p :src s}`, which carries the
+;; file's NAME. A namespace is not a file's only identity: a file with no
+;; `(ns …)`, or one whose source cannot be read, has no namespace to report, and
+;; it used to appear in the summary as `?` — a hole with no name, which reads as
+;; a suite that ran everything it found.
+
+(defn- entry-src [e] (if (string? e) e (:src e)))
+
+(defn- entry-path [e] (if (string? e) nil (:path e)))
+
+(defn- entry-note
+  "Why an entry carries no source: the read failure its caller recorded. nil
+   for an entry that carries its source."
+  [e]
+  (if (string? e) nil (:unreadable e)))
+
+(defn- named
+  "`r` with the file it came from attached, when the caller told the runner that
+   file's path. Additive: a caller passing source strings gets exactly the map
+   it got before."
+  [r path]
+  (if (some? path) (assoc r :path path) r))
+
 ;; ── Tier-B diagnosis: an SMT repair for a failing stateful process ────────
 ;;
 ;; When a FAILING file defines a process (a `defserver`) whose invariant the
@@ -99,11 +126,16 @@
                     (if (and (:checked r) (seq (:repairs r))) r nil)))
                 procs))
         (catch _ nil)))))                       ; z3 absent / untranslatable → no Tier B
-
 (defn run-file
-  "Run one test file's SOURCE in a fresh isolated fork of `base`. Returns a
-   result map: {:ns ns :status :passed|:failed|:incoherent :totals {…} :warnings
-   [...] :errors [...]}.
+  "Run one test file's SOURCE in a fresh isolated fork of `base` IN A SEPARATE
+   WORKER PROCESS with a clean mailbox. Returns a result map: {:ns ns :status
+   :passed|:failed|:incoherent :totals {…} :warnings [...] :errors [...]}.
+
+   MAILBOX HYGIENE (BUG-041): Each test file runs in its own erlang/spawn'd
+   worker process, NOT in the daemon executor GenServer. This ensures test
+   `receive` calls cannot observe daemon protocol messages ({:\"$gen_call\", ...},
+   {:run, port, ...}). The worker binds the forked env, runs the test, and sends
+   the result back.
 
    The coherence pass is ADVISORY here, not a gate. reload's coherence checker is
    tuned for whole-namespace top-level defs; a test file legitimately binds
@@ -119,50 +151,55 @@
     (if (nil? ns)
       {:ns nil :status :incoherent
        :errors [{:kind :no-ns :msg "test file declares no (ns …) form"}]}
-      (let [warns (check-source ns src)]
-        (do
-          ; advisory coherence — warn, do not reject; run the file regardless. We drive
-          ; `run_ns` directly (not `run-tests`) so ward owns the summary line:
-          ; run_ns prints the ns header and per-failure detail (useful) but not
-          ; the totals footer, which ward renders once for the whole suite.
-          (env/isolated base
-            (fn []
-              ; Bind reload's commit target to THIS fork, so a test that drives
-              ; reload/commit lands its edits in the fork (isolated, destroyed on
-              ; exit) rather than the shared :global image — and reload's own
-              ; coherence checks, which read the same env they write, agree. This
-              ; is what makes global-mutating reload tests ward-valid.
-              (reload/with-target (env/current) (fn []
-              ; A top-level crash while LOADING the file (a `throw` at read/eval
-              ; time, before any test runs) is caught here and becomes an
-              ; :errored result — the fork is still destroyed on exit, and the
-              ; runner moves to the next file. A single explosive file can no
-              ; more take down the run than an incoherent one can.
-              (try
-                (do
-                  (env/eval src)
-                  (let [result (BeamLisp.TestRT/run_ns ns)
-                        totals  {:tests (:tests result) :pass (:pass result)
-                                 :fail (:fail result) :error (:error result)}
-                        ; the per-assertion failure/error reports — the WHY,
-                        ; Tier A: expected/actual/form/test/context for each.
-                        failures (filter (fn [r] (contains? #{:fail :error} (:type r)))
-                                         (:reports result))
-                        failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
-                    {:ns ns
-                     :status (if failed? :failed :passed)
-                     :totals totals
-                     :reports (vec failures)
-                     ; Tier B (best-effort): a synthesized guard for a failing
-                     ; stateful process; nil/absent for a plain unit failure.
-                     :repair (if failed? (diagnose-processes src) nil)
-                     :warnings warns}))
-                (catch e
-                  {:ns ns :status :incoherent :warnings warns
-                   :errors [{:kind :load-crash
-                             :msg (str "crashed while loading: " (ex-message e))}]})))))))))))
+      (let [warns (check-source ns src)
+            ; The worker starts in a FRESH process, whose pdict — and therefore
+            ; whose env — is empty, so the parent's env crosses as a token and
+            ; is re-bound there before anything else runs.
+            env-token (env/capture)
+            me (erlang/self)
+            worker (erlang/spawn
+                     (fn []
+                       (env/bind env-token)
+                       (let [result
+                             (env/isolated base
+                               (fn []
+                                 (reload/with-target (env/current)
+                                   (fn []
+                                     (try
+                                       (do
+                                         (env/eval src)
+                                         (let [result (BeamLisp.TestRT/run_ns ns)
+                                               totals  {:tests (:tests result) :pass (:pass result)
+                                                        :fail (:fail result) :error (:error result)}
+                                               failures (filter (fn [r] (contains? #{:fail :error} (:type r)))
+                                                                (:reports result))
+                                               failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
+                                           {:ns ns
+                                            :status (if failed? :failed :passed)
+                                            :totals totals
+                                            :reports (vec failures)
+                                            :repair (if failed? (diagnose-processes src) nil)
+                                            :warnings warns}))
+                                       (catch e
+                                         {:ns ns :status :incoherent :warnings warns
+                                          :errors [{:kind :load-crash
+                                                    :msg (str "crashed while loading: " (ex-message e))}]}))))))]
+                             ; The result goes back to the parent — the only process
+                             ; that can report it — and the worker then exits.
+                             (erlang/send me [:ward-result (erlang/self) result]))))]
+        ; Wait for the worker's result. The bound must cover a SLOW file on a
+        ; contended machine (a mount+index test under a warming daemon measured
+        ; past 60s), not a healthy one — a hang still reports, just later. A
+        ; timed-out worker is killed: left running it would keep mutating the
+        ; shared image after its result was already given up on.
+        (receive
+          [:ward-result _wpid r] r
+          (after 300000
+            (do (erlang/exit worker :kill)
+                {:ns ns :status :incoherent :warnings warns
+                 :errors [{:kind :timeout :msg "test worker timed out after 300s"}]})))))))
 
-;; ── run a suite of files ──────────────────────────────────────────────────
+;; ── run a suite of files ──────────────────────────────────────
 
 (def ^:private core-module
   "The compiled module a test file's assertions CALL: the `core` namespace
@@ -194,22 +231,42 @@
   (and (not (= :error (BeamLisp.Env/fetch "core" "deftest")))
        (assertion-runtime-loaded?)))
 
+(defn- test-lib-source
+  "The test library's SOURCE: this CHECKOUT's `priv/std/test.bl` when the image
+   has a priv tree — where the file, and not the copy compiled into TestRT, is
+   the truth — else the copy TestRT carries (an escript, or a flat deployment,
+   has no priv dir to read)."
+  []
+  (try
+    (let [priv (erlang/list_to_binary (erlang/apply :code :priv_dir (list :beam_lisp)))]
+      (File/read! (str priv "/std/test.bl")))
+    (catch _ (BeamLisp.TestRT/test_lib_source))))
+
+(def ^:private loaded-lib
+  "The test-library SOURCE this VM last interned into core (`nil` before the
+   first load).
+
+   The library is loaded by EVALUATION: the module it lands in carries whatever
+   was interned and nothing more, so an edit to `priv/std/test.bl` moves the
+   FILE and no module. `deftest-available?` asks whether a library is present —
+   it answers yes, and the stale one stays: a change to the assertion runtime
+   (the `is` macro's expansion, the shape of a failure report) is then invisible
+   in every run. The source IS the identity of what is loaded, so it is the
+   marker."
+  (atom nil))
+
 (defn- ensure-test-lib!
-  "Load the test library (`deftest`/`is`/`run-tests`) into core if it is not
-   already there. `bl test` pre-loads it; `bl run` and
+  "Load the test library (`deftest`/`is`/`run-tests`) into core unless the image
+   already carries the CURRENT one. `bl test` pre-loads it; `bl run` and
    `beam_lisp.ward` do not, so ward loads it itself and is self-contained in
    every entry point."
   []
-  (when (not (deftest-available?))
-    ;; Checkout: the live priv file. Escript (and any runtime without a
-    ;; :beam_lisp priv dir): the source embedded in TestRT — same bytes.
-    (let [src (try
-                (let [priv (erlang/list_to_binary (erlang/apply :code :priv_dir (list :beam_lisp)))]
-                  (File/read! (str priv "/test.bl")))
-                (catch _ (BeamLisp.TestRT/test_lib_source)))]
+  (let [src (test-lib-source)]
+    (when (or (not (deftest-available?)) (not= src (deref loaded-lib)))
       ;; the test lib declares no (ns …); it loads INTO core, so its macros
       ;; resolve from every namespace via the core fallback (same as cond/when).
-      (BeamLisp.Env/with_ns "core" (fn [] (env/eval src))))))
+      (BeamLisp.Env/with_ns "core" (fn [] (env/eval src)))
+      (swap! loaded-lib (fn [_] src)))))
 
 (defn- warm-base
   "A warm base env: the test library loaded once into a fresh fork of the current
@@ -289,20 +346,31 @@
   "Run one file, firing `:file-start` (with the file's ns, read before the fork)
    BEFORE it runs and `:file-done` after — so a live view shows the tile go from
    running to resolved. `prep` optionally transforms the source (run-sandboxed's
-   ns-prefixing) and `fix` optionally repairs the result's :ns.
+   ns-prefixing) and `fix` optionally repairs the result's :ns. An entry is a
+   source string or `{:path p :src s}`; when it carries a path, the path rides
+   into the result so a file with no namespace to report — one that declares no
+   `(ns …)`, or one that could not be read — is named by its path instead.
 
    The file runs against the environment it FOUND: the OS environment is
    snapshotted before the run and restored after it, so a file that points the
    analysis store at its own temp root cannot decide where the NEXT file's store
    lives (`os-env`)."
-  [base src on-event prep fix]
-  (let [ns (ns-of src)
+  [base entry on-event prep fix]
+  (let [src (entry-src entry)
+        path (entry-path entry)
+        ns (ns-of src)
         before (os-env)]
     (emit-start! on-event ns)
-    (let [r0 (try
-               (run-file base (prep src))
-               (finally (restore-os-env! before)))
-          r  (fix r0 ns)]
+    (let [r0 (if (nil? src)
+               ; The caller could not read the file at all: the hole is
+               ; REPORTED, by name, rather than silently shrinking the suite.
+               {:ns nil :status :incoherent
+                :errors [{:kind :unreadable
+                          :msg (or (entry-note entry) "source could not be read")}]}
+               (try
+                 (run-file base (prep src))
+                 (finally (restore-os-env! before))))
+          r (named (fix r0 ns) path)]
       (emit! on-event r))))
 
 (defn- summarize
@@ -318,7 +386,8 @@
      :ok? (and (= 0 failed) (= 0 incoh))}))
 
 (defn run
-  "Run a suite of test-file SOURCES (a list of source strings), each in its own
+  "Run a suite of test files — each a source string, or an entry naming the
+   file it came from (`{:path p :src s}`) — each in its own
    coherence-gated isolated fork off one warm base. Returns
      {:files [result …] :passed n :failed n :incoherent n :ok? bool}
    The aggregate a CI gate reads. No file can contaminate another: each runs in a
@@ -411,6 +480,13 @@
 
 ;; ── rendering ──────────────────────────────────────────────────────────────
 
+(defn- file-name
+  "What the report calls one file: its PATH when the runner was told one, else
+   its namespace. A file with no `(ns …)`, or one that could not be read, has no
+   namespace to report — its path is its only name, and `?` is not a name."
+  [r]
+  (or (:path r) (:ns r) "?"))
+
 (defn- file-line
   "One file's result as a terminal line: a glyph, its ns, and a count or reason."
   [r]
@@ -419,7 +495,7 @@
                     :else                   "⊘")]
     (cond
       (= :incoherent (:status r))
-      (str "  " glyph " " (or (:ns r) "?") "  INCOHERENT — "
+      (str "  " glyph " " (file-name r) "  INCOHERENT — "
            (:msg (first (:errors r))))
       :else
       (let [t (:totals r)]
@@ -428,10 +504,37 @@
              (if (> (:fail t) 0) (str ", " (:fail t) " failed") "")
              (if (> (:error t) 0) (str ", " (:error t) " errored") ""))))))
 
+(defn- eq-left
+  "The LEFT operand of an `(= a b)` assertion form, or nil for any other form.
+
+   The report's `:expected` is the operand's VALUE — recorded at assertion time,
+   the only moment it exists — so this recovers the EXPRESSION that produced it,
+   letting the report show both when they read differently while a literal,
+   where form and value read the same, stays unannotated."
+  [rep]
+  (let [f (:form rep)]
+    (if (and (erlang/is_list f)
+             (= "=" (BeamLisp.TestRT/sym_name (first f))))
+      (second f)
+      nil)))
+
+(defn- expected-line
+  "The expected half of a failure: the VALUE, and — when the assertion's left
+   operand reads differently from the value it produced — the form it came
+   from. A literal shows once; a var standing in for a value never hides it."
+  [rep]
+  (let [v (:expected rep)
+        f (eq-left rep)]
+    (str "        expected: " (pr-str v)
+         (if (and (some? f) (not= (pr-str f) (pr-str v)))
+           (str "   ← " (pr-str f))
+           ""))))
+
 (defn- failure-block
   "One failing assertion rendered as an indented block: the test name, the form,
-   and expected-vs-actual — the WHY a bare red line hides. `context` (a `testing`
-   stack) is shown when present."
+   and expected-vs-actual — the WHY a bare red line hides. `expected` is the
+   left operand's VALUE, and the form it came from rides beside it when the two
+   read differently; `context` (a `testing` stack) is shown when present."
   [rep]
   (let [ctx (:context rep)
         head (str "      ✗ " (:test rep)
@@ -441,7 +544,7 @@
         (list head
               (if (and ctx (not (= ctx ""))) (str "        ctx:      " ctx) nil)
               (str "        form:     " (pr-str (:form rep)))
-              (str "        expected: " (pr-str (:expected rep)))
+              (expected-line rep)
               (str "        actual:   " (pr-str (:actual rep))))))))
 
 (defn- repair-block

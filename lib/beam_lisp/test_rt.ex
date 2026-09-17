@@ -257,6 +257,22 @@ defmodule BeamLisp.TestRT do
     end
   end
 
+  # One suite file's SOURCE, evaluated into the env that is current, under the
+  # file's own directory on the load path.
+  #
+  # The source comes from `Loader.read_source/1` — the loader's OWN read, the
+  # one `bl run`, `bl build` and a `require` use — so a literate `.bl.md` /
+  # `.bl.org` file contributes its code cells and a `#!/usr/bin/env bl` shebang
+  # is stripped. A raw `File.read!` fed the document's PROSE to the reader, so
+  # the same file that runs under `bl run` answered `INCOHERENT — declares no
+  # (ns …) form` here, or killed the reader (and with it the VM) on the first
+  # `#` heading.
+  defp eval_file(path) do
+    BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
+      Compiler.eval_string(BeamLisp.Loader.read_source(path))
+    end)
+  end
+
   # The shared run: every named file in ONE image, forked from the caller's.
   #
   # The fork is not isolation BETWEEN the files — they share it, which is the
@@ -275,10 +291,7 @@ defmodule BeamLisp.TestRT do
 
       Enum.each(paths, fn path ->
         Env.in_ns("user")
-
-        BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-          Compiler.eval_string(File.read!(path))
-        end)
+        eval_file(path)
       end)
 
       RT.invoke(Env.fetch!("core", "run-tests"), [:all])
@@ -327,10 +340,7 @@ defmodule BeamLisp.TestRT do
 
       try do
         Env.in_ns("user")
-
-        BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
-          Compiler.eval_string(File.read!(path))
-        end)
+        eval_file(path)
 
         totals = RT.invoke(Env.fetch!("core", "run-tests"), [:all])
         {totals, StringIO.contents(io) |> elem(1)}
