@@ -9,7 +9,7 @@ the tool, what to write, and how to check the write worked.
 ```
 bl install                 the targets and their status
 bl install doom [DOOMDIR]  the Doom Emacs module + tree-sitter grammar + init.el
-bl install mcp [DIR]       agent instructions + client registration (default: .)
+bl install mcp [DIR]       the beam-lisp skill + server registration, per agent (default: .)
 bl install TARGET --check  verify an installation instead of making one
 ```
 
@@ -21,7 +21,7 @@ to drift.
 
 ```beam-lisp
 (ns bl.install
-  (:require [bl.util :as u] [datom]))
+  (:require [bl.util :as u] [datom] [clojure.string :as str]))
 ```
 
 ## Where things live
@@ -92,16 +92,39 @@ carries the payload itself.
 
 The mode wants a compiled grammar; the repo ships a pre-generated
 `parser.c`, so installing is one `cc` call into Emacs's grammar directory —
-no tree-sitter CLI, no node. The grammar directory is Doom's local etc when
-it exists, the classic `~/.emacs.d/tree-sitter` otherwise.
+no tree-sitter CLI, no node. That directory is the one the profile has, and
+it is made when no profile has one yet: Emacs creates it only when you run
+`treesit-install-language-grammar`, so on a fresh machine there is nothing
+to find, and an install that only looked would have nowhere to write.
 
 ```beam-lisp
 (defn- grammar-dir
-  "Where this Emacs keeps tree-sitter grammars."
-  []
-  (or (dir-or-nil (str (home) "/.config/emacs/.local/etc/tree-sitter"))
-      (dir-or-nil (str (home) "/.emacs.d/.local/etc/tree-sitter"))
-      (dir-or-nil (str (home) "/.emacs.d/tree-sitter"))))
+  "Where this Emacs keeps tree-sitter grammars, or nil.
+
+   The three places Emacs looks, in its order: this profile's
+   `.local/etc/tree-sitter` (Doom puts the grammars it installs there), the
+   same under `~/.emacs.d`, and the classic `~/.emacs.d/tree-sitter`. A
+   directory that is already there wins, wherever it sits in that order;
+   with `create?`, the first place whose Emacs is present is then made.
+   `--check` asks with create? false — verifying an installation writes
+   nothing, so it reports the absence instead of ending it.
+
+   The home directory comes in as an argument rather than being read: which
+   machine this runs on is the one thing a test cannot arrange."
+  [user-home create?]
+  (let [places [[(str user-home "/.config/emacs")
+                 (str user-home "/.config/emacs/.local/etc/tree-sitter")]
+                [(str user-home "/.emacs.d")
+                 (str user-home "/.emacs.d/.local/etc/tree-sitter")]
+                [(str user-home "/.emacs.d")
+                 (str user-home "/.emacs.d/tree-sitter")]]
+        existing (fn [place] (dir-or-nil (second place)))
+        made (fn [place]
+               (when (File/dir? (first place))
+                 (File/mkdir_p (second place))
+                 (second place)))]
+    (or (some existing places)
+        (when create? (some made places)))))
 
 (defn- install-grammar
   "Compile parser.c into the grammar dir. Returns {:ok path} or {:error msg} —
@@ -117,7 +140,7 @@ it exists, the classic `~/.emacs.d/tree-sitter` otherwise.
       {:error "no cc on PATH — install a C compiler, then re-run"}
 
       :else
-      (let [dir (grammar-dir)]
+      (let [dir (grammar-dir (home) true)]
         (if (nil? dir)
           {:error "no Emacs tree-sitter grammar directory found"}
           (let [out (str dir "/libtree-sitter-beamlisp.so")
@@ -205,56 +228,370 @@ last word is always the same: `doom sync`, then restart Emacs.
 
 ## The mcp target
 
-Agents don't need files copied into a home directory — they need the server
-registered and crisp instructions. The instructions are the corpus itself,
-assembled from the fact database (mcp.instructions): onboarding for first
-contact, usage for the day-to-day. The files this writes and the prompts the
-server serves are projections of one corpus — they cannot drift.
+An agent does not want a markdown file dropped in the project root — it wants
+two things in the two places its runtime actually reads. The **skill** goes
+into a skills directory the agent's loader scans (`.claude/skills/`,
+`.spell/skills/`); the **registration** goes into the file that agent reads for
+MCP servers (`.mcp.json`, `spell.kdl`). Which agent it is decides both.
+
+So this target is a table of agents, and the install is that table filtered by
+detection. Adding an agent is adding a row: how to NOTICE it, where its config
+root is, how it registers a server. An agent that is not here decides nothing —
+and a machine with no agent at all gets a report that says so, rather than a
+silent success over files nobody reads.
 
 ```beam-lisp
-(defn- assemble-prompts
-  "Mount the codebase, assemble the three prompts. The live section comes
-   from mcp.server, the same builder the served prompts/get uses."
-  []
-  (BeamLisp.Loader/ensure_loaded "mcp.tools")
-  (BeamLisp.Loader/ensure_loaded "mcp.server")
-  (BeamLisp.Loader/ensure_loaded "mcp.instructions")
-  (let [conn (mcp.tools/conn)
-        db (datom/db conn)
-        live (mcp.server/live-usage-section {:conn conn})]
-    {:onboarding (get (mcp.instructions/prompt "beam-lisp/onboarding" db live) :text)
-     :usage (get (mcp.instructions/prompt "beam-lisp/usage" db live) :text)
-     :protocol (get (mcp.instructions/prompt "beam-lisp/protocol" db live) :text)}))
+(defn- which
+  "The path of `name` on PATH, or nil."
+  [name]
+  (System/find_executable name))
 
-(def registration
-  "How a client registers the server — the header of every file we write."
-  (join "\n"
-        ["> Register the server with your MCP client:"
-         ">"
-         ">     claude mcp add beam-lisp -- bl mcp"
-         ">"
-         "> or in a mcpServers config:"
-         ">"
-         ">     {\"mcpServers\": {\"beam-lisp\": {\"command\": \"bl\", \"args\": [\"mcp\"]}}}"
-         ">"
-         "> The server serves these same instructions over prompts/list +"
-         "> prompts/get (beam-lisp/onboarding, beam-lisp/usage,"
-         "> beam-lisp/protocol) — one corpus, both projections."
-         ""]))
+;; Detection reports what it SAW — a directory, a config file, a binary — and
+;; never a guess: the report line has to be checkable by the reader. The
+;; project's own marker comes first (this is the tree we are writing into),
+;; then the user's, then the binary, which is the weakest evidence of all:
+;; an installed client that never visits this tree is not a reason to configure
+;; it here.
+;;
+;; It reads a CONTEXT rather than the ambient machine — {:dir :home :which} —
+;; because "what is on this machine" is the one thing a test cannot arrange by
+;; making directories. With the context in hand, every branch of every
+;; descriptor is reachable from a scratch directory.
+
+(defn- ctx
+  "What detection is allowed to look at."
+  [dir]
+  {:dir dir :home (home) :which which})
+
+(defn- somewhere?
+  "A file, a directory, or nil — the three answers `cond` needs, in the order
+   the argument list gives them."
+  [& paths]
+  (some (fn [p] (if (or (File/dir? p) (File/regular? p)) p nil)) paths))
+
+(defn- claude-here
+  "Where Claude Code was found for this project, or nil."
+  [ctx]
+  (let [dir (:dir ctx) home (:home ctx)]
+    (or (somewhere? (str dir "/.claude")
+                    (str home "/.claude.json")
+                    (str home "/.claude"))
+        (let [bin ((:which ctx) "claude")]
+          (if (some? bin) (str "claude on PATH: " bin) nil)))))
+
+(defn- pi-here
+  "Where Spell was found for this project, or nil."
+  [ctx]
+  (let [dir (:dir ctx)
+        home (:home ctx)
+        user (str (or (System/get_env "XDG_CONFIG_HOME") (str home "/.config"))
+                  "/spell/spell.kdl")]
+    (or (somewhere? (str dir "/.spell") (str dir "/spell.kdl") user
+                    (str home "/.spell"))
+        (let [bin (or ((:which ctx) "spell") ((:which ctx) "pi"))]
+          (if (some? bin) (str "spell on PATH: " bin) nil)))))
+```
+
+### Registering the server, per agent
+
+Claude Code reads a project's servers from `.mcp.json`. The write MERGES:
+the file may hold other servers, and an existing beam-lisp entry is left
+exactly as it is, so a second install changes nothing.
+
+```beam-lisp
+(def mcp-server-name "beam-lisp")
+
+(defn- claude-server-file [dir] (str dir "/.mcp.json"))
+
+(defn- read-json
+  "`path` as a JSON map, or `{:unreadable why}`. A config we cannot parse is
+   reported, never replaced: \"rewriting the document I could not read\" is how
+   a tool loses somebody's servers."
+  [path]
+  (if (File/regular? path)
+    (try (Jason/decode! (File/read! path))
+         (catch e {:unreadable (str e)}))
+    {}))
+
+(defn- claude-registered?
+  [ctx]
+  (let [path (claude-server-file (:dir ctx))
+        existing (read-json path)]
+    (and (not (contains? existing :unreadable))
+         (contains? (or (get existing "mcpServers") {}) mcp-server-name))))
+
+(defn- claude-register
+  "Add the server to `DIR/.mcp.json`. Returns :already | {:wrote path} |
+   {:error why}."
+  [ctx]
+  (let [dir (:dir ctx)
+        path (claude-server-file dir)]
+    (if (claude-registered? ctx)
+      :already
+      (let [existing (read-json path)
+            servers (or (get existing "mcpServers") {})]
+        (if (contains? existing :unreadable)
+          {:error (str path " does not parse as JSON — fix it, then re-run")}
+          (do (File/write! path
+                (str (Jason/encode! {"mcpServers"
+                                     (assoc servers mcp-server-name
+                                            {:command "bl" :args (list "mcp")})})
+                     "\n"))
+              {:wrote path}))))))
+```
+
+The Spell config is KDL: `mcp { server "beam-lisp" { command "bl"; args "mcp" } }`.
+Written into an existing `mcp` node when there is one, appended as a whole node
+when there is not — and the brace it inserts before is found by counting, with
+strings and comments skipped, because a brace inside either is text.
+
+```beam-lisp
+(defn- string-end
+  "The index just past the quoted string that starts at `i`, or the end of `s`
+   when the quote never closes."
+  [s i]
+  (loop [j (+ i 1)]
+    (if (>= j (count s))
+      (count s)
+      (let [c (subs s j (+ j 1))]
+        (cond
+          (= "\\" c) (recur (+ j 2))
+          (= "\"" c) (+ j 1)
+          :else (recur (+ j 1)))))))
+
+(defn- newline-at
+  "The index just past the newline at or after `i`, or the end of `s`."
+  [s i]
+  (let [j (str/index-of s "\n" i)]
+    (if (nil? j) (count s) (+ j 1))))
+
+(defn- comment-end
+  "The index just past the `*/` that closes a block comment starting at `i`,
+   or the end of `s` when it never closes."
+  [s i]
+  (let [j (str/index-of s "*/" i)]
+    (if (nil? j) (count s) (+ j 2))))
+
+(defn- block-end
+  "The index of the `}` closing the `{` at `open` in `s`, or nil when the file
+   never closes it. Quoted strings and both KDL comment forms are skipped."
+  [s open]
+  (loop [i open depth 0]
+    (if (>= i (count s))
+      nil
+      (let [c (subs s i (+ i 1))
+            nxt (if (< (+ i 1) (count s)) (subs s i (+ i 2)) "")
+            on (inc i)]
+        (cond
+          (= "\"" c) (recur (string-end s i) depth)
+          (= nxt "//") (recur (newline-at s i) depth)
+          (= nxt "/*") (recur (comment-end s i) depth)
+          (= c "{") (recur on (inc depth))
+          (= c "}") (if (= depth 1) i (recur on (dec depth)))
+          :else (recur on depth))))))
+
+(defn- mcp-block-open
+  "The index of the `{` of a `mcp` node in `s`, or nil. The node has to START a
+   line: that is how spell.kdl spells it, and a file with two `mcp` nodes means
+   the one a reader would call the mcp block."
+  [s]
+  (let [lines (String/split s "\n")]
+    (loop [i 0 offset 0]
+      (if (>= i (count lines))
+        nil
+        (let [line (nth lines i)
+              trimmed (String/trim line)
+              head (and (includes? line "{")
+                        (or (= trimmed "mcp")
+                            (starts-with? trimmed "mcp ")
+                            (starts-with? trimmed "mcp{")))]
+          (if head
+            (+ offset (str/index-of line "{"))
+            (recur (+ i 1) (+ offset (count line) 1))))))))
+
+(defn- line-indent
+  "The whitespace before the first non-blank character of the line holding
+   index `i`. When `i` is on the first line there is nothing to look back for."
+  [s i]
+  (let [start (str/last-index-of s "\n" i)
+        from (if (some? start) (+ start 1) 0)]
+    (loop [j from]
+      (if (or (>= j (count s)) (not (includes? " \t" (subs s j (+ j 1)))))
+        (subs s from j)
+        (recur (+ j 1))))))
+
+(defn- kdl-server-text
+  "The registration as KDL, indented by `indent`."
+  [indent]
+  (str indent "server \"" mcp-server-name "\" {\n"
+       indent "\tcommand \"bl\"\n"
+       indent "\targs \"mcp\"\n"
+       indent "}\n"))
+
+(defn- pi-register
+  "Register the server in `DIR/spell.kdl`, creating the file if this project
+   has none. Returns :already | {:wrote path} | {:error why}."
+  [ctx]
+  (let [path (str (:dir ctx) "/spell.kdl")
+        text (if (File/regular? path) (File/read! path) "")]
+    (if (includes? text (str "server \"" mcp-server-name "\""))
+      :already
+      (let [open (mcp-block-open text)]
+        (if (nil? open)
+          (do (File/write! path
+                (str text
+                     (if (= "" text) "" (if (= "\n" (subs text (- (count text) 1))) "\n" "\n\n"))
+                     "mcp {\n" (kdl-server-text "\t") "}\n"))
+              {:wrote path})
+          (let [close (block-end text open)]
+            (if (nil? close)
+              {:error (str path " has an mcp node whose braces never close")}
+              (do (File/write! path
+                    (str (subs text 0 close)
+                         (kdl-server-text (str (line-indent text open) "\t"))
+                         (subs text close)))
+                  {:wrote path}))))))))
+
+(defn- pi-registered?
+  [ctx]
+  (let [path (str (:dir ctx) "/spell.kdl")]
+    (and (File/regular? path)
+         (includes? (File/read! path) (str "server \"" mcp-server-name "\"")))))
+```
+
+### The table, and the install
+
+One row per agent. The skill directory is derived from the agent's config root,
+so an agent cannot register a server and forget the skill — or the other way
+round.
+
+```beam-lisp
+(def agents
+  "The agents this target knows: how to notice one, where its config root is,
+   and how it registers a server. The install, the report and the check are
+   all projections of this table."
+  [{"name" "claude"
+    "root" ".claude"
+    "detect" claude-here
+    "register" claude-register
+    "registered?" claude-registered?}
+   {"name" "pi"
+    "root" ".spell"
+    "detect" pi-here
+    "register" pi-register
+    "registered?" pi-registered?}])
+
+(defn- skill-name
+  "The skill's directory name, from the one place that declares it."
+  []
+  (BeamLisp.Loader/ensure_loaded "mcp.skill")
+  (BeamLisp.Env/fetch! "mcp.skill" "skill-name"))
+
+(defn- skills-dir [dir root] (str dir "/" root "/skills/" (skill-name)))
+
+(defn- corpus
+  "The skill corpus, mounted alone: the skill describes the LANGUAGE, so
+   rendering one writes a document and does not index this tree."
+  []
+  (BeamLisp.Loader/ensure_loaded "mcp.skill")
+  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "db") (list)))
+
+(defn- skill-steps
+  "Write the skill for one found agent. Returns the one-line detail the report
+   prints — the same list `write!` answered, not a second guess at it."
+  [agent ctx]
+  (let [where (skills-dir (:dir ctx) (get agent "root"))]
+    (BeamLisp.Loader/ensure_loaded "mcp.skill")
+    (let [paths (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "write!")
+                                    (list where (corpus)))]
+      (str (count (to-list paths)) " files, v"
+           (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "version") (list))
+           " — " (u/rel-path where)))))
+
+(defn- agent-install
+  "Install into one agent: the skill, then the server. `seen` is what detection
+   saw, reported as the evidence it is; the skill is written first so the
+   directory exists before a config file lands in it."
+  [agent ctx]
+  (let [name (get agent "name")
+        seen (BeamLisp.RT/invoke (get agent "detect") (list ctx))
+        skill (skill-steps agent ctx)
+        reg (BeamLisp.RT/invoke (get agent "register") (list ctx))]
+    [{:name name :ok (not (contains? reg :error)) :detail (str "found — " seen)}
+     (step (str name " skill") {:ok skill})
+     (step (str name " server")
+           (if (= :already reg) {:ok "already registered"}
+               (or (get reg :wrote) (get reg :error))))]))
+
+(defn- found-agents
+  "The agents detected for `ctx`, with what each detection SAW — the pair the
+   report and the check both need."
+  [ctx]
+  (into []
+        (keep (fn [a]
+                (let [seen (BeamLisp.RT/invoke (get a "detect") (list ctx))]
+                  (if (some? seen) [a seen] nil)))
+              agents)))
 
 (defn- run-mcp [dir-arg]
-  (let [dir (u/resolve (or dir-arg "."))]
-    (File/mkdir_p dir)
-    (let [ps (assemble-prompts)
-          onb (str dir "/beam-lisp-mcp.onboarding.md")
-          usg (str dir "/beam-lisp-mcp.usage.md")]
-      (File/write! onb (str (:onboarding ps) "\n\n---\n\n" registration "\n"
-                            (:protocol ps) "\n"))
-      (File/write! usg (str (:usage ps) "\n\n---\n\n" registration))
-      [(step "onboarding" {:ok (u/rel-path onb)})
-       (step "usage" {:ok (u/rel-path usg)})
-       {:name "register" :ok true
-        :detail "claude mcp add beam-lisp -- bl mcp"}])))
+  (let [dir (u/resolve (or dir-arg "."))
+        context (ctx dir)
+        found (found-agents context)]
+    (if (empty? found)
+      [{:name "agents" :ok false
+        :detail (str "none found — no .claude/ or .spell/ here, and no client on PATH. "
+                     "This install knows: " (join ", " (map (fn [a] (get a "name")) agents)))}]
+      (do (File/mkdir_p dir)
+          (concat
+           [{:name "agents" :ok true
+             :detail (str (count found) " of " (count agents) " found: "
+                          (join ", " (map (fn [pair] (get (first pair) "name")) found)))}]
+           (mapcat (fn [pair] (agent-install (first pair) context)) found)
+           [{:name "next" :ok true
+             :detail "restart the agent so it loads the skill and the server"}])))))
+```
+
+### Checking
+
+`--check` is the same table, asked rather than written: is the skill there, is
+it the one THIS release would write, and is the server registered. The version
+line is what makes staleness answerable — a skill written by an older `bl` is a
+skill whose idioms have moved.
+
+```beam-lisp
+(defn- skill-status
+  [agent ctx]
+  (let [where (skills-dir (:dir ctx) (get agent "root"))]
+    (BeamLisp.Loader/ensure_loaded "mcp.skill")
+    (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "stale?") (list where))))
+
+(defn- check-mcp [dir-arg]
+  (let [dir (u/resolve (or dir-arg "."))
+        context (ctx dir)
+        found (found-agents context)]
+    (concat
+     [{:name "agents" :ok (not (empty? found))
+       :detail (if (empty? found)
+                 "none found — nothing here would read what this installs"
+                 (join ", " (map (fn [pair] (get (first pair) "name")) found)))}]
+     (mapcat
+      (fn [pair]
+        (let [agent (first pair)
+              name (get agent "name")
+              where (skills-dir dir (get agent "root"))
+              status (skill-status agent context)
+              registered (BeamLisp.RT/invoke (get agent "registered?") (list context))]
+          [{:name (str name " skill")
+            :ok (= status :current)
+            :detail (cond
+                      (= status :absent) (str "absent — run: bl install mcp")
+                      (= status :current) (str (u/rel-path where) " (current)")
+                      :else (str (u/rel-path where) " was written by another release"
+                                 " — run: bl install mcp"))}
+           {:name (str name " server")
+            :ok registered
+            :detail (if registered "registered" "not registered — run: bl install mcp")}]))
+      found))))
 ```
 
 ## The command
@@ -274,10 +611,10 @@ the corpus assembles.
         [{:name "module" :ok (File/dir? mod-dir)
           :detail (if (File/dir? mod-dir) mod-dir "absent — run: bl install doom")}
          {:name "grammar"
-          :ok (let [d (grammar-dir)]
+          :ok (let [d (grammar-dir (home) false)]
                 (and (some? d)
                      (File/regular? (str d "/libtree-sitter-beamlisp.so"))))
-          :detail (let [d (grammar-dir)]
+          :detail (let [d (grammar-dir (home) false)]
                     (if (and (some? d)
                              (File/regular? (str d "/libtree-sitter-beamlisp.so")))
                       (str d "/libtree-sitter-beamlisp.so")
@@ -668,10 +1005,9 @@ the corpus assembles.
                :run run-redirect
                :check check-redirect
                :remove remove-redirect}
-   "mcp"  {:summary "MCP clients: agent instructions + server registration"
+   "mcp"  {:summary "MCP agents (claude, pi): the beam-lisp skill + server registration"
            :run run-mcp
-           :check (fn [_] [{:name "mcp" :ok true
-                            :detail "instructions are assembled, not installed — bl install mcp [DIR]"}])}})
+           :check check-mcp}})
 
 (defn- render-report
   [target steps]

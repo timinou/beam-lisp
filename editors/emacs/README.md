@@ -20,6 +20,9 @@ cc -shared -fPIC -O2 -I ~/code/undefine/beam-lisp/editors/tree-sitter-beamlisp/s
 
 Verify: `M-: (treesit-language-available-p 'beamlisp)` → t.
 
+Without it the mode is still usable: comments, indentation, imenu and the
+language server need no grammar, and the mode warns once naming this step.
+
 (Alternative: `M-x treesit-install-language-grammar` with a recipe entry in
 `treesit-language-source-alist` pointing at the grammar dir.)
 

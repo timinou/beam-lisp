@@ -14,6 +14,10 @@
 ;; Requires Emacs 29+ built with tree-sitter support and the
 ;; `beamlisp' grammar installed.  Check: (treesit-language-available-p 'beamlisp)
 ;;
+;; The grammar is one install step, not a precondition: without it the mode
+;; still opens `.bl' files — comments, indentation, imenu and the language
+;; server need no grammar — and says once what is missing.
+;;
 ;; Install the grammar (no tree-sitter CLI needed, parser.c is
 ;; pre-generated in the repo):
 ;;
@@ -32,6 +36,7 @@
 
 (require 'treesit)
 (require 'lisp-mode)                    ; lisp-indent-line, syntax table base
+(require 'seq)                          ; seq-some, for the search-rule table below
 
 (defgroup beamlisp-ts nil
   "Tree-sitter support for Beam Lisp."
@@ -124,11 +129,12 @@
 
 ;;;###autoload
 (define-derived-mode beamlisp-ts-mode prog-mode "BeamLisp"
-  "Major mode for Beam Lisp (.bl) sources, powered by tree-sitter."
+  "Major mode for Beam Lisp (.bl) sources, powered by tree-sitter.
+
+The tree-sitter half needs the `beamlisp' grammar, which is a separate
+install; without it the mode keeps the half that needs no grammar —
+comments, indentation, imenu, and the language server — and says so once."
   :syntax-table beamlisp-ts-mode--syntax-table
-  (unless (treesit-ready-p 'beamlisp)
-    (error "tree-sitter grammar `beamlisp' not available; see beamlisp-ts-mode.el commentary"))
-  (treesit-parser-create 'beamlisp)
   ;; comments: `;' to end of line
   (setq-local comment-start ";")
   (setq-local comment-end "")
@@ -140,13 +146,6 @@
   (setq-local comment-add 1)
   (setq-local comment-indent-function
               (lambda () (or (lisp-comment-indent) comment-column)))
-  ;; font-lock
-  (setq-local treesit-font-lock-settings beamlisp-ts-mode--font-lock-settings)
-  (setq-local treesit-font-lock-feature-list
-              '((comment string)
-                (keyword number call)
-                (definition reader-macro)
-                (bracket)))
   ;; indentation: plain sexp-aware lisp indentation; tree-sitter is not
   ;; needed for it and lisp-mode's handles bl's forms fine
   (setq-local indent-line-function #'lisp-indent-line)
@@ -154,7 +153,23 @@
   ;; navigation / discovery
   (setq-local imenu-generic-expression
               `((nil ,beamlisp-ts-mode--imenu-regexp 1)))
-  (treesit-major-mode-setup))
+  ;; tree-sitter is one half of the mode, and its grammar is a separate
+  ;; install: when it is missing, keep the other half rather than error out of
+  ;; the mode. A mode that errors leaves the buffer in `fundamental-mode', and
+  ;; no major-mode hook runs from there — so the LSP never attaches and every
+  ;; lookup falls through to a plain search tool that knows nothing of `.bl'.
+  (if (treesit-ready-p 'beamlisp t)
+      (progn
+        (treesit-parser-create 'beamlisp)
+        (setq-local treesit-font-lock-settings
+                    beamlisp-ts-mode--font-lock-settings)
+        (setq-local treesit-font-lock-feature-list
+                    '((comment string)
+                      (keyword number call)
+                      (definition reader-macro)
+                      (bracket)))
+        (treesit-major-mode-setup))
+    (beamlisp-ts-mode--missing-grammar)))
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.bl\\'" . beamlisp-ts-mode))
@@ -168,6 +183,46 @@
 (with-eval-after-load 'eglot
   (add-to-list 'eglot-server-programs
                '(beamlisp-ts-mode . ("bl" "lsp" "serve"))))
+
+;;; When the grammar is not installed
+
+(defvar beamlisp-ts-mode--missing-grammar-said nil
+  "Whether the missing-grammar warning has been shown this session.")
+
+(defun beamlisp-ts-mode--missing-grammar ()
+  "Warn once that the `beamlisp' grammar is absent, and how to install it."
+  (unless beamlisp-ts-mode--missing-grammar-said
+    (setq beamlisp-ts-mode--missing-grammar-said t)
+    (display-warning
+     'beamlisp-ts
+     (concat "tree-sitter grammar `beamlisp' is not installed: `.bl' buffers get"
+             " no tree-sitter font-lock, and stay in the plain-lisp half of this"
+             " mode. Comments, indentation, imenu and the language server need no"
+             " grammar and work as usual.\n"
+             "Install it with `bl install doom' — or compile the pre-generated"
+             " parser.c by hand; the `cc' line is in the commentary at the top of"
+             " beamlisp-ts-mode.el.")
+     :warning)))
+
+;;; Search: `.bl' is Clojure's reader, so Clojure's rules answer
+
+;; A lookup in a `.bl' buffer that no language server answers goes to whatever
+;; regex-search tool the editor wired into `xref' (dumb-jump, in Doom). That
+;; tool keys its rules off a file-extension table, and `.bl' is not in it — so
+;; instead of searching it answers "Could not find rules for '.bl file'." bl
+;; defines with the `def' family, which is exactly what the clojure rules
+;; match, so the extension is the only thing missing.
+(defvar dumb-jump-language-file-exts)   ; dumb-jump: the table extended below
+(with-eval-after-load 'dumb-jump
+  (dolist (ext '("bl" "bl.md"))
+    (unless (seq-some (lambda (rule)
+                        (and (equal (plist-get rule :language) "clojure")
+                             (equal (plist-get rule :ext) ext)))
+                      dumb-jump-language-file-exts)
+      (set-default 'dumb-jump-language-file-exts
+                   (cons (list :language "clojure" :ext ext
+                               :agtype "clojure" :rgtype "clojure")
+                         dumb-jump-language-file-exts)))))
 
 (provide 'beamlisp-ts-mode)
 ;;; beamlisp-ts-mode.el ends here

@@ -82,8 +82,17 @@ data:
 [00-the-cli.md](00-the-cli.md#install)): `bl install doom` installs the Doom
 Emacs module — the major mode, the tree-sitter grammar, LSP registration, a
 warm REPL, and first-party literate `.bl.md` / `.bl.org` support — and
-`bl install mcp` writes the agent instructions and client registration for
-MCP clients. The sections below remain the hand-run reference for clients
+`bl install mcp [DIR]` installs for **agents**, and an agent is a table row:
+how to notice one (a `.claude/` or `.spell/` marker, a `spell.kdl`, the user's
+config, the binary on `PATH`), where its skills live, and which file it reads
+for MCP servers. `bl install mcp` reports what it found, writes the beam-lisp
+skill into each found agent's skills directory (`.claude/skills/beam-lisp/`,
+`.spell/skills/beam-lisp/`), and registers the server (`.mcp.json` for Claude
+Code, `spell.kdl` for Spell) — merging, never replacing, so a second run is a
+no-op. `bl install mcp --check` asks the same questions without writing, and
+reports a skill whose `version:` line names another release.
+
+The sections below remain the hand-run reference for clients
 the installer does not know yet (Neovim, VS Code) and for understanding what
 the installer writes.
 
@@ -126,13 +135,18 @@ amends), `:instr/for` (the surface: `"mcp"`), `:instr/kind`
   puts an instruction in the namespace it describes, and the indexer
   (`codebase.bl`) emits it as the same kind of fact.
 
-The prompt surface is three queries over those facts:
+`:instr/code` is the optional executable half: a form a renderer shows as a
+literate cell, so the examples in a skill can be RUN (`bl run
+modules.bl.md`) rather than trusted. A fragment is prose, a form, or both.
+
+The prompt surface is queries over those facts:
 
 | prompt | kind | when a client reads it |
 |---|---|---|
 | `beam-lisp/onboarding` | `:onboarding` | first contact, once (also on `server/discover` as `instructions`) |
 | `beam-lisp/usage` | `:usage` | on task start; closes with the live registry — tools, questions and counts as they are right now |
 | `beam-lisp/protocol` | `:protocol` | before extending or amending the instructions |
+| `beam-lisp/skill` | `:onboarding` + `:modules` + `:usage` | the language itself: what it is, the modules worth knowing first, where the rest lives — the same corpus `bl install mcp` writes to disk |
 
 `prompts/list` advertises them; `prompts/get` assembles one. Because the
 facts sit in the served database, `code/query` can read the instructions
