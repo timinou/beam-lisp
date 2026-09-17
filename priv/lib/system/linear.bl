@@ -227,25 +227,78 @@
   #{"lit" "var" "global" "remote" "app" "lett" "iff" "doo" "casee" "fnn" "tryy"
     "recv" "tup" "mapp" "cons-cell" "structt" "clause"})
 
-(defn- callee-name
-  "The unqualified callee name of a call node, or nil."
+;; ── THE TWO SHAPES ONE CONSTRUCTOR CALL TAKES ───────────────────────────
+;
+; `(a/lett self outer inner)` is ONE source form that compiles to one of TWO
+; node shapes, decided by how the prefix `a` happens to resolve in the VM doing
+; the analyzing:
+;
+;   {:op :remote :mod :a :fun :lett :args […]}
+;     the prefix read as a HOST MODULE — a direct remote call; and
+;
+;   {:op :remote :mod :Elixir.BeamLisp.RT :fun :invoke
+;    :args [{:op :global :ns "a" :name "lett"} …]}
+;     the prefix read as a beam-lisp VAR, so the call is the general RT.invoke
+;     of a fetched fn. anf.global keeps :ns and :name APART, so the spelling
+;     `a/lett` survives only as the pair ("a", "lett").
+;
+; WHICH SHAPE APPEARS DEPENDS ON AMBIENT VM STATE — whether a namespace named
+; `a` is loaded, or the prefix is resolvable, is a property of the warm daemon,
+; not of the source. A recognizer reading only the first shape reports "no
+; violations" over a source that is nothing BUT constructor calls (BUG-054).
+; Both are read here, and the NAMESPACE is what makes a call a constructor: an
+; arbitrary RT.invoke is never one.
+
+(def ^:private constructor-ns
+  "The beam-lisp namespaces the ANF constructors live in."
+  #{"a" "anf"})
+
+(def ^:private constructor-modules
+  "The host-module atoms `a`/`anf` compile to when the prefix resolves as a
+   module instead of a var (the DIRECT-remote shape)."
+  #{:a :anf :Elixir.BeamLisp.Ns.Anf})
+
+(defn- unqualified
+  "`a/lett` → `lett`; a bare name is unchanged."
+  [nm]
+  (let [i (index-of nm "/")]
+    (if (and i (>= i 0)) (subs nm (inc i)) nm)))
+
+(defn- invoke-callee
+  "The callee node of an `RT.invoke(callee, args)` application, or nil — the
+   wrapper a var-resolved prefix compiles to (see the note above)."
   [n]
-  (cond
-    (= :remote (:op n)) (str (:fun n))
-    (and (= :apply (:op n)) (ir/node? (:fn n)) (= :global (get-in n [:fn :op])))
-      (let [nm (get-in n [:fn :name]) i (index-of nm "/")]
-        (if (and i (>= i 0)) (subs nm (inc i)) nm))
-    :else nil))
+  (when (and (ir/node? n) (= :remote (:op n))
+             (= :Elixir.BeamLisp.RT (:mod n)) (= "invoke" (str (:fun n))))
+    (first (:args n))))
+
+(defn- global-callee
+  "The `{:op :global :ns :name}` node a call applies — as the direct target of
+   an `:apply`, or as the callee inside an RT.invoke wrapper — or nil."
+  [n]
+  (let [f (if (= :apply (:op n)) (:fn n) (invoke-callee n))]
+    (when (and (ir/node? f) (= :global (:op f))) f)))
+
+(defn- callee-name
+  "The unqualified callee name of a call node, or nil — reading BOTH shapes."
+  [n]
+  (if-let [f (global-callee n)]
+    (unqualified (get-in f [:name]))
+    (when (= :remote (:op n)) (str (:fun n)))))
 
 (defn- constructor-call?
-  "A call into anf.bl's constructors."
+  "A call into anf.bl's constructors, in EITHER shape. The NAMESPACE decides,
+   so an arbitrary RT.invoke is never counted: a var-resolved callee must name
+   `a`/`anf`, and a direct remote must target their module."
   [n]
   (and (ir/node? n)
        (let [nm (callee-name n)]
          (and nm (contains? constructor-names nm)
-              (or (= :remote (:op n)) (= :Elixir.BeamLisp.Ns.Anf (:mod n))
-                  (let [full (get-in n [:fn :name])]
-                    (or (zero? (index-of full "a/")) (zero? (index-of full "anf/")))))))))
+              (if-let [f (global-callee n)]
+                (or (contains? constructor-ns (get-in f [:ns]))
+                    (let [full (get-in f [:name])]
+                      (or (zero? (index-of full "a/")) (zero? (index-of full "anf/")))))
+                (and (= :remote (:op n)) (contains? constructor-modules (:mod n))))))))
 
 ;; A `(a/var "x")` / `(a/lit v)` / `(a/global ns name)` is a LEAF: a
 ;; reference, not a compiled subtree. Placing the same leaf twice is how a
@@ -258,7 +311,10 @@
 (defn- compiled-init?
   "Is this let-init the compilation of a child? A call whose callee name
    starts with `compile` (compile-node, compile-body, compile-each-notail …)
-   or ends in `-node`/`-steps`, or a NON-LEAF constructor call itself."
+   or ends in `-node`/`-steps`, or a NON-LEAF constructor call itself.
+   NB: the `compile*` clause still reads only the DIRECT-remote and `:apply`
+   spellings, so a call that compiled to the RT.invoke shape is not seen here
+   — see the BUG-054 note in !tasks/bugs before relying on it."
   [init]
   (or (and (constructor-call? init) (not (leaf-constructor? init)))
       (and (ir/node? init) (= :apply (:op init)) (ir/node? (:fn init))
@@ -374,25 +430,88 @@
   [params body]
   (into [] (keep (fn [[c n]] (when (> n 1) {:local c :placements n})) (placements params body))))
 
+;; ── THE RECOGNIZER'S OWN CENSUS ────────────────────────────────────
+;
+; `[]` means "no violation" ONLY if the recognizer actually saw the
+; constructors. When a third shape appears — a new resolution mood, a renamed
+; constructor — every check silently reports [] over a source full of `a/…`
+; calls: green, and meaningless. So a call spelled like a constructor that the
+; namespace gate REFUSES is counted as evidence, and an answer with misses but
+; no recognized site is refused rather than returned (BUG-054).
+
+(defn- call-census
+  "{:sites :misses} over one ANF tree: `:sites` is how many calls the
+   recognizer counted as constructors; `:misses` names the unqualified callees
+   of calls it did NOT accept although they are spelled like a constructor —
+   the gap that must never be silently empty."
+  [n]
+  (let [acc (atom {:sites 0 :misses []})
+        walk (fn walk [x]
+               (when (ir/node? x)
+                 (let [nm (callee-name x)]
+                   (when (and nm (contains? constructor-names nm))
+                     (swap! acc (fn [a] (if (constructor-call? x)
+                                         (update a :sites inc)
+                                         (update a :misses conj nm))))))
+                 (doseq [c (ir/child-nodes x)] (walk c))))]
+    (walk n)
+    (deref acc)))
+
+(defn- bodies-census
+  "{:sites n :misses [[fn-name constructor-name] …]} over a fn-bodies map."
+  [bodies]
+  (reduce (fn [a [name d]]
+            (let [c (call-census (:body d))]
+              {:sites (+ (:sites a) (:sites c))
+               :misses (into (:misses a) (map (fn [nm] [name nm]) (:misses c)))}))
+          {:sites 0 :misses []} (into [] bodies)))
+
+(defn constructor-sites
+  "How many constructor calls the recognizer counts in `src` — the census a
+   vacuous [] cannot fake. A source written in `a/…` that yields 0 here is a
+   recognizer miss, and `param-violations`/`check-compiler` say so loudly
+   instead of returning [] (BUG-054)."
+  [src]
+  (:sites (bodies-census (analyze/fn-bodies src))))
+
+(defn- refuse-vacuity!
+  "Raise when the source calls constructors by name but the recognizer counted
+   NONE: the answer can only be a vacuous []. Returns `bodies` so a caller can
+   wrap a `let` with it."
+  [bodies]
+  (let [{:keys [sites misses]} (bodies-census bodies)]
+    (when (and (seq misses) (zero? sites))
+      (throw (ex-info (str "system.linear: the source calls "
+                           (count misses) " call(s) spelled like an ANF constructor ("
+                           (join ", " (map (fn [[f nm]] (str f "/" nm)) (take 5 misses)))
+                           ") but not one constructor site was recognized — the prefix "
+                           "resolved to a shape this recognizer does not read. Refusing "
+                           "to report a vacuous [].")
+                      {:misses misses :sites sites}))))
+  bodies)
+
 (defn param-violations
-  "`affine-violations` over every defn in `src`, flattened with :fn."
+  "`affine-violations` over every defn in `src`, flattened with :fn. Raises
+   rather than returning [] when the source calls constructors and none was
+   recognized — see `refuse-vacuity!`."
   [src]
   (into []
     (mapcat (fn [[name d]]
               (map (fn [v] (assoc v :fn name)) (affine-violations (:params d) (:body d))))
-            (analyze/fn-bodies src))))
+            (refuse-vacuity! (analyze/fn-bodies src)))))
 
 (defn check-compiler
   "Tier 1 over the compiler source: [{:fn :violations}] for every function
    that places a compiled child — a let-bound one or a parameter — more than
    once in the tree it emits. Empty ⇒ the compiler is emission-linear BY
-   CONSTRUCTION. This is the theorem; tier 3 is its measurement."
+   CONSTRUCTION. This is the theorem; tier 3 is its measurement. Raises
+   instead of answering vacuously; see `refuse-vacuity!`."
   [compiler-src]
   (into []
     (keep (fn [[name d]]
             (let [v (affine-violations (:params d) (:body d))]
               (when (seq v) {:fn name :violations v})))
-          (analyze/fn-bodies compiler-src))))
+          (refuse-vacuity! (analyze/fn-bodies compiler-src)))))
 
 ; ════════════════════════════════════════════════════════════════════════
 ; TIER 2 — the size lemma, discharged by z3
