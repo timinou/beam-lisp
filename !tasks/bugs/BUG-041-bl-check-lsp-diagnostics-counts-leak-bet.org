@@ -1,5 +1,5 @@
 #+TITLE: bl check/lsp: diagnostics counts leak between analyses — test order changes the result
-#+STATE: ITEM
+#+STATE: DOING
 #+SESSION_ID: 157bcd97046112e7
 #+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-11T19-45-37-298Z_157bcd97046112e7.jsonl]]
 #+CUSTOM_ID: BUG-041-bl-check-lsp-diagnostics-counts-leak-bet
@@ -114,3 +114,114 @@ shared state is either (a) inside the deeper engines those call (`system.analyze
 set up by the test runtime itself (`ward`'s warm isolated run loads many files in
 one VM). Bisect by running the PAIR with one earlier test file at a time, not by
 reading the analyzer — the analyzer has been read, and it is clean.
+
+NOTE [2026-09-16]: 2026-09-16 post-merge full-suite run (session 158190337cc00a7b): FOUR new instances of this class, failing assertion again differs per file — system.check-test (analyze-source on clean-src: 0→6 phantom diagnostics), system.lsp-cli-test (lc/report of a 3-line program: 6 diagnostics at lines 4/89/365/419/577 — lines that EXIST IN NO on-disk source; identical set then surfaced in system.lsp-memo-test's different program), system.lsp-test (expected 1 diagnostic, got 8 = own 2 + ambient 6), system.mcp-project-mount-test (callers row missing while :entities.calls>0 passes). All four PASS in isolation. The phantom diagnostics (get on (:sym) at 4:1, keyword-opts at 89:1, keys/vals on nil at 365:1, dissoc 419:1, merge 577:1) match no file under priv/test/examples/docs at those lines — the analyzed source is generated or the state is ambient. New suspicion vs prior notes: the branch landed a PERSISTENT corpus memo (32bd910 code.semantic 'read a source the loader's way, so the corpus memo persists') and a datom-backed analysis cache (datom.blanalysis-cache) — these are exactly the kind of cross-fork shared state (ETS/atom/disk) ward's env-only fork does not isolate (ward.bl:14-40). NB the same run executed a stale toolchain (BUG-052), so re-verify on a fresh seed before deep-diving; but the class is proven pre-existing at 41a3043.
+
+NOTE [2026-09-16]: 2026-09-16 POST-CUTOVER confirmation (fresh toolchain, key-coherent drop f9839063, no stale-seed warning): the leak class is REAL, not toolchain skew. system.check-test still reports the same 6 phantom diagnostics (0→6), system.lsp-cli-test 0→6, system.lsp-test 1→8, system.mcp-project-mount-test callers-row-missing, system.linear-test vacuous-nil. NEW escalation in a second run (daemon under active use): datom.broadcast.test (8 fails — the test's receive-with-timeout mailbox caught $gen_call/:queue_depth and a daemon `{:run, #Port, "eval …mcp.instructions…"}` protocol message — direct proof that ward forks share the daemon's PROCESS/MAILBOX layer, not just ETS/atoms), live.socket.test (16 fails), system.install-test (16 ERRORs), system.mcp-test — all absent from the previous run. The failure SET is now nondeterministic across runs, i.e. the suite's result depends on what the daemon happened to be doing. This is the beta blocker. Fix direction sharper now: ward isolation must extend past the var registry to (a) mailbox hygiene — fork servers should use alias-based or dedicated-mailbox message protocols, or the test receive must match only its own tags; (b) the shared memos (code.index/held, mcp.tools/the-mount, corpus memo) need fork scoping or per-file keys.
+
+NOTE [2026-09-16]: ## Contamination Map (file:line evidence)
+
+### Mailbox Layer
+Root cause: Ward forks ran in daemon executor GenServer process, so test `receive` caught daemon protocol messages.
+
+- `lib/beam_lisp/daemon/executor.ex:91-97` — `handle_call({:run, ...})` executes in executor GenServer
+- `lib/beam_lisp/daemon/executor.ex:136-181` — `execute()` runs program in executor process
+- `lib/beam_lisp/daemon/executor.ex:149-154` — `BeamLisp.Env.isolated` forks vars but same process
+- `priv/std/reload/ward.bl:88-120` (pre-fix) — `run-file` called `env/isolated` in current process
+
+Observed pollution: `datom.broadcast.test` received `{:"$gen_call", {pid, [:alias | ref]}, :queue_depth}` and `{:run, #Port, ...}` in test mailbox.
+
+### Memo Layer (VM-global mutable state)
+Analyzer-facing memos (highest priority):
+- `priv/lib/lsp.bl:69` — `analyzed-cache (atom [])` keyed by [sha], VM-global
+- `priv/lib/lsp.bl:70` — `growth-cache (atom [])` keyed by [sha], VM-global
+- `priv/lib/lsp.bl:71` — `diagnostics-cache (atom [])` keyed by [ns sha], VM-global
+- `priv/lib/code/semantic.bl:572-620` — corpus manifest memo, filesystem-global
+
+Other VM-global state:
+- `priv/lib/code/index.bl:388-405` — `daemon-owner` via `erlang/whereis`
+- `priv/lib/mcp/tools.bl:311-312` — `the-engine` and `the-mount` atoms
+- `lib/beam_lisp/build_plan.ex:93-101` — build plan ETS memo table
+- `lib/beam_lisp/aot_cache.ex:173-176` — toolchain key persistent_term
+
+Observed pollution: `system.check_test.bl` and `lsp_cli_test.bl` saw 6 diagnostics for sources that weren't theirs when run in suite (passed isolated).
+
+## Fix Mechanisms
+
+### 1. Mailbox Hygiene (priv/std/reload/ward.bl:88-151)
+**Mechanism:** Each ward test file now runs in its own `erlang/spawn`'d worker process with a CLEAN MAILBOX, not in the daemon executor GenServer.
+
+**Implementation:**
+- Worker captures parent env via `env/capture` token
+- Worker binds env via `env/bind` in spawned process
+- Worker runs test in `env/isolated` fork
+- Worker sends result back via message `[:ward-result pid result]`
+- Parent receives with 60s timeout
+
+**Why datom.broadcast mailbox pollution is now impossible:** Test code executes in a fresh worker process whose PID is never registered with or known to the daemon's request routing. Daemon protocol messages (`{:"$gen_call", ...}`, `{:run, port, ...}`) are sent to the EXECUTOR GenServer's registered name, not to ephemeral worker PIDs. The worker's mailbox contains only: (a) messages the test itself sends, (b) the result message from itself to parent. Daemon traffic cannot route there structurally.
+
+### 2. Memo Scoping (priv/lib/lsp.bl:69-181)
+**Mechanism:** Analyzer caches now keyed by [env-id sha] / [env-id ns sha] instead of [sha] / [ns sha], so forks cannot read each other's entries.
+
+**Implementation:**
+- `analyzed-cache` key: `[sha]` → `[(env/id) sha]`
+- `growth-cache` key: `[sha]` → `[(env/id) sha]`
+- `diagnostics-cache` key: `[ns sha]` → `[(env/id) ns sha]`
+- Added `env/id` function to priv/std/env.bl (alias for `env/current`)
+
+**Why cross-fork memo leakage is now impossible:** Each ward fork has a distinct env_id (from `BeamLisp.Env/fork`). Cache lookups include this id in the key, so fork A analyzing dirty source and fork B analyzing clean source (even with identical SHA-256) consult different cache slots. Sequential runs of the SAME file in the SAME env_id still hit the cache (warm daemon fast path preserved). Cross-FORK leakage is the bug that's fixed; cross-RUN sharing (when desired) still works.
+
+## Verification
+- Created `test/bl/reload/ward_isolation_test.bl` with three tests:
+  1. `mailbox-is-clean-in-ward-fork` — receives only test's own messages
+  2. `analyzer-memos-do-not-leak-across-forks` — env-scoped cache isolation
+  3. `ward-runner-isolates-forks` — end-to-end via `ward/run-sandboxed`
+
+Test must FAIL before fix (will demonstrate mailbox pollution + memo leak) and PASS after fix.
+
+NOTE [2026-09-16]: NOTE [2026-09-16, cross-session]: the uncommitted `priv/std/reload/ward.bl` edit in this worktree (the "MAILBOX HYGIENE (BUG-041)" worker-process spawn) does NOT PARSE, and it takes the whole test verb down with it.
+
+Measured: `bl lint priv/std/reload/ward.bl` → `error: unexpected )`. `bl test test/bl/anf_test.bl` — a file nobody touched — fails identically. `BeamLisp.Reader/read_string` on the file → `unexpected )` with no position data.
+
+Cause is a `)`/`]` TRANSPOSITION at line 185: offsets 9587 (`)`) and 9588 (`]`) are swapped. A typed-bracket stack walk reports `line 185: ')' but innermost open is '[' from line 163` followed by `']' but innermost open is '(' from line 163`. Note that a flat paren COUNT stays balanced — the file ends at depth 0 — which is why "remove one paren" does not fix it; it is a type mismatch, not a surplus.
+
+Verified fix: swapping those two adjacent characters makes the file read cleanly — `39 top-level forms` via `BeamLisp.Reader/read_string`, and `bl lint` then reports smells only. The API the change relies on does exist: `BeamLisp.Env.capture/0` at lib/beam_lisp/env.ex:397 and `bind/1` at :414.
+
+Careful before editing: another session may hold this file. Whoever lands it should re-run `bl test test/bl/anf_test.bl` as the gate.
+
+NOTE [2026-09-16]: Coordination (session 1581b4ed0954e773, 2026-09-16): I am working in the ANALYSIS STORE's read path next to you — PLAN-118 W1, "reads never block on a writer". Scope boundary, so we do not collide: I touch `priv/std/codebase.bl` = the store/cache half ONLY (`cache-path`, `manifest-*`, `connect-codebase`, the artifact OPEN path, `index!`'s artifact reuse) and I do NOT touch the fact-extraction half (`index-source`, `defn-facts`, `walk-calls*`, `instr-fact`) nor `priv/lib/system/analyze.bl`, `priv/lib/lsp.bl` — those are yours. If a lock/lease change would make your diagnosis of the diagnostics leak easier, say so in this item and I will keep the shape flexible.
+
+Why it is adjacent to your bug: the 30-minute `bl check` hang I measured today (1m27s CPU in 30m wall) is artifact-access, not accounting — a reader parked on another process's open fjall handle (fjall's `open/1` takes an exclusive file lock, freed only by GC). If a "leaked count" reproduces only in one process while another holds the store, the two are the same investigation and we should compare notes.
+
+NOTE [2026-09-16] — OBSERVABILITY SURFACE SHIPPED: `bl test --diagnose` (session 4-WardObservability).
+
+Instrument: `priv/std/reload/ward_diag.bl` (ns `reload.ward-diag`), a contamination ledger. At every test file's boundaries it inspects the surfaces a fork does NOT own and records what the file could have READ without having written it. Wired into `bl test --diagnose` (priv/std/bl/test.bl.md; flag parsed in priv/std/bl/cli.bl). `--deep` adds per-surface counters and every key; `--json` carries the findings under `:contamination`; WITHOUT the flag the ledger is not loaded (zero cost, zero output on the clean path). `--diagnose` refuses `--shared`/`--async` (one shared process = no per-file boundary to observe).
+
+Surfaces, each naming its fix pattern:
+- `mailbox` — a message in the runner's queue that is not ward's own result handoff. Names surface, file, tag + message, and the sender when the message names one. Fix: narrow the receive, or run the file in its own process (ward's worker spawn). Daemon protocol tuples classify as `:ambient` only when the runner IS the daemon executor.
+- `os-env` — a variable still set after the file ran. Fix: snapshot/restore the node environment around the file (ward does, sequentially).
+- `<memo>` — any registered VM-global memo; `lsp/analyzed`, `lsp/growth`, `lsp/diagnostics` register themselves (read through the env, so no lsp.bl edit), and a test or dev session can `register!` its own. A key with NO env-id is a WARNING naming surface + key (+ the writer env when known): the pre-BUG-041 shape, readable from every fork. An env-scoped key is only RECORDED (deep: what each file wrote, owners labelled e1/e2), never warned about — the scope IS what makes it unreachable.
+
+Honest limits, stated in the module: the FORK's own mailbox is not observable (the worker dies with it); the runner's queue is the proxy, and it is the queue a test would share if worker isolation regressed. An env-scoped memo entry is reported as retained, never as a leak.
+
+Reproduce (deliberate contamination; `test/fixtures/ward/leaker.bl` sends the runner a message, `bystander.bl` minds its business, leaker INERT unless a ledger is watching so a directory run moves nothing):
+
+  $ bin/bl test test/fixtures/ward/leaker.bl test/fixtures/ward/bystander.bl
+      → both green, NO ledger block at all
+  $ bin/bl test --diagnose test/fixtures/ward/leaker.bl test/fixtures/ward/bystander.bl
+      ── ward: contamination ledger ──
+        ⚠ mailbox     fixtures.ward.leaker — the runner received a message it did not send: [:ward-diag-probe 1]
+        2 file(s) watched, 1 warning(s)
+
+  (the clean file is never blamed; `--deep` on a real suite file prints
+   `lsp/analyzed  4 entries  env-scoped: e1` plus every key)
+
+Tests: `test/bl/reload/ward_diag_test.bl` — 14 green. A message the runner did not send is NAMED; a clean run prints NOTHING; an env-less memo key is named; an env-scoped write is recorded, not warned; with no observer the ledger stays empty. Mutation-verified: forcing `ward-message?` true makes the mailbox test FAIL (reverted).
+
+Doc: `docs/dev/ward-contamination.bl.md` — literate walkthrough: "my test passed alone and failed in the suite" → the tool output that names the leak → the fix patterns (memo key discipline / narrow receive / snapshot the env). Runs as a program; `bl doc run --check` → 5 cells, 0 cell errors, unchanged.
+
+WARD.BL: the parse failure described in the note above is FIXED (this session owned the repair; re-verify before overwriting). It was TWO defects, not one: (a) `run-file`'s docstring held UNESCAPED quotes (`({:"$gen_call", ...}`), so the reader ended the string early and parsed the remainder as code — which is why the file READ as 39 forms yet failed to LOAD; (b) the closers around the worker's `let [result …]` were transposed exactly as diagnosed above: `]` belongs at the end of the catch line (closing the binding vector) with `(erlang/send …)` as the let's body, whose line then closes let/fn/spawn. Measured after the repair: `reload.ward` loads, `bl test test/bl/reload/ward_isolation_test.bl` → 10 passed, and `bl test test/bl/anf_test.bl` — the gate the other session asked for — runs.
+
+NOTE [2026-09-16]: 2026-09-16 LATE ROOT CAUSE (orchestrator, after the ward/memo fixes landed): the phantom '6 diagnostics' (get on (:sym) 4:1, keyword-opts 89:1, keys/vals 365:1, dissoc 419:1, merge 577:1 — identical across check-test, lsp-cli, lsp-memo, lsp-test) came from a mechanism NONE of the earlier hypotheses named: priv/std/typed.bl:228-229 kept `(def warnings (atom []))` / `(def evidence (atom {}))` VM-GLOBAL and check-source-with NEVER RESET them — every typed check accumulated into every later caller's report. The phantom source was an earlier suite file's own deliberate dirty-fixture warnings (callable.test's cannot-be-called/arity cases et al — typed doing its job once, then leaking). Isolated runs always started with empty atoms, hence pass-alone/fail-in-suite; the failing assertion moved between runs because accumulation depends on what ran before. Ward forks share the atom through the env chain, so env-scoping (the lsp cache fix) could not have fixed this one. FIX: per-call state stashed in the process dictionary (typed/bl state-key, install+fresh per check-source-with, restore in finally); warn!/record! read the current call's pair; deferred.bl and callable_test.bl's reset!/delta dances deleted — the return value IS the slice now. TWO TRAPS LANDED AND FIXED in the same edit: (1) erlang/get's miss is :undefined not nil — some? accepted it, (:warnings :undefined) → nil → swap! crash under ward (stack via Elixir harness: refs.ex:122 ← typed walk); (2) a finally placed inside a let's body kills the VM with rc 141 and no diagnostic. Verified: check_test 49, callable 209, deferred 21, lsp_cli 8, lsp_memo 16 green; per-call isolation probed (second check returns [] in the same process). NB the same global-atom pattern may lurk in other priv/std analyzers — grep `(def warnings\|(def evidence\|(atom [])` at load scope when touching any checker.
+
+NOTE [2026-09-16]: 2026-09-16 CONSOLIDATED VERIFICATION: 20-file battery covering every failure observed today (anf, live.session, ward_isolation, ward, broadcast, frame, lsp×4, check, linear, mcp-mount, index-parallel, test-verb, tasks, build, callable, deferred, termination-anf) — all green in one sequential daemon session, i.e. under the exact contamination conditions that produced the original failures. The typed per-call fix additionally required preserving the ENGINE's ambient-warning contract (lsp-rpc's positionless-diagnostic test pins it): warn! outside a check now lands in a PROCESS-ambient table that lsp/diagnostics merges post-memo — session-scoped in a live editor, file-scoped in a suite (ward's worker-per-file). 62/62 lsp-rpc. Remaining before DONE: one full `bin/bl test` suite run on a quiet machine (repeatedly cancelled mid-run today due to daemon contention — every partial run showed the BUG-041 family gone; residuals found and fixed along the way: numeric-tower growth blindness BUG-062, anf.test contract update, explorer :default_backend cutover gap, ward worker timeout 60s→300s+reap, exit-code reconciliation 1-vs-2 between test_verb and tasks tests).
