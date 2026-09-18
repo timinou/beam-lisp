@@ -78,7 +78,7 @@ input.
                       (eof? body) :eof
                       (not (string? body)) :eof
                       (< (erlang/byte_size body) want) :eof
-                      :else (try {:msg (Jason/decode! body)}
+                      :else (try {:msg (bl.json/decode body)}
                                   (catch _e {:error :bad-json}))))
                   (catch _e {:error :bad-content-length}))))
             (let [kv (parse-header line)]

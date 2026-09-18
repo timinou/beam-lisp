@@ -1,0 +1,455 @@
+; bl/json.bl — JSON for beam-lisp values: the traversal is OURS, the bytes are
+; OTP's.
+;
+; ── Why this exists ─────────────────────────────────────────────────────────
+;
+; `Jason/encode!` is a protocol dispatch on ELIXIR structs. A beam-lisp value
+; that is not an Elixir map/list/binary/scalar therefore dies INSIDE the
+; library, naming a struct the caller never wrote:
+;
+;   [1 2]             %BeamLisp.Vector{}   -> Protocol.UndefinedError
+;   (map inc [1 2])   %BeamLisp.LazySeq{}  -> Protocol.UndefinedError
+;   #{1 2}            %BeamLisp.Set{}      -> Protocol.UndefinedError
+;   (symbol "<=")     a 2-tuple            -> Protocol.UndefinedError
+;   nil               an atom              -> the STRING "nil"
+;
+; `interop/jsonable` WAS the pre-walk that patched the first four, and it was
+; OPT-IN: `mcp/transport-stdio.bl`, `mcp/server.bl` and `web.bl` each called
+; `Jason/encode!` WITHOUT it, and there an unencodable value was DROPPED:
+; the transport caught it,
+; logs to stderr, and writes no line — which a client cannot tell from a server
+; still thinking. That is why the repair `code/verify` synthesized looked like a
+; hang until the caller timed out.
+;
+; This namespace IS the boundary, so the mapping lives once and no call site has
+; to remember a pre-pass. A value that cannot be represented fails LOUDLY, and
+; the message names where.
+;
+; ── The split: our traversal, OTP's bytes ───────────────────────────────────
+;
+; OURS — the part that knows beam-lisp:
+;   * which bl types are arrays, objects and strings, in one table;
+;   * nil -> null;
+;   * deterministic key order (sorted by the encoded key), so `--json` output is
+;     a stable contract rather than a function of map internals;
+;   * the DIAGNOSTIC: an error carrying an RFC 6901 JSON Pointer to the value.
+;
+; OTP's `json` module — EEP 68, RFC 8259 + ECMA 404, JSONTestSuite-tested:
+;   * `encode_binary/1` / `encode_binary_escape_all/1`: escaping AND UTF-8
+;     validation. An invalid byte raises `{invalid_byte, B}` — it does NOT go
+;     out as broken JSON;
+;   * `encode_integer/1` / `encode_float/1`: number formatting. Integers are
+;     exact (bignums included); floats use `[short]`, which round-trips;
+;   * `decode/3`: the LEXER — string escapes, surrogate pairs, UTF-8
+;     validation, the number grammar, and an EXPLICIT stack, so nesting depth is
+;     heap-bounded instead of call-stack-bounded.
+;
+; We do NOT use `json:encode/2`'s own recursion. Its callback is
+; `fun((Value, Encode) -> iodata())` — no user state — so it cannot carry the
+; path of the value it is encoding. Owning the recursion is what buys the
+; diagnostic, and it is also what lets `nil` be `null` and key order be sorted.
+;
+; ── The mapping, encode ─────────────────────────────────────────────────────
+;
+;   nil              null
+;   true/false       true/false
+;   string           string          (must be valid UTF-8)
+;   integer          number          (exact, however large)
+;   float            number          (NaN/Infinity FAIL — JSON has neither)
+;   keyword          string          ("kw" — the name, no colon)
+;   symbol           string          ("<=")
+;   map              object          (keys sorted; duplicates FAIL)
+;   vector           array
+;   list             array
+;   lazy seq         array
+;   range            array
+;   set              array           (members sorted, so the output is stable)
+;   foreign struct   its own Jason.Encoder, if it has one — the escape hatch
+;   anything else    FAIL, naming the path and the type
+;
+; ── The mapping, decode ─────────────────────────────────────────────────────
+;
+;   object           map             (keys are strings by default; see :keys)
+;   array            VECTOR          (so `[1 2]` survives a round trip)
+;   string           string
+;   integer          integer         (exact)
+;   float            float
+;   true/false       true/false
+;   null             nil
+;
+; A duplicate object key resolves to the LAST occurrence, which is what every
+; mainstream decoder does (JavaScript, Python, Go, Jason).
+;
+; ── What does NOT round-trip, and why that is not a defect ──────────────────
+;
+; A keyword and a symbol have no JSON spelling, so they cross as their NAMES:
+; `:kw` is the string "kw", `(symbol "<=")` is the string "<=". So the law
+;
+;   (= x (decode (encode x)))
+;
+; holds for the JSON-native subset — nil, booleans, numbers, strings, vectors,
+; lists, and maps whose keys have a text — and NOT for a keyword or a symbol,
+; which come back as strings. There is no honest alternative: giving `:kw` any
+; other spelling would produce a document no other JSON consumer could read,
+; which is the opposite of what a wire format is for.
+
+(ns bl.json)
+
+;; ── iodata plumbing ─────────────────────────────────────────────────────────
+
+(defn- concat-list
+  "A flat iodata list from the parts — one allocation, no intermediate strings."
+  [& parts]
+  (to-list parts))
+
+(defn- sep
+  "Interpose `s` between the pieces. Returns an Erlang LIST, because iodata is
+   lists of binaries: a vector nested inside would not be iodata."
+  [pieces s]
+  (to-list (reduce (fn [acc p] (if (empty? acc) (conj acc p) (conj (conj acc s) p)))
+                   [] pieces)))
+
+(defn- pad
+  "The indent for depth `level`, `n` spaces a level. Empty when not pretty.
+
+   `(= 0 n)` IS DELIBERATE, and `bl lint` wants `(zero? n)` here. Do not take
+   the suggestion: the comparison is doing double duty as a TYPE NARROWING.
+   `n` and `level` arrive from an options map (`(get opts :pretty 0)`), and the
+   analyzer infers a parameter's type from its CALL SITES, so both read as the
+   union of everything a map can hold. `(= 0 n)` narrows them to numbers; a
+   predicate does not, and `*` then reports
+
+     *: argument 1 is (nil :bool :fn :kw …), declared (:float :int)
+
+   which is a real diagnostic about a real raise, not a style warning.
+   Measured both ways: `(zero? n)` gives 0 smells + 1 diagnostic, `(= 0 n)`
+   gives 1 smell + 0 diagnostics. A declared `^{:args :ret}` does not change
+   it — verified against a probe."
+  [n level]
+  (if (= 0 n) "" (join "" (repeat (* n level) " "))))
+
+;; ── the diagnostic: an RFC 6901 JSON Pointer, so a message can say WHERE ────
+
+(defn- ptr-escape
+  "RFC 6901: `~` becomes `~0`, then `/` becomes `~1`."
+  [s]
+  (join "~1" (split (join "~0" (split s "~")) "/")))
+
+(defn- ptr-key
+  "The pointer for an object member."
+  [path k]
+  (str path "/" (ptr-escape (str k))))
+
+(defn- ptr-idx
+  "The pointer for an array element."
+  [path i]
+  (str path "/" i))
+
+(defn- fail
+  "Raise, naming the PATH of the value that could not be represented."
+  [path reason]
+  (throw (ex-info (str "bl.json: cannot encode " reason " (at \"" path "\")")
+                  {:path path :reason reason})))
+
+;; ── scalars ─────────────────────────────────────────────────────────────────
+
+(def ^:private max-float 1.7976931348623157e308)
+
+(defn- emit-string
+  "A JSON string. OTP escapes AND validates UTF-8, so a bad byte raises here
+   rather than going out as broken JSON — translated into a path-aware error,
+   because `{invalid_byte, 255}` says nothing about which field is at fault."
+  [s path opts]
+  (try
+    (if (= true (get opts :ascii))
+      (json/encode_binary_escape_all s)
+      (json/encode_binary s))
+    (catch e
+      (fail path (str "a string that is not valid UTF-8 [" (get e :original) "]")))))
+
+(defn- emit-float
+  "A JSON number from a float. NaN and Infinity have no JSON spelling, so they
+   FAIL rather than emit `nan`/`inf` — text no JSON reader will take back."
+  [v path]
+  (cond
+    (not= v v) (fail path "NaN — JSON has no NaN; send nil, a string, or omit the field")
+    (> (erlang/abs v) max-float) (fail path "Infinity — JSON has no Infinity")
+    :else (json/encode_float v)))
+
+(defn- symbol-value?
+  "A beam-lisp symbol IS a 2-tuple `{:symbol \"name\"}` — there is no struct to
+   test for. A tuple that is not one of these has no JSON representation."
+  [v]
+  (and (erlang/is_tuple v)
+       (= 2 (erlang/tuple_size v))
+       (= :symbol (erlang/element 1 v))))
+
+(defn- key-text
+  "The TEXT of a JSON object key. JSON keys are strings, and a bl map key may be
+   a string, keyword, symbol or number — each with an unambiguous text. Any
+   other key has none, so it FAILS with its path rather than being stringified
+   into something the reader cannot get back."
+  [k path]
+  (cond
+    (string? k) k
+    (keyword? k) (str k)
+    (symbol-value? k) (str k)
+    (float? k) (erlang/iolist_to_binary (emit-float k path))
+    (number? k) (erlang/iolist_to_binary (json/encode_integer k))
+    :else (fail path (str "an object key of type " (type k)
+                          " — JSON object keys are strings, so give this key one"))))
+
+;; ── the traversal ───────────────────────────────────────────────────────────
+
+(declare emit)
+
+(defn- emit-array
+  [items path opts pretty]
+  (if (empty? items)
+    "[]"
+    (let [level (inc (get opts :level 0))
+          child-opts (assoc opts :level level)
+          pieces (second (reduce (fn [st x]
+                                   (list (inc (first st))
+                                         (conj (second st)
+                                               (emit x (ptr-idx path (first st)) child-opts))))
+                                 (list 0 [])
+                                 items))
+          here (pad pretty (get opts :level 0))]
+      (if (zero? pretty)
+        (concat-list "[" (sep pieces ",") "]")
+        (concat-list "[" "\n" (pad pretty level)
+                     (sep pieces (str ",\n" (pad pretty level)))
+                     "\n" here "]")))))
+
+(defn- emit-object
+  "A JSON object. Keys are sorted by their ENCODED text so the output is stable
+   whatever the map's internal order is; two keys that encode to the same text
+   are a duplicate, which FAILS rather than silently dropping a member."
+  [m path opts pretty]
+  (let [ks (filter (fn [k] (not= :__struct__ k)) (keys m))]
+    (if (empty? ks)
+      "{}"
+      (let [level (inc (get opts :level 0))
+            child-opts (assoc opts :level level)
+            sorted (sort-by first
+                            (map (fn [k]
+                                   (let [text (key-text k path)]
+                                     (list text (emit (get m k) (ptr-key path text) child-opts))))
+                                 ks))
+            dup (second (reduce (fn [st kv]
+                                  (if (= (first st) (first kv))
+                                    (list (first kv) (first kv))
+                                    (list (first kv) (second st))))
+                                (list nil nil)
+                                sorted))
+            colon (if (zero? pretty) ":" ": ")
+            pieces (map (fn [kv] (concat-list (emit-string (first kv) path opts) colon (second kv)))
+                        sorted)
+            here (pad pretty (get opts :level 0))]
+        (if (some? dup)
+          (fail path (str "an object with two keys that both encode to \"" dup "\""))
+          (if (zero? pretty)
+            (concat-list "{" (sep pieces ",") "}")
+            (concat-list "{" "\n" (pad pretty level)
+                         (sep pieces (str ",\n" (pad pretty level)))
+                         "\n" here "}")))))))
+
+(defn- emit-collection
+  "The three collection arms, in one place.
+
+   A set is an ARRAY in JSON — there is no set — and its members are sorted by
+   their printed form so the same set always emits the same bytes."
+  [v path opts pretty]
+  (cond
+    (map? v) (emit-object v path opts pretty)
+    (set? v) (emit-array (sort-by pr-str (to-list v)) path opts pretty)
+    (sequential? v) (emit-array (to-list v) path opts pretty)
+    :else (fail path (str "a " (type v) " — no JSON representation"))))
+
+(defn- emit-struct
+  "A struct that is not a bl collection (a Date, a library response) encodes
+   itself — the escape hatch `interop/jsonable` used to protect, and which is
+   this namespace's own rule now. A struct WITHOUT an encoder (a bl record)
+   falls back to its own fields.
+
+   THIS IS THE ONE `Jason` CALL THIS NAMESPACE MAKES, AND IT IS DELIBERATE. It
+   is a DELEGATION, not a leftover: the mapping for someone else's type belongs
+   to that type's owner, and `Jason.Encoder` is where they wrote it. Rewriting
+   this call to `bl.json/encode` makes the encoder call itself on a struct —
+   infinite recursion, which presents as a HANG and not as an error. (It did,
+   once.) A sweep that replaces `Jason/` with `bl.json/` must skip this line."
+  [v path opts]
+  (let [own (try
+              (list :ok (Jason/encode! v))
+              (catch e (list :no nil)))]
+    (if (= :ok (first own))
+      (second own)
+      (emit-object v path opts (get opts :pretty 0)))))
+
+(defn- emit
+  "One value as iodata. The ONE dispatch table: every bl type is decided here,
+   and anything undecided fails naming its path.
+
+   `pretty` is read ONCE here rather than in each arm: three arms used to repeat
+   `(get opts :pretty 0)`, and the analyzer flags a subtree spliced more than
+   once (`emitted IR duplicates a N-node subtree`) — correctly, since the same
+   lookup compiled three times is the same lookup compiled three times."
+  [v path opts]
+  (let [pretty (get opts :pretty 0)]
+    (cond
+      (nil? v) "null"
+      (= true v) "true"
+      (= false v) "false"
+      (string? v) (emit-string v path opts)
+      (float? v) (emit-float v path)
+      (number? v) (json/encode_integer v)
+      ; a keyword and a symbol cross as their NAME and nothing else, so they
+      ; share one arm.
+      (or (keyword? v) (symbol-value? v)) (emit-string (str v) path opts)
+      (struct? v) (emit-struct v path opts)
+      ; one arm for "it is a collection", so the shared argument tail is written
+      ; once — and a subtree that repeats is what the analyzer flags
+      (or (map? v) (set? v) (sequential? v)) (emit-collection v path opts pretty)
+      :else (fail path (str "a " (type v) " — no JSON representation")))))
+
+;; ── encode ──────────────────────────────────────────────────────────────────
+
+(defn- normalize-opts
+  "`:pretty true` means two spaces; `:pretty N` means N. Anything else is
+   compact. Normalized once here so the traversal never re-decides."
+  [opts]
+  (let [p (get opts :pretty 0)]
+    (assoc opts :pretty
+           (cond
+             (= true p) 2
+             (number? p) p
+             :else 0))))
+
+(defn encode
+  "A beam-lisp value as JSON, as a string.
+
+   Options:
+     :pretty N     indent N spaces per level (0, the default, is compact)
+     :ascii true   escape every non-ASCII character as \\uXXXX, for a receiver
+                   that is not going to read UTF-8
+
+   The value mapping is the table at the head of this file. A value with no JSON
+   representation raises, and the message names its RFC 6901 path."
+  ([v] (encode v {}))
+  ([v opts]
+   (erlang/iolist_to_binary (emit v "" (normalize-opts opts)))))
+
+(defn try-encode
+  "`encode`, as a result map: `{:ok string}` or `{:error message}`. The total
+   form, for a boundary that must answer a peer even when it cannot encode."
+  ([v] (try-encode v {}))
+  ([v opts]
+   (try
+     {:ok (encode v opts)}
+     (catch e {:error (str e)}))))
+
+;; ── decode ──────────────────────────────────────────────────────────────────
+
+(defn- key-fn
+  "How an object key becomes a beam-lisp key. `:string` is the default because
+   it is the only TOTAL one: `:keyword` interns an atom per key, and the atom
+   table is a bounded, never-collected resource, so a document from a peer is a
+   way to exhaust it. `:existing-atom` asks for an atom that already exists —
+   safe on untrusted input, but it fails on a key it has never seen."
+  [opts]
+  (let [mode (get opts :keys :string)]
+    (cond
+      (= mode :keyword) (fn [k] (keyword k))
+      (= mode :existing-atom) (fn [k]
+                                (try
+                                  (erlang/binary_to_existing_atom k :utf8)
+                                  (catch e
+                                    (throw (ex-info
+                                             (str "bl.json: decode :keys :existing-atom met the new key \""
+                                                  k "\" — the atom table grows and is never collected, "
+                                                  "so this refuses to intern it")
+                                             {:key k})))))
+      :else (fn [k] k))))
+
+(defn- decoders
+  "OTP's per-type decoder callbacks. We supply the VALUE CONSTRUCTION — arrays
+   become vectors, `null` becomes nil, keys follow `:keys` — and OTP keeps the
+   lexer: the escapes, the surrogate pairs, the UTF-8 validation, the number
+   grammar, and the explicit stack that keeps deep nesting off the call stack."
+  [opts]
+  (let [kf (key-fn opts)]
+    {:array_start  (fn [old] (list))
+     :array_push   (fn [elem acc] (conj acc elem))
+     :array_finish (fn [acc old] (erlang/list_to_tuple (list (vec (reverse acc)) old)))
+     :object_start (fn [old] (list))
+     :object_push  (fn [k v acc] (conj acc (erlang/list_to_tuple (list k v))))
+     ;; assoc in document order, so a repeated key keeps the LAST one — what
+     ;; JavaScript, Python, Go and Jason all do.
+     :object_finish (fn [acc old]
+                      (erlang/list_to_tuple
+                        (list (reduce (fn [m kv] (assoc m (kf (first kv)) (second kv)))
+                                      {}
+                                      (reverse acc))
+                              old)))
+     :null nil}))
+
+(defn- trailing-error
+  [rest]
+  (ex-info (str "bl.json: " (erlang/byte_size rest) " trailing bytes after the document: \""
+                (if (> (erlang/byte_size rest) 24) (subs rest 0 24) rest) "\"")
+           {:trailing rest}))
+
+(defn- decode-failure
+  "OTP's lexer errors, said in a way that names what is wrong. `original` is the
+   reason the BEAM raised: `:unexpected_end`, `{invalid_byte, B}` or
+   `{unexpected_sequence, S}`."
+  [e]
+  (let [orig (get e :original)]
+    (cond
+      (= :unexpected_end orig)
+        "the document ends in the middle of a value"
+      (and (erlang/is_tuple orig) (= :invalid_byte (erlang/element 1 orig)))
+        (let [b (erlang/element 2 orig)]
+          (str "an unexpected byte " b
+               (if (and (>= b 32) (<= b 126))
+                 (str " (\"" (erlang/list_to_binary (list b)) "\")")
+                 "")
+               " — not JSON here"))
+      (and (erlang/is_tuple orig) (= :unexpected_sequence (erlang/element 1 orig)))
+        (str "an unexpected sequence " (erlang/element 2 orig))
+      :else (str e))))
+
+(defn decode
+  "A JSON document as beam-lisp data. The mapping is the decode table at the
+   head of this file: objects are maps, arrays are VECTORS, `null` is nil.
+
+   Options:
+     :keys :string         (default) object keys stay strings
+     :keys :keyword        object keys become keywords (interns an atom per key)
+     :keys :existing-atom  object keys become the atom that already exists
+
+   Raises on malformed input. `json:decode/3` also returns the UNPARSED tail;
+   this wrapper treats a non-empty one as a malformed document, because one call
+   is one document."
+  ([s] (decode s {}))
+  ([s opts]
+   (if-not (string? s)
+     (throw (ex-info (str "bl.json: decode wants a string, got a " (type s)) {:value s}))
+     (let [r (try
+               (json/decode s :ok (decoders opts))
+               (catch e
+                 (throw (ex-info (str "bl.json: " (decode-failure e))
+                                 {:reason (get e :original)}))))]
+       (let [rest (erlang/element 3 r)]
+         (if (= "" rest)
+           (erlang/element 1 r)
+           (throw (trailing-error rest))))))))
+
+(defn try-decode
+  "`decode`, as a result map: `{:ok value}` or `{:error message}`."
+  ([s] (try-decode s {}))
+  ([s opts]
+   (try
+     {:ok (decode s opts)}
+     (catch e {:error (str e)}))))

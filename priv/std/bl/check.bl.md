@@ -202,7 +202,7 @@ the command's cwd, so the file survives a move to another checkout.
         ; prints a top-level string WITHOUT its quotes — the reader would take
         ; the path as a symbol and every lookup would miss. Every quoted string
         ; here comes from the encoder that never forgets the quotes.
-        line (fn [k] (str "         " (Jason/encode! k) " " (pr-str (get files k))))]
+        line (fn [k] (str "         " (bl.json/encode k) " " (pr-str (get files k))))]
     (str "{:version " (:version b) "\n"
          " :metrics " (pr-str (:metrics b)) "\n"
          " :files {" (join "\n" (map line keys)) "}}\n")))

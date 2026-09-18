@@ -3,10 +3,10 @@
 `bl` commands live in their own namespaces (`bl.check`, `bl.lint`, `bl.repl`,
 …) and do the same few chores at their edges: print a line to stderr, turn a
 file or directory argument into the sources to act on, save a file through the
-cwd the caller is standing in, and hand a value to Jason. Those chores live
-here once so every verb speaks the same dialect.
+cwd the caller is standing in, and hand a value to the encoder. Those chores
+live here once so every verb speaks the same dialect.
 
-Three shape-mismatches explain almost everything in this namespace.
+Two shape-mismatches explain almost everything in this namespace.
 
 - **Elixir option APIs read keyword lists.** `Keyword.get/3`, any `Enum`
   function taking `opts`, and the loader's ward entry points pattern-match
@@ -14,16 +14,17 @@ Three shape-mismatches explain almost everything in this namespace.
   beam-lisp literal cannot spell the tuple, so `kw-pair` and `kw` build the
   tuple list the Elixir side expects.
 
-- **beam-lisp collections are their own types.** A `[…]` literal is a
-  `BeamLisp.Vector` struct and a `#{…}` is a `BeamLisp.Set`; Jason encodes
-  neither. `plain` recursively lowers a value to the lists, maps and strings
-  Jason accepts, so one `emit` can serve both the human reader and the `--json`
-  reader of the same data.
-
 - **A command resolves file arguments against the client's cwd.** A standalone
   `bl` runs in the caller's shell, where the OS cwd is already right. The
   daemon serves many clients from one VM, so `resolve` reads the cwd the
   request bound rather than the daemon's own checkout.
+
+A THIRD used to be here, and it is worth knowing why it is not: a `[…]` literal
+is a `BeamLisp.Vector` struct and a `#{…}` a `BeamLisp.Set`, and `Jason`
+encoded neither — so every `--json` value was lowered first by `plain`, a
+recursive converter into lists and string-keyed maps. `bl.json` takes a
+beam-lisp value as it stands, so the mismatch and the pass are both gone: `emit`
+hands the value straight to the encoder.
 
 The functions here return, they never halt. A command namespace hands its
 `run` an integer exit code; `bl.cli/main` is the only place a process leaves.
@@ -152,51 +153,32 @@ A command produces a value and prints it two ways. The human way is a render
 function the command supplies. The machine way is JSON, and it is the same
 value either way — `--json` changes the printer, not the data.
 
-`plain` is the one lowering step JSON needs. It converts a keyword to its name,
-a vector, list, set or lazy seq to an Erlang list, a map to a string-keyed map,
-and does so recursively. A `BeamLisp.Vector` reaches Jason as a struct it
-cannot encode, so the conversion happens here once rather than at every call
-site. A foreign struct with its own `Jason.Encoder` is left intact so a library
-value encodes the way its owner intends.
+There is no lowering step. `emit` hands the value to `bl.json/encode`, which
+takes beam-lisp data as it stands: a keyword as its name, a vector and a lazy
+seq as arrays, a set as an array in a stable order, a map as an object. A
+foreign struct with its own `Jason.Encoder` is still left to its owner, so a
+library value encodes the way its owner intends.
+
+This paragraph used to describe `plain`, a recursive converter that existed only
+because `Jason` refused a `BeamLisp.Vector` and a `BeamLisp.Set`. It was one of
+FOUR copies of that walk in this tree — `plain` here, `jsonable` in `interop`,
+`json-safe` in `lsp.rpc`, and inline calls in `tooling.pulse`. All four are gone,
+which is why there is nothing to describe.
 
 `emit` picks the printer. `render` may be nil for a command whose JSON is the
 only content. `usage-error` reports a bad invocation and returns the CLI's
 usage exit code.
 
 ```beam-lisp
-(defn- plain-key [k]
-  (cond (keyword? k) (name k)
-        (string? k) k
-        :else (str k)))
-
-(defn plain
-  "A beam-lisp value → the plain BEAM shapes Jason encodes. Keywords become
-   their name (a JSON string); vectors, lists, sets and lazy seqs become Erlang
-   lists; map keys become strings; the conversion is recursive. Jason rejects a
-   BeamLisp.Vector or BeamLisp.Set deep in its encoder, so every `--json` output
-   crosses here once."
-  [x]
-  (cond
-    (keyword? x) (name x)
-    (vector? x) (Enum/to_list (Enum/map (Enum/to_list x) (fn [e] (plain e))))
-    (set? x)    (Enum/to_list (Enum/map (Enum/to_list x) (fn [e] (plain e))))
-    (list? x)   (Enum/to_list (Enum/map (Enum/to_list x) (fn [e] (plain e))))
-    (BeamLisp.LazySeq/lazy? x) (Enum/to_list (Enum/map (doall x) (fn [e] (plain e))))
-    (struct? x) x
-    (map? x)    (Map/new (Enum/to_list
-                           (Enum/map (Enum/to_list x)
-                             (fn [t] (kw-pair (plain-key (erlang/element 1 t))
-                                              (plain (erlang/element 2 t)))))))
-    :else x))
-
 (defn emit
   "Print `data` through the command's output mode. With `:json` in the parsed
-   argv, prints `(Jason/encode! (plain data))`; otherwise prints `(render data)`
-   when that returns a string. `render` may be nil when the JSON is the only
+   argv, prints `(bl.json/encode data)` — no lowering step, because the encoder
+   takes beam-lisp values as they are; otherwise prints `(render data)` when
+   that returns a string. `render` may be nil when the JSON is the only
    content. Returns nil."
   [st data render]
   (if (:json st)
-    (println (Jason/encode! (plain data)))
+    (println (bl.json/encode data))
     (when render
       (let [s (render data)]
         (when s (println s)))))

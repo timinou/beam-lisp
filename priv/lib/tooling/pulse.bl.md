@@ -275,7 +275,7 @@ of the pattern \u2014 the roster machinery is `data.registry`, not bespoke code.
           (apply str
                  (map (fn [c]
                         (str "q.push(['" (nth c 0) "','" (nth c 1) "',"
-                             (Jason/encode! (interop/jsonable (nth c 2))) "]);"))
+                             (bl.json/encode (nth c 2)) "]);"))
                       cells))
           "})();")])
   ```
@@ -354,10 +354,9 @@ kind histogram, and the tracked cells.
      :ops (:ops f)}))
 
 (defn frame-json
-  "The snapshot as a JSON string, bl collections deep-converted so Jason can
-   encode them. This is what a websocket ships each tick."
+  "The snapshot as a JSON string. This is what a websocket ships each tick."
   []
-  (Jason/encode! (interop/jsonable (assoc (snapshot) :msg "snapshot"))))
+  (bl.json/encode (assoc (snapshot) :msg "snapshot")))
 ```
 
 ## Shape one: the full page
@@ -1030,7 +1029,7 @@ purpose rather than by oversight.
     :else [:ok state]))
 
 (defn- reply [state msg]
-  [:push (list (list :text (Jason/encode! (interop/jsonable msg)))) state])
+  [:push (list (list :text (bl.json/encode msg))) state])
 
 (defn- frame-at
   "One frame rendered for the timeline: its html (the tree is a value we
@@ -1050,7 +1049,7 @@ purpose rather than by oversight.
   (try
     (if (= :mount (:kind f))
       (count (h/hiccup->html (:tree f)))
-      (count (Jason/encode! (interop/jsonable (:ops f)))))
+      (count (bl.json/encode (:ops f))))
     (catch _ 0)))
 
 (defn- timeline-index

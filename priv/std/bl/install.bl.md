@@ -309,7 +309,7 @@ exactly as it is, so a second install changes nothing.
    a tool loses somebody's servers."
   [path]
   (if (File/regular? path)
-    (try (Jason/decode! (File/read! path))
+    (try (bl.json/decode (File/read! path))
          (catch e {:unreadable (str e)}))
     {}))
 
@@ -333,7 +333,7 @@ exactly as it is, so a second install changes nothing.
         (if (contains? existing :unreadable)
           {:error (str path " does not parse as JSON — fix it, then re-run")}
           (do (File/write! path
-                (str (Jason/encode! {"mcpServers"
+                (str (bl.json/encode {"mcpServers"
                                      (assoc servers mcp-server-name
                                             {:command "bl" :args (list "mcp")})})
                      "\n"))

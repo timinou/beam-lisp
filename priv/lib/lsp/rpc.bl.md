@@ -86,41 +86,27 @@ and only claims a message when the whole body has arrived.
           :else
           (let [body (erlang/binary_part bytes bstart n)
                 rest (erlang/binary_part bytes (+ bstart n) (- end (+ bstart n)))]
-            {:msg (Jason/decode! body) :rest rest}))))))
+            {:msg (bl.json/decode body) :rest rest}))))))
 
 (defn encode-frame
   "A message map → the bytes of one LSP frame."
   [msg]
-  (let [json (Jason/encode! msg)]
+  (let [json (bl.json/encode msg)]
     (str "Content-Length: " (erlang/byte_size json) "\r\n\r\n" json)))
 ```
 
 ## JSON-safe values
 
 `handle` answers in beam-lisp data — keywords, vectors, sets, lazy sequences.
-Jason encodes none of those, and a beam-lisp vector reaches it as a struct it
-refuses. `json-safe` lowers a value once: keywords to strings, maps to
-string-keyed maps, everything sequential to Erlang lists. Every response and
-notification passes through it, so the server's writer may hand Jason whatever
-`handle` returned.
+This used to need a `json-safe` lowering here: `Jason` encoded none of those,
+and a beam-lisp vector reached it as a struct it refused, so every response and
+notification was walked once before the writer saw it.
 
-```beam-lisp
-(defn- key-str [k] (if (keyword? k) (name k) (str k)))
-
-(defn json-safe
-  "A beam-lisp value → the lists, string-keyed maps and scalars Jason encodes."
-  [x]
-  (cond
-    (keyword? x) (name x)
-    (map? x) (reduce (fn [out t]
-                       (assoc out (key-str (get t 0)) (json-safe (get t 1))))
-                     {} (to-list x))
-    (vector? x) (to-list (map json-safe x))
-    (list? x) (to-list (map json-safe x))
-    (set? x) (to-list (map json-safe (to-list x)))
-    (BeamLisp.LazySeq/lazy? x) (to-list (map json-safe (doall x)))
-    :else x))
-```
+That walk is gone. `bl.json` owns the mapping — a vector and a lazy seq are
+arrays, a set is an array in a stable order, `nil` is null, a keyword is its
+name — so the writer hands its value straight to the encoder. The rule the
+lowering used to enforce ("a response must be JSON-safe before it is written")
+is now unrepresentable: there is nothing to remember.
 
 ## Positions: 1-based codepoints ↔ 0-based UTF-16
 
@@ -282,18 +268,18 @@ specifies for go-to-definition.
 ## Envelopes
 
 Three shapes cross the wire: a response carrying a result, an error response,
-and a notification. Each lowers its payload through `json-safe` so the writer
-never has to know what a beam-lisp vector is.
+and a notification. The payload is beam-lisp data and the encoder takes it as
+it stands — see "JSON-safe values" above.
 
 ```beam-lisp
 (defn- response [id result]
-  {"jsonrpc" "2.0" "id" id "result" (json-safe result)})
+  {"jsonrpc" "2.0" "id" id "result" result})
 
 (defn- error-resp [id code message]
   {"jsonrpc" "2.0" "id" id "error" {"code" code "message" message}})
 
 (defn- notification [method params]
-  {"jsonrpc" "2.0" "method" method "params" (json-safe params)})
+  {"jsonrpc" "2.0" "method" method "params" params})
 
 (defn parse-error
   "The response to an unframable inbound message: JSON-RPC -32700."

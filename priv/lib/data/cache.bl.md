@@ -144,7 +144,7 @@ recording the fact. The same inputs never compute twice.
 
       ; durable hit: on disk from a previous run. Warm the hot tier.
       (and path (File/exists? path))
-      (let [value (Jason/decode! (File/read! path))]
+      (let [value (bl.json/decode (File/read! path))]
         (swap! hot assoc hash value)
         (note! store hash :hot (byte-size value))
         value)
@@ -155,13 +155,13 @@ recording the fact. The same inputs never compute twice.
         (swap! hot assoc hash value)
         (when path
           (File/mkdir_p! (:vault/dir store))
-          (File/write! path (Jason/encode! value)))
+          (File/write! path (bl.json/encode value)))
         (note! store hash (if path :durable :hot) (byte-size value))
         value))))
 
 (defn- byte-size [value]
   ; a cheap, honest estimate: the encoded size the durable tier would write.
-  (try (String/length (Jason/encode! value)) (catch _ 0)))
+  (try (String/length (bl.json/encode value)) (catch _ 0)))
 ```
 
 ## The payoff: query the cache
