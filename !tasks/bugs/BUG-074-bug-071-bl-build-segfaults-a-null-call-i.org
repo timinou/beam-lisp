@@ -204,3 +204,74 @@ NOTE [2026-09-18]: FOURTH ROUND (2026-09-18) — it is 100% reproducible, and fo
    - `nif_init` called `rt::internal_write_symbols()` inside its own `OnceLock`, so the dynamic NIF API symbol table was written only on the first call. Rustler's generated entry (rustler_codegen::init.rs:141) writes it UNCONDITIONALLY on every call — and it must, because the accessors read that table with `Option::unwrap_unchecked`, so a zeroed slot is not a bad argument and not a panic, it is a call to address 0. Every crate in `native/` takes that dynamic path (`nm -D` shows zero undefined `enif_*` symbols anywhere and `dlsym` in every object), so the whole family shares the hazard; `lazy_memo` was simply the one that hand-rolled the write into a cache.
 
 5. Where to look next, unchanged in direction and now much cheaper to test: the crash is deterministic in the SEQUENCE, not in the work. With `native-key` bypassed, ~331,000 native calls in one process still precede it, and it still lands in the same place. Instrument the boundary between one `native-one` returning and the next beginning — `rest`/`first`/`empty?` over the crate seq — or run the loop over a hardcoded 7-element list and see whether the 7th element alone reproduces it.
+
+NOTE [2026-09-18]: RESOLVED (2026-09-18) — root cause found, fixed, verified. Commit d05862cd.
+
+* ROOT CAUSE. `bl build` truncated the NIF it was running from.
+
+`native-one` copied each freshly built (or cache-hit) artefact straight onto
+`priv/native/<crate>.so` — `File/cp! found dest`. But `bl build` runs IN THE SAME
+VM that has those `.so` files mapped as NIFs. Truncating a file that is mapped
+executable makes the kernel drop the mapped PTEs across the truncated range, so
+the next fault re-reads the NEW file. A relocated `.got` slot then reads back as
+zero — the file's content, before the loader ever writes the addend into it — and
+the next `call *slot` jumps to address 0.
+
+That is the whole bug, and it explains its shape rather than just its site:
+- it could only land in the crate that had JUST been installed (crate 6 of 7);
+- it needed a NIF to be live to be visible at all;
+- it vanished from any test that did not map the file being written.
+
+* HOW THE LAST ROUND FOUND IT, having eliminated everything else. Live gdb on a
+crash, not a core:
+  #1 handle_nif_result+205:  call *0x4e475(%rip)   # slot = base + 0x84348
+At the FIRST NIF return that slot holds base+0x3b360 — correctly relocated. At
+the crash it is zero. Three instruments all came back SILENT, and their silence
+was the answer:
+  - a hardware watchpoint on the slot caught NO WRITE;
+  - catchpoints on mmap/munmap over the library range caught NO REMAP;
+  - `LD_DEBUG=files,reloc` showed ONE load, relocated, and NO unload;
+  - the load base was identical at both observations.
+A read-only page whose value changed with no write and no remap means the
+MAPPING was replaced, not the memory — and `truncate` does exactly that.
+
+The earlier "the GOT slot is zero" reading of the core was right after all; it
+was my recalculation of the base in between that was wrong.
+
+* THE FIX. `install-artifact!` copies beside the destination and renames over it.
+`rename` gives the destination a DIFFERENT inode, so the running VM keeps the
+mapping it is executing and nothing changes underneath it. `BeamLisp.Native.build!`
+(priv/std/vm/native.bl) has always installed this way — this is the same rule, in
+the build path that was missing it. One need, two implementations, one wrong, and
+the wrong one ran on every build.
+
+* MEASURED.
+  before   100% fatal: EXIT=139 (sometimes 132) on every run, crate 6 of 7
+  after    6/6 clean, EXIT=0, all SEVEN crates — `wry_webview` included, which
+           the old code never reached at all
+  suites   build 37, build_plan 26, deps 15, seed 25, nif_trace 4, lazy+seq 30
+
+* RELATED. BUG-078 (SIGSEGV in a `.so` fini destructor at VM exit, filed
+independently) is a different window on the same family of hazards — a library
+being torn down or replaced under a live VM. That one is NOT fixed by this and
+has not been reproduced since; it should be re-tested now that `bl build`
+completes, because the crash it was diagnosed from may itself have been this bug
+arriving at a different moment.
+
+* PERFORMANCE, measured and honestly reported. Profiled warm `bl build` (12 s):
+  VM start 0.5 s · bootstrap install 0.4 s · app start 0.4 s ·
+  `ensure_loaded "bl.cli"` 2.6 s · project/claim/reload 0.7 s ·
+  `run` 3.6 s (of which read+parse of all sources 0.15 s, native stage ~1 s)
+So the BUILD is not the cost; per-VM startup and interning are. `bl.cli` is
+AOT-cached (748 beams in `build/`), so the 2.6 s is interning, which is the
+per-invocation design cost a daemon exists to amortize — and no `bl` daemon
+persists between commands on this host right now.
+
+Two things found and NOT changed, because they are the user's call:
+  - the host's `ELIXIR_ERL_OPTIONS=+S 4:4` DOUBLES the build: 23 s at `+S 4:4`
+    against 12 s at `+S 8:8`. A build is a batch job; four schedulers for it is
+    the single largest lever measured.
+  - the redundant copy is gone (18 MB of `.so` and seven inodes per build, now
+    skipped when the bytes are identical), but that is NOT claimed as a
+    speed-up: a warm build measures the same. It is fewer inodes replaced, which
+    is the hazard this bug was.
