@@ -1,101 +1,66 @@
-//! `bl_json` — the native half of `bl.json`, at SPIKE stage.
+//! `bl_json` — the native half of `bl.json`: the byte loop, at Erlang speed.
 //!
-//! FEAT-043's v2 design rests on three load-bearing assumptions. This file
-//! exists to turn them from arguments into observations. Two are already
-//! settled by reading rustler 0.38:
+//! # The split
 //!
-//! 1. **A NIF cannot read `:persistent_term`.** `rustler::Env` exposes
-//!    `whereis_pid`, `send` and `binary_to_term` and no MFA call, so the record
-//!    registry has to arrive as an ARGUMENT. That is the better shape anyway:
-//!    the registry is bl's policy, and `persistent_term:get` returns a shared
-//!    term, so passing it costs nothing. Not a NIF's business to reach for.
-//! 2. **A NIF can build a bl struct term** — `%BeamLisp.Vector{items: {…}}` is a
-//!    map with a `__struct__` key, and `Env::map_new` + `Term::map_put` are
-//!    enough. `spike_vector/1` is that claim, executed.
-//! 3. **serde_json over an Erlang term walk is fast enough to matter.**
-//!    `spike_encode/1` and `spike_decode/1` are the measurement.
+//! bl DECIDES; Rust WRITES BYTES. Every policy stays in `priv/std/bl/json.bl` — the
+//! value mapping, `nil` as null, keys sorted by their encoded text, `:pretty`,
+//! `:ascii`, records declared through the wire registry, and every error message with
+//! its RFC 6901 path. This crate owns exactly two things: assembling JSON text while
+//! walking a term, and building Erlang terms while parsing JSON text.
 //!
-//! The term walk here converts to `serde_json::Value` first — an intermediate
-//! tree the real encoder will NOT build, since it will stream through a
-//! `Serializer`. So these numbers are an UPPER BOUND on the cost, which is the
-//! direction that makes them safe to quote.
+//! # Why it is here at all
 //!
-//! What this file is NOT: the real encoder. No options, no ordering contract,
-//! no error paths with an RFC 6901 pointer, no record handling. Those stay in
-//! `bl.json`, which is the whole architecture — bl decides, Rust writes bytes.
+//! A beam-lisp call costs ~0.7–1.0 us (measured), and a serialiser needs several per
+//! node, so bl-level traversal cannot compete with a native loop. MEASURED, same
+//! process, 24.3 KB, best of 11:
+//!
+//! ```text
+//!                     bl.json today    this crate    Jason
+//!   encode            16–23 ms         0.43–0.59 ms  0.46–0.57 ms
+//!   decode            2.5 ms           0.85 ms       0.35 ms
+//! ```
+//!
+//! Encode is at parity with Jason and ~30x better than assembling in bl. Decode is 3x
+//! better than bl.json; the remaining 2.5x gap splits into 0.35 ms of building bl
+//! Vectors (which Jason does not do, because bl documents that arrays decode to Vectors
+//! so a round trip holds) and a ~1.5x serde-visitor cost that would need a hand-written
+//! parser to remove.
+//!
+//! Both directions are byte-compatible with the codec they replace, and compose:
+//! `bl.json/encode(json_decode(bytes)) == bytes`.
+//!
+//! # Two things this crate must NOT do
+//!
+//! - Reach for `:persistent_term`. rustler's `Env` has no MFA call, so a NIF CANNOT —
+//!   which is the right shape anyway: the record wire registry is bl's policy, and bl
+//!   hands it down. (Not needed yet: records are refused and escape to bl.)
+//! - Emit `{"__struct__": …}` for a struct it does not know. A Stream/Set/record/foreign
+//!   struct is REFUSED, loudly, so the caller can handle it in bl. Silently serialising
+//!   a struct's internals is how a wrong document gets written.
 
 use rustler::types::atom::Atom;
 use rustler::types::map;
-use rustler::types::tuple::make_tuple;
+use rustler::types::tuple::{get_tuple, make_tuple};
 use rustler::{Binary, Env, Error, NifResult, OwnedBinary, Term};
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value as Json};
 use std::collections::HashMap;
 
 fn err(msg: impl std::fmt::Display) -> Error {
     Error::Term(Box::new(format!("{}", msg)))
 }
 
-/// The marker `vm.native/available?` calls to tell a loaded NIF from the
-/// unloaded stub. Without it every availability check answers false while every
-/// real call works — the capability reads as absent while being present.
+/// The marker `vm.native/available?` calls to tell a loaded NIF from the unloaded stub.
 #[rustler::nif]
 fn __nif_loaded__() -> bool {
     true
 }
 
-/// Assumption 2: a NIF CAN build a bl struct term.
+// ── shared: term helpers ────────────────────────────────────────────────────
+
+/// An object key as text: an atom (a bl keyword) or a binary.
 ///
-/// `%BeamLisp.Vector{items: {…}, meta: nil}` is an Erlang map with a
-/// `__struct__` key holding the module atom; `items` is a TUPLE, not a list, so
-/// `make_tuple` is what puts the elements in. If bl then reads this back as a
-/// vector — `vector?`, `count`, and `bl.json/encode` giving `[1,2,3]` — the
-/// claim holds and a native decoder can build bl values directly instead of
-/// handing Elixir a list to wrap.
-#[rustler::nif]
-fn spike_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
-    let tuple = make_tuple(env, &items);
-    let m = map::map_new(env);
-    let m = m.map_put(
-        Atom::from_str(env, "__struct__")?,
-        Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
-    )?;
-    m.map_put(Atom::from_str(env, "items")?, tuple)
-}
-
-/// Assumption 3, encode direction. A term tree in, JSON bytes out.
-#[rustler::nif(schedule = "DirtyCpu")]
-fn spike_encode<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
-    let value = to_json(term)?;
-    let bytes = serde_json::to_vec(&value).map_err(err)?;
-    let mut owned = OwnedBinary::new(bytes.len()).ok_or_else(|| err("alloc"))?;
-    owned.as_mut_slice().copy_from_slice(&bytes);
-    Ok(Binary::from_owned(owned, env))
-}
-
-/// Assumption 3, decode direction. JSON bytes in, bl-shaped term out.
-///
-/// Arrays come back as LISTS here — `spike_decode_bl/1` below is the one that
-/// builds Vectors, and the pair is deliberately kept so the cost of building
-/// them can be measured rather than assumed.
-#[rustler::nif(schedule = "DirtyIo")]
-fn spike_decode<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
-    from_json(env, value, false)
-}
-
-/// The REAL decode shape: an array becomes a bl Vector, as `bl.json/decode`
-/// documents ("arrays decode to vectors so a round trip holds").
-#[rustler::nif(schedule = "DirtyIo")]
-fn spike_decode_bl<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
-    from_json(env, value, true)
-}
-
-// ── the term walk (spike: via an intermediate Value) ────────────────────────
-
+/// `atom_to_string` lives on `Term`, not on `Atom`, and answers Ok only when the term
+/// IS an atom — which is exactly the discriminator wanted.
 fn as_key(term: Term) -> NifResult<String> {
-    // `atom_to_string` lives on Term, not on Atom: it answers Ok only when the
-    // term IS an atom, which is exactly the discriminator we want.
     if let Ok(name) = term.atom_to_string() {
         return Ok(name);
     }
@@ -105,51 +70,10 @@ fn as_key(term: Term) -> NifResult<String> {
     Err(err("object key is not an atom or a string"))
 }
 
-fn to_json(term: Term) -> NifResult<Json> {
-    // Order matters: a binary must be claimed before the atom check would try
-    // it, and integers before floats.
-    if let Ok(b) = term.decode::<Binary>() {
-        return Ok(Json::String(
-            String::from_utf8_lossy(b.as_slice()).into_owned(),
-        ));
-    }
-    if let Ok(name) = term.atom_to_string() {
-        return Ok(match name.as_str() {
-            "nil" => Json::Null,
-            "true" => Json::Bool(true),
-            "false" => Json::Bool(false),
-            // a bl keyword and a bl symbol both cross as their name
-            _ => Json::String(name),
-        });
-    }
-    if let Ok(i) = term.decode::<i64>() {
-        return Ok(Json::Number(JsonNumber::from(i)));
-    }
-    if let Ok(f) = term.decode::<f64>() {
-        return JsonNumber::from_f64(f)
-            .map(Json::Number)
-            .ok_or_else(|| err("non-finite float"));
-    }
-    if let Ok(items) = term.decode::<Vec<Term>>() {
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            out.push(to_json(item)?);
-        }
-        return Ok(Json::Array(out));
-    }
-    if let Ok(entries) = term.decode::<HashMap<Term, Term>>() {
-        let mut out = JsonMap::new();
-        for (k, v) in entries {
-            out.insert(as_key(k)?, to_json(v)?);
-        }
-        return Ok(Json::Object(out));
-    }
-    Err(err("term has no JSON representation in the spike walk"))
-}
-
-/// A bl Vector: an Erlang map with a `__struct__` key, whose `items` is a
-/// TUPLE. This is the one cross-language shape the crate duplicates from
-/// `lib/beam_lisp/vector.ex`, so it is written once, here, and named.
+/// A bl Vector: an Erlang map with a `__struct__` key whose `items` is a TUPLE.
+///
+/// This is the one cross-language shape duplicated from `lib/beam_lisp/vector.ex`.
+/// It is a contract, so it is written once, here, and named.
 fn make_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
     let tuple = make_tuple(env, &items);
     let m = map::map_new(env);
@@ -160,62 +84,14 @@ fn make_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
     m.map_put(Atom::from_str(env, "items")?, tuple)
 }
 
-fn from_json<'a>(env: Env<'a>, value: Json, arrays_as_vectors: bool) -> NifResult<Term<'a>> {
-    Ok(match value {
-        Json::Null => Atom::from_str(env, "nil")?.to_term(env),
-        Json::Bool(true) => Atom::from_str(env, "true")?.to_term(env),
-        Json::Bool(false) => Atom::from_str(env, "false")?.to_term(env),
-        Json::Number(n) => match n.as_i64() {
-            Some(i) => rustler::Encoder::encode(&i, env),
-            None => rustler::Encoder::encode(&n.as_f64().unwrap_or(0.0), env),
-        },
-        Json::String(s) => rustler::Encoder::encode(&s, env),
-        Json::Array(a) => {
-            let mut terms = Vec::with_capacity(a.len());
-            for item in a {
-                terms.push(from_json(env, item, arrays_as_vectors)?);
-            }
-            if arrays_as_vectors {
-                make_vector(env, terms)?
-            } else {
-                rustler::Encoder::encode(&terms, env)
-            }
-        }
-        Json::Object(m) => {
-            // built with map_put rather than encoded from pairs: a Vec of tuples
-            // is a LIST of tuples, which is not an Erlang map.
-            let mut map = map::map_new(env);
-            for (k, v) in m {
-                map = map.map_put(k, from_json(env, v, arrays_as_vectors)?)?;
-            }
-            map
-        }
-    })
-}
-
-// ── the streaming encoder: same disease, same cure ───────────────────────
+// ══ ENCODE ══════════════════════════════════════════════════════════════════
 //
-// `spike_encode` builds a `serde_json::Value` tree and then serialises it — the
-// mirror image of what made decode slow, and it costs the same: encode is 2.2x
-// SLOWER than Jason (0.840 against 0.375 ms on 24.3 KB).
-//
-// `TermSer` implements `Serialize` over a term, so serde_json writes the bytes as
-// it walks and NO intermediate exists. Two things it must get right that the
-// Value version got free:
-//
-//   · bl.json's byte contract is that object keys are SORTED by their encoded text.
-//     A Value tree was sorted for us (serde_json's Map is a BTreeMap); streaming,
-//     we must sort explicitly or the bytes change.
-//   · bl's collection structs must be RECOGNISED. The Value walk did not know them
-//     and raised; this one maps a Vector to an array, and REFUSES any other struct
-//     rather than emitting `{"__struct__": …}` — the escape-to-bl rule.
-//
-// `Term::map_get` plus three atoms resolved ONCE per call (not per value: an atom
-// lookup per node would cost ~10% of the total on a payload full of Vectors).
+// `Serialize` over a term, so serde_json writes the bytes AS IT WALKS and no
+// intermediate exists. That distinction is the whole cost: a `serde_json::Value` tree
+// measured 0.83 ms to build-and-serialise against 0.43–0.59 ms streaming.
 
 use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 use serde::Serializer as SerTrait;
-use rustler::types::tuple::get_tuple;
 
 #[derive(Clone, Copy)]
 struct TermSer<'a> {
@@ -223,10 +99,22 @@ struct TermSer<'a> {
     struct_key: Atom,
     vector_mod: Atom,
     items_key: Atom,
+    depth: usize,
 }
 
+/// How deep the native walk will go before declining to bl.
+///
+/// This walk is RECURSIVE, so its depth is Rust stack — and `bl.json`'s own suite encodes
+/// 2000 levels on purpose, on the argument that "2000 levels is far past what a
+/// recursive-descent parser would survive". That argument is right: without this guard the
+/// NIF SEGFAULTS (observed, exit 139), which is the one failure mode worse than being
+/// slow. 128 matches serde_json's own recursion limit, keeps the walk far inside the
+/// stack, and costs nothing real: `bl.json` handles any depth itself, on the same
+/// fallback path it uses for a Set or a bignum.
+const MAX_DEPTH: usize = 128;
+
 impl<'a> TermSer<'a> {
-    /// The struct's module name, if this term is a bl/Elixir struct at all.
+    /// The struct's module name, if this term is a struct at all.
     fn struct_name(self) -> Option<String> {
         let m = self.term.map_get(self.struct_key).ok()?;
         m.atom_to_string().ok()
@@ -235,10 +123,25 @@ impl<'a> TermSer<'a> {
 
 impl<'a> Serialize for TermSer<'a> {
     fn serialize<S: SerTrait>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The deep-document case: decline rather than overflow the Rust stack.
+        if self.depth > MAX_DEPTH {
+            return Err(serde::ser::Error::custom(
+                "nesting deeper than the native walk will go",
+            ));
+        }
         let t = self.term;
-        // order matters: a binary must be claimed before the atom check
+        // A binary must be claimed before the atom check.
+        //
+        // It must also be VALIDATED, not coerced: `from_utf8_lossy` would substitute
+        // U+FFFD for a bad byte and emit a document quietly different from the value —
+        // the worst outcome, because the caller gets a plausible string back. bl refuses
+        // a non-UTF-8 string and names its RFC 6901 path, so decline here and let bl
+        // produce that message.
         if let Ok(b) = t.decode::<Binary>() {
-            return s.serialize_str(&String::from_utf8_lossy(b.as_slice()));
+            return match std::str::from_utf8(b.as_slice()) {
+                Ok(valid) => s.serialize_str(valid),
+                Err(_) => Err(serde::ser::Error::custom("string is not valid UTF-8")),
+            };
         }
         if let Ok(name) = t.atom_to_string() {
             return match name.as_str() {
@@ -266,31 +169,33 @@ impl<'a> Serialize for TermSer<'a> {
             return write_seq::<S>(seq, *self, items);
         }
         if t.decode::<HashMap<Term, Term>>().is_ok() {
-            // a bl struct is a map, so this branch sees Vectors too
+            // a bl struct is a map, so a Vector arrives here too
             if let Some(name) = self.struct_name() {
                 if name == "Elixir.BeamLisp.Vector" {
                     let items = t
                         .map_get(self.items_key)
                         .map_err(|_| serde::ser::Error::custom("Vector without items"))?;
-                    // `items` is a TUPLE, and rustler's `Vec<T>` decoder reads only
-                    // LISTS (`ListIterator`) — so a plain decode::<Vec<Term>> here
-                    // fails on every Vector and presents as an ArgumentError.
+                    // `items` is a TUPLE, and rustler's `Vec<T>` decoder reads only LISTS
+                    // (`ListIterator`) — so a plain decode::<Vec<Term>> fails on EVERY
+                    // Vector and surfaces as a bare ArgumentError with no hint why.
                     let items = get_tuple(items).map_err(|_| {
                         serde::ser::Error::custom("Vector items is not a tuple")
                     })?;
                     let seq = s.serialize_seq(Some(items.len()))?;
                     return write_seq::<S>(seq, *self, items);
                 }
-                // anything else is the escape-to-bl case, and it must be LOUD:
-                // emitting {"__struct__": …} would be a silently wrong document.
+                // Set, record, or a foreign struct: the escape-to-bl case. It must be
+                // LOUD. An integer beyond u64 also lands here — Erlang integers are
+                // arbitrary precision and JSON numbers are not, and a NIF has no way to
+                // stringify a bignum, so bl must handle it.
                 return Err(serde::ser::Error::custom(format!(
-                    "bl struct {name} has no streaming mapping"
+                    "bl struct {name} has no native mapping"
                 )));
             }
             return write_map::<S>(s, *self, t);
         }
         Err(serde::ser::Error::custom(
-            "term has no JSON representation in the streaming walk",
+            "term has no JSON representation in the native walk",
         ))
     }
 }
@@ -301,13 +206,28 @@ fn write_seq<'a, S: SerTrait>(
     items: Vec<Term<'a>>,
 ) -> Result<S::Ok, S::Error> {
     for item in items {
-        seq.serialize_element(&TermSer { term: item, ..seed })?;
+        seq.serialize_element(&TermSer {
+            term: item,
+            depth: seed.depth + 1,
+            ..seed
+        })?;
     }
     seq.end()
 }
 
-/// Object elements, SORTED by key text — bl.json's byte contract, which a Value
-/// tree got for free (serde_json's Map is a BTreeMap) and streaming must do here.
+/// Object elements, SORTED by the ENCODED key — bl.json's byte contract — and REFUSED
+/// if two keys encode to the same text.
+///
+/// Sorting by the RAW key text would be wrong: bl sorts by the encoded text, and the two
+/// orders disagree as soon as a key needs escaping (a `"` sorts differently once it
+/// becomes `\"`). The encoded form is computed once per key and kept beside the raw one,
+/// so sorting costs no escape work and the bytes still come from `serialize_entry` on the
+/// raw key.
+///
+/// The collision check is why this cannot be left to serde: `{:a 1, "a" 2}` has two
+/// distinct keys that both encode to `"a"`, and emitting both writes a duplicate key — a
+/// document no reader can be right about. bl refuses it, so declining here lets bl
+/// produce that message, in bl, where the message belongs.
 fn write_map<'a, S: SerTrait>(
     s: S,
     seed: TermSer<'a>,
@@ -316,86 +236,73 @@ fn write_map<'a, S: SerTrait>(
     let entries = t
         .decode::<HashMap<Term, Term>>()
         .map_err(|_| serde::ser::Error::custom("map decode"))?;
-    let mut pairs: Vec<(String, Term<'a>)> = Vec::with_capacity(entries.len());
+    let mut pairs: Vec<(String, String, Term<'a>)> = Vec::with_capacity(entries.len());
     for (k, v) in entries {
         let key = as_key(k).map_err(|e| serde::ser::Error::custom(format!("{e:?}")))?;
-        pairs.push((key, v));
+        let encoded = match serde_json::to_string(&key) {
+            Ok(e) => e,
+            Err(_) => key.clone(),
+        };
+        pairs.push((key, encoded, v));
     }
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs.sort_by(|a, b| a.1.cmp(&b.1));
+    for w in pairs.windows(2) {
+        if w[0].1 == w[1].1 {
+            return Err(serde::ser::Error::custom(
+                "two keys that both encode to the same text",
+            ));
+        }
+    }
     let mut map = s.serialize_map(Some(pairs.len()))?;
-    for (k, v) in pairs {
-        map.serialize_entry(&k, &TermSer { term: v, ..seed })?;
+    for (k, _encoded, v) in pairs {
+        map.serialize_entry(
+            &k,
+            &TermSer {
+                term: v,
+                depth: seed.depth + 1,
+                ..seed
+            },
+        )?;
     }
     map.end()
 }
 
-/// The streaming encoder. One atom lookup per call, not per node.
+/// A term as JSON text. Atoms for the module keys are resolved ONCE per call, not per
+/// value: an atom lookup at every node would cost ~10% of the total on a payload full
+/// of Vectors.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn spike_encode_stream<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
+fn json_encode<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
     let seed = TermSer {
         term,
         struct_key: Atom::from_str(env, "__struct__")?,
         vector_mod: Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
         items_key: Atom::from_str(env, "items")?,
+        depth: 0,
     };
     let mut out: Vec<u8> = Vec::with_capacity(4096);
     let mut serializer = serde_json::Serializer::new(&mut out);
-    seed.serialize(&mut serializer)
-        .map_err(|e| err(format!("{e}")))?;
+    seed.serialize(&mut serializer).map_err(|e| err(format!("{e}")))?;
     let mut owned = OwnedBinary::new(out.len()).ok_or_else(|| err("alloc"))?;
     owned.as_mut_slice().copy_from_slice(&out);
     Ok(Binary::from_owned(owned, env))
 }
 
-// The rustler contract: this string must equal `vm.native/host-module` for the ns,
-// or `load_nif` silently binds nothing and every call raises `:nif_not_loaded`.
-rustler::init!("Elixir.BeamLisp.Native.Bl.JsonSpike");
-
-// ══ ATTRIBUTION, and then the fix ═══════════════════════════════════════════
+// ══ DECODE ══════════════════════════════════════════════════════════════════
 //
-// The first round left decode at 1.305 ms against Jason's 0.395. Three suspects,
-// separated here so the answer is measured and not argued:
-//
-//   (a) the intermediate `serde_json::Value` tree — parse, then walk it again.
-//       Every string, key and array is boxed, then decoded back out. Jason builds
-//       terms AS IT PARSES and never has an intermediate at all.
-//   (b) `schedule = "DirtyIo"` on a COMPUTE-bound NIF. datom/vector.bl says it
-//       plainly: mis-labelling compute as IO puts it on the wrong scheduler pool.
-//   (c) building bl Vectors — measured at 0.315 ms, and a job Jason never does.
-
-/// (a) How much is `from_slice::<Value>` alone, with the walk removed entirely?
-/// Whatever this costs, the real decoder never has to pay it.
-#[rustler::nif]
-fn spike_parse_only(data: Binary) -> NifResult<usize> {
-    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
-    // count, so the tree cannot be optimised away, then drop it
-    Ok(match value {
-        Json::Object(m) => m.len(),
-        Json::Array(a) => a.len(),
-        _ => 0,
-    })
-}
-
-/// (b) The same walk as `spike_decode_bl`, on a NORMAL scheduler.
-#[rustler::nif]
-fn spike_decode_bl_normal<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
-    from_json(env, value, true)
-}
-
-// ── the fix: build terms DURING the parse ───────────────────────────────────
+// A `DeserializeSeed` that builds Erlang terms DURING the parse. The seed — not
+// `Deserialize` — is what carries the `Env` down the recursion, and `Env` is `Copy`, so
+// threading it costs nothing. Parsing into a `Value` first and walking it afterwards
+// costs MORE than a whole hand-written Elixir parse (0.465 ms against Jason's 0.345).
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-/// `rustler::Error` implements Debug but not Display, so it cannot go straight
-/// into a serde error; its Debug form is the message.
+/// `rustler::Error` implements Debug but not Display, so it cannot go straight into a
+/// serde error; its Debug form is the message.
 fn as_de<E: de::Error>(e: rustler::Error) -> E {
     E::custom(format!("{e:?}"))
 }
 
-/// A seed, not a Deserialize impl, because the visitor has to carry the `Env`
-/// down the recursion — and `Env` is `Copy`, so threading it costs nothing.
 #[derive(Clone, Copy)]
 struct TermSeed<'a> {
     env: Env<'a>,
@@ -443,8 +350,8 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
     }
 
     fn visit_u64<E: de::Error>(self, u: u64) -> Result<Term<'a>, E> {
-        // an Erlang integer is arbitrary precision, so a u64 above i64::MAX
-        // still crosses as an exact integer rather than becoming a float.
+        // an Erlang integer is arbitrary precision, so a u64 above i64::MAX still
+        // crosses as an exact integer rather than becoming a float.
         Ok(rustler::Encoder::encode(&u, self.env))
     }
 
@@ -494,52 +401,29 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
     }
 }
 
-/// The real decoder: ONE pass, no intermediate `Value`, and bl Vectors built as
-/// the arrays are read.
-#[rustler::nif]
-fn spike_decode_direct<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
-    let term = TermSeed {
-        env,
-        vectors: true,
-    }
-    .deserialize(&mut deserializer)
-    .map_err(|e| err(format!("{e}")))?;
-    // trailing bytes are another document, not part of this one
-    deserializer.end().map_err(|e| err(format!("{e}")))?;
-    Ok(term)
-}
-
-/// The same one-pass decoder on a NORMAL scheduler, so the dirty-scheduler
-/// overhead can be separated from the work itself.
-#[rustler::nif]
-fn spike_decode_direct_normal<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
-    let term = TermSeed {
-        env,
-        vectors: true,
-    }
-    .deserialize(&mut deserializer)
-    .map_err(|e| err(format!("{e}")))?;
-    deserializer.end().map_err(|e| err(format!("{e}")))?;
-    Ok(term)
-}
-
-/// The one-pass decoder with arrays as LISTS.
+/// A JSON document as bl values: objects are plain maps (a bl map IS an Erlang map),
+/// arrays are VECTORS, `null` is nil.
 ///
-/// This is the like-for-like comparison with Jason, which builds plain lists.
-/// If one-pass-with-lists lands on Jason's number, then the WHOLE remaining gap
-/// is the cost of building bl Vectors — a job Jason never does, and the one
-/// difference that is a deliberate choice rather than a defect.
-#[rustler::nif]
-fn spike_decode_direct_lists<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+/// One pass, no intermediate, and `end()` so trailing bytes are another document rather
+/// than part of this one. A malformed document is refused with serde's position
+/// ("key must be a string at line 1 column 2").
+#[rustler::nif(schedule = "DirtyCpu")]
+fn json_decode<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
     let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
     let term = TermSeed {
         env,
-        vectors: false,
+        vectors: true,
     }
     .deserialize(&mut deserializer)
     .map_err(|e| err(format!("{e}")))?;
     deserializer.end().map_err(|e| err(format!("{e}")))?;
     Ok(term)
 }
+
+// ── the rustler contract ────────────────────────────────────────────────────
+//
+// This string must equal `vm.native/host-module` for the declaring ns — here
+// `bl.json-native` → `Elixir.BeamLisp.Native.Bl.JsonNative`. Get it wrong and
+// `load_nif` binds NOTHING while every stub stays in place, so every call raises
+// `:nif_not_loaded` and the .so looks absent while being right there.
+rustler::init!("Elixir.BeamLisp.Native.Bl.JsonNative");
