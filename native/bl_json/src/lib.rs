@@ -74,12 +74,21 @@ fn spike_encode<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
 
 /// Assumption 3, decode direction. JSON bytes in, bl-shaped term out.
 ///
-/// Arrays come back as LISTS here — the real decoder builds Vectors, and
-/// `spike_vector/1` above is the evidence that it can.
+/// Arrays come back as LISTS here — `spike_decode_bl/1` below is the one that
+/// builds Vectors, and the pair is deliberately kept so the cost of building
+/// them can be measured rather than assumed.
 #[rustler::nif(schedule = "DirtyIo")]
 fn spike_decode<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
     let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
-    from_json(env, value)
+    from_json(env, value, false)
+}
+
+/// The REAL decode shape: an array becomes a bl Vector, as `bl.json/decode`
+/// documents ("arrays decode to vectors so a round trip holds").
+#[rustler::nif(schedule = "DirtyIo")]
+fn spike_decode_bl<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
+    from_json(env, value, true)
 }
 
 // ── the term walk (spike: via an intermediate Value) ────────────────────────
@@ -138,7 +147,20 @@ fn to_json(term: Term) -> NifResult<Json> {
     Err(err("term has no JSON representation in the spike walk"))
 }
 
-fn from_json<'a>(env: Env<'a>, value: Json) -> NifResult<Term<'a>> {
+/// A bl Vector: an Erlang map with a `__struct__` key, whose `items` is a
+/// TUPLE. This is the one cross-language shape the crate duplicates from
+/// `lib/beam_lisp/vector.ex`, so it is written once, here, and named.
+fn make_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
+    let tuple = make_tuple(env, &items);
+    let m = map::map_new(env);
+    let m = m.map_put(
+        Atom::from_str(env, "__struct__")?,
+        Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
+    )?;
+    m.map_put(Atom::from_str(env, "items")?, tuple)
+}
+
+fn from_json<'a>(env: Env<'a>, value: Json, arrays_as_vectors: bool) -> NifResult<Term<'a>> {
     Ok(match value {
         Json::Null => Atom::from_str(env, "nil")?.to_term(env),
         Json::Bool(true) => Atom::from_str(env, "true")?.to_term(env),
@@ -151,16 +173,20 @@ fn from_json<'a>(env: Env<'a>, value: Json) -> NifResult<Term<'a>> {
         Json::Array(a) => {
             let mut terms = Vec::with_capacity(a.len());
             for item in a {
-                terms.push(from_json(env, item)?);
+                terms.push(from_json(env, item, arrays_as_vectors)?);
             }
-            rustler::Encoder::encode(&terms, env)
+            if arrays_as_vectors {
+                make_vector(env, terms)?
+            } else {
+                rustler::Encoder::encode(&terms, env)
+            }
         }
         Json::Object(m) => {
             // built with map_put rather than encoded from pairs: a Vec of tuples
             // is a LIST of tuples, which is not an Erlang map.
             let mut map = map::map_new(env);
             for (k, v) in m {
-                map = map.map_put(k, from_json(env, v)?)?;
+                map = map.map_put(k, from_json(env, v, arrays_as_vectors)?)?;
             }
             map
         }
