@@ -741,3 +741,113 @@ bl.json 17.34 ms on 24.3 KB (20.6x), and Jason 0.465 ms — so encode is 1.8x FA
 Jason while decode is 3.3x slower. The next decode lever is building the Vector term
 without the intermediate `Value` tree; the next encode lever is streaming instead of
 building `Value` at all.
+
+* The streaming encoder: 1.9x over the Value tree, parity with Jason
+
+The encode side had the SAME disease decode did — `to_vec(&Value)` builds a tree and then
+serialises it. `TermSer` implements `Serialize` over a term, so serde_json writes bytes as
+it walks. Same run, 24.3 KB, best of 11:
+
+| encoder | run A | run B |
+|---------+-------+-------|
+| bl.json/encode | 16.232 ms | 23.098 ms |
+| NIF, Value tree | 0.829 ms | — |
+| NIF, STREAMING | 0.431 ms | 0.591 ms |
+| Jason/encode! | 0.455 ms | 0.567 ms |
+
+∴ 1.9x over the Value-tree encoder (same run, both runs agree), and PARITY with Jason —
+NOT superiority. Run A had streaming 5% faster, run B 4% slower; that is noise, and the
+claim is "within a few percent either way". Against bl.json today: 27–39x.
+
+Byte-identical to bl.json, checked case by case: nested arrays, nil/true/false, keyword
+keys, escaped strings, and a map whose keys must be SORTED. Streaming must sort explicitly
+(a Value tree got it free — serde_json's Map is a BTreeMap), which is exactly the kind of
+thing that silently changes bytes if you forget.
+
+**And it does something Jason cannot.** `Jason/encode!` REFUSES a bl Vector outright
+("protocol Jason.Encoder not implemented for BeamLisp.Vector"). That is the original
+reason `bl.json` exists. The streaming encoder maps a Vector to an array and matches
+bl.json byte for byte; on the vector payload bl.json takes 18.958 ms and the NIF 0.704 ms.
+
+Refusal discipline holds: a bl Set and a bl record both RAISE rather than emitting
+{"__struct__": …} — the escape-to-bl rule, loud instead of silently wrong.
+
+**Two findings, each one a debug cycle:**
+
+1. A bl Vector's `items` is an Erlang TUPLE, and rustler's `Vec<T>` decoder reads only
+   LISTS (`ListIterator`), so `decode::<Vec<Term>>()` fails on EVERY Vector and surfaces as
+   an ArgumentError with no hint of why. `rustler::types::tuple::get_tuple/1` is the tuple
+   reader. This is the same wall the Value-tree walk hit, now named at the mechanism.
+2. A KNOWN GAP, not papered over: an integer beyond u64 RAISES here where bl.json emits it
+   exactly (123456789012345678901234567890). Erlang integers are arbitrary precision and
+   JSON numbers are not; the real encoder must make the same decision bl.json already made.
+
+**Both directions are now native, and compose:**
+
+    streaming(decode(jb)) == jb   →   true
+
+**Corrected tally of the whole spike, same-process, 24.3 KB, best of 11:**
+
+| | bl.json today | NIF | Jason |
+|--+---------------+-----+-------|
+| encode | 16.2–23.1 ms | 0.43–0.59 ms | 0.46–0.57 ms |
+| decode | 2.5 ms | 0.85 ms | 0.35 ms |
+
+Encode: parity with Jason, ~30x better than bl.json. Decode: 3.0x better than bl.json, 2.5x
+slower than Jason — of which 0.345 ms is building bl Vectors, which Jason does not do, and
+the residual 1.47x is serde's visitor dispatch, which needs a hand-written parser to remove.
+
+* The native byte loop is the compact encoder now (25d9ba6a)
+
+`bl.json/encode` writes compact JSON with the NIF when it is present. MEASURED on the
+production path, 24.3 KB, best of 11: **0.45–0.65 ms**, against 15–23 ms for assembling
+the bytes in beam-lisp and 0.46–0.57 ms for Jason. Byte-identical to the codec beside it.
+
+Preference, not requirement: no cargo or no built .so behaves exactly as before
+(`defnative` leaves raising stubs, `available?` false, `encode-otp` runs). `:ascii` is bl
+policy and routes to OTP.
+
+**FIVE REAL BUGS, each found by wiring it in and running the suite.** A benchmark only
+exercises what it is fed; none of these were visible to one.
+
+1. **Duplicate keys.** `{:a 1, "a" 2}` — two distinct keys, one encoded text. Streaming
+   wrote BOTH: `{"a":1,"a":2}`, a document no reader can be right about. Now detected and
+   declined.
+2. **Invalid UTF-8.** `String::from_utf8_lossy` substitutes U+FFFD, turning a bad byte
+   into a plausible-looking string — a silently different document. Now validated, so bl
+   refuses it and names the RFC 6901 path.
+3. **Deep nesting SEGFAULTED (exit 139).** The suite encodes 2000 levels on purpose and
+   the walk is recursive. Now declines past 128 levels (serde_json's own limit).
+4. **A NIF failure does not arrive as an exception.** `Error::Term` surfaces to beam-lisp
+   as a RETURNED value, so the `catch` never fired: the fallback was dead and a non-string
+   escaped from `encode`. Success is now CHECKED, not caught.
+5. **Sorting by RAW key text is wrong.** bl sorts by the ENCODED key; the orders diverge
+   once a key needs escaping. The encoded form is computed once per key and sorted on;
+   bytes still come from the raw key.
+
+**AND ONE WRONG LESSON, recorded so it is not re-learned.** loom failed 21 assertions with
+`undefined var: bl.json-native/present` after this wiring, which reads exactly like "a
+`def` holding state does not survive a generation swap". It was NOT that: a STALE AOT
+CACHE entry in `~/.cache/beam_lisp/aot` still referenced the old var, and clearing the
+cache made loom green **with the `def` still in place**. The latch sits in
+`:persistent_term` anyway, and the docstring now gives the real reason instead of the
+tempting wrong one.
+
+**A claim of mine that was false, and how it was caught.** An earlier report said the
+suites were green "with the native encoder live". They were not: `loaded` was false and
+every one of those passes was on the FALLBACK. A green suite proves nothing about a path
+it never took — so the verification is now two-part: `loaded?` true, AND the timing
+(0.45 ms rather than 15 ms).
+
+**Verified, native live:** bl.json 163 + differential 940, loom.form 46, loom.ui 63,
+interop 29, cli-util 17, mcp 77, mcp-registry 31, mcp-transport-http 43, lsp-server 4,
+install 161, live/* 144, tooling.pulse.draft 102, prelude 300, print 30, core-additions
+159, ns-interface 29, mcp.z3.port 19, datom.cost 26 — 0 failed. Byte-identity against the
+pre-wiring implementation: 18 values, 0 differing, `:pretty 2` and `:ascii` included.
+
+**NOT verified:** `bl.json/decode` is still OTP's (the native decoder needs `:keys`
+policy, duplicate-key semantics and the error text bl pins); the bignum-encoder gap is
+still a loud refusal rather than a fix; the intermittent exit 135 SIGBUS is pre-existing
+(it hits `datom.cost`, which references no JSON at all, and clears on retry under this
+host's memory pressure plus a concurrent session's edits) — and it is NOT evidence about
+this change either way.
