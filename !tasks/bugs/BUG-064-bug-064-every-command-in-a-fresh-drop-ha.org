@@ -1,0 +1,135 @@
+#+TITLE: BUG-064 — every command in a fresh drop hangs: vm.session→bl.daemon→bl.cli→vm.client→vm.session is a load-time cycle the AOT loader deadlocks on
+#+STATE: ITEM
+#+SESSION_ID: 15839d044a6586d8
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-17T21-21-15-049Z_15839d044a6586d8.jsonl]]
+#+CUSTOM_ID: BUG-064-bug-064-every-command-in-a-fresh-drop-ha
+#+LAYER: build
+#+PRIORITY: A
+#+STATE: DONE
+#+COMPLETION_HASH: f603aa862bfed583
+
+* Initial Message
+
+look at the work done since v2026.3 and tell me if there's anything pending to be done. then show me the changelog that you think v2026.4 should ahve. Build a drop, try it out, and let me know how it delivers.
+
+(side note: make the LSP hover better. It's having weird escaped characters, is on one line, doesn't have docs, and could in general be more approachable to those looking to understand a new system)
+
+* Symptom
+
+`./bl-v2026.4 version` (a drop built from this release) never returns and prints
+nothing. Not slow — BLOCKED: the process sits at ~0.2% CPU, `wchan =
+poll_schedule_timeout`, with 2s of CPU spent and no progress across 40s
+sampling windows. Rebuilding the drop reproduces it deterministically; the
+checkout's `bin/bl` is unaffected.
+
+* Reproduction
+
+Built the drop from a checkout at HEAD (c8e2c… era, after FUP-085):
+
+    ./bin/bl self-build --bin /home/user/.cache/cargo-target/release/drop-launcher --out ./bl-v2026.4
+    ./bl-v2026.4 version          # hangs, no output
+
+The release payload itself is fine — the hang is in the CLI entry the launcher
+calls (`common.rs:14`):
+
+    CLI_ENTRY = "BeamLisp.Ns.Bl.Cli.main(System.argv())"
+
+    # boots fine
+    $ <payload>/bin/bl eval 'BeamLisp.AOT.boot(); IO.puts("boot done")'
+    boot done
+
+    # hangs
+    $ <payload>/bin/bl eval 'BeamLisp.AOT.boot(); IO.inspect(BeamLisp.AOT.ensure_loaded("bl.cli"))'
+
+* Root cause — the stacktrace
+
+Spawning the load and inspecting it from another process pins it:
+
+    p = spawn(fn -> BeamLisp.AOT.ensure_loaded("bl.cli") end)
+    Process.info(p, :current_stacktrace)
+    # {:gen, :do_call, 4} → GenServer.call/3 → BeamLisp.Loader.Server.run/1
+    #   (loader_server.ex:33) → BeamLisp.AOT.ensure_loaded/1 (aot.ex:238)
+    #   → :global.trans/4
+
+and the Loader.Server itself:
+
+    Process.info(whereis(BeamLisp.Loader.Server), :current_stacktrace)
+    # :global.random_sleep/1 → :global.set_lock/4 → :global.trans/4
+    #   → BeamLisp.Loader.ensure_loaded_locked/1 (loader.ex:245)
+    #   → BeamLisp.Loader.ensure_loaded/1 (loader.ex:227)
+    #   → BeamLisp.Ns.Bl.Daemon.__bl_init__/0
+    #   → BeamLisp.AOT.ensure_loaded/1 (aot.ex:240)
+    #   → BeamLisp.Env.with_env/2
+
+Two processes, each waiting for what the other holds:
+
+| process | holds | waits for |
+|---|---|---|
+| the caller of `AOT.ensure_loaded("bl.cli")` | `:global` lock `{:bl_load, BeamLisp.Ns.Bl.Cli}` | `Loader.Server` (to run `__bl_init__`) |
+| `Loader.Server` | (running `bl.cli`'s `__bl_init__`) | `:global` lock taken while replaying into `bl.daemon` — which comes back around to `bl.cli` |
+
+`:global.set_lock` does not fail fast; it retries with backoff, so the symptom
+is a silent hang rather than an error.
+
+* Why the cycle is reachable at all
+
+    (ns bl.cli    (:require [bl.util :as u] [bl.env :as env] [vm.client]))
+    (ns vm.client (:require [vm.session :as session] ...))
+    (ns vm.session (:require ... [bl.daemon :as daemon]))
+    (ns bl.daemon (:require [bl.cli] ...))
+
+so `vm.session → bl.daemon → bl.cli → vm.client → vm.session`. Introduced by the
+daemon cutover (FUP-085 / PLAN-121-123), which made `vm.session` compose the
+command handler statically.
+
+The load-time mark (`Env.mark_loaded`) happens AFTER `__bl_init__` replay, and
+the cycle guard (`:bl_loading`) is process-local — while the AOT path splits the
+work across two processes (caller holds the lock, server runs the init). So the
+guard cannot see this cycle at all.
+
+* Why the checkout does not hang
+
+Same entry, different load order: in a checkout the AOT modules for the cycle
+members are reached through a path where `Env.loaded_ns?` is already true, or
+hit the source path with no cross-process handoff. The drop builds a fresh image
+and walks it cold, which is why only a drop shows it. That asymmetry is the
+reason a test suite that boots the tree it stands in cannot see it — the same
+shape as the v2026.4 `bl mcp` corpus bug.
+
+* Fix (landed, commit pending)
+
+Break the cycle where the layering is wrong: the substrate must not statically
+depend on the application. `vm/session.bl` drops `[bl.daemon :as daemon]` and
+resolves the handler by name at the point of use, which is the idiom the rest of
+the CLI already uses:
+
+    (let [_loaded (BeamLisp.Loader/ensure_loaded "bl.daemon")
+          handler (BeamLisp.Env/fetch! "bl.daemon" "handle-in-vm")
+          r (handler argv cwd env)]
+      ...)
+
+`vm.session`'s own header already names the seam (`bl.daemon/handle-in-vm`); the
+require merely bound it too early. Verified after the fix, in the checkout:
+
+    (BeamLisp.Loader/ensure_loaded "bl.cli")     → cli loaded
+    (BeamLisp.Loader/ensure_loaded "bl.daemon")  → daemon loaded
+    (BeamLisp.Loader/ensure_loaded "vm.session") → session loaded
+
+and in a rebuilt drop (see PLAN-123 / the v2026.4 changelog proof).
+
+* What this does NOT fix
+
+The loader's cross-process cycle deadlock is a CLASS, not an instance. Two
+processes plus a `:global` lock plus a retry-forever loop is a hang generator,
+and the next cycle anyone introduces between a substrate namespace and an
+application namespace will do the same thing. Worth a follow-up: either make the
+lock acquisition bounded (fail with a named cycle instead of sleeping), or move
+the lock to the process that actually runs the init. Filed as a follow-up rather
+than done here, because it is a change to the bootstrap and needs its own proof.
+
+* Evidence to keep
+
+- `bl-v2026.4` before the fix: hangs >600s, ~0.2% CPU, no output.
+- After the fix: see the changelog's *Proof* section.
+
+NOTE [2026-09-17]: FIXED + VERIFIED. `vm/session.bl` drops the static `[bl.daemon :as daemon]` require and resolves the handler by name at the point of use; the drop rebuilt from that tree runs (`version` -> beam-lisp 0.1.0; `eval` -> 42; `lsp hover` -> a card; daemon autostart -> warm 279/265/339 ms vs 2966 ms cold; `daemon status` -> full session read-model with a NAMED port). Checkout unaffected: bl.cli / bl.daemon / vm.session all load. The loader's cross-process cycle deadlock remains a class — see the v2026.4 changelog follow-ups.
