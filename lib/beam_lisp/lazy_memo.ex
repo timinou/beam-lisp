@@ -3,6 +3,47 @@ defmodule BeamLisp.LazyMemo do
   @load_lock {__MODULE__, :load_nif}
   @default_budget_bytes 512 * 1024 * 1024
 
+  # ── The native-call flight recorder ─────────────────────────────────────────
+  #
+  # One line per native call, appended BEFORE the call, unsynced.
+  #
+  # Unsynced is the POINT, not an optimisation: a completed `write(2)` lives in
+  # the kernel's page cache, so it survives the process being killed by a signal.
+  # `fsync` protects against losing the machine, not against losing the VM — and
+  # a segfault in a NIF returns no exception, no stack and no message, so the
+  # last line in this file is the only record of which call was in flight when
+  # the VM died. That is what a core dump costs gdb, registers and a reading of
+  # the vendored Rust to establish.
+  #
+  # Off unless `BEAM_LISP_NIF_TRACE` names a path, so the default path pays one
+  # `System.get_env/1` on a call that is already crossing into native code.
+  @trace_env "BEAM_LISP_NIF_TRACE"
+
+  @doc "Whether the flight recorder is armed, and where it writes."
+  def trace_path, do: System.get_env(@trace_env)
+
+  defp trace!(name, arity, notes \\ []) do
+    case System.get_env(@trace_env) do
+      nil ->
+        :ok
+
+      path ->
+        File.write!(path, [
+          Integer.to_string(System.monotonic_time(:microsecond)),
+          " ",
+          Atom.to_string(name),
+          "/",
+          Integer.to_string(arity),
+          Enum.map(notes, fn {k, v} -> [" ", Atom.to_string(k), "=", to_string(v)] end),
+          " pid=",
+          inspect(self()),
+          "\n"
+        ], [:append])
+
+        :ok
+    end
+  end
+
   def ensure_loaded! do
     if nif_loaded?() do
       :ok
@@ -44,6 +85,8 @@ defmodule BeamLisp.LazyMemo do
     # (which copies megabytes into the cell) takes the dirty lane. The
     # estimate is known here, before the call, so the lane is chosen directly
     # — no reroute round-trip needed for creation.
+    trace!(:new, 3, bytes: bytes, lane: (if bytes <= nif_fast_lane_bytes(), do: :fast, else: :dirty))
+
     if bytes <= nif_fast_lane_bytes() do
       nif_new_fast(state, deps, bytes)
     else
@@ -62,6 +105,8 @@ defmodule BeamLisp.LazyMemo do
     ensure_loaded!()
     bytes = estimate_bytes(value)
 
+    trace!(:new_ref, 3, bytes: bytes, lane: (if bytes <= nif_fast_lane_bytes(), do: :fast, else: :dirty))
+
     if bytes <= nif_fast_lane_bytes() do
       nif_new_fast(value, [], bytes)
     else
@@ -73,6 +118,8 @@ defmodule BeamLisp.LazyMemo do
   def exchange_ref(resource, expected, value, notifications \\ []) do
     ensure_loaded!()
     bytes = estimate_bytes(value)
+
+    trace!(:exchange_ref, 6, bytes: bytes)
 
     if bytes <= nif_fast_lane_bytes() do
       case nif_compare_exchange_fast(resource, expected, value, [], bytes, notifications) do
@@ -95,6 +142,8 @@ defmodule BeamLisp.LazyMemo do
     # any NEW dependency edge (an unbounded cycle walk), and we then take the
     # dirty lane. The router only skips the fast attempt when the replacement
     # is obviously too big, so the common tiny-memo case costs one crossing.
+    trace!(:exchange, 6, bytes: bytes)
+
     if bytes <= nif_fast_lane_bytes() do
       case nif_compare_exchange_fast(resource, expected, state, deps, bytes, notifications) do
         :reroute -> nif_compare_exchange(resource, expected, state, deps, bytes, notifications)
@@ -173,6 +222,7 @@ defmodule BeamLisp.LazyMemo do
 
   def cursor(list) do
     ensure_loaded!()
+    trace!(:cursor, 3, bytes: estimate_bytes(list))
     nif_cursor(list, dependencies(list), estimate_bytes(list))
   end
 

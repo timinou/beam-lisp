@@ -61,6 +61,9 @@
 ;   dangling ref  — a call whose head neither the bundle nor the image provides
 ;                   (deferred/collect-unknown-calls, the L7 deferral layer)
 ;   promise       — a `(declare x)` with no later `(defn x)` in bundle or image
+;   require cycle — a cycle through a staged ns in the merged require graph
+;                   (source-graph/cycles, the one owner — the same answer the
+;                   build fails on; a cold AOT load of one is BUG-064's deadlock)
 ;   type          — an inferred-type conflict (typed/check-source, sound-only)
 ;   message       — a queued message whose contract the bundle changed
 ;                   (reload.migrate, Wave 3 — attached to the bundle, not here)
@@ -69,7 +72,7 @@
 ; (contract-changing) bundle coherent again — see reload/attach and reload.migrate.
 
 (ns reload
-  (:require [env] [typed] [deferred]))
+  (:require [env] [typed] [deferred] [source-graph :as sg]))
 
 ;; ── the bundle: staged edits since the last coherent image ──────────────
 
@@ -77,9 +80,15 @@
 ;  :migration migration-or-nil           ; a reload.migrate spec bound to this bundle
 ;  :status :empty|:staged|:applied|:held|:blocked
 ;  :errors [error-map …]                 ; why a held/blocked bundle does not fit
-;  :applied [ns-string …]}               ; namespaces swapped by the last commit
+;  :applied [ns-string …]                ; namespaces swapped by the last commit
+;  :requires {ns-string → [ns-string]}   ; the require edges the image REMEMBERS
+;                                         ; (what apply-bundle! last evaluated) — the
+;                                         ; only graph a file-less, reload-created
+;                                         ; namespace has
+;  :graph {ns-string → [ns-string]}      ; the parse-once memo of SOURCE-derived
+;                                         ; edges (see image-requires)
 (def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []
-                  :journal []}))
+                  :journal [] :requires {} :graph {}}))
 
 (def journal-limit 200)
 
@@ -432,6 +441,79 @@
              outside)))
     (removed-names defs ns)))
 
+(defn- source-requires
+  "One namespace's require edges from its source, by the one parser
+   (source-graph); nil when no source resolves (an AOT-only beam)."
+  [ns]
+  (let [src (try (BeamLisp.Loader/source_content ns) (catch e nil))]
+    (if (string? src)
+      (let [[_ reqs] (sg/header src)] (vec reqs))
+      nil)))
+
+(defn- image-requires
+  "The SOURCE-derived require edges of the live image, {ns → [dep …]}, from
+   the `:graph` parse-once memo: parsing every loaded namespace's source on
+   every commit measured as the difference between a green reload suite and
+   a native crash (the per-commit full-image re-parse churned the runtime
+   into a SIGSEGV under the ward — BUG-078), so a namespace's source is read
+   once and re-read NEVER; the memo grows only when `Env/namespaces` names
+   a ns it has not seen. What apply-bundle! REMEMBERS (`:requires`) is
+   fresher than this memo and is merged by the caller — filtered to the env
+   being committed into (see require-cycle-errors).
+
+   The boundary, stated: a namespace whose file changes OUTSIDE this gate
+   (edited on disk and re-loaded through the loader, never staged) keeps its
+   first-parsed edges here. Dev edits flow through stage/commit — the watcher
+   is the door — and the build is the backstop for loads that bypass it
+   (build-plan fails on the same sg/cycles answer)."
+  []
+  (let [memo (:graph (deref state))
+        missing (filter (fn [ns] (not (contains? memo ns))) (BeamLisp.Env/namespaces))
+        fresh (reduce (fn [acc ns]
+                        (let [r (source-requires ns)]
+                          (if (nil? r) acc (assoc acc ns r))))
+                      {} missing)]
+    (if (empty? fresh)
+      memo
+      (let [grown (merge memo fresh)]
+        (swap! state (fn [s] (assoc s :graph grown)))
+        grown))))
+
+(defn- require-cycle-errors
+  "Require cycles through a STAGED namespace, as held reasons. The merged
+   graph — each staged ns's NEW requires over the live image's — is walked
+   from the bundle's own roots by sg/cycles, the one owner of cycle
+   knowledge (the build fails on the same answer; this gate is the dev-time
+   altitude of it). A cycle admitted here is BUG-064's cross-process loader
+   deadlock shipped into the next cold drop, so the bundle is held until
+   one edge is converted to a by-name lookup — the idiom vm.session already
+   uses for bl.daemon.
+
+   `:requires` is VM-global (the image's memory), but the image being
+   committed into is the CURRENT env — under the ward, a fork. Recorded
+   edges are therefore filtered to namespaces loaded HERE: a sibling fork's
+   commits are not this image's truth."
+  [staged]
+  (let [recorded (reduce (fn [acc pair]
+                           (let [n (first pair)]
+                             (if (BeamLisp.Env/loaded_ns? n)
+                               (assoc acc n (second pair))
+                               acc)))
+                         {} (:requires (deref state)))
+        merged (reduce (fn [acc pair]
+                         (let [[_ reqs] (sg/header (second pair))]
+                           (assoc acc (first pair) (vec reqs))))
+                       (merge (image-requires) recorded) staged)
+        roots (vec (map first staged))
+        cycs (sg/cycles roots (fn [n] (get merged n [])))]
+    (map (fn [cyc]
+           {:kind :require-cycle :ns (first cyc)
+            :msg (str "require cycle: " (join " -> " (to-list cyc))
+                      " — a cold AOT load of a require cycle deadlocks (BUG-064);"
+                      " break one edge by resolving that namespace by name"
+                      " (Loader/ensure_loaded + Env/fetch!) at the point of use")})
+         cycs)))
+
 (defn coherence
   "Every coherence error across the whole bundle, computed STATICALLY from the
    sources and the live image's public names. Empty ⇒ the bundle is coherent and
@@ -440,13 +522,16 @@
    migration (Wave 3), not here."
   [staged]
   (let [defs (bundle-defs staged)]
-    (vec (mapcat (fn [pair]
-                   (let [ns (first pair) src (second pair)]
-                     (concat (dangling-errors defs ns src)
-                             (promise-errors defs ns src)
-                             (removal-errors defs ns)
-                             (type-errors ns src))))
-                 staged))))
+    (vec (concat (mapcat (fn [pair]
+                           (let [ns (first pair) src (second pair)]
+                             (concat (dangling-errors defs ns src)
+                                     (promise-errors defs ns src)
+                                     (removal-errors defs ns)
+                                     (type-errors ns src))))
+                         staged)
+                 ; a whole-bundle property, not per-ns: the graph, from the
+                 ; staged roots, once.
+                 (require-cycle-errors staged)))))
 
 ;; ── commit: prove coherent, then swap atomically; else hold ─────────────
 
@@ -485,7 +570,14 @@
             ;; `(:require)`s it resolves to the live sibling. Author-ordered:
             ;; a required sibling is staged before its requirer, exactly as
             ;; source files are ordered by the require DAG.
-            (BeamLisp.Env/mark_loaded ns)))))))
+            (BeamLisp.Env/mark_loaded ns)
+            ;; the image REMEMBERS this ns's require edges: a reload-created
+            ;; namespace has no file for image-requires to parse, so this is
+            ;; the only graph it has. (Where a source file exists, the
+            ;; source-derived edge wins — sources are fresher.)
+            (swap! state (fn [s] (assoc-in s [:requires ns]
+                                           (let [[_ reqs] (sg/header (second pair))]
+                                             (vec reqs)))))))))))
 
 (defn commit
   "Prove the whole pending bundle coherent (statically); on success apply it
@@ -494,8 +586,8 @@
 
    Returns the bundle status. `:status` is:
      :applied — the bundle was coherent and is now live
-     :held    — incoherent (dangling / type / promise); or refused by the prod
-                policy (reload disabled) — the old code keeps serving either way
+     :held    — incoherent (dangling / type / promise / require-cycle); or refused
+                by the prod policy (reload disabled) — the old code keeps serving either way
      :blocked — a message-migration was required or rejected (Wave 3)
      :empty   — nothing staged"
   []
