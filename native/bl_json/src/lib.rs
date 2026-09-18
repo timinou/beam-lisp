@@ -194,3 +194,196 @@ fn from_json<'a>(env: Env<'a>, value: Json, arrays_as_vectors: bool) -> NifResul
 }
 
 rustler::init!("Elixir.BeamLisp.Native.Bl.JsonSpike");
+
+// ══ ATTRIBUTION, and then the fix ═══════════════════════════════════════════
+//
+// The first round left decode at 1.305 ms against Jason's 0.395. Three suspects,
+// separated here so the answer is measured and not argued:
+//
+//   (a) the intermediate `serde_json::Value` tree — parse, then walk it again.
+//       Every string, key and array is boxed, then decoded back out. Jason builds
+//       terms AS IT PARSES and never has an intermediate at all.
+//   (b) `schedule = "DirtyIo"` on a COMPUTE-bound NIF. datom/vector.bl says it
+//       plainly: mis-labelling compute as IO puts it on the wrong scheduler pool.
+//   (c) building bl Vectors — measured at 0.315 ms, and a job Jason never does.
+
+/// (a) How much is `from_slice::<Value>` alone, with the walk removed entirely?
+/// Whatever this costs, the real decoder never has to pay it.
+#[rustler::nif]
+fn spike_parse_only(data: Binary) -> NifResult<usize> {
+    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
+    // count, so the tree cannot be optimised away, then drop it
+    Ok(match value {
+        Json::Object(m) => m.len(),
+        Json::Array(a) => a.len(),
+        _ => 0,
+    })
+}
+
+/// (b) The same walk as `spike_decode_bl`, on a NORMAL scheduler.
+#[rustler::nif]
+fn spike_decode_bl_normal<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+    let value: Json = serde_json::from_slice(data.as_slice()).map_err(err)?;
+    from_json(env, value, true)
+}
+
+// ── the fix: build terms DURING the parse ───────────────────────────────────
+
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::fmt;
+
+/// `rustler::Error` implements Debug but not Display, so it cannot go straight
+/// into a serde error; its Debug form is the message.
+fn as_de<E: de::Error>(e: rustler::Error) -> E {
+    E::custom(format!("{e:?}"))
+}
+
+/// A seed, not a Deserialize impl, because the visitor has to carry the `Env`
+/// down the recursion — and `Env` is `Copy`, so threading it costs nothing.
+#[derive(Clone, Copy)]
+struct TermSeed<'a> {
+    env: Env<'a>,
+    vectors: bool,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
+    type Value = Term<'a>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(TermVisitor {
+            env: self.env,
+            vectors: self.vectors,
+        })
+    }
+}
+
+struct TermVisitor<'a> {
+    env: Env<'a>,
+    vectors: bool,
+}
+
+fn atom<'a, E: de::Error>(env: Env<'a>, name: &str) -> Result<Term<'a>, E> {
+    Atom::from_str(env, name)
+        .map(|a| a.to_term(env))
+        .map_err(|_| E::custom("atom table exhausted"))
+}
+
+impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
+    type Value = Term<'a>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, b: bool) -> Result<Term<'a>, E> {
+        atom(self.env, if b { "true" } else { "false" })
+    }
+
+    fn visit_i64<E: de::Error>(self, i: i64) -> Result<Term<'a>, E> {
+        Ok(rustler::Encoder::encode(&i, self.env))
+    }
+
+    fn visit_u64<E: de::Error>(self, u: u64) -> Result<Term<'a>, E> {
+        // an Erlang integer is arbitrary precision, so a u64 above i64::MAX
+        // still crosses as an exact integer rather than becoming a float.
+        Ok(rustler::Encoder::encode(&u, self.env))
+    }
+
+    fn visit_f64<E: de::Error>(self, f: f64) -> Result<Term<'a>, E> {
+        if !f.is_finite() {
+            return Err(E::custom("non-finite float"));
+        }
+        Ok(rustler::Encoder::encode(&f, self.env))
+    }
+
+    /// One binary allocation for the string, and no intermediate `String`.
+    fn visit_str<E: de::Error>(self, s: &str) -> Result<Term<'a>, E> {
+        Ok(rustler::Encoder::encode(&s, self.env))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Term<'a>, E> {
+        atom(self.env, "nil")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Term<'a>, A::Error> {
+        let seed = TermSeed {
+            env: self.env,
+            vectors: self.vectors,
+        };
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(8));
+        while let Some(item) = seq.next_element_seed(seed)? {
+            items.push(item);
+        }
+        if self.vectors {
+            make_vector(self.env, items).map_err(as_de)
+        } else {
+            Ok(rustler::Encoder::encode(&items, self.env))
+        }
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Term<'a>, A::Error> {
+        let seed = TermSeed {
+            env: self.env,
+            vectors: self.vectors,
+        };
+        let mut built = map::map_new(self.env);
+        while let Some(key) = map.next_key_seed(seed)? {
+            let value = map.next_value_seed(seed)?;
+            built = built.map_put(key, value).map_err(as_de)?;
+        }
+        Ok(built)
+    }
+}
+
+/// The real decoder: ONE pass, no intermediate `Value`, and bl Vectors built as
+/// the arrays are read.
+#[rustler::nif]
+fn spike_decode_direct<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
+    let term = TermSeed {
+        env,
+        vectors: true,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|e| err(format!("{e}")))?;
+    // trailing bytes are another document, not part of this one
+    deserializer.end().map_err(|e| err(format!("{e}")))?;
+    Ok(term)
+}
+
+/// The same one-pass decoder on a NORMAL scheduler, so the dirty-scheduler
+/// overhead can be separated from the work itself.
+#[rustler::nif]
+fn spike_decode_direct_normal<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
+    let term = TermSeed {
+        env,
+        vectors: true,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|e| err(format!("{e}")))?;
+    deserializer.end().map_err(|e| err(format!("{e}")))?;
+    Ok(term)
+}
+
+/// The one-pass decoder with arrays as LISTS.
+///
+/// This is the like-for-like comparison with Jason, which builds plain lists.
+/// If one-pass-with-lists lands on Jason's number, then the WHOLE remaining gap
+/// is the cost of building bl Vectors — a job Jason never does, and the one
+/// difference that is a deliberate choice rather than a defect.
+#[rustler::nif]
+fn spike_decode_direct_lists<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
+    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
+    let term = TermSeed {
+        env,
+        vectors: false,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|e| err(format!("{e}")))?;
+    deserializer.end().map_err(|e| err(format!("{e}")))?;
+    Ok(term)
+}
