@@ -12,12 +12,13 @@ defmodule BeamLisp.SourceGraph do
   `header/1` reads with the real reader, so the build never carries a second
   parser that could disagree with the language about what a `:require` is.
 
-  It lives in the `boot/` tier: the drift gate consults it on every AOT load,
-  so a change to it must rotate every stamp — and the toolchain key hashes
-  `priv/boot/` by directory (`BeamLisp.AOTCache`), needing no graph itself.
-  Boot-tier beams are trusted by the loader without a drift check (see
-  `BeamLisp.AOT.ensure_loaded/1`), which is also what keeps `stale?/2` from
-  recursing into the very namespace it asks.
+  It lives in the `build/` tier as that tier's graph KERNEL (see
+  `BeamLisp.Tiers`): the one build-tier namespace a program outside `build/`
+  may require, because every consumer of the require graph — the driver,
+  `std/` dev tooling, this facade — must read the SAME graph. Build-tier
+  beams are vetted by the tier key, not the closure hash: the drift gate runs
+  ON this graph and cannot vet its own tool with the tool — which is also
+  what keeps `stale?/2` from recursing into the very namespace it asks.
   """
 
   @ns "source-graph"

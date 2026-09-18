@@ -90,6 +90,26 @@ defmodule BeamLisp.BootBuildBarrierTest do
            ])
   end
 
+  test "the tier law: std/lib/compat may require the graph kernel, never the driver" do
+    # The law of tiers.ex, enforced over SOURCE with the kernel itself: every
+    # `.bl` under the program tiers is read by `SourceGraph.header` (the one
+    # parser), and no `:require` may name a driver namespace. `source-graph`
+    # is the kernel — std dev tooling (codebase, reload) requires it by
+    # design (PLAN-125).
+    driver = BeamLisp.Tiers.build_namespaces() -- BeamLisp.Tiers.build_kernel_namespaces()
+
+    offenders =
+      for tier <- ~w(std lib compat),
+          path <- Path.wildcard(Path.join([BeamLisp.Tiers.priv_root(), tier, "**", "*.bl"])),
+          {ns, requires} <- [BeamLisp.SourceGraph.header(File.read!(path))],
+          bad = Enum.sort(Enum.filter(requires, &(&1 in driver))),
+          bad != [] do
+        {path, ns, bad}
+      end
+
+    assert offenders == []
+  end
+
   test "each tier's sources are recognised, relative or absolute" do
     assert BeamLisp.Tiers.boot_source?("priv/boot/core.bl")
     assert BeamLisp.Tiers.boot_source?(Path.join(BeamLisp.Tiers.boot_dir(), "core.bl"))
@@ -112,6 +132,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
     build = BeamLisp.Tiers.build_namespaces()
 
     assert Enum.sort(build) == [
+             "app-resource",
              "build",
              "build-log",
              "build-plan",
@@ -119,7 +140,9 @@ defmodule BeamLisp.BootBuildBarrierTest do
              "deps",
              "deps-compile",
              "drop",
+             "embed-asset",
              "hex",
+             "mix-shim",
              "ns-interface",
              "pristine",
              "release",
@@ -127,7 +150,8 @@ defmodule BeamLisp.BootBuildBarrierTest do
              "selfbuild",
              "source-graph",
              "store",
-             "substrate"
+             "substrate",
+             "z3-asset"
            ]
 
     assert Enum.all?(build, &(&1 not in boot))

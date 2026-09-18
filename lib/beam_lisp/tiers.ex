@@ -32,13 +32,32 @@ defmodule BeamLisp.Tiers do
       source loads and runs. Per-namespace keyed; optional in a release.
 
   `self/` holds the self-hosting gates (oracle, fixpoint) — never a library a
-  program requires. `build/` is a library tier only in that the driver requires
-  its own modules (`build` → `build-plan` → `source-graph`); no program under
-  `std/`, `lib/` or `compat/` may reach into it.
+  program requires. `build/` itself splits in two:
+
+    * the graph KERNEL — `source-graph`: the single extraction point for the
+      require graph (`header*` / `closure` / `closure-hash` / `cycles`).
+      Every consumer of that graph — the driver, `std/` dev tooling
+      (`codebase`, `reload`), the Elixir runtime through
+      `BeamLisp.SourceGraph` — reads the SAME implementation, so a program
+      under `std/`, `lib/` or `compat/` MAY require it (PLAN-125). The edge
+      is per-namespace in the requiring ns's closure hash: honest coupling,
+      not tier rot.
+    * the DRIVER — everything else (`build`, `build-plan`, `ns-interface`,
+      the release machinery): no program under `std/`, `lib/` or `compat/`
+      may reach into it. The driver schedules the build; nothing it ships
+      to may schedule it back.
   """
 
   @tiers ~w(boot std lib compat build self)
   @library_tiers ~w(boot std lib compat build)
+
+  @doc """
+  The build-tier namespaces a program outside `build/` may require: the graph
+  kernel. Everything else in `build/` is the DRIVER — `std/`, `lib/` and
+  `compat/` sources must not name it in a `:require` (pinned by
+  `BeamLisp.BootBuildBarrierTest`).
+  """
+  def build_kernel_namespaces, do: ~w(source-graph)
 
   @doc "Tier directory names, in load-path order."
   def names, do: @tiers
