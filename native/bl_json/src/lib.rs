@@ -193,6 +193,162 @@ fn from_json<'a>(env: Env<'a>, value: Json, arrays_as_vectors: bool) -> NifResul
     })
 }
 
+// ── the streaming encoder: same disease, same cure ───────────────────────
+//
+// `spike_encode` builds a `serde_json::Value` tree and then serialises it — the
+// mirror image of what made decode slow, and it costs the same: encode is 2.2x
+// SLOWER than Jason (0.840 against 0.375 ms on 24.3 KB).
+//
+// `TermSer` implements `Serialize` over a term, so serde_json writes the bytes as
+// it walks and NO intermediate exists. Two things it must get right that the
+// Value version got free:
+//
+//   · bl.json's byte contract is that object keys are SORTED by their encoded text.
+//     A Value tree was sorted for us (serde_json's Map is a BTreeMap); streaming,
+//     we must sort explicitly or the bytes change.
+//   · bl's collection structs must be RECOGNISED. The Value walk did not know them
+//     and raised; this one maps a Vector to an array, and REFUSES any other struct
+//     rather than emitting `{"__struct__": …}` — the escape-to-bl rule.
+//
+// `Term::map_get` plus three atoms resolved ONCE per call (not per value: an atom
+// lookup per node would cost ~10% of the total on a payload full of Vectors).
+
+use serde::ser::{Serialize, SerializeMap, SerializeSeq};
+use serde::Serializer as SerTrait;
+use rustler::types::tuple::get_tuple;
+
+#[derive(Clone, Copy)]
+struct TermSer<'a> {
+    term: Term<'a>,
+    struct_key: Atom,
+    vector_mod: Atom,
+    items_key: Atom,
+}
+
+impl<'a> TermSer<'a> {
+    /// The struct's module name, if this term is a bl/Elixir struct at all.
+    fn struct_name(self) -> Option<String> {
+        let m = self.term.map_get(self.struct_key).ok()?;
+        m.atom_to_string().ok()
+    }
+}
+
+impl<'a> Serialize for TermSer<'a> {
+    fn serialize<S: SerTrait>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let t = self.term;
+        // order matters: a binary must be claimed before the atom check
+        if let Ok(b) = t.decode::<Binary>() {
+            return s.serialize_str(&String::from_utf8_lossy(b.as_slice()));
+        }
+        if let Ok(name) = t.atom_to_string() {
+            return match name.as_str() {
+                "nil" => s.serialize_unit(),
+                "true" => s.serialize_bool(true),
+                "false" => s.serialize_bool(false),
+                // a bl keyword and a bl symbol both cross as their name
+                _ => s.serialize_str(&name),
+            };
+        }
+        if let Ok(i) = t.decode::<i64>() {
+            return s.serialize_i64(i);
+        }
+        if let Ok(u) = t.decode::<u64>() {
+            return s.serialize_u64(u);
+        }
+        if let Ok(f) = t.decode::<f64>() {
+            if !f.is_finite() {
+                return Err(serde::ser::Error::custom("non-finite float"));
+            }
+            return s.serialize_f64(f);
+        }
+        if let Ok(items) = t.decode::<Vec<Term>>() {
+            let seq = s.serialize_seq(Some(items.len()))?;
+            return write_seq::<S>(seq, *self, items);
+        }
+        if t.decode::<HashMap<Term, Term>>().is_ok() {
+            // a bl struct is a map, so this branch sees Vectors too
+            if let Some(name) = self.struct_name() {
+                if name == "Elixir.BeamLisp.Vector" {
+                    let items = t
+                        .map_get(self.items_key)
+                        .map_err(|_| serde::ser::Error::custom("Vector without items"))?;
+                    // `items` is a TUPLE, and rustler's `Vec<T>` decoder reads only
+                    // LISTS (`ListIterator`) — so a plain decode::<Vec<Term>> here
+                    // fails on every Vector and presents as an ArgumentError.
+                    let items = get_tuple(items).map_err(|_| {
+                        serde::ser::Error::custom("Vector items is not a tuple")
+                    })?;
+                    let seq = s.serialize_seq(Some(items.len()))?;
+                    return write_seq::<S>(seq, *self, items);
+                }
+                // anything else is the escape-to-bl case, and it must be LOUD:
+                // emitting {"__struct__": …} would be a silently wrong document.
+                return Err(serde::ser::Error::custom(format!(
+                    "bl struct {name} has no streaming mapping"
+                )));
+            }
+            return write_map::<S>(s, *self, t);
+        }
+        Err(serde::ser::Error::custom(
+            "term has no JSON representation in the streaming walk",
+        ))
+    }
+}
+
+fn write_seq<'a, S: SerTrait>(
+    mut seq: S::SerializeSeq,
+    seed: TermSer<'a>,
+    items: Vec<Term<'a>>,
+) -> Result<S::Ok, S::Error> {
+    for item in items {
+        seq.serialize_element(&TermSer { term: item, ..seed })?;
+    }
+    seq.end()
+}
+
+/// Object elements, SORTED by key text — bl.json's byte contract, which a Value
+/// tree got for free (serde_json's Map is a BTreeMap) and streaming must do here.
+fn write_map<'a, S: SerTrait>(
+    s: S,
+    seed: TermSer<'a>,
+    t: Term<'a>,
+) -> Result<S::Ok, S::Error> {
+    let entries = t
+        .decode::<HashMap<Term, Term>>()
+        .map_err(|_| serde::ser::Error::custom("map decode"))?;
+    let mut pairs: Vec<(String, Term<'a>)> = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        let key = as_key(k).map_err(|e| serde::ser::Error::custom(format!("{e:?}")))?;
+        pairs.push((key, v));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut map = s.serialize_map(Some(pairs.len()))?;
+    for (k, v) in pairs {
+        map.serialize_entry(&k, &TermSer { term: v, ..seed })?;
+    }
+    map.end()
+}
+
+/// The streaming encoder. One atom lookup per call, not per node.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn spike_encode_stream<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
+    let seed = TermSer {
+        term,
+        struct_key: Atom::from_str(env, "__struct__")?,
+        vector_mod: Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
+        items_key: Atom::from_str(env, "items")?,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    let mut serializer = serde_json::Serializer::new(&mut out);
+    seed.serialize(&mut serializer)
+        .map_err(|e| err(format!("{e}")))?;
+    let mut owned = OwnedBinary::new(out.len()).ok_or_else(|| err("alloc"))?;
+    owned.as_mut_slice().copy_from_slice(&out);
+    Ok(Binary::from_owned(owned, env))
+}
+
+// The rustler contract: this string must equal `vm.native/host-module` for the ns,
+// or `load_nif` silently binds nothing and every call raises `:nif_not_loaded`.
 rustler::init!("Elixir.BeamLisp.Native.Bl.JsonSpike");
 
 // ══ ATTRIBUTION, and then the fix ═══════════════════════════════════════════
