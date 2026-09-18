@@ -318,23 +318,46 @@ is what makes it stick.
                    (filter (fn [d] (not= d "")) (String/split env ":")))]
     (concat (:code-paths st) from-env)))
 
+(defn- path->binary
+  "A code-path entry as a binary. `code.get_path` answers charlists and the
+   library store answers binaries; comparing the two needs one shape."
+  [p]
+  (if (erlang/is_binary p) p (erlang/list_to_binary p)))
+
+(defn register-store-paths!
+  "Put the library STORE's compiled ebins on the VM code path. Idempotent: a
+   directory already on the path is left alone, so this costs nothing when it
+   runs twice and never leaves the path half-applied.
+
+   Machine-global — it reads no command state, because it has none to read.
+   Any `.bl` namespace may call a library module (`Jason` behind every `--json`,
+   the store behind everything else), and the directories that hold them exist
+   for the whole VM, not for one invocation. `run-argv` calls this on every
+   entry, ahead of dispatch, so no command can reach a library module before
+   the path that carries it is in place."
+  []
+  (BeamLisp.Loader/ensure_loaded "deps-compile")
+  (let [have (set (map path->binary (code/get_path)))]
+    (each (fn [d]
+            (when-not (contains? have (path->binary d))
+              (Code/prepend_path d)))
+          (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list)))))
+
 (defn register-paths
   "Apply the parsed command's library roots and code paths. Library roots go to
    the loader's search path; code paths go on the VM's code path, expanded
    against the command's cwd.
 
-   The third source is the one that makes a tree Mix-free: `bl deps compile`
-   writes a library's beams into a content-addressed directory beside the
-   library store, and naming those here is the whole search-path rule (FUP-050
-   step 2). A tree with no `deps/` and no `_build` therefore runs against its
-   libraries — and because the directories are addressed by content and tagged
-   with the runtime that built them, every worktree on a machine shares one
-   compilation while a drop carrying its own erts never loads a checkout's
-   beams."
+   This is the ARGV-DERIVED half. A code-path directory matters because Mix
+   prunes the VM code path down to the project's dependencies once the project
+   loads, so a `-pa` handed to the VM is gone by the time a program runs.
+   Adding the directory here, after the prune, is what makes it stick.
+
+   The store half is `register-store-paths!` — machine-global, and already run
+   by `run-argv` before dispatch. It is called again here so a caller reading
+   only this function still gets a complete path."
   [st]
   (each (fn [d] (BeamLisp.Env/add_search_path d)) (:paths st))
   (each (fn [d] (Code/prepend_path (resolve d))) (code-paths st))
-  (BeamLisp.Loader/ensure_loaded "deps-compile")
-  (each (fn [d] (Code/prepend_path d))
-        (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list))))
+  (register-store-paths!))
 ```

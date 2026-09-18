@@ -44,7 +44,18 @@ defmodule BeamLisp.BuildReleaseTest do
     assert is_binary(value.erts.vsn) and value.erts.vsn == to_string(:erlang.system_info(:version))
 
     apps = bl(BeamLisp.Release.value(:beam_lisp).apps)
-    assert length(apps) >= 25, "expected the dependency closure, got #{length(apps)}"
+    # Every app the closure requires is NAMED here: a missing one is a boot
+    # that dies on a dependency. This used to be a size floor (`>= 25`), which
+    # pinned a number a different manifest happened to produce instead of the
+    # property that matters — and a proxy that cannot drift with its derivation
+    # goes stale silently.
+    named = Enum.map(apps, & &1.app)
+    assert Enum.sort(bl(BeamLisp.Release.app_closure(:beam_lisp)) -- named) == []
+
+    # What may be named BEYOND the closure is exactly the assembly tools: they
+    # ride in the tree without being started, which is why the `.rel` writes
+    # them `none`, and why `:sasl` is present and not in the closure.
+    assert (named -- bl(BeamLisp.Release.app_closure(:beam_lisp))) == [:sasl]
 
     for %{app: app, vsn: vsn, dir: dir} <- apps do
       assert is_binary(vsn) and vsn != "", "#{app} has no version"
