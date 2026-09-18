@@ -401,24 +401,30 @@ it is how a closed or clean document clears its squiggles.
                    "diagnostics" ds})))
 ```
 
-## Hover, with the proof card
+## Hover: the expression, and the proof behind it
 
-Standard hover names the expression under the cursor. When that expression is a
-call to a user function, the server appends what the compiler PROVED about it —
-purity, termination, return tagset, callees — because `lsp/proof-hover` answers
-exactly that. The beyond-LSP intelligence therefore reaches every editor, with
-no plugin: it rides the one request every editor already sends.
+Hover is where a reader meets a name they did not write, so the answer is a
+card rather than a label: what the expression is, the type the compiler
+inferred for it, and — when it names a function of this source — the docstring
+its author wrote and the proof the compiler computed (purity, termination,
+return tagset, callees). The proof half has no LSP request of its own; it rides
+the one request every editor already sends.
+
+`lsp/hover` answers as DATA and `lsp/hover-card` renders it. Two facts the card
+carries are corrections rather than features, and both were visible in what the
+server used to answer. A call names its CALLEE: every user call compiles to an
+`RT/invoke` trampoline, and reading the IR back is how hovering `(greet …)` came
+to say `Elixir.BeamLisp.RT/invoke`. And a type that is the compiler's universal
+tagset reads `any`, rather than listing fourteen tags nobody reads.
+
+A docstring is read through `typed/defn-clauses` — the compiler's own reading of
+a definition's shape — so it is the docstring the compiler found, and neither a
+metadata map nor a body that happens to be a string can be mistaken for one.
+
+`hover-markdown` is public because the terminal is a second client of the same
+answer: `bl lsp hover FILE LINE COL` prints exactly what a tooltip would show.
 
 ```beam-lisp
-(defn- proof-markdown [p]
-  (str "**" (:fn p) "** — "
-       (if (:pure p) "pure" "effects")
-       (if (:terminates p) " · terminates" " · may-diverge")
-       " · returns " (pr-str (into [] (:returns p)))
-       (if (seq (:calls p))
-         (str " · calls " (join ", " (into [] (:calls p))))
-         "")))
-
 (defn- name-token-end
   "The 0-based end index (exclusive) of the name token starting at `from` in
    `line`: the first delimiter."
@@ -449,21 +455,22 @@ no plugin: it rides the one request every editor already sends.
                        (subs line-text start end))))))
              ["(defn " "(defn- "]))))))
 
-(defn- hover-value [text line col]
-  (let [hv (lsp/hover text line col)
-        d (lsp/definition text line col)
-        nm (:resolves-to d)
-        card (when (and (some? nm) (= :user-fn (:kind d)))
-               (lsp/proof-hover text nm))]
-    (cond
-      (some? card) (str hv "\n\n---\n\n" (proof-markdown card))
-      ;; pointing at a definition's own head answers its proof card — the
-      ;; most natural place to ask "what does this fn do" cannot stay ∅
-      (= "∅ nothing here" hv) (let [dn (defn-name-at text line col)]
-                                (if (nil? dn)
-                                  hv
-                                  (proof-markdown (lsp/proof-hover text dn))))
-      :else hv)))
+(defn hover-markdown
+  "The markdown an editor shows for the point at [line col]: the expression
+   there and the type the compiler inferred for it, or — when the point names a
+   function of this source — its author's docstring and the compiler's proof.
+
+   The terminal is a second client of this answer, so the rendering lives here
+   rather than inside the request handler: `bl lsp hover` prints what an
+   editor's tooltip shows."
+  [text line col]
+  (or (lsp/hover-card text line col)
+      ;; A point on a definition's own HEAD has no call node to describe, and
+      ;; it is the most natural place to ask what a function does.
+      (let [dn (defn-name-at text line col)]
+        (if (nil? dn)
+          "No beam-lisp expression here."
+          (lsp/fn-card text dn)))))
 
 (defn- hover-out [state params id]
   (let [uri (get-in params ["textDocument" "uri"])
@@ -473,7 +480,7 @@ no plugin: it rides the one request every editor already sends.
       [state [(response id nil)]]
       (let [text (:text d)
             bl (lsp->bl text (get pos "line") (get pos "character"))
-            value (hover-value text (:line bl) (:col bl))]
+            value (hover-markdown text (:line bl) (:col bl))]
         [state [(response id {"contents" {"kind" "markdown" "value" value}})]]))))
 ```
 
@@ -559,7 +566,7 @@ symbol kind is Function.
 
 ```beam-lisp
 (defn- symbol-detail [s]
-  (str "→ " (pr-str (into [] (:returns s)))
+  (str "→ " (lsp/tagset-str (:returns s))
        (if (:pure s) " · pure" " · effects")
        (if (:terminates s) " · ↓" " · ⟳?")))
 
