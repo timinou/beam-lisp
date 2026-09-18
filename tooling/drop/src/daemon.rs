@@ -375,47 +375,73 @@ pub enum Attach {
     Stalled(u64),
 }
 
+/// The hello exchange, and the ONE place it is implemented.
 #[cfg(unix)]
-pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
+enum Hello {
+    /// Connected and answered ready; the stream is positioned to send a request.
+    Ready(UnixStream),
+    /// The daemon is up but wants a restart before it will serve this tree.
+    RestartRequired,
+    /// Unreachable, unusable, or a reject we do not recognise.
+    No,
+}
+
+#[cfg(unix)]
+fn hello(root: &Path) -> Hello {
     let ep = match endpoints(root) {
         Some(e) => e,
-        None => return Attach::Fallback,
+        None => return Hello::No,
     };
     if !ep.sock.exists() {
-        return Attach::Fallback;
+        return Hello::No;
     }
     let token = match std::fs::read(&ep.token) {
         Ok(t) => t,
-        Err(_) => return Attach::Fallback,
+        Err(_) => return Hello::No,
     };
 
     let mut stream = match UnixStream::connect(&ep.sock) {
         Ok(s) => s,
-        Err(_) => return Attach::Fallback,
+        Err(_) => return Hello::No,
     };
     let _ = stream.set_read_timeout(Some(read_timeout()));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    // hello
     let fp = tree_fingerprint(root);
-    let hello = encode_hello(&fp, &token);
-    if send_frame(&mut stream, &hello).is_err() {
-        return Attach::Fallback;
+    if send_frame(&mut stream, &encode_hello(&fp, &token)).is_err() {
+        return Hello::No;
     }
 
-    let hello_reply = match recv_frame(&mut stream) {
-        Ok(b) => decode(&b),
-        // a daemon that cannot answer hello within the timeout is unusable: cold.
-        Err(_) => return Attach::Fallback,
-    };
-    match hello_reply {
+    match recv_frame(&mut stream).ok().and_then(|b| decode(&b)) {
         // PLAN-121/123: the daemon runs each request as its OWN VM process, so
         // it is never "busy" — a ready hello means attach and send.
-        Some(Term::Tuple(t)) if is_ready(&t) => {}
-        Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => return Attach::RestartRequired,
-        Some(Term::Tuple(_)) => return Attach::Fallback, // other reject (wrong tree/unauthorized)
-        _ => return Attach::Fallback,
+        Some(Term::Tuple(t)) if is_ready(&t) => Hello::Ready(stream),
+        Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => Hello::RestartRequired,
+        // any other reject (wrong tree / unauthorized), and a daemon that cannot
+        // answer hello within the timeout, are both simply unusable.
+        _ => Hello::No,
     }
+}
+
+/// Whether a daemon for `root` is up and would serve a request.
+///
+/// This asks the HELLO and stops there — readiness IS the hello, so nothing has
+/// to be requested to ask. That is what keeps it silent: a probe runs in a poll
+/// loop inside a caller that is about to print its OWN command's output, and
+/// probing with a real command wrote that command's output into the caller.
+#[cfg(unix)]
+pub fn daemon_ready(root: &Path) -> bool {
+    matches!(hello(root), Hello::Ready(_))
+}
+
+#[cfg(unix)]
+pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
+    let mut stream = match hello(root) {
+        Hello::Ready(s) => s,
+        Hello::RestartRequired => return Attach::RestartRequired,
+        Hello::No => return Attach::Fallback,
+    };
+
 
     // request — from here, NEVER fall back (side effects may happen).
     let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());

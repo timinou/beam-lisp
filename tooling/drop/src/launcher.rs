@@ -385,20 +385,6 @@ fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
         .spawn();
 }
 
-/// Is a daemon reachable for this tree RIGHT NOW? A live socket plus a hello
-/// that completes — `version` through the protocol, the cheapest round trip.
-/// The socket file alone is not enough: after a crash it outlives its server.
-#[cfg(unix)]
-fn daemon_ready(root: &std::path::Path) -> bool {
-    match endpoints(root) {
-        Some(ep) => {
-            ep.sock.exists()
-                && matches!(try_attach(root, &["version".to_string()]), Attach::Exit(_))
-        }
-        None => false,
-    }
-}
-
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
 #[cfg(unix)]
 fn wait_ready(root: &std::path::Path) -> bool {
