@@ -97,7 +97,6 @@ use serde::Serializer as SerTrait;
 struct TermSer<'a> {
     term: Term<'a>,
     struct_key: Atom,
-    vector_mod: Atom,
     items_key: Atom,
     depth: usize,
 }
@@ -275,7 +274,6 @@ fn json_encode<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
     let seed = TermSer {
         term,
         struct_key: Atom::from_str(env, "__struct__")?,
-        vector_mod: Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
         items_key: Atom::from_str(env, "items")?,
         depth: 0,
     };
@@ -293,9 +291,31 @@ fn json_encode<'a>(env: Env<'a>, term: Term<'a>) -> NifResult<Binary<'a>> {
 // `Deserialize` — is what carries the `Env` down the recursion, and `Env` is `Copy`, so
 // threading it costs nothing. Parsing into a `Value` first and walking it afterwards
 // costs MORE than a whole hand-written Elixir parse (0.465 ms against Jason's 0.345).
+//
+// It is TOTAL: the answer is always `{:ok, value}` or `{:error, message}`, never an
+// exception and never a silent substitute. That matters because a decoded document can be
+// ANY beam-lisp value, a string included — so "did I get a string back?" cannot be the
+// success test the way it is for the encoder. And a NIF failure does not reliably arrive
+// as a raised exception (observed), so the outcome has to be in the value.
+//
+// Two things it REFUSES to guess at, both handed back to `bl.json`:
+//   · nesting past serde_json's own 128-level limit — `bl.json` decodes any depth, and its
+//     suite encodes 2000 levels on purpose;
+//   · `:existing-atom` meeting a key that is not interned — `bl.json` owns the message for
+//     that, and it is a refusal, not a fallback to a string.
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::fmt;
+
+/// How an object key becomes a beam-lisp key. `:string` is the default because it is the
+/// only TOTAL one: `:keyword` interns an atom per key, and the atom table is a bounded,
+/// never-collected resource, so a document from a peer is a way to exhaust it.
+#[derive(Clone, Copy)]
+enum KeyMode {
+    String,
+    Keyword,
+    ExistingAtom,
+}
 
 /// `rustler::Error` implements Debug but not Display, so it cannot go straight into a
 /// serde error; its Debug form is the message.
@@ -306,7 +326,7 @@ fn as_de<E: de::Error>(e: rustler::Error) -> E {
 #[derive(Clone, Copy)]
 struct TermSeed<'a> {
     env: Env<'a>,
-    vectors: bool,
+    mode: KeyMode,
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
@@ -318,14 +338,14 @@ impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
     {
         deserializer.deserialize_any(TermVisitor {
             env: self.env,
-            vectors: self.vectors,
+            mode: self.mode,
         })
     }
 }
 
 struct TermVisitor<'a> {
     env: Env<'a>,
-    vectors: bool,
+    mode: KeyMode,
 }
 
 fn atom<'a, E: de::Error>(env: Env<'a>, name: &str) -> Result<Term<'a>, E> {
@@ -333,6 +353,7 @@ fn atom<'a, E: de::Error>(env: Env<'a>, name: &str) -> Result<Term<'a>, E> {
         .map(|a| a.to_term(env))
         .map_err(|_| E::custom("atom table exhausted"))
 }
+
 
 impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
     type Value = Term<'a>;
@@ -374,50 +395,116 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Term<'a>, A::Error> {
         let seed = TermSeed {
             env: self.env,
-            vectors: self.vectors,
+            mode: self.mode,
         };
         let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(8));
         while let Some(item) = seq.next_element_seed(seed)? {
             items.push(item);
         }
-        if self.vectors {
-            make_vector(self.env, items).map_err(as_de)
-        } else {
-            Ok(rustler::Encoder::encode(&items, self.env))
-        }
+        // arrays become VECTORS: bl's documented mapping, so a round trip holds
+        make_vector(self.env, items).map_err(as_de)
     }
 
+    /// Objects AND numbers arrive here.
+    ///
+    /// With `arbitrary_precision`, serde_json presents a number as a one-entry map under
+    /// `$serde_json::private::Number` holding the EXACT text — which is the only way to
+    /// tell `123456789012345678901234567890` from `1.2345678901234568e29`. Without it,
+    /// serde_json hands that integer to `visit_f64` and the value silently becomes a
+    /// float: the suite caught exactly that (`integers-are-exact`), and a decoder that
+    /// quietly changes a number is worse than a slow one.
+    ///
+    /// A rustler NIF CANNOT build an Erlang integer wider than u64 (`enif_make_int64`),
+    /// so an integer whose text does not fit must DECLINE — which sends the document to
+    /// `bl.json`, whose own decoder is exact. Passing it through as f64 would be the
+    /// silent corruption this whole arrangement exists to avoid.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Term<'a>, A::Error> {
-        let seed = TermSeed {
-            env: self.env,
-            vectors: self.vectors,
-        };
         let mut built = map::map_new(self.env);
-        while let Some(key) = map.next_key_seed(seed)? {
-            let value = map.next_value_seed(seed)?;
+        loop {
+            let key_text: String = match map.next_key::<String>()? {
+                Some(k) => k,
+                None => break,
+            };
+            if key_text == NUMBER_TOKEN {
+                let text: String = map.next_value()?;
+                return number_term(self.env, &text).map_err(as_de);
+            }
+            let key = key_term(self.env, self.mode, &key_text).map_err(as_de)?;
+            let value = map.next_value_seed(TermSeed {
+                env: self.env,
+                mode: self.mode,
+            })?;
+            // later keys overwrite earlier ones, which is bl's documented duplicate-key
+            // rule — an Erlang map gives it for free
             built = built.map_put(key, value).map_err(as_de)?;
         }
         Ok(built)
     }
 }
 
-/// A JSON document as bl values: objects are plain maps (a bl map IS an Erlang map),
-/// arrays are VECTORS, `null` is nil.
-///
-/// One pass, no intermediate, and `end()` so trailing bytes are another document rather
-/// than part of this one. A malformed document is refused with serde's position
-/// ("key must be a string at line 1 column 2").
-#[rustler::nif(schedule = "DirtyCpu")]
-fn json_decode<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>> {
-    let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
-    let term = TermSeed {
-        env,
-        vectors: true,
+/// The marker serde_json uses to hand over a number's exact text under
+/// `arbitrary_precision`.
+const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+/// An object key as beam-lisp wants it: a string, or an atom under `:keyword` /
+/// `:existing-atom`. The one place an atom is built at all.
+fn key_term<'a>(env: Env<'a>, mode: KeyMode, s: &str) -> NifResult<Term<'a>> {
+    Ok(match mode {
+        KeyMode::String => rustler::Encoder::encode(&s, env),
+        KeyMode::Keyword => Atom::from_str(env, s)?.to_term(env),
+        // `existing_from_str` asks WITHOUT creating, and a miss is an error — which is the
+        // decline bl.json needs, so it can say why rather than intern an atom a peer chose.
+        KeyMode::ExistingAtom => Atom::existing_from_str(env, s)?.to_term(env),
+    })
+}
+
+/// A JSON number, from its exact text. Integers that fit cross exactly; anything with a
+/// fraction or an exponent becomes the double bl's own decoder would produce; an integer
+/// too wide for a NIF DECLINES rather than rounding.
+fn number_term<'a>(env: Env<'a>, text: &str) -> NifResult<Term<'a>> {
+    if !text.contains(['.', 'e', 'E']) {
+        if let Ok(u) = text.parse::<u64>() {
+            return Ok(rustler::Encoder::encode(&u, env));
+        }
+        if let Ok(i) = text.parse::<i64>() {
+            return Ok(rustler::Encoder::encode(&i, env));
+        }
+        return Err(err("integer wider than u64"));
     }
-    .deserialize(&mut deserializer)
-    .map_err(|e| err(format!("{e}")))?;
-    deserializer.end().map_err(|e| err(format!("{e}")))?;
-    Ok(term)
+    match text.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(rustler::Encoder::encode(&f, env)),
+        Ok(_) => Err(err("non-finite float")),
+        Err(_) => Err(err("number is not parseable")),
+    }
+}
+
+/// A JSON document as beam-lisp values: objects are plain maps (a bl map IS an Erlang
+/// map), arrays are VECTORS, `null` is nil.
+///
+/// TOTAL: always `{:ok, value}` or `{:error, message}`. One pass, no intermediate, and
+/// `end()` so trailing bytes are another document rather than part of this one.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn json_decode<'a>(env: Env<'a>, data: Binary<'a>, keys: Atom) -> NifResult<Term<'a>> {
+    // `atom_to_string` is a method on Term, not on Atom (a lesson already recorded in
+    // this crate's own docs, and still mis-applied once) — so go through the term.
+    let mode = match keys.to_term(env).atom_to_string()?.as_str() {
+        "keyword" => KeyMode::Keyword,
+        "existing-atom" => KeyMode::ExistingAtom,
+        _ => KeyMode::String,
+    };
+    let outcome: Result<Term<'a>, String> = (|| {
+        let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
+        let term = TermSeed { env, mode }
+            .deserialize(&mut deserializer)
+            .map_err(|e| e.to_string())?;
+        deserializer.end().map_err(|e| e.to_string())?;
+        Ok(term)
+    })();
+    // A tuple is not `encode`-able by method: the trait has to be named.
+    Ok(match outcome {
+        Ok(term) => rustler::Encoder::encode(&(Atom::from_str(env, "ok")?, term), env),
+        Err(message) => rustler::Encoder::encode(&(Atom::from_str(env, "error")?, message), env),
+    })
 }
 
 // ── the rustler contract ────────────────────────────────────────────────────

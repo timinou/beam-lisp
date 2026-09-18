@@ -420,113 +420,32 @@
 ; (and for pretty output), so its cost does not matter and its diagnostic is
 ; exactly the one this namespace always produced.
 
-(defn- kv-pairs
-  "Sorted `{key, value}` tuples for a JSON object, with each key as its JSON
-   text. Sorted by the ENCODED key, so the bytes are deterministic whatever the
-   map's internal order is — which OTP's own map path is not above 32 keys."
-  [m]
-  (sort-by first
-           (to-list (map (fn [k] (erlang/list_to_tuple (list (key-text k "") (get m k))))
-                         (keys m)))))
-
-(defn- make-enc
-  "The encoder `json:encode/2` drives, closed over the options. `json:encode(Term,
-   Encoder)` is `Encoder(Term, Encoder)`, so this callback owns the ROOT, and
-   every primitive calls back into it for children. One bl-level decision per
-   value is the entire budget; OTP builds the brackets, commas and colons.
-
-   The options ride in the CLOSURE rather than as an argument: the callback's
-   arity is fixed by OTP and carries no state — the same constraint that makes it
-   unable to name a path — so closing over them costs one allocation per encode
-   call and nothing per value, whereas threading a map would cost a bl-level
-   operation at every node.
-
-   Hot arms first, deliberately: a string used to reach arm 4 of the old order,
-   at 2.04 us; reaching arm 1 costs 0.41 us (measured). `float?` must precede
-   `number?` because a float answers true to both.
-
-   `map?` precedes `struct?` because a `defrecord` is BOTH — and a record's
-   fields are what we want, while a foreign struct (a Date) has to reach its own
-   `Jason.Encoder`. A Vector is `sequential?` AND a struct; sequential wins."
-  [ascii?]
-  (fn [v self]
-    (cond
-      (string? v) (if ascii?
-                    (json/encode_binary_escape_all v)
-                    (json/encode_binary v))
-      (float? v) (if (or (not= v v) (> (erlang/abs v) max-float))
-                   (throw (ex-info "bl.json: non-finite float" {:non-finite v}))
-                   (json/encode_float v))
-      (number? v) (json/encode_integer v)
-      ; a bl record is a map, so it arrives here: `wire-project` reduces it to
-      ; its DECLARED fields, and an undeclared record THROWS — the walk, which
-      ; owns the path, then says which record and how to declare it. `struct?` is
-      ; false for a plain map and for Vector/Set, so the common case pays one
-      ; cheap predicate and no call.
-      (map? v) (let [m (if (struct? v) (wire-project v nil) v)]
-                 (if (empty? m)
-                   "{}"
-                   (json/encode_key_value_list_checked (kv-pairs m) self)))
-      (sequential? v) (if (empty? v) "[]" (json/encode_value (to-list v) self))
-      (nil? v) "null"
-      (keyword? v) (if ascii?
-                     (json/encode_binary_escape_all (str v))
-                     (json/encode_binary (str v)))
-      (set? v) (if (empty? v) "[]" (json/encode_value (sort-by pr-str (to-list v)) self))
-      (symbol-value? v) (json/encode_binary (str v))
-      (struct? v) (Jason/encode! v)
-      (= true v) "true"
-      (= false v) "false"
-      :else (json/encode_value v self))))
+;; ── encode: compact, by the native byte loop ────────────────────────────────
 
 (defn- encode-compact
-  "The native byte loop when it is present, otherwise OTP's.
+  "Compact JSON, written by the native byte loop.
 
-   PREFERENCE, not requirement. `bl.json-native` may be absent — no cargo, or no built
-   .so — and this namespace must stay correct either way, which is part of why the
-   fallback lives here rather than in the native namespace.
+   There is no second compact encoder. The NIF is assumed present — a build of bl ships
+   it, and a checkout without cargo is not a supported configuration to degrade into
+   silently. Two things still take the `emit` walk below, and neither is a hedge about
+   packaging:
 
-   The native encoder REFUSES anything it will not own: a Set, a record, a foreign
-   struct, or an integer beyond u64 (a NIF cannot read an Erlang bignum — rustler
-   exposes no way to). Rather than trust `try/catch` to see that refusal, the RESULT is
-   checked: a binary is the encoded text, and anything else means the native half
-   declined — because a NIF's failure does not reliably arrive as a raised exception.
-   (Observed: `Error::Term` from rustler surfaces to beam-lisp as a RETURNED value, so a
-   `catch` around the call never fires. A `catch` alone left this fallback dead and let a
-   non-string out of `encode`; the suite caught it as an unencodable value that failed
-   to raise.)
+     · `:ascii` — bl policy, not the byte loop's business;
+     · anything the byte loop REFUSES: a Set (whose array order is bl's `pr-str` order), a
+       record (whose fields the wire registry decides), an integer past u64 (a NIF cannot
+       read an Erlang bignum), or nesting past its 128-level limit.
 
-   So `encode-otp` runs whenever the fast lane produced no text, and THAT is the path
-   that yields the message the caller finally sees, including the RFC 6901 path a Rust
-   walk cannot name. The native half is a fast lane, never the arbiter of what is
-   encodable: if the two disagree, the walk wins and says why.
-
-   `:ascii` is not the native half's business — it is bl policy — so it routes to OTP,
-   which honours it."
+   The walk is not a second implementation of the same thing: it is the AUTHORITY for the
+   shapes the native half will not own, and the only code that can name an RFC 6901 path —
+   which is why a refusal lands there rather than being guessed at."
   [v o]
-  (if (and (not (get o :ascii)) (native/loaded?))
+  (if (get o :ascii)
+    (erlang/iolist_to_binary (emit v "" o))
     (let [r (try (native/json-encode v) (catch e nil))]
-      (if (string? r) r (encode-otp v o)))
-    (encode-otp v o)))
+      (if (string? r)
+        r
+        (erlang/iolist_to_binary (emit v "" o))))))
 
-(defn- encode-otp
-  "OTP assembles; bl decides. On failure the WALK produces the diagnostic, so the
-   message still names an RFC 6901 path — the fast path's callback carries no
-   state, which is precisely why it cannot say where."
-  [v o]
-  (try
-    (erlang/iolist_to_binary (json/encode v (make-enc (get o :ascii))))
-    (catch e
-      (let [diag (try {:ok (emit v "" o)} (catch e2 {:raise e2}))]
-        (if (contains? diag :raise)
-          (throw (:raise diag))
-          ;; The walk encoded what the fast path refused. They must not disagree
-          ;; about what this namespace accepts — silence here would hide a bug in
-          ;; `enc` behind a slow success.
-          (throw (ex-info
-                   (str "bl.json: the fast path refused a value the walk encodes ("
-                        (get e :original) ") — a bug in `enc`, not in the value")
-                   {:original (get e :original) :value v})))))))
 
 ;; ── encode ──────────────────────────────────────────────────────────────────
 
@@ -647,6 +566,25 @@
         (str "an unexpected sequence " (erlang/element 2 orig))
       :else (str e))))
 
+(defn- otp-decode
+  "OTP's decoder: the AUTHORITY, not a fallback.
+
+   It is what runs when the native half declines — nesting past its 128-level limit,
+   `:existing-atom` meeting a key that is not interned — and it is the only decoder that
+   reproduces this namespace's error MESSAGES (\"ends in the middle of a value\", \"trailing
+   bytes…\"), which callers and tests both pin. So the messages are bl's, and the native
+   half's own wording never reaches a caller."
+  [s opts]
+  (let [r (try
+            (json/decode s :ok (decoders opts))
+            (catch e
+              (throw (ex-info (str "bl.json: " (decode-failure e))
+                              {:reason (get e :original)}))))]
+    (let [rest (erlang/element 3 r)]
+      (if (= "" rest)
+        (erlang/element 1 r)
+        (throw (trailing-error rest))))))
+
 (defn decode
   "A JSON document as beam-lisp data. The mapping is the decode table at the
    head of this file: objects are maps, arrays are VECTORS, `null` is nil.
@@ -656,22 +594,25 @@
      :keys :keyword        object keys become keywords (interns an atom per key)
      :keys :existing-atom  object keys become the atom that already exists
 
-   Raises on malformed input. `json:decode/3` also returns the UNPARSED tail;
-   this wrapper treats a non-empty one as a malformed document, because one call
-   is one document."
+   Raises on malformed input, and treats bytes after the document as malformed —
+   one call is one document.
+
+   The native half parses; `otp-decode` takes over whenever it declines, so a
+   document it will not own (deep nesting, a key `:existing-atom` cannot place) is
+   decoded and REFUSED in bl's own words rather than in serde's. The answer is
+   always either a value or this namespace's exception; the native half is total,
+   so there is no third outcome to interpret."
   ([s] (decode s {}))
   ([s opts]
    (if-not (string? s)
      (throw (ex-info (str "bl.json: decode wants a string, got a " (type s)) {:value s}))
-     (let [r (try
-               (json/decode s :ok (decoders opts))
-               (catch e
-                 (throw (ex-info (str "bl.json: " (decode-failure e))
-                                 {:reason (get e :original)}))))]
-       (let [rest (erlang/element 3 r)]
-         (if (= "" rest)
-           (erlang/element 1 r)
-           (throw (trailing-error rest))))))))
+     (let [o (normalize-opts opts)
+           r (try
+               (native/json-decode s (get o :keys :string))
+               (catch e (list :error nil)))]
+       (if (= :ok (first r))
+         (second r)
+         (otp-decode s o))))))
 
 (defn try-decode
   "`decode`, as a result map: `{:ok value}` or `{:error message}`."
