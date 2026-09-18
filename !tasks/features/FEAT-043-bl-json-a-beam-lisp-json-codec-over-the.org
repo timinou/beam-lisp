@@ -326,3 +326,326 @@ documented above · `bl lsp check` 0 diagnostics on `json.bl`, `util.bl.md`,
   per-file `diagnostics`/`smells` counts were trusted here.
 
 NOTE [2026-09-18]: Committed as 1b103bd4 (26 files: bl.json, two test files, interop, util, 24 swept call sites). NOT committed, deliberately: `priv/std/bl/cli.bl`, which holds BOTH my one-comment change (the library-store-path rationale, where the JSON path left that list) and a CONCURRENT session's `lsp actions` feature work. Per FUP-046 the rule is to leave a file a concurrent session is editing and let the change ride with theirs. So one comment of mine is uncommitted by design — the file is otherwise green (its suite, system.cli-util-test, passes).
+
+* Round three: the performance regression, found by measuring, fixed by delegating
+
+**What was wrong.** 1b103bd4 shipped `bl.json` assembling the JSON bytes in
+beam-lisp. That moved the byte loop out of Erlang and into the interpreter, and
+it cost: 24.3 KB took 46–64 ms where the pipeline it replaced (`jsonable` +
+Jason) took 0.55 ms. So the rewrite made the hot path ~100x worse than the code
+it deleted. Found by benchmarking the codec I had just made the single
+implementation for every wire path — not by any test, because no test had ever
+timed it.
+
+**The mechanism** (measured, `bl run`, this machine): a bl-level call costs
+~0.7–1.0 us — `reduce` stepping costs 0.29 us/op, one predicate call 1.02 us,
+the 11-arm `cond` on a string 2.04 us — while `json/encode_binary` on 1 KB costs
+0.095 us. The escaping was never the problem. My traversal spent 20–40 bl calls
+per node.
+
+**The fix.** `json:encode(Term, Encoder)` is `Encoder(Term, Encoder)`, so the
+callback owns the ROOT and every primitive calls back into it for children. bl
+now DECIDES (one `cond` arm per value, options closed over) and OTP BUILDS
+(separators, brackets, colons) at Erlang speed. The path-threading walk survives
+as the DIAGNOSER: it runs only when we are about to raise, and for `:pretty`.
+That was the whole point of owning the traversal, so nothing about the
+diagnostic changed.
+
+**Measured, same process, best of 9, byte-equality asserted per row:**
+
+| payload | old | new | speedup |
+|---|---|---|---|
+| small frame (~170 B) | 0.145 ms | 0.058 ms | 2.5x |
+| frame with a bl vector | 0.208 ms | 0.077 ms | 2.7x |
+| 24.3 KB (500 maps) | 101.5 ms | 24.0 ms | **4.2x** |
+| flat 500-key object | 11.3 ms | 7.5 ms | 1.5x |
+| 500-int array | 1.035 ms | 0.032 ms | **32x** |
+| 200-deep nesting | 0.716 ms | 0.030 ms | **24x** |
+
+⚠ An earlier draft of this work claimed **5.1x** from a cross-run measurement.
+Re-measured in one process against the actual old implementation it is 4.2x on
+that payload; the 5.1x did not reproduce. Absolute times vary ~2x between runs,
+so only the RATIOS are claimed. (The 10.9 ms that produced 5.1x was a run
+artifact — the same-shaped scratch code measured 52–67 ms in a later process.)
+
+**Equivalence, which is what makes the change safe:** 53/53 compact outputs
+byte-identical to 1b103bd4, 50/50 `:pretty 2`, 50/50 `:pretty 4`, 50/50
+`:ascii true`, **6/6 error MESSAGES identical**, 50/50 decode round-trips. The
+corpus covers every arm, both key types, a >32-key map, a foreign struct, sets,
+lazy seqs, NUL bytes and unicode.
+
+**Two bugs the equivalence check caught, both in the new fast path, neither
+findable by reading it:**
+
+1. `(to-list {})` returns **nil** — every other empty collection returns `()`.
+2. `(sort-by f <empty>)` returns a **BeamLisp.Vector**, not a list — and OTP's
+   primitives reject a bl Vector, whose `items` is the empty tuple. That is
+   exactly where `{:unsupported_type, {}}` came from.
+
+Both fixed with explicit empty-collection arms (which also removes the
+dependence on how `sort-by` treats an empty input). The first line of defence
+worked as designed: the fast path failed, the walk succeeded, and instead of
+silently falling back — which would have hidden the bug behind a slow success —
+`encode-compact` raised "a bug in `enc`, not in the value". That guard exists
+precisely for this.
+
+**Still slow, now attributable.** Objects. `kv-pairs` plus reaching the map arm
+costs ~22 us per KEY: 500 ints encode in 0.032 ms, 500 keys in 7.5 ms. So
+`bl.json` remains 40–100x Jason for object-heavy payloads and must not go on a
+per-tick path (`tooling.pulse/frame-json`). Array/scalar payloads are at parity
+or better (500 ints: 0.032 ms vs Jason 0.063 ms). Decode is 3–8x throughout,
+because OTP's lexer does the per-byte work. Closing the object gap needs a
+native path or a map-specific one, not micro-optimisation: arm position and
+per-key plumbing are the measured costs, and the dispatch is already ordered
+hottest-first.
+
+* `defrecord` / `deftype`: what happens today, and the design
+
+**Observed** (`bl run`, not inferred):
+
+- `defrecord Point [x y]` is a real Elixir struct; `map?` **true** and `struct?`
+  **true**; `keys` gives `(:x :y)` with no `__struct__` leak. There is **no
+  `Jason.Encoder` for bl records**, so `Jason/encode!` refuses — but
+  `bl.json/encode` gives `{"x":1,"y":2}` through the field fallback, nested and
+  pretty included. Decoding gives a plain MAP: the type identity is lost, so the
+  round trip is one-way today.
+- `deftype Blob [a b]` is the bare tuple `{:bl_deftype, Mod, {3,4}}`; `map?` and
+  `struct?` are both false, and `bl.json` REFUSES it with a path-aware message
+  (`"/bl"` when nested). Jason refuses too.
+
+**Design:** a protocol (bl has `defprotocol`/`extend-type`) — `bl.json/Jsonable`
+with `to-json` (the owner declares the wire shape: field subset, renamed keys,
+computed fields) and `from-json` (closes the round trip). Checked in `emit`
+before the struct arm. A DERIVED default for records costs nothing because the
+registry already holds `{:record, ns, name, fields}` in a `persistent_term`;
+`deftype` gets NO default, because its own docstring is emphatic that it has no
+map semantics and a default would be a lie. Decode needs a target:
+`(j/decode s {:as Point})` — a `"$type"` discriminator is the alternative, but it
+couples the wire to our module names and lets a peer choose the type.
+
+**The hazard to fix in the same change:** the implicit all-fields default is a
+silent wire leak — adding a field changes the format with no error. Elixir's own
+refusal message warns about this verbatim. So the default should be a DECLARED
+field list, and a record with undeclared fields should be refused with a message
+saying so — the same shape as the duplicate-key refusal.
+
+**Not implemented.** Both probes above are evidence, not code.
+
+* v2 DESIGN — native, typed, bidirectional
+
+** The inventory a wire shape must cover
+
+Data records — the fields ARE values (12):
+
+| type | fields | kind |
+|------+--------+------|
+| datom.file/DFile | sha size media-type | blob descriptor |
+| datom.time/Interval | from to resolution calendar | time value |
+| datom.vector/DVec | dim body | packed LE-f32 binary |
+| datalog.parser.type/{PlainSymbol,Variable,Constant,SrcVar,Predicate,Function,Query} | | query AST (7) |
+| veritas/{IntGen,AnyGen,RealGen} | lo hi / — | generators (3) |
+
+Handle/runtime records — the fields are processes, tids, atoms, credentials (12):
+
+| type | fields | why it must never reach a wire |
+|------+--------+--------------------------------|
+| datom.blob-s3/BlobS3 | bucket prefix region endpoint access-key secret | CREDENTIALS (BUG-080) |
+| datom.store-ets/EtsStore, datom.blob-ets/BlobEts | table | ETS tid |
+| datom.store-fjall/FjallStore | handle path | NIF resource |
+| datom.store-map/MapStore | state | atom |
+| datom.blob-overlay/BlobOverlay, datom.store-overlay/OverlayStore | base buffer | atom |
+| datom.conn/Conn | store schema basis writer subs blobs | live processes |
+| datom.db/Db | store schema basis-t filter-mode since-t blobs | store handle |
+| datom.blob-fs/BlobFs | dir ephemeral? | local path |
+| loom.desktop/App | window driver | webview handle |
+
+⇒ no predicate separates DFile from FjallStore. The type must DECLARE which it is,
+and that declaration cannot be derived.
+
+deftype: ZERO production declarations — every `(deftype …)` in the tree is in test/
+(dispatch_table, guards, wave24, java_oracle, one specter fixture). No wire default;
+the refusal names the protocol.
+
+** The mechanisms already present (verified by running, not by reading)
+
+- registry: `:persistent_term` mod → {:record, "pv", "Point", [:x :y]} — ns, name,
+  fields, at runtime
+- Record.info/1, fields_of/1, record?/1, record_module?/1, deftype_module?/1
+- ->Name (positional), map->Name (map), Record.literal/3 (by ns+name)
+- INLINE protocol blocks on defrecord work. Fields are NOT implicit locals — a
+  record's access path is keyword lookup:
+  #+begin_src clojure
+  (defrecord Point [x y] Wire (wire-out [this] {"x" (:x this) "y" (:y this)}))
+  #+end_src
+- protocol dispatch on a plain map is REFUSED ⇒ a protocol is a genuine discriminator
+- `is_bl_map(x) when is_map(x) and not is_struct(x)` ⇒ a bl map IS a plain Erlang
+  map — a NIF builds one for free
+- struct-valued bl types: Vector{items: ()}, Set{members}, SortedMap/SortedSet{tree},
+  LazySeq{resource,metadata}, Delay{seq}, Decimal{unscaled,scale}
+- native substrate: `defnative "crate"` → vm.native/declare; rustler 0.38;
+  priv/native/<crate>.so; ETS :beam_lisp_native_declarations;
+  schedule = DirtyCpu|DirtyIo; __nif_loaded__/0 marker
+- serde_json 1.0.151 is ALREADY in native/code_embed/Cargo.toml ⇒ no new dep class
+
+** The type-management story: three lattices, deliberately separate
+
+| lattice | decided by | opaque allowed? |
+|---------+------------+-----------------|
+| runtime identity | BeamLisp.Record registry + struct/tagged tuple | n/a |
+| storage | datom.value-codec — LANE-*, ESC = term_to_binary | YES, correct here |
+| wire (JSON) | bl.json/Wire | NO |
+
+Rule: **storage may be opaque; the wire must be explicit.** A store is one writer and
+one reader on one machine, so term_to_binary gives exact fidelity and the ESC lane is
+the right answer for an unknown type. A wire is ANOTHER PROCESS'S PARSER, and
+binary_to_term on untrusted bytes is a remote-code-execution primitive ([:safe] exists
+for that reason) — the ESC lane must never be emulated on the wire. ∴ records opt in,
+and decode is allowlisted.
+
+** The defrecord protocol
+
+#+begin_src clojure
+(defprotocol Wire
+  (wire-out [this])   ; value -> a plain payload (maps/vectors/strings/…)
+  (wire-in  [m]))     ; a plain payload -> a value of this type
+#+end_src
+
+`wire-` not `json-`: the protocol states the VALUE's shape; the tag syntax is the
+codec's business, so a future CBOR/transit writer reuses it unchanged.
+
+#+begin_src clojure
+;; derived — the 90% case, and the field list IS the decision
+(defrecord DFile [sha size media-type])
+(wire/declare! DFile [:sha :size :media-type])       ; derives out + in
+(wire/declare! BlobS3 [:bucket :region :prefix])     ; NOT access-key/secret: a decision
+(wire/declare! Conn :all-fields)                     ; greppable "yes, I mean it"
+
+;; custom — when the shape is not the fields
+(defrecord Interval [from to resolution calendar]
+  Wire
+  (wire-out [this] {"from" (:from this) "to" (:to this) "res" (:resolution this)})
+  (wire-in  [m]    (->Interval (get m "from") (get m "to") (get m "res") nil)))
+#+end_src
+
+Three deliberate choices:
+
+1. The field list is explicit even in the derived form. The defect is not a naming
+   accident; it is that ADDING A FIELD SILENTLY CHANGES THE WIRE FORMAT. A declared
+   list is a line of reviewable intent, and `bl check` can flag a record with fields
+   absent from its own declaration. :all-fields keeps the leaky choice available — and
+   greppable.
+2. wire-in builds POSITIONALLY from the declared list, so a key the payload lacks is
+   nil only when declared optional; otherwise it raises naming the key.
+3. deftype gets no default, and the refusal names the protocol it must implement.
+
+** The tag format
+
+#+begin_src json
+{"$rec":"datom.file/DFile","sha":"…","size":123,"media-type":"text/plain"}
+#+end_src
+
+- the tag name is ns/name from the registry — a SOURCE-level name, so the wire never
+  encodes Elixir.BeamLisp.Record.… If module_name/2 changes, the wire must not.
+- INTERNALLY TAGGED, not a wrapper object or ["~#tag", …]: the payload stays an object,
+  so a consumer that knows nothing of tags still reads the DATA and ignores $rec. That
+  is the interop property that motivates plain-by-default.
+- $-prefixed record fields are refused at declaration ⇒ data can never spoof the tag.
+- decode resolves ns/name → registry → must be DECLARED (allowlist) and the ns LOADED
+  ⇒ an unknown tag is a loud error, never a silent plain map. Silent degradation is
+  exactly how richness gets lost, which is what v2 exists to prevent.
+
+** The rest of the rich-type vocabulary
+
+| bl value | plain (today, unchanged) | typed |
+|----------+--------------------------+-------|
+| keyword | "foo" | keyword tag (distinct from string) |
+| symbol | "foo" | symbol tag |
+| set | array | $set tag |
+| bl Vector vs list | both array | list tagged only if it must round-trip distinctly |
+| Decimal | float | $dec tag (exact unscaled+scale) |
+| inst | string | $inst tag (RFC3339, mandatory offset) |
+| DVec | {dim,body} | $rec (declared) |
+| char | string | char tag |
+| LazySeq | array | array (forcing is a VM job — see below) |
+
+Key policy (:keys) is unchanged — typed mode changes only what LOSES information.
+
+** Architecture: bl owns policy, Rust owns the byte loop
+
+#+begin_src text
+bl.json/encode ──opts, errors, pretty, paths──┐
+                                              ├─ hot path
+      native/bl_json (serde_json, DirtyCpu) ──┘
+                  │
+                  └─ {:unhandled, pointer, term} ──→ bl's existing walk
+#+end_src
+
+The NIF owns the CLOSED set it can own: nil, bool, int (bignum), float, binary, atom,
+list, plain map (free), Vector, Set, sorted variants, and a DERIVED record (registry
+lookup + declared fields).
+
+It returns {:unhandled, json_pointer, term} for what it must not own:
+- a LazySeq — forcing it is running VM code, which a NIF must not do
+- a record with a CUSTOM wire-out — that is a bl protocol call
+- a Decimal, a foreign struct, anything else
+
+bl then handles exactly that subtree with the walk it already has, so PATHS, ERROR
+TEXT, PROTOCOL DISPATCH and the pretty printer all stay in bl, and the common case never
+leaves Rust. :pretty stays on the existing walk (it needs indent state).
+
+Decode mirrors it: serde_json parses; Rust builds plain Erlang maps and
+%BeamLisp.Vector{items: {}} directly; a $rec whose shape is DERIVED is built in Rust
+(registry → __struct__ + fields); a $rec with a custom wire-in escapes to bl.
+
+THE BOUNDARY CONTRACT. Rust would duplicate Vector{items,meta}, Set{members} and the
+registry tuple {:record, ns, name, fields}. That is cross-language coupling with no
+compiler on either side. Mitigation, following the precedent already in vm/native
+(the rustler init! module-name string, documented as "THE contract"): document each
+shape and add a test asserting it from BOTH sides, so a change fails CI instead of
+corrupting values at runtime.
+
+** Efficiency: measured costs, PREDICTED gains
+
+Measured: a bl-level call ~0.7–1.0 us (reduce step 0.29, one predicate 1.02, 11-arm
+cond 2.04); today's encode spends ~4–6 such calls per node plus ~22 us per object KEY.
+
+| payload | Jason | bl.json today | v2 PREDICTED |
+|---------+-------+---------------+--------------|
+| small frame ~170 B | 0.004 ms | 0.058 ms | ~0.005 ms |
+| 24.3 KB (500 maps) | 0.63 ms | 24.0 ms | ~0.4–0.8 ms |
+| flat 500-key object | 0.13 ms | 7.5 ms | ~0.15 ms |
+| 500-int array | 0.063 ms | 0.032 ms | ~0.03 ms |
+| decode 24.3 KB | 0.37 ms | 2.94 ms | ~0.3–0.6 ms |
+
+Target: parity with Jason — the walk is in Rust and the crossings are one per call.
+NOT measured: no native code exists.
+
+** Migration, each step shippable alone
+
+1. BUG-080 — default-deny records + the loud derived ctor. bl only, small, no native.
+   Lands FIRST: it is the security fix and it is independent.
+2. bl.json/Wire + wire/declare! + $rec. bl only. Tests: round-trip for every DATA
+   record; refusal for every HANDLE record, so a 13th cannot arrive undeclared.
+3. native/bl_json crate: encode fast path, escaping to the walk; byte-identity vs today
+   on the whole corpus before/after.
+4. decode fast path.
+5. :typed vocabulary.
+6. retire vm/inspect's now-redundant lowering.
+
+MODE DISCIPLINE. :plain stays the default ⇒ every existing caller's bytes are
+UNCHANGED ⇒ the 1930-assertion cutover surface stays green without edits. Richness is
+opt-in because most wire is someone else's protocol (MCP, LSP) that must not see our
+tags.
+
+** NOT VERIFIED — do not read these as done
+
+- No native code written. Every v2 number above is a PREDICTION from measured per-op
+  costs.
+- Reading the :persistent_term registry from a NIF, and building an Elixir struct term
+  from rustler 0.38, are both UNVERIFIED — and both are load-bearing for steps 3–5.
+  Spike before committing to the crate.
+- serde_json at the version/features bl_json needs is an assumption from the lockfile,
+  not a build.
+- The $-prefix reservation and the tag-name format are design choices, untested.
+- Whether any foreign (Elixir) struct currently reaches a caller that would move to
+  :typed has not been checked.
