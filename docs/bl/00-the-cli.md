@@ -612,6 +612,49 @@ Exit `0` when the file has no diagnostics, `1` when it has some.
 `--json` keys: `diagnostics`, `symbols` (each `name`, `returns`, `pure`,
 `terminates`, `calls`).
 
+#### `bl lsp hover FILE LINE COL`
+
+Print exactly what an editor's tooltip shows at a source position (1-based),
+so the hover card is testable without an editor. A call names its callee and
+carries the fn's whole proof card — docstring, signature, inferred return,
+purity/effects, termination, recursion growth class, native eligibility. A
+position on a parameter, a literal, or an operator answers as that thing.
+
+````sh
+$ bl lsp hover src/ledger.bl 24 18
+### total — function
+
+> Sum the ledger's entries.
+
+```beam-lisp
+(total entries)
+```
+
+- **returns** `float | int`
+- **pure** — it touches no state, so a call to it may be reordered or dropped
+- **terminates** — every loop in it halts
+- **grows** `O(n)` — self-recursive; that is its recursion's cost shape
+- **native-eligible** — pure ∧ terminating, a candidate for native offload
+````
+
+#### `bl lsp actions FILE LINE COL [--json]`
+
+The quick-fixes and refactors offered at a position: one `fix: …` per
+diagnostic on the line, `compile '<fn>' to native` when the enclosing fn is
+pure ∧ terminating, and `annotate '<fn>' — returns …` when the inferred return
+type is narrower than `any` (the edit inserts the `^{:args … :ret …}` metadata
+the typed checker consumes).
+
+#### `bl lsp complete FILE LINE COL [--json]`
+
+The completion candidates at a position, each with its proven detail
+(`→ float | int · pure ↓`).
+
+#### `bl lsp symbols FILE [--json]`
+
+The document outline: every definition with its inferred return, purity,
+termination, and recursion growth class.
+
 #### `bl lsp serve`
 
 Speak LSP on stdin/stdout — the language server an editor starts. It advertises

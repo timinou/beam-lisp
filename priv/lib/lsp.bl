@@ -26,6 +26,7 @@
             [system.footprint :as fp]
             [system.linear :as lin]
             [termination :as term]
+            [reader-node :as rn]
             [typed]
             [errors]))
 
@@ -141,6 +142,10 @@
             (when hit [name hit])))
         (into [] (:bodies a))))
 
+; hover answers with a fn's FULL projection; the projection reads the growth
+; table and the native gate, both defined further down.
+(declare fn-projection defn-info)
+
 ; ── reading an answer, for humans ─────────────────────────────────────────
 ;
 ; Three renderers every human-facing surface shares, so a type is spelled once
@@ -212,57 +217,238 @@
              (= (:fun node) :invoke))
     (first (:args node))))
 
+; ── the token layer ─────────────────────────────────────────────────────
+;
+; The reader stamps only LIST forms with source positions — atoms stay bare,
+; to match the Elixir answer key — so an argument (a parameter use, a literal)
+; has no ANF span of its own: the innermost stamped node covering it is the
+; enclosing call. The token layer closes that gap WITHOUT touching the reader:
+; given a point inside a stamped span, read the token the point is actually
+; on. The ANF answer stays the authority on what the form IS; the token
+; refines WHERE inside it the cursor rests.
+
+(def ^:private token-delims
+  "Chars that bound a token: whitespace, brackets, the string quote, the
+   comment char, and reader-macro chars that never appear inside a symbol."
+  (set (String/codepoints " \t\r\n()[]{}\"`,;^'~@")))
+
+(def ^:private digits (set (String/codepoints "0123456789")))
+
+(defn- digit? [c] (contains? digits c))
+
+(defn- lex-state-at
+  "The lexical state at [line col] (both 1-based): :string when the point
+   rests inside a string literal, :comment when inside a line comment, else
+   :code. Scanned from the start of the source, so a multi-line string's
+   quotes are counted honestly; a comment never outlives its own line."
+  [src line col]
+  (let [lines (into [] (split src "\n"))]
+    (loop [ln 1 in-string false esc false]
+      (let [cps (into [] (String/codepoints (get lines (dec ln) "")))
+            limit (if (= ln line) (min (dec col) (count cps)) (count cps))
+            st (reduce (fn [s idx]
+                         (let [c (nth cps idx)]
+                           (cond
+                             (:comment s) s
+                             (:esc s)     (assoc s :esc false)
+                             (and (:string s) (= c "\\")) (assoc s :esc true)
+                             (= c "\"")  (assoc s :string (not (:string s)))
+                             (and (not (:string s)) (= c ";")) (assoc s :comment true)
+                             :else s)))
+                       {:string in-string :esc esc :comment false}
+                       (range 0 limit))]
+        (if (= ln line)
+          (cond (:comment st) :comment (:string st) :string :else :code)
+          (recur (inc ln) (:string st) (:esc st)))))))
+
+(defn- token-at
+  "The token under [line col] (both 1-based), as {:text :start :end} with
+   0-based bounds (end exclusive), or {:in :string} / {:in :comment} when the
+   point rests inside one, or nil on whitespace and brackets."
+  [src line col]
+  (let [state (lex-state-at src line col)]
+    (if (not= state :code)
+      {:in state}
+      (let [lt (get (into [] (split src "\n")) (dec line))]
+        (when (string? lt)
+          (let [cps (into [] (String/codepoints lt))
+                n (count cps)
+                i (dec col)]
+            (when (and (>= i 0) (< i n) (not (contains? token-delims (nth cps i))))
+              (let [start (loop [j i]
+                            (if (and (> j 0) (not (contains? token-delims (nth cps (dec j)))))
+                              (recur (dec j)) j))
+                    end (loop [j i]
+                          (if (and (< j n) (not (contains? token-delims (nth cps j))))
+                            (recur (inc j)) j))]
+                {:text (join "" (take (- end start) (drop start cps)))
+                 :start start :end end}))))))))
+
+(defn- float-spelling?
+  "Does the codepoint seq `cs` spell a float: digits with a `.` or an
+   exponent, an optional leading `-`, nothing else?"
+  [cs]
+  (let [b (into [] (if (= "-" (first cs)) (rest cs) cs))
+        s (join "" b)]
+    (and (seq b)
+         (some digit? b)
+         (or (some? (index-of s ".")) (some? (index-of s "e")) (some? (index-of s "E")))
+         (every? (fn [c] (or (digit? c) (contains? #{"." "e" "E" "+" "-"} c))) b))))
+
+(defn- literal-token-tag
+  "The tag of the literal `tok` spells (:int :float :kw :bool :nil), or nil
+   when `tok` is not a literal. Shapes only — the value is the source's
+   business."
+  [tok]
+  (let [cs (into [] (String/codepoints tok))
+        n (count cs)
+        all-digits (fn [from] (every? digit? (take (- n from) (drop from cs))))]
+    (cond
+      (= n 0) nil
+      (or (= tok "true") (= tok "false")) :bool
+      (= tok "nil") :nil
+      (and (> n 1) (= ":" (first cs))) :kw
+      (and (digit? (first cs)) (all-digits 1)) :int
+      (and (= "-" (first cs)) (> n 1) (all-digits 1)) :int
+      (float-spelling? cs) :float
+      :else nil)))
+
+(defn- enclosing-defn
+  "The name of the top-level definition whose form span contains [line col],
+   or nil. Read from the reader's own form wrappers (they carry end
+   positions), so a point inside a LITERAL body — a map, a vector, a bare
+   value the ANF never stamps with a span — still knows which fn it lives in."
+  [src line col]
+  (first
+   (filter some?
+    (map (fn [form]
+           (try
+             (let [f (rn/node-form form)]
+               (when (= :list (rn/node-tag f))
+                 (let [its (into [] (rn/node-items f))]
+                   (when (>= (count its) 2)
+                     (let [head (rn/node-form (first its))
+                           nm (rn/node-form (second its))]
+                       (when (and (= :symbol (rn/node-tag head))
+                                  (contains? #{"defn" "defn-" "defmacro" "defmacro-"}
+                                             (rn/node-name head))
+                                  (= :symbol (rn/node-tag nm)))
+                         (let [pos (rn/node-pos form)]
+                           (when (and (map? pos) (in-span? pos line col))
+                             (rn/node-name nm)))))))))
+             (catch _e nil)))
+         (try (BeamLisp.Reader/read_string src)
+              (catch _e []))))))
+
+(defn- param-of?
+  "Is `tok` a parameter name in `fname`'s definition? Read from the source's
+   own defn facts — the names the programmer wrote, not the hygienic ones."
+  [src fname tok]
+  (let [ps (:params (get (defn-info src) fname))]
+    (and (some? ps)
+         (some? (some (fn [arity] (some (fn [p] (if (= p tok) p nil)) arity)) ps)))))
+
+(defn- refine-with-token
+  "Sharpen `answer` with the source token under the point. The ANF resolves
+   the FORM; the token resolves the CURSOR inside it: a parameter use, a
+   literal, or a function named as a value each answer as themselves, while a
+   point on the callee's own name keeps the call answer. Whitespace, comments,
+   and positions the node already explains change nothing."
+  [src a fname answer line col]
+  (if (= :literal (:kind answer))
+    answer
+    (let [t (token-at src line col)]
+      (cond
+        (nil? t) answer
+        (= :string (:in t))
+        (merge answer {:kind :literal :label "a string" :type #{:string}
+                       :fn nil :projection nil :code nil})
+        (:in t) answer
+        (= (:text t) (:label answer)) answer
+        (some? (literal-token-tag (:text t)))
+        (merge answer {:kind :literal :label (:text t) :type #{(literal-token-tag (:text t))}
+                       :fn nil :projection nil :code (:text t)})
+        (and (some? fname) (not= fname analyze/top-name) (param-of? src fname (:text t)))
+        ; a param's own type is not inferred (yet) — `any`, not the enclosing
+        ; node's tagset, which describes the FORM's value, not the variable's
+        (merge answer {:kind :param :label (:text t) :in-fn fname :type summary/all-tags
+                       :fn nil :projection nil :code (:text t)})
+        (contains? (:summaries a) (:text t))
+        (merge answer {:kind :fn :label (:text t) :fn (:text t)
+                       :projection (fn-projection src (:text t))})
+        :else answer))))
+
 (defn hover
   "textDocument/hover, as DATA: what the expression at [line col] is, and the
    tagset the compiler inferred for its value.
 
-   → {:kind  :call | :op | :fn | :var | :literal | :expr
+   → {:kind  :call | :op | :fn | :var | :param | :literal | :expr
       :label `greet`            the name to show, already resolved
       :type  #{:string}         the inferred return tagset
       :fn    `greet` | nil      the user fn a proof card can be read for
+      :projection fn-projection | nil   the fn's whole proof card, as DATA
       :code  `(greet x)` | nil  the source the point covers
+      :in-fn `greet` | nil      for :param, the fn whose parameter this is
    → {:kind :none}              no analyzed node covers the point
 
    A call names its CALLEE. Every user call compiles to an `RT/invoke`
    trampoline, and answering from that node is how a hover came to say
    `Elixir.BeamLisp.RT/invoke` for `(greet …)` — the resolved name is the fact
-   a reader wants, and the compiler already resolved it. `:op` is a direct host
-   call (`erlang/+`); `:fn` is a function used as a value."
+   a reader wants, and the compiler already resolved it. `:op` is a direct
+   host call (`erlang/+`) OR the canonical arith op it spells (`+` IS
+   `erlang/+` — one op, one answer). `:fn` is a function used as a value.
+   `:param` and inner literals come from the token layer: the ANF spans the
+   form, the token resolves the cursor inside it."
   [src line col]
   (let [a (analyzed src)
         hit (fn-at a line col)]
     (if (nil? hit)
-      {:kind :none}
-      (let [[_fname node] hit
+      ;; No stamped node covers the point — a literal body (a map, a bare
+      ;; value), a defn's own head, the gaps between forms. The token layer
+      ;; still answers what it can (a literal, a param, a fn named as a
+      ;; value); anything else is honestly :none.
+      (refine-with-token src a (enclosing-defn src line col)
+                         {:kind :none :type summary/all-tags} line col)
+      (let [[fname node] hit
             summaries (:summaries a)
             tags (summary/returns-tag (:known a) node)
             callee (callee-node node)
             local? (fn [nm] (contains? summaries nm))
-            base {:type tags :code (span-text src (:ann node))}]
-        (cond
-          (and (some? callee) (= :global (:op callee)))
-          (let [nm (:name callee)]
-            (merge base {:kind :call :label nm :fn (when (local? nm) nm)}))
+            proj (fn [nm] (when (local? nm) (fn-projection src nm)))
+            base {:type tags :code (span-text src (:ann node))}
+            answer (cond
+                     (and (some? callee) (= :global (:op callee)))
+                     (let [nm (:name callee)]
+                       (merge base {:kind :call :label nm :fn (when (local? nm) nm)
+                                    :projection (proj nm)}))
 
-          (and (some? callee) (= :var (:op callee)))
-          (merge base {:kind :var :label (:name callee)})
+                     (and (some? callee) (= :var (:op callee)))
+                     (merge base {:kind :var :label (:name callee)})
 
-          (= :remote (:op node))
-          (merge base {:kind :op :label (str (:mod node) "/" (:fun node))})
+                     (= :remote (:op node))
+                     (merge base {:kind :op :label (str (:mod node) "/" (:fun node))})
 
-          (= :var (:op node))
-          (merge base {:kind :var :label (:name node)})
+                     ; `+` IS `erlang/+`: the canonical arith op answers as
+                     ; the operator it is, with the BIF's inferred tagset —
+                     ; never "arith — expression, type any".
+                     (= :arith (:op node))
+                     (merge base {:kind :op :label (name (:bif node))})
 
-          (= :global (:op node))
-          (merge base {:kind :fn :label (:name node)
-                       :fn (when (local? (:name node)) (:name node))})
+                     (= :var (:op node))
+                     (merge base {:kind :var :label (:name node)})
 
-          (= :lit (:op node))
-          (merge base {:kind :literal :label (value-str (:val node))})
+                     (= :global (:op node))
+                     (merge base {:kind :fn :label (:name node)
+                                  :fn (when (local? (:name node)) (:name node))
+                                  :projection (proj (:name node))})
 
-          :else
-          (merge base {:kind :expr
-                       :label (if (keyword? (:op node)) (name (:op node)) "expression")}))))))
+                     (= :lit (:op node))
+                     (merge base {:kind :literal :label (value-str (:val node))})
+
+                     :else
+                     (merge base {:kind :expr
+                                  :label (if (keyword? (:op node)) (name (:op node)) "expression")}))]
+        (refine-with-token src a fname answer line col)))))
 
 ; ── the hover card ────────────────────────────────────────────────────────
 ;
@@ -356,6 +542,7 @@
     :op      "BEAM function"
     :fn      "function value"
     :var     "variable"
+    :param   "parameter"
     :literal "literal"
     "expression"))
 
@@ -369,48 +556,60 @@
     (if (keyword? k) (name k) (pr-str k))))
 
 (defn- proof-bullets
-  "What the compiler proved about summary `s`, one markdown bullet each.
-   Nothing is claimed that was not computed: a function with no effects says
-   so, and one that calls nothing says nothing."
-  [s]
-  (str "- **returns** `" (tagset-str (:returns s)) "`\n"
-       (if (empty? (:footprint s))
+  "What the compiler proved about the fn projection `p`, one markdown bullet
+   each. Nothing is claimed that was not computed: a function with no effects
+   says so, one that calls nothing says nothing, and only a self-recursive fn
+   carries a growth class."
+  [p]
+  (str "- **returns** `" (tagset-str (:returns p)) "`\n"
+       (if (empty? (:footprint p))
          "- **pure** — it touches no state, so a call to it may be reordered or dropped\n"
          (str "- **effects** — it touches "
               (join ", " (map (fn [k] (effect-name k))
-                               (sort (keys (:footprint s)))))
+                               (sort (keys (:footprint p)))))
               "\n"))
-       (if (:terminates s)
+       (if (:terminates p)
          "- **terminates** — every loop in it halts\n"
          "- **may diverge** — a loop in it is not proven to halt\n")
-       (when (seq (:calls s))
+       (when (some? (:growth-label p))
+         (str "- **grows** `" (:growth-label p) "` — self-recursive; that is its recursion's cost shape\n"))
+       (when (:native p)
+         "- **native-eligible** — pure ∧ terminating, a candidate for native offload\n")
+       (when (seq (:calls p))
          (str "- **calls** "
               (join ", " (map (fn [c] (str "`" (callee-str c) "`"))
-                               (sort (into [] (:calls s)))))
+                               (sort (into [] (:calls p)))))
               "\n"))))
+
+(defn render-fn-card
+  "The markdown card for a fn projection: what its author wrote, how it is
+   called, and what the compiler proved. The ONE renderer — `fn-card`,
+   `hover-card`, and the terminal report all project through it, so an editor
+   and a terminal can never disagree about the same fact."
+  [p]
+  (str "### " (:label p) " — function\n"
+       "\n"
+       (when (string? (:doc p)) (str "> " (:doc p) "\n\n"))
+       "```beam-lisp\n" (or (:sig p) (str "(" (:label p) ")")) "\n```\n"
+       "\n"
+       (proof-bullets p)))
 
 (defn fn-card
   "The markdown card for the function `nm` of `src`: what its author wrote,
    how it is called, and what the compiler proved about it."
   [src nm]
-  (let [a (analyzed src)
-        s (get (:summaries a) nm)]
-    (if (nil? s)
+  (let [p (fn-projection src nm)]
+    (if (nil? p)
       (str "### " nm "\n\nNot defined in this file.\n")
-      (let [sig (signature-of src nm)
-            doc (docstring-of src nm)]
-        (str "### " nm " — function\n"
-             "\n"
-             (when (string? doc) (str "> " doc "\n\n"))
-             "```beam-lisp\n" (or sig (str "(" nm ")")) "\n```\n"
-             "\n"
-             (proof-bullets s))))))
+      (render-fn-card p))))
 
 (defn- expr-card
   "The card for a node that is not a call to a function of this source: what it
    is, the source it covers, and the type the compiler inferred for it."
   [h]
-  (str "### " (:label h) " — " (kind-word (:kind h)) "\n"
+  (str "### " (:label h) " — " (kind-word (:kind h))
+       (if (some? (:in-fn h)) (str " of `" (:in-fn h) "`") "")
+       "\n"
        (when (some? (:code h)) (str "\n```beam-lisp\n" (:code h) "\n```\n"))
        "\n- **"
        (if (or (= :call (:kind h)) (= :op (:kind h))) "returns" "type")
@@ -425,7 +624,7 @@
   [src line col]
   (let [h (hover src line col)]
     (cond
-      (some? (:fn h)) (fn-card src (:fn h))
+      (some? (:projection h)) (render-fn-card (:projection h))
       (not= :none (:kind h)) (expr-card h)
       :else nil)))
 (defn diagnostics
@@ -552,6 +751,34 @@
   [src fn-name]
   (native-eligible* (analyzed src) fn-name))
 
+(defn fn-projection
+  "Everything the compiler knows about the function `nm` of `src`, as DATA —
+   the author's docstring and signature, and the whole proof: return type,
+   effect footprint, termination, callees, recursion growth class, native
+   eligibility. This is the hover answer for anything that resolves to a fn
+   (the `:projection` key), and the ONE source `render-fn-card` draws on, so
+   the data and the prose can never disagree. nil when `src` does not define
+   `nm`."
+  [src nm]
+  (let [a (analyzed src)
+        s (get (:summaries a) nm)]
+    (when (some? s)
+      (let [g (growth-of src nm)]
+        {:kind :fn
+         :label nm
+         :fn nm
+         :doc (docstring-of src nm)
+         :sig (signature-of src nm)
+         :type (:returns s)
+         :returns (sort (into [] (:returns s)))
+         :pure (empty? (:footprint s))
+         :footprint (:footprint s)
+         :terminates (:terminates s)
+         :calls (into [] (:edges s))
+         :growth (:class g)
+         :growth-label (:label g)
+         :native (:eligible (native-eligible* a nm))}))))
+
 (defn impact
   "No LSP request for this. Every function that transitively CALLS `fn-name` —
    what a change to it can break, computed by inverting the call graph. LSP
@@ -659,34 +886,158 @@
     (doseq [[_ d] (into [] (:bodies a))] (walk (:body d)))
     (filter (fn [s] (contains? s :line)) (deref spans))))
 
-(defn- non-top
-  "The [name entry] pairs of a bodies/summaries table minus the synthetic
-   `<top>` — for offers that name a function the user can see (a native-compile
-   refactor on the script's top level would be nonsense)."
-  [table]
-  (filter (fn [[name _]] (not= analyze/top-name name)) (into [] table)))
+; ── code actions, as data ───────────────────────────────────────────────
+;
+; A conventional server hardcodes its quick-fixes in the request handler, and
+; adding one means editing the handler. Here the handler is one walker over a
+; TABLE of providers: each provider is data with two fns, `:applies?` and
+; `:offer`, reading a shared context. Adding an action to the server is adding
+; ONE entry to the table — providers compose, never see each other, and the
+; table itself can be listed and tested as data.
+
+(defn- annotated-name?
+  "Does a defn's name node carry `^` metadata? The reader rides author
+   metadata in the same {:meta …} channel as source position, with the spec's
+   keys — so a wrapped name whose map mentions :args or :ret is annotated."
+  [nmnode]
+  (and (erlang/is_tuple nmnode)
+       (= :meta (rn/node-tag nmnode))
+       (let [m (rn/node-pos nmnode)]
+         (and (map? m) (or (contains? m :args) (contains? m :ret))))))
+
+(defn- defn-head
+  "The head of `nm`'s definition: the {:line :col} of the NAME token (where a
+   `^{…}` annotation is inserted) and whether the name is annotated already.
+   Positions come from the reader's own wrapper on the defn form, and the
+   computed name column is verified against the token actually there — a
+   multi-line head answers nil rather than misplacing an edit. nil when `src`
+   does not define `nm`."
+  [src nm]
+  (first
+   (filter some?
+    (map (fn [form]
+           (try
+             (let [f (rn/node-form form)]
+               (when (= :list (rn/node-tag f))
+                 (let [its (into [] (rn/node-items f))]
+                   (when (>= (count its) 2)
+                     (let [head (rn/node-form (first its))
+                           nmnode (second its)
+                           nmf (rn/node-form nmnode)]
+                       (when (and (= :symbol (rn/node-tag head))
+                                  (contains? #{"defn" "defn-" "defmacro" "defmacro-"}
+                                             (rn/node-name head))
+                                  (= :symbol (rn/node-tag nmf))
+                                  (= nm (rn/node-name nmf)))
+                         (let [pos (rn/node-pos form)]
+                           (when (and (map? pos) (int? (:line pos)) (int? (:col pos)))
+                             ; ( defn ␣ — the name starts at open + 1 + len(head) + 1
+                             (let [line (:line pos)
+                                   col (+ (:col pos) 2 (count (rn/node-name head)))
+                                   t (token-at src line col)]
+                               (when (and (some? t) (= nm (:text t)))
+                                 {:line line :col col
+                                  :annotated (annotated-name? nmnode)}))))))))))
+             (catch _e nil)))
+         (try (BeamLisp.Reader/read_string src)
+              (catch _e []))))))
+
+(defn- tagset->type-expr
+  "A tagset spelled in the typed checker's annotation language (P0): the
+   numeric pair is `number`, one tag is its name, several are a union."
+  [tags]
+  (let [ts (set tags)]
+    (cond
+      (= ts #{:int :float}) "number"
+      (= 1 (count ts)) (name (first ts))
+      :else (str "(U " (join " " (map name (sort (into [] ts)))) ")"))))
+
+(defn- annotate-target
+  "The edit that would annotate the context's enclosing fn with its inferred
+   signature, or nil: no enclosing fn, an `any` return (nothing worth writing
+   down), or a head already annotated. Multi-arity fns annotate the first
+   arity — the checker's table is per-name, not per-arity."
+  [ctx]
+  (let [src (:src ctx)
+        nm (:enclosing ctx)
+        s (:summary ctx)]
+    (when (and (some? nm) (some? s)
+               (not= summary/all-tags (set (:returns s))))
+      (let [h (defn-head src nm)]
+        (when (and (some? h) (not (:annotated h)))
+          (let [params (first (:params (get (defn-info src) nm)))
+                args (if (some? params) (join " " (map (fn [_] "any") params)) "")
+                ann (str "^{:args [" args "] :ret " (tagset->type-expr (:returns s)) "} ")]
+            {:edit {:line (:line h) :col (:col h) :insert ann}
+             :annotation ann}))))))
+
+(defn- action-ctx
+  "The one bundle every provider reads: the point, the analysis, this line's
+   diagnostics, and the enclosing definition (nil at a script's top level — a
+   refactor that names a function has no function to name there)."
+  [src ns line col]
+  (let [a (analyzed src)
+        hit (fn-at a line col)
+        enclosing (when (and (some? hit) (not= (first hit) analyze/top-name))
+                    (first hit))]
+    {:src src :ns ns :line line :col col
+     :a a
+     :diags (into [] (filter (fn [d] (= line (:line d))) (diagnostics src ns)))
+     :hit hit
+     :enclosing enclosing
+     :summary (when (some? enclosing) (get (:summaries a) enclosing))}))
+
+(def action-providers
+  "Every quick-fix and refactor this server offers, as a table of DATA
+   providers:
+     {:id       a stable keyword — tests and telemetry name it
+      :kind     :quickfix | :refactor
+      :doc      what it offers, and when
+      :applies? (fn [ctx] → truthy)     is it relevant at this point?
+      :offer    (fn [ctx] → [action …]) the actions, each {:title :kind, plus
+                :at (a span), :fn (a name), or :edit {:line :col :insert}}}
+   ctx is `action-ctx`. `code-actions` asks every provider and concatenates,
+   so a new action is one new entry here — never an edit to the handler."
+  [{:id :diagnostic-quickfix
+    :kind :quickfix
+    :doc "every diagnostic on the line whose engine has a rewrite becomes a
+          fix action (a deodorant smell → the trivia-preserving edit)"
+    :applies? (fn [ctx] (seq (:diags ctx)))
+    :offer (fn [ctx]
+             (into [] (map (fn [d] {:title (str "fix: " (:msg d)) :kind :quickfix
+                                    :at (select-keys d [:line :col :end-col])})
+                           (:diags ctx))))}
+   {:id :native-compile
+    :kind :refactor
+    :doc "a pure ∧ terminating fn can go native — the doc-05 gate read off
+          the summary; the refused cases are simply not offered"
+    :applies? (fn [ctx]
+                (let [s (:summary ctx)]
+                  (and (some? s) (empty? (:footprint s)) (:terminates s))))
+    :offer (fn [ctx]
+             [{:title (str "compile '" (:enclosing ctx) "' to native (pure ∧ terminating)")
+               :kind :refactor :fn (:enclosing ctx)}])}
+   {:id :annotate-return-type
+    :kind :refactor
+    :doc "the inferred return type, materialized as the ^{:args … :ret …}
+          metadata the typed checker consumes (P0) — offered when inference
+          found something narrower than `any` and the defn is unannotated"
+    :applies? (fn [ctx] (some? (annotate-target ctx)))
+    :offer (fn [ctx]
+             (let [t (annotate-target ctx)]
+               [{:title (str "annotate '" (:enclosing ctx) "' — returns "
+                             (tagset-str (:returns (:summary ctx))))
+                 :kind :refactor :fn (:enclosing ctx)
+                 :edit (:edit t)}]))}])
 
 (defn code-actions
-  "textDocument/codeAction — the quick-fixes available at a point. Two sources,
-   both already computed: (1) every diagnostic here is fixable if its engine has
-   a rewrite (a deodorant smell → the trivia-preserving edit from Tool 1); (2)
-   a pure+terminating fn offers a 'compile native' action (Tool 5). Returns
-   action descriptors {:title :kind :at}; applying uses span-rewrite so the edit
-   is formatting-safe."
+  "textDocument/codeAction — the quick-fixes and refactors available at a
+   point. The actions are whatever the PROVIDERS (the data table above) offer
+   for the shared context; this fn builds the context once and concatenates.
+   Returns action descriptors {:title :kind [:at|:fn|:edit]}; applying uses
+   span-rewrite so the edit is formatting-safe."
   [src ns line col]
-  (let [diags (filter (fn [d] (= line (:line d))) (diagnostics src ns))
-        a (analyzed src)
-        hit (fn-at a line col)
-        acts (map (fn [d] {:title (str "fix: " (:msg d)) :kind :quickfix
-                           :at (select-keys d [:line :col :end-col])}) diags)]
-    (concat acts
-            (when hit
-              (let [enclosing (first (some (fn [[name d]]
-                                             (when (innermost-at (:body d) line col) [name]))
-                                           (non-top (:bodies a))))
-                    s (when enclosing (get (:summaries a) enclosing))]
-                (if (and s (empty? (:footprint s)) (:terminates s))
-                  [{:title (str "compile '" enclosing "' to native (pure ∧ terminating)")
-                    :kind :refactor :fn enclosing}]
-                  []))))))
+  (let [ctx (action-ctx src ns line col)]
+    (into [] (mapcat (fn [p] (if ((:applies? p) ctx) ((:offer p) ctx) []))
+                     action-providers))))
 
