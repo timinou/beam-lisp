@@ -48,6 +48,49 @@ defmodule BeamLisp.SourceGraphTest do
     end
   end
 
+  describe "cycles/2" do
+    test "an acyclic graph has none" do
+      reqs = fn n -> %{"a" => ["b"], "b" => []} |> Map.get(n, []) end
+      assert SourceGraph.cycles(["a"], reqs) == []
+    end
+
+    test "a two-node cycle is named as a closed path" do
+      reqs = fn n -> %{"x" => ["y"], "y" => ["x"]} |> Map.get(n, []) end
+      assert SourceGraph.cycles(["x"], reqs) == [["x", "y", "x"]]
+    end
+
+    test "the BUG-064 shape: a four-node substrate/application cycle" do
+      reqs = fn n ->
+        %{
+          "vm.session" => ["bl.daemon"],
+          "bl.daemon" => ["bl.cli"],
+          "bl.cli" => ["vm.client"],
+          "vm.client" => ["vm.session"]
+        }
+        |> Map.get(n, [])
+      end
+
+      assert [cycle] = SourceGraph.cycles(["bl.cli"], reqs)
+      assert hd(cycle) == List.last(cycle)
+      assert Enum.sort(Enum.drop(cycle, -1)) == ["bl.cli", "bl.daemon", "vm.client", "vm.session"]
+    end
+
+    test "a cycle off the spine of an acyclic root is still found" do
+      reqs = fn n -> %{"a" => ["b", "c"], "b" => [], "c" => ["d"], "d" => ["c"]} |> Map.get(n, []) end
+      assert SourceGraph.cycles(["a"], reqs) == [["c", "d", "c"]]
+    end
+
+    test "a self-require is a cycle of one" do
+      reqs = fn n -> %{"a" => ["a"]} |> Map.get(n, []) end
+      assert SourceGraph.cycles(["a"], reqs) == [["a", "a"]]
+    end
+
+    test "an unresolvable require is skipped, not crashed on" do
+      reqs = fn n -> %{"a" => ["missing"]} |> Map.get(n, []) end
+      assert SourceGraph.cycles(["a"], reqs) == []
+    end
+  end
+
   describe "closure/2 and closure_hash/3" do
     # a -> b -> c ; a -> d
     @reqs %{"a" => ["b", "d"], "b" => ["c"], "c" => [], "d" => []}

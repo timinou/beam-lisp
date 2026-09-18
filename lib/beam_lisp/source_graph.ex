@@ -36,6 +36,21 @@ defmodule BeamLisp.SourceGraph do
   end
 
   @doc """
+  Every require cycle reachable from `roots`, as named paths: each a list of
+  namespace names whose last element repeats an earlier one — the cycle, ready
+  to print. `reqs.(ns)` → direct requires.
+
+  The one implementation of cycle knowledge: `closure/2` must stay total (a
+  hash cannot skip what it cannot see), so its back-edge is silent; `cycles/2`
+  names what `closure/2` steps over. The build fails on it, the reload gate
+  holds a bundle on it, and the loader's bounded lock can raise with it.
+  """
+  @spec cycles([binary], (binary -> [binary])) :: [[binary]]
+  def cycles(roots, reqs) when is_list(roots) and is_function(reqs, 1) do
+    call(:cycles, [roots, reqs]) |> Enum.map(&Enum.to_list/1)
+  end
+
+  @doc """
   Hash a namespace's require-closure: sha256 over the sorted `"<ns>:<srchash>"`
   line of every member. `srchash.(ns)` → content hash or `nil`; `reqs.(ns)` →
   direct requires. Identical callbacks ⇒ identical hash, build or runtime.
