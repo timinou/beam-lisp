@@ -313,6 +313,90 @@
       (or (map? v) (set? v) (sequential? v)) (emit-collection v path opts pretty)
       :else (fail path (str "a " (type v) " — no JSON representation")))))
 
+;; ── encode: the fast path, and the walk that survives as the diagnoser ──────
+;
+; MEASURED (24.3 KB, 5 000 leaves): assembling the bytes in bl cost 55.8 ms;
+; letting OTP assemble them and only DECIDING in bl costs 10.9 ms — 5.1x, byte
+; for byte the same output. On bl-specific values (vectors, sets, lazy seqs) it
+; is 27x. The reason is arithmetic, not magic: a bl-level call costs ~1 us
+; (measured), so a traversal that touches every node can afford very few of them,
+; and bl has no cheap way to emit a comma.
+;
+; So the bytes are OTP's and the DECISIONS are ours. `emit` below still exists
+; and still threads the path — but it now runs only when we are ABOUT to raise
+; (and for pretty output), so its cost does not matter and its diagnostic is
+; exactly the one this namespace always produced.
+
+(defn- kv-pairs
+  "Sorted `{key, value}` tuples for a JSON object, with each key as its JSON
+   text. Sorted by the ENCODED key, so the bytes are deterministic whatever the
+   map's internal order is — which OTP's own map path is not above 32 keys."
+  [m]
+  (sort-by first
+           (to-list (map (fn [k] (erlang/list_to_tuple (list (key-text k "") (get m k))))
+                         (keys m)))))
+
+(defn- make-enc
+  "The encoder `json:encode/2` drives, closed over the options. `json:encode(Term,
+   Encoder)` is `Encoder(Term, Encoder)`, so this callback owns the ROOT, and
+   every primitive calls back into it for children. One bl-level decision per
+   value is the entire budget; OTP builds the brackets, commas and colons.
+
+   The options ride in the CLOSURE rather than as an argument: the callback's
+   arity is fixed by OTP and carries no state — the same constraint that makes it
+   unable to name a path — so closing over them costs one allocation per encode
+   call and nothing per value, whereas threading a map would cost a bl-level
+   operation at every node.
+
+   Hot arms first, deliberately: a string used to reach arm 4 of the old order,
+   at 2.04 us; reaching arm 1 costs 0.41 us (measured). `float?` must precede
+   `number?` because a float answers true to both.
+
+   `map?` precedes `struct?` because a `defrecord` is BOTH — and a record's
+   fields are what we want, while a foreign struct (a Date) has to reach its own
+   `Jason.Encoder`. A Vector is `sequential?` AND a struct; sequential wins."
+  [ascii?]
+  (fn [v self]
+    (cond
+      (string? v) (if ascii?
+                    (json/encode_binary_escape_all v)
+                    (json/encode_binary v))
+      (float? v) (if (or (not= v v) (> (erlang/abs v) max-float))
+                   (throw (ex-info "bl.json: non-finite float" {:non-finite v}))
+                   (json/encode_float v))
+      (number? v) (json/encode_integer v)
+      (map? v) (if (empty? v) "{}" (json/encode_key_value_list_checked (kv-pairs v) self))
+      (sequential? v) (if (empty? v) "[]" (json/encode_value (to-list v) self))
+      (nil? v) "null"
+      (keyword? v) (if ascii?
+                     (json/encode_binary_escape_all (str v))
+                     (json/encode_binary (str v)))
+      (set? v) (if (empty? v) "[]" (json/encode_value (sort-by pr-str (to-list v)) self))
+      (symbol-value? v) (json/encode_binary (str v))
+      (struct? v) (Jason/encode! v)
+      (= true v) "true"
+      (= false v) "false"
+      :else (json/encode_value v self))))
+
+(defn- encode-compact
+  "OTP assembles; bl decides. On failure the WALK produces the diagnostic, so the
+   message still names an RFC 6901 path — the fast path's callback carries no
+   state, which is precisely why it cannot say where."
+  [v o]
+  (try
+    (erlang/iolist_to_binary (json/encode v (make-enc (get o :ascii))))
+    (catch e
+      (let [diag (try {:ok (emit v "" o)} (catch e2 {:raise e2}))]
+        (if (contains? diag :raise)
+          (throw (:raise diag))
+          ;; The walk encoded what the fast path refused. They must not disagree
+          ;; about what this namespace accepts — silence here would hide a bug in
+          ;; `enc` behind a slow success.
+          (throw (ex-info
+                   (str "bl.json: the fast path refused a value the walk encodes ("
+                        (get e :original) ") — a bug in `enc`, not in the value")
+                   {:original (get e :original) :value v})))))))
+
 ;; ── encode ──────────────────────────────────────────────────────────────────
 
 (defn- normalize-opts
@@ -335,10 +419,17 @@
                    that is not going to read UTF-8
 
    The value mapping is the table at the head of this file. A value with no JSON
-   representation raises, and the message names its RFC 6901 path."
+   representation raises, and the message names its RFC 6901 path.
+
+   Compact is OTP's byte loop with our decisions (~5x faster than assembling in
+   bl); `:pretty` keeps the walk's exact indentation, and `:ascii` is honoured on
+   the walk too, since OTP's escape-all variant is what the walk calls."
   ([v] (encode v {}))
   ([v opts]
-   (erlang/iolist_to_binary (emit v "" (normalize-opts opts)))))
+   (let [o (normalize-opts opts)]
+     (if (zero? (get o :pretty 0))
+       (encode-compact v o)
+       (erlang/iolist_to_binary (emit v "" o))))))
 
 (defn try-encode
   "`encode`, as a result map: `{:ok string}` or `{:error message}`. The total
