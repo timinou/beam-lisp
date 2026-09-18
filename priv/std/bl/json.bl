@@ -267,25 +267,113 @@
     (sequential? v) (emit-array (to-list v) path opts pretty)
     :else (fail path (str "a " (type v) " — no JSON representation"))))
 
-(defn- emit-struct
-  "A struct that is not a bl collection (a Date, a library response) encodes
-   itself — the escape hatch `interop/jsonable` used to protect, and which is
-   this namespace's own rule now. A struct WITHOUT an encoder (a bl record)
-   falls back to its own fields.
+;; ── the wire registry: a record declares which fields may cross ────────────
+;
+; A record IS a map, so without a declaration every field it has — a credential
+; among them — sits one `encode` call away from the wire. That is BUG-080:
+; encoding a `BlobS3` emitted its `access-key` and `secret` in cleartext, and no
+; predicate separates that record from `DFile`, whose fields are exactly what you
+; DO want to send. The field list cannot answer the question; the TYPE must.
+;
+; So a record is not serialisable until it says which fields are. The list is
+; explicit rather than implied by the record's own fields, because the implicit
+; form fails silently in the direction that hurts: a field ADDED LATER joins the
+; wire with no edit to review. `:all-fields` is the explicit "yes, all of them",
+; and it is greppable — every record that made that choice can be found.
 
-   THIS IS THE ONE `Jason` CALL THIS NAMESPACE MAKES, AND IT IS DELIBERATE. It
-   is a DELEGATION, not a leftover: the mapping for someone else's type belongs
-   to that type's owner, and `Jason.Encoder` is where they wrote it. Rewriting
-   this call to `bl.json/encode` makes the encoder call itself on a struct —
-   infinite recursion, which presents as a HANG and not as an error. (It did,
-   once.) A sweep that replaces `Jason/` with `bl.json/` must skip this line."
+(def wire-registry-key :bl-json-wire-fields)
+
+(defn- wire-table [] (erlang/apply :persistent_term :get (list wire-registry-key {})))
+
+(defn- wire-name
+  "A record module's source-level name — `datom.blob-s3/BlobS3`, not the host's
+   `Elixir.BeamLisp.Record.…`, which is an implementation detail."
+  [mod]
+  (let [i (BeamLisp.Record/info mod)]
+    (if (nil? i)
+      (str mod)
+      (str (erlang/element 2 i) "/" (erlang/element 3 i)))))
+
+(defn- record-refusal
+  "The one message for an undeclared record: what it is, why it is refused, and
+   the exact declaration that would allow it. It names the TYPE and never the
+   value — an error message must not be the leak."
+  [mod]
+  (str "a record with no declared wire shape (" (wire-name mod) ") — a record's "
+       "fields are not serialised implicitly, because a field added later would "
+       "join the wire with no edit to review; declare the fields that may cross: "
+       "(bl.json/declare-wire! " (wire-name mod) " [:field …])"))
+
+(defn declare-wire!
+  "Declare which fields of `record-type` may cross a JSON boundary. `fields` is
+   a vector of field names, or `:all-fields` for a record that genuinely is all
+   fields. Returns the declared list.
+
+   A field named here that the record does not have is an ERROR, not a warning:
+   a typo would otherwise be a field that silently never crosses."
+  [record-type fields]
+  (if-not (BeamLisp.Record/record_module? record-type)
+    (throw (ex-info (str "bl.json/declare-wire!: " (str record-type)
+                         " is not a defrecord, so it has no fields to declare")
+                    {:type record-type}))
+    (let [known (to-list (BeamLisp.Record/fields_of record-type))
+          declared (if (= fields :all-fields) known (to-list fields))
+          unknown (filter (fn [f] (not (some (fn [k] (= k f)) known))) declared)]
+      (when (not (empty? unknown))
+        (throw (ex-info (str "bl.json/declare-wire! " (wire-name record-type)
+                             ": no such field " (pr-str (first unknown))
+                             ", the record has " (pr-str known))
+                        {:type record-type :unknown (first unknown)})))
+      (erlang/apply :persistent_term :put
+                    (list wire-registry-key (assoc (wire-table) record-type declared)))
+      declared)))
+
+(defn wire-fields
+  "The declared wire fields of `record-type`, or nil when it never declared."
+  [record-type]
+  (get (wire-table) record-type))
+
+(defn- wire-project
+  "Record `v` as a plain map of its DECLARED wire fields. `path` is nil on the
+   fast path, which has no path to name — there `wire-project` throws and the
+   walk, which does have one, produces the message the caller finally sees."
+  [v path]
+  (let [mod (type v)
+        ks (wire-fields mod)]
+    (if (nil? ks)
+      (if (nil? path)
+        (throw (ex-info (record-refusal mod) {:type mod :undeclared true}))
+        (fail path (record-refusal mod)))
+      (reduce (fn [m k] (assoc m k (get v k))) {} ks))))
+
+(defn- emit-struct
+  "A struct that is not a bl collection. Two kinds, and they are NOT alike:
+
+   · a FOREIGN struct (a Date, a library response) encodes ITSELF — the escape
+     hatch `interop/jsonable` used to protect, and which is this namespace's own
+     rule now. Its mapping belongs to its owner, and `Jason.Encoder` is where
+     they wrote it.
+
+     THIS IS THE ONE `Jason` CALL THIS NAMESPACE MAKES, AND IT IS DELIBERATE. It
+     is a DELEGATION, not a leftover. Rewriting this call to `bl.json/encode`
+     makes the encoder call itself on a struct — infinite recursion, which
+     presents as a HANG and not as an error. (It did, once.) A sweep that
+     replaces `Jason/` with `bl.json/` must skip this line.
+
+   · a bl RECORD emits only the fields it DECLARED (see the wire registry above).
+     An undeclared record FAILS. A record is a map, so its fields are one encode
+     call from the wire — and the fields of a store, a connection or an S3 client
+     are not data. Falling back to \"all fields\" here is how a secret reaches a
+     log (BUG-080)."
   [v path opts]
-  (let [own (try
-              (list :ok (Jason/encode! v))
-              (catch e (list :no nil)))]
-    (if (= :ok (first own))
-      (second own)
-      (emit-object v path opts (get opts :pretty 0)))))
+  (if (BeamLisp.Record/record? v)
+    (emit-object (wire-project v path) path opts (get opts :pretty 0))
+    (let [own (try
+                (list :ok (Jason/encode! v))
+                (catch e (list :no nil)))]
+      (if (= :ok (first own))
+        (second own)
+        (emit-object v path opts (get opts :pretty 0))))))
 
 (defn- emit
   "One value as iodata. The ONE dispatch table: every bl type is decided here,
@@ -315,10 +403,14 @@
 
 ;; ── encode: the fast path, and the walk that survives as the diagnoser ──────
 ;
-; MEASURED (24.3 KB, 5 000 leaves): assembling the bytes in bl cost 55.8 ms;
-; letting OTP assemble them and only DECIDING in bl costs 10.9 ms — 5.1x, byte
-; for byte the same output. On bl-specific values (vectors, sets, lazy seqs) it
-; is 27x. The reason is arithmetic, not magic: a bl-level call costs ~1 us
+; MEASURED, same process, best of 9 (24.3 KB, 5 000 leaves): assembling the
+; bytes in bl cost 101.5 ms; letting OTP assemble them and only DECIDING in bl
+; costs 24.0 ms — 4.2x, byte for byte the same output. On bl-specific values
+; (vectors, sets, lazy seqs) it is 2.7x, and on scalars and arrays 24-32x (a
+; 500-int array: 1.03 ms → 0.032 ms, against Jason's own 0.063 ms). An earlier
+; cross-run measurement claimed 5.1x for this payload; it did not reproduce, and
+; this is the number that does. The reason is arithmetic, not magic: a bl-level
+; call costs ~1 us
 ; (measured), so a traversal that touches every node can afford very few of them,
 ; and bl has no cheap way to emit a comma.
 ;
@@ -365,7 +457,15 @@
                    (throw (ex-info "bl.json: non-finite float" {:non-finite v}))
                    (json/encode_float v))
       (number? v) (json/encode_integer v)
-      (map? v) (if (empty? v) "{}" (json/encode_key_value_list_checked (kv-pairs v) self))
+      ; a bl record is a map, so it arrives here: `wire-project` reduces it to
+      ; its DECLARED fields, and an undeclared record THROWS — the walk, which
+      ; owns the path, then says which record and how to declare it. `struct?` is
+      ; false for a plain map and for Vector/Set, so the common case pays one
+      ; cheap predicate and no call.
+      (map? v) (let [m (if (struct? v) (wire-project v nil) v)]
+                 (if (empty? m)
+                   "{}"
+                   (json/encode_key_value_list_checked (kv-pairs m) self)))
       (sequential? v) (if (empty? v) "[]" (json/encode_value (to-list v) self))
       (nil? v) "null"
       (keyword? v) (if ascii?
@@ -421,9 +521,10 @@
    The value mapping is the table at the head of this file. A value with no JSON
    representation raises, and the message names its RFC 6901 path.
 
-   Compact is OTP's byte loop with our decisions (~5x faster than assembling in
-   bl); `:pretty` keeps the walk's exact indentation, and `:ascii` is honoured on
-   the walk too, since OTP's escape-all variant is what the walk calls."
+   Compact is OTP's byte loop with our decisions — 4.2x faster than assembling
+   in bl on a map-heavy payload, 24-32x on arrays (same-process, measured);
+   `:pretty` keeps the walk's exact indentation, and `:ascii` is honoured on the
+   walk too, since OTP's escape-all variant is what the walk calls."
   ([v] (encode v {}))
   ([v opts]
    (let [o (normalize-opts opts)]
