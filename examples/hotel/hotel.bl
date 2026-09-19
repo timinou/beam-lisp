@@ -1,0 +1,269 @@
+; hotel.bl — a hotel runs on `proc`, and you can watch it.
+; Run: bl -p priv/std run examples/hotel/hotel.bl
+;      bl serve examples/hotel/desk.bl      (the same hotel, with a front page)
+;
+; ── What this shows ───────────────────────────────────────────────────
+;
+; Every recurring thing a hotel does is one of the patterns in `proc`, and
+; NONE of them is a special case of the others:
+;
+;   THE NIGHT LEDGER      proc.table  — the charges survive the clerk who made
+;                                      them; an ETS table dies with its owner,
+;                                      so the table has an HEIR
+;   THE FRONT DESK        proc.server — one process, its own state, and a
+;                                      `tick` clause for a wake-up call
+;   HOUSEKEEPING ROUNDS   proc.sched  — a declaration, a policy for what to do
+;                                      about a gap, and a clock you can MOVE
+;   THE NIGHT AUDIT       proc.sched  — a daily job at 03:00, and time travel to
+;                                      prove it fires
+;   THE PANE              proc.sched  — the same facts `bl daemon status` shows,
+;                                      read from the store rather than asked of
+;                                      a process
+;
+; The hotel is three rooms and two guests on purpose. What is being shown is
+; the SHAPE of the operations, and a shape is easier to see when the numbers
+; are small enough to check by hand.
+;
+; docs/the-process-pattern-language.md is the pattern language this walks;
+; docs/scheduling/the-clock-and-the-wheel.md is the scheduler's design.
+
+(ns hotel.hotel
+  (:require [proc :as proc]
+            [proc.table :as table]
+            [datom :as datom]))
+
+(defn check! [truth message data]
+  (when-not truth (throw (ex-info message data))))
+
+(defn- say [label v] (println (str "   " label " → " (Kernel/inspect v))))
+
+;; ── 1. the night ledger: a table that outlives its clerk ───────────────
+;;
+;; The ledger is ETS — a room's charges, written as they happen. An ETS table
+;; lives exactly as long as the process that created it, so the interesting
+;; question is not "does the desk own it" (the desk crashes, and a desk that
+;; owns the ledger takes the night's takings with it) but "who owns it".
+;;
+;; `proc/hold` answers with a NAME, and no caller ever owns what it names: the
+;; creator is a keeper nothing else knows about, and the keeper has an heir.
+
+(def LEDGER :hotel-ledger)
+
+(defn ledger-open! []
+  (proc/hold LEDGER {:type :set}))
+
+(defn charge!
+  "Put a charge on a room. Total on purpose: a clerk that cannot write the
+   ledger must not be able to lose the guest's key as well."
+  [room amount]
+  (let [t (proc/tid (ledger-open!))
+        was (erlang/apply :ets :lookup (list t room))
+        ;; `lookup` answers a LIST of rows (empty when the room has no charges
+        ;; yet), and a row is a tuple keyed by room — so the running total is the
+        ;; second element of the first row, or zero.
+        cur (if (and (erlang/is_list was) (not (empty? was)))
+              (nth (to-list (first was)) 1)
+              0)]
+    (erlang/apply :ets :insert (list t (tuple room (+ amount cur))))
+    room))
+
+(defn charges []
+  (let [t (proc/tid (ledger-open!))]
+    (sort (map (fn [r] (to-list r)) (erlang/apply :ets :tab2list (list t))))))
+
+;; ── 2. the front desk: one process, its own state, and a wake-up call ──
+;;
+;; `desk` is a server in the ordinary way — state, calls, a `tick` clause — and
+;; the tick is what makes it a front desk rather than a table: a wake-up call is
+;; a message you send yourself at a computed delay, and `(tick 120 :ms …)` is
+;; that sentence.
+
+(def calls (atom []))
+
+(proc/defserver desk
+  (init [_] (ok {:rooms {"101" {:state :vacant}
+                         "102" {:state :vacant}
+                         "103" {:state :vacant}}
+                 :guests {}}))
+
+  ;; every 120 ms the desk checks its wake-up book: a call due now is rung.
+  ;; The clause is the WHOLE beat — period, body, and a name so a test can
+  ;; reset it — and it composes with the state the way any other clause does.
+  (tick 120 :ms [st]
+    (let [now (proc/wall-ms)
+          due (filter (fn [c] (<= (:at c) now)) (:wakeups st (to-list [])))]
+      (doseq [c due] (swap! calls conj (:room c)))
+      (noreply (assoc st :wakeups (vec (remove (fn [c] (<= (:at c) now))
+                                               (:wakeups st (to-list []))))))))
+
+  (handle-call [:check-in room guest] [_from st]
+    (reply {:ok true}
+           (-> st
+               (assoc-in [:rooms room] {:state :occupied :guest guest})
+               (assoc-in [:guests guest] room))))
+
+  (handle-call [:wake-up room in-ms] [_from st]
+    (reply {:at (+ (proc/wall-ms) in-ms)}
+           (assoc st :wakeups (conj (:wakeups st (to-list []))
+                                    {:room room :at (+ (proc/wall-ms) in-ms)}))))
+
+  (handle-call [:rooms] [_from st] (reply (:rooms st) st)))
+
+;; ── 3. housekeeping: a schedule, declared rather than remembered ───────
+;;
+;; The clause the whole tier was built for. THREE things are worth watching,
+;; and each is a decision rather than an implementation detail:
+;;
+;;   · the CLOCK IS A VALUE. `:clock` is a function, so this walkthrough moves
+;;     time instead of sleeping through it — the night audit fires at 03:00
+;;     because we SAID it is 03:00, not because a test waited.
+;;   · a GAP has a POLICY. `:catch-up :skip` means a busy hour does not produce
+;;     a burst of rounds; `:coalesce` means one round, named for the round that
+;;     was missed.
+;;   · a schedule is INSPECTABLE: `proc/spec` is the declaration as data, and
+;;     `proc/enter/schedule` shows it beside its last run.
+
+(def rounds (atom 0))
+(def audits (atom []))
+
+(defn- fake-clock
+  "A clock you can move. It answers epoch-milliseconds and it only changes when
+   this file changes it — which is the whole point of the clock being a value.
+
+   It starts at the epoch, midnight, so that 03:00 is a number anyone can check
+   (3 × 3600 × 1000) rather than an offset to work out."
+  [c]
+  (fn [] (:ms @c)))
+
+(def clock (atom {:ms 0}))            ; midnight, day zero
+
+(proc/defserver housekeeping
+  (sched {:clock (fake-clock clock)}
+    ;; a round is real and frequent, so the wheel turns and there is something
+    ;; to watch; the audit is daily, and it is the one that needs the clock.
+    (every 150 :ms :rounds (fn [ev] (swap! rounds inc)))
+    (daily 3 0 :audit (fn [ev] (swap! audits conj (:occurrence ev)))
+           {:catch-up :coalesce}))
+
+  (handle-call [:spec] [_from st] (reply (proc/summary st) st)))
+
+;; ── 4. the walkthrough ─────────────────────────────────────────────────
+
+(println)
+(println "── the hotel ──────────────────────────────────────────────────")
+
+(println)
+(println "== 1. the ledger: charges survive the clerk ==")
+(ledger-open!)
+(let [owner (proc/owner LEDGER)]
+  (say "who owns the ledger" (if (= owner (Process/whereis :bl-table-heir))
+                               "the HEIR — nobody who asked for it owns it"
+                               "a keeper"))
+  (charge! "101" 129)
+  (charge! "101" 45)
+  (charge! "102" 210)
+  (say "charges" (charges))
+  (check! (= [174 210] (map (fn [r] (nth (to-list r) 1)) (charges)))
+          "charges accumulate per room" {:ledger (charges)})
+
+  ;; Now kill the owner. This is the failure the heir exists for, and it is an
+  ;; ordinary event: a clerk's process ends.
+  (erlang/exit (proc/owner LEDGER) :kill)
+  (Process/sleep 120)
+  (say "after the owner is killed, the ledger is" (if (table/live? (ledger-open!)) "still live" "gone (bad)"))
+  (check! (table/live? (ledger-open!)) "the ledger must survive its owner" {})
+  (say "…and the charges are" (charges))
+  (check! (= [174 210] (map (fn [r] (nth (to-list r) 1)) (charges)))
+          "the same charges, not an empty table"
+          {:ledger (charges)}))
+
+(println)
+(println "== 2. the front desk: state, and a beat of its own ==")
+(let [d (start desk nil {:name :desk})]
+  (call :desk [:check-in "101" "Ada"])
+  (call :desk [:check-in "103" "Grace"])
+  (let [rooms (call :desk [:rooms])]
+    (say "rooms" rooms)
+    (check! (= :occupied (:state (get rooms "101"))) "a check-in changes the room" {})
+    (check! (= :vacant (:state (get rooms "102"))) "…and only that room" {}))
+
+  (call :desk [:wake-up "101" 150])
+  (Process/sleep 300)
+  (say "the wake-up book rang" @calls)
+  (check! (some (fn [r] (= r "101")) @calls)
+          "a wake-up call is a tick that came due" {:calls @calls})
+  (stop d))
+
+(println)
+(println "== 3. housekeeping: declared, and time you can move ==")
+;; NOTE the start has no `{:name …}`. A `sched` server registers the name its
+;; declarations are keyed by (`:bl-sched/<server>`) in its own init, and passing
+;; a name option as well makes that registration collide with the start — with a
+;; `badarg` from `:erlang.register` that names neither the server nor the holder
+;; (FUP-104). The pid is what a caller needs anyway.
+(let [h (start housekeeping nil {})]
+  (let [spec (proc/spec h)]
+    (say "declared" (map (fn [s] [(:id s) (:state s) (:in-ms s)]) spec))
+    (check! (= 2 (count spec)) "two declarations, two schedules" {}))
+
+  ;; The wheel turns on the REAL timer, but whether anything is DUE is decided by
+  ;; the clock — so a movement of the clock is a round, and a still clock is
+  ;; nothing at all. Two moves, two rounds.
+  (let [before @rounds]
+    (reset! clock {:ms 150})
+    (Process/sleep 250)
+    (say "rounds after the first move" (- @rounds before))
+    (check! (>= (- @rounds before) 1) "housekeeping came round" {:rounds @rounds})
+    (let [mid @rounds]
+      (reset! clock {:ms 300})
+      (Process/sleep 250)
+      (say "…and after the second" (- @rounds mid))
+      (check! (>= (- @rounds mid) 1) "…and again on the next move" {:rounds @rounds})))
+
+  ;; TIME TRAVEL. The clock is a VALUE — a function this file owns — so the night
+  ;; audit can be made due at 03:00 without anything waiting for 03:00. Nothing
+  ;; else changes: the wheel is the same wheel, the occurrence is the same kind
+  ;; of occurrence, and the store records it the same way.
+  ;;
+  ;; The clock starts at midnight, so the audit's FIRST occurrence is 03:00 that
+  ;; same day — 10,800,000 ms. Move the clock there and the next wake finds it
+  ;; due. (Nothing else changes: the same wheel, the same kind of occurrence, the
+  ;; same row in the same store.)
+  (say "audits before the move" @audits)
+  (check! (= 0 (count @audits)) "…nothing has fired the audit yet" {})
+  (reset! clock {:ms (* 3 3600 1000)})       ; 03:00 on the hotel's clock
+  (Process/sleep 400)
+  (say "audits after moving the clock to 03:00" (count @audits))
+  (check! (>= (count @audits) 1)
+          "the night audit fires at 03:00 on the moved clock"
+          {:audits @audits})
+
+  ;; and it is a FACT in a store, not a private timer: another process reads it
+  (let [row (first (filter (fn [r] (= "audit" (name (:id r))))
+                           (proc/schedules)))]
+    (say "the store says" (select-keys row [:id :state :runs :last-run]))
+    (check! (>= (:runs row) 1) "the run is recorded where a pane can read it"
+            {:row row})
+
+    ;; and the pane's WRITE path reaches the same process by name — the one it
+    ;; was never handed
+    (let [r (proc/op! (str (:server row)) "audit" :pause)
+          paused (first (filter (fn [x] (= "audit" (name (:id x)))) (proc/schedules)))]
+      (say "after a pause" (:state paused))
+      (check! (= :paused (:state paused))
+              "a human can stop it, and the store remembers" {})))
+  (stop h))
+
+(println)
+(println "== 4. what a pane shows ==")
+(let [rows (proc/schedules)]
+  (doseq [r rows]
+    (say (str (:server r) "/" (name (:id r)))
+         (select-keys r [:state :runs :fails :live])))
+  (check! (>= (count rows) 2)
+          "the hotel's schedules are readable without asking any process"
+          {:rows (count rows)}))
+
+(println)
+(println "✓ the hotel: a ledger with an heir, a desk with a beat, and")
+(println "  housekeeping that happens whether or not anyone remembers.")
