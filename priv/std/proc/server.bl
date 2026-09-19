@@ -1,0 +1,193 @@
+; server.bl — one `defserver`, and an OPEN vocabulary of clauses.
+;
+; ══ WHY THIS EXISTS ═════════════════════════════════════════════════════════
+;
+; `defserver` is a COMPILER special form, and a special form is checked before
+; macros (priv/boot/compiler.bl:4014), so no macro named `defserver` can shadow
+; it. That wall is why `defregistry`, `defbus`, `defsupervisor` and `defbeat`
+; are four hand-copied `defserver` bodies instead of four thin transformations:
+; a bundle could not add a CLAUSE, so it copied the whole server.
+;
+; This namespace removes the wall from the std side. `server/defserver` accepts
+; every clause the boot form does, PLUS any clause name registered here, and
+; lowers the whole thing to one boot `defserver`. So a bundle becomes:
+;
+;     (tick/defserver reaper
+;       (init [_] (ok {:done 0}))
+;       (tick 15 :minutes [st] (do (reap!) (noreply {:done (inc (:done st))}))))
+;
+; ∵ a macro cannot take the name `defserver` while the special form holds it,
+; consumers reach it QUALIFIED — `tick/defserver`, `reg/defserver`,
+; `server/defserver`. When boot's form is renamed to `defgen` (PLAN-126 §4.6,
+; gated on PLAN-088) the qualifier drops off, mechanically, by a smell
+; (FUP-094/095). Until then the qualifier is the rung, and it is honest.
+;
+; ══ THE CLAUSE CONTRACT ═════════════════════════════════════════════════════
+;
+; A transform is `(fn [clause ctx] → contribution)` where `ctx` is
+; `{:name <the server's name symbol>}` and the contribution may carry any of:
+;
+;     {:prelude [forms…]   spliced at the TOP of init — arming, setup
+;      :init    <form>     a map MERGED into the server's state (an EXPRESSION,
+;                            so it may read the init param)
+;      :clauses [forms…]   real defserver clauses, injected BEFORE the user's
+;      :meta    [forms…]}  non-callback clauses (invariant, …)
+;
+; `:init` is the load-bearing one: it is what makes a clause COMPOSABLE where a
+; macro is a fork. A server's own state and every clause's slice arrive in one
+; `init`, because the expander rewrites exactly the `(ok …)` position — and
+; refuses loudly when the body does not end there.
+;
+; Injected clauses go in BEFORE the server's own, so the pattern a clause
+; installed (`[:bl/tick n]`, `[:register pid attrs]`) is matched before any
+; catch-all the author wrote. A clause you declared must work.
+;
+; ══ AN UNKNOWN CLAUSE IS A DIAGNOSTIC, NOT A CRASH ══════════════════════════
+;
+; The boot path does not check: `BeamLisp.Server/callback` answers `nil` for an
+; unknown head, `compile-defserver` calls `tuple_to_list(nil)`, and the author
+; sees `1st argument: not a tuple`. Here the head is checked against the
+; compiler's OWN table (via `BeamLisp.Server/callback`, so there is no second
+; list to drift) plus this registry, and an unknown one names both sets.
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/tick.bl     — the first client: the `(tick …)` clause
+; priv/std/reg.bl      — the next: `(registry (keys …))`
+; docs/scheduling/the-clock-and-the-wheel.md §4.6, §4.6.1
+
+(ns proc.server
+  ; …the expander. No requires: everything it reads is a fact about the VM
+  ; (`BeamLisp.Server/callback`) or this registry.
+  )
+
+;; ── the registry ────────────────────────────────────────────────────────
+
+(def registry
+  "Clause head (a keyword) → transform. An atom, because `extend-clause!`
+   extends it at load time: the vocabulary is DATA, so a bundle adds a clause
+   without touching the compiler."
+  (atom {}))
+
+(defn extend-clause!
+  "Register `transform` under the clause head `k` (a keyword). Returns `k`.
+
+   `transform` is `(fn [clause ctx] → contribution)`; see the header for the
+   contract. Re-registration replaces, like a var, so a reload is idempotent."
+  [k transform]
+  (swap! registry assoc k transform)
+  k)
+
+(defn registered-clauses
+  "Every clause name this runtime accepts, sorted — the set an unknown clause
+   is reported against."
+  []
+  (vec (sort (map (fn [k] (name k)) (keys @registry)))))
+
+;; ── the compiler's own vocabulary ───────────────────────────────────────
+;;
+;; Read from `BeamLisp.Server/callback`, never copied: a second list would drift
+;; from the one the codegen actually uses.
+
+(defn- callback? [head]
+  (some? (BeamLisp.Server/callback (name head))))
+
+(defn- meta-clause?
+  "Clauses the boot form handles but `callback/1` does not answer for —
+   `invariant` is partitioned out by `compile-defserver` before the dispatch."
+  [head]
+  (= "invariant" (name head)))
+
+;; ── assembling the contribution ─────────────────────────────────────────
+
+(defn- contribution
+  "Normalise a transform's answer into a keyed record with every slot present."
+  [c]
+  {:kind :contrib
+   :prelude (vec (:prelude c))
+   :init (:init c)
+   :clauses (vec (:clauses c))
+   :meta (vec (:meta c))})
+
+(defn- classify
+  "Decide what one clause is: passed through, contributed, or unknown."
+  [clause where]
+  (let [head (first clause)]
+    (cond
+      (not (symbol? head)) {:kind :pass :form clause}
+      (meta-clause? head) {:kind :pass :form clause}
+      (callback? head) {:kind :pass :form clause}
+      :else
+        (let [t (get @registry (keyword (name head)))]
+          (if (nil? t)
+            {:kind :unknown :head (name head) :where where}
+            (contribution (t clause {:name where})))))))
+
+;; ── init: the user's slice, every clause's slice, one state ─────────────
+
+(defn- last-form [forms] (nth forms (- (count forms) 1)))
+
+(defn- build-init
+  "Rewrite the server's `init` so it returns the user's state MERGED with every
+   clause's `:init`, with the prelude spliced at the top. Synthesizes an init
+   when the server has none.
+
+   The user's body must END in `(ok …)`: that is the position the arithmetic of
+   a merge happens at, and guessing at any other shape would be silent
+   breakage. A missing `(ok …)` is a declaration-time error naming the clause
+   that made it necessary."
+  [user-init prelude merged where]
+  (let [prelude (vec prelude)]
+    (if (nil? user-init)
+      (when (or (seq prelude) (some? merged))
+        `(init [_opts#] (do ~@prelude (ok ~(or merged {})))))
+      (let [parts (vec (rest user-init))
+            params (first parts)
+            body (vec (drop 1 parts))
+            tail-form (when (> (count body) 0) (last-form body))
+            head-forms (vec (take (- (count body) 1) body))]
+        (when (not (and (list? tail-form) (= 'ok (first tail-form))))
+          (throw (ex-info (str where ": init must end with (ok state) — a clause"
+                                " contributes a slice of that state, and this is"
+                                " where the merge happens")
+                          {:init user-init})))
+        (let [state (if (= 2 (count tail-form)) (second tail-form) {})
+              state' (if (nil? merged) state `(merge ~state ~merged))]
+          `(init ~params (do ~@prelude ~@head-forms (ok ~state'))))))))
+
+(defmacro defserver
+  "A `defserver` that also accepts the clauses this runtime has registered.
+
+   Every clause the boot form takes, plus any registered clause name. An
+   unknown name is reported with the whole accepted vocabulary rather than
+   reaching the codegen as a `not a tuple`."
+
+  [name & clauses]
+  (let [parsed (vec (map (fn [c] (classify c name)) clauses))
+        unknown (first (filter (fn [p] (= :unknown (:kind p))) parsed))]
+    (when (some? unknown)
+      (throw (ex-info (str "defserver " name ": unknown clause `"
+                           (:head unknown) "` — accepted here: "
+                           (join " " (sort (concat ["init" "handle-call" "handle-cast"
+                                                    "handle-info" "handle-continue"
+                                                    "terminate" "invariant"]
+                                                   (registered-clauses)))))
+                      {:clause (:head unknown) :server name})))
+    (let [pass (vec (map :form (filter (fn [p] (= :pass (:kind p))) parsed)))
+          contribs (vec (filter (fn [p] (= :contrib (:kind p))) parsed))
+          prelude (vec (mapcat :prelude contribs))
+          init-forms (vec (filter (fn [x] (some? x)) (map :init contribs)))
+          merged (cond (empty? init-forms) nil
+                       (= 1 (count init-forms)) (first init-forms)
+                       :else (cons 'merge init-forms))
+          injected (vec (mapcat :clauses contribs))
+          meta (vec (mapcat :meta contribs))
+          init? (fn [c] (= 'init (first c)))
+          user-init (first (filter init? pass))
+          rest-pass (vec (remove init? pass))
+          built-init (build-init user-init prelude merged (str "defserver " name))]
+      `(defserver ~name
+         ~@(if (nil? built-init) (list) (list built-init))
+         ~@injected
+         ~@meta
+         ~@rest-pass))))

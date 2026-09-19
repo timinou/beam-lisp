@@ -1,0 +1,272 @@
+; proc/table.bl — a table that cannot die with the process that asked for it.
+;
+; ══ THE PROBLEM ═════════════════════════════════════════════════════════════
+;
+; An ETS table is OWNED by the process that created it, and it is DESTROYED with
+; that owner. That is not an accident of the implementation, it is the design: a
+; process's tables are part of its memory, and the VM reclaiming them on death is
+; what makes ETS safe to use without a cleanup protocol.
+;
+; It becomes a problem the moment the table is SHARED. A library that creates one
+; on demand hands it to whoever asked first:
+;
+;     (defn get-store []
+;       (when (missing? (ets-whereis :store))
+;         (ets-new :store)))                 ; ← THE BUG. One line.
+;
+; The first caller — a request, a test, a scheduler — owns it. It answers, dies
+; with the response, and takes the store with it. The next caller finds an empty
+; table and starts over. The symptom is never "the table died"; it is a one-shot
+; that ran twice, a cache that always misses, a counter that reset, and three
+; restarts of confusion before anyone suspects a TABLE.
+;
+; ══ THE PATTERN ═════════════════════════════════════════════════════════════
+;
+; `:ets.new` takes a HEIR — `{:heir, Pid, HeirData}`. If the owner dies, the
+; table is not destroyed: it is TRANSFERRED to the heir, which receives
+;
+;     [:ETS-TRANSFER tid from-pid heir-data]
+;
+; The heir now owns it, and can hand it on with `:ets.give_away/3`. So the
+; pattern is a pair of processes, each with one job:
+;
+;   an OWNER  a trivial process that creates the table and does nothing else —
+;             no clauses, no state worth the name — because a process with one
+;             job has nothing in it to go wrong
+;   an HEIR   a long-lived process that catches tables whose owners died, holds
+;             them, and gives them back when a new owner asks
+;
+; and the sequence on a crash is: **owner dies → heir catches the table → a new
+; owner starts → asks the heir → RECLAIMS the table it would otherwise have
+; recreated empty.** The table's lifetime is no longer tied to any single
+; process, so "who created it" stops being a lifetime question.
+;
+; ══ WHY NOT JUST SUPERVISE THE OWNER ════════════════════════════════════════
+;
+; A supervisor restarts the owner, and the restarted owner creates a NEW table —
+; empty. Supervision gives you a live process; it does not give you the data
+; back. **The heir is the difference between "the owner is running again" and
+; "the store is still there."** The two compose: supervise the owner for
+; liveness, heir the table for continuity.
+;
+; ══ USE ═════════════════════════════════════════════════════════════════════
+;
+;     (ns app.cache (:require [proc.table :as table]))
+;
+;     (table/hold :app-cache {:type :set :options [:public :named_table]})
+;
+;     (erlang/apply :ets :insert (list :app-cache (tuple :k :v)))  ; plain ETS
+;     (erlang/apply :ets :lookup (list :app-cache :k))
+;     (table/owner :app-cache)                                     ; who holds it
+;
+; `hold` is idempotent and costs one `Process/whereis` after the first call. It
+; starts the owner and the heir if they are not running, then ASSERTS the
+; invariant. Reads and writes stay ordinary ETS calls — this namespace owns
+; LIFETIME, never access, which is why it has no get/put of its own.
+;
+; Three rules make it structural rather than careful, and they are worth
+; restating because each one is a hole that was measured once:
+;
+;   1. ONE CREATOR. `:ets.new` for a held table appears in `table-keeper`'s init
+;      and NOWHERE ELSE. `hold` starts a process; it never creates a table, and
+;      it has no branch that could. A fallback that "creates it if missing" is
+;      the whole bug wearing a safety net.
+;   2. AN HEIR, ALWAYS. The heir is named at creation, so there is no window in
+;      which the table exists unheired.
+;   3. CHECKED. `hold` does not return until THIS table's keeper owns it. An heir
+;      holding the table is the designed state BETWEEN two owners — but `hold` is
+;      the call that ENDS that window, so a window still open a second later is an
+;      error, not a state. That check is not decoration: it is the assertion that
+;      caught this file's own bug.
+;
+; ══ THE FAILURE MODE IS SILENCE, WHICH IS WHY THIS IS A FILE ════════
+;
+; There are two ways to get the heir wrong and they are both invisible:
+;
+;   an unquoted `:ETS-TRANSFER`   the clause never matches, so the heir catches
+;                                 the table and forgets it
+;   the state assoc'd one level   `(assoc (:holding st) …)` rebuilds the INNER
+;   too shallow                  map, dropping `:holding` entirely
+;
+; In both cases the heir still OWNS the table — ownership transfers whether or
+; not anything remembers it — so reads keep working, nothing crashes, nothing
+; logs, and the store is simply one process away from vanishing instead of two.
+; The symptom arrives later and elsewhere: a one-shot that ran twice. Hence rule
+; 3, and hence a test that kills the owner and demands the table come back.
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/proc/sched.bl      — the store, and the first user of this pattern
+; priv/lib/datom/store-ets.bl — documents the same hazard ("the table belongs to
+;   the creating process and dies with that process") and is the next user
+;
+; db_connection/holder.ex, under projects/*/*/deps/ — the SAME primitive in
+;   production Elixir: a pool is the heir, a checkout process is the owner, and
+;   `{:ETS-TRANSFER, holder, pool, {lock, ref, checkin_time}}` is how the table
+;   comes home. Same two roles, inverted so the RISKY process holds it.
+;
+; ══ WHAT IT DOES NOT DO ═════════════════════════════════════════════════════
+;
+; The table is still IN MEMORY. The heir survives a PROCESS crash; nothing here
+; survives the VM. Durability across a restart of the node is a different
+; question with a different answer (a real store), and this pattern should not
+; be mistaken for it. What it guarantees is narrower and exact: **a table's
+; lifetime is not accidentally tied to whoever touched it first.**
+;
+; ══ SEE ALSO
+
+(ns proc.table)
+
+(def HEIR
+  "The one heir in the VM. It is deliberately NOT per-table: an heir's whole job
+   is to outlive things, and one long-lived process is a better guarantee of that
+   than N of them that could each die."
+  :bl-table-heir)
+
+(defn missing?
+  "True when a registry answered 'nothing there'.
+
+   TWO registries, TWO miss values — `:ets.whereis` answers `:undefined` and
+   `Process/whereis` answers `nil` — and comparing the WRONG one is silent: the
+   lookup 'succeeds', the branch taken is the other one, and a table ends up
+   owned by a process that dies. Public, because every holder needs this
+   comparison and a second copy of it is a second chance to get it wrong."
+  [v]
+  (or (nil? v) (= :undefined v)))
+
+(defn- tid-of [nm] (erlang/apply :ets :whereis (list nm)))
+
+(defn tid
+  "The ETS table for `nm`, or nil when it does not exist."
+  [nm]
+  (let [t (tid-of nm)]
+    (when (not (missing? t)) t)))
+
+(defn live? [nm] (some? (tid nm)))
+
+(defn owner
+  "The pid that owns `nm`, or nil. Public because it is the invariant, and an
+   invariant nobody can read is a comment."
+  [nm]
+  (let [t (tid-of nm)]
+    (when (not (missing? t)) (erlang/apply :ets :info (list t :owner)))))
+
+;; ── the heir ────────────────────────────────────────────────────────────
+;;
+;; Two clauses and a transfer, and NOTHING ELSE it could be asked to do can go
+;; wrong — the point of giving a long-lived job to a small process.
+;;
+;; Its whole state IS its holdings: a flat `{table-name tid}`, no wrapper. That is
+;; deliberate, because a nested `{:holding {...}}` has a wrong level to `assoc`
+;; into, and getting it wrong is INVISIBLE: the heir still OWNS the table —
+;; ownership transfers whether or not the map remembers — so everything looks
+;; healthy while every reclaim answers `:nothing` and the table's protection
+;; quietly drops from two-deep to one-deep. One level: nothing to get wrong.
+;;
+;; The name it files a table under is the ONE WE PUT IN THE TRANSFER (`HeirData`),
+;; not something it works out afterwards. Two reasons, and the second is the one
+;; that matters: an `:ets.info(tid, :name)` lookup is a second chance to disagree
+;; about identity, and it does not work AT ALL for an UNNAMED table — the kind
+;; `datom/store-ets` makes, which is the next user of this pattern.
+;;
+;; `:"ETS-TRANSFER"` is QUOTED. Unquoted, `:ETS-TRANSFER` is not a name, it is the
+;; expression `:ETS - TRANSFER`: it compiles to something, and it never matches,
+;; so the clause is dead code that reads as live. Both failures produce the same
+;; symptom — a table that is alive, owned, and no longer recoverable.
+
+(defserver table-heir
+  (init [_] (ok {}))
+  (handle-info [:"ETS-TRANSFER" t _from nm] [st]
+    (noreply (assoc st nm t)))
+  (handle-call [:give-to nm pid] [_from st]
+    (let [t (get st nm)]
+      (if (some? t)
+        (do (erlang/apply :ets :give_away (list t pid nil))
+            (reply :given (assoc st nm nil)))
+        (reply :nothing st)))))
+
+;; ── the owner ───────────────────────────────────────────────────────────
+
+(defn- keeper-name [nm] (keyword (str (name nm) "-keeper")))
+
+(defn- make-table [nm spec]
+  (let [type (:type spec :set)
+        base (or (:options spec) [:public :named_table])
+        heir (Process/whereis HEIR)
+        opts (concat [type] base (if (some? heir) [(tuple :heir heir nm)] []))]
+    (erlang/apply :ets :new (list nm (to-list opts)))))
+
+(defserver table-keeper
+  (init [spec]
+    (do
+      ;; RECLAIM before creating: a keeper that starts after its predecessor
+      ;; died must resume the table the heir is holding, not make a fresh one.
+      ;; This is the line that turns a crash from a data loss into a hiccup.
+      (when (some? (Process/whereis HEIR))
+        (call HEIR [:give-to (:table spec) (erlang/self)]))
+      (when (missing? (tid-of (:table spec)))
+        (make-table (:table spec) spec))
+      (ok {:table (:table spec)}))))
+
+(defn- claim!
+  "Wait — bounded — for `nm` to be owned by `keeper`.
+
+   The keeper reclaims and creates during its init, so ownership lands a moment
+   after `start` returns; and when two callers race to start it, the loser has
+   seen a name that is registered but not yet finished initialising. Neither is a
+   failure, so neither may be reported as one.
+
+   But a TIMEOUT is: it means the table is alive and the keeper does not hold it,
+   which is precisely the silent state this file exists to abolish — a store that
+   answers reads and quietly has no protector. Loud, here, beats mysterious
+   later."
+  [nm keeper]
+  (loop [n 0]
+    (cond
+      (= (owner nm) keeper) nm
+      (> n 200)
+      (throw (ex-info (str "proc.table: " nm " has no keeper after 1s — owner is "
+                           (owner nm) ", wanted " keeper
+                           ". The table is alive; its protection is not.")
+                      {:table nm :owner (owner nm) :keeper keeper}))
+      :else
+      (do
+        (Process/sleep 5)
+        (recur (+ n 1))))))
+
+(defn- start-once!
+  "Start `srv` under `nm` unless it is already there. Losing a start race is not
+   a failure — the winner's process is the one we wanted."
+  [srv arg nm]
+  (when (missing? (Process/whereis nm))
+    (try
+      (start srv arg {:name nm})
+      (catch e
+        (when (missing? (Process/whereis nm))
+          (throw (ex-info (str "proc.table: " nm " would not start: "
+                               (if (map? e) (get e :message) (str e)))
+                          {:error e})))))))
+
+(defn hold
+  "Ensure `nm` exists, is owned by a process that can outlive its users, and has
+   an heir. Returns `nm`; the table itself is ordinary ETS.
+
+   `spec` is `{:type :set | :ordered_set | :bag, :options [...]}` — anything
+   `:ets.new` accepts, minus the type (which has its own key) and minus `:heir`
+   (which is this namespace's job, and is appended for you).
+
+   Idempotent, and cheap after the first call: one `Process/whereis` per role,
+   then the assertion. Called from the first user, because a store that has to
+   be started by hand is a store that is sometimes not started."
+  ([nm] (hold nm {}))
+  ([nm spec]
+   ;; the HEIR first: the owner names it as the table's heir AT CREATION, so a
+   ;; table must never be born into a VM with no heir to catch it
+   (start-once! table-heir nil HEIR)
+   (let [keeper (keeper-name nm)]
+     (start-once! table-keeper (assoc spec :table nm) keeper)
+     ;; and it must be the KEEPER that holds it. An heir holding the table is the
+     ;; designed state between two owners — but `hold` is the call that ENDS that
+     ;; window, so leaving it open is the failure, not the state.
+     (claim! nm (Process/whereis keeper))
+     nm)))

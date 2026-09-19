@@ -1,0 +1,122 @@
+; test/bl/table_test.bl — a table that cannot die with the process that asked for it.
+; Run: bl -p priv/std test --shared test/bl/table_test.bl
+;
+; Four rules, one test each, because each rule is a hole that was measured:
+;
+;   1. a CALLER never owns the table      — the whole bug, one line, is `(ets-new)`
+;                                           in a library's get-or-create
+;   2. an heir is named AT CREATION       — there is no unheired window
+;   3. the store survives its owner       — kill the keeper, keep the data
+;   4. the next owner RECLAIMS it         — not "restarts", RESUMES
+;
+; The tests kill real processes, so they are ordered and each cleans up its own
+; table: a leaked table would pass a later test for the wrong reason.
+
+(ns table.test
+  (:require [proc :as proc]))
+
+(defn- drop! [nm]
+  (let [t (proc/tid nm)]
+    (when (some? t) (erlang/apply :ets :delete (list t)))))
+
+;; `:ets.lookup` answers a LIST OF TUPLES, so comparing against a vector-of-vector
+;; fails on the container rather than the content. Read the single value instead.
+(defn- the-value [nm k]
+  (erlang/apply :erlang :element
+                (list 2 (first (erlang/apply :ets :lookup (list nm k))))))
+
+;; ── rule 1: a caller never owns the table ───────────────────────────────
+
+(deftest a-caller-never-owns-the-table
+  (drop! :t-owner)
+  (let [before (erlang/self)]
+    (proc/hold :t-owner {:type :set :options [:public :named_table]})
+    (is (not= before (proc/owner :t-owner))
+        "the process that asked does NOT own it — it can die freely")
+    (is (= (Process/whereis :t-owner-keeper) (proc/owner :t-owner))
+        "…the table's own keeper does")
+    (drop! :t-owner)))
+
+(deftest hold-is-idempotent-and-keeps-the-same-keeper
+  (drop! :t-idem)
+  (proc/hold :t-idem {:type :set :options [:public :named_table]})
+  (let [k (proc/owner :t-idem)]
+    (proc/hold :t-idem {:type :set :options [:public :named_table]})
+    (is (= k (proc/owner :t-idem)) "the second call is a no-op, not a new owner")
+    (is (= k (Process/whereis :t-idem-keeper)))
+    (drop! :t-idem)))
+
+;; ── rule 2 + 3: the heir is named at creation, and it catches ───────────
+
+(deftest the-table-is-born-heired
+  (drop! :t-heired)
+  (proc/hold :t-heired {:type :set :options [:public :named_table]})
+  (let [h (erlang/apply :ets :info (list (proc/tid :t-heired) :heir))]
+    ;; `:ets.info(t, :heir)` answers the heir pid, or `:none` when there is no
+    ;; heir at all — and `:none` is the state that lets a table vanish with its
+    ;; owner through the one-line bug this whole namespace exists to prevent
+    (is (not= :none h) "the table has an heir from its first instant")
+    (is (= (Process/whereis :bl-table-heir) h) "…and it is THE heir")
+    (drop! :t-heired)))
+
+(deftest the-store-outlives-its-keeper
+  (drop! :t-survive)
+  (proc/hold :t-survive {:type :set :options [:public :named_table]})
+  (erlang/apply :ets :insert (list :t-survive (tuple :k :written-before-the-crash)))
+  (let [heir (Process/whereis :bl-table-heir)
+        keeper (proc/owner :t-survive)]
+    (erlang/exit keeper :kill)
+    (Process/sleep 200)
+    (is (= heir (proc/owner :t-survive))
+        "the heir holds it the moment the keeper dies — not nobody")
+    (is (= :written-before-the-crash (the-value :t-survive :k))
+        "…with the DATA intact, which is the entire point"))
+
+  ;; rule 4: a new owner RECLAIMS what the heir is holding
+  (proc/hold :t-survive {:type :set :options [:public :named_table]})
+  (is (= (Process/whereis :t-survive-keeper) (proc/owner :t-survive))
+      "and the next keeper takes it back rather than making an empty one")
+  (is (= :written-before-the-crash (the-value :t-survive :k))
+      "…so a restart RESUMES instead of repeating")
+  (drop! :t-survive))
+
+(deftest the-heir-releases-what-it-gave-back
+  (drop! :t-release)
+  (proc/hold :t-release {:type :set :options [:public :named_table]})
+  (erlang/exit (proc/owner :t-release) :kill)
+  (Process/sleep 200)
+  (proc/hold :t-release {:type :set :options [:public :named_table]})
+  ;; holding a table it already handed on would make a SECOND keeper's reclaim
+  ;; fail, and the failure would look like a missing table rather than a stale map
+  (is (= :nothing
+         (erlang/apply :gen_server :call
+                       (list :bl-table-heir [:give-to :t-release (erlang/self)])))
+      "a second ask finds nothing to give — the map does not go stale")
+  (drop! :t-release))
+
+;; ── the invariant, when it cannot be met ────────────────────────────────
+
+(deftest a-transiently-created-table-is-refused-loudly
+  (drop! :t-squat)
+  ;; the shape of the original bug: a caller creates the table itself
+  (erlang/apply :ets :new (list :t-squat (to-list [:set :public :named_table])))
+  (is (= (erlang/self) (erlang/apply :ets :info (list :t-squat :owner)))
+      "this process owns it, so it would die with this test")
+  ;; `hold` cannot adopt it (the heir is not holding anything to hand over) and
+  ;; must NOT pretend otherwise: a store whose protector is a process that is
+  ;; about to exit is exactly the silent state this namespace abolishes
+  (is (thrown? (proc/hold :t-squat {:type :set :options [:public :named_table]}))
+      "…and `hold` refuses rather than reporting success")
+  (drop! :t-squat))
+
+;; ── the two registries, two miss values ─────────────────────────────────
+
+(deftest missing-covers-both-registries
+  ;; `:ets.whereis` says `:undefined`; `Process/whereis` says `nil`. Comparing
+  ;; the wrong one is silent: the lookup "succeeds" and the branch is inverted.
+  (is (proc/missing? nil))
+  (is (proc/missing? :undefined))
+  (is (not (proc/missing? (erlang/self))))
+  (is (not (proc/missing? :some-value)))
+  (is (nil? (proc/owner :t-does-not-exist-anywhere)))
+  (is (not (proc/live? :t-does-not-exist-anywhere))))

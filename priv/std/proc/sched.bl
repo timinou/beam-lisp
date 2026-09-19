@@ -1,0 +1,873 @@
+; proc/sched.bl — the deadline queue: recurrence that a human can see and change.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; A Heartbeat whose period is recomputed on every fire. `proc.tick` gives "wake
+; me in N ms"; this gives "wake me when something is DUE", where the something
+; is declared, named, and inspectable:
+;
+;   (proc.server/defserver housekeeping
+;     (init [_] (ok {:firm "acme"}))
+;     (sched
+;       (every 15 :minutes :reap-orphans reap-orphans! {:catch-up :skip :jitter 0.05})
+;       (daily 07 00      :digest       send-digest!    {:catch-up :coalesce})
+;       (at 1790000000000 :go-live      switch-to-live!)))
+;
+;   (proc.sched/next    h :digest)    ; → {:at … :in-ms … :runs 9 :last-run …}
+;   (proc.sched/spec    h)            ; the declaration AS DATA
+;   (proc.sched/pause   h :reap-orphans)
+;   (proc.sched/run-now h :digest)
+;
+; It COMPOSES with the server's own state and with every other clause, because
+; it is a clause (docs/scheduling/the-clock-and-the-wheel.md §4.6.1) — the
+; `:init` slice arrives merged with the author's, and the beat shares the
+; process with whatever else the server does.
+;
+; ══ THE WHEEL, AND WHY IT IS NOT A TABLE ════════════════════════════════════
+;
+; The wheel is the schedules map in the process state, and the hand that turns it
+; is ONE `send_after` at the earliest due. On each fire: everything due runs,
+; each advances to its next occurrence, and the single wake is re-armed at the
+; new minimum. Nothing polls, nothing scans, and the number of timers is one.
+;
+; A self-send cannot overlap with itself, so `:overlap` is NOT an option here:
+; for a single owner, "the previous run has not finished" and "an occurrence was
+; missed" are the same event, and `:catch-up` is the word for it. Asking for
+; `:overlap` is a reported error rather than a silent no-op.
+;
+; ══ THE CLOCK IS A VALUE, AND SO IS THE OCCURRENCE ══════════════════════════
+;
+; `:clock` (a fn → epoch-ms) is injectable, so a test runs a week in a
+; millisecond and the answer to "when does this next fire?" is arithmetic rather
+; than a sleep. It defaults to the wall clock.
+;
+; Every occurrence has a deterministic id — `"<schedule-id>@<due-ms>"` — and the
+; scheduler refuses to run the same id twice IN ONE PROCESS. That is the
+; Idempotency Key: at-least-once delivery with at-most-once effect, without a
+; store, and it is the id a user's body should key on for the durable half.
+;
+; ══ WHAT THIS DOES NOT DO YET (honest) ══════════════════════════════════════
+;
+; The declarations and the outcome live in the PROCESS. A restart re-derives the
+; wheel from the rules, which is right for a recurrence and wrong for a one-shot
+; already run, and there is no `pause` that survives a restart. That is the
+; durable half — the declaration as a FACT in the store — and it is the next
+; step (PLAN-126 P2b). Nothing here pretends otherwise: `runs`/`fails`/`last-run`
+; reset on restart and say so in the summary.
+;
+; Also not yet: `:cron` strings, `:tz`, and `:run-all` catch-up. Each is a
+; reported error, never a silent default.
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/proc/tick.bl — the heartbeat this is built on
+; priv/std/proc.server.bl — the expander, and the clause contract
+
+(ns proc.sched
+  (:require [datom :as datom]
+            [datom.store-ets :as store-ets]
+            [proc.server :refer [extend-clause!]]
+            [proc.table :as table]
+            [proc.tick :as tick]))
+
+;; ── the policies ────────────────────────────────────────────────────────
+
+(def KNOWN-FREQS [:every :daily :at])
+
+;; `:overlap` is deliberately absent — see the header. A knob that silently does
+;; nothing is the worst kind of configuration bug (docs/dev/env.bl.md), so the
+;; unknown-option error NAMES catch-up as the answer instead.
+(def KNOWN-OPTS [:catch-up :jitter :on-error :clock])
+
+(def KNOWN-CATCH-UP [:skip :coalesce :run-all])
+
+(def MAX-CATCH-UP
+  "How many occurrences one `:run-all` wake may run before it gives up and jumps
+   to the present. A ceiling, because a schedule dormant for a year must not
+   become a month-long burst."
+  64)
+
+(defn- known? [k ks] (some (fn [x] (= x k)) ks))
+
+(defn- option-hint
+  "Why an unknown option is unknown, when there is a useful answer. An option
+   we do not honour is never a silent no-op (docs/dev/env.bl.md), and for two of
+   these the *right* option is the useful half of the message."
+  [k]
+  (cond
+    (= k :overlap)
+      (str ". A self-send cannot overlap with itself, so there is nothing for"
+           " :overlap to decide; what a single owner wants is :catch-up"
+           " (:skip, :coalesce, or :run-all).")
+    (= k :tz)
+      (str ". Time zones are not implemented yet: give a `daily` hour in the"
+           " clock's own zone.")
+    (= k :cron)
+      ". Cron strings are not implemented yet: use :every / :daily / :at."
+    :else ""))
+
+(defn- check-opts! [opts where]
+  (doseq [k (keys opts)]
+    (when (not (known? k KNOWN-OPTS))
+      (throw (ex-info (str where ": unknown option " k " — known: "
+                           (join " " (map (fn [x] (str x)) KNOWN-OPTS))
+                           (option-hint k))
+                      {:option k :known KNOWN-OPTS}))))
+  (when (some? (get opts :catch-up))
+    (when (not (known? (get opts :catch-up) KNOWN-CATCH-UP))
+      (throw (ex-info (str where ": unknown :catch-up " (get opts :catch-up)
+                           " — use " (join " " (map (fn [x] (str x)) KNOWN-CATCH-UP)))
+                      {:catch-up (get opts :catch-up)}))))
+  opts)
+
+;; ── the rules ───────────────────────────────────────────────────────────
+;;
+;; A rule answers two questions and nothing else: when is the FIRST occurrence
+;; at or after `now`, and what is the occurrence AFTER `due`. Keeping the second
+;; one anchored to `due` rather than to `now` is what stops drift: a schedule
+;; that fires 3 seconds late still fires on its grid.
+
+(defn- daily-ms
+  "The epoch-ms of today's HH:MM in the clock's zone, given `now` midnight
+   anchor. Days are 86400000 ms; the epoch is UTC midnight, so a whole number of
+   days after it is a midnight and `rem` lands on one."
+  [now hh mm]
+  (let [midnight (- now (rem now 86400000))
+        at (+ midnight (* hh 3600000) (* mm 60000))]
+    at))
+
+(defn first-due
+  "The first occurrence of `rule` at or after `now`."
+  [rule now]
+  (let [freq (:freq rule)]
+    (cond
+      (= freq :every) (+ now (:ms rule))
+      (= freq :at) (:ms rule)
+      (= freq :daily) (let [h (first (:at rule)) m (second (:at rule))
+                            today (daily-ms now h m)]
+                        (if (>= today now) today (+ today 86400000)))
+      :else (throw (ex-info (str "sched: unknown rule " rule) {:rule rule})))))
+
+(defn advance
+  "The occurrence after `due`. Nil for a one-shot."
+  [rule due]
+  (let [freq (:freq rule)]
+    (cond
+      (= freq :every) (+ due (:ms rule))
+      (= freq :daily) (+ due 86400000)
+      (= freq :at) nil
+      :else (throw (ex-info (str "sched: unknown rule " rule) {:rule rule})))))
+
+;; ── the policies, applied ───────────────────────────────────────────────
+
+(defn- jitter-ms
+  "±`f` of `ms`, never below one millisecond. Zero is the identity, and the
+   common case, so it costs one comparison."
+  [ms f]
+  (if (or (nil? f) (not (> f 0)))
+    ms
+    (let [u (- (erlang/apply :rand :uniform (list)) 0.5)
+          v (erlang/round (* ms (+ 1 (* 2 f u))))]
+      (if (< v 1) 1 v))))
+
+(defn missed-count
+  "How many occurrences of `rule` lie at or before `now`, starting at `due`.
+
+   ARITHMETIC, not a walk. A schedule dormant for a year at a one-second period
+   has 31 million missed occurrences, and a loop that counts them one at a time
+   is a hang, not a catch-up policy — measured the hard way."
+  [rule due now]
+  (if (> due now)
+    0
+    (let [freq (:freq rule)]
+      (cond
+        (= freq :at) 1
+        (= freq :every) (inc (quot (- now due) (:ms rule)))
+        (= freq :daily) (inc (quot (- now due) 86400000))
+        :else (throw (ex-info (str "sched: unknown rule " rule) {:rule rule}))))))
+
+(defn advance-n
+  "The occurrence `n` steps after `due`. Nil past a one-shot's only occurrence."
+  [rule due n]
+  (let [freq (:freq rule)]
+    (cond
+      (= freq :at) (if (> n 0) nil due)
+      (= freq :every) (+ due (* n (:ms rule)))
+      (= freq :daily) (+ due (* n 86400000))
+      :else (throw (ex-info (str "sched: unknown rule " rule) {:rule rule})))))
+
+(defn catch-up-plan
+  "The occurrences to RUN for one schedule, and the due to arm next.
+
+   An occurrence is due — and RUNS, whatever the policy — until its SUCCESSOR
+   has already passed. Only then is there a backlog for a policy to decide
+   about. That distinction is the whole thing: a wake that lands a few
+   milliseconds late is NOT a missed occurrence, and a policy that treats it as
+   one drops every fire and the schedule silently never runs (measured: a
+   `(every 60 :ms … :catch-up :skip)` schedule ran zero times in 220 ms).
+
+     not due, or not yet stale  → run it, advance one step
+     stale                      → the policy decides:
+       `:skip`     drop everything missed; land on the first occurrence after now
+       `:coalesce` run ONCE, and with the FIRST missed due, so the occurrence id
+                   names the period that was MISSED rather than the instant it
+                   was noticed
+       `:run-all`  run every missed occurrence, bounded by `MAX-CATCH-UP`; past
+                   the bound the rest are dropped and the wheel lands after now
+
+   A one-shot past its due is always stale: there is nothing after it."
+  [rule due now policy]
+  (let [nxt (advance-n rule due 1)
+        stale? (if (nil? nxt) true (<= nxt now))
+        missed (missed-count rule due now)]
+    (cond
+      (> due now) {:runs [] :due due}
+      (not stale?) {:runs [due] :due nxt}
+      (= policy :skip) {:runs [] :due (advance-n rule due missed)}
+      (= policy :coalesce) {:runs [due] :due (advance-n rule due missed)}
+      :else
+        (let [n (if (> missed MAX-CATCH-UP) MAX-CATCH-UP missed)
+              complete? (<= missed MAX-CATCH-UP)]
+          {:runs (vec (map (fn [i] (advance-n rule due i)) (range n)))
+           :due (if complete? (advance-n rule due missed) nil)}))))
+
+;; ── the store ───────────────────────────────────────────────────────────
+;;
+;; The DECLARATION lives in the code — it is a literal, so it is durable by
+;; construction and needs no store at all. What has to outlive the process is
+;; the OUTCOME: what already ran, what failed, and whether a human stopped it.
+;; That is four fields per schedule, and it is the whole difference between a
+;; restart that resumes and a restart that repeats.
+;;
+;; ONE PUBLIC ETS TABLE serves two readers: the scheduler (which resumes from
+;; it) and the pane (which renders it). The pane therefore never asks a ticker
+;; anything, and a ticker never queues behind the pane — the same rule
+;; `vm.exec` and `vm.index` follow, and the reason the host's single dirty-IO
+;; scheduler (+SDio 1) cannot make a dashboard slow down the work it reports.
+
+(def STORE :bl_sched)
+
+(def CONN-KEY :bl-sched-conn)
+
+(def NS "schedule")
+
+(def OUTCOME-KEYS [:due :last-occ :runs :fails :last-run :last-error :state])
+
+;; ── the store, as datoms ────────────────────────────────────────────────
+;;
+;; The DECLARATION is a literal in the code, so it is durable by construction and
+;; needs no store at all. What has to outlive the process is the OUTCOME: what
+;; already ran, what failed, and whether a human stopped it. That is six fields
+;; per schedule, and it is the whole difference between a restart that resumes and
+;; a restart that repeats.
+;;
+;; It is a DATABASE rather than a table of our own, for three reasons that each
+;; delete something:
+;;
+;;   · the pane reads schedules with the SAME query language as every other pane,
+;;     so there is no second read model to keep in step with this one;
+;;   · `history` and `as-of` come free, so a scheduler can be asked what it looked
+;;     like at 03:00 and not only what it looks like now;
+;;   · `:schedule/key` is `:db.unique/identity`, so a tempid asserting it UPSERTS
+;;     — one transaction per write, with no read-modify-write window between
+;;     "which entity is this?" and "write it".
+;;
+;; What has NOT changed is that the table is PUBLIC. Two readers depend on it: the
+;; scheduler resumes from it, and the pane renders it. A dashboard never asks a
+;; ticker anything, and a ticker never queues behind a pane — which is also why
+;; this host's single dirty-IO scheduler (`+SDio 1`) cannot make a dashboard slow
+;; down the work it reports. Reads take `datom/db`, which builds a value from the
+;; basis atom and never touches the writer.
+;;
+;; LIFETIME is not this namespace's business either, and that is the point of the
+;; migration: the table is created by ITS OWN keeper, heir-protected, and the
+;; database merely ADOPTS it. Nothing about the store's life is decided by whoever
+;; happened to call `connect` first.
+
+(def SCHEMA
+  [{:db/ident :schedule/key :db/valueType :db.type/string
+    :db/unique :db.unique/identity :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/server :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/id :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/due :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/last-occ :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/runs :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/fails :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/last-run :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/last-error :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :schedule/state :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}])
+
+(defn- key-of
+  "The identity of one schedule. `name` rather than `str`, so a keyword and a
+   symbol for the same word name ONE entity instead of two."
+  [srv id]
+  (str (name srv) "/" (name id)))
+
+(defn- schema-key
+  "The attribute ident for an outcome key.
+
+   Pull answers with attributes as keys — `:schedule/runs` — and `inspect` renders
+   that as `\"schedule/runs\"`, which READS as a string and is not one. Comparing
+   against a string key matches nothing and yields an empty map, silently: a
+   schedule looks like it has never run. Use `(keys m)` when the type matters."
+  [k] (keyword NS (name k)))
+
+(defn- store [] (store-ets/adopt (table/hold STORE {:type :ordered_set
+                                                    :options [:public :named_table]})))
+
+(defn ensure-store!
+  "Make the store exist, with an owner and an heir that outlive every scheduler.
+   Never creates the table itself — `proc.table` starts the process that does, and
+   that indirection is the whole guarantee."
+  []
+  (store))
+
+(defn conn
+  "The connection over the store, published once per VM.
+
+   Not a cache of state: two connections over one store share a writer and a basis
+   through datom's own registry, so a reader needs this only to NAME the basis it
+   reads at. `:persistent_term` because the read is lock-free and answers the same
+   value from every process, including one that has never called this before."
+  []
+  (or (erlang/apply :persistent_term :get (list CONN-KEY nil))
+      (let [c (datom/connect-with (store) SCHEMA)]
+        (erlang/apply :persistent_term :put (list CONN-KEY c))
+        c)))
+
+(defn store-live?
+  "Whether the store exists right now. Public for the same reason `store-owner`
+   is: a test and a pane both want to ask."
+  []
+  (table/live? STORE))
+
+(defn store-owner
+  "The pid that owns the store, or nil. The invariant, readable."
+  []
+  (table/owner STORE))
+
+;; ── reaching a live scheduler ───────────────────────────────────────────
+;;
+;; A pane has the STORE and nothing else — that is the point of it — so pausing
+;; a schedule means finding the process that owns it without having been handed
+;; a pid. The name is DERIVED from the declaration (`kitchen` → `:bl-sched
+;; kitchen`), which is the same trick `vm.exec` uses for the sequencer: a
+;; deterministic name is a handle that survives a restart, and it is registered
+;; at boot by the process that will answer to it, not by whoever wants to call.
+;;
+;; `[:registry key]` names would work too, and would be the right answer if these
+;; came and went by the hundred. They are declared in code, so the name is a
+;; function of the declaration and needs no registry to hold it.
+
+(defn op-name
+  "The name a scheduler answers to: derived from its declaration, so a caller who
+   has only a stored `:server` can still reach the process."
+  [srv]
+  (keyword "bl-sched" (name srv)))
+
+(defn live?
+  "Whether a scheduler is running for `srv` right now."
+  [srv]
+  (some? (Process/whereis (op-name srv))))
+
+(defn announce!
+  "Register this process under its declaration's name.
+
+   Called from the scheduler's own init, because a name is only useful if the
+   process that OWNS it put it there. `:erlang.register` raises when the name is
+   taken — and it cannot be taken by a corpse, since the VM frees a name when its
+   process dies. So a collision here is two live schedulers claiming one
+   declaration, which is a bug worth a loud failure rather than a rename."
+  [srv]
+  (erlang/register (op-name srv) (erlang/self))
+  (op-name srv))
+
+(defn op!
+  "Pause, resume, or run-now a schedule BY NAME — the pane's write path.
+
+   Answers a value rather than raising: 'no scheduler is running' is a fact about
+   the world, not an error in the request, and the pane renders it as one. A
+   request that cannot be delivered must say so, because a button that silently
+   does nothing is worse than a button that is disabled."
+  [srv id op]
+  (let [nm (op-name srv)]
+    (if (nil? (Process/whereis nm))
+      {:ok false :reason "no scheduler is running for this server"}
+      (do (call nm [(keyword "sched" (name op)) (keyword (name id))])
+          {:ok true}))))
+
+;; ── the row, read and written ───────────────────────────────────────────
+
+(defn- ->tx
+  "One row as transaction data.
+
+   `dbid` is the tempid, and it MUST BE DISTINCT per entity in a batch: two maps
+   carrying `:db/id -1` in one transaction describe the SAME entity, so a write of
+   N schedules collapses them into one — the last one wins and every other key
+   reads back nil. It is not a partial write or an error, it is a silent merge,
+   which is why the batch is built with a counter rather than a constant."
+  [srv id sched dbid]
+  (reduce
+    (fn [m k]
+      ;; nil is DROPPED, not written: a nil value in a transaction is a
+      ;; RETRACTION, and "has never failed" is not a retraction of a failure.
+      (let [v (get sched k)]
+        (if (nil? v) m (assoc m (schema-key k) v))))
+    {:db/id dbid
+     :schedule/key (key-of srv id)
+     :schedule/server (name srv)
+     :schedule/id (name id)}
+    OUTCOME-KEYS))
+
+(defn read-record
+  "The persisted outcome for one schedule, or nil the first time it runs.
+
+   `datom/pull` takes a LOOKUP REF, so one call reads the entity by its unique
+   key: no query, no entity-id resolution, and — the part that matters — no
+   requirement that every attribute be present. A query joining the optional
+   attributes would return NOTHING for a schedule that has never failed, which is
+   the silent-absence shape this file keeps having to avoid."
+  [srv id]
+  (let [m (datom/pull (datom/db (conn)) '[*] [:schedule/key (key-of srv id)])]
+    (when (some? m)
+      (reduce (fn [acc k]
+                (let [a (schema-key k)]
+                  (if (contains? m a) (assoc acc k (get m a)) acc)))
+              {} OUTCOME-KEYS))))
+
+(defn write-record! [srv id sched]
+  (datom/transact! (conn) [(->tx srv id sched -1)])
+  sched)
+
+(defn persist!
+  "Write every schedule's outcome, in ONE transaction.
+
+   Called at each mutation rather than on every wake — the wake path must not do
+   I/O. One transaction rather than N because a write here is a round trip to the
+   writer, and a batch also makes the store's view of a mutation atomic."
+  [st]
+  (let [txs (reduce (fn [acc sid]
+                      (conj acc (->tx (:server st) sid (get (:schedules st) sid)
+                                      (- (inc (count acc))))))
+                    [] (keys (:schedules st)))]
+    (when (not (empty? txs))
+      (datom/transact! (conn) txs)))
+  st)
+
+(defn read-all
+  "Every schedule any scheduler in this VM has published — the pane's whole read
+   model, and the reason a pane needs no registry of its own. Sorted by key here,
+   so every reader sees the same order."
+  []
+  (let [d (datom/db (conn))]
+    (vec (sort-by
+           (fn [r] (get r :schedule/key))
+           (map (fn [row] (datom/pull d '[*] (first row)))
+                (datom/q '[:find ?e :where [?e :schedule/key _]] d))))))
+
+(defn- row-of [d e now]
+  (let [m (datom/pull d '[*] e)
+        srv (get m :schedule/server)]
+    (reduce (fn [acc k]
+              (let [a (schema-key k)]
+                (if (contains? m a) (assoc acc k (get m a)) acc)))
+            {:key (get m :schedule/key)
+             :server srv
+             :id (get m :schedule/id)
+             ;; whether a scheduler is RUNNING for this server right now. The
+             ;; pane shows it so an operator can tell "stopped" from "stopped on
+             ;; purpose", and so an op that cannot be delivered says why.
+             :live (live? srv)
+             ;; what a human actually wants: not an absolute epoch-ms but how
+             ;; far away it is. Negative means overdue, which is a real state.
+             :in-ms (let [due (get m :schedule/due)]
+                      (if (nil? due) nil (- due now)))}
+            OUTCOME-KEYS)))
+
+(defn schedules
+  "The pane's read model: every declared schedule, its outcome, and where it
+   stands. Sorted by key so every reader sees the same order.
+
+   READ-ONLY BY CONSTRUCTION. It is built from `(datom/db …)` — a basis — so a
+   render path holding this value cannot write even by accident, and a render
+   never queues behind the writer. That is the whole reason the store is public
+   and the pane reads it directly instead of asking a scheduler (FUP-101).
+
+   A schedule that has never fired is here too: its row is written at BOOT, so
+   'declared' and 'known' are the same set. A pane that showed only what has run
+   would hide exactly the schedules an operator is looking for."
+  []
+  (let [d (datom/db (conn))
+        now (tick/wall-ms)]
+    (vec (sort-by (fn [r] (:key r))
+                  (map (fn [row] (row-of d (first row) now))
+                       (datom/q '[:find ?e :where [?e :schedule/key _]] d))))))
+
+
+;;
+;;   {:clock   fn
+;;    :wake    the generation of the armed tick (for the stale-tick check)
+;;    :schedules {id → {:id :rule :run :opts
+;;                      :due          the next occurrence, epoch-ms (nil = done)
+;;                      :last-occ     the id of the last occurrence RUN
+;;                      :runs :fails :last-run :last-error :state}}}
+
+(defn- empty-schedule [id rule run opts now]
+  {:id id
+   :rule rule
+   :run run
+   :opts opts
+   ;; JITTER SCALES THE DELAY, never the due. `due` is an absolute epoch-ms —
+   ;; five percent of it is six WEEKS, not five percent of a period, and the
+   ;; wheel then arms a season away. Measured: an `(every 60 :ms … :jitter 0.05)`
+   ;; schedule sat 688 days out and never fired.
+   :due (+ now (jitter-ms (- (first-due rule now) now) (get opts :jitter 0)))
+   :last-occ nil
+   :runs 0
+   :fails 0
+   :last-run nil
+   :last-error nil
+   :state :active})
+
+(defn next-due-ms
+  "The earliest due across `schedules`, or nil when nothing is pending. Paused
+   schedules and finished one-shots do not hold the wheel."
+  [schedules]
+  (reduce (fn [acc [_ s]]
+            (let [d (:due s)]
+              (if (and (some? d) (= :active (:state s)))
+                (if (or (nil? acc) (< d acc)) d acc)
+                acc)))
+          nil
+          schedules))
+
+(defn arm
+  "Arm the single wake at the earliest due. Returns the delay armed, or nil
+   when the wheel is empty. `delay < 1` becomes 1: an occurrence that is due
+   NOW is still delivered as a message, never as a re-entrant call."
+  ([st] (arm st (:clock st)))
+  ([st clock]
+   (let [due (next-due-ms (:schedules st))]
+     (when (some? due)
+       (let [d (- due (clock))
+             d (if (< d 1) 1 d)]
+         (tick/tick-arm d {:name :sched})
+         d)))))
+
+;; ── the run ─────────────────────────────────────────────────────────────
+
+(defn- run-one
+  "Run one occurrence and return the updated schedule.
+
+   TWO guards, and the second is not redundant. `occ` is the Idempotency Key —
+   `\"<id>@<due>\"` — and it refuses the same occurrence twice. But a ONE-SHOT's
+   due is reconstructed at every start (its `:ms` is an expression), so after a
+   restart the key is a different string for the SAME occurrence. A one-shot is
+   therefore at-most-once for its LIFETIME, which is also what a one-shot means."
+  [sched due]
+  (let [occ (str (name (:id sched)) "@" due)
+        one-shot? (= :at (:freq (:rule sched)))]
+    (if (or (= occ (:last-occ sched))
+            (and one-shot? (some? (:last-occ sched))))
+      sched                                  ; already run — at-most-once effect
+      (let [opts (:opts sched)
+            on-error (get opts :on-error :stop)]
+        (try
+          ((:run sched) {:id (:id sched) :due due :occurrence occ})
+          (assoc sched :last-occ occ :runs (inc (:runs sched)) :last-run due)
+          (catch e
+            (do (proc.tick/tick-failed! (:id sched) e)
+                (assoc sched
+                       :last-occ occ
+                       :fails (inc (:fails sched))
+                       :last-error (if (map? e) (get e :message) (str e))
+                       ; `:continue` keeps the schedule alive across a throwing
+                       ; body; `:stop` is the default and lets the process crash
+                       ; so the supervisor heals it and the failure is VISIBLE.
+                       :state (if (= on-error :continue) :active :crashed)))))))))
+
+(defn fire!
+  "Everything due at `now`, in one pass. Returns the new schedules map."
+  [schedules now]
+  (reduce
+    (fn [acc [id sched]]
+      (cond
+        (or (nil? (:due sched)) (not= :active (:state sched)))
+          (assoc acc id sched)
+
+        (> (:due sched) now)
+          (assoc acc id sched)               ; not due yet
+
+        :else
+          (let [plan (catch-up-plan (:rule sched) (:due sched) now
+                                    (get (:opts sched) :catch-up :skip))
+                ran (reduce (fn [s d] (run-one s d)) sched (:runs plan))
+                nxt (:due plan)]
+            (assoc acc id (assoc ran :due nxt)))))
+    schedules
+    schedules))
+
+;; ── the state ops, as fns over the state ────────────────────────────────
+;;
+;; These run INSIDE the server, so they are the state → state half; the
+;; `handle-call` clauses the transform injects are the thin wire around them.
+
+(defn decls
+  "A vector of declarations, keyed by id. The clause emits a vector literal and
+   this keys it — a map literal cannot carry spliced pairs."
+  [v]
+  (reduce (fn [m d] (assoc m (:id d) d)) {} v))
+
+(defn init-state
+  "The state the clause contributes: the declarations, each due seeded from its
+   rule and the clock — or RESUMED from the store when it has run before.
+
+   The row is written HERE, at boot, and that is what makes the pane complete: a
+   schedule that has never fired still appears, so 'declared' and 'known' are the
+   same set. It is one transaction per boot, not one per wake."
+  [decls clock srv]
+  (ensure-store!)
+  (announce! srv)
+  (let [now (clock)
+        st {:clock clock
+            :server srv
+            :schedules (reduce
+                         (fn [m [id d]]
+                           (let [fresh (empty-schedule id (:rule d) (:run d) (:opts d) now)
+                                 rec (read-record srv id)]
+                             (assoc m id (if (nil? rec) fresh (merge fresh rec)))))
+                         {}
+                         decls)}]
+    (persist! st)
+    st))
+
+(defn arm-first
+  "The prelude: arm the earliest due across the declarations.
+
+   It reads the STORE as well as the code, because after a restart a schedule
+   resumes from the due it was on — not from a due re-seeded as if it had never
+   run — and a schedule a human paused stays paused with nothing to arm.
+
+   The prelude runs BEFORE `(ok state)`, which is exactly where an arming step
+   belongs and exactly why it cannot read the state."
+  [decls clock srv]
+  (ensure-store!)
+  (let [now (clock)
+        d (reduce (fn [acc [id d0]]
+                    (let [rec (read-record srv id)
+                          paused (and (some? rec) (= :paused (:state rec)))
+                          due (if (and (some? rec) (some? (:due rec)))
+                                (:due rec)
+                                (first-due (:rule d0) now))]
+                      (if paused
+                        acc
+                        (if (or (nil? acc) (< due acc)) due acc))))
+                  nil
+                  decls)
+        d (if (and (some? d) (< d now)) now d)]
+    (when (some? d)
+      (let [delay (- d now)]
+        (tick/tick-arm (if (< delay 1) 1 delay) {:name :sched})))))
+
+(defn summary
+  "Every schedule, its rule, its policy, where it stands, and how long until it
+   fires. This is what a pane renders."
+  [st]
+  (let [now ((:clock st))]
+    (vec (map (fn [id]
+                (let [s (get (:schedules st) id)]
+                  {:server (:server st)
+                   :id id
+                   :rule (:rule s)
+                   :state (:state s)
+                   :due (:due s)
+                   :in-ms (when (some? (:due s)) (- (:due s) now))
+                   :runs (:runs s)
+                   :fails (:fails s)
+                   :last-run (:last-run s)
+                   :last-error (:last-error s)
+                   :opts (:opts s)}))
+              (sort (keys (:schedules st)))))))
+
+(defn when-next [st id]
+  (let [s (get (:schedules st) id)
+        now ((:clock st))]
+    (if (nil? s)
+      {:error {:unknown id :known (vec (keys (:schedules st)))}}
+      {:id id
+       :at (:due s)
+       :in-ms (when (some? (:due s)) (- (:due s) now))
+       :state (:state s)
+       :runs (:runs s)
+       :fails (:fails s)
+       :last-run (:last-run s)})))
+
+(defn- set-state [st id v]
+  (let [s (get (:schedules st) id)]
+    (if (nil? s)
+      st
+      (assoc st :schedules (assoc (:schedules st) id (assoc s :state v))))))
+
+(defn pause-schedule [st id] (set-state st id :paused))
+(defn resume-schedule [st id] (set-state st id :active))
+
+(defn run-now-state
+  "Fire `id`'s CURRENT due out of band. The occurrence id is the one it was
+   already on, so the next scheduled fire of the same occurrence is still
+   refused — `run-now` cannot manufacture a second run."
+  [st id]
+  (let [s (get (:schedules st) id)]
+    (if (or (nil? s) (nil? (:due s)))
+      st
+      (assoc st :schedules (assoc (:schedules st) id (run-one s (:due s)))))))
+
+;; ── parsing the clause ──────────────────────────────────────────────────
+;;
+;;     (sched opts? ENTRY…)
+;;     (every N UNIT id fn opts?)
+;;     (daily HH MM id fn opts?)
+;;     (at MS id fn opts?)
+;;
+;; `opts` on the clause is `{:clock fn}`; on an entry it is `:catch-up`,
+;; `:jitter`, `:on-error`. The entry's `fn` is called WITH ONE ARGUMENT,
+;; `{:id :due :occurrence}` — the occurrence id being the thing to key a
+;; durable effect on.
+
+(defn- arity-error [where entry id-shape]
+  (throw (ex-info (str where ": " id-shape) {:entry entry})))
+
+(defn- parse-entry [e where]
+  (let [h (first e)
+        freq (keyword (name h))
+        tail (vec (rest e))]
+    (when (not (known? freq KNOWN-FREQS))
+      (throw (ex-info (str where ": unknown schedule " (name h) " — use "
+                           (join " " (map (fn [x] (str x)) KNOWN-FREQS)))
+                      {:entry e :freq freq})))
+    (let [nhead (if (= freq :every) 2 (if (= freq :daily) 2 1))
+          need (+ nhead 2)
+          has-opts (and (> (count tail) need) (map? (nth tail (- (count tail) 1))))
+          body-count (if has-opts (- (count tail) 1) (count tail))]
+      (when (not= body-count need)
+        (arity-error where e
+                      (str "(tick " (name h) " " (if (= freq :every) "N UNIT" (if (= freq :daily) "HH MM" "MS"))
+                           " ID FN opts?) — a schedule needs an id and a fn")))
+      (let [opts (if has-opts (nth tail (- (count tail) 1)) {})
+            _ (check-opts! opts where)
+            args (vec (take nhead tail))
+            id (nth tail nhead)
+            fnf (nth tail (inc nhead))
+            idk (when (keyword? id) id)
+            _ (when (nil? idk)
+                (throw (ex-info (str where ": the schedule id must be a keyword, got " id)
+                                {:id id})))
+            rule (cond
+                   (= freq :every)
+                     `{:freq :every :ms (proc.tick/unit-ms ~(nth args 0) ~(nth args 1))}
+                   (= freq :daily)
+                     `{:freq :daily :at [~(nth args 0) ~(nth args 1)]}
+                   :else
+                     `{:freq :at :ms ~(nth args 0)})]
+        {:id idk :rule rule :run fnf :opts opts}))))
+
+;; ── the clause ──────────────────────────────────────────────────────────
+
+
+(defn spec
+  "The declaration as data: every schedule, its rule, its policy, and where it
+   stands. This is what a pane renders and what `explain` narrates."
+  [h]
+  (call h [:sched/spec]))
+
+(defn next
+  "When `id` fires next, and how that compares to now."
+  [h id]
+  (call h [:sched/next id]))
+
+(defn pause
+  "Stop `id` from firing. Its due is KEPT, so resuming runs the occurrence it
+   was on rather than skipping it — the same choice `catch-up` makes per
+   schedule, made once by the human."
+  [h id]
+  (call h [:sched/pause id]))
+
+(defn resume [h id] (call h [:sched/resume id]))
+
+(defn run-now
+  "Fire `id` out of band, with the occurrence id of the due it was on. A
+   `run-now` therefore does NOT create a second occurrence — the next scheduled
+   fire of the same due is still refused."
+  [h id]
+  (call h [:sched/run-now id]))
+
+;; ── the clause ──────────────────────────────────────────────────────────
+;;
+;; One contribution, and the whole bundle. The two emissions of the declaration
+;; vector are deliberate: the prelude runs BEFORE `(ok state)` — which is where
+;; an arming step belongs, and why it cannot read the state — so each side is
+;; handed the same declarations rather than sharing a binding. Building the map
+;; twice costs nothing; a reader of the expansion sees exactly where the wheel
+;; is wound.
+
+(defn sched-clause
+  "The `(sched opts? ENTRY…)` transform. Public because it is worth testing on
+   its own: it is the unit that turns a declaration into a wheel."
+  [clause ctx]
+  (let [forms (vec (rest clause))
+        with-opts (and (seq forms) (map? (first forms)))
+        opts (if with-opts (first forms) {})
+        entries (if with-opts (vec (drop 1 forms)) forms)
+        where (str "defserver " (:name ctx))]
+    (check-opts! opts where)
+    (when (empty? entries)
+      (throw (ex-info (str where ": (sched (every …) … ) — at least one entry is required")
+                      {})))
+    (let [ds (vec (map (fn [e] (parse-entry e where)) entries))
+          ids (vec (map (fn [d] (:id d)) ds))
+          dup (first (filter (fn [k] (> (count (filter (fn [x] (= x k)) ids)) 1)) ids))]
+      (when (some? dup)
+        (throw (ex-info (str where ": two schedules named " dup)
+                        {:duplicate dup :ids ids})))
+      (let [clock-form (if (some? (get opts :clock)) (get opts :clock) `proc.tick/wall-ms)
+            decls-form `(proc.sched/decls [~@ds])
+            srv-form (list 'quote (:name ctx))
+            tick-name :sched]
+        {:prelude [`(proc.sched/arm-first ~decls-form ~clock-form ~srv-form)]
+         :init `(proc.sched/init-state ~decls-form ~clock-form ~srv-form)
+         :clauses
+         [`(handle-info [:bl/tick n#] [st#]
+             (if (proc.tick/tick-current? ~tick-name n#)
+               (let [clk# (:clock st#)
+                     now# (clk#)
+                     st2# (proc.sched/persist!
+                            (assoc st# :schedules
+                                   (proc.sched/fire! (:schedules st#) now#)))]
+                 (proc.sched/arm st2#)
+                 (noreply st2#))
+               (noreply st#)))
+          `(handle-call [:sched/spec] [_from# st#]
+             (reply (proc.sched/summary st#) st#))
+          `(handle-call [:sched/next id#] [_from# st#]
+             (reply (proc.sched/when-next st# id#) st#))
+          `(handle-call [:sched/pause id#] [_from# st#]
+             (reply id# (proc.sched/persist! (proc.sched/pause-schedule st# id#))))
+          `(handle-call [:sched/resume id#] [_from# st#]
+             (let [st2# (proc.sched/persist! (proc.sched/resume-schedule st# id#))]
+               ;; RE-ARM: a paused schedule holds no wake, so resuming one is
+               ;; exactly the moment the wheel has to be wound again. Without
+               ;; it the schedule is alive and never fires — measured.
+               (proc.sched/arm st2#)
+               (reply id# st2#)))
+          `(handle-call [:sched/run-now id#] [_from# st#]
+             (reply id# (proc.sched/persist! (proc.sched/run-now-state st# id#))))]}))))
+
+(extend-clause! :sched sched-clause)

@@ -1,0 +1,215 @@
+; examples/tooling/proc.bl — the tier, end to end: who owns the store, how the
+; wheel turns, and how a reader sees it.
+; Run: bl -p priv/std run examples/tooling/proc.bl
+;
+; The three smaller examples each take one layer (`tick`, `sched`, and the
+; pattern language for the rest). This one is the whole shape at once, and its
+; subject is the question a scheduler cannot avoid:
+;
+;   WHO OWNS THE STORE, AND WHAT HAPPENS WHEN THAT PROCESS DIES?
+;
+; Four layers, each with one job:
+;
+;   proc.table    LIFETIME   a table that cannot die with whoever asked first
+;   proc.tick     ONE BEAT   a message you send yourself, at a computed delay
+;   proc.sched    THE WHEEL  when should this fire, and what happened in the gap
+;   proc.server   THE CLAUSE the form, and the clause registry
+;
+; What to watch for:
+;
+;   · the store is a DATABASE, so a reader queries it with the same language as
+;     any other pane — and can ask what it looked like an hour ago;
+;   · the process that OWNS that database is a trivial keeper nobody has heard
+;     of, not the scheduler and not this file's main process;
+;   · killing the keeper costs nothing: the heir catches the table, the next
+;     keeper reclaims it, and a one-shot that already ran still does not re-run.
+;
+; docs/scheduling/the-clock-and-the-wheel.md is the design of record;
+; docs/the-process-pattern-language.md §3.6 Heir is the pattern.
+
+(ns tooling.proc
+  ; ONE require. `proc` is the tier's door: the form, the verbs, and — through
+  ; the require itself — every clause this tree has registered.
+  (:require [proc :as proc]
+            [datom :as datom]))
+
+(defn check! [truth message data]
+  (when-not truth
+    (throw (ex-info message data))))
+
+(defn- say [label v] (println (str "   " label " → " (Kernel/inspect v))))
+
+;; ── 1. a declaration, and the state it lives in ────────────────────────
+;;
+;; The clause and the author's state are ONE state. `:firm` is the server's own
+;; slice; the schedules are the clause's slice; `init` is merged onto both.
+
+(def runs (atom []))
+
+(proc/defserver kitchen
+  (init [_] (ok {:firm "acme"}))
+  (sched {:clock proc/wall-ms}
+    ; fires often enough to see, and its occurrence id is the idempotency key
+    (every 40 :ms :prep (fn [ev] (swap! runs conj (:occurrence ev))))
+    ; a ONE-SHOT whose due is already past: it runs once, at the first wake,
+    ; and never again — not even after the process that ran it is replaced
+    (at (- (proc/wall-ms) 60000) :open (fn [_] (swap! runs conj :open))
+        {:catch-up :coalesce}))
+  (handle-call :firm [_from st] (reply (:firm st) st)))
+
+(println "== 1. who owns the store ==")
+(let [s (start kitchen nil {})]
+  (Process/sleep 150)
+  (let [owner (proc/store-owner)]
+    (say "this process" (if (= owner (erlang/self)) "OWNS the store (bad)" "owns nothing"))
+    (say "the store's owner" owner)
+    (say "…which is" (if (= owner (Process/whereis :bl_sched-keeper))
+                       "kitchen's keeper — a process nobody declared"
+                       "something else (bad)"))
+    (say "the scheduler asked" "and did not become the owner"))
+  (say "the server's own state survived the clause" (call s :firm))
+  (stop s))
+
+;; ── 2. the store is a database, so query it ────────────────────────────
+;;
+;; This is what the migration buys: the pane does not need a bespoke read model,
+;; and it does not need to ask a scheduler anything. It reads the store.
+
+(println)
+(println "== 2. the store, read as a database ==")
+(let [d (datom/db (proc/conn))]
+  (say "every schedule, as a query"
+       (datom/q '[:find ?id ?runs
+                  :where [?e :schedule/id ?id]
+                         [?e :schedule/runs ?runs]]
+                d))
+  (say "…and the ones that have actually run"
+       (datom/q '[:find ?id
+                  :where [?e :schedule/id ?id]
+                         [?e :schedule/runs ?runs]
+                         [(> ?runs 0)]]
+                d))
+  (say "the outcome, entity by entity" (proc/read-record 'kitchen :prep)))
+
+;; ── 3. the same query, of the past ─────────────────────────────────────
+;;
+;; `as-of` is O(1) and copies nothing: the historical value shares the store and
+;; differs only in its basis. No audit table, no second write path — and the
+;; query does not know it is looking at the past.
+
+;; The id is stored as its NAME (`"prep"`), the string the key is built from, so
+;; a query asks for a string. Storing the keyword too would be a second way to
+;; say the same fact, and the two can disagree.
+(defn- runs-of [d]
+  (first (first (datom/q '[:find ?runs
+                           :where [?e :schedule/id "prep"]
+                                  [?e :schedule/runs ?runs]]
+                         d))))
+
+(println)
+(println "== 3. the store is also a time machine ==")
+(let [t0 (datom/basis-t (datom/db (proc/conn)))]
+  (let [s (start kitchen nil {})]
+    (Process/sleep 150)
+    (stop s))
+  (let [now-db (datom/db (proc/conn))]
+    (say "runs, as of now" (runs-of now-db))
+    (say "runs, as of the basis we captured" (runs-of (datom/as-of now-db t0)))
+    (check! (> (runs-of now-db) (runs-of (datom/as-of now-db t0)))
+            "the past must hold fewer runs than the present"
+            {:now (runs-of now-db) :then (runs-of (datom/as-of now-db t0))})
+    (say "…same query, same syntax" "the query does not know it is looking at the past")))
+
+;; ── 4. a late wake is not a missed occurrence ──────────────────────────
+;;
+;; The rule that makes the wheel an arithmetic question instead of a walk: an
+;; occurrence is due until its SUCCESSOR has passed. A clock jump is therefore
+;; one subtraction, and the policy — not the loop — decides what happens.
+
+(println)
+(println "== 4. a clock jump ==")
+(say "4 hours of downtime, under :catch-up :skip"
+     (do (reset! runs [])
+         (proc/catch-up-plan {:freq :every :ms 1000} 0 14400000 :skip)
+         (str "run " (count (:runs (proc/catch-up-plan {:freq :every :ms 1000} 0 14400000 :skip)))
+              " of the 14400 missed, and land at " (:due (proc/catch-up-plan {:freq :every :ms 1000} 0 14400000 :skip)))))
+(say "…the same gap, under :coalesce"
+     (str "run " (count (:runs (proc/catch-up-plan {:freq :every :ms 1000} 0 14400000 :coalesce)))
+          ", with the FIRST missed due — so the occurrence id is that occurrence"))
+
+;; ── 5. the heir: kill the owner, keep the store ────────────────────────
+;;
+;; The point of `proc.table`. An ETS table dies with its owner, so the
+;; interesting question is not "does a scheduler take the store with it" (it
+;; never gets to own it) but "does the KEEPER?" — and an heir means killing the
+;; owner no longer costs anything.
+
+(println)
+(println "== 5. the heir ==")
+(let [heir (Process/whereis :bl-table-heir)
+      keeper (proc/store-owner)
+      ;; the number that matters: what the STORE says, not what this file's atom
+      ;; happens to hold
+      persisted (:runs (proc/read-record 'kitchen :prep))]
+  (say "the heir" heir)
+  (say "runs persisted before the kill" persisted)
+  (erlang/exit keeper :kill)
+  (Process/sleep 150)
+  (say "the store is still live" (proc/store-live?))
+  (say "…and its owner is now" (if (= heir (proc/store-owner))
+                                 "the heir — it CAUGHT the table"
+                                 "nobody (bad)"))
+  (check! (proc/store-live?) "the store must survive its owner" {})
+  (proc/ensure-store!)
+  (say "after ensure-store!" (if (= (Process/whereis :bl_sched-keeper) (proc/store-owner))
+                               "the new keeper RECLAIMED it, rather than making an empty one"
+                               "not reclaimed (bad)"))
+  (check! (= (Process/whereis :bl_sched-keeper) (proc/store-owner))
+          "ownership must be reclaimed, not restarted"
+          {:owner (proc/store-owner)})
+  (say "…and the outcome it kept" (proc/read-record 'kitchen :prep))
+  (check! (= persisted (:runs (proc/read-record 'kitchen :prep)))
+          "the persisted outcome must be the SAME one"
+          {:before persisted :after (:runs (proc/read-record 'kitchen :prep))}))
+
+;; ── 6. what the heir protects ──────────────────────────────────────────
+;;
+;; Two ways to get the heir wrong are INVISIBLE — the table stays alive and
+;; owned and only its protection drops from two-deep to one-deep:
+;;
+;;   `:ETS-TRANSFER` unquoted        it is the expression `:ETS - TRANSFER`; the
+;;                                   clause compiles and never matches
+;;   the heir's state assoc'd         the inner map is rebuilt, so the heir owns
+;;   one level too shallow           the table and has no record of owning it
+;;
+;; Both end in the same symptom, and it is the one that started this work: a
+;; one-shot that ran twice. What catches them is an ASSERTION, not care —
+;; `hold` does not return until the table's keeper owns it, and
+;; `test/bl/table_test.bl` kills the owner and demands the table come back.
+
+(println)
+(println "== 6. the property this all protects ==")
+(reset! runs [])
+(let [s (start kitchen nil {})]
+  (Process/sleep 120)
+  (stop s))
+(let [s (start kitchen nil {})]
+  (Process/sleep 120)
+  (let [opens (count (filter (fn [x] (= x :open)) @runs))
+        preps (count (filter (fn [x] (not= x :open)) @runs))]
+    (say "one-shots run across two restarts" opens)
+    (say "interval fires across two restarts" preps)
+    ;; the interval KEPT COUNTING (`> 0`), the one-shot did NOT repeat (exactly
+    ;; `0`). Both halves matter: a store that reset would give 0 and 0, and one
+    ;; that repeated would give more than one one-shot.
+    (check! (= 0 opens) "the one-shot must not run again" {:opens opens})
+    (check! (> preps 0) "the interval must keep firing after a restart" {:preps preps})
+    (say "…which is the property"
+         "exactly-once across a restart, from the store alone")))
+(check! (some? (proc/read-record 'kitchen :open))
+        "the one-shot's outcome must still be in the store"
+        {})
+
+(println)
+(println "✓ proc: the store is the wheel, the wheel is a database, and the")
+(println "  database outlives everyone who asked for it.")

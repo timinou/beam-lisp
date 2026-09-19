@@ -1,0 +1,187 @@
+; test/bl/tick_test.bl — the heartbeat: units, the delay, arming, generations.
+; Run: bl -p priv/std test --shared test/bl/tick_test.bl
+;      (the default ward path cannot use the tree's own std yet — FUP-093)
+;
+; The pure half (`unit-ms`, `tick-delay`) answers "when does the next tick
+; land?" with no process and no waiting — which is exactly what the injected
+; clock buys. The live half proves the two properties a SELF-SEND has and a
+; timer callback does not: a body cannot overlap itself, and a debounce fires
+; once for a burst.
+;
+; It also proves the CLAUSE machinery: a tick composes with a server's own
+; state, with a second clause, and with the user's own handlers — which is what
+; `defbeat` could never do.
+
+(ns tick.test
+  (:require [proc :as proc]))
+
+;; ── the units, and the loud refusals ────────────────────────────────────
+
+(deftest unit-ms-knows-the-units
+  (is (= 1 (proc/unit-ms 1 :ms)))
+  (is (= 1000 (proc/unit-ms 1 :second)))
+  (is (= 900000 (proc/unit-ms 15 :minutes)))
+  (is (= 900000 (proc/unit-ms 15 :minute)))
+  (is (= 7200000 (proc/unit-ms 2 :hours)))
+  (is (= 86400000 (proc/unit-ms 1 :day))))
+
+(deftest a-typo-is-an-error-not-a-silent-default
+  ; a scheduler's typo is silent by nature: the tick keeps its old shape and
+  ; nobody notices. So both the unit and the option are refusals.
+  (is (thrown? (proc/unit-ms 1 :fortnights)))
+  (is (thrown? (proc/tick-delay 100 {:juntter 0.1} 0)))
+  (is (thrown? (proc/tick-delay 100 {:anchor :moon} 0)))
+  (is (thrown? (proc/tick-delay 0 {} 0))))
+
+;; ── the delay is a pure function of the clock ───────────────────────────
+
+(deftest self-anchor-is-one-full-period
+  (is (= 100 (proc/tick-delay 100 {} 0)))
+  (is (= 100 (proc/tick-delay 100 {:anchor :self} 1234567))))
+
+(deftest wall-anchor-lands-on-a-boundary
+  ; epoch-relative boundaries: for a period that divides an hour (and an hour
+  ; divides a day), that IS the wall clock people mean.
+  (is (= 900000 (proc/tick-delay 900000 {:anchor :wall} 0)))
+  (is (= 800000 (proc/tick-delay 900000 {:anchor :wall} 100000)))
+  (is (= 1 (proc/tick-delay 900000 {:anchor :wall} 899999))))
+
+(deftest jitter-stays-in-band
+  (let [p 900000
+        ds (vec (map (fn [_] (proc/tick-delay p {:jitter 0.1} 0)) (range 200)))]
+    (is (every? (fn [d] (and (>= d (* p 0.9)) (<= d (* p 1.1)))) ds)
+        "every delay is within ±10% of the period")))
+
+(deftest an-injected-clock-is-honoured
+  (let [calls (atom 0)
+        clock (fn [] (swap! calls inc) 100000)]
+    (is (= 800000 (proc/tick-delay 900000 {:anchor :wall} (clock))))
+    (is (= 1 @calls))))
+
+;; ── the clause registry ─────────────────────────────────────────────────
+
+(deftest the-tick-clause-is-registered
+  (is (some (fn [c] (= "tick" c)) (proc/registered-clauses))
+      "`tick` is a clause of the one server form, not a form of its own"))
+
+(deftest the-transform-returns-clauses-not-a-server
+  ; the unit that turns a clause into clauses — testable on its own, which is
+  ; the whole difference between a bundle and a copied body.
+  (let [c (proc/tick-clause '(tick 100 :ms [st] (noreply st)) {:name 'x})]
+    (is (= 1 (count (:prelude c))) "one arming goes into init")
+    (is (= 1 (count (:clauses c))) "one handler is injected")
+    (is (nil? (:init c)) "a tick contributes no state")))
+
+;; ── a live beat ─────────────────────────────────────────────────────────
+
+(def beat-count (atom 0))
+
+(proc/defserver counter
+  (init [_] (ok {:n 0}))
+  (tick 30 :ms [st]
+    (do (swap! beat-count inc) (noreply {:n (inc (:n st))})))
+  (handle-call :n [_from st] (reply (:n st) st)))
+
+(deftest a-beat-fires-again-and-again
+  (reset! beat-count 0)
+  (let [s (start counter nil {})]
+    (Process/sleep 200)
+    (let [n (call s :n)]
+      (is (> n 2) (str "at 30ms over 200ms the beat should have fired several times, got " n))
+      ; the body ran exactly as often as the state advanced — no stacked ticks
+      (is (= n @beat-count)))
+    (stop s)))
+
+;; ── a clause's slice of the state, merged with the server's own ─────────
+
+(proc/extend-clause! :slice
+  (fn [clause _ctx] {:init {:slice (second clause)}}))
+
+(proc/defserver composite
+  (init [_] (ok {:mine 1}))
+  (slice 42)
+  (tick 25 :ms [st] (noreply (assoc st :n (inc (or (:n st) 0)))))
+  (handle-call :state [_from st] (reply st st)))
+
+(deftest a-clause-merges-its-slice-into-the-state
+  ; THE load-bearing property: the server's own slice and every clause's slice
+  ; arrive in ONE init, because the expander rewrites the (ok …) position. A
+  ; macro cannot do this, which is why `defbeat` had to own the whole server.
+  (let [s (start composite nil {})]
+    (Process/sleep 120)
+    (let [st (call s :state)]
+      (is (= 1 (:mine st)) "the server's own slice survived")
+      (is (= 42 (:slice st)) "the clause's slice was merged in")
+      (is (> (:n st) 0) "…and the beat still ran"))
+    (stop s)))
+
+;; ── a throwing body, when it is allowed to fail ─────────────────────────
+
+(def flaky-count (atom 0))
+
+(proc/defserver flaky
+  (init [_] (ok {:n 0}))
+  (tick 25 :ms {:on-error :continue} [st]
+    (do (swap! flaky-count inc)
+        (if (< @flaky-count 2)
+          (throw (ex-info "the first throw is always" {}))
+          (noreply {:n (inc (:n st))}))))
+  (handle-call :n [_from st] (reply (:n st) st))
+  ; read the failure record from INSIDE the beat: the counter lives in the
+  ; process dictionary, which is per-process.
+  (handle-call :failures [_from st] (reply (proc/tick-failures 'flaky) st)))
+
+(deftest on-error-continue-keeps-the-beat-alive
+  (reset! flaky-count 0)
+  (let [s (start flaky nil {})]
+    (Process/sleep 200)
+    (is (> (call s :n) 0)
+        "the beat survived the throw, so later ticks ran")
+    (is (>= (call s :failures) 1)
+        "the throw was RECORDED, not swallowed")
+    (stop s)))
+
+;; ── the debounce: a burst produces one fire ─────────────────────────────
+
+(proc/defserver debounced
+  (init [_] (ok {:fires 0}))
+  (tick 150 :ms {:once true} [st] (noreply {:fires (inc (:fires st))}))
+  (handle-info [:activity] [st]
+    (do (proc/tick-reset 150 {:name 'debounced}) (noreply st)))
+  (handle-call :fires [_from st] (reply (:fires st) st)))
+
+(deftest a-burst-fires-once
+  (let [s (start debounced nil {})]
+    ; activity every 20ms for 200ms — far inside the 150ms period, so the
+    ; pending tick is always cancelled before it can fire.
+    (doseq [_ (range 10)]
+      (erlang/send s [:activity])
+      (Process/sleep 20))
+    (is (= 0 (call s :fires)) "no fire while the burst is still running")
+    ; now go quiet for longer than the period: exactly one.
+    (Process/sleep 320)
+    (is (= 1 (call s :fires)) "the quiet tail fires exactly once")
+    ; and a once-tick does NOT re-arm, so it stays at one.
+    (Process/sleep 200)
+    (is (= 1 (call s :fires)) "a :once tick does not re-arm")
+    (stop s)))
+
+;; ── cancel ──────────────────────────────────────────────────────────────
+
+(proc/defserver cancelled
+  (init [_] (ok {:n 0}))
+  (tick 60 :ms [st] (noreply {:n (inc (:n st))}))
+  (handle-info [:halt] [st]
+    (do (proc/tick-cancel 'cancelled) (noreply st)))
+  (handle-call :n [_from st] (reply (:n st) st)))
+
+(deftest cancel-stops-the-beat
+  (let [s (start cancelled nil {})]
+    (Process/sleep 150)
+    (is (> (call s :n) 0) "it was beating")
+    (erlang/send s [:halt])
+    (Process/sleep 30)
+    (let [at (call s :n)]
+      (Process/sleep 200)
+      (is (= at (call s :n)) "and after the cancel it is frozen"))
+    (stop s)))

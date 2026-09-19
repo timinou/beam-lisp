@@ -1,0 +1,350 @@
+; test/bl/sched_test.bl — the deadline queue: rules, catch-up, the wheel, the ops.
+; Run: bl -p priv/std test --shared test/bl/sched_test.bl
+;
+; The rule arithmetic is PURE, so most of this needs no process and no sleep:
+; "when does it next fire?" and "what happened during the gap?" are answered by
+; arithmetic because the clock is a value.
+;
+; The live half pins the three things a deadline queue must not get wrong:
+;   · an occurrence runs at most ONCE, keyed by its occurrence id;
+;   · a gap is dropped or coalesced according to the schedule's policy, never
+;     silently turned into a burst;
+;   · pause keeps the due, so resuming runs the occurrence it was on.
+
+(ns sched.test
+  (:require [proc :as proc]))
+
+;; ── the rules, pure ─────────────────────────────────────────────────────
+
+(deftest every-fires-one-period-out-and-advances-from-the-due
+  (is (= 6000 (proc/first-due {:freq :every :ms 1000} 5000)))
+  ; anchored to the DUE, not to now — that is what stops drift
+  (is (= 7000 (proc/advance {:freq :every :ms 1000} 6000))))
+
+(deftest daily-lands-on-the-hour-in-the-clocks-own-zone
+  ; the epoch is a UTC midnight, so a whole number of days after it is one too
+  (is (= 25200000 (proc/first-due {:freq :daily :at [7 0]} 0)) "07:00 today")
+  (is (= 25200000 (proc/first-due {:freq :daily :at [7 0]} 25200000)) "…and at the stroke")
+  (is (= 111600000 (proc/first-due {:freq :daily :at [7 0]} 25200001)) "…else tomorrow")
+  (is (= 111600000 (proc/advance {:freq :daily :at [7 0]} 25200000)) "a day later"))
+
+(deftest a-one-shot-has-no-successor
+  (is (= 900 (proc/first-due {:freq :at :ms 900} 100)))
+  (is (nil? (proc/advance {:freq :at :ms 900} 900))))
+
+;; ── the gap, pure ───────────────────────────────────────────────────────
+
+(deftest skip-drops-the-whole-gap-and-lands-after-now
+  ; due 1040, period 40, now 1200: occurrences 1040, 1080, 1120, 1160 are all
+  ; missed. :skip runs NONE of them and lands on the first due past now.
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1200 :skip)]
+    (is (= 0 (count (:runs p))) "a dropped gap runs nothing")
+    (is (= 1240 (:due p)) "…and the wheel lands after now")))
+
+(deftest a-late-wake-is-not-a-missed-occurrence
+  ; THE rule. A wake lands 10ms after a 40ms due: the successor is still ahead,
+  ; so the occurrence RUNS — under :skip too. Treating lateness as a missed
+  ; occurrence made :skip drop every fire; this test is why that is fixed.
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1050 :skip)]
+    (is (= [1040] (:runs p)) ":skip still runs an occurrence that is merely late")
+    (is (= 1080 (:due p)) "…and advances one step"))
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1050 :coalesce)]
+    (is (= [1040] (:runs p)))))
+
+(deftest stale-is-a-successor-that-already-passed
+  ; 1040 + 40 = 1080 <= 1200, so the backlog is real and the policy applies
+  (is (= 0 (count (:runs (proc/catch-up-plan {:freq :every :ms 40} 1040 1080 :skip)))))
+  (is (= [1040] (:runs (proc/catch-up-plan {:freq :every :ms 40} 1040 1080 :coalesce)))))
+
+(deftest coalesce-runs-once-for-the-whole-gap
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1200 :coalesce)]
+    (is (= 1 (count (:runs p))) "one run, however many were missed")
+    (is (= 1040 (first (:runs p)))
+        "…named by the FIRST missed due — the occurrence id says which period was missed")
+    (is (= 1240 (:due p)))))
+
+(deftest a-gap-with-nothing-missed-runs-when-it-is-due
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1040 :coalesce)]
+    (is (= [1040] (:runs p)) "due NOW is due"))
+  (let [p (proc/catch-up-plan {:freq :every :ms 40} 1040 1000 :coalesce)]
+    (is (= 0 (count (:runs p))) "not yet is not due")
+    (is (= 1040 (:due p)))))
+
+(deftest a-year-dormant-schedule-answers-in-one-step
+  ; ~31M missed occurrences. Counting them one at a time is a HANG, not a
+  ; policy — this test exists because the first implementation did exactly that.
+  (let [rule {:freq :every :ms 1000}
+        now 31537000000]
+    (is (= 31537000 (proc/missed-count rule 1000 now)) "counted arithmetically")
+    ; :coalesce runs ONCE however long the gap was, and lands past now
+    (let [p (proc/catch-up-plan rule 1000 now :coalesce)]
+      (is (= [1000] (:runs p)) "one run, named by the first missed due")
+      (is (> (:due p) now) "…and the wheel is wound to the future"))
+    ; :skip runs nothing at all
+    (let [p (proc/catch-up-plan rule 1000 now :skip)]
+      (is (= [] (:runs p)))
+      (is (> (:due p) now)))
+    ; :run-all is bounded, and says so by emptying the wheel rather than
+    ; pretending it kept up
+    (let [p (proc/catch-up-plan rule 1000 now :run-all)]
+      (is (= proc/MAX-CATCH-UP (count (:runs p))) "capped")
+      (is (nil? (:due p)) "…and the re-seeded wheel is empty"))))
+
+;; ── the clause, as a transform ──────────────────────────────────────────
+
+(deftest the-transform-returns-a-wheel-not-a-server
+  (let [c (proc/sched-clause '(sched (every 40 :ms :beat f)) {:name 'x})]
+    (is (= 1 (count (:prelude c))) "one arming in init")
+    (is (some? (:init c)) "…and a slice of state")
+    (is (= 6 (count (:clauses c))) "1 wake + 5 ops")))
+
+(deftest a-malformed-entry-is-refused-at-expansion
+  (is (thrown? (proc/sched-clause '(sched (every 40 :ms :beat)) {:name 'x}))
+      "an entry with no fn")
+  (is (thrown? (proc/sched-clause '(sched (fortnightly 2 :x f)) {:name 'x}))
+      "an unknown rule")
+  (is (thrown? (proc/sched-clause '(sched) {:name 'x}))
+      "no entries at all")
+  (is (thrown? (proc/sched-clause '(sched (at 1 :x f) (at 2 :x f)) {:name 'x}))
+      "two schedules with one name"))
+
+(deftest the-declarations-are-keyed-by-id
+  (let [d (proc/decls [{:id :a :rule {:freq :at :ms 1} :run 1 :opts {}}
+                        {:id :b :rule {:freq :at :ms 2} :run 2 :opts {}}])]
+    (is (= [:a :b] (vec (sort (keys d)))))))
+
+;; ── the wheel, live ─────────────────────────────────────────────────────
+
+(def shift-a (atom 0))
+(def log-a (atom []))
+
+(proc/defserver beat
+  (init [_] (ok {:firm "acme"}))
+  (sched {:clock (fn [] (+ (proc/wall-ms) @shift-a))}
+    (every 40 :ms :beat
+      (fn [ev] (swap! log-a conj (:occurrence ev)))
+      {:catch-up :coalesce}))
+  (handle-call :log [_from st] (reply @log-a st))
+  (handle-call :firm [_from st] (reply (:firm st) st)))
+
+(deftest a-beat-fires-again-and-again-with-distinct-occurrences
+  (reset! shift-a 0)
+  (reset! log-a [])
+  (let [s (start beat nil {})]
+    (Process/sleep 220)
+    (let [l (call s :log)]
+      (is (> (count l) 2) (str "at 40ms over 220ms, several fires; got " (count l)))
+      (is (= (count l) (count (distinct l))) "no occurrence ran twice")
+      (is (every? (fn [o] (String/starts_with? o "beat@")) l)
+          "the id names the schedule and the due"))
+    (stop s)))
+
+(deftest the-servers-own-state-survives-the-clause
+  ; the point of a clause over a form: the schedule's slice and the author's
+  ; slice are ONE state.
+  (reset! shift-a 0)
+  (let [s (start beat nil {})]
+    (is (= "acme" (call s :firm)) "the init clause's state is intact")
+    (stop s)))
+
+(deftest next-and-spec-describe-the-wheel
+  (reset! shift-a 0)
+  (reset! log-a [])
+  (let [s (start beat nil {})]
+    (let [n (call s [:sched/next :beat])]
+      (is (= :beat (:id n)))
+      (is (= :active (:state n)))
+      (is (some? (:at n)) "a due is announced")
+      (is (some? (:in-ms n))))
+    (let [spec (call s [:sched/spec])]
+      (is (= 1 (count spec)))
+      (is (= :every (get-in (first spec) [:rule :freq])))
+      (is (= 40 (get-in (first spec) [:rule :ms]))))
+    (is (= {:error {:unknown :nope :known [:beat]}}
+           (call s [:sched/next :nope])))
+    (stop s)))
+
+(deftest pause-keeps-the-due-and-resume-runs-it
+  (reset! shift-a 0)
+  (reset! log-a [])
+  (let [s (start beat nil {})]
+    (Process/sleep 120)
+    (call s [:sched/pause :beat])
+    (Process/sleep 20)
+    (let [frozen (count (call s :log))]
+      (Process/sleep 150)
+      (is (= frozen (count (call s :log))) "paused means paused")
+      (is (= :paused (:state (call s [:sched/next :beat]))))
+      (call s [:sched/resume :beat])
+      (Process/sleep 150)
+      (is (> (count (call s :log)) frozen) "and resuming winds it again"))
+    (stop s)))
+
+(deftest run-now-cannot-manufacture-a-second-run
+  (reset! shift-a 0)
+  (reset! log-a [])
+  (let [s (start beat nil {})]
+    (call s [:sched/pause :beat])
+    (Process/sleep 20)
+    (let [before (count (call s :log))]
+      (call s [:sched/run-now :beat])
+      (let [ran (count (call s :log))]
+        (is (= (inc before) ran) "run-now runs the occurrence it was on")
+        (call s [:sched/run-now :beat])
+        (is (= ran (count (call s :log)))
+            "…and the SAME occurrence is refused the second time: the idempotency key")
+        (call s [:sched/resume :beat])
+        (Process/sleep 150)
+        (is (> (count (call s :log)) ran) "the beat carried on")))
+    (stop s)))
+
+;; ── the store: a restart RESUMES, it does not REPEAT ────────────────────
+
+(def once-runs (atom 0))
+(def interval-runs (atom 0))
+
+(proc/defserver resumable
+  (sched {:clock proc/wall-ms}
+    ; a one-shot whose due is already past: it runs once, at the first wake,
+    ; and never again — not even after the process is replaced
+    (at (- (proc/wall-ms) 60000) :once-only
+      (fn [_] (swap! once-runs inc)) {:catch-up :coalesce})
+    (every 50 :ms :beat
+      (fn [_] (swap! interval-runs inc)) {:catch-up :skip}))
+  (handle-call :spec [_from st] (reply (proc/summary st) st)))
+
+(defn- by-id [spec id] (first (filter (fn [x] (= id (:id x))) spec)))
+
+(deftest a-restart-resumes-it-does-not-repeat
+  (reset! once-runs 0)
+  (reset! interval-runs 0)
+
+  (let [s (start resumable nil {})]
+    (Process/sleep 170)
+    (let [spec (call s [:sched/spec])]
+      (is (= 1 @once-runs) "the stale one-shot ran once")
+      (is (= 1 (:runs (by-id spec :once-only))) "…and the outcome says so")
+      (is (> @interval-runs 0) "the interval ran"))
+    (stop s))
+
+  (let [s (start resumable nil {})]
+    (Process/sleep 170)
+    (is (= 1 @once-runs)
+        "THE property: the one-shot did NOT run again — exactly-once across a restart")
+    (let [spec (call s [:sched/spec])]
+      (is (= 1 (:runs (by-id spec :once-only))) "its run count was resumed, not reset")
+      (is (> (:runs (by-id spec :beat)) 1)
+          "…and the interval kept COUNTING from its stored total rather than from zero"))
+    (stop s)))
+
+(deftest a-pause-survives-a-restart
+  (let [s (start resumable nil {})]
+    (call s [:sched/pause :beat])
+    (is (= :paused (:state (by-id (call s [:sched/spec]) :beat))))
+    (stop s))
+  ; a NEW process, same name, same store: the human's decision outlives it
+  (let [s (start resumable nil {})]
+    (Process/sleep 80)
+    (is (= :paused (:state (by-id (call s [:sched/spec]) :beat)))
+        "paused is a fact, not a bit in the process that made it")
+    (call s [:sched/resume :beat])
+    (is (= :active (:state (by-id (call s [:sched/spec]) :beat))))
+    (stop s)))
+
+;; ── ownership is structural, not careful ────────────────────────────────
+
+(deftest a-transient-process-never-owns-the-store
+  (let [s (start resumable nil {})]
+    (Process/sleep 80)
+    (let [o (proc/store-owner)]
+      (is (some? o) "the store has an owner")
+      (is (not= s o) "and it is NOT the scheduler that happened to ask first")
+      (is (= (Process/whereis :bl_sched-keeper) o) "it is the keeper"))
+    (stop s)))
+
+(deftest the-store-outlives-its-OWNER
+  ; THE point of the heir. An ETS table dies with its owner, so the interesting
+  ; question is not "does a scheduler take the store with it" (it never gets to
+  ; own it) but "does the KEEPER?" — and with an heir, killing the owner no
+  ; longer costs anything.
+  (reset! once-runs 0)
+  (reset! interval-runs 0)
+  (let [s (start resumable nil {})]
+    (Process/sleep 140)
+    (let [keeper (Process/whereis :bl_sched-keeper)
+          heir (Process/whereis :bl-table-heir)
+          before (:runs (proc/read-record 'resumable :beat))]
+      (is (some? keeper))
+      (is (some? heir) "the heir is up, named as the table's heir at creation")
+      (is (= keeper (proc/store-owner)))
+      (is (some? before) "the schedule has an outcome worth losing")
+
+      (erlang/exit keeper :kill)
+      (Process/sleep 80)
+
+      (is (proc/store-live?) "the store SURVIVED its owner")
+      (is (= heir (proc/store-owner)) "…the heir holds it now")
+
+      (proc/ensure-store!)
+      (let [k (Process/whereis :bl_sched-keeper)]
+        (is (some? k) "a keeper is up again")
+        (is (= k (proc/store-owner)) "…and it owns the store, reclaimed from the heir")
+        (is (not= s (proc/store-owner)) "…and never the scheduler that asked"))
+      (is (>= (:runs (proc/read-record 'resumable :beat)) before)
+          "…and it is the SAME store: the count continued rather than resetting"))
+    (stop s))
+
+  ; the sharp assertion: the outcome the OLD owner was keeping is still there
+  ; (the suite shares one store, so the one-shot may already have run in an
+  ;  earlier test — what matters is that THIS restart does not run it again)
+  (let [ran-before @once-runs]
+    (let [s (start resumable nil {})]
+      (Process/sleep 150)
+      (is (= ran-before @once-runs)
+          "the one-shot still did not re-run — across the owner's death, not just the scheduler's")
+      (stop s))))
+
+;; ── the gap, live: the two policies differ, and both are bounded ─────────
+
+(def shift-b (atom 0))
+(def log-b (atom []))
+
+(proc/defserver skipper
+  (sched {:clock (fn [] (+ (proc/wall-ms) @shift-b))}
+    (every 40 :ms :s (fn [ev] (swap! log-b conj (:due ev))) {:catch-up :skip}))
+  (handle-call :n [_from st] (reply @log-b st)))
+
+(def shift-c (atom 0))
+(def log-c (atom []))
+
+(proc/defserver coalescer
+  (sched {:clock (fn [] (+ (proc/wall-ms) @shift-c))}
+    (every 40 :ms :c (fn [ev] (swap! log-c conj (:due ev))) {:catch-up :coalesce}))
+  (handle-call :n [_from st] (reply @log-c st)))
+
+(deftest a-clock-jump-is-dropped-or-coalesced-never-a-burst
+  ; The occurrence the schedule was ON before the jump is read from the WHEEL,
+  ; not guessed from timing — so these assertions are exact.
+  (reset! shift-b 0)
+  (reset! log-b [])
+  (let [s (start skipper nil {})]
+    (let [missed (:at (call s [:sched/next :s]))]
+      (reset! shift-b 10000)
+      (Process/sleep 160)
+      (call s [:sched/pause :s])
+      (is (not (some (fn [d] (= d missed)) (call s :n)))
+          ":skip dropped the missed occurrence — it never ran"))
+    (stop s))
+
+  (reset! shift-c 0)
+  (reset! log-c [])
+  (let [s (start coalescer nil {})]
+    (let [missed (:at (call s [:sched/next :c]))]
+      (reset! shift-c 10000)
+      (Process/sleep 160)
+      (call s [:sched/pause :c])
+      (is (= missed (first (call s :n)))
+          (str ":coalesce ran ONCE, named by the FIRST missed due — the period"
+               " that was missed, not the instant it was noticed. got "
+               (pr-str (call s :n)))))
+    (stop s)))

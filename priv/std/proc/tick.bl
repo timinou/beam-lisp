@@ -1,0 +1,372 @@
+; tick.bl — the heartbeat: a process that wakes itself, on time or on a boundary.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; A Timeout Edge with a body — the Heartbeat pattern
+; (docs/the-process-pattern-language.md §1.5 and §4.1). Every other scheduling
+; shape in the tree is built on this one.
+;
+; It is a CLAUSE now, not a form of its own:
+;
+;   (proc.server/defserver reaper
+;     (init [_] (ok {:done 0}))
+;     (tick 15 :minutes [st]                     ; ≙ send_after + re-arm
+;       (do (reap! conn) (noreply {:done (inc (:done st))}))))
+;
+; The form is QUALIFIED because `defserver` is a compiler special form, and a
+; special form is checked BEFORE macros — so a bare `defserver` can never be
+; this one. When boot's form is renamed to `defgen` (PLAN-126 §4.6, PLAN-088)
+; the qualifier drops off and `(:require [server :refer [defserver]])` finally
+; does what it looks like it does. A REFERRED macro also does not resolve
+; through a qualifier (`(other/defserver …)` is a value, not a macro), so this
+; macro lives in exactly one namespace on purpose.
+;
+; `defbeat` used to exist because a bundle could not add a clause to
+; `defserver`. It can now (priv/std/server.bl), so the second name for one graph
+; is gone — and the server can carry other clauses beside its beat, which the
+; form never could.
+;
+; The tick is a SELF-SEND, which buys the two properties a timer callback does
+; not have:
+;
+;   · it cannot overlap with itself — the mailbox serialises it against the
+;     process's other work, so a slow body DELAYS the next tick instead of
+;     stacking a second one;
+;   · it cannot interrupt a handler — it is a message, so it is handled at a
+;     point the server already chose.
+;
+; ══ THE CLOCK IS A VALUE ════════════════════════════════════════════════════
+;
+; `:clock` is a fn → milliseconds on the axis that `:anchor :wall` measures
+; against; it defaults to the wall clock. A test passes a fixed one, so "when
+; does the next tick land?" is a pure question with a pure answer
+; (`tick-delay`), and a pane can time-travel without waiting. Reading the clock
+; is an EFFECT, so it is a parameter here and never an ambient call (the
+; `effects` lattice in docs/tempo-maximalist.md §9 says the same thing).
+;
+; ══ POLICIES ARE OPTIONS, AND AN UNKNOWN OPTION IS AN ERROR ═════════════════
+;
+; `env.bl` sets the rule: "a typo that silently does nothing is the worst kind
+; of configuration bug" (docs/dev/env.bl.md). A scheduling policy is the same
+; kind of value, so `(tick 5 :minutes {:juntter 0.1} …)` is REPORTED, not
+; quietly ignored.
+;
+; ══ WHAT THIS IS NOT (YET) ══════════════════════════════════════════════════
+;
+; A tick lives in a PROCESS: it dies with the process, and its counters die
+; with it. Durable recurrence — a schedule that survives a restart, that a
+; human can pause, and that the pane can read without asking a pid — is the
+; Deadline Queue, `priv/std/sched.bl`.
+;
+;   (tick …)          one process's private beat.  debounce, poll, prune,
+;                     a periodic re-derivation.
+;   (sched …)         a DECLARED recurrence: a fact in the store, one owner
+;                     for the next wake, pause/next/explain as queries.
+;
+; `:catch-up` and `:overlap` are therefore not options here. A missed deadline,
+; and two runs that would overlap, are possibilities only a durable queue has;
+; they arrive with it and are REJECTED here (see the unknown-option rule).
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/server.bl — the expander, and the clause contract
+; examples/tooling/tick.bl — the shape in motion, runnable
+; docs/scheduling/the-clock-and-the-wheel.md — the design of record
+
+(ns proc.tick
+  (:require [proc.server :refer [extend-clause!]]))
+
+;; ── units ───────────────────────────────────────────────────────────────
+
+(def UNIT-MS
+  {:ms 1 :millisecond 1 :milliseconds 1
+   :s 1000 :second 1000 :seconds 1000
+   :m 60000 :minute 60000 :minutes 60000
+   :h 3600000 :hour 3600000 :hours 3600000
+   :d 86400000 :day 86400000 :days 86400000})
+
+(defn unit-ms
+  "Milliseconds in `n` of `unit` — `(unit-ms 15 :minutes)` → 900000.
+
+   An unknown unit throws: a period is a number a scheduler will be asked to
+   honour, and a silent zero would be an infinity."
+  [n unit]
+  (let [m (get UNIT-MS unit)]
+    (if (nil? m)
+      (throw (ex-info (str "tick: unknown unit " unit
+                           " — use :ms :seconds :minutes :hours :days")
+                      {:unit unit :n n}))
+      (* n m))))
+
+(defn wall-ms
+  "The default clock: milliseconds since the epoch, UTC. Only the difference
+   between two readings is meaningful — `:anchor :wall` needs an absolute axis,
+   a duration never does."
+  []
+  (erlang/system_time :millisecond))
+
+;; ── the policies ────────────────────────────────────────────────────────
+
+(def KNOWN-OPTS [:name :anchor :jitter :clock :on-error])
+
+;; A clause-only option: it decides the SHAPE of the emitted handler rather than
+;; a policy the arming call honours, so it never reaches `tick-arm`.
+(def CLAUSE-OPTS [:once])
+
+(defn check-opts!
+  "Reject an option key we do not honour. Loud, because a scheduler's typo is
+   silent by nature: the tick simply keeps its old shape and nobody notices."
+  [opts]
+  (doseq [k (keys opts)]
+    (when (not (some (fn [known] (= known k)) (concat KNOWN-OPTS CLAUSE-OPTS)))
+      (throw (ex-info (str "tick: unknown option " k " — known: "
+                           (join " " (map (fn [x] (str x)) (concat KNOWN-OPTS CLAUSE-OPTS))))
+                      {:option k :known KNOWN-OPTS}))))
+  opts)
+
+(defn- jittered
+  "±`f` of `base`, never less than a millisecond. A jitter of zero is the
+   identity, and the common case, so it costs one comparison."
+  [base f]
+  (if (or (nil? f) (not (> f 0)))
+    base
+    (let [u (- (erlang/apply :rand :uniform (list)) 0.5)
+          ms (erlang/round (* base (+ 1 (* 2 f u))))]
+      (if (< ms 1) 1 ms))))
+
+(defn tick-delay
+  "The milliseconds to wait, given the period, the policies, and `now`.
+
+   `:anchor :self` (default) — one full period from now: the interval is
+     measured from the END of the previous body, so a slow body delays the next
+     tick rather than stacking one.
+
+   `:anchor :wall` — the next multiple of `period` on the clock's axis: the
+     tick lands on a boundary and cannot accumulate drift, at the cost of
+     firing as soon as it is armed if it is armed just before a boundary.
+
+   `:jitter f` — spread the delay by ±f, so N processes that would otherwise
+     wake together do not. Jitter and `:anchor :wall` compose: boundary first,
+     spread after.
+
+   Pure, so a test answers 'when does the next tick land?' without waiting."
+  [period opts now]
+  (check-opts! opts)
+  (when (not (and (erlang/is_integer period) (> period 0)))
+    (throw (ex-info (str "tick: period must be a positive integer of ms, got " period)
+                    {:period period})))
+  (let [anchor (get opts :anchor :self)
+        jitter (get opts :jitter 0)]
+    (cond
+      (= anchor :self) (jittered period jitter)
+      (= anchor :wall) (let [r (rem now period)]
+                         (jittered (if (zero? r) period (- period r)) jitter))
+      :else (throw (ex-info (str "tick: unknown :anchor " anchor " — use :self or :wall")
+                            {:anchor anchor})))))
+
+;; ── the arming ──────────────────────────────────────────────────────────
+;;
+;; The generation counter is the subtle half. A DEBOUNCE cancels its pending
+;; timer and arms a new one, but `cancel_timer` cannot un-send a message already
+;; in the mailbox — so a stale `[:bl/tick n]` can still arrive. Each arming
+;; bumps a counter kept in the PROCESS DICTIONARY (a timer is process-local
+;; ephemera; forcing every server's state to carry a timer slot is the tax this
+;; avoids), and the handler compares before running its body.
+
+(defn- gen-key [name] (tuple :bl/tick-gen name))
+(defn- ref-key [name] (tuple :bl/tick-ref name))
+(defn- fails-key [name] (tuple :bl/tick-fails name))
+(defn- err-key [name] (tuple :bl/tick-err name))
+
+(defn- pd
+  "The process dictionary's value for `key`, or `default`.
+
+   `:erlang.get/1` answers the ATOM `:undefined` on a miss, and an atom is
+   truthy here — so `(or (erlang/get k) 0)` hands `:undefined` on and the next
+   arithmetic dies with a badarith. Every read of the dictionary goes through
+   this."
+  [key default]
+  (let [v (erlang/get key)]
+    (if (= :undefined v) default v)))
+
+(defn tick-gen
+  "The current generation for `name` — 0 before the first arming."
+  [name]
+  (pd (gen-key name) 0))
+
+(defn tick-current?
+  "Whether `n` is the generation now armed. The body runs only for a current
+   tick: that is what makes a reset safe."
+  [name n]
+  (= n (tick-gen name)))
+
+(defn tick-arm
+  "Arm the next tick; returns the timer reference.
+
+   `period` is milliseconds and `opts` carries the policies (`:name` keeps
+   several independent beats in one process, plus `:clock`, `:anchor`,
+   `:jitter`). Arming bumps the generation, so arming twice leaves exactly one
+   live tick."
+  ([period] (tick-arm period {}))
+  ([period opts]
+   (check-opts! opts)
+   (let [name (get opts :name :tick)
+         clock (get opts :clock wall-ms)
+         now (clock)
+         ms (tick-delay period opts now)
+         n (inc (tick-gen name))]
+     (erlang/put (gen-key name) n)
+     (let [r (erlang/send_after ms (erlang/self) (tuple :bl/tick n))]
+       (erlang/put (ref-key name) r)
+       r))))
+
+(defn tick-cancel
+  "Drop `name`'s pending tick, and make any tick already in the mailbox STALE.
+   Returns the remaining milliseconds when a timer was cancelled, `false` when
+   nothing was pending, `nil` when none was ever armed.
+
+   The generation bump is why `cancel` can be read as *it will not run*: a
+   `cancel_timer` cannot un-send a message already delivered, and a body that
+   runs after a cancel would re-arm the beat. A DEBOUNCE is this plus a fresh
+   arm — `tick-reset`."
+  [name]
+  (erlang/put (gen-key name) (inc (tick-gen name)))
+  (let [k (ref-key name) r (pd k nil)]
+    (if (nil? r)
+      nil
+      (do (erlang/erase k) (erlang/cancel_timer r)))))
+
+(defn tick-reset
+  "The debounce: cancel whatever is pending and arm a fresh period. A tick
+   already in the mailbox is made STALE by the generation bump, so an activity
+   burst produces exactly one fire."
+  ([period] (tick-reset period {}))
+  ([period opts]
+   (let [name (get opts :name :tick)]
+     (tick-cancel name)
+     (tick-arm period opts))))
+
+;; ── failure, when a body is allowed to fail ─────────────────────────────
+;;
+;; `:on-error :stop` (the default) lets a throwing body crash the process: the
+;; supervisor restarts it, init re-arms, and the failure is VISIBLE in the
+;; supervision tree. `:on-error :continue` keeps the beat alive across a
+;; throwing body — right for a sweep over many independent items — and records
+;; the failure where a reader can find it rather than swallowing it.
+
+(defn tick-failed!
+  "Record one failed body for `name`. Returns the new failure count."
+  [name e]
+  (let [n (inc (pd (fails-key name) 0))
+        m (if (map? e) (get e :message) nil)]
+    (erlang/put (fails-key name) n)
+    (erlang/put (err-key name) (if (nil? m) (str e) (str m)))
+    n))
+
+(defn tick-failures [name] (pd (fails-key name) 0))
+(defn tick-last-error [name] (pd (err-key name) nil))
+
+;; ── parsing the clause ──────────────────────────────────────────────────
+;;
+;;     (tick N UNIT opts? [state] BODY)
+;;
+;; `opts` may be a map — `{:anchor :wall}` — or bare keyword pairs —
+;; `:anchor :wall :jitter 0.05` — and is optional; a params vector naming the
+;; state is required, as in every other defserver clause. The body is one form
+;; and must be last.
+;;
+;; `{:once true}` fires the body once and does NOT re-arm: that is the building
+;; block of a DEBOUNCE, where activity re-arms with `tick-reset` and only the
+;; quiet tail fires. Without it the beat is an interval.
+
+(defn- pairs->map
+  "Turn `(:anchor :wall :jitter 0.05)` into `{:anchor :wall :jitter 0.05}` AT
+   EXPANSION TIME, so the emitted form is a plain map literal."
+  [xs]
+  (loop [m {} ys (vec xs)]
+    (if (empty? ys)
+      m
+      (recur (assoc m (first ys) (second ys)) (vec (drop 2 ys))))))
+
+(defn- first-vector-index
+  "The index of the first vector form in `xs`, or nil."
+  [xs]
+  (loop [i 0 ys (vec xs)]
+    (cond (empty? ys) nil
+          (vector? (first ys)) i
+          :else (recur (inc i) (vec (rest ys))))))
+
+(defn- parse-tick
+  "`[opts-form params-vector body-form]` from the forms after `(tick N UNIT …)`.
+
+   The params vector is required, exactly as every other defserver clause has
+   one, because the body has to have a NAME for the state it returns."
+  [tail where]
+  (let [pi (first-vector-index tail)]
+    (when (nil? pi)
+      (throw (ex-info (str where ": (tick N UNIT opts? [state] BODY) — a params vector is required")
+                      {:tail tail})))
+    (when (not= 2 (- (count tail) pi))
+      (throw (ex-info (str where ": (tick N UNIT opts? [state] BODY) — exactly one body form after the params")
+                      {:tail tail})))
+    (let [opt-forms (vec (take pi tail))
+          params (nth tail pi)
+          body (nth tail (- (count tail) 1))]
+      (when (not (and (= 1 (count params)) (symbol? (first params))))
+        (throw (ex-info (str where ": the tick's params vector holds exactly one symbol — the state")
+                        {:params params})))
+      [(if (and (= 1 (count opt-forms)) (map? (first opt-forms)))
+         (first opt-forms)
+         (pairs->map opt-forms))
+       params
+       body])))
+
+(defn- check-opt-forms!
+  [opts where]
+  (doseq [k (keys opts)]
+    (when (not (some (fn [known] (= known k)) (concat KNOWN-OPTS CLAUSE-OPTS)))
+      (throw (ex-info (str where ": unknown option " k " — known: "
+                           (join " " (map (fn [x] (str x)) (concat KNOWN-OPTS CLAUSE-OPTS))))
+                      {:option k :known KNOWN-OPTS}))))
+  opts)
+
+;; ── the clause ──────────────────────────────────────────────────────────
+;;
+;; One contribution, and the whole of the bundle: arm in the prelude (so the
+;; beat starts when the process starts), and a `handle-info` that checks the
+;; generation, runs the body, and re-arms. The reader of the expansion sees the
+;; same init → armed → fire → armed graph `system.model` reasons about, which
+;; is why no new runtime was needed for any of this.
+
+(defn tick-clause
+  "The `(tick N UNIT opts? [state] BODY)` transform. Public because it is worth
+   testing on its own: it is the unit that turns a clause into clauses."
+  [clause ctx]
+  (let [spec (vec (rest clause))
+        n (first spec)
+        unit (second spec)
+        where (str "defserver " (:name ctx))]
+    (when (or (nil? n) (nil? unit))
+      (throw (ex-info (str where ": (tick N UNIT …) — a period is required") {})))
+    (let [parsed (parse-tick (vec (drop 2 spec)) where)
+          opts (check-opt-forms! (first parsed) where)
+          params (second parsed)
+          body (nth parsed 2)
+          state (first params)
+          once (get opts :once false)
+          tick-name (list 'quote (:name ctx))
+          ;; `:once` is consumed here: it is not a policy the arming call sees
+          armed (assoc (dissoc opts :once) :name tick-name)
+          arm `(proc.tick/tick-arm (proc.tick/unit-ms ~n ~unit) ~armed)
+          on-error (get opts :on-error :stop)
+          fire (if (= on-error :continue)
+                 `(try ~body
+                    (catch e# (do (proc.tick/tick-failed! ~tick-name e#) (noreply ~state))))
+                 body)]
+      {:prelude [arm]
+       :clauses [`(handle-info [:bl/tick n#] ~params
+                   (if (proc.tick/tick-current? ~tick-name n#)
+                     (let [out# ~fire] ~@(if once (list) (list arm)) out#)
+                     (noreply ~state)))]})))
+
+(extend-clause! :tick tick-clause)
