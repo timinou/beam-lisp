@@ -12,6 +12,10 @@
 //                     ["patch", ops]              a list of patch ops
 //                     ["denied", why]             an intent was refused
 //   client → server:  ["event", term, data]      a fired event + its data
+//                     ["ping"]                    heartbeat — inbound traffic
+//                                                 that keeps an idle socket
+//                                                 under the server's idle
+//                                                 timeout (no reply expected)
 //
 // Op set (mirrors diff.bl):
 //   ["set-attr",    path, k, v]
@@ -340,6 +344,11 @@
     var outbox = opts.outbox ? makeOutbox("live:outbox") : null;
     var reconnect = opts.reconnect !== false;
 
+    // heartbeat: a ["ping"] frame every heartbeatMs keeps a quiet page's
+    // socket under the server's idle timeout (web/upgrade carries 120s) and
+    // holds proxies open. Default 30s; {heartbeatMs:0} disables.
+    var heartbeatMs = opts.heartbeatMs === undefined ? 30000 : opts.heartbeatMs;
+
     // `ws` is now MUTABLE — a reconnect swaps in a fresh socket while the event
     // delegation (bound to `root` once, below) keeps firing. `pending` buffers
     // sends made while the CURRENT socket is still CONNECTING.
@@ -385,15 +394,24 @@
     function openSocket() {
       ws = new WebSocket(opts.url);
       ws.__send = sendFrame;   // relay() and __navigate use this
+      var sock = ws;           // the heartbeat captures THIS socket — after a
+      var beat = null;         // reconnect swaps `ws`, the dead socket's timer
+                               // must die with it, never beat on the fresh one
 
       ws.onopen = function () {
         reconnectMs = 500;                         // reset backoff
         for (var i = 0; i < pending.length; i++) ws.send(pending[i]);
         pending = [];
         if (outbox) outbox.replay(sendFrame);      // resend every un-acked frame
+        if (heartbeatMs > 0) {
+          beat = setInterval(function () {
+            if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(["ping"]));
+          }, heartbeatMs);
+        }
         setLive(true);
       };
       ws.onclose = function () {
+        if (beat) { clearInterval(beat); beat = null; }
         setLive(false);
         if (reconnect) {                           // auto-reconnect with backoff
           setTimeout(openSocket, reconnectMs);
