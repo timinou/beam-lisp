@@ -112,9 +112,29 @@ Gate: bench runs on the rebuilt NIF; numbers appended to §7.
 nif_read_fast returns :reroute over the ceiling; read/1 becomes one crossing hot path.
 Deletes nif_lane from the API. Gate: lazy-seq tests + bench p50 read latency.
 
-** Phase 2 — fjall range cursor (fix F7)
-Chunked scan (32 rows/pull, lane decided once from avg row bytes — LazyMemo's cursor shape).
-Gate: memory ceiling on wide scans; conformance suite byte-identical.
+** Phase 2 — fjall range cursor (fix F7)  ⟶ DONE (2026-09-19, commit d8a92fa4)
+Chunked scan: `fjall_range_chunk` returns the next N pairs, resuming from the last key
+received (inclusive `start` for the first chunk, exclusive `after` for the rest — re-seeking
+costs µs against a scan measured in seconds). `datom.store-fjall/-range` loops it at
+CHUNK-ROWS = 512; the port's contract is unchanged.
+Gate: conformance suite green (73, incl. a new test that crosses TWO chunk edges with 1101
+keys — the mutation that makes the resume bound inclusive HANGS it, so the pin is real), plus
+24 durable + 60 file + 44 store. Memory: the native transient is bounded by the chunk.
+MEASURED on a COPY of the live corpus (filali `sources-legales`: 969 016 rows, 1.1 GB):
+
+| probe | before (whole window) | after (chunked 512) |
+|---|---|---|
+| full scan, alone | 15.58 s | 13.08 s |
+| point-get under a scan — median | 0.051 ms | 0.102 ms |
+| point-get under a scan — **max** | **3421 ms** | **1.39 ms** |
+
+⟶ the F8 tail (a get behind a full scan) drops ~2460×, and the scan itself is not slower.
+WHAT THIS DOES NOT FIX, measured the same way: a SINGLE scan's own cost — the NIF's 969k
+pairs take 2.48 s, and the same scan through the port takes 8.57 s, i.e. **71% of one wide
+read is the bl-side `decode-value`, one call per row**. A live projection that reads the whole
+index therefore stays ~8–17 s per render; chunking stops it blocking everyone else, it does
+not make the read cheap. The next lever is FUP-022 (native/columnar decode, or a datom read
+that does not decode values the query discards), not more chunking.
 
 ** Phase 3 — native dependency walk (fix F5)
 nif_dependencies(term): one crossing, native term walk. Deletes the 60-line Elixir walk.
@@ -259,3 +279,67 @@ NIFs from ~/.local/share/drop/*/priv, NOT from ./priv/native.
   before trying; the self-guard must be inside fjall's own error path. Needs a spike.
 - Generation-validated L1 views: a stale L1 read is a correctness bug, not a perf bug —
   stale-serve probe is the gate, and it must run under edit load, not just at rest.
+
+* 9. The maximalist frame (user directive, 2026-09-19): the cache is a program
+
+The project's own trajectory is the guide: mix retired (PLAN-107), the build is a program
+(priv/build/build.bl), daemon paths are bl (vm/paths.bl), tests are bl. Elixir is the
+bootstrap FLOOR, not the home of systems code. So the unified cache is not "a better Elixir
+module" — it is a bl program over one NIF, and the Elixir that remains is exactly what the
+boot path forces to remain.
+
+** The boundary that decides everything: does it run before bl can?
+
+The seed floor must never depend on a native: the drift gate decides whether cached beams are
+loadable, INCLUDING the beams that would rebuild a stale NIF. If the gate needed the NIF, a
+missing/stale lazy_memo.so would make boot impossible and recovery circular. Callers prove
+the split (mapped 2026-09-19):
+
+- BOOT PATH (stays Elixir, stays pterm/pdict, stays dumb): AOTCache.compiler_key/build_key/
+  key_for_ns (called from aot.ex stale? gate + bootstrap.ex seed verification),
+  Tiers tier_namespaces memo, Env.fetch L1 memo (interpreter-hot, per-deref).
+- POST-BOOT (moves to bl): AOTCache fetch/store/closure_key/closure_walk/gc/
+  cleanup_obsolete_generations/fetch_stats (called ONLY from priv/build/build.bl + tests),
+  BeamLisp.Cache path layout (callers: bl cache/codebase/embed-asset + model.ex),
+  sandbox base memo, all eviction/GC policy, PerfProbe (replaced by native op counters —
+  already shipped in Phase 0).
+
+** The shape
+
+1. ONE NIF crate is the substrate (cells + lanes + deps + stats; fjall stays its own crate
+   behind the same Store protocol — merging engines is NOT the point, merging IDENTITY,
+   ACCOUNTING, INVALIDATION and PROBES is).
+2. The cache API is a bl ns (vm/cell.bl or bl/cache.bl) via defnative — the same mechanism
+   store-fjall.bl already uses. Policy (budgets, eviction, sweep, manifests) is bl.
+3. The tree daemon (bl daemon, already running per-tree) OWNS L3: fjall handles live in the
+   daemon VM; CLI invocations are clients over the socket. F9 (process-exclusive stores)
+   stops being a constraint and becomes the architecture. Bonus: cross-process warm cache
+   (a `bl search` warms the daemon; the next run hits), eviction becomes a daemon duty
+   instead of a per-CLI-run tax, and cache stats join the daemon model that vm/inspect.bl
+   already renders.
+4. Elixir consumers of cells (lazy_seq/refs/reactive/seq_cursor — all rt-adjacent, all boot
+   path) keep calling ONE thin Elixir stub module. No parallel bl/Elixir routing logic: after
+   Phases 1+3 the logic has shrunk into the NIF itself; the stub is the only face.
+
+** Elixir deletion ledger
+
+| module | today | after | mechanism |
+|---|---|---|---|
+| aot_cache.ex | ~813 ln | ~150 ln (keys only) | store/GC/walk → priv/build/cache.bl; keys stay (seed floor) |
+| cache.ex | 105 ln | 0–10 ln | path layout → vm/paths.bl neighbor; residue only while model.ex needs root() |
+| lazy_memo.ex | 311 ln | ~60 ln | dep walk → NIF (Ph3); routing → self-guard (Ph1); budget policy → bl over stats |
+| perf_probe.ex | 56 ln | 0 | native op counters (DONE, Phase 0) |
+| sandbox.ex memo bits | ~10 ln | 0 | daemon-held cell |
+| tiers.ex memo | ~20 ln | stays (dumb pterm; boot path) | but gets a reset for symmetry (F-adjacent) |
+| env.ex fetch memo | ~80 ln | stays (L1, interpreter-hot) | generation-validated L1 later (Ph5) |
+| test/beam_lisp/aot_cache_test.exs | 22K | → test/bl | self-hosted tests for the moved halves |
+
+Net: roughly −1000 lines of Elixir, and every cache POLICY becomes a bl program.
+
+** Sequencing consequence
+
+Phases 1–3 unchanged (they shrink the Elixir stub — prerequisite for the ledger). Phase 4
+(eviction) and Phase 5 (merge) now read differently: the invalidation-by-edges work applies
+to POST-boot caches only; the seed-floor keys keep their pterm memos FOREVER, by design.
+New Phase 6: daemon-owned L3 (fjall handles move into the daemon; store-fjall open becomes a
+daemon RPC for CLI processes; keep a direct-open escape hatch for tests + detached tools).
