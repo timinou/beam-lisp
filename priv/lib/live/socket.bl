@@ -236,20 +236,77 @@
       (push! state [:tap (:t f) (:basis f)])))
   (dissoc state :last-event))
 
-;; ── mount ───────────────────────────────────────────────────────────
+;; ── the session outlives its transport ───────────────────────────────
+;;
+;; A dropped socket used to take the session with it: the client reconnected
+;; to a fresh process and a fresh MOUNT — locals reset (a wizard back at step
+;; 0, a query erased) and the DOM replaced wholesale. The session is not the
+;; transport, so it no longer is one: the socket process is started UNLINKED,
+;; the transport is only its current `:sink`, and a reconnecting client names
+;; the session (the `live-sid` query param, minted once per page load — app.bl
+;; resolves it) so the server re-ATTACHES the same process. Locals, the datom
+;; subscriptions and the last tree the CLIENT saw all survive, so attach ships
+;; the DELTA — not a mount.
+;;
+;; Who ends it: the socket monitors its sink; the sink's death detaches and
+;; arms ONE grace timer (`:resume-ms`). A re-attach cancels it; expiry stops
+;; the process. A RELOAD is a new page load, hence a new sid, hence a fresh
+;; session: resume is for a transport that dropped, never for a reload.
+
+(def ^:private DEFAULT-RESUME-MS 120000)
 
 (defn mount
   "First paint. Render the view, push the full HTML, remember the tree.
    `opts` = {:view :shared :session :locals :sink :auth}. Returns the
-   socket state map."
+   socket state map. The sink is MONITORED here: its death is the detach."
   [opts]
-  (let [state (merge {:locals {}} opts)
+  (let [sink (:sink opts)
+        state (merge {:locals {} :attached? true} opts
+                     (when (some? sink)
+                       {:sink-mon (erlang/monitor :process sink)}))
         t0 (now-us)
         tree (render state)
         state2 (push! (ship-css! (assoc state :tree tree))
                       [:mount (hiccup/hiccup->html tree)])]
     (tap! state2 {:kind :mount :ops [] :tree tree
                   :ms (/ (- (now-us) t0) 1000.0)})))
+
+(defn detach
+  "The transport we were shipping to died. Keep the session, stop shipping:
+   `on-commit` is a no-op while detached (no render, no diff), and one grace
+   timer ends the session unless a re-attach arrives first.
+
+   Only the CURRENT sink's :DOWN detaches: a re-attach demonitors the old
+   sink, and that late :DOWN must not tear down the fresh transport (the
+   reconnect-before-the-server-noticed case)."
+  [state ref]
+  (if (and (:attached? state) (= ref (:sink-mon state)))
+    (let [ms (or (:resume-ms state) DEFAULT-RESUME-MS)]
+      (assoc state
+             :attached? false :sink nil :sink-mon nil
+             :grace (erlang/send_after ms (erlang/self) (tuple :live/expire))))
+    state))
+
+(defn attach
+  "A transport for this session is (re)connecting: adopt the sink, cancel the
+   grace, and ship the DELTA since the tree the client last saw — a reconnect
+   with nothing missed ships nothing, because the DOM is already correct.
+
+   `me` must be the principal the session was opened for: a session's locals
+   and its projection stream are never handed to another viewer, so a guessed
+   sid is not a way in. Answers [:ok state] or [:denied state]."
+  [state sink me]
+  (if (not= me (:me state))
+    [:denied state]
+    (let [state (if-let [ref (:sink-mon state)] (do (erlang/demonitor ref) state) state)
+          state (if-let [g (:grace state)] (do (erlang/cancel_timer g) state) state)
+          state (assoc state :attached? true :sink sink :grace nil
+                             :sink-mon (erlang/monitor :process sink))
+          next (render state)
+          ops (diff/diff (:tree state) next)
+          state2 (ship-css! (assoc state :tree next))]
+      (when (seq ops) (push! state2 [:patch ops]))
+      [:ok state2])))
 
 ;; ── a commit landed: re-project this viewer, ship minimal patches ───
 
@@ -259,15 +316,22 @@
    The stylesheet ships even when the tree did NOT move: a navigate between
    differently-themed routes with identical markup produces zero diff ops
    but a new base (see ship-css!), and skipping the ship would leave the
-   old route's body rules on the page."
+   old route's body rules on the page.
+
+   While DETACHED (the transport died, the grace window is open) there is
+   nothing to ship and a tree the client has not seen must not be treated as
+   seen: re-rendering would advance `:tree` past the client's DOM. The commit
+   is a no-op; the next `attach` renders once and ships the whole delta."
   [state]
-  (let [t0 (now-us)
-        next (render state)
-        ops (diff/diff (:tree state) next)
-        ms (/ (- (now-us) t0) 1000.0)
-        state2 (ship-css! (assoc state :tree next))]
-    (when (seq ops) (push! state2 [:patch ops]))
-    (tap! state2 {:kind :commit :ops (into [] ops) :tree next :ms ms})))
+  (if (not (:attached? state))
+    state
+    (let [t0 (now-us)
+          next (render state)
+          ops (diff/diff (:tree state) next)
+          ms (/ (- (now-us) t0) 1000.0)
+          state2 (ship-css! (assoc state :tree next))]
+      (when (seq ops) (push! state2 [:patch ops]))
+      (tap! state2 {:kind :commit :ops (into [] ops) :tree next :ms ms}))))
 
 ;; ── an event fired ──────────────────────────────────────────────────
 
@@ -457,13 +521,15 @@
 ;;     :session task-ui-schema        ; opens an in-memory session conn (opt)
 ;;     :listen  {:payload :basis})    ; datom listen opts (opt)
 ;;
-;; init ctx = {:shared conn :sink pid :locals {…} :auth {…}}. The generated
-;; server:
+;; init ctx = {:shared conn :sink pid :locals {…} :auth {…} :me principal}.
+;; The generated server:
 ;;   - opens the session conn (if :session schema given), listens to both
 ;;     worlds, mounts (first paint), and holds the socket state;
 ;;   - on [:datom/tx …]/[:datom/changed …] (a commit) re-projects via
 ;;     on-commit;
-;;   - on {:event ev data} (a browser event, as a call) applies handle-event.
+;;   - on {:event ev data} (a browser event, as a call) applies handle-event;
+;;   - on :DOWN / [:live/attach …] / [:live/expire] keeps the SESSION alive
+;;     across transports (see § the session outlives its transport).
 ;;
 ;; The MOUNT TRAP is closed by construction: init opens worlds and paints,
 ;; but has no intent in scope — a write at mount is unrepresentable.
@@ -486,6 +552,8 @@
                            :session session#
                            :sink (:sink ctx#)
                            :locals (or (:locals ctx#) {})
+                           :me (:me ctx#)
+                           :resume-ms (:resume-ms ctx#)
                            :auth (:auth ctx#)
                            :intents ~intents})]
            (ok st#)))
@@ -495,6 +563,22 @@
          (noreply (on-commit st#)))
        (handle-info [:datom/changed _basis# _attrs#] [st#]
          (noreply (on-commit st#)))
+
+       ;; a transport died, or the grace window closed with none attached
+       (handle-info [:DOWN ref# :process _pid# _why#] [st#]
+         (noreply (detach st# ref#)))
+       (handle-info [:live/expire] [st#]
+         ;; the OTP tuple, spelled out: `stop` in a clause body is the prelude
+         ;; VERB (BeamLisp.Server.stop/2), not the constructor — using it here
+         ;; raised `no process` and crashed the handler instead of ending it.
+         ;; `:normal`: an expired session is the lifecycle working, not a fault
+         ;; (any other reason logs the shutdown at error level).
+         (if (:attached? st#) (noreply st#) (tuple :stop :normal st#)))
+
+       ;; a transport for this session reconnects
+       (handle-call [:live/attach sink# me#] [_from# st#]
+         (let [r# (attach st# sink# me#)]
+           (reply (first r#) (second r#))))
 
        ;; a browser event, delivered as a call so the client can await :ok
        (handle-call [:event ev#] [_from# st#]

@@ -349,6 +349,23 @@
     // holds proxies open. Default 30s; {heartbeatMs:0} disables.
     var heartbeatMs = opts.heartbeatMs === undefined ? 30000 : opts.heartbeatMs;
 
+    // the SESSION id: minted once PER PAGE LOAD and carried by every
+    // reconnect, so the server re-attaches the SAME session — locals (a
+    // wizard's step, a query, a flash), subscriptions and the tree the client
+    // last saw — instead of mounting a fresh one. In memory only, on purpose:
+    // a reload is a new page load and wants a fresh session, so there is
+    // nothing to persist, expire or clear.
+    var sid = (function () {
+      var a = new Uint8Array(16), i, s = "";
+      if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a);
+      else for (i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
+      for (i = 0; i < a.length; i++) s += ("0" + a[i].toString(16)).slice(-2);
+      return s;
+    })();
+    function sessionUrl(url) {
+      return url + (url.indexOf("?") === -1 ? "?" : "&") + "live-sid=" + sid;
+    }
+
     // `ws` is now MUTABLE — a reconnect swaps in a fresh socket while the event
     // delegation (bound to `root` once, below) keeps firing. `pending` buffers
     // sends made while the CURRENT socket is still CONNECTING.
@@ -392,7 +409,7 @@
 
     // open (or re-open) the socket and wire its handlers.
     function openSocket() {
-      ws = new WebSocket(opts.url);
+      ws = new WebSocket(sessionUrl(opts.url));
       ws.__send = sendFrame;   // relay() and __navigate use this
       var sock = ws;           // the heartbeat captures THIS socket — after a
       var beat = null;         // reconnect swaps `ws`, the dead socket's timer

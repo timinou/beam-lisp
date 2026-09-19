@@ -43,22 +43,51 @@ The hardest question in any UI framework is "where does state live?" Here the
 answer is closed. Three kinds, each with one home:
 
 ```
-  kind         lives in                      lifetime            example
-  ──────────   ───────────────────────────   ─────────────────   ─────────────────
-  SHARED    →  the shared datom conn         durable, the log    a check-in fact
-  SESSION   →  a per-socket in-memory conn   dies with the tab   a draft note
-  LOCAL     →  the socket's :locals map      dies with the tab   who am I (:me)
+  kind         lives in                      lifetime                 example
+  ──────────   ───────────────────────────   ──────────────────────   ─────────────────
+  SHARED    →  the shared datom conn         durable, the log         a check-in fact
+  SESSION   →  a per-socket in-memory conn   the SESSION's lifetime    a draft note
+  LOCAL     →  the socket's :locals map      the SESSION's lifetime    who am I (:me)
 ```
 
 - **shared** is the truth everyone sees. It is a fact in the log; it has
   `q`, `pull`, `as-of`, `watch` — and history — for free.
 - **session** is *this viewer's* private database. Same datom API, but the ETS
-  table is owned by the socket process, so it is reclaimed when the tab closes
-  — leak-free by process lifetime, no cleanup code.
+  table is owned by the socket process, so it is reclaimed when the SESSION
+  ends — leak-free by process lifetime, no cleanup code.
 - **local** is a plain map for scalars (route, role, identity).
 
 There is no fourth "component state" tier to invent. Durable/shared → it's a
 fact. Ephemeral/private → it's a session datom or a local. That's it.
+
+### The session outlives its transport (and nothing more)
+
+A socket is a SESSION with a TRANSPORT attached — not one process per
+connection. The client mints a session id per page load and carries it on the
+ws URL (`live-sid`, `live/client.js`); the socket process is started UNLINKED
+and registered under that id (`live.app`'s `live-sessions` registry), so a
+reconnect re-ATTACHES the same process: locals, the session conn, the datom
+subscriptions and the tree the client last saw all survive.
+
+What that buys, and what it does not:
+
+- **Resume, not re-mount.** `live.socket/attach` diffs the client's last-seen
+  tree against a fresh render and ships the delta. A reconnect with nothing
+  missed ships nothing; the DOM the viewer holds (a half-typed query, a
+  wizard's step) is never replaced. `on-commit` is a no-op while detached, so
+  a commit made during the gap ships once, on attach.
+- **It is never handed over.** `attach` refuses a transport whose principal is
+  not the session's `:me` — a guessed sid is not a way into another viewer's
+  stream. The refused connection gets its own fresh session.
+- **It still ends.** The socket monitors its sink; the sink's death detaches
+  and arms ONE grace timer (`:resume-ms`, default 120s), cancelled by a
+  re-attach, expiring to a stop. A RELOAD is a new page load, hence a new sid,
+  hence a fresh session — resume is for a transport that dropped, never for a
+  reload.
+
+Proof: `test/bl/live/resume_test.bl` (headless — detach, attach's delta, the
+principal refusal, expiry) and `test/browser/connect.spec.js` (the sid rides
+on every socket URL and is identical across a reconnect).
 
 ### Truth ordering — LOG ⊐ FILE ⊐ IMAGE
 

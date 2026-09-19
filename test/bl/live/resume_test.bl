@@ -1,0 +1,149 @@
+; resume_test.bl — the session outlives its transport.
+;
+; A dropped socket used to take the session with it: the reconnect mounted a
+; FRESH process, so the locals were gone (a wizard back at step 0, a query
+; erased) and the DOM was replaced wholesale. The socket process IS the
+; session now: a transport is only its sink, a sink's death detaches it, and a
+; re-attach ships the DELTA since the tree the CLIENT last saw. That is the
+; claim below, headless — a real transport for a frame is just a pid.
+;
+; Run: bl test test/bl/live/resume_test.bl
+
+(ns live.resume.test
+  (:require [live.socket :as s] [live.hiccup :as h] [datom]))
+
+(defn- fresh-conn []
+  (datom/connect
+    [{:db/ident :task/slug :db/valueType :db.type/string
+      :db/unique :db.unique/identity}
+     {:db/ident :task/title :db/valueType :db.type/string}]))
+
+;; the view reads the session local (`:draft`) — the state a reconnect must
+;; bring back — and the shared world, which moves while the client is away.
+(defn- board [db _session locals]
+  [:main
+   [:input {:data-draft (or (:draft locals) "")}]
+   [:ul (for [t (sort (datom/q '[:find ?slug :where [?e :task/slug ?slug]] db))]
+         [:li {:key (first t)} (first t)])]])
+
+(s/deflive resume-socket
+  :view board
+  :intents {})
+
+(defn- sink
+  "A transport that labels what it receives and forwards it to `me` — so a
+   test can tell which transport a frame landed on."
+  [me label]
+  (erlang/spawn
+    (fn []
+      (loop []
+        (receive
+          [tag _] (do (erlang/send me [label tag]) (recur))
+          (after 3000 nil))))))
+
+(defn- drain-all
+  "Every pending frame, in order."
+  []
+  (loop [out []]
+    (let [m (receive
+              [:mount html] [:mount html]
+              [:patch ops] [:patch ops]
+              [:style css] [:style css]
+              [label tag] [label tag]
+              (after 60 :none))]
+      (if (= :none m) out (recur (conj out m))))))
+
+(defn- tags [frames] (into [] (map (fn [f] (first f)) frames)))
+
+(deftest a-reconnect-resumes-locals-and-ships-the-delta
+  (let [conn (fresh-conn)
+        me (erlang/self)
+        a (sink me :a)]
+    (datom/transact! conn [{:db/id -1 :task/slug "a" :task/title "First"}])
+    (let [pid (start resume-socket {:shared conn :sink a :me "viewer"})]
+      (Process/sleep 60)
+      (drain-all)                                  ; the mount + its style
+
+      ;; the viewer's session state exists (a wizard's step, a typed query)
+      (call pid [:event [:assign :draft "typed"]])
+      (Process/sleep 40)
+      (drain-all)
+
+      ;; the transport dies — the session must NOT
+      (erlang/exit a :kill)
+      (Process/sleep 100)
+      (let [st (call pid [:state])]
+        (is (= true (not (:attached? st))) "the sink's death detaches the session")
+        (is (nil? (:sink st)))
+
+        ;; a commit while detached must not advance the tree the CLIENT saw:
+        ;; the client's DOM is frozen where it left it
+        (let [tree-before (:tree st)]
+          (datom/transact! conn [{:db/id -1 :task/slug "b" :task/title "Second"}])
+          (Process/sleep 100)
+          (is (= tree-before (:tree (call pid [:state])))
+              "detached: nothing is shipped and the client's tree is untouched")))
+
+      ;; the SAME session adopts a new transport
+      (is (= :ok (call pid [:live/attach me "viewer"])))
+      (let [frames (drain-all)
+            frame-tags (tags frames)]
+        (is (some (fn [t] (= :patch t)) frame-tags)
+            "a re-attach ships a PATCH (the delta), not a re-mount")
+        (is (not (some (fn [t] (= :mount t)) frame-tags))
+            "no mount on resume — the DOM the client holds is not replaced")
+        (let [html (h/hiccup->html (:tree (call pid [:state])))]
+          (is (String/contains? html "typed") "the local survived the drop")
+          (is (String/contains? html "b") "the commit made while away is in the delta"))))))
+
+(deftest a-session-is-never-handed-to-another-principal
+  (let [conn (fresh-conn)
+        me (erlang/self)
+        a (sink me :a)
+        pid (start resume-socket {:shared conn :sink a :me "viewer"})]
+    (Process/sleep 60)
+    (drain-all)
+    (is (= :denied (call pid [:live/attach me "intruder"]))
+        "a guessed sid is not a way into someone else's session")
+    (is (= true (:attached? (call pid [:state])))
+        "the refusal leaves the session exactly as it was")
+    (erlang/exit a :kill)
+    (Process/sleep 60)
+    (drain-all)))
+
+(deftest a-late-down-from-the-old-transport-does-not-detach-the-new-one
+  (let [conn (fresh-conn)
+        me (erlang/self)
+        a (sink me :a)
+        pid (start resume-socket {:shared conn :sink a :me "viewer"})]
+    (Process/sleep 60)
+    (drain-all)
+    ;; the reconnect arrives BEFORE the server notices the drop
+    (is (= :ok (call pid [:live/attach me "viewer"])))
+    (Process/sleep 40)
+    (drain-all)
+    ;; now the old transport's death is observed — it must be ignored
+    (erlang/exit a :kill)
+    (Process/sleep 100)
+    (is (= true (:attached? (call pid [:state])))
+        "only the CURRENT sink's :DOWN detaches")
+    (drain-all)))
+
+(deftest the-grace-window-ends-a-detached-session
+  (let [conn (fresh-conn)
+        me (erlang/self)
+        a (sink me :a)
+        pid (start resume-socket {:shared conn :sink a :me "viewer" :resume-ms 60000})]
+    (Process/sleep 60)
+    (drain-all)
+    ;; attached: the grace firing is a no-op (it was cancelled or never armed)
+    (erlang/send pid [:live/expire])
+    (Process/sleep 60)
+    (is (= true (:attached? (call pid [:state]))))
+    ;; detached: the grace ends the session
+    (erlang/exit a :kill)
+    (Process/sleep 100)
+    (erlang/send pid [:live/expire])
+    (Process/sleep 100)
+    (is (= false (Process/alive? pid)) "an unattached session stops when its grace expires")
+    (drain-all)))

@@ -55,6 +55,7 @@
             [loom.token :as t]
             [datom]
             [web]
+            [reg]
             [interop]))
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -289,33 +290,124 @@
     (reduce (fn [acc kv] (assoc acc (keyword (str (first kv))) (second kv))) {} (seq m))
     m))
 
+;; ── the session registry: sid → socket process ──────────────────────
+;;
+;; A reconnect must find the SAME socket process (its locals, its last-seen
+;; tree, its subscriptions) instead of mounting a fresh one. The sid naming
+;; it is minted per PAGE LOAD by the client (live/client.js) and travels in
+;; the ws URL as `live-sid`; the router strips it before the route's own
+;; query is read, so no screen ever sees it.
+;;
+;; A session outlives its transport, so its registry entry must die with the
+;; PROCESS, not with a connection: that is `reg` exactly — the pid ↔ attrs
+;; relation, retracted by the VM on :DOWN, so an expired session is simply
+;; not found and there is no sweep to write.
+
+(reg/defregistry live-sessions (keys :sid))
+
+(def ^:private SESSIONS :live-sessions)
+
+(defn- sessions
+  "The registry, started on first use under its OTP name. `start`, not
+   `start-link`: it must outlive the request that started it — and the loser
+   of a double start reuses the winner by name."
+  []
+  (or (Process/whereis SESSIONS)
+      (try (start live-sessions nil {:name SESSIONS})
+           (catch _e (Process/whereis SESSIONS)))))
+
+(defn session-of
+  "The socket process serving `sid`, or nil (unknown, expired, or never
+   registered). Public: that a session SURVIVES its transport is a fact
+   about this lookup, so a test asserts it here."
+  [sid]
+  (when (and (some? sid) (some? (sessions)))
+    (reg/whereis SESSIONS {:sid sid})))
+
+(defn- start-session
+  "Start a socket for this transport. UNLINKED on purpose — the transport's
+   death is a detach, not the session's end (live.socket/detach). Registered
+   under `sid` when the client sent one, so its reconnect finds it."
+  [ctx sid]
+  (let [started (start app-socket ctx)
+        pid (if (map? started) (:pid started) started)]
+    (when (and (some? sid) (some? pid) (some? (sessions)))
+      (reg/register SESSIONS pid {:sid sid}))
+    pid))
+
+(defserver app-socket
+  (init [ctx]
+    (let [observe (get ctx :observe [])
+          _ (doseq [c observe] (datom/listen! c {}))
+          st (sock/mount {:view (get ctx :view)
+                          :shared (get ctx :shared)
+                          :session (get ctx :session)
+                          :sink (get ctx :sink)
+                          :locals (get ctx :locals {})
+                          :me (get ctx :me)
+                          :resume-ms (get ctx :resume-ms)
+                          :auth (get ctx :auth)
+                          :intents (get ctx :intents {})
+                          :tap (get ctx :tap)})]
+      (ok st)))
+
+  ;; a commit landed on any observed world — re-project this viewer
+  (handle-info [:datom/tx _basis _datoms] [st] (noreply (sock/on-commit st)))
+  (handle-info [:datom/changed _basis _attrs] [st] (noreply (sock/on-commit st)))
+
+  ;; a transport died, or the grace window closed with none attached
+  (handle-info [:DOWN ref :process _pid _why] [st] (noreply (sock/detach st ref)))
+  (handle-info [:live/expire] [st]
+    (if (:attached? st) (noreply st) (tuple :stop :normal st)))
+
+  ;; a transport for this session reconnects
+  (handle-call [:live/attach sink me] [_from st]
+    (let [r (sock/attach st sink me)]
+      (reply (first r) (second r))))
+
+  ;; a browser event (click/input/navigate), delivered as a call so the
+  ;; client can await :ok
+  (handle-call [:event ev] [_from st] (reply :ok (sock/handle-event st ev)))
+  (handle-call [:event ev data] [_from st] (reply :ok (sock/handle-event st ev data)))
+
+  ;; introspection for tests
+  (handle-call [:state] [_from st] (reply st st)))
+
+(defn- app-socket-ctx
+  "The socket context for one transport: the app's seams plus the
+   principal — `:me` is what an attach is checked against, so it is a
+   connection fact, never taken from the session."
+  [init-state me]
+  (let [app (get init-state :app)]
+    {:view dispatch
+     :shared (get init-state :shared)
+     :session nil
+     :sink (erlang/self)
+     :observe (get init-state :observe [])
+     :intents (get app :intents {})
+     :me me
+     :resume-ms (get app :resume-ms)
+     :auth (let [a (get init-state :auth)]
+             (if (map? a)
+               (merge a {:principal me})
+               {:fn (fn [_op _p _pr] {:verdict :allow}) :principal me}))
+     ;; dev tooling: the app's tap (data.tap) receives a frame per
+     ;; mount/commit — see live.socket/tap!. nil in production.
+     :tap (get app :tap)
+     :locals {:app app :me me :route (get init-state :route)}}))
 (defn- ws-init [init-state]
-  ;; init-state carries {:app :me :route :observe :shared}. Start an app-socket
-  ;; whose sink is THIS ws process; its locals seed the dispatcher.
-  (let [app (get init-state :app)
-        me (get init-state :me)
-        ;; the performer needs to know WHO fired the intent. live.socket reads
-        ;; the principal from :auth's :principal, so thread `me` there. When the
-        ;; app supplies its own :auth (a real biscuit policy), honour it but
-        ;; still carry `me` as the principal; otherwise a permissive gate that
-        ;; names the principal so intents can resolve the firm.
-        auth (let [a (get init-state :auth)]
-               (if (map? a)
-                 (merge a {:principal me})
-                 {:fn (fn [_op _p _pr] {:verdict :allow}) :principal me}))
-        srv (start-link app-socket
-              {:view dispatch
-               :shared (get init-state :shared)
-               :session nil
-               :sink (erlang/self)
-               :observe (get init-state :observe [])
-               :intents (get app :intents {})
-               :auth auth
-               ;; dev tooling: the app's tap (data.tap) receives a frame per
-               ;; mount/commit — see live.socket/tap!. nil in production.
-               :tap (get app :tap)
-               :locals {:app app :me me :route (get init-state :route)}})]
-    [:ok {:srv srv}]))
+  ;; init-state carries {:app :me :route :observe :shared :sid :resume-ms}.
+  ;; Two outcomes: an existing session for this sid ADOPTS this transport (a
+  ;; reconnect: locals, tree and subscriptions survive — it ships the delta),
+  ;; or a new session is started for it. A sid whose session belongs to
+  ;; another principal is not adopted: the connection gets its own session
+  ;; instead, so a guessed sid reads nothing.
+  (let [me (get init-state :me)
+        sid (get init-state :sid)
+        existing (session-of sid)]
+    (if (and (some? existing) (= :ok (call existing [:live/attach (erlang/self) me])))
+      [:ok {:srv existing}]
+      [:ok {:srv (start-session (app-socket-ctx init-state me) sid)}])))
 
 (defn- ws-handle-in [frame state]
   ;; the wire vocabulary: ["event" term data] drives the socket; ["ping"] is
@@ -362,6 +454,20 @@
 ;; 6. serve — the whole app, one call
 ;; ════════════════════════════════════════════════════════════════════
 
+(defn- take-sid
+  "Pull `live-sid` out of a raw query string → [sid route-query]. The session
+   id is the transport's own concern: it must not leak into the route's query
+   params, or a screen reading :q would see it."
+  [qs]
+  (if (or (nil? qs) (= "" qs))
+    [nil ""]
+    (let [pairs (String/split qs "&")
+          sid (some (fn [p] (if (String/starts_with? p "live-sid=")
+                              (web/url-decode (subs p 9 (count p))) nil))
+                    pairs)
+          kept (into [] (filter (fn [p] (not (String/starts_with? p "live-sid="))) pairs))]
+      [sid (join "&" kept)])))
+
 (defn router
   "The HTTP router for an app: assets, client.js, the ws upgrade, and SSR
    first paint for any matched route. `style-html` is the warmed sheet."
@@ -393,11 +499,12 @@
       (String/starts_with? path "/ws")
         (let [suffix (subs path 3 (count path))         ; "/ws/lib/x" → "/lib/x"
               route0 (if (or (= suffix "") (= suffix "/")) (get app :home "/") suffix)
-              q (web/query conn)
+              [sid q] (take-sid (web/query conn))       ; the session id is NOT route state
               target (if (or (nil? q) (= "" q)) route0 (str route0 "?" q))]
           (web/upgrade conn ws-handlers
                        {:app app :me me
                         :route target
+                        :sid sid
                         :observe (if-let [obs (get app :observe)] (obs me) [])
                         :auth (if-let [ar (get app :auth-info)] (ar me) nil)
                         :shared (shared-for app me)}))

@@ -26,8 +26,11 @@ driving a real Chromium with Playwright against the JS client.
    `["ping"]` heartbeat within `heartbeatMs` (30 s by DEFAULT, which is what
    beats the server's 120 s idle timeout in `web/upgrade`) and auto-reconnect
    after a close with no opts — plus the two opt-outs (`{heartbeatMs:0}`,
-   `{reconnect:false}`). Against the pre-heartbeat client, the three default
-   claims fail and only the two opt-outs pass — which is the point.
+   `{reconnect:false}`), and the SESSION id (`live-sid`) that makes a reconnect
+   RESUME the server-side session instead of re-mounting it: it rides on every
+   socket URL and is identical across a reconnect, while a fresh `connect()`
+   mints a new one. Against the pre-heartbeat client, the three default claims
+   fail and only the two opt-outs pass — which is the point.
 
 ## Run it
 
@@ -43,7 +46,7 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `8 passed` (3 differ + 5 lifecycle).
+Expected: `10 passed` (3 differ + 7 lifecycle).
 
 ## Why not Phoenix here
 

@@ -104,3 +104,35 @@ test("reconnect: {reconnect:false} opts out", async ({ page }) => {
   await page.waitForTimeout(1200);         // > the 500ms first backoff
   expect(await page.evaluate(() => window.__sockets.length)).toBe(1);
 });
+
+// ── the session id ───────────────────────────────────────────────────
+//
+// The server keys the SESSION (locals, last-seen tree, subscriptions) on
+// `live-sid`, so a reconnect resumes instead of re-mounting. Two things have
+// to hold for that: the id is on every socket URL, and it is the SAME one
+// across a reconnect of the same page load — a fresh id per reconnect would
+// be a fresh session, which is the bug this exists to prevent.
+
+test("session: every socket URL carries the sid, identical across a reconnect", async ({ page }) => {
+  await boot(page);
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const first = await page.evaluate(() => window.__sockets[0].url);
+  expect(first).toMatch(/[?&]live-sid=[0-9a-f]{32}/);
+  await page.evaluate(() => window.Live.ws.close());
+  await page.waitForFunction(() => window.__sockets.length === 2, null, { timeout: 5000 });
+  const second = await page.evaluate(() => window.__sockets[1].url);
+  expect(second).toBe(first);
+});
+
+test("session: a fresh connect() mints a NEW sid (a reload is a new session)", async ({ page }) => {
+  await boot(page);
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const first = await page.evaluate(() => window.__sockets[0].url);
+  const other = await page.evaluate(() => {
+    var before = window.__sockets.length;
+    window.Live.connect({ root: document.getElementById("live-root"), url: "ws://fake/ws" });
+    return window.__sockets[before].url;
+  });
+  expect(other).not.toBe(first);
+  expect(other).toMatch(/[?&]live-sid=[0-9a-f]{32}/);
+});
