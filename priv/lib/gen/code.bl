@@ -1,0 +1,304 @@
+; gen/code.bl — text → verified beam-lisp fn, interned and callable. SPIKE.
+;
+; The loop, at spike scale:
+;
+;   doc (+ needed arity) ─► prompt ─► LLM ─► extraction ─► battery ─► intern ─► fn
+;    ▲                                    │                  │
+;    └── repair message ◄─────────────────┴──────────────────┘ (retries)
+;
+; Battery (spike tiers): parse (exactly one form, head defn) → ARITY (when the
+; caller supplied args, the defn's parameter list — read statically off the
+; form — must accept that count; a mismatch is a repair, never a runtime
+; arity crash) → compile+intern in the scratch ns gen.generated (a compile
+; failure IS the undefined-var battery). The full design (PLAN-129) adds
+; types, codebase facts, semantic dup, and z3 props ahead of interning.
+;
+; NO MEMO on purpose: the same doc with different call args is a DIFFERENT
+; request (an arity-1 memo nearly answered an arity-2 call — BUG-2026-09-18).
+; Caching, when it returns, keys on the normalized spec, not the doc string.
+;
+; Try:
+;   bl run examples/gen/repl.bl
+;   user=> (gen/call "square of a number" 7)
+;   49
+
+(ns gen.code
+  (:require [gen.llm :as llm]
+            [typed]))
+
+(def ^:private scratch-ns "gen.generated")
+
+(def ^:private max-attempts 3)
+
+(def primer
+  (str "beam-lisp is a Clojure-shaped Lisp for the BEAM. It is NOT Clojure.\n"
+       "Rules:\n"
+       "- Respond with EXACTLY ONE (defn name [args] body) form. No prose, no markdown fences, no docstring.\n"
+       "- Available core fns: + - * / mod inc dec min max = not= < > <= >= and or not\n"
+       "  str subs count first second last rest nth get get-in assoc dissoc update conj into\n"
+       "  map filter remove reduce apply when if cond let do loop recur doseq -> ->>\n"
+       "  zero? pos? neg? even? odd? nil? some? empty? contains? sort reverse distinct take drop repeat\n"
+       "- These do NOT exist: mapv, filterv, juxt, clojure.string anything.\n"
+       "- {} is a MAP literal. Tuples are built: (tuple :ok x). You will not need tuples.\n"
+       "- Host interop looks like (Module/function arg …), e.g. (String/upcase s). Avoid it unless asked.\n"
+       "- Recursion uses (loop [bindings] … (recur values)). No lazy infinite seqs.\n"
+       "- Multiple arities: (defn f ([x] …) ([x y] …)). Variadic: (defn f [x & rest] …).\n"
+       "- Predicates end in ?, names are kebab-case.\n"))
+
+;; ── extraction: text → one defn's source ────────────────────────────────
+
+(defn- ws? [ch] (contains? #{" " "\n" "\t" "\r"} ch))
+
+(defn- first-form-src
+  "The source of the first balanced form starting at index `i` of `s`
+   (which must point at an opening paren). String-, escape- and comment-aware.
+   Returns nil when the form never closes."
+  [s i]
+  (let [n (count s)]
+    (loop [j i, depth 0, instr false, esc false, comment false]
+      (if (>= j n)
+        nil
+        (let [ch (String/at s j)]
+          (cond
+            esc      (recur (inc j) depth instr false comment)
+            comment  (if (= ch "\n")
+                       (recur (inc j) depth instr false false)
+                       (recur (inc j) depth instr false true))
+            instr    (cond
+                       (= ch "\\") (recur (inc j) depth true false false)
+                       (= ch "\"") (recur (inc j) depth false false false)
+                       :else       (recur (inc j) depth true false false))
+            (= ch "\"") (recur (inc j) depth true false false)
+            (= ch ";")  (recur (inc j) depth instr false true)
+            (contains? #{"(" "[" "{"} ch)
+              (recur (inc j) (inc depth) instr false false)
+            (contains? #{")" "]" "}"} ch)
+              (if (= 1 depth)
+                (subs s i (inc j))
+                (recur (inc j) (dec depth) instr false false))
+            :else (recur (inc j) depth instr false false)))))))
+
+(defn- name-of
+  "The var a defn source interns: the token after `(defn` or `(defn-`."
+  [src]
+  (let [priv? (some? (index-of src "(defn-"))
+        start (if priv? (+ (index-of src "(defn-") 6) (+ (index-of src "(defn") 5))
+        after (subs src start)]
+    (loop [i 0]
+      (cond
+        (>= i (count after)) nil
+        (ws? (String/at after i)) (recur (inc i))
+        :else
+        (loop [j i]
+          (if (or (>= j (count after))
+                  (ws? (String/at after j))
+                  (contains? #{"(" ")" "["} (String/at after j)))
+            (subs after i j)
+            (recur (inc j))))))))
+
+(defn- extract
+  "Response text → {:ok {:source src :name n}} | {:error [why]}.
+   Tolerates prose and fences around the form; demands the form exist, parse,
+   be alone, and be a defn."
+  [text]
+  (let [i (index-of text "(defn")]
+    (if (nil? i)
+      {:error ["no (defn …) form in the response"]}
+      (let [src (first-form-src text i)]
+        (if (nil? src)
+          {:error ["the (defn …) form never closes"]}
+          (let [forms (try (to-list (BeamLisp.Reader/read_string src))
+                           (catch e {:parse-failed (str e)}))]
+            (if (:parse-failed forms)
+              {:error [(str "reader: " (:parse-failed forms))]}
+              {:ok {:source src :name (name-of src)}})))))))
+
+;; ── the battery ─────────────────────────────────────────────────────────
+
+(defn- eval-in-scratch
+  "Eval `src` in the scratch ns, restoring the caller's ns afterwards —
+   BeamLisp/eval switches the VM's current ns as a side effect."
+  [src]
+  (let [here (BeamLisp.Env/current_ns)]
+    (try
+      (BeamLisp/eval (str "(ns " scratch-ns ")\n" src))
+      (finally (BeamLisp.Env/in_ns here)))))
+
+(defn- node-items [n] (to-list (typed/node-items n)))
+(defn- node-tag   [n] (typed/node-tag (typed/node-form n)))
+(defn- node-name  [n] (typed/node-name (typed/node-form n)))
+
+(defn- amp-index
+  "Position of `&` in a param-name seq, else nil. (index-of is string-only.)"
+  [names]
+  (loop [ns names, i 0]
+    (cond (empty? ns) nil
+          (= "&" (first ns)) i
+          :else (recur (rest ns) (inc i)))))
+
+(defn- params-info
+  "A params VECTOR node → {:count n :variadic? bool}: fixed parameter count,
+   and whether `& rest` follows. `count` excludes `&` and the rest symbol, so
+   a variadic fn accepting [x & rest] reports {:count 1 :variadic? true}."
+  [pnode]
+  (let [names (map node-name (node-items pnode))
+        amp (amp-index names)]
+    (if (nil? amp)
+      {:count (count names) :variadic? false}
+      {:count amp :variadic? true})))
+
+(defn- arities-of
+  "The arities a defn source accepts, read STATICALLY off its form (no eval):
+   {:fixed #{n …} :variadic-min nil|n}. Single-clause, multi-clause
+   ([x] …) ([x y] …), docstring, and variadic forms all read."
+  [src]
+  (let [form (first (to-list (BeamLisp.Reader/read_string src)))
+        items (node-items form)
+        body (drop 2 items)                       ; defn, name
+        body (if (and (not (empty? body))
+                      (= :scalar (node-tag (first body))))
+                 (rest body) body)]               ; docstring
+    (if (empty? body)
+      {:fixed #{} :variadic-min nil}
+      (if (= :vector (node-tag (first body)))
+        (let [pi (params-info (first body))]
+          {:fixed (if (:variadic? pi) #{} #{(:count pi)})
+           :variadic-min (if (:variadic? pi) (:count pi) nil)})
+        (reduce (fn [acc clause]
+                  (let [pi (params-info (first (node-items clause)))]
+                    {:fixed (if (:variadic? pi)
+                              (:fixed acc)
+                              (conj (:fixed acc) (:count pi)))
+                     :variadic-min (if (:variadic? pi)
+                                     (:count pi)
+                                     (:variadic-min acc))}))
+                {:fixed #{} :variadic-min nil}
+                body)))))
+
+(defn- arity-check
+  "When the caller supplied N args, the defn must accept N. Returns nil when
+   acceptable (or when no requirement was given), an explanation otherwise —
+   the exact text the repair message shows the LLM."
+  [src needed]
+  (if (nil? needed)
+    nil
+    (let [a (arities-of src)]
+      (if (or (contains? (:fixed a) needed)
+              (and (some? (:variadic-min a)) (>= needed (:variadic-min a))))
+        nil
+        (str "the function will be called with exactly " needed " argument(s), "
+         "but your defn accepts "
+         (if (empty? (:fixed a))
+           (if (some? (:variadic-min a))
+             (str "only " (:variadic-min a) " or more (variadic)")
+             "none")
+           (str "only arities " (pr-str (sort (:fixed a)))
+                (if (some? (:variadic-min a))
+                  (str " plus " (:variadic-min a) " or more (variadic)")
+                  "")))
+         ". Provide a variant whose parameter list accepts " needed " argument(s).")))))
+
+(defn- compile-check
+  "Compile+intern `src` in the scratch ns. A bl compile failure covers the
+   undefined-var tier of the full battery. Returns nil on success, an error
+   string on failure."
+  [src]
+  (try
+    (eval-in-scratch src)
+    nil
+    (catch e (str e))))
+
+(defn- battery
+  "Spike battery: the reader ran at extraction; here ARITY (static) then
+   COMPILE are the gates. Returns {:ok nil} | {:error [why]}."
+  [src needed]
+  (if-let [why (arity-check src needed)]
+    {:error [why]}
+    (if-let [err (compile-check src)]
+      {:error [(str "compile: " err)]}
+      {:ok nil})))
+
+;; ── the loop ────────────────────────────────────────────────────────────
+
+(defn- messages-for [doc needed prior]
+  (let [requirement (if (nil? needed)
+                      ""
+                      (str "\nIt will be called with exactly " needed " argument(s); "
+                           "its parameter list must accept that many."))
+        first-user (str "Write a beam-lisp defn for: " doc requirement)]
+    (if (nil? prior)
+      (list {:role "system" :content primer}
+            {:role "user" :content first-user})
+      (list {:role "system" :content primer}
+            {:role "user" :content first-user}
+            {:role "assistant" :content (:answered prior)}
+            {:role "user" :content
+             (str "That failed to load in beam-lisp:\n"
+                  (first (:errors prior))
+                  "\nFix it. Respond with exactly one corrected (defn …) form, nothing else.")}))))
+
+(defn candidate
+  "doc → {:source :name :fn :attempts} | {:error …}.
+
+   `ask-fn` : messages → {:ok text} | {:error e} — the pluggable LLM seam
+   (default gen.llm/chat); tests pass a stub.
+   `needed` : when the fn will be called with a known argument count, pass it —
+   the prompt states it up front and the battery refuses non-conforming arities."
+  ([doc] (candidate doc llm/chat nil))
+  ([doc ask-fn] (candidate doc ask-fn nil))
+  ([doc ask-fn needed]
+   (loop [attempt 1, prior nil]
+     (let [r (ask-fn (messages-for doc needed prior))]
+       (if (:error r)
+         {:error {:llm (:error r) :attempts attempt}}
+         (let [text (:ok r)
+               ex (extract text)]
+           (if (:error ex)
+             (if (< attempt max-attempts)
+               (recur (inc attempt) {:answered text :errors (:error ex)})
+               {:error {:extract (:error ex) :attempts attempt :answered text}})
+             (let [src (:source (:ok ex))
+                   b (battery src needed)]
+               (if (:error b)
+                 (if (< attempt max-attempts)
+                   (recur (inc attempt) {:answered text :errors (:error b)})
+                   {:error {:battery (:error b) :attempts attempt :source src}})
+                 (let [name (:name (:ok ex))
+                       f (eval-in-scratch name)]
+                   {:source src :name name :fn f :attempts attempt}))))))))))
+
+(defn- fn-or-throw [c]
+  (if (:error c)
+    (throw (str "gen: " (pr-str (:error c))))
+    (:fn c)))
+
+(defn f
+  "doc → the generated, verified, interned fn. Every call generates anew —
+   caching was removed (see the header); it will return keyed on the
+   normalized spec, never on the doc string."
+  [doc]
+  (fn-or-throw (candidate doc)))
+
+(defn call
+  "doc, args… → generate a fn for the doc, verify it ACCEPTS this many args
+   (the battery's arity tier), then apply it. Generation happens on every
+   call; a wrong arity is a repair conversation with the LLM, never your
+   crash."
+  [doc & args]
+  (apply (fn-or-throw (candidate doc llm/chat (count args))) args))
+
+(defn defn!
+  "doc → generate, verify, intern into gen.generated. Returns the name."
+  [doc]
+  (let [c (candidate doc)]
+    (if (:error c)
+      (throw (str "gen: " (pr-str (:error c))))
+      (do (println (str ";; interned gen.generated/" (:name c) " (attempt " (:attempts c) ")"))
+          (println (:source c))
+          (:name c)))))
+
+(defn spec
+  "doc → the spike's spec: just the doc. The full spec-map (:args :ret :props)
+   arrives with gen/spec.bl (PLAN-129)."
+  [doc]
+  {:doc doc})
