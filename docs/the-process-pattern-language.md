@@ -503,11 +503,20 @@ that add edges *out of* `⊥`.
   receives `[:"ETS-TRANSFER" tid from data]` when an owner dies, holds the
   table, and returns it with `:ets.give_away/3` when a new owner asks. The
   table's lifetime is then tied to no single process.
-- **Protocol.** `ets.new(name, [type, :public, :named_table, {:heir, heir-pid, nil}])`
-  once, from the owner's init; `[:"ETS-TRANSFER", tid, from, data]` arrives in
+- **Protocol.** `ets.new(name, [type, :public, :named_table, {:heir, heir-pid, KEY}])`
+  once, from the owner's init; `[:"ETS-TRANSFER", tid, from, KEY]` arrives in
   the heir; `:ets.give_away(tid, new-owner, nil)` hands it back. **The atom is
   QUOTED** — unquoted, `:ETS-TRANSFER` is the *expression* `:ETS - TRANSFER`,
   which compiles and never matches.
+- **The HeirData carries the table's KEY, not `nil`.** The heir files what it
+  holds by the key it was handed at creation, because the tid cannot tell it:
+  `:ets.info(tid, :name)` answers `:undefined` for every unnamed table, and
+  `datom/store-ets` makes unnamed tables. A heir that filed by name would lose
+  exactly the tables whose names were never written down. (`db_connection`'s
+  HeirData is `{lock, ref, checkin_time}` for the same reason: an heir has to be
+  told what it will later have to recognise.) The successor's data on
+  `give_away` is `nil` — the next holder needs no key, because it is being told
+  which table it is receiving.
 - **Guarantee.** Three, and each was a measured hole. (1) ONE CREATOR: the table
   is created by its owner and by nothing else, so no caller can own it and no
   "create it if missing" branch exists to be reached. (2) AN HEIR AT CREATION,
@@ -515,6 +524,19 @@ that add edges *out of* `⊥`.
   acquiring the table does not return until this table's owner holds it — an heir
   holding it is the designed state *between* two owners, but acquisition is the
   call that ends that window, so a window still open is an error.
+
+  Two smaller traps live in the same code, and both are the same shape as the
+  quoted atom — silence where an error was expected:
+
+  - "is it missing?" must be asked of the RIGHT absence. ETS answers `:undefined`
+    for a table that is not there and `Process.whereis` answers `nil` for a
+    process that is not there: two vocabularies, one question. A predicate that
+    knows only one of them reports a live table as gone (or the reverse) and the
+    code path taken is always the wrong one.
+  - `give_away` may answer "I do not hold that" — the heir is asked for a key it
+    does not have whenever an owner dies twice over or a name is reused before
+    the transfer lands. That is a state to report (`:nothing`), not a crash and
+    not a table to invent.
 - **API.** ✅ `proc/hold` · `proc/owner` · `proc/tid` · `proc/live?`
   (`priv/std/proc/table.bl`).
 - **Grounding.** The scheduler's store (`proc.sched`); `datom/store-ets`
