@@ -10,6 +10,11 @@
 ;   · ports    — every live claim, whoever made it, with the address a human keeps
 ;   · tasks    — what the project declares (env.bl)
 ;   · index    — the code index's phase, off vm.index's ETS row (never a call)
+;   · schedules — every declared recurrence and where it stands, off the store
+;   · ticker   — the ONE live thing in that store-only view: the wheel process,
+;                drawn as a monitor's fact and never asked anything
+;   · deep     — ONE declaration in full — its recent occurrences, its refusals,
+;                its verify verdict — attached to its row only when asked for
 ;   · image    — the reload read-model, when the language side has it loaded
 ;
 ; identity/image are reached through the runtime, not reimplemented: the
@@ -18,23 +23,32 @@
 
 (ns vm.inspect
   (:require [vm.paths :as paths] [vm.ports :as ports] [vm.gateway :as gateway]
-            [vm.index :as index] [bl.env :as env] [proc.sched :as sched]))
+            [vm.index :as index] [bl.env :as env] [datom :as datom]
+            [proc.sched :as sched]))
 
 ;; ── the model ───────────────────────────────────────────────────────────────
 
 (defn model
   "The read-model for the running daemon. Cheap enough per request: one ETS read
-   for the index, one dir scan for ports, one env.bl read for tasks, the reload
-   read-model only when already loaded. `opts` may carry {:root … :started-at …
-   :pid …} from the session; defaults resolve from the process/cwd."
+   for the index, one dir scan for ports, one env.bl read for tasks, one store
+   read for the schedules and their wheel, the reload read-model only when it is
+   already loaded. `opts` may carry {:root … :started-at … :pid …} from the
+   session — and `{:deep [server id]}` to attach ONE declaration's deep row —
+   and defaults resolve from the process/cwd."
   ([] (model {}))
   ([opts]
-   (let [root (or (get opts :root) (BeamLisp/cwd))]
+   (let [root (or (get opts :root) (BeamLisp/cwd))
+         now (erlang/system_time :millisecond)
+         rows (schedules-of)]
      {:identity (identity-of opts root)
       :ports (ports-of)
       :tasks (tasks-of root)
       :index (index/progress)
-      :schedules (schedules-of)
+      :schedules (with-deep rows (get opts :deep))
+      ;; the ticker is the ONE field that is not a store fact, and it is drawn
+      ;; from the runtime's own name table rather than by asking the wheel —
+      ;; see `ticker-of`.
+      :ticker (ticker-of rows now)
       :image (image-of)})))
 
 (defn- schedules-of
@@ -51,6 +65,227 @@
   []
   (try (sched/schedules)
        (catch _e [])))
+
+;; ── the deep row ────────────────────────────────────────────────────────────
+;;
+;; The summary row answers "where does this stand?". The deep row answers "what
+;; has it been DOING?" for ONE declaration: its recent occurrences with their
+;; outcomes, the states it has refused in, and the `verify` verdict when the row
+;; carries one.
+;;
+;; It is a READING, not a feature — every fact is already in the store.
+;; `proc.sched` writes the outcome INTO the declaration's own row (the occurrence
+;; id, the run/fail counters, the error) and datom never forgets a value an
+;; attribute held, so one entity's history IS the schedule's log. A refusal is a
+;; `:refused` state — a fact, not an absent row — and a verdict, when one is
+;; written, is the row's `:schedule/verify`. Nothing here invents a second
+;; store, adds a writer, or asks the scheduler anything (FUP-101, FUP-106).
+
+(def DEEP-LIMIT
+  "How many occurrences and refusals the deep row shows, most recent first.
+
+   Bounded on purpose: a declaration that has fired forty thousand times must
+   render the same number of lines as one that has fired six, or a pane stops
+   being a pane and becomes a log viewer. The older facts are not lost — they are
+   datoms, and `as-of` reaches them — they are simply not what a reader opened
+   this row for."
+  5)
+
+(defn- last-n
+  "The last `n` items of `xs`, in order. The prelude has `take`/`drop` but no
+   `take-last`, and `(drop (- (count xs) n) xs)` still realizes the whole
+   sequence, so the tail is taken by reversing twice — the shape `reload.monitor`
+   already uses for its journal window."
+  [xs n]
+  (reverse (take n (reverse xs))))
+
+(defn- schedule-key [server id] (str (name server) "/" (name id)))
+
+(defn- tx-at
+  "The wall-clock instant a transaction was recorded. Every datom carries its
+   `t`, and every transaction writes `:db/txInstant` about itself — so an
+   occurrence's TIME is a store fact rather than something this file has to
+   watch for as it happens."
+  [d t]
+  (get (datom/pull d [:db/txInstant] t) :db/txInstant))
+
+(defn- occurrence-due
+  "The epoch-ms a stored occurrence id names. The id is `\"<schedule-id>@<due>\"`
+   — `proc.sched`'s Idempotency Key — and a schedule id may itself contain an
+   `@`, so the split is on the LAST one. Nil for an id that carries no due, so a
+   malformed row degrades to a missing number rather than a crashed pane."
+  [occ]
+  (let [parts (split occ "@")]
+    (if (> (count parts) 1)
+      (erlang/binary_to_integer (last parts))
+      nil)))
+
+(defn- fail-txs
+  "The transactions in which this declaration recorded a FAILED occurrence.
+
+   `proc.sched` writes `:schedule/fails` only in the failure arm of a fire, in the
+   SAME transaction as the occurrence's `:last-occ` — so the transaction id is
+   the join between an occurrence and its outcome. A count of zero is the row's
+   boot write and is excluded, or it would mark the first occurrence failed."
+  [d eid]
+  (filter (fn [c] (and (:added c) (pos? (or (:value c) 0))))
+          (datom/changes d eid :schedule/fails)))
+
+(defn- occurrences
+  "The last DEEP-LIMIT occurrences of one declaration, NEWEST FIRST.
+
+   Newest first because the row exists to answer `what just happened?`, and the
+   newest occurrence is the only one a reader can still act on. The order is
+   asserted in `test/bl/vm/inspect_deep_test.bl`, because it is the half of this
+   function a caller cannot infer from its shape.
+
+   A FAILED occurrence's reason is read AT its transaction (`value-at`), not from
+   the change list: datom's no-op rule means a body that fails the same way twice
+   writes `:last-error` ONCE, so the same message has no second change to be
+   found in. The value in force at `t` is the fact either way.
+
+   A `:run-all` catch-up burst runs several occurrences in ONE transaction and
+   leaves only the last one's id in the row, so a burst is one row here. That is
+   not a rounding error — it is the honest reading of what the store kept."
+  [d eid]
+  (let [fails (fail-txs d eid)
+        changed (filter (fn [c] (:added c)) (datom/changes d eid :schedule/last-occ))]
+    (vec
+      (reverse
+        (map (fn [c]
+               (let [failed (some (fn [f] (= (:t f) (:t c))) fails)]
+                 {:occurrence (:value c)
+                  :due (occurrence-due (:value c))
+                  :at (tx-at d (:t c))
+                  :outcome (if failed :failed :ok)
+                  :reason (if failed
+                            (datom/value-at d (:t c) eid :schedule/last-error)
+                            nil)}))
+             (last-n changed DEEP-LIMIT))))))
+
+(defn- refusals
+  "Every state this declaration REFUSED in, newest first, with the reason.
+
+   A refusal is a FACT (proc.sched/refuse!): a wheel that cannot turn writes a
+   `:refused` row, so `this project declares nothing` and `this project declares
+   something that cannot turn` are told apart — the whole reason the row exists
+   rather than being merely absent."
+  [d eid]
+  (let [refused (filter (fn [c] (and (:added c) (= :refused (:value c))))
+                        (datom/changes d eid :schedule/state))]
+    (vec
+      (reverse
+        (map (fn [c]
+               {:at (tx-at d (:t c))
+                :reason (datom/value-at d (:t c) eid :schedule/last-error)})
+             (last-n refused DEEP-LIMIT))))))
+
+(defn- entity-of [server id]
+  (let [d (datom/db (sched/conn))]
+    (if-let [m (datom/pull d '[*] [:schedule/key (schedule-key server id)])]
+      {:db d :eid (get m :db/id) :attrs m}
+      nil)))
+
+(defn deep-row
+  "ONE declaration in full: its recent occurrences with their outcomes, the
+   states it refused in, and the `verify` verdict the declaration carries — nil
+   when it carries none, so a face draws no verify line rather than an empty one.
+
+   `server` and `id` name the schedule exactly as `/schedules` does. Nil for a
+   declaration the store has never heard of, so a caller renders `no such
+   schedule` instead of an empty row that reads like a schedule that never ran.
+
+   READ-ONLY BY CONSTRUCTION and PROCESS-FREE, like `schedules` and for the same
+   reason (FUP-101): every read is built from `(datom/db …)`, a basis, so this
+   path cannot write and never queues behind the scheduler's writer — and the
+   scheduler may be dead, restarting, or mid-fire while the row is answered.
+
+   What it reads is bounded too, and in the only way this store can offer it: the
+   row SHOWS at most DEEP-LIMIT occurrences and DEEP-LIMIT refusals, and every
+   read is this ONE declaration's own change history (the EAVT prefix for one
+   entity and one attribute) — never a scan across the store, and never a read of
+   the whole dataset for every row in the pane."
+  [server id]
+  (try
+    (if-let [e (entity-of server id)]
+      (let [d (get e :db) eid (get e :eid) attrs (get e :attrs)]
+        {:key (schedule-key server id)
+         :server (name server)
+         :id (name id)
+         :state (get attrs :schedule/state)
+         :occurrences (occurrences d eid)
+         :refusals (refusals d eid)
+         :verify (get attrs :schedule/verify)})
+      nil)
+    (catch _e nil)))
+
+(defn- with-deep
+  "Attach the deep row to ONE schedule when the caller asked for one — opts
+   `{:deep [server id]}`.
+
+   Not attached by default: a history window is a store read per declaration, and
+   a pane that paid for every row's whole past on every render would slow down
+   the work it reports (the `gateway/live` lesson, `the-clock-and-the-wheel` §6.1)."
+  [rows deep]
+  (if (or (nil? deep) (< (count deep) 2))
+    rows
+    (let [d (deep-row (first deep) (second deep))]
+      (map (fn [r]
+             (if (and (= (name (first deep)) (:server r))
+                      (= (name (second deep)) (:id r)))
+               (assoc r :deep d)
+               r))
+           rows))))
+
+;; ── the ticker line ─────────────────────────────────────────────────────────
+;;
+;; Every other fact here is in the store, and a store-only view is peaceful: it
+;; cannot be lied to by a process's in-memory opinion. The TICKER is the one live
+;; thing in it — the wheel that turns the declarations — and the question a
+;; reader has about a wheel is not `what did it write?` but `is it still there?`.
+;;
+;; So it is drawn as a MONITOR's fact and never asked. `Process/whereis` reads the
+;; runtime's own name table, and ERTS frees a registered name the instant its
+;; process dies: a name that resolves IS a liveness fact the VM maintains for us,
+;; and nothing is sent to the process — a wheel that is blocked, being killed, or
+;; mid-restart answers a call with nothing at all, which is why a store-only pane
+;; must not make one.
+;;
+;; The `since when` half can only come from the store: a store-only view cannot
+;; see a process's birth. What it CAN state is when the wheel last wrote, so
+;; `:last-fired-ms` is the newest occurrence the store holds for that server —
+;; a fact already in the rows, at no extra read.
+
+(defn- ticker-of [rows now]
+  (let [servers (distinct (map (fn [r] (:server r)) rows))]
+    (vec
+      (map (fn [srv]
+             (let [mine (filter (fn [r] (= srv (:server r))) rows)
+                   ;; `op-name` is proc.sched's OWN derivation of the name a wheel
+                   ;; answers to; asking it again here keeps ONE definition of the
+                   ;; handle the pane's buttons already address.
+                   pid (Process/whereis (sched/op-name srv))
+                   ;; The newest occurrence the row holds, read from the id it is
+                   ;; stored as. `:last-run` would do for a schedule that
+                   ;; SUCCEEDS, but it is written only on the success arm — a
+                   ;; wheel whose every run fails would read `never fired`, which
+                   ;; is the one thing it is certainly not. `:last-occ` is written
+                   ;; on BOTH arms, so it is the honest `last heard from`.
+                   fired (reduce (fn [acc r]
+                                   (let [lo (:last-occ r)
+                                         d (if (some? lo) (occurrence-due lo) nil)]
+                                     (if (and (erlang/is_integer d)
+                                              (or (nil? acc) (> d acc)))
+                                       d acc)))
+                                 nil mine)]
+               {:server srv
+                :wheel (str "bl-sched/" srv)
+                :pid (if (nil? pid) nil (pr-str pid))
+                :alive (some? pid)
+                :declarations (count mine)
+                :last-fired-ms fired
+                :last-fired-age-ms (if (nil? fired) nil (- now fired))}))
+           servers))))
 
 (defn- identity-of [opts root]
   (let [started (get opts :started-at)
@@ -147,6 +382,7 @@
       "tasks" (to-list (map stringify (:tasks m)))
       "index" (stringify (:index m))
       "schedules" (to-list (map stringify (:schedules m)))
+      "ticker" (to-list (map stringify (:ticker m)))
       "image" (if (:image m) (stringify (:image m)) nil)})))
 
 (defn schedules-json
@@ -171,6 +407,7 @@
          (render-ports (:ports m)) "\n"
          (render-tasks (:tasks m)) "\n"
          (render-schedules (:schedules m))
+         (render-ticker (:ticker m))
          (render-index (:index m)) (render-image (:image m)))))
 
 (defn- in-str [n]
@@ -178,20 +415,78 @@
         (neg? n) (str (quot (- n) 1000) "." (rem (quot (- n) 100) 10) "s OVERDUE")
         :else (str (quot n 1000) "." (rem (quot n 100) 10) "s")))
 
+(defn- age-str
+  "How long ago `n` milliseconds were, at the pane's own tenth-of-a-second
+   resolution. `in-str` reads FORWARD (`in 40s`); this is its mirror for a fact
+   in the past, and `—` for a fact that is not there at all."
+  [n]
+  (if (and (erlang/is_integer n) (not (neg? n)))
+    (str (quot n 1000) "." (rem (quot n 100) 10) "s ago")
+    "—"))
+
+(defn- render-ticker
+  "The wheel(s) that turn the declarations — the ONE non-store line in this
+   render, drawn from the runtime's name table (see `ticker-of`)."
+  [ticker]
+  (if (empty? ticker)
+    "\n  ticker        (no wheel declared in this VM)"
+    (join ""
+      (map (fn [t]
+             (str "\n  ticker        " (:wheel t) "  "
+                  (if (:alive t)
+                    (str "alive  pid " (:pid t))
+                    "dead  (nothing answers to that name)")
+                  "  " (:declarations t)
+                  (if (= 1 (:declarations t)) " declaration" " declarations")
+                  (if (nil? (:last-fired-age-ms t))
+                    "  never fired"
+                    (str "  last fired " (age-str (:last-fired-age-ms t))))))
+           ticker))))
+
+(defn- render-deep
+  "The deep row's lines, under its schedule line. Bounded by construction:
+   `:occurrences` and `:refusals` are already at most DEEP-LIMIT each, so a
+   declaration that has run for a year costs the same lines as one that ran
+   twice. Nothing is drawn for a part the declaration does not have — an empty
+   verify line would read as a verdict."
+  [deep now]
+  (if (nil? deep)
+    ""
+    (str
+      "\n  deep          " (:server deep) "/" (:id deep)
+      (if (nil? (:state deep)) "" (str "  " (name (:state deep))))
+      "  (newest first, " (count (:occurrences deep)) " of " DEEP-LIMIT
+      " occurrences kept)"
+      (join ""
+        (map (fn [o]
+               (str "\n  occurrence    " (age-str (if (:at o) (- now (:at o)) nil))
+                    "  " (name (:outcome o))
+                    (if (:due o) (str "  due " (:due o)) "")
+                    (if (:reason o) (str "  " (:reason o)) "")))
+             (:occurrences deep)))
+      (join ""
+        (map (fn [r]
+               (str "\n  refusal       " (age-str (if (:at r) (- now (:at r)) nil))
+                    "  " (:reason r)))
+             (:refusals deep)))
+      (if (nil? (:verify deep)) "" (str "\n  verify        " (:verify deep))))))
+
 (defn- render-schedules [rows]
-  (cond
-    (empty? rows) "\n  schedules     (none declared in this VM)"
-    :else
-      (str "\n  schedules     " (count rows) " declared"
-           (join "\n"
-             (map (fn [r]
-                    (str "\n  schedule      " (:server r) "/" (:id r)
-                         "  " (name (get r :state :active))
-                         "  " (:runs r) " runs"
-                         (if (pos? (or (:fails r) 0)) (str ", " (:fails r) " failed") "")
-                         (if (nil? (:in-ms r)) "" (str "  in " (in-str (:in-ms r))))
-                         (if (:live r) "" "  (no scheduler running)")))
-                  rows)))))
+  (let [now (erlang/system_time :millisecond)]
+    (cond
+      (empty? rows) "\n  schedules     (none declared in this VM)"
+      :else
+        (str "\n  schedules     " (count rows) " declared"
+             (join ""
+               (map (fn [r]
+                      (str "\n  schedule      " (:server r) "/" (:id r)
+                           "  " (name (get r :state :active))
+                           "  " (:runs r) " runs"
+                           (if (pos? (or (:fails r) 0)) (str ", " (:fails r) " failed") "")
+                           (if (nil? (:in-ms r)) "" (str "  in " (in-str (:in-ms r))))
+                           (if (:live r) "" "  (no scheduler running)")
+                           (render-deep (:deep r) now)))
+                    rows))))))
 
 (defn- to-int [n] (if (erlang/is_integer n) n 0))
 (defn- cnt [s k] (to-int (get s k)))
