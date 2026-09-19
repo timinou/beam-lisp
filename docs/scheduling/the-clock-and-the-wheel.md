@@ -957,6 +957,48 @@ hand today.
 any app registers a schedule; the pane shows every claim, whoever made it. The
 stale-entry cleanup is itself a schedule, which is a pleasing bootstrap.
 
+### 5.2.1 As built (P3) — the schedules half
+
+Landed: `vm.inspect/model` gains `:schedules`, so the field appears in
+`bl daemon status` (the terminal face), the HTML page, `GET /model`, and a new
+`GET /schedules` at once. The op path is
+`POST /schedules/<server>/<id>/<op>` for `pause` · `resume` · `run-now`, behind
+the same `x-bl-token` guard `/intent` uses.
+
+```
+Schedules            (the model's field — every face renders THIS)
+  kitchen/prep    active · 7 runs · in 40s                  [resume][pause][run now]
+  kitchen/open    active · 1 run · — a one-shot with nothing left to run
+  audits/rebuild  paused · 3 runs · 2 failed · 12s overdue  (no scheduler running)
+```
+
+Four decisions the sketch did not have, each from something that broke:
+
+| | |
+|---|---|
+| **`<server>` is in the path** | a schedule's identity is `(server, id)`, not `id`: two servers may declare the same id, and the store already keys on the pair. The sketch's `/schedules/<id>/…` would have addressed an ambiguous name |
+| **503, not 404, when nothing is listening** | the request was well formed and understood; the WORLD could not satisfy it. A page that cannot tell those apart sends its reader looking in the wrong place |
+| **the row is written at BOOT** | not on the first fire. A pane that showed only what has RUN hides exactly the schedule an operator came for — the one that has never fired |
+| **the scheduler announces its own name** | `:bl-sched/<server>`, derived from the declaration, registered by the scheduler's own init (the `vm.exec` idiom). A pane has only the store, so the name must be a FUNCTION of the declaration. A collision is refused with a message naming the holder, because two schedulers for one declaration are two writers of one fact — measured: that refusal is what caught a leaked scheduler in an example |
+
+**The read path cannot write, and that is proven rather than intended.**
+`proc/schedules` is built from `datom/db` — a basis — so it never touches the
+writer. `test/bl/vm/schedules_test.bl` renders 50 times and requires the store's
+basis not to move; with the scheduler left running the number it catches is the
+TICKER's, not the pane's, which is why the test stops it first. See FUP-101.
+
+**Honest limit of "the two faces agree".** Each face builds the model when
+asked, so with a ticker firing between two reads the numbers genuinely differ —
+what the covenant promises is that both faces describe ONE shape and agree about
+a state, not that two reads a millisecond apart are simultaneous. The example's
+first version of this comparison failed on exactly that, which is the useful
+form of the caveat.
+
+Still open in the pane: `:jobs` (awaiting `defqueue`), the deep row
+(graph · invariant · `verify` · event history — `datom/q history` on the
+schedule's own entity), the ticker line, and the daemon's four hand-rolled
+schedulers as first tenants (P4).
+
 ---
 
 ## 6. Challenges — where this could be locally coherent and systemically wrong
@@ -1048,7 +1090,10 @@ P2c priv/std/proc/sched.bl + priv/lib/datom/store-ets.bl — datom over ETS   �
       UNNAMED table so the handle cannot be re-derived — it must be published.
       (a) heir in store-ets (b) publish the conn (c) swap the four functions.
       The 22 sched assertions are written against BEHAVIOUR, so green = proven.
-P3  vm.inspect :schedules  →  vm.http pane + GET /schedules + paused/run-now POSTs
+P3  ✅ vm.inspect :schedules → the terminal + HTML + JSON faces, GET /schedules,
+     and POST /schedules/<server>/<id>/{pause,resume,run-now}; a declared-but-
+     never-run schedule appears (the row is written at boot), and the read path
+     is proven not to write (FUP-101)
       reads the store, so the pane never asks a ticker anything
       acceptance: `bl daemon status` and the page render the SAME numbers
 P4  CUTOVER: the daemon's own cache-prune (manual today) + a stale-port sweep +
