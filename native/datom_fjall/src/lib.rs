@@ -151,6 +151,57 @@ fn fjall_range<'a>(
     Ok(pairs.encode(env))
 }
 
+/// `fjall_range_chunk`: the NEXT `limit` `[k v]` pairs of a bounded scan.
+///
+/// `fjall_range` above returns the WHOLE window in one crossing. On a real
+/// corpus that is 969 016 rows / 1.1 GB in one call (measured: 15.6 s), and
+/// every fjall op runs on ONE dirty-IO scheduler (this host pins `+SDio 1:1`),
+/// so a concurrent point get waits the ENTIRE scan — measured max 3421 ms
+/// against a 0.05 ms median.
+///
+/// The scan is resumable instead of stateful: `start` (inclusive) bounds the
+/// FIRST chunk, `after` (exclusive) the rest — the caller passes the last key
+/// it received. Re-seeking per chunk costs microseconds against a 15 s scan,
+/// and it buys two things the whole-window call cannot: the dirty-IO lane is
+/// RELEASED between chunks (so other ops interleave instead of queueing), and
+/// the transient the NIF materializes is bounded by `limit`, not by the table.
+///
+/// Bounds are INCLUSIVE on both sides for `start`/`stop`, as `fjall_range`
+/// specifies; `after` is the exclusive resume point and wins over nothing —
+/// pass either `start` (first chunk) or `after` (resume), never both.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_range_chunk<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    start: Option<Binary>,
+    after: Option<Binary>,
+    stop: Option<Binary>,
+    limit: usize,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound;
+    let lower = match (&start, &after) {
+        (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
+        (None, Some(b)) => Bound::Excluded(b.as_slice().to_vec()),
+        (None, None) => Bound::Unbounded,
+    };
+    let upper = match &stop {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+
+    let mut pairs: Vec<Term<'a>> = Vec::with_capacity(limit.min(4096));
+    for entry in handle.datoms.range((lower, upper)).take(limit) {
+        let (k, v) = entry.map_err(|e| err(e))?;
+        let kb = to_binary(env, &k)?;
+        let vb = to_binary(env, &v)?;
+        pairs.push(rustler::types::tuple::make_tuple(
+            env,
+            &[kb.to_term(env), vb.to_term(env)],
+        ));
+    }
+    Ok(pairs.encode(env))
+}
+
 /// `-put`: store `value` at `key`.
 ///
 /// The write lands in the journal (WAL, crash-recoverable) and the memtable
