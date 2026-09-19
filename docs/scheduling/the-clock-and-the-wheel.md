@@ -951,6 +951,16 @@ Six decisions, each from something that broke:
   (`:vm-index`), so the verb answers a declaration from a *different* tree with
   the mismatch rather than refreshing the wrong index (FUP-103).
 
+**The domain walkthrough.** `examples/hotel/hotel.bl` runs a hotel on the tier —
+the night ledger on a table with an heir (the owner is killed mid-walkthrough and
+the charges are still there), the front desk as a server with a `tick` clause for
+a wake-up call, housekeeping as a declaration with a clock the file OWNS (one
+round per move of the clock, and a night audit that goes from 0 runs to 1 by
+moving that clock to 03:00), and the pane reading the outcomes out of the store
+without asking any process. The front page (`desk.bl`, loom) is designed and
+unbuilt — FUP-104 names the verbs it needs and the three API facts that cost runs
+to learn, so it is one pass of work rather than a rediscovery.
+
 **A build-environment discovery worth its own line.** `./bl` (the ELF launcher
 at the tree root) runs the **drop's** prebuilt image: `priv/std/bl/*` is
 committed to `Elixir.BeamLisp.Ns.Bl.*.beam` there, so edits to `bl.env`,
