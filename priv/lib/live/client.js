@@ -36,8 +36,8 @@
   // the event data as "ev/id", PERSISTED to localStorage, then sent. It clears
   // only when the server sends ["ack", id]; on reconnect every un-acked frame
   // is replayed. The server dedups by the unique :ev/id, so replay is
-  // exactly-once. Off by default — an app that never sets {outbox:true} keeps
-  // the old volatile behaviour byte-for-byte.
+  // exactly-once. The outbox itself stays opt-in; RECONNECT does not (see
+  // connect()): every socket auto-reconnects unless {reconnect:false}.
   function makeOutbox(key) {
     function load() {
       try { return JSON.parse(window.localStorage.getItem(key) || "[]"); }
@@ -333,9 +333,12 @@
     const root = opts.root || document.getElementById("live-root");
 
     // The outbox is opt-in: {outbox:true} turns on a durable localStorage queue
-    // + auto-reconnect + replay. Without it, the socket keeps its old volatile
-    // behaviour (buffer while CONNECTING, drop when CLOSED, no reconnect).
+    // + replay. RECONNECT is the default: every socket re-opens on close with
+    // backoff ({reconnect:false} restores the old volatile behaviour for hosts
+    // that manage the lifecycle themselves). Without the outbox a dropped
+    // volatile frame is still lost — only durable frames replay.
     var outbox = opts.outbox ? makeOutbox("live:outbox") : null;
+    var reconnect = opts.reconnect !== false;
 
     // `ws` is now MUTABLE — a reconnect swaps in a fresh socket while the event
     // delegation (bound to `root` once, below) keeps firing. `pending` buffers
@@ -392,7 +395,7 @@
       };
       ws.onclose = function () {
         setLive(false);
-        if (outbox) {                              // auto-reconnect with backoff
+        if (reconnect) {                           // auto-reconnect with backoff
           setTimeout(openSocket, reconnectMs);
           reconnectMs = Math.min(reconnectMs * 2, 10000);
         }
