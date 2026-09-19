@@ -1,0 +1,151 @@
+; bench/cache_boundary_bench.bl — Phase-0 probes for PLAN-132 (unified cache substrate).
+; Run: bin/bl run bench/cache_boundary_bench.bl
+;
+; Answers, with numbers:
+;   P1  crossings per small-cell read   (F1: read/1 pays nif_lane + nif_read_fast — expect 2)
+;   P2  reroute rate under CAS load     (fast-lane calibration)
+;   P3  dependency-walk tax             (F5: 2 crossings per embedded handle — expect 2K)
+;   P4  fjall range materialization     (F7: whole-window copies, memory spike per scan)
+;   P5  point-get latency under a       (F8: every fjall op is DirtyIo; this host pins ONE
+;       concurrent range scan            dirty-IO scheduler, so gets queue behind the scan)
+;
+; The op_* counters come from the instrumented lazy_memo NIF (PLAN-132 Phase 0a);
+; BeamLisp.LazyMemo/stats returns them as a diff-able map.
+
+(ns bench.cache-boundary
+  (:require [datom.store-fjall :as fj]))
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+(defn- stats [] (BeamLisp.LazyMemo/stats))
+(defn- delta [s0 s1 k] (- (get s1 k 0) (get s0 k 0)))
+(defn- row [& parts] (println (str "  " (join "  |  " (to-list (mapv str parts))))))
+(defn- pct [sorted q] (nth sorted (min (dec (count sorted)) (quot (* (count sorted) q) 100))))
+
+;; ── P1/P2/P3: the LazyMemo boundary ────────────────────────────────────────
+
+(defn probe-read [n]
+  (let [cell (BeamLisp.LazyMemo/create {:probe :small})
+        _ (BeamLisp.LazyMemo/read cell)                      ; warm
+        s0 (stats) t0 (now-us)
+        _ (doseq [_ (range n)] (BeamLisp.LazyMemo/read cell))
+        t1 (now-us) s1 (stats)]
+    {:n n
+     :us-per-read (/ (* 1.0 (- t1 t0)) n)
+     :read-crossings (+ (delta s0 s1 :op_read) (delta s0 s1 :op_read_fast))
+     :lane-crossings (delta s0 s1 :op_lane)}))
+
+(defn probe-exchange [n]
+  (let [cell (BeamLisp.LazyMemo/create {:probe :cas})
+        _ (doseq [i (range n)]
+            (let [cur (BeamLisp.LazyMemo/read cell)]
+              (BeamLisp.LazyMemo/exchange cell cur {:i i})))
+        s1 (stats)]
+    {:n n
+     :cas-fast (get s1 :op_cas_fast)
+     :cas-dirty (get s1 :op_cas)
+     :reroutes (get s1 :op_reroute)
+     :retries (get s1 :op_retry)}))
+
+(defn probe-deps [k]
+  (let [cells (mapv (fn [_] (BeamLisp.LazyMemo/create 1)) (range k))
+        s0 (stats)
+        _ (BeamLisp.LazyMemo/create {:holders cells})
+        s1 (stats)]
+    {:handles k
+     :dep-resource-crossings (delta s0 s1 :op_dep_resource)
+     :id-crossings (delta s0 s1 :op_id)}))
+
+;; ── P4/P5: the fjall boundary ──────────────────────────────────────────────
+
+(defn- value-of [i] (erlang/term_to_binary {:e i :a :probe/attr :v (str "value-" i) :tx i}))
+(defn- key-of [i] (str "k" i))
+
+(defn load-kv [handle n]
+  (doseq [i (range n)]
+    (fj/fjall-put handle (key-of i) (value-of i)))
+  (fj/fjall-sync handle))
+
+(defn probe-range [handle n]
+  (let [_ (erlang/apply :erlang :garbage_collect (list))
+        mem0 (erlang/apply :erlang :memory (list :total))
+        t0 (now-us)
+        pairs (fj/fjall-range handle nil nil)
+        t1 (now-us)
+        mem1 (erlang/apply :erlang :memory (list :total))
+        cnt (count pairs)]
+    {:rows cnt :of n
+     :ms (/ (* 1.0 (- t1 t0)) 1000.0)
+     :heap-delta-mb (/ (* 1.0 (- mem1 mem0)) 1048576.0)}))
+
+(defn probe-queue [handle n-gets]
+  ; p50/p99 of point-get latency, idle vs while full-window ranges occupy the
+  ; (single, on this host) dirty-IO scheduler. The handshake + head start make
+  ; the overlap deterministic: 40 ranges x ~40ms >> the get loop's runtime.
+  (let [gets (fn []
+               (mapv (fn [i]
+                       (let [t0 (now-us)
+                             _ (fj/fjall-get handle (key-of i))
+                             t1 (now-us)]
+                         (- t1 t0)))
+                     (range n-gets)))
+        idle (sort (gets))
+        done (atom false)
+        started (atom false)
+        _ (spawn (fn []
+                   (reset! started true)
+                   (doseq [_ (range 40)]
+                     (fj/fjall-range handle nil nil))
+                   (reset! done true)))
+        _ (loop [] (if (deref started) nil (do (erlang/apply :timer :sleep (list 1)) (recur))))
+        _ (erlang/apply :timer :sleep (list 50))
+        loaded (sort (gets))
+        queues (erlang/apply :erlang :statistics (list :run_queue_lengths_all))
+        _ (loop [] (if (deref done) nil (do (erlang/apply :timer :sleep (list 5)) (recur))))]
+    {:n n-gets
+     :get-us-p50-idle (pct idle 50) :get-us-p99-idle (pct idle 99)
+     :get-us-p50-loaded (pct loaded 50) :get-us-p99-loaded (pct loaded 99)
+     :get-us-max-loaded (nth loaded (dec (count loaded)))
+     :run-queues-loaded queues}))
+
+;; ── driver ─────────────────────────────────────────────────────────────────
+
+(def N 20000)
+
+(println "== P1 small-cell read (n=" N ")")
+(let [r (probe-read N)]
+  (row "us/read" (:us-per-read r))
+  (row "read crossings" (:read-crossings r) "lane crossings" (:lane-crossings r)
+       "=> crossings/logical-read" (/ (* 1.0 (+ (:read-crossings r) (:lane-crossings r))) N)))
+
+(println "== P2 exchange under CAS load (n=" N ")")
+(let [s0 (stats) r (probe-exchange N) s1 (stats)]
+  (row "cas fast" (delta s0 s1 :op_cas_fast) "cas dirty" (delta s0 s1 :op_cas)
+       "reroute" (delta s0 s1 :op_reroute) "retry" (delta s0 s1 :op_retry)))
+
+(println "== P3 dependency walk (K=64 embedded handles)")
+(let [r (probe-deps 64)]
+  (row "handles" (:handles r)
+       "dep-resource" (:dep-resource-crossings r) "id" (:id-crossings r)
+       "=> crossings/handle" (/ (* 1.0 (+ (:dep-resource-crossings r) (:id-crossings r))) 64.0)))
+
+(println "== P4/P5 fjall")
+(if (fj/available?)
+  (let [store (fj/open-fresh)
+        handle (:handle store)
+        path (:path store)
+        rows 50000]
+    (println "  loading" rows "kv pairs into" path)
+    (load-kv handle rows)
+    (let [r (probe-range handle rows)]
+      (row "range rows" (:rows r) "ms" (:ms r) "heap delta MB" (:heap-delta-mb r)))
+    (let [q (probe-queue handle 2000)]
+      (row "get p50 idle/loaded us" (:get-us-p50-idle q) (:get-us-p50-loaded q))
+      (row "get p99 idle/loaded us" (:get-us-p99-idle q) (:get-us-p99-loaded q))
+      (row "get max loaded us" (:get-us-max-loaded q))
+      (row "run queues (loaded)" (:run-queues-loaded q)))
+    (File/rm_rf! path)
+    (File/rm_rf! (str path ".blobs")))
+  (println "  SKIPPED — datom.store-fjall NIF unavailable"))
+
+(println "== final NIF stats")
+(println " " (stats))

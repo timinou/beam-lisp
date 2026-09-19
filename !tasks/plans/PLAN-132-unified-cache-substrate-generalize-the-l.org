@@ -1,0 +1,251 @@
+#+TITLE: Unified cache substrate — generalize the LazyMemo/fjall NIF-boundary pattern (probes first)
+#+STATE: ITEM
+#+SESSION_ID: 1585934c870b57f3
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-09-19T09-55-45-308Z_1585934c870b57f3.jsonl]]
+#+CUSTOM_ID: PLAN-132-unified-cache-substrate-generalize-the-l
+
+* Initial Message
+
+can you look at the different caches across the codebase and tell me if there's something redundant?
+
+* Status
+
+ITEM. Phase 0 (probes) started 2026-09-19: op counters in the lazy_memo NIF + a boundary
+bench. Everything past Phase 0 is gated on the baseline numbers those probes produce.
+
+* 1. Context — the two caching systems and the pattern between them
+
+Two NIF-backed caches exist today, built on the same boundary discipline:
+
+**LazyMemo** (lib/beam_lisp/lazy_memo.ex, native/lazy_memo/src/lib.rs) — in-memory cells:
+- resource-as-cell: value in OwnedEnv/SavedTerm off-heap, identity = native u64, GC-owned
+- two scheduler lanes (fast regular / DirtyCpu), SELF-GUARDING: the fast NIF answers
+  :reroute for unbounded work (big term, new dependency edges) and the caller retries dirty
+- decisions made once and threaded (cursor dirty_chunks at creation; byte estimate before crossing)
+- native ownership graph: dependency edges + cycle detection in Rust; CAS publishes state AND
+  sends notifications in one crossing
+- budget admission: RETAINED_BYTES accounting, admit!/0 raises over budget, deferred reclaim thread
+- truth probes in the NIF (nif_loaded? — "host-module reload cannot lie")
+
+**datom_fjall** (priv/lib/datom/store-fjall.bl, native/datom_fjall/src/) — durable substrate:
+- six-method Store protocol; ETS/map/fjall interchangeable above L1
+- engine matched to workload by measurement (redb B-tree bulk-load ~13s vs fjall LSM memtable)
+- atomic cross-index commit: index tag in first key byte -> one keyspace -> one Batch
+- coarse boundary: whole tx per commit, whole tx's keys in ONE crossing (keycodec_batch,
+  522ms -> 25ms measured); classification native to kill per-component BEAM allocation
+- oracle + fallback: Rust codec byte-identical to codec.bl (differential-tested); out-of-lane
+  -> nil -> bl fallback. Correctness never depends on Rust coverage
+- explicit durability: WAL per put, fsync only at named fjall_sync (per-group fsync measured
+  at 26s vs few hundred ms)
+
+THE SHARED IDEA (the thing to generalize): state lives native behind a resource handle; the
+boundary is crossed once per unit of work, at coarse granularity; the fast path refuses what
+it cannot bound and the caller falls back; identity, accounting, and durability boundaries are
+explicit and probed from the native side.
+
+* 2. Flaws found (evidence: file:line, observed vs inferred)
+
+LazyMemo:
+- F1 read/1 pays TWO crossings always (nif_lane then nif_read*, lazy_memo.ex:219) and races:
+  an exchange between them can grow the cell past the ceiling so nif_read_fast copies a
+  megabyte term on a regular scheduler. CAS self-guards with :reroute; read does not.
+  OBSERVED.
+- F2 estimate_bytes = :erts_debug.flat_size on the CALLING (regular) scheduler — O(term)
+  before any lane is chosen (lazy_memo.ex:187). The lane-selection step can violate the 1ms
+  bound the lanes protect. OBSERVED design; magnitude inferred.
+- F3 No eviction — only refusal. Over budget -> admit!/0 raises ForceError; GC is the only
+  way space returns. Fatal if generalized as-is into a unified cache. OBSERVED.
+- F4 One global GRAPH mutex serializes every allocate/CAS; would_cycle walks while holding it.
+  OBSERVED.
+- F5 dependencies/1 walks terms in Elixir with 2 NIF calls per embedded handle
+  (nif_dependency_resource + nif_id, lazy_memo.ex:108-171) — the per-item crossing tax
+  keycodec_batch eliminated in the fjall crate. OBSERVED.
+- F6 Accounting is estimate-only (flat_size overcounts shared subterms), never reconciled
+  with real RSS; the 512MB budget is heuristic. OBSERVED design, impact inferred.
+
+fjall:
+- F7 fjall_range materializes the WHOLE window into BEAM terms in one call (lib.rs:122-156).
+  No cursor/chunking — LazyMemo's 32-head cursor pattern was not reused. FUP-022 adjacent.
+  OBSERVED.
+- F8 Every op DirtyIo including memtable-hit point gets. On THIS host ELIXIR_ERL_OPTIONS pins
+  ONE dirty-IO scheduler (+SDio 1:1) — every fjall op queues on a single thread; a long range
+  scan blocks point gets behind it. OBSERVED (config + host env).
+- F9 Exclusive file lock + eager partition creation: opening for READ still takes the lock
+  and can mutate the directory. conn.bl's registry/release! machinery exists because of this;
+  two bl processes cannot share an analysis store. Durable tier is single-process by
+  construction. OBSERVED.
+- F10 keycodec.rs mirrors codec.bl byte-for-byte; bl is the oracle so the Rust copy can never
+  become canonical — permanent parallel-implementation tax, drift guarded only by
+  differential tests. OBSERVED, deliberate.
+- F11 Cross-range consistency undocumented: each -range is its own snapshot iterator; a query
+  doing several ranges under a concurrent writer can tear across them. Basis-t filtering above
+  presumably absorbs it. INFERRED risk.
+- F12 The single Mutex<()> also covers fjall_sync — one writer's fsync stalls all writers.
+  OBSERVED, minor.
+
+Also: TWO NIF-load disciplines (LazyMemo ensure_loaded! + :global.trans vs fjall defnative +
+vm.native/available?) — two answers to "is my NIF loaded". And build/datom_redb.so is a fossil
+of the retired engine (no crate remains).
+
+* 3. Goal / non-goals
+
+GOAL: one cache substrate — one crate, one cell API, two tiers (L2 volatile cells a la
+LazyMemo, L3 durable keyspaces a la fjall), with L1 per-process views (pdict/pterm) validated
+by a native generation counter. Unified: identity, accounting, invalidation (dependency
+EDGES, not per-cache epoch/key/mtime inventions), stats surface, load discipline.
+
+NON-GOALS: rewriting the on-disk formats (content addressing stays); forcing hot tiny reads
+through a NIF crossing (Env.fetch's per-deref path stays L1); live NIF upgrade support;
+touching the query engine.
+
+* 4. Phases
+
+** Phase 0 — probes (THIS SESSION)
+- P0a op counters in lazy_memo NIF: per-entry crossing counts, lane split, reroute/retry/cycle
+  counts, exposed via nif_stats. [started 2026-09-19]
+- P0b bench/cache_boundary_bench.bl: read-crossing cost, reroute rate under exchange load,
+  dirty-queue depth during bulk work, fjall range materialization curve.
+- P0c record baselines in this item.
+Gate: bench runs on the rebuilt NIF; numbers appended to §7.
+
+** Phase 1 — LazyMemo read self-guard (fix F1)
+nif_read_fast returns :reroute over the ceiling; read/1 becomes one crossing hot path.
+Deletes nif_lane from the API. Gate: lazy-seq tests + bench p50 read latency.
+
+** Phase 2 — fjall range cursor (fix F7)
+Chunked scan (32 rows/pull, lane decided once from avg row bytes — LazyMemo's cursor shape).
+Gate: memory ceiling on wide scans; conformance suite byte-identical.
+
+** Phase 3 — native dependency walk (fix F5)
+nif_dependencies(term): one crossing, native term walk. Deletes the 60-line Elixir walk.
+Gate: LazySeq/reactive tests; create/exchange cost at K handles.
+
+** Phase 4 — eviction for L2 (fix F3)
+Priority/LRU eviction under budget pressure instead of only ForceError. Requires native
+generations (a cell invalidated native-side must make L1 views stale-checkable).
+Gate: budget stress test — cache degrades by eviction, not by raising.
+
+** Phase 5 — tier merge + invalidation by edges
+- compiler_key/build_key/Tiers namespace lists become cells with edges on a priv-manifest
+  cell: one invalidation mechanism replaces reset_keys/reset_compiler_key/the unresettable
+  Tiers memo (fixes the asymmetry found 2026-09-19).
+- Cache.root consolidation: AOTCache.dir, embed-asset.bl cache-root, store.bl root all call
+  BeamLisp.Cache.root() (store.bl's hand-rolled XDG/HOME is a latent divergence bug).
+- fjall fast-lane gets for memtable-resident keys, self-guarded (fix F8; biggest single win
+  on this host per the +SDio 1:1 constraint).
+Gate: stale-serve rate = 0 under a reload_watcher edit loop; dirty-queue depth ~0 during
+bulk transact; no end-to-end gate regresses >5%.
+
+* 5. Improvement estimates (to be replaced by Phase-0 measurements)
+
+- read/1 2->1 crossings: crossing ≈ sub-µs–2µs for small terms; fast-path read p50 −40–50%.
+  Multiplier: every LazySeq force, every reactive deref.
+- deps walk 2K->1 crossings at create/exchange: typical K small (0–3) → modest; large for
+  graph-heavy reactive values.
+- fjall fast-lane gets: removes dirty-queue SCHEDULING from point reads; with one dirty-IO
+  scheduler on this host, p99 under concurrent scan load goes from ms-scale queueing to µs.
+  Potentially the largest single win; P0b measures it.
+- range cursor: memory from O(window) to O(32 rows); latency neutral (more crossings, each
+  bounded); enables scans that today spike or die.
+- Env.fetch unification (Phase 5+): perf-neutral by design (L1 stays pdict), wins are in
+  deleted mechanisms (epoch dance, per-cache resets).
+
+* 6. What gets simpler — before/after syntax
+
+*** 6.1 LazyMemo.read (Phase 1)
+#+begin_src elixir
+# BEFORE — two crossings, race window, lane API surface
+def read(resource) do
+  ensure_loaded!()
+  case nif_lane(resource) do
+    :fast  -> nif_read_fast(resource)
+    :dirty -> nif_read(resource)
+  end
+end
+
+# AFTER — self-guarding; one crossing on the hot path; nif_lane deleted
+def read(resource) do
+  ensure_loaded!()
+  case nif_read_fast(resource) do
+    :reroute -> nif_read(resource)
+    value    -> value
+  end
+end
+#+end_src
+
+*** 6.2 Dependency collection (Phase 3)
+#+begin_src elixir
+# BEFORE — 60-line Elixir walk, 2 crossings per embedded handle
+def dependencies(term) do
+  ensure_loaded!()
+  walk([term], MapSet.new(), MapSet.new(), [])
+end
+# ... walk/4 x8, include_resource/4, prepend_tuple/3 ...
+
+# AFTER
+def dependencies(term) do
+  ensure_loaded!()
+  nif_dependencies(term)
+end
+#+end_src
+
+*** 6.3 Cache-root derivation (Phase 5) — four implementations become one
+#+begin_src elixir
+# aot_cache.ex BEFORE
+nil -> :filename.basedir(:user_cache, ~c"beam_lisp") |> Path.join("aot")
+# AFTER
+nil -> Path.join(BeamLisp.Cache.root(), "aot")
+#+end_src
+#+begin_src clojure
+;; store.bl BEFORE — hand-rolled XDG/HOME (divergent: skips :filename.basedir)
+(let [xdg (System/get_env "XDG_CACHE_HOME")
+      base (if (and (some? xdg) (not= "" xdg)) xdg
+             (Path/join (System/get_env "HOME") ".cache"))]
+  (Path/join (Path/join base "beam_lisp") "lib"))
+;; AFTER
+(Path/join (BeamLisp.Cache/root) "lib")
+;; embed-asset.bl cache-root likewise: (BeamLisp.Cache/root) — same VM, no reason to re-derive
+#+end_src
+
+*** 6.4 Invalidation (Phase 5) — N mechanisms become edges
+#+begin_src elixir
+# BEFORE — manual resets, asymmetric (Tiers memo has NO reset):
+AOTCache.reset_keys()          # erases @toolchain_key_pt + @build_key_pt
+AOTCache.reset_cleanup_throttle()
+# Tiers tier_namespaces memo: nothing erases it — add a file to priv/build mid-VM
+# and build_key recomputes but build_namespaces() serves the stale list.
+
+# AFTER — one dependency edge; editing priv/** CASes the manifest cell and every
+# key cell hanging off it is stale natively:
+Cache.cell(:compiler_key, deps: [priv_manifest_cell])
+Cache.cell(:tier_namespaces, :build, deps: [priv_manifest_cell])
+#+end_src
+
+*** 6.5 Store GC (Phase 5) — two policies, one sweep
+#+begin_src clojure
+;; BEFORE: bl.cache/evict (mtime+byte-cap, bl) AND AOTCache.cleanup_obsolete_generations
+;; (keep-N + max-age, Elixir) — two GCs for two content-addressed stores.
+;; AFTER: one sweep, policy as data:
+(Cache/sweep aot-dir      {:keep-generations 8 :max-age-days 30})
+(Cache/sweep analysis-dir {:cap-bytes cap :keep current-run})
+#+end_src
+
+* 7. Baselines (Phase 0 fills these)
+
+| probe | baseline | after | 
+|-------|----------|-------|
+| crossings per small-cell read | TBD (expect 2) | 1 |
+| reroute rate under exchange load | TBD | <5% |
+| dirty-queue depth, bulk transact | TBD | ~0 (Phase 5) |
+| fjall_range max window bytes | TBD | bounded (Phase 2) |
+| RETAINED_BYTES vs :erlang.memory drift | TBD | calibrated |
+
+* 8. Risks
+
+- NIF rebuild on this host: live upgrades unsupported — every bl invocation is a fresh VM, so
+  dev iteration is safe; a running daemon holds the old .so (build.bl already guards claimed
+  target dirs).
+- Fast-lane reads for fjall (Phase 5) must reroute on any disk touch — fjall get cannot know
+  before trying; the self-guard must be inside fjall's own error path. Needs a spike.
+- Generation-validated L1 views: a stale L1 read is a correctness bug, not a perf bug —
+  stale-serve probe is the gate, and it must run under edit load, not just at rest.

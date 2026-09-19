@@ -31,6 +31,34 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_CELLS: AtomicUsize = AtomicUsize::new(0);
 static RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PENDING_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
+
+// ── Phase-0 probes (PLAN-132): boundary crossings per entry point ──────────
+// Every BEAM->Rust call bumps exactly one slot. The point is the RATIO:
+// `op_lane` is a crossing that exists only to route another crossing (F1),
+// `op_dep_resource`/`op_id` are the per-handle tax of the Elixir-side
+// dependency walk (F5). A healthy system has op_lane == 0 and read calls
+// equal to the number of logical reads.
+const OP_NEW: usize = 0;
+const OP_NEW_FAST: usize = 1;
+const OP_READ: usize = 2;
+const OP_READ_FAST: usize = 3;
+const OP_LANE: usize = 4;
+const OP_CAS: usize = 5;
+const OP_CAS_FAST: usize = 6;
+const OP_REROUTE: usize = 7;
+const OP_RETRY: usize = 8;
+const OP_CYCLE: usize = 9;
+const OP_DEP_RESOURCE: usize = 10;
+const OP_ID: usize = 11;
+const OP_CURSOR: usize = 12;
+const OP_CURSOR_CHUNK: usize = 13;
+const OP_CURSOR_CHUNK_FAST: usize = 14;
+const OP_COUNT: usize = 15;
+static OPS: [AtomicU64; OP_COUNT] = [const { AtomicU64::new(0) }; OP_COUNT];
+
+fn count(op: usize) {
+    OPS[op].fetch_add(1, Ordering::Relaxed);
+}
 static GRAPH: OnceLock<Mutex<HashMap<u64, Vec<u64>>>> = OnceLock::new();
 struct Reclaimer {
     sender: mpsc::Sender<OwnedEnv>,
@@ -78,6 +106,24 @@ struct MemoStats {
     live_cells: usize,
     retained_bytes: usize,
     pending_reclaims: usize,
+    // Phase-0 probes (PLAN-132): BEAM<->Rust crossings per entry point.
+    // `op_lane` should trend to 0 once reads self-guard (F1);
+    // `op_dep_resource` + `op_id` price the Elixir-side dependency walk (F5).
+    op_new: u64,
+    op_new_fast: u64,
+    op_read: u64,
+    op_read_fast: u64,
+    op_lane: u64,
+    op_cas: u64,
+    op_cas_fast: u64,
+    op_reroute: u64,
+    op_retry: u64,
+    op_cycle: u64,
+    op_dep_resource: u64,
+    op_id: u64,
+    op_cursor: u64,
+    op_cursor_chunk: u64,
+    op_cursor_chunk_fast: u64,
 }
 
 fn graph() -> &'static Mutex<HashMap<u64, Vec<u64>>> {
@@ -215,6 +261,7 @@ fn new(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
 ) -> NifResult<ResourceArc<MemoCell>> {
+    count(OP_NEW);
     allocate(state, dependencies, estimate, false)
 }
 
@@ -226,6 +273,7 @@ fn new_fast(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
 ) -> NifResult<ResourceArc<MemoCell>> {
+    count(OP_NEW_FAST);
     allocate(state, dependencies, estimate, false)
 }
 
@@ -276,6 +324,7 @@ fn cursor(
     dependencies: Vec<ResourceArc<MemoCell>>,
     estimate: u64,
 ) -> NifResult<ResourceArc<Cursor>> {
+    count(OP_CURSOR);
     let len = list.list_length()?;
     let source = allocate(list, dependencies, estimate, true)?;
     let retained = lock(&source.state)
@@ -343,6 +392,7 @@ fn cursor_chunk_fast<'a>(
     env: Env<'a>,
     cursor: ResourceArc<Cursor>,
 ) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    count(OP_CURSOR_CHUNK_FAST);
     cursor_chunk_impl(env, cursor)
 }
 
@@ -353,11 +403,13 @@ fn cursor_chunk<'a>(
     env: Env<'a>,
     cursor: ResourceArc<Cursor>,
 ) -> NifResult<(Vec<Term<'a>>, Option<ResourceArc<Cursor>>)> {
+    count(OP_CURSOR_CHUNK);
     cursor_chunk_impl(env, cursor)
 }
 
 #[rustler::nif(name = "nif_dependency_resource")]
 fn dependency_resource(term: Term<'_>) -> Option<ResourceArc<MemoCell>> {
+    count(OP_DEP_RESOURCE);
     term.decode::<ResourceArc<MemoCell>>().ok().or_else(|| {
         term.decode::<ResourceArc<Cursor>>()
             .ok()
@@ -371,6 +423,7 @@ fn dependency_resource(term: Term<'_>) -> Option<ResourceArc<MemoCell>> {
 /// the dirty-scheduler migration that a multi-megabyte value legitimately needs.
 #[rustler::nif(name = "nif_lane")]
 fn lane(resource: ResourceArc<MemoCell>) -> NifResult<Atom> {
+    count(OP_LANE);
     let guard = lock(&resource.state);
     let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
     Ok(if state.retained_bytes <= fast_lane_bytes() { fast() } else { dirty() })
@@ -399,12 +452,14 @@ fn read_impl<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Ter
 /// larger cells to the dirty `nif_read`.
 #[rustler::nif(name = "nif_read_fast")]
 fn read_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    count(OP_READ_FAST);
     read_impl(env, resource)
 }
 
 /// Dirty lane: unchanged behaviour for large values.
 #[rustler::nif(name = "nif_read", schedule = "DirtyCpu")]
 fn read<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    count(OP_READ);
     read_impl(env, resource)
 }
 
@@ -423,6 +478,7 @@ fn compare_exchange_impl<'a>(
     notifications: Vec<(LocalPid, Term<'a>)>,
     fast_lane: bool,
 ) -> NifResult<Atom> {
+    count(if fast_lane { OP_CAS_FAST } else { OP_CAS });
     if resource.read_only {
         return Err(rustler::Error::BadArg);
     }
@@ -434,6 +490,7 @@ fn compare_exchange_impl<'a>(
         let ceiling = fast_lane_bytes();
         if current.retained_bytes > ceiling || retained_bytes > ceiling {
             drop(cell);
+            count(OP_REROUTE);
             return Ok(reroute());
         }
     }
@@ -442,6 +499,7 @@ fn compare_exchange_impl<'a>(
         .run(|owned| current.term.load(owned) == expected);
     if !identical {
         drop(cell);
+        count(OP_RETRY);
         return Ok(retry());
     }
 
@@ -460,11 +518,13 @@ fn compare_exchange_impl<'a>(
         // New edges mean an unbounded cycle walk: not fast-lane work.
         drop(edges);
         drop(cell);
+        count(OP_REROUTE);
         return Ok(reroute());
     }
     if would_cycle(&edges, resource.id, &added) {
         drop(edges);
         drop(cell);
+        count(OP_CYCLE);
         return Ok(cycle());
     }
 
@@ -522,11 +582,13 @@ fn compare_exchange<'a>(
 
 #[rustler::nif(name = "nif_id")]
 fn id(resource: ResourceArc<MemoCell>) -> u64 {
+    count(OP_ID);
     resource.id
 }
 
 #[rustler::nif(name = "nif_resource_id")]
 fn resource_id(term: Term<'_>) -> Option<u64> {
+    count(OP_ID);
     term.decode::<ResourceArc<MemoCell>>()
         .ok()
         .map(|cell| cell.id)
@@ -534,10 +596,26 @@ fn resource_id(term: Term<'_>) -> Option<u64> {
 
 #[rustler::nif(name = "nif_stats")]
 fn stats() -> MemoStats {
+    let op = |i: usize| OPS[i].load(Ordering::Relaxed);
     MemoStats {
         live_cells: LIVE_CELLS.load(Ordering::Acquire),
         retained_bytes: RETAINED_BYTES.load(Ordering::Acquire),
         pending_reclaims: PENDING_RECLAIMS.load(Ordering::Acquire),
+        op_new: op(OP_NEW),
+        op_new_fast: op(OP_NEW_FAST),
+        op_read: op(OP_READ),
+        op_read_fast: op(OP_READ_FAST),
+        op_lane: op(OP_LANE),
+        op_cas: op(OP_CAS),
+        op_cas_fast: op(OP_CAS_FAST),
+        op_reroute: op(OP_REROUTE),
+        op_retry: op(OP_RETRY),
+        op_cycle: op(OP_CYCLE),
+        op_dep_resource: op(OP_DEP_RESOURCE),
+        op_id: op(OP_ID),
+        op_cursor: op(OP_CURSOR),
+        op_cursor_chunk: op(OP_CURSOR_CHUNK),
+        op_cursor_chunk_fast: op(OP_CURSOR_CHUNK_FAST),
     }
 }
 
