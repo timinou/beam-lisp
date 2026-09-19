@@ -1,0 +1,1020 @@
+; proc/queue.bl — the durable queue: a job is a FACT, and the store is the wheel.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; The Deadline Queue of docs/scheduling/the-clock-and-the-wheel.md §3.1, over the
+; store a server already has. Two of its patterns need NO new machinery —
+; Idempotency Key (a unique value in the store) and Claim/Lease (a guarded
+; transaction) — and everything else is the clause that declares both:
+;
+;   (proc/defserver larder
+;     (queue {:of          :hotel/order
+;             :concurrency 4
+;             :retry       {:max 5 :backoff :exponential :base 1000
+;                           :max-delay 60000 :jitter 0.2}
+;             :unique      [:order/room :order/item]
+;             :lease       300
+;             :partition   [:order/room]})
+;     (perform [job] (charge! job)))
+;
+;   (proc.queue/enqueue! :larder {:order/room "101" :order/item :breakfast})
+;   (proc.queue/enqueue! :larder {:order/room "102" :order/item :minibar}
+;                                {:in [30 :minutes]})
+;   (proc.queue/enqueue! :larder {:order/room "103" :order/item :audit}
+;                                {:at (proc/next housekeeping :audit)})
+;
+;   (proc.queue/stats :larder)   ; {:queued 3 :running 1 :done 12 :failed 0 …}
+;
+; ══ AT-LEAST-ONCE, SAID OUT LOUD ════════════════════════════════════════════
+;
+; This is an AT-LEAST-ONCE queue, and a body that has BEGUN may run AGAIN:
+;
+;   · a worker that is killed after its side effect, but before the outcome is
+;     written, leaves the job `:running`; when its lease expires the job is
+;     claimed and `perform` runs a second time;
+;   · the write that records the outcome is itself refused when the queue lost
+;     the job in the meantime (another claimant owns it), so the JOB cannot be
+;     double-finished — but the BODY already ran.
+;
+; ∴ `perform` MUST be idempotent, or the caller must make it so. At-most-once
+; EFFECT is available and is what this file gives you: the job settles once,
+; under one owner token. At-most-once DELIVERY is not, and no amount of care
+; inside this file could give it to you — the body's effect and the fact that
+; records it are in two different processes.
+;
+; ══ THE CLAIM IS THE WHOLE OF CLAIM/LEASE ═══════════════════════════════════
+;
+; Taking a due job and marking it running is ONE transaction, and the CAS in it
+; is what makes two claims unable to take one job:
+;
+;   [[:db/cas e :job/state :queued :running]   ; only if it is STILL queued
+;    [:db/add e :job/lease-until …]
+;    [:db/add e :job/owner token]
+;    [:db/add e :job/attempts n]]
+;
+; The read that decides "is it still :queued?" happens INSIDE the connection's
+; writer (datom.conn/transact! serialises every write per connection), so it is
+; not a read-then-write window — it is the transaction's own before-value. The
+; loser's whole transaction is refused, and `claim!` answers nil; it does not
+; half-apply. (BUG-022 lived one layer down, in the basis; the claim is proven
+; under concurrency by `two-concurrent-claims-never-take-one-job`.)
+;
+; ══ THE NOTIFIER IS THE STORE, AND THE WAKE IS ONE TIMER ════════════════════
+;
+; Enqueue is a COMMIT, so it broadcasts on the store it wrote (`datom/listen!`,
+; §3.2's "the notifier = datom/watch — no second transport") and the loop wakes.
+; The wake itself is ONE `send_after` at the earliest deadline still worth a
+; timer — a queued job's `:at` in the FUTURE, or a running job's lease expiry
+; (the Lifeline wake: an orphan is reclaimed when its lease runs out, with no
+; poll). A deadline already BEHIND us is not a timer: at boot it is a job nobody
+; has claimed and the tick is the only thing that will notice it, while at
+; runtime it is a job this process can already claim or one waiting for a slot —
+; and a slot frees with a MESSAGE (a completion), never with a poll. Nothing
+; scans, nothing sleeps in a loop, and the number of timers is one.
+;
+; The generation counter `tick` needs is NOT needed here. `tick-cancel` cannot
+; un-send a message, so a stale tick's BODY must be refused; a stale queue wake
+; only re-reads the store and claims what is due, which is idempotent by
+; construction. A second timer is therefore cancelled and a message already in
+; flight is harmless.
+;
+; ══ THE TWO VERBS THAT SURVIVE ══════════════════════════════════════════════
+;
+; `enqueue!` (a store write, with the queue's eligibility rules applied to it)
+; and `stats` (a QUERY — counts by status, so the pane never asks a process, and
+; the answer is the same whether the queue is running, stopped, or was never
+; started in this VM). `retry`, `unique`, `lease`, `concurrency` and
+; `partition` are OPTIONS ON THE CLAIM LOOP, not verbs. `prune` is not part of
+; this bundle at all: it is a `:schedules` declaration of the tree that owns the
+; queue (§4.3).
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/proc/sched.bl — the sibling clause this is modelled on: the same
+;   announcement name, the same public ETS table with an heir, the same "the
+;   pane reads the store, never the process".
+; priv/lib/datom/tx.bl — `cas-ops`, the compare-and-swap this claim is built on.
+
+(ns proc.queue
+  (:require [datom :as datom]
+            [datom.store-ets :as store-ets]
+            [proc.server :refer [extend-clause!]]
+            [proc.table :as table]
+            [proc.tick :as tick]))
+
+;; ── the declaration, and its refusals ───────────────────────────────────
+
+(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition])
+
+(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition
+                        :clock :server])
+
+(def KNOWN-RETRY-OPTS [:max :backoff :base :max-delay :jitter])
+
+(def KNOWN-BACKOFF [:exponential :constant])
+
+(def KNOWN-ENQUEUE-OPTS [:in :at])
+
+(defn- known? [k ks] (some (fn [x] (= x k)) ks))
+
+(defn- positive-int? [v] (and (erlang/is_integer v) (> v 0)))
+
+(defn- positive-number? [v] (and (number? v) (> v 0)))
+
+(defn- normalise-retry
+  "The retry policy, defaults filled, every value a number a `backoff-ms` can
+   honour. `:max` is the number of ATTEMPTS (Oban's `max_attempts`), not a
+   delay; the delay ceiling is `:max-delay`. Two meanings of one word is how a
+   knob comes to do nothing, and a map cannot hold `:max` twice."
+  [r]
+  (let [r (or r {})]
+    (when-not (map? r)
+      (throw (ex-info (str "queue: :retry must be a map — got " (str r)) {:retry r})))
+    (doseq [k (keys r)]
+      (when-not (known? k KNOWN-RETRY-OPTS)
+        (throw (ex-info (str "queue: unknown :retry option " k " — known: "
+                             (join " " (map (fn [x] (str x)) KNOWN-RETRY-OPTS)))
+                        {:option k :retry r}))))
+    (let [max (get r :max 1)
+          backoff (get r :backoff :exponential)
+          base (get r :base 1000)
+          ceiling (get r :max-delay 60000)
+          jitter (get r :jitter 0)]
+      (when-not (positive-int? max)
+        (throw (ex-info (str "queue: :retry :max is the number of attempts and must be a"
+                             " positive integer — got " (str max))
+                        {:max max})))
+      (when-not (known? backoff KNOWN-BACKOFF)
+        (throw (ex-info (str "queue: unknown :backoff " (str backoff) " — use "
+                             (join " " (map (fn [x] (str x)) KNOWN-BACKOFF)))
+                        {:backoff backoff})))
+      (when-not (positive-int? base)
+        (throw (ex-info (str "queue: :retry :base is milliseconds and must be a positive"
+                             " integer — got " (str base))
+                        {:base base})))
+      (when-not (positive-int? ceiling)
+        (throw (ex-info (str "queue: :retry :max-delay is milliseconds and must be a"
+                             " positive integer — got " (str ceiling))
+                        {:max-delay ceiling})))
+      (when-not (and (number? jitter) (>= jitter 0))
+        (throw (ex-info (str "queue: :retry :jitter is a fraction and must be ≥ 0 — got "
+                             (str jitter))
+                        {:jitter jitter})))
+      {:max max :backoff backoff :base base :max-delay ceiling :jitter jitter})))
+
+(defn normalise-decl
+  "A queue's declaration with every default filled and every typo REFUSED, so
+   the rest of this file reads one shape.
+
+   It is called twice on purpose: once when the clause is EXPANDED (a literal
+   typo fails at compile time, naming the server) and once at boot (the same
+   checks over the values that actually arrived). A declaration is data — the
+   options are literals, and `:clock` is the one expression allowed, which is
+   why it is not part of this map."
+  [d]
+  (when-not (map? d)
+    (throw (ex-info (str "queue: the declaration must be a map, got " (str d)) {:decl d})))
+  (doseq [k (keys d)]
+    (when-not (known? k KNOWN-DECL-OPTS)
+      (throw (ex-info (str "queue: unknown declaration option " k " — known: "
+                           (join " " (map (fn [x] (str x)) KNOWN-DECL-OPTS)))
+                      {:option k :decl d}))))
+  (let [of (get d :of)
+        concurrency (get d :concurrency 1)
+        lease (get d :lease 300)
+        unique (or (get d :unique) [])
+        partition (or (get d :partition) [])]
+    (when-not (keyword? of)
+      (throw (ex-info (str "queue: :of is required and must be a keyword — the entity"
+                           " kind this server's jobs are")
+                      {:decl d})))
+    (when-not (positive-int? concurrency)
+      (throw (ex-info (str "queue: :concurrency must be a positive integer — got "
+                           (str concurrency))
+                      {:concurrency concurrency})))
+    (when-not (positive-number? lease)
+      (throw (ex-info (str "queue: :lease is a duration in SECONDS and must be > 0 — got "
+                           (str lease))
+                      {:lease lease})))
+    (when-not (vector? unique)
+      (throw (ex-info (str "queue: :unique is the key set the store enforces, as a vector"
+                           " of attribute keywords — got " (str unique))
+                      {:unique unique})))
+    (when-not (vector? partition)
+      (throw (ex-info (str "queue: :partition is a vector of attribute keywords — got "
+                           (str partition))
+                      {:partition partition})))
+    (doseq [k unique]
+      (when-not (keyword? k)
+        (throw (ex-info (str "queue: every :unique key must be a keyword — got " (str k))
+                        {:key k}))))
+    (doseq [k partition]
+      (when-not (keyword? k)
+        (throw (ex-info (str "queue: every :partition key must be a keyword — got " (str k))
+                        {:key k}))))
+    {:of of
+     :concurrency concurrency
+     :lease lease
+     :unique (vec unique)
+     :partition (vec partition)
+     :retry (normalise-retry (get d :retry))}))
+
+(defn backoff-ms
+  "Milliseconds to wait before the attempt AFTER `n` failures.
+
+   Pure, so the retry lattice is a test rather than a sleep: `:exponential`
+   doubles from `:base`, `:constant` never grows, both are capped by
+   `:max-delay`, and `:jitter` (a fraction) spreads the result by ± that much —
+   never below a millisecond, because a delay of zero is a busy loop wearing a
+   policy's name."
+  [retry n]
+  (let [r (if (map? retry) (normalise-retry retry) retry)
+        base (get r :base 1000)
+        raw (if (= :constant (get r :backoff))
+              base
+              (erlang/round (* base (erlang/apply :math :pow (list 2 (- n 1))))))
+        capped (min raw (get r :max-delay 60000))
+        j (get r :jitter 0)]
+    (if (or (nil? j) (not (> j 0)))
+      capped
+      (let [u (- (erlang/apply :rand :uniform (list)) 0.5)
+            v (erlang/round (* capped (+ 1 (* 2 j u))))]
+        (if (< v 1) 1 v)))))
+
+;; ── the store ───────────────────────────────────────────────────────────
+;;
+;; ONE PUBLIC ETS TABLE PER QUEUE, held by a keeper with an heir, and a datom
+;; connection over it. Per queue rather than one for the VM, because `:of`,
+;; `:unique` and `:lease` are the DECLARATION's: two queues sharing a table
+;; would share an identity they do not share a policy for, and a ticket one
+;; queue computed would refuse the other's job.
+;;
+;; The pane needs no registry of its own: it reads the same table with the same
+;; query language, and `(proc.queue/conn :larder)` is the whole door.
+
+(def SCHEMA
+  [{:db/ident :job/of :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+   {:db/ident :job/server :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/state :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :job/at :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :job/attempts :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :job/enqueued-at :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :job/lease-until :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   ;; the lease's OWNER TOKEN: a fresh value per claim, so the process that
+   ;; finishes a job must still hold it. A reclaimed job has a new token, and
+   ;; the old worker's outcome is refused rather than written over the new one.
+   {:db/ident :job/owner :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   ;; the Idempotency Key. UNIQUE, so a second enqueue of one payload cannot
+   ;; make a second entity — and RETRACTED when the job settles, so the same
+   ;; payload may be owed again once it is finished.
+   {:db/ident :job/ticket :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :job/partition :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   ;; the job's own facts, as ONE value. `:db.type/term` rather than one
+   ;; attribute per payload key: the queue cannot know a caller's attributes, and
+   ;; a schema it invented for them would make every job kind a schema change.
+   {:db/ident :job/payload :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/result :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/last-error :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/finished-at :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :queue/key :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :queue/decl :db/valueType :db.type/term :db/cardinality :db.cardinality/one}])
+
+(defn store-name
+  "The ETS table one queue owns. The name is a FUNCTION of the server's, because
+   a name that has to be remembered is a name that is sometimes not found."
+  [srv]
+  (keyword (str "bl_queue_" (name srv))))
+
+(defn ensure-store!
+  "Make this queue's store exist, with an owner and an heir that outlive every
+   claimer. Never creates the table itself — `proc.table` starts the process that
+   does, and that indirection is the whole guarantee."
+  [srv]
+  (table/hold (store-name srv) {:type :ordered_set
+                                :options [:public :named_table]}))
+
+(defn- conn-key [srv] (tuple :bl-queue-conn (name srv)))
+
+(defn conn
+  "The connection over this queue's store, published once per VM.
+
+   Not a cache of state: two connections over one store share a writer and a
+   basis through datom's own registry, so a reader needs this only to NAME the
+   basis it reads at. `:persistent_term` because the read is lock-free and
+   answers the same value from every process — a pane that has never started a
+   queue can still read it."
+  [srv]
+  (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
+      (let [c (datom/connect-with (store-ets/adopt (ensure-store! srv)) SCHEMA)]
+        (erlang/apply :persistent_term :put (list (conn-key srv) c))
+        c)))
+
+(defn store-live?
+  "Whether this queue's store exists right now. Public for the same reason
+   `proc.table/owner` is: a test and a pane both want to ask."
+  [srv]
+  (table/live? (store-name srv)))
+
+(defn store-owner
+  "The pid that owns this queue's store, or nil. The invariant, readable."
+  [srv]
+  (table/owner (store-name srv)))
+
+(defn- write-decl!
+  "Publish the declaration as a FACT. Upserted by `:queue/key`, so a boot is one
+   transaction and re-booting is the same one.
+
+   Why the store holds it at all: `enqueue!` is a store write that must apply the
+   queue's OWN rules (`:of`, `:unique`, `:partition`) without asking a process,
+   and a rule a caller has to restate at every call site is a rule that drifts."
+  [c srv d]
+  (datom/transact! c [{:db/id -1
+                       :queue/key (name srv)
+                       :queue/decl (assoc d :server (name srv))}]))
+
+(defn declaration
+  "The durable declaration this queue wrote at boot, or nil when this VM's store
+   has never seen a `(queue …)` for `srv`."
+  [srv]
+  (let [m (datom/pull (datom/db (conn srv)) '[*] [:queue/key (name srv)])]
+    (:queue/decl m)))
+
+;; ── reaching a live queue ───────────────────────────────────────────────
+;;
+;; The name is DERIVED from the declaration (`larder` → `:bl-queue/larder`), the
+;; same trick `proc.sched` uses: a deterministic name is a handle that survives a
+;; restart, and it is registered by the process that will answer to it — its own
+;; init — never by whoever wants to call. The clause does NOT also ask to be
+;; started under a `{:name …}`: one process, one name it owns (FUP-105).
+
+(defn op-name [srv] (keyword "bl-queue" (name srv)))
+
+(defn- error-text
+  [e]
+  (let [m (if (map? e) (get e :message) nil)]
+    (if (nil? m) (str e) (str m))))
+
+(defn serving?
+  "Whether a queue is RUNNING for `srv` right now. Named `serving?` rather than
+   `live?` so it cannot collide with `proc.table/live?` in the umbrella."
+  [srv]
+  (some? (Process/whereis (op-name srv))))
+
+(defn announce!
+  "Register this process under its declaration's name, from its OWN init.
+
+   A collision is REFUSED, loudly: two queues for one declaration would claim
+   the same jobs from the same store under the same leases, and the second one is
+   not inconvenient, it is a second claimant of one job. The check is against a
+   LIVE pid only — the VM frees a name when its process dies, so a predecessor
+   that has properly stopped never blocks its successor.
+
+   `{:name …}` on the start call is deliberately NOT how this is done; the whole
+   point is that one process registers one name, and it is the process itself.
+   (The register is still guarded, because a name lookup and a name claim are
+   not one operation.)"
+  [srv]
+  (let [nm (op-name srv)
+        holder (Process/whereis nm)]
+    (when (some? holder)
+      (throw (ex-info (str "proc.queue: a queue for " srv " is already running ("
+                           holder "). Two would claim the same jobs from the same"
+                           " store under the same leases.")
+                      {:server srv :name nm :holder holder})))
+    (try
+      (erlang/register nm (erlang/self))
+      (catch e
+        (throw (ex-info (str "proc.queue: the name " nm " for " srv " is taken ("
+                             (Process/whereis nm) ") — the register refused it;"
+                             " the holder above is what the VM reported afterwards.")
+                        {:server srv :name nm :holder (Process/whereis nm)
+                         :why (error-text e)}))))
+    nm))
+
+;; ── the job's shape, and the two derived keys ───────────────────────────
+
+(defn- validate-payload!
+  "Refuse a job the declaration cannot act on. Every `:unique` and `:partition`
+   key must be PRESENT: a rule whose key is missing matches `nil` on every job
+   and therefore does nothing at all, which is the worst kind of configuration
+   bug (docs/dev/env.bl.md). Keys in the `job` namespace are refused too — the
+   payload is the caller's, and a caller who writes `:job/state` is editing the
+   queue's bookkeeping by accident."
+  [d job]
+  (when-not (and (map? job) (seq job))
+    (throw (ex-info "queue: a job must be a non-empty map — the facts perform will act on"
+                    {:job job})))
+  (doseq [k (keys job)]
+    (when-not (keyword? k)
+      (throw (ex-info (str "queue: every job key must be a keyword, got " (str k))
+                      {:key k :job job})))
+    (when (= "job" (namespace k))
+      (throw (ex-info (str "queue: " k " is the queue's own namespace — a job's payload"
+                           " may not write it")
+                      {:key k :job job}))))
+  (doseq [k (concat (:unique d) (:partition d))]
+    (when (nil? (get job k))
+      (throw (ex-info (str "queue: the declaration names " k " as :unique/:partition and"
+                           " this job does not carry it — the rule would be a silent"
+                           " no-op")
+                      {:key k :job job :decl d})))))
+
+(defn- ticket-for
+  "The Idempotency Key for one job: the `:unique` values, plus the kind, as one
+   string. `pr-str` per value rather than `str`, so `:a` and `\"a\"` are two
+   facts and not one."
+  [d job]
+  (let [u (:unique d)]
+    (when (seq u)
+      (str (name (:of d))
+           (join "" (map (fn [k] (str "|" (name k) "=" (pr-str (get job k)))) u))))))
+
+(defn- partition-key
+  "The `:partition` values of one job as one string, or nil. Per-key
+   serialisation: two jobs with the SAME string never run at once."
+  [d job]
+  (let [p (:partition d)]
+    (when (seq p)
+      (join "|" (map (fn [k] (str (name k) "=" (pr-str (get job k)))) p)))))
+
+(defn- due-at
+  "When the job is owed, from `:in` / `:at` / neither.
+
+   `:in [N UNIT]` follows the shape a project file's declarations already use
+   (`:every [30 :min]`), so a duration is one value with its unit rather than two
+   keys that can disagree. The clock here is the WALL clock: an enqueue may come
+   from a process that has no queue and no injected clock, and `:at` is available
+   to anyone who needs a number they chose."
+  [now opts]
+  (let [at (get opts :at)
+        in (get opts :in)]
+    (cond
+      (and (some? at) (some? in))
+        (throw (ex-info "queue: :in and :at are two ways to say when — give one"
+                        {:opts opts}))
+      (some? at) (if (erlang/is_integer at)
+                   at
+                   (throw (ex-info (str "queue: :at is epoch milliseconds — got " (str at))
+                                   {:at at})))
+      (some? in)
+        (do
+          (when-not (and (vector? in) (= 2 (count in)))
+            (throw (ex-info "queue: :in takes [N UNIT] — as in {:in [30 :minutes]}"
+                            {:in in})))
+          (+ now (tick/unit-ms (first in) (second in))))
+      :else now)))
+
+;; ── enqueue: a transaction, never a send ────────────────────────────────
+
+(defn- find-by-ticket [c ticket]
+  (datom/pull (datom/db c) '[*] [:job/ticket ticket]))
+
+(defn enqueue!
+  "Put a job ON the queue — a TRANSACTION against the queue's store, never a
+   message, so the job is a FACT before anything could act on it and a restart
+   cannot lose it. Returns the job, as a map of its stored facts (`:db/id`
+   included).
+
+   Options: `{:at <epoch-ms>}` for an absolute due, `{:in [N UNIT]}` for a
+   delay; neither means NOW.
+
+   A DUPLICATE INSIDE THE WINDOW IS A NO-OP RETURNING THE EXISTING JOB. The
+   window is the job's own life as an OUTSTANDING job — `:queued` or
+   `:running`: `:unique` names this queue's Idempotency Key, the key is asserted
+   with the job, and a second enqueue of the same key is refused by the store
+   (its `:db.unique/identity`) rather than by a key table this file would have to
+   keep in step. The returned map is the EXISTING job with `:job/created false`;
+   a job that was created says `:job/created true`.
+
+   The window CLOSES when the job settles: `:done` and `:failed` retract the
+   ticket, so a payload that was owed, ran, and finished may be enqueued again —
+   and does make a new job.
+
+   The queue must have STARTED once in this VM (its init writes the declaration
+   into the store, and a store that was never written has no declaration to
+   apply). A queue whose process is merely down still accepts work: the store
+   outlives the process, which is the entire point."
+  ([srv job] (enqueue! srv job {}))
+  ([srv job opts]
+   (let [opts (or opts {})]
+     (doseq [k (keys opts)]
+       (when-not (known? k KNOWN-ENQUEUE-OPTS)
+         (throw (ex-info (str "queue: unknown enqueue option " k " — known: "
+                              (join " " (map (fn [x] (str x)) KNOWN-ENQUEUE-OPTS)))
+                         {:option k :opts opts}))))
+     (let [c (conn srv)
+           d (declaration srv)]
+       (when (nil? d)
+         (throw (ex-info (str "queue: no declaration for \"" (name srv) "\" in the"
+                              " store — start the queue once before enqueueing into"
+                              " it")
+                         {:server srv})))
+       (validate-payload! d job)
+       (let [now (tick/wall-ms)
+             at (due-at now opts)
+             ticket (ticket-for d job)
+             pk (partition-key d job)
+             row (merge {:db/id -1
+                         :job/of (:of d)
+                         :job/server (name srv)
+                         :job/state :queued
+                         :job/at at
+                         :job/enqueued-at now
+                         :job/attempts 0
+                         :job/payload job}
+                        (if (some? ticket) {:job/ticket ticket} {})
+                        (if (some? pk) {:job/partition pk} {}))
+             ;; The row ASSERTS the ticket (so the tempid UPSERTS onto a job that
+             ;; already holds it) and the CAS REFUSES that upsert — which is the
+             ;; difference between "one job, quietly overwritten" and "no-op".
+             tx (if (some? ticket)
+                  [row [:db/cas -1 :job/ticket nil ticket]]
+                  [row])]
+         (try
+           (let [report (datom/transact! c tx)
+                 e (get (:tempids report) -1)]
+             (assoc (datom/entity (datom/db c) e) :job/created true))
+           (catch err
+             (if (and (some? ticket)
+                      (includes? (error-text err) "compare-and-swap"))
+               (let [j (find-by-ticket c ticket)]
+                 (if (some? j) (assoc j :job/created false) (throw err)))
+               (throw err)))))))))
+
+;; ── stats: a query, not a counter ───────────────────────────────────────
+
+(defn- job-rows
+  "Every job, as `[entity state at]`. A query, so the loop, the pane and the
+   verifier read the SAME facts — the table is public and neither of them needs
+   the process to have run."
+  [d]
+  (datom/q '[:find ?e ?s ?at :where [?e :job/state ?s] [?e :job/at ?at]] d))
+
+(defn stats
+  "Counts by status, as a QUERY over the store.
+
+   No process is asked, so the answer is the same whether the queue is running,
+   stopped, or was never started in this VM (an empty store answers zeros), and a
+   dashboard cannot be made slow by the work it reports. `:overdue` counts jobs
+   that are `:running` under an expired lease — the rows a Lifeline wake is about
+   to reclaim, and the ones an operator wants to see BEFORE it happens."
+  [srv]
+  (let [d (datom/db (conn srv))
+        now (tick/wall-ms)
+        rows (job-rows d)
+        of (fn [st] (count (filter (fn [r] (= st (second r))) rows)))
+        running (filter (fn [r] (= :running (second r))) rows)
+        overdue (count (filter (fn [r]
+                                 (let [j (datom/entity d (first r))
+                                       lease (:job/lease-until j)]
+                                   (or (nil? lease) (<= lease now))))
+                               running))]
+    {:queued (of :queued)
+     :running (of :running)
+     :done (of :done)
+     :failed (of :failed)
+     :overdue overdue
+     :total (count rows)}))
+
+;; ── the claim: ONE guarded transaction ──────────────────────────────────
+
+(defn- claim-tx
+  "The transaction that takes `job`, or nil when it is not claimable now.
+
+   The CAS is the guard, and there are two of them because there are two ways to
+   take a job: a `:queued` one (`:state` still `:queued`?) and an ORPHANED one —
+   `:running` under a lease that has run out, where the only value that can tell
+   two claimants apart is the lease itself (a CAS whose old equals its new would
+   let both through)."
+  [job now lease-ms token]
+  (let [e (:db/id job)
+        s (:job/state job)
+        lease (:job/lease-until job)
+        attempts (get job :job/attempts 0)]
+    (cond
+      (= s :queued)
+        [[:db/cas e :job/state :queued :running]
+         [:db/add e :job/lease-until (+ now lease-ms)]
+         [:db/add e :job/owner token]
+         [:db/add e :job/attempts (inc attempts)]]
+      (and (= s :running) (or (nil? lease) (<= lease now)))
+        [[:db/cas e :job/lease-until lease (+ now lease-ms)]
+         [:db/add e :job/owner token]
+         [:db/add e :job/attempts (inc attempts)]]
+      :else nil)))
+
+(defn- lose-race?
+  "Whether a refusal is the OTHER claimer winning. A compare-and-swap that does
+   not match throws, and everything else must stay loud: swallowing a schema
+   violation as 'lost the race' would hide a broken queue behind a busy one."
+  [e]
+  (includes? (error-text e) "compare-and-swap"))
+
+(defn claim!
+  "Take ONE job: mark it `:running`, lease it, and record the attempt — in ONE
+   transaction, so two claims cannot both take it. Returns the claimed job, or
+   nil when the world moved underneath the caller.
+
+   The caller passes the job it READ (the CAS is against that value, which is
+   what makes the read-modify-write safe without a lock); a live lease is
+   refused here as well as in the candidate scan, so a claim cannot steal a job
+   a live worker holds merely by asking.
+
+   Public because it is the whole of Claim/Lease and a verifier should be able
+   to exercise it without a running queue."
+  [c job now lease-ms]
+  (let [e (:db/id job)
+        ;; a value no other claim can produce: the VM's monotonic counter beside
+        ;; the clock, so a token that survives in a store across a restart still
+        ;; cannot collide with a fresh one.
+        token (str (erlang/system_time :millisecond) "-"
+                   (erlang/apply :erlang :unique_integer (list (list :positive))))
+        tx (claim-tx job now lease-ms token)]
+    (when (some? tx)
+      (try
+        (datom/transact! c tx)
+        (datom/entity (datom/db c) e)
+        (catch err
+          (if (lose-race? err) nil (throw err)))))))
+
+;; ── the loop ────────────────────────────────────────────────────────────
+;;
+;; ONE timer at the earliest deadline, and a claim pass on every wake. The state
+;; carries what a claim needs and nothing else: the declaration, the clock, the
+;; body, and the jobs currently RUNNING IN THIS PROCESS (which is what bounds
+;; concurrency and what makes :partition per-key serialisation possible).
+
+(def TIMER-KEY :bl-queue/timer)
+
+(defn- pd
+  "The process dictionary's value for `key`, or `default`. `:erlang.get/1`
+   answers the ATOM `:undefined` on a miss, and an atom is truthy here — so
+   `(or (erlang/get k) …)` hands `:undefined` on and the next arithmetic dies."
+  [key default]
+  (let [v (erlang/get key)]
+    (if (= :undefined v) default v)))
+
+(defn- arm-ms!
+  "Arm the ONE wake, `delay` milliseconds out, cancelling whatever was pending.
+
+   A cancelled timer may already have sent its message; a stale wake is
+   HARMLESS here (it re-reads the store), which is why this needs none of
+   `proc.tick`'s generation machinery. `delay < 1` becomes 1: work that is due
+   NOW is delivered as a message, never as a re-entrant call."
+  [delay]
+  (let [old (pd TIMER-KEY nil)]
+    (when (some? old) (erlang/cancel_timer old))
+    (erlang/put TIMER-KEY
+                (erlang/send_after (if (< delay 1) 1 delay)
+                                   (erlang/self)
+                                   (tuple :bl-queue/wake)))))
+
+(defn- wake-time
+  "The earliest moment this queue must look again, from the store, or nil.
+
+   `owed?` is BOOT semantics: a `:at` that ALREADY PASSED is a deadline missed
+   while the queue was not running, nobody has claimed it, and the only thing
+   that will notice it is this timer. At RUNTIME a past due is different — it is
+   a job this process can already claim, or one waiting for a slot, and both of
+   those unblock with a MESSAGE (a completion, an enqueue) rather than a timer —
+   so arming for it would be a 1 ms poll, which is exactly what this design
+   exists to avoid (a queue at its concurrency bound would spin at 1000 store
+   reads a second).
+
+   A RUNNING job's lease is always counted, past or absent: it means the owner is
+   gone, and the wake after it prunes the dead claim and hands the job to the
+   Lifeline."
+  [d now owed?]
+  (reduce
+    (fn [acc row]
+      (let [s (second row)
+            t (cond
+                (= s :queued) (let [at (nth row 2)]
+                                (if (or owed? (> at now)) at nil))
+                (= s :running) (or (:job/lease-until (datom/entity d (first row))) now)
+                :else nil)]
+        (if (nil? t) acc (if (or (nil? acc) (< t acc)) t acc))))
+    nil
+    (job-rows d)))
+
+(defn next-wake
+  "The earliest moment this queue must look again AT BOOT, or nil when there is
+   nothing owed: a queued job's `:at` (past or future) or a running job's LEASE
+   EXPIRY. A restart re-derives the wheel from the facts, so a deadline missed
+   while the queue was down is visible here as a past `:at`."
+  [d now]
+  (wake-time d now true))
+
+(defn- due-candidates
+  "Every claimable job, oldest first: queued and due, plus running ones whose
+   lease has run out."
+  [d now]
+  (->> (job-rows d)
+       (filter (fn [row]
+                 (let [s (second row)]
+                   (or (= s :running)
+                       (and (= s :queued) (<= (nth row 2) now))))))
+       (map (fn [row] (datom/entity d (first row))))
+       (filter (fn [j]
+                 (if (= :queued (:job/state j))
+                   true
+                   (let [lease (:job/lease-until j)]
+                     (or (nil? lease) (<= lease now))))))
+       (sort-by (fn [j] (:job/at j)))))
+
+(defn arm
+  "Re-arm the wake at the earliest deadline still worth a timer. Returns the
+   delay armed, or nil when nothing is outstanding — an idle queue is woken by
+   its own store's broadcast (an enqueue) and by its workers' completions, never
+   by a poll."
+  [st]
+  (let [q (:queue st)
+        now ((:clock q))
+        due (wake-time (datom/db (conn (:server q))) now false)]
+    (when (some? due)
+      (let [delay (- due now)]
+        (arm-ms! delay)
+        delay))))
+
+(defn- busy-partitions [running]
+  (into #{} (remove nil? (map (fn [entry] (:partition (second entry))) running))))
+
+(defn- partition-free? [job busy]
+  (let [pk (:job/partition job)]
+    (or (nil? pk) (not (contains? busy pk)))))
+
+(defn- job-map
+  "The job as `perform` sees it: the stored facts, with the payload's own keys
+   hoisted so a body may name them directly. The queue's own fields win a
+   collision — `validate-payload!` has already refused a payload that writes the
+   `job` namespace, so this is belt and braces."
+  [j]
+  (let [payload (:job/payload j)]
+    (if (map? payload) (merge payload j) j)))
+
+(defn- launch!
+  "Claim `job` and start its body on its OWN process. Returns the running entry,
+   or nil when another claimer took it first.
+
+   The body runs on a plain `spawn`, not on the server: a slow `perform` must not
+   stop the queue from claiming the next job, which is what `:concurrency`
+   means. A worker that is KILLED (not merely raising) sends nothing, and the
+   job stays `:running` until its lease runs out — the Lifeline wake above —
+   which is why the lease is the safety net and no monitor is registered: a
+   `[:DOWN …]` handler would have to match every DOWN message in the server, and
+   the lease already answers the same question for less."
+  [st job]
+  (let [q (:queue st)
+        c (conn (:server q))
+        now ((:clock q))
+        decl (:decl q)
+        claimed (claim! c job now (* 1000 (:lease decl)))]
+    (when (some? claimed)
+      (let [ref (erlang/make_ref)
+            e (:db/id claimed)
+            token (:job/owner claimed)
+            body (:perform q)
+            me (erlang/self)]
+        (spawn (fn []
+                 (let [out (try
+                             {:ok (body (job-map claimed))}
+                             (catch err {:error (error-text err)}))]
+                   (erlang/send me (tuple :bl-queue/finished ref out)))))
+        {:ref ref
+         :e e
+         :token token
+         :attempts (:job/attempts claimed)
+         ;; the deadline this CLAIM will be judged by. Kept here as well as in
+         ;; the store, because this process must know when its own claim stops
+         ;; being one — that is what frees the slot a killed worker leaked.
+         :lease-until (+ now (* 1000 (:lease decl)))
+         :partition (:job/partition claimed)}))))
+
+(defn- outcome-tx
+  "The transaction that settles one claimed job.
+
+   Every branch is GUARDED on the owner token, so the process that no longer
+   holds the job cannot write its outcome over the one that does — the job
+   settles once, under one owner, however many times the body ran."
+  [e job token out now decl attempts]
+  (let [guard [[:db/cas e :job/owner token token]
+               [:db/retract e :job/owner token]]
+        ticket (when (some? (:job/ticket job))
+                 [[:db/retract e :job/ticket (:job/ticket job)]])
+        with-ticket (fn [ops] (vec (concat guard ops ticket)))]
+    (if (contains? out :ok)
+      (with-ticket [[:db/add e :job/state :done]
+                    [:db/add e :job/result (:ok out)]
+                    [:db/add e :job/finished-at now]])
+      (let [err (str (:error out))]
+        (if (>= attempts (:max (:retry decl)))
+          ;; EXHAUSTED, and the job is KEPT: :failed is a state a human reads,
+          ;; which is the whole difference between a retry ceiling and a hole the
+          ;; work fell into.
+          (with-ticket [[:db/add e :job/state :failed]
+                        [:db/add e :job/last-error err]])
+          (with-ticket [[:db/add e :job/state :queued]
+                        [:db/add e :job/at (+ now (backoff-ms (:retry decl) attempts))]
+                        [:db/add e :job/last-error err]]))))))
+
+(defn- settle!
+  [st entry out]
+  (let [q (:queue st)
+        c (conn (:server q))
+        now ((:clock q))
+        e (:e entry)
+        decl (:decl q)
+        job (datom/entity (datom/db c) e)]
+    (if (nil? job)
+      :gone
+      (let [tx (outcome-tx e job (:token entry) out now decl (:attempts entry))]
+        (try
+          (datom/transact! c tx)
+          :settled
+          (catch err
+            (if (lose-race? err) :lost (throw err))))))))
+
+(defn settle
+  "Record one worker's outcome and stop tracking it. A ref this process is not
+   tracking is ignored — a wake that raced the completion is not an error."
+  [st ref out]
+  (let [q (:queue st)]
+    (if (nil? (get (:running q) ref))
+      st
+      (do
+        (settle! st (get (:running q) ref) out)
+        (assoc st :queue (assoc q :running (dissoc (:running q) ref)))))))
+
+(defn run-due
+  "One pass: forget claims whose lease has run out, claim as much due work as
+   there is ROOM for, then arm the next wake.
+
+   Idempotent by construction — it reads the store and claims what is due, so a
+   stale wake costs one store read and nothing else. `:concurrency` is bounded
+   HERE, by the room left after the jobs this process is already running, which
+   is also why `:partition` can be honoured at all: both rules are about what one
+   claimant already holds.
+
+   FORGETTING AN EXPIRED CLAIM is why the lease is a slot and not only a
+   timestamp. A worker that was KILLED sends nothing, so its entry would sit in
+   `:running` forever and the queue would be permanently one slot smaller — a
+   queue that heals its job but not its own capacity. The entry dies with its
+   lease instead; the job it was holding is then reclaimed by the same pass, and
+   if that worker is merely SLOW, its late outcome is refused (it no longer owns
+   the job) — which is at-least-once, stated where it happens."
+  [st]
+  (let [q0 (:queue st)
+        c (conn (:server q0))
+        now ((:clock q0))
+        live (into {} (remove (fn [entry]
+                                (let [lu (:lease-until (second entry))]
+                                  (and (some? lu) (<= lu now))))
+                              (:running q0)))
+        st (assoc st :queue (assoc q0 :running live))
+        room (- (:concurrency (:decl q0)) (count live))
+        busy (busy-partitions live)
+        cands (if (> room 0) (vec (due-candidates (datom/db c) now)) [])]
+    (loop [st st cs cands room room busy busy]
+      (if (or (<= room 0) (empty? cs))
+        (do (arm st) st)
+        (let [job (first cs)]
+          (if (not (partition-free? job busy))
+            (recur st (vec (rest cs)) room busy)
+            (let [entry (launch! st job)]
+              (if (nil? entry)
+                (recur st (vec (rest cs)) room busy)
+                (recur (assoc-in st [:queue :running (:ref entry)] entry)
+                       (vec (rest cs))
+                       (dec room)
+                       (if (some? (:partition entry))
+                         (conj busy (:partition entry))
+                         busy))))))))))
+
+;; ── the init, the prelude, the two clauses ──────────────────────────────
+
+(def perform-fns
+  "Server name (as a string) → the `(perform …)` body. An atom, because the
+   `perform` clause is resolved when the server is COMPILED and this map is
+   filled when it is STARTED: the clause's prelude registers the body, and the
+   queue's init reads it — which is the one order that works for both, since
+   every prelude runs before any clause's `:init`."
+  (atom {}))
+
+(defn register-perform!
+  "Called from the `(perform [job] …)` clause's prelude. Public because the
+   generated form lives in the CALLER's namespace and calls it there."
+  [srv f]
+  (swap! perform-fns assoc (name srv) f)
+  f)
+
+(defn- perform-fn [srv] (get @perform-fns (name srv)))
+
+(defn init-state
+  "The state the clause contributes: the declaration, the clock, the body, and
+   the jobs running in THIS process.
+
+   The declaration is written to the store HERE, at boot. That is what lets
+   `enqueue!` be a store write with no process to ask, and it is why a queue
+   must be started once before it can be enqueued into."
+  [srv decl clock]
+  (announce! srv)
+  (ensure-store! srv)
+  (let [d (normalise-decl decl)
+        body (perform-fn srv)
+        _ (when (nil? body)
+            (throw (ex-info (str "queue: \"" (name srv) "\" declares no (perform [job] …) —"
+                                 " a queue with no body would accept work it can never"
+                                 " do")
+                            {:server srv})))]
+    (write-decl! (conn srv) srv d)
+    {:queue {:server srv
+             :decl d
+             :clock clock
+             :perform body
+             :running {}}}))
+
+(defn arm-first
+  "The prelude: subscribe THIS process to its store, and arm the wake for work
+   already in it.
+
+   Subscribing here, and not at the caller's, is deliberate: a subscription (like
+   a name) is only useful if the process that OWNS it installed it. Arming from
+   the STORE is what makes a restart RESUME — a deadline missed while the queue
+   was down has `:at` in the past and runs at once, and a job left `:running`
+   wakes the loop when its lease expires."
+  [srv clock]
+  (datom/listen! (conn srv) {:attrs #{:job/at}})
+  (let [c (conn srv)
+        now (clock)
+        due (next-wake (datom/db c) now)]
+    (when (some? due)
+      (arm-ms! (- due now)))))
+
+(defn queue-clause
+  "The `(queue {…})` transform. Public because it is worth testing on its own:
+   it is the unit that turns a declaration into a loop."
+  [clause ctx]
+  (let [forms (vec (rest clause))
+        where (str "defserver " (:name ctx))]
+    (when (not= 1 (count forms))
+      (throw (ex-info (str where ": (queue {…}) — exactly one option map is required")
+                      {:clause clause})))
+    (let [opts (first forms)]
+      (when-not (map? opts)
+        (throw (ex-info (str where ": (queue {…}) — the options must be a LITERAL map,"
+                             " so the declaration is data")
+                        {:opts opts})))
+      (doseq [k (keys opts)]
+        (when-not (known? k KNOWN-CLAUSE-OPTS)
+          (throw (ex-info (str where ": unknown queue option " k " — known: "
+                               (join " " (map (fn [x] (str x)) KNOWN-CLAUSE-OPTS)))
+                          {:option k}))))
+      (let [decl (select-keys opts KNOWN-DECL-OPTS)
+            _ (normalise-decl decl)          ; a typo fails HERE, naming the server
+            clock (if (some? (get opts :clock)) (get opts :clock) `proc.tick/wall-ms)
+            srv (if (some? (get opts :server))
+                  (get opts :server)
+                  (list 'quote (:name ctx)))]
+        {:prelude [`(proc.queue/arm-first ~srv ~clock)]
+         :init `(proc.queue/init-state ~srv ~decl ~clock)
+         :clauses
+         [`(handle-info [:bl-queue/wake] [st#]
+             (noreply (proc.queue/run-due st#)))
+          `(handle-info [:datom/tx _basis# _datoms#] [st#]
+             (noreply (proc.queue/run-due st#)))
+          `(handle-info [:bl-queue/finished ref# out#] [st#]
+             (noreply (proc.queue/run-due (proc.queue/settle st# ref# out#))))
+          `(handle-call [:enqueue job# opts#] [_from# st#]
+             (reply (proc.queue/enqueue! (:server (get st# :queue)) job# opts#) st#))
+          `(handle-call [:stats] [_from# st#]
+             (reply (proc.queue/stats (:server (get st# :queue))) st#))]}))))
+
+(defn perform-clause
+  "The `(perform [job] BODY…)` transform: the ONE thing a queue cannot derive.
+
+   It contributes a prelude and no state, because the body belongs in the queue's
+   OWN slice rather than beside it: two clauses claiming `:init` keys would merge
+   as two maps where the later silently replaced the earlier, and a queue whose
+   body vanished at boot is a queue that accepts work and never does it."
+  [clause ctx]
+  (let [forms (vec (rest clause))
+        where (str "defserver " (:name ctx))]
+    (when (< (count forms) 2)
+      (throw (ex-info (str where ": (perform [job] BODY…) — a params vector and a body"
+                           " are required")
+                      {:clause clause})))
+    (let [params (first forms)
+          body (vec (rest forms))]
+      (when-not (and (vector? params) (= 1 (count params)) (symbol? (first params)))
+        (throw (ex-info (str where ": the perform's params vector holds exactly one"
+                             " symbol — the job")
+                        {:params params})))
+      {:prelude [`(proc.queue/register-perform! '~(:name ctx) (fn ~params ~@body))]})))
+
+(extend-clause! :queue queue-clause)
+
+(extend-clause! :perform perform-clause)

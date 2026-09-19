@@ -1,0 +1,299 @@
+; test/bl/queue_test.bl — the durable queue: the claim, the fact, the loop, the query.
+; Run: bin/bl -p priv/std test --shared test/bl/queue_test.bl
+;
+; `--shared`, exactly as the other clause suites (sched_test, tick_test) need it,
+; and for the same reason: the ISOLATED runner expands a file's `defserver` forms
+; before any of its top-level calls run, so a clause registered by a namespace
+; the runner's image has not already loaded (BUG-082) is unknown at expansion —
+; measured here, where `bl test test/bl/queue_test.bl` fails on `(queue …)` and
+; the same file passes under `--shared`. `proc.sched` is in the image because the
+; tree's own `:schedules` load it at boot; `proc.queue` has no such caller yet.
+;
+; The claim is proven FIRST, under concurrency, because everything else is built
+; on it: if two claims can take one job, a queue is a way to run a body twice.
+; The rest pins the four properties the design turns on:
+;
+;   · a job is a FACT — enqueue is a transaction, so killing the process cannot
+;     lose it and a restart RESUMES rather than repeats;
+;   · a failure is a state a human reads (`:failed`, with attempts and the
+;     error), and the retry lattice is arithmetic, not a hope;
+;   · `:unique` makes a duplicate enqueue a NO-OP inside the job's window and a
+;     NEW job once the window closes;
+;   · `:concurrency` is an upper bound, and `stats` answers from the store — so
+;     the pane never asks a process, and never wakes one either.
+
+(ns queue.test
+  (:require [proc :as proc]
+            [proc.queue :as queue]
+            [datom :as datom]))
+
+;; ── reading the store the way a pane would ──────────────────────────────
+
+(defn- job-of [srv e]
+  (datom/entity (datom/db (queue/conn srv)) e))
+
+(defn- all-jobs [srv]
+  (let [d (datom/db (queue/conn srv))]
+    (map (fn [row] (datom/entity d (first row)))
+         (datom/q '[:find ?e :where [?e :job/state _]] d))))
+
+(defn- wait-until
+  "Poll `pred` until it holds, or `ms` elapses. A queue is timers and processes,
+   so a test that asserts after a fixed sleep is a test that fails on a busy
+   machine."
+  [pred ms]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n ms) false
+      :else (do (Process/sleep 10) (recur (+ n 10))))))
+
+;; ── the claim: one job, one claimer ─────────────────────────────────────
+
+(def empty-runs (atom 0))
+
+(proc/defserver empties-q
+  (queue {:of :demo/nothing :concurrency 1})
+  (perform [job] (swap! empty-runs inc)))
+
+(deftest two-concurrent-claims-never-take-one-job
+  ; The queue is NOT running: its init wrote the declaration into the store, and
+  ; the race is between independent claimers on one connection — which is the
+  ; shape two queues, or a queue and a Lifeline sweep, actually take.
+  (let [s (start empties-q nil {})]
+    (Process/sleep 30)
+    (stop s))
+  (let [j (queue/enqueue! :empties-q {:demo/fact 1})
+        c (queue/conn :empties-q)
+        tasks (to-list (map (fn [_]
+                              (Task/async (fn [] (queue/claim! c j (proc/wall-ms) 60000))))
+                            (range 8)))
+        outcomes (to-list (map (fn [t] (Task/await t)) tasks))
+        won (filter some? outcomes)]
+    (is (= 1 (count won)) "one claim, not eight")
+    (is (= 1 (:job/attempts (first won))) "…and exactly one attempt was recorded")
+    (is (= :running (:job/state (job-of :empties-q (:db/id j))))
+        "…and the job is running under that one owner")))
+
+(deftest an-expired-lease-makes-a-running-job-claimable-again
+  ; The Lifeline. A worker that died leaves the job :running; the lease is the
+  ; only thing that can tell "still working" from "gone", and it is a CAS on the
+  ; lease VALUE, so two reclaimers cannot both take it.
+  (let [s (start empties-q nil {})]
+    (Process/sleep 30)
+    (stop s))
+  (let [j (queue/enqueue! :empties-q {:demo/fact 1})
+        c (queue/conn :empties-q)
+        first-claim (queue/claim! c j (proc/wall-ms) 60000)]
+    (is (= :running (:job/state first-claim)))
+    (is (nil? (queue/claim! c first-claim (proc/wall-ms) 60000))
+        "a job under a LIVE lease is not claimable")
+    ;; the process that held it is gone, and its lease has run out
+    (datom/transact! c [[:db/add (:db/id first-claim) :job/lease-until
+                         (- (proc/wall-ms) 1)]])
+    (let [again (queue/claim! c (job-of :empties-q (:db/id j)) (proc/wall-ms) 60000)]
+      (is (some? again) "an expired lease is reclaimed")
+      (is (not= (:job/owner first-claim) (:job/owner again)) "under a NEW owner token")
+      (is (= 2 (:job/attempts again)) "…and the attempt is counted"))))
+
+;; ── the job is a fact ───────────────────────────────────────────────────
+
+(def served (atom []))
+
+(proc/defserver larder
+  (queue {:of :hotel/order
+          :concurrency 2
+          :unique [:order/room :order/item]
+          :lease 300})
+  (perform [job] (swap! served conj (:order/item job))))
+
+(deftest an-enqueued-job-outlives-the-queue-process
+  (let [s (start larder nil {})]
+    (Process/sleep 30)
+    (erlang/exit s :kill)
+    (Process/sleep 60)
+    (is (nil? (Process/whereis :bl-queue/larder)) "the queue was killed, not asked to stop"))
+  (let [j (queue/enqueue! :larder {:order/room "101" :order/item :breakfast})]
+    (is (= :queued (:job/state j)) "the job is a fact, not a message")
+    (is (= "101" (get-in j [:job/payload :order/room])) "the payload is stored as the job's own facts")
+    (let [s (start larder nil {})]
+      (is (wait-until (fn [] (= :done (:job/state (job-of :larder (:db/id j))))) 3000)
+          "the restart resumed from the store and ran it")
+      (is (some (fn [x] (= :breakfast x)) @served))
+      (stop s))))
+
+(deftest a-duplicate-enqueue-inside-the-window-yields-one-job
+  (let [s (start larder nil {})]
+    (Process/sleep 30)
+    (stop s))                                  ; nothing claims, so the window stays open
+  (let [a (queue/enqueue! :larder {:order/room "102" :order/item :late-checkout})
+        b (queue/enqueue! :larder {:order/room "102" :order/item :late-checkout})]
+    (is (= true (:job/created a)))
+    (is (= (:db/id a) (:db/id b)) "one job, not two")
+    (is (= false (:job/created b)) "the second enqueue is a NO-OP returning the first")
+    (is (= 1 (count (filter (fn [x] (= "102" (get-in x [:job/payload :order/room])))
+                            (all-jobs :larder))))
+        "…and the store holds exactly one such job")
+    ; the window CLOSES when the job settles, so the same payload may be owed again
+    (let [s (start larder nil {})]
+      (is (wait-until (fn [] (= :done (:job/state (job-of :larder (:db/id a))))) 3000))
+      (stop s))
+    (let [c (queue/enqueue! :larder {:order/room "102" :order/item :late-checkout})]
+      (is (= true (:job/created c)) "a settled job frees its key")
+      (is (not= (:db/id a) (:db/id c)) "…and a fresh job is what the key buys"))))
+
+;; ── the loop: retry, and the bound ──────────────────────────────────────
+
+(def tries (atom 0))
+
+(proc/defserver flaky
+  (queue {:of :demo/flaky
+          :concurrency 1
+          :retry {:max 3 :backoff :exponential :base 20 :max-delay 40 :jitter 0}})
+  (perform [job]
+    (swap! tries inc)
+    (throw (ex-info "the kitchen is on fire" {}))))
+
+(deftest a-failing-perform-retries-then-ends-failed
+  (reset! tries 0)
+  (let [s (start flaky nil {})
+        j (queue/enqueue! :flaky {:demo/fact 1})]
+    (is (wait-until (fn [] (= :failed (:job/state (job-of :flaky (:db/id j))))) 5000)
+        "the job ends :failed rather than vanishing")
+    (let [done (job-of :flaky (:db/id j))]
+      (is (= :failed (:job/state done)) "…visibly, where a pane reads it")
+      (is (= 3 (:job/attempts done)) "three attempts — the retry ceiling")
+      (is (includes? (str (:job/last-error done)) "on fire") "…and the error is kept"))
+    (is (= 3 @tries) "the body ran once per attempt, and not again")
+    (stop s)))
+
+(deftest backoff-grows-exponentially-and-is-capped
+  (let [r {:max 5 :backoff :exponential :base 100 :max-delay 1000 :jitter 0}]
+    (is (= 100 (queue/backoff-ms r 1)))
+    (is (= 200 (queue/backoff-ms r 2)))
+    (is (= 400 (queue/backoff-ms r 3)))
+    (is (= 800 (queue/backoff-ms r 4)))
+    (is (= 1000 (queue/backoff-ms r 5)) "capped at :max-delay, not 1600"))
+  (is (= 50 (queue/backoff-ms {:backoff :constant :base 50 :max-delay 900 :jitter 0} 4))
+      ":constant does not grow"))
+
+;; ── at-least-once: the lease reclaims, and the owner guard settles ──────
+
+(def haul-runs (atom 0))
+
+(proc/defserver orphaned
+  ; a ONE-SECOND lease, so the reclaim is a test rather than a five-minute wait,
+  ; and concurrency ONE, so the claim's expiry must also free the slot: without
+  ; that, the queue would be permanently one worker smaller — a queue that heals
+  ; its job and not its own capacity.
+  (queue {:of :demo/haul :concurrency 1 :lease 1})
+  (perform [job]
+    ; the FIRST body outlives its lease on purpose; every later one does not.
+    (let [n (swap! haul-runs inc)]
+      (Process/sleep (if (= 1 n) 1600 100)))))
+
+(deftest a-body-that-outlives-its-lease-runs-again-and-settles-once
+  ; AT-LEAST-ONCE, demonstrated rather than promised in prose. The first body
+  ; outlives its one-second lease, the Lifeline wake reclaims the job and runs it
+  ; again, and the FIRST worker's outcome does not settle it — by then it is no
+  ; longer the owner — so the job settles ONCE, under the claim that holds it,
+  ; even though the body ran twice. That is the whole of the contract, and it is
+  ; measurable.
+  (reset! haul-runs 0)
+  (let [s (start orphaned nil {})
+        j (queue/enqueue! :orphaned {:demo/haul 1})]
+    (is (wait-until (fn [] (= :done (:job/state (job-of :orphaned (:db/id j))))) 8000)
+        "the job settles — once, however many times the body ran")
+    (let [end (job-of :orphaned (:db/id j))]
+      (is (>= (:job/attempts end) 2) "the expired lease made it claimable again")
+      (is (>= @haul-runs 2) "…and the body really did run again")
+      (is (nil? (:job/owner end)) "…under one owner, which let go when it settled"))
+    (stop s)))
+
+
+(def in-flight (atom 0))
+(def high-water (atom 0))
+(def finished (atom 0))
+
+(proc/defserver staggered
+  (queue {:of :demo/step :concurrency 2 :lease 60})
+  (perform [job]
+    (let [n (swap! in-flight inc)]
+      (swap! high-water (fn [h] (max h n))))
+    (Process/sleep 60)
+    (swap! in-flight dec)
+    (swap! finished inc)))
+
+(deftest concurrency-is-never-exceeded
+  (reset! in-flight 0)
+  (reset! high-water 0)
+  (reset! finished 0)
+  (let [s (start staggered nil {})]
+    (doseq [i (range 6)] (queue/enqueue! :staggered {:demo/step i}))
+    ; wait on the STORE, not on the body's own counter: the outcome is written
+    ; by the queue when the worker reports back, so "the body finished" and "the
+    ; job settled" are two moments (and that gap is exactly at-least-once).
+    (is (wait-until (fn [] (= 6 (:done (queue/stats :staggered)))) 6000)
+        "all six ran and settled")
+    (is (= 6 @finished) "each body ran once")
+    (is (<= @high-water 2) (str "□(executing ≤ 2) — the high-water mark was " @high-water))
+    (stop s)))
+
+;; ── stats: a query, whoever asks ────────────────────────────────────────
+
+(proc/defserver ledger
+  (queue {:of :demo/entry :concurrency 1 :unique [:entry/id] :lease 300})
+  (perform [job] :ok))
+
+(deftest stats-answers-with-no-process-asked
+  (let [s (start ledger nil {})]
+    (Process/sleep 30)
+    (stop s))
+  (queue/enqueue! :ledger {:entry/id "a"})
+  (queue/enqueue! :ledger {:entry/id "b"})
+  (is (not (queue/serving? :ledger)) "no process is running to be asked")
+  (let [s (queue/stats :ledger)]
+    (is (= 2 (:queued s)) "counted from the store, by nobody in particular")
+    (is (= 2 (:total s)))
+    (is (= 0 (:running s)))
+    (is (= 0 (:overdue s))))
+  (let [q (start ledger nil {})]
+    (is (wait-until (fn [] (= 2 (:done (queue/stats :ledger)))) 3000))
+    (is (queue/serving? :ledger))
+    (stop q))
+  (let [s (queue/stats :ledger)]
+    (is (= 2 (:done s)) "and the answer outlives the process that did the work")
+    (is (= 0 (:queued s)))))
+
+;; ── the clause itself: refusals, and what it contributes ────────────────
+
+(proc/defserver bodiless
+  (queue {:of :demo/nothing :concurrency 1}))
+
+(deftest a-queue-with-no-perform-refuses-to-start
+  (is (thrown? (start bodiless nil {})))
+  (is (not (queue/serving? :bodiless)) "…and it left no registration behind"))
+
+(deftest a-malformed-declaration-is-refused-at-expansion
+  (is (thrown? (queue/queue-clause '(queue {:concurrency 2}) {:name 'x}))
+      "no :of — a queue with no entity kind")
+  (is (thrown? (queue/queue-clause '(queue {:of :a :concurency 2}) {:name 'x}))
+      "a typo'd option, not a silent default")
+  (is (thrown? (queue/queue-clause '(queue {:of :a :concurrency 0}) {:name 'x}))
+      "a concurrency bound of zero can never run anything")
+  (is (thrown? (queue/queue-clause '(queue {:of :a :lease 0}) {:name 'x}))
+      "a lease of zero is an orphan the moment it is taken")
+  (is (thrown? (queue/queue-clause '(queue {:of :a :retry {:backoff :fibonacci}}) {:name 'x}))
+      "an unknown backoff")
+  (is (thrown? (queue/queue-clause '(queue {:of :a :retry {:max 0}}) {:name 'x}))
+      "zero attempts cannot mean 'try once'")
+  (is (thrown? (queue/queue-clause '(queue) {:name 'x})) "no option map"))
+
+(deftest the-transform-returns-a-loop-not-a-server
+  (let [c (queue/queue-clause '(queue {:of :demo/thing :concurrency 3}) {:name 'x})]
+    (is (= 1 (count (:prelude c))) "one subscribe-and-arm in the prelude")
+    (is (some? (:init c)) "…and a slice of state")
+    (is (= 5 (count (:clauses c))) "1 wake + 1 notifier + 1 completion + 2 ops"))
+  (let [p (queue/perform-clause '(perform [job] (charge! job)) {:name 'x})]
+    (is (= 1 (count (:prelude p))) "the body is registered, not merged")
+    (is (nil? (:init p)) "…so it cannot collide with the queue's own slice")))

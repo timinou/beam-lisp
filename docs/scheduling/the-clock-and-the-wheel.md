@@ -649,26 +649,40 @@ narrate a decision and the pane can show a policy column — the same trick as
   ;; the store IS the queue; the clause is the hand that turns it
   (queue {:of          :hotel/order          ; the entity kind in this server's store
           :concurrency 4                     ; □(executing ≤ 4) — z3, like outbox's ≤200
-          :retry       {:max 5 :backoff :exponential :base 1000 :max 60000 :jitter 0.2}
+          :retry       {:max 5               ; ATTEMPTS (Oban's max_attempts)
+                        :backoff :exponential :base 1000
+                        :max-delay 60000     ; the delay CEILING — a map cannot hold :max twice
+                        :jitter 0.2}
           :unique      [:order/room :order/item]  ; the STORE's identity — one window, no key table
-          :lease       300                   ; orphan detection (Lifeline)
+          :lease       300                   ; SECONDS — orphan detection (Lifeline)
           :partition   [:order/room]})       ; per-key serialisation
   (perform [job]                             ; the ONE thing a queue cannot derive
-    (charge! job)
-    (assoc job :status :done)))
+    (charge! job)))
 ```
 
+As built (`priv/std/proc/queue.bl`): `:of` and `:unique`/`:partition` name attributes
+of the JOB's map, which the queue stores as ONE `:job/payload` value — the queue
+cannot know a caller's attributes, and a schema it invented for them would make
+every job kind a schema change. A payload that does not carry a declared
+`:unique`/`:partition` key is REFUSED, because the rule would otherwise match
+`nil` on every job and do nothing. `perform` still sees the payload's own keys:
+the job map it is handed is the stored entity with the payload merged in.
+
 **Enqueue is a write, not a verb on a handle.** The job must be a FACT before it
-can be owed, so it is a transaction against the same store the claim reads:
+can be owed, so it is a transaction against the same store the claim reads — and
+`enqueue!` needs no process to answer it:
 
 ```clojure
-(call :larder [! :enqueue {:room "101" :item :breakfast}])          ; immediate
-(call :larder [! :enqueue {:room "102" :item :late-checkout} :in 30 :minutes])
-(call :larder [! :enqueue {:room "103" :item :minibar} :at (sched/next housekeeping :audit)])
+(proc.queue/enqueue! :larder {:order/room "101" :order/item :breakfast})
+(proc.queue/enqueue! :larder {:order/room "102" :order/item :late-checkout}
+                             {:in [30 :minutes]})
+(proc.queue/enqueue! :larder {:order/room "103" :order/item :minibar}
+                             {:at (proc/next housekeeping :audit)})
 
 ;; and the pane does not ask anyone — it is the same store
-(datom/q (proc/conn :larder) '[:find ?room ?status :where …])
-(system/verify 'larder)   ; the concurrency bound, the retry lattice, lease ≥ timeout
+(datom/q (proc.queue/conn :larder) '[:find ?room ?state :where …])
+(proc.queue/stats :larder)   ; {:queued 3 :running 1 :done 12 :failed 0 :overdue 0 :total 16}
+(system/verify 'larder)      ; the concurrency bound, the retry lattice, lease ≥ timeout
 ```
 
 The verbs that survive are the two that are NOT machinery: `enqueue!` (a store
@@ -1209,10 +1223,21 @@ P4  ✅ CUTOVER: the tree's periodic work is a DECLARATION (env.bl `:schedules`)
      clause) and lives in Elixir
       the watch-debounce (reload_watcher.ex) onto P1/P2; the pane is now non-empty
         ── then, separately ──
-P5  priv/std/proc/queue.bl — the `(queue …)` CLAUSE, not a `defqueue` form
+P5  priv/std/proc/queue.bl — the `(queue …)` CLAUSE, not a `defqueue` form  ← DONE
      (§4.3: a form is a fork — the `defbeat` precedent). The store is the queue;
      the clause is the claim loop; `enqueue!` is a transaction and `stats` is a
      query; `prune` is a `:schedules` declaration, not part of this bundle.
+     `bl -p priv/std test --shared test/bl/queue_test.bl` — 12 tests, 61
+     assertions: the claim proven under concurrency (8 claimers, one winner),
+     a job that outlives a KILLED queue and runs on restart, the retry lattice
+     bounded to `:failed` with attempts + error kept, a duplicate enqueue a
+     no-op inside the window and a NEW job once it closes, the concurrency
+     high-water mark ≤ 2, `stats` answering with no process alive, and a body
+     that outlives its one-second lease re-run by the Lifeline while its first
+     worker's late outcome is refused (at-least-once, at-most-once EFFECT).
+     `--shared` for the reason sched_test/tick_test need it: the isolated runner
+     expands a file's `defserver` forms before its requires run (BUG-082), so a
+     clause from a namespace its image has not loaded is unknown at expansion.
      knowledger cut over from its hand-rolled runner.
 P3b the pane's two open rows: `:jobs` (waits on P5) and the DEEP ROW — a
      declaration's recent occurrences + its refusals + its `verify` verdict, and
