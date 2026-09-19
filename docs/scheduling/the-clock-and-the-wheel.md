@@ -630,28 +630,53 @@ State, as facts (this is what the pane reads):
 narrate a decision and the pane can show a policy column — the same trick as
 `hw.gpu.mode` in the AGENTS.md AVD config, but as a queryable fact.
 
-### 4.3 `defqueue` — durable jobs (the Oban bundle)
+### 4.3 the `(queue …)` clause — durable jobs (the Oban bundle)
+
+> **A clause, not a form — because a form is a fork.** `defbeat` was this same
+> decision one rung down: it existed, the `(tick …)` clause landed, and the form
+> was DELETED (§4.1.1). The reason quoted there holds here: a macro cannot hold
+> state, so it has nowhere to put a slice, and it cannot compose with the other
+> `defserver` clauses a worker will want (`handle` for its own backlog, `tick` for
+> a sweep, `sched` for the prune).
+>
+> §3.2 has already said what this is: *"a relation + a tick + a watch"*, with the
+> two durable patterns — *Idempotency Key* and *Claim/Lease* — named as needing
+> **no new machinery**. A queue is the store you already have, plus a claim loop,
+> plus the clause that declares both.
 
 ```clojure
-(ns jobs.ingest)
-
-(defqueue ingest
-  (concurrency 4)                                   ; □(executing ≤ 4) — z3, like outbox's ≤200
-  (retry 5 {:backoff :exponential :base 1000 :max 60000 :jitter 0.2})
-  (unique    {:by [:job/source] :for 60})           ; unique-identity, one window
-  (lease     300)                                   ; orphan detection (Lifeline)
-  (prune    {:completed "7d" :discarded "30d"})     ; the Pruner, as a Tick
-  (partition :by [:job/library])                    ; per-key serialisation
-
-(def q (start-link ingest))
-
-(jobs/perform q :ingest (fn [args _job] (run-ingest! args)))     ; a plain fn
-(jobs/enqueue q {:kind :ingest :args {:lib "notes" :source p}})  ; immediate
-(jobs/enqueue q {:kind :ingest :args {…} :in 30 :seconds})       ; delayed
-(jobs/enqueue q {:kind :ingest :args {…} :at (sched/next h :digest)})
-(jobs/stats  q)   ; {:scheduled 12 :available 3 :executing 2 :retryable 1 :discarded 4}
-(system/verify 'ingest)   ; the concurrency bound, the retry lattice, lease ≥ timeout
+(defserver larder
+  ;; the store IS the queue; the clause is the hand that turns it
+  (queue {:of          :hotel/order          ; the entity kind in this server's store
+          :concurrency 4                     ; □(executing ≤ 4) — z3, like outbox's ≤200
+          :retry       {:max 5 :backoff :exponential :base 1000 :max 60000 :jitter 0.2}
+          :unique      [:order/room :order/item]  ; the STORE's identity — one window, no key table
+          :lease       300                   ; orphan detection (Lifeline)
+          :partition   [:order/room]})       ; per-key serialisation
+  (perform [job]                             ; the ONE thing a queue cannot derive
+    (charge! job)
+    (assoc job :status :done)))
 ```
+
+**Enqueue is a write, not a verb on a handle.** The job must be a FACT before it
+can be owed, so it is a transaction against the same store the claim reads:
+
+```clojure
+(call :larder [! :enqueue {:room "101" :item :breakfast}])          ; immediate
+(call :larder [! :enqueue {:room "102" :item :late-checkout} :in 30 :minutes])
+(call :larder [! :enqueue {:room "103" :item :minibar} :at (sched/next housekeeping :audit)])
+
+;; and the pane does not ask anyone — it is the same store
+(datom/q (proc/conn :larder) '[:find ?room ?status :where …])
+(system/verify 'larder)   ; the concurrency bound, the retry lattice, lease ≥ timeout
+```
+
+The verbs that survive are the two that are NOT machinery: `enqueue!` (a store
+write, with the queue's eligibility rules applied to it) and `stats` (a query).
+`retry`, `unique`, `lease`, `concurrency` and `partition` are options on the claim
+loop. **`prune` is not part of this bundle at all** — it is a `:schedules`
+declaration of the tree that owns the queue: P4's machinery, which is what
+`:schedules` was built to be able to say.
 
 **This is a cutover, not a parallel implementation:** knowledger's
 `run-job-async!` + `runner-sup` + `supervised-job` + `job-worker` + registry
@@ -1184,7 +1209,16 @@ P4  ✅ CUTOVER: the tree's periodic work is a DECLARATION (env.bl `:schedules`)
      clause) and lives in Elixir
       the watch-debounce (reload_watcher.ex) onto P1/P2; the pane is now non-empty
         ── then, separately ──
-P5  priv/std/jobs.bl — defqueue; knowledger cut over from its hand-rolled runner
+P5  priv/std/proc/queue.bl — the `(queue …)` CLAUSE, not a `defqueue` form
+     (§4.3: a form is a fork — the `defbeat` precedent). The store is the queue;
+     the clause is the claim loop; `enqueue!` is a transaction and `stats` is a
+     query; `prune` is a `:schedules` declaration, not part of this bundle.
+     knowledger cut over from its hand-rolled runner.
+P3b the pane's two open rows: `:jobs` (waits on P5) and the DEEP ROW — a
+     declaration's recent occurrences + its refusals + its `verify` verdict, and
+     the ticker line (the one live thing in a store-only view, drawn as a
+     monitor's fact). Both are projections over facts already written; neither
+     writes (FUP-101) and neither asks a process.
 P6  flow/distribute + batch + defpipeline  (the Broadway half)
 ```
 
@@ -1202,6 +1236,7 @@ per the repo's ethics). P5/P6 are separate waves with a real consumer each.
 | 3 | Should the clock be injected? | **Injected everywhere** (a fn → seconds); the daemon passes wall time. Without it you cannot test a week in a second, cannot time-travel the pane, and "this scheduler secretly reads now" becomes an invisible smell. |
 | 4 | Where are schedules **declared**? | **Both.** `env.bl :schedules` for the tree's; `defscheduler` for a namespace's; the pane unions them. `:tasks` (a verb the daemon runs) and `:ports` (a claim the session hosts) are the precedent. |
 | 5 | What does the pane **monitor**? | **A session-wide registry**, like `ports/list-claims` — any app registers a schedule, and `bl ui` is the one place to see all recurrent work. The stale-entry cleanup is itself a schedule. |
+| 6 | Is a durable queue a **form** (`defqueue`) or a **clause** (`(queue …)`)? | **Clause.** §4.3 originally prescribed `defqueue`; the user pushed back and the doc agreed with itself: `defbeat` was DELETED when `(tick …)` landed (a macro is a fork), and §3.2 already calls the durable patterns — *Idempotency Key*, *Claim/Lease* — "no new machinery". So: the store IS the queue, the clause is the claim loop, `enqueue!` is a write, `stats` is a query, `prune` is a `:schedules` declaration, and nothing gets a registry of its own. |
 
 ---
 
