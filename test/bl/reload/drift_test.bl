@@ -1,0 +1,167 @@
+; test/bl/reload/drift_test.bl — the image's own generation, by use case.
+;
+; The property is that a warm image can be TOLD it is older than its sources —
+; without restarting it, and without the telling itself changing anything. Four
+; things have to hold together, and each is a test here:
+;
+;   · a source that has not moved since the image started is fresh, and saying so
+;     is a stat, not a recompile;
+;   · a source that HAS moved, whose loaded module no longer matches it, is
+;     REPORTED — with the reconcile gate's verdict on it attached — while the
+;     image keeps serving the code it was loaded with;
+;   · a source that moved but still MATCHES its provenance stamp is not drift at
+;     all (a checkout rewrites every mtime and no bytes);
+;   · asking is not applying: `warm-apply!` is the separate, explicit door, and
+;     it is the same stage/commit gate every other edit goes through.
+;
+; The fixture is a REAL AOT beam rather than a source evaluated in a fork: the
+; stamp the emitter writes is the anchor the question is asked against, and a
+; beam is also the shape a warm daemon's image has.
+
+(ns reload.drift-test
+  (:require [reload] [reload.monitor :as mon] [env]))
+
+(def fixture-dir (Path/join (System/tmp_dir) "bl-drift-test"))
+(def fixture-ebin (Path/join fixture-dir "ebin"))
+(def fixture-file (Path/join fixture-dir "driftfixture.bl"))
+
+(def one "(ns driftfixture)\n(defn v [] :one)\n")
+(def two "(ns driftfixture)\n(defn v [] :two)\n")
+
+(defn- write-fixture!
+  "Write the fixture's source. Its mtime is therefore always AFTER this image
+   started, which is the point: the stamp, not the clock, is what must settle it."
+  [src]
+  (File/mkdir_p! fixture-dir)
+  (File/mkdir_p! fixture-ebin)
+  (File/write! fixture-file src))
+
+(defn- opts-for [path out]
+  (list (erlang/list_to_tuple (list :output_dir out))
+        (erlang/list_to_tuple (list :file path))))
+
+(defn- load-fixture!
+  "Compile the fixture to a real stamped beam, put its directory on the code path
+   and on the loader's search path, and load it — so the image holds a namespace
+   whose provenance it can be asked about."
+  []
+  (write-fixture! one)
+  (BeamLisp.AOT/compile_source one (opts-for fixture-file fixture-ebin))
+  ;; `compile_source` leaves the compiler's current ns at the namespace it just
+  ;; compiled, so a top-level form after it would be defined THERE.
+  (BeamLisp.Env/in_ns "reload.drift-test")
+  (Code/prepend_path fixture-ebin)
+  (BeamLisp.Env/add_search_path fixture-dir)
+  (BeamLisp.Loader/ensure_loaded "driftfixture")
+  (BeamLisp.Env/in_ns "reload.drift-test"))
+
+(defn- reported?
+  "Whether the drift answer reports `ns` as moved."
+  [d ns]
+  (not (empty? (filter (fn [r] (= ns (:ns r))) (:changed d)))))
+
+(defn- why-not
+  "The whole evidence for an unexpected `:class`, so a failure names WHICH fact
+   moved instead of making a reader re-derive it."
+  [d want]
+  (str "expected " want "; got " (:summary d)
+       "  toolchain=" (pr-str (get-in d [:image :toolchain]))))
+
+; ── the window and its anchor ────────────────────────────────────────────
+
+(deftest drift-is-anchored-to-the-image-not-to-noise
+  (let [d (reload/drift)
+        start (get-in d [:image :started-at])]
+    (is (= start (:since d))
+        "the default window IS this image's start — the question the system has")
+    (is (every? (fn [r] (> (:mtime r) start)) (:changed d))
+        "every reported move is one that happened after this image started")))
+
+(deftest the-toolchain-answer-is-the-aot-caches-own
+  ;; Structural on purpose: this machine's checkout is edited by other processes
+  ;; WHILE this image boots, and a moved `priv/build/` source makes the class
+  ;; :toolchain truthfully. What must hold in every run is that the answer is the
+  ;; AOT cache's own pair and that `:moved?` is exactly their comparison.
+  (let [tc (get-in (reload/drift) [:image :toolchain])]
+    (is (= (BeamLisp.AOTCache/compiler_key) (get-in tc [:booted :compiler])))
+    (is (= (BeamLisp.AOTCache/current_compiler_key) (get-in tc [:live :compiler])))
+    (is (= (BeamLisp.AOTCache/build_key) (get-in tc [:booted :build])))
+    (is (= (BeamLisp.AOTCache/current_build_key) (get-in tc [:live :build])))
+    (is (= (:moved? tc)
+           (or (not= (get-in tc [:booted :compiler]) (get-in tc [:live :compiler]))
+               (not= (get-in tc [:booted :build]) (get-in tc [:live :build]))))
+        "moved? is exactly the key comparison, not a second rule")))
+
+(deftest a-window-of-the-callers-own-can-be-asked
+  (let [d (reload/drift {:since (erlang/system_time :millisecond)})]
+    (is (= [] (:changed d)) "no source moved in a window that starts now")
+    (is (or (= :none (:class d)) (= :toolchain (:class d)))
+        "with no namespace move, the only class left is the toolchain's")
+    (is (= (get-in d [:image :toolchain :moved?])
+           (= :toolchain (:class d)))
+        "and it is the toolchain's fact, never a namespace")))
+
+; ── a source that moved in time but not in bytes ─────────────────────────
+
+(deftest a-matching-beam-is-verified-not-assumed
+  (load-fixture!)
+  (let [d (reload/drift)]
+    (is (not (reported? d "driftfixture"))
+        (str "the fixture's beam still matches the source it was compiled from,"
+             " so the image holds it — a recent mtime alone is not drift."
+             " Reported: " (pr-str (:changed d))))
+    (is (= :one (env/eval "(driftfixture/v)")))))
+
+; ── a source that really did move ────────────────────────────────────────
+
+(deftest a-moved-source-is-reported-without-restarting
+  (load-fixture!)
+  (File/write! fixture-file two)
+  (let [d (reload/drift)]
+    (is (not= :none (:class d)) (why-not d "not none"))
+    (is (reported? d "driftfixture"))
+    (is (contains? (set (:tree d)) "driftfixture"))
+    (is (= :coherent (get-in d [:warm :status]))
+        "a plain redefinition is exactly what the reconcile gate accepts")
+    (is (= :one (env/eval "(driftfixture/v)"))
+        "asking is not applying — the image still serves the code it was loaded with")))
+
+(deftest warm-apply-routes-the-drift-through-the-gate
+  (load-fixture!)
+  (File/write! fixture-file two)
+  (is (= :applied (:status (reload/warm-apply!))))
+  (is (= :two (env/eval "(driftfixture/v)")))
+  (is (not (reported? (reload/drift) "driftfixture"))
+      "after the apply the image holds the source it serves, and says so"))
+
+(deftest the-pane-prints-which-generation-this-is
+  ;; The acceptance the item exists for: an image older than its sources is a
+  ;; READABLE FACT — something a command or the pane can print — not an inference
+  ;; from a confusing failure. `bl monitor DIR` paints exactly this frame, and
+  ;; `bl daemon status` embeds it.
+  (load-fixture!)
+  (File/write! fixture-file two)
+  (let [frame (mon/render-text (reload/inspect))]
+    (is (not (nil? (index-of frame "drift")))
+        (str "the frame must state the image's drift:\n" frame))
+    (is (not (nil? (index-of frame "driftfixture")))
+        (str "and it must name what moved:\n" frame))))
+
+; ── the blind spot, pinned ───────────────────────────────────────────────
+
+(deftest a-source-the-image-cannot-print-provenance-for-is-reported
+  ;; `driftfixture2` is loaded from SOURCE, so its module carries no provenance
+  ;; stamp and there is nothing to compare its file against. The image cannot
+  ;; prove it holds that source, and it says so rather than reading as correct —
+  ;; the conservative direction, because the whole point is that a possibly-stale
+  ;; image must never read as a fresh one. (A namespace a COMMIT made live is
+  ;; answered from the gate's own `:generation` record instead, which is why
+  ;; `warm-apply!` clears the report above.)
+  (let [file (Path/join fixture-dir "driftfixture2.bl")
+        src "(ns driftfixture2)\n(defn v [] :one)\n"]
+    (File/mkdir_p! fixture-dir)
+    (File/write! file src)
+    (BeamLisp.Env/add_search_path fixture-dir)
+    (BeamLisp.Loader/ensure_loaded "driftfixture2")
+    (BeamLisp.Env/in_ns "reload.drift-test")
+    (is (reported? (reload/drift) "driftfixture2"))))

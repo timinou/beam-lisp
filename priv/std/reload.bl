@@ -87,8 +87,13 @@
 ;                                         ; namespace has
 ;  :graph {ns-string → [ns-string]}      ; the parse-once memo of SOURCE-derived
 ;                                         ; edges (see image-requires)
+;  :generation {ns-string → hash-string} ; what the image KNOWS it is made of: the
+;                                         ; program hash of every namespace a commit
+;                                         ; made live (see `drift`). The image's own
+;                                         ; record, because nothing below this gate
+;                                         ; is asked to keep one.
 (def state (atom {:staged {} :migration nil :status :empty :errors [] :applied []
-                  :journal [] :requires {} :graph {}}))
+                  :journal [] :requires {} :graph {} :generation {}}))
 
 (def journal-limit 200)
 
@@ -173,6 +178,7 @@
 
 (declare status)
 (declare print-errors)
+(declare program-hash)
 
 ;; ── the prod policy: inspect always, MUTATE gated ────────────────────────
 ;;
@@ -287,8 +293,13 @@
    preserved — abort discards uncommitted intent, not the record of what already
    happened."
   []
-  (swap! state (fn [s] {:staged {} :migration nil :status :empty :errors []
-                        :applied [] :journal (:journal s)}))
+  ;; ASSOC over the live state, not a fresh literal: abort discards the BUNDLE,
+  ;; and everything else in `state` is a fact about the IMAGE rather than about
+  ;; the bundle — the journal, the remembered require edges, the parse-once memo,
+  ;; and the generation a commit recorded. Rebuilding the map from scratch
+  ;; silently dropped the last three.
+  (swap! state (fn [s] (assoc s :staged {} :migration nil :status :empty
+                              :errors [] :applied [])))
   (status))
 
 (defn status
@@ -560,6 +571,12 @@
                 ;; which would otherwise mask what the old image owned.
                 gone (removed-names defs ns)]
             (env/eval (second pair))
+            ;; THE IMAGE REMEMBERS WHAT IT IS MADE OF. The drift question asks
+            ;; whether the image still matches its sources; a namespace THIS gate
+            ;; made live is answered from here, because the gate is the one door
+            ;; that knows the bytes it evaluated — the module the eval builds is
+            ;; in memory and carries no provenance stamp to compare against.
+            (swap! state (fn [s] (assoc-in s [:generation ns] (program-hash (second pair)))))
             ;; NAMESPACE-LEVEL replacement: a var the new source dropped is
             ;; genuinely removed from the image, so nothing can still reach the
             ;; stale definition. The coherence pass already proved no live caller
@@ -668,6 +685,289 @@
   []
   (status))
 
+;; ── generation: is the live image older than its sources? ────────────────
+;
+;; The image is a GENERATION — a particular fold of particular source bytes into
+;; a running VM — and nothing else says WHICH one. A warm image that cannot be
+;; told it is stale is indistinguishable from a correct one: this session lost an
+;; hour to exactly that shape (`./bl` runs a pre-compiled snapshot of
+;; `priv/std/bl/*` while `priv/std/vm/*` loads from source, so half a change
+;; appears to work), and FUP-084 was filed from the same shape in the daemon.
+;; `docs/dev/which-bl.md` states the cut for the launcher; this is that fact for
+;; the IMAGE, as a value a command or the pane can print.
+;;
+;; Two anchors, because the tiers answer to different clocks.
+;;
+;;   TOOLCHAIN (tier-0/1: `priv/boot/`, `priv/build/`, the `lib/*.ex` substrate)
+;;     The key this image booted under, against the key the sources on disk
+;;     compute NOW. `AOTCache/compiler_key` is memoised in `:persistent_term`, so
+;;     it IS the boot generation, and `AOTCache/current_compiler_key` says in its
+;;     own doc that the daemon reads it for exactly this. Warm-applying a new
+;;     compiler with the old compiler's beams resident is BUG-048's deadlock
+;;     class, so a moved key is a RESTART and never a warm apply — which is why
+;;     this half is a class of its own rather than a per-namespace row.
+;;
+;;   TREE (everything above)
+;;     Per namespace, against its own source, cheaply first: a source written
+;;     BEFORE this image started cannot have been written after the image read
+;;     it, so one `stat` settles it. A source written AFTER is a candidate, and a
+;;     candidate is then VERIFIED by the drift gate's own rule — the closure hash
+;;     recomputed from the live source (`AOT/ns_closure_hash`) against the hash
+;;     the loaded module carries (`__bl_provenance__/0`, the stamp the emitter
+;;     writes). Equal ⇒ the image holds exactly those bytes and merely the mtime
+;;     moved (a checkout, a copy); different, or no stamp to compare, ⇒ REPORTED.
+;;     A namespace THIS gate made live is answered from `:generation` instead:
+;;     the gate is the one door that knows the bytes it evaluated, and the module
+;;     it builds in memory carries no stamp.
+;;
+;; The blind spot is stated rather than hidden: a source-loaded namespace whose
+;; file moved after the image started, with no stamp to compare, is reported as
+;; drift — the image cannot prove it holds that source, and the whole point is
+;; that a possibly-stale image must never read as a correct one.
+;;
+;; Nothing here compiles, applies, purges or reloads anything: it reads the
+;; filesystem and the loaded modules and returns the question, never the build.
+;; The warm half of the answer, for a tree drift, is `warm-verdict` — the SAME
+;; coherence pass `commit` runs — and `warm-apply!` is that answer applied
+;; through the same gate.
+
+(defn image-start-ms
+  "When this image started, in ms since the epoch — the instant every `since`
+   below is measured against.
+
+   `erlang/system_info(:start_time)` is not on every OTP (measured: `argument
+   error` on this tree's erts), so this is the same fact from the other side: the
+   wall clock the runtime reports having lived, subtracted from now. Reading the
+   runtime SHORT would put the start LATE, which only makes more sources
+   candidates — the safe direction for a question that is asked before it is
+   believed."
+  []
+  (let [now (now-ms)
+        up  (erlang/element 1 (erlang/statistics :wall_clock))]
+    (if (and (number? up) (<= up now)) (- now up) now)))
+
+(defn- file-mtime-ms
+  "A file's mtime in ms since the epoch, or nil when it cannot be read. POSIX
+   seconds from `:file`, not the runtime's datetime tuple: this is compared
+   against a clock, and a tuple is not one."
+  [path]
+  (try
+    (let [r (erlang/apply :file :read_file_info
+                          (list path (list (erlang/list_to_tuple (list :time :posix)))))]
+      (if (erlang/is_tuple r) (* 1000 (erlang/element 6 (erlang/element 2 r))) nil))
+    (catch _ nil)))
+
+(defn- program-hash
+  "The hash of a PROGRAM — the bytes a namespace's source compiles from — in the
+   spelling `Loader.source_hash/1` answers (`Base.encode16()`, uppercase), so a
+   hash the image recorded and a hash re-read from disk are comparable."
+  [src]
+  (binary/encode_hex (crypto/hash :sha256 src) :uppercase))
+
+(defn- module-stamp
+  "The provenance stamp `{:hash :key}` the LOADED module for `ns` carries, or nil
+   when it carries none — a namespace loaded from source has its shim built in
+   memory, and an emitter with no file to hash writes a nil hash. Nil is a
+   DIFFERENT fact from a mismatched stamp: it says nothing recorded what the image
+   was read from, and no caller may read it as fresh.
+
+   This is the gate's own read (`AOT.beam_provenance/1`) written in the open: the
+   gate's copy is private, and a report has to be able to ask the same question."
+  [ns]
+  (try
+    (let [st (erlang/apply (BeamLisp.Link/module_for ns) :__bl_provenance__ (list))]
+      (if (erlang/is_tuple st)
+        (let [h (erlang/element 1 st) k (erlang/element 2 st)]
+          (if (nil? h) nil {:hash h :key k}))
+        nil))
+    (catch _ nil)))
+
+(defn- closure-hash
+  "The LIVE closure hash of `ns` — the drift gate's own recomputation
+   (`AOT/ns_closure_hash`). Nil when it cannot be answered (no source resolves, or
+   the graph kernel is not loadable in this image): the caller must treat that as
+   unknown, never as fresh."
+  [ns]
+  (try (BeamLisp.AOT/ns_closure_hash ns) (catch _ nil)))
+
+(defn- stamp-verdict
+  "The gate's rule (`AOT.stale_by_provenance?/2`) asked of the live image: is the
+   module's stamp the source on disk, or the source it was built from? `:unknown`
+   when the live hash cannot be computed — which is a fact about the image, not a
+   licence to call it fresh."
+  [ns stamp]
+  (let [now (closure-hash ns)]
+    (cond
+      (nil? now) :unknown
+      (and (= (:hash stamp) now) (= (:key stamp) (BeamLisp.AOTCache/compiler_key))) :fresh
+      :else :stale)))
+
+(defn- source-row
+  "One loaded namespace judged against the source it resolves to NOW.
+
+   `:state` is `:fresh` (the image provably holds this source), `:moved` (the
+   source moved after the image started and the image does not provably hold it),
+   or `:unanswerable` (no source resolves, or the provenance question cannot be
+   answered). `:why` says which way a `:fresh`/`:unanswerable` was reached, so a
+   reader never has to re-derive it."
+  [ns since gen]
+  (let [path (try (BeamLisp.Loader/source_path ns) (catch _ nil))
+        mtime (if (string? path) (file-mtime-ms path) nil)
+        recorded (get gen ns)]
+    (cond
+      (nil? path)
+      {:ns ns :state :unanswerable :why :no-source}
+
+      (and (some? recorded)
+           (= recorded (try (BeamLisp.Loader/source_hash ns) (catch _ nil))))
+      {:ns ns :path path :mtime mtime :state :fresh :why :applied}
+
+      (or (nil? mtime) (<= mtime since))
+      {:ns ns :path path :mtime mtime :state :fresh :why :predates-image}
+
+      :else
+      (let [stamp (module-stamp ns)
+            v (if (some? stamp) (stamp-verdict ns stamp) :stale)]
+        (cond
+          (= :fresh v) {:ns ns :path path :mtime mtime :state :fresh :why :verified}
+          (= :unknown v) {:ns ns :path path :mtime mtime :state :unanswerable :why :no-provenance}
+          :else {:ns ns :path path :mtime mtime :state :moved :stamp (some? stamp)})))))
+
+(defn- toolchain-drift
+  "Whether the toolchain this image is RUNNING is still the toolchain on disk: the
+   keys it booted under against the keys the sources compute now. Both reads are
+   the AOT cache's own, so a moved key means exactly what it means to the gate."
+  []
+  (let [booted {:compiler (BeamLisp.AOTCache/compiler_key)
+                :build (BeamLisp.AOTCache/build_key)}
+        live {:compiler (BeamLisp.AOTCache/current_compiler_key)
+              :build (BeamLisp.AOTCache/current_build_key)}]
+    {:booted booted :live live
+     :moved? (or (not= (:compiler booted) (:compiler live))
+                 (not= (:build booted) (:build live)))}))
+
+(defn warm-verdict
+  "What the reconcile gate says about making `nss`'s CURRENT sources live — asked
+   WITHOUT staging them into the live bundle and WITHOUT committing, on a
+   candidate bundle read from disk.
+
+   `:coherent` ⇒ the drift is warmly applicable and `commit` would take it.
+   `:held` names the gate's reasons, and the old code keeps serving exactly as it
+   would on a refused commit. `:empty` when none of `nss` has a source on disk."
+  [nss]
+  (let [staged (reduce (fn [acc ns]
+                         (let [src (try (BeamLisp.Loader/source_content ns) (catch _ nil))]
+                           (if (string? src) (assoc acc ns src) acc)))
+                       {} (to-list nss))]
+    (if (empty? staged)
+      {:status :empty :namespaces [] :errors []}
+      (let [errs (coherence staged)]
+        {:status (if (empty? errs) :coherent :held)
+         :namespaces (vec (keys staged))
+         :errors errs}))))
+
+(defn- short-key
+  "A cache key short enough for one line, or `?` when there is none."
+  [k]
+  (if (string? k) (str (subs k 0 12) "…") "?"))
+
+(defn- drift-summary
+  "The drift fact as ONE sentence, held in the read-model rather than in a
+   renderer, so the terminal pane, the web view and a test print the same words
+   instead of three paraphrases of them."
+  [d]
+  (let [c (:class d)
+        tc (get-in d [:image :toolchain])]
+    (cond
+      (= :toolchain c)
+      (str "TOOLCHAIN — the tree's compiler/driver sources moved since this image booted; "
+           "it is running " (short-key (get-in tc [:booted :compiler]))
+           " and the sources on disk hash to " (short-key (get-in tc [:live :compiler]))
+           (if (empty? (:toolchain d)) "" (str " (also moved: " (join ", " (:toolchain d)) ")"))
+           " — restart required")
+
+      (= :tree c)
+      (str "TREE — " (count (:tree d)) " source"
+           (if (= 1 (count (:tree d))) "" "s")
+           " moved after this image started: " (join ", " (:tree d))
+           (cond
+             (= :coherent (get-in d [:warm :status]))
+             " — the reconcile gate accepts them (warmly applicable)"
+             (= :held (get-in d [:warm :status]))
+             (str " — HELD: " (:msg (first (get-in d [:warm :errors]))))
+             :else " — no source on disk to apply"))
+
+      :else
+      (str "none — this image matches its sources ("
+           (:fresh d) " verified, " (:unanswerable d) " with no source to check)"))))
+
+(defn drift
+  "Is this image older than the sources it serves, and what would it take to say
+   no? A VALUE — a pane, a log or a test can print it — read and never applied:
+   nothing here recompiles, reloads or purges.
+
+   `opts` may carry `:since` (ms since the epoch) to ask about a window of the
+   caller's own; the default is this image's start, which is the question the
+   system actually has.
+
+   `:class` is `:none` | `:tree` | `:toolchain`:
+     :toolchain — the compiler or the driver moved since this image booted, so
+                  the running toolchain is not the tree's: restart.
+     :tree      — application sources moved after this image started. `:warm` is
+                  the reconcile gate's verdict on them, and `warm-apply!` is that
+                  verdict applied through the same gate.
+     :none      — nothing the image can see has moved.
+
+   `:changed` carries every reported namespace with the evidence (its source
+   path, the mtime that moved it, and whether a provenance stamp existed), so the
+   report never has to be taken on trust."
+  ([] (drift {}))
+  ([opts]
+   (let [start (image-start-ms)
+         since (or (:since opts) start)
+         gen (:generation (deref state))
+         rows (mapv (fn [ns] (source-row ns since gen)) (sort (BeamLisp.Env/namespaces)))
+         moved (filterv (fn [r] (= :moved (:state r))) rows)
+         tc-nses (filterv (fn [r] (BeamLisp.Tiers/toolchain_source? (:path r))) moved)
+         tree-nses (filterv (fn [r] (not (BeamLisp.Tiers/toolchain_source? (:path r)))) moved)
+         tc (toolchain-drift)
+         warm (warm-verdict (map :ns tree-nses))
+         d {:class (cond (or (:moved? tc) (not (empty? tc-nses))) :toolchain
+                         (not (empty? tree-nses)) :tree
+                         :else :none)
+            :at (now-ms)
+            :since since
+            :image {:started-at start :toolchain tc}
+            :changed (vec (map (fn [r] {:ns (:ns r) :path (:path r) :mtime (:mtime r)
+                                        :stamp (:stamp r)})
+                               moved))
+            :tree (vec (map :ns tree-nses))
+            :toolchain (vec (map :ns tc-nses))
+            :fresh (count (filterv (fn [r] (= :fresh (:state r))) rows))
+            :unanswerable (count (filterv (fn [r] (= :unanswerable (:state r))) rows))
+            :warm warm}]
+     (assoc d :summary (drift-summary d)))))
+
+(defn warm-apply!
+  "Make the drifted TREE namespaces live through the one gate: stage each from its
+   source on disk and commit the bundle as ONE transaction, so a rename whose
+   halves both moved lands atomically and a half-moved rename is HELD with the old
+   code still serving.
+
+   The warm half of FUP-084 — tree drift routed through the existing reconcile
+   gate rather than a restart. It applies nothing that is not already the source
+   on disk, and it cannot touch the toolchain class: a moved codegen key is a
+   restart, and `drift` keeps saying so after this returns."
+  []
+  (let [d (drift)]
+    (if (empty? (:tree d))
+      (status)
+      (do
+        (doseq [ns (:tree d)]
+          (let [src (try (BeamLisp.Loader/source_content ns) (catch _ nil))]
+            (when (string? src) (stage ns src))))
+        (commit)))))
+
 ;; ── inspect: the queryable live-image read-model (CLI + web monitors) ───
 
 (defn- app-ns?
@@ -717,7 +1017,9 @@
 (defn inspect
   "A full, JSON-friendly snapshot of the live image for a monitor to render:
    the current bundle status, every application namespace with its vars, and the
-   recent event journal. One call the CLI prints and the web pushes over a socket
+   recent event journal, and whether the image is STILL the sources it serves
+   (`drift` — the one field that tells a reader which generation this is). One
+   call the CLI prints and the web pushes over a socket
    — the single read-model behind every view of the running system."
   ([] (inspect false))
   ([all?]
@@ -725,4 +1027,5 @@
     :bundle   (status)
     :namespaces (namespaces all?)
     :journal  (journal 50)
+    :drift    (drift)
     :at       (now-ms)}))
