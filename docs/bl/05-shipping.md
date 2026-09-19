@@ -1,8 +1,11 @@
 # Shipping
 
 There are two builds. `bl build` AOT-compiles beam-lisp source to `.beam`
-modules inside a project; `mix bl.build` produces the distributable `bl` drop.
-One ships libraries; the other ships the language.
+modules inside a project; `bl self-build` assembles a release from the
+checkout and seals it as the distributable `bl` drop. One ships libraries;
+the other ships the language. (The Mix-era `mix bl.build` is gone with
+`mix.exs` — see
+[../build/the-toolchain-without-mix.md](../build/the-toolchain-without-mix.md).)
 
 ## `bl build` — compile namespaces to beams
 
@@ -33,23 +36,28 @@ Put a directory of these beams on a program's code path with `--code-path DIR`
 or `BEAM_LISP_CODE_PATH` — see
 [00-the-cli.md](00-the-cli.md#where-a-namespace-is-found).
 
-## The drop — `mix bl.build`
+## The drop — `bl self-build`
 
-`mix bl.build` is the one command that produces a distributable `bl`. It chains,
-in order:
+`./bin/bl self-build` is the one command that produces a distributable `bl`.
+It chains, in order:
 
-1. `mix compile` — the beams, the AOT prelude, the NIFs;
-2. `mix release bl` (prod) — the ERTS-carrying release tree;
-3. `cargo build --release` in `tooling/drop` — the launcher and pack tool;
-4. `drop pack` — graft launcher + payload + trailer into one file;
-5. install to `--out` — an atomic rename (default `./bl`).
+1. the tier sources rebuild from the tree's image directory (`.bl/`);
+2. the ERTS-carrying release assembles from that image;
+3. the Rust launcher named by `--bin` is embedded — cargo builds it from
+   `tooling/drop` (`cargo build --release`). The drop ships THAT binary, so a
+   launcher fix is missing from the artifact until the binary is rebuilt —
+   `cargo check` is not enough;
+4. the compound — launcher + payload + trailer — is written to `--out`.
+
+```sh
+$ ./bin/bl self-build --bin ~/.cache/cargo-target/release/drop-launcher --out ./bl
+self-build: …/bl  (227 tier sources rebuilt from …/.bl, 141404864 payload bytes)
+```
 
 | option | effect |
 |---|---|
 | `--out PATH` | where to write the `bl` binary (default `./bl`) |
-| `--release DIR` | reuse an existing release tree (skip step 2) |
-| `--skip-cargo` | reuse a previously built launcher / pack tool |
-| `--target T` | cross-target (`linux/x86_64` …; needs per-target NIFs) |
+| `--bin PATH` | the drop-launcher binary to embed (required) |
 
 The result is a single self-extracting binary carrying ERTS, the native tier
 (the language crates, the solver, Explorer), and the shipped libraries. It runs
@@ -58,18 +66,18 @@ installs a launcher; later runs go straight to the payload, and a warm
 `bl daemon` for the tree makes them instant.
 
 The escript is not a packaging tier: it is a single BEAM archive that cannot
-carry native artifacts. `mix release` — which `mix bl.build` wraps — is the only
-supported one.
+carry native artifacts. The release assembly inside `bl self-build` is the
+only supported one.
 
-## `mix bl.z3.fetch` — the solver
+## `bl install z3` — the solver
 
 The SMT solver is resolved at exactly one place, `priv/z3/bin/z3`, never from
-`PATH`. `mix bl.z3.fetch` downloads the pinned official z3 release for the host
+`PATH`. `bl install z3` downloads the pinned official z3 release for the host
 platform, verifies it against a pinned sha256, extracts it into `priv/z3/`, and
 smoke-runs it.
 
 ```sh
-$ mix bl.z3.fetch
+$ bl install z3
 fetching https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip
 sha256 verified; extracting to …/priv/z3
 bundled z3 ready: Z3 version 4.16.0 - 64 bit
@@ -78,7 +86,7 @@ bundled z3 ready: Z3 version 4.16.0 - 64 bit
 The fetched tree is a derived artifact and is gitignored; re-running the task
 reproduces it. Re-pinning z3 means bumping the version and the digests in the
 task. A fresh checkout that will build a drop, or that will use the prover,
-runs this once — after `mix compile`, so the `priv` symlink exists.
+runs this once.
 
 ## On a fresh machine: `bl doctor`
 
@@ -132,10 +140,11 @@ stale result.
 The release pipeline itself adds the two build-only steps in front:
 
 ```sh
-mix deps.get
-mix compile                 # also creates the priv symlink
-mix bl.z3.fetch             # the solver, from the pinned asset
-mix bl.build --out bl-linux-x86_64
+bl deps fetch              # hex tarballs into the content-addressed store
+bl deps compile            # …and their beams onto the code path
+bl install z3              # the solver, from the pinned asset
+cargo build --release --manifest-path tooling/drop/Cargo.toml   # the launcher
+./bin/bl self-build --bin <drop-launcher> --out bl-linux-x86_64
 ```
 
 Each target is built natively on its own runner, because every NIF is compiled
