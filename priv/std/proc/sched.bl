@@ -77,7 +77,14 @@
 ;; `:overlap` is deliberately absent — see the header. A knob that silently does
 ;; nothing is the worst kind of configuration bug (docs/dev/env.bl.md), so the
 ;; unknown-option error NAMES catch-up as the answer instead.
-(def KNOWN-OPTS [:catch-up :jitter :on-error :clock])
+(def KNOWN-OPTS [:catch-up :jitter :on-error])
+
+;; What the CLAUSE takes, where `:from` is a project file's declarations (data)
+;; and the literal entries are source. Two vocabularies rather than one, because
+;; the two places mean different things: `:catch-up` on a clause would configure
+;; nothing, and `:clock` on one entry of five would configure nothing else.
+;; Accepting both everywhere is how a knob comes to do nothing quietly.
+(def KNOWN-CLAUSE-OPTS [:clock :from])
 
 (def KNOWN-CATCH-UP [:skip :coalesce :run-all])
 
@@ -104,21 +111,35 @@
            " clock's own zone.")
     (= k :cron)
       ". Cron strings are not implemented yet: use :every / :daily / :at."
+    ;; An option that IS known — somewhere else — is the most useful hint of
+    ;; all, because the reader already knows the word and only put it on the
+    ;; wrong line.
+    (known? k KNOWN-CLAUSE-OPTS)
+      (str ". `" (name k) "` configures the whole `(sched …)` clause: it goes in"
+           " the clause's option map, beside :clock, not on one entry.")
+    (known? k KNOWN-OPTS)
+      (str ". `" (name k) "` is an ENTRY option: it goes on one `(every …)`"
+           " entry, where the entry it describes is.")
     :else ""))
 
-(defn- check-opts! [opts where]
+(defn- check-opts!
+  "`known` is the vocabulary of the place the options were written. A clause and
+   an entry take different ones (KNOWN-CLAUSE-OPTS / KNOWN-OPTS), and an option
+   accepted in the wrong place is a knob that does nothing."
+  ([opts where] (check-opts! opts where KNOWN-OPTS))
+  ([opts where known]
   (doseq [k (keys opts)]
-    (when (not (known? k KNOWN-OPTS))
+    (when (not (known? k known))
       (throw (ex-info (str where ": unknown option " k " — known: "
-                           (join " " (map (fn [x] (str x)) KNOWN-OPTS))
+                           (join " " (map (fn [x] (str x)) known))
                            (option-hint k))
-                      {:option k :known KNOWN-OPTS}))))
+                      {:option k :known known}))))
   (when (some? (get opts :catch-up))
     (when (not (known? (get opts :catch-up) KNOWN-CATCH-UP))
       (throw (ex-info (str where ": unknown :catch-up " (get opts :catch-up)
                            " — use " (join " " (map (fn [x] (str x)) KNOWN-CATCH-UP)))
                       {:catch-up (get opts :catch-up)}))))
-  opts)
+  opts))
 
 ;; ── the rules ───────────────────────────────────────────────────────────
 ;;
@@ -147,6 +168,39 @@
                             today (daily-ms now h m)]
                         (if (>= today now) today (+ today 86400000)))
       :else (throw (ex-info (str "sched: unknown rule " rule) {:rule rule})))))
+
+;; ── the rules, built ────────────────────────────────────────────────────
+;;
+;; A clause's entries are SOURCE — `(every 30 :min :reap reap!)`. A project
+;; file's declarations are DATA: it is read without evaluation (bl.env), so a
+;; duration cannot be an expression and a body cannot be a closure. Those are
+;; two spellings of one thing, and they meet HERE, so that a rule means one
+;; thing in this system rather than two.
+
+(defn rule
+  "The rule for one declaration, from VALUES.
+
+     (rule :every 30 :min)      → a rule that fires every thirty minutes
+     (rule :daily 4 10)         → a rule that fires at 04:10
+     (rule :at 1758000000000)   → a one-shot at that epoch-ms
+
+   `:every` is the one that needs a unit, and `tick/unit-ms` is the one place
+   `:min` becomes milliseconds."
+  [freq a b]
+  (cond
+    (= freq :every) {:freq :every :ms (tick/unit-ms a b)}
+    (= freq :daily) {:freq :daily :at [a b]}
+    (= freq :at) {:freq :at :ms a}
+    :else (throw (ex-info (str "sched: unknown schedule " (str freq)
+                              " — use every / daily / at")
+                          {:freq freq}))))
+
+(defn- clock-time?
+  "An hour/minute pair a clock can show: 0–23 and 0–59. A `daily` of 25:00 is
+   not a late night, it is a schedule that never fires."
+  [hh mm]
+  (and (erlang/is_integer hh) (erlang/is_integer mm)
+       (>= hh 0) (<= hh 23) (>= mm 0) (<= mm 59)))
 
 (defn advance
   "The occurrence after `due`. Nil for a one-shot."
@@ -635,11 +689,93 @@
 ;; These run INSIDE the server, so they are the state → state half; the
 ;; `handle-call` clauses the transform injects are the thin wire around them.
 
+;; ── declarations from DATA (a project file) ────────────────────────────
+
+(defn- verb-fn
+  "A `\"namespace/verb\"` name as the fn a schedule runs.
+
+   Resolved when it FIRES, not when it is declared. A project file that names a
+   verb which does not exist must not stop the command that read it — that is
+   bl.env's first rule, and it is why the file is read as data at all. What a
+   unresolvable name does instead is FAIL VISIBLY: the occurrence is recorded
+   with its error, the count of failures climbs, and a pane shows it beside the
+   schedule. A typo is loud where a human is already looking, and silence
+   everywhere else.
+
+   The one argument is the occurrence map every scheduled body takes:
+   `{:id :due :occurrence}`, where the occurrence is the key to be idempotent
+   on."
+  [nm]
+  (let [parts (to-list (erlang/apply :string :split (list nm "/" :all)))]
+    (when (not= 2 (count parts))
+      (throw (ex-info (str "sched: \"" nm "\" is not a verb — write"
+                           " \"namespace/verb\", as in \"bl.cache/prune\"")
+                      {:run nm})))
+    (let [ns (first parts)
+          verb (second parts)]
+      (fn [occ]
+        (BeamLisp.Loader/ensure_loaded ns)
+        (BeamLisp.RT/invoke (BeamLisp.Env/fetch! ns verb) (to-list [occ]))))))
+
+(defn from-data
+  "A project file's declarations as schedules — the shape `parse-entry`
+   produces, built from values instead of source.
+
+     [{:id \"cache-prune\"   :daily [4 10]   :run \"bl.cache/prune\"}
+      {:id \"index-refresh\" :every [30 :min] :run \"vm.index/refresh\"}]
+
+   ONE of `:every` / `:daily` / `:at` says when, `:run` says what, and every
+   other key is an entry option (`:catch-up`, `:jitter`, `:on-error`).
+
+   Everything a file cannot express correctly is refused HERE, at arming time,
+   with the declaration in the message: an unknown frequency, two frequencies,
+   a time that is not on a clock, a `:run` that is not a name. A project file's
+   typo is a diagnostic, never a schedule that quietly never runs."
+  [decls]
+  (vec (map (fn [d]
+              (let [id (get d :id)
+                    where (str "schedule " (str id))]
+                (when (nil? id)
+                  (throw (ex-info "sched: every declaration needs an :id" {:decl d})))
+                (let [freqs (to-list (filter (fn [k] (contains? d k)) [:every :daily :at]))]
+                  (when (not= 1 (count freqs))
+                    (throw (ex-info (str where ": exactly one of :every / :daily / :at"
+                                         " is required, found " (count freqs))
+                                    {:decl d})))
+                  (let [f (first freqs)
+                        v (to-list (get d f))
+                        run (get d :run)
+                        a (first v)
+                        b (second v)]
+                    (when (not (string? run))
+                      (throw (ex-info (str where ": :run must be a \"namespace/verb\""
+                                           " string")
+                                      {:decl d})))
+                    (when (and (= f :daily) (not (clock-time? a b)))
+                      (throw (ex-info (str where ": " (str a) ":" (str b)
+                                           " is not a time on a clock — :daily is [HH MM]")
+                                      {:decl d})))
+                    {:id (if (keyword? id) id (keyword id))
+                     :rule (if (= f :daily) (rule :daily a b) (rule f a b))
+                     :run (verb-fn run)
+                     :opts (check-opts! (select-keys d [:catch-up :jitter :on-error]) where)
+                     :doc (get d :doc)}))))
+         (or decls []))))
+
 (defn decls
-  "A vector of declarations, keyed by id. The clause emits a vector literal and
-   this keys it — a map literal cannot carry spliced pairs."
+  "A vector of declarations, keyed by id: the literal entries a clause was
+   written with, plus the ones a project file declared.
+
+   A duplicate id is refused rather than merged. Two declarations of one name
+   are two writers of one row — the store would keep whichever was transacted
+   last, and a reader would never learn there had been a question."
   [v]
-  (reduce (fn [m d] (assoc m (:id d) d)) {} v))
+  (reduce (fn [m d]
+            (when (contains? m (:id d))
+              (throw (ex-info (str "sched: two schedules named " (str (:id d)))
+                              {:id (:id d) :ids (vec (keys m))})))
+            (assoc m (:id d) d))
+          {} v))
 
 (defn init-state
   "The state the clause contributes: the declarations, each due seeded from its
@@ -784,13 +920,11 @@
             _ (when (nil? idk)
                 (throw (ex-info (str where ": the schedule id must be a keyword, got " id)
                                 {:id id})))
-            rule (cond
-                   (= freq :every)
-                     `{:freq :every :ms (proc.tick/unit-ms ~(nth args 0) ~(nth args 1))}
-                   (= freq :daily)
-                     `{:freq :daily :at [~(nth args 0) ~(nth args 1)]}
-                   :else
-                     `{:freq :at :ms ~(nth args 0)})]
+            rule (if (= freq :every)
+                   `(proc.sched/rule :every ~(nth args 0) ~(nth args 1))
+                   (if (= freq :daily)
+                     `(proc.sched/rule :daily ~(nth args 0) ~(nth args 1))
+                     `(proc.sched/rule :at ~(nth args 0) nil)))]
         {:id idk :rule rule :run fnf :opts opts}))))
 
 ;; ── the clause ──────────────────────────────────────────────────────────
@@ -841,20 +975,28 @@
         opts (if with-opts (first forms) {})
         entries (if with-opts (vec (drop 1 forms)) forms)
         where (str "defserver " (:name ctx))]
-    (check-opts! opts where)
-    (when (empty? entries)
-      (throw (ex-info (str where ": (sched (every …) … ) — at least one entry is required")
-                      {})))
-    (let [ds (vec (map (fn [e] (parse-entry e where)) entries))
-          ids (vec (map (fn [d] (:id d)) ds))
-          dup (first (filter (fn [k] (> (count (filter (fn [x] (= x k)) ids)) 1)) ids))]
-      (when (some? dup)
-        (throw (ex-info (str where ": two schedules named " dup)
-                        {:duplicate dup :ids ids})))
-      (let [clock-form (if (some? (get opts :clock)) (get opts :clock) `proc.tick/wall-ms)
-            decls-form `(proc.sched/decls [~@ds])
-            srv-form (list 'quote (:name ctx))
-            tick-name :sched]
+    (check-opts! opts where KNOWN-CLAUSE-OPTS)
+    (let [from (get opts :from)]
+      (when (and (empty? entries) (nil? from))
+        (throw (ex-info (str where ": (sched (every …) …) — at least one entry is"
+                             " required, or :from naming a project file's"
+                             " declarations")
+                        {})))
+      (let [ds (vec (map (fn [e] (parse-entry e where)) entries))
+            ids (vec (map (fn [d] (:id d)) ds))
+            dup (first (filter (fn [k] (> (count (filter (fn [x] (= x k)) ids)) 1)) ids))]
+        (when (some? dup)
+          (throw (ex-info (str where ": two schedules named " dup)
+                          {:duplicate dup :ids ids})))
+        (let [clock-form (if (some? (get opts :clock)) (get opts :clock) `proc.tick/wall-ms)
+              ;; BOTH sources, one vector. A project file's declarations and the
+              ;; clause's own entries are the same kind of thing — a scheduled
+              ;; fact — so they are keyed, armed, stored and rendered by one
+              ;; path; `:from` is where they came in, not what they are.
+              decls-form `(proc.sched/decls (concat [~@ds]
+                                                    (proc.sched/from-data ~from)))
+              srv-form (list 'quote (:name ctx))
+              tick-name :sched]
         {:prelude [`(proc.sched/arm-first ~decls-form ~clock-form ~srv-form)]
          :init `(proc.sched/init-state ~decls-form ~clock-form ~srv-form)
          :clauses
@@ -882,6 +1024,6 @@
                (proc.sched/arm st2#)
                (reply id# st2#)))
           `(handle-call [:sched/run-now id#] [_from# st#]
-             (reply id# (proc.sched/persist! (proc.sched/run-now-state st# id#))))]}))))
+             (reply id# (proc.sched/persist! (proc.sched/run-now-state st# id#))))]})))))
 
 (extend-clause! :sched sched-clause)
