@@ -20,6 +20,15 @@ driving a real Chromium with Playwright against the JS client.
    rides through). This is the property a string diff structurally cannot
    achieve: a reorder moves DOM nodes instead of rewriting them.
 
+3. **`connect.spec.js` › the socket lifecycle defaults** — the differ's client is
+   only half of `client.js`: `connect()` also owns liveness. With a fake
+   WebSocket (no server) it pins the defaults every shell relies on — a
+   `["ping"]` heartbeat within `heartbeatMs` (30 s by DEFAULT, which is what
+   beats the server's 120 s idle timeout in `web/upgrade`) and auto-reconnect
+   after a close with no opts — plus the two opt-outs (`{heartbeatMs:0}`,
+   `{reconnect:false}`). Against the pre-heartbeat client, the three default
+   claims fail and only the two opt-outs pass — which is the point.
+
 ## Run it
 
 ```sh
@@ -34,7 +43,7 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `2 passed`.
+Expected: `8 passed` (3 differ + 5 lifecycle).
 
 ## Why not Phoenix here
 
