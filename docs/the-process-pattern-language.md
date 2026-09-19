@@ -487,6 +487,47 @@ that add edges *out of* `⊥`.
 
 ---
 
+### 3.6 Heir (state that survives `⊥`)
+
+- **Intent.** Let a table outlive the process that created it, so that a crash
+  costs a restart rather than the data.
+- **Forces.** An ETS table is owned by its creator and destroyed with it — which
+  is exactly what makes ETS safe without a cleanup protocol, and exactly what
+  makes a *shared* table fragile. Supervision restarts the owner but not the
+  table: the restarted owner creates an empty one. So an ETS table created by
+  "whoever asked first" is the store of a process that is about to exit.
+  `:ets.new` accepts `{:heir, pid, data}`, so ownership can be *transferred* on
+  death instead of destroyed.
+- **Shape.** A pair of processes, each with one job. An **owner** — trivial,
+  creates the table and does nothing else — and an **heir** — long-lived,
+  receives `[:"ETS-TRANSFER" tid from data]` when an owner dies, holds the
+  table, and returns it with `:ets.give_away/3` when a new owner asks. The
+  table's lifetime is then tied to no single process.
+- **Protocol.** `ets.new(name, [type, :public, :named_table, {:heir, heir-pid, nil}])`
+  once, from the owner's init; `[:"ETS-TRANSFER", tid, from, data]` arrives in
+  the heir; `:ets.give_away(tid, new-owner, nil)` hands it back. **The atom is
+  QUOTED** — unquoted, `:ETS-TRANSFER` is the *expression* `:ETS - TRANSFER`,
+  which compiles and never matches.
+- **Guarantee.** Three, and each was a measured hole. (1) ONE CREATOR: the table
+  is created by its owner and by nothing else, so no caller can own it and no
+  "create it if missing" branch exists to be reached. (2) AN HEIR AT CREATION,
+  so there is no instant in which the table exists unheired. (3) CHECKED:
+  acquiring the table does not return until this table's owner holds it — an heir
+  holding it is the designed state *between* two owners, but acquisition is the
+  call that ends that window, so a window still open is an error.
+- **API.** ✅ `proc/hold` · `proc/owner` · `proc/tid` · `proc/live?`
+  (`priv/std/proc/table.bl`).
+- **Grounding.** The scheduler's store (`proc.sched`); `datom/store-ets`
+  documents the same hazard and is the next user. The same primitive in
+  production Elixir: `db_connection/holder.ex` — a pool is the heir and a
+  checkout process is the owner, so a borrower crashing returns the connection
+  instead of losing it. jola.dev's "Manager/Worker" is the same inversion.
+- **Related.** Healing Edge (which restarts the *owner* and would hand back an
+  empty table on its own), Monitor (the failure this survives), Snapshot. The
+  two roles compose: supervise for liveness, heir for continuity. Note the
+  inverse arrangement — make the RISKY process the owner and the stable one the
+  heir, and the table follows the work instead of outliving it.
+
 ## 4. Observation patterns — reading the graph without adding edges
 
 ### 4.1 Heartbeat
@@ -617,6 +658,7 @@ Two consequences for the API:
 | Registry | ✅ `reg.bl` — `defregistry`, monitor-retract, name-as-value; ◐ `vitals` atom cutover deferred |
 | Monitor, Link | ✅ native |
 | Healing Edge | ✅ `supervise` + `defsupervisor` (`super.bl`: strategies, intensity, pools, tree verbs) |
+| Heir | ✅ `proc/table` — `hold`/`owner`/`tid`/`live?`; one creator, an heir at creation, checked acquisition. ✅ first user: `proc.sched`'s store (a datom database, adopted via `store-ets/adopt`) |
 | Governor | ✅ OTP intensity; `defsupervisor (intensity r s)`; ○ `find-lasso` pre-check wired in |
 | Bounded Isolation | ✅ `fence.bl` stdlib (ward cut over); ◐ hand-rolled copies in spell remain |
 | Heartbeat, Snapshot | ◐ `vitals.bl`; ○ stdlib fns |
