@@ -1,0 +1,226 @@
+; test/bl/datom/resolve_test.bl — the fjall `Scan` fast path == the generic read.
+; Run: ./bin/bl test test/bl/datom/resolve_test.bl
+;
+; ── What must hold ────────────────────────────────────────────────────
+;
+; `datom.store/Scan` is an OPTIONAL capability: the index layer calls
+; `scan-datoms`, which dispatches on `satisfies?` and otherwise falls back to
+; reading the range and taking its values. fjall implements it (fjall.bl, over
+; the native `fjall-resolve-chunk`), so the fast path is now live on the durable
+; substrate — and a fast path is only worth having if it is INDISTINGUISHABLE
+; from the slow one.
+;
+; These are the four assertions FUP-022 asked to restore when the redb
+; implementation was deleted with its backend (its `resolve_test.bl` was gated on
+; `when-redb`), re-pointed at fjall:
+;
+;   1. the same datoms, in the same order, for a whole prefix
+;   2. the same datoms for a BOUNDED range (the scan-range path)
+;   3. retractions read back as datoms, not dropped and not merged
+;   4. arbitrary structures (the any-term lane) survive the native decode
+;
+; Plus the two properties the fjall implementation adds beyond the old one:
+; a scan that spans SEVERAL native chunks is exact at the seams, and rows still
+; in the pre-lane `term_to_binary` format decode through the SAME fast path (a
+; store upgrades lazily, so a mixed keyspace must read correctly).
+
+(ns datom.resolve.test
+  (:require [datom.store] [datom.store-fjall] [datom.index] [datom.codec]))
+
+(defn- fresh-store []
+  (if (datom.store-fjall/available?)
+    (datom.store-fjall/open-fresh)
+    nil))
+
+(defn- generic-scan
+  "The SLOW path, forced: read the range and take the values.
+
+   `datom.store/scan-via-range` is exactly what `scan-datoms` falls back to for
+   a substrate without the capability, so comparing against it compares the fast
+   path against the contract it must satisfy — not against a copy of itself."
+  [store lo hi]
+  (datom.store/scan-via-range store lo hi))
+
+(defn- both
+  "The fast and generic reads of one range, as a pair to compare."
+  [store lo hi]
+  [(datom.store/scan-datoms store lo hi) (generic-scan store lo hi)])
+
+(defn- write-datoms
+  "Put `ds` into `store` through the real index keys, as a transaction would."
+  [store index ds]
+  (doseq [d ds]
+    (datom.store/-put store (datom.index/key-for index d) d))
+  store)
+
+(deftest scan-is-implemented-so-the-fast-path-is-not-a-fallback
+  ; If this fails the suite below would be comparing the generic path with
+  ; itself — passing while proving nothing.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (is (satisfies? datom.store/Scan store)
+          "fjall must implement the Scan capability, or every read here is generic"))))
+
+(deftest scan-datoms-matches-the-generic-read-over-a-whole-prefix
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [ds [[1 :person/name "Ada" 1 true]
+                [1 :person/age 36 1 true]
+                [2 :person/name "Grace" 2 true]
+                [2 :person/name "Grace Hopper" 3 true]
+                [3 :doc/body "a body" 4 true]]
+            _ (write-datoms store :eavt ds)
+            lo (datom.index/key-prefix :eavt 2)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)]
+        (is (= slow fast) "the fast path must return the same datoms, in order")
+        (is (= 2 (count fast)))
+        ; The datoms must be bl VECTORS, not Erlang tuples: the runtime's own
+        ; reader (`get`, `vector?`) is what every layer above uses, and a tuple
+        ; would satisfy `=` by accident while answering every accessor with nil.
+        (is (vector? (first fast)))
+        (is (= 2 (get (first fast) 0)))
+        (is (= [[2 :person/name "Grace" 2 true]
+                [2 :person/name "Grace Hopper" 3 true]]
+               fast))))))
+
+(deftest scan-datoms-matches-the-generic-read-over-a-bounded-range
+  ; The `scan-range` path brackets on a VALUE inside a prefix, so the bounds are
+  ; mid-key rather than at an index boundary — a different set of seams.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [ds (mapv (fn [i] [i :person/age (+ 20 i) (+ 100 i) true]) (range 30))
+            _ (write-datoms store :avet ds)
+            base (datom.index/key-prefix :avet :person/age)
+            lo (datom.codec/concat-bins [base (datom.codec/encode-value 25)])
+            hi (datom.index/prefix-end
+                 (datom.codec/concat-bins [base (datom.codec/encode-value 29)]))
+            [fast slow] (both store lo hi)]
+        (is (= slow fast))
+        (is (= 5 (count fast)))
+        (is (= [25 26 27 28 29] (mapv datom.index/-v fast)))))))
+
+(deftest scan-datoms-keeps-retractions-distinct-from-assertions
+  ; The old corrupting bug this guards: an assertion and a retraction of the
+  ; same fact at the same tx agree on e/a/v/tx and differ only in `op`. They are
+  ; two datoms. A reader that drops or merges either one is losing history.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [ds [[9 :person/name "Ada" 7 true]
+                [9 :person/name "Ada" 7 false]
+                [9 :person/name "Ada" 8 false]]
+            _ (write-datoms store :eavt ds)
+            lo (datom.index/key-prefix :eavt 9)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)]
+        (is (= slow fast))
+        (is (= 3 (count fast)) "both ops at one tx, and the later retraction, survive")
+        ; KEY order: `op` is the last component, and a retraction sorts before an
+        ; assertion of the same fact at the same tx — which is exactly why the
+        ; key has an `op` byte at all (without it the two keys collide and the
+        ; store keeps one, losing history).
+        (is (= [false true false] (mapv datom.index/-op fast)))
+        (is (= [7 7 8] (mapv datom.index/-tx fast)))))))
+
+(deftest scan-datoms-decodes-arbitrary-structures
+  ; The any-term lane rides an ETF payload inside the native decode; a nested
+  ; structure is the case that fails if the reader ever assumes a fixed width.
+  ; Asserted as a MAP keyed by attribute, because a scan returns datoms in KEY
+  ; order — not the order they were written — and comparing a vector by index
+  ; would be testing insertion order, which this layer never promises.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [ds [[1 :doc/blocks {:blocks [{:type :h1 :text "T"} {:type :p :text "B"}]} 3 true]
+                [1 :tags #{:a :b} 3 true]
+                [1 :kw :db.type/ref 4 false]
+                [1 :maybe nil 5 true]
+                [1 :big (erlang/bsl 1 70) 5 true]]
+            _ (write-datoms store :eavt ds)
+            lo (datom.index/key-prefix :eavt 1)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)
+            by-a (fn [rows] (into {} (mapv (fn [d] [(datom.index/-a d) (datom.index/-v d)]) rows)))]
+        (is (= slow fast))
+        (is (= 5 (count fast)))
+        (is (= (by-a slow) (by-a fast)))
+        (is (= [{:type :h1 :text "T"} {:type :p :text "B"}]
+               (:blocks (get (by-a fast) :doc/blocks))))
+        (is (= #{:a :b} (get (by-a fast) :tags)))
+        (is (= :db.type/ref (get (by-a fast) :kw)))
+        (is (nil? (get (by-a fast) :maybe)))
+        (is (= (erlang/bsl 1 70) (get (by-a fast) :big)))))))
+
+(deftest scan-reads-a-row-the-packed-lane-could-not-hold
+  ; A datom the lane cannot pack (an entity that is a bignum) rides the slot's
+  ; ESC lane as a whole term. One such row must not break the SCAN — the whole
+  ; range is read through the same decode, so a reader that only understood the
+  ; packed form would fail every query that happened to touch this entity.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [big (erlang/bsl 1 70)
+            ds [[big :person/name "Huge" 1 true]
+                [2 :person/name "Small" 2 true]]
+            _ (write-datoms store :eavt ds)
+            lo (datom.index/key-prefix :eavt big)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)]
+        (is (= slow fast))
+        (is (= [[big :person/name "Huge" 1 true]] fast))))))
+
+(deftest scan-spans-many-native-chunks-without-a-gap-or-a-repeat
+  ; The fast path reads CHUNK-ROWS datoms per crossing and resumes from the last
+  ; key it received. 1101 rows crosses the 512-row boundary twice, which is where
+  ; an off-by-one in the resume key would drop or duplicate exactly one datom —
+  ; in the middle of the index, where nothing else would notice.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [n 1101
+            pad4 (fn [i] (let [s (str i)] (str (subs "0000" 0 (- 4 (count s))) s)))
+            ; ONE entity, 1101 values: the scan must be bounded by a range that
+            ; actually SPANS them. (Bounding on entity 1 while writing entities
+            ; 1..1101 tests nothing — the scan would stop at the first key.)
+            ds (mapv (fn [i] [1 :item/label (str "label-" (pad4 i)) (+ 1 i) true])
+                     (range n))
+            _ (write-datoms store :eavt ds)
+            lo (datom.index/key-prefix :eavt 1)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)]
+        (is (= n (count fast)))
+        (is (= slow fast))
+        (is (= (mapv datom.index/-v fast) (mapv datom.index/-v slow)))
+        (is (= (mapv (fn [i] (str "label-" (pad4 i))) (range n))
+               (mapv datom.index/-v fast)))
+        (is (= (range 1 (+ 1 n)) (mapv datom.index/-tx fast)))))))
+
+(deftest scan-reads-rows-written-before-the-value-lane-existed
+  ; A store written by an older build holds `term_to_binary` values. The reader
+  ; must decode them through the SAME fast path (the LEGACY lane), because a
+  ; lazy upgrade is the whole reason there is no migration step: old rows stay
+  ; readable, new writes are packed, and the two coexist in one keyspace.
+  (let [store (fresh-store)]
+    (if (nil? store)
+      (is true "fjall backend absent")
+      (let [legacy [[5 :person/name "Old" 11 true]
+                    [5 :person/age 44 12 true]]
+            packed [[5 :person/name "New" 13 true]]
+            _ (doseq [d legacy]
+                ; exactly what the pre-lane store wrote: the datom as ETF
+                (datom.store-fjall/fjall-put
+                  (:handle store) (datom.index/key-for :eavt d) (erlang/term_to_binary d)))
+            _ (write-datoms store :eavt packed)
+            lo (datom.index/key-prefix :eavt 5)
+            hi (datom.index/prefix-end lo)
+            [fast slow] (both store lo hi)]
+        (is (= 3 (count fast)))
+        (is (= slow fast) "legacy and packed rows must read identically")
+        ; key order: attribute first (:person/age < :person/name), then the value
+        ; ("New" < "Old") — a scan is in KEY order, never insertion order.
+        (is (= [44 "New" "Old"] (mapv datom.index/-v fast)))
+        (is (= [12 13 11] (mapv datom.index/-tx fast)))))))

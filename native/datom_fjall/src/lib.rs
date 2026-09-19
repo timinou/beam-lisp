@@ -41,6 +41,7 @@
 //! the whole window — so a transaction costs one BEAM↔Rust crossing.
 
 use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, Resource, ResourceArc, Term};
+use rustler::types::map::map_new;
 use std::io::Write;
 use std::sync::Mutex;
 
@@ -56,6 +57,11 @@ mod atoms {
         nil,
         put,
         delete,
+        columns,
+        datoms,
+        pairs,
+        true_,
+        false_,
     }
 }
 
@@ -200,6 +206,496 @@ fn fjall_range_chunk<'a>(
         ));
     }
     Ok(pairs.encode(env))
+}
+
+// ══ the datom read path: one crossing, decoded natively ═════════════
+//
+// The storage slot (datom.value-codec, the "datom lane") packs a datom
+// field-wise, so a reader recovers e/tx/op/a/v by OFFSET, with no ETF parse of
+// a container and no per-field BEAM call. This module is that reader.
+//
+// It matters because of where the cost sits. Reading 969 016 rows through the
+// port takes 8.57 s, of which only 2.48 s is fjall iteration: the rest is
+// per-row work in the BEAM (`binary_to_term` of a 5-vector, a fresh vector per
+// row, the range's [k v] pairs) — work that is thrown away whenever a filter
+// rejects the row. A columnar read replaces it with a handful of bulk binaries.
+//
+// Two shapes, one decode loop:
+//
+//   datoms  — the same datoms the generic path returns, built here instead.
+//             Drop-in for `scan-datoms`, and the win is simply that the parse
+//             is a byte read in Rust rather than a BEAM term parse per row.
+//
+//   columns — the DENSE UNION layout a columnar engine uses for a
+//             heterogeneous column: one lane tag per row plus a per-lane dense
+//             array, and for variable-width lanes a shared offsets array beside
+//             one bytes blob (Arrow's var-length layout). A caller can then
+//             filter over columns — a text predicate becomes `binary.match`
+//             over one blob — and materialize terms only for rows that survive.
+//             The attribute column is dictionary-encoded, because in a range
+//             scan `a` is nearly constant: an AEVT chunk carries ONE attribute
+//             for its whole length.
+//
+// Rows written before the datom lane existed start with the ETF version byte.
+// They are decoded with `binary_to_term` exactly as they always were (lane
+// LEGACY), so a store upgrades lazily and a mixed keyspace reads correctly.
+
+/// Lane tags, mirrored from `datom.value-codec`. Kept as plain constants so
+/// this module and the bl codec can be read side by side.
+const LANE_LONG: u8 = 1;
+const LANE_BOOL: u8 = 2;
+const LANE_STR: u8 = 3;
+const LANE_KW: u8 = 4;
+const LANE_FLOAT: u8 = 5;
+const LANE_DATOM: u8 = 6;
+const LANE_ESC: u8 = 255;
+/// Not a codec lane: this crate's marker for a row still in the pre-lane
+/// `term_to_binary` format. A caller that sees it decodes the whole value with
+/// `binary_to_term` and takes element 2 — the old path, for old rows only.
+const LANE_LEGACY: u8 = 254;
+const ETF_VERSION: u8 = 131;
+
+/// The five fields of one stored datom, borrowed from the row's bytes.
+struct Row<'a> {
+    e: i64,
+    tx: i64,
+    op: u8,
+    a: &'a [u8],
+    /// The `v` payload with its lane tag still on the front.
+    v: &'a [u8],
+    /// `Some(etf bytes)` for a row whose whole datom rode the any-term lane: a
+    /// pre-lane (`term_to_binary`) value, or a value the datom lane could not
+    /// pack (a bignum entity, an attribute name past 255 bytes). `v` is then
+    /// meaningless and the bytes are the datom, ETF-encoded.
+    legacy: Option<&'a [u8]>,
+}
+
+/// Read the datom payload at `val` into its fields by offset.
+///
+/// Every malformed shape is an ERROR naming the reason: a store that holds an
+/// index range full of something other than datoms is a corrupted database, and
+/// the one thing a reader must never do is invent a plausible datom for it.
+fn read_row(val: &[u8]) -> Result<Row<'_>, Error> {
+    if val.is_empty() {
+        return Err(err("empty value in a datom index"));
+    }
+    if val[0] == ETF_VERSION {
+        return Ok(Row { e: 0, tx: 0, op: 1, a: &[], v: &[], legacy: Some(val) });
+    }
+    if val[0] == LANE_ESC {
+        // The slot's own escape lane: the datom did not fit the packed lane (a
+        // bignum entity, an attribute name past 255 bytes), so the WRITER put
+        // the whole datom in a term. This is not a defect to report — it is a
+        // legal row, and a reader that refused it would break an entire scan
+        // because one datom in it is unusual.
+        return Ok(Row { e: 0, tx: 0, op: 1, a: &[], v: &[], legacy: Some(&val[1..]) });
+    }
+    if val[0] != LANE_DATOM {
+        return Err(err(format!(
+            "index row is not a datom payload (leading byte {}; expected {}, {} or {})",
+            val[0], LANE_DATOM, LANE_ESC, ETF_VERSION
+        )));
+    }
+    if val.len() < 19 {
+        return Err(err(format!("datom payload truncated: {} bytes", val.len())));
+    }
+    let e = i64::from_le_bytes(val[1..9].try_into().unwrap());
+    let tx = i64::from_le_bytes(val[9..17].try_into().unwrap());
+    let a_len = val[18] as usize;
+    if val.len() < 19 + a_len {
+        return Err(err(format!(
+            "datom payload truncated: attribute claims {} bytes, payload is {}",
+            a_len,
+            val.len()
+        )));
+    }
+    Ok(Row {
+        e,
+        tx,
+        op: val[17],
+        a: &val[19..19 + a_len],
+        v: &val[19 + a_len..],
+        legacy: None,
+    })
+}
+
+/// One stored value, decoded — the whole slot, not just a datom's `v`.
+///
+/// This is `datom.value-codec/decode-slot` executed in Rust. The port's generic
+/// `-range` needs decoded values, and doing that decode in the BEAM made the port
+/// FOUR TIMES SLOWER on packed values than on the ETF they replaced (measured on
+/// 50 000 rows: 1964 ms against 479 ms) — because the packed payload is cheap
+/// only when a compiled reader touches it. Decoding it here keeps every read
+/// path's cost where it belongs, and keeps the regression off `-range` for any
+/// caller that never touches datoms at all.
+fn slot_term<'a>(env: Env<'a>, bytes: &[u8], shape: &VectorShape) -> NifResult<Term<'a>> {
+    if bytes.is_empty() {
+        return Err(err("empty value slot"));
+    }
+    match bytes[0] {
+        ETF_VERSION => decode_stored(env, bytes, "stored value"),
+        LANE_ESC => decode_stored(env, &bytes[1..], "escaped value"),
+        LANE_DATOM => {
+            let row = read_row(bytes)?;
+            datom_term(env, &row, shape)
+        }
+        // A scalar slot: the same lanes a datom's `v` uses, with nothing in
+        // front of them. The synthetic row carries no entity/attribute, which
+        // `v_term` never reads for these lanes.
+        _ => v_term(
+            env,
+            &Row { e: 0, tx: 0, op: 1, a: &[], v: bytes, legacy: None },
+            shape,
+        ),
+    }
+}
+
+/// The shape of a bl VECTOR, resolved once per call.
+///
+/// A bl vector is the runtime's own struct: an Erlang map keyed by ATOMS
+/// (`__struct__`, `items`, `meta`), and for 32 or fewer elements the elements
+/// live in a plain tuple inside it. A NIF that hands back datoms must build
+/// THAT, because an Erlang tuple is a near-miss — it prints like a vector, then
+/// answers `get` with nil and `vector?` with false, so every reader above it
+/// (the index accessors, the db filter) silently sees garbage. That failure is
+/// a long way from its cause, which is why the shape is named once, here.
+///
+/// Datoms are 5 elements, well inside the tail, so the trie form never applies.
+struct VectorShape {
+    struct_value: Atom,
+    struct_key: Atom,
+    items: Atom,
+    meta: Atom,
+}
+
+impl VectorShape {
+    fn new(env: Env) -> NifResult<Self> {
+        Ok(VectorShape {
+            struct_value: Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
+            struct_key: Atom::from_str(env, "__struct__")?,
+            items: Atom::from_str(env, "items")?,
+            meta: Atom::from_str(env, "meta")?,
+        })
+    }
+
+    fn vector<'a>(&self, env: Env<'a>, items: &[Term<'a>]) -> NifResult<Term<'a>> {
+        let tup = rustler::types::tuple::make_tuple(env, items);
+        Ok(map_new(env)
+            .map_put(self.struct_key, self.struct_value)?
+            .map_put(self.items, tup)?
+            .map_put(self.meta, atoms::nil().to_term(env))?)
+    }
+}
+
+/// Decode bytes this database wrote.
+///
+/// TRUSTED, deliberately. rustler's `binary_to_term` is the SAFE variant, which
+/// refuses any binary carrying an atom that is not ALREADY in the atom table —
+/// and on a fresh VM that is every attribute name in the store, so a legacy row
+/// would fail to decode for a reason that has nothing to do with the row. The
+/// BEAM's own `binary_to_term/1`, which the bl-side reader calls, interns atoms
+/// exactly like this, so reading a store has always created its atoms: this is
+/// parity with the existing path, not a new exposure. The bytes come from our
+/// own value slot, under our own key space, written by our own writer.
+fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str) -> NifResult<Term<'a>> {
+    unsafe { env.binary_to_term_trusted(bytes) }
+        .map(|(term, _)| term)
+        .ok_or_else(|| err(format!("{} did not decode", what)))
+}
+
+/// The five fields of a datom stored in the BEAM's own format.
+///
+/// A bl vector is NOT an Erlang tuple. For 32 or fewer elements it is the
+/// runtime's struct — a map whose `items` key holds the elements — so a reader
+/// that assumed a tuple would fail on EVERY row of a store written before the
+/// packed lane existed, which is exactly the population a lazy upgrade must keep
+/// serving. Both shapes are accepted here, and the tuple case is tried first
+/// because it is the cheaper test.
+fn datom_fields<'a>(env: Env<'a>, term: Term<'a>, shape: &VectorShape) -> NifResult<Vec<Term<'a>>> {
+    if let Ok(items) = rustler::types::tuple::get_tuple(term) {
+        return Ok(items.to_vec());
+    }
+    if let Ok(items) = term.map_get(shape.items) {
+        if let Ok(elems) = rustler::types::tuple::get_tuple(items) {
+            return Ok(elems.to_vec());
+        }
+    }
+    let _ = env;
+    Err(err("stored datom is neither a tuple nor a bl vector"))
+}
+
+/// The BEAM term for one row's `v`, chosen by its lane tag.
+fn v_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Term<'a>> {
+    if let Some(whole) = row.legacy {
+        // Pre-lane row: the value IS the datom, so recover `v` from it.
+        let term = decode_stored(env, whole, "legacy datom value")?;
+        let fields = datom_fields(env, term, shape)?;
+        return fields
+            .get(2)
+            .copied()
+            .ok_or_else(|| err("legacy datom value is not a 5-element datom"));
+    }
+    let v = row.v;
+    match v.first() {
+        Some(&LANE_LONG) if v.len() == 9 => {
+            Ok(i64::from_le_bytes(v[1..9].try_into().unwrap()).encode(env))
+        }
+        Some(&LANE_BOOL) if v.len() == 2 => Ok(if v[1] == 1 {
+            atoms::true_().to_term(env)
+        } else {
+            atoms::false_().to_term(env)
+        }),
+        Some(&LANE_FLOAT) if v.len() == 9 => {
+            Ok(f64::from_le_bytes(v[1..9].try_into().unwrap()).encode(env))
+        }
+        Some(&LANE_STR) => Ok(to_binary(env, &v[1..])?.to_term(env)),
+        Some(&LANE_KW) => Ok(Atom::from_bytes(env, &v[1..])?.to_term(env)),
+        Some(&LANE_ESC) => {
+            let term = decode_stored(env, &v[1..], "escaped value")?;
+            Ok(term)
+        }
+        Some(&tag) => Err(err(format!(
+            "unknown value lane {} (payload {} bytes)",
+            tag,
+            v.len()
+        ))),
+        None => Err(err("datom payload carries no value")),
+    }
+}
+
+/// One row as the datom the index layer expects: `[e a v tx op]`.
+fn datom_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Term<'a>> {
+    if row.legacy.is_some() {
+        // Already a datom in the BEAM's own format: hand it back as-is.
+        return decode_stored(env, row.legacy.unwrap(), "legacy datom value");
+    }
+    let a = Atom::from_bytes(env, row.a)?;
+    let v = v_term(env, row, shape)?;
+    shape.vector(
+        env,
+        &[
+            row.e.encode(env),
+            a.to_term(env),
+            v,
+            row.tx.encode(env),
+            (row.op == 1).encode(env),
+        ],
+    )
+}
+
+/// The columnar form of a chunk: dense per-lane arrays + a lane tag per row.
+///
+/// The layout is deliberately index-addressable — `v_idx[i]` says where row i's
+/// value lives, in its lane's dense array or in the shared variable-width
+/// area — because late materialization picks rows out of order, and a layout
+/// that only streams would force a full pass to reach row 900 000.
+#[derive(Default)]
+struct Columns {
+    n: usize,
+    e: Vec<u8>,
+    tx: Vec<u8>,
+    op: Vec<u8>,
+    a_idx: Vec<u8>,
+    a_dict: Vec<Vec<u8>>,
+    v_lane: Vec<u8>,
+    v_idx: Vec<u8>,
+    v_long: Vec<u8>,
+    v_bool: Vec<u8>,
+    v_double: Vec<u8>,
+    v_var_off: Vec<u8>,
+    v_var: Vec<u8>,
+}
+
+impl Columns {
+    fn new() -> Self {
+        let mut c = Columns::default();
+        // offsets[0] = 0, so row j of the variable area is off[j]..off[j+1]
+        // without a special case for the first row.
+        c.v_var_off.extend_from_slice(&0u32.to_le_bytes());
+        c
+    }
+
+    fn push_var(&mut self, lane: u8, bytes: &[u8]) -> u32 {
+        let ordinal = (self.v_var_off.len() / 4 - 1) as u32;
+        self.v_var.extend_from_slice(bytes);
+        self.v_var_off
+            .extend_from_slice(&(self.v_var.len() as u32).to_le_bytes());
+        self.v_lane.push(lane);
+        ordinal
+    }
+
+    fn push(&mut self, env: Env, row: &Row<'_>, shape: &VectorShape) -> NifResult<()> {
+        // NOTE: `push` is the only place a row's bytes become columns, so it is
+        // also the only place the LEGACY/ESC distinction has to be resolved.
+        self.e.extend_from_slice(&row.e.to_le_bytes());
+        self.tx.extend_from_slice(&row.tx.to_le_bytes());
+        self.op.push(row.op);
+
+        // Dictionary-encode the attribute: in a range scan it is close to
+        // constant (an AEVT chunk has exactly one value here), so a linear
+        // scan over a tiny dictionary is both correct and the cheapest thing
+        // to do — no hashing, no ordering, and the dictionary keeps the first
+        // -seen order, which is the scan's own order.
+        let idx = match self.a_dict.iter().position(|d| d.as_slice() == row.a) {
+            Some(i) => i,
+            None => {
+                self.a_dict.push(row.a.to_vec());
+                self.a_dict.len() - 1
+            }
+        };
+        if idx > u16::MAX as usize {
+            return Err(err("more distinct attributes in one chunk than a u16 holds"));
+        }
+        self.a_idx.extend_from_slice(&(idx as u16).to_le_bytes());
+
+        if let Some(whole) = row.legacy {
+            // A pre-lane (or unpackable) row: pull `v` out of the stored datom
+            // and re-emit it as an ESC payload. The columnar reader's callers
+            // then never see a legacy lane at all — one code path above, and no
+            // migration step before a store can be read columnar.
+            let term = decode_stored(env, whole, "legacy datom value")?;
+            let fields = datom_fields(env, term, shape)?;
+            let v = fields
+                .get(2)
+                .ok_or_else(|| err("legacy datom value is not a 5-element datom"))?;
+            let etf = v.to_binary();
+            let ordinal = self.push_var(LANE_ESC, etf.as_slice());
+            self.v_idx.extend_from_slice(&ordinal.to_le_bytes());
+            self.n += 1;
+            return Ok(());
+        }
+
+        let v = row.v;
+        let idx = match v.first() {
+            Some(&LANE_LONG) if v.len() == 9 => {
+                let i = (self.v_long.len() / 8) as u32;
+                self.v_long.extend_from_slice(&v[1..9]);
+                self.v_lane.push(LANE_LONG);
+                Some(i)
+            }
+            Some(&LANE_BOOL) if v.len() == 2 => {
+                let i = self.v_bool.len() as u32;
+                self.v_bool.push(v[1]);
+                self.v_lane.push(LANE_BOOL);
+                Some(i)
+            }
+            Some(&LANE_FLOAT) if v.len() == 9 => {
+                let i = (self.v_double.len() / 8) as u32;
+                self.v_double.extend_from_slice(&v[1..9]);
+                self.v_lane.push(LANE_FLOAT);
+                Some(i)
+            }
+            Some(&LANE_STR) => Some(self.push_var(LANE_STR, &v[1..])),
+            Some(&LANE_KW) => Some(self.push_var(LANE_KW, &v[1..])),
+            Some(&LANE_ESC) => Some(self.push_var(LANE_ESC, &v[1..])),
+            Some(&tag) => {
+                return Err(err(format!(
+                    "unknown value lane {} (payload {} bytes)",
+                    tag,
+                    v.len()
+                )))
+            }
+            None => return Err(err("datom payload carries no value")),
+        };
+        if let Some(i) = idx {
+            self.v_idx.extend_from_slice(&i.to_le_bytes());
+        }
+        self.n += 1;
+        Ok(())
+    }
+}
+
+/// `fjall_resolve_chunk`: up to `limit` datoms from a bounded scan, decoded in
+/// Rust, in the shape `mode` asks for.
+///
+/// `mode` is `:datoms` (a list under `"datoms"`) or `:columns` (the dense-union
+/// columns). Both return `"n"` and `"last"` — the last key read, which the
+/// caller passes back as `after` to resume, exactly as `fjall_range_chunk`
+/// specifies. The bounds are the same three options, with the same meanings.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_resolve_chunk<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    start: Option<Binary>,
+    after: Option<Binary>,
+    stop: Option<Binary>,
+    limit: usize,
+    mode: Atom,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound;
+    let lower = match (&start, &after) {
+        (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
+        (None, Some(b)) => Bound::Excluded(b.as_slice().to_vec()),
+        (None, None) => Bound::Unbounded,
+    };
+    let upper = match &stop {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+    let want_columns = mode == atoms::columns();
+    let want_datoms = mode == atoms::datoms();
+    let want_pairs = mode == atoms::pairs();
+    if !want_columns && !want_datoms && !want_pairs {
+        return Err(err("resolve mode must be :datoms, :columns or :pairs"));
+    }
+
+    let mut datoms: Vec<Term<'a>> = Vec::new();
+    let mut pairs: Vec<Term<'a>> = Vec::new();
+    let mut cols = Columns::new();
+    let mut last_key: Option<Vec<u8>> = None;
+    let shape = VectorShape::new(env)?;
+
+    for entry in handle.datoms.range((lower, upper)).take(limit) {
+        let (k, v) = entry.map_err(|e| err(e))?;
+        if want_pairs {
+            // The port's `-range` holds ARBITRARY values (counters, blobs and
+            // datoms share the keyspace), so this mode must not require a datom
+            // shape — that is the `:datoms`/`:columns` contract, not the port's.
+            let key = to_binary(env, &k)?.to_term(env);
+            let value = slot_term(env, &v, &shape)?;
+            pairs.push(shape.vector(env, &[key, value])?);
+        } else {
+            let row = read_row(&v)?;
+            if want_datoms {
+                datoms.push(datom_term(env, &row, &shape)?);
+            } else {
+                cols.push(env, &row, &shape)?;
+            }
+        }
+        last_key = Some(k.to_vec());
+    }
+
+    let out = map_new(env);
+    let n = if want_columns { cols.n } else if want_datoms { datoms.len() } else { pairs.len() };
+    let out = out.map_put("n", n as u64)?;
+    let out = match &last_key {
+        Some(k) => out.map_put("last", to_binary(env, k)?)?,
+        None => out.map_put("last", atoms::nil().to_term(env))?,
+    };
+    let out = if want_datoms {
+        out.map_put("datoms", datoms.encode(env))?
+    } else if want_pairs {
+        out.map_put("pairs", pairs.encode(env))?
+    } else {
+        let paths = cols
+            .a_dict
+            .iter()
+            .map(|d| to_binary(env, d).map(|b| b.to_term(env)))
+            .collect::<NifResult<Vec<Term>>>()?;
+        out.map_put("a-dict", paths.encode(env))?
+            .map_put("a-idx", to_binary(env, &cols.a_idx)?)?
+            .map_put("e", to_binary(env, &cols.e)?)?
+            .map_put("tx", to_binary(env, &cols.tx)?)?
+            .map_put("op", to_binary(env, &cols.op)?)?
+            .map_put("v-lane", to_binary(env, &cols.v_lane)?)?
+            .map_put("v-idx", to_binary(env, &cols.v_idx)?)?
+            .map_put("v-long", to_binary(env, &cols.v_long)?)?
+            .map_put("v-bool", to_binary(env, &cols.v_bool)?)?
+            .map_put("v-double", to_binary(env, &cols.v_double)?)?
+            .map_put("v-var-off", to_binary(env, &cols.v_var_off)?)?
+            .map_put("v-var", to_binary(env, &cols.v_var)?)?
+    };
+    Ok(out)
 }
 
 /// `-put`: store `value` at `key`.

@@ -14,7 +14,7 @@
 ; and is what everything above uses today.
 
 (ns datom.store-fjall
-  (:require [datom.store] [datom.blob] [datom.blob-fs]))
+  (:require [datom.store] [datom.blob] [datom.blob-fs] [datom.value-codec]))
 
 (def ^:private CHUNK-ROWS
   "Rows per native range crossing. 512 keeps a chunk ~8ms on the measured
@@ -35,6 +35,22 @@
   ; concurrent get waited the whole scan (max 3421ms). Chunks release that
   ; lane between reads and bound the native transient.
   (fjall-range-chunk 5)
+  ; fjall-resolve-chunk: the DATOM read path — up to `limit` datoms from the
+  ; same three bounds, DECODED IN RUST. Args: (start after stop limit mode),
+  ; where mode is :datoms (a list under "datoms"), :pairs ([k v] decoded values,
+  ; what `-range` needs) or :columns (a dense-union columnar chunk: e/tx/op/
+  ; a-dict+a-idx/v-lane+v-idx + per-lane dense arrays and one shared
+  ; variable-width area). Returns {n, last} plus one of them; `last` is nil when
+  ; the chunk was empty, which is how a caller stops.
+  ;
+  ; Why it exists: on the real corpus (969 016 rows / 1.1 GB) the generic
+  ; `-range` read costs 8.57s, of which fjall iteration is 2.48s — the rest is
+  ; per-row BEAM work (term_to_binary parse, a fresh vector per row, the [k v]
+  ; pairs) that is thrown away for every row a filter rejects. Here the parse
+  ; is a byte read and the caller can filter columns before materializing
+  ; anything. Measured on 50 000 identical rows: 112ms read as datoms through
+  ; this path where the BEAM-decoding path needs 479ms.
+  (fjall-resolve-chunk 6)
   (fjall-put 3)
   (fjall-delete 2)
   (fjall-cas 4)
@@ -59,13 +75,64 @@
 
 (defrecord FjallStore [handle path])
 
-;; ── values: faithful round trip, nothing more ───────────────────────
+;; ── values: faithful round trip, and CHEAP to read back ─────────────
 ;; KEYS are the database's own order-preserving binaries — never reinterpreted.
 ;; VALUES are whatever the layer above stored; their bytes are only returned,
-;; never compared, so term_to_binary is the obvious faithful codec.
+;; never compared, so the slot codec's only jobs are fidelity and speed.
+;;
+;; A datom is the overwhelmingly common value here (every index row), and the
+;; old `term_to_binary` slot paid for it twice: an ETF envelope around a
+;; 5-vector, parsed back into a fresh vector per row, at every read. The datom
+;; lane packs e/tx as fixed-width little-endian integers, `op` as one byte, the
+;; attribute with its own length, and `v` last — so a reader (in Rust, in the
+;; columnar path) recovers fields by offset and allocates NOTHING for a row it
+;; filters out. Scalars (the transaction and entity counters in this same
+;; keyspace) take their own runtime lane; nothing here guesses wrong, because a
+;; slot that is not a datom still round-trips.
+;;
+;; Rows written before the lane existed start with the ETF version byte (131),
+;; which no lane tag is, so `decode-slot` reads them exactly as before: a store
+;; upgrades lazily and a mixed keyspace is expected.
 
-(defn- encode-value [v] (erlang/term_to_binary v))
-(defn- decode-value [b] (if (nil? b) nil (erlang/binary_to_term b)))
+(defn- encode-value [v] (datom.value-codec/encode-slot v))
+(defn- decode-value [b] (datom.value-codec/decode-slot b))
+
+
+;; ── the datom read fast path: the `Scan` capability ─────────────────
+;;
+;; `Scan` is declared in datom.store as an OPTIONAL capability beside the Store
+;; port, and this backend is the reason it exists: it is the serializing one, so
+;; it is the one whose generic read pays a per-row BEAM decode it can avoid.
+;; `datom.store/scan-datoms` dispatches on `satisfies?`, so the index layer and
+;; everything above it take this path for fjall and an in-memory fast path for
+;; ETS without either naming a substrate.
+;;
+;; The contract is the generic one, exactly: every datom whose key is in
+;; [lo, hi] inclusive, in key order, unfiltered (basis and time travel are the
+;; db layer's job, and doing them here would hide them from `:history`).
+;;
+;; Chunked for the same reason `-range` is — the whole-window read over a real
+;; corpus is 15.6s in one crossing on ONE dirty-IO scheduler, so a concurrent
+;; get waited the entire scan (measured 3421ms against a 0.05ms median). A
+;; chunk releases that lane, and here it also bounds the native transient to
+;; CHUNK-ROWS datoms instead of the table.
+(extend-protocol datom.store/Scan
+  FjallStore
+  (-scan-datoms [store lo hi]
+    (loop [out [] start lo after nil]
+      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS :datoms)
+            n (get res "n")]
+        ; A native read that FAILED comes back as {:error, reason} rather than
+        ; raising, and a failed first call would then read exactly like an empty
+        ; range — a query that silently answers "no datoms" for a full table.
+        ; So the RESULT SHAPE is the test, never the row count: `n` is present on
+        ; every successful chunk and absent on every failure.
+        (if (nil? n)
+          (throw (ex-info (str "native datom scan failed: " res) {:lo lo :hi hi}))
+          (let [last (get res "last")]
+            (if (nil? last)
+              out
+              (recur (into out (to-list (get res "datoms"))) nil last))))))))
 
 (defn open
   "Open (or create) a fjall-backed store at `path`. The keyspace persists after
@@ -105,17 +172,22 @@
     ; Each chunk releases that lane, so other work interleaves and the native
     ; transient is bounded by the chunk, not by the table. The port's contract
     ; is unchanged — the same vector, same order, inclusive bounds.
+    ;
+    ; The values are decoded NATIVELY (:pairs), which is not an optimisation
+    ; detail but a correctness-of-cost one: the packed value lane is cheap only
+    ; for a compiled reader, and decoding it in the BEAM made this method four
+    ; times slower than the ETF it replaced (1964ms against 479ms over 50 000
+    ; rows). A port method that the whole database's reads rest on must not get
+    ; slower when the storage format improves.
     (loop [out [] start lo after nil]
-      (let [chunk (to-list (fjall-range-chunk (:handle store) start after hi CHUNK-ROWS))]
-        (if (empty? chunk)
-          out
-          (let [last-key (erlang/element 1 (nth chunk (- (count chunk) 1)))]
-            (recur (reduce (fn [acc pair]
-                             (conj acc [(erlang/element 1 pair)
-                                        (decode-value (erlang/element 2 pair))]))
-                           out chunk)
-                   nil
-                   last-key))))))
+      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS :pairs)
+            n (get res "n")]
+        (if (nil? n)
+          (throw (ex-info (str "native range read failed: " res) {:lo lo :hi hi}))
+          (let [last (get res "last")]
+            (if (nil? last)
+              out
+              (recur (into out (to-list (get res "pairs"))) nil last)))))))
 
   (-put [store k v]
     (fjall-put (:handle store) k (encode-value v))

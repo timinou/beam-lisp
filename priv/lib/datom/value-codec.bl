@@ -51,6 +51,8 @@
 (def LANE-KEYWORD 4)   ; raw UTF-8 (keyword name)
 (def LANE-FLOAT 5)     ; 8B LE IEEE-754
 (def LANE-ESC 255)     ; term_to_binary escape: any BEAM term
+(def LANE-DATOM 6)     ; a stored datom [e a v tx op], packed field-wise
+                       ; (see "the datom lane" below; never an ETF envelope)
 ;; A `:db.type/file` descriptor (datom/file.bl: 32B sha + size + media-type)
 ;; rides LANE-ESC today, like a vector. A packed LANE-FILE (raw sha, u64
 ;; size, media-type) would shave the term_to_binary framing — a contained
@@ -204,3 +206,125 @@
       (= lane LANE-ESC) (erlang/binary_to_term rest-bin)
       :else (throw (ex-info (str "unknown value-codec lane: " lane)
                             {:lane lane})))))
+
+;; ── the datom lane: a stored datom, packed field-wise ───────────────
+;;
+;; Every datom index stores the whole datom as its value, so the value slot is
+;; where a durable read spends its time. Encoded as a bare 5-vector it would
+;; fall to the ESC lane and ride the BEAM's own serializer — an ETF envelope,
+;; parsed back into a fresh 5-vector per row. That is the cost a columnar read
+;; exists to delete: to build a typed column from a scan, the reader must not
+;; parse a CONTAINER at all.
+;;
+;; So the datom lane packs the five fields field-wise, in the order a
+;; fixed-width reader wants them:
+;;
+;;   LANE-DATOM | e:i64 | tx:i64 | op:u8 | a-len:u8 | a:utf8 | v:<lane payload>
+;;        0        1-8     9-16      17      18      19..     19+a-len..
+;;
+;; e and tx sit at known offsets; `a` (a keyword, an attribute name) carries its
+;; own length so that `v` — the only unbounded field — ends the payload, and the
+;; reader recovers it with one `binary_part` and no delimiter search. A Rust NIF
+;; reads e/tx with a single `i64::from_le_bytes` each and allocates NO term until
+;; a row survives a filter — which is what makes a wide read cheap.
+;;
+;; `op` rides one byte (it is a boolean). A retraction is `0`, so a column read
+;; can count or filter retractions with a byte comparison.
+;;
+;; Two composites fall to ESC instead of packing: an attribute name past 255
+;; bytes, and an e/tx past i64. The lane is TOTAL, like every other.
+
+(defn byte-at
+  "The integer value of byte `i` of binary `b`."
+  [b i]
+  (erlang/hd (erlang/binary_to_list (erlang/binary_part b i 1))))
+
+(defn datom-shaped?
+  "Whether `v` has the shape of a datom: `[e a v tx op]` with an integer
+   entity and tx, a keyword attribute, and a boolean op.
+
+   A TOTAL test, not a guess. A user value that happens to match round-trips
+   byte-for-byte through the datom lane, so misclassifying one costs bytes,
+   never truth — which is why the store may apply it to any value, with no
+   schema and no caller-supplied tag."
+  [v]
+  (and (vector? v)
+       (= 5 (count v))
+       (int? (get v 0))
+       (keyword? (get v 1))
+       (int? (get v 3))
+       (or (= true (get v 4)) (= false (get v 4)))))
+
+(defn encode-datom
+  "Pack `[e a v tx op]` into the datom lane. Total: an attribute name past
+   255 bytes, or an e/tx past i64, falls back to the any-term lane."
+  [d]
+  (let [e (get d 0)
+        a (get d 1)
+        tx (get d 3)
+        a-bytes (erlang/binary_to_list (str a))]
+    (if (and (fits-i64? e) (fits-i64? tx) (<= (count a-bytes) 255))
+      (erlang/list_to_binary
+        (to-list (concat [LANE-DATOM]
+                         (u64-le-bytes (i64->u64 e))
+                         (u64-le-bytes (i64->u64 tx))
+                         [(if (get d 4) 1 0) (count a-bytes)]
+                         a-bytes
+                         (erlang/binary_to_list (encode (get d 2))))))
+      (esc d))))
+
+(defn decode-datom
+  "Recover `[e a v tx op]` from a datom-lane payload."
+  [payload]
+  (let [a-len (byte-at payload 18)
+        v-start (+ 19 a-len)
+        v-size (- (erlang/byte_size payload) v-start)]
+    [(decode-i64-le (erlang/binary_part payload 1 8))
+     (keyword (erlang/binary_part payload 19 a-len))
+     (decode (erlang/binary_part payload v-start v-size))
+     (decode-i64-le (erlang/binary_part payload 9 8))
+     (= 1 (byte-at payload 17))]))
+
+(defn datom-v-offset
+  "Where `v`'s payload starts inside a datom-lane payload.
+
+   The columnar reader's side of the contract: a scan can locate every row's
+   `v` without decoding the datom, so a filter over v's BYTES (a text search)
+   never builds a term for a row it rejects."
+  [payload]
+  (+ 19 (byte-at payload 18)))
+
+;; ── the storage slot: a datom lane, or any value ────────────────────
+;;
+;; The store holds datoms in the datom indexes and plain scalars elsewhere
+;; (transaction and entity counters), so one slot codec must carry both. It
+;; does that without being told which is which: a value shaped like a datom
+;; takes the datom lane, everything else takes its own runtime lane.
+
+(def LEGACY-ETF 131)   ; the ETF version byte: every pre-lane value starts here
+
+(defn encode-slot
+  "Encode a store value: the datom lane when `v` is datom-shaped, the
+   value's own lane otherwise. Total for any BEAM term."
+  [v]
+  (if (datom-shaped? v) (encode-datom v) (encode v)))
+
+(defn decode-slot
+  "Recover a store value from a slot written by `encode-slot` — or by the
+   `term_to_binary` era before it.
+
+   The first byte discriminates and cannot be ambiguous: 131 is the ETF
+   version byte, and no lane tag is 131 (they are 1..6 and 255). So rows
+   written before this lane existed keep reading exactly as they did, with
+   no rewrite and no migration — a durable store upgrades lazily, one
+   rewritten value at a time, and a mixed keyspace is expected rather than
+   exceptional."
+  [b]
+  (if (nil? b)
+    nil
+    (let [tag (byte-at b 0)]
+      (cond
+        (= tag LEGACY-ETF) (erlang/binary_to_term b)
+        (= tag LANE-DATOM) (decode-datom b)
+        :else (decode b)))))
+
