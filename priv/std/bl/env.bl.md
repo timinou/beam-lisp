@@ -142,7 +142,7 @@ per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp silent
-(def known-keys [:name :instance :paths :tasks :ports :env :doc
+(def known-keys [:name :instance :paths :tasks :ports :schedules :env :doc
                  :app :build :release :deps :browser])
 
 (defn- unknown-keys
@@ -253,6 +253,107 @@ problems reports all three in one pass.
       [{} []]
       (keys v))
     :else [{} [":ports must be a map of name → port"]]))
+
+(defn- norm-when
+  "The `:every` / `:daily` / `:at` value of one declaration, checked: `[N UNIT]`,
+   `[HH MM]`, or epoch-milliseconds.
+
+   The spellings are the `(sched …)` clause's own (`(every 30 :min :id f)`),
+   written where a file can carry them. A file cannot be evaluated, so it cannot
+   hold an expression — but it can hold the same WORDS, and the scheduler builds
+   both into one rule (proc.sched/rule)."
+  [k v what]
+  (cond
+    (= k :at)
+      (if (erlang/is_integer v)
+        [v []]
+        [nil [(str what " :at must be an epoch in milliseconds")]])
+
+    ;; `[N UNIT]` — the unit is a NAME, and tick/unit-ms owns what it means. A
+    ;; list of two integers is a TIME (below), which is why `:every 30 :min`
+    ;; and `:daily 4 10` cannot be told apart by shape alone: the key says which
+    ;; it is, and checking the wrong one would refuse every correct file.
+    (and (= k :every) (vector? v) (= 2 (count v))
+         (erlang/is_integer (nth v 0))
+         (or (keyword? (nth v 1)) (string? (nth v 1))))
+      [v []]
+
+    (and (= k :daily) (vector? v) (= 2 (count v))
+         (erlang/is_integer (nth v 0)) (erlang/is_integer (nth v 1)))
+      ;; A time a clock can show. `:daily [25 0]` is not a late night — it is a
+      ;; schedule that never fires, which is the failure a reader of the file is
+      ;; least able to notice, so it is refused where the file is read.
+      (if (and (>= (nth v 0) 0) (<= (nth v 0) 23) (>= (nth v 1) 0) (<= (nth v 1) 59))
+        [v []]
+        [nil [(str what " " (nth v 0) ":" (nth v 1)
+                   " is not a time on a clock — :daily is [HH MM]")]])
+
+    (= k :every)
+      [nil [(str what " :every is [N UNIT], as in [30 :min]")]]
+
+    :else
+      [nil [(str what " :daily is [HH MM], as in [4 10]")]]))
+
+(def SCHEDULE-KEYS
+  "What one declaration may carry: when, what to run, how it reads in a listing,
+   and the policies a single scheduled entry takes. An unknown key is refused
+   rather than ignored — a mistyped `:evry` is a schedule that never runs, which
+   is the one failure the reader of a project file cannot see for themselves."
+  [:id :every :daily :at :run :doc :catch-up :jitter :on-error])
+
+(defn- norm-schedule
+  "One declaration → its normalized map and its errors.
+
+   Shape only. Whether the VERB exists is decided when it fires
+   (proc.sched/from-data), because a project that names a verb it has not
+   written yet is still a project, and `bl` must keep working in it."
+  [i d]
+  (let [id (get d :id)
+        nm (cond (string? id) id (keyword? id) (name id) :else nil)]
+    (if (nil? nm)
+      [nil [(str "schedule " i " needs an :id (a string)")]]
+      (let [what (str "schedule \"" nm "\"")
+            freqs (to-list (filter (fn [k] (contains? d k)) [:every :daily :at]))
+            freq (when (= 1 (count freqs)) (first freqs))
+            [when errs] (if (nil? freq)
+                          [nil [(str what " must say exactly one of :every /"
+                                      " :daily / :at")]]
+                          (norm-when freq (get d freq) what))
+            run (get d :run)
+            rerrs (if (and (string? run)
+                           (= 2 (count (to-list (erlang/apply :string :split
+                                                     (list run "/" :all))))))
+                    []
+                    [(str what " :run must be a \"namespace/verb\" string, as in"
+                          " \"bl.cache/prune\"")])
+            uerrs (map (fn [k] (str what " has unknown key " k))
+                       (filter (fn [k] (not (some (fn [x] (= x k)) SCHEDULE-KEYS)))
+                               (keys d)))
+            errs (concat errs rerrs uerrs)]
+        [(if (or (nil? freq) (seq errs))
+           nil
+           (merge (select-keys d SCHEDULE-KEYS) {:id nm}))
+         (vec errs)]))))
+
+(defn- norm-schedules
+  "A project file's periodic work, in declaration order. Each entry carries the
+   three-word spelling the `(sched …)` clause takes — `:every [30 :min]`,
+   `:daily [4 10]`, `:at MS` — plus `:run \"namespace/verb\"`. Errors are data,
+   like every other shape problem here: a broken declaration costs the tree that
+   schedule and never the command that read the file."
+  [v]
+  (cond
+    (nil? v) [[] []]
+    (vector? v)
+      (let [rs (map (fn [i]
+                      (let [d (nth v i)]
+                        (if (map? d)
+                          (norm-schedule i d)
+                          [nil [(str "schedule " i " must be a map")]])))
+                    (range (count v)))]
+        [(vec (remove nil? (map (fn [r] (first r)) rs)))
+         (vec (mapcat (fn [r] (second r)) rs))])
+    :else [[] [":schedules must be a list of declarations"]]))
 
 (defn- norm-env
   "A name → string map. The label names the key it came from, so an error says
@@ -464,6 +565,7 @@ shape, whatever the file said.
         ierr           (if (or (nil? inst) (string? inst)) [] [":instance must be a string"])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
+        [sched serr]   (norm-schedules (:schedules m))
         [env eerr]     (norm-env (:env m) ":env")
         [app aerr]     (norm-app (:app m))
         [bld berr]     (norm-build (:build m) root)
@@ -477,13 +579,15 @@ shape, whatever the file said.
      :paths paths
      :tasks tasks
      :ports ports
+     :schedules sched
      :env env
      :app app
      :build bld
      :release rel
      :deps deps
      :browser brw
-     :errors (concat perr nerr ierr terr porerr eerr aerr berr rerr derr brerr
+     :errors (concat perr nerr ierr terr porerr serr eerr aerr berr rerr derr
+                     brerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -491,6 +595,7 @@ shape, whatever the file said.
    case — every accessor reads it the same way it reads a declared one."
   [root]
   {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
+   :schedules []
    :env {} :app nil :build nil :release nil :deps [] :browser nil :errors []})
 ```
 

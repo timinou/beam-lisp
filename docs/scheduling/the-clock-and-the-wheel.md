@@ -891,6 +891,76 @@ assuming: `rewrite` matches **exact arity only** (`priv/std/rewrite.bl:141-145`)
 so a migration smell binds a whole sub-form as one variable (`?keys` holding
 `(keys :id)`) and guards its shape, rather than splicing a variadic pattern.
 
+### 4.6.2 As built (P4) — a tree declares its periodic work
+
+P4's line was *“cut the daemon's own housekeeping over”*. The cut landed on the
+other side of the question: the work became a **declaration**, and the daemon
+stopped being the place it was written down.
+
+```
+ env.bl
+   :schedules [{:id "cache-prune" :daily [4 10] :run "bl.cache/prune-scheduled"}
+               {:id "index-refresh" :every [30 :minutes] :run "vm.index/refresh-scheduled"}]
+        |
+        |  bl.env/normalize          shape checked; a mistake is a VALUE in :errors
+        v
+   vm.spec/read                   the VM's spec carries what the tree SAID
+        |
+        |  vm.sched/start-for        at daemon boot AND at VM spawn, idempotently
+        v
+   (proc/defserver declared       ONE module, `:server (:id start-opts)`
+     (sched {:clock tick/wall-ms   — one wheel per project, told apart by its id
+             :server (:id start-opts)
+             :from (:schedules start-opts)}))
+        |
+        v
+   the store (datoms)  →  bl daemon status · the dashboard · GET /schedules
+```
+
+Measured on this tree, first boot after the cut:
+
+```
+bl daemon
+  schedules     2 declared
+  schedule      beam-lisp@574618/cache-prune    active  0 runs  in 49233.0s
+  schedule      beam-lisp@574618/index-refresh  active  0 runs  in 1754.2s
+```
+
+Six decisions, each from something that broke:
+
+| | |
+|---|---|
+| **the DATA spelling IS the source spelling** | `:every [30 :minutes]`, `:daily [4 10]`, `:at EPOCH-MS` — the `(sched …)` clause's own words. A file that is read without evaluation cannot hold `(every 30 :minutes …)`, but it can hold the same three words, and both paths meet at ONE `proc.sched/rule` — `parse-entry` emits a call to it |
+| **a verb is resolved when it FIRES, not when it is declared** | a project may name a verb it has not written yet, and a file's typo must not cost the tree its tool. The first occurrence fails, `:fails` climbs, `:last-error` holds the reason — loud where a human is looking |
+| **`start-opts` is in scope for every clause's init** | `server.bl` gained a documented name for the map a server was started with. A clause is a slice of a server someone else starts; without the start argument there is no way to configure one, and a hard-coded default is the only alternative |
+| **one module, many owners** | `:server (:id start-opts)` — the wheel's name comes from the VM, so two projects' `cache-prune` rows do not collide on one key in one store |
+| **the tree is told, not inferred** | the wheel runs in the daemon's process, where cwd is the daemon's; the tree travels as `:ctx {:root …}` in the declaration, merged into the occurrence every body is handed. The occurrence IS the argument, so this costs no new channel |
+| **a refusal is a FACT** | if arming fails, `vm.sched` writes a `:refused` row per declaration with the reason. `declares nothing` and `declares something that cannot turn` are the same picture to a reader — an absent row — and they are the two things a reader most needs told apart. Measured: `:every [30 :min]` (`:min` is not a unit `proc.tick` knows) armed nothing, said nothing, and showed exactly the empty pane of a tree with no declarations at all |
+
+**What did NOT need a schedule**, and why that is the finding rather than a gap:
+
+- the **stale-port sweep** is already correct lazily — `vm.ports/list-claims`
+  sweeps every claim whose owner is gone as it reads it, and takes a claim's
+  place on the next command. A schedule would be a second implementation of a
+  need that is met, and the second implementation is the one that drifts.
+- the **watcher's debounce** is a State Timeout, not a schedule: it is "wake me
+  after quiet", and `proc.tick` already models that as a *clause*. It stays
+  unimplemented here for a different reason — it lives in Elixir
+  (`lib/beam_lisp/reload_watcher.ex`), and a clause cannot be reached from there.
+- the **index refresh** turned out to be per-TREE with a node-GLOBAL owner
+  (`:vm-index`), so the verb answers a declaration from a *different* tree with
+  the mismatch rather than refreshing the wrong index (FUP-103).
+
+**A build-environment discovery worth its own line.** `./bl` (the ELF launcher
+at the tree root) runs the **drop's** prebuilt image: `priv/std/bl/*` is
+committed to `Elixir.BeamLisp.Ns.Bl.*.beam` there, so edits to `bl.env`,
+`bl.cache`, `bl.cli` are INVISIBLE under it — while `priv/std/vm/*` is not in
+the drop and loads from source, which is why half this work seemed to take
+effect and half did not. `./bin/bl` is the checkout's own launcher (`build/`),
+AOT-compiling the tree's `.bl` sources; every measurement in this section was
+taken with it. See FUP-093 for the general case.
+
+
 ## 5. The `bl ui` pane — prior art, then the design
 
 ### 5.1 Prior art worth stealing from
@@ -1096,7 +1166,12 @@ P3  ✅ vm.inspect :schedules → the terminal + HTML + JSON faces, GET /schedul
      is proven not to write (FUP-101)
       reads the store, so the pane never asks a ticker anything
       acceptance: `bl daemon status` and the page render the SAME numbers
-P4  CUTOVER: the daemon's own cache-prune (manual today) + a stale-port sweep +
+P4  ✅ CUTOVER: the tree's periodic work is a DECLARATION (env.bl `:schedules`)
+     — `bl cache prune` as a scheduled verb, the index refresh, armed at daemon
+     boot and at VM spawn, visible in the pane, and a refusal that cannot arm is
+     itself a visible row. Findings: the stale-port sweep needs no schedule (the
+     read IS the sweep); the watcher's debounce is a State Timeout (a `tick`
+     clause) and lives in Elixir
       the watch-debounce (reload_watcher.ex) onto P1/P2; the pane is now non-empty
         ── then, separately ──
 P5  priv/std/jobs.bl — defqueue; knowledger cut over from its hand-rolled runner

@@ -1,0 +1,161 @@
+; vm/sched.bl — the periodic work a PROJECT declares, armed for its VM.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; `env.bl` may carry a `:schedules` list. Those are FACTS about a tree — a
+; nightly prune, a refresh every half hour — and a fact a human can read and
+; change is a fact worth having in the project file rather than in a module
+; someone has to find, or in a command someone has to remember. This namespace
+; is the hand that turns that declaration into a wheel: it reads the list at VM
+; spawn, and arms one `proc.sched` server for the VM.
+;
+;   env.bl                       vm.sched                       pane
+;   {:schedules [...]}  →  (sched {:from [...]})  →  bl daemon status · /schedules
+;
+; ══ WHY IT LIVES WITH THE VM AND NOT WITH THE DAEMON ════════════════════════
+;
+; The declarations come from a TREE, and a VM is what a tree means here (its
+; root, its env, its caps). So the wheel belongs to the VM: it is armed when the
+; VM is, it is a registered MEMBER of the VM (`owner/adopt`), and `drain` takes
+; it down with everything else the VM owns. A wheel that outlived its project
+; would fire against a root that is no longer loaded.
+;
+; The STORE is deliberately not per-VM: `proc.sched`'s rows live in one datom
+; database for the node, so the pane unions every project's schedules and a run
+; that happened before a restart is still a fact. What is per-VM is the HAND.
+;
+; ══ ONE MODULE, MANY OWNERS ═════════════════════════════════════════════════
+;
+; Two projects in one daemon each get their own wheel from this ONE server
+; definition, told apart by the `:server` the clause is started with — the VM's
+; id (`beam-lisp@a1b2c3`). Without it, every project's `cache-prune` row would
+; key to `declared/cache-prune` and they would be one schedule that two VMs
+; wrote. The id is also what a pane's op addresses:
+;
+;   (proc.sched/op! "beam-lisp@a1b2c3" "cache-prune" :pause)
+;
+; ══ A BROKEN FILE NEVER STOPS THE COMMAND ═══════════════════════════════════
+;
+; `bl.env` validates the list when it reads the project file, and reports what
+; is wrong as DATA in `:errors` (a wrong key is a value, not a crash). If the
+; list survives validation we arm it; if a declaration is still refused at
+; arming — a verb `"ns/verb"` that does not resolve, a `:daily` of 25:00 — the
+; failure is recorded on the schedule and shown in the pane, and the command
+; that spawned the VM runs exactly as it would have. A project file can cost a
+; project its periodic work. It cannot cost it its tool.
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/proc/sched.bl       — the wheel itself, and the clause this uses
+; priv/std/vm/spec.bl          — where a tree's declarations are read
+; docs/scheduling/the-clock-and-the-wheel.md §5 — the pane
+
+(ns vm.sched
+  (:require [vm.core :as vmc]
+            [vm.owner :as owner]
+            [proc :as proc]
+            [proc.sched :as sched]
+            [proc.tick :as tick]))
+
+;; ── the wheel ───────────────────────────────────────────────────────────
+;;
+;; One `(sched …)`, with BOTH sources wired to the start argument: the
+;; declarations come from the project file (`:from`), and the name the wheel is
+;; registered under comes from the VM's identity (`:server`). No literal entries
+;; at all — a project's periodic work is data, and this module is the only place
+;; that knows how to turn it into a server.
+
+(proc/defserver declared
+  (sched {:clock tick/wall-ms
+          :server (:id start-opts)
+          :from (:schedules start-opts)}))
+
+;; ── arming, once per VM ─────────────────────────────────────────────────
+
+(defn bind-context
+  "Each declaration, told which TREE it belongs to — as DATA, in the declaration
+   itself.
+
+   The wheel turns in the daemon's process, where the working directory is the
+   daemon's, so a verb that means 'this project's stores' has to be told which
+   project; every VM's prune would otherwise be about whichever tree happened to
+   be current. The fact travels as `:ctx`, which `proc.sched/from-data` merges
+   into every occurrence the schedule runs — the map a body is already handed,
+   now with `:root` in it.
+
+   It must be the DATA rather than the resolved body: a body is a function, and
+   the scheduler builds bodies FROM the data — wrapping one that has already
+   been built leaves the builder holding a fn where a name belongs (measured:
+   arming failed with `:run must be a \"namespace/verb\" string`, because the
+   name had been replaced by the fn it was going to become)."
+  [decls root]
+  (vec (map (fn [d] (assoc d :ctx {:root root})) decls)))
+
+(defn armed-pid
+  "The wheel for the VM called `id`, or nil."
+  [id]
+  (when (some? id)
+    (Process/whereis (sched/op-name id))))
+
+(defn armed?
+  "Whether a wheel is already turning for the VM called `id`."
+  [id]
+  (some? (armed-pid id)))
+
+(defn start-for
+  "Arm `vm`'s declared work. Returns its pid, or nil when the tree declares
+   none — a project with no `:schedules` gets no process, not an idle one.
+
+   Idempotent by the VM's id, so a caller may ask on every spawn: two wheels for
+   one project would be two writers of one fact, and `announce!` refuses the
+   second rather than letting it run.
+
+   The wheel is ADOPTED by the VM, so `vm.manager/drain` takes it down with the
+   rest — which is what makes draining a VM mean 'this project is no longer
+   loaded' rather than only 'its env is gone'.
+
+   A declaration that survived the file's reader and STILL cannot arm — a verb
+   whose namespace does not load, a period the wheel refuses — is caught here.
+   A project file may cost the project its periodic work; it must not cost the
+   tree its tool, and this call sits in the path of every command the VM runs.
+   What is lost is loud where a human is already reading: the file's own shape
+   errors are a value in the project (`bl doctor` prints them), and a verb that
+   fails when it FIRES is recorded on the schedule the pane shows."
+  [vm]
+  (let [id (:id vm)
+        decls (:schedules vm)]
+    (cond
+      (nil? id) nil
+      (empty? decls) nil
+      (armed? id) (armed-pid id)
+      :else
+        (try
+          (let [pid (vmc/start declared {:id id
+                                         :schedules (bind-context decls (:root vm))})]
+            (owner/adopt id :schedules pid)
+            pid)
+          ;; A REFUSAL IS A FACT, so it is written where facts live. The two
+          ;; pictures a reader must be able to tell apart — `declares nothing`
+          ;; and `declares something that cannot turn` — differ only by this row,
+          ;; and silence renders them identical. A project file's typo is then
+          ;; visible in the pane beside the schedules that do work, rather than
+          ;; missing from it (measured: `:every [30 :min]` — `:min` is not a
+          ;; unit `proc.tick` knows — armed nothing, said nothing, and showed
+          ;; the same empty pane as a tree that declares no work at all).
+          (catch e
+            (let [why (str (ex-message e))]
+              (doseq [d decls]
+                (when (some? (:id d)) (sched/refuse! id (:id d) why)))
+              nil))))))
+
+(defn stop-for
+  "Stop `vm`'s wheel, if it has one. Returns :stopped, or :none.
+
+   Not the usual way a wheel ends — `drain` kills it as a VM member — but a
+   caller that re-arms a VM wants to be sure the old hand is gone first."
+  [vm]
+  (let [p (armed-pid (:id vm))]
+    (if (nil? p)
+      :none
+      (do (erlang/apply :gen_server :stop (list p))
+          :stopped))))
