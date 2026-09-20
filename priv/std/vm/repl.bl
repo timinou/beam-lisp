@@ -1,0 +1,365 @@
+; vm/repl.bl — the daemon's REPL: sessions over WebSocket, into the project VM.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; The wire protocol IS the product (PLAN-135 §2): every language question a
+; REPL frontend can ask — eval, complete, doc, interrupt, form-completeness —
+; is one JSON op behind ONE WebSocket route on the daemon's HTTP face
+; (vm.http mounts /repl + /repl/ws). Frontends stay dumb: the CodeMirror page
+; shipped in priv/std/vm/repl/ is the reference client, not the only one.
+;
+; ══ THE MODEL (measured in the Phase-0 spike, research/repl-spike/) ═════════
+;
+; A SESSION is {:env fork :ns "user" :root … :eval nil|{:worker :mref}} held
+; by the `sessions` defserver, keyed "sN". The env forks the PROJECT VM's env
+; (vm.manager/ensure × vm.spec/read): the session sees everything the warm VM
+; has interned through the env chain, while its own defs stay isolated — two
+; REPL sessions cannot see each other's vars, and a session cannot pollute the
+; project VM (spike U1 proved fork-per-session semantics; the final impl only
+; changes the fork's PARENT).
+;
+; An EVAL runs in its own monitored worker process under the session env
+; (pdict `*ns*` rebound from the session row, cwd = the project root), with a
+; group-leader proxy that turns stdout into {:push …} messages to the socket.
+; The runner (a second process) owns the monitor, so INTERRUPT IS ONE KILL:
+; `:erlang.exit(worker, :kill)` is untrappable and the runner's DOWN clause
+; does ALL cleanup — one cleanup path, no race between "interrupted" and
+; "finished" (spike U3: kill → error frame in 6 ms, session survives).
+;
+; ══ WHY A DEFSERVER, NOT ETS ════════════════════════════════════════════════
+;
+; The spike kept sessions in a named ETS table owned by `main`. In the daemon
+; there is no `main` that outlives the mount point — an ETS table dies with
+; its owner, and HTTP connection processes die per request. A defserver is the
+; codebase's canonical long-lived state owner (vm.manager's shape): the table
+; survives every connection, and session rows are one `call` away from any
+; process. Writes are human-paced; serialisation is invisible.
+;
+; ══ COMPLETION HERE IS THE DIRECT SCAN ══════════════════════════════════════
+;
+; Phase 2 builds the materialised index (spike U2: direct ~100–500 ms/query
+; vs indexed 1.5–2.6 ms). The op exists now so the protocol is complete and
+; the probe can verify end-to-end; its cost is documented, not hidden.
+
+(ns vm.repl
+  (:require [env] [vm.manager :as mgr] [vm.spec :as spec]))
+
+(def SERVER :vm-repl)
+
+;; ── the session table (vm.manager's shape) ──────────────────────────────────
+
+(defserver sessions
+  (init [_]
+    (ok {:sessions {} :n 0}))
+
+  ;; mint a session: a fork of `base-env` (the project VM's env). Forking here
+  ;; — inside the server process — is fine: an env is ETS data, not a process
+  ;; binding.
+  (handle-call [:new base-env root] [_from st]
+    (let [sid (str "s" (:n st))
+          row {:env (env/fork base-env) :ns "user" :root root :eval nil}]
+      (reply sid (assoc st
+                   :sessions (assoc (:sessions st) sid row)
+                   :n (inc (:n st))))))
+
+  (handle-call [:get sid] [_from st]
+    (reply (get (:sessions st) sid) st))
+
+  (handle-call [:put sid row] [_from st]
+    (reply :ok (assoc st :sessions (assoc (:sessions st) sid row))))
+
+  ;; an ended eval (finished OR killed) clears its row and lands the ns the
+  ;; worker last saw — one write site for both outcomes, so the runner's DOWN
+  ;; path and its value path cannot disagree about the session's state.
+  (handle-call [:eval-ended sid ns'] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply :ok (assoc st :sessions
+                          (assoc (:sessions st) sid
+                                 (assoc row :eval nil :ns (or ns' (:ns row))))))
+        (reply :ok st)))))
+
+(defn start
+  "Boot the session server (idempotent by name)."
+  []
+  (if (nil? (Process/whereis SERVER))
+    (core/start sessions nil {:name SERVER})
+    (Process/whereis SERVER)))
+
+(defn- get-session [sid] (call SERVER [:get sid]))
+(defn- put-session [sid row] (call SERVER [:put sid row]))
+
+(defn- busy?
+  "An eval row counts only while its worker is alive — a crashed runner that
+   left a stale row does not wedge the session."
+  [row]
+  (let [ev (:eval row)]
+    (and (map? ev) (contains? ev :worker)
+         (= true (erlang/apply :erlang :is_process_alive (list (:worker ev)))))))
+
+;; ── stdout: a text group-leader proxy (vm.io's protocol, JSON not ETF) ──────
+
+(defn- normalize [chars]
+  (cond
+    (erlang/is_binary chars) chars
+    (erlang/is_list chars) (erlang/apply :erlang :iolist_to_binary (list chars))
+    :else (erlang/apply :erlang :iolist_to_binary
+            (list (erlang/apply :io_lib :format (list "~p" (list chars)))))))
+
+(defn- handle-text-io [ws id from reply-as req]
+  (cond
+    (and (erlang/is_tuple req) (= :put_chars (elem req 0)))
+    (do (erlang/send ws (tuple :push {"kind" "out" "id" id
+                                      "text" (normalize (elem req (- (erlang/tuple_size req) 1)))}))
+        (erlang/send from (tuple :io_reply reply-as :ok)))
+
+    (and (erlang/is_tuple req) (= :setopts (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :ok))
+
+    (= req :getopts)
+    (erlang/send from (tuple :io_reply reply-as (list (tuple :binary true) (tuple :encoding :unicode))))
+
+    (and (erlang/is_tuple req) (= :get_geometry (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as (if (= :columns (elem req 1)) 80 24)))
+
+    (and (erlang/is_tuple req) (contains? #{:get_line :get_chars :get_until} (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :eof))
+
+    :else (erlang/send from (tuple :io_reply reply-as (tuple :error :request)))))
+
+(defn- proxy-loop [ws id]
+  (receive
+    [:io_request from reply-as req]
+    (do (handle-text-io ws id from reply-as req)
+        (proxy-loop ws id))
+    [:stop] :ok
+    (after 600000 :ok)))
+
+(defn- io-text-proxy [ws id]
+  (spawn (fn [] (proxy-loop ws id))))
+
+;; ── eval (spike's model, verbatim: worker + runner-owned monitor) ───────────
+
+(defn- eval-worker [runner e ns0 root src proxy]
+  (erlang/group_leader proxy (erlang/self))
+  (env/with-env e
+    (fn []
+      (BeamLisp/with_cwd root
+        (fn []
+          (BeamLisp.Env/in_ns ns0)
+          (try
+            (let [v (BeamLisp/eval src)
+                  ns' (BeamLisp.Env/current_ns)]
+              (BeamLisp.Env/intern ns' "*2" (try (BeamLisp.Env/fetch! ns' "*1") (catch _ nil)))
+              (BeamLisp.Env/intern ns' "*1" v)
+              (erlang/send runner (tuple :eval-finished :value (BeamLisp.RT/print_str v) ns')))
+            (catch ex
+              (let [ns' (BeamLisp.Env/current_ns)]
+                (BeamLisp.Env/intern ns' "*e" ex)
+                (erlang/send runner (tuple :eval-finished :error (str (ex-message ex)) ns'))))))))))
+
+(defn- eval-wait [ws sid id proxy mref t0]
+  (receive
+    [:eval-finished kind payload ns']
+    (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
+        (erlang/send proxy (tuple :stop))
+        (call SERVER [:eval-ended sid ns'])
+        (erlang/send ws (tuple :push {"kind" (if (= kind :value) "value" "error")
+                                      "id" id "text" payload "ns" ns'
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    [:DOWN down-ref :process _wpid reason]
+      :when (= down-ref mref)
+    (do (erlang/send proxy (tuple :stop))
+        (call SERVER [:eval-ended sid nil])
+        (erlang/send ws (tuple :push {"kind" "error" "id" id "interrupted" true
+                                      "text" (str "eval ended: " (BeamLisp.RT/print_str reason))
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    (after 3600000
+      (do (erlang/send proxy (tuple :stop))
+          (call SERVER [:eval-ended sid nil])))))
+
+(defn- run-eval [ws sid id src]
+  ;; runs in its own process: the socket must stay responsive for `interrupt`
+  (let [row (get-session sid)
+        proxy (io-text-proxy ws id)
+        runner (erlang/self)
+        t0 (System/monotonic_time :millisecond)
+        sm (erlang/apply :erlang :spawn_monitor
+             (list (fn [] (eval-worker runner (:env row) (:ns row) (:root row) src proxy))))
+        worker (elem sm 0)
+        mref (elem sm 1)]
+    (put-session sid (assoc row :eval {:worker worker :mref mref}))
+    (eval-wait ws sid id proxy mref t0)))
+
+;; ── completion: the direct scan (Phase 2 replaces this with the index) ──────
+
+(defn- candidates
+  "Every public var in every namespace visible from THIS process's env."
+  []
+  (mapcat (fn [ns]
+            (try
+              (map (fn [n] {"label" (str n) "ns" (str ns)}) (BeamLisp.Env/public_names ns))
+              (catch _ex (list))))
+          (BeamLisp.Env/namespaces)))
+
+(defn- complete-prefix [prefix cur-ns]
+  (let [t0 (System/monotonic_time :millisecond)
+        cands (candidates)
+        hits (filter (fn [c] (String/starts_with? (get c "label") prefix)) cands)
+        sorted (sort-by (fn [c] (str (if (= (get c "ns") cur-ns) "0" "1") (get c "label"))) hits)
+        t1 (System/monotonic_time :millisecond)]
+    {"items" (to-list (take 100 sorted)) "total" (count hits)
+     "scanned" (count cands) "ms" (- t1 t0)}))
+
+(defn- arities-str [nsname name]
+  ;; arglists are NOT in var meta (spike: meta of a defn = %{doc}); the arity
+  ;; truth lives in ns_defs entries {:fixed arity name clause-map mod}.
+  (let [defs (try (BeamLisp.Env/ns_defs nsname) (catch _ex nil))
+        entries (if (map? defs) (get defs name) nil)]
+    (if (empty? entries)
+      ""
+      (str "arities: "
+           (join ", " (distinct
+                        (map (fn [e] (if (and (erlang/is_tuple e) (> (erlang/tuple_size e) 1))
+                                       (str (elem e 1)) "?"))
+                             entries)))))))
+
+(defn- doc-for [nsname name]
+  ;; doc_string returns the INFO MAP {:name :doc :ns} directly (spike), not
+  ;; {:ok doc} — and not every var has one (core fns carry none: the stdlib's
+  ;; doc truth lives in its SOURCE files; Phase 2's index merges both).
+  (let [d (try (BeamLisp.Env/doc_string nsname name) (catch _ex nil))
+        doc (cond
+              (map? d) (or (:doc d) "")
+              (and (erlang/is_tuple d) (= :ok (elem d 0))) (elem d 1)
+              (erlang/is_binary d) d
+              :else "")]
+    {"doc" doc "arglists" (arities-str nsname name)}))
+
+(defn- run-complete [ws sid id prefix]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (env/with-env (:env row)
+               (fn []
+                 (let [r (complete-prefix prefix (:ns row))]
+                   (erlang/send ws (tuple :push (assoc r "kind" "completions" "id" id))))))))))
+
+(defn- has-var?
+  "Var EXISTENCE, not doc presence: a var with no meta row (core/map has none)
+   is still a var. member? walks this process's env chain, so a session-env
+   def shadows :global exactly the way eval would resolve it."
+  [ns name]
+  (= true (try (BeamLisp.Env/member? (tuple ns name)) (catch _ex false))))
+
+(defn- resolve-doc-target
+  "Where a symbol's docs live: explicit ns wins; ns/name splits; a bare name
+   tries the session ns, then core, then a full scan."
+  [row nsname name]
+  (cond
+    (not= nsname "auto") [nsname name]
+    (some? (index-of name "/"))
+    (let [parts (String/split name "/")] [(first parts) (join "/" (rest parts))])
+    (has-var? (:ns row) name) [(:ns row) name]
+    (has-var? "core" name) ["core" name]
+    :else
+    (let [hit (some (fn [ns] (if (has-var? (str ns) name) (str ns) nil))
+                    (BeamLisp.Env/namespaces))]
+      [(or hit (:ns row)) name])))
+
+(defn- run-doc [ws sid id nsname name]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (env/with-env (:env row)
+               (fn []
+                 (BeamLisp.Env/in_ns (:ns row))
+                 (let [[tns tname] (resolve-doc-target row nsname name)
+                       r (doc-for tns tname)]
+                   (erlang/send ws (tuple :push (assoc r "kind" "doc" "id" id
+                                                       "ns" tns "name" tname))))))))))
+
+;; ── balanced? — server truth for a frontend's parity self-check ─────────────
+;;
+;; A frontend ports the scanner for keystroke-latency gating; this op lets it
+;; prove the port agrees with bl.repl on a fixture set (the spike's harness
+;; caught BUG-087 this way).
+
+(defn- run-balanced [ws id srcs]
+  (spawn (fn []
+           (BeamLisp.Loader/ensure_loaded "bl.repl")
+           (let [bal (BeamLisp.Env/fetch! "bl.repl" "balanced?")
+                 results (to-list (map (fn [s] (= true (BeamLisp.RT/invoke bal (to-list [s])))) srcs))]
+             (erlang/send ws (tuple :push {"kind" "balanced" "id" id "results" results}))))))
+
+;; ── the socket ──────────────────────────────────────────────────────────────
+
+(defn- handle-op [ws sid msg]
+  (let [op (get msg "op")
+        id (get msg "id" 0)]
+    (cond
+      (= op "eval")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (erlang/send ws (tuple :push {"kind" "busy" "id" id}))
+          (spawn (fn [] (run-eval ws sid id (get msg "src" ""))))))
+
+      (= op "complete") (run-complete ws sid id (get msg "prefix" ""))
+
+      (= op "doc") (run-doc ws sid id (get msg "ns" "user") (get msg "name" ""))
+
+      (= op "interrupt")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (do (erlang/apply :erlang :exit (list (:worker (:eval row)) :kill))
+              (erlang/send ws (tuple :push {"kind" "interrupt-sent" "id" id})))
+          (erlang/send ws (tuple :push {"kind" "not-busy" "id" id}))))
+
+      (= op "balanced") (run-balanced ws id (to-list (get msg "srcs" (to-list []))))
+
+      :else (erlang/send ws (tuple :push {"kind" "error" "id" id "text" (str "unknown op: " op)})))))
+
+(defn ws-handlers
+  "The WebSocket handler map for one REPL connection. `opts` carries :root —
+   the project tree whose VM the session forks. One session per connection;
+   reattach-by-id is Phase 4."
+  [opts]
+  (start)
+  (let [root (get opts :root (BeamLisp/cwd))]
+    {:init (fn [_state]
+             (let [sp (spec/read root)
+                   vm (mgr/ensure sp)
+                   sid (call SERVER [:new (:env vm) root])]
+               [:push [[:text (bl.json/encode {"kind" "hello" "session" sid "ns" "user"})]] sid]))
+     :handle-in (fn [frame sid]
+                  ;; inbound frames are bl VECTORS [:text payload] (the
+                  ;; adapter's frame_vector), NOT Erlang tuples (spike trap #1).
+                  (if (and (vector? frame) (= :text (first frame)))
+                    (let [msg (try (bl.json/decode (nth frame 1)) (catch _ex nil))]
+                      (if (map? msg)
+                        (do (handle-op (erlang/self) sid msg) [:ok sid])
+                        [:ok sid]))
+                    [:ok sid]))
+     :handle-info (fn [msg sid]
+                    (if (and (erlang/is_tuple msg) (= :push (elem msg 0)))
+                      [:push [[:text (bl.json/encode (elem msg 1))]] sid]
+                      [:ok sid]))}))
+
+;; ── the page assets (served by vm.http) ─────────────────────────────────────
+
+(defn page
+  "The reference client's HTML. Read per request: it is small, and a developer
+   iterating the page must not restart the daemon to see a change."
+  []
+  (File/read! (str (BeamLisp.Tiers/priv_root) "/std/vm/repl/page.html")))
+
+(defn bundle
+  "The vendored CodeMirror bundle, memoised for the daemon's lifetime: 405 KB
+   a read is real money on the ONE dirty-IO scheduler this host runs, and the
+   bundle changes only with a rebundle — which ships with a daemon restart."
+  []
+  (let [key (tuple :vm-repl :bundle)
+        cached (erlang/apply :persistent_term :get (list key nil))]
+    (if (nil? cached)
+      (let [b (File/read! (str (BeamLisp.Tiers/priv_root) "/std/vm/repl/editor.bundle.js"))]
+        (erlang/apply :persistent_term :put (list key b))
+        b)
+      cached)))
