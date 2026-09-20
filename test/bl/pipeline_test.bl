@@ -1,0 +1,403 @@
+; test/bl/pipeline_test.bl — the transform stage: the chain, the policies, the row.
+; Run: bl test --shared test/bl/pipeline_test.bl
+;
+; `--shared` is required for the same reason `sched_test` needs it: the isolated
+; runner expands a file's `defserver` forms BEFORE its requires run, so a clause
+; registered by a require (`(pipeline …)` here) is unknown at expansion time
+; (BUG-082).
+;
+; What a pipeline must not get wrong, and what this file pins:
+;   · every event reaches the pipeline exactly once, end to end;
+;   · a batch coalesces, and a PARTIAL batch still goes out on its timeout;
+;   · `:concurrency` means what it says — the high-water mark is bounded by it;
+;   · `:on-lag :block` holds the SOURCE back, so a slow stage cannot let the
+;     producer run away;
+;   · a dead worker is VISIBLE — its pid is in the row and a reader can see it
+;     is dead — never silently swallowed;
+;   · the read model is a FACT: readable with the pipeline stopped, and reading
+;     it never writes.
+
+(ns pipeline.test
+  (:require [proc :as proc]
+            [proc.pipeline :as pipeline]
+            [proc.flow :as flow]))
+
+;; ── helpers ─────────────────────────────────────────────────────────────
+
+(defn- await
+  "Poll `pred` every 10 ms until it holds or `ms` runs out."
+  [pred ms]
+  (loop [left ms]
+    (cond
+      (pred) true
+      (<= left 0) false
+      :else (do (Process/sleep 10) (recur (- left 10))))))
+
+(defn- cell [srv stage k] (get (pipeline/pipeline-row srv stage) k))
+
+(defn- wait-for
+  "Block until `flag` is set, or `ms` runs out — a LATCH.
+
+   A stage fn that holds its worker open is how a test looks at a `:workers` row
+   without racing a sleep: on a busy machine a poll can take longer than a
+   `(Process/sleep 40)` ever did, and then the pid it just read is a dead one and
+   the test blames the pipeline for the weather."
+  [flag ms]
+  (loop [left ms]
+    (cond
+      (deref flag) true
+      (<= left 0) false
+      :else (do (Process/sleep 5) (recur (- left 5))))))
+
+(defn- refused
+  "The message a declaration is refused with, or nil when it is accepted."
+  [form]
+  (try
+    (do (pipeline/pipeline-clause form {:name 'probe}) nil)
+    (catch e (let [m (if (map? e) (get e :message) nil)]
+               (if (nil? m) (str e) (str m))))))
+
+;; ── the chain, and the read model ───────────────────────────────────────
+
+(def checked (atom []))
+(def cooked (atom []))
+
+(proc/defserver line
+  (pipeline
+    (from (range 1 21))
+    (stage :check (fn [n] (swap! checked conj n) n) {:concurrency 2})
+    (stage :cook (fn [n] (swap! cooked conj n) n) {:concurrency 3})
+    (on-lag :block)
+    (on-error :requeue)))
+
+(deftest every-event-reaches-every-stage-exactly-once
+  (reset! checked [])
+  (reset! cooked [])
+  (let [s (start line nil {})]
+    (is (await (fn [] (= 20 (cell :line :cook :out))) 8000)
+        "the line drains")
+    (is (= (vec (range 1 21)) (vec (sort @checked)))
+        "the first stage saw every event, once each")
+    (is (= 20 (count @checked)) "…and no event twice")
+    (is (= (vec (range 1 21)) (vec (sort @cooked)))
+        "…and so did the one downstream of it")
+    (is (= 20 (cell :line :source :in)) "the source row counts what it took")
+    (is (= 20 (cell :line :source :out)))
+    (is (= 20 (cell :line :check :in)) "every stage's :in is the whole input")
+    (is (= 20 (cell :line :check :out)))
+    (is (= 20 (cell :line :cook :in)))
+    (is (= 0 (cell :line :check :errors)) "and nothing failed on the way")
+    (stop s)))
+
+(deftest the-row-is-the-topology-and-its-workers
+  (reset! checked [])
+  (let [s (start line nil {})]
+    (is (await (fn [] (= 20 (cell :line :cook :out))) 8000) "the line drains")
+    (let [rows (pipeline/pipeline-of :line)]
+      (is (= [1 2 3] (vec (map (fn [r] (get r :pos)) rows)))
+          "one row per node, in declaration order")
+      (is (= [:from :stage :stage] (vec (map (fn [r] (get r :kind)) rows))))
+      (is (= [:source :check :cook] (vec (map (fn [r] (get r :stage)) rows))))
+      (is (every? (fn [r] (= "line" (get r :name))) rows)
+          "…and every row says which pipeline it belongs to")
+      (is (= :block (get (first rows) :lag)) "the lag policy is IN the row")
+      (is (= :requeue (get (first rows) :on-error))))
+    (let [ws (vec (get (pipeline/pipeline-row :line :check) :workers))]
+      (is (every? (fn [p] (erlang/is_pid p)) ws) "the workers are listed BY PID")
+      (is (= 2 (count ws)) "one pid per worker the stage declared")
+      ;; the pipeline has DRAINED by now, so these are dead pids — which is
+      ;; itself the point: the row keeps naming the process, and what the VM
+      ;; says about it is a READ (see the kill test for a live one).
+      (is (contains? (pipeline/worker-vitals (first ws)) :alive)
+          "…and a reader looks each one up for what the VM says"))
+    (stop s)))
+
+;; ── batching ────────────────────────────────────────────────────────────
+
+(def pans (atom []))
+(def plated (atom []))
+
+(proc/defserver kitchen
+  (pipeline
+    (from (range 1 21))
+    (batch :pan 8 {:timeout 2000})
+    (stage :fry (fn [pan] (swap! pans conj (vec pan)) (count pan)))
+    (stage :plate (fn [n] (swap! plated conj n) n))))
+
+(deftest a-batch-coalesces-events-into-whole-batches
+  (reset! pans [])
+  (reset! plated [])
+  (let [s (start kitchen nil {})]
+    (is (await (fn [] (= 3 (cell :kitchen :pan :batches))) 8000) "three batches")
+    (is (= 20 (cell :kitchen :pan :in)) "of twenty events in")
+    (is (= 3 (cell :kitchen :pan :out)) "…and three batches out")
+    (is (= [[1 2 3 4 5 6 7 8] [9 10 11 12 13 14 15 16] [17 18 19 20]] @pans)
+        "the count trigger fills whole batches, and the tail is the remainder")
+    (is (= [8 8 4] @plated) "…and what is downstream sees BATCHES, not events")
+    (stop s)))
+
+(def src (atom nil))
+(def trickle-pans (atom []))
+
+(proc/defserver trickle
+  (pipeline
+    (from @src)
+    (batch :pan 5 {:timeout 150})
+    (stage :fry (fn [pan] (swap! trickle-pans conj (vec pan)) (count pan)))))
+
+(deftest a-partial-batch-fires-on-the-timeout
+  ; The source emits three events and then HOLDS THE STREAM OPEN — the producer
+  ; sleeps before it halts, so nothing but the clock can release the short
+  ; batch. A source that ended would flush its tail immediately, which is a
+  ; different trigger and the reason this one is written the hard way.
+  (reset! trickle-pans [])
+  (let [p (flow/producer
+            (fn [st max]
+              (if (empty? st)
+                (do (Process/sleep 600) :halt)
+                [(take max st) (drop max st)]))
+            (vec (range 3)))]
+    (reset! src p)
+    (let [t0 (proc/wall-ms)
+          s (start trickle nil {})]
+      (is (await (fn [] (= 1 (cell :trickle :pan :batches))) 8000)
+          "the short batch came out on the clock")
+      (is (>= (- (proc/wall-ms) t0) 100)
+          "…and only after the timeout, never reaching five")
+      (is (= [[0 1 2]] @trickle-pans) "…whole, and short")
+      (is (= 3 (cell :trickle :pan :in)) "three events in, ONE batch out")
+      (stop s))))
+
+;; ── concurrency, and the lag policy ─────────────────────────────────────
+
+(proc/defserver ranch
+  (pipeline
+    (from (range 1 41))
+    (stage :tend (fn [n] (Process/sleep 25) n) {:concurrency 4})))
+
+(deftest a-stage-runs-as-many-at-once-as-it-was-declared
+  (let [s (start ranch nil {})]
+    (is (await (fn [] (= 40 (cell :ranch :tend :out))) 15000) "the work finished")
+    (let [hw (cell :ranch :tend :high-water)]
+      (is (<= hw 4) (str "the high-water mark never passed the declared four: " hw))
+      (is (> hw 1) (str "…and four workers really did run at once: " hw)))
+    (is (= 4 (count (get (pipeline/pipeline-row :ranch :tend) :workers)))
+        "…and every one of the four is named")
+    (stop s)))
+
+(proc/defserver stalled
+  (pipeline
+    (from (range 1 201))
+    (stage :stall (fn [n] (Process/sleep 20000) n) {:concurrency 1})
+    (on-lag :block)))
+
+(deftest on-lag-block-holds-the-source-back
+  ; THE property, and not a timing: with the first stage stuck, the demand
+  ; window is what bounds the source — a couple of concurrency's worth of
+  ; events, never two hundred. `:on-lag :block` is the name for the behaviour
+  ; the demand protocol already has; what this pins is that it is IN FORCE.
+  (let [s (start stalled nil {})]
+    (Process/sleep 300)
+    (let [taken (cell :stalled :source :in)]
+      (is (< taken 8)
+          (str "the source was held to the window, not the whole stream: " taken))
+      (is (pos? taken) "…and it did start, so the pipeline really is running")
+      (is (< (cell :stalled :stall :in) 4)
+          "…and the stuck stage took only what it could hold"))
+    (stop s)))
+
+;; ── errors, and death ───────────────────────────────────────────────────
+
+(def sifted (atom []))
+(def sift-hold (atom false))
+
+(proc/defserver watched
+  (pipeline
+    (from (range 1 61))
+    (stage :sift (fn [n] (swap! sifted conj n) (wait-for sift-hold 8000) n)
+           {:concurrency 2})))
+
+(deftest a-killed-worker-is-visible-not-swallowed
+  (reset! sifted [])
+  (reset! sift-hold false)
+  (let [s (start watched nil {})]
+    (is (await (fn [] (seq (get (pipeline/pipeline-row :watched :sift) :workers))) 8000)
+        "a worker took an event, so the row knows its pid")
+    (let [victim (first (get (pipeline/pipeline-row :watched :sift) :workers))]
+      (is (:alive (pipeline/worker-vitals victim))
+          "…and the row named a process that is really running")
+      (kill victim)
+      (reset! sift-hold true)
+      (is (await (fn [] (not (:alive (pipeline/worker-vitals victim)))) 8000)
+          "the reader sees it die — liveness is read, never stored")
+      (is (await (fn [] (= 60 (cell :watched :sift :in))) 20000)
+          "the stage took every event, so the loss is the pipeline's, not the feed's")
+      (is (>= (cell :watched :sift :errors) 1)
+          "…and the events it was holding are COUNTED, not silently dropped")
+      (is (some (fn [p] (= p victim))
+                (get (pipeline/pipeline-row :watched :sift) :workers))
+          "…and its pid is STILL in the row: the process is the thing a demo sees"))
+    (stop s)))
+
+(def wobbled (atom false))
+
+(proc/defserver flaky
+  (pipeline
+    (from (range 1 6))
+    (stage :wave (fn [n]
+                   ; a TRANSIENT failure, and deliberately so: `:requeue` is a
+                   ; retry with no ceiling, and a poison event would go round
+                   ; for ever — which the row would show as a climbing `:errors`
+                   ; and an `:in` that never stops.
+                   (if (and (= n 3) (not @wobbled))
+                     (do (reset! wobbled true)
+                         (throw (ex-info "scorched" {:n n})))
+                     n))
+           {:concurrency 1})
+    (on-error :requeue)))
+
+(deftest on-error-requeue-puts-a-failed-event-back
+  ; The fn throws ONCE. `:requeue` puts the event back on the stage's queue
+  ; rather than losing it: it lands downstream on the second try, the stage
+  ; TOOK six events for five successes (the retry is a take), and the row says
+  ; a failure happened. `:fail` would have let the worker die instead.
+  (reset! wobbled false)
+  (let [s (start flaky nil {})]
+    (is (await (fn [] (= 5 (cell :flaky :wave :out))) 8000)
+        "the failed event came through on the second try")
+    (is (= 6 (cell :flaky :wave :in)) "…the stage took it twice for one success")
+    (is (>= (cell :flaky :wave :errors) 1) "…and the failure is counted")
+    (stop s)))
+
+(def choke (atom false))
+
+(proc/defserver spilling
+  (pipeline
+    (from (range 1 501))
+    (stage :fast (fn [n] n) {:concurrency 1})
+    (stage :slow (fn [n] (wait-for choke 8000) n) {:concurrency 1})
+    (on-lag :drop)))
+
+(deftest on-lag-drop-lets-the-source-run-ahead
+  ; The PAIR to the `:block` test, and the reason the policy is a NAME and not a
+  ; default: with `:drop` a result with nowhere to go is discarded and its worker
+  ; released, so nothing holds the source back. The loss is not silent — it is
+  ; `:dropped`, and it is also the gap between what the stage took and what it
+  ; passed on.
+  (reset! choke false)
+  (let [s (start spilling nil {})]
+    (Process/sleep 400)
+    (let [row (pipeline/pipeline-row :spilling :fast)]
+      (is (> (get row :dropped) 0)
+          (str "results the choked stage could not take were dropped: " (get row :dropped)))
+      (is (= (get row :in) (+ (get row :out) (get row :dropped) (get row :in-flight)))
+          "…and every event the stage took is accounted for: out, dropped, or in flight"))
+    (is (> (cell :spilling :source :in) 50)
+        (str "the source was NOT held back: " (cell :spilling :source :in)))
+    (reset! choke true)
+    (stop s)))
+
+(proc/defserver brittle
+  (pipeline
+    (from (range 1 11))
+    (stage :wave (fn [n] (if (= n 3) (throw (ex-info "scorched" {:n n})) n))
+           {:concurrency 1})
+    (on-error :fail)))
+
+(deftest on-error-fail-stops-the-line-visibly
+  ; `:fail` is the default, and it is not a euphemism: the worker DIES. The stage
+  ; stops taking work — nothing else has demand — the failure is counted, and the
+  ; pid stays in the row for a reader to find dead. A line that stopped is a
+  ; fact, not a silence.
+  (let [s (start brittle nil {})]
+    (is (await (fn [] (>= (cell :brittle :wave :errors) 1)) 8000) "the failure is counted")
+    (Process/sleep 150)
+    (is (= 3 (cell :brittle :wave :in)) "the stage took three events and stopped")
+    (is (= 2 (cell :brittle :wave :out)) "…two came out, the third did not")
+    (let [ws (vec (get (pipeline/pipeline-row :brittle :wave) :workers))]
+      (is (seq ws) "the worker is named")
+      (is (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) ws)
+          "…and it is dead, where a reader can see it"))
+    (stop s)))
+
+;; ── the read model is a fact ────────────────────────────────────────────
+
+(deftest the-read-model-outlives-the-pipeline
+  (reset! checked [])
+  (let [s (start line nil {})]
+    (is (await (fn [] (= 20 (cell :line :cook :out))) 8000) "the line drains")
+    (let [workers (vec (get (pipeline/pipeline-row :line :check) :workers))
+          size (erlang/apply :ets :info (list :bl_pipeline :size))]
+      (stop s)
+      (Process/sleep 60)
+      (is (seq (pipeline/pipeline-of :line))
+          "the rows are still there with the pipeline GONE: a fact, not a call")
+      (is (= 20 (cell :line :cook :out)) "…with the numbers it finished on")
+      (is (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) workers)
+          "…and the workers it names are dead, which a reader can see for itself")
+      ;; a reader never writes: fifty reads change neither the rows nor the table
+      (doseq [_ (range 50)] (pipeline/pipeline-rows))
+      (is (= 20 (cell :line :cook :out)) "…and fifty renders changed nothing")
+      (is (= size (erlang/apply :ets :info (list :bl_pipeline :size)))
+          "…not even the number of rows"))))
+
+;; ── declarations ────────────────────────────────────────────────────────
+
+(deftest an-invalid-declaration-is-refused-by-name
+  (let [unknown (refused '(pipeline (from (range 2)) (stage :a f) (reprocess 3)))]
+    (is (some? unknown) "an unknown entry is refused")
+    (is (includes? unknown "reprocess") "…naming the entry")
+    (is (includes? unknown "(stage :name FN opts?)")
+        "…and the whole accepted set, so the answer is a vocabulary"))
+  (let [nofrom (refused '(pipeline (stage :a f)))]
+    (is (some? nofrom) "a pipeline with no source is refused")
+    (is (includes? nofrom "(from SRC)")))
+  (let [zero (refused '(pipeline (from (range 2)) (stage :a f {:concurrency 0})))]
+    (is (some? zero) "a :concurrency of 0 is refused")
+    (is (includes? zero ":concurrency"))
+    (is (includes? zero "0") "…and the offending value is in the message"))
+  (let [nofn (refused '(pipeline (from (range 2)) (stage :a)))]
+    (is (some? nofn) "a stage with no fn is refused")
+    (is (includes? nofn "a name and the fn it runs")))
+  (let [lag (refused '(pipeline (from (range 2)) (stage :a f) (on-lag :nope)))]
+    (is (some? lag) "an unknown lag policy is refused")
+    (is (includes? lag ":block")))
+  (let [dup (refused '(pipeline (from (range 2)) (stage :a f) (stage :a g)))]
+    (is (some? dup) "two nodes with one name are refused")
+    (is (includes? dup ":a")))
+  (let [opt (refused '(pipeline (from (range 2)) (stage :a f {:concurency 2})))]
+    (is (some? opt) "a stage option that does not exist is refused, not ignored")
+    (is (includes? opt ":concurrency")))
+  (let [two (refused '(pipeline (from (range 2)) (batch :a 2) (batch :b 2)))]
+    (is (some? two) "a second (batch …) is refused")
+    (is (includes? two "ONE (batch")))
+  (let [twice (refused '(pipeline (from (range 2)) (stage :a f)
+                                  (on-lag :block) (on-lag :drop)))]
+    (is (some? twice) "two lag policies are refused")
+    (is (includes? twice "stated once"))))
+
+;; A declaration is one thing; a fn that is not a fn is another, and it is
+;; caught when the line is ARMED — before a single process starts.
+
+(proc/defserver misnamed
+  (pipeline
+    (from (range 1 4))
+    (stage :x "desk/cook")))
+
+(deftest a-stage-fn-that-is-not-a-function-is-refused-when-the-line-is-armed
+  (let [msg (try (do (start misnamed nil {}) nil) (catch e (str e)))]
+    (is (some? msg)
+        "a string names no fn here, so arming must fail rather than the first event")
+    (is (includes? msg "FUNCTION") "…and the refusal has to say so")))
+
+(deftest stopping-the-pipeline-takes-its-processes-down
+  (reset! checked [])
+  (let [s (start line nil {})]
+    (is (await (fn [] (seq (get (pipeline/pipeline-row :line :check) :workers))) 8000)
+        "a worker exists to be taken down")
+    (let [workers (vec (mapcat (fn [r] (get r :workers)) (pipeline/pipeline-of :line)))]
+      (is (seq workers))
+      (stop s)
+      (Process/sleep 100)
+      (is (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) workers)
+          "every worker the pipeline started went with it"))))
