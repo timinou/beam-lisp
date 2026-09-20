@@ -46,28 +46,135 @@
 ;;               SEARCH hot path: decode+quantise happen ONCE per basis, a query
 ;;               only quantises itself. Supersedes the raw packed corpus for
 ;;               search (PLAN-132 Phase 5c).
+;;   :packed   — a datom.vector/PackedCorpus (raw corpus binary) for callers that
+;;               want the bytes directly.
 ;; All are pure functions of (store, attr, basis), share one slot key and
 ;; discriminator, and are built lazily and independently on first demand.
+;;
+;; ── The memory bound (PLAN-132 Phase 4) ──────────────────────────────
+;;
+;; Each of those artifacts is LARGE: on the live corpus (62 396 × 768) the rows
+;; are ~196 MB, the packed binary ~190 MB, the resident index ~190 MB — ~580 MB
+;; for ONE fully-built column, and there is one slot per (store, attr) with no
+;; bound across stores. A long-lived daemon indexing many stores would grow
+;; without limit. So the cache carries a BYTE BUDGET and evicts least-recently-
+;; used columns when an insert pushes it over. The budget is a SOFT floor: a
+;; single column larger than the whole budget is still cached (the entry being
+;; built is never its own eviction victim) — the bound is "at most one oversized
+;; column plus whatever else fits", never "unbounded".
+;;
+;; The row is a WIDE TUPLE, not a map, for one reason: `ets/update_element` can
+;; bump the access-time field in place on every read WITHOUT recopying the row's
+;; heavy fields. (ETS shares refc binaries by pointer, but the rows list spine
+;; is heap; update_element touches only the atime slot.)
+;;   row = {key atime bytes disc rows packed resident n dim}
+;;           1    2     3    4    5     6      7     8  9
+;; Meta rows share the table under ATOM keys (entry keys are {store attr}
+;; tuples, so eviction tells them apart with is_tuple): {:__total_bytes__ N},
+;; {:__evictions__ N}, {:__budget_bytes__ N}.
+
+(ns datom.query.corpus
+  (:require [datom.db] [datom.index] [datom.vector]))
 
 ;; ── the table ────────────────────────────────────────────────────────
-;;
-;; VM-wide and public: any process evaluating a query over the same store must
-;; share the hit. `:set`, keyed by `[store attr]`. Value: `{:disc [...] :rows
-;; [[e dvec] ...]}`. Created lazily on first use, like oracle.bl's memo.
 
 (def TABLE :datom_corpus_cache)
+(def TOTAL-KEY :__total_bytes__)
+(def EVICT-KEY :__evictions__)
+(def BUDGET-KEY :__budget_bytes__)
+(def DEFAULT-BUDGET (* 512 1024 1024)) ; 512 MiB of derived columns before eviction
 
 (defn- t2 [a b] (erlang/list_to_tuple (to-list [a b])))
+(defn- now-tick [] (erlang/unique_integer (to-list [:monotonic :positive])))
 
 (defn- table []
   (when (= :undefined (ets/info TABLE))
     ; Racy first-touch is fine: ets/new throws :badarg if a concurrent caller
-    ; won, which means the table now exists — exactly what we wanted.
-    (try (ets/new TABLE (to-list [:set :public :named_table
-                                  (t2 :read_concurrency true)
-                                  (t2 :write_concurrency true)]))
-         (catch _ :ok)))
+    ; won, which means the table now exists — exactly what we wanted. The
+    ; meta rows are only seeded on the branch that actually created the table.
+    (try
+      (do (ets/new TABLE (to-list [:set :public :named_table
+                                   (t2 :read_concurrency true)
+                                   (t2 :write_concurrency true)]))
+          (ets/insert TABLE (t2 TOTAL-KEY 0))
+          (ets/insert TABLE (t2 EVICT-KEY 0))
+          (ets/insert TABLE (t2 BUDGET-KEY DEFAULT-BUDGET)))
+      (catch _ :ok)))
   TABLE)
+
+;; ── row accessors ─────────────────────────────────────────────────────
+
+(defn- r-key [row] (erlang/element 1 row))
+(defn- r-atime [row] (erlang/element 2 row))
+(defn- r-bytes [row] (erlang/element 3 row))
+(defn- r-disc [row] (erlang/element 4 row))
+(defn- r-rows [row] (erlang/element 5 row))
+(defn- r-packed [row] (erlang/element 6 row))
+(defn- r-resident [row] (erlang/element 7 row))
+(defn- r-n [row] (erlang/element 8 row))
+(defn- r-dim [row] (erlang/element 9 row))
+
+(defn- ->row [k atime bytes disc rows packed resident n dim]
+  (erlang/list_to_tuple (to-list [k atime bytes disc rows packed resident n dim])))
+
+;; ── byte accounting ───────────────────────────────────────────────────
+
+(defn- words-for [dim] (erlang/div (+ dim 63) 64))
+
+(defn- corpus-dim [rows]
+  (if (empty? rows) 0 (:dim (get (first rows) 1))))
+
+(defn- est-bytes
+  "Estimated resident memory of an entry given which artifacts are present.
+   rows: n DVec bodies (dim*4 each) plus ~96 B list/record spine per pair;
+   packed: one dim*4*n contiguous binary; resident: the decoded f32 matrix
+   (dim*4*n) plus the quantised codes (words*8 per row). All additive — none
+   share bytes (packed is a fresh concat, resident is decoded off-heap)."
+  [n dim has-rows has-packed has-resident]
+  (+ (if has-rows (+ (* n dim 4) (* n 96)) 0)
+     (if has-packed (* n dim 4) 0)
+     (if has-resident (+ (* n dim 4) (* n (words-for dim) 8)) 0)))
+
+(defn- current-total []
+  (let [hit (ets/lookup TABLE TOTAL-KEY)]
+    (if (empty? hit) 0 (erlang/element 2 (first (to-list hit))))))
+
+(defn- get-budget []
+  (let [hit (ets/lookup TABLE BUDGET-KEY)]
+    (if (empty? hit) DEFAULT-BUDGET (erlang/element 2 (first (to-list hit))))))
+
+(defn- entry-rows []
+  ; every row whose key is a {store attr} tuple — the meta rows have atom keys,
+  ; and an atom is not a tuple, so is_tuple tells them apart.
+  (filterv (fn [row] (erlang/is_tuple (r-key row)))
+           (to-list (ets/tab2list TABLE))))
+
+(defn- evict-row! [row]
+  (ets/delete TABLE (r-key row))
+  (ets/update_counter TABLE TOTAL-KEY (t2 2 (- 0 (r-bytes row))))
+  (ets/update_counter TABLE EVICT-KEY (t2 2 1)))
+
+(defn- evict-to-budget!
+  "Evict least-recently-used columns until total ≤ budget. Never evicts
+   `keep-key` (the entry just built), so the budget is a soft floor: one
+   oversized column can exceed it, but nothing grows unbounded."
+  [keep-key]
+  (loop []
+    (when (> (current-total) (get-budget))
+      (let [rows (filterv (fn [r] (not= (r-key r) keep-key)) (entry-rows))]
+        (when (not (empty? rows))
+          (let [victim (reduce (fn [a b] (if (< (r-atime a) (r-atime b)) a b))
+                               (first rows) (rest rows))]
+            (evict-row! victim)
+            (recur)))))))
+
+(defn- store-entry!
+  "Insert/overwrite an entry row, adjust the running byte total by the delta
+   from `old-bytes`, and evict LRU columns if now over budget."
+  [k row old-bytes]
+  (ets/insert TABLE row)
+  (ets/update_counter TABLE TOTAL-KEY (t2 2 (- (r-bytes row) old-bytes)))
+  (evict-to-budget! k))
 
 (defn- discriminator
   "The db state a corpus depends on. Two db values with the same discriminator
@@ -90,21 +197,28 @@
 
 ;; ── the public read ──────────────────────────────────────────────────
 
-(defn- entry
-  "The cached entry `{:disc :rows :packed?}` for `(store, attr)` at `db`'s
-   state, building and storing `{:disc :rows}` on a miss. The one lookup both
-   `column` and `packed` share, so a hit costs a single ets/lookup and the
-   discriminator check lives in one place."
+(defn- ensure-entry
+  "The entry row for `(store, attr)` at `db`'s state, with `:rows` built. On a
+   hit at the same discriminator, stamps a fresh access time (O(1),
+   update_element — no payload copy) and returns it. On a miss or a stale
+   discriminator, assembles the rows and stores a rows-only entry."
   [db attr]
+  (table)
   (let [k (t2 (datom.db/store-of db) attr)
         disc (discriminator db)
-        hit (ets/lookup (table) k)
-        cached (if (empty? hit) nil (erlang/element 2 (first (to-list hit))))]
-    (if (and (some? cached) (= disc (:disc cached)))
-      cached
-      (let [e {:disc disc :rows (assemble db attr)}]
-        (ets/insert (table) (t2 k e))
-        e))))
+        hit (ets/lookup TABLE k)
+        row (if (empty? hit) nil (first (to-list hit)))]
+    (if (and (some? row) (= disc (r-disc row)))
+      (do (ets/update_element TABLE k (t2 2 (now-tick)))
+          row)
+      (let [rows (assemble db attr)
+            n (count rows)
+            dim (corpus-dim rows)
+            old-bytes (if (some? row) (r-bytes row) 0)
+            newrow (->row k (now-tick) (est-bytes n dim true false false)
+                          disc rows nil nil n dim)]
+        (store-entry! k newrow old-bytes)
+        newrow))))
 
 (defn column
   "The `[[entity dvec] …]` corpus of embedding column `attr` in `db`, memoised
@@ -116,7 +230,7 @@
    rebuilds and overwrites the slot — the cache can never return datoms from a
    basis the caller is not reading."
   [db attr]
-  (:rows (entry db attr)))
+  (r-rows (ensure-entry db attr)))
 
 (defn packed
   "The `datom.vector/PackedCorpus` of embedding column `attr` in `db` — the ids
@@ -124,14 +238,14 @@
    Memoised beside `column` under the same (store, attr, basis) discipline, so
    the search hot path pays the concat ONCE per basis, not once per query."
   [db attr]
-  (let [e (entry db attr)]
-    (or (:packed e)
-        ; build the packed form lazily, on first search, and cache it in place
-        ; alongside the rows without rebuilding the rows.
-        (let [pc (datom.vector/pack-corpus (:rows e))]
-          (ets/insert (table)
-                      (t2 (t2 (datom.db/store-of db) attr)
-                          (assoc e :packed pc)))
+  (let [row (ensure-entry db attr)
+        k (r-key row)]
+    (or (r-packed row)
+        (let [pc (datom.vector/pack-corpus (r-rows row))
+              b (est-bytes (r-n row) (r-dim row) true true (some? (r-resident row)))
+              newrow (->row k (now-tick) b (r-disc row) (r-rows row)
+                            pc (r-resident row) (r-n row) (r-dim row))]
+          (store-entry! k newrow (r-bytes row))
           pc))))
 
 (defn resident
@@ -142,30 +256,47 @@
    This is the hot search path; `packed` remains for callers that want the raw
    corpus binary."
   [db attr]
-  (let [e (entry db attr)]
-    (or (:resident e)
-        (let [r (datom.vector/build-resident (:rows e))]
-          (ets/insert (table)
-                      (t2 (t2 (datom.db/store-of db) attr)
-                          (assoc e :resident r)))
+  (let [row (ensure-entry db attr)
+        k (r-key row)]
+    (or (r-resident row)
+        (let [r (datom.vector/build-resident (r-rows row))
+              b (est-bytes (r-n row) (r-dim row) true (some? (r-packed row)) true)
+              newrow (->row k (now-tick) b (r-disc row) (r-rows row)
+                            (r-packed row) r (r-n row) (r-dim row))]
+          (store-entry! k newrow (r-bytes row))
           r))))
 
-;; ── introspection (probes, tests, a future `bl cache status`) ─────────
+;; ── configuration + introspection (probes, a future `bl cache status`) ─
+
+(defn set-budget!
+  "Set the byte budget for derived columns; evicts LRU immediately if the new
+   budget is below the current total. Returns the budget."
+  [bytes]
+  (table)
+  (ets/insert TABLE (t2 BUDGET-KEY bytes))
+  (evict-to-budget! nil)
+  bytes)
 
 (defn stats
-  "How many columns are resident, and the total rows they hold. Cheap: reads
-   ETS metadata and the cached vectors' lengths, never rebuilds."
+  "Cache occupancy: resident columns, total rows, estimated bytes held, the
+   budget, and how many columns have been evicted. Cheap — reads ETS metadata
+   and per-row counts, never rebuilds."
   []
   (if (= :undefined (ets/info TABLE))
-    {:columns 0 :rows 0}
-    (let [entries (to-list (ets/tab2list TABLE))]
-      {:columns (count entries)
-       :rows (reduce (fn [acc e] (+ acc (count (:rows (erlang/element 2 e))))) 0 entries)})))
+    {:columns 0 :rows 0 :bytes 0 :budget DEFAULT-BUDGET :evictions 0}
+    (let [rows (entry-rows)
+          evh (ets/lookup TABLE EVICT-KEY)]
+      {:columns (count rows)
+       :rows (reduce (fn [acc r] (+ acc (r-n r))) 0 rows)
+       :bytes (current-total)
+       :budget (get-budget)
+       :evictions (if (empty? evh) 0 (erlang/element 2 (first (to-list evh))))})))
 
 (defn forget!
-  "Drop every cached column. For tests and for a manual flush; correctness never
-   depends on calling it — a stale basis already misses."
+  "Drop every cached column and reset the byte total. For tests and for a manual
+   flush; correctness never depends on calling it — a stale basis already misses."
   []
   (when (not= :undefined (ets/info TABLE))
-    (ets/delete_all_objects TABLE))
+    (doseq [r (entry-rows)] (ets/delete TABLE (r-key r)))
+    (ets/insert TABLE (t2 TOTAL-KEY 0)))
   :ok)
