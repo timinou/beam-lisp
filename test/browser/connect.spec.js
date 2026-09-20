@@ -105,6 +105,29 @@ test("reconnect: {reconnect:false} opts out", async ({ page }) => {
   expect(await page.evaluate(() => window.__sockets.length)).toBe(1);
 });
 
+// A reconnect SWAPS `ws` for a new object (openSocket reassigns it), and the
+// click handler reads `ws.__navigate` off whatever is current. Attach the
+// navigator to only the first socket and the one a reconnect brings back has
+// none: the click is preventDefault'd, no navigate frame is ever sent, and the
+// URL never moves — a dead in-app link on a socket that reports itself live.
+// Silent, and only after a drop, which is what makes it look intermittent.
+test("reconnect: an in-app link still navigates on the socket that came back", async ({ page }) => {
+  await boot(page);
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  await page.evaluate(() => {
+    document.getElementById("live-root").innerHTML = '<a href="/lib/dossier-mci">dossier-mci</a>';
+  });
+  await page.evaluate(() => window.Live.ws.close());
+  await page.waitForFunction(() => window.__sockets.length === 2 && window.__sockets[1].readyState === 1);
+
+  await page.click("a[href='/lib/dossier-mci']");
+
+  // the click must reach the server over the socket that is actually open
+  await page.waitForFunction(() => window.__sockets[1].sent.length > 0, null, { timeout: 2000 });
+  expect(await page.evaluate(() => window.__sockets[1].sent))
+    .toEqual(['["event",["navigate","/lib/dossier-mci"],{}]']);
+});
+
 // ── the session id ───────────────────────────────────────────────────
 //
 // The server keys the SESSION (locals, last-seen tree, subscriptions) on

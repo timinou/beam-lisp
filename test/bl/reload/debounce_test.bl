@@ -1,0 +1,109 @@
+; test/bl/reload/debounce_test.bl — the watcher's quiet window is the
+; SCHEDULER's, proven against real events.
+;
+; A file save is many filesystem events, and the image must be updated ONCE,
+; from settled content, after they stop. That need is `proc.tick`'s debounce
+; (priv/std/reload.bl `watch-debounce`), and the watcher owns none of it: it
+; forwards each event and applies what it holds when the owner answers
+; `:flush_pending`.
+;
+; These tests drive the watcher with SYNTHETIC FileSystem messages, so the
+; multiplicity of a save is exact rather than observed — no inotify, and no
+; sleeping to wait for an event to arrive. The flush itself IS timed by the
+; scheduler, so a test does wait out a quiet window; that is the subject.
+;
+; `--shared` for the reason tick_test/sched_test need it: the watcher commits
+; into the image it was started in, and a plain GenServer process cannot reach
+; an isolated ward's fork. Run:
+;
+;   ./bin/bl test --shared test/bl/reload/debounce_test.bl
+
+(ns reload.debounce-test
+  (:require [reload] [bl.util :as u]))
+
+(defn- tmp-dir []
+  (Path/join (System/tmp_dir)
+             (str "bl_debounce_" (erlang/unique_integer (list :positive)))))
+
+(defn- start-watcher [name dir quiet-ms]
+  (BeamLisp.ReloadWatcher/start_link
+    (u/kw [:dirs (u/to-list [dir])] [:name name] [:quiet_ms quiet-ms])))
+
+(defn- state-of [name] (erlang/apply :sys :get_state (list name)))
+
+(defn- save!
+  "One save, as the filesystem reports it: a `[:file_event fs [path events]]`
+   message from the watcher's OWN FileSystem process (its handler accepts no
+   other sender). Built by hand so a test can say exactly how many events a save
+   is — the multiplicity that makes the debounce load-bearing."
+  [name path]
+  (let [fs (:fs (state-of name))
+        msg (erlang/list_to_tuple
+              (list :file_event fs (erlang/list_to_tuple (list path (list :modified)))))]
+    (erlang/send name msg)))
+
+(defn- stop-watcher [name]
+  (erlang/apply :gen_server :stop (list name :normal 1000)))
+
+(defn- applied-count
+  "How many commits naming `ns-name` the image has recorded. The journal is
+   written by `reload/commit` itself, so this counts what the IMAGE did — not
+   what the watcher thinks it did."
+  [ns-name]
+  (count (filter (fn [e] (and (= :applied (:event e))
+                              (some (fn [n] (= ns-name n)) (:nses e))))
+                 (reload/journal))))
+
+; ── N events, ONE commit, and it lands after the LAST one ───────────────
+;
+; The events are spread over LONGER than the quiet window, which is the case an
+; "arm once and ignore the rest" timer gets wrong: it measures the quiet from
+; the first event, so it fires mid-save. `tick-reset` measures it from the last.
+
+(deftest a-burst-of-events-commits-once-and-after-the-last
+  (reload/abort)
+  (let [dir (tmp-dir)
+        path (Path/join dir "one.bl")
+        before (applied-count "db.one")]
+    (File/mkdir_p! dir)
+    (File/write! path "(ns db.one)\n(defn v [] 1)\n")
+    (is (= :ok (erlang/element 1 (start-watcher :db-debounce dir 300))))
+    (try
+      (doseq [_ (range 8)]
+        (save! :db-debounce path)
+        (Process/sleep 50))
+      ; the content the LAST event will find, written while the window is open
+      (File/write! path "(ns db.one)\n(defn v [] 2)\n")
+      (save! :db-debounce path)
+      (Process/sleep 700)                       ; outlast the 300ms window
+      (is (= 2 (BeamLisp/eval "(db.one/v)")) "the last on-disk content is what is live")
+      (is (= (+ before 1) (applied-count "db.one")) "9 events, one commit")
+      (finally
+        (stop-watcher :db-debounce)
+        (File/rm_rf dir)))))
+
+; ── the quiet window is a PROCESS; losing it may not strand a save ──────
+;
+; The owner is deliberately not linked to the watcher: the watcher is the door
+; the image heals through, so it must survive its own helper. What it may NOT do
+; is keep watching a tree it can no longer act on.
+
+(deftest a-dead-quiet-window-does-not-strand-the-next-save
+  (reload/abort)
+  (let [dir (tmp-dir)
+        path (Path/join dir "two.bl")
+        before (applied-count "db.two")]
+    (File/mkdir_p! dir)
+    (File/write! path "(ns db.two)\n(defn v [] 1)\n")
+    (is (= :ok (erlang/element 1 (start-watcher :db-debounce-dead dir 60))))
+    (try
+      (erlang/exit (:debounce (state-of :db-debounce-dead)) :kill)
+      (Process/sleep 60)                        ; let the watcher notice
+      (File/write! path "(ns db.two)\n(defn v [] 2)\n")
+      (save! :db-debounce-dead path)
+      (Process/sleep 400)
+      (is (= 2 (BeamLisp/eval "(db.two/v)")) "the save after the owner died landed")
+      (is (= (+ before 1) (applied-count "db.two")) "…and landed exactly once")
+      (finally
+        (stop-watcher :db-debounce-dead)
+        (File/rm_rf dir)))))

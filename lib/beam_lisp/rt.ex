@@ -2400,10 +2400,19 @@ defmodule BeamLisp.RT do
   """
   def read_data(source) when is_binary(source), do: BeamLisp.Compiler.read_data(source)
 
-  # Inside a collection, strings print readably; at the top level
-  # (println, pr-str of a bare string) they print raw.
+  # Inside a collection, strings print readably; at the top level `println` and
+  # `print-str` print them raw, while `pr-str` prints them readably — the ONE
+  # case where the readable printer and the human printer differ. It used to be
+  # that `pr-str` printed a bare string raw too: `(pr-str "x")` answered `x`,
+  # which no reader reads back as a string, and which made `pr-str` of a string
+  # indistinguishable from `pr-str` of a symbol — the trap that silently emptied
+  # `.bl-check.edn`'s per-source keys (FUP-032).
   defp print_elem(x) when is_binary(x), do: inspect(x)
   defp print_elem(x), do: print_str(x)
+
+  @doc false
+  def print_readably(x) when is_binary(x), do: inspect(x)
+  def print_readably(x), do: print_str(x)
 
   @doc false
   def str do
@@ -2513,7 +2522,7 @@ defmodule BeamLisp.RT do
       "next" => &next/1,
       "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
       "println" => multi_fn(%{0 => &println/0, 1 => &println/1}, {1, &println_multi/2}),
-      "pr-str" => &print_str/1,
+      "pr-str" => &print_readably/1,
       # Clojure's `print-str` returns the printed representation (like
       # pr-str, minus readably-quoted strings); both share the one printer.
       "print-str" => &print_str/1,
@@ -2765,7 +2774,7 @@ defmodule BeamLisp.RT do
       "nth" => 2,
       "empty?" => 1,
       "next" => 1,
-      "pr-str" => :print_str,
+      "pr-str" => :print_readably,
       "print-str" => :print_str,
       "reader-macro!" => :reader_macro!,
       "data-reader!" => :data_reader!,

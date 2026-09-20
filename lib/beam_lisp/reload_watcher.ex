@@ -19,6 +19,24 @@ defmodule BeamLisp.ReloadWatcher do
   — no `Process.sleep`. The reload module's own `reload/drain` is the bl-side
   barrier that pairs with this.
 
+  ## Where the quiet window lives
+
+  A save is many filesystem events, so they have to be folded into one commit
+  once they stop. That is a DEBOUNCE, and the tree has exactly one implementation
+  of it: `priv/std/proc/tick.bl`, whose `tick-reset` cancels the armed wake, arms
+  a fresh one, and bumps a generation so a wake already in the mailbox is
+  STALE. So this module does no timing of its own. It starts a
+  `reload/watch-debounce` owner (a beam-lisp `defserver`, one per watcher),
+  forwards every event to it, and applies what it holds when the owner answers
+  `:flush_pending`.
+
+  What stays here is the part that cannot leave: the pending set, the flush, and
+  the injected `:apply` it runs — the daemon's variant submits the stage→commit
+  to its Executor FIFO, so the commit must happen where the caller put it.
+
+  The owner is not linked. If it dies, the pending paths are applied at once
+  (nothing is stranded), and the next event starts a fresh owner.
+
   ## Scope
 
   Dev + test only. Production trusts compiled beams and runs no watcher — the
@@ -38,6 +56,10 @@ defmodule BeamLisp.ReloadWatcher do
       `false`, changes are staged and a caller drives `reload/commit` itself.
     * `:on_result` — optional 1-arg fn called with each commit's status map
       (for tests/observability).
+    * `:apply` — optional 3-arg fn `(source, path, commit?) -> status`; the seam
+      a host with its own ordering (the daemon's Executor FIFO) injects.
+    * `:quiet_ms` — how long the paths must be quiet before the flush
+      (default 50). The window is the bl-side owner's, not this module's.
   """
   def start_link(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -82,29 +104,41 @@ defmodule BeamLisp.ReloadWatcher do
   @impl true
   def init(opts) do
     dirs = Keyword.fetch!(opts, :dirs)
-    {:ok, fs} = FileSystem.start_link(dirs: dirs)
-    FileSystem.subscribe(fs)
+    quiet_ms = Keyword.get(opts, :quiet_ms, 50)
 
-    state = %{
-      fs: fs,
-      auto_commit: Keyword.get(opts, :auto_commit, true),
-      on_result: Keyword.get(opts, :on_result),
-      # How a change is applied: `(source, path, commit?) -> result`. Defaults to
-      # the in-process `apply_change/3`. The daemon injects a variant that
-      # submits the reload to its Executor FIFO, so a stage->commit is ordered
-      # against runs/tests in the same warm VM (no two things mutating the image
-      # at once).
-      apply: Keyword.get(opts, :apply, &apply_change/3),
-      event_count: 0,
-      last: :idle,
-      # Debounce state: paths with an unflushed event, and the armed flush
-      # timer (nil when quiet). See `defer/2`.
-      pending: %{},
-      flush_timer: nil,
-      quiet_ms: Keyword.get(opts, :quiet_ms, 50)
-    }
+    case start_debounce(quiet_ms) do
+      {:ok, debounce} ->
+        {:ok, fs} = FileSystem.start_link(dirs: dirs)
+        FileSystem.subscribe(fs)
 
-    {:ok, state}
+        state = %{
+          fs: fs,
+          auto_commit: Keyword.get(opts, :auto_commit, true),
+          on_result: Keyword.get(opts, :on_result),
+          # How a change is applied: `(source, path, commit?) -> result`. Defaults to
+          # the in-process `apply_change/3`. The daemon injects a variant that
+          # submits the reload to its Executor FIFO, so a stage->commit is ordered
+          # against runs/tests in the same warm VM (no two things mutating the image
+          # at once).
+          apply: Keyword.get(opts, :apply, &apply_change/3),
+          event_count: 0,
+          last: :idle,
+          # Debounce state: the paths with an unflushed event, and the bl-side
+          # owner that decides when they have gone quiet. See `defer/2`.
+          pending: %{},
+          debounce: debounce,
+          debounce_ref: Process.monitor(debounce),
+          debounce_warned: false,
+          quiet_ms: quiet_ms
+        }
+
+        {:ok, state}
+
+      {:error, reason} ->
+        # No quiet window means no way to act on a save. Refuse to come up at
+        # all rather than watch a tree and drop every edit silently.
+        {:stop, reason}
+    end
   end
 
   @impl true
@@ -137,6 +171,16 @@ defmodule BeamLisp.ReloadWatcher do
     {:noreply, state}
   end
 
+  # The quiet-window owner died. Nothing is left holding the pending paths, so
+  # apply them NOW — a save that never lands is the one outcome this may not
+  # have — and drop the pid, so the next event starts a fresh owner. The watcher
+  # survives its bl-side helper, which is the point: this is the door the image
+  # heals through, and it may not be the thing that needs healing first.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{debounce_ref: ref} = state) do
+    Logger.warning("reload watcher: quiet-window owner exited (#{inspect(reason)}); flushing held paths")
+    {:noreply, flush(%{state | debounce: nil, debounce_ref: nil, debounce_warned: false})}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # One save is many inotify events (create + write + attrib + close, more
@@ -144,30 +188,86 @@ defmodule BeamLisp.ReloadWatcher do
   # run the full stage→commit per event: a single save committed the SAME
   # bundle 13 times on the reference host (blueprint FUP-020), and an event
   # landing between an editor's truncate and its write staged PARTIAL content
-  # ("source declares no (ns …)"). So events only arm a flush; the flush runs
-  # once the path has been quiet for `quiet_ms`, applying each path ONCE from
-  # its settled on-disk state.
+  # ("source declares no (ns …)"). So an event only RECORDS a path and resets
+  # the quiet window; one flush then applies every pending path ONCE, from its
+  # settled on-disk state.
+  #
+  # The window itself is `proc.tick`'s (see `priv/std/reload.bl` `watch-debounce`),
+  # in a beam-lisp process the watcher owns: each event is forwarded there, and
+  # it sends back `:flush_pending` once the paths have been quiet for `quiet_ms`.
+  # Timing out of this module means one implementation of "wake me after quiet"
+  # in the tree instead of two — and the ONE that resets on activity, so the
+  # flush lands after the LAST event rather than the first.
   defp defer(path, state) do
     state = %{state | pending: Map.put(state.pending, path, true)}
 
-    case state.flush_timer do
-      nil ->
-        %{state | flush_timer: Process.send_after(self(), :flush_pending, state.quiet_ms)}
-
-      _timer ->
-        # A flush is already armed; it reads the whole pending set when it
-        # fires, so re-arming would only split one save across two flushes.
+    case arm(state) do
+      {:ok, state} ->
         state
+
+      {:unavailable, state} ->
+        # A quiet window could not be started, so nothing will ever come back to
+        # say "flush". Apply the save NOW: a tree that reloads a little too
+        # eagerly is a bug, a tree whose saves never load is a broken tool.
+        flush(state)
     end
+  end
+
+  # Reset the quiet window: tell the bl-side owner that a save is still being
+  # written. A window already armed is reset, not duplicated — the owner cancels
+  # its wake and arms a fresh one, and the wake already in ITS mailbox is made
+  # stale by a generation bump (why `tick-reset` exists).
+  defp arm(%{debounce: pid} = state) when is_pid(pid) do
+    send(pid, {:"reload/activity", self()})
+    {:ok, state}
+  end
+
+  defp arm(state) do
+    case start_debounce(state.quiet_ms) do
+      {:ok, pid} ->
+        send(pid, {:"reload/activity", self()})
+        {:ok, %{state | debounce: pid, debounce_ref: Process.monitor(pid), debounce_warned: false}}
+
+      {:error, reason} ->
+        unless state.debounce_warned do
+          Logger.warning(
+            "reload watcher: no quiet-window owner (#{reason}); applying each save as it arrives"
+          )
+        end
+
+        {:unavailable, %{state | debounce: nil, debounce_ref: nil, debounce_warned: true}}
+    end
+  end
+
+  # The quiet-window owner for this watcher — a beam-lisp `defserver` in the
+  # `reload` namespace (see `priv/std/reload.bl`). One per watcher, unnamed: the
+  # watcher holds the pid, and a name would be a second identity for one process.
+  # A failure here is REPORTED, never stubbed with a local timer: two
+  # implementations of one debounce is the thing this seam exists to abolish.
+  defp start_debounce(quiet_ms) do
+    BeamLisp.Loader.ensure_loaded("reload")
+    {:ok, BeamLisp.RT.invoke(BeamLisp.Env.fetch!("reload", "watch-debounce-start"), [quiet_ms])}
+  rescue
+    e -> {:error, Exception.message(e)}
   end
 
   @impl true
   def terminate(_reason, state) do
     # Stop the linked FileSystem worker so its `inotifywait` port does not leak
     # across tests (a lingering watcher on a removed tmp dir emits stray events).
-    if is_pid(state.fs) and Process.alive?(state.fs) do
+    stop(state.fs)
+    # …and the bl-side quiet-window owner, which is NOT linked to us: leave it
+    # and it would keep a wake armed for a watcher that no longer exists.
+    stop(state.debounce)
+    :ok
+  end
+
+  defp stop(pid) when not is_pid(pid), do: :ok
+
+  defp stop(pid) do
+    if Process.alive?(pid) do
       try do
-        GenServer.stop(state.fs, :normal, 500)
+        GenServer.stop(pid, :normal, 500)
       catch
         _, _ -> :ok
       end
@@ -183,7 +283,7 @@ defmodule BeamLisp.ReloadWatcher do
   # instead of printing a stage error for a file that is simply gone.
   defp flush(state) do
     paths = state.pending
-    state = %{state | pending: %{}, flush_timer: nil}
+    state = %{state | pending: %{}}
 
     Enum.reduce(paths, state, fn {path, _}, acc ->
       if File.regular?(path) do

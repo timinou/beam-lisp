@@ -271,5 +271,6 @@ pub fn vec_pack_rows<'a>(env: Env<'a>, rows: Vec<Vec<f64>>) -> NifResult<Binary<
 
 pub fn load(env: Env, _info: Term) -> bool {
     let _ = env.register::<HnswIndex>();
+    let _ = env.register::<crate::Resident>();
     true
 }

@@ -199,19 +199,43 @@ The user surface is Lisp, composed from the algebra that exists:
 
 ```clojure
 ;; the rule, read as the sentence a human would say
-(recur :month (on :friday :last) (at 9 30))     ; the last Friday at 09:30
-(recur :week 2 (on :monday) (at 8 0))           ; every second Monday at 08:00
-(recur :day (at 6 0))                           ; daily at 06:00
-(recur :year (in :march) (on :sunday :last))    ; the DST Sunday, some places
-(recur :month (on :day 31) {:clamp :last})      ; the 31st, clamped where short
+(rule :month (on :friday :last) (at 9 30))     ; the last Friday at 09:30
+(rule :week 2 (on :monday) (at 8 0))           ; every second Monday at 08:00
+(rule :day (at 6 0))                           ; daily at 06:00
+(rule :year (in :march) (on :sunday :last))    ; the DST Sunday, in some places
+(rule :month (day 31))                         ; the 31st — and a month that has
+                                               ; no 31st simply has no occurrence,
+                                               ; which is the rule's MEANING, not
+                                               ; a bug: clamping is a policy, and
+                                               ; a policy is a decision someone
+                                               ; makes rather than a thing the
+                                               ; engine does quietly
 
-;; composition IS the set algebra, and that is the whole point
-(∪ (recur :day (at 8 0)) (recur :day (at 18 0)))         ; twice a day
-(∖ (recur :day (at 6 0)) holidays)                       ; except holidays
-(∩ (recur :week (on :monday)) (interval :year 2026))     ; only this year
-(take 5 (recur :month (on :friday :last)))
-(until (recur :day (at 6 0)) ~o"2026-12-31")
+;; the questions a rule can be asked — and the SAME scan that fires answers them
+(next rule after)                              ; the next occurrence interval
+(preview rule from 5)                          ; the next five, ascending
+(count-in rule from to)                        ; how many start in a window
+(why rule instant)                             ; WHICH selector admitted it, or
+                                               ; the bound that excluded it
+explain rule                                   ; tagged structure + English
 ```
+
+**As built (2026-09-20).** Two corrections from the sketch above, both learned by
+writing it:
+
+* The constructor is **`rule`**, not `recur`: `recur` is a special form in this
+  Lisp, and a surface that shadows it is a trap, not a convenience. The sentence
+  survives because the words are `:refer`red — `(:require [datom.recur :refer
+  [rule on at in day every times until starting]])` — which is also why the
+  surface is **functions and not a macro**: a rule assembled at runtime (from a
+  config, a store row, a REPL) is then the same kind of thing as a written one,
+  and the two meet in one `validate`.
+* **Composition is still roadmap R2.** `∪`/`∖`/`∩` over rules — so "except
+  holidays" is an expression — needs an `IntervalSet`, because `datom.time`'s
+  `union`/`subtract` return ONE interval while a rule produces a set. Until then
+  the surface is the constructors plus the questions, and saying so here is the
+  point of writing a design down before the code: the doc corrected the code in
+  six places, and the code corrects the doc in two.
 
 Four design commitments, each of which is a thing cron and RRULE cannot do:
 

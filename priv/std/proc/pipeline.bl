@@ -1,0 +1,787 @@
+; proc/pipeline.bl — a source, stages, a batcher, a sink: ONE declaration.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; `proc.flow` is the demand protocol and two primitives (`distribute`, `batch`).
+; A PIPELINE is the shape you build out of them, declared once:
+;
+;   (proc/defserver kitchen
+;     (pipeline
+;       (from (orders))                            ; a seq, a fn, or a flow stream
+;       (stage :check desk/check {:concurrency 2}) ; the fn on N workers
+;       (batch :pan    8 {:timeout 150})           ; 8 events or 150 ms, first wins
+;       (stage :cook  desk/cook  {:concurrency 4})
+;       (stage :plate desk/plate)
+;       (on-lag :block)                            ; or :drop
+;       (on-error :requeue)))                      ; or :fail
+;
+; The entries are validated FORMS, the way `(sched (every …) (daily …))` is: an
+; unknown entry, a missing `(from …)`, a stage with no fn, a `:concurrency` of
+; 0 — each is refused when the server form is EXPANDED, naming the offending
+; entry and the whole accepted set.
+;
+; ══ WHY A CLAUSE, AND NOT `defpipeline` ═════════════════════════════════════
+;
+; A macro that copies a `defserver` body is a FORK — the tier deleted
+; `defbeat`, `defregistry` and `defbus` for exactly that, and refused
+; `defqueue`. A pipeline is a SLICE of a server: a prelude (wire the topology),
+; a slice of state (the handle), and a terminate (take the processes down with
+; it). The server keeps its own state and its own clauses; the pipeline is one
+; more clause beside them.
+;
+; ══ THE SHAPE: A CHAIN OF NODES, EACH A DISTRIBUTOR AND A COLLECTOR ════════
+;
+; Every node — the source, a stage, and both meters around a batcher — is built
+; the same way, out of `flow/distribute`:
+;
+;   … → [distributor → n workers] → collector → [next node] → …
+;
+;   · the DISTRIBUTOR is `flow/distribute`: each event reaches exactly ONE
+;     worker, chosen among live workers with demand, and the window it demands
+;     upstream is the SUM of its workers' demand. A worker that stops asking
+;     throttles the producer — that is the primitive's contract, not this
+;     file's promise.
+;   · a WORKER runs the stage's fn, then hands the RESULT to the collector and
+;     BLOCKS until the collector has passed it on. That block is the whole of
+;     end-to-end backpressure: a stage that cannot pass its output on cannot
+;     take more input, so the window closes all the way back to the source.
+;     `:on-lag :block` is that behaviour, NAMED — and it is the default.
+;   · the COLLECTOR is the node's OUTPUT face: a flow PRODUCER, so the next
+;     node subscribes to it exactly as it would to any producer, and one
+;     node's demand arithmetic never has to know how the previous one was made.
+;
+; `:on-lag :drop` is the other choice, and it does something: a result the
+; collector cannot pass on is DISCARDED and its worker released at once, so the
+; source runs ahead. The row shows the loss as `:dropped`, and as the gap
+; between `:in` and `:out`.
+;
+; ══ THE READ MODEL: ONE PUBLIC TABLE, ONE ROW PER NODE ═════════════════════
+;
+; A pane renders a pipeline WITHOUT asking it anything (FUP-101): the rows are
+; plain ETS in a table held by `proc.table`, so a reader cannot make the
+; pipeline wait, and the pipeline cannot make a reader wait. Every row carries
+; the pipeline's name, the node's name, kind and POSITION, its counters, the
+; policies in force, and the pids OF ITS WORKERS — because the pipeline is the
+; only place that knows which processes are its workers, and a process is the
+; thing a demo wants to see.
+;
+; NOTHING about a worker's LIVENESS is stored. That is a monitor's fact: the
+; pid is written once, when the worker first takes an event, and a reader looks
+; it up (`worker-vitals`) for `:alive`, `:state` and `:message_queue_len`. A
+; row that recorded "dead" would be a second, staler, answer to a question the
+; VM already answers.
+;
+; The counters are written by the node's OWN processes (`:ets.update_counter`
+; for the arithmetic), so a render path holding the rows cannot write even by
+; accident, and turning the pipeline off does not turn its facts off: the row
+; outlives the process that made it, like a schedule's does.
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/std/proc/flow.bl — the demand protocol, `distribute` and `batch`
+; priv/std/proc/server.bl — the expander, and the clause contract
+; priv/std/proc/sched.bl — the clause this one copies the SHAPE of
+
+(ns proc.pipeline
+  (:require [proc.server :refer [extend-clause!]]
+            [proc.flow :as flow]
+            [proc.table :as table]))
+
+;; ── the read model ──────────────────────────────────────────────────────
+;;
+;; ONE public table, as `proc.sched` has: the pane needs no registry of its own,
+;; and the table's lifetime is a KEEPER's, not the pipeline's — so killing the
+;; pipeline leaves the facts readable rather than taking them with it.
+
+(def TABLE :bl_pipeline)
+
+(def ROW-KEYS
+  "The row, in order. The order IS the layout: counters are addressed by
+   position, so a field may only be appended after `:workers`."
+  [:key :name :stage :pos :kind :in :out :in-flight :batches :high-water
+   :errors :dropped :lag :on-error :workers])
+
+(def POS-IN 6)
+(def POS-OUT 7)
+(def POS-IN-FLIGHT 8)
+(def POS-BATCHES 9)
+(def POS-HIGH-WATER 10)
+(def POS-ERRORS 11)
+(def POS-DROPPED 12)
+(def POS-WORKERS 15)
+
+(defn- ets [verb args] (erlang/apply :ets verb (to-list args)))
+
+(defn ensure-table!
+  "Make the read model exist, with an owner and an heir that outlive every
+   pipeline. Never creates the table itself — `proc.table` starts the process
+   that does, and that indirection is the whole guarantee."
+  []
+  (table/hold TABLE {:type :ordered_set :options [:public :named_table]}))
+
+(defn live?
+  "Whether the read model exists right now. Public for the same reason
+   `proc.table/live?` is: a test and a pane both want to ask."
+  []
+  (table/live? TABLE))
+
+(defn- bump!
+  "Add `n` to one counter of one row — ETS arithmetic, not a call. The pipeline
+   is never asked, so a render cannot make it wait and a worker never queues
+   behind a pane."
+  [key pos n]
+  (when (table/live? TABLE)
+    (ets :update_counter (list TABLE key (tuple pos n)))))
+
+(defn- set-el! [key pos v]
+  (when (table/live? TABLE)
+    (ets :update_element (list TABLE key (tuple pos v)))))
+
+(defn- nstr
+  "A name as the string the row is keyed by. A keyword, a symbol and a string
+   for the same word name ONE row rather than three."
+  [x]
+  (cond
+    (string? x) x
+    (keyword? x) (name x)
+    (symbol? x) (name x)
+    :else (str x)))
+
+(defn row-key [srv stage] (str (nstr srv) "/" (nstr stage)))
+
+(defn- put-row!
+  "The row a node is born with: its identity, its policies, and every counter
+   at zero. Written BEFORE the topology is wired, so a reader that looks while
+   the pipeline is still starting sees the declaration rather than nothing."
+  [spec node]
+  (ets :insert
+       (list TABLE
+             (tuple (row-key (:name spec) (:stage node))
+                    (:name spec) (:stage node) (:pos node) (:kind node)
+                    0 0 0 0 0 0 0
+                    (:lag spec) (:on-error spec)
+                    (to-list [])))))
+
+(defn- row-map [t]
+  (let [m (reduce (fn [acc i]
+                    (assoc acc (nth ROW-KEYS (dec i)) (erlang/element i t)))
+                  {}
+                  (range 1 (+ 1 (count ROW-KEYS))))]
+    (assoc m :workers (vec (to-list (:workers m))))))
+
+(defn pipeline-rows
+  "The whole read model: one row per node of every pipeline this VM has
+   declared. A READ, and only a read — it is built from the table, so a render
+   path cannot write, and the pipeline that made the rows does not have to be
+   alive to be read."
+  []
+  (if (table/live? TABLE)
+    (vec (map row-map (to-list (ets :tab2list (list TABLE)))))
+    []))
+
+(defn pipeline-of
+  "One pipeline's nodes, in declaration order."
+  [srv]
+  (vec (sort-by (fn [r] (:pos r))
+                (filter (fn [r] (= (:name r) (nstr srv))) (pipeline-rows)))))
+
+(defn pipeline-row
+  "One node's row, or nil when nothing by that name has ever been declared."
+  [srv stage]
+  (first (filter (fn [r] (= (:key r) (row-key srv stage))) (pipeline-rows))))
+
+(defn worker-vitals
+  "A worker's vital signs, READ from the VM: is it alive, what is it doing, how
+   much is waiting for it. This is a monitor's fact and it is read here rather
+   than written into the row — a row claiming `:dead` would be a second and
+   staler answer to a question `:erlang.is_process_alive` already answers."
+  [pid]
+  (if (and (some? pid) (erlang/is_process_alive pid))
+    (let [info (erlang/process_info pid (list :status :message_queue_len))]
+      {:alive true
+       :state (name (second (nth info 0)))
+       :message_queue_len (second (nth info 1))})
+    {:alive false :state "dead" :message_queue_len 0}))
+
+;; ── the collector: a node's output face ─────────────────────────────────
+;;
+;; A worker hands its result over with a CALL and is answered only once that
+;; result is on its way downstream. The call is the backpressure — and it is why
+;; the collector can hold the WHOLE of a node's outstanding work in one map
+;; (`:buf`), one entry per blocked worker, bounded by the node's concurrency.
+
+(defn collect-init [cfg]
+  {:cfg cfg
+   :sub nil            ; the downstream producer subscribed, if any
+   :want 0             ; the downstream demand, in EVENTS
+   :buf []             ; results held for want, each {:r <result> :from <caller>}
+   :inflight 0         ; events taken and not yet passed on
+   :high-water 0       ; the widest this node has ever been
+   :workers []         ; every pid that has taken an event, ONCE each
+   :done? false        ; upstream is exhausted
+   :finished? false})
+
+(defn- seen? [ws p] (some (fn [x] (= x p)) ws))
+
+(defn collect-enter
+  "A worker took work. Count it, count the process, and remember it: the pipeline
+   is the only place that knows which pids are its workers, and a reader looks
+   each one up rather than being told whether it is alive.
+
+   `w` is the WEIGHT of what was taken — events, for a stage; the events inside a
+   batch, for a batcher's outtake. `:in` is in those units while `:in-flight` is
+   in the node's own work items, so `:high-water` stays a statement about
+   CONCURRENCY whatever a node's units are."
+  [st pid w]
+  (let [cfg (:cfg st)
+        key (:key cfg)
+        ws (:workers st)
+        fresh? (not (seen? ws pid))
+        ws2 (if fresh? (conj ws pid) ws)
+        n (inc (:inflight st))
+        hw (max n (:high-water st))]
+    (when fresh? (set-el! key POS-WORKERS (to-list ws2)))
+    (when (:in? cfg) (bump! key POS-IN w))
+    (set-el! key POS-IN-FLIGHT n)
+    (when (> hw (:high-water st)) (set-el! key POS-HIGH-WATER hw))
+    (assoc st :workers ws2 :inflight n :high-water hw)))
+
+(defn collect-release
+  "Release `n` in-flight slots — a worker's result has been passed on (or
+   discarded), or the event was taken and will never be emitted."
+  [st n]
+  (let [k (max 0 (- (:inflight st) n))]
+    (set-el! (:key (:cfg st)) POS-IN-FLIGHT k)
+    (assoc st :inflight k)))
+
+(defn collect-finish
+  "Tell the downstream the stream is over, once upstream is exhausted and
+   nothing is left to pass on. After that the node has no work by definition,
+   and it stops: its facts are in the row, where a reader keeps finding them."
+  [st]
+  (if (and (:done? st) (some? (:sub st)) (empty? (:buf st)) (not (:finished? st)))
+    (do (erlang/send (:sub st) [:done])
+        (assoc st :finished? true))
+    st))
+
+(defn collect-flush
+  "Pass on what the downstream has asked for, oldest first.
+
+   The loop is not decoration: a stage fn may return NOTHING for an event (a
+   filter), and an entry that emits nothing still holds one worker's call and
+   must still be released. Its delivery does not consume demand, so the loop
+   keeps taking entries while there are entries and demand — and it always ends,
+   because every pass removes at least one entry."
+  [st]
+  (loop [st st]
+    (let [cfg (:cfg st)
+          key (:key cfg)
+          sub (:sub st)
+          buf (:buf st)
+          want (:want st)]
+      (if (or (nil? sub) (empty? buf) (< want 1))
+        (collect-finish st)
+        (let [k (min want (count buf))
+              taken (vec (take k buf))
+              left (vec (drop k buf))
+              ;; the RESULTS, not the entries that hold them: a worker's call
+              ;; record is the collector's bookkeeping, and what goes downstream
+              ;; is what the stage fn returned
+              outs (vec (map (fn [e] (:r e)) (filter (fn [e] (some? (:r e))) taken)))
+              n (count outs)
+              st2 (collect-release st k)]
+          (when (> n 0)
+            (erlang/send sub [:events outs])
+            (when (:out? cfg) (bump! key POS-OUT n))
+            (when (:batch? cfg) (bump! key POS-BATCHES n)))
+          ;; every entry released, whether it emitted or not — the worker's call
+          ;; is owed an answer either way
+          (vec (map (fn [e] (GenServer/reply (:from e) :ok)) taken))
+          (recur (assoc st2 :buf left :want (- want n))))))))
+
+(defn collect-result
+  "One worker's result.
+
+   `:block` (the default) holds the worker's call until the result is on its way
+   downstream — the backpressure, named. `:drop` answers at once and discards
+   what cannot go NOW, which is what lets a `:drop` pipeline's source run ahead
+   of its slowest stage instead of being held to it."
+  [st r from]
+  (let [cfg (:cfg st)]
+    (if (and (= :drop (:lag cfg)) (< (:want st) 1))
+      (do (bump! (:key cfg) POS-DROPPED 1)
+          (GenServer/reply from :dropped)
+          (collect-release st 1))
+      (collect-flush (assoc st :buf (conj (:buf st) {:r r :from from}))))))
+
+(defn collect-demand [st n] (collect-flush (assoc st :want (+ (:want st) n))))
+
+(defn collect-up-done [st] (collect-finish (assoc st :done? true)))
+
+(defn collect-lost
+  "A worker died holding `n` events. They are gone — its fn never returned — so
+   the slots are released and the loss is COUNTED, where a reader is already
+   looking. Its pid stays in the row: liveness is read, never stored."
+  [st n]
+  (bump! (:key (:cfg st)) POS-ERRORS n)
+  (collect-release st n))
+
+(defserver pipeline-collect
+  (init [cfg] (ok (collect-init cfg)))
+
+  (handle-info [:in pid w] [st]
+    (noreply (collect-enter st pid w)))
+
+  (handle-info [:abort] [st]
+    (noreply (collect-release st 1)))
+
+  (handle-info [:lost n] [st]
+    (noreply (collect-lost st n)))
+
+  (handle-info [:up-done] [st]
+    (let [st2 (collect-up-done st)]
+      (if (:finished? st2) (stop :normal st2) (noreply st2))))
+
+  (handle-info [:subscribe c] [st]
+    (let [st2 (collect-finish (assoc st :sub c))]
+      (if (:finished? st2) (stop :normal st2) (noreply st2))))
+
+  (handle-info [:demand n c] [st]
+    (let [st2 (collect-demand st n)]
+      (if (:finished? st2) (stop :normal st2) (noreply st2))))
+
+  (handle-info [:demand n] [st]
+    (let [st2 (collect-demand st n)]
+      (if (:finished? st2) (stop :normal st2) (noreply st2))))
+
+  (handle-info [:cancel] [st]
+    (stop :normal st))
+
+  (handle-call [:out r] [from st]
+    (let [st2 (collect-result st r from)]
+      (if (:finished? st2) (stop :normal st2) (noreply st2)))))
+
+;; ── a node: distributor, workers, collector ─────────────────────────────
+
+(defn- err-text [e]
+  (let [m (if (map? e) (get e :message) nil)]
+    (if (nil? m) (str e) (str m))))
+
+(defn- worker-fn
+  "What one worker of one node runs for each event it is handed.
+
+   The ORDER is the whole design: announce (so the node counts the event and
+   learns the pid), run the stage's fn, then hand the RESULT over and WAIT. A
+   worker that is waiting takes no new event, which is how the demand window
+   closes back to the source.
+
+   A fn that THROWS is where `:on-error` means something: `:requeue` puts the
+   event back on this node's queue (the distributor accepts events from
+   anywhere, and its window shrinks by what it now holds), while `:fail` lets
+   the worker die — the distributor reports it, the collector counts the loss,
+   and the pid stays in the row for a reader to find dead."
+  [cfg]
+  (fn [ev]
+    (erlang/send (:collect cfg) [:in (erlang/self) ((:weigh cfg) ev)])
+    (let [outcome (try {:ok ((:fn cfg) ev)} (catch e {:err (err-text e)}))]
+      (if (contains? outcome :err)
+        (do
+          (bump! (:key cfg) POS-ERRORS 1)
+          (erlang/send (:collect cfg) [:abort])
+          (if (= :requeue (:on-error cfg))
+            (do (erlang/send @(:dist cfg) [:events [ev]]) :requeued)
+            (throw (ex-info (str "pipeline " (:name cfg) "/" (name (:stage cfg))
+                                 ": " (:err outcome))
+                            {:stage (:stage cfg) :event ev :error (:err outcome)}))))
+        (call (:collect cfg) [:out (:ok outcome)] :infinity)))))
+
+(defn start-node
+  "One node: a distributor over `up`, its workers running `cfg`'s fn, and the
+   collector they hand to. Public because a verifier should be able to build ONE
+   node without a whole pipeline.
+
+   `:in` is the distributor — what downstream subscribes to; `:out` is the
+   collector — the producer downstream actually reads. Both are returned so a
+   stop can take the whole node down, and the atom holding the distributor is
+   how the requeue path reaches it (the fn is built before the distributor
+   exists)."
+  [up cfg0]
+  (let [dist* (atom nil)
+        cfg (assoc cfg0 :dist dist*)
+        collect (start pipeline-collect cfg {})
+        cfg2 (assoc cfg :collect collect)
+        dist (flow/distribute
+               up
+               (worker-fn cfg2)
+               {:concurrency (:concurrency cfg2) :batch 1
+                :on-down (fn [notice]
+                           (erlang/send collect [:lost (count (:lost notice))]))
+                :on-done (fn [] (erlang/send collect [:up-done]))})]
+    (reset! dist* dist)
+    {:in dist :out collect :pids [collect dist]}))
+
+;; ── the declaration, as data ────────────────────────────────────────────
+;;
+;; The clause's entries are SOURCE; the spec they produce is DATA the prelude
+;; evaluates. These four constructors are what the transform EMITS — one call
+;; per node, so the fn and the source form are arguments of a call rather than
+;; fragments spliced into a map literal, which is the difference between a
+;; declaration that reads and one that only looks like it does.
+
+(defn from-node [pos src]
+  {:kind :from :stage :source :pos pos :src src})
+
+(defn stage-node [pos stage f concurrency]
+  {:kind :stage :stage stage :pos pos :fn f :concurrency concurrency})
+
+(defn batch-node [pos stage n timeout]
+  {:kind :batch :stage stage :pos pos :n n :timeout timeout})
+
+(defn spec [srv lag on-error nodes]
+  {:name (nstr srv) :lag lag :on-error on-error :nodes (vec nodes)})
+
+;; ── wiring ──────────────────────────────────────────────────────────────
+
+(defn- source-producer
+  "The producer a `(from …)` names: a flow stream (a pid) as it is, a fn called
+   for the seq it yields, or any collection. A nil source is refused HERE rather
+   than becoming a pipeline that is wired and silent."
+  [src]
+  (cond
+    (nil? src)
+      (throw (ex-info (str "pipeline: (from …) evaluated to nothing — a source is"
+                           " a seq, a fn returning one, or a flow stream (a pid)")
+                      {}))
+    (erlang/is_pid src) src
+    (fn? src) (flow/from-seq (src))
+    :else (flow/from-seq src)))
+
+(defn- node-cfg
+  "A node's working config: where its row is, what it counts, what it runs.
+
+   A node built by `(batch …)` counts its `:in` in EVENTS while its work items are
+   BATCHES — `:weigh` is that difference, and it is why a batch's row can say
+   both `20 in` and `3 batches out` without two collectors fighting over one row."
+  [spec node]
+  (let [batch? (= :batch (:kind node))]
+    {:name (:name spec)
+     :stage (:stage node)
+     :key (row-key (:name spec) (:stage node))
+     :concurrency (if (some? (:concurrency node)) (:concurrency node) 1)
+     :fn (if (some? (:fn node)) (:fn node) identity)
+     :weigh (if batch? (fn [ev] (count ev)) (fn [_] 1))
+     :in? true :out? true :batch? batch?
+     :lag (:lag spec)
+     :on-error (:on-error spec)}))
+
+(defn- wire!
+  "Build the topology from the source DOWNSTREAM, so each node is handed the
+   face it subscribes to. Every node is built the same way — INCLUDING the
+   source, whose fn is `identity`: it is a node like any other, and the read
+   model wants its counters (how much the source was made to hand over) as much
+   as it wants a stage's."
+  [spec]
+  (let [nodes (:nodes spec)]
+    (loop [rest (vec nodes)
+           up (source-producer (:src (first nodes)))
+           pids []
+           dists []]
+      (if (empty? rest)
+        {:up up :pids pids :dists dists}
+        (let [node (first rest)]
+          (if (= :batch (:kind node))
+            ;; a batcher, and ONE node over it — the node is what counts, and the
+            ;; WEIGHT of what it takes is the events inside each batch it is
+            ;; handed. The batcher coalesces; the node reports.
+            (let [batcher (flow/batch up (:n node) (:timeout node))
+                  nout (start-node batcher (node-cfg spec node))]
+              (recur (vec (drop 1 rest))
+                     (:out nout)
+                     (vec (concat pids [batcher] (:pids nout)))
+                     (vec (conj dists (:in nout)))))
+            (let [nd (start-node up (node-cfg spec node))]
+              (recur (vec (drop 1 rest))
+                     (:out nd)
+                     (vec (concat pids (:pids nd)))
+                     (vec (conj dists (:in nd)))))))))))
+
+(def ^:private topologies
+  "Pipeline name → the topology its prelude armed. An atom, for the same reason
+   `proc.queue` keeps one: the PRELUDE runs before the server's state exists,
+   and the init is where the handle has to arrive."
+  (atom {}))
+
+(defn- check-fns!
+  "Refuse a stage whose fn is not one, BEFORE a single process is spawned.
+
+   A string is what `sched` takes for a body (a `namespace/verb` name), and this
+   clause deliberately does not: the fn here is an EXPRESSION, evaluated when the
+   line is armed. A string would be a stage that fails one event at a time
+   instead of a declaration refused once — and by then the line is running."
+  [spec]
+  (doseq [node (:nodes spec)]
+    (when (and (= :stage (:kind node)) (not (fn? (:fn node))))
+      (throw (ex-info (str "pipeline " (:name spec) "/" (nstr (:stage node))
+                           ": a stage's fn must be a FUNCTION — write the fn"
+                           " itself (desk/cook) or a (fn [ev] …)")
+                      {:stage (:stage node) :fn (:fn node)})))))
+
+(defn arm-first
+  "The prelude: publish a row per node, wire the topology, and leave the handle
+   where the init finds it.
+
+   The rows exist BEFORE the first event, so a declared node and a known node
+   are the same set and a pane that looks during startup sees the declaration
+   rather than an empty table. The sink is a plain consumer on the last node's output face: a
+   pipeline nobody drains produces nothing, which is the demand protocol's own
+   rule and not a choice this file makes."
+  [spec]
+  (check-fns! spec)
+  (ensure-table!)
+  (doseq [node (:nodes spec)] (put-row! spec node))
+  (let [wired (wire! spec)
+        sink (spawn (fn [] (flow/run-each (:up wired) (fn [_] nil) 8)))
+        topo {:name (:name spec) :spec spec :up (:up wired)
+              :dists (:dists wired) :pids (conj (:pids wired) sink)}]
+    (swap! topologies assoc (:name spec) topo)
+    topo))
+
+(defn init-state
+  "The state slice the clause contributes: the handle. The topology itself is in
+   the ATOM, because a prelude has no way to hand a value to an init."
+  [srv]
+  (let [nm (nstr srv)
+        topo (get @topologies nm)]
+    (when (nil? topo)
+      (throw (ex-info (str "pipeline " nm ": the topology was not armed in the"
+                           " prelude, so there is nothing to hold")
+                      {:pipeline nm})))
+    {:pipeline topo}))
+
+(defn- workers-of
+  "A distributor's live workers, asked with a bounded wait: a teardown must not
+   block on a process that may already be gone."
+  [d]
+  (if (and (some? d) (erlang/is_process_alive d))
+    (do (erlang/send d [:workers (erlang/self)])
+        (receive
+          [:workers ws] (vec (to-list ws))
+          (after 200 [])))
+    []))
+
+(defn stop-topology
+  "Take the whole topology down with the server that declared it.
+
+   The workers are asked of their distributors rather than read from the row —
+   the row keeps every pid that ever worked, and a dead pid is not worth
+   killing. The ROWS stay: they are facts about what ran, and a fact does not
+   become false when the process stops."
+  [topo]
+  (when (some? topo)
+    (doseq [d (:dists topo)]
+      (doseq [w (workers-of d)]
+        (when (erlang/is_process_alive w) (erlang/exit w :kill))))
+    (doseq [p (:pids topo)]
+      (when (and (some? p) (erlang/is_process_alive p)) (erlang/exit p :kill)))
+    (swap! topologies dissoc (:name topo))
+    :ok))
+
+;; ── parsing the clause ──────────────────────────────────────────────────
+;;
+;;   (pipeline (from SRC) (stage :name FN opts?) (batch :name N opts?)
+;;             (on-lag …) (on-error …))
+;;
+;; Validated when the server form is EXPANDED — the same place `sched` refuses a
+;; malformed entry, and for the same reason: a declaration error must name the
+;; line it is on, not surface as a pipeline that quietly never runs.
+
+(def ACCEPTED
+  "The whole vocabulary, in the order a reader wants it. An unknown entry is
+   refused against THIS list, so a typo answers 'did you mean one of these?'"
+  ["(from SRC)" "(stage :name FN opts?)" "(batch :name N opts?)"
+   "(on-lag :block|:drop)" "(on-error :requeue|:fail)"])
+
+(def KNOWN-LAG [:block :drop])
+
+(def KNOWN-ON-ERROR [:requeue :fail])
+
+(def KNOWN-STAGE-OPTS [:concurrency])
+
+(def KNOWN-BATCH-OPTS [:timeout])
+
+(def DEFAULT-BATCH-TIMEOUT
+  "Milliseconds a short batch waits before it is emitted anyway. A default is not
+   optional here: a stream that STAYS OPEN would otherwise hold a partial batch
+   forever, because only the count trigger or the end of the stream could ever
+   release it."
+  1000)
+
+(defn- known? [k ks] (some (fn [x] (= x k)) ks))
+
+(defn- refuse! [where entry why]
+  (throw (ex-info (str where ": " why " — accepted here: " (join " " ACCEPTED))
+                  {:entry entry})))
+
+(defn- listed
+  "The known names, as a reader would write them. `pr-str`, not `str`: this
+   runtime's `str` renders a keyword WITHOUT its colon (`concurrency`), and a
+   message that lists a vocabulary has to spell it the way the declaration does."
+  [ks]
+  (join " " (map (fn [x] (pr-str x)) ks)))
+
+(defn- check-options! [where entry opts known]
+  (when-not (map? opts)
+    (refuse! where entry (str "the options must be a LITERAL map — got " (pr-str opts))))
+  (doseq [k (keys opts)]
+    (when-not (known? k known)
+      (refuse! where entry (str "unknown option " (pr-str k) " — known: " (listed known)))))
+  opts)
+
+(defn- positive-int [where entry v what]
+  (when-not (and (erlang/is_integer v) (> v 0))
+    (refuse! where entry (str what " — got " (pr-str v))))
+  v)
+
+(defn- parse-entry [where e]
+  (when-not (and (seq e) (symbol? (first e)))
+    (refuse! where e (str "an entry must be a form like " (first ACCEPTED))))
+  (let [head (name (first e))
+        parts (vec e)]
+    (cond
+      (= head "from")
+        (do (when (not= 2 (count parts))
+              (refuse! where e "a source is (from SRC) — ONE form that yields the events"))
+            {:kind :from :stage :source :src (second parts)})
+
+      (= head "stage")
+        (do (when (< (count parts) 3)
+              (refuse! where e "a stage is (stage :name FN opts?) — a name and the fn it runs"))
+            (when (> (count parts) 4)
+              (refuse! where e "a stage is (stage :name FN opts?) — a name, a fn and an option map, and nothing else"))
+            (let [nm (nth parts 1)
+                  f (nth parts 2)
+                  opts (if (= 4 (count parts)) (nth parts 3) {})]
+              (when-not (keyword? nm)
+                (refuse! where e (str "a stage's name must be a keyword — got " (pr-str nm))))
+              (when (= :source nm)
+                (refuse! where e ":source names the pipeline's own source row — pick another stage name"))
+              (check-options! where e opts KNOWN-STAGE-OPTS)
+              {:kind :stage :stage nm :fn f
+               :concurrency (positive-int where e (get opts :concurrency 1)
+                                          ":concurrency is how many workers run this stage at once and must be a positive integer")}))
+
+      (= head "batch")
+        (do (when (< (count parts) 3)
+              (refuse! where e "a batch is (batch :name N opts?) — a name and a count"))
+            (when (> (count parts) 4)
+              (refuse! where e "a batch is (batch :name N opts?) — a name, a count and an option map, and nothing else"))
+            (let [nm (nth parts 1)
+                  n (nth parts 2)
+                  opts (if (= 4 (count parts)) (nth parts 3) {})]
+              (when-not (keyword? nm)
+                (refuse! where e (str "a batch's name must be a keyword — got " (pr-str nm))))
+              (check-options! where e opts KNOWN-BATCH-OPTS)
+              {:kind :batch :stage nm
+               :n (positive-int where e n ":batch N is the events that fill one batch and must be a positive integer")
+               :timeout (positive-int where e (get opts :timeout DEFAULT-BATCH-TIMEOUT)
+                                      ":timeout is milliseconds a short batch waits and must be a positive integer")}))
+
+      (= head "on-lag")
+        (do (when (not= 2 (count parts))
+              (refuse! where e "the lag policy is (on-lag :block) or (on-lag :drop)"))
+            (let [v (second parts)]
+              (when-not (known? v KNOWN-LAG)
+                (refuse! where e (str "unknown lag policy " (pr-str v) " — use " (listed KNOWN-LAG))))
+              {:kind :on-lag :value v}))
+
+      (= head "on-error")
+        (do (when (not= 2 (count parts))
+              (refuse! where e "the error policy is (on-error :requeue) or (on-error :fail)"))
+            (let [v (second parts)]
+              (when-not (known? v KNOWN-ON-ERROR)
+                (refuse! where e (str "unknown error policy " (pr-str v) " — use " (listed KNOWN-ON-ERROR))))
+              {:kind :on-error :value v}))
+
+      :else
+        (refuse! where e (str "unknown entry " (pr-str e))))))
+
+(defn- policy-of [parsed kind default]
+  (let [p (first (filter (fn [x] (= kind (:kind x))) parsed))]
+    (if (nil? p) default (:value p))))
+
+(defn- once!
+  "Refuse a clause that may appear at most once, naming the SECOND one — the one
+   a reader would have to notice."
+  [where parsed kind why]
+  (let [hits (vec (filter (fn [p] (= kind (:kind p))) parsed))]
+    (when (> (count hits) 1)
+      (refuse! where (:form (second hits)) why))))
+
+(defn pipeline-spec
+  "The declaration as data, with the topology's order and the policies filled
+   in — and every way of getting it wrong refused BY NAME."
+  [where entries]
+  (when (empty? entries)
+    (refuse! where nil (str "a pipeline needs a source and at least one stage: "
+                            (first ACCEPTED) " …")))
+  ;; `:form` rides along on each parsed entry — never emitted, only used to name
+  ;; the offending entry in a refusal, because "the second (from …)" is only
+  ;; useful if the message can point at it.
+  (let [parsed (vec (map (fn [e] (assoc (parse-entry where e) :form e)) entries))]
+    (when-not (= :from (:kind (first parsed)))
+      (refuse! where (:form (first parsed))
+               "a pipeline starts with its source: (from SRC) must be the FIRST entry"))
+    (once! where parsed :from "a pipeline takes exactly ONE (from SRC)")
+    (once! where parsed :on-lag
+           "the lag policy is stated once — two (on-lag …) entries leave which one is in force to the reader")
+    (once! where parsed :on-error
+           "the error policy is stated once — two (on-error …) entries leave which one is in force to the reader")
+    (let [nodes (vec (remove (fn [p] (or (= :on-lag (:kind p)) (= :on-error (:kind p))))
+                             parsed))
+          shapes (vec (filter (fn [p] (not= :from (:kind p))) nodes))
+          names (vec (map (fn [p] (:stage p)) nodes))
+          dup (first (filter (fn [k] (> (count (filter (fn [x] (= x k)) names)) 1)) names))]
+      (when (empty? shapes)
+        (refuse! where (first entries) "a pipeline needs at least one (stage …) after its source"))
+      (when (some? dup)
+        (refuse! where dup (str "two nodes named " (pr-str dup)
+                                " — the read model keys one row per name")))
+      (let [batches (vec (filter (fn [p] (= :batch (:kind p))) nodes))]
+        (when (> (count batches) 1)
+          (refuse! where (:form (second batches))
+                   (str "a pipeline takes at most ONE (batch …) — the second is "
+                        (pr-str (:stage (second batches)))
+                        ", and a second coalescer is a pipeline of its own"))))
+      {:lag (policy-of parsed :on-lag :block)
+       :on-error (policy-of parsed :on-error :fail)
+       :nodes (vec (map (fn [i] (assoc (nth nodes i) :pos (inc i)))
+                        (range (count nodes))))})))
+
+(defn- node-form [node]
+  (cond
+    (= :from (:kind node)) `(proc.pipeline/from-node ~(:pos node) ~(:src node))
+    (= :stage (:kind node)) `(proc.pipeline/stage-node ~(:pos node) ~(:stage node)
+                                                      ~(:fn node) ~(:concurrency node))
+    :else `(proc.pipeline/batch-node ~(:pos node) ~(:stage node)
+                                     ~(:n node) ~(:timeout node))))
+
+(defn pipeline-clause
+  "The `(pipeline …)` transform. Public because it is worth testing on its own:
+   it is the unit that turns a declaration into a topology."
+  [clause ctx]
+  (let [where (str "defserver " (:name ctx))
+        parsed (pipeline-spec where (vec (rest clause)))
+        spec-form `(proc.pipeline/spec '~(:name ctx) ~(:lag parsed) ~(:on-error parsed)
+                                       [~@(vec (map node-form (:nodes parsed)))])]
+    {:prelude [`(proc.pipeline/arm-first ~spec-form)]
+     ;; the init names the pipeline rather than repeating the spec: the source
+     ;; expression is the AUTHOR's, and a declaration evaluated twice is a
+     ;; declaration that can disagree with itself.
+     :init `(proc.pipeline/init-state '~(:name ctx))
+     ;; Injected clauses go in BEFORE the server's own, so this terminate wins
+     ;; over one the author wrote — the same trade `(bus …)` makes. The way out
+     ;; is the one `:down` already has: boot merges callback clauses that must
+     ;; compose, and `terminate` does not yet.
+     :clauses [`(terminate [_reason st] (proc.pipeline/stop-topology (:pipeline st)))]}))
+
+(extend-clause! :pipeline pipeline-clause)

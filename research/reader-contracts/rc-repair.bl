@@ -1,0 +1,322 @@
+; research/reader-contracts/rc-repair.bl
+; ══════════════════════════════════════════════════════════════════════════
+; GOAL #1, second half: "easily solving these when auto-resolving is ambiguous".
+;
+; The analysis run BACKWARDS. Instead of asking "is this balanced?", ask "what
+; edit would balance it?" — and then CHECK each answer by re-reading the text it
+; produces. Ranking is by EDIT COUNT (a measurement, not a taste); the forward
+; check is what turns a guess into an answer:
+;
+;   (when x [1 2)   replace ) with ]   -> (when x [1 2]    -> still unterminated
+;                   insert ] before )  -> (when x [1 2])   -> reads cleanly
+;
+; Two candidates, one edit each; only one yields a text that parses, so the tie
+; COLLAPSES. This is research/p21_repair's move — abduce the candidate, then
+; verify it forward — one layer down, at the syntax instead of the state machine.
+;
+; Where the tie does NOT collapse the tool must not guess. `(a b))` has two
+; one-edit repairs that both read cleanly (delete the stray `)`, or insert the
+; `(` that was never typed); `ambiguous?` says so, the message asks, and `choose`
+; still picks one but NAMES the policy and hands back the alternatives — so a
+; harness can tell a model "I guessed, and here is what else it could have been"
+; instead of passing a guess off as a fact.
+; ══════════════════════════════════════════════════════════════════════════
+
+(ns rc-repair
+  (:require [rc-reader :as rdr]))
+
+; ── source metrics: char offsets, computed once ──────────────────────────────
+
+(defn- line-start*
+  "The char offset at which line `target` begins."
+  [cs cur target off]
+  (cond
+    (= cur target) off
+    (empty? cs) off
+    (= (first cs) 10) (recur (rest cs) (inc cur) target (inc off))
+    :else (recur (rest cs) cur target (inc off))))
+
+(defn line-start [src n]
+  (line-start* (String/to_charlist src) 1 n 0))
+
+(defn- line-end*
+  "The char offset just past the last character of line `target` (exclusive of
+   its newline) — where a human would have typed the missing closer."
+  [cs cur target off]
+  (cond
+    (empty? cs) off
+    (= cur target) (if (= (first cs) 10) off (recur (rest cs) cur target (inc off)))
+    (= (first cs) 10) (recur (rest cs) (inc cur) target (inc off))
+    :else (recur (rest cs) cur target (inc off))))
+
+(defn line-end [src n]
+  (line-end* (String/to_charlist src) 1 n 0))
+
+(defn- char-at [src off] (String/slice src off 1))
+
+(defn- open-for-kind [kind] (cond (= kind :list) "(" (= kind :vector) "[" :else "{"))
+
+(defn- close-chars [stack acc]
+  (if (empty? stack)
+    (reverse acc)
+    (let [kind (first (first stack))
+          c (cond (= kind :list) 41 (= kind :vector) 93 :else 125)]
+      (recur (rest stack) (cons c acc)))))
+
+(defn- closers-of
+  "The missing closers for a stack, innermost first — every one of them, because
+   a source that ran out mid-nesting needs all of them, not just the last."
+  [stack]
+  (unicode/characters_to_binary (close-chars stack (list))))
+
+(defn- blank-chars? [cs]
+  (cond
+    (empty? cs) true
+    (or (= (first cs) 32) (= (first cs) 9) (= (first cs) 10) (= (first cs) 13)) (recur (rest cs))
+    :else false))
+
+(defn- blank? [s] (blank-chars? (String/to_charlist s)))
+
+; ── candidates ───────────────────────────────────────────────────────────────
+
+(defn- base-candidates [diag src]
+  (let [kind (get diag :kind)
+        sp (get diag :span)
+        off (get sp :offset)
+        col (get sp :col)
+        line (get sp :line)]
+    (cond
+      (= kind :unexpected-close)
+        (let [c (char-at src off)]
+          (list {:kind :delete-close :edits 1 :offset off :remove 1 :insert ""
+                 :why (str "delete the stray " c " at " line ":" col)}
+                {:kind :insert-open-at-line-start :edits 1
+                 :offset (line-start src line) :remove 0 :insert "("
+                 :why (str "the " c " at " line ":" col
+                           " closes a form that was never opened — insert ( at the start of line " line)}))
+
+      (= kind :mismatch)
+        (let [c (char-at src off)
+              expect (get diag :expected)
+              open-sp (get diag :opened-span)
+              open-loc (str (get open-sp :line) ":" (get open-sp :col))]
+          (list {:kind :replace-close :edits 1 :offset off :remove 1 :insert expect
+                 :why (str "replace " c " with " expect " — it reads as a mistyped " expect)}
+                {:kind :insert-close-before :edits 1 :offset off :remove 0 :insert expect
+                 :why (str "insert " expect " before the " c " — the " (get diag :opened)
+                           " at " open-loc " is missing its closer, and then the " c
+                           " closes an outer form")}
+                {:kind :delete-close :edits 2 :offset off :remove 1 :insert ""
+                 :why (str "delete the " c " — the opener stays unclosed, so this only "
+                           "helps if a closer follows")}))
+
+      (= kind :unterminated)
+        (let [stack (get diag :unclosed)
+              closers (closers-of stack)
+              top (first stack)
+              open-pos (second top)
+              open-line (rdr/pos-line open-pos)
+              eof (get (get diag :eof-span) :offset)
+              boundary (line-end src open-line)
+              tail (String/slice src boundary (- eof boundary))]
+          (concat
+            (list {:kind :insert-closers-at-eof :edits 1 :offset eof :remove 0 :insert closers
+                   :why (str "add " closers " at the end of the file")})
+            (if (and (< boundary eof) (not (blank? tail)))
+              (list {:kind :insert-closers-at-boundary :edits 1 :offset boundary :remove 0 :insert closers
+                     :why (str "add " closers " at the end of line " open-line
+                               " — there is more source after it, so the closer probably belongs "
+                               "there, not at EOF (the two give different programs)")})
+              (list))
+            (list {:kind :delete-open :edits 2 :offset (rdr/pos-off open-pos) :remove 1 :insert ""
+                   :why (str "delete the " (open-for-kind (first top)) " at "
+                             open-line ":" (rdr/pos-col open-pos) " — it opens nothing")})))
+
+      (= kind :unterminated-string)
+        (list {:kind :insert-quote-at-line-end :edits 1 :offset (line-end src line) :remove 0 :insert "\""
+               :why (str "close the string at the end of line " line)}
+              {:kind :insert-quote-at-eof :edits 1 :offset (String/length src) :remove 0 :insert "\""
+               :why "close the string at the end of the file"})
+
+      :else (list))))
+
+; ── the forward check ────────────────────────────────────────────────────────
+
+(defn apply-fix
+  "Insert `:insert` at `:offset`, removing `:remove` chars first."
+  [src cand]
+  (let [off (get cand :offset)
+        rm (get cand :remove)]
+    (str (String/slice src 0 off)
+         (get cand :insert)
+         (String/slice src (+ off rm) (- (String/length src) (+ off rm))))))
+
+(defn solves?
+  "Does this candidate leave a text that reads cleanly? A candidate that does not
+   is not a repair, so it cannot even be offered."
+  [src cand opts]
+  (empty? (second (rdr/read (apply-fix src cand) opts))))
+
+(defn rank [cands] (sort-by (fn [c] (get c :edits)) cands))
+
+(defn viable [cands] (filter (fn [c] (get c :viable)) cands))
+
+(defn candidates
+  "Every structurally valid repair, cheapest first, each marked :viable by the
+   forward check."
+  [diag src opts]
+  (rank (map (fn [c] (assoc c :viable (solves? src c opts)))
+             (base-candidates diag src))))
+
+(defn ambiguous?
+  "True when MORE THAN ONE viable repair is equally cheap. A candidate that does
+   not read cleanly is not a repair, so it cannot create ambiguity; only two real
+   repairs that differ in MEANING do."
+  [cands]
+  (let [vs (viable (rank cands))]
+    (if (empty? vs)
+      false
+      (> (count (filter (fn [c] (= (get c :edits) (get (first vs) :edits))) vs)) 1))))
+
+(def ^:private policy
+  (list :replace-close :insert-close-before :delete-close
+        :insert-closers-at-boundary :insert-closers-at-eof
+        :insert-open-at-line-start :insert-quote-at-line-end :insert-quote-at-eof
+        :delete-open))
+
+(defn- index-of [x xs]
+  (cond
+    (empty? xs) nil
+    (= x (first xs)) 0
+    :else (let [r (index-of x (rest xs))] (if (nil? r) nil (inc r)))))
+
+(defn- policy-index [kind]
+  (let [i (index-of kind policy)]
+    (if (nil? i) 99 i)))
+
+(defn choose
+  "Pick one, and say which policy picked it: the result names the policy and
+   returns the alternatives, so a caller can pass the guess on AS a guess."
+  [cands]
+  (let [ranked (rank cands)
+        vs (viable ranked)
+        pool (if (empty? vs) ranked vs)
+        sorted (sort-by (fn [c] (list (get c :edits) (policy-index (get c :kind)))) pool)
+        best (first sorted)]
+    {:chosen best
+     :policy :cheapest-then-declared-preference
+     :ambiguous (ambiguous? cands)
+     :solved (get best :viable)
+     :others (filter (fn [c] (not= c best)) ranked)}))
+
+(defn fix-all
+  "Apply repairs until the source reads cleanly, or until nothing helps.
+
+   One pass is not always enough, and pretending otherwise would be a lie: a
+   source with an unterminated string AND two unclosed openers has no single edit
+   that clears it, and closing the string reveals the next diagnostic. This loop
+   is the shape a harness wants — fix, re-read, fix — and it terminates because
+   every candidate was verified forward before it was offered."
+  ([src opts] (fix-all src opts 8 (list)))
+  ([src opts left kinds]
+   (let [r (rdr/read src opts)]
+     (cond
+       (empty? (second r)) {:src src :ok true :kinds (reverse kinds)}
+       (= 0 left) {:src src :ok false :kinds (reverse kinds)}
+       :else
+         (let [cs (candidates (first (second r)) src opts)]
+           (if (empty? cs)
+             {:src src :ok false :kinds (reverse kinds)}
+             (let [c (get (choose cs) :chosen)]
+               (recur (apply-fix src c) opts (- left 1) (cons (get c :kind) kinds)))))))))
+
+; ── the message ──────────────────────────────────────────────────────────────
+
+(defn- spaces [n] (if (<= n 0) "" (str " " (spaces (- n 1)))))
+
+(defn- line-text [src n]
+  (let [parts (String/split src "\n")]
+    (if (> (count parts) (- n 1)) (nth parts (- n 1)) "")))
+
+(defn window
+  "Keep the caret visible on a long line by eliding the side that is off-screen.
+   The mistake is usually at the END of a long line — priv/lib/web.bl:479 is 80
+   columns — so truncating the tail would hide exactly the character in
+   question."
+  [text col width]
+  (let [cs (String/to_charlist text)
+        n (count cs)]
+    (if (<= n width)
+      (list (unicode/characters_to_binary cs) col)
+      (let [half (erlang/div width 2)
+            start (max 0 (min (- col half) (- n width)))
+            slice (lists/sublist cs (+ start 1) width)
+            pre (if (> start 0) (list 8230) (list))
+            post (if (< (+ start width) n) (list 8230) (list))
+            shown (lists/append (lists/append pre slice) post)]
+        (list (unicode/characters_to_binary shown)
+              (max 1 (+ (- col start) (count pre))))))))
+
+(defn snippet
+  "Two lines: `NNN | source`, `    | caret`."
+  [src sp width]
+  (let [line (get sp :line)
+        col (get sp :col)
+        w (window (line-text src line) col width)
+        shown (first w)
+        c (second w)
+        gut (+ 1 (String/length (str line)))]
+    (str (spaces gut) line " | " shown "\n"
+         (spaces gut) "  | " (spaces (- c 1)) "^")))
+
+(defn- indent [text]
+  (join "\n" (map (fn [l] (str "  " l)) (String/split text "\n"))))
+
+(defn- help [diag src]
+  (let [cs (candidates diag src {:file (get (get diag :span) :file)})
+        vs (viable (rank cs))]
+    (cond
+      (empty? cs) ""
+      (ambiguous? cs)
+        (str "\n  help: " (count vs) " different repairs each balance the file"
+             " — which did you mean?\n"
+             (join "\n"
+                   (map (fn [c]
+                          (str "    " (get c :edits) " edit"
+                               (if (= 1 (get c :edits)) "" "s")
+                               (if (get c :viable) " (clears the file)" " (still broken)")
+                               " — " (get c :why)))
+                        (rank cs)))
+             "\n")
+      (empty? vs)
+        (str "\n  help: " (get (first (rank cs)) :why)
+             " — a PARTIAL repair: this source has more than one defect, and the fix loop\n"
+             "        resolves them in turn (each candidate is verified before it is offered).\n")
+      :else (str "\n  help: " (get (first vs) :why) "\n"))))
+
+(defn render
+  "A diagnostic as prose a person can act on: the position, the offending line
+   with a caret, the opener's own snippet when it is elsewhere, and the repairs
+   that exist — ranked, verified, and honest about a tie."
+  [diag src]
+  (let [sp (get diag :span)
+        open-sp (get diag :opened-span)
+        note (if (and (not (nil? open-sp)) (not= (get open-sp :offset) (get sp :offset)))
+               (str "\n  note: the " (get diag :opened) " opened here is never closed:\n"
+                    (indent (snippet src open-sp 76)))
+               "")
+        also (if (and (= :unterminated (get diag :kind)) (> (count (get diag :unclosed)) 1))
+               (str "\n"
+                    (join "\n"
+                          (map (fn [e]
+                                 (let [p (second e)
+                                       k (first e)]
+                                   (str "  note: also unclosed: " (open-for-kind k)
+                                        " at " (get sp :file) ":" (rdr/pos-line p)
+                                        ":" (rdr/pos-col p))))
+                               (rest (get diag :unclosed)))))
+               "")]
+    (str (rdr/diag-line diag) "\n"
+         (snippet src sp 76) "\n"
+         note also
+         (help diag src))))

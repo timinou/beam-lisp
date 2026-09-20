@@ -1,0 +1,173 @@
+; examples/tooling/pipeline.bl — the kitchen line: one declaration, and the row
+; that says what it is doing.
+; Run: bl -p priv/std examples examples/tooling/pipeline.bl
+;
+; `proc/defserver` with a `(pipeline …)` clause is the whole of it. The
+; declaration IS the topology: a source, a stage that checks each order, a
+; batcher that gathers eight orders into a pan, a stage that cooks a pan on two
+; burners, and a stage that plates it. The clauses beside it (`on-lag`,
+; `on-error`) name the two policies a live line cannot leave unsaid.
+;
+; What to watch for:
+;
+;   · a stage's `:concurrency` is its number of WORKERS, and the pipeline is the
+;     only place that knows their pids — so the pids are IN the row, and a
+;     reader looks each one up rather than being told whether it is alive;
+;   · `(batch :pan 8 …)` emits BATCHES downstream: the cook sees a pan, not an
+;     order. The batch's own row counts events IN and batches OUT, because a
+;     coalescer is exactly the place where those two numbers differ;
+;   · the row is a FACT, not a call. Reading it needs nothing running, which is
+;     what lets a dashboard survive the thing it reports on. (FUP-101)
+;
+; docs/the-process-pattern-language.md is the tier's document;
+; priv/std/proc/flow.bl is the demand protocol underneath.
+
+(ns tooling.pipeline
+  (:require [proc :as proc]
+            [proc.pipeline :as pipeline]))
+
+(defn check! [truth message data]
+  (when-not truth
+    (throw (ex-info message data))))
+
+(defn- say [label v] (println (str "   " label " → " (Kernel/inspect v))))
+
+(defn- await
+  "Poll `pred` every 10 ms until it holds (or a few seconds pass, which for a
+   line of twenty orders means something is wrong)."
+  [pred ms]
+  (loop [left ms]
+    (cond
+      (pred) true
+      (<= left 0) false
+      :else (do (Process/sleep 10) (recur (- left 10))))))
+
+(defn- cell [stage k] (get (pipeline/pipeline-row :kitchen stage) k))
+
+(defn- wait-for
+  "Block until `flag` is set, or `ms` runs out. A LATCH: it is how this example
+   holds a worker open long enough to look at it, instead of racing a sleep
+   against a machine that is doing other things."
+  [flag ms]
+  (loop [left ms]
+    (cond
+      (deref flag) true
+      (<= left 0) false
+      :else (do (Process/sleep 5) (recur (- left 5))))))
+
+;; ── the line, and the three things it remembers ────────────────────────
+
+(def checked (atom []))   ; what the check desk saw, in order
+(def pans (atom []))      ; the pans the batcher made
+(def plated (atom []))    ; how many orders were on each plated pan
+(def cooked (atom false)) ; the latch: a pan is on the stove until this is set
+
+(defn- menu [] (range 1 21))
+
+(proc/defserver kitchen
+  (pipeline
+    (from (menu))                                        ; the orders
+    (stage :check (fn [n] (swap! checked conj n) n) {:concurrency 2})
+    (batch :pan 8 {:timeout 250})                        ; 8 orders, or 250 ms
+    ;; cooking takes a moment, and that moment is what makes the workers
+    ;; OBSERVABLE: a stage that finishes in microseconds is a stage whose pids
+    ;; are gone before a pane could ever look one up. The latch is the moment;
+    ;; `(Process/sleep 100)` would be the same idea with a race in it.
+    (stage :cook (fn [pan]
+                   (swap! pans conj (vec pan))
+                   (wait-for cooked 5000)
+                   pan)
+           {:concurrency 2})
+    (stage :plate (fn [pan] (swap! plated conj (count pan)) (count pan)))
+    (on-lag :block)                                      ; hold the source back
+    (on-error :requeue)))                                ; put a failed order back
+
+;; ── 1. the line runs, and the row says who is working ──────────────────
+;;
+;; The workers are read WHILE they are working. After the line drains they are
+;; gone — a `flow/distribute` worker exits when the stream ends — so this is the
+;; only moment at which "the pid in the row is a live process" is a fact worth
+;; checking.
+
+(println "== 1. the line runs ==")
+(let [s (start kitchen nil {})]
+  ;; The first pan is the moment to look: the worker that took it is INSIDE the
+  ;; cook's fn, so its pid is in the row AND it is alive. (A worker that has
+  ;; finished the stream exits; its pid stays in the row, and what the VM says
+  ;; about it then is a READ — section 2 shows that side.)
+  (check! (await (fn [] (= 2 (count (get (pipeline/pipeline-row :kitchen :cook) :workers))))
+                 5000)
+          "both of the cook's workers must take a pan, and the row must know their pids"
+          {})
+  (let [ws (vec (get (pipeline/pipeline-row :kitchen :cook) :workers))]
+    (say "the cook's workers, pans on the stove" ws)
+    (say "…and one of them, looked up" (pipeline/worker-vitals (first ws)))
+    (check! (every? (fn [p] (:alive (pipeline/worker-vitals p))) ws)
+            "each pid in the row is a live process a reader can look up"
+            {:workers ws})
+    (check! (= 2 (cell :cook :high-water))
+            "…and both burners were busy at once, which is what :concurrency 2 means"
+            {:high-water (cell :cook :high-water)}))
+  (reset! cooked true)
+  (check! (await (fn [] (= 3 (cell :plate :out))) 5000)
+          "the line must drain twenty orders in three pans"
+          {:plated @plated})
+  (say "orders checked" (count @checked))
+  (say "pans made" @pans)
+  (say "orders per plated pan" @plated)
+  (stop s))
+
+;; ── 2. the row is a fact, not a call ───────────────────────────────────
+;;
+;; The line is STOPPED before any of this is read: nothing is asked, because a
+;; row is a fact. What the row cannot tell you — whether a pid is alive — is a
+;; READ too, and it now says what everyone would expect.
+
+(println)
+(println "== 2. the row, read with nothing running ==")
+(Process/sleep 80)
+
+(defn- row-line [r]
+  (str "   " (get r :stage) " (pos " (get r :pos) ", " (get r :kind) ") "
+       "in " (get r :in) " → out " (get r :out)
+       (if (= :batch (get r :kind)) (str " (" (get r :batches) " batches)") "")
+       ", lag " (get r :lag)
+       ", errors " (get r :errors)
+       ", workers " (count (get r :workers))))
+
+(doseq [r (pipeline/pipeline-of :kitchen)] (println (row-line r)))
+
+(let [ws (vec (get (pipeline/pipeline-row :kitchen :cook) :workers))]
+  (check! (seq (pipeline/pipeline-of :kitchen))
+          "the rows outlive the pipeline that made them" {})
+  (check! (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) ws)
+          "…and the workers it named are dead, which a reader can see for itself"
+          {:workers ws})
+  (say "with the line stopped, the row still says" (cell :pan :batches)))
+
+;; ── 3. what the counters prove ─────────────────────────────────────────
+
+(println)
+(println "== 3. what the counters prove ==")
+(check! (= (vec (range 1 21)) (vec (sort @checked)))
+        "every order reached the check desk, exactly once"
+        {:checked (count @checked)})
+(check! (= [[1 2 3 4 5 6 7 8] [9 10 11 12 13 14 15 16] [17 18 19 20]] @pans)
+        "the batcher made whole pans of eight, and the tail of four"
+        {:pans @pans})
+(check! (= 20 (cell :pan :in)) "the batch row counts the events IN" {:in (cell :pan :in)})
+(check! (= 3 (cell :pan :batches)) "…and the BATCHES out" {:batches (cell :pan :batches)})
+  ; ORDER-INDEPENDENT on purpose: two cook workers plate concurrently, so which pan
+  ; is plated first is a RACE. Asserting the arrival order fails roughly one run in
+  ; three for no reason (measured: [8 8 4], [8 8 4], then a run that reached the
+  ; plate as [4 8 8]). What this pins is the SHAPE — one count per plated pan, and
+  ; the counts are the pan sizes.
+  (check! (= [4 8 8] (vec (sort @plated)))
+        "the cook and the plate saw batches — a pan in, a count out"
+        {:plated @plated})
+(check! (= 0 (cell :check :errors)) "nothing on the line failed" {:errors (cell :check :errors)})
+(say "…which is why" "three pans out of twenty orders is a whole line, not a lost one")
+
+(println)
+(println "✓ pipeline: one declaration wires the line, the row reports it, and the")
+(println "  row is a fact nothing has to be running to read.")

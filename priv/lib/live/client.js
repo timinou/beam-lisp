@@ -411,6 +411,16 @@
     function openSocket() {
       ws = new WebSocket(sessionUrl(opts.url));
       ws.__send = sendFrame;   // relay() and __navigate use this
+      // The NAVIGATOR is per-socket too, for the same reason: the click handler
+      // below reads `ws.__navigate` off whatever socket is current. Attach it
+      // once, outside openSocket, and only the FIRST socket ever gets one — the
+      // socket a reconnect brings back has none, so every in-app <a href="/…">
+      // is preventDefault'd and then dropped: the URL never moves, the page
+      // never repaints, and nothing on the wire records that a click happened.
+      ws.__navigate = function (path) {
+        try { history.pushState({ live: path }, "", path); } catch (_e) {}
+        sendFrame(JSON.stringify(["event", ["navigate", path], {}]));
+      };
       var sock = ws;           // the heartbeat captures THIS socket — after a
       var beat = null;         // reconnect swaps `ws`, the dead socket's timer
                                // must die with it, never beat on the fresh one
@@ -486,17 +496,18 @@
       // intercept the click, push the URL, and fire a navigate event so the
       // dispatcher re-projects with a keyed patch (no reload). Falls back to a
       // real page load when JS is off, when it's a modified click (new tab),
-      // or when the link is external/hash — so links stay honest and
-      // bookmarkable. This is what makes EVERY screen-to-screen move live
-      // without wiring a single link by hand.
+      // when the link is external/hash, or when the socket has no navigator
+      // (see openSocket) — so links stay honest and bookmarkable, and a link is
+      // never preventDefault'd into silence. This is what makes EVERY
+      // screen-to-screen move live without wiring a single link by hand.
       var a = e.target.closest && e.target.closest("a[href]");
       if (a && !e.defaultPrevented && !e.metaKey && !e.ctrlKey &&
           !e.shiftKey && !e.altKey && (a.getAttribute("target") || "") === "") {
         var href = a.getAttribute("href") || "";
         if (href.indexOf("/") === 0 && href.indexOf("//") !== 0 &&
-            href.indexOf("#") !== 0) {
+            href.indexOf("#") !== 0 && ws && ws.__navigate) {
           e.preventDefault();
-          if (ws.__navigate) ws.__navigate(href);
+          ws.__navigate(href);
           return;
         }
       }
@@ -538,14 +549,6 @@
       (ws.__send || ws.send.bind(ws))(
         JSON.stringify(["event", ["navigate", path], {}]));
     });
-
-    // programmatic navigation: push the URL and tell the server. Lets app code
-    // (or a film driver) move routes without a synthetic click.
-    ws.__navigate = function (path) {
-      try { history.pushState({ live: path }, "", path); } catch (_e) {}
-      (ws.__send || ws.send.bind(ws))(
-        JSON.stringify(["event", ["navigate", path], {}]));
-    };
 
     return ws;
   }

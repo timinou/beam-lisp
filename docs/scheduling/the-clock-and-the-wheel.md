@@ -1242,6 +1242,17 @@ P4  ✅ CUTOVER: the tree's periodic work is a DECLARATION (env.bl `:schedules`)
      itself a visible row. Findings: the stale-port sweep needs no schedule (the
      read IS the sweep); the watcher's debounce is a State Timeout (a `tick`
      clause) and lives in Elixir
+       ⟶ CORRECTED 2026-09-20: it did NOT live in a `tick` clause. Measured:
+       `reload_watcher.ex` ran `Process.send_after(self(), :flush_pending,
+       state.quiet_ms)` — a hand-rolled timer, the exact second implementation
+       `proc.tick` exists to replace, in the one module that could not be cut
+       over because it is Elixir. The cutover landed (d6ca2e52): the watcher now
+       does no timing, a beam-lisp `reload/watch-debounce` owner holds the quiet
+       window with `tick-reset`'s generation (which is why a stale wake cannot
+       slip through), and if that owner dies the pending paths are applied at
+       once so nothing is stranded. A doc line that asserts a mechanism the code
+       does not use is the failure mode this file exists to prevent — it read as
+       "already done" for a whole wave.
       the watch-debounce (reload_watcher.ex) onto P1/P2; the pane is now non-empty
         ── then, separately ──
 P5  priv/std/proc/queue.bl — the `(queue …)` CLAUSE, not a `defqueue` form  ← DONE

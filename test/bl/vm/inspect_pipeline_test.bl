@@ -1,0 +1,239 @@
+; inspect_pipeline_test.bl — the PIPELINE pane: the rows, the workers, the faces.
+;
+; `proc.pipeline` publishes one PUBLIC ETS row per node — the counters, the
+; policies, and the PIDS of the node's workers. The pane PROJECTS that and asks
+; the pipeline for nothing (FUP-101). This file pins what the projection must not
+; get wrong:
+;
+;   * ONE row per pipeline, its stages IN ORDER, each with `:in`, `:out`,
+;     `:in-flight`, `:batches`, `:high-water`, `:errors`, `:dropped` — and the
+;     `:lag`/`:on-error` policy actually in force, because a row that shows
+;     throughput but not the policy is a row nobody can act on;
+;   * a BATCH stage reads events in and batches out, in ONE row;
+;   * the workers are PROCESSES: the pipeline knows the pids, the pane does the
+;     lookup, and a DEAD worker is visibly dead rather than absent;
+;   * with NOTHING declared the render is a no-op — it must not CREATE the read
+;     model's table (FUP-101) — and two renders of one fact are the same value;
+;   * one row the pane cannot read cannot take the section down with it.
+;
+; Run: bl test --shared test/bl/vm/inspect_pipeline_test.bl
+
+(ns vm.inspect-pipeline-test
+  (:require [proc :as proc]
+            [proc.pipeline :as pipeline]
+            [vm.inspect :as inspect]))
+
+;; ── helpers ─────────────────────────────────────────────────────────────
+
+(defn- await
+  "Poll `pred` every 10 ms until it holds or `ms` runs out."
+  [pred ms]
+  (loop [left ms]
+    (cond
+      (pred) true
+      (<= left 0) false
+      :else (do (Process/sleep 10) (recur (- left 10))))))
+
+(defn- wait-for
+  "Block until `flag` is set, or `ms` runs out — a LATCH, so a test that looks at
+   a LIVE worker does not race a sleep."
+  [flag ms]
+  (loop [left ms]
+    (cond
+      (deref flag) true
+      (<= left 0) false
+      :else (do (Process/sleep 5) (recur (- left 5))))))
+
+(defn- cell [srv stage k] (get (pipeline/pipeline-row srv stage) k))
+
+(defn- pipeline-named [m nm]
+  (first (filter (fn [p] (= nm (:name p))) (:pipelines m))))
+
+(defn- stage-named [p nm]
+  (first (filter (fn [s] (= nm (:stage s))) (:stages p))))
+
+;; ── the declarations ────────────────────────────────────────────────────
+
+(def taken (atom []))
+
+(proc/defserver one-stage
+  (pipeline
+    (from (range 1 4))
+    (stage :sift (fn [n] (swap! taken conj n) n) {:concurrency 1})
+    (on-lag :block)
+    (on-error :requeue)))
+
+(proc/defserver panline
+  (pipeline
+    (from (range 1 21))
+    (batch :pan 8 {:timeout 2000})
+    (stage :fry (fn [pan] (count pan)))))
+
+(def gate (atom false))
+
+(proc/defserver held
+  (pipeline
+    (from (range 1 21))
+    (stage :stall (fn [n] (wait-for gate 5000) n) {:concurrency 2})))
+
+;; ── reading nothing is a no-op ──────────────────────────────────────────
+;;
+;; FIRST on purpose: nothing has armed a pipeline yet, so the read model's table
+;; is genuinely absent, and this is the only moment a render can be caught
+;; CREATING it.
+
+(deftest reading-nothing-creates-nothing
+  (is (= false (pipeline/live?)) "no pipeline has been armed in this VM yet")
+  (let [m (inspect/model {})]
+    (is (empty? (:pipelines m)) "nothing declared → an empty pane, not a broken one")
+    (is (empty? (to-list (inspect/pipelines-json {}))))
+    (is (String/contains? (inspect/render-text m) "pipelines")
+        "the terminal face draws its section even with nothing in it"))
+  (is (= false (pipeline/live?))
+      "every face rendered without CREATING the read model's table (FUP-101)"))
+
+;; ── one row per pipeline, stages in order ───────────────────────────────
+
+(deftest a-pipeline-is-one-row-with-its-stages-in-order
+  (reset! taken [])
+  (let [s (start one-stage nil {})]
+    (is (await (fn [] (= 3 (cell :one-stage :sift :out))) 8000) "the line drains")
+    (let [m (inspect/model {})
+          p (pipeline-named m "one-stage")]
+      (is (some? p) "the declared pipeline is a row")
+      (is (= [:source :sift] (vec (map (fn [st] (:stage st)) (:stages p))))
+          "its nodes are listed in declaration order")
+      (is (= [1 2] (vec (map (fn [st] (:pos st)) (:stages p)))))
+      (is (= :block (:lag p)) "the lag policy in force is IN the row")
+      (is (= :requeue (:on-error p)) "…and so is the error policy")
+      (let [st (stage-named p :sift)]
+        (is (= :stage (:kind st)))
+        (is (= 3 (:in st))) (is (= 3 (:out st)))
+        (is (= 0 (:in-flight st)) "it drained, so nothing is in flight")
+        (is (= 0 (:errors st))) (is (= 0 (:dropped st)))
+        (is (= 1 (:high-water st)) "one worker ran one event at a time")
+        (is (= :block (:lag st)) "…and the policy is on the stage's own row too")
+        (is (= :requeue (:on-error st)))
+        (is (seq (:workers st)) "the stage names the processes that ran it")))
+    (stop s)))
+
+(deftest a-batch-stage-reads-events-in-and-batches-out
+  (let [s (start panline nil {})]
+    (is (await (fn [] (= 3 (cell :panline :pan :batches))) 8000) "three batches")
+    (let [st (stage-named (pipeline-named (inspect/model {}) "panline") :pan)]
+      (is (= :batch (:kind st)))
+      (is (= 20 (:in st)) "the batcher counts EVENTS in")
+      (is (= 3 (:batches st)) "…and BATCHES out")
+      (is (= 3 (:out st)) "…which is also its output"))
+    (stop s)))
+
+;; ── the workers are processes ───────────────────────────────────────────
+
+(deftest a-dead-worker-is-visibly-dead-not-absent
+  (reset! gate false)
+  (let [s (start held nil {})]
+    (is (await (fn [] (seq (get (pipeline/pipeline-row :held :stall) :workers))) 8000)
+        "a worker took an event, so the row knows its pid")
+    (let [victim (first (vec (get (pipeline/pipeline-row :held :stall) :workers)))
+          st (stage-named (pipeline-named (inspect/model {}) "held") :stall)
+          live (first (filter (fn [w] (= (pr-str victim) (:pid w))) (:workers st)))]
+      (is (some? live))
+      (is (= true (:alive live)) "a live worker is reported alive…")
+      (is (some? (:state live)) "…with the state the VM gives it")
+      (is (erlang/is_integer (:message_queue_len live)))
+      (kill victim)
+      (is (await (fn [] (not (:alive (pipeline/worker-vitals victim)))) 8000)
+          "the VM sees it die — liveness is READ, never stored")
+      (let [m (inspect/model {})
+            dead (first (filter (fn [w] (= (pr-str victim) (:pid w)))
+                                (:workers (stage-named (pipeline-named m "held") :stall))))]
+        (is (some? dead) "its pid is STILL in the row — the process is what a demo sees")
+        (is (= false (:alive dead)) "…and it is now visibly dead")
+        (is (= "dead" (:state dead)))
+        (is (String/contains? (inspect/render-text m) (pr-str victim))
+            "the terminal face draws the dead worker")
+        (is (String/contains? (inspect/render-text m) "dead")
+            "…and says so")))
+    (stop s)))
+
+;; ── the three faces ─────────────────────────────────────────────────────
+
+(deftest the-faces-show-one-pipeline
+  (reset! taken [])
+  (let [s (start one-stage nil {})]
+    (is (await (fn [] (= 3 (cell :one-stage :sift :out))) 8000))
+    (let [m (inspect/model {})
+          p (pipeline-named m "one-stage")
+          jr (first (filter (fn [x] (= "one-stage" (get x "name")))
+                            (get (inspect/json {}) "pipelines")))
+          sift-json (nth (get jr "stages") 1)
+          text (inspect/render-text m)]
+      (is (some? jr) "the JSON face carries the pipeline")
+      (is (= (:in (stage-named p :sift)) (get sift-json "in"))
+          "the two faces agree on a number — there is one model")
+      (is (String/contains? text "one-stage") "the terminal face names it")
+      (is (String/contains? text "lag block") "…and states the policy in force")
+      (let [w (first (get sift-json "workers"))]
+        (is (contains? w "alive") "the JSON worker says whether it is alive")
+        (is (contains? w "message_queue_len") "…and what is waiting for it")))
+    (stop s)))
+
+;; ── read-only, and stable ───────────────────────────────────────────────
+
+(deftest two-renders-of-one-fact-are-identical
+  ;; The pane is a projection of fixed rows, so two reads of the same facts must
+  ;; be the same VALUE. The pipeline is STOPPED first, for the same reason the
+  ;; schedules pane pauses its wheel before comparing: with a writer running the
+  ;; counters move between the two reads and "identical" is undecidable.
+  (reset! taken [])
+  (let [s (start one-stage nil {})]
+    (is (await (fn [] (= 3 (cell :one-stage :sift :out))) 8000))
+    (stop s)
+    (Process/sleep 80)
+    (let [a (:pipelines (inspect/model {}))
+          b (:pipelines (inspect/model {}))]
+      (is (seq a) "there is a fact to compare")
+      (is (= a b) "two renders of the same facts are the same value")
+      (is (= (to-list (inspect/pipelines-json {}))
+             (to-list (inspect/pipelines-json {})))
+          "…and the JSON face is as stable as the model"))))
+
+(deftest rendering-the-pipeline-section-writes-nothing
+  ;; FUP-101's rule again, extended to the new pane: a render is a READ. With the
+  ;; pipeline stopped the only writer is gone, so if the table's row count or a
+  ;; single value moves across many renders, the render path wrote.
+  (reset! taken [])
+  (let [s (start one-stage nil {})]
+    (is (await (fn [] (= 3 (cell :one-stage :sift :out))) 8000))
+    (stop s)
+    (Process/sleep 80)
+    (let [size (erlang/apply :ets :info (list pipeline/TABLE :size))
+          before (:pipelines (inspect/model {}))]
+      (doseq [_ (range 50)]
+        (inspect/model {})
+        (inspect/render-text (inspect/model {}))
+        (inspect/json {})
+        (inspect/pipelines-json {}))
+      (is (= size (erlang/apply :ets :info (list pipeline/TABLE :size)))
+          "fifty renders changed the row count — the pane wrote")
+      (is (= before (:pipelines (inspect/model {})))
+          "…and changed a value — a render is a read, not a writer"))))
+
+;; ── one bad row cannot kill the projection ──────────────────────────────
+
+(deftest a-row-that-cannot-be-read-does-not-kill-the-pane
+  ;; The read model maps every row without a per-row guard, so a row that cannot
+  ;; be read raises inside `proc.pipeline/pipeline-rows`. The PANE's job is that
+  ;; a raise there is an EMPTY section, never a 500 for the page it is one part
+  ;; of. The junk is removed again (whether or not the render raised) so the pane
+  ;; is left as it was found.
+  (erlang/apply :ets :insert (list pipeline/TABLE (tuple "corrupt/row" "corrupt")))
+  (let [raised (try
+                 (do (inspect/model {}) (inspect/pipelines-json {})
+                     (inspect/render-text (inspect/model {}))
+                     nil)
+                 (catch e (str e)))]
+    (erlang/apply :ets :delete (list pipeline/TABLE "corrupt/row"))
+    (is (nil? raised) "the three faces render with an unreadable row present")
+    (is (seq (:pipelines (inspect/model {})))
+        "…and the rows that CAN be read are back once the junk is gone")))
