@@ -1,0 +1,123 @@
+; datom/query/corpus.bl — the derived embedding-column cache (PLAN-132 Phase 5).
+;
+; ── What this is, and why it exists ───────────────────────────────────
+;
+; An embedding column is read by SIMILARITY, not by a range (datom/vector.bl):
+; every analytic clause — `similar-to`, `cluster`, `project-2d`, and the
+; semantic-graph providers in query/relations.bl — first ASSEMBLES the corpus,
+; the list of `[entity dvec]` for every current datom of the column, and then
+; hands it to a Rust NIF. Assembly is `attr-datoms db attr` |> keep the DVec
+; values |> pair with the entity id.
+;
+; On the live corpus (filali sources-legales: 62 396 chunks × 768 dims) that
+; assembly is ~3.85 s of engine work per evaluation — while the underlying
+; store read of the same attribute is 203–400 ms, i.e. the RE-ASSEMBLY, not the
+; IO, is the cost (PLAN-132 §10). And it was paid on EVERY eval: warm == cold,
+; because nothing held the assembled corpus. Three call sites each rebuilt it.
+;
+; This ns builds the corpus ONCE per `(store, attr)` state and memoises it, so
+; the second and every later evaluation at the same basis pays nothing. The
+; NIF search/cluster still runs each time (it must — the query differs); only
+; the ~3.85 s assembly is removed.
+;
+; ── Why the key is (store, attr) discriminated by (basis, filter, since) ──
+;
+; A datom cache MUST NOT serve a value from a basis the caller is not reading.
+; The db value carries a basis-t (and a filter-mode / since-t for history and
+; `since` views); the corpus is a pure function of exactly those. So the cache
+; is keyed by `(store, attr)` and the stored entry carries the DISCRIMINATOR
+; `[basis-t filter-mode since-t]` it was built under. A read at a different
+; discriminator is a miss that rebuilds and overwrites — so a transaction
+; (which advances basis-t) is an AUTOMATIC miss, with no explicit invalidation
+; to forget to call. One slot per column keeps the table O(distinct columns),
+; and the newest state evicts the previous one in place.
+;
+; This is the (store, attribute, basis) derived-column cache of PLAN-132 Phase
+; 5, and it is pure beam-lisp: the table is ETS, the policy is here, the vector
+; DECODING stays native (we cache the DVec values the store already decoded —
+; we never re-decode value bytes in bl, which the read path measured at 4× loss).
+
+(ns datom.query.corpus
+  (:require [datom.db] [datom.index] [datom.vector]))
+
+;; ── the table ────────────────────────────────────────────────────────
+;;
+;; VM-wide and public: any process evaluating a query over the same store must
+;; share the hit. `:set`, keyed by `[store attr]`. Value: `{:disc [...] :rows
+;; [[e dvec] ...]}`. Created lazily on first use, like oracle.bl's memo.
+
+(def TABLE :datom_corpus_cache)
+
+(defn- t2 [a b] (erlang/list_to_tuple (to-list [a b])))
+
+(defn- table []
+  (when (= :undefined (ets/info TABLE))
+    ; Racy first-touch is fine: ets/new throws :badarg if a concurrent caller
+    ; won, which means the table now exists — exactly what we wanted.
+    (try (ets/new TABLE (to-list [:set :public :named_table
+                                  (t2 :read_concurrency true)
+                                  (t2 :write_concurrency true)]))
+         (catch _ :ok)))
+  TABLE)
+
+(defn- discriminator
+  "The db state a corpus depends on. Two db values with the same discriminator
+   over the same store see the SAME current datoms for any attribute, so they
+   may share a corpus; any difference is a rebuild."
+  [db]
+  [(datom.db/basis-t db) (:filter-mode db) (:since-t db)])
+
+(defn- assemble
+  "The corpus of `[entity dvec]` for embedding column `attr`, current-basis.
+   The one place the assembly lives now — every caller routes here.
+   A datom whose value is not a DVec (a mis-typed column) is skipped, matching
+   the previous inline behaviour in analytic.bl / relations.bl."
+  [db attr]
+  (filterv some?
+           (mapv (fn [d]
+                   (let [e (datom.index/-e d) v (datom.index/-v d)]
+                     (if (datom.vector/vec? v) [e v] nil)))
+                 (datom.db/attr-datoms db attr))))
+
+;; ── the public read ──────────────────────────────────────────────────
+
+(defn column
+  "The `[[entity dvec] …]` corpus of embedding column `attr` in `db`, memoised
+   by `(store, attr)` and validated against `db`'s basis/filter/since.
+
+   First call at a given state builds it (≈ the old per-eval cost); every later
+   call at the same state returns the cached vector in O(1). A transaction
+   advances the basis, which changes the discriminator, so the next call
+   rebuilds and overwrites the slot — the cache can never return datoms from a
+   basis the caller is not reading."
+  [db attr]
+  (let [store (datom.db/store-of db)
+        k (t2 store attr)
+        disc (discriminator db)
+        hit (ets/lookup (table) k)]
+    (if (and (not (empty? hit))
+             (= disc (:disc (erlang/element 2 (first (to-list hit))))))
+      (:rows (erlang/element 2 (first (to-list hit))))
+      (let [rows (assemble db attr)]
+        (ets/insert (table) (t2 k {:disc disc :rows rows}))
+        rows))))
+
+;; ── introspection (probes, tests, a future `bl cache status`) ─────────
+
+(defn stats
+  "How many columns are resident, and the total rows they hold. Cheap: reads
+   ETS metadata and the cached vectors' lengths, never rebuilds."
+  []
+  (if (= :undefined (ets/info TABLE))
+    {:columns 0 :rows 0}
+    (let [entries (to-list (ets/tab2list TABLE))]
+      {:columns (count entries)
+       :rows (reduce (fn [acc e] (+ acc (count (:rows (erlang/element 2 e))))) 0 entries)})))
+
+(defn forget!
+  "Drop every cached column. For tests and for a manual flush; correctness never
+   depends on calling it — a stale basis already misses."
+  []
+  (when (not= :undefined (ets/info TABLE))
+    (ets/delete_all_objects TABLE))
+  :ok)
