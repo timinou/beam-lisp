@@ -723,10 +723,15 @@ priv/std/proc/super.bl  (ns proc.super)    supervision trees as data
 priv/std/proc/fence.bl  (ns proc.fence)    bounded isolation
 priv/std/proc/table.bl  (ns proc.table)    a store-backed table
 priv/std/proc/queue.bl  (ns proc.queue)    the durable owed-work clause
-priv/std/proc/jobs.bl   (ns proc.jobs)     ○ defqueue · enqueue · perform · stats · retry · cancel · prune
-vm/inspect.bl           :schedules, :jobs ← the pane, no new model
-vm/http.bl                  GET /schedules · POST /schedules/<id>/{pause,resume,run-now}
-bl:  bl schedules [--json]  ·  bl jobs [--json]
+priv/std/proc/queue.bl  (ns proc.queue)   ✅ the durable owed-work CLAUSE — decision 6
+                            deleted the `jobs.bl` row this map used to carry: a
+                            `defqueue` form over `jobs.bl` was the fork the user
+                            pushed back on, and the clause is the home.
+vm/inspect.bl           ✅ :schedules (:deep), :jobs, :ticker — the pane, no new model
+vm/http.bl              ✅ GET /schedules · POST /schedules/<server>/<id>/{pause,resume,run-now}
+                            and the pane renders both rows (there is no `bl jobs` or
+                            `bl schedules` VERB — the terminal face is `bl daemon status`,
+                            which builds the SAME model the page builds)
 ```
 
 ---
@@ -1155,6 +1160,17 @@ schedulers as first tenants (P4).
    (`(take-while (before? …) (rule))`) — already tempo §8's shape, needing only a
    few constructors. Explicitly refuse "last Friday of the month" until
    recurrence lands.
+   **SETTLED 2026-09-18 — see [`the-rule-and-the-set.md`](the-rule-and-the-set.md).**
+   The refusal stands for a *string*: RRULE becomes the INTERCHANGE we read and
+   write, and the user surface is a rule-set over the interval algebra
+   `datom.time` already ships. "Last Friday" is then expressible and testable
+   (the cron hack people reach for instead, `24-31 * 5`, misses 5 of 192 months
+   in 2015-2030 — all Februaries — and no day-range repairs it, because the last
+   Friday's day-of-month runs 22…31). The wow is not the notation, which Tempo
+   already ships: it is that a rule is DATA, so it can be *proved* about — can
+   two schedules ever collide? — which no cron or RRULE implementation can
+   answer. Oban's answer to anything beyond cron, measured against its own docs,
+   is "insert the next job yourself".
 5. **Distributed scheduling is not designed for, and shouldn't be yet.** No
    `:pg`/`global` in-tree. But note the *nice* consequence: **one store, one
    writer = the scheduler leader is the store's owner.** That's cleaner than
@@ -1206,7 +1222,7 @@ P2b priv/std/proc/sched.bl — the durable half                                 
       ran does NOT run again across a restart) and `a-pause-survives-a-restart`
       (paused is a fact, not a bit in the process that made it).
       The same table is the pane's read model — `proc/read-all`.
-P2c priv/std/proc/sched.bl + priv/lib/datom/store-ets.bl — datom over ETS   ← NEXT
+P2c priv/std/proc/sched.bl + priv/lib/datom/store-ets.bl — datom over ETS   ← DONE
       the declaration and the outcome as `:schedule/*` facts, so the pane
       queries them like everything else and `history`/`as-of` come free
       DEPENDENCY: `datom/store-ets` has NO heir (grep: zero hits), so a conn's
@@ -1244,12 +1260,24 @@ P5  priv/std/proc/queue.bl — the `(queue …)` CLAUSE, not a `defqueue` form  
      expands a file's `defserver` forms before its requires run (BUG-082), so a
      clause from a namespace its image has not loaded is unknown at expansion.
      knowledger cut over from its hand-rolled runner.
-P3b the pane's two open rows: `:jobs` (waits on P5) and the DEEP ROW — a
+P3b ✅ DONE (2026-09-18) — the pane's two rows landed: `:jobs` (P5's consumer, a
      declaration's recent occurrences + its refusals + its `verify` verdict, and
      the ticker line (the one live thing in a store-only view, drawn as a
      monitor's fact). Both are projections over facts already written; neither
      writes (FUP-101) and neither asks a process.
-P6  flow/distribute + batch + defpipeline  (the Broadway half)
+P6  flow/distribute + batch + defpipeline  (the Broadway half)          ← NEXT
+     NOT as a `defpipeline` FORM: §4.4's sketch is the same fork `defbeat` was,
+     and the user asked the right question — the ideas become a CLAUSE on
+     `defserver`, exactly like `(sched …)`/`(queue …)`: one clause whose entries
+     are validated forms (`(from …)`/`(stage …)`/`(batch …)`/`(on-lag …)`),
+     contributing `:prelude` (arming) and `:init` (the counters).
+     `flow` has no fan-out and no batcher today (verified): `distribute` (N
+     consumers over ONE demand window) and `batch` (N events or T ms) are the
+     primitives, and they land FIRST — the clause is sugar over them.
+     Its real consumer is this repo: `bl search`'s ingest is exactly
+     walk → parse → embed-batch → write, with `code/embed-batch` (256-dim
+     potion-code-16M-v2) as the slow stage, which is what §4.4's own example
+     (`(batch :embed 32 {:timeout 200})`) was describing.
 ```
 
 P1→P4 is the honest wave: **substrate → observable → cutover** (prove, then cut,
