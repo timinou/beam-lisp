@@ -100,11 +100,39 @@ next one.
   [name]
   (url-for* name (live)))
 
+(defn open-external
+  "Hand `url` to the desktop's opener, returning true when it was handed over.
+
+   Argv, never a shell string: `System/cmd` is Elixir's, so its second argument
+   is a LIST of arguments, and `xdg-open <url>` passed as one string asks for a
+   program whose name contains a space (the same bug shape FUP-100 fixed in
+   the build). A host with no opener is not an error — the caller has already
+   printed the address — so this reports instead of raising."
+  [url]
+  (try
+    (do (System/cmd "xdg-open" (u/to-list [url])) true)
+    (catch _e false)))
+
 (defn- loopback-url
   "The same listener with no name in it. Never depends on the gateway — this is
    the half of the address that is always true."
   [c]
   (str "http://127.0.0.1:" (:port c) "/"))
+
+(defn page-url
+  "A named port's page at `path`, on the LOOPBACK address — or nil when this
+   tree holds no such claim.
+
+   The loopback half on purpose: a window (or any embedder) is a fresh browser
+   with no gateway, proxy or DNS setup, so a name that resolves in the
+   developer's shell can still be a blank page there. `url`/`url-for` stay the
+   human-facing address; this one is what a program opens."
+  [name path]
+  (if-let [c (claim-for name)]
+    (let [base (loopback-url c)
+          base (if (String/ends_with? base "/") (String/slice base 0 (- (count base) 1)) base)]
+      (str base (if (String/starts_with? path "/") path (str "/" path))))
+    nil))
 ```
 
 ## The verbs
@@ -162,7 +190,7 @@ it.
         (when (not (nil? named))
           (println (str "  → " plain)))
         (when (some (fn [a] (= a "--open")) args)
-          (System/cmd (str "xdg-open " (or named plain))))
+          (open-external (or named plain)))
         0))))
 
 (defn url
