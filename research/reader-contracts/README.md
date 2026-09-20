@@ -47,7 +47,7 @@ edited by other sessions.
 The reader is the first act of the harness. It decides **what may be written**
 (the reader's options are the admission contract), **what comes back when it is
 wrong** (a diagnostic is data, and names the delimiter that was opened and
-where), and **where** (a span with byte offsets, shared with the compiler, the
+where), and **where** (a span carrying the offsets that locate AND slice the
 type checker and the LSP). Today `priv/boot/reader.bl` answers all three with a
 hard-coded policy: three entry points, positions on lists only, a bare message
 on failure, no offsets, no stream. edamame shows all of that can be values
@@ -223,11 +223,14 @@ identity.** Three rules, and the spike implements the first:
   it), no atom-table guard, no `#d[…]`/`#inst`, no multi-line string rule, and
   string escapes cover only `\n \t \r \" \\`. The parts it omits are the parts
   with no policy decision to make.
-- **`col` counts characters, `offset` counts characters too.** The tree's reader
-  threads a `{line col file}` tuple; this one adds a 4th slot. An earlier
-  Elixir prototype counted columns in characters and offsets in BYTES; the port
-  should use UTF-8 BYTE offsets, because that is what an LSP converts from
-  (`priv/std/span-rewrite.bl` is byte-based).
+- **Offsets are CODEPOINT indices, not bytes.** The tree's reader threads a
+  `{line col file}` tuple; this one adds a 4th slot. The unit is codepoints
+  because that is what the one existing consumer indexes by — `span-rewrite`
+  walks `(String/codepoints src)` and cuts with `subvec` — so
+  `(subvec cps (:offset pos) (:end-offset pos))` substitutes for
+  `(+ (get line-offsets line) (dec col))` with no conversion. An LSP needs UTF-16
+  code units, which it converts to from whichever unit it is handed; a byte
+  offset is a separate decision, not this one.
 - **`fix-all` is greedy.** It takes the chosen repair each round and does not
   backtrack, so a source where the second repair only works if the first was
   different would not be solved. No such fixture is claimed.
@@ -260,15 +263,27 @@ struct (FUP-102).
 
 ### 2. offsets in the position map
 
-Thread the running count beside `{line, col, file}` — the charlist scan already
-visits every character once, so the offset is an integer carried, not a second
-pass. Use BYTE offsets (see §What this does not do).
+LANDED in the reader: `make-pos` gained a 4th slot,
+`advance-pos`/`advance-to` count it, and `pos-meta`/`pos-meta-span` emit
+`:offset`/`:end-offset`, so a span can slice its own source. The unit is
+CODEPOINTS — measured, not assumed: the one existing consumer, `span-rewrite`,
+walks `(String/codepoints src)` and cuts with `subvec`, so the substitution is
+direct.
 
-- deletes: `span-rewrite.bl`'s `line-offsets` (a second pass over every source)
-  and the three copies of line/col → offset arithmetic built on it
-- unblocks: byte-exact slicing for the rewriter and the LSP
-- accept: `node-pos` carries `offset`/`end-offset`; `span-rewrite` slices from
-  them with no `line-offsets` left in the file
+Measured: every top-level form's span slices back to its own text, including the
+form after a multi-byte `→` and a form with an inner comment; and three rich
+sources (295 top-level forms — `priv/boot/reader.bl`, `priv/boot/core.bl`,
+`priv/lib/web.bl`) parse **structurally identically modulo the two new keys**.
+
+- deletes (NOT yet — and the gate is the point): `span-rewrite.bl`'s
+  `line-offsets` and the three arithmetic sites built on it. The gate is that
+  EVERY producer of a pos map carries offsets — including the compiler's
+  synthesized positions for desugared macro nodes (`research/p2_positions`),
+  which are built outside the reader. Until those carry offsets, `slice-node`
+  needs its fallback and the table stays; deleting the table first would make a
+  rewrite degrade to `pr-str` instead of failing loudly.
+- unblocks: a rewriter or an LSP that slices a span with no table, no arithmetic
+- accept (met): `node-pos` carries `:offset`/`:end-offset`
 
 ### 3. `read` takes an options map
 
