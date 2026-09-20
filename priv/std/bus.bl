@@ -1,6 +1,9 @@
 ; bus.bl — backpressured fan-out on flow's pull protocol.
 
-(ns bus)
+(ns bus
+  ; The bus is a CLAUSE of `defserver` now, not a form of its own, so the one
+  ; thing this module needs from the expander is how to register it.
+  (:require [proc.server :refer [extend-clause!]]))
 
 (defn- drain-sub [sub]
   (let [queue (:queue sub)
@@ -96,64 +99,92 @@
                  subs))
              (:subs st) (:subs st)))))
 
+(defn down-handler
+  "A monitored subscriber died: its subscription goes.
+
+   This is the clause's `:down` contribution, not a `handle-info` clause of its
+   own — the server's ONE `[:DOWN …]` clause threads every clause's handler, so
+   a registry and a bus in one server cannot shadow each other. A pid this bus
+   never subscribed is a no-op, and in particular does NOT release a waiting
+   publisher on the way past."
+  [st ref pid _reason]
+  (if (some (fn [[_ sub]] (and (= (:pid sub) pid) (= (:ref sub) ref))) (:subs st))
+    (remove-sub st ref pid)
+    st))
+
 (defn send-done [st]
   (vec (map (fn [[_ sub]] (erlang/send (:pid sub) [:done])) (:subs st)))
   (vec (map (fn [[from _ev]] (GenServer/reply from :done)) (:waiting st)))
   :ok)
 
-(defmacro ^:deprecated defbus
-  "Define an event bus — subscribers, lag policy, demand, backpressure.
+;; ── the clause ─────────────────────────────────────────────────────────
+;;
+;; `(bus (demand 8))` — the bus as a CLAUSE of `defserver`. It was a macro
+;; until `proc.server` gave bundles a clause registry; a clause contributes a
+;; slice of a server's state, so a server that IS a bus AND carries its own
+;; state is one form rather than a body to paste. `publish` and
+;; `flow/subscribe` never needed the macro and do not change.
 
-   (bus/defbus events (demand 8))
+(defn init-state
+  "The state slice the clause contributes: subscribers, the waiter queue, and
+   the lag bound. `start-opts` is the map the server was STARTED with, so the
+   demand and the lag bound are configurable without editing the declaration."
+  [start-opts default-demand]
+  {:subs {} :closed? false :waiting []
+   :demand (get start-opts :demand default-demand)
+   :max-lag (get start-opts :max-lag 1024)})
 
-   ⟶ DEPRECATED AS A SPELLING (2026-09-18). Nothing about the behaviour goes
-   away: `bus/publish` and `flow/subscribe` stay exactly as they are. What goes
-   away is this MACRO — once `priv/std/server.bl` lands, a bus is a CLAUSE, and
-   the whole form above is one line inside the one server form:
+(defn- declared-demand
+  "The default demand from a clause's `(demand N)` form, or 8 when it has none.
 
-     (srv/defserver events (bus (demand 8)))
+   An impossible declaration is refused HERE, when the server form is expanded,
+   with a sentence: a bus that cannot say what demand a subscriber starts with
+   would hand the drain loop a value it cannot subtract."
+  [forms where]
+  (when (> (count forms) 1)
+    (throw (ex-info (str where ": (bus (demand N)) takes at most one demand clause —"
+                         " got " (count forms))
+                    {:clause forms})))
+  (let [cfg (first forms)]
+    (if (nil? cfg)
+      8
+      (do
+        (when-not (and (list? cfg) (= 'demand (first cfg)) (= 2 (count cfg)))
+          (throw (ex-info (str where ": (bus …) takes (demand N) — the demand a"
+                               " subscriber starts with. Got " (pr-str cfg))
+                          {:clause cfg})))
+        (second cfg)))))
 
-   The clause COMPOSES, which the macro cannot: a server that is a bus AND
-   carries its own state is one form, not a body to copy.
-
-   DO NOT MIGRATE YET. The clause does not resolve until `server.bl` lands
-   (gated by PLAN-088's boot rename). See
-   docs/scheduling/the-clock-and-the-wheel.md §4.6 and FUP-094, which carries
-   the deodorant smell that will do the rewrite."
-  [name & config]
-  (let [demand-form (first config)
-        default-demand (if demand-form (second demand-form) 8)]
-    `(defserver ~name
-       (init [opts#]
-         (ok {:subs {} :closed? false :waiting []
-              :demand (get opts# :demand ~default-demand)
-              :max-lag (get opts# :max-lag 1024)}))
-
-       (handle-call [:publish ev#] [from# st#]
+(defn bus-clause
+  "The `(bus (demand N))` transform. Public because it is worth testing on its
+   own: it is the unit that turns a declaration into a fan-out."
+  [clause ctx]
+  (let [where (str "defserver " (:name ctx))
+        default-demand (declared-demand (vec (rest clause)) where)]
+    {:init `(bus/init-state start-opts ~default-demand)
+     :down [`bus/down-handler]
+     :clauses
+     [`(handle-call [:publish ev#] [from# st#]
          (if (bus/blocked? st#)
            (noreply (assoc st# :waiting (conj (:waiting st#) [from# ev#])))
            (reply :ok (bus/append-event st# ev#))))
-
-       (handle-cast [:publish ev#] [st#]
+      `(handle-cast [:publish ev#] [st#]
          (noreply (bus/append-event st# ev#)))
-
-       (handle-info [:subscribe pid#] [st#]
+      `(handle-info [:subscribe pid#] [st#]
          (noreply (bus/add-sub st# pid#)))
-
-       (handle-info [:flow-options pid# id# policy# max-lag#] [st#]
+      `(handle-info [:flow-options pid# id# policy# max-lag#] [st#]
          (noreply (bus/configure-sub st# pid# id# policy# max-lag#)))
-
-       (handle-info [:demand n# pid#] [st#]
+      `(handle-info [:demand n# pid#] [st#]
          (noreply (bus/demand-from st# pid# n#)))
-
-       (handle-info [:demand n#] [st#]
+      `(handle-info [:demand n#] [st#]
          (noreply st#))
+      `(terminate [_reason# st#]
+         (bus/send-done st#))]}))
 
-       (handle-info [:DOWN ref# :process pid# _reason#] [st#]
-         (noreply (bus/remove-sub st# ref# pid#)))
-
-       (terminate [_reason# st#]
-         (bus/send-done st#)))))
+;; Registered BEFORE `broadcast-bus` expands, and that order is load-bearing: a
+;; clause is resolved when the server form is COMPILED, so a registration at the
+;; bottom of this file would arrive too late for its one in-file use.
+(extend-clause! :bus bus-clause)
 
 (defn publish
   "Publish one event. The call waits when a :block subscriber reaches its
@@ -161,7 +192,8 @@
   [b ev]
   (call b [:publish ev] :infinity))
 
-(defbus broadcast-bus (demand 8))
+;; The bus this namespace starts for `start-broadcast`, spelled as the clause.
+(proc.server/defserver broadcast-bus (bus (demand 8)))
 
 (defn- bridge-loop [up b batch]
   (receive

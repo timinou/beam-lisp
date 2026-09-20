@@ -8,7 +8,7 @@
 ; itself — every entry retracts itself when its pid dies, because the
 ; registry monitors each registration and handles :DOWN.
 ;
-;   (reg/defregistry sessions (keys :user-id :node))
+;   (proc/defserver sessions (registry (keys :user-id :node)))
 ;   (def r (start sessions nil {:name :sessions}))
 ;   (reg/register r pid {:user-id 42})
 ;   (reg/whereis r {:user-id 42})        ; → pid | nil
@@ -25,7 +25,10 @@
 ; Honest scope: single node. `where` is attribute-match, not datalog — a
 ; full query engine is a lib-tier dependency this std file does not take.
 
-(ns reg)
+(ns reg
+  ; The registry is a CLAUSE of `defserver` now, not a form of its own, so the
+  ; one thing this module needs from the expander is how to register it.
+  (:require [proc.server :refer [extend-clause!]]))
 
 ;; ── the relation, as pure functions over the server state ─────────────
 ;; state: {:entries {pid → attr-map} :keys [declared-attr-keys]}
@@ -53,6 +56,16 @@
 (defn remove-entry [st pid]
   (assoc st :entries (dissoc (:entries st) pid)))
 
+(defn down-handler
+  "A monitored pid died: its entry retracts.
+
+   This is the clause's `:down` contribution, not a `handle-info` clause of its
+   own — the server's ONE `[:DOWN …]` clause threads every clause's handler, so
+   a registry and a bus in one server cannot shadow each other. A pid this
+   registry never held is a no-op, which is exactly what the thread needs."
+  [st _ref pid _reason]
+  (remove-entry st pid))
+
 (defn find-one [st query]
   (first (keep (fn [pair]
                  (if (matches? (second pair) query) (first pair) nil))
@@ -63,54 +76,71 @@
                (if (matches? (second pair) query) (first pair) nil))
              (:entries st))))
 
-;; ── the form ───────────────────────────────────────────────────────────
+;; ── the clause ─────────────────────────────────────────────────────────
+;;
+;; `(registry (keys :user-id :node))` — the pid ↔ attributes relation as a
+;; CLAUSE of `defserver`. It was a macro until `proc.server` gave bundles a
+;; clause registry; a macro copies a whole server, a clause contributes a slice,
+;; so a server that IS a registry AND holds its own state is one form rather
+;; than a body to paste. The verbs below never needed the macro and do not
+;; change.
 
-(defmacro ^:deprecated defregistry
-  "Define a registry — a server whose state is the pid ↔ attributes relation.
+(defn init-state
+  "The state slice the clause contributes: the empty relation, and the attribute
+   names the declaration allows. An empty key list means any attribute goes."
+  [declared]
+  {:entries {} :keys declared})
 
-   (reg/defregistry sessions (keys :user-id :node))
+(defn- declared-keys
+  "The attribute names from a clause's `(keys …)` form, or `[]` when it has none.
 
-   `keys` declares the attribute names; registering an undeclared key is an
-   [:error {:unknown-keys …}] reply. With no `keys` clause any attributes go.
-   Every registered pid is monitored; its entry retracts on :DOWN.
+   An impossible declaration is refused HERE, when the server form is expanded,
+   with a sentence. A registry that cannot say what it keys on fails much later,
+   on a `register` nobody can read: `[:error {:unknown-keys …}]` names the key it
+   refused, never the declaration that refused it."
+  [forms where]
+  (when (> (count forms) 1)
+    (throw (ex-info (str where ": (registry (keys :a :b)) takes at most one keys"
+                         " clause — got " (count forms))
+                    {:clause forms})))
+  (let [ks (first forms)]
+    (if (nil? ks)
+      []
+      (do
+        (when-not (and (list? ks) (= 'keys (first ks)))
+          (throw (ex-info (str where ": (registry …) takes (keys :a :b) — the attribute"
+                               " names this registry allows. Got " (pr-str ks))
+                          {:clause ks})))
+        (let [declared (vec (rest ks))]
+          (doseq [k declared]
+            (when-not (keyword? k)
+              (throw (ex-info (str where ": every registry key must be a keyword — got "
+                                   (pr-str k) ". A non-keyword key can never match an"
+                                   " attribute map, so no one could ever register on it.")
+                              {:key k :clause ks}))))
+          declared)))))
 
-   ⟶ DEPRECATED AS A SPELLING (2026-09-18). Nothing about the behaviour goes
-   away: the pid↔attributes relation and every verb below stay exactly as they
-   are. What goes away is this MACRO — once `priv/std/server.bl` lands, a
-   registry is a CLAUSE, and the whole form above is one line inside the one
-   server form:
-
-     (srv/defserver sessions (registry (keys :user-id :node)))
-
-   The clause COMPOSES, which the macro cannot: it contributes its slice to a
-   server's state, so a registry that also holds other state is one form rather
-   than a body to copy. That is the difference between a bundle and a fork.
-
-   DO NOT MIGRATE YET. The clause does not resolve until `server.bl` lands
-   (gated by PLAN-088's boot rename). See
-   docs/scheduling/the-clock-and-the-wheel.md §4.6 and FUP-094, which carries
-   the deodorant smell that will do the rewrite."
-  [name & clauses]
-  (let [keys-clause (first (filter (fn [c] (= (quote keys) (first c))) clauses))
-        declared (if keys-clause (rest keys-clause) (list))]
-    `(defserver ~name
-       (init [_opts#] (ok {:entries {} :keys [~@declared]}))
-
-       (handle-call [:register pid# attrs#] [_from# st#]
+(defn registry-clause
+  "The `(registry (keys …))` transform. Public because it is worth testing on its
+   own: it is the unit that turns a declaration into the pid↔attributes relation,
+   and it contributes a state SLICE rather than copying a server."
+  [clause ctx]
+  (let [where (str "defserver " (:name ctx))
+        declared (declared-keys (vec (rest clause)) where)]
+    {:init `(reg/init-state ~declared)
+     :down [`reg/down-handler]
+     :clauses
+     [`(handle-call [:register pid# attrs#] [_from# st#]
          (let [outcome# (reg/register-entry st# pid# attrs#)]
            (reply (first outcome#) (second outcome#))))
-
-       (handle-call [:unregister pid#] [_from# st#]
+      `(handle-call [:unregister pid#] [_from# st#]
          (reply :ok (reg/remove-entry st# pid#)))
-
-       (handle-call [:whereis query#] [_from# st#]
+      `(handle-call [:whereis query#] [_from# st#]
          (reply (reg/find-one st# query#) st#))
+      `(handle-call [:where query#] [_from# st#]
+         (reply (reg/find-all st# query#) st#))]}))
 
-       (handle-call [:where query#] [_from# st#]
-         (reply (reg/find-all st# query#) st#))
-
-       (handle-info [:DOWN _ref# :process pid# _reason#] [st#]
-         (noreply (reg/remove-entry st# pid#))))))
+(extend-clause! :registry registry-clause)
 
 ;; ── the verbs (tier 2: hold for every registry) ────────────────────────
 
