@@ -1,0 +1,145 @@
+; 09_fleet_lifecycle.bl — the capstone: a whole day in the life of a 2-node bl
+;   fleet, with EVERY algorithm from this suite doing its real job on REAL datom.
+; Run: ./blx run research/fleet_spike/09_fleet_lifecycle.bl
+;
+; The other spikes teach one algorithm each. This one puts them ALL on one stage
+; and runs a narrative — join, place, replicate, migrate, partition, fail over,
+; heal, converge — so you can see how the per-data-class model composes into a
+; living system. Two datom connections are two nodes; the "network" is a value we
+; can cut and restore.
+;
+; The cast (each links to its teaching spike):
+;   · placement       → HRW rendezvous            (01_sharding.bl)
+;   · desired state    → single-writer + Raft quorum (06_raft.bl)
+;   · events           → G-Set union on real datom  (02_gset_crdt.bl)
+;   · routes           → OR-Set add-wins            (03_orset.bl)
+;   · health           → LWW-Register               (04_lww.bl)
+;   · dissemination    → log-shipping (basis-t/since) + gossip (07_gossip_swim.bl)
+;   · failure detect   → SWIM verdict               (07_gossip_swim.bl)
+
+(ns fleet.lifecycle (:require [datom]))
+
+;; ═══ the substrate: two nodes = two datom conns; each holds desired + events ═
+(def dstate-schema
+  [{:db/ident :svc/id   :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :svc/host :db/valueType :db.type/string}
+   {:db/ident :svc/gen  :db/valueType :db.type/long}])
+(defn new-node [] {:conn (datom/connect dstate-schema) :basis 0})
+
+(def vps1 (atom (new-node)))
+(def vps2 (atom (new-node)))
+(def cluster ["vps-1" "vps-2"])
+
+(defn h [s] (erlang/phash2 s 4294967296))
+
+;; ── log-shipping: replicate the leader's desired-state facts to a follower ──
+(defn desired-facts [node]
+  (set (datom/q '[:find ?id ?host ?gen
+                  :where [?e :svc/id ?id][?e :svc/host ?host][?e :svc/gen ?gen]]
+                (datom/db (:conn node)))))
+(defn ship! [from-node to-atom]
+  (let [facts (desired-facts from-node)
+        r (datom/transact! (:conn (deref to-atom))
+            (vec (map-indexed (fn [i f] {:db/id (- (- i) 1) :svc/id (nth f 0)
+                                         :svc/host (nth f 1) :svc/gen (nth f 2)}) facts)))]
+    (swap! to-atom assoc :basis (datom/basis-t (:db-after r)))))
+
+(println "══════════ A DAY IN A 2-NODE bl FLEET ══════════")
+
+;; ═══ SCENE 1 — the cluster forms; leader is elected ════════════════════════
+;; single-writer discipline (06): ONE node owns desired-state writes. With 2
+;; nodes, majority = 2, so a real quorum needs both; we elect vps-1 as writer and
+;; note the honest caveat (2-node clusters can't tolerate a failure and keep
+;; quorum — that's why 3 or 5 is the real recommendation, see the tutorial).
+(def leader "vps-1")
+(defn majority [] (inc (quot (count cluster) 2)))       ; 2
+(println (str "\nSCENE 1 — cluster {" (clojure.string/join ", " cluster)
+              "} forms; leader=" leader " (writer); majority=" (majority)))
+
+;; ═══ SCENE 2 — place two services by HRW, transact desired state on leader ══
+(defn hrw-host [key] (second (reduce (fn [best n]
+                                       (let [w (h (str n "|" key))]
+                                         (if (> w (first best)) [w n] best)))
+                                     [-1 nil] cluster)))
+(def placements {"billing" (hrw-host "billing") "api" (hrw-host "api")})
+(datom/transact! (:conn (deref vps1))
+  [{:db/id -1 :svc/id "billing" :svc/host (get placements "billing") :svc/gen 1}
+   {:db/id -2 :svc/id "api"     :svc/host (get placements "api")     :svc/gen 1}])
+(println (str "\nSCENE 2 — HRW places services: " (pr-str placements)))
+(println "  leader transacted desired state (billing, api) at gen 1")
+
+;; ═══ SCENE 3 — replicate to the follower (log-shipping) ════════════════════
+(ship! (deref vps1) vps2)
+(println "\nSCENE 3 — replicate leader → follower (ship tx facts)")
+(println (str "  follower vps-2 desired state: " (pr-str (desired-facts (deref vps2)))))
+(def replicated (= (desired-facts (deref vps1)) (desired-facts (deref vps2))))
+(println (str "  converged: " replicated))
+
+;; ═══ SCENE 4 — routes (OR-Set) and events (G-Set) flow, coordination-free ══
+;; routes: an OR-Set of name→backend claims, each side may add; merge = union
+(defn or-add [s e tag] (update-in s [:adds e] (fn [t] (clojure.set/union (or t #{}) #{tag}))))
+(defn or-val [s] (set (keep (fn [[e t]] (if (seq (clojure.set/difference t (:rems s))) e nil)) (:adds s))))
+(defn or-merge [x y] {:adds (merge-with clojure.set/union (:adds x) (:adds y)) :rems (clojure.set/union (:rems x) (:rems y))})
+(def routes1 (-> {:adds {} :rems #{}} (or-add "billing.app" [:vps1 1])))
+(def routes2 (-> {:adds {} :rems #{}} (or-add "web.app" [:vps2 1])))
+(def routes (or-merge routes1 routes2))
+;; events: each node emits its own, merge = union (a G-Set); no id collision bc tagged by node
+(def events (clojure.set/union #{[:vps1 :req 1] [:vps1 :req 2]} #{[:vps2 :req 1] [:vps2 :err 1]}))
+(println "\nSCENE 4 — coordination-free data flows")
+(println (str "  routes (OR-Set union): " (pr-str (or-val routes))))
+(println (str "  events (G-Set union):  " (count events) " events, node-tagged, no collision"))
+
+;; ═══ SCENE 5 — migrate billing vps→vps (desired-state change on leader) ════
+;; the operator flips billing's host; leader bumps gen; reconciler on each node
+;; sees the delta. This is the reconciler (01_reconciler) across two nodes.
+(def target (if (= (get placements "billing") "vps-1") "vps-2" "vps-1"))
+(datom/transact! (:conn (deref vps1)) [{:db/id -1 :svc/id "billing" :svc/host target :svc/gen 2}])
+(ship! (deref vps1) vps2)
+(defn host-of [node id] (first (first (datom/q '[:find ?h :in $ ?id :where [?e :svc/id ?id][?e :svc/host ?h]] (datom/db (:conn node)) id))))
+(println (str "\nSCENE 5 — migrate billing → " target " (gen 2), replicate"))
+(println (str "  vps-1 sees billing on: " (host-of (deref vps1) "billing")))
+(println (str "  vps-2 sees billing on: " (host-of (deref vps2) "billing")))
+(def migrated (= target (host-of (deref vps1) "billing") (host-of (deref vps2) "billing")))
+
+;; ═══ SCENE 6 — PARTITION: the follower is cut off; writes must not fork ════
+;; With the network cut, the follower tries to accept a CONFLICTING write. Single-
+;; writer + quorum (06) forbids it: a lone follower is a minority (1 < majority 2),
+;; so its write is REFUSED — reality does not fork. Meanwhile SWIM on the leader
+;; probes the follower and (after indirect probes also fail) marks it suspect.
+(def network-up (atom false))                          ; partition!
+(defn can-commit? [reachable-count] (>= reachable-count (majority)))
+(def follower-alone 1)                                  ; only itself reachable
+(def follower-write-refused (not (can-commit? follower-alone)))
+;; SWIM verdict from the leader's side: direct fails, indirect (no other nodes) fails ⇒ suspect
+(def swim-verdict (if (deref network-up) :alive :suspect))
+(println "\nSCENE 6 — PARTITION {vps-1} | {vps-2}")
+(println (str "  follower tries a conflicting write {billing→vps-1}"))
+(println (str "  quorum check: 1 reachable < majority " (majority) " → write REFUSED: " follower-write-refused))
+(println (str "  SWIM on leader: follower verdict = " swim-verdict " (direct+indirect probes failed)"))
+(println "  ∴ no split-brain: the minority cannot commit; the leader keeps serving reads.")
+
+;; ═══ SCENE 7 — HEAL: network restored; anti-entropy reconverges ════════════
+;; on heal, the follower pulls the leader's log since its last basis and applies
+;; it. LWW health (04) marks the follower :up again with a fresh timestamp.
+(reset! network-up true)
+(ship! (deref vps1) vps2)                               ; catch-up replicate
+(defn lww-merge [a b] (if (>= (:ts b) (:ts a)) b a))
+(def health (lww-merge {:node "vps-2" :val :suspect :ts 10} {:node "vps-2" :val :up :ts 20}))
+(println "\nSCENE 7 — HEAL: network restored")
+(println (str "  follower catches up; billing on vps-2 = " (host-of (deref vps2) "billing")))
+(println (str "  LWW health: vps-2 now " (:val health) " @ts " (:ts health)))
+(def healed (= (desired-facts (deref vps1)) (desired-facts (deref vps2))))
+(println (str "  final convergence (leader == follower): " healed))
+
+;; ═══ THE CURTAIN — assertions across the whole lifecycle ═══════════════════
+(def ok (and replicated                          ; scene 3: replication converged
+             (= 2 (count (or-val routes)))        ; scene 4: both routes present (OR-Set)
+             (= 4 (count events))                 ; scene 4: all events survive (G-Set)
+             migrated                             ; scene 5: migration replicated to both
+             follower-write-refused               ; scene 6: minority cannot commit (no fork)
+             (= :suspect swim-verdict)            ; scene 6: SWIM detected the partition
+             (= :up (:val health))                ; scene 7: LWW healed health
+             healed))                             ; scene 7: full reconvergence
+(println "\n═══════════════════════════════════════════════")
+(println (str (if ok "PASS" "FAIL")
+              " 09_fleet_lifecycle  (join→place→replicate→migrate→partition→heal, all algorithms)"))

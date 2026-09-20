@@ -23,6 +23,7 @@ first for the organizing idea; then read these in order for the full argument.
 | **desired state** | ONE truth, no split-brain | Raft (consensus) | [06](06-raft.md) |
 | **dissemination + failure** | spread + detect death robustly | gossip + SWIM | [07](07-gossip-swim.md) |
 | the design choice itself | — | OT vs CRDT, justified | [08](08-ot-vs-crdt.md) |
+| **all of them, composed** | a full fleet day | the capstone integration | [09](09-fleet-lifecycle.md) |
 
 ## The three threads that tie them together
 

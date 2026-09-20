@@ -114,6 +114,7 @@ impl is **Ra** (rabbitmq/ra — multi-Raft, Jepsen-tested).
 | 06 | `06_raft.bl` | Raft (election + replication + single-writer + split-brain) | desired state |
 | 07 | `07_gossip_swim.bl` | anti-entropy gossip + SWIM failure detection | dissemination |
 | 08 | `08_ot_vs_crdt.bl` | OT vs CRDT, side by side | the design choice, justified |
+| 09 | `09_fleet_lifecycle.bl` | **the capstone** — a whole 2-node fleet day (join→place→replicate→migrate→partition→heal) with every algorithm integrated on real datom | all of them, composed |
 
 ## A note on fidelity
 
