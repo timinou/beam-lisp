@@ -21,7 +21,7 @@ re-registers; callers never notice.
 ## Making one
 
 ```clojure
-(ns my-app (:require [reg :as reg]))
+(ns my-app (:require [proc.reg :as reg]))
 
 (reg/defregistry sessions (keys :user-id))
 
@@ -93,7 +93,7 @@ Try it in `examples/registry.bl`: register a worker, `kill` it, and
 1. Register two workers under the same `{:team :red}` and different `:id`s;
    use `reg/where` to reach the team and `reg/whereis` to reach one.
 2. What happens if you register the *same pid* twice under different attrs?
-   Read `register-entry` in `priv/std/reg.bl` and predict, then test.
+   Read `register-entry` in `priv/std/proc/reg.bl` and predict, then test.
 3. `(stop r)` the registry and then `(call [:sessions {:user-id 42}] :ping)`.
    What error do you get, and why is it *that* error? (Read `resolve` in
    `lib/beam_lisp/server.ex`.)

@@ -38,7 +38,7 @@ universal.
 | tier | where | verbs | holds for |
 |---|---|---|---|
 | **1 prelude** | top-level | `start` `start-link` `stop` · `call` `cast` · `monitor` `link` `kill` · `fence` `fence-fn` · `supervise` `worker` | every process |
-| **2 behaviour** | `kind/` ns | `super/children` `super/child-of` `super/terminate` `super/restart` · `reg/register` `reg/unregister` `reg/whereis` `reg/where` · `bus/publish` · `flow/subscribe` (a bus *is* a producer) | every process of that kind |
+| **2 behaviour** | `proc.super`, `proc.reg`, `proc.bus`, `proc.flow` | `proc.super/children` `proc.super/child-of` `proc.super/terminate` `proc.super/restart` · `proc.reg/register` `proc.reg/unregister` `proc.reg/whereis` `proc.reg/where` · `proc.bus/publish` · `proc.flow/subscribe` (a bus *is* a producer) | every process of that kind |
 | **3 domain** | your ns, plain `defn` | `(defn withdraw [a n] (call a [:withdraw n]))` | this protocol |
 | **4 definition** | only inside a `def*` | `init handle-call handle-cast handle-info name invariant` · `ok reply noreply stop` · `keys` · `demand` · `strategy intensity child pool` | return vocabulary |
 | **graph** | `system/` | `system/verify` `system/model` | beam-lisp's addition; the BEAM has no equivalent |
@@ -89,7 +89,7 @@ Bundle: Loop-Carried State + Ask + Tell + Correlated Reply + Timeout Edge.
   emitter also asserts in dev builds; `system/verify` reads it for
   `establishes?`/`preserves?`. ~20 lines in `priv/boot/compiler.bl`.
 - `call`/`cast`/`start`/`start-link`/`stop`: rename of `server-*` in the
-  prelude, plus name resolution (`[:reg key]` → `reg/whereis`) at the top of
+  prelude, plus name resolution (`[:reg key]` → `proc.reg/whereis`) at the top of
   each. `call` takes `{:timeout ms}` as optional third arg.
 
 ---
@@ -111,10 +111,10 @@ define, nothing to supervise.
 ;; :kill? true → exit the child on timeout (default true)
 ;; :as :throw  → raise instead of returning the map
 
-(map #(fence-fn 50 %) thunks)        ; higher-order; composes with flow/map-stage
+(map #(fence-fn 50 %) thunks)        ; higher-order; composes with proc.flow/map-stage
 ```
 
-**Implementation.** `priv/std/fence.bl`, ~30 lines:
+**Implementation.** `priv/std/proc/fence.bl`, ~30 lines:
 
 ```clojure
 (defmacro fence [opts & body] `(fence-fn ~opts (fn [] ~@body)))
@@ -146,10 +146,10 @@ Bundle: Loop-Carried State (a relation) + Ask + Monitor (auto-retract).
   (keys :user-id :node))             ; attributes stored with each pid
 
 (def r (start sessions))
-(reg/register   r pid {:user-id 42 :node (node)})
-(reg/whereis    r {:user-id 42})     ; → pid | nil
-(reg/where      r '[:find ?p :where [?e :node "b@h"] [?e :pid ?p]])   ; datalog
-(reg/unregister r pid)
+(proc.reg/register   r pid {:user-id 42 :node (node)})
+(proc.reg/whereis    r {:user-id 42})     ; → pid | nil
+(proc.reg/where      r '[:find ?p :where [?e :node "b@h"] [?e :pid ?p]])   ; datalog
+(proc.reg/unregister r pid)
 ;; an entry retracts itself when its pid dies
 
 ;; a name is a value — every prelude verb accepts one
@@ -168,7 +168,7 @@ and `erlang/monitor`s; `[:whereis attrs]` / `[:where q]` query;
 `handle-info [:DOWN _ :process pid _]` retracts every datom with that `:pid`.
 Invariant: every `:pid` in the db is alive — the Monitor rule (`:DOWN`
 handled in the only state) is what `system/verify` checks. `(name …)` on
-`defserver` → `init` prepends `reg/register`. `priv/std/registry.bl`, ~100 lines;
+`defserver` → `init` prepends `proc.reg/register`. `priv/std/proc/reg.bl`, ~100 lines;
 `examples/tooling/vitals.bl`'s atom registry cuts over. Single-node only in this slice.
 
 ---
@@ -183,10 +183,10 @@ backpressure.
   (demand 16))                       ; per-subscriber pull size (default 8)
 
 (def b (start payments))
-(flow/subscribe b :ledger ledger/record!)                       ; a fn
-(flow/subscribe b :big    (flow/filter-stage #(> (:amount %) 1000) email/send!)
+(proc.flow/subscribe b :ledger ledger/record!)                       ; a fn
+(proc.flow/subscribe b :big    (proc.flow/filter-stage #(> (:amount %) 1000) email/send!)
                           {:on-lag :drop-oldest})               ; a stage + policy
-(bus/publish b {:type :paid :amount 42})
+(proc.bus/publish b {:type :paid :amount 42})
 (stop b)                             ; End-of-Stream to every subscriber
 ```
 
@@ -198,10 +198,10 @@ queue to `:max-lag` (default 1024), then its policy fires: `:block` (the
 **Implementation.** `defbus` expands to a `defserver` with state
 `{:subs {id {:pid :demand :queue :policy}} :closed? false}` speaking `flow`'s
 existing `[:subscribe]/[:demand]/[:events]/[:done]` protocol — so every flow
-consumer already speaks bus and `flow/subscribe` needs no bus-specific code.
+consumer already speaks bus and `proc.flow/subscribe` needs no bus-specific code.
 `[:publish ev]` appends to each queue then drains `min(demand queue)` per
 subscriber; lag policy applied in drain; `:DOWN` auto-unsubscribes.
-`priv/std/bus.bl`, ~80 lines. `flow/broadcast` (any producer → bus) is the same
+`priv/std/proc/bus.bl`, ~80 lines. `proc.flow/broadcast` (any producer → bus) is the same
 server started from a producer instead of `bus/publish`.
 
 ---
@@ -222,9 +222,9 @@ Bundle: Monitor|Link + Healing Edge + Governor + Invariant Gate.
 
 (system/verify 'bank/billing)   ; whole-graph gate, before boot
 (def s (start-link billing))
-(super/children s)              ; → [{:id :acct :pid … :restarts 0} …]
-(call (super/child-of s :acct) :balance)
-(super/terminate s :acct)       ; → healed: new pid, restarts 1
+(proc.super/children s)              ; → [{:id :acct :pid … :restarts 0} …]
+(call (proc.super/child-of s :acct) :balance)
+(proc.super/terminate s :acct)       ; → healed: new pid, restarts 1
 
 ;; existing wrapping form — same result
 (supervise :one-for-one {:intensity [3 5000]}
@@ -234,7 +234,7 @@ Bundle: Monitor|Link + Healing Edge + Governor + Invariant Gate.
 `child` takes **any** startable name — a server, bus, registry, another
 supervisor — so no form needs a `child_spec` callback. `pool` is N identical
 children under a `one-for-one` sub-supervisor with a Fan-Out(distribute)
-front: `(cast (super/child-of s :workers) job)` reaches one worker with demand.
+front: `(cast (proc.super/child-of s :workers) job)` reaches one worker with demand.
 
 **What `system/verify` checks on a tree:**
 
@@ -257,7 +257,7 @@ OTP child specs whose `start` is `(fn [] (start-link child args))`, and
 new restart machinery. `supervise`/`worker` are rewritten to produce the same
 specs. `system/verify` on a supervisor name = `system.core` verbs over
 `(system.model/system-model children-sources)` plus the two new checks
-(~40 lines, `priv/std/super.bl`). `super/children`/`child-of`/`terminate`/`restart`
+(~40 lines, `priv/std/proc/super.bl`). `super/children`/`child-of`/`terminate`/`restart`
 wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
 `examples/tooling/vitals.bl`'s hand-rolled supervisor cuts over.
 
@@ -273,9 +273,9 @@ wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
   (init [_] (ok {:done 0}))
   (handle-cast [:job j] [s]
     (match (fence 50 (process j))
-      {:ok v}     (do (bus/publish [:results] v)               (noreply (update s :done inc)))
-      {:crash r}  (do (bus/publish [:errors] {:job j :r r})    (noreply s))
-      {:timeout}  (do (bus/publish [:errors] {:job j :r :hung}) (noreply s))))
+      {:ok v}     (do (proc.bus/publish [:results] v)               (noreply (update s :done inc)))
+      {:crash r}  (do (proc.bus/publish [:errors] {:job j :r r})    (noreply s))
+      {:timeout}  (do (proc.bus/publish [:errors] {:job j :r :hung}) (noreply s))))
   (handle-call :stats [_ s] (reply s s)))
 
 (defbus results (demand 32))
@@ -292,8 +292,8 @@ wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
 
 (system/verify 'jobs/app)                              ; :ok
 (def s (start-link app))
-(flow/subscribe (super/child-of s :errors) :log println)
-(doseq [j job-list] (cast (super/child-of s :pool) [:job j]))
+(proc.flow/subscribe (proc.super/child-of s :errors) :log println)
+(doseq [j job-list] (cast (proc.super/child-of s :pool) [:job j]))
 (call [:workers {:id some-id}] :stats)
 ```
 
@@ -305,11 +305,11 @@ wrap `Supervisor/which_children`/`terminate_child`/`restart_child` as maps.
 |---|---|---|---|
 | 1 | **Docs trued** (this commit) | `the-process-pattern-language.md`, `the-five-bundles.md` | — |
 | 2 | **Generic verbs**: `call` `cast` `start` `start-link` `stop` in prelude; name resolution hook (no-op until 5) | `priv/boot/core.bl` (where `server-call` lives), `priv/boot/compiler.bl` client API | `examples/server.bl`, `guards.bl` green using new names; `server-*` removed (cutover) |
-| 3 | **`fence`** | `priv/std/fence.bl` | new `examples/fence.bl`: three outcomes green; `ward` per-test wrapper cut over; note for spell to cut its two copies |
+| 3 | **`fence`** | `priv/std/proc/fence.bl` | new `examples/fence.bl`: three outcomes green; `ward` per-test wrapper cut over; note for spell to cut its two copies |
 | 4 | **`defserver (invariant …)`** clause + `system/verify` on a server name | `priv/boot/compiler.bl`, `priv/lib/system/core.bl` | `guards.bl` `account` gains invariant; `(system/verify 'account)` → `:ok`; a deliberately bad server → `{:unsafe …}` |
-| 5 | **`defregistry`**, `(name …)` clause, name resolution in verbs | `priv/std/registry.bl`, `priv/boot/compiler.bl`, `priv/boot/core.bl` | `examples/registry.bl`: register / whereis / where / auto-retract on kill; `examples/tooling/vitals.bl` atom registry cut over |
-| 6 | **`defbus`** on flow's protocol, `flow/broadcast` | `priv/std/bus.bl`, `priv/std/flow.bl` | `examples/bus.bl`: two subscribers, one slow, `:drop-oldest` observed; `stop` reaches both |
-| 7 | **`defsupervisor`**, `child`, `pool`, `super/*`, `system/verify` over a tree; `supervise`/`worker` as skin | `priv/std/super.bl`, `lib/beam_lisp/rt.ex` (specs only), `priv/lib/system/core.bl` | `examples/supervision.bl` green; `system/verify` **rejects** a child with a lasso; `examples/tooling/vitals.bl` hand-rolled sup cut over |
+| 5 | **`defregistry`**, `(name …)` clause, name resolution in verbs | `priv/std/proc/reg.bl`, `priv/boot/compiler.bl`, `priv/boot/core.bl` | `examples/registry.bl`: register / whereis / where / auto-retract on kill; `examples/tooling/vitals.bl` atom registry cut over |
+| 6 | **`defbus`** on flow's protocol, `flow/broadcast` | `priv/std/proc/bus.bl`, `priv/std/proc/flow.bl` | `examples/bus.bl`: two subscribers, one slow, `:drop-oldest` observed; `stop` reaches both |
+| 7 | **`defsupervisor`**, `child`, `pool`, `super/*`, `system/verify` over a tree; `supervise`/`worker` as skin | `priv/std/proc/super.bl`, `lib/beam_lisp/rt.ex` (specs only), `priv/lib/system/core.bl` | `examples/supervision.bl` green; `system/verify` **rejects** a child with a lasso; `examples/tooling/vitals.bl` hand-rolled sup cut over |
 | 8 | **§6 example** + pattern ledger ◐/○ → ✅ | `examples/bundles/00-all-five.bl`, `the-process-pattern-language.md` | example green end to end |
 
 Steps 2 and 3 are independent (parallel). 4 needs 2. 5–7 each need 2; 7 needs

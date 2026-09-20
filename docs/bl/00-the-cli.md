@@ -894,6 +894,12 @@ A project file shadows a shipped library of the same name. Inside the beam-lisp
 checkout the shipped tiers are already on the search path, so no extra root is
 needed.
 
+A process **bundle** lives at `priv/std/proc/<name>.bl` and declares
+`(ns proc.<name>)` — the path and the namespace are one fact, so a bundle has
+exactly one home. `priv/std/proc.bl` is the tier's door: `(:require [proc :as proc])`
+reaches every bundle's verbs through it, while `(:require [proc.tick])` still
+loads one bundle on its own.
+
 The loader reads `.bl` sources and literate `.bl.md` / `.bl.org` documents; a
 namespace may live in any of them.
 

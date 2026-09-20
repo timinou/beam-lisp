@@ -13,7 +13,7 @@ expressible.
 
 | ns | role | built on |
 |---|---|---|
-| `vm.owner` | an env owns the processes spawned under it; teardown = `halt` over exactly that set | `reg.bl` (monitor-retract registry) |
+| `vm.owner` | an env owns the processes spawned under it; teardown = `halt` over exactly that set | `proc.reg.bl` (monitor-retract registry) |
 | `vm.scope` | scope `System/halt` to the calling VM — end my sandbox, never the node | process-dict scope + `vm.owner` |
 | `vm.core` | a VM as data: `{id root base env caps status}` + lifecycle (`spawn-vm`/`serve`/`run`/`drain`) | `env.bl`, `vm.owner`, `vm.scope` |
 | `vm.spec` | a VM spec from `env.bl` overlaid by gitignored `.env.local.bl`; collision-proof `:id` | `bl.env`, deep-merge |
@@ -23,7 +23,7 @@ expressible.
 
 - **GenServer** → `defserver` (real `:gen_server`)
 - **Supervisor** → `super/defsupervisor` + `pool`
-- **Registry (monitor-retract)** → `reg/defregistry` — the key to env-scoped teardown
+- **Registry (monitor-retract)** → `proc.reg/defregistry` — the key to env-scoped teardown
 - **named process / routing** → `{:name …}` at start + name-as-value in `call`/`cast`
 - **bounded child** → `fence`
 - **content-addressed warm base** → `BeamLisp.Sandbox/warm!` (`:persistent_term`), consumed as `:base`

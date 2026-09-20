@@ -21,7 +21,7 @@ grows back.
 ## A tree, written as data
 
 ```clojure
-(ns my-app (:require [super :as super]))
+(ns my-app (:require [proc.super :as super]))
 
 (super/defsupervisor shop
   (strategy :one-for-one)       ; a dead child regrows alone

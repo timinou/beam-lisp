@@ -23,7 +23,7 @@ Load the standard namespace and wrap an expression:
 
 ```clojure
 (ns my.app
-  (:require [fence :refer :all]))
+  (:require [proc.fence :refer :all]))
 
 (fence 200 (risky-work))
 (fence {:ms 200 :kill? true} (risky-work))
@@ -42,7 +42,7 @@ A number is shorthand for `{:ms number}`. `:kill?` defaults to `true`, which exi
 
 ```clojure
 (ns examples.fence
-  (:require [fence :refer :all]))
+  (:require [proc.fence :refer :all]))
 
 (def ok-result
   (fence 200 (+ 20 22)))

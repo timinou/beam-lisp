@@ -137,7 +137,7 @@ Two design rules keep the vocabulary closed and teachable:
 `system/model` reads directly (this is why the `defprocess` proposal was
 withdrawn; see `docs/the-fundamental-form.md`'s supersession note). `system` is
 not an entity either — it is the observation layer (category 4) applied to all
-the others. `flow` (`priv/std/flow.bl`) is the composition library (category 2)
+the others. `flow` (`priv/std/proc/flow.bl`) is the composition library (category 2)
 as pull-based stages. Seven candidate "fundamental things" reduce to: **one
 primitive, 23 patterns, five bundles, two libraries.**
 

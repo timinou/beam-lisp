@@ -13,10 +13,10 @@ deliberately complete:
 
 ```clojure
 (defserver ^{:invariant (>= done 0)} worker …)   ; 04: a promise on state
-(bus/defbus results-bus (demand 32))              ; 06: streams with backpressure
-(bus/defbus errors-bus  (demand 8))
-(reg/defregistry workers (keys :id))              ; 05: find by what it is
-(super/defsupervisor app                          ; 07: a tree that heals
+(proc.server/defserver results-bus (bus (demand 32)))   ; 06: streams with backpressure
+(proc.server/defserver errors-bus  (bus (demand 8)))
+(proc.server/defserver workers (registry (keys :id)))   ; 05: find by what it is
+(proc.super/defsupervisor app                           ; 07: a tree that heals
   (strategy :one-for-one)
   (intensity 5 10000)
   (child :workers-reg workers     nil {:name :workers})
@@ -50,7 +50,7 @@ dead worker's entry retracts itself. The script asks for stats by *name*:
 
 **The supervisor (07)** owns them all. When the script kills worker 1 in cold
 blood, the tree regrows it, the new worker's `init` re-registers the name, and
-`(reg/whereis :workers {:id 1})` points at the new pid. Every piece you read
+`(proc.reg/whereis :workers {:id 1})` points at the new pid. Every piece you read
 about in isolation, doing its one job in one composition.
 
 **The invariant (04)** runs *before any of it boots*:

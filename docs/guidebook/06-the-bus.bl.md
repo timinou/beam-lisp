@@ -27,8 +27,8 @@ A pipeline has one downstream pace. A bus has one pace per subscriber. The ledge
 
 ```clojure
 (ns payments
-  (:require [bus :as bus]
-            [flow :as flow]))
+  (:require [proc.bus :as bus]
+            [proc.flow :as flow]))
 
 (bus/defbus payments (demand 16))
 
@@ -66,11 +66,11 @@ A dead subscriber cannot hold the bus forever. The bus monitors every subscripti
 `flow/broadcast` turns any producer into a bus:
 
 ```clojure
-(def source (flow/from-seq (range 1 101)))
-(def b (flow/broadcast source {:demand 8 :max-lag 32}))
+(def source (proc.flow/from-seq (range 1 101)))
+(def b (proc.flow/broadcast source {:demand 8 :max-lag 32}))
 
-(flow/subscribe b :sum add-to-total {:demand 8 :on-lag :block})
-(flow/subscribe b :screen redraw {:demand 1 :on-lag :drop-oldest})
+(proc.flow/subscribe b :sum add-to-total {:demand 8 :on-lag :block})
+(proc.flow/subscribe b :screen redraw {:demand 1 :on-lag :drop-oldest})
 ```
 
 The bridge speaks the same subscribe, demand, events, and done protocol. The source remains pull-driven. When the source sends `[:done]`, the bridge stops the bus, and the bus forwards completion to all subscribers.
@@ -98,7 +98,7 @@ It publishes twenty values to a fast blocking subscriber and a deliberately slow
 1. Change the slow subscriber to `:block`. Measure how long publishing twenty events takes.
 2. Change it to `:detach` and print the `:lagged` event received by the remaining subscriber.
 3. Kill a subscriber while a publisher is blocked. Confirm that monitoring removes it and publishing continues.
-4. Build a `flow/from-seq` source, broadcast it, and attach consumers with demand sizes 1 and 10. Compare their batches without changing the source.
+4. Build a `proc.flow/from-seq` source, broadcast it, and attach consumers with demand sizes 1 and 10. Compare their batches without changing the source.
 
 ---
 

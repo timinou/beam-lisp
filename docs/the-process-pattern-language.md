@@ -27,6 +27,31 @@ Format per pattern (Alexander-style, adapted):
 
 ---
 
+## Where a bundle lives
+
+A **bundle** is one namespace that teaches one pattern language for a running
+process — a server and its clauses, a heartbeat, a bus, a registry, a
+supervision tree, a fence, a deadline queue — together with the verbs that act
+on it. Every bundle lives in one place, and the file name and the namespace are
+the same fact:
+
+    priv/std/proc/<name>.bl        (ns proc.<name>)
+
+`priv/std/proc.bl` — `(ns proc)` — is the tier's door. One require
+(`(:require [proc :as proc])`) reaches every bundle's verbs through it, while
+`(:require [proc.tick])` still loads one bundle on its own. `proc.server` is the
+expander that turns each bundle into a set of clauses on one server form, which
+is why a consumer writes the FORM once and the clauses come from wherever they
+live. The bundles are `proc.server`, `proc.tick`, `proc.sched`, `proc.table`,
+`proc.queue`, `proc.flow`, `proc.bus`, `proc.reg`, `proc.super` and
+`proc.fence`; `priv/std/proc.bl` carries the same list with a line on each.
+
+**To add a bundle: add `proc/<name>.bl`.** Nothing sits loose at the root of
+`priv/std`, so there is never a question of which of two paths is the real one —
+a bundle that is referenced as `proc.<name>` IS that file.
+
+---
+
 ## 0. The substrate: the receive loop, as the reader sees it
 
 There is no new definition form underneath the patterns. The substrate is the
@@ -67,7 +92,7 @@ BEAM's own layering — see `the-five-bundles.md` §0):
 | tier | examples | holds for |
 |---|---|---|
 | prelude | `start start-link stop call cast monitor link kill fence` | every process |
-| `kind/` | `super/children reg/whereis bus/publish flow/subscribe` | every process of that behaviour |
+| `proc.*` | `proc.super/children` `proc.reg/whereis` `proc.bus/publish` `proc.flow/subscribe` | every process of that behaviour |
 | your ns | `(defn withdraw [a n] (call a [:withdraw n]))` | this protocol |
 | inside `def*` | `init handle-call reply noreply ok stop …` | return vocabulary |
 

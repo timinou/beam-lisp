@@ -348,13 +348,13 @@ state and a clause's slice in ONE `init`, which a macro could never express:
 
 | the sketch | as built | why |
 |---|---|---|
-| `(tick …)` as a `defserver` clause | `(tick …)` as a `defserver` clause ✅ | the std expander landed (P1.5, `priv/std/server.bl`), so the clause is real and `defbeat` is deleted |
+| `(tick …)` as a `defserver` clause | `(tick …)` as a `defserver` clause ✅ | the std expander landed (P1.5, `priv/std/proc/server.bl`), so the clause is real and `defbeat` is deleted |
 | `(tick N UNIT opts? BODY)` | `(tick N UNIT opts? [state] BODY)` | the body must have a NAME for the state it returns — every other `defserver` clause has one, so this is not a wart, it is the missing half of the sketch |
 | `:catch-up`, `:reset-on` | **rejected** | both are DEADLINE policies: a missed deadline and an overlapping run are possibilities only a durable queue has. They arrive with `defscheduler`; here they are a loud error |
 | — | **`:once`** | the debounce needs a tick that does not re-arm; `:once` + `tick-reset` is the whole pattern |
 
 **The clause vocabulary is now open, and the vocabulary is DATA.**
-`priv/std/server.bl` registers clause heads (`extend-clause!`) and lowers every
+`priv/std/proc/server.bl` registers clause heads (`extend-clause!`) and lowers every
 clause to one boot `defserver`. It validates a head against the compiler's OWN
 table (`BeamLisp.Server/callback`, so there is no second list to drift) plus the
 registry, and reports an unknown one with the whole accepted set — where the
@@ -387,7 +387,7 @@ without a process, a sleep, or a wait. `wall-ms` is only the default; a test
 passes a fixed clock, and `:anchor :wall` was verified by arithmetic rather than
 by hoping a wall clock landed where it should.
 
-**Location: `priv/std/tick.bl` — the correct tier.** An earlier revision of this
+**Location: `priv/std/proc/tick.bl` — the correct tier.** An earlier revision of this
 note moved it to `priv/lib` because the tree's `priv/std` appeared unsearchable.
 That was wrong, and the reason matters:
 
@@ -709,18 +709,23 @@ store it already uses for `:job/*`.
   (on-lag  :block))                                      ; no Demand ⇒ Tell is the flagged hazard
 ```
 
-### 4.5 Namespace map (proposed)
+### 4.5 Namespace map (as built)
 
 ```
 priv/std/proc.bl        (ns proc)          the umbrella — one require, the verbs
 priv/std/proc/server.bl (ns proc.server)   the EXPANDER: defserver + the clause registry
 priv/std/proc/tick.bl   (ns proc.tick)     the `(tick …)` clause
 priv/std/proc/sched.bl  (ns proc.sched)    the `(sched …)` clause — the deadline queue
-priv/std/{flow,bus,reg,super,fence}.bl     still loose; referred by proc.bl, moved
-                                           one commit at a time (FUP-097)
-priv/std/jobs.bl        defqueue · enqueue · perform · stats · retry · cancel · prune
+priv/std/proc/flow.bl   (ns proc.flow)     demand-driven streaming
+priv/std/proc/bus.bl    (ns proc.bus)      backpressured fan-out
+priv/std/proc/reg.bl    (ns proc.reg)      find a process by what it is
+priv/std/proc/super.bl  (ns proc.super)    supervision trees as data
+priv/std/proc/fence.bl  (ns proc.fence)    bounded isolation
+priv/std/proc/table.bl  (ns proc.table)    a store-backed table
+priv/std/proc/queue.bl  (ns proc.queue)    the durable owed-work clause
+priv/std/proc/jobs.bl   (ns proc.jobs)     ○ defqueue · enqueue · perform · stats · retry · cancel · prune
 vm/inspect.bl           :schedules, :jobs ← the pane, no new model
-vm/http.bl              GET /schedules · POST /schedules/<id>/{pause,resume,run-now}
+vm/http.bl                  GET /schedules · POST /schedules/<id>/{pause,resume,run-now}
 bl:  bl schedules [--json]  ·  bl jobs [--json]
 ```
 
@@ -778,7 +783,7 @@ that are already OTP callback names plus a meta slot — and std owns the mappin
 ```
 
 ```clojure
-;; STD (priv/std/server.bl) — the vocabulary, and a REGISTRY so it is open.
+;; STD (priv/std/proc/server.bl) — the vocabulary, and a REGISTRY so it is open.
 (srv/extend-clause! :tick
   (fn [clause ctx]
     ;; → real clauses to splice + a prelude for init
@@ -826,7 +831,7 @@ for the *name*. A std expander can already accept arbitrary clause names and
 lower them to boot-legal ones — that is exactly what `defbeat` does. So the
 copy-pasting can stop today:
 
-- `priv/std/server.bl` gains **one** shared expander: clause head → registered
+- `priv/std/proc/server.bl` gains **one** shared expander: clause head → registered
   transform, spliced into a single boot `defserver`.
 - `defregistry`, `defbus`, `defsupervisor` and `defbeat` each become a thin
   mapping over it, instead of four hand-copied `defserver` bodies.
@@ -904,7 +909,7 @@ and the seven clauses `defbus` copies today: `[:publish ev]` as both a call
 Unchanged, and not deprecated. A supervisor is a different **process type**
 (`:supervisor`, not `gen_server`), so it is not a clause of `defserver` — it is
 the **second client of the same expander**. And it already *is* a clause-DSL
-over a descriptor (`priv/std/super.bl:95-134` emits
+over a descriptor (`priv/std/proc/super.bl:95-134` emits
 `{:__supervisor__ true :strategy … :intensity … :children (list …)}`), which is
 independent evidence that §4.6's design is the one the language already wanted.
 Its `strategy` / `intensity` / `child` names register in the same registry, so
@@ -920,7 +925,7 @@ their validation and their error messages come from the same place.
 
 A bundle is a *namespace of verbs plus a clause* — never a copied body. The
 macro spellings are deprecated as of 2026-09-18 (`^:deprecated` in
-`priv/std/reg.bl` and `priv/std/bus.bl`, with the successor named in the
+`priv/std/proc/reg.bl` and `priv/std/proc/bus.bl`, with the successor named in the
 docstring), and the deodorant smells that migrate consumers are written and
 parked in **FUP-094**, because a smell may only rewrite to a word that
 resolves — and the clause does not resolve until `server.bl` lands.
@@ -1176,12 +1181,12 @@ schedulers as first tenants (P4).
 ## 7. What gets prototyped, in this order
 
 ```
-P1  priv/std/tick.bl + examples/tooling/tick.bl                    ← DONE — 34 assertions green
+P1  priv/std/proc/tick.bl + examples/tooling/tick.bl                    ← DONE — 34 assertions green
       `bl -p priv/std test --shared test/bl/tick_test.bl`  (see FUP-093: the
       ward path cannot yet use the tree's own std, for reasons unrelated to it)
       intervals, wall anchors, jitter, injected clocks, one-shot + debounce,
       cancel, on-error :continue — all covered
-P1.5 priv/std/server.bl — the expander: defserver + an OPEN clause vocabulary  ← DONE
+P1.5 priv/std/proc/server.bl — the expander: defserver + an OPEN clause vocabulary  ← DONE
       `(tick …)` is a real clause, `defbeat` is deleted, a clause MERGES its
       slice into the server's state, and an unknown clause names the whole
       accepted set instead of `not a tuple`
