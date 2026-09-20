@@ -352,6 +352,66 @@
   (some (fn [m] (let [head (msg-head m)] (or (= head :datom/tx) (= head :datom/changed))))
         (mailbox)))
 
+(defn- cast-body
+  "The message inside a cast, if it is one.
+
+   `cast` does not deliver its payload bare: Erlang wraps it as
+   `{'$gen_cast', Msg}`, which the defserver unwraps before matching its
+   `handle-cast` clauses. A peek at the mailbox sees the ENVELOPE, so it has to
+   unwrap too — a peek that reads the raw message finds no event, so every
+   keystroke renders, which is exactly the bug this helper exists to prevent."
+  [m]
+  (if (and (erlang/is_tuple m) (= :"$gen_cast" (erlang/element 1 m)))
+    (erlang/element 2 m)
+    m))
+
+(defn- assign-queued?
+  "Is another `:assign` for the SAME locals path ALREADY in this process's
+   mailbox?
+
+   A keystroke is an `:assign`, and each one re-renders. Typing a word fires N
+   of them, so the socket renders N times for values of which only the last is
+   ever seen — and when the view is expensive (knowledger's search bar ranks
+   the firm's whole corpus per render, measurably ~1 s) that is N full searches
+   for one word.
+
+   The payload goes through `normalize-event` — the same function the cast
+   handler will use on it — so this reads the event the socket is ABOUT to read,
+   not a guess at the wire shape (an event arrives as a vector with keywords
+   in-process, and as lists of strings off a JSON round trip).
+
+   Superseding is safe BY CONSTRUCTION, not by policy: the queued event writes
+   the same path, so the state IT renders is the newer one, and nothing reads
+   locals between events. The chain always ends: the last queued assign finds
+   the mailbox empty and renders."
+  [path]
+  (let [want (str path)]
+    ; FAILS SAFE: anything this cannot read is not a supersession, so the render
+    ; happens exactly as it did before this existed. Getting that wrong costs one
+    ; render; guessing a supersession that is not there would cost the user their
+    ; keystroke.
+    (try
+      (some (fn [m]
+              (let [body (cast-body m)]
+                (if (= :event (msg-head body))
+                  (let [ev (normalize-event (erlang/element 2 body))
+                        ; one event, or a vector of them (an :on-* may carry several)
+                        evs (if (and (vector? ev) (> (count ev) 0) (vector? (first ev)))
+                              ev
+                              [ev])]
+                    (some (fn [e]
+                            ; `get`, not `nth`: a vector here is the runtime's own
+                            ; struct, which is what every vector accessor in this
+                            ; codebase indexes with.
+                            (and (vector? e)
+                                 (= :assign (first e))
+                                 (> (count e) 1)
+                                 (= want (str (get e 1)))))
+                          evs))
+                  false)))
+            (mailbox))
+      (catch _ false))))
+
 (defn on-commit
   "The shared or session world moved. Re-render, diff against the last
    tree, push the patch ops (only if non-empty), remember the new tree.
@@ -471,14 +531,20 @@
    :navigate — mutate locals (route/params), re-render now.
 
    `event-data` is the payload the client sent with the fire (DOM field
-   values for [:from …] sources)."
-  ([state ev] (handle-event state ev {}))
-  ([state ev event-data]
+   values for [:from …] sources).
+
+   `buffered?` says this event came off the WIRE (a cast), so more of them may
+   already be queued behind it — which is what makes superseding a keystroke's
+   render safe. An in-process CALL is synchronous: the caller waits for the
+   answer, so it gets its render, mailbox or not."
+  ([state ev] (handle-event state ev {} false))
+  ([state ev event-data] (handle-event state ev event-data false))
+  ([state ev event-data buffered?]
    ;; a NEW gesture from this viewer: the previous intent's outcome is stale
    (handle-event* (clear-outcome (if (:tap state) (assoc state :last-event ev) state))
-                  ev event-data)))
+                  ev event-data buffered?)))
 
-(defn- handle-event* [state ev event-data]
+(defn- handle-event* [state ev event-data buffered?]
    (cond
      ;; a vector of events: fold them in order. An intent that did NOT write
      ;; — denied, or a no-op (the performer validated and declined) — stops
@@ -492,7 +558,7 @@
            s
            (let [e (first es)
                  ;; inner steps keep the fold's outcome (only a NEW gesture clears it)
-                 s2 (handle-event* (if (:tap s) (assoc s :last-event e) s) e event-data)]
+                 s2 (handle-event* (if (:tap s) (assoc s :last-event e) s) e event-data buffered?)]
              (if (and (= :intent (first e))
                       (or (:denied-last s2)
                           (= :noop (get-in s2 [:locals :live/outcome :status]))))
@@ -504,7 +570,13 @@
              source (nth ev 2)
              value (resolve-source source event-data)
              state2 (assoc state :locals (assign-path (:locals state) path value))]
-         (on-commit state2))
+         ; A newer assign to the SAME path is already queued behind this WIRE
+         ; event, so this render would be thrown away: the later event renders
+         ; the newer value. Type a word into a search box and this is the
+         ; difference between N searches and one.
+         (if (and buffered? (assign-queued? path))
+           state2
+           (on-commit state2)))
 
      (= :navigate (first ev))
        (let [target (nth ev 1)
@@ -628,8 +700,12 @@
        ;; a browser event: a CAST on the wire (a WebSocket has no reply channel
        ;; — the reply was never used — and a call made a slow render fatal to the
        ;; transport), a CALL for in-process callers and tests.
-       (handle-cast [:event ev#] [st#] (noreply (handle-event st# ev#)))
-       (handle-cast [:event ev# data#] [st#] (noreply (handle-event st# ev# data#)))
+       ;;
+       ;; The cast passes `true` for `buffered?`: more wire events may already be
+       ;; queued behind this one, which is what lets a superseded keystroke skip
+       ;; its render. A call is synchronous and gets its render unconditionally.
+       (handle-cast [:event ev#] [st#] (noreply (handle-event st# ev# {} true)))
+       (handle-cast [:event ev# data#] [st#] (noreply (handle-event st# ev# data# true)))
 
        ;; the same, as a call, so an in-process caller can await :ok
        (handle-call [:event ev#] [_from# st#]
