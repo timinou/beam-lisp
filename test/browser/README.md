@@ -32,6 +32,19 @@ driving a real Chromium with Playwright against the JS client.
    mints a new one. Against the pre-heartbeat client, the three default claims
    fail and only the two opt-outs pass — which is the point.
 
+4. **`connect.spec.js` › navigation survives a reconnect** — the lifecycle claims
+   above stop at the socket; this one ties the socket back to the DOM. A
+   reconnect SWAPS the socket object, so every per-socket seam has to be
+   re-attached on the new one. `__navigate` was not: it was attached once, to
+   the first socket only. So on the socket a drop brought back, every in-app
+   `<a href="/…">` was `preventDefault`'d and then dropped — the URL never
+   moved, the page never repainted, nothing reached the wire, and the shell
+   reported itself `live` throughout. Dead links, only after a disconnect, was
+   the whole shape of the report. Against the pre-fix client this claim fails
+   (the click sends nothing at all); the click handler now also refuses to
+   `preventDefault` a link it cannot navigate, so the failure mode is a real
+   page load rather than silence.
+
 ## Run it
 
 ```sh
@@ -46,7 +59,7 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `10 passed` (3 differ + 7 lifecycle).
+Expected: `11 passed` (3 differ + 8 lifecycle).
 
 ## Why not Phoenix here
 
