@@ -3,23 +3,31 @@
 ; Parsing happens over a charlist so delimiters and escapes remain integer
 ; codepoints until a complete token or string is converted back to a binary.
 ;
-; TWO entry shapes, ONE read loop (`read-forms*`): `read-string` threads a
-; {line col file} position through every step and wraps LIST forms in
+; THREE entry shapes, ONE read loop (`read-forms*`): `read-string` threads a
+; {line col file offset} position through every step and wraps LIST forms in
 ; {:meta node pos} (the compiler reads these); `read-all` deep-unwraps them for
-; callers that only want bare shapes; `read-one` is the single-form entry.
+; callers that only want bare shapes; `read` takes an OPINIONS map and can hand
+; a failure back as a value; `read-one` is the single-form entry.
 ;
-; A failure raises `BeamLisp.Reader.SyntaxError`, and its MESSAGE carries
-; `file:line:col` — that prefix is the half that survives the CLI's error path,
-; and it is what FUP-102 asks of `bl run FILE`:
+; A failure raises a DIAGNOSTIC MAP — `{:bl_diag true :kind :msg :line :col
+; :file :offset …}` — the same shape the checker's warnings take, so
+; `errors/render` can draw it and a repair pass can read it. `:msg` is the
+; rendered one-line form (`file:line:col: message`), which is the half that
+; survives the CLI's error path — FUP-102's acceptance:
 ;
 ;   priv/std/proc/sched.bl:2:3: unterminated collection, expected ) — the (
 ;     opened here is never closed
 ;
+; The reader raises THAT map, never the host's error struct: a beam-lisp caller
+; catches a value it can read, and the host edge — which is shrinking — renders
+; one into whatever its own callers still expect.
+;
 ; The position reported is the one a human should LOOK at: the OPENER for an
 ; unterminated collection (not the end of the file), the offending character for
 ; a stray or mismatched closer, and the opening quote for an unterminated string.
-; Only the delimiter-shaped failures carry a position so far; the metadata,
-; reader-conditional and tagged-literal failures still raise a bare message.
+; `:kind` is filled in for the failures a REPAIR has a move for (close the
+; collection, swap the closer, drop the stray, close the quote); the rest carry
+; `:kind :syntax` and only a message.
 
 (ns reader
   (:require [reader-node :as rn]))
@@ -42,15 +50,75 @@
   (let [loc (pos->loc pos)]
     (if (nil? loc) message (str loc ": " message))))
 
+(defn- diag
+  "A reader failure AS DATA — the shape every other diagnostic in the tree
+   already has (`typed`'s warnings, `errors/render`'s caret input:
+   {:msg :line :col :end-line :end-col :file}), plus the reader's own structure:
+   `:kind` names what went wrong, `:expected`/`:opened-at` carry the delimiter a
+   human forgot and where its collection opened, and the offsets locate the
+   offending text so a caller can underline it or slice it.
+
+   `:bl_diag` is the marker the host edge keys on: this map is a reader
+   diagnostic, and the host's error type is a rendering of it, not its identity.
+
+   `:msg` is the rendered one-line form, byte-identical to what this reader has
+   always raised, so nothing that reads messages has to move."
+  [kind message pos extra]
+  (maps/from_list
+    (apply list
+      (concat (list (tuple2 :bl_diag true)
+                    (tuple2 :kind kind)
+                    (tuple2 :msg (at-pos message pos)))
+              (if (nil? pos)
+                (list)
+                (list (tuple2 :line (pos-line pos))
+                      (tuple2 :col (pos-col pos))
+                      (tuple2 :file (pos-file pos))
+                      (tuple2 :offset (pos-offset pos))))
+              (if (nil? extra) (list) extra)))))
+
+(defn- fail!
+  "Raise the diagnostic `diag` builds. The ONE raiser: a reader failure is
+   always this value, so any caller's `(catch e …)` — and `read`'s
+   `:diagnostics :collect` — receives something it can read."
+  [kind message pos extra]
+  (erlang/error (diag kind message pos extra)))
+
 (defn- syntax-error
-  "Raise a reader error with `message` when source text cannot form a valid reader tree.
-   Raises `BeamLisp.Reader.SyntaxError` directly — the language owns its own error
-   type, so the host front door (`BeamLisp.Reader`) needs no error-translation layer.
-   Given a `pos` the message carries `file:line:col`, so the failure names WHERE it
-   is and not only what it is."
-  ([message] (syntax-error message nil))
-  ([message pos]
-   (erlang/error (BeamLisp.Reader.SyntaxError/exception (at-pos message pos)))))
+  "Raise an unclassified reader error — `:kind :syntax`, no structure beyond the
+   position — when source text cannot form a valid reader tree. Given a `pos`
+   the message carries `file:line:col`, so the failure names WHERE it is and not
+   only what it is. A failure a caller must TELL APART (a delimiter shape a
+   repair pass would act on) goes through `syntax-fail` with its kind."
+  ([message] (fail! :syntax message nil nil))
+  ([message pos] (fail! :syntax message pos nil)))
+
+(defn- syntax-fail
+  "Raise a reader error of a KNOWN `kind`, with structured `extra` pairs:
+   `:expected` (the delimiter the source needed), `:opened-at` (where its
+   collection opened), `:closer` (the delimiter actually found), and the `:end-*`
+   of the caret. These are the failures a repair has a move for, so they must be
+   data — a sentence cannot be acted on."
+  [kind message pos extra]
+  (fail! kind message pos extra))
+
+(defn- pos-pairs
+  "The position pairs for `pos` under `prefix` — how a diagnostic names a SECOND
+   location, the opener a stray closer should have closed."
+  [prefix pos]
+  (list (tuple2 prefix
+                (maps/from_list (list (tuple2 :line (pos-line pos))
+                                      (tuple2 :col (pos-col pos))
+                                      (tuple2 :file (pos-file pos))
+                                      (tuple2 :offset (pos-offset pos)))))))
+
+(defn- span-from
+  "The `:end-line`/`:end-col`/`:end-offset` pairs underlining ONE character at
+   `pos`, so a diagnostic marks a caret's width of source and not a bare point."
+  [pos]
+  (list (tuple2 :end-line (pos-line pos))
+        (tuple2 :end-col (inc (pos-col pos)))
+        (tuple2 :end-offset (inc (pos-offset pos)))))
 
 (defn- tuple2
   "Build the two-element Erlang tuple used for one key/value pair in a map reader node."
@@ -306,12 +374,12 @@
   [chars pos qpos]
   (loop [remaining chars acc (list)]
     (cond
-      (empty? remaining) (syntax-error "unterminated string — the source ends before the closing quote" qpos)
+      (empty? remaining) (syntax-fail :unterminated-string "unterminated string — the source ends before the closing quote" qpos (apply list (concat (list (tuple2 :closer "\"")) (span-from qpos))))
       (= 34 (first remaining)) [(chars->string (reverse acc)) (rest remaining) (advance-to pos chars (rest remaining))]
       (= 92 (first remaining))
         (let [tail (rest remaining)]
           (cond
-            (empty? tail) (syntax-error "unterminated string — the source ends before the closing quote" qpos)
+            (empty? tail) (syntax-fail :unterminated-string "unterminated string — the source ends before the closing quote" qpos (apply list (concat (list (tuple2 :closer "\"")) (span-from qpos))))
             (= 117 (first tail))
               (let [[value after] (parse-unicode-escape (rest tail))]
                 (recur after (cons value acc)))
@@ -555,7 +623,13 @@
   (let [[start spos] (skip-pos chars pos)]
     (loop [remaining start rpos spos acc (list)]
       (cond
-        (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer)) " — the " (chars->string (list (opener-for closer))) " opened here is never closed") open-pos)
+        (empty? remaining)
+          (syntax-fail :unterminated-collection
+                       (str "unterminated collection, expected " (chars->string (list closer))
+                            " — the " (chars->string (list (opener-for closer))) " opened here is never closed")
+                       open-pos
+                       (apply list (concat (list (tuple2 :expected (chars->string (list closer))))
+                                           (span-from open-pos))))
         (= closer (first remaining)) [(reverse acc) (rest remaining) (advance-pos rpos closer)]
         ; A closer that is NOT the one this collection needs: `[1 2)`. The
         ; expected delimiter is known HERE (it is `closer`), so this is the one
@@ -563,10 +637,16 @@
         ; generic "unexpected )" in `read-form` cannot, because by then the
         ; opener it belonged to is out of scope.
         (or (= 41 (first remaining)) (= 93 (first remaining)) (= 125 (first remaining)))
-          (syntax-error (str "unexpected " (chars->string (list (first remaining)))
-                             " — expected " (chars->string (list closer))
-                             " to close the " (chars->string (list (opener-for closer)))
-                             " opened at " (pos->loc open-pos)) rpos)
+          (syntax-fail :mismatched-closer
+                       (str "unexpected " (chars->string (list (first remaining)))
+                            " — expected " (chars->string (list closer))
+                            " to close the " (chars->string (list (opener-for closer)))
+                            " opened at " (pos->loc open-pos))
+                       rpos
+                       (apply list (concat (list (tuple2 :expected (chars->string (list closer)))
+                                                 (tuple2 :closer (chars->string (list (first remaining)))))
+                                           (pos-pairs :opened-at open-pos)
+                                           (span-from rpos))))
         :else (let [[form after fpos] (read-form remaining in-fn? rpos)
                     [next npos] (skip-pos after fpos)]
                 (cond
@@ -858,7 +938,7 @@
   [chars pos]
   (let [[token after] (take-token chars)]
     (if (empty? token)
-      (syntax-error (str "unexpected character " (first chars)) pos)
+      (syntax-fail :unexpected-character (str "unexpected character " (first chars)) pos (apply list (span-from pos)))
       [(classify token) after (advance-to pos chars after)])))
 
 (defn- read-form
@@ -875,9 +955,9 @@
       (= head 40) (let [[items after fpos] (read-until tail 41 in-fn? tpos pos)] [(wrap-list-pos (node :list items) pos fpos) after fpos])
       (= head 91) (let [[items after fpos] (read-until tail 93 in-fn? tpos pos)] [(node :vector items) after fpos])
       (= head 123) (let [[items after fpos] (read-until tail 125 in-fn? tpos pos)] [(node :map (pair-items items)) after fpos])
-      (= head 41) (syntax-error "unexpected ) — nothing is open that it could close" pos)
-      (= head 93) (syntax-error "unexpected ] — nothing is open that it could close" pos)
-      (= head 125) (syntax-error "unexpected } — nothing is open that it could close" pos)
+      (= head 41) (syntax-fail :unexpected-closer "unexpected ) — nothing is open that it could close" pos (apply list (concat (list (tuple2 :closer ")")) (span-from pos))))
+      (= head 93) (syntax-fail :unexpected-closer "unexpected ] — nothing is open that it could close" pos (apply list (concat (list (tuple2 :closer "]")) (span-from pos))))
+      (= head 125) (syntax-fail :unexpected-closer "unexpected } — nothing is open that it could close" pos (apply list (concat (list (tuple2 :closer "}")) (span-from pos))))
       (= head 39) (wrap-prefix tail "quote" in-fn? pos)
       (= head 96) (wrap-prefix tail "syntax-quote" in-fn? pos)
       (= head 126)
@@ -1005,13 +1085,45 @@
         (recur (nth r 2) (cons (second r) forms))
         (reverse forms)))))
 
+(defn read
+  "The OPTIONS entry — the read as a value: options in, a diagnostic out.
+
+   opts: `{:file path-or-nil, :diagnostics :raise | :collect}`
+
+   `:raise` (the default) — a malformed source RAISES the diagnostic, which is
+   what every existing caller and the host edge expect.
+   `:collect` — a malformed source is RETURNED: `{:ok forms}` | `{:error diag}`.
+   The failure becomes data the caller can act on: a harness renders it, a
+   repair pass dispatches on `:kind`/`:opened-at`, an editor underlines
+   `:offset`/`:end-offset` — and nothing parses a sentence back into structure.
+
+   The one unreadable-safely case is a failure that is NOT a reader diagnostic
+   (the host's atom-table guard, say): it is re-raised untouched, because
+   swallowing it would report success.
+
+   A note on the catch: beam-lisp's `catch` binds the runtime's error WRAPPER,
+   whose `:original` is the value that was raised (`(catch e (:original e))` is
+   the idiom; verified against a raised map). The unwrap here accepts either
+   shape, so this works whether the runtime hands back the bare term or the
+   wrapper."
+  [src opts]
+  (let [file (:file opts)]
+    (if (= :collect (:diagnostics opts))
+      (try {:ok (read-forms* src file)}
+           (catch e
+             (let [d (if (and (map? e) (:bl_diag e)) e (:original e))]
+               (if (and (map? d) (:bl_diag d))
+                 {:error d}
+                 (erlang/error e)))))
+      (read-forms* src file))))
+
 (defn read-string
   "Read binary source text `src` into reader-node forms WITH source-position
    {:meta …} wrappers, attributed to `file`. This is the position-bearing entry
    the compiler needs (a diagnostic points at file:line off these wrappers);
    `read-all` is the position-free entry for tools that only want bare shapes."
   [src file]
-  (read-forms* src file))
+  (read src {:file file}))
 
 (defn read-all
   "Read binary source text `src` into a list of BARE reader-node forms (source
@@ -1022,7 +1134,7 @@
   ; realize the list: genesis read_all returned an eager list, and consumers
   ; (source-graph header-forms -> Enum/search) index it as a concrete list, not
   ; a LazySeq. `to-list` forces the `map` so the facade is a drop-in.
-  (to-list (map unwrap-deep (read-forms* src nil))))
+  (to-list (map unwrap-deep (read src {:file nil}))))
 
 ; --- Elixir-facing entry points (underscore names) ---
 ;
@@ -1047,7 +1159,7 @@
   (let [forms (read-all src)]
     (cond
       (= 1 (count forms)) (first forms)
-      ; use the reader's own error channel (ex-info) so the host facade maps it
-      ; to BeamLisp.Reader.SyntaxError, not a raw ErlangError.
+      ; the reader's own failure channel: a diagnostic VALUE, which the host edge
+      ; renders as its own error type (`BeamLisp.Reader.SyntaxError`).
       (empty? forms) (syntax-error "expected one form, got none")
       :else (syntax-error (str "expected one form, got " (count forms))))))
