@@ -113,13 +113,20 @@
   (if (= :build (BeamLisp.Tiers/tier_of_ns ns)) build-key compiler-key))
 
 (defn stamp
-  "What a beam says built it: `{:ok key}` when it answered, `{:error why}` when it
-   could not. Those are DIFFERENT FACTS and the caller must be able to tell them
-   apart — a beam that answers with a foreign key is evidence about a toolchain,
-   while a beam that cannot be loaded at all is evidence about a file. Collapsing
-   the second into the first is how a generator reports that a beam is not one of
-   ours about a beam that is one of ours and says so (measured: `binary/to_list`
-   does not exist, and the catch turned that into `built under no key`).
+  "What a beam says built it: `{:ok {:hash h :key k}}` when it answered,
+   `{:error why}` when it could not. Those are DIFFERENT FACTS and the caller must
+   be able to tell them apart — a beam that answers with a foreign key is evidence
+   about a toolchain, while a beam that cannot be loaded at all is evidence about a
+   file. Collapsing the second into the first is how a generator reports that a
+   beam is not one of ours about a beam that is one of ours and says so (measured:
+   `binary/to_list` does not exist, and the catch turned that into `built under no
+   key`).
+
+   Both halves are needed and for different questions: the KEY is the beam's
+   generation (what `stale-why/5` judges), and the HASH is the source closure it was
+   emitted from — the same `ns_closure_hash` the language computes from the live
+   tree. Together they make the floor JUDGEABLE rather than trusted, and both are
+   already IN the beam, so judging costs no new state.
 
    The key is read by LOADING the beam: a stale beam answers this question
    wrongly, which is exactly what there is to catch. The module is purged first,
@@ -134,7 +141,16 @@
         (if (and (tuple? loaded) (= :module (erlang/element 1 loaded)))
           (let [st (erlang/apply mod :__bl_provenance__ (list))]
             (if (tuple? st)
-              {:ok (erlang/element 2 st)}
+              (let [h (as-text (erlang/element 1 st))
+                    k (as-text (erlang/element 2 st))]
+                ;; A key with no source hash is a beam nothing can compare against:
+                ;; the emitter resolves the closure at emit time and answers nil when
+                ;; the namespace's source is not on its search path (measured on
+                ;; `data-readers` and `multi`). Naming it is what keeps `check` from
+                ;; reading that nil as agreement.
+                (if (empty? h)
+                  {:error "the beam carries a key but no source hash"}
+                  {:ok {:hash h :key k}}))
               {:error "the beam carries no provenance stamp"}))
           {:error (str "cannot load the beam: " (pr-str loaded))})))
     (catch e {:error (str "cannot load the beam: " (or (ex-message e) (pr-str e)))})))
@@ -148,10 +164,94 @@
     (let [want (expected-key (ns-of name) compiler-key build-key)
           got (stamp (Path/join ebin name))]
       (cond
-        (= (:ok got) want) nil
+        (= (:key (:ok got)) want) nil
         (some? (:error got)) (str name ": " (:error got))
-        :else (str name ": built under " (subs (:ok got) 0 16)
+        :else (str name ": built under " (subs (:key (:ok got)) 0 16)
                    "…, this toolchain writes " (subs want 0 16) "…")))))
+
+(defn- moved
+  "Which of `nss` no longer match the source they were seeded from — the
+   incremental question, answered per namespace.
+
+   `[{:ns :beam :stamped :live :verdict}]`, where the verdict is `:moved` (the two
+   hashes differ), `:current` (they agree), or `:unjudged` (the beam carries no
+   source hash, so there is nothing to compare and the answer must NOT be read as
+   agreement). Nothing is written and nothing is compiled: the beam already holds
+   one side of the comparison and the language already computes the other."
+  [out nss]
+  (map (fn [ns]
+         (let [beam (Path/join out (beam-of (str "Ns." ns)))
+               ;; The row is keyed by the NAMESPACE — lowercased and hyphenated —
+               ;; not by the CamelCase the beam FILENAME carries. `namespaces/1`
+               ;; answers filenames (it feeds `beam-of`), while
+               ;; `ns_closure_hash` is asked for a namespace, and `ns-of` is the
+               ;; same routing the emitter and the tier table use. Without this
+               ;; the hash came back unresolved for every row and the check
+               ;; reported the whole floor as moved (measured).
+               name (ns-of (beam-of (str "Ns." ns)))
+               p (stamp beam)
+               live (try (BeamLisp.AOT/ns_closure_hash name)
+                         (catch e (str "unresolved: " (or (ex-message e) (pr-str e)))))]
+           (if (:ok p)
+             (let [h (:hash (:ok p))]
+               {:ns name :beam (Path/basename beam) :stamped h :live live
+                :verdict (if (= h live) :current :moved)})
+             {:ns name :beam (Path/basename beam) :stamped nil :live live
+              :verdict :unjudged})))
+       nss))
+
+(defn moved-lines
+  "The `:moved` rows as the lines a refusal prints: the namespace, then the two
+   hashes. Twelve characters tells two closures apart and stays readable; the full
+   value is in the manifest when someone needs it."
+  [rows]
+  (map (fn [r]
+         (str "  " (:ns r) ": seeded from "
+              (if (string? (:stamped r)) (subs (:stamped r) 0 12) "<none>")
+              "…, the tree's source hashes "
+              (if (string? (:live r)) (subs (:live r) 0 12) "<none>")
+              "… — rebuilt by `bl build`, republished by `bl seed`"))
+       rows))
+
+(defn check
+  "Is the committed floor CURRENT, and if not, WHAT moved? Reads the floor's shim
+   beams and the tree's live source closures; writes nothing, compiles nothing.
+
+   This is the question a pre-commit gate asks, and it is cheap for one reason: both
+   sides of the comparison already exist. A beam carries the source closure it was
+   emitted from (`stamp/1`) and the language computes the same closure from the tree
+   (`ns_closure_hash`), so `check` never builds anything in order to decide whether
+   a build is needed.
+
+   Returns `{:ok? :current :moved :unjudged :namespaces :compiler-key :build-key
+   :errors}`. `:ok?` is true only when every namespace is `:current`; a namespace
+   that cannot be judged is REPORTED, never silently counted as agreement."
+  [opts]
+  (let [root (or (:root opts) (BeamLisp/cwd))
+        boot (under root (or (:boot opts) default-boot))
+        out (under root (or (:out opts) default-out))
+        nss (namespaces boot)]
+    (cond
+      (empty? nss)
+      {:ok? false :errors [(str "no boot sources under " boot)]}
+
+      (not (File/exists? (Path/join out "manifest.exs")))
+      {:ok? false :errors [(str "no floor at " out " — there is nothing to check")]}
+
+      :else
+      (let [rows (vec (moved out nss))
+            gone (vec (filter (fn [r] (= :moved (:verdict r))) rows))
+            unjudged (vec (map (fn [r] (:ns r))
+                               (filter (fn [r] (= :unjudged (:verdict r))) rows)))]
+        {:ok? (and (empty? gone) (empty? unjudged))
+         :current (vec (map (fn [r] (:ns r))
+                            (filter (fn [r] (= :current (:verdict r))) rows)))
+         :moved gone
+         :unjudged unjudged
+         :namespaces (count nss)
+         :compiler-key (BeamLisp.AOTCache/current_compiler_key)
+         :build-key (BeamLisp.AOTCache/current_build_key)
+         :errors []}))))
 
 (defn- manifest-text
   "The manifest as it is written: the header, then the map as pretty-printed
@@ -195,7 +295,15 @@
         (if (not (empty? stale))
           {:ok? false :errors (concat [(str "refusing to seed a stale floor — " ebin
                                             " holds beams this toolchain did not build")]
-                                      stale)}
+                                      stale
+                                      ;; WHICH SOURCES MOVED, not just which beams
+                                      ;; refused. A beam named by filename does not
+                                      ;; tell a reader what to edit; this does — the
+                                      ;; part of the tree that is ahead of the floor,
+                                      ;; in the tree's own terms.
+                                      (moved-lines
+                                        (filter (fn [r] (= :moved (:verdict r)))
+                                                (moved out nss))))}
           (do
             (File/mkdir_p! out)
             (doseq [p (Path/wildcard (Path/join out "*.beam"))] (File/rm! p))

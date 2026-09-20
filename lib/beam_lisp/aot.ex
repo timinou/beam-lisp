@@ -876,20 +876,35 @@ defmodule BeamLisp.AOT do
   # Content hash ONLY, never mtime: mtime is scrambled by git checkout, worktrees,
   # tar, and hardlinks; the content hash survives all of them and equals the Mix
   # manifest's own hash for the same bytes.
+  # BOOTSTRAP STAGING: a mismatched committed seed was installed as a
+  # previous-generation bootstrap stage (BeamLisp.Bootstrap.install!/1 sets
+  # `:bootstrap_staging` to the namespaces it provides). Those staged beams are
+  # a VALID compiler even though their key differs from the current toolchain —
+  # interning replays def VALUES, it does not recompile — so trust them.
+  #
+  # THAT IS FORCED, NOT CONVENIENT, and I measured the alternative first
+  # (BUG-089). Removing the trust so a moved boot tier rebuilds itself from
+  # source does NOT work: the SOURCE path reads with the reader it is in the
+  # middle of compiling. Without the trust, every `bl` run died with
+  #
+  #     Body.Reader.take-token -> undefined var: reader/delimiters
+  #     <- read-atom (priv/boot/reader.bl:788) <- Compiler.eval_string
+  #
+  # — the reader's own FUNCTIONS are on the code path (they come from the staged
+  # beam, which is not gated) while the VARS they read have not been interned,
+  # precisely because the gate just refused to intern that namespace. Every
+  # boot-tier namespace is in that position, so there is no narrower set to
+  # trust: the tier is one generation unit.
+  #
+  # The real defect was that a mixed-generation VM got assembled SILENTLY, and
+  # the first error named another file entirely (`undefined var:
+  # vm.catalog/defonce`). So the trust now SAYS what it is doing, once, when the
+  # tier has actually moved — and a moved tier is rebuilt as a unit by the build
+  # driver (`bl build`) and published with `bl seed`.
   defp stale?(ns, mod) do
     cond do
-      # BOOTSTRAP STAGING: a mismatched committed seed was installed as a
-      # previous-generation bootstrap stage (BeamLisp.Bootstrap.install!/1 sets
-      # `:bootstrap_staging` to the namespaces it provides). Those staged beams
-      # are a VALID compiler even though their key differs from the current
-      # toolchain — interning replays def VALUES, it does not recompile — so
-      # trust them for interning. Without this the gate would route `compiler`/
-      # `reader-node` to the SOURCE path, which, with genesis deleted, has no
-      # compiler to build them. Once the build re-emits these under the current
-      # key the staged copies are superseded and a matching install clears the
-      # flag; so the trust is scoped to exactly the staged namespaces and only
-      # while staging is in effect.
       ns in staging_namespaces() ->
+        note_mixed_generation()
         false
 
       true ->
@@ -901,6 +916,25 @@ defmodule BeamLisp.AOT do
     case Application.get_env(:beam_lisp, :bootstrap_staging, nil) do
       list when is_list(list) -> list
       _ -> []
+    end
+  end
+
+  # ONE note, once per VM, and only when the staged floor really is another
+  # generation: the condition is the same key match `install!/1` reports, so it
+  # cannot fire on a matching floor and cannot be noise on a healthy boot.
+  defp note_mixed_generation do
+    key = {__MODULE__, :mixed_generation_noted}
+
+    if :persistent_term.get(key, false) == false and
+         BeamLisp.Tiers.boot_namespaces() != [] and
+         BeamLisp.Bootstrap.manifest() != nil and
+         not BeamLisp.Bootstrap.key_matches?(BeamLisp.Bootstrap.manifest()) do
+      :persistent_term.put(key, true)
+
+      IO.puts(:stderr, "bl: the boot tier has MOVED; this VM is running it from the committed floor.")
+      IO.puts(:stderr, "bl: that floor is a previous generation of priv/boot/, so a primitive")
+      IO.puts(:stderr, "bl: added since then fails with an undefined var naming a file not at fault.")
+      IO.puts(:stderr, "bl: rebuild the tier as a unit:  bl build && bl seed")
     end
   end
 
