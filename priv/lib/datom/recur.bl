@@ -1,0 +1,1046 @@
+; datom/recur.bl — a recurrence is a rule that PRODUCES intervals.
+;
+; ── Why this is a rule and not a subsystem ────────────────────────────
+;
+; `datom.time` already carries everything a calendar needs: a half-open
+; interval [from,to) at a resolution, Allen's thirteen relations, set
+; algebra, `expand`, and a reader. A recurrence, then, is not a new kind
+; of value. It is a RULE — plain data — that PRODUCES a set of intervals;
+; "the last Friday of the month, except in August" is that set with an
+; interval subtracted, using `datom.time/subtract`.
+;
+; The consequence worth stating out loud: the generator here and the
+; preview a UI renders are the SAME function. `next` is not a second
+; implementation that might drift from `occurrences`; both walk the one
+; scan. If a screen shows Friday the 27th, Friday the 27th is what fires.
+;
+; ── What a rule is ────────────────────────────────────────────────────
+;
+;   {:dtstart 1735689600          ; the anchor instant (seconds); default 0
+;    :freq    :monthly            ; :daily | :weekly | :monthly | :yearly
+;    :interval 2                  ; every N periods; default 1
+;    :byday   [[:friday -1]]      ; [-1FR]; [[:friday]] is every Friday
+;    :at      [9 30]              ; sugar for :byhour [9] + :byminute [30]
+;    :count   10 :until … :bymonthday […] :bymonth […] :bysetpos […]
+;    :wkst    :monday :duration 3600}
+;
+; `validate` REFUSES loudly — naming the offending key — on anything it
+; does not understand, because an unsupported rule that quietly runs at
+; the wrong times is the worst failure this namespace could have. The
+; same applies to RRULE parsing: BYYEARDAY/BYWEEKNO and FREQ=HOURLY/… are
+; refused BY NAME, never dropped.
+;
+; ── RRULE is the interchange, not the model ───────────────────────────
+;
+; `parse-rrule`/`->rrule` convert to and from RFC 5545, so the same rule
+; round-trips through iCalendar, Google Calendar and Postgres. The rule
+; map stays the model; the string is a wire format.
+
+(ns datom.recur
+  (:require [datom.time :as time]))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; VOCABULARY
+;; ═══════════════════════════════════════════════════════════════════
+
+(def ^:private SECS-PER-DAY time/SECS-PER-DAY)
+
+(def ^:private WEEKDAY
+  {:sunday 0 :monday 1 :tuesday 2 :wednesday 3 :thursday 4 :friday 5 :saturday 6})
+
+;; Indexed by the 0=Sunday..6=Saturday convention datom.time uses.
+(def ^:private DAY-KW
+  [:sunday :monday :tuesday :wednesday :thursday :friday :saturday])
+
+(def ^:private RRULE-CODE
+  {"MO" :monday "TU" :tuesday "WE" :wednesday "TH" :thursday
+   "FR" :friday "SA" :saturday "SU" :sunday})
+
+(def ^:private CODE-OF
+  {0 "SU" 1 "MO" 2 "TU" 3 "WE" 4 "TH" 5 "FR" 6 "SA"})
+
+;; Both the long (RRULE) and short spellings are accepted; the canonical
+;; form is the RRULE one, so a rule written `:freq :month` normalises to
+;; `:freq :monthly` and interoperates without a second representation.
+(def ^:private FREQ-CANON
+  {:daily :daily :day :daily :days :daily
+   :weekly :weekly :week :weekly :weeks :weekly
+   :monthly :monthly :month :monthly :months :monthly
+   :yearly :yearly :year :yearly :years :yearly})
+
+(def ^:private KNOWN-KEYS
+  #{:dtstart :freq :interval :count :until :duration :byday :bymonthday
+    :bymonth :byhour :byminute :bysecond :bysetpos :wkst :at})
+
+(def ^:private SUPPORTED-PARTS
+  #{"FREQ" "INTERVAL" "COUNT" "UNTIL" "BYDAY" "BYMONTHDAY" "BYMONTH"
+    "BYHOUR" "BYMINUTE" "BYSECOND" "BYSETPOS" "WKST"})
+
+(def ^:private REFUSED-PARTS #{"BYYEARDAY" "BYWEEKNO" "BYEASTER"})
+
+(def ^:private MONTH-NAME
+  ["January" "February" "March" "April" "May" "June"
+   "July" "August" "September" "October" "November" "December"])
+
+;; The bucket walk is monotone in k, and a finite window always terminates
+;; it; this only guards a rule that admits nothing (BYMONTH=2;BYMONTHDAY=30)
+;; against a silent spin.
+(def ^:private MAX-BUCKETS 1000000)
+
+(defn- refuse [msg data]
+  (throw (ex-info (str "datom.recur: " msg) data)))
+
+(defn- contains-kw [s k] (contains? s k))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; THE RULE MODEL — validation that refuses by name
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn- as-secs
+  "An instant as scale-seconds: accept a raw integer or a datom.time
+   interval (its lower bound). Anything else is refused, never defaulted."
+  [x]
+  (cond
+    (int? x) x
+    (time/interval? x) (time/from x)
+    :else (refuse (str "expected an instant (seconds) or a #time interval — got " (pr-str x))
+                  {:value x})))
+
+(defn- int-in [k v lo hi]
+  (when-not (and (int? v) (>= v lo) (<= v hi))
+    (refuse (str (name k) " must be an integer in [" lo "," hi "] — got " (pr-str v))
+            {:key k :value v}))
+  v)
+
+(defn- int-list [k v lo hi]
+  (when-not (and (vector? v) (seq v))
+    (refuse (str (name k) " must be a non-empty vector of integers — got " (pr-str v))
+            {:key k :value v}))
+  (mapv (fn [x] (int-in k x lo hi)) v))
+
+(defn- nonzero-list [k v lo hi]
+  (let [xs (int-list k v lo hi)]
+    (doseq [x xs]
+      (when (zero? x)
+        (refuse (str (name k) " cannot contain 0") {:key k :value v})))
+    xs))
+
+(defn- weekday-kw
+  "Validate a weekday keyword and return it. 0 is a legitimate weekday, so
+   this tests against the map, not for truthiness."
+  [k v]
+  (if (some? (WEEKDAY v))
+    v
+    (refuse (str (name k) " must be :monday … :sunday — got " (pr-str v)) {:key k :value v})))
+
+(defn- normalize-byday
+  "BYDAY -> [[weekday ordinal-or-nil] …]. Accepts a bare weekday, a single
+   [weekday ordinal] entry, or a vector of entries. An ordinal is refused
+   outside MONTHLY/YEARLY, where RFC 5545 forbids it."
+  [v freq]
+  (let [entries (cond
+                  (keyword? v) [v]
+                  (and (vector? v) (keyword? (first v))) [v]
+                  (vector? v) v
+                  :else (refuse "BYDAY must be a weekday or a vector of [weekday ordinal] entries"
+                                {:value v}))]
+    (when (empty? entries)
+      (refuse "BYDAY cannot be empty" {:value v}))
+    (mapv (fn [e]
+            (let [[wd ord] (cond
+                             (keyword? e) [e nil]
+                             (and (vector? e) (= 1 (count e))) [(first e) nil]
+                             (and (vector? e) (= 2 (count e))) [(first e) (second e)]
+                             :else (refuse (str "a BYDAY entry is [weekday] or [weekday ordinal] — got " (pr-str e))
+                                           {:entry e}))
+                  wd (weekday-kw :byday wd)]
+              (when (some? ord)
+                (int-in :byday ord -53 53)
+                (when (zero? ord)
+                  (refuse "a BYDAY ordinal cannot be 0" {:entry e}))
+                (when-not (or (= freq :monthly) (= freq :yearly))
+                  (refuse (str "a BYDAY ordinal like " (pr-str e)
+                               " is only meaningful with FREQ=MONTHLY or YEARLY (RFC 5545)")
+                          {:entry e :freq freq})))
+              [wd ord]))
+          entries)))
+
+(defn- normalize-at
+  "[hour minute] or [hour minute second] -> {:byhour […] :byminute […] :bysecond […]}."
+  [v]
+  (when-not (and (vector? v) (>= (count v) 2) (<= (count v) 3))
+    (refuse ":at must be [hour minute] or [hour minute second]" {:value v}))
+  {:byhour [(int-in :at (nth v 0) 0 23)]
+   :byminute [(int-in :at (nth v 1) 0 59)]
+   :bysecond (when (= 3 (count v)) [(int-in :at (nth v 2) 0 59)])})
+
+(defn validate
+  "Check a rule and return it NORMALISED: defaults filled, `:at` expanded,
+   BYDAY and freq canonicalised, instants reduced to seconds.
+
+   Refuses loudly — naming the key — on an unknown key, an out-of-range
+   value, or a combination RFC 5545 forbids (a BYDAY ordinal outside
+   MONTHLY/YEARLY; COUNT together with UNTIL). Normalising here is what
+   lets every other function assume its keys exist."
+  [rule]
+  (when-not (map? rule)
+    (refuse (str "a rule is a map — got " (pr-str rule)) {:rule rule}))
+  (doseq [k (keys rule)]
+    (when-not (contains-kw KNOWN-KEYS k)
+      (refuse (str "unknown rule key " k)
+              {:key k :known (vec (sort KNOWN-KEYS))})))
+  ;; EVERY test here is `some?`, not `contains?`, and that is not style: this
+  ;; function is called by every other function in the namespace, and it can be
+  ;; handed a rule it has ALREADY normalised — which still CARRIES the optional
+  ;; keys, with nil values. `(contains? rule :count)` is true for `{:count nil}`,
+  ;; so a contains?-based check tries to range-check nil and refuses its own
+  ;; output. Measured, before this: `(occurrences (rule :day) w t)` raised
+  ;; `count must be an integer … got nil` on the SECOND validate. A normaliser
+  ;; that is not idempotent makes `next` and `occurrences` disagree about rules
+  ;; they both accept, which is the worst bug this namespace could have.
+  (let [freq (or (FREQ-CANON (:freq rule))
+                 (refuse (str "FREQ is required and must be one of :daily :weekly :monthly :yearly — got "
+                              (pr-str (:freq rule)))
+                         {:key :freq :value (:freq rule)}))
+        interval (if (some? (:interval rule)) (int-in :interval (:interval rule) 1 100000) 1)
+        count (when (some? (:count rule)) (int-in :count (:count rule) 1 100000000))
+        until (when (some? (:until rule)) (as-secs (:until rule)))
+        _ (when (and (some? count) (some? until))
+            (refuse ":count and :until are mutually exclusive (RFC 5545)"
+                    {:count count :until until}))
+        duration (when (some? (:duration rule))
+                   (int-in :duration (:duration rule) 1 (* 1000000 SECS-PER-DAY)))
+        dtstart (if (some? (:dtstart rule)) (as-secs (:dtstart rule)) 0)
+        at (when (some? (:at rule)) (normalize-at (:at rule)))
+        _ (when (and (some? at)
+                     (or (some? (:byhour rule)) (some? (:byminute rule)) (some? (:bysecond rule))))
+            (refuse ":at and BYHOUR/BYMINUTE/BYSECOND cannot both be given" {}))
+        byday (when (some? (:byday rule)) (normalize-byday (:byday rule) freq))
+        bymonthday (when (some? (:bymonthday rule)) (nonzero-list :bymonthday (:bymonthday rule) -31 31))
+        bymonth (when (some? (:bymonth rule)) (int-list :bymonth (:bymonth rule) 1 12))
+        byhour (or (:byhour at) (when (some? (:byhour rule)) (int-list :byhour (:byhour rule) 0 23)))
+        byminute (or (:byminute at) (when (some? (:byminute rule)) (int-list :byminute (:byminute rule) 0 59)))
+        bysecond (or (:bysecond at) (when (some? (:bysecond rule)) (int-list :bysecond (:bysecond rule) 0 59)))
+        bysetpos (when (some? (:bysetpos rule)) (nonzero-list :bysetpos (:bysetpos rule) -1000 1000))
+        wkst (if (some? (:wkst rule)) (weekday-kw :wkst (:wkst rule)) :monday)]
+    {:dtstart dtstart :freq freq :interval interval :count count :until until
+     :duration duration :byday byday :bymonthday bymonthday :bymonth bymonth
+     :byhour byhour :byminute byminute :bysecond bysecond
+     :bysetpos bysetpos :wkst wkst}))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; CALENDAR ARITHMETIC (day numbers; seconds only at the edges)
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn- day-secs [day] (* day SECS-PER-DAY))
+(defn- floor-day [secs]
+  (let [q (quot secs SECS-PER-DAY) r (rem secs SECS-PER-DAY)]
+    (if (< r 0) (- q 1) q)))
+(defn- dow-of-day [day] (time/day-of-week (day-secs day)))
+(defn- ymd-of-day [day] (time/civil-from-days day))
+(defn- day-of-ymd [y m d] (time/days-from-civil y m d))
+(defn- month-length [y m] (time/days-in-month y m))
+(defn- month-idx [y m] (+ (* y 12) (dec m)))
+(defn- idx->ym [i] [(quot i 12) (inc (mod i 12))])
+
+(defn- week-start
+  "The day number of the week containing `day`, given the week-start
+   weekday — the anchor RFC 5545's INTERVAL and WKST are counted from."
+  [wkst day]
+  (- day (mod (- (dow-of-day day) (WEEKDAY wkst)) 7)))
+
+(defn- context
+  "The per-rule facts every bucket needs, computed once."
+  [r]
+  (let [dp (time/date-parts (:dtstart r))
+        anchor (floor-day (:dtstart r))]
+    {:rule r
+     :anchor anchor
+     :dp dp
+     :dom (:day dp)
+     :dow (dow-of-day anchor)
+     :year (:year dp)
+     :month (:month dp)
+     :month-idx (month-idx (:year dp) (:month dp))
+     :week-start (week-start (:wkst r) anchor)
+     :interval (:interval r)
+     :wkst (:wkst r)}))
+
+;; ── the times of day a candidate expands to ─────────────────────────
+
+(defn- time-parts
+  "The [h m s] instants a rule produces within a day, ascending. Each of
+   BYHOUR/BYMINUTE/BYSECOND expands; an absent one is DTSTART's component,
+   which is what makes DAILY;COUNT=10 keep DTSTART's 09:00."
+  [ctx]
+  (let [dp (:dp ctx) r (:rule ctx)
+        hh (or (:byhour r) [(:hour dp)])
+        mm (or (:byminute r) [(:minute dp)])
+        ss (or (:bysecond r) [(:second dp)])]
+    (sort-by (fn [x] (+ (* 3600 (nth x 0)) (* 60 (nth x 1)) (nth x 2)))
+             (vec (for [h hh m mm s ss] [h m s])))))
+
+(defn- time-why [ctx h m s]
+  (let [r (:rule ctx)]
+    (vec (remove nil?
+                 [(when (:byhour r) [:byhour h])
+                  (when (:byminute r) [:byminute m])
+                  (when (:bysecond r) [:bysecond s])
+                  (when-not (or (:byhour r) (:byminute r) (:bysecond r))
+                    ; A tag is [name value] like every other one here, and
+                    ; `why-text` maps over the value. Splatted [.. h m s], the
+                    ; value was the first number — so at midnight `(mapv pad2 0)`
+                    ; died with a case_clause on 0. Measured: `(why r i)` raised.
+                    [:dtstart-time [h m s]])]))))
+
+(defn- day-instants
+  "The sorted [secs why] pairs one calendar day produces."
+  [ctx day why]
+  (mapv (fn [[h m s]]
+          [(+ (day-secs day) (* h 3600) (* m 60) s) (into why (time-why ctx h m s))])
+        (time-parts ctx)))
+
+;; ── which days a period admits ──────────────────────────────────────
+
+(defn- month-allowed? [r m]
+  (or (nil? (:bymonth r)) (some (fn [x] (= x m)) (:bymonth r))))
+
+(defn- weekday-allowed? [r day]
+  (or (nil? (:byday r))
+      (some (fn [e] (= (first e) (DAY-KW (dow-of-day day)))) (:byday r))))
+
+(defn- monthday-allowed? [r y m d]
+  (or (nil? (:bymonthday r))
+      (some (fn [md] (= d (if (pos? md) md (+ (month-length y m) md 1))))
+            (:bymonthday r))))
+
+(defn- weekday-days-in-month [y m wd]
+  (let [len (month-length y m)
+        first (day-of-ymd y m 1)
+        off (mod (- wd (dow-of-day first)) 7)]
+    (loop [i off acc []]
+      (if (>= i len) acc (recur (+ i 7) (conj acc (+ first i)))))))
+
+(defn- weekday-days-in-year [y wd]
+  (let [first (day-of-ymd y 1 1)
+        len (- (day-of-ymd (+ y 1) 1 1) first)
+        off (mod (- wd (dow-of-day first)) 7)]
+    (loop [i off acc []]
+      (if (>= i len) acc (recur (+ i 7) (conj acc (+ first i)))))))
+
+(defn- pick-ordinal
+  "The ord-th of `days` (or all of them when ord is nil). Out-of-range
+   positions — a fifth Friday in a four-Friday month — yield nothing."
+  [days ord]
+  (cond
+    (nil? ord) days
+    (pos? ord) (let [x (nth days (dec ord) nil)] (if (some? x) [x] []))
+    :else (let [x (nth days (+ (count days) ord) nil)] (if (some? x) [x] []))))
+
+(defn- resolve-monthday
+  "A BYMONTHDAY value in (y,m) as a day number, or nil when the date does
+   not exist — RFC 5545 ignores February 30."
+  [y m md]
+  (let [len (month-length y m)
+        d (if (pos? md) md (+ len md 1))]
+    (when (and (>= d 1) (<= d len)) (day-of-ymd y m d))))
+
+(defn- tagged-byday-days
+  "[[day why] …] admitted by BYDAY, ordinals scoped to the month or year."
+  [r scope y m]
+  (vec (mapcat (fn [[wd ord]]
+                 (let [days (if (= scope :year)
+                              (weekday-days-in-year y (WEEKDAY wd))
+                              (weekday-days-in-month y m (WEEKDAY wd)))]
+                   (mapv (fn [d] [d [[:byday [wd ord]]]]) (pick-ordinal days ord))))
+               (:byday r))))
+
+(defn- tagged-monthday-days [r y m]
+  (vec (mapcat (fn [md]
+                 (let [d (resolve-monthday y m md)]
+                   (if (some? d) [[d [[:bymonthday md]]]] [])))
+               (:bymonthday r))))
+
+(defn- merge-tags
+  "Merge two tag vectors per day; days only in one keep their own tags."
+  [a b]
+  (let [bm (reduce (fn [acc [d tags]] (assoc acc d tags)) {} b)]
+    (vec (sort-by first
+                  (mapv (fn [[d tags]] [d (into tags (get bm d []))]) a)))))
+
+(defn- month-set
+  "The [day why] the rule admits within month (y,m).
+
+   BYDAY and BYMONTHDAY TOGETHER are an INTERSECTION (Friday the 13th is
+   both), which is how RFC 5545 composes them. With neither, the day is
+   DTSTART's day-of-month CLAMPED to the month's length — so a rule set on
+   the 31st still fires in February — while an EXPLICIT BYMONTHDAY that
+   does not exist is ignored per RFC 5545. The two cases differ on purpose."
+  [r y m default-dom]
+  (cond
+    (and (:byday r) (:bymonthday r))
+    (merge-tags (tagged-byday-days r :month y m) (tagged-monthday-days r y m))
+    (:byday r) (sort-by first (tagged-byday-days r :month y m))
+    (:bymonthday r) (sort-by first (tagged-monthday-days r y m))
+    :else (let [len (month-length y m)
+                d (min (or default-dom 1) len)]
+            [[(day-of-ymd y m d) [[:freq (:freq r)]]]])))
+
+(defn- year-set
+  "The [day why] a YEARLY rule admits in `y` when BYMONTH is absent: a
+   bare ordinal counts through the YEAR (the 20th Monday of 1997), all
+   other shapes fall back to DTSTART's month."
+  [r y default-dom]
+  (if (:byday r)
+    (let [byday (tagged-byday-days r :year y 1)]
+      (if (:bymonthday r)
+        (merge-tags byday (vec (mapcat (fn [m] (tagged-monthday-days r y m)) (range 1 13))))
+        (sort-by first byday)))
+    (month-set r y (:month r) default-dom)))
+
+;; ── one frequency period ────────────────────────────────────────────
+
+(defn- bucket-days [ctx k]
+  (let [r (:rule ctx) i (:interval ctx)]
+    (case (:freq r)
+      :daily
+      (let [day (+ (:anchor ctx) (* k i))
+            ymd (ymd-of-day day)]
+        (if (and (month-allowed? r (second ymd))
+                 (monthday-allowed? r (first ymd) (second ymd) (nth ymd 2))
+                 (weekday-allowed? r day))
+          [[day [[:freq :daily]]]]
+          []))
+
+      :weekly
+      (let [ws (+ (:week-start ctx) (* k i 7))
+            entries (if (:byday r) (:byday r) [[(DAY-KW (:dow ctx)) nil]])
+            pairs (mapv (fn [[wd _]]
+                          (let [day (+ ws (mod (- (WEEKDAY wd) (WEEKDAY (:wkst ctx))) 7))]
+                            [day (if (:byday r) [[:byday [wd nil]]] [[:freq :weekly]])]))
+                        entries)]
+        ; distinct by day: BYDAY may name the same weekday twice
+        (vec (sort-by first
+                      (reduce (fn [acc [d why]]
+                                (if (some (fn [[x _]] (= x d)) acc) acc (conj acc [d why])))
+                              [] pairs))))
+
+      :monthly
+      (let [ym (idx->ym (+ (:month-idx ctx) (* k i)))
+            y (first ym) m (second ym)]
+        (if (month-allowed? r m) (month-set r y m (:dom ctx)) []))
+
+      :yearly
+      (let [y (+ (:year ctx) (* k i))]
+        (if (:bymonth r)
+          (vec (mapcat (fn [m] (if (month-allowed? r m) (month-set r y m (:dom ctx)) []))
+                       (sort (:bymonth r))))
+          (year-set r y (:dom ctx)))))))
+
+(defn- apply-setpos
+  "BYSETPOS selects positions within the period's sorted set (negative from
+   the end). Absent, the whole set stands."
+  [r insts]
+  (if (:bysetpos r)
+    (let [n (count insts)]
+      (vec (sort-by first
+                    (distinct
+                      (keep (fn [p]
+                              (let [i (if (pos? p) (dec p) (+ n p))]
+                                (when (and (>= i 0) (< i n)) (nth insts i))))
+                            (:bysetpos r))))))
+    insts))
+
+(defn- bucket-instants [ctx k]
+  (let [days (bucket-days ctx k)]
+    (apply-setpos (:rule ctx)
+                  (vec (mapcat (fn [[day why]] (day-instants ctx day why)) days)))))
+
+(defn- bucket-floor
+  "The earliest instant a period can contain, for the walk's stop test."
+  [ctx k]
+  (let [r (:rule ctx) i (:interval ctx)]
+    (case (:freq r)
+      :daily (day-secs (+ (:anchor ctx) (* k i)))
+      :weekly (day-secs (+ (:week-start ctx) (* k i 7)))
+      :monthly (let [ym (idx->ym (+ (:month-idx ctx) (* k i)))]
+                 (day-secs (day-of-ymd (first ym) (second ym) 1)))
+      :yearly (day-secs (day-of-ymd (+ (:year ctx) (* k i)) 1 1)))))
+
+(defn- bucket-index
+  "The period containing `secs` — used to skip periods before the window
+   when COUNT does not force a walk from DTSTART."
+  [ctx secs]
+  (let [r (:rule ctx) i (:interval ctx) day (floor-day secs)]
+    (case (:freq r)
+      :daily (max 0 (quot (- day (:anchor ctx)) i))
+      :weekly (max 0 (quot (- (week-start (:wkst ctx) day) (:week-start ctx)) (* 7 i)))
+      :monthly (let [ym (ymd-of-day day)]
+                 (max 0 (quot (- (month-idx (first ym) (second ym)) (:month-idx ctx)) i)))
+      :yearly (max 0 (quot (- (first (ymd-of-day day)) (:year ctx)) i)))))
+
+;; ── the walk ────────────────────────────────────────────────────────
+
+(defn- scan-pairs
+  "Every [secs why] the rule produces, ascending, restricted to starts in
+   [lo, hi). `hi` must be finite. :count is counted from DTSTART — so
+   occurrences before the window still consume the budget — and :until
+   bounds the last instant inclusively.
+
+   `first-only?` returns as soon as the earliest in-window instant is found.
+   Its caller is `next`, which wants exactly one occurrence; walking the
+   whole 400-year window to keep only the first was 34 SECONDS per call on a
+   WEEKLY rule (measured: a 26-step `next` walk timed out at 300s), because
+   every bucket's candidates were accumulated into `out` only to be thrown
+   away."
+  ([r lo hi] (scan-pairs r lo hi false))
+  ([r lo hi first-only?]
+   (let [ctx (context r)
+         n-limit (:count r)
+         until (:until r)
+         k0 (if (or (nil? lo) (some? n-limit)) 0 (max 0 (dec (bucket-index ctx lo))))
+         in-window? (fn [s] (and (or (nil? lo) (>= s lo)) (< s hi)))]
+     (loop [k k0 n 0 out []]
+       (let [floor (bucket-floor ctx k)]
+         (cond
+           (> floor hi) (filterv (fn [p] (in-window? (first p))) out)
+           (and (some? until) (> floor until)) (filterv (fn [p] (in-window? (first p))) out)
+           (and (some? n-limit) (>= n n-limit)) (filterv (fn [p] (in-window? (first p))) out)
+           (> k MAX-BUCKETS)
+           (refuse "no occurrence within 1000000 periods — the rule may be unsatisfiable"
+                   {:rule (dissoc r :dtstart)})
+           :else
+           (let [cand (filterv (fn [p] (>= (first p) (:dtstart r))) (bucket-instants ctx k))
+                 cand (if (some? until) (filterv (fn [p] (<= (first p) until)) cand) cand)
+                 room (if (some? n-limit) (- n-limit n) nil)
+                 cand (if (some? room) (vec (take room cand)) cand)
+                 out (into out cand)]
+             ; buckets ascend, so the first in-window candidate is the
+             ; earliest there is; a caller asking for one can stop here.
+             (if (and first-only? (some (fn [p] (in-window? (first p))) cand))
+               (filterv (fn [p] (in-window? (first p))) out)
+               (recur (inc k) (+ n (count cand)) out)))))))))
+
+;; ── the occurrence value ────────────────────────────────────────────
+
+(def ^:private RES-WIDTH {:second 1 :minute 60 :hour 3600 :day SECS-PER-DAY})
+
+(defn- time-resolution
+  "The finest time component the rule fixes; the occurrence's width in the
+   absence of an explicit :duration. No time parts means a whole day."
+  [r]
+  (cond (:bysecond r) :second
+        (:byminute r) :minute
+        (:byhour r) :hour
+        :else :day))
+
+(defn- occurrence-interval [r s]
+  (if (:duration r)
+    (time/->Interval s (+ s (:duration r)) :second :gregorian)
+    (let [res (time-resolution r)]
+      (time/->Interval s (+ s (RES-WIDTH res)) res :gregorian))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; THE GENERATOR
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn occurrences
+  "The exact set of occurrence intervals whose START lies in [from, to),
+   ascending. Each occurrence is a datom.time interval, so it composes
+   with Allen's algebra and set operations directly."
+  [rule from to]
+  (when (nil? to)
+    (refuse "occurrences needs an upper bound; an unbounded rule is a wheel, not a set" {:rule rule}))
+  (let [r (validate rule)]
+    (mapv (fn [p] (occurrence-interval r (first p)))
+          (scan-pairs r (as-secs from) (as-secs to)))))
+
+(defn next
+  "The first occurrence that starts STRICTLY after `after`, or nil. This is
+   the SAME walk `occurrences` runs — not a second rule engine — so a
+   preview and a firing cannot disagree."
+  [rule after]
+  (let [r (validate rule)
+        a (as-secs after)]
+    (when-let [p (first (scan-pairs r (inc a) (+ a (* 400 366 SECS-PER-DAY)) true))]
+      (occurrence-interval r (first p)))))
+
+(defn prev
+  "The last occurrence that starts STRICTLY before `before`, or nil."
+  [rule before]
+  (let [r (validate rule)
+        b (as-secs before)]
+    (when-let [p (last (scan-pairs r nil (dec b)))]
+      (occurrence-interval r (first p)))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; RFC 5545 INTERCHANGE
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn- part-refuse [k v]
+  (refuse (str "unsupported RRULE part " k)
+          {:part k :value v :supported (vec (sort SUPPORTED-PARTS))}))
+
+(defn- parse-num [k v]
+  (try
+    (erlang/binary_to_integer v)
+    (catch e
+      (refuse (str "RRULE " k " is not an integer: " (pr-str v)) {:part k :value v}))))
+
+(defn- parse-basic-datetime
+  "YYYYMMDD or YYYYMMDDTHHMMSS[Z] -> seconds. The UNTIL form."
+  [v]
+  (let [v (if (clojure.string/ends-with? v "Z") (subs v 0 (- (count v) 1)) v)
+        halves (split v "T")
+        d (first halves)
+        t (second halves)]
+    (when-not (= 8 (count d))
+      (refuse (str "RRULE UNTIL must be YYYYMMDD[THHMMSS][Z] — got " (pr-str v)) {:value v}))
+    (when (and (some? t) (not= 6 (count t)))
+      (refuse (str "RRULE UNTIL time must be HHMMSS — got " (pr-str v)) {:value v}))
+    (let [y (parse-num "UNTIL" (subs d 0 4))
+          mo (parse-num "UNTIL" (subs d 4 6))
+          day (parse-num "UNTIL" (subs d 6 8))
+          h (if (some? t) (parse-num "UNTIL" (subs t 0 2)) 0)
+          mi (if (some? t) (parse-num "UNTIL" (subs t 2 4)) 0)
+          s (if (some? t) (parse-num "UNTIL" (subs t 4 6)) 0)]
+      (+ (day-secs (day-of-ymd y mo day)) (* h 3600) (* mi 60) s))))
+
+(defn- parse-byday-token [t]
+  (let [n (count t)]
+    (when (< n 2)
+      (refuse (str "RRULE BYDAY token must be like MO or -1FR — got " (pr-str t)) {:value t}))
+    (let [code (clojure.string/upper-case (subs t (- n 2) n))
+          wd (or (RRULE-CODE code)
+                 (refuse (str "unknown BYDAY weekday code " (pr-str code)) {:value t}))
+          num (subs t 0 (- n 2))]
+      (if (zero? (count num))
+        [wd nil]
+        (let [o (parse-num "BYDAY" num)]
+          (when (zero? o)
+            (refuse "RRULE BYDAY ordinal 0 is not a position" {:value t}))
+          [wd o])))))
+
+(defn- parse-int-list [k v]
+  (mapv (fn [x] (parse-num k x)) (split v ",")))
+
+(defn- parse-rule-part [k v]
+  (cond
+    (= k "FREQ")
+    (let [f (keyword (clojure.string/lower-case v))]
+      ; A [key value] pair like every other branch — the reduce in `parse-rrule`
+      ; destructures it. Returning the bare keyword made `(second :yearly)`
+      ; raise (nth/2, no clause) on the FIRST part of every RRULE. Measured:
+      ; `(parse-rrule "FREQ=YEARLY;BYYEARDAY=100")` stopped there, so the
+      ; refusal-by-name this namespace promises never ran.
+      [:freq (or (FREQ-CANON f)
+                 (refuse (str "unsupported FREQ " v " — only DAILY, WEEKLY, MONTHLY and YEARLY are supported")
+                         {:part k :value v}))])
+    (= k "INTERVAL") [:interval (parse-num k v)]
+    (= k "COUNT") [:count (parse-num k v)]
+    (= k "UNTIL") [:until (parse-basic-datetime v)]
+    (= k "BYDAY") [:byday (mapv parse-byday-token (split v ","))]
+    (= k "BYMONTHDAY") [:bymonthday (parse-int-list k v)]
+    (= k "BYMONTH") [:bymonth (parse-int-list k v)]
+    (= k "BYHOUR") [:byhour (parse-int-list k v)]
+    (= k "BYMINUTE") [:byminute (parse-int-list k v)]
+    (= k "BYSECOND") [:bysecond (parse-int-list k v)]
+    (= k "BYSETPOS") [:bysetpos (parse-int-list k v)]
+    (= k "WKST") [:wkst (or (RRULE-CODE (clojure.string/upper-case v))
+                            (refuse (str "unknown WKST code " (pr-str v)) {:value v}))]
+    :else (part-refuse k v)))
+
+(defn parse-rrule
+  "Parse an RFC 5545 RRULE value (the `RRULE:` prefix optional) into a rule
+   map without DTSTART — DTSTART lives on the event, so `assoc` it in.
+
+   A part this namespace does not implement is REFUSED BY NAME. A rule that
+   silently dropped BYWEEKNO would run at plausible-looking wrong times,
+   which is the one failure mode worth being loud about."
+  [s]
+  (when-not (string? s)
+    (refuse (str "an RRULE is a string — got " (pr-str s)) {:value s}))
+  (let [body (if (clojure.string/starts-with? s "RRULE:") (subs s 6) s)
+        parts (filterv (fn [p] (not= "" p)) (split body ";"))]
+    (when (empty? parts)
+      (refuse "an RRULE value cannot be empty" {:value s}))
+    (reduce (fn [acc part]
+              (let [kv (split part "=")]
+                (when-not (= 2 (count kv))
+                  (refuse (str "an RRULE part is NAME=VALUE — got " (pr-str part)) {:part part}))
+                (let [k (clojure.string/upper-case (first kv))
+                      v (second kv)]
+                  (when-not (or (contains-kw SUPPORTED-PARTS k) (contains-kw REFUSED-PARTS k))
+                    (part-refuse k v))
+                  (let [pair (parse-rule-part k v)]
+                    (assoc acc (first pair) (second pair))))))
+            {} parts)))
+
+(defn- pad2 [x]
+  (let [s (str x)] (if (< (count s) 2) (str "0" s) s)))
+
+(defn- byday-token [[wd ord]]
+  (str (if (some? ord) (str ord) "") (CODE-OF (WEEKDAY wd))))
+
+(defn- basic-datetime [secs]
+  (let [dp (time/date-parts secs)]
+    (str (:year dp) (pad2 (:month dp)) (pad2 (:day dp)) "T"
+         (pad2 (:hour dp)) (pad2 (:minute dp)) (pad2 (:second dp)) "Z")))
+
+(defn ->rrule
+  "Emit a rule as an RFC 5545 RRULE value. DTSTART is not part of an RRULE
+   string, so it is not emitted; BYSECOND and WKST appear only as needed."
+  [rule]
+  (let [r (validate rule)
+        i (:interval r)
+        wkst? (or (= :weekly (:freq r)) (not= :monday (:wkst r)))
+        parts (remove nil?
+                      [(str "FREQ=" (clojure.string/upper-case (name (:freq r))))
+                       (when (not= 1 i) (str "INTERVAL=" i))
+                       (when (some? (:count r)) (str "COUNT=" (:count r)))
+                       (when (some? (:until r)) (str "UNTIL=" (basic-datetime (:until r))))
+                       (when (:byday r) (str "BYDAY=" (clojure.string/join "," (mapv byday-token (:byday r)))))
+                       (when (:bymonthday r) (str "BYMONTHDAY=" (clojure.string/join "," (mapv str (:bymonthday r)))))
+                       (when (:bymonth r) (str "BYMONTH=" (clojure.string/join "," (mapv str (sort (:bymonth r))))))
+                       (when (:byhour r) (str "BYHOUR=" (clojure.string/join "," (mapv str (:byhour r)))))
+                       (when (:byminute r) (str "BYMINUTE=" (clojure.string/join "," (mapv str (:byminute r)))))
+                       (when (:bysecond r) (str "BYSECOND=" (clojure.string/join "," (mapv str (:bysecond r)))))
+                       (when (:bysetpos r) (str "BYSETPOS=" (clojure.string/join "," (mapv str (:bysetpos r)))))
+                       (when wkst? (str "WKST=" (CODE-OF (WEEKDAY (:wkst r)))))])]
+
+    (clojure.string/join ";" parts)))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; EXPLAIN — tagged, plain English (and WHY an instant matched)
+;; ═══════════════════════════════════════════════════════════════════
+
+(defn- ordinal-word [n]
+  (if (pos? n)
+    (case n 1 "first" 2 "second" 3 "third" 4 "fourth" 5 "fifth" (str n "th"))
+    (case (- 0 n) 1 "last" 2 "second-to-last" 3 "third-to-last"
+          (str (- 0 n) "th-to-last"))))
+
+(defn- day-name [wd]
+  (let [s (name wd)] (str (clojure.string/upper-case (subs s 0 1)) (subs s 1))))
+
+(defn- byday-text [byday]
+  (clojure.string/join " and "
+    (mapv (fn [[wd ord]]
+            (if (some? ord) (str "the " (ordinal-word ord) " " (day-name wd)) (day-name wd)))
+          byday)))
+
+(defn- md-text [mds]
+  (clojure.string/join " and "
+    (mapv (fn [md] (if (pos? md) (str "day " md) (str "the " (ordinal-word md) " day"))) mds)))
+
+(defn- month-text [ms]
+  (clojure.string/join " and " (mapv (fn [m] (get MONTH-NAME (dec m))) (sort ms))))
+
+(defn- freq-text [r]
+  (let [i (:interval r) f (:freq r)]
+    (if (= 1 i)
+      (case f :daily "every day" :weekly "every week" :monthly "every month" :yearly "every year")
+      (str "every " i " " (case f :daily "days" :weekly "weeks" :monthly "months" :yearly "years")))))
+
+(defn- hms [dp]
+  (let [s (if (zero? (:second dp)) "" (str ":" (pad2 (:second dp))))]
+    (str (pad2 (:hour dp)) ":" (pad2 (:minute dp)) s)))
+
+(defn- iso-date [secs]
+  (let [dp (time/date-parts secs)]
+    (str (:year dp) "-" (pad2 (:month dp)) "-" (pad2 (:day dp)))))
+
+(defn explain
+  "A tagged, plain-English reading of a rule: a summary plus one clause per
+   rule part, each carrying the part's key, value and rendering. The tags
+   are the structure; the text is the reading."
+  [rule]
+  (let [r (validate rule)
+        times (time-parts (context r))
+        time-text (cond
+                    (:byhour r) (str "at " (clojure.string/join ", " (mapv hms (mapv (fn [h] {:hour h :minute (or (first (:byminute r)) 0) :second (or (first (:bysecond r)) 0)}) (:byhour r)))))
+                    :else (str "at " (hms (first times))))
+        parts (remove nil?
+                      [(freq-text r)
+                       (when (:byday r) (str "on " (byday-text (:byday r))))
+                       (when (:bymonthday r) (str "on " (md-text (:bymonthday r))))
+                       (when (:bymonth r) (str "in " (month-text (:bymonth r))))
+                       time-text
+                       (when (:bysetpos r) (str "taking the "
+                                                (clojure.string/join " and " (mapv ordinal-word (:bysetpos r)))
+                                                " of the set"))
+                       (when (some? (:count r)) (str (:count r) " times"))
+                       (when (some? (:until r)) (str "until " (iso-date (:until r))))])
+        clauses (vec (remove nil?
+                             [{:tag :freq :value (:freq r) :text (freq-text r)}
+                              (when (= :weekly (:freq r))
+                                {:tag :wkst :value (:wkst r) :text (str "weeks start " (day-name (:wkst r)))})
+                              (when (:byday r) {:tag :byday :value (:byday r) :text (str "on " (byday-text (:byday r)))})
+                              (when (:bymonthday r) {:tag :bymonthday :value (:bymonthday r) :text (str "on " (md-text (:bymonthday r)))})
+                              (when (:bymonth r) {:tag :bymonth :value (:bymonth r) :text (str "in " (month-text (:bymonth r)))})
+                              (when (:byhour r) {:tag :byhour :value (:byhour r) :text (str "hour " (clojure.string/join ", " (mapv str (:byhour r))))})
+                              (when (:byminute r) {:tag :byminute :value (:byminute r) :text (str "minute " (clojure.string/join ", " (mapv str (:byminute r))))})
+                              (when (:bysecond r) {:tag :bysecond :value (:bysecond r) :text (str "second " (clojure.string/join ", " (mapv str (:bysecond r))))})
+                              (when (:bysetpos r) {:tag :bysetpos :value (:bysetpos r) :text (str (clojure.string/join ", " (mapv ordinal-word (:bysetpos r))) " of the set")})
+                              (when (some? (:count r)) {:tag :count :value (:count r) :text (str (:count r) " occurrences")})
+                              (when (some? (:until r)) {:tag :until :value (:until r) :text (str "until " (iso-date (:until r)))})
+                              (when (some? (:duration r)) {:tag :duration :value (:duration r) :text (str "lasting " (:duration r) " seconds")})]))]
+    {:tag :recurrence
+     :rule r
+     :summary (clojure.string/join ", " parts)
+     :clauses clauses}))
+
+(defn- why-text [tags]
+  (clojure.string/join " and "
+    (mapv (fn [t]
+            (let [tag (first t) v (second t)]
+              (case tag
+                :freq (str "the " (name v) " period")
+                :byday (let [wd (first v) ord (second v)]
+                         (if (some? ord)
+                           (str "BYDAY=" (ordinal-word ord) " " (day-name wd))
+                           (str "BYDAY=" (day-name wd))))
+                :bymonthday (str "BYMONTHDAY=" v)
+                :byhour (str "BYHOUR=" v)
+                :byminute (str "BYMINUTE=" v)
+                :bysecond (str "BYSECOND=" v)
+                :dtstart-time (str "the DTSTART time " (clojure.string/join ":" (mapv (fn [x] (pad2 x)) v)))
+                (str (name tag) " " v))))
+          tags)))
+
+(defn why
+  "Why an instant is — or is not — an occurrence: the selectors that
+   admitted it, or the bound that excluded it."
+  [rule instant]
+  (let [r (validate rule)
+        s (as-secs instant)
+        pairs (scan-pairs r nil (inc s))
+        hit (first (filterv (fn [p] (= (first p) s)) pairs))]
+    (if (some? hit)
+      {:tag :occurrence :matched true :instant s :why (second hit)
+       :text (str (iso-date s) " is generated by " (why-text (second hit)))}
+      {:tag :occurrence :matched false :instant s
+       :reason (cond
+                 (< s (:dtstart r)) :before-dtstart
+                 (and (some? (:until r)) (> s (:until r))) :after-until
+                 (and (some? (:count r)) (>= (count pairs) (:count r))) :beyond-count
+                 :else :no-selector-match)
+       :text (str (iso-date s) " is not an occurrence of this rule")})))
+
+;; ═══════════════════════════════════════════════════════════════
+;; THE SURFACE — a rule that reads as the sentence
+;; ═══════════════════════════════════════════════════════════════
+;;
+;; Everything above this line takes a RULE MAP. That map is the model — it is
+;; data, it is what the store keeps and what z3 will read — but it is not how a
+;; human says "the last Friday of the month at half nine". This section is the
+;; sentence, and it is deliberately nothing more than a thin, total spelling of
+;; the map: every function below returns a fragment, `rule` merges the
+;; fragments and VALIDATES once, and there is no second code path anywhere.
+;;
+;; It is functions and not a macro, and that is deliberate. A macro would make
+;; the surface unavailable to a rule ASSEMBLED at runtime — from a config file,
+;; a store row, a REPL — and the whole point of a rule being data is that such a
+;; rule is the same kind of thing as a written one. Functions keep the two
+;; identical: `(rule :month …)` and `{:freq :monthly …}` meet in `validate`.
+;;
+;; Idiomatic use brings the words into scope, which is what makes it read:
+;;
+;;   (ns my.app
+;;     (:require [datom.recur :as r
+;;                :refer [rule on at in day every times until starting]]))
+;;
+;;   (rule :month (on :friday :last) (at 9 30))
+;;   (rule :week 2 (on :monday) (at 8 0))       ; a bare integer is the interval
+;;   (rule :year (in :march) (on :sunday :last))
+;;   (rule :day (at 6 0) (starting 1767225600))
+
+(def ^:private ORDINAL
+  ;; The words a human uses for "which one of them in the period". Negative
+  ;; counts from the end, which is the only way to say "the last" — and the
+  ;; thing cron structurally cannot say.
+  {:first 1 :second 2 :third 3 :fourth 4 :fifth 5
+   :last -1 :second-to-last -2 :third-to-last -3})
+
+(defn- ordinal-of [k where]
+  (cond
+    (contains? ORDINAL k) (get ORDINAL k)
+    (and (integer? k) (not (zero? k))) k
+    :else (refuse
+            (str where ": " (pr-str k) " is not an ordinal — use a positive count, "
+                 "or one of " (clojure.string/join " " (sort (mapv name (keys ORDINAL))))
+                 ", or a negative count to count from the end")
+            {:ordinal k})))
+
+(defn on
+  "A weekday selector, and how many of it in the period.
+
+     (on :friday)              every Friday
+     (on :friday :last)        the LAST Friday of the month  [FREQ=MONTHLY;BYDAY=-1FR]
+     (on :tuesday 2)           the second Tuesday            [BYDAY=2TU]
+     (on :friday :second-to-last)
+
+   An ordinal needs a MONTHLY or YEARLY rule, exactly as RFC 5545 says — with
+   FREQ=WEEKLY the ordinal is refused by name rather than ignored, because a
+   rule that parses and then quietly means something else is the worst failure
+   this namespace could have."
+  ([wd] {:byday wd})
+  ([wd k] (if (nil? k) {:byday wd} {:byday [[wd (ordinal-of k "on")]]}))
+  ([wd k & more]
+   ;; BL will not let a variadic fn be called with only its fixed args — measured:
+   ;; `(on :friday)` was "a fn called with 1 argument — a variadic fn taking 2 or
+   ;; more". So the common calls get their own arities and the variadic one is
+   ;; only the refusal. The surface has to be TOTAL: a rule you cannot write is
+   ;; a rule you will write some other way.
+   (refuse (str "(on " wd " " k " …) takes at most a weekday and one ordinal")
+           {:args (into [wd k] more)})))
+
+(defn at
+  "The clock time of day — (at 9 30) or (at 9 30 15). Expanded by `validate`
+   into BYHOUR/BYMINUTE/BYSECOND, so a rule that names a time of day and a rule
+   that names those parts are the same rule."
+  [h m & sec]
+  {:at (vec (concat [h m] sec))})
+
+(def ^:private MONTH-ORD
+  ;; The month names a person writes, long and short. An integer passes through
+  ;; unmapped, so `(in :march)` and `(in 3)` are one rule, not two.
+  {:january 1 :february 2 :march 3 :april 4 :may 5 :june 6
+   :july 7 :august 8 :september 9 :october 10 :november 11 :december 12
+   :jan 1 :feb 2 :mar 3 :apr 4 :jun 6 :jul 7 :aug 8 :sep 9 :sept 9
+   :oct 10 :nov 11 :dec 12})
+
+(defn- month-number [m]
+  (cond
+    (int? m) m
+    (keyword? m)
+    (or (MONTH-ORD m)
+        (refuse (str "(in " m ") is not a month — accepted: "
+                     (clojure.string/join " " (sort (mapv name (keys MONTH-ORD))))
+                     ", or an integer in [1,12]")
+                {:month m :accepted (vec (sort (mapv name (keys MONTH-ORD))))}))
+    :else
+    (refuse (str "(in …) takes a month name or an integer in [1,12] — got " (pr-str m))
+            {:month m})))
+
+(defn in
+  "The months of the year, by name or by number: (in :march), (in :jan :dec).
+
+   A name the calendar does not have is REFUSED naming itself and the accepted
+   set — `(in :febuary)` must not become a rule that fires in no month at all.
+   The name is only a spelling: `(in :march)` and `(in 3)` produce the same
+   BYMONTH, because the engine's model counts months 1-12."
+  ([m] {:bymonth [(month-number m)]})
+  ([m & more] {:bymonth (mapv month-number (cons m more))}))
+
+(defn day
+  "The day(s) of the month: (day 1) or (day 1 15). Negative counts from the
+   END of the month (BYMONTHDAY=-1 is the last day), which is why a month that
+   lacks the day is skipped rather than clamped — see `occurrences`."
+  ([d] {:bymonthday [d]})
+  ([d & more] {:bymonthday (vec (cons d more))}))
+
+(defn every
+  "The interval between periods: (every 2) with :week is every second week.
+   A bare integer among the parts means the same thing."
+  [n]
+  {:interval n})
+
+(defn times
+  "A bound: the rule produces at most N occurrences, counted from DTSTART.
+   Mutually exclusive with `until` — RFC 5545 forbids both, and so does
+   `validate`, by name."
+  [n]
+  {:count n})
+
+(defn until
+  "A bound: no occurrence after this instant. Takes anything `datom.time` can
+   read as a time — seconds, or an ISO 8601 string."
+  [t]
+  {:until t})
+
+(defn starting
+  "The anchor (DTSTART): where the count is counted from, and the earliest
+   instant the rule may produce."
+  [t]
+  {:dtstart t})
+
+(defn lasting
+  "How long each occurrence lasts, in seconds. Without it, an occurrence is an
+   interval one unit of the rule's resolution wide — a minute for a rule with
+   BYMINUTE, a day for a bare FREQ=DAILY — so a rule never produces an instant
+   pretending to be a span."
+  [secs]
+  {:duration secs})
+
+(defn taking
+  "Take the Nth of the set the period produced (BYSETPOS), where the ordinals
+   are `ordinal-of`'s words: (taking :last) with (on :friday) is the same set
+   as (on :friday :last) — two spellings, one set, and a test that says so."
+  ([p] {:bysetpos [(ordinal-of p "taking")]})
+  ([p & more] {:bysetpos (mapv (fn [x] (ordinal-of x "taking")) (cons p more))}))
+
+(defn weeks-start
+  "Which day a week starts on (WKST), for a WEEKLY rule with INTERVAL > 1:
+   it is what decides where the interval's weeks are cut. Monday, RFC 5545's
+   default, is what `validate` fills in."
+  [wd]
+  {:wkst wd})
+
+(defn- part->map [p]
+  (cond
+    (map? p) p
+    ;; The sugar that makes the sentence shortest: (rule :week 2 …) is
+    ;; (rule :week (every 2) …).
+    (integer? p) {:interval p}
+    :else
+    (refuse
+      (str "a rule part must be a selector — (on …) (at …) (in …) (day …) "
+           "(every n) (times n) (until t) (starting t) (lasting s) (taking …) "
+           "(weeks-start wd) — or a bare integer for the interval, or a map to "
+           "merge; got " (pr-str p))
+      {:part p})))
+
+(defn rule
+  "A recurrence rule, written as the sentence a human would say.
+
+     (rule :month (on :friday :last) (at 9 30))    ; FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=9;BYMINUTE=30
+     (rule :week 2 (on :monday) (at 8 0))          ; every second Monday at 08:00
+     (rule :day (at 6 0) (until 1790294400))       ; daily at 06:00, and then stop
+
+   The parts are the selectors above; a bare integer is the interval; a map is
+   merged, which is the escape hatch for a rule assembled from data. The result
+   is the validated rule MAP — the same value `occurrences`, `next`, `explain`,
+   `->rrule` and (later) the solver all take.
+
+   Validation happens HERE, at the declaration. A rule that cannot mean
+   anything raises on the line that wrote it, naming the offending key and the
+   accepted set, rather than at the first wake — which is the difference between
+   a typo and an incident."
+  ([freq] (validate {:freq freq}))
+  ([freq & parts]
+   (validate (reduce (fn [acc p] (merge acc (part->map p))) {:freq freq} parts))))
+
+(defn preview
+  "The next `n` occurrences after `from` — and this is not a second rule
+   engine. It walks the same `next`, which walks the same scan `occurrences`
+   walks, which is the property the whole namespace is built around: a screen
+   that shows Friday the 27th is showing the instant that will fire.
+
+   Returns intervals, in ascending order, at most `n` of them (fewer when the
+   rule is bounded)."
+  [r from n]
+  (loop [acc [] cursor from]
+    (if (or (>= (count acc) n) (neg? n))
+      acc
+      (if-let [iv (next r cursor)]
+        (recur (conj acc iv) (time/from iv))
+        acc))))
+
+(defn count-in
+  "How many occurrences start inside [from, to) — the question a dashboard asks,
+   answered by the same set `occurrences` returns rather than by arithmetic
+   beside it."
+  [r from to]
+  (count (occurrences r from to)))
+
