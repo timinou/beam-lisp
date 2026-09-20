@@ -1,0 +1,348 @@
+; repl.spike — Phase-0 spike for PLAN-135: a WebSocket REPL server in pure bl.
+;
+; Retires U1 (eval-over-wire), U2 (completion corpus cost), U3 (interrupt),
+; U4 (web transport), U5 (balanced? parity fixture source) with real numbers.
+; Throwaway quality, real measurements. Run from the worktree root:
+;
+;   ./bin/bl run research/repl-spike/serve.bl
+;
+; then open http://127.0.0.1:7841/ or drive it with probe.mjs.
+;
+; ── model ───────────────────────────────────────────────────────────────────
+;
+; A SESSION is {:env fork :ns "user" :eval nil|{:worker pid :mref ref}} in an
+; ETS row keyed by a "sN" id. The env is a fork of :global: defs interned at
+; eval time persist across evals and across socket reconnects, and two
+; sessions cannot see each other's vars.
+;
+; An EVAL runs in its own monitored worker process under the session env
+; (pdict `*ns*` rebound from the session row), with a group-leader proxy that
+; turns its stdout into {:push {:kind "out"}} messages to the socket. The
+; runner (a second process) owns the monitor, so INTERRUPT IS ONE KILL:
+; `:erlang.exit(worker, :kill)` is untrappable, the runner's DOWN clause does
+; ALL cleanup (proxy stop, session row, socket notify) — one cleanup path, no
+; races between "interrupted" and "finished".
+
+(ns repl.spike
+  (:require [web] [env]))
+
+(def TABLE :repl_spike_sessions)
+(def PORT 7841)
+
+(def PAGE (File/read! "research/repl-spike/page.html"))
+(def BUNDLE (File/read! "research/repl-spike/vendor/editor.bundle.js"))
+
+;; ── session store ───────────────────────────────────────────────────────────
+
+(defn- put-session [sid row]
+  (erlang/apply :ets :insert (list TABLE (tuple sid row))))
+
+(defn- get-session [sid]
+  (let [r (erlang/apply :ets :lookup (list TABLE sid))]
+    (if (empty? r) nil (elem (first r) 1))))
+
+(defn new-session!
+  "Fork an env off :global and register a session for it. Public: the probe
+   and the page both mint sessions through the socket hello."
+  []
+  (let [n (erlang/apply :erlang :unique_integer (list (list :positive)))
+        sid (str "s" n)]
+    (put-session sid {:env (env/fork :global) :ns "user" :eval nil})
+    sid))
+
+(defn- busy?
+  "An eval row counts only while its worker is alive — a crashed runner that
+   left a stale row does not wedge the session."
+  [row]
+  (let [ev (:eval row)]
+    (and (map? ev) (contains? ev :worker)
+         (= true (erlang/apply :erlang :is_process_alive (list (:worker ev)))))))
+
+;; ── stdout: a text group-leader proxy (vm.io's protocol, JSON instead of ETF) ──
+
+(defn- normalize [chars]
+  (cond
+    (erlang/is_binary chars) chars
+    (erlang/is_list chars) (erlang/apply :erlang :iolist_to_binary (list chars))
+    :else (erlang/apply :erlang :iolist_to_binary
+            (list (erlang/apply :io_lib :format (list "~p" (list chars)))))))
+
+(defn- handle-text-io [ws id from reply-as req]
+  (cond
+    (and (erlang/is_tuple req) (= :put_chars (elem req 0)))
+    (do (erlang/send ws (tuple :push {"kind" "out" "id" id
+                                      "text" (normalize (elem req (- (erlang/tuple_size req) 1)))}))
+        (erlang/send from (tuple :io_reply reply-as :ok)))
+
+    (and (erlang/is_tuple req) (= :setopts (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :ok))
+
+    (= req :getopts)
+    (erlang/send from (tuple :io_reply reply-as (list (tuple :binary true) (tuple :encoding :unicode))))
+
+    (and (erlang/is_tuple req) (= :get_geometry (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as (if (= :columns (elem req 1)) 80 24)))
+
+    (and (erlang/is_tuple req) (contains? #{:get_line :get_chars :get_until} (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :eof))
+
+    :else (erlang/send from (tuple :io_reply reply-as (tuple :error :request)))))
+
+(defn- proxy-loop [ws id]
+  (receive
+    [:io_request from reply-as req]
+    (do (handle-text-io ws id from reply-as req)
+        (proxy-loop ws id))
+    [:stop] :ok
+    (after 600000 :ok)))
+
+(defn- io-text-proxy [ws id]
+  (spawn (fn [] (proxy-loop ws id))))
+
+;; ── eval ────────────────────────────────────────────────────────────────────
+
+(defn- eval-worker [runner e ns0 src proxy]
+  (erlang/group_leader proxy (erlang/self))
+  (env/with-env e
+    (fn []
+      (BeamLisp.Env/in_ns ns0)
+      (try
+        (let [v (BeamLisp/eval src)
+              ns' (BeamLisp.Env/current_ns)]
+          (BeamLisp.Env/intern ns' "*2" (try (BeamLisp.Env/fetch! ns' "*1") (catch _ nil)))
+          (BeamLisp.Env/intern ns' "*1" v)
+          (erlang/send runner (tuple :eval-finished :value (BeamLisp.RT/print_str v) ns')))
+        (catch ex
+          (let [ns' (BeamLisp.Env/current_ns)]
+            (BeamLisp.Env/intern ns' "*e" ex)
+            (erlang/send runner (tuple :eval-finished :error (str (ex-message ex)) ns'))))))))
+
+(defn- clear-eval [sid ns']
+  (let [row (get-session sid)]
+    (when (map? row)
+      (put-session sid (assoc row :eval nil :ns (or ns' (:ns row)))))))
+
+(defn- eval-wait [ws sid id proxy mref t0]
+  (println (str "[spike] eval-wait entered id=" id))
+  (receive
+    [:eval-finished kind payload ns']
+    (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
+        (erlang/send proxy (tuple :stop))
+        (clear-eval sid ns')
+        (erlang/send ws (tuple :push {"kind" (if (= kind :value) "value" "error")
+                                      "id" id "text" payload "ns" ns'
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    [:DOWN down-ref :process _wpid reason]
+      :when (= down-ref mref)
+    (do (erlang/send proxy (tuple :stop))
+        (clear-eval sid nil)
+        (erlang/send ws (tuple :push {"kind" "error" "id" id "interrupted" true
+                                      "text" (str "eval ended: " (BeamLisp.RT/print_str reason))
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    (after 3600000
+      (do (erlang/send proxy (tuple :stop))
+          (clear-eval sid nil)))))
+
+(defn- run-eval [ws sid id src]
+  ;; runs in its own process: the socket must stay responsive for `interrupt`
+  (println (str "[spike] run-eval start id=" id))
+  (let [row (get-session sid)
+        proxy (io-text-proxy ws id)
+        runner (erlang/self)
+        t0 (System/monotonic_time :millisecond)
+        sm (erlang/apply :erlang :spawn_monitor
+             (list (fn [] (eval-worker runner (:env row) (:ns row) src proxy))))
+        worker (elem sm 0)
+        mref (elem sm 1)]
+    (put-session sid (assoc row :eval {:worker worker :mref mref}))
+    (eval-wait ws sid id proxy mref t0)))
+
+;; ── completion (U2: measured, not guessed) ─────────────────────────────────
+
+(defn- candidates
+  "Every public var in every namespace visible from THIS process's env.
+   The corpus a completion index would materialise; built per call so the
+   spike measures the honest worst case."
+  []
+  (mapcat (fn [ns]
+            (try
+              (map (fn [n] {"label" (str n) "ns" (str ns)}) (BeamLisp.Env/public_names ns))
+              (catch _ex (list))))
+          (BeamLisp.Env/namespaces)))
+
+(defn- complete-prefix [prefix cur-ns]
+  (let [t0 (System/monotonic_time :millisecond)
+        cands (candidates)
+        hits (filter (fn [c] (String/starts_with? (get c "label") prefix)) cands)
+        sorted (sort-by (fn [c] (str (if (= (get c "ns") cur-ns) "0" "1") (get c "label"))) hits)
+        t1 (System/monotonic_time :millisecond)]
+    {"items" (to-list (take 100 sorted)) "total" (count hits)
+     "scanned" (count cands) "ms" (- t1 t0)}))
+
+(defn- safe-pr [v] (try (BeamLisp.RT/print_str v) (catch _ex (str v))))
+
+(defn- arities-str [nsname name]
+  ;; arglists are NOT in var meta (measured: meta of a defn = %{doc}); the
+  ;; arity truth lives in ns_defs entries {:fixed arity name clause-map mod}.
+  (let [defs (try (BeamLisp.Env/ns_defs nsname) (catch _ex nil))
+        entries (if (map? defs) (get defs name) nil)]
+    (if (empty? entries)
+      ""
+      (str "arities: "
+           (join ", " (distinct
+                        (map (fn [e] (if (and (erlang/is_tuple e) (> (erlang/tuple_size e) 1))
+                                       (str (elem e 1)) "?"))
+                             entries)))))))
+
+(defn- doc-for [nsname name]
+  ;; doc_string returns the INFO MAP {:name :doc :ns} directly (measured),
+  ;; not {:ok doc} — and not every var has one.
+  (let [d (try (BeamLisp.Env/doc_string nsname name) (catch _ex nil))
+        doc (cond
+              (map? d) (or (:doc d) "")
+              (and (erlang/is_tuple d) (= :ok (elem d 0))) (elem d 1)
+              (erlang/is_binary d) d
+              :else "")]
+    {"doc" doc "arglists" (arities-str nsname name)}))
+
+(defn- run-complete [ws sid id prefix]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (env/with-env (:env row)
+               (fn []
+                 (let [r (complete-prefix prefix (:ns row))]
+                   (erlang/send ws (tuple :push (assoc r "kind" "completions" "id" id))))))))))
+
+(defn- run-doc [ws sid id nsname name]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (env/with-env (:env row)
+               (fn []
+                 (let [r (doc-for nsname name)]
+                   (erlang/send ws (tuple :push (assoc r "kind" "doc" "id" id
+                                                       "ns" nsname "name" name))))))))))
+
+;; ── bench (U2 numbers without driving a browser) ────────────────────────────
+
+(defn- total-ms [f n]
+  (let [t0 (System/monotonic_time :millisecond)]
+    (loop [i 0] (when (< i n) (f) (recur (inc i))))
+    (- (System/monotonic_time :millisecond) t0)))
+
+(defn- run-bench [ws id]
+  (spawn (fn []
+           (let [prefixes (to-list ["m" "re" "str" "va" "datom"])
+                 direct (total-ms (fn [] (vec (map (fn [p] (complete-prefix p "user")) prefixes))) 10)
+                 t0 (System/monotonic_time :millisecond)
+                 idx (vec (candidates))
+                 build-ms (- (System/monotonic_time :millisecond) t0)
+                 indexed (total-ms
+                           (fn [] (vec (map (fn [p]
+                                              (count (filter (fn [c] (String/starts_with? (get c "label") p)) idx)))
+                                            prefixes)))
+                           100)]
+             (erlang/send ws (tuple :push {"kind" "bench" "id" id
+                                           "corpus" (count idx)
+                                           "index-build-ms" build-ms
+                                           "direct-5q-x10-ms" direct
+                                           "indexed-5q-x100-ms" indexed}))))))
+
+;; ── balanced? fixtures (U5: server truth for the JS port's parity check) ────
+
+(defn- run-balanced [ws id srcs]
+  (spawn (fn []
+           (BeamLisp.Loader/ensure_loaded "bl.repl")
+           (let [bal (BeamLisp.Env/fetch! "bl.repl" "balanced?")
+                 results (to-list (map (fn [s] (= true (BeamLisp.RT/invoke bal (to-list [s])))) srcs))]
+             (erlang/send ws (tuple :push {"kind" "balanced" "id" id "results" results}))))))
+
+;; ── socket ──────────────────────────────────────────────────────────────────
+
+(defn- handle-op [ws sid msg]
+  (let [op (get msg "op")
+        id (get msg "id" 0)]
+    (println (str "[spike] op=" op " id=" id " sid=" sid))
+    (cond
+      (= op "eval")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (erlang/send ws (tuple :push {"kind" "busy" "id" id}))
+          (spawn (fn [] (run-eval ws sid id (get msg "src" ""))))))
+
+      (= op "complete") (run-complete ws sid id (get msg "prefix" ""))
+
+      (= op "doc") (run-doc ws sid id (get msg "ns" "user") (get msg "name" ""))
+
+      (= op "interrupt")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (do (erlang/apply :erlang :exit (list (:worker (:eval row)) :kill))
+              (erlang/send ws (tuple :push {"kind" "interrupt-sent" "id" id})))
+          (erlang/send ws (tuple :push {"kind" "not-busy" "id" id}))))
+
+      (= op "bench") (run-bench ws id)
+
+      (= op "env-debug")
+      (let [row (get-session sid)]
+        (spawn (fn []
+                 (env/with-env (:env row)
+                   (fn []
+                     (BeamLisp.Env/in_ns (:ns row))
+                     (let [d (try (BeamLisp.Env/doc_string "user" "spike-doc-fn") (catch ex (tuple :raised (ex-message ex))))
+                           m (try (BeamLisp.Env/meta "user" "spike-doc-fn") (catch ex (tuple :raised (ex-message ex))))
+                           _ (BeamLisp.Loader/ensure_loaded "bl.repl")
+                           bal (BeamLisp.Env/fetch! "bl.repl" "balanced?")
+                           b1 (BeamLisp.RT/invoke bal (to-list ["; )"]))]
+                       (erlang/send ws (tuple :push {"kind" "env-debug" "id" id
+                                                     "doc_string" (BeamLisp.RT/print_str d)
+                                                     "meta" (BeamLisp.RT/print_str m)
+                                                     "balanced-comment" (BeamLisp.RT/print_str b1)}))))))))
+
+      (= op "balanced") (run-balanced ws id (to-list (get msg "srcs" (to-list []))))
+
+      :else (erlang/send ws (tuple :push {"kind" "error" "id" id "text" (str "unknown op: " op)})))))
+
+(defn- ws-handlers []
+  {:init (fn [_state]
+           (let [sid (new-session!)]
+             [:push [[:text (bl.json/encode {"kind" "hello" "session" sid "ns" "user"})]] sid]))
+   :handle-in (fn [frame sid]
+                ;; inbound frames are bl VECTORS [:text payload] (the adapter's
+                ;; frame_vector), NOT Erlang tuples — is_tuple never matches.
+                (if (and (vector? frame) (= :text (first frame)))
+                  (let [msg (try (bl.json/decode (nth frame 1)) (catch _ex nil))]
+                    (if (map? msg)
+                      (do (handle-op (erlang/self) sid msg) [:ok sid])
+                      [:ok sid]))
+                  [:ok sid]))
+   :handle-info (fn [msg sid]
+                  (if (and (erlang/is_tuple msg) (= :push (elem msg 0)))
+                    [:push [[:text (bl.json/encode (elem msg 1))]] sid]
+                    [:ok sid]))})
+
+;; ── http ────────────────────────────────────────────────────────────────────
+
+(defn router [conn]
+  (web/route conn
+    [:get "/"] (web/html conn PAGE)
+    [:get "/vendor/editor.bundle.js"] (web/bytes-cached conn "application/javascript" BUNDLE)
+    [:get "/healthz"] (web/text conn "ok")
+    [:get "/ws"] (web/upgrade conn (ws-handlers))
+    :else (web/json conn 404 {"error" "not found"})))
+
+;; ── boot ────────────────────────────────────────────────────────────────────
+
+(defn main []
+  (try
+    (erlang/apply :ets :new (list TABLE (list :named_table :public :set)))
+    (catch _ex :already-exists))
+  ;; U2 boot number: what the completion corpus costs to enumerate in :global.
+  (let [t0 (System/monotonic_time :millisecond)
+        corpus (count (candidates))
+        ms (- (System/monotonic_time :millisecond) t0)]
+    (println (str "repl-spike: completion corpus = " corpus " public vars in " ms " ms (direct scan, :global)")))
+  (web/serve {:port PORT :ip (tuple 127 0 0 1) :plug router})
+  (println (str "repl-spike: http://127.0.0.1:" PORT "/  (ws /ws)"))
+  (loop [] (receive [:stop] :ok (after 60000 :ok)) (recur)))
+
+(main)
