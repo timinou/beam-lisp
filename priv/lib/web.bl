@@ -92,29 +92,59 @@
           (second parts)
           nil)))))
 
-(defn read-body
-  "Read the full request body as a binary (empty when none). For a login POST
-   or a webhook. Reads once; a second call is empty (Plug consumes the body)."
+(defn read-body*
+  "Read the FULL request body and return [body conn].
+
+   RESPOND WITH THAT CONN. Plug tracks how much of the request it has already
+   consumed, and the conn carries that position; a response sent on the
+   pre-read conn leaves the socket mid-body, so the next request on a
+   keep-alive connection is parsed from the leftover bytes. The failure is a
+   bare 400 with an empty body ('Request line HTTP error: …' in the journal)
+   on the FOLLOWING request — measured at 15-35% of POSTs when the body
+   arrives in its own TCP segment, which is what a browser, a proxy, or any
+   streaming client does. A client that coalesces headers and body into one
+   write (curl does) never trips it, which is why it hides in a smoke test.
+
+   Loops until Plug says :ok, so a body larger than one read chunk is
+   complete — unlike the single-chunk convenience of the same name."
   [conn]
-  (let [res (erlang/apply Conn :read_body (list conn (list)))]
-    ;; {:ok body conn} | {:more partial conn} | {:error _}; take the first chunk's
-    ;; body (login/webhook bodies are small, single-chunk).
-    (let [tag (elem res 0)]
-      (if (or (= tag :ok) (= tag :more)) (elem res 1) ""))))
+  (loop [conn conn acc []]
+    (let [res (erlang/apply Conn :read_body (list conn (list)))
+          tag (elem res 0)]
+      (cond
+        (= tag :ok) [(apply str (conj acc (elem res 1))) (elem res 2)]
+        (= tag :more) (recur (elem res 2) (conj acc (elem res 1)))
+        :else [(apply str acc) conn]))))
+
+(defn read-body
+  "The body only — for a caller that will not respond on this connection.
+   Prefer read-body* when you do respond: dropping the conn it returns costs
+   the NEXT request on a keep-alive connection (read-body* documents how)."
+  [conn]
+  (first (read-body* conn)))
+
+(defn form-params*
+  "Parse an application/x-www-form-urlencoded body and return [params conn].
+
+   A string-keyed map, e.g. a=1&b=hi -> {a 1, b hi}, percent-decoded, '+' as
+   space — the shape a POSTed HTML form arrives in. RESPOND WITH THAT CONN:
+   see read-body* for what a response on the pre-read conn costs."
+  [conn]
+  (let [[body conn] (read-body* conn)]
+    [(if (or (nil? body) (= "" body)) {}
+       (reduce (fn [acc pair]
+                 (let [kv (String/split pair "=")]
+                   (if (>= (count kv) 2)
+                     (assoc acc (url-decode (first kv)) (url-decode (second kv)))
+                     acc)))
+               {} (String/split body "&")))
+     conn]))
 
 (defn form-params
-  "Parse an application/x-www-form-urlencoded body into a string-keyed map,
-   e.g. a=1&b=hi -> {a 1, b hi}. Percent-decoded, '+' as space. The shape a
-   POSTed HTML form arrives in."
+  "The parsed form only — for a caller that will not respond on this
+   connection. Prefer form-params* when you do respond."
   [conn]
-  (let [body (read-body conn)]
-    (if (or (nil? body) (= "" body)) {}
-      (reduce (fn [acc pair]
-                (let [kv (String/split pair "=")]
-                  (if (>= (count kv) 2)
-                    (assoc acc (url-decode (first kv)) (url-decode (second kv)))
-                    acc)))
-              {} (String/split body "&")))))
+  (first (form-params* conn)))
 
 (defn- content-type-of [conn]
   (let [h (req-header conn "content-type")] (or h "")))
@@ -350,20 +380,172 @@
   [rel]
   (File/read! (str (priv-dir) "/" rel)))
 
+;; ── the access log ───────────────────────────────────────────────────────
+;
+; One EDN record per request, on STDERR by default. stdout is reserved for a
+; program's own data (`bl run --json`), so a log line there would corrupt it —
+; config/config.exs points the Elixir logger at :standard_error for the same
+; reason.
+;
+; THE STATUS EXISTED NOWHERE ELSE. When a screen raises, no bl code sees the
+; response: the exception unwinds through this plug into Bandit, which maps it
+; with Plug.Exception.status/1, replies 500 with an EMPTY body, and logs it
+; itself (Bandit.Pipeline.handle_error/7). A log placed in a router, or in an
+; app's own hooks, is therefore blind exactly when it matters most. The wrapper
+; in `serve` owns the try/catch for that reason: it records 500, then re-raises
+; so Bandit still owns the reply.
+;
+; An EDN record, not prose, because `bl` can read its own log back — and
+; because journald is what RETAINS it in production: a unit's stderr lands in
+; the journal, and retention is `journalctl --vacuum-*`'s business, not this
+; server's. `:log-pretty` is for a FOREGROUND terminal: journald gives every
+; LINE its own record, so the multi-line shape is a dev-server shape.
+
+(defn status
+  "The response status of a (sent) conn, or nil before anything was sent."
+  [conn]
+  (erlang/map_get :status conn))
+
+(defn put-private
+  "Stash `v` under `k` on the conn — Plug's own place for data a later layer
+   needs and the client must never see."
+  [conn k v]
+  (erlang/apply Conn :put_private (list conn k v)))
+
+(defn private
+  "The `k` a previous layer stashed with `put-private`, or nil.
+
+   `get`, not `erlang/map_get`: a conn whose router stashed nothing is the
+   ordinary case for a plain `web/serve` server, and a log field that is absent
+   must be absent, not a KeyError."
+  [conn k]
+  (get (erlang/map_get :private conn) k))
+
+(defn- elapsed-ms
+  "Whole microseconds since `t0`, as milliseconds to one decimal."
+  [t0]
+  (/ (erlang/round (/ (- (erlang/monotonic_time :microsecond) t0) 100.0)) 10.0))
+
+(defn- who
+  "A principal as one short token for the log. The app's principal is whatever
+   the app decided it is (a string, or a map with :id); the log names it,
+   bounded, so one record stays one readable line."
+  [me]
+  (when (some? me)
+    (let [s (cond
+              (string? me) me
+              (map? me) (str (or (:id me) (:name me) "?"))
+              :else (str me))]
+      (if (> (count s) 48) (String/slice s 0 48) s))))
+
+;; The bytes this fn escapes TO, built from their codes: a backslash and a double
+;; quote. Written as literals they need escaping, and in a language where a stray
+;; quote ANYWHERE — including inside a `;` comment — breaks the parse of the
+;; whole file (measured: it cost an hour, and it is why no comment below quotes
+;; anything), a code is cheaper to read than a count of backslashes.
+(def ^:private bs (erlang/list_to_binary (list 92)))
+(def ^:private qt (erlang/list_to_binary (list 34)))
+(def ^:private nl (erlang/list_to_binary (list 10)))
+(def ^:private cr (erlang/list_to_binary (list 13)))
+(def ^:private tab (erlang/list_to_binary (list 9)))
+
+(defn- edn-string
+  "A string as EDN text, quoted and escaped.
+
+   `pr-str` alone is not enough: bl prints a STRING bare, so a path with a space
+   or a colon would produce a record that cannot be read back. Quoting also
+   keeps a multi-line error message on one line."
+  [s]
+  (let [escaped (-> (str s)
+                    (String/replace bs (str bs bs))
+                    (String/replace qt (str bs qt))
+                    (String/replace nl (str bs "n"))
+                    (String/replace cr (str bs "r"))
+                    (String/replace tab (str bs "t")))]
+    (str qt escaped qt)))
+
+(defn- edn-value
+  "A value as EDN text: strings quoted, everything else as bl prints it."
+  [v]
+  (if (string? v) (edn-string v) (pr-str v)))
+
+(defn- access-line
+  "The record as EDN: one line, or `pretty?` one field per line."
+  [pretty? pairs]
+  (let [field (fn [kv] (str ":" (name (first kv)) " " (edn-value (second kv))))]
+    (if pretty?
+      (str "{" (join "\n " (map field pairs)) "}")
+      (str "{" (join " " (map field pairs)) "}"))))
+
+(defn- log-sink
+  "Where records go: :stderr (the default), nil/:off for silence, or a 1-arg
+   fn the caller routes — the fn is handed the record as DATA, so pretty
+   printing of a routed log is the caller's business, not this one's."
+  [log]
+  (cond
+    (nil? log) nil
+    (= log :off) nil
+    (= log :stderr) :stderr
+    (BeamLisp.RT/invocable? log 1) log
+    :else :stderr))
+
+(defn- access!
+  "One record for one request. `code` is nil when the request ENDED without a
+   response — the raise path, which is logged as 500 because that is what
+   Bandit will send.
+
+   Never raises: the record is worth less than the response it describes, and
+   this runs on the request's own path (measured: a `:me` getter that raised on
+   a conn whose router stashed nothing turned every logged request into an
+   error AFTER its body was already sent — the client saw 200, the log showed a
+   stack trace, and the record never appeared)."
+  [sink pretty? conn code t0 err]
+  (when (some? sink)
+    (try
+      ;; a field with nothing to say is ABSENT, not nil: one record, one line,
+      ;; and every field in it worth reading
+      (let [pairs (into []
+                        (keep (fn [kv] (if (some? (second kv)) kv nil))
+                              [[:at (erlang/system_time :millisecond)]
+                               [:method (method conn)]
+                               [:path (path conn)]
+                               [:status (if (nil? code) 500 code)]
+                               [:ms (elapsed-ms t0)]
+                               [:me (who (private conn :me))]
+                               [:err (when (some? err) (ex-message err))]]))]
+        (if (= sink :stderr)
+          (IO/puts :stderr (access-line pretty? pairs))
+          (sink (into {} pairs))))
+      (catch _e nil))))
+
 ;; ── the server ────────────────────────────────────────────────────────
 
 (defn serve
-  "Start a Bandit HTTP server. `opts` = {:port int :plug fn :ip tuple}.
+  "Start a Bandit HTTP server. `opts` = {:port int :plug fn :ip tuple
+   :log :stderr|:off|fn :log-pretty bool}.
    The plug is a 1-arg bl function (conn → conn). :ip (an Erlang ip tuple,
    e.g. {127,0,0,1}) binds a specific interface — a management console
    belongs on loopback; absent, Bandit's default (all interfaces) applies.
-   Returns {:ok pid}."
+   Every request is logged (see the access-log note above) unless :log says
+   otherwise. Returns {:ok pid}."
   [opts]
   (let [port (get opts :port 4000)
         plug-fn (get opts :plug)
+        sink (log-sink (get opts :log :stderr))
+        pretty? (get opts :log-pretty false)
         ;; Bandit accepts a function plug of arity 2: (conn, opts) -> conn.
-        ;; Wrap the user's 1-arg router so it ignores the opts argument.
-        plug2 (fn [conn _opts] (plug-fn conn))
+        ;; Wrap the user's 1-arg router so it ignores the opts argument, and
+        ;; log what it produced: this wrapper is the only place a response is
+        ;; observable at all (see the access-log note above).
+        plug2 (fn [conn _opts]
+                (let [t0 (erlang/monotonic_time :microsecond)]
+                  (try
+                    (let [c (plug-fn conn)]
+                      (access! sink pretty? conn (status c) t0 nil)
+                      c)
+                    (catch e
+                      (access! sink pretty? conn nil t0 e)
+                      (throw e)))))
         bopts (list (erlang/list_to_tuple (list :plug plug2))
                     (erlang/list_to_tuple (list :port port))
                     (erlang/list_to_tuple (list :scheme :http)))
