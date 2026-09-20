@@ -9,8 +9,15 @@ across a whole codebase reviewable: the diff shows the shortcuts, nothing else.
 The rules come from the same tiers `bl lint` describes. No `--tier` is the
 default safe+idiomatic set; `--tier safe` applies only the value-identical
 rules; `--tier every` adds the reinvention tier that restructures a hand-rolled
-`reduce` into `count` or `sum`. `--tier every` is explicit — naming it is the
-opt-in.
+`reduce` into `count` or `sum`, and the MIGRATION tier that turns one form into
+a successor form. `--tier every` is explicit — naming it is the opt-in.
+
+A migration may bring a SECOND EDIT: a rule whose output names a namespace can
+declare `:ensure-require [proc.server :as srv]`, and the fixer appends that
+require to the file's `(ns …)` line — append only, never reorder. When the
+header has no `:require` clause to append to, or already requires the namespace
+under a different alias, the fixer REFUSES and writes NOTHING, naming the line
+to edit: a fix whose output must be hand-repaired is worse than no fix.
 
 Only plain `.bl` sources are rewritten. A literate document (`.bl.md`,
 `.bl.org`) holds prose around its cells, and the fixer works on whole file
@@ -49,11 +56,15 @@ it.
 ```beam-lisp
 (defn- fix-one
   "Fix one plain source in place. `{:path :changed :applied}`, or
-   `{:path :error}` when the fixer could not read the file."
+   `{:path :error}` when the fixer could not read the file OR a migration's
+   second edit was REFUSED (the header could not be amended safely) — in which
+   case nothing was written, so the file is reported, not silently half-fixed."
   [rules p]
   (try
     (let [r (deodorant/fix-file-preserving! rules p)]
-      {:path (u/rel-path p) :changed (> (:changed r) 0) :applied (:changed r)})
+      (if (:refused r)
+        {:path (u/rel-path p) :error (:refused r)}
+        {:path (u/rel-path p) :changed (> (:changed r) 0) :applied (:changed r)}))
     (catch e {:path (u/rel-path p) :error (ex-message e)})))
 ```
 
@@ -94,7 +105,10 @@ the tally.
   (let [lines (map (fn [f] (str "fixed " (:path f) " (" (:applied f) ")"))
                    (filter (fn [f] (:changed f)) (:files report)))]
     (join "\n"
-          (concat (if (empty? lines) ["no smells to fix"] lines)
+          (concat (if (empty? lines)
+                    [(if (empty? (:failed report)) "no smells to fix"
+                         "nothing written — see the errors below")]
+                    lines)
                   [(str (u/plural (:changed report) "file") " changed, "
                         (u/plural (count (:skipped report)) "literate file") " skipped")]))))
 ```

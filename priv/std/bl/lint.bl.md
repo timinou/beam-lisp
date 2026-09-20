@@ -15,9 +15,16 @@ tier that says how much trust it needs:
   `0` it always is. In the default ruleset with the safe rules.
 - **reinvention** — a hand-rolled stdlib function. `(reduce (fn [acc x] (+ acc 1)) 0 xs)`
   is `count`. Exact, but it restructures more of the form, so it is opt-in.
+- **migration** — a form becomes ANOTHER form (the bundle macros onto a server
+  clause). Correct, but its target may not exist yet, and the rewrite may drag
+  a second edit with it (a `:require` entry on the file's `(ns …)` line). Opt-in
+  like reinvention, and reported as its own kind so a reader knows the fix is a
+  diff to review, not a cosmetic tidy.
 
 `--tier` picks the set: `safe`, `idiomatic` (the safe+idiomatic default), or
-`every` (all three, reinvention included). No `--tier` means the default.
+`every` (all four, reinvention and migration included). No `--tier` means the
+default. A migration whose declared prerequisite does not resolve is INERT — it
+matches nothing and the report names it under `skipped` rather than hiding it.
 
 The command exits 0 when the source is clean and 1 when it has at least one
 smell, so a gate can branch on it. `--json` prints the same report as one JSON
@@ -39,8 +46,8 @@ rather than silently linting with some default.
 (defn tier-rules
   "The deodorant rules for a `--tier` value: nil or \"idiomatic\" is the
    default (safe + idiomatic), \"safe\" is the safe rules alone, \"every\" adds
-   the reinvention tier. An unknown string returns nil so the caller can report
-   a usage error."
+   the reinvention AND migration tiers. An unknown string returns nil so the
+   caller can report a usage error."
   [tier]
   (cond
     (nil? tier)            (deodorant/all-rules)
@@ -135,20 +142,26 @@ sweep; a linter reports what it can read and keeps going.
    An ADVISORY rule has no local rewrite — the fix restructures the form,
    not the text — so it carries `:after nil` and a `:note` instead.
    `str` rather than `name` keeps a namespaced rule's namespace, so
-   `datalog/nested-scan` reads as itself."
+   `datalog/nested-scan` reads as itself.
+
+   A MIGRATION that needs a second edit carries `:ensures` — the `:require`
+   entries the fixer will append — so the report names the whole diff, not
+   just the rewritten line."
   [rule form pos]
-  (if (:advisory rule)
-    {:name (str (:name rule))  ; a string, so `--json` can encode it
-     :tier (:tier rule)
-     :line (line-of pos)
-     :before (pr-str form)
-     :after nil
-     :note (:note rule)}
-    {:name (str (:name rule))  ; a string, so `--json` can encode it
-     :tier (:tier rule)
-     :line (line-of pos)
-     :before (pr-str form)
-     :after (pr-str (deodorant/deodorize-with (list rule) form))}))
+  (let [ensures (into [] (map pr-str (deodorant/ensure-require-entries rule)))]
+    (if (:advisory rule)
+      {:name (str (:name rule))  ; a string, so `--json` can encode it
+       :tier (:tier rule)
+       :line (line-of pos)
+       :before (pr-str form)
+       :after nil
+       :note (:note rule)}
+      {:name (str (:name rule))  ; a string, so `--json` can encode it
+       :tier (:tier rule)
+       :line (line-of pos)
+       :before (pr-str form)
+       :after (pr-str (deodorant/deodorize-with (list rule) form))
+       :ensures ensures})))
 
 (defn lint-source
   "Every smell in one source text under `rules`: `{:path :smells [...]}`. Walks
@@ -173,13 +186,26 @@ sweep; a linter reports what it can read and keeps going.
   [rules src]
   (reduce + 0 (vals (deodorant/report-source rules src))))
 
+(defn skipped-rule
+  "One INERT rule as JSON-safe data: the rule's name and tier, the
+   prerequisite it is waiting on, and a one-line why. A rule whose target is
+   not available is reported here rather than silently ignored."
+  [rule]
+  {:name (str (:name rule))
+   :tier (name (:tier rule))
+   :requires (str (:requires-ns rule))
+   :note (str "skipped — the target " (:requires-ns rule)
+              " is not available, so this rule cannot fire yet")})
+
 (defn lint-paths
-  "Lint every source in `paths`, in order: `{:files [...] :total n}`, where
-   `total` is the smell count across all files."
+  "Lint every source in `paths`, in order: `{:files [...] :total n :skipped
+   [...]}`, where `total` is the smell count across all files and `skipped`
+   names every rule in `rules` whose prerequisite does not resolve."
   [rules paths]
   (let [files (into [] (map (fn [p] (lint-source rules (u/rel-path p) (BeamLisp.Loader/read_source p))) paths))]
     {:files files
-     :total (reduce + 0 (map (fn [f] (count (:smells f))) files))}))
+     :total (reduce + 0 (map (fn [f] (count (:smells f))) files))
+     :skipped (into [] (map skipped-rule (deodorant/skipped-rules rules)))}))
 ```
 
 ## The report
@@ -188,26 +214,40 @@ sweep; a linter reports what it can read and keeps going.
 lines that show the change. The last line is the tally a gate reads.
 
 ```beam-lisp
+(defn- smell-block
+  "One smell as its location, its rule and TIER, the before line, and the
+   after line (or, for an advisory rule, its note). A migration that needs a
+   second edit adds an `also:` line naming the require it will append, so the
+   report shows the whole diff, not just the rewritten form."
+  [path s]
+  (str path ":" (:line s) "  " (:name s) " [" (name (:tier s)) "]\n"
+       "    " (:before s) "\n"
+       (if (nil? (:after s))
+         (str "  note: " (:note s))
+         (str "  → " (:after s)))
+       (if (empty? (:ensures s))
+         ""
+         (str "\n  also: add " (join ", " (:ensures s)) " to the :require line"))))
+
 (defn render
   "The human report: one block per smell — `path:line  name [tier]`, the before
-   line, then the after line (or, for an advisory rule, its note) — then
-   `N smells in M files`."
+   line, then the after line (or, for an advisory rule, its note); then a `⊘`
+   line per INERT rule (target not available); then `N smells in M files`."
   [report]
   (let [blocks
         (mapcat
-         (fn [f]
-           (map (fn [s]
-                  (str (:path f) ":" (:line s) "  " (:name s) " [" (name (:tier s)) "]\n"
-                       "    " (:before s) "\n"
-                       (if (nil? (:after s))
-                         (str "  note: " (:note s))
-                         (str "  → " (:after s)))))
-                (:smells f)))
-         (:files report))]
+         (fn [f] (map (fn [s] (smell-block (:path f) s)) (:smells f)))
+         (:files report))
+        skipped (map (fn [s] (str "⊘ " (:name s) " [" (:tier s) "] " (:note s)))
+                     (:skipped report))]
     (join "\n"
           (concat blocks
+                  skipped
                   [(str (u/plural (:total report) "smell") " in "
-                        (u/plural (count (:files report)) "file"))]))))
+                        (u/plural (count (:files report)) "file")
+                        (if (empty? skipped)
+                          ""
+                          (str ", " (u/plural (count skipped) "rule") " skipped")))]))))
 ```
 
 ## The command

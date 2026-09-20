@@ -67,6 +67,14 @@
       (and (contains? #{:symbol :scalar :keyword} (rn/node-tag (rn/node-form n)))
            (not (erlang/is_binary (safe-form n))))))
 
+(defn- capture-binding-ok?
+  "One binding's worth of `capture-ok?`: a rest binding holds a LIST of nodes,
+   each of which must be reproducible; every other binding holds one node."
+  [nm v]
+  (if (rest-pvar-name? nm)
+    (every? capture-ok? v)
+    (capture-ok? v)))
+
 (defn- form-cell
   "[:ok value] when the node converts to a data form (value may itself be nil),
    or [:no] when rn/form refuses the shape. Unlike safe-form this never loses
@@ -107,6 +115,19 @@
        (let [nm (rn/node-name (rn/node-form n))]
          (and (pos? (String/length nm)) (= "?" (String/slice nm 0 1))))))
 
+(defn- rest-pvar-name?
+  "True when the pvar NAME `nm` is a REST pvar (`?*x`). The star is the whole
+   difference from `?x` — one convention extended, not a second beside it."
+  [nm]
+  (and (> (String/length nm) 1) (= "?*" (String/slice nm 0 2))))
+
+(defn- rest-pvar?
+  "True when node `n` is a rest pvar (`?*name`). Legal only as the LAST element
+   of a list or vector pattern, where it binds the REMAINING elements."
+  [n]
+  (and (= :symbol (rn/node-tag (rn/node-form n)))
+       (rest-pvar-name? (rn/node-name (rn/node-form n)))))
+
 (defn- slice-key
   "A structural identity for a node, for pvar re-unification. Uses the node's
    data form when convertible, else its raw node tuple — either way, equal
@@ -116,6 +137,36 @@
     "nil"
     (let [f (safe-form n)]
       (pr-str (if (nil? f) (rn/node-form n) f)))))
+
+(defn- match-seq-pattern
+  "Match a list/vector pattern's ITEMS against a form's items, threading
+   `binds`. A trailing `?*name` makes the fixed prefix positional and binds the
+   REMAINING items as a proper list — empty at the shortest arity, so an empty
+   tail matches. Without one the arities must be EQUAL: a longer form is a
+   mismatch, never a prefix match. A rest seen twice is refused rather than
+   guessed at — sequence unification is deliberately unsupported."
+  [ps ns binds]
+  (let [np (count ps)]
+    (if (and (pos? np) (rest-pvar? (get ps (dec np))))
+      (let [fixed (subvec ps 0 (dec np))
+            need (count fixed)
+            nm (rn/node-name (rn/node-form (get ps (dec np))))]
+        (when (>= (count ns) need)
+          (if (contains? binds nm)
+            (throw (ex-info
+                     "span-rewrite: a rest pattern (?*name) may appear only once in a pattern — sequence unification is deliberately unsupported"
+                     {:rest-var nm}))
+            (loop [i 0 b binds]
+              (if (>= i need)
+                (assoc b nm (doall (drop need ns)))
+                (let [b2 (node-match (get fixed i) (get ns i) b)]
+                  (if (nil? b2) nil (recur (inc i) b2))))))))
+      (when (= np (count ns))
+        (loop [i 0 b binds]
+          (if (>= i np)
+            b
+            (let [b2 (node-match (get ps i) (get ns i) b)]
+              (if (nil? b2) nil (recur (inc i) b2)))))))))
 
 (defn node-match
   "Match reader-node `n` against node-pattern `pat`, threading `binds`
@@ -127,18 +178,23 @@
   (let [pf (rn/node-form pat) nf (rn/node-form n)
         ptag (rn/node-tag pf) ntag (rn/node-tag nf)]
     (cond
+      ; A bare rest pvar has nothing to bind the remainder OF — it is legal
+      ; only as a trailing element, handled in the list/vector branch below.
+      ; This MUST precede the pvar? branch: `?*x` also starts with `?`.
+      (rest-pvar? pat)
+        (throw (ex-info
+                 "span-rewrite: a rest pattern (?*name) is only legal as the LAST element of a list or vector pattern"
+                 {:rest-var (rn/node-name pf)}))
       (pvar? pat)
         (let [nm (rn/node-name pf)]
           (if (contains? binds nm)
             (when (= (slice-key (get binds nm)) (slice-key n)) binds)
             (assoc binds nm n)))
       (contains? #{:list :vector} ptag)
-        (when (and (= ptag ntag)
-                 (= (count (rn/node-items pf)) (count (rn/node-items nf)))) (loop [ps (rn/node-items pf) ns (rn/node-items nf) b binds]
-            (if (empty? ps)
-              b
-              (let [b2 (node-match (first ps) (first ns) b)]
-                (if (nil? b2) nil (recur (rest ps) (rest ns) b2))))))
+        (when (= ptag ntag)
+          (match-seq-pattern (into [] (rn/node-items pf))
+                             (into [] (rn/node-items nf))
+                             binds))
       (= :symbol ptag)
         (when (and (= :symbol ntag) (= (rn/node-name pf) (rn/node-name nf))) binds)
       (= :keyword ptag)
@@ -171,11 +227,16 @@
 
 (defn- binds->data
   "{pvar-name-string → node} → {pattern-symbol → data-form}, the shape a
-   deodorant :when guard expects."
+   deodorant :when guard expects. A rest pvar bound to a LIST of nodes
+   converts to a list of data forms, so a guard reads `(get b '?*xs)`."
   [binds]
   (reduce (fn [m pair]
-            (assoc m (symbol (first pair))
-                   (if (nil? (second pair)) nil (safe-form (second pair)))))
+            (let [nm (first pair)
+                  v  (second pair)]
+              (assoc m (symbol nm)
+                     (if (rest-pvar-name? nm)
+                       (map safe-form v)
+                       (if (nil? v) nil (safe-form v))))))
           {} (into [] binds)))
 
 (defn- rule-guard-ok?
@@ -197,6 +258,13 @@
   (fn [slice binds]
     (letfn [(render [x]
               (cond
+                (and (symbol? x) (rest-pvar-name? (str x)))
+                  ; a REST capture splices its captured nodes inline, joined by
+                  ; a space — zero of them renders nothing, which is what makes
+                  ; `(f ?*xs)` reproduce `(f)` for an empty tail.
+                  (if (contains? binds (str x))
+                    (join " " (map slice (get binds (str x))))
+                    (str x))
                 (and (symbol? x) (pvar-name? (str x)))
                   ; a capture may be bound to a nil-literal node, which the
                   ; reader represents as bare nil — so test membership, not
@@ -237,6 +305,10 @@
   [rules src]
   (let [cps (into [] (String/codepoints src))
         offs (line-offsets src)
+        ; the rules as a vector + their indices, ONCE: the walk visits every
+        ; node, and rebuilding the sequence per node is pure waste.
+        rv (into [] rules)
+        idxs (vec (range 0 (count rv)))
         slice (fn [n] (slice-node src cps offs n))
         forms (BeamLisp.Reader/read_string src)
         ; collect [span replacement-text] edits over the whole tree
@@ -273,8 +345,9 @@
                  (if (quoting? nf)
                    nil  ; do not descend into a quoted template
                  ; try each rule at THIS node
-                 (let [hit (some (fn [rule]
-                                   (let [b (node-match (:pattern rule) n {})]
+                 (let [hit (some (fn [i]
+                                   (let [rule (get rv i)
+                                         b (node-match (:pattern rule) n {})]
                                      (when (and (some? b) (rule-guard-ok? rule b)
                                                 ; a COMPOUND capture (map/list/
                                                 ; vector/set) with no span cannot
@@ -283,11 +356,14 @@
                                                 ; fix. A leaf (symbol/scalar/kw)
                                                 ; with no span renders losslessly
                                                 ; via pr-str, so it is fine.
-                                                (every? (fn [pair] (capture-ok? (second pair)))
+                                                (every? (fn [pair]
+                                                          (capture-binding-ok? (first pair)
+                                                                               (second pair)))
                                                         (into [] b)))
-                                       {:pos (rn/node-pos n)
+                                       {:idx i
+                                        :pos (rn/node-pos n)
                                         :text ((:render rule) slice b)})))
-                                 rules)]
+                                 idxs)]
                    (if (and (some? hit) (has-span? (:pos hit))
                             ; SELF-REFERENCE GUARD: never rewrite a call inside
                             ; f's own definition into a call to f (a primitive
@@ -304,7 +380,8 @@
                                           (get-in e [:pos :col])))) (deref edits))]
       (loop [es sorted out cps changed 0]
         (if (empty? es)
-          {:source (apply str out) :changed changed}
+          {:source (apply str out) :changed changed
+           :fired (vec (distinct (map (fn [e] (:idx e)) (deref edits))))}
           (let [e (first es)
                 pos (:pos e)
                 start (+ (get offs (:line pos)) (dec (:col pos)))
