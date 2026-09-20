@@ -1,0 +1,619 @@
+; play/change.bl — pure change-set constructors, structural materializer, and
+; restricted model-response decoder.
+;
+; This is a CANDIDATE API living under research/workspace-spike/, NOT a second
+; production editor. The intended cutover target is dev.change once this API is
+; stabilised. Never mutate priv/std/dev/change.bl from here.
+;
+; Key invariants:
+;   - No process state; every function is pure or reads files at materialise time.
+;   - materialize reads from disk; it does NOT write. save! in dev.workspace writes.
+;   - decode parses the restricted grammar using the reader; it NEVER evals.
+;   - Path guards reject absolute paths, ".." escapes, dotfiles, .env access.
+;   - Basis is SHA256(original file bytes); nil for new files.
+
+(ns play.change
+  (:require [reader-node :as rn] [span-rewrite :as span]))
+
+; ── Path guards ──────────────────────────────────────────────────────────────
+
+(defn- path-component-safe?
+  "A single path component is safe when it is not empty, not '..', and
+   does not start with '.' (which would make it a dotfile)."
+  [c]
+  (and (string? c)
+       (not (= "" c))
+       (not (= ".." c))
+       (not (starts-with? c "."))))
+
+(defn safe-relative?
+  "True when `relative` is a safe project-relative path:
+   - not absolute
+   - no '..', no dotfile components
+   - non-empty
+   Exposed for use by workspace."
+  [relative]
+  (and (string? relative)
+       (not (= "" relative))
+       (not (starts-with? relative "/"))
+       (let [comps (filter (fn [c] (not (= "" c)))
+                           (seq (String/split relative "/")))]
+         (and (> (count comps) 0)
+              (every? path-component-safe? comps)))))
+
+(defn guard-path!
+  "Throw with ex-info if `relative` is not a safe path."
+  [relative]
+  (when (not (safe-relative? relative))
+    (throw (ex-info (str "play.change: path rejected (absolute, escape, or dotfile): "
+                         (pr-str relative))
+                    {:path relative}))))
+
+(defn resolve-path!
+  "Resolve a guarded relative path, refusing symlinks at every existing component."
+  [root relative]
+  (guard-path! relative)
+  (reduce (fn [parent part]
+            (let [path (Path/join parent part)]
+              (when (= :ok (elem (File/read_link path) 0))
+                (throw (ex-info "Project paths cannot pass through symlinks." {:path relative})))
+              path))
+          (Path/expand root) (String/split relative "/")))
+
+; ── Digest ───────────────────────────────────────────────────────────────────
+
+(defn digest
+  "SHA256 hex string of `source`. nil source → nil.
+   Same encoding as reload/program-hash: uppercase hex."
+  [source]
+  (when (some? source)
+    (binary/encode_hex (erlang/apply :crypto :hash (list :sha256 source)) :uppercase)))
+
+; ── Namespace / path helpers ─────────────────────────────────────────────────
+
+(defn ns-to-path
+  "Map namespace string to project-relative source path.
+   billing.rules → src/billing/rules.bl"
+  [ns-str]
+  (str "src/" (join "/" (seq (String/split ns-str "."))) ".bl"))
+
+(defn defn-name-of
+  "The name string if node is a def-bearing top-level form, else nil.
+   Handles defn, defn-, def, defmacro, defmulti, defprotocol, defserver."
+  [node]
+  (let [f (rn/node-form node)]
+    (when (= :list (rn/node-tag f))
+      (let [items (rn/node-items f)]
+        (when (>= (count items) 2)
+          (let [head (rn/node-form (first items))]
+            (when (and (= :symbol (rn/node-tag head))
+                       (contains? #{"defn" "defn-" "def" "defmacro"
+                                    "defmulti" "defprotocol" "defserver"}
+                                  (rn/node-name head)))
+              (let [name-node (rn/node-form (second items))]
+                (when (= :symbol (rn/node-tag name-node))
+                  (rn/node-name name-node))))))))))
+
+(defn ns-form?
+  "True if `node` is the (ns ...) top-level form."
+  [node]
+  (let [f (rn/node-form node)]
+    (and (= :list (rn/node-tag f))
+         (> (count (rn/node-items f)) 0)
+         (let [head (rn/node-form (first (rn/node-items f)))]
+           (and (= :symbol (rn/node-tag head))
+                (= "ns" (rn/node-name head)))))))
+
+(defn- has-span?
+  "True when pos has all four span fields."
+  [pos]
+  (and (map? pos)
+       (int? (:line pos)) (int? (:col pos))
+       (int? (:end-line pos)) (int? (:end-col pos))))
+
+(defn- definition-source [form]
+  (if (and (list? form) (contains? #{'defn 'defn- 'defmacro} (first form)))
+    (str "(" (join " " (map pr-str (take 2 form))) "\n  "
+         (join "\n  " (map pr-str (drop 2 form))) ")")
+    (pr-str form)))
+
+; ── Span-based source replacement ────────────────────────────────────────────
+
+(defn- replace-span
+  "Replace the source span `pos` in `src` with `new-text`, preserving
+   all bytes outside that span. Returns the modified source string."
+  [src pos new-text]
+  (let [cps  (into [] (String/codepoints src))
+        offs (span/line-offsets src)
+        start (+ (get offs (:line pos)) (- (:col pos) 1))
+        end   (+ (get offs (:end-line pos)) (- (:end-col pos) 1))
+        result (concat (subvec cps 0 start)
+                       (into [] (String/codepoints new-text))
+                       (subvec cps end))]
+    (apply str result)))
+
+(defn- slice-source
+  "Slice the source text at `pos` span."
+  [src pos]
+  (let [cps  (into [] (String/codepoints src))
+        offs (span/line-offsets src)
+        start (+ (get offs (:line pos)) (- (:col pos) 1))
+        end   (+ (get offs (:end-line pos)) (- (:end-col pos) 1))]
+    (apply str (subvec cps start end))))
+
+(defn- find-def-node
+  "Find the top-level reader node whose defined name equals `name-str`.
+   Returns the node (with its position) or nil."
+  [forms name-str]
+  (let [matches (vec (filter (fn [n] (= name-str (defn-name-of n))) forms))]
+    (when (> (count matches) 1)
+      (throw (ex-info "The source contains multiple definitions with that name." {:name name-str})))
+    (first matches)))
+
+(defn- node-outer-pos
+  "The source position of a node. For a :meta-wrapped node this is the
+   wrapper's position (the outermost span). For unwrapped, nil."
+  [node]
+  (rn/node-pos node))
+
+; ── Require merge ─────────────────────────────────────────────────────────────
+
+(defn- ns-clause-tag
+  "The keyword tag of a clause node like (:require ...) → :require, or nil."
+  [node]
+  (let [f (rn/node-form node)]
+    (when (and (= :list (rn/node-tag f))
+               (> (count (rn/node-items f)) 0))
+      (let [head (rn/node-form (first (rn/node-items f)))]
+        (when (= :keyword (rn/node-tag head))
+          (keyword (rn/node-name head)))))))
+
+(defn- render-require-vector
+  "Render a require vector like '[billing.rules :as rules] as source text."
+  [vec-form]
+  (str "[" (join " " (map (fn [x]
+                              (cond
+                                (keyword? x) (str ":" (name x))
+                                (symbol? x)  (str x)
+                                (string? x)  (str x)
+                                :else        (pr-str x)))
+                            (vec vec-form))) "]"))
+
+(defn- apply-require-to-source
+  "Add or merge `require-vec` (BL vector like '[billing.rules :as rules])
+   into the ns declaration of `src`. Returns modified source string.
+   Rebuilds the ns form with preserved spans for unchanged clauses."
+  [src require-vec]
+  (let [cps  (into [] (String/codepoints src))
+        offs (span/line-offsets src)
+        forms (BeamLisp.Reader/read_string src)
+        ns-node (first (filter ns-form? forms))]
+    (when (nil? ns-node)
+      (throw (ex-info "play.change: no (ns ...) form found in source" {})))
+    (let [ns-pos   (node-outer-pos ns-node)
+          ns-items (rn/node-items (rn/node-form ns-node))
+          ns-name  (rn/node-name (rn/node-form (second ns-items)))
+          ; All clauses (after ns name)
+          clauses  (drop 2 ns-items)
+          req-node (first (filter (fn [n] (= :require (ns-clause-tag n))) clauses))
+          other-clauses (filter (fn [n] (not (= :require (ns-clause-tag n)))) clauses)
+          ; Slice existing require vectors from original source
+          existing-req-items (when (some? req-node)
+                               (rest (rn/node-items (rn/node-form req-node))))
+          existing-req-texts
+            (vec (map (fn [n]
+                         (let [p (node-outer-pos n)]
+                           (if (has-span? p)
+                             (slice-source src p)
+                             (pr-str (rn/form (rn/node-form n))))))
+                       (or existing-req-items [])))
+          ; Check if namespace already required — exact match (not prefix).
+          ; Strip leading '[', then ns name must be followed by space, ']', or end.
+          new-ns-name (str (first require-vec))
+          already?
+            (some (fn [t]
+                    (let [inner   (subs (trim t) 1)   ; strip leading [
+                          ns-len  (count new-ns-name)]
+                      (and (>= (count inner) ns-len)
+                           (= (subs inner 0 ns-len) new-ns-name)
+                           (let [after (when (> (count inner) ns-len)
+                                         (subs inner ns-len (inc ns-len)))]
+                             (or (nil? after)
+                                 (= " " after)
+                                 (= "]" after))))))
+                  existing-req-texts)
+          new-vec-str (render-require-vector require-vec)
+          all-req-texts (if already?
+                           existing-req-texts
+                           (conj existing-req-texts new-vec-str))
+          ; Slice other clauses from original source
+          other-clause-texts
+            (vec (map (fn [n]
+                         (let [p (node-outer-pos n)]
+                           (if (has-span? p)
+                             (str "  " (slice-source src p))
+                             (str "  " (pr-str (rn/form (rn/node-form n)))))))
+                       other-clauses))
+          ; Build new ns form
+          req-clause (when (> (count all-req-texts) 0)
+                       (str "  (:require " (join "\n             " all-req-texts) ")"))
+          all-parts (filter some? (concat [req-clause] other-clause-texts))
+          new-ns-form (if (empty? all-parts)
+                        (str "(ns " ns-name ")")
+                        (str "(ns " ns-name "\n" (join "\n" all-parts) ")"))]
+      (if (has-span? ns-pos)
+        (replace-span src ns-pos new-ns-form)
+        new-ns-form))))
+
+(defn- apply-replace-def-to-source
+  "Replace the definition named `name-str` in `src` with `pr-str(form)`.
+   Throws if the definition is not found or the form's name differs."
+  [src name-str form]
+  (let [forms (BeamLisp.Reader/read_string src)
+        target-node (find-def-node forms name-str)]
+    (when (nil? target-node)
+      (throw (ex-info (str "play.change: definition not found: " name-str) {:name name-str})))
+    (let [pos (node-outer-pos target-node)]
+      (when (not (has-span? pos))
+        (throw (ex-info (str "play.change: no span for definition: " name-str)
+                        {:name name-str})))
+      (let [new-src (definition-source form)
+            ; Verify the form's name matches
+            new-forms (BeamLisp.Reader/read_string new-src)
+            new-name  (when (> (count new-forms) 0) (defn-name-of (first new-forms)))]
+        (when (and (some? new-name) (not (= new-name name-str)))
+          (throw (ex-info (str "play.change: name mismatch in replace-definition: "
+                               "expected " name-str " but form defines " new-name)
+                          {:expected name-str :got new-name})))
+        (replace-span src pos new-src)))))
+
+(defn- apply-add-def-to-source
+  "Append `form` as a new definition to `src`.
+   Throws if a definition with the same name already exists."
+  [src form]
+  (let [new-src  (definition-source form)
+        new-forms (BeamLisp.Reader/read_string new-src)
+        new-name  (when (> (count new-forms) 0) (defn-name-of (first new-forms)))]
+    (when (nil? new-name)
+      (throw (ex-info "play.change: add-definition: form does not define a named var" {})))
+    (let [existing-forms (BeamLisp.Reader/read_string src)]
+      (when (some (fn [n] (= new-name (defn-name-of n))) existing-forms)
+        (throw (ex-info (str "play.change: add-definition: " new-name " already exists")
+                        {:name new-name}))))
+    (str src "\n\n" new-src "\n")))
+
+(defn- apply-ops-to-source
+  "Apply a sequence of in-namespace ops to `src`, returning modified source."
+  [src ops]
+  (reduce (fn [current-src op]
+            (case (:op op)
+              :require
+                (apply-require-to-source current-src (:vector op))
+              :replace-definition
+                (apply-replace-def-to-source current-src (:name op) (:form op))
+              :add-definition
+                (apply-add-def-to-source current-src (:form op))
+              (throw (ex-info (str "play.change: unknown in-namespace op: " (:op op))
+                              {:op op}))))
+          src ops))
+
+; ── Constructors ─────────────────────────────────────────────────────────────
+
+(defn bundle
+  "A change bundle: {:title title :operations [op ...]}."
+  [title & ops]
+  {:title (str title) :operations (vec ops)})
+
+(defn create-namespace
+  "Operation: create a new namespace source file.
+   Path: src/<ns-path>.bl, derived from ns-symbol.
+   Refuses to overwrite an existing file (checked at materialize time)."
+  [ns-symbol & quoted-definitions]
+  {:op :create-namespace
+   :ns (str ns-symbol)
+   :definitions (vec quoted-definitions)})
+
+(defn in-namespace
+  "Scoped operation group for an existing namespace's file."
+  [ns-symbol & ops]
+  {:op :in-namespace
+   :ns (str ns-symbol)
+   :ops (vec ops)})
+
+(defn require
+  "Add or merge a require into the ns declaration."
+  [quoted-require-vector]
+  {:op :require :vector (vec quoted-require-vector)})
+
+(defn replace-definition
+  "Replace an exact existing top-level definition by name.
+   Throws at materialize time if missing or name differs."
+  [name-symbol quoted-defn]
+  {:op :replace-definition
+   :name (str name-symbol)
+   :form quoted-defn})
+
+(defn add-definition
+  "Append a new named definition.
+   Throws at materialize time if the name already exists."
+  [quoted-defn]
+  {:op :add-definition :form quoted-defn})
+
+(defn create-file
+  "Create a new file at `relative` path with `source` content."
+  [relative source]
+  (guard-path! relative)
+  {:op :create-file :path relative :source source})
+
+(defn move-file
+  "Move/rename `from` to `to`."
+  [from to]
+  (guard-path! from)
+  (guard-path! to)
+  {:op :move-file :from from :to to})
+
+(defn delete-file
+  "Delete the file at `relative`."
+  [relative]
+  (guard-path! relative)
+  {:op :delete-file :path relative})
+
+; ── Materializer ─────────────────────────────────────────────────────────────
+
+(defn- read-file-safe
+  "Read `abs-path` or return nil if it does not exist.
+   Throws on read errors other than enoent."
+  [abs-path]
+  (try
+    (File/read! abs-path)
+    (catch e
+      (let [msg (str e)]
+        (if (or (includes? msg "enoent") (includes? msg "no such file"))
+          nil
+          (throw e))))))
+
+(defn- ns-to-source
+  "Synthesize source text for a new namespace with quoted definition forms."
+  [ns-str definitions]
+  (let [def-strs (map definition-source definitions)]
+    (if (empty? def-strs)
+      (str "(ns " ns-str ")\n")
+      (str "(ns " ns-str ")\n\n" (join "\n\n" def-strs) "\n"))))
+
+(defn materialize
+  "Resolve `bundle-map` against the workspace at `root`, returning a vector of
+   change maps: [{:path relative :before string-or-nil :after string-or-nil
+                  :basis string-or-nil :reason string}].
+
+   - Reads source files from disk; does NOT write.
+   - Groups edits per file; applies ops sequentially.
+   - Uses reader spans for structural modifications.
+   - Basis is SHA256 of original bytes (nil for new files)."
+  [root bundle-map]
+  (let [ops (:operations bundle-map)
+        ; Group ops by target path
+        by-path
+          (reduce (fn [acc op]
+                    (case (:op op)
+                      :create-namespace
+                        (let [path (ns-to-path (:ns op))
+                              abs  (resolve-path! root path)]
+                          (update acc abs (fn [v] (conj (or v []) (assoc op :ns-path path)))))
+                      :in-namespace
+                        (reduce (fn [a sub-op]
+                                  (let [path (ns-to-path (:ns op))
+                                        abs  (resolve-path! root path)]
+                                    (update a abs (fn [v] (conj (or v [])
+                                                                (assoc sub-op :ns-path path
+                                                                              :parent-ns (:ns op)))))))
+                                acc (:ops op))
+                      :create-file
+                        (do (guard-path! (:path op))
+                            (let [abs (resolve-path! root (:path op))]
+                              (update acc abs (fn [v] (conj (or v []) op)))))
+                      :move-file
+                        (do (guard-path! (:from op)) (guard-path! (:to op))
+                            (let [from-abs (resolve-path! root (:from op))
+                                  to-abs   (resolve-path! root (:to op))]
+                              (-> acc
+                                  (update from-abs (fn [v] (conj (or v []) {:op :_move-source :from (:from op) :to (:to op)})))
+                                  (update to-abs   (fn [v] (conj (or v []) {:op :_move-dest   :from (:from op) :to (:to op)}))))))
+                      :delete-file
+                        (do (guard-path! (:path op))
+                            (let [abs (resolve-path! root (:path op))]
+                              (update acc abs (fn [v] (conj (or v []) op)))))
+                      (throw (ex-info "Unknown change operation." {:op (:op op)}))))
+                  {} ops)]
+    ; Process each target file
+    (vec (mapcat
+      (fn [pair]
+        (let [abs-path (first pair)
+              file-ops (second pair)
+              first-op (first file-ops)
+              rel-path (or (:ns-path first-op) (:path first-op)
+                           (:to first-op) (:from first-op))]
+          (cond
+            ; create-namespace: synthesize new file
+            (= :create-namespace (:op first-op))
+              (do
+                (when (File/exists? abs-path)
+                  (throw (ex-info (str "play.change: create-namespace refuses existing file: " rel-path)
+                                  {:path rel-path})))
+                [{:path   rel-path
+                  :before nil
+                  :after  (apply-ops-to-source (ns-to-source (:ns first-op) (:definitions first-op)) (rest file-ops))
+                  :basis  nil
+                  :reason (str "Create namespace " (:ns first-op))}])
+
+            ; create-file
+            (= :create-file (:op first-op))
+              [{:path   rel-path
+                :before nil
+                :after  (:source first-op)
+                :basis  nil
+                :reason (str "Create file " rel-path)}]
+
+            ; delete-file
+            (= :delete-file (:op first-op))
+              (let [before (read-file-safe abs-path)]
+                [{:path   rel-path
+                  :before before
+                  :after  nil
+                  :basis  (digest before)
+                  :reason (str "Delete file " rel-path)}])
+
+            ; move-file (source side): record deletion
+            (= :_move-source (:op first-op))
+              (let [before (read-file-safe abs-path)]
+                [{:path   (:from first-op)
+                  :before before
+                  :after  nil
+                  :basis  (digest before)
+                  :reason (str "Move " (:from first-op) " \u2192 " (:to first-op))}])
+
+            ; move-file (dest side): record creation
+            (= :_move-dest (:op first-op))
+              (let [from-abs (resolve-path! root (:from first-op))
+                    before   (read-file-safe from-abs)]
+                [{:path   (:to first-op)
+                  :before nil
+                  :after  before
+                  :basis  nil
+                  :reason (str "Move " (:from first-op) " \u2192 " (:to first-op))}])
+
+            ; in-namespace: structural edits to existing file
+            :else
+              (let [before (read-file-safe abs-path)]
+                (when (nil? before)
+                  (throw (ex-info (str "play.change: file not found for in-namespace: " rel-path)
+                                  {:path rel-path})))
+                (let [after (apply-ops-to-source before file-ops)]
+                  [{:path   rel-path
+                    :before before
+                    :after  after
+                    :basis  (digest before)
+                    :reason (str "Update " (or (:parent-ns first-op) rel-path))}])))))
+      by-path))))
+
+; ── Restricted decoder ───────────────────────────────────────────────────────
+;
+; Accepts ONLY: (change/bundle ...) or (bundle ...) at the top level.
+; Each operation argument must be a constructor call whose arguments are
+; literal strings, quoted symbols, quoted vectors, or quoted forms.
+; Never evaluates the model response.
+
+(def ^:private allowed-constructors
+  #{"bundle" "change/bundle"
+    "create-namespace" "change/create-namespace"
+    "in-namespace" "change/in-namespace"
+    "require" "change/require"
+    "replace-definition" "change/replace-definition"
+    "add-definition" "change/add-definition"
+    "create-file" "change/create-file"
+    "move-file" "change/move-file"
+    "delete-file" "change/delete-file"})
+
+; Forward declare for mutual recursion
+(declare decode-constructor-node)
+
+(defn- extract-literal-value
+  "Extract a safe literal value from a reader node without evaluating.
+   Accepts: string/number/bool/nil scalar, symbol, keyword, vector,
+            (quote x) with x a symbol/vector/form, constructor calls."
+  [node]
+  (let [f   (rn/node-form node)
+        tag (rn/node-tag f)]
+    (cond
+      (= :scalar tag)  f
+      (= :symbol tag)  (symbol (rn/node-name f))
+      (= :keyword tag) (keyword (rn/node-name f))
+      (= :vector tag)
+        (into [] (map extract-literal-value (rn/node-items f)))
+      (= :list tag)
+        (let [items     (rn/node-items f)]
+          (when (empty? items)
+            (throw (ex-info "play.change/decode: empty list in constructor arg" {})))
+          (let [head-f    (rn/node-form (first items))
+                head-name (when (= :symbol (rn/node-tag head-f)) (rn/node-name head-f))]
+            (cond
+              (= "quote" head-name)
+                ; (quote x) — extract x as BL data
+                (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "compiler" "datum")
+                                    (list (second items)))
+              (contains? allowed-constructors head-name)
+                ; Nested constructor call — decode recursively
+                (decode-constructor-node node)
+              :else
+                (throw (ex-info (str "play.change/decode: non-literal in constructor arg: "
+                                     head-name)
+                                {:head head-name})))))
+      :else
+        (throw (ex-info (str "play.change/decode: unsupported literal type: " tag)
+                        {:tag tag})))))
+
+(defn- decode-constructor-node
+  "Decode one constructor call node into the same data as the constructor fns."
+  [node]
+  (let [f         (rn/node-form node)
+        items     (rn/node-items f)
+        head-name (rn/node-name (rn/node-form (first items)))
+        ; Strip the change/ qualifier if present
+        bare-name (let [parts (seq (String/split head-name "/"))]
+                    (if (> (count parts) 1) (last parts) head-name))
+        args      (map extract-literal-value (rest items))]
+    (case bare-name
+      "bundle"             (apply bundle args)
+      "create-namespace"   (apply create-namespace args)
+      "in-namespace"       (apply in-namespace args)
+      "require"            (apply require args)
+      "replace-definition" (apply replace-definition args)
+      "add-definition"     (apply add-definition args)
+      "create-file"        (apply create-file args)
+      "move-file"          (apply move-file args)
+      "delete-file"        (apply delete-file args)
+      (throw (ex-info (str "play.change/decode: unknown constructor: " bare-name)
+                      {:constructor bare-name})))))
+
+(defn- strip-fenced-code
+  "Strip ```clojure ... ``` or ``` ... ``` fencing from model output."
+  [text]
+  (let [lines (seq (String/split text "\n"))
+        stripped
+          (filter (fn [l]
+                    (let [t (trim l)]
+                      (not (or (starts-with? t "```clojure")
+                               (starts-with? t "```")
+                               (= "```" t)))))
+                  lines)]
+    (join "\n" stripped)))
+
+(defn decode
+  "Decode a model-response text into a bundle data structure.
+   Accepts only (change/bundle ...) or (bundle ...) forms with constructor
+   arguments containing literal strings, quoted symbols/vectors/forms.
+   Rejects: unknown constructors, non-literal expressions, path escapes.
+   Returns the bundle map or throws ex-info on invalid input.
+   Strips ```clojure fenced output automatically."
+  [text]
+  (let [src (strip-fenced-code text)
+        forms (try
+                (BeamLisp.Reader/read_string src)
+                (catch e
+                  (throw (ex-info (str "play.change/decode: parse error: " (ex-message e))
+                                  {:source src}))))
+        non-empty-forms (filter some? forms)]
+    (when (empty? non-empty-forms)
+      (throw (ex-info "play.change/decode: no forms found in model response"
+                      {:source src})))
+    (let [top      (first non-empty-forms)
+          f        (rn/node-form top)
+          tag      (rn/node-tag f)]
+      (when (not (= :list tag))
+        (throw (ex-info "play.change/decode: top-level form must be a bundle call" {})))
+      (let [head-f    (rn/node-form (first (rn/node-items f)))
+            head-name (when (= :symbol (rn/node-tag head-f)) (rn/node-name head-f))]
+        (when (not (contains? #{"bundle" "change/bundle"} head-name))
+          (throw (ex-info (str "play.change/decode: top-level must be bundle or change/bundle, got: "
+                               head-name)
+                          {:head head-name})))
+        (decode-constructor-node top)))))
