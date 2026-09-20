@@ -20,12 +20,14 @@ defmodule BeamLisp.Reader do
 
   ## Errors: the language owns its own VALUE, the host owns the rendering
 
-  A malformed source makes the `.bl` reader raise a DIAGNOSTIC MAP —
-  `{:bl_diag true, :kind, :msg, :line, :col, :offset, :end-line, :end-col,
-  :file, …}` — the same shape the type checker's warnings take, so one renderer
-  (`priv/std/errors.bl`) can draw a caret under any of them. `:kind` names what
-  went wrong, `:expected`/`:opened-at` name the delimiter a human forgot and
-  where its collection opened, and the offsets locate the offending text.
+  A malformed source makes the `.bl` reader raise a DIAGNOSTIC — the tree's one
+  diagnostic shape, defined and enforced in `priv/boot/diag.bl`:
+  `{:diag true, :severity, :kind, :msg, :line, :col, :offset, :end-line,
+  :end-col, :end-offset, :file, …}`. The same shape the type checker's warnings
+  take, so one renderer (`priv/std/errors.bl`) draws a caret under any of them.
+  `:kind` names what went wrong, `:expected`/`:opened-at` name the delimiter a
+  human forgot and where its collection opened, and the offsets locate the
+  offending text.
 
   THIS module turns that value into `BeamLisp.Reader.SyntaxError` for its own
   callers, using the diagnostic's `:msg` verbatim — the host type is a RENDERING
@@ -51,7 +53,7 @@ defmodule BeamLisp.Reader do
   Read binary `source` into position-bearing reader forms, attributed to `file`.
 
   THE reader entry every caller funnels through. Delegates to the self-hosted
-  reader, and renders a reader diagnostic (`{:bl_diag true, :msg, …}`) as
+  reader, and renders a reader diagnostic (`{:diag true, :msg, …}`) as
   `BeamLisp.Reader.SyntaxError` on the way out.
   """
   @spec read_string(String.t()) :: [term]
@@ -77,7 +79,7 @@ defmodule BeamLisp.Reader do
   # type.
   #
   # The language raises a diagnostic VALUE, not a host struct: a map carrying
-  # `{:bl_diag true, :kind, :msg, :line, :col, :offset, :end-line, :end-col,
+  # `{:diag true, :kind, :msg, :line, :col, :offset, :end-line, :end-col,
   # :end-offset, …}` — the same shape the type checker's warnings take, so
   # `errors/render` draws its caret from it. `SyntaxError` is THIS boundary's
   # rendering of that value, which is why the `.bl` reader needs no host
@@ -94,6 +96,14 @@ defmodule BeamLisp.Reader do
 
     e in ErlangError ->
       case e.original do
+        %{diag: true, msg: msg} when is_binary(msg) ->
+          reraise BeamLisp.Reader.SyntaxError, [message: msg], __STACKTRACE__
+
+        # `:bl_diag` is the spelling this marker carried before the vocabulary
+        # landed as `priv/boot/diag.bl` (`:diag`). Accepted while the reader
+        # side of that move is in flight in another session, so this front door
+        # is correct against EITHER reader; delete this clause when no producer
+        # writes it.
         %{bl_diag: true, msg: msg} when is_binary(msg) ->
           reraise BeamLisp.Reader.SyntaxError, [message: msg], __STACKTRACE__
 
