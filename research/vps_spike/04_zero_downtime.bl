@@ -1,0 +1,82 @@
+; 04_zero_downtime.bl — the swap no request feels.
+; Run: ./blx run research/vps_spike/04_zero_downtime.bl
+;
+; Hints at: zero-downtime.md (all three levels), devops.md §deploys,
+;           the-reconciler.md §node/generation.
+;
+; Three levels of change, each with its zero-downtime mechanism:
+;   L1 code    — a version pointer flips atomically; in-flight calls finish
+;   L2 service — a new capped env is spawned, warmed, then routed to
+;   L3 node    — the gateway (a STABLE routing table) re-claims a name from an
+;                old node generation to a new one; the stream never sees a gap
+; Rollback is a VALUE: desired generation is a datom, and `as-of` reaches the
+; prior one without a restore.
+;
+; The gateway here is a real routing table (atom of name→backend) — exactly the
+; shape vm/gateway.bl holds — driven while a concurrent request loop runs. We
+; assert: every request got a valid answer, AND the answer changed exactly once
+; at the cutover (no dropped/errored request in between).
+
+(ns vps.zero-downtime (:require [datom]))
+
+;; ── the gateway: one stable table, survives every backend swap ──────────────
+(def gateway (atom {"app.test" :blue}))          ; name → live backend
+(defn route [host] (get (deref gateway) host))
+(defn claim! [host backend] (swap! gateway assoc host backend))
+
+;; two node generations, each answering the same name differently
+(def backends {:blue  (fn [] "v1")
+               :green (fn [] "v2")})
+(defn serve [host] ((get backends (route host))))
+
+;; ── desired generation is a datom (so rollback is as-of) ────────────────────
+(def conn (datom/connect [{:db/ident :node/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+                          {:db/ident :node/generation :db/valueType :db.type/keyword}]))
+(def r0 (datom/transact! conn [{:db/id -1 :node/id "vps-1" :node/generation :blue}]))
+(def t-blue (:tx r0))
+
+;; ── a concurrent request stream that must never drop ────────────────────────
+(def results (atom []))
+(def stop (atom false))
+(def loper
+  (erlang/spawn
+    (fn []
+      (loop []
+        (when (not (deref stop))
+          (swap! results conj (serve "app.test"))
+          (Process/sleep 2)
+          (recur))))))
+
+(Process/sleep 30)                                ; stream runs on :blue
+;; ── the swap: warm green, then flip the claim atomically (L3) ───────────────
+(datom/transact! conn [{:db/id -1 :node/id "vps-1" :node/generation :green}])
+(claim! "app.test" :green)                        ; gateway re-claims the name
+(Process/sleep 30)                                ; stream runs on :green
+(reset! stop true)
+(Process/sleep 10)
+
+(def seen (deref results))
+(def answers (distinct seen))
+;; count the transitions in the observed stream: must be exactly one (v1→v2)
+(defn transitions [xs]
+  (count (filter (fn [[a b]] (not= a b)) (map (fn [a b] [a b]) xs (rest xs)))))
+
+(println "── request stream across the swap ──")
+(println "  total requests:" (count seen))
+(println "  distinct answers:" (pr-str answers))
+(println "  transitions (cutovers):" (transitions seen))
+
+;; ── rollback is a value: what generation was live at t-blue? ────────────────
+(defn gen-at [db] (first (first (datom/q '[:find ?g :where [?e :node/id "vps-1"][?e :node/generation ?g]] db))))
+(println "── rollback ──")
+(println "  generation now:     " (gen-at (datom/db conn)))
+(println "  generation as-of blue:" (gen-at (datom/as-of (datom/db conn) t-blue)))
+
+;; ── assertions ──────────────────────────────────────────────────────────────
+(def ok (and (> (count seen) 10)                 ; the stream actually ran
+             (every? (fn [x] (or (= x "v1") (= x "v2"))) seen) ; no dropped/errored req
+             (= 1 (transitions seen))            ; exactly one cutover, no flapping
+             (= :green (gen-at (datom/db conn)))
+             (= :blue (gen-at (datom/as-of (datom/db conn) t-blue))))) ; rollback = value
+(println "")
+(println (str (if ok "PASS" "FAIL") " 04_zero_downtime  (swap no request felt)"))
