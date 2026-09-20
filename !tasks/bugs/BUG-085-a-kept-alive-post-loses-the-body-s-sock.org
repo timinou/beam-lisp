@@ -1,0 +1,109 @@
+#+TITLE: a kept-alive POST loses the body's socket state, so the next request is parsed as garbage
+#+STATE: ITEM
+#+SESSION_ID: 15849b3b59e2e7fd
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-products-knowledger/2026-09-18T15-51-56-007Z_15849b3b59e2e7fd.jsonl]]
+#+CUSTOM_ID: BUG-085-a-kept-alive-post-loses-the-body-s-sock
+
+* Found on
+
+A Knowledger instance served by `bl serve clients/filali/serve.bl` (Bandit
+1.12.4, thousand_island 1.5.0, plug 1.20.3 — the pinned tree), reached through
+a cloudflared tunnel. ~10% of requests from a browser or an MCP client came back
+`400` with an EMPTY body; every `GET` was fine, and the rate was higher for
+`POST` (up to ~30% under a synthetic loop).
+
+* Symptom, measured
+
+    POST /mcp HTTP/1.1
+    → HTTP/1.1 400            (headers: `connection: close`, nothing else)
+    body: (empty)
+
+The journal names it exactly once per failure:
+
+    ** (Bandit.HTTPError) Request line HTTP error: " Bearer euUDCvo…"
+
+i.e. the parser was parked INSIDE the previous/current request's header block
+and read a header line as if it were a request line.
+
+* Repro (deterministic, no tunnel, no knowledger)
+
+Two facts pin it — both against the same server, same body:
+
+1. The body must arrive in a packet of its own.
+
+   | client's writes                                    | failures |
+   |----------------------------------------------------|----------|
+   | `sendall(headers + body)` — one write               | 0/40     |
+   | `sendall(headers)`; `sendall(body)` — two writes    | 12/40, 14/40 |
+
+   `curl` coalesces headers and body into one write → 25/25 clean.
+   Python's `http.client` writes them separately → ~15%. cloudflared relays a
+   stream and therefore splits → that is why the tunnel exposed it.
+
+2. The app must DROP the conn that `read_body` returns.
+
+   A bare Bandit server (`mix run`, no beam-lisp in the path) with
+
+       {:ok, body, _discarded} = Plug.Conn.read_body(conn)
+       Plug.Conn.send_resp(conn, 200, body)
+
+   → split-send 13/40 failures. With the conn threaded
+   (`{:ok, body, conn} = …` then `send_resp(conn, …)`) → 0/40, both modes.
+
+   Same Bandit 1.12.4 and 1.12.5 standalone, threaded: 0/40. So the server is
+   not at fault; the bl side is.
+
+* Root cause
+
+`web/read-body` (`priv/lib/web.bl`) returns ONLY the body:
+
+    (defn read-body [conn]
+      (let [res (erlang/apply Conn :read_body (list conn (list)))]
+        (let [tag (elem res 0)]
+          (if (or (= tag :ok) (= tag :more)) (elem res 1) ""))))
+
+`Plug.Conn.read_body/2` returns `{:ok, body, conn}` where THAT conn carries the
+advanced adapter — `Bandit.Adapter.read_req_body/2` (deps/bandit
+lib/bandit/adapter.ex:68) returns `%{adapter | transport: transport, metrics:
+…}`, i.e. the socket position after the consumed body. Dropping it means the
+next keep-alive cycle resumes from the OLD socket position, and Bandit's HTTP/1
+handler re-parses bytes it already consumed — the `Request line HTTP error:
+" Bearer …"` above.
+
+Why a single write hides it: when the body arrives with the headers it is
+already in the buffer, so the buffer/position bookkeeping happens to line up.
+Only a body that arrives later (the common case for any real client or proxy)
+leaves the stale position exposed.
+
+* Fix
+
+Thread the conn. `read-body` must return the updated conn alongside the body —
+`[body conn]` — and every caller must respond/continue with the conn it got
+back. Call sites to sweep (`grep -rn "read-body" priv lib test` plus the apps
+that use it): `priv/lib/web.bl` (`form-params`), `priv/lib/mcp/transport-http.bl`,
+`priv/lib/live/app.bl`, and in the Knowledger app
+`apps/knowledger/src/knowledger/wire.bl` (lines 461, 468).
+
+Alternative shape, if changing the arity is too wide: keep `read-body` as is and
+add `read-body+conn` returning `[body conn]`, deprecating the 1-arity reader —
+but a silent wrong-context reader is exactly what caused this, so an explicit
+pair is worth the churn.
+
+* Stopgap (one line, runtime-wide, if a fix must wait)
+
+`web/serve` can disable HTTP/1 keep-alive by passing Bandit
+`http_1_options: [max_requests: 1]` (`Bandit.start_link`, bandit.ex:151 —
+`max_requests` is a valid `http_1_options` key; there is no `keepalive` key).
+One request per connection makes the stale position unreachable: measured 0/40
+on the same loop that had failed. Cost: a TCP handshake per request (nil on
+loopback, small through a tunnel) and no reuse for a browser's asset burst.
+
+* Impact
+
+Any bl-served app behind a proxy, a browser, or a non-coalescing client loses a
+fraction of its POSTs to a bare 400 — with no bl-level log line, because the
+failure happens below the plug. On the filali instance it surfaced as MCP tool
+calls failing intermittently from Claude, at a rate (10–30%) high enough to
+look like flakiness in the tunnel. The tunnel was fixed separately (quic →
+http2, edge pinned to IPv4: it removed a different, hang-shaped failure); this
+one is the bl/Elixir seam.
