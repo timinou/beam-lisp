@@ -264,6 +264,121 @@
   [db a]
   (datoms db :aevt a))
 
+;; ── attribute paging: the read a backfill can afford ────────────────
+;;
+;; Materializing a whole attribute column to walk it is what makes a backfill
+;; O(corpus) in the middle of an otherwise incremental pipeline. `attribute-page`
+;; is the bounded replacement: the next `limit` ENTITY groups of one attribute
+;; after a cursor, each group read WHOLE.
+;;
+;; Why whole groups: AEVT orders a datom by (attribute, entity, …), so every
+;; datom of one `[e a]` is contiguous — which means a native page boundary can
+;; fall INSIDE an entity's datoms. Filtering a half group would build the
+;; supersession map from half the retractions and could publish a stale value.
+;; A group is therefore only filtered once the scan has shown the NEXT entity,
+;; and it is filtered by the db value's OWN filter — so a snapshot, `as-of`,
+;; `since` or `history` view all compose without a second visibility rule here.
+;;
+;; The cursor is the ENTITY, not a row: a group that is entirely retracted
+;; still advances `:after-eid`, and a caller loops until `:more?` is false
+;; rather than until the visible rows run out. `:datoms` holds only what the db
+;; value says is visible.
+
+(def ^:private PAGE-MIN-CHUNK
+  "Smallest rows-per-native-crossing when paging. A page rescales its read to
+   twice the entities asked for, so a column of one-datom entities reads about
+   twice what it returns; the floor keeps a tiny page from crossing once per
+   datom."
+  16)
+
+(def ^:private PAGE-MAX-CHUNK
+  "Largest rows-per-native-crossing when paging. A ceiling keeps the native and
+   BEAM transient bounded no matter how large the requested page is."
+  1024)
+
+(defn- page-chunk
+  "Rows to ask the store for per crossing when paging `limit` entities."
+  [limit]
+  (min PAGE-MAX-CHUNK (max PAGE-MIN-CHUNK (* 2 limit))))
+
+(defn- split-entity-groups
+  "Split `datoms` (ascending by entity, as AEVT orders them) into CLOSED groups
+   — entities a later datom has proven complete — and the trailing OPEN group of
+   the last entity, which the next page completes. Only closed groups may be
+   filtered: an open group's retractions may still lie ahead."
+  [datoms]
+  (if (empty? datoms)
+    {:closed [] :open []}
+    (loop [ds datoms cur-e (datom.index/-e (first datoms)) cur [] closed []]
+      (if (empty? ds)
+        {:closed closed :open cur}
+        (let [d (first ds) e (datom.index/-e d)]
+          (if (= e cur-e)
+            (recur (rest ds) cur-e (conj cur d) closed)
+            (recur (rest ds) e [d] (conj closed cur))))))))
+
+(defn attribute-page
+  "The next bounded page of attribute `attr`'s entity groups, after `after-eid`.
+
+  Returns `{:datoms [...] :after-eid eid :more? bool}`:
+
+    :datoms     the VISIBLE datoms of up to `limit` entity groups, in AEVT
+                order. Visibility is this db value's own filter, so a
+                snapshot, `as-of`, `since` or `history` value all behave.
+    :after-eid  the last entity group consumed — pass it back as the cursor.
+                A fully retracted group still advances it, so the walk never
+                stalls on a page with no visible datoms.
+    :more?      true when another entity group follows. Stop on `false`; never
+                on a row count, since a page can legitimately hold zero
+                visible datoms and still have advanced.
+
+  `after-eid` nil starts at the beginning of the attribute. `attr` must be in
+  the schema and `limit` a positive integer. A durable store reads this in
+  bounded native pages — never the whole column."
+  [db attr after-eid limit]
+  (when-not (datom.schema/known? (schema-of db) attr)
+    (throw (ex-info "attribute-page: unknown attribute" {:attr attr})))
+  (when-not (and (erlang/is_integer limit) (> limit 0))
+    (throw (ex-info "attribute-page: limit must be a positive integer"
+                    {:limit limit})))
+  ; A cursor is an ENTITY id (an integer); anything else would build a bogus
+  ; lower bound and silently page the wrong slice, so it fails loud here.
+  (when-not (or (nil? after-eid) (erlang/is_integer after-eid))
+    (throw (ex-info "attribute-page: after-eid must be nil or an entity id"
+                    {:after-eid after-eid})))
+  (let [base (datom.index/key-prefix :aevt attr)
+        ; Resume AFTER the cursor entity: `prefix-end` of that entity's prefix
+        ; sorts above every datom about it and below the next entity.
+        lo (if (nil? after-eid)
+             base
+             (datom.index/prefix-end (datom.index/key-prefix :aevt attr after-eid)))
+        hi (datom.index/prefix-end base)
+        chunk (page-chunk limit)
+        emit (fn [groups more?]
+               (if (empty? groups)
+                 {:datoms [] :after-eid after-eid :more? more?}
+                 (let [datoms (reduce (fn [acc g] (into acc g)) [] groups)
+                       last-eid (datom.index/-e (peek (peek groups)))]
+                   {:datoms (filter-datoms db datoms)
+                    :after-eid last-eid
+                    :more? more?})))]
+    (loop [start lo after nil open [] closed []]
+      (let [res (datom.store/page-datoms (store-of db) start after hi chunk)
+            ds (:datoms res)
+            end? (or (:end? res) (empty? ds))
+            split (split-entity-groups (into open ds))
+            closed2 (into closed (get split :closed))
+            open2 (get split :open)]
+        (if end?
+          ; The range is exhausted: the trailing group is complete too.
+          (let [all (if (empty? open2) closed2 (conj closed2 open2))]
+            (emit (vec (take limit all)) (> (count all) limit)))
+          (if (>= (count closed2) limit)
+            ; `open2` is non-empty whenever the page was not empty, so those
+            ; `limit` closed groups are followed by at least one more entity.
+            (emit (vec (take limit closed2)) true)
+            (recur nil (:last res) open2 closed2)))))))
+
 (defn entity
   "Entity `e` as a map of attribute to value.
 

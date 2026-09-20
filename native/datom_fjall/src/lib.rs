@@ -60,8 +60,14 @@ mod atoms {
         columns,
         datoms,
         pairs,
-        true_,
-        false_,
+        // The boolean lane's decoded terms. The trailing underscore is a Rust
+        // keyword accident, not part of the atom: without the alias rustler
+        // stringifies the IDENTIFIER, so a stored `true` came back as `:true_`
+        // — a keyword that is truthy, unequal to `true`, and unmatchable by a
+        // bound query. Alias to the real atom names (the same form rustler's
+        // own stdlib atoms use: `false_ = "false"`).
+        true_ = "true",
+        false_ = "false",
     }
 }
 
