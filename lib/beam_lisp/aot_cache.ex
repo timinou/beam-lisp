@@ -14,9 +14,9 @@ defmodule BeamLisp.AOTCache do
   Keys:
 
     * `compiler_key/0` — the TOOLCHAIN tier (FEAT-030): beam_lisp's version,
-      Elixir and OTP versions, the SHA-256 of the codegen modules' SOURCES
-      (AOT/AtomGuard/CompilerData/Record/Emit/Link/Native — NOT the Compiler
-      orchestration module, which does not affect emitted code) and
+      Elixir and OTP versions, the SHA-256 of the SOURCES of every module that
+      emits beams (`@codegen_modules`, below — NOT the `Compiler` orchestration
+      module, which does not affect emitted code) and
       every source in `priv/boot/` (the self-hosted compiler, the reader
       providers, and the ambient `core`/`sugar` prelude — not the whole
       `priv/**/*.bl`). A change to a tier-1 source invalidates every beam; a
@@ -116,7 +116,10 @@ defmodule BeamLisp.AOTCache do
   # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
   # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
   # is produced, so it contributed nothing to the key in every image while
-  # implying it was covered.
+  # implying it was covered. `BeamLisp.Native` was the second: `native.ex` was
+  # deleted when the defnative policy moved to `vm.native` (PLAN-122), and the
+  # moduledoc went on listing it. The moduledoc now points at this list rather
+  # than repeating it, so there is one authority and it is the one that emits.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
