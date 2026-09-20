@@ -39,7 +39,7 @@ close it.
         (let [ch (get gs i)
               n (inc i)]
           (cond
-            comment? (recur n stack str? esc? (= ch "\n"))
+            comment? (recur n stack str? esc? (not= ch "\n"))
             esc?     (recur n stack str? false false)
             str?     (if (= ch "\\")
                        (recur n stack true true false)
