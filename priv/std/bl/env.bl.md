@@ -106,8 +106,8 @@ one.
 
 ## The shape
 
-A project map declares twelve keys. Anything else is reported as an unknown key
-rather than ignored, because a typo'd key that silently does nothing is the
+A project map declares the keys below. Anything else is reported as an unknown
+key rather than ignored, because a typo'd key that silently does nothing is the
 worst kind of configuration bug.
 
 - `:name` — the project's name, a string.
@@ -136,6 +136,15 @@ worst kind of configuration bug.
   variable that holds the key — the key itself never appears here — and
   `:session` is handed to the provider verbatim, since only the provider knows
   its own vocabulary.
+- `:catalog` — `{:name :lib-dir :examples-dir}`: where this tree's COMPONENT
+  CATALOG lives. `:lib-dir` is the directory holding the vocabulary (its public
+  defns are the catalog's primitives) and `:examples-dir` the directory holding
+  the catalogued examples, one `^:catalog` metadata map each. They must be
+  SIBLINGS: the tool joins the two, so an examples directory inside the library
+  directory would have every example demonstrate itself. Everything else is
+  measured from those two directories, never declared — coverage, the gap, the
+  token escapes, the unlabelled inputs. See [tooling/catalog](../../priv/lib/tooling/catalog.bl)
+  and the session dashboard's Catalog pane.
 
 Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
@@ -143,7 +152,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :paths :tasks :ports :schedules :env :doc
-                 :app :build :release :deps :browser])
+                 :app :build :release :deps :browser :catalog])
 
 (defn- unknown-keys
   "The keys of `m` that nothing declares."
@@ -497,6 +506,43 @@ problems reports all three in one pass.
         [[] []]
         v)))
 
+(defn- norm-catalog
+  "`:catalog` — where this tree's component catalog lives: the DIRECTORY holding
+   the vocabulary and the DIRECTORY holding its catalogued examples, relative in
+   the file and absolute in the value, like `:paths`.
+
+   Those two directories (and a name, for the page's title) are the whole
+   declaration, because everything else is MEASURED from them: which primitives
+   the library exports, which one an example demonstrates, the gap between the
+   two, and where a component reached past the token grammar. A tree that
+   declares none carries no catalog — the session dashboard says exactly that,
+   rather than rendering an empty one."
+  [v root]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":catalog must be a map"]]
+    :else
+      (let [dir (fn [k what]
+                  (let [x (get v k)]
+                    (cond
+                      (nil? x) [nil [(str ":catalog " what " is required")]]
+                      (not (string? x)) [nil [(str ":catalog " what " must be a string")]]
+                      :else [(Path/expand x root) []])))
+            [lib lerr] (dir :lib-dir ":lib-dir")
+            [ex eerr] (dir :examples-dir ":examples-dir")
+            nm (:name v)
+            nerr (if (and (not (nil? nm)) (not (string? nm)))
+                   [":catalog :name must be a string"]
+                   [])]
+        [(if (seq (concat lerr eerr nerr))
+           nil
+           {:name (if (string? nm) nm nil)
+            :lib-dir lib
+            :examples-dir ex
+            :threads (:threads v)
+            :module-threads (:module-threads v)})
+         (concat lerr eerr nerr)])))
+
 (defn- norm-browser
   "`:browser` — how this tree reaches a browser provider: which provider, the
    NAME of the environment variable that holds its key, the provider's base
@@ -571,7 +617,8 @@ shape, whatever the file said.
         [bld berr]     (norm-build (:build m) root)
         [rel rerr]     (norm-release (:release m) root)
         [deps derr]    (norm-deps (:deps m))
-        [brw brerr]    (norm-browser (:browser m))]
+        [brw brerr]    (norm-browser (:browser m))
+        [cat cerr]     (norm-catalog (:catalog m) root)]
     {:path path
      :root root
      :name (if (string? nm) nm nil)
@@ -586,8 +633,9 @@ shape, whatever the file said.
      :release rel
      :deps deps
      :browser brw
+     :catalog cat
      :errors (concat perr nerr ierr terr porerr serr eerr aerr berr rerr derr
-                     brerr
+                     brerr cerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -596,7 +644,8 @@ shape, whatever the file said.
   [root]
   {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
    :schedules []
-   :env {} :app nil :build nil :release nil :deps [] :browser nil :errors []})
+   :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil
+   :errors []})
 ```
 
 ## The project value for a directory
