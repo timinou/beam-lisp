@@ -23,7 +23,7 @@ if [ -x "$HERE/garage/up.sh" ] && command -v garage >/dev/null 2>&1; then
 fi
 
 pass=0; fail=0
-for f in "$HERE"/0*.bl; do
+for f in "$HERE"/[0-9][0-9]_*.bl; do
   name=$(basename "$f" .bl)
   out=$("$BL" run "$f" 2>&1 | grep -vE "unknown key schedules")
   line=$(printf '%s\n' "$out" | grep -E "^(PASS|FAIL) ")

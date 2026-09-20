@@ -9,6 +9,9 @@ research/vps_spike/run.sh            # bl spikes 01-08 (brings Garage up for 06)
 research/vps_spike/run.sh --podman   # + 09 platform-swap, real containers, capped
 ```
 
+**Every spike has a step-by-step tutorial in [`tutorials/`](tutorials/README.md)** —
+what it proves, a walk of its code, and an honest real-vs-modelled boundary.
+
 Runtime: `./blx` — a wrapper that runs the checkout-matched `bl-v2026.4` drop
 with this worktree's `priv/std` + `priv/lib` on `BEAM_LISP_PATH` (so the REAL
 `proc.sched`, `reload`, `vm.*` load) and a `z3` for the verifier tiers. The
@@ -28,6 +31,10 @@ filters it.
 | `07_incident.bl` | page→postmortem in one store: the page carries its query, the window is bitemporal, automation and operators share one audit log, the postmortem's action is a datom | `incident-ritual.md` | **real** datom |
 | `08_upgrade_refusal.bl` | an upgrade is PROVEN or REFUSED: a missing/unsafe **data** migration and a missing/unsafe **message** migration are each held with a distinct z3-checked reason — never half-shipped | `zero-downtime.md` §L1, `the-reconciler.md` | **real** z3 (`migration-preserves?`, `simulates?`) |
 | `09` `podman/blue_green.sh` | a PLATFORM update (new container/OTP/OS closure) is blue-green across real rootless-podman containers behind a stable gateway: one clean cutover, ≤1 in-flight drop | `zero-downtime.md` §L3, `bootstrap.md` | **real** podman + socat + two bl node containers |
+| `10_identity.bl` | one capability, end to end: mint → attenuate → authorize → RLS → audit → revoke, all fail-closed | `devops.md` §identity, `fleet.md` §blast radius | **real** `auth` (Ed25519 Biscuit) |
+| `11_ssh_access.bl` | ssh terminates in a capped REPL whose caps come from the identity token; forged token forks nothing; per-user memory quota is real | `devops.md` §access | **real** `executor.sandbox/admit` + `auth` |
+| `12_ingress_tls.bl` | one TLS listener, a per-name leaf minted by the node's own CA, routed by SNI to the right backend — a real handshake | `devops.md` §ingress | **real** `vm.ca` + Erlang `:ssl` |
+| `13_drift_and_proof.bl` | drift is a recorded choice (commit-to-desired vs revert); the reconciler's delta is z3-proved before it applies, and refused with a reason if it would break an invariant | `the-reconciler.md` §drift + §failure-posture | **real** datom + z3 |
 
 ## The L1/L3 distinction this suite encodes
 

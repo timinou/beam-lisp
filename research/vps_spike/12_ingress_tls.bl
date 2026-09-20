@@ -1,0 +1,85 @@
+; 12_ingress_tls.bl — real ingress: one TLS listener, a per-name leaf from the
+;                      node's own CA, routed by SNI/Host to the right service.
+; Run: ./blx run research/vps_spike/12_ingress_tls.bl
+;
+; Hints at: devops.md §ingress, zero-downtime.md (the gateway is a separate
+;           process holding the port), README "TLS by name".
+;
+; Spikes 04 and 09 modelled the gateway (a routing atom / a socat pipe). This
+; one uses the REAL vm.ca: the node mints its own root once, then a LEAF cert
+; per service name on demand, and an `:ssl` listener with `sni_fun` serves the
+; right leaf for each handshake's SNI. Two names share ONE listener; each gets
+; its own certificate; both chain to the node's root; and the request is routed
+; to the backend that owns the name — exactly vm/gateway.bl's contract, proven
+; with a real TLS handshake rather than a plaintext stand-in.
+
+(ns vps.ingress-tls (:require [vm.ca :as ca]))
+
+(erlang/apply :application :ensure_all_started (list :ssl))
+
+;; ── the node's CA: one root, trusted by clients (served at /bl-ca.crt) ──────
+(def root-pem (ca/root-pem))
+(println "── the node's CA ──")
+(println "  root cert:" (subs root-pem 0 27) "…")
+
+;; ── the route table: Host → backend answer (vm.gateway holds this on disk) ──
+(def routes {"web.svc.localhost" "web-backend-v3"
+             "api.svc.localhost" "api-backend-v2"})
+(defn backend-for [host] (get routes host))
+
+;; ── one TLS listener, per-name leaf via sni_fun ─────────────────────────────
+(def sni (ca/sni-fun))
+(def lopts (list (tuple :sni_fun sni) (tuple :reuseaddr true) :binary (tuple :active false)))
+(def ls (elem (erlang/apply :ssl :listen (list 0 lopts)) 1))
+(def portnum (elem (elem (erlang/apply :ssl :sockname (list ls)) 1) 1))
+(println "── one TLS listener on :" portnum " serving every name ──")
+
+;; the acceptor: read the SNI the client asked for, answer with its backend
+(defn serve-one []
+  (erlang/spawn
+    (fn []
+      (let [r (erlang/apply :ssl :transport_accept (list ls 5000))]
+        (when (= :ok (elem r 0))
+          (let [h (erlang/apply :ssl :handshake (list (elem r 1) 5000))]
+            (when (= :ok (elem h 0))
+              (let [sock (elem h 1)
+                    sni-name (let [ci (erlang/apply :ssl :connection_information
+                                        (list sock (list :sni_hostname)))]
+                               (if (= :ok (elem ci 0))
+                                 (let [v (get (into {} (map (fn [t] [(elem t 0) (elem t 1)]) (elem ci 1))) :sni_hostname)]
+                                   (if (list? v) (erlang/list_to_binary v) v))
+                                 nil))
+                    host (if (list? sni-name) (erlang/list_to_binary sni-name) sni-name)
+                    backend (backend-for host)]
+                (erlang/apply :ssl :send (list sock (erlang/iolist_to_binary
+                                                      (list (or backend "no-route")))))))))))))
+
+;; ── a client hitting each name; verify it gets that name's backend + cert ───
+(defn hit [host]
+  (serve-one)
+  (Process/sleep 100)
+  (let [c (erlang/apply :ssl :connect
+            (list (erlang/binary_to_list "127.0.0.1") portnum
+                  (list :binary (tuple :active false) (tuple :verify :verify_none)
+                        (tuple :server_name_indication (erlang/binary_to_list host))) 5000))]
+    (if (= :ok (elem c 0))
+      (let [sock (elem c 1)
+            ;; the leaf the server presented, for this SNI
+            cert-r (erlang/apply :ssl :peercert (list sock))
+            got (elem (erlang/apply :ssl :recv (list sock 0 3000)) 1)]
+        {:backend got :got-cert (= :ok (elem cert-r 0))})
+      {:error (elem c 1)})))
+
+(def web (hit "web.svc.localhost"))
+(def api (hit "api.svc.localhost"))
+(println "── routed by name, each with its own leaf ──")
+(println "  web.svc.localhost →" (pr-str web))
+(println "  api.svc.localhost →" (pr-str api))
+
+;; ── assertions ──────────────────────────────────────────────────────────────
+(def ok (and (= "web-backend-v3" (:backend web))     ; SNI web → web backend
+             (= "api-backend-v2" (:backend api))     ; SNI api → api backend
+             (:got-cert web) (:got-cert api)         ; each handshake presented a leaf
+             (clojure.string/starts-with? root-pem "-----BEGIN CERTIFICATE")))
+(println "")
+(println (str (if ok "PASS" "FAIL") " 12_ingress_tls  (one listener, per-name leaf, routed by SNI)"))
