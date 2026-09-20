@@ -26,15 +26,19 @@ SCENE 1  join        → single-writer election        (06_raft)
 SCENE 2  place        → HRW rendezvous                 (01_sharding)
 SCENE 3  replicate    → log-shipping (basis-t/facts)   (02 + datom)
 SCENE 4  route/emit   → OR-Set + G-Set, union merges   (03, 02)
-SCENE 5  migrate      → desired-state delta, gen bump   (the reconciler, 01_reconciler)
-SCENE 6  partition    → quorum refuses the fork + SWIM  (06, 07)
-SCENE 7  heal         → catch-up ship + LWW health      (04)
+SCENE 5a migration gate→ z3 refuses an incomplete plan  (08_upgrade_refusal)
+SCENE 5b migrate      → proven plan admitted, gen bump   (the reconciler, 01/13)
+SCENE 6  partition    → quorum refuses the fork + SWIM   (06, 07)
+SCENE 7  heal         → catch-up ship + LWW health       (04)
 ```
 
 The thesis the whole day proves: **the classes that must not fork (desired
-state) are gated by consensus; the classes that only need to converge (events,
-routes, health) merge freely; and the two regimes coexist on one substrate
-without fighting.**
+state) are gated by consensus AND by proof; the classes that only need to
+converge (events, routes, health) merge freely; and the two regimes coexist on
+one substrate without fighting.** A migration is not just a desired-state write —
+it is an *upgrade of a stateful service across hosts*, so the fleet refuses to
+replicate it until z3 proves the state and message migrations are safe (scene
+5a), and only then flips and ships it (scene 5b).
 
 ## How it works
 
@@ -112,9 +116,39 @@ scene asserts `(= (desired-facts vps1) (desired-facts vps2))` — converged.
 events as a G-Set (union, spike 02). Both merge without touching the leader —
 this is the AP half of the fleet running in parallel with the CP half.
 
-**Scene 5 — migrate.** The operator flips `billing`'s host and bumps `:svc/gen`
-to 2; `ship!` replicates; both nodes now see `billing` on the new host. This is
-the reconciler's desired-state delta (spike 01 / 13) crossing a node boundary.
+**Scene 5a — the migration gate refuses an incomplete plan.** Moving `billing`
+across hosts is an *upgrade of a stateful service*: its ledger must survive the
+move, and charge requests queued under the old placement must still be honoured.
+So the fleet runs the z3 gate from spike 08 before it will replicate anything:
+
+```clojure
+(defn admit-migration [data-mig msg-mig]
+  (let [data-ok (and data-mig (sys/migration-preserves? port inv decls "b1" "b2" data-mig))
+        msg-ok  (and msg-mig (sys/simulates? port R decls "b1" "b2" "(- b1 amt)" msg-mig
+                                              "(assert (>= b1 amt))\n(assert (>= amt 0))"))]
+    (cond
+      (not data-mig) {:refused "data migration missing: … would strand the balance"}
+      (not data-ok)  {:refused "data migration unsafe: z3 found a balance … below 0 …"}
+      (not msg-mig)  {:refused "message migration missing: in-flight charge requests …"}
+      (not msg-ok)   {:refused "message migration unsafe: z3 found a message … diverges …"}
+      :else          {:ok true})))
+```
+
+The operator submits four plans, each fixing the last refusal, and z3 rejects
+each with a *distinct, actionable reason*: empty → *data migration missing*;
+`(- b1 100)` → *data migration unsafe* (a real counter-example balance drops
+below zero); data-only → *message migration missing*; a diverging handler
+`(+ (- b2 amt) 1)` → *message migration unsafe*. Nothing has been written to
+desired state yet — the fleet will not even flip the host until the plan is
+proven. This is `08_upgrade_refusal` applied at the fleet layer: *proven or
+held, never half-migrated.*
+
+**Scene 5b — the proven plan migrates.** With `data-mig = "b1"` (carry the
+balance) and `msg-mig = "(- b2 amt)"` (a handler that simulates the old one), the
+gate returns `{:ok true}`. *Only then* does the leader flip `billing`'s host and
+bump `:svc/gen` to 2, and `ship!` replicates it; both nodes now see `billing` on
+the new host. This is the reconciler's desired-state delta (spike 01 / 13)
+crossing a node boundary — gated by proof.
 
 **Scene 6 — partition (the climax).**
 
@@ -144,6 +178,7 @@ This *is* the fleet — every data class from
 | place | placement | HRW | [01](01-sharding.md) |
 | events | events | G-Set | [02](02-gset-crdt.md) |
 | routes | routes | OR-Set | [03](03-orset.md) |
+| migrate 5a | migration safety | z3 data + message proof | [../../vps_spike/tutorials/08-upgrade-refusal.md](../../vps_spike/tutorials/08-upgrade-refusal.md) |
 | heal | health | LWW | [04](04-lww.md) |
 | elect/partition | desired state | Raft quorum | [06](06-raft.md) |
 | partition | failure detect | SWIM | [07](07-gossip-swim.md) |
@@ -157,7 +192,9 @@ around.
 **Real:** two independent `datom` connections with a real unique-identity schema;
 real `transact!`/`q`/`basis-t`; real log-shipping with idempotent upsert; real
 OR-Set / G-Set / LWW merge algebra; real HRW placement; real quorum arithmetic
-refusing a minority write.
+refusing a minority write; **real z3 migration gate** — `system.core/migration-preserves?`
+and `simulates?` (spike 08) genuinely prove or refute each of the four scene-5a
+plans, each refusal is a z3 verdict, not a hand-written string.
 
 **Modelled:** the "network" is an atom (`network-up`) we flip, not real sockets —
 partition is simulated by choosing what `ship!` runs and what `reachable-count`

@@ -16,8 +16,9 @@
 ;   · health           → LWW-Register               (04_lww.bl)
 ;   · dissemination    → log-shipping (basis-t/since) + gossip (07_gossip_swim.bl)
 ;   · failure detect   → SWIM verdict               (07_gossip_swim.bl)
+;   · migration gate   → z3 proof, refuse-or-admit   (08_upgrade_refusal.bl)
 
-(ns fleet.lifecycle (:require [datom]))
+(ns fleet.lifecycle (:require [datom] [system.core :as sys] [z3]))
 
 ;; ═══ the substrate: two nodes = two datom conns; each holds desired + events ═
 (def dstate-schema
@@ -89,18 +90,62 @@
 (println (str "  routes (OR-Set union): " (pr-str (or-val routes))))
 (println (str "  events (G-Set union):  " (count events) " events, node-tagged, no collision"))
 
-;; ═══ SCENE 5 — migrate billing vps→vps (desired-state change on leader) ════
-;; the operator flips billing's host; leader bumps gen; reconciler on each node
-;; sees the delta. This is the reconciler (01_reconciler) across two nodes.
+;; ═══ SCENE 5 — migrate billing vps→vps, GATED by a proven migration ════════
+;; Moving a stateful service across hosts is an upgrade: its state at rest must
+;; still satisfy the invariant after the move, and in-flight messages queued under
+;; the old placement must still be honoured under the new one. The fleet REFUSES
+;; to replicate a migration until BOTH are proven by z3 (08_upgrade_refusal). So
+;; the scene has two acts: 5a the operator submits an incomplete plan and is
+;; refused, with a clear reason each time, until it is fixed; 5b the proven plan
+;; is admitted, the desired state flips, and it replicates.
 (def target (if (= (get placements "billing") "vps-1") "vps-2" "vps-1"))
-(datom/transact! (:conn (deref vps1)) [{:db/id -1 :svc/id "billing" :svc/host target :svc/gen 2}])
-(ship! (deref vps1) vps2)
 (defn host-of [node id] (first (first (datom/q '[:find ?h :in $ ?id :where [?e :svc/id ?id][?e :svc/host ?h]] (datom/db (:conn node)) id))))
-(println (str "\nSCENE 5 — migrate billing → " target " (gen 2), replicate"))
-(println (str "  vps-1 sees billing on: " (host-of (deref vps1) "billing")))
-(println (str "  vps-2 sees billing on: " (host-of (deref vps2) "billing")))
-(def migrated (= target (host-of (deref vps1) "billing") (host-of (deref vps2) "billing")))
 
+;; the migration gate: prove the data migration preserves the service invariant
+;; (billing's ledger balance ≥ 0) AND the new message handler simulates the old.
+(def port (z3/open))
+(defn inv [v] (str "(>= " v " 0)"))                 ; billing invariant: balance ≥ 0
+(def decls "(declare-const b1 Int)\n(declare-const b2 Int)\n(declare-const amt Int)\n")
+(def R (fn [a c] (str "(= " a " " c ")")))          ; observable: same balance
+
+(defn admit-migration
+  "Decide a host migration. `data-mig` maps old state→new (b1→b2 expr); `msg-mig`
+   is the new handler's transition. nil = that half of the plan is MISSING.
+   Returns {:ok true} or {:refused reason} — the fleet ships only on :ok."
+  [data-mig msg-mig]
+  (let [data-ok (and data-mig (sys/migration-preserves? port inv decls "b1" "b2" data-mig))
+        msg-ok  (and msg-mig (sys/simulates? port R decls "b1" "b2" "(- b1 amt)" msg-mig
+                                              "(assert (>= b1 amt))\n(assert (>= amt 0))"))]
+    (cond
+      (not data-mig) {:refused "data migration missing: billing carries a ledger; moving it without a state migration would strand the balance"}
+      (not data-ok)  {:refused "data migration unsafe: z3 found a starting balance the migration drives below 0 (invariant balance≥0 broken)"}
+      (not msg-mig)  {:refused "message migration missing: in-flight charge requests queued on the old host have no handler on the new one"}
+      (not msg-ok)   {:refused "message migration unsafe: z3 found a message the new handler answers differently from the old (observable divergence)"}
+      :else          {:ok true})))
+
+(println (str "\nSCENE 5a — operator submits an incomplete migration of billing → " target))
+;; the plan evolves as the operator fixes each refusal in turn:
+(def attempt-1 (admit-migration nil          nil))           ; nothing proven
+(def attempt-2 (admit-migration "(- b1 100)" nil))           ; data mig added, but unsafe
+(def attempt-3 (admit-migration "b1"         nil))           ; data mig fixed; msg mig missing
+(def attempt-4 (admit-migration "b1"         "(+ (- b2 amt) 1)")) ; msg mig added, but diverges
+(doseq [[label a] [["attempt 1 (empty plan)   " attempt-1]
+                   ["attempt 2 (+data, unsafe) " attempt-2]
+                   ["attempt 3 (data ok, -msg) " attempt-3]
+                   ["attempt 4 (+msg, diverges)" attempt-4]]]
+  (println (str "  ✗ " label " → REFUSED: " (:refused a))))
+
+;; 5b — the operator submits a complete, correct plan; z3 admits it; it ships.
+(def final-plan (admit-migration "b1" "(- b2 amt)"))         ; carry balance, handler simulates
+(println (str "\nSCENE 5b — corrected plan (carry state + simulating handler)"))
+(println (str "  ✓ migration gate → " (if (:ok final-plan) "ADMITTED (data preserved ∧ messages simulate)" (:refused final-plan))))
+(when (:ok final-plan)
+  (datom/transact! (:conn (deref vps1)) [{:db/id -1 :svc/id "billing" :svc/host target :svc/gen 2}])
+  (ship! (deref vps1) vps2))
+(println (str "  billing migrated → " target ", replicated:"))
+(println (str "    vps-1 sees billing on: " (host-of (deref vps1) "billing")))
+(println (str "    vps-2 sees billing on: " (host-of (deref vps2) "billing")))
+(def migrated (= target (host-of (deref vps1) "billing") (host-of (deref vps2) "billing")))
 ;; ═══ SCENE 6 — PARTITION: the follower is cut off; writes must not fork ════
 ;; With the network cut, the follower tries to accept a CONFLICTING write. Single-
 ;; writer + quorum (06) forbids it: a lone follower is a minority (1 < majority 2),
@@ -133,13 +178,16 @@
 
 ;; ═══ THE CURTAIN — assertions across the whole lifecycle ═══════════════════
 (def ok (and replicated                          ; scene 3: replication converged
+             (:refused attempt-1) (:refused attempt-2) ; scene 5a: incomplete plans refused
+             (:refused attempt-3) (:refused attempt-4) ; ...each with a distinct reason
+             (:ok final-plan)                     ; scene 5b: proven plan admitted
              (= 2 (count (or-val routes)))        ; scene 4: both routes present (OR-Set)
              (= 4 (count events))                 ; scene 4: all events survive (G-Set)
-             migrated                             ; scene 5: migration replicated to both
+             migrated                             ; scene 5b: migration replicated to both
              follower-write-refused               ; scene 6: minority cannot commit (no fork)
              (= :suspect swim-verdict)            ; scene 6: SWIM detected the partition
              (= :up (:val health))                ; scene 7: LWW healed health
              healed))                             ; scene 7: full reconvergence
 (println "\n═══════════════════════════════════════════════")
 (println (str (if ok "PASS" "FAIL")
-              " 09_fleet_lifecycle  (join→place→replicate→migrate→partition→heal, all algorithms)"))
+              " 09_fleet_lifecycle  (join→place→replicate→gate→migrate→partition→heal, all algorithms)"))
