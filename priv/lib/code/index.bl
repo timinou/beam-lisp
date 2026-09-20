@@ -56,6 +56,19 @@
 
 ; ── what a tree is ───────────────────────────────────────────────────────
 
+(defn- declared-ns
+  "The namespace `f` declares — `u/ns-of`'s answer — or nil when the file
+   cannot be READ at all.
+
+   nil is NOT `\"user\"`: `\"user\"` is a readable file that declares no
+   namespace (left out of a tree's sources), while nil is a file with no text to
+   ask (kept as a candidate so the build can report it as a skip rather than
+   drop it silently). One raise here used to fail the WHOLE walk — every door
+   that needs the index went down because one path could not be read."
+  [f]
+  (try (u/ns-of (BeamLisp.Loader/read_source f))
+       (catch e nil)))
+
 (defn tree-sources
   "The tree's OWN sources: every loader source under env.bl's `:paths`, as
    `[ns path]` pairs, sorted — or nil when there is no project file, no roots,
@@ -68,19 +81,25 @@
    and would otherwise be indexed twice into one conn.
 
    Files that only DECLARE nothing (no ns head parseable) get the name the
-   loader's own rule gives them, `user` — and are skipped for the same reason."
+   loader's own rule gives them, `user` — and are skipped for the same reason.
+
+   A file that cannot be READ is neither: it stays a CANDIDATE, named by its
+   file, so `readable-corpus` records it as a skip and the tree still indexes
+   everything else. Dropping it here would be a smaller index that looks
+   complete, which is the failure the skip record exists to prevent."
   [root]
   (let [p (env/project root)
         roots (to-list (:paths p))]
     (when (seq roots)
       (let [sources (reduce
                       (fn [acc f]
-                        (let [ns-str (u/ns-of (BeamLisp.Loader/read_source f))]
-                          (if (or (= "user" ns-str)
-                                  (contains? #{ "codebase" "typed"} ns-str)
-                                  (some (fn [pr] (= ns-str (get pr 0))) acc))
-                            acc
-                            (conj acc [ns-str f]))))
+                        (let [ns-str (declared-ns f)]
+                          (cond
+                            (nil? ns-str) (conj acc [(Path/basename f) f])
+                            (= "user" ns-str) acc
+                            (contains? #{ "codebase" "typed"} ns-str) acc
+                            (some (fn [pr] (= ns-str (get pr 0))) acc) acc
+                            :else (conj acc [ns-str f]))))
                       []
                       (sort (mapcat u/expand-targets roots)))]
         (when (seq sources) sources)))))
@@ -98,7 +117,7 @@
   (reduce
     (fn [acc root]
       (concat acc
-              (mapv (fn [p] [(u/ns-of (File/read! p)) p])
+              (mapv (fn [p] [(u/ns-of (try (File/read! p) (catch e ""))) p])
                     (to-list (sort (Path/wildcard (str root "/**/*.bl")))))))
     []
     (to-list roots)))
@@ -126,14 +145,59 @@
   "The identity of a corpus: every source's namespace and content hash, IN
    ORDER, plus this namespace's memo version.
 
+   Takes `[ns sha]` ENTRIES — the shape an index's `:sources` already has —
+   rather than `[ns path]` pairs, so the key and the sources it names come from
+   ONE read of each source and cannot disagree. It reads no file at all, which
+   is what lets the walk drop a source it cannot read BEFORE the key is taken
+   (see `readable-corpus`).
+
    Order is part of the key rather than an accident of the filesystem — the id
    bands follow position, so the same files in another order are a different
    index, and a memo that ignored the order would hand back facts banded for a
    corpus that no longer exists."
-  [pairs]
+  [entries]
   (sha256-hex
     (str MANIFEST-VERSION "|"
-         (join ";" (map (fn [p] (str (get p 0) " " (sha-of p))) (to-list pairs))))))
+         (join ";" (map (fn [e] (str (get e 0) " " (get e 1))) (to-list entries))))))
+
+(defn- readable-corpus
+  "`{:pairs [...] :sources [...] :skipped [...]}` — the pairs whose bytes can
+   be read, IN ORDER, their `[ns sha]` identities, and one record per pair that
+   cannot be read.
+
+   A source this process cannot READ is a fact about that one FILE — a
+   permission bit, a path that moved, a directory where a file was expected —
+   not about the tree. The index is complete for every source that IS readable,
+   and `:skipped` is how the walk says which files it had to leave out, with
+   the path AND the reason (a reason alone names a problem but not the file it
+   is about, which is the half a reader needs to act). A build that failed
+   instead would cost the caller every other source to report one.
+
+   The read happens ONCE, here, so the corpus key, the assembly and the report
+   all describe the same corpus; three readers that disagreed would produce an
+   index nobody can name."
+  [pairs]
+  (reduce
+    (fn [acc p]
+      (try
+        (-> acc
+            (update :pairs conj p)
+            (update :sources conj [(get p 0) (sha-of p)]))
+        (catch e
+          (update acc :skipped conj {:path (get p 1) :reason (ex-message e)}))))
+    {:pairs [] :sources [] :skipped []}
+    (to-list pairs)))
+
+(defn- with-read-skips
+  "`stats` with the walk's own skips appended to whatever the assembly
+   reported. ONE list in ONE shape — `\"path — reason\"` — so a caller (the CLI's
+   `bl search` footer, the pane) prints `:skipped` without asking which layer
+   left a file out."
+  [stats skips]
+  (update stats :skipped
+          (fn [s] (vec (concat (to-list (or s []))
+                               (map (fn [x] (str (get x :path) " — " (get x :reason)))
+                                    (to-list skips)))))))
 
 (defn- band-of
   "The id band for source `i`. Files never collide because no two files share a
@@ -231,33 +295,43 @@
   (datom/load-facts! conn facts))
 
 (defn- one-band
-  "`acc` grown by source `i`'s facts — its id band applied, its stats counted."
+  "`acc` grown by source `i`'s facts — its id band applied, its stats counted.
+
+   A source the analyzer cannot read is RECORDED as a skip and the corpus goes
+   on, the same rule the embedded path already keeps
+   (`code.semantic/analyze-one`): a corpus must not be a fraction of itself on
+   the one path where the model happens to be absent. The record carries the
+   path AND the reason, in the same `\"path — reason\"` shape the embedded
+   stats carry, so a caller prints one list."
   [acc i pair sigs root report n]
-  (let [r (facts-for sigs root (get pair 0) (get pair 1))
-        facts (:facts r)
+  (let [path (or (get pair 1) (get pair 0))
+        r (try (facts-for sigs root (get pair 0) (get pair 1))
+               (catch e {:reason (ex-message e)}))
         from (:from r)
         _ (if (some? report)
-            (report {:phase :file :i i :n n :file (or (get pair 1) (get pair 0)) :from from})
-            nil)
-        d (band-of i)]
-    (-> acc
-        (update :facts into (concat (shift (:fn facts) d)
-                                    (shift (:calls facts) d)
-                                    (shift (:instr facts) d)
-                                    (shift (:requires facts) d)))
-        (update :analyzed + (if (= :analyzed from) 1 0))
-        (update :cached + (if (= :cache from) 1 0))
-        (update :functions + (count (:fn facts)))
-        (update :skipped (fn [s] (if (:skipped facts) (conj s (get pair 1)) s)))
-        ; The per-source tally, kept where the facts were read: a caller that
-        ; wants to report what a corpus is made of (the MCP `code/list` groups)
-        ; would otherwise re-read every source's cache to count what this pass
-        ; already counted.
-        (update :per-source conj {:ns (get pair 0)
-                                  :file (get pair 1)
-                                  :functions (count (:fn facts))
-                                  :calls (count (:calls facts))
-                                  :names (mapv (fn [f] (get f :fn/name)) (:fn facts))}))))
+            (report {:phase :file :i i :n n :file path :from (or from :skipped)})
+            nil)]
+    (if (some? (:reason r))
+      (update acc :skipped conj (str path " — " (:reason r)))
+      (let [facts (:facts r)
+            d (band-of i)]
+        (-> acc
+            (update :facts into (concat (shift (:fn facts) d)
+                                        (shift (:calls facts) d)
+                                        (shift (:instr facts) d)
+                                        (shift (:requires facts) d)))
+            (update :analyzed + (if (= :analyzed from) 1 0))
+            (update :cached + (if (= :cache from) 1 0))
+            (update :functions + (count (:fn facts)))
+            ; The per-source tally, kept where the facts were read: a caller that
+            ; wants to report what a corpus is made of (the MCP `code/list` groups)
+            ; would otherwise re-read every source's cache to count what this pass
+            ; already counted.
+            (update :per-source conj {:ns (get pair 0)
+                                      :file (get pair 1)
+                                      :functions (count (:fn facts))
+                                      :calls (count (:calls facts))
+                                      :names (mapv (fn [f] (get f :fn/name)) (:fn facts))}))))))
 
 (defn- assemble-plain!
   "The model-less assembly: facts only, from the per-source term cache.
@@ -436,23 +510,33 @@
 (defn- build!
   "The work: read the corpus key, and on a miss assemble the conn. Runs ON THE
    OWNER when there is one (see `ensure`), which is what makes the conn's tables
-   outlive the answer."
+   outlive the answer.
+
+   A source the walk cannot read is dropped from the corpus and RECORDED, not
+   thrown: the key, the assembly and `:stats :skipped` all describe the readable
+   corpus, so an unreadable fixture costs one file rather than the whole tree.
+   An error from the ASSEMBLY — a store that cannot be written — is not a read
+   failure and still rethrows (see `do-build` in `vm.index`, which records the
+   path and operation on the frame the pane renders)."
   [sigs pairs root report opts]
   (let [t0 (System/monotonic_time :millisecond)
-        k (key-of pairs)
+        corpus (readable-corpus pairs)
+        k (key-of (:sources corpus))
         h (get-in (deref held) [:by-key k])
         ms (fn [] (- (System/monotonic_time :millisecond) t0))
         tell (fn [m] (if (some? report) (report m) nil))]
     (if (and (some? h) (datom/alive? (:conn h)))
       (do (tell {:phase :ready :hit true :ms (ms) :stats (:stats h)}) h)
       (try
-        (let [built (assemble! sigs pairs root report opts)
+        (let [built (assemble! sigs (:pairs corpus) root report opts)
+              stats (with-read-skips (:stats built) (:skipped corpus))
               v (assoc built
                        :key k
                        :built-at (System/monotonic_time :millisecond)
-                       :sources (mapv (fn [p] [(get p 0) (sha-of p)]) pairs))]
+                       :stats stats
+                       :sources (:sources corpus))]
           (remember! v)
-          (tell {:phase :ready :hit false :ms (ms) :stats (:stats built)})
+          (tell {:phase :ready :hit false :ms (ms) :stats stats})
           v)
         (catch e
           (tell {:phase :error :message (ex-message e)})
@@ -562,9 +646,17 @@
       (let [idx (ensure-tree root)]
         (when (some? idx)
           (let [files (to-list (sort (mapcat u/expand-targets (to-list paths))))
-                want-shas (mapv (fn [f] [(u/ns-of (BeamLisp.Loader/read_source f))
-                                         (sha256-hex (BeamLisp.Loader/read_source f))])
-                                files)]
+                ; A file the caller cannot read is dropped from its own side too:
+                ; the index's `:sources` exclude exactly the sources the walk
+                ; could not read (`readable-corpus`), so a comparison that kept an
+                ; unreadable file here would say the index does not cover a
+                ; corpus it does — and re-build it, uncached, every question.
+                want-shas (reduce (fn [acc f]
+                                    (try
+                                      (conj acc [(u/ns-of (BeamLisp.Loader/read_source f))
+                                                 (sha256-hex (BeamLisp.Loader/read_source f))])
+                                      (catch e acc)))
+                                  [] files)]
             ; The engine's two bands lead every index (see `engine-pairs`) and are
             ; never part of a caller's question about ITS sources, so they are
             ; dropped from the comparison rather than counted against every
@@ -604,6 +696,15 @@
    Returns nil when the tree has no sources to index (no env.bl, or nothing
    loadable under its `:paths`), which is a fact a caller must be able to tell
    from an empty index: there is no such thing as an index of nothing.
+
+   A source the walk cannot READ is a WARNING, not an ERROR: the build's verdict
+   is `:phase :ready` and the file is reported in `:stats :skipped` as
+   `\"path — reason\"`. The index is complete for every source that IS readable,
+   which is the honest outcome of a walk that met an unreadable file, and the
+   alternative — failing the tree — costs the caller every other source to
+   report one. `:error` is reserved for a failure of the BUILD itself (a store
+   that cannot be written), which `vm.index/do-build` records with the path and
+   the operation.
 
    `opts`: `:on-progress` `(fn [i n path from] …)`, `:roots` to index an
    explicit set of paths instead of the project's."
