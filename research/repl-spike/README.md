@@ -16,10 +16,34 @@ node research/repl-spike/probe2.mjs   # the interrupt sequence, frame by frame
 ```
 
 `vendor/editor.bundle.js` is CodeMirror 6 + clojure mode + autocomplete,
-esbuild-bundled to one 395 KB ESM file (host has node+esbuild; build recipe in
-git history — npm i in /tmp, one esbuild call). **This is also the vendoring
-answer for the final impl: one committed bundle, no runtime CDN, no build
-step in the tree.**
+esbuild-bundled to one ~405 KB ESM file (host has node+esbuild). **This is also
+the vendoring answer for the final impl: one committed bundle, no runtime CDN,
+no build step in the tree.**
+
+The shipped bundle is the one at `priv/std/vm/repl/editor.bundle.js`;
+`vendor/` keeps the exact entry point it was built from. To rebundle — e.g. to
+export one more CodeMirror API — recreate the build tree anywhere (it must NOT
+live in the repo):
+
+```sh
+mkdir -p /tmp/cm6 && cd /tmp/cm6
+npm i @codemirror/autocomplete@^6.20.3 @codemirror/commands@^6.11.1 \
+      @codemirror/language@^6.12.4 @codemirror/legacy-modes@^6.5.4 \
+      @codemirror/state@^6.7.5 @codemirror/view@^6.43.12 \
+      @lezer/highlight@^1.2.3 codemirror@^6.0.2
+cp <this dir>/vendor/entry.js .          # the export list is the page's API
+npx esbuild entry.js --bundle --format=esm --minify --outfile=editor.bundle.js
+cp editor.bundle.js <tree>/priv/std/vm/repl/editor.bundle.js
+```
+
+Two things bite afterwards: the daemon memoises the bundle in
+`persistent_term` (vm.repl/bundle), so a rebundle ships with a **daemon
+restart**; and browsers never revalidate it, so bump the `?v=N` on the page's
+import or the old bundle stays in cache.
+
+Keep the versions as pinned above: the page's behaviour (`basicSetup`, the
+clojure StreamLanguage, autocomplete) comes from this bundle, so a version
+drift is a behaviour change, not a dependency update.
 
 ## Verdict per uncertainty
 
