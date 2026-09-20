@@ -1,0 +1,138 @@
+; test/bl/flow_test.bl — fan-out and batching on the demand protocol.
+; Run: bin/bl test --shared test/bl/flow_test.bl
+;
+; `flow` is the demand-driven streaming tier: a producer emits ONLY what a
+; consumer has asked for. Two primitives were missing for the Broadway half —
+; fan-out (`distribute`) and coalescing (`batch`) — and this file pins the
+; invariants each must hold, because both are places where a demand pipeline
+; most easily loses an event or lets a producer run away:
+;
+;   · distribute routes every event to exactly ONE worker, and the upstream
+;     window is the SUM of the workers' demand, so a slow worker throttles the
+;     producer. A worker that dies is REPORTED, with the events it held.
+;   · batch emits on the COUNT trigger and on the TIMEOUT trigger, and `n` = 1
+;     is exactly no batching — no timer is left armed.
+
+(ns flow.test
+  (:require [proc :as proc]
+            [proc.flow :as flow]))
+
+;; ── helpers ─────────────────────────────────────────────────────────────
+
+(defn- await
+  "Poll `pred` every 10 ms until it holds or `ms` runs out."
+  [pred ms]
+  (loop [left ms]
+    (cond
+      (pred) true
+      (<= left 0) false
+      :else (do (Process/sleep 10) (recur (- left 10))))))
+
+(defn- recv-events [ms]
+  (receive
+    [:events evs] evs
+    (after ms :timeout)))
+
+;; ── distribute: exactly one worker, and the window is the sum ────────────
+
+(deftest every-event-reaches-exactly-one-worker
+  (let [recs (atom [])
+        done (atom false)
+        src (flow/from-seq (range 30))]
+    (flow/distribute src
+      (fn [e] (swap! recs conj [(erlang/self) e]))
+      {:concurrency 3 :batch 2 :on-done (fn [] (reset! done true))})
+    (is (await (fn [] @done) 5000) "the fan-out completed")
+    (let [events (map second @recs)]
+      (is (= 30 (count events)) "every event was delivered")
+      (is (= (vec (range 30)) (vec (sort events)))
+          "…exactly once each: no loss and no duplication")
+      (is (= 3 (count (distinct (map first @recs))))
+          "…disjointly across all three workers, not all to one"))))
+
+(deftest a-single-worker-is-the-plain-consumer
+  (let [via-run (flow/run (flow/from-seq (range 20)) [] conj 4)
+        recs (atom [])
+        done (atom false)]
+    (flow/distribute (flow/from-seq (range 20))
+      (fn [e] (swap! recs conj e))
+      {:concurrency 1 :batch 4 :on-done (fn [] (reset! done true))})
+    (is (await (fn [] @done) 5000) "the fan-out completed")
+    (is (= (vec via-run) @recs)
+        "concurrency 1 delivers the same events, in the same order")))
+
+(defn- lead-producer
+  "Emits 0..total-1, recording the widest gap between events EMITTED and events
+   DELIVERED by the workers — the backpressure witness."
+  [total emitted delivered peak]
+  (flow/producer
+    (fn [remaining k]
+      (if (empty? remaining)
+        :halt
+        (let [ev (vec (take k remaining))
+              em (+ @emitted (count ev))
+              lead (- em @delivered)]
+          (reset! emitted em)
+          (swap! peak (fn [p] (if (> lead p) lead p)))
+          [ev (vec (drop k remaining))])))
+    (vec (range total))))
+
+(deftest a-slow-worker-holds-the-producer-to-the-window
+  (let [emitted (atom 0)
+        delivered (atom 0)
+        peak (atom 0)
+        done (atom false)
+        src (lead-producer 20 emitted delivered peak)]
+    (flow/distribute src
+      (fn [_] (Process/sleep 15) (swap! delivered inc))
+      {:concurrency 1 :batch 1 :on-done (fn [] (reset! done true))})
+    (is (await (fn [] @done) 5000) "the slow stream finished")
+    (is (= 20 @delivered) "every event was delivered — the slow worker lost nothing")
+    (is (= 20 @emitted) "and the producer emitted exactly the events the worker took")
+    (is (<= @peak 2)
+        (str "the producer never ran ahead of the demand window; widest gap was " @peak))))
+
+(deftest a-dead-worker-is-reported-not-swallowed
+  (let [seen (atom [])
+        down (atom nil)
+        src (flow/from-seq (range 60))
+        d (flow/distribute src
+            (fn [e] (swap! seen conj e) (Process/sleep 300))
+            {:concurrency 2 :batch 4 :on-down (fn [notice] (reset! down notice))})]
+    (is (await (fn [] (pos? (count @seen))) 2000) "a worker is mid-flight")
+    (let [victim (first (flow/workers d))]
+      (kill victim)
+      (is (await (fn [] (some? @down)) 2000) "the death reached the observer")
+      (is (= victim (:worker @down)) "…naming the worker that died")
+      (is (seq (:lost @down))
+          "…and the events it held are reported, not silently dropped"))))
+
+;; ── batch: the count trigger, the timeout trigger, and n = 1 ─────────────
+
+(deftest a-full-batch-emits-on-the-count-not-the-clock
+  (let [t0 (proc/wall-ms)
+        out (flow/run (flow/batch (flow/from-seq (range 10)) 5 5000) [] conj 8)
+        elapsed (- (proc/wall-ms) t0)]
+    (is (= [[0 1 2 3 4] [5 6 7 8 9]] out) "two whole batches of five")
+    (is (< elapsed 2000)
+        "…emitted when the count filled, not after the five-second timer")))
+
+(deftest a-short-batch-emits-on-the-timeout
+  (let [b (flow/batch (flow/from-seq (range 3)) 5 120)]
+    (erlang/send b [:subscribe (erlang/self)])
+    (erlang/send b [:demand 3 (erlang/self)])
+    (let [t0 (proc/wall-ms)
+          got (recv-events 3000)
+          elapsed (- (proc/wall-ms) t0)]
+      (is (= [[0 1 2]] got) "the short batch came out whole")
+      (is (>= elapsed 100) "…only once the timeout passed, never reaching five"))
+    (erlang/send b [:cancel])))
+
+(deftest one-event-batches-leave-no-timer-armed
+  (let [b (flow/batch (flow/from-seq (range 100)) 1 1000)]
+    (erlang/send b [:subscribe (erlang/self)])
+    (erlang/send b [:demand 3 (erlang/self)])
+    (is (= [[0] [1] [2]] (recv-events 3000)) "each event is its own batch")
+    (is (nil? (:timer (flow/batch-state b)))
+        "n = 1 is exactly no batching: no timer is left armed")
+    (erlang/send b [:cancel])))

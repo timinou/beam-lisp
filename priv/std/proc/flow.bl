@@ -281,6 +281,145 @@
   [up f chunk] (flat-transform up (fn [e] (vec (f e))) chunk))
 
 ;; ─────────────────────────────────────────────────────────────────────
+;; BATCH — coalesce many events into one.
+;;
+;; A batcher is the multi-rate stage turned around: it takes MANY events and
+;; emits ONE, a list. Two triggers race and whichever fires first wins:
+;;
+;;   • the COUNT trigger — `n` events have accumulated, emit them now;
+;;   • the TIMEOUT trigger — fewer than `n` wait and `t` ms have passed, emit
+;;     the short batch rather than hold it forever (Broadway's batcher).
+;;
+;; Downstream demand is counted in BATCHES, so a demand of k allows at most k
+;; emissions and the stage cannot overrun its consumer. Upstream demand is what
+;; the outstanding batch demand can absorb — `want × n` — less what is already
+;; buffered or in flight. `n` = 1 is exactly no batching: every event is a batch
+;; of one, emitted on arrival, and NO timer is ever armed.
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- b-emit
+  "Emit whole `n`-event batches while downstream demand allows. [state' emitted?]"
+  [st sub n]
+  (let [k (min (:want st) (quot (count (:buf st)) n))]
+    (if (> k 0)
+      (do (erlang/send sub
+                       [:events
+                        (vec (map (fn [i] (vec (take n (drop (* i n) (:buf st)))))
+                                  (range k)))])
+          [(assoc st :buf (vec (drop (* k n) (:buf st))) :want (- (:want st) k)) true])
+      [st false])))
+
+(defn- b-emit-partial
+  "Emit the open short batch now — the timeout trigger, and the tail at :done."
+  [st sub]
+  (if (and (> (count (:buf st)) 0) (> (:want st) 0))
+    (do (erlang/send sub [:events [(vec (:buf st))]])
+        [(assoc st :buf [] :want (- (:want st) 1)) true])
+    [st false]))
+
+(defn- b-settle
+  "Push out everything that may go now: whole batches, then — once upstream is
+   done — the remainder as a final short batch, then :done when the buffer drains."
+  [st sub n]
+  (let [[st _] (b-emit st sub n)
+        [st _] (if (:done? st) (b-emit-partial st sub) [st false])]
+    (if (and (:done? st) (empty? (:buf st)))
+      (do (erlang/send sub [:done]) (assoc st :finished? true))
+      st)))
+
+(defn- b-clear-timer [st]
+  (when (some? (:timer st)) (erlang/cancel_timer (:timer st)))
+  (assoc st :timer nil))
+
+(defn- b-arm
+  "Arm the timeout iff a short batch is open and a partial may still go. `n` = 1
+   never arms: a one-event batch is already whole, and an armed timer left
+   behind is the exact leftover this stage must not have."
+  [st n t]
+  (if (and (nil? (:timer st)) (> n 1) (> (count (:buf st)) 0)
+           (> (:want st) 0) (< (count (:buf st)) n))
+    (let [r (erlang/make_ref)]
+      (erlang/send_after t (erlang/self) (tuple :bl-flow/flush r))
+      (assoc st :timer r))
+    st))
+
+(defn- b-pump
+  "Ask upstream for what the outstanding batch demand can absorb, less what is
+   buffered or already on its way. Never pulls without demand."
+  [st up n]
+  (let [need (- (* (:want st) n) (count (:buf st)) (:up-out st))]
+    (if (and (> need 0) (not (:done? st)))
+      (do (erlang/send up [:demand need (erlang/self)])
+          (assoc st :up-out (+ (:up-out st) need)))
+      st)))
+
+(defn- b-step
+  "The settle / clear-timer / arm-timer / pump sequence after a state change."
+  [st sub up n t]
+  (let [st (b-settle st sub n)]
+    (if (:finished? st)
+      st
+      (b-pump (b-arm (b-clear-timer st) n t) up n))))
+
+(defn- b-loop [up sub st n t]
+  (receive
+    [:subscribe c]
+    (do (erlang/send up [:subscribe (erlang/self)])
+        (b-loop up c st n t))
+
+    [:demand k]       (let [st (b-step (assoc st :want (+ (:want st) k)) sub up n t)]
+                        (if (:finished? st) :done (b-loop up sub st n t)))
+    [:demand k _from] (let [st (b-step (assoc st :want (+ (:want st) k)) sub up n t)]
+                        (if (:finished? st) :done (b-loop up sub st n t)))
+
+    [:events events]
+    (let [st (b-step (assoc st
+                            :buf (into (:buf st) events)
+                            :up-out (max 0 (- (:up-out st) (count events))))
+                     sub up n t)]
+      (if (:finished? st) :done (b-loop up sub st n t)))
+
+    [:done]
+    (let [st (b-step (assoc st :done? true) sub up n t)]
+      (if (:finished? st) :done (b-loop up sub st n t)))
+
+    ;; the timeout: only the timer THIS stage armed may flush
+    [:bl-flow/flush r]
+    (if (= r (:timer st))
+      (let [[st _] (b-emit-partial (assoc st :timer nil) sub)
+            st (b-step st sub up n t)]
+        (if (:finished? st) :done (b-loop up sub st n t)))
+      (b-loop up sub st n t))
+
+    [:state from]
+    (do (erlang/send from [:state st]) (b-loop up sub st n t))
+
+    [:cancel] (do (erlang/send up [:cancel]) :cancelled)
+
+    (after 3600000 (b-loop up sub st n t))))
+
+(defn batch
+  "A batcher stage: subscribe, demand in BATCHES, and receive one event per
+   batch — a list of up to `n` upstream events, emitted when `n` have gathered
+   (the count trigger) or after `t` ms with a shorter batch (the timeout
+   trigger), whichever comes first. `n` = 1 is exactly no batching; each event
+   is its own batch and no timer is ever armed."
+  [up n t]
+  (when (< n 1)
+    (throw (ex-info "batch: n must be at least 1" {:n n})))
+  (spawn (fn []
+           (b-loop up nil {:buf [] :want 0 :up-out 0 :done? false
+                           :timer nil :finished? false} n t))))
+
+(defn batch-state
+  "The batcher's state — the timer it holds, its buffer, its demand. Observability
+   for a live batcher, e.g. that `n` = 1 leaves no timer armed."
+  [b]
+  (erlang/send b [:state (erlang/self)])
+  (receive
+    [:state s] s
+    (after 5000 :timeout)))
+
 ;; CONSUMER — the demand SOURCE. It drives the whole pipeline: nothing
 ;; upstream produces anything until a consumer issues demand. `run` is the
 ;; blocking consumer that folds every event into an accumulator and returns
@@ -366,3 +505,254 @@
    bus subscribers therefore see the same events as `proc.bus/publish` produces."
   ([up] (proc.bus/start-broadcast up {}))
   ([up opts] (proc.bus/start-broadcast up opts)))
+
+;; ─────────────────────────────────────────────────────────────────────
+;; FAN-OUT — one upstream, N concurrent workers.
+;;
+;; `subscribe` gives ONE consumer a demand-driven view of a stream;
+;; `distribute` gives N. It demands from upstream the SUM of what its workers
+;; have asked for, and routes each event to exactly one worker that has demand.
+;; The arithmetic is the point: a worker that stops renewing withholds its own
+;; credit, so the producer is throttled to the sum and cannot run away. A slow
+;; worker bounds the producer; a dead one is reported, never silently dropped.
+;;
+;; Wire protocol — a worker C and its distributor D:
+;;   C -> D   [:subscribe C]      join the worker set
+;;   C -> D   [:demand n C]       I can take n more
+;;   D -> C   [:events (e …)]     at most the per-worker demand outstanding
+;;   D -> C   [:done]             upstream exhausted and every event routed
+;;   C -> D   [:worker-done C]    after :done, C has handled all it was sent
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- d-demand
+  "The live workers' total outstanding demand — the upstream window."
+  [workers]
+  (reduce (fn [acc w] (+ acc (:demand w))) 0 workers))
+
+(defn- d-ready
+  "Index at or after `start` (cyclically) of a worker with demand > 0, or nil."
+  [workers start]
+  (let [n (count workers)]
+    (when (> n 0)
+      (loop [i 0]
+        (if (>= i n)
+          nil
+          (let [j (mod (+ start i) n)]
+            (if (> (:demand (nth workers j)) 0) j (recur (inc i)))))))))
+
+(defn- d-dispatch
+  "Route `pending` events to live workers, one each, round-robin from `next`.
+   Every event lands on exactly one worker, and only on one that had demand."
+  [workers pending next]
+  (loop [ws workers p (vec pending) idx next]
+    (if (empty? p)
+      [ws p idx]
+      (let [j (d-ready ws idx)]
+        (if (nil? j)
+          [ws p idx]
+          (let [w (nth ws j)
+                ev (first p)]
+            (erlang/send (:pid w) [:events [ev]])
+            (recur (assoc ws j (assoc w
+                                      :demand (- (:demand w) 1)
+                                      :inflight (conj (:inflight w) ev)))
+                   (vec (rest p))
+                   (mod (inc j) (count ws)))))))))
+
+(defn- d-topup
+  "Demand from upstream the difference between the workers' total demand and
+   what is already buffered or in flight. The window IS the sum — no more is
+   ever asked of the producer."
+  [st up]
+  (if (:done? st)
+    st
+    (let [target (max 0 (- (d-demand (:workers st)) (count (:pending st))))
+          out (:up-out st)]
+      (if (> target out)
+        (do (erlang/send up [:demand (- target out) (erlang/self)])
+            (assoc st :up-out target))
+        st))))
+
+(defn- d-credit
+  "A worker renewed demand: add the credit and clear the in-flight set it has
+   now accounted for by renewing."
+  [st w n]
+  (assoc st :workers
+         (vec (map (fn [x]
+                     (if (= (:pid x) w)
+                       (assoc x :demand (+ (:demand x) n) :inflight [])
+                       x))
+                   (:workers st)))))
+
+(defn- d-without
+  "The worker set with `ref` removed."
+  [st ref]
+  (vec (remove (fn [w] (= (:ref w) ref)) (:workers st))))
+
+(defn- d-report
+  "Tell the observer a worker died. A fn is called, a pid is sent a
+   `[:worker-down …]`; with no observer the loss has nowhere to go, but the
+   demand is still returned from the window."
+  [down pid reason lost]
+  (when (some? down)
+    (let [notice {:worker pid :reason reason :lost (vec lost)}]
+      (if (erlang/is_pid down)
+        (erlang/send down [:worker-down notice])
+        (down notice)))))
+
+(defn- d-finish
+  "The stream is fully handled: tell the observer once, and stop."
+  [st]
+  (when (some? (:on-done st)) ((:on-done st)))
+  (assoc st :finished? true))
+
+(defn- d-close
+  "Upstream is exhausted and nothing is pending: release every worker, then
+   wait for them to confirm they handled what they were sent."
+  [st]
+  (vec (map (fn [w] (erlang/send (:pid w) [:done])) (:workers st)))
+  (if (empty? (:workers st))
+    (d-finish st)
+    (assoc st :closing? true)))
+
+(defn- d-continue
+  "Dispatch what can go, reconcile the upstream window, and close the stream
+   once upstream is exhausted and nothing is left pending — so a demand that
+   finally drains a backlog still ends the run."
+  [st]
+  (let [[ws p idx] (d-dispatch (:workers st) (:pending st) (:next st))
+        st (d-topup (assoc st :workers ws :pending p :next idx) (:up st))]
+    (if (and (:done? st) (empty? (:pending st))
+             (not (:closing? st)) (not (:finished? st)))
+      (d-close st)
+      st)))
+
+(defn- d-lost
+  "A monitored worker died: report the events it held, drop it, and let the
+   survivors absorb any pending backlog. Its demand leaves the window."
+  [st ref pid reason]
+  (let [victim (first (filter (fn [w] (= (:ref w) ref)) (:workers st)))]
+    (if (nil? victim)
+      st
+      (do
+        (d-report (:down st) pid reason (:inflight victim))
+        (let [st (assoc st :workers (d-without st ref))
+              [ws p idx] (d-dispatch (:workers st) (:pending st) (:next st))
+              st (assoc st :workers ws :pending p :next idx)]
+          (if (and (:closing? st) (empty? (:workers st)))
+            (d-finish st)
+            st))))))
+
+(defn- d-loop [st]
+  (receive
+    [:subscribe w]
+    (let [worker {:pid w :ref (erlang/monitor :process w) :demand 0 :inflight []}]
+      (d-loop (assoc st :workers (conj (:workers st) worker))))
+
+    [:demand n w]
+    (let [st (d-continue (d-credit st w n))]
+      (if (:finished? st) :finished (d-loop st)))
+
+    ;; untagged demand is meaningful only for the single-consumer case
+    [:demand n]
+    (let [st (d-continue (if (= 1 (count (:workers st)))
+                           (d-credit st (:pid (first (:workers st))) n)
+                           st))]
+      (if (:finished? st) :finished (d-loop st)))
+
+    [:events events]
+    (let [st (d-continue (assoc st
+                                :pending (into (:pending st) events)
+                                :up-out (max 0 (- (:up-out st) (count events)))))]
+      (if (:finished? st) :finished (d-loop st)))
+
+    [:worker-done w]
+    (let [victim (first (filter (fn [x] (= (:pid x) w)) (:workers st)))
+          st (if (nil? victim)
+               st
+               (do (erlang/demonitor (:ref victim) (list :flush))
+                   (assoc st :workers (d-without st (:ref victim)))))]
+      (if (and (:closing? st) (empty? (:workers st)))
+        (do (d-finish st) :finished)
+        (d-loop st)))
+
+    [:done]
+    (let [st (d-continue (assoc st :done? true))]
+      (if (:finished? st) :finished (d-loop st)))
+
+    [:workers from]
+    (do (erlang/send from [:workers (vec (map (fn [w] (:pid w)) (:workers st)))])
+        (d-loop st))
+
+    [:DOWN ref :process pid reason]
+    (let [st (d-lost st ref pid reason)]
+      (if (:finished? st) :finished (d-loop st)))
+
+    (after 3600000 (d-loop st))))
+
+(defn- worker-loop [dist f batch]
+  (erlang/send dist [:subscribe (erlang/self)])
+  (erlang/send dist [:demand batch (erlang/self)])
+  (loop []
+    (receive
+      [:events events]
+      (do (vec (map f events))
+          (erlang/send dist [:demand batch (erlang/self)])
+          (recur))
+      [:done]
+      (do (erlang/send dist [:worker-done (erlang/self)]) :done)
+      (after 3600000 (recur)))))
+
+(defn distribute
+  "Fan `up` out to `concurrency` concurrent workers, each running `(f event)`
+   on its own process. Returns the distributor pid; `(workers d)` lists the
+   live workers.
+
+   The distributor is a producer to its workers and a consumer of `up`, and it
+   extends the same demand protocol: workers pull with `[:demand n self]`, the
+   distributor demands the SUM of their outstanding demand upstream, and routes
+   each event to exactly one worker that had demand for it.
+
+   INVARIANTS:
+   · exactly-once routing: an upstream event is sent to exactly ONE worker,
+     chosen round-robin among live workers with demand. While every worker
+     lives, no event is lost and none is delivered twice.
+   · the upstream window IS the sum of the workers' demand: the distributor
+     asks upstream for `sum(demand) - pending` and nothing more, so a worker
+     that stops renewing withholds only its own credit and throttles the
+     producer. A slow worker cannot let the producer run away.
+   · reported loss: the protocol has no ack, so an event handed to a worker
+     counts as delivered. If a worker DIES, the events it was handed since its
+     last demand are reported to `:on-down` as `{:worker pid :reason reason
+     :lost [events]}` — AT-MOST-ONCE per worker, with the loss stated rather
+     than guessed. The dead worker's demand leaves the window, so the producer
+     stops working for a gone pid.
+
+   opts (all optional): `:concurrency` workers (default 1 — exactly the single
+   consumer), `:batch` events demanded per worker at a time (default 8),
+   `:on-down` a fn or pid told about a worker death, `:on-done` a fn called once
+   when the stream is fully handled (upstream exhausted AND every worker has
+   handled what it was sent)."
+  ([up f] (distribute up f {}))
+  ([up f opts]
+   (let [n (max 1 (get opts :concurrency 1))
+         batch (get opts :batch 8)
+         dist (spawn (fn []
+                       (erlang/send up [:subscribe (erlang/self)])
+                       (d-loop {:up up
+                                :workers [] :next 0 :pending [] :up-out 0
+                                :done? false :closing? false :finished? false
+                                :down (get opts :on-down nil)
+                                :on-done (get opts :on-done nil)})))]
+     (vec (map (fn [_] (spawn (fn [] (worker-loop dist f batch))))
+               (range n)))
+     dist)))
+
+(defn workers
+  "The live worker pids of a `distribute` handle — the fan-out in flight."
+  [d]
+  (erlang/send d [:workers (erlang/self)])
+  (receive
+    [:workers ws] ws
+    (after 5000 :timeout)))
+
