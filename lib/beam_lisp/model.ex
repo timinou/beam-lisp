@@ -41,7 +41,8 @@ defmodule BeamLisp.Model do
   @doc """
   The AMBIENT root: `$BEAM_LISP_MODEL_DIR`, else
   `$XDG_CACHE_HOME/beam_lisp/models` — the `models` subdirectory of the host
-  cache root (`BeamLisp.Cache`), which owns the one answer to "where does this
+  cache root (`:filename.basedir(:user_cache, …)`, the same OTP answer
+  `vm.paths/cache-root` gives beam-lisp), the one answer to "where does this
   machine keep beam-lisp's derived state".
 
   This is where a fetch writes by DEFAULT. Readers ask `dir/1`, which prefers a
@@ -55,7 +56,7 @@ defmodule BeamLisp.Model do
   @spec root() :: String.t()
   def root do
     case System.get_env(@env_dir) do
-      nil -> Path.join(BeamLisp.Cache.root(), "models")
+      nil -> Path.join(:filename.basedir(:user_cache, ~c"beam_lisp") |> to_string(), "models")
       dir -> Path.expand(dir)
     end
   end
