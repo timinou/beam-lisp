@@ -1,0 +1,159 @@
+; vm/nif-trace.bl — a flight recorder for native calls, on the VM's own tracer.
+;
+; ══ WHAT MOVED HERE (PLAN-132 ZERO-.ex sweep 3/5) ═══════════════════════════
+;
+; Ported from lib/beam_lisp/nif_trace.ex verbatim in behaviour. Despite the
+; name there was never a NIF here: the recorder is built entirely on the VM's
+; own tracing BIFs (:erlang.trace/3, :erlang.trace_pattern/3), so it is pure
+; policy — exactly the kind of thing that belongs in bl, not Elixir. It lives
+; in vm.* because it is reusable substrate any host may arm, not CLI-specific.
+;
+; ── Why this exists ──
+;
+; A segfault inside a NIF returns no exception, no stack and no message. When it
+; kills the VM, the only question worth answering is which call was in flight,
+; and the only place that answer survives is outside the process.
+;
+; ── Why it is built this way ──
+;
+; An earlier version wrote a line from inside the memo funnel, before each NIF
+; invocation. It worked but paid in the hot path (test/bl/build_test.bl failed
+; two runs in three with it live, zero with it inert). :erlang.trace/3 gets the
+; same answer without touching the observed code: it fires on the Erlang-level
+; call — the stub load_nif replaces — which is the last moment the VM is still
+; running Erlang. When the recorder is off, no code at all runs for it.
+;
+; ── Why the write is unsynced ──
+;
+; Unsynced is the point. A completed write(2) lives in the kernel page cache, so
+; it survives the process being killed by a signal; fsync protects against
+; losing the machine, not the VM. The last line in the file is the call that was
+; in flight, whatever happened next.
+;
+; ── What it can and cannot see ──
+;
+; It reports the Erlang-level call. A function load_nif has replaced with a NIF
+; is NOT traceable — the VM does not run its Erlang body — so the recorder names
+; the last Erlang funnel that ran (create/1, exchange/4, cursor/1 for the memo).
+; That is enough to say which work was in flight; it is not enough to name the
+; exact native entry point.
+;
+; ── Use ──
+;
+;   (def rec (nif-trace/start "/tmp/nif.log"))
+;   (nif-trace/stop rec)
+;
+; Or from a shell, armed by env, with no code change:
+;
+;   BEAM_LISP_NIF_TRACE=/tmp/nif.log bl build
+
+(ns vm.nif-trace)
+
+(def ENV "BEAM_LISP_NIF_TRACE")
+
+;; The module traced by default: the memo funnel whose functions are the stubs
+;; the native library replaces — tracing them names the NIF about to run.
+(def DEFAULT-MODULE :"Elixir.BeamLisp.LazyMemo")
+
+;; ── the tracer loop ─────────────────────────────────────────────────────────
+;;
+;; `:call` reports the ARGUMENTS, not the arity: the payload is {mod fn args}.
+;; The arity is what a reader wants — the arguments are unbounded and would make
+;; the recorder a copy of the workload — so this counts them and drops them.
+
+(defn- loop [io]
+  (receive
+    [:trace pid :call mfa]
+    (let [module (elem mfa 0)
+          function (elem mfa 1)
+          args (elem mfa 2)]
+      (erlang/apply :io :put_chars
+        (list io
+          (list (erlang/integer_to_binary (erlang/monotonic_time :microsecond))
+                " "
+                (erlang/atom_to_binary function :utf8)
+                "/"
+                (erlang/integer_to_binary (count args))
+                " "
+                (pr-str module)
+                " pid="
+                (pr-str pid)
+                "\n")))
+      (loop io))
+
+    [:close from ref]
+    ;; A round trip, not a kill: the mailbox is FIFO, so answering this can only
+    ;; happen once every earlier trace message has been written. Killing the
+    ;; tracer instead would discard everything still queued.
+    (do (erlang/apply :file :close (list io))
+        (erlang/send from (tuple :closed ref)))
+
+    _other
+    (loop io)))
+
+;; ── start / stop ────────────────────────────────────────────────────────────
+
+(defn start
+  "Record every call `module` makes into `path`, until `stop`. `module` defaults
+   to the memo funnel. Returns a handle to pass to `stop`."
+  ([path] (start path DEFAULT-MODULE))
+  ([path module]
+   (let [parent (erlang/self)
+         ref (erlang/apply :erlang :make_ref (list))
+         ;; The tracer OPENS THE FILE rather than being handed a descriptor: a
+         ;; raw file belongs to the process that opened it (handing it across
+         ;; raises :not_on_controlling_process on the first write), and opening
+         ;; it here means the file exists before the first call is armed, so no
+         ;; message can arrive at a recorder that is not yet listening.
+         tracer (spawn
+                  (fn []
+                    (let [r (erlang/apply :file :open
+                              (list (erlang/binary_to_list path)
+                                    (list :write :raw :binary)))
+                          io (elem r 1)]
+                      (erlang/send parent (tuple :ready ref))
+                      (loop io))))]
+     (receive
+       [:ready r] :ok
+       (after 5000 (throw (ex-info (str "nif trace: tracer did not open " path) {:path path}))))
+     ;; `:call` turns the trace flag on for every process; trace_pattern decides
+     ;; which calls produce a message, so only `module` is recorded. Order
+     ;; matters: the pattern must be set before the flag, or a call in the gap is
+     ;; reported with nothing to match it against.
+     (erlang/apply :erlang :trace_pattern (list (tuple module :_ :_) true (list :local)))
+     (erlang/apply :erlang :trace (list :all true (list :call (tuple :tracer tracer))))
+     (erlang/apply :erlang :trace (list :existing true (list :call (tuple :tracer tracer))))
+     {:path path :tracer tracer :module module})))
+
+(defn stop
+  "Stop recording and close the file. FLUSHES first: trace messages arrive
+   asynchronously, so killing the tracer would discard everything still queued.
+   The mailbox is FIFO, so a round-trip sent after the flag is cleared can only
+   be answered once every earlier message has been written."
+  [rec]
+  (let [module (:module rec)
+        tracer (:tracer rec)]
+    (erlang/apply :erlang :trace_pattern (list (tuple module :_ :_) false (list :local)))
+    (erlang/apply :erlang :trace (list :all false (list :call)))
+    (erlang/apply :erlang :trace (list :existing false (list :call)))
+    (let [ref (erlang/apply :erlang :make_ref (list))]
+      (erlang/send tracer (tuple :close (erlang/self) ref))
+      (receive
+        [:closed r] :ok
+        (after 5000 (erlang/apply :erlang :exit (list tracer :kill))))
+      :ok)))
+
+(defn path
+  "The path ENV names, or nil."
+  []
+  (System/get_env ENV))
+
+(defn start-from-env
+  "Trace into the path ENV names when it names one, otherwise do nothing. The
+   shell entry: a crash can be recorded with no code change and no rebuild."
+  ([] (start-from-env DEFAULT-MODULE))
+  ([module]
+   (let [p (System/get_env ENV)]
+     (if (or (nil? p) (= p ""))
+       :off
+       (tuple :on (start p module))))))
