@@ -2,6 +2,8 @@
 
 Status: proposed architecture, not feature implementation. Main has been merged into `repl` as `c1bd7a56`, with a BL compiler fix and regenerated seed. This design supersedes the earlier stateless-looking `dev.workspace` sketch. All new domain logic, orchestration, state transitions, cache logic, view composition, and themes are Beam Lisp. Existing OTP/NIF/CodeMirror/browser transport primitives remain substrate, not a place to put a second implementation of the domain.
 
+Checkpoint 2, [change sets and REPL parity](PLAN-136-change-sets-and-repl-parity.md), extends this design with cross-namespace transformations and a complete UI/REPL capability inventory. Its independent Made/Saved/Live revision pointers and guarded save-closure semantics refine the lifecycle below.
+
 ## 1. Start with the interaction
 
 ```clojure
@@ -25,7 +27,7 @@ A generation is a real stateful value. Evaluating the form returns its address i
 
 Moving away collapses the experience to a row: symbol label, running/ready/error state, unread-turn count, and accepted version. It does NOT cancel the run, discard the buffer, accept a candidate, or move another browser's focus. Clicking the row reopens it; pinning prevents automatic collapse. Moving from the source into the sidebar keeps the same experience focused. Every encountered symbol/call site with an experience stays in that project's sidebar, grouped by file/namespace. This is a general experience registry, not a special popup attached to the text `gen/ns`.
 
-Unsaved scratch buffers work too, but persistence is explicitly shown as session-only until attached to a source file. A generated namespace gets a stable derived identity from its source site; the optional `:ns` override remains available for programmatic use. The model cannot silently choose to overwrite a different live namespace.
+Unsaved scratch buffers work too, but persistence is explicitly shown as session-only until attached to a source file. The experience gets stable identity from its source site. `gen/ns` defaults to the enclosing file's namespace; an optional `:ns` override remains available for programmatic use, with explicit source materialization when creating an additional namespace (checkpoint 2). The model cannot silently choose to overwrite a different live namespace.
 
 Loading a file normally resolves accepted generated code. It never starts a paid model call because the cursor moved, a page reconnected, or a watcher reloaded the file. Explicit interactive evaluation starts/refines generation. Missing accepted code is reported as unresolved with a Generate affordance. This distinction must be an explicit evaluator/expansion contract, not a heuristic in JavaScript. Compile-time accepted expansion is deterministic and includes the sidecar content digest in freshness.
 
@@ -130,7 +132,7 @@ runtime:   unchanged -> staged -> applied | held
 view:      collapsed <-> focused; pinned is independent
 ```
 
-Acceptance and publication are different operations. Trying a candidate uses the session environment. Accepting saves the chosen version into the source-owned ledger. Publishing uses `reload/stage` and coherent `reload/commit` against the project image. A held publication leaves the old project code serving. The UI can offer an explicit combined Accept & Publish command, but the receipt must distinguish durable acceptance from runtime publication; a filesystem write and a live-image commit are not one atomic transaction.
+Acceptance and publication are different operations. Trying a candidate uses the session environment. Accepting records the reviewed selection in the source-owned ledger. Saving commits required companion source edits and advances the macro's accepted-version pointer together; acceptance alone cannot make an incomplete change set the restart default. Publishing uses `reload/stage` and coherent `reload/commit` against the project image. A held publication leaves the old project code serving. The UI can offer an explicit combined Save & Make Live command, but the receipt must distinguish review selection, saved source and runtime publication; a filesystem write and a live-image commit are not one atomic transaction.
 
 Proposed programmatic surface (not existing APIs):
 
