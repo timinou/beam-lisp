@@ -1,19 +1,56 @@
-; reader.bl — turn beam-lisp source text into bare reader-node trees.
+; reader.bl — turn beam-lisp source text into reader-node trees.
 ;
 ; Parsing happens over a charlist so delimiters and escapes remain integer
 ; codepoints until a complete token or string is converted back to a binary.
-; Reader nodes intentionally carry no source metadata: this namespace is the
-; position-free reader used to prove the language can read itself.
+;
+; TWO entry shapes, ONE read loop (`read-forms*`): `read-string` threads a
+; {line col file} position through every step and wraps LIST forms in
+; {:meta node pos} (the compiler reads these); `read-all` deep-unwraps them for
+; callers that only want bare shapes; `read-one` is the single-form entry.
+;
+; A failure raises `BeamLisp.Reader.SyntaxError`, and its MESSAGE carries
+; `file:line:col` — that prefix is the half that survives the CLI's error path,
+; and it is what FUP-102 asks of `bl run FILE`:
+;
+;   priv/std/proc/sched.bl:2:3: unterminated collection, expected ) — the (
+;     opened here is never closed
+;
+; The position reported is the one a human should LOOK at: the OPENER for an
+; unterminated collection (not the end of the file), the offending character for
+; a stray or mismatched closer, and the opening quote for an unterminated string.
+; Only the delimiter-shaped failures carry a position so far; the metadata,
+; reader-conditional and tagged-literal failures still raise a bare message.
 
 (ns reader
   (:require [reader-node :as rn]))
 
+(defn- pos->loc
+  "`file:line:col` for a position, or nil when the caller has none — the
+   position-free entries (`read-all`, `read-one`) pass nil."
+  [pos]
+  (if (nil? pos)
+    nil
+    (str (pos-file pos) ":" (pos-line pos) ":" (pos-col pos))))
+
+(defn- at-pos
+  "Prefix `message` with the position it happened at, when there is one. This is
+   what makes a reader failure greppable in a log and clickable in a terminal —
+   FUP-102's acceptance is that `bl run FILE` on an unbalanced file prints the
+   diagnostic WITH ITS POSITION, and the message is the only part that survives
+   the CLI's error path."
+  [message pos]
+  (let [loc (pos->loc pos)]
+    (if (nil? loc) message (str loc ": " message))))
+
 (defn- syntax-error
   "Raise a reader error with `message` when source text cannot form a valid reader tree.
    Raises `BeamLisp.Reader.SyntaxError` directly — the language owns its own error
-   type, so the host front door (`BeamLisp.Reader`) needs no error-translation layer."
-  [message]
-  (erlang/error (BeamLisp.Reader.SyntaxError/exception message)))
+   type, so the host front door (`BeamLisp.Reader`) needs no error-translation layer.
+   Given a `pos` the message carries `file:line:col`, so the failure names WHERE it
+   is and not only what it is."
+  ([message] (syntax-error message nil))
+  ([message pos]
+   (erlang/error (BeamLisp.Reader.SyntaxError/exception (at-pos message pos)))))
 
 (defn- tuple2
   "Build the two-element Erlang tuple used for one key/value pair in a map reader node."
@@ -249,16 +286,17 @@
   "Read characters through the closing quote and return `[binary-value remaining-source pos']`,
    interpreting string escapes. A string is a scalar — never wrapped — so `pos`
    is threaded only to report where reading resumes. `pos` is the position of
-   the first char AFTER the opening quote."
-  [chars pos]
+   the first char AFTER the opening quote; `qpos` is the position of the opening
+   quote itself, which is what an unterminated string must name."
+  [chars pos qpos]
   (loop [remaining chars acc (list)]
     (cond
-      (empty? remaining) (syntax-error "unterminated string")
+      (empty? remaining) (syntax-error "unterminated string — the source ends before the closing quote" qpos)
       (= 34 (first remaining)) [(chars->string (reverse acc)) (rest remaining) (advance-to pos chars (rest remaining))]
       (= 92 (first remaining))
         (let [tail (rest remaining)]
           (cond
-            (empty? tail) (syntax-error "unterminated string")
+            (empty? tail) (syntax-error "unterminated string — the source ends before the closing quote" qpos)
             (= 117 (first tail))
               (let [[value after] (parse-unicode-escape (rest tail))]
                 (recur after (cons value acc)))
@@ -484,18 +522,36 @@
           (let [[target after tpos] (read-form remaining in-fn? rpos)]
             [(attach-meta target (metadata-spec spec)) after tpos]))))))
 
+(defn- opener-for
+  "The opener that `closer` closes, so a diagnostic can name the delimiter a
+   human forgot instead of only the one that was expected."
+  [closer]
+  (cond (= closer 41) 40 (= closer 93) 91 :else 123))
+
 (defn- read-until
   "Read forms until codepoint `closer` and return `[items remaining-source pos']`,
    raising when the collection is unterminated. `pos` is the position of the
    first char after the opener; the returned pos' is the position just past the
    consumed `closer`. Child positions thread through directly (no re-walk), so
-   the whole descent stays linear in the source length."
-  [chars closer in-fn? pos]
+   the whole descent stays linear in the source length. `open-pos` is the
+   position of the OPENER — the `(` — so an unterminated collection can name the
+   delimiter a human forgot, and not only the end of the file."
+  [chars closer in-fn? pos open-pos]
   (let [[start spos] (skip-pos chars pos)]
     (loop [remaining start rpos spos acc (list)]
       (cond
-        (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer))))
+        (empty? remaining) (syntax-error (str "unterminated collection, expected " (chars->string (list closer)) " — the " (chars->string (list (opener-for closer))) " opened here is never closed") open-pos)
         (= closer (first remaining)) [(reverse acc) (rest remaining) (advance-pos rpos closer)]
+        ; A closer that is NOT the one this collection needs: `[1 2)`. The
+        ; expected delimiter is known HERE (it is `closer`), so this is the one
+        ; place that can say which delimiter the `)` should have been — the
+        ; generic "unexpected )" in `read-form` cannot, because by then the
+        ; opener it belonged to is out of scope.
+        (or (= 41 (first remaining)) (= 93 (first remaining)) (= 125 (first remaining)))
+          (syntax-error (str "unexpected " (chars->string (list (first remaining)))
+                             " — expected " (chars->string (list closer))
+                             " to close the " (chars->string (list (opener-for closer)))
+                             " opened at " (pos->loc open-pos)) rpos)
         :else (let [[form after fpos] (read-form remaining in-fn? rpos)
                     [next npos] (skip-pos after fpos)]
                 (cond
@@ -665,14 +721,14 @@
     (and (not (empty? chars)) (= 64 (first chars)))
       (let [[after-at apos] (skip-pos (rest chars) (advance-pos pos 64))]
         (if (and (not (empty? after-at)) (= 40 (first after-at)))
-          (let [[items after fpos] (read-until (rest after-at) 41 in-fn? (advance-pos apos 40))
+          (let [[items after fpos] (read-until (rest after-at) 41 in-fn? (advance-pos apos 40) apos)
                 selected (select-conditional items)]
             ; a skipped `#?@` splices NOTHING — `:reader-discard` is the same
             ; sentinel `#_` yields, so the surrounding collection drops it.
             [(if (= selected :reader-discard) :reader-discard (splice-marker selected)) after fpos])
           (syntax-error "reader conditional must be #?( ... ) or #?@( ... )")))
     (and (not (empty? chars)) (= 40 (first chars)))
-      (let [[items after fpos] (read-until (rest chars) 41 in-fn? (advance-pos pos 40))]
+      (let [[items after fpos] (read-until (rest chars) 41 in-fn? (advance-pos pos 40) pos)]
         [(select-conditional items) after fpos])
     :else (syntax-error "reader conditional must be #?( ... ) or #?@( ... )")))
 
@@ -723,7 +779,7 @@
         ; through read-form instead would advance over the `{` (pos0+1) and leave
         ; the returned pos — hence the next sibling's column — one too high. Read
         ; the contents directly from (rest after) starting at pos0 to match.
-        (let [[items rest2 fpos] (read-until (rest after) 125 in-fn? pos0)
+        (let [[items rest2 fpos] (read-until (rest after) 125 in-fn? pos0 pos0)
               kvs (pair-items items)]
           ; A record literal is NOT wrapped by reader.ex — stays bare.
           [(rn/->tuple [:record tag kvs]) rest2 fpos])
@@ -746,11 +802,11 @@
           ; the body AND into the returned pos, so the NEXT sibling after a
           ; fn-literal is 2 short. Passing pos0 (not the advanced position)
           ; reproduces it exactly; the fn's own wrapper is positioned at pos0 too.
-          (let [[items after fpos] (read-until (rest chars) 41 true pos0)]
+          (let [[items after fpos] (read-until (rest chars) 41 true pos0 pos0)]
             ; #() desugars to an (fn …) list; reader.ex positions it at the `#`.
             [(wrap-list-pos (desugar-fn items) pos0) after fpos]))
       (= 123 (first chars))
-        (let [[items after fpos] (read-until (rest chars) 125 in-fn? (advance-pos after-hash 123))]
+        (let [[items after fpos] (read-until (rest chars) 125 in-fn? (advance-pos after-hash 123) after-hash)]
           ; A set is NOT wrapped by reader.ex — stays bare.
           [(node :set items) after fpos])
       (= 95 (first chars))
@@ -787,7 +843,7 @@
   [chars pos]
   (let [[token after] (take-token chars)]
     (if (empty? token)
-      (syntax-error (str "unexpected character " (first chars)))
+      (syntax-error (str "unexpected character " (first chars)) pos)
       [(classify token) after (advance-to pos chars after)])))
 
 (defn- read-form
@@ -801,12 +857,12 @@
   (let [head (first chars) tail (rest chars)
         tpos (advance-pos pos head)]
     (cond
-      (= head 40) (let [[items after fpos] (read-until tail 41 in-fn? tpos)] [(wrap-list-pos (node :list items) pos fpos) after fpos])
-      (= head 91) (let [[items after fpos] (read-until tail 93 in-fn? tpos)] [(node :vector items) after fpos])
-      (= head 123) (let [[items after fpos] (read-until tail 125 in-fn? tpos)] [(node :map (pair-items items)) after fpos])
-      (= head 41) (syntax-error "unexpected )")
-      (= head 93) (syntax-error "unexpected ]")
-      (= head 125) (syntax-error "unexpected }")
+      (= head 40) (let [[items after fpos] (read-until tail 41 in-fn? tpos pos)] [(wrap-list-pos (node :list items) pos fpos) after fpos])
+      (= head 91) (let [[items after fpos] (read-until tail 93 in-fn? tpos pos)] [(node :vector items) after fpos])
+      (= head 123) (let [[items after fpos] (read-until tail 125 in-fn? tpos pos)] [(node :map (pair-items items)) after fpos])
+      (= head 41) (syntax-error "unexpected ) — nothing is open that it could close" pos)
+      (= head 93) (syntax-error "unexpected ] — nothing is open that it could close" pos)
+      (= head 125) (syntax-error "unexpected } — nothing is open that it could close" pos)
       (= head 39) (wrap-prefix tail "quote" in-fn? pos)
       (= head 96) (wrap-prefix tail "syntax-quote" in-fn? pos)
       (= head 126)
@@ -816,9 +872,9 @@
       (= head 64) (wrap-prefix tail "deref" in-fn? pos)
       (= head 35) (read-dispatch tail in-fn? pos)
       (= head 94) (read-meta tail in-fn? pos)
-      (= head 34) (read-string-body tail tpos)
+      (= head 34) (read-string-body tail tpos pos)
       (and (= head 58) (not (empty? tail)) (= 34 (first tail)))
-        (let [[name after spos] (read-string-body (rest tail) (advance-pos tpos 34))] [(node :keyword name) after spos])
+        (let [[name after spos] (read-string-body (rest tail) (advance-pos tpos 34) tpos)] [(node :keyword name) after spos])
       :else (read-atom chars pos))))
 
 (defn- unwrap-deep
