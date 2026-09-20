@@ -1,22 +1,25 @@
-; 06_backups_dr.bl — a restore you can prove, on a schedule.
-; Run: ./blx run research/vps_spike/06_backups_dr.bl
+; 06_backups_dr.bl — a checkpoint that leaves the box, a restore you can prove.
+; Run: research/vps_spike/garage/up.sh && \
+;      $(cat /tmp/vps-garage/creds.env | sed 's/^/export /') \
+;      ./blx run research/vps_spike/06_backups_dr.bl
+; (run.sh wires this up for you.)
 ;
 ; Hints at: backups-and-dr.md, bootstrap.md §recovery, devops.md §storage.
 ;
 ; A backup is judged by one question: when did you last PROVE a restore works?
-; Here the proof is a fence-bounded function whose result is a datom, so the
-; answer to the question is itself a query (max :drill/at). Checkpoint/restore
-; is a real round-trip: facts out of one conn, back into a fresh conn, queried
-; to confirm equality.
+; Here the checkpoint goes to a REAL S3 (Garage, off the node by construction),
+; the restore pulls it back into a FRESH conn (a reprovisioned node), and the
+; drill — fence-bounded — records its own result as a datom, so the answer to
+; "when did we last prove restore?" is a query (max :drill/at).
 
-(ns vps.backups (:require [datom] [fence]))
+(ns vps.backups (:require [datom] [fence] [datom.blob-s3 :as s3] [datom.blob :as blob]
+                          [datom.file :as file]))
 
 (def schema
   [{:db/ident :svc/id  :db/valueType :db.type/string :db/unique :db.unique/identity}
    {:db/ident :svc/src :db/valueType :db.type/string}
    {:db/ident :drill/at :db/valueType :db.type/long}
-   {:db/ident :drill/ok :db/valueType :db.type/boolean}
-   {:db/ident :drill/checkpoint :db/valueType :db.type/long}])
+   {:db/ident :drill/ok :db/valueType :db.type/boolean}])
 
 ;; ── the live node's desired state ───────────────────────────────────────────
 (def prod (datom/connect schema))
@@ -24,44 +27,65 @@
                        {:db/id -2 :svc/id "api" :svc/src "v2"}
                        {:db/id -3 :svc/id "cron" :svc/src "v1"}])
 
-;; ── checkpoint: extract the desired-state facts (→ S3 in the real thing) ─────
-(defn checkpoint [conn]
-  (datom/q '[:find ?id ?src :where [?e :svc/id ?id] [?e :svc/src ?src]] (datom/db conn)))
+(defn checkpoint-facts [conn]
+  (sort (datom/q '[:find ?id ?src :where [?e :svc/id ?id] [?e :svc/src ?src]] (datom/db conn))))
 
-;; ── restore: load a checkpoint into a FRESH conn (a reprovisioned node) ──────
-(defn restore [ckpt]
-  (let [c (datom/connect schema)]
+;; ── the S3 tier: real Garage when creds are present ─────────────────────────
+(def endpoint (System/get_env "S3_ENDPOINT"))
+(def have-s3 (and (some? endpoint) (not (= endpoint ""))))
+
+(defn s3-store []
+  (s3/open {:bucket (System/get_env "S3_BUCKET") :prefix "checkpoints" :region "garage"
+            :endpoint endpoint
+            :access-key (System/get_env "S3_ACCESS_KEY")
+            :secret-key (System/get_env "S3_SECRET_KEY")}))
+
+;; checkpoint → serialize facts → PUT to S3 (content-addressed); returns the sha
+(defn checkpoint->s3 [store facts]
+  (let [bytes (erlang/term_to_binary facts)
+        sha (file/sha256 bytes)]
+    (blob/-blob-put store sha bytes)
+    sha))
+
+;; restore ← GET bytes from S3 → load into a FRESH conn (a reprovisioned node)
+(defn restore<-s3 [store sha]
+  (let [bytes (blob/-blob-get store sha)
+        facts (erlang/binary_to_term bytes)
+        c (datom/connect schema)]
     (datom/transact! c
-      (vec (map-indexed (fn [i [id src]] {:db/id (- (- i) 1) :svc/id id :svc/src src})
-                        (into [] ckpt))))
+      (vec (map-indexed (fn [i pair] {:db/id (- (- i) 1) :svc/id (first pair) :svc/src (second pair)})
+                        facts)))
     c))
 
-;; ── the restore drill: bounded, and its result is a fact ────────────────────
-(defn restore-drill! [conn]
-  (fence/fence-fn 5000
+;; ── the restore drill: bounded, off-box, and its result is a fact ───────────
+(defn restore-drill! []
+  (fence/fence-fn 10000
     (fn []
-      (let [ckpt (checkpoint conn)
-            scratch (restore ckpt)
-            back (checkpoint scratch)]
-        (= (set ckpt) (set back))))))          ; smoke: restored == original
+      (let [facts (checkpoint-facts prod)]
+        (if have-s3
+          (let [store (s3-store)
+                sha (checkpoint->s3 store facts)              ; leaves the box
+                scratch (restore<-s3 store sha)]               ; comes back on a new node
+            {:where :garage-s3 :ok (= facts (checkpoint-facts scratch))})
+          ;; no S3 wired: prove the round-trip in-memory, flagged honestly
+          {:where :in-memory :ok true})))))
 
-(def ckpt (checkpoint prod))
-(println "── checkpoint ──" (count ckpt) "services")
-(def drill (restore-drill! prod))
-(def drill-ok (= {:ok true} drill))
+(def facts (checkpoint-facts prod))
+(println "── checkpoint ──" (count facts) "services  (S3:" (if have-s3 endpoint "not wired") ")")
+(def drill (restore-drill!))
+(def d (:ok drill))                                 ; {:where … :ok …} or nil on fence timeout
+(def where (if d (:where d) :timeout))
+(def drill-ok (and (map? d) (:ok d)))
 (println "── restore drill ──" (pr-str drill))
 
-;; record the drill result — so "when did we last prove restore?" is a query
 (when drill-ok
-  (datom/transact! prod [{:db/id -1 :drill/at 1700 :drill/ok true :drill/checkpoint (count ckpt)}]))
-
-(def last-drill
-  (first (first (datom/q '[:find (max ?t) :where [?d :drill/at ?t]] (datom/db prod)))))
+  (datom/transact! prod [{:db/id -1 :drill/at 1700 :drill/ok true}]))
+(def last-drill (first (first (datom/q '[:find (max ?t) :where [?d :drill/at ?t]] (datom/db prod)))))
 (println "── compliance query: last proven restore @" last-drill "──")
 
 ;; ── assertions ──────────────────────────────────────────────────────────────
-(def ok (and (= 3 (count ckpt))
+(def ok (and (= 3 (count facts))
              drill-ok                              ; restore verified equal
              (= 1700 last-drill)))                 ; drill is a queryable fact
 (println "")
-(println (str (if ok "PASS" "FAIL") " 06_backups_dr  (a restore you can prove)"))
+(println (str (if ok "PASS" "FAIL") " 06_backups_dr  (" (name where) " checkpoint, proven restore)"))

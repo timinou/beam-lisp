@@ -1,56 +1,105 @@
 # vps_spike — the design, made runnable
 
-Seven spikes, each a runnable `.bl` file that PASSES on the real beam-lisp
-runtime, together touching every element of the VPS design in
-`docs/design/vps/`. Each spike ends in a `PASS`/`FAIL` line and asserts its own
-claim, so the suite is a regression gate, not a demo.
+Eight `.bl` spikes and one container demo, each ending in a `PASS`/`FAIL` line
+that asserts its own claim, together touching every element of the VPS design
+in `docs/design/vps/`. The suite is a regression gate, not a slideshow.
 
 ```
-research/vps_spike/run.sh      # runs all seven cold, prints PASS/FAIL
+research/vps_spike/run.sh            # bl spikes 01-08 (brings Garage up for 06)
+research/vps_spike/run.sh --podman   # + 09 platform-swap, real containers, capped
 ```
 
-Runtime: `./blx` (a symlink to the `bl-v2026.4` drop that ships `datom`,
-`vm.core`, `super`, `fence`, `reload`, `flow`). The stderr line
-`env.bl: unknown key schedules` is a harmless mismatch between the checkout's
-`env.bl` and the drop; `run.sh` filters it.
+Runtime: `./blx` — a wrapper that runs the checkout-matched `bl-v2026.4` drop
+with this worktree's `priv/std` + `priv/lib` on `BEAM_LISP_PATH` (so the REAL
+`proc.sched`, `reload`, `vm.*` load) and a `z3` for the verifier tiers. The
+stderr line `env.bl: unknown key schedules` is a harmless env mismatch; `run.sh`
+filters it.
 
 ## The spikes and what they prove
 
 | spike | proves | design doc | stands on |
 |---|---|---|---|
 | `01_reconciler.bl` | desired ⇒ observed ⇒ delta ⇒ effect is one pure fn; every effect is a queryable fact | `the-reconciler.md` | **real** datom |
-| `02_capabilities.bl` | the blast radius is a *compile error* — a right the token never granted is unspeakable; attenuation only narrows | `devops.md` §identity, `fleet.md` §blast radius | **real** env cap gate |
-| `03_services.bl` | a service is a supervised tree in a capped env; `systemctl restart` = OTP restart; drain = total teardown | `services-and-schedules.md` | **real** super + vm.core |
-| `04_zero_downtime.bl` | a backend swap under a stable gateway drops zero requests (exactly one cutover); rollback is a `as-of` value | `zero-downtime.md` | **real** datom; gateway modelled as a routing atom |
+| `02_capabilities.bl` | the blast radius is a *compile error* — a right the token never granted is unspeakable; attenuation only narrows | `devops.md` §identity | **real** env cap gate |
+| `03_services.bl` | a service is a supervised tree in a capped env; `systemctl restart` = OTP restart; drain = total teardown; cron is `proc.sched` arithmetic with declared catch-up policies | `services-and-schedules.md` | **real** super + vm.core + **proc.sched** |
+| `04_hot_reload.bl` | app AND bl-stdlib updates are HOT (atomic per-var swap, no restart); an incoherent edit is HELD with old code still serving | `zero-downtime.md` §L1 | **real** `reload` coherence gate |
 | `05_observability.bl` | events are datoms; a dashboard re-runs live on tx; an alert's firing is itself a fact; latency JOINS the deploy boundary | `observability.md` | **real** datom + `datom/watch` |
-| `06_backups_dr.bl` | checkpoint/restore round-trips; the restore drill is fence-bounded and its result is a fact ("when did we last prove restore?" = a query) | `backups-and-dr.md` | **real** datom + fence |
+| `06_backups_dr.bl` | checkpoint leaves the box to **real S3 (Garage)** and restores into a fresh conn; the fence-bounded drill records its own result, so "when did we last prove restore?" is a query | `backups-and-dr.md` | **real** datom + fence + **blob-s3 → Garage** |
 | `07_incident.bl` | page→postmortem in one store: the page carries its query, the window is bitemporal, automation and operators share one audit log, the postmortem's action is a datom | `incident-ritual.md` | **real** datom |
+| `08_upgrade_refusal.bl` | an upgrade is PROVEN or REFUSED: a missing/unsafe **data** migration and a missing/unsafe **message** migration are each held with a distinct z3-checked reason — never half-shipped | `zero-downtime.md` §L1, `the-reconciler.md` | **real** z3 (`migration-preserves?`, `simulates?`) |
+| `09` `podman/blue_green.sh` | a PLATFORM update (new container/OTP/OS closure) is blue-green across real rootless-podman containers behind a stable gateway: one clean cutover, ≤1 in-flight drop | `zero-downtime.md` §L3, `bootstrap.md` | **real** podman + socat + two bl node containers |
+
+## The L1/L3 distinction this suite encodes
+
+The corrected model, and why there are two separate spikes:
+
+- **App + bl updates are HOT** (`04_hot_reload.bl`). Inside the one long-lived
+  node, a `defn` swap is atomic per var; the coherence gate refuses anything
+  that would dangle. Nothing restarts. This is the common case.
+- **Platform updates are blue-green** (`09`). A new container image, a new OTP,
+  a new OS closure cannot hot-load — so a *new node generation* comes up beside
+  the old and a stable gateway re-claims the public port. This is the rare case,
+  reserved for the floor below bl.
+
+Conflating them (an earlier draft blue-greened app deploys) is the mistake this
+split exists to prevent.
+
+## The verifier tier is the headline
+
+`08_upgrade_refusal.bl` is the spike that could not be modelled — it runs real
+z3 proofs. `migration-preserves?` asks whether the state at rest still satisfies
+the invariant after the migration fn; `simulates?` asks whether the new message
+handler simulates the old so a queued message survives the swap. A missing or
+wrong migration is REFUSED before it ships, the process never stopping. That is
+the guarantee the BEAM's own hot-code-load lacks, made into a deploy gate.
 
 ## Real vs modelled
 
-Honesty about the boundary — a spike is a probe, not the product:
+- **Real, exercised as-is:** datom (facts, datalog, `as-of`/`since`, `watch`);
+  the env capability gate (`env/fork` + compile-in-env denial); OTP supervision
+  (`super`); env isolation + teardown (`vm.core`); `fence`; the `reload`
+  coherence gate; `proc.sched` recurrence algebra; z3 upgrade/migration proofs;
+  `blob-s3` against a real Garage S3; rootless podman containers running real bl
+  nodes.
+- **Modelled in miniature** (the organ exists but is heavier than a probe needs):
+  the gateway is a socat re-point (`vm/gateway.bl` is the real reverse proxy
+  with connection draining — it would close even the ≤1-drop window that socat
+  leaves); the reconciler's effect application is direct rather than through the
+  live `vm.manager`.
 
-- **Real, exercised as-is:** datom (facts, datalog, `as-of`/`since`, `watch`),
-  the env capability gate (`env/fork` + compile-in-env denial), OTP supervision
-  via `super`, env isolation and teardown via `vm.core`, `fence`.
-- **Modelled in miniature** (the full organ exists in the tree but is either
-  checkout-only or too heavy for a spike): the gateway routing table (a plain
-  atom here; `vm/gateway.bl` is the real reverse proxy), the scheduler wheel (a
-  due-list here; `proc/sched.bl` is the real declarative cron), the node
-  blue/green swap (two backend fns here; the real thing swaps OS node
-  processes), checkpoint-to-S3 (an in-memory fact set here; `blob-s3.bl` is the
-  real store).
+## Containment — why 09 runs detached under a cgroup
 
-## The below-OTP stratum
+The container demo is heavy, and this host runs near its memory ceiling with
+zram swap. Run synchronously it can thrash the machine. So `run.sh --podman`
+launches it **detached** as a transient systemd unit with a hard cap and polls a
+file for the verdict:
 
-`flake.nix` in this folder is the declarative artifact for everything below
-OTP (kernel, firewall, the one systemd unit). It is not run here — this host
-has `nix` but not `nixos-rebuild` — it stands as the concrete shape the
-`bootstrap.md` design refers to: the machine's below-OTP identity as one
-evaluable value.
+```
+systemd-run --user --unit=bl-bg --collect \
+  -p MemoryMax=1200M -p MemorySwapMax=0 -p TasksMax=96 -p RuntimeMaxSec=150 \
+  -p StandardOutput=file:/tmp/bg.out  bash podman/blue_green.sh
+```
+
+A runaway dies in its own cgroup, the host untouched — the design's
+blast-radius thesis applied to the harness itself. `podman/scoped.sh` wraps the
+same caps for a foreground run. (Cold `blx` starts cost ~10-15s each for JIT
+warmup, so the full 8-spike sweep takes a couple of minutes; that latency is
+boot, not work.)
+
+## The infra artifacts
+
+- `flake.nix` — the below-OTP stratum (kernel, firewall, the one systemd unit),
+  the declarative shape `bootstrap.md` refers to. Parses under `nix`; not
+  applied here (no `nixos-rebuild`).
+- `garage/up.sh` — brings up a local Garage S3 (the off-box durable tier),
+  rootless, idempotent, emitting creds for `06`.
+- `podman/node.bl` — a minimal concurrent bl HTTP node, one per generation.
+- `podman/blue_green.sh` + `podman/scoped.sh` — the platform-swap demo and its
+  cgroup wrapper.
 
 ## The whole point, in one line
 
-Desired state, observed state, history, audit, and the fix are all datoms and
-live processes in one address space — so every devops question is a query and
-every devops action is a transaction. The spikes are that sentence, executed.
+Desired state, observed state, history, audit, the deploy proof, and the fix
+are all datoms and live processes in one address space — so every devops
+question is a query, every action a transaction, and every unsafe upgrade a
+refusal with a reason. The spikes are that sentence, executed.
