@@ -34,6 +34,25 @@ defmodule BeamLisp.EnvIsolationTest do
     Env.destroy(base)
   end
 
+  test "in_ns declares the namespace: enumeration sees its vars (BUG-089)" do
+    # the REPL route: enter a ns and def — no (ns …) form ever runs.
+    # namespaces/0 enumerates only marker rows, so before in_ns declared,
+    # the ns's vars were invisible to every corpus enumeration.
+    e = Env.fork()
+
+    Env.with_env(e, fn ->
+      Env.in_ns("replish.user")
+      Env.intern("replish.user", "widget", 1)
+
+      assert "replish.user" in Env.namespaces()
+      assert "widget" in Env.public_names("replish.user")
+    end)
+
+    # the marker stayed in the fork — :global was not polluted
+    refute "replish.user" in Env.namespaces()
+    Env.destroy(e)
+  end
+
   test "two concurrent forks of one base isolate the same var" do
     a = Env.fork()
     b = Env.fork()

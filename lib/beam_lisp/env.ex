@@ -600,6 +600,12 @@ defmodule BeamLisp.Env do
   def in_ns(ns) when is_binary(ns) do
     Process.put(@pdict_ns, ns)
 
+    # Declare what entering means: a REPL/session brings a namespace into
+    # being by in_ns + def, never by an (ns …) form — and enumeration
+    # (namespaces/0) only sees marker rows, so without this the ns's vars
+    # were invisible to completion/index/doc-scan (BUG-089). Idempotent.
+    declare_ns(ns)
+
     # Mirror to the Agent at :global so unbound observers (REPL display,
     # live panel) see the ambient namespace. Compilation never reads the
     # mirror — pdict wins — so concurrent writers cannot cross-compile.

@@ -35,21 +35,147 @@
 ; survives every connection, and session rows are one `call` away from any
 ; process. Writes are human-paced; serialisation is invisible.
 ;
-; ══ COMPLETION HERE IS THE DIRECT SCAN ══════════════════════════════════════
+; ══ COMPLETION READS A MATERIALISED INDEX (Phase 2) ═════════════════════════
 ;
-; Phase 2 builds the materialised index (spike U2: direct ~100–500 ms/query
-; vs indexed 1.5–2.6 ms). The op exists now so the protocol is complete and
-; the probe can verify end-to-end; its cost is documented, not hidden.
+; Spike U2 measured the direct Env scan at ~100–500 ms/query; the daemon
+; measures 516–938 ms (1842 vars) — broken at keystroke latency. The index
+; (see INDEX below) is one ETS row per session: built once synchronously on
+; the first query, invalidated by every eval-end with a background rebuild,
+; TTL-backstopped for vars other commands intern. Warm queries are a memory
+; filter (spike: 1.5–2.6 ms).
 
 (ns vm.repl
   (:require [env] [vm.manager :as mgr] [vm.spec :as spec]))
 
 (def SERVER :vm-repl)
 
+;; ══ COMPLETION: THE MATERIALISED INDEX (Phase 2) ════════════════════════════
+;;
+;; The spike measured the direct Env scan at ~100–500 ms/query; the daemon
+;; measures 516–938 ms (1842 vars, deeper chain). At keystroke latency that
+;; is broken, so completion reads a MATERIALISED index: one ETS row per
+;; session, the table owned by the defserver (long-lived; a table created by
+;; a connection process would die with it).
+;;
+;; Row states: absent (cold) · :building (first build in flight — nothing to
+;; serve yet) · {:ready entries built-at rebuilding?}. Last-good entries keep
+;; serving through every rebuild: the swap is the builder's single write.
+;; Invalidation is eval-triggered — evals are what intern into a session's
+;; chain, so the eval-end path marks the row stale and kicks a BACKGROUND
+;; rebuild: by the time the user presses Tab after defining something, the
+;; index is warm. A 30 s TTL backstop catches vars other commands intern
+;; into the shared project VM. A cold query builds synchronously ONCE (the
+;; honest first answer); every later query is a memory filter.
+;;
+;; Entries carry {label ns arglists} — arglists from ns_defs, fetched ONCE
+;; per namespace and shared across that ns's vars. Docs are NOT in the
+;; index: the frontend fetches the SELECTED item's doc through the doc op,
+;; so the build never pays 1842 doc_string calls.
+
+(def INDEX :vm_repl_index)
+(def INDEX-TTL-MS 30000)
+
+(defn- index-read [sid]
+  (let [r (erlang/apply :ets :lookup (list INDEX sid))]
+    (if (empty? r) :cold (elem (first r) 1))))
+
+(defn- index-write [sid v]
+  (erlang/apply :ets :insert (list INDEX (tuple sid v))))
+
+(defn- index-build
+  "Scan the corpus visible from THIS process's env (call under the session
+   env) into index entries."
+  []
+  (mapcat (fn [ns]
+            (try
+              (let [defs (try (BeamLisp.Env/ns_defs ns) (catch _ex nil))]
+                (map (fn [n]
+                       (let [clauses (if (map? defs) (get defs n) nil)
+                             arities (if (empty? clauses)
+                                       ""
+                                       (str "arities: "
+                                            (join ", " (distinct
+                                                          (map (fn [e] (if (and (erlang/is_tuple e) (> (erlang/tuple_size e) 1))
+                                                                         (str (elem e 1)) "?"))
+                                                               clauses)))))]
+                         {"label" (str n) "ns" (str ns) "arglists" arities}))
+                     (BeamLisp.Env/public_names ns)))
+              (catch _ex (list))))
+          (BeamLisp.Env/namespaces)))
+
+(defn- index-builder [sid row]
+  ;; the ONE build body: under the session env, swap the row atomically when
+  ;; done. Then the dirty check: an invalidation that arrived WHILE building
+  ;; was not lost — it rides the session row ([:index-dirty]), and the swap
+  ;; we just wrote is already stale, so kick the next build immediately.
+  (spawn (fn []
+           (env/with-env (:env row)
+             (fn []
+               (BeamLisp.Env/in_ns (:ns row))
+               (let [entries (vec (index-build))]
+                 (index-write sid (tuple :ready entries
+                                         (System/monotonic_time :millisecond) false))
+                 (when (call SERVER [:take-dirty sid])
+                   (index-rebuild-async sid (get-session sid)))))))))
+
+(defn- index-rebuild-async
+  "Kick a background rebuild. NEVER deletes last-good entries: the row keeps
+   serving them while the builder runs and the swap is atomic (an eval-end →
+   ~1s rebuild window must not empty completion — the probe caught exactly
+   that). The rebuilding flag is the one-builder lock. Cold (never built)
+   gets the :building marker — there is nothing to serve yet."
+  [sid row]
+  (let [r (index-read sid)]
+    (cond
+      (= r :cold)
+      (do (index-write sid :building) (index-builder sid row))
+      (and (erlang/is_tuple r) (= false (elem r 3)))
+      (do (index-write sid (tuple :ready (elem r 1) (elem r 2) true))
+          (index-builder sid row))
+      :else :already-building)))
+
+(defn- index-invalidate [sid row]
+  ;; the eval that just ended is the thing that interns: the corpus changed
+  ;; exactly now. Mark dirty FIRST (rides the session row, survives the
+  ;; in-flight builder's swap), then kick a rebuild; if one is already
+  ;; running, the dirty flag makes its completion re-kick (see index-builder).
+  (call SERVER [:index-dirty sid])
+  (index-rebuild-async sid row))
+
+(defn- index-entries
+  "{:entries entries} | :building. Cold builds synchronously ONCE; a stale
+   (TTL'd) row answers from itself and refreshes in the background."
+  [sid row]
+  (let [r (index-read sid)]
+    (cond
+      (= r :cold)
+      (do (env/with-env (:env row)
+            (fn []
+              (BeamLisp.Env/in_ns (:ns row))
+              (index-write sid (tuple :ready (vec (index-build))
+                                      (System/monotonic_time :millisecond) false))))
+          (let [r2 (index-read sid)]
+            {:entries (elem r2 1)}))
+
+      (= r :building)
+      :building
+
+      :else
+      (let [entries (elem r 1)
+            built-at (elem r 2)]
+        (when (> (- (System/monotonic_time :millisecond) built-at) INDEX-TTL-MS)
+          (index-rebuild-async sid row))
+        {:entries entries}))))
+
 ;; ── the session table (vm.manager's shape) ──────────────────────────────────
 
 (defserver sessions
   (init [_]
+    ;; the completion index lives here: this process is long-lived, so a
+    ;; table it owns survives every connection (see the header's Phase-2 note)
+    (try
+      (erlang/apply :ets :new (list INDEX (list :named_table :public :set)))
+      (catch _ex :already-exists))
     (ok {:sessions {} :n 0}))
 
   ;; mint a session: a fork of `base-env` (the project VM's env). Forking here
@@ -67,6 +193,21 @@
 
   (handle-call [:put sid row] [_from st]
     (reply :ok (assoc st :sessions (assoc (:sessions st) sid row))))
+
+  (handle-call [:index-dirty sid] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply :ok (assoc st :sessions (assoc (:sessions st) sid (assoc row :index-dirty true))))
+        (reply :ok st))))
+
+  ;; the builder's end-of-swap check: TRUE (and cleared) when an invalidation
+  ;; arrived while it was building — its swap is already stale, rebuild now
+  (handle-call [:take-dirty sid] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply (= true (:index-dirty row))
+               (assoc st :sessions (assoc (:sessions st) sid (assoc row :index-dirty false))))
+        (reply false st))))
 
   ;; an ended eval (finished OR killed) clears its row and lands the ns the
   ;; worker last saw — one write site for both outcomes, so the runner's DOWN
@@ -164,6 +305,7 @@
     (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
         (erlang/send proxy (tuple :stop))
         (call SERVER [:eval-ended sid ns'])
+        (eval-ended sid)
         (erlang/send ws (tuple :push {"kind" (if (= kind :value) "value" "error")
                                       "id" id "text" payload "ns" ns'
                                       "ms" (- (System/monotonic_time :millisecond) t0)})))
@@ -171,12 +313,20 @@
       :when (= down-ref mref)
     (do (erlang/send proxy (tuple :stop))
         (call SERVER [:eval-ended sid nil])
+        (eval-ended sid)
         (erlang/send ws (tuple :push {"kind" "error" "id" id "interrupted" true
                                       "text" (str "eval ended: " (BeamLisp.RT/print_str reason))
                                       "ms" (- (System/monotonic_time :millisecond) t0)})))
     (after 3600000
       (do (erlang/send proxy (tuple :stop))
-          (call SERVER [:eval-ended sid nil])))))
+          (call SERVER [:eval-ended sid nil])
+          (eval-ended sid)))))
+
+(defn- eval-ended [sid]
+  ;; every eval outcome lands here (eval-wait already did [:eval-ended]):
+  ;; the corpus may have changed → invalidate + background rebuild.
+  (let [row (get-session sid)]
+    (when (map? row) (index-invalidate sid row))))
 
 (defn- run-eval [ws sid id src]
   ;; runs in its own process: the socket must stay responsive for `interrupt`
@@ -191,25 +341,28 @@
     (put-session sid (assoc row :eval {:worker worker :mref mref}))
     (eval-wait ws sid id proxy mref t0)))
 
-;; ── completion: the direct scan (Phase 2 replaces this with the index) ──────
+;; ── completion: queries read the index (see the Phase-2 note at INDEX) ──────
 
-(defn- candidates
-  "Every public var in every namespace visible from THIS process's env."
+(defn- direct-candidates
+  "The un-indexed corpus scan (label+ns only). NOT a query path — it answers
+   for the cold window while the FIRST index build is still in flight
+   (measured: 0.5–1s vs the build's 3.5–5s), so a session's first Tabs are
+   slow-but-correct instead of empty."
   []
   (mapcat (fn [ns]
             (try
-              (map (fn [n] {"label" (str n) "ns" (str ns)}) (BeamLisp.Env/public_names ns))
+              (map (fn [n] {"label" (str n) "ns" (str ns) "arglists" ""}) (BeamLisp.Env/public_names ns))
               (catch _ex (list))))
           (BeamLisp.Env/namespaces)))
 
-(defn- complete-prefix [prefix cur-ns]
+(defn- complete-prefix [prefix cur-ns entries]
+  ;; the warm path: a memory filter over the materialised index
   (let [t0 (System/monotonic_time :millisecond)
-        cands (candidates)
-        hits (filter (fn [c] (String/starts_with? (get c "label") prefix)) cands)
+        hits (filter (fn [c] (String/starts_with? (get c "label") prefix)) entries)
         sorted (sort-by (fn [c] (str (if (= (get c "ns") cur-ns) "0" "1") (get c "label"))) hits)
         t1 (System/monotonic_time :millisecond)]
     {"items" (to-list (take 100 sorted)) "total" (count hits)
-     "scanned" (count cands) "ms" (- t1 t0)}))
+     "scanned" (count entries) "ms" (- t1 t0)}))
 
 (defn- arities-str [nsname name]
   ;; arglists are NOT in var meta (spike: meta of a defn = %{doc}); the arity
@@ -239,10 +392,19 @@
 (defn- run-complete [ws sid id prefix]
   (let [row (get-session sid)]
     (spawn (fn []
-             (env/with-env (:env row)
-               (fn []
-                 (let [r (complete-prefix prefix (:ns row))]
-                   (erlang/send ws (tuple :push (assoc r "kind" "completions" "id" id))))))))))
+             (let [r (index-entries sid row)]
+               (if (= r :building)
+                 ;; the FIRST build is still in flight: fall back to the
+                 ;; direct scan — slow-but-correct beats empty (the index
+                 ;; swap makes every LATER rebuild invisible)
+                 (env/with-env (:env row)
+                   (fn []
+                     (BeamLisp.Env/in_ns (:ns row))
+                     (let [r2 (assoc (complete-prefix prefix (:ns row) (vec (direct-candidates)))
+                                     "building" true)]
+                       (erlang/send ws (tuple :push (assoc r2 "kind" "completions" "id" id))))))
+                 (let [r2 (complete-prefix prefix (:ns row) (:entries r))]
+                   (erlang/send ws (tuple :push (assoc r2 "kind" "completions" "id" id))))))))))
 
 (defn- has-var?
   "Var EXISTENCE, not doc presence: a var with no meta row (core/map has none)
@@ -315,6 +477,24 @@
 
       (= op "balanced") (run-balanced ws id (to-list (get msg "srcs" (to-list []))))
 
+      (= op "index-state")
+      ;; debug: the raw index row + entries matching a substring
+      (let [r (index-read sid)
+            want (get msg "label" "")
+            shape (cond
+                    (= r :cold) "cold"
+                    (= r :building) "building"
+                    :else
+                    (let [entries (elem r 1)
+                          hits (take 30 (filter (fn [c] (some? (index-of (get c "label") want))) entries))
+                          user-n (count (filter (fn [c] (= "user" (get c "ns"))) entries))]
+                      (str "ready n=" (count entries)
+                           " user-ns=" user-n
+                           " age-ms=" (- (System/monotonic_time :millisecond) (elem r 2))
+                           " rebuilding=" (elem r 3)
+                           " hits=[" (join ", " (map (fn [c] (str (get c "ns") "/" (get c "label"))) hits)) "]")))]
+        (erlang/send ws (tuple :push {"kind" "index-state" "id" id "state" shape})))
+
       :else (erlang/send ws (tuple :push {"kind" "error" "id" id "text" (str "unknown op: " op)})))))
 
 (defn ws-handlers
@@ -328,6 +508,9 @@
              (let [sp (spec/read root)
                    vm (mgr/ensure sp)
                    sid (call SERVER [:new (:env vm) root])]
+               ;; prime the completion index: the build is background, so the
+               ;; first Tab finds it warm instead of paying the cold scan
+               (index-rebuild-async sid (get-session sid))
                [:push [[:text (bl.json/encode {"kind" "hello" "session" sid "ns" "user"})]] sid]))
      :handle-in (fn [frame sid]
                   ;; inbound frames are bl VECTORS [:text payload] (the
