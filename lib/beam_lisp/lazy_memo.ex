@@ -218,10 +218,14 @@ defmodule BeamLisp.LazyMemo do
 
   def read(resource) do
     ensure_loaded!()
-
-    case nif_lane(resource) do
-      :fast -> nif_read_fast(resource)
-      :dirty -> nif_read(resource)
+    # One crossing on the hot path (PLAN-132 Phase 1, fixes F1): the fast NIF
+    # self-guards, returning :reroute for an over-ceiling cell instead of a
+    # routing round-trip. A small cell holding the literal :reroute atom falls
+    # through to the dirty read and returns the same value — correct, one extra
+    # crossing for that lone pathological case only.
+    case nif_read_fast(resource) do
+      :reroute -> nif_read(resource)
+      value -> value
     end
   end
 
@@ -262,8 +266,6 @@ defmodule BeamLisp.LazyMemo do
   def nif_read(_resource), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_read_fast(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  @doc false
-  def nif_lane(_resource), do: :erlang.nif_error(:nif_not_loaded)
   @doc false
   def nif_fast_lane_bytes, do: :erlang.nif_error(:nif_not_loaded)
   @doc false

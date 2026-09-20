@@ -417,18 +417,9 @@ fn dependency_resource(term: Term<'_>) -> Option<ResourceArc<MemoCell>> {
     })
 }
 
-/// Which scheduler lane a cell's current contents belong on. Non-dirty and
-/// O(1): it reads the byte accounting the cell already maintains. Callers
-/// route `read`/`compare_exchange` on this answer so a tiny memo never pays
-/// the dirty-scheduler migration that a multi-megabyte value legitimately needs.
-#[rustler::nif(name = "nif_lane")]
-fn lane(resource: ResourceArc<MemoCell>) -> NifResult<Atom> {
-    count(OP_LANE);
-    let guard = lock(&resource.state);
-    let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
-    Ok(if state.retained_bytes <= fast_lane_bytes() { fast() } else { dirty() })
-}
-
+/// (PLAN-132 Phase 1) `nif_lane` is GONE: reads self-guard in `nif_read_fast`,
+/// so no separate routing crossing exists. `op_lane` remains in `nif_stats` as
+/// a regression sentinel — it must read 0 forever.
 #[rustler::nif(name = "nif_fast_lane_bytes")]
 fn get_fast_lane_bytes() -> u64 {
     fast_lane_bytes() as u64
@@ -447,13 +438,23 @@ fn read_impl<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Ter
     Ok(state.env.run(|owned| state.term.load(owned).in_env(env)))
 }
 
-/// Fast lane: regular scheduler. Bounded only for cells at or under the fast
-/// lane byte ceiling; `LazyMemo.read/1` checks `nif_lane` first and routes
-/// larger cells to the dirty `nif_read`.
+/// Fast lane: regular scheduler. SELF-GUARDING (PLAN-132 Phase 1, fixes F1):
+/// for an over-ceiling cell it returns the bare `:reroute` atom WITHOUT loading
+/// the term (loading a multi-megabyte value here is the very stall the lanes
+/// exist to prevent), and `LazyMemo.read/1` retries on the dirty `nif_read`.
+/// The only ambiguity — a small cell whose value IS the atom `:reroute` — is
+/// benign: it is under the ceiling, so it loads and returns `:reroute`, the
+/// caller retries dirty, and `nif_read` returns `:reroute` again (the true
+/// value). One wasted crossing for that lone pathological cell; never wrong.
 #[rustler::nif(name = "nif_read_fast")]
 fn read_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
     count(OP_READ_FAST);
-    read_impl(env, resource)
+    let guard = lock(&resource.state);
+    let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
+    if state.retained_bytes > fast_lane_bytes() {
+        return Ok(reroute().to_term(env));
+    }
+    Ok(state.env.run(|owned| state.term.load(owned).in_env(env)))
 }
 
 /// Dirty lane: unchanged behaviour for large values.

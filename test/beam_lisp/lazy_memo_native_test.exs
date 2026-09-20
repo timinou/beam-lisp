@@ -2,6 +2,17 @@ defmodule BeamLisp.LazyMemoNativeTest do
   use ExUnit.Case, async: false
   alias BeamLisp.{LazyMemo, LazySeq}
 
+  # Lane is no longer a separate NIF (PLAN-132 Phase 1 deleted nif_lane): reads
+  # self-guard, so the OBSERVABLE lane is whether nif_read_fast reroutes. A cell
+  # is :dirty iff the fast read refuses it. (Valid for every value except the
+  # literal atom :reroute, which no test here stores.)
+  defp lane(resource) do
+    case LazyMemo.nif_read_fast(resource) do
+      :reroute -> :dirty
+      _ -> :fast
+    end
+  end
+
   setup do
     LazyMemo.ensure_loaded!()
     :ok
@@ -139,20 +150,20 @@ defmodule BeamLisp.LazyMemoNativeTest do
 
   test "create routes by size and both lanes hold the same value" do
     small = LazyMemo.create(:x)
-    assert :fast = LazyMemo.nif_lane(small)
+    assert :fast = lane(small)
     assert :x = LazyMemo.read(small)
     big = LazyMemo.create(Map.new(1..50_000, fn i -> {i, i} end))
-    assert :dirty = LazyMemo.nif_lane(big)
+    assert :dirty = lane(big)
   end
 
   # ---- scheduler lanes: one cell, two lanes, chosen by measured size ----
 
   test "small cells route to the fast lane; large cells stay dirty" do
     small = LazyMemo.create({:value, 1})
-    assert :fast = LazyMemo.nif_lane(small)
+    assert :fast = lane(small)
 
     big = LazyMemo.create(Map.new(1..50_000, fn i -> {i, i} end))
-    assert :dirty = LazyMemo.nif_lane(big)
+    assert :dirty = lane(big)
     # both lanes read the same value
     assert {:value, 1} = LazyMemo.read(small)
     assert LazyMemo.read(big) == LazyMemo.nif_read(big)
@@ -178,7 +189,7 @@ defmodule BeamLisp.LazyMemoNativeTest do
 
   test "fast lane preserves CAS exactness and single-shot notification" do
     r = LazyMemo.create(0)
-    assert :fast = LazyMemo.nif_lane(r)
+    assert :fast = lane(r)
     tag = make_ref()
     assert :retry = LazyMemo.exchange(r, 0.0, 1, [{self(), tag}])
     refute_received ^tag
@@ -189,13 +200,13 @@ defmodule BeamLisp.LazyMemoNativeTest do
 
   test "a cell that grows past the ceiling migrates lanes and stays correct" do
     r = LazyMemo.create(0)
-    assert :fast = LazyMemo.nif_lane(r)
+    assert :fast = lane(r)
     big = Enum.to_list(1..100_000)
     assert :ok = LazyMemo.exchange(r, 0, big)
-    assert :dirty = LazyMemo.nif_lane(r)
+    assert :dirty = lane(r)
     assert ^big = LazyMemo.read(r)
     assert :ok = LazyMemo.exchange(r, big, 1)
-    assert :fast = LazyMemo.nif_lane(r)
+    assert :fast = lane(r)
     assert 1 = LazyMemo.read(r)
   end
 
@@ -205,7 +216,7 @@ defmodule BeamLisp.LazyMemoNativeTest do
       r = LazyMemo.create(0)
       # lower the ceiling below any real term: everything becomes dirty
       LazyMemo.set_fast_lane_bytes(0)
-      assert :dirty = LazyMemo.nif_lane(r)
+      assert :dirty = lane(r)
       assert :ok = LazyMemo.exchange(r, 0, 1)
       assert 1 = LazyMemo.read(r)
     after
