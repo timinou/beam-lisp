@@ -15,6 +15,13 @@ The cache env vars are only needed while a concurrent session holds the shared
 AOT cache lock (`~/.cache/beam_lisp/aot.lock`); without them `bl` waits, and on
 a contended tree it can exit silently. Drop them when the tree is quiet.
 
+Two further traps in this venue, both measured (PLAN-135 lists the rest):
+`./bl` never loads the tree's own `priv/boot/reader.bl` — the drop ships a
+**compiled** `reader`, so `-p priv/boot` does *not* override it, and a change
+there needs a rebuilt drop (or a renamed copy) to be exercised at all; and a
+long-running `bl` (past ~35 s) can be SIGTERM'd by a concurrent session clearing
+runs, so keep verification runs short or expect to retry them.
+
 Files, all beam-lisp, all under `research/` — nothing in `priv/` or `lib/` is
 touched:
 
