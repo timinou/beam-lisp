@@ -73,6 +73,50 @@ file; what a developer opens is `http://web.<project>.test`.
   (get-in (env/project (BeamLisp/cwd)) [:ports (name-str name) :port]))
 ```
 
+## The access log's shape
+
+The access log is ON by default — one EDN record per request on stderr,
+emitted by `web/serve` (the one place a response status is observable at all).
+The SHAPE is what a program decides here: one line per request is what a
+journal wants, one field per line is what a terminal wants. `--pretty-log`
+and `--no-pretty-log` move it through the same cooperative call `--port` uses,
+and a tree that declares the preference once in `env.bl` —
+`:serve {:access-log {:pretty true}}` — reads it here instead of repeating it
+in every server file.
+
+Why the default is OFF (one line): production stderr goes to journald, which
+gives every LINE its own record. An indented multi-line record is therefore a
+foreground-server shape, not a log shape.
+
+```beam-lisp
+(def pretty-override
+  "The log shape `--pretty-log` / `--no-pretty-log` selected, or nil. The
+   state behind `pretty`."
+  (atom nil))
+
+(defn declared-pretty
+  "The shape this tree declares in env.bl — `:serve {:access-log {:pretty
+   bool}}` — or nil when it declares none. A declaration is a PREFERENCE: the
+   flag and the program's own literal both outrank it."
+  []
+  (let [v (get-in (env/project (BeamLisp/cwd)) [:serve :access-log :pretty])]
+    (if (or (= true v) (= false v)) v nil)))
+
+(defn pretty
+  "Whether this server's access log prints one field per line.
+
+   `(pretty false)` in a server file means \"one line per request\" — what a
+   journal wants; `(pretty true)` is the foreground-dev default. `--pretty-log`
+   or `--no-pretty-log` overrides the literal, and a tree-level declaration in
+   env.bl overrides it too. The three are consulted here in that order: FLAG,
+   then env.bl, then the program's literal."
+  [default]
+  (if (some? @pretty-override)
+    @pretty-override
+    (let [d (declared-pretty)]
+      (if (some? d) d default))))
+```
+
 ## The command
 
 `run` runs the file first, so the program's own startup output — including the
@@ -82,18 +126,25 @@ server; a program that starts its server and returns parks here forever.
 
 ```beam-lisp
 (defn run
-  "`bl serve FILE [-- args...] [--port N]`. Run FILE, then park the VM so the
-   server it started keeps answering. Returns 1 when the program raises."
+  "`bl serve FILE [-- args...] [--port N] [--pretty-log]`. Run FILE, then park
+   the VM so the server it started keeps answering. Returns 1 when the program
+   raises."
   [args st]
   (if (empty? args)
-    (u/usage-error "usage: bl serve FILE [-- args...] [--port N]")
+    (u/usage-error "usage: bl serve FILE [-- args...] [--port N] [--pretty-log]")
     (let [target (first args)]
       (u/register-paths st)
       (reset! port-override (:port st))
+      (reset! pretty-override (:pretty_log st))
       (try
         (BeamLisp/with_argv (u/to-list (or (:dd st) []))
           (fn [] (BeamLisp/run_file (u/resolve target))))
         (println (str "bl serve: " target " running — Ctrl+C to stop"))
+        ;; where the access log goes, said out loud: a server that logs every
+        ;; request must not leave you guessing where the log went (and in
+        ;; production that is the journal, not a file this verb owns)
+        (println (str "bl serve: access log → stderr, one EDN line per request"
+                      " (--pretty-log: one field per line)"))
         (Process/sleep :infinity)
         0
         (catch e
