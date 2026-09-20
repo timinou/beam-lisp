@@ -433,9 +433,10 @@
 ;; ── set algebra over the value ──────────────────────────────────────
 ;;
 ;; intersect / union return an interval when the result is a single
-;; contiguous span, else nil (a gap). The store's query layer is where
-;; multi-span results live (difference = not-join); these are the
-;; value-in-hand primitives the optics traversals in 05 call.
+;; contiguous span, else nil (a gap). Multi-span results live in the
+;; store's query layer (difference = not-join) and, value-in-hand, in the
+;; IntervalSet below; these are the single-span primitives the optics
+;; traversals in 05 call.
 
 (defn intersect
   "The overlap of a and b as an interval, or nil when they are disjoint.
@@ -475,6 +476,181 @@
             right (when (< (:to i) (:to a))
                     (->Interval (:to i) (:to a) (:resolution a) (:calendar a)))]
         (filterv some? [left right])))))
+
+;; ═══════════════════════════════════════════════════════════════════
+;; THE SET — many intervals, coalesced (an IntervalSet)
+;;
+;; `intersect` / `union` / `subtract` above describe ONE span (or, for
+;; `subtract`, at most two). That is exactly why "every day at 06:00,
+;; except the holidays" was not an expression: a recurrence yields MANY
+;; spans and nothing could hold them. An IntervalSet IS that holder — a
+;; sorted, disjoint, maximal collection of intervals, the value Postgres
+;; calls a multirange and Tempo calls an IntervalSet.
+;;
+;; The invariant is the value: spans sorted by `from`, no two touching or
+;; overlapping (touching spans have been COALESCED), empty spans gone.
+;; `interval-set` is the only constructor and the only place the
+;; invariant is established; every other operation may therefore ASSUME
+;; it, and returns a value that re-establishes it. That is what makes the
+;; type safe to store and re-read: normalising is idempotent, so
+;; `(interval-set (set-spans s))` is `s` again.
+;;
+;; A coalesced span reports the FINER of the resolutions that made it,
+;; matching `union`. A set has no single resolution (its spans may be
+;; days and years at once), but each span must carry one for `width` and
+;; `date-parts` to read it.
+;; ═══════════════════════════════════════════════════════════════════
+
+(defrecord IntervalSet [spans])
+
+(defn interval-set?
+  "Whether `x` is a datom.time interval set."
+  [x]
+  (instance? IntervalSet x))
+
+(defn- coalesce
+  "The hull of two spans that touch or overlap. Resolution is the finer
+   of the two (matching `union`); the calendar follows the earlier span."
+  [a b]
+  (->Interval (:from a) (max (:to a) (:to b))
+              (if (finer? (:resolution a) (:resolution b))
+                (:resolution a) (:resolution b))
+              (:calendar a)))
+
+(defn interval-set
+  "An IntervalSet from any collection of intervals, NORMALISED.
+
+   Normalising is the whole contract: empty spans are dropped, the rest
+   sorted by `from`, and any two that touch or overlap COALESCED into
+   their hull — the result is sorted, disjoint and maximal. Touch
+   concatenates: [1,3) then [3,5) is the single span [1,5), because
+   [a,b) ++ [b,c) covers every instant of [a,c) with no gap.
+
+   A non-interval anywhere in the input is REFUSED, naming it, rather
+   than silently skipped: a set that quietly lost a member answers wrong
+   questions forever after."
+  [intervals]
+  (let [kept (filterv (fn [iv]
+                        (cond
+                          (not (interval? iv))
+                          (throw (ex-info (str "datom.time: interval-set holds intervals — got "
+                                               (pr-str iv) " (expected integer :from < :to)")
+                                          {:value iv}))
+                          (< (:from iv) (:to iv)) true
+                          :else false))
+                      intervals)
+        ordered (sort-by (fn [iv] (:from iv)) kept)]
+    (->IntervalSet
+      (loop [todo ordered
+             acc []
+             cur nil]
+        (cond
+          (empty? todo) (if (nil? cur) acc (conj acc cur))
+          (nil? cur) (recur (rest todo) acc (first todo))
+          (<= (:from (first todo)) (:to cur))
+          (recur (rest todo) acc (coalesce cur (first todo)))
+          :else (recur (rest todo) (conj acc cur) (first todo)))))))
+
+;; ── reading a set ───────────────────────────────────────────────────
+
+(defn set-spans
+  "The canonical spans of `s` — sorted, disjoint, maximal. The value the
+   whole type is built around; `(interval-set (set-spans s))` is `s`."
+  [s]
+  (:spans s))
+
+(defn set-count
+  "How many spans `s` holds — not how many seconds, which is `set-measure`."
+  [s]
+  (count (:spans s)))
+
+(defn set-empty?
+  "Whether `s` holds no span. The intersection of two disjoint sets is
+   EMPTY, not an error, and this is how it says so."
+  [s]
+  (empty? (:spans s)))
+
+(defn set-measure
+  "The total WIDTH of `s` in seconds: the sum of its spans, NOT the hull
+   (last `to` minus first `from`). [1,2) and [8,9) measure 2, not 8 — the
+   gap between them is time the set does not contain, and counting it
+   would overstate every free-busy answer by the coffee break."
+  [s]
+  (reduce + 0 (map width (:spans s))))
+
+(defn set-covers?
+  "Whether any span of `s` contains the instant `t` — half-open at BOTH
+   ends. `t` equal to a span's `from` is covered; equal to its `to` is
+   NOT, because `to` belongs to whatever comes next."
+  [s t]
+  (boolean (some (fn [iv] (and (<= (:from iv) t) (< t (:to iv)))) (:spans s))))
+
+(defn set-overlaps?
+  "Whether `a` and `b` share any instant. Spans that merely touch do NOT
+   overlap — [1,3) and [3,5) have no instant in common. Both sets are
+   sorted and disjoint, so one sweep answers it: advance whichever span
+   ends first, because it cannot reach past the other."
+  [a b]
+  (let [xs (:spans a) ys (:spans b)]
+    (loop [i 0 j 0]
+      (cond
+        (or (>= i (count xs)) (>= j (count ys))) false
+        (overlaps? (nth xs i) (nth ys j)) true
+        (before? (nth xs i) (nth ys j)) (recur (inc i) j)
+        :else (recur i (inc j))))))
+
+;; ── the algebra: union, intersection, difference, complement ────────
+;;
+;; Every operation routes back through `interval-set`, so the coalescing
+;; rule is written once and the result is normalised by construction — a
+;; composed expression cannot accumulate a near-normalised set.
+
+(defn set-union
+  "Every instant `a` or `b` contains. Both span lists are re-normalised
+   together, so adjacency across the two sets coalesces exactly as it
+   does within one."
+  [a b]
+  (interval-set (concat (:spans a) (:spans b))))
+
+(defn set-intersect
+  "Every instant both `a` and `b` contain. Disjoint sets intersect to the
+   EMPTY set — not an error; ask `set-empty?`."
+  [a b]
+  (let [ys (:spans b)]
+    (interval-set
+      (vec (mapcat (fn [x] (filterv some? (mapv (fn [y] (intersect x y)) ys)))
+                   (:spans a))))))
+
+(defn set-subtract
+  "The difference `a ∖ b` — the parts of `a` that `b` does not cover. This
+   is the operator that makes an exception an expression: a set of
+   occurrences minus a set of holidays. It applies the interval-level
+   `subtract` span by span, so a subtraction that SPLITS one span into
+   two ([1,10) minus [4,5) is [1,4) and [5,10)) is the same code that
+   always handled it."
+  [a b]
+  (let [ys (:spans b)]
+    (interval-set
+      (reduce (fn [spans y] (vec (mapcat (fn [s] (subtract s y)) spans)))
+              (:spans a)
+              ys))))
+
+(defn set-complement
+  "The complement of `s` within the one interval `bound` — the gaps of `s`
+   inside it, i.e. `bound ∖ s`.
+
+   A set of intervals is UNBOUNDED below: nothing fixes its start, so its
+   complement has no smallest or largest span and a bound-less call has no
+   honest answer. Rather than invent one, the one-argument arity REFUSES,
+   naming the missing bound. Pass the window you mean:
+
+     (set-complement s bound)"
+  ([s]
+   (throw (ex-info (str "datom.time: set-complement needs a bound — a set of intervals is unbounded below, "
+                        "so its complement has no span to return; call (set-complement s bound) with the interval to complement within")
+                   {:set s})))
+  ([s bound]
+   (set-subtract (interval-set [bound]) s)))
 
 ;; ── the ISO 8601 reader (crisp Part-1 grammar) ──────────────────────
 ;;
