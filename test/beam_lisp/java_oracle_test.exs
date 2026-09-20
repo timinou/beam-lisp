@@ -9,7 +9,19 @@ defmodule BeamLisp.JavaOracleTest do
   `:import`s). beam-lisp compiles the identical text through
   `priv/lib/java/manifest.bl` and must print the same value.
 
-  Compared modulo the top-level string quoting difference of `pr-str` (FUP-032).
+  Each row's answer is DATA — an Elixir string, number, or boolean — and bl's
+  `pr-str` is compared against the READABLE printing of it (`inspect/1`), which
+  is what `pr-str` answers now: a string row reads `"ABC"` on both sides, a
+  number row `3`. Before FUP-032 was fixed, a top-level string printed bare, so
+  the two columns agreed only modulo that defect — and the fixture could not have
+  told a string from a symbol.
+
+  A row's answer is typed as the JVM typed it — a String where the JVM answered
+  a String (`(.toPlainString x)` answers `"3.30"`; `(.toUpperCase "abc")` answers
+  `"ABC"`), a number where it answered a number, a boolean where a boolean. bl's
+  interop returns the same types, so the two columns are comparable directly, and
+  a regression that stringified a number would now be caught instead of printing
+  the same text.
   """
   use ExUnit.Case, async: false
 
@@ -21,33 +33,33 @@ defmodule BeamLisp.JavaOracleTest do
     {"(.toPlainString (.multiply (BigDecimal. \"1.5\") (BigDecimal/valueOf 4)))", "6.0"},
     {"(.toPlainString (.negate BigDecimal/ONE))", "-1"},
     {"(.toPlainString (.abs -2.5M))", "2.5"},
-    {"(.signum -3M)", "-1"},
-    {"(.compareTo 1.0M 1.00M)", "0"},
-    {"(.equals 1.0M 1.00M)", "false"},
-    {"(.scale 1.230M)", "3"},
-    {"(.precision 1.230M)", "4"},
-    {"(.longValue 3.99M)", "3"},
+    {"(.signum -3M)", -1},
+    {"(.compareTo 1.0M 1.00M)", 0},
+    {"(.equals 1.0M 1.00M)", false},
+    {"(.scale 1.230M)", 3},
+    {"(.precision 1.230M)", 4},
+    {"(.longValue 3.99M)", 3},
     {"(.toPlainString (.stripTrailingZeros 1.500M))", "1.5"},
     {"(.toPlainString (.movePointLeft 15M 2))", "0.15"},
     {"(.toPlainString (.movePointRight 1.5M 3))", "1500"},
     {"(.toUpperCase \"abc\")", "ABC"},
-    {"(.startsWith \"hello\" \"he\")", "true"},
+    {"(.startsWith \"hello\" \"he\")", true},
     {"(.substring \"hello\" 1 3)", "el"},
-    {"(.lastIndexOf \"a.b.c\" \".\")", "3"},
+    {"(.lastIndexOf \"a.b.c\" \".\")", 3},
     {"(.toString 1.50M)", "1.50"},
     {"(str (.getTime (Date/from (java.time.Instant/ofEpochMilli 1000))))", "1000"},
-    {"(.before (Date/from (java.time.Instant/ofEpochMilli 1)) (Date/from (java.time.Instant/ofEpochMilli 2)))", "true"},
-    {"(instance? BigDecimal 1M)", "true"},
-    {"(instance? BigDecimal 1)", "false"},
+    {"(.before (Date/from (java.time.Instant/ofEpochMilli 1)) (Date/from (java.time.Instant/ofEpochMilli 2)))", true},
+    {"(instance? BigDecimal 1M)", true},
+    {"(instance? BigDecimal 1)", false},
     {"(try (BigDecimal. \"x\") (catch NumberFormatException _ \"NFE\"))", "NFE"},
     {"(try (.divide 1M 3M) (catch ArithmeticException _ \"ARITH\"))", "ARITH"},
     {"(try (throw (ex-info \"b\" {})) (catch Exception _ \"EXC\"))", "EXC"},
     {"(try (throw (ex-info \"b\" {})) (catch Throwable _ \"THR\"))", "THR"},
     {"(str (UUID/fromString \"123E4567-E89B-12D3-A456-426614174000\"))", "123e4567-e89b-12d3-a456-426614174000"},
-    {"(let [c (AtomicLong.)] (.incrementAndGet c) (.incrementAndGet c))", "2"},
-    {"Long/MAX_VALUE", "9223372036854775807"},
-    {"(Math/abs -3)", "3"},
-    {"(Character/isDigit \\7)", "true"},
+    {"(let [c (AtomicLong.)] (.incrementAndGet c) (.incrementAndGet c))", 2},
+    {"Long/MAX_VALUE", 9223372036854775807},
+    {"(Math/abs -3)", 3},
+    {"(Character/isDigit \\7)", true},
   ]
 
   setup_all do
@@ -65,7 +77,7 @@ defmodule BeamLisp.JavaOracleTest do
     failures =
       for {{src, expected}, i} <- Enum.with_index(@rows),
           got = run(src, env),
-          got != expected,
+          got != inspect(expected),
           do: "row #{i}: #{src}\n    JVM: #{inspect(expected)}\n    bl:  #{inspect(got)}"
 
     assert failures == [], "#{length(failures)} of #{length(@rows)} rows diverge:\n\n" <> Enum.join(failures, "\n\n")
@@ -93,7 +105,7 @@ defmodule BeamLisp.JavaOracleTest do
 
   defp run(src, env) do
     v = BeamLisp.Compiler.eval_string(src, env)
-    BeamLisp.RT.print_str(v) |> String.trim("\"")
+    BeamLisp.RT.print_readably(v)
   rescue
     _ -> "ERROR"
   catch
