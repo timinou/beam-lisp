@@ -1,0 +1,193 @@
+; system/arity.bl — a call must hand its callee an arity the callee HAS.
+;
+; ── The bug this names ───────────────────────────────────────────────────
+;
+; `(into {} (keep (fn [l] …)) coll)` — one closing paren too many, so `keep`
+; is called with ONE argument. bl's `keep` is `[f coll]`; there is no 1-arity
+; transducer form. The shape is valid Clojure, compiles to the same call node
+; as any other, and blew up only at RUNTIME, on the request that first reached
+; the expression: a 500 in a customer's browser.
+;
+; Nothing in the pipeline asked the one question that settles it — is `1` an
+; arity of `keep`? The compiler cannot (a call lowers to a generic `RT.invoke`;
+; the callee is resolved at runtime), and `codebase/arity-mismatches` cannot
+; (it joins only against fns DEFINED in the indexed source — a name that comes
+; from anywhere else is not in that fact DB at all, so the whole class is
+; invisible to it).
+;
+; ── The property ─────────────────────────────────────────────────────────
+;
+; ARITY: for every call site in the source, the number of arguments is one the
+; RESOLVED CALLEE's value accepts.
+;
+; ── Four rules, all about not lying ──────────────────────────────────────
+;
+; READ THE CALL AS WRITTEN. `codebase/walk-calls` is the one owner of "what is
+; a call in this source" — it macroexpands once and hands back the head as the
+; author spelled it (`keep`, `env/find`). Stripping the qualifier before
+; resolving is what produced this tier's first false positives.
+;
+; RESOLVE AS THE COMPILER RESOLVES (compiler.bl:2491/2496): a qualified head
+; through the source's alias table, a bare head through its refers, core last.
+; A qualified head is judged ONLY when the source's own namespace is loaded
+; (the alias table that gives the qualifier its meaning lives there) and the
+; namespace it names actually defines the name. Without that, the source is
+; not the only possible reading, so there is no reading.
+;
+; ASK THE RUNTIME, NOT A TABLE. `RT/invocable?` is what the compiler's own
+; call-head dispatch uses (compiler.bl:887) and what `invoke/2` raises
+; against. It answers for every shape a callee can be — a plain fn of N args, a
+; multi-arity multi-fn, a variadic fn (`str`, `map`, `+` accept any arity ≥
+; their min), a keyword/atom lookup. A source-level arity table cannot, and it
+; would be wrong exactly when a macro or a reload moved a clause.
+;
+; So `str` at 7 arguments is not a finding, `filter` at 1 is not a finding
+; (bl's filter IS 1-arity — it returns a transducer), `into` at 4 is not a
+; finding, and `(keep f)` is.
+;
+; A callee invocable at NO arity is a macro or a plain var, not a fn — not this
+; check's question either, so it is skipped rather than guessed at.
+; (`declare`, a macro, is the observed case.)
+;
+; ── Why the reader forms and not the analysis bundle ─────────────────────
+;
+; The call facts are read straight off the reader forms with
+; `codebase/walk-calls`. The obvious alternative — `codebase/index-source`, which
+; also produces `:calls` — runs the definition/type pass as well, and that cost
+; is the whole cost of this tier: measured 1.7–16.2 s PER FILE, which is an
+; editor's budget blown for a question about call sites. The walk below is the
+; same walker over the same forms; it answers nothing else, and it costs what
+; reading costs.
+;
+; Scope, deliberately: a name the source itself defines is skipped (a user
+; `keep` may legitimately be 1-arity; this is not a shadowing check). A call
+; through a local value carries no static callee and is not read.
+
+(ns system.arity
+  (:require [codebase :as cb]))
+
+; The upper bound for ENUMERATING a callee's arities. It answers two questions:
+; "is this a fn at all?" (a variadic fn is invocable at any high arity) and
+; "what arities does it accept?" (for the message).
+(def ^:private max-arity 24)
+
+(defn- src-ns
+  "The namespace `src` declares — `BeamLisp.Loader/declared_ns`, the SAME head
+   scan the loader uses to accept a file, so a resolution here cannot disagree
+   with the resolution a load would do."
+  [src]
+  (try
+    (let [n (BeamLisp.Loader/declared_ns src)]
+      (if (string? n) n "user"))
+    (catch _e "user")))
+
+(defn- source-facts
+  "The calls in `src`, and the names `src` defines.
+
+   One pass over the reader forms: `defn-form` says whether a top-level form
+   defines something (and what it is called), `walk-calls` records every call
+   under it with the head AS WRITTEN, its argument count and its line."
+  [in-ns src]
+  (let [forms (BeamLisp.Reader/read_string src)
+        defn-name (fn [form] (cb/defn-form form))
+        locals (into #{} (keep defn-name forms))
+        calls (first
+                (reduce (fn [acc form]
+                          (cb/walk-calls (or (defn-name form) "<top>")
+                                         in-ns form (first acc) (second acc)))
+                        [[] 100000]
+                        forms))]
+    {:locals locals :calls calls}))
+
+(defn- defined?
+  "Whether namespace `ns` publicly defines `name` itself — no refer and no core
+   fallback consulted. A qualified head must MEAN the name it names."
+  [ns name]
+  (contains? (set (BeamLisp.Env/public_names ns)) name))
+
+(defn- fetch-value
+  "The value of `name` in `ns`, or nil when this VM cannot say."
+  [ns name]
+  (try (BeamLisp.Env/fetch! ns name) (catch _e nil)))
+
+(defn- callee-value
+  "The value a call site's head resolves to, or nil when the VM cannot say.
+
+   A BARE head resolves in the source's own namespace (refers, then core — a
+   file that never mentions core still reaches core's `keep`). A QUALIFIED
+   head resolves through the source's alias table, and only there: an alias
+   the loader never registered (the namespace is not loaded) is not a reading
+   this check is entitled to."
+  [in-ns callee]
+  (if (String/contains? callee "/")
+    (let [parts (split callee "/")
+          prefix (nth parts 0)
+          name (join "/" (rest (seq parts)))
+          target (or (BeamLisp.Env/alias_target in-ns prefix) prefix)]
+      (when (and (BeamLisp.Env/ns_exists? in-ns)
+                 (defined? target name))
+        (fetch-value target name)))
+    (fetch-value in-ns callee)))
+
+(defn- invocable-at? [v n] (BeamLisp.RT/invocable? v n))
+
+(defn- a-callable
+  "Whether `v` is a fn at all — invocable at some arity this tier can see. A
+   macro or a plain var is not, and neither is this check's business."
+  [v]
+  (some (fn [n] (invocable-at? v n))
+        (range 0 (inc max-arity))))
+
+(defn- accepted
+  "How to word what the callee DOES accept."
+  [v]
+  (let [as (into [] (filter (fn [n] (invocable-at? v n)))
+                 (range 0 (inc max-arity)))]
+    (cond
+      (empty? as) "nothing this tier can see"
+      (contains? (set as) max-arity) (str (first as) " or more")
+      :else (join ", " as))))
+
+(defn- finding
+  [site value]
+  (let [callee (str (:call/callee site))
+        n (:call/arity site)]
+    {:kind :call-arity
+     :fn (str (:call/caller site))
+     :line (or (:call/line site) 0)
+     :col 0
+     :msg (str callee " is called with " n " argument" (if (= 1 n) "" "s")
+               "; the resolved fn accepts " (accepted value))}))
+
+(defn- consider
+  "The finding for one call site, or nil when the oracle is satisfied — or when
+   the oracle cannot be asked at all."
+  [in-ns locals site]
+  (let [callee (str (:call/callee site))
+        n (:call/arity site)]
+    (if (contains? locals callee)
+      nil
+      (let [v (callee-value in-ns callee)]
+        (when (and (some? v)
+                   (some? (a-callable v))
+                   (not (invocable-at? v n)))
+          (finding site v))))))
+
+(defn diagnostics
+  "One diagnostic per call site whose resolved callee cannot take that many
+   arguments — positioned on the call's own line.
+
+   A source this tier cannot read yields NO findings: an analyzer that cannot
+   run is not evidence about the program, and a tier that throws turns every
+   file it cannot compile into a red suite. `bl check`'s other tiers keep their
+   own verdict on the file."
+  [src]
+  (try
+    (let [in-ns (src-ns src)
+          facts (source-facts in-ns src)
+          locals (:locals facts)
+          calls (:calls facts)]
+      (into []
+            (keep (fn [site] (consider in-ns locals site))
+                  calls)))
+    (catch _e [])))
