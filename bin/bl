@@ -225,6 +225,9 @@ fi
 # Order matters in one direction only: the floor is installed BEFORE
 # `ensure_all_started`, because the application's boot interns the toolchain.
 export BL_EBIN="$EBIN"
+# The boot-tier rebuild needs the TREE root, not the ebin's parent: under Mix the
+# ebin is `_build/dev/lib/beam_lisp/ebin`, whose parent holds no `priv/`.
+export BL_ROOT="$ROOT"
 
 # THE BOOT PROGRAM GOES IN A QUOTED HEREDOC, never in `-e '…'`.
 #
@@ -256,7 +259,61 @@ cat > "$SNIPPET" <<'BL_BOOT'
   if BeamLisp.Bootstrap.manifest() != nil do
     case BeamLisp.Bootstrap.install!(ebin) do
       {:staged, why} ->
-        IO.puts(:stderr, "bl: the committed compiler floor was built by another toolchain (#{why}); using it to rebuild")
+        # THE FLOOR IS A PREVIOUS GENERATION, so it can only COMPILE the current
+        # tier — it must never RUN it. Serving it is how this tree produced its
+        # worst failure: a VM assembled from two generations, its `reader` from
+        # the floor and its `reader-node` freshly compiled, dying inside a file
+        # nobody had edited (`undefined var: reader/delimiters`, or
+        # `:erlang.tuple_to_list` naming reader-node.bl). So do what the sentence
+        # below always said and rebuild the tier AS A UNIT, before the
+        # application starts and interns it.
+        #
+        # This is `bl build --source-dir priv/boot`. It lives here because the
+        # verb that would do it cannot START on the image this very state
+        # produces — `bl build` loads `priv/build/*.bl` through the mixed loader
+        # and dies in the reader (measured: BUG-090). The launcher is the only
+        # layer below that failure.
+        #
+        # Self-limiting: the rebuild writes `build/`, so the next run's
+        # `install!` finds a current destination and answers `:ok` — this costs a
+        # tier rebuild once per boot-source edit, and nothing on a warm tree.
+        IO.puts(:stderr, "bl: the compiler floor was built by another toolchain (#{why}); rebuilding the boot tier as a unit")
+
+        root = System.get_env("BL_ROOT") || Path.dirname(ebin)
+
+        sources =
+          Path.wildcard(Path.join(root, "priv/boot/*.bl")) ++
+            Path.wildcard(Path.join(root, "priv/std/multi.bl")) ++
+            Path.wildcard(Path.join(root, "priv/boot/*.bl.md")) ++
+            Path.wildcard(Path.join(root, "priv/boot/*.bl.org"))
+
+        try do
+          BeamLisp.AOT.boot()
+          BeamLisp.Env.add_search_path(Path.join(root, "priv/boot"))
+          BeamLisp.Env.add_search_path(Path.join(root, "priv/std"))
+          BeamLisp.Loader.ensure_loaded("build")
+          run = BeamLisp.Env.fetch!("build", "run")
+
+          _ =
+            BeamLisp.RT.invoke(run, [
+              %{
+                sources: sources,
+                out: ebin,
+                manifest: Path.join(ebin, ".beam_lisp/compile.beam_lisp"),
+                force?: false,
+                jobs: nil,
+                log: fn msg -> IO.puts(:stderr, msg) end
+              }
+            ])
+        rescue
+          # A tier that will not compile from source is a REAL error with a real
+          # subject — the source that fails — and the verb may be one that does
+          # not need the tier at all (`bl seed --check` is a pure read). Report
+          # the reason and let the command fail where it actually fails, instead
+          # of turning every verb into a boot crash.
+          e ->
+            IO.puts(:stderr, "bl: the boot tier does not rebuild from source: #{Exception.message(e)}")
+        end
 
       _ ->
         :ok
@@ -327,40 +384,22 @@ cat > "$SNIPPET" <<'BL_BOOT'
   System.halt(BeamLisp.RT.invoke(run, [argv]))
 BL_BOOT
 
-# ── the AOT cache is a shared resource, and two writers corrupt it (BUG-083).
+# ── no lock: the writers are ATOMIC, which is what the lock stood in for.
 #
-# Measured: two `bl` runs at once (six were running when it bit) left
-# `~/.cache/beam_lisp/aot` half-written, and the NEXT run — in a file nobody had
-# touched — died as a COMPILER crash (`:erlang.tuple_to_list("n")` inside
-# `priv/boot/reader-node.bl`, reached from `compiler.bl`'s `parse-fn-clauses`).
-# The drop worked, the checkout did not, and clearing the cache fixed it
-# instantly: the diagnosis cost an hour precisely because the symptom names the
-# wrong file. A cache keyed by content still has to be WRITTEN, and a key and a
-# beam are two writes, not one.
+# BUG-083's corruption was `lower.bl`'s `write-beam!` writing a beam IN PLACE at a
+# path that `AOTCache.link_beams` had hardlinked to the cache's own inode, so a
+# rebuild rewrote the cache under every other VM reading it. Measured without a
+# boot: 20 in-place writes over a hardlinked path gave 641 torn-or-missing reads
+# out of 668 in a concurrent reader; the same writes as sibling temp + rename
+# gave 0. It now publishes atomically, like every other write in the tree, so a
+# reader sees the old beam or the new one and no inode is ever mutated in place.
 #
-# So short-lived runs serialize on the cache root. The lock file follows
-# `BEAM_LISP_AOT_CACHE_DIR` (relocate the cache and you relocate the lock), the
-# wait is bounded, and `BL_NO_LOCK=1` opts out of the whole thing.
-#
-# The long-lived verbs are exempt, and that is deliberate: `bl daemon start`
-# holds the cache for its whole lifetime, so locking it would lock out
-# everything else forever. That is the honest LIMIT of this fix — a daemon
-# compiling while a `bl test` compiles is still a race, and the real fix is
-# atomic writes in `BeamLisp.AOTCache` (filed on BUG-083).
-LOCK_DIR="${BEAM_LISP_AOT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/beam_lisp/aot}"
-LONG_LIVED=""
-for a in "$@"; do
-  case "$a" in
-    daemon|serve|ui|repl|watch) LONG_LIVED=1; break ;;
-  esac
-done
+# The lock that used to serialize every short-lived verb on the cache root — and
+# could hang one run behind another for BL_LOCK_WAIT seconds — was a stopgap for
+# that, and the daemon/serve exemption it needed existed only because of the
+# stopgap. Both are gone, because the reason they existed is gone. If a shared
+# writer is ever added here again, make IT atomic rather than restoring the lock:
+# serializing every command is what made one process able to stop all of bl.
 
-if [ -n "${BL_NO_LOCK:-}" ] || [ -n "$LONG_LIVED" ] || [ "${BEAM_LISP_AOT_CACHE:-}" = "off" ] || ! command -v flock >/dev/null 2>&1; then
-  exec elixir $PA "$SNIPPET" "$@"
-fi
+exec elixir $PA "$SNIPPET" "$@"
 
-if ! flock -n "$LOCK_DIR.lock" true 2>/dev/null; then
-  echo "bl: waiting for the AOT cache lock ($LOCK_DIR.lock) — another bl run is compiling" >&2
-  echo "bl: BL_NO_LOCK=1 to skip the lock, BEAM_LISP_AOT_CACHE_DIR=<dir> for a cache of your own" >&2
-fi
-exec flock -w "${BL_LOCK_WAIT:-1800}" "$LOCK_DIR.lock" elixir $PA "$SNIPPET" "$@"

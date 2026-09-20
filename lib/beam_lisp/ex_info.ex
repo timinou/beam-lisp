@@ -20,6 +20,17 @@ defmodule BeamLisp.ExInfo do
   def ex_message(e), do: if(is_exception(e), do: Exception.message(e), else: inspect(e))
 
   @doc """
+  The Erlang ORIGINAL of an ErlangError — `:terminated`, `:epipe`, `:badarg`,
+  … — or nil for any other value.
+
+  `ex_message/1` renders that original into PROSE ("Erlang error: :terminated"),
+  and prose collides with itself: the reader's "unterminated collection"
+  contains the very word a closed-output check looks for. A caller that must
+  tell an EPIPE apart from a syntax error should ask this, not read the words.
+  """
+  def ex_original(e), do: if(is_struct(e, ErlangError), do: e.original, else: nil)
+
+  @doc """
   Raise a value as an exception, so `try` can catch it.
 
   An existing exception is re-raised as-is; a map becomes an ExInfo
