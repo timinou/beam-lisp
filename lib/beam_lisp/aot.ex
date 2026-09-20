@@ -990,7 +990,16 @@ defmodule BeamLisp.AOT do
   # carries no stamp (predates L1) or its code cannot be loaded. `ensure_loaded/1`
   # already made the module code-loadable, so this is a plain call — NO
   # `__bl_init__/0`, no eval.
-  defp beam_provenance(mod) do
+  @doc """
+  The {hash, key} provenance of a module's beam, or nil when it carries none.
+
+  PUBLIC because the contract is wider than this module: the LAUNCHER
+  (`bin/bl`'s generated bootstrap) asks it of every boot namespace to decide
+  whether `build/` holds one generation, and it runs on a previous generation's
+  beams — so the read has to be callable from outside, on the floor, by design.
+  `priv/std/reload.bl` describes the same read as "the gate's own read".
+  """
+  def beam_provenance(mod) do
     if function_exported?(mod, :__bl_provenance__, 0) do
       case mod.__bl_provenance__() do
         {nil, _} -> nil
