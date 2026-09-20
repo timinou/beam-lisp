@@ -20,7 +20,10 @@
 ;   · `:unique` makes a duplicate enqueue a NO-OP inside the job's window and a
 ;     NEW job once the window closes;
 ;   · `:concurrency` is an upper bound, and `stats` answers from the store — so
-;     the pane never asks a process, and never wakes one either.
+;     the pane never asks a process, and never wakes one either;
+;   · `cancel!` STOPS what has not begun and REFUSES what has (a claimed job is
+;     running on a body this queue does not track), and `prune!` deletes
+;     TERMINAL jobs only — never one that is owed, claimed or mid-retry.
 
 (ns queue.test
   (:require [proc :as proc]
@@ -297,3 +300,141 @@
   (let [p (queue/perform-clause '(perform [job] (charge! job)) {:name 'x})]
     (is (= 1 (count (:prelude p))) "the body is registered, not merged")
     (is (nil? (:init p)) "…so it cannot collide with the queue's own slice")))
+
+;; ── cancel! : the work that has NOT begun ────────────────────────────────
+;;
+;; `cancel!` is a store write, so these tests STOP the queue first and cancel
+;; with no process alive: that is the shape an operator actually uses (a
+;; destination job stopped, a bad payload retired) and it is also the strongest
+;; form of the claim that these verbs belong to the STORE, not to a claimer.
+
+(defn- refused
+  "The MESSAGE of the refusal `f` raises, or nil when it did not refuse.
+
+   A test that reads a refusal has to be able to tell one from an ANSWER: a
+   `cancel!` that wrongly succeeded would return a job map, and `(ex-message …)`
+   on it would be nil or a crash, so the two cases cannot be confused."
+  [f]
+  (try (do (f) nil) (catch err (ex-message err))))
+
+(def cancel-runs (atom []))
+
+(proc/defserver cancellable
+  (queue {:of :demo/ticket :concurrency 1 :unique [:ticket/id] :lease 300})
+  (perform [job] (swap! cancel-runs conj (:ticket/id job))))
+
+(deftest cancelling-a-queued-job-finishes-it-and-frees-its-key
+  (let [s (start cancellable nil {})]
+    (Process/sleep 30)
+    (stop s))
+  (let [j (queue/enqueue! :cancellable {:ticket/id "q1"})
+        e (:db/id j)
+        c (queue/cancel! :cancellable e)]
+    (is (= :cancelled (:job/state c)) "a job that has not begun is cancelled")
+    (is (nil? (:job/ticket c)) "…and its Idempotency Key is freed with it")
+    (is (some? (:job/finished-at c)) "…and it says WHEN it finished, which is what a prune ages by")
+    (is (= 1 (:cancelled (queue/stats :cancellable))) "the pane's query counts it")
+    ; the window CLOSES, exactly as it does when a job settles
+    (let [again (queue/enqueue! :cancellable {:ticket/id "q1"})]
+      (is (= true (:job/created again)) "a cancelled job frees its key")
+      (is (not= e (:db/id again)) "…and a fresh job is what the key buys")
+      (is (empty? @cancel-runs) "…so the body it would have run never ran")
+      (let [s (start cancellable nil {})]
+        (is (wait-until (fn [] (= :done (:job/state (job-of :cancellable (:db/id again))))) 3000)
+            "the fresh job runs")
+        (is (= :cancelled (:job/state (job-of :cancellable e)))
+            "…and a cancelled job is NEVER claimed, however long the queue runs")
+        (is (= ["q1"] @cancel-runs)
+            "…the only body that ran is the FRESH job's, once")
+        (stop s)))))
+
+(deftest cancel-refuses-an-unknown-id-and-a-terminal-job
+  (let [m (refused (fn [] (queue/cancel! :cancellable 424242)))]
+    (is (some? m) "an id that is not a job is refused")
+    (is (includes? (str m) "424242") "…naming the id, so a typo is not a silent no-op"))
+  (let [s (start cancellable nil {})
+        j (queue/enqueue! :cancellable {:ticket/id "already-done"})]
+    (is (wait-until (fn [] (= :done (:job/state (job-of :cancellable (:db/id j))))) 3000)
+        "the job runs and finishes")
+    (stop s)
+    (let [m (refused (fn [] (queue/cancel! :cancellable (:db/id j))))]
+      (is (some? m) "a terminal job is refused")
+      (is (includes? (str m) ":done") "…naming the state, because cancelling finished work is a category error"))))
+
+;; ── cancel! : the work that HAS begun is refused ─────────────────────────
+
+(def gate (atom false))
+(def gate-runs (atom 0))
+
+(proc/defserver guarded
+  ; concurrency ONE and a long lease, so the job is RUNNING and stays running
+  ; while the test asks — the window this test is about.
+  (queue {:of :demo/guard :concurrency 1 :lease 60})
+  (perform [job]
+    (swap! gate-runs inc)
+    (wait-until (fn [] @gate) 5000)))
+
+(deftest cancel-refuses-a-claimed-job-and-names-its-owner
+  (reset! gate false)
+  (reset! gate-runs 0)
+  (let [s (start guarded nil {})
+        j (queue/enqueue! :guarded {:demo/guard 1})]
+    (is (wait-until (fn [] (= :running (:job/state (job-of :guarded (:db/id j))))) 3000)
+        "a worker holds the job")
+    (let [before (job-of :guarded (:db/id j))
+          m (refused (fn [] (queue/cancel! :guarded (:db/id j))))]
+      (is (some? m) "a CLAIMED job is refused — cancel cannot stop a body it does not track")
+      (is (includes? (str m) ":running") "…naming the state")
+      (is (includes? (str m) (:job/owner before))
+          "…and the OWNER TOKEN the store holds (it keeps no pid, by design)")
+      (is (= :running (:job/state (job-of :guarded (:db/id j)))) "…and the job is untouched"))
+    (reset! gate true)
+    (is (wait-until (fn [] (= :done (:job/state (job-of :guarded (:db/id j))))) 3000)
+        "the body it could not stop still settles the job")
+    (is (= 1 @gate-runs) "…and it ran once")
+    (stop s)))
+
+;; ── prune! : terminal jobs go, live ones DO NOT ──────────────────────────
+
+(proc/defserver sweepable
+  (queue {:of :demo/leaf :concurrency 1 :unique [:leaf/id] :lease 300})
+  (perform [job] :ok))
+
+(deftest prune-removes-terminal-jobs-and-never-an-owed-one
+  (let [s (start sweepable nil {})
+        settled (queue/enqueue! :sweepable {:leaf/id "settled"})]
+    (is (wait-until (fn [] (= :done (:job/state (job-of :sweepable (:db/id settled))))) 3000))
+    (stop s)
+    ; with nothing running: one job OWED and one CANCELLED, and only one of them
+    ; may be prunable — that difference is what the whole guard exists for
+    (let [owed (queue/enqueue! :sweepable {:leaf/id "owed"})
+          c (queue/cancel! :sweepable (:db/id (queue/enqueue! :sweepable {:leaf/id "dropped"})))
+          r (queue/prune! :sweepable (+ (proc/wall-ms) 1000))]
+      (is (= :cancelled (:job/state c)) "the cancelled job is the terminal one")
+      (is (>= (:removed r) 2) "the settled and the cancelled job are removed")
+      (is (>= (get (:by-state r) :done 0) 1) "…and counted by state")
+      (is (>= (get (:by-state r) :cancelled 0) 1))
+      (is (nil? (job-of :sweepable (:db/id settled))) "a terminal job past the bound is GONE")
+      (is (some? (job-of :sweepable (:db/id owed)))
+          "an OWED job survives — deleting live work is the one way a prune loses it silently")
+      (is (= :queued (:job/state (job-of :sweepable (:db/id owed)))))
+      (is (not (some (fn [x] (= x (:db/id owed))) (:ids r))))))
+  (let [m (refused (fn [] (queue/prune! :sweepable "yesterday")))]
+    (is (some? m) "a cutoff that is not an epoch-ms integer is refused")
+    (is (includes? (str m) "yesterday") "…naming what it was given")))
+
+(deftest prune-never-deletes-a-claimed-job
+  (reset! gate false)
+  (let [s (start guarded nil {})
+        j (queue/enqueue! :guarded {:demo/guard 2})]
+    (is (wait-until (fn [] (= :running (:job/state (job-of :guarded (:db/id j))))) 3000))
+    ; a bound a million times past: age is not what protects it — being live is
+    (let [r (queue/prune! :guarded (+ (proc/wall-ms) 3600000))]
+      (is (not (some (fn [x] (= x (:db/id j))) (:ids r)))
+          "a RUNNING job is not eligible, however old the bound")
+      (is (= :running (:job/state (job-of :guarded (:db/id j))))))
+    (reset! gate true)
+    (is (wait-until (fn [] (= :done (:job/state (job-of :guarded (:db/id j))))) 3000)
+        "…and it still settles under its own worker")
+    (stop s)))
+

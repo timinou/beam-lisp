@@ -78,15 +78,24 @@
 ; construction. A second timer is therefore cancelled and a message already in
 ; flight is harmless.
 ;
-; ══ THE TWO VERBS THAT SURVIVE ══════════════════════════════════════════════
+; ══ THE VERBS, AND THE ONE THAT IS NOT MACHINERY ═══════════════════════════
 ;
-; `enqueue!` (a store write, with the queue's eligibility rules applied to it)
-; and `stats` (a QUERY — counts by status, so the pane never asks a process, and
-; the answer is the same whether the queue is running, stopped, or was never
-; started in this VM). `retry`, `unique`, `lease`, `concurrency` and
-; `partition` are OPTIONS ON THE CLAIM LOOP, not verbs. `prune` is not part of
-; this bundle at all: it is a `:schedules` declaration of the tree that owns the
-; queue (§4.3).
+; `enqueue!` (a store write, with the queue's eligibility rules applied to it),
+; `stats` (a QUERY — counts by status, so the pane never asks a process, and the
+; answer is the same whether the queue is running, stopped, or was never started
+; in this VM), `cancel!` (a store write that stops work NOT YET BEGUN) and
+; `prune!` (a store write that deletes TERMINAL jobs past a bound). `retry`,
+; `unique`, `lease`, `concurrency` and `partition` are OPTIONS ON THE CLAIM
+; LOOP, not verbs.
+;
+; WHAT CANNOT BE CANCELLED, and why, is its own section below, beside `cancel!`.
+;
+; `prune!` is the FN, NOT the SCHEDULE. The design puts a queue's prune in the
+; tree that owns it — a `:schedules` declaration of the tree's own verb (§4.3) —
+; and this file invents no second scheduler to say when. What belongs here is
+; that the DELETE is correct: terminal jobs only, never one that is owed,
+; claimed or mid-retry. `prune!`'s docstring carries the declaration a tree
+; writes, and the reason the guard is STRUCTURAL rather than a filtered check.
 ;
 ; ══ SEE ALSO ════════════════════════════════════════════════════════════════
 ;
@@ -577,6 +586,7 @@
      :running (of :running)
      :done (of :done)
      :failed (of :failed)
+     :cancelled (of :cancelled)
      :overdue overdue
      :total (count rows)}))
 
@@ -640,6 +650,155 @@
         (datom/entity (datom/db c) e)
         (catch err
           (if (lose-race? err) nil (throw err)))))))
+
+;; ── cancelling work that has not begun, and reaping what has ────────────
+;;
+;; Both verbs are STORE WRITES, so neither needs a running queue: the store
+;; outlives the process, and an operator who has stopped a queue can still stop
+;; work and still reap what is finished.
+
+(def TERMINAL-STATES #{:done :failed :cancelled})
+
+(defn- cancel-state
+  "The transaction that cancels `job`, from the state the caller READ, or nil
+   when that state may not be cancelled.
+
+   The CAS is on `:job/state`, so a cancel and a claim cannot both land: the
+   loser's whole transaction is refused and `cancel!` retries against what
+   actually happened. That is the claim's own read-modify-write discipline, one
+   attribute over."
+  [job now]
+  (let [e (:db/id job)
+        s (:job/state job)]
+    (when-not (or (contains? TERMINAL-STATES s) (= s :running))
+      (vec (concat [[:db/cas e :job/state s :cancelled]
+                    [:db/add e :job/finished-at now]]
+                   ;; THE KEY GOES WITH THE JOB. A cancelled job is finished, so its
+                   ;; Idempotency Key window is CLOSED — the same payload may be
+                   ;; owed again (as after :done), and no key is left held by a job
+                   ;; nothing will ever run.
+                   (if (some? (:job/ticket job))
+                     [[:db/retract e :job/ticket (:job/ticket job)]]
+                     []))))))
+
+(defn cancel!
+  "Cancel a job that has NOT BEGUN — one still `:queued` — and answer the
+   cancelled job. A STORE WRITE, so it needs no running queue.
+
+   REFUSES every other state, NAMING it, and that is this file's decision about
+   a CLAIMED (in-flight) job:
+
+     · this queue cannot stop a body it does not track. `launch!` starts the work
+       on a plain `spawn` with NO monitor — deliberately; the lease is the safety
+       net instead — so the most a cancel could do to an in-flight job is rewrite
+       its record while its body runs on. A `:cancelled` row over a body that is
+       still charging a card is a lie that keeps an audit trail.
+     · the model this bundle follows agrees: Oban refuses `cancel` on an
+       `executing` job, for the same reason, and §4.3 names Oban as the shape.
+     · it also keeps `:cancelled` meaning ONE thing — work that will never run —
+       instead of two (never ran, and ran-but-forgotten).
+
+   The refusal names the state; for `:running` it also names the OWNER TOKEN and
+   how much lease is left. NOT a pid: the store keeps the lease's owner TOKEN and
+   nothing else, because nothing here registers a monitor and `launch!` never
+   records the worker's pid — naming one would be inventing a fact. The token is
+   what a `:db/cas` on `:job/owner` compares against, so it is the worker's name
+   in every sense this store has.
+
+   A missing id is refused NAMING THE ID, so a typo is not a silent no-op; a
+   terminal job is refused NAMING ITS STATE, because cancelling work that is
+   already done is a category error and should read as one."
+  [srv id]
+  (let [c (conn srv)]
+    (loop [n 0]
+      (let [job (datom/entity (datom/db c) id)
+            st (:job/state job)]
+        (cond
+          (nil? job)
+            (throw (ex-info (str "queue: no job " id " in " (name srv) " — nothing"
+                                 " to cancel. Cancel takes the id of an EXISTING job,"
+                                 " and only :queued work can be cancelled")
+                            {:server srv :id id}))
+          (contains? TERMINAL-STATES st)
+            (throw (ex-info (str "queue: job " id " is :" (name st) " — a terminal job"
+                                 " cannot be cancelled (only :queued work can)")
+                            {:server srv :id id :state st}))
+          (= :running st)
+            (throw (ex-info (str "queue: job " id " is :running under owner "
+                                 (:job/owner job) " with "
+                                 (- (or (:job/lease-until job) (tick/wall-ms))
+                                    (tick/wall-ms))
+                                 "ms of lease left — a CLAIMED job has BEGUN and"
+                                 " cannot be cancelled (only :queued work can); its"
+                                 " outcome settles under that owner")
+                            {:server srv :id id :state st :owner (:job/owner job)
+                             :lease-until (:job/lease-until job)}))
+          (> n 2)
+            (throw (ex-info (str "queue: job " id " would not settle into a"
+                                 " cancellable state — it is :" (name st) " now")
+                            {:server srv :id id :state st}))
+          :else
+            (let [outcome (try
+                            (datom/transact! c (cancel-state job (tick/wall-ms)))
+                            :cancelled
+                            (catch err (if (lose-race? err) :lost (throw err))))]
+              (if (= outcome :lost)
+                (recur (inc n))
+                (datom/entity (datom/db c) id))))))))
+
+(defn prune!
+  "Delete TERMINAL jobs finished at or before `cutoff` (epoch milliseconds), and
+   answer what was removed: `{:removed N :by-state {:done … :failed …
+   :cancelled …} :ids […]}`. A STORE WRITE, so it needs no running queue — which
+   is exactly when a nightly prune runs.
+
+   TERMINAL ONLY, and the guard is STRUCTURAL rather than a filter someone could
+   forget: eligibility is the PRESENCE of `:job/finished-at`, the attribute a
+   terminal settle writes and nothing else does. A job that is owed (`:queued`),
+   claimed (`:running`, live lease or expired) or waiting on a retry backoff
+   carries no `finished-at`, so the query cannot see it. DELETING A LIVE JOB IS
+   THE ONE WAY A PRUNE LOSES WORK SILENTLY — the queue would never re-run it and
+   nothing would say so — which is why the bound is applied to a fact only
+   terminal jobs have.
+
+   THE FN, NOT THE SCHEDULE. This bundle has no scheduler, and the design puts a
+   queue's prune in the tree that owns it (§4.3) as a `:schedules` line. A
+   scheduled body is handed the occurrence map and nothing else, so the tree
+   writes the two lines that say WHICH queue and HOW FAR BACK — neither of which
+   this file could know:
+
+     :schedules [{:id «larder-prune» :daily [4 10]
+                  :run «hotel.jobs/prune-larder»}]
+
+     (defn prune-larder [_occ]
+       (proc.queue/prune! :larder (- (proc/wall-ms) (* 7 24 3600000))))
+
+   Seven days, there, is the tree's choice: the queue has no opinion about how
+   long a finished job is worth keeping, only that a live one is never worth
+   deleting."
+  [srv cutoff]
+  (when-not (erlang/is_integer cutoff)
+    (throw (ex-info (str "queue: prune! takes an epoch-ms cutoff — got " (str cutoff))
+                    {:server srv :cutoff cutoff})))
+  (let [c (conn srv)
+        d (datom/db c)
+        doomed (vec (filter (fn [row]
+                              (and (contains? TERMINAL-STATES (second row))
+                                   (<= (nth row 2) cutoff)))
+                            (datom/q '[:find ?e ?s ?fin
+                                       :where [?e :job/state ?s]
+                                              [?e :job/finished-at ?fin]]
+                                     d)))]
+    (if (empty? doomed)
+      {:removed 0 :by-state {} :ids []}
+      (do
+        (datom/transact! c (vec (map (fn [row] [:db/retractEntity (first row)]) doomed)))
+        {:removed (count doomed)
+         :by-state (reduce (fn [m row]
+                             (assoc m (second row) (inc (get m (second row) 0))))
+                           {}
+                           doomed)
+         :ids (vec (map first doomed))}))))
 
 ;; ── the loop ────────────────────────────────────────────────────────────
 ;;
@@ -814,9 +973,12 @@
         (if (>= attempts (:max (:retry decl)))
           ;; EXHAUSTED, and the job is KEPT: :failed is a state a human reads,
           ;; which is the whole difference between a retry ceiling and a hole the
-          ;; work fell into.
+          ;; work fell into. `:job/finished-at` is written on THIS arm as well as
+          ;; on the success one, because it is the ONE attribute `prune!` ages a
+          ;; terminal job by: a `:failed` row without it could never be reaped.
           (with-ticket [[:db/add e :job/state :failed]
-                        [:db/add e :job/last-error err]])
+                        [:db/add e :job/last-error err]
+                        [:db/add e :job/finished-at now]])
           (with-ticket [[:db/add e :job/state :queued]
                         [:db/add e :job/at (+ now (backoff-ms (:retry decl) attempts))]
                         [:db/add e :job/last-error err]]))))))

@@ -1,0 +1,240 @@
+; examples/tooling/queue.bl — the durable queue, end to end: a job is a FACT
+; before it is owed, and the STORE is the queue.
+; Run: bl -p priv/std examples examples/tooling/queue.bl
+;
+; The smaller pieces each own one layer — `tick` the beat, `sched` the wheel,
+; `proc.queue`'s own docstring the claim. This one is the queue as a whole, and
+; its subject is the question prose cannot answer:
+;
+;   WHAT HAPPENS TO WORK WHOSE PROCESS DISAPPEARS?
+;
+; Three faces, one section each:
+;
+;   · A JOB IS A FACT. `enqueue!` is a transaction against the queue's store,
+;     so a job survives the queue being STOPPED, and `stats` is a QUERY — the
+;     same answer whether the queue is running, stopped, or was never started.
+;   · THE LEASE IS THE SAFETY NET, AND NO MONITOR IS. A worker killed mid-flight
+;     sends nothing at all; when its lease runs out the job is claimed again and
+;     the body RUNS AGAIN. At-most-once DELIVERY is not on offer, so `perform`
+;     must be idempotent — at-most-once EFFECT is, and the job still settles
+;     exactly once.
+;   · CANCEL STOPS ONLY WHAT HAS NOT BEGUN. A queued job is cancelled and its
+;     Idempotency Key released; a CLAIMED job is REFUSED, because this queue
+;     cannot stop a body it deliberately does not track.
+;
+; What to watch for:
+;
+;   · `stats` before and after — the same numbers with nothing alive;
+;   · a job whose BODY ran twice and whose EFFECT happened once;
+;   · a refusal that names the state and the claim's owner token.
+;
+; docs/scheduling/the-clock-and-the-wheel.md §4.3 is the design of record.
+
+(ns tooling.queue
+  (:require [proc :as proc]
+            [proc.queue :as queue]
+            [datom :as datom]))
+
+(defn check! [truth message data]
+  (when-not truth
+    (throw (ex-info message data))))
+
+(defn- say [label v] (println (str "   " label " → " (Kernel/inspect v))))
+
+(defn- wait-until
+  "Poll `pred` until it holds, or `ms` elapses.
+
+   A queue is timers and processes, so an assertion after a fixed sleep is an
+   assertion that fails on a busy machine."
+  [pred ms]
+  (loop [n 0]
+    (cond (pred) true
+          (> n ms) false
+          :else (do (Process/sleep 10) (recur (+ n 10))))))
+
+(defn- job-of [srv e] (datom/entity (datom/db (queue/conn srv)) e))
+
+;; ── 1. a job is a fact, and the store is the queue ──────────────────────
+;;
+;; The clause is the CLAIM LOOP and nothing else. `enqueue!` writes a row, and
+;; `stats` reads the same table with a query — so neither needs the queue to be
+;; running, and the numbers below are the same facts a pane would show.
+
+(def served (atom []))
+
+(proc/defserver larder
+  (queue {:of :hotel/order
+          :concurrency 2
+          :unique [:order/room :order/item]
+          :lease 30})
+  (perform [job]
+    (swap! served conj [(:order/room job) (:order/item job)])))
+
+(println "== 1. a job is a fact, and the store is the queue ==")
+(println)
+; start once so the declaration lands in the store — `enqueue!` applies the
+; queue's OWN rules, and a rule it has never been told is a rule it cannot apply
+(let [s (start larder nil {})]
+  (Process/sleep 40)
+  (stop s))
+
+(let [a (queue/enqueue! :larder {:order/room "101" :order/item :breakfast})
+      b (queue/enqueue! :larder {:order/room "102" :order/item :minibar})
+      c (queue/enqueue! :larder {:order/room "103" :order/item :audit}
+                        {:in [30 :minutes]})]
+  (say "three jobs written with NO queue running"
+       (map (fn [j] [(:order/room (:job/payload j)) (:job/state j)]) [a b c]))
+  (say "stats, a QUERY over that store" (queue/stats :larder))
+  (check! (not (queue/serving? :larder)) "nothing is running to be asked" {})
+  (check! (= 3 (:queued (queue/stats :larder))) "the query counts what nobody is holding" {}))
+
+(println)
+(let [s (start larder nil {})]
+  (check! (wait-until (fn [] (= 2 (:done (queue/stats :larder)))) 5000)
+          "the loop claims what is due and settles it" {})
+  (say "the loop claimed and settled" (queue/stats :larder))
+  (say "…and the bodies saw" @served))
+(check! (= 2 (count @served)) "two ran; the third is not due for half an hour" {})
+(check! (= 1 (:queued (queue/stats :larder))) "…and it is still owed, not lost" {})
+
+;; ── 2. the lease is the safety net, and no monitor is ──────────────────
+;;
+;; A ONE-second lease, so the reclaim is a demo rather than a five-minute wait.
+;; The body records the EFFECT into a SET (idempotent by the job's own key: two
+;; runs move a room once) and counts its own runs — the two numbers that differ
+;; by exactly the thing this design refuses to promise.
+
+(def runs (atom 0))
+(def hauls (atom #{}))
+(def tries (atom {}))
+(def first-worker (atom nil))
+
+(defn- attempt-of
+  "Which attempt this is for `room`, counted IN THE BODY rather than read from
+   the job — the job's `:job/attempts` is the queue's number, and the demo is
+   about what the BODY did."
+  [room]
+  (let [n (inc (get @tries room 0))]
+    (swap! tries assoc room n)
+    n))
+
+(proc/defserver lifeline
+  (queue {:of :demo/haul :concurrency 1 :lease 1})
+  (perform [job]
+    (let [room (:demo/room job)
+          n (attempt-of room)]
+      (swap! runs inc)
+      ; THE EFFECT IS IDEMPOTENT BY THE JOB'S OWN KEY. This is the caller's half
+      ; of at-least-once, and the set is what makes it observable.
+      (swap! hauls conj room)
+      (cond
+        (and (= 1 n) (= :kill (:demo/mode job)))
+          (do (reset! first-worker (erlang/self))
+              (wait-until (fn [] false) 20000))     ; wait to be KILLED mid-flight
+        (and (= 1 n) (= :slow (:demo/mode job)))
+          (Process/sleep 1600))                      ; outlive the lease, then report
+      {:room room :attempt n})))
+
+(println)
+(println "== 2. a worker that outlives its lease ==")
+(println)
+
+(let [s (start lifeline nil {})
+      j (queue/enqueue! :lifeline {:demo/room "301" :demo/mode :slow})]
+  (check! (wait-until (fn [] (= :done (:job/state (job-of :lifeline (:db/id j))))) 8000)
+          "the slow job settles — once, however many times the body ran" {})
+  (let [end (job-of :lifeline (:db/id j))]
+    (say "the settled job" (select-keys end [:job/state :job/attempts :job/result]))
+    (say "body runs" @runs)
+    (say "effects on the world" @hauls)
+    (check! (>= (:job/attempts end) 2)
+            "the expired lease made the job claimable again"
+            {:attempts (:job/attempts end)})
+    (check! (= 2 @runs) "the body really ran twice" {:runs @runs})
+    (check! (= 1 (count @hauls)) "…and the EFFECT happened once" {:hauls @hauls})
+    (check! (= 2 (:attempt (:job/result end)))
+            "the stored result is the SECOND worker's — the first worker's late outcome was refused"
+            {:result (:job/result end)}))
+  (stop s))
+
+(println)
+(println "== 2b. a worker that is KILLED mid-flight ==")
+(println)
+
+(let [s (start lifeline nil {})
+      j (queue/enqueue! :lifeline {:demo/room "302" :demo/mode :kill})]
+  (check! (wait-until (fn [] (some? @first-worker)) 5000)
+          "the first worker started and published its pid" {})
+  (say "the first worker is" @first-worker)
+  (erlang/exit @first-worker :kill)
+  (Process/sleep 100)
+  (say "the store, right after the kill" (queue/stats :lifeline))
+  (check! (= :running (:job/state (job-of :lifeline (:db/id j))))
+          "the job is still :running — a killed worker sends nothing at all" {})
+  (check! (wait-until (fn [] (= :done (:job/state (job-of :lifeline (:db/id j))))) 8000)
+          "the Lifeline re-runs it and it settles" {})
+  (let [end (job-of :lifeline (:db/id j))]
+    (say "the settled job" (select-keys end [:job/state :job/attempts :job/result]))
+    (say "body runs" @runs)
+    (say "effects on the world" @hauls)
+    (check! (= 2 (:job/attempts end)) "the lease expired and the job was claimed again" {:attempts (:job/attempts end)})
+    (check! (= 4 @runs) "the body ran four times across both jobs" {:runs @runs})
+    (check! (= 2 (count @hauls)) "…and the world holds two effects, one per room" {:hauls @hauls}))
+  (stop s))
+
+;; ── 3. cancel: what has not begun stops, what has begun does not ───────
+;;
+;; Cancel is a store write too, so it works on a stopped queue. The refusal is
+;; the interesting half: an in-flight job is work this queue CANNOT stop — and a
+;; verb that said otherwise would be a promise with no machinery behind it.
+
+(def gate (atom false))
+(def charged (atom []))
+
+(proc/defserver desk
+  (queue {:of :hotel/charge :concurrency 1 :lease 60})
+  (perform [job]
+    (swap! charged conj (:charge/id job))
+    (wait-until (fn [] @gate) 10000)))
+
+(println)
+(println "== 3. cancel stops only what has not begun ==")
+(println)
+
+(let [s (start desk nil {})]
+  (Process/sleep 40)
+  (stop s))
+
+(let [j (queue/enqueue! :desk {:charge/id "booking-7"})
+      c (queue/cancel! :desk (:db/id j))]
+  (say "cancelled while the queue is down" (select-keys c [:job/state :job/ticket :job/finished-at]))
+  (check! (= :cancelled (:job/state c)) "a queued job is cancelled" {})
+  (check! (nil? (:job/ticket c)) "…and its Idempotency Key is released" {})
+  (check! (= 1 (:cancelled (queue/stats :desk))) "…and the pane's query counts it" {}))
+
+(println)
+(let [s (start desk nil {})
+      j (queue/enqueue! :desk {:charge/id "booking-8"})]
+  (check! (wait-until (fn [] (= :running (:job/state (job-of :desk (:db/id j))))) 4000)
+          "a worker is holding booking-8" {})
+  (let [before (job-of :desk (:db/id j))
+        refusal (try
+                  (do (queue/cancel! :desk (:db/id j)) nil)
+                  (catch err (ex-message err)))]
+    (say "cancel of the CLAIMED job" refusal)
+    (check! (some? refusal) "cancelling a claimed job is REFUSED" {})
+    (check! (includes? (str refusal) ":running") "…naming the state" {:refusal refusal})
+    (check! (includes? (str refusal) (:job/owner before))
+            "…and the owner token the store holds (no pid is kept, by design)"
+            {:owner (:job/owner before)}))
+  ; the body it refused to stop still settles the job — under its own owner
+  (reset! gate true)
+  (check! (wait-until (fn [] (= :done (:job/state (job-of :desk (:db/id j))))) 4000)
+          "the refused-to-cancel body still settles the job" {})
+  (say "charges that ran" @charged)
+  (say "everything the desk's store holds" (queue/stats :desk))
+  (stop s))
+
+(println)
+(println "✓ queue: a job is a fact, the store is the queue, and the lease — not a")
+(println "  monitor — is what turns a dead worker back into owed work.")
