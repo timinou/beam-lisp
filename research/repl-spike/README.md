@@ -77,6 +77,11 @@ recorded:
 2. CM6 keymap precedence: `basicSetup`'s Enter binding wins over a later
    `keymap.of` — the eval-on-Enter keymap must come BEFORE basicSetup (or use
    `Prec.high`)
+3. `web/bytes-cached` sets `max-age=31536000, immutable` — right for
+   content-addressed URLs, a trap for a stable URL like
+   /vendor/editor.bundle.js: the browser NEVER revalidates, so a rebuilt
+   bundle is invisible until the URL changes. Version the URL or serve
+   without cache headers in dev.
 
 **balanced? (U5)** — the parity harness (JS port vs server truth over 13
 fixtures) flagged exactly one mismatch, and it was a **real bug in bl.repl**,
@@ -84,6 +89,16 @@ not the port: the `comment?` clause recurs with `(= ch "\n")`, ending comment
 state after one character — brackets in comments miscount, so `(+ 1 2) ; oops
 )` hangs the terminal repl. Filed as **BUG-087, fixed, and pinned by
 test/bl/repl_test.bl (19 assertions green)**.
+
+**Docs are split-brained (found by the hints pane)** — runtime meta only
+covers user-defined vars (`doc_string` on a session defn works); boot/stdlib
+fns like `core/map` have NO runtime doc or arglist metadata (`ns_defs` knows
+them not). The doc truth for stdlib lives in the SOURCE files — `bl.doc`
+already parses `.bl`/`.bl.md` cells (`declared-ns`, `cells`, `slice-doc`).
+Phase 2's index must merge both: runtime meta for the session, source-derived
+docs (bl.doc machinery) for stdlib. Also: var-EXISTENCE checks must use
+`Env/member?({ns name})`, not meta presence — a var without docs is still a
+var, and meta-based probing misroutes resolution.
 
 **wry (U6)** — `examples/wry_hello.bl` opens a WebKitGTK window on this
 Wayland session, `wry/eval` mutates the live page, clean close. The desktop
@@ -112,9 +127,14 @@ shell for the final REPL is a thin page-load, no Electron.
 - `serve.bl` — the spike server: sessions in ETS, eval workers + monitor
   runners, text group-leader proxy (vm.io's protocol minus ETF), completion /
   doc / bench / balanced ops, web.bl WS + HTTP
-- `page.html` — CM6 UI: dropdown completion w/ docs, highlighting, Enter =
-  eval when balanced (JS port of the scanner), Shift+Enter newline, history
-  (localStorage), interrupt button, bench button, parity self-check
+- `page.html` — CM6 UI, console-style: the prompt is an inline `user=>`
+  transcript line (not a bottom editor pane); Tab opens the completion
+  dropdown (`activateOnTyping:false`); a fixed hints pane below shows the
+  selected completion's arglists+doc live, or the doc of the symbol before
+  the cursor when idle (350ms debounce, server-side `auto` resolution:
+  session ns → core → refer source → global scan); Enter = eval when
+  balanced (JS port of the scanner), Shift+Enter newline, Ctrl+↑/↓ history
+  (localStorage), interrupt + bench buttons, parity self-check badge
 - `probe.mjs` / `probe2.mjs` — scripted verification (no browser needed)
 - `vendor/editor.bundle.js` — the CM6 bundle (395 KB, esbuild, reproducible)
 - `shot-completion.png`, `shot-eval.png`, `shot-eval2.png` — visual evidence
