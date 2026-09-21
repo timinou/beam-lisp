@@ -1,0 +1,103 @@
+#+TITLE: datom world-class reads: semi-join, columnar decode, pull-many, plan/rule cache, vector lane, fjall config, N+1 lint
+#+STATE: ITEM
+#+SESSION_ID: 158846149623eea3
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-products-knowledger/2026-09-21T12-13-49-528Z_158846149623eea3.jsonl]]
+#+CUSTOM_ID: PLAN-138-datom-world-class-reads-semi-join-column
+
+* Initial Message
+
+ok your goal is very simple: i want you to look at the query history of the knowledger instance for clients/filali, and tell me where you see clear improvements to the indexing, the caching, hte query optimiser, or anything else so that it doesn't feel so slow. I am SURE the implementation in beam-lisp (~/code/ora/beam-lisp) can be improved. You are responsible for this; you can get a newer version of beam-lisp (v2026.4) and do a deep, deep investigation of the code and the native datom stores, and how knowledger uses them, and give me a list of all the issues and opportunities we have to make this datim implementaiton world-class in terms of speed and efficiency
+
+* Motive
+Measured on knowledger's Cabinet Filali stores (sources-legales: 64 708 chunks, 1.1 GB fjall;
+dossier-mci: 2 010 chunks). Report: knowledger/docs/15-datom-performance-audit.md.
+The store/index layer is sound (point read 0–1 ms, AVET prefix 4 ms, tx commit 0.2 ms).
+Everything slow is ABOVE the store, in the engine, the read funnel, pull, and the vector column.
+
+| symptom | measured | cause |
+|---|---|---|
+| 3-clause join [?c :chunk/src X][?c :chunk/order ?o][?c :chunk/text ?t] (1 760 rows) | 4.1–6.4 s | engine.bl pattern-scan-once bounds by `common` → full :aevt column scans ×2 |
+| same join by hand (avet + per-entity eavt) | 0.77 s | — |
+| raw native :aevt :chunk/text scan (64 708) | 0.3 s | fine |
+| db/datoms over the same | 1.6–2.8 s | filter-datoms builds [e a v]→tx map over 0 retractions |
+| q [:find ?t :where [?c :chunk/text ?t]] | 10–11 s | per-row vector + binding map + set |
+| [(includes? ?t "Apple")] | 4.6–4.9 s | post-filter after full materialisation |
+| raw :aevt :chunk/embedding scan | 1.03 s, 506 MiB re-read per scan | ETF ESC lane, 62 396 binary_to_term, 2× written (EAVT+AEVT) |
+| corpus/column assemble | 5.3 s | same |
+| HNSW cold build 64 708 vectors | 178 s | hnsw_rs single-thread insert; no persistence |
+| resident build / search | 2.1 s / 12 ms | ✓ the right default |
+| transact! 1 entity | 4–6 ms (raw -commit 0.2 ms) | BEAM pipeline store reads per op |
+| fjall block cache | column scans never hit (35–506 MiB rchar per scan) | 32 MiB default shared by all keyspaces |
+
+* Principles (beam-lisp maximalist)
+- Remove the CLASS, not the instance: every fix lands as (a) a tier change, (b) a counting-store
+  test in test/bl/datom/cost_test.bl asserting store-op COUNTS (never timings), (c) a
+  `bl lint` smell or `bl ask` question that detects the pattern in application code.
+- One read funnel: store-fjall `:columns` mode is the only decode path; `:datoms` stays for ETS parity.
+- Caches are basis-discriminated (corpus.bl discipline) — never a bare Agent.
+- No parallel implementations: `pull-many` replaces the mapv; `q` gains `:limit`, apps stop sorting.
+
+* Waves
+** W1 — join engine: semi-join by cardinality  (engine.bl pattern-scan-once)
+When the join variable is bound in EVERY row (values differ), choose:
+  |distinct(join vals)| ≤ K (default 4 096) → per-value prefix reads via ONE store call
+  (new Store capability `MultiScan`: `-scan-prefixes [store prefixes]` → fjall NIF
+  `fjall_resolve_prefixes`; ETS impl = mapcat of ranges) else column scan + hash join (today).
+Tests: cost_test — `a-bound-join-over-N-entities-reads-N-prefixes-in-ONE-store-op`,
+`a-join-wider-than-the-column-falls-back-to-one-column-scan`; conformance unchanged.
+Explain: plan-trace reports :multi-prefix so `datom/explain` shows the choice.
+
+** W2 — columnar read funnel + skip-filter + pushdown  (store-fjall.bl, db.bl, engine.bl, lib.rs)
+- `-scan-datoms` takes a `need` mask `#{:e :a :v :tx :op}` and an optional native predicate
+  `{:v-includes "…"}` / `{:v-in #{…}}`; requests `:columns`; materialises only surviving rows.
+- NIF returns per-chunk `has-retractions?`; `filter-datoms` skips the retraction map when
+  every chunk is assertion-only and no since/valid bound (`current?` fast path).
+- `:limit` for non-aggregate finds stops the fold; `(count ?x)` over a single pattern →
+  native count mode (no terms).
+- adaptive chunk: 512 → ×4 up to 16 384 while chunks come back full.
+Tests: cost_test counts NIF crossings (`a-full-column-read-is-⌈n/chunk⌉-crossings`), a
+`:limit` test in query_test, includes?-pushdown parity test (same rows as post-filter).
+
+** W3 — pull-many + plan/rule memo  (pull.bl, engine.bl, rules.bl, analytic.bl)
+- `pull` = ONE eavt prefix read per entity, grouped by attr; `pull-many` = one MultiScan.
+  cost_test: `pull-costs-ONE-range-per-entity` (replaces per-attribute), `pull-many-is-ONE-op`.
+- parsed+planned query memo keyed by query value (bounded persistent map, 1 024 entries).
+- rules memo: (store, rules-fingerprint, basis-t, filter-mode, since-t) → relations; only rules
+  reachable from the :where invocation set are materialised.
+- `ensure-registered!` guarded by an atom flag (no Agent hop on the hot path).
+
+** W4 — vector lane + fjall config  (value-codec.bl, index.bl, lib.rs, store-fjall.bl)
+- `LANE-VECTOR`: packed f32 with dim header; native decode → one refc binary, zero per-row terms.
+- `:db.type/vector` attrs are NOT written to AEVT by value; the corpus assembles from an
+  EAVT-keyed native reader (`fjall_resolve_column attr → [ids body]`), one crossing.
+- fjall open options from store opts / env: `cache-mb` (default max(64, min(1024, store/8)),
+  ONE shared cache per process), 32 KiB blocks, one partition per index tag, `fsync` policy
+  explicit (`:journal` default = today; `:tx` = SyncAll per commit; measured +2–3 ms/tx on btrfs).
+- store migration: `datom.migrate` step re-encoding vector values (dry-run via `with`).
+Tests: value_codec roundtrip for the new lane, corpus_cache_test peak-memory bound, migrate test.
+
+** W5 — HNSW: parallel build + persistence  (hnsw.rs, relations.bl)
+- `parallel_insert` (rayon) + `file_dump`/`load` beside the store (`<path>.hnsw/<attr>`),
+  reconciled by cursor as today. Cold boot = load + catch-up, not 178 s.
+Tests: hnsw_relation_test build-from-file parity.
+
+** W6 — detect the class: `bl lint` N+1 smells + `bl ask nplus1`
+- deodorant advisory smells (`datalog/`):
+  `pull-in-loop`: (map/mapv/for/doseq/reduce … (datom/pull …)) → "use pull-many".
+  `q-in-loop`: a `datom/q` inside a per-row fn → "bind the rows with :in [?ids …]".
+  `sort-then-take`: (take n (drop m (sort …))) over a query result → ":limit/:offset".
+  `column-scan-in-render`: a pattern with only the attribute bound inside a fn whose name
+  matches screen/render/view → "attribute-page or memo by basis".
+- `bl ask nplus1 PATH…`: codebase facts + :~reaches — every fn reachable from a `defscreen`/
+  handler that reaches `datom/pull` or `datom/q` through a `map`/`for` frame. Uses the
+  existing call-facts DB; adds `:call/in-loop?` (walk-calls-at records the enclosing
+  iteration head) so the question is pure datalog: [?c :call/callee "datom/pull"]
+  [?c :call/in-loop? true] [?c :call/caller ?f] [?screen :~reaches ?f].
+Tests: deodorant_test fixtures for each smell; bl_ask_test for nplus1 on a fixture file.
+
+* Acceptance (all measured on the filali copies, tmp-perf/bench*.bl in knowledger)
+- join 4–6 s → < 0.3 s; full-column q 10 s → < 1 s; includes? 4.7 s → < 0.5 s
+- /queries render store ops: 15 000 → < 300; /locations: 5 300 → < 5
+- corpus assemble 5.3 s → < 0.5 s; embedding column on disk −50 %
+- `bl lint --tier every apps/` on knowledger reports the N+1 sites the audit found (§5.3–5.5)
+- cost_test green with the new COUNT contracts; conformance_test unchanged.
