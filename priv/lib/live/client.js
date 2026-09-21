@@ -541,6 +541,20 @@
       }
     });
 
+    // Escape is a DOCUMENT-level gesture, unlike Enter: when it is pressed
+    // nothing in particular has focus, so an element that declares
+    // `data-ev-keydown.escape` is found from the document. This is what lets a
+    // dialog close without a pointer (loom.parts/drawer puts the attribute on
+    // its ✕ and on the layer). Without it an escape was only ever a click.
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      var el = closestAttrPrefix(e.target, "data-ev-keydown.escape") ||
+               document.querySelector("[data-ev-keydown\\.escape]");
+      if (!el) return;
+      e.preventDefault();
+      relay(el, "data-ev-keydown.escape", ws, {});
+    });
+
     // Back/Forward: the browser restored a previous URL, so tell the server to
     // re-route to it (a plain navigate event → the dispatcher re-projects).
     // No pushState here — the history entry already moved; we only sync state.
