@@ -75,6 +75,19 @@
   (-update [s k f] (bump :update) (datom.store/-update (:inner s) k f))
   (-commit [s ops] (bump :commit) (datom.store/-commit (:inner s) ops)))
 
+;; A multi-prefix read is ONE request — that is its whole point — so it
+;; counts as one `:range`, and the rows it returns are counted like any
+;; other scan's. Without this the decorator hides the capability and the
+;; engine takes the column path, which is exactly what the semi-join tests
+;; would then fail to see.
+(extend-protocol datom.store/MultiScan
+  CountingStore
+  (-scan-prefixes [s bounds]
+    (bump :range)
+    (let [result (datom.store/scan-prefixes (:inner s) bounds)]
+      (swap! ROWS (fn [n] (+ n (count result))))
+      result)))
+
 (defn- ranges [] (or (get (deref COUNTER) :range) 0))
 
 (defn- nums
@@ -300,3 +313,88 @@
     (is (= (set [[96] [97] [98] [99]])
            (datom.query.engine/q '[:find ?a :where [?e :r/plain ?a] [(> ?a 95)]]
                                  (datom.conn/db c))))))
+
+;; ── semi-join: a bound join reads the ROWS it joins, not the column ─
+;;
+;; The constant-ranges contract above says a join is O(1) in store REQUESTS.
+;; It said nothing about how many datoms came back — and `pattern-scan-once`
+;; bounded its single scan only by what was common to EVERY binding row.
+;; Once the join variable took a different value per row (one entity per
+;; chunk), nothing was common, the scan fell to the whole AEVT column, and
+;; a 1 760-row join over a 64 708-row column read 129 416 datoms to keep
+;; 3 520 (measured on knowledger's sources-legales: 4–6 s where the same
+;; join done by hand took 0.8 s).
+;;
+;; The fix keeps the request count constant AND makes the rows read follow
+;; the ANSWER: when every row binds the join variable, the clause is read
+;; as ONE multi-prefix scan over the distinct join values (`MultiScan`), so
+;; the store hands back only the datoms of the entities being joined.
+
+(defn- selective-fixture
+  "`n` chunks over 2 sources: `n/2` per source, each chunk with an order
+   and a text. `:c/src` is a ref (AVET+VAET), the others plain columns."
+  [n]
+  (let [c (datom.conn/connect-with
+            (->CountingStore (datom.store-ets/open))
+            [{:db/ident :c/src :db/valueType :db.type/ref :db/index true}
+             {:db/ident :c/order :db/valueType :db.type/long}
+             {:db/ident :c/text :db/valueType :db.type/string}
+             {:db/ident :s/name :db/valueType :db.type/string}])
+        r (datom.conn/transact! c [{:db/id -1 :s/name "a"} {:db/id -2 :s/name "b"}])
+        a (get (:tempids r) -1) b (get (:tempids r) -2)]
+    (datom.conn/transact!
+      c (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                       :c/src (if (even? i) a b)
+                       :c/order i
+                       :c/text (str "t" i)})
+              (nums n)))
+    [c a]))
+
+(def CHUNK-JOIN
+  '[:find ?o ?t :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o] [?c :c/text ?t]])
+
+(deftest a-bound-join-reads-the-rows-it-joins-not-the-column
+  ; 100 chunks, 50 per source. The join for one source must read ~50
+  ; orders and ~50 texts, not 100 of each. Requests stay constant.
+  (let [[c a] (selective-fixture 100)
+        rows (datoms-read c (fn [db] (datom.query.engine/q CHUNK-JOIN db a)))
+        reqs (ranges)]
+    (is (= 50 (count (datom.query.engine/q CHUNK-JOIN (datom.conn/db c) a))))
+    ; 50 src datoms + 50 orders + 50 texts = 150; the column scan read 250.
+    (is (<= rows 160) (str "reads the joined entities' datoms only (" rows " datoms)"))
+    (is (<= reqs 4) (str "and still a constant number of store requests (" reqs ")"))))
+
+(deftest a-bound-join-cost-follows-the-answer-not-the-database
+  ; Doubling the database while the answer stays the same size must not
+  ; change what the store hands back.
+  (let [[c1 a1] (selective-fixture 40)
+        [c2 a2] (selective-fixture 400)
+        small (datoms-read c1 (fn [db] (datom.query.engine/q
+                                         '[:find ?o :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o]] db a1)))
+        large (datoms-read c2 (fn [db] (datom.query.engine/q
+                                         '[:find ?o :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o]] db a2)))]
+    ; 20 vs 200 answers: the rows read scale with the ANSWER (×10), never
+    ; with the database beyond it.
+    (is (< large (* 12 small)) (str small " datoms at N=40, " large " at N=400"))))
+
+(deftest a-semi-join-does-not-change-the-ANSWER
+  (let [[c a] (selective-fixture 60)
+        db (datom.conn/db c)
+        semi (datom.query.engine/q CHUNK-JOIN db a)
+        ; the same question, forced through the column path: no bound row set
+        column (set (filterv (fn [r] (some? r))
+                       (mapv (fn [r] (if (= a (get r 2)) [(get r 0) (get r 1)] nil))
+                             (datom.query.engine/q '[:find ?o ?t ?s :where [?c :c/src ?s] [?c :c/order ?o] [?c :c/text ?t]] db))))]
+    (is (= semi column))
+    (is (= 30 (count semi)))))
+
+(deftest a-join-wider-than-its-column-falls-back-to-one-column-scan
+  ; The bound-row set can be LARGER than what a column scan would return
+  ; (every entity bound, say). Then one column scan is the cheaper read,
+  ; and the engine must still issue exactly one request.
+  (let [[c a] (selective-fixture 40)
+        db (datom.conn/db c)]
+    (reset! COUNTER {})
+    (datom.query.engine/q '[:find ?o ?t :where [?c :c/order ?o] [?c :c/text ?t]] db)
+    (is (<= (ranges) 2))))
+

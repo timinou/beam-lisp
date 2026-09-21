@@ -36,7 +36,7 @@
 ; Recorded rather than pretended away.
 
 (ns datom.query.engine
-  (:require [datom.db] [datom.index] [datom.query.agg] [datom.query.parse]
+  (:require [datom.db] [datom.index] [datom.store] [datom.query.agg] [datom.query.parse]
             [datom.query.plan] [datom.schema] [datom.query.analytic]
             [datom.query.rules]))
 
@@ -495,9 +495,59 @@
                              (if (nil? high) nil (get high 0)))
       (apply datom.db/datoms db index components))))
 
+(def SEMI-JOIN-MAX
+  "The most distinct join values a semi-join reads by prefix before the
+   engine prefers one column scan. Above this the prefix list itself is the
+   cost — and a column with fewer rows than bound entities is the cheaper
+   read. Deliberately a constant, not a statistic: predictable beats clever
+   here, exactly as `clause-cost` argues."
+  4096)
+
+(defn- semi-join-selection
+  "How to read `clause` for a join variable at `position` that is bound in
+   every row: `[index component-vectors]` — one prefix per distinct bound
+   value — or nil when no index prefix-scans on that position.
+
+   The shapes, by which position the join variable occupies:
+     entity (0)   → EAVT [e] or [e a] when the attribute is a constant
+     value  (2)   → AVET [a v] when the attribute is constant and indexed;
+                    VAET [v] when the attribute is unbound and every value
+                    is an entity id (a ref)
+   An attribute-position join (`[?e ?a _]` over bound `?a`) has no prefix
+   index and falls back to the column path."
+  [schema common terms position values]
+  (let [a (get terms 1)
+        a-const? (and (not (datom.query.parse/variable? a))
+                      (not (datom.query.parse/blank? a)))
+        a-bound (cond a-const? a
+                      (datom.query.parse/variable? a) (get common a)
+                      :else nil)]
+    (cond
+      (= position 0)
+        (if (some? a-bound)
+          [:eavt (mapv (fn [v] [v a-bound]) values)]
+          [:eavt (mapv (fn [v] [v]) values)])
+      (= position 2)
+        (cond
+          (and (some? a-bound) (datom.schema/indexed? schema a-bound))
+            [:avet (mapv (fn [v] [a-bound v]) values)]
+          (and (nil? a-bound) (every? int? values))
+            [:vaet (mapv (fn [v] [v]) values)]
+          :else nil)
+      :else nil)))
+
 (defn- pattern-scan-once
   "Every extension of EVERY binding in `bindings` under `clause`, using a
    SINGLE store scan.
+
+   Two shapes of that single scan. When the join variable is bound in EVERY
+   row — to different values, one entity per row — the clause is read as a
+   SEMI-JOIN: one multi-prefix request over the distinct bound values, so
+   the store hands back only the datoms of the rows being joined. Otherwise
+   the clause is scanned once, bounded by what is common to every row, and
+   hash-joined in memory. Same answer either way; the semi-join is what
+   makes a 1 760-row join over a 64 708-row column read 3 520 datoms
+   instead of 129 416.
 
    The nested-loop form asked the store once per binding row, so a
    two-clause join over N entities issued N+1 range reads \u2014 measured
@@ -529,17 +579,40 @@
                                    (into [] (keys acc)))))
                        nil
                        bindings)
-        selection (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause)
-        index (get selection 0)
-        components (get selection 1)
-        candidates (range-scan-or-full db index components clause remaining common)
         terms (datom.query.plan/pattern-terms clause)
         ; The variable this clause SHARES with the rows already bound.
         ; It is the join key, and indexing candidates by it turns the
         ; match from a scan into a lookup.
         join-var (first (filterv (fn [v] (and (datom.query.parse/variable? v)
                                               (contains? (first bindings) v)))
-                                 terms))]
+                                 terms))
+        join-position (if (nil? join-var)
+                        nil
+                        (loop [i 0]
+                          (if (>= i (count terms))
+                            nil
+                            (if (= (get terms i) join-var) i (recur (+ i 1))))))
+        ; The semi-join read: the join variable bound in EVERY row, to values
+        ; the common bound does not already pin, few enough to list.
+        join-values (if (and (some? join-var)
+                             (not (contains? (or common {}) join-var))
+                             (every? (fn [b] (contains? b join-var)) bindings))
+                      (into [] (distinct (mapv (fn [b] (get b join-var)) bindings)))
+                      nil)
+        semi (if (and (some? join-values)
+                      (<= (count join-values) SEMI-JOIN-MAX)
+                      ; only a store that answers N prefixes in ONE request:
+                      ; anything else would be the N+1 shape in disguise.
+                      (datom.store/multi-scan? (datom.db/store-of db)))
+               (semi-join-selection (datom.db/schema-of db) (or common {})
+                                    terms join-position join-values)
+               nil)
+        candidates (if (some? semi)
+                     (datom.db/datoms-many db (get semi 0) (get semi 1))
+                     (let [selection (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause)
+                           index (get selection 0)
+                           components (get selection 1)]
+                       (range-scan-or-full db index components clause remaining common)))]
     (if (nil? join-var)
       ; Nothing shared: this is a cartesian product, and every candidate
       ; must be tried against every row. Rare, and inherently quadratic
@@ -557,10 +630,7 @@
       ; failed. Reducing the store operations to a constant had made the
       ; I/O honest while leaving the CPU quadratic, which is why a join
       ; that reads 2 ranges still took 5 seconds.
-      (let [position (loop [i 0]
-                       (if (>= i (count terms))
-                         nil
-                         (if (= (get terms i) join-var) i (recur (+ i 1)))))
+      (let [position join-position
             value-at (fn [d]
                        (cond (= position 0) (datom.index/-e d)
                              (= position 1) (datom.index/-a d)
