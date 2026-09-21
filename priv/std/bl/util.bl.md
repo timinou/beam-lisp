@@ -264,16 +264,57 @@ rather than the Elixir delegate because it is what a trimmed release always
 carries.
 
 ```beam-lisp
-(defn version
-  "The beam-lisp version string, or \"0.0.0-dev\" outside a started application."
+(defn- as-vsn-string
+  "A `.app` `:vsn` value (a charlist or binary) as a binary, or nil."
+  [vsn]
+  (cond (erlang/is_binary vsn) vsn
+        (erlang/is_list vsn) (erlang/list_to_binary vsn)
+        :else nil))
+
+(defn- version-from-app-file
+  "The `:vsn` read directly from the `beam_lisp.app` the code path resolves, or
+   nil when there is none. The fallback for `version` when the app is present on
+   disk but its spec is not loaded — the `.app` is authoritative and needs no
+   running application. `:file.consult` answers `{:ok, [{:application, name,
+   props}]}`; `props` is a proplist, so the `:vsn` value is the second element of
+   its `{:vsn, V}` tuple."
   []
-  (let [r (application/get_key :beam_lisp :vsn)]
-    (if (= :undefined r)
-      "0.0.0-dev"
-      (let [[tag vsn] r]
-        (if (= :ok tag)
-          (if (string? vsn) vsn (erlang/list_to_binary vsn))
-          "0.0.0-dev")))))
+  (let [dir (erlang/apply :code :lib_dir (list :beam_lisp))]
+    (when (erlang/is_list dir)
+      (let [app-file (Path/join (Path/join (erlang/list_to_binary dir) "ebin")
+                                "beam_lisp.app")]
+        (when (File/exists? app-file)
+          (try
+            (let [res (erlang/apply :file :consult
+                                    (list (erlang/binary_to_list app-file)))]
+              (when (and (tuple? res) (= :ok (erlang/element 1 res)))
+                (let [forms (erlang/element 2 res)
+                      app (first forms)                 ; {:application name props}
+                      props (erlang/element 3 app)
+                      pair (first (filter (fn [t] (and (tuple? t)
+                                                       (= :vsn (erlang/element 1 t))))
+                                          props))]
+                  (when (some? pair) (as-vsn-string (erlang/element 2 pair))))))
+            (catch _ nil)))))))
+
+(defn version
+  "The beam-lisp version string, or \"0.0.0-dev\" when no app resource can answer.
+
+   `bl version` runs on the coldest path there is — `BL_DAEMON=off`, in a drop, so
+   the `:beam_lisp` application is often only present as a `.app` on disk and has
+   not been STARTED. `application/get_key` answers `:undefined` for an app that is
+   merely loadable, which is exactly the drop case that reported `0.0.0-dev` while
+   the packaged `.app` carried the real version. So load the app first (idempotent,
+   no supervisor), and if the spec still cannot answer, read the version straight
+   off the `.app` the code path resolves — the same fact `build.release/vsn-of`
+   reads. Only a genuine source checkout with no app resource at all falls through
+   to the dev sentinel."
+  []
+  (do (try (application/load :beam_lisp) (catch _ nil))
+      (let [r (application/get_key :beam_lisp :vsn)]
+        (if (and (tuple? r) (= :ok (erlang/element 1 r)))
+          (or (as-vsn-string (erlang/element 2 r)) "0.0.0-dev")
+          (or (version-from-app-file) "0.0.0-dev")))))
 ```
 
 ## Library roots and code paths
