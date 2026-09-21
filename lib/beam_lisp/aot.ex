@@ -1000,7 +1000,7 @@ defmodule BeamLisp.AOT do
   `priv/std/reload.bl` describes the same read as "the gate's own read".
   """
   def beam_provenance(mod) do
-    if function_exported?(mod, :__bl_provenance__, 0) do
+    if Code.ensure_loaded?(mod) and function_exported?(mod, :__bl_provenance__, 0) do
       case mod.__bl_provenance__() do
         {nil, _} -> nil
         {_, _} = prov -> prov

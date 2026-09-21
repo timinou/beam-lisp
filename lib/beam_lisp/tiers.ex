@@ -88,7 +88,11 @@ defmodule BeamLisp.Tiers do
   the AOT drift gate asks on every load, and the tier's membership is a
   constant of the checkout.
   """
-  def boot_namespaces, do: tier_namespaces(:boot)
+  def boot_namespaces do
+    # data-readers.bl executes registrations into core at boot; it declares no
+    # namespace and therefore cannot have a namespace BEAM/provenance stamp.
+    Enum.reject(tier_namespaces(:boot), &(&1 == "data-readers"))
+  end
 
   @doc "Namespaces of the build tier — file basenames under `priv/build/`. Memoised."
   def build_namespaces, do: tier_namespaces(:build)
