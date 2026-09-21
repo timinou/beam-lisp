@@ -507,6 +507,61 @@ fn json_decode<'a>(env: Env<'a>, data: Binary<'a>, keys: Atom) -> NifResult<Term
     })
 }
 
+// ── the isolation instrument ─────────────────────────────────────────────────
+//
+// PARSE ONLY: walk the document and return how many JSON values it held, building NO
+// Erlang terms at all. It exists to answer one question with a number instead of an
+// argument — how much of a decode is the PARSE, and how much is carrying values across the
+// Rust/BEAM boundary?
+//
+// Every control measurable from `bench/json.bl` (OTP, Jason, `binary_to_term`) compares a
+// DIFFERENT implementation, which is how three wrong explanations for the decode gap
+// survived as long as they did. This one holds the parser, the visitor machinery and the
+// input constant, and varies the ONLY thing in question — so `json-count` and `json-decode`
+// on the same bytes, in the same build, bracket the boundary cost exactly.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn json_count(data: Binary) -> NifResult<u64> {
+    struct S;
+    impl<'de> DeserializeSeed<'de> for S {
+        type Value = u64;
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<u64, D::Error> {
+            d.deserialize_any(V)
+        }
+    }
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = u64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<u64, E> { Ok(1) }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<u64, E> { Ok(1) }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<u64, E> { Ok(1) }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<u64, E> { Ok(1) }
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<u64, E> { Ok(1) }
+        fn visit_unit<E: de::Error>(self) -> Result<u64, E> { Ok(1) }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<u64, A::Error> {
+            let mut n = 1;
+            while let Some(c) = s.next_element_seed(S)? { n += c; }
+            Ok(n)
+        }
+        // A number still arrives as a one-entry map under `arbitrary_precision`, so it
+        // counts 2 here and 1 in `json-decode`'s terms. Irrelevant to timing; noted so the
+        // count is not mistaken for a term count.
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<u64, A::Error> {
+            let mut n = 1;
+            while let Some(_k) = m.next_key::<String>()? {
+                n += m.next_value_seed(S)?;
+            }
+            Ok(n)
+        }
+    }
+    let mut d = serde_json::Deserializer::from_slice(data.as_slice());
+    let n = S.deserialize(&mut d).map_err(|e| err(format!("{e}")))?;
+    d.end().map_err(|e| err(format!("{e}")))?;
+    Ok(n)
+}
+
 // ── the rustler contract ────────────────────────────────────────────────────
 //
 // This string must equal `vm.native/host-module` for the declaring ns — here
