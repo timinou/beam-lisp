@@ -28,7 +28,7 @@
               :title "Reachability: bind the target"
               :text "An impact/reachable answer is only honest when the target is bound via :in. A free variable inside (reaches ?who ?name) means \"reaches SOMETHING\" — every caller in the graph, not the callees of a named fn. code/ask binds the target for you; raw code/query with the % rules must bind it itself. This discipline lives here, in the namespace that owns the rules, and reaches your prompt because the indexer reads this annotation as a fact."}}
   codebase
-  (:require [typed] [datom] [compiler] [datom.query.relation]
+  (:require [typed] [datom] [compiler] [datom.query.relation] [datalog-shape :as shape]
            [datom.store-fjall] [datom.conn] [source-graph :as sg]
            [vm.paths :as paths]))
 
@@ -50,6 +50,11 @@
    {:db/ident :call/callee    :db/valueType :db.type/string :db/index true}
    {:db/ident :call/arity     :db/valueType :db.type/long}
    {:db/ident :call/line      :db/valueType :db.type/long}
+   ;; how many PER-ELEMENT loops (map/mapv/for/doseq/reduce/… — LOOP-HEADS)
+   ;; enclose the call site, within its defn. 0 = straight-line. A store read
+   ;; with depth ≥ 1 is one request per row of the enclosing collection: the
+   ;; N+1 class, answered by `bl ask nplus1` as a query over these facts.
+   {:db/ident :call/loop-depth :db/valueType :db.type/long :db/index true}
    ;; require edges (the namespace graph as facts): one entity per edge, so a
    ;; cycle in the static `:require` graph is a QUERY over the same store —
    ;; answered by sg/cycles (require-cycles below), never by loading a
@@ -80,6 +85,15 @@
   "Interop or alias-qualified callees (contain a /) resolve elsewhere."
   [s]
   (some? (index-of s "/")))
+
+(def FACTS-VERSION
+  "The version of the fact SCHEMA these indexers emit. Part of every cache
+   key beside the source hash: a source that has not changed still needs
+   re-reading when the facts it yields have gained a column."
+  "facts-2")
+
+(def LOOP-HEADS shape/LOOP-HEADS)
+(def STORE-READ-NAMES shape/STORE-READ-NAMES)
 
 (def special-heads
   #{"ns" "def" "fn" "if" "do" "quote" "syntax-quote" "let" "loop" "recur"
@@ -199,39 +213,70 @@
   [caller ns-str node acc next-id]
   (walk-calls-at caller ns-str node acc next-id nil))
 
-(defn walk-calls-at [caller ns-str node acc next-id hint]
+(defn walk-calls-at
+  ([caller ns-str node acc next-id hint]
+   (walk-calls-at caller ns-str node acc next-id hint 0))
+  ([caller ns-str node acc next-id hint depth]
+  ; `depth` counts the per-element loops (LOOP-HEADS) enclosing `node`:
+  ; the FUNCTION argument of the `map` family and the BODY of `for`/`doseq`
+  ; are walked one level deeper; a loop's collection argument is not.
   (let [tag (node-tag node)]
     (cond
       (= tag :meta)
         (walk-calls-at caller ns-str (second (erlang/tuple_to_list node))
-                       acc next-id (node-pos node))
+                       acc next-id (node-pos node) depth)
 
       (contains? #{:vector :set} tag)
-        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint))
+        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
                 [acc next-id] (node-items node))
 
       (= tag :map)
         (reduce (fn [[a i] pair]
                   (let [[a2 i2] (walk-calls-at caller ns-str
-                                            (first (erlang/tuple_to_list pair)) a i hint)]
+                                            (first (erlang/tuple_to_list pair)) a i hint depth)]
                     (walk-calls-at caller ns-str
-                                (second (erlang/tuple_to_list pair)) a2 i2 hint)))
+                                (second (erlang/tuple_to_list pair)) a2 i2 hint depth)))
                 [acc next-id] (node-items node))
 
       (= tag :list)
         (let [items (node-items node)
               head  (node-form (first items))]
           (if (not (= :symbol (node-tag head)))
-            (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint))
+            (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
                     [acc next-id] items)
             (let [hname (node-name head)
+                  loop? (contains? LOOP-HEADS hname)
+                  ; Which arguments run per element. `for`/`doseq`: the BODY
+                  ; (everything after the binding vector). The `map` family:
+                  ; the FUNCTION (first arg) — the collection argument is
+                  ; evaluated ONCE, so a read there is not an N+1.
+                  per-element? (fn [k]
+                                 (cond
+                                   (not loop?) false
+                                   (contains? #{"for" "doseq"} hname) (>= k 1)
+                                   :else (= k 0)))
                   rec-children (fn [a i]
-                                 (reduce (fn [[a2 i2] sub]
-                                           (walk-calls-at caller ns-str sub a2 i2 hint))
-                                         [a i] (rest items)))]
+                                 (reduce (fn [[a2 i2] [k sub]]
+                                           (walk-calls-at caller ns-str sub a2 i2 hint
+                                                          (if (per-element? k) (+ depth 1) depth)))
+                                         [a i] (map-indexed (fn [k x] [k x]) (rest items))))]
               (cond
-                (contains? special-heads hname)
-                  (rec-children acc next-id)
+                ; a loop head is walked as WRITTEN, never through its
+                ; macro expansion: the expansion of `for` is where the
+                ; per-element shape lives, and the depth must be assigned
+                ; on the surface form the author reads.
+                (or (contains? special-heads hname) loop?)
+                  (if loop?
+                    (let [p (node-pos node)
+                          line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                          fact {:db/id next-id
+                                :call/caller caller
+                                :call/callee hname
+                                :call/arity (count (rest items))
+                                :call/line line
+                                :call/loop-depth depth}]
+                      (rec-children (conj acc fact) (+ next-id 1)))
+                    (rec-children acc next-id))
 
                 ; unknown head: macro? expand once, walk the expansion —
                 ; the call graph sees through threading. Not a macro:
@@ -240,16 +285,17 @@
                   (let [orig   (typed/->tuple [:list items])
                         grew?  (compiler/macroexpand-1 orig ns-str)]
                     (if (not (identical? grew? orig))
-                      (walk-calls-at caller ns-str grew? acc next-id hint)
+                      (walk-calls-at caller ns-str grew? acc next-id hint depth)
                       (let [p (node-pos node)
                             line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
                             fact {:db/id next-id
                                   :call/caller caller
                                   :call/callee hname
                                   :call/arity (count (rest items))
-                                  :call/line line}]
+                                  :call/line line
+                                  :call/loop-depth depth}]
                         (rec-children (conj acc fact) (+ next-id 1)))))))))
-      :else [acc next-id])))
+      :else [acc next-id]))))
 
 ; --- defn extraction ------------------------------------------------------------
 
@@ -795,6 +841,27 @@
                     (update :variadic (fn [s] (if variadic (conj s name) s))))))
             {:arities {} :variadic #{}}
             rows)))
+
+(defn nplus1
+  "Store reads issued from inside a per-element loop: `[caller callee line depth]`,
+   sorted by caller then line.
+
+   The N+1 CLASS as a question over facts: every `:call/*` row whose callee
+   is a datom read and whose `:call/loop-depth` is ≥ 1 is one store request
+   per row of the enclosing collection. deodorant's `datalog/n+1-read` smell
+   reports the same sites file by file at lint time; this is the whole-corpus
+   view, answerable from the indexed store in milliseconds."
+  [db]
+  (sort (into []
+    (filter (fn [row] (contains? STORE-READ-NAMES (shape/callee-name (nth (vec row) 1))))
+            (datom/q '[:find ?caller ?callee ?line ?d
+                       :where
+                       [?c :call/loop-depth ?d]
+                       [(>= ?d 1)]
+                       [?c :call/caller ?caller]
+                       [?c :call/callee ?callee]
+                       [?c :call/line ?line]]
+                     db)))))
 
 (defn arity-mismatches
   "Calls whose callee is defined but never at the called arity

@@ -50,7 +50,7 @@
 ; The registry is OPEN: a project declares its house idioms in its own
 ; file with `defsmell`, no library edit.
 (ns deodorant
-  (:require [rewrite] [span-rewrite] [reader-node :as rn]))
+  (:require [rewrite] [span-rewrite] [reader-node :as rn] [datalog-shape :as shape]))
 
 ; --- the registry --------------------------------------------------------
 
@@ -218,6 +218,114 @@
                      (let [smells (BeamLisp.Env/fetch! "datom.explain" "smells")]
                        (not (empty? (smells q nil)))))
                    (catch _ false))))))
+
+; N+1 STORE READS: a store read — `pull`, `q`, `entity`, `datoms` — inside a
+; per-element function of a collection form (`mapv`, `map`, `for`, `doseq`,
+; `reduce`, `filter`, …) is one store request PER ROW. A page of 236 rows
+; pulled that way was 236 × 17 requests (knowledger's /queries screen,
+; measured 3–82 s); the same page is ONE request through `pull-many`, or
+; one query with the ids bound through `:in [?id ...]`.
+;
+; The rule is structural, not lexical: the pattern matches the LOOP HEAD,
+; and the guard walks the body for a read call whose namespace or name is
+; a datom read. That is what makes it a rule about the CLASS (a read per
+; element) rather than about one spelling of it. ADVISORY, because the fix
+; is a restructure — hoist the read above the loop as one batched read —
+; and there is no local rewrite that is always right.
+;
+; What it does NOT flag, on purpose: a read whose subject is the SAME for
+; every element cannot be batched further (it is a memo, not an N+1) — but
+; the rule cannot see that, so a `datom/db` call (O(1), a snapshot) is
+; excluded by name and everything else is reported for a human to judge.
+
+(def STORE-READ-NAMES shape/STORE-READ-NAMES)
+(def LOOP-HEADS shape/LOOP-HEADS)
+
+(defn- head-name
+  "The NAME part of a call head symbol, or nil when the head is not a symbol."
+  [form]
+  (if (and (list? form) (seq form) (symbol? (first form)))
+    (name (first form))
+    nil))
+
+(defn store-read-call?
+  "Whether `form` is a call to a store read: `(datom/pull …)`, `(pull …)`,
+   `(p/q …)`, `(datom.db/datoms …)`. Bare `pull-many`/`q` with the ids
+   bound are the batched shapes — they are reads too, and inside a loop
+   they are still one per element, so they count."
+  [form]
+  (let [n (head-name form)]
+    (and (some? n) (contains? STORE-READ-NAMES n))))
+
+(defn- contains-store-read?
+  "Whether a store read appears ANYWHERE under `form` — a nested `let`,
+   `if`, threading, or a lambda. Descends lists and vectors and maps."
+  [form]
+  (cond
+    (store-read-call? form) true
+    (list? form) (some contains-store-read? (into [] form))
+    (vector? form) (some contains-store-read? form)
+    (map? form) (some contains-store-read? (into [] (vals form)))
+    :else false))
+
+(defn- loop-head?
+  [form]
+  (let [n (head-name form)] (and (some? n) (contains? LOOP-HEADS n))))
+
+(defn- per-element-fn
+  "The per-element function of a loop form: the FIRST argument for the
+   `map`/`reduce` family, the BODY for `for`/`doseq`. nil when the head is
+   not a loop."
+  [form]
+  (let [n (head-name form)
+        args (into [] (rest form))]
+    (cond
+      (nil? n) nil
+      (contains? #{"for" "doseq"} n) (into [] (rest args))       ; [bindings body…] → body
+      (contains? LOOP-HEADS n) (if (seq args) (get args 0) nil)
+      :else nil)))
+
+(defn n+1-read?
+  "THE class: a loop whose per-element function reads the store."
+  [form]
+  (and (loop-head? form)
+       (let [f (per-element-fn form)]
+         (and (some? f)
+              (if (vector? f) (some contains-store-read? f) (contains-store-read? f))
+              ; the per-element fn must be a LAMBDA (or a body) — a bare
+              ; `pull` passed as `(mapv pull ids)` is the same smell, so
+              ; accept a symbol whose name is a read too
+              true))))
+
+(defsmell datalog/n+1-read :idiomatic
+  (?head ?*args) => (?head ?*args)
+  :advisory true
+  :note "A store read (pull / q / entity / datoms) inside a per-element function is one store request PER ROW — the N+1. Hoist it above the loop as ONE batched read: `(datom/pull-many db pattern ids)` for a list of entities, or one `q` with the ids bound through `:in $ [?id ...]`, then join in memory. A read whose subject is identical for every element is a memo, not an N+1 — compute it once outside the loop."
+  :when (fn [b]
+          (let [form (cons (get b '?head) (get b '?*args))]
+            (n+1-read? form))))
+
+; A bare read passed as the mapping function — `(mapv pull ids)` — has no
+; lambda to descend, so the rule above does not see it. Same class, its
+; own spelling.
+(defsmell datalog/n+1-read-bare :idiomatic
+  (?head ?f ?coll) => (?head ?f ?coll)
+  :advisory true
+  :note "A store read passed as the mapping function is one request per element. Use `pull-many` (one request for the whole list) or bind the ids into one query."
+  :when (fn [b]
+          (let [h (get b '?head) f (get b '?f)]
+            (and (symbol? h) (contains? LOOP-HEADS (name h))
+                 (symbol? f) (contains? STORE-READ-NAMES (name f))))))
+
+; FULL SORT BEFORE A PAGE: `(take n (drop m (sort xs)))` (or `lists/sort`)
+; over a query result sorts EVERY row to return a page. On a 62 k-row
+; result that is the whole cost of the call. The bounded shape is a
+; `:limit`/`:offset` on the query, or a sort of the page's keys only.
+(defsmell datalog/sort-then-page :idiomatic
+  (take ?n (drop ?m (?sort ?*rest))) => (take ?n (drop ?m (?sort ?*rest)))
+  :advisory true
+  :note "Sorting the whole result to return a page costs the result, not the page. Page in the store (`:limit`/`:offset` on the query, or `datom/attribute-page`), or sort only the keys of the rows you keep."
+  :when (fn [b] (let [s (get b '?sort)] (and (symbol? s) (contains? #{"sort" "sort-by" "lists/sort"} (str s))))))
 
 ; --- MIGRATION: a form becomes another form, opt-in ----------------------
 ;
