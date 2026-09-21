@@ -372,6 +372,17 @@
     var ws = null;
     var pending = [];
     var reconnectMs = 500;
+    // the latest route the page wants but has not yet put on the wire. A
+    // navigation moves the URL bar SYNCHRONOUSLY (pushState) but the page only
+    // changes when the server receives the navigate event and re-projects
+    // ([:patch] content + [:style] the new route's rules). If the socket is not
+    // OPEN at click/popstate time the frame is dropped, so the URL and the page
+    // diverge — and because a reconnect RESUMES the same server session at its
+    // (now stale) route, the divergence survives the reconnect and only a full
+    // reload recovers. So navigation CONVERGES instead of dropping: the desired
+    // route is remembered here and flushed on (re)open. Last-wins — only the
+    // final route matters, so a newer navigate replaces an older pending one.
+    var pendingNav = null;
 
     // send a raw JSON frame string: straight through when OPEN, buffered while
     // CONNECTING, dropped when there is no socket (the outbox holds the durable
@@ -381,6 +392,20 @@
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(payload);
       else if (ws && ws.readyState === WebSocket.CONNECTING) pending.push(payload);
       // no socket / CLOSED: drop — a durable frame is in the outbox already
+    }
+
+    // send a navigate to `path` now when the socket is OPEN, else remember it as
+    // the latest route to flush on (re)open. Unlike sendFrame's CLOSED-drop, a
+    // navigate is idempotent and last-wins, so it is never dropped: the page
+    // always catches up to the address bar. Used by __navigate (link clicks) and
+    // the popstate handler (Back/Forward).
+    function sendNav(path) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        pendingNav = null;
+        ws.send(JSON.stringify(["event", ["navigate", path], {}]));
+      } else {
+        pendingNav = path;
+      }
     }
 
     function dispatchLive(up) {
@@ -411,6 +436,7 @@
     function openSocket() {
       ws = new WebSocket(sessionUrl(opts.url));
       ws.__send = sendFrame;   // relay() and __navigate use this
+      ws.__sendNav = sendNav;  // relay() uses this for a view-declared :navigate
       // The NAVIGATOR is per-socket too, for the same reason: the click handler
       // below reads `ws.__navigate` off whatever socket is current. Attach it
       // once, outside openSocket, and only the FIRST socket ever gets one — the
@@ -419,7 +445,11 @@
       // never repaints, and nothing on the wire records that a click happened.
       ws.__navigate = function (path) {
         try { history.pushState({ live: path }, "", path); } catch (_e) {}
-        sendFrame(JSON.stringify(["event", ["navigate", path], {}]));
+        // sendNav, NOT sendFrame: a navigate is buffered (last-wins) when the
+        // socket is not OPEN and flushed on (re)open, so the page always
+        // catches up to the URL the pushState just set — never the dropped
+        // frame that left the address bar ahead of a stale page.
+        sendNav(path);
       };
       var sock = ws;           // the heartbeat captures THIS socket — after a
       var beat = null;         // reconnect swaps `ws`, the dead socket's timer
@@ -427,6 +457,15 @@
 
       ws.onopen = function () {
         reconnectMs = 500;                         // reset backoff
+        // flush the route the page wants before anything else: a click or a
+        // Back/Forward that happened while the socket was down left the URL bar
+        // ahead of the page, and a reconnect RESUMES the server session at its
+        // stale route — so drive it to the current URL first, and the resume's
+        // own render/diff then ships the page the address bar promises.
+        if (pendingNav !== null) {
+          ws.send(JSON.stringify(["event", ["navigate", pendingNav], {}]));
+          pendingNav = null;
+        }
         for (var i = 0; i < pending.length; i++) ws.send(pending[i]);
         pending = [];
         if (outbox) outbox.replay(sendFrame);      // resend every un-acked frame
@@ -558,10 +597,12 @@
     // Back/Forward: the browser restored a previous URL, so tell the server to
     // re-route to it (a plain navigate event → the dispatcher re-projects).
     // No pushState here — the history entry already moved; we only sync state.
+    // sendNav (not a bare send): when the socket is down the browser has
+    // ALREADY moved the history entry, so a dropped frame would strand the page
+    // on the screen the user left — buffering the route and flushing it on
+    // reopen is what makes Back/Forward converge instead.
     window.addEventListener("popstate", function () {
-      var path = location.pathname + location.search;
-      (ws.__send || ws.send.bind(ws))(
-        JSON.stringify(["event", ["navigate", path], {}]));
+      sendNav(location.pathname + location.search);
     });
 
     return ws;
@@ -621,7 +662,17 @@
     // reflects the live route — a bookmarkable SPA over one socket. The
     // server still gets the SAME event and re-routes; this only syncs the URL.
     var nav = navTarget(term);
-    if (nav) { try { history.pushState({ live: nav }, "", nav); } catch (_e) {} }
+    if (nav) {
+      try { history.pushState({ live: nav }, "", nav); } catch (_e) {}
+      // The URL just moved. If the socket is down the term below is dropped, so
+      // remember the route for the reopen flush — otherwise the address bar
+      // would sit ahead of a stale page across the reconnect. When OPEN the
+      // navigate rides in the term itself, so this only buffers on a dead
+      // socket (no double send).
+      if (!(ws && ws.readyState === WebSocket.OPEN) && ws && ws.__sendNav) {
+        ws.__sendNav(nav);
+      }
+    }
     // A durable gesture (inside a [data-live-durable] node) is minted an
     // idempotency id, persisted to the outbox, and augmented into `data` as
     // "ev/id" BEFORE the send — so a drop-then-reconnect replays it exactly

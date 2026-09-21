@@ -1,0 +1,143 @@
+#+TITLE: live: in-app nav moves the URL but not the page when the socket is not OPEN — the navigate frame is dropped, and a reconnect resumes a stale route
+#+STATE: DONE
+#+SESSION_ID: 15884918c228a788
+#+CUSTOM_ID: BUG-095-live-in-app-nav-moves-the-url-but-not-the
+
+* Initial Message
+
+Downstream (Knowledger, filali instance): clicking a nav link (e.g. Access →
+Queries) sometimes leaves the CSS/content on the previous screen while the
+address bar changes; Alt+Left/Right changes the URL but not the page; sometimes
+a click moves the address bar but a manual reload is needed to actually get
+there. Reported as "probably an upstream live bug". It is.
+
+* Symptom (three faces of ONE bug)
+
+1. Click an in-app link: the address bar changes, but the page content — and the
+   route's CSS — stays on the previous screen. A manual reload fixes it.
+2. Back/Forward (popstate): the URL changes, the page content does not follow.
+3. "The CSS doesn't update" is the same event seen through the stylesheet: the
+   new route's class rules ship on the same server re-projection that never
+   happened, so newly-referenced classes have no rule.
+
+Intermittent: it only bites when the WebSocket is not OPEN at the instant of the
+click / history move — a proxy blip, a server restart or deploy, a wifi drop, or
+the client's own auto-reconnect backoff window.
+
+* Root cause (read from source, reproduced in headless Chrome)
+
+`priv/lib/live/client.js`. In-app navigation splits the URL update from the
+content update, and only the URL update is guaranteed.
+
+`ws.__navigate` (a link click) and the `popstate` handler (Back/Forward) both
+put the route on the wire with the plain frame sender:
+
+#+begin_src js
+ws.__navigate = function (path) {
+  history.pushState({ live: path }, "", path);                    // (1) UNCONDITIONAL, sync
+  sendFrame(JSON.stringify(["event", ["navigate", path], {}]));  // (2) may be DROPPED
+};
+#+end_src
+
+and `sendFrame`:
+
+#+begin_src js
+function sendFrame(payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(payload);
+  else if (ws && ws.readyState === WebSocket.CONNECTING) pending.push(payload);
+  // no socket / CLOSED: drop — a durable frame is in the outbox already
+}
+#+end_src
+
+(1) always runs → the address bar moves. (2) is the ONLY thing that repaints:
+the server turns a navigate event into a re-projection whose ~[:patch]~
+(content) and ~[:style]~ (the new route's class rules) are pushed back. When the
+socket is CLOSED, `sendFrame` DROPS the frame — CONNECTING buffers into
+`pending[]` and flushes on open, but CLOSED drops, and a navigate is not a
+durable/outbox gesture (the outbox only wraps `[data-live-durable]` nodes), so
+it is never replayed. ∴ URL moved, content/CSS did not (symptoms 1 and 3). The
+popstate path has the same shape minus the pushState (the browser already moved
+the entry), so its send is likewise dropped (symptom 2).
+
+** Why a manual RELOAD was required (the sticky trap)
+
+The socket auto-reconnects (default) and a reconnect RESUMES the same
+server-side session (same `live-sid`, minted per page load). The dropped
+navigate never updated that session's locals, so its `:route` is STILL the old
+route. On reconnect, `live/socket.bl attach` renders the STALE route and diffs
+it against the last tree the client saw → zero ops, nothing ships. So even after
+the socket is healthy again (`data-live=1`), the page stays on the old screen
+while the URL says the new one. Only a full reload recovers (new page load → new
+sid → fresh MOUNT rendered from the URL's pathname).
+
+** Not the earlier bugs (why it read as "already fixed")
+
+Same "click a link" surface as two prior fixes, DISTINCT cause:
+- feb2a30d (a reconnect keeps the navigator): `__navigate` was attached to the
+  first socket only, so links went DEAD after a reconnect — URL never moved.
+  This bug is the opposite: URL DOES move, page doesn't. That fix is present and
+  correct.
+- f22594f0 (the stylesheet keeps up with the tree): fixed CSS shipping ON A LIVE
+  SOCKET. It cannot help when the frame that would trigger the ship is dropped.
+
+* Fix (client.js — navigation CONVERGES instead of dropping)
+
+The invariant restored: the address bar must not commit to a route the page
+cannot reach. A navigate is idempotent and last-wins, so instead of dropping it
+when the socket is not OPEN, remember the desired route and flush it on (re)open.
+
+1. New closure state `pendingNav` + a `sendNav(path)` helper beside `sendFrame`:
+   send immediately when OPEN, else remember the (latest) route.
+2. `ws.__navigate` and the `popstate` handler send via `sendNav`, not the
+   dropping `sendFrame` / bare send.
+3. `ws.onopen` flushes `pendingNav` first (before the `pending[]` and outbox
+   replay), so the reconnect drives the resumed session to the client's current
+   URL — the resume's own render/diff then ships the page the address bar
+   promises, breaking the stale-route trap.
+4. The seam `ws.__sendNav` is exposed per-socket (like `ws.__send`); `relay()`'s
+   view-declared `[:navigate]` path (tab `:on-select`, etc.) buffers the route
+   for the reopen flush when the socket is down (no double send when OPEN — the
+   navigate already rides in the term).
+
+Files:
+- `priv/lib/live/client.js` — the four changes above (+56 / -5).
+- `test/browser/connect.spec.js` — new claim "reconnect: a link clicked while
+  the socket is DOWN still navigates on reopen": close the socket, click a link
+  while CLOSED, assert nothing was sent, wait for the same-closure reconnect,
+  assert the reopened socket receives the buffered navigate.
+- `test/browser/README.md` — claim 5 documented; count 11 → 12.
+
+* Acceptance (all observed, 2026-09-21)
+
+- Repro against the running Knowledger dev server (127.0.0.1:58217), headless
+  Chrome: GET /access → `Live.ws.close()` → click "Queries" → `location`
+  = /queries but `h1` = "Access", `wsState` = 3; and after auto-reconnect
+  settles (`data-live=1`) the content is STILL "Access" until a reload.
+  Back-button variant likewise (url reverts, h1 stays). VERIFIED before the fix.
+- Control (healthy socket): the same click ships one ~[:patch]~ (18 ops) + one
+  ~[:style]~; live-root has 0 loom classes absent from the head sheet. So the
+  differ/sheet/route-boundary are NOT implicated — the fault is frame delivery.
+  VERIFIED.
+- Gate green after the fix: `cd test/browser && PLAYWRIGHT_BROWSERS_PATH=
+  ~/.cache/ms-playwright npx playwright test connect.spec.js` → 9 passed
+  (was 8). `node --check priv/lib/live/client.js` clean.
+- Gate FALSIFIED before fixing: with the fix reverted (only the new test added),
+  the claim fails — the reopened socket never receives the navigate (it was
+  dropped at click time). VERIFIED, then the fix restored.
+
+* Also noticed (SEPARATE, latent — not this bug)
+
+`route-boundary` (commit 25b799c4: wrap each screen in a keyed per-route child so
+positional reconciliation can't mix a previous page into the new route) is
+missing from some deployed drops but present in HEAD. Not the cause here
+(healthy-socket nav repaints cleanly), but a drop-refresh hygiene item for the
+downstream instances.
+
+* Deploy record (2026-09-21)
+
+The Knowledger filali service (`knowledger-filali.service`, `bl serve
+clients/filali/serve.bl`, :4040) serves `/client.js` from the beam-lisp drop's
+`priv/lib/live/client.js`. The committed fix was placed into the running drop's
+payload and the service restarted so the client-facing instance serves the
+fixed client. See the downstream bug (knowledger BUG-035) for the instance-side
+record.
