@@ -99,16 +99,16 @@ fn make_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
 ///
 /// This is the one cross-language shape duplicated from `lib/beam_lisp/vector.ex`.
 /// It is a contract, so it is written once, here, and named.
-fn make_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
+fn make_vector<'a>(
+    env: Env<'a>,
+    items: Vec<Term<'a>>,
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
+) -> NifResult<Term<'a>> {
     let tuple = make_tuple(env, &items);
-    let keys = [
-        Atom::from_str(env, "__struct__")?.to_term(env),
-        Atom::from_str(env, "items")?.to_term(env),
-    ];
-    let vals = [
-        Atom::from_str(env, "Elixir.BeamLisp.Vector")?.to_term(env),
-        tuple,
-    ];
+    let keys = [struct_k.to_term(env), items_k.to_term(env)];
+    let vals = [vec_mod.to_term(env), tuple];
     // ONE call for the whole struct, instead of two `map_put`s that each copy the map.
     Term::map_from_term_arrays(env, &keys, &vals)
 }
@@ -356,6 +356,14 @@ fn as_de<E: de::Error>(e: rustler::Error) -> E {
 struct TermSeed<'a> {
     env: Env<'a>,
     mode: KeyMode,
+    // Resolved ONCE per call, not once per Vector. A Vector is a map with a struct tag and
+    // an items tuple, so building one costs three `Atom::from_str` lookups — and a document
+    // of 500 arrays paid 1500 lookups for three atoms that never change. Measured: 446 ns
+    // per Vector, which made arrays the most expensive value type in the whole decoder and
+    // left `make_vector` as the biggest single cost after the boundary itself.
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
@@ -368,6 +376,9 @@ impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
         deserializer.deserialize_any(TermVisitor {
             env: self.env,
             mode: self.mode,
+            struct_k: self.struct_k,
+            items_k: self.items_k,
+            vec_mod: self.vec_mod,
         })
     }
 }
@@ -375,6 +386,9 @@ impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
 struct TermVisitor<'a> {
     env: Env<'a>,
     mode: KeyMode,
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
 }
 
 fn atom<'a, E: de::Error>(env: Env<'a>, name: &str) -> Result<Term<'a>, E> {
@@ -426,13 +440,16 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
         let seed = TermSeed {
             env: self.env,
             mode: self.mode,
+            struct_k: self.struct_k,
+            items_k: self.items_k,
+            vec_mod: self.vec_mod,
         };
         let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(8));
         while let Some(item) = seq.next_element_seed(seed)? {
             items.push(item);
         }
         // arrays become VECTORS: bl's documented mapping, so a round trip holds
-        make_vector(self.env, items).map_err(as_de)
+        make_vector(self.env, items, self.struct_k, self.items_k, self.vec_mod).map_err(as_de)
     }
 
     /// Objects AND numbers arrive here.
@@ -471,6 +488,9 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
             let value = map.next_value_seed(TermSeed {
                 env: self.env,
                 mode: self.mode,
+                struct_k: self.struct_k,
+                items_k: self.items_k,
+                vec_mod: self.vec_mod,
             })?;
             keys.push(key);
             values.push(value);
@@ -532,9 +552,22 @@ fn json_decode<'a>(env: Env<'a>, data: Binary<'a>, keys: Atom) -> NifResult<Term
         "existing-atom" => KeyMode::ExistingAtom,
         _ => KeyMode::String,
     };
+    // Atom lookups happen HERE, once per call — see `TermSeed`. They sit outside the
+    // closure below because that closure's error type is `String` and these return
+    // `rustler::Error`.
+    let struct_k = Atom::from_str(env, "__struct__")?;
+    let items_k = Atom::from_str(env, "items")?;
+    let vec_mod = Atom::from_str(env, "Elixir.BeamLisp.Vector")?;
     let outcome: Result<Term<'a>, String> = (|| {
         let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
-        let term = TermSeed { env, mode }
+        let seed = TermSeed {
+            env,
+            mode,
+            struct_k,
+            items_k,
+            vec_mod,
+        };
+        let term = seed
             .deserialize(&mut deserializer)
             .map_err(|e| e.to_string())?;
         deserializer.end().map_err(|e| e.to_string())?;
