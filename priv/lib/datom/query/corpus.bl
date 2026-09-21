@@ -38,7 +38,7 @@
 ; we never re-decode value bytes in bl, which the read path measured at 4× loss).
 
 (ns datom.query.corpus
-  (:require [datom.db] [datom.index] [datom.vector]))
+  (:require [datom.db] [datom.index] [datom.vector] [datom.attr-basis]))
 
 ;; Cached artifacts per column, chosen by what the caller strides:
 ;;   :rows     — the `[[entity dvec] …]` pair list (clustering, projection, knn-all)
@@ -74,7 +74,7 @@
 ;; {:__evictions__ N}, {:__budget_bytes__ N}.
 
 (ns datom.query.corpus
-  (:require [datom.db] [datom.index] [datom.vector]))
+  (:require [datom.db] [datom.index] [datom.vector] [datom.attr-basis]))
 
 ;; ── the table ────────────────────────────────────────────────────────
 
@@ -113,6 +113,16 @@
 (defn- r-resident [row] (erlang/element 7 row))
 (defn- r-n [row] (erlang/element 8 row))
 (defn- r-dim [row] (erlang/element 9 row))
+
+(defn- r-with-disc
+  "`row` with its discriminator replaced. Rows are TUPLES (`list_to_tuple`),
+   so this rebuilds rather than `assoc`s — nine elements copied, once per
+   reuse, against a rebuild of the whole column."
+  [row disc]
+  (erlang/list_to_tuple
+    (to-list [(erlang/element 1 row) (erlang/element 2 row) (erlang/element 3 row)
+              disc (erlang/element 5 row) (erlang/element 6 row)
+              (erlang/element 7 row) (erlang/element 8 row) (erlang/element 9 row)])))
 
 (defn- ->row [k atime bytes disc rows packed resident n dim]
   (erlang/list_to_tuple (to-list [k atime bytes disc rows packed resident n dim])))
@@ -176,12 +186,44 @@
   (ets/update_counter TABLE TOTAL-KEY (t2 2 (- (r-bytes row) old-bytes)))
   (evict-to-budget! k))
 
+(defn- attr-changed?
+  "Whether `attr`'s datoms differ between the basis `built` a corpus was built
+   at and the basis `db` reads.
+
+   O(1), from the per-attribute marks the connection records at every commit
+   (`datom.attr-basis`) plus the mark a build LEAVES BEHIND: a build at tx T
+   proves the artifact holds the column as of T, so readers may ask from T
+   onward rather than from the beginning of the store's history.
+
+   UNKNOWN means rebuild. The temptation is a WAL-tail read — the quantity is
+   right (proportional to the delta) but `datom.time/history` materialises an
+   index over the WHOLE store to build it, measured at 736 ms on a 1M-datom
+   store for a one-transaction window. Rebuilding costs 2–5 s; a hedge that
+   costs a third of a rebuild to answer a question whose honest answers are
+   'no' and 'yes' is not a hedge. With the mark recorded at build time,
+   unknown happens once per (store, attribute) per VM."
+  [db attr built]
+  (let [now (datom.db/basis-t db)
+        mark (datom.attr-basis/basis-t-for (datom.db/store-of db) attr 0)]
+    (if (zero? mark)
+      true                       ; nothing recorded → cannot prove otherwise
+      (> mark built))))          ; a write to this attribute since the build
+
 (defn- discriminator
-  "The db state a corpus depends on. Two db values with the same discriminator
-   over the same store see the SAME current datoms for any attribute, so they
-   may share a corpus; any difference is a rebuild."
+  "The db state a corpus of `attr` depends on: the basis it was BUILT at plus
+   the view axes. Two db values may share the slot when the filter/since axes
+   match and the attribute has not changed between the built basis and the
+   reading one — which `corpus-valid?` decides, because that question needs
+   the store and not just two values.
+
+   The basis recorded is the one the ROWS were built at, not the reader's: a
+   slot built at tx 40 stays usable at tx 41 when tx 41 wrote some other
+   attribute. Keying on the reader's basis instead meant every unrelated
+   write — an audit row, a label, a title — invalidated the column, and
+   re-decoding + re-quantising 64 708 rows costs 5.3 s + 2.1 s. That is why
+   the first application to need this grew a SECOND cache beside the tier's."
   [db]
-  [(datom.db/basis-t db) (:filter-mode db) (:since-t db)])
+  [(:filter-mode db) (:since-t db)])
 
 (defn- assemble
   "The corpus of `[entity dvec]` for embedding column `attr`, current-basis.
@@ -198,25 +240,53 @@
 ;; ── the public read ──────────────────────────────────────────────────
 
 (defn- ensure-entry
-  "The entry row for `(store, attr)` at `db`'s state, with `:rows` built. On a
-   hit at the same discriminator, stamps a fresh access time (O(1),
-   update_element — no payload copy) and returns it. On a miss or a stale
-   discriminator, assembles the rows and stores a rows-only entry."
+  "The entry row for `(store, attr)` usable for `db`, with `:rows` built.
+
+   VALIDITY, not equality. The slot is stamped with the basis its rows were
+   built at; a reader at a LATER basis reuses them when this attribute did
+   not change in between (`attr-changed?` — a WAL-tail question, O(delta)),
+   and rebuilds only when it did. A reader at an EARLIER basis (an `as-of`
+   view) cannot reuse rows from the future and rebuilds.
+
+   The consequence, measured on the deployment that motivated it: a write to
+   a title, a label or an audit row no longer re-decodes and re-quantises a
+   64 708-row embedding column (5.3 s + 2.1 s), and a screen that searches
+   after every write stops paying for the corpus on each one."
   [db attr]
   (table)
   (let [k (t2 (datom.db/store-of db) attr)
-        disc (discriminator db)
+        axis (discriminator db)
         hit (ets/lookup TABLE k)
-        row (if (empty? hit) nil (first (to-list hit)))]
-    (if (and (some? row) (= disc (r-disc row)))
-      (do (ets/update_element TABLE k (t2 2 (now-tick)))
-          row)
+        row (if (empty? hit) nil (first (to-list hit)))
+        built (if (some? row) (get (r-disc row) 1) nil)
+        usable? (and (some? row)
+                     (= axis (get (r-disc row) 0))
+                     ; the reader is at or ahead of the build: reuse unless
+                     ; this attribute changed in between. A reader BEHIND the
+                     ; build (an `as-of` view) cannot reuse rows from its
+                     ; future and rebuilds.
+                     (>= (datom.db/basis-t db) built)
+                     (not (attr-changed? db attr built)))]
+    (if usable?
+      (let [; Stamp the basis the rows are now KNOWN valid for — the reader
+            ; reads at most this basis, so the next one asks a smaller delta.
+            stamped [axis (datom.db/basis-t db)]]
+        (if (= stamped (r-disc row))
+          (do (ets/update_element TABLE k (t2 2 (now-tick)))
+              ; the row is unchanged; only its access time moved
+              row)
+          (let [stamped-row (r-with-disc row stamped)]
+            (ets/insert TABLE stamped-row)
+            stamped-row)))
       (let [rows (assemble db attr)
             n (count rows)
             dim (corpus-dim rows)
             old-bytes (if (some? row) (r-bytes row) 0)
+            ; leave the mark that this build proves: from here on, readers
+            ; start their window at this basis rather than the store's start
+            _ (datom.attr-basis/note! (datom.db/store-of db) attr (datom.db/basis-t db))
             newrow (->row k (now-tick) (est-bytes n dim true false false)
-                          disc rows nil nil n dim)]
+                          [axis (datom.db/basis-t db)] rows nil nil n dim)]
         (store-entry! k newrow old-bytes)
         newrow))))
 
@@ -225,10 +295,10 @@
    by `(store, attr)` and validated against `db`'s basis/filter/since.
 
    First call at a given state builds it (≈ the old per-eval cost); every later
-   call at the same state returns the cached vector in O(1). A transaction
-   advances the basis, which changes the discriminator, so the next call
-   rebuilds and overwrites the slot — the cache can never return datoms from a
-   basis the caller is not reading."
+   call returns the cached vector in O(1) as long as this column has not
+   changed in between — a write to an UNRELATED attribute advances the store's
+   basis and costs nothing here. A change to this column rebuilds, and a
+   reader behind the built basis never sees rows from its future."
   [db attr]
   (r-rows (ensure-entry db attr)))
 
