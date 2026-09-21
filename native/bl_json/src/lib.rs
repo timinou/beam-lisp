@@ -618,9 +618,13 @@ fn json_count(data: Binary) -> NifResult<u64> {
             while let Some(c) = s.next_element_seed(S)? { n += c; }
             Ok(n)
         }
-        // A number still arrives as a one-entry map under `arbitrary_precision`, so it
-        // counts 2 here and 1 in `json-decode`'s terms. Irrelevant to timing; noted so the
-        // count is not mistaken for a term count.
+        // A FLOAT arrives as a one-entry map under `arbitrary_precision`, so it counts 2
+        // here and 1 in `json-decode`'s terms — measured: a `[1.5]` document counts 3
+        // nodes, and 2 without the flag. In-range integers do NOT take this path
+        // (`[1,2,3]` counts 4 either way); only a number whose lexeme has to be kept
+        // does, which is exactly the point — it is how a wider-than-i64 integer is
+        // noticed and declined instead of silently becoming an f64. Irrelevant to
+        // timing; noted so the count is not mistaken for a term count.
         fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<u64, A::Error> {
             let mut n = 1;
             while let Some(_k) = m.next_key::<String>()? {
