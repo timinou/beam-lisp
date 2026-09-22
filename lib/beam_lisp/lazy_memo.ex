@@ -24,16 +24,52 @@ defmodule BeamLisp.LazyMemo do
 
         {:error, reason} ->
           raise """
-          BeamLisp LazySeq requires the lazy_memo native runtime.
-          Cannot load #{path}: #{inspect(reason)}.
-          Run `mix compile` to build it. After changing native runtime modules,
-          restart the VM; live NIF upgrades are intentionally unsupported.
+          the lazy_memo native runtime is not loadable, and nothing runs without it:
+            #{path}.so
+            #{inspect(reason)}
+
+          #{load_advice(reason, path)}
+          After changing a native runtime module, restart the VM; live NIF
+          upgrades are intentionally unsupported.
           """
       end
     end
 
     :ok
   end
+
+  # THE ONE FAILURE THAT IS NOT "BUILD IT". `load_nif` answers `:bad_lib` when
+  # the library at this path declares a DIFFERENT module — the file is there,
+  # it simply belongs to another crate. Freshness is judged by mtime (see
+  # `priv/std/vm/native.bl`), so an artifact left by an experiment that has
+  # moved on is NEWER than the crate's sources and is never rebuilt. Measured
+  # 2026-09-20: `priv/native/lazy_memo.so` held `Elixir.BeamLisp.Native.Vm.Cell`
+  # while `native/lazy_memo/src` was still the real crate, and every `bl`
+  # command died at boot reading as a MISSING runtime — which sent three
+  # sessions looking for a build that was never the problem. The mismatch is
+  # the diagnosis, so it is reported instead of summarised.
+  defp load_advice({:bad_lib, detail}, path) do
+    if foreign_module?(detail) do
+      """
+      The artifact is NOT this crate's library — the loader reports:
+        #{detail}
+      Fix: rm #{path}.so && bl native build
+      """
+    else
+      "Fix: bl native build   (builds native/lazy_memo into #{path}.so)\n"
+    end
+  end
+
+  defp load_advice(_reason, path),
+    do: "Fix: bl native build   (builds native/lazy_memo into #{path}.so)\n"
+
+  defp foreign_module?(detail) when is_list(detail),
+    do: detail |> List.to_string() |> String.contains?("does not match calling module")
+
+  defp foreign_module?(detail) when is_binary(detail),
+    do: String.contains?(detail, "does not match calling module")
+
+  defp foreign_module?(_detail), do: false
 
   def create(state) do
     ensure_loaded!()

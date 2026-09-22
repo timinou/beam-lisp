@@ -18,13 +18,23 @@ defmodule BeamLisp.Reader do
   DELETED. A genesis-less tree boots the reader from the committed Core-Erlang
   seed (`priv/bootstrap/seed/`, installed by `BeamLisp.Bootstrap`).
 
-  ## Errors: the language owns its own type
+  ## Errors: the language owns its own VALUE, the host owns the rendering
 
-  A malformed source raises `BeamLisp.Reader.SyntaxError`, and the `.bl` reader
-  raises THAT struct itself (`reader.bl`'s `syntax-error` does
-  `(erlang/error (BeamLisp.Reader.SyntaxError/exception msg))`). So the facade
-  does NOT translate reader errors — the type is the language's own contract,
-  the same struct Elixir callers `assert_raise` on, raised at the source.
+  A malformed source makes the `.bl` reader raise a DIAGNOSTIC — the tree's one
+  diagnostic shape, defined and enforced in `priv/boot/diag.bl`:
+  `{:diag true, :severity, :kind, :msg, :line, :col, :offset, :end-line,
+  :end-col, :end-offset, :file, …}`. The same shape the type checker's warnings
+  take, so one renderer (`priv/std/errors.bl`) draws a caret under any of them.
+  `:kind` names what went wrong, `:expected`/`:opened-at` name the delimiter a
+  human forgot and where its collection opened, and the offsets locate the
+  offending text.
+
+  THIS module turns that value into `BeamLisp.Reader.SyntaxError` for its own
+  callers, using the diagnostic's `:msg` verbatim — the host type is a RENDERING
+  at the boundary, not the language's error vocabulary. A beam-lisp caller never
+  needs this module: it can `(catch e (:original e))` and read the diagnostic, or
+  ask `(read src {:diagnostics :collect})` for `{:error diag}` with no raise at
+  all.
 
   One error the facade DOES still map is `BeamLisp.AtomGuard.LimitError`. That is
   not a reader concern: it is the host VM's atom-table high-water valve
@@ -43,7 +53,8 @@ defmodule BeamLisp.Reader do
   Read binary `source` into position-bearing reader forms, attributed to `file`.
 
   THE reader entry every caller funnels through. Delegates to the self-hosted
-  reader, which raises `BeamLisp.Reader.SyntaxError` itself on malformed input.
+  reader, and renders a reader diagnostic (`{:diag true, :msg, …}`) as
+  `BeamLisp.Reader.SyntaxError` on the way out.
   """
   @spec read_string(String.t()) :: [term]
   @spec read_string(String.t(), binary | nil) :: [term]
@@ -64,13 +75,41 @@ defmodule BeamLisp.Reader do
   end
 
   # Run `fun`, surfacing the host VM's atom-table guard as the reader-facing
-  # `AtomLimitError`. A `SyntaxError` from the `.bl` reader passes through
-  # untouched — the language already raises the right type.
+  # `AtomLimitError`, and RENDERING a reader diagnostic into this module's error
+  # type.
+  #
+  # The language raises a diagnostic VALUE, not a host struct: a map carrying
+  # `{:diag true, :kind, :msg, :line, :col, :offset, :end-line, :end-col,
+  # :end-offset, …}` — the same shape the type checker's warnings take, so
+  # `errors/render` draws its caret from it. `SyntaxError` is THIS boundary's
+  # rendering of that value, which is why the `.bl` reader needs no host
+  # vocabulary of its own: swap this front door for a beam-lisp one and the
+  # diagnostics are unchanged.
+  #
+  # Anything that is not a reader diagnostic passes through untouched, so
+  # nothing is swallowed.
   defp mapping_atom_limit(fun) do
     fun.()
   rescue
     e in BeamLisp.AtomGuard.LimitError ->
       reraise BeamLisp.Reader.AtomLimitError, [message: Exception.message(e)], __STACKTRACE__
+
+    e in ErlangError ->
+      case e.original do
+        %{diag: true, msg: msg} when is_binary(msg) ->
+          reraise BeamLisp.Reader.SyntaxError, [message: msg], __STACKTRACE__
+
+        # `:bl_diag` is the spelling this marker carried before the vocabulary
+        # landed as `priv/boot/diag.bl` (`:diag`). Accepted while the reader
+        # side of that move is in flight in another session, so this front door
+        # is correct against EITHER reader; delete this clause when no producer
+        # writes it.
+        %{bl_diag: true, msg: msg} when is_binary(msg) ->
+          reraise BeamLisp.Reader.SyntaxError, [message: msg], __STACKTRACE__
+
+        _ ->
+          reraise e, __STACKTRACE__
+      end
   end
 
   @doc """

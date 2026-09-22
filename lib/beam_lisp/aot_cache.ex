@@ -13,10 +13,10 @@ defmodule BeamLisp.AOTCache do
 
   Keys:
 
-    * `compiler_key/0` — the TOOLCHAIN tier (FEAT-030): beam_lisp's version,
-      Elixir and OTP versions, the SHA-256 of the codegen modules' SOURCES
-      (AOT/AtomGuard/CompilerData/Record/Emit/Link/Native — NOT the Compiler
-      orchestration module, which does not affect emitted code) and
+    * `compiler_key/0` — the TOOLCHAIN tier (FEAT-030): the Elixir and OTP
+      versions, the AOT backend, the SHA-256 of the SOURCES of every module that
+      emits beams (`@codegen_modules`, below — NOT the `Compiler` orchestration
+      module, which does not affect emitted code) and
       every source in `priv/boot/` (the self-hosted compiler, the reader
       providers, and the ambient `core`/`sugar` prelude — not the whole
       `priv/**/*.bl`). A change to a tier-1 source invalidates every beam; a
@@ -116,7 +116,10 @@ defmodule BeamLisp.AOTCache do
   # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
   # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
   # is produced, so it contributed nothing to the key in every image while
-  # implying it was covered.
+  # implying it was covered. `BeamLisp.Native` was the second: `native.ex` was
+  # deleted when the defnative policy moved to `vm.native` (PLAN-122), and the
+  # moduledoc went on listing it. The moduledoc now points at this list rather
+  # than repeating it, so there is one authority and it is the one that emits.
   @codegen_modules [
     BeamLisp.AOT,
     BeamLisp.AtomGuard,
@@ -165,8 +168,11 @@ defmodule BeamLisp.AOTCache do
 
   @doc """
   Hash of the toolchain that produced a beam. Any change to codegen, the
-  runtime it links against, or the language/VM version yields a new key,
-  so stale artifacts compiled by a different toolchain are never linked.
+  toolchain sources, or the Elixir/OTP/backend it runs on yields a new key,
+  so stale artifacts compiled by a different toolchain are never linked. The
+  app's release version is NOT an input: it is metadata, not codegen, and
+  hashing it would make a version stamp masquerade as a toolchain change (see
+  `compute_compiler_key/0`).
   """
   def compiler_key do
     case :persistent_term.get(@toolchain_key_pt, :undefined) do
@@ -275,17 +281,22 @@ defmodule BeamLisp.AOTCache do
   end
 
   defp compute_compiler_key do
-    # Loading metadata does not start the app. Builds and ordinary startup
-    # must not hash different versions merely because one ran before start.
-    :application.load(:beam_lisp)
-    vsn =
-      case :application.get_key(:beam_lisp, :vsn) do
-        {:ok, v} -> List.to_string(v)
-        _ -> "unknown"
-      end
-
+    # The app :vsn is DELIBERATELY NOT hashed here. It is release METADATA, not a
+    # codegen input: two builds of byte-identical toolchain sources at different
+    # versions emit behaviourally identical beams, so keying the toolchain
+    # GENERATION on the version manufactures a generation change out of a release
+    # stamp. That is exactly what broke a stamped release: CI stamps env.bl
+    # `:vsn` (0.1.0 -> 2026.4.0), which rotated this key, so the committed
+    # bootstrap floor (seeded at 0.1.0) no longer matched the stamped tree; the
+    # launcher's generation check then rebuilt the boot tier from that
+    # now-foreign floor and died `undefined var: compiler/special-forms`. A real
+    # toolchain change already rotates this key through `codegen_part/0` and
+    # `toolchain_source_contents/0` below; the version adds nothing but that
+    # fragility. (A consumer macro that BAKES `bl.util/version` into a compiled
+    # function is the one theoretical case that would want the version in a key
+    # — there is no such built-in, and that is a per-artifact concern, not the
+    # toolchain generation's.)
     parts = [
-      "beam_lisp:#{vsn}",
       "elixir:#{System.version()}",
       "otp:#{:erlang.system_info(:otp_release)}",
       # The BACKEND is part of the toolchain: a Core-built beam and an

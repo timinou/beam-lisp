@@ -45,6 +45,22 @@ driving a real Chromium with Playwright against the JS client.
    `preventDefault` a link it cannot navigate, so the failure mode is a real
    page load rather than silence.
 
+5. **`connect.spec.js` › a link clicked while the socket is DOWN still navigates
+   on reopen** — claim 4 covers a socket that came BACK before the click; this
+   covers a click DURING the down window. A navigation moves the URL bar
+   synchronously (`pushState`) but the page only changes when the server
+   receives the navigate event and re-projects. If the socket was not OPEN the
+   frame used to be dropped (`sendFrame`'s CLOSED branch buffers only
+   CONNECTING), so the URL moved and the page did not — and since a reconnect
+   RESUMES the same server session at its now-stale route, the divergence
+   survived the reconnect: only a full reload recovered. Navigation now
+   CONVERGES — the desired route is buffered (`pendingNav`, last-wins) while the
+   socket is down and flushed in `onopen`, so the page always catches up to the
+   address bar. The test closes the socket, clicks a link while CLOSED, asserts
+   nothing was sent, then waits for the same-closure reconnect and asserts the
+   reopened socket receives the buffered navigate. Against the pre-fix client
+   the reopened socket never receives it (the frame was dropped at click time).
+
 ## Run it
 
 ```sh
@@ -59,7 +75,7 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `11 passed` (3 differ + 8 lifecycle).
+Expected: `12 passed` (3 differ + 9 lifecycle).
 
 ## Why not Phoenix here
 

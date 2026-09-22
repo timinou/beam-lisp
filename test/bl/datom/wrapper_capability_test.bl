@@ -1,0 +1,204 @@
+; test/bl/datom/wrapper_capability_test.bl — a wrapper must not downgrade a
+; capability, and must not fork a cache.
+; Run: bl test test/bl/datom/wrapper_capability_test.bl
+;
+; ── The bug class this pins ──────────────────────────────────────────
+;
+; The Store port is tiny ON PURPOSE, and every fast read sits beside it as an
+; OPTIONAL protocol (`Scan`, `MultiScan`, `PageScan`). Optional protocols are
+; dispatched with `satisfies?` on the store VALUE. So a wrapper implementing
+; only `Store` does not merely fail to help — it silently DELETES the fast
+; paths of everything beneath it, and nothing raises.
+;
+; `datom.store-overlay` shipped that way. Measured through it, on the same
+; store: the engine's semi-join could not be chosen (`multi-scan?` was false),
+; so a join over a bound entity set read the whole column (4.1–6.4 s on
+; 64 708 rows) instead of the bound entities' datoms (0.73 s); a datom scan
+; fell back to the pairs path; and a bounded page lost its native page read.
+; Every dry-run migration and every `with` speculation paid it, quietly.
+;
+; ── Why the assertions are COUNTS ────────────────────────────────────
+;
+; A forwarding wrapper IS a claim about request shapes — "this read is still
+; one request" — so a counting substrate is the exact instrument, and the only
+; one that does not flake (see cost_test.bl: two identical runs on a loaded
+; host differed by 2.2x). No timing appears here.
+;
+; Both directions are asserted, and the second is what catches a wrapper that
+; forwards when it must NOT:
+;   · a read the buffer does not touch is the BASE's read, unchanged;
+;   · a read the buffer DOES touch must still see the speculative datoms.
+
+(ns datom.wrapper.capability.test
+  (:require [datom.conn] [datom.db] [datom.index] [datom.store]
+            [datom.store-ets] [datom.store-overlay] [datom.query.engine]))
+
+;; ── a substrate that declares every capability, and logs ─────────────
+
+(def OPS (atom []))
+
+(defn- log! [op] (swap! OPS (fn [v] (conj v op))))
+
+(defrecord CapableStore [inner]
+  datom.store/Store
+  (-get [s k] (log! :get) (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (log! :range) (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (log! :put) (datom.store/-put (:inner s) k v))
+  (-delete [s k] (log! :delete) (datom.store/-delete (:inner s) k))
+  (-update [s k f] (log! :update) (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (log! :commit) (datom.store/-commit (:inner s) ops)))
+
+(extend-type CapableStore
+  datom.store/Scan
+  (-scan-datoms [s lo hi]
+    (log! :scan)
+    (datom.store/scan-datoms (:inner s) lo hi)))
+
+(extend-type CapableStore
+  datom.store/MultiScan
+  (-scan-prefixes [s bounds]
+    (log! :multiscan)
+    (datom.store/scan-prefixes (:inner s) bounds)))
+
+(extend-type CapableStore
+  datom.store/PageScan
+  (-scan-datoms-page [s start after hi limit]
+    (log! :page)
+    (datom.store/page-datoms (:inner s) start after hi limit)))
+
+(defn- reads [] (filterv (fn [o] (not= :commit o)) (deref OPS)))
+(defn- reset-ops! [] (reset! OPS []))
+
+;; ── the fixture ──────────────────────────────────────────────────────
+
+(def SCHEMA
+  [{:db/ident :p/n :db/valueType :db.type/string}
+   {:db/ident :p/a :db/valueType :db.type/long}
+   {:db/ident :p/city :db/valueType :db.type/string}])
+
+(def ^:private CONN (atom nil))
+
+(defn- fixture
+  "60 people, built once: a connection is a registry entry keyed by store, so
+   a second fixture over the same store would inherit the first's data."
+  []
+  (or (deref CONN)
+      (let [c (datom.conn/connect-with (->CapableStore (datom.store-ets/open)) SCHEMA)]
+        (datom.conn/transact!
+          c
+          (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                         :p/n (str "n" i)
+                         :p/a i
+                         :p/city (if (even? i) "London" "NY")})
+                (vec (range 60))))
+        (reset! CONN c)
+        c)))
+
+;; A query whose join variable is bound in EVERY row at the ENTITY position —
+;; the shape `pattern-scan-once` recognises as a semi-join, and the one whose
+;; cost is a request SHAPE rather than a row count.
+(def JOIN '[:find ?n :in [?e ...] :where [?e :p/n ?n]])
+
+(defn- eids
+  "`n` REAL entity ids, in the order the fixture created them. The fixture's
+   `:db/id -k` are TEMP ids — the store assigns the real ones — so a literal
+   `-k` here would bind nothing and the join would answer zero rows."
+  [db n]
+  (into [] (take n (mapv datom.index/-e (datom.db/attr-datoms db :p/n)))))
+
+;; ── 1. the capabilities survive the wrapper ──────────────────────────
+
+(deftest a-wrapper-still-declares-the-capabilities
+  (let [base (->CapableStore (datom.store-ets/open))
+        o (datom.store-overlay/open base)]
+    (is (datom.store/multi-scan? o)
+        "an overlay over a MultiScan store must declare it")
+    (is (satisfies? datom.store/Scan o) "an overlay must declare Scan")
+    (is (satisfies? datom.store/PageScan o) "an overlay must declare PageScan")
+    (is (identical? base (datom.store/identity-of o))
+        "identity-of an overlay is its base, so caches key what the base keys")
+    (is (identical? base (datom.store/identity-of base))
+        "a substrate is its own identity")))
+
+;; ── 2. a semi-join is ONE request through the wrapper too ────────────
+
+(deftest a-semi-join-through-the-wrapper-is-one-request
+  (let [c (fixture)
+        db (datom.conn/db c)
+        kept (eids db 40)]
+    (reset-ops!)
+    (let [plain (datom.query.engine/q JOIN db kept)]
+      (is (= 40 (count plain)) "the join answers one row per bound entity")
+      (let [plain-ops (reads)]
+        ; The same query against a SPECULATION's db value — an overlay of this
+        ; conn's store. The speculation writes only attributes other than
+        ; `:p/n`, so the semi-join's bounds are untouched by the buffer.
+        (let [rep (datom.conn/with c [{:db/id -9001 :p/a 7 :p/city "NY"}])
+              db-after (get rep :db-after)]
+          (reset-ops!)
+          (let [spec (datom.query.engine/q JOIN db-after kept)
+                spec-ops (reads)]
+            (is (= 40 (count spec)) "the speculation does not change the answer")
+            (is (= [:multiscan] plain-ops)
+                "the base read is ONE multi-prefix request")
+            (is (= plain-ops spec-ops)
+                (str "an overlay read must keep the base's request shape — the"
+                     " capability the wrapper used to drop (speculated: "
+                     (pr-str spec-ops) ")"))))))))
+
+;; ── 3. the buffer is still visible through the forwarded path ────────
+
+(deftest a-speculative-write-is-still-visible
+  (let [c (fixture)
+        rep (datom.conn/with c [{:db/id -9002 :p/n "speculative" :p/a 99}])
+        db-after (get rep :db-after)
+        eid (get (get rep :tempids) -9002)
+        lo (datom.index/key-prefix :eavt)
+        prefix (fn [e] [(datom.index/key-prefix :eavt e)
+                        (datom.index/prefix-end (datom.index/key-prefix :eavt e))])]
+    (is (some? eid) "the speculation created the entity")
+    ; A read whose bounds the buffer IS inside: the speculative datom must come
+    ; back through the forwarded multi-prefix path.
+    (let [found (datom.store/scan-prefixes (datom.db/store-of db-after)
+                                           [(prefix eid)])]
+      (is (some (fn [d] (= "speculative" (datom.index/-v d))) found)
+          "a speculative datom inside the bounds is reported"))
+    ; And the BASE never saw it.
+    (let [[b-lo b-hi] (prefix eid)
+          base-rows (datom.index/scan (:store c) :eavt b-lo b-hi)]
+      (is (empty? base-rows) "the speculation did not write the base"))))
+
+;; ── 4. a bounded page keeps its native read ──────────────────────────
+
+(deftest a-page-through-the-wrapper-is-still-a-page
+  (let [c (fixture)
+        db (datom.conn/db c)
+        o (datom.store-overlay/open (:store c))
+        o-db (datom.db/db-value o (datom.conn/schema c) (datom.db/basis-t db)
+                                (datom.db/blobs-of db))]
+    (reset-ops!)
+    (let [a (datom.db/attribute-page db :p/n nil 10)
+          base-ops (reads)]
+      (reset-ops!)
+      (let [b (datom.db/attribute-page o-db :p/n nil 10)
+            wrapped-ops (reads)]
+        (is (= (count (:datoms a)) (count (:datoms b)))
+            "the page through the wrapper holds the same rows")
+        (is (= (:after-eid a) (:after-eid b))
+            "and the same cursor")
+        (is (some (fn [op] (= :page op)) base-ops)
+            "the base pages natively")
+        (is (some (fn [op] (= :page op)) wrapped-ops)
+            "the wrapper did not lose the native page read")))))
+
+;; ── 5. the wrapper is not a cache key ────────────────────────────────
+
+(deftest an-instrumented-store-does-not-fork-the-derived-column-cache
+  ; The caches above the port key by store value (`datom.attr-basis`,
+  ; `datom.query.corpus`). A wrapper keyed by itself would hold a SECOND copy
+  ; of the same column — so a measured query would measure a cache build.
+  (let [base (->CapableStore (datom.store-ets/open))
+        o (datom.store-overlay/open base)]
+    (is (= 1 (count (into #{} [(datom.store/identity-of o)
+                               (datom.store/identity-of base)])))
+        "a wrapper and its base are ONE cache identity")))

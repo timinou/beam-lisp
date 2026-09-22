@@ -15,16 +15,30 @@
 ; work happens in the session that will serve it, it is VISIBLE while it runs,
 ; and a reader never queues behind it.
 ;
+; ══ WHY THE BUILD HOLDS ITSELF OPEN ═════════════════════════════════════════
+;
+; A datom conn's store is an ETS table, and an ETS table lives exactly as long
+; as the process that created it — the opening fact of `vm.index`, and the bug
+; this module was caught by. The build runs in a process of its own so the
+; request that asked for it can answer at once; that process must then STAY, or
+; the conn it built dies with it and the next render raises badarg on a dead
+; table. Measured, before `hold!`: the catalog page 500'd under the dashboard
+; (`view-failed %ArgumentError`) while the standalone server — which prepares
+; AND serves in one process — was fine.
+;
+; So the build process publishes its result and then waits, holding the conn for
+; as long as the session lives. It costs one parked process and one atom read.
+;
 ; ══ THE SHAPE ══════════════════════════════════════════════════════════════
 ;
 ;   (catalog/declaration root)      → the env.bl declaration, or nil
-;   (catalog/status root)           → the read-model's catalog field (never indexes)
-;   (catalog/ensure-building! root) → start the index in the background (idempotent)
+;   (catalog/status root)           → the read-model's field (never indexes)
+;   (catalog/ensure-building! root) → start the build (idempotent)
 ;   (catalog/handler root)          → a plug: the LIVE catalog, mounted at PREFIX
 ;
 ; `status` is what vm.inspect puts in the model and what the dashboard's pane
 ; renders; neither indexes anything. `GET /catalog` is the door that pays, and
-; it is the SAME router the standalone `bl serve examples/catalog.bl` serves —
+; it serves the SAME router the standalone `bl serve examples/catalog.bl` does —
 ; one implementation, reachable from `bl ui`, instead of a second server beside
 ; it (PLAN-024; the argument FUP-011 made for the scenario workbench).
 
@@ -33,13 +47,13 @@
 
 (def PREFIX
   "Where the dashboard mounts this catalog. One address, so a link in a pane,
-   the page's own script URLs and the socket all agree."
+   the page's own script and socket URLs, and the page a person pastes agree."
   "/catalog")
 
-;; One session, one tree, one catalog: the state is a value the session holds,
-;; not a call into a build — a reader must be able to say "building" while the
-;; build is running.
-(defonce state (atom {:phase :cold}))
+;; One session, one tree, one catalog. The state is a value the session holds,
+;; not a call into a build: a reader must be able to say "building" WHILE the
+;; build runs, so nothing a renderer touches may queue behind it.
+(def state (atom {:phase :cold}))
 
 ;; ── the declaration ─────────────────────────────────────────────────────────
 
@@ -52,8 +66,8 @@
 ;; ── the build ───────────────────────────────────────────────────────────────
 
 (defn- summary
-  "The report, projected for a pane: counts, the gap, and the escape leaders —
-   the figures a person acts on, not everything the tool can measure."
+  "The report, projected for a pane: the counts a person acts on, the gap by
+   name, and the escape leaders — not everything the tool can measure."
   [r]
   {:package (:package r)
    :groups (map (fn [g] [(:group g) (:count g)]) (:groups r))
@@ -66,28 +80,53 @@
    :a11y (count (:a11y r))
    :unkeyed (:unkeyed r)})
 
+(defn- hold!
+  "Wait forever, holding whatever this process built.
+
+   The prepared value contains a datom conn, whose store is an ETS table OWNED BY
+   THIS PROCESS. A process that exits takes its tables with it, so a build that
+   returned would leave every later render reading a dead table — which is
+   exactly what happened before this fn existed. Parking is the whole mechanism:
+   the catalog is dropped by killing the session, never by finishing."
+  []
+  (loop []
+    (erlang/apply :timer :sleep (list 60000))
+    (recur)))
+
 (defn- build!
-  "Index, measure, and publish — the whole of the background work. Failure is a
-   STATE, not a crash: a catalog whose library does not load is a fact the pane
-   can state, and the session it runs in must survive saying so."
+  "Index, measure, publish, then HOLD the build open. Failure is a STATE, not a
+   crash: a catalog whose library does not load is a fact a pane can state, and
+   the session it runs in must survive saying so."
   [root decl]
+  (reset! state (assoc decl :root root :phase :building
+                       :package (get decl :name)
+                       :prefix PREFIX
+                       :at (erlang/system_time :millisecond)))
   (try
     (let [prepared (catalog/prepare decl)
           r (catalog/report prepared)]
-      (reset! state {:phase :ready :root root :decl decl
-                     :prepared prepared
+      (reset! state {:root root :decl decl :prepared prepared :phase :ready
+                     :package (get decl :name)
+                     :lib-dir (get decl :lib-dir)
+                     :examples-dir (get decl :examples-dir)
+                     :prefix PREFIX
                      :summary (summary r)
                      :problems (catalog/problems r)
-                     :at (erlang/system_time :millisecond)}))
+                     :at (erlang/system_time :millisecond)})
+      (hold!))
     (catch e
-      (reset! state {:phase :error :root root :decl decl
+      (reset! state {:root root :decl decl :phase :error
+                     :package (get decl :name)
+                     :lib-dir (get decl :lib-dir)
+                     :examples-dir (get decl :examples-dir)
+                     :prefix PREFIX
                      :message (ex-message e)
                      :at (erlang/system_time :millisecond)}))))
 
 (defn ensure-building!
-  "Start the tree's catalog index in the background, once. Idempotent: a build
-   in flight is not started twice, and a catalog already ready for THIS tree is
-   not rebuilt (`forget!` forces one). Returns the state that started."
+  "Start the tree's catalog build, once (idempotent: a build in flight is
+   joined, and a catalog already ready for THIS tree is not rebuilt). Returns the
+   state that is now current — `:cold`, `:building`, `:ready` or `:error`."
   [root]
   (let [decl (declaration root)
         s @state]
@@ -97,6 +136,7 @@
       s
       (do
         (reset! state {:phase :building :root root :decl decl
+                       :package (get decl :name) :prefix PREFIX
                        :at (erlang/system_time :millisecond)})
         (erlang/apply :erlang :spawn (list (fn [] (build! root decl))))
         @state))))
@@ -104,31 +144,30 @@
 (defn forget!
   "Drop what was measured. The next `ensure-building!` indexes again."
   []
-  (reset! state {:phase :cold}))
-
-;; ── the read-model's field ──────────────────────────────────────────────────
+  (reset! state {:phase :cold})
+  :ok)
 
 (defn status
   "What this tree's catalog is, as data: cheap enough for every request to the
-   dashboard, because it NEVER indexes — `:phase` says where the work stands and
-   `:summary` exists only once it is done."
+   dashboard and for `bl daemon status`, because it NEVER indexes — `:phase` says
+   where the work stands and `:summary` exists only once it is done."
   [root]
   (let [decl (declaration root)]
     (if (nil? decl)
       {:declared false :prefix PREFIX}
       (let [s @state
             mine? (= root (:root s))
-            phase (if mine? (:phase s) :cold)
-            done? (= :ready phase)]
+            s (if mine? s {:phase :cold})
+            phase (:phase s)]
         {:declared true
          :prefix PREFIX
-         :package (:name decl)
-         :lib-dir (:lib-dir decl)
-         :examples-dir (:examples-dir decl)
+         :package (get decl :name)
+         :lib-dir (get decl :lib-dir)
+         :examples-dir (get decl :examples-dir)
          :phase phase
-         :message (if (and mine? (= :error phase)) (:message s) nil)
-         :summary (if done? (:summary s) nil)
-         :problems (if done? (:problems s) [])}))))
+         :message (if (= :error phase) (:message s) nil)
+         :summary (if (= :ready phase) (:summary s) nil)
+         :problems (if (= :ready phase) (:problems s) [])}))))
 
 ;; ── the two pages a mount needs ─────────────────────────────────────────────
 ;;
@@ -158,18 +197,18 @@
 (defn- building-page [decl]
   ;; the refresh is the honest answer to "where is it?": the build happens in
   ;; this session, so the page that asked is what can report it.
-  (page (str (:name decl) " · catalog")
+  (page (str (get decl :name) " · catalog")
         (str "<meta http-equiv=\"refresh\" content=\"2\">"
              "<h1>Indexing the catalog…</h1>"
-             "<p class=\"note\">Evaluating <code>" (esc (:lib-dir decl)) "</code> and <code>"
-             (esc (:examples-dir decl)) "</code>. This page reloads itself.</p>"
+             "<p class=\"note\">Evaluating <code>" (esc (get decl :lib-dir)) "</code> and <code>"
+             (esc (get decl :examples-dir)) "</code>. This page reloads itself.</p>"
              "<p class=\"note\"><a href=\"/\">← the session dashboard</a></p>")))
 
 (defn- error-page [decl s]
   (page "catalog · error"
         (str "<h1>The catalog could not be indexed</h1>"
-             "<p class=\"note\"><code>" (esc (:lib-dir decl)) "</code> / <code>"
-             (esc (:examples-dir decl)) "</code></p>"
+             "<p class=\"note\"><code>" (esc (get decl :lib-dir)) "</code> / <code>"
+             (esc (get decl :examples-dir)) "</code></p>"
              "<pre class=\"note\">" (esc (:message s)) "</pre>"
              "<p class=\"note\"><a href=\"/\">← the session dashboard</a></p>")))
 

@@ -75,6 +75,19 @@
   (-update [s k f] (bump :update) (datom.store/-update (:inner s) k f))
   (-commit [s ops] (bump :commit) (datom.store/-commit (:inner s) ops)))
 
+;; A multi-prefix read is ONE request — that is its whole point — so it
+;; counts as one `:range`, and the rows it returns are counted like any
+;; other scan's. Without this the decorator hides the capability and the
+;; engine takes the column path, which is exactly what the semi-join tests
+;; would then fail to see.
+(extend-protocol datom.store/MultiScan
+  CountingStore
+  (-scan-prefixes [s bounds]
+    (bump :range)
+    (let [result (datom.store/scan-prefixes (:inner s) bounds)]
+      (swap! ROWS (fn [n] (+ n (count result))))
+      result)))
+
 (defn- ranges [] (or (get (deref COUNTER) :range) 0))
 
 (defn- nums
@@ -153,9 +166,35 @@
                               '[:find ?n :where [?e :p/n ?n] [?e :p/a ?a] [?e :p/city "London"]] db)))]
     (is (= small large))))
 
-(deftest pull-costs-one-range-per-attribute-not-per-entity
+(deftest pull-costs-ONE-range-per-entity-whatever-the-pattern-width
+  ; A pull read the entity ONCE to see it existed, threw that away, and
+  ; then read once more PER ATTRIBUTE. Sixteen attributes were seventeen
+  ; store requests — and knowledger's /queries screen pulled 236 rows ×
+  ; 16 attributes × 4 renders that way (≈15 000 requests per page).
+  ;
+  ; The entity's datoms are one prefix. Read it once; serve every forward
+  ; element of the pattern from that read. Only a REVERSE reference
+  ; (`:p/_f`, VAET) and a NESTED pull (another entity) cost another read.
+  (is (= 1 (cost-of 10 (fn [db c] (datom.pull/pull db [:p/n :p/a] 1)))))
+  (is (= 1 (cost-of 10 (fn [db c] (datom.pull/pull db '[:p/n :p/a :p/city (default :p/f 0) (:p/n :as :name)] 1)))))
+  (is (= 1 (cost-of 10 (fn [db c] (datom.pull/pull db '[*] 1)))))
   (is (= (cost-of 10 (fn [db c] (datom.pull/pull db [:p/n :p/a] 1)))
          (cost-of 40 (fn [db c] (datom.pull/pull db [:p/n :p/a] 1))))))
+
+(deftest pull-many-costs-ONE-range-for-every-entity
+  ; The N+1 of screens: a list of ids, a pull each. `pull-many` is one
+  ; multi-prefix read for the whole list (the same MultiScan read the
+  ; semi-join uses), so a 236-row page costs one request, not 236 × 17.
+  (is (= 1 (cost-of 40 (fn [db c] (datom.pull/pull-many db [:p/n :p/a :p/city] [1 2 3 4 5 6 7 8 9 10])))))
+  (is (= 10 (count (datom.pull/pull-many (datom.conn/db (fixture 40)) [:p/n] [1 2 3 4 5 6 7 8 9 10])))))
+
+(deftest pull-many-gives-exactly-what-pull-gives
+  (let [db (datom.conn/db (fixture 12))
+        ids [1 5 9 999]
+        each (mapv (fn [e] (datom.pull/pull db '[:p/n :p/a (default :p/city "?")] e)) ids)
+        many (datom.pull/pull-many db '[:p/n :p/a (default :p/city "?")] ids)]
+    (is (= each many) "same maps, same order, nil for a missing entity")
+    (is (nil? (get many 3)))))
 
 (deftest an-aggregate-costs-what-its-query-costs
   ; Aggregation folds rows already in memory, so it adds no store work.
@@ -300,3 +339,154 @@
     (is (= (set [[96] [97] [98] [99]])
            (datom.query.engine/q '[:find ?a :where [?e :r/plain ?a] [(> ?a 95)]]
                                  (datom.conn/db c))))))
+
+;; ── semi-join: a bound join reads the ROWS it joins, not the column ─
+;;
+;; The constant-ranges contract above says a join is O(1) in store REQUESTS.
+;; It said nothing about how many datoms came back — and `pattern-scan-once`
+;; bounded its single scan only by what was common to EVERY binding row.
+;; Once the join variable took a different value per row (one entity per
+;; chunk), nothing was common, the scan fell to the whole AEVT column, and
+;; a 1 760-row join over a 64 708-row column read 129 416 datoms to keep
+;; 3 520 (measured on knowledger's sources-legales: 4–6 s where the same
+;; join done by hand took 0.8 s).
+;;
+;; The fix keeps the request count constant AND makes the rows read follow
+;; the ANSWER: when every row binds the join variable, the clause is read
+;; as ONE multi-prefix scan over the distinct join values (`MultiScan`), so
+;; the store hands back only the datoms of the entities being joined.
+
+(defn- selective-fixture
+  "`n` chunks over 2 sources: `n/2` per source, each chunk with an order
+   and a text. `:c/src` is a ref (AVET+VAET), the others plain columns."
+  [n]
+  (let [c (datom.conn/connect-with
+            (->CountingStore (datom.store-ets/open))
+            [{:db/ident :c/src :db/valueType :db.type/ref :db/index true}
+             {:db/ident :c/order :db/valueType :db.type/long}
+             {:db/ident :c/text :db/valueType :db.type/string}
+             {:db/ident :s/name :db/valueType :db.type/string}])
+        r (datom.conn/transact! c [{:db/id -1 :s/name "a"} {:db/id -2 :s/name "b"}])
+        a (get (:tempids r) -1) b (get (:tempids r) -2)]
+    (datom.conn/transact!
+      c (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                       :c/src (if (even? i) a b)
+                       :c/order i
+                       :c/text (str "t" i)})
+              (nums n)))
+    [c a]))
+
+(def CHUNK-JOIN
+  '[:find ?o ?t :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o] [?c :c/text ?t]])
+
+(deftest a-bound-join-reads-the-rows-it-joins-not-the-column
+  ; 100 chunks, 50 per source. The join for one source must read ~50
+  ; orders and ~50 texts, not 100 of each. Requests stay constant.
+  (let [[c a] (selective-fixture 100)
+        rows (datoms-read c (fn [db] (datom.query.engine/q CHUNK-JOIN db a)))
+        reqs (ranges)]
+    (is (= 50 (count (datom.query.engine/q CHUNK-JOIN (datom.conn/db c) a))))
+    ; 50 src datoms + 50 orders + 50 texts = 150; the column scan read 250.
+    (is (<= rows 160) (str "reads the joined entities' datoms only (" rows " datoms)"))
+    (is (<= reqs 4) (str "and still a constant number of store requests (" reqs ")"))))
+
+(deftest a-bound-join-cost-follows-the-answer-not-the-database
+  ; Doubling the database while the answer stays the same size must not
+  ; change what the store hands back.
+  (let [[c1 a1] (selective-fixture 40)
+        [c2 a2] (selective-fixture 400)
+        small (datoms-read c1 (fn [db] (datom.query.engine/q
+                                         '[:find ?o :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o]] db a1)))
+        large (datoms-read c2 (fn [db] (datom.query.engine/q
+                                         '[:find ?o :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o]] db a2)))]
+    ; 20 vs 200 answers: the rows read scale with the ANSWER (×10), never
+    ; with the database beyond it.
+    (is (< large (* 12 small)) (str small " datoms at N=40, " large " at N=400"))))
+
+(deftest a-semi-join-does-not-change-the-ANSWER
+  (let [[c a] (selective-fixture 60)
+        db (datom.conn/db c)
+        semi (datom.query.engine/q CHUNK-JOIN db a)
+        ; the same question, forced through the column path: no bound row set
+        column (set (filterv (fn [r] (some? r))
+                       (mapv (fn [r] (if (= a (get r 2)) [(get r 0) (get r 1)] nil))
+                             (datom.query.engine/q '[:find ?o ?t ?s :where [?c :c/src ?s] [?c :c/order ?o] [?c :c/text ?t]] db))))]
+    (is (= semi column))
+    (is (= 30 (count semi)))))
+
+(deftest a-join-wider-than-its-column-falls-back-to-one-column-scan
+  ; The bound-row set can be LARGER than what a column scan would return
+  ; (every entity bound, say). Then one column scan is the cheaper read,
+  ; and the engine must still issue exactly one request.
+  (let [[c a] (selective-fixture 40)
+        db (datom.conn/db c)]
+    (reset! COUNTER {})
+    (datom.query.engine/q '[:find ?o ?t :where [?c :c/order ?o] [?c :c/text ?t]] db)
+    (is (<= (ranges) 2))))
+
+
+;; ── per-call fixed costs: plan once, filter only when there is history ─
+
+(deftest a-query-form-is-parsed-and-planned-once
+  ; Measured: parse+validate+plan is ~0.45 ms of a ~0.86 ms point query —
+  ; half of every call, for a form that is a literal in the source and
+  ; never changes. The engine memoises the planned form by VALUE.
+  (let [q '[:find ?n :in $ ?e :where [?e :p/n ?n]]
+        db (datom.conn/db (fixture 5))]
+    (datom.query.engine/q q db 1)
+    (let [before (datom.query.engine/plan-cache-stats)]
+      (datom.query.engine/q q db 2)
+      (datom.query.engine/q q db 3)
+      (let [after (datom.query.engine/plan-cache-stats)]
+        (is (= 2 (- (:hits after) (:hits before))) "the second and third calls hit the memo")
+        (is (= (:misses after) (:misses before)) "and miss nothing")))))
+
+(deftest the-plan-memo-is-bounded
+  ; A memo keyed by query VALUE must not grow with every distinct literal a
+  ; program ever builds (an app that templates ids into the form would
+  ; leak). Bounded: past the cap the oldest entries go.
+  (let [db (datom.conn/db (fixture 3))
+        n (+ 50 datom.query.engine/PLAN-CACHE-MAX)]
+    (loop [i 0]
+      (when (< i n)
+        (datom.query.engine/q [:find '?n :where ['?e :p/a i] ['?e :p/n '?n]] db)
+        (recur (+ i 1))))
+    (is (<= (:size (datom.query.engine/plan-cache-stats)) datom.query.engine/PLAN-CACHE-MAX))))
+
+(deftest a-history-free-column-skips-the-retraction-pass
+  ; `filter-datoms` built a `[e a v] → tx` map over EVERY candidate to pair
+  ; retractions with assertions — 5 µs a row, 727 ms over 64 708 rows that
+  ; held ZERO retractions. When a scan holds no retraction and the value
+  ; has no since/valid bound, every visible assertion is current by
+  ; definition and the map is never built.
+  (let [c (fixture 30)
+        db (datom.conn/db c)]
+    (reset! datom.db/FILTER-STATS {})
+    (datom.db/datoms db :aevt :p/n)
+    (is (= 1 (get (deref datom.db/FILTER-STATS) :fast 0)) "no retractions → the fast path")
+    (is (nil? (get (deref datom.db/FILTER-STATS) :indexed)))
+    ; retract one value: the pairing pass is needed again, and the answer
+    ; must not include the retracted datom
+    (let [d0 (first (datom.db/datoms db :aevt :p/n))]
+      (datom.conn/transact! c [[:db/retract (datom.index/-e d0) :p/n (datom.index/-v d0)]]))
+    (let [db2 (datom.conn/db c)
+          _ (reset! datom.db/FILTER-STATS {})
+          ds (datom.db/datoms db2 :aevt :p/n)
+          gone (datom.index/-v (first (datom.db/datoms db :aevt :p/n)))]
+      (is (>= (get (deref datom.db/FILTER-STATS) :indexed 0) 1) "a retraction → the pairing pass")
+      (is (nil? (get (deref datom.db/FILTER-STATS) :fast)) "and never the fast one")
+      (is (= 29 (count ds)))
+      (is (not (some (fn [d] (= gone (datom.index/-v d))) ds))))))
+
+(deftest as-of-still-pairs-retractions
+  ; The fast path is only sound when nothing in the scan is a retraction.
+  ; An as-of view over a column WITH a retraction must see the old value.
+  (let [c (fixture 5)
+        t0 (:basis-t (datom.conn/db c))
+        d0 (first (datom.db/datoms (datom.conn/db c) :aevt :p/n))]
+    (datom.conn/transact! c [[:db/retract (datom.index/-e d0) :p/n (datom.index/-v d0)]])
+    (let [then (datom.time/as-of (datom.conn/db c) t0)
+          now (datom.conn/db c)]
+      (is (= 5 (count (datom.db/datoms then :aevt :p/n))))
+      (is (= 4 (count (datom.db/datoms now :aevt :p/n)))))))
+

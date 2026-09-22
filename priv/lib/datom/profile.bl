@@ -1,0 +1,243 @@
+; datom/profile.bl — what a query actually COST, measured rather than argued.
+;
+; ── The gap this fills ────────────────────────────────────────────────
+;
+; Two instruments existed and neither answered the question an application
+; actually asks ("why is THIS request slow?").
+;
+; `datom.explain` reads the query text and the schema and reports the PLAN and
+; its smells — before anything runs. Correct, and blind to what happens: a plan
+; that looks narrow can still scan a column, and a count of store requests
+; cannot see the work between them (cost_test.bl records a join that passed a
+; "constant number of requests" test for the whole time it took five seconds,
+; because the quadratic part was in memory).
+;
+; `CountingStore` (test/bl/datom/cost_test.bl) counts store operations
+; truthfully — but it lives in a TEST, as a decorator a test builds by hand.
+; In production the only figure available was the request's own wall-clock
+; time, which says nothing about which of the three layers spent it, and which
+; cannot even be compared across runs on a loaded host (two identical bulk runs
+; there differed by 2.2x).
+;
+; This namespace promotes both ideas into the library:
+;
+;   · `watch`      — a store decorator that COUNTS every operation and row
+;                    (the test double, promoted and capability-forwarding);
+;   · `analyze`    — a query run with that store AND the engine's per-clause
+;                    trace on, returning result, counters, per-clause facts,
+;                    the static plan, and a verdict.
+;
+; The two halves answer different questions on purpose. Store counters answer
+; "what did we ask the store for?" — the figure that predicts cost behind a
+; network. Per-clause rows-in/rows-out answer "how much work happened between
+; the requests?" — the figure that predicts CPU. A report with only one of them
+; is the half that misled somebody already.
+;
+; ── Why measuring must not CHANGE what it measures ───────────────────
+;
+; A wrapper around the store is a different VALUE, and the caches above the
+; port (`datom.attr-basis`, `datom.query.corpus`) are keyed by store value. A
+; naive profile would therefore build its own derived columns and report the
+; BUILD as the query's cost — the measurement perturbing the measured. So
+; `ProfilingStore` declares `datom.store/Underlying`, and those caches key the
+; base store (see `datom.store/identity-of`).
+;
+; The same reasoning drives capability forwarding: `MultiScan`/`PageScan` are
+; optional protocols dispatched on the store value, so a wrapper that omitted
+; them would silently make the profiled query read a whole column where the
+; unprofiled one read 3 520 datoms — and the profile would confidently report
+; the wrong shape. All three read capabilities are forwarded and counted.
+
+(ns datom.profile
+  (:require [datom.db] [datom.store] [datom.query.engine] [datom.query.parse]
+            [datom.query.plan] [datom.explain]))
+
+;; ── the counted store ───────────────────────────────────────────────
+
+(def COUNTER-KEYS
+  "Every counter this decorator keeps, so a report can render them all and a
+   test can ask for one by name. `:rows` is what came BACK; the op counters are
+   what was ASKED. A wrapper must forward the capability protocol, or the
+   op counters quietly report a slower read shape than the unprofiled one."
+  [:get :range :put :delete :update :commit
+   :scan :multiscan :page :rows :bounds])
+
+(defn- empty-counters []
+  (reduce (fn [m k] (assoc m k 0)) {} COUNTER-KEYS))
+
+(defn- bump
+  "Add `n` to counter `k`. An ETS-free atom: a profile is per-value and
+   short-lived, and an atom's `swap!` is the cheapest correct increment."
+  [counters k n]
+  (swap! counters (fn [m] (assoc m k (+ (or (get m k) 0) n)))))
+
+(defrecord ProfilingStore [inner counters]
+  datom.store/Store
+  (-get [s k] (bump (:counters s) :get 1) (datom.store/-get (:inner s) k))
+  (-range [s lo hi]
+    (bump (:counters s) :range 1)
+    (let [r (datom.store/-range (:inner s) lo hi)]
+      (bump (:counters s) :rows (count r))
+      r))
+  (-put [s k v] (bump (:counters s) :put 1) (datom.store/-put (:inner s) k v))
+  (-delete [s k] (bump (:counters s) :delete 1) (datom.store/-delete (:inner s) k))
+  (-update [s k f] (bump (:counters s) :update 1) (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (bump (:counters s) :commit 1) (datom.store/-commit (:inner s) ops)))
+
+;; `extend-protocol`, not a second `extend-type`: in this dialect an `extend-type`
+;; on a type REPLACES its protocol table, so a second one here would delete the
+;; `Store` implementation above it.
+(extend-protocol datom.store/Scan
+  ProfilingStore
+  (-scan-datoms [s lo hi]
+    (bump (:counters s) :scan 1)
+    (let [r (datom.store/scan-datoms (:inner s) lo hi)]
+      (bump (:counters s) :rows (count r))
+      r)))
+
+(extend-protocol datom.store/MultiScan
+  ProfilingStore
+  (-scan-prefixes [s bounds]
+    (bump (:counters s) :multiscan 1)
+    (bump (:counters s) :bounds (count bounds))
+    (let [r (datom.store/scan-prefixes (:inner s) bounds)]
+      (bump (:counters s) :rows (count r))
+      r)))
+
+(extend-protocol datom.store/PageScan
+  ProfilingStore
+  (-scan-datoms-page [s start after hi limit]
+    (bump (:counters s) :page 1)
+    (let [r (datom.store/page-datoms (:inner s) start after hi limit)]
+      (bump (:counters s) :rows (count (get r :datoms)))
+      r)))
+
+; The store this profile wraps IS the store, for anything keyed by store value:
+; the derived-column caches ask `identity-of`, so a profiled read reuses the
+; corpus the base built instead of building a second one and billing it here.
+(extend-protocol datom.store/Underlying
+  ProfilingStore
+  (-underlying [s] (datom.store/identity-of (:inner s))))
+
+(extend-protocol datom.store/Alive?
+  ProfilingStore
+  (-alive? [s] (datom.store/alive? (:inner s))))
+
+; Not forwarded, deliberately: `Closeable` (a profile owns nothing to free, and
+; closing one must never close the store it watches) and `FileBacked` (a profile
+; is not opened at a path).
+
+(defn watch
+  "A store that counts every operation and row it is asked for, delegating to
+   `store`. Returns the wrapper; read it with `counters`."
+  [store]
+  (->ProfilingStore store (atom (empty-counters))))
+
+(defn counters
+  "The live counter map of a `watch`ed store: `{op n …, :rows n :bounds n}`."
+  [ps]
+  (deref (:counters ps)))
+
+(defn watched
+  "The store a profiler wraps (through any chain of wrappers)."
+  [ps]
+  (datom.store/identity-of (:inner ps)))
+
+(defn reset!
+  "Zero every counter. A measurement should not inherit another's totals."
+  [ps]
+  (reset! (:counters ps) (empty-counters))
+  ps)
+
+;; ── a database value read through the counter ───────────────────────
+
+(defn db
+  "`db` with its store wrapped for counting — the same schema, basis, filter
+   and blob tier, so every answer is identical (only the accounting differs)."
+  [db]
+  (datom.db/db-value (watch (datom.db/store-of db))
+                     (datom.db/schema-of db)
+                     (datom.db/basis-t db)
+                     (datom.db/blobs-of db)))
+
+;; ── the analyze report ──────────────────────────────────────────────
+
+(defn- clause-line [f]
+  (str "  " (pr-str (get f :clause))
+       "  shape=" (pr-str (get f :shape))
+       "  index=" (pr-str (get f :index))
+       (let [n (get f :prefixes)]
+         (if (and (some? n) (> n 0)) (str "  prefixes=" n) ""))
+       "  candidates=" (get f :candidates)
+       "  rows " (get f :rows-in) "→" (get f :rows-out)))
+
+(defn- verdict
+  "One line naming what the run cost, in the terms that predict it: what the
+   STORE was asked for, and how many rows moved between the requests."
+  [counters facts]
+  (let [asks (+ (get counters :range) (get counters :scan)
+                (get counters :multiscan) (get counters :page)
+                (get counters :get))
+        worst (reduce (fn [a f]
+                        (if (or (nil? a) (> (get f :candidates) (get a :candidates))) f a))
+                      nil facts)]
+    (str asks " store read" (if (= 1 asks) "" "s")
+         " · " (get counters :rows) " rows back · "
+         (count facts) " clause" (if (= 1 (count facts)) "" "s")
+         (if (nil? worst)
+           ""
+           (str " · widest read: " (pr-str (get worst :clause))
+                " (" (get worst :candidates) " candidates)")))))
+
+(defn analyze
+  "Run `query` against `db` (with optional `inputs`) and report what it cost:
+
+     {:result    the query's answer — identical to `q`'s
+      :store     store counters: ops asked, rows returned, bounds listed
+      :clauses   per clause: shape, index, candidates, rows in and out
+      :plan      the static plan (`datom.query.plan`) — the before picture
+      :smells    static per-row rescans (`datom.explain`)
+      :verdict   one line}
+
+   Both halves of the picture in one call: `:store` is what a network would have
+   charged for, `:clauses` is what the CPU did between the requests. Callers who
+   only want the answer should call `datom.query.engine/q`; this is the call for
+   when the answer was not the interesting part.
+
+   The trace is per PROCESS and restored on exit, so a nested or concurrent
+   query is unaffected — and the result is not a projection, so `analyze` is
+   `q` with accounting."
+  [query db & inputs]
+  (let [pdb (db db)
+        [result facts] (datom.query.engine/with-trace
+                         (fn [] (apply datom.query.engine/q query pdb inputs)))]
+    {:result result
+     :store (counters (datom.db/store-of pdb))
+     :clauses facts
+     :plan (datom.query.plan/plan (datom.query.parse/parse query))
+     :smells (try (datom.explain/smells query db) (catch _ []))
+     :verdict (verdict (counters (datom.db/store-of pdb)) facts)}))
+
+(defn render
+  "The report as text — a REPL or `bl run` wants one call."
+  [report]
+  (let [c (get report :store)]
+    (join "\n"
+          (concat
+            [(str "store: " (get c :range) " range · " (get c :multiscan) " multiscan"
+                  (let [b (get c :bounds)] (if (> b 0) (str " (" b " bounds)") ""))
+                  " · " (get c :scan) " scan · " (get c :page) " page · "
+                  (get c :get) " get · " (get c :rows) " rows")]
+            ["clauses:"]
+            (map clause-line (get report :clauses))
+            (if (seq (get report :smells))
+              (into [(str "smells: " (count (get report :smells)) " per-row rescan(s)")]
+                    (map (fn [s] (str "  " (pr-str (get s :clause))
+                                      " → " (pr-str (get s :index)))) (get report :smells)))
+              [])
+            [(str "verdict: " (get report :verdict))]))))
+
+(defn analyze-str
+  "`analyze` rendered to text."
+  [query db & inputs]
+  (render (apply analyze query db inputs)))

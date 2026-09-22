@@ -1,0 +1,285 @@
+; test/bl/datom/attribute_page_test.bl — paging an attribute column in bounded
+; pages, whole ENTITY groups at a time.
+;
+; Run: BEAM_LISP_PATH=<tree>/priv/lib bl test test/bl/datom/attribute_page_test.bl
+;
+; A durable backfill cannot afford to materialize a whole `:chunk/text` column
+; to walk it: that is O(corpus) in the middle of an otherwise incremental
+; pipeline. `datom/attribute-page` is the bounded read — the next `limit`
+; entity groups of one attribute after a cursor — and this file is its proof:
+;
+;   • the pages concatenate to EXACTLY the full `attr-datoms`, values,
+;     supersessions and retractions alike (all substrates, fjall included);
+;   • a group that spans a native page boundary is still read WHOLE, so a
+;     retraction on the far side of the crossing can never be missed and a
+;     stale value never published (the naive half-group is demonstrated to
+;     fail, so the guarantee is not vacuous);
+;   • the cursor is the ENTITY, so a fully retracted group still advances and
+;     `:more?`, not a row count, ends the walk;
+;   • snapshot / `as-of` / `since` / `history` compose (the db's own filter);
+;   • the durable path takes BOUNDED pages and never the unbounded
+;     `-scan-datoms` — a storage spy proves the crossing, not just the count.
+
+(ns datom.attribute.page.test
+  (:require [datom] [datom.conn] [datom.db] [datom.index] [datom.schema]
+            [datom.store] [datom.store-ets] [datom.store-map]
+            [datom.store-fjall]))
+
+(def schema
+  [{:db/ident :p/n   :db/valueType :db.type/long}
+   {:db/ident :p/tag :db/valueType :db.type/string
+                     :db/cardinality :db.cardinality/many}])
+
+(defn- impls
+  "Every Store that can back a connection, as `[name open-fn]`. fjall only
+   when its NIF loaded; each file-backed engine mints its own fresh path."
+  []
+  (let [base [["ets" datom.store-ets/open] ["map" datom.store-map/open]]]
+    (if (datom.store-fjall/available?)
+      (conj base ["fjall" datom.store-fjall/open-fresh])
+      base)))
+
+(defn- conn-on [open-fn]
+  (datom.conn/connect-with (open-fn) schema))
+
+(defn- walk
+  "Page `attr` from the start until `:more?` is false. Returns the pages
+   concatenated in cursor order, how many pages that took, and the final
+   cursor. `limit` entities per page."
+  [db attr limit]
+  (loop [after nil acc [] pages 0]
+    (let [p (datom/attribute-page db attr after limit)]
+      (if (:more? p)
+        (recur (:after-eid p) (into acc (:datoms p)) (inc pages))
+        {:datoms (into acc (:datoms p)) :pages (inc pages) :after (:after-eid p)}))))
+
+(defn- many?
+  "`true` when any datom in `ds` carries value `v`."
+  [ds v]
+  (some (fn [d] (= v (datom/datom-v d))) ds))
+
+;; ── 1. pages == the whole column ──────────────────────────────────────
+
+(deftest many-pages-equal-the-whole-attribute-column
+  (doseq [impl (impls)]
+    (let [c (conn-on (get impl 1))
+          _ (datom.conn/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/n i}) (range 25)))
+          db (datom.conn/db c)
+          w (walk db :p/n 4)]
+      ; Equality is the strongest statement available: the paged walk is an
+      ; AEVT-ordered, db-filtered read, and so is `attr-datoms`, so a correct
+      ; page sequencer reproduces it datom-for-datom.
+      (is (= (datom.db/attr-datoms db :p/n) (:datoms w))
+          (str (get impl 0) ": the pages concatenate to the full column"))
+      (is (> (:pages w) 1)
+          (str (get impl 0) ": 25 entities at 4/page took more than one page"))
+      (is (= 25 (count (:datoms w)))
+          (str (get impl 0) ": every entity is present exactly once")))))
+
+(deftest a-tail-smaller-than-the-page-is-still-complete
+  (let [c (conn-on datom.store-ets/open)
+        _ (datom.conn/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/n i}) (range 7)))
+        db (datom.conn/db c)
+        w (walk db :p/n 5)]
+    (is (= 2 (:pages w)) "5 then 2")
+    (is (= (datom.db/attr-datoms db :p/n) (:datoms w)))
+    (is (= false (:more? (datom/attribute-page db :p/n (:after w) 5)))
+        "the last page is terminal")
+    (is (= [] (:datoms (datom/attribute-page db :p/n (:after w) 5)))
+        "past the end, an empty page")))
+
+;; ── 2. complete ENTITY groups at a native page boundary ───────────────
+
+(deftest a-group-crossing-a-page-boundary-is-read-whole
+  (doseq [impl (impls)]
+    (let [c (conn-on (get impl 1))
+          vals (mapv (fn [i]
+                       (str "v" (if (< i 10) (str "00" i)
+                                    (if (< i 100) (str "0" i) (str i)))))
+                     (range 100))
+          r (datom.conn/transact! c (mapv (fn [v] [:db/add -1 :p/tag v]) vals))
+          e (get (:tempids r) -1)
+          ; A 101-datom group (100 values + one retraction) is far larger
+          ; than any page chunk, so its datoms necessarily SPAN native
+          ; crossings; the retraction of v063 lands right after v063's
+          ; assertion, where a page-local filter would miss it.
+          _ (datom.conn/transact! c [[:db/retract e :p/tag "v063"]])
+          db (datom.conn/db c)
+          w (walk db :p/tag 1)]
+      (is (= (datom.db/attr-datoms db :p/tag) (:datoms w))
+          (str (get impl 0) ": the split group still matches the full read"))
+      (is (= 99 (count (:datoms w)))
+          (str (get impl 0) ": the retracted value is gone"))
+      (is (not (many? (:datoms w) "v063"))
+          (str (get impl 0) ": no stale value survives the crossing"))
+      ; Make the hazard visible rather than assumed: a retraction sorts
+      ; IMMEDIATELY after its assertion in AEVT, so ANY native page boundary
+      ; between the two makes a page-local filter publish the retracted
+      ; value. Filtering the prefix that ends on the assertion (a legal page
+      ; edge, whatever its size) must therefore FAIL — unless the group is
+      ; completed first, which is what the API does.
+      (let [raw (datom.index/scan (datom.db/store-of db) :aevt :p/tag)
+            idx (loop [i 0 ds raw]
+                  (cond
+                    (empty? ds) nil
+                    (= "v063" (datom/datom-v (first ds))) i
+                    :else (recur (inc i) (rest ds))))
+            naive (datom.db/filter-datoms db (vec (take (inc idx) raw)))]
+        (is (many? naive "v063")
+            (str (get impl 0) ": a half group WOULD show the stale value"))))))
+
+;; ── 3. the cursor is the entity ───────────────────────────────────────
+
+(deftest cursor-advances-across-a-fully-retracted-group
+  (doseq [impl (impls)]
+    (let [c (conn-on (get impl 1))
+          r1 (datom.conn/transact! c [{:db/id -1 :p/n 1}
+                                      {:db/id -2 :p/n 2}
+                                      {:db/id -3 :p/n 3}])
+          e1 (get (:tempids r1) -1)
+          _ (datom.conn/transact! c [[:db/retract e1 :p/n 1]])
+          db (datom.conn/db c)
+          p1 (datom/attribute-page db :p/n nil 1)
+          w (walk db :p/n 1)]
+      (is (= [] (:datoms p1))
+          (str (get impl 0) ": the first group is fully retracted"))
+      (is (= true (:more? p1))
+          (str (get impl 0) ": yet more follows — the cursor advanced over it"))
+      (is (= e1 (:after-eid p1))
+          (str (get impl 0) ": the cursor is that retracted entity"))
+      (is (= 3 (:pages w))
+          (str (get impl 0) ": one page per group, retracted group included"))
+      (is (= (datom.db/attr-datoms db :p/n) (:datoms w)))
+      (is (not (many? (:datoms w) 1))
+          (str (get impl 0) ": the retracted value stays gone")))))
+
+(deftest limit-one-walks-each-entity-group-once
+  (let [c (conn-on datom.store-ets/open)
+        _ (datom.conn/transact! c [{:db/id -1 :p/n 10}
+                                   {:db/id -2 :p/n 20}
+                                   {:db/id -3 :p/n 30}])
+        db (datom.conn/db c)
+        w (walk db :p/n 1)]
+    (is (= 3 (:pages w)) "one entity group per page")
+    (is (= (datom.db/attr-datoms db :p/n) (:datoms w)))
+    (is (= [10 20 30] (mapv datom/datom-v (:datoms w))) "cursor order")))
+
+(deftest sparse-entity-ids-page-without-gaps
+  (let [c (conn-on datom.store-ets/open)
+        _ (datom.conn/transact! c [{:db/id 10 :p/n 1} {:db/id 1000000 :p/n 2}])
+        db (datom.conn/db c)
+        w (walk db :p/n 1)]
+    (is (= 2 (:pages w)))
+    (is (= [10 1000000] (into [] (sort (map datom/datom-e (:datoms w))))))))
+
+(deftest an-empty-attribute-is-a-terminal-empty-page
+  (let [c (conn-on datom.store-ets/open)
+        db (datom.conn/db c)
+        p (datom/attribute-page db :p/n nil 5)]
+    (is (= [] (:datoms p)))
+    (is (= false (:more? p)))
+    (is (nil? (:after-eid p)) "nothing consumed, no cursor")))
+
+;; ── 4. time views compose ─────────────────────────────────────────────
+
+(deftest a-captured-basis-pages-the-world-it-saw
+  (let [c (conn-on datom.store-ets/open)
+        _ (datom.conn/transact! c [{:db/id -1 :p/n 1}])
+        db (datom.conn/db c)                              ; capture the basis
+        _ (datom.conn/transact! c [{:db/id -2 :p/n 2}])   ; a concurrent write
+        w (walk db :p/n 5)]
+    (is (= (datom.db/attr-datoms db :p/n) (:datoms w)))
+    (is (= [1] (mapv datom/datom-v (:datoms w))) "only what the snapshot saw")
+    (is (= 2 (count (datom.db/attr-datoms (datom.conn/db c) :p/n)))
+        "the live db sees both")))
+
+(deftest as-of-since-and-history-compose
+  (let [c (conn-on datom.store-ets/open)
+        r1 (datom.conn/transact! c [{:db/id -1 :p/n 1} {:db/id -2 :p/n 2}])
+        e1 (get (:tempids r1) -1)
+        t1 (:tx r1)
+        _ (datom.conn/transact! c [[:db/add e1 :p/n 10]])
+        db (datom.conn/db c)
+        as-of (datom/as-of db t1)
+        since (datom/since db t1)
+        hist (datom/history db)]
+    (is (= (datom.db/attr-datoms as-of :p/n) (:datoms (walk as-of :p/n 1)))
+        "as-of: the pre-supersession world")
+    (is (= [1 2] (into [] (sort (mapv datom/datom-v (:datoms (walk as-of :p/n 1))))))
+        "as-of reads the old value 1")
+    (is (= (datom.db/attr-datoms since :p/n) (:datoms (walk since :p/n 1)))
+        "since: only the delta after t1")
+    (is (many? (:datoms (walk since :p/n 1)) 10) "the supersession is in the delta")
+    (is (= (datom.db/attr-datoms hist :p/n) (:datoms (walk hist :p/n 1)))
+        "history: retractions are visible datoms too")
+    (is (many? (:datoms (walk hist :p/n 1)) 1)
+        "history keeps the superseded value")))
+
+;; ── 5. bad arguments are refused ──────────────────────────────────────
+
+(deftest unknown-attribute-and-bad-limit-are-refused
+  (let [c (conn-on datom.store-ets/open)
+        db (datom.conn/db c)]
+    (is (try (datom/attribute-page db :nope/attr nil 1) false (catch _ true))
+        "an unknown attribute raises rather than paging an empty column")
+    (is (try (datom/attribute-page db :p/n nil 0) false (catch _ true))
+        "limit 0 raises")
+    (is (try (datom/attribute-page db :p/n nil -3) false (catch _ true))
+        "a negative limit raises")
+    (is (try (datom/attribute-page db :p/n "not-an-eid" 1) false (catch _ true))
+        "a non-numeric cursor raises rather than paging the wrong slice")))
+
+;; ── 6. the durable path is BOUNDED (storage spy) ──────────────────────
+;;
+;; The rows a page RETURNS are no proof: a wrong implementation could read the
+;; whole column and hand back `limit`. So the spy wraps a real fjall store,
+;; delegates `Store`, and records every paging crossing (rows returned vs the
+;; bound asked for) AND every call to the UNBOUNDED `-scan-datoms`. A bounded
+;; walk is one where the unbounded read is never called and each crossing
+;; stays within its page budget.
+
+(defrecord SpyStore [inner pages scans])
+
+(extend-type SpyStore
+  datom.store/Store
+  (-get [s k] (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (datom.store/-put (:inner s) k v) s)
+  (-delete [s k] (datom.store/-delete (:inner s) k) s)
+  (-update [s k f] (let [r (datom.store/-update (:inner s) k f)] [s (get r 1)]))
+  (-commit [s ops] (datom.store/-commit (:inner s) ops) s))
+
+(extend-protocol datom.store/PageScan
+  SpyStore
+  (-scan-datoms-page [s start after hi limit]
+    (let [r (datom.store/-scan-datoms-page (:inner s) start after hi limit)]
+      (swap! (:pages s) conj [(count (:datoms r)) limit])
+      r)))
+
+(extend-protocol datom.store/Scan
+  SpyStore
+  (-scan-datoms [s lo hi]
+    (swap! (:scans s) conj [lo hi])
+    (datom.store/-scan-datoms (:inner s) lo hi)))
+
+(deftest the-durable-page-path-is-bounded-not-a-column-scan
+  (if (not (datom.store-fjall/available?))
+    (is true "fjall absent — the bounded native path cannot be exercised here")
+    (let [spy (->SpyStore (datom.store-fjall/open-fresh) (atom []) (atom []))
+          c (datom.conn/connect-with spy schema)
+          _ (datom.conn/transact! c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/n i}) (range 300)))
+          db (datom.conn/db c)]
+      (reset! (:pages spy) [])
+      (reset! (:scans spy) [])
+      (let [w (walk db :p/n 24)
+            crossings @(:pages spy)]
+        (is (= 0 (count @(:scans spy)))
+            "the unbounded -scan-datoms was NEVER called on the durable path")
+        (is (> (count crossings) 1) "the walk crossed in more than one page")
+        (is (< (count crossings) 40) "and not one crossing per row")
+        (is (every? (fn [pc] (<= (get pc 0) 128)) crossings)
+            "each crossing returned a bounded number of rows")
+        (is (every? (fn [pc] (<= (get pc 1) 128)) crossings)
+            "and each asked for a bounded page, never the column")
+        (is (= (datom.db/attr-datoms db :p/n) (:datoms w))
+            "still exactly the full column's visible datoms")))))

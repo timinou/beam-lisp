@@ -36,7 +36,7 @@
 ; Recorded rather than pretended away.
 
 (ns datom.query.engine
-  (:require [datom.db] [datom.index] [datom.query.agg] [datom.query.parse]
+  (:require [datom.db] [datom.index] [datom.store] [datom.query.agg] [datom.query.parse]
             [datom.query.plan] [datom.schema] [datom.query.analytic]
             [datom.query.rules]))
 
@@ -454,6 +454,45 @@
 
       :else (throw (ex-info (str "unknown rule operator: " op) {:clause clause})))))
 
+;; ── the per-clause trace (the engine's own instrumentation) ───────────
+;;
+;; `datom.explain` answers "what does this query's PLAN cost" before it runs,
+;; from the query text and the schema. This answers "what did each clause
+;; ACTUALLY read", from the run — the second half of the picture, and the one
+;; that catches a plan that is fine on paper and quadratic in fact (a count of
+;; store requests cannot see the work BETWEEN them; see cost_test.bl).
+;;
+;; The collector lives in the PROCESS DICTIONARY, not a dynamic var (this
+;; dialect has no `binding`), following the same idiom as `oracle`'s memo:
+;; one private key, plain `put`/`get`, and a `with-` helper for save/restore.
+;; The cost when nothing is tracing is ONE dictionary read per CLAUSE — never
+;; per row — so the hot path pays nothing measurable for the hook existing.
+
+(def ^:private TRACE-KEY :datom-query-trace)
+
+(defn trace-on!
+  "Collect a per-clause trace into `collector` (an atom holding a vector) for
+   queries evaluated by this process. Returns the collector."
+  [collector] (erlang/put TRACE-KEY collector) collector)
+
+(defn trace-off! [] (erlang/put TRACE-KEY nil) :off)
+
+(defn- record-scan! [fact]
+  (let [c (erlang/get TRACE-KEY)]
+    (when (and (some? c) (not= :undefined c))
+      (swap! c (fn [v] (conj v fact))))
+    nil))
+
+(defn with-trace
+  "Run `f` with a per-clause trace on, restoring the previous collector. Returns
+   `[result facts]`. `datom.profile/analyze` is this, plus a counted store."
+  [f]
+  (let [prev (erlang/get TRACE-KEY)
+        c (atom [])]
+    (erlang/put TRACE-KEY c)
+    (try (let [r (f)] [r (deref c)])
+         (finally (erlang/put TRACE-KEY prev)))))
+
 (defn- range-scan-or-full
   "A BOUNDED scan when a later comparison predicate constrains this
    pattern's value on an indexed attribute, else the ordinary full scan.
@@ -495,9 +534,59 @@
                              (if (nil? high) nil (get high 0)))
       (apply datom.db/datoms db index components))))
 
+(def SEMI-JOIN-MAX
+  "The most distinct join values a semi-join reads by prefix before the
+   engine prefers one column scan. Above this the prefix list itself is the
+   cost — and a column with fewer rows than bound entities is the cheaper
+   read. Deliberately a constant, not a statistic: predictable beats clever
+   here, exactly as `clause-cost` argues."
+  4096)
+
+(defn- semi-join-selection
+  "How to read `clause` for a join variable at `position` that is bound in
+   every row: `[index component-vectors]` — one prefix per distinct bound
+   value — or nil when no index prefix-scans on that position.
+
+   The shapes, by which position the join variable occupies:
+     entity (0)   → EAVT [e] or [e a] when the attribute is a constant
+     value  (2)   → AVET [a v] when the attribute is constant and indexed;
+                    VAET [v] when the attribute is unbound and every value
+                    is an entity id (a ref)
+   An attribute-position join (`[?e ?a _]` over bound `?a`) has no prefix
+   index and falls back to the column path."
+  [schema common terms position values]
+  (let [a (get terms 1)
+        a-const? (and (not (datom.query.parse/variable? a))
+                      (not (datom.query.parse/blank? a)))
+        a-bound (cond a-const? a
+                      (datom.query.parse/variable? a) (get common a)
+                      :else nil)]
+    (cond
+      (= position 0)
+        (if (some? a-bound)
+          [:eavt (mapv (fn [v] [v a-bound]) values)]
+          [:eavt (mapv (fn [v] [v]) values)])
+      (= position 2)
+        (cond
+          (and (some? a-bound) (datom.schema/indexed? schema a-bound))
+            [:avet (mapv (fn [v] [a-bound v]) values)]
+          (and (nil? a-bound) (every? int? values))
+            [:vaet (mapv (fn [v] [v]) values)]
+          :else nil)
+      :else nil)))
+
 (defn- pattern-scan-once
   "Every extension of EVERY binding in `bindings` under `clause`, using a
    SINGLE store scan.
+
+   Two shapes of that single scan. When the join variable is bound in EVERY
+   row — to different values, one entity per row — the clause is read as a
+   SEMI-JOIN: one multi-prefix request over the distinct bound values, so
+   the store hands back only the datoms of the rows being joined. Otherwise
+   the clause is scanned once, bounded by what is common to every row, and
+   hash-joined in memory. Same answer either way; the semi-join is what
+   makes a 1 760-row join over a 64 708-row column read 3 520 datoms
+   instead of 129 416.
 
    The nested-loop form asked the store once per binding row, so a
    two-clause join over N entities issued N+1 range reads \u2014 measured
@@ -529,18 +618,52 @@
                                    (into [] (keys acc)))))
                        nil
                        bindings)
-        selection (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause)
-        index (get selection 0)
-        components (get selection 1)
-        candidates (range-scan-or-full db index components clause remaining common)
         terms (datom.query.plan/pattern-terms clause)
         ; The variable this clause SHARES with the rows already bound.
         ; It is the join key, and indexing candidates by it turns the
         ; match from a scan into a lookup.
         join-var (first (filterv (fn [v] (and (datom.query.parse/variable? v)
                                               (contains? (first bindings) v)))
-                                 terms))]
-    (if (nil? join-var)
+                                 terms))
+        join-position (if (nil? join-var)
+                        nil
+                        (loop [i 0]
+                          (if (>= i (count terms))
+                            nil
+                            (if (= (get terms i) join-var) i (recur (+ i 1))))))
+        ; The semi-join read: the join variable bound in EVERY row, to values
+        ; the common bound does not already pin, few enough to list.
+        join-values (if (and (some? join-var)
+                             (not (contains? (or common {}) join-var))
+                             (every? (fn [b] (contains? b join-var)) bindings))
+                      (into [] (distinct (mapv (fn [b] (get b join-var)) bindings)))
+                      nil)
+        semi (if (and (some? join-values)
+                      (<= (count join-values) SEMI-JOIN-MAX)
+                      ; only a store that answers N prefixes in ONE request:
+                      ; anything else would be the N+1 shape in disguise.
+                      (datom.store/multi-scan? (datom.db/store-of db)))
+               (semi-join-selection (datom.db/schema-of db) (or common {})
+                                    terms join-position join-values)
+               nil)
+        ; The read this clause will make, named once so the trace can report
+        ; the SHAPE rather than only the rows: a semi-join and a column scan
+        ; can return the same candidates and differ by 36x in what the store
+        ; was asked for.
+        shape (if (some? semi) :multiscan :scan)
+        selection (if (some? semi)
+                    semi
+                    (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause))
+        read-index (get selection 0)
+        read-components (get selection 1)
+        prefixes (if (some? semi) (count (get semi 1)) 0)
+        candidates (if (some? semi)
+                     (datom.db/datoms-many db read-index read-components)
+                     (range-scan-or-full db read-index read-components clause remaining common))
+        ; The result, bound once so the trace can report rows in and out —
+        ; the figure that shows work done BETWEEN store requests, which no
+        ; request count can see.
+        result (if (nil? join-var)
       ; Nothing shared: this is a cartesian product, and every candidate
       ; must be tried against every row. Rare, and inherently quadratic
       ; in the SIZE OF THE ANSWER rather than in wasted work.
@@ -557,10 +680,7 @@
       ; failed. Reducing the store operations to a constant had made the
       ; I/O honest while leaving the CPU quadratic, which is why a join
       ; that reads 2 ranges still took 5 seconds.
-      (let [position (loop [i 0]
-                       (if (>= i (count terms))
-                         nil
-                         (if (= (get terms i) join-var) i (recur (+ i 1)))))
+      (let [position join-position
             value-at (fn [d]
                        (cond (= position 0) (datom.index/-e d)
                              (= position 1) (datom.index/-a d)
@@ -575,7 +695,18 @@
                      (filterv some?
                               (mapv (fn [d] (unify-pattern b clause d))
                                     (or (get buckets (get b join-var)) []))))
-                   bindings)))))
+                   bindings)))]
+    (record-scan! {:clause clause
+                   :shape shape
+                   :index read-index
+                   :components read-components
+                   :prefixes prefixes
+                   :join-var join-var
+                   :join-position join-position
+                   :candidates (count candidates)
+                   :rows-in (count bindings)
+                   :rows-out (count result)})
+    result))
 
 (defn run-clauses
   "Fold every clause over the binding set.
@@ -692,6 +823,57 @@
           (loop [i 0 acc []]
             (if (>= i (count forms)) acc (recur (+ i 1) (conj acc i)))))))
 
+(def PLAN-CACHE-MAX
+  "Distinct query forms the plan memo holds. Past this the oldest go.
+   1 024 covers every literal query an application has; a program that
+   templates values INTO the form (rather than binding them through `:in`)
+   churns through it harmlessly."
+  1024)
+
+(def ^:private PLAN-CACHE
+  "`{query-form → {:parsed :planned :in-forms}}` plus an insertion ring.
+   Parse + validate + plan measured ~0.45 ms of a ~0.86 ms point query —
+   half of every call, for a form that is a literal in the source. Keyed by
+   the query VALUE, so the same form from any caller is one entry."
+  (atom {:entries {} :order [] :hits 0 :misses 0}))
+
+(defn plan-cache-stats
+  "`{:size :hits :misses}` — for tests and `datom/explain`."
+  []
+  (let [c (deref PLAN-CACHE)]
+    {:size (count (:entries c)) :hits (:hits c) :misses (:misses c)}))
+
+(defn- prepare
+  "The parsed, validated and planned form of `query`, from the memo when
+   this exact form has been seen. Throws `invalid query` exactly as the
+   unmemoised path did — an invalid form is never cached."
+  [query]
+  (let [hit (get (:entries (deref PLAN-CACHE)) query)]
+    (if (some? hit)
+      (do (swap! PLAN-CACHE (fn [c] (assoc c :hits (+ 1 (:hits c)))))
+          hit)
+      (let [parsed (datom.query.parse/parse query)
+            problems (into (datom.query.parse/validate parsed)
+                           (datom.query.agg/validate-find (:find parsed)))]
+        (if (seq problems)
+          (throw (ex-info "invalid query" {:problems problems}))
+          (let [entry {:parsed parsed
+                       :planned (datom.query.plan/plan parsed)
+                       :in-forms (datom.query.parse/input-forms parsed)}]
+            (swap! PLAN-CACHE
+                   (fn [c]
+                     (let [order (conj (:order c) query)
+                           entries (assoc (:entries c) query entry)
+                           over (- (count order) PLAN-CACHE-MAX)]
+                       (if (> over 0)
+                         (let [gone (subvec order 0 over)]
+                           {:entries (reduce dissoc entries gone)
+                            :order (subvec order over)
+                            :hits (:hits c) :misses (+ 1 (:misses c))})
+                         {:entries entries :order order
+                          :hits (:hits c) :misses (+ 1 (:misses c))}))))
+            entry))))))
+
 (defn q
   "Run `query` against `db` with optional `inputs`.
 
@@ -707,17 +889,15 @@
   ; community, …) are not registered merely because engine :requires analytic;
   ; this forces analytic's body to run once. Idempotent and cheap.
   (datom.query.analytic/ensure-registered!)
-  (let [parsed (datom.query.parse/parse query)
-        problems (into (datom.query.parse/validate parsed)
-                       (datom.query.agg/validate-find (:find parsed)))]
-    (if (seq problems)
-      (throw (ex-info "invalid query" {:problems problems}))
+  (let [prepared (prepare query)
+        parsed (:parsed prepared)]
+    (do
       (let [; `input-forms` includes the `%` rules source, so arguments line
             ; up positionally; `binding-forms` (variables only) is what
             ; `bind-inputs` consumes. When a `%` form is present we split its
             ; argument off, materialise the rules to a fixpoint, and thread
             ; the resulting relations into evaluation.
-            in-forms (datom.query.parse/input-forms parsed)
+            in-forms (:in-forms prepared)
             supplied (into [] (or inputs '()))
             _ (when (not (= (count in-forms) (count supplied)))
                 (throw (ex-info "wrong number of query inputs"
@@ -766,7 +946,7 @@
                           (or (:all seeds) {})
                           (or (:query seeds) {}))
                         {})
-            planned (datom.query.plan/plan parsed)
+            planned (:planned prepared)
             bindings (run-clauses db initial (:where planned) resolve-fn rules-rel)
             find-elements (:find parsed)]
         ; With an aggregate present, the fold runs over the raw BINDINGS

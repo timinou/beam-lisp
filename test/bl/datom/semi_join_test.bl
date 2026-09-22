@@ -1,0 +1,103 @@
+; test/bl/datom/semi_join_test.bl — the semi-join reads the SAME rows on every
+; substrate, and the multi-prefix read is one crossing on the durable one.
+; Run: bl test test/bl/datom/semi_join_test.bl
+;
+; cost_test.bl pins the store-operation COUNTS against a counting ETS store.
+; This file pins the two things that file cannot see: that the answer is
+; substrate-independent (ETS, map, fjall agree with each other and with the
+; column path), and that the fjall `MultiScan` capability is really there —
+; a durable store without it would silently take the column path and pass
+; every correctness test while reading 40× the rows.
+
+(ns datom.semi-join.test
+  (:require [datom.conn] [datom.db] [datom.store] [datom.index] [datom.query.engine]
+            [datom.store-ets] [datom.store-map] [datom.store-fjall]))
+
+(defn- impls []
+  (let [base [["ets" datom.store-ets/open] ["map" datom.store-map/open]]]
+    (if (datom.store-fjall/available?)
+      (conj base ["fjall" datom.store-fjall/open-fresh])
+      base)))
+
+(def SCHEMA
+  [{:db/ident :c/src :db/valueType :db.type/ref :db/index true}
+   {:db/ident :c/order :db/valueType :db.type/long}
+   {:db/ident :c/text :db/valueType :db.type/string}
+   {:db/ident :c/tag :db/valueType :db.type/keyword :db/index true}
+   {:db/ident :s/name :db/valueType :db.type/string}])
+
+(defn- fixture
+  "`n` chunks over two sources; returns `[conn src-a]`."
+  [open n]
+  (let [c (datom.conn/connect-with (open) SCHEMA)
+        r (datom.conn/transact! c [{:db/id -1 :s/name "a"} {:db/id -2 :s/name "b"}])
+        a (get (:tempids r) -1) b (get (:tempids r) -2)]
+    (datom.conn/transact!
+      c (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                       :c/src (if (even? i) a b)
+                       :c/order i
+                       :c/text (str "t" i)
+                       :c/tag (if (= 0 (mod i 3)) :x :y)})
+              (range n)))
+    [c a]))
+
+(def JOIN '[:find ?o ?t :in $ ?src :where [?c :c/src ?src] [?c :c/order ?o] [?c :c/text ?t]])
+
+(deftest every-substrate-gives-the-same-semi-join-answer
+  (let [answers (mapv (fn [pair]
+                        (let [[c a] (fixture (get pair 1) 60)]
+                          [(get pair 0) (datom.query.engine/q JOIN (datom.conn/db c) a)]))
+                      (impls))
+        first-answer (get (first answers) 1)]
+    (is (= 30 (count first-answer)))
+    (doseq [pair answers]
+      (is (= first-answer (get pair 1)) (str (get pair 0) " agrees with the others")))))
+
+(deftest the-semi-join-agrees-with-the-column-path-on-every-position
+  ; join on the ENTITY position (the common case), and on the VALUE position
+  ; through an indexed attribute (`?tag` bound per row, `:c/tag` AVET).
+  (doseq [pair (impls)]
+    (let [[c a] (fixture (get pair 1) 45)
+          db (datom.conn/db c)
+          ; value-position join: which chunks share a tag with chunk 0's tag?
+          by-value (datom.query.engine/q
+                     '[:find ?other :in $ ?src :where
+                       [?c :c/src ?src] [?c :c/tag ?tag] [?other :c/tag ?tag]]
+                     db a)
+          expected (set (mapv (fn [r] [(get r 0)])
+                              (datom.query.engine/q
+                                '[:find ?other ?s :where [?c :c/src ?s] [?c :c/tag ?tag] [?other :c/tag ?tag]]
+                                db)))]
+      ; every chunk shares a tag with SOME chunk of source a (both tags occur
+      ; in every source), so the set equals every chunk.
+      (is (= 45 (count by-value)) (str (get pair 0) ": value-position semi-join"))
+      (is (= (set (mapv (fn [r] [(get r 0)]) (into [] by-value))) expected)))))
+
+(deftest a-semi-join-honours-the-basis-and-retractions
+  ; The multi-prefix read is UNFILTERED, like every scan; the db layer's
+  ; filter must still apply. Retract one chunk's text and ask again.
+  (doseq [pair (impls)]
+    (let [[c a] (fixture (get pair 1) 20)
+          db0 (datom.conn/db c)
+          victim (first (first (into [] (datom.query.engine/q
+                                          '[:find ?c :in $ ?src :where [?c :c/src ?src] [?c :c/order 0]] db0 a))))]
+      (datom.conn/transact! c [[:db/retract victim :c/text "t0"]])
+      (let [now (datom.query.engine/q JOIN (datom.conn/db c) a)
+            then (datom.query.engine/q JOIN db0 a)]
+        (is (= 10 (count then)) (str (get pair 0) ": the old value still sees t0"))
+        (is (= 9 (count now)) (str (get pair 0) ": the new value does not"))
+        (is (not (contains? (set (mapv (fn [r] (get r 1)) (into [] now))) "t0")))))))
+
+(deftest fjall-answers-many-prefixes-in-one-native-crossing
+  (when (datom.store-fjall/available?)
+    (let [[c a] (fixture datom.store-fjall/open-fresh 30)
+          store (:store c)
+          db (datom.conn/db c)]
+      (is (datom.store/multi-scan? store) "the durable store declares MultiScan")
+      (let [eids (mapv (fn [r] (get r 0))
+                       (into [] (datom.query.engine/q '[:find ?c :in $ ?src :where [?c :c/src ?src]] db a)))
+            rows (datom.index/scan-many store :eavt (mapv (fn [e] [e :c/order]) eids))]
+        (is (= 15 (count rows)) "one datom per bound entity")
+        (is (every? (fn [d] (= :c/order (datom.index/-a d))) rows))
+        ; key order within the pass: entity ids ascending
+        (is (= (into [] (sort eids)) (mapv datom.index/-e rows)))))))

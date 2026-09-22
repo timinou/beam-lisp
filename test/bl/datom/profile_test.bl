@@ -1,0 +1,196 @@
+; test/bl/datom/profile_test.bl — the runtime attribution: what a query ACTUALLY
+; cost, and that measuring it does not change it.
+; Run: bl test test/bl/datom/profile_test.bl
+;
+; ── What the assertions are, and why ─────────────────────────────────
+;
+; 1. The counters are TRUE. A `ProfilingStore` is validated against an
+;    INDEPENDENT counter — the same counting substrate the semi-join tests use
+;    — so a field the decorator forgets to forward cannot pass by agreeing with
+;    itself. (A decorator that omits `MultiScan` would report one column scan
+;    where the engine asked for N prefixes: the numbers would look plausible and
+;    describe a different query.)
+;
+; 2. The trace names the SHAPE. A semi-join and a column scan can return the
+;    same candidates and differ 36x in what the store was asked for — the shape
+;    is the fact that predicts cost, so it is asserted, not inferred.
+;
+; 3. The instrument does not perturb. `analyze` must give the SAME answer as `q`,
+;    and must not build a second derived column (the caches key store identity).
+;
+; No timings: see cost_test.bl on why a wall-clock assertion on this host is
+; noise dressed as a contract.
+
+(ns datom.profile.test
+  (:require [datom.conn] [datom.db] [datom.index] [datom.profile]
+            [datom.query.engine] [datom.store] [datom.store-ets]))
+
+;; ── an independent counter to validate the decorator against ─────────
+
+(def INDEPENDENT (atom {:range 0 :multiscan 0 :rows 0}))
+
+(defrecord CountingStore [inner]
+  datom.store/Store
+  (-get [s k] (datom.store/-get (:inner s) k))
+  (-range [s lo hi]
+    (swap! INDEPENDENT (fn [m] (assoc m :range (+ 1 (get m :range)))))
+    (let [r (datom.store/-range (:inner s) lo hi)]
+      (swap! INDEPENDENT (fn [m] (assoc m :rows (+ (count r) (get m :rows)))))
+      r))
+  (-put [s k v] (datom.store/-put (:inner s) k v))
+  (-delete [s k] (datom.store/-delete (:inner s) k))
+  (-update [s k f] (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (datom.store/-commit (:inner s) ops)))
+
+(extend-protocol datom.store/MultiScan
+  CountingStore
+  (-scan-prefixes [s bounds]
+    (swap! INDEPENDENT (fn [m] (assoc m :multiscan (+ 1 (get m :multiscan)))))
+    (let [r (datom.store/scan-prefixes (:inner s) bounds)]
+      (swap! INDEPENDENT (fn [m] (assoc m :rows (+ (count r) (get m :rows)))))
+      r)))
+
+(defn- indep [] (deref INDEPENDENT))
+
+(def ^:private CONN (atom nil))
+
+(defn- fixture []
+  (or (deref CONN)
+      (let [c (datom.conn/connect-with
+                (->CountingStore (datom.store-ets/open))
+                [{:db/ident :q/n :db/valueType :db.type/string}
+                 {:db/ident :q/a :db/valueType :db.type/long}
+                 {:db/ident :q/city :db/valueType :db.type/string}])]
+        (datom.conn/transact!
+          c
+          (mapv (fn [i] {:db/id (- 0 (+ i 1))
+                         :q/n (str "n" i) :q/a i
+                         :q/city (if (even? i) "London" "NY")})
+                (vec (range 60))))
+        (reset! CONN c)
+        c)))
+
+(defn- eids [db n]
+  (into [] (take n (mapv datom.index/-e (datom.db/attr-datoms db :q/n)))))
+
+(def JOIN '[:find ?n :in [?e ...] :where [?e :q/n ?n]])
+(def TWO-CLAUSE '[:find ?n ?c :where [?e :q/n ?n] [?e :q/city ?c]])
+
+;; ── 1. the counters agree with an independent count ─────────────────
+
+(deftest the-counters-agree-with-an-independent-counting-store
+  (let [c (fixture)
+        db (datom.conn/db c)
+        kept (eids db 40)]
+    (reset! INDEPENDENT {:range 0 :multiscan 0 :rows 0})
+    (let [rep (datom.profile/analyze JOIN db kept)]
+      (is (= 40 (count (get rep :result))) "the join answers one row per entity")
+      (is (= 1 (get (get rep :store) :multiscan))
+          "the semi-join read is ONE multi-prefix request")
+      (is (= (get (indep) :multiscan) (get (get rep :store) :multiscan))
+          "the decorator's multi-prefix count matches the store's own")
+      (is (= (get (indep) :rows) (get (get rep :store) :rows))
+          "and so does every row it reports coming back")
+      (is (= (get (indep) :range) (get (get rep :store) :range))
+          "and the range reads"))))
+
+;; ── 2. the trace names the shape and the rows ───────────────────────
+
+(deftest the-trace-names-the-shape-and-the-rows
+  (let [c (fixture)
+        db (datom.conn/db c)
+        kept (eids db 40)
+        rep (datom.profile/analyze JOIN db kept)]
+    (is (= 1 (count (get rep :clauses))) "one pattern clause")
+    (let [f (first (get rep :clauses))]
+      (is (= :multiscan (get f :shape))
+          "the read is named a semi-join, not merely counted")
+      (is (= 40 (get f :prefixes)) "one prefix per bound entity")
+      (is (= 40 (get f :candidates)) "and one candidate per bound entity")
+      (is (= 40 (get f :rows-in)))
+      (is (= 40 (get f :rows-out))))))
+
+(deftest each-clause-names-its-own-read-shape
+  ; A two-clause query is exactly where the shapes DIVERGE, and the divergence
+  ; is the whole point of the trace: the first clause has nothing bound, so it
+  ; scans the column (60 candidates for 60 entities); the second has `?e` bound
+  ; in every row, so it reads by prefix instead — one request, one row per
+  ; entity. Two clauses, the same answer, 36x difference in what the store was
+  ; asked for. A per-query total would hide which clause did which.
+  (let [c (fixture)
+        db (datom.conn/db c)
+        rep (datom.profile/analyze TWO-CLAUSE db)
+        facts (get rep :clauses)
+        shapes (mapv (fn [f] (get f :shape)) facts)]
+    (is (= [:scan :multiscan] shapes)
+        "clause 1 scans the column; clause 2 joins by prefix")
+    (is (= 60 (get (first facts) :candidates))
+        "the first clause reads the whole column (60 entities)")
+    (is (= 60 (get (get facts 1) :prefixes))
+        "the second reads 60 prefixes in ONE request")
+    (is (= 60 (get (get facts 1) :candidates))
+        "and gets one candidate per prefix — no column read")
+    (is (= 60 (count (get rep :result))) "and the answer is the 60 cities")))
+
+;; ── 3. the static plan rides along ──────────────────────────────────
+
+(deftest the-report-carries-the-plan-as-well-as-the-run
+  (let [c (fixture)
+        db (datom.conn/db c)
+        rep (datom.profile/analyze TWO-CLAUSE db)]
+    (is (contains? rep :plan) "the before-picture is included")
+    (is (contains? rep :smells) "as is the static smell list")
+    (is (string? (get rep :verdict)))
+    (is (string? (datom.profile/render rep)) "and the report renders")))
+
+;; ── 4. measuring does not change the measurement ────────────────────
+
+(deftest analyze-gives-the-same-answer-as-q
+  (let [c (fixture)
+        db (datom.conn/db c)
+        kept (eids db 40)]
+    (is (= (datom.query.engine/q JOIN db kept)
+           (get (datom.profile/analyze JOIN db kept) :result))
+        "the profiled run answers exactly the unprofiled one")))
+
+(deftest a-profile-does-not-fork-the-derived-column-caches
+  ; The caches above the port key by store VALUE; a profiler that did not
+  ; declare `Underlying` would build its own copy of every derived column and
+  ; bill the build to the query it was measuring.
+  (let [c (fixture)
+        db (datom.conn/db c)
+        watched-store (datom.profile/watch (datom.db/store-of db))]
+    (is (identical? (datom.db/store-of db) (datom.store/identity-of watched-store))
+        "a profiled store IS the store it wraps, for cache identity")
+    (is (identical? (datom.db/store-of db) (datom.profile/watched watched-store)))
+    (is (identical? (datom.db/store-of db)
+                    (datom.store/identity-of (:store (datom.profile/db db))))
+        "and so is the store of a profiled db value")))
+
+;; ── 5. the trace never leaks ────────────────────────────────────────
+
+(deftest a-trace-does-not-leak-into-the-next-query
+  (let [c (fixture)
+        db (datom.conn/db c)
+        _ (datom.profile/analyze TWO-CLAUSE db)
+        ; A plain query AFTER an analyzed one must collect nothing. If the
+        ; collector were left installed, every later query in this process
+        ; would keep appending to a dead atom (a slow leak with no symptom).
+        [r facts] (datom.query.engine/with-trace
+                    (fn [] :no-query-ran))]
+    (is (= [] facts) "a fresh trace starts empty")
+    (is (= 60 (count (datom.query.engine/q TWO-CLAUSE db)))
+        "and the engine still answers")))
+
+(deftest with-trace-restores-the-previous-collector
+  (let [c (fixture)
+        db (datom.conn/db c)
+        outer (atom [])]
+    (datom.query.engine/trace-on! outer)
+    (let [[_ inner-facts] (datom.query.engine/with-trace
+                            (fn [] (datom.query.engine/q TWO-CLAUSE db)))]
+      (is (= 2 (count inner-facts))
+          "the nested trace collected its own query's clauses")
+      (is (= [] (deref outer))
+          "and appended nothing to the collector it was nested inside"))
+    (datom.query.engine/trace-off!)))

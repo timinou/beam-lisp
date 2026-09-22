@@ -907,25 +907,37 @@
 ;; ── the first paint: SSR the view for the requested group ───────────
 
 (defn- initial-group [db conn]
-  (let [q (web/query conn)]
-    (if (and q (String/starts_with? q "group="))
+  ;; `:query_string` is read with `get`, not `web/query`: a host that mounts this
+  ;; router builds its own conn, and a request with NO query string need not
+  ;; carry the key at all — `web/query` is `maps:get/2`, so the missing key was a
+  ;; badarg on every bare visit (measured: `/catalog` 500s where
+  ;; `/catalog?group=Inputs` answers). A tool mounted inside someone else's
+  ;; server cannot assume that server's conn is Plug's.
+  (let [q (get conn :query_string)]
+    (if (and (string? q) (String/starts_with? q "group="))
       (web/url-decode (subs q 6))
       (first (groups db)))))
 
-(defn- page [db style-tag group]
+(defn- page
+  "The first paint, as one HTML document. `prefix` is where this router is
+   mounted — \"\" standalone, \"/catalog\" on the session's dashboard — so the
+   script and socket URLs address the same place the page came from."
+  [prepared prefix group]
   ;; render the body for first paint; the <style> is the warmed, complete sheet
   (t/reset-sheet!)
-  (let [body (h/hiccup->html (view nil nil {:db db :group group}))]
+  (let [db (:db prepared)
+        style-tag (:style-tag prepared)
+        body (h/hiccup->html (view nil nil {:db db :group group}))]
     (str "<!doctype html><html lang=\"en\"><head>"
          "<meta charset=\"utf-8\">"
          "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-         "<title>loom · catalog</title>"
+         "<title>" (:name (:package prepared)) " · catalog</title>"
          (h/hiccup->html style-tag)
          "</head><body>"
          "<div id=\"live-root\">" body "</div>"
-         "<script src=\"/client.js\"></script>"
+         "<script src=\"" prefix "/client.js\"></script>"
          "<script>Live.connect({url:(location.protocol==='https:'?'wss://':'ws://')"
-         "+location.host+'/ws'+location.search,root:document.getElementById('live-root')})</script>"
+         "+location.host+'" prefix "/ws'+location.search,root:document.getElementById('live-root')})</script>"
          "</body></html>")))
 
 ;; ── the WebSocket boundary: one deflive socket per connection ────────
@@ -971,48 +983,152 @@
 ;; the JS client, read from priv at boot (live/ moved under lib/ in W0)
 (def client-js (web/asset "lib/live/client.js"))
 
-(defn router [db style-tag shared-conn conn]
-  (web/route conn
-    [:get "/"]
-    (web/html conn (page db style-tag (initial-group db conn)))
+;; ── the routes, MOUNTED at a prefix ──────────────────────────────────
+;;
+;; ONE router, reachable at two addresses: `main` serves it at the root, the
+;; session's dashboard mounts it at "/catalog" (PLAN-024). A host calls
+;; `((router prepared prefix) conn)` from its own dispatch, so the page, the
+;; client script and the socket all live at the mount point — and there is no
+;; second server to keep in step with the first.
 
-    [:get "/client.js"]
-    (web/js conn client-js)
+(defn router
+  [prepared prefix]
+  (fn [conn]
+    (let [db (:db prepared)
+          get? (= "get" (web/method conn))
+          p (web/path conn)]
+      (cond
+        ;; the mount point answers with and without its trailing slash: a host
+        ;; links to the bare prefix (the dashboard's pane does), and a person
+        ;; pastes either. Measured: without this the bare path 404s the moment
+        ;; the catalog is READY — a build-dependent difference, the worst kind.
+        (and get? (or (= p prefix) (= p (str prefix "/"))))
+        (web/html conn (page prepared prefix (initial-group db conn)))
 
-    [:get "/ws"]
-    ;; the socket's initial group comes from the ws url's ?group= (forwarded by
-    ;; the page's Live.connect), so a shared link opens on the right group live.
-    ;; db + group + the (empty) shared conn ride as init-state → `:init`.
-    (web/upgrade conn ws-handlers
-                 {:db db :group (initial-group db conn) :conn shared-conn})
+        (and get? (= p (str prefix "/client.js")))
+        (web/js conn client-js)
 
-    :else (web/text conn 404 "not found")))
+        (and get? (= p (str prefix "/ws")))
+        ;; the socket's initial group comes from the ws url's ?group= (forwarded
+        ;; by the page's Live.connect), so a shared link opens on the right
+        ;; group live. db + group + the (empty) shared conn ride as init-state.
+        (web/upgrade conn ws-handlers
+                     {:db db :group (initial-group db conn)
+                      :conn (:shared-conn prepared)})
+
+        :else (web/text conn 404 "not found")))))
 
 ;; ── entrypoint ───────────────────────────────────────────────────────
 
+;; ── a PREPARED catalog: the db, the warmed sheet, the numbers ────────
+;;
+;; A host (the session's dashboard, a test, a gate) works with these values
+;; instead of re-deriving them: `prepare` does the work once, `report` says what
+;; was measured, `problems` says what is wrong. `main` is the standalone wrapper
+;; over the same three — the terminal face of one implementation.
+
+(defn prepare
+  "Index `package` and warm its stylesheet, once. → the value `router` mounts:
+   {:package :db :style-tag :shared-conn :lint}. Indexing EVALUATES the library
+   and the showcase, so a host calls this deliberately — not per request."
+  [package]
+  (let [db (index-package package)]
+    {:package package
+     :db db
+     :style-tag (warm-style db)
+     ;; an empty shared conn for deflive to listen to (never commits)
+     :shared-conn (datom/connect [])
+     ;; START-TIME LINT: statically scan the showcase source for rendered lists
+     ;; missing :key — caught before anyone clicks, the static counterpart to
+     ;; diff.bl's runtime warning. The view is data; so is the code that builds it.
+     :lint (lint/check! (bl-files (:examples-dir package))) }))
+
+(defn report
+  "What this catalog measures about its package, as data. Every figure is a
+   datalog query over `prepared`'s db, so a pane and a gate cannot disagree with
+   the queries — they are the queries."
+  [prepared]
+  (let [db (:db prepared)
+        cov (coverage db)]
+    {:package (:name (:package prepared))
+     :lib-dir (:lib-dir (:package prepared))
+     :examples-dir (:examples-dir (:package prepared))
+     :groups (into [] (map (fn [g] {:group g :count (count-in-group db g)}) (groups db)))
+     :entries (count (all-catalogued db))
+     :undocumented (count (uncatalogued db))
+     :prims (count (public-prims db))
+     :coverage cov
+     :gap (into [] (:gap cov))
+     :by-module (coverage-by-module db)
+     :by-thread (coverage-by-thread db)
+     :escapes (escape-leaders db)
+     :a11y (a11y-warnings db)
+     :unkeyed (count (:lint prepared))}))
+
+(defn problems
+  "What this package must NOT have, as sentences; empty means healthy. The
+   gate's ONE implementation, so `--check`, a dashboard pane and a suite that
+   imports this all read the same verdict."
+  [r]
+  (into []
+    (concat
+      (if (zero? (get r :prims))
+        [(str "no public primitive indexed — check :lib-dir " (pr-str (get r :lib-dir)))]
+        [])
+      (if (zero? (get r :entries))
+        ["no catalogued entries — nothing in :examples-dir carries ^:catalog metadata"]
+        [])
+      (if (seq (get r :gap))
+        [(str (count (get r :gap)) " primitive(s) with no catalogued example: "
+              (pr-str (get r :gap)))]
+        [])
+      (if (seq (get r :a11y))
+        [(str (count (get r :a11y)) " example(s) render an input no label names: "
+              (pr-str (map (fn [w] (:name w)) (get r :a11y))))]
+        [])
+      (if (pos? (get r :unkeyed))
+        [(str (get r :unkeyed) " unkeyed list(s) in the showcase source")]
+        []))))
+
+(defn print-report
+  "The report, one line per figure — the terminal face of the same value."
+  [r]
+  (println (str "\n-- " (:package r) " explorer --"))
+  (println (str "  library:  " (:lib-dir r)))
+  (println (str "  examples: " (:examples-dir r)))
+  (println (str "  groups:   " (pr-str (map (fn [g] (:group g)) (:groups r)))))
+  (println (str "  entries:  " (:entries r) "  undocumented: " (:undocumented r)))
+  (println (str "  prims:    " (:prims r)
+                "  coverage: " (:shown (:coverage r)) "/" (:total (:coverage r))
+                " (" (:pct (:coverage r)) "%)"))
+  (println (str "  gaps:     " (pr-str (:gap r))))
+  (println (str "  escapes:  " (pr-str (map (fn [e] [(get e :name) (get e :n)]) (:escapes r)))))
+  (println (str "  a11y:     " (count (:a11y r)) "  unkeyed lists: " (:unkeyed r)))
+  r)
+
 (defn main
-  "Index `source-dir`, warm the stylesheet, and serve the LIVE catalog. Called
-   only from the entrypoint below — so REQUIRING this module (a test, another
-   tool) runs NOTHING, indexes nothing, prints nothing."
-  []
-  (let [db (index-package package)
-        style-tag (warm-style db)
-        ;; an empty shared conn for deflive to listen to (never commits)
-        shared-conn (datom/connect [])
-        ;; START-TIME LINT: statically scan the showcase source for rendered
-        ;; lists missing :key — caught here, before anyone clicks, the static
-        ;; counterpart to diff.bl's runtime warning. This is the datalog-over-
-        ;; code check: the view is data, so is the code that builds it.
-        lint-warnings (lint/check! (bl-files (:examples-dir package)))]
-    (println (str "\n-- " (:name package) " explorer (live) --"))
-    (println (str "  library:  " (:lib-dir package)))
-    (println (str "  examples: " (:examples-dir package)))
-    (println (str "  groups:   " (pr-str (groups db))))
-    (println (str "  entries:  " (count (all-catalogued db))))
-    (println (str "  undocumented: " (count (uncatalogued db))))
-    (println (str "  unkeyed lists: " (count lint-warnings) " (static lint)"))
-    (web/serve {:port 4050 :plug (fn [conn] (router db style-tag shared-conn conn))})
-    (println "  open:     http://127.0.0.1:4050  (nav + search are live)\n")))
+  "Index `source-dir`, warm the stylesheet, and serve the LIVE catalog — or,
+  with `--check`, measure and FAIL loudly when the package has a problem, so a
+  tree gates its suite on the catalog with no server at all. Called only from
+  the entrypoint below — so REQUIRING this module (a test, another tool) runs
+  NOTHING, indexes nothing, prints nothing."
+  [& args]
+  (let [prepared (prepare package)
+        r (print-report (report prepared))
+        ps (problems r)
+        check? (some (fn [a] (= a "--check")) args)]
+    (if check?
+      (if (empty? ps)
+        (do (println "  check:    ok\n") 0)
+        (do
+          (doseq [p ps] (println (str "  PROBLEM:  " p)))
+          (throw (ex-info (str "catalog check failed: " (count ps) " problem(s) for "
+                               (:package r))
+                          {:problems ps}))))
+      (do
+        (web/serve {:port 4050 :plug (router prepared "")})
+        (println "  open:     http://127.0.0.1:4050  (nav + search are live)\n")
+        0))))
 
 ;; No auto-run: this file is a LIBRARY (the engine + queries + view), safe to
 ;; `require` from a test or another tool with zero side effects. The runnable
