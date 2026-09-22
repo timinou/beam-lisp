@@ -15,13 +15,29 @@
 //!
 //! MEASURED with `bench/json.bl`, 51 samples, medians, one build, on a 24.3 KB mixed
 //! document (3501 JSON values). These move with host load, so they are quoted as a set
-//! and never as a single number:
+//! and never as a single number — the same decode read 0.22, 0.35, 0.47 and 1.19 ms across
+//! one session while nothing about the code changed. They are also ORDER-SENSITIVE: the
+//! harness used to time one layer's 51 samples and then the next layer's, so each landed
+//! in the noise regime of its own second (an ordered run put the wrapper at 1.81x the NIF;
+//! a rotated one, 0.82x). The decode layers are interleaved now. Read the ratios.
 //!
 //! ```text
-//!                         this crate   OTP    Jason   ETF floor   parse only
-//!   decode 24.3 KB           0.22 ms  0.27   0.23       0.06        0.12
-//!   flat 500-key decode      0.08 ms                       0.03        0.03
+//!                      bl.json   NIF   OTP   Jason
+//!   decode 24.3 KB      0.40 ms  0.42  0.42  0.49
+//!   flat 500-key        0.12 ms  0.14  0.16  0.18
+//!   500 ints            0.03 ms  0.03  0.03  0.04
+//!   ~110 B frame        0.01 ms  0.01  0.00  0.00
 //! ```
+//!
+//! One INTERLEAVED run, so the four columns share a noise regime and comparing them means
+//! something. `bl.json` and the NIF are the same call — the wrapper measured 0.96x the raw
+//! NIF, i.e. nothing. Against Jason that is parity on the big document, 1.5x ahead on the
+//! flat one, and BEHIND on a 110-byte frame, where the crossing is not paid back.
+//!
+//! Where the time goes, from instruments that isolate a layer instead of comparing columns:
+//! `json-count` holds the parser and the visitor and builds no terms, which puts the parse
+//! at roughly half of a mixed decode; `binary_to_term` on the same values is the floor
+//! beneath both.
 //!
 //! Per byte, since the corpora differ: the counting parse measures 2.9 ns/byte in a
 //! standalone Rust bench with no BEAM in it at all (24,281 B, best of 200), which is the
