@@ -342,3 +342,46 @@ Ordered by measured payoff per unit of risk. The oracle (`oracle.bl`, currently
 **The flip stays gated on 0–4.** List comparison is already at parity; the vector
 walk is the last number standing between the runtime and a usable toolchain, and
 it is a variable-resolution problem, not an algorithmic one.
+
+---
+
+## 7. Finding these statically: the census
+
+The profiler finds a slow shape by RUNNING it. The compiler's own IR finds it by
+READING it — over every definition at once — because `system.ir` reads bl-ANF,
+where the cost is already visible:
+
+| source form | ANF |
+|---|---|
+| a namespace `def` VALUE | `{:op :global :ns … :name …}` |
+| a call to a same-namespace `defn` | `:global` **+** `RT.invoke` |
+| an `erlang/…` BIF | `{:op :remote :mod :erlang …}` |
+| a `loop` | a `:let` binding a `:fn` its own body applies by name |
+
+So "which functions re-resolve a variable on every iteration?" is a static
+question with a static answer. `rt/census.bl` walks each definition's ANF with
+`system.ir/child-nodes`, detects loop bodies, and counts `:global` nodes inside
+them. Current census of `rt/**/*.bl`:
+
+```
+in-loop globals 5  k-take, reduce-list
+globals   4  k-to-list, pairs->entries
+globals   3  nth-list, k-drop, reduce-map              (plus load-time tables)
+globals   2  count-list, sort-elems, sort-keys, reduce-seq, reduce-lazy, ...
+globals   1  list-cmp, walk-cmp, record-fields
+```
+
+Every one of those is 2 `BeamLisp.Env` lookups per iteration. The three inside
+`rt/kind.bl` (`struct-desc`, `families-from-descriptors`, `build-struct-kinds`)
+run once to build tables and are not hot; the ones in `rt/seq.bl`, `rt/eq.bl` and
+`rt/reduce.bl` run per element.
+
+`family` is the case that shows what this buys. It was a `cond` over the scalar
+kinds with a LOOP over the descriptors as its fallback — and the registered kinds
+(`:vector` `:set` `:lazy` `:sorted-map` `:decimal`) are exactly the common ones,
+so the fallback was the normal path. It is now a load-time table and one
+`maps/get`; the census no longer lists it, which is the structural statement that
+it cannot come back.
+
+**Use the census, not a search.** `grep` cannot tell a per-element reference from
+a load-time one, and it cannot see the shapes the compiler actually emits.
