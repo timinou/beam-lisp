@@ -1,0 +1,480 @@
+; rt/lazy.bl — lazy sequences and infinite iterators.
+;
+; Laziness is an OBSERVABLE property: a `map` must not realize its input, and
+; must not lose it when something else does. `doall` FORCES and returns its
+; argument; `dorun` forces and discards (returns nil). The representations are
+; `BeamLisp.LazySeq` (built with `LazySeq.new/1` or `LazySeq.chain/2`) and
+; ordinary lists with a lazy tail (what `cons x lazy` yields).
+;
+; CHUNKING: several operations batch elements into chunks (up to `chunk_size`)
+; before wrapping the tail in a new thunk, so a consumer that stops early never
+; realizes more than one chunk past the point it stopped. This is the shape
+; `lib/beam_lisp/rt.ex`'s `lazy_map`, `lazy_filter` and `take_while_seg` use.
+
+(ns rt.lazy
+  (:require [rt.kind :as k]
+            [rt.seq :as s]
+            [rt.raw :as raw]))
+
+(def ^:private RT-MOD (erlang/binary_to_atom "Elixir.BeamLisp.RT" :utf8))
+
+;; ── small list constructors ───────────────────────────────────────────────
+(defn- one [x] (raw/cons x ()))
+(defn- two [a b] (raw/cons a (raw/cons b ())))
+
+;; ── invoke: call a function with arguments ────────────────────────────────
+(defn- invoke
+  "Apply `f` to the given arguments. Fast path: a raw Erlang fun. Fallback: the
+   runtime's call-shape dispatcher, for BL multi-arity fns and other callables."
+  [f args]
+  (cond
+    (erlang/is_function f) (erlang/apply f args)
+    :else (erlang/apply RT-MOD :invoke (two f args))))
+
+;; ── seqable: coerce a collection to a seqable form ────────────────────────
+(defn- seqable [x]
+  "Coerce `x` to a form that LazySeq operations can consume: either a LazySeq
+   or a sequence. A list, vector, set, etc. pass through unchanged."
+  x)
+
+;; ── map: apply f to each element, lazily ───────────────────────────────────
+(declare map-chunk lazy-map)
+
+(defn map [f coll]
+  "Map `f` over a collection lazily. The result is a lazy seq that applies `f`
+   to each element as it is consumed; forcing only the prefix that is demanded."
+  (lazy-map f (BeamLisp.LazySeq/input (seqable coll))))
+
+(defn- lazy-map [f coll]
+  (BeamLisp.LazySeq/new
+    (fn []
+      (let [cell (BeamLisp.LazySeq/cell coll)]
+        (cond
+          (erlang/== nil cell) nil
+          :else
+          (let [h (erlang/hd cell)
+                t (erlang/tl cell)
+                f-h (invoke f (one h))
+                chunk-size (BeamLisp.LazySeq/chunk_size)
+                result (map-chunk f (raw/cons f-h ()) t (erlang/- chunk-size 1))]
+            (let [elems (erlang/element 1 result)
+                  rest (erlang/element 2 result)]
+              (cond
+                (erlang/== nil rest) elems
+                :else (BeamLisp.LazySeq/chain elems
+                         (fn [] (lazy-map f rest)))))))))))
+
+(defn- map-chunk [f acc coll n]
+  "Collect up to n elements from coll, applying f to each, accumulating in
+   reverse. Returns [elements rest]."
+  (cond
+    (erlang/== n 0) (raw/tuple2 (erlang/apply :lists :reverse (list acc)) coll)
+    :else
+    (let [cell (BeamLisp.LazySeq/cell coll)]
+      (cond
+        (erlang/== nil cell) (raw/tuple2 (erlang/apply :lists :reverse (list acc)) nil)
+        :else
+        (let [h (erlang/hd cell)
+              t (erlang/tl cell)
+              f-h (invoke f (one h))]
+          (map-chunk f (raw/cons f-h acc) t (erlang/- n 1)))))))
+
+;; ── map-multi: map over multiple collections ───────────────────────────────
+(declare lazy-multi-map)
+
+(defn map-multi [f c1 rest-colls]
+  "Map `f` over multiple collections, stopping when the shortest ends.
+   Applies `f` to one element from each collection."
+  (let [wrapped (erlang/apply :lists :map
+                   (list (fn [c] (BeamLisp.LazySeq/input c))
+                         (raw/cons c1 rest-colls)))]
+    (lazy-multi-map f wrapped)))
+
+(defn- lazy-multi-map [f colls]
+  (BeamLisp.LazySeq/new
+    (fn []
+      (let [seqs (erlang/apply :lists :map
+                    (list (fn [seq]
+                            (cond
+                              (erlang/is_map seq)
+                              (cond
+                                (erlang/is_map_key :"__struct__" seq)
+                                (BeamLisp.LazySeq/cell seq)
+                                :else (s/k-seq seq))
+                              :else (s/k-seq seq)))
+                          colls))]
+        (cond
+          (erlang/apply :lists :any
+            (list (fn [seq] (erlang/== nil seq)) seqs))
+          nil
+          :else
+          (let [args (erlang/apply :lists :map
+                       (list (fn [seq] (erlang/hd seq)) seqs))]
+            (raw/cons (invoke f args)
+              (lazy-multi-map f
+                (erlang/apply :lists :map
+                  (list (fn [seq] (erlang/tl seq)) seqs))))))))))
+
+;; ── filter: select elements matching a predicate ──────────────────────────
+(declare filter-chunk skip-filter lazy-filter)
+
+(defn filter [pred coll]
+  "Filter `coll` with `pred`, lazily. Returns a lazy seq of elements for which
+   `pred` returns a truthy value."
+  (lazy-filter pred (BeamLisp.LazySeq/input (seqable coll))))
+
+(defn- lazy-filter [pred coll]
+  (let [coll (BeamLisp.LazySeq/input coll)]
+    (BeamLisp.LazySeq/new
+      (fn []
+        (let [first-match (skip-filter pred coll)]
+          (cond
+            (erlang/== nil first-match) nil
+            :else
+            (let [h (erlang/hd first-match)
+                  t (erlang/tl first-match)
+                  chunk-size (BeamLisp.LazySeq/chunk_size)
+                  result (filter-chunk pred (raw/cons h ()) t (erlang/- chunk-size 1))]
+              (let [elems (erlang/element 1 result)
+                    rest (erlang/element 2 result)]
+                (cond
+                  (erlang/== nil rest) elems
+                  :else (BeamLisp.LazySeq/chain elems
+                           (fn [] (lazy-filter pred rest))))))))))))
+
+(defn- skip-filter [pred coll]
+  "Find the next element in coll matching pred, skipping non-matches."
+  (let [cell (BeamLisp.LazySeq/cell coll)]
+    (cond
+      (erlang/== nil cell) nil
+      :else
+      (let [h (erlang/hd cell)
+            t (erlang/tl cell)]
+        (cond
+          (invoke pred (one h))
+          (raw/cons h t)
+          :else (skip-filter pred t))))))
+
+(defn- filter-chunk [pred acc coll n]
+  "Collect up to n elements matching pred, accumulating in reverse.
+   Returns [elements rest]."
+  (cond
+    (erlang/== n 0) (raw/tuple2 (erlang/apply :lists :reverse (list acc)) coll)
+    :else
+    (let [first-match (skip-filter pred coll)]
+      (cond
+        (erlang/== nil first-match) (raw/tuple2 (erlang/apply :lists :reverse (list acc)) nil)
+        :else
+        (let [h (erlang/hd first-match)
+              t (erlang/tl first-match)]
+          (filter-chunk pred (raw/cons h acc) t (erlang/- n 1)))))))
+
+;; ── filter-xform: transducer version of filter ─────────────────────────────
+(defn filter-xform [pred]
+  "Transducer arity of filter. Returns a function that wraps a reducing function."
+  (fn [rf]
+    (erlang/apply (erlang/binary_to_atom "Elixir.BeamLisp.Fns" :utf8) :multi_fn
+      (list (maps/put 0 (fn [] (invoke rf ()))
+              (maps/put 1 (fn [result] (invoke rf (one result)))
+                (maps/put 2 (fn [result input]
+                              (cond
+                                (invoke pred (one input))
+                                (invoke rf (two result input))
+                                :else result))
+                  (maps/new))))))))
+
+;; ── map-xform: transducer version of map ───────────────────────────────────
+(defn map-xform [f]
+  "Transducer arity of map. Returns a function that wraps a reducing function."
+  (fn [rf]
+    (erlang/apply (erlang/binary_to_atom "Elixir.BeamLisp.Fns" :utf8) :multi_fn
+      (list (maps/put 0 (fn [] (invoke rf ()))
+              (maps/put 1 (fn [result] (invoke rf (one result)))
+                (maps/put 2 (fn [result input]
+                              (invoke rf (two result (invoke f (one input)))))
+                  (maps/new))))))))
+
+;; ── take-xform: transducer that takes first n elements ──────────────────────
+(defn take-xform [n]
+  "Transducer that passes through the first n inputs, then stops."
+  (fn [rf]
+    (let [nv (BeamLisp.Refs/volatile n)]
+      (erlang/apply (erlang/binary_to_atom "Elixir.BeamLisp.Fns" :utf8) :multi_fn
+        (list (maps/put 0 (fn [] (invoke rf ()))
+                (maps/put 1 (fn [result] (invoke rf (one result)))
+                  (maps/put 2 (fn [result input]
+                                (let [cur (BeamLisp.Refs/deref nv)
+                                      _ (BeamLisp.Refs/vreset! nv (erlang/- cur 1))]
+                                  (cond
+                                    (erlang/> cur 0) (invoke rf (two result input))
+                                    :else result)))
+                    (maps/new)))))))))
+
+;; ── take-while: lazy seq of leading elements matching predicate ────────────
+(declare take-while-build take-while-seg)
+
+(defn take-while [pred coll]
+  "Lazy seq of leading elements from coll for which pred is truthy. Stops at
+   the first falsy pred result."
+  (let [input (BeamLisp.LazySeq/input (seqable coll))]
+    (BeamLisp.LazySeq/new
+      (fn [] (take-while-seg pred input)))))
+
+(defn- take-while-seg [pred coll]
+  "Chunked version that collects up to chunk_size consecutive matching elements."
+  (let [chunk-size (BeamLisp.LazySeq/chunk_size)
+        result (take-while-build pred coll () chunk-size)]
+    (cond
+      (erlang/== :empty result) nil
+      :else
+      (let [elems (erlang/element 1 result)
+            rest (erlang/element 2 result)]
+        (cond
+          (erlang/== nil rest) elems
+          :else (BeamLisp.LazySeq/chain elems
+                   (fn [] (take-while-seg pred rest))))))))
+
+(defn- take-while-build [pred coll acc n]
+  "Build a chunk of matching elements. Returns :empty, or [elements rest]."
+  (cond
+    (erlang/== n 0)
+    (cond
+      (erlang/== acc ()) :empty
+      :else (raw/tuple2 (erlang/apply :lists :reverse (list acc)) coll))
+    :else
+    (let [cell (BeamLisp.LazySeq/cell coll)]
+      (cond
+        (erlang/== nil cell)
+        (cond
+          (erlang/== acc ()) :empty
+          :else (raw/tuple2 (erlang/apply :lists :reverse (list acc)) nil))
+        :else
+        (let [h (erlang/hd cell)
+              t (erlang/tl cell)]
+          (cond
+            (invoke pred (one h))
+            (take-while-build pred t (raw/cons h acc) (erlang/- n 1))
+            :else
+            (cond
+              (erlang/== acc ()) :empty
+              :else (raw/tuple2 (erlang/apply :lists :reverse (list acc)) nil))))))))
+
+;; ── drop-while: drop elements while predicate is truthy ──────────────────────
+(declare drop-while-skip)
+
+(defn drop-while [pred coll]
+  "Lazy seq with leading elements removed where pred is truthy. Returns the
+   first element where pred is falsy and everything after it."
+  (BeamLisp.LazySeq/new
+    (fn [] (drop-while-skip pred (seqable coll)))))
+
+(defn- drop-while-skip [pred coll]
+  "Skip leading elements while pred is truthy, returning the rest."
+  (let [cell (BeamLisp.LazySeq/cell coll)]
+    (cond
+      (erlang/== nil cell) nil
+      :else
+      (let [h (erlang/hd cell)
+            t (erlang/tl cell)]
+        (cond
+          (invoke pred (one h))
+          (drop-while-skip pred t)
+          :else (raw/cons h t))))))
+
+;; ── range: infinite or bounded integer sequence ──────────────────────────
+(declare range-chunk range-build)
+
+(defn range
+  ([] (BeamLisp.LazySeq/new (fn [] (range-chunk 0 nil))))
+  ([end_] (range 0 end_))
+  ([start end_] (BeamLisp.LazySeq/new (fn [] (range-chunk start end_)))))
+
+(defn- range-chunk [start end_]
+  "Build one chunk of integers (up to chunk_size) with a lazy tail if not exhausted."
+  (cond
+    (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= start end_))
+    nil
+    :else
+    (let [chunk-size (BeamLisp.LazySeq/chunk_size)
+          result (range-build start end_ () chunk-size)]
+      (let [elems (erlang/element 1 result)
+            next (erlang/element 2 result)]
+        (cond
+          (erlang/== nil next) elems
+          :else (BeamLisp.LazySeq/chain elems
+                   (fn [] (range-chunk next end_))))))))
+
+(defn- range-build [i end_ acc n]
+  "Accumulate integers from i until end_ or chunk is full. Returns [elems next]."
+  (cond
+    (erlang/== n 0) (raw/tuple2 (erlang/apply :lists :reverse (list acc)) i)
+    :else
+    (cond
+      (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= i end_))
+      (raw/tuple2 (erlang/apply :lists :reverse (list acc)) nil)
+      :else
+      (range-build (erlang/+ i 1) end_ (raw/cons i acc) (erlang/- n 1)))))
+
+;; ── iterate: infinite sequence x, (f x), (f (f x)), ... ───────────────────
+(declare iterate-from)
+
+(defn iterate [f x]
+  "Infinite lazy seq starting with x, then (f x), (f (f x)), etc."
+  (BeamLisp.LazySeq/new (fn [] (iterate-from f x))))
+
+(defn- iterate-from [f x]
+  "Generate the next element: x, then tail is the infinite iteration of f."
+  (raw/cons x
+    (BeamLisp.LazySeq/new
+      (fn [] (iterate-from f (invoke f (one x)))))))
+
+;; ── repeat: infinite or bounded repetition ──────────────────────────────────
+(declare repeat-from)
+
+(defn repeat
+  ([x] (BeamLisp.LazySeq/new (fn [] (repeat-from x))))
+  ([n x] (erlang/apply :lists :duplicate (list n x))))
+
+(defn- repeat-from [x]
+  "Generate an infinite repetition of x."
+  (raw/cons x
+    (BeamLisp.LazySeq/new
+      (fn [] (repeat-from x)))))
+
+;; ── cycle: repeat a collection forever ─────────────────────────────────────
+(declare cycle-from)
+
+(defn cycle [coll]
+  "Infinite lazy seq repeating the elements of coll forever. Returns nil
+   (empty seq) if coll is empty."
+  (let [input (BeamLisp.LazySeq/input coll)]
+    (let [cell (BeamLisp.LazySeq/cell input)]
+      (cond
+        (erlang/== nil cell) nil
+        :else (BeamLisp.LazySeq/new
+                (fn [] (cycle-from input input)))))))
+
+(defn- cycle-from [current original]
+  "Yield current's head, then recursively cycle through tail. When current ends,
+   restart from original."
+  (let [cell (BeamLisp.LazySeq/cell current)]
+    (cond
+      (erlang/== nil cell)
+      (cycle-from original original)
+      :else
+      (let [head (erlang/hd cell)
+            tail (erlang/tl cell)]
+        (raw/cons head
+          (BeamLisp.LazySeq/new
+            (fn [] (cycle-from tail original))))))))
+
+;; ── doall: force a lazy seq and return it ────────────────────────────────
+(defn doall [x]
+  "Force a lazy seq to completion and return it. Improper lists (lazy tail)
+   are realized to proper lists. Non-lazy values are returned unchanged."
+  (cond
+    (erlang/is_map x)
+    (cond
+      (erlang/== (maps/get :"__struct__" x nil)
+        (erlang/binary_to_atom "Elixir.BeamLisp.LazySeq" :utf8))
+      (BeamLisp.LazySeq/to_list x)
+      :else x)
+    (erlang/is_list x)
+    (cond
+      (is-improper? x)
+      (BeamLisp.LazySeq/to_list x)
+      :else x)
+    :else x))
+
+(defn- is-improper? [xs]
+  "Check if xs is an improper list (ends in a LazySeq, not nil or [])."
+  (cond
+    (erlang/is_list xs)
+    (cond
+      (erlang/== () xs) false
+      :else
+      (let [t (erlang/tl xs)]
+        (is-improper-tail? t)))
+    :else false))
+
+(defn- is-improper-tail? [tail]
+  "Check if tail is a LazySeq (improper) or a proper list terminator."
+  (cond
+    (erlang/== nil tail) false
+    (erlang/== () tail) false
+    (erlang/is_map tail)
+    (cond
+      (erlang/== (maps/get :"__struct__" tail nil)
+        (erlang/binary_to_atom "Elixir.BeamLisp.LazySeq" :utf8))
+      true
+      :else false)
+    (erlang/is_list tail)
+    (is-improper-tail? (erlang/tl tail))
+    :else false))
+
+;; ── dorun: force a lazy seq for side effects ───────────────────────────────
+(defn dorun [x]
+  "Force a lazy seq for side effects only, returning nil. Only lazy seqs are
+   forced; other values return nil unchanged."
+  (cond
+    (erlang/is_map x)
+    (cond
+      (erlang/== (erlang/map_get :"__struct__" x nil)
+        (erlang/binary_to_atom "Elixir.BeamLisp.LazySeq" :utf8))
+      (BeamLisp.LazySeq/run x)
+      :else nil)
+    :else nil))
+
+;; ── subseq: subsequence of a sorted collection ──────────────────────────────
+(defn subseq [coll start stop]
+  "Ascending-order subsequence of coll from start to stop (both inclusive for
+   keys >= start and < stop). Works on sorted maps and sets."
+  (range-seq coll start stop :asc))
+
+;; ── rsubseq: descending subsequence ────────────────────────────────────────
+(defn rsubseq [coll start stop]
+  "Descending-order subsequence of coll from start to stop."
+  (range-seq coll start stop :desc))
+
+;; ── range-seq: backing implementation for subseq / rsubseq ────────────────
+(defn- range-seq [coll start stop dir]
+  "Extract a subsequence from a sorted collection. Uses nil as unbounded marker."
+  (let [lo (cond (erlang/== start nil) :unbounded :else (raw/tuple2 :bound start))
+        hi (cond (erlang/== stop nil) :unbounded :else (raw/tuple2 :bound stop))
+        entries (cond
+                  (erlang/== dir :asc)
+                  (erlang/apply (erlang/binary_to_atom "Elixir.BeamLisp.Sorted" :utf8)
+                    :subseq_entries (list coll (two lo hi)))
+                  :else
+                  (erlang/apply (erlang/binary_to_atom "Elixir.BeamLisp.Sorted" :utf8)
+                    :rsubseq_entries (list coll (two lo hi))))]
+    (let [struct (erlang/map_get :"__struct__" coll)]
+      (cond
+        (erlang/== struct (erlang/binary_to_atom "Elixir.BeamLisp.Sorted.SortedSet" :utf8))
+        (erlang/apply :lists :map
+          (list (fn [e] (erlang/element 1 e)) entries))
+        (erlang/== struct (erlang/binary_to_atom "Elixir.BeamLisp.Sorted.SortedMap" :utf8))
+        (erlang/apply :lists :map
+          (list (fn [e]
+                  (let [k (erlang/element 1 e) v (erlang/element 2 e)]
+                    (maps/put :meta nil
+                      (maps/put :items (raw/tuple2 k v)
+                        (maps/put :__struct__
+                          (erlang/binary_to_atom "Elixir.BeamLisp.Vector" :utf8)
+                          (maps/new))))))
+            entries))
+        :else entries))))
+
+;; ── tree-seq: depth-first traversal of a tree ──────────────────────────────
+(defn tree-seq [branch? children root]
+  "Depth-first traversal: yields root, then each subtree reachable through
+   children. Uses branch? to decide if a node has children. Realized eagerly."
+  (cond
+    (invoke branch? (one root))
+    (let [kids (invoke children (one root))
+          seqable-kids (seqable kids)
+          tree-seqs (erlang/apply :lists :flatmap
+                      (list (fn [child] (tree-seq branch? children child))
+                            (s/k-to-list seqable-kids)))]
+      (raw/cons root tree-seqs))
+    :else (one root)))
