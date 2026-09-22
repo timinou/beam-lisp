@@ -1,0 +1,447 @@
+; research/reader-contracts/rc-reader.bl
+; ══════════════════════════════════════════════════════════════════════════
+; THE READER AS THE HARNESS CONTRACT — the four contracts, in beam-lisp.
+;
+;   1. options are a VALUE      (read src {:location … :read-cond … :diagnostics …})
+;   2. positions carry OFFSETS  (every span has :offset and :end-offset)
+;   3. errors are DATA          (a diag map — never a bare message)
+;   4. reading is a STREAM      (read-next / read-next-string over a state map)
+;
+; and the goal those four exist to serve: an unbalanced paren is the most common
+; mistake a person (or a model) makes, so the reader must say WHICH delimiter,
+; WHERE it was opened, and WHAT to do — including "I cannot tell, there are two
+; repairs" (rc-repair/ambiguous?).
+;
+; The node vocabulary is the real one (priv/boot/reader-node.bl), because it is
+; REQUIRED, not re-implemented: {:list …}, {:vector …}, {:meta node pos}, and a
+; bare scalar passing through as itself. What this file adds is not a node kind;
+; it is the POLICY — :location decides which nodes get the wrapper, :read-cond
+; decides what a conditional becomes, :diagnostics decides whether a failure
+; collects or raises.
+;
+; The read shape is the tree's own: a charlist walked from the front, a position
+; threaded through every step. The one addition is the OFFSET — a `pos` here is
+; {line col file offset}, the tree's {line col file} plus a running character
+; count, so a span can SLICE its own source (rc-reader/slice) with no line table
+; to rebuild.
+; ══════════════════════════════════════════════════════════════════════════
+
+(ns rc-reader
+  (:require [reader-node :as rn]))
+
+; ── a position carries an offset ─────────────────────────────────────────────
+
+(defn- tup4 [a b c d] (erlang/list_to_tuple (list a b c d)))
+(defn pos-line [p] (erlang/element 1 p))
+(defn pos-col [p] (erlang/element 2 p))
+(defn pos-file [p] (erlang/element 3 p))
+(defn pos-off [p] (erlang/element 4 p))
+(defn- mk-pos [l c f o] (tup4 l c f o))
+
+(defn pos->span
+  "A span from one position to another: WHERE a form starts and ends, WITH
+   offsets. `slice` turns it back into the source text it covers."
+  [p1 p2]
+  {:line (pos-line p1) :col (pos-col p1) :offset (pos-off p1)
+   :end-line (pos-line p2) :end-col (pos-col p2) :end-offset (pos-off p2)
+   :file (pos-file p1)})
+
+(defn slice
+  "The source text a span covers. This is the whole of contract 2's payoff: no
+   line-offsets table, no arithmetic — the reader already counted."
+  [src sp]
+  (String/slice src (get sp :offset) (- (get sp :end-offset) (get sp :offset))))
+
+(defn- advance1
+  "Advance a position over the single codepoint `c`."
+  [p c]
+  (if (= c 10)
+    (mk-pos (inc (pos-line p)) 1 (pos-file p) (inc (pos-off p)))
+    (mk-pos (pos-line p) (inc (pos-col p)) (pos-file p) (inc (pos-off p)))))
+
+(defn- one-char-span
+  "The span of the character under the cursor (never a newline: a closer)."
+  [st]
+  (let [p (:pos st)]
+    (pos->span p (mk-pos (pos-line p) (inc (pos-col p)) (pos-file p) (inc (pos-off p))))))
+
+(defn- at-span [st p]
+  (pos->span p (mk-pos (pos-line p) (inc (pos-col p)) (pos-file p) (inc (pos-off p)))))
+
+; ── nodes ────────────────────────────────────────────────────────────────────
+; beam-lisp has no tuple literal ({:list …} is a MAP), so every node is built
+; through erlang/list_to_tuple over a real list — the same rule reader-node.bl
+; documents.
+
+(defn- tup2 [a b] (erlang/list_to_tuple (list a b)))
+(defn sym-node [s] (tup2 :symbol s))
+(defn list-node [items] (tup2 :list items))
+(defn vector-node [items] (tup2 :vector items))
+(defn set-node [items] (tup2 :set items))
+(defn map-node [pairs] (tup2 :map pairs))
+
+; ── diagnostics: errors as DATA ──────────────────────────────────────────────
+
+(defn- cp [c] (unicode/characters_to_binary (list c)))
+(defn- opener-of [kind] (cond (= kind :list) 40 (= kind :vector) 91 :else 123))
+(defn- closer-for [open] (cond (= open 40) 41 (= open 91) 93 :else 125))
+
+(defn- diag-unexpected-close [st c]
+  {:kind :unexpected-close
+   :message (str "unexpected " (cp c) " — nothing is open that it could close")
+   :span (one-char-span st)
+   :expected nil :opened nil :opened-span nil :eof-span nil :unclosed (list)})
+
+(defn- diag-mismatch [st open open-pos c]
+  {:kind :mismatch
+   :message (str "unexpected " (cp c) " — expected " (cp (closer-for open))
+                 " to close the " (cp open) " opened at "
+                 (pos-file open-pos) ":" (pos-line open-pos) ":" (pos-col open-pos))
+   :span (one-char-span st)
+   :expected (cp (closer-for open))
+   :opened (cp open)
+   :opened-span (at-span st open-pos)
+   :eof-span nil
+   :unclosed (list)})
+
+(defn- diag-unterminated [st open-pos stack]
+  (let [top (first stack)
+        open (opener-of (first top))
+        n (count stack)
+        also (if (> n 1) (str " — " (- n 1) " other opener(s) unclosed too") "")]
+    {:kind :unterminated
+     :message (str "unterminated " (cp open) " — the source ends before it is closed" also)
+     :span (at-span st open-pos)
+     :expected (cp (closer-for open))
+     :opened (cp open)
+     :opened-span (at-span st open-pos)
+     :eof-span (pos->span (:pos st) (:pos st))
+     :unclosed stack}))
+
+(defn- diag-unterminated-string [st open-pos]
+  {:kind :unterminated-string
+   :message "unterminated string — the source ends before the closing quote"
+   :span (at-span st open-pos)
+   :expected "\"" :opened "\"" :opened-span (at-span st open-pos)
+   :eof-span (pos->span (:pos st) (:pos st))
+   :unclosed (list)})
+
+(defn diag-line
+  "`file:line:col: message` — the one-line form, for a CLI or a log. This is what
+   FUP-102's acceptance asks `bl run FILE` to print instead of `unexpected )`."
+  [d]
+  (let [sp (get d :span)]
+    (str (get sp :file) ":" (get sp :line) ":" (get sp :col) ": " (get d :message))))
+
+(defn diag-loc [d]
+  (let [sp (get d :span)] (list (get sp :file) (get sp :line) (get sp :col))))
+
+(defn- collected
+  "Record a diagnostic on the state — or raise, per the :diagnostics option. The
+   raised error's MESSAGE carries the position, because that is the only part
+   that survives a raise; a caller that wants the diag as data uses `read`."
+  [st diag]
+  (if (= :raise (get (:opts st) :diagnostics :collect))
+    (erlang/error (BeamLisp.Reader.SyntaxError/exception (diag-line diag)))
+    (assoc st :diags (cons diag (:diags st)))))
+
+; ── the stream: one state map, threaded ──────────────────────────────────────
+
+(defn stream
+  "A reader value. `opts` is the whole of contract 1:
+
+     :file         nil        — the name a diagnostic reports
+     :location     :lists     — :lists | :collections | :none
+     :read-cond    :select    — :select | :preserve
+     :diagnostics  :collect   — :collect | :raise
+
+   :location is the policy current reader.bl hard-codes as lists-only. It is a
+   value because it is a DECISION different consumers answer differently: the
+   compiler wants today's shapes; the trivia-preserving rewriter wants every
+   composite so it stops degrading a captured vector to pr-str."
+  [src opts]
+  (let [o (merge {:location :lists :read-cond :select :diagnostics :collect} opts)]
+    {:src src
+     :chars (String/to_charlist src)
+     :pos (mk-pos 1 1 (get o :file nil) 0)
+     :opts o
+     :stack (list)
+     :diags (list)}))
+
+(defn- peek [st] (if (empty? (:chars st)) :eof (first (:chars st))))
+
+(defn- take1 [st]
+  (assoc (assoc st :chars (rest (:chars st))) :pos (advance1 (:pos st) (first (:chars st)))))
+
+(defn- ignored? [c] (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 44)))
+
+(defn- skip-line [st]
+  (let [c (peek st)]
+    (cond
+      (= :eof c) st
+      (= 10 c) st
+      :else (recur (take1 st)))))
+
+(defn- skip-trivia [st]
+  (let [c (peek st)]
+    (cond
+      (= :eof c) st
+      (ignored? c) (recur (take1 st))
+      (= 59 c) (recur (skip-line (take1 st)))
+      :else st)))
+
+; ── tokens ───────────────────────────────────────────────────────────────────
+
+(defn- delim? [c]
+  (or (ignored? c)
+      (= c 40) (= c 41) (= c 91) (= c 93) (= c 123) (= c 125)
+      (= c 34) (= c 59) (= c 39) (= c 96) (= c 126) (= c 64) (= c 94) (= c 92)))
+
+(defn- take-word [st acc]
+  (let [c (peek st)]
+    (if (or (= :eof c) (delim? c))
+      [st (reverse acc)]
+      (recur (take1 st) (cons c acc)))))
+
+(defn- letters-until-delim [st acc]
+  (let [c (peek st)]
+    (if (and (not= :eof c) (>= c 97) (<= c 122))
+      (recur (take1 st) (cons c acc))
+      [st (reverse acc)])))
+
+(def ^:private int-re (Regex/compile! "^[+-]?[0-9]+$"))
+(def ^:private float-re (Regex/compile! "^[+-]?[0-9]*[.][0-9]+$"))
+
+(defn- chars->string [cs] (unicode/characters_to_binary cs))
+
+(defn- classify
+  "A token's text as a value node: keyword, number, boolean, nil — or a symbol."
+  [text]
+  (let [n (String/length text)]
+    (cond
+      (= text "true") true
+      (= text "false") false
+      (= text "nil") nil
+      (= 0 n) (sym-node text)
+      (String/starts_with? text ":") (tup2 :keyword (String/slice text 1 (- n 1)))
+      (Regex/run int-re text) (String/to_integer text)
+      (Regex/run float-re text) (String/to_float text)
+      :else (sym-node text))))
+
+(defn- p-token [st]
+  (let [r (take-word st (list))]
+    [:ok (classify (chars->string (second r))) (first r)]))
+
+; ── forms ────────────────────────────────────────────────────────────────────
+
+(defn- wrap
+  "Contract 1's decision, in one function. `:lists` is today's behaviour and the
+   DEFAULT, so the compiler's tree does not move; `:collections` is what the
+   rewriter needs; `:none` is for a consumer that only wants values."
+  [node kind sp opts]
+  (let [loc (get opts :location :lists)]
+    (cond
+      (= loc :none) node
+      (= loc :collections)
+        (if (or (= kind :list) (= kind :vector) (= kind :map) (= kind :set))
+          (rn/meta-node node sp) node)
+      :else (if (= kind :list) (rn/meta-node node sp) node))))
+
+(defn- pair-up [items]
+  (cond
+    (empty? items) (list)
+    (empty? (rest items)) (list (tup2 (first items) nil))
+    :else (cons (tup2 (first items) (second items)) (pair-up (rest (rest items))))))
+
+(defn- p-coll [st kind close]
+  (let [start (:pos st)
+        st1 (assoc (take1 st) :stack (cons (list kind start) (:stack st)))
+        r (p-items st1 close (list))]
+    (if (= :ok (first r))
+      (let [items (second r)
+            st2 (nth r 2)
+            st3 (assoc st2 :stack (rest (:stack st2)))
+            node (if (= kind :map) (map-node (pair-up items)) (tup2 kind items))
+            sp (pos->span start (:pos st3))]
+        [:ok (wrap node kind sp (:opts st3)) st3])
+      r)))
+
+(defn- p-items [st close acc]
+  (let [st (skip-trivia st)
+        c (peek st)]
+    (cond
+      (= :eof c)
+        (let [top (first (:stack st))]
+          [:error (diag-unterminated st (second top) (:stack st)) st])
+
+      (= c close)
+        [:ok (reverse acc) (take1 st)]
+
+      (or (= c 41) (= c 93) (= c 125))
+        (let [top (first (:stack st))]
+          [:error (diag-mismatch st (opener-of (first top)) (second top) c) st])
+
+      :else
+        (let [r (p-form st)]
+          (cond
+            (= :ok (first r)) (recur (nth r 2) close (cons (second r) acc))
+            (= :eof (first r))
+              (let [st2 (second r) top (first (:stack st2))]
+                [:error (diag-unterminated st2 (second top) (:stack st2)) st2])
+            :else [:error (second r) (nth r 2)])))))
+
+(defn- p-string-body [st start acc]
+  (let [c (peek st)]
+    (cond
+      (= :eof c) [:error (diag-unterminated-string st start) st]
+      (= c 34) [:ok (chars->string (reverse acc)) (take1 st)]
+      (= c 92)
+        (let [st2 (take1 st)
+              e (peek st2)]
+          (if (= :eof e)
+            [:error (diag-unterminated-string st start) st]
+            (recur (take1 st2) start (cons (escaped e) acc))))
+      :else (recur (take1 st) start (cons c acc)))))
+
+(defn- escaped
+  "The codepoint an escape introduces: n t r are the named ones; anything else
+   stands for itself, so \\\" is a quote and \\\\ a backslash."
+  [e]
+  (cond (= e 110) 10 (= e 116) 9 (= e 114) 13 :else e))
+
+(defn- p-string [st]
+  (p-string-body (take1 st) (:pos st) (list)))
+
+(defn- p-char [st]
+  (let [st1 (take1 st)
+        c (peek st1)]
+    (cond
+      (= :eof c) [:ok (tup2 :char "") st1]
+      (and (>= c 97) (<= c 122))
+        (let [r (letters-until-delim st1 (list))]
+          [:ok (tup2 :char (chars->string (second r))) (first r)])
+      :else [:ok (tup2 :char (cp c)) (take1 st1)])))
+
+(defn- p-quote [st]
+  (let [start (:pos st)
+        r (p-form (take1 st))]
+    (if (= :ok (first r))
+      (let [st2 (nth r 2)
+            node (list-node (list (sym-node "quote") (second r)))
+            sp (pos->span start (:pos st2))]
+        [:ok (wrap node :list sp (:opts st2)) st2])
+      r)))
+
+(defn- p-meta [st]
+  (let [start (:pos st)
+        r1 (p-form (take1 st))]
+    (if (= :ok (first r1))
+      (let [m (second r1)
+            r2 (p-form (nth r1 2))]
+        (if (= :ok (first r2))
+          (let [st2 (nth r2 2)
+                target (rn/node-form (second r2))
+                sp (assoc (pos->span start (:pos st2)) :author m)]
+            [:ok (rn/meta-node target sp) st2])
+          r2))
+      r1)))
+
+(defn- feature? [k]
+  (let [f (rn/node-form k)]
+    (and (= :keyword (rn/node-tag f))
+         (or (= "clj" (rn/node-name f)) (= "default" (rn/node-name f))))))
+
+(defn- select-feature [pairs]
+  (cond
+    (empty? pairs) nil
+    (feature? (erlang/element 1 (first pairs))) (erlang/element 2 (first pairs))
+    :else (recur (rest pairs))))
+
+(defn- p-read-cond [st]
+  (let [r (p-coll (take1 st) :list 41)]
+    (if (= :ok (first r))
+      (let [st2 (nth r 2)
+            items (rn/node-items (rn/node-form (second r)))
+            pairs (pair-up items)]
+        (if (= :preserve (get (:opts st2) :read-cond :select))
+          [:ok (tup2 :read-cond pairs) st2]
+          [:ok (select-feature pairs) st2]))
+      r)))
+
+(defn- p-tagged [st]
+  (let [r1 (p-token st)]
+    (if (= :ok (first r1))
+      (let [r2 (p-form (nth r1 2))]
+        (if (= :ok (first r2))
+          [:ok (erlang/list_to_tuple (list :tagged (second r1) (second r2))) (nth r2 2)]
+          r2))
+      r1)))
+
+(defn- p-hash [st]
+  (let [st1 (take1 st)
+        c (peek st1)]
+    (cond
+      (= c 123) (p-coll st1 :set 125)
+      (= c 63) (p-read-cond st1)
+      :else (p-tagged st1))))
+
+(defn p-form
+  "One form: [:ok form state] | [:eof state] | [:error diag state].
+
+   The three closer codes are handled BEFORE the value readers, so a stray `)`
+   never reaches the token reader and becomes a symbol of itself."
+  [st]
+  (let [st (skip-trivia st)
+        c (peek st)]
+    (cond
+      (= :eof c) [:eof st]
+      (or (= c 41) (= c 93) (= c 125)) [:error (diag-unexpected-close st c) st]
+      (= c 40) (p-coll st :list 41)
+      (= c 91) (p-coll st :vector 93)
+      (= c 123) (p-coll st :map 125)
+      (= c 34) (p-string st)
+      (= c 92) (p-char st)
+      (= c 39) (p-quote st)
+      (= c 94) (p-meta st)
+      (= c 35) (p-hash st)
+      :else (p-token st))))
+
+; ── the public surface ───────────────────────────────────────────────────────
+
+(defn read-next
+  "The next form: [:ok form state] | [:eof state] | [:error diag state]."
+  [st]
+  (p-form st))
+
+(defn read-next-string
+  "The next form AND its own source text — comments intact:
+   [:ok form text state]. What a rewriter wants instead of re-scanning for
+   offsets, and what a REPL wants to echo back."
+  [st]
+  (let [started (skip-trivia st)
+        r (p-form started)]
+    (if (= :ok (first r))
+      (let [st2 (nth r 2)]
+        [:ok (second r)
+         (String/slice (:src st) (pos-off (:pos started))
+                       (- (pos-off (:pos st2)) (pos-off (:pos started))))
+         st2])
+      r)))
+
+(defn read
+  "Every form: [forms diags]. Never raises unless :diagnostics is :raise."
+  [src opts]
+  (read-loop (stream src opts) (list)))
+
+(defn- read-loop [st acc]
+  (let [r (read-next st)]
+    (cond
+      (= :ok (first r)) (recur (nth r 2) (cons (second r) acc))
+      (= :eof (first r)) (let [st2 (second r)] [(reverse acc) (reverse (:diags st2))])
+      :else (let [st2 (nth r 2)] [(reverse acc) (reverse (:diags (collected st2 (second r))))]))))
+
+(defn read!
+  "Every form, raising the first diagnostic. The compiler's face of `read`, and
+   what `bl run FILE` should print: the message already names file:line:col."
+  [src opts]
+  (first (read src (assoc opts :diagnostics :raise))))

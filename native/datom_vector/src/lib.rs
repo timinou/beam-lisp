@@ -53,7 +53,7 @@
 //! keeps the layering honest: `datom.vector` depends on this, not on any store
 //! backend.
 
-use rustler::{Binary, Env, Error, NifResult, OwnedBinary};
+use rustler::{Binary, Env, Error, NifResult, OwnedBinary, ResourceArc};
 use std::io::Write;
 
 /// Wrap a message as a BEAM-raisable error term.
@@ -356,11 +356,82 @@ pub fn vec_search(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Clustering and dimensionality reduction
+// Resident index: decode + quantize ONCE, search many times (PLAN-132 Phase 5c)
 //
-// Two more things a corpus of embeddings makes possible, both pure numeric
-// loops that belong in Rust for the same reason search does. Neither knows the
-// database; the datalog layer gathers the vectors and hands them down.
+// `vec_search` decodes the whole corpus to f32 AND re-quantizes every row on
+// EVERY call — identical work each query at a fixed basis. For a column searched
+// repeatedly (knowledger.search, ~62k×768 on the live corpus) that is the
+// dominant cost. A `Resident` is that per-call work made a VALUE held behind a
+// resource: the decoded f32 matrix and the packed bit-codes, computed once at
+// build. A query then only quantizes ITSELF (one vector) and runs the two-pass
+// search. Immutable after build, so no lock is needed. Identity of results is
+// bit-for-bit with `vec_search` over the same corpus — same kernels, same order.
+
+pub struct Resident {
+    dim: usize,
+    words: usize,
+    n: usize,
+    flat: Vec<f32>,  // n*dim, row-major, normalised at pack time
+    codes: Vec<u64>, // n*words, binary-quantised once
+}
+
+impl rustler::Resource for Resident {}
+impl std::panic::RefUnwindSafe for Resident {}
+
+/// `vec_build_resident(corpus, dim)` → a resident index over the packed corpus.
+/// Decodes and quantizes once; the resulting resource is searched by
+/// `vec_search_resident` with no per-query marshalling.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_build_resident(corpus: Binary, dim: usize) -> NifResult<ResourceArc<Resident>> {
+    if dim == 0 {
+        return Err(err("dim must be positive"));
+    }
+    let (n, flat) = decode_corpus(corpus.as_slice(), dim)?;
+    let words = words_for(dim);
+    let mut codes = vec![0u64; n * words];
+    for i in 0..n {
+        let c = quantize(&flat[i * dim..(i + 1) * dim]);
+        codes[i * words..(i + 1) * words].copy_from_slice(&c);
+    }
+    Ok(ResourceArc::new(Resident { dim, words, n, flat, codes }))
+}
+
+/// `vec_search_resident(index, query, ids, k, rerank)` → `[{id, score}]`, the k
+/// nearest — identical to `vec_search` over the corpus the index was built from,
+/// minus the per-call decode+quantize. `ids` are parallel to the build corpus's
+/// rows and returned, not indexed; a length mismatch is a caller error.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_search_resident(
+    index: ResourceArc<Resident>,
+    query: Vec<f64>,
+    ids: Vec<i64>,
+    k: usize,
+    rerank: usize,
+) -> NifResult<Vec<(i64, f64)>> {
+    if ids.len() != index.n {
+        return Err(err("ids and resident row count disagree"));
+    }
+    let mut q: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+    if q.len() != index.dim {
+        return Err(err("query dimension disagrees with the resident index"));
+    }
+    normalize(&mut q);
+    let hits = if rerank == 0 {
+        search_flat(&q, &index.flat, index.dim, index.n, k)
+    } else {
+        let qb = quantize(&q);
+        search_quantized(
+            &q, &qb, &index.flat, &index.codes, index.dim, index.words, index.n, k, rerank,
+        )
+    };
+    Ok(hits.iter().map(|h| (ids[h.id as usize], h.score as f64)).collect())
+}
+
+/// `vec_resident_count(index)` → how many vectors the index holds. Cheap.
+#[rustler::nif]
+pub fn vec_resident_count(index: ResourceArc<Resident>) -> usize {
+    index.n
+}
 
 /// Decode a packed corpus binary into a contiguous f32 matrix (row-major).
 fn decode_corpus(bytes: &[u8], dim: usize) -> Result<(usize, Vec<f32>), Error> {

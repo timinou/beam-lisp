@@ -326,6 +326,36 @@ defmodule BeamLisp.Loader do
           Env.mark_loaded(ns)
         end)
       end)
+    rescue
+      e ->
+        # ── ATTRIBUTION: a load that crashes names its FILE and its FORM ──
+        #
+        # Everything above resolves a namespace to a file. This is the one
+        # place that knows WHICH file, and until now it threw that knowledge
+        # away: `eval_string` raises from inside the compiler, and a compiler
+        # trace names a HELPER and a LINE in a file nobody edited.
+        #
+        # The cost was measured. BUG-090 surfaced as
+        # `:erlang.tuple_to_list("n")` in `reader-node.bl:67`, reached from
+        # `parse-fn-clauses` in `compiler.bl:2208` — a message naming no file,
+        # no namespace and no form, on a checkout that had just taken three
+        # writes to the reader, so three sessions read it as three different
+        # bugs (a reader bug, a compiler bug, a serialization bug) before
+        # anyone could say WHICH FILE WAS BEING LOADED. The loader knew.
+        #
+        # The crashing compiler is a PREVIOUS generation's beams — the tier is
+        # rebuilt by the floor, by design — so it cannot be instrumented at
+        # the point of use. The attribution is re-derived here, from the
+        # source, and ONLY after a failure: the healthy path is untouched (one
+        # `eval_string`, no replay, no second read).
+        #
+        # The replay evaluates the forms in order and stops at the first that
+        # raises, in the same env and load path the real load used, so it stops
+        # on the same form. It runs only on a load that has already failed —
+        # the file is broken either way, and a NAME for the form is worth more
+        # than the duplication.
+        IO.puts(:stderr, load_attribution(ns, path, content, e, __STACKTRACE__))
+        reraise(e, __STACKTRACE__)
     after
       # A required file's (ns …) is scoped to that file; the
       # requiring namespace must survive the load.
@@ -333,6 +363,106 @@ defmodule BeamLisp.Loader do
     end
 
     :ok
+  end
+
+  @doc """
+  The attribution for a file that could not be evaluated: the file, the FORM
+  that failed (index, position, text) and the original failure — in that order,
+  because the file and the form are the two facts the original failure withheld.
+
+  Public because it is not only a message: the CLI's repair path and the test
+  suite both want it as a value, and a load failure that can be named is one a
+  machine can act on. Never raises; an unreadable source degrades to the file
+  name alone, which is still more than the compiler's own trace carries.
+  """
+  def load_attribution(ns, path, content, e, stacktrace \\ nil) do
+    counted = form_at_fault(ns, path, content)
+
+    where =
+      case counted do
+        {:ok, i, total, form} ->
+          line = node_line(form)
+          at = if line, do: "#{path}:#{line}", else: path
+          "  form #{i} of #{total}, at #{at}\n  #{short(form)}"
+
+        :unknown ->
+          "  (the failing form could not be isolated: the source could not be re-read)"
+      end
+
+    failure =
+      if stacktrace, do: Exception.format(:error, e, stacktrace), else: Exception.format(:error, e)
+
+    """
+    bl: LOAD FAILED — #{path} (namespace #{ns})
+
+    #{where}
+
+    #{failure}
+    """
+  end
+
+  # The form that raises, found by replaying the source. `:unknown` whenever
+  # anything about the replay is not certain — a reader that cannot re-read the
+  # file, a module not yet loaded, a form count that has drifted — because a
+  # wrong form is worse than no form.
+  defp form_at_fault(ns, path, content) do
+    with true <- loaded?(BeamLisp.Ns.Reader),
+         true <- loaded?(BeamLisp.Ns.Body.Compiler),
+         forms when is_list(forms) <- read_forms(content, path) do
+      total = length(forms)
+      env = BeamLisp.Ns.Body.Compiler.new_env(ns)
+
+      found =
+        with_load_path(Path.dirname(path), fn ->
+          Env.with_env(:global, fn ->
+            forms
+            |> Enum.with_index(1)
+            |> Enum.reduce_while(:none, fn {form, i}, _ ->
+              env = Map.put(env, :ns, Env.current_ns())
+
+              try do
+                BeamLisp.Ns.Body.Compiler.eval_form(form, env)
+                {:cont, :none}
+              rescue
+                _ -> {:halt, {:ok, i, total, form}}
+              catch
+                _, _ -> {:halt, {:ok, i, total, form}}
+              end
+            end)
+          end)
+        end)
+
+      case found do
+        :none -> :unknown
+        {:ok, _, _, _} = it -> it
+      end
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp read_forms(content, path) do
+    case BeamLisp.Ns.Reader.read_string(content, path) do
+      forms when is_list(forms) -> forms
+      forms -> Enum.to_list(forms)
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp loaded?(mod), do: Code.ensure_loaded?(mod)
+
+  # A node's position, from the meta wrapper the reader attaches. `nil` when the
+  # form carries none — a form with no position is still worth naming.
+  defp node_line({:meta, _inner, pos}) when is_map(pos), do: Map.get(pos, :line)
+  defp node_line(_), do: nil
+
+  defp short(form) do
+    inspect(form, limit: 30, printable_limit: 400, width: 100)
+  rescue
+    _ -> "(unprintable)"
   end
 
   defp do_load_miss(ns, miss) do

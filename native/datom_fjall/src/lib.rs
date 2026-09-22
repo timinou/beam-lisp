@@ -60,8 +60,14 @@ mod atoms {
         columns,
         datoms,
         pairs,
-        true_,
-        false_,
+        // The boolean lane's decoded terms. The trailing underscore is a Rust
+        // keyword accident, not part of the atom: without the alias rustler
+        // stringifies the IDENTIFIER, so a stored `true` came back as `:true_`
+        // — a keyword that is truthy, unequal to `true`, and unmatchable by a
+        // bound query. Alias to the real atom names (the same form rustler's
+        // own stdlib atoms use: `false_ = "false"`).
+        true_ = "true",
+        false_ = "false",
     }
 }
 
@@ -695,6 +701,42 @@ fn fjall_resolve_chunk<'a>(
             .map_put("v-var-off", to_binary(env, &cols.v_var_off)?)?
             .map_put("v-var", to_binary(env, &cols.v_var)?)?
     };
+    Ok(out)
+}
+
+/// `fjall_resolve_prefixes`: every datom under ANY of `bounds` (a list of
+/// `[lo hi]` inclusive binary pairs), decoded in Rust, in ONE crossing.
+///
+/// The read behind the engine's semi-join: N prefixes — one per distinct
+/// bound join value — in, only their datoms out. Bounds arrive sorted (the
+/// index layer sorts them) so this is one forward pass over the LSM with N
+/// short seeks, never a column scan. Rows are decoded the same way
+/// `fjall_resolve_chunk`'s `:datoms` mode decodes them.
+///
+/// Not chunked: each prefix is bounded by construction (an entity's datoms,
+/// one attribute's value), and the caller has already capped N
+/// (`SEMI-JOIN-MAX`), so the transient is bounded by the ANSWER.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_resolve_prefixes<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    bounds: Vec<(Binary, Binary)>,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound;
+    let shape = VectorShape::new(env)?;
+    let mut datoms: Vec<Term<'a>> = Vec::new();
+    for (lo, hi) in bounds {
+        let lower = Bound::Included(lo.as_slice().to_vec());
+        let upper = Bound::Included(hi.as_slice().to_vec());
+        for entry in handle.datoms.range((lower, upper)) {
+            let (_k, v) = entry.map_err(|e| err(e))?;
+            let row = read_row(&v)?;
+            datoms.push(datom_term(env, &row, &shape)?);
+        }
+    }
+    let out = map_new(env)
+        .map_put("n", datoms.len() as u64)?
+        .map_put("datoms", datoms.encode(env))?;
     Ok(out)
 }
 

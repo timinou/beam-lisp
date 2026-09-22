@@ -70,18 +70,47 @@ fn as_key(term: Term) -> NifResult<String> {
     Err(err("object key is not an atom or a string"))
 }
 
+/// A BEAM binary in ONE call: `enif_make_new_binary` returns the term AND a pointer to its
+/// payload, so the bytes are written straight in.
+///
+/// The safe path this replaces (`Encoder for str`) allocates an `OwnedBinary`, copies into
+/// it, then releases and wraps it — three crossings of the same boundary for one string, and
+/// strings are the most numerous value in any document. Measured, they cost ~231 ns per value
+/// where BEAM's own builder spends ~23, and the boundary is 92% of a decode (0.81 of 0.88 ms
+/// on 24 KB). rustler's own wrapper module takes exactly this shortcut; this is that idiom,
+/// named, so the reason survives.
+///
+/// Unsafe by necessity: the returned pointer is valid only until the next allocation, so it
+/// must be filled immediately — which is what happens here and nothing else.
+fn make_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+    let mut term = std::mem::MaybeUninit::uninit();
+    let buf = unsafe {
+        rustler::sys::enif_make_new_binary(env.as_c_arg(), bytes.len(), term.as_mut_ptr())
+    };
+    if buf.is_null() {
+        return Err(err("binary allocation failed"));
+    }
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len()) };
+    // `Term::new` is unsafe too: the caller asserts the term belongs to `env`.
+    Ok(unsafe { Term::new(env, term.assume_init()) })
+}
+
 /// A bl Vector: an Erlang map with a `__struct__` key whose `items` is a TUPLE.
 ///
 /// This is the one cross-language shape duplicated from `lib/beam_lisp/vector.ex`.
 /// It is a contract, so it is written once, here, and named.
-fn make_vector<'a>(env: Env<'a>, items: Vec<Term<'a>>) -> NifResult<Term<'a>> {
+fn make_vector<'a>(
+    env: Env<'a>,
+    items: Vec<Term<'a>>,
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
+) -> NifResult<Term<'a>> {
     let tuple = make_tuple(env, &items);
-    let m = map::map_new(env);
-    let m = m.map_put(
-        Atom::from_str(env, "__struct__")?,
-        Atom::from_str(env, "Elixir.BeamLisp.Vector")?,
-    )?;
-    m.map_put(Atom::from_str(env, "items")?, tuple)
+    let keys = [struct_k.to_term(env), items_k.to_term(env)];
+    let vals = [vec_mod.to_term(env), tuple];
+    // ONE call for the whole struct, instead of two `map_put`s that each copy the map.
+    Term::map_from_term_arrays(env, &keys, &vals)
 }
 
 // ══ ENCODE ══════════════════════════════════════════════════════════════════
@@ -327,6 +356,14 @@ fn as_de<E: de::Error>(e: rustler::Error) -> E {
 struct TermSeed<'a> {
     env: Env<'a>,
     mode: KeyMode,
+    // Resolved ONCE per call, not once per Vector. A Vector is a map with a struct tag and
+    // an items tuple, so building one costs three `Atom::from_str` lookups — and a document
+    // of 500 arrays paid 1500 lookups for three atoms that never change. Measured: 446 ns
+    // per Vector, which made arrays the most expensive value type in the whole decoder and
+    // left `make_vector` as the biggest single cost after the boundary itself.
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
@@ -339,6 +376,9 @@ impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
         deserializer.deserialize_any(TermVisitor {
             env: self.env,
             mode: self.mode,
+            struct_k: self.struct_k,
+            items_k: self.items_k,
+            vec_mod: self.vec_mod,
         })
     }
 }
@@ -346,6 +386,9 @@ impl<'de, 'a> DeserializeSeed<'de> for TermSeed<'a> {
 struct TermVisitor<'a> {
     env: Env<'a>,
     mode: KeyMode,
+    struct_k: Atom,
+    items_k: Atom,
+    vec_mod: Atom,
 }
 
 fn atom<'a, E: de::Error>(env: Env<'a>, name: &str) -> Result<Term<'a>, E> {
@@ -383,9 +426,10 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
         Ok(rustler::Encoder::encode(&f, self.env))
     }
 
-    /// One binary allocation for the string, and no intermediate `String`.
+    /// One BEAM allocation, written in place — see `make_binary` for why this is not
+    /// `Encoder::encode`.
     fn visit_str<E: de::Error>(self, s: &str) -> Result<Term<'a>, E> {
-        Ok(rustler::Encoder::encode(&s, self.env))
+        make_binary(self.env, s.as_bytes()).map_err(as_de)
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Term<'a>, E> {
@@ -396,13 +440,16 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
         let seed = TermSeed {
             env: self.env,
             mode: self.mode,
+            struct_k: self.struct_k,
+            items_k: self.items_k,
+            vec_mod: self.vec_mod,
         };
         let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(8));
         while let Some(item) = seq.next_element_seed(seed)? {
             items.push(item);
         }
         // arrays become VECTORS: bl's documented mapping, so a round trip holds
-        make_vector(self.env, items).map_err(as_de)
+        make_vector(self.env, items, self.struct_k, self.items_k, self.vec_mod).map_err(as_de)
     }
 
     /// Objects AND numbers arrive here.
@@ -419,7 +466,15 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
     /// `bl.json`, whose own decoder is exact. Passing it through as f64 would be the
     /// silent corruption this whole arrangement exists to avoid.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Term<'a>, A::Error> {
-        let mut built = map::map_new(self.env);
+        // Pairs are COLLECTED and the map built in ONE call rather than inserted one at a
+        // time. `map_put` is an `enif_make_map_put`, which COPIES the map on every insert —
+        // so a 500-key object is quadratic in the number of keys, which is exactly why the
+        // flat 500-key decode measured 0.03 ms parsing against 0.21 with terms built.
+        // bl's duplicate-key rule (LAST wins) is preserved: a map built from arrays keeps
+        // the last value for a repeated key, and `bl.json`'s suite pins that.
+        let hint = map.size_hint().unwrap_or(8);
+        let mut keys: Vec<Term<'a>> = Vec::with_capacity(hint);
+        let mut values: Vec<Term<'a>> = Vec::with_capacity(hint);
         loop {
             let key_text: String = match map.next_key::<String>()? {
                 Some(k) => k,
@@ -433,12 +488,17 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
             let value = map.next_value_seed(TermSeed {
                 env: self.env,
                 mode: self.mode,
+                struct_k: self.struct_k,
+                items_k: self.items_k,
+                vec_mod: self.vec_mod,
             })?;
-            // later keys overwrite earlier ones, which is bl's documented duplicate-key
-            // rule — an Erlang map gives it for free
-            built = built.map_put(key, value).map_err(as_de)?;
+            keys.push(key);
+            values.push(value);
         }
-        Ok(built)
+        if keys.is_empty() {
+            return Ok(map::map_new(self.env));
+        }
+        Term::map_from_term_arrays(self.env, &keys, &values).map_err(as_de)
     }
 }
 
@@ -450,7 +510,7 @@ const NUMBER_TOKEN: &str = "$serde_json::private::Number";
 /// `:existing-atom`. The one place an atom is built at all.
 fn key_term<'a>(env: Env<'a>, mode: KeyMode, s: &str) -> NifResult<Term<'a>> {
     Ok(match mode {
-        KeyMode::String => rustler::Encoder::encode(&s, env),
+        KeyMode::String => make_binary(env, s.as_bytes())?,
         KeyMode::Keyword => Atom::from_str(env, s)?.to_term(env),
         // `existing_from_str` asks WITHOUT creating, and a miss is an error — which is the
         // decline bl.json needs, so it can say why rather than intern an atom a peer chose.
@@ -492,9 +552,22 @@ fn json_decode<'a>(env: Env<'a>, data: Binary<'a>, keys: Atom) -> NifResult<Term
         "existing-atom" => KeyMode::ExistingAtom,
         _ => KeyMode::String,
     };
+    // Atom lookups happen HERE, once per call — see `TermSeed`. They sit outside the
+    // closure below because that closure's error type is `String` and these return
+    // `rustler::Error`.
+    let struct_k = Atom::from_str(env, "__struct__")?;
+    let items_k = Atom::from_str(env, "items")?;
+    let vec_mod = Atom::from_str(env, "Elixir.BeamLisp.Vector")?;
     let outcome: Result<Term<'a>, String> = (|| {
         let mut deserializer = serde_json::Deserializer::from_slice(data.as_slice());
-        let term = TermSeed { env, mode }
+        let seed = TermSeed {
+            env,
+            mode,
+            struct_k,
+            items_k,
+            vec_mod,
+        };
+        let term = seed
             .deserialize(&mut deserializer)
             .map_err(|e| e.to_string())?;
         deserializer.end().map_err(|e| e.to_string())?;
@@ -505,6 +578,61 @@ fn json_decode<'a>(env: Env<'a>, data: Binary<'a>, keys: Atom) -> NifResult<Term
         Ok(term) => rustler::Encoder::encode(&(Atom::from_str(env, "ok")?, term), env),
         Err(message) => rustler::Encoder::encode(&(Atom::from_str(env, "error")?, message), env),
     })
+}
+
+// ── the isolation instrument ─────────────────────────────────────────────────
+//
+// PARSE ONLY: walk the document and return how many JSON values it held, building NO
+// Erlang terms at all. It exists to answer one question with a number instead of an
+// argument — how much of a decode is the PARSE, and how much is carrying values across the
+// Rust/BEAM boundary?
+//
+// Every control measurable from `bench/json.bl` (OTP, Jason, `binary_to_term`) compares a
+// DIFFERENT implementation, which is how three wrong explanations for the decode gap
+// survived as long as they did. This one holds the parser, the visitor machinery and the
+// input constant, and varies the ONLY thing in question — so `json-count` and `json-decode`
+// on the same bytes, in the same build, bracket the boundary cost exactly.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn json_count(data: Binary) -> NifResult<u64> {
+    struct S;
+    impl<'de> DeserializeSeed<'de> for S {
+        type Value = u64;
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<u64, D::Error> {
+            d.deserialize_any(V)
+        }
+    }
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = u64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<u64, E> { Ok(1) }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<u64, E> { Ok(1) }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<u64, E> { Ok(1) }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<u64, E> { Ok(1) }
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<u64, E> { Ok(1) }
+        fn visit_unit<E: de::Error>(self) -> Result<u64, E> { Ok(1) }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<u64, A::Error> {
+            let mut n = 1;
+            while let Some(c) = s.next_element_seed(S)? { n += c; }
+            Ok(n)
+        }
+        // A number still arrives as a one-entry map under `arbitrary_precision`, so it
+        // counts 2 here and 1 in `json-decode`'s terms. Irrelevant to timing; noted so the
+        // count is not mistaken for a term count.
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<u64, A::Error> {
+            let mut n = 1;
+            while let Some(_k) = m.next_key::<String>()? {
+                n += m.next_value_seed(S)?;
+            }
+            Ok(n)
+        }
+    }
+    let mut d = serde_json::Deserializer::from_slice(data.as_slice());
+    let n = S.deserialize(&mut d).map_err(|e| err(format!("{e}")))?;
+    d.end().map_err(|e| err(format!("{e}")))?;
+    Ok(n)
 }
 
 // ── the rustler contract ────────────────────────────────────────────────────

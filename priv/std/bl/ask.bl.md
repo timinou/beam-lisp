@@ -10,9 +10,17 @@ Two kinds of question live here.
 
 - **Database questions** read a *fact database* built from the sources: every
   definition and every call is a fact, and a question is a query over those
-  facts. `impact`, `callers`, `reachable`, `returns-type`, `arity-mismatches`
-  and `unknown-callees` are these. They answer about a whole *set* of files at
-  once, because facts from every file land in one database.
+  facts. `impact`, `callers`, `reachable`, `returns-type`, `arity-mismatches`,
+  `unknown-callees` and `nplus1` are these. They answer about a whole *set* of
+  files at once, because facts from every file land in one database.
+
+  `nplus1` is the one that answers a PERFORMANCE question: every call fact
+  carries `:call/loop-depth` — how many per-element loops (`map`, `for`,
+  `doseq`, `reduce`, …) enclose the call site — and a datom read (`pull`, `q`,
+  `entity`, `datoms`) at depth ≥ 1 is one store request per row of the
+  collection. That is the N+1 class stated as a datalog query, not a grep;
+  `bl lint` reports the same sites file by file as `datalog/n+1-read`, from
+  the same vocabulary (`datalog-shape`).
 - **File questions** read one file's inter-procedural analysis — the call graph
   with its proofs. `dead-code` and `symbols` are these. They answer about each
   file on its own, because a summary belongs to the program it summarizes.
@@ -71,6 +79,10 @@ it validates with `db-question?` and keeps its own MRTR envelope around them.
     :needs-target? false
     :scope :db
     :doc "calls to names never defined, not core, not interop"}
+   {:name "nplus1"
+    :needs-target? false
+    :scope :db
+    :doc "store reads (pull / q / entity / datoms) issued inside a per-element loop — one request per row"}
    {:name "dead-code"
     :needs-target? false
     :scope :source
@@ -172,7 +184,7 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
    definition and call facts, from the cache when this exact text has been
    indexed before."
   [sigs src root]
-  (let [sha (sha256-hex src)]
+  (let [sha (sha256-hex (str codebase/FACTS-VERSION "\n" src))]
     (or (cached-analysis "facts" sha root)
         (let [ns-str (u/ns-of src)
               facts (codebase/index-source sigs ns-str src)
@@ -218,7 +230,8 @@ set lives in memory for this run only — the same answers, just not remembered.
   "One content hash for an ordered set of sources."
   [paths]
   (sha256-hex
-    (join "\n" (map (fn [p] (sha256-hex (File/read! p))) (u/to-list paths)))))
+    (str codebase/FACTS-VERSION "\n"
+         (join "\n" (map (fn [p] (sha256-hex (File/read! p))) (u/to-list paths))))))
 
 (defn- set-store-path [hash root]
   (str (codebase/blanalysis-dir root) "/askset." hash ".fjall"))
@@ -304,6 +317,9 @@ question; an interface validates first, so it never reaches here.
 
     (= question "unknown-callees")
       (rows-of (codebase/unknown-callees db core-names))
+
+    (= question "nplus1")
+      (rows-of (codebase/nplus1 db))
 
     (= question "callers")
       (rows-of (datom/q '[:find ?caller ?line

@@ -11,6 +11,26 @@ defmodule BeamLisp.Wave14MetaTest do
 
   defp eval(source), do: BeamLisp.eval(source)
 
+  describe "reader locations do not become runtime metadata" do
+    test "native calls receive ordinary lists despite source offsets" do
+      [{:meta, _, position}] = BeamLisp.Ns.Reader.read_string("(list 1 2)", "metadata-test.bl")
+      assert position[:offset] == 0
+      assert position[:"end-offset"] == 10
+      assert eval(~s|(erlang/list_to_tuple (list "def" "value"))|) == {"def", "value"}
+      assert eval(~s|(maps/from_list (list (erlang/list_to_tuple (list "def" "value"))))|) ==
+               %{"def" => "value"}
+    end
+
+    test "nested evaluated forms have no implicit source metadata" do
+      assert eval("(meta (list (list 1 2) 3))") == nil
+      assert eval("(meta (first (list (list 1 2))))") == nil
+    end
+
+    test "explicit author metadata survives but source positions do not" do
+      assert eval("(meta ^{:audit true} (list 1 2))") == %{audit: true}
+    end
+  end
+
   # Lazy seqs carry metadata directly while their native resource provides
   # shared memoization across independently annotated values.
   defp seq1, do: LazySeq.new(fn -> [1, 2, 3] end)

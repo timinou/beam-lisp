@@ -1,0 +1,140 @@
+; web_request_test.bl — the request BODY contract of web/serve (BUG-085).
+;
+; Plug threads a conn: `read_body` returns {:ok, body, conn} and THAT conn
+; carries how much of the request has been consumed. A response sent on the
+; pre-read conn leaves the socket mid-body, so the NEXT request on the same
+; keep-alive connection is parsed from the leftover bytes and dies a bare 400
+; with an empty body ("Request line HTTP error: …" in the journal).
+;
+; It only shows when the body arrives in its own TCP segment — a browser, a
+; proxy, cloudflared, or python's http.client — and it disappears when the
+; client coalesces headers and body into one write (curl does), which is why a
+; smoke test never saw it. Both shapes are pinned below: the split one is the
+; regression, the coalesced one is the control that explains the hiding.
+;
+; Measured on the broken shape before the fix: 12-14 bare 400s per 40 requests
+; in a tight loop, ~2-7% of POSTs through a tunnel.
+
+(ns live.web-request-test
+  (:require [web]))
+
+;; ── a keep-alive client (gen_tcp; the corpus has no http client dep) ──
+
+(defn- connect [port]
+  (elem (erlang/apply :gen_tcp :connect
+          (list (tuple 127 0 0 1) port
+                (to-list [:binary (tuple :packet :raw) (tuple :active false)]) 3000)) 1))
+
+(defn- send! [cs s] (erlang/apply :gen_tcp :send (list cs s)))
+
+(defn- recv [cs]
+  (let [r (erlang/apply :gen_tcp :recv (list cs 0 3000))]
+    (if (and (erlang/is_tuple r) (= :ok (elem r 0))) (elem r 1) nil)))
+
+(defn- headers-of [head]
+  (split head "\r\n"))
+
+(defn- status-of [head] (second (split (first (headers-of head)) " ")))
+
+(defn- header-value [head name]
+  (let [hit (some (fn [l]
+                    (let [ix (index-of l ":")]
+                      (when (and (some? ix) (>= ix 0)
+                                 (= (String/downcase (subs l 0 ix)) name))
+                        (subs l (+ ix 1) (count l)))))
+                  (headers-of head))]
+    (if (some? hit)
+      (let [t (String/trim hit)]
+        ;; a chunked body is not what this server sends for these routes
+        (if (= t "") "0" t))
+      "0")))
+
+(defn- response
+  "Read ONE HTTP/1.1 response — headers AND the whole body, so a test can
+   assert both — and LEAVE THE SOCKET OPEN: the point of this file is what the
+   server does with the request that follows."
+  [cs]
+  (loop [buf ""]
+    (let [i (index-of buf "\r\n\r\n")]
+      (if (and (some? i) (>= i 0))
+        (let [n (String/to_integer (header-value (subs buf 0 i) "content-length"))]
+          (loop [acc buf]
+            (if (>= (- (count acc) (+ i 4)) n)
+              acc
+              (let [more (recv cs)]
+                (if (nil? more) acc (recur (str acc more)))))))
+        (let [more (recv cs)]
+          (if (nil? more) buf (recur (str buf more))))))))
+
+;; ── the server under test: echo the body back ─────────────────────────
+
+(defn- echo-plug
+  "The shape every bl app uses: read the body with the * reader, respond with
+   the conn it handed back — read-body* for a JSON/opaque body, form-params*
+   for a urlencoded one."
+  [conn]
+  (if (String/starts_with? (or (web/req-header conn "content-type") "")
+                           "application/x-www-form-urlencoded")
+    (let [[params conn] (web/form-params* conn)]
+      (web/text conn 200 (str "form:" (get params "email"))))
+    (let [[body conn] (web/read-body* conn)]
+      (web/text conn 200 (str "echo:" body)))))
+
+(def ^:private PORT
+  (let [p (+ 23000 (rem (erlang/system_time :millisecond) 3000))]
+    (web/serve {:port p :ip (tuple 127 0 0 1) :log :off :plug echo-plug})
+    (erlang/apply :timer :sleep (list 400))
+    p))
+
+(def ^:private BODY "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
+
+(defn- request-head [body]
+  (str "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json"
+       "\r\ncontent-length: " (count body) "\r\n\r\n"))
+
+(deftest a-kept-alive-post-with-a-split-body-answers-twice
+  (testing "headers and body in separate writes, then a second request on the same socket"
+    (let [cs (connect PORT)]
+      ;; the split: headers first, body as its own segment
+      (send! cs (request-head BODY))
+      (send! cs BODY)
+      (let [r1 (response cs)]
+        (is (= "200" (status-of r1)))
+        ;; the WHOLE body came back: a reader that takes one chunk and stops
+        ;; would echo a prefix (and, pre-fix, leave the socket mid-body)
+        (is (String/contains? r1 (str "echo:" BODY))))
+      ;; THE REGRESSION. On the pre-fix code this reads a bare 400 (empty
+      ;; body, connection: close) — or the socket is already closed.
+      (send! cs (request-head BODY))
+      (send! cs BODY)
+      (let [r2 (response cs)]
+        (is (= "200" (status-of r2)))
+        (is (String/contains? r2 (str "echo:" BODY))))
+      (erlang/apply :gen_tcp :close (list cs)))))
+
+(deftest a-kept-alive-post-that-coalesces-answers-twice
+  (testing "the control: one write hides the bug, so this passed even before the fix"
+    (let [cs (connect PORT)]
+      (send! cs (str (request-head BODY) BODY))
+      (let [r1 (response cs)]
+        (is (= "200" (status-of r1)))
+        (is (String/contains? r1 (str "echo:" BODY))))
+      (send! cs (str (request-head BODY) BODY))
+      (is (= "200" (status-of (response cs))))
+      (erlang/apply :gen_tcp :close (list cs)))))
+
+(deftest form-params*-threads-the-conn-too
+  (testing "a urlencoded login body parses, and the socket survives the next request"
+    (let [cs (connect PORT)
+          form "email=ada%40acme.com&password=s3cret"
+          head (str "POST /login HTTP/1.1\r\nhost: 127.0.0.1"
+                    "\r\ncontent-type: application/x-www-form-urlencoded"
+                    "\r\ncontent-length: " (count form) "\r\n\r\n")]
+      (send! cs head)
+      (send! cs form)
+      (let [r1 (response cs)]
+        (is (= "200" (status-of r1)))
+        (is (String/contains? r1 "form:ada@acme.com")))
+      (send! cs (str (request-head BODY) BODY))
+      (is (= "200" (status-of (response cs))))
+      (erlang/apply :gen_tcp :close (list cs)))))

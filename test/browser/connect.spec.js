@@ -105,6 +105,61 @@ test("reconnect: {reconnect:false} opts out", async ({ page }) => {
   expect(await page.evaluate(() => window.__sockets.length)).toBe(1);
 });
 
+// A reconnect SWAPS `ws` for a new object (openSocket reassigns it), and the
+// click handler reads `ws.__navigate` off whatever is current. Attach the
+// navigator to only the first socket and the one a reconnect brings back has
+// none: the click is preventDefault'd, no navigate frame is ever sent, and the
+// URL never moves — a dead in-app link on a socket that reports itself live.
+// Silent, and only after a drop, which is what makes it look intermittent.
+test("reconnect: an in-app link still navigates on the socket that came back", async ({ page }) => {
+  await boot(page);
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  await page.evaluate(() => {
+    document.getElementById("live-root").innerHTML = '<a href="/lib/dossier-mci">dossier-mci</a>';
+  });
+  await page.evaluate(() => window.Live.ws.close());
+  await page.waitForFunction(() => window.__sockets.length === 2 && window.__sockets[1].readyState === 1);
+
+  await page.click("a[href='/lib/dossier-mci']");
+
+  // the click must reach the server over the socket that is actually open
+  await page.waitForFunction(() => window.__sockets[1].sent.length > 0, null, { timeout: 2000 });
+  expect(await page.evaluate(() => window.__sockets[1].sent))
+    .toEqual(['["event",["navigate","/lib/dossier-mci"],{}]']);
+});
+
+// A navigation moves the URL bar synchronously (pushState) but the page only
+// changes when the server receives the navigate event and re-projects. If the
+// socket is not OPEN at click time the frame used to be DROPPED (sendFrame's
+// CLOSED branch), so the URL moved and the page did not — and because a
+// reconnect RESUMES the same server session at its now-stale route, the
+// divergence survived the reconnect: only a full reload recovered. Navigation
+// now CONVERGES: the route is buffered while the socket is down and flushed on
+// reopen, so the page always catches up to the address bar.
+test("reconnect: a link clicked while the socket is DOWN still navigates on reopen", async ({ page }) => {
+  await boot(page);                                 // reconnect is ON by default
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  await page.evaluate(() => {
+    document.getElementById("live-root").innerHTML = '<a href="/lib/dossier-mci">dossier-mci</a>';
+  });
+  // close the socket and click WHILE IT IS CLOSED — before the 500ms backoff
+  // reopens it. The same connect() closure will reconnect on its own timer, so
+  // its buffered route (pendingNav) survives to the reopen.
+  await page.evaluate(() => window.Live.ws.close());
+  await page.click("a[href='/lib/dossier-mci']");
+  // the frame was NOT dropped and NOT yet on any wire: socket #1 is closed,
+  // socket #2 has not opened, so nothing was sent — the route is buffered.
+  // (pushState's URL move is not asserted here: this harness runs on
+  // about:blank, where a same-origin pushState to /lib/… is blocked; the
+  // headless-Chrome repro against the real app confirms the URL moves.)
+  expect(await page.evaluate(() => window.__sockets[0].sent.filter(function (d) { return d.indexOf("navigate") >= 0; }))).toEqual([]);
+  // the same-closure reconnect brings socket #2; onopen flushes the buffered route
+  await page.waitForFunction(() => window.__sockets.length === 2 && window.__sockets[1].readyState === 1);
+  await page.waitForFunction(
+    () => window.__sockets[1].sent.some(function (d) { return d === '["event",["navigate","/lib/dossier-mci"],{}]'; }),
+    null, { timeout: 2000 });
+});
+
 // ── the session id ───────────────────────────────────────────────────
 //
 // The server keys the SESSION (locals, last-seen tree, subscriptions) on

@@ -1,0 +1,434 @@
+; examples/hotel/kitchen.bl — the kitchen line, live: the pans, and the
+; processes that make them.
+;
+; Run:  bl serve examples/hotel/kitchen.bl
+; Open: http://127.0.0.1:4058
+;
+; ── What this is ───────────────────────────────────────────────────────
+;
+; `examples/tooling/pipeline.bl` declares a line and reads its row from a
+; terminal. This is that line with a window on it: orders arrive from the
+; dining room, the desk checks each one, the pan gathers eight of them, four
+; cooks work the pans, and the pass plates them. The page IS the deliverable,
+; and it is the line's own dashboard — `bl serve` runs this file and parks the
+; VM, so the server this file starts is the whole of it and no daemon stands
+; beside it.
+;
+; What the page shows, and why each thing is on it:
+;
+;   · per stage, the row's own arithmetic — `:in`, `:out`, `:in-flight`,
+;     `:batches`, `:high-water`, `:errors`, `:dropped` — and the `:lag` /
+;     `:on-error` policies in force, because a counter without its policy is a
+;     number a reader cannot interpret;
+;   · the WORKERS as processes. The pipeline is the only thing that knows its
+;     workers, so the row carries their pids; the page looks each one up
+;     (`pipeline/worker-vitals`) for its `:state` and its mailbox depth. A
+;     worker that has exited keeps its pid in the row, so it reads DEAD rather
+;     than vanishing — and the row carries no per-worker history to show,
+;     because a pid is what it carries: what a worker handled is over by the
+;     time a frame could ask;
+;   · the pans THEMSELVES, so the batching is visible: the orders leave the
+;     line as pans, not as hundreds of individual plates.
+;
+; ── Why the page re-reads the row, and not the line ────────────────────
+;
+; Reading is a READ. `pipeline/pipeline-rows` is built from a table the line
+; only ever writes counters into, so a frame cannot make a worker wait and a
+; worker cannot make a frame wait (FUP-101). That is also what lets the page
+; go on reporting after the last order: the rows outlive the processes that
+; made them.
+;
+; ── Why one frame a second ─────────────────────────────────────────────
+;
+; The shortest stage on this line is the cook, at a few hundred milliseconds, so
+; a two-second frame could miss a worker mid-pan entirely. One second is the
+; coarsest frame that still shows a worker doing its job, and the page asks for
+; it with a plain meta refresh — no client state to drift from the server it
+; reads.
+;
+; docs/the-process-pattern-language.md is the tier's document;
+; priv/std/proc/pipeline.bl is the declaration and the row it publishes.
+
+(ns hotel.kitchen
+  (:require [proc :as proc]
+            [proc.pipeline :as pipeline]
+            [proc.flow :as flow]
+            [bl.serve :as serve]
+            [web]))
+
+(defn check! [truth message data]
+  (when-not truth
+    (throw (ex-info message data))))
+
+(defn- say [label v] (println (str "   " label " → " (Kernel/inspect v))))
+
+(defn- await
+  "Poll `pred` every 10 ms until it holds, or `ms` runs out. A demo that reads a
+   running line has to WAIT for the thing it wants to look at; a bare sleep
+   would race a machine that is doing other work."
+  [pred ms]
+  (loop [left ms]
+    (cond
+      (pred) true
+      (<= left 0) false
+      :else (do (Process/sleep 10) (recur (- left 10))))))
+
+;; ── the dining room: the orders, and the pace they arrive at ───────────
+;;
+;; A kitchen's pace is set by the DOOR, not by the stove: orders arrive over a
+;; service. So the source is a flow producer that hands over one order every
+;; 60 ms and sleeps in between — `(from …)` takes a flow stream as readily as a
+;; seq, and a paced stream is the one thing a seq cannot express.
+;;
+;; The gap is tied to the batcher's patience on purpose. `(batch :pan 8 …)` with
+;; a 150 ms timeout flushes a short pan when the stream goes QUIET for that
+;; long; orders every 60 ms never leave it quiet, so a pan is always the eight
+;; orders the declaration says, and the timeout only matters at the tail.
+
+(def orders 240)          ; the service: this many covers
+(def pan-size 8)          ; orders that fill one pan
+(def arrival-ms 60)       ; one order every 60 ms, well inside the 150 ms timeout
+(def cook-ms 320)         ; one pan on one burner
+
+(defn- menu [] (range 1 (+ 1 orders)))
+
+(defn- arrivals []
+  (flow/producer
+    (fn [state _max]
+      (if (empty? state)
+        :halt
+        (do (Process/sleep arrival-ms)
+            [(list (first state)) (drop 1 state)])))
+    (vec (menu))))
+
+;; ── the line, declared once ───────────────────────────────────────────
+
+(def pans (atom []))       ; the pans the cook was handed, in order
+(def plated (atom []))     ; how many orders were on each plated pan
+(def started (atom nil))   ; epoch ms the doors opened; nil until then
+
+(defn- check-order
+  "The desk: an order is valid when it is a number on the menu. A fn that
+   THROWS is where `(on-error :requeue)` means something, and nothing here
+   throws — so the page can show a line whose error counter is honestly zero."
+  [n]
+  (if (and (> n 0) (<= n orders))
+    n
+    (throw (ex-info (str "the desk refused order " n) {:order n}))))
+
+(defn- cook-pan
+  "A pan on a burner. The sleep is the point of the whole example: a stage that
+   finished in microseconds would be a stage whose pids are gone before a frame
+   could look one up. A few hundred ms is slow enough for a one-second frame to
+   catch a worker mid-pan, and fast enough that thirty pans still finish in a
+   service — which is exactly the wait a demo needs to be watchable."
+  [pan]
+  (let [orders-on-pan (vec pan)]
+    (swap! pans conj orders-on-pan)
+    (Process/sleep cook-ms)
+    orders-on-pan))
+
+(defn- plate-pan [pan]
+  (swap! plated conj (count pan))
+  (count pan))
+
+(proc/defserver kitchen
+  (pipeline
+    (from (arrivals))                               ; the dining room
+    (stage :check check-order {:concurrency 2})     ; the desk
+    (batch :pan 8 {:timeout 150})                   ; eight orders, or 150 ms quiet
+    (stage :cook cook-pan {:concurrency 4})         ; four burners
+    (stage :plate plate-pan)                        ; the pass
+    (on-lag :block)                                 ; hold the door rather than drop
+    (on-error :requeue)))                           ; a refused order goes back
+
+;; ── reading the row ───────────────────────────────────────────────────
+
+(defn- cell
+  "One counter of one node's row, or nil when nothing by that name has been
+   declared. Every read on this page goes through here, so an empty row is a
+   nil rather than a crash."
+  [stage k]
+  (get (pipeline/pipeline-row :kitchen stage) k))
+
+(defn- needed-pans []
+  (quot (+ orders (dec pan-size)) pan-size))
+
+(defn- line-state
+  "Not-started, running, or finished — DERIVED from the row, never from a flag
+   this file keeps. The doors are open while the source still has covers to
+   hand over or the pass is short of the pans the menu makes, so the page
+   reports the finish by itself, with no one to tell it."
+  []
+  (cond
+    (empty? (pipeline/pipeline-of :kitchen)) :not-started
+    (or (< (or (cell :source :out) 0) orders)
+        (< (or (cell :plate :out) 0) (needed-pans))) :running
+    :else :finished))
+
+;; ── the page ──────────────────────────────────────────────────────────
+
+(defn- esc [x]
+  ;; `str` raises on a pid — String.Chars is not implemented for one — and a pid
+  ;; is exactly what a worker cell holds, so anything that is not already a
+  ;; string goes through `pr-str`, which renders a pid the way a reader has seen
+  ;; one all day.
+  (let [s (if (string? x) x (pr-str x))]
+    (String/replace
+      (String/replace (String/replace s "&" "&amp;") "<" "&lt;")
+      ">" "&gt;")))
+
+(defn- pad2 [n] (if (< n 10) (str "0" n) (str n)))
+
+(defn- clock
+  "Epoch milliseconds as a wall-clock time. The VM's own calendar does the
+   conversion, so the page shows the time the OPERATOR's clock shows."
+  [ms]
+  (let [lt (to-list (erlang/apply :calendar :system_time_to_local_time
+                                  (list ms :millisecond)))
+        t (to-list (nth lt 1))]
+    (str (pad2 (nth t 0)) ":" (pad2 (nth t 1)) ":" (pad2 (nth t 2)))))
+
+(defn- num [v] (esc (if (nil? v) 0 v)))
+
+(defn- figure
+  "A number with its label under it. The number stays a number: a reader wants
+   to see 8 in-flight, not a sentence that says there are eight in flight."
+  [label v]
+  (str "<span class=\"n\"><b>" (num v) "</b><i>" (esc label) "</i></span>"))
+
+(defn- worker-line [w]
+  (let [v (pipeline/worker-vitals w)
+        alive (:alive v)]
+    (str "<tr class=\"" (if alive "alive" "dead") "\">"
+         "<td class=\"pid\">" (esc w) "</td>"
+         "<td>" (esc (:state v)) "</td>"
+         "<td class=\"r\">" (num (:message_queue_len v)) "</td>"
+         "<td class=\"mark\">" (if alive "alive" "dead") "</td></tr>")))
+
+(defn- stage-card [r]
+  (let [batch? (= :batch (:kind r))
+        ws (vec (:workers r))]
+    (str
+      "<section class=\"stage" (if batch? " pan" "") "\">"
+      "<h2>" (esc (name (:stage r)))
+      " <span class=\"kind\">" (esc (name (:kind r))) "</span>"
+      "<span class=\"pol\">lag " (esc (name (:lag r)))
+      " · on-error " (esc (name (:on-error r))) "</span></h2>"
+      "<div class=\"nums\">"
+      (figure "in" (:in r))
+      (figure "out" (:out r))
+      (figure "in-flight" (:in-flight r))
+      (if batch? (figure "batches" (:batches r)) "")
+      (figure "high-water" (:high-water r))
+      (figure "errors" (:errors r))
+      (figure "dropped" (:dropped r))
+      "</div>"
+      (if batch?
+        (str "<p class=\"sub\">" (num (:in r)) " orders in → "
+             (num (:batches r)) " pans out — a coalescer is exactly the place"
+             " where those two numbers differ</p>")
+        "")
+      "<table class=\"w\"><tr><th>worker</th><th>state</th>"
+      "<th class=\"r\">mailbox</th><th></th></tr>"
+      (if (empty? ws)
+        "<tr><td colspan=\"4\" class=\"dim\">no worker has taken an event yet</td></tr>"
+        (apply str (map worker-line ws)))
+      "</table></section>")))
+
+(defn- pans-section []
+  (let [ps @pans
+        row (pipeline/pipeline-row :kitchen :pan)]
+    (str "<h2 class=\"wide\">the pans the cook was handed</h2><div class=\"pans\">"
+         (if (empty? ps)
+           "<span class=\"dim\">no pan has come off the line yet</span>"
+           (apply str (map (fn [p] (str "<span class=\"pan-tag\">" (count p) "</span>"))
+                           ps)))
+         "</div>"
+         "<p class=\"sub\">" (num (get row :in)) " orders in → "
+         (num (get row :batches)) " pans out of the batcher, "
+         (num (count ps)) " handed to a burner</p>")))
+
+(defn- header []
+  (let [state (line-state)
+        at @started
+        since (if (some? at) (clock at) "not yet")
+        ran (if (some? at) (quot (- (proc/wall-ms) at) 1000) 0)]
+    (cond
+      (= state :not-started)
+      (str "<h1>the hotel · the kitchen line</h1>"
+           "<p class=\"state idle\">the line has not started yet — and this page"
+           " says so rather than showing nothing</p>")
+
+      (= state :running)
+      (str "<h1>the hotel · the kitchen line</h1>"
+           "<p class=\"state run\">the line is RUNNING — since " (esc since)
+           " · " (num ran) "s · " (num (cell :source :out)) " of " (num orders)
+           " orders in · " (num (cell :plate :out)) " of " (num (needed-pans))
+           " pans plated</p>")
+
+      :else
+      (str "<h1>the hotel · the kitchen line</h1>"
+           "<p class=\"state done\">the line FINISHED — opened " (esc since)
+           ", ran " (num ran) "s; " (num orders) " orders left as "
+           (num (cell :pan :batches)) " pans, and the page still reports it</p>"))))
+
+(defn- body []
+  (let [rows (pipeline/pipeline-of :kitchen)]
+    (str (header)
+         "<div class=\"line\">"
+         (if (empty? rows)
+           "<p class=\"dim\">no node has a row yet: the line is not declared.</p>"
+           (apply str (map stage-card rows)))
+         "</div>"
+         (pans-section)
+         "<p class=\"foot\">one frame a second: the cook is a few hundred"
+         " milliseconds, so a slower frame could miss a worker mid-pan. The page"
+         " re-reads the row, which cannot block the line and cannot be written"
+         " by it.</p>")))
+
+(def page-style
+  (str "*{box-sizing:border-box;margin:0}"
+       "body{background:#0d1117;color:#e6edf3;font-family:ui-monospace,Menlo,monospace;padding:24px;line-height:1.5}"
+       "h1{font-size:20px}"
+       "h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#79c0ff;margin-bottom:10px}"
+       "h2 .kind{color:#7d8590;letter-spacing:0;margin-left:6px}"
+       "h2 .pol{float:right;color:#7d8590;letter-spacing:0;font-weight:400;font-size:12px}"
+       ".state{font-size:14px;font-weight:600;padding:10px 14px;border-radius:10px;margin:10px 0 20px}"
+       ".state.idle{background:#161b22;color:#7d8590;border:1px solid #30363d}"
+       ".state.run{background:#132e1a;color:#4ac26b;border:1px solid #2ea04326}"
+       ".state.done{background:#1c2128;color:#d29922;border:1px solid #9e6a0326}"
+       ".line{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}"
+       ".stage{background:#0f141b;border:1px solid #30363d;border-radius:12px;padding:16px}"
+       ".stage.pan{border-color:#1f6feb55;box-shadow:0 0 0 1px #1f6feb22}"
+       ".nums{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px}"
+       ".n{display:flex;flex-direction:column}"
+       ".n b{font-size:19px;color:#e6edf3}"
+       ".n i{font-size:10px;color:#7d8590;font-style:normal;text-transform:uppercase;letter-spacing:.05em}"
+       "table.w{width:100%;border-collapse:collapse}"
+       "table.w th{text-align:left;font-size:10px;color:#7d8590;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #30363d;padding:2px 0}"
+       "table.w td{font-size:12px;color:#adbac7;padding:3px 0;border-bottom:1px solid #161b22}"
+       "table.w td.r,table.w th.r{text-align:right}"
+       "table.w tr.dead td{color:#f85149;opacity:.75}"
+       "table.w tr.alive td.mark{color:#4ac26b}"
+       ".pid{color:#7d8590}"
+       ".dim{color:#7d8590;font-size:12px}"
+       ".sub{color:#7d8590;font-size:12px;margin-bottom:10px}"
+       "h2.wide{margin-top:26px}"
+       ".pans{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}"
+       ".pan-tag{background:#161b22;border:1px solid #1f6feb55;color:#79c0ff;border-radius:6px;padding:2px 9px;font-size:12px}"
+       ".foot{color:#7d8590;font-size:11px;margin-top:26px;max-width:820px}"))
+
+(defn- page []
+  (str "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<meta http-equiv=\"refresh\" content=\"1\">"
+       "<title>the hotel · the kitchen line</title>"
+       "<style>" page-style "</style></head><body>"
+       (body)
+       "</body></html>"))
+
+;; ── HTTP: one route, rendered on the way in ───────────────────────────
+
+(defn router [conn]
+  (web/route conn
+    [:get "/"] (web/html conn (page))
+    :else (web/text conn 404 "not found")))
+
+;; ── the walkthrough ───────────────────────────────────────────────────
+;;
+;; Running this file IS the walk: it asserts what can be asserted about a line
+;; mid-service and then RETURNS, leaving the line running so the page has
+;; something to report. (Nothing new is invented for the serve case: the file
+;; starts its server and returns either way, which is what `bl serve` supplies
+;; the missing half of.)
+
+(defn- walk []
+  (println)
+  (println "── the hotel's kitchen line ──────────────────────────────────")
+
+  (println)
+  (println "== 1. before the doors open ==")
+  (check! (empty? (pipeline/pipeline-of :kitchen))
+          "no node has a row yet, and the page reports that rather than crashing"
+          {})
+  (say "the line, declared" "nothing yet — and the page still renders")
+
+  (println)
+  (println "== 2. the line, and the processes on it ==")
+  (reset! started (proc/wall-ms))
+  (let [s (start kitchen nil {})]
+    (check! (await (fn [] (>= (or (cell :pan :batches) 0) 1)) 15000)
+            "the batcher must release its first pan"
+            {:batches (cell :pan :batches)})
+    (say "the first pan the cook was handed" (first @pans))
+    (check! (= pan-size (count (first @pans)))
+            "eight orders fill a pan, because the stream is never quiet for the 150 ms the batcher waits"
+            {:pan (first @pans)})
+    (check! (> (or (cell :pan :in) 0) (or (cell :pan :batches) 0))
+            "the batch row counts events IN while its batches are FEWER — the two numbers a coalescer exists to separate"
+            {:in (cell :pan :in) :batches (cell :pan :batches)})
+
+    (check! (await (fn [] (some (fn [p] (:alive (pipeline/worker-vitals p)))
+                               (vec (get (pipeline/pipeline-row :kitchen :cook) :workers))))
+                   10000)
+            "a cook worker must be a live process a reader can look up"
+            {:workers (get (pipeline/pipeline-row :kitchen :cook) :workers)})
+    (let [pid (first (vec (get (pipeline/pipeline-row :kitchen :cook) :workers)))]
+      (say "the cook's first worker, looked up" (pipeline/worker-vitals pid))
+      (check! (some? (:state (pipeline/worker-vitals pid)))
+              "…and that lookup answers a state and a mailbox for the page to print"
+              {:vitals (pipeline/worker-vitals pid)}))
+
+    (check! (every? (fn [r] (= :block (:lag r))) (pipeline/pipeline-of :kitchen))
+            "every row carries the lag policy in force — a kitchen holds the door rather than throwing orders away"
+            {})
+    (check! (every? (fn [r] (= :requeue (:on-error r))) (pipeline/pipeline-of :kitchen))
+            "…and the error policy: an order the desk refuses goes back on the queue"
+            {})
+    (check! (= 0 (cell :check :errors))
+            "nothing on the line has failed"
+            {:errors (cell :check :errors)})
+
+    ;; The read is a read. Hammer the read model while the line runs, then check
+    ;; the line is still moving: a dashboard that stalls what it reports is the
+    ;; one thing a pane must never be (FUP-101).
+    (let [before (or (cell :check :in) 0)]
+      (doseq [_ (range 0 500)] (pipeline/pipeline-rows))
+      (check! (await (fn [] (> (or (cell :check :in) 0) before)) 5000)
+              "five hundred frames' worth of reads, and the desk never noticed"
+              {:before before :after (cell :check :in)}))
+
+    (say "orders the desk has seen" (cell :check :in))
+    (say "pans the batcher made" (cell :pan :batches))
+    (say "the server the line runs under" s)
+    ;; One line per node, read WHILE the line is working — the same rows the
+    ;; page is rendering, in the terminal that started it.
+    (doseq [r (pipeline/pipeline-of :kitchen)]
+      (say (name (:stage r))
+           (str "in " (:in r)
+                (if (= :batch (:kind r)) (str " → " (:batches r) " pans") (str " → out " (:out r)))
+                " · in-flight " (:in-flight r)
+                " · high-water " (:high-water r)
+                " · workers " (count (:workers r))
+                " · lag " (name (:lag r)))))
+    ;; The line is deliberately left running. It finishes on its own, and the
+    ;; rows it wrote stay readable — which is what the page shows after the
+    ;; last order, with nobody left to tell it the service is over.
+    s)
+
+  (println)
+  (println "✓ kitchen: one declaration wires the line, the row reports the")
+  (println "  processes that work it, and the page reads that row a frame a")
+  (println "  second — while the line runs, and after it stops."))
+
+(defn main []
+  (web/serve {:port (serve/port 4058) :plug router})
+  (println "\n-- the hotel's kitchen line --")
+  (println (str "  open:   http://127.0.0.1:" (serve/port 4058)))
+  (println "  the doors open as this page comes up; watch the pans and the")
+  (println "  pids. --port N moves it; the page keeps reporting after the")
+  (println "  last order.")
+  (walk))
+
+(main)
