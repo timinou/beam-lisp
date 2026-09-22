@@ -1,0 +1,553 @@
+; driver.bl — the all-BL measurement driver for the fused byte-fold prototype.
+;
+; WHAT THIS IS. `fusion.driver/run` is handed one native sidecar executable, the
+; IR text it was compiled from, and a vector of fixtures, and returns one
+; evidence map. Everything on this side of the BL/host line — process spawn,
+; port framing, u64 codec, byte adaptation, assertion, timing, aggregation and
+; reporting — is written here, in BL. No shell, no Elixir source, no Python
+; wrapper: the only non-BL thing this file touches is the sidecar PROCESS it
+; spawns, and it touches it through `erlang.open_port/2` exactly as the protocol
+; document specifies.
+;
+; THE THREE PATHS, all driven from this one file:
+;   :rt      fusion.pipeline/rt-run     — BeamLisp.RT map/filter/reduce over a
+;                                         byte LIST, with binary:bin_to_list
+;                                         INSIDE the timed function.
+;   :beam    fusion.pipeline/fused-run  — the generated Elixir.Krt.FusedPipeline
+;                                         module (must already be installed).
+;   :native  the j1_probe sidecar       — one RESIDENT `--serve-fold` port.
+;
+; THE WIRE (research/j1_probe/PROTOCOL.md §2):
+;   spawn → first frame payload "READY"      (spawn + IR parse + JIT — the
+;                                             handshake, measured separately)
+;   request  = init:u64 BE ‖ buffer bytes    (the port's {:packet,4} adds the
+;                                             u32 BE length; the driver adds
+;                                             neither)
+;   response = value:u64 BE ‖ inner_ns:u64 BE (16 bytes; inner_ns is the JIT
+;                                             call alone, boundary excluded)
+;   EOF = close. Exit status arrives as {Port, {:exit_status, N}}.
+;
+; The u64 codec below is built out of erlang shifts/band/binary:at — there is no
+; host encoder to call and no host source involved.
+;
+; WHAT IT DOES NOT CLAIM. The driver measures and cross-checks; it does not
+; verify the sidecar's protocol safety envelope (malformed frames, oversize
+; declarations, truncated headers — that is the `main` harness's job) and it
+; does not certify that the shared formula is right (the fixtures carry their
+; own `:expected`, produced by an independent oracle). Agreement on these
+; fixtures is not a safety certificate.
+;
+; A NOTE ON ASSERTIONS. Every check throws. There is no branch anywhere in this
+; file that treats a falsy result as "close enough" or that skips a mismatch
+; because it is inconvenient — `check!` compares with erlang/== against `true`
+; exactly, so a non-boolean truthy value is a failure too. That is deliberate:
+; the prototype's first harness discarded false results and reported a pass.
+
+(ns fusion.driver)
+
+;; ── constants ───────────────────────────────────────────────────────────────
+
+(def U64 18446744073709551615)
+(def MAX-BYTES 1048576)          ; the admitted fragment's input cap
+(def FRAME-TIMEOUT-MS 30000)     ; one receive window: spawn, reply, or silence
+(def STARTUP-SAMPLES 3)          ; independent spawn+JIT handshakes
+(def ROUNDS 5)                   ; timing rounds per (size, variant)
+(def MAX-REPEATS 200)            ; a call is repeated at most this many times
+(def REPEAT-BUDGET 65536)        ; bytes·repeats budget: small inputs repeat more
+(def VARIANTS [:rt :beam :native])
+(def TALLY-KEY :fusion-driver-checks)
+
+;; ── u64 codec, in BL ────────────────────────────────────────────────────────
+;
+; The wire is big-endian fixed width. `bsr`/`bsl`/`band` are erlang BIFs, and
+; `binary:at/2` reads one byte — no host encoder, no intermediate integer list
+; beyond the eight bytes a frame actually carries.
+
+(defn u64->bin
+  "The 8-byte big-endian binary for `v` (v is a u64; the caller has validated)."
+  [v]
+  (erlang/list_to_binary
+    (to-list
+      (map (fn [i] (erlang/band (erlang/bsr v (erlang/* 8 i)) 255))
+           (list 7 6 5 4 3 2 1 0)))))
+
+(defn bin->u64
+  "Read 8 big-endian bytes of `b` starting at `start` as an integer."
+  [b start]
+  (loop [i start acc 0]
+    (if (erlang/== i (erlang/+ start 8))
+      acc
+      (recur (erlang/+ i 1)
+             (erlang/+ (erlang/bsl acc 8) (binary/at b i))))))
+
+;; ── assertions and the check tally ──────────────────────────────────────────
+
+(defn- reset-tally! []
+  (erlang/put TALLY-KEY {})
+  0)
+
+(defn- tally! [kind]
+  (let [counts (erlang/get TALLY-KEY)
+        n (erlang/+ 1 (get counts kind 0))]
+    (erlang/put TALLY-KEY (assoc counts kind n))
+    n))
+
+(defn- tally-count
+  "The tallied assertion counts, one entry per kind; `:total` is their sum."
+  []
+  (let [counts (erlang/get TALLY-KEY)]
+    (assoc counts :total
+           (reduce (fn [a k] (erlang/+ a (get counts k))) 0 (keys counts)))))
+
+(defn assert!
+  "A wire invariant: throws on every mismatch, but is NOT tallied — the frame
+   that carries a measurement is not itself one of the checks being reported."
+  [label ok]
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "fusion.driver: " label) {:label label :actual ok})))
+  true)
+
+(defn check!
+  "A contract assertion — a value, a refusal, a handshake — counted under `kind`
+   and thrown on every mismatch. A non-boolean truthy value fails too, so
+   nothing is silently accepted. Returns true."
+  [kind label ok]
+  (tally! kind)
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "fusion.driver: assertion failed: " label)
+                    {:label label :kind kind :actual ok})))
+  true)
+
+;; ── the sidecar port ────────────────────────────────────────────────────────
+
+(defn spawn-fold!
+  "Spawn `exe --serve-fold ir` as a binary {packet,4} port that also reports its
+   exit status. The port is owned by the caller's process; nothing about the
+   child is shared with any other path."
+  [exe ir]
+  (erlang/open_port (tuple :spawn_executable exe)
+                    (list :binary
+                          (tuple :packet 4)
+                          :exit_status
+                          (tuple :args (list "--serve-fold" ir)))))
+
+(defn recv-frame!
+  "The next {port, {:data, payload}} payload from `port`.
+
+   The guard matches THIS port, so a frame belonging to any other port stays in
+   the mailbox. A port exit is a failure and throws (the sidecar is not allowed
+   to die mid-run without the driver saying so), and 30s of silence throws.
+   Exactly one frame is returned per request — no reply is ever discarded."
+  [port]
+  (receive
+    [who [:data payload]] :when (= who port) payload
+    [who [:exit_status status]] :when (= who port)
+      (throw (ex-info (str "fusion.driver: j1_probe exited with status " status)
+                      {:status status}))
+    (after FRAME-TIMEOUT-MS
+      (throw (ex-info "fusion.driver: timed out waiting for a j1_probe frame" {})))))
+
+(defn await-ready!
+  "Consume the handshake frame. It must be exactly the 5 bytes READY."
+  [port]
+  (let [payload (recv-frame! port)]
+    (assert! (str "handshake payload is READY (got " (pr-str payload) ")")
+             (erlang/== payload "READY"))
+    (assert! "handshake frame is 5 bytes"
+             (erlang/== 5 (erlang/byte_size payload)))
+    true))
+
+(defn request!
+  "One protocol roundtrip: pack the request, send it, read the 16-byte reply.
+
+   The request iolist is handed to Port.command as-is: the 8-byte init header
+   plus the ORIGINAL buffer binary, which is never converted — one frame, one
+   copy, and the copy is the port's. `:ns` is the measured boundary: packing,
+   command, the port round trip, the read, and the 16-byte decode are all inside
+   it. `:inner-ns` is the sidecar's own JIT scalar and excludes all of that."
+  [port init bin]
+  (let [t0 (erlang/monotonic_time :nanosecond)
+        _ (Port/command port (list (u64->bin init) bin))
+        reply (recv-frame! port)
+        t1 (erlang/monotonic_time :nanosecond)
+        n (erlang/byte_size reply)]
+    (assert! (str "native reply is 16 bytes (got " n ")") (erlang/== 16 n))
+    {:value (bin->u64 reply 0)
+     :inner-ns (bin->u64 reply 8)
+     :ns (erlang/- t1 t0)}))
+
+;; ── input contract (shared by every path, and the native path's gate) ───────
+
+(defn input-problem
+  "The one contract all three paths enforce: a binary of at most 1 MiB and a
+   u64 initial accumulator. Returns the reason string, or nil when the input is
+   admissible. `rt-run`/`fused-run` enforce it themselves; the native path has
+   no BL entry point of its own, so the driver enforces the same contract here
+   BEFORE anything reaches the port."
+  [bin init]
+  (cond
+    (not (erlang/is_binary bin)) "input must be a binary"
+    (erlang/> (erlang/byte_size bin) MAX-BYTES)
+      (str "input is " (erlang/byte_size bin) " bytes; the admitted fragment caps at " MAX-BYTES)
+    (not (erlang/is_integer init)) "initial accumulator must be a u64 integer"
+    (erlang/< init 0) "initial accumulator must be >= 0"
+    (erlang/> init U64) "initial accumulator exceeds u64"
+    :else nil))
+
+(defn native-request!
+  "Validate, then one protocol roundtrip. A refused input never opens a frame."
+  [port init bin]
+  (let [problem (input-problem bin init)]
+    (when (some? problem)
+      (throw (ex-info (str "fusion: " problem) {:input bin :init init})))
+    (request! port init bin)))
+
+;; ── the one adapter dispatch ────────────────────────────────────────────────
+;
+; Every value this driver consumes comes through here, so "which path produced
+; it" is one `cond` and not three call sites that can drift.
+
+(defn call-adapter
+  "Run one variant and return {:value v :inner-ns n}. `inner-ns` is non-zero
+   only for :native (the sidecar's own scalar); the two BEAM paths have no inner
+   timer and report 0 rather than inventing one."
+  [ctx variant bin init]
+  (cond
+    (erlang/== variant :rt) {:value (fusion.pipeline/rt-run bin init) :inner-ns 0}
+    (erlang/== variant :beam) {:value (fusion.pipeline/fused-run bin init) :inner-ns 0}
+    (erlang/== variant :native)
+      (let [r (native-request! (:port ctx) init bin)]
+        {:value (:value r) :inner-ns (:inner-ns r)})
+    :else (throw (ex-info (str "fusion.driver: unknown variant " (pr-str variant)) {}))))
+
+;; ── startup: spawn + JIT, measured on its own ───────────────────────────────
+
+(defn startup-sample!
+  "One independent cold handshake. Times spawn → READY only; spawn, IR parse and
+   JIT compile are all inside that window and nothing else is. The port is then
+   used for exactly one empty-buffer roundtrip — proving the freshly compiled
+   kernel answers — and always closed."
+  [exe ir round]
+  (let [t0 (erlang/monotonic_time :nanosecond)
+        port (spawn-fold! exe ir)]
+    (try
+      (await-ready! port)
+      (let [t1 (erlang/monotonic_time :nanosecond)
+            r (request! port 0 "")]
+        (check! :startup (str "startup sample " round " preserves the initial accumulator")
+                (erlang/== 0 (:value r)))
+        {:round round :ns (erlang/- t1 t0)
+         :value (:value r) :inner-ns (:inner-ns r)})
+      (finally (Port/close port)))))
+
+;; ── the timing matrix ───────────────────────────────────────────────────────
+
+(defn- repeat-count
+  "How many times one call is repeated for a `size`-byte input: the byte budget
+   divided by the size, floored at 1 (big inputs are measured once) and capped
+   at 200 (small inputs are measured enough times to leave the clock's floor)."
+  [size]
+  (max 1 (min MAX-REPEATS (quot REPEAT-BUDGET (max 1 size)))))
+
+(defn- rotate [v n]
+  (let [k (erlang/rem n (count v))]
+    (into [] (concat (drop k v) (take k v)))))
+
+(defn- variant-order
+  "Round `round`'s measurement order. Rotating moves each variant through every
+   position across the five rounds; reversing on odd rounds means no variant is
+   always measured first OR always last, so a systematic warm/cold bias lands on
+   a different path each time."
+  [round]
+  (let [rot (rotate VARIANTS round)]
+    (if (erlang/== 1 (erlang/rem round 2)) (into [] (reverse rot)) rot)))
+
+(defn measure-batch
+  "Time `repeats` calls of one adapter, recording the batch's wall time, the
+   summed native inner time, process reductions consumed, and process memory on
+   both sides. The last call's value is kept for the correctness assertion."
+  [ctx variant bin init repeats]
+  (erlang/garbage_collect)
+  (let [m-before (elem (erlang/process_info (erlang/self) :memory) 1)
+        r-before (elem (erlang/process_info (erlang/self) :reductions) 1)
+        t0 (erlang/monotonic_time :nanosecond)
+        acc (loop [i 0 value nil inner 0]
+              (if (erlang/== i repeats)
+                {:value value :inner-ns inner}
+                (let [r (call-adapter ctx variant bin init)]
+                  (recur (erlang/+ i 1) (:value r) (erlang/+ inner (:inner-ns r))))))
+        t1 (erlang/monotonic_time :nanosecond)
+        reductions (erlang/- (elem (erlang/process_info (erlang/self) :reductions) 1) r-before)
+        m-after (elem (erlang/process_info (erlang/self) :memory) 1)]
+    {:ns (erlang/- t1 t0)
+     :value (:value acc)
+     :inner-ns (:inner-ns acc)
+     :reductions reductions
+     :memory-before m-before
+     :memory-after m-after}))
+
+(defn bench-rows
+  "The timing matrix: for every bench fixture, one warm call per variant, then
+   ROUNDS batches per variant in the rotated order. Every batch's value is
+   asserted against the fixture's expected value — a fast wrong answer fails
+   here, not in a later pass."
+  [ctx bench-fixtures]
+  (into []
+    (mapcat
+      (fn [f]
+        (let [bin (:binary f)
+              size (erlang/byte_size bin)
+              init (:initial f)
+              expected (:expected f)
+              repeats (repeat-count size)]
+          (doseq [v VARIANTS] (call-adapter ctx v bin init))
+          (into []
+            (mapcat
+              (fn [round]
+                (into []
+                  (map (fn [v]
+                         (let [s (measure-batch ctx v bin init repeats)]
+                           (check! :bench (str "bench value " (pr-str v) " size " size " round " round)
+                                   (erlang/== expected (:value s)))
+                           (assoc s
+                                  :variant v :size size :round round :repeats repeats)))
+                       (variant-order round))))
+              (range ROUNDS)))))
+      bench-fixtures)))
+
+;; ── correctness over every fixture ──────────────────────────────────────────
+
+(defn correctness-rows
+  "Every fixture through every variant, asserted against its expected value.
+   Fixtures are run in the caller's order; nothing is skipped for being small,
+   empty, at a boundary, or in :bench mode."
+  [ctx fixtures]
+  (into []
+    (mapcat
+      (fn [f]
+        (mapv (fn [v]
+                (let [r (call-adapter ctx v (:binary f) (:initial f))
+                      got (:value r)
+                      want (:expected f)]
+                  (check! :correctness (str "value " (pr-str v) " fixture " (:tag f))
+                          (erlang/== want got))
+                  {:variant v :tag (:tag f) :mode (:mode f)
+                   :size (erlang/byte_size (:binary f))
+                   :value got :expected want}))
+              VARIANTS))
+      fixtures)))
+
+;; ── refusals: 5 inputs, every variant ───────────────────────────────────────
+
+(defn refusal-inputs
+  "The five departures from the input contract, one per failure mode. Each must
+   be refused by EVERY path — a refusal is a property of the contract, not of
+   which implementation happened to be called."
+  []
+  [{:tag "nonbinary" :binary :not-a-binary :initial 0}
+   {:tag "init-negative" :binary "" :initial -1}
+   {:tag "init>u64" :binary "" :initial (erlang/+ U64 1)}
+   {:tag "init-float" :binary "" :initial 1.5}
+   {:tag "buffer>1MiB" :binary (binary/copy (erlang/list_to_binary (list 0)) (erlang/+ MAX-BYTES 1)) :initial 0}])
+
+(defn refusal-rows
+  "Each refusal input against each variant. The assertion is that the path
+   THROWS; a path that returns a value here is the failure. The caught value is
+   recorded, not inspected — refusal *reason* text belongs to the path that
+   refused (fusion.pipeline's input validation for :rt/:beam,
+   fusion.driver/input-problem for :native); the driver owns only 'did it
+   refuse'."
+  [ctx inputs]
+  (into []
+    (mapcat
+      (fn [v]
+        (mapv (fn [in]
+                (let [threw (try (do (call-adapter ctx v (:binary in) (:initial in)) false)
+                                 (catch e true))]
+                  (check! :refusal (str "refusal " (pr-str v) " " (:tag in)) threw)
+                  {:variant v :tag (:tag in) :refused threw}))
+              inputs))
+      VARIANTS)))
+
+;; ── byte adaptation, measured separately ────────────────────────────────────
+;
+; binary:bin_to_list is the RT path's own byte adapter, and it lives INSIDE
+; rt-run's timed body. Measuring it separately is what makes the RT number
+; readable: the conversion is never subtracted from RT (that would report a
+; pipeline nobody can write), it is exposed beside it.
+
+(defn adapter-samples
+  "3 samples of binary:bin_to_list per bench size. Only the conversion is
+   inside the timer; the length walk that keeps the list alive is outside it."
+  [bench-fixtures]
+  (into []
+    (mapcat
+      (fn [f]
+        (let [bin (:binary f)]
+          (mapv (fn [round]
+                  (let [t0 (erlang/monotonic_time :nanosecond)
+                        lst (binary/bin_to_list bin)
+                        t1 (erlang/monotonic_time :nanosecond)]
+                    {:size (erlang/byte_size bin) :round round
+                     :bytes (erlang/length lst)
+                     :ns (erlang/- t1 t0)}))
+                (range 3))))
+      bench-fixtures)))
+
+;; ── aggregation and reporting ───────────────────────────────────────────────
+
+(defn- fsize [f] (erlang/byte_size (:binary f)))
+
+(defn- median [xs]
+  (let [ordered (into [] (sort xs))]
+    (nth ordered (quot (count ordered) 2))))
+
+(defn- per-call-ns [samples size variant]
+  (into []
+    (map (fn [s] (quot (:ns s) (:repeats s)))
+         (filterv (fn [s] (and (erlang/== size (:size s))
+                               (erlang/== variant (:variant s))))
+                  samples))))
+
+(defn- per-call-inner [samples size]
+  (into []
+    (map (fn [s] (quot (:inner-ns s) (:repeats s)))
+         (filterv (fn [s] (and (erlang/== size (:size s))
+                               (erlang/== :native (:variant s))))
+                  samples))))
+
+(defn summarize
+  "Per size: the five per-call samples and their median for each variant, plus
+   the native inner median. Exposed as data so a caller can re-derive anything
+   the printed table drops."
+  [samples bench-fixtures]
+  (mapv
+    (fn [f]
+      (let [size (fsize f)]
+        {:size size
+         :variants
+           (into {}
+             (map (fn [v]
+                    (let [xs (per-call-ns samples size v)]
+                      [v {:samples-ns xs :median-ns (median xs)
+                          :min-ns (reduce min xs) :max-ns (reduce max xs)}]))
+                  VARIANTS))
+         :native-inner-median-ns (median (per-call-inner samples size))}))
+    bench-fixtures))
+
+(defn- total-of [xs] (reduce (fn [a x] (erlang/+ a x)) 0 xs))
+
+(defn print-table
+  "The human table. `all?` also prints every raw sample row."
+  [samples bench-fixtures all?]
+  (println "bytes | RT us | fused BEAM us | native us | native inner us | RT reductions")
+  (doseq [f bench-fixtures]
+    (let [size (fsize f)
+          row (fn [v] (median (per-call-ns samples size v)))
+          reds (median (into [] (map (fn [s] (:reductions s))
+                                     (filterv (fn [s] (and (erlang/== size (:size s))
+                                                           (erlang/== :rt (:variant s))))
+                                              samples))))
+          vrow (filterv (fn [s] (erlang/== size (:size s))) samples)]
+      (println (str size
+                    " | " (/ (row :rt) 1000.0)
+                    " | " (/ (row :beam) 1000.0)
+                    " | " (/ (row :native) 1000.0)
+                    " | " (/ (median (per-call-inner samples size)) 1000.0)
+                    " | " reds))
+      (when all?
+        (doseq [s vrow]
+          (println (str "    " (:variant s) " round=" (:round s)
+                        " repeats=" (:repeats s) " ns=" (:ns s)
+                        " inner-ns=" (:inner-ns s)
+                        " reductions=" (:reductions s)
+                        " mem=" (:memory-before s) "->" (:memory-after s)
+                        " value=" (:value s))))))))
+
+;; ── the entry point ─────────────────────────────────────────────────────────
+
+(defn run
+  "Measure the three fused-fold paths and return the evidence.
+
+   run(exe, ir, fixtures) — print a summary table.
+   run(exe, ir, fixtures, opts) — opts: {:print :summary|:all|:none}.
+
+   `exe`       the j1_probe executable (spawned, never shelled).
+   `ir`        the --serve-fold IR text path (the SAME descriptor the fused BEAM
+               module was generated from).
+   `fixtures`  vector of {:tag str :mode :bench|:check :initial u64
+                          :expected u64 :binary binary}.
+
+   Returns
+     {:passed       true            ; reached only if every assertion held
+      :checks       <int>           ; total contract assertions performed
+      :check-counts {kind <int> :total <int>}   ; :correctness/:bench/:refusal/:startup
+      :refusals     <int>           ; refusal inputs each path in fact refused, 0..15
+      :samples      [<sample>]      ; 3 variants × ROUNDS × bench fixtures
+      :startup      [<startup>]     ; STARTUP-SAMPLES spawn+JIT handshakes
+      :startup-ns   [<int>]         ; the same, as bare nanoseconds
+      :adapters     [<conv>]        ; 3 binary:bin_to_list samples per bench size
+      :correctness  [<row>]         ; every (fixture, variant) value check
+      :refusal-rows [<row>]         ; every (input, variant) refusal check
+      :summary      [<size>]        ; medians, per bench size
+      :counts       {…}             ; matrix shape actually measured
+      :ns           {…}]            ; wall nanoseconds by section
+
+   <sample>  {:variant :rt|:beam|:native :size :round :repeats :ns :value
+              :inner-ns :reductions :memory-before :memory-after}
+   <conv>    {:size :round :bytes :ns}
+
+   `fusion.pipeline` must already be loaded (rt-run/fused-run) and its generated
+   module installed (fused-run) — that is the caller's sequencing, not this
+   file's, so that loading the driver never runs a generator as a side effect."
+  ([exe ir fixtures] (run exe ir fixtures {}))
+  ([exe ir fixtures opts]
+   (reset-tally!)
+   (let [print-mode (or (:print opts) :summary)
+         bench (into [] (sort-by fsize (filterv (fn [f] (erlang/== :bench (:mode f))) fixtures)))
+         startup (into [] (map (fn [i] (startup-sample! exe ir i)) (range STARTUP-SAMPLES)))
+         measured
+           (let [port (spawn-fold! exe ir)]
+             (try
+               (await-ready! port)
+               (let [ctx {:port port}]
+                 {:correctness (correctness-rows ctx fixtures)
+                  :refusal-rows (refusal-rows ctx (refusal-inputs))
+                  :samples (bench-rows ctx bench)
+                  :adapters (adapter-samples bench)})
+               (finally (Port/close port))))
+         samples (:samples measured)
+         tally (tally-count)
+         result
+           {:passed true
+            :checks (:total tally)
+            :check-counts tally
+            :refusals (count (filterv (fn [r] (erlang/== true (:refused r)))
+                                       (:refusal-rows measured)))
+            :samples samples
+            :startup startup
+            :startup-ns (into [] (map (fn [s] (:ns s)) startup))
+            :adapters (:adapters measured)
+            :correctness (:correctness measured)
+            :refusal-rows (:refusal-rows measured)
+            :summary (summarize samples bench)
+            :counts {:fixtures (count fixtures)
+                     :bench-fixtures (count bench)
+                     :startup-samples STARTUP-SAMPLES
+                     :rounds ROUNDS
+                     :variants (count VARIANTS)
+                     :correctness-checks (count (:correctness measured))
+                     :bench-checks (count samples)
+                     :refusal-checks (count (:refusal-rows measured))
+                     :adapter-samples (count (:adapters measured))
+                     :samples (count samples)}
+            :ns {:startup (total-of (map (fn [s] (:ns s)) startup))
+                 :bench (total-of (map (fn [s] (:ns s)) samples))
+                 :adapters (total-of (map (fn [s] (:ns s)) (:adapters measured)))}}
+         _ (when (erlang/== :all print-mode) (print-table samples bench true))
+         _ (when (erlang/== :summary print-mode) (print-table samples bench false))]
+     (println (str "PASS fusion driver: checks=" (:checks result)
+                   " refusals=" (:refusals result)
+                   " samples=" (count samples)
+                   " startup-ns=" (pr-str (:startup-ns result))))
+     result)))

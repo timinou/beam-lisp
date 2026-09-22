@@ -1,0 +1,298 @@
+; pipeline.bl — one explicit descriptor, two generated lowerings.
+;
+; THE FRAGMENT (frozen, shared by every path):
+;
+;     for each byte b of one immutable binary (len <= 1 MiB):
+;         y = (3*b + 7) mod 256
+;         keep y  when y < 128
+;         acc = (acc + retained y) mod 2^64        ; u64 wrap
+;     return acc                                    ; supplied initial acc
+;
+; WHAT THIS IS. A research prototype for a *bounded packed-byte* pipeline. The
+; three measured paths are:
+;
+;   rt-run   — the shipped runtime, the way a user would write it: actual
+;              BeamLisp.RT map_xform / filter_xform / reduce / invoke, with the
+;              binary->list adapter inside the timed function.
+;   fused-run — the SAME contract compiled to one BEAM loop, called through the
+;              generated module Elixir.Krt.FusedPipeline.run/2.
+;   native    — the SAME descriptor, lowered to the j1_probe text IR
+;              (`pipeline.ir`) for the Cranelift sidecar.
+;
+; ONE DESCRIPTOR, NOT A FUSION PASS. `descriptor` is the single value both
+; generators read. `admit` is CONSERVATIVE and EXACT: it admits precisely that
+; value and refuses every departure, naming the differing keys. This is not a
+; general compiler theorem about arbitrary BL — no map/filter/reduce body is
+; analysed or fused; there is no claim that an arbitrary pipeline could be. The
+; admission gate is the boundary between "a fragment we have proven exact" and
+; "a program we have not".
+;
+; The generated BEAM has NO runtime dependency on this module: the descriptor is
+; consumed at generation time and the emitted Core carries only erlang/binary
+; calls, so the artifact keeps running if the generator is never loaded again.
+;
+; This is a research prototype. It is not wired into anything, it is not the
+; production numeric policy, and agreeing on these fixtures is not a safety
+; certificate.
+
+(ns fusion.pipeline
+  (:require [anf :as a] [lower :as lower]))
+
+(def ^:private MAX-BYTES 1048576)
+(def ^:private MASK64 18446744073709551615)
+
+; ── the one descriptor ──────────────────────────────────────────────────────
+
+(def descriptor
+  "The explicit map/filter/reduce contract. Every constant the generators emit
+   is read from here, so the Core loop and the native IR are two lowerings of
+   ONE value rather than two hand-maintained copies."
+  {:pipeline :krt/fused-byte-fold
+   :version 1
+   :input {:kind :bytes :max-bytes MAX-BYTES}
+   :map {:op :byte-affine :scale 3 :offset 7 :modulus 256}
+   :filter {:op :signed-lt :bound 128}
+   :reduce {:op :sum-u64-wrap :modulus MASK64}
+   :init {:kind :u64}
+   :emit {:module :Elixir.Krt.FusedPipeline :function :run :arity 2}
+   :native {:kernel-name "fused"
+            :n-params 3
+            :ptr-var 0 :len-var 1 :acc-var 2 :counter-var 3
+            :counter-init 0 :step 1}})
+
+; ── conservative exact-fragment admission ───────────────────────────────────
+
+(defn descriptor-problems
+  "Every top-level way `d` departs from the admitted fragment, as data. An empty
+   result is the admission: `d` IS the descriptor above. Extra keys are a
+   departure too — a fragment that silently accepts an unknown knob is a
+   fragment whose meaning depends on who reads it."
+  [d]
+  (if (not (map? d))
+    [(str "descriptor must be a map, got " (pr-str d))]
+    (let [want (maps/keys descriptor)]
+      (reduce
+        (fn [acc k]
+          (cond
+            (not (contains? d k))
+            (conj acc (str "missing key " (str k)))
+            (not (erlang/=:= (get d k) (get descriptor k)))
+            (conj acc (str "key " (str k) " is " (pr-str (get d k))
+                           ", admitted is " (pr-str (get descriptor k))))
+            :else acc))
+        (reduce (fn [acc k]
+                  (if (contains? descriptor k)
+                    acc
+                    (conj acc (str "unknown key " (str k)))))
+                []
+                (maps/keys d))
+        want))))
+
+(defn admitted?
+  "True exactly when `d` is the one admitted descriptor."
+  [d]
+  (empty? (descriptor-problems d)))
+
+(defn admit!
+  "Return `d` when it is the admitted fragment; otherwise throw with the full
+   list of departures. Called by both generators, so a descriptor that is not
+   the proven fragment can never be partially lowered."
+  [d]
+  (let [problems (descriptor-problems d)]
+    (when (not (empty? problems))
+      (throw (ex-info (str "fusion: descriptor refused, not the admitted fragment: "
+                           (pr-str problems))
+                      {:problems problems :descriptor d})))
+    d))
+
+(defn- dget [d path]
+  (reduce (fn [m k] (get m k)) d path))
+
+; ── generated BEAM: direct Core clauses through anf/lower ───────────────────
+;
+; `run/2` is the public API. `go/4` is the loop, exported so the self-call is an
+; ordinary module call — the ANF vocabulary has no "local function" node, and a
+; recursive closure is not expressible as a `let` (a binding's init cannot name
+; itself). Generation reads scale/offset/modulus/bound/wrap from the descriptor.
+
+(defn- cl [fname params body]
+  {:op :defn-clause :fname fname :params params :guard nil :body body :ann {}})
+
+(defn- av [name] (a/var name))
+(defn- ap [name] (a/pvar name))
+(defn- era [f args] (a/remote :erlang f args))
+
+(defn- core-descriptor [d]
+  (let [modname (dget d [:emit :module])
+        scale (dget d [:map :scale])
+        offset (dget d [:map :offset])
+        modulus (dget d [:map :modulus])
+        bound (dget d [:filter :bound])
+        wrap (dget d [:reduce :modulus])
+        body
+        (cl :go [(ap "bin") (ap "i") (ap "n") (ap "acc")]
+          (a/iff (era :< [(av "i") (av "n")])
+            (a/lett "b" (a/remote :binary :at [(av "bin") (av "i")])
+              (a/lett "t" (era :+ [(era :* [(a/lit scale) (av "b")]) (a/lit offset)])
+                (a/lett "y" (era :rem [(av "t") (a/lit modulus)])
+                  (a/lett "sum" (era :band [(era :+ [(av "acc") (av "y")]) (a/lit wrap)])
+                    (a/iff (era :< [(av "y") (a/lit bound)])
+                      (a/remote modname :go [(av "bin") (era :+ [(av "i") (a/lit 1)]) (av "n") (av "sum")])
+                      (a/remote modname :go [(av "bin") (era :+ [(av "i") (a/lit 1)]) (av "n") (av "acc")]))))))
+            (av "acc")))]
+    (a/module modname
+      [(cl :run [(ap "bin") (ap "init")]
+         (a/lett "n" (era :byte_size [(av "bin")])
+           (a/remote modname :go [(av "bin") (a/lit 0) (av "n") (av "init")])))
+       body]
+      [[:run 2] [:go 4]]
+      [])))
+
+; ── generated native IR from the SAME descriptor ────────────────────────────
+;
+; The j1_probe text IR: a 3-parameter counted loop fn(ptr,len,init)->u64. The
+; register layout is this emitter's business; every CONSTANT comes from the
+; descriptor. `byte-map rem256` lowers as udiv/sub (q = t/modulus; y = t -
+; q*modulus), exact for the admitted non-negative power-of-two modulus and
+; driven by the descriptor's own `modulus` rather than by a fixed width — the
+; verifier admits exactly this spelling for a power-of-two divisor, alongside
+; the equivalent single-op `zext8` mask. `acc+ y then sel pred sum oldacc`
+; keeps the branchless u64 wrap.
+
+(defn native-ir
+  "The j1_probe text IR for the admitted descriptor: `kernel <name> 3`,
+   var0=ptr var1=len var2=init/mutable-acc, counter var3 init 0, `loop 3 1 1`,
+   `ret 2`. Exposed so the generator's output is inspectable without a build."
+  [d]
+  (admit! d)
+  (let [nm (dget d [:native :kernel-name])
+        np (dget d [:native :n-params])
+        ptr (dget d [:native :ptr-var])
+        len (dget d [:native :len-var])
+        acc (dget d [:native :acc-var])
+        ctr (dget d [:native :counter-var])
+        scale (dget d [:map :scale])
+        offset (dget d [:map :offset])
+        modulus (dget d [:map :modulus])
+        bound (dget d [:filter :bound])]
+    (str
+      "kernel " nm " " np "\n"
+      "init " ctr " " (dget d [:native :counter-init]) "\n"
+      "load 4 " ptr " " ctr "\n"
+      "imm 5 " scale "\n"
+      "mul 6 4 5\n"
+      "addimm 7 6 " offset "\n"
+      "udivimm 8 7 " modulus "\n"
+      "imm 9 " modulus "\n"
+      "mul 10 8 9\n"
+      "sub 11 7 10\n"
+      "imm 12 " bound "\n"
+      "lt 13 11 12\n"
+      "add 14 " acc " 11\n"
+      "sel " acc " 13 14 " acc "\n"
+      "loop " ctr " " len " " (dget d [:native :step]) "\n"
+      "ret " acc "\n")))
+
+; ── generation: compile, load, write ────────────────────────────────────────
+
+(defn install!
+  "Admit the descriptor, generate its Core loop through anf/lower, compile and
+   LOAD Elixir.Krt.FusedPipeline, and write `<dir>/Elixir.Krt.FusedPipeline.beam`
+   (+ .core) and `<dir>/pipeline.ir` — both from the SAME descriptor. The two
+   argument arity takes an explicit descriptor and refuses anything but the
+   admitted fragment.
+
+   Returns {:module :beam :core :ir :bytes}. Rebuilding an identical descriptor
+   must reproduce the beam (the Core backend's per-process fresh counter is
+   reset per compilation unit), so a rebuild that differs is a bug, not noise."
+  ([dir] (install! dir descriptor))
+  ([dir d]
+   (admit! d)
+   (File/mkdir_p! dir)
+   (let [desc (core-descriptor d)
+         built (lower/descriptor->beam desc)
+         module (elem built 0)
+         beam (elem built 1)
+         again (elem (lower/descriptor->beam desc) 1)]
+     (when (not= beam again)
+       (throw (ex-info "fusion: non-deterministic Core generation" {:module module})))
+     (let [path (lower/write-beam! dir module beam)
+           core-path (str path ".core")
+           ir-path (str dir "/pipeline.ir")]
+       (File/write! core-path
+                    (erlang/iolist_to_binary (core_pp/format (lower/module->core desc))))
+       (File/write! ir-path (native-ir d))
+       (File/write! (str dir "/descriptor.edn") (pr-str d))
+       (let [loaded (code/load_binary module (erlang/binary_to_list path) beam)]
+         (when (not= loaded (tuple :module module))
+           (throw (ex-info "fusion: generated module failed to load"
+                           {:module module :result loaded}))))
+       {:module module :beam path :core core-path :ir ir-path
+        :bytes (erlang/byte_size beam)}))))
+
+; ── input validation (shared by every entry point) ──────────────────────────
+
+(defn- problems-binary [bin]
+  (cond
+    (not (erlang/is_binary bin)) "input must be a binary"
+    (erlang/> (erlang/byte_size bin) MAX-BYTES) (str "input is " (erlang/byte_size bin)
+                                                     " bytes; the admitted fragment caps at " MAX-BYTES)
+    :else nil))
+
+(defn- problems-init [init]
+  (cond
+    (not (erlang/is_integer init)) "initial accumulator must be a u64 integer"
+    (erlang/< init 0) "initial accumulator must be >= 0"
+    (erlang/> init MASK64) "initial accumulator exceeds u64"
+    :else nil))
+
+(defn- check-input!
+  "Refuse any input the admitted fragment does not cover — before any work, and
+   identically on every path, so a refusal is a property of the CONTRACT and not
+   of which implementation happened to be called."
+  [bin init]
+  (let [bp (problems-binary bin) ip (problems-init init)]
+    (cond
+      (some? bp) (throw (ex-info (str "fusion: " bp) {:input bin}))
+      (some? ip) (throw (ex-info (str "fusion: " ip) {:init init}))
+      :else true)))
+
+; ── the three paths ─────────────────────────────────────────────────────────
+
+(defn rt-list-run
+  "The RT transducer pipeline WITHOUT the binary adapter: fold the actual
+   `BeamLisp.RT` map_xform / filter_xform through reduce/invoke over an already
+   realized byte list. Diagnostic only — it exists so the adapter's cost can be
+   separated from the pipeline's; `rt-run` is the baseline."
+  [bytes init]
+  ; Capture descriptor constants once per pipeline, not once per byte. The
+  ; baseline must measure RT/transducer dispatch, not redundant descriptor walks.
+  (let [scale (dget descriptor [:map :scale])
+        offset (dget descriptor [:map :offset])
+        modulus (dget descriptor [:map :modulus])
+        bound (dget descriptor [:filter :bound])
+        wrap (dget descriptor [:reduce :modulus])
+        mapper (fn [b] (erlang/rem (erlang/+ (erlang/* scale b) offset) modulus))
+        pred (fn [y] (erlang/< y bound))
+        sum-step (fn ([acc] acc) ([acc y] (erlang/band (erlang/+ acc y) wrap)))
+        xf (BeamLisp.RT/map_xform mapper)
+        xf2 (BeamLisp.RT/filter_xform pred)
+        rf (BeamLisp.RT/invoke xf (list (BeamLisp.RT/invoke xf2 (list sum-step))))]
+    (BeamLisp.RT/invoke rf (list (BeamLisp.RT/reduce rf init bytes)))))
+
+(defn rt-run
+  "Baseline: the shipped runtime, written the way a user would. The
+   binary->list adapter (`binary:bin_to_list/1`) is INSIDE this function, so the
+   RT number carries the conversion the fused paths do not need."
+  [bin init]
+  (check-input! bin init)
+  (rt-list-run (binary/bin_to_list bin) init))
+
+(defn fused-run
+  "The generated BEAM loop: validate, then call
+   `Elixir.Krt.FusedPipeline.run/2`. The module must be installed in this VM
+   first — `install!` (this prototype) or an AOT build of the generated beam.
+   A missing module is a loader error at this call site, not a wrong answer."
+  [bin init]
+  (check-input! bin init)
+  (Krt.FusedPipeline/run bin init))

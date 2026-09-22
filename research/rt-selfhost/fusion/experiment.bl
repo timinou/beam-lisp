@@ -1,0 +1,117 @@
+; Everything above the existing native backend is BL: build orchestration,
+; fixture oracle, admission checks, port transport, timing and reporting.
+; Run from repository root:
+;   BL_NO_LOCK=1 bin/bl run research/rt-selfhost/fusion/experiment.bl
+(ns fusion.experiment)
+
+; The fixture oracle and the 22-case set now live in fusion.fixtures — ONE
+; oracle shared by this file, the driver's caller and invm.bench. Loaded FIRST so
+; the defns below (wire-tests included) resolve its constants when they compile;
+; `ns` then puts this namespace back, since run_file leaves the loaded file's
+; namespace current.
+(BeamLisp/run_file "research/rt-selfhost/fusion/fixtures.bl")
+(ns fusion.experiment)
+
+(def root (File/cwd!))
+(def work
+  (let [result (System/cmd "mktemp" (list "-d" "/tmp/rt-fusion.XXXXXX"))]
+    (when (not= 0 (elem result 1)) (throw (ex-info "Cannot create private scratch directory" {})))
+    (String/trim (elem result 0))))
+(println (str "fusion work: " work))
+
+(defn check! [label ok]
+  (when (not (erlang/== true ok)) (throw (ex-info (str "fusion assertion: " label) {}))))
+
+(defn command! [program args log-name]
+  (let [executable (if (String/contains? program "/") (Path/expand program root) program)
+        start (erlang/monotonic_time :nanosecond)
+        opts (list (tuple :cd root) (tuple :stderr_to_stdout true)
+                   (tuple :env (list (tuple "CARGO_TARGET_DIR" (str work "/cargo-target"))
+                                     (tuple "BL_NO_LOCK" "1"))))
+        _ (println (str "RUN " executable " " (pr-str args) " cwd=" root))
+        result (System/cmd executable (to-list args) opts)
+        elapsed (erlang/- (erlang/monotonic_time :nanosecond) start)
+        path (str work "/" log-name)]
+    (File/write! path (str "$ " program " " (pr-str args) "\nrc=" (elem result 1)
+                          " wall_ns=" elapsed "\n" (elem result 0)))
+    (when (not= 0 (elem result 1))
+      (throw (ex-info (str "child failed; see " path) {:program program :exit (elem result 1)})))
+    (println (str "PASS command " program " " (pr-str args) " log=" path))
+    (elem result 0)))
+
+; The oracle, the deterministic fixture bytes and the fixture constructor moved
+; to fusion.fixtures (loaded above); this file no longer defines any of them.
+
+(defn encode-be [value n]
+  (erlang/list_to_binary
+    (to-list (map (fn [i] (erlang/band (erlang/bsr value (* 8 (- (dec n) i))) 255)) (range n)))))
+
+(defn decode-be [bytes start n]
+  (loop [i start result 0]
+    (if (erlang/== i (erlang/+ start n)) result
+      (recur (erlang/+ i 1) (erlang/+ (erlang/bsl result 8) (binary/at bytes i))))))
+
+(defn wire-tests [exe ir]
+  ; Shell is used only for stdin file redirection, not as an authored driver.
+  ; All paths are separate positional args, never interpolated into shell code.
+  (let [cases [["clean-eof" "" true]
+               ["valid-empty" (erlang/iolist_to_binary (list (encode-be 8 4) (encode-be fusion.fixtures/U64 8))) true]
+               ["short-header" (encode-be 0 2) false]
+               ["short-payload" (erlang/iolist_to_binary (list (encode-be 8 4) (encode-be 0 1))) false]
+               ["missing-init" (encode-be 0 4) false]
+               ["oversize" (encode-be (+ fusion.fixtures/MAX-BYTES 9) 4) false]]]
+    (mapv
+      (fn [[tag data accepted]]
+        (let [path (str work "/wire-" tag ".bin")
+              _ (File/write! path data)
+              result (System/cmd "sh"
+                        (list "-c" "exec \"$1\" --serve-fold \"$2\" < \"$3\"" "--" exe ir path)
+                        (list (tuple :stderr_to_stdout true)))
+              output (elem result 0) status (elem result 1)]
+          (File/write! (str work "/wire-" tag ".out") output)
+          (check! (str "wire status " tag) (= accepted (= status 0)))
+          (check! (str "wire READY " tag)
+                  (and (>= (erlang/byte_size output) 9)
+                       (= (binary/part output 0 9)
+                          (erlang/iolist_to_binary (list (encode-be 5 4) "READY")))))
+          (when (= tag "valid-empty")
+            (check! "empty reply length" (= 29 (erlang/byte_size output)))
+            (check! "empty reply frame" (= 16 (decode-be output 9 4)))
+            (check! "empty preserves initial" (= fusion.fixtures/U64 (decode-be output 13 8))))
+          {:case tag :status status :accepted accepted})) cases)))
+
+; Namespace loading is explicit. Neither module runs the experiment on import.
+(BeamLisp/run_file "research/rt-selfhost/fusion/pipeline.bl")
+(BeamLisp/run_file "research/rt-selfhost/fusion/driver.bl")
+(ns fusion.experiment)
+
+(defn main []
+  (check! "oracle all bytes" (= 8128 (fusion.fixtures/oracle (erlang/list_to_binary (to-list (range 256))) 0)))
+  (check! "oracle threshold" (= 127 (fusion.fixtures/oracle (erlang/list_to_binary (list 40 211)) 0)))
+  (check! "oracle overflow" (= 134 (fusion.fixtures/oracle (erlang/list_to_binary (list 0 40 255)) (- fusion.fixtures/U64 3))))
+  (let [generated (str work "/generated")
+        installed (fusion.pipeline/install! generated)
+        ir (str generated "/pipeline.ir")
+        exe (str work "/cargo-target/release/j1_probe")]
+    (System/put_env "FUSION_OUT" generated)
+    (command! "bin/bl" ["test" "research/rt-selfhost/fusion/pipeline_test.bl"] "pipeline-tests.log")
+    (command! "cargo" ["test" "--release" "--manifest-path" "research/j1_probe/Cargo.toml"] "native-tests.log")
+    (command! "cargo" ["build" "--release" "--manifest-path" "research/j1_probe/Cargo.toml"] "native-build.log")
+    (let [wire (wire-tests exe ir)
+          cases (fusion.fixtures/make)
+          result (fusion.driver/run exe ir cases)
+          summary (:summary result)
+          evidence (assoc result :by-size summary :wire-tests wire :work work
+                    :pipeline fusion.pipeline/descriptor
+                    :fixtures (mapv (fn [f] (-> f (dissoc :binary) (assoc :size (erlang/byte_size (:binary f))))) cases))]
+      (check! "driver passed" (:passed result))
+      (check! "complete correctness matrix"
+              (= (* 3 (count cases)) (get-in result [:counts :correctness-checks])))
+      (check! "all input refusals" (= 15 (:refusals result)))
+      (check! "three startup measurements" (= 3 (count (:startup result))))
+      (check! "complete timing matrix" (= (* 15 (count fusion.fixtures/sizes)) (count (:samples result))))
+      (File/write! (str work "/summary.edn") (pr-str evidence))
+      (println (str "PASS fusion experiment; evidence: " work "/summary.edn"))
+      evidence)))
+
+(do (main) :ok)
