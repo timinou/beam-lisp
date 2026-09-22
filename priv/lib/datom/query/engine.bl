@@ -454,6 +454,45 @@
 
       :else (throw (ex-info (str "unknown rule operator: " op) {:clause clause})))))
 
+;; ── the per-clause trace (the engine's own instrumentation) ───────────
+;;
+;; `datom.explain` answers "what does this query's PLAN cost" before it runs,
+;; from the query text and the schema. This answers "what did each clause
+;; ACTUALLY read", from the run — the second half of the picture, and the one
+;; that catches a plan that is fine on paper and quadratic in fact (a count of
+;; store requests cannot see the work BETWEEN them; see cost_test.bl).
+;;
+;; The collector lives in the PROCESS DICTIONARY, not a dynamic var (this
+;; dialect has no `binding`), following the same idiom as `oracle`'s memo:
+;; one private key, plain `put`/`get`, and a `with-` helper for save/restore.
+;; The cost when nothing is tracing is ONE dictionary read per CLAUSE — never
+;; per row — so the hot path pays nothing measurable for the hook existing.
+
+(def ^:private TRACE-KEY :datom-query-trace)
+
+(defn trace-on!
+  "Collect a per-clause trace into `collector` (an atom holding a vector) for
+   queries evaluated by this process. Returns the collector."
+  [collector] (erlang/put TRACE-KEY collector) collector)
+
+(defn trace-off! [] (erlang/put TRACE-KEY nil) :off)
+
+(defn- record-scan! [fact]
+  (let [c (erlang/get TRACE-KEY)]
+    (when (and (some? c) (not= :undefined c))
+      (swap! c (fn [v] (conj v fact))))
+    nil))
+
+(defn with-trace
+  "Run `f` with a per-clause trace on, restoring the previous collector. Returns
+   `[result facts]`. `datom.profile/analyze` is this, plus a counted store."
+  [f]
+  (let [prev (erlang/get TRACE-KEY)
+        c (atom [])]
+    (erlang/put TRACE-KEY c)
+    (try (let [r (f)] [r (deref c)])
+         (finally (erlang/put TRACE-KEY prev)))))
+
 (defn- range-scan-or-full
   "A BOUNDED scan when a later comparison predicate constrains this
    pattern's value on an indexed attribute, else the ordinary full scan.
@@ -607,13 +646,24 @@
                (semi-join-selection (datom.db/schema-of db) (or common {})
                                     terms join-position join-values)
                nil)
+        ; The read this clause will make, named once so the trace can report
+        ; the SHAPE rather than only the rows: a semi-join and a column scan
+        ; can return the same candidates and differ by 36x in what the store
+        ; was asked for.
+        shape (if (some? semi) :multiscan :scan)
+        selection (if (some? semi)
+                    semi
+                    (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause))
+        read-index (get selection 0)
+        read-components (get selection 1)
+        prefixes (if (some? semi) (count (get semi 1)) 0)
         candidates (if (some? semi)
-                     (datom.db/datoms-many db (get semi 0) (get semi 1))
-                     (let [selection (datom.query.plan/index-for (datom.db/schema-of db) (or common {}) clause)
-                           index (get selection 0)
-                           components (get selection 1)]
-                       (range-scan-or-full db index components clause remaining common)))]
-    (if (nil? join-var)
+                     (datom.db/datoms-many db read-index read-components)
+                     (range-scan-or-full db read-index read-components clause remaining common))
+        ; The result, bound once so the trace can report rows in and out —
+        ; the figure that shows work done BETWEEN store requests, which no
+        ; request count can see.
+        result (if (nil? join-var)
       ; Nothing shared: this is a cartesian product, and every candidate
       ; must be tried against every row. Rare, and inherently quadratic
       ; in the SIZE OF THE ANSWER rather than in wasted work.
@@ -645,7 +695,18 @@
                      (filterv some?
                               (mapv (fn [d] (unify-pattern b clause d))
                                     (or (get buckets (get b join-var)) []))))
-                   bindings)))))
+                   bindings)))]
+    (record-scan! {:clause clause
+                   :shape shape
+                   :index read-index
+                   :components read-components
+                   :prefixes prefixes
+                   :join-var join-var
+                   :join-position join-position
+                   :candidates (count candidates)
+                   :rows-in (count bindings)
+                   :rows-out (count result)})
+    result))
 
 (defn run-clauses
   "Fold every clause over the binding set.
