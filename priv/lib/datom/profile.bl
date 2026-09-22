@@ -87,30 +87,63 @@
 ;; `extend-protocol`, not a second `extend-type`: in this dialect an `extend-type`
 ;; on a type REPLACES its protocol table, so a second one here would delete the
 ;; `Store` implementation above it.
+;;
+;; ── Every counter names the operation the SUBSTRATE performed ────────
+;;
+;; Not the entry point the caller used. A profiler implements the read
+;; protocols so it can intercept them, and the tempting implementation is
+;; `(bump :multiscan 1)` on entry — which reports a multi-prefix read even when
+;; the store beneath it has no such capability and answered with N single
+;; reads. Measured, on the real 64 708-row corpus, against a decorator that
+;; implemented only `Store`: the report said "1 multiscan" for a read that was
+;; 2 000 separate scans. An instrument that reports what was ASKED rather than
+;; what was DONE is worse than no instrument, because it is believed.
+;;
+;; So each branch below asks what the inner store actually declares and counts
+;; THAT: a native path when it has one, the fallback's OWN requests when it
+;; does not (`N` scans for the prefix fallback, one range for the page
+;; fallback — the exact reads `datom.store/scan-via-prefixes` and
+;; `scan-via-range-page` make).
+
 (extend-protocol datom.store/Scan
   ProfilingStore
   (-scan-datoms [s lo hi]
-    (bump (:counters s) :scan 1)
-    (let [r (datom.store/scan-datoms (:inner s) lo hi)]
-      (bump (:counters s) :rows (count r))
-      r)))
+    (let [inner (:inner s)]
+      (if (satisfies? datom.store/Scan inner)
+        (bump (:counters s) :scan 1)
+        (bump (:counters s) :range 1))
+      (let [r (datom.store/scan-datoms inner lo hi)]
+        (bump (:counters s) :rows (count r))
+        r))))
 
 (extend-protocol datom.store/MultiScan
   ProfilingStore
   (-scan-prefixes [s bounds]
-    (bump (:counters s) :multiscan 1)
-    (bump (:counters s) :bounds (count bounds))
-    (let [r (datom.store/scan-prefixes (:inner s) bounds)]
-      (bump (:counters s) :rows (count r))
-      r)))
+    (let [inner (:inner s)
+          n (count bounds)]
+      (if (datom.store/multi-scan? inner)
+        (do (bump (:counters s) :multiscan 1)
+            (bump (:counters s) :bounds n))
+        ; The fallback is one `scan-datoms` per bound — counted as the scans
+        ; (or range reads) it really is, never as the one request it is not.
+        (if (satisfies? datom.store/Scan inner)
+          (bump (:counters s) :scan n)
+          (bump (:counters s) :range n)))
+      (let [r (datom.store/scan-prefixes inner bounds)]
+        (bump (:counters s) :rows (count r))
+        r))))
 
 (extend-protocol datom.store/PageScan
   ProfilingStore
   (-scan-datoms-page [s start after hi limit]
-    (bump (:counters s) :page 1)
-    (let [r (datom.store/page-datoms (:inner s) start after hi limit)]
-      (bump (:counters s) :rows (count (get r :datoms)))
-      r)))
+    (let [inner (:inner s)]
+      (if (satisfies? datom.store/PageScan inner)
+        (bump (:counters s) :page 1)
+        ; `scan-via-range-page` materializes the range first: one range read.
+        (bump (:counters s) :range 1))
+      (let [r (datom.store/page-datoms inner start after hi limit)]
+        (bump (:counters s) :rows (count (get r :datoms)))
+        r))))
 
 ; The store this profile wraps IS the store, for anything keyed by store value:
 ; the derived-column caches ask `identity-of`, so a profiled read reuses the
@@ -118,6 +151,13 @@
 (extend-protocol datom.store/Underlying
   ProfilingStore
   (-underlying [s] (datom.store/identity-of (:inner s))))
+
+; ... and its CAPABILITIES are the inner store's, for anything that asks. This
+; is the other half of honest counting: `multi-scan?` must answer about the
+; substrate, so the engine chooses a shape the store can actually answer.
+(extend-protocol datom.store/Transparent
+  ProfilingStore
+  (-transparent-to [s] (datom.store/capability-target (:inner s))))
 
 (extend-protocol datom.store/Alive?
   ProfilingStore
@@ -127,11 +167,56 @@
 ; closing one must never close the store it watches) and `FileBacked` (a profile
 ; is not opened at a path).
 
+(def ^:private REGISTRY
+  "Every watched store in this process, in the order they were opened."
+  (atom []))
+
 (defn watch
   "A store that counts every operation and row it is asked for, delegating to
-   `store`. Returns the wrapper; read it with `counters`."
+   `store`. Returns the wrapper; read it with `counters`.
+
+   Registered process-wide, so an application can ask what its stores did as a
+   whole (`totals`, `delta`) without threading an accounting object through
+   every call site. An application that never calls `watch` pays nothing: the
+   registry stays empty and every read here is a `deref` of it."
   [store]
-  (->ProfilingStore store (atom (empty-counters))))
+  (let [ps (->ProfilingStore store (atom (empty-counters)))]
+    (swap! REGISTRY (fn [v] (conj v ps)))
+    ps))
+
+(defn profiled?
+  "Whether anything in this process is being watched — an application's switch
+   for whether to bother reading counters at all."
+  []
+  (not (empty? (deref REGISTRY))))
+
+(defn watched-stores [] (deref REGISTRY))
+
+(defn totals
+  "Every watched store's counters, summed. One number per operation for the
+   whole process, which is what an application wants when it asks 'what did
+   that request cost the storage layer?' without knowing which stores the
+   request reached."
+  []
+  (reduce (fn [acc ps] (merge-with + acc (counters ps)))
+          (empty-counters)
+          (watched-stores)))
+
+(defn delta
+  "What the watched stores did BETWEEN `before` (a `totals` snapshot) and now,
+   with the operations that predict cost summed into `:reads`.
+
+   Snapshot, work, subtract — the shape that lets a caller attribute a request
+   without knowing which store inside it was hit. Returns nil when nothing is
+   watched, so a caller stores nothing rather than zeros that look measured."
+  [before]
+  (when (profiled?)
+    (let [now (totals)
+          d (reduce (fn [m k] (assoc m k (- (or (get now k) 0) (or (get before k) 0))))
+                    {}
+                    COUNTER-KEYS)]
+      (assoc d :reads (+ (get d :get) (get d :range) (get d :scan)
+                         (get d :multiscan) (get d :page))))))
 
 (defn counters
   "The live counter map of a `watch`ed store: `{op n …, :rows n :bounds n}`."
@@ -144,9 +229,14 @@
   (datom.store/identity-of (:inner ps)))
 
 (defn reset!
-  "Zero every counter. A measurement should not inherit another's totals."
+  "Zero every counter. A measurement should not inherit another's totals.
+
+   `swap!` and not `reset!`: inside THIS namespace `reset!` is the name defined
+   here, so the obvious body would call itself — with the atom and the map as
+   two arguments to a one-argument function. The failure reads as a bad arity in
+   `datom.profile`, which is exactly where it was."
   [ps]
-  (reset! (:counters ps) (empty-counters))
+  (swap! (:counters ps) (fn [_] (empty-counters)))
   ps)
 
 ;; ── a database value read through the counter ───────────────────────
