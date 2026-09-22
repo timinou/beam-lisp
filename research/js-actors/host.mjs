@@ -154,26 +154,36 @@ export function identical(a, b) { return a === b; }
 export function truthy(x) { return x !== null && x !== undefined && x !== false; }
 
 /** Canonical structural key. Equality for every data value is this compare;
- *  functions and host handles compare by identity. */
+ *  functions and host handles compare by identity.
+ *
+ *  The encoding is INJECTIVE, so distinct values never share a key: every
+ *  string / keyword leaf is length-prefixed (`s3:abc`, `k3:abc`) and every
+ *  composite carries its child count plus each child's length, so `[:x :y]`
+ *  and `[(keyword "x,k:y")]` — equal under a naive `join(",")` — stay apart. */
+function enc(tag, kids) {
+  let out = tag + kids.length + "[";
+  for (const k of kids) out += k.length + ":" + k;
+  return out + "]";
+}
 export function hashKey(x) {
   if (x === null || x === undefined) return "nil";
   if (x === true) return "b:1";
   if (x === false) return "b:0";
   const t = typeof x;
   if (t === "number") return "n:" + (Object.is(x, -0) ? 0 : x);
-  if (t === "string") return "s:" + JSON.stringify(x);
-  if (x instanceof KW) return "k:" + x.n;
+  if (t === "string") return "s" + x.length + ":" + x;
+  if (x instanceof KW) return "k" + x.n.length + ":" + x.n;
   if (x === ENIL) return "l:()";
-  if (x instanceof Cons) return "l:(" + hashKey(x.h) + "," + hashKey(x.t) + ")";
-  if (x instanceof T) return "t:(" + x.items.map(hashKey).join(",") + ")";
+  if (x instanceof Cons) return enc("l", [hashKey(x.h), hashKey(x.t)]);
+  if (x instanceof T) return enc("t", x.items.map(hashKey));
   if (isStruct(x)) {
-    if (isVec(x)) return "v:(" + vecItems(x).map(hashKey).join(",") + ")";
+    if (isVec(x)) return enc("v", vecItems(x).map(hashKey));
     const keys = Object.keys(x).filter(k => k !== "__struct").sort();
-    return "r:" + x.__struct + "{" + keys.map(k => k + ":" + hashKey(x[k])).join(",") + "}";
+    return enc("r", [x.__struct].concat(keys.flatMap(k => [k, hashKey(x[k])])));
   }
   if (x instanceof BMap) {
     const keys = [...x.m.keys()].sort();
-    return "m:{" + keys.map(k => k + ":" + hashKey(x.m.get(k)[1])).join(",") + "}";
+    return enc("m", keys.flatMap(k => [k, hashKey(x.m.get(k)[1])]));
   }
   if (typeof x === "function" || x.__blfn) return "f:" + (x.__id ||= ++idCounter);
   return "o:" + (x.__id ||= ++idCounter);
@@ -223,16 +233,44 @@ export function toStr(x) {
 
 export function arith(op, a, b) {
   switch (op) {
-    case "add": return a + b;
-    case "sub": return a - b;
-    case "mul": return a * b;
+    // Integers are carried as EXACT SAFE INTEGERS: when both operands are
+    // integers, both inputs and the result must fit in ±(2^53-1), otherwise we
+    // raise instead of silently losing precision. Floats are a documented
+    // SUBSET: if either operand is a float the operation is IEEE-754 double
+    // arithmetic (the receive deadline clock is a float, so this path is
+    // load-bearing) and no overflow check is applied.
+    case "add": case "sub": case "mul": {
+      if (typeof a !== "number" || typeof b !== "number")
+        throw new Error("[" + op + "] needs two numbers, got " + describe(a) + " and " + describe(b));
+      if (Number.isInteger(a) && Number.isInteger(b)) {
+        if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b))
+          throw new Error("integer out of safe range in [" + op + "]");
+        const r = op === "add" ? a + b : op === "sub" ? a - b : a * b;
+        if (!Number.isSafeInteger(r)) throw new Error("integer overflow in [" + op + "]");
+        return r;
+      }
+      return op === "add" ? a + b : op === "sub" ? a - b : a * b;
+    }
     case "div": {
+      if (typeof a !== "number" || typeof b !== "number")
+        throw new Error("[div] needs two numbers, got " + describe(a) + " and " + describe(b));
       if (b === 0) throw new Error("divide by zero");
       const q = a / b;
-      return Number.isInteger(q) ? q : q;
+      if (Number.isInteger(q) && Number.isInteger(a) && Number.isInteger(b) && !Number.isSafeInteger(q))
+        throw new Error("integer overflow in [div]");
+      return q;
     }
     case "rem": {
+      if (typeof a !== "number" || typeof b !== "number")
+        throw new Error("[rem] needs two numbers, got " + describe(a) + " and " + describe(b));
       if (b === 0) throw new Error("rem by zero");
+      if (Number.isInteger(a) && Number.isInteger(b)) {
+        if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b))
+          throw new Error("integer out of safe range in [rem]");
+        const r = a % b;
+        if (!Number.isSafeInteger(r)) throw new Error("integer overflow in [rem]");
+        return r;
+      }
       return a % b;
     }
     case "lt": return lt(a, b);
@@ -314,18 +352,27 @@ export function invokeNative(rt, f, args) {
  *  process is a value the BL scheduler can store in its registry. */
 export function runTurn(rt, frames, budget) {
   let steps = 0;
+  // The critical depth this turn entered with. A failed turn is unwound to it,
+  // so a BL function that raised between critical-enter and critical-leave does
+  // not leave the depth positive and defer every future slice forever.
+  const cd0 = rt.criticalDepth || 0;
   // The pending resume value is MACHINE STATE, not a local: a slice can end
   // exactly between "a callee finished" and "its caller is resumed", and a
   // value dropped there would silently become nil. It rides on the frame
   // stack (the one object a suspended process already is).
   let sent = frames.__sent === undefined ? null : frames.__sent;
   const finish = (r) => { frames.__sent = sent; return r; };
+  const fail = (message) => { rt.criticalDepth = cd0; return finish(mkResult("error", frames, { message })); };
   while (true) {
-    if (steps >= budget) return finish(mkResult("yield", frames, {}));
+    if (frames.length > (rt.maxFrames || 0)) rt.maxFrames = frames.length;
+    // A bounded slice normally ends here. While a critical section is open the
+    // boundary is DEFERRED: splitting a read-modify-write of `rt.state` across
+    // a slice would let another process mutate the same root underneath it.
+    if (steps >= budget && (rt.criticalDepth || 0) === 0) return finish(mkResult("yield", frames, {}));
     const g = frames[frames.length - 1];
     let res;
     try { res = g.next(sent); }
-    catch (e) { steps = 0; return finish(mkResult("error", frames, { message: String((e && e.stack) || e) })); }
+    catch (e) { steps = 0; return fail(String((e && e.stack) || e)); }
     sent = null;
     steps++;
     if (res.done) {
@@ -342,17 +389,17 @@ export function runTurn(rt, frames, budget) {
       if (step.k === "call" || step.k === "tail") {
         let factory = null;
         try { factory = resolveCallee(step.f, step.args); }
-        catch (e) { return finish(mkResult("error", frames, { message: String((e && e.stack) || e) })); }
+        catch (e) { return fail(String((e && e.stack) || e)); }
         if (factory) {
           let ng;
           try { ng = factory(rt, step.args); }
-          catch (e) { return finish(mkResult("error", frames, { message: String((e && e.stack) || e) })); }
+          catch (e) { return fail(String((e && e.stack) || e)); }
           if (step.k === "tail") frames[frames.length - 1] = ng; else frames.push(ng);
           break;
         }
         let v;
         try { v = invokeNative(rt, step.f, step.args); }
-        catch (e) { return finish(mkResult("error", frames, { message: String((e && e.stack) || e) })); }
+        catch (e) { return fail(String((e && e.stack) || e)); }
         steps++;
         if (step.k === "tail") frames.pop();
         if (frames.length === 0) return finish(mkResult("done", frames, { value: isStep(v) ? null : v }));
@@ -360,7 +407,7 @@ export function runTurn(rt, frames, budget) {
         sent = v;
         break;
       }
-      return finish(mkResult("error", frames, { message: "unknown control step " + step.k }));
+      return fail("unknown control step " + step.k);
     }
     if (frames.length === 0) return finish(mkResult("done", frames, { value: sent }));
   }
@@ -391,6 +438,18 @@ export function newRuntime() {
     // the host goes through `host-wait` (a deadline), never through the slice.
     // The slice that matters for FAIRNESS is the per-process one in `rt-run-pid`.
     budget: 100000,
+    // A generic critical-section depth. It is MACHINE state, not actor state:
+    // BL functions are generators, so a slice can end between the read and the
+    // write of a read-modify-write on `rt.state`. While the depth is positive
+    // `runTurn` defers the slice boundary, so the RMW completes atomically
+    // with respect to other processes. `host/park` is refused inside one.
+    criticalDepth: 0,
+    // A generic error counter. The BL runtime records a process failure (and
+    // a scheduler deadlock) here, and `boot` rejects the run when it is nonzero.
+    // No actor policy lives here — it is a count.
+    errors: 0,
+    // High-water mark of the generator frame stack, for a stack-safety test.
+    maxFrames: 0,
     out: (s) => { console.log(s); },
   };
 }
@@ -481,20 +540,37 @@ export const PURE = {
 };
 
 /** Intrinsics that need the runtime: the retained mutable root and the
- *  scheduler bridge. Everything else is `PURE` above. */
+ *  scheduler bridge. Everything else is `PURE` above.
+ *
+ *  `critical-enter`/`critical-leave` are the ONE generic machine service the BL
+ *  runtime needs to make a read-modify-write on `rt.state` atomic across a
+ *  slice boundary. They carry no actor meaning — only a depth counter — and
+ *  `runTurn` defers its slice boundary while the depth is positive. */
 export const RT_HOST = {
-  park: () => new Step("park"),
+  park: (rt) => {
+    if ((rt.criticalDepth || 0) > 0) throw new Error("host/park inside a critical section");
+    return new Step("park");
+  },
+  "park-release": (rt) => {
+    if (rt.criticalDepth !== 1) throw new Error("host/park-release requires one critical section");
+    rt.criticalDepth = 0;
+    return new Step("park");
+  },
   "wait-until": (rt, ms) => new Step("host-wait", { ms: ms < 0 ? 0 : ms }),
   now: () => (globalThis.performance && globalThis.performance.now ? globalThis.performance.now() : Date.now()),
   state: (rt) => rt.state,
   "set-state": (rt, s) => { rt.state = s; return s; },
   self: (rt) => rt.self,
   "set-self": (rt, p) => { rt.self = p; return p; },
+  "critical-enter": (rt) => { rt.criticalDepth = (rt.criticalDepth || 0) + 1; return rt.criticalDepth; },
+  "critical-leave": (rt) => { rt.criticalDepth = Math.max(0, (rt.criticalDepth || 0) - 1); return rt.criticalDepth; },
   "run-turn": (rt, frames, budget) => runTurn(rt, frames, budget),
   "make-frames": (rt, f, args) => { const as = argsArray(args); return [resolveCallee(f, as)(rt, as)]; },
   ref: (rt, ns, name) => ref(rt, ns, name),
   write: (rt, s) => { rt.out(toStr(s)); return null; },
   raise: (rt, msg) => { throw new Error(toStr(msg)); },
+  "record-error": (rt, msg) => { rt.errors = (rt.errors || 0) + 1; rt.lastError = toStr(msg); return rt.errors; },
+  "max-frames": (rt) => rt.maxFrames || 0,
 };
 
 /** The callee a compiled call site uses for a `host/…` intrinsic. Cached per
@@ -549,10 +625,10 @@ export const ERLANG = {
   ">": (a, b) => lt(b, a),
   "=<": (a, b) => !lt(b, a),
   ">=": (a, b) => !lt(a, b),
-  "+": (a, b) => a + b,
-  "-": (a, b) => a - b,
-  "*": (a, b) => a * b,
-  "rem": (a, b) => a % b,
+  "+": (a, b) => arith("add", a, b),
+  "-": (a, b) => arith("sub", a, b),
+  "*": (a, b) => arith("mul", a, b),
+  "rem": (a, b) => arith("rem", a, b),
   "is_integer": isInt,
   "is_float": isFloat,
   "is_number": isNum,
@@ -587,6 +663,13 @@ export async function init(rt) {
   }
 }
 
+/** Hand one turn to the host TASK queue. It MUST be a macrotask (`setTimeout`),
+ *  not a microtask: only a macrotask lets timers and I/O run, which is the whole
+ *  point of returning from a bounded root slice. */
+function yieldToHostTasks() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export async function boot(rt) {
   const entry = ref(rt, "js", "entry");
   const mainFn = ref(rt, "js", "bl-main");
@@ -594,15 +677,24 @@ export async function boot(rt) {
   for (;;) {
     const r = runTurn(rt, frames, rt.budget);
     const st = resultStatus(r);
-    if (st === "done") return resultValue(r);
-    // The scheduler's own slice ended: it still has work, so hand it straight
-    // back. Only `host-wait` (the scheduler asking for a deadline) yields to
-    // the host task queue.
-    if (st === "yield") continue;
+    if (st === "done") {
+      const errors = rt.errors || 0;
+      if (errors > 0) {
+        rt.out("actor runtime: " + errors + " error(s) recorded; failing boot");
+        if (globalThis.process) globalThis.process.exitCode = 1;
+        throw new Error("actor runtime recorded " + errors + " error(s)");
+      }
+      return resultValue(r);
+    }
+    // The scheduler's own bounded slice ended. Yield to the host TASK queue so
+    // timers and I/O run before the next slice: a bare `continue` here would
+    // chain microtasks and starve them. `host-wait` (the scheduler asking for a
+    // deadline) already sleeps for real.
+    if (st === "yield") { await yieldToHostTasks(); continue; }
     if (st === "error") {
       rt.out("actor runtime error: " + resultMessage(r));
       if (globalThis.process) globalThis.process.exitCode = 1;
-      return null;
+      throw new Error("actor runtime error: " + resultMessage(r));
     }
     if (st === "host-wait") {
       const ms = resultMs(r);
@@ -613,6 +705,6 @@ export async function boot(rt) {
     // nothing to resume it: a scheduler bug, not a user program's.
     rt.out("scheduler parked with no resumer");
     if (globalThis.process) globalThis.process.exitCode = 1;
-    return null;
+    throw new Error("scheduler parked with no resumer");
   }
 }

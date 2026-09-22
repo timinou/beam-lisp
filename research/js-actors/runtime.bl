@@ -150,7 +150,7 @@
 ;
 ;   {:next-pid  n
 ;    :procs     {pid -> proc}
-;    :runnable  (pid …)}
+;    :runnable  [pid …]}          ; a FIFO VECTOR: `conj` appends, the head runs
 ;
 ; A proc is {:pid n :frames <host frame stack> :mailbox [msg …]
 ;            :status :runnable|:running|:waiting :wait nil|<deadline-ms>}
@@ -162,44 +162,73 @@
 (defn rt-empty-state []
   (assoc (assoc (assoc (host/empty-map) :next-pid 0)
                 :procs (host/empty-map))
-         :runnable (host/empty-list)))
+         :runnable (host/vec-from-list (host/empty-list))))
 
 (defn rt-proc-of [st pid] (get (:procs st) pid))
 (defn rt-put-proc [st pid proc] (assoc st :procs (assoc (:procs st) pid proc)))
 (defn rt-drop-proc [st pid] (assoc st :procs (host/map-remove (:procs st) pid)))
 
+; ── critical sections ───────────────────────────────────────────────────────
+;
+; Every function below is a generator the machine can slice: a turn can end
+; between the `host/state` read and the `host/set-state` write of a
+; read-modify-write. `host/critical-enter` / `host/critical-leave` are a
+; generic depth counter with no actor meaning; while the depth is positive the
+; machine DEFERS the slice boundary, so the pair runs to completion against
+; every other process. Nesting is fine, `host/park` is refused inside one, and
+; a failed turn unwinds the depth to what it was on entry (host.mjs `runTurn`).
+
+(defn rt-vec-index
+  "The first index of `x` in vector `v` at or after `i`, or -1."
+  [v x i]
+  (if (host/lt i (host/vec-size v))
+    (if (host/eq (host/vec-el v i) x)
+      i
+      (rt-vec-index v x (host/arith "add" i 1)))
+    -1))
+
 (defn rt-set-proc-field [pid k v]
-  (let [st (host/state)]
-    (host/set-state (rt-put-proc st pid (assoc (rt-proc-of st pid) k v)))))
+  (do
+    (host/critical-enter)
+    (let [st (host/state)]
+      (host/set-state (rt-put-proc st pid (assoc (rt-proc-of st pid) k v))))
+    (host/critical-leave)
+    nil))
 
 (defn rt-requeue! [pid]
-  (let [st (host/state)
-        proc (rt-proc-of st pid)]
-    (if (nil? proc)
-      nil
-      (if (host/eq (:status proc) :runnable)
-        nil
-        (do
-          (host/set-state (assoc (rt-put-proc st pid (assoc proc :status :runnable))
-                                 :runnable (conj (:runnable st) pid)))
-          nil)))))
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      (do
+        (if (nil? proc)
+          nil
+          (if (host/eq (:status proc) :runnable)
+            nil
+            (host/set-state (assoc (rt-put-proc st pid (assoc proc :status :runnable))
+                                   :runnable (conj (:runnable st) pid)))))
+        (host/critical-leave)
+        nil))))
 
 (defn rt-spawn
   "Start `f` with `args` as a new process; answer its pid. The new proc is
    runnable immediately: its frame stack is built by the host machine."
   [f args]
-  (let [st (host/state)
-        pid (:next-pid st)
-        proc (assoc (assoc (assoc (assoc (host/empty-map) :pid pid)
-                                  :frames (host/make-frames f args))
-                           :mailbox [])
-                    :status :runnable)
-        proc2 (assoc proc :wait nil)]
-    (do
-      (host/set-state (assoc (assoc (rt-put-proc st pid proc2)
-                                    :next-pid (host/arith "add" pid 1))
-                             :runnable (conj (:runnable st) pid)))
-      pid)))
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          pid (:next-pid st)
+          proc (assoc (assoc (assoc (assoc (host/empty-map) :pid pid)
+                                    :frames (host/make-frames f args))
+                             :mailbox [])
+                      :status :runnable)
+          proc2 (assoc proc :wait nil)]
+      (do
+        (host/set-state (assoc (assoc (rt-put-proc st pid proc2)
+                                      :next-pid (host/arith "add" pid 1))
+                               :runnable (conj (:runnable st) pid)))
+        (host/critical-leave)
+        pid))))
 
 (defn rt-self [] (host/self))
 
@@ -207,61 +236,159 @@
   "Queue `msg` on `to`'s mailbox; if `to` is parked in a receive, wake it so it
    can rescan. Answers the message."
   [to msg]
-  (let [st (host/state)
-        proc (rt-proc-of st to)]
-    (if (nil? proc)
-      (do (host/write (host/str-cat "send: no such process " to)) nil)
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st to)
+          ans (if (nil? proc)
+                (do (host/write (host/str-cat "send: no such process " to)) nil)
+                (do
+                  (host/set-state (rt-put-proc st to (assoc proc :mailbox (conj (:mailbox proc) msg))))
+                  (if (host/eq (:status proc) :waiting)
+                    (rt-requeue! to)
+                    nil)
+                  msg))]
       (do
-        (host/set-state (rt-put-proc st to (assoc proc :mailbox (conj (:mailbox proc) msg))))
-        (if (host/eq (:status proc) :waiting)
-          (rt-requeue! to)
-          nil)
-        msg))))
+        (host/critical-leave)
+        ans))))
 
 (defn rt-drop-mailbox-msg
   "Remove the message at index `i` from `pid`'s mailbox. Removing BEFORE the
    selected body runs is what makes the next receive start where the mailbox
    actually is: skipped messages stay, the consumed one is gone."
   [pid i]
-  (let [st (host/state)
-        proc (rt-proc-of st pid)]
-    (host/set-state (rt-put-proc st pid
-                                 (assoc proc :mailbox (host/vec-remove (:mailbox proc) i))))))
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      (host/set-state (rt-put-proc st pid
+                                   (assoc proc :mailbox (host/vec-remove (:mailbox proc) i)))))
+    (host/critical-leave)
+    nil))
+
+; ── receive ─────────────────────────────────────────────────────────────────
+;
+; The deadline is computed ONCE, on entry, and never reset: a flood of
+; unmatched messages can delay when the timeout *fires* (the queue must still
+; be scanned) but cannot push the deadline out.
+
+(defn rt-deadline-of
+  "The monotonic deadline for a receive timeout. `nil` (no `after` clause) and
+   `:infinity` mean no deadline; a nonnegative integer `ms` means now + ms.
+   Anything else is a source error and raises."
+  [timeout-ms]
+  (cond
+    (host/is-nil timeout-ms) nil
+    (host/is-kw timeout-ms)
+      (if (host/eq (host/kw-name timeout-ms) "infinity")
+        nil
+        (host/raise (host/str-cat "receive: bad timeout "
+                                  (host/describe timeout-ms)
+                                  " (want a nonnegative integer or :infinity)")))
+    (host/is-int timeout-ms)
+      (if (host/lt timeout-ms 0)
+        (host/raise (host/str-cat "receive: bad timeout " timeout-ms
+                                  " (want a nonnegative integer or :infinity)"))
+        (host/arith "add" (host/now) timeout-ms))
+    :else
+      (host/raise (host/str-cat "receive: bad timeout "
+                                (host/describe timeout-ms)
+                                " (want a nonnegative integer or :infinity)"))))
+
+(defn rt-deadline-passed? [dl]
+  (if (host/is-nil dl)
+    false
+    (not (host/lt (host/now) dl))))
+
+(defn rt-scan-from
+  "Offer the messages of the mailbox SNAPSHOT `mb`, from cursor `i`, to the
+   compiled probe `scan`. Answers [:match idx sel] or [:nomatch end] where
+   `end` is the cursor just past the snapshot. `mb` is a BL local, so messages
+   that arrive while the scan is sliced are picked up by the next pass, never
+   by this one: a flood cannot extend a pass."
+  [scan mb i]
+  (if (host/lt i (host/vec-size mb))
+    (let [r (scan (host/vec-el mb i))]
+      (if (host/eq r :nomatch)
+        (rt-scan-from scan mb (host/arith "add" i 1))
+        [:match i r]))
+    [:nomatch i]))
+
+(defn rt-proc-wait!
+  "Register `pid` as waiting until deadline `dl` in ONE critical section, so a
+   send either sees :waiting (and requeues) or sees the message the post-
+   registration rescan finds — it cannot slip between the two fields."
+  [pid dl]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)]
+      (host/set-state (rt-put-proc st pid
+                                   (assoc (assoc (rt-proc-of st pid) :wait dl)
+                                          :status :waiting))))
+    (host/critical-leave)
+    nil))
+
+(defn rt-proc-resume!
+  "Clear `pid`'s wait, mark it running, and drop any runnable entry a racing
+   send may have appended. One critical section."
+  [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)
+          runq (:runnable st)
+          i (rt-vec-index runq pid 0)
+          st2 (if (nil? proc)
+                st
+                (rt-put-proc st pid (assoc (assoc proc :wait nil) :status :running)))
+          st3 (if (host/lt i 0)
+                st2
+                (assoc st2 :runnable (host/vec-remove runq i)))]
+      (host/set-state st3))
+    (host/critical-leave)
+    nil))
 
 (defn rt-receive
   "The one suspension point of a receive.
    `scan` is a compiler-generated probe: (fn [msg] -> :nomatch | [:match body-fn]).
-   `after-fn` is the timeout continuation, `timeout-ms` a number or nil.
+   `after-fn` is the timeout continuation, `timeout-ms` nil | :infinity | ms.
 
    Selection is message-major (each message is offered to every clause in
-   source order, inside the probe) and the scan cursor `i` is retained across
-   parks, so skipped messages keep their order and are never rescanned. The
-   deadline is computed once, before the first scan, so continuing arrivals
-   cannot extend a timed wait.
+   source order, inside the probe) and each fresh snapshot is scanned from its
+   head, so skipped messages keep their order.
 
-   The scan is always completed over what is already queued BEFORE parking, so
-   `after 0` still selects an already-queued message; the park that follows is
-   the scheduling boundary the design calls for."
+   The mailbox is scanned BEFORE any park, so `after 0` scans what is already
+   queued and times out WITHOUT parking. On every wakeup the queue is rescanned
+   before the timeout is answered, so a message and an expired deadline are
+   ordered message-first — while the fixed deadline keeps a flood of unmatched
+   messages from extending the wait."
   [scan after-fn timeout-ms]
-  (let [pid (host/self)
-        dl (if (host/is-nil timeout-ms) nil (host/arith "add" (host/now) timeout-ms))]
-    (loop [i 0]
-      (let [mb (:mailbox (rt-proc-of (host/state) pid))
-            n (count mb)]
-        (if (host/lt i n)
-          (let [r (scan (nth mb i))]
-            (if (host/eq r :nomatch)
-              (recur (host/arith "add" i 1))
-              (do (rt-drop-mailbox-msg pid i) r)))
+  (rt-receive-wait scan after-fn (host/self) (rt-deadline-of timeout-ms) 0))
+
+(defn rt-receive-wait [scan after-fn pid dl i]
+  (let [mb (:mailbox (rt-proc-of (host/state) pid))
+        r (rt-scan-from scan mb i)]
+    (if (host/eq (rt-first r) :match)
+      (let [idx (rt-nth r 1)]
+        (do
+          (rt-drop-mailbox-msg pid idx)
+          (rt-nth r 2)))
+      (let [n (rt-nth r 1)]
+        (if (rt-deadline-passed? dl)
+          [:timeout after-fn]
           (do
-            (rt-set-proc-field pid :wait dl)
-            (rt-set-proc-field pid :status :waiting)
-            (host/park)
-            (rt-set-proc-field pid :wait nil)
-            (rt-set-proc-field pid :status :running)
-            (if (and (some? dl) (not (host/lt (host/now) dl)))
-              [:timeout after-fn]
-              (recur i))))))))
+            ; Registration, recheck and parking form one scheduling transaction.
+            (host/critical-enter)
+            (rt-proc-wait! pid dl)
+            (if (host/lt n (host/vec-size (:mailbox (rt-proc-of (host/state) pid))))
+              (do
+                (rt-proc-resume! pid)
+                (host/critical-leave)
+                (rt-receive-wait scan after-fn pid dl n))
+              (do
+                (host/park-release)
+                (rt-proc-resume! pid)
+                (rt-receive-wait scan after-fn pid dl n)))))))))
 
 (defn rt-min-deadline [procs]
   (rt-min-deadline-1 (host/map-keys procs) procs nil))
@@ -288,8 +415,8 @@
 
 (defn rt-run-pid
   "Run one bounded turn of `pid`. A parked turn leaves the proc waiting with
-   its frame stack intact; a yielded turn requeues it; a finished or failed
-   turn drops it."
+   its frame stack intact; a yielded turn requeues it; a finished turn drops
+   it; a failed turn is recorded (so `boot` rejects) and dropped."
   [pid]
   (let [proc (rt-proc-of (host/state) pid)]
     (if (nil? proc)
@@ -301,52 +428,84 @@
             (host/eq status :done)
               (host/set-state (rt-drop-proc (host/state) pid))
             (host/eq status :error)
-              (do
-                (host/write (host/str-cat (host/str-cat "process " pid)
-                                          (host/str-cat " failed: " (:message r))))
-                (host/set-state (rt-drop-proc (host/state) pid)))
+              (let [m (host/str-cat (host/str-cat "process " pid)
+                                    (host/str-cat " failed: " (:message r)))]
+                (do
+                  (host/write m)
+                  (host/record-error m)
+                  (host/set-state (rt-drop-proc (host/state) pid))))
             (host/eq status :yield)
               (rt-requeue! pid)
             :else nil)
           :done)))))
 
-(defn rt-run-head []
+(defn rt-run-head-pid [pid]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (if (nil? proc)
+      (rt-run-head)                  ; a stale runnable entry: skip to the next
+      (do
+        (rt-set-proc-field pid :status :running)
+        (host/set-self pid)
+        (let [r (rt-run-pid pid)]
+          (do
+            (host/set-self nil)      ; the scheduler root owns the context again
+            r))))))
+
+(defn rt-pop-runnable! [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          runq (:runnable st)
+          i (rt-vec-index runq pid 0)]
+      (host/set-state (if (host/lt i 0) st (assoc st :runnable (host/vec-remove runq i)))))
+    (host/critical-leave)
+    nil))
+
+(defn rt-run-head
+  "Run the head of the FIFO runnable queue. A pid whose process is gone is
+   skipped, so a dropped process never resurrects a zombie registry entry."
+  []
   (let [st (host/state)
         runq (:runnable st)]
-    (if (host/is-enil runq)
+    (if (host/eq 0 (host/vec-size runq))
       :empty
-      (let [pid (first runq)]
+      (let [pid (host/vec-el runq 0)]
         (do
-          (host/set-state (assoc st :runnable (rest runq)))
-          (rt-set-proc-field pid :status :running)
-          (host/set-self pid)
-          (rt-run-pid pid))))))
+          (rt-pop-runnable! pid)
+          (rt-run-head-pid pid))))))
 
 (defn rt-clamp [ms] (if (host/lt ms 0) 0 ms))
 
 (defn rt-sched-loop
   "One scheduler step per iteration, in tail position, so the scheduler itself
-   is stack-safe. Decides between running a runnable process, sleeping to the
-   earliest deadline, and stopping."
+   is stack-safe. Expired timers are woken on EVERY cycle, runnable peers or
+   not, so a busy process cannot hide a timeout. Decides between running a
+   runnable process, sleeping to the earliest deadline, and stopping."
   []
   (let [st (host/state)
         procs (:procs st)]
     (if (host/eq 0 (host/map-size procs))
       :done
-      (if (host/is-enil (:runnable st))
-        (let [dl (rt-min-deadline procs)]
-          (if (host/is-nil dl)
+      (do
+        (rt-wake-expired (host/map-keys procs) procs (host/now))
+        (let [st2 (host/state)
+              procs2 (:procs st2)]
+          (if (host/eq 0 (host/vec-size (:runnable st2)))
+            (let [dl (rt-min-deadline procs2)]
+              (if (host/is-nil dl)
+                (let [m (host/str-cat "scheduler: "
+                                      (host/str-cat (host/map-size procs2)
+                                                    " process(es) blocked with no deadline"))]
+                  (do
+                    (host/write m)
+                    (host/record-error m)
+                    :done))
+                (do
+                  (host/wait-until (rt-clamp (host/arith "sub" dl (host/now))))
+                  (rt-sched-loop))))
             (do
-              (host/write (host/str-cat (host/str-cat "scheduler: " (host/map-size procs))
-                                        " process(es) blocked with no deadline"))
-              :done)
-            (do
-              (host/wait-until (rt-clamp (host/arith "sub" dl (host/now))))
-              (rt-wake-expired (host/map-keys procs) procs (host/now))
-              (rt-sched-loop))))
-        (do
-          (rt-run-head)
-          (rt-sched-loop))))))
+              (rt-run-head)
+              (rt-sched-loop))))))))
 
 (defn bl-main
   "The JS driver's entry. `entry` is the application's main fn, bound by the
