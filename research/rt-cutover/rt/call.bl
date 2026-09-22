@@ -28,37 +28,136 @@
 (defn call-shape-error [v arity]
   (str "cannot call " (pr-str v :limit 3 :printable_limit 40)))
 
-;; Minimal invoke - just handle the basic cases
+;; ── the call protocol ──────────────────────────────────────────────────────
+
+(def ^:private FACADE-MOD
+  "The runtime's own public module.
+
+   `invoke` needs `get` for its keyword and map clauses, and `rt.coll/get` is
+   VARIADIC — a computed call cannot reach a variadic definition by arity
+   (measured: `erlang/apply` `Rt.Coll` `:get` with `[m k]` is
+   `UndefinedFunctionError`). The facade is not variadic at `get/2`,`get/3`, and
+   it is the module this cutover PRODUCES, so this is a real edge to the layer
+   above rather than a forwarder to the layer being deleted."
+  :"Elixir.BeamLisp.Ns.Rt")
+
+(defn- facade-get
+  "`(rt/get m k)` / `(rt/get m k default)` by computed call. One implementation of
+   indexing, reached through the module atom rather than a static import, which
+   is what keeps rt.call below rt.coll instead of in a cycle with it."
+  ([m k] (erlang/apply FACADE-MOD :get (raw/cons m (raw/cons k ()))))
+  ([m k d] (erlang/apply FACADE-MOD :get (raw/cons m (raw/cons k (raw/cons d ()))))))
+
+(defn- bad-call [f arity]
+  (erlang/error (raw/tuple2 :"ArgumentError" (call-shape-error f arity))))
+
+(defn- invoke-multi
+  "The multi-fn tag tuple: `fixed` is the arity→fn map, `variadic` is `{min, f}`
+   or nil. RT's own clause, one for one — including the shape of the variadic
+   call, which passes the first `min` arguments followed by the REST AS ONE
+   LIST. That is what makes `str`'s `{0, fn args -> … end}` receive its whole
+   argument list in a single parameter."
+  [f args]
+  (let [fixed (erlang/element 2 f)
+        variadic (erlang/element 3 f)
+        arity (erlang/length args)]
+    (cond
+      (erlang/is_map_key arity fixed)
+      (erlang/apply (maps/get arity fixed) args)
+
+      (erlang/== variadic nil)
+      (bad-call f arity)
+
+      :else
+      (let [mn (erlang/element 1 variadic)
+            vf (erlang/element 2 variadic)]
+        (cond
+          (erlang/>= arity mn)
+          (erlang/apply vf
+            (erlang/apply :lists :append
+              (list (erlang/apply :lists :sublist (list args mn))
+                    (raw/cons (erlang/apply :lists :nthtail (list mn args)) ()))))
+          :else (bad-call f arity))))))
+
 (defn invoke
+  "Call `f` with the argument LIST `args`.
+
+   Dispatched on `rt.kind/kind`, so the whole question \"what is this and how do
+   I call it\" is one read of the one classifier rather than a chain of `is_*`
+   tests that has to be kept in the same order as the classifier's clauses.
+
+   The clauses mirror `BeamLisp.RT.invoke/2`: a plain fn, a multi-fn, a dynamic
+   remote handle, a keyword (a function of maps), a vector (of its indices), a
+   set (of its members), a sorted collection, and a plain map (of its keys).
+   The port had the first three and treated a plain map as callable — both too
+   permissive (a struct is a map, so a Vector was callable as a lookup) and too
+   narrow (a keyword, a vector and a set were all uncallable). Nothing else is
+   callable, and the last clause says so in a sentence rather than leaving the
+   reader a host stack frame naming the wrong function."
   ([f] (invoke f ()))
   ([f args]
-   (cond
-     ;; Plain function
-     (erlang/is_function f)
-     (erlang/apply f args)
-
-     ;; Keyword
-     (and (erlang/is_atom f)
-          (not (erlang/is_boolean f))
-          (not (erlang/== nil f)))
+   (let [kd (k/kind f)
+         n (erlang/length args)]
      (cond
-       (erlang/== 1 (erlang/length args))
-       (maps/get f (erlang/hd args) nil)
-       (erlang/== 2 (erlang/length args))
-       (maps/get f (erlang/hd args) (erlang/hd (erlang/tl args)))
-       :else (erlang/error :"invoke/2: bad arity"))
+       ;; A plain fn: the overwhelmingly common case.
+       (erlang/== kd :fn) (erlang/apply f args)
 
-     ;; Plain map
-     (erlang/is_map f)
-     (cond
-       (erlang/== 1 (erlang/length args))
-       (maps/get (erlang/hd args) f nil)
-       (erlang/== 2 (erlang/length args))
-       (maps/get (erlang/hd args) f (erlang/hd (erlang/tl args)))
-       :else (erlang/error :"invoke/2: bad arity"))
+       (erlang/== kd :blfn) (invoke-multi f args)
 
-     ;; Non-callable
-     :else (erlang/error (raw/tuple2 :"error" (call-shape-error f (erlang/length args)))))))
+       ;; Dynamic invocation of a host-module handle: the runtime half of the
+       ;; capability gate, whose static half the compiler enforces.
+       (erlang/== kd :remote)
+       (erlang/apply (erlang/element 2 f) (erlang/element 3 f) args)
+
+       ;; Keywords are functions of maps: `(:a m)` is `(get m :a)`.
+       (erlang/== kd :atom)
+       (cond
+         (erlang/== n 1) (facade-get (erlang/hd args) f)
+         (erlang/== n 2) (facade-get (erlang/hd args) f (erlang/hd (erlang/tl args)))
+         :else (bad-call f n))
+
+       ;; Vectors are functions of their indices: `([a b] 1)` is `(nth [a b] 1)`.
+       (erlang/== kd :vector)
+       (cond
+         (and (erlang/== n 1) (erlang/is_integer (erlang/hd args)))
+         (BeamLisp.Vector/nth f (erlang/hd args))
+         :else (bad-call f n))
+
+       ;; Sets are functions of their members: the member, or the default.
+       (erlang/== kd :set)
+       (cond
+         (erlang/== n 1)
+         (cond (BeamLisp.Set/member? f (erlang/hd args)) (erlang/hd args) :else nil)
+         (erlang/== n 2)
+         (cond (BeamLisp.Set/member? f (erlang/hd args)) (erlang/hd args)
+               :else (erlang/hd (erlang/tl args)))
+         :else (bad-call f n))
+
+       (erlang/== kd :sorted-set)
+       (cond
+         (erlang/== n 1)
+         (cond (BeamLisp.Sorted/set_member? f (erlang/hd args)) (erlang/hd args) :else nil)
+         (erlang/== n 2)
+         (cond (BeamLisp.Sorted/set_member? f (erlang/hd args)) (erlang/hd args)
+               :else (erlang/hd (erlang/tl args)))
+         :else (bad-call f n))
+
+       (erlang/== kd :sorted-map)
+       (cond
+         (erlang/== n 1) (facade-get f (erlang/hd args))
+         (erlang/== n 2) (facade-get f (erlang/hd args) (erlang/hd (erlang/tl args)))
+         :else (bad-call f n))
+
+       ;; A plain map is a function of its keys. A struct never reaches here:
+       ;; each has its own kind, which is the ordering hazard the classifier
+       ;; removes for every protocol at once.
+       (erlang/== kd :map)
+       (cond
+         (erlang/== n 1) (facade-get f (erlang/hd args))
+         (erlang/== n 2) (facade-get f (erlang/hd args) (erlang/hd (erlang/tl args)))
+         :else (bad-call f n))
+
+       :else (bad-call f n)))))
 
 ;; invocable? checks if a value can be called with a specific arity.
 ;;
