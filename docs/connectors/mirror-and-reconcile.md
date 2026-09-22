@@ -155,17 +155,27 @@ Measured with the owed-set query of §4 (probe kept in BUG-100):
 
 ```
 file added under a subfolder        → {:added #{[10 "r1"]}}   ✓ (touches :f/rev, a top-level attr)
-job recorded (the not-join)          → silent                  ✓ correct (the answer did not change)
+job recorded (the not-join)          → silent                  ✗  answer moved: {[10 "r1"]} → {}
 rev bumped                           → {:added … :removed …}   ✓
 file MOVED into the root (parent only) → silent                ✗  truth after: [[10 "r2"] [12 "x"]]
 ```
 
 The move changed only `:f/parent`, which is read solely inside the recursive rule.
-For sync this is the exact event that matters, and it is lost silently.
+For sync this is the exact event that matters, and it is lost silently. The
+`not-join` row was first annotated `✓ (the answer did not change)` — it is in fact
+the same defect: recording the job stops the file being owed, so the answer DOES
+move, and the old watch missed that too.
 
-### 3.2 · The fix, and the axis it adds
+### 3.2 · The fix, and the axis it adds — LANDED 2026-09-22 (BUG-100, W0)
 
-Two parts, the second being the reusable one:
+Two parts, the second being the reusable one. Both are in the tree
+(`priv/lib/datom/watch.bl`, `priv/lib/datom/query/relation.bl`); the tests that
+pin them are `datom.watch.test/a-watch-over-a-rule-and-a-not-join-reads-the-whole-query`
+(the §3.1 probe, now firing `{:added #{["…" "x"]}}`), `…-inside-not-fires`,
+`…-inside-or-fires`, `…-inside-a-rule-body-fires`,
+`a-computed-relations-declared-reads-reach-the-prefilter`,
+`a-computed-relation-without-reads-is-always-relevant`, and
+`the-prefilter-still-prefilters`.
 
 1. **`query-attrs` walks the whole query.** Recurse into `:not`/`:not-join`/`:or`/
    `:or-join`/`:and` sub-clauses, and into the bodies of every rule the `%` input
@@ -180,9 +190,11 @@ Two parts, the second being the reusable one:
    watch prefilter uses it; so can `datom.attr-basis` (a derived column is
    invalidated by ITS attributes — W4a already argues this per attribute) and
    `datom.derived` validity. A relation without `:reads` is conservatively
-   "reads everything". This is the dependency axis the seven-axes header in
-   `datom/query/relation.bl` is missing: `maintenance` says *how* to update under
-   a delta but nothing says *which* deltas are relevant.
+   "reads everything", and an empty or malformed `:reads` is a registration
+   error rather than a silent "never relevant". It is the eighth axis in
+   `datom/query/relation.bl` (and is emitted by `catalog-datoms`), the one the
+   seven-axis header was missing: `maintenance` says *how* to update under a
+   delta but nothing said *which* deltas are relevant.
 
 ### 3.3 · `:~file/under` — the folder closure as a derived relation, not a rule argument
 

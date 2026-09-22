@@ -72,7 +72,8 @@
 
 (ns datom.watch
   (:require [datom.conn] [datom.db] [datom.index]
-            [datom.query.engine] [datom.query.parse]))
+            [datom.query.engine] [datom.query.parse]
+            [datom.query.relation] [datom.query.rules]))
 
 ;; ── recognising the interest shape ──────────────────────────────────
 
@@ -112,43 +113,185 @@
                  tx-datoms)))
 
 ;; ── T2a: prefilter by attribute, then diff the query result ─────────
+;;
+;; The prefilter must OVER-approximate what a commit can move the answer
+;; through: a commit touching none of the query's read attributes cannot
+;; change its answer, so the query need not run. UNDER-approximating it —
+;; naming fewer attributes than the query really reads — silently DROPS
+;; firings, the one failure a watch cannot report. BUG-100 was exactly
+;; that: an attribute read only inside a rule body, a `:not`, an `:or`, or
+;; a computed relation was invisible, so a real change came back `:silent`.
+;; Everything the walker cannot NAME therefore yields ALWAYS-RELEVANT.
 
-(defn- pattern-clauses
-  "The pattern clauses of a parsed query's `:where` (skipping predicates,
-   analytic and rule clauses — only patterns name attributes to watch)."
-  [where]
-  (filterv datom.query.parse/pattern-clause? where))
+(def ^:private ALWAYS-RELEVANT
+  "The read-set verdict for a query (or a computed relation) whose
+   attributes cannot be enumerated: every commit is relevant, so the query
+   runs. `query-attrs` otherwise returns the SET of attributes read;
+   `touches?` accepts either verdict."
+  :all)
 
-(defn- clause-attr
-  "The attribute a pattern clause constrains, if it is a constant keyword.
+(defn- merge-attrs
+  "Union two read-set verdicts. ALWAYS-RELEVANT absorbs: one clause the
+   walker cannot classify makes the WHOLE query always-relevant, because a
+   partial set would drop the firings of the piece it missed."
+  [a b]
+  (if (or (= ALWAYS-RELEVANT a) (= ALWAYS-RELEVANT b))
+    ALWAYS-RELEVANT
+    (into a b)))
 
-   `[?e :order/status ?v]` → `:order/status`. A clause whose attribute is a
-   variable constrains no single attribute, so it contributes nothing to the
-   prefilter and returns nil (the query still runs on any commit that clears
-   another clause's attribute — a variable-attribute query is rare and the
-   prefilter stays conservative)."
+(defn- pattern-attrs
+  "The read set of a data pattern: `#{:order/status}` for a constant
+   attribute, or ALWAYS-RELEVANT when the pattern names none.
+
+   `[?e :order/status ?v]` → `#{:order/status}`. A variable attribute
+   (`[?e ?a ?v]`) or a wildcard could be any attribute; naming none of them
+   would drop real firings."
   [clause]
   (let [a (if (> (count clause) 1) (get clause 1) nil)]
-    (if (keyword? a) a nil)))
+    (if (keyword? a) #{a} ALWAYS-RELEVANT)))
+
+(defn- relation-reads
+  "The attributes a computed-relation clause reads, from the relation's
+   declared `:reads` (datom.query.relation axis 8), or ALWAYS-RELEVANT when
+   it declares none — an undeclared relation reads anything."
+  [clause]
+  (let [reads (get (datom.query.relation/relation (first (get clause 0))) :reads)]
+    (if (seq reads) (set (to-list reads)) ALWAYS-RELEVANT)))
+
+(defn- db-call?
+  "Whether a call form takes the database as an argument — a DATABASE
+   BUILTIN (`get-else`, `missing?`), which reads attributes this walker does
+   not know. A plain predicate never takes a `$` source."
+  [call]
+  (some datom.query.parse/source? (into [] (rest call))))
+
+(defn- clause-attrs
+  "The attributes ONE `:where` (sub-)clause reads: a set, or
+   ALWAYS-RELEVANT when it reads something the walker cannot name.
+
+   `names` are the names the query's `%` rules define, `rule-attrs` what
+   their bodies read; together they tell a rule invocation from a predicate
+   by exactly the test the engine uses (the name is a defined rule).
+   Recursion covers the rule operators, so a `:not`/`:or`/`:and`/`-join`
+   sub-clause contributes exactly like a top-level one."
+  [clause names rule-attrs]
+  (cond
+    ; a rule operator — recurse into its sub-clauses. The -join forms carry
+    ; a join-variable vector first; it names no attribute, so it is skipped.
+    (datom.query.parse/rule-clause? clause)
+      (let [op (get clause 0)
+            subs (cond
+                   (= op :not) (rest clause)
+                   (= op :or) (rest clause)
+                   (= op :and) (rest clause)
+                   (= op :not-join) (drop 2 clause)
+                   (= op :or-join) (drop 2 clause)
+                   :else nil)]
+        (if (nil? subs)
+          ALWAYS-RELEVANT                    ; unknown operator: fail open
+          (reduce (fn [acc sub]
+                    (merge-attrs acc (clause-attrs sub names rule-attrs)))
+                  #{}
+                  subs)))
+
+    ; a computed relation — its DECLARED :reads
+    (datom.query.parse/analytic-clause? clause)
+      (relation-reads clause)
+
+    ; a rule invocation — what the rule bodies read (walked once, over all)
+    (datom.query.parse/rule-invocation? clause names)
+      rule-attrs
+
+    ; a call form taking the db — a database builtin, reads unknown attrs
+    (and (or (list? clause)
+             (and (vector? clause) (> (count clause) 0) (list? (get clause 0))))
+         (db-call? (if (list? clause) clause (get clause 0))))
+      ALWAYS-RELEVANT
+
+    ; a plain predicate reads no attribute — it filters on bound values
+    (datom.query.parse/predicate-clause? clause) #{}
+
+    ; an unrecognised call form
+    (list? clause) ALWAYS-RELEVANT
+
+    ; a data pattern
+    (datom.query.parse/pattern-clause? clause) (pattern-attrs clause)
+
+    :else ALWAYS-RELEVANT))
+
+(defn- rules-attrs
+  "The attributes the `%` rules read: the union over EVERY rule body.
+
+   Laying every body side by side is exact and needs no per-name closure or
+   fixpoint — a body's rule invocation names a rule that is IN `%`, so that
+   body is in this union too, and recursion cannot contribute an attribute
+   no body mentions. An invocation inside a body therefore adds nothing."
+  [rules names]
+  (reduce (fn [acc rule-def]
+            (reduce (fn [a c] (merge-attrs a (clause-attrs c names #{})))
+                    acc
+                    (into [] (rest rule-def))))
+          #{}
+          (to-list rules)))
+
+(defn- rules-argument
+  "The `%` rules value out of `inputs`, by POSITION: `inputs` line up with
+   `parse/input-forms` (data sources excluded), so the form at an index
+   names which argument it is.
+
+   nil when the query takes no rules; ALWAYS-RELEVANT when it declares `%`
+   but the value is not a rule set (or the arguments do not line up) — the
+   walker must not conclude a query reads nothing from rules it could not
+   read."
+  [parsed inputs]
+  (let [forms (datom.query.parse/input-forms parsed)
+        supplied (into [] (or inputs '()))]
+    (if (not= (count forms) (count supplied))
+      (if (datom.query.parse/has-rules-input? parsed) ALWAYS-RELEVANT nil)
+      (loop [i 0]
+        (if (>= i (count forms))
+          nil
+          (if (datom.query.parse/rules-var? (get forms i))
+            (let [r (get supplied i)]
+              (if (and (or (vector? r) (list? r))
+                       (every? datom.query.rules/rule-definition? (to-list r)))
+                r
+                ALWAYS-RELEVANT))
+            (recur (+ i 1))))))))
 
 (defn- query-attrs
-  "The set of attributes a query reads through its pattern clauses."
-  [parsed]
-  (reduce (fn [acc c]
-            (let [a (clause-attr c)]
-              (if (nil? a) acc (conj acc a))))
-          #{}
-          (pattern-clauses (:where parsed))))
+  "The set of attributes a query reads — over the WHOLE query — or
+   ALWAYS-RELEVANT when any part of it cannot be named.
+
+   Walks the top-level `:where`, recurses into every rule operator's
+   sub-clauses (`:not`/`:not-join`/`:or`/`:or-join`/`:and`), and folds in
+   every body of the `%` rules input (located by `parse/input-forms`
+   position, so it lines up with the `inputs` the watch holds). A computed
+   relation contributes its declared `:reads`. Anything unclassifiable — a
+   variable attribute, an unknown clause form, an undeclared computed
+   relation, a `%` argument that is not a rule set — makes the whole
+   verdict ALWAYS-RELEVANT: correctness over the optimisation, the promise
+   `touches?` already made for variable attributes (BUG-100)."
+  [parsed inputs]
+  (let [rules (rules-argument parsed inputs)]
+    (if (= ALWAYS-RELEVANT rules)
+      ALWAYS-RELEVANT
+      (let [names (if (nil? rules) #{} (set (to-list (datom.query.rules/rule-names rules))))
+            rule-attrs (if (nil? rules) #{} (rules-attrs rules names))]
+        (reduce (fn [acc c] (merge-attrs acc (clause-attrs c names rule-attrs)))
+                #{}
+                (to-list (:where parsed)))))))
 
 (defn- touches?
-  "Whether a commit's tx-datoms touch any attribute in `attrs`.
+  "Whether a commit's tx-datoms touch any attribute the query reads.
 
-   The cheap T0-style prefilter: a set-membership test over what changed,
-   so a commit that cannot possibly affect the query is discarded WITHOUT
-   running it. An empty `attrs` (a query with only variable attributes) is
-   treated as 'always relevant' — correctness over the optimisation."
+   `attrs` is `query-attrs`' verdict: a set of attributes, or
+   ALWAYS-RELEVANT. Either ALWAYS-RELEVANT or the empty set (a query that
+   names no attribute at all) means 'always relevant' — the query runs.
+   Otherwise the cheap set-membership test discards a commit that cannot
+   possibly affect the query WITHOUT running it."
   [attrs tx-datoms]
-  (if (empty? attrs)
+  (if (or (= ALWAYS-RELEVANT attrs) (empty? attrs))
     true
     (reduce (fn [_ d]
               (if (contains? attrs (datom.index/-a d)) (reduced true) false))
@@ -193,7 +336,7 @@
   [conn query inputs callback]
   (datom.conn/listen! conn)
   (let [parsed (datom.query.parse/parse query)
-        attrs (query-attrs parsed)]
+        attrs (query-attrs parsed inputs)]
     (loop [db-before (datom.conn/db conn)]
       (receive
         [:datom/tx _basis tx-datoms]

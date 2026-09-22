@@ -10,7 +10,9 @@
 ; receiving (a fire) or timing out (silence).
 
 (ns datom.watch.test
-  (:require [datom] [datom.watch] [datom.vector]))
+  (:require [datom] [datom.watch] [datom.vector]
+            [datom.db] [datom.index]
+            [datom.query.relation :as rel]))
 
 (defn- order-conn []
   (datom/connect
@@ -161,3 +163,196 @@
     (Process/sleep 50)
     (datom/transact! conn [{:db/id -2 :order/id 2 :order/status :shipped}])
     (is (= :silent (fired 300)) "silent after unwatch")))
+
+;; ── BUG-100: the prefilter reads the WHOLE query ────────────────────
+;;
+;; A T2a prefilter used to see only TOP-LEVEL pattern clauses, so a commit
+;; that moved the answer through an attribute named only inside a rule body,
+;; a `[:not …]`/`[:or …]` sub-clause, or a computed relation came back
+;; `:silent` while the answer changed. One test per construct, plus the
+;; fail-open cases (variable attribute, undeclared relation) and the
+;; "still prefilters" case that keeps the optimisation honest.
+
+(defn- mount-conn []
+  (datom/connect
+    [{:db/ident :f/key :db/valueType :db.type/string :db/unique :db.unique/identity}
+     {:db/ident :f/parent :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+     {:db/ident :f/rev :db/valueType :db.type/string}
+     {:db/ident :f/size :db/valueType :db.type/long}
+     {:db/ident :m/root :db/valueType :db.type/ref}
+     {:db/ident :j/origin :db/valueType :db.type/ref}
+     {:db/ident :j/rev :db/valueType :db.type/string}
+     {:db/ident :w/topic :db/valueType :db.type/keyword}
+     {:db/ident :w/label :db/valueType :db.type/string}
+     {:db/ident :w/flag :db/valueType :db.type/boolean}]))
+
+(def UNDER '[[(under ?f ?r) [?f :f/parent ?r]]
+             [(under ?f ?r) [?f :f/parent ?p] (under ?p ?r)]])
+
+(def OWED '[:find ?f ?rev :in $ % ?m
+            :where [?m :m/root ?r] (under ?f ?r) [?f :f/rev ?rev]
+                   [:not-join [?f ?rev] [?j :j/origin ?f] [?j :j/rev ?rev]]])
+
+(defn- ent
+  "The entity with `v` at attribute `a`."
+  [conn a v]
+  (get (first (into [] (datom/q '[:find ?e :in $ ?a ?v :where [?e ?a ?v]]
+                                (datom/db conn) a v))) 0))
+
+(defn- rows-diff
+  "The {:added :removed} that two answers of the same query imply."
+  [before after]
+  {:added   (reduce (fn [s r] (if (contains? before r) s (conj s r))) #{} (to-list after))
+   :removed (reduce (fn [s r] (if (contains? after r) s (conj s r))) #{} (to-list before))})
+
+(deftest a-watch-over-a-rule-and-a-not-join-reads-the-whole-query
+  (let [conn (mount-conn)
+        me (erlang/self)]
+    ; root ← sub ← a(r1, with a job recorded for r1); b(r2) under nothing
+    (datom/transact! conn [{:db/id -1 :f/key "root"} {:db/id -2 :m/root -1}
+                           {:db/id -3 :f/key "sub" :f/parent -1}])
+    (let [root (ent conn :f/key "root")
+          sub (ent conn :f/key "sub")]
+      (datom/transact! conn [{:db/id -1 :f/key "a" :f/rev "r1" :f/parent sub}])
+      (datom/transact! conn [{:db/id -1 :j/origin (ent conn :f/key "a") :j/rev "r1"}])
+      (datom/transact! conn [{:db/id -1 :f/key "b" :f/rev "r2"}])
+      (let [m (ent conn :m/root root)
+            w (watch-t2a conn OWED [UNDER m] me)]
+        (Process/sleep 30)
+        (is (= #{} (datom/q OWED (datom/db conn) UNDER m))
+            "nothing is owed yet: b is not under the root")
+        (let [before (datom/q OWED (datom/db conn) UNDER m)]
+          ; the move changes ONLY :f/parent — an attribute named only in the
+          ; recursive rule's BODY, never in a top-level pattern
+          (datom/transact! conn [[:db/add (ent conn :f/key "b") :f/parent root]])
+          (let [after (datom/q OWED (datom/db conn) UNDER m)
+                d (fired 1000)]
+            (is (not (= :silent d)) "the parent-only move fires the owed watch")
+            (is (= (rows-diff before after) d)
+                "and the diff is the engine's own before/after")
+            (is (= 1 (count (:added d))) "one file became owed")
+            (is (= "r2" (second (first (to-list (:added d))))) "b at rev r2")))
+        (datom.watch/unwatch w)))))
+
+(deftest an-attribute-read-only-inside-not-fires
+  (let [conn (mount-conn)
+        me (erlang/self)
+        q '[:find ?e :where [?e :w/topic :x] [:not [?e :w/label "done"]]]]
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (let [e1 (ent conn :w/topic :x)
+          w (watch-t2a conn q me)]
+      (Process/sleep 30)
+      (datom/transact! conn [[:db/add e1 :w/label "done"]])
+      (let [d (fired 1000)]
+        (is (not (= :silent d)) "an attribute read only inside [:not …] fires")
+        (is (= {:added #{} :removed #{[e1]}} d) "the negated row leaves the answer"))
+      (datom.watch/unwatch w))))
+
+(deftest an-attribute-read-only-inside-or-fires
+  (let [conn (mount-conn)
+        me (erlang/self)
+        q '[:find ?e :where [?e :w/topic :x]
+                         [:or [?e :w/label "hot"] [?e :w/flag true]]]]
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (let [e1 (ent conn :w/topic :x)
+          w (watch-t2a conn q me)]
+      (Process/sleep 30)
+      (datom/transact! conn [[:db/add e1 :w/flag true]])
+      (let [d (fired 1000)]
+        (is (not (= :silent d)) "an attribute read only inside [:or …] fires")
+        (is (= {:added #{[e1]} :removed #{}} d) "the second branch now matches"))
+      (datom.watch/unwatch w))))
+
+(deftest an-attribute-read-only-inside-a-rule-body-fires
+  (let [conn (mount-conn)
+        me (erlang/self)
+        rules '[[(flagged ?e) [?e :w/flag true]]]
+        q '[:find ?e :in $ % :where [?e :w/topic :x] (flagged ?e)]]
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (let [e1 (ent conn :w/topic :x)
+          w (watch-t2a conn q [rules] me)]
+      (Process/sleep 30)
+      (datom/transact! conn [[:db/add e1 :w/flag true]])
+      (let [d (fired 1000)]
+        (is (not (= :silent d)) "an attribute read only in a rule body fires")
+        (is (= {:added #{[e1]} :removed #{}} d) "the rule's row appears"))
+      (datom.watch/unwatch w))))
+
+(defn- label-provider
+  "A provider whose answer is a function of :w/label alone — the relation's
+   real read set, whether or not it declares one."
+  [db mode bounds args]
+  (mapv (fn [d] [(datom.index/-e d) (datom.index/-v d)])
+        (datom.db/attr-datoms db :w/label)))
+
+(defn- register-label-relations!
+  "One relation that declares its `:reads`, one that does not."
+  []
+  (rel/register-relation! :~labelled
+    {:arity 2 :modes #{:bf} :reads #{:w/label}
+     :doc "entities carrying a :w/label"
+     :provider label-provider})
+  (rel/register-relation! :~unread
+    {:arity 2 :modes #{:bf}
+     :doc "the same provider, declaring no :reads (reads everything)"
+     :provider label-provider}))
+
+(deftest a-computed-relations-declared-reads-reach-the-prefilter
+  (register-label-relations!)
+  (let [conn (mount-conn)
+        me (erlang/self)
+        q '[:find ?e :where [?e :w/topic :x] [?e :~labelled ?v]]]
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (let [e1 (ent conn :w/topic :x)
+          w (watch-t2a conn q me)]
+      (Process/sleep 30)
+      ; only :w/label changes — a top-level pattern never names it
+      (datom/transact! conn [[:db/add e1 :w/label "hot"]])
+      (let [d (fired 1000)]
+        (is (not (= :silent d)) "the relation's declared :reads makes the label commit relevant")
+        (is (= {:added #{[e1]} :removed #{}} d) "and its new row appears"))
+      (datom.watch/unwatch w))))
+
+(deftest a-computed-relation-without-reads-is-always-relevant
+  (register-label-relations!)
+  (let [conn (mount-conn)
+        me (erlang/self)
+        q '[:find ?e :where [?e :w/topic :x] [?e :~unread ?v]]]
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (let [e1 (ent conn :w/topic :x)
+          w (watch-t2a conn q me)]
+      (Process/sleep 30)
+      ; the same commit as above, but this relation declares no :reads — the
+      ; prefilter must fail OPEN (always relevant) rather than assume silence
+      (datom/transact! conn [[:db/add e1 :w/label "hot"]])
+      (let [d (fired 1000)]
+        (is (not (= :silent d)) "an undeclared relation makes every commit relevant")
+        (is (= {:added #{[e1]} :removed #{}} d) "and the query is re-run, not skipped"))
+      (datom.watch/unwatch w))))
+
+(deftest a-variable-attribute-is-always-relevant
+  (let [conn (mount-conn)
+        me (erlang/self)
+        w (watch-t2a conn '[:find ?e :where [?e ?a :x]] me)]
+    (Process/sleep 30)
+    (datom/transact! conn [{:db/id -1 :w/topic :x}])
+    (is (not (= :silent (fired 1000)))
+        "a query whose attribute is a variable cannot prefilter, so it re-runs")
+    (datom.watch/unwatch w)))
+
+(deftest the-prefilter-still-prefilters
+  (let [conn (mount-conn)
+        me (erlang/self)]
+    (datom/transact! conn [{:db/id -1 :f/key "root"} {:db/id -2 :m/root -1}])
+    (let [root (ent conn :f/key "root")
+          m (ent conn :m/root root)
+          w (watch-t2a conn OWED [UNDER m] me)]
+      (Process/sleep 30)
+      ; :f/size is read NOWHERE in OWED — the commit cannot move the answer,
+      ; so the query must not even run
+      (datom/transact! conn [{:db/id -1 :f/key "x" :f/size 99}])
+      (is (= :silent (fired 400)) "an attribute the query reads nowhere stays silent")
+      ; ... and the watch is still live on a read attribute
+      (datom/transact! conn [{:db/id -2 :f/key "y" :f/rev "r1" :f/parent root}])
+      (is (not (= :silent (fired 1000))) "a read attribute still fires it")
+      (datom.watch/unwatch w))))
