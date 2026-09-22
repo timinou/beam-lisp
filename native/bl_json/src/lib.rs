@@ -23,6 +23,12 @@
 //!   flat 500-key decode      0.08 ms                       0.03        0.03
 //! ```
 //!
+//! Per byte, since the corpora differ: the counting parse measures 2.9 ns/byte in a
+//! standalone Rust bench with no BEAM in it at all (24,281 B, best of 200), which is the
+//! floor serde_json reaches when it builds nothing. `json-count` and the full decode
+//! report the SAME parse time, which is what proves no intermediate tree is built and no
+//! second pass over the terms happens.
+//!
 //! The decoder measured 0.88 ms before terms were built with raw `enif_*` calls instead of
 //! rustler's per-value wrappers, and 0.60 ms after; hoisting the Vector atoms out of the
 //! per-Vector path took it to 0.22 ms. Vector construction fell from 591 to 117 ns across
