@@ -85,43 +85,62 @@ each delegating to its owner.
 
 | operation | BL | Elixir | ratio |
 |---|---:|---:|---:|
-| harness floor | 12 | 12 | 1.0 |
-| `kind` (vector) | 203 | — | — |
-| `vector?` | 172 | 16 | 10.8 |
-| `map?` | 27 | 19 | 1.4 |
-| `first` (vector) | 222 | 50 | 4.4 |
-| `first` (list) | 254 | 20 | 12.7 |
-| `rest` (list) | 237 | 20 | 11.9 |
-| `count` (vector) | 241 | 32 | 7.5 |
-| `nth 3` (vector) | 414 | 43 | 9.6 |
-| `empty?` | 584 | 41 | 14.2 |
-| `compare` ints | 175 | 43 | 4.1 |
-| `compare` 10-vector | 19 719 | 383 | 51 |
-| `compare` 1000-vector | 1 295 525 | 1 072 | 1 209 |
-| `eqv` 10-vector | 17 665 | 811 | 22 |
-| `compare` 1000-vector with itself | 1 515 906 | 11 | 137 810 |
+| harness floor | 13–16 | 18–20 | ~0.8 |
+| `kind` (vector) | 162–190 | — | — |
+| `vector?` | 193–278 | 16–64 | 4–12 |
+| `map?` | 28–38 | 22–24 | 1.3–1.6 |
+| `first` (vector) | 201–216 | 21–32 | 6–10 |
+| `first` (list) | 188–197 | 12–17 | 11–16 |
+| `rest` (list) | 176–212 | 10–15 | 12–21 |
+| `count` (vector) | 217–239 | 22–25 | 9.6–9.9 |
+| `nth 3` (vector) | 350–384 | 34–36 | 10.3–10.7 |
+| `empty?` | 372–432 | 38–41 | 9.8–10.5 |
+| `compare` ints | 149–160 | 39 | 3.8–4.1 |
+| `compare` 10-vector, differ at the 10th | 13 352–14 362 | 339–449 | 32–39 |
+| `compare` 1000-vector, EQUAL terms | 455–690 | 462–865 | **0.80–0.98** |
+| `compare` 1000-vector, differ at the last | 327 756–363 475 | 14 056–16 438 | 20–26 |
+| `eqv` 10-vector, differ at the 10th | 14 069–14 663 | 759–961 | 15–19 |
+| `compare` the same 1000-vector twice | 13–91 | 11–69 | 1.2–1.3 |
 
-One optimisation is already in: the classifier looked its struct kind up by
-SCANNING the representation descriptors, which cost ~500 ns per `kind` call.
-A module→kind map built once at load took `kind` from 489 ns to 203 ns,
-`vector?` from 598 to 172, `count` from 979 to 241.
+Two independent runs (the host is noisy — report spreads, not points). Rows name
+what they exercise, because a comparison benchmark that does not is measuring
+its own fast paths: `erlang/==` is STRUCTURAL equality, so two equal vectors are
+answered by one C compare, while `big3` differs from `big` in the LAST element
+and can only be answered by walking.
+
+Two optimisations are already in, both from this table:
+
+1. **The classifier scanned for its struct kind.** `kind` looked its answer up
+   by looping over the representation descriptors, ~500 ns per call. A
+   module→kind map built once at load: `kind` 489→162–190 ns, `vector?`
+   598→193–278, `count` 979→217–239.
+2. **`compare` had no equality short-circuit.** Comparing a term with itself
+   cost 1.52 ms against the Elixir runtime's 11 ns. `(erlang/== a b) → 0` at the
+   head of `k-compare` took it to 13–91 ns — and because that test is
+   STRUCTURAL, it also answers the far more common case of two equal values:
+   455–690 ns for a 1000-element vector against the Elixir runtime's 462–865,
+   i.e. parity.
 
 ### What the numbers say about sequencing
 
-The plan said: cut over, then optimise. The measurement says that order is
-wrong, and says why.
+**What this changes.** The plan said: cut over, then optimise. The measurements
+say that order is wrong, and say why: the earlier prototype's 1.3–1.6× figure
+was for a DIRECT kernel call, while the real cutover goes through the public
+namespace and through a classifier every operation consults — the Elixir runtime
+answers the same question inside each function's clause head, in pattern
+matching, for free.
 
-The earlier prototype's 1.3–1.6× figure was for a DIRECT kernel call. The real
-cutover goes through the public namespace (two remote hops) and, more
-importantly, through a classifier that every operation calls — the Elixir
-runtime answers the same question inside the clause head of each function, in
-C-shaped pattern matching, for free.
-
-- **leaf operations are 4–14×** — tolerable for a toolchain that already accepts
+- **leaf operations are 4–21×** — tolerable for a toolchain that already accepts
   5× for its compiler and 27× for its reader;
-- **sequence comparison is 51–1209×, and identity comparison 137 810×** — not
-  tolerable. Every `sort`, every map key, every `distinct`, every Sorted
-  insertion goes through it, and the toolchain sorts constantly.
+- **comparing UNEQUAL sequences is 20–39×** — a value that differs from another
+  at the last element can only be answered by walking, and the walk costs ~1 400
+  ns per element against the Elixir runtime's ~14 ns per element on the same
+  input, because the Elixir runtime's per-element work is a C-level term compare
+  while the BL runtime's is interpreted classification plus a family dispatch.
+  Every `sort`, every Sorted insertion, every `distinct` over unequal values
+  goes through it. Equality-heavy work — map lookups, replacing an equal value —
+  is now at parity, so the remaining cost is concentrated exactly where a
+  language's collections spend their comparisons.
 
 So the flip must be preceded by the comparison work, or the toolchain becomes
 unusable for as long as it takes to do it. The ranking below is the order the
@@ -129,19 +148,19 @@ measurements justify, and P5 is no longer "follow-up": it is the gate.
 
 ## P5, ranked by measurement
 
-1. **Identity short-circuit in `compare`/`eqv`.** 1.5 ms vs 11 ns. Comparing a
-   term with itself is distance zero; that is provable, not a heuristic
-   (`compare` is reflexive by construction). Trivial, and removes the worst
-   ratio in the table.
+1. ~~Identity short-circuit in `compare`/`eqv`.~~ DONE — `(erlang/== a b) → 0`
+   at the head of `k-compare`. 1.52 ms → 13–91 ns for a term against itself, and
+   because the test is structural, equal values went to parity with the Elixir
+   runtime as well. This was the largest single ratio in the table and it cost
+   one clause.
 2. **Delegate same-family sequence comparison to the BEAM's term order.** The
-   Elixir runtime answers in 1 072 ns for 1000 elements — it is not walking
-   element by element in Elixir, it is comparing the underlying tuple in C. The
-   BL comparator walks in interpreted code at ~1 300 ns PER ELEMENT. A fast path
-   that uses `:erlang` term comparison where the representation already encodes
-   the semantic order (same family, non-numeric, non-metadata) and falls back to
-   the semantic walk only where it does not (mixed families, numeric
-   representation equivalences such as `1 = 1.0 = 1M`, metadata) is the single
-   largest win available.
+   remaining hotspot, and the one that decides whether the flip is safe: two
+   sequences that agree for 999 elements and differ at the last cost 328–363 µs
+   in BL against 14–16 µs in the Elixir runtime. Where the representation
+   already encodes the semantic order — same family, non-numeric, no metadata —
+   `:erlang` term comparison on the underlying sequence answers the same
+   question in C. The semantic walk stays for the cases where it must: mixed
+   families, numeric representation equivalences (`1 = 1.0 = 1M`), metadata.
 3. **`kind` as a generated `case`, not a `cond` chain.** 203 ns is now the floor
    for every operation; the chain evaluates up to 13 type tests before it
    answers, and the answer is a fixed function of the term's tag. Generating the
