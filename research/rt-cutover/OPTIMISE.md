@@ -89,29 +89,89 @@ matching and C-level term comparison, not a call into a classifier.
 
 ## 2. Where the time actually goes
 
-Five distinct causes, in order of size:
+Micro-benchmark differencing ran out here: a comparison step measured ~380 ns
+per element in BOTH representations, while every constituent call measured
+2–25 ns, and the arithmetic refused to close. Differencing amplifies noise by
+subtraction. A profiler does not, so the answer came from CALL COUNTS:
 
-1. **List construction costs ~700 ns per element.** `rt/raw.bl`'s `cons` is five
-   BIF calls (`make_tuple`, `tuple_to_list`, `setelement`×2, `lists:append`)
-   because a runtime cannot call the language it implements, and a 2-tuple is not
-   a cons cell. That figure is paid by every `to-list`, `map`, `filter`,
-   `sort-elems`, and sequence realization. On the BEAM a cons is one instruction.
-2. **Classification is redone per element.** `k-compare` re-derives `kind` and
-   `family` for both operands on every step, though for two same-kind sequences
-   the answer is a property of the pair, not of the step.
-3. **`family` costs 459–607 ns on its own** — more than `kind`. It is asked once
-   per element, twice per `k-compare`.
-4. **Wasted passes.** Fixed for `seq-cmp`; still present for sets and maps, where
-   `coll-cmp` **sorts both sides** to compare them (O(n log n) plus two
-   realizations) when a count check plus membership would do.
-5. **One extra remote call per operation** through the public namespace
-   (`rt` → `rt/…`). Small (measured `map?` 28–38 through the facade against
-   22–24 direct) but universal.
+```
+ONE compare of two 1000-element LISTS   26 065 calls total
+    atomics:get/2                       2 000
+    persistent_term:get/2               2 000
+
+ONE compare of two 1000-element VECTORS 106 607 calls total
+    atomics:get/2                       6 010
+    persistent_term:get/2               6 010
+```
+
+`atomics:get/2` plus `persistent_term:get/2` is `BeamLisp.Env` — **namespace
+variable resolution**. For the list walk that is exactly 2 lookups per element:
+the `EMPTY` reference inside the loop. For the vector walk it is 6 per element:
+three cross-namespace calls, each resolved through the environment.
+
+### The cost of a reference
+
+| how the code says it | what it costs |
+|---|---|
+| `erlang/...` BIF | direct call |
+| a `defn` in the SAME namespace, called by name | direct call |
+| a namespace `def` VALUE, e.g. `EMPTY` | **2 env lookups (~0.4 µs) per use** |
+| a `defn` in ANOTHER namespace via `:as` alias | **2 env lookups per call** |
+
+That table is the whole explanation. `list-cmp` referenced `EMPTY` twice per
+iteration — 2 000 env lookups to walk 1 000 elements — and hoisting it into a
+`let` before the loop took list comparison from **405 to 42 ns per element**, a
+9.6× win and parity with the Elixir runtime (40–66 ns/element). One line, chosen
+by a call count.
+
+### The remaining cost
+
+The vector walk still pays **6 env lookups per element**, because it steps through
+`rt.seq`'s `k-seq`/`k-first`/`k-next` across a namespace boundary. At 1 482 ns per
+element it is now the entire remaining gap, and it is not a trie problem: it is
+three variable lookups per step.
+
+That is also why every measured floor was cheap and every real walk was not. A
+bare `loop` over a list is 19–25 ns/element; a `defn` re-entering itself with
+`recur` is 2 ns/element; a local call is 17 ns; a BIF is 24 ns. None of those
+forms touches the environment. All of them were measured on values held in local
+bindings — which is exactly the state the runtime is NOT in when it is doing its
+job.
+
+### Other causes, still real but smaller
+
+1. **List construction ≈ 700 ns/element** when it goes through `rt/raw.bl`'s
+   five-BIF `cons`. Unchanged, and still the biggest constant in every
+   list-producing path.
+2. **`family` costs 459–607 ns when it is asked per element** — but with A2 in
+   place it is asked per *comparison*, not per element, so its weight has moved.
+3. **Sets and maps sort both sides to compare them** (`coll-cmp`), O(n log n) plus
+   two realizations where a count check and membership would do.
+4. **The facade hop**, one extra call per operation (`map?` 28–38 against 22–24
+   direct). Small now, but it is a lookups question too.
+
 
 ## 3. Levers — algorithmic and mathematical
 
 No native code, no code generation. These are the ones to take first, because
 they are cheap, safe, and the oracle already guards them.
+
+### A0. Stop resolving variables per element — DONE for constants, OPEN for calls
+
+The profiler says the per-element cost is namespace variable resolution. Two forms:
+
+- **a `def` VALUE referenced inside a loop** — hoist it into a `let`/`loop`
+  binding. Done for `EMPTY`: 405 → 42 ns/element. **Every loop in the runtime
+  that names a namespace constant is paying this, and the fix is local and
+  mechanical.** Sweep them: `rt/seq.bl`, `rt/reduce.bl`, `rt/key.bl` all
+  reference their own constants per step.
+- **a call into another namespace via `:as`** — 2 lookups per call, which is the
+  entire remaining vector cost (6 lookups/element). Two fixes, in order of
+  preference: (i) publish link rows for the runtime's own namespaces so the
+  compiler emits direct calls (`linked-call` already consults the link table for
+  alias-qualified names, so this needs no compiler change); (ii) where a walk is
+  representation-specific, walk the representation directly with BIFs instead of
+  going through the seq protocol at all.
 
 ### A1. Stop realizing to answer a prefix question — DONE
 
@@ -188,6 +248,29 @@ with a real export surface. Its clauses are mechanical delegations; emitting the
 directly, so a hot leaf is one jump instead of two, is a code-generation problem,
 not a design change.
 
+### B4. Publish link rows for the runtime's own namespaces
+
+The `core` link table is what makes a BARE name compile to a direct remote call.
+The runtime's INTERNAL cross-namespace calls do not go through it, so each one is
+two environment lookups. The same mechanism applies to them: publish the runtime's
+names for its own sub-namespaces and the compiler emits direct calls.
+
+- **Estimated payoff**: removes 6 lookups per element from the vector walk, i.e.
+the current remaining gap.
+- **What to check first**: the link table resolves through `BeamLisp.Env`, which
+exists so that a redefinition is visible. A link row pins a module, so a pinned
+runtime namespace must be re-published whenever one of its definitions is
+replaced — the same discipline `Loader` already applies for reload, and the thing
+to verify before this is switched on generally.
+
+### B5. Generated code has no environment at all
+
+The generated path (`Krt.Intrinsics`, `Krt.Specialized`) takes no environment
+lookups, because its constants are literals and its calls are direct. That is why
+the prototype's generated `count` measured 25.9 ns against the Elixir runtime's
+28.7 ns while the interpreted kernel measured hundreds. **Every lever in this
+section is a special case of that fact.**
+
 ## 5. Levers — → native
 
 Native is not an alternative to the above; it is a different regime with a
@@ -245,16 +328,17 @@ Ordered by measured payoff per unit of risk. The oracle (`oracle.bl`, currently
 
 | # | lever | evidence for doing it now | verification |
 |---|---|---|---|
-| 1 | A1 stop realizing | 400 µs → 2 µs, done | oracle + `decompose` A/C |
-| 2 | A2 classify the pair once | 1 400 ns/element ⇒ ~200 estimated | `decompose` A, oracle |
-| 3 | B1 generated `cons` | ~700 ns/element paid everywhere | `decompose` D, oracle |
-| 4 | B2 generated `kind`/`family` | `family` 459–607 ns, per element | `decompose` D, oracle |
-| 5 | A3 sets/maps without sorting | O(n log n) + 2 passes; O(n) available | oracle (set/map rows) |
-| 6 | A4 drop `proper?` | one fewer pass | oracle |
-| 7 | B3 facade inlining | one call per operation | `bench` |
-| 8 | native, per §5 | needs ≥10 µs of body work | `invm` harness |
+| 0 | A1 stop realizing | 400 µs → 2 µs, done | oracle + `decompose` A/C |
+| 1 | A2 classify the pair once | done; vectors 1.55 ms → 1.06 ms | `decompose` A, oracle |
+| 2 | A0 hoist `def` values out of loops | done for `EMPTY`: 405 → 42 ns/element | `decompose4`, oracle |
+| 3 | A0 sweep the other loops | same defect, not yet swept | `decompose4`, `profile` |
+| 4 | B4 link the runtime's namespaces | 6 env lookups/element = the remaining vector gap | `profile` counts, `decompose4` |
+| 5 | B1 generated `cons` | ~700 ns/element paid everywhere | `decompose` D, oracle |
+| 6 | A3 sets/maps without sorting | O(n log n) + 2 passes; O(n) available | oracle (set/map rows) |
+| 7 | B2 generated `kind`/`family` | `family` 459–607 ns when asked per element | `decompose` D, oracle |
+| 8 | B3 facade inlining | one call per operation | `bench` |
+| 9 | native, per §5 | needs ≥10 µs of body work | `invm` harness |
 
-**The flip stays gated on 1–4.** At 1 400 ns per compared element the toolchain
-would crawl; the estimates say 2–4 bring it to roughly 50–100 ns per element,
-which is within 2× of the runtime being replaced and inside the range the project
-already accepts for its compiler and reader.
+**The flip stays gated on 0–4.** List comparison is already at parity; the vector
+walk is the last number standing between the runtime and a usable toolchain, and
+it is a variable-resolution problem, not an algorithmic one.
