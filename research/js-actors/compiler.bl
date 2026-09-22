@@ -1,0 +1,823 @@
+; compiler.bl — the bl-ANF → JavaScript backend, written in beam-lisp.
+;
+; This is the prototype's compiler stage. It runs on the existing BEAM host
+; (through `bl run`), reads BL sources with the EXISTING reader, compiles them
+; with the EXISTING compiler to canonical bl-ANF, and emits JavaScript from
+; that ANF. It never interprets ANF and never re-parses BL: the only input to
+; the emitter below is the validated bl-ANF vocabulary of priv/boot/anf.bl.
+;
+;   test.bl / runtime.bl        (beam-lisp source)
+;     → BeamLisp.Ns.Reader      (the existing reader)
+;     → BeamLisp.Ns.Compiler    (source → bl-ANF, the one IR)
+;     → emit-js (this file)     (bl-ANF → JavaScript)
+;     → out/bundle.mjs          (imports host.mjs; runs on Node or a browser)
+;
+; WHAT THIS FILE REFUSES, AND WHY IT REFUSES IT AT BUILD TIME
+;
+;   * `:try`. The machine has no exception frames, so a `try` that spanned a
+;     park would lose its `finally`. Emitting it "approximately" would silently
+;     change semantics, so it is a hard compile error instead.
+;   * any `:remote` outside the checked ABI allowlist (`host/…`, `erlang/…`,
+;     and a closed map of core names onto the BL prelude).
+;   * any `:global` that neither the sources define nor the prelude provides.
+;   * unsupported literal values (a literal tuple/list in value position).
+;
+; The allowlist is deliberately a static table rather than a discovery
+; mechanism: a closed set that says NO to everything else is the only version
+; of this check that cannot silently widen.
+
+(ns js-actors-compiler)
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Reader-node accessors. Self-contained on purpose (no `:require`): a node is
+; an Erlang tuple, and these functions are the whole surface this file needs.
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn n-unwrap [n]
+  (if (and (erlang/is_tuple n) (= :meta (first (erlang/tuple_to_list n))))
+    (second (erlang/tuple_to_list n))
+    n))
+
+(defn n-tag [n]
+  (let [f (n-unwrap n)]
+    (if (erlang/is_tuple f) (first (erlang/tuple_to_list f)) :scalar)))
+
+(defn n-items [n] (second (erlang/tuple_to_list (n-unwrap n))))
+(defn n-name [n] (second (erlang/tuple_to_list (n-unwrap n))))
+(defn sym-node [s] (erlang/list_to_tuple (list :symbol s)))
+(defn list-node [xs] (erlang/list_to_tuple (list :list xs)))
+
+(defn form-sym? [n s]
+  (and (= :symbol (n-tag n)) (= s (n-name n))))
+
+(defn defn-form? [n]
+  (and (= :list (n-tag n))
+       (let [its (n-items n)]
+         (and (not (empty? its)) (form-sym? (first its) "defn")))))
+
+(defn defn-name [n] (n-name (second (n-items n))))
+
+(defn defn->fn-form
+  "Turn `(defn name [params] body…)` into `(fn name [params] body…)` — the
+   named-fn form the existing compiler already understands, so a top-level
+   definition needs no Env/Link machinery on this backend. A docstring and an
+   attr-map are dropped, exactly as the AOT path drops them from the value."
+  [n]
+  (let [its (n-items n)
+        name (second its)
+        body0 (rest (rest its))
+        body1 (if (and (not (empty? body0))
+                       (erlang/is_binary (n-unwrap (first body0)))
+                       (not (empty? (rest body0))))
+                (rest body0)
+                body0)
+        body2 (if (and (not (empty? body1))
+                       (= :map (n-tag (first body1)))
+                       (not (empty? (rest body1))))
+                (rest body1)
+                body1)]
+    (list-node (cons (sym-node "fn") (cons name body2)))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; JavaScript text helpers
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn js-escape [s]
+  (apply str
+    (map (fn [c]
+           (cond
+             (= c 34) "\\\""
+             (= c 92) "\\\\"
+             (= c 10) "\\n"
+             (= c 13) "\\r"
+             (= c 9) "\\t"
+             :else (erlang/list_to_binary (list c))))
+         (erlang/binary_to_list s))))
+
+(defn js-str [s] (str "\"" (js-escape s) "\""))
+
+(defn join-str [xs sep]
+  (if (empty? xs)
+    ""
+    (loop [i 1 acc (str (first xs))]
+      (if (>= i (count xs))
+        acc
+        (recur (inc i) (str acc sep (nth xs i)))))))
+
+(defn jsname
+  "A JS identifier for a bl-ANF local name. ANF names are already unique per
+   function (the compiler's fresh counter), so munging is only about legal
+   characters and reserved words — the `v_` prefix settles both."
+  [n]
+  (str "v_"
+       (apply str
+         (map (fn [c]
+                (if (or (and (>= c 97) (<= c 122))
+                        (and (>= c 65) (<= c 90))
+                        (and (>= c 48) (<= c 57)))
+                  (erlang/list_to_binary (list c))
+                  "_"))
+              (erlang/binary_to_list n)))))
+
+(defn fresh-tmp []
+  (let [cur (erlang/get :js-actors-tmp)
+        n (erlang/+ (if (= cur :undefined) 0 cur) 1)]
+    (erlang/put :js-actors-tmp n)
+    (str "t" n)))
+
+(defn lit-js [v]
+  (cond
+    (= v nil) "null"
+    (= v true) "true"
+    (= v false) "false"
+    (erlang/is_integer v) (str v)
+    (erlang/is_float v) (str v)
+    (erlang/is_binary v) (js-str v)
+    (erlang/is_atom v) (str "H.kw(" (js-str (str v)) ")")
+    :else (throw (ex-info (str "js-actors: unsupported literal " (pr-str v)
+                               " — the JS backend carries numbers, strings, keywords,"
+                               " booleans and nil only")
+                          {:value v}))))
+
+(def mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.RT"))
+(def mod-core (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Core"))
+(def mod-transient (erlang/binary_to_atom "Elixir.BeamLisp.Transient"))
+(def mod-host :host)
+(def mod-erlang :erlang)
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The ABI allowlist
+; ─────────────────────────────────────────────────────────────────────────────
+
+(def host-names
+  "Every `host/…` leaf the JS host implements. MUST mirror host.mjs `PURE` +
+   `RT_HOST`; the build fails closed on anything else."
+  #{"kw" "kw-name" "is-kw" "cons" "is-cons" "is-enil" "cons-head" "cons-tail"
+    "is-list" "empty-list" "list->array" "tup" "is-tup" "tup-el" "tup-size"
+    "struct" "is-struct" "struct-mod" "struct-field" "is-vec" "vec-size" "vec-el"
+    "vec-append" "vec-remove" "vec-to-list" "vec-from-list" "is-set" "bmap" "empty-map"
+    "is-map" "map-get" "map-put" "map-remove" "map-keys" "map-size"
+    "eq" "identical" "lt" "is-nil" "is-int" "is-float" "is-num" "is-str"
+    "is-bool" "is-fn" "to-str" "describe" "arith" "str-cat" "str-size" "truthy"
+    "park" "wait-until" "now" "state" "set-state" "self" "set-self" "run-turn"
+    "make-frames" "ref" "write" "raise"})
+
+(def erlang-names
+  "Every `:erlang` bif a guard (or a raw bif call) may reach."
+  #{"==" "/=" "=:=" "=/=" "<" ">" "=<" ">=" "+" "-" "*" "rem" "is_integer"
+    "is_float" "is_number" "is_binary" "is_tuple" "is_list" "is_pid"
+    "is_reference" "is_port" "is_atom" "is_map" "tuple_size" "map_size" "abs"
+    "length" "self"})
+
+(def remote-map
+  "Remote references the existing compiler emits for core names, each mapped
+   onto the BL prelude function that gives it meaning. Missing from here ⇒ the
+   build fails closed, naming the pair."
+  {"Elixir.BeamLisp.RT/eqv" "rt-eqv"
+   "Elixir.BeamLisp.RT/identical?" "rt-identical?"
+   "Elixir.BeamLisp.RT/hash_key" "rt-hash-key"
+   "Elixir.BeamLisp.RT/first" "rt-first"
+   "Elixir.BeamLisp.RT/rest" "rt-rest"
+   "Elixir.BeamLisp.RT/nth" "rt-nth"
+   "Elixir.BeamLisp.RT/count" "rt-count"
+   "Elixir.BeamLisp.RT/cons" "rt-cons"
+   "Elixir.BeamLisp.RT/conj" "rt-conj"
+   "Elixir.BeamLisp.RT/get" "rt-get"
+   "Elixir.BeamLisp.RT/assoc" "rt-assoc"
+   "Elixir.BeamLisp.RT/empty?" "rt-empty?"
+   "Elixir.BeamLisp.RT/seq" "rt-seq"
+   "Elixir.BeamLisp.RT/next" "rt-next"
+   "Elixir.BeamLisp.RT/to_list" "rt-to-list"
+   "Elixir.BeamLisp.RT/print_str" "rt-print-str"
+   "Elixir.BeamLisp.Ns.Core/list__bl_v" "core-list"
+   "Elixir.BeamLisp.Ns.Core/not=" "core-not="
+   "Elixir.BeamLisp.Ns.Core/nil?" "core-nil?"
+   "Elixir.BeamLisp.Ns.Core/some?" "core-some?"
+   "Elixir.BeamLisp.Ns.Core/inc" "core-inc"
+   "Elixir.BeamLisp.Ns.Core/dec" "core-dec"
+   "Elixir.BeamLisp.Ns.Core/keyword" "core-keyword"
+   "Elixir.BeamLisp.Ns.Core/name" "core-name"
+   "Elixir.BeamLisp.Transient/hash_map" "core-hash-map"})
+
+(def core-map
+  "Core names the compiler leaves as a namespace-global fetch. The emitter
+   falls back from the source namespace to `core`, mirroring Env.fetch!/2."
+  {"str" "core-str" "not" "core-not" "list" "core-list" "vector" "core-vector"
+   "print" "core-print" "println" "core-println" "hash-map" "core-hash-map"
+   "nil?" "core-nil?" "some?" "core-some?" "not=" "core-not=" "inc" "core-inc"
+   "dec" "core-dec" "keyword" "core-keyword" "name" "core-name"})
+
+(defn remote-key [m f] (str (str m) "/" (str f)))
+
+(defn callee-js [m f]
+  (cond
+    (= m mod-host) (str "H.hostRef(rt," (js-str (str f)) ")")
+    (= m mod-erlang) (str "H.erlangRef(" (js-str (str f)) ")")
+    :else (str "H.ref(rt," (js-str (str m)) "," (js-str (str f)) ")")))
+
+(defn lit-key-js [keynode where]
+  (if (and (erlang/is_map keynode) (= :lit (:op keynode)))
+    (let [v (:val keynode)]
+      (if (erlang/is_atom v)
+        (str v)
+        (throw (ex-info (str "js-actors: " where " keys must be keywords") {:key v}))))
+    (throw (ex-info (str "js-actors: " where " keys must be literal nodes") {:key keynode}))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The emitter
+;
+; `emit` answers {:lines (JS statements, in order) :val "a JS expression"}.
+; Every operand is lowered into a `const` first, so nothing is evaluated twice
+; and every suspension point becomes a statement — which is also what makes
+; `yield` legal there.
+; ─────────────────────────────────────────────────────────────────────────────
+
+(declare emit)
+(declare emit-args)
+
+(defn step-call [ctx callee args-js]
+  (if (:tail ctx)
+    {:lines (list (str "yield {__step:true, k:'tail', f: " callee ", args: " args-js "};") "return;")
+     :val nil}
+    (let [t (fresh-tmp)]
+      {:lines (list (str "const " t " = yield {__step:true, k:'call', f: " callee
+                              ", args: " args-js "};"))
+       :val t})))
+
+(defn arglist-js [vals] (str "[" (join-str vals ", ") "]"))
+
+(defn emit-args-temps
+  "Emit `nodes` and answer {:lines … :temps [t…]} — one temp per node, in order."
+  [nodes ctx]
+  (reduce (fn [acc n]
+            (let [r (emit n (assoc ctx :tail false))
+                  t (fresh-tmp)]
+              {:lines (concat (:lines acc) (:lines r)
+                              (list (str "const " t " = " (:val r) ";")))
+               :temps (conj (:temps acc) t)}))
+          {:lines (list) :temps []}
+          nodes))
+
+(defn emit-remote
+  "A `:remote` in value position. `RT/invoke` and `RT/apply_to` are the
+   dynamic-call forms: both become a call step whose callee is the EVALUATED
+   function value and whose arguments come from a BL list."
+  [node ctx]
+  (let [m (:mod node) f (:fun node) args (:args node)]
+    (if (or (and (= m mod-rt) (= f :invoke))
+            (and (= m mod-rt) (= f :apply_to)))
+      (let [fr (emit (first args) (assoc ctx :tail false))
+            lr (emit (second args) (assoc ctx :tail false))
+            ft (fresh-tmp) lt (fresh-tmp)
+            st (step-call ctx ft (str "H.listToArray(" lt ")"))]
+        {:lines (concat (:lines fr)
+                        (list (str "const " ft " = " (:val fr) ";"))
+                        (:lines lr)
+                        (list (str "const " lt " = " (:val lr) ";"))
+                        (:lines st))
+         :val (:val st)})
+      (let [ar (emit-args-temps args ctx)
+            st (step-call ctx (callee-js m f) (arglist-js (:temps ar)))]
+        {:lines (concat (:lines ar) (:lines st))
+         :val (:val st)}))))
+
+(defn emit-arith [node ctx]
+  (let [ar (emit-args-temps (:args node) ctx)
+        t (fresh-tmp)]
+    {:lines (concat (:lines ar)
+                    (list (str "const " t " = H.arith(" (js-str (str (:fun node)))
+                               ", " (nth (:temps ar) 0) ", " (nth (:temps ar) 1) ");")))
+     :val t}))
+
+(defn emit-apply [node ctx]
+  (let [fr (emit (:fn node) (assoc ctx :tail false))
+        ar (emit-args-temps (:args node) ctx)
+        ft (fresh-tmp)
+        st (step-call ctx ft (arglist-js (:temps ar)))]
+    {:lines (concat (:lines fr)
+                    (list (str "const " ft " = " (:val fr) ";"))
+                    (:lines ar)
+                    (:lines st))
+     :val (:val st)}))
+
+(defn emit-let [node ctx]
+  (let [r (emit (:init node) (assoc ctx :tail false))
+        b (emit (:body node) ctx)]
+    {:lines (concat (:lines r)
+                    (list (str "const " (jsname (:name node)) " = " (:val r) ";"))
+                    (:lines b))
+     :val (:val b)}))
+
+(defn emit-if [node ctx]
+  (let [tr (emit (:test node) (assoc ctx :tail false))
+        th (emit (:then node) ctx)
+        el (emit (:else node) ctx)
+        t (fresh-tmp) res (fresh-tmp)
+        assign (fn [r] (if (nil? (:val r)) (list) (list (str res " = " (:val r) ";"))))]
+    {:lines (concat (:lines tr)
+                    (list (str "const " t " = " (:val tr) ";"))
+                    (list (str "let " res ";"))
+                    (list (str "if (H.truthy(" t ")) {"))
+                    (:lines th) (assign th)
+                    (list "} else {")
+                    (:lines el) (assign el)
+                    (list "}"))
+     :val res}))
+
+(defn emit-do [node ctx]
+  (let [stmts (:stmts node) n (count stmts)]
+    (loop [i 0 acc {:lines (list) :val "null"}]
+      (if (>= i n)
+        acc
+        (let [r (emit (nth stmts i) ctx)]
+          (recur (inc i) {:lines (concat (:lines acc) (:lines r)) :val (:val r)}))))))
+
+(defn emit-tuple [node ctx]
+  (let [ar (emit-args-temps (:elems node) ctx)]
+    {:lines (:lines ar)
+     :val (str "H.tup(" (arglist-js (:temps ar)) ")")}))
+
+(defn emit-map [node ctx]
+  (let [pairs (:pairs node)
+        ar (reduce (fn [acc pair]
+                     (let [kr (emit (first pair) (assoc ctx :tail false))
+                           vr (emit (second pair) (assoc ctx :tail false))
+                           kt (fresh-tmp) vt (fresh-tmp)]
+                       {:lines (concat (:lines acc) (:lines kr)
+                                       (list (str "const " kt " = " (:val kr) ";"))
+                                       (:lines vr)
+                                       (list (str "const " vt " = " (:val vr) ";")))
+                        :entries (conj (:entries acc) (str "[" kt "," vt "]"))}))
+                   {:lines (list) :entries []}
+                   pairs)]
+    {:lines (:lines ar)
+     :val (str "H.bmap([" (join-str (:entries ar) ", ") "])")}))
+
+(defn emit-cons [node ctx]
+  (let [hr (emit (:head node) (assoc ctx :tail false))
+        tr (emit (:tail node) (assoc ctx :tail false))
+        ht (fresh-tmp) tt (fresh-tmp)]
+    {:lines (concat (:lines hr)
+                    (list (str "const " ht " = " (:val hr) ";"))
+                    (:lines tr)
+                    (list (str "const " tt " = " (:val tr) ";")))
+     :val (str "H.cons(" ht ", " tt ")")}))
+
+(defn emit-struct [node ctx]
+  (let [fields (:fields node)
+        ar (reduce (fn [acc pair]
+                     (let [fname (lit-key-js (first pair) "struct")
+                           vr (emit (second pair) (assoc ctx :tail false))
+                           vt (fresh-tmp)]
+                       {:lines (concat (:lines acc) (:lines vr)
+                                       (list (str "const " vt " = " (:val vr) ";")))
+                        :fields (conj (:fields acc) (str fname ": " vt))}))
+                   {:lines (list) :fields []}
+                   fields)]
+    {:lines (:lines ar)
+     :val (str "H.struct(" (js-str (str (:mod node))) ", {"
+               (join-str (:fields ar) ", ") "})")}))
+
+; ── functions ────────────────────────────────────────────────────────────────
+
+(defn emit-fn
+  "A `:fn` value: a JS expression building a `blFn` closure. All clauses of one
+   `:fn` node share a shape (arity and variadic-ness), so the arity is read off
+   the first clause — the compiler's `assemble-fn` already grouped them."
+  [node ctx]
+  (let [cls (:clauses node)
+        arity (count (:pats (first cls)))
+        res (fresh-tmp) matched (fresh-tmp)
+        binds (fn [c]
+                (let [pats (:pats c)]
+                  (apply str
+                    (map (fn [i]
+                           (str "const " (jsname (:name (nth pats i)))
+                                " = args[" i "];\n"))
+                         (range (count pats))))))
+        clause-lines (fn [c]
+                       (let [label (fresh-tmp)
+                             g (:guard c)
+                             gl (if (nil? g) {:lines (list) :val "true"}
+                                               (emit g (assoc ctx :tail false)))
+                             bl (emit (:body c) ctx)]
+                         (concat
+                           (list (str "if (!" matched ") { " label ": {"))
+                           (:lines gl)
+                           (list (str "if (H.truthy(" (:val gl) ")) {"))
+                           (:lines bl)
+                           (if (nil? (:val bl)) (list) (list (str res " = " (:val bl) ";")))
+                           (list (str matched " = true;"))
+                           (list "} } }"))))
+        body (apply str
+               (map (fn [c] (str (binds c) (apply str (clause-lines c))))
+                    cls))]
+    (str "H.blFn(\"fn\", new Map([[" arity ", function*(rt, args) {\n"
+         "let " res "; let " matched " = false;\n"
+         body
+         "if (!" matched ") throw new Error('fn: no matching clause');\n"
+         "return " res ";\n"
+         "}]]), null)")))
+
+; ── case ─────────────────────────────────────────────────────────────────────
+
+(defn emit-pattern-lines [p v label ctx]
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar)
+        (list (str "const " (jsname (:name p)) " = " v ";"))
+
+      (= op :plit)
+        (list (str "if (!H.eq(" v ", " (lit-js (:val p)) ")) break " label ";"))
+
+      (= op :pnil)
+        (list (str "if (!H.isEnil(" v ")) break " label ";"))
+
+      (= op :ptuple)
+        (let [t (fresh-tmp) n (count (:elems p))]
+          (concat
+            (list (str "const " t " = " v ";"))
+            (list (str "if (!H.isTup(" t ")) break " label ";"))
+            (list (str "if (H.tupSize(" t ") !== " n ") break " label ";"))
+            (mapcat (fn [i]
+                      (emit-pattern-lines (nth (:elems p) i) (str "H.tupEl(" t "," i ")") label ctx))
+                    (range n))))
+
+      (= op :pcons)
+        (let [t (fresh-tmp)]
+          (concat
+            (list (str "const " t " = " v ";"))
+            (list (str "if (!H.isCons(" t ")) break " label ";"))
+            (emit-pattern-lines (:head p) (str "H.consHead(" t ")") label ctx)
+            (emit-pattern-lines (:tail p) (str "H.consTail(" t ")") label ctx)))
+
+      (= op :palias)
+        (concat (emit-pattern-lines (:b p) v label ctx)
+                (emit-pattern-lines (:a p) v label ctx))
+
+      (= op :pmap)
+        (let [t (fresh-tmp)]
+          (concat
+            (list (str "const " t " = " v ";"))
+            (list (str "if (!H.isMap(" t ")) break " label ";"))
+            (mapcat (fn [pair]
+                      (let [keyjs (lit-js (:lit (first pair)))]
+                        (concat
+                          (list (str "if (!H.mapHas(" t ", " keyjs ")) break " label ";"))
+                          (emit-pattern-lines (second pair)
+                                              (str "H.mapGet(" t ", " keyjs ")") label ctx))))
+                    (:pairs p))))
+
+      (= op :pstruct)
+        (let [t (fresh-tmp)]
+          (concat
+            (list (str "const " t " = " v ";"))
+            (list (str "if (!H.isStruct(" t ") || H.structMod(" t ") !== "
+                       (js-str (str (:mod p))) ") break " label ";"))
+            (mapcat (fn [pair]
+                      (emit-pattern-lines (second pair)
+                                          (str "H.structField(" t ", " (js-str (str (first pair))) ")")
+                                          label ctx))
+                    (:fields p))))
+
+      :else
+        (throw (ex-info (str "js-actors: unknown pattern op " (pr-str op)) {:pattern p})))))
+
+(defn emit-pats-lines [pats vals label ctx]
+  (apply concat
+    (map (fn [i] (emit-pattern-lines (nth pats i) (nth vals i) label ctx))
+         (range (count pats)))))
+
+(defn emit-case [node ctx]
+  (let [sr (emit (:subj node) (assoc ctx :tail false))
+        st (fresh-tmp)
+        res (fresh-tmp) matched (fresh-tmp)
+        clauses (:clauses node)
+        clines (mapcat (fn [c]
+                         (let [label (fresh-tmp)
+                               g (:guard c)
+                               gl (if (nil? g) {:lines (list) :val "true"}
+                                                 (emit g (assoc ctx :tail false)))
+                               bl (emit (:body c) ctx)]
+                           (concat
+                             (list (str "if (!" matched ") { " label ": {"))
+                             (emit-pats-lines (:pats c) (list st) label ctx)
+                             (:lines gl)
+                             (list (str "if (H.truthy(" (:val gl) ")) {"))
+                             (:lines bl)
+                             (if (nil? (:val bl)) (list) (list (str res " = " (:val bl) ";")))
+                             (list (str matched " = true;"))
+                             (list "} } }"))))
+                       clauses)]
+    {:lines (concat (:lines sr)
+                    (list (str "const " st " = " (:val sr) ";"))
+                    (list (str "let " res "; let " matched " = false;"))
+                    clines
+                    (list (str "if (!" matched ") throw new Error('case: no matching clause');")))
+     :val res}))
+
+; ── receive ──────────────────────────────────────────────────────────────────
+
+(defn closure0
+  "A zero-arity BL closure from an ANF body node — how a receive clause body
+   and the timeout body reach the runtime. Bodies are emitted in tail position:
+   the machine replaces the closure's own frame, so a receive loop is
+   stack-safe."
+  [nm bodynode ctx]
+  (let [b (emit bodynode (assoc ctx :tail true))]
+    (str "H.blFn(" (js-str nm) ", new Map([[0, function*(rt, args) {\n"
+         (apply str (:lines b))
+         (if (nil? (:val b)) "" (str "return " (:val b) ";\n"))
+         "}]]), null)")))
+
+(defn emit-recv
+  "A `:recv`. The compiled probe — one labelled block per clause, each clause
+   body wrapped as a closure returned only on a match — is handed to the BL
+   runtime's `rt-receive`, which owns mailbox scanning, the scan cursor, wait
+   registration and the deadline. The emitter owns only suspension and the
+   dispatch of the selected body."
+  [node ctx]
+  (let [to (if (nil? (:timeout node))
+             {:lines (list) :val "null"}
+             (emit (:timeout node) (assoc ctx :tail false)))
+        after-js (if (nil? (:after node))
+                   "null"
+                   (closure0 "after" (:after node) ctx))
+        scan (fresh-tmp) sel (fresh-tmp) body (fresh-tmp)
+        vm (fresh-tmp) res (fresh-tmp) matched (fresh-tmp)
+        clauses (:clauses node)
+        clines (mapcat
+                 (fn [c]
+                   (let [label (fresh-tmp)
+                         g (:guard c)
+                         gl (if (nil? g) {:lines (list) :val "true"}
+                                           (emit g (assoc ctx :tail false)))]
+                     (concat
+                       (list (str "if (!" matched ") { " label ": {"))
+                       (emit-pats-lines (:pats c) (list vm) label ctx)
+                       (:lines gl)
+                       (list (str "if (H.truthy(" (:val gl) ")) {"))
+                       (list (str res " = H.vec([H.kw(\"match\"), "
+                                  (closure0 "recv-body" (:body c) ctx) "]);"))
+                       (list (str matched " = true;"))
+                       (list "} } }"))))
+                 clauses)
+        scan-closure (str "H.blFn(\"scan\", new Map([[1, function*(rt, args) {\n"
+                          "const " vm " = args[0];\n"
+                          "let " res " = null; let " matched " = false;\n"
+                          (apply str clines)
+                          "if (" matched ") return " res ";\n"
+                          "return H.kw(\"nomatch\");\n"
+                          "}]]), null)")
+        sel-lines (list (str "const " scan " = " scan-closure ";")
+                        (str "const " sel " = yield {__step:true, k:'call', f: H.ref(rt,\"js\",\"rt-receive\"),"
+                             " args: [" scan ", " after-js ", " (:val to) "]};")
+                        (str "const " body " = H.vecEl(" sel ", 1);"))
+        t (fresh-tmp)
+        dispatch (if (:tail ctx)
+                   (list (str "yield {__step:true, k:'tail', f: " body ", args: []};") "return;")
+                   (list (str "const " t " = yield {__step:true, k:'call', f: " body ", args: []};")))]
+    {:lines (concat (:lines to) sel-lines dispatch)
+     :val (if (:tail ctx) nil t)}))
+
+; ── the dispatcher ───────────────────────────────────────────────────────────
+
+(defn emit
+  "Emit one bl-ANF node. `ctx` carries `:tail` — whether the node's value is
+   the enclosing function's result, which is where a call becomes a tail step."
+  [node ctx]
+  (let [op (:op node)]
+    (cond
+      (= op :lit) {:lines (list) :val (lit-js (:val node))}
+      (= op :var) {:lines (list) :val (jsname (:name node))}
+      (= op :global)
+        {:lines (list)
+         :val (str "H.ref(rt," (js-str (:ns node)) "," (js-str (:name node)) ")")}
+      (= op :remote) (emit-remote node ctx)
+      (= op :arith) (emit-arith node ctx)
+      (= op :apply) (emit-apply node ctx)
+      (= op :let) (emit-let node ctx)
+      (= op :if) (emit-if node ctx)
+      (= op :do) (emit-do node ctx)
+      (= op :tuple) (emit-tuple node ctx)
+      (= op :map) (emit-map node ctx)
+      (= op :cons) (emit-cons node ctx)
+      (= op :enil) {:lines (list) :val "H.ENIL"}
+      (= op :struct) (emit-struct node ctx)
+      (= op :fn) {:lines (list) :val (emit-fn node ctx)}
+      (= op :case) (emit-case node ctx)
+      (= op :recv) (emit-recv node ctx)
+      (= op :try)
+        (throw (ex-info (str "js-actors: `:try` is not supported by the JS backend."
+                             " The machine has no exception frames, so a try spanning a"
+                             " park would lose its `finally` — refusing is the only"
+                             " semantics-preserving answer.")
+                        {:op :try}))
+      :else (throw (ex-info (str "js-actors: unknown ANF op " (pr-str op)) {:op op})))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Reference audit — the fail-closed half of the ABI
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn walk-refs [x acc]
+  (cond
+    (erlang/is_map x)
+      (let [acc2 (cond
+                   (not (contains? x :op)) acc
+                   (= (:op x) :remote) (conj acc [:remote (:mod x) (:fun x)])
+                   (= (:op x) :global) (conj acc [:global (:ns x) (:name x)])
+                   :else acc)]
+        (reduce (fn [a k] (walk-refs (get x k) a)) acc2 (maps/keys x)))
+    (erlang/is_list x) (reduce (fn [a y] (walk-refs y a)) acc x)
+    (BeamLisp.RT/vector? x) (reduce (fn [a y] (walk-refs y a)) acc (to-list x))
+    :else acc))
+
+(defn refs-of [nodes]
+  (reduce (fn [acc n] (walk-refs n acc)) [] nodes))
+
+(defn remote-ok? [m f]
+  (cond
+    (= m mod-host) (contains? host-names (str f))
+    (= m mod-erlang) (contains? erlang-names (str f))
+    ; the two dynamic-call forms are lowered by name, not through the table
+    (and (= m mod-rt) (= f :invoke)) true
+    (and (= m mod-rt) (= f :apply_to)) true
+    :else (contains? remote-map (remote-key m f))))
+
+(defn global-ok? [ns name defined]
+  (or (and (= ns "js") (or (contains? defined name) (contains? core-map name)))
+      (contains? core-map name)))
+
+(defn audit! [refs defined]
+  (let [bad (reduce
+              (fn [acc r]
+                (let [kind (nth r 0)]
+                  (cond
+                    (= kind :remote)
+                      (if (remote-ok? (nth r 1) (nth r 2))
+                        acc
+                        (conj acc (str "  unknown remote " (remote-key (nth r 1) (nth r 2))
+                                       " — not in the checked ABI")))
+                    (= kind :global)
+                      (if (global-ok? (nth r 1) (nth r 2) defined)
+                        acc
+                        (conj acc (str "  unresolved global " (nth r 1) "/" (nth r 2))))
+                    :else acc)))
+              []
+              refs)]
+    (if (empty? bad)
+      :ok
+      (throw (ex-info (str "js-actors: the program reaches outside the checked ABI:\n"
+                           (join-str (distinct bad) "\n"))
+                      {:references (distinct bad)})))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The build
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn read-file-forms [path]
+  (BeamLisp.Ns.Reader/read_all (File/read! path)))
+
+(defn compile-source
+  "Compile one source file to a vector of {:name name :node node} definitions.
+   Every top-level form must be a `defn` — this backend has no value-defs, no
+   namespace side effects and no top-level expressions, which is the honest
+   scope of the prototype."
+  [path ns]
+  (let [forms (read-file-forms path)]
+    (reduce
+      (fn [acc form]
+        (if (defn-form? form)
+          (let [node (BeamLisp.Ns.Compiler/compile
+                       (defn->fn-form form)
+                       (BeamLisp.Ns.Compiler/new_env ns))]
+            (conj acc {:name (defn-name form) :node node}))
+          (throw (ex-info (str "js-actors: " path ": every top-level form must be a defn;"
+                               " got a " (str (n-tag form)) " form")
+                          {:path path :tag (n-tag form)}))))
+      []
+      forms)))
+
+(defn emit-init
+  "The bundle's `__init` generator: one `H.def` per compiled definition. It is
+   a generator rather than straight-line code because a single-arity `fn`
+   compiles to the compiler's self-application scaffold, whose value needs the
+   machine to be applied."
+  [defs]
+  (let [lines (mapcat
+                (fn [d]
+                  (let [r (emit (:node d) {:tail false})
+                        t (fresh-tmp)]
+                    (concat (:lines r)
+                            (list (str "const " t " = " (:val r) ";"))
+                            (list (str "H.def(rt, " (js-str (str "js/" (:name d))) ", " t ");")))))
+                defs)]
+    (str "H.def(rt, \"js/__init\", H.blFn(\"__init\", new Map([[0, function*(rt, args) {\n"
+         (apply str lines)
+         "return null;\n"
+         "}]]), null));")))
+
+(defn alias-lines []
+  (concat
+    (map (fn [k] (str "H.defAlias(rt, " (js-str k) ", "
+                      (js-str (str "js/" (get remote-map k))) ");"))
+         (keys remote-map))
+    (map (fn [k] (str "H.defAlias(rt, " (js-str (str "core/" k)) ", "
+                      (js-str (str "js/" (get core-map k))) ");"))
+         (keys core-map))))
+
+(defn compile-one [src]
+  (BeamLisp.Ns.Compiler/compile (BeamLisp.Ns.Reader/read_one src)
+                                (BeamLisp.Ns.Compiler/new_env "js")))
+
+(defn compile-and-audit [src]
+  (let [node (compile-one src)]
+    (audit! (refs-of [node]) {})
+    node))
+
+(defn expect-refusal [label thunk]
+  (let [r (try (do (thunk) :no-throw) (catch e :threw))]
+    (if (= r :threw)
+      (do (println (str "NEGATIVE OK   " label)) 0)
+      (do (println (str "NEGATIVE FAIL " label " — the backend accepted it")) 1))))
+
+(defn negative-tests
+  "The other half of the ABI contract: things the backend must REFUSE, checked
+   at build time so a regression is a failed build, not a silent widening."
+  []
+  (loop [thunks (list
+                  (fn [] (compile-and-audit "(fn [] (try 1 (catch e 2)))"))
+                  (fn [] (compile-and-audit "(fn [] (File/read! \"/tmp/x\"))"))
+                  (fn [] (compile-and-audit "(fn [] (totally-unknown-name 1))"))
+                  (fn [] (audit! [[:global "js" "not-defined"]] {}))
+                  (fn [] (compile-and-audit "(fn [] (case 1 [a b] (+ a b) 0))"))
+                  (fn [] (compile-and-audit "(fn [] (erlang/no_such_bif 1 2))"))
+                  (fn [] (compile-and-audit "(fn [] (case [1 2] [a b] (+ a b) :no))")))
+         labels (list
+                  "`:try` is refused (no exception frames across a park)"
+                  "an unknown remote module is refused"
+                  "an unresolved global is refused"
+                  "a hand-built unresolved global ref is refused"
+                  "an unresolved global nested in a value is refused"
+                  "an unknown erlang bif is refused"
+                  "the earlier missed shape (vector subject, vector binder pattern) is refused")
+         fails 0]
+    (if (empty? thunks)
+      fails
+      (recur (rest thunks) (rest labels)
+             (+ fails (expect-refusal (first labels) (first thunks)))))))
+
+(defn readable? [path]
+  (try (do (File/read! path) true) (catch e false)))
+
+(defn resolve-dir
+  "Find the directory holding runtime.bl. The documented invocation runs from
+   the worktree root (`bl run research/js-actors/compiler.bl`), but running
+   from inside the prototype directory is just as reasonable — so try the
+   argument, then the root-relative default, then the current directory, and
+   report the argument unchanged if none of them hold the sources."
+  [dir]
+  (loop [cs (list dir "research/js-actors" ".")]
+    (if (empty? cs)
+      dir
+      (if (readable? (str (first cs) "/runtime.bl"))
+        (first cs)
+        (recur (rest cs))))))
+
+(defn build [dir]
+  (let [out-dir (str dir "/out")
+        sources [(str dir "/runtime.bl") (str dir "/test.bl")]
+        defs (reduce (fn [acc p] (concat acc (compile-source p "js"))) [] sources)
+        defined (reduce (fn [m d] (assoc m (:name d) true)) {} defs)
+        refs (refs-of (map (fn [d] (:node d)) defs))
+        _ (audit! refs defined)
+        nrem (count (filter (fn [r] (= (nth r 0) :remote)) refs))
+        nglob (count (filter (fn [r] (= (nth r 0) :global)) refs))
+        _ (println (str "DEBUG globals: " (pr-str (distinct (map (fn [r] (nth r 2))
+                                                               (filter (fn [r] (= (nth r 0) :global)) refs))))))
+        js (str "// GENERATED by research/js-actors/compiler.bl — do not edit.\n"
+                "// Sources: " (join-str sources " ") "\n"
+                "import * as H from \"../host.mjs\";\n\n"
+                "const rt = H.newRuntime();\n\n"
+                (emit-init defs) "\n"
+                "await H.init(rt);\n\n"
+                (apply str (map (fn [l] (str l "\n")) (alias-lines)))
+                "\nH.def(rt, \"js/entry\", H.ref(rt, \"js\", \"main\"));\n"
+                "await H.boot(rt);\n")]
+    (File/mkdir_p out-dir)
+    (File/write (str out-dir "/bundle.mjs") js)
+    (println (str "js-actors: compiled " (count defs) " definitions from "
+                  (count sources) " sources -> " out-dir "/bundle.mjs"))
+    (println (str "js-actors: " (count refs) " host references audited ("
+                  nrem " remote, " nglob " global) against the allowlist")))
+  (let [fails (negative-tests)]
+    (if (zero? fails)
+      0
+      1)))
+
+(defn main [argv]
+  (let [dir (if (empty? argv) "research/js-actors" (first argv))]
+    (let [code (build (resolve-dir dir))]
+      (if (zero? code) code 1))))
+
+(main (BeamLisp/argv))

@@ -1,0 +1,359 @@
+; runtime.bl — the actor runtime, written in beam-lisp.
+;
+; Compiled by research/js-actors/compiler.bl with the SAME ANF→JS backend that
+; compiles application code. Nothing in this file is JavaScript; the only
+; JavaScript it reaches is the host's leaf operations (`host/…`) and the
+; scheduler bridge (`host/run-turn`, `host/park`, `host/wait-until`,
+; `host/now`, `host/state`).
+;
+; Two layers live here.
+;
+;   1. THE PRELUDE. Beam-lisp semantics above the host's leaves: list and
+;      vector walking, map access, equality, string building, keyword/name.
+;      Every `rt-*`/`core-*` name below is defined over `host/…` leaves only,
+;      so the prelude is the bottom of the bootstrap. compiler.bl maps the
+;      core names the compiler links (Elixir.BeamLisp.RT/first,
+;      Elixir.BeamLisp.Ns.Core/inc, …) onto these functions.
+;
+;   2. THE ACTOR RUNTIME. Process registry, runnable queue, mailbox, receive
+;      selection with a scan cursor and a monotonic deadline, timeout wait
+;      registration and wakeups, and the scheduler. All of it is BL data and
+;      BL control flow.
+;
+; The host owns exactly one piece of retained state used here — the mutable
+; root `rt.state` (a BL map threaded through `host/state` / `host/set-state`),
+; which is what lets a running process see the scheduler's registry.
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 1. Prelude — semantics over host leaves
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn rt-eqv [a b] (host/eq a b))
+(defn rt-identical? [a b] (host/identical a b))
+(defn rt-hash-key [x] x)
+
+(defn rt-first [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) (host/cons-head xs)
+    (host/is-vec xs) (if (host/lt 0 (host/vec-size xs)) (host/vec-el xs 0) nil)
+    :else (host/raise (host/str-cat "first: not a sequence: " xs))))
+
+(defn rt-rest [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) (host/empty-list)
+    (host/is-cons xs) (host/cons-tail xs)
+    :else (host/raise (host/str-cat "rest: not a sequence: " xs))))
+
+(defn rt-nth [xs i]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) (if (host/eq i 0)
+                        (host/cons-head xs)
+                        (rt-nth (host/cons-tail xs) (host/arith "sub" i 1)))
+    (host/is-vec xs) (host/vec-el xs i)
+    :else (host/raise (host/str-cat "nth: not a sequence: " xs))))
+
+(defn rt-count [xs]
+  (cond
+    (host/is-nil xs) 0
+    (host/is-enil xs) 0
+    (host/is-cons xs) (host/arith "add" 1 (rt-count (host/cons-tail xs)))
+    (host/is-vec xs) (host/vec-size xs)
+    (host/is-str xs) (host/str-size xs)
+    (host/is-map xs) (host/map-size xs)
+    :else 0))
+
+(defn rt-cons [h t] (host/cons h t))
+
+(defn rt-conj [coll x]
+  (cond
+    (host/is-vec coll) (host/vec-append coll x)
+    (host/is-nil coll) (host/cons x (host/empty-list))
+    (host/is-enil coll) (host/cons x (host/empty-list))
+    (host/is-cons coll) (host/cons x coll)
+    :else (host/raise "conj: unsupported collection")))
+
+(defn rt-get [m k]
+  (cond
+    (host/is-nil m) nil
+    (host/is-vec m) (host/vec-el m k)
+    :else (host/map-get m k)))
+
+(defn rt-assoc [m k v] (host/map-put m k v))
+
+(defn rt-empty? [xs]
+  (cond
+    (host/is-nil xs) true
+    (host/is-enil xs) true
+    (host/is-cons xs) false
+    (host/is-vec xs) (host/eq 0 (host/vec-size xs))
+    (host/is-str xs) (host/eq 0 (host/str-size xs))
+    :else false))
+
+(defn rt-seq [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) xs
+    (host/is-vec xs) (if (host/eq 0 (host/vec-size xs)) nil (host/vec-to-list xs))
+    :else nil))
+
+(defn rt-next [xs] (rt-seq (rt-rest xs)))
+(defn rt-to-list [xs] (rt-seq xs))
+(defn rt-print-str [x] (host/to-str x))
+(defn rt-join-str [xs acc]
+  (if (host/is-enil xs)
+    acc
+    (rt-join-str (host/cons-tail xs)
+                 (host/str-cat acc (host/to-str (host/cons-head xs))))))
+
+; core/* — the unlinked core names an ordinary program reaches by name. The
+; compiler resolves those to `Env.fetch!("core", …)`, which the emitter mirrors
+; by falling back from the source namespace to `core` at registry lookup.
+
+(defn core-list [xs] xs)
+(defn core-not [x] (if (host/truthy x) false true))
+(defn core-nil? [x] (host/is-nil x))
+(defn core-some? [x] (if (host/is-nil x) false true))
+(defn core-not= [a b] (if (host/eq a b) false true))
+(defn core-inc [x] (host/arith "add" x 1))
+(defn core-dec [x] (host/arith "sub" x 1))
+(defn core-keyword [x]
+  (cond
+    (host/is-kw x) x
+    (host/is-str x) (host/kw x)
+    :else (host/kw (host/to-str x))))
+(defn core-name [x] (if (host/is-kw x) (host/kw-name x) (host/to-str x)))
+(defn core-str [& xs] (rt-join-str xs ""))
+(defn core-print [x] (do (host/write (host/to-str x)) nil))
+(defn core-println [x] (do (host/write (host/to-str x)) nil))
+(defn core-vector [& xs] (host/vec-from-list xs))
+(defn core-hash-map [k v more]
+  (let [m (host/map-put (host/empty-map) k v)]
+    (rt-hash-map-more more m)))
+(defn rt-hash-map-more [more m]
+  (if (host/is-enil more)
+    m
+    (rt-hash-map-more (host/cons-tail (host/cons-tail more))
+                      (host/map-put m (host/cons-head more) (rt-first (host/cons-tail more))))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 2. Actor runtime
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; The scheduler's whole world is one BL map living in the host's one mutable
+; root:
+;
+;   {:next-pid  n
+;    :procs     {pid -> proc}
+;    :runnable  (pid …)}
+;
+; A proc is {:pid n :frames <host frame stack> :mailbox [msg …]
+;            :status :runnable|:running|:waiting :wait nil|<deadline-ms>}
+;
+; The frame stack is the only host-shaped value in a proc: it is the machine's
+; suspended generator stack, handed back by `host/run-turn` and stored as an
+; opaque value, exactly as the design's "one retained mutable root" allows.
+
+(defn rt-empty-state []
+  (assoc (assoc (assoc (host/empty-map) :next-pid 0)
+                :procs (host/empty-map))
+         :runnable (host/empty-list)))
+
+(defn rt-proc-of [st pid] (get (:procs st) pid))
+(defn rt-put-proc [st pid proc] (assoc st :procs (assoc (:procs st) pid proc)))
+(defn rt-drop-proc [st pid] (assoc st :procs (host/map-remove (:procs st) pid)))
+
+(defn rt-set-proc-field [pid k v]
+  (let [st (host/state)]
+    (host/set-state (rt-put-proc st pid (assoc (rt-proc-of st pid) k v)))))
+
+(defn rt-requeue! [pid]
+  (let [st (host/state)
+        proc (rt-proc-of st pid)]
+    (if (nil? proc)
+      nil
+      (if (host/eq (:status proc) :runnable)
+        nil
+        (do
+          (host/set-state (assoc (rt-put-proc st pid (assoc proc :status :runnable))
+                                 :runnable (conj (:runnable st) pid)))
+          nil)))))
+
+(defn rt-spawn
+  "Start `f` with `args` as a new process; answer its pid. The new proc is
+   runnable immediately: its frame stack is built by the host machine."
+  [f args]
+  (let [st (host/state)
+        pid (:next-pid st)
+        proc (assoc (assoc (assoc (assoc (host/empty-map) :pid pid)
+                                  :frames (host/make-frames f args))
+                           :mailbox [])
+                    :status :runnable)
+        proc2 (assoc proc :wait nil)]
+    (do
+      (host/set-state (assoc (assoc (rt-put-proc st pid proc2)
+                                    :next-pid (host/arith "add" pid 1))
+                             :runnable (conj (:runnable st) pid)))
+      pid)))
+
+(defn rt-self [] (host/self))
+
+(defn rt-send
+  "Queue `msg` on `to`'s mailbox; if `to` is parked in a receive, wake it so it
+   can rescan. Answers the message."
+  [to msg]
+  (let [st (host/state)
+        proc (rt-proc-of st to)]
+    (if (nil? proc)
+      (do (host/write (host/str-cat "send: no such process " to)) nil)
+      (do
+        (host/set-state (rt-put-proc st to (assoc proc :mailbox (conj (:mailbox proc) msg))))
+        (if (host/eq (:status proc) :waiting)
+          (rt-requeue! to)
+          nil)
+        msg))))
+
+(defn rt-drop-mailbox-msg
+  "Remove the message at index `i` from `pid`'s mailbox. Removing BEFORE the
+   selected body runs is what makes the next receive start where the mailbox
+   actually is: skipped messages stay, the consumed one is gone."
+  [pid i]
+  (let [st (host/state)
+        proc (rt-proc-of st pid)]
+    (host/set-state (rt-put-proc st pid
+                                 (assoc proc :mailbox (host/vec-remove (:mailbox proc) i))))))
+
+(defn rt-receive
+  "The one suspension point of a receive.
+   `scan` is a compiler-generated probe: (fn [msg] -> :nomatch | [:match body-fn]).
+   `after-fn` is the timeout continuation, `timeout-ms` a number or nil.
+
+   Selection is message-major (each message is offered to every clause in
+   source order, inside the probe) and the scan cursor `i` is retained across
+   parks, so skipped messages keep their order and are never rescanned. The
+   deadline is computed once, before the first scan, so continuing arrivals
+   cannot extend a timed wait.
+
+   The scan is always completed over what is already queued BEFORE parking, so
+   `after 0` still selects an already-queued message; the park that follows is
+   the scheduling boundary the design calls for."
+  [scan after-fn timeout-ms]
+  (let [pid (host/self)
+        dl (if (host/is-nil timeout-ms) nil (host/arith "add" (host/now) timeout-ms))]
+    (loop [i 0]
+      (let [mb (:mailbox (rt-proc-of (host/state) pid))
+            n (count mb)]
+        (if (host/lt i n)
+          (let [r (scan (nth mb i))]
+            (if (host/eq r :nomatch)
+              (recur (host/arith "add" i 1))
+              (do (rt-drop-mailbox-msg pid i) r)))
+          (do
+            (rt-set-proc-field pid :wait dl)
+            (rt-set-proc-field pid :status :waiting)
+            (host/park)
+            (rt-set-proc-field pid :wait nil)
+            (rt-set-proc-field pid :status :running)
+            (if (and (some? dl) (not (host/lt (host/now) dl)))
+              [:timeout after-fn]
+              (recur i))))))))
+
+(defn rt-min-deadline [procs]
+  (rt-min-deadline-1 (host/map-keys procs) procs nil))
+
+(defn rt-min-deadline-1 [keys procs best]
+  (if (host/is-enil keys)
+    best
+    (let [w (:wait (get procs (first keys)))
+          nxt (if (host/is-nil w)
+                best
+                (if (host/is-nil best) w (if (host/lt w best) w best)))]
+      (rt-min-deadline-1 (rest keys) procs nxt))))
+
+(defn rt-wake-expired [keys procs now]
+  (if (host/is-enil keys)
+    nil
+    (let [pid (first keys)
+          w (:wait (get procs pid))]
+      (do
+        (if (and (not (host/is-nil w)) (not (host/lt now w)))
+          (rt-requeue! pid)
+          nil)
+        (rt-wake-expired (rest keys) procs now)))))
+
+(defn rt-run-pid
+  "Run one bounded turn of `pid`. A parked turn leaves the proc waiting with
+   its frame stack intact; a yielded turn requeues it; a finished or failed
+   turn drops it."
+  [pid]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (if (nil? proc)
+      :gone
+      (let [r (host/run-turn (:frames proc) 200)
+            status (:status r)]
+        (do
+          (cond
+            (host/eq status :done)
+              (host/set-state (rt-drop-proc (host/state) pid))
+            (host/eq status :error)
+              (do
+                (host/write (host/str-cat (host/str-cat "process " pid)
+                                          (host/str-cat " failed: " (:message r))))
+                (host/set-state (rt-drop-proc (host/state) pid)))
+            (host/eq status :yield)
+              (rt-requeue! pid)
+            :else nil)
+          :done)))))
+
+(defn rt-run-head []
+  (let [st (host/state)
+        runq (:runnable st)]
+    (if (host/is-enil runq)
+      :empty
+      (let [pid (first runq)]
+        (do
+          (host/set-state (assoc st :runnable (rest runq)))
+          (rt-set-proc-field pid :status :running)
+          (host/set-self pid)
+          (rt-run-pid pid))))))
+
+(defn rt-clamp [ms] (if (host/lt ms 0) 0 ms))
+
+(defn rt-sched-loop
+  "One scheduler step per iteration, in tail position, so the scheduler itself
+   is stack-safe. Decides between running a runnable process, sleeping to the
+   earliest deadline, and stopping."
+  []
+  (let [st (host/state)
+        procs (:procs st)]
+    (if (host/eq 0 (host/map-size procs))
+      :done
+      (if (host/is-enil (:runnable st))
+        (let [dl (rt-min-deadline procs)]
+          (if (host/is-nil dl)
+            (do
+              (host/write (host/str-cat (host/str-cat "scheduler: " (host/map-size procs))
+                                        " process(es) blocked with no deadline"))
+              :done)
+            (do
+              (host/wait-until (rt-clamp (host/arith "sub" dl (host/now))))
+              (rt-wake-expired (host/map-keys procs) procs (host/now))
+              (rt-sched-loop))))
+        (do
+          (rt-run-head)
+          (rt-sched-loop))))))
+
+(defn bl-main
+  "The JS driver's entry. `entry` is the application's main fn, bound by the
+   emitted bundle (`js/entry`)."
+  [entry]
+  (do
+    (host/set-state (rt-empty-state))
+    (rt-spawn entry [])
+    (host/set-self nil)
+    (rt-sched-loop)))
