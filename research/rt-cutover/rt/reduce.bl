@@ -1,0 +1,199 @@
+; rt/reduce.bl — one traversal protocol, selected once per collection.
+;
+; `k-reduce` asks `rt.kind/kind` ONE time, then walks the representation it
+; found directly:
+;
+;   list   → the cons spine (hd/tl), no length call, no copy
+;   vector → the small tuple, or the trie's leaves then its tail buffer, in
+;            order — NEVER `BeamLisp.Vector/to_list`
+;   lazy   → the memo cell contract: force the next cell only when an element
+;            is actually consumed; a `reduced` step stops before the next force
+;   map    → `maps:iterator`/`maps:next`, no entry list materialized
+;   other  → the generic seq protocol (`rt.seq`) for sets, sorted collections,
+;            records, tuples and text
+;
+; EARLY TERMINATION. The step function may return `(BeamLisp.RT/reduced v)` (or
+; a bare `%BeamLisp.Reduced{}`); the fold returns `v` unwrapped at that point
+; and performs NO further callback and NO further lazy force. This mirrors
+; `BeamLisp.RT/reduce`, which peels the sentinel at the halting point.
+;
+; CALLBACKS. A raw Erlang fun of arity 2 — which is what a single-clause BL
+; `(fn [acc x] …)` compiles to — is applied with `erlang:apply/2`, no runtime
+; hop. Anything else callable (a BL `$blfn` multi-arity/variadic fn, a keyword,
+; a map, a vector) is dispatched through `BeamLisp.RT.invoke/2`. That fallback
+; is reached through a COMPUTED module atom, so it adds no static import to
+; this module — but it IS a runtime dependency on RT and is recorded here
+; deliberately: the fast path has no RT edge, the general path does.
+;
+; The vector walk mirrors `lib/beam_lisp/vector.ex`: a small vector stores its
+; elements directly as the `items` tuple; a trie stores `{bl_vec, cnt, shift,
+; root, tail}` and `leaves_to_list(root, div(shift,5))` is the ordered leaf
+; sequence, with `tail` appended last. We fold the same sequence without
+; building it.
+
+(ns rt.reduce
+  (:require [rt.kind :as k]
+            [rt.seq :as s]
+            [rt.raw :as raw]))
+
+(def ^:private EMPTY (raw/empty-list))
+(def ^:private TRIE-TAG :bl_vec)
+(def ^:private REDUCED-MOD (erlang/binary_to_atom "Elixir.BeamLisp.Reduced" :utf8))
+(def ^:private RT-MOD (erlang/binary_to_atom "Elixir.BeamLisp.RT" :utf8))
+
+;; ── small list constructors (raw intrinsics) ───────────────────────────────
+(defn- one [x] (raw/cons x EMPTY))
+(defn- two [a b] (raw/cons a (raw/cons b EMPTY)))
+
+;; ── the reduced sentinel ───────────────────────────────────────────────────
+(defn- reduced?
+  "The descriptor-generated sentinel match avoids a global var lookup per step."
+  [x]
+  (Krt.Specialized/reduced? x))
+
+(defn- unwrap [x] (erlang/map_get :value x))
+
+;; ── the step callback ──────────────────────────────────────────────────────
+(defn- step
+  "Apply `f` to `(acc, x)`. Fast path: a raw 2-arity fun. Fallback: the
+   runtime's call-shape dispatcher, for BL multi-arity fns and other callables."
+  [f acc x]
+  (cond
+    (erlang/is_function f 2) (f acc x)
+    :else (erlang/apply RT-MOD :invoke (two f (two acc x)))))
+
+;; ── representation-directed walks ──────────────────────────────────────────
+(declare reduce-lazy)
+
+(defn- reduce-list [f acc xs]
+  (loop [acc acc ys xs]
+    (cond
+      (not (erlang/is_list ys))
+      (cond (erlang/== (k/kind ys) :lazy) (reduce-lazy f acc ys) :else acc)
+      (erlang/== ys EMPTY) acc
+      :else
+      (let [acc2 (step f acc (erlang/hd ys))]
+        (cond
+          (reduced? acc2) acc2
+          :else (recur acc2 (erlang/tl ys)))))))
+
+(defn- reduce-lazy [f acc l]
+  (loop [acc acc cell (BeamLisp.LazySeq/cell l)]
+    (cond
+      (erlang/== cell nil) acc
+      :else
+      (let [acc2 (step f acc (erlang/hd cell))]
+        (cond
+          (reduced? acc2) acc2
+          :else (recur acc2 (BeamLisp.LazySeq/cell (erlang/tl cell))))))))
+
+(defn- reduce-tuple-elems
+  "Fold every element of a dense tuple (a small vector's `items`, or a trie
+   leaf)."
+  [f acc t]
+  (let [n (erlang/tuple_size t)]
+    (loop [i 0 acc acc]
+      (cond
+        (erlang/>= i n) acc
+        :else
+        (let [acc2 (step f acc (erlang/element (erlang/+ i 1) t))]
+          (cond
+            (reduced? acc2) acc2
+            :else (recur (erlang/+ i 1) acc2)))))))
+
+(defn- trie-items?
+  "The trie tag test from `vector.ex`: a 5-tuple tagged `:bl_vec` with a count
+   above the small-vector bound. A small vector's `items` tuple never has this
+   shape for a value a caller could not already confuse in the runtime."
+  [items]
+  (cond
+    (erlang/is_tuple items)
+    (cond
+      (erlang/== 5 (erlang/tuple_size items))
+      (cond
+        (erlang/== (erlang/element 1 items) TRIE-TAG)
+        (cond
+          (erlang/is_integer (erlang/element 2 items))
+          (erlang/> (erlang/element 2 items) 32)
+          :else false)
+        :else false)
+      :else false)
+    :else false))
+
+(defn- reduce-trie-node
+  "Fold the leaves under `node`, in order. `depth` counts node levels from the
+   root to a leaf (`div(shift,5)`), matching `vector.ex:leaves_to_list`."
+  [f acc node depth]
+  (cond
+    (erlang/== depth 0) (reduce-tuple-elems f acc node)
+    :else
+    (let [n (erlang/tuple_size node)]
+      (loop [i 0 acc acc]
+        (cond
+          (erlang/>= i n) acc
+          :else
+          (let [child (erlang/element (erlang/+ i 1) node)]
+            (cond
+              (erlang/== child nil) (recur (erlang/+ i 1) acc)
+              :else
+              (let [acc2 (reduce-trie-node f acc child (erlang/- depth 1))]
+                (cond
+                  (reduced? acc2) acc2
+                  :else (recur (erlang/+ i 1) acc2))))))))))
+
+(defn- reduce-vector [f acc v]
+  (let [items (erlang/map_get :items v)]
+    (cond
+      (trie-items? items)
+      (let [shift (erlang/element 3 items)
+            root (erlang/element 4 items)
+            tail (erlang/element 5 items)
+            acc1 (reduce-trie-node f acc root (erlang/div shift 5))]
+        (cond
+          (reduced? acc1) acc1
+          :else (reduce-tuple-elems f acc1 tail)))
+      :else (reduce-tuple-elems f acc items))))
+
+(defn- reduce-map
+  "Iterate a plain map directly. Entries are the same `[k v]` vectors the seq
+   protocol yields (`rt.seq/entry`), so `k-reduce` and `k-seq` agree."
+  [f acc m]
+  (loop [iter (erlang/apply :maps :iterator (one m)) acc acc]
+    (let [nx (erlang/apply :maps :next (one iter))]
+      (cond
+        (erlang/== nx :none) acc
+        :else
+        (let [acc2 (step f acc (s/entry (erlang/element 1 nx) (erlang/element 2 nx)))]
+          (cond
+            (reduced? acc2) acc2
+            :else (recur (erlang/element 3 nx) acc2)))))))
+
+(defn- reduce-seq [f acc coll]
+  (loop [acc acc ys (s/k-seq coll)]
+    (cond
+      (erlang/== ys nil) acc
+      :else
+      (let [acc2 (step f acc (s/k-first ys))]
+        (cond
+          (reduced? acc2) acc2
+          :else (recur acc2 (s/k-next ys)))))))
+
+;; ── the one entry point ────────────────────────────────────────────────────
+(defn k-reduce
+  "`(reduce f init coll)`: fold `f` as `(f acc x)` over `coll`, returning the
+   accumulator. Dispatch happens once, on the collection's kind; the walk is
+   then representation-directed. A step returning a `Reduced` stops the fold
+   immediately — no further callback, no further lazy force — and its value is
+   returned unwrapped."
+  [f init coll]
+  (let [kd (k/kind coll)
+        out (cond
+              (erlang/== kd :list) (reduce-list f init coll)
+              (erlang/== kd :vector) (reduce-vector f init coll)
+              (erlang/== kd :lazy) (reduce-lazy f init coll)
+              (erlang/== kd :map) (reduce-map f init coll)
+              (erlang/== kd :nil) init
+              :else (reduce-seq f init coll))]
+    (cond
+      (reduced? out) (unwrap out)
+      :else out)))

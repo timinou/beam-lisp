@@ -1,0 +1,257 @@
+; rt/eq.bl — equality and ordering, from ONE comparison.
+;
+; The claim this file makes: if `=` is defined as `(compare a b) == 0` and
+; `compare` is one function over one classifier, then "= and compare disagree"
+; stops being a bug you can have. It becomes a property of the code.
+;
+; The current runtime has two independent implementations. `RT.eqv/2` is a
+; `cond` over type predicates; `RT.compare/2` is a `rank/1` table plus
+; `cmp_same/2` plus Erlang's own term order. BUG-018 was found because the two
+; disagreed about tuples; BUG-019 is the same defect one type family up.
+;
+; POLICY. Comparison is by SEMANTIC FAMILY, not by kind (`rt.kind/family`).
+; This prototype deliberately chooses a NEW policy (NATIVE-PLAN §3-4), not the
+; production compatibility policy:
+;
+;   * `:sequential` — list, vector and lazy seq are ONE value family. Two of
+;     them are equal when their elements are equal, element by element, stopping
+;     at the first difference. A lazy seq is realised only as far as the walk
+;     reaches; it is never eagerly realised. Equal INFINITE sequences do not
+;     terminate, which is the honest cost of streaming equality.
+;   * `:number` — int, float and decimal are one numeric family, compared on
+;     their EXACT rational value (`rt.number/ratio`): a float by its IEEE value
+;     (`Float.ratio/1`), a decimal by unscaled/10^scale, an int as n/1. The
+;     comparison is cross-multiplication, exact for arbitrary precision
+;     integers. `Num.cmp/2` is NOT consulted and the shortest decimal that
+;     round-trips (`Decimal.from_float`) is NOT used: `0.1` and `0.1M` are
+;     different numbers, the honest reading and the only one transitive beside a
+;     large float integer.
+;   * `:set` — set and sorted-set are equal when they hold the same elements;
+;     `:map` — map and sorted-map when they hold the same entries. Sortedness is
+;     a storage property, not part of a value's identity.
+;   * `:record` — a record equals only a record of the SAME type with equal
+;     fields (Clojure's rule); a record is not a plain map. The fields are ALL
+;     the map's keys except `__struct__`, so a key assoc'd onto the record after
+;     construction is part of its value — `Record.fields_of` alone would
+;     silently drop it.
+;   * `:tuple` — data tuples compare by ARITY first, then element-wise, matching
+;     Erlang and the datom codec (BUG-005). A tuple is not a vector.
+;   * metadata is ignored wherever it can ride: a vector's `:meta` never reaches
+;     the walk, and a `{:meta form m}` reader wrapper compares as its `form`
+;     (recursively), so a wrapper and the bare value it wraps are ONE value.
+;   * identities (`fn`/`blfn`/`remote`/`pid`/`port`/`ref`/`reduced`) and opaque
+;     values (`macro`/`protocol`/`transient`/`deftype`/`reify`/unknown structs)
+;     have no value order, so they fall back to Erlang's TOTAL term order — never
+;     a silent 0, which is what BUG-018 was. Two distinct functions now compare
+;     -1 and 1 in the two directions, not 1 and 1.
+;
+; Construction uses `rt.raw` (raw cons/tuple) and BIFs only; the file
+; imports no BeamLisp.RT.
+
+(ns rt.eq
+  (:require [rt.kind :as k]
+            [rt.seq :as s]
+            [rt.number :as n]
+            [rt.raw :as raw]))
+
+(declare k-compare)
+
+;; ── shared constants and helpers ───────────────────────────────────────────
+; `[]`, built once. A proper list walk ends here, and comparing against this is
+; O(1) — where `(length xs)` in the loop condition would make every walk
+; quadratic on exactly the vector sizes P0 asks about.
+(def EMPTY (erlang/tl (raw/cons nil (raw/empty-list))))
+
+(defn- erlang-order [a b]
+  (cond
+    (erlang/== a b) 0
+    (erlang/< a b) -1
+    :else 1))
+
+;; ── numbers ────────────────────────────────────────────────────────────────
+; All three numeric kinds project to ONE exact rational (`rt.number/ratio`) and
+; compare by cross-multiplication, so an int, a float and a decimal share one
+; order — including at the 2^53 boundary, where the float's rounding and the
+; integer part company. See rt.number for the projection and the proof.
+(defn- num-cmp [a b] (n/num-cmp a b))
+
+;; ── sequences ──────────────────────────────────────────────────────────────
+; `finite-list` materialises a finite sequence ONCE. It is only used when
+; neither operand is lazy (or after a lazy walk has already excluded that), so
+; this is not an eager realisation of a lazy value — those go through walk-cmp.
+(defn- finite-list [x]
+  (let [kd (k/kind x)]
+    (cond
+      (erlang/== kd :list) x
+      (erlang/== kd :vector) (BeamLisp.Vector/to_list x)
+      (erlang/== kd :tuple) (erlang/tuple_to_list x)
+      :else (s/k-to-list x))))
+
+; A proper list ends at EMPTY. `is_list/1` is true for improper lists too, so
+; this also separates `[1 2 | lazy]` (which walk-cmp must handle) from data.
+(defn- proper? [xs]
+  (cond
+    (erlang/== xs EMPTY) true
+    (erlang/is_list xs) (proper? (erlang/tl xs))
+    :else false))
+
+(defn- list-cmp [xs ys]
+  (cond
+    (erlang/== xs EMPTY) (cond (erlang/== ys EMPTY) 0 :else -1)
+    (erlang/== ys EMPTY) 1
+    :else (let [c (k-compare (erlang/hd xs) (erlang/hd ys))]
+            (cond (erlang/== c 0) (recur (erlang/tl xs) (erlang/tl ys))
+                  :else c))))
+
+; The lazy walk: realise one cell at a time, stop at the first difference.
+(defn- walk-cmp [a b]
+  (loop [xs (s/k-seq a) ys (s/k-seq b)]
+    (cond
+      (erlang/== xs nil) (cond (erlang/== ys nil) 0 :else -1)
+      (erlang/== ys nil) 1
+      :else (let [c (k-compare (s/k-first xs) (s/k-first ys))]
+              (cond (erlang/== c 0) (recur (s/k-next xs) (s/k-next ys))
+                    :else c)))))
+
+(defn- seq-cmp [a b]
+  (cond
+    (erlang/== (k/kind a) :lazy) (walk-cmp a b)
+    (erlang/== (k/kind b) :lazy) (walk-cmp a b)
+    :else (let [la (finite-list a) lb (finite-list b)]
+            (cond
+              (proper? la) (cond (proper? lb) (list-cmp la lb)
+                                 :else (walk-cmp a b))
+              :else (walk-cmp a b)))))
+
+;; ── unordered collections ──────────────────────────────────────────────────
+; Insertion sort. O(n^2) on the collection size; enough for the finite
+; collections this prototype compares, and it compares WHOLE elements, which the
+; first prototype did not: keying on `(first entry)` made every scalar element's
+; key `nil`, so a set was never actually ordered and could not equal its sorted
+; sibling. Sorting both operands by the same total order makes unordered
+; equality order-insensitive.
+(defn- insert-entry [sorted e]
+  (cond
+    (erlang/== sorted EMPTY) (s/k-cons e (s/k-empty-list))
+    :else (let [h (erlang/hd sorted)]
+            (cond
+              (erlang/< 0 (k-compare h e)) (s/k-cons e sorted)
+              :else (s/k-cons h (insert-entry (erlang/tl sorted) e))))))
+
+(defn- sort-elems [es]
+  (loop [acc (s/k-empty-list) rest es]
+    (cond
+      (erlang/== rest EMPTY) acc
+      :else (recur (insert-entry acc (erlang/hd rest)) (erlang/tl rest)))))
+
+(defn- coll-cmp [a b]
+  (let [ca (s/k-count a) cb (s/k-count b)]
+    (cond
+      (erlang/== ca cb) (seq-cmp (sort-elems (s/k-to-list a)) (sort-elems (s/k-to-list b)))
+      (erlang/< ca cb) -1
+      :else 1)))
+
+;; ── records ────────────────────────────────────────────────────────────────
+; A record's identity includes its type. Two records of different types are
+; never equal even with identical fields; a record is never equal to a plain map
+; (which `:map` handles alone). The fields are every map key except `__struct__`
+; — NOT `Record.fields_of`, which names only the declared fields and would let a
+; key assoc'd after construction ride invisibly.
+(defn- record-fields [r]
+  (loop [acc (s/k-empty-list)
+         ps (erlang/apply :maps :to_list (raw/cons r (raw/empty-list)))]
+    (cond
+      (erlang/== ps EMPTY) acc
+      :else
+      (let [pr (erlang/hd ps)
+            f (erlang/element 1 pr)]
+        (cond
+          (erlang/== f :__struct__) (recur acc (erlang/tl ps))
+          :else (recur (s/k-cons (s/entry f (erlang/element 2 pr)) acc)
+                       (erlang/tl ps)))))))
+
+(defn- record-cmp [a b]
+  (let [ma (erlang/map_get :__struct__ a) mb (erlang/map_get :__struct__ b)]
+    (cond
+      (erlang/== ma mb) (seq-cmp (sort-elems (record-fields a)) (sort-elems (record-fields b)))
+      :else (erlang-order ma mb))))
+
+;; ── tuples ─────────────────────────────────────────────────────────────────
+; Arity first, then element-wise — Erlang's rule and the datom codec's.
+(defn- tuple-cmp [a b]
+  (let [sa (erlang/tuple_size a) sb (erlang/tuple_size b)]
+    (cond
+      (erlang/< sa sb) -1
+      (erlang/> sa sb) 1
+      :else (seq-cmp a b))))
+
+;; ── family dispatch ────────────────────────────────────────────────────────
+(defn- same-family [fam a b]
+  (cond
+    (erlang/== fam :nil) 0
+    (erlang/== fam :bool) (cond (erlang/== a b) 0 (erlang/== a true) 1 :else -1)
+    (erlang/== fam :number) (num-cmp a b)
+    (erlang/== fam :text) (erlang-order a b)
+    (erlang/== fam :atom) (erlang-order a b)
+    (erlang/== fam :symbol) (erlang-order (erlang/element 2 a) (erlang/element 2 b))
+    (erlang/== fam :sequential) (seq-cmp a b)
+    (erlang/== fam :set) (coll-cmp a b)
+    (erlang/== fam :map) (coll-cmp a b)
+    (erlang/== fam :record) (record-cmp a b)
+    (erlang/== fam :tuple) (tuple-cmp a b)
+    (erlang/== fam :meta) (k-compare (erlang/element 2 a) (erlang/element 2 b))
+    :else (erlang-order a b)))
+
+(defn- family-rank [fam]
+  (cond
+    (erlang/== fam :nil) 0
+    (erlang/== fam :bool) 1
+    (erlang/== fam :number) 2
+    (erlang/== fam :text) 3
+    (erlang/== fam :symbol) 4
+    (erlang/== fam :atom) 5
+    (erlang/== fam :sequential) 6
+    (erlang/== fam :set) 7
+    (erlang/== fam :map) 8
+    (erlang/== fam :record) 9
+    (erlang/== fam :tuple) 10
+    (erlang/== fam :meta) 11
+    (erlang/== fam :identity) 12
+    :else 13))
+
+(defn rank
+  "The rank of a KIND's family. Kept kind-indexed because the first prototype's
+   `rank` took a kind; the policy table is `family-rank`."
+  [kd]
+  (family-rank (k/family kd)))
+
+(defn- unwrap-meta
+  "A `{:meta form m}` reader wrapper is `form` carrying metadata: unwrap it —
+   and any wrapper nested inside — so comparison never sees the wrapper. (A
+   vector struct's `:meta` is a different carrier: its kind stays `:vector` and
+   the field never reaches the walk.)"
+  [x]
+  (cond
+    (erlang/== (k/kind x) :meta) (unwrap-meta (erlang/element 2 x))
+    :else x))
+
+(defn k-compare
+  "A total order over every value the language can hold. Metadata wrappers are
+   unwrapped first, so a wrapper and the bare value it wraps compare equal. Two
+   values of the same family compare INSIDE that family (so a vector and a list
+   with equal elements are 0); different families compare by `family-rank`,
+   which is injective, so a cross-family pair is never 0 and the order is
+   antisymmetric and total."
+  [a b]
+  (let [a (unwrap-meta a)
+        b (unwrap-meta b)
+        fa (k/family (k/kind a)) fb (k/family (k/kind b))]
+    (cond
+      (erlang/== fa fb) (same-family fa a b)
+      (erlang/< (family-rank fa) (family-rank fb)) -1
+      :else 1)))
+
+(defn k-eqv
+  "`=`. Defined by the order, so these can never disagree."
+  [a b]
+  (erlang/== 0 (k-compare a b)))
